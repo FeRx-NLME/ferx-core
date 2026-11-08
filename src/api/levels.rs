@@ -1388,6 +1388,13 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
     Ok(levels)
 }
 
+/// The sentence [`no_levels_message`] ends on when the data has no discrete-state record:
+/// then no reader the user could add defines a level on it, whichever arm names the cause.
+const NO_DEFINING_RECORDS: &str = " Only Gaussian rows and the discrete-state records of a \
+                                   `[binary_model]` or DTMM `[markov_model]` endpoint define a \
+                                   level, and this data has neither, so it cannot estimate the \
+                                   block.";
+
 /// The refusal for a block [`discover_levels`] found no level of. Every Gaussian
 /// observation defines a level, so there are none. When the data carries no record of any
 /// kind either, it has no observation rows, and the refusal says that. Otherwise it names
@@ -1402,18 +1409,21 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
 fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     let name = decl.name();
     let head = format!("theta {name}[{}]", decl.columns().join(", "));
-    let any = |kind: fn(&ObsRecord) -> bool| {
-        population
-            .subjects
-            .iter()
-            .any(|s| s.obs_records.iter().any(kind))
-    };
-    let discrete = any(|r| matches!(r, ObsRecord::DiscreteState { .. }));
-    #[cfg(feature = "survival")]
-    let events = any(|r| matches!(r, ObsRecord::Event { .. }));
-    #[cfg(not(feature = "survival"))]
-    let events = false;
-    let counts = any(|r| matches!(r, ObsRecord::Count { .. }));
+    // One exhaustive pass, so a new `ObsRecord` variant fails to compile here rather than
+    // falling through to "no observation rows" (#2751 review r1 #4).
+    let mut discrete = false;
+    // Only the `survival` build has an `Event` variant to set it.
+    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    let mut events = false;
+    let mut counts = false;
+    for record in population.subjects.iter().flat_map(|s| &s.obs_records) {
+        match record {
+            ObsRecord::DiscreteState { .. } => discrete = true,
+            #[cfg(feature = "survival")]
+            ObsRecord::Event { .. } => events = true,
+            ObsRecord::Count { .. } => counts = true,
+        }
+    }
     if !(discrete || events || counts) {
         return format!("{head}: the data carries no observation rows, so the block has no levels");
     }
@@ -1440,6 +1450,11 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
             " Nothing reads it: a data-driven block is read bare, as `{name}`; its index is \
              implicit."
         ));
+        // On this data no reader defines a level either, so reading it bare would only
+        // trade this refusal for the next one (#2751 review r1 #1).
+        if !discrete {
+            message.push_str(NO_DEFINING_RECORDS);
+        }
     } else if !decl.record_cmts.is_empty() {
         let cmts: Vec<String> = decl.record_cmts.iter().map(|c| c.to_string()).collect();
         message.push_str(&format!(
@@ -1459,9 +1474,7 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
             " Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` \
              transition."
         } else {
-            " Only Gaussian rows and the discrete-state records of a `[binary_model]` or DTMM \
-             `[markov_model]` endpoint define a level, and this data has neither, so it cannot \
-             estimate the block."
+            NO_DEFINING_RECORDS
         });
     }
     message

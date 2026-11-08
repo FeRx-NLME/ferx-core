@@ -1017,8 +1017,9 @@ const BARE_ADVICE: &str =
 /// … or a level-defining endpoint the data has no record for.
 const BARE_NO_RECORDS: &str = "The block is read bare by an endpoint whose records define levels \
                                (CMT 1), but the data has no record there.";
-/// #2751: the bare-read advice when the data has no discrete-state record, so no reader
-/// the model could add defines a level on it.
+/// #2751: the closing sentence when the data has no discrete-state record, so no reader
+/// the model could add defines a level on it. It ends both the unread arm (review r1 #1)
+/// and the non-definer bare-read arm.
 const BARE_NO_DEFINER_DATA: &str = "Only Gaussian rows and the discrete-state records of a \
                                     `[binary_model]` or DTMM `[markov_model]` endpoint define a \
                                     level, and this data has neither, so it cannot estimate the \
@@ -1297,7 +1298,7 @@ struct Kinds {
     counts: bool,
 }
 
-/// [`read_population`]'s three studies with each subject's records replaced by one of each
+/// [`read_population`]'s three studies, record-free, each given one record of each
 /// kind in `kinds`: a discrete-state record on CMT 3, an exact TTE event on CMT 2 and a
 /// count on CMT 4. No Gaussian row, so no row defines a level.
 fn records_population(kinds: Kinds) -> Population {
@@ -1405,7 +1406,8 @@ fn record_kind_cells() {
             }
             // Expression side: exactly one read arm.
             let want: &[&str] = match reader {
-                Reader::Unread => &[UNREAD, READ_BARE],
+                Reader::Unread if discrete => &[UNREAD, READ_BARE],
+                Reader::Unread => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA],
                 Reader::Definer => &[BARE_NO_RECORDS],
                 Reader::NonDefiner if discrete => &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
                 Reader::NonDefiner => &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
@@ -1499,6 +1501,7 @@ fn tte_only_csv_is_not_called_rowless() {
             assert!(!m.contains(sentence), "{label}: {sentence:?} in {m}");
         }
         assert_eq!(m.contains(UNREAD), unread, "{label}: {m}");
-        assert_eq!(m.contains(BARE_NO_DEFINER_DATA), !unread, "{label}: {m}");
+        // Neither arm has a reader that could define a level on TTE-only data (r1 #1).
+        assert!(m.contains(BARE_NO_DEFINER_DATA), "{label}: {m}");
     }
 }
