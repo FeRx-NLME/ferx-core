@@ -186,14 +186,49 @@ pub(crate) fn cmt_off_times(
         .iter()
         .map(|d| {
             let record = d.implied.map_or(d.time, |i| doses[i.parent].time);
-            toggles
-                .iter()
-                .filter(|c| !c.on && c.state == d.cmt_idx())
-                .filter_map(|c| pk_only_times.get(c.pk_only).copied())
-                .filter(|&t| t >= record)
-                .fold(f64::INFINITY, f64::min)
+            cmt_off_time(
+                record,
+                d.cmt_idx(),
+                toggles,
+                pk_only_times,
+                CoTimedOff::Stops,
+            )
         })
         .collect()
+}
+
+/// How an off row at exactly a dose's record time counts in [`cmt_off_time`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoTimedOff {
+    /// The engines' order for a data record: the dose sorts ahead of the row, so the row
+    /// stops it ([`cmt_off_times`]).
+    Stops,
+    /// A dose an adaptive controller decided (#2753). The decision sees the state after
+    /// every on/off row at its time, so its dose is a record after the row, as the reader
+    /// orders a dose row listed after it: the row does not stop it.
+    After,
+}
+
+/// The time the input of a dose recorded at `record` into state `cmt_idx` stops: the first
+/// off row on that compartment at or after the record (strictly after, under
+/// [`CoTimedOff::After`]), `+∞` when none follows. The one rule for `DoseEvent::off_at`,
+/// shared by [`cmt_off_times`] and the adaptive driver's controller doses.
+pub(crate) fn cmt_off_time(
+    record: f64,
+    cmt_idx: usize,
+    toggles: &[CmtToggle],
+    pk_only_times: &[f64],
+    cotimed: CoTimedOff,
+) -> f64 {
+    toggles
+        .iter()
+        .filter(|c| !c.on && c.state == cmt_idx)
+        .filter_map(|c| pk_only_times.get(c.pk_only).copied())
+        .filter(|&t| match cotimed {
+            CoTimedOff::Stops => t >= record,
+            CoTimedOff::After => t > record,
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
@@ -1337,6 +1372,19 @@ impl Subject {
             d.off_at = off_at;
         }
         Cow::Owned(owned)
+    }
+
+    /// `DoseEvent::off_at` for a dose an adaptive controller decided at `t` into state
+    /// `cmt_idx` (#2753): see [`CoTimedOff::After`]. The driver sets it at injection and the
+    /// frozen replay on each ledger dose, so the two cut the same input at the same row.
+    pub(crate) fn controller_dose_off_at(&self, t: f64, cmt_idx: usize) -> f64 {
+        cmt_off_time(
+            t,
+            cmt_idx,
+            &self.cmt_toggles,
+            &self.pk_only_times,
+            CoTimedOff::After,
+        )
     }
 
     /// True when any dose record on this subject is flagged steady-state

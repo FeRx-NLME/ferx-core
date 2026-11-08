@@ -1195,6 +1195,7 @@ fn integrate_segment_zero_length_is_a_noop() {
         None,
         &mut auto_state,
         &[],
+        &[],
     );
 
     assert_eq!(u, vec![10.0], "zero-length segment must not change state");
@@ -1236,6 +1237,7 @@ fn integrate_segment_advances_state_and_records_obs() {
         &mut predictions,
         None,
         &mut auto_state,
+        &[],
         &[],
     );
 
@@ -4811,6 +4813,7 @@ fn integrate_segment_tad_anchor_set_when_prior_dose_exists() {
         &mut predictions,
         None,
         &mut auto_state,
+        &[],
         &[],
     );
 
@@ -17128,5 +17131,381 @@ fn due_mask_stop_schedules_nothing() {
     assert!(
         matches!(run, Err(AdaptiveDriverError::Refusal { .. })),
         "the same interval with a dose is refused: {run:?}"
+    );
+}
+
+// ── Compartment on/off records on the integrate-segment walks (#2753) ──────────────────────
+//
+// The adaptive driver, its constant-path replay (the static dense engine) and its
+// time-varying replay apply EVID=2 on/off rows through `apply_cmt_toggles_at_break`. The
+// oracle here is outside every engine: the oral 1-cpt system has a closed-form propagator,
+// and an off row on `depot` is an instant zeroing with nothing flowing in while it is off.
+// Fixture: KA = 0.3, so `depot` still holds 40.7 at the off row at 3 and 54.9 at the second
+// off row at 8 (from the dose at 6 that turned it back on). The off state is live on both
+// sides of each row, and the doses at 0, 6 and 12 land on residual drug.
+
+/// Relative band against the closed form, at the default solver tolerances. Measured on
+/// macOS arm64: 6.0e-6 (driver and dense engine, which agree bit for bit), 9.9e-7 (the
+/// infusion cut). 3e-5 is 5× the worst; the alternatives these tests reject sit more than
+/// 10% away.
+const TOG_TOL: f64 = 3e-5;
+const TOG_KA: f64 = 0.3;
+const TOG_CL: f64 = 5.0;
+const TOG_V: f64 = 50.0;
+
+fn pk_tog() -> PkParams {
+    let mut p = pk_one(TOG_CL, TOG_V);
+    p.values[crate::types::PK_IDX_KA] = TOG_KA;
+    p
+}
+
+/// `subject` with an on/off row per `(time, state, on)`, as the reader stores them.
+fn with_toggles(mut s: Subject, rows: &[(f64, usize, bool)]) -> Subject {
+    for &(t, state, on) in rows {
+        s.cmt_toggles.push(crate::types::CmtToggle {
+            pk_only: s.pk_only_times.len(),
+            state,
+            on,
+        });
+        s.pk_only_times.push(t);
+    }
+    s
+}
+
+/// Closed-form `central` of the oral 1-cpt system at each of `obs`, under `events`
+/// `(time, kind)` applied in list order at their time: `Some(amt)` adds to `depot`, `None`
+/// zeroes it (an off row on `depot`, which nothing flows into, so it stays zero while off).
+fn tog_closed_form(events: &[(f64, Option<f64>)], obs: &[f64]) -> Vec<f64> {
+    let (ka, k) = (TOG_KA, TOG_CL / TOG_V);
+    let step = |(d, c): (f64, f64), dt: f64| {
+        let ed = (-ka * dt).exp();
+        let ec = (-k * dt).exp();
+        (d * ed, c * ec + d * ka / (ka - k) * (ec - ed))
+    };
+    obs.iter()
+        .map(|&t_obs| {
+            let (mut s, mut t) = ((0.0, 0.0), 0.0);
+            for &(te, kind) in events.iter().filter(|e| e.0 <= t_obs) {
+                s = step(s, te - t);
+                t = te;
+                s.0 = match kind {
+                    Some(amt) => s.0 + amt,
+                    None => 0.0,
+                };
+            }
+            step(s, t_obs - t).1
+        })
+        .collect()
+}
+
+const TOG_OBS: [f64; 6] = [1.0, 4.0, 7.0, 8.5, 10.0, 12.5];
+const TOG_DECISIONS: [f64; 3] = [0.0, 6.0, 12.0];
+const TOG_ROWS: [(f64, usize, bool); 3] = [(3.0, 0, false), (8.0, 0, false), (9.0, 0, true)];
+
+fn tog_events() -> Vec<(f64, Option<f64>)> {
+    vec![
+        (0.0, Some(100.0)),
+        (3.0, None),
+        (6.0, Some(100.0)),
+        (8.0, None),
+        (12.0, Some(100.0)),
+    ]
+}
+
+/// Worst relative error of `got` against `want`, with every value asserted finite first so
+/// a `NaN` cannot hide in the fold.
+fn worst_rel(got: &[f64], want: &[f64]) -> f64 {
+    assert_eq!(got.len(), want.len());
+    assert!(
+        got.iter().chain(want).all(|x| x.is_finite()),
+        "{got:?} / {want:?}"
+    );
+    got.iter()
+        .zip(want)
+        .map(|(g, w)| ((g - w) / w).abs())
+        .fold(0.0, f64::max) // nan-ok: every operand asserted finite above
+}
+
+/// The static dense engine — the adaptive constant-path replay — honours on/off rows
+/// (#2753). Replay-side oracle: dropping the toggle in
+/// `ode_predictions_with_extra_breaks_and_stats` fails here, and the driver test below
+/// stays green on its closed-form check. The no-toggle twin is asserted far away, so the
+/// fixture tells the two apart.
+#[test]
+fn cmt_toggle_dense_engine_matches_the_closed_form() {
+    let ode = one_cpt_oral_ode_spec();
+    let pk = pk_tog();
+    let doses: Vec<DoseEvent> = TOG_DECISIONS
+        .iter()
+        .map(|&t| DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    let s = with_toggles(make_subject(doses.clone(), TOG_OBS.to_vec()), &TOG_ROWS);
+    let got = ode_predictions_with_extra_breaks(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &s.with_cmt_cutoffs(),
+        &TOG_DECISIONS,
+    );
+    let want = tog_closed_form(&tog_events(), &TOG_OBS);
+    let worst = worst_rel(&got, &want);
+    eprintln!("dense engine vs closed form: worst rel {worst:e}");
+    assert!(worst < TOG_TOL, "worst rel {worst:e}: {got:?} vs {want:?}");
+
+    let untoggled = ode_predictions_with_extra_breaks(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &make_subject(doses, TOG_OBS.to_vec()),
+        &TOG_DECISIONS,
+    );
+    assert!(
+        worst_rel(&untoggled, &want) > 0.1,
+        "the off rows must move the answer"
+    );
+}
+
+/// The reader leaves an off row one ULP from a co-timed dose (`order_cmt_toggle_ties`):
+/// below it when the row is listed first (the dose lands), above it when listed after (the
+/// dose is wiped). The dense engine must keep the two on their own breaks and fire each at
+/// its own: merged into one break, the walk's fixed order (toggles before doses) would let
+/// the listed-after row miss the dose. Both cells against the closed form.
+#[test]
+fn cmt_toggle_dense_engine_orders_a_one_ulp_tie_by_time() {
+    let ode = one_cpt_oral_ode_spec();
+    let pk = pk_tog();
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let obs = [7.0, 10.0];
+    let run = |off_t: f64| {
+        let s = with_toggles(
+            make_subject(doses.clone(), obs.to_vec()),
+            &[(3.0, 0, false), (off_t, 0, false)],
+        );
+        ode_predictions_with_extra_breaks(&ode, &pk.values, &[], &[], &s.with_cmt_cutoffs(), &[])
+    };
+    let lands = tog_closed_form(&[(0.0, Some(100.0)), (3.0, None), (6.0, Some(100.0))], &obs);
+    let wiped = tog_closed_form(&[(0.0, Some(100.0)), (3.0, None)], &obs);
+    let before = run(6.0f64.next_down());
+    let after = run(6.0f64.next_up());
+    assert!(
+        worst_rel(&before, &lands) < TOG_TOL,
+        "row listed before the dose: {before:?} vs {lands:?}"
+    );
+    assert!(
+        worst_rel(&after, &wiped) < TOG_TOL,
+        "row listed after the dose: {after:?} vs {wiped:?}"
+    );
+    assert!(
+        worst_rel(&lands, &wiped) > 0.1,
+        "the two cells straddle the tie"
+    );
+}
+
+/// The static dense subject the frozen replay rebuilds from `run` (#2753), as
+/// `verify_adaptive_frozen_replay` does: base cutoffs, then each ledger dose with the
+/// controller's `off_at`.
+fn replay_subject(base: &Subject, run: &AdaptiveRun) -> Subject {
+    let mut s = base.with_cmt_cutoffs().into_owned();
+    s.doses.extend(run.ledger.iter().map(|e| {
+        let mut d = DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0);
+        d.off_at = base.controller_dose_off_at(e.time, d.cmt_idx());
+        d
+    }));
+    s
+}
+
+/// The reactive driver honours on/off rows (#2753). Driver-side oracle: dropping the toggle
+/// in `ode_predictions_adaptive_impl` fails the closed-form check here, while the replay
+/// tests above stay green. The driver is also bit-identical to its constant-path replay on
+/// the same segments, and the frozen-replay verifier accepts the run.
+#[test]
+fn adaptive_driver_applies_cmt_toggles_like_the_closed_form() {
+    let ode = one_cpt_oral_ode_spec();
+    let pk = pk_tog();
+    let base = with_toggles(make_subject(vec![], TOG_OBS.to_vec()), &TOG_ROWS);
+    let mut controller = |_: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &TOG_DECISIONS,
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs on a toggled subject");
+    assert_eq!(run.ledger.len(), 3);
+    let want = tog_closed_form(&tog_events(), &TOG_OBS);
+    let worst = worst_rel(&run.predictions, &want);
+    eprintln!("driver vs closed form: worst rel {worst:e}");
+    assert!(
+        worst < TOG_TOL,
+        "worst rel {worst:e}: {:?} vs {want:?}",
+        run.predictions
+    );
+
+    let replay = ode_predictions_with_extra_breaks(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &replay_subject(&base, &run),
+        &TOG_DECISIONS,
+    );
+    for (j, (a, b)) in run.predictions.iter().zip(&replay).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "obs {j}: driver {a} vs replay {b}"
+        );
+    }
+    verify_adaptive_frozen_replay(
+        &ode,
+        &pk.values,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &base,
+        &TOG_DECISIONS,
+        &run,
+    )
+    .expect("frozen replay accepts the toggled run");
+}
+
+/// A controller infusion running across an off row on its compartment stops there and does
+/// not resume at the on row (#2753, `DoseEvent::off_at` on the controller dose), as a
+/// recorded infusion does. The 400-over-8-h infusion into `depot` is cut at the off row at
+/// 3. Closed form: a constant input `R` into `depot` over 0–3, then the free decay.
+#[test]
+fn adaptive_controller_infusion_stops_at_an_off_row() {
+    let ode = one_cpt_oral_ode_spec();
+    let pk = pk_tog();
+    let obs = vec![2.0, 5.0, 10.0];
+    let rows = [(3.0, 0, false), (4.0, 0, true)];
+    let base = with_toggles(make_subject(vec![], obs.clone()), &rows);
+    let mut controller = |_: &ControllerCtx| {
+        vec![DoseAction::Infuse {
+            amt: 400.0,
+            cmt: 1,
+            rate: 50.0,
+        }]
+    };
+    let run = ode_predictions_adaptive(
+        &ode,
+        &pk.values,
+        &[],
+        &[],
+        &base,
+        &[0.0],
+        &[],
+        &mut controller,
+        100,
+        None,
+    )
+    .expect("driver runs");
+
+    // Closed form. Under a constant input R into depot from 0: depot = R/ka (1 − e^{−ka t}),
+    // central = R/k (1 − e^{−k t}) − R/(ka − k) (e^{−k t} − e^{−ka t}). After the cut at 3,
+    // depot is zero (off, then on at 4 with nothing arriving) and central decays at k.
+    let (ka, k, r) = (TOG_KA, TOG_CL / TOG_V, 50.0);
+    let central_in =
+        |t: f64| r / k * (1.0 - (-k * t).exp()) - r / (ka - k) * ((-k * t).exp() - (-ka * t).exp());
+    let want: Vec<f64> = obs
+        .iter()
+        .map(|&t| {
+            if t <= 3.0 {
+                central_in(t)
+            } else {
+                central_in(3.0) * (-k * (t - 3.0)).exp()
+            }
+        })
+        .collect();
+    let worst = worst_rel(&run.predictions, &want);
+    eprintln!("controller infusion cut: worst rel {worst:e}");
+    assert!(worst < TOG_TOL, "{:?} vs {want:?}", run.predictions);
+    verify_adaptive_frozen_replay(
+        &ode,
+        &pk.values,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &base,
+        &[0.0],
+        &run,
+    )
+    .expect("frozen replay accepts the run");
+}
+
+/// The driver's side of `cmt_toggle_dense_engine_orders_a_one_ulp_tie_by_time` (#2753): base
+/// doses at 0 and 6 with an off row one ULP either side of the dose at 6, a holding
+/// controller deciding at 2 and 6 (so a decision also sits on the tie). Both cells against
+/// the closed form, and the frozen replay accepts each.
+#[test]
+fn adaptive_driver_orders_a_one_ulp_tie_by_time() {
+    let ode = one_cpt_oral_ode_spec();
+    let pk = pk_tog();
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let obs = [7.0, 10.0];
+    let decisions = [2.0, 6.0f64.next_down().next_down()];
+    let run = |off_t: f64| {
+        let base = with_toggles(
+            make_subject(doses.clone(), obs.to_vec()),
+            &[(3.0, 0, false), (off_t, 0, false)],
+        );
+        let mut hold = |_: &ControllerCtx| vec![DoseAction::Hold];
+        let run = ode_predictions_adaptive(
+            &ode,
+            &pk.values,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &[],
+            &mut hold,
+            100,
+            None,
+        )
+        .expect("driver runs");
+        verify_adaptive_frozen_replay(
+            &ode,
+            &pk.values,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            &base,
+            &decisions,
+            &run,
+        )
+        .expect("frozen replay accepts the run");
+        run.predictions
+    };
+    let lands = tog_closed_form(&[(0.0, Some(100.0)), (3.0, None), (6.0, Some(100.0))], &obs);
+    let wiped = tog_closed_form(&[(0.0, Some(100.0)), (3.0, None)], &obs);
+    let before = run(6.0f64.next_down());
+    let after = run(6.0f64.next_up());
+    assert!(
+        worst_rel(&before, &lands) < TOG_TOL,
+        "row listed before the dose: {before:?} vs {lands:?}"
+    );
+    assert!(
+        worst_rel(&after, &wiped) < TOG_TOL,
+        "row listed after the dose: {after:?} vs {wiped:?}"
     );
 }
