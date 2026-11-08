@@ -575,6 +575,11 @@ mod adaptive_dose_expr_tests;
 #[path = "tests/adaptive_dose_knowledge_tests.rs"]
 mod adaptive_dose_knowledge_tests;
 
+// #944 PR3: `round_to`, the dose grid.
+#[cfg(test)]
+#[path = "tests/adaptive_round_to_tests.rs"]
+mod adaptive_round_to_tests;
+
 // #1594: supplied per-subject η on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_inputs_tests.rs"]

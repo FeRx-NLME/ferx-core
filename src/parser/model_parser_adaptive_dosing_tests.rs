@@ -1303,3 +1303,76 @@ fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
         }
     }
 }
+
+// ── round_to (#944 PR3) ──
+
+/// `valid_min` with `start_dose = 500`, `dose_bounds = [250, 4000]` (a low above 0, so
+/// V8 does not apply) and `extra` appended.
+fn gridded(extra: &[&str]) -> Vec<String> {
+    let mut body: Vec<String> = valid_min()
+        .into_iter()
+        .map(|l| {
+            if l.starts_with("dose_bounds") {
+                "dose_bounds = [250, 4000]"
+            } else if l.starts_with("start_dose") {
+                "start_dose = 500"
+            } else {
+                l
+            }
+            .to_string()
+        })
+        .collect();
+    body.extend(extra.iter().map(|s| s.to_string()));
+    body
+}
+
+/// `round_to` parses into the spec; absent, it is `None`, so a block without it is the
+/// spec it was before PR3.
+///
+/// Mutation: the key parsed but not stored, or a default other than `None`.
+#[test]
+fn round_to_parses_and_defaults_to_none() {
+    let spec = parse_adaptive_dosing_block(&gridded(&["round_to = 250"])).unwrap();
+    assert_eq!(spec.round_to, Some(250.0));
+    let spec = parse_adaptive_dosing_block(&gridded(&[])).unwrap();
+    assert_eq!(spec.round_to, None);
+}
+
+/// P3 at parse time, with the value as written (`abc` is not a number at all, so it
+/// cannot come back through `f64` formatting). One sentence, asserted whole.
+///
+/// Mutations: a non-number accepted as an expression; `0` or a negative step accepted;
+/// `inf` accepted.
+#[test]
+fn round_to_must_be_a_finite_positive_number() {
+    for v in ["0", "-250", "inf", "NaN", "abc", "25 * WT"] {
+        let body = gridded(&[&format!("round_to = {v}")]);
+        assert_eq!(
+            parse_adaptive_dosing_block(&body).unwrap_err(),
+            format!("[adaptive_dosing]: round_to must be a finite number > 0: {v}"),
+            "{v}"
+        );
+    }
+}
+
+/// P4 at parse time: `round_to` beside a valid `levels` ladder.
+///
+/// Mutation: P4 only in a programmatic path, or after the ladder checks.
+#[test]
+fn round_to_with_levels_errors() {
+    let body = [
+        "observe = central",
+        "at = [24, 48]",
+        "start_dose = 500",
+        "route = bolus(cmt = 1)",
+        "dose_bounds = [250, 4000]",
+        "levels = [250, 500, 1000]",
+        "round_to = 250",
+        "when signal < 10 : increase",
+    ];
+    assert_eq!(
+        perr(&body),
+        "[adaptive_dosing]: round_to cannot be combined with levels: a levels ladder is \
+         already discrete, so write the rounded doses as the levels"
+    );
+}
