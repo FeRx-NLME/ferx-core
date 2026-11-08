@@ -30,8 +30,11 @@ ever tracked. Run this script locally, then run the anchor:
 
 The download is Europe PMC's `supplementaryFiles` endpoint, an outer zip that is
 assembled per request (fresh timestamps every time), so only the inner CSV can be
-hash-pinned. The endpoint is slow (minutes for ~10 MB) and has returned HTTP 500,
-hence the retries. `--from` takes a local copy of the outer zip, of
+hash-pinned. The endpoint is slow (minutes for ~10 MB), has returned HTTP 500, and
+has served an inner CSV with the wrong hash that a request half an hour later got
+right (#2818), hence the retries: a transport error, an unreadable zip and a wrong
+hash each fail one attempt, and all attempts share one `--deadline-seconds` budget,
+so a trickling download cannot outlast the CI step's cap (#1938). `--from` takes a local copy of the outer zip, of
 `PSP4-15-e70158-s002.zip`, or of the bare `data_9studies.csv`, and skips the
 download.
 
@@ -74,6 +77,9 @@ URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC12896392/supplementar
 INNER_ZIP = "PSP4-15-e70158-s002.zip"
 INNER_CSV = "supplemental/case_study_2/data_9studies.csv"
 DEFAULT_OUT = "data/external/mbma_canakinumab.csv"
+# Linear backoff between attempts (10 s, 20 s, 30 s), each capped by the time left
+# in `--deadline-seconds`. There is no sleep after the last attempt (#1938).
+BACKOFF_SECONDS = 10
 
 # sha256 of the upstream `data_9studies.csv` (inside PSP4-15-e70158-s002.zip).
 UPSTREAM_SHA256 = "d71c7e0882e95eae4f096387a95c33ed1c4fa0fe85eb57d317886dee94553b27"
@@ -93,22 +99,115 @@ DRUGS = ("abata", "adali", "canaki")
 OUT_COLUMNS = ["ID", "ARM", "TIME", "DV", "NARM", "ABATA", "ADALI", "CANAKI", "MDV"]
 
 
-def download(attempts=4, timeout=600):
-    last = None
+class AttemptFailed(Exception):
+    """One download attempt that did not yield the pinned upstream CSV."""
+
+    def __init__(self, log, sha=None):
+        super().__init__(log)
+        self.log = log  # the attempt's line in the final report
+        self.sha = sha  # the wrong sha256, when the payload parsed but hashed wrong
+
+
+def read_within(url, timeout, deadline):
+    """The response body of `url`; `TimeoutError` once `deadline` (monotonic) passes.
+
+    `urlopen(timeout=...)` limits each socket operation, not the download: a server
+    that trickles bytes never trips it (#1938). So no blocking call may outlast the
+    time left, and the deadline is re-checked after every chunk.
+    """
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("deadline reached before the request")
+    # URL is the https constant above, never user input (asserted in main).
+    with urllib.request.urlopen(url, timeout=min(timeout, left)) as r:  # nosec B310
+        parts = []
+        while True:
+            chunk = r.read1(1 << 16)
+            if not chunk:
+                return b"".join(parts)
+            parts.append(chunk)
+            if time.monotonic() >= deadline:
+                got = sum(len(p) for p in parts)
+                raise TimeoutError(f"deadline reached mid-download ({got} bytes received)")
+
+
+def attempt(url, timeout, deadline):
+    """The pinned upstream CSV bytes, or `AttemptFailed`.
+
+    A payload that downloads but is not a readable zip, or whose CSV hashes wrong,
+    fails the attempt exactly like a transport error: the endpoint has served a
+    wrong-hash payload that the next request got right (#2818).
+    """
+    try:
+        blob = read_within(url, timeout, deadline)
+    except Exception as e:  # noqa: BLE001 — any failure is retried, then reported
+        raise AttemptFailed(f"error: {type(e).__name__}: {e}") from None
+    # The endpoint always answers with a zip; anything else is a garbled reply, not
+    # a bare CSV to hash.
+    if not zipfile.is_zipfile(io.BytesIO(blob)):
+        raise AttemptFailed(f"unreadable payload: not a zip ({len(blob)} bytes)")
+    try:
+        raw = upstream_csv(blob)
+    except (ValueError, zipfile.BadZipFile, KeyError, EOFError) as e:
+        raise AttemptFailed(f"unreadable payload ({len(blob)} bytes): {e}") from None
+    got = hashlib.sha256(raw).hexdigest()
+    if got != UPSTREAM_SHA256:
+        raise AttemptFailed(f"sha256 {got}", sha=got)
+    return raw
+
+
+def fetch_upstream(attempts, timeout, deadline_seconds):
+    """Retry `attempt` until it returns the pinned CSV, or the attempts or the total
+    `deadline_seconds` budget run out; then exit with a report naming every attempt."""
+    deadline = time.monotonic() + deadline_seconds
+    failed = []
+    out_of_time = False
     for i in range(attempts):
+        print(f"downloading {URL} (attempt {i + 1}/{attempts}) ...", file=sys.stderr)
         try:
-            print(f"downloading {URL} (attempt {i + 1}/{attempts}) ...", file=sys.stderr)
-            # URL is the https constant above, never user input (asserted in main).
-            with urllib.request.urlopen(URL, timeout=timeout) as r:  # nosec B310
-                return r.read()
-        except Exception as e:  # noqa: BLE001 — any failure is retried, then reported
-            last = e
-            time.sleep(10 * (i + 1))
-    sys.exit(f"download failed after {attempts} attempts: {last}")
+            return attempt(URL, timeout, deadline)
+        except AttemptFailed as e:
+            failed.append(e)
+            print(f"attempt {i + 1}: {e.log}", file=sys.stderr)
+        if i + 1 == attempts:
+            break  # no sleep after the last attempt
+        left = deadline - time.monotonic()
+        if left > 0:
+            time.sleep(min(BACKOFF_SECONDS * (i + 1), left))
+        if deadline - time.monotonic() <= 0:
+            out_of_time = True
+            break
+    sys.exit(fetch_report(failed, out_of_time, deadline_seconds))
+
+
+def fetch_report(failed, out_of_time, deadline_seconds):
+    """The exit message once every attempt failed: the verdict, then one line each."""
+    n = len(failed)
+    shas = {e.sha for e in failed}
+    if n >= 2 and len(shas) == 1 and None not in shas:
+        lines = [
+            f"upstream {INNER_CSV} hashed sha256 {failed[0].sha} on all {n} attempts, "
+            f"not the pinned {UPSTREAM_SHA256}.",
+            "The same wrong hash on every attempt means the upstream file really changed: "
+            "inspect it, then re-pin UPSTREAM_SHA256 (and DERIVED_SHA256) deliberately.",
+        ]
+    else:
+        lines = [
+            f"no attempt of {n} delivered the pinned upstream {INNER_CSV} "
+            f"(sha256 {UPSTREAM_SHA256}).",
+            "Mixed hashes or transport errors mean the endpoint is flaky, not that the "
+            "file changed: re-run the fetch, and do not re-pin.",
+        ]
+    if out_of_time:
+        lines.append(f"Stopped at the {deadline_seconds:g} s --deadline-seconds budget.")
+    lines += [f"  attempt {i + 1}: {e.log}" for i, e in enumerate(failed)]
+    return "\n".join(lines)
 
 
 def upstream_csv(blob):
-    """The bytes of `data_9studies.csv`, from the outer zip, the inner zip or the CSV."""
+    """The bytes of `data_9studies.csv`, from the outer zip, the inner zip or the CSV.
+
+    Raises `ValueError` on a zip that holds neither."""
     if not zipfile.is_zipfile(io.BytesIO(blob)):
         return blob
     z = zipfile.ZipFile(io.BytesIO(blob))
@@ -117,7 +216,7 @@ def upstream_csv(blob):
         return z.read(INNER_CSV)
     inner = [n for n in names if os.path.basename(n) == INNER_ZIP]
     if len(inner) != 1:
-        sys.exit(f"neither {INNER_CSV} nor {INNER_ZIP} found in the zip ({len(names)} entries)")
+        raise ValueError(f"neither {INNER_CSV} nor {INNER_ZIP} found in the zip ({len(names)} entries)")
     return upstream_csv(z.read(inner[0]))
 
 
@@ -163,7 +262,25 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--from", dest="src", help="local outer zip, inner zip, or data_9studies.csv")
     ap.add_argument("--out", default=DEFAULT_OUT)
-    ap.add_argument("--allow-new-hash", action="store_true")
+    ap.add_argument(
+        "--allow-new-hash",
+        action="store_true",
+        help="accept a new DERIVED sha256; the upstream pin is never waived",
+    )
+    ap.add_argument("--attempts", type=int, default=4, help="download attempts (default 4)")
+    ap.add_argument(
+        "--timeout",
+        type=float,
+        default=120,
+        help="seconds any one socket operation may block (default 120)",
+    )
+    ap.add_argument(
+        "--deadline-seconds",
+        type=float,
+        default=780,
+        help="wall-time budget for all attempts and backoffs together (default 780 = "
+        "13 min, inside slow-tests.yml's 15-min step cap)",
+    )
     ap.add_argument(
         "--check",
         action="store_true",
@@ -179,14 +296,24 @@ def main():
             sys.exit(f"--check: {a.out} sha256 {got} != pinned {DERIVED_SHA256}")
         print(f"ok: {a.out} is the pinned derived file")
         return
-    if not URL.startswith("https://"):
+    # The loopback arm exists for `tests/mbma_canakinumab_fetch_script.rs`, which
+    # points URL at a local fake server; the constant itself is https.
+    if not (URL.startswith("https://") or URL.startswith("http://127.0.0.1:")):
         sys.exit(f"refusing a non-https download URL: {URL}")
 
-    blob = open(a.src, "rb").read() if a.src else download()
-    raw = upstream_csv(blob)
-    got = hashlib.sha256(raw).hexdigest()
-    if got != UPSTREAM_SHA256:
-        sys.exit(f"upstream {INNER_CSV} sha256 {got} != pinned {UPSTREAM_SHA256}")
+    if a.src:
+        try:
+            raw = upstream_csv(open(a.src, "rb").read())
+        except (ValueError, zipfile.BadZipFile) as e:
+            sys.exit(f"--from {a.src}: {e}")
+        got = hashlib.sha256(raw).hexdigest()
+        if got != UPSTREAM_SHA256:
+            sys.exit(f"upstream {INNER_CSV} sha256 {got} != pinned {UPSTREAM_SHA256}")
+    else:
+        # The upstream pin is checked inside the retry loop, so a wrong hash is a
+        # failed attempt and never an accepted payload; `--allow-new-hash` does not
+        # reach it.
+        raw = fetch_upstream(a.attempts, a.timeout, a.deadline_seconds)
 
     derived = derive(raw)
     got = hashlib.sha256(derived).hexdigest()
