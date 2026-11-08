@@ -1388,15 +1388,20 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
     Ok(levels)
 }
 
-/// The sentence [`no_levels_message`] ends on, in the unread and the non-definer arms, when
-/// the data has no discrete-state record on a binary or DTMM endpoint
+/// The sentence [`no_levels_message`] closes the unread and the non-definer arms with,
+/// when the data has no discrete-state record on a binary or DTMM endpoint
 /// ([`LevelBlockDecl::level_capable_cmts`], #2808): then no reader the user could add
-/// defines a level on it. The definer arm never appends it: there, that the data has no
+/// defines a level on it, so the block cannot be estimated. Each arm follows it with its
+/// own next step (#2819). The definer arm never appends it: there, that the data has no
 /// record on the reading endpoint is the fact the user can act on.
 const NO_DEFINING_RECORDS: &str = " Only Gaussian rows and the discrete-state records of a \
                                    `[binary_model]` or DTMM `[markov_model]` endpoint define a \
                                    level, and this data has neither, so it cannot estimate the \
                                    block.";
+
+/// The part both next steps share (#2819): rows that would define a level.
+const ADD_DEFINING_ROWS: &str = "add rows that define a level, scored by an expression that \
+                                 reads it.";
 
 /// The refusal for a block [`discover_levels`] found no level of. Every Gaussian
 /// observation defines a level, so there are none. When the data carries no record of any
@@ -1408,7 +1413,12 @@ const NO_DEFINING_RECORDS: &str = " Only Gaussian rows and the discrete-state re
 /// bare ([`LevelBlockDecl::read_bare`]): if none does, nothing reads it at all, since the
 /// parse refuses a subscripted `NAME[COLUMN]` read (#2744); if one does, its reader defines
 /// no level on this data — a level-defining endpoint with no records here, or only a
-/// Gaussian prediction, a CTMM generator or a TTE hazard.
+/// Gaussian prediction, a CTMM generator or a TTE hazard. When no reader could define a
+/// level on this data, it ends on [`NO_DEFINING_RECORDS`] and a next step (#2819): drop
+/// the block if nothing reads it; if something reads it bare, deleting the declaration
+/// would turn the bare name into a covariate, so the step is to declare it as one scalar
+/// θ. There the reason for the Gaussian reader is not restated, since the closing
+/// sentence gives it.
 fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     let name = decl.name();
     let head = format!("theta {name}[{}]", decl.columns().join(", "));
@@ -1465,6 +1475,8 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
         // trade this refusal for the next one (#2751 review r1 #1).
         if !definable {
             message.push_str(NO_DEFINING_RECORDS);
+            message.push_str(" Drop the block, or ");
+            message.push_str(ADD_DEFINING_ROWS);
         }
     } else if !decl.record_cmts.is_empty() {
         let cmts: Vec<String> = decl.record_cmts.iter().map(|c| c.to_string()).collect();
@@ -1477,16 +1489,32 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
         message.push_str(
             " The block is read bare, but only by a Gaussian prediction, a `[markov_model]` \
              CTMM generator or an `[event_model]` hazard, and none of them defines a level on \
-             this data: it has no Gaussian rows, a CTMM generator is built once per subject \
-             from the baseline, and one time-to-event row can yield zero or two records, so \
-             neither kind of record defines a level.",
+             this data: ",
         );
-        message.push_str(if definable {
-            " Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` \
-             transition."
+        // Without a definable record the closing sentence says the data has no Gaussian
+        // rows, so the reason for the Gaussian reader is stated there, once (#2819).
+        if definable {
+            message.push_str("it has no Gaussian rows, ");
+        }
+        message.push_str(
+            "a CTMM generator is built once per subject from the baseline, and one \
+             time-to-event row can yield zero or two records, so neither kind of record \
+             defines a level.",
+        );
+        if definable {
+            message.push_str(
+                " Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` \
+                 transition.",
+            );
         } else {
-            NO_DEFINING_RECORDS
-        });
+            // Not "drop the block": the bare `NAME` would then read as a covariate (#2819
+            // review r1 #1).
+            message.push_str(NO_DEFINING_RECORDS);
+            message.push_str(&format!(
+                " Declare it as one `theta {name}` without the index, or "
+            ));
+            message.push_str(ADD_DEFINING_ROWS);
+        }
     }
     message
 }

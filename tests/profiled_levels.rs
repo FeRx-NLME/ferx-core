@@ -16,7 +16,9 @@
 //! a reference that profiles nothing.
 
 use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
-use ferx_core::types::{CovarianceMethod, EstimationMethod, FitOptions, FitResult, OmegaMatrix};
+use ferx_core::types::{
+    CovarianceMethod, EstimationMethod, FitOptions, FitResult, HeldReason, OmegaMatrix,
+};
 use nalgebra::DMatrix;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -417,6 +419,70 @@ fn f2b_evaluated(
     (p, f)
 }
 
+/// #2797 on a profiled fit, the "no matrix" cell: ETA_EM forced onto the internal guard
+/// (ω = e⁻¹²) where the data supports ω ≈ 0.1 is not a stationary point — the profile
+/// objective's Hessian is indefinite along ETA_EM itself (min eigenvalue −0.006, measured)
+/// — so the step publishes no matrix and holds nothing. ETA_EM is still listed in
+/// `held_at_bound` beside the profiled level, `cov_fixed` is empty, and the guard warning
+/// makes no claim about standard errors there are none of. The held side of the profiled
+/// step is pinned in `profile_tests::a_profiled_step_holds_a_structural_coordinate_on_the_guard`.
+#[test]
+fn a_profiled_fit_lists_a_collapse_even_when_its_step_fails() {
+    let (est, _) = ext("profile_mbma_bound.ext");
+    let path = unique_temp("ferx_profiled_levels_2797");
+    std::fs::write(&path, f2b_text(true)).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(root().join(F2_DATA).to_str().unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut params = p.init_params.clone();
+    for k in 0..3 {
+        params.theta[k] = est[&format!("THETA{}", k + 1)];
+    }
+    params.omega = OmegaMatrix::from_diagonal(&[(-12.0_f64).exp()], vec!["ETA_EM".into()]);
+    params.omega_iov = Some(OmegaMatrix::from_diagonal(
+        &[est["OMEGA(2,2)"]],
+        vec!["KAPPA_ARM".into()],
+    ));
+    let opts = r(FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..p.parsed.fit_options.clone()
+    });
+    let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(f.covariance_matrix.is_none(), "{:?}", f.warnings);
+    assert!(
+        f.warnings
+            .iter()
+            .any(|w| w.contains("Hessian of the profile objective is not positive definite")),
+        "{:?}",
+        f.warnings
+    );
+    let held: Vec<(&str, HeldReason)> = f
+        .held_at_bound
+        .iter()
+        .map(|h| (h.name.as_str(), h.reason))
+        .collect();
+    assert_eq!(
+        held,
+        [
+            ("PLACEBO[STUDY=7,TIME=4]", HeldReason::ProfiledBound),
+            ("ETA_EM", HeldReason::CollapsedAtGuard),
+        ]
+    );
+    assert!(f.cov_fixed.is_empty());
+    let guard = f
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("Internal optimizer parameter guard reached"))
+        .expect("the guard warning");
+    assert!(guard.contains("ETA_EM"), "{guard}");
+    assert!(!guard.contains("standard errors"), "{guard}");
+}
+
 /// The profiled [`f2b_evaluated`] under `r`, evaluated once for the tests that read it.
 fn bounded_at_nonmem_optimum() -> &'static (ferx_core::PreparedRun, FitResult) {
     static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
@@ -456,6 +522,31 @@ fn a_bounded_profiled_evaluation_reproduces_nonmem_with_the_level_fixed() {
         f.warnings
     );
     assert_eq!(f.profiled_levels_at_bound, [pinned]);
+    // #2797: the same level is the one `held_at_bound` entry, as a `ProfiledBound` — no
+    // collapse is listed beside it (none of this model's coordinates is on a rail), and the
+    // matrix below is unchanged by the field's arrival (the NONMEM comparison is the pin).
+    let held: Vec<(
+        &str,
+        ferx_core::types::ParameterKind,
+        usize,
+        usize,
+        HeldReason,
+    )> = f
+        .held_at_bound
+        .iter()
+        .map(|h| (h.name.as_str(), h.kind, h.index, h.packed_index, h.reason))
+        .collect();
+    assert_eq!(
+        held,
+        [(
+            "PLACEBO[STUDY=7,TIME=4]",
+            ferx_core::types::ParameterKind::Theta,
+            pinned,
+            pinned,
+            HeldReason::ProfiledBound
+        )]
+    );
+    assert!(f.cov_fixed[pinned], "{:?}", f.cov_fixed);
     let d_ofv = f.ofv - est["OBJ"];
     let mut worst_level = 0.0_f64;
     for k in (3..39).filter(|&k| k != pinned) {

@@ -382,6 +382,8 @@ fn run_covariance_scoped(
     // The levels the replayed step held on their bound (#2112), and their warning: the
     // incoming fit's describe a step this call replaced.
     crate::api::refresh_profiled_bound_report(model_ref, pop_ref, &params, held_at_bound, &mut out);
+    // The guard warning's SE sentence and `held_at_bound` (#2797), from this step's matrix.
+    crate::api::refresh_held_at_bound_report(&params, &mut out);
     // After the report above: the levels it lists are held too.
     out.cov_fixed = crate::estimation::parameterization::cov_fixed_mask(&params, &out);
     crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);

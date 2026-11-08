@@ -8268,6 +8268,50 @@ pub struct LevelGroupEbe {
     pub kappa: Vec<f64>,
 }
 
+/// One coordinate the covariance step reports no standard error for (#2797), as listed in
+/// [`FitResult::held_at_bound`]: its SE displays as not available, and — when the step held
+/// it (it is marked in [`FitResult::cov_fixed`]) — every other SE is conditional on it at
+/// its estimate.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HeldAtBound {
+    /// The parameter's name as in the estimate table: `"ETA_KA"`, `"K_ARM"`, `"TVE0"`.
+    pub name: String,
+    /// The family the parameter is reported under.
+    pub kind: ParameterKind,
+    /// Its index within that family: into `theta`, the Ω diagonal, `sigma`, or the κ
+    /// (Ω_IOV) diagonal.
+    pub index: usize,
+    /// Its row in [`FitResult::covariance_matrix`] and [`FitResult::cov_fixed`].
+    pub packed_index: usize,
+    /// Why it is held.
+    pub reason: HeldReason,
+}
+
+/// Why a coordinate is in [`FitResult::held_at_bound`].
+#[non_exhaustive]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldReason {
+    /// A profiled level the bounded profile solve ended on its block's declared box
+    /// (#2112); [`FitResult::profiled_levels_at_bound`] lists the same levels.
+    ProfiledBound,
+    /// A free coordinate collapsed onto ferx's internal lower guard (#2797): an Ω or κ
+    /// diagonal or a σ at the floor of its log packing, or a θ on the internal 1e-10 floor
+    /// that replaces an undeclared lower bound. The same coordinates the
+    /// `parameter_at_runaway_guard` warning calls a collapse.
+    CollapsedAtGuard,
+}
+
+impl HeldReason {
+    /// The snake_case token the YAML and `.fitrx` outputs write.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldReason::ProfiledBound => "profiled_bound",
+            HeldReason::CollapsedAtGuard => "collapsed_at_guard",
+        }
+    }
+}
+
 /// Full fit result
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct FitResult {
@@ -9019,8 +9063,28 @@ pub struct FitResult {
     /// its bound: its row and column of `covariance_matrix` are zero, its `se_theta` is
     /// `0.0` and printed as not available, as a FIX θ's is, and every other standard error
     /// is conditional on it. Empty when no level sits on a bound.
+    ///
+    /// **Deprecated** in favour of [`Self::held_at_bound`], which lists these levels as
+    /// [`HeldReason::ProfiledBound`] entries alongside every other held coordinate. Still
+    /// filled, from the same source, for one release.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiled_levels_at_bound: Vec<usize>,
+    /// Every coordinate whose standard error is not available because it sits on a bound
+    /// (#2797), in packed order: the profiled levels on their declared box
+    /// ([`HeldReason::ProfiledBound`]) and the free coordinates collapsed on ferx's internal
+    /// guard ([`HeldReason::CollapsedAtGuard`]). Filled from the reported estimate, whether
+    /// or not the covariance step ran or succeeded.
+    ///
+    /// The list says "this SE is not available"; [`Self::cov_fixed`] says whether the step
+    /// held the coordinate, and so whether every other SE is conditional on it. A collapse
+    /// is held only when the step's `R` was clean (no eigenvalue floor, no `S` fallback):
+    /// otherwise the matrix and the SEs are the unconditional ones, the coordinate is not
+    /// marked in `cov_fixed`, and its stored `se_*` keeps the unconditional value. A held
+    /// coordinate's stored `se_*` is `0.0`, as a FIX parameter's is (never `NaN`, which
+    /// would break every consumer that sums or folds SEs). Display reads this list, not the
+    /// number.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_at_bound: Vec<HeldAtBound>,
 }
 
 /// Free-parameter counts by Delattre et al. (2014) class, plus the record count
@@ -9110,9 +9174,17 @@ pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize
 /// [`omega_se_at`] over a borrowed SE slice, for a caller holding the packed
 /// vector without its `Option<Vec<_>>` (`OmegaRowsInput`, #1859).
 pub(crate) fn omega_se_at_in(se: &[f64], n_eta: usize, i: usize, j: usize) -> Option<f64> {
+    se.get(omega_se_slot(se.len(), n_eta, i, j)?).copied()
+}
+
+/// The position of Ω element `(i, j)` in an `se_omega` vector of length `len`, or `None`
+/// when that layout has no slot for it. The one reading of the layout, shared by the
+/// lookup ([`omega_se_at_in`]) and the writer that zeroes a held variance's SE
+/// (`apply_held_at_bound`, #2797), so the two cannot disagree on a block Ω.
+pub(crate) fn omega_se_slot(len: usize, n_eta: usize, i: usize, j: usize) -> Option<usize> {
     let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
     let n_lt = crate::estimation::parameterization::omega_packed_len(n_eta, false);
-    if se.len() == n_lt && n_lt != n_eta {
+    if len == n_lt && n_lt != n_eta {
         // Full lower-triangle format (block omega). The packed index is the
         // shared column-major `chol_lt_idx` (same convention as `pack_params`).
         //
@@ -9124,21 +9196,10 @@ pub(crate) fn omega_se_at_in(se: &[f64], n_eta: usize, i: usize, j: usize) -> Op
         // answer. This is only reachable by an external caller: every in-repo
         // caller loops `i,j < n_eta`, so the guard is inert internally. The
         // guard also keeps `chol_lt_idx`'s `debug_assert!(i < n)` from firing.
-        if r < n_eta {
-            se.get(crate::estimation::parameterization::chol_lt_idx(
-                r, c, n_eta,
-            ))
-            .copied()
-        } else {
-            None
-        }
+        (r < n_eta).then(|| crate::estimation::parameterization::chol_lt_idx(r, c, n_eta))
     } else {
         // Diagonal-only format: only (i, i) is available.
-        if r == c {
-            se.get(r).copied()
-        } else {
-            None
-        }
+        (r == c).then_some(r)
     }
 }
 
