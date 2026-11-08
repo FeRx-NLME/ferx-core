@@ -1076,10 +1076,15 @@ fn snapped_integer(q: f64) -> Option<f64> {
 /// `ceil(lo / s)` and `floor(hi / s)`, each after snapping a quotient within
 /// [`GRID_SNAP`] of an integer onto it, so `0.3 / 0.1` floors to 3, not 2 (#944 audit 1
 /// row 12). The interval holds no multiple when the first exceeds the second.
+///
+/// A positive low never snaps to index 0: 0 is not inside `[lo, hi]`, however small
+/// `lo / s` is, so the lowest multiple is at least one step (`lo = 1e-6` at `s = 1000`
+/// aligns to 1000; #2805 review r1 row 1). Only a low of exactly 0 has index 0.
 fn grid_index_bounds(lo: f64, hi: f64, s: f64) -> (f64, f64) {
     let (ql, qh) = (lo / s, hi / s);
+    let kl = snapped_integer(ql).unwrap_or_else(|| ql.ceil());
     (
-        snapped_integer(ql).unwrap_or_else(|| ql.ceil()),
+        if lo > 0.0 { kl.max(1.0) } else { kl },
         snapped_integer(qh).unwrap_or_else(|| qh.floor()),
     )
 }
@@ -1114,10 +1119,9 @@ impl DoseGrid {
             return None;
         }
         // Each multiple kept inside `[lo, hi]`: a snapped multiple can miss its bound by an
-        // ulp either way. `kl <= kh`, so only a bound within the snap of one shared
-        // multiple can then put `high` below `low`; both stand for that multiple.
+        // ulp either way. The clamp is monotone and `kl <= kh`, so `low <= high`.
         let low = (kl * step).clamp(lo, hi);
-        let high = (kh * step).clamp(lo, hi).max(low);
+        let high = (kh * step).clamp(lo, hi);
         Some(Self { step, low, high })
     }
 
@@ -1460,16 +1464,20 @@ impl AdaptiveDosingSpec {
     /// invalid one, which `validate` refuses first (P3).
     pub(crate) fn grid_rule(&self) -> Option<GridRule> {
         let step = self.round_to.filter(|s| s.is_finite() && *s > 0.0)?;
-        let percent_steps = self.rules.iter().any(|r| {
+        Some(GridRule {
+            step,
+            percent_steps: self.has_percent_steps(),
+        })
+    }
+
+    /// Whether a rule takes a percentage dose step (`increase N%` / `decrease N%`).
+    fn has_percent_steps(&self) -> bool {
+        self.rules.iter().any(|r| {
             matches!(
                 r.action,
                 AdaptiveAction::Increase(DoseStep::Percent(_))
                     | AdaptiveAction::Decrease(DoseStep::Percent(_))
             )
-        });
-        Some(GridRule {
-            step,
-            percent_steps,
         })
     }
 
@@ -1632,13 +1640,7 @@ impl AdaptiveDosingSpec {
             }
         }
         // Percentage vs one-level dose steps are mutually exclusive and tied to `levels`.
-        let has_percent = self.rules.iter().any(|r| {
-            matches!(
-                r.action,
-                AdaptiveAction::Increase(DoseStep::Percent(_))
-                    | AdaptiveAction::Decrease(DoseStep::Percent(_))
-            )
-        });
+        let has_percent = self.has_percent_steps();
         let has_level = self.rules.iter().any(|r| {
             matches!(
                 r.action,
@@ -1995,7 +1997,8 @@ mod tests {
     /// 0.3. The nudged half sends it up to 0.4 (#944 audit 1 row 12). `375` at `s = 250`
     /// is an exact tie and also goes up, and a value just below a tie still goes down.
     ///
-    /// Mutations: `(x / s).round() * s`; the nudge dropped; the nudge made absolute.
+    /// Mutations: `(x / s).round() * s`; the nudge dropped. (A nudge made absolute differs
+    /// only at `|x / s| >~ 1e7`, which no dose grid here reaches; it is not pinned.)
     #[test]
     fn round_to_grid_sends_ties_up_on_a_decimal_grid() {
         assert_eq!(
@@ -2146,6 +2149,39 @@ mod tests {
         let mut hold_only = gridded(250.0, (0.0, 4000.0), 1000.0);
         hold_only.rules[0].action = AdaptiveAction::Hold;
         assert_eq!(hold_only.validate(), Ok(()));
+    }
+
+    /// V8 refuses a low of exactly 0, never a positive one, however small against the
+    /// step: `lo = 1e-6` at `s = 1000` (and `1e-7` at `s = 250`, both within the 1e-9
+    /// snap of 0) is lifted to one step, as the docs and the example promise, so a dose
+    /// cannot round to 0 (#2805 review r1 row 1). The straddle: `lo = 0` at the same step
+    /// is refused.
+    ///
+    /// Mutation: the low's quotient snapped to index 0 for a positive low (V8 refuses
+    /// `1e-6`, and the aligned low is `1e-6`, not 1000).
+    #[test]
+    fn a_tiny_positive_low_bound_is_lifted_to_one_step_not_refused() {
+        for (s, lo) in [(1000.0, 1e-6), (2000.0, 1e-6), (250.0, 1e-7)] {
+            assert_eq!(
+                gridded(s, (lo, 4000.0), 2000.0).validate(),
+                Ok(()),
+                "s = {s}, lo = {lo}"
+            );
+            let g = DoseGrid::new(s, (lo, 4000.0)).expect("grid");
+            assert_eq!(g.low.to_bits(), s.to_bits(), "s = {s}, lo = {lo}: {g:?}");
+            assert_eq!(g.place(1.0).to_bits(), s.to_bits(), "s = {s}, lo = {lo}");
+        }
+        let e = gridded(1000.0, (0.0, 4000.0), 2000.0)
+            .validate()
+            .unwrap_err();
+        assert!(
+            e.contains("dose_bounds low = 0 lets a dose round to 0"),
+            "{e}"
+        );
+        // A positive low with no positive multiple at or below the high is V7, not a
+        // grid that clamps every dose to the low.
+        let e = gridded(250.0, (1e-7, 100.0), 50.0).validate().unwrap_err();
+        assert!(e.contains("no multiple of round_to = 250"), "{e}");
     }
 
     /// V8 needs only the low bound: a numeric `0` low is refused when the block is parsed

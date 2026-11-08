@@ -279,6 +279,16 @@ rule that fired (`rule_fired`) and the unchanged `amt` — exactly the record a 
 clamped at a bound produces — and the metrics count it as neither an increase nor a
 decrease, since they count realized changes. There is no separate field for it.
 
+**A small step can be absorbed every time.** The rounded dose is carried, so a
+`p%` step moves a dose `d` only when it changes it by at least half a step
+(`d · p / 100 ≥ step / 2` on the way up; strictly more on the way down, since ties
+go up). Below that, the same rule fires
+at every decision and the dose never moves: with a step of 250, `increase 25%` from
+250 gives 312.5, which rounds back to 250, so a subject held at 250 stays there.
+Likewise, because ties go up, 500 `decrease 25%` gives 375, which rounds back to
+500. Choose the step and the percentages together so the lowest doses can still
+move, or check `rule_fired` against the realized `amt` in the ledger.
+
 `round_to` does not combine with `levels`: a ladder is already discrete, so write
 the rounded doses as the rungs. Without `round_to`, nothing changes: doses are clamped
 to `dose_bounds` only, as before.
@@ -292,10 +302,10 @@ the replicate, for an oracle subject):
 
 - **No multiple inside the bounds.** With `dose_bounds = [10 * WT, 12 * WT]` and a step
   of 250, a 20 kg subject's bounds are `[200, 240]`, which hold no multiple of 250.
-- **A low bound that aligns to 0, with percentage steps.** A dose could then round to
-  0, a dose of 0 is a hold, and a running dose of 0 cannot rise again under percentage
-  steps. Set the low bound above 0: any value up to the step is lifted to the step, so
-  `dose_bounds = [1e-6, …]` and `[250, …]` both give a lowest dose of 250. A block
+- **A low bound of 0, with percentage steps.** A dose could then round to 0, a dose
+  of 0 is a hold, and a running dose of 0 cannot rise again under percentage steps.
+  Set the low bound above 0: any positive value up to the step is lifted to the step,
+  so `dose_bounds = [1e-6, …]` and `[250, …]` both give a lowest dose of 250. A block
   whose rules take no percentage step is not refused.
 
 ```

@@ -101,6 +101,13 @@ impl AdaptiveController {
         // The start dose goes onto the grid by the same path as every step (#944). A
         // plan that passed `dose_plan_violation` has a grid whenever `round_to` is set.
         let grid = spec.dose_grid(plan.dose_bounds);
+        // V7 refuses bounds with no multiple before any subject runs; without it a set
+        // `round_to` would fall back to the unrounded clamp here, silently.
+        debug_assert!(
+            spec.round_to.is_none() || grid.is_some(),
+            "round_to is set but dose_bounds {:?} hold no multiple of it (V7 not checked)",
+            plan.dose_bounds
+        );
         let dose = grid.map_or(plan.start_dose, |g| g.place(plan.start_dose));
         Self {
             route: spec.route.clone(),
