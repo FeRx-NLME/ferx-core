@@ -1389,30 +1389,51 @@ fn discover_levels(decl: &LevelBlockDecl, population: &Population) -> Result<Vec
 }
 
 /// The refusal for a block [`discover_levels`] found no level of. Every Gaussian
-/// observation defines a level, so there are none; when the data still carries
-/// discrete-state records, none of them is on an endpoint that reads the block through
-/// its implicit index ([`LevelBlockDecl::record_cmts`]) (#2623). Why depends on whether
-/// any expression reads the block bare ([`LevelBlockDecl::read_bare`]): if none does,
-/// nothing reads it at all, since the parse refuses a subscripted `NAME[COLUMN]` read
-/// (#2744); if one does, its reader defines no level on this data — a level-defining
-/// endpoint with no records here, or only a Gaussian prediction, a CTMM generator or a
-/// TTE hazard.
+/// observation defines a level, so there are none. When the data carries no record of any
+/// kind either, it has no observation rows, and the refusal says that. Otherwise it names
+/// each record kind present and why it defined no level: a discrete-state record is on no
+/// endpoint that reads the block through its implicit index
+/// ([`LevelBlockDecl::record_cmts`]) (#2623), while a time-to-event or count record never
+/// defines one (#2751). Then why, which depends on whether any expression reads the block
+/// bare ([`LevelBlockDecl::read_bare`]): if none does, nothing reads it at all, since the
+/// parse refuses a subscripted `NAME[COLUMN]` read (#2744); if one does, its reader defines
+/// no level on this data — a level-defining endpoint with no records here, or only a
+/// Gaussian prediction, a CTMM generator or a TTE hazard.
 fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     let name = decl.name();
     let head = format!("theta {name}[{}]", decl.columns().join(", "));
-    let has_records = population.subjects.iter().any(|s| {
-        s.obs_records
+    let any = |kind: fn(&ObsRecord) -> bool| {
+        population
+            .subjects
             .iter()
-            .any(|r| matches!(r, ObsRecord::DiscreteState { .. }))
-    });
-    if !has_records {
+            .any(|s| s.obs_records.iter().any(kind))
+    };
+    let discrete = any(|r| matches!(r, ObsRecord::DiscreteState { .. }));
+    #[cfg(feature = "survival")]
+    let events = any(|r| matches!(r, ObsRecord::Event { .. }));
+    #[cfg(not(feature = "survival"))]
+    let events = false;
+    let counts = any(|r| matches!(r, ObsRecord::Count { .. }));
+    if !(discrete || events || counts) {
         return format!("{head}: the data carries no observation rows, so the block has no levels");
     }
-    let mut message = format!(
-        "{head}: the block has no levels. The data carries no Gaussian observation rows, and \
-         none of its discrete-state records is on an endpoint whose expression reads the block \
-         through its implicit index."
-    );
+    let mut message =
+        format!("{head}: the block has no levels. The data carries no Gaussian observation rows");
+    if discrete {
+        message.push_str(
+            ", and none of its discrete-state records is on an endpoint whose expression reads \
+             the block through its implicit index",
+        );
+    }
+    if events {
+        message.push_str(", and its time-to-event records define no level");
+    }
+    if counts {
+        message.push_str(
+            ", and its count records define no level, since no endpoint scores a count record",
+        );
+    }
+    message.push('.');
     if !decl.read_bare {
         // A subscripted read is refused at parse (#2744), so here nothing reads the block.
         message.push_str(&format!(
@@ -1432,9 +1453,16 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
              CTMM generator or an `[event_model]` hazard, and none of them defines a level on \
              this data: it has no Gaussian rows, a CTMM generator is built once per subject \
              from the baseline, and one time-to-event row can yield zero or two records, so \
-             neither kind of record defines a level. Read the block in a `[binary_model]` \
-             predictor or a DTMM `[markov_model]` transition.",
+             neither kind of record defines a level.",
         );
+        message.push_str(if discrete {
+            " Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` \
+             transition."
+        } else {
+            " Only Gaussian rows and the discrete-state records of a `[binary_model]` or DTMM \
+             `[markov_model]` endpoint define a level, and this data has neither, so it cannot \
+             estimate the block."
+        });
     }
     message
 }
