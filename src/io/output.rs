@@ -156,6 +156,19 @@ fn final_gradient_line(result: &FitResult) -> Option<String> {
     ))
 }
 
+/// The `Status:` line (#2799): [`FitResult::status`]'s label, then its reason labels in
+/// parentheses when there are any. Printed by `print_results` and `format_summary` after the
+/// `Final gradient:` line, which #1934 pins directly under `Converged:`.
+pub(crate) fn status_line(result: &FitResult) -> String {
+    let status = result.status();
+    let reasons: Vec<String> = status.reasons().iter().map(|r| r.label()).collect();
+    if reasons.is_empty() {
+        format!("Status:     {}", status.label())
+    } else {
+        format!("Status:     {} ({})", status.label(), reasons.join(", "))
+    }
+}
+
 /// SD from a variance: `sqrt(var)`, or `0` for a non-positive variance.
 fn sd_from_var(var: f64) -> f64 {
     if var > 0.0 {
@@ -1371,6 +1384,7 @@ pub fn print_results(result: &FitResult) {
     if let Some(line) = final_gradient_line(result) {
         eprintln!("{line}");
     }
+    eprintln!("{}", status_line(result));
     if result.method_chain.len() > 1 {
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
         eprintln!("Estimation chain:  {}", chain.join(" → "));
@@ -1694,6 +1708,7 @@ pub fn format_summary(result: &FitResult) -> String {
     if let Some(line) = final_gradient_line(result) {
         let _ = writeln!(out, "{line}");
     }
+    let _ = writeln!(out, "{}", status_line(result));
     let _ = writeln!(out, "Iterations: {}", result.n_iterations);
     let _ = writeln!(
         out,
@@ -3004,6 +3019,17 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if let Some(stop) = &result.optimizer_stop {
         writeln!(f, "  optimizer_stop: {stop}").map_err(|e| e.to_string())?;
     }
+    // #2799: the usability verdict beside `converged`, always present. The reasons are
+    // JSON-quoted, as in `warnings:` below: a collapse label carries parameter names.
+    let status = result.status();
+    writeln!(f, "  status: {}", status.token()).map_err(|e| e.to_string())?;
+    let reasons = status
+        .reasons()
+        .iter()
+        .map(|r| serde_json::to_string(&r.label()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    writeln!(f, "  status_reasons: [{}]", reasons.join(", ")).map_err(|e| e.to_string())?;
     writeln!(f, "  method: {}", result.method.label()).map_err(|e| e.to_string())?;
     if result.method_chain.len() > 1 {
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
@@ -4507,6 +4533,100 @@ mod tests {
         r.final_gradient_source = None;
         let s = format_summary(&r);
         assert!(!s.contains("Final gradient"), "{s}");
+    }
+
+    /// #2799: three results, one per status, with the reason sets the classifier gives.
+    fn status_cases() -> Vec<(&'static str, FitResult)> {
+        use crate::types::{classify_warning, HeldAtBound, HeldReason, ParameterKind};
+        let base = || {
+            let mut r = comprehensive_result();
+            r.warnings.clear();
+            r.warnings_structured.clear();
+            r.held_at_bound.clear();
+            r.eval_budget_spent = false;
+            r.evaluation_only = false;
+            r.covariance_status = crate::types::CovarianceStatus::Computed;
+            r
+        };
+        let mut converged = base();
+        converged.converged = true;
+        // Bill's shape (#2799 plan row 7): converged, step failed, a collapse it did not hold.
+        let mut issues = base();
+        issues.converged = true;
+        issues.covariance_status = crate::types::CovarianceStatus::Failed;
+        issues.cov_fixed.clear();
+        issues.held_at_bound = vec![HeldAtBound {
+            name: "ETA_STUDY".into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index: 3,
+            reason: HeldReason::CollapsedAtGuard,
+        }];
+        let w = "Covariance step failed: Hessian is not positive definite".to_string();
+        issues.warnings_structured = vec![classify_warning(&w)];
+        issues.warnings = vec![w];
+        let mut eval = base();
+        eval.converged = false;
+        eval.evaluation_only = true;
+        vec![
+            ("converged", converged),
+            ("issues", issues),
+            ("evaluation only", eval),
+        ]
+    }
+
+    /// #2799: `ferx summary` prints the `Status:` line, after `Final gradient:` (whose
+    /// adjacency to `Converged:` #1934 pins) and before `Iterations:`, one case per status:
+    /// no parentheses on an empty list, the reasons in order otherwise. `print_results` shares
+    /// `status_line`. Mutation: drop the line from `format_summary` → every case.
+    #[test]
+    fn format_summary_prints_the_status_line() {
+        let want = [
+            "Status:     CONVERGED\n",
+            "Status:     CONVERGED WITH ISSUES (covariance_failed, collapsed_at_guard: ETA_STUDY)\n",
+            "Status:     NOT CONVERGED (evaluation_only)\n",
+        ];
+        for ((name, mut r), line) in status_cases().into_iter().zip(want) {
+            r.final_gradient = Some(vec![1.0e-3]);
+            r.final_gradient_source = Some("optimizer".into());
+            let s = format_summary(&r);
+            assert!(s.contains(line), "{name}: {s}");
+            assert!(!s.contains("()"), "{name}: {s}");
+            let at = |needle: &str| s.find(needle).unwrap_or_else(|| panic!("{needle}: {s}"));
+            assert!(
+                at("Final gradient:") < at("Status:") && at("Status:") < at("Iterations:"),
+                "{name}: {s}"
+            );
+        }
+    }
+
+    /// #2799: the fit YAML writes `status:` and `status_reasons:` in the `model:` block,
+    /// always, one case per status (`[]` on an empty list). Mutation: drop either line → every
+    /// case.
+    #[test]
+    fn estimates_yaml_writes_status_and_reasons() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let want = [
+            ("converged", "[]"),
+            (
+                "converged_with_issues",
+                r#"["covariance_failed", "collapsed_at_guard: ETA_STUDY"]"#,
+            ),
+            ("not_converged", r#"["evaluation_only"]"#),
+        ];
+        for ((name, r), (token, reasons)) in status_cases().into_iter().zip(want) {
+            let path = dir.path().join(format!("{token}.yaml"));
+            write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+            let yaml = std::fs::read_to_string(&path).expect("yaml read");
+            assert!(
+                yaml.contains(&format!("  status: {token}\n")),
+                "{name}: {yaml}"
+            );
+            assert!(
+                yaml.contains(&format!("  status_reasons: {reasons}\n")),
+                "{name}: {yaml}"
+            );
+        }
     }
 
     /// #2785: the fit YAML records the Newton decrement and the NLopt stop state in the

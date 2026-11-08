@@ -9169,6 +9169,12 @@ impl FitResult {
                 "schema_version".to_string(),
                 serde_json::json!(Self::JSON_SCHEMA_VERSION),
             );
+            // #2799: the derived usability verdict, as `schema_version` is derived: there is no
+            // stored field, so a reader gets it from the same facts the result carries.
+            map.insert(
+                "status".to_string(),
+                serde_json::to_value(self.status()).expect("FitStatus is serializable"),
+            );
         }
         v
     }
@@ -9181,7 +9187,8 @@ impl FitResult {
     /// `NaN` (an `Option<f64>` reads it as `None`). A plain
     /// `serde_json::from_str::<FitResult>` refuses such a file — any fit whose
     /// diagnostics came out undefined, e.g. `dw_statistic` when no subject has
-    /// two IWRES values. The `schema_version` key is ignored.
+    /// two IWRES values. The `schema_version` and `status` keys are ignored (the status is
+    /// recomputed from the fields by [`Self::status`]).
     pub fn from_json_str(text: &str) -> Result<FitResult, serde_json::Error> {
         let value: serde_json::Value = serde_json::from_str(text)?;
         serde::Deserialize::deserialize(crate::io::serde_nan::NullAsNan(value))

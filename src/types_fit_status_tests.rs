@@ -415,3 +415,28 @@ fn status_reason_labels_are_pinned() {
     assert_eq!(labels, ["collapsed_at_guard: ETA_STUDY"]);
     assert!(!labels[0].contains("ETA_KA"), "{labels:?}");
 }
+
+/// The JSON writer carries the derived `status` key in serde form, and the reader ignores it:
+/// a round trip gives back a result whose recomputed status is the same. Mutation: drop the
+/// key from `to_json_value` → the first assertion.
+#[test]
+fn json_value_carries_status_and_round_trips() {
+    let mut r = cell(false, Guard::F, false);
+    r.converged = true;
+    let v = r.to_json_value();
+    assert_eq!(
+        v["status"],
+        serde_json::json!({"converged_with_issues": {"reasons": [
+            "covariance_failed",
+            {"collapsed_at_guard": {"parameters": ["ETA_STUDY"]}}
+        ]}})
+    );
+    let back = FitResult::from_json_str(&v.to_string()).expect("round trip");
+    assert_eq!(back.status(), r.status());
+    let mut plain = cell(false, Guard::N, false);
+    plain.converged = true;
+    assert_eq!(
+        plain.to_json_value()["status"],
+        serde_json::json!("converged")
+    );
+}
