@@ -1,7 +1,7 @@
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
-    validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, DoseKnowledge, DoseStep, DoseValue, IntervalStep,
+    round_to_message, validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec,
+    AdaptiveRoute, AdaptiveRule, Comparison, DoseKnowledge, DoseStep, DoseValue, IntervalStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -11460,6 +11460,7 @@ fn parse_adaptive_dosing_block(
     let mut dose_bounds: Option<(DoseValue, DoseValue)> = None;
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<DoseValue>> = None;
+    let mut round_to: Option<f64> = None;
     let mut dose_knowledge = DoseKnowledge::Known;
     let mut intervals: Option<Vec<f64>> = None;
     let mut start_interval: Option<f64> = None;
@@ -11571,6 +11572,16 @@ fn parse_adaptive_dosing_block(
                 }
                 levels = Some(l);
             }
+            "round_to" => {
+                // A positive grid step, the same for every subject (#944). Its pairing
+                // with `levels` and the bounds is checked by `validate`.
+                let s = val
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .ok_or_else(|| round_to_message(val))?;
+                round_to = Some(s);
+            }
             "dose_knowledge" => {
                 dose_knowledge = match val {
                     "known" => DoseKnowledge::Known,
@@ -11664,6 +11675,7 @@ fn parse_adaptive_dosing_block(
         dose_bounds,
         confirm,
         levels,
+        round_to,
         dose_knowledge,
         intervals,
         start_interval,

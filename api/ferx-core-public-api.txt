@@ -2264,6 +2264,7 @@ pub ferx_core::sim::adaptive::AdaptiveDosingSpec::intervals: core::option::Optio
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<ferx_core::sim::adaptive::DoseValue>>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::round_to: core::option::Option<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::start_dose: ferx_core::sim::adaptive::DoseValue
@@ -4368,6 +4369,7 @@ pub ferx_core::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::V
 pub ferx_core::AdaptiveDosingSpec::levels: core::option::Option<alloc::vec::Vec<ferx_core::sim::adaptive::DoseValue>>
 pub ferx_core::AdaptiveDosingSpec::observe: core::option::Option<alloc::string::String>
 pub ferx_core::AdaptiveDosingSpec::observe_declared_covariates: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::AdaptiveDosingSpec::round_to: core::option::Option<f64>
 pub ferx_core::AdaptiveDosingSpec::route: ferx_core::sim::adaptive::AdaptiveRoute
 pub ferx_core::AdaptiveDosingSpec::rules: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveRule>
 pub ferx_core::AdaptiveDosingSpec::start_dose: ferx_core::sim::adaptive::DoseValue
