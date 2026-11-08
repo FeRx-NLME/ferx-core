@@ -333,6 +333,11 @@ when the list is empty. A bundle written before the field existed carries only
 `profiled_levels_at_bound`; on load those levels become `profiled_bound` entries, so
 old and new bundles read the same way.
 
+A `reason` the reading build does not know — one a later ferx added — loads as
+`unknown` instead of failing the bundle (#2817). The entry still counts as held, so
+its standard error shows as `N/A`. Re-saving writes it back as `unknown`; the original
+token is not kept. The same holds when a `FitResult` JSON file is read.
+
 #### Engine results
 
 `bayes`, `importance_sampling`, `impmap_trace` and `exclusions` hold the

@@ -8300,6 +8300,13 @@ pub enum HeldReason {
     /// that replaces an undeclared lower bound. The same coordinates the
     /// `parameter_at_runaway_guard` warning calls a collapse.
     CollapsedAtGuard,
+    /// A reason this build does not know (#2817): read from a `.fitrx` bundle or
+    /// `FitResult` JSON written by a later ferx that added one. ferx never produces it.
+    /// The entry still counts as held, so its SE displays as not available; it is
+    /// neither a profiled bound nor a guard collapse, so nothing that acts on either
+    /// treats it as one. Written back as `"unknown"` — the original token is not kept.
+    #[serde(other)]
+    Unknown,
 }
 
 impl HeldReason {
@@ -8308,6 +8315,7 @@ impl HeldReason {
         match self {
             HeldReason::ProfiledBound => "profiled_bound",
             HeldReason::CollapsedAtGuard => "collapsed_at_guard",
+            HeldReason::Unknown => "unknown",
         }
     }
 }

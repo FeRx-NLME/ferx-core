@@ -2726,6 +2726,7 @@ pub fn ferx_core::HazardSpec::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> co
 #[non_exhaustive] pub enum ferx_core::types::HeldReason
 pub ferx_core::types::HeldReason::CollapsedAtGuard
 pub ferx_core::types::HeldReason::ProfiledBound
+pub ferx_core::types::HeldReason::Unknown
 impl ferx_core::HeldReason
 pub fn ferx_core::HeldReason::as_str(self) -> &'static str
 pub enum ferx_core::types::HessianAnchor
@@ -4172,6 +4173,7 @@ pub fn ferx_core::HazardSpec::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> co
 #[non_exhaustive] pub enum ferx_core::HeldReason
 pub ferx_core::HeldReason::CollapsedAtGuard
 pub ferx_core::HeldReason::ProfiledBound
+pub ferx_core::HeldReason::Unknown
 impl ferx_core::HeldReason
 pub fn ferx_core::HeldReason::as_str(self) -> &'static str
 pub enum ferx_core::HessianAnchor

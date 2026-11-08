@@ -4963,6 +4963,124 @@ mod tests {
         assert_eq!(loaded.profiled_levels_at_bound, [0, 2]);
     }
 
+    /// The held-at-bound fixture for #2817: θ `V` (index 1) collapsed on the guard and θ
+    /// `KA` (index 2) a profiled level, so a reader that mishandles one entry cannot pass
+    /// on the strength of the other.
+    fn two_held_thetas() -> FitResult {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let mut r = minimal_fit_result();
+        r.held_at_bound = vec![
+            HeldAtBound {
+                name: "V".into(),
+                kind: ParameterKind::Theta,
+                index: 1,
+                packed_index: 1,
+                reason: HeldReason::CollapsedAtGuard,
+            },
+            HeldAtBound {
+                name: "KA".into(),
+                kind: ParameterKind::Theta,
+                index: 2,
+                packed_index: 2,
+                reason: HeldReason::ProfiledBound,
+            },
+        ];
+        r
+    }
+
+    /// Rename the reason of `held_at_bound[0]` in a fit JSON value to one no build knows.
+    fn inject_future_reason(v: &mut serde_json::Value) {
+        assert_eq!(v["held_at_bound"][0]["reason"], "collapsed_at_guard", "{v}");
+        v["held_at_bound"][0]["reason"] = "some_future_reason".into();
+    }
+
+    /// #2817: a bundle whose `held_at_bound` names a reason this build does not know — as a
+    /// later ferx that added one would write — loads, rather than failing the whole
+    /// `load_fit`. The unknown entry reads as `HeldReason::Unknown` and still counts as
+    /// held (SE `N/A`, YAML `se: ~`); the neighbouring known entry and the not-held θ are
+    /// untouched. Under the strict derive (no `#[serde(other)]`) `load_fit` returns `Err`
+    /// and the first `unwrap` fails.
+    #[test]
+    fn a_bundle_with_an_unknown_held_reason_loads_and_the_entry_stays_held() {
+        use crate::io::output::{se_held, write_estimates_yaml};
+        use crate::types::{HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let r = two_held_thetas();
+        let src = dir.path().join("known.fitrx");
+        save_fit(&r, &p, "model source\n", &src, SaveFitOptions::default()).unwrap();
+        let dst = dir.path().join("future.fitrx");
+        rewrite_bundle(&src, &dst, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, inject_future_reason)
+            } else {
+                body
+            })
+        });
+        assert_eq!(
+            fit_json(&dst)["held_at_bound"][0]["reason"],
+            "some_future_reason"
+        );
+
+        let loaded = load_fit(&dst)
+            .expect("an unknown held reason must not fail the bundle")
+            .fit;
+        let reasons: Vec<HeldReason> = loaded.held_at_bound.iter().map(|h| h.reason).collect();
+        assert_eq!(reasons, [HeldReason::Unknown, HeldReason::ProfiledBound]);
+        assert_eq!(loaded.held_at_bound[0].name, "V");
+        assert_eq!(loaded.held_at_bound[0].packed_index, 1);
+
+        // Displays: held, so no SE — and the not-held θ keeps its number.
+        assert_eq!(
+            se_held(&loaded, ParameterKind::Theta, 1),
+            Some(HeldReason::Unknown)
+        );
+        assert_eq!(se_held(&loaded, ParameterKind::Theta, 0), None);
+        let yaml_path = dir.path().join("est.yaml");
+        write_estimates_yaml(&loaded, yaml_path.to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            yaml.contains(
+                "  V:\n    estimate: 2.000000\n    se: ~\n    rse_pct: ~\n    held: unknown\n"
+            ),
+            "{yaml}"
+        );
+        assert!(yaml.contains("    se: 0.010000\n"), "{yaml}");
+    }
+
+    /// #2817: the same unknown reason through `FitResult::from_json_str` (the
+    /// `--output-format json` reader), and the plain serde read of that file — which the
+    /// strict derive would refuse.
+    #[test]
+    fn fit_result_json_with_an_unknown_held_reason_reads_back() {
+        use crate::types::HeldReason;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fit.json");
+        crate::io::output::write_result_json(&two_held_thetas(), path.to_str().unwrap()).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        inject_future_reason(&mut v);
+        let text = serde_json::to_string(&v).unwrap();
+
+        let back = FitResult::from_json_str(&text)
+            .expect("an unknown held reason must not fail the FitResult JSON");
+        let reasons: Vec<HeldReason> = back.held_at_bound.iter().map(|h| h.reason).collect();
+        assert_eq!(reasons, [HeldReason::Unknown, HeldReason::ProfiledBound]);
+
+        let reason: HeldReason = serde_json::from_str("\"some_future_reason\"").unwrap();
+        assert_eq!(reason, HeldReason::Unknown);
+        // Known tokens are unaffected, and `Unknown` writes the token it reads back from.
+        for r in [
+            HeldReason::ProfiledBound,
+            HeldReason::CollapsedAtGuard,
+            HeldReason::Unknown,
+        ] {
+            let tok = serde_json::to_string(&r).unwrap();
+            assert_eq!(tok, format!("\"{}\"", r.as_str()));
+            assert_eq!(serde_json::from_str::<HeldReason>(&tok).unwrap(), r);
+        }
+    }
+
     /// `final_gradient_source` has to survive the checkpoint alongside the vector
     /// it labels (#997 §1). A bundle that kept the gradient and dropped the label
     /// is worse than one that kept neither: the reader then has a plausible vector
