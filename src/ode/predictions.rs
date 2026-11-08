@@ -4362,12 +4362,16 @@ pub fn ode_predictions(
     eta: &[f64],
     subject: &Subject,
 ) -> Vec<f64> {
+    // A compartment on/off record (#2732) stops a dose's input at the row: the engine
+    // honours the rows and reads that from `DoseEvent::off_at`, which the stored subject
+    // never carries, so the cutoffs are set here (borrowed, unchanged, without a row). Not
+    // in the engine, whose adaptive verifier passes its own cutoffs (#2753 review r1 #4).
     ode_predictions_with_extra_breaks_and_stats(
         ode,
         pk_params_flat,
         theta,
         eta,
-        subject,
+        &subject.with_cmt_cutoffs(),
         &[],
         None,
         &[],
@@ -4402,12 +4406,13 @@ pub(crate) fn ode_predictions_and_chz(
     subject: &Subject,
     chz_times: &[f64],
 ) -> (Vec<f64>, Vec<Vec<f64>>) {
+    // Cutoffs as in [`ode_predictions`].
     ode_predictions_with_extra_breaks_and_stats(
         ode,
         pk_params_flat,
         theta,
         eta,
-        subject,
+        &subject.with_cmt_cutoffs(),
         &[],
         None,
         chz_times,
@@ -4430,12 +4435,13 @@ pub fn ode_predictions_with_solver_stats(
     subject: &Subject,
 ) -> (Vec<f64>, OdeSolverStats) {
     let mut stats = OdeSolverStats::default();
+    // Cutoffs as in [`ode_predictions`].
     let (predictions, _chz) = ode_predictions_with_extra_breaks_and_stats(
         ode,
         pk_params_flat,
         theta,
         eta,
-        subject,
+        &subject.with_cmt_cutoffs(),
         &[],
         Some(&mut stats),
         &[],
@@ -4894,7 +4900,8 @@ fn ode_predictions_with_extra_breaks_and_stats(
     fill_prestart_states(chz_times, &mut chz_states, break_times.first().copied(), &u);
 
     // Compartments currently off (#2753), empty and never touched for a subject with no
-    // on/off record. The caller sets the doses' `off_at` (`verify_adaptive_frozen_replay`).
+    // on/off record. The caller sets the doses' `off_at`: the public wrappers from
+    // `with_cmt_cutoffs`, `verify_adaptive_frozen_replay` with each ledger dose's own.
     let mut off_states: Vec<usize> = Vec::new();
 
     // Most-recent system-reset time; `NEG_INFINITY` until the first reset is

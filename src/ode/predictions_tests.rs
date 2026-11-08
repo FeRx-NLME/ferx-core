@@ -17509,3 +17509,51 @@ fn adaptive_driver_orders_a_one_ulp_tie_by_time() {
         "row listed after the dose: {after:?} vs {wiped:?}"
     );
 }
+
+/// The public `ode_predictions` stops a recorded infusion at an off row on its compartment,
+/// and it does not resume at the on row (#2753 review r1 #4). The wrapper sets the cutoffs
+/// itself, so a stored subject (whose `off_at` is `+∞`) is enough. Without that, the
+/// engine would hold `depot` at zero while off and then let the infusion resume at the on
+/// row at 4: half the rule. Same closed form as the controller-infusion test above.
+#[test]
+fn public_ode_predictions_stops_an_infusion_at_an_off_row() {
+    let ode = one_cpt_oral_ode_spec();
+    let pk = pk_tog();
+    let obs = vec![2.0, 5.0, 10.0];
+    let s = with_toggles(
+        make_subject(
+            vec![DoseEvent::new(0.0, 400.0, 1, 50.0, false, 0.0)],
+            obs.clone(),
+        ),
+        &[(3.0, 0, false), (4.0, 0, true)],
+    );
+    let (ka, k, r) = (TOG_KA, TOG_CL / TOG_V, 50.0);
+    let central_in =
+        |t: f64| r / k * (1.0 - (-k * t).exp()) - r / (ka - k) * ((-k * t).exp() - (-ka * t).exp());
+    let want: Vec<f64> = obs
+        .iter()
+        .map(|&t| {
+            if t <= 3.0 {
+                central_in(t)
+            } else {
+                central_in(3.0) * (-k * (t - 3.0)).exp()
+            }
+        })
+        .collect();
+    for (name, got) in [
+        (
+            "ode_predictions",
+            ode_predictions(&ode, &pk.values, &[], &[], &s),
+        ),
+        (
+            "ode_predictions_with_solver_stats",
+            ode_predictions_with_solver_stats(&ode, &pk.values, &[], &[], &s).0,
+        ),
+    ] {
+        let worst = worst_rel(&got, &want);
+        assert!(
+            worst < TOG_TOL,
+            "{name}: worst rel {worst:e}: {got:?} vs {want:?}"
+        );
+    }
+}
