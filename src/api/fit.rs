@@ -2445,30 +2445,19 @@ fn fit_inner(
 
     result.warnings = accumulated_warnings;
 
-    // Thread efficiency warnings (post-chain, uses n_threads_used captured above).
-    let n_subjects = population.subjects.len();
-    if n_subjects > 0 && n_threads_used > n_subjects {
-        // `threads = 0` is not a valid Rayon pool size, so for n_subjects = 1
-        // we still suggest a 1-thread pool.
-        let suggested = n_subjects.max(1);
-        result.warnings.push(format!(
-            "{} threads configured but only {} subject(s) — consider threads = {} to reduce \
-             scheduling overhead (no speed benefit beyond n_subjects)",
-            n_threads_used, n_subjects, suggested
+    // Thread warnings (post-chain, uses n_threads_used captured above): where the count
+    // came from, an unusable `RAYON_NUM_THREADS`, oversubscribed cores (#2800, #1811), and
+    // more workers than subjects.
+    {
+        let resolved = super::pool::fit_thread_resolution(options.threads);
+        result.warnings.extend(super::pool::thread_warnings(
+            n_threads_used,
+            resolved.source,
+            resolved.env_ignored.as_deref(),
+            super::pool::available_cpus(),
+            population.subjects.len(),
+            chain.iter().any(|&m| m == EstimationMethod::Saem),
         ));
-    }
-    // SAEM-specific: MH scheduling has higher per-subject overhead than FOCE.
-    // Skip when n_subjects < 2 (n_subjects/2 = 0 is meaningless and the prior
-    // warning already covers the n_threads > n_subjects case).
-    if chain.iter().any(|&m| m == EstimationMethod::Saem) && n_subjects >= 2 {
-        let suggested = (n_subjects / 2).max(1);
-        if n_threads_used > suggested {
-            result.warnings.push(format!(
-                "SAEM with more threads than subjects/2 may be slower due to MH scheduling \
-                 overhead. Consider threads = {} for SAEM.",
-                suggested
-            ));
-        }
     }
 
     // Compute per-subject diagnostics. For a mixture (#985) each subject's

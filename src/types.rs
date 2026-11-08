@@ -8153,6 +8153,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("_max_time`") {
         // #2687: the fit stopped on its wall-clock limit, so `converged` is false.
         (WarningSeverity::Warning, WarningCode::Convergence)
+    } else if lower.contains("logical cpu(s) available")
+        || (lower.contains("rayon_num_threads") && lower.contains("was ignored"))
+    {
+        // #1811 / #2800: an explicit count oversubscribes the cores, or a set
+        // `RAYON_NUM_THREADS` could not be used — the user asked for something the
+        // fit did not (or could not usefully) do.
+        (WarningSeverity::Warning, WarningCode::Threads)
     } else if lower.contains("thread count overridden") {
         // #1416: a front end's explicit `--threads` beat the model file's
         // `[fit_options] threads`. A Warning, not Info, for the same reason the
@@ -9980,8 +9987,10 @@ pub struct FitOptions {
     pub mu_referencing: bool,
     /// Number of rayon worker threads used for the per-subject parallel loops
     /// (inner EBE search, SAEM MH steps, SIR weighting, likelihood reductions).
-    /// `None` or `Some(0)` uses available cores minus one, clamped to 1..8,
-    /// unless explicitly configured through `configure_global_thread_pool`.
+    /// `None` or `Some(0)` uses the engine default: the width declared through
+    /// `configure_global_thread_pool` if any, else a positive `RAYON_NUM_THREADS`
+    /// (used as given, read once per process — #2800), else available cores minus
+    /// one, at least two where two exist, capped at 8.
     /// `Some(n)` for positive `n` exclusively leases a pool of that width for
     /// this call. Idle pools are reused within a bounded cache; concurrent fits
     /// keep independent budgets even when their ODE overrides are identical.

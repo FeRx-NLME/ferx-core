@@ -531,9 +531,11 @@ fn work_outside_a_fit_runs_on_a_ferx_pool_of_the_requested_width() {
     // pool was never built at all, which no core count can fake.
     // Both routes to a pool are exercised, and which one a given width takes is a
     // property of the host: the shared default pool when it is already that wide (no new
-    // threads at all), a lease from `fit()`'s own cache otherwise. `default_thread_count()`
-    // is the first by construction and `+ 5` cannot be, on any machine.
-    for n in [default_thread_count(), default_thread_count() + 5, 3] {
+    // threads at all), a lease from `fit()`'s own cache otherwise.
+    // `effective_default_threads()` is the first by construction and `+ 5` cannot be,
+    // on any machine.
+    let shared = crate::api::effective_default_threads();
+    for n in [shared, shared + 5, 3] {
         let (index, width) = install_on_pool_sized(n, || {
             (rayon::current_thread_index(), rayon::current_num_threads())
         });
