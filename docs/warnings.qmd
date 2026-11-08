@@ -391,6 +391,10 @@ did. The `ode_method` named is the one stamped on the model by its own
 | `Warning` | The result stands but a caveat applies (autocorrelation, shrinkage, data quality). | Inspect; often iterate on error model, IIV structure, or data. |
 | `Info` | Informational note, no action implied. | Log; no action. |
 
+Every `Critical` code except `covariance_failed` also becomes a reason in the fit's
+[status](output.qmd#fit-status) (`FitResult::status()`); the covariance failure is
+read there from `covariance_status` instead.
+
 ## Warning codes {#warning-codes}
 
 Each `WarningCode` token, what it flags, and a typical response. The groups below

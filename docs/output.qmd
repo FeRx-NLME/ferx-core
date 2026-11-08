@@ -220,6 +220,8 @@ model:
   final_gradient_source: optimizer
   newton_decrement: 4.311000e-9
   optimizer_stop: Failure
+  status: converged_with_issues
+  status_reasons: ["covariance_failed", "collapsed_at_guard: ETA_KA"]
   method: FOCE
   covariance_method: r
 objective_function:
@@ -333,6 +335,10 @@ absent when there is nothing to list.
   …). `converged` is a verdict built on it, not a copy: a bare `Failure` at a
   plateau is converged, an `FtolReached` at a non-stationary point is not. Omitted
   for optimizers other than NLopt's (#2785).
+- **status** / **status_reasons**: the usability verdict beside `converged`
+  (`converged`, `converged_with_issues` or `not_converged`) and the reasons that
+  qualify it, always present (`[]` when there are none). See [Fit
+  status](#fit-status) (#2799).
 - **ofv**: Objective Function Value (-2 log-likelihood)
 - **aic**: Akaike Information Criterion (OFV + 2p)
 - **bic**: Bayesian Information Criterion (OFV + p * ln(n), with n the number of
@@ -533,6 +539,48 @@ models. The `IWRES` column itself is unchanged.
 | `Computed` | Covariance step succeeded; SE values are valid |
 | `Failed` | Hessian was singular or inversion failed; SE fields are `None` |
 | `NotRequested` | `covariance = false` was set; SE fields are `None` |
+
+### Fit status
+
+`FitResult::status()` returns a `FitStatus`: one verdict on whether the fit can be
+used as it stands, read from facts the result already carries. It is computed
+when you ask for it, never stored, so it is current after `run_covariance` and
+available on a fit loaded from a `.fitrx` or JSON file. The console prints it as
+a `Status:` line after `Final gradient:`, the YAML writes `status:` and
+`status_reasons:`, and the JSON carries a derived `status` key (#2799).
+
+The rule:
+
+| `converged` | Reasons | Status |
+|---|---|---|
+| `false` | any | `NOT CONVERGED` (with its reasons, if any) |
+| `true` | none | `CONVERGED` |
+| `true` | at least one | `CONVERGED WITH ISSUES` |
+
+`converged` itself is unchanged. It still means the optimizer's stop was
+verified, and the status never rewrites it. Multi-start selection still reads
+`converged` and OFV, not the status.
+
+Each reason has one source, and they are listed in this order:
+
+| Reason | Source |
+|---|---|
+| `evaluation_only` | `evaluation_only`: no stage estimated. That is `maxiter = 0` on FOCE, FOCEI, Laplace/AGQ or pure Gauss–Newton (which read it as NONMEM's `MAXEVAL=0`), or a standalone `imp_eval_only` / `agq_eval_only` run |
+| `budget_spent` | `eval_budget_spent`: the outer optimizer used its whole evaluation budget. NLopt only, profiled or not |
+| a warning code, e.g. `condition_number` | each distinct code of a `Critical` [structured warning](warnings.qmd#severity), in order of first appearance. An earlier chain stage's counts. `covariance_failed` never appears here |
+| `covariance_failed` | `covariance_status` is `Failed` |
+| `collapsed_at_guard: ETA_KA, …` | a coordinate collapsed onto ferx's internal guard ([held parameters](estimation/parameterization.qmd#held-parameters)) that a covariance step ran on and did **not** hold, because the step failed, floored `R` or fell back to `S` |
+
+A collapse the step held (marked in `cov_fixed`) is not a reason: its SE is
+reported as not available and every other SE is conditional on it, which is a
+clean answer. Neither is a collapse with no covariance step, which leaves no
+`R` to judge it, nor a profiled level on its declared box. The guard warning
+still names those.
+
+So `maxiter = 0` prints `NOT CONVERGED (evaluation_only)` rather than a bare
+`NOT CONVERGED`. A converged fit whose covariance step failed beside an unheld
+collapse prints `CONVERGED WITH ISSUES (covariance_failed, collapsed_at_guard: ETA_KA)`:
+the optimizer stopped, and the point it stopped at needs a second look.
 
 ### Which covariance estimator produced these numbers {#covariance-estimator}
 

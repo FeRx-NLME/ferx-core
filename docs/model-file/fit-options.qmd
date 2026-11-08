@@ -1036,7 +1036,7 @@ warnings.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `n_starts` | `1` | Number of independent optimization runs. `1` disables multi-start (no behaviour change). When `> 1`, all starts run in parallel via rayon; the converged run with the lowest OFV is returned. Start 0 always uses the exact initial values from the model file. |
+| `n_starts` | `1` | Number of independent optimization runs. `1` disables multi-start (no behaviour change). When `> 1`, all starts run in parallel via rayon; the converged run with the lowest OFV is returned. Selection reads `converged`, not the [fit status](../output.qmd#fit-status): a start that is `CONVERGED WITH ISSUES` still ranks as converged. Start 0 always uses the exact initial values from the model file. |
 | `start_sigma` | `0.3` | Log-space perturbation applied to initial theta values for starts 1..n. Log-packed thetas are multiplied by `exp(N(0, start_sigma))`; thetas with negative lower bounds are shifted additively. |
 | `multi_start_seed` | `42` | RNG seed for the multi-start theta perturbations. Independent of `seed` (SAEM) so that changing the SAEM seed does not silently alter which perturbed starting points are used in FOCE multi-start runs. |
 
