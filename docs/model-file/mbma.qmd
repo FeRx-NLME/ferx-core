@@ -173,12 +173,12 @@ fits next to a profiled level block, and its refusals come first
 A positive Durbin–Watson warning ([`dw_autocorrelation`](../warnings.qmd#codes-residuals))
 on a compartment-free model suggests this line, `by` the grouping the model
 declares: its `iov_column` (which a single `level` also sets), or the innermost
-level's name when levels are nested. With no grouping declared, it asks you to
-declare one first. A model with compartments keeps the structural advice. The
-bundled `mbma_naproxen` model, whose arms are not declared, reads DW 1.08 and
-gets the no-grouping advice. Declaring the arms alone (`kappa K_E0` on `E0`, with
-`iov_column = ARM`) silences the warning, before any `correlation` line is
-added.
+level's name when levels are nested. With no grouping declared, it suggests the
+line `by` any data column that labels the group, and a `kappa` at that grouping
+as the alternative. A model with compartments keeps the structural advice. The
+bundled `mbma_naproxen` model, whose arms are not declared, gets the no-grouping
+advice; a `kappa` on `E0` at the arm (`iov_column = ARM`) can absorb the shared
+part before any `correlation` line is added.
 
 With few studies, do not read the OFV drop for `ρ` against a χ² distribution.
 On the 6-study `mbma_placebo` data, which the generator draws with no serial
