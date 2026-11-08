@@ -454,8 +454,9 @@ pub(crate) fn dw_advice(model: &CompiledModel, options: &FitOptions) -> DwAdvice
 /// #1285 precisely because nothing tested it), and deliberately the same for an
 /// ODE and a closed-form model (only a compartment-free one differs): it used
 /// to append " For ODE models, SDE process noise may also help." whenever
-/// `model.ode_spec` was present. `[diffusion]` is not that remedy. The EKF propagates the state covariance and never corrects the state
-/// mean with the observed data (#1285), so the fitted object is the
+/// `model.ode_spec` was present. `[diffusion]` is not that remedy. The EKF
+/// propagates the state covariance and never corrects the state mean with the
+/// observed data (#1285), so the fitted object is the
 /// deterministic ODE mean with an inflated residual variance: it re-weights the
 /// fit rather than supplying the missing dynamics the statistic is reporting.
 /// Measured on a 2-cpt population fitted as 1-cpt, one variable changed:
