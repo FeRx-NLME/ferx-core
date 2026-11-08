@@ -1111,9 +1111,10 @@ fn a_population_with_no_rows_still_says_so() {
 }
 
 /// Assert the bare-read refusal of review r1 #1 on `m`: the shared facts, then exactly
-/// one bare-read arm — `no_records` picks which — and never the "read it bare" advice,
-/// which would tell the user to do what they already did.
-fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool) {
+/// one bare-read arm — `no_records` picks which; in the non-definer arm `definable` (a
+/// discrete-state record off a CTMM, #2808) picks the advice — and never the "read it
+/// bare" advice, which would tell the user to do what they already did.
+fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool, definable: bool) {
     for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER] {
         assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
     }
@@ -1125,10 +1126,15 @@ fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool) {
             &[BARE_NO_RECORDS],
             &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE, BARE_NO_DEFINER_DATA],
         )
-    } else {
+    } else if definable {
         (
             &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
             &[BARE_NO_RECORDS, BARE_NO_DEFINER_DATA],
+        )
+    } else {
+        (
+            &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
+            &[BARE_NO_RECORDS, BARE_ADVICE],
         )
     };
     for sentence in want {
@@ -1168,7 +1174,7 @@ fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
     let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
         .expect_err("no Gaussian rows");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
-    assert_bare_read_refusal("y bare", &d.message, false);
+    assert_bare_read_refusal("y bare", &d.message, false, true);
 }
 
 /// Review r2 #5: a block read bare by an `[event_model]` hazard alone is read through its
@@ -1194,7 +1200,7 @@ fn a_hazard_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
     let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
         .expect_err("a hazard defines no levels");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
-    assert_bare_read_refusal("hazard bare", &d.message, false);
+    assert_bare_read_refusal("hazard bare", &d.message, false, true);
 }
 
 /// Review r1 #1, the Markov cells: a block read bare by a CTMM generator alone (whose
@@ -1225,7 +1231,8 @@ fn a_markov_bare_read_names_why_it_defines_no_level() {
     let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, ctmm, &mut pop)
         .expect_err("a CTMM defines no levels");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
-    assert_bare_read_refusal("ctmm bare", &d.message, false);
+    // #2808: its records are all on the CTMM, so no reader could define a level.
+    assert_bare_read_refusal("ctmm bare", &d.message, false, false);
 
     let dtmm = r"
 [parameters]
@@ -1255,7 +1262,7 @@ fn a_markov_bare_read_names_why_it_defines_no_level() {
     let mut pop = state_population();
     let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, dtmm, &mut pop)
         .expect_err("no record on CMT 1");
-    assert_bare_read_refusal("dtmm bare, records elsewhere", &d.message, true);
+    assert_bare_read_refusal("dtmm bare, records elsewhere", &d.message, true, true);
 }
 
 /// #2744: the subscripted read #2623 named in the binder's no-levels refusal is refused
@@ -1503,5 +1510,86 @@ fn tte_only_csv_is_not_called_rowless() {
         assert_eq!(m.contains(UNREAD), unread, "{label}: {m}");
         // Neither arm has a reader that could define a level on TTE-only data (r1 #1).
         assert!(m.contains(BARE_NO_DEFINER_DATA), "{label}: {m}");
+    }
+}
+
+/// #2808. A CTMM's state rows are discrete-state records, but no reader can make them
+/// define a level, and their CMT has no other endpoint. So on data whose discrete-state
+/// records are all on a CTMM, the refusal ends on the cannot-estimate sentence in the
+/// unread and the non-definer arms, never on the "read it in a `[binary_model]`" advice.
+/// The input space is data (CTMM-only, or CTMM plus one off-CTMM record) × read state
+/// (unread, bare by the CTMM alone, bare by a binary endpoint whose CMT has no record).
+/// Each pair of rows on the same model differs only by the off-CTMM record, so the two
+/// straddle the gate: the CTMM-only row asserts the cannot-estimate sentence and not the
+/// advice, the mixed row the reverse.
+///
+/// Mutations: gate on any discrete-state record (the pre-#2808 `discrete`) and every
+/// CTMM-only row fails; gate on none (always cannot-estimate) and every mixed row fails;
+/// stop the parse filling `ctmm_cmts` and the CTMM-only rows fail.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_records_define_no_level_cells() {
+    let ctmm = |read: &str| {
+        format!(
+            "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  \
+             theta TVL(-0.3, -5.0, 5.0)\n  theta PLACEBO[STUDY](0.0)\n[covariates]\n  \
+             STUDY categorical\n[markov_model]\n  type   = ctmm\n  cmt    = 5\n  \
+             states = [awake=0, asleep=1]\n  \
+             transition awake  -> asleep = exp(LQ01{ctmm_read})\n  \
+             transition asleep -> awake  = exp(LQ10)\n[binary_model]\n  cmt   = 1\n  \
+             logit = TVL{binary_read}\n",
+            ctmm_read = if read == "ctmm" { " + PLACEBO" } else { "" },
+            binary_read = if read == "binary" { " + PLACEBO" } else { "" },
+        )
+    };
+    for (read, reader) in [
+        ("none", Reader::Unread),
+        ("ctmm", Reader::NonDefiner),
+        ("binary", Reader::Definer),
+    ] {
+        let text = ctmm(read);
+        let parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{read}: {e}"));
+        assert_eq!(
+            parsed.model.theta_blocks().level_blocks()[0].ctmm_cmts,
+            [5],
+            "fixture precondition: the parse records the CTMM's CMT"
+        );
+        for mixed in [false, true] {
+            let cell = format!("read {read} × mixed {mixed}");
+            let mut pop = state_population();
+            if mixed {
+                // One off-CTMM discrete-state record, on a CMT no endpoint reads the block
+                // from, so it defines no level either and the refusal is still reached.
+                pop.subjects[0].obs_records.push(ObsRecord::DiscreteState {
+                    time: 9.0,
+                    raw_time: 9.0,
+                    state: 1,
+                    cmt: 3,
+                });
+            }
+            let mut parsed = parse_full_model(&text).unwrap();
+            let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+                .expect_err(&cell);
+            assert_eq!(d.code, "E_THETA_LEVEL_BINDING", "{cell}");
+            let m = &d.message;
+            for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER] {
+                assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
+            }
+            assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
+            let want: &[&str] = match (reader, mixed) {
+                (Reader::Unread, false) => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA],
+                (Reader::Unread, true) => &[UNREAD, READ_BARE],
+                (Reader::NonDefiner, false) => &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
+                (Reader::NonDefiner, true) => &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
+                (Reader::Definer, _) => &[BARE_NO_RECORDS],
+            };
+            for sentence in [UNREAD, READ_BARE].into_iter().chain(BARE_ANY) {
+                assert_eq!(
+                    m.contains(sentence),
+                    want.contains(&sentence),
+                    "{cell}: {sentence:?} in {m}"
+                );
+            }
+        }
     }
 }

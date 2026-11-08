@@ -7543,6 +7543,19 @@ pub fn parse_full_model_with(
     {
         decl.record_cmts = level_record_cmts(&model.endpoints, &decl.index_covariate);
     }
+    // #2808: the CMTs whose discrete-state records no reader can make define a level.
+    #[cfg(feature = "markov")]
+    {
+        let ctmm_cmts = model.ctmm_cmts();
+        for decl in model
+            .indiv_param_partials
+            .theta_blocks
+            .level_blocks
+            .iter_mut()
+        {
+            decl.ctmm_cmts.clone_from(&ctmm_cmts);
+        }
+    }
 
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
     // parsing) so that parameters used only in [event_model] are not falsely
@@ -19963,6 +19976,7 @@ fn parse_parameters(
                                 eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
                                 record_cmts: Vec::new(),
+                                ctmm_cmts: Vec::new(),
                                 read_bare: false,
                             });
                             (levels, theta_names, Some(index_covariate), columns)
@@ -24617,6 +24631,12 @@ pub struct LevelBlockDecl {
     /// CTMM generator is built once per subject from the baseline, and one time-to-event
     /// data row can yield zero or two records, so neither defines levels.
     pub(crate) record_cmts: Vec<usize>,
+    /// Set by the parse: the CMTs of the model's CTMM `[markov_model]` endpoints, sorted
+    /// (#2808). A discrete-state record there defines no level whatever reads the block,
+    /// and its CMT has no other endpoint, so the binder's no-levels refusal must not advise
+    /// reading the block in a `[binary_model]` or DTMM on data whose discrete-state records
+    /// are all there.
+    pub(crate) ctmm_cmts: Vec<usize>,
     /// Set by the parse: some expression reads this block bare, through
     /// `index_covariate` — the model's referenced covariates include it (#2623 review).
     /// Bare is the only way to read a data-driven block: the parse refuses a
