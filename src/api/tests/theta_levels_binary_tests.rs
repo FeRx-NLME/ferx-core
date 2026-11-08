@@ -1009,9 +1009,14 @@ const READ_BARE: &str = "a data-driven block is read bare, as `PLACEBO`; its ind
 const BARE_NO_DEFINER: &str = "The block is read bare, but only by a Gaussian prediction, a \
                                `[markov_model]` CTMM generator or an `[event_model]` hazard, and \
                                none of them defines a level on this data";
-const BARE_WHY: &str = "it has no Gaussian rows, a CTMM generator is built once per subject from \
-                        the baseline, and one time-to-event row can yield zero or two records, \
-                        so neither kind of record defines a level.";
+const BARE_WHY: &str = "a CTMM generator is built once per subject from the baseline, and one \
+                        time-to-event row can yield zero or two records, so neither kind of \
+                        record defines a level.";
+/// #2819: the reason for the Gaussian reader, given in the non-definer arm only when the
+/// advice follows. Each discriminator spans the colon, so it pins where the reason sits.
+const BARE_WHY_GAUSSIAN: &str = "this data: it has no Gaussian rows, a CTMM generator";
+/// #2819: … and dropped when the cannot-estimate sentence follows, which states it.
+const BARE_WHY_SHORT: &str = "this data: a CTMM generator";
 const BARE_ADVICE: &str =
     "Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` transition.";
 /// … or a level-defining endpoint the data has no record for.
@@ -1024,12 +1029,27 @@ const BARE_NO_DEFINER_DATA: &str = "Only Gaussian rows and the discrete-state re
                                     `[binary_model]` or DTMM `[markov_model]` endpoint define a \
                                     level, and this data has neither, so it cannot estimate the \
                                     block.";
-/// Every bare-read sentence, for the cells where none belongs.
-const BARE_ANY: [&str; 5] = [
+/// #2819: the half of the next step both arms share, wherever `BARE_NO_DEFINER_DATA` is.
+const ADD_ROWS: &str = "add rows that define a level, scored by an expression that reads it.";
+/// #2819: the unread arm's next step. It spans the sentence boundary, so it pins that the
+/// step follows the cannot-estimate sentence.
+const DROP_STEP: &str = "so it cannot estimate the block. Drop the block, or add rows";
+/// #2819 review r1 #1: the bare non-definer arm's next step. Not "drop the block": the
+/// bare `PLACEBO` would then read as a covariate.
+const SCALAR_STEP: &str = "so it cannot estimate the block. Declare it as one `theta PLACEBO` \
+                           without the index, or add rows";
+/// Every bare-read sentence, and the closing sentences the unread arm shares, for the cells
+/// where none belongs.
+const BARE_ANY: [&str; 10] = [
     BARE_NO_DEFINER,
     BARE_WHY,
+    BARE_WHY_GAUSSIAN,
+    BARE_WHY_SHORT,
     BARE_ADVICE,
     BARE_NO_DEFINER_DATA,
+    ADD_ROWS,
+    DROP_STEP,
+    SCALAR_STEP,
     BARE_NO_RECORDS,
 ];
 /// The pre-#2623 wording, still right when the data has no row at all.
@@ -1124,17 +1144,41 @@ fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool, definable: bo
     let (want, not): (&[&str], &[&str]) = if no_records {
         (
             &[BARE_NO_RECORDS],
-            &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE, BARE_NO_DEFINER_DATA],
+            &[
+                BARE_NO_DEFINER,
+                BARE_WHY,
+                BARE_WHY_GAUSSIAN,
+                BARE_WHY_SHORT,
+                BARE_ADVICE,
+                BARE_NO_DEFINER_DATA,
+                ADD_ROWS,
+                DROP_STEP,
+                SCALAR_STEP,
+            ],
         )
     } else if definable {
         (
-            &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
-            &[BARE_NO_RECORDS, BARE_NO_DEFINER_DATA],
+            &[BARE_NO_DEFINER, BARE_WHY, BARE_WHY_GAUSSIAN, BARE_ADVICE],
+            &[
+                BARE_NO_RECORDS,
+                BARE_WHY_SHORT,
+                BARE_NO_DEFINER_DATA,
+                ADD_ROWS,
+                DROP_STEP,
+                SCALAR_STEP,
+            ],
         )
     } else {
         (
-            &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
-            &[BARE_NO_RECORDS, BARE_ADVICE],
+            &[
+                BARE_NO_DEFINER,
+                BARE_WHY,
+                BARE_WHY_SHORT,
+                BARE_NO_DEFINER_DATA,
+                SCALAR_STEP,
+                ADD_ROWS,
+            ],
+            &[BARE_NO_RECORDS, BARE_WHY_GAUSSIAN, BARE_ADVICE, DROP_STEP],
         )
     };
     for sentence in want {
@@ -1431,9 +1475,16 @@ fn record_kind_cells() {
             // cannot-estimate sentence (#2808). `ctmm_records_define_no_level_cells` holds the
             // other side of that gate.
             let want: &[&str] = match reader {
-                Reader::Unread => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA],
+                Reader::Unread => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA, DROP_STEP, ADD_ROWS],
                 Reader::Definer => &[BARE_NO_RECORDS],
-                Reader::NonDefiner => &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
+                Reader::NonDefiner => &[
+                    BARE_NO_DEFINER,
+                    BARE_WHY_SHORT,
+                    BARE_WHY,
+                    BARE_NO_DEFINER_DATA,
+                    SCALAR_STEP,
+                    ADD_ROWS,
+                ],
             };
             for sentence in [UNREAD, READ_BARE].into_iter().chain(BARE_ANY) {
                 assert_eq!(
@@ -1499,6 +1550,39 @@ fn tte_only_csv_is_not_called_rowless() {
         .unwrap();
     }
     data.flush().unwrap();
+    // #2819 review r1 #1: each arm's next step, applied, clears every error; the step the
+    // bare arm must not give (drop the declaration) trades this refusal for a missing
+    // covariate, since the bare `PLACEBO` then reads as one.
+    let decl = "  theta PLACEBO[STUDY](0.0, -5.0, 5.0)\n";
+    let unread_text = bare.replace(" * exp(PLACEBO)", "");
+    for (label, text, want) in [
+        ("unread, block dropped", unread_text.replace(decl, ""), None),
+        (
+            "bare, scalar theta",
+            bare.replace("PLACEBO[STUDY](0.0", "PLACEBO(0.0"),
+            None,
+        ),
+        (
+            "bare, block dropped",
+            bare.replace(decl, ""),
+            Some("E_MISSING_COVARIATE"),
+        ),
+    ] {
+        let mut model = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        model.write_all(text.as_bytes()).unwrap();
+        model.flush().unwrap();
+        let report = crate::api::validate_model_file(
+            model.path().to_str().unwrap(),
+            Some(data.path().to_str().unwrap()),
+        );
+        let errors: Vec<&str> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::diagnostics::Severity::Error)
+            .map(|d| d.code.as_str())
+            .collect();
+        assert_eq!(errors, want.into_iter().collect::<Vec<_>>(), "{label}");
+    }
     for (label, text, unread) in [
         ("hazard bare", bare.to_string(), false),
         ("unread", bare.replace(" * exp(PLACEBO)", ""), true),
@@ -1524,8 +1608,18 @@ fn tte_only_csv_is_not_called_rowless() {
             assert!(!m.contains(sentence), "{label}: {sentence:?} in {m}");
         }
         assert_eq!(m.contains(UNREAD), unread, "{label}: {m}");
-        // Neither arm has a reader that could define a level on TTE-only data (r1 #1).
-        assert!(m.contains(BARE_NO_DEFINER_DATA), "{label}: {m}");
+        // Neither arm has a reader that could define a level on TTE-only data (r1 #1), so
+        // both end on the cannot-estimate sentence and the next step (#2819).
+        for sentence in [BARE_NO_DEFINER_DATA, ADD_ROWS] {
+            assert!(m.contains(sentence), "{label}: missing {sentence:?} in {m}");
+        }
+        // Each arm's own next step, and not the other's (review r1 #1).
+        assert_eq!(m.contains(DROP_STEP), unread, "{label}: {m}");
+        assert_eq!(m.contains(SCALAR_STEP), !unread, "{label}: {m}");
+        // #2819: the bare cell states "no Gaussian rows" in the data clause and the closing
+        // sentence only, not a third time in the reason for the Gaussian reader.
+        assert_eq!(m.contains(BARE_WHY_SHORT), !unread, "{label}: {m}");
+        assert!(!m.contains(BARE_WHY_GAUSSIAN), "{label}: {m}");
     }
 }
 
@@ -1597,10 +1691,21 @@ fn ctmm_records_define_no_level_cells() {
             assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
             assert_data_paragraph_closed(&cell, m);
             let want: &[&str] = match (reader, mixed) {
-                (Reader::Unread, false) => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA],
+                (Reader::Unread, false) => {
+                    &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA, DROP_STEP, ADD_ROWS]
+                }
                 (Reader::Unread, true) => &[UNREAD, READ_BARE],
-                (Reader::NonDefiner, false) => &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
-                (Reader::NonDefiner, true) => &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
+                (Reader::NonDefiner, false) => &[
+                    BARE_NO_DEFINER,
+                    BARE_WHY_SHORT,
+                    BARE_WHY,
+                    BARE_NO_DEFINER_DATA,
+                    SCALAR_STEP,
+                    ADD_ROWS,
+                ],
+                (Reader::NonDefiner, true) => {
+                    &[BARE_NO_DEFINER, BARE_WHY_GAUSSIAN, BARE_WHY, BARE_ADVICE]
+                }
                 (Reader::Definer, _) => &[BARE_NO_RECORDS],
             };
             for sentence in [UNREAD, READ_BARE].into_iter().chain(BARE_ANY) {
