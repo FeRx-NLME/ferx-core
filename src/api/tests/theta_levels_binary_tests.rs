@@ -1009,9 +1009,14 @@ const READ_BARE: &str = "a data-driven block is read bare, as `PLACEBO`; its ind
 const BARE_NO_DEFINER: &str = "The block is read bare, but only by a Gaussian prediction, a \
                                `[markov_model]` CTMM generator or an `[event_model]` hazard, and \
                                none of them defines a level on this data";
-const BARE_WHY: &str = "it has no Gaussian rows, a CTMM generator is built once per subject from \
-                        the baseline, and one time-to-event row can yield zero or two records, \
-                        so neither kind of record defines a level.";
+const BARE_WHY: &str = "a CTMM generator is built once per subject from the baseline, and one \
+                        time-to-event row can yield zero or two records, so neither kind of \
+                        record defines a level.";
+/// #2819: the reason for the Gaussian reader, given in the non-definer arm only when the
+/// advice follows. Each discriminator spans the colon, so it pins where the reason sits.
+const BARE_WHY_GAUSSIAN: &str = "this data: it has no Gaussian rows, a CTMM generator";
+/// #2819: … and dropped when the cannot-estimate sentence follows, which states it.
+const BARE_WHY_SHORT: &str = "this data: a CTMM generator";
 const BARE_ADVICE: &str =
     "Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` transition.";
 /// … or a level-defining endpoint the data has no record for.
@@ -1024,12 +1029,19 @@ const BARE_NO_DEFINER_DATA: &str = "Only Gaussian rows and the discrete-state re
                                     `[binary_model]` or DTMM `[markov_model]` endpoint define a \
                                     level, and this data has neither, so it cannot estimate the \
                                     block.";
-/// Every bare-read sentence, for the cells where none belongs.
-const BARE_ANY: [&str; 5] = [
+/// #2819: the next step that follows `BARE_NO_DEFINER_DATA` wherever it appears.
+const NEXT_STEP: &str =
+    "Drop the block, or add rows of either kind scored by an expression that reads it.";
+/// Every bare-read sentence, and the closing pair the unread arm shares, for the cells where
+/// none belongs.
+const BARE_ANY: [&str; 8] = [
     BARE_NO_DEFINER,
     BARE_WHY,
+    BARE_WHY_GAUSSIAN,
+    BARE_WHY_SHORT,
     BARE_ADVICE,
     BARE_NO_DEFINER_DATA,
+    NEXT_STEP,
     BARE_NO_RECORDS,
 ];
 /// The pre-#2623 wording, still right when the data has no row at all.
@@ -1124,17 +1136,36 @@ fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool, definable: bo
     let (want, not): (&[&str], &[&str]) = if no_records {
         (
             &[BARE_NO_RECORDS],
-            &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE, BARE_NO_DEFINER_DATA],
+            &[
+                BARE_NO_DEFINER,
+                BARE_WHY,
+                BARE_WHY_GAUSSIAN,
+                BARE_WHY_SHORT,
+                BARE_ADVICE,
+                BARE_NO_DEFINER_DATA,
+                NEXT_STEP,
+            ],
         )
     } else if definable {
         (
-            &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
-            &[BARE_NO_RECORDS, BARE_NO_DEFINER_DATA],
+            &[BARE_NO_DEFINER, BARE_WHY, BARE_WHY_GAUSSIAN, BARE_ADVICE],
+            &[
+                BARE_NO_RECORDS,
+                BARE_WHY_SHORT,
+                BARE_NO_DEFINER_DATA,
+                NEXT_STEP,
+            ],
         )
     } else {
         (
-            &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
-            &[BARE_NO_RECORDS, BARE_ADVICE],
+            &[
+                BARE_NO_DEFINER,
+                BARE_WHY,
+                BARE_WHY_SHORT,
+                BARE_NO_DEFINER_DATA,
+                NEXT_STEP,
+            ],
+            &[BARE_NO_RECORDS, BARE_WHY_GAUSSIAN, BARE_ADVICE],
         )
     };
     for sentence in want {
@@ -1431,9 +1462,15 @@ fn record_kind_cells() {
             // cannot-estimate sentence (#2808). `ctmm_records_define_no_level_cells` holds the
             // other side of that gate.
             let want: &[&str] = match reader {
-                Reader::Unread => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA],
+                Reader::Unread => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA, NEXT_STEP],
                 Reader::Definer => &[BARE_NO_RECORDS],
-                Reader::NonDefiner => &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
+                Reader::NonDefiner => &[
+                    BARE_NO_DEFINER,
+                    BARE_WHY_SHORT,
+                    BARE_WHY,
+                    BARE_NO_DEFINER_DATA,
+                    NEXT_STEP,
+                ],
             };
             for sentence in [UNREAD, READ_BARE].into_iter().chain(BARE_ANY) {
                 assert_eq!(
@@ -1524,8 +1561,15 @@ fn tte_only_csv_is_not_called_rowless() {
             assert!(!m.contains(sentence), "{label}: {sentence:?} in {m}");
         }
         assert_eq!(m.contains(UNREAD), unread, "{label}: {m}");
-        // Neither arm has a reader that could define a level on TTE-only data (r1 #1).
-        assert!(m.contains(BARE_NO_DEFINER_DATA), "{label}: {m}");
+        // Neither arm has a reader that could define a level on TTE-only data (r1 #1), so
+        // both end on the cannot-estimate sentence and the next step (#2819).
+        for sentence in [BARE_NO_DEFINER_DATA, NEXT_STEP] {
+            assert!(m.contains(sentence), "{label}: missing {sentence:?} in {m}");
+        }
+        // #2819: the bare cell states "no Gaussian rows" in the data clause and the closing
+        // sentence only, not a third time in the reason for the Gaussian reader.
+        assert_eq!(m.contains(BARE_WHY_SHORT), !unread, "{label}: {m}");
+        assert!(!m.contains(BARE_WHY_GAUSSIAN), "{label}: {m}");
     }
 }
 
@@ -1597,10 +1641,18 @@ fn ctmm_records_define_no_level_cells() {
             assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
             assert_data_paragraph_closed(&cell, m);
             let want: &[&str] = match (reader, mixed) {
-                (Reader::Unread, false) => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA],
+                (Reader::Unread, false) => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA, NEXT_STEP],
                 (Reader::Unread, true) => &[UNREAD, READ_BARE],
-                (Reader::NonDefiner, false) => &[BARE_NO_DEFINER, BARE_WHY, BARE_NO_DEFINER_DATA],
-                (Reader::NonDefiner, true) => &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
+                (Reader::NonDefiner, false) => &[
+                    BARE_NO_DEFINER,
+                    BARE_WHY_SHORT,
+                    BARE_WHY,
+                    BARE_NO_DEFINER_DATA,
+                    NEXT_STEP,
+                ],
+                (Reader::NonDefiner, true) => {
+                    &[BARE_NO_DEFINER, BARE_WHY_GAUSSIAN, BARE_WHY, BARE_ADVICE]
+                }
                 (Reader::Definer, _) => &[BARE_NO_RECORDS],
             };
             for sentence in [UNREAD, READ_BARE].into_iter().chain(BARE_ANY) {
