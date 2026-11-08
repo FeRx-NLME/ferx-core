@@ -56,7 +56,7 @@ Whether it finds anything depends on the model. On the naproxen MBMA
 (`examples/mbma_naproxen.ferx`, 18 trials, 36 arms, 122 observations) it found nothing
 better: from the published estimates and from a naive start (all covariate
 effects at 0, the typical values off by 2–7×), `n_starts = 1` and `n_starts = 8`
-reached the same OFV, 261.8149, and eight starts took 0.04–0.05 s against
+reached the same OFV, 261.8149, and eight starts took 0.04–0.06 s against
 0.03 s for one. A user fitting arm-level ulcerative-colitis models reported
 better optima from multi-start on several of them
 ([ferx-r#721](https://github.com/FeRx-NLME/ferx-r/issues/721)). Compare the OFV against your single-start fit: the

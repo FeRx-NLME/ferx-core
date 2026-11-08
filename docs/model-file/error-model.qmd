@@ -591,8 +591,8 @@ To turn another tool's figure into ferx's `weight = W` OFV, add:
 | ferx, `DV ~ additive(S) weight = W` | `ofv` | 0 |
 | NONMEM, natural scale, `Y = F + W*EPS(1)` | `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT` (`#OBJV`) | 0 |
 | NONMEM, same model | `... WITH CONSTANT` | $-N\log 2\pi$ |
-| ferx / NONMEM hand-built: `DV/W` in the data, prediction `/W`, σ² = 1 | OFV without constant | $+\sum_j 2\ln W_j$ |
-| nlmixr2 FOCEi hand-built with a precision weight: `DV·√w`, prediction `·√w`, `add()` sd 1 | `fit$objf` (any `adjLik`) | $-\sum_j \ln w_j \;=\; +\sum_j 2\ln W_j$ |
+| ferx / NONMEM hand-built: `DV/W` in the data, prediction `/W`, the same σ as the `weight =` fit | OFV without constant | $+\sum_j 2\ln W_j$ |
+| nlmixr2 FOCEi hand-built with a precision weight: `DV·√w`, prediction `·√w`, `add()` sd the same as the `weight =` fit's σ | `fit$objf` (any `adjLik`) | $-\sum_j \ln w_j \;=\; +\sum_j 2\ln W_j$ |
 | nlmixr2, same fit | $-2\,$`logLik(fit)` | $-N\log 2\pi - \sum_j \ln w_j$ |
 
 Measured on one dataset (6 subjects, 18 rows, `W` from 0.3 to 2.5, a model linear
