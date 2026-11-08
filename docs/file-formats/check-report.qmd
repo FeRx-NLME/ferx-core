@@ -527,6 +527,12 @@ The model runs, but on a path that is experimental or that quietly drops a capab
 
 A missing Ω~IOV~ on `simulate()` reuses an existing code, since the cause is the same: it is `E_PARAM_SHAPE`, the parameter-shape code the other entry points return (see [matching on the code](../warnings.qmd#entry-point-error-codes)).
 
+#### Kaplan–Meier VPC {#codes-vpc-tte}
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_VPC_TTE_INPUT` | error | An input the Kaplan–Meier VPC (`vpc_tte()`) would draw a wrong curve or band from: several TTE endpoints and no `cmt`, a `cmt` that is not a TTE endpoint, a repeated-events endpoint, left truncation, an interval-censored record, more than one record per subject on the endpoint, a duplicated subject id, no record on the endpoint, band probabilities not strictly inside (0, 1) and increasing, too few replicates for them, a grid time that is not finite and non-negative, or a stratification covariate a subject lacks or with more than 10 values ([#1886](https://github.com/FeRx-NLME/ferx-core/issues/1886)). See [Kaplan–Meier VPC](../estimation/tte.qmd#km-vpc). |
+
 #### File entry points {#codes-file-entry-points}
 
 Refusals of the file entry points (`fit_from_files()`, `prepare_run()`, `run_model_with_data()`, `run_model_simulate()` and their variants, which `ferx` runs) and of `fit()` itself, for inputs `ferx check` does not read ([#1788](https://github.com/FeRx-NLME/ferx-core/issues/1788)).

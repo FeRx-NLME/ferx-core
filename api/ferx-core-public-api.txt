@@ -3,6 +3,17 @@ pub mod ferx_core::api
 #[non_exhaustive] pub enum ferx_core::api::UnmatchedSubjects
 pub ferx_core::api::UnmatchedSubjects::Draw
 pub ferx_core::api::UnmatchedSubjects::Refuse
+pub enum ferx_core::api::VpcCensoring
+pub ferx_core::api::VpcCensoring::Horizon
+pub ferx_core::api::VpcCensoring::Observed
+pub enum ferx_core::api::VpcGrid
+pub ferx_core::api::VpcGrid::AllSteps
+pub ferx_core::api::VpcGrid::Auto
+pub ferx_core::api::VpcGrid::Times(alloc::vec::Vec<f64>)
+pub enum ferx_core::api::VpcStratify
+pub ferx_core::api::VpcStratify::Covariate(alloc::string::String)
+pub ferx_core::api::VpcStratify::Dose
+pub ferx_core::api::VpcStratify::None
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveInputs<'a>
 pub ferx_core::api::AdaptiveInputs::etas: core::option::Option<&'a ferx_core::SuppliedEtas>
 pub ferx_core::api::AdaptiveInputs::params: &'a ferx_core::ModelParameters
@@ -132,7 +143,37 @@ pub ferx_core::api::ThetaLevelValue::se: core::option::Option<f64>
 pub ferx_core::api::ThetaLevelValue::sir_ci: core::option::Option<(f64, f64)>
 pub ferx_core::api::ThetaLevelValue::theta_index: core::option::Option<usize>
 pub ferx_core::api::ThetaLevelValue::value: f64
+pub struct ferx_core::api::TteVpc
+pub ferx_core::api::TteVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::api::TteVpc::cmt: usize
+pub ferx_core::api::TteVpc::horizon: f64
+pub ferx_core::api::TteVpc::n_sim: usize
+pub ferx_core::api::TteVpc::probs: [f64; 3]
+pub ferx_core::api::TteVpc::strata: alloc::vec::Vec<ferx_core::TteVpcStratum>
+pub ferx_core::api::TteVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::api::TteVpcStratum
+pub ferx_core::api::TteVpcStratum::grid: alloc::vec::Vec<f64>
+pub ferx_core::api::TteVpcStratum::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::TteVpcStratum::label: alloc::string::String
+pub ferx_core::api::TteVpcStratum::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::TteVpcStratum::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::TteVpcStratum::n_subjects: usize
+pub ferx_core::api::TteVpcStratum::n_used: alloc::vec::Vec<usize>
+pub ferx_core::api::TteVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::TteVpcStratum::observed: ferx_core::stats::km::KmCurve
+pub ferx_core::api::TteVpcStratum::value: core::option::Option<f64>
+pub struct ferx_core::api::VpcTteOptions
+pub ferx_core::api::VpcTteOptions::censoring: ferx_core::VpcCensoring
+pub ferx_core::api::VpcTteOptions::cmt: core::option::Option<usize>
+pub ferx_core::api::VpcTteOptions::grid: ferx_core::VpcGrid
+pub ferx_core::api::VpcTteOptions::n_sim: usize
+pub ferx_core::api::VpcTteOptions::probs: [f64; 3]
+pub ferx_core::api::VpcTteOptions::sim: ferx_core::SimulateOptions
+pub ferx_core::api::VpcTteOptions::stratify: ferx_core::VpcStratify
+impl core::default::Default for ferx_core::VpcTteOptions
+pub fn ferx_core::VpcTteOptions::default() -> Self
 pub const ferx_core::api::FIT_RAYON_STACK_SIZE: usize
+pub const ferx_core::api::VPC_TTE_MAX_STRATA: usize
 pub fn ferx_core::api::assert_covariate_model_bound(model: &ferx_core::CompiledModel) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::api::bind_covariate_stats(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &ferx_core::Population) -> core::result::Result<(), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::bind_from_fit(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population, fitted: &ferx_core::parser::model_parser::DataBindings) -> core::result::Result<(), ferx_core::diagnostics::EngineError>
@@ -182,6 +223,7 @@ pub fn ferx_core::api::theta_level_values(model: &ferx_core::CompiledModel, thet
 pub fn ferx_core::api::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_output_columns(model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
+pub fn ferx_core::api::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
 pub mod ferx_core::build_info
 pub enum ferx_core::build_info::GradientMethodKind
 pub ferx_core::build_info::GradientMethodKind::Analytic
@@ -2352,6 +2394,37 @@ pub fn ferx_core::stats::convergence::ess_bulk(chains: &[alloc::vec::Vec<f64>]) 
 pub fn ferx_core::stats::convergence::ess_tail(chains: &[alloc::vec::Vec<f64>]) -> f64
 pub fn ferx_core::stats::convergence::quantile_sorted(sorted: &[f64], q: f64) -> f64
 pub fn ferx_core::stats::convergence::split_rhat(chains: &[alloc::vec::Vec<f64>]) -> f64
+pub mod ferx_core::stats::km
+pub enum ferx_core::stats::km::KmInputError
+pub ferx_core::stats::km::KmInputError::BadProbs
+pub ferx_core::stats::km::KmInputError::BadProbs::probs: [f64; 3]
+pub ferx_core::stats::km::KmInputError::BadTime
+pub ferx_core::stats::km::KmInputError::BadTime::index: usize
+pub ferx_core::stats::km::KmInputError::BadTime::value: f64
+pub ferx_core::stats::km::KmInputError::LengthMismatch
+pub ferx_core::stats::km::KmInputError::LengthMismatch::events: usize
+pub ferx_core::stats::km::KmInputError::LengthMismatch::times: usize
+impl core::error::Error for ferx_core::stats::km::KmInputError
+impl core::fmt::Display for ferx_core::stats::km::KmInputError
+pub fn ferx_core::stats::km::KmInputError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::stats::km::KmCurve
+pub ferx_core::stats::km::KmCurve::cumhaz: alloc::vec::Vec<f64>
+pub ferx_core::stats::km::KmCurve::n_censor: alloc::vec::Vec<usize>
+pub ferx_core::stats::km::KmCurve::n_event: alloc::vec::Vec<usize>
+pub ferx_core::stats::km::KmCurve::n_risk: alloc::vec::Vec<usize>
+pub ferx_core::stats::km::KmCurve::surv: alloc::vec::Vec<f64>
+pub ferx_core::stats::km::KmCurve::time: alloc::vec::Vec<f64>
+impl ferx_core::stats::km::KmCurve
+pub fn ferx_core::stats::km::KmCurve::at(&self, t: f64) -> core::option::Option<f64>
+pub struct ferx_core::stats::km::VpcBand
+pub ferx_core::stats::km::VpcBand::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::stats::km::VpcBand::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::stats::km::VpcBand::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::stats::km::VpcBand::n_used: alloc::vec::Vec<usize>
+pub fn ferx_core::stats::km::kaplan_meier(times: &[f64], events: &[bool]) -> core::result::Result<ferx_core::stats::km::KmCurve, ferx_core::stats::km::KmInputError>
+pub fn ferx_core::stats::km::min_curves_for(probs: [f64; 3]) -> usize
+pub fn ferx_core::stats::km::probs_valid(probs: [f64; 3]) -> bool
+pub fn ferx_core::stats::km::vpc_band(curves: &[ferx_core::stats::km::KmCurve], grid: &[f64], probs: [f64; 3]) -> core::result::Result<ferx_core::stats::km::VpcBand, ferx_core::stats::km::KmInputError>
 pub mod ferx_core::stats::likelihood
 pub fn ferx_core::stats::likelihood::apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[core::option::Option<f64>])
 pub fn ferx_core::stats::likelihood::build_block_diag_omega(omega_bsv: &nalgebra::base::alias::DMatrix<f64>, omega_iov: &nalgebra::base::alias::DMatrix<f64>, n_occasions: usize) -> nalgebra::base::alias::DMatrix<f64>
@@ -4290,6 +4363,17 @@ pub ferx_core::ViOmegaUpdate::ClosedForm
 pub enum ferx_core::ViSigmaUpdate
 pub ferx_core::ViSigmaUpdate::Adam
 pub ferx_core::ViSigmaUpdate::ClosedForm
+pub enum ferx_core::VpcCensoring
+pub ferx_core::VpcCensoring::Horizon
+pub ferx_core::VpcCensoring::Observed
+pub enum ferx_core::VpcGrid
+pub ferx_core::VpcGrid::AllSteps
+pub ferx_core::VpcGrid::Auto
+pub ferx_core::VpcGrid::Times(alloc::vec::Vec<f64>)
+pub enum ferx_core::VpcStratify
+pub ferx_core::VpcStratify::Covariate(alloc::string::String)
+pub ferx_core::VpcStratify::Dose
+pub ferx_core::VpcStratify::None
 #[non_exhaustive] pub enum ferx_core::WarningCode
 pub ferx_core::WarningCode::AbsorptionTwinDeclined
 pub ferx_core::WarningCode::BloqMethod
@@ -5567,6 +5651,25 @@ pub ferx_core::TteObsDiagnostic::dv: f64
 pub ferx_core::TteObsDiagnostic::martingale: f64
 pub ferx_core::TteObsDiagnostic::pit: f64
 pub ferx_core::TteObsDiagnostic::time: f64
+pub struct ferx_core::TteVpc
+pub ferx_core::TteVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::TteVpc::cmt: usize
+pub ferx_core::TteVpc::horizon: f64
+pub ferx_core::TteVpc::n_sim: usize
+pub ferx_core::TteVpc::probs: [f64; 3]
+pub ferx_core::TteVpc::strata: alloc::vec::Vec<ferx_core::TteVpcStratum>
+pub ferx_core::TteVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::TteVpcStratum
+pub ferx_core::TteVpcStratum::grid: alloc::vec::Vec<f64>
+pub ferx_core::TteVpcStratum::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::TteVpcStratum::label: alloc::string::String
+pub ferx_core::TteVpcStratum::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::TteVpcStratum::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::TteVpcStratum::n_subjects: usize
+pub ferx_core::TteVpcStratum::n_used: alloc::vec::Vec<usize>
+pub ferx_core::TteVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::TteVpcStratum::observed: ferx_core::stats::km::KmCurve
+pub ferx_core::TteVpcStratum::value: core::option::Option<f64>
 #[non_exhaustive] pub struct ferx_core::ViResult
 pub ferx_core::ViResult::converged: bool
 pub ferx_core::ViResult::data_term: f64
@@ -5585,6 +5688,16 @@ pub ferx_core::ViResult::n_mc_samples: usize
 pub ferx_core::ViResult::neg_two_elbo: f64
 pub ferx_core::ViResult::objective_trace: alloc::vec::Vec<f64>
 pub ferx_core::ViResult::superseded_by: core::option::Option<alloc::string::String>
+pub struct ferx_core::VpcTteOptions
+pub ferx_core::VpcTteOptions::censoring: ferx_core::VpcCensoring
+pub ferx_core::VpcTteOptions::cmt: core::option::Option<usize>
+pub ferx_core::VpcTteOptions::grid: ferx_core::VpcGrid
+pub ferx_core::VpcTteOptions::n_sim: usize
+pub ferx_core::VpcTteOptions::probs: [f64; 3]
+pub ferx_core::VpcTteOptions::sim: ferx_core::SimulateOptions
+pub ferx_core::VpcTteOptions::stratify: ferx_core::VpcStratify
+impl core::default::Default for ferx_core::VpcTteOptions
+pub fn ferx_core::VpcTteOptions::default() -> Self
 pub struct ferx_core::WarningEntry
 pub ferx_core::WarningEntry::category: ferx_core::WarningCode
 pub ferx_core::WarningEntry::details: core::option::Option<serde_json::value::Value>
@@ -5610,6 +5723,7 @@ pub const ferx_core::PK_IDX_Q3: usize
 pub const ferx_core::PK_IDX_V: usize
 pub const ferx_core::PK_IDX_V2: usize
 pub const ferx_core::PK_IDX_V3: usize
+pub const ferx_core::VPC_TTE_MAX_STRATA: usize
 pub fn ferx_core::apply_method_option(opts: &mut ferx_core::FitOptions, value: &str) -> core::result::Result<(), alloc::string::String>
 pub fn ferx_core::bic(result: &ferx_core::FitResult, kind: ferx_core::model_selection::BicType) -> f64
 pub fn ferx_core::bind_from_fit(parsed: &mut ferx_core::ParsedModel, model_text: &str, population: &mut ferx_core::Population, fitted: &ferx_core::parser::model_parser::DataBindings) -> core::result::Result<(), ferx_core::diagnostics::EngineError>
@@ -5673,6 +5787,7 @@ pub fn ferx_core::theta_level_map(model: &ferx_core::CompiledModel) -> std::coll
 pub fn ferx_core::theta_level_values(model: &ferx_core::CompiledModel, theta: &[f64], covariance: core::option::Option<&nalgebra::base::alias::DMatrix<f64>>, sir_resamples_packed: core::option::Option<&[alloc::vec::Vec<f64>]>) -> core::result::Result<std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<ferx_core::api::ThetaLevelValue>>, alloc::string::String>
 pub fn ferx_core::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
+pub fn ferx_core::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
 pub type ferx_core::DerivedEvalFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::DerivedFilterFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> bool + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::ErrorSelectFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&std::collections::hash::map::HashMap<alloc::string::String, f64>) -> usize + core::marker::Send + core::marker::Sync)>

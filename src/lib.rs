@@ -83,6 +83,12 @@ pub use api::{
     predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
     SurvivalPredictionOutput, SurvivalPredictionResult,
 };
+// Kaplan–Meier VPC of a single-event TTE endpoint (#1886).
+#[cfg(feature = "survival")]
+pub use api::{
+    vpc_tte, TteVpc, TteVpcStratum, VpcCensoring, VpcGrid, VpcStratify, VpcTteOptions,
+    VPC_TTE_MAX_STRATA,
+};
 
 /// Positive proof that the `debug_assert!` guards in this crate are LIVE
 /// (#344, #1248).
