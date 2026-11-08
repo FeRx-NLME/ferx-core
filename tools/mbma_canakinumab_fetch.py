@@ -130,6 +130,11 @@ def read_within(url, timeout, deadline):
         sock = getattr(getattr(r.fp, "raw", None), "_sock", None)
         parts = []
         while True:
+            # Python ≥ 3.12's `read1` closes the connection itself once Content-Length
+            # has arrived, and a `settimeout` on that closed socket raises EBADF: the
+            # body is complete, so stop before re-capping (#2820 review r2).
+            if r.isclosed():
+                break
             left = deadline - time.monotonic()
             if left <= 0:
                 got = sum(len(p) for p in parts)

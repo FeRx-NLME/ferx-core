@@ -490,7 +490,10 @@ fn a_stall_cut_by_the_read_timeout_is_not_the_deadline() {
         r.log
     );
     assert!(
-        r.message.contains("  attempt 1: error: timeout")
+        // The class name differs by Python: `timeout: timed out` on 3.9,
+        // `TimeoutError: timed out` on ≥ 3.10 (CI). "timed out" is both.
+        r.message.contains("  attempt 1: error: ")
+            && r.message.contains("timed out")
             && !r.message.contains("deadline reached")
             && !r.message.contains("Stopped at"),
         "{}",
