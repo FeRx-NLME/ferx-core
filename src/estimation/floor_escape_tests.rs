@@ -2169,6 +2169,84 @@ fn a_small_real_variance_inside_the_span_is_probed_and_kept() {
     assert_rail_untouched(&on, &off);
 }
 
+/// [`Stub`] plus the two start verdicts, for the one decision that reads them.
+#[derive(Debug, Clone)]
+struct WithVerdict {
+    fit: Stub,
+    left_init: Option<bool>,
+    stationary_start: bool,
+}
+
+impl StoppedFit for WithVerdict {
+    fn params(&self) -> &ModelParameters {
+        self.fit.params()
+    }
+    fn ofv(&self) -> f64 {
+        self.fit.ofv()
+    }
+    fn converged_mut(&mut self) -> &mut bool {
+        self.fit.converged_mut()
+    }
+    fn evals_mut(&mut self) -> &mut usize {
+        self.fit.evals_mut()
+    }
+    fn warnings_mut(&mut self) -> &mut Vec<String> {
+        self.fit.warnings_mut()
+    }
+    fn covariance_secs_mut(&mut self) -> &mut f64 {
+        self.fit.covariance_secs_mut()
+    }
+    fn start_eval(&self) -> &Option<StartEval> {
+        self.fit.start_eval()
+    }
+    fn start_eval_mut(&mut self) -> &mut Option<StartEval> {
+        self.fit.start_eval_mut()
+    }
+    fn start_verdict_mut(&mut self) -> Option<(&mut Option<bool>, &mut bool)> {
+        Some((&mut self.left_init, &mut self.stationary_start))
+    }
+}
+
+/// An adopted resumed run reports the fit's "left its start" verdict, not its own: it is
+/// measured from the rail point it was resumed at, where a resumed run that barely moves
+/// reads "never left" and may carry a start-probe verdict. A first run that left the user's
+/// start makes the fit's answer `Some(true)`, with no stationary start. A first run that did
+/// not leave it leaves the resumed run's own verdict standing.
+#[test]
+fn an_adopted_rail_restart_keeps_the_fits_left_its_start_verdict() {
+    let cands = &rail_candidates()[..1];
+    let resolve = |first_left: Option<bool>| {
+        resolve_rail_completion(
+            WithVerdict {
+                fit: short_stop(),
+                left_init: first_left,
+                stationary_start: false,
+            },
+            None,
+            cands,
+            |_| WithVerdict {
+                fit: at_ofv(-37.381570),
+                left_init: None,
+                stationary_start: false,
+            },
+            |_| WithVerdict {
+                fit: at_ofv(-37.396982),
+                left_init: Some(false),
+                stationary_start: true,
+            },
+            |s| s.fit.ofv + s.fit.penalty,
+            false,
+        )
+    };
+    let r = resolve(Some(true));
+    assert_eq!(r.fit.ofv, -37.396982, "adopted");
+    assert_eq!((r.left_init, r.stationary_start), (Some(true), false));
+    let r = resolve(Some(false));
+    assert_eq!((r.left_init, r.stationary_start), (Some(false), true));
+    let r = resolve(None);
+    assert_eq!((r.left_init, r.stationary_start), (Some(false), true));
+}
+
 /// T3. The adopted text is `optimizer_health` (a warning, so `status()` stays CONVERGED);
 /// the not-converged text is `convergence` (critical).
 #[test]

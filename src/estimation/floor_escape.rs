@@ -500,6 +500,18 @@ pub(crate) fn resolve_rail_completion<T: StoppedFit>(
     }
     *second.evals_mut() += *first.evals_mut() + n_probes;
     *second.covariance_secs_mut() += *first.covariance_secs_mut();
+    // The resumed run measures "left its start" against the point it was resumed from,
+    // a few ULPs to a few ln-units from where the first stopped, so a resumed run that
+    // barely moves reports `left_init = Some(false)` and runs the #2506 start probe on it
+    // (measured: `a_fit_with_a_real_budget_is_not_flagged_as_stalled`). The published
+    // verdict answers "are the estimates still on the user's start" (#1277 review), and a
+    // first run that left it is answered: the resumed run only continued from there.
+    if first.start_verdict_mut().map(|(l, _)| *l) == Some(Some(true)) {
+        if let Some((left, stationary)) = second.start_verdict_mut() {
+            *left = Some(true);
+            *stationary = false;
+        }
+    }
     if let Some(w) = escape {
         if !*first.converged_mut() {
             *second.converged_mut() = false;
@@ -799,6 +811,11 @@ pub(crate) trait StoppedFit {
     /// The fit's first evaluation ([`OuterResult::start_eval`]).
     fn start_eval(&self) -> &Option<StartEval>;
     fn start_eval_mut(&mut self) -> &mut Option<StartEval>;
+    /// The start verdicts measured against the user's start: [`OuterResult::left_init`]
+    /// and [`OuterResult::stationary_start`]. `None` for a fit that carries neither.
+    fn start_verdict_mut(&mut self) -> Option<(&mut Option<bool>, &mut bool)> {
+        None
+    }
 }
 
 impl StoppedFit for OuterResult {
@@ -825,6 +842,9 @@ impl StoppedFit for OuterResult {
     }
     fn start_eval_mut(&mut self) -> &mut Option<StartEval> {
         &mut self.start_eval
+    }
+    fn start_verdict_mut(&mut self) -> Option<(&mut Option<bool>, &mut bool)> {
+        Some((&mut self.left_init, &mut self.stationary_start))
     }
 }
 
