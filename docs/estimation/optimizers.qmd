@@ -325,6 +325,34 @@ there when started near it. A start far from the expected estimates can reach a 
 any model. Compare fits from two or three starts, or use a [global pre-search](#global-pre-search),
 when the starts are uncertain.
 
+### A variance stopped short of its guard {#variance-short-of-guard}
+
+A variance is optimized as the log of its standard deviation (for Ω and κ, of the Cholesky
+diagonal), with an internal lower guard: −6 for Ω, κ and `[mixture]` Ω overrides, −8 for σ. When
+the data carry no variability for a random effect, the objective falls all the way to that guard,
+but the fall flattens geometrically on the log scale. A derivative-free optimizer can then shrink
+its trust region below its `xtol` stop before it reaches the guard and report `converged = true`
+at a point that is not a minimum. On a two-class `[mixture]` fixture
+([#2832](https://github.com/FeRx-NLME/ferx-core/issues/2832)) BOBYQA stopped the class-2 override
+1.2 log units above the guard, 0.159 OFV above the optimum. The base ω stopped short in the same
+way when the class labels were swapped. L-BFGS reached the guard on both.
+
+Since #2832, after the outer optimizer of a FOCE-family fit stops (and after the
+[log-packing floor](#log-packing-floor) check above), ferx looks at every free variance within 2
+log units of its guard but not on it: Ω and κ diagonals, σ, and `[mixture]` overrides. A block's
+coordinate is its Cholesky diagonal `L_ii`, as for the [collapse hold](parameterization.qmd#held-parameters), so
+`Ω_ii` itself need not be small. ferx evaluates the objective once per variance, with that variance
+alone on its guard. Each one that is lower by more than `1e-6` is moved to the guard, and the fit is
+resumed once with it `1e-3` above the guard. Started exactly on the guard, BOBYQA walked one
+variance back off it. If the resumed run ends lower, it is reported, with an `optimizer_health`
+warning that names each variance (a `[mixture]` override by its class, `ETA_CL_MIX2`), its value
+and both objectives. The variance is then on its guard, so the post-fit collapse warning names it
+as well. If the resumed run ends no lower, the first stop is kept, `converged = false`, with a
+`convergence` warning. A variance whose objective rises on the guard is a genuine small estimate
+and is left untouched, bit for bit. The check costs one evaluation per variance in that band and
+nothing on any other fit. It covers FOCE, FOCEI, Laplace and AGQ, profiled or not, but not
+Gauss–Newton, SAEM or VI, which run their own loops.
+
 ### A BOBYQA tolerance stop is polished {#bobyqa-tolerance-polish}
 
 BOBYQA's own stopping rules are *relative*: `outer_ftol` (default `1e-6`) on the objective change of
