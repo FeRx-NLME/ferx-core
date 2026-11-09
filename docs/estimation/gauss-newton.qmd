@@ -78,13 +78,14 @@ conditioned. The radius is measured in this scaled space.
   subject to $\lVert\delta\rVert \le \Delta$, by Steihaug truncated conjugate gradients. CG stops
   once its residual is small, steps to the boundary when it would leave the region or meets a
   direction of non-positive curvature, and runs at most
-  $\min(\max(\lceil\sqrt{n}\rceil, 5),\ \max(n, 5))$ iterations for $n$ packed parameters.
+  $\max(\lceil\sqrt{n}\rceil, 5)$ iterations for $n$ packed parameters.
   There is no damping factor, Cholesky solve or line search.
 - **The trial point:** the inner loop re-estimates every subject's EBEs at $x + \delta$
   (warm-started from the current EBEs), so the trial OFV is the FOCE/FOCEI objective, not the
   quadratic model.
 - **The ratio:** $\rho$ is the actual OFV reduction divided by the reduction the quadratic model
-  predicts. A non-finite trial OFV counts as $\rho < 0$.
+  predicts. A non-finite trial OFV counts as $\rho < 0$, and so does a step clamped at a bound
+  whose predicted reduction is no longer positive.
 - **The radius:** $\Delta$ starts at 1 and never exceeds 10.
 
 | $\rho$ | Step | Radius |
@@ -95,8 +96,8 @@ conditioned. The radius is measured in this scaled space.
 
 A rejected step costs an iteration but keeps the current estimates. When the quadratic model
 predicts almost no reduction ($< 10^{-10}$) while the gradient is not zero, the BHHH matrix is
-degenerate along the step: the radius is divided by 4 and the iteration retried without
-evaluating a trial point.
+degenerate along the step: the radius is divided by 4 and the next iteration starts, with no
+trial point evaluated. That iteration still counts toward `maxiter`.
 
 ### Bounds and stalled steps
 
@@ -130,7 +131,17 @@ The GN loop ends at the first of:
   steps or degenerate-BHHH retries. The fit adds the warning "Gauss-Newton: trust radius
   collapsed" (or "degenerate BHHH Hessian, trust radius collapsed").
 - **Not converged, budget spent:** `maxiter` iterations ran, with the warning "Gauss-Newton:
-  max iterations reached without convergence".
+  max iterations reached without convergence". A collapsed radius or a cancelled fit currently
+  carries that warning too, next to its own
+  ([#1049](https://github.com/FeRx-NLME/ferx-core/issues/1049)).
+
+This is the loop's verdict, not yet the fit's. Pure `gn` re-checks `converged` afterwards: a
+cold re-solve of the EBEs at the final estimates
+([#2097](https://github.com/FeRx-NLME/ferx-core/issues/2097)), the covariance step's check that
+the end point is stationary ([#2785](https://github.com/FeRx-NLME/ferx-core/issues/2785)), and a
+check that the final objective is finite can each demote it. The small-change rule has no gradient condition, so
+a tiny step taken after the radius has shrunk also satisfies it
+([#2738](https://github.com/FeRx-NLME/ferx-core/issues/2738)).
 
 The optimizer trace (`optimizer_trace = true`) logs one row per step. For GN rows its
 `lm_lambda` column holds the trust radius: the radius the step was tried with on a rejected row,
