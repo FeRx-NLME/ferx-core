@@ -832,8 +832,8 @@ fn run_extracts_block_omega_and_reports_a_failed_fit() {
         &fake,
         format!(
             // Refuses unless asked for JSON (`run` must request the file it reads) and
-            // for one thread: ferx ignores RAYON_NUM_THREADS (#1460), so the flag is the
-            // only thing that pins the reduction order.
+            // for one thread: a pinned count beats RAYON_NUM_THREADS (#2800), so the flag
+            // pins the reduction order whatever environment runs the tool.
             "#!/bin/sh\n\
              case \"$*\" in *'--output-format json'*) ;; *) echo 'no json' >&2; exit 9;; esac\n\
              case \"$*\" in *'--threads 1'*) ;; *) echo 'no --threads 1' >&2; exit 8;; esac\n\

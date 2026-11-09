@@ -14,6 +14,7 @@
 # set equality with no exemption rule to get wrong.
 agq
 binary_logit_levels
+binary_probit_nonmem_anchor
 branch_only_param_hazard
 categorical_convergence
 categorical_smoke
@@ -53,4 +54,5 @@ tte_ode_solve_failed
 tte_residuals_nonmem_anchor
 tte_smoke
 vi_dcm_omega_recovery
+vpc_tte_self_consistency
 zero_omega_fit

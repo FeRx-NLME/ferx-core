@@ -37,14 +37,27 @@ where $g_i = \nabla_x \text{NLL}_i$ is the gradient of the negative log-likeliho
 
 Per-subject gradients come from a closed form at fixed $\hat\eta_i$ whenever the model is inside its scope:
 
-- **Almquist Laplace** when `interaction = true` (FOCEI): exact in $\Omega$ and $\sigma$, with the $\theta$ axis contracted exactly from the fixed-$\eta$ θ-adjoint (one reverse sweep per eight weight rows). Runs on analytical and ODE models and on per-compartment error models.
+- **Almquist Laplace** when `interaction = true` (FOCEI): the exact fixed-EBE score in $\Omega$ and $\sigma$, with the $\theta$ axis contracted exactly from the fixed-$\eta$ θ-adjoint (one reverse sweep per eight weight rows). Runs on analytical and ODE models and on per-compartment error models.
 - **Sheiner–Beal** when `interaction = false` (FOCE): the same $\theta$ axis, but its linearisation additionally requires an analytical (non-ODE) structural model and a single error model.
 
 Where a closed form does not apply, the score is the **exact fixed-EBE score of the analytic likelihood kernel** — the per-subject objective with $\hat\eta_i$ and $H$ held, one reverse sweep plus the θ contractions. That covers what the closed forms decline: M3 BLOQ censoring, inter-occasion variability (the stacked marginal at $[\hat\eta, \hat\kappa]$), IIV on the residual error, a θ-dependent residual-error magnitude, `block_sigma` residual correlations, FREM rows, and a non-Gaussian data term (`[event_model]` TTE / RTTE, `[binary_model]`, CTMM — over the BSV block under IOV). The closed forms' own scope is `closed_form_fixed_ebe_grad_ok` in [`src/estimation/gauss_newton.rs`](https://github.com/FeRx-NLME/ferx-core/blob/main/src/estimation/gauss_newton.rs), whose doc comment says, for each exclusion, which term of the objective they do not carry.
 
 Central finite differences of the per-subject objective remain only for an endpoint without an exact channel and for a subject outside the recorders' scope (see [Known FD fallbacks](foce.qmd#known-fd-fallbacks)). A closed form also hands one subject on to the kernel score at one evaluation when the matrix it factorises ($\tilde H$ for Laplace, $\tilde R$ for Sheiner–Beal) is not positive definite.
 
-On a subject with IOV, the gradient GN steps along is not the fixed-EBE score: it is the
+These are the scores the BHHH matrix is built from. They are **not** the gradient GN steps
+along on a FOCEI model. The Laplace marginal carries $\log|\tilde H(\hat\eta_i)|$, and holding
+$\hat\eta_i$ fixed drops its response $\partial_\eta \log|\tilde H| \cdot d\hat\eta_i/dx$, which is
+non-zero under proportional or combined error. So for every FOCEI subject with random effects,
+GN steps along the subject's exact total derivative: the analytic adjoint at the mode, or a
+finite difference with $\hat\eta_i$ re-solved at each point where the adjoint declines. The
+same holds for a TTE or discrete endpoint under FOCE. Before
+[#2740](https://github.com/FeRx-NLME/ferx-core/issues/2740), the gradient was the score plus a
+θ-only approximation of that term, or nothing at all past the closed forms (M3, IIV on RUV, …).
+It disagreed with the objective, sometimes in sign, and GN's trust region collapsed far from
+the optimum (`warfarin_bloq` stopped 10.6 OFV above FOCEI). FOCE Gaussian models keep the
+fixed-EBE score.
+
+On a subject with IOV, the gradient GN steps along is not the fixed-EBE score either: it is the
 per-subject outer gradient the NLopt optimizers take, with $\hat\eta_i$ and the occasion
 $\hat\kappa_{ik}$ responding to $x$. That gradient is exact where the analytic adjoint serves
 the subject, and a reconverged finite difference otherwise. Without it, `method = gn` stopped
@@ -78,6 +91,26 @@ via Cholesky decomposition. If the Cholesky fails (singular Hessian), $\lambda$ 
 ### Line Search
 
 Each step uses backtracking line search (up to 15 halvings). At each trial point, EBEs are re-estimated via the inner loop (warm-started from the previous EBEs), ensuring the FOCE objective is evaluated consistently.
+
+### Bounds and stalled steps
+
+A parameter that reaches its bound while the gradient still pushes it outward is held for that
+iteration, the way a `FIX` parameter is, and the rest of the step is solved without it. When a
+step does run into a bound, the trust region judges it against the reduction the quadratic model
+predicts for the step actually taken, not the unclamped one. Before
+[#2777](https://github.com/FeRx-NLME/ferx-core/issues/2777) the clamped coordinate still claimed
+its share of the prediction, so the ratio of actual to predicted reduction stayed at a fixed
+value below 0.25 at every radius and the fit stopped on "trust radius collapsed"
+(`examples/one_cpt_transit.ferx` under `method = gn`: 1513.94; now 1492.17, with `TVV` on its
+upper bound of 500 and no collapse).
+
+After three rejected steps in a row that no bound clamped, GN checks whether one subject's
+EBE-response term sets the step direction: its term is at least 10 times every other subject's,
+and on some parameter it outweighs the rest of the gradient. That happens when the subject's EBE
+mode moves sharply with the parameters (for example near a fold), so its slope is exact at the
+point but wrong over any step GN can take. GN then uses that subject's raw score for the rest of
+the fit and adds a warning that names it. The reported final gradient keeps the subject's full
+term.
 
 ### Convergence
 

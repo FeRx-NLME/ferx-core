@@ -355,8 +355,9 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
 /// (`whitened_residual_autocorrelation`). The statistic then reports dependence the
 /// line does **not** explain, so the advice is about the line first: under `cs`
 /// every pair of a block correlates equally, and serial dependence that decays with
-/// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima:
-/// `cs` leaves DW 1.43, `ar1` 1.69).
+/// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima,
+/// with the statistic split by arm and pair-normalised since #2798: `cs` leaves DW
+/// 1.63, `ar1` 1.96 — the classic whole-subject form read 1.43 and 1.69).
 pub(crate) fn dw_autocorrelation_warning_decorrelated(
     dw: f64,
     line: &str,
@@ -398,33 +399,107 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
     }
 }
 
+/// Which remedies the positive-DW warning may name (#2798): only ones the fitted
+/// model can take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DwAdvice {
+    /// A model with compartments (closed form or ODE): today's structural advice,
+    /// byte for byte.
+    Compartmental,
+    /// A compartment-free model ([`CompiledModel::is_algebraic`]): it has no
+    /// absorption, compartment, `ka` or `F` to change, so the advice is a
+    /// `correlation` line `by` the group whose rows may be dependent — `group` is
+    /// the name such a line can read, or `None` when the model declares no grouping
+    /// a `by` can name.
+    Algebraic { group: Option<String> },
+}
+
+/// The [`DwAdvice`] for `model` fitted under `options` (#2798).
+///
+/// `group` is what a `correlation … by` line would have to write to read the
+/// model's grouping:
+/// - nested levels: the **innermost** level's **name** — `by ARM` naming a level
+///   reads its groups nested by key (`residual_level`), where its column would read
+///   the column within `ID` and merge arms of different studies;
+/// - `iov_column`, which a **single** `level X by COL in ID` also sets (the parser
+///   writes the level's column into it): that **column**. A one-level model has no
+///   named level a `by` can read (`residual_level` needs more than one);
+/// - derived occasions (`iov_occasion = dose` / `time(...)` on a model with a
+///   kappa, `run::occasions_are_derived`): `None` — the occasions come from the
+///   timeline, so there is no column a `by` can read, and the rule overrides
+///   `iov_column`. Without a kappa the fit derives nothing and the `iov_column`
+///   grouping stands, so that cell takes the column arm;
+/// - no grouping: `None`.
+///
+/// `options`, not `model.fit_options`, because the occasion rule a fit runs under is
+/// the caller's (#1783).
+pub(crate) fn dw_advice(model: &CompiledModel, options: &FitOptions) -> DwAdvice {
+    if !model.is_algebraic() {
+        return DwAdvice::Compartmental;
+    }
+    let group = if let Some(levels) = model.nested_levels() {
+        levels.levels.last().map(|l| l.name.clone())
+    } else if crate::api::run::occasions_are_derived(model, options) {
+        None
+    } else {
+        options.iov_column.clone()
+    };
+    DwAdvice::Algebraic { group }
+}
+
 /// The pooled-IWRES autocorrelation warning for a Durbin-Watson statistic, or
 /// `None` when `dw` is non-finite or inside the `[1.5, 2.5]` band.
 ///
+/// The positive text depends on `advice` (#2798): a compartmental model gets the
+/// structural remedies, a compartment-free one a `correlation` line. The negative
+/// text does not.
+///
 /// A free function rather than an inline block so the exact text is reachable
 /// from a unit test without running a fit (the suffix dropped below outlived
-/// #1285 precisely because nothing tested it), and deliberately independent of
-/// the model: it used to append " For ODE models, SDE process noise may also
-/// help." whenever `model.ode_spec` was present. `[diffusion]` is not that
-/// remedy. The EKF propagates the state covariance and never corrects the state
-/// mean with the observed data (#1285), so the fitted object is the
+/// #1285 precisely because nothing tested it), and deliberately the same for an
+/// ODE and a closed-form model (only a compartment-free one differs): it used
+/// to append " For ODE models, SDE process noise may also help." whenever
+/// `model.ode_spec` was present. `[diffusion]` is not that remedy. The EKF
+/// propagates the state covariance and never corrects the state mean with the
+/// observed data (#1285), so the fitted object is the
 /// deterministic ODE mean with an inflated residual variance: it re-weights the
 /// fit rather than supplying the missing dynamics the statistic is reporting.
 /// Measured on a 2-cpt population fitted as 1-cpt, one variable changed:
-/// adding `central ~ 0.01` moved DW from 0.40 to 0.77 — still below the
+/// adding `central ~ 0.01` moved DW (the classic form, before #2798) from 0.40 to
+/// 0.77 — still below the
 /// threshold, so the warning fires again — while CL moved from 0.99 to 2.49
 /// against a truth of 1.0. The hint returns with the mean update.
-pub(crate) fn dw_autocorrelation_warning(dw: f64) -> Option<String> {
+pub(crate) fn dw_autocorrelation_warning(dw: f64, advice: &DwAdvice) -> Option<String> {
     if !dw.is_finite() {
         return None;
     }
     if dw < 1.5 {
-        Some(format!(
-            "Positive IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
-             Structural model may be missing dynamics. Consider a transit \
-             absorption model, additional compartment, or IOV on ka/F.",
-            dw
-        ))
+        let what = format!("Positive IWRES autocorrelation detected (Durbin-Watson = {dw:.2}).");
+        // The `correlation` line is FOCE/FOCEI only (validation.rs, #1081), and `cs`
+        // is never suggested: over a kappa-carrying grouping it is refused
+        // (E_RESIDUAL_CORRELATION_CONFOUNDED_KAPPA).
+        const CAR1_AND_METHOD: &str = "`car1(RHO)` decays the correlation with the time \
+             between rows instead. The line needs method = foce or focei.";
+        Some(match advice {
+            DwAdvice::Compartmental => format!(
+                "{what} Structural model may be missing dynamics. Consider a transit \
+                 absorption model, additional compartment, or IOV on ka/F."
+            ),
+            DwAdvice::Algebraic { group: Some(g) } => format!(
+                "{what} Rows of one `{g}` group may share what the structural model \
+                 leaves out. A `correlation ar1(RHO) by {g}` line in [error_model] lets \
+                 them correlate, decaying with the number of visits between them; \
+                 {CAR1_AND_METHOD}"
+            ),
+            DwAdvice::Algebraic { group: None } => format!(
+                "{what} Rows of one subject may share what the structural model leaves \
+                 out, such as the visits of one arm or occasion. A `correlation \
+                 ar1(RHO) by COL` line in [error_model] lets them correlate, with COL any \
+                 data column that labels the group (the innermost level's name when \
+                 levels are nested); {CAR1_AND_METHOD} A `level` for that grouping with a \
+                 `kappa … at` it can absorb the shared part instead."
+            ),
+        })
     } else if dw > 2.5 {
         Some(format!(
             "Negative IWRES autocorrelation detected (Durbin-Watson = {:.2}). \
@@ -538,9 +613,10 @@ pub(crate) fn nn_regularization_unapplied_warning(
 /// When `options.threads` is `Some(n)`, the fit runs inside a scoped rayon
 /// pool of `n` workers, so this setting is per-call (different fits in the
 /// same process can use different thread counts). When `None`, the shared
-/// big-stack fit pool is used, sized to available cores minus one and capped
-/// at 8 (#707) unless a front end declared a width with
-/// [`configure_global_thread_pool`](crate::configure_global_thread_pool).
+/// big-stack fit pool is used, sized to the width a front end declared with
+/// [`configure_global_thread_pool`](crate::configure_global_thread_pool) if any,
+/// else a positive `RAYON_NUM_THREADS` (#2800), else available cores minus one
+/// capped at 8 (#707).
 /// Rayon's own global pool is not used either way, and `--threads N` no longer
 /// sizes it (#1460).
 ///
@@ -870,9 +946,14 @@ fn fit_unstamped(
     drop(ode_solver_override);
     drop(bloq_override);
 
+    // What the estimators score: the records up to each subject's last scored one (#2778).
+    // Everything above ran on every record. `pop_ref` stays for the outputs reading past it.
+    let scored = crate::api::scored_population(model, std::borrow::Cow::Borrowed(pop_ref));
+    let scored_ref: &Population = &scored;
+
     // Single-start fast path (default)
     if options.n_starts <= 1 {
-        let run = || fit_inner(model, pop_ref, init_params, options);
+        let run = || fit_inner(model, scored_ref, pop_ref, init_params, options);
         // A pinned positive `threads` builds a fit-scoped pool sized to it (and surfaces a
         // build failure as `Err`, as before). The unpinned default reuses the shared
         // big-stack pool; if that one-time build ever failed we run on the ambient pool
@@ -945,7 +1026,7 @@ fn fit_unstamped(
                     };
                     &opts_k_storage
                 };
-                (k, fit_inner(model, pop_ref, &init_k, opts_ref))
+                (k, fit_inner(model, scored_ref, pop_ref, &init_k, opts_ref))
             })
             .collect()
     };
@@ -1202,9 +1283,13 @@ fn release_worker_tapes() {
     }
 }
 
+/// One fit of `population`, the records the estimators score (`scored_population`, #2778).
+/// `all_records` is the same population with every record, for the data warnings and the
+/// `[derived]` outputs, whose grids run past the last observation.
 fn fit_inner(
     model: &CompiledModel,
     population: &Population,
+    all_records: &Population,
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
@@ -1596,13 +1681,13 @@ fn fit_inner(
     // `check_model_data_warnings` so `ferx check` reports the same findings;
     // message text is unchanged. Probed against `population` (not the pruned
     // copy) and `init_params`, matching the historical inline checks.
-    for d in check_model_data_warnings(model, population, init_params) {
+    for d in check_model_data_warnings(model, all_records, init_params) {
         accumulated_warnings.push(d.message);
     }
     // Fit-only, so not in the bundle above that `simulate()` shares (#2459). Reads the
     // censoring method through `bloq_in_force`, armed by `fit_unstamped` (#1824).
     if let Some(d) =
-        crate::api::validation::check_zero_dv_magnitude_only(model, population, init_params)
+        crate::api::validation::check_zero_dv_magnitude_only(model, all_records, init_params)
     {
         accumulated_warnings.push(d.message);
     }
@@ -1635,7 +1720,7 @@ fn fit_inner(
     }
     // A `[covariate_nn]` input the data drive into saturation (#2549).
     #[cfg(feature = "nn")]
-    for d in crate::api::validation::check_nn_input_scale(model, population) {
+    for d in crate::api::validation::check_nn_input_scale(model, all_records) {
         accumulated_warnings.push(d.message);
     }
     if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
@@ -2084,6 +2169,9 @@ fn fit_inner(
                         mcem_lowest_objective: None,
                         mcem_objective_trail: None,
                         mixture_posteriors: None,
+                        newton_decrement: None,
+                        optimizer_stop: None,
+                        eval_budget_spent: false,
                     });
                 }
             }
@@ -2183,6 +2271,9 @@ fn fit_inner(
                     start_eval: None,
                     mcem_lowest_objective: None,
                     mcem_objective_trail: None,
+                    newton_decrement: None,
+                    optimizer_stop: None,
+                    eval_budget_spent: false,
                 });
             }
             let prev = result.as_ref().expect(
@@ -2454,31 +2545,15 @@ fn fit_inner(
 
     result.warnings = accumulated_warnings;
 
-    // Thread efficiency warnings (post-chain, uses n_threads_used captured above).
-    let n_subjects = population.subjects.len();
-    if n_subjects > 0 && n_threads_used > n_subjects {
-        // `threads = 0` is not a valid Rayon pool size, so for n_subjects = 1
-        // we still suggest a 1-thread pool.
-        let suggested = n_subjects.max(1);
-        result.warnings.push(format!(
-            "{} threads configured but only {} subject(s) — consider threads = {} to reduce \
-             scheduling overhead (no speed benefit beyond n_subjects)",
-            n_threads_used, n_subjects, suggested
-        ));
-    }
-    // SAEM-specific: MH scheduling has higher per-subject overhead than FOCE.
-    // Skip when n_subjects < 2 (n_subjects/2 = 0 is meaningless and the prior
-    // warning already covers the n_threads > n_subjects case).
-    if chain.iter().any(|&m| m == EstimationMethod::Saem) && n_subjects >= 2 {
-        let suggested = (n_subjects / 2).max(1);
-        if n_threads_used > suggested {
-            result.warnings.push(format!(
-                "SAEM with more threads than subjects/2 may be slower due to MH scheduling \
-                 overhead. Consider threads = {} for SAEM.",
-                suggested
-            ));
-        }
-    }
+    // Thread warnings (post-chain, uses n_threads_used captured above): where the count
+    // came from, an unusable `RAYON_NUM_THREADS`, oversubscribed cores (#2800, #1811), and
+    // more workers than subjects.
+    result.warnings.extend(super::pool::fit_thread_warnings(
+        options.threads,
+        n_threads_used,
+        population.subjects.len(),
+        chain.iter().any(|&m| m == EstimationMethod::Saem),
+    ));
 
     // Compute per-subject diagnostics. For a mixture (#985) each subject's
     // diagnostics are evaluated under its own MIXEST class: `result.eta_hats` are
@@ -2574,7 +2649,7 @@ fn fit_inner(
     if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
         compute_extra_output_columns(
             model,
-            population,
+            all_records,
             &result.params.theta,
             &result.kappas,
             &mut subjects,
@@ -2699,7 +2774,7 @@ fn fit_inner(
         // actually serves it (#1855).
         warnings.extend(derived_cmt_time_varying_warnings(
             model,
-            population,
+            all_records,
             &result.params.theta,
             &result.eta_hats,
             &result.kappas,
@@ -2713,7 +2788,7 @@ fn fit_inner(
         // An `[odes] init(...)` re-seeded at a reset reads the reset row's own snapshot
         // in the state pass, as `ipred` does (#1133, #2133); only the disposition stays
         // at the first-observation snapshot, which W_DERIVED_CMT_TV_ODE above covers.
-        if model.ode_spec.is_none() && population.subjects.iter().any(|s| s.has_resets()) {
+        if model.ode_spec.is_none() && all_records.subjects.iter().any(|s| s.has_resets()) {
             warnings.push(
                 "W_DERIVED_CMT_RESET_ANALYTICAL: analytical model with EVID=3/4 \
                  reset events — compartment states and compartment-based integrals \
@@ -2745,7 +2820,7 @@ fn fit_inner(
         // per-obs compartment states return empty (→ NaN) rather than report
         // silently-wrong amounts.
         if model.ode_spec.is_none()
-            && population
+            && all_records
                 .subjects
                 .iter()
                 .any(|s| crate::pk::dose_needs_event_walk(model.pk_model, s))
@@ -3042,7 +3117,11 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
-    if let Some((msg, entry)) = runaway_guard_warning(&mut converged, &result.params) {
+    if let Some((msg, entry)) = runaway_guard_warning_for(
+        &mut converged,
+        &result.params,
+        result.covariance_matrix.as_ref(),
+    ) {
         warnings.push(msg);
         native_warnings.push(entry);
     }
@@ -3137,6 +3216,9 @@ fn fit_inner(
 
     // Under a `correlation` line the raw IWRES are correlated by construction; the
     // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
+    // Either way each subject's series is split at its occasions and residual blocks
+    // (#2798), read off `population` — the prepared one this fit scored, whose
+    // occasions carry the `iov_column`, a derived rule's labels or the level cells.
     let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
         crate::stats::residual_error::whitened_residual_autocorrelation(
             model,
@@ -3145,14 +3227,19 @@ fn fit_inner(
             &subjects,
         )
     } else {
-        iwres_autocorrelation(&subjects)
+        crate::stats::residual_error::grouped_iwres_autocorrelation(population, &subjects)
     };
 
     // Covariance status. Bayesian fits report posterior credible intervals
     // instead of a Hessian covariance, so the covariance step is never
-    // "requested" for them (reporting it as FAILED would be misleading).
+    // "requested" for them (reporting it as FAILED would be misleading). Nor is
+    // it for a chain with no estimating stage — a standalone `imp_eval_only` /
+    // `agq_eval_only` evaluation owns no step (`covariance_stage`), so with the
+    // default `covariance = true` it read FAILED with no warning, and
+    // `FitResult::status` then printed a covariance failure that never happened
+    // (#2799 r1).
     let covariance_status = resolve_covariance_status(
-        options.run_covariance_step && result.bayes.is_none(),
+        options.run_covariance_step && result.bayes.is_none() && !options.evaluation_only_chain(),
         result.covariance_matrix.is_some(),
         sir_fallback_result.is_some(),
     );
@@ -3216,7 +3303,7 @@ fn fit_inner(
         (Some(serial), Some(line)) => {
             dw_autocorrelation_warning_decorrelated(dw_statistic, &line, serial.kind)
         }
-        _ => dw_autocorrelation_warning(dw_statistic),
+        _ => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options)),
     };
     if let Some(msg) = dw_warning {
         warnings.push(msg);
@@ -3402,6 +3489,7 @@ fn fit_inner(
         bic_inputs,
         profiled_blocks: model.indiv_param_partials.theta_blocks.profiled_names(),
         profiled_levels_at_bound,
+        held_at_bound: Vec::new(),
         eta_log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -3422,6 +3510,10 @@ fn fit_inner(
         obs_time_range,
         final_gradient: result.final_gradient.clone(),
         final_gradient_source: result.final_gradient_source.clone(),
+        newton_decrement: result.newton_decrement,
+        optimizer_stop: result.optimizer_stop.clone(),
+        eval_budget_spent: result.eval_budget_spent,
+        evaluation_only: options.evaluation_only_run(),
         optimizer: optimizer_label,
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,
@@ -3540,6 +3632,11 @@ fn fit_inner(
         fit_result.se_theta.as_ref(),
         &fit_result.theta_fixed,
     );
+    // #2797: every coordinate whose SE is not available because it sits on a bound, from
+    // the reported estimate — after any floor-escape restart, which wraps the whole
+    // estimator run, its covariance step included, so the list and the matrix describe one
+    // point. Before `cov_fixed`, which marks the collapses the step held.
+    crate::api::apply_held_at_bound(&result.params, &mut fit_result);
     // The final parameters, not `init_params`: an estimator can hold more than it was
     // given, as SAEM does a mixture's σ overrides, and the step ran on these.
     fit_result.cov_fixed =

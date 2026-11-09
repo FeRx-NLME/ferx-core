@@ -51,11 +51,13 @@ with the run, never with a fitted model's parameters.
 |-----|:--------:|---------|
 | `observe` | signal¹ | The **latent** monitored signal — a free-form expression over states + individual parameters (e.g. `central / V` for concentration), titrated on with **no** measurement noise. Provide this *or* `with_assay_error`, never both. The `when` rules compare the keyword `signal` to its value. |
 | `at` | ✓ | Decision schedule on the subject clock: an explicit list `[0, 24, 48]` or an arithmetic sequence `every <Δ> from <t0> to <t1>` (inclusive). |
-| `start_dose` | ✓ | The dose issued at the first decision; seeds the running dose. A number, or an expression over θ and data covariates evaluated per subject (e.g. `15 * WT`); see [Dose expressions](#dose-expressions). |
+| `start_dose` | ✓ | The dose issued at the first decision; seeds the running dose. A number, or an expression evaluated per subject (e.g. `15 * WT`, or `400 * CL` for a subject whose η are supplied); see [Dose expressions](#dose-expressions). |
 | `route` | ✓ | `bolus(cmt=N)` or `infuse(cmt=N, over=T)` (zero-order over duration `T`). |
 | `dose_bounds` | ✓ | Inclusive `[low, high]` clamp applied to every emitted dose. Each side is a number or a per-subject expression (e.g. `[0, min(30 * WT, 4000)]`). |
 | `confirm` | | Debounce: act only after this many *consecutive* matches of the same rule (default `1` = act on the first breach). |
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. Each rung is a number or a per-subject expression. |
+| `round_to` | | Dose grid step, a number `> 0` (e.g. `250` for 250 mg vials): every dose the controller sets is rounded to the nearest multiple, then clamped to the multiples inside `dose_bounds`. Not with `levels`. See [Rounding doses to a grid](#rounding-doses-to-a-grid). |
+| `dose_knowledge` | | `known` (default) or `oracle`: whether a dose expression may read a drawn subject's individual parameters. See [Which subjects' values are known](#which-subjects-values-are-known). |
 | `intervals` | | Dosing-interval ladder `[d1, d2, …]`, strictly increasing and positive. Rules step it with `lengthen` / `shorten`. Requires `start_interval`. See [Changing the dosing interval](#changing-the-dosing-interval). |
 | `start_interval` | | The dosing interval in force from the first decision; one of `intervals`, and required with it. |
 | `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
@@ -93,7 +95,12 @@ readout, so it shares that block's name scope — including the `TIME` built-in
 (spelled `TIME` or `T`), which resolves to **the decision's own time**. A
 protocol-time-dependent target such as `observe = central / V - TARGET * TIME /
 (TIME + T50)` therefore titrates against the intended ramp
-([#1028](https://github.com/FeRx-NLME/ferx-core/issues/1028)).
+([#1028](https://github.com/FeRx-NLME/ferx-core/issues/1028)). It is the `TIME` as
+written at the decision, which is what an observation record there reads. After a reset
+that restarts `TIME`, that is the restarted value, not the engine clock the decision
+times are given on. The same holds for a monitor without `observe` whose `[scaling]`
+readout reads `TIME`, and for every point of an `auc_target` window
+([#2756](https://github.com/FeRx-NLME/ferx-core/issues/2756)).
 
 The shared name scope includes the `T` precedence rule: a `T` (or `t`) declared in
 `[covariates]` is the **data column**, in `observe` exactly as in `[scaling]`, so
@@ -121,7 +128,9 @@ the first subject. Anything else is an expression, compiled with the same expres
 as `observe` (`min`, `max`, `exp`, `if (…) … else …`, …).
 
 Each expression is evaluated **once per subject, at the first decision** (`at[0]`),
-from θ and the covariates in force there: the row of the record in force at `at[0]`,
+from θ, the covariates in force there and, for a subject whose values are known, its
+individual parameters there (see [Which subjects' values are known](#which-subjects-values-are-known)).
+The covariates are the row of the record in force at `at[0]`,
 the same row a programmatic controller reads in `ctx.covariates` at that decision. A
 covariate that changes before `at[0]` is read at its new value; one that changes after
 `at[0]` does not change the plan. When `at[0]` is before the subject's first record,
@@ -129,12 +138,14 @@ it is the subject's first value of each covariate, as in the driver. The resulti
 start dose, bounds and ladder then work exactly as the numbers would: rules step from
 that start dose and clamp to those bounds.
 
-Every subject's values are checked before any subject is simulated, with the same
+Every subject's values are checked before any subject is simulated (except an oracle
+subject, checked in each replicate after its draw; see [Which subjects' values are known](#which-subjects-values-are-known)), with the same
 rules as the numbers: finite and `>= 0`, `low <= high`, the start dose inside the
 bounds (and on the ladder, with `levels`), every rung inside the bounds, and the ladder
 strictly increasing. The first subject that fails is refused with
 `E_ADAPTIVE_DOSE_VALUE`, naming the subject, the expression, the values it evaluated to
-and the covariate values it read:
+and the covariate and individual-parameter values it read (and, for an oracle subject,
+checked in each replicate, the replicate):
 
 ```
 [adaptive_dosing] subject 2: start_dose = 15 * WT - 1000 evaluates to -250; a dose
@@ -152,21 +163,161 @@ A covariate the data lack is refused when the run starts, with
 |---|---|---|
 | A number, θ | yes | The same for every subject. |
 | A data covariate | yes | Known when the dose is written. Read at `at[0]`. |
+| An individual parameter that no random effect reaches (`TVCLW = TVCL * (WT / 70)`) | yes | A function of θ, covariates and `TIME` alone, so known for every subject. Read at `at[0]`. |
+| An individual parameter that a random effect reaches (`CL = TVCLW * exp(ETA_CL)`, or any parameter computed from one), or a random effect (`ETA_CL`) | for a supplied subject; for a drawn one only under `dose_knowledge = oracle` | Known at dosing time only when the subject's η come from input; see [Which subjects' values are known](#which-subjects-values-are-known). A parameter counts as reached when an η, a κ or `MIXNUM` enters it through any intermediate or `if` condition. |
 | A state (`CENT`) | no | The expression runs once; to follow the drug level, write a `when signal …` rule. |
 | `TIME` (or `T`) | no | It would always be `at[0]`; write the value. |
-| An individual parameter (`CL`) or a random effect (`ETA_CL`) | not yet | A subject's own parameter values are not known at dosing time unless they are supplied; this is the next step of #944. Today, carry a known value as a data column (e.g. `CL_KNOWN`) and read that. |
-| A κ (IOV) | no | Drawn for each occasion, so never known at dosing time. |
-| `MIXNUM` | no | The simulation draws the class. |
+| A κ (IOV) | no | Drawn for each occasion, so never known at dosing time. Read the individual parameter instead: a supplied subject reads it at κ = 0. |
+| `MIXNUM` | only under `dose_knowledge = oracle` | The simulation draws the class, and supplied η refuse a `[mixture]` model, so no subject's class is known. |
 
-These are refused when the model is parsed, so `ferx check` reports them, with a
+The refusals are raised when the model is parsed, so `ferx check` reports them, with a
 message that names the key and the name read. A spec built in code is checked again
-when the run starts.
+when the run starts. Whether a subject may read its individual parameters depends on
+whether its η are supplied, so that is decided when the run starts.
+
+### Which subjects' values are known
+
+A subject's individual parameters are known at dosing time when they come from input:
+its η are supplied (`etas` in R, `AdaptiveInputs::with_etas` in Rust; see
+[Supplied individual values](#supplied-individual-values)). When the simulation draws
+the η, the individual parameters are the simulated truth, which no prescriber knows.
+The rule is decided per subject, so a run under `UnmatchedSubjects::Draw` that mixes
+known and virtual patients treats each by its own source
+([#944](https://github.com/FeRx-NLME/ferx-core/issues/944)):
+
+| Subject | `dose_knowledge = known` (default) | `dose_knowledge = oracle` |
+|---|---|---|
+| η supplied | reads its supplied η, with κ = 0 | the same; `dose_oracle` is `false` |
+| η drawn | the run is refused (`E_ADAPTIVE_DOSE_KNOWLEDGE`), listing the drawn subjects | reads its drawn η and the κ of the first decision's occasion, in each replicate; `dose_oracle` is `true` |
+
+The refusal names the three routes to a dose computed from an individual value:
+
+```
+[adaptive_dosing] start_dose reads CL, an individual parameter, but the random effects
+of 1 of 2 subject(s) are drawn by the simulation ('2'), so CL is the simulated truth,
+which no prescriber knows at dosing time. To dose from it: carry the known value as a
+data column (e.g. CL_KNOWN) and read that; supply each subject's random effects (e.g. a
+previous fit's estimates, as `etas` in R, or through `AdaptiveInputs::with_etas` and
+`simulate_adaptive_from_spec_with_inputs` in Rust); or set dose_knowledge = oracle for a
+perfect-information comparison arm, which is flagged in the results.
+```
+
+The individual parameters are evaluated at the first decision: at the covariates in
+force there and at `TIME` as written there, the same point the driver evaluates the
+first decision's PK at. κ is drawn per occasion, so a supplied subject reads κ = 0. An
+oracle subject reads the κ of the first decision's occasion, the one the driver resolves
+the first dose's attributes under. With a record at the next decision, the disposition
+over the first window follows that record's occasion ([#943](https://github.com/FeRx-NLME/ferx-core/issues/943)), so the
+oracle's κ and the κ its first trough reflects can differ.
+
+**The oracle is never silent.** `dose_knowledge = oracle` is a perfect-information
+comparison arm, a standard benchmark in model-informed dosing studies. Each subject
+dosed from its drawn values has `dose_oracle = true` in its metrics
+(`AdaptiveSubjectMetrics::dose_oracle` in Rust), and the run warns:
+
+```
+W_ADAPTIVE_DOSE_ORACLE: 1 of 2 subject(s) were dosed from their simulated individual
+values (dose_knowledge = oracle; start_dose reads CL). This is a perfect-information
+arm: no prescriber has these values. Each such subject's metrics have dose_oracle =
+true.
+```
+
+A run in which every subject is supplied doses no subject from its drawn values, so it
+flags none and does not warn. A block whose dose expressions read no individual
+parameter that a random effect reaches, no random effect and no `MIXNUM` has nothing for
+the oracle to apply to, so
+`dose_knowledge = oracle` there is refused when the model is parsed.
+
+**Supplied values are taken as exact.** A supplied subject's η are both its simulated
+truth and its dosing input, so the run assumes the dose was computed from perfect
+estimates, which is optimistic. To represent estimation error, let the simulation draw
+the truth and pass the estimate as a data column (e.g. `CL_KNOWN`), which a dose
+expression reads as a covariate. The full treatment, where the controller estimates
+the individual values from the observations it sees, is the MAP-Bayes controller
+(#391, Part F).
 
 On a FREM model, a dose expression that reads a covariate doses from the value in the
 data, while a subject whose η is drawn has PK that follows its drawn covariate η — unless
 the model's own expressions read that column directly. The `W_FREM_DRAWN_ETA` warning
 then names the covariates the dose expressions read and the model does not, each with
 the first key that reads it.
+
+### Rounding doses to a grid
+
+`round_to = <step>` puts every dose the controller sets on a grid of multiples of
+`<step>` — the vial or tablet size a real order is written in
+([#944](https://github.com/FeRx-NLME/ferx-core/issues/944)):
+
+```
+  start_dose  = 15 * WT
+  dose_bounds = [250, min(30 * WT, 4000)]
+  round_to    = 250
+```
+
+The step is one number for every subject, finite and `> 0`. Each dose — the start
+dose, and the dose after each percentage step — goes through the same three steps:
+
+1. **Round** to the nearest multiple of the step. A value exactly halfway goes **up**
+   (375 → 500 with a step of 250). The halfway test allows for decimal steps, whose
+   quotients are rarely exact in binary (`0.35 / 0.1` is `3.4999999999999996`, and
+   still rounds up to 0.4).
+2. **Clamp** to the multiples inside `dose_bounds`: the lowest multiple at or above
+   the low bound and the highest at or below the high bound. With
+   `dose_bounds = [250, 1150]` and a step of 250, a step to 1300 rounds to 1250 and is
+   clamped to 1000; a dose never leaves the bounds as written. Rounding comes first:
+   clamping first would give 1150, which rounds to 1250, above the bound.
+3. **Carry** the rounded dose. The next step starts from the dose actually given:
+   500 +30% is 650, given as 750; the next +30% starts from 750 and gives 1000 (from
+   650 it would be 845, given as 750).
+
+The rounded dose is what every later decision re-issues when no rule fires; it is
+rounded once, when it is set.
+
+**An absorbed step looks like a clamped step.** A step the grid absorbs (500 +10% is
+550, which rounds back to 500) leaves the dose unchanged. The dose ledger records the
+rule that fired (`rule_fired`) and the unchanged `amt` — exactly the record a step
+clamped at a bound produces — and the metrics count it as neither an increase nor a
+decrease, since they count realized changes. There is no separate field for it.
+
+**A small step can be absorbed every time.** The rounded dose is carried, so a
+`p%` step moves a dose `d` only when it changes it by at least half a step
+(`d · p / 100 ≥ step / 2` on the way up; strictly more on the way down, since ties
+go up). Below that, the same rule fires
+at every decision and the dose never moves: with a step of 250, `increase 25%` from
+250 gives 312.5, which rounds back to 250, so a subject held at 250 stays there.
+Likewise, because ties go up, 500 `decrease 25%` gives 375, which rounds back to
+500. Choose the step and the percentages together so the lowest doses can still
+move, or check `rule_fired` against the realized `amt` in the ledger.
+
+`round_to` does not combine with `levels`: a ladder is already discrete, so write
+the rounded doses as the rungs. Without `round_to`, nothing changes: doses are clamped
+to `dose_bounds` only, as before.
+
+### When a grid is refused
+
+Bounds can be expressions, so the grid is checked for each subject before any subject
+runs (an oracle subject in each replicate, after its draw), and for numeric bounds when
+the file is parsed. Each refusal is `E_ADAPTIVE_DOSE_VALUE` and names the subject (and
+the replicate, for an oracle subject):
+
+- **No multiple inside the bounds.** With `dose_bounds = [10 * WT, 12 * WT]` and a step
+  of 250, a 20 kg subject's bounds are `[200, 240]`, which hold no multiple of 250.
+- **A low bound of 0, with percentage steps.** A dose could then round to 0, a dose
+  of 0 is a hold, and a running dose of 0 cannot rise again under percentage steps.
+  Set the low bound above 0: any positive value up to the step is lifted to the step,
+  so `dose_bounds = [1e-6, …]` and `[250, …]` both give a lowest dose of 250. A block
+  whose rules take no percentage step is not refused.
+
+```
+[adaptive_dosing] subject 1: with round_to = 250, dose_bounds = [WT - 20, 4000]
+evaluate to [0, 4000]: a low of 0 lets a dose round to 0, and a running dose of 0
+cannot rise again under percentage steps; set the lower bound above 0 (any value up
+to 250 raises it to 250). The dose expressions read WT = 20, at the first decision
+(t = 0).
+```
+
+A step that is not a finite number `> 0`, and `round_to` together with `levels`, are
+parse errors. Example: `examples/adaptive_vanco_mgkg_rounded.ferx`.
 
 ### Rules — `when signal <op> <value> : <action>`
 
@@ -187,8 +338,9 @@ order: `when signal > 20 : decrease 25%, lengthen`. A rule with only an interval
 effect re-issues the running dose. `stop` cannot be combined with an interval
 effect.
 
-A dose change is clamped to `dose_bounds`; a level step saturates at the ends of
-the ladder. When no rule matches (or a matched rule has not yet `confirm`-ed),
+A dose change is clamped to `dose_bounds` (with `round_to`, rounded first; see
+[Rounding doses to a grid](#rounding-doses-to-a-grid)); a level step saturates at the
+ends of the ladder. When no rule matches (or a matched rule has not yet `confirm`-ed),
 the running dose is **re-issued** unchanged — the regimen continues, an explicit
 no-op rather than a silent skip.
 
@@ -458,7 +610,9 @@ observes a 1-based compartment/endpoint under an [`ObserveMode`]:
 - `Dv` — the realized, assay-noised measurement: `IPRED + ε·√(residual variance)`,
   clamped at 0, with the residual variance taken from the endpoint's own
   `[error_model]`. This is the realistic TDM / titration signal — a clinician
-  titrates on a *measured* value, not the latent truth.
+  titrates on a *measured* value, not the latent truth. A residual-error magnitude
+  applies, evaluated at the decision
+  ([magnitudes and adaptive dosing](error-model.qmd#magnitude-adaptive)).
 
 Mode is chosen **per monitor**, so a PK exposure target can run on `Ipred` while a
 safety marker (e.g. ANC → CTCAE grade) runs on `Dv` in the same simulation.
@@ -756,6 +910,23 @@ within the cross-solver band at a supplied η = 0. The kit lives in
 `WT = 40`) reproduces the literal block (`1000`) bit for bit, and a block whose rules
 never fire matches `predict()` on each subject's frozen weight-based regimen.
 
+### The rounded-dose vancomycin anchor
+
+`round_to` is cross-checked against the same mrgsolve kit, in a second arm
+(`examples/adaptive_vanco_mgkg_rounded.ferx`, `expected_round_to.md`): the same model
+and rules with `round_to = 250` and `dose_bounds = [250, min(30 * WT, 4000)]`, on a
+40 kg and an 80 kg patient. The R loop rounds with the same rule (nearest multiple,
+ties up, then clamp to the multiples inside the bounds, then carry). Between them the
+two patients exercise each part of it: the 40 kg start dose of 600 mg is given as
+500 mg; a tie goes up (625 → 750 at 40 kg, 1875 → 2000 at 80 kg); the 30 mg/kg cap
+needs aligning (1200 → 1000, 2400 → 2250), where clamping before rounding would give a
+dose above the cap; and the 40 kg patient's second step starts from the carried
+750 mg and gives 1000 mg, where the unrounded 625 mg would give 750 mg. Every dose
+matches mrgsolve exactly, and the troughs agree within the same cross-solver band.
+Beside it, every shipped adaptive example runs bit-identically with and without this
+feature in the engine when `round_to` is absent, and a `round_to` whose grid already
+holds every dose the controller would set reproduces the run without it.
+
 ## Model time in a reactive run
 
 ### Decision times after a moved reset
@@ -793,6 +964,36 @@ record's covariates, gives the same predictions (`nonmem_anchor/adaptive_prestar
 The [verifier](#verification-on-by-default) starts its replay at the same origin. Up to
 #2125 it refused a run whose first decision came before the first record without a dose
 there: it started integrating at that decision instead.
+
+### Compartment on/off records
+
+A reactive run honours `EVID=2` rows that turn a compartment off (`CMT=-N`) and back on
+(`CMT=N`), with the rules of [Compartment on/off](../data-format.qmd#compartment-onoff-evid2-cmt-n)
+on the static path (#2753). Four points are specific to a controller:
+
+- **A decision at the same time as an on/off row comes after it.** The monitors read the
+  state the row leaves, and a dose decided there is a record after the row: it lands. This
+  is the order of a reset and a decision, and the order the reader gives a dose row written
+  after the off row. One exception follows file order: a row written *after* a dose row at
+  the same `TIME` takes effect after that dose, and a decision reads before the doses at its
+  time, so a decision there comes before the row. Its monitors read the amount, and a dose
+  it gives into that compartment is wiped by the row. Write the row before the dose row, or
+  give it its own `TIME`, to have the decision see it.
+- **A controller dose into an off compartment turns it on** when it arrives, as a recorded
+  dose does. A controller infusion running when an off row on its compartment arrives
+  stops there and does not resume when the compartment comes back.
+- **A monitor on an off compartment reads 0**, the amount held there. The static path
+  refuses an observation row of an off compartment (`E_OBS_CMT_OFF`), but a monitor is not
+  a data record. A `Dv` monitor there under a proportional error model reads a draw of
+  σ = 1e-6 around 0, possibly negative. That σ is the floor the residual-error variance is
+  held at to keep the likelihood finite, not a modelled assay error, so a controller should
+  not treat the reading as an assay result.
+- **`E_OBS_CMT_OFF` is checked on the data alone.** An observation row of a compartment
+  that only a controller dose would turn back on is still refused. Write an `EVID=2` on
+  row before it.
+
+The [verifier](#verification-on-by-default) replays the rows on the realized schedule, and
+the window AUC of an `auc_target` integrates the held zero over an off interval.
 
 ### Dose clocks before the first dose
 

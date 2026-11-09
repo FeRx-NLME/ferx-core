@@ -973,26 +973,27 @@ fn full_err(src: &str) -> String {
     }
 }
 
-/// Every read a dose expression may not make is refused when the model is parsed, by
+/// Every read a dose expression may never make is refused when the model is parsed, by
 /// name, with the whole message asserted (so deleting any sentence fails here). A
-/// θ-and-covariate expression on the same model parses, so the refusals are not a
-/// blanket rejection of expressions.
+/// θ-and-covariate expression, an individual parameter and a random effect on the same
+/// model parse: whether a subject may read its own values is decided per subject at run
+/// time (#944 PR2), so they are not refused here.
 ///
 /// Regressions, per row: the state check dropped (`2 * CENT` reads a zero state); the
 /// `TIME` check dropped (it evaluates to 0.0 outside the driver), or the `T` alias
-/// missed; κ reported with the shared compiler's `Form C … per observation` text; an
-/// individual parameter or η read let through to a zero PK / η slice; `MIXNUM` let
-/// through; a syntax error reported without the key.
+/// missed; κ reported with the shared compiler's `Form C … per observation` text, or
+/// without the route to the individual parameter; a syntax error reported without the
+/// key; and an individual parameter or η still refused outright (PR1's refusal kept).
 #[test]
 fn dose_expression_reads_are_refused_at_parse_time() {
-    let cases: [(bool, &str, &str); 7] = [
+    let cases: [(bool, &str, &str); 5] = [
         (
             false,
             "2 * CENT",
             "[adaptive_dosing] start_dose reads CENT, a state of the model. A dose \
              expression is evaluated once per subject, at the first decision; it may read \
-             data covariates and θ. To respond to the drug level, write a `when signal …` \
-             rule.",
+             data covariates, θ and the subject's individual parameters. To respond to the \
+             drug level, write a `when signal …` rule.",
         ),
         (
             false,
@@ -1011,23 +1012,9 @@ fn dose_expression_reads_are_refused_at_parse_time() {
             "100 * exp(KAPPA_CL)",
             "[adaptive_dosing] start_dose reads KAPPA_CL, an inter-occasion random effect. \
              It is drawn for each occasion, so it is never known at dosing time, even for a \
-             subject whose random effects are supplied.",
-        ),
-        (
-            false,
-            "400 * CL",
-            "[adaptive_dosing] start_dose reads CL, an individual parameter. A dose \
-             expression may read data covariates and θ; it cannot read a subject's own \
-             parameter values yet. To dose from a known value, carry it as a data column \
-             (e.g. CL_KNOWN) and read that.",
-        ),
-        (
-            false,
-            "1000 * exp(ETA_CL)",
-            "[adaptive_dosing] start_dose reads ETA_CL, a random effect. A dose expression \
-             may read data covariates and θ; it cannot read a subject's own parameter values \
-             yet. To dose from a known value, carry it as a data column (e.g. CL_KNOWN) and \
-             read that.",
+             subject whose random effects are supplied. Read the individual parameter \
+             instead: it is evaluated at the first decision, with KAPPA_CL = 0 for a \
+             supplied subject.",
         ),
         (false, "15 * (WT", "[adaptive_dosing] start_dose: "),
     ];
@@ -1043,17 +1030,19 @@ fn dose_expression_reads_are_refused_at_parse_time() {
             );
         }
     }
-    assert!(
-        crate::parser::model_parser::parse_full_model(&dose_model(true, "15 * WT * TVCL")).is_ok()
-    );
+    for ok in ["15 * WT * TVCL", "400 * CL", "1000 * exp(ETA_CL)"] {
+        assert!(
+            crate::parser::model_parser::parse_full_model(&dose_model(true, ok)).is_ok(),
+            "{ok} parses"
+        );
+    }
 }
 
-/// `MIXNUM` is drawn with the subject's class, so a dose expression cannot read it.
-///
-/// Regression: `MIXNUM` let through, evaluating to the class-1 default for every subject.
-#[test]
-fn a_dose_expression_reading_mixnum_is_refused() {
-    let src = "[parameters]
+/// A two-class `[mixture]` model whose dose expression reads `MIXNUM`, under
+/// `dose_knowledge = <knowledge>`.
+fn mixnum_model(knowledge: &str) -> String {
+    format!(
+        "[parameters]
   theta TVCL(5.0, 0.1, 50.0)
   theta TVV(50.0, 1.0, 500.0)
   theta MIXL(0.0, -5.0, 5.0)
@@ -1079,15 +1068,75 @@ fn a_dose_expression_reading_mixnum_is_refused() {
   start_dose = 100 * MIXNUM
   route = bolus(cmt=1)
   dose_bounds = [0, 400]
+  dose_knowledge = {knowledge}
   when signal < 1 : increase 25%
-";
+"
+    )
+}
+
+/// `MIXNUM` is drawn with the subject's class, and supplied η refuse a `[mixture]`
+/// model, so no subject's class is known: refused under `known`, with the oracle route
+/// named; read under `oracle`. One test holds both sides of the gate.
+///
+/// Regressions: `MIXNUM` let through under `known`, evaluating to the class-1 default
+/// for every subject; the refusal kept under `oracle`; the oracle route dropped from the
+/// message.
+#[test]
+fn a_dose_expression_reading_mixnum_is_refused_unless_oracle() {
+    let got = full_err(&mixnum_model("known"));
     assert!(
-        full_err(src).ends_with(
+        got.ends_with(
             "[adaptive_dosing] start_dose reads MIXNUM, the subject's mixture class, which \
-             the simulation draws; no prescriber knows it at dosing time."
+             the simulation draws; no prescriber knows it at dosing time. For a \
+             perfect-information comparison arm, set dose_knowledge = oracle, which is \
+             flagged in the results."
         ),
-        "{}",
-        full_err(src)
+        "{got}"
+    );
+    assert!(crate::parser::model_parser::parse_full_model(&mixnum_model("oracle")).is_ok());
+}
+
+/// `dose_knowledge` takes `known` or `oracle` (P5), and `oracle` must have a dose
+/// expression reading a subject value to apply to (C4): a covariate-only block, and a
+/// block of numbers, are refused under `oracle` and parse under `known`. A block reading
+/// `CL` parses under `oracle`.
+///
+/// Regressions: an unknown value read as `known`; C4 dropped (an oracle run that read no
+/// truth would still be flagged as one); C4 firing on a block that does read CL; C4 on a
+/// block of numbers skipped because it has no expressions.
+#[test]
+fn dose_knowledge_is_parsed_and_an_unused_oracle_is_refused() {
+    let with = |expr: &str, k: &str| {
+        dose_model(false, expr).replace(
+            "dose_bounds = [0, 4000]",
+            &format!("dose_bounds = [0, 4000]\n  dose_knowledge = {k}"),
+        )
+    };
+    assert_eq!(
+        full_err(&with("400 * CL", "perfect")),
+        "[adaptive_dosing]: dose_knowledge must be `known` or `oracle`, got `perfect`"
+    );
+    let c4 = "[adaptive_dosing] dose_knowledge = oracle has no effect: no dose expression \
+              reads an individual parameter, a random effect or MIXNUM.";
+    for expr in ["15 * WT", "500"] {
+        let got = full_err(&with(expr, "oracle"));
+        assert!(got.ends_with(c4), "{expr}: {got}");
+        assert!(
+            crate::parser::model_parser::parse_full_model(&with(expr, "known")).is_ok(),
+            "{expr} under known"
+        );
+    }
+    let p = crate::parser::model_parser::parse_full_model(&with("400 * CL", "oracle"))
+        .expect("oracle reading CL parses");
+    assert_eq!(
+        p.adaptive_dosing.expect("block").dose_knowledge,
+        crate::sim::adaptive::DoseKnowledge::Oracle
+    );
+    let p = crate::parser::model_parser::parse_full_model(&dose_model(false, "400 * CL"))
+        .expect("default");
+    assert_eq!(
+        p.adaptive_dosing.expect("block").dose_knowledge,
+        crate::sim::adaptive::DoseKnowledge::Known
     );
 }
 
@@ -1107,11 +1156,11 @@ fn a_dose_expression_refusal_names_its_own_key() {
     let src = dose_model(false, "500")
         .replace(
             "dose_bounds = [0, 4000]",
-            "dose_bounds = [0, 4000]\n  levels = [500, 400 * CL]",
+            "dose_bounds = [0, 4000]\n  levels = [500, 400 * CENT]",
         )
         .replace("increase 25%", "increase");
     let got = full_err(&src);
-    assert!(got.contains("[adaptive_dosing] levels reads CL"), "{got}");
+    assert!(got.contains("[adaptive_dosing] levels reads CENT"), "{got}");
     assert!(!got.contains("start_dose"), "{got}");
 }
 
@@ -1253,4 +1302,77 @@ fn a_mixed_block_is_checked_among_its_numbers_at_parse_time() {
             panic!("{lines:?} should parse: {e}");
         }
     }
+}
+
+// ── round_to (#944 PR3) ──
+
+/// `valid_min` with `start_dose = 500`, `dose_bounds = [250, 4000]` (a low above 0, so
+/// V8 does not apply) and `extra` appended.
+fn gridded(extra: &[&str]) -> Vec<String> {
+    let mut body: Vec<String> = valid_min()
+        .into_iter()
+        .map(|l| {
+            if l.starts_with("dose_bounds") {
+                "dose_bounds = [250, 4000]"
+            } else if l.starts_with("start_dose") {
+                "start_dose = 500"
+            } else {
+                l
+            }
+            .to_string()
+        })
+        .collect();
+    body.extend(extra.iter().map(|s| s.to_string()));
+    body
+}
+
+/// `round_to` parses into the spec; absent, it is `None`, so a block without it is the
+/// spec it was before PR3.
+///
+/// Mutation: the key parsed but not stored, or a default other than `None`.
+#[test]
+fn round_to_parses_and_defaults_to_none() {
+    let spec = parse_adaptive_dosing_block(&gridded(&["round_to = 250"])).unwrap();
+    assert_eq!(spec.round_to, Some(250.0));
+    let spec = parse_adaptive_dosing_block(&gridded(&[])).unwrap();
+    assert_eq!(spec.round_to, None);
+}
+
+/// P3 at parse time, with the value as written (`abc` is not a number at all, so it
+/// cannot come back through `f64` formatting). One sentence, asserted whole.
+///
+/// Mutations: a non-number accepted as an expression; `0` or a negative step accepted;
+/// `inf` accepted.
+#[test]
+fn round_to_must_be_a_finite_positive_number() {
+    for v in ["0", "-250", "inf", "NaN", "abc", "25 * WT"] {
+        let body = gridded(&[&format!("round_to = {v}")]);
+        assert_eq!(
+            parse_adaptive_dosing_block(&body).unwrap_err(),
+            format!("[adaptive_dosing]: round_to must be a finite number > 0: {v}"),
+            "{v}"
+        );
+    }
+}
+
+/// P4 at parse time: `round_to` beside a valid `levels` ladder.
+///
+/// Mutation: P4 only in a programmatic path, or after the ladder checks.
+#[test]
+fn round_to_with_levels_errors() {
+    let body = [
+        "observe = central",
+        "at = [24, 48]",
+        "start_dose = 500",
+        "route = bolus(cmt = 1)",
+        "dose_bounds = [250, 4000]",
+        "levels = [250, 500, 1000]",
+        "round_to = 250",
+        "when signal < 10 : increase",
+    ];
+    assert_eq!(
+        perr(&body),
+        "[adaptive_dosing]: round_to cannot be combined with levels: a levels ladder is \
+         already discrete, so write the rounded doses as the levels"
+    );
 }

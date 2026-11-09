@@ -59,6 +59,12 @@ pub(crate) fn gn_scale(x: &[f64], options: &FitOptions) -> Vec<f64> {
     }
 }
 
+/// Whether a pure Gauss–Newton loop spent its iteration budget (#2799): it ran (`maxiter >
+/// 0`) and no stop rule, collapse or cancel broke out of it before the range ended.
+pub(crate) fn gn_loop_budget_spent(maxiter: usize, exited_early: bool) -> bool {
+    maxiter > 0 && !exited_early
+}
+
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///
 /// Returns the same `OuterResult` as `optimize_population`.
@@ -164,19 +170,30 @@ pub fn run_foce_gn(
     let mut converged = false;
     // Best accepted iterate, so an interrupted run's checkpoint holds it (#1317).
     let mut best = crate::estimation::outer_optimizer::BestPoint::new();
+    // #2777: rejected steps in a row that no bound clamped, and the subjects whose
+    // EBE-response term `tᵢ` has been dropped from the gradient after such a run
+    // (`dominant_ebe_response_subject`). Sticky for the rest of the fit.
+    let mut unclamped_stalls: usize = 0;
+    let mut raw_score_subjects: Vec<usize> = Vec::new();
 
+    // #2799: the loop ran out of `maxiter` iterations — no stop rule, collapse or cancel
+    // ended it. Every `break` below sets `exited_early`, so a run that falls off the end of
+    // the range spent its budget. `maxiter = 0` runs no iteration and spends nothing (an
+    // evaluation).
+    let mut exited_early = false;
     for iter in 1..=maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
                 eprintln!("  GN iter {:>3}: cancelled by user", iter);
             }
             warnings.push("cancelled by user".to_string());
+            exited_early = true;
             break;
         }
 
         // ---- Build the BHHH system ----
         // Gradient + outer-product Hessian approximation
-        let (mut grad, mut h_bhhh) = build_gn_system(
+        let (mut grad, mut h_bhhh, mut per_subj_t) = build_gn_system_parts(
             &x,
             init_params,
             model,
@@ -204,19 +221,49 @@ pub fn run_foce_gn(
             priors.add_hessian(&mut |i, j, v| h_bhhh[(i, j)] += v);
         }
 
+        // #2777: one subject whose EBE mode sits near a fold can own the step
+        // direction through its `tᵢ`, which is exact at the point and wrong over any
+        // step GN can take. After a run of unclamped rejections, take such a subject
+        // back to its raw score `gᵢ`; the BHHH matrix already uses `gᵢ`. Only the
+        // coordinates the step can move count: a FIX one, or one held on its bound,
+        // played no part in the rejections.
+        for &s in &raw_score_subjects {
+            drop_ebe_response(&mut grad, &mut per_subj_t[s]);
+        }
+        if unclamped_stalls >= GN_DOMINANT_SUBJECT_STALLS {
+            let held = bound_active_outward(&x, &grad, &bounds);
+            let free: Vec<bool> = (0..n_packed).map(|i| !fixed_mask[i] && !held[i]).collect();
+            if let Some(s) = dominant_ebe_response_subject(&per_subj_t, &grad, &gn_scale, &free) {
+                drop_ebe_response(&mut grad, &mut per_subj_t[s]);
+                raw_score_subjects.push(s);
+                warnings.push(format!(
+                    "Gauss-Newton: subject {} dominated the gradient through its EBE \
+                     response (a mode that moves sharply with the parameters) and stalled \
+                     the trust region; its raw score is used for the rest of the fit",
+                    population.subjects[s].id
+                ));
+                if verbose {
+                    eprintln!(
+                        "  GN iter {:>3}: subject {} dominates the EBE-response term, \
+                         using its raw score",
+                        iter, population.subjects[s].id
+                    );
+                }
+            }
+            unclamped_stalls = 0;
+        }
+
         // Zero gradient rows / BHHH rows & cols for FIX parameters, and set
         // their diagonal to 1. The clamp at step-application keeps x[i] at its
         // pinned value; this form guarantees the Cholesky solve gives
         // `delta[i] = 0` exactly (rather than relying on the clamp to hide a
-        // large, meaningless step).
+        // large, meaningless step). A coordinate on a bound whose descent points
+        // out of the box is held the same way for this iteration (#2777); read
+        // after any raw-score switch above, which can change the gradient's sign.
+        let held = bound_active_outward(&x, &grad, &bounds);
         for i in 0..n_packed {
-            if fixed_mask[i] {
-                grad[i] = 0.0;
-                for j in 0..n_packed {
-                    h_bhhh[(i, j)] = 0.0;
-                    h_bhhh[(j, i)] = 0.0;
-                }
-                h_bhhh[(i, i)] = 1.0;
+            if fixed_mask[i] || held[i] {
+                hold_coordinate(&mut grad, &mut h_bhhh, i);
             }
         }
 
@@ -246,8 +293,7 @@ pub fn run_foce_gn(
         let delta_s = solve_trust_region_subproblem(&grad_s, &h_s, trust_radius, cg_budget);
 
         // Predicted decrease in the scaled quadratic model: -gᵀδ - ½ δᵀHδ
-        let h_s_delta_s = &h_s * &delta_s;
-        let pred_reduction = -grad_s.dot(&delta_s) - 0.5 * delta_s.dot(&h_s_delta_s);
+        let pred_reduction = model_reduction(&grad_s, &h_s, &delta_s);
 
         if pred_reduction < 1e-10 {
             if grad_s.norm() < 1e-8 {
@@ -259,6 +305,7 @@ pub fn run_foce_gn(
                         iter
                     );
                 }
+                exited_early = true;
                 break;
             } else {
                 // Degenerate BHHH: near-zero quadratic improvement despite a
@@ -274,6 +321,7 @@ pub fn run_foce_gn(
                     warnings.push(
                         "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed".to_string(),
                     );
+                    exited_early = true;
                     break;
                 }
                 if verbose {
@@ -290,9 +338,20 @@ pub fn run_foce_gn(
         let delta =
             DVector::from_iterator(n_packed, (0..n_packed).map(|i| delta_s[i] * gn_scale[i]));
         let mut x_try = x.clone();
+        let mut clamped = false;
         for i in 0..n_packed {
             x_try[i] = (x[i] + delta[i]).clamp(bounds.lower[i], bounds.upper[i]);
+            clamped |= x_try[i] != x[i] + delta[i];
         }
+        // rho is measured against the reduction the model predicts for the step
+        // actually taken. On the unclamped `delta_s` a clamped coordinate still
+        // claims its share, so rho is a fixed ratio below 0.25 at every radius and
+        // the region collapses (#2777, `one_cpt_transit`: 0.214 down to 1e-10).
+        let pred_taken = if clamped {
+            taken_step_reduction(&grad_s, &h_s, &x, &x_try, &gn_scale)
+        } else {
+            pred_reduction
+        };
 
         let params_try = unpack_params(&x_try, init_params);
         let try_mu_k = compute_mu_k(model, &params_try.theta, options.mu_referencing);
@@ -326,8 +385,9 @@ pub fn run_foce_gn(
 
         // TR ratio: actual OFV decrease vs quadratic model decrease.
         // rho < 0 or non-finite OFV → reject.
-        let rho = if ofv_try.is_finite() {
-            (ofv - ofv_try) / pred_reduction
+        // A clamped step the model no longer predicts to descend is rejected too.
+        let rho = if ofv_try.is_finite() && pred_taken > 0.0 {
+            (ofv - ofv_try) / pred_taken
         } else {
             -1.0
         };
@@ -335,6 +395,12 @@ pub fn run_foce_gn(
         let radius_before = trust_radius;
         let (new_radius, accepted) = update_trust_radius(rho, trust_radius, delta_max);
         trust_radius = new_radius;
+
+        if accepted || clamped {
+            unclamped_stalls = 0;
+        } else {
+            unclamped_stalls += 1;
+        }
 
         if !accepted {
             // Trace: rejected step — use radius_before so the column records
@@ -368,6 +434,7 @@ pub fn run_foce_gn(
                     eprintln!("  GN iter {:>3}: trust radius collapsed, stopping", iter);
                 }
                 warnings.push("Gauss-Newton: trust radius collapsed".to_string());
+                exited_early = true;
                 break;
             }
             if verbose {
@@ -441,10 +508,12 @@ pub fn run_foce_gn(
             if verbose {
                 eprintln!("  Converged: relative OFV change = {:.2e}", rel_change);
             }
+            exited_early = true;
             break;
         }
     }
 
+    let gn_budget_spent = gn_loop_budget_spent(maxiter, exited_early);
     if !converged {
         warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
         // #1006: at n_eta = 0 an unconverged pure-GN run is the state that
@@ -536,8 +605,16 @@ pub fn run_foce_gn(
             warnings: cov_warnings,
             sir_fallback_proposal,
             method: covariance_method,
+            newton_decrement,
+            non_stationary_optimum,
         } = out;
         warnings.extend(cov_warnings);
+        // #2785: the LM stop rule is a small step, which a stall satisfies too.
+        crate::estimation::covariance::demote_non_stationary_optimum(
+            non_stationary_optimum,
+            &mut converged,
+            &mut warnings,
+        );
 
         // #1303: `converged` here is the LM loop's own stop rule (a small
         // parameter/objective step), which a run whose objective went `NaN`
@@ -592,6 +669,9 @@ pub fn run_foce_gn(
             start_eval: None,
             mcem_lowest_objective: None,
             mcem_objective_trail: None,
+            newton_decrement,
+            optimizer_stop: None,
+            eval_budget_spent: gn_budget_spent,
         };
     }
 
@@ -720,8 +800,16 @@ pub fn run_foce_gn(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum,
     } = out;
     warnings.extend(cov_warnings);
+    // #2785: whichever half supplied the estimate, it is not a stationary point.
+    crate::estimation::covariance::demote_non_stationary_optimum(
+        non_stationary_optimum,
+        &mut converged,
+        &mut warnings,
+    );
 
     // #1303 — the hybrid's verdict is `polish_result.converged || converged`, an
     // OR that can keep a `true` from whichever half did *not* supply `final_ofv`.
@@ -772,6 +860,12 @@ pub fn run_foce_gn(
         start_eval: None,
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement,
+        optimizer_stop: None,
+        // The hybrid's estimate is the FOCEI polish's or the GN phase's; the polish runs its
+        // own fixed 100-evaluation budget, not the user's `maxiter`, so neither half's budget
+        // is the fit's to report (#2799).
+        eval_budget_spent: false,
     }
 }
 
@@ -852,6 +946,126 @@ fn update_trust_radius(rho: f64, current: f64, delta_max: f64) -> (f64, bool) {
         ((current * 2.0).min(delta_max), true)
     } else {
         (current, true)
+    }
+}
+
+/// Take coordinate `i` out of the trust-region subproblem: zero its gradient entry and
+/// its BHHH row and column, and set the diagonal to 1, so the solve returns
+/// `delta[i] = 0` exactly. Used for FIX coordinates and for bound-active ones
+/// ([`bound_active_outward`]).
+fn hold_coordinate(grad: &mut DVector<f64>, h: &mut DMatrix<f64>, i: usize) {
+    let n = grad.len();
+    grad[i] = 0.0;
+    for j in 0..n {
+        h[(i, j)] = 0.0;
+        h[(j, i)] = 0.0;
+    }
+    h[(i, i)] = 1.0;
+}
+
+/// Coordinates sitting on a packed bound whose descent direction `−grad` points out of
+/// the box (#2777). The step clamps them back to the bound, so the coordinate never
+/// moves; left in the subproblem it still bends the rest of the step toward it and
+/// claims part of the predicted reduction. Holding them like FIX coordinates for the
+/// iteration is the projected (active-set) trust region. A coordinate on a bound
+/// whose gradient points back inside stays free.
+fn bound_active_outward(x: &[f64], grad: &DVector<f64>, bounds: &PackedBounds) -> Vec<bool> {
+    (0..x.len())
+        .map(|i| {
+            (x[i] >= bounds.upper[i] && grad[i] < 0.0) || (x[i] <= bounds.lower[i] && grad[i] > 0.0)
+        })
+        .collect()
+}
+
+/// Reduction the quadratic model `m(s) = gᵀs + ½ sᵀHs` predicts for the step `s`:
+/// `−gᵀs − ½ sᵀHs`.
+fn model_reduction(g: &DVector<f64>, h: &DMatrix<f64>, s: &DVector<f64>) -> f64 {
+    -g.dot(s) - 0.5 * s.dot(&(h * s))
+}
+
+/// [`model_reduction`] for the step actually taken from `x` to the clamped `x_try`,
+/// in the scaled space the model was built in (#2777). A coordinate the clamp held still
+/// contributes nothing, where the unclamped step would credit it its full share.
+fn taken_step_reduction(
+    g_s: &DVector<f64>,
+    h_s: &DMatrix<f64>,
+    x: &[f64],
+    x_try: &[f64],
+    scale: &[f64],
+) -> f64 {
+    let taken_s =
+        DVector::from_iterator(x.len(), (0..x.len()).map(|i| (x_try[i] - x[i]) / scale[i]));
+    model_reduction(g_s, h_s, &taken_s)
+}
+
+/// Consecutive rejected, unclamped steps after which GN looks for one subject whose
+/// EBE-response term `tᵢ` sets the step direction ([`dominant_ebe_response_subject`]).
+/// Three rejections shrink the radius 64×: a step direction that is right at the point
+/// but wrong over every usable radius (#2777) already shows by then, while an ordinary
+/// overshoot is usually fixed by one or two shrinks.
+const GN_DOMINANT_SUBJECT_STALLS: usize = 3;
+
+/// How many times the next-largest subject's `‖tᵢ‖` the largest must be to count as
+/// dominant. #2777's private ODE IOV model measured 4919 against 1.0.
+const GN_DOMINANT_SUBJECT_RATIO: f64 = 10.0;
+
+/// The subject whose EBE-response term `tᵢ` alone sets GN's step direction, if any (#2777).
+///
+/// A subject whose EBE mode sits near a fold has a correct `tᵢ = dᵢ − gᵢ` at the point,
+/// but the slope changes over a distance far smaller than any step GN can take, so a
+/// direction it dominates is wrong at every radius and the trust region collapses. A
+/// subject qualifies when, in the scaled space the step is solved in (`scale`), its
+/// `‖tᵢ‖∞` is at least [`GN_DOMINANT_SUBJECT_RATIO`] times every other subject's, and on
+/// some coordinate its contribution `2·tᵢ[k]` outweighs the rest of the gradient
+/// `grad[k] − 2·tᵢ[k]`. With fewer than two subjects there is nothing to compare against.
+/// Both tests read only the coordinates `free` marks: a FIX coordinate, or one held on
+/// its bound, never entered the steps that were rejected.
+fn dominant_ebe_response_subject(
+    per_subj_t: &[Vec<f64>],
+    grad: &DVector<f64>,
+    scale: &[f64],
+    free: &[bool],
+) -> Option<usize> {
+    if per_subj_t.len() < 2 {
+        return None;
+    }
+    let norms: Vec<f64> = per_subj_t
+        .iter()
+        .map(|t| {
+            t.iter()
+                .zip(scale)
+                .zip(free)
+                .filter(|(_, &f)| f)
+                .map(|((tk, sk), _)| (tk * sk).abs())
+                .fold(0.0, f64::max)
+        })
+        .collect();
+    if norms.iter().any(|m| !m.is_finite()) {
+        return None;
+    }
+    let (s, &top) = norms.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+    let runner_up = norms
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != s)
+        .map(|(_, &m)| m)
+        .fold(0.0, f64::max);
+    if top <= 0.0 || top < GN_DOMINANT_SUBJECT_RATIO * runner_up {
+        return None;
+    }
+    let sets_direction = per_subj_t[s]
+        .iter()
+        .enumerate()
+        .any(|(k, &tk)| free[k] && (2.0 * tk).abs() > (grad[k] - 2.0 * tk).abs());
+    sets_direction.then_some(s)
+}
+
+/// Take one subject's EBE-response term `t` back out of the gradient (`grad −= 2·t`) and
+/// zero it, so the subject contributes its raw score and cannot be picked again.
+fn drop_ebe_response(grad: &mut DVector<f64>, t: &mut [f64]) {
+    for (g, tk) in grad.iter_mut().zip(t.iter_mut()) {
+        *g -= 2.0 * *tk;
+        *tk = 0.0;
     }
 }
 
@@ -2032,11 +2246,43 @@ pub(crate) fn fixed_ebe_score_drops_ebe_response(model: &CompiledModel) -> bool 
     model.n_eta > 0 && (model.has_tte() || model.has_discrete())
 }
 
+/// Whether GN's and trust-region's **gradient** for this model takes the exact total
+/// derivative `dᵢ` of every (non-IOV) subject rather than the fixed-EBE score `gᵢ` plus the
+/// closed form's `gn_theta_correction` (#2740).
+///
+/// Wider than [`fixed_ebe_score_drops_ebe_response`], which keeps routing the NLopt
+/// dispatcher: every **FOCEI** model with η is in. Its Laplace marginal carries
+/// `log|H̃(η̂)|`, which the envelope theorem does not zero, and neither cheap stand-in for
+/// `∂_η log|H̃| · dη̂/dx` was right. The kernel-score path (M3, IIV on RUV, a θ-dependent
+/// residual magnitude, `block_sigma`, FREM) had no cache and so `tᵢ = 0`: on
+/// `warfarin_bloq` GN's θ gradient read 49.86 against a central difference of 6.86. The
+/// closed form's θ-only correction drops the `errⱼ·∂²fⱼ/∂η∂θ` and `∂Rⱼ/∂θ` cross terms,
+/// replaces the exact inner Hessian by the Gauss–Newton `H̃`, and has no Ω/σ block: on
+/// `schnider` it read −1.40 against 4.37 on θ₁. Once the trust radius is small, GN's
+/// acceptance ratio is the true slope along δ over GN's, so a wrong gradient collapsed the
+/// radius far from the optimum (#2738). Taking `dᵢ` closed the GN − FOCEI OFV gap from
+/// +10.62 to 0.000 on `warfarin_bloq` and from +0.93 to 0.000 on `pkpd_nonmem`.
+///
+/// FOCE (`interaction = false`) keeps the score: its gradient is not the subject of the
+/// measurements above. A CTMM endpoint stays out for the reason given on
+/// [`fixed_ebe_score_drops_ebe_response`].
+pub(crate) fn gn_gradient_takes_total_derivative(
+    model: &CompiledModel,
+    options: &FitOptions,
+) -> bool {
+    #[cfg(feature = "markov")]
+    if model.has_ctmm() {
+        return false;
+    }
+    fixed_ebe_score_drops_ebe_response(model) || (model.n_eta > 0 && options.interaction)
+}
+
 /// The per-subject term `tᵢ` that GN and trust-region add to the raw fixed-EBE score `gᵢ`
 /// in their **gradient**, `2·Σ(gᵢ + tᵢ)`. Their BHHH Hessian `4·Σ gᵢgᵢᵀ` stays on `gᵢ`.
 ///
-/// For a model inside [`fixed_ebe_score_drops_ebe_response`] the FD branch returns no
-/// `cache`, so `tᵢ` is the gap to this subject's total derivative: `tᵢ = dᵢ − gᵢ`, `dᵢ` the
+/// For a model inside [`gn_gradient_takes_total_derivative`] — every FOCEI model with η,
+/// and a TTE / discrete one under FOCE too — `tᵢ` is the gap to this subject's total
+/// derivative: `tᵢ = dᵢ − gᵢ`, `dᵢ` the
 /// adjoint's exact packed gradient (`subject_adjoint_gradient_at`, which carries the mode
 /// response), or for a subject it declines the reconverged difference
 /// (`outer_optimizer::subject_reconverged_fd_gradient`). The gradient is then `2·Σ dᵢ`, the
@@ -2044,7 +2290,8 @@ pub(crate) fn fixed_ebe_score_drops_ebe_response(model: &CompiledModel) -> bool 
 /// the raw score, as it does for a Gaussian FOCEI model whose `gᵢ` also lacks `tᵢ`; folding
 /// `dᵢ` into the outer product as well measured worse (see `build_gn_system`).
 ///
-/// This fixes `method = gn` on a single-endpoint TTE model (`examples/tte_exponential.ferx`:
+/// This fixes `method = gn` on a Gaussian FOCEI model (#2740, see
+/// [`gn_gradient_takes_total_derivative`]) and on a single-endpoint TTE model (`examples/tte_exponential.ferx`:
 /// 166.4983 reported as converged → 166.4395, BOBYQA 166.4394). It does not rescue GN on the
 /// joint PK + TTE example, which fails to converge with or without it (71.92 before, 72.63
 /// after, optimum 66.975); `gn_hybrid` reaches the optimum on both.
@@ -2058,6 +2305,9 @@ pub(crate) fn fixed_ebe_score_drops_ebe_response(model: &CompiledModel) -> bool 
 /// it `method = gn` stopped on `examples/warfarin_iov.ferx` at 331.762270 reporting
 /// convergence, near its initial estimates, against the L-BFGS optimum 308.830465 (#2455).
 /// The adjoint's `dᵢ` is not masked on FIX'd coordinates; `build_gn_system` zeroes them.
+///
+/// Under `gradient = fd` (model, `FitOptions`, or the fit-scoped flag) or a model outside
+/// the adjoint's scope, `dᵢ` is always the reconverged difference.
 ///
 /// Otherwise, or when the subject is repelled (`nll` unusable, `gᵢ` or `dᵢ` non-finite),
 /// it is the closed form's `gn_theta_correction`, or zero without a cache.
@@ -2094,14 +2344,21 @@ pub(crate) fn ebe_response_correction(
         }
     }
     if kappas.is_empty()
-        && fixed_ebe_score_drops_ebe_response(model)
+        && gn_gradient_takes_total_derivative(model, options)
         && is_usable_subject_nll(nll)
         && gi.iter().all(|v| v.is_finite())
     {
         let subject = &population.subjects[subj_idx];
         // The exact total derivative `dᵢ` — the adjoint's packed gradient carries the mode
-        // response the fixed-EBE score drops. IOV subjects took the arm above.
-        let exact = crate::estimation::covariance::stacked_mode(model, subject, eta_hat, None)
+        // response the fixed-EBE score drops. IOV subjects took the arm above. Asked only
+        // where the NLopt dispatch would ask it (`analytic_outer_gradient_available`, which
+        // reads the fit-scoped `gradient = fd` too, as the IOV arm's `pt` does) and where the
+        // caller's own options do not force FD; otherwise the reconverged difference below.
+        let analytic = crate::sens::provider::analytic_outer_gradient_available(model)
+            && GradientMethod::effective(model, options) != GradientMethod::Fd;
+        let exact = analytic
+            .then(|| crate::estimation::covariance::stacked_mode(model, subject, eta_hat, None))
+            .flatten()
             .and_then(|b| {
                 let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
                 crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
@@ -2465,6 +2722,7 @@ pub(crate) fn subject_nll_pop_grad_with_cache(
 /// Each subject contributes its per-subject NLL gradient g_i; the totals are:
 ///   grad(OFV) = 2 * Σ_i g_i
 ///   H_bhhh(OFV) ≈ 4 * Σ_i g_i g_i^T   (BHHH approximation)
+#[allow(clippy::too_many_arguments)]
 fn build_gn_system(
     x: &[f64],
     template: &ModelParameters,
@@ -2476,6 +2734,27 @@ fn build_gn_system(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> (DVector<f64>, DMatrix<f64>) {
+    let (grad, h_bhhh, _) = build_gn_system_parts(
+        x, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
+    );
+    (grad, h_bhhh)
+}
+
+/// [`build_gn_system`], also returning each subject's EBE-response term `tᵢ` (unscaled
+/// packed space, before the factor 2 the gradient applies), so the step loop can take a
+/// subject back to its raw score (#2777, [`dominant_ebe_response_subject`]).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn build_gn_system_parts(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> (DVector<f64>, DMatrix<f64>, Vec<Vec<f64>>) {
     let n = x.len();
     let n_subj = population.subjects.len();
     // One unpack for the population, read by every IOV subject's outer gradient (#2455).
@@ -2568,7 +2847,8 @@ fn build_gn_system(
         }
     }
 
-    (grad, h_bhhh)
+    let per_subj_t = per_subj.into_iter().map(|(_, _, ti)| ti).collect();
+    (grad, h_bhhh, per_subj_t)
 }
 
 /// Compute FOCE NLL for a single subject at given parameters with fixed EBEs.
@@ -3076,6 +3356,182 @@ mod tests {
         );
     }
 
+    /// #2777: a coordinate on a bound is held only when `−grad` points out of the box.
+    /// Each bound is checked on both signs of the gradient, and an interior coordinate
+    /// with either sign stays free.
+    #[test]
+    fn bound_active_outward_holds_only_coordinates_pushed_out_of_the_box() {
+        let bounds = PackedBounds {
+            lower: vec![0.0; 6],
+            upper: vec![1.0; 6],
+        };
+        let x = [1.0, 1.0, 0.0, 0.0, 0.5, 0.5];
+        let grad = DVector::from_vec(vec![-1.0, 1.0, 1.0, -1.0, -1.0, 1.0]);
+        assert_eq!(
+            bound_active_outward(&x, &grad, &bounds),
+            vec![true, false, true, false, false, false]
+        );
+    }
+
+    /// #2777: the held coordinate gets `delta = 0` from the subproblem, and the rest of
+    /// the step is the one the reduced system gives.
+    #[test]
+    fn a_held_coordinate_does_not_move_in_the_trust_region_step() {
+        let mut g = DVector::from_vec(vec![-2.0, 1.0]);
+        let mut h = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
+        hold_coordinate(&mut g, &mut h, 0);
+        assert_eq!(g, DVector::from_vec(vec![0.0, 1.0]));
+        assert_eq!(h, DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+        let step = solve_trust_region_subproblem(&g, &h, 10.0, 10);
+        assert_eq!(step[0], 0.0);
+        assert!((step[1] + 1.0).abs() < 1e-12, "got {step:?}");
+        // −gᵀs − ½sᵀHs at s = (0, −1): 1 − 0.5.
+        assert!((model_reduction(&g, &h, &step) - 0.5).abs() < 1e-12);
+    }
+
+    /// #2777: rho is measured against the step taken. With coordinate 0 already on its
+    /// upper bound, the clamp turns the proposed `(1, −1)` into `(0, −1)`; the reduction
+    /// must be the model's on `(0, −1)`, here 0.5, not on `(1, −1)` (1.5), which credits
+    /// the coordinate that never moved. The scale divides the taken step back into the
+    /// model's space.
+    #[test]
+    fn the_predicted_reduction_is_for_the_clamped_step() {
+        let g = DVector::from_vec(vec![-2.0, 1.0]);
+        let h = DMatrix::from_row_slice(2, 2, &[2.0, 0.0, 0.0, 1.0]);
+        let x = [1.0, 0.0];
+        let x_try = [1.0, -1.0];
+        assert!((taken_step_reduction(&g, &h, &x, &x_try, &[1.0, 1.0]) - 0.5).abs() < 1e-12);
+        assert!((model_reduction(&g, &h, &DVector::from_vec(vec![1.0, -1.0])) - 1.5).abs() < 1e-12);
+        // Scale 2 on coordinate 1: the taken −1 is −0.5 in the model's space,
+        // −gᵀs − ½sᵀHs = 0.5 − 0.125.
+        assert!((taken_step_reduction(&g, &h, &x, &x_try, &[1.0, 2.0]) - 0.375).abs() < 1e-12);
+    }
+
+    /// #2777: a step that crosses a bound before the coordinate is active is judged on
+    /// the step taken. Unbounded, this fixture's TVV ends at 49.868 from its start of 50;
+    /// a lower bound of 49.95 sits between the two, so the first step clamps TVV. On the
+    /// taken step the first iteration is accepted and the fit moves onto the bound; on
+    /// the unclamped prediction rho credits the clamped share and rejects it, and the
+    /// one-iteration fit stays at the start.
+    #[test]
+    fn a_step_clamped_by_a_bound_is_judged_on_the_step_taken() {
+        let mut model = make_model();
+        model.default_params.theta_lower[1] = 49.9999;
+        model.default_params.omega_fixed = vec![true];
+        model.default_params.sigma_fixed = vec![true];
+        let pop = make_population();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            ..Default::default()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(
+            (res.params.theta[1] / 49.9999 - 1.0).abs() < 1e-12,
+            "the first step must be accepted onto the TVV bound: TVV = {}",
+            res.params.theta[1]
+        );
+    }
+
+    /// #2777: a subject is dominant only when its scaled `‖tᵢ‖∞` is at least 10× every
+    /// other subject's *and* it outweighs the rest of the gradient on some coordinate.
+    /// Each condition is broken alone, and the passing case is the issue's measured one
+    /// (4919 against 1.0 on TVQ, the rest of the gradient −184).
+    #[test]
+    fn dominant_ebe_response_subject_needs_both_dominance_and_direction() {
+        let scale = [1.0, 1.0];
+        let free = [true, true];
+        let others = vec![vec![1.0, 0.2]; 4];
+        let with = |t: Vec<f64>| {
+            let mut all = others.clone();
+            all.insert(2, t);
+            all
+        };
+        // grad = 2·Σtᵢ + rest, with rest = (−184 − 8, 30) so the rest of the gradient
+        // on k = 0 is −184 once the dominant 2·4919 is removed.
+        let grad_for = |ts: &[Vec<f64>], rest: [f64; 2]| {
+            DVector::from_iterator(
+                2,
+                (0..2).map(|k| rest[k] + 2.0 * ts.iter().map(|t| t[k]).sum::<f64>()),
+            )
+        };
+        let ts = with(vec![4919.0, 3.0]);
+        let g = grad_for(&ts, [-192.0, 30.0]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &free),
+            Some(2)
+        );
+
+        // Under 10× the runner-up: not dominant.
+        let ts = with(vec![9.0, 0.0]);
+        let g = grad_for(&ts, [-192.0, 30.0]);
+        assert_eq!(dominant_ebe_response_subject(&ts, &g, &scale, &free), None);
+
+        // Dominant over the subjects, but the rest of the gradient outweighs it on
+        // every coordinate.
+        let ts = with(vec![4919.0, 3.0]);
+        let g = grad_for(&ts, [1e5, 1e5]);
+        assert_eq!(dominant_ebe_response_subject(&ts, &g, &scale, &free), None);
+
+        // The comparison is made in the scaled space the step is solved in: the same
+        // `tᵢ` stops dominating when its coordinate is scaled down below the others'.
+        let ts = with(vec![4919.0, 0.0]);
+        let g = grad_for(&ts, [-192.0, 30.0]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &[1e-4, 1.0], &free),
+            None
+        );
+
+        // A held or FIX coordinate does not count (#2777 review). Each mask is broken
+        // alone. Norm: dominant only through coordinate 0; on coordinate 1 alone its 1.0
+        // is 5× the others' 0.2, under the ratio, while it does outweigh the rest of the
+        // gradient there (rest 0 once its 2·1.0 is removed), so only the norm's mask
+        // rejects it.
+        let ts = with(vec![4919.0, 1.0]);
+        let g = grad_for(&ts, [-192.0, -1.6]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &[false, true]),
+            None,
+            "the norm must read only free coordinates"
+        );
+        // Direction: dominant on both coordinates, but outweighs the rest only on 0.
+        let ts = with(vec![4919.0, 4919.0]);
+        let g = grad_for(&ts, [-192.0, 1e6]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &[true, true]),
+            Some(2)
+        );
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &[false, true]),
+            None,
+            "the direction test must read only free coordinates"
+        );
+
+        // One subject has nothing to be dominant over; a non-finite `tᵢ` is not ranked.
+        let one = vec![vec![4919.0, 0.0]];
+        assert_eq!(
+            dominant_ebe_response_subject(&one, &grad_for(&one, [0.0, 0.0]), &scale, &free),
+            None
+        );
+        let ts = with(vec![f64::NAN, 0.0]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &DVector::zeros(2), &scale, &free),
+            None
+        );
+    }
+
+    /// #2777: dropping a subject's `tᵢ` leaves its raw score in the gradient and zeroes
+    /// the term, so a second detection cannot pick the same subject.
+    #[test]
+    fn drop_ebe_response_restores_the_raw_score_and_clears_the_term() {
+        let mut grad = DVector::from_vec(vec![10.0, -4.0]);
+        let mut t = vec![3.0, -1.0];
+        drop_ebe_response(&mut grad, &mut t);
+        assert_eq!(grad, DVector::from_vec(vec![4.0, -2.0]));
+        assert_eq!(t, vec![0.0, 0.0]);
+    }
+
     /// Verify that build_gn_system returns a gradient and BHHH Hessian with
     /// correct dimensions and that the gradient matches a sequential central-FD
     /// reference to within numerical noise.
@@ -3098,7 +3554,11 @@ mod tests {
             .map(|_| nalgebra::DMatrix::zeros(n_obs, n_eta))
             .collect();
         let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
-        let options = FitOptions::default();
+        // FOCE: its GN gradient is the fixed-EBE score, which this η̂ = 0 / H = 0 reference
+        // differences. Under FOCEI the gradient is the total derivative at the mode
+        // (#2740), pinned by `gn_system_gradient_is_the_reconverged_fd_on_a_focei_model`.
+        let mut options = FitOptions::default();
+        options.interaction = false;
 
         let (grad, h_bhhh) = build_gn_system(
             &x,
@@ -3571,6 +4031,315 @@ mod tests {
                 ref_j,
             );
         }
+    }
+
+    /// #2740: on a Gaussian FOCEI model GN's per-subject gradient `gᵢ + tᵢ` must be the
+    /// total derivative of the objective it evaluates — the central difference of the
+    /// subject NLL with η̂ re-solved warm at every point (`subject_reconverged_fd_gradient`)
+    /// — not the fixed-EBE score plus the closed form's θ-only `gn_theta_correction`.
+    ///
+    /// One example per path the defect lived on: `warfarin_bloq` (M3, the kernel score,
+    /// where `tᵢ` was zero), `schnider` and `pkpd_nonmem` (the Almquist closed form, whose
+    /// correction drops cross terms and has no Ω/σ block; `pkpd_nonmem` also per-CMT
+    /// error). Taken at the initial estimates, away from the optimum, where the trust
+    /// region collapsed. Each case also asserts the **old** gradient misses the oracle by
+    /// far more than the tolerance, so the test fails on the pre-#2740 routing.
+    #[test]
+    fn gn_gradient_is_the_total_derivative_on_gaussian_focei_models() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let cases = [
+            ("examples/warfarin_bloq.ferx", "data/warfarin_bloq.csv"),
+            ("examples/schnider.ferx", "data/schnider_propofol.csv"),
+            ("examples/pkpd_nonmem.ferx", "data/pkpd_nonmem.csv"),
+        ];
+        for (m, d) in cases {
+            let prep =
+                crate::api::prepare_run(&format!("{root}/{m}"), Some(&format!("{root}/{d}")))
+                    .unwrap();
+            let model = &prep.parsed.model;
+            let template = &prep.init_params;
+            let options = &prep.parsed.fit_options;
+            assert!(
+                options.interaction && model.n_eta > 0,
+                "{m}: fixture precondition: FOCEI with η"
+            );
+            assert!(
+                !fixed_ebe_score_drops_ebe_response(model),
+                "{m}: fixture precondition: Gaussian, outside the #1778 routing"
+            );
+            assert!(gn_gradient_takes_total_derivative(model, options));
+            let x = pack_params(template);
+            let bounds = compute_bounds(template);
+            let (mut worst_new, mut worst_old) = (0.0f64, 0.0f64);
+            for i in 0..3 {
+                let s = &prep.population.subjects[i];
+                let ebe = crate::estimation::inner_optimizer::find_ebe(
+                    model, s, template, 500, 1e-10, None, None, 0,
+                );
+                let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
+                    &x,
+                    template,
+                    model,
+                    &prep.population,
+                    i,
+                    &ebe.eta,
+                    &ebe.h_matrix,
+                    &[],
+                    &bounds,
+                    options,
+                );
+                let ti = ebe_response_correction(
+                    &x,
+                    template,
+                    model,
+                    &prep.population,
+                    i,
+                    &ebe.eta,
+                    &[],
+                    None,
+                    nll,
+                    &gi,
+                    cache.as_ref(),
+                    &bounds,
+                    options,
+                );
+                let old_t = cache
+                    .as_ref()
+                    .map(|c| c.gn_theta_correction.clone())
+                    .unwrap_or_else(|| vec![0.0; x.len()]);
+                let fd = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+                    &x, template, model, s, &ebe.eta, &bounds, options,
+                );
+                let tag = format!("{m} subject {i}");
+                assert!(
+                    gi.iter()
+                        .chain(&ti)
+                        .chain(&old_t)
+                        .chain(&fd)
+                        .all(|v| v.is_finite()),
+                    "{tag}: every side must be finite: g {gi:?}, t {ti:?}, fd {fd:?}"
+                );
+                assert!(fd.iter().all(|e| e.is_finite()));
+                let scale = fd.iter().fold(1.0f64, |a, v| a.max(v.abs()));
+                for k in 0..x.len() {
+                    let new = (gi[k] + ti[k] - fd[k]).abs() / scale;
+                    let old = (gi[k] + old_t[k] - fd[k]).abs() / scale;
+                    assert!(new.is_finite() && old.is_finite(), "{tag}: coordinate {k}");
+                    worst_new = worst_new.max(new);
+                    worst_old = worst_old.max(old);
+                }
+            }
+            // Measured (Linux): new 1.1e-7 / 2.2e-5 / 2.6e-6, old 0.71 / 4.5e-2 / 0.46 for
+            // warfarin_bloq / schnider / pkpd_nonmem — the new bound is the central
+            // difference's own truncation with ~5× headroom, the old floor ~4× below.
+            eprintln!("[#2740] {m}: new {worst_new:.3e}, old {worst_old:.3e} (rel. to ‖fd‖∞)");
+            assert!(
+                worst_new < 1e-4,
+                "{m}: GN gradient vs reconverged FD {worst_new:.3e}"
+            );
+            assert!(
+                worst_old > 1e-2,
+                "{m}: the old gradient must miss the oracle (non-degenerate fixture), \
+                 got {worst_old:.3e}"
+            );
+        }
+    }
+
+    /// #2740 review: the widened total-derivative arm must honour `gradient = fd` from every
+    /// source the rest of the crate reads — the model's flag, the caller's `FitOptions`, and
+    /// the fit-scoped flag `fit()` arms on its threads — by taking the reconverged difference
+    /// instead of the adjoint. Each forced side must equal `fd − g` **bit for bit**; the
+    /// unforced control must take the adjoint, which differs from `fd − g` in the bits and
+    /// agrees with the adjoint called directly. Without the gate every forced side reads
+    /// the adjoint's value and fails the bit check; a gate that ignores one source fails
+    /// that side alone (each names itself).
+    #[test]
+    fn total_derivative_arm_honours_forced_fd_from_every_source() {
+        use crate::sens::ode_provider::adjoint;
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_bloq.ferx"),
+            Some(&format!("{root}/data/warfarin_bloq.csv")),
+        )
+        .unwrap();
+        let base_model = &prep.parsed.model;
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_available(base_model),
+            "fixture precondition: the adjoint serves this model"
+        );
+        let template = &prep.init_params;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let s = &prep.population.subjects[0];
+        let base_opts = prep.parsed.fit_options.clone();
+        let ebe = crate::estimation::inner_optimizer::find_ebe(
+            base_model, s, template, 500, 1e-10, None, None, 0,
+        );
+        let correction = |model: &CompiledModel, opts: &FitOptions| {
+            let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
+                &x,
+                template,
+                model,
+                &prep.population,
+                0,
+                &ebe.eta,
+                &ebe.h_matrix,
+                &[],
+                &bounds,
+                opts,
+            );
+            let ti = ebe_response_correction(
+                &x,
+                template,
+                model,
+                &prep.population,
+                0,
+                &ebe.eta,
+                &[],
+                None,
+                nll,
+                &gi,
+                cache.as_ref(),
+                &bounds,
+                opts,
+            );
+            let fd = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+                &x, template, model, s, &ebe.eta, &bounds, opts,
+            );
+            let fd_t: Vec<f64> = fd.iter().zip(&gi).map(|(d, g)| d - g).collect();
+            (gi, ti, fd_t)
+        };
+
+        // Unforced control: the adjoint.
+        let (gi, ti, fd_t) = correction(base_model, &base_opts);
+        let pt = adjoint::PackedPoint::new(template, &x).unwrap();
+        let di = adjoint::subject_adjoint_gradient_at(
+            base_model,
+            s,
+            &pt,
+            ebe.eta.as_slice(),
+            adjoint::Objective::Focei,
+        )
+        .expect("in the adjoint's scope");
+        assert!(ti.iter().chain(&di).chain(&gi).all(|v| v.is_finite()));
+        for k in 0..x.len() {
+            let want = di[k] - gi[k];
+            assert!(
+                (ti[k] - want).abs() <= 1e-12 * (1.0 + want.abs()),
+                "unforced: coordinate {k} must take the adjoint, {} vs {want}",
+                ti[k]
+            );
+        }
+        assert_ne!(
+            ti, fd_t,
+            "fixture precondition: adjoint and FD differ in the bits"
+        );
+
+        // Forced, one source at a time.
+        let fd_opts = FitOptions {
+            gradient_method: GradientMethod::Fd,
+            ..base_opts.clone()
+        };
+        let (_, ti, fd_t) = correction(base_model, &fd_opts);
+        assert_eq!(
+            ti, fd_t,
+            "FitOptions gradient = fd must take the reconverged FD"
+        );
+        {
+            let _armed = crate::types::arm_forced_fd(true);
+            let (_, ti, fd_t) = correction(base_model, &base_opts);
+            assert_eq!(
+                ti, fd_t,
+                "the fit-scoped gradient = fd must take the reconverged FD"
+            );
+        }
+        let mut fd_model = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_bloq.ferx"),
+            Some(&format!("{root}/data/warfarin_bloq.csv")),
+        )
+        .unwrap()
+        .parsed
+        .model;
+        fd_model.gradient_method = GradientMethod::Fd;
+        let (_, ti, fd_t) = correction(&fd_model, &base_opts);
+        assert_eq!(ti, fd_t, "model gradient = fd must take the reconverged FD");
+    }
+
+    /// #2740, the GN call site: on a Gaussian FOCEI model `build_gn_system`'s gradient must
+    /// be `2·Σ dᵢ`, the reconverged central difference of the objective at the EBEs. The
+    /// helper test above pins `ebe_response_correction`; this one dies if `build_gn_system`
+    /// stops adding its `tᵢ` (the gradient falls back to the M3 kernel score `2·Σ gᵢ`, whose
+    /// correction was zero). `warfarin_bloq`, first four subjects, at the initial estimates.
+    #[test]
+    fn gn_system_gradient_is_the_reconverged_fd_on_a_focei_model() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let mut prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_bloq.ferx"),
+            Some(&format!("{root}/data/warfarin_bloq.csv")),
+        )
+        .unwrap();
+        prep.population.subjects.truncate(4);
+        let model = &prep.parsed.model;
+        let template = &prep.init_params;
+        let options = &prep.parsed.fit_options;
+        assert!(options.interaction, "fixture precondition: FOCEI");
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let (eta_hats, h_mats, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+            model,
+            &prep.population,
+            template,
+            500,
+            1e-10,
+            None,
+            None,
+            0,
+            0,
+        );
+        let (grad, _) = build_gn_system(
+            &x,
+            template,
+            model,
+            &prep.population,
+            &eta_hats,
+            &h_mats,
+            &kappas,
+            &bounds,
+            options,
+        );
+        let mut want = vec![0.0f64; x.len()];
+        for (i, s) in prep.population.subjects.iter().enumerate() {
+            let fd = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+                &x,
+                template,
+                model,
+                s,
+                &eta_hats[i],
+                &bounds,
+                options,
+            );
+            for k in 0..x.len() {
+                want[k] += 2.0 * fd[k];
+            }
+        }
+        assert!(
+            grad.iter().chain(&want).all(|v| v.is_finite()),
+            "every side must be finite: gn {grad:?}, fd {want:?}"
+        );
+        assert!(want.iter().all(|e| e.is_finite()));
+        let scale = want.iter().fold(1.0f64, |a, v| a.max(v.abs()));
+        let gaps: Vec<f64> = grad
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs() / scale)
+            .collect();
+        assert!(gaps.iter().all(|e| e.is_finite()));
+        let off = gaps.iter().fold(0.0f64, |a, &e| a.max(e));
+        eprintln!("[#2740] build_gn_system vs reconverged FD: {off:.3e} (rel. to ‖fd‖∞)");
+        assert!(
+            off < 1e-4,
+            "GN gradient vs reconverged FD {off:.3e}: gn {grad:?}, fd {want:?}"
+        );
     }
 
     /// FOCEI INTER (Almquist Laplace) analytical pop-gradient — checks NLL
@@ -5551,6 +6320,48 @@ mod tests {
         );
     }
 
+    /// #2799 r1 #2: pure Gauss–Newton publishes `eval_budget_spent` when its loop runs off
+    /// the end of `maxiter`, and not when a stop rule ends it or no iteration runs. The
+    /// 2-iteration run cannot converge (the only normal convergence branch needs `iter > 3`);
+    /// the 200-iteration run on `one_cpt_iv` converges and breaks out (the pooled `n_eta = 0`
+    /// model never converges under pure GN, #1006, so it cannot be the twin). `maxiter = 0` is an
+    /// evaluation. Mutation: drop the `exited_early = true` on the relative-change stop (the
+    /// one this fixture converges through) → the converging run reads `true`; drop the
+    /// `maxiter > 0` conjunct → the evaluation reads `true`; fill `false` → the short run.
+    /// The cancel, collapse and zero-gradient breaks set the same flag and are not reached here.
+    #[test]
+    fn pure_gn_reports_a_spent_iteration_budget() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/one_cpt_iv.ferx"))
+                .expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("data loads");
+        let run = |maxiter: usize| {
+            let opts = FitOptions {
+                method: EstimationMethod::FoceGn,
+                outer_maxiter: maxiter,
+                run_covariance_step: false,
+                ..Default::default()
+            };
+            run_foce_gn(&model, &pop, &model.default_params, &opts)
+        };
+        let short = run(2);
+        assert!(!short.converged, "a 2-iteration GN budget cannot converge");
+        assert!(short.eval_budget_spent, "{:?}", short.warnings);
+        let long = run(200);
+        assert!(
+            long.converged,
+            "the straddle needs a converging twin: {:?}",
+            long.warnings
+        );
+        assert!(!long.eval_budget_spent);
+        assert!(!run(0).eval_budget_spent, "an evaluation spends no budget");
+        assert!(!gn_loop_budget_spent(0, false));
+        assert!(gn_loop_budget_spent(3, false));
+        assert!(!gn_loop_budget_spent(3, true));
+    }
+
     /// `gn_hybrid` options with the FOCEI polish reached through `run_foce_gn`.
     fn hybrid_opts(report_final_gradient: bool) -> FitOptions {
         FitOptions {
@@ -6404,9 +7215,10 @@ mod tests {
         /// a guard spelled `has_tte()` fails the binary cell, one spelled
         /// `has_tte() || has_discrete()` fails the CTMM cell, one without the CTMM
         /// early return fails it the other way, and one without `n_eta > 0` fails the
-        /// η-free TTE cell. The Gaussian-only cell is the open side — there `tᵢ` stays the
-        /// closed form's `gn_theta_correction` and the corrected score is *not* the
-        /// reconverged one, so a gate stuck open fails here.
+        /// η-free TTE cell. The Gaussian-only cell is outside that predicate but inside
+        /// [`gn_gradient_takes_total_derivative`] under FOCEI (#2740), so it is routed
+        /// too; under FOCE it is the open side — there `tᵢ` stays zero and the corrected
+        /// score is *not* the reconverged one, so a gate stuck open fails there.
         ///
         /// The gap is asserted non-degenerate: with `tᵢ = 0` the identity `gᵢ + tᵢ = dᵢ`
         /// would hold only because `gᵢ` already equalled `dᵢ`, and the test would pin
@@ -6424,18 +7236,38 @@ mod tests {
                     .collect()
             };
             #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+            // (label, endpoint, records, interaction, #1778 routing, GN routing)
             let mut cases = vec![
-                ("Gaussian-only", String::new(), vec![], false),
+                (
+                    "Gaussian-only FOCEI",
+                    String::new(),
+                    vec![],
+                    true,
+                    false,
+                    true,
+                ),
+                (
+                    "Gaussian-only FOCE",
+                    String::new(),
+                    vec![],
+                    false,
+                    false,
+                    false,
+                ),
                 (
                     "joint PK + TTE",
                     JOINT_TTE_BLOCK.to_string(),
                     vec![event(7.0, true)],
+                    true,
+                    true,
                     true,
                 ),
                 (
                     "joint PK + binary",
                     "[binary_model]\n  cmt   = 3\n  logit = TVLAM + ETA_CL\n".to_string(),
                     states(3, &[(2.0, 1), (6.0, 0)]),
+                    true,
+                    true,
                     true,
                 ),
             ];
@@ -6447,18 +7279,25 @@ mod tests {
                  awake  = TVLAM\n"
                     .to_string(),
                 states(5, &[(0.0, 0), (3.0, 1), (6.0, 0)]),
+                true,
+                false,
                 false,
             ));
-            let mut opts = FitOptions::default();
-            opts.interaction = true;
 
-            for (label, endpoint, records, biased) in cases {
+            for (label, endpoint, records, interaction, drops, biased) in cases {
+                let mut opts = FitOptions::default();
+                opts.interaction = interaction;
                 let model = parse(&format!("{JOINT_GAUSSIAN}{endpoint}"));
                 assert_eq!(model.n_eta, 1, "{label}: fixture precondition: one η");
                 assert_eq!(
                     fixed_ebe_score_drops_ebe_response(&model),
-                    biased,
+                    drops,
                     "{label}: fixture precondition: the #1778 routing"
+                );
+                assert_eq!(
+                    gn_gradient_takes_total_derivative(&model, &opts),
+                    biased,
+                    "{label}: the #2740 GN routing"
                 );
                 let mut joint = joint_subject();
                 joint.obs_records = records;
@@ -6520,7 +7359,11 @@ mod tests {
                     &pop.subjects[0],
                     &pt,
                     eta_hat.as_slice(),
-                    crate::sens::ode_provider::adjoint::Objective::Focei,
+                    if interaction {
+                        crate::sens::ode_provider::adjoint::Objective::Focei
+                    } else {
+                        crate::sens::ode_provider::adjoint::Objective::Foce
+                    },
                 )
                 .unwrap();
                 let fd = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(

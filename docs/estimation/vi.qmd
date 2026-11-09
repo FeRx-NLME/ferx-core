@@ -773,9 +773,13 @@ raise `vi_iters` before concluding anything about the model. Starting closer (th
 from `0.13 / 8 / 1.0`) needs ~17 500.
 :::
 
-The FOCEI rows also pin the objective *convention*: ferx omits `½·n_obs·log 2π` and nlmixr2
-has an `adjObf` flag defaulting to `TRUE`, and the measured offset between them is zero — a
-mismatch would have shown as `110 · log 2π ≈ 202`.
+The FOCEI rows also pin the objective *convention*: ferx omits `½·n_obs·log 2π`, and so does
+nlmixr2's FOCEi `objf`. Its `foceiControl(adjLik =)` switch does not change `objf`, which gave
+41.1483038026 with `adjLik` both `TRUE` and `FALSE` on the dataset in
+[OFV conventions across tools](../model-file/error-model.qmd#ofv-conventions) (nlmixr2est
+7.1.0). The measured offset between the two tools is zero; a mismatch would have shown as
+`110 · log 2π ≈ 202`. (`adjObf` is the switch of the other estimators' controls, `emviControl`
+among them.)
 
 The harness that produces these numbers, including a cross-implementation comparison against
 nlmixr2 7.0's `est = "emvi"` — the only other variational-inference implementation in a

@@ -345,6 +345,12 @@ impl<'a> LikCtx<'a> {
 fn log_phi<T: PkNum>(z: T) -> T {
     let zv = z.val();
     let h = crate::stats::special::inv_mills(zv);
+    if h == 0.0 {
+        // Past `h`'s underflow `log Φ` is flat: every derivative is `h` times a polynomial
+        // in `z`, limit `0`. A constant, not a lift: at `z = +∞` both `h′ = −h(z + h)` and
+        // the chain rule's `0·z′` (with `z′` overflowed too) would be `0·∞` (#2772).
+        return T::from_f64(crate::stats::special::log_normal_cdf(zv));
+    }
     let h1 = -h * (zv + h);
     // (log Φ)‴ = h″ = −h′(z + h) − h(1 + h′): the Laplace kernel's second-order dual
     // differentiates the `(log Φ)″` factor; (log Φ)⁗ = h‴ = −h″(z + 2h) − 2h′(1 + h′), for
@@ -384,6 +390,11 @@ fn m3_terms<T: PkNum>(y: f64, f: T, v: T, d: T, d2: T, cens: i8) -> (T, T, T, T)
     let r = c(y) - f;
     let z = c(sgn) * r / w;
     let h = inv_mills(z);
+    if h.val() == 0.0 {
+        // A certain row past `h`'s underflow: `g2`, `cz` and `cm` are `h` times polynomials
+        // in `z` and `m`, limit `0`, and `z²` overflows from `|z| ≈ 1.3e154` (#2772).
+        return (c(-2.0) * log_phi(z), c(0.0), c(0.0), c(0.0));
+    }
     let m = c(sgn) * (c(1.0) / w + r * d / (c(2.0) * v * w));
     let w3 = v * w;
     let w5 = v * v * w;
@@ -1293,4 +1304,60 @@ fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
         y[i] = s / l[i][i];
     }
     y
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sens::dual2::Dual2;
+
+    /// #2762 on the adjoint's M3 kernel (`m3_terms`, behind the exact FOCEI gradient, `H̃`
+    /// and R-matrix). It lifts the f64 `log_normal_cdf` / `inv_mills` by hand, so the value-
+    /// path likelihood test never reaches it (#2767 review r1 #4). A censored limit at `±1e300`
+    /// puts `z` past the `normal_cdf` overflow, where `log_normal_cdf` was `NaN`. The row is
+    /// certain, so every term and its jet in `f` is exactly `0`.
+    ///
+    /// #2772 extends it to every term and to `z = +∞`. Past `h = φ/Φ`'s underflow the
+    /// `iiv_on_ruv` cross terms `cz`/`cm` form `h·z²`, `0·∞` once `z²` overflows (`±1e300`),
+    /// and at `z = +∞` (`±1e308`) `log_phi`'s own `h′ = −h(z + h)` is `0·∞` too. All their
+    /// limits are `0`. The oracle is that exact `0`, not a neighbouring row: `±1e6` is
+    /// `z = 1e7`, past `h`'s underflow too, so it takes the same guards and a wrong guard
+    /// constant would agree with itself there (#2782 review r1 #1). `==`, not bits, so the
+    /// guard's `+0` and a computed `−0` both pass while `NaN` still fails.
+    #[test]
+    fn m3_terms_score_a_limit_past_the_normal_cdf_overflow_as_certain() {
+        // Proportional error at f = 1, σ = 0.1: v = σ²f², d = 2σ²f, d2 = 2σ², all carried
+        // in the dual so the jets of the terms move with f.
+        let terms = |limit: f64, cens: i8| {
+            let f = Dual2::<1>::var(1.0, 0);
+            let s2 = Dual2::<1>::from_f64(0.01);
+            let two = Dual2::<1>::from_f64(2.0);
+            m3_terms(limit, f, s2 * f * f, two * s2 * f, two * s2, cens)
+        };
+        let z = |limit: f64, cens: i8| (if cens < 0 { -1.0 } else { 1.0 }) * (limit - 1.0) / 0.1;
+        for (near, sq_over, inf, cens) in [(1e6, 1e300, 1e308, 1), (-1e6, -1e300, -1e308, -1)] {
+            // The straddles: z² finite at the control, overflowing at `sq_over`, and z
+            // itself infinite at `inf`.
+            assert!(z(near, cens).powi(2).is_finite(), "{near:e}");
+            assert!(z(sq_over, cens).is_finite() && z(sq_over, cens).powi(2) == f64::INFINITY);
+            assert_eq!(z(inf, cens), f64::INFINITY, "{inf:e}");
+            for x in [near, sq_over, inf] {
+                let got = terms(x, cens);
+                for (name, g) in [
+                    ("value", got.0),
+                    ("g2", got.1),
+                    ("cz", got.2),
+                    ("cm", got.3),
+                ] {
+                    assert!(g.val() == 0.0, "{name} at {x:e}: {}", g.val());
+                    assert!(g.grad[0] == 0.0, "∂{name}/∂f at {x:e}: {}", g.grad[0]);
+                    assert!(
+                        g.hess[0][0] == 0.0,
+                        "∂²{name}/∂f² at {x:e}: {}",
+                        g.hess[0][0]
+                    );
+                }
+            }
+        }
+    }
 }

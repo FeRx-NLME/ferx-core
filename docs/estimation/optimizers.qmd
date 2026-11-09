@@ -571,6 +571,74 @@ gradient-based arm — not a pass/fail test. A weakly-identified direction can c
 ∂OFV/∂x across a genuinely flat objective, which is the same reason ferx does not use a gradient norm
 as its convergence criterion (see [Leaving the initial estimates](#leaving-the-initial-estimates)).
 
+### What `converged` guarantees {#what-converged-guarantees}
+
+`converged: true` is a verdict, not a copy of the optimizer's stop state. NLopt's own word is
+kept beside it as `optimizer_stop` (#2785), and the two can disagree in either direction:
+
+- a bare `Failure` is converged when the OFV trace has gone flat and a cold re-solve
+  reproduces it ([Leaving the initial estimates](#leaving-the-initial-estimates)) — the
+  analytic-gradient L-BFGS returns one at a plateaued optimum its line search can no longer
+  improve on;
+- an `FtolReached`, an `XtolReached`, or that same accepted `Failure` is **not** converged when the
+  estimates are not a stationary point of the objective.
+
+The second check is made by the covariance step. At the estimates it takes the gradient `g`
+of the objective, at the modes it reconverges, and with the Hessian `H` it has just built it
+forms the **Newton decrement** `½·gᵀH⁻¹g`: the OFV a Newton step from the estimates is
+predicted to remove. The covariance is `R⁻¹ = 2·H⁻¹`, so the decrement is also the squared
+distance from the estimates to the minimum of the quadratic model, in standard errors. Unlike
+the raw gradient, it does not change when a coordinate is rescaled. A coordinate whose
+gradient is large only because it is badly scaled, or because the objective is flat along it,
+gets a small decrement. One the optimizer stalled on gets a large one.
+
+For FOCE, FOCEI, Laplace / AGQ and Gauss–Newton (`gn`, `gn_hybrid`), a decrement above
+**1 OFV unit**, one standard error, reports `converged: false` with
+`W_NON_STATIONARY_OPTIMUM`. The message gives the decrement and names the three coordinates
+with the largest Newton steps, in standard errors, with the sign of the move a minimiser would
+make. The threshold and its measurements are the ones #2541 set for samplers (see [SAEM's
+stationarity test](saem.qmd#saem-stationarity)). On converged fits the decrement reads 1e-13 to 1e-7 (table below), at least seven orders of
+magnitude under it. The value is
+published as `newton_decrement` on the result and in the fit YAML. A sampler (SAEM, IMP,
+IMPMAP, VI) still gets `W_COV_NON_STATIONARY_ESTIMATE` and keeps its verdict, since its
+estimate is not expected to minimise the objective `R` is the Hessian of.
+
+Two cases are deliberately left out of the test:
+
+- **A coordinate on a bound** whose descent would leave the box keeps a non-zero gradient at
+  a legitimate constrained optimum. It is held out of the decrement (a Schur complement on
+  `H⁻¹`, not a deleted row), so a θ resting on its declared bound does not demote the fit.
+- **A fit with no unfloored `R`** makes no claim either way: `run_covariance_step = false`,
+  `covariance_method = s` (which builds no `R`), an `R` that needed an eigenvalue floor (it
+  has its own warning, and `H⁻¹` along a floored direction would measure the floor), a
+  profiled fit, or a cancelled run. `newton_decrement` is then absent.
+
+A fit demoted this way is what `[strictness] require_converged` exists to reject, so a model
+search steps past it rather than ranking an objective that is still falling. To recover the
+estimates, restart from the reported values and compare the OFV. If the same coordinate keeps
+stalling, rescale it or tighten its bounds.
+
+The shareable reproduction is the built-in BFGS (`Optimizer::Bfgs` through the Rust API) on
+`examples/warfarin.ferx`, whose stop rule is a raw gradient norm `|g| < outer_gtol`
+(`a_bfgs_stop_on_a_raw_gradient_norm_short_of_the_minimum_is_not_converged`). Measured in a
+debug build on Linux x86_64, sweeping `outer_gtol` against a minimum of OFV −286.00:
+
+| `outer_gtol` | iterations | OFV | `newton_decrement` | `converged` |
+|---|---|---|---|---|
+| 30 | 10 | −285.65 | 0.36 | `true` |
+| 50 | 9 | −285.51 | 0.47 | `true` |
+| 100 | 4 | −273.08 | **337.4** | `false` since #2785 (`true` before) |
+| 200 | 2 | −267.08 | — (`R` floored, not tested) | `true` |
+| default | — | −286.00 | 1.9e−8 | `true` |
+
+The first two rows stop within one standard error of the minimum, and the decrement matches
+the OFV they left on the table, so they stay converged. The 100 row is the case the gate
+exists for. The 200 row shows its limit: so far from the minimum that `R` is not positive
+definite, the step makes no claim, and only the eigenvalue-floor warning flags the fit.
+On the bundled golden-set examples with a covariance step (`warfarin`, its BOBYQA, block-Ω
+and prior variants, `two_cpt_iv`, `two_cpt_oral_cov`, `one_cpt_infusion`, `three_cpt_iv`), the
+decrement reads 7.8e−14 to 8.6e−8 and every fit stays converged (`ci-fast` build, Linux x86_64).
+
 ---
 
 ## Fixed-EBE gradient bias and `reconverge_gradient_interval`

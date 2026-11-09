@@ -90,6 +90,17 @@ pub struct OuterResult {
     /// lifted onto [`crate::types::FitResult::final_gradient_source`], where the
     /// distinction is documented. `None` exactly when `final_gradient` is `None`.
     pub final_gradient_source: Option<String>,
+    /// The covariance step's Newton decrement at the estimate (#2785), lifted onto
+    /// [`crate::types::FitResult::newton_decrement`]. `None` when no step tested it.
+    pub newton_decrement: Option<f64>,
+    /// The outer optimizer's own stop state (#2785) — NLopt's status (`FtolReached`,
+    /// `Failure`, …) on the NLopt path — lifted onto
+    /// [`crate::types::FitResult::optimizer_stop`]. `None` where no optimizer reports one.
+    pub optimizer_stop: Option<String>,
+    /// Whether the outer optimizer spent its evaluation budget on the leg that produced
+    /// these estimates (#2799), lifted onto [`crate::types::FitResult::eval_budget_spent`].
+    /// The final state, after the latch and polish adjustments; `false` off the NLopt path.
+    pub eval_budget_spent: bool,
     /// Fallback proposal covariance for the SIR sampler, set when the FD
     /// Hessian is non-PD. Built from the `|eigenvalue|`-rectified free-block
     /// Hessian, inflated 4×, and embedded into the full packed parameter space.
@@ -1241,6 +1252,7 @@ fn evaluate_at_initial_params(
     // Mixture (#983 Phase 6): the covariance step now builds its FD Hessian on the
     // K-fold mixture OFV (`compute_covariance` branches on `template.mixture`), so
     // it runs for mixtures exactly like the single-population path.
+    let newton_decrement;
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
         let out = crate::estimation::covariance::run_covariance_step(
             &x,
@@ -1259,8 +1271,11 @@ fn evaluate_at_initial_params(
             warnings: cov_warnings,
             sir_fallback_proposal,
             method: covariance_method,
+            newton_decrement: decrement,
+            non_stationary_optimum: _,
         } = out;
         warnings.extend(cov_warnings);
+        newton_decrement = decrement;
         (
             matrix,
             wall_time_secs,
@@ -1308,6 +1323,9 @@ fn evaluate_at_initial_params(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
+        newton_decrement,
+        optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 
@@ -5628,6 +5646,8 @@ pub(crate) fn optimize_nlopt(
             warnings,
             sir_fallback_proposal,
             method,
+            newton_decrement,
+            non_stationary_optimum,
         } = crate::estimation::covariance::run_covariance_step(
             &x_hat,
             init_params,
@@ -5644,6 +5664,15 @@ pub(crate) fn optimize_nlopt(
         result.covariance_wall_time_secs = wall_time_secs;
         result.sir_fallback_proposal = sir_fallback_proposal;
         result.warnings.extend(warnings);
+        result.newton_decrement = newton_decrement;
+        // #2785: whatever NLopt and the plateau rule concluded, the point the fit reports
+        // is not stationary — the stop the issue traced was a bare `Failure` the #751
+        // plateau check accepted on an OFV trace that had stopped falling.
+        crate::estimation::covariance::demote_non_stationary_optimum(
+            non_stationary_optimum,
+            &mut result.converged,
+            &mut result.warnings,
+        );
     }
     result
 }
@@ -8469,6 +8498,9 @@ fn optimize_nlopt_attempt_probed(
     // used — it still reads O(1) at these genuine optima; the resolution block
     // explains why.)
     let mut stationarity_check_pending = false;
+    // #2785: NLopt's own word, published beside the verdict below, which can overrule it in
+    // either direction.
+    let optimizer_stop = Some(nlopt_stop_label(&result));
     let mut converged = match &result {
         Ok((status, _)) => {
             if options.verbose {
@@ -9050,6 +9082,7 @@ fn optimize_nlopt_attempt_probed(
     // mixtures too. The `final_ehs`/`final_hms` handed in are the MIXEST-class
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
+    let newton_decrement;
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
         let out = if defer_covariance {
             crate::estimation::covariance::CovStepOutcome::skipped()
@@ -9072,8 +9105,15 @@ fn optimize_nlopt_attempt_probed(
             warnings: cov_warnings,
             sir_fallback_proposal,
             method: covariance_method,
+            newton_decrement: decrement,
+            non_stationary_optimum,
         } = out;
         warnings.extend(cov_warnings);
+        newton_decrement = decrement;
+        // #2785: the "did not converge" line below covers this demotion too.
+        if non_stationary_optimum {
+            converged = false;
+        }
         (
             matrix,
             wall_time_secs,
@@ -9191,6 +9231,12 @@ fn optimize_nlopt_attempt_probed(
         start_eval: inherited_start.unwrap_or(start_eval.get()),
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement,
+        optimizer_stop,
+        // #2799: the final budget state — after the polish (`PolishEnd::BudgetSpent`), a
+        // verified stop and a stagnation latch on the last permitted eval have each had their
+        // say above, so it is the same fact the "increase maxiter" warning is gated on.
+        eval_budget_spent: max_eval_reached,
     };
     (
         result,
@@ -9203,6 +9249,19 @@ fn optimize_nlopt_attempt_probed(
             plateau_checked: stationarity_check_pending,
         },
     )
+}
+
+/// NLopt's stop state as the fit publishes it (#2785): the `SuccessState` / `FailState`
+/// variant name (`FtolReached`, `Failure`, `RoundoffLimited`, …), the same word the verbose
+/// log prints after "NLopt finished:" / "NLopt stopped:". `converged` is a verdict built on
+/// this and on checks after it, and can overrule it either way — a bare `Failure` at a
+/// plateau is converged (#751), an `FtolReached` at a non-stationary point is not (#2785) —
+/// so the raw state is kept beside it for a reader asking why.
+fn nlopt_stop_label<T>(result: &Result<(nlopt::SuccessState, T), (nlopt::FailState, T)>) -> String {
+    match result {
+        Ok((status, _)) => format!("{status:?}"),
+        Err((fail, _)) => format!("{fail:?}"),
+    }
 }
 
 /// Whether a run that stopped mid-descent is worth restarting from its own best
@@ -9582,11 +9641,15 @@ fn optimize_bfgs(
     // Best accepted iterate, so an interrupted run's checkpoint holds it (#1317).
     let mut best = BestPoint::new();
 
+    // #2799: as in pure Gauss–Newton, every `break` below sets this, so a loop that runs off
+    // the end of `outer_maxiter` spent its budget.
+    let mut exited_early = false;
     for iter in 1..=options.outer_maxiter {
         n_iterations = iter;
 
         if crate::cancel::is_cancelled(&options.cancel) {
             warnings.push("cancelled by user".to_string());
+            exited_early = true;
             break;
         }
 
@@ -9601,6 +9664,7 @@ fn optimize_bfgs(
                 eprintln!("Converged at iteration {} (|g| = {:.2e})", iter, g_norm);
             }
             converged = true;
+            exited_early = true;
             break;
         }
 
@@ -9630,6 +9694,7 @@ fn optimize_bfgs(
                 if options.verbose {
                     eprintln!("Stopping: line search stalled at iteration {}", iter);
                 }
+                exited_early = true;
                 break;
             }
             s_hist.clear();
@@ -9764,6 +9829,7 @@ fn optimize_bfgs(
                 );
             }
             converged = true;
+            exited_early = true;
             break;
         }
     }
@@ -9805,8 +9871,14 @@ fn optimize_bfgs(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum,
     } = out;
     warnings.extend(cov_warnings);
+    // #2785: the "did not converge" line below covers this demotion too.
+    if non_stationary_optimum {
+        converged = false;
+    }
 
     // #1303 — same gate as the NLopt path above, on this path's own `final_ofv`,
     // which is likewise recomputed by the final inner loop and can therefore
@@ -9853,6 +9925,12 @@ fn optimize_bfgs(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
+        newton_decrement,
+        optimizer_stop: None,
+        eval_budget_spent: crate::estimation::gauss_newton::gn_loop_budget_spent(
+            options.outer_maxiter,
+            exited_early,
+        ),
     }
 }
 

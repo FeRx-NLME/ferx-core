@@ -245,6 +245,16 @@ struct FitWire {
     // #2112. Absent on every fit with no profiled level on its bound.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     profiled_levels_at_bound: Vec<usize>,
+    // #2797. Absent on every fit with no held coordinate, and on every bundle written
+    // before the field existed; such a bundle's `profiled_levels_at_bound` is synthesised
+    // into `ProfiledBound` entries on load (`held_at_bound_on_load`). An entry of a
+    // parameter family this build does not know is dropped on read (#2817).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::types::held_at_bound_lenient"
+    )]
+    held_at_bound: Vec<crate::types::HeldAtBound>,
 
     sir: Option<SirWire>,
     iov: Option<IovWire>,
@@ -313,6 +323,18 @@ struct FitWire {
     final_gradient: Option<Vec<f64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_gradient_source: Option<String>,
+    // The covariance step's Newton decrement and the optimizer's stop state (#2785).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    newton_decrement: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    optimizer_stop: Option<String>,
+    // #2799: the facts `FitResult::status` reads beside `converged`. A bundle from before
+    // them reads `false`, which is what such a fit reported (no typed budget fact, and an
+    // evaluation-only run was told apart only by `outer_maxiter = 0`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    eval_budget_spent: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    evaluation_only: bool,
     // ── Run settings ─────────────────────────────────────────────────────────
     optimizer: String,
     n_starts: usize,
@@ -878,6 +900,34 @@ struct LevelWire {
 const DISCRETE_ENTRY: &str = "predictions_discrete.csv";
 const DISCRETE_HEADER: [&str; 7] = ["ID", "CMT", "TIME", "DV", "PRED", "IPRED", "IWRES"];
 const N_OBS_DISCRETE: &str = "n_obs_discrete";
+
+/// The time-to-event-rows entry and the `ebes.csv` column that sizes each subject's block
+/// (#911). The header is `ID, CMT, TIME, DV` followed by the sdtab's own residual column
+/// list, so the two cannot drift.
+#[cfg(feature = "survival")]
+const TTE_ENTRY: &str = "predictions_tte.csv";
+#[cfg(feature = "survival")]
+const N_OBS_TTE: &str = "n_obs_tte";
+#[cfg(feature = "survival")]
+const TTE_KEY_COLUMNS: [&str; 4] = ["ID", "CMT", "TIME", "DV"];
+#[cfg(feature = "survival")]
+const TTE_HEADER_LEN: usize = TTE_KEY_COLUMNS.len() + crate::io::output::TTE_RESIDUAL_COLUMNS.len();
+#[cfg(feature = "survival")]
+const TTE_HEADER: [&str; TTE_HEADER_LEN] = {
+    let residuals = crate::io::output::TTE_RESIDUAL_COLUMNS;
+    let mut h = [""; TTE_HEADER_LEN];
+    let mut i = 0;
+    while i < TTE_KEY_COLUMNS.len() {
+        h[i] = TTE_KEY_COLUMNS[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < residuals.len() {
+        h[TTE_KEY_COLUMNS.len() + j] = residuals[j];
+        j += 1;
+    }
+    h
+};
 
 const COVTAB_ENTRY: &str = "covtab.csv";
 const COVTAB_BASE_COLUMNS: [&str; 3] = ["ID", "TIME", "EVID"];
@@ -1446,6 +1496,14 @@ fn encode_bundle(
         entries.push(DISCRETE_ENTRY.into());
     }
 
+    // --- predictions_tte.csv (only when the fit has time-to-event rows, #911) ---
+    #[cfg(feature = "survival")]
+    if has_tte_rows(result) {
+        zip.start_file(TTE_ENTRY, zopts)?;
+        write_predictions_tte_csv(&mut zip, result)?;
+        entries.push(TTE_ENTRY.into());
+    }
+
     // --- covtab.csv (only with a `[covariates]` block) ---------------------
     if let Some(table) = &result.covariate_table {
         zip.start_file(COVTAB_ENTRY, zopts)?;
@@ -1675,6 +1733,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         bic_inputs: r.bic_inputs,
         profiled_blocks: r.profiled_blocks.clone(),
         profiled_levels_at_bound: r.profiled_levels_at_bound.clone(),
+        held_at_bound: r.held_at_bound.clone(),
         sir: if r.sir_ci_theta.is_some() || r.sir_ess.is_some() || r.sir_resamples_packed.is_some()
         {
             Some(SirWire {
@@ -1751,6 +1810,10 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
         final_gradient_source: r.final_gradient_source.clone(),
+        newton_decrement: r.newton_decrement,
+        optimizer_stop: r.optimizer_stop.clone(),
+        eval_budget_spent: r.eval_budget_spent,
+        evaluation_only: r.evaluation_only,
         optimizer: r.optimizer.clone(),
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
@@ -1790,6 +1853,11 @@ fn has_discrete_rows(r: &FitResult) -> bool {
     r.subjects.iter().any(|s| !s.discrete_rows.is_empty())
 }
 
+#[cfg(feature = "survival")]
+fn has_tte_rows(r: &FitResult) -> bool {
+    r.subjects.iter().any(|s| !s.tte_rows.is_empty())
+}
+
 fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> {
     let n_eta = r.omega.nrows();
     let mut header = String::from("ID");
@@ -1805,6 +1873,14 @@ fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> 
     if any_discrete {
         header.push(',');
         header.push_str(N_OBS_DISCRETE);
+    }
+    // The same for time-to-event rows (#911), so a bundle without them keeps its old bytes.
+    #[cfg(feature = "survival")]
+    let any_tte = has_tte_rows(r);
+    #[cfg(feature = "survival")]
+    if any_tte {
+        header.push(',');
+        header.push_str(N_OBS_TTE);
     }
     // Mixture (#983): a mixture fit carries per-subject `MIXEST` (most-probable
     // class) and `PMIX_1..K` (posterior class weights). Append them after the
@@ -1835,6 +1911,11 @@ fn write_ebes_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> 
         if any_discrete {
             row.push(',');
             row.push_str(&s.discrete_rows.len().to_string());
+        }
+        #[cfg(feature = "survival")]
+        if any_tte {
+            row.push(',');
+            row.push_str(&s.tte_rows.len().to_string());
         }
         if let Some(k) = mix_k {
             // MIXEST is 1-based; write 0 for a subject that somehow lacks it so
@@ -2119,6 +2200,59 @@ fn write_predictions_discrete_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<
     Ok(())
 }
 
+/// `predictions_tte.csv` (#911): one block of rows per subject with time-to-event records,
+/// in `ebes.csv` order, sized by that subject's `n_obs_tte`. The residual cells are written
+/// in `TTE_HEADER`'s order, looked up by name, so a reordered column list cannot shift a
+/// value under the wrong header.
+#[cfg(feature = "survival")]
+fn write_predictions_tte_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> {
+    writeln!(w, "{}", TTE_HEADER.join(","))?;
+    for s in &r.subjects {
+        for t in &s.tte_rows {
+            let mut line = format!(
+                "{},{},{},{}",
+                csv_escape(&s.id),
+                t.cmt,
+                fmt_f64(t.time),
+                fmt_f64(t.dv)
+            );
+            for name in crate::io::output::TTE_RESIDUAL_COLUMNS {
+                line.push(',');
+                line.push_str(&fmt_f64(tte_residual(t, name)));
+            }
+            writeln!(w, "{line}")?;
+        }
+    }
+    Ok(())
+}
+
+/// The residual of `t` under sdtab column `name`, one of `TTE_RESIDUAL_COLUMNS`, for the
+/// writer. The bundle shares the sdtab's column names, not its field mapping:
+/// `append_tte_rows` has its own, and T1 pins this one against literal entry text, since a
+/// reader built on the same mistake would round-trip it exactly.
+#[cfg(feature = "survival")]
+fn tte_residual(t: &crate::types::TteObsDiagnostic, name: &str) -> f64 {
+    match name {
+        "COXSNELL" => t.coxsnell,
+        "MARTINGALE" => t.martingale,
+        "DEVIANCE" => t.deviance,
+        "PIT" => t.pit,
+        other => unreachable!("no TteObsDiagnostic field for sdtab column {other:?}"),
+    }
+}
+
+/// [`tte_residual`]'s field by `&mut`, for the reader.
+#[cfg(feature = "survival")]
+fn tte_residual_mut<'a>(t: &'a mut crate::types::TteObsDiagnostic, name: &str) -> &'a mut f64 {
+    match name {
+        "COXSNELL" => &mut t.coxsnell,
+        "MARTINGALE" => &mut t.martingale,
+        "DEVIANCE" => &mut t.deviance,
+        "PIT" => &mut t.pit,
+        other => unreachable!("no TteObsDiagnostic field for sdtab column {other:?}"),
+    }
+}
+
 /// `covtab.csv`: `ID, TIME, EVID, <covariates...>`, one row per input record. Exact doubles
 /// like every bundle CSV, where the `-covtab.csv` output beside a run rounds for reading.
 fn write_covtab_csv<W: Write>(w: &mut W, t: &CovariateTable) -> Result<(), FitrxError> {
@@ -2263,6 +2397,13 @@ fn load_bundle<R: Read + std::io::Seek>(
     let mut subjects = parse_subjects(&ebes_csv, &preds_csv, ebes_kappa_csv.as_deref(), n_eta)?;
     let discrete_csv = read_optional_text(&mut archive, DISCRETE_ENTRY)?;
     attach_discrete_rows(&mut subjects, &ebes_csv, discrete_csv.as_deref())?;
+    // Without `survival` the rows have no type to land in: the entry and the `n_obs_tte`
+    // column are ignored, as a reader older than #911 ignores them.
+    #[cfg(feature = "survival")]
+    {
+        let tte_csv = read_optional_text(&mut archive, TTE_ENTRY)?;
+        attach_tte_rows(&mut subjects, &ebes_csv, tte_csv.as_deref())?;
+    }
     let ebe_kappas = if let Some(csv) = ebes_kappa_csv.as_deref() {
         parse_ebe_kappas(
             csv,
@@ -2650,7 +2791,8 @@ fn parse_subjects(
             compartment_states: vec![],
             // Filled by `attach_discrete_rows` from `predictions_discrete.csv`.
             discrete_rows: Vec::new(),
-            // The bundle has no entry for these (#911), so a restored result has none.
+            // Filled by `attach_tte_rows` from `predictions_tte.csv` (#911); empty for a
+            // bundle written before that entry existed.
             #[cfg(feature = "survival")]
             tte_rows: Vec::new(),
         });
@@ -2884,6 +3026,106 @@ fn attach_discrete_rows(
     match rows.next() {
         Some((i, _)) => Err(corrupt(format!(
             "row {} is past the rows {N_OBS_DISCRETE} accounts for",
+            i + 1
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Fill `tte_rows` from `predictions_tte.csv` (#911): each subject's block is the next
+/// `n_obs_tte` rows, with the row ID as a check. The column and the entry come together,
+/// so either one alone is `Corrupt`; neither is a bundle written before #911, and leaves
+/// every `tte_rows` empty. A copy of [`attach_discrete_rows`] rather than a shared generic:
+/// these rows are `survival`-gated and those are not.
+#[cfg(feature = "survival")]
+fn attach_tte_rows(
+    subjects: &mut [SubjectResult],
+    ebes_csv: &str,
+    tte_csv: Option<&str>,
+) -> Result<(), FitrxError> {
+    let corrupt = |msg: String| FitrxError::Corrupt(format!("{TTE_ENTRY}: {msg}"));
+    let mut ebes = ebes_csv.lines();
+    let count_col = ebes
+        .next()
+        .and_then(|h| h.split(',').position(|c| c == N_OBS_TTE));
+    let (count_col, csv) = match (count_col, tte_csv) {
+        (None, None) => return Ok(()),
+        (Some(col), Some(csv)) => (col, csv),
+        (Some(_), None) => {
+            return Err(FitrxError::Corrupt(format!(
+                "ebes.csv has {N_OBS_TTE}, but the bundle has no {TTE_ENTRY}"
+            )))
+        }
+        (None, Some(_)) => return Err(corrupt(format!("ebes.csv has no {N_OBS_TTE}"))),
+    };
+    let counts = ebes
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let fields = parse_csv_row(line);
+            let raw = fields.get(count_col).map_or("", String::as_str);
+            raw.parse::<usize>()
+                .map_err(|_| FitrxError::Corrupt(format!("ebes.csv: bad {N_OBS_TTE} {raw:?}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut lines = csv.lines();
+    let header = lines.next().ok_or_else(|| corrupt("empty".into()))?;
+    if header.split(',').ne(TTE_HEADER) {
+        return Err(corrupt(format!(
+            "header {header:?}, expected {:?}",
+            TTE_HEADER.join(",")
+        )));
+    }
+    let mut rows = lines.filter(|line| !line.trim().is_empty()).enumerate();
+    for (s, n) in subjects.iter_mut().zip(counts) {
+        for _ in 0..n {
+            let (i, line) = rows.next().ok_or_else(|| {
+                corrupt(format!(
+                    "ran out of rows at subject {:?}, which {N_OBS_TTE} gives {n}",
+                    s.id
+                ))
+            })?;
+            let fields = parse_csv_row(line);
+            if fields.len() != TTE_HEADER.len() {
+                return Err(corrupt(format!(
+                    "row {} has {} fields, expected {}",
+                    i + 1,
+                    fields.len(),
+                    TTE_HEADER.len()
+                )));
+            }
+            if fields[0] != s.id {
+                return Err(corrupt(format!(
+                    "row {}: ID {:?} out of order; expected subject {:?}",
+                    i + 1,
+                    fields[0],
+                    s.id
+                )));
+            }
+            let cmt = fields[1]
+                .parse::<usize>()
+                .map_err(|_| corrupt(format!("row {}: bad CMT {:?}", i + 1, fields[1])))?;
+            let num = |f: &str| {
+                parse_cell(f).map_err(|_| corrupt(format!("row {}: bad number {f:?}", i + 1)))
+            };
+            let mut row = crate::types::TteObsDiagnostic {
+                cmt,
+                time: num(&fields[2])?,
+                dv: num(&fields[3])?,
+                coxsnell: f64::NAN,
+                martingale: f64::NAN,
+                deviance: f64::NAN,
+                pit: f64::NAN,
+            };
+            for (name, cell) in TTE_HEADER.iter().zip(&fields).skip(TTE_KEY_COLUMNS.len()) {
+                *tte_residual_mut(&mut row, name) = num(cell)?;
+            }
+            s.tte_rows.push(row);
+        }
+    }
+    match rows.next() {
+        Some((i, _)) => Err(corrupt(format!(
+            "row {} is past the rows {N_OBS_TTE} accounts for",
             i + 1
         ))),
         None => Ok(()),
@@ -3564,6 +3806,11 @@ fn wire_to_fit_result(
         imp
     });
 
+    let held_at_bound = held_at_bound_on_load(
+        std::mem::take(&mut w.held_at_bound),
+        &w.profiled_levels_at_bound,
+        &w.theta.names,
+    );
     let mut fit = FitResult {
         restored_from_checkpoint: true,
         covariate_relations: Vec::new(),
@@ -3684,6 +3931,7 @@ fn wire_to_fit_result(
         bic_inputs: w.bic_inputs,
         profiled_blocks: w.profiled_blocks,
         profiled_levels_at_bound: w.profiled_levels_at_bound,
+        held_at_bound,
         eta_log_transformed: w.omega.log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -3698,6 +3946,10 @@ fn wire_to_fit_result(
         obs_time_range: w.obs_time_range,
         final_gradient: w.final_gradient,
         final_gradient_source: w.final_gradient_source,
+        newton_decrement: w.newton_decrement,
+        optimizer_stop: w.optimizer_stop,
+        eval_budget_spent: w.eval_budget_spent,
+        evaluation_only: w.evaluation_only,
         optimizer: w.optimizer,
         n_starts: w.n_starts,
         multi_start_seed: w.multi_start_seed,
@@ -3767,6 +4019,31 @@ fn parse_csv_row(line: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A bundle's `held_at_bound` (#2797): its own, or — for a bundle written before the field
+/// existed, which carries only `profiled_levels_at_bound` — those levels as
+/// [`crate::types::HeldReason::ProfiledBound`] entries, so a reader has one rule for old
+/// and new bundles. A θ's packed index is its θ index.
+fn held_at_bound_on_load(
+    held: Vec<crate::types::HeldAtBound>,
+    profiled_levels_at_bound: &[usize],
+    theta_names: &[String],
+) -> Vec<crate::types::HeldAtBound> {
+    if !held.is_empty() {
+        return held;
+    }
+    profiled_levels_at_bound
+        .iter()
+        .map(|&k| crate::types::HeldAtBound {
+            name: theta_names.get(k).cloned().unwrap_or_default(),
+            kind: crate::types::ParameterKind::Theta,
+            index: k,
+            packed_index: k,
+            reason: crate::types::HeldReason::ProfiledBound,
+            class: None,
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -4636,6 +4913,305 @@ mod tests {
         let loaded = load_fit(&path).unwrap().fit;
         assert!(loaded.profiled_blocks.is_empty());
         assert!(loaded.profiled_levels_at_bound.is_empty());
+    }
+
+    /// #2797 (D8): `held_at_bound` round-trips, as `snake_case` reasons, is omitted when
+    /// empty, and a bundle written before the field existed — `profiled_levels_at_bound`
+    /// only — loads with those levels as `ProfiledBound` entries, so a reader has one rule
+    /// for old and new bundles.
+    #[test]
+    fn held_at_bound_round_trips_and_an_old_bundle_synthesises_its_profiled_levels() {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+
+        let mut r = minimal_fit_result();
+        r.held_at_bound = vec![HeldAtBound {
+            name: "ETA_KA".into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index: r.theta.len(),
+            reason: HeldReason::CollapsedAtGuard,
+            class: None,
+        }];
+        let path = dir.path().join("held.fitrx");
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        assert_eq!(
+            fit_json(&path)["held_at_bound"][0]["reason"],
+            "collapsed_at_guard"
+        );
+        assert_eq!(load_fit(&path).unwrap().fit.held_at_bound, r.held_at_bound);
+
+        // Omitted when empty.
+        let wire = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(wire.get("held_at_bound").is_none(), "{wire}");
+
+        // An old bundle: only `profiled_levels_at_bound = [0, 2]`.
+        let mut old = minimal_fit_result();
+        old.theta_names = (0..old.theta.len()).map(|i| format!("L{i}")).collect();
+        old.profiled_levels_at_bound = vec![0, 2];
+        let path = dir.path().join("old.fitrx");
+        save_fit(&old, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        assert!(fit_json(&path).get("held_at_bound").is_none());
+        let loaded = load_fit(&path).unwrap().fit;
+        let got: Vec<(String, ParameterKind, usize, usize, HeldReason)> = loaded
+            .held_at_bound
+            .iter()
+            .map(|h| (h.name.clone(), h.kind, h.index, h.packed_index, h.reason))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "L0".to_string(),
+                    ParameterKind::Theta,
+                    0,
+                    0,
+                    HeldReason::ProfiledBound
+                ),
+                (
+                    "L2".to_string(),
+                    ParameterKind::Theta,
+                    2,
+                    2,
+                    HeldReason::ProfiledBound
+                ),
+            ]
+        );
+        assert_eq!(loaded.profiled_levels_at_bound, [0, 2]);
+    }
+
+    /// T5 (#2809): a `[mixture]` override entry's `class` round-trips as a 1-based number;
+    /// a base entry writes no `class` key at all (so a bundle without an override entry is
+    /// byte-unchanged); and an entry written before the field existed loads as `None`.
+    #[test]
+    fn held_at_bound_class_round_trips_and_is_absent_for_a_base_entry() {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let entry = |name: &str, packed_index, class| HeldAtBound {
+            name: name.into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index,
+            reason: HeldReason::CollapsedAtGuard,
+            class,
+        };
+        let mut r = minimal_fit_result();
+        let n = r.theta.len();
+        r.held_at_bound = vec![
+            entry("eta_CL", n, None),
+            entry("eta_CL_MIX2", n + 3, Some(2)),
+        ];
+        let path = dir.path().join("class.fitrx");
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        let json = fit_json(&path);
+        let held = &json["held_at_bound"];
+        assert!(held[0].get("class").is_none(), "{held}");
+        assert_eq!(held[1]["class"], 2, "{held}");
+        assert_eq!(load_fit(&path).unwrap().fit.held_at_bound, r.held_at_bound);
+
+        // An entry from a bundle written before #2809.
+        let old: HeldAtBound = serde_json::from_value(serde_json::json!({
+            "name": "eta_CL", "kind": "Omega", "index": 0, "packed_index": n,
+            "reason": "collapsed_at_guard",
+        }))
+        .unwrap();
+        assert_eq!(old, entry("eta_CL", n, None));
+    }
+
+    /// The held-at-bound fixture for #2817: θ `V` (index 1) collapsed on the guard and θ
+    /// `KA` (index 2) a profiled level, so a reader that mishandles one entry cannot pass
+    /// on the strength of the other.
+    fn two_held_thetas() -> FitResult {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let mut r = minimal_fit_result();
+        r.held_at_bound = vec![
+            HeldAtBound {
+                name: "V".into(),
+                kind: ParameterKind::Theta,
+                index: 1,
+                packed_index: 1,
+                reason: HeldReason::CollapsedAtGuard,
+                class: None,
+            },
+            HeldAtBound {
+                name: "KA".into(),
+                kind: ParameterKind::Theta,
+                index: 2,
+                packed_index: 2,
+                reason: HeldReason::ProfiledBound,
+                class: None,
+            },
+        ];
+        r
+    }
+
+    /// Rename the reason of `held_at_bound[0]` in a fit JSON value to one no build knows.
+    fn inject_future_reason(v: &mut serde_json::Value) {
+        assert_eq!(v["held_at_bound"][0]["reason"], "collapsed_at_guard", "{v}");
+        v["held_at_bound"][0]["reason"] = "some_future_reason".into();
+    }
+
+    /// #2817: a bundle whose `held_at_bound` names a reason this build does not know — as a
+    /// later ferx that added one would write — loads, rather than failing the whole
+    /// `load_fit`. The unknown entry reads as `HeldReason::Unknown` and still counts as
+    /// held (SE `N/A`, YAML `se: ~`); the neighbouring known entry and the not-held θ are
+    /// untouched. Under the strict derive (no `#[serde(other)]`) `load_fit` returns `Err`
+    /// and the first `unwrap` fails.
+    #[test]
+    fn a_bundle_with_an_unknown_held_reason_loads_and_the_entry_stays_held() {
+        use crate::io::output::{se_held, write_estimates_yaml};
+        use crate::types::{HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let r = two_held_thetas();
+        let src = dir.path().join("known.fitrx");
+        save_fit(&r, &p, "model source\n", &src, SaveFitOptions::default()).unwrap();
+        let dst = dir.path().join("future.fitrx");
+        rewrite_bundle(&src, &dst, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, inject_future_reason)
+            } else {
+                body
+            })
+        });
+        assert_eq!(
+            fit_json(&dst)["held_at_bound"][0]["reason"],
+            "some_future_reason"
+        );
+
+        let loaded = load_fit(&dst)
+            .expect("an unknown held reason must not fail the bundle")
+            .fit;
+        let reasons: Vec<HeldReason> = loaded.held_at_bound.iter().map(|h| h.reason).collect();
+        assert_eq!(reasons, [HeldReason::Unknown, HeldReason::ProfiledBound]);
+        assert_eq!(loaded.held_at_bound[0].name, "V");
+        assert_eq!(loaded.held_at_bound[0].packed_index, 1);
+
+        // Displays: held, so no SE — and the not-held θ keeps its number.
+        assert_eq!(
+            se_held(&loaded, ParameterKind::Theta, 1),
+            Some(HeldReason::Unknown)
+        );
+        assert_eq!(se_held(&loaded, ParameterKind::Theta, 0), None);
+        let yaml_path = dir.path().join("est.yaml");
+        write_estimates_yaml(&loaded, yaml_path.to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            yaml.contains(
+                "  V:\n    estimate: 2.000000\n    se: ~\n    rse_pct: ~\n    held: unknown\n"
+            ),
+            "{yaml}"
+        );
+        assert!(yaml.contains("    se: 0.010000\n"), "{yaml}");
+    }
+
+    /// #2817: the same unknown reason through `FitResult::from_json_str` (the
+    /// `--output-format json` reader), and the plain serde read of that file — which the
+    /// strict derive would refuse.
+    #[test]
+    fn fit_result_json_with_an_unknown_held_reason_reads_back() {
+        use crate::types::HeldReason;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fit.json");
+        crate::io::output::write_result_json(&two_held_thetas(), path.to_str().unwrap()).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        inject_future_reason(&mut v);
+        let text = serde_json::to_string(&v).unwrap();
+
+        let back = FitResult::from_json_str(&text)
+            .expect("an unknown held reason must not fail the FitResult JSON");
+        let reasons: Vec<HeldReason> = back.held_at_bound.iter().map(|h| h.reason).collect();
+        assert_eq!(reasons, [HeldReason::Unknown, HeldReason::ProfiledBound]);
+
+        let reason: HeldReason = serde_json::from_str("\"some_future_reason\"").unwrap();
+        assert_eq!(reason, HeldReason::Unknown);
+        // Known tokens are unaffected, and `Unknown` writes the token it reads back from.
+        for r in [
+            HeldReason::ProfiledBound,
+            HeldReason::CollapsedAtGuard,
+            HeldReason::Unknown,
+        ] {
+            let tok = serde_json::to_string(&r).unwrap();
+            assert_eq!(tok, format!("\"{}\"", r.as_str()));
+            assert_eq!(serde_json::from_str::<HeldReason>(&tok).unwrap(), r);
+        }
+    }
+
+    /// Rename the `kind` of `held_at_bound[0]` in a fit JSON value to a family no build
+    /// knows.
+    fn inject_future_kind(v: &mut serde_json::Value) {
+        assert_eq!(v["held_at_bound"][0]["kind"], "Theta", "{v}");
+        v["held_at_bound"][0]["kind"] = "SomeFutureKind".into();
+    }
+
+    /// #2817 (review r1 row 2): a `held_at_bound` entry of a parameter family this build
+    /// does not know is dropped on load, and the rest of the bundle and the list load, both
+    /// through `load_fit` and through `FitResult::from_json_str`. Without the lenient read,
+    /// the strict `ParameterKind` derive fails both `expect`s.
+    #[test]
+    fn an_unknown_held_kind_is_dropped_and_the_rest_loads() {
+        use crate::types::{HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let r = two_held_thetas();
+        let src = dir.path().join("known.fitrx");
+        save_fit(&r, &p, "model source\n", &src, SaveFitOptions::default()).unwrap();
+        let dst = dir.path().join("future-kind.fitrx");
+        rewrite_bundle(&src, &dst, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, inject_future_kind)
+            } else {
+                body
+            })
+        });
+        let survivors = |list: &[crate::types::HeldAtBound]| {
+            list.iter()
+                .map(|h| (h.name.clone(), h.kind, h.index, h.reason))
+                .collect::<Vec<_>>()
+        };
+        let want = [(
+            "KA".to_string(),
+            ParameterKind::Theta,
+            2,
+            HeldReason::ProfiledBound,
+        )];
+        let loaded = load_fit(&dst)
+            .expect("an unknown held kind must not fail the bundle")
+            .fit;
+        assert_eq!(survivors(&loaded.held_at_bound), want);
+
+        let json = dir.path().join("fit.json");
+        crate::io::output::write_result_json(&r, json.to_str().unwrap()).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        inject_future_kind(&mut v);
+        let back = FitResult::from_json_str(&serde_json::to_string(&v).unwrap())
+            .expect("an unknown held kind must not fail the FitResult JSON");
+        assert_eq!(survivors(&back.held_at_bound), want);
+
+        // The negative: every known kind survives the lenient read.
+        let mut all = two_held_thetas();
+        for (k, kind) in [
+            ParameterKind::Omega,
+            ParameterKind::Sigma,
+            ParameterKind::Kappa,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut h = all.held_at_bound[0].clone();
+            h.kind = kind;
+            h.index = k;
+            all.held_at_bound.push(h);
+        }
+        let text = serde_json::to_string(&all).unwrap();
+        assert_eq!(
+            FitResult::from_json_str(&text).unwrap().held_at_bound,
+            all.held_at_bound
+        );
     }
 
     /// `final_gradient_source` has to survive the checkpoint alongside the vector
@@ -7264,6 +7840,451 @@ mod tests {
         );
     }
 
+    /// A binary + TTE model (#911): what `write_sdtab_csv` parses to decide the refusal.
+    #[cfg(feature = "survival")]
+    const TTE_MODEL_911: &str = "
+[parameters]
+  theta TH0(0.1, 0.001, 10.0)
+  omega ETA ~ 0.1
+[binary_model]
+  cmt   = 3
+  logit = TH0 + ETA
+[event_model]
+  cmt    = 2
+  family = exponential
+  scale  = TH0 * exp(ETA)
+";
+
+    #[cfg(feature = "survival")]
+    fn tte_row_911(
+        time: f64,
+        dv: f64,
+        coxsnell: f64,
+        deviance: f64,
+    ) -> crate::types::TteObsDiagnostic {
+        crate::types::TteObsDiagnostic {
+            cmt: 2,
+            time,
+            dv,
+            coxsnell,
+            martingale: 0.1 + 0.2,
+            deviance,
+            pit: 1e-300,
+        }
+    }
+
+    /// Every field of a TTE row as bits, so `NaN` compares equal to itself and `-0.0`
+    /// differs from `0.0`.
+    #[cfg(feature = "survival")]
+    fn tte_bits(rows: &[crate::types::TteObsDiagnostic]) -> Vec<(usize, [u64; 6])> {
+        rows.iter()
+            .map(|t| {
+                (
+                    t.cmt,
+                    [t.time, t.dv, t.coxsnell, t.martingale, t.deviance, t.pit].map(f64::to_bits),
+                )
+            })
+            .collect()
+    }
+
+    /// T1's fit (#911): three subjects, the first and third sharing an ID so only
+    /// `n_obs_tte` can place their rows. S0 has one binary row and two TTE rows, S1 none,
+    /// S2 three. The cells need every digit (`0.1 + 0.2`, `1e-300`), and hold an interval
+    /// censor's `NaN`, a deviance of `-0.0` and a round-off-negative Cox–Snell residual.
+    #[cfg(feature = "survival")]
+    fn tte_fit_911() -> (FitResult, Population) {
+        let mut r = minimal_fit_result();
+        let s2 = r.subjects[0].clone();
+        r.subjects.push(s2);
+        r.n_subjects = 3;
+        r.subjects[0].discrete_rows = vec![discrete_row(3, 1.5, 0.25)];
+        r.subjects[0].tte_rows = vec![
+            tte_row_911(5.0, 1.0, -1e-17, -0.0),
+            tte_row_911(7.5, f64::NAN, 0.75, -0.5),
+        ];
+        r.subjects[2].tte_rows = vec![
+            tte_row_911(2.0, 0.0, 0.1 + 0.2, -0.75),
+            tte_row_911(4.0, 1.0, 1e-300, 0.5),
+            tte_row_911(6.0, 1.0, 0.0, f64::INFINITY),
+        ];
+        r.model_text = Some(TTE_MODEL_911.to_string());
+        let id0 = r.subjects[0].id.clone();
+        let id1 = r.subjects[1].id.clone();
+        let p = dummy_population(&[id0.as_str(), id1.as_str(), id0.as_str()], 3);
+        (r, p)
+    }
+
+    #[cfg(feature = "survival")]
+    fn save_911(dir: &tempfile::TempDir, name: &str, r: &FitResult, p: &Population) -> PathBuf {
+        let path = dir.path().join(name);
+        save_fit(r, p, TTE_MODEL_911, &path, SaveFitOptions::default()).unwrap();
+        path
+    }
+
+    /// T1 (#911): TTE rows round-trip bit for bit, each to its own subject, through
+    /// `predictions_tte.csv` and the `n_obs_tte` column, which appears exactly once.
+    ///
+    /// Dies on: the entry not written (no rows back), `attach_tte_rows` skipped, a field
+    /// written through `{:.6}` (`0.1 + 0.2`, `1e-300`), two subjects' blocks swapped (S0
+    /// and S2 share an ID, so only the count places them).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn roundtrip_tte_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_911();
+        let path = save_911(&dir, "tte.fitrx", &r, &p);
+        let loaded = load_fit(&path).unwrap();
+        assert!(loaded
+            .manifest
+            .entries
+            .contains(&"predictions_tte.csv".to_string()));
+        for (si, (got, want)) in loaded.fit.subjects.iter().zip(&r.subjects).enumerate() {
+            assert_eq!(
+                tte_bits(&got.tte_rows),
+                tte_bits(&want.tte_rows),
+                "subject {si}"
+            );
+            assert_eq!(got.discrete_rows, want.discrete_rows, "subject {si}");
+        }
+        let header = entry_text(&path, "ebes.csv").unwrap();
+        let header = header.lines().next().unwrap();
+        assert_eq!(header.split(',').filter(|c| *c == "n_obs_tte").count(), 1);
+        assert!(
+            header.ends_with(",n_obs,n_obs_discrete,n_obs_tte"),
+            "{header}"
+        );
+        // The entry's own text, not only its round trip: the writer and the reader share
+        // a name→field map, so a swapped pair (DEVIANCE ↔ PIT) would round-trip exactly
+        // (review r1 #1). Row 2 holds the interval censor's empty DV; row 5 an event with
+        // ΔH = 0, whose +∞ deviance the bundle writes `inf` where the sdtab leaves it empty.
+        let entry = entry_text(&path, "predictions_tte.csv").unwrap();
+        let lines: Vec<&str> = entry.lines().collect();
+        assert_eq!(lines[0], "ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT");
+        assert_eq!(
+            lines[1],
+            "S1,2,5.0,1.0,-1e-17,0.30000000000000004,-0.0,1e-300"
+        );
+        assert_eq!(lines[2], "S1,2,7.5,,0.75,0.30000000000000004,-0.5,1e-300");
+        assert_eq!(lines[5], "S1,2,6.0,1.0,0.0,0.30000000000000004,inf,1e-300");
+        assert_eq!(lines.len(), 6);
+    }
+
+    /// T2 (#911), the exit condition: `sdtab()` and `write_sdtab_csv` of the restored
+    /// binary + TTE fit equal the live ones, bit for bit and byte for byte.
+    ///
+    /// Dies on: `attach_tte_rows` skipped (the restored fit is refused), the blocks
+    /// swapped (S0's and S2's rows change places under one ID), the refusal keyed on the
+    /// TTE endpoint alone.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn restored_sdtab_equals_live() {
+        use crate::io::output::{sdtab, write_sdtab_csv};
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_911();
+        let loaded = load_fit(&save_911(&dir, "tte.fitrx", &r, &p)).unwrap().fit;
+        assert!(loaded.restored_from_checkpoint, "premise: restored");
+
+        let live = sdtab(&r, &p);
+        let back = sdtab(&loaded, &p);
+        let names = |c: &[(String, Vec<f64>)]| c.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&back), names(&live));
+        assert!(
+            names(&live).iter().any(|n| n == "COXSNELL"),
+            "premise: TTE columns"
+        );
+        for ((name, want), (_, got)) in live.iter().zip(&back) {
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(got), bits(want), "column {name}");
+        }
+
+        let live_csv = dir.path().join("live.csv");
+        let back_csv = dir.path().join("back.csv");
+        write_sdtab_csv(&r, &p, live_csv.to_str().unwrap()).unwrap();
+        write_sdtab_csv(&loaded, &p, back_csv.to_str().unwrap())
+            .expect("a restored fit with its TTE rows writes sdtab");
+        assert_eq!(
+            std::fs::read(&back_csv).unwrap(),
+            std::fs::read(&live_csv).unwrap()
+        );
+    }
+
+    /// The bundle at `src` as a writer before #911 left it: no `predictions_tte.csv`, and
+    /// no `n_obs_tte` column in `ebes.csv` (the last column of a non-mixture fit).
+    #[cfg(feature = "survival")]
+    fn strip_tte_911(src: &Path, dst: &Path) {
+        rewrite_bundle(src, dst, |name, body| match name {
+            "predictions_tte.csv" => None,
+            "ebes.csv" => {
+                let text = String::from_utf8(body).unwrap();
+                assert!(
+                    text.lines().next().unwrap().ends_with(",n_obs_tte"),
+                    "premise: n_obs_tte is the last column"
+                );
+                let mut out = String::new();
+                for line in text.lines() {
+                    out.push_str(&line[..line.rfind(',').unwrap()]);
+                    out.push('\n');
+                }
+                Some(out.into_bytes())
+            }
+            _ => Some(body),
+        });
+    }
+
+    /// T3 (#911): a bundle written before #911 still loads, with every `tte_rows` empty,
+    /// and its sdtab is still refused, with the message saying the bundle predates the
+    /// TTE rows. A load + re-save cannot recover them (cell A5): there are none to write.
+    ///
+    /// Dies on: the strip rejected as `Corrupt` (the entry made mandatory), the refusal
+    /// keyed on the rows alone without the TTE endpoint (T6's binary cell), on a TTE
+    /// endpoint with rows (T2).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn pre_911_bundle_keeps_the_refusal() {
+        use crate::io::output::write_sdtab_csv;
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_911();
+        let new = save_911(&dir, "new.fitrx", &r, &p);
+        let old = dir.path().join("old.fitrx");
+        strip_tte_911(&new, &old);
+        assert_eq!(entry_text(&old, "predictions_tte.csv"), None);
+
+        let loaded = load_fit(&old).expect("a pre-#911 bundle loads").fit;
+        assert!(loaded.subjects.iter().all(|s| s.tte_rows.is_empty()));
+        assert_eq!(
+            loaded.subjects[0].discrete_rows,
+            r.subjects[0].discrete_rows
+        );
+        let out = dir.path().join("sdtab.csv");
+        let err = write_sdtab_csv(&loaded, &p, out.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.contains("written before time-to-event rows were bundled"),
+            "{err}"
+        );
+        assert!(err.contains("#911"), "{err}");
+        assert!(!out.exists());
+
+        // A5: loading and saving again writes no entry, so the refusal stands.
+        let again = save_911(&dir, "again.fitrx", &loaded, &p);
+        assert_eq!(entry_text(&again, "predictions_tte.csv"), None);
+        let reloaded = load_fit(&again).unwrap().fit;
+        assert!(write_sdtab_csv(&reloaded, &p, out.to_str().unwrap()).is_err());
+    }
+
+    /// T4 (#911): the count column and the entry vouch for each other, and a row that does
+    /// not fit its count is refused rather than given to a neighbour.
+    ///
+    /// Dies on: each guard of `attach_tte_rows` deleted in turn (its own assert).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn damaged_tte_rows_are_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.subjects[0].tte_rows = vec![tte_row_911(1.5, 1.0, 0.5, -0.5)];
+        r.subjects[1].tte_rows = vec![tte_row_911(2.5, 0.0, 0.5, -0.5)];
+        let good = saved(&dir, &r);
+        let (s0, s1) = (r.subjects[0].id.clone(), r.subjects[1].id.clone());
+        load_fit(&good).expect("premise: the unedited bundle loads");
+        let edited = dir.path().join("edited.fitrx");
+        let load_with = |edit: &dyn Fn(String) -> Option<String>| {
+            rewrite_bundle(&good, &edited, |name, body| {
+                if name == "predictions_tte.csv" {
+                    edit(String::from_utf8(body).unwrap()).map(String::into_bytes)
+                } else {
+                    Some(body)
+                }
+            });
+            load_corrupt(load_fit(&edited))
+        };
+
+        let no_entry = load_with(&|_| None);
+        assert!(no_entry.contains("no predictions_tte.csv"), "{no_entry}");
+        let one_row = load_with(&|csv| Some(csv.lines().take(2).collect::<Vec<_>>().join("\n")));
+        assert!(one_row.contains("ran out of rows"), "{one_row}");
+        let extra = load_with(&|csv| Some(format!("{csv}{s1},2,9.0,1.0,0.5,0.5,0.5,0.5\n")));
+        assert!(extra.contains("past the rows"), "{extra}");
+        let swapped = load_with(&|csv| Some(csv.replacen(&s0, "OTHER", 1)));
+        assert!(swapped.contains("out of order"), "{swapped}");
+        let bad_num = load_with(&|csv| Some(csv.replace("1.5", "abc")));
+        assert!(bad_num.contains("bad number \"abc\""), "{bad_num}");
+        let bad_cmt =
+            load_with(&|csv| Some(csv.replacen(&format!("{s0},2,"), &format!("{s0},x,"), 1)));
+        assert!(bad_cmt.contains("bad CMT \"x\""), "{bad_cmt}");
+        let short = load_with(&|csv| {
+            let mut lines: Vec<String> = csv.lines().map(String::from).collect();
+            let cut = lines[1].rfind(',').unwrap();
+            lines[1].truncate(cut);
+            Some(lines.join("\n") + "\n")
+        });
+        assert!(short.contains("fields, expected 8"), "{short}");
+        let bad_header = load_with(&|csv| Some(csv.replacen("PIT", "PITT", 1)));
+        assert!(bad_header.contains("header"), "{bad_header}");
+
+        rewrite_bundle(&good, &edited, |name, body| {
+            Some(if name == "ebes.csv" {
+                String::from_utf8(body)
+                    .unwrap()
+                    .replace(",n_obs_tte", ",other")
+                    .into_bytes()
+            } else {
+                body
+            })
+        });
+        let no_column = load_corrupt(load_fit(&edited));
+        assert!(
+            no_column.contains("ebes.csv has no n_obs_tte"),
+            "{no_column}"
+        );
+
+        rewrite_bundle(&good, &edited, |name, body| {
+            Some(if name == "ebes.csv" {
+                let text = String::from_utf8(body).unwrap();
+                let mut lines = text.lines();
+                let mut out = format!("{}\n", lines.next().unwrap());
+                for line in lines {
+                    out.push_str(&line[..line.rfind(',').unwrap()]);
+                    out.push_str(",-1\n");
+                }
+                out.into_bytes()
+            } else {
+                body
+            })
+        });
+        let bad_count = load_corrupt(load_fit(&edited));
+        assert!(bad_count.contains("bad n_obs_tte \"-1\""), "{bad_count}");
+    }
+
+    /// T5 (#911): a fit without TTE rows writes neither the entry nor the column, so its
+    /// `ebes.csv` is byte for byte the layout a writer before #911 produced, plain and with
+    /// discrete rows.
+    ///
+    /// Dies on: the entry or the column written unconditionally.
+    #[test]
+    fn a_fit_without_tte_rows_writes_neither_entry_nor_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = saved(&dir, &minimal_fit_result());
+        assert_eq!(entry_text(&plain, "predictions_tte.csv"), None);
+        let ebes = entry_text(&plain, "ebes.csv").unwrap();
+        assert!(
+            ebes.lines()
+                .next()
+                .unwrap()
+                .ends_with(",ofv_contribution,n_obs"),
+            "{ebes}"
+        );
+        assert!(ebes.lines().nth(1).unwrap().ends_with(",3"), "{ebes}");
+
+        let mut r = minimal_fit_result();
+        r.subjects[1].discrete_rows = vec![discrete_row(3, 2.5, 0.25)];
+        let dir2 = tempfile::tempdir().unwrap();
+        let discrete = saved(&dir2, &r);
+        assert_eq!(entry_text(&discrete, "predictions_tte.csv"), None);
+        let ebes = entry_text(&discrete, "ebes.csv").unwrap();
+        let mut lines = ebes.lines();
+        assert!(
+            lines.next().unwrap().ends_with(",n_obs,n_obs_discrete"),
+            "{ebes}"
+        );
+        assert!(lines.next().unwrap().ends_with(",3,0"), "{ebes}");
+        assert!(lines.next().unwrap().ends_with(",2,1"), "{ebes}");
+    }
+
+    /// T7 (#911): the rows outlive a load and a second save, written from the restored
+    /// rows (cell A6).
+    ///
+    /// Dies on: the second save dropping the entry, the reader not filling `tte_rows`
+    /// (the writer then has nothing to write).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn tte_rows_survive_a_load_and_re_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_911();
+        let loaded = load_fit(&save_911(&dir, "first.fitrx", &r, &p))
+            .unwrap()
+            .fit;
+        let back = load_fit(&save_911(&dir, "again.fitrx", &loaded, &p))
+            .unwrap()
+            .fit;
+        for (si, (got, want)) in back.subjects.iter().zip(&r.subjects).enumerate() {
+            assert_eq!(
+                tte_bits(&got.tte_rows),
+                tte_bits(&want.tte_rows),
+                "subject {si}"
+            );
+        }
+    }
+
+    /// T8 (#911): a build without `survival` loads a bundle that carries TTE rows (what a
+    /// survival build writes, built here from text), ignoring the entry and the column,
+    /// and keeps its discrete rows. Also the forward-compat proxy for a reader older than
+    /// #911 (cell F1), which knows neither name.
+    ///
+    /// Dies on: an unconditional `attach_tte_rows`-style read of the entry or the column
+    /// that refuses what it does not know.
+    #[cfg(not(feature = "survival"))]
+    #[test]
+    fn tte_bundle_loads_without_survival() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.subjects[1].discrete_rows = vec![discrete_row(3, 2.5, 0.25)];
+        let base = saved(&dir, &r);
+        let (s0, s1) = (r.subjects[0].id.clone(), r.subjects[1].id.clone());
+        let with_tte = dir.path().join("with_tte.fitrx");
+        let tte_csv = format!(
+            "ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT\n\
+             {s0},2,5.0,1.0,0.5,0.5,-0.5,0.6\n\
+             {s1},2,6.0,0.0,0.25,-0.25,-0.7,0.7\n\
+             {s1},2,7.0,,0.3,,,0.8\n"
+        );
+        let mut archive = ZipArchive::new(File::open(&base).unwrap()).unwrap();
+        let mut out = ZipWriter::new(File::create(&with_tte).unwrap());
+        for i in 0..archive.len() {
+            let mut f = archive.by_index(i).unwrap();
+            let name = f.name().unwrap().to_string();
+            let mut body = Vec::new();
+            f.read_to_end(&mut body).unwrap();
+            drop(f);
+            if name == "ebes.csv" {
+                let text = String::from_utf8(body).unwrap();
+                let mut lines = text.lines();
+                let mut edited = format!("{},n_obs_tte\n", lines.next().unwrap());
+                for (line, n) in lines.zip([1, 2]) {
+                    edited.push_str(&format!("{line},{n}\n"));
+                }
+                body = edited.into_bytes();
+            }
+            // Index the new entry, as a survival build's writer does (review r1 #5).
+            if name == "manifest.json" {
+                body = edit_json(body, |v| {
+                    v["entries"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push("predictions_tte.csv".into())
+                });
+            }
+            out.start_file(name, SimpleFileOptions::default()).unwrap();
+            out.write_all(&body).unwrap();
+        }
+        out.start_file("predictions_tte.csv", SimpleFileOptions::default())
+            .unwrap();
+        out.write_all(tte_csv.as_bytes()).unwrap();
+        out.finish().unwrap();
+
+        let loaded = load_fit(&with_tte).expect("a TTE bundle loads without survival");
+        assert!(
+            loaded
+                .manifest
+                .entries
+                .contains(&"predictions_tte.csv".to_string()),
+            "premise: the fixture indexes the entry"
+        );
+        assert!(loaded.fit.subjects[0].discrete_rows.is_empty());
+        assert_eq!(
+            loaded.fit.subjects[1].discrete_rows,
+            r.subjects[1].discrete_rows
+        );
+    }
+
     /// A covariate table whose declaration order is not alphabetical, so a reader taking
     /// the order from the `covariate_types` object would swap the columns.
     fn covariate_fixture() -> CovariateTable {
@@ -7501,6 +8522,34 @@ mod tests {
         });
         let loaded = load_fit(&edited).expect("core does not interpret the entry");
         assert_eq!(loaded.fit.interface_extras.as_deref(), Some("{not json"));
+    }
+
+    /// #2799: `eval_budget_spent` and `evaluation_only` round-trip, and a bundle written
+    /// before them (neither key present) loads both as `false`.
+    #[test]
+    fn roundtrip_status_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.eval_budget_spent = true;
+        r.evaluation_only = true;
+        let path = saved(&dir, &r);
+        let back = load_fit(&path).unwrap().fit;
+        assert!(back.eval_budget_spent && back.evaluation_only);
+
+        let edited = dir.path().join("old.fitrx");
+        rewrite_bundle(&path, &edited, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, |f| {
+                    let m = f.as_object_mut().unwrap();
+                    assert!(m.remove("eval_budget_spent").is_some());
+                    assert!(m.remove("evaluation_only").is_some());
+                })
+            } else {
+                body
+            })
+        });
+        let old = load_fit(&edited).unwrap().fit;
+        assert!(!old.eval_budget_spent && !old.evaluation_only);
     }
 
     /// #2695: `cov_fixed` round-trips, its pattern not all one value, and holds to the

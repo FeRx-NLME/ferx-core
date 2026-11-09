@@ -6,7 +6,9 @@
 //! where `R` stays positive definite. That is the #2536 seed-2 cell: before #2541 a sampler's
 //! fit there reported standard errors with no warning however far it sat from the minimum.
 use super::{compute_covariance, CovarianceOutput, CovarianceStepResult};
-use crate::estimation::cov_diagnostics::{NON_STATIONARY_DECREMENT_OFV, NON_STATIONARY_TOKEN};
+use crate::estimation::cov_diagnostics::{
+    NON_STATIONARY_DECREMENT_OFV, NON_STATIONARY_OPTIMUM_TOKEN, NON_STATIONARY_TOKEN,
+};
 use crate::estimation::parameterization::pack_params;
 use crate::types::{
     CompiledModel, CovarianceMethod, EstimationMethod as M, FitOptions, Population,
@@ -19,11 +21,16 @@ const TVCL_HAT: f64 = 0.132695;
 /// `examples/warfarin.ferx` with its initial estimates moved to the FOCEI minimum, `TVCL`
 /// replaced by `tvcl`.
 fn warfarin_at(tvcl: f64) -> (CompiledModel, Population) {
+    warfarin_at_bounded(tvcl, 0.001)
+}
+
+/// [`warfarin_at`] with `TVCL`'s lower bound at `lower` (#2785).
+fn warfarin_at_bounded(tvcl: f64, lower: f64) -> (CompiledModel, Population) {
     let src = std::fs::read_to_string("examples/warfarin.ferx").expect("model file");
     let src = src
         .replace(
             "theta TVCL(0.2, 0.001, 10.0)",
-            &format!("theta TVCL({tvcl:?}, 0.001, 10.0)"),
+            &format!("theta TVCL({tvcl:?}, {lower:?}, 10.0)"),
         )
         .replace("theta TVV(10.0,", "theta TVV(7.737706,")
         .replace("theta TVKA(1.5,", "theta TVKA(0.810796,")
@@ -218,5 +225,186 @@ fn a_positive_definite_r_at_a_non_stationary_sampler_estimate_warns() {
         stationarity_warnings(&saem_near).is_empty(),
         "{:?}",
         saem_near.warnings
+    );
+}
+
+fn optimum_warnings(out: &CovarianceOutput) -> Vec<&String> {
+    out.warnings
+        .iter()
+        .filter(|w| w.starts_with(NON_STATIONARY_OPTIMUM_TOKEN))
+        .collect()
+}
+
+/// #2785: the same test on an estimate whose method *did* minimise the objective — FOCEI —
+/// which demotes the fit instead of only warning. Three straddles in one test:
+///
+/// - **distance**: FOCEI at the minimum reads a decrement far under the threshold and is not
+///   flagged; at `TVCL × 1.06` (the #2541 `far` point, `R` still positive definite) it is,
+///   with one `W_NON_STATIONARY_OPTIMUM` naming `TVCL` first;
+/// - **the same number as the sampler's test**: at that point, with nothing on a bound, the
+///   decrement is SAEM's `W_COV_NON_STATIONARY_ESTIMATE` decrement to the bit, so the two
+///   gates cannot drift apart in scale;
+/// - **bound**: the same point with `TVCL`'s lower bound moved onto it — a constrained optimum
+///   whose slope points out of the box — holds `TVCL`, and the decrement of what is left falls
+///   under the threshold. Without the hold it would be the unconstrained one again.
+///
+/// Measured (debug, Linux x86_64): 1.9e-8 at the minimum, 1.2667 at `far` (SAEM's own
+/// printed 1.267), 0.0629 with `TVCL` held.
+#[test]
+fn a_non_stationary_focei_estimate_is_demoted_unless_a_bound_holds_it() {
+    let (model, pop) = warfarin_at(TVCL_HAT);
+    let (_, at_min) = cov(&model, &pop, M::FoceI);
+    let d_min = at_min
+        .newton_decrement
+        .expect("FOCEI on an unclipped R is tested");
+    eprintln!("at the minimum: decrement {d_min:e}");
+    assert!(d_min.is_finite() && d_min < 1e-3, "{d_min}");
+    assert!(!at_min.non_stationary_optimum);
+    assert!(
+        optimum_warnings(&at_min).is_empty(),
+        "{:?}",
+        at_min.warnings
+    );
+
+    let (model, pop) = warfarin_at(TVCL_HAT * 1.06);
+    let (_, focei) = cov(&model, &pop, M::FoceI);
+    let d_far = focei.newton_decrement.expect("tested");
+    eprintln!("far: decrement {d_far}");
+    assert!(focei.non_stationary_optimum, "decrement {d_far}");
+    let w = optimum_warnings(&focei);
+    assert_eq!(w.len(), 1, "{:?}", focei.warnings);
+    assert!(
+        w[0].contains("the FOCEI estimate is not a stationary point")
+            && w[0].contains("in standard errors: theta[TVCL] -"),
+        "TVCL is the displaced coordinate, and a minimiser lowers it: {}",
+        w[0]
+    );
+    // The sampler's gate, not this one, owns `W_COV_NON_STATIONARY_ESTIMATE`.
+    assert!(
+        stationarity_warnings(&focei).is_empty(),
+        "{:?}",
+        focei.warnings
+    );
+    let (_, saem) = cov(&model, &pop, M::Saem);
+    assert!(
+        !saem.non_stationary_optimum,
+        "a sampler is warned, never demoted"
+    );
+    assert_eq!(
+        saem.newton_decrement,
+        Some(d_far),
+        "same point, same objective"
+    );
+
+    let (model, pop) = warfarin_at_bounded(TVCL_HAT * 1.06, TVCL_HAT * 1.06);
+    let (_, held) = cov(&model, &pop, M::FoceI);
+    let d_held = held.newton_decrement.expect("tested");
+    eprintln!("far, TVCL on its lower bound: decrement {d_held}");
+    assert!(d_held < NON_STATIONARY_DECREMENT_OFV, "{d_held}");
+    assert!(!held.non_stationary_optimum);
+    assert!(optimum_warnings(&held).is_empty(), "{:?}", held.warnings);
+}
+
+#[test]
+fn a_non_stationary_optimum_demotes_converged_once() {
+    use super::demote_non_stationary_optimum as demote;
+    let (mut converged, mut warnings) = (true, Vec::new());
+    demote(false, &mut converged, &mut warnings);
+    assert!(converged && warnings.is_empty(), "nothing to demote");
+    demote(true, &mut converged, &mut warnings);
+    assert!(!converged);
+    assert_eq!(
+        warnings,
+        vec!["Outer optimization did not converge".to_string()]
+    );
+    // Already unconverged: the generic line is not pushed a second time.
+    demote(true, &mut converged, &mut warnings);
+    assert_eq!(warnings.len(), 1);
+}
+
+/// `examples/warfarin.ferx` fitted end to end by the built-in BFGS (`Optimizer::Bfgs`), which
+/// stops on a raw gradient norm `|g| < outer_gtol` (#2785).
+fn bfgs_fit(outer_gtol: f64) -> crate::types::FitResult {
+    let (model, pop) = warfarin_at(0.2);
+    let o = FitOptions {
+        optimizer: crate::types::Optimizer::Bfgs,
+        outer_gtol,
+        ..opts(M::FoceI)
+    };
+    crate::api::fit(&model, &pop, &model.default_params, &o).expect("fit")
+}
+
+/// #2785's shareable fixture: a stop rule that is met at a point that is not a minimum, and
+/// was reported `converged: true` before the stationarity gate. The built-in BFGS stops when
+/// the **raw** scaled-space gradient norm drops under `outer_gtol` — the scale-blind measure
+/// the issue names — and at `outer_gtol = 100` it does so after 4 iterations, 12.9 OFV above
+/// the minimum (−273.08 against −286.00). The gate is the only thing that
+/// demotes it: the warning set below carries no other non-convergence reason, so removing the
+/// demotion reports `converged: true` and reddens this test.
+///
+/// The control is the same fit at the default `outer_gtol`, which runs to the minimum and is
+/// left converged with a decrement far under the threshold — the straddle that keeps a gate
+/// stuck on "demote" from passing.
+///
+/// Measured (debug, Linux x86_64), sweeping `outer_gtol`: 30 and 50 stop 0.36 / 0.49 OFV
+/// short with decrements of 0.36 / 0.47 — under one standard error, so left converged, as the
+/// threshold intends; 80 and 100 stop at the same point with a decrement of 337.4 (√ ≈ 18
+/// SEs); 200 stops after 2 iterations where `R` needs an eigenvalue floor, so the step makes
+/// no claim (`newton_decrement = None`). The default `outer_gtol` reads 1.9e-8 at the minimum.
+#[test]
+fn a_bfgs_stop_on_a_raw_gradient_norm_short_of_the_minimum_is_not_converged() {
+    let loose = bfgs_fit(100.0);
+    let d = loose
+        .newton_decrement
+        .expect("FOCEI, covariance step on an unclipped R");
+    eprintln!(
+        "outer_gtol = 100: decrement {d:e}, {} iterations",
+        loose.n_iterations
+    );
+    assert!(
+        d > NON_STATIONARY_DECREMENT_OFV,
+        "fixture: stops short ({d})"
+    );
+    assert!(!loose.converged, "{:?}", loose.warnings);
+    let tokens: Vec<_> = loose
+        .warnings
+        .iter()
+        .filter(|w| w.contains(NON_STATIONARY_OPTIMUM_TOKEN))
+        .collect();
+    assert_eq!(tokens.len(), 1, "{:?}", loose.warnings);
+    assert!(tokens[0].contains("the FOCEI estimate"), "{}", tokens[0]);
+    assert_eq!(
+        loose
+            .warnings
+            .iter()
+            .filter(|w| w.as_str() == "Outer optimization did not converge")
+            .count(),
+        1,
+        "the generic line, once: {:?}",
+        loose.warnings
+    );
+    assert!(
+        loose.warnings_structured.iter().any(|e| {
+            e.message.contains(NON_STATIONARY_OPTIMUM_TOKEN)
+                && e.category == crate::types::WarningCode::Convergence
+        }),
+        "{:?}",
+        loose.warnings_structured
+    );
+    // The built-in BFGS is not NLopt: no NLopt state to publish.
+    assert_eq!(loose.optimizer_stop, None);
+
+    let tight = bfgs_fit(FitOptions::default().outer_gtol);
+    let d = tight.newton_decrement.expect("tested");
+    eprintln!("default outer_gtol: decrement {d:e}");
+    assert!(d < 1e-3, "{d}");
+    assert!(tight.converged, "{:?}", tight.warnings);
+    assert!(
+        !tight
+            .warnings
+            .iter()
+            .any(|w| w.contains(NON_STATIONARY_OPTIMUM_TOKEN)),
+        "{:?}",
+        tight.warnings
     );
 }

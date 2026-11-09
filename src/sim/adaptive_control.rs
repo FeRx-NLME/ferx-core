@@ -22,8 +22,8 @@ use crate::diagnostics::Diagnostic;
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
     dose_plan_violation, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, ControllerCtx, ControllerDecision, DoseAction, DosePlanViolation, DoseStep,
-    IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
+    Comparison, ControllerCtx, ControllerDecision, DoseAction, DoseGrid, DosePlanViolation,
+    DoseStep, IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
 };
 use crate::types::CompiledModel;
 
@@ -60,6 +60,9 @@ struct AdaptiveController {
     // ── plan (immutable) ──
     route: AdaptiveRoute,
     dose_bounds: (f64, f64),
+    /// The dose grid (`round_to`, #944): every dose this controller sets lands on it.
+    /// `None` without `round_to`, where doses are only clamped to `dose_bounds`.
+    grid: Option<DoseGrid>,
     confirm: u32,
     rules: Vec<AdaptiveRule>,
     levels: Option<Vec<f64>>,
@@ -95,14 +98,26 @@ impl AdaptiveController {
             (Some(l), Some(d)) => l.iter().position(|&x| x == d).unwrap_or(0),
             _ => 0,
         };
+        // The start dose goes onto the grid by the same path as every step (#944). A
+        // plan that passed `dose_plan_violation` has a grid whenever `round_to` is set.
+        let grid = spec.dose_grid(plan.dose_bounds);
+        // V7 refuses bounds with no multiple before any subject runs; without it a set
+        // `round_to` would fall back to the unrounded clamp here, silently.
+        debug_assert!(
+            spec.round_to.is_none() || grid.is_some(),
+            "round_to is set but dose_bounds {:?} hold no multiple of it (V7 not checked)",
+            plan.dose_bounds
+        );
+        let dose = grid.map_or(plan.start_dose, |g| g.place(plan.start_dose));
         Self {
             route: spec.route.clone(),
             dose_bounds: plan.dose_bounds,
+            grid,
             confirm: spec.confirm,
             rules: spec.rules.clone(),
             levels: plan.levels.clone(),
             intervals: spec.intervals.clone(),
-            dose: plan.start_dose,
+            dose,
             level,
             rung,
             last_rule: None,
@@ -209,13 +224,21 @@ impl AdaptiveController {
         })
     }
 
-    /// Move the running dose one step up/down, clamped to `dose_bounds`.
+    /// Move the running dose one step up/down, clamped to `dose_bounds` — or, with
+    /// `round_to`, placed on the dose grid (rounded, then clamped to the aligned bounds,
+    /// #944). The placed dose is what is carried, so the next step starts from the dose
+    /// actually given, and a re-issue (`emit_dose`) gives it as is, never rounding it again. A step
+    /// the grid absorbs leaves the dose unchanged, as a step clamped at a bound does.
     fn step_dose(&mut self, step: DoseStep, up: bool) {
         let (lo, hi) = self.dose_bounds;
         match (step, &self.levels) {
             (DoseStep::Percent(p), _) => {
                 let factor = if up { 1.0 + p / 100.0 } else { 1.0 - p / 100.0 };
-                self.dose = (self.dose * factor).clamp(lo, hi);
+                let x = self.dose * factor;
+                self.dose = match &self.grid {
+                    Some(g) => g.place(x),
+                    None => x.clamp(lo, hi),
+                };
             }
             (DoseStep::Level, Some(levels)) => {
                 self.level = if up {
@@ -280,6 +303,16 @@ struct CompiledDoseExpr {
     key: &'static str,
     eval: OdeOutputFn,
     covariates: Vec<String>,
+    /// What it reads of the subject (`check_adaptive_dose_expression`'s return).
+    reads: crate::parser::model_parser::DoseExprReads,
+}
+
+/// A subject's own values at the first decision, for the dose expressions that read
+/// them (#944): its `[η | κ]` and the PK they give there. A supplied subject passes its
+/// supplied η with κ = 0; an oracle subject its drawn η and first-occasion κ.
+pub(crate) struct SubjectValues<'a> {
+    pub eta: &'a [f64],
+    pub pk: &'a crate::types::PkParams,
 }
 
 /// One subject's dose plan, or the first invariant it breaks.
@@ -305,29 +338,55 @@ impl CompiledDoseExprs {
         out
     }
 
-    /// Evaluate every dose value of `spec` for one subject, from `theta` and the
-    /// covariates `covs` in force at the first decision (#944).
+    /// The subject values the expressions read (individual parameters a draw reaches,
+    /// random effects, `MIXNUM`), each once, with the first key that reads it.
+    pub(crate) fn subject_value_reads(&self) -> Vec<(&'static str, &str)> {
+        first_reads(&self.exprs, |r| &r.subject_values)
+    }
+
+    /// Whether any expression reads a subject value, so that a subject may be dosed from
+    /// it only when that value is known (or under `dose_knowledge = oracle`).
+    pub(crate) fn reads_subject_values(&self) -> bool {
+        self.exprs
+            .iter()
+            .any(|e| !e.reads.subject_values.is_empty())
+    }
+
+    /// Whether any expression reads an individual parameter, a draw-free one included:
+    /// every such read needs the subject's PK at the first decision.
+    pub(crate) fn reads_indiv_params(&self) -> bool {
+        self.exprs.iter().any(|e| !e.reads.indiv_params.is_empty())
+    }
+
+    /// Evaluate every dose value of `spec` for one subject, from `theta`, the
+    /// covariates `covs` in force at the first decision, and — when an expression reads
+    /// them — the subject's own values `subject` there (#944).
     ///
-    /// An expression reads only θ and covariates — the parser refuses a state, `TIME`,
-    /// an individual parameter, a random effect and `MIXNUM`
-    /// (`check_adaptive_dose_expression`), and `compile_adaptive` refuses them again on
-    /// a spec built in code — so the state, PK and η slices it is handed are zeros that
-    /// it never reads.
+    /// The parser refuses a state and `TIME` (`check_adaptive_dose_expression`), and
+    /// `compile_adaptive` refuses them again on a spec built in code, so the state slice
+    /// is zeros that no expression reads. With `subject` absent the PK and η slices are
+    /// zeros too; the caller passes `None` only when [`Self::reads_indiv_params`] and
+    /// [`Self::reads_subject_values`] are both false.
     pub(crate) fn resolve(
         &self,
         spec: &AdaptiveDosingSpec,
         model: &CompiledModel,
         theta: &[f64],
         covs: &std::collections::HashMap<String, f64>,
+        subject: Option<&SubjectValues<'_>>,
     ) -> ResolvedDosePlan {
         let n_states = model.ode_spec.as_ref().map_or(0, |o| o.n_states);
         let states = vec![0.0; n_states];
-        let pk = crate::types::PkParams::default();
-        let eta = vec![0.0; model.n_eta + model.n_kappa];
+        let zero_pk = crate::types::PkParams::default();
+        let zero_eta = vec![0.0; model.n_eta + model.n_kappa];
+        let (pk, eta) = match subject {
+            Some(v) => (v.pk, v.eta),
+            None => (&zero_pk, zero_eta.as_slice()),
+        };
         let mut values = self
             .exprs
             .iter()
-            .map(|e| (e.eval)(&states, &pk.values, theta, &eta, covs));
+            .map(|e| (e.eval)(&states, &pk.values, theta, eta, covs));
         let mut value = |v: &crate::sim::adaptive::DoseValue| match v.as_literal() {
             Some(x) => x,
             None => values
@@ -346,17 +405,75 @@ impl CompiledDoseExprs {
             dose_bounds,
             levels,
         };
-        let reads = self
+        let mut reads: Vec<(String, f64)> = self
             .covariates()
             .into_iter()
-            .map(|(_, c)| (c.to_string(), covs.get(c).copied().unwrap_or(f64::NAN)))
+            .map(|(_, c)| {
+                (
+                    c.to_string(),
+                    crate::parser::model_parser::output_covariate_read(covs, c),
+                )
+            })
             .collect();
+        // Every individual parameter read, then the random effects and `MIXNUM`.
+        let indiv = first_reads(&self.exprs, |r| &r.indiv_params);
+        let others = self.subject_value_reads();
+        let mut names: Vec<&str> = indiv.into_iter().map(|(_, n)| n).collect();
+        for (_, n) in others {
+            if !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        reads.extend(
+            names
+                .into_iter()
+                .map(|n| (n.to_string(), subject_value_read(model, pk, eta, n))),
+        );
         ResolvedDosePlan {
-            violation: dose_plan_violation(&plan),
+            violation: dose_plan_violation(spec, &plan),
             plan,
             reads,
         }
     }
+}
+
+/// Each name `pick` lists across `exprs`, once, with the first key that reads it.
+fn first_reads<'a>(
+    exprs: &'a [CompiledDoseExpr],
+    pick: impl Fn(&'a crate::parser::model_parser::DoseExprReads) -> &'a Vec<String>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut out: Vec<(&'static str, &str)> = Vec::new();
+    for e in exprs {
+        for n in pick(&e.reads) {
+            if !out.iter().any(|(_, m)| m == n) {
+                out.push((e.key, n));
+            }
+        }
+    }
+    out
+}
+
+/// The value a dose expression reads for subject value `name` — the slot
+/// `build_y_output_fn` reads it from: an individual parameter's PK slot, a random
+/// effect's η, or the mixture class. For the "reads" sentence of a refusal, so it
+/// reports the value the expression used.
+fn subject_value_read(
+    model: &CompiledModel,
+    pk: &crate::types::PkParams,
+    eta: &[f64],
+    name: &str,
+) -> f64 {
+    if name == "MIXNUM" {
+        return crate::parser::model_parser::current_mixture_class() as f64;
+    }
+    if let Some(i) = model.indiv_param_names.iter().position(|n| n == name) {
+        return pk.values[model.pk_indices.get(i).copied().unwrap_or(i)];
+    }
+    model
+        .eta_names
+        .iter()
+        .position(|n| n == name)
+        .map_or(f64::NAN, |i| eta[i])
 }
 
 /// Compile every dose expression of `spec` (#944) through the same
@@ -373,12 +490,13 @@ pub(crate) fn compile_dose_exprs(
         .map_or(&[], |o| o.state_names.as_slice());
     let mut exprs = Vec::new();
     for (key, src) in spec.dose_expressions() {
-        crate::parser::model_parser::check_adaptive_dose_expression(
+        let reads = crate::parser::model_parser::check_adaptive_dose_expression(
             src,
             key,
             model,
             &spec.observe_declared_covariates,
             spec.at[0],
+            spec.dose_knowledge,
         )?;
         let context = format!("[adaptive_dosing] {key}");
         let mut warnings: Vec<String> = Vec::new();
@@ -402,9 +520,15 @@ pub(crate) fn compile_dose_exprs(
             key,
             eval,
             covariates,
+            reads,
         });
     }
-    Ok(CompiledDoseExprs { exprs })
+    let compiled = CompiledDoseExprs { exprs };
+    crate::parser::model_parser::check_dose_knowledge_used(
+        spec.dose_knowledge,
+        compiled.reads_subject_values(),
+    )?;
+    Ok(compiled)
 }
 
 /// Compile a latent (`Ipred`) `observe` expression into the engine's
@@ -579,6 +703,8 @@ mod tests {
             levels: levels.map(|l| l.into_iter().map(Into::into).collect()),
             target_window: None,
             auc_target: None,
+            round_to: None,
+            dose_knowledge: Default::default(),
             rules,
             intervals: None,
             start_interval: None,
@@ -938,6 +1064,8 @@ mod tests {
             levels: None,
             target_window: None,
             auc_target: None,
+            round_to: None,
+            dose_knowledge: Default::default(),
             rules: vec![rule(Comparison::Gt, 1000.0, AdaptiveAction::Hold)],
             intervals: None,
             start_interval: None,
@@ -1159,5 +1287,176 @@ mod tests {
             IntervalStep::Shorten,
         );
         assert_eq!(r.label(), "signal < 10 : shorten");
+    }
+
+    // ── round_to: the dose grid (#944 PR3) ─────────────────────────────────────────
+    //
+    // The oracles are hand-computed: with `s = 250` every grid dose is an exact integer,
+    // so each expected amount is compared by bits.
+
+    /// `spec` with `round_to = 250`, bolus, confirm 1, and the one rule `rule_action`
+    /// firing whenever the signal is below 10.
+    fn grid_spec(start: f64, bounds: (f64, f64), action: AdaptiveAction) -> AdaptiveDosingSpec {
+        let mut s = spec(
+            start,
+            AdaptiveRoute::Bolus { cmt: 1 },
+            bounds,
+            1,
+            None,
+            vec![rule(Comparison::Lt, 10.0, action)],
+        );
+        s.round_to = Some(250.0);
+        s
+    }
+
+    /// Like [`run`], keeping the rule each decision names.
+    fn decisions(spec: &AdaptiveDosingSpec, signals: &[f64]) -> Vec<ControllerDecision> {
+        let factory = build_adaptive_controller(spec);
+        let mut controller = factory(&spec.literal_dose_plan().expect("a block of numbers"));
+        let empty_cov: HashMap<String, f64> = HashMap::new();
+        signals
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let mut sig = HashMap::new();
+                sig.insert(ADAPTIVE_SIGNAL.to_string(), s);
+                controller(&ControllerCtx {
+                    t: i as f64,
+                    state: &[],
+                    covariates: &empty_cov,
+                    history: &[],
+                    decision_index: i,
+                    signals: &sig,
+                    interval: None,
+                })
+            })
+            .collect()
+    }
+
+    fn amt(actions: &[DoseAction]) -> f64 {
+        match actions {
+            [DoseAction::Bolus { amt, .. }] => *amt,
+            other => panic!("expected one bolus, got {other:?}"),
+        }
+    }
+
+    /// 500 → +30% → 750 → +30% → 1000: each step starts from the dose actually given.
+    /// Carrying the unrounded 650 would give 845 → 750 at the second step (#944 audit 1
+    /// row 15). The third decision fires no rule and re-issues 1000 as is.
+    ///
+    /// Mutation: `step_dose` carries `x` and only the emitted amount is rounded.
+    #[test]
+    fn round_to_carries_the_rounded_dose() {
+        let s = grid_spec(
+            500.0,
+            (250.0, 4000.0),
+            AdaptiveAction::Increase(DoseStep::Percent(30.0)),
+        );
+        let out = run(&s, &[0.0, 0.0, 50.0]);
+        assert_eq!(amt(&out[0]).to_bits(), 750.0f64.to_bits(), "{out:?}");
+        assert_eq!(amt(&out[1]).to_bits(), 1000.0f64.to_bits(), "{out:?}");
+        assert_eq!(amt(&out[2]).to_bits(), 1000.0f64.to_bits(), "{out:?}");
+    }
+
+    /// `hi = 1150, s = 250`: a step to 1300 rounds to 1250, then clamps to the aligned
+    /// 1000. Clamping first gives 1150, which rounds to 1250, above the written bound
+    /// (#944 audit 1 row 13).
+    ///
+    /// Mutation: clamp to the raw bounds, then round.
+    #[test]
+    fn round_to_rounds_then_clamps_to_the_aligned_bound() {
+        let s = grid_spec(
+            1000.0,
+            (250.0, 1150.0),
+            AdaptiveAction::Increase(DoseStep::Percent(30.0)),
+        );
+        let out = run(&s, &[0.0]);
+        assert_eq!(amt(&out[0]).to_bits(), 1000.0f64.to_bits(), "{out:?}");
+    }
+
+    /// The start dose takes the same path as a step: 375 is a tie between 250 and 500
+    /// and goes up; 100 with a lower bound of `1e-6` rounds to 0, and the aligned lower
+    /// bound, 250, lifts it — a dose, not a hold (#944 audit 1 row 14).
+    ///
+    /// Mutations: the start dose not placed on the grid; ties sent down; the aligned
+    /// lower bound taken as the raw `lo`.
+    #[test]
+    fn round_to_places_the_start_dose_on_the_grid() {
+        let maintain = AdaptiveAction::Maintain;
+        let tie = grid_spec(375.0, (1e-6, 4000.0), maintain.clone());
+        assert_eq!(amt(&run(&tie, &[50.0])[0]).to_bits(), 500.0f64.to_bits());
+        let lifted = grid_spec(100.0, (1e-6, 4000.0), maintain);
+        assert_eq!(amt(&run(&lifted, &[50.0])[0]).to_bits(), 250.0f64.to_bits());
+    }
+
+    /// 500 +10% is 550, which rounds back to 500: the rule fires and the dose stays —
+    /// the same record a step clamped at a bound produces (`rule_fired`, unchanged
+    /// `amt`). The next step from the carried 500 is again absorbed, not 605 → 500.
+    ///
+    /// Mutation: an absorbed step reported as no rule.
+    #[test]
+    fn round_to_an_absorbed_step_names_the_rule_and_keeps_the_dose() {
+        let s = grid_spec(
+            500.0,
+            (250.0, 4000.0),
+            AdaptiveAction::Increase(DoseStep::Percent(10.0)),
+        );
+        let out = decisions(&s, &[0.0, 0.0]);
+        for (i, d) in out.iter().enumerate() {
+            assert_eq!(
+                amt(&d.actions).to_bits(),
+                500.0f64.to_bits(),
+                "decision {i}"
+            );
+            assert!(
+                d.rule.is_some(),
+                "decision {i}: the rule that fired is named"
+            );
+        }
+    }
+
+    /// A grid that already holds every dose the controller would set leaves the run
+    /// unchanged: 1000 → +50% 1500 → −50% 750 → +100% 1500 on `s = 250` with the bounds
+    /// on the grid and never reached. The actions equal those without `round_to`, by
+    /// bits (#944 D2, second half).
+    ///
+    /// Mutation: rounding that moves an on-grid value (e.g. a tie bias of a whole step).
+    #[test]
+    fn round_to_on_a_grid_holding_every_dose_equals_no_round_to() {
+        let mut s = spec(
+            1000.0,
+            AdaptiveRoute::Bolus { cmt: 1 },
+            (250.0, 4000.0),
+            1,
+            None,
+            vec![
+                rule(
+                    Comparison::Lt,
+                    10.0,
+                    AdaptiveAction::Increase(DoseStep::Percent(50.0)),
+                ),
+                rule(
+                    Comparison::Gt,
+                    90.0,
+                    AdaptiveAction::Decrease(DoseStep::Percent(50.0)),
+                ),
+                rule(
+                    Comparison::Lt,
+                    20.0,
+                    AdaptiveAction::Increase(DoseStep::Percent(100.0)),
+                ),
+            ],
+        );
+        let signals = [0.0, 95.0, 15.0, 50.0];
+        let plain = run(&s, &signals);
+        s.round_to = Some(250.0);
+        let gridded = run(&s, &signals);
+        let bits = |o: &[Vec<DoseAction>]| o.iter().map(|a| amt(a).to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&plain), bits(&gridded), "{plain:?} vs {gridded:?}");
+        assert_eq!(
+            bits(&plain),
+            [1500.0f64, 750.0, 1500.0, 1500.0].map(f64::to_bits),
+            "the doses are the ones named above: {plain:?}"
+        );
     }
 }

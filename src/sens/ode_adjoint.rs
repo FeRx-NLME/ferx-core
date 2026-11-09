@@ -1954,7 +1954,7 @@ fn record_analytic_events<T: VmNum>(
         || uses_time;
     // `first[i]`: the record whose evaluation record `i` reuses (itself when none);
     // `None` when every record is its own.
-    let first: Option<Vec<usize>> = if per_record && T::RECORDS_TAPE {
+    let first: Option<std::rc::Rc<[usize]>> = if per_record && T::RECORDS_TAPE {
         // A taped type evaluates every record of a time-varying subject. Reusing one
         // evaluation is the same function but a different tape: the reverse sweep then
         // sums the records' adjoints into one node before passing them on, and that
@@ -1964,8 +1964,11 @@ fn record_analytic_events<T: VmNum>(
         // static subject predates the index and is kept on every type.
         None
     } else {
-        crate::pk::first_record_with_same_pk_inputs(
+        // Built once per EBE search, not per evaluation (#2558): `SharingScope`.
+        crate::pk::sharing_scope::first_record_with_same_pk_inputs(
             model,
+            subject,
+            crate::pk::sharing_scope::ShareSite::Recorder,
             records.iter().map(|&(occ, cov, _)| (group(occ), cov)),
         )
     };

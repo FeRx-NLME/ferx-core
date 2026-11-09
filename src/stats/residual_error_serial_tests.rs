@@ -558,7 +558,9 @@ fn whitened_autocorrelation_reads_the_subjects_own_residual_scale() {
         warnings: vec![],
     };
     let got = whitened_residual_autocorrelation(&model, &pop, &params, std::slice::from_ref(&res));
-    let want = residual_autocorrelation(std::iter::once(z.as_slice()));
+    // Split by block (#2798): ARM [1, 1, 2, 1, 2] is rows {0, 1, 3} and {2, 4}.
+    let blocks = [vec![z[0], z[1], z[3]], vec![z[2], z[4]]];
+    let want = residual_autocorrelation(blocks.iter().map(Vec::as_slice));
     assert!(got.0.is_finite() && got.1.is_finite(), "{got:?}");
     assert_relative_eq!(got.0, want.0, max_relative = 1e-12);
     assert_relative_eq!(got.1, want.1, max_relative = 1e-12);
@@ -606,7 +608,9 @@ fn whitened_autocorrelation_is_the_statistic_of_l_inverse_residuals() {
         warnings: vec![],
     };
     let got = whitened_residual_autocorrelation(&model, &pop, &params, std::slice::from_ref(&res));
-    let want = residual_autocorrelation(std::iter::once(z.as_slice()));
+    // Split by block (#2798): ARM [1, 1, 2, 1, 2] is rows {0, 1, 3} and {2, 4}.
+    let blocks = [vec![z[0], z[1], z[3]], vec![z[2], z[4]]];
+    let want = residual_autocorrelation(blocks.iter().map(Vec::as_slice));
     assert!(got.0.is_finite() && got.1.is_finite(), "{got:?}");
     assert_relative_eq!(got.0, want.0, max_relative = 1e-12);
     assert_relative_eq!(got.1, want.1, max_relative = 1e-12);
@@ -614,5 +618,112 @@ fn whitened_autocorrelation_is_the_statistic_of_l_inverse_residuals() {
     assert!(
         (raw.1 - want.1).abs() > 0.1,
         "raw {raw:?} vs whitened {want:?}"
+    );
+    // B4 (#2798), by hand: the blocks [0.8, −0.3, 0.4] and [1.1, −0.9] have squared
+    // steps 1.21 + 0.49 + 4.00 = 5.70 over pair means 0.365 + 0.125 + 1.01 = 1.5, so
+    // DW = 3.8. The whole series would pair across the blocks: 5.35 / 2.185 = 2.4485.
+    // This fixture has no `occasions`, so the split here is `obs_rgroup` alone.
+    assert!(pop.subjects[0].occasions.is_empty());
+    assert!(
+        (got.1 - 3.8).abs() < 1e-12,
+        "whitened DW split by residual block: 3.8, got {}",
+        got.1
+    );
+}
+
+/// B5 (#2798): rows are grouped by key, not by contiguous run. Two occasions written
+/// interleaved, `[1, 2, 1, 2]`, give the same series — and the same statistic — as the
+/// same rows written contiguously, `[1, 1, 2, 2]`, with the values reordered to match.
+/// Each occasion's values are `[1, 2]` and `[−1, 3]`: steps 1 and 16 over pair means
+/// 2.5 and 5, DW = 17 / 7.5.
+///
+/// Mutation that must redden this: grouping by contiguous run of the key (the
+/// interleaved layout would then be four one-row series and no pair at all).
+#[test]
+fn grouped_dw_groups_by_key_not_by_contiguous_run() {
+    let pop_of = |occasions: Vec<u32>| crate::types::Population {
+        subjects: vec![Subject {
+            obs_times: vec![0.0, 1.0, 2.0, 3.0],
+            observations: vec![0.0; 4],
+            obs_cmts: vec![1; 4],
+            occasions,
+            ..Default::default()
+        }],
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let res_of = |iwres: Vec<f64>| {
+        let mut r = crate::types::test_helpers::dummy_subject("1", 0, 4);
+        r.iwres = iwres;
+        r
+    };
+    let interleaved = grouped_iwres_autocorrelation(
+        &pop_of(vec![1, 2, 1, 2]),
+        &[res_of(vec![1.0, -1.0, 2.0, 3.0])],
+    );
+    let contiguous = grouped_iwres_autocorrelation(
+        &pop_of(vec![1, 1, 2, 2]),
+        &[res_of(vec![1.0, 2.0, -1.0, 3.0])],
+    );
+    assert!(interleaved.1.is_finite() && contiguous.1.is_finite());
+    assert!(
+        (contiguous.1 - 17.0 / 7.5).abs() < 1e-12,
+        "contiguous: {}",
+        contiguous.1
+    );
+    assert_eq!(interleaved.1.to_bits(), contiguous.1.to_bits());
+    assert_eq!(interleaved.0.to_bits(), contiguous.0.to_bits());
+}
+
+/// #2798 review row 2: the key is the **pair** `(occasion, residual block)`, not
+/// either part alone, nor occasions-if-present-else-block. Two occasions crossed with
+/// two blocks give four cells of two rows each; every other key joins rows across a
+/// cell boundary and lands on a different value, which the test computes and asserts
+/// apart (so the straddle cannot quietly become a tautology).
+///
+/// Rows `e = [1, 2 | 3, 1 | −1, 1 | 2, 2]`, cells `(1,0) (1,1) (2,0) (2,1)`:
+/// pairs (1,2) (3,1) (−1,1) (2,2), Σ diff² = 1 + 4 + 4 + 0 = 9,
+/// Σ (eₜ²+eₜ₋₁²)/2 = 2.5 + 5 + 1 + 4 = 12.5, DW = 0.72.
+/// Occasion alone: 11 / 21.5 = 0.5116. Block alone: 19 / 17.5 = 1.0857.
+#[test]
+fn grouped_dw_keys_on_occasion_and_block_together() {
+    let pop_of = |occasions: Vec<u32>, obs_rgroup: Vec<u32>| crate::types::Population {
+        subjects: vec![Subject {
+            obs_times: (0..8).map(f64::from).collect(),
+            observations: vec![0.0; 8],
+            obs_cmts: vec![1; 8],
+            occasions,
+            obs_rgroup,
+            ..Default::default()
+        }],
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let mut res = crate::types::test_helpers::dummy_subject("1", 0, 8);
+    res.iwres = vec![1.0, 2.0, 3.0, 1.0, -1.0, 1.0, 2.0, 2.0];
+    let res = [res];
+    let occ = vec![1, 1, 1, 1, 2, 2, 2, 2];
+    let grp = vec![0, 0, 1, 1, 0, 0, 1, 1];
+    let both = grouped_iwres_autocorrelation(&pop_of(occ.clone(), grp.clone()), &res).1;
+    let occ_only = grouped_iwres_autocorrelation(&pop_of(occ, vec![]), &res).1;
+    let grp_only = grouped_iwres_autocorrelation(&pop_of(vec![], grp), &res).1;
+    assert!(both.is_finite() && occ_only.is_finite() && grp_only.is_finite());
+    assert!(
+        (occ_only - 11.0 / 21.5).abs() < 1e-12,
+        "occasion only: {occ_only}"
+    );
+    assert!(
+        (grp_only - 19.0 / 17.5).abs() < 1e-12,
+        "block only: {grp_only}"
+    );
+    assert!(
+        (both - 9.0 / 12.5).abs() < 1e-12,
+        "(occasion, block): {both}, occasion alone {occ_only}, block alone {grp_only}"
     );
 }

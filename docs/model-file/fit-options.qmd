@@ -66,8 +66,8 @@ What runs, how long, and how it is resumed or traced.
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `method` | `foce`, `focei`, `laplace`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](../estimation/index.qmd#method-chaining). When neither this key nor a wrapper's `method` argument is set, the engine falls back to `focei` and emits a warning so the implicit choice is visible — set `method` here to silence it. `foce` is FOCE **without** η–ε interaction (NONMEM `METHOD=1`) and `focei` FOCE with it (`METHOD=1 INTER`); the choice also fixes the objective every post-fit step scores — the sdtab CWRES, SIR's importance weights, the standalone `run_sir` / `run_covariance`, and the reported `interaction` (#1710). |
-| `threads` | positive integer, `0`, `auto` | `auto` | Number of Rayon worker threads for per-subject parallelism. A positive integer pins the count. `0`/`auto` (or omitting the key) uses the engine's default: available cores − 1 (floored at 1), capped at 8 — most fits gain little from spreading across every core; see [choosing a thread count](#choosing-a-thread-count). A pinned count is an upper bound on the whole fit, `n_starts > 1` included: a multi-start fit runs its start fan-out and the per-subject loops underneath it on the same pinned pool. The CLI's `--threads` flag mirrors this key (see `ferx --help`) and **overrides it** when both are given: an explicit `ferx model.ferx --threads 1` wins over a file that says `threads = 8`, and a warning names both counts. `--threads 0` / `--threads auto` counts as explicit too — it asks for the engine default by name, so it also overrides a pinned count (#1416). |
-| `maxiter` | integer | `500` | Maximum outer loop iterations. `maxiter = 0` is *evaluation only* (NONMEM `MAXEVAL=0`): the engine runs one inner EBE solve at the initial parameters and reports the objective there with no outer optimisation — useful for scoring a fixed parameter set or computing standard errors at known estimates (with `covariance = true`). The reported fit is marked not-converged, and the parameters are returned unchanged — except that the start is still clamped into the optimizer's bounds, so a parameter that begins outside them is evaluated at the bound (e.g. a free `omega ~ 0.0` at `exp(-12)`, not `1e-8`); `FIX` pins a coordinate at its own start and avoids this. |
+| `threads` | positive integer, `0`, `auto` | `auto` | Number of Rayon worker threads for per-subject parallelism. A positive integer pins the count. `0`/`auto` (or omitting the key) uses the engine's default: a positive `RAYON_NUM_THREADS` if set, else available cores − 1 (at least 2 where two cores exist, at least 1), capped at 8 — see [containers](#threads-containers) and [choosing a thread count](#choosing-a-thread-count). A pinned count is an upper bound on the whole fit, `n_starts > 1` included: a multi-start fit runs its start fan-out and the per-subject loops underneath it on the same pinned pool. The CLI's `--threads` flag mirrors this key (see `ferx --help`) and **overrides it** when both are given: an explicit `ferx model.ferx --threads 1` wins over a file that says `threads = 8`, and a warning names both counts. `--threads 0` / `--threads auto` counts as explicit too — it asks for the engine default by name, so it also overrides a pinned count (#1416). |
+| `maxiter` | integer | `500` | Maximum outer loop iterations. `maxiter = 0` is *evaluation only* (NONMEM `MAXEVAL=0`): the engine runs one inner EBE solve at the initial parameters and reports the objective there with no outer optimisation — useful for scoring a fixed parameter set or computing standard errors at known estimates (with `covariance = true`). The reported fit is marked not-converged, and the parameters are returned unchanged — except that the start is still clamped into the optimizer's bounds, so a parameter that begins outside them is evaluated at the bound (e.g. a free `omega ~ 0.0` at `exp(-12)`, not `1e-8`); `FIX` pins a coordinate at its own start and avoids this. How-to: [evaluate the OFV at given parameter values](../faq.qmd#evaluate-ofv). |
 | `checkpoint` | `true`, `false` | `true` | Periodically save a resume point so a run that is interrupted (e.g. `Ctrl-C`, a crashed job) can be restarted from where it stopped instead of from scratch (#755). The CLI writes `{model}.tmp` next to the other outputs and, on the next run of the same model + data, resumes from it automatically; the file is deleted on successful completion. The write is throttled to `checkpoint_interval_secs`, so a run that finishes before the first interval leaves nothing behind. Restart is *coarse*: the population estimates (θ/Ω/Σ) at the last save are used as the new starting point and the fit continues — not a bit-exact optimizer-state resume — so the resumed run may take a few extra iterations to re-converge. What is saved depends on the stage's method. A **deterministic** stage (`foce`, `focei`, `laplace`, `gn`, `gn_hybrid`) saves the **best point it has reached**, not the last one evaluated (#1317): the objective is evaluated at every point the optimizer probes, including the trial steps a line search rejects, so saving the current evaluation could record a throwaway point far from the fit's actual position — the file's `iter` and `ofv` are then the evaluation index and the (unpenalized) objective at that best point. A **`saem`** stage instead saves its *latest* state, which is what a correct continuation of the stochastic-approximation chain resumes from; its `ofv` is that iteration's conditional NLL, not a best-so-far and not comparable to a deterministic stage's. `method_chain` and `stage_idx` in the file say which stage wrote it. A change to the model or data invalidates the checkpoint (a hash check), and the run silently starts fresh. Pass the CLI flag `--clean` to force a fresh start (it deletes any existing `{model}.tmp` first). Set `checkpoint = false` to disable saving entirely. |
 | `checkpoint_interval_secs` | integer | `300` | Minimum wall-clock seconds between checkpoint writes. Larger values reduce I/O overhead but lose more progress on an interrupt; smaller values save more often. Only used when `checkpoint = true`. |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
@@ -93,7 +93,7 @@ to 16, onto the SMT siblings of the same cores, saved a further 7–11 % but cos
 about 70 % more CPU time. This is one CPU and two models; scaling depends on the
 host and the model, so treat these as a starting point and time your own fit:
 
-- **The default** (available cores − 1, capped at 8) is a sensible start.
+- **The default** (available cores − 1, at least 2 where two cores exist, capped at 8) is a sensible start.
 - **For a long fit**, try `threads` up to the number of *physical* cores. On the
   machine above, that is where most of the wall-time gain was.
 - **Threads beyond the physical cores** (SMT / hyper-threads) bought little wall
@@ -107,6 +107,55 @@ host and the model, so treat these as a starting point and time your own fit:
 
 The thread count changes speed only. With the same binary, data, model and seed,
 estimates do not depend on it (#703).
+
+#### Containers, CPU quotas and `RAYON_NUM_THREADS` {#threads-containers}
+
+"Available cores" is Rust's `std::thread::available_parallelism()`, which on Linux
+honours the container's cgroup CPU quota rather than the host's core count. Measured in Docker on an 18-core host (`nproc` reports 18 in every case,
+because it ignores the quota):
+
+| `docker run` flag | cores ferx sees | default `threads` |
+|---|---|---|
+| none | 18 | 8 (the cap) |
+| `--cpus 8` | 8 | 7 |
+| `--cpus 4` | 4 | 3 |
+| `--cpus 2` | 2 | 2 |
+
+So a job given 8 CPUs runs 7 workers by default. To use all of them, set
+`threads = 8`, pass `--threads 8`, or set `RAYON_NUM_THREADS=8` in the job's
+environment.
+
+A positive integer in `RAYON_NUM_THREADS` is a pin, used as given: no "minus one"
+and no cap at 8 (#2800). It sits **below** every explicit count. In order, a fit
+uses:
+
+1. `threads = N` from the R package's `ferx_fit()` argument, the CLI's
+   `--threads N`, or `[fit_options] threads = N`, in that precedence (#1416);
+2. `RAYON_NUM_THREADS`, when it is a positive integer;
+3. the default in the table above.
+
+`threads = 0`, `threads = auto` and `--threads auto` name the engine default, so
+the variable applies to them. A value that is not a non-negative integer (`x`,
+`-2`, ` 8` with a space) is ignored, and the fit warns and names it. `0` and an
+empty value mean "the default", as they do for Rayon, and are not warned about.
+A count above the available CPUs, whether from the variable or from `threads`, is
+honoured but warned about, because the workers then time-share the cores. When
+a fit has more workers than subjects, the note that says so also says where the
+count came from.
+
+The variable is read **once per process**, the first time ferx sizes a worker
+pool (any fit, prediction or simulation), because the shared worker pool is sized
+then and cannot be resized. Changing it later in the same R
+session or process has no effect; pass `threads` for a different count.
+
+**Bootstrap.** `ferx-tools`' bootstrap with no `threads` set runs as many
+replicates at once as Rayon's own default pool is wide (or, when called from
+inside a Rayon pool, as that pool has workers). Rayon parses `RAYON_NUM_THREADS`
+exactly as above, so a positive value sizes the replicate lanes too, and an
+unusable one is ignored there as well — silently, since Rayon does not warn. Without the variable the two
+defaults differ: a fit uses the capped default above, while a bootstrap uses one
+lane per logical CPU, since each replicate is pinned to one thread. A bootstrap
+with `threads = N` runs `N` replicates at once whatever the variable says.
 
 #### Worker reuse for repeated fits
 
@@ -179,7 +228,7 @@ The population-parameter search: which algorithm, when it stops, and whether a g
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `report_final_gradient` | `true`, `false` | `true` | Compute a gradient at the reported estimates when the optimizer supplied none of its own, and report it as `final_gradient` (#997): the exact one, with `final_gradient_source = "analytic"`, when every subject is in the analytic gradient's scope, else a central difference with `final_gradient_source = "finite_difference"`. Only `bobyqa` — the derivative-free `auto` pick for out-of-scope ODE/PD, SDE, `gradient = fd` and `[mixture]` models — has no gradient of its own; every other outer optimizer reports the one it used, labelled `"optimizer"`. Without this a derivative-free run reports `converged = true` with nothing in the result to check the claim against, which is how a BOBYQA fit that stopped 1.54 OFV short of the L-BFGS optimum on the same model looked identical to one that had not. It is a **reporting** quantity: computed once, after the fit, never fed to the optimizer, so the estimates are bit-identical either way. Costs one gradient — the exact one, or `2 × n_free` objective evaluations for the difference — the same as a single step of the optimizers that get it for free. Set `false` when that is not worth paying (a large ODE model whose every evaluation is seconds). It does not govern the covariance step's stationarity gradient after a `saem` / `imp` / `impmap` / `vi` fit, which always runs ([#2541](https://github.com/FeRx-NLME/ferx-core/issues/2541), [details](../estimation/saem.qmd#saem-stationarity)). |
+| `report_final_gradient` | `true`, `false` | `true` | Compute a gradient at the reported estimates when the optimizer supplied none of its own, and report it as `final_gradient` (#997): the exact one, with `final_gradient_source = "analytic"`, when every subject is in the analytic gradient's scope, else a central difference with `final_gradient_source = "finite_difference"`. Only `bobyqa` — the derivative-free `auto` pick for out-of-scope ODE/PD, SDE, `gradient = fd` and `[mixture]` models — has no gradient of its own; every other outer optimizer reports the one it used, labelled `"optimizer"`. Without this a derivative-free run reports `converged = true` with nothing in the result to check the claim against, which is how a BOBYQA fit that stopped 1.54 OFV short of the L-BFGS optimum on the same model looked identical to one that had not. It is a **reporting** quantity: computed once, after the fit, never fed to the optimizer, so the estimates are bit-identical either way. Costs one gradient — the exact one, or `2 × n_free` objective evaluations for the difference — the same as a single step of the optimizers that get it for free. Set `false` when that is not worth paying (a large ODE model whose every evaluation is seconds). It does not govern the covariance step's stationarity gradient, which always runs when the step builds an `R` — after a `saem` / `imp` / `impmap` / `vi` fit ([#2541](https://github.com/FeRx-NLME/ferx-core/issues/2541), [details](../estimation/saem.qmd#saem-stationarity)), and since [#2785](https://github.com/FeRx-NLME/ferx-core/issues/2785) after every other method too, where it can demote `converged` ([details](../estimation/optimizers.qmd#what-converged-guarantees)). |
 
 #### Global pre-search {#outer-optimizer-global-search}
 
@@ -212,6 +261,12 @@ Gradient-norm convergence tolerance for the inner (per-subject EBE) optimizer. A
 Guarded multi-start count for the inner (per-subject EBE) optimizer, to escape a **multimodal individual objective**. Saturable protein binding is the classic case: a high-volume/low-concentration fit and a low-volume/high-concentration fit can both explain a subject's total-concentration data, so a single warm-started inner BFGS can settle in the wrong (shallower) basin, inflating that subject's objective and biasing its EBE. With `inner_restarts = N > 0` (default `1`), a subject re-solves the EBE **on a cold start** from `N` Ω-scaled alternate seeds (`±2·sd`, `±3·sd`, …) and keeps the lowest-objective mode; the outer loop's warm start then carries the chosen basin through the rest of the fit, so the scan runs only on the cold solves: the pre-flight, the first evaluation of each optimizer leg (except an estimating fit's first leg, which starts from the pre-flight's EBEs when the pre-flight froze no parameter and no `global_search` moved the start, [#2076](https://github.com/FeRx-NLME/ferx-core/issues/2076); including the second leg of a [restart from the cold solve](../estimation/foce.qmd#cold-solve-better)) and the final re-solve (before [#2014](https://github.com/FeRx-NLME/ferx-core/issues/2014) an estimating fit ran it on the last of these only). The probes of a `global_search` pre-search do not scan: the local optimizer's first evaluation scans at the point the pre-search picks. The cost depends on the model: wall time is unchanged on `examples/warfarin.ferx` and rises from 0.88 s to 1.68 s on `examples/schnider.ferx` (macOS arm64). Two situations are scanned. Subjects on the event-driven path (system resets `EVID=3/4` or time-varying covariates — the saturable-binding case above) re-seed **every** random effect. Every other subject is checked, per random effect, for a **weakly-identified coordinate** — one whose individual objective is flat, i.e. the data adds less curvature than the prior already carries (high per-subject shrinkage). This is exactly the condition under which a distant, lower posterior mode can hide from a single BFGS descent (issue [#891](https://github.com/FeRx-NLME/ferx-core/issues/891); the poorly-identified `V1` in a saturable-clearance fluconazole model is the motivating case), and only those flagged coordinates are re-seeded. The flatness check is a two-point finite difference of the objective per coordinate, so a well-identified subject pays only that probe and its EBE is unchanged. An alternate seed that reconverges to the same mode is not accepted, so unimodal subjects are bit-identical to `inner_restarts = 0`; only a genuinely trapped subject changes (it moves to the deeper, correct basin). Applies to the gradient-based methods that share this inner EBE solve (`focei`, `foce`, `laplace`, `gn`, `gn_hybrid`, `trust_region`); the covariance step reconverges with the same setting so standard errors stay consistent with the fit. Set `inner_restarts = 0` to disable; raise it above `1` only if a wider seed ladder is needed.
 
 The initial BFGS metric also decides which basin a cold start lands in. Under `focei`, `foce`, `gn`, `gn_hybrid` and `laplace` (any `n_agq`), warm-started inner solves seed BFGS from the subject's conditional η-Hessian, which speeds up re-convergence near the previous mode. A **cold** start (the first outer evaluation and the final cold EBE re-solve) runs twice, once with that seed and once with the historical metric, and keeps the lower objective; the two share one [Sobol screen](#inner-screen), whose descents read neither metric (#2549). Neither metric picks the right basin on every subject ([#1504](https://github.com/FeRx-NLME/ferx-core/pull/1504)). If both reach the same mode, the historical solve is kept, so unimodal subjects are unchanged. Models with a `[covariate_nn]` block never use the seed.
+
+#### Seeds under a correlated Ω {#inner-restarts-correlated}
+
+A per-coordinate seed is placed `±2·sd`, `±3·sd`, … along its random effect. Under a `block_omega`, the random effects correlated with it move too, by their conditional mean given that move: the seed follows Ω's own column for that coordinate, so it sits the intended 2 or 3 prior SDs out. With a diagonal Ω nothing else moves and the seeds are as before. On a subject with occasions the same holds for the random effects' block of the search vector; a `kappa` seed moves only its own `kappa`.
+
+Until [#2788](https://github.com/FeRx-NLME/ferx-core/issues/2788) the other random effects were held. On a strongly correlated Ω that crosses the prior's ridge. On a melphalan 2-compartment ODE model at a FOCEI plateau, with ρ(η_CL, η_V) = 0.9995, a 2-SD η_CL seed with η_V held was at a prior distance `ηᵀΩ⁻¹η` of about 6×10⁵. The descents from those seeds ran on to `V2` of 10⁻⁶⁰ to 10¹¹⁰, where every ODE solve is stiff. On the same optimizer path, the cold solve of 68 subjects at that plateau went from 78 s to 1.3 s, and the fit from 191 s to 13 s, ending at the same OFV, 2686.670708 (Linux x86_64, one thread).
 
 #### Inter-occasion variability {#inner-restarts-iov}
 
@@ -983,7 +1038,7 @@ warnings.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `n_starts` | `1` | Number of independent optimization runs. `1` disables multi-start (no behaviour change). When `> 1`, all starts run in parallel via rayon; the converged run with the lowest OFV is returned. Start 0 always uses the exact initial values from the model file. |
+| `n_starts` | `1` | Number of independent optimization runs. `1` disables multi-start (no behaviour change). When `> 1`, all starts run in parallel via rayon; the converged run with the lowest OFV is returned. Selection reads `converged`, not the [fit status](../output.qmd#fit-status): a start that is `CONVERGED WITH ISSUES` still ranks as converged. Start 0 always uses the exact initial values from the model file. |
 | `start_sigma` | `0.3` | Log-space perturbation applied to initial theta values for starts 1..n. Log-packed thetas are multiplied by `exp(N(0, start_sigma))`; thetas with negative lower bounds are shifted additively. |
 | `multi_start_seed` | `42` | RNG seed for the multi-start theta perturbations. Independent of `seed` (SAEM) so that changing the SAEM seed does not silently alter which perturbed starting points are used in FOCE multi-start runs. |
 

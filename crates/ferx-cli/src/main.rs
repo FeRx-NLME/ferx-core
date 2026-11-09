@@ -52,7 +52,7 @@ Data must be in NONMEM format (ID, TIME, DV, EVID, AMT, CMT, ...)
        an explicit --data overrides it, with a warning if they differ.
 
 --threads N    use N rayon workers (N > 0)
---threads 0    use the default worker count (available cores - 1, floored at 1, capped at 8)
+--threads 0    use the default worker count (available cores - 1, at least 2 on two or more cores, capped at 8)
 --threads auto alias for --threads 0
                An explicit --threads (including 0/auto) overrides the model
                file's [fit_options] threads, with a warning if they differ.
@@ -335,7 +335,7 @@ fn main() {
     // its own (#1460): the fit runs on a pool fit() leases with the 32 MiB worker stack
     // that wide ODE+IOV analytic gradients need, and sizing rayon's global pool here as
     // well used to leave N threads idle beside it for the whole run. Without --threads,
-    // fit() applies its own default (available cores - 1, floored at 1, capped at 8 —
+    // fit() applies its own default (available cores - 1, at least 2 where two cores exist, capped at 8 —
     // #707). `Some(0)` (`--threads 0` / `auto`) names the default rather than a width, so
     // it declares nothing here — but it is still carried in `RunOverrides` below, where it
     // overrides a model file's `[fit_options] threads`.

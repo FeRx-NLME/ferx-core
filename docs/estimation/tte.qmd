@@ -911,9 +911,10 @@ negative and `PIT` a hair above 1. Only `DEVIANCE` clamps `ΔH` at 0.
 IOV κ never reach a hazard (see [IOV, mixtures and refusals](#iov-mixtures-and-refusals)),
 so the residuals are those of the BSV η̂ alone.
 
-A fit restored from a `.fitrx` bundle has no TTE rows, so writing its sdtab is refused
-with a message naming the time-to-event endpoint, until
-[#911](https://github.com/FeRx-NLME/ferx-core/issues/911).
+A `.fitrx` bundle carries the TTE rows (`predictions_tte.csv`,
+[#911](https://github.com/FeRx-NLME/ferx-core/issues/911)), so the sdtab of a restored
+fit equals the live one. Only a bundle written before #911 has none: writing its sdtab is
+refused with a message saying the bundle predates the TTE rows.
 
 ### Validation
 
@@ -930,6 +931,93 @@ Measured on Linux aarch64 at `inner_tol = 1e-10`, with ODE tolerances 1e-9 / 1e-
 joint model; macOS arm64 agrees to every digit shown. The inner η-gradient is exact, which
 is why the identities hold to ~1e-11. Test:
 `tests/tte_residuals_nonmem_anchor.rs`.
+
+## Kaplan–Meier VPC {#km-vpc}
+
+`vpc_tte()` checks a fitted single-event TTE model against its data. It simulates `n_sim`
+replicates of the observed design in one simulator call (it never refits). Then it returns
+the observed Kaplan–Meier curve beside the pointwise band of the replicate curves, per
+stratum.
+
+```rust
+let opts = VpcTteOptions {
+    n_sim: 500,
+    stratify: VpcStratify::Covariate("SEX".into()),
+    sim: SimulateOptions { seed: Some(1), ..Default::default() },
+    ..Default::default()
+};
+let vpc = vpc_tte(&model, &population, &fit_params, &opts)?;
+for s in &vpc.strata {
+    // s.grid, s.obs_on_grid, s.lo / s.med / s.hi, s.n_used, s.observed (KmCurve)
+}
+```
+
+Each stratum carries the observed curve with its Nelson–Aalen cumulative hazard
+(`observed`: time, number at risk, events, censorings, survival, cumulative hazard), the grid,
+the observed curve read on the grid, the band, and how many replicates are still under
+follow-up at each grid time. The defaults are 200 replicates, a 5 %–95 % band with the median,
+the automatic grid, observed censoring and no strata.
+
+### The curve and the band
+
+The curve uses R `survival::survfit`'s tie convention: at a tied time, events count before
+censorings, so the subjects censored at that time are still in the risk set of its events.
+`ferx_core::stats::km::kaplan_meier` computes it. The band at each grid time is R's default
+quantile (type 7, the one `vpc::vpc_tte` uses) over the replicate curves still defined there.
+A replicate past its last follow-up time is left out unless its curve has reached zero; it
+is not counted as 0 or 1. A band point with fewer replicates than `⌈1 / min(p, 1 − p)⌉ − 1`
+(19 for 5 %/95 %) is empty: with fewer than about 1/p curves the p-tail holds less than one
+curve, so its quantile is only an interpolation between the two most extreme values. So
+`n_sim` must be at least one more than that, 20 for the default band.
+
+The automatic grid is 0, the stratum's observed times and 101 evenly spaced points up to the
+horizon `H`. `VpcGrid::Times` takes your own times. `VpcGrid::AllSteps` adds every step of
+every replicate curve, which gives exact step ribbons on a large grid.
+
+### Censoring in the replicates
+
+The simulator censors a right-censored record at its own time and draws an event record
+unbounded, and a horizon replaces every record's window. So `vpc_tte()` simulates to `H`
+(`sim.horizon`, or the latest time recorded on the endpoint) and then, under the default
+`VpcCensoring::Observed`, gives each subject a censoring time: a draw after it becomes a
+censoring there. A subject observed censored keeps its own time. A subject observed with an
+event was never seen censored, only known to be censored later than its event time, so it
+draws a censoring time from the reverse Kaplan–Meier curve of the observed censorings in
+its own stratum, conditional on exceeding its event time (`H` if no censoring is left past
+it). Every subject's replicate censoring time then has its stratum's censoring distribution,
+so the replicates are exchangeable with the data when censoring is independent of the event
+time within a stratum. Keeping `H` for event
+subjects, the common administrative-end shortcut, censors the replicates too little: with
+45 % censored the band covered the data in 85.5 % of datasets at 3H/4 for a nominal 90 %,
+against 91 % with the draw. A
+horizon below a subject's censoring time wins. `VpcCensoring::Horizon` censors every
+replicate at `H` only. The draws are seeded by `sim.seed`.
+
+`VpcStratify::Covariate(name)` groups subjects by the exact covariate value at their first
+record, up to 10 values; bin a continuous covariate first. `VpcStratify::Dose` groups by the
+first dose's amount.
+
+### What it refuses
+
+`vpc_tte()` returns `E_VPC_TTE_INPUT` rather than a wrong curve for: several TTE endpoints and
+no `cmt` (under competing risks, 1 − KM of one cause is not its cumulative incidence; with
+`cmt` set, the curve is that cause's survival with the other causes as censoring); a
+repeated-events endpoint; left truncation; interval-censored records; more than one record
+per subject on the endpoint; too few replicates or invalid band probabilities; and a
+stratification covariate a subject lacks or that has more than 10 values. Repeated-event and
+cumulative-incidence VPCs, binned strata and left truncation are planned follow-ups.
+
+### Validation against survfit and by self-consistency
+
+NONMEM has no Kaplan–Meier estimator, so there is no NONMEM run to anchor against. R's
+`survfit` is the external reference. `tests/km_survfit_reference.rs` matches survfit 3.8.12
+row for row on 120 subjects in two strata with frequent ties: the counts exactly, survival
+within 1.1e-16 and the cumulative hazard exactly. The band is checked for self-consistency in
+`tests/vpc_tte_self_consistency.rs`. 200 datasets are drawn outside the simulator from the
+model, with about 45 % censored, and each gets a 200-replicate VPC. The observed curve then
+lies inside the 5 %–95 % band in 92.5 %, 89.5 % and 91 % of datasets at H/4, H/2 and 3H/4,
+inside the 99 % binomial interval around 90 % (84.5 %–95.5 %). Dropping the per-subject
+censoring takes the coverage at 3H/4 to 82 %, out of it.
 
 ::: {.callout-note}
 ## Per-subject simulation diagnostics

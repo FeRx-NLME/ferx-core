@@ -43,5 +43,26 @@ cargo run --release -p ferx-cli -- examples/mm_multistart.ferx --data mm_multist
 | Michaelis-Menten elimination | High | 4–8 |
 | Full-block omega (≥ 3 etas) | Moderate | 4 |
 | Many correlated covariates | Moderate | 4–8 |
+| Small dataset (e.g. an arm-level MBMA) | Model-dependent; cheap to check | 8 |
+
+### Small datasets {#small-datasets}
+
+On a dataset of a few hundred rows or fewer, such as an arm-level model-based
+meta-analysis, a single fit takes well under a second, so eight starts cost
+almost nothing. That makes multi-start a cheap check that the reported optimum
+is not a local one, even when the model is not one of the high-risk types above.
+
+Whether it finds anything depends on the model. On the naproxen MBMA
+(`examples/mbma_naproxen.ferx`, 18 trials, 36 arms, 122 observations) it found nothing
+better: from the published estimates and from a naive start (all covariate
+effects at 0, the typical values off by 2–7×), `n_starts = 1` and `n_starts = 8`
+reached the same OFV, 261.8149, and eight starts took 0.04–0.06 s against
+0.03 s for one. A user fitting arm-level ulcerative-colitis models reported
+better optima from multi-start on several of them
+([ferx-r#721](https://github.com/FeRx-NLME/ferx-r/issues/721)). Compare the OFV against your single-start fit: the
+`Multi-start: best result from start k/n` warning on `FitResult.warnings` names
+the start that won, and in the naive-start run above it named start 3 at the same
+OFV as start 0, so a winning start other than 0 does not by itself mean a better
+optimum.
 
 `start_sigma = 0.3` (the default, ≈ 30% CV) is appropriate for most models. For ridge-shaped surfaces like Vmax/Km, `start_sigma = 0.4–0.5` explores a wider neighbourhood.
