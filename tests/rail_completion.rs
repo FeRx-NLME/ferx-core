@@ -95,6 +95,48 @@ fn fit_mixture(swap: bool) -> (FitResult, Vec<String>, Vec<f64>) {
     (r, names, packed)
 }
 
+/// Row 2 of the #2839 review: an **evaluation-only** fit (`outer_maxiter = 0`) whose
+/// override starts inside the probe band is scored where the user put it — rail completion
+/// does not move it. Measured by the review on this fixture with the skip deleted: OFV
+/// −30.310880833 → −30.470485243, the override moved from −4.8 to −5.999, and a "resumed"
+/// warning. Evaluation only, so not gated (it fits nothing).
+#[test]
+fn an_evaluation_only_fit_is_not_moved_by_rail_completion() {
+    // Override variance e^(2·(−4.8)): packed −4.8, inside the band above the −6 guard.
+    let src = mixture_source(false).replace(
+        "omega(2) ETA_CL ~ 0.05",
+        &format!("omega(2) ETA_CL ~ {:e}", (2.0f64 * -4.8).exp()),
+    );
+    let model = ferx_core::parse_model_string(&src).expect("model parses");
+    let pop = read_nonmem_csv(Path::new(MIX_DATA), None, None).expect("data loads");
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        optimizer: Optimizer::Bobyqa,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let r = ferx_core::fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+    let names = coordinate_names(&model.default_params);
+    let start = pack_params(&model.default_params);
+    let ovr = packed_of(&names, &start, "ETA_CL_MIX2");
+    assert!(
+        (ovr - (-4.8)).abs() < 1e-9,
+        "fixture premise: override starts in the band, got {ovr}"
+    );
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(
+        bits(r.packed_estimate.as_deref().expect("packed estimate")),
+        bits(&start),
+        "an evaluation-only fit reports its start"
+    );
+    assert!(
+        r.warnings.iter().all(|w| !w.contains("guard")),
+        "{:?}",
+        r.warnings
+    );
+}
+
 fn packed_of(names: &[String], packed: &[f64], name: &str) -> f64 {
     let i = names.iter().position(|n| n == name).expect(name);
     packed[i]

@@ -341,17 +341,24 @@ Since #2832, after the outer optimizer of a FOCE-family fit stops (and after the
 [log-packing floor](#log-packing-floor) check above), ferx looks at every free variance within 2
 log units of its guard but not on it: Ω and κ diagonals, σ, and `[mixture]` overrides. A block's
 coordinate is its Cholesky diagonal `L_ii`, as for the [collapse hold](parameterization.qmd#held-parameters), so
-`Ω_ii` itself need not be small. ferx evaluates the objective once per variance, with that variance
-alone on its guard. Each one that is lower by more than `1e-6` is moved to the guard, and the fit is
-resumed once with it `1e-3` above the guard. Started exactly on the guard, BOBYQA walked one
-variance back off it. If the resumed run ends lower, it is reported, with an `optimizer_health`
-warning that names each variance (a `[mixture]` override by its class, `ETA_CL_MIX2`), its value
-and both objectives. The variance is then on its guard, so the post-fit collapse warning names it
-as well. If the resumed run ends no lower, the first stop is kept, `converged = false`, with a
-`convergence` warning. A variance whose objective rises on the guard is a genuine small estimate
-and is left untouched, bit for bit. The check costs one evaluation per variance in that band and
-nothing on any other fit. It covers FOCE, FOCEI, Laplace and AGQ, profiled or not, but not
-Gauss–Newton, SAEM or VI, which run their own loops.
+`Ω_ii` itself need not be small; for a block's later rows the warning reports `L_ii` as the
+"conditional SD in its block". ferx re-scores the stop, evaluation-only, and evaluates the objective
+once per variance with that variance alone on its guard, all at one inner budget (`inner_maxiter`
+or the default 200, whichever is larger), so a difference in budget does not read as a slope. Each
+variance that is lower by more than `1e-6` is moved to the guard, and the fit is resumed once with
+it `1e-3` above the guard. Started exactly on the guard, BOBYQA walked one variance back off it.
+
+If the resumed run ends no lower, the first stop is kept, `converged = false`, with a `convergence`
+warning. If it ends lower, it is reported, with an `optimizer_health` warning that names each
+variance (a `[mixture]` override by its class, `ETA_CL_MIX2`), its value and both objectives. The
+resumed run is then checked the same way. When it ended on the guard, the post-fit collapse warning
+names the variance as well. When it stopped short of a guard again, with the objective still falling
+there, it is still reported (it is lower), but `converged = false`, with a `convergence` warning
+that names what it left short. A variance whose objective rises on the guard is a genuine small
+estimate, and the fit is left untouched, bit for bit; only `n_iterations` counts the evaluations.
+The check costs the re-score plus one evaluation per variance in that band, and nothing on any
+other fit. It covers FOCE, FOCEI, Laplace and AGQ, profiled or not, but not Gauss–Newton, SAEM or
+VI, which run their own loops.
 
 ### A BOBYQA tolerance stop is polished {#bobyqa-tolerance-polish}
 

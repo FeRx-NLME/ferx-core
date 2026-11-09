@@ -1502,6 +1502,37 @@ fn near_rail_variances_are_free_variances_within_the_span_and_off_the_guard() {
     );
 }
 
+/// Row 5: a block's later row near the guard is its Cholesky factor `L_22`, not `Ω_22`.
+/// `rail_template`'s κ block has `L_21` at −4.8, so with `L_22` at guard + 1.0 the variance
+/// `Ω_22 = L_21² + L_22²` is 23.04 while the coordinate near the guard is `L_22 = e^−5`. The
+/// first row (`L_11² = Ω_11`) stays a plain variance. Both sides of the gate in one test.
+#[test]
+fn a_block_rows_factor_is_reported_as_its_conditional_sd() {
+    let base = rail_template();
+    let names = coordinate_names(&base);
+    let at = |n: &str| names.iter().position(|x| x == n).expect(n);
+    let mut x = pack_params(&base);
+    x[at("KAPPA_2")] = OMEGA_CHOL_PACKED_LOWER + 1.0;
+    let p = unpack_params(&x, &base);
+    let c = near_rail_variances(&p);
+    let k2 = c
+        .iter()
+        .find(|c| c.name == "KAPPA_2")
+        .expect("KAPPA_2 in the band");
+    assert_eq!(k2.family, RailFamily::BlockFactor);
+    assert!(
+        (k2.value - (OMEGA_CHOL_PACKED_LOWER + 1.0).exp()).abs() < 1e-15,
+        "the factor, not Ω_22: {}",
+        k2.value
+    );
+    let k1 = c.iter().find(|c| c.name == "KAPPA_1").expect("KAPPA_1");
+    assert_eq!(
+        k1.family,
+        RailFamily::RandomEffect,
+        "the first row is its variance"
+    );
+}
+
 /// The probe and restart start: the named coordinates on their guard (exactly, as the
 /// optimizer reads them), everything else where it stopped, and the user's θ FIX mask.
 #[test]
@@ -1555,37 +1586,96 @@ fn at_ofv(ofv: f64) -> Stub {
 /// `resolve_rail` call.
 type RailCalls = (Vec<usize>, Option<Vec<usize>>);
 
-/// Resolve over `candidates` with per-index probe OFVs and a restart OFV.
+/// The fake rail world of one resolve: the stop's candidates and per-index probe OFVs, the
+/// resumed run's OFV, and the candidates and probe OFVs the resumed run itself shows
+/// (`again`, empty for a resumed run on the guard). A fit is told apart by its OFV: the
+/// stop's, or the resumed run's. `rescore` is the stop re-scored at the probes' budget
+/// (`None`: it scores as the run did).
+struct RailWorld<'a> {
+    candidates: &'a [RailCandidate],
+    probes: &'a [(usize, f64)],
+    restart_ofv: f64,
+    again: &'a [RailCandidate],
+    again_probes: &'a [(usize, f64)],
+    rescore: Option<f64>,
+}
+
+impl RailWorld<'_> {
+    fn new<'a>(
+        candidates: &'a [RailCandidate],
+        probes: &'a [(usize, f64)],
+        restart_ofv: f64,
+    ) -> RailWorld<'a> {
+        RailWorld {
+            candidates,
+            probes,
+            restart_ofv,
+            again: &[],
+            again_probes: &[],
+            rescore: None,
+        }
+    }
+
+    /// Resolve `first` (whose OFV marks it as the stop) in this world; returns the
+    /// result, the indices probed on the stop, and the restart's indices.
+    fn resolve(&self, first: Stub, escape: Option<String>) -> (Stub, RailCalls) {
+        use std::cell::RefCell;
+        let stop_ofv = first.ofv;
+        let is_stop = |s: &Stub| s.ofv.to_bits() == stop_ofv.to_bits();
+        let probed = RefCell::new(Vec::new());
+        let restarted = RefCell::new(None);
+        let r = resolve_rail_completion(
+            first,
+            escape,
+            |s: &Stub| {
+                if is_stop(s) {
+                    self.candidates.to_vec()
+                } else {
+                    self.again.to_vec()
+                }
+            },
+            |s: &Stub| Stub {
+                ofv: if is_stop(s) {
+                    self.rescore.unwrap_or(s.ofv)
+                } else {
+                    s.ofv
+                },
+                ..s.clone()
+            },
+            |s: &Stub, i| {
+                let table = if is_stop(s) {
+                    probed.borrow_mut().push(i);
+                    self.probes
+                } else {
+                    self.again_probes
+                };
+                at_ofv(table.iter().find(|(j, _)| *j == i).expect("probe").1)
+            },
+            |_, idx| {
+                *restarted.borrow_mut() = Some(idx.to_vec());
+                Stub {
+                    evals: 40,
+                    cov_secs: 1.5,
+                    ..at_ofv(self.restart_ofv)
+                }
+            },
+            |s| s.ofv + s.penalty,
+            FitOptions::default().inner_maxiter,
+            false,
+        );
+        (r, (probed.into_inner(), restarted.into_inner()))
+    }
+}
+
+/// Resolve over `candidates` with per-index probe OFVs and a restart OFV; the resumed run
+/// shows no candidate.
 fn resolve_rail(
     first: Stub,
     probes: &[(usize, f64)],
     restart_ofv: f64,
     candidates: &[RailCandidate],
 ) -> (Stub, RailCalls) {
-    use std::cell::RefCell;
-    let probed = RefCell::new(Vec::new());
-    let restarted = RefCell::new(None);
-    let r = resolve_rail_completion(
-        first,
-        None,
-        candidates,
-        |i| {
-            probed.borrow_mut().push(i);
-            let ofv = probes.iter().find(|(j, _)| *j == i).expect("probe").1;
-            at_ofv(ofv)
-        },
-        |idx| {
-            *restarted.borrow_mut() = Some(idx.to_vec());
-            Stub {
-                evals: 40,
-                cov_secs: 1.5,
-                ..at_ofv(restart_ofv)
-            }
-        },
-        |s| s.ofv + s.penalty,
-        false,
-    );
-    (r, (probed.into_inner(), restarted.into_inner()))
+    RailWorld::new(candidates, probes, restart_ofv).resolve(first, None)
 }
 
 /// T2 (i)–(iii), (v): the per-candidate gate and the adoption, both sides. Only the downhill
@@ -1610,7 +1700,11 @@ fn rail_completion_restarts_with_only_the_downhill_candidates_on_the_guard() {
     assert_eq!(restarted, Some(vec![7]));
     assert_eq!(r.ofv, -37.396982);
     assert!(r.converged);
-    assert_eq!(r.evals, 40 + 30 + 2, "restart + stop + one per probe");
+    assert_eq!(
+        r.evals,
+        40 + 30 + 1 + 2,
+        "restart + stop + the re-score + one per probe"
+    );
     assert_eq!(
         r.cov_secs,
         1.5 + 2.0,
@@ -1624,7 +1718,8 @@ fn rail_completion_restarts_with_only_the_downhill_candidates_on_the_guard() {
     );
     assert!(r.warnings[0].contains("ETA_CL_MIX2") && !r.warnings[0].contains("ETA_SMALL"));
 
-    // (i): no downhill probe — one within the gain, one uphill — returns the stop untouched.
+    // (i): no downhill probe — one within the gain, one uphill — returns the stop untouched
+    // but for its evaluation count, which books the re-score and both probes (row 8).
     let stop = short_stop();
     let (r, (probed, restarted)) = resolve_rail(
         stop.clone(),
@@ -1636,7 +1731,7 @@ fn rail_completion_restarts_with_only_the_downhill_candidates_on_the_guard() {
     assert_eq!(restarted, None);
     assert_eq!(r.ofv.to_bits(), stop.ofv.to_bits());
     assert_eq!(pack_params(&r.params), pack_params(&stop.params));
-    assert_eq!((r.converged, r.evals), (true, stop.evals));
+    assert_eq!((r.converged, r.evals), (true, stop.evals + 1 + 2));
     assert!(r.warnings.is_empty(), "{:?}", r.warnings);
 
     // A NaN probe is not downhill.
@@ -1651,7 +1746,7 @@ fn rail_completion_restarts_with_only_the_downhill_candidates_on_the_guard() {
     assert_eq!(restarted, Some(vec![7]));
     assert_eq!(r.ofv, -37.238760);
     assert!(!r.converged);
-    assert_eq!((r.evals, r.cov_secs), (30 + 40 + 2, 1.5));
+    assert_eq!((r.evals, r.cov_secs), (30 + 40 + 1 + 2, 1.5));
     assert_eq!(r.warnings.len(), 1);
     assert!(
         r.warnings[0].contains("not reported as converged"),
@@ -1684,16 +1779,105 @@ fn the_rail_gate_ranks_on_the_penalized_objective() {
     let r = resolve_rail_completion(
         short_stop(),
         None,
-        cands,
-        |_| Stub {
+        |_: &Stub| cands.to_vec(),
+        |s: &Stub| s.clone(),
+        |_: &Stub, _| Stub {
             penalty: 1.0,
             ..at_ofv(-37.381570)
         },
-        |_| panic!("an uphill ranked probe must not restart"),
+        |_, _| panic!("an uphill ranked probe must not restart"),
         |s| s.ofv + s.penalty,
+        FitOptions::default().inner_maxiter,
         false,
     );
     assert!(r.converged && r.warnings.is_empty());
+}
+
+/// Row 4: the gate judges the probes against the stop **re-scored** at their budget, not
+/// against the run's in-run OFV. Both sides of it in one test: a probe lower than the
+/// in-run OFV but not than the re-score does not restart; one lower than the re-score
+/// but not than the in-run OFV does. The warning then names the re-score and its budget,
+/// since it prints differently from the run's OFV.
+#[test]
+fn the_rail_gate_judges_the_probes_against_the_rescored_stop() {
+    let cands = &rail_candidates()[..1];
+    // In-run −37.238760; re-scored −37.30. A probe at −37.25 is below the first only.
+    let mut world = RailWorld::new(cands, &[(7, -37.25)], -37.40);
+    world.rescore = Some(-37.30);
+    let (r, (_, restarted)) = world.resolve(short_stop(), None);
+    assert_eq!(restarted, None, "uphill of the re-score");
+    assert!(r.converged && r.warnings.is_empty(), "{:?}", r.warnings);
+
+    // In-run −37.238760; re-scored −37.20. A probe at −37.22 is below the re-score only.
+    let mut world = RailWorld::new(cands, &[(7, -37.22)], -37.40);
+    world.rescore = Some(-37.20);
+    let (r, (_, restarted)) = world.resolve(short_stop(), None);
+    assert_eq!(restarted, Some(vec![7]), "downhill of the re-score");
+    let w = &r.warnings[0];
+    assert!(
+        w.contains(
+            "stopped at OFV -37.238760 (re-scored -37.200000 at `inner_maxiter = 200`, as \
+             the probes were) with"
+        ),
+        "{w}"
+    );
+
+    // A re-score that prints as the run's OFV adds nothing.
+    let (r, _) = resolve_rail(short_stop(), &[(7, -37.381570)], -37.40, cands);
+    assert!(
+        r.warnings[0].contains("stopped at OFV -37.238760 with"),
+        "{}",
+        r.warnings[0]
+    );
+
+    // A re-score that is not finite probes nothing (and books only itself).
+    let mut world = RailWorld::new(cands, &[(7, -37.381570)], -37.40);
+    world.rescore = Some(f64::NAN);
+    let (r, (probed, restarted)) = world.resolve(short_stop(), None);
+    assert_eq!((probed.len(), restarted), (0, None));
+    assert_eq!(r.evals, short_stop().evals + 1);
+}
+
+/// Row 3: the adopted resumed run is probed the same way. One left short of a guard again,
+/// downhill there, is reported (it is lower) but not converged, with a text that names what
+/// the **resumed** run left short. Both sides: a resumed run whose only candidate is uphill
+/// stays converged. The re-check's evaluations are booked.
+#[test]
+fn an_adopted_rail_restart_left_short_again_is_not_converged() {
+    let cands = &rail_candidates()[..1];
+    let again = vec![RailCandidate {
+        index: 5,
+        name: "EPS_PROP".into(),
+        family: RailFamily::ResidualError,
+        value: 4.0e-4,
+    }];
+    let mut world = RailWorld::new(cands, &[(7, -37.381570)], -37.396982);
+    world.again = &again;
+    world.again_probes = &[(5, -37.40)];
+    let (r, _) = world.resolve(short_stop(), None);
+    assert_eq!(r.ofv, -37.396982, "still reported: it is lower");
+    assert!(!r.converged);
+    assert_eq!(r.evals, 40 + 30 + (1 + 1) + (1 + 1), "both probes booked");
+    assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
+    let w = &r.warnings[0];
+    for want in [
+        "the random effect ETA_CL_MIX2 (",
+        "reached OFV = -37.396982, but stopped with the residual error EPS_PROP (SD 4.000e-4; \
+         OFV -37.400000 with it on the guard) just above the guard again.",
+        "The reported estimates are from the resumed run, and the fit is not reported as \
+         converged: tighten `outer_xtol`, or try another `optimizer`.",
+    ] {
+        assert!(w.contains(want), "missing {want:?} in {w}");
+    }
+    let entry = classify_warning(w);
+    assert_eq!(entry.category, WarningCode::Convergence);
+
+    // The resumed run's candidate is uphill: converged, the plain restart text.
+    world.again_probes = &[(5, -37.0)];
+    let (r, _) = world.resolve(short_stop(), None);
+    assert!(r.converged);
+    assert_eq!(r.evals, 40 + 30 + (1 + 1) + (1 + 1));
+    assert!(!r.warnings[0].contains("again"), "{}", r.warnings[0]);
 }
 
 /// An adopted resumed run is a new result: it carries the θ floor escape's warning ahead of
@@ -1702,20 +1886,18 @@ fn the_rail_gate_ranks_on_the_penalized_objective() {
 #[test]
 fn an_adopted_rail_restart_carries_the_floor_escapes_warning_and_verdict() {
     let cands = &rail_candidates()[..1];
+    let world = RailWorld::new(cands, &[(7, -37.381570)], -37.396982);
     let resolve = |converged: bool, escape: Option<String>| {
-        resolve_rail_completion(
-            Stub {
-                converged,
-                warnings: vec!["the stop's own".into()],
-                ..short_stop()
-            },
-            escape,
-            cands,
-            |_| at_ofv(-37.381570),
-            |_| at_ofv(-37.396982),
-            |s| s.ofv + s.penalty,
-            false,
-        )
+        world
+            .resolve(
+                Stub {
+                    converged,
+                    warnings: vec!["the stop's own".into()],
+                    ..short_stop()
+                },
+                escape,
+            )
+            .0
     };
     let r = resolve(false, Some("the escape's".into()));
     assert!(!r.converged, "the escape's not-converged verdict stands");
@@ -1749,8 +1931,18 @@ fn the_rail_messages_name_each_coordinate_by_family_and_say_what_happened() {
         family: RailFamily::ResidualError,
         value: 6.1e-4,
     };
+    // A re-score that prints as the run's OFV, so no budget clause.
+    let same = |ofv: f64| RailScore {
+        at_ofv: ofv,
+        inner_maxiter: 200,
+    };
     // One random effect, adopted.
-    let one = rail_restart_warning(&[(ov.clone(), -37.381570)], -37.238760, -37.396982);
+    let one = rail_restart_warning(
+        &[(ov.clone(), -37.381570)],
+        -37.238760,
+        same(-37.238760),
+        -37.396982,
+    );
     for want in [
         "Outer optimization stopped at OFV -37.238760",
         "the random effect ETA_CL_MIX2 (variance 6.700e-5; OFV -37.381570 with it on the guard)",
@@ -1769,11 +1961,30 @@ fn the_rail_messages_name_each_coordinate_by_family_and_say_what_happened() {
         "not reported as converged",
         "interior",
         "outer_xtol",
+        "re-scored",
+        "conditional SD",
     ] {
         assert!(!one.contains(not), "{not:?} in {one}");
     }
+    // A block's later row: its factor, named as the conditional SD in its block (row 5),
+    // never as a variance.
+    let blk = RailCandidate {
+        index: 4,
+        name: "ETA_V".into(),
+        family: RailFamily::BlockFactor,
+        value: 1.4e-2,
+    };
+    let b = rail_restart_warning(&[(blk, -5.0)], -4.0, same(-4.0), -5.5);
+    assert!(
+        b.contains(
+            "the random effect ETA_V (conditional SD in its block 1.400e-2; OFV -5.000000 \
+             with it on the guard)"
+        ),
+        "{b}"
+    );
+    assert!(!b.contains("variance"), "{b}");
     // σ: its own family and scale, never "random effect".
-    let s = rail_restart_warning(&[(sig.clone(), -10.0)], -9.0, -10.5);
+    let s = rail_restart_warning(&[(sig.clone(), -10.0)], -9.0, same(-9.0), -10.5);
     assert!(
         s.contains(
             "the residual error EPS_PROP (SD 6.100e-4; OFV -10.000000 with it on the guard)"
@@ -1785,6 +1996,7 @@ fn the_rail_messages_name_each_coordinate_by_family_and_say_what_happened() {
     let two = rail_restart_warning(
         &[(ov.clone(), -37.381570), (sig.clone(), -37.30)],
         -37.238760,
+        same(-37.238760),
         -37.40,
     );
     assert!(
@@ -1794,18 +2006,21 @@ fn the_rail_messages_name_each_coordinate_by_family_and_say_what_happened() {
     assert!(two.contains("with them there"), "{two}");
     assert!(!two.contains("with it there"), "{two}");
     // Not converged: the verdict and the remedy, and never "reached OFV".
-    let nc = rail_not_converged_warning(&[(ov, -37.381570)], -37.238760);
+    let nc = rail_not_converged_warning(&[(ov, -37.381570)], -37.238760, same(-37.238760));
     for want in [
         "Outer optimization stopped at OFV -37.238760",
         "A run resumed from just above the guard with it there found no lower point",
         "so the fit is not reported as converged",
         "tighten `outer_xtol`",
-        "on a `[mixture]` model set `optimizer = nlopt_lbfgs`",
+        "or try another `optimizer`.",
     ] {
         assert!(nc.contains(want), "missing {want:?} in {nc}");
     }
-    assert!(!nc.contains("reached OFV"), "{nc}");
-    let nc2 = rail_not_converged_warning(&[(sig.clone(), -1.0), (sig, -1.0)], 0.0);
+    // Optimizer-neutral (row 6): rail completion runs after every optimizer.
+    for not in ["reached OFV", "nlopt_lbfgs", "bobyqa", "[mixture]"] {
+        assert!(!nc.contains(not), "{not:?} in {nc}");
+    }
+    let nc2 = rail_not_converged_warning(&[(sig.clone(), -1.0), (sig, -1.0)], 0.0, same(0.0));
     assert!(
         nc2.contains("with them there") && !nc2.contains("with it there"),
         "{nc2}"
@@ -1848,16 +2063,22 @@ fn escape_floor_probes_each_near_rail_variance_alone_then_resumes_the_downhill_o
     use std::cell::RefCell;
     let _g = rail_lock();
     let start = template();
-    let options = FitOptions::default();
+    // A small inner budget, so the probes' "at least the default" budget is visible (row 4).
+    let options = FitOptions {
+        inner_maxiter: 5,
+        ..FitOptions::default()
+    };
     let g = OMEGA_CHOL_PACKED_LOWER;
     let stop = two_near_rail();
     let calls: RefCell<Vec<(ModelParameters, usize)>> = RefCell::new(Vec::new());
+    let budgets: RefCell<Vec<usize>> = RefCell::new(Vec::new());
     let r = escape_floor(
         &start,
         &options,
         4,
         |p, o| {
             calls.borrow_mut().push((p.clone(), o.outer_maxiter));
+            budgets.borrow_mut().push(o.inner_maxiter);
             if calls.borrow().len() == 1 {
                 return Stub {
                     params: stop.clone(),
@@ -1867,14 +2088,26 @@ fn escape_floor_probes_each_near_rail_variance_alone_then_resumes_the_downhill_o
             }
             let (em, b) = (packed_of(p, "ETA_EM"), packed_of(p, "ETA_B"));
             let near = |x: f64| (x - (g + RAIL_RESTART_ABOVE)).abs() < 1e-12;
-            let ofv = match (em == g, b == g, o.outer_maxiter) {
-                (true, false, 0) => 49.0,
-                (false, true, 0) => 51.0,
-                (false, false, m) if m > 0 && near(em) => 48.5,
+            let off_em = (em - (g + 1.2)).abs() < 1e-12;
+            let (ofv, params) = match (em == g, b == g, o.outer_maxiter) {
+                // The stop, re-scored: as it scored in the run.
+                (false, false, 0) if off_em => (50.0, p.clone()),
+                (true, false, 0) => (49.0, p.clone()),
+                (false, true, 0) => (51.0, p.clone()),
+                // The resumed run ends with ETA_EM on the guard, as BOBYQA does.
+                (false, false, m) if m > 0 && near(em) => {
+                    let i = coordinate_names(p)
+                        .iter()
+                        .position(|n| n == "ETA_EM")
+                        .expect("ETA_EM");
+                    (48.5, at_rail_params(p, &start, &[i], 0.0))
+                }
+                // The resumed run's re-check: ETA_B is still in the band, and uphill.
+                (true, true, 0) => (49.0, p.clone()),
                 other => panic!("unexpected call {other:?}"),
             };
             Stub {
-                params: p.clone(),
+                params,
                 ofv,
                 ..landed()
             }
@@ -1882,27 +2115,46 @@ fn escape_floor_probes_each_near_rail_variance_alone_then_resumes_the_downhill_o
         |_| 0.0,
     );
     let calls = calls.into_inner();
-    assert_eq!(calls.len(), 4, "fit, two probes, one restart");
     assert_eq!(
-        (calls[1].1, calls[2].1),
-        (0, 0),
-        "the probes are evaluations"
+        calls.len(),
+        7,
+        "fit; re-score, two probes, restart; the resumed run's re-score and its one probe"
     );
-    assert_eq!(calls[3].1, options.outer_maxiter);
-    assert_eq!(packed_of(&calls[1].0, "ETA_EM"), g);
-    assert!((packed_of(&calls[1].0, "ETA_B") - (g + 0.8)).abs() < 1e-12);
-    assert!((packed_of(&calls[2].0, "ETA_EM") - (g + 1.2)).abs() < 1e-12);
-    assert_eq!(packed_of(&calls[2].0, "ETA_B"), g);
+    let maxiters: Vec<usize> = calls.iter().map(|c| c.1).collect();
+    let m = options.outer_maxiter;
+    assert_eq!(
+        maxiters,
+        vec![m, 0, 0, 0, m, 0, 0],
+        "every probe is an evaluation"
+    );
+    let d = FitOptions::default().inner_maxiter;
+    assert_eq!(
+        budgets.into_inner(),
+        vec![5, d, d, d, 5, d, d],
+        "the runs keep the fit's budget; the re-scores and probes share at least the default"
+    );
+    assert_eq!(
+        pack_params(&calls[1].0),
+        pack_params(&stop),
+        "the stop, re-scored"
+    );
+    assert_eq!(packed_of(&calls[2].0, "ETA_EM"), g);
+    assert!((packed_of(&calls[2].0, "ETA_B") - (g + 0.8)).abs() < 1e-12);
+    assert!((packed_of(&calls[3].0, "ETA_EM") - (g + 1.2)).abs() < 1e-12);
+    assert_eq!(packed_of(&calls[3].0, "ETA_B"), g);
     // The probes sit on the guard; the resumed run starts just above it.
     assert!(
-        (packed_of(&calls[3].0, "ETA_EM") - (g + RAIL_RESTART_ABOVE)).abs() < 1e-12,
+        (packed_of(&calls[4].0, "ETA_EM") - (g + RAIL_RESTART_ABOVE)).abs() < 1e-12,
         "{}",
-        packed_of(&calls[3].0, "ETA_EM")
+        packed_of(&calls[4].0, "ETA_EM")
     );
     assert!(
-        (packed_of(&calls[3].0, "ETA_B") - (g + 0.8)).abs() < 1e-12,
+        (packed_of(&calls[4].0, "ETA_B") - (g + 0.8)).abs() < 1e-12,
         "the uphill candidate stays where it stopped"
     );
+    // The re-check probes the resumed run, not the stop: ETA_EM on the guard there.
+    assert_eq!(packed_of(&calls[6].0, "ETA_EM"), g);
+    assert_eq!(packed_of(&calls[6].0, "ETA_B"), g);
     assert_eq!(r.ofv, 48.5);
     assert!(r.converged);
     assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
@@ -1943,6 +2195,62 @@ fn escape_floor_probes_each_near_rail_variance_alone_then_resumes_the_downhill_o
     assert_eq!((*n.borrow(), off.ofv), (1, 50.0));
 }
 
+/// Row 2: rail completion's own skips, each on a stop that **has** near-rail variances (so
+/// the empty-candidates fast path cannot answer for it): an evaluation-only fit, a
+/// cancelled one, and a non-finite objective each run once and come back as the optimizer
+/// returned them. Deleting any one arm reddens its row.
+#[test]
+fn rail_completion_skips_evaluation_only_cancelled_and_non_finite_fits() {
+    use std::cell::RefCell;
+    let _g = rail_lock();
+    let start = template();
+    let stop = two_near_rail();
+    assert_eq!(near_rail_variances(&stop).len(), 2, "fixture premise");
+    let cancelled = {
+        let flag = crate::cancel::CancelFlag::new();
+        flag.cancel();
+        FitOptions {
+            cancel: Some(flag),
+            ..FitOptions::default()
+        }
+    };
+    for (what, options, ofv) in [
+        (
+            "evaluation-only",
+            FitOptions {
+                outer_maxiter: 0,
+                ..FitOptions::default()
+            },
+            50.0,
+        ),
+        ("cancelled", cancelled, 50.0),
+        ("non-finite", FitOptions::default(), f64::NAN),
+    ] {
+        let n = RefCell::new(0);
+        let r = escape_floor(
+            &start,
+            &options,
+            4,
+            |_, _| {
+                *n.borrow_mut() += 1;
+                Stub {
+                    params: stop.clone(),
+                    ofv,
+                    ..landed()
+                }
+            },
+            |_| 0.0,
+        );
+        assert_eq!(*n.borrow(), 1, "{what}: one run, no rail probe");
+        assert_eq!(pack_params(&r.params), pack_params(&stop), "{what}");
+        assert!(
+            r.warnings.iter().all(|w| !w.contains("guard")),
+            "{what}: {:?}",
+            r.warnings
+        );
+    }
+}
+
 /// T2 (vi): rail completion reads the run the θ escape reports. The θ restart lands with
 /// `ETA_EM` near the rail (the first stop had it **on** the rail, where it is no candidate),
 /// so the rail probe's start carries the θ restart's EMAX, not the first stop's.
@@ -1981,11 +2289,17 @@ fn rail_completion_reads_the_floor_escapes_restart_not_the_first_stop() {
                     params: restarted.clone(),
                     ..landed()
                 },
+                // The θ restart re-scored, as it scored in its run.
                 4 => Stub {
+                    params: p.clone(),
+                    ..landed()
+                },
+                5 => Stub {
                     params: p.clone(),
                     ofv: 101.0,
                     ..landed()
                 },
+                // The rail restart, then its re-check (re-score and probe), all level.
                 _ => Stub {
                     params: p.clone(),
                     ofv: 100.0,
@@ -1998,14 +2312,19 @@ fn rail_completion_reads_the_floor_escapes_restart_not_the_first_stop() {
     let calls = calls.into_inner();
     assert_eq!(
         calls.len(),
-        5,
-        "fit, θ probe, θ restart, rail probe, rail restart"
+        8,
+        "fit, θ probe, θ restart; rail re-score, probe, restart; the resumed run's re-check"
     );
     assert_eq!(
-        calls[3].theta[1], 7.77,
+        pack_params(&calls[3]),
+        pack_params(&restarted),
+        "the rail re-score reads the θ restart"
+    );
+    assert_eq!(
+        calls[4].theta[1], 7.77,
         "the rail probe starts from the θ restart"
     );
-    assert_eq!(packed_of(&calls[3], "ETA_EM"), g);
+    assert_eq!(packed_of(&calls[4], "ETA_EM"), g);
     assert_eq!(r.ofv, 100.0);
     assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
     assert!(r.warnings[0].contains("log-packing floor"));
@@ -2085,13 +2404,13 @@ fn a_variance_already_on_the_guard_is_not_probed() {
   theta TVKA(1.0, 0.01, 50.0)
   omega ETA_CL ~ 0.08
   omega ETA_V  ~ 0.06
-  omega ETA_KA ~ 0.05
+  omega ETA_KA_T6 ~ 0.05
   sigma PROP_ERR ~ 0.1 (sd)
 
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
   V  = TVV  * exp(ETA_V)
-  KA = TVKA * exp(ETA_KA)
+  KA = TVKA * exp(ETA_KA_T6)
 
 [structural_model]
   pk one_cpt_oral(cl=CL, v=V, ka=KA)
@@ -2107,17 +2426,20 @@ fn a_variance_already_on_the_guard_is_not_probed() {
             .unwrap()
             .default_params,
     );
-    let ka = names.iter().position(|n| n == "ETA_KA").expect("ETA_KA");
+    let ka = names
+        .iter()
+        .position(|n| n == "ETA_KA_T6")
+        .expect("ETA_KA_T6");
     let x = on.packed_estimate.as_deref().expect("packed")[ka];
     eprintln!(
-        "T6 ofv {:.9} ETA_KA packed {x:.9} probed {probed:?}",
+        "T6 ofv {:.9} ETA_KA_T6 packed {x:.9} probed {probed:?}",
         on.ofv
     );
     assert!(
         (x - OMEGA_CHOL_PACKED_LOWER).abs() < 1e-12,
         "fixture premise: ω_KA on the guard, got {x}"
     );
-    assert!(!probed.contains(&"ETA_KA".to_string()), "{probed:?}");
+    assert!(!probed.contains(&"ETA_KA_T6".to_string()), "{probed:?}");
     assert_rail_untouched(&on, &off);
 }
 
@@ -2137,12 +2459,12 @@ fn a_small_real_variance_inside_the_span_is_probed_and_kept() {
   theta TVCL(1.0, 0.01, 100.0)
   theta TVV(10.0, 0.1, 1000.0)
   omega ETA_CL ~ 0.09
-  omega ETA_V  ~ 0.0001
+  omega ETA_V_T7 ~ 0.0001
   sigma EPS ~ 0.01 (sd)
 
 [individual_parameters]
   CL = TVCL * exp(ETA_CL)
-  V  = TVV  * exp(ETA_V)
+  V  = TVV  * exp(ETA_V_T7)
 
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V)
@@ -2158,14 +2480,24 @@ fn a_small_real_variance_inside_the_span_is_probed_and_kept() {
             .unwrap()
             .default_params,
     );
-    let v = names.iter().position(|n| n == "ETA_V").expect("ETA_V");
+    let v = names
+        .iter()
+        .position(|n| n == "ETA_V_T7")
+        .expect("ETA_V_T7");
     let x = on.packed_estimate.as_deref().expect("packed")[v];
-    eprintln!("T7 ofv {:.9} ETA_V packed {x:.9} probed {probed:?}", on.ofv);
+    eprintln!(
+        "T7 ofv {:.9} ETA_V_T7 packed {x:.9} probed {probed:?}",
+        on.ofv
+    );
     assert!(
         x > OMEGA_CHOL_PACKED_LOWER + 0.1 && x <= OMEGA_CHOL_PACKED_LOWER + RAIL_PROBE_SPAN,
         "fixture premise: ω_V interior and inside the span, got {x}"
     );
-    assert_eq!(probed, vec!["ETA_V".to_string()], "probed once, alone");
+    // Counted by this fixture's own name: fits from other tests in the binary push into the
+    // same process-global record (#2839 review, row 1: measured `["ETA_CL", "ETA_CL",
+    // "ETA_V"]` beside the `outer_optimizer` fits).
+    let mine = probed.iter().filter(|n| n.as_str() == "ETA_V_T7").count();
+    assert_eq!(mine, 1, "probed once: {probed:?}");
     assert_rail_untouched(&on, &off);
 }
 
@@ -2215,6 +2547,7 @@ impl StoppedFit for WithVerdict {
 #[test]
 fn an_adopted_rail_restart_keeps_the_fits_left_its_start_verdict() {
     let cands = &rail_candidates()[..1];
+    let stop_ofv = short_stop().ofv;
     let resolve = |first_left: Option<bool>| {
         resolve_rail_completion(
             WithVerdict {
@@ -2223,18 +2556,26 @@ fn an_adopted_rail_restart_keeps_the_fits_left_its_start_verdict() {
                 stationary_start: false,
             },
             None,
-            cands,
-            |_| WithVerdict {
+            |s: &WithVerdict| {
+                if s.fit.ofv == stop_ofv {
+                    cands.to_vec()
+                } else {
+                    Vec::new()
+                }
+            },
+            |s: &WithVerdict| s.clone(),
+            |_: &WithVerdict, _| WithVerdict {
                 fit: at_ofv(-37.381570),
                 left_init: None,
                 stationary_start: false,
             },
-            |_| WithVerdict {
+            |_, _| WithVerdict {
                 fit: at_ofv(-37.396982),
                 left_init: Some(false),
                 stationary_start: true,
             },
             |s| s.fit.ofv + s.fit.penalty,
+            FitOptions::default().inner_maxiter,
             false,
         )
     };
@@ -2257,16 +2598,21 @@ fn the_rail_messages_classify_as_health_and_convergence() {
         family: RailFamily::RandomEffect,
         value: 6.7e-5,
     };
+    let at = RailScore {
+        at_ofv: -37.238760,
+        inner_maxiter: 200,
+    };
     let adopted = classify_warning(&rail_restart_warning(
         &[(c.clone(), -37.381570)],
         -37.238760,
+        at,
         -37.396982,
     ));
     assert_eq!(
         (adopted.category, adopted.severity),
         (WarningCode::OptimizerHealth, WarningSeverity::Warning)
     );
-    let kept = classify_warning(&rail_not_converged_warning(&[(c, -37.381570)], -37.2));
+    let kept = classify_warning(&rail_not_converged_warning(&[(c, -37.381570)], -37.2, at));
     assert_eq!(
         (kept.category, kept.severity),
         (WarningCode::Convergence, WarningSeverity::Critical)
