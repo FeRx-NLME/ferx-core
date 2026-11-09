@@ -1885,6 +1885,83 @@ fn a_bounded_profiled_cross_product_holds_the_level_as_fixed() {
     );
 }
 
+/// [`s1_visit_text`] profiled, at its inits, with ETA_EMAX (the second ETA) moved onto the
+/// internal guard ω = e⁻¹² — a collapse (#2797) — and ETA_EMAX `FIX` when `fix`, under
+/// `covariance_method = s`.
+fn s1_visit_collapsed_s(fix: bool) -> (ferx_core::PreparedRun, FitResult) {
+    let path = unique_temp("ferx_profiled_levels_s1_visit_collapsed");
+    std::fs::write(&path, s1_visit_text(true)).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(root().join(S1_DATA_100).to_str().unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut params = p.init_params.clone();
+    let om = &params.omega;
+    assert_eq!(om.eta_names.len(), 2, "fixture moved");
+    let diag = [om.matrix[(0, 0)], (-12.0_f64).exp()];
+    params.omega = OmegaMatrix::from_diagonal(&diag, om.eta_names.clone());
+    params.omega_fixed[1] = fix;
+    let opts = s(FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..p.parsed.fit_options.clone()
+    });
+    let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    (p, f)
+}
+
+/// ETA_EMAX's packed row in [`s1_visit_collapsed_s`]: its Cholesky diagonal.
+const S1_ETA_EMAX_ROW: usize = 11;
+
+/// #2816 T4 + T5: a variance collapsed on the guard is held by the profiled
+/// `covariance_method = s` step as the unprofiled one holds it (#2797) — the matrix is the
+/// profiled FIX twin's bit for bit, its row is `cov_fixed`, its SE zero, and the guard
+/// warning says the other SEs are computed with it held. `run_covariance` replays the held
+/// matrix in memory and after a `.fitrx` reload.
+///
+/// Mutation: drop `condition_on_held` in `cross_product_covariance` → correlation-scale gap
+/// 1.9e2 to the FIX twin, `cov_fixed[11]` false, SE(ETA_E0) 8.6238e-3 against 7.4515e-3
+/// (macOS arm64).
+#[test]
+fn a_collapse_is_held_by_the_profiled_cross_product_as_fixed() {
+    let (p, held) = s1_visit_collapsed_s(false);
+    let (_, fix) = s1_visit_collapsed_s(true);
+    for (side, f) in [("held", &held), ("FIX", &fix)] {
+        assert_eq!(
+            f.covariance_method,
+            Some(CovarianceMethod::CrossProduct),
+            "{side}: {:?}",
+            f.warnings
+        );
+    }
+    let listed: Vec<_> = held.held_at_bound.iter().map(|h| h.packed_index).collect();
+    assert_eq!(listed, [S1_ETA_EMAX_ROW], "the collapse is listed");
+    assert!(
+        fix.held_at_bound.is_empty(),
+        "a FIX parameter is not listed"
+    );
+    assert_eq!(held.covariance_matrix, fix.covariance_matrix);
+    assert!(held.cov_fixed[S1_ETA_EMAX_ROW], "{:?}", held.cov_fixed);
+    let se = held.se_omega.as_ref().expect("SEs");
+    assert_eq!(se[1], 0.0, "{se:?}");
+    assert_eq!(held.se_omega, fix.se_omega);
+    assert_eq!(held.se_theta, fix.se_theta);
+    let guard = held
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("Internal optimizer parameter guard reached"))
+        .expect("the guard warning");
+    // Both arms open "Their standard errors are not reported"; only the held one goes on.
+    assert!(
+        guard.ends_with("the other standard errors are computed with them held at the floor."),
+        "{guard}"
+    );
+    assert_replays_bit_for_bit(&p, &held, &s1_visit_text(true), s);
+}
+
 /// The held `S⁻¹` against the all-free one, off the held row: realised 0.306 (Linux
 /// aarch64 and macOS arm64 alike), against 3.4e-10 for the held one against FIX (under `S_SE`). The floor is a
 /// third of it.

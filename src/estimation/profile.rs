@@ -4057,6 +4057,15 @@ impl ProfileCtx<'_> {
         );
         let inv = crate::estimation::covariance::invert_cross_product(&s, &units)
             .ok_or_else(|| crate::estimation::covariance::S_SINGULAR_MSG.to_string())?;
+        // #2816: `S⁻¹` conditional on the coordinates collapsed on the guard, once `S` itself
+        // inverted cleanly — the unprofiled step's rule (#2797), so a held collapse is the
+        // same coordinate `FIX`. `unheld` is the template `free_all` indexes.
+        let held = crate::estimation::covariance::held_free_positions(x_hat, &unheld, &free_all);
+        let inv = crate::estimation::covariance::condition_on_held(&s, &held, |sub, keep| {
+            let keep_units: Vec<_> = keep.iter().map(|&a| units[a]).collect();
+            crate::estimation::covariance::invert_cross_product(sub, &keep_units)
+        })
+        .unwrap_or(inv);
         if self.options.verbose {
             eprintln!("  Covariance step successful (profile)");
         }

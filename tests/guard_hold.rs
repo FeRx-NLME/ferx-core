@@ -451,3 +451,121 @@ fn a_held_variance_in_a_block_omega_zeroes_its_own_se_slot() {
         "{table}"
     );
 }
+
+// ── #2816: SIR holds a step-held collapse as FIX ─────────────────────────────────────
+
+/// The fit's `SIR:` warnings, in order.
+fn sir_warnings(r: &FitResult) -> Vec<&str> {
+    r.warnings
+        .iter()
+        .filter(|w| w.starts_with("SIR"))
+        .map(String::as_str)
+        .collect()
+}
+
+/// `sir_ess` and `sir_ci_{theta,omega,sigma}` of `got` bit-for-bit those of `want`.
+fn assert_same_sir(got: &FitResult, want: &FitResult, how: &str) {
+    let ess = |r: &FitResult| r.sir_ess.map(f64::to_bits);
+    assert!(want.sir_ess.is_some(), "{how}: no SIR on the reference");
+    assert_eq!(
+        ess(got),
+        ess(want),
+        "{how}: ESS {:?} vs {:?}",
+        got.sir_ess,
+        want.sir_ess
+    );
+    assert_eq!(got.sir_ci_theta, want.sir_ci_theta, "{how}: θ CIs");
+    assert_eq!(got.sir_ci_omega, want.sir_ci_omega, "{how}: Ω CIs");
+    assert_eq!(got.sir_ci_sigma, want.sir_ci_sigma, "{how}: σ CIs");
+}
+
+/// #2816 T1 + T2: at the stationary point the covariance step holds ETA_KA (#2797), so SIR
+/// on that matrix is SIR on the same fit with ETA_KA `FIX` — the same ESS bits, the same
+/// CIs and the same `SIR:` sentences — under `r` (the analytic R-matrix proposal) and `s`
+/// (the unprofiled `S`). `run_sir` on the held fit, in memory and after a `.fitrx` reload,
+/// reproduces the in-fit SIR: the gate reads the reloaded matrix and the guard walk the
+/// reloaded estimates, so a reload that rounded ETA_KA off the rail would redden it.
+///
+/// Mutation: delete the SIR hold in `run_sir_in_box` → ESS 129.71 against 747.85 (`r`) and
+/// 43.15 against 432.47 (`s`), and two SIR sentences naming ETA_KA appear (macOS arm64).
+#[test]
+fn sir_holds_a_step_held_collapse_as_fix_under_r_and_s() {
+    for method in ["", "  covariance_method = s\n"] {
+        let sir = format!("{method}  sir = true\n  sir_seed = 7\n");
+        let held_src = format!("{}{sir}", model_source(SIGMA_HAT, false, true));
+        let fix_src = held_src.replace(
+            &format!("omega ETA_KA ~ {RAIL}\n"),
+            &format!("omega ETA_KA ~ {RAIL} FIX\n"),
+        );
+        assert_ne!(fix_src, held_src);
+        let (h, model, pop, _d) = evaluate("held_sir", &held_src);
+        let (f, _, _, _d2) = evaluate("fix_sir", &fix_src);
+        let how = if method.is_empty() { "r" } else { "s" };
+        // Precondition: the step held ETA_KA, so the two proposals are one matrix.
+        assert!(h.cov_fixed[ETA_KA_ROW], "{how}: {:?}", h.warnings);
+        assert_eq!(h.held_at_bound.len(), 1, "{how}");
+        assert_eq!(h.covariance_method, f.covariance_method, "{how}");
+        assert_eq!(
+            h.covariance_matrix, f.covariance_matrix,
+            "{how}: proposals differ"
+        );
+        assert_same_sir(&h, &f, how);
+        assert_eq!(sir_warnings(&h), sir_warnings(&f), "{how}");
+        assert!(
+            !sir_warnings(&h).iter().any(|w| w.contains("ETA_KA")),
+            "{how}: a SIR sentence names the held coordinate: {:?}",
+            sir_warnings(&h)
+        );
+        if !method.is_empty() {
+            continue;
+        }
+        let opts = FitOptions {
+            sir: true,
+            sir_seed: Some(7),
+            ..FitOptions::default()
+        };
+        let mem = ferx_core::run_sir(&h, Some(&model), Some(&pop), &opts).expect("run_sir");
+        assert_same_sir(&mem, &h, "run_sir in memory");
+        let path = _d.path().join("held_sir.fitrx");
+        ferx_core::io::fitrx::save_fit(&h, &pop, &held_src, &path, Default::default())
+            .expect("saves");
+        let loaded = ferx_core::io::fitrx::load_fit(&path).expect("loads");
+        assert_eq!(
+            loaded.fit.held_at_bound.len(),
+            1,
+            "the hold survives the reload"
+        );
+        let re = ferx_core::run_sir(&loaded.fit, Some(&model), Some(&pop), &opts)
+            .expect("run_sir after reload");
+        assert_same_sir(&re, &h, "run_sir after .fitrx reload");
+    }
+}
+
+/// #2816 T3, the straddle: at the poor-σ point the analytic `R` is floored along ETA_KA, so
+/// the step does not hold it (`cov_fixed` false) and SIR must keep sampling it. There SIR
+/// shrinks the proposal along ETA_KA and says so, naming it — a property of the proposal,
+/// not of the draws, so the ESS of ≈1 at this point cannot flake it.
+///
+/// Mutation: drop the `step_held` gate (hold every guard coordinate) → ETA_KA leaves the
+/// free block and the shrink note disappears (measured, macOS arm64).
+#[test]
+fn sir_keeps_sampling_a_collapse_the_step_did_not_hold() {
+    let src = format!(
+        "{}  sir = true\n  sir_seed = 7\n",
+        model_source("0.02", false, true)
+    );
+    let (f, _, _, _d) = evaluate("poor_sir", &src);
+    assert!(
+        !f.cov_fixed[ETA_KA_ROW],
+        "the step held it: {:?}",
+        f.warnings
+    );
+    assert_eq!(f.held_at_bound.len(), 1, "listed, not held");
+    assert!(
+        sir_warnings(&f)
+            .iter()
+            .any(|w| w.starts_with("SIR: proposal was shrunk") && w.contains("[ETA_KA")),
+        "{:?}",
+        sir_warnings(&f)
+    );
+}

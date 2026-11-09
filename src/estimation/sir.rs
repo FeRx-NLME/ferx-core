@@ -1166,6 +1166,16 @@ fn run_sir_in_box(
             fixed_mask[k] = true;
         }
     }
+    // A random-effect variance the covariance step held on its guard (#2797: a
+    // `CollapsedAtGuard` coordinate whose row of the matrix is zero) is a FIX parameter of
+    // that matrix, so it is one here too (#2816) and SIR equals the same fit with it `FIX`.
+    // The gate reads the *proposal*: a non-PD fallback or a floored `R` has no zero row
+    // there, so a collapse that step did not hold stays sampled.
+    for p in crate::api::held_guard_coordinates(params) {
+        if crate::api::step_held(Some(proposal_cov), p) {
+            fixed_mask[p] = true;
+        }
+    }
     adjust_box(&mut bounds);
     let n_packed = x_hat.len();
 

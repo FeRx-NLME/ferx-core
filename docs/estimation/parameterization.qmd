@@ -532,11 +532,11 @@ the analytic R-matrix and the finite-difference stencil.
 other SEs are conditional on the held coordinate. The guard warning says the
 same in words: "the other standard errors are computed with them held at the
 floor" after a clean `R`, and only "their standard errors are not reported"
-otherwise. Its `details.parameters[].held` mirrors `cov_fixed`. Two consumers do not
-hold a collapse in this version: SIR, and the profiled step under
-`covariance_method = s` (#2816). In both, the collapse is listed and shown as `N/A`,
-but the matrix stays unconditional. A `[mixture]` per-class override on the rail is
-not held either (#2809).
+otherwise. Its `details.parameters[].held` mirrors `cov_fixed`. Every consumer of
+the matrix treats a held collapse as the same coordinate `FIX`: the covariance step
+under every `covariance_method`, profiled or not, SIR and the asymptotic draws
+(#2816). A `[mixture]` per-class override on the rail is not held in this version
+(#2809).
 
 ## Where the packed space surfaces
 
