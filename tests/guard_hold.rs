@@ -653,3 +653,216 @@ fn a_re_run_rebuilds_the_held_override_entry() {
     assert!(again.cov_fixed[OVERRIDE_ROW]);
     assert_eq!(all_ses(&again), all_ses(&f));
 }
+
+// ── #2816: SIR holds a step-held collapse as FIX ─────────────────────────────────────
+
+/// The fit's `SIR:` warnings, in order.
+fn sir_warnings(r: &FitResult) -> Vec<&str> {
+    r.warnings
+        .iter()
+        .filter(|w| w.starts_with("SIR"))
+        .map(String::as_str)
+        .collect()
+}
+
+/// `sir_ess` and `sir_ci_{theta,omega,sigma}` of `got` bit-for-bit those of `want`.
+fn assert_same_sir(got: &FitResult, want: &FitResult, how: &str) {
+    let ess = |r: &FitResult| r.sir_ess.map(f64::to_bits);
+    assert!(want.sir_ess.is_some(), "{how}: no SIR on the reference");
+    assert_eq!(
+        ess(got),
+        ess(want),
+        "{how}: ESS {:?} vs {:?}",
+        got.sir_ess,
+        want.sir_ess
+    );
+    assert_eq!(got.sir_ci_theta, want.sir_ci_theta, "{how}: θ CIs");
+    assert_eq!(got.sir_ci_omega, want.sir_ci_omega, "{how}: Ω CIs");
+    assert_eq!(got.sir_ci_sigma, want.sir_ci_sigma, "{how}: σ CIs");
+}
+
+/// SIR on the held fit at the stationary point against the same fit with ETA_KA `FIX`,
+/// under `method` (`""` for `r`, or a `covariance_method` line). Returns the held fit,
+/// its model, population, source and temp dir for the `run_sir` replays.
+fn held_sir_is_fix_sir(
+    method: &str,
+    how: &str,
+) -> (
+    FitResult,
+    ferx_core::types::CompiledModel,
+    ferx_core::types::Population,
+    String,
+    tempfile::TempDir,
+) {
+    let sir = format!("{method}  sir = true\n  sir_seed = 7\n");
+    let held_src = format!("{}{sir}", model_source(SIGMA_HAT, false, true));
+    let fix_src = held_src.replace(
+        &format!("omega ETA_KA ~ {RAIL}\n"),
+        &format!("omega ETA_KA ~ {RAIL} FIX\n"),
+    );
+    assert_ne!(fix_src, held_src);
+    let (h, model, pop, dir) = evaluate("held_sir", &held_src);
+    let (f, _, _, _d) = evaluate("fix_sir", &fix_src);
+    // Precondition: the step held ETA_KA, so the two proposals are one matrix.
+    assert!(h.cov_fixed[ETA_KA_ROW], "{how}: {:?}", h.warnings);
+    assert_eq!(h.held_at_bound.len(), 1, "{how}");
+    assert_eq!(h.covariance_method, f.covariance_method, "{how}");
+    assert_eq!(
+        h.covariance_matrix, f.covariance_matrix,
+        "{how}: proposals differ"
+    );
+    assert_same_sir(&h, &f, how);
+    assert_eq!(sir_warnings(&h), sir_warnings(&f), "{how}");
+    assert!(
+        !sir_warnings(&h).iter().any(|w| w.contains("ETA_KA")),
+        "{how}: a SIR sentence names the held coordinate: {:?}",
+        sir_warnings(&h)
+    );
+    (h, model, pop, held_src, dir)
+}
+
+/// #2816 T1: at the stationary point the covariance step holds ETA_KA (#2797), so SIR on
+/// the analytic R-matrix proposal is SIR on the same fit with ETA_KA `FIX` — the same ESS
+/// bits, the same CIs and the same `SIR:` sentences. `run_sir` on the held fit, in memory
+/// and after a `.fitrx` reload, reproduces the in-fit SIR: the gate reads the reloaded
+/// matrix and the guard walk the reloaded estimates, so a reload that rounded ETA_KA off
+/// the rail would redden it.
+///
+/// Mutation: delete the SIR hold in `run_sir_in_box` → ESS 129.71 against 747.85, and a
+/// rank-deficiency sentence naming ETA_KA appears (macOS arm64).
+#[test]
+fn sir_holds_a_step_held_collapse_as_fix_under_r() {
+    let (h, model, pop, held_src, dir) = held_sir_is_fix_sir("", "r");
+    let opts = FitOptions {
+        sir: true,
+        sir_seed: Some(7),
+        ..FitOptions::default()
+    };
+    let mem = ferx_core::run_sir(&h, Some(&model), Some(&pop), &opts).expect("run_sir");
+    assert_same_sir(&mem, &h, "run_sir in memory");
+    let path = dir.path().join("held_sir.fitrx");
+    ferx_core::io::fitrx::save_fit(&h, &pop, &held_src, &path, Default::default()).expect("saves");
+    let loaded = ferx_core::io::fitrx::load_fit(&path).expect("loads");
+    assert_eq!(
+        loaded.fit.held_at_bound.len(),
+        1,
+        "the hold survives the reload"
+    );
+    let re = ferx_core::run_sir(&loaded.fit, Some(&model), Some(&pop), &opts)
+        .expect("run_sir after reload");
+    assert_same_sir(&re, &h, "run_sir after .fitrx reload");
+}
+
+/// #2816 T2: T1 on the unprofiled `S` proposal (`covariance_method = s`). Its low ESS on
+/// the unheld proposal also emits the "heaviest draw … moves ETA_KA" sentence, which the
+/// equality with the FIX twin's sentences rules out.
+///
+/// Mutation: delete the SIR hold → ESS 43.15 against 432.47 (macOS arm64).
+#[test]
+fn sir_holds_a_step_held_collapse_as_fix_under_s() {
+    held_sir_is_fix_sir("  covariance_method = s\n", "s");
+}
+
+/// #2816 T3, the straddle: at the poor-σ point the analytic `R` is floored along ETA_KA, so
+/// the step does not hold it (`cov_fixed` false) and SIR must keep sampling it. There SIR
+/// shrinks the proposal along ETA_KA and says so, naming it — a property of the proposal,
+/// not of the draws, so the ESS of ≈1 at this point cannot flake it.
+///
+/// Mutation: drop the `step_held` gate (hold every guard coordinate) → ETA_KA leaves the
+/// free block and the shrink note disappears (measured, macOS arm64).
+#[test]
+fn sir_keeps_sampling_a_collapse_the_step_did_not_hold() {
+    let src = format!(
+        "{}  sir = true\n  sir_seed = 7\n",
+        model_source("0.02", false, true)
+    );
+    let (f, _, _, _d) = evaluate("poor_sir", &src);
+    assert!(
+        !f.cov_fixed[ETA_KA_ROW],
+        "the step held it: {:?}",
+        f.warnings
+    );
+    assert_eq!(f.held_at_bound.len(), 1, "listed, not held");
+    assert!(
+        sir_warnings(&f)
+            .iter()
+            .any(|w| w.starts_with("SIR: proposal was shrunk") && w.contains("[ETA_KA")),
+        "{:?}",
+        sir_warnings(&f)
+    );
+}
+
+/// #2830 review r1 #1: a proposal whose shape does not match the packed vector is refused
+/// with `E_FIT_INPUT_MODEL`, also when the parameters carry a guard collapse. The hold reads
+/// the proposal's diagonal at the collapse's packed index, so it must run after the shape
+/// check: a 7×5 proposal (ETA_KA is packed row 5, columns 0–4 only) otherwise indexes
+/// `(5, 5)` and panics instead of returning the refusal.
+///
+/// Mutation: move the hold loop back above the dimension check → panic (index out of
+/// bounds), not `Err`.
+#[test]
+fn run_sir_core_refuses_a_misshapen_proposal_with_a_collapse() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shape.ferx");
+    std::fs::write(&path, model_source(SIGMA_HAT, false, true)).unwrap();
+    let p = ferx_core::prepare_run(path.to_str().unwrap(), Some(DATA)).expect("prepare");
+    let params = &p.init_params;
+    // Precondition: the inits carry the collapse, so the hold loop has a coordinate to read.
+    assert_eq!(
+        params.omega.matrix[(2, 2)].to_bits(),
+        RAIL.parse::<f64>().unwrap().to_bits()
+    );
+    let etas = vec![nalgebra::DVector::zeros(3); p.population.subjects.len()];
+    let opts = FitOptions {
+        sir: true,
+        sir_seed: Some(7),
+        ..FitOptions::default()
+    };
+    let proposal = nalgebra::DMatrix::<f64>::zeros(7, ETA_KA_ROW);
+    let err = ferx_core::estimation::sir::run_sir_core(
+        &p.parsed.model,
+        &p.population,
+        params,
+        &etas,
+        &proposal,
+        0.0,
+        &opts,
+    )
+    .err()
+    .expect("a 7×5 proposal is refused");
+    assert!(
+        err.contains("Covariance matrix dimensions (7,5) don't match packed parameters (7)"),
+        "{err}"
+    );
+}
+
+/// #2809 × #2816 (merge of #2830): SIR holds a step-held `[mixture]` override like its FIX
+/// twin — the same ESS bits, CIs and `SIR:` notes. #2816's SIR hold walks
+/// `held_guard_coordinates`, which #2809 widened to the override rows, so the two compose;
+/// neither PR's tests saw the pair. The override's row is packed 6 (`OVERRIDE_ROW`).
+///
+/// Mutation: delete the SIR hold in `run_sir_in_box` → ESS 46.97 against 718.74, and a
+/// rank-deficiency note naming ETA_CL_MIX2 (macOS arm64).
+#[test]
+fn sir_holds_a_step_held_mixture_override_as_fix() {
+    let sir = "  sir = true\n  sir_seed = 7\n";
+    let (h, _d) = evaluate_mixture(
+        "held_mix_sir",
+        &format!("{}{sir}", mixture_source(false, true)),
+    );
+    let (f, _d2) = evaluate_mixture(
+        "fix_mix_sir",
+        &format!("{}{sir}", mixture_source(true, true)),
+    );
+    // Precondition: the step held the override, so the two proposals are one matrix.
+    assert!(h.cov_fixed[OVERRIDE_ROW], "{:?}", h.warnings);
+    assert_eq!(h.held_at_bound.len(), 1);
+    assert_eq!(h.covariance_matrix, f.covariance_matrix, "proposals differ");
+    assert_same_sir(&h, &f, "mixture override");
+    assert_eq!(sir_warnings(&h), sir_warnings(&f));
+    assert!(
+        !sir_warnings(&h).iter().any(|w| w.contains("ETA_CL_MIX2")),
+        "a SIR sentence names the held override: {:?}",
+        sir_warnings(&h)
+    );
+}
