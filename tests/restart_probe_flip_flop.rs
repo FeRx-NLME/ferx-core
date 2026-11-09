@@ -62,10 +62,17 @@ fn quoted_cold(message: &str) -> f64 {
 
 /// `cold_ofv` is the trapped first leg's cold re-solve, which the fit's own restart notice
 /// names; it identifies the restart the fit ran, as opposed to one of the probe's.
-/// `from_probe` is which point the verification reports: the probe's, when it ended lower
-/// than the restart it verified, or the restart's own. The two fixtures land one each, so the
-/// notice's closing clause is pinned on both of its values.
-fn assert_restart_reported_converged(model: &str, cold_ofv: f64, from_probe: bool) {
+///
+/// Which point the verification reports, the probe's or the restart's own, is not pinned
+/// here: the two end within 1.7e-8 (closed form) and 1.5e-7 (ODE twin) of each other on an
+/// OFV of −3051 (relative 1e-11, measured on macOS arm64), and `settle_restart_probe` takes
+/// the lower. The winner flips with the platform and the build: on CI the closed form
+/// reported the resumed run where Linux locally had reported the probe's. Both clauses and
+/// both outcomes of that choice are pinned deterministically in
+/// `outer_optimizer_tests.rs` (`settle_restart_probe`, the provenance wording); what this
+/// test pins is that the notice names exactly one of them and the fit is reported
+/// converged.
+fn assert_restart_reported_converged(model: &str, cold_ofv: f64) {
     let result = fit_example(model);
     assert!(result.ofv.is_finite(), "{model}: OFV {}", result.ofv);
     // The straddle: the fit must still go through a basin-shift restart, or this tests a
@@ -88,15 +95,11 @@ fn assert_restart_reported_converged(model: &str, cold_ofv: f64, from_probe: boo
          restart from a perturbation of that point, which reached a lower objective.",
         "the reported estimates are from the resumed run.",
     );
-    let (says, not) = if from_probe {
-        (probe_clause, resumed_clause)
-    } else {
-        (resumed_clause, probe_clause)
-    };
+    let names_probe = notices[0].ends_with(probe_clause) && !notices[0].contains(resumed_clause);
+    let names_resumed = notices[0].ends_with(resumed_clause) && !notices[0].contains(probe_clause);
     assert!(
-        notices[0].ends_with(says) && !notices[0].contains(not),
-        "{model}: the notice names the run the estimates come from (from probe = \
-         {from_probe}): {}",
+        names_probe != names_resumed,
+        "{model}: the notice names exactly one run the estimates come from: {}",
         notices[0]
     );
     eprintln!(
@@ -145,12 +148,12 @@ fn assert_restart_reported_converged(model: &str, cold_ofv: f64, from_probe: boo
 
 #[test]
 fn a_verified_basin_shift_restart_is_converged_closed_form() {
-    assert_restart_reported_converged(CLOSED_FORM, -3051.324118, true);
+    assert_restart_reported_converged(CLOSED_FORM, -3051.324118);
 }
 
 #[test]
 fn a_verified_basin_shift_restart_is_converged_ode_twin() {
-    assert_restart_reported_converged(ODE_TWIN, -3051.295773, false);
+    assert_restart_reported_converged(ODE_TWIN, -3051.295773);
 }
 
 /// The probe and its restart chain run on what is left of the fit's `maxiter` budget, not on
