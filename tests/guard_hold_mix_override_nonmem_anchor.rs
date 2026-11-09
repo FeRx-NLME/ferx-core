@@ -158,3 +158,64 @@ fn held_override_standard_errors_match_nonmem_with_the_override_fixed() {
     }
     assert!(failed.is_empty(), "{}", failed.join("; "));
 }
+
+/// T10 (#2833): the held override renders as held — `N/A` in the console and the table,
+/// `se: ~` + `held: collapsed_at_guard` in the YAML — while its base `ETA_CL` keeps its
+/// number. NONMEM prints no SE for the `FIX` `OMEGA(2,2)` (asserted above).
+///
+/// The straddle that makes `fixed`'s source observable: the covariance step held this
+/// coordinate (`cov_fixed[6]`), yet it is **not** fixed by the model (`fixed == false`).
+/// Mutations: read `fixed` from `cov_fixed` → the row renders `---` (fixed), not `N/A`;
+/// match `held_at_bound` on `(kind, index)` alone → the base `ETA_CL` row turns `N/A`.
+#[test]
+fn held_override_renders_held_and_its_base_keeps_its_se() {
+    let f = evaluate();
+    let p = &f.mixture_override_params[0];
+    assert_eq!((p.name.as_str(), p.packed_index), ("ETA_CL_MIX2", 6));
+    assert!(
+        f.cov_fixed[p.packed_index] && !p.fixed,
+        "straddle lost: cov_fixed {} fixed {}",
+        f.cov_fixed[p.packed_index],
+        p.fixed
+    );
+
+    let summary = ferx_core::io::output::format_summary(&f);
+    let line = |text: &str, name: &str| -> String {
+        text.lines()
+            .find(|l| l.trim_start().split_whitespace().next() == Some(name))
+            .unwrap_or_else(|| panic!("no `{name}` row in:\n{text}"))
+            .to_string()
+    };
+    assert!(
+        line(&summary, "ETA_CL_MIX2").ends_with("SE = N/A"),
+        "{summary}"
+    );
+    let base = line(&summary, "ETA_CL");
+    assert!(!base.contains("N/A") && !base.contains("---"), "{summary}");
+
+    let table = ferx_core::io::output::parameter_table(&f);
+    assert!(line(&table, "ETA_CL_MIX2").contains(" N/A "), "{table}");
+    assert!(!line(&table, "ETA_CL").contains("N/A"), "{table}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fit.yaml");
+    ferx_core::io::output::write_estimates_yaml(&f, path.to_str().unwrap()).unwrap();
+    let yaml = std::fs::read_to_string(&path).unwrap();
+    let section = &yaml[yaml.find("\nmixture_overrides:\n").expect("section")..];
+    assert!(
+        section.starts_with(
+            "\nmixture_overrides:\n  ETA_CL_MIX2:\n    class: 2\n    base: ETA_CL\n    \
+             kind: omega\n"
+        ),
+        "{section}"
+    );
+    assert!(
+        section.contains("    se: ~\n    held: collapsed_at_guard\n"),
+        "{section}"
+    );
+    assert_eq!(
+        yaml.matches("held: collapsed_at_guard").count(),
+        1,
+        "{yaml}"
+    );
+}

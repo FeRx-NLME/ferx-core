@@ -4638,6 +4638,53 @@ pub(crate) fn extract_standard_errors(
     (Some(se_theta), Some(se_omega), Some(se_sigma), se_kappa)
 }
 
+/// Standard errors of a `[mixture]` fit's per-class overrides (#2833), parallel to
+/// [`FitResult::mixture_overrides`](crate::types::FitResult::mixture_overrides) and on its
+/// scales. Each override packs `ln` of its class's standard deviation — an Ω override the
+/// Cholesky diagonal `ln L_ee`, a σ override `ln σ` — so the delta method gives
+/// `SE(var) = 2·var·SE(packed)` for Ω and `SE(σ) = σ·SE(packed)` for Σ.
+///
+/// The Ω rule is exact only because an Ω override is accepted on a **diagonal** base
+/// alone (the parser refuses one on a block Ω, `mixture_block_omega_override_rejected`):
+/// there `L_ee = sd`. Lifting that refusal makes this formula wrong.
+///
+/// Rows come from [`mixture_override_params`](crate::estimation::parameterization::mixture_override_params),
+/// so the offsets are the packed-segment helpers', never re-spelled here. A fixed override
+/// reports `0.0`, as a pinned θ/Ω/σ does. `None` with no override or no matrix.
+pub(crate) fn extract_mixture_override_se(
+    cov: &Option<DMatrix<f64>>,
+    template: &ModelParameters,
+) -> Option<Vec<f64>> {
+    let mix = template.mixture.as_ref()?;
+    let params = crate::estimation::parameterization::mixture_override_params(template);
+    if params.is_empty() {
+        return None;
+    }
+    let cov = cov.as_ref()?;
+    let n = cov.nrows();
+    Some(
+        params
+            .iter()
+            .map(|p| {
+                let idx = p.packed_index;
+                // A truncated `cov` reports 0.0, as the other `se_*` extractions do.
+                if p.fixed || idx >= n {
+                    return 0.0;
+                }
+                let var = cov[(idx, idx)];
+                let se_packed = if var > 0.0 { var.sqrt() } else { 0.0 };
+                let c = p.class - 1;
+                match p.kind {
+                    crate::types::ParameterKind::Omega => {
+                        2.0 * mix.omega[c].matrix[(p.index, p.index)] * se_packed
+                    }
+                    _ => mix.sigma[c].values[p.index] * se_packed,
+                }
+            })
+            .collect(),
+    )
+}
+
 /// Standard errors for the estimated `block_sigma` correlations (#847), on the
 /// natural ρ scale.
 ///

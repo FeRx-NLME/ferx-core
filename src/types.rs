@@ -8276,6 +8276,38 @@ pub struct LevelGroupEbe {
     pub kappa: Vec<f64>,
 }
 
+/// One estimated `[mixture]` per-class override (`omega(k)` / `sigma(k)`, #977), as listed in
+/// [`FitResult::mixture_override_params`] (#2833): what a renderer needs to name its row and
+/// read its state. Parallel to [`FitResult::mixture_overrides`] (its value) and
+/// [`FitResult::se_mixture_overrides`] (its standard error).
+///
+/// Not to be confused with [`MixtureClassOverride`], the parsed declaration.
+/// `#[non_exhaustive]` so a later field is not a breaking change; ferx builds it, a caller
+/// reads it.
+#[non_exhaustive]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MixtureOverrideParam {
+    /// The override's name, as
+    /// [`crate::estimation::parameterization::coordinate_names`] spells it: the base name with a
+    /// `_MIX{class}` suffix, e.g. `"ETA_CL_MIX2"`, `"EPS_MIX2"`.
+    pub name: String,
+    /// [`ParameterKind::Omega`] or [`ParameterKind::Sigma`].
+    pub kind: ParameterKind,
+    /// The index of the **base** η (Ω diagonal) or σ the override replaces in its class —
+    /// the same convention as [`HeldAtBound::index`] for an override entry.
+    pub index: usize,
+    /// The class, 1-based like the model file, the `_MIX{c}` name and
+    /// [`HeldAtBound::class`].
+    pub class: usize,
+    /// Its row in [`FitResult::covariance_matrix`].
+    pub packed_index: usize,
+    /// Held by the model: a user `FIX`, or an override an estimator held at its initial
+    /// value (SAEM's σ override, #985). Read from the model's packed FIX mask, **not** from
+    /// [`FitResult::cov_fixed`], which also marks a coordinate the covariance step held on
+    /// the internal guard — that one is listed in [`FitResult::held_at_bound`] instead.
+    pub fixed: bool,
+}
+
 /// One coordinate the covariance step reports no standard error for (#2797), as listed in
 /// [`FitResult::held_at_bound`]: its SE displays as not available, and — when the step held
 /// it (it is marked in [`FitResult::cov_fixed`]) — every other SE is conditional on it at
@@ -9101,6 +9133,19 @@ pub struct FitResult {
     /// carries no `packed_estimate`; `None` otherwise and for hand-built results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixture_overrides: Option<Vec<f64>>,
+    /// One descriptor per entry of [`FitResult::mixture_overrides`], in the same order
+    /// (#2833): the override's name, family, base index, class, packed row and FIX state, so
+    /// a renderer can label its row. Empty for a fit with no override and for a result that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixture_override_params: Vec<MixtureOverrideParam>,
+    /// Standard errors of [`FitResult::mixture_overrides`] (#2833), parallel to it and on its
+    /// scales: an Ω override's class **variance**, a σ override's σ (the scale the base
+    /// `se_sigma` reports). `0.0` for a fixed override
+    /// ([`MixtureOverrideParam::fixed`]), as the other `se_*` vectors report a pinned
+    /// coordinate. `None` with no override or no covariance matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_mixture_overrides: Option<Vec<f64>>,
     /// The outer optimizer's own verdict on whether the fit left its initial
     /// estimates — its `INIT_ESCAPE_STEP_S` test (#751) in scaled packed space,
     /// on the point the reported estimates are built from. `Some(false)` is the
