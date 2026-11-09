@@ -8850,10 +8850,12 @@ pub struct FitResult {
     /// warnings. Read from the optimizer's final state, after a stagnation latch that
     /// landed on the last permitted evaluation has been attributed to the guard rather than
     /// the budget, and after a polish that spent it (which [`Self::optimizer_stop`], taken
-    /// from the primary leg, does not see). Set on the NLopt path, profiled or not; `false`
-    /// for every other optimizer and estimator (Gauss–Newton, trust region, SAEM, IMP,
-    /// IMPMAP, Bayes, VI), which report their own iteration caps in warnings. Read by
-    /// [`Self::status`].
+    /// from the primary leg, does not see). Set by every outer optimizer with a `maxiter`
+    /// budget: NLopt (profiled or not), the trust region (`MaxItersReached`), pure
+    /// Gauss–Newton and `optimizer = bfgs` (a loop that ran out of iterations). `false` for
+    /// SAEM, IMP, IMPMAP, Bayes and VI, which report their own iteration caps in warnings,
+    /// and for the Gauss–Newton hybrid, whose polish runs a fixed budget rather than the
+    /// user's. Read by [`Self::status`].
     #[serde(default)]
     pub eval_budget_spent: bool,
     /// Whether no stage of the run estimated: it scored the given values by request
@@ -12169,14 +12171,14 @@ pub struct ParsedModel {
     pub bindings: crate::parser::model_parser::ParseBindings,
 }
 
-/// Factories that build minimal `CompiledModel` instances for unit tests.
-/// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests
-/// can construct models without duplicating the boilerplate.
 // #2799: the usability verdict beside `converged`, in its own file.
 #[path = "types_fit_status.rs"]
 mod fit_status;
 pub use fit_status::{FitStatus, StatusReason};
 
+/// Factories that build minimal `CompiledModel` instances for unit tests.
+/// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests
+/// can construct models without duplicating the boilerplate.
 #[cfg(test)]
 #[path = "types_test_helpers.rs"]
 pub(crate) mod test_helpers;

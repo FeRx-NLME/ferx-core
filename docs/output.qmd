@@ -538,7 +538,7 @@ models. The `IWRES` column itself is unchanged.
 |-------|---------|
 | `Computed` | Covariance step succeeded; SE values are valid |
 | `Failed` | Hessian was singular or inversion failed; SE fields are `None` |
-| `NotRequested` | `covariance = false` was set; SE fields are `None` |
+| `NotRequested` | `covariance = false` was set, or no step belongs to the run (a Bayes fit, or a standalone `imp_eval_only` / `agq_eval_only` evaluation); SE fields are `None` |
 
 ### Fit status
 
@@ -566,7 +566,7 @@ Each reason has one source, and they are listed in this order:
 | Reason | Source |
 |---|---|
 | `evaluation_only` | `evaluation_only`: no stage estimated. That is `maxiter = 0` on FOCE, FOCEI, Laplace/AGQ or pure Gauss–Newton (which read it as NONMEM's `MAXEVAL=0`), or a standalone `imp_eval_only` / `agq_eval_only` run |
-| `budget_spent` | `eval_budget_spent`: the outer optimizer used its whole evaluation budget. NLopt only, profiled or not |
+| `budget_spent` | `eval_budget_spent`: the outer optimizer used its whole `maxiter` budget. Set by NLopt (profiled or not), the trust region, pure Gauss–Newton and `optimizer = bfgs`. Not by SAEM, IMP, IMPMAP, Bayes or VI, which report their own iteration caps in warnings, nor by the Gauss–Newton hybrid, whose polish runs a fixed budget |
 | a warning code, e.g. `condition_number` | each distinct code of a `Critical` [structured warning](warnings.qmd#severity), in order of first appearance. An earlier chain stage's counts. `covariance_failed` never appears here |
 | `covariance_failed` | `covariance_status` is `Failed` |
 | `collapsed_at_guard: ETA_KA, …` | a coordinate collapsed onto ferx's internal guard ([held parameters](estimation/parameterization.qmd#held-parameters)) that a covariance step ran on and did **not** hold, because the step failed, floored `R` or fell back to `S` |
@@ -578,7 +578,10 @@ clean answer. Neither is a collapse with no covariance step, which leaves no
 still names those.
 
 So `maxiter = 0` prints `NOT CONVERGED (evaluation_only)` rather than a bare
-`NOT CONVERGED`. A converged fit whose covariance step failed beside an unheld
+`NOT CONVERGED`. A standalone `imp_eval_only` or `agq_eval_only` run is also an
+evaluation, but it reports `converged = true` whenever its objective is finite, so it
+prints `CONVERGED WITH ISSUES (evaluation_only)`. The two read differently because the
+status never rewrites `converged`; the shared reason is what says no stage estimated. A converged fit whose covariance step failed beside an unheld
 collapse prints `CONVERGED WITH ISSUES (covariance_failed, collapsed_at_guard: ETA_KA)`:
 the optimizer stopped, and the point it stopped at needs a second look.
 
