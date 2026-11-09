@@ -333,6 +333,13 @@ when the list is empty. A bundle written before the field existed carries only
 `profiled_levels_at_bound`; on load those levels become `profiled_bound` entries, so
 old and new bundles read the same way.
 
+A `reason` the reading build does not know — one a later ferx added — loads as
+`unknown` instead of failing the bundle (#2817). The entry still counts as held, so
+its standard error shows as `N/A`. Re-saving writes it back as `unknown`; the original
+token is not kept. An entry whose `kind` the build does not know (a parameter family
+a later ferx added) is dropped on load, since there is no family to show it under; the
+rest of the list loads. Both rules apply when a `FitResult` JSON file is read, too.
+
 #### Engine results
 
 `bayes`, `importance_sampling`, `impmap_trace` and `exclusions` hold the
