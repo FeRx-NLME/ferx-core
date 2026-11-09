@@ -597,8 +597,9 @@ fn assert_override_held_like_its_fix_twin(analytic: bool) -> FitResult {
     f
 }
 
-/// T7 (#2809), analytic R. Base `se_omega[0]` = 0.019272550413150978 on macOS arm64 (the
-/// plan's M3/M4: every SE bit-equal to the FIX twin, 0 ULP).
+/// T7 (#2809), analytic R. Base `se_omega[0]` = 0.019272550413150978 on macOS arm64 and
+/// 1.927255e-2 on Linux aarch64 (`tools/linux-test.sh`, every printed digit equal); every SE
+/// bit-equal to the FIX twin, 0 ULP, on both platforms (the plan's M3/M4).
 #[test]
 fn a_collapsed_mixture_override_is_held_like_its_fix_twin_on_the_analytic_r() {
     assert_override_held_like_its_fix_twin(true);

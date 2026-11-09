@@ -135,7 +135,8 @@ fn held_override_standard_errors_match_nonmem_with_the_override_fixed() {
             worst = (rel, name);
         }
     }
-    // Measured (macOS arm64): worst 3.99e-4 at SIGMA(1,1), then 1.97e-4 (THETA1), 8.1e-5
+    // Measured (macOS arm64 and Linux aarch64, identical in every printed digit): worst
+    // 3.99e-4 at SIGMA(1,1), then 1.97e-4 (THETA1), 8.1e-5
     // (OMEGA(1,1)), the rest ≤ 1.5e-5; the .ext prints 6 significant digits. NONMEM's
     // finite-difference `$COV` against ferx's analytic R. 2× headroom. The unheld step
     // (before #2809) moves SIGMA(1,1) by 9.3e-3 and THETA2 by 5.37e-3 — 11× and 6.7× the
