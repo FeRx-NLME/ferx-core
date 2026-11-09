@@ -589,3 +589,47 @@ fn sir_keeps_sampling_a_collapse_the_step_did_not_hold() {
         sir_warnings(&f)
     );
 }
+
+/// #2830 review r1 #1: a proposal whose shape does not match the packed vector is refused
+/// with `E_FIT_INPUT_MODEL`, also when the parameters carry a guard collapse. The hold reads
+/// the proposal's diagonal at the collapse's packed index, so it must run after the shape
+/// check: a 7×5 proposal (ETA_KA is packed row 5, columns 0–4 only) otherwise indexes
+/// `(5, 5)` and panics instead of returning the refusal.
+///
+/// Mutation: move the hold loop back above the dimension check → panic (index out of
+/// bounds), not `Err`.
+#[test]
+fn run_sir_core_refuses_a_misshapen_proposal_with_a_collapse() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("shape.ferx");
+    std::fs::write(&path, model_source(SIGMA_HAT, false, true)).unwrap();
+    let p = ferx_core::prepare_run(path.to_str().unwrap(), Some(DATA)).expect("prepare");
+    let params = &p.init_params;
+    // Precondition: the inits carry the collapse, so the hold loop has a coordinate to read.
+    assert_eq!(
+        params.omega.matrix[(2, 2)].to_bits(),
+        RAIL.parse::<f64>().unwrap().to_bits()
+    );
+    let etas = vec![nalgebra::DVector::zeros(3); p.population.subjects.len()];
+    let opts = FitOptions {
+        sir: true,
+        sir_seed: Some(7),
+        ..FitOptions::default()
+    };
+    let proposal = nalgebra::DMatrix::<f64>::zeros(7, ETA_KA_ROW);
+    let err = ferx_core::estimation::sir::run_sir_core(
+        &p.parsed.model,
+        &p.population,
+        params,
+        &etas,
+        &proposal,
+        0.0,
+        &opts,
+    )
+    .err()
+    .expect("a 7×5 proposal is refused");
+    assert!(
+        err.contains("Covariance matrix dimensions (7,5) don't match packed parameters (7)"),
+        "{err}"
+    );
+}
