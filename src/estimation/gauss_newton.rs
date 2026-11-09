@@ -59,6 +59,12 @@ pub(crate) fn gn_scale(x: &[f64], options: &FitOptions) -> Vec<f64> {
     }
 }
 
+/// Whether a pure Gauss–Newton loop spent its iteration budget (#2799): it ran (`maxiter >
+/// 0`) and no stop rule, collapse or cancel broke out of it before the range ended.
+pub(crate) fn gn_loop_budget_spent(maxiter: usize, exited_early: bool) -> bool {
+    maxiter > 0 && !exited_early
+}
+
 /// Run FOCE estimation using a Gauss-Newton optimizer.
 ///
 /// Returns the same `OuterResult` as `optimize_population`.
@@ -170,12 +176,18 @@ pub fn run_foce_gn(
     let mut unclamped_stalls: usize = 0;
     let mut raw_score_subjects: Vec<usize> = Vec::new();
 
+    // #2799: the loop ran out of `maxiter` iterations — no stop rule, collapse or cancel
+    // ended it. Every `break` below sets `exited_early`, so a run that falls off the end of
+    // the range spent its budget. `maxiter = 0` runs no iteration and spends nothing (an
+    // evaluation).
+    let mut exited_early = false;
     for iter in 1..=maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
                 eprintln!("  GN iter {:>3}: cancelled by user", iter);
             }
             warnings.push("cancelled by user".to_string());
+            exited_early = true;
             break;
         }
 
@@ -293,6 +305,7 @@ pub fn run_foce_gn(
                         iter
                     );
                 }
+                exited_early = true;
                 break;
             } else {
                 // Degenerate BHHH: near-zero quadratic improvement despite a
@@ -308,6 +321,7 @@ pub fn run_foce_gn(
                     warnings.push(
                         "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed".to_string(),
                     );
+                    exited_early = true;
                     break;
                 }
                 if verbose {
@@ -420,6 +434,7 @@ pub fn run_foce_gn(
                     eprintln!("  GN iter {:>3}: trust radius collapsed, stopping", iter);
                 }
                 warnings.push("Gauss-Newton: trust radius collapsed".to_string());
+                exited_early = true;
                 break;
             }
             if verbose {
@@ -493,10 +508,12 @@ pub fn run_foce_gn(
             if verbose {
                 eprintln!("  Converged: relative OFV change = {:.2e}", rel_change);
             }
+            exited_early = true;
             break;
         }
     }
 
+    let gn_budget_spent = gn_loop_budget_spent(maxiter, exited_early);
     if !converged {
         warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
         // #1006: at n_eta = 0 an unconverged pure-GN run is the state that
@@ -654,6 +671,7 @@ pub fn run_foce_gn(
             mcem_objective_trail: None,
             newton_decrement,
             optimizer_stop: None,
+            eval_budget_spent: gn_budget_spent,
         };
     }
 
@@ -844,6 +862,10 @@ pub fn run_foce_gn(
         mcem_objective_trail: None,
         newton_decrement,
         optimizer_stop: None,
+        // The hybrid's estimate is the FOCEI polish's or the GN phase's; the polish runs its
+        // own fixed 100-evaluation budget, not the user's `maxiter`, so neither half's budget
+        // is the fit's to report (#2799).
+        eval_budget_spent: false,
     }
 }
 
@@ -6296,6 +6318,48 @@ mod tests {
             "mixed-effects gn must not carry the #1006 warning: {:?}",
             res.warnings
         );
+    }
+
+    /// #2799 r1 #2: pure Gauss–Newton publishes `eval_budget_spent` when its loop runs off
+    /// the end of `maxiter`, and not when a stop rule ends it or no iteration runs. The
+    /// 2-iteration run cannot converge (the only normal convergence branch needs `iter > 3`);
+    /// the 200-iteration run on `one_cpt_iv` converges and breaks out (the pooled `n_eta = 0`
+    /// model never converges under pure GN, #1006, so it cannot be the twin). `maxiter = 0` is an
+    /// evaluation. Mutation: drop the `exited_early = true` on the relative-change stop (the
+    /// one this fixture converges through) → the converging run reads `true`; drop the
+    /// `maxiter > 0` conjunct → the evaluation reads `true`; fill `false` → the short run.
+    /// The cancel, collapse and zero-gradient breaks set the same flag and are not reached here.
+    #[test]
+    fn pure_gn_reports_a_spent_iteration_budget() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/one_cpt_iv.ferx"))
+                .expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("data loads");
+        let run = |maxiter: usize| {
+            let opts = FitOptions {
+                method: EstimationMethod::FoceGn,
+                outer_maxiter: maxiter,
+                run_covariance_step: false,
+                ..Default::default()
+            };
+            run_foce_gn(&model, &pop, &model.default_params, &opts)
+        };
+        let short = run(2);
+        assert!(!short.converged, "a 2-iteration GN budget cannot converge");
+        assert!(short.eval_budget_spent, "{:?}", short.warnings);
+        let long = run(200);
+        assert!(
+            long.converged,
+            "the straddle needs a converging twin: {:?}",
+            long.warnings
+        );
+        assert!(!long.eval_budget_spent);
+        assert!(!run(0).eval_budget_spent, "an evaluation spends no budget");
+        assert!(!gn_loop_budget_spent(0, false));
+        assert!(gn_loop_budget_spent(3, false));
+        assert!(!gn_loop_budget_spent(3, true));
     }
 
     /// `gn_hybrid` options with the FOCEI polish reached through `run_foce_gn`.

@@ -560,6 +560,7 @@ pub ferx_core::estimation::outer_optimizer::OuterResult::covariance_method: core
 pub ferx_core::estimation::outer_optimizer::OuterResult::covariance_wall_time_secs: f64
 pub ferx_core::estimation::outer_optimizer::OuterResult::ebe_convergence_warnings: u32
 pub ferx_core::estimation::outer_optimizer::OuterResult::eta_hats: alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
+pub ferx_core::estimation::outer_optimizer::OuterResult::eval_budget_spent: bool
 pub ferx_core::estimation::outer_optimizer::OuterResult::final_gradient: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::estimation::outer_optimizer::OuterResult::final_gradient_source: core::option::Option<alloc::string::String>
 pub ferx_core::estimation::outer_optimizer::OuterResult::h_matrices: alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>
@@ -2707,6 +2708,16 @@ pub ferx_core::types::EventType::IntervalCensored
 pub ferx_core::types::EventType::IntervalCensored::left: f64
 pub ferx_core::types::EventType::IntervalCensored::right: f64
 pub ferx_core::types::EventType::RightCensored
+#[non_exhaustive] pub enum ferx_core::types::FitStatus
+pub ferx_core::types::FitStatus::Converged
+pub ferx_core::types::FitStatus::ConvergedWithIssues
+pub ferx_core::types::FitStatus::ConvergedWithIssues::reasons: alloc::vec::Vec<ferx_core::StatusReason>
+pub ferx_core::types::FitStatus::NotConverged
+pub ferx_core::types::FitStatus::NotConverged::reasons: alloc::vec::Vec<ferx_core::StatusReason>
+impl ferx_core::FitStatus
+pub fn ferx_core::FitStatus::label(&self) -> &'static str
+pub fn ferx_core::FitStatus::reasons(&self) -> &[ferx_core::StatusReason]
+pub fn ferx_core::FitStatus::token(&self) -> &'static str
 pub enum ferx_core::types::GradientMethod
 pub ferx_core::types::GradientMethod::Ad
 pub ferx_core::types::GradientMethod::Auto
@@ -2883,6 +2894,15 @@ pub ferx_core::types::SirScale::Natural
 pub ferx_core::types::SirScale::Packed
 impl ferx_core::SirScale
 pub fn ferx_core::SirScale::label(self) -> &'static str
+#[non_exhaustive] pub enum ferx_core::types::StatusReason
+pub ferx_core::types::StatusReason::BudgetSpent
+pub ferx_core::types::StatusReason::CollapsedAtGuard
+pub ferx_core::types::StatusReason::CollapsedAtGuard::parameters: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::StatusReason::CovarianceFailed
+pub ferx_core::types::StatusReason::CriticalWarning(ferx_core::WarningCode)
+pub ferx_core::types::StatusReason::EvaluationOnly
+impl ferx_core::StatusReason
+pub fn ferx_core::StatusReason::label(&self) -> alloc::string::String
 pub enum ferx_core::types::ThetaTransform
 pub ferx_core::types::ThetaTransform::Identity
 pub ferx_core::types::ThetaTransform::Log
@@ -3440,6 +3460,8 @@ pub ferx_core::types::FitResult::error_model: ferx_core::ErrorModel
 pub ferx_core::types::FitResult::eta_log_transformed: alloc::vec::Vec<bool>
 pub ferx_core::types::FitResult::eta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::FitResult::eta_param_info: alloc::vec::Vec<ferx_core::EtaParamInfo>
+pub ferx_core::types::FitResult::eval_budget_spent: bool
+pub ferx_core::types::FitResult::evaluation_only: bool
 pub ferx_core::types::FitResult::exclusions: core::option::Option<ferx_core::ExclusionSummary>
 pub ferx_core::types::FitResult::ferx_version: alloc::string::String
 pub ferx_core::types::FitResult::final_gradient: core::option::Option<alloc::vec::Vec<f64>>
@@ -3560,6 +3582,8 @@ impl ferx_core::FitResult
 pub const ferx_core::FitResult::JSON_SCHEMA_VERSION: u32
 pub fn ferx_core::FitResult::from_json_str(text: &str) -> core::result::Result<ferx_core::FitResult, serde_json::error::Error>
 pub fn ferx_core::FitResult::to_json_value(&self) -> serde_json::value::Value
+impl ferx_core::FitResult
+pub fn ferx_core::FitResult::status(&self) -> ferx_core::FitStatus
 pub struct ferx_core::types::FremConfig
 pub ferx_core::types::FremConfig::covariate_sigma_index: usize
 pub ferx_core::types::FremConfig::fremtype_to_indices: std::collections::hash::map::HashMap<u16, (usize, usize)>
@@ -4153,6 +4177,16 @@ pub ferx_core::EventType::IntervalCensored
 pub ferx_core::EventType::IntervalCensored::left: f64
 pub ferx_core::EventType::IntervalCensored::right: f64
 pub ferx_core::EventType::RightCensored
+#[non_exhaustive] pub enum ferx_core::FitStatus
+pub ferx_core::FitStatus::Converged
+pub ferx_core::FitStatus::ConvergedWithIssues
+pub ferx_core::FitStatus::ConvergedWithIssues::reasons: alloc::vec::Vec<ferx_core::StatusReason>
+pub ferx_core::FitStatus::NotConverged
+pub ferx_core::FitStatus::NotConverged::reasons: alloc::vec::Vec<ferx_core::StatusReason>
+impl ferx_core::FitStatus
+pub fn ferx_core::FitStatus::label(&self) -> &'static str
+pub fn ferx_core::FitStatus::reasons(&self) -> &[ferx_core::StatusReason]
+pub fn ferx_core::FitStatus::token(&self) -> &'static str
 pub enum ferx_core::GradientMethod
 pub ferx_core::GradientMethod::Ad
 pub ferx_core::GradientMethod::Auto
@@ -4347,6 +4381,15 @@ pub ferx_core::SirScale::Natural
 pub ferx_core::SirScale::Packed
 impl ferx_core::SirScale
 pub fn ferx_core::SirScale::label(self) -> &'static str
+#[non_exhaustive] pub enum ferx_core::StatusReason
+pub ferx_core::StatusReason::BudgetSpent
+pub ferx_core::StatusReason::CollapsedAtGuard
+pub ferx_core::StatusReason::CollapsedAtGuard::parameters: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::StatusReason::CovarianceFailed
+pub ferx_core::StatusReason::CriticalWarning(ferx_core::WarningCode)
+pub ferx_core::StatusReason::EvaluationOnly
+impl ferx_core::StatusReason
+pub fn ferx_core::StatusReason::label(&self) -> alloc::string::String
 pub enum ferx_core::ThetaTransform
 pub ferx_core::ThetaTransform::Identity
 pub ferx_core::ThetaTransform::Log
@@ -5079,6 +5122,8 @@ pub ferx_core::FitResult::error_model: ferx_core::ErrorModel
 pub ferx_core::FitResult::eta_log_transformed: alloc::vec::Vec<bool>
 pub ferx_core::FitResult::eta_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::FitResult::eta_param_info: alloc::vec::Vec<ferx_core::EtaParamInfo>
+pub ferx_core::FitResult::eval_budget_spent: bool
+pub ferx_core::FitResult::evaluation_only: bool
 pub ferx_core::FitResult::exclusions: core::option::Option<ferx_core::ExclusionSummary>
 pub ferx_core::FitResult::ferx_version: alloc::string::String
 pub ferx_core::FitResult::final_gradient: core::option::Option<alloc::vec::Vec<f64>>
@@ -5199,6 +5244,8 @@ impl ferx_core::FitResult
 pub const ferx_core::FitResult::JSON_SCHEMA_VERSION: u32
 pub fn ferx_core::FitResult::from_json_str(text: &str) -> core::result::Result<ferx_core::FitResult, serde_json::error::Error>
 pub fn ferx_core::FitResult::to_json_value(&self) -> serde_json::value::Value
+impl ferx_core::FitResult
+pub fn ferx_core::FitResult::status(&self) -> ferx_core::FitStatus
 pub struct ferx_core::FremConfig
 pub ferx_core::FremConfig::covariate_sigma_index: usize
 pub ferx_core::FremConfig::fremtype_to_indices: std::collections::hash::map::HashMap<u16, (usize, usize)>

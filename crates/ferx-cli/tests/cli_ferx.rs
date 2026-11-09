@@ -195,6 +195,11 @@ fn fit_with_data_writes_outputs_and_bundle() {
             && stderr.contains("(packed coordinates, source: optimizer)\n"),
         "final gradient missing under Converged: {stderr}"
     );
+    // #2799: the `Status:` line follows the gradient line in `print_results` too.
+    assert!(
+        stderr.contains("(packed coordinates, source: optimizer)\nStatus:     "),
+        "status line missing after Final gradient: {stderr}"
+    );
 
     // Output files are named from the model stem and written to cwd (the tmp).
     for name in ["one_cpt_iv-fit.yaml", "one_cpt_iv-sdtab.csv", "run.fitrx"] {

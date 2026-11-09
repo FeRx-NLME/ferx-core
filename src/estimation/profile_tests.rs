@@ -7442,3 +7442,59 @@ fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
         profiled.warnings
     );
 }
+
+/// #2799: `profiled_budget_spent`, the one predicate behind the budget advice and
+/// `OuterResult::eval_budget_spent`: a budget spent before a leg, or a leg that ended
+/// `Settled` on `MaxEvalReached`, and nothing else — not a leg cap or an unneeded polish that
+/// happens to carry `MaxEvalReached`, not a tolerance stop. Mutation: drop either disjunct →
+/// its row.
+#[test]
+fn a_profiled_budget_is_spent_only_before_or_during_a_leg() {
+    use nlopt::{FailState as F, SuccessState as S};
+    let cases: [(&str, PolishEnd, NloptReturn, bool); 7] = [
+        (
+            "before a leg",
+            PolishEnd::BudgetSpent,
+            ok(S::XtolReached),
+            true,
+        ),
+        (
+            "during a leg",
+            PolishEnd::Settled,
+            ok(S::MaxEvalReached),
+            true,
+        ),
+        (
+            "settled on tolerance",
+            PolishEnd::Settled,
+            ok(S::FtolReached),
+            false,
+        ),
+        (
+            "settled on failure",
+            PolishEnd::Settled,
+            Err((F::Failure, 1.0)),
+            false,
+        ),
+        (
+            "leg cap on MaxEvalReached",
+            PolishEnd::LegCapReached { last_gain: 1.0 },
+            ok(S::MaxEvalReached),
+            false,
+        ),
+        (
+            "not needed",
+            PolishEnd::NotNeeded,
+            ok(S::MaxEvalReached),
+            false,
+        ),
+        ("skipped", PolishEnd::Skipped, ok(S::FtolReached), false),
+    ];
+    for (name, end, last, want) in cases {
+        assert_eq!(profiled_budget_spent(end, &last), want, "{name}");
+        // The warning's budget advice reads the same predicate.
+        let advises = profiled_verdict_warning(end, &last, false)
+            .is_some_and(|w| w.contains("spent its evaluation budget"));
+        assert_eq!(advises, want, "{name}: warning");
+    }
+}

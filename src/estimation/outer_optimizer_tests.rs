@@ -16479,3 +16479,124 @@ mod start_warm_rescore {
         assert_eq!(start.n_unconverged, 27, "{start:?}");
     }
 }
+
+/// #2799: `eval_budget_spent` is the budget state *after* a stagnation latch on the last
+/// permitted evaluation has been attributed to the guard. On `one_cpt_iv` / SLSQP with the
+/// #2462 verification leg off (the rule BOBYQA's polish keeps; under the verification a spent
+/// budget is final and never reset), a 106-evaluation budget ends inside the latch: NLopt
+/// returns `MaxEvalReached`, the plateau check takes the stop, and the fit is converged with
+/// `eval_budget_spent == false`. The guard-off twin at the same budget runs out on its own
+/// descent: `MaxEvalReached` and `true`. Measured window (macOS arm64): budgets 105–107 all
+/// straddle; 106 sits in its middle. Mutation: fill `eval_budget_spent` from
+/// `max_eval_reached` as it stood *before* the latch reset → the latched run reads `true`.
+#[test]
+fn eval_budget_spent_is_read_after_the_latch_reset() {
+    use crate::estimation::outer_optimizer::{
+        optimize_nlopt_once, OuterFdDeclineLog, EVAL_BUDGET_OVERRIDE, UNPROFILED_VERIFY_OFF,
+    };
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    const BUDGET: u32 = 106;
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let _off = WarmPredictorOff::new();
+    let run = |guard: bool| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Slsqp,
+            stagnation_guard: guard,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        UNPROFILED_VERIFY_OFF.with(|o| o.set(true));
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(Some(BUDGET)));
+        let out = optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            &[],
+        );
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+        UNPROFILED_VERIFY_OFF.with(|o| o.set(false));
+        out
+    };
+    let (on, on_outcome) = run(true);
+    let (off, off_outcome) = run(false);
+    // The straddle: both runs end on the budget, one inside the latch and one outside it.
+    assert!(on_outcome.stagnation_latched, "the guarded run must latch");
+    assert!(!off_outcome.stagnation_latched, "guard off never latches");
+    assert_eq!(on.optimizer_stop.as_deref(), Some("MaxEvalReached"));
+    assert_eq!(off.optimizer_stop.as_deref(), Some("MaxEvalReached"));
+    assert!(
+        !on.eval_budget_spent,
+        "a latch on the last permitted eval is the guard's stop, not the budget's"
+    );
+    assert!(on.converged, "the plateau check accepts the latched stop");
+    assert!(off.eval_budget_spent, "the unguarded run spent its budget");
+    assert!(!off.converged);
+}
+
+/// #2799 r1 #2: the internal BFGS (`optimizer = bfgs`) publishes `eval_budget_spent` when its
+/// loop runs off the end of `outer_maxiter`, and not when it converges. `one_cpt_iv` with a
+/// 2-iteration budget cannot reach either stop rule; a 500-iteration budget converges on it
+/// through the relative-change stop, and a 1-iteration budget with a tolerance every gradient
+/// meets converges through the gradient-norm stop on its last permitted iteration. Mutation:
+/// drop the `exited_early = true` on either convergence `break` → its run reads `true`;
+/// fill `false` → the short run.
+#[test]
+fn internal_bfgs_reports_a_spent_iteration_budget() {
+    use crate::estimation::outer_optimizer::{optimize_bfgs, OuterFdDeclineLog};
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let run_gtol = |maxiter: usize, gtol: f64| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bfgs,
+            outer_maxiter: maxiter,
+            outer_gtol: gtol,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        optimize_bfgs(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+        )
+    };
+    let run = |maxiter: usize| run_gtol(maxiter, FitOptions::default().outer_gtol);
+    let short = run(2);
+    assert!(!short.converged);
+    assert!(short.eval_budget_spent, "{:?}", short.warnings);
+    let long = run(500);
+    assert!(
+        long.converged,
+        "the straddle needs a converging twin: {:?}",
+        long.warnings
+    );
+    assert!(!long.eval_budget_spent);
+    // The gradient-norm stop on the last permitted iteration: a budget of 1 with a tolerance
+    // every gradient meets converges on iteration 1, inside the range, so it is not spent.
+    let gtol = run_gtol(1, 1e12);
+    assert!(gtol.converged, "{:?}", gtol.warnings);
+    assert_eq!(gtol.n_iterations, 1);
+    assert!(!gtol.eval_budget_spent);
+}
