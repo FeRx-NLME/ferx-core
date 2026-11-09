@@ -433,7 +433,14 @@ own because its inner solves run to `1e-10`. Over the A2 grid the legs cost 19% 
 in total and doubled the wall time (9.7 s to 20.7 s for 80 fits); on `warfarin_iov` they add 21
 evaluations to a 49-evaluation fit. The fit's reported OFV is still the final cold
 re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather than the +4e-8 the
-leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
+leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) do not take the leg.
+
+A `[mixture]` fit does (#2745), since `optimizer = auto` sends it to L-BFGS when the analytic outer
+gradient is in scope. It takes the first leg only, not the rounds below, whose cold solve and Newton
+step score a single population. Each evaluation of a mixture objective solves every class, so its
+leg costs that many times a single population's. Measured on macOS arm64, the leg gained 3.0e-8
+and 0 on `mixture_iv` and `mixture_iv_iov` (both stops were already the minimum) and 0 on the 120-subject
+`mixture_2cpt_oral_iov` example, where it added 12 evaluations to a 35-evaluation fit (449 s to 595 s).
 
 #### Rounds from outside the incumbent's modes
 
@@ -442,7 +449,7 @@ legs have settled, two more rounds of legs may run (#2645). Each opens from some
 not reach, and the fit keeps a round only if it ended lower; otherwise the incumbent and its verdict
 stand. Neither start wins everywhere, which is why the warm legs run first: a cold start left a
 subject unconverged on the `transit_flip_flop` ODE twin, and on one simulated dataset the cold
-round ended several OFV above the incumbent.
+round ended several OFV above the incumbent. A `[mixture]` fit runs neither round (#2745).
 
 - **From a cold solve's modes.** A cold solve at the verified point runs, and if any subject's `−2LL`
   term differs from the incumbent's by more than 1e-3, *in either direction*, a round starts at the

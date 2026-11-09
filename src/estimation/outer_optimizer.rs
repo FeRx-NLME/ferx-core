@@ -6244,16 +6244,11 @@ pub(crate) const UNPROFILED_VERIFY_GAIN: f64 = 3e-5;
 /// gradient optimizer (L-BFGS, SLSQP), whose `1e-12` stops are unreachable, so that its
 /// stops are bare `Failure`s the plateau rule accepts or tolerance stops met mid-descent.
 /// Not a quadrature objective, which has reachable stops
-/// (`gradient_run_has_reachable_stops`) and its own noise floor, and not a mixture, whose
-/// objective is a different solve.
-pub(crate) fn unprofiled_verify_applies(
-    algo: nlopt::Algorithm,
-    reachable_stops: bool,
-    is_mixture: bool,
-) -> bool {
-    matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp)
-        && !reachable_stops
-        && !is_mixture
+/// (`gradient_run_has_reachable_stops`) and its own noise floor. A mixture takes the
+/// first, incumbent-seeded leg (#2745) but not the [`LegStart`] passes, which score the
+/// single-population objective.
+pub(crate) fn unprofiled_verify_applies(algo: nlopt::Algorithm, reachable_stops: bool) -> bool {
+    matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp) && !reachable_stops
 }
 
 /// Does a stop need a verification leg before it may be called converged (#2462)? Every
@@ -6534,6 +6529,9 @@ pub(crate) struct PassState<'a> {
     pub(crate) stagnation_latched: &'a std::sync::atomic::AtomicBool,
     /// The incumbent's objective at the leg tolerance: what a kept pass changes.
     pub(crate) kept_best: &'a std::cell::Cell<Option<f64>>,
+    /// A mixture fit takes no pass (#2745): a pass's cold solve, Newton step and comparison of
+    /// modes are the single-population objective's and do not score a mixture's classes.
+    pub(crate) mixture: bool,
 }
 
 /// Runs each [`LegStart`] pass that applies after the verdict `warm`, and returns the verdict
@@ -6555,6 +6553,9 @@ pub(crate) fn drive_leg_passes<V>(
     let mut verdict = warm;
     let mut stop_is_free = Some(stop_is_free);
     for start in [LegStart::ColdModes, LegStart::NewtonStep] {
+        if state.mixture {
+            break;
+        }
         let probe_fired = state.basin_probe_fired.get();
         if !leg_pass_applies(start, end_of(&verdict), probe_fired, cancelled()) {
             continue;
@@ -7054,11 +7055,7 @@ fn optimize_nlopt_attempt_probed(
     // objectives at the user's tolerance; `leg_first` is the leg's first feasible
     // objective, for its gain.
     let verify_on = unprofiled_verify_enabled()
-        && unprofiled_verify_applies(
-            algo,
-            gradient_run_has_reachable_stops(options),
-            init_params.mixture.is_some(),
-        );
+        && unprofiled_verify_applies(algo, gradient_run_has_reachable_stops(options));
     let leg_options = FitOptions {
         inner_tol: options.inner_tol.min(UNPROFILED_VERIFY_INNER_TOL),
         ..options.clone()
@@ -8295,6 +8292,7 @@ fn optimize_nlopt_attempt_probed(
                 basin_probe_fired: &basin_probe_fired,
                 stagnation_latched: &stagnation_latched,
                 kept_best: &kept_best_seen,
+                mixture: init_params.mixture.is_some(),
             },
             || {
                 // Clean, as the final check reads it: the cold objective carries no penalty.
