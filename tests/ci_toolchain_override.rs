@@ -45,7 +45,7 @@ fn sets_toolchain(env: &Value) -> bool {
 
 #[test]
 fn every_toolchain_job_overrides_rust_toolchain_toml() {
-    let dir = root().join(".github/workflows");
+    let dir = root().join(".github/workflows/");
     let mut checked = Vec::new();
     let mut missing = Vec::new();
     for entry in std::fs::read_dir(&dir).expect("read .github/workflows") {
