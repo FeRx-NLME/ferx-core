@@ -1,17 +1,25 @@
-//! `tools/mbma_canakinumab_fetch.py`'s retry loop against a fake Europe PMC (#2818, #1938).
+//! `tools/mbma_canakinumab_fetch.py`'s retry loop against a fake Europe PMC (#2818, #1938,
+//! #2824).
 //!
 //! The nightly `slow-tests.yml` core leg fetches the canakinumab data with that script, and
-//! `FERX_REQUIRE_EXTERNAL_DATA=1` turns a failed fetch into a red night. Two failure modes
+//! `FERX_REQUIRE_EXTERNAL_DATA=1` turns a failed fetch into a red night. Three failure modes
 //! made that red for no reason: a payload that downloaded but hashed wrong exited at once
-//! with attempts 2–4 unused (#2818), and `urlopen(timeout=…)` bounded each socket read, not
-//! the download, so a trickling reply ran into the step's cap and no retry ever ran (#1938).
+//! with attempts 2–4 unused (#2818); `urlopen(timeout=…)` bounded each socket read, not
+//! the download, so a trickling reply ran into the step's cap and no retry ever ran (#1938);
+//! and every attempt fell inside the first ~90 s of the 720 s budget, so an outage of a few
+//! minutes used them all up (#2824). The attempts now spread over the budget (waits doubling
+//! from 15 s to a 120 s cap, none starting in the budget's last quarter).
 //!
 //! Nothing here touches the network. `tests/data/mbma_canakinumab/fetch_fake_server.py`
 //! starts an `http.server` on `127.0.0.1` that replies per scenario, loads the script as a
 //! module, points `URL` at it and the two pins at a synthetic `data_9studies.csv` (the real
 //! one may not be committed, #1913), gives the script a virtual clock whose `sleep` returns
 //! at once but spends deadline, and runs `main()`. A watchdog fails the harness at 25 s, so
-//! a fetch that ignores its deadline is a red test, not a hung binary.
+//! a fetch that ignores its deadline is a red test, not a hung binary. The harness scales
+//! the waits down to 1 s, 2 s, 4 s, … with no cap and no reserve, which keeps every test
+//! written before #2824 at its numbers; `--harness-production-timing` keeps the script's own
+//! constants (the virtual clock makes 720 s cost no wall time), and `--harness-reserve=F`
+//! switches the reserve on in the scaled timing.
 //!
 //! The verdict is decided on the **complete downloads' hashes** alone; a transport error or
 //! an unreadable payload says nothing about the file. One wrong hash on ≥ 2 downloads →
@@ -32,15 +40,25 @@
 //! | "D different wrong hashes mean the endpoint is flaky … do not re-pin." | `two_alternating_wrong_hashes_say_flaky` |
 //! | "Fewer than two complete downloads cannot tell … re-run the fetch." | the inconclusive tests |
 //! | "Stopped at the D s --deadline-seconds budget." | every deadline test |
+//! | "No attempt starts in the last R s of the D s … too little time for a full download." | `an_outage_longer_than_the_budget_spreads_the_attempts_over_it` |
 //! | "  attempt K: …" (one per attempt) | every failing-fetch test |
+//! | "… not a zip (N bytes, C): <the whole reply>" | `a_short_non_zip_reply_is_quoted_whole`, `a_garbled_payload_is_a_failed_attempt_not_a_hash` |
+//! | "… (cut at 1024 of N bytes)" | `a_long_non_zip_reply_is_cut_and_says_so` |
+//! | "deadline reached before the response headers" | `headers_that_never_end_stop_at_the_deadline`, `headers_arriving_after_the_deadline_stop_before_the_body` |
 //! | "--attempts: must be at least 1, got N" | `zero_attempts_is_a_usage_error` |
 //! | "--timeout and --deadline-seconds must be positive" | `a_zero_deadline_is_a_usage_error` |
 //! | "--from F: neither … nor … found in the zip (N entries)" | `from_a_zip_without_the_csv_names_what_is_missing` |
 //!
-//! Not covered, by design: a server that trickles its *headers* forever. `urlopen` reads
-//! them with the timeout set at open, so each header byte resets it; the step's 15-min cap
-//! is the bound there (`headers_arriving_after_the_deadline_stop_before_the_body` covers
-//! headers that end late, not ones that never end).
+//! The message's tail has one row per way the loop ends, each with a test: the deadline
+//! passed, also during the attempt at the last start → "Stopped at" (the deadline tests,
+//! `a_last_attempt_that_meets_the_deadline_reports_the_deadline`); the last start reached
+//! with attempts left → "No attempt starts in the last" (`an_outage_longer_than_…`);
+//! `--attempts` used up with time left → neither (`attempts_exhausted_with_time_left_…`,
+//! `transport_errors_on_every_attempt_are_inconclusive`); success → no message.
+//!
+//! The response headers are waited for only until the deadline: `urlopen` runs in a worker
+//! thread, so a server that trickles its headers forever ends at the deadline like any
+//! other phase (`headers_that_never_end_stop_at_the_deadline`).
 //!
 //! Not feature-gated: must run in the base `--features ci` job.
 
@@ -57,6 +75,8 @@ struct Run {
     message: String,
     exit: i32,
     hits: usize,
+    /// Virtual seconds since the fetch began, one per request.
+    hit_times: Vec<f64>,
     sleeps: usize,
     sleep_total: f64,
     elapsed: f64,
@@ -64,6 +84,7 @@ struct Run {
     pin: String,
     wrong_a: String,
     wrong_b: String,
+    errorbean_tail: String,
 }
 
 fn field<'a>(out: &'a str, key: &str) -> &'a str {
@@ -104,6 +125,11 @@ fn run(slot: &str, scenario: &str, args: &[&str]) -> Run {
         message,
         exit: field(&stdout, "EXIT").parse().unwrap(),
         hits: field(&stdout, "HITS").parse().unwrap(),
+        hit_times: field(&stdout, "HIT_TIMES")
+            .split(',')
+            .filter(|t| !t.is_empty())
+            .map(|t| t.parse().unwrap())
+            .collect(),
         sleeps: field(&stdout, "SLEEPS").parse().unwrap(),
         sleep_total: field(&stdout, "SLEEP_TOTAL").parse().unwrap(),
         elapsed: field(&stdout, "ELAPSED").parse().unwrap(),
@@ -111,6 +137,7 @@ fn run(slot: &str, scenario: &str, args: &[&str]) -> Run {
         pin: field(&stdout, "PIN").to_string(),
         wrong_a: field(&stdout, "WRONG_A").to_string(),
         wrong_b: field(&stdout, "WRONG_B").to_string(),
+        errorbean_tail: field(&stdout, "ERRORBEAN_TAIL").to_string(),
         log,
     }
 }
@@ -172,7 +199,8 @@ fn a_wrong_hash_then_the_right_one_succeeds_and_logs_the_wrong_hash() {
 
 /// A reply that is not a zip at all fails one attempt and is reported as unreadable, not
 /// hashed as if it were the bare CSV; the next attempt succeeds. The log line quotes the
-/// start of the reply, the only clue to what the endpoint sent instead.
+/// reply, the only clue to what the endpoint sent instead, and says the server sent no
+/// `Content-Type` (the fake's plain replies send none) instead of printing a raw `None`.
 #[test]
 fn a_garbled_payload_is_a_failed_attempt_not_a_hash() {
     let r = run("garbled", "garbled_then_right", &[]);
@@ -180,8 +208,9 @@ fn a_garbled_payload_is_a_failed_attempt_not_a_hash() {
     assert!(r.wrote_pinned, "{}", r.log);
     assert!(
         r.log.contains(
-            "attempt 1: unreadable payload: not a zip (27 bytes): b'<html>gateway hiccup</html>'"
-        ),
+            "attempt 1: unreadable payload: not a zip (27 bytes, no content-type): \
+             b'<html>gateway hiccup</html>'"
+        ) && !r.log.contains("None"),
         "{}",
         r.log
     );
@@ -317,6 +346,12 @@ fn transport_errors_on_every_attempt_are_inconclusive() {
     assert_eq!(r.hits, 3, "{}", r.log);
     assert_inconclusive(&r, 3);
     assert!(!r.message.contains("None"), "{}", r.message);
+    // `--attempts` used up with time left: neither stop sentence.
+    assert!(
+        !r.message.contains("Stopped") && !r.message.contains("No attempt starts"),
+        "{}",
+        r.message
+    );
     for k in 1..=3 {
         assert!(
             r.message
@@ -435,9 +470,10 @@ fn a_stall_after_a_trickle_stops_at_the_deadline() {
     );
 }
 
-/// A response whose headers arrive after the deadline is refused before the body is
-/// read: `urlopen` returns at ~2.5 s on a 2 s budget, and the body loop reports the
-/// deadline with 0 bytes received instead of handing a negative timeout to the socket.
+/// A response whose headers arrive after the deadline is refused at the deadline, before
+/// the body: `urlopen` would return at ~2.5 s on a 2 s budget, but its worker thread is
+/// abandoned at 2 s and the attempt names the headers it was waiting for (#2824). Before
+/// the worker thread it ended at 2.61 s with "mid-download (0 bytes received)".
 #[test]
 fn headers_arriving_after_the_deadline_stop_before_the_body() {
     let r = run(
@@ -455,8 +491,16 @@ fn headers_arriving_after_the_deadline_stop_before_the_body() {
     assert_eq!(r.exit, 1, "{}", r.log);
     assert!(!r.wrote_pinned, "{}", r.log);
     assert!(
+        // Measured 2.00–2.01 s; the bound is T6's, with ~1 s for a loaded CI runner. The
+        // message below, not this bound, is what tells the worker from the old 2.61 s path.
+        (1.9..3.0).contains(&r.elapsed),
+        "must stop at the 2 s deadline: {} s\n{}",
+        r.elapsed,
+        r.log
+    );
+    assert!(
         r.message.contains(
-            "  attempt 1: error: TimeoutError: deadline reached mid-download (0 bytes received)"
+            "  attempt 1: error: TimeoutError: deadline reached before the response headers"
         ) && r
             .message
             .contains("Stopped at the 2 s --deadline-seconds budget."),
@@ -555,6 +599,209 @@ fn a_deadline_on_the_last_attempt_is_reported() {
         "{}",
         r.message
     );
+}
+
+/// The attempt starts at the script's own constants on a 720 s budget, when every failure
+/// comes back at once: waits of 15, 30, 60, then 120 s (the cap), the last one cut short to
+/// end at `latest_start` = 720 − 0.25 · 720 = 540 s.
+const PRODUCTION_STARTS: [f64; 8] = [0.0, 15.0, 45.0, 105.0, 225.0, 345.0, 465.0, 540.0];
+
+/// `r.hit_times` matches `want`, each start within 1 s after its target (the attempts' own
+/// wall time).
+fn assert_starts(r: &Run, want: &[f64]) {
+    assert!(
+        r.hit_times.iter().all(|t| t.is_finite()),
+        "{:?}\n{}",
+        r.hit_times,
+        r.log
+    );
+    assert!(
+        r.hit_times.len() == want.len()
+            && r.hit_times
+                .iter()
+                .zip(want)
+                .all(|(got, w)| (*w..w + 1.0).contains(got)),
+        "attempt starts {:?}, want {want:?}\n{}",
+        r.hit_times,
+        r.log
+    );
+}
+
+/// #2824's acceptance, item 1: the endpoint answers with the errorBean for the first 480 s
+/// of the 720 s budget, then recovers. The spread puts an attempt at 540 s, which succeeds.
+/// Under the old schedule (linear 10 s waits, 4 attempts) every attempt fell in the first
+/// minute and the fetch failed.
+#[test]
+fn an_outage_for_most_of_the_budget_then_recovery_succeeds() {
+    let r = run(
+        "outage-480",
+        "errorbean_until_480",
+        &["--harness-production-timing"],
+    );
+    assert_eq!(r.exit, 0, "{}", r.log);
+    assert!(r.wrote_pinned, "{}", r.log);
+    assert_eq!(r.hits, 8, "{}", r.log);
+    assert_starts(&r, &PRODUCTION_STARTS);
+}
+
+/// An outage longer than the budget: 8 attempts spread over its first 75%, the last at
+/// `latest_start` = 540 s, 7 waits between them and none after. The loop then stops with
+/// attempts left (8 of 10) and time left, and the message names the reserve, not the
+/// deadline.
+#[test]
+fn an_outage_longer_than_the_budget_spreads_the_attempts_over_it() {
+    let r = run(
+        "outage-forever",
+        "errorbean_until_100000",
+        &["--harness-production-timing"],
+    );
+    let m = &r.message;
+    assert_eq!(r.exit, 1, "{}", r.log);
+    assert_eq!(r.hits, 8, "{}", r.log);
+    assert_starts(&r, &PRODUCTION_STARTS);
+    assert_eq!(r.sleeps, 7, "{}", r.log);
+    assert!(
+        m.contains(
+            "No attempt starts in the last 180 s of the 720 s --deadline-seconds budget: \
+             too little time for a full download."
+        ),
+        "{m}"
+    );
+    assert!(!m.contains("Stopped at"), "{m}");
+}
+
+/// The same 8 starts with `--attempts 8`: the loop ends at `latest_start` because the
+/// attempts ran out, not because of the reserve, so neither stop sentence is printed.
+#[test]
+fn attempts_exhausted_with_time_left_names_no_stop() {
+    let r = run(
+        "outage-attempts-8",
+        "errorbean_until_100000",
+        &["--harness-production-timing", "--attempts", "8"],
+    );
+    let m = &r.message;
+    assert_eq!(r.exit, 1, "{}", r.log);
+    assert_eq!(r.hits, 8, "{}", r.log);
+    assert_starts(&r, &PRODUCTION_STARTS);
+    assert!(
+        !m.contains("No attempt starts") && !m.contains("Stopped at"),
+        "{m}"
+    );
+}
+
+/// When the attempt at `latest_start` runs into the deadline, the deadline is what the
+/// message names. Scaled timing with the reserve on: a 4 s budget keeps 1 s, so the
+/// attempts start at 0, 1 and 3 s (= `latest_start`), and the third trickles to 4 s.
+#[test]
+fn a_last_attempt_that_meets_the_deadline_reports_the_deadline() {
+    let r = run(
+        "reserve-then-deadline",
+        "same_wrong_then_trickle",
+        &[
+            "--harness-reserve=0.25",
+            "--deadline-seconds",
+            "4",
+            "--timeout",
+            "30",
+        ],
+    );
+    let m = &r.message;
+    assert_eq!(r.exit, 1, "{}", r.log);
+    assert_starts(&r, &[0.0, 1.0, 3.0]);
+    assert!(
+        m.contains("Stopped at the 4 s --deadline-seconds budget.")
+            && !m.contains("No attempt starts"),
+        "{m}"
+    );
+}
+
+/// The 292-byte reply of #2824's red nights is quoted whole, with its `Content-Type`: its
+/// last 60 bytes, where an errorBean's `errMsg` ends, are in the log.
+#[test]
+fn a_short_non_zip_reply_is_quoted_whole() {
+    let r = run("errorbean", "errorbean_then_right", &[]);
+    assert_eq!(r.exit, 0, "{}", r.log);
+    assert!(r.wrote_pinned, "{}", r.log);
+    assert_eq!(r.errorbean_tail.len(), 60, "{}", r.log);
+    assert!(
+        r.log
+            .contains("attempt 1: unreadable payload: not a zip (292 bytes, application/xml): ")
+            && r.log.contains(&format!("{}'", r.errorbean_tail))
+            && !r.log.contains("cut at"),
+        "{}",
+        r.log
+    );
+}
+
+/// A reply longer than 1024 bytes is cut there, and the line says so.
+#[test]
+fn a_long_non_zip_reply_is_cut_and_says_so() {
+    let r = run("long-html", "long_html_then_right", &[]);
+    assert_eq!(r.exit, 0, "{}", r.log);
+    assert!(
+        r.log
+            .contains("attempt 1: unreadable payload: not a zip (2048 bytes, text/html): ")
+            && r.log.contains("EARLY-MARKER")
+            && r.log.contains("' (cut at 1024 of 2048 bytes)")
+            && !r.log.contains("LATE-MARKER"),
+        "{}",
+        r.log
+    );
+}
+
+/// #2824's acceptance, item 2: a server that trickles its headers one byte every 0.1 s and
+/// never finishes. Each byte resets a socket timeout, so before the worker thread nothing
+/// but the step's cap ended it (here: the harness's 25 s watchdog). Measured 2.00–2.01 s on
+/// Python 3.9 and 3.12; the bound leaves ~1 s for a loaded CI runner.
+#[test]
+fn headers_that_never_end_stop_at_the_deadline() {
+    let r = run(
+        "headers-forever",
+        "headers_forever",
+        &[
+            "--attempts",
+            "1",
+            "--deadline-seconds",
+            "2",
+            "--timeout",
+            "30",
+        ],
+    );
+    let m = &r.message;
+    assert_eq!(r.exit, 1, "{}", r.log);
+    assert!(!r.log.contains("WATCHDOG"), "{}", r.log);
+    assert!(
+        (1.9..3.0).contains(&r.elapsed),
+        "must stop at the 2 s deadline: {} s\n{}",
+        r.elapsed,
+        r.log
+    );
+    assert!(
+        m.contains(
+            "  attempt 1: error: TimeoutError: deadline reached before the response headers"
+        ) && m.contains("Stopped at the 2 s --deadline-seconds budget."),
+        "{m}"
+    );
+}
+
+/// The twin across the deadline: headers that take ~2.5 s but end inside a 5 s budget are
+/// waited for, and the download succeeds.
+#[test]
+fn headers_that_end_inside_the_budget_still_succeed() {
+    let r = run(
+        "slow-headers-in-budget",
+        "slow_headers",
+        &[
+            "--attempts",
+            "1",
+            "--deadline-seconds",
+            "5",
+            "--timeout",
+            "30",
+        ],
+    );
+    assert_eq!(r.exit, 0, "{}", r.log);
+    assert!(r.wrote_pinned, "{}", r.log);
 }
 
 /// `--attempts` below 1 is a usage error, not a report that "no attempt of 0" succeeded.
