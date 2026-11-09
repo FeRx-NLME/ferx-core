@@ -378,9 +378,10 @@ from the K-fold mixture marginal at the SAEM optimum, exactly as for FOCEI.
 Per-class **σ** overrides (`sigma(k)`) are the one piece not yet re-estimated
 under SAEM — they are held at their initial values (with a warning), and every
 class-`k` subject is *scored* under that held σ, so the free base σ is estimated
-only from the classes that actually share it. Being held, the overrides report a
-standard error of 0, as `FIX`ed parameters do; route the model to FOCEI if they
-must be fit. HMC and the conditional-distribution pass are disabled for a mixture
+only from the classes that actually share it. Being held, the overrides are reported
+as fixed, as `FIX`ed parameters are: `[FIX]` with SE `---` in the console and the
+parameter table, `fixed: true` in the YAML (#2833). Route the model to FOCEI if
+they must be fit. HMC and the conditional-distribution pass are disabled for a mixture
 (they are class-unaware); the MH E-step is used.
 
 Two further SAEM-specific rules follow from the separated M-step:
