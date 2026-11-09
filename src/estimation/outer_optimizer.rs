@@ -6589,6 +6589,8 @@ pub(crate) fn drive_leg_passes<V>(
         if !leg_pass_applies(start, end_of(&verdict), probe_fired, cancelled()) {
             continue;
         }
+        #[cfg(test)]
+        LEG_PASSES_APPLIED.with(|c| c.set(c.get() + 1));
         if stop_is_free.take().is_some_and(|free| !free()) {
             break;
         }
@@ -6661,6 +6663,9 @@ thread_local! {
     /// The #2645 passes turned off on this thread, for the tests' straddles.
     pub(crate) static LEG_PASSES_OFF: std::cell::Cell<&'static [LegStart]> =
         const { std::cell::Cell::new(&[]) };
+    /// [`LegStart`] passes `drive_leg_passes` reached on this thread, for the tests (#2745).
+    pub(crate) static LEG_PASSES_APPLIED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
     /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };

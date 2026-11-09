@@ -16573,10 +16573,13 @@ const MIXTURE_FIXTURES: [(&str, &str, Option<&str>); 2] = [
 #[test]
 fn a_mixture_stop_gets_one_verification_leg() {
     for (model, csv, occ) in MIXTURE_FIXTURES {
+        LEG_PASSES_APPLIED.with(|c| c.set(0));
         let (on, legs) = mixture_fit(model, csv, occ, true);
+        let passes = LEG_PASSES_APPLIED.with(|c| c.get());
         let (off, none) = mixture_fit(model, csv, occ, false);
         assert!(none.is_empty(), "the switch turns the leg off: {none:?}");
         assert_eq!(legs.len(), 1, "{csv}: one leg, no pass: {legs:?}");
+        assert_eq!(passes, 0, "{csv}: a mixture fit reaches no LegStart pass");
         let first = legs[0]
             .first
             .expect("the leg's first evaluation is feasible");
@@ -16607,6 +16610,36 @@ fn a_mixture_stop_gets_one_verification_leg() {
             off.ofv
         );
     }
+}
+
+/// #2745: the other side of the pass gate at fit level. The same data fitted as one population
+/// (no `[mixture]`) reaches the `LegStart` passes, so the zero counted for the mixture fits above
+/// is the `mixture` flag's doing and not a stop that never settles. Without this, replacing
+/// `init_params.mixture.is_some()` at the `PassState` call site by `false` left every test green.
+#[test]
+fn the_single_population_twin_of_a_mixture_fixture_reaches_the_leg_passes() {
+    const TWIN: &str = r"
+[parameters]
+  theta TVCL(1.8, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    LEG_PASSES_APPLIED.with(|c| c.set(0));
+    let (fit, legs) = mixture_fit(TWIN, "tests/nonmem/mixture_iv.csv", None, true);
+    let passes = LEG_PASSES_APPLIED.with(|c| c.get());
+    assert!(fit.ofv.is_finite(), "ofv {}", fit.ofv);
+    assert!(passes > 0, "a single population takes passes: {legs:?}");
 }
 
 /// #2745, the straddle: a mixture stop the leg does not settle is not reported converged,
