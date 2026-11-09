@@ -99,6 +99,8 @@ Re-measured after #1722 (FOCE EBEs with the residual variance held at $f(\eta{=}
 The proposal is the fit's asymptotic covariance matrix, and that matrix is often
 degenerate in ways SIR has to handle explicitly.
 
+#### What SIR never samples
+
 **`FIX`ed parameters are never sampled.** A fixed parameter has no uncertainty:
 its row/column in the covariance matrix is exactly zero and its packed bounds
 are pinned (`lower == upper`). SIR restricts the proposal to the *free* block,
@@ -107,6 +109,18 @@ the Student-t dimensionality, so the importance weights stay consistent. This
 matters for model-based meta-analysis, where fixing the residual variance
 (`sigma ADD_ERR ~ 1.0 (variance) FIX`) *is* the inverse-variance weighting
 scheme and cannot be dropped.
+
+**A collapse the covariance step held is not sampled either.** When a variance
+collapses onto ferx's internal lower guard and the covariance step holds it there
+(see [Parameterization](parameterization.qmd), #2797), its row of the matrix is
+zero, exactly as for a `FIX` parameter, and SIR treats it as one (#2816): the same
+draws, CIs, effective sample size and `SIR:` notes as the same fit with that
+variance `FIX`, under every `covariance_method`, and through `run_sir` too. The
+rank-deficiency note does not list it. A collapse the step did not hold (after a
+floored `R`, or on a non-PD fallback proposal) has no zero row and is sampled as
+before.
+
+#### Floored and shrunk directions
 
 **Directions the data do not identify are floored or shrunk, and reported.**
 Two things can go wrong with the free block itself:
