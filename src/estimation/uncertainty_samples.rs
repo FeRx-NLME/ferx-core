@@ -781,9 +781,14 @@ fn draw_asymptotic(
     }
     // A collapse on the internal guard the step held (#2797) has the same zero row and is
     // held the same way: a draw off its rail would be a draw from the floor's 1/curvature.
+    // So is an entry whose reason this build does not know (#2817, a bundle from a later
+    // ferx): `step_held` reads only the matrix, so a zero row is held whatever the reason,
+    // and the draws agree with the displays, which already show its SE as N/A.
     for h in &fit_result.held_at_bound {
-        if h.reason == crate::types::HeldReason::CollapsedAtGuard
-            && crate::api::step_held(Some(cov), h.packed_index)
+        if matches!(
+            h.reason,
+            crate::types::HeldReason::CollapsedAtGuard | crate::types::HeldReason::Unknown
+        ) && crate::api::step_held(Some(cov), h.packed_index)
         {
             if let Some(f) = fixed_mask.get_mut(h.packed_index) {
                 *f = true;
@@ -1100,6 +1105,8 @@ mod tests {
             kappa_is_diagonal: None,
             newton_decrement: None,
             optimizer_stop: None,
+            eval_budget_spent: false,
+            evaluation_only: false,
         }
     }
 
@@ -1481,7 +1488,19 @@ mod tests {
     /// control half: same matrix, empty `held_at_bound`), so the pin is the mask's work.
     #[test]
     fn asymptotic_draws_hold_a_collapse_the_step_held() {
-        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        assert_asymptotic_draws_hold(crate::types::HeldReason::CollapsedAtGuard);
+    }
+
+    /// #2817: an entry whose reason this build does not know (read from a later ferx's
+    /// bundle) is held the same way when the step held its row, so the draws agree with
+    /// the displays (SE `N/A`). Without the hold the σ scatters, as the control half shows.
+    #[test]
+    fn asymptotic_draws_hold_an_unknown_reason_the_step_held() {
+        assert_asymptotic_draws_hold(crate::types::HeldReason::Unknown);
+    }
+
+    fn assert_asymptotic_draws_hold(reason: crate::types::HeldReason) {
+        use crate::types::{HeldAtBound, ParameterKind};
         let template = tiny_template();
         let n_packed = crate::estimation::parameterization::packed_len(&template);
         let p = crate::estimation::parameterization::packed_segments(&template).sigma_start();
@@ -1505,7 +1524,7 @@ mod tests {
             kind: ParameterKind::Sigma,
             index: 0,
             packed_index: p,
-            reason: HeldReason::CollapsedAtGuard,
+            reason,
             class: None,
         }];
         let s_hat = template.sigma.values[0];
@@ -1513,7 +1532,7 @@ mod tests {
         for s in &pinned {
             assert!(
                 s.is_finite() && (s - s_hat).abs() < 1e-12,
-                "held σ drifted: {s}"
+                "held σ ({reason:?}) drifted: {s}"
             );
         }
         let scattered = sigma_draws(&free);

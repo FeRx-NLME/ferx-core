@@ -7744,7 +7744,15 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     // rewrite instead of a one-line edit. Scoped to this statement rather than
     // the whole fn so a future duplicated arm in another chain still lints.
     #[allow(clippy::if_same_then_else)]
-    let (severity, category) = if lower.contains("w_vi_bad_basin") {
+    let (severity, category) = if lower.starts_with("multi-start:") {
+        // #2799: the multi-start notes `fit()` appends to the returned run — "k of n starts
+        // failed: <errors>" and "best result from start k/n". A prefix-token arm ahead of
+        // *every* other arm, because the failure note interpolates the sibling starts' own
+        // error text: a "did not converge" or covariance-failure phrase in it would land on a
+        // Critical arm and mark a healthy returned fit as failing. The note is about runs that
+        // were not returned, so it is informational.
+        (WarningSeverity::Info, WarningCode::MultiStart)
+    } else if lower.contains("w_vi_bad_basin") {
         // #1098: VI's final bound-quality check demotes `converged`; keep this
         // distinct from a budget-limited convergence failure so programmatic
         // consumers can choose new starts or a chained initializer.
@@ -8310,6 +8318,68 @@ pub enum HeldReason {
     /// that replaces an undeclared lower bound. The same coordinates the
     /// `parameter_at_runaway_guard` warning calls a collapse.
     CollapsedAtGuard,
+    /// A reason this build does not know (#2817): read from a `.fitrx` bundle or
+    /// `FitResult` JSON written by a later ferx that added one. ferx never produces it.
+    /// The entry still counts as held, so its SE displays as not available; it is
+    /// neither a profiled bound nor a guard collapse, so nothing that acts on either
+    /// treats it as one. Written back as `"unknown"` — the original token is not kept.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Reads a `held_at_bound` list leniently (#2817): an entry whose `kind` this build does
+/// not know (a parameter family a later ferx added) is dropped instead of failing the
+/// whole `.fitrx` bundle or `FitResult` JSON. Nothing could use such an entry: there is
+/// no family to display its SE under, and a build that cannot pack the family cannot
+/// draw from or hold it. An unknown `reason` is not dropped. It reads as
+/// [`HeldReason::Unknown`] and stays held. `ParameterKind` itself is left strict, since
+/// priors and every per-family `match` read it.
+pub(crate) fn held_at_bound_lenient<'de, D>(d: D) -> Result<Vec<HeldAtBound>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    enum KindRead {
+        Theta,
+        Omega,
+        Sigma,
+        Kappa,
+        #[serde(other)]
+        Unknown,
+    }
+    #[derive(serde::Deserialize)]
+    struct HeldRead {
+        name: String,
+        kind: KindRead,
+        index: usize,
+        packed_index: usize,
+        reason: HeldReason,
+        // #2809: the `[mixture]` class must survive this read, or an override entry
+        // loads as its base parameter.
+        #[serde(default)]
+        class: Option<usize>,
+    }
+    let rows: Vec<HeldRead> = serde::Deserialize::deserialize(d)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|h| {
+            let kind = match h.kind {
+                KindRead::Theta => ParameterKind::Theta,
+                KindRead::Omega => ParameterKind::Omega,
+                KindRead::Sigma => ParameterKind::Sigma,
+                KindRead::Kappa => ParameterKind::Kappa,
+                KindRead::Unknown => return None,
+            };
+            Some(HeldAtBound {
+                name: h.name,
+                kind,
+                index: h.index,
+                packed_index: h.packed_index,
+                reason: h.reason,
+                class: h.class,
+            })
+        })
+        .collect())
 }
 
 impl HeldReason {
@@ -8318,6 +8388,7 @@ impl HeldReason {
         match self {
             HeldReason::ProfiledBound => "profiled_bound",
             HeldReason::CollapsedAtGuard => "collapsed_at_guard",
+            HeldReason::Unknown => "unknown",
         }
     }
 }
@@ -8847,6 +8918,27 @@ pub struct FitResult {
     /// a non-stationary point is not (#2785). Kept so a reader can see which.
     #[serde(default)]
     pub optimizer_stop: Option<String>,
+    /// Whether the outer optimizer spent its evaluation budget (`maxiter`) on the leg that
+    /// produced the reported estimates (#2799) — the typed form of the "increase maxiter"
+    /// warnings. Read from the optimizer's final state, after a stagnation latch that
+    /// landed on the last permitted evaluation has been attributed to the guard rather than
+    /// the budget, and after a polish that spent it (which [`Self::optimizer_stop`], taken
+    /// from the primary leg, does not see). Set by every outer optimizer with a `maxiter`
+    /// budget: NLopt (profiled or not), the trust region (`MaxItersReached`), pure
+    /// Gauss–Newton and `optimizer = bfgs` (a loop that ran out of iterations). `false` for
+    /// SAEM, IMP, IMPMAP, Bayes and VI, which report their own iteration caps in warnings,
+    /// and for the Gauss–Newton hybrid, whose polish runs a fixed budget rather than the
+    /// user's. Read by [`Self::status`].
+    #[serde(default)]
+    pub eval_budget_spent: bool,
+    /// Whether no stage of the run estimated: it scored the given values by request
+    /// (#2799). That is `maxiter = 0` on an estimator that reads it as NONMEM's
+    /// `MAXEVAL=0` (FOCE, FOCEI, Laplace/AGQ, pure Gauss–Newton, profiled and mixture fits),
+    /// or a standalone `imp_eval_only` / `agq_eval_only` chain. Not `maxiter = 0` alone:
+    /// SAEM, IMP, IMPMAP, Bayes, VI and the Gauss–Newton hybrid's polish search
+    /// regardless of it. Read by [`Self::status`].
+    #[serde(default)]
+    pub evaluation_only: bool,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
@@ -9093,7 +9185,14 @@ pub struct FitResult {
     /// coordinate's stored `se_*` is `0.0`, as a FIX parameter's is (never `NaN`, which
     /// would break every consumer that sums or folds SEs). Display reads this list, not the
     /// number.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Read leniently: an entry of a parameter family this build does not know is
+    /// dropped on load rather than failing the whole read (#2817).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "held_at_bound_lenient"
+    )]
     pub held_at_bound: Vec<HeldAtBound>,
 }
 
@@ -9152,6 +9251,12 @@ impl FitResult {
                 "schema_version".to_string(),
                 serde_json::json!(Self::JSON_SCHEMA_VERSION),
             );
+            // #2799: the derived usability verdict, as `schema_version` is derived: there is no
+            // stored field, so a reader gets it from the same facts the result carries.
+            map.insert(
+                "status".to_string(),
+                serde_json::to_value(self.status()).expect("FitStatus is serializable"),
+            );
         }
         v
     }
@@ -9164,7 +9269,8 @@ impl FitResult {
     /// `NaN` (an `Option<f64>` reads it as `None`). A plain
     /// `serde_json::from_str::<FitResult>` refuses such a file — any fit whose
     /// diagnostics came out undefined, e.g. `dw_statistic` when no subject has
-    /// two IWRES values. The `schema_version` key is ignored.
+    /// two IWRES values. The `schema_version` and `status` keys are ignored (the status is
+    /// recomputed from the fields by [`Self::status`]).
     pub fn from_json_str(text: &str) -> Result<FitResult, serde_json::Error> {
         let value: serde_json::Value = serde_json::from_str(text)?;
         serde::Deserialize::deserialize(crate::io::serde_nan::NullAsNan(value))
@@ -11396,6 +11502,30 @@ impl FitOptions {
         self.method_chain().iter().all(|m| eval_only.contains(m))
     }
 
+    /// Whether no stage of the run estimates (#2799), the source of
+    /// [`FitResult::evaluation_only`]: every stage is either a standalone evaluator
+    /// ([`Self::evaluation_only_chain`]'s `imp_eval_only` / `agq_eval_only`) or one that reads
+    /// `outer_maxiter = 0` as NONMEM `MAXEVAL=0`. Those are the stages `fit()` routes through
+    /// `optimize_population` (FOCE, FOCEI, Laplace — profiled and mixture fits included, and
+    /// the trust region beneath them), which short-circuits to `evaluate_at_initial_params`,
+    /// and pure Gauss–Newton, whose loop runs `1..=maxiter`. Not SAEM, IMP, IMPMAP, Bayes or
+    /// VI, which carry their own iteration counts, nor the Gauss–Newton hybrid, whose FOCEI
+    /// polish runs a fixed 100-evaluation budget whatever `maxiter` says.
+    pub(crate) fn evaluation_only_run(&self) -> bool {
+        let eval_only = self.eval_only_methods();
+        self.method_chain().iter().all(|m| {
+            eval_only.contains(m)
+                || (self.outer_maxiter == 0
+                    && matches!(
+                        m,
+                        EstimationMethod::Foce
+                            | EstimationMethod::FoceI
+                            | EstimationMethod::FoceGn
+                            | EstimationMethod::Laplace
+                    ))
+        })
+    }
+
     /// The chain stage that would run the post-fit covariance step: the last stage that
     /// estimates, ignoring a trailing run of evaluation-only stages (#615).
     ///
@@ -12120,6 +12250,11 @@ pub struct ParsedModel {
     /// bindings still in hand instead of silently dropping them.
     pub bindings: crate::parser::model_parser::ParseBindings,
 }
+
+// #2799: the usability verdict beside `converged`, in its own file.
+#[path = "types_fit_status.rs"]
+mod fit_status;
+pub use fit_status::{FitStatus, StatusReason};
 
 /// Factories that build minimal `CompiledModel` instances for unit tests.
 /// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests

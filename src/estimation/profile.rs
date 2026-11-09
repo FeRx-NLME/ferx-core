@@ -2493,6 +2493,16 @@ pub(crate) fn profiled_converged(
     }
 }
 
+/// Whether a profiled fit's outer optimizer spent its evaluation budget (#2799): the loop
+/// ran out before a leg (`BudgetSpent`), or a leg ended on `MaxEvalReached`. The one
+/// predicate behind both [`profiled_verdict_warning`]'s budget advice and
+/// `OuterResult::eval_budget_spent`.
+pub(crate) fn profiled_budget_spent(end: PolishEnd, last: &NloptReturn) -> bool {
+    matches!(end, PolishEnd::BudgetSpent)
+        || (matches!(end, PolishEnd::Settled)
+            && matches!(last, Ok((nlopt::SuccessState::MaxEvalReached, _))))
+}
+
 /// The warning a profiled fit gets for how its verification ended, or `None` when it is
 /// converged. A function rather than inline `format!`s so each message is tested where
 /// it is written.
@@ -2526,10 +2536,7 @@ pub(crate) fn profiled_verdict_warning(
              verification legs (the last lowered the objective by {last_gain:.3e}), so \
              it is not reported as converged; re-run from these estimates."
         )),
-        PolishEnd::BudgetSpent => Some(budget()),
-        PolishEnd::Settled if matches!(last, Ok((nlopt::SuccessState::MaxEvalReached, _))) => {
-            Some(budget())
-        }
+        _ if profiled_budget_spent(end, last) => Some(budget()),
         _ if !converged => {
             let status = match last {
                 Ok((s, _)) => format!("{s:?}"),
@@ -2913,6 +2920,9 @@ pub(crate) fn optimize_profiled(
     };
 
     let mut converged = false;
+    // #2799: whether the profiled outer optimizer spent its evaluation budget, from the same
+    // predicate as its "increase maxiter" warning.
+    let mut eval_budget_spent = false;
     // The start verdict published as `left_init` / `stationary_start` (#2506). Set only
     // when the profiled levels are the only free coordinates (#2591).
     let mut start_verdict: (Option<bool>, bool) = (None, false);
@@ -3075,6 +3085,7 @@ pub(crate) fn optimize_profiled(
             },
         );
         converged = profiled_converged(algo, end, &result, cancelled(), left_init());
+        eval_budget_spent = profiled_budget_spent(end, &result);
         warnings.extend(profiled_verdict_warning(end, &result, converged));
     } else {
         // Evaluation only (`maxiter = 0`, NONMEM `MAXEVAL=0`), or nothing to search: the
@@ -3193,6 +3204,7 @@ pub(crate) fn optimize_profiled(
         mcem_objective_trail: None,
         newton_decrement: None,
         optimizer_stop: None,
+        eval_budget_spent,
     }
 }
 
@@ -3379,6 +3391,7 @@ fn failed_result(
         mcem_objective_trail: None,
         newton_decrement: None,
         optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 
