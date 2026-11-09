@@ -85,6 +85,10 @@ fn the_report_gate_turns_off_on_each_condition() {
         &every_other
     ));
 
+    let (mut fd, _, _) = analytic_and_declining();
+    fd.gradient_method = GradientMethod::Fd;
+    assert!(!gate(Optimizer::NloptLbfgs, false, &fd, template, &opts));
+
     let agq = FitOptions {
         method: EstimationMethod::Laplace,
         ..focei()
@@ -234,6 +238,63 @@ fn a_coordinate_pinned_at_its_bound_is_not_measured() {
         norm([0.5, 0.5, 1.0], [1.0, 1.0, 1.0]),
         13.0,
         "leaving the upper"
+    );
+}
+
+/// The held subjects are the declines the assembly's salvage left on the held-EBE
+/// gradient, under the same predicate the assembly uses: a numerical decline is held, a
+/// structural one is not, nor any under a reconverging log, nor a non-Gaussian subject
+/// with records (#1778). Mutations that redden it: filtering on structural declines alone
+/// (the TTE case), or dropping the filter (every case but the first).
+#[cfg(feature = "survival")]
+#[test]
+fn only_the_held_ebe_salvage_counts_as_held() {
+    let (model, analytic, _) = analytic_and_declining();
+    let pop = mk_pop(vec![analytic]);
+    let numerical = OuterFdDeclineLog::new(1);
+    numerical.record(0);
+    assert_eq!(
+        held_subjects(&model, &pop, &numerical),
+        vec![0],
+        "numerical"
+    );
+    let structural = OuterFdDeclineLog::new(1);
+    structural.record(0);
+    structural.record_structural(0);
+    assert!(
+        held_subjects(&model, &pop, &structural).is_empty(),
+        "structural"
+    );
+    let reconverging = OuterFdDeclineLog::reconverging(1);
+    reconverging.record(0);
+    assert!(
+        held_subjects(&model, &pop, &reconverging).is_empty(),
+        "reconverging"
+    );
+
+    let tte = crate::parser::model_parser::parse_model_string(
+        &std::fs::read_to_string("examples/tte_exponential.ferx").expect("model file"),
+    )
+    .expect("parse");
+    let (tte_pop, _) = crate::api::read_population_for(
+        &tte,
+        &None,
+        "data/tte_exponential.csv",
+        None,
+        None,
+        None,
+        &[],
+    )
+    .expect("data");
+    assert!(
+        !tte_pop.subjects[0].obs_records.is_empty(),
+        "fixture: the TTE subject has records"
+    );
+    let log = OuterFdDeclineLog::new(tte_pop.subjects.len());
+    log.record(0);
+    assert!(
+        held_subjects(&tte, &tte_pop, &log).is_empty(),
+        "a non-Gaussian decline is reconverged, not held"
     );
 }
 

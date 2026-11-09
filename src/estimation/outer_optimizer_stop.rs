@@ -23,8 +23,10 @@ pub(crate) struct StopGradientGap {
 /// Whether a fit that stopped this way gets the report: a gradient-driven optimizer that
 /// did not converge, on a route whose declined subjects can take the held-EBE fallback.
 /// Under IOV every decline is reconverged, under `reconverge_gradient_interval = 1` every
-/// gradient is, and AGQ and mixtures assemble their gradient elsewhere; in all of these
-/// the fit's gradient is already the exact one, or not the one measured here.
+/// gradient is, and AGQ and mixtures assemble their gradient elsewhere; a model off the
+/// analytic outer gradient (out of the adjoint's scope, or `gradient = fd`) takes the
+/// population FD path instead. In all of these the fit's gradient is already the exact
+/// one, or not the one measured here.
 pub(crate) fn wants_stop_report(
     resolved: Optimizer,
     converged: bool,
@@ -40,6 +42,7 @@ pub(crate) fn wants_stop_report(
             | Optimizer::Lbfgs
             | Optimizer::Bfgs
     ) && !converged
+        && crate::sens::provider::analytic_outer_gradient_available(model)
         && model.n_kappa == 0
         && options.reconverge_gradient_interval != 1
         && options.agq_nodes().is_none()
@@ -81,6 +84,9 @@ pub(crate) fn attach_stop_report(
 /// two assemblies over those subjects alone: one population gradient, plus one held-EBE and
 /// one reconverged gradient per held subject. `None` when the inputs do not match the
 /// population or the exact gradient has no free coordinate left to measure against.
+///
+/// Under `reconverge_gradient_interval` above 1, "the fit's gradient" is the one of the
+/// evaluations the schedule does not reconverge; the fit's last may have been one it does.
 pub(crate) fn stop_gradient_gap(
     model: &CompiledModel,
     population: &Population,
@@ -122,11 +128,7 @@ pub(crate) fn stop_gradient_gap(
     nn_reg.penalty_and_gradient(&params.theta, &mut g_fit);
     priors.penalty_and_gradient(&x, &mut g_fit);
 
-    let held: Vec<usize> = fit_log
-        .declined_indices()
-        .into_iter()
-        .filter(|&i| !fit_log.is_structural(i))
-        .collect();
+    let held = held_subjects(model, population, &fit_log);
     let mut g_exact = g_fit.clone();
     if !held.is_empty() {
         let sub = Population {
@@ -153,6 +155,21 @@ pub(crate) fn stop_gradient_gap(
         n_held: held.len(),
         gap,
     })
+}
+
+/// The subjects `log` saw decline whose salvage was the held-EBE gradient, not the
+/// reconverged one: the subjects the fit's gradient and the exact one differ on.
+fn held_subjects(
+    model: &CompiledModel,
+    population: &Population,
+    log: &OuterFdDeclineLog,
+) -> Vec<usize> {
+    log.declined_indices()
+        .into_iter()
+        .filter(|&i| {
+            !declined_salvage_reconverges(model, &population.subjects[i], log.is_structural(i), log)
+        })
+        .collect()
 }
 
 /// The norm of `v` over the coordinates of `x` free to move along `-g`: a coordinate at a

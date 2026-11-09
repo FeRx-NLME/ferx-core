@@ -163,7 +163,7 @@ between nearby estimates, or a kink in the model such as `if`, `abs` or `max`.
 
 When no subject carries the fallback there, the warning says the final gradient is exact and points at the objective instead. The fallback can still have biased the gradient at a line-search trial point, so this rules it out only at the reported estimates. A fit that ran out of its evaluation budget gets the report too, beside its own budget warning; there the budget is the cause, and the report only says whether the final gradient was exact.
 
-The check costs one population outer gradient plus, for each subject on the fallback, one held-EBE and one reconverged finite-difference gradient. It is skipped for IOV models and under `reconverge_gradient_interval = 1`, where every declined subject is already reconverged, and under AGQ/Laplace and for mixture models, which assemble their gradient elsewhere.
+The check costs one population outer gradient plus, for each subject on the fallback, one held-EBE and one reconverged finite-difference gradient. It is skipped for IOV models and under `reconverge_gradient_interval = 1`, where every declined subject is already reconverged; under AGQ/Laplace and for mixture models, which assemble their gradient elsewhere; and for a model off the analytic outer gradient (`gradient = fd`, or out of its scope), whose gradient is finite differences throughout. Under `reconverge_gradient_interval` above 1 the report measures the held-EBE gradient, the one the fit used on the evaluations the schedule does not reconverge; the last evaluation may have been one it does.
 
 #### What a declined subject is charged {#declined-subject-salvage}
 
