@@ -4024,6 +4024,7 @@ fn held_at_bound_on_load(
             index: k,
             packed_index: k,
             reason: crate::types::HeldReason::ProfiledBound,
+            class: None,
         })
         .collect()
 }
@@ -4915,6 +4916,7 @@ mod tests {
             index: 0,
             packed_index: r.theta.len(),
             reason: HeldReason::CollapsedAtGuard,
+            class: None,
         }];
         let path = dir.path().join("held.fitrx");
         save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
@@ -4961,6 +4963,45 @@ mod tests {
             ]
         );
         assert_eq!(loaded.profiled_levels_at_bound, [0, 2]);
+    }
+
+    /// T5 (#2809): a `[mixture]` override entry's `class` round-trips as a 1-based number;
+    /// a base entry writes no `class` key at all (so a bundle without an override entry is
+    /// byte-unchanged); and an entry written before the field existed loads as `None`.
+    #[test]
+    fn held_at_bound_class_round_trips_and_is_absent_for_a_base_entry() {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let entry = |name: &str, packed_index, class| HeldAtBound {
+            name: name.into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index,
+            reason: HeldReason::CollapsedAtGuard,
+            class,
+        };
+        let mut r = minimal_fit_result();
+        let n = r.theta.len();
+        r.held_at_bound = vec![
+            entry("eta_CL", n, None),
+            entry("eta_CL_MIX2", n + 3, Some(2)),
+        ];
+        let path = dir.path().join("class.fitrx");
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        let json = fit_json(&path);
+        let held = &json["held_at_bound"];
+        assert!(held[0].get("class").is_none(), "{held}");
+        assert_eq!(held[1]["class"], 2, "{held}");
+        assert_eq!(load_fit(&path).unwrap().fit.held_at_bound, r.held_at_bound);
+
+        // An entry from a bundle written before #2809.
+        let old: HeldAtBound = serde_json::from_value(serde_json::json!({
+            "name": "eta_CL", "kind": "Omega", "index": 0, "packed_index": n,
+            "reason": "collapsed_at_guard",
+        }))
+        .unwrap();
+        assert_eq!(old, entry("eta_CL", n, None));
     }
 
     /// `final_gradient_source` has to survive the checkpoint alongside the vector

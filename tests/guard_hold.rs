@@ -451,3 +451,193 @@ fn a_held_variance_in_a_block_omega_zeroes_its_own_se_slot() {
         "{table}"
     );
 }
+
+// ── #2809: a collapsed `[mixture]` per-class override ───────────────────────────────────
+//
+// `tests/data/guard_hold/mix_override_collapse.{py,csv}`: a two-class 1-cpt IV population
+// whose class 2 has **no** CL variability, fitted with `omega(2) ETA_CL` — the override
+// collapses. The point is the full fit's estimate with the override on its rail (OFV
+// −37.391597, macOS arm64; the plan's M2). Packed: `[TVCL1, TVCL2, TVV, MIXL, ETA_CL, EPS,
+// ETA_CL_MIX2]`.
+
+const MIX_DATA: &str = "tests/data/guard_hold/mix_override_collapse.csv";
+/// ETA_CL_MIX2's packed row.
+const OVERRIDE_ROW: usize = 6;
+
+fn mixture_source(override_fixed: bool, analytic_cov: bool) -> String {
+    let fix = if override_fixed { " FIX" } else { "" };
+    format!(
+        "[parameters]
+  theta TVCL1(1.2921355862556707, 0.01, 100.0)
+  theta TVCL2(2.526598380988927, 0.01, 100.0)
+  theta TVV(10.040303488207734, 0.1, 1000.0)
+  theta MIXL(-0.11953563542469542, -10.0, 10.0)
+  omega ETA_CL ~ 0.06227533113210565
+  sigma EPS ~ 0.10298957033853946 (sd)
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+  omega(2) ETA_CL ~ {RAIL}{fix}
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = true
+  analytic_cov_hessian = {analytic_cov}
+"
+    )
+}
+
+fn evaluate_mixture(name: &str, src: &str) -> (FitResult, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path: PathBuf = dir.path().join(format!("{name}.ferx"));
+    std::fs::write(&path, src).unwrap();
+    let (fit, _) = run_model_with_data(path.to_str().unwrap(), Some(MIX_DATA)).expect("evaluate");
+    (fit, dir)
+}
+
+/// The ETA_CL row of `parameter_table`: its estimate, SE and RSE cells.
+fn base_eta_cl_cells(r: &FitResult) -> Vec<String> {
+    let table = parameter_table(r);
+    let row = table
+        .lines()
+        .find(|l| l.starts_with("ETA_CL "))
+        .unwrap_or_else(|| panic!("{table}"));
+    row.split_whitespace()
+        .skip(1)
+        .take(3)
+        .map(str::to_string)
+        .collect()
+}
+
+/// T7/T8's shared assertions for one route: the override is held and listed with its
+/// class, the step marks it, every SE is bit-equal to the FIX twin fitted from the FIX
+/// model file (`FitResult` has no override-FIX field, so `fix_clone` cannot build it), and
+/// the base ETA_CL keeps a positive SE that the table prints as a number.
+///
+/// Mutations, each named by the assertion that dies: restore the D3 filter in
+/// `held_guard_coordinates` → the list and `cov_fixed[6]`, and the SEs (the step no longer
+/// conditions); drop the override mapping in `packed_diagonal_parameter` → the list; drop
+/// the `class` skip in `apply_held_at_bound` → base `se_omega[0]` is 0.0, not the twin's;
+/// drop the `class` filter in `se_held` → the table's ETA_CL row prints `N/A`.
+fn assert_override_held_like_its_fix_twin(analytic: bool) -> FitResult {
+    let tag = if analytic { "analytic" } else { "fd" };
+    let (f, _d) = evaluate_mixture(&format!("held_{tag}"), &mixture_source(false, analytic));
+    assert!(f.covariance_matrix.is_some(), "{tag}: {:?}", f.warnings);
+    assert!(!regularized(&f), "{tag}: a clean R: {:?}", f.warnings);
+    let held: Vec<_> = f
+        .held_at_bound
+        .iter()
+        .map(|h| {
+            (
+                h.name.as_str(),
+                h.kind,
+                h.index,
+                h.packed_index,
+                h.reason,
+                h.class,
+            )
+        })
+        .collect();
+    assert_eq!(
+        held,
+        [(
+            "ETA_CL_MIX2",
+            ParameterKind::Omega,
+            0,
+            OVERRIDE_ROW,
+            HeldReason::CollapsedAtGuard,
+            Some(2)
+        )],
+        "{tag}"
+    );
+    assert!(f.cov_fixed[OVERRIDE_ROW], "{tag}: {:?}", f.cov_fixed);
+    assert_eq!(f.cov_fixed.iter().filter(|&&b| b).count(), 1, "{tag}");
+    let w = guard_warning(&f);
+    assert!(w.contains("ETA_CL_MIX2"), "{w}");
+    assert!(
+        w.ends_with(
+            "Their standard errors are not reported; the other standard errors are computed \
+             with them held at the floor."
+        ),
+        "{w}"
+    );
+
+    let (twin, _d) = evaluate_mixture(&format!("fix_{tag}"), &mixture_source(true, analytic));
+    assert!(twin.held_at_bound.is_empty(), "{:?}", twin.held_at_bound);
+    assert!(twin.cov_fixed[OVERRIDE_ROW], "{:?}", twin.cov_fixed);
+    assert!(
+        !twin.warnings.iter().any(|w| w.contains("parameter guard")),
+        "a FIX override raises no guard warning: {:?}",
+        twin.warnings
+    );
+    assert_eq!(
+        all_ses(&f),
+        all_ses(&twin),
+        "{tag}: held SEs = FIX twin SEs"
+    );
+    assert_eq!(f.covariance_matrix, twin.covariance_matrix, "{tag}");
+
+    let se = f.se_omega.as_ref().unwrap()[0];
+    assert!(se.is_finite() && se > 0.0, "{tag}: base ETA_CL SE {se}");
+    let cells = base_eta_cl_cells(&f);
+    assert!(!cells.contains(&"N/A".to_string()), "{tag}: {cells:?}");
+    assert_eq!(cells, base_eta_cl_cells(&twin), "{tag}");
+    f
+}
+
+/// T7 (#2809), analytic R. Base `se_omega[0]` = 0.019272550413150978 on macOS arm64 (the
+/// plan's M3/M4: every SE bit-equal to the FIX twin, 0 ULP).
+#[test]
+fn a_collapsed_mixture_override_is_held_like_its_fix_twin_on_the_analytic_r() {
+    assert_override_held_like_its_fix_twin(true);
+}
+
+/// T8 (#2809), FD stencil. The route is asserted, so a fixture that silently ran the same
+/// engine twice fails by name: the stencil's base ETA_CL SE is 0.01926268 against the
+/// analytic R's 0.01927255 (macOS arm64).
+#[test]
+fn a_collapsed_mixture_override_is_held_like_its_fix_twin_on_the_fd_stencil() {
+    let fd = assert_override_held_like_its_fix_twin(false);
+    let (an, _d) = evaluate_mixture("route_analytic", &mixture_source(false, true));
+    assert_ne!(
+        all_ses(&an),
+        all_ses(&fd),
+        "the two fits must run different routes"
+    );
+}
+
+/// T9 (#2809): a `run_covariance` re-run on a mixture fit rebuilds the override's entry
+/// and its `cov_fixed` mark from its own step. The incoming fit is stale (no list, no
+/// mask), so an incoming copy cannot satisfy it. Mutation: `refresh_held_at_bound_report`
+/// skips `apply_held_at_bound` → the list is empty.
+#[test]
+fn a_re_run_rebuilds_the_held_override_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rerun.ferx");
+    std::fs::write(&path, mixture_source(false, true)).unwrap();
+    let (f, pop) = run_model_with_data(path.to_str().unwrap(), Some(MIX_DATA)).expect("fit");
+    let model = parse_model_file(&path).expect("parse");
+    assert_eq!(f.held_at_bound.len(), 1);
+    let mut stale = f.clone();
+    stale.held_at_bound.clear();
+    stale.cov_fixed.clear();
+    let again =
+        run_covariance(&stale, Some(&model), Some(&pop), &FitOptions::default()).expect("re-run");
+    assert_eq!(again.held_at_bound, f.held_at_bound);
+    assert_eq!(again.held_at_bound[0].class, Some(2));
+    assert_eq!(again.cov_fixed, f.cov_fixed);
+    assert!(again.cov_fixed[OVERRIDE_ROW]);
+    assert_eq!(all_ses(&again), all_ses(&f));
+}

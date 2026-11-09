@@ -338,3 +338,268 @@ fn runaway_only_never_gets_an_se_sentence() {
         assert_eq!(details["parameters"][0]["held"], false, "{held:?}");
     }
 }
+
+// ── `[mixture]` per-class overrides (#2809) ──────────────────────────────────────────────
+
+/// Packed: `[TVCL, TVV, MIXL2, MIXL3, ETA_CL, ETA_V, PROP_ERR, ADD_ERR, ETA_CL_MIX2,
+/// ETA_V_MIX2, ADD_ERR_MIX3]` — three classes; `omega(2) ETA_CL` free, `omega(2) ETA_V`
+/// FIX and always on the rail, `sigma(3) ADD_ERR` free. The Σ override names σ index 1
+/// and class 3, the Ω one η index 0 and class 2, so a swap of the two address tables, or
+/// a dropped `+ 1`, changes the listed `(kind, index, class)`.
+///
+/// `ov_omega` / `ov_sigma`: the free overrides on their lower rail; `base_v`: ETA_V
+/// collapsed (`Some(false)`) or run to the upper rail (`Some(true)`); `None` interior.
+fn mixture_params(ov_omega: bool, ov_sigma: bool, base_v: Option<bool>) -> ModelParameters {
+    let mut p = params_with_every_kind_of_hit();
+    p.theta = vec![0.5, 6.0, 0.0, 0.0];
+    p.theta_names = vec!["TVCL".into(), "TVV".into(), "MIXL2".into(), "MIXL3".into()];
+    p.theta_lower = vec![0.0, 0.0, -10.0, -10.0];
+    p.theta_upper = vec![f64::INFINITY, 500.0, 10.0, 10.0];
+    p.theta_fixed = vec![false; 4];
+    let l_v = match base_v {
+        None => 0.3,
+        Some(false) => OMEGA_RAIL_L.exp(),
+        Some(true) => 6.0_f64.exp(),
+    };
+    let names = ["ETA_CL", "ETA_V"];
+    p.omega = diag_chol(&[0.25, l_v], &names);
+    p.omega_fixed = vec![false; 2];
+    p.sigma = SigmaVector {
+        values: vec![0.1, 0.2],
+        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
+    };
+    p.sigma_fixed = vec![false; 2];
+    p.omega_iov = None;
+    p.kappa_fixed = Vec::new();
+    let ov_l = if ov_omega { OMEGA_RAIL_L.exp() } else { 0.2 };
+    let ov_s = if ov_sigma { SIGMA_RAIL.exp() } else { 0.15 };
+    p.mixture = Some(crate::types::MixtureParams {
+        omega: vec![
+            p.omega.clone(),
+            diag_chol(&[ov_l, OMEGA_RAIL_L.exp()], &names),
+            p.omega.clone(),
+        ],
+        sigma: vec![
+            p.sigma.clone(),
+            p.sigma.clone(),
+            SigmaVector {
+                values: vec![0.1, ov_s],
+                names: p.sigma.names.clone(),
+            },
+        ],
+        omega_override_addr: vec![(1, 0), (1, 1)],
+        omega_override_fixed: vec![false, true],
+        sigma_override_addr: vec![(2, 1)],
+        sigma_override_fixed: vec![false],
+    });
+    p
+}
+
+/// T1 (#2809): a collapsed per-class override is held like a base coordinate; a FIX
+/// override on the rail is not; nor is one off the rail. Restoring the D3 range filter
+/// drops 8 and 10.
+#[test]
+fn a_collapsed_mixture_override_is_held_and_a_fix_one_is_not() {
+    let p = mixture_params(true, true, None);
+    assert_eq!(
+        crate::estimation::parameterization::coordinate_names(&p)[8..],
+        ["ETA_CL_MIX2", "ETA_V_MIX2", "ADD_ERR_MIX3"],
+        "packed order the fixture relies on"
+    );
+    assert_eq!(super::held_guard_coordinates(&p), [8, 10]);
+    // Beside a base collapse, both are held.
+    assert_eq!(
+        super::held_guard_coordinates(&mixture_params(true, true, Some(false))),
+        [5, 8, 10]
+    );
+    // Off the rail (the FIX override still on it): nothing.
+    assert!(super::held_guard_coordinates(&mixture_params(false, false, None)).is_empty());
+}
+
+/// T2 (#2809): the list names each override by its base `(kind, index)` and its 1-based
+/// class, and lists no base entry for it. Kills: `packed_diagonal_parameter` returning
+/// `None` past the base segments (the list is empty), the Σ range read through
+/// `omega_override_addr` (`(Sigma, 0, Some(2))`), and a dropped `+ 1` (classes 1 and 2).
+#[test]
+fn a_held_override_is_listed_with_its_class_and_never_as_the_base() {
+    let list = super::held_at_bound_list(&mixture_params(true, true, None), &[]);
+    let got: Vec<_> = list
+        .iter()
+        .map(|h| {
+            (
+                h.name.as_str(),
+                h.kind,
+                h.index,
+                h.packed_index,
+                h.reason,
+                h.class,
+            )
+        })
+        .collect();
+    use HeldReason::CollapsedAtGuard as C;
+    assert_eq!(
+        got,
+        [
+            ("ETA_CL_MIX2", ParameterKind::Omega, 0, 8, C, Some(2)),
+            ("ADD_ERR_MIX3", ParameterKind::Sigma, 1, 10, C, Some(3)),
+        ]
+    );
+    assert!(list.iter().all(|h| h.class.is_some()), "{list:?}");
+
+    // A base collapse beside them keeps `class: None`.
+    let list = super::held_at_bound_list(&mixture_params(true, true, Some(false)), &[]);
+    let base: Vec<_> = list.iter().filter(|h| h.class.is_none()).collect();
+    assert_eq!(base.len(), 1, "{list:?}");
+    assert_eq!(
+        (base[0].name.as_str(), base[0].kind, base[0].index),
+        ("ETA_V", ParameterKind::Omega, 1)
+    );
+}
+
+/// The covariance a clean `R` gives `mixture_params`: every held coordinate's row zero,
+/// the FIX override's row zero as for any FIX coordinate.
+fn mixture_step_matrix(zero_rows: &[usize]) -> DMatrix<f64> {
+    let mut m = DMatrix::from_diagonal_element(11, 11, 0.01);
+    for &p in zero_rows.iter().chain(&[9]) {
+        m[(p, p)] = 0.0;
+    }
+    m
+}
+
+/// T3 (#2809): `apply_held_at_bound` writes no `0.0` for a held override — it has no
+/// `se_*` slot, and its `(kind, index)` names the base, whose SE would be zeroed — while a
+/// base collapse in the same call still gets its `0.0` (both sides of the gate).
+#[test]
+fn applying_a_held_override_leaves_the_base_se_untouched() {
+    let p = mixture_params(true, true, Some(false));
+    let mut r = crate::types::test_helpers::minimal_fit_result();
+    r.omega = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.0625, 3.8e-11]));
+    r.covariance_matrix = Some(mixture_step_matrix(&[5, 8, 10]));
+    let se_eta_cl = 0.019_272_6_f64;
+    let se_add = 0.002_f64;
+    r.se_omega = Some(vec![se_eta_cl, 0.03]);
+    r.se_sigma = Some(vec![0.001, se_add]);
+    super::apply_held_at_bound(&p, &mut r);
+    assert_eq!(r.held_at_bound.len(), 3, "{:?}", r.held_at_bound);
+    let se_omega = r.se_omega.unwrap();
+    let se_sigma = r.se_sigma.unwrap();
+    assert_eq!(se_omega[0].to_bits(), se_eta_cl.to_bits(), "base ETA_CL SE");
+    assert_eq!(se_sigma[1].to_bits(), se_add.to_bits(), "base ADD_ERR SE");
+    assert_eq!(se_omega[1], 0.0, "the base collapse ETA_V is still zeroed");
+    assert_eq!(se_sigma[0].to_bits(), 0.001_f64.to_bits());
+}
+
+/// One guard-warning cell on `mixture_params` (T6, #2809).
+fn mixture_cell(
+    p: &ModelParameters,
+    cov: Option<DMatrix<f64>>,
+) -> Option<(String, serde_json::Value)> {
+    let mut converged = true;
+    super::runaway_guard_warning_for(&mut converged, p, cov.as_ref())
+        .map(|(msg, entry)| (msg, entry.details.unwrap()))
+}
+
+fn held_of(details: &serde_json::Value, name: &str) -> serde_json::Value {
+    details["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["parameter"] == name)
+        .unwrap_or_else(|| panic!("{name} not in {details}"))["held"]
+        .clone()
+}
+
+/// `msg` names `full` and never the bare base name `base` (the base parameter did not
+/// collapse; its override did).
+fn names_only_the_override(msg: &str, full: &str, base: &str) {
+    assert!(msg.contains(full), "{msg}");
+    assert!(!msg.replace(full, "").contains(base), "bare {base}: {msg}");
+}
+
+#[test]
+fn override_collapse_clean_r_is_held_and_named_with_its_class() {
+    let p = mixture_params(true, false, None);
+    let (msg, details) = mixture_cell(&p, Some(mixture_step_matrix(&[8]))).unwrap();
+    names_only_the_override(&msg, "ETA_CL_MIX2", "ETA_CL");
+    assert!(
+        msg.contains("Their standard errors are not reported; "),
+        "{msg}"
+    );
+    assert!(msg.ends_with(HELD_SENTENCE), "{msg}");
+    assert_eq!(held_of(&details, "ETA_CL_MIX2"), true);
+}
+
+#[test]
+fn override_collapse_floored_r_reports_no_se_and_claims_no_hold() {
+    let p = mixture_params(true, false, None);
+    let (msg, details) = mixture_cell(&p, Some(mixture_step_matrix(&[]))).unwrap();
+    names_only_the_override(&msg, "ETA_CL_MIX2", "ETA_CL");
+    assert!(
+        msg.ends_with(" Their standard errors are not reported."),
+        "{msg}"
+    );
+    assert!(!msg.contains(HELD_SENTENCE), "{msg}");
+    assert_eq!(held_of(&details, "ETA_CL_MIX2"), false);
+}
+
+#[test]
+fn override_collapse_without_a_matrix_has_no_se_sentence() {
+    let p = mixture_params(true, false, None);
+    let (msg, details) = mixture_cell(&p, None).unwrap();
+    names_only_the_override(&msg, "ETA_CL_MIX2", "ETA_CL");
+    assert!(!msg.contains("not reported"), "{msg}");
+    assert_eq!(held_of(&details, "ETA_CL_MIX2"), false);
+}
+
+#[test]
+fn override_collapse_and_runaway_names_the_override_in_the_collapse_subset() {
+    let p = mixture_params(true, false, Some(true));
+    let (msg, details) = mixture_cell(&p, Some(mixture_step_matrix(&[8]))).unwrap();
+    assert!(
+        msg.contains(
+            " The standard errors of the collapsed parameter(s) ETA_CL_MIX2 are not reported; "
+        ),
+        "{msg}"
+    );
+    assert!(msg.ends_with(HELD_SENTENCE), "{msg}");
+    assert!(!msg.contains("parameter(s) ETA_V"), "{msg}");
+    assert_eq!(held_of(&details, "ETA_CL_MIX2"), true);
+    assert_eq!(held_of(&details, "ETA_V"), false, "a runaway is never held");
+}
+
+#[test]
+fn base_and_override_collapse_clean_r_holds_both() {
+    let p = mixture_params(true, false, Some(false));
+    let (msg, details) = mixture_cell(&p, Some(mixture_step_matrix(&[5, 8]))).unwrap();
+    assert!(msg.contains("ETA_V"), "{msg}");
+    assert!(msg.contains("ETA_CL_MIX2"), "{msg}");
+    assert!(
+        msg.contains("Their standard errors are not reported; "),
+        "{msg}"
+    );
+    assert!(msg.ends_with(HELD_SENTENCE), "{msg}");
+    assert_eq!(held_of(&details, "ETA_V"), true);
+    assert_eq!(held_of(&details, "ETA_CL_MIX2"), true);
+}
+
+#[test]
+fn a_fix_override_on_the_rail_raises_no_guard_warning() {
+    let p = mixture_params(false, false, None);
+    assert!(
+        mixture_cell(&p, Some(mixture_step_matrix(&[]))).is_none(),
+        "ETA_V_MIX2 is FIX on the rail"
+    );
+}
+
+#[test]
+fn sigma_override_collapse_clean_r_is_held_and_named_with_its_class() {
+    let p = mixture_params(false, true, None);
+    let (msg, details) = mixture_cell(&p, Some(mixture_step_matrix(&[10]))).unwrap();
+    names_only_the_override(&msg, "ADD_ERR_MIX3", "ADD_ERR");
+    assert!(
+        msg.contains("Their standard errors are not reported; "),
+        "{msg}"
+    );
+    assert!(msg.ends_with(HELD_SENTENCE), "{msg}");
+    assert_eq!(held_of(&details, "ADD_ERR_MIX3"), true);
+}
