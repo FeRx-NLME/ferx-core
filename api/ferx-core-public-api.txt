@@ -3564,6 +3564,7 @@ pub struct ferx_core::types::FremConfig
 pub ferx_core::types::FremConfig::covariate_sigma_index: usize
 pub ferx_core::types::FremConfig::fremtype_to_indices: std::collections::hash::map::HashMap<u16, (usize, usize)>
 pub struct ferx_core::types::HeldAtBound
+pub ferx_core::types::HeldAtBound::class: core::option::Option<usize>
 pub ferx_core::types::HeldAtBound::index: usize
 pub ferx_core::types::HeldAtBound::kind: ferx_core::ParameterKind
 pub ferx_core::types::HeldAtBound::name: alloc::string::String
@@ -5221,6 +5222,7 @@ pub ferx_core::FremPrepareResult::model_path: std::path::PathBuf
 pub ferx_core::FremPrepareResult::n_total_etas: usize
 pub ferx_core::FremPrepareResult::warnings: alloc::vec::Vec<alloc::string::String>
 pub struct ferx_core::HeldAtBound
+pub ferx_core::HeldAtBound::class: core::option::Option<usize>
 pub ferx_core::HeldAtBound::index: usize
 pub ferx_core::HeldAtBound::kind: ferx_core::ParameterKind
 pub ferx_core::HeldAtBound::name: alloc::string::String

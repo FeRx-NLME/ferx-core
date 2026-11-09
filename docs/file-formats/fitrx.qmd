@@ -329,7 +329,11 @@ other length is refused on save and on load.
 in packed order, each as `{name, kind, index, packed_index, reason}`, with `reason`
 `profiled_bound` or `collapsed_at_guard`
 ([held parameters](../estimation/parameterization.qmd#held-parameters)). It is absent
-when the list is empty. A bundle written before the field existed carries only
+when the list is empty. An entry for a `[mixture]` per-class override also has
+`class`, its 1-based class (#2809). Its `kind` and `index` then name the **base**
+parameter it overrides, so a reader matching entries to the base estimates must skip
+an entry that has `class`. A base entry has no `class` key. A reader built before
+#2809 drops the key and would read the override as its base parameter. A bundle written before the field existed carries only
 `profiled_levels_at_bound`; on load those levels become `profiled_bound` entries, so
 old and new bundles read the same way.
 

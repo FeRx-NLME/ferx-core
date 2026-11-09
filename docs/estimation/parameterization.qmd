@@ -535,8 +535,11 @@ floor" after a clean `R`, and only "their standard errors are not reported"
 otherwise. Its `details.parameters[].held` mirrors `cov_fixed`. Two consumers do not
 hold a collapse in this version: SIR, and the profiled step under
 `covariance_method = s` (#2816). In both, the collapse is listed and shown as `N/A`,
-but the matrix stays unconditional. A `[mixture]` per-class override on the rail is
-not held either (#2809).
+but the matrix stays unconditional. A `[mixture]` per-class override (`omega(k)` or
+`sigma(k)`) on the rail is held under the same rule (#2809). Its `held_at_bound` entry
+carries `class: k`, and its `kind` and `index` name the base parameter it overrides. So
+the base parameter keeps its own SE, and the other SEs equal a run with the override
+`FIX`. Per-class override estimates and their SEs are not printed in this version.
 
 ## Where the packed space surfaces
 
