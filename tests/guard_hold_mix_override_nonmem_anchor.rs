@@ -7,11 +7,11 @@
 //! `6.1442123533282098E-6`, `$EST MAXEVAL=0`, `$COV MATRIX=R SIGL=12` (NONMEM 7.6.0, `nm3`
 //! anchor image). "Held" means FIX at the estimate, which NONMEM computes.
 //!
-//! Unlike #2797's anchor, this one **does** separate held from unheld, on two of its six
-//! SEs: ferx's unheld SEs (before #2809) differ from the held ones by 9.3e-3 relative on σ
-//! and 5.37e-3 on TVCL2, against a NONMEM gap of 4.0e-4 and 4e-7. On TVCL1 (3.2e-4) the
-//! unheld shift is inside the bound and NONMEM does not tell the two apart. Tier 2: one
-//! evaluation, not gated.
+//! Unlike #2797's anchor, this one **does** separate held from unheld, on five of its six
+//! SEs, each against its own bound (the table in the test): ferx's unheld SEs (before
+//! #2809) move TVCL2 by 5.37e-3 and σ by 9.3e-3, against NONMEM gaps of 4e-7 and 4.0e-4.
+//! On TVCL1 (3.2e-4) the unheld shift is inside the bound and NONMEM does not tell the two
+//! apart. Tier 2: one evaluation, not gated.
 
 use std::path::PathBuf;
 
@@ -115,37 +115,46 @@ fn held_override_standard_errors_match_nonmem_with_the_override_fixed() {
     let so = f.se_omega.as_ref().unwrap();
     // σ: NONMEM's SIGMA is the variance σ²; ferx stores the SD. SE(σ) = SE(σ²) / 2σ.
     let s_sd = f.se_sigma.as_ref().unwrap()[0];
+    // One bound per SE, from its own measured gap (#2831 review r1 row 1), so the tight
+    // ones are not loosened by σ's. Measured on macOS arm64 and Linux aarch64, identical
+    // in every printed digit; NONMEM's finite-difference `$COV` against ferx's analytic R.
+    // Each bound is 2× its measured gap, floored at 2e-5: the `.ext` prints 6 significant
+    // digits, a rounding of at most 5e-6 relative, so a bound below 2e-5 would test
+    // NONMEM's print format. The unheld step (before #2809) moves THETA2 by 5.37e-3 (268×
+    // its bound), SIGMA(1,1) by 9.3e-3 (11.6×), OMEGA(1,1) by 7.4e-4 (4.6×), THETA3 by
+    // 7.0e-4 (23×) and THETA4 by 7.2e-5 (3.6×); THETA1's 3.2e-4 shift is inside its 4e-4.
+    //
+    //   SE          measured   bound
+    //   THETA1      1.97e-4    4e-4
+    //   THETA2      4.1e-7     2e-5
+    //   THETA3      1.51e-5    3e-5
+    //   THETA4      4.5e-7     2e-5
+    //   OMEGA(1,1)  8.05e-5    1.6e-4
+    //   SIGMA(1,1)  3.99e-4    8e-4
     let pairs = [
-        ("THETA1", st[0], se["THETA1"]),
-        ("THETA2", st[1], se["THETA2"]),
-        ("THETA3", st[2], se["THETA3"]),
-        ("THETA4", st[3], se["THETA4"]),
-        ("OMEGA(1,1)", so[0], se["OMEGA(1,1)"]),
-        ("SIGMA(1,1)", s_sd, se["SIGMA(1,1)"] / (2.0 * SIGMA_SD)),
+        ("THETA1", st[0], se["THETA1"], 4e-4),
+        ("THETA2", st[1], se["THETA2"], 2e-5),
+        ("THETA3", st[2], se["THETA3"], 3e-5),
+        ("THETA4", st[3], se["THETA4"], 2e-5),
+        ("OMEGA(1,1)", so[0], se["OMEGA(1,1)"], 1.6e-4),
+        (
+            "SIGMA(1,1)",
+            s_sd,
+            se["SIGMA(1,1)"] / (2.0 * SIGMA_SD),
+            8e-4,
+        ),
     ];
-    let mut worst = (0.0_f64, "");
-    for (name, ferx, nm) in pairs {
+    let mut failed = Vec::new();
+    for (name, ferx, nm, bound) in pairs {
         assert!(
             ferx.is_finite() && nm.is_finite() && nm > 0.0,
             "{name}: {ferx} vs {nm}"
         );
         let rel = (ferx - nm).abs() / nm;
-        eprintln!("{name}: ferx {ferx:.6e}  NONMEM {nm:.5e}  rel {rel:.2e}");
-        if rel > worst.0 {
-            worst = (rel, name);
+        eprintln!("{name}: ferx {ferx:.6e}  NONMEM {nm:.5e}  rel {rel:.2e}  bound {bound:.1e}");
+        if rel >= bound {
+            failed.push(format!("{name}: rel {rel:.3e} ≥ {bound:.1e}"));
         }
     }
-    // Measured (macOS arm64 and Linux aarch64, identical in every printed digit): worst
-    // 3.99e-4 at SIGMA(1,1), then 1.97e-4 (THETA1), 8.1e-5
-    // (OMEGA(1,1)), the rest ≤ 1.5e-5; the .ext prints 6 significant digits. NONMEM's
-    // finite-difference `$COV` against ferx's analytic R. 2× headroom. The unheld step
-    // (before #2809) moves SIGMA(1,1) by 9.3e-3 and THETA2 by 5.37e-3 — 11× and 6.7× the
-    // bound — so a step that stops holding the override fails here.
-    const BOUND: f64 = 8e-4;
-    assert!(
-        worst.0 < BOUND,
-        "worst relative SE gap {:.3e} at {}",
-        worst.0,
-        worst.1
-    );
+    assert!(failed.is_empty(), "{}", failed.join("; "));
 }
