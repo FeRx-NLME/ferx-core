@@ -9582,11 +9582,15 @@ fn optimize_bfgs(
     // Best accepted iterate, so an interrupted run's checkpoint holds it (#1317).
     let mut best = BestPoint::new();
 
+    // #2799: as in pure Gauss–Newton, every `break` below sets this, so a loop that runs off
+    // the end of `outer_maxiter` spent its budget.
+    let mut exited_early = false;
     for iter in 1..=options.outer_maxiter {
         n_iterations = iter;
 
         if crate::cancel::is_cancelled(&options.cancel) {
             warnings.push("cancelled by user".to_string());
+            exited_early = true;
             break;
         }
 
@@ -9601,6 +9605,7 @@ fn optimize_bfgs(
                 eprintln!("Converged at iteration {} (|g| = {:.2e})", iter, g_norm);
             }
             converged = true;
+            exited_early = true;
             break;
         }
 
@@ -9630,6 +9635,7 @@ fn optimize_bfgs(
                 if options.verbose {
                     eprintln!("Stopping: line search stalled at iteration {}", iter);
                 }
+                exited_early = true;
                 break;
             }
             s_hist.clear();
@@ -9764,6 +9770,7 @@ fn optimize_bfgs(
                 );
             }
             converged = true;
+            exited_early = true;
             break;
         }
     }
@@ -9861,7 +9868,10 @@ fn optimize_bfgs(
         cond_dist: None,
         newton_decrement,
         optimizer_stop: None,
-        eval_budget_spent: false,
+        eval_budget_spent: crate::estimation::gauss_newton::gn_loop_budget_spent(
+            options.outer_maxiter,
+            exited_early,
+        ),
     }
 }
 

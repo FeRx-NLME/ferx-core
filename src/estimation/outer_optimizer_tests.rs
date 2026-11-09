@@ -16545,3 +16545,58 @@ fn eval_budget_spent_is_read_after_the_latch_reset() {
     assert!(off.eval_budget_spent, "the unguarded run spent its budget");
     assert!(!off.converged);
 }
+
+/// #2799 r1 #2: the internal BFGS (`optimizer = bfgs`) publishes `eval_budget_spent` when its
+/// loop runs off the end of `outer_maxiter`, and not when it converges. `one_cpt_iv` with a
+/// 2-iteration budget cannot reach either stop rule; a 500-iteration budget converges on it
+/// through the relative-change stop, and a 1-iteration budget with a tolerance every gradient
+/// meets converges through the gradient-norm stop on its last permitted iteration. Mutation:
+/// drop the `exited_early = true` on either convergence `break` → its run reads `true`;
+/// fill `false` → the short run.
+#[test]
+fn internal_bfgs_reports_a_spent_iteration_budget() {
+    use crate::estimation::outer_optimizer::{optimize_bfgs, OuterFdDeclineLog};
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let run_gtol = |maxiter: usize, gtol: f64| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bfgs,
+            outer_maxiter: maxiter,
+            outer_gtol: gtol,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        optimize_bfgs(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+        )
+    };
+    let run = |maxiter: usize| run_gtol(maxiter, FitOptions::default().outer_gtol);
+    let short = run(2);
+    assert!(!short.converged);
+    assert!(short.eval_budget_spent, "{:?}", short.warnings);
+    let long = run(500);
+    assert!(
+        long.converged,
+        "the straddle needs a converging twin: {:?}",
+        long.warnings
+    );
+    assert!(!long.eval_budget_spent);
+    // The gradient-norm stop on the last permitted iteration: a budget of 1 with a tolerance
+    // every gradient meets converges on iteration 1, inside the range, so it is not spent.
+    let gtol = run_gtol(1, 1e12);
+    assert!(gtol.converged, "{:?}", gtol.warnings);
+    assert_eq!(gtol.n_iterations, 1);
+    assert!(!gtol.eval_budget_spent);
+}

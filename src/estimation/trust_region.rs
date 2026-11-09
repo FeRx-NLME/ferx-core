@@ -865,8 +865,14 @@ pub(crate) fn optimize_trust_region_seeded(
         .configure(|state| state.param(x0.clone()).max_iters(max_iters))
         .run();
 
+    // #2799: argmin's own word that the iteration budget ended the run.
+    let mut tr_budget_spent = false;
     let (converged, best_x, n_iterations, final_gradient, incumbent_ebes) = match result {
         Ok(res) => {
+            tr_budget_spent = matches!(
+                res.state().get_termination_status(),
+                TerminationStatus::Terminated(TerminationReason::MaxItersReached)
+            );
             let (converged, warning) =
                 classify_termination(res.state().get_termination_status(), max_iters);
             let n_iterations = res.state().get_iter() as usize;
@@ -1101,7 +1107,7 @@ pub(crate) fn optimize_trust_region_seeded(
         mcem_objective_trail: None,
         newton_decrement,
         optimizer_stop: None,
-        eval_budget_spent: false,
+        eval_budget_spent: tr_budget_spent,
     }
 }
 
@@ -2047,6 +2053,8 @@ mod tests {
             !res.converged,
             "a run that exhausted outer_maxiter must not report converged"
         );
+        // #2799: the typed form of the same fact.
+        assert!(res.eval_budget_spent, "MaxItersReached is a spent budget");
         assert!(
             res.warnings.iter().any(|w| w.contains("maxiter = 2")),
             "missing the budget-exhaustion warning: {:?}",
