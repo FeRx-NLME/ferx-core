@@ -8287,12 +8287,22 @@ pub struct HeldAtBound {
     /// The family the parameter is reported under.
     pub kind: ParameterKind,
     /// Its index within that family: into `theta`, the Ω diagonal, `sigma`, or the κ
-    /// (Ω_IOV) diagonal.
+    /// (Ω_IOV) diagonal. For a `[mixture]` per-class override (`class` is `Some`), the
+    /// index of the **base** η or σ the override replaces in that class.
     pub index: usize,
     /// Its row in [`FitResult::covariance_matrix`] and [`FitResult::cov_fixed`].
     pub packed_index: usize,
     /// Why it is held.
     pub reason: HeldReason,
+    /// `Some(c)` when the entry is a `[mixture]` per-class override — `omega(c)` or
+    /// `sigma(c)`, 1-based like the model file, the `_MIX{c}` name and NONMEM's `MIXNUM`
+    /// (#2809). The entry is then the override, **not** the base parameter that `kind` and
+    /// `index` name: a consumer matching entries to the base estimate table by
+    /// `(kind, index)` must skip it. `None` for a base parameter, and absent from the
+    /// serialised form, so a bundle with no override entry is byte-unchanged; a reader
+    /// that predates the field drops it and would read the override as the base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<usize>,
 }
 
 /// Why a coordinate is in [`FitResult::held_at_bound`].
@@ -8344,6 +8354,10 @@ where
         index: usize,
         packed_index: usize,
         reason: HeldReason,
+        // #2809: the `[mixture]` class must survive this read, or an override entry
+        // loads as its base parameter.
+        #[serde(default)]
+        class: Option<usize>,
     }
     let rows: Vec<HeldRead> = serde::Deserialize::deserialize(d)?;
     Ok(rows
@@ -8362,6 +8376,7 @@ where
                 index: h.index,
                 packed_index: h.packed_index,
                 reason: h.reason,
+                class: h.class,
             })
         })
         .collect())

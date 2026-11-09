@@ -1525,6 +1525,7 @@ mod tests {
             index: 0,
             packed_index: p,
             reason,
+            class: None,
         }];
         let s_hat = template.sigma.values[0];
         let pinned = sigma_draws(&held);

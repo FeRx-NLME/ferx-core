@@ -1677,17 +1677,14 @@ pub(crate) fn collapsed_coordinates(params: &ModelParameters) -> Vec<(usize, Pac
 
 /// The packed coordinates the covariance step holds at the internal guard (#2797): the
 /// [`collapsed_coordinates`] (a lower rail on a log-packed coordinate; a runaway is never
-/// held, D1), less the `[mixture]` per-class overrides (D3, not held in v1: their
-/// [`ParameterKind`] index would name the base parameter). Ascending. One walk for the step
-/// and for `FitResult::held_at_bound`, so the list and the matrix cannot disagree on which
+/// held, D1), `[mixture]` per-class overrides included (#2809: listed with their class, so
+/// no consumer reads one as the base parameter). Ascending. One walk for the step and for
+/// `FitResult::held_at_bound`, so the list and the matrix cannot disagree on which
 /// coordinates are held.
 pub(crate) fn held_guard_coordinates(params: &ModelParameters) -> Vec<usize> {
-    let segs = crate::estimation::parameterization::packed_segments(params);
-    let overrides = segs.mixture_omega_start()..segs.mixture_sigma_start() + segs.mixture_sigma;
     collapsed_coordinates(params)
         .into_iter()
         .map(|(i, _)| i)
-        .filter(|i| !overrides.contains(i))
         .collect()
 }
 
@@ -1711,13 +1708,14 @@ pub(crate) fn held_at_bound_list(
             index: k,
             packed_index: k,
             reason: HeldReason::ProfiledBound,
+            class: None,
         })
         .collect();
     for p in held_guard_coordinates(params) {
         if out.iter().any(|h| h.packed_index == p) {
             continue;
         }
-        let Some((kind, index)) = packed_diagonal_parameter(params, &segs, p) else {
+        let Some((kind, index, class)) = packed_diagonal_parameter(params, &segs, p) else {
             continue;
         };
         out.push(HeldAtBound {
@@ -1726,21 +1724,24 @@ pub(crate) fn held_at_bound_list(
             index,
             packed_index: p,
             reason: HeldReason::CollapsedAtGuard,
+            class,
         });
     }
     out.sort_by_key(|h| h.packed_index);
     out
 }
 
-/// The `(family, index)` a packed coordinate reports under — θ index, Ω diagonal, σ, or
-/// κ (Ω_IOV) diagonal — for a θ or a diagonal Ω / Ω_IOV coordinate (a block's packed
-/// `L_ii` names `Omega(i)`, D4) or a σ. `None` for an off-diagonal, a mixture override or
-/// a ρ, none of which is ever held.
+/// The `(family, index, class)` a packed coordinate reports under — θ index, Ω diagonal,
+/// σ, or κ (Ω_IOV) diagonal — for a θ or a diagonal Ω / Ω_IOV coordinate (a block's packed
+/// `L_ii` names `Omega(i)`, D4) or a σ, with `class: None`. A `[mixture]` per-class
+/// override (#2809) names the base η or σ it replaces and its 1-based class
+/// (`omega(2)` → `Some(2)`); an Ω override is always diagonal (the parser refuses a block
+/// one). `None` for an off-diagonal or a ρ, neither of which is ever held.
 fn packed_diagonal_parameter(
     params: &ModelParameters,
     segs: &crate::estimation::parameterization::PackedSegments,
     p: usize,
-) -> Option<(ParameterKind, usize)> {
+) -> Option<(ParameterKind, usize, Option<usize>)> {
     use crate::estimation::parameterization::lower_tri_iter;
     let diag_of = |om: &crate::types::OmegaMatrix, off: usize| {
         lower_tri_iter(om.dim(), om.diagonal)
@@ -1748,14 +1749,26 @@ fn packed_diagonal_parameter(
             .and_then(|(i, j)| (i == j).then_some(i))
     };
     if p < segs.omega_start() {
-        Some((ParameterKind::Theta, p))
+        Some((ParameterKind::Theta, p, None))
     } else if p < segs.sigma_start() {
-        diag_of(&params.omega, p - segs.omega_start()).map(|i| (ParameterKind::Omega, i))
+        diag_of(&params.omega, p - segs.omega_start()).map(|i| (ParameterKind::Omega, i, None))
     } else if p < segs.iov_start() {
-        Some((ParameterKind::Sigma, p - segs.sigma_start()))
+        Some((ParameterKind::Sigma, p - segs.sigma_start(), None))
     } else if p < segs.mixture_omega_start() {
         let iov = params.omega_iov.as_ref()?;
-        diag_of(iov, p - segs.iov_start()).map(|i| (ParameterKind::Kappa, i))
+        diag_of(iov, p - segs.iov_start()).map(|i| (ParameterKind::Kappa, i, None))
+    } else if p < segs.mixture_sigma_start() {
+        let mix = params.mixture.as_ref()?;
+        let &(c, e) = mix
+            .omega_override_addr
+            .get(p - segs.mixture_omega_start())?;
+        Some((ParameterKind::Omega, e, Some(c + 1)))
+    } else if p < segs.rho_start() {
+        let mix = params.mixture.as_ref()?;
+        let &(c, s) = mix
+            .sigma_override_addr
+            .get(p - segs.mixture_sigma_start())?;
+        Some((ParameterKind::Sigma, s, Some(c + 1)))
     } else {
         None
     }
@@ -2036,6 +2049,12 @@ pub(crate) fn apply_held_at_bound(params: &ModelParameters, result: &mut FitResu
     let cov = result.covariance_matrix.clone();
     for h in &result.held_at_bound {
         if h.reason != HeldReason::CollapsedAtGuard || !step_held(cov.as_ref(), h.packed_index) {
+            continue;
+        }
+        // A `[mixture]` override has no `se_*` slot (its covariance row is already the
+        // zero row); its `(kind, index)` names the base parameter, whose SE it must not
+        // touch (#2809).
+        if h.class.is_some() {
             continue;
         }
         // `se_omega` of a block Ω is its whole lower triangle, so the held variance's slot
@@ -3133,8 +3152,8 @@ pub(crate) fn runaway_guard_warning_for(
              log-transformed error model.",
         );
     }
-    // #2797: the collapses the step reports no SE for (`held_guard_coordinates`: a mixture
-    // override is not held), and whether it held them.
+    // #2797: the collapses the step reports no SE for (`held_guard_coordinates`, `[mixture]`
+    // overrides included since #2809), and whether it held them.
     let held_set = held_guard_coordinates(params);
     let collapsed: Vec<&RunawayGuardHit> = hits
         .iter()

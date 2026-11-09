@@ -34,6 +34,7 @@ fn collapse(name: &str, packed_index: usize) -> HeldAtBound {
         index: 0,
         packed_index,
         reason: HeldReason::CollapsedAtGuard,
+        class: None,
     }
 }
 
@@ -439,4 +440,24 @@ fn json_value_carries_status_and_round_trips() {
         plain.to_json_value()["status"],
         serde_json::json!("converged")
     );
+}
+
+/// T10 (#2809, audit 1 row 10): a `[mixture]` override collapse follows the same rule as a
+/// base one. Held (marked in `cov_fixed`): no reason. Not held (a floored `R` or an `S`
+/// fallback): `collapsed_at_guard` names the override, `ETA_CL_MIX2`, never its base
+/// `ETA_CL` — the entry's `kind`/`index` name the base, and the reason must not read them.
+/// Both sides in one test, so a gate stuck on either reddens it.
+#[test]
+fn status_t10_mixture_override_collapse_held_and_not_held() {
+    let override_entry = HeldAtBound {
+        class: Some(2),
+        ..collapse("ETA_CL_MIX2", COLLAPSED_ROW)
+    };
+    let mut held = cell(false, Guard::H, false);
+    held.held_at_bound = vec![override_entry.clone()];
+    assert_cell("T10 held", held, vec![]);
+
+    let mut floored = cell(false, Guard::R, false);
+    floored.held_at_bound = vec![override_entry];
+    assert_cell("T10 not held", floored, vec![guard(&["ETA_CL_MIX2"])]);
 }

@@ -36,7 +36,8 @@ pub(crate) fn se_held(result: &FitResult, kind: ParameterKind, i: usize) -> Opti
     result
         .held_at_bound
         .iter()
-        .find(|h| h.kind == kind && h.index == i)
+        // A `[mixture]` override's `(kind, index)` names its base parameter (#2809).
+        .find(|h| h.class.is_none() && h.kind == kind && h.index == i)
         .map(|h| h.reason)
         .or_else(|| {
             (kind == ParameterKind::Theta && result.profiled_levels_at_bound.contains(&i))
@@ -4561,6 +4562,7 @@ mod tests {
             index: 0,
             packed_index: 3,
             reason: HeldReason::CollapsedAtGuard,
+            class: None,
         }];
         let w = "Covariance step failed: Hessian is not positive definite".to_string();
         issues.warnings_structured = vec![classify_warning(&w)];
@@ -4878,6 +4880,37 @@ mod tests {
         }
     }
 
+    /// T4 (#2809): a `[mixture]` override entry names its base `(kind, index)`, so
+    /// `se_held` must skip it — or the base's SE prints `N/A` in every renderer — while a
+    /// base entry at the same `(kind, index)` still counts (both sides of the gate).
+    #[test]
+    fn se_held_never_reads_a_mixture_override_entry_as_its_base() {
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        let entry = |name: &str, class| HeldAtBound {
+            name: name.into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index: 3,
+            reason: HeldReason::CollapsedAtGuard,
+            class,
+        };
+        r.held_at_bound = vec![entry("eta_CL_MIX2", Some(2))];
+        assert_eq!(se_held(&r, ParameterKind::Omega, 0), None);
+        let table = parameter_table(&r);
+        let row = table
+            .lines()
+            .find(|l| l.starts_with("eta_CL "))
+            .unwrap_or_else(|| panic!("{table}"));
+        assert!(!row.contains("N/A"), "{table}");
+        assert!(row.contains("0.010000"), "{table}");
+
+        r.held_at_bound = vec![entry("eta_CL", None)];
+        assert_eq!(
+            se_held(&r, ParameterKind::Omega, 0),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+    }
+
     /// #2797 test 2: every renderer reads `se_held`, for every kind × reason. A held row
     /// prints `N/A` (console and parameter table) or `se: ~` plus `held: <reason>` (YAML),
     /// a profiled level keeps its `at_bound: true`, and — the negative — a row that is not
@@ -4910,6 +4943,7 @@ mod tests {
             index,
             packed_index,
             reason,
+            class: None,
         };
         r.held_at_bound = vec![
             held("TVV", ParameterKind::Theta, 1, 1, HeldReason::ProfiledBound),
