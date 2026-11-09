@@ -152,6 +152,40 @@ All four agree to **< 1 %**. The `p(1)` row compares NONMEM's direct
 $P(1)=\theta_4$ SE to ferx's logit-scale SE mapped through
 $\operatorname{SE}(p) = p(1-p)\operatorname{SE}(\text{logit})$.
 
+#### Per-class overrides
+
+An `omega(k)` / `sigma(k)` override is an estimated coordinate like any other, and
+since #2833 it is reported with its estimate, SE and %RSE in the console, the fit
+YAML's `mixture_overrides:` section and `parameter_table`, named `<base>_MIX<k>`
+(see [Mixture per-class overrides](../output.qmd#mixture-overrides)). Each override
+packs the log of its class SD, so its SE is put on the reported scale by the delta
+method: $\operatorname{SE}(\omega^2_k) = 2\,\omega^2_k\,\operatorname{SE}(\ln \omega_k)$
+for an Ω override (exact because an Ω override is accepted on a diagonal base only)
+and $\operatorname{SE}(\sigma_k) = \sigma_k\,\operatorname{SE}(\ln \sigma_k)$ for a σ
+override.
+
+Cross-checked against NONMEM at ferx's FOCEI estimate on a 2-class, 80-subject
+population with both overrides interior (`nonmem_anchor/mix_override_se.ctl`: each
+override is a second `ETA` / `EPS` used only for `MIXNUM.EQ.2`, `$EST MAXEVAL=0`,
+`$COV MATRIX=R SIGL=8`). OFVs agree to 9e-8; NONMEM's σ SEs are converted from the
+variance by $\operatorname{SE}(\sigma^2)/2\sigma$:
+
+| SE | NONMEM (`SIGL=8`) | ferx (analytic R) | relative gap |
+|---|---|---|---|
+| `TVCL1` | 0.0536804 | 0.0536807 | 6.2e-6 |
+| `TVCL2` | 0.246881 | 0.246863 | 7.2e-5 |
+| `V` | 0.0772119 | 0.0772116 | 4.2e-6 |
+| `MIXL` | 0.263654 | 0.263651 | 9.8e-6 |
+| `ETA_CL` | 0.0168770 | 0.0168769 | 1.1e-6 |
+| `EPS` | 0.00583841 | 0.00583828 | 2.2e-5 |
+| **`ETA_CL_MIX2`** | 0.0649761 | 0.0649758 | 3.8e-6 |
+| **`EPS_MIX2`** | 0.0106680 | 0.0106675 | 4.1e-5 |
+
+`SIGL=8` matters here. At `SIGL=12` NONMEM's own finite-difference step moves
+`TVCL2` by 1 % and `EPS_MIX2` by 0.66 %, at `SIGL=14` `TVCL2` by 9 %, while ferx's
+analytic and finite-difference R agree with each other and with `SIGL=8`.
+`tests/mixture_override_se_nonmem_anchor.rs` pins each SE against its own bound.
+
 #### The `s` and `rsr` estimators
 
 `covariance_method = s` (`S⁻¹`) and `rsr` (`R⁻¹SR⁻¹`) need a per-subject score

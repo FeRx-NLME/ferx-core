@@ -28,8 +28,8 @@ const EXT: &str = "nonmem_anchor/results/mix_override_se.ext";
 /// `SE(σ) = SE(σ²) / 2σ`.
 const SIGMA_SD: [f64; 2] = [0.10051824793268943, 0.21117117356992268];
 /// Per-SE relative bounds, in [`nonmem_ses`] order (see the table on each test).
-const BOUNDS_ANALYTIC: [f64; 8] = [1.0; 8];
-const BOUNDS_FD: [f64; 8] = [1.0; 8];
+const BOUNDS_ANALYTIC: [f64; 8] = [2e-5, 1.5e-4, 2e-5, 2e-5, 2e-5, 5e-5, 2e-5, 9e-5];
+const BOUNDS_FD: [f64; 8] = [4e-4, 3e-5, 8e-3, 1.2e-3, 5e-4, 1.2e-3, 6e-4, 9e-4];
 
 /// Fixture P at ferx's FOCEI estimate. `sigma(2) … (sd)`: without `(sd)` the class σ is
 /// read on the variance scale, like an undecorated base σ (OFV 597.1, not 441.58).
@@ -190,11 +190,18 @@ fn assert_fixture(f: &FitResult) {
 /// against NONMEM SIGL=8, and the labels every renderer prints on the real fit.
 ///
 /// Bounds: 2× each SE's measured gap, floored at 2e-5 (the `.cov` prints 6 significant
-/// digits). Measured on Linux (the reference platform, `tools/linux-test.sh`) and macOS
-/// arm64, identical in every printed digit:
+/// digits). Measured on Linux aarch64 (the reference platform, `tools/linux-test.sh`) and
+/// macOS arm64, identical in every printed digit:
 ///
 ///   SE            measured   bound
-///   TVCL1         MEASURE    MEASURE
+///   TVCL1         6.15e-6    2e-5
+///   TVCL2         7.16e-5    1.5e-4
+///   TVV           4.15e-6    2e-5
+///   MIXL          9.76e-6    2e-5
+///   ETA_CL        1.12e-6    2e-5
+///   EPS           2.19e-5    5e-5
+///   ETA_CL_MIX2   3.80e-6    2e-5
+///   EPS_MIX2      4.10e-5    9e-5
 ///
 /// Mutations: read `se_mixture_overrides` from a neighbouring row (κ forgotten, Ω/Σ
 /// swapped) or drop the Ω factor 2 → `ETA_CL_MIX2` / `EPS_MIX2` red by orders of
@@ -231,7 +238,21 @@ fn override_standard_errors_match_nonmem_analytic_r() {
 }
 
 /// T8 (#2833): the same anchor on the finite-difference R stencil
-/// (`analytic_cov_hessian = false`), each SE against its own bound.
+/// (`analytic_cov_hessian = false`), each SE against its own bound — the stencil's own,
+/// not T7's: the FD R sits up to 3.75e-3 (TVV) from NONMEM, so T7's bounds would fail it.
+/// The override gaps (2.7e-4, 4.4e-4) are the stencil's accuracy, not a scale error: a
+/// dropped factor 2 or a neighbouring row is off by ≥ 50 %. Measured on Linux aarch64 and
+/// macOS arm64, identical in every printed digit; bounds 2× the gap:
+///
+///   SE            measured   bound
+///   TVCL1         1.93e-4    4e-4
+///   TVCL2         1.26e-5    3e-5
+///   TVV           3.75e-3    8e-3
+///   MIXL          5.58e-4    1.2e-3
+///   ETA_CL        2.19e-4    5e-4
+///   EPS           5.73e-4    1.2e-3
+///   ETA_CL_MIX2   2.74e-4    6e-4
+///   EPS_MIX2      4.44e-4    9e-4
 #[test]
 fn override_standard_errors_match_nonmem_fd_r() {
     let dir = tempfile::tempdir().unwrap();
