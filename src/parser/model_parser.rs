@@ -13027,6 +13027,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
         }
         "vi_seed" => opts.vi_seed = parse_u64_opt("vi_seed")?,
+        // Deprecated (#1841): still parsed so an existing model keeps loading, but read by
+        // nothing; `deprecated_keys` carries the warning it draws on every method.
+        #[allow(deprecated)]
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         // Covariate-NN (DCM) regularization strengths. Non-negative; 0 = off
         // (strict no-op — existing fits stay byte-identical). Settable from the

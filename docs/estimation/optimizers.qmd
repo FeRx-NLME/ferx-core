@@ -13,7 +13,7 @@ It only applies to methods that *have* a single outer-loop minimisation over tha
 | method | does `optimizer` apply? |
 |---|---|
 | `foce` / `focei` | yes — picks the algorithm for the population OFV minimisation |
-| `gn` (pure Gauss-Newton) | no — GN runs its own Levenberg-Marquardt loop |
+| `gn` (pure Gauss-Newton) | no — GN runs its own trust-region loop |
 | `gn_hybrid` | yes for the FOCEI polish phase only; the preceding GN phase ignores it |
 | `saem` | **no** — SAEM has no single outer minimisation; the M-step uses a hardcoded NLopt algorithm and is not user-selectable. Setting `optimizer` under `method = saem` triggers a warning and is otherwise ignored. |
 | `[saem, focei]` (chain) | applies to the FOCEI polish stage only |

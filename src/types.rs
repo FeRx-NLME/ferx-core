@@ -9848,7 +9848,15 @@ pub struct FitOptions {
     /// Base RNG seed for the Bayes sampler. Chain `c` uses a seed derived from
     /// this. `None` draws a nondeterministic seed.
     pub bayes_seed: Option<u64>,
-    /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
+    /// Read by nothing. Gauss-Newton has used a trust region, not Levenberg-Marquardt
+    /// damping, since 0.1.0 (#68), so there is no damping factor for this to set. The
+    /// `[fit_options]` key is still parsed and draws a warning (#1841); the key and this
+    /// field go at the next minor release.
+    #[deprecated(
+        since = "0.4.1",
+        note = "has no effect: Gauss-Newton has used a trust region since 0.1.0; \
+                the field is removed at the next minor release (#1841)"
+    )]
     pub gn_lambda: f64,
     /// L2 (weight-decay) regularization strength for `[covariate_nn]` weights
     /// (NN-only). Adds `nn_l2_lambda · Σ wᵢ²` over the network **weight** blocks
@@ -10515,6 +10523,7 @@ impl Default for FitOptions {
             bayes_chains: 4,
             bayes_thin: 1,
             bayes_seed: None,
+            #[allow(deprecated)] // removed with the field at the next minor (#1841)
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -11706,6 +11715,15 @@ impl FitOptions {
             if key == "method" || key == "methods" {
                 continue;
             }
+            // A deprecated key is read by no method, so it gets its own notice on every
+            // chain instead of the "not used by method" text, which would suggest that
+            // some other method reads it.
+            if let Some(notice) = deprecated_key_notice(key) {
+                if seen.insert(key.clone()) {
+                    warnings.push(notice.to_string());
+                }
+                continue;
+            }
             if applicable.contains(key.as_str()) {
                 continue;
             }
@@ -11865,6 +11883,29 @@ impl FitOptions {
             self.method.label()
         ))
     }
+}
+
+/// `[fit_options]` keys the parser still accepts but nothing reads, each with the
+/// warning [`FitOptions::unsupported_keys_warnings`] emits when it is set, on any method.
+///
+/// A key here is in no `method_specific_keys` list and not in [`framework_keys`]: the
+/// notice is its only diagnostic. Each entry is removed, key and field together, at the
+/// next minor release after it was added.
+pub(crate) fn deprecated_keys() -> &'static [(&'static str, &'static str)] {
+    &[(
+        "gn_lambda",
+        "fit option `gn_lambda` has no effect: Gauss-Newton has used a trust region, not \
+         Levenberg-Marquardt damping, since ferx 0.1.0. Remove the key from your settings; \
+         it will be rejected from the next minor release.",
+    )]
+}
+
+/// The [`deprecated_keys`] notice for `key`, if it is deprecated.
+fn deprecated_key_notice(key: &str) -> Option<&'static str> {
+    deprecated_keys()
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, notice)| *notice)
 }
 
 /// The `ode_*` subset of [`framework_keys`]: knobs that only ever reach the ODE
@@ -12052,7 +12093,6 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
-            "gn_lambda",
             "nn_l2",
             "nn_smooth",
         ],
@@ -12071,7 +12111,6 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_search",
             "global_maxeval",
             "stagnation_guard",
-            "gn_lambda",
             "reconverge_gradient_interval",
             "nn_l2",
             "nn_smooth",

@@ -17,7 +17,7 @@ NONMEM-compatible data through a command-line interface, Rust API, and
 
 - **FOCE/FOCEI estimation** -- First-Order Conditional Estimation with optional interaction, the gold standard for PopPK
 - **SAEM estimation** -- Stochastic Approximation EM for robust convergence on complex models
-- **Gauss-Newton (BHHH)** -- Fast outer optimizer with Levenberg-Marquardt damping, plus a GN+FOCEI hybrid
+- **Gauss-Newton (BHHH)** -- Fast outer optimizer with a trust region, plus a GN+FOCEI hybrid
 - **Importance Sampling (IMP) and SIR** -- For exact likelihood estimation and posterior sampling
 - **Analytical PK solutions** -- Built-in one-, two-, and three-compartment models (IV bolus, oral, infusion) with numerical stability guarantees
 - **ODE solver** -- Dormand-Prince RK45 adaptive integrator for custom kinetic models (e.g. Michaelis-Menten), plus Rosenbrock (`rodas4` / `rodas5p` / `rosenbrock23`) steppers for stiff systems
