@@ -596,6 +596,16 @@ fn sigma_override_collapse_clean_r_is_held_and_named_with_its_class() {
     let p = mixture_params(false, true, None);
     let (msg, details) = mixture_cell(&p, Some(mixture_step_matrix(&[10]))).unwrap();
     names_only_the_override(&msg, "ADD_ERR_MIX3", "ADD_ERR");
+    // The warning's "held" and the list must agree (#2831 review r1 row 4): a Σ branch in
+    // `packed_diagonal_parameter` returning `None` keeps the sentence but drops the entry —
+    // the warning would claim a hold nothing records.
+    let list = super::held_at_bound_list(&p, &[]);
+    assert_eq!(
+        list.iter()
+            .map(|h| (h.name.as_str(), h.kind, h.index, h.class))
+            .collect::<Vec<_>>(),
+        [("ADD_ERR_MIX3", ParameterKind::Sigma, 1, Some(3))]
+    );
     assert!(
         msg.contains("Their standard errors are not reported; "),
         "{msg}"

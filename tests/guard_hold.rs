@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use ferx_core::io::output::parameter_table;
 use ferx_core::parser::model_parser::parse_model_file;
-use ferx_core::types::{FitOptions, FitResult, HeldReason, ParameterKind};
+use ferx_core::types::{FitOptions, FitResult, HeldReason, ParameterKind, StatusReason};
 use ferx_core::{run_covariance, run_model_with_data};
 
 const DATA: &str = "tests/data/guard_hold/sim_oral_no_ka_iiv.csv";
@@ -588,6 +588,17 @@ fn assert_override_held_like_its_fix_twin(analytic: bool) -> FitResult {
         "{tag}: held SEs = FIX twin SEs"
     );
     assert_eq!(f.covariance_matrix, twin.covariance_matrix, "{tag}");
+    // T10 (#2809, audit 1 row 10): the held override is a clean answer, so `status()`
+    // lists no `collapsed_at_guard` — the same verdict as the FIX twin. Mutation: the step
+    // lists the override but does not mark `cov_fixed` → the reason appears.
+    let collapsed = |r: &FitResult| {
+        r.status()
+            .reasons()
+            .iter()
+            .any(|s| matches!(s, StatusReason::CollapsedAtGuard { .. }))
+    };
+    assert!(!collapsed(&f), "{tag}: {:?}", f.status());
+    assert_eq!(f.status(), twin.status(), "{tag}");
 
     let se = f.se_omega.as_ref().unwrap()[0];
     assert!(se.is_finite() && se > 0.0, "{tag}: base ETA_CL SE {se}");
