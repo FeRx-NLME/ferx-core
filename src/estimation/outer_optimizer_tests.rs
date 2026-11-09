@@ -6530,7 +6530,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
 /// (`moving_bounds_separable` reads the resolved infusion windows and lag times), so a
 /// subject can decline at the probe point and be served at its EBE. Both halves of that
 /// are pinned below.
-mod outer_fd_fallback {
+pub(crate) mod outer_fd_fallback {
     use super::*;
     use std::path::Path;
 
@@ -6567,7 +6567,7 @@ mod outer_fd_fallback {
   DV ~ proportional(PROP_ERR)
 "#;
 
-    fn mk_pop(subjects: Vec<Subject>) -> Population {
+    pub(crate) fn mk_pop(subjects: Vec<Subject>) -> Population {
         Population {
             subjects,
             covariate_names: Vec::new(),
@@ -6582,7 +6582,7 @@ mod outer_fd_fallback {
     /// infusion into the depot. An oral infusion routes the subject to the event walk,
     /// and the walk declines an SS infusion under a lag time
     /// (`ss_lagtime_walk_unsupported`), so the twin falls back while its sibling stays exact.
-    fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
+    pub(crate) fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
         let model =
             crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
         let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)

@@ -442,6 +442,16 @@ pub fn optimize_population(
     if let Some(w) = outer_fd_fallback_warning(model, population, &declines) {
         result.warnings.push(w);
     }
+    // #2713: a gradient-driven stop short of convergence reports how far its final
+    // gradient is from the exact one.
+    stop::attach_stop_report(
+        resolved,
+        model,
+        population,
+        init_params,
+        options,
+        &mut result,
+    );
     result
 }
 
@@ -11235,6 +11245,13 @@ impl OuterFdDeclineLog {
         }
     }
 
+    /// Whether subject `i` declined structurally on some evaluation.
+    fn is_structural(&self, i: usize) -> bool {
+        self.structural
+            .get(i)
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
     /// How many declined subjects were structural declines.
     fn n_structural(&self) -> usize {
         self.structural
@@ -11505,12 +11522,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                         declines,
                         || {
                             non_iov_declined_salvage(
-                                // A non-Gaussian subject's held-EBE score drops the EBE
-                                // response it depends on strongly (#1778): reconverge it.
-                                structural
-                                    || declines.reconverge_declined
-                                    || (!subject.obs_records.is_empty()
-                                        && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model)),
+                                declined_salvage_reconverges(model, subject, structural, declines),
                                 x,
                                 init_params,
                                 model,
@@ -11553,6 +11565,23 @@ pub(crate) fn population_gradient_sens_mixed_dx(
             .collect()
     });
     (grad, eta_dx)
+}
+
+/// Whether a declined non-IOV subject takes the reconverged salvage in
+/// [`population_gradient_sens_mixed_dx`] rather than the held-EBE one: a structural decline
+/// (#1536), a log that reconverges every decline (#2136), or a non-Gaussian subject, whose
+/// held-EBE score drops the EBE response it depends on strongly (#1778). The stop report
+/// (#2713) asks the same question to count the subjects left on the held-EBE fallback.
+pub(crate) fn declined_salvage_reconverges(
+    model: &CompiledModel,
+    subject: &Subject,
+    structural: bool,
+    declines: &OuterFdDeclineLog,
+) -> bool {
+    structural
+        || declines.reconverge_declined
+        || (!subject.obs_records.is_empty()
+            && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model))
 }
 
 /// One IOV subject's exact analytic packed outer gradient at the stacked mode
@@ -12179,6 +12208,9 @@ fn covariance_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
 }
+
+#[path = "outer_optimizer_stop.rs"]
+mod stop;
 
 #[cfg(test)]
 #[path = "outer_optimizer_tests.rs"]
