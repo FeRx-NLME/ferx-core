@@ -5268,7 +5268,9 @@ fn gn_lambda_draws_the_deprecation_notice_on_every_method() {
             "method {method}: {w}"
         );
         assert!(
-            w.contains("Gauss-Newton has used a trust region") && w.contains("since ferx 0.1.0"),
+            w.contains("Gauss-Newton has used a trust region")
+                && w.contains("not Levenberg-Marquardt damping")
+                && w.contains("since ferx 0.1.0"),
             "method {method}: {w}"
         );
         // Sentence 2: what to do, and that the key is going away.
@@ -5276,6 +5278,27 @@ fn gn_lambda_draws_the_deprecation_notice_on_every_method() {
         assert!(w.contains("next minor release"), "method {method}: {w}");
         assert!(!w.contains("is not used by method"), "method {method}: {w}");
     }
+}
+
+/// `gn_lambda` set twice — in the model file and again in ferx-r `settings`, both of which go
+/// through `apply_fit_option` and push the key onto `user_set_keys` — still draws one notice.
+#[test]
+fn gn_lambda_set_twice_draws_one_notice() {
+    let mut opts = parse_fit_options(&["method = gn".to_string()]).unwrap();
+    apply_fit_option(&mut opts, "gn_lambda", "0.05").unwrap();
+    apply_fit_option(&mut opts, "gn_lambda", "0.01").unwrap();
+    assert_eq!(
+        opts.user_set_keys
+            .iter()
+            .filter(|k| k.as_str() == "gn_lambda")
+            .count(),
+        2,
+        "fixture must reach the dedup with the key recorded twice: {:?}",
+        opts.user_set_keys
+    );
+    let warnings = opts.unsupported_keys_warnings();
+    assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+    assert!(warnings[0].contains("`gn_lambda`"), "got: {warnings:?}");
 }
 
 /// The notice keys on the key being *set*: the same methods without `gn_lambda` stay
