@@ -133,13 +133,20 @@ The two can disagree. A subject no recorder serves — an out-of-scope ODE dose 
 
 ```
 1 of 32 subjects could not be given the exact analytic outer gradient during this fit
-(e.g. subject 7) (a shape no analytic recorder serves, or a trial point
-where it could not be formed) and used fixed-EBE outer gradients, which omit the
-EBE-response term the analytic gradient carries. If the fit stalls,
-`reconverge_gradient_interval = N` restores the reconverged gradient every N-th
-evaluation. The reported outer gradient method is the model-level route, not the
-per-subject one.
+(e.g. subject 7) (1 with an inner Hessian at the EBE that was singular, or indefinite
+at an EBE that was not stationary (an EBE off a strict mode), at some trial point) and
+used fixed-EBE outer gradients, which omit the EBE-response term the analytic gradient
+carries. If the fit stalls, `reconverge_gradient_interval = N` restores the reconverged
+gradient every N-th evaluation. The reported outer gradient method is the model-level
+route, not the per-subject one.
 ```
+
+The parenthesis counts the declined subjects by cause (#2713), one clause per cause:
+
+- **an inner Hessian at the EBE that was singular, or indefinite at an EBE that was not stationary**: the exact gradient needs a nonsingular `H` at a stationary `η̂`, and this subject's EBE was off a strict mode at some trial point. A large count here points at hard-to-locate or multimodal EBEs rather than at the recorders.
+- **a shape no analytic recorder serves, or a recording that failed or came back non-finite**: no recorder served the subject at that point, either because its records are outside the recorders' scope or because a prediction, Ω factor or gradient component was not finite there.
+
+The counts cover every trial point of the fit, including rejected ones. A subject that declined for both causes is counted under each, so the counts can add up to more than the declined total.
 
 #### What a declined subject is charged {#declined-subject-salvage}
 
