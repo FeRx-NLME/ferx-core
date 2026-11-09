@@ -351,8 +351,9 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
 /// (`whitened_residual_autocorrelation`). The statistic then reports dependence the
 /// line does **not** explain, so the advice is about the line first: under `cs`
 /// every pair of a block correlates equally, and serial dependence that decays with
-/// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima:
-/// `cs` leaves DW 1.43, `ar1` 1.69).
+/// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima,
+/// with the statistic split by arm and pair-normalised since #2798: `cs` leaves DW
+/// 1.63, `ar1` 1.96 — the classic whole-subject form read 1.43 and 1.69).
 pub(crate) fn dw_autocorrelation_warning_decorrelated(
     dw: f64,
     line: &str,
@@ -460,7 +461,8 @@ pub(crate) fn dw_advice(model: &CompiledModel, options: &FitOptions) -> DwAdvice
 /// deterministic ODE mean with an inflated residual variance: it re-weights the
 /// fit rather than supplying the missing dynamics the statistic is reporting.
 /// Measured on a 2-cpt population fitted as 1-cpt, one variable changed:
-/// adding `central ~ 0.01` moved DW from 0.40 to 0.77 — still below the
+/// adding `central ~ 0.01` moved DW (the classic form, before #2798) from 0.40 to
+/// 0.77 — still below the
 /// threshold, so the warning fires again — while CL moved from 0.99 to 2.49
 /// against a truth of 1.0. The hint returns with the mean update.
 pub(crate) fn dw_autocorrelation_warning(dw: f64, advice: &DwAdvice) -> Option<String> {
@@ -3190,6 +3192,9 @@ fn fit_inner(
 
     // Under a `correlation` line the raw IWRES are correlated by construction; the
     // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
+    // Either way each subject's series is split at its occasions and residual blocks
+    // (#2798), read off `population` — the prepared one this fit scored, whose
+    // occasions carry the `iov_column`, a derived rule's labels or the level cells.
     let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
         crate::stats::residual_error::whitened_residual_autocorrelation(
             model,
@@ -3198,7 +3203,7 @@ fn fit_inner(
             &subjects,
         )
     } else {
-        iwres_autocorrelation(&subjects)
+        crate::stats::residual_error::grouped_iwres_autocorrelation(population, &subjects)
     };
 
     // Covariance status. Bayesian fits report posterior credible intervals

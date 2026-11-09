@@ -2658,11 +2658,67 @@ pub fn compute_iwres_with_correlations(
 
 /// Compute pooled lag-1 autocorrelation diagnostics on IWRES across subjects.
 ///
-/// Subjects with fewer than 2 finite IWRES values are skipped.
-/// Returns `(lag1_r, durbin_watson)` where DW = 2.0 indicates no autocorrelation.
+/// Each subject's IWRES is one series (this entry has no `Population` to group by;
+/// the fit's own statistic splits each subject at its occasions and residual
+/// blocks, #2798). Subjects with fewer than 2 finite IWRES values are skipped.
+/// Returns `(lag1_r, durbin_watson)`, the Durbin–Watson statistic pair-normalised:
+/// `Σ (eₜ − eₜ₋₁)² / Σ (eₜ² + eₜ₋₁²)/2` over the same lag pairs, so independent
+/// residuals give 2 whatever the series lengths.
 /// Returns `(f64::NAN, f64::NAN)` when no subject has enough observations.
 pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
     residual_autocorrelation(subjects.iter().map(|s| s.iwres.as_slice()))
+}
+
+/// The series the fit's Durbin–Watson statistic pairs within (#2798): `values`
+/// (one per observation row of `subject`) split into the rows sharing the key
+/// `(occasions[j], obs_rgroup[j])`, each part of the key read only when the subject
+/// carries it. Rows are grouped **by key**, not by contiguous run, and kept in row
+/// order; the groups come out in order of first appearance.
+///
+/// The key is what the fit grouped the rows by: the occasions are the prepared
+/// population's (an `iov_column`, a derived `iov_occasion` rule, or a nested
+/// model's level cells, `assign_level_cells`), and the residual blocks a
+/// `correlation … by` line's (`assign_residual_groups`). Whitened residuals split
+/// the same way: the Cholesky factor of a block-diagonal (up to permutation) `R`
+/// has no fill between blocks, so whitening never mixes two groups.
+pub(crate) fn split_by_residual_group(
+    values: &[f64],
+    subject: &crate::types::Subject,
+) -> Vec<Vec<f64>> {
+    // A subject's vector is either empty (the key part is absent: every row `None`)
+    // or one entry per row, so `get` alone reads both cases.
+    let part = |v: &[u32], j: usize| v.get(j).copied();
+    let mut keys: Vec<(Option<u32>, Option<u32>)> = Vec::new();
+    let mut groups: Vec<Vec<f64>> = Vec::new();
+    for (j, &e) in values.iter().enumerate() {
+        let key = (part(&subject.occasions, j), part(&subject.obs_rgroup, j));
+        match keys.iter().position(|k| *k == key) {
+            Some(g) => groups[g].push(e),
+            None => {
+                keys.push(key);
+                groups.push(vec![e]);
+            }
+        }
+    }
+    groups
+}
+
+/// The fit's statistic on raw IWRES (#2798): [`iwres_autocorrelation`] with each
+/// subject's series split by [`split_by_residual_group`] on the **prepared**
+/// `population` (the one the fit scored, whose occasions and residual blocks are
+/// set), so lag pairs never join one occasion's last row to the next one's first.
+pub(crate) fn grouped_iwres_autocorrelation(
+    population: &crate::types::Population,
+    subjects: &[SubjectResult],
+) -> (f64, f64) {
+    debug_assert_eq!(population.subjects.len(), subjects.len());
+    let series: Vec<Vec<f64>> = population
+        .subjects
+        .iter()
+        .zip(subjects)
+        .flat_map(|(subject, res)| split_by_residual_group(&res.iwres, subject))
+        .collect();
+    residual_autocorrelation(series.iter().map(Vec::as_slice))
 }
 
 /// [`iwres_autocorrelation`] under a `correlation … by COL` line (#1081): the same
@@ -2679,6 +2735,9 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
 /// *not* explain? On raw IWRES it would report the correlation the line was written
 /// to model (Durbin–Watson 0.99 on the naproxen `cs` fit). A subject whose `R` does
 /// not factor contributes nothing, as a subject with < 2 finite IWRES does.
+///
+/// The whitened series is split like the raw one ([`split_by_residual_group`],
+/// #2798): pairs stay within one `(occasion, residual block)` cell.
 pub(crate) fn whitened_residual_autocorrelation(
     model: &crate::types::CompiledModel,
     population: &crate::types::Population,
@@ -2689,7 +2748,7 @@ pub(crate) fn whitened_residual_autocorrelation(
         .subjects
         .iter()
         .zip(subjects)
-        .map(|(subject, res)| {
+        .flat_map(|(subject, res)| {
             let n = res.iwres.len();
             if n != subject.observations.len() || res.iwres.iter().any(|v| !v.is_finite()) {
                 return Vec::new();
@@ -2714,18 +2773,27 @@ pub(crate) fn whitened_residual_autocorrelation(
             );
             chol.l()
                 .solve_lower_triangular(&e)
-                .map(|w| w.as_slice().to_vec())
+                .map(|w| split_by_residual_group(w.as_slice(), subject))
                 .unwrap_or_default()
         })
         .collect();
     residual_autocorrelation(series.iter().map(Vec::as_slice))
 }
 
-/// Pooled lag-1 Pearson correlation and Durbin–Watson statistic of residual series,
-/// one per subject (shared by [`iwres_autocorrelation`] and
-/// [`whitened_residual_autocorrelation`]).
+/// Pooled lag-1 Pearson correlation and Durbin–Watson statistic of residual series
+/// (shared by [`iwres_autocorrelation`], [`grouped_iwres_autocorrelation`] and
+/// [`whitened_residual_autocorrelation`]). Both are taken over the same lag pairs:
+/// consecutive finite values of one series (a non-finite value is dropped and its
+/// neighbours become a pair).
+///
+/// The Durbin–Watson denominator is **pair-normalised** (#2798),
+/// `Σ_pairs (eₜ² + eₜ₋₁²)/2`, not the classic `Σ eₜ²` over every row. Under the
+/// classic form `E[DW] ≈ 2·pairs/rows` for independent residuals — 1.70 on the
+/// naproxen MBMA's layout, so a correct model warned 12% of the time, and splitting
+/// each subject into shorter series would pull it lower still. Pair-normalised,
+/// independent residuals give 2 whatever the series lengths.
 fn residual_autocorrelation<'a>(series: impl Iterator<Item = &'a [f64]>) -> (f64, f64) {
-    // Accumulators for Durbin-Watson: Σ(eᵢ - eᵢ₋₁)², Σeᵢ²
+    // Accumulators for Durbin-Watson: Σ(eₜ - eₜ₋₁)², Σ(eₜ² + eₜ₋₁²)/2
     let mut dw_num = 0.0_f64;
     let mut dw_den = 0.0_f64;
 
@@ -2746,16 +2814,14 @@ fn residual_autocorrelation<'a>(series: impl Iterator<Item = &'a [f64]>) -> (f64
         if valid.len() < 2 {
             continue;
         }
-        // DW accumulation
-        dw_den += valid.iter().map(|e| e * e).sum::<f64>();
-        for w in valid.windows(2) {
-            let diff = w[1] - w[0];
-            dw_num += diff * diff;
-        }
-        // Lag-1 Pearson accumulation
         for w in valid.windows(2) {
             let x = w[0];
             let y = w[1];
+            // DW accumulation
+            let diff = y - x;
+            dw_num += diff * diff;
+            dw_den += 0.5 * (x * x + y * y);
+            // Lag-1 Pearson accumulation
             sum_x += x;
             sum_y += y;
             sum_x2 += x * x;
@@ -4693,8 +4759,11 @@ mod tests {
 
     #[test]
     fn test_dw_uncorrelated_near_two() {
-        // White-noise-like residuals → DW near 2 (no autocorrelation)
-        let subj = make_subject(vec![1.0, -0.5, 0.2, 0.8, -0.3, -0.7, 0.4, 0.1]);
+        // White-noise-like residuals → DW near 2 (no autocorrelation). Pair-normalised
+        // DW 2.217 (#2798); the earlier sequence [1, −0.5, 0.2, 0.8, −0.3, −0.7, 0.4,
+        // 0.1] sat in the band only under the classic ÷Σe² (2.15) and reads 2.65 here
+        // — its lag-1 r is negative, which the classic form's downward bias hid.
+        let subj = make_subject(vec![1.0, 0.3, -0.8, 0.5, 0.9, -0.4, -0.2, 0.6]);
         let (_r, dw) = iwres_autocorrelation(&[subj]);
         assert!(
             dw > 1.5 && dw < 2.5,
@@ -4728,6 +4797,179 @@ mod tests {
         let (r, dw) = iwres_autocorrelation(&[subj]);
         assert!(r.is_nan());
         assert!(dw.is_nan());
+    }
+
+    // ── #2798 PR B: pair-normalised, grouped Durbin–Watson ─────────────────────────
+
+    /// A one-subject population whose rows carry `occasions` (empty = none).
+    fn population_with_occasions(occasions: Vec<u32>) -> crate::types::Population {
+        let n = occasions.len().max(4);
+        crate::types::Population {
+            subjects: vec![crate::types::Subject {
+                obs_times: (0..n).map(|j| j as f64).collect(),
+                observations: vec![0.0; n],
+                obs_cmts: vec![1; n],
+                occasions,
+                ..Default::default()
+            }],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    /// B3: the denominator is pair-normalised. `e = [1, 2]` is one pair:
+    /// `(2 − 1)² / ((1² + 2²)/2) = 1 / 2.5 = 0.4`, where the classic `Σ e²`
+    /// denominator gives `1 / 5 = 0.2`.
+    ///
+    /// Mutation that must redden this: the denominator back to `Σ e²` over every row.
+    #[test]
+    fn dw_denominator_is_pair_normalised() {
+        let (_r, dw) = iwres_autocorrelation(&[make_subject(vec![1.0, 2.0])]);
+        assert!(dw.is_finite(), "{dw}");
+        assert!(
+            (dw - 0.4).abs() < 1e-15,
+            "pair-normalised DW of [1, 2] is 0.4 (classic 0.2), got {dw}"
+        );
+    }
+
+    /// B1: the fit's statistic pairs rows of one occasion only. `e = [1, 1, −1, −1]`
+    /// whole is three pairs, `(0 + 4 + 0) / (1 + 1 + 1) = 4/3`; split at occasions
+    /// `[1, 1, 2, 2]` it is the two flat pairs, `0 / 2 = 0`.
+    ///
+    /// Mutation that must redden this: a key that ignores `occasions`.
+    #[test]
+    fn grouped_dw_splits_at_occasions() {
+        let res = make_subject(vec![1.0, 1.0, -1.0, -1.0]);
+        let pop = population_with_occasions(vec![1, 1, 2, 2]);
+        let (r, dw) = grouped_iwres_autocorrelation(&pop, std::slice::from_ref(&res));
+        assert!(dw.is_finite() && r.is_finite(), "({r}, {dw})");
+        assert!(dw.abs() < 1e-15, "split at the occasion: DW 0, got {dw}");
+        // The lag-1 r over the same two pairs: x = [1, −1], y = [1, −1], r = 1.
+        assert!(
+            (r - 1.0).abs() < 1e-12,
+            "lag-1 r over the split pairs, got {r}"
+        );
+        let (_, whole) = iwres_autocorrelation(std::slice::from_ref(&res));
+        assert!(whole.is_finite());
+        assert!(
+            (whole - 4.0 / 3.0).abs() < 1e-15,
+            "whole subject: 4/3, got {whole}"
+        );
+    }
+
+    /// B2: the split is a function of the occasions, neither a no-op nor always on.
+    /// One occasion (or none) is the whole series, bit for bit the public ungrouped
+    /// [`iwres_autocorrelation`]; two occasions differ from it.
+    ///
+    /// Mutations that must redden this: the split made a no-op; every row its own
+    /// group (no pairs, `NaN`).
+    #[test]
+    fn grouped_dw_is_the_ungrouped_one_on_a_single_occasion() {
+        let res = make_subject(vec![1.0, 1.0, -1.0, -1.0]);
+        let ungrouped = iwres_autocorrelation(std::slice::from_ref(&res));
+        assert!(ungrouped.0.is_finite() && ungrouped.1.is_finite());
+        for occ in [vec![1, 1, 1, 1], vec![]] {
+            let label = format!("{occ:?}");
+            let pop = population_with_occasions(occ);
+            let got = grouped_iwres_autocorrelation(&pop, std::slice::from_ref(&res));
+            assert!(got.0.is_finite() && got.1.is_finite(), "{label}: {got:?}");
+            assert_eq!(got.0.to_bits(), ungrouped.0.to_bits(), "{label}: lag-1 r");
+            assert_eq!(got.1.to_bits(), ungrouped.1.to_bits(), "{label}: DW");
+        }
+        let split = grouped_iwres_autocorrelation(
+            &population_with_occasions(vec![1, 1, 2, 2]),
+            std::slice::from_ref(&res),
+        );
+        assert!(split.1.is_finite());
+        assert!(
+            (split.1 - ungrouped.1).abs() > 1.0,
+            "two occasions must move DW: {} vs {}",
+            split.1,
+            ungrouped.1
+        );
+    }
+
+    /// Exit condition of #2798: white noise on the naproxen MBMA's layout (18 studies
+    /// of two arms, arm lengths 2×8, 3×12, 4×10, 5×6 = 122 rows, each arm an
+    /// occasion) gives the grouped, pair-normalised statistic a mean of 2 and a
+    /// false-warning rate near 1% per side. Under the classic `÷ Σ e²` the same draws gave a
+    /// mean of 1.70 and warned 12% of the time unsplit, 71.5% split (plan §0.3,
+    /// 20 000 draws in Python; this test re-runs it on the kernel with 4 000).
+    ///
+    /// Realised (seed 2798, 4 000 draws, macOS arm64): mean 1.9940, P(DW < 1.5)
+    /// 0.0085, P(DW > 2.5) 0.0075. Bounds: mean within 0.03 of 2 (its Monte-Carlo SE
+    /// is ≈ 0.004), each tail's rate below 3% (≈ 1% ± 0.15%); the upper tail is the
+    /// one the classic form never reached (0.0% on this layout).
+    /// The classic split would fail both by an order of magnitude.
+    #[test]
+    fn grouped_dw_is_calibrated_on_white_noise_at_the_naproxen_layout() {
+        use rand::SeedableRng;
+        use rand_distr::{Distribution, Normal};
+        let mut lengths: Vec<usize> = Vec::new();
+        for (len, count) in [(2usize, 8usize), (3, 12), (4, 10), (5, 6)] {
+            lengths.extend(std::iter::repeat_n(len, count));
+        }
+        assert_eq!(lengths.len(), 36);
+        assert_eq!(lengths.iter().sum::<usize>(), 122);
+        // Study i holds arms 2i and 2i+1, labelled occasions 1 and 2.
+        let mut subjects = Vec::new();
+        for study in lengths.chunks(2) {
+            let occ: Vec<u32> = study
+                .iter()
+                .enumerate()
+                .flat_map(|(a, &len)| std::iter::repeat_n(a as u32 + 1, len))
+                .collect();
+            subjects.push(crate::types::Subject {
+                obs_times: (0..occ.len()).map(|j| j as f64).collect(),
+                observations: vec![0.0; occ.len()],
+                obs_cmts: vec![1; occ.len()],
+                occasions: occ,
+                ..Default::default()
+            });
+        }
+        let pop = crate::types::Population {
+            subjects,
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(2798);
+        let normal = Normal::new(0.0, 1.0).unwrap();
+        let n_draws = 4000;
+        let (mut sum, mut below, mut above) = (0.0, 0usize, 0usize);
+        for _ in 0..n_draws {
+            let results: Vec<SubjectResult> = pop
+                .subjects
+                .iter()
+                .map(|s| {
+                    make_subject(
+                        (0..s.occasions.len())
+                            .map(|_| normal.sample(&mut rng))
+                            .collect(),
+                    )
+                })
+                .collect();
+            let (_, dw) = grouped_iwres_autocorrelation(&pop, &results);
+            assert!(dw.is_finite(), "{dw}");
+            sum += dw;
+            below += usize::from(dw < 1.5);
+            above += usize::from(dw > 2.5);
+        }
+        let mean = sum / n_draws as f64;
+        let rate = below as f64 / n_draws as f64;
+        let rate_hi = above as f64 / n_draws as f64;
+        eprintln!(
+            "white noise, naproxen layout: mean DW {mean:.4}, P(DW < 1.5) {rate:.4}, \
+             P(DW > 2.5) {rate_hi:.4}"
+        );
+        assert!((mean - 2.0).abs() < 0.03, "mean DW {mean}");
+        assert!(rate < 0.03, "P(DW < 1.5) = {rate}");
+        assert!(rate_hi < 0.03, "P(DW > 2.5) = {rate_hi}");
     }
 }
 

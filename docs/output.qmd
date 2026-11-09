@@ -499,12 +499,16 @@ Both metrics are `NaN` when `omega_iov` diagonal is zero or fewer than two subje
 
 Two pooled autocorrelation diagnostics are reported after every fit:
 
-**`iwres_lag1_r`** — pooled lag-1 Pearson correlation of IWRES across subjects. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.
+Both are pooled over **lag pairs**: two consecutive rows of one series. A series is the rows of one subject that share its occasion (an `iov_column`, a derived `iov_occasion`, or a nested model's innermost level cell) and its `correlation … by` block, in row order. So a pair never joins one arm's or occasion's last visit to the next one's first.
 
-**`dw_statistic`** — pooled Durbin-Watson statistic:
+**`iwres_lag1_r`** — pooled lag-1 Pearson correlation of IWRES over those pairs. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.
+
+**`dw_statistic`** — pooled Durbin-Watson statistic, pair-normalised:
 $$
-\text{DW} = \frac{\sum_i \sum_t (e_{i,t} - e_{i,t-1})^2}{\sum_i \sum_t e_{i,t}^2}
+\text{DW} = \frac{\sum_{\text{pairs}} (e_{t} - e_{t-1})^2}{\sum_{\text{pairs}} \tfrac12\,(e_{t}^2 + e_{t-1}^2)}
 $$
+
+The denominator runs over the same pairs as the numerator, so independent residuals give 2 however short the series are. The classic form, $\sum e_t^2$ over every row, has expectation about $2 \cdot \text{pairs}/\text{rows}$: 1.70 on the 122 rows of the naproxen MBMA, where it warned on 12% of white-noise draws. The pair-normalised, per-series statistic has mean 2.00 there and warns on about 1% of draws on each side, about 2% in all (the classic form's 12% was all on the low side; its high-DW warning fired on 0.0% of draws). This changed after 0.4.0 ([#2798](https://github.com/FeRx-NLME/ferx-core/issues/2798)), so DW values from earlier versions are not comparable. Under a `correlation` line the residuals are decorrelated first ([Diagnostics](model-file/residual-correlation.qmd#diagnostics)).
 
 | DW range | Interpretation |
 |----------|---------------|
@@ -512,9 +516,9 @@ $$
 | < 1.5 | Positive autocorrelation — structural model likely missing dynamics |
 | > 2.5 | Negative autocorrelation — possible over-parameterization or misspecified error model |
 
-Subjects with fewer than 2 finite IWRES values are excluded from both statistics. Both fields are `NaN` when no subject qualifies.
+A series with fewer than 2 finite IWRES values contributes no pair. Both fields are `NaN` when there is no pair at all.
 
-When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption model, additional compartment, or IOV on ka/F. When `dw_statistic > 2.5`, the warning suggests over-parameterization or a misspecified error model.
+When `dw_statistic < 1.5`, ferx warns. On a model with compartments the warning suggests a transit absorption model, an additional compartment, or IOV on ka/F; on a compartment-free model it suggests a `correlation` line ([`dw_autocorrelation`](warnings.qmd#codes-residuals)). When `dw_statistic > 2.5`, the warning suggests over-parameterization or a misspecified error model.
 
 The warning used to add "SDE process noise may also help" on ODE models. It no longer does: the Kalman filter behind `[diffusion]` propagates the state covariance but never corrects the state mean with the observed data, so it inflates the observation variance instead of supplying the dynamics the statistic is reporting — see [what the filter does not do](model-file/diffusion.qmd#what-the-filter-does-not-do).
 

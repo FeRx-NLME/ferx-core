@@ -288,17 +288,21 @@ it.
 
 The pooled Durbin–Watson statistic and lag-1 correlation (`dw_statistic`,
 `iwres_lag1_r`) are taken on each subject's residuals decorrelated by the fitted
-`R`, `L⁻¹(y − IPRED)` with `R = L Lᵀ`. Under the model these are independent, so a
-value outside `[1.5, 2.5]` reports dependence the line does **not** explain. On the
-naproxen data at NONMEM's optima:
+`R`, `L⁻¹(y − IPRED)` with `R = L Lᵀ`, and paired within each `by` block
+([IWRES autocorrelation](../output.qmd#iwres-autocorrelation)). Under the model
+these are independent, so a value outside `[1.5, 2.5]` reports dependence the line
+does **not** explain. On the naproxen data at NONMEM's optima:
 
-| | raw IWRES | decorrelated |
+| | raw IWRES, whole subject | decorrelated, per arm |
 |---|---|---|
-| `cs` | 0.99 | 1.43 — warns, with the `ar1` advice |
-| `ar1` | 0.94 | 1.69 — silent |
+| `cs` | 1.11 | 1.63 — silent |
+| `ar1` | 1.06 | 1.96 — silent |
 
 Compound symmetry correlates every two visits of an arm equally, and what is left
-is the decay with distance that `ar1` carries. Under `car1` a warning names `ar1`
+is the decay with distance that `ar1` carries: `cs` leaves more of it (1.63 against
+1.96), though no longer past the 1.5 threshold. Through 0.4.0 the statistic paired
+across arms and divided by every row's square (1.43 and 1.69, so `cs` warned).
+When `cs` does warn, the warning names `ar1`. Under `car1` a warning names `ar1`
 as the alternative that decays with the visit order instead of the time. The `IWRES` column is unchanged
 (per-row standardised).
 
