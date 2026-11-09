@@ -135,8 +135,21 @@ fn a_mixture_override_stopped_short_of_the_guard_is_resumed_onto_it() {
         !w.contains("ETA_CL ("),
         "the bare base name points at the base: {w}"
     );
-    // `held_at_bound` listing the override (`class = Some(2)`) needs #2831, open when this
-    // was written: whichever of the two lands second adds that assertion here.
+    // Now on the guard, the override is held as #2831 holds it: listed by its own name and
+    // class, under the base η's family and index. Before rail completion it was not on the
+    // guard, so not collapsed, so not listed at all.
+    let held: Vec<_> = r
+        .held_at_bound
+        .iter()
+        .filter(|h| h.reason == HeldReason::CollapsedAtGuard)
+        .map(|h| (h.name.as_str(), h.kind, h.index, h.class))
+        .collect();
+    assert_eq!(
+        held,
+        vec![("ETA_CL_MIX2", ParameterKind::Omega, 0, Some(2))],
+        "{:?}",
+        r.held_at_bound
+    );
 }
 
 /// T5. Labels swapped: the base ω collapses instead, is resumed onto the guard and held;
