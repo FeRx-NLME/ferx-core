@@ -43,22 +43,6 @@ fn fixture(iov: bool, mixed_fallback: bool) -> (CompiledModel, Population) {
     (model, pop)
 }
 
-/// The adjoint's cause for subject `s`'s declined outer gradient at `x` and `eta`, as the
-/// production assembly reads it (#2713).
-fn decline_cause(
-    model: &CompiledModel,
-    s: &Subject,
-    template: &ModelParameters,
-    x: &[f64],
-    eta: &[f64],
-    interaction: bool,
-) -> DeclineCause {
-    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x).expect("packed");
-    subject_analytic_outer_gradient_dx(model, s, &pt, eta, interaction, false)
-        .0
-        .expect_err("the subject declines")
-}
-
 fn bits(values: &[f64]) -> Vec<u64> {
     values.iter().map(|v| v.to_bits()).collect()
 }
@@ -276,14 +260,12 @@ fn fused_gradient_preserves_analytic_and_subject_fallback_results() {
                         // The production dispatch: reconverged for a structural decline
                         // (#1536), held-EBE otherwise.
                         _ => non_iov_declined_salvage(
-                            is_structural_decline(decline_cause(
+                            is_structural_decline(
                                 &model,
                                 &pop.subjects[i],
                                 params,
-                                &x,
                                 etas[i].as_slice(),
-                                interaction,
-                            )),
+                            ),
                             &x,
                             params,
                             &model,
@@ -895,6 +877,15 @@ fn iov_salvage_probes_start_at_the_subject_mode() {
         vec![0],
         "fixture: subject 0 is salvaged"
     );
+    // #2713: the IOV assembly records the cause too: a recorder decline.
+    assert_eq!(
+        (
+            declines.n_cause(DeclineCause::ModeSystem),
+            declines.n_cause(DeclineCause::Recording)
+        ),
+        (0, 1),
+        "the IOV route must record why subject 0 declined"
+    );
     let n = assert_starts_at_modes("IOV salvage", &rec, |_| true, &pop, &etas, &kappas);
     crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
         "IOV salvage",
@@ -969,14 +960,7 @@ fn non_iov_salvage_probes_resolve_at_the_stencil_tol() {
     let opts = FitOptions::default();
     let (etas, hms, _, _) = run_inner_loop_warm(&model, &pop, params, 200, 1e-8, None, None, 0, 0);
     assert!(
-        is_structural_decline(decline_cause(
-            &model,
-            &pop.subjects[0],
-            params,
-            &x,
-            etas[0].as_slice(),
-            opts.interaction,
-        )),
+        is_structural_decline(&model, &pop.subjects[0], params, etas[0].as_slice()),
         "fixture: subject 0 is a structural decline, so its salvage reconverges"
     );
     let declines = OuterFdDeclineLog::new(pop.subjects.len());

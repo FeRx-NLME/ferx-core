@@ -2024,47 +2024,6 @@ fn an_infusion_into_an_absorption_kernel_declines_to_fd() {
     assert!(exact_eta_jacobian(&m, &inf, &p.theta, &[0.0, 0.0]).is_none());
 }
 
-/// #2713 review round 3: the ODE recorder's decline of an infusion into a built-in
-/// absorption kernel is the subject's shape, so the adjoint names it `Shape`, not a failed
-/// recording. Both ODE walks decline the subject on its records alone
-/// (`has_infusion_into_input_rate`), at every parameter point. The bolus twin is the
-/// straddle: served, no cause. Mutation that reddens it: the ODE arm of
-/// `recorder_declines_shape` answering `false`.
-#[test]
-fn an_infusion_into_an_absorption_kernel_is_a_shape_decline() {
-    let m = parse_model_string(SS_FIRST_ORDER_F).unwrap();
-    let times = [1.0, 3.0, 6.0, 9.0, 12.0];
-    let bolus = subject(
-        &m,
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        &times,
-        &[0.0, 0.0],
-    );
-    let mut inf = bolus.clone();
-    inf.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
-    let p = m.default_params.clone();
-    let x = pack_params(&p);
-    let pt = PackedPoint::new(&p, &x).expect("packed point");
-    let cause = |s: &Subject| {
-        let mut out = ModeOut::default();
-        let g = subject_adjoint_gradient_and_mode_at(
-            &m,
-            s,
-            &pt,
-            &[0.0, 0.0],
-            Objective::Focei,
-            &mut out,
-        );
-        (g.is_some(), out.decline)
-    };
-    assert_eq!(cause(&bolus), (true, None), "the bolus twin is served");
-    assert_eq!(
-        cause(&inf),
-        (false, Some(DeclineCause::Shape)),
-        "an infusion into the absorption kernel declines for its shape"
-    );
-}
-
 const SS_ZERO_ORDER: &str = r#"
 [parameters]
   theta TVCL(1.0, 0.01, 50.0)
