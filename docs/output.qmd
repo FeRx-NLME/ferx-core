@@ -508,7 +508,7 @@ $$
 \text{DW} = \frac{\sum_{\text{pairs}} (e_{t} - e_{t-1})^2}{\sum_{\text{pairs}} \tfrac12\,(e_{t}^2 + e_{t-1}^2)}
 $$
 
-The denominator runs over the same pairs as the numerator, so independent residuals give 2 however short the series are. The classic form, $\sum e_t^2$ over every row, has expectation about $2 \cdot \text{pairs}/\text{rows}$: 1.70 on the 122 rows of the naproxen MBMA, where it warned on 12% of white-noise draws. The pair-normalised, per-series statistic has mean 2.00 there and warns on about 1%. This changed after 0.4.0 ([#2798](https://github.com/FeRx-NLME/ferx-core/issues/2798)), so DW values from earlier versions are not comparable. Under a `correlation` line the residuals are decorrelated first ([Diagnostics](model-file/residual-correlation.qmd#diagnostics)).
+The denominator runs over the same pairs as the numerator, so independent residuals give 2 however short the series are. The classic form, $\sum e_t^2$ over every row, has expectation about $2 \cdot \text{pairs}/\text{rows}$: 1.70 on the 122 rows of the naproxen MBMA, where it warned on 12% of white-noise draws. The pair-normalised, per-series statistic has mean 2.00 there and warns on about 1% of draws on each side, about 2% in all (the classic form's 12% was all on the low side; its high-DW warning fired on 0.0% of draws). This changed after 0.4.0 ([#2798](https://github.com/FeRx-NLME/ferx-core/issues/2798)), so DW values from earlier versions are not comparable. Under a `correlation` line the residuals are decorrelated first ([Diagnostics](model-file/residual-correlation.qmd#diagnostics)).
 
 | DW range | Interpretation |
 |----------|---------------|

@@ -677,3 +677,53 @@ fn grouped_dw_groups_by_key_not_by_contiguous_run() {
     assert_eq!(interleaved.1.to_bits(), contiguous.1.to_bits());
     assert_eq!(interleaved.0.to_bits(), contiguous.0.to_bits());
 }
+
+/// #2798 review row 2: the key is the **pair** `(occasion, residual block)`, not
+/// either part alone, nor occasions-if-present-else-block. Two occasions crossed with
+/// two blocks give four cells of two rows each; every other key joins rows across a
+/// cell boundary and lands on a different value, which the test computes and asserts
+/// apart (so the straddle cannot quietly become a tautology).
+///
+/// Rows `e = [1, 2 | 3, 1 | −1, 1 | 2, 2]`, cells `(1,0) (1,1) (2,0) (2,1)`:
+/// pairs (1,2) (3,1) (−1,1) (2,2), Σ diff² = 1 + 4 + 4 + 0 = 9,
+/// Σ (eₜ²+eₜ₋₁²)/2 = 2.5 + 5 + 1 + 4 = 12.5, DW = 0.72.
+/// Occasion alone: 11 / 21.5 = 0.5116. Block alone: 19 / 17.5 = 1.0857.
+#[test]
+fn grouped_dw_keys_on_occasion_and_block_together() {
+    let pop_of = |occasions: Vec<u32>, obs_rgroup: Vec<u32>| crate::types::Population {
+        subjects: vec![Subject {
+            obs_times: (0..8).map(f64::from).collect(),
+            observations: vec![0.0; 8],
+            obs_cmts: vec![1; 8],
+            occasions,
+            obs_rgroup,
+            ..Default::default()
+        }],
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let mut res = crate::types::test_helpers::dummy_subject("1", 0, 8);
+    res.iwres = vec![1.0, 2.0, 3.0, 1.0, -1.0, 1.0, 2.0, 2.0];
+    let res = [res];
+    let occ = vec![1, 1, 1, 1, 2, 2, 2, 2];
+    let grp = vec![0, 0, 1, 1, 0, 0, 1, 1];
+    let both = grouped_iwres_autocorrelation(&pop_of(occ.clone(), grp.clone()), &res).1;
+    let occ_only = grouped_iwres_autocorrelation(&pop_of(occ, vec![]), &res).1;
+    let grp_only = grouped_iwres_autocorrelation(&pop_of(vec![], grp), &res).1;
+    assert!(both.is_finite() && occ_only.is_finite() && grp_only.is_finite());
+    assert!(
+        (occ_only - 11.0 / 21.5).abs() < 1e-12,
+        "occasion only: {occ_only}"
+    );
+    assert!(
+        (grp_only - 19.0 / 17.5).abs() < 1e-12,
+        "block only: {grp_only}"
+    );
+    assert!(
+        (both - 9.0 / 12.5).abs() < 1e-12,
+        "(occasion, block): {both}, occasion alone {occ_only}, block alone {grp_only}"
+    );
+}

@@ -427,8 +427,8 @@ fn fd_stencil_se_of_rho_runs_low_by_its_truncation_error() {
 /// matches to the 4 decimals it printed. The constants are ferx's Linux aarch64
 /// digits (`tools/linux-test.sh`); native macOS arm64 prints the same nine decimals
 /// for both kinds, so the realised `|ferx − want|` is < 5e-10 (the print) on both.
-/// Bound 1e-6, above the print and the FOCE inner tolerance's reach into the
-/// whitened residuals, and 2e5× below the 0.21 the change moved `cs` by.
+/// Bound 1e-8: 20× the 5e-10 print floor of that realised error, and 2e7× below the
+/// 0.21 the change moved `cs` by.
 ///
 /// Raw IWRES would still warn on both — they are correlated by construction.
 /// Decorrelated, neither warns any more: `cs` sits at 1.63, above the 1.5 threshold
@@ -455,7 +455,7 @@ fn durbin_watson_is_taken_on_decorrelated_residuals() {
             raw.1
         );
         assert!(
-            (r.dw_statistic - want_dw).abs() < 1e-6,
+            (r.dw_statistic - want_dw).abs() < 1e-8,
             "{kind}: DW {}",
             r.dw_statistic
         );

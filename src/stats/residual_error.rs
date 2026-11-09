@@ -2685,8 +2685,10 @@ pub(crate) fn split_by_residual_group(
     values: &[f64],
     subject: &crate::types::Subject,
 ) -> Vec<Vec<f64>> {
-    let part = |v: &[u32], j: usize| (!v.is_empty()).then(|| v.get(j).copied());
-    let mut keys: Vec<(Option<Option<u32>>, Option<Option<u32>>)> = Vec::new();
+    // A subject's vector is either empty (the key part is absent: every row `None`)
+    // or one entry per row, so `get` alone reads both cases.
+    let part = |v: &[u32], j: usize| v.get(j).copied();
+    let mut keys: Vec<(Option<u32>, Option<u32>)> = Vec::new();
     let mut groups: Vec<Vec<f64>> = Vec::new();
     for (j, &e) in values.iter().enumerate() {
         let key = (part(&subject.occasions, j), part(&subject.obs_rgroup, j));
@@ -2709,6 +2711,7 @@ pub(crate) fn grouped_iwres_autocorrelation(
     population: &crate::types::Population,
     subjects: &[SubjectResult],
 ) -> (f64, f64) {
+    debug_assert_eq!(population.subjects.len(), subjects.len());
     let series: Vec<Vec<f64>> = population
         .subjects
         .iter()
@@ -4892,13 +4895,14 @@ mod tests {
     /// Exit condition of #2798: white noise on the naproxen MBMA's layout (18 studies
     /// of two arms, arm lengths 2×8, 3×12, 4×10, 5×6 = 122 rows, each arm an
     /// occasion) gives the grouped, pair-normalised statistic a mean of 2 and a
-    /// false-warning rate near 1%. Under the classic `÷ Σ e²` the same draws gave a
+    /// false-warning rate near 1% per side. Under the classic `÷ Σ e²` the same draws gave a
     /// mean of 1.70 and warned 12% of the time unsplit, 71.5% split (plan §0.3,
     /// 20 000 draws in Python; this test re-runs it on the kernel with 4 000).
     ///
     /// Realised (seed 2798, 4 000 draws, macOS arm64): mean 1.9940, P(DW < 1.5)
-    /// 0.0085. Bounds: mean within 0.03 of 2 (its Monte-Carlo SE is ≈ 0.004), rate
-    /// below 3% (≈ 1% ± 0.15%).
+    /// 0.0085, P(DW > 2.5) 0.0075. Bounds: mean within 0.03 of 2 (its Monte-Carlo SE
+    /// is ≈ 0.004), each tail's rate below 3% (≈ 1% ± 0.15%); the upper tail is the
+    /// one the classic form never reached (0.0% on this layout).
     /// The classic split would fail both by an order of magnitude.
     #[test]
     fn grouped_dw_is_calibrated_on_white_noise_at_the_naproxen_layout() {
@@ -4937,7 +4941,7 @@ mod tests {
         let mut rng = rand::rngs::SmallRng::seed_from_u64(2798);
         let normal = Normal::new(0.0, 1.0).unwrap();
         let n_draws = 4000;
-        let (mut sum, mut below) = (0.0, 0usize);
+        let (mut sum, mut below, mut above) = (0.0, 0usize, 0usize);
         for _ in 0..n_draws {
             let results: Vec<SubjectResult> = pop
                 .subjects
@@ -4954,12 +4958,18 @@ mod tests {
             assert!(dw.is_finite(), "{dw}");
             sum += dw;
             below += usize::from(dw < 1.5);
+            above += usize::from(dw > 2.5);
         }
         let mean = sum / n_draws as f64;
         let rate = below as f64 / n_draws as f64;
-        eprintln!("white noise, naproxen layout: mean DW {mean:.4}, P(DW < 1.5) {rate:.4}");
+        let rate_hi = above as f64 / n_draws as f64;
+        eprintln!(
+            "white noise, naproxen layout: mean DW {mean:.4}, P(DW < 1.5) {rate:.4}, \
+             P(DW > 2.5) {rate_hi:.4}"
+        );
         assert!((mean - 2.0).abs() < 0.03, "mean DW {mean}");
         assert!(rate < 0.03, "P(DW < 1.5) = {rate}");
+        assert!(rate_hi < 0.03, "P(DW > 2.5) = {rate_hi}");
     }
 }
 
