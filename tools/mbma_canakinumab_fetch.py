@@ -34,7 +34,11 @@ hash-pinned. The endpoint is slow (minutes for ~10 MB), has returned HTTP 500, a
 has served an inner CSV with the wrong hash that a request half an hour later got
 right (#2818), hence the retries: a transport error, an unreadable zip and a wrong
 hash each fail one attempt, and all attempts share one `--deadline-seconds` budget,
-so a trickling download cannot outlast the CI step's cap (#1938). `--from` takes a local copy of the outer zip, of
+so a trickling download cannot outlast the CI step's cap (#1938). The attempts are
+spread over that budget, doubling waits from 15 s up to 120 s, so a short outage is
+waited out; none starts in the budget's last quarter, which is kept for one full
+download; and every phase of an attempt, the response headers included, ends at the
+deadline (#2824; see `read_within` for the one fallback). `--from` takes a local copy of the outer zip, of
 `PSP4-15-e70158-s002.zip`, or of the bare `data_9studies.csv`, and skips the
 download.
 
@@ -71,6 +75,7 @@ import os
 import socket
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import zipfile
@@ -79,9 +84,18 @@ URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/PMC12896392/supplementar
 INNER_ZIP = "PSP4-15-e70158-s002.zip"
 INNER_CSV = "supplemental/case_study_2/data_9studies.csv"
 DEFAULT_OUT = "data/external/mbma_canakinumab.csv"
-# Linear backoff between attempts (10 s, 20 s, 30 s), each capped by the time left
-# in `--deadline-seconds`. There is no sleep after the last attempt (#1938).
-BACKOFF_SECONDS = 10
+# The attempts are spread over the `--deadline-seconds` budget (#2824): the waits
+# double from BACKOFF_BASE_SECONDS up to BACKOFF_CAP_SECONDS, and no attempt starts
+# in the last RESERVE_FRACTION of the budget, which is kept for one full download.
+# At the default 720 s, with fast failures, the attempts start at 0, 15, 45, 105,
+# 225, 345, 465 and 540 s; the 180 s reserve is about 1.03x the slowest download CI
+# has measured (174 s, slow-tests run 42608366633), so it has little headroom; see
+# #2824. There is no sleep after the last attempt (#1938).
+BACKOFF_BASE_SECONDS = 15
+BACKOFF_CAP_SECONDS = 120
+RESERVE_FRACTION = 0.25
+# A non-zip reply is quoted in the log up to this many bytes.
+QUOTE_BYTES = 1024
 
 # sha256 of the upstream `data_9studies.csv` (inside PSP4-15-e70158-s002.zip).
 UPSTREAM_SHA256 = "d71c7e0882e95eae4f096387a95c33ed1c4fa0fe85eb57d317886dee94553b27"
@@ -110,19 +124,48 @@ class AttemptFailed(Exception):
         self.sha = sha  # the wrong sha256, when the payload parsed but hashed wrong
 
 
+def open_within(url, timeout, deadline):
+    """`urlopen(url)`, or `TimeoutError` if its response headers are not in by `deadline`.
+
+    `urlopen(timeout=...)` limits each socket operation, so a server that trickles its
+    headers one byte at a time resets it with every byte, and name resolution is not
+    covered at all (#2824). So `urlopen` runs in a daemon thread and the caller waits
+    for it only until the deadline. A thread left behind dies with the process: the
+    retry loop starts no attempt after the deadline. An exception raised in the thread
+    is re-raised here, type and text intact. The thread gets the full `timeout`, not
+    the time left: the `join` is the one deadline gate, so a header phase cut by the
+    deadline is always reported as the deadline, never as a socket `timed out` that
+    happens to fire at the same instant (#2834 review row 2).
+    """
+    box = {}
+
+    def work():
+        try:
+            # URL is the https constant above, never user input (asserted in main).
+            box["r"] = urllib.request.urlopen(url, timeout=timeout)  # nosec B310
+        except BaseException as e:  # noqa: BLE001 — handed to the caller as is
+            box["e"] = e
+
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    worker.join(max(0.0, deadline - time.monotonic()))
+    if worker.is_alive():
+        raise TimeoutError("deadline reached before the response headers")
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
+
+
 def read_within(url, timeout, deadline):
-    """The response body of `url`; `TimeoutError` once `deadline` (monotonic) passes.
+    """`(body, Content-Type)` of `url`; `TimeoutError` once `deadline` (monotonic) passes.
 
     `urlopen(timeout=...)` limits each socket operation, not the download: a server
-    that trickles bytes never trips it (#1938). So the request opens with at most the
-    time left, and before every read the socket timeout is re-set to
-    `min(timeout, time left)`: no read outlasts the deadline, including one that
-    stalls after the body has started.
+    that trickles bytes never trips it (#1938). So the headers are waited for only
+    until the deadline (`open_within`), and before every body read the socket timeout
+    is re-set to `min(timeout, time left)`: no read outlasts the deadline, including
+    one that stalls after the body has started.
     """
-    # The caller's loop only starts an attempt with time left, so this is positive.
-    left = deadline - time.monotonic()
-    # URL is the https constant above, never user input (asserted in main).
-    with urllib.request.urlopen(url, timeout=min(timeout, left)) as r:  # nosec B310
+    with open_within(url, timeout, deadline) as r:
         # The connection's socket, to re-cap per read. It is private CPython API, so
         # if it is ever missing the fetch still works and only loses the re-cap: the
         # worst case is then the deadline plus one `timeout`, which the workflow's
@@ -160,7 +203,7 @@ def read_within(url, timeout, deadline):
         # `length` is what Content-Length promised and has not arrived.
         if r.length:
             raise http.client.IncompleteRead(body, r.length)
-        return body
+        return body, r.headers.get("Content-Type")
 
 
 def attempt(url, timeout, deadline):
@@ -171,16 +214,21 @@ def attempt(url, timeout, deadline):
     wrong-hash payload that the next request got right (#2818).
     """
     try:
-        blob = read_within(url, timeout, deadline)
+        blob, content_type = read_within(url, timeout, deadline)
     except Exception as e:  # noqa: BLE001 — any failure is retried, then reported
         raise AttemptFailed(f"error: {type(e).__name__}: {e}") from None
     # The endpoint always answers with a zip; anything else is a garbled reply, not
     # a bare CSV to hash.
     if not zipfile.is_zipfile(io.BytesIO(blob)):
-        # Show the start of it: on CI it has been a short non-zip body three times in a
-        # row (run 42516551049, 292 bytes), and its text is the only clue what it was.
+        # Quote it whole, up to QUOTE_BYTES: on CI it has been the same 292-byte reply
+        # every time (sha256 dd011235…, served with HTTP 2xx, #2824), and its text is
+        # the only clue what it was.
+        quote = f"{blob[:QUOTE_BYTES]!r}"
+        if len(blob) > QUOTE_BYTES:
+            quote += f" (cut at {QUOTE_BYTES} of {len(blob)} bytes)"
         raise AttemptFailed(
-            f"unreadable payload: not a zip ({len(blob)} bytes): {blob[:120]!r}"
+            f"unreadable payload: not a zip ({len(blob)} bytes, "
+            f"{content_type or 'no content-type'}): {quote}"
         )
     try:
         raw = upstream_csv(blob)
@@ -196,7 +244,11 @@ def fetch_upstream(attempts, timeout, deadline_seconds):
     """Retry `attempt` until it returns the pinned CSV, or the attempts or the total
     `deadline_seconds` budget run out; then exit with a report naming every attempt."""
     deadline = time.monotonic() + deadline_seconds
+    reserve = RESERVE_FRACTION * deadline_seconds
+    # No attempt starts after this: the reserve is kept for one full download.
+    latest_start = deadline - reserve
     failed = []
+    reserve_reached = False
     for i in range(attempts):
         # The one deadline gate: no attempt starts without time left.
         if time.monotonic() >= deadline:
@@ -207,14 +259,27 @@ def fetch_upstream(attempts, timeout, deadline_seconds):
         except AttemptFailed as e:
             failed.append(e)
             print(f"attempt {i + 1}: {e.log}", file=sys.stderr)
-        if i + 1 < attempts:  # no sleep after the last attempt
-            time.sleep(max(0.0, min(BACKOFF_SECONDS * (i + 1), deadline - time.monotonic())))
+        if i + 1 >= attempts:  # no sleep after the last attempt
+            break
+        now = time.monotonic()
+        if now >= latest_start:  # the attempt at `latest_start` was the last one
+            reserve_reached = True
+            break
+        wait = min(BACKOFF_BASE_SECONDS * 2**i, BACKOFF_CAP_SECONDS)
+        time.sleep(max(0.0, min(wait, latest_start - now)))
     out_of_time = time.monotonic() >= deadline
-    sys.exit(fetch_report(failed, out_of_time, deadline_seconds))
+    sys.exit(
+        fetch_report(
+            failed, out_of_time, deadline_seconds, reserve if reserve_reached else None
+        )
+    )
 
 
-def fetch_report(failed, out_of_time, deadline_seconds):
+def fetch_report(failed, out_of_time, deadline_seconds, reserve=None):
     """The exit message once every attempt failed: the verdict, then one line each.
+
+    `reserve` is set when the loop stopped at `latest_start` with attempts left; it is
+    reported only when the deadline itself had not passed, which wins.
 
     The verdict reads the complete downloads' hashes only. A transport error or an
     unreadable payload says nothing about the file, so it neither confirms nor
@@ -248,6 +313,11 @@ def fetch_report(failed, out_of_time, deadline_seconds):
             )
     if out_of_time:
         lines.append(f"Stopped at the {deadline_seconds:g} s --deadline-seconds budget.")
+    elif reserve is not None:
+        lines.append(
+            f"No attempt starts in the last {reserve:g} s of the {deadline_seconds:g} s "
+            "--deadline-seconds budget: too little time for a full download."
+        )
     lines += [f"  attempt {i + 1}: {e.log}" for i, e in enumerate(failed)]
     return "\n".join(lines)
 
@@ -315,7 +385,14 @@ def main():
         action="store_true",
         help="accept a new DERIVED sha256; the upstream pin is never waived",
     )
-    ap.add_argument("--attempts", type=int, default=4, help="download attempts (default 4)")
+    ap.add_argument(
+        "--attempts",
+        type=int,
+        default=10,
+        help="most download attempts (default 10; at the default deadline the "
+        "budget, not the count, ends the loop: up to 8 attempts fit, with fast "
+        "failures)",
+    )
     ap.add_argument(
         "--timeout",
         type=float,
