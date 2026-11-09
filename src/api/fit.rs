@@ -3205,9 +3205,14 @@ fn fit_inner(
 
     // Covariance status. Bayesian fits report posterior credible intervals
     // instead of a Hessian covariance, so the covariance step is never
-    // "requested" for them (reporting it as FAILED would be misleading).
+    // "requested" for them (reporting it as FAILED would be misleading). Nor is
+    // it for a chain with no estimating stage — a standalone `imp_eval_only` /
+    // `agq_eval_only` evaluation owns no step (`covariance_stage`), so with the
+    // default `covariance = true` it read FAILED with no warning, and
+    // `FitResult::status` then printed a covariance failure that never happened
+    // (#2799 r1).
     let covariance_status = resolve_covariance_status(
-        options.run_covariance_step && result.bayes.is_none(),
+        options.run_covariance_step && result.bayes.is_none() && !options.evaluation_only_chain(),
         result.covariance_matrix.is_some(),
         sir_fallback_result.is_some(),
     );

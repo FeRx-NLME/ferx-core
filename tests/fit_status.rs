@@ -24,6 +24,16 @@ const SIGMA_HAT: &str = "0.10069194732313741";
 const SIGMA_POOR: &str = "0.02";
 
 fn model_source(sigma: &str) -> String {
+    model_source_with(
+        sigma,
+        "  method     = focei
+  maxiter    = 0
+",
+    )
+}
+
+/// The fixture with its `[fit_options]` method lines replaced by `method_lines`.
+fn model_source_with(sigma: &str, method_lines: &str) -> String {
     format!(
         "[parameters]
   theta TVCL(0.12250099819205257, 0.001, 10.0)
@@ -46,17 +56,19 @@ fn model_source(sigma: &str) -> String {
   DV ~ proportional(PROP_ERR)
 
 [fit_options]
-  method     = focei
-  maxiter    = 0
-  covariance = true
+{method_lines}  covariance = true
 "
     )
 }
 
 fn evaluate(name: &str, sigma: &str) -> FitResult {
+    evaluate_src(name, &model_source(sigma))
+}
+
+fn evaluate_src(name: &str, src: &str) -> FitResult {
     let dir = tempfile::tempdir().unwrap();
     let path: PathBuf = dir.path().join(format!("{name}.ferx"));
-    std::fs::write(&path, model_source(sigma)).unwrap();
+    std::fs::write(&path, src).unwrap();
     run_model_with_data(path.to_str().unwrap(), Some(DATA))
         .expect("evaluate")
         .0
@@ -131,4 +143,53 @@ fn status_names_an_unheld_collapse_and_an_evaluation_only_run() {
         printed(&g),
         ["evaluation_only", "collapsed_at_guard: ETA_KA"]
     );
+}
+
+/// #2799 r1 #1: a standalone `agq_eval_only` run is an evaluation too, but its arm publishes
+/// `converged = true` on any finite objective (#1303), while `maxiter = 0` publishes
+/// `false`. The status never rewrites `converged`, so the same request reads
+/// `CONVERGED WITH ISSUES (evaluation_only)` here and `NOT CONVERGED (evaluation_only)`
+/// above. Pinned so a change to either arm's `converged` is a visible decision, not drift:
+/// this is the one test in the file that asserts `converged`, because it is the subject.
+/// Mutation: drop the `evaluation_only_chain` term from `fit()`'s covariance request →
+/// `Failed`, and the status gains `covariance_failed`.
+#[test]
+fn a_standalone_agq_evaluation_reads_converged_with_issues() {
+    let r = evaluate_src(
+        "agq_eval_only",
+        // ETA_KA off the rail: the rail start is accepted only at `maxiter = 0`, and this test
+        // is about the AGQ arm's `converged`, not the collapse.
+        &model_source_with(
+            SIGMA_HAT,
+            "  method     = laplace
+  agq_eval_only = true
+",
+        )
+        .replace(RAIL, "0.01"),
+    );
+    assert!(
+        r.evaluation_only,
+        "a standalone agq_eval_only run evaluates"
+    );
+    assert!(
+        r.converged,
+        "its arm reports a finite objective as converged"
+    );
+    // With the fixture's `covariance = true`: a chain with no estimating stage owns no step,
+    // so it is not requested, not failed. Before r1 this read `Failed` and the status gained
+    // a `covariance_failed` for a step that never ran.
+    assert_eq!(
+        r.covariance_status,
+        ferx_core::types::CovarianceStatus::NotRequested
+    );
+    assert_eq!(
+        r.status(),
+        FitStatus::ConvergedWithIssues {
+            reasons: vec![StatusReason::EvaluationOnly]
+        },
+        "{:?}",
+        r.warnings
+    );
+    let reasons: Vec<String> = r.status().reasons().iter().map(|x| x.label()).collect();
+    assert_eq!(reasons, ["evaluation_only"]);
 }
