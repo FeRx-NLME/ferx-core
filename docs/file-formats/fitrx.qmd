@@ -325,6 +325,27 @@ told from a degenerate one without reading it off a zero diagonal. It is absent 
 there is no matrix or no mask for it, and otherwise has the matrix's dimension; any
 other length is refused on save and on load.
 
+`held_at_bound` (#2797) lists the parameters whose standard error is not available,
+in packed order, each as `{name, kind, index, packed_index, reason}`, with `reason`
+`profiled_bound` or `collapsed_at_guard`
+([held parameters](../estimation/parameterization.qmd#held-parameters)). It is absent
+when the list is empty. An entry for a `[mixture]` per-class override also has
+`class`, its 1-based class (#2809). Its `kind` and `index` then name the **base**
+parameter it overrides, so a reader matching entries to the base estimates must skip
+an entry that has `class`. A base entry has no `class` key. A reader built before
+#2809 drops the key and would read the override as its base parameter.
+
+A bundle written before `held_at_bound` existed carries only `profiled_levels_at_bound`;
+on load those levels become `profiled_bound` entries, so old and new bundles read the
+same way.
+
+A `reason` the reading build does not know — one a later ferx added — loads as
+`unknown` instead of failing the bundle (#2817). The entry still counts as held, so
+its standard error shows as `N/A`. Re-saving writes it back as `unknown`; the original
+token is not kept. An entry whose `kind` the build does not know (a parameter family
+a later ferx added) is dropped on load, since there is no family to show it under; the
+rest of the list loads. Both rules apply when a `FitResult` JSON file is read, too.
+
 #### Engine results
 
 `bayes`, `importance_sampling`, `impmap_trace` and `exclusions` hold the

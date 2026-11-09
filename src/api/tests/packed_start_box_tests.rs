@@ -696,10 +696,10 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 /// the box while another drifted in — this fails on the *identity* of the
 /// coordinate, so either direction reddens.
 ///
-/// The thirteen entries below are all `OmegaDiagonal` / `Below`, i.e. all already
-/// in #1229's scope: ten simulate-only adaptive-dosing models declaring
+/// The fourteen entries below are all `OmegaDiagonal` / `Below`, i.e. all already
+/// in #1229's scope: eleven simulate-only adaptive-dosing models declaring
 /// `omega ~ 1e-10` (the ninth is the #945 mrgsolve kit's model, the tenth #944's
-/// mg/kg example), two `reset_init_snapshot_*` anchors declaring `~ 0.0`, and
+/// mg/kg example, the eleventh its `round_to` twin), two `reset_init_snapshot_*` anchors declaring `~ 0.0`, and
 /// `tests/fixtures/iov_scaling.ferx` declaring `kappa KAPPA_V ~ 0.000001`.
 /// **Zero** θ, Σ, off-diagonal or upper-rail hits — which is what makes this
 /// change safe for everything shipped.
@@ -708,7 +708,7 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 /// Round 1's review verified the wider scope by hand and the committed test did
 /// not inherit it: `.ferx` files also live in `tests/fixtures/`, `tests/nonmem/`,
 /// `tests/reference/` and `tools/`, and `tests/fixtures/` is where the next
-/// fixture lands. The eleventh entry is exactly what the narrower sweep missed
+/// fixture lands. The `tests/fixtures/` entry is exactly what the narrower sweep missed
 /// (#1309 review).
 ///
 /// Both start-side predicates are ratcheted here, not just the out-of-box one.
@@ -718,7 +718,7 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 /// no corpus guard at all. The corpus carries **zero** inverted boxes; this is
 /// what keeps that true.
 #[test]
-fn no_shipped_model_file_starts_outside_its_box_except_the_known_thirteen() {
+fn no_shipped_model_file_starts_outside_its_box_except_the_known_fourteen() {
     let allowed: std::collections::BTreeSet<&str> = [
         "examples/adaptive_platelet_ladder.ferx::ETA_CL",
         "examples/adaptive_vanco_auc.ferx::ETA_CL",
@@ -726,6 +726,7 @@ fn no_shipped_model_file_starts_outside_its_box_except_the_known_thirteen() {
         "examples/adaptive_vanco_iov_loading.ferx::ETA_CL",
         "examples/adaptive_vanco_loading.ferx::ETA_CL",
         "examples/adaptive_vanco_mgkg.ferx::ETA_CL",
+        "examples/adaptive_vanco_mgkg_rounded.ferx::ETA_CL",
         "examples/adaptive_vanco_renal.ferx::ETA_CL",
         "examples/adaptive_vanco_renal_iov.ferx::ETA_CL",
         "examples/adaptive_vanco_renal_loading.ferx::ETA_CL",

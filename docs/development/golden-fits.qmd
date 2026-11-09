@@ -44,10 +44,11 @@ differs from the release's copy is marked as such, so an edited example does not
 read as engine drift.
 
 All fits run on one worker thread. `golden.py` passes `--threads 1` and rejects
-any result whose `n_threads_used` is not 1. `RAYON_NUM_THREADS` alone does not do
-this, because ferx sizes its own pool from the machine's core count (#1460). If
-the flag were left out, the size of the runner would decide the reduction order,
-and that would show up as drift.
+any result whose `n_threads_used` is not 1. The workflow's `RAYON_NUM_THREADS=1`
+would size an unpinned fit to one worker too since #2800, but the flag does not
+rely on it: a pinned count beats the variable, so the check holds whatever
+environment runs it. If both were left out, the size of the runner would decide
+the reduction order, and that would show up as drift.
 
 Fit numbers come from **Linux** only. See
 [Reference platform](sdlc.qmd#reference-platform-linux). Do not compare a macOS

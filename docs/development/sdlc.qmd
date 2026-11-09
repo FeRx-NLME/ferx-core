@@ -274,7 +274,9 @@ after each major feature) and not yet on GitHub — a known gap to formalize.
 | `release.yml` | tag `v*` or manual | GitHub release with generated notes |
 
 > Note: `RAYON_NUM_THREADS=1` is pinned in CI so cargo owns the test
-> parallelism on 2-core runners. Don't remove it.
+> parallelism on 2-core runners. Don't remove it. Since #2800 it also sizes
+> every unpinned `fit()` to one worker (before, fits ignored it and ran the
+> engine default); a test that pins `threads` is unaffected.
 
 #### Merge queue {#merge-queue}
 

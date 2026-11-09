@@ -779,6 +779,22 @@ fn draw_asymptotic(
             *f = true;
         }
     }
+    // A collapse on the internal guard the step held (#2797) has the same zero row and is
+    // held the same way: a draw off its rail would be a draw from the floor's 1/curvature.
+    // So is an entry whose reason this build does not know (#2817, a bundle from a later
+    // ferx): `step_held` reads only the matrix, so a zero row is held whatever the reason,
+    // and the draws agree with the displays, which already show its SE as N/A.
+    for h in &fit_result.held_at_bound {
+        if matches!(
+            h.reason,
+            crate::types::HeldReason::CollapsedAtGuard | crate::types::HeldReason::Unknown
+        ) && crate::api::step_held(Some(cov), h.packed_index)
+        {
+            if let Some(f) = fixed_mask.get_mut(h.packed_index) {
+                *f = true;
+            }
+        }
+    }
     let n_packed = x_hat.len();
     if cov.nrows() != n_packed || cov.ncols() != n_packed {
         return Err(crate::api::fit_input_model(format!(
@@ -1044,6 +1060,7 @@ mod tests {
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
             profiled_levels_at_bound: Vec::new(),
+            held_at_bound: Vec::new(),
             eta_log_transformed: vec![],
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -1088,6 +1105,8 @@ mod tests {
             kappa_is_diagonal: None,
             newton_decrement: None,
             optimizer_stop: None,
+            eval_budget_spent: false,
+            evaluation_only: false,
         }
     }
 
@@ -1460,6 +1479,66 @@ mod tests {
         assert!(
             any_v_varies,
             "free parameter V was inadvertently pinned by the clamp"
+        );
+    }
+
+    /// #2797: a collapse the covariance step held (its row of the matrix zero) is held in
+    /// the asymptotic draws too, as a FIX parameter and a #2418 profiled level are. Without
+    /// the hold the regularised Cholesky scatters the zero-variance coordinate (the
+    /// control half: same matrix, empty `held_at_bound`), so the pin is the mask's work.
+    #[test]
+    fn asymptotic_draws_hold_a_collapse_the_step_held() {
+        assert_asymptotic_draws_hold(crate::types::HeldReason::CollapsedAtGuard);
+    }
+
+    /// #2817: an entry whose reason this build does not know (read from a later ferx's
+    /// bundle) is held the same way when the step held its row, so the draws agree with
+    /// the displays (SE `N/A`). Without the hold the σ scatters, as the control half shows.
+    #[test]
+    fn asymptotic_draws_hold_an_unknown_reason_the_step_held() {
+        assert_asymptotic_draws_hold(crate::types::HeldReason::Unknown);
+    }
+
+    fn assert_asymptotic_draws_hold(reason: crate::types::HeldReason) {
+        use crate::types::{HeldAtBound, ParameterKind};
+        let template = tiny_template();
+        let n_packed = crate::estimation::parameterization::packed_len(&template);
+        let p = crate::estimation::parameterization::packed_segments(&template).sigma_start();
+        let mut cov = DMatrix::identity(n_packed, n_packed) * 0.01;
+        for k in 0..n_packed {
+            cov[(p, k)] = 0.0;
+            cov[(k, p)] = 0.0;
+        }
+        let sigma_draws = |fit: &FitResult| {
+            let mut rng = StdRng::seed_from_u64(11);
+            draw_parameter_samples(fit, &template, 50, UncertaintyMethod::Asymptotic, &mut rng)
+                .expect("draws")
+                .iter()
+                .map(|d| d.sigma.values[0])
+                .collect::<Vec<_>>()
+        };
+        let free = fit_with_cov(&template, cov.clone());
+        let mut held = free.clone();
+        held.held_at_bound = vec![HeldAtBound {
+            name: template.sigma.names[0].clone(),
+            kind: ParameterKind::Sigma,
+            index: 0,
+            packed_index: p,
+            reason,
+            class: None,
+        }];
+        let s_hat = template.sigma.values[0];
+        let pinned = sigma_draws(&held);
+        for s in &pinned {
+            assert!(
+                s.is_finite() && (s - s_hat).abs() < 1e-12,
+                "held σ ({reason:?}) drifted: {s}"
+            );
+        }
+        let scattered = sigma_draws(&free);
+        assert!(
+            scattered.iter().any(|s| (s - s_hat).abs() > 1e-12),
+            "the control must scatter, or the test cannot see the hold: {scattered:?}"
         );
     }
 

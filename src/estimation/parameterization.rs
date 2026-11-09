@@ -1072,7 +1072,19 @@ pub(crate) fn cov_fixed_mask(
             *f = true;
         }
     }
-    let mask = packed_fixed_mask(&held);
+    let mut mask = packed_fixed_mask(&held);
+    // #2797: a collapse on the internal guard is marked only where the step held it (a
+    // clean `R`); on a floored `R` or an `S` fallback it is in `held_at_bound` but the other
+    // SEs are not conditional on it, so it is not marked.
+    for h in &fit.held_at_bound {
+        if h.reason == crate::types::HeldReason::CollapsedAtGuard
+            && crate::api::step_held(fit.covariance_matrix.as_ref(), h.packed_index)
+        {
+            if let Some(m) = mask.get_mut(h.packed_index) {
+                *m = true;
+            }
+        }
+    }
     if mask.len() == dim {
         mask
     } else {

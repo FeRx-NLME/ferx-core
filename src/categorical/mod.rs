@@ -129,6 +129,12 @@ pub(crate) fn neg_log_normal_cdf_jet(x: f64) -> [f64; 5] {
         -cdf.ln()
     };
     let m = phi / cdf;
+    if m == 0.0 {
+        // `φ` has underflowed (from `x ≈ 38.6`). Every derivative is `m` times a polynomial
+        // in `x` and `m`, so its limit is `0`; at `x = +∞` the recursion would form `0·∞`
+        // (#2772).
+        return [value, 0.0, 0.0, 0.0, 0.0];
+    }
     let a = x + m;
     let m1 = -m * a;
     let m2 = -m1 * a - m * (1.0 + m1);

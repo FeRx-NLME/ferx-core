@@ -1289,6 +1289,7 @@ pub fn run_vi(
         mixture_posteriors: None,
         newton_decrement,
         optimizer_stop: None,
+        eval_budget_spent: false,
     })
 }
 

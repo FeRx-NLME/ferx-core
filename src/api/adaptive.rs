@@ -56,33 +56,6 @@ pub(crate) fn reject_selected_error_for_adaptive(model: &CompiledModel) -> Resul
     Ok(())
 }
 
-/// Reject an adaptive-dosing simulation on any active residual-error magnitude: a sigma
-/// scaled by an expression, a `weight =`, a `power(σ, P)` exponent, or a magnitude on a
-/// `CMT=N:` line (#2731, #2741). [`assay_resid_var`] has no observation row to evaluate
-/// a magnitude on, so the assay would draw on the bare sigma and report the run as if
-/// the factor had applied — measured on #2741: a tenfold multiplier and a cubed loading
-/// left every `Dv` reading bit-identical to the bare model's.
-///
-/// The assay is the only reader of the residual error, so a run with no `Dv` monitor
-/// (and a spec without assay error) was correct, and is refused too: the check runs on
-/// the model alone, before the options are looked at, like the `Selected` reject above.
-/// #2741's lift, applying the magnitude in the assay, removes the refusal for both.
-///
-/// One gate, [`RuvMagnitude::is_active`](crate::types::RuvMagnitude::is_active), so the
-/// single-endpoint and endpoint-keyed forms cannot drift apart.
-fn reject_ruv_magnitude_for_adaptive(model: &CompiledModel) -> Result<(), EngineError> {
-    if model.has_custom_ruv_magnitude() {
-        return Err(super::entry_refusals::adaptive_unsupported(
-            Some("error_model"),
-            "adaptive-dosing simulation does not support a residual-error magnitude (a sigma \
-             multiplied by an expression, a `weight =`, a `power(...)` exponent, or a \
-             magnitude on a `CMT=N:` line). The assay draws its residual error from the bare \
-             sigma, without the magnitude. Use bare sigma names in `[error_model]`.",
-        ));
-    }
-    Ok(())
-}
-
 /// The model-vs-data checks both public adaptive entry points run before anything
 /// else touches the population: `check_simulation_data` (the list every other
 /// simulate entry point runs, #1083), then the `Selected` error-model reject (#658).
@@ -99,8 +72,7 @@ pub(crate) fn check_adaptive_model_data(
         return Err(super::entry_refusals::nested_level_simulate_unsupported());
     }
     first_error(&check_simulation_data(model, population))?;
-    reject_selected_error_for_adaptive(model)?;
-    reject_ruv_magnitude_for_adaptive(model)
+    reject_selected_error_for_adaptive(model)
 }
 
 /// Reject the model / data combinations the reactive driver cannot yet simulate
@@ -976,18 +948,10 @@ where
     // models, so an adaptive-dosing dataset with an out-of-range or `CMT=0`-infusion seed dose now
     // returns a recoverable `Err` here instead of the engine silently dropping it. (It was a no-op
     // for ODE models before #899 — do not "simplify" this call away as dead code.)
+    // It also runs `check_cmt_toggles` (#2732), on the base data alone: a compartment on/off
+    // record is honoured by the driver (#2753), and an observation row of a compartment the
+    // data leave off is still refused, though a controller dose would turn it on.
     first_error(&check_dose_compartments(model, population))?;
-    // The adaptive walk has its own timeline, with no compartment on/off record (#2732).
-    if let Some(s) = population.subjects.iter().find(|s| s.has_cmt_toggles()) {
-        return Err(super::entry_refusals::adaptive_unsupported(
-            None,
-            format!(
-                "subject {} turns a compartment off (`EVID=2` with a negative `CMT`), which \
-                 adaptive dosing cannot honour.",
-                s.id
-            ),
-        ));
-    }
     first_error(&check_absorption_closed_form_support_diags(
         model, population,
     ))?;
@@ -1256,11 +1220,15 @@ where
             // that compartment (S1.5 edge a). The base seed keys this
             // (subject, replicate)'s controller-assay substream.
             let ruv_scale = model.residual_var_scale(&eta_slice);
-            let resid_var = |cmt: usize, ipred: f64| -> Option<f64> {
-                assay_resid_var(model, params, cmt, ipred, ruv_scale)
+            let resid_var = |row: &crate::sim::adaptive::AssayRow| {
+                assay_resid_var(model, params, row, ruv_scale)
             };
             let assay = crate::sim::adaptive::AssayNoise {
                 resid_var: &resid_var,
+                needs_tad: model
+                    .ruv_magnitude
+                    .as_ref()
+                    .is_some_and(|rm| rm.is_active() && rm.uses_tad),
                 base_seed: crate::sim::adaptive::subject_assay_base_seed(
                     assay_root,
                     &subject.id,
@@ -1770,28 +1738,88 @@ pub(crate) fn verify_adaptive_snapshots(
     Ok(())
 }
 
-/// The controller-assay residual variance of one `Dv` reading at `ipred` on
-/// `cmt`, or `None` when no `[error_model]` covers that compartment (S1.5 edge
-/// a). It uses the `block_sigma` correlations of the parameter set being
-/// simulated (`draw_correlations`, #1733), not the model's declared ρ. One
-/// reading is one row, so only the within-observation cross term applies.
+/// The controller-assay residual variance of one `Dv` reading `row`: `simulate()`'s
+/// variance for an observation row at the decision (#2741) — the same magnitude
+/// evaluator (`RuvMagnitude::eval_key`, on `row.cmt`'s endpoint), the same variance
+/// tail (`residual_variance_for_key`), `ruv_scale` applied. `Ok(None)` when no
+/// `[error_model]` covers `row.cmt` (S1.5 edge a). It uses the `block_sigma`
+/// correlations of the parameter set being simulated (`draw_correlations`, #1733),
+/// not the model's declared ρ. One reading is one row, so only the
+/// within-observation cross term applies.
+///
+/// A model without an active magnitude passes `mult = None`, the legacy form: the
+/// `_scaled` form at a row of ones differs from it in the last bit on about half of
+/// all predictions (measured on #2741), so a bare model's readings stay bit-identical.
+///
+/// `Err` when a multiplier or a `power` exponent is not positive and finite at the
+/// decision. `check_residual_magnitude` sees the data's observation rows only, at the
+/// initial θ; a decision can sit on a row it never evaluated (an `EVID=2` row, a
+/// decision between records), so the assay checks its own.
 pub(crate) fn assay_resid_var(
     model: &CompiledModel,
     params: &ModelParameters,
-    cmt: usize,
-    ipred: f64,
+    row: &crate::sim::adaptive::AssayRow,
     ruv_scale: f64,
-) -> Option<f64> {
+) -> Result<Option<f64>, String> {
     let sigma = &params.sigma.values;
-    if !model.has_residual_error_for_cmt(cmt, sigma) {
-        return None;
+    if !model.has_residual_error_for_cmt(row.cmt, sigma) {
+        return Ok(None);
     }
+    let mult = match model.ruv_magnitude.as_ref().filter(|rm| rm.is_active()) {
+        Some(rm) => {
+            let m = rm.eval_key(row.cmt, &params.theta, row.cov, row.time, row.tad);
+            if let Some(k) = m.iter().position(|v| !(v.is_finite() && *v > 0.0)) {
+                return Err(assay_magnitude_message(model, params, row, k, m[k]));
+            }
+            Some(m)
+        }
+        None => None,
+    };
     let correlations = super::simulate::draw_correlations(model, params);
-    Some(
-        model
-            .error_spec
-            .variance_at_with_correlations(cmt, ipred, sigma, correlations.pairs)
-            * ruv_scale,
+    Ok(Some(model.residual_variance_for_key(
+        row.cmt,
+        row.ipred,
+        sigma,
+        correlations.pairs,
+        ruv_scale,
+        mult.as_deref(),
+    )))
+}
+
+/// The refusal of a magnitude entry `k` of the assay's row that evaluated to `value`
+/// (#2741). The lower half of the row is the multiplier per flat σ slot, the upper the
+/// `power` exponent (`RuvMagnitude::eval_obs`). A `CMT=N:` block names the endpoint,
+/// so the σ is found on its line.
+fn assay_magnitude_message(
+    model: &CompiledModel,
+    params: &ModelParameters,
+    row: &crate::sim::adaptive::AssayRow,
+    k: usize,
+    value: f64,
+) -> String {
+    let n = params.sigma.values.len();
+    let (what, slot) = if k >= n {
+        ("power exponent", k - n)
+    } else {
+        ("magnitude", k)
+    };
+    let name = params
+        .sigma
+        .names
+        .get(slot)
+        .map_or_else(|| format!("slot {slot}"), |s| format!("`{s}`"));
+    let line = if matches!(model.error_spec, ErrorSpec::PerCmt(_)) {
+        format!(" on the `CMT={}:` line", row.cmt)
+    } else {
+        String::new()
+    };
+    format!(
+        "[error_model] the residual-error {what} of sigma {name}{line} evaluates to {value} at \
+         this `Dv` reading, TIME {} as written — it must be strictly positive and finite. The \
+         assay draws the reading's residual error from it, and the check on the data's \
+         observation rows does not see a decision. Check θ and the covariates its expression \
+         reads in the row in force at this decision.",
+        row.time
     )
 }
 

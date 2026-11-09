@@ -2493,6 +2493,16 @@ pub(crate) fn profiled_converged(
     }
 }
 
+/// Whether a profiled fit's outer optimizer spent its evaluation budget (#2799): the loop
+/// ran out before a leg (`BudgetSpent`), or a leg ended on `MaxEvalReached`. The one
+/// predicate behind both [`profiled_verdict_warning`]'s budget advice and
+/// `OuterResult::eval_budget_spent`.
+pub(crate) fn profiled_budget_spent(end: PolishEnd, last: &NloptReturn) -> bool {
+    matches!(end, PolishEnd::BudgetSpent)
+        || (matches!(end, PolishEnd::Settled)
+            && matches!(last, Ok((nlopt::SuccessState::MaxEvalReached, _))))
+}
+
 /// The warning a profiled fit gets for how its verification ended, or `None` when it is
 /// converged. A function rather than inline `format!`s so each message is tested where
 /// it is written.
@@ -2526,10 +2536,7 @@ pub(crate) fn profiled_verdict_warning(
              verification legs (the last lowered the objective by {last_gain:.3e}), so \
              it is not reported as converged; re-run from these estimates."
         )),
-        PolishEnd::BudgetSpent => Some(budget()),
-        PolishEnd::Settled if matches!(last, Ok((nlopt::SuccessState::MaxEvalReached, _))) => {
-            Some(budget())
-        }
+        _ if profiled_budget_spent(end, last) => Some(budget()),
         _ if !converged => {
             let status = match last {
                 Ok((s, _)) => format!("{s:?}"),
@@ -2913,6 +2920,9 @@ pub(crate) fn optimize_profiled(
     };
 
     let mut converged = false;
+    // #2799: whether the profiled outer optimizer spent its evaluation budget, from the same
+    // predicate as its "increase maxiter" warning.
+    let mut eval_budget_spent = false;
     // The start verdict published as `left_init` / `stationary_start` (#2506). Set only
     // when the profiled levels are the only free coordinates (#2591).
     let mut start_verdict: (Option<bool>, bool) = (None, false);
@@ -3075,6 +3085,7 @@ pub(crate) fn optimize_profiled(
             },
         );
         converged = profiled_converged(algo, end, &result, cancelled(), left_init());
+        eval_budget_spent = profiled_budget_spent(end, &result);
         warnings.extend(profiled_verdict_warning(end, &result, converged));
     } else {
         // Evaluation only (`maxiter = 0`, NONMEM `MAXEVAL=0`), or nothing to search: the
@@ -3193,6 +3204,7 @@ pub(crate) fn optimize_profiled(
         mcem_objective_trail: None,
         newton_decrement: None,
         optimizer_stop: None,
+        eval_budget_spent,
     }
 }
 
@@ -3379,6 +3391,7 @@ fn failed_result(
         mcem_objective_trail: None,
         newton_decrement: None,
         optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 
@@ -3898,7 +3911,19 @@ impl ProfileCtx<'_> {
         // the non-PD fallback's |λ|-rectified proposal (`build_non_pd_fallback_proposal`,
         // as the unprofiled step builds it, at the same 4× inflation), with the reason.
         let (cov_s, non_pd) = match a_p.clone().cholesky() {
-            Some(ch) => (ch.inverse() * 2.0, None),
+            // #2797: on a positive-definite `A_p`, the structural coordinates collapsed on the
+            // internal guard are held — `A_p⁻¹` becomes the inverse of its sub-block over the
+            // rest, embedded with zero rows — so the level blocks and the sandwich built from
+            // it below are conditional on them too. Only after the verdict, as in the
+            // unprofiled step.
+            Some(ch) => {
+                let held = crate::estimation::covariance::held_free_positions(x_hat, hold, free);
+                let cov = crate::estimation::covariance::condition_on_held(a_p, &held, |sub, _| {
+                    sub.clone().cholesky().map(|c| c.inverse() * 2.0)
+                })
+                .unwrap_or_else(|| ch.inverse() * 2.0);
+                (cov, None)
+            }
             None => {
                 let sym = (a_p + a_p.transpose()) * 0.5;
                 let Some(eigvals) = crate::estimation::covariance::extract_eigenvalues(&sym) else {
@@ -4045,6 +4070,15 @@ impl ProfileCtx<'_> {
         );
         let inv = crate::estimation::covariance::invert_cross_product(&s, &units)
             .ok_or_else(|| crate::estimation::covariance::S_SINGULAR_MSG.to_string())?;
+        // #2816: `S⁻¹` conditional on the coordinates collapsed on the guard, once `S` itself
+        // inverted cleanly — the unprofiled step's rule (#2797), so a held collapse is the
+        // same coordinate `FIX`. `unheld` is the template `free_all` indexes.
+        let held = crate::estimation::covariance::held_free_positions(x_hat, &unheld, &free_all);
+        let inv = crate::estimation::covariance::condition_on_held(&s, &held, |sub, keep| {
+            let keep_units: Vec<_> = keep.iter().map(|&a| units[a]).collect();
+            crate::estimation::covariance::invert_cross_product(sub, &keep_units)
+        })
+        .unwrap_or(inv);
         if self.options.verbose {
             eprintln!("  Covariance step successful (profile)");
         }

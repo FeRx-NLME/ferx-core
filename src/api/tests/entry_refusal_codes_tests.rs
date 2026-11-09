@@ -1416,30 +1416,36 @@ fn ferx_check_reports_what_fit_refuses() {
     }
 }
 
-/// The adaptive walk has no compartment on/off record (#2732), so it must refuse the row
-/// rather than integrate through the off window.
+/// Adaptive dosing honours compartment on/off records (#2753), but the static data checks
+/// of #2732 still run at its entry, on the base data alone: an observation row of a
+/// compartment the data leave off is refused (`E_OBS_CMT_OFF`), even when a controller
+/// dose before it would turn the compartment back on. The pair straddles that check: the
+/// same subject with the observation moved before the off row runs.
 #[test]
-fn adaptive_refuses_a_compartment_off_row() {
+fn adaptive_still_refuses_an_observation_of_a_compartment_the_data_leave_off() {
     use crate::sim::adaptive::{ControllerCtx, DoseAction};
     let ode = parse_model_string(ODE_ADAPTIVE).expect("parse");
-    let mut subject = observed("1", &[1.0]);
-    subject.pk_only_times = vec![1.5];
-    subject.cmt_toggles = vec![crate::types::CmtToggle {
-        pk_only: 0,
-        state: 0,
-        on: false,
-    }];
-    let pop = population_of(vec![subject], &[]);
-    let bolus = || |_: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
-    let options = AdaptiveSimulateOptions {
-        seed: Some(1),
-        decision_times: vec![0.0],
-        ..Default::default()
+    let run = |off_at: f64| {
+        let mut subject = observed("1", &[1.0]);
+        subject.pk_only_times = vec![off_at];
+        subject.cmt_toggles = vec![crate::types::CmtToggle {
+            pk_only: 0,
+            state: 0,
+            on: false,
+        }];
+        let pop = population_of(vec![subject], &[]);
+        let bolus = || |_: &ControllerCtx| vec![DoseAction::Bolus { amt: 100.0, cmt: 1 }];
+        let options = AdaptiveSimulateOptions {
+            seed: Some(1),
+            // The decision at 0.75 doses compartment 1 after the off row at 0.5.
+            decision_times: vec![0.75],
+            ..Default::default()
+        };
+        simulate_adaptive(&ode, &pop, &ode.default_params, 1, bolus, &options)
     };
-    let err = simulate_adaptive(&ode, &pop, &ode.default_params, 1, bolus, &options)
-        .err()
-        .expect("refused");
+    let err = run(0.5).err().expect("refused");
     let text = format!("{err:?}");
-    assert!(text.contains("E_ADAPTIVE_UNSUPPORTED"), "{text}");
-    assert!(text.contains("adaptive dosing cannot honour"), "{text}");
+    assert!(text.contains("E_OBS_CMT_OFF"), "{text}");
+    assert!(!text.contains("E_ADAPTIVE_UNSUPPORTED"), "{text}");
+    run(1.5).expect("the observation at 1 precedes the off row at 1.5");
 }

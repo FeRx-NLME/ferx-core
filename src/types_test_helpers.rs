@@ -425,12 +425,15 @@ pub(crate) fn empty_fit_result() -> FitResult {
         bic_inputs: BicInputs::default(),
         profiled_blocks: Vec::new(),
         profiled_levels_at_bound: Vec::new(),
+        held_at_bound: Vec::new(),
         left_init: None,
         stationary_start: false,
         omega_is_diagonal: None,
         kappa_is_diagonal: None,
         newton_decrement: None,
         optimizer_stop: None,
+        eval_budget_spent: false,
+        evaluation_only: false,
     }
 }
 
@@ -563,6 +566,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         bic_inputs: BicInputs::default(),
         profiled_blocks: Vec::new(),
         profiled_levels_at_bound: Vec::new(),
+        held_at_bound: Vec::new(),
         eta_log_transformed: vec![true, true],
         omega_param_corr: None,
         omega_iov_param_corr: None,
@@ -607,6 +611,8 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         kappa_is_diagonal: None,
         newton_decrement: None,
         optimizer_stop: None,
+        eval_budget_spent: false,
+        evaluation_only: false,
     }
 }
 

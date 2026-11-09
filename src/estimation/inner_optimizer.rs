@@ -5159,7 +5159,13 @@ fn residual_inner_obs(
         // Signed kernel: right-censored (`cens < 0`) rows use the upper tail, so
         // `h·m` / `h·z` match `individual_nll_iov`'s `m3_logcdf` data term.
         let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df, cens);
-        (h * m, if ruv_active { h * z } else { 0.0 })
+        if h == 0.0 {
+            // A certain row past `h`'s underflow: both limits are `0`, and at `z = +∞` the
+            // products would be `0·∞` (#2772).
+            (0.0, 0.0)
+        } else {
+            (h * m, if ruv_active { h * z } else { 0.0 })
+        }
     } else {
         let ruv_term = if ruv_active {
             ruv_data_dterm(y - f, v)
