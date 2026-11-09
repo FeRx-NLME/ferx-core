@@ -8309,6 +8309,56 @@ pub enum HeldReason {
     Unknown,
 }
 
+/// Reads a `held_at_bound` list leniently (#2817): an entry whose `kind` this build does
+/// not know (a parameter family a later ferx added) is dropped instead of failing the
+/// whole `.fitrx` bundle or `FitResult` JSON. Nothing could use such an entry: there is
+/// no family to display its SE under, and a build that cannot pack the family cannot
+/// draw from or hold it. An unknown `reason` is not dropped. It reads as
+/// [`HeldReason::Unknown`] and stays held. `ParameterKind` itself is left strict, since
+/// priors and every per-family `match` read it.
+pub(crate) fn held_at_bound_lenient<'de, D>(d: D) -> Result<Vec<HeldAtBound>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    enum KindRead {
+        Theta,
+        Omega,
+        Sigma,
+        Kappa,
+        #[serde(other)]
+        Unknown,
+    }
+    #[derive(serde::Deserialize)]
+    struct HeldRead {
+        name: String,
+        kind: KindRead,
+        index: usize,
+        packed_index: usize,
+        reason: HeldReason,
+    }
+    let rows: Vec<HeldRead> = serde::Deserialize::deserialize(d)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|h| {
+            let kind = match h.kind {
+                KindRead::Theta => ParameterKind::Theta,
+                KindRead::Omega => ParameterKind::Omega,
+                KindRead::Sigma => ParameterKind::Sigma,
+                KindRead::Kappa => ParameterKind::Kappa,
+                KindRead::Unknown => return None,
+            };
+            Some(HeldAtBound {
+                name: h.name,
+                kind,
+                index: h.index,
+                packed_index: h.packed_index,
+                reason: h.reason,
+            })
+        })
+        .collect())
+}
+
 impl HeldReason {
     /// The snake_case token the YAML and `.fitrx` outputs write.
     pub fn as_str(self) -> &'static str {
@@ -9091,7 +9141,14 @@ pub struct FitResult {
     /// coordinate's stored `se_*` is `0.0`, as a FIX parameter's is (never `NaN`, which
     /// would break every consumer that sums or folds SEs). Display reads this list, not the
     /// number.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// Read leniently: an entry of a parameter family this build does not know is
+    /// dropped on load rather than failing the whole read (#2817).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "held_at_bound_lenient"
+    )]
     pub held_at_bound: Vec<HeldAtBound>,
 }
 

@@ -247,8 +247,13 @@ struct FitWire {
     profiled_levels_at_bound: Vec<usize>,
     // #2797. Absent on every fit with no held coordinate, and on every bundle written
     // before the field existed; such a bundle's `profiled_levels_at_bound` is synthesised
-    // into `ProfiledBound` entries on load (`held_at_bound_on_load`).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    // into `ProfiledBound` entries on load (`held_at_bound_on_load`). An entry of a
+    // parameter family this build does not know is dropped on read (#2817).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::types::held_at_bound_lenient"
+    )]
     held_at_bound: Vec<crate::types::HeldAtBound>,
 
     sir: Option<SirWire>,
@@ -5079,6 +5084,80 @@ mod tests {
             assert_eq!(tok, format!("\"{}\"", r.as_str()));
             assert_eq!(serde_json::from_str::<HeldReason>(&tok).unwrap(), r);
         }
+    }
+
+    /// Rename the `kind` of `held_at_bound[0]` in a fit JSON value to a family no build
+    /// knows.
+    fn inject_future_kind(v: &mut serde_json::Value) {
+        assert_eq!(v["held_at_bound"][0]["kind"], "Theta", "{v}");
+        v["held_at_bound"][0]["kind"] = "SomeFutureKind".into();
+    }
+
+    /// #2817 (review r1 row 2): a `held_at_bound` entry of a parameter family this build
+    /// does not know is dropped on load, and the rest of the bundle and the list load, both
+    /// through `load_fit` and through `FitResult::from_json_str`. Without the lenient read,
+    /// the strict `ParameterKind` derive fails both `expect`s.
+    #[test]
+    fn an_unknown_held_kind_is_dropped_and_the_rest_loads() {
+        use crate::types::{HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let r = two_held_thetas();
+        let src = dir.path().join("known.fitrx");
+        save_fit(&r, &p, "model source\n", &src, SaveFitOptions::default()).unwrap();
+        let dst = dir.path().join("future-kind.fitrx");
+        rewrite_bundle(&src, &dst, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, inject_future_kind)
+            } else {
+                body
+            })
+        });
+        let survivors = |list: &[crate::types::HeldAtBound]| {
+            list.iter()
+                .map(|h| (h.name.clone(), h.kind, h.index, h.reason))
+                .collect::<Vec<_>>()
+        };
+        let want = [(
+            "KA".to_string(),
+            ParameterKind::Theta,
+            2,
+            HeldReason::ProfiledBound,
+        )];
+        let loaded = load_fit(&dst)
+            .expect("an unknown held kind must not fail the bundle")
+            .fit;
+        assert_eq!(survivors(&loaded.held_at_bound), want);
+
+        let json = dir.path().join("fit.json");
+        crate::io::output::write_result_json(&r, json.to_str().unwrap()).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        inject_future_kind(&mut v);
+        let back = FitResult::from_json_str(&serde_json::to_string(&v).unwrap())
+            .expect("an unknown held kind must not fail the FitResult JSON");
+        assert_eq!(survivors(&back.held_at_bound), want);
+
+        // The negative: every known kind survives the lenient read.
+        let mut all = two_held_thetas();
+        for (k, kind) in [
+            ParameterKind::Omega,
+            ParameterKind::Sigma,
+            ParameterKind::Kappa,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut h = all.held_at_bound[0].clone();
+            h.kind = kind;
+            h.index = k;
+            all.held_at_bound.push(h);
+        }
+        let text = serde_json::to_string(&all).unwrap();
+        assert_eq!(
+            FitResult::from_json_str(&text).unwrap().held_at_bound,
+            all.held_at_bound
+        );
     }
 
     /// `final_gradient_source` has to survive the checkpoint alongside the vector
