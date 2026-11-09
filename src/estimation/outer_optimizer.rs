@@ -431,6 +431,16 @@ pub fn optimize_population(
     if let Some(w) = outer_fd_fallback_warning(model, population, &declines) {
         result.warnings.push(w);
     }
+    // #2713: a gradient-driven stop short of convergence reports how far its final
+    // gradient is from the exact one.
+    stop::attach_stop_report(
+        resolved,
+        model,
+        population,
+        init_params,
+        options,
+        &mut result,
+    );
     result
 }
 
@@ -11157,6 +11167,13 @@ impl OuterFdDeclineLog {
         }
     }
 
+    /// Whether subject `i` declined structurally on some evaluation.
+    fn is_structural(&self, i: usize) -> bool {
+        self.structural
+            .get(i)
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+    }
+
     /// How many declined subjects were structural declines.
     fn n_structural(&self) -> usize {
         self.structural
@@ -12101,6 +12118,9 @@ fn covariance_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
 }
+
+#[path = "outer_optimizer_stop.rs"]
+mod stop;
 
 #[cfg(test)]
 #[path = "outer_optimizer_tests.rs"]

@@ -148,6 +148,23 @@ The parenthesis counts the declined subjects by cause (#2713), one clause per ca
 
 The counts cover every trial point of the fit, including rejected ones. A subject that declined for both causes is counted under each, so the counts can add up to more than the declined total.
 
+#### When the optimizer stops short {#outer-stop-report}
+
+When a gradient-driven outer optimizer (L-BFGS, SLSQP, MMA, BFGS) stops without converging, the fit adds a warning about the gradient at the reported estimates (#2713). It counts the subjects whose outer gradient there is the fixed-EBE fallback and says how far the gradient the fit used is from the exact one, in which those subjects are reconverged:
+
+```
+The outer optimizer stopped without converging (#2713). At the reported estimates 3 of
+40 subjects carry fixed-EBE outer gradients, and the gradient the fit used there is
+12.346% off the exact one. Unless the stop was the evaluation budget, test whether that
+caused it by rerunning with `reconverge_gradient_interval = 1`: if the stop goes away,
+the fallback was the cause; if it stays, look at the objective: EBEs that change mode
+between nearby estimates, or a kink in the model such as `if`, `abs` or `max`.
+```
+
+When no subject carries the fallback there, the warning says the final gradient is exact and points at the objective instead. The fallback can still have biased the gradient at a line-search trial point, so this rules it out only at the reported estimates. A fit that ran out of its evaluation budget gets the report too, beside its own budget warning; there the budget is the cause, and the report only says whether the final gradient was exact.
+
+The check costs one population outer gradient plus, for each subject on the fallback, one held-EBE and one reconverged finite-difference gradient. It is skipped for IOV models and under `reconverge_gradient_interval = 1`, where every declined subject is already reconverged, and under AGQ/Laplace and for mixture models, which assemble their gradient elsewhere.
+
 #### What a declined subject is charged {#declined-subject-salvage}
 
 The salvage follows the [`reconverge_gradient_interval`](#gradient-accuracy-vs-cost-reconverged-ebes) schedule like every other fixed-EBE gradient (#1529): a declined subject gets the gradient at its **held** EBE — `2·n_free` evaluations of that one subject, no inner re-solve — and an evaluation the schedule reconverges re-solves every subject's EBE anyway. Before #1529 a declined subject was always charged a reconverged finite-difference gradient (`2·n_free` full EBE solves) whatever the setting. Because declines depend on the trial point, a blown-up line-search trial could send most of the population down that path at once: on a 55-subject parent–metabolite ODE model, 46 subjects declined at one such trial, about 1,200 EBE solves for a single gradient and 82% of the fit's wall time.

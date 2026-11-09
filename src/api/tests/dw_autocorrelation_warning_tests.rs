@@ -265,6 +265,10 @@ const ACCOUNTED: &[(&str, &str)] = &[
         "increase maxiter for a tighter fit.",
     ),
     ("Outer optimization did not converge", "did not converge"),
+    (
+        "The outer optimizer stopped without converging (#2713).",
+        "such as `if`, `abs` or `max`.",
+    ),
     ("threads configured", "(no speed benefit beyond n_subjects)"),
     (
         "Stochastic differential equations ([diffusion]",
