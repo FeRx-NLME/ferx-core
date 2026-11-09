@@ -44,7 +44,7 @@
 //! | "  attempt K: …" (one per attempt) | every failing-fetch test |
 //! | "… not a zip (N bytes, C): <the whole reply>" | `a_short_non_zip_reply_is_quoted_whole`, `a_garbled_payload_is_a_failed_attempt_not_a_hash` |
 //! | "… (cut at 1024 of N bytes)" | `a_long_non_zip_reply_is_cut_and_says_so` |
-//! | "deadline reached before the response headers" | `headers_that_never_end_stop_at_the_deadline`, `headers_arriving_after_the_deadline_stop_before_the_body` |
+//! | "deadline reached before the response headers" | `headers_that_never_end_stop_at_the_deadline`, `headers_arriving_after_the_deadline_stop_before_the_body`, `a_silent_server_stops_at_the_deadline` |
 //! | "--attempts: must be at least 1, got N" | `zero_attempts_is_a_usage_error` |
 //! | "--timeout and --deadline-seconds must be positive" | `a_zero_deadline_is_a_usage_error` |
 //! | "--from F: neither … nor … found in the zip (N entries)" | `from_a_zip_without_the_csv_names_what_is_missing` |
@@ -410,9 +410,11 @@ fn the_backoff_never_sleeps_past_the_deadline() {
     );
 }
 
-/// A server that accepts the request and never answers: the read timeout handed to
-/// `urlopen` is capped by the time left, so the 2 s budget ends it, not the 30 s
-/// `--timeout`. (The trickler sends bytes, so it cannot see that cap.)
+/// A server that accepts the request and never answers: the header phase is waited for
+/// only until the deadline (the `join` in `open_within`), so the 2 s budget ends it, not
+/// the 30 s `--timeout`, and the attempt line names the deadline. The worker's socket
+/// gets the full 30 s, so no socket `timed out` can race the deadline (#2834 review
+/// rows 2 and 3); a `join` without a timeout runs to the 25 s watchdog.
 #[test]
 fn a_silent_server_stops_at_the_deadline() {
     let r = run(
@@ -423,7 +425,13 @@ fn a_silent_server_stops_at_the_deadline() {
     let m = &r.message;
     assert_eq!(r.exit, 1, "{}", r.log);
     assert!(
-        (1.9..10.0).contains(&r.elapsed),
+        m.contains(
+            "  attempt 1: error: TimeoutError: deadline reached before the response headers"
+        ),
+        "{m}"
+    );
+    assert!(
+        (1.9..3.0).contains(&r.elapsed),
         "must stop at the 2 s deadline, not the 30 s read timeout: {} s\n{}",
         r.elapsed,
         r.log
@@ -606,8 +614,9 @@ fn a_deadline_on_the_last_attempt_is_reported() {
 /// end at `latest_start` = 720 − 0.25 · 720 = 540 s.
 const PRODUCTION_STARTS: [f64; 8] = [0.0, 15.0, 45.0, 105.0, 225.0, 345.0, 465.0, 540.0];
 
-/// `r.hit_times` matches `want`, each start within 1 s after its target (the attempts' own
-/// wall time).
+/// `r.hit_times` matches `want`, each start within 1 s after its target. That 1 s covers
+/// the attempts' own wall time: measured worst drift over 3 runs on Python 3.12 was 12 ms
+/// (#2834 review row 6), so the bound has ~80x headroom for a loaded CI runner.
 fn assert_starts(r: &Run, want: &[f64]) {
     assert!(
         r.hit_times.iter().all(|t| t.is_finite()),
@@ -900,4 +909,34 @@ fn slow_tests_fetch_budget_fits_the_core_job_ceiling() {
         "core ceiling {ceiling} min < 15 setup + {step_cap} fetch + {inner} inner + \
          {kill_after} kill-after"
     );
+}
+
+/// The harness refuses a `--harness-*` option it does not know, rather than dropping it:
+/// a typo (or `--harness-reserve 0.25` with a space) would otherwise run a different
+/// schedule than the test's name says (#2834 review row 5). Both spellings are refused;
+/// the known options are exercised by the schedule tests (T1–T3, T10).
+#[test]
+fn the_harness_refuses_an_unknown_harness_option() {
+    for bad in ["--harness-reserv=0.25", "--harness-reserve"] {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cana-fetch-harness-typo");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = Command::new("python3")
+            .arg("-I")
+            .arg(repo_root().join("tests/data/mbma_canakinumab/fetch_fake_server.py"))
+            .arg(repo_root().join("tools/mbma_canakinumab_fetch.py"))
+            .arg(&dir)
+            .arg("always_500")
+            .arg(bad)
+            .output()
+            .expect("python3 on PATH");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{bad} was accepted:\n{err}");
+        assert!(
+            err.contains(&format!(
+                "fetch_fake_server: unknown harness option(s): {bad}"
+            )),
+            "{bad}: {err}"
+        );
+    }
 }

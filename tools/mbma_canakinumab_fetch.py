@@ -38,7 +38,7 @@ so a trickling download cannot outlast the CI step's cap (#1938). The attempts a
 spread over that budget, doubling waits from 15 s up to 120 s, so a short outage is
 waited out; none starts in the budget's last quarter, which is kept for one full
 download; and every phase of an attempt, the response headers included, ends at the
-deadline (#2824). `--from` takes a local copy of the outer zip, of
+deadline (#2824; see `read_within` for the one fallback). `--from` takes a local copy of the outer zip, of
 `PSP4-15-e70158-s002.zip`, or of the bare `data_9studies.csv`, and skips the
 download.
 
@@ -88,8 +88,9 @@ DEFAULT_OUT = "data/external/mbma_canakinumab.csv"
 # double from BACKOFF_BASE_SECONDS up to BACKOFF_CAP_SECONDS, and no attempt starts
 # in the last RESERVE_FRACTION of the budget, which is kept for one full download.
 # At the default 720 s, with fast failures, the attempts start at 0, 15, 45, 105,
-# 225, 345, 465 and 540 s; the 180 s reserve is 1.4x the slowest download CI has
-# measured (127 s). There is no sleep after the last attempt (#1938).
+# 225, 345, 465 and 540 s; the 180 s reserve is about 1.03x the slowest download CI
+# has measured (174 s, slow-tests run 42608366633), so it has little headroom; see
+# #2824. There is no sleep after the last attempt (#1938).
 BACKOFF_BASE_SECONDS = 15
 BACKOFF_CAP_SECONDS = 120
 RESERVE_FRACTION = 0.25
@@ -131,16 +132,17 @@ def open_within(url, timeout, deadline):
     covered at all (#2824). So `urlopen` runs in a daemon thread and the caller waits
     for it only until the deadline. A thread left behind dies with the process: the
     retry loop starts no attempt after the deadline. An exception raised in the thread
-    is re-raised here, type and text intact.
+    is re-raised here, type and text intact. The thread gets the full `timeout`, not
+    the time left: the `join` is the one deadline gate, so a header phase cut by the
+    deadline is always reported as the deadline, never as a socket `timed out` that
+    happens to fire at the same instant (#2834 review row 2).
     """
-    # The caller's loop only starts an attempt with time left, so this is positive.
-    left = deadline - time.monotonic()
     box = {}
 
     def work():
         try:
             # URL is the https constant above, never user input (asserted in main).
-            box["r"] = urllib.request.urlopen(url, timeout=min(timeout, left))  # nosec B310
+            box["r"] = urllib.request.urlopen(url, timeout=timeout)  # nosec B310
         except BaseException as e:  # noqa: BLE001 — handed to the caller as is
             box["e"] = e
 
@@ -388,7 +390,8 @@ def main():
         type=int,
         default=10,
         help="most download attempts (default 10; at the default deadline the "
-        "budget, not the count, ends the loop: 8 attempts fit)",
+        "budget, not the count, ends the loop: up to 8 attempts fit, with fast "
+        "failures)",
     )
     ap.add_argument(
         "--timeout",

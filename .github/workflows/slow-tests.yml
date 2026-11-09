@@ -199,9 +199,10 @@ jobs:
         #
         # Time (#1938, #2818, #2824). The script's own budget is `--deadline-seconds 720`
         # (12 min) across all attempts and backoffs. The attempts spread over it (waits
-        # doubling from 15 s to a 120 s cap: starts at 0, 15, 45, … 465, 540 s), so a
-        # few-minute outage is waited out, and none starts in the last 180 s, which are
-        # kept for one full download (the slowest measured took 127 s). The response
+        # doubling from 15 s to a 120 s cap: with fast failures, starts at 0, 15, 45, …
+        # 465, 540 s), so a few-minute outage is waited out, and none starts in the last
+        # 180 s, which are kept for one full download (the slowest measured took 174 s,
+        # run 42608366633). The response
         # headers are waited for only until the deadline, and before every body read the
         # socket timeout is re-capped at the time left, so a trickling, stalling or silent
         # server ends there and the script prints which attempt failed how. Should that

@@ -34,6 +34,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 script, out_dir, scenario, extra = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4:]
 production_timing = "--harness-production-timing" in extra
 reserve_opt = [a.split("=", 1)[1] for a in extra if a.startswith("--harness-reserve=")]
+unknown = [
+    a for a in extra
+    if a.startswith("--harness-")
+    and a != "--harness-production-timing"
+    and not a.startswith("--harness-reserve=")
+]
+if unknown:
+    # A typo here would silently run a different schedule than the test's name says.
+    sys.exit(f"fetch_fake_server: unknown harness option(s): {' '.join(unknown)}")
 extra = [a for a in extra if not a.startswith("--harness-")]
 WATCHDOG_SECONDS = 25
 
