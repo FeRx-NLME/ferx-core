@@ -8750,11 +8750,12 @@ pub struct FitResult {
     /// EPS shrinkage: `1 - SD(IWRES)`.  `NaN` when fewer than 2 valid residuals.
     pub shrinkage_eps: f64,
     /// Pooled lag-1 Pearson correlation of IWRES across subjects.
-    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    /// `NaN` when no series has ≥ 2 valid IWRES values (a series is a subject's
+    /// rows, split at its `correlation … by` blocks and its parallel occasions).
     pub iwres_lag1_r: f64,
     /// Pooled Durbin-Watson statistic for IWRES within subjects.
     /// 2.0 = no autocorrelation; < 1.5 = positive; > 2.5 = negative.
-    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    /// `NaN` when no series has ≥ 2 valid IWRES values, as for `iwres_lag1_r`.
     pub dw_statistic: f64,
     /// Wall-clock time for the complete fit in seconds.
     pub wall_time_secs: f64,
