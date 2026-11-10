@@ -261,12 +261,514 @@ pub(crate) fn floor_not_converged_warning(
     )
 }
 
+/// How far above its internal lower guard, in packed ln-SD units, a free variance coordinate
+/// is probed on the guard (#2832). Measured stops short of the guard sat 1.20 (Linux, the
+/// `[mixture]` override of `mix_override_collapse.csv` under BOBYQA), 1.00 (the same on
+/// macOS), 0.85 (its base ω with the labels swapped), 0.63 and 0.30 (tighter stops) above
+/// it: 0.8 units of headroom over the worst. The probe adopts only a lower OFV, so the span
+/// bounds what the check costs (one evaluation per coordinate inside it), not what it can
+/// get wrong.
+pub(crate) const RAIL_PROBE_SPAN: f64 = 2.0;
+
+/// Where the resumed run starts a railed coordinate, in packed units above its guard (the
+/// probe evaluates it **on** the guard). Measured on Linux aarch64 with
+/// `mix_override_collapse.csv` under BOBYQA (#2832): resumed from exactly the guard, the
+/// labels-swapped base ω walked 1.2e-4 back off it and stopped there, within `xtol` but not
+/// on the guard, so it was not held; resumed from 1e-3 above, the override and the base ω
+/// both ended exactly on the guard (−37.396982 / −37.396686, the base held).
+pub(crate) const RAIL_RESTART_ABOVE: f64 = 1e-3;
+
+/// What a near-rail coordinate is, for the warning's wording and the scale of its value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RailFamily {
+    /// An Ω or κ diagonal whose variance is its Cholesky diagonal squared (a diagonal Ω, a
+    /// block's first row), or a `[mixture]` Ω override. Its value is the variance.
+    RandomEffect,
+    /// A later row of a block Ω or κ: the coordinate near the guard is the Cholesky diagonal
+    /// `L_ii`, the SD left once the earlier η are known, while `Ω_ii = Σ_j L_ij²` need not be
+    /// small (#2839 review, row 5). Its value is `L_ii`.
+    BlockFactor,
+    /// A σ, or a `[mixture]` σ override. Its value is the SD.
+    ResidualError,
+}
+
+/// A free variance coordinate a run stopped just above its internal lower guard
+/// ([`near_rail_variances`]): its packed index, its name as the estimate table shows it
+/// (`ETA_CL_MIX2` for a class-2 override), its family, and its value on that family's
+/// scale.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RailCandidate {
+    pub(crate) index: usize,
+    pub(crate) name: String,
+    pub(crate) family: RailFamily,
+    pub(crate) value: f64,
+}
+
+/// The free log-packed variance coordinates of `result` — Ω and κ diagonals (a block's
+/// `L_ii`), σ, and `[mixture]` overrides — within [`RAIL_PROBE_SPAN`] above their internal
+/// lower guard but not on it (#2832). On the guard they are
+/// `api::postfit::collapsed_coordinates`, which the warning and the hold already read; FIXed
+/// ones cannot move; off-diagonals and ρ have no lower rail that means collapse. The bounds
+/// walk is `api::postfit::runaway_guard_estimates`': the optimizer's own packing and box.
+pub(crate) fn near_rail_variances(result: &ModelParameters) -> Vec<RailCandidate> {
+    use crate::estimation::parameterization::{
+        coordinate_kinds, coordinate_names, coordinate_values, pack_with_bounds, PackedStart,
+    };
+    let PackedStart {
+        packed,
+        bounds,
+        fixed,
+        moves: _,
+    } = pack_with_bounds(result);
+    let names = coordinate_names(result);
+    let values = coordinate_values(result);
+    let kinds = coordinate_kinds(result);
+    let on_rail: Vec<usize> = crate::api::postfit::collapsed_coordinates(result)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
+    (result.theta.len()..packed.len())
+        .filter_map(|i| {
+            let (x, lo) = (packed[i], *bounds.lower.get(i)?);
+            let value = values.get(i).copied().unwrap_or(f64::NAN);
+            let (family, value) = match kinds.get(i)? {
+                // A block's later row: the reported variance is not the packed factor
+                // squared. Read from the values themselves, so the test is the one the
+                // reader would make, not a second walk of the block layout.
+                PackedCoordKind::OmegaDiagonal
+                    if ((2.0 * x).exp() - value).abs() > 1e-9 * value.abs() =>
+                {
+                    (RailFamily::BlockFactor, x.exp())
+                }
+                PackedCoordKind::OmegaDiagonal => (RailFamily::RandomEffect, value),
+                PackedCoordKind::Sigma => (RailFamily::ResidualError, value),
+                _ => return None,
+            };
+            // "Not on the guard" is the collapse walk's alone (it admits the few ULPs a
+            // scaled clamp leaves), not a second `x > lo`: two gates rejecting the same
+            // inputs would leave each untestable (AGENTS.md). Every variance lower bound is
+            // a finite constant (a FIXed one's is its packed value), so no finiteness gate
+            // either (#2839 review, row 7).
+            (!fixed.get(i).copied().unwrap_or(false)
+                && x <= lo + RAIL_PROBE_SPAN
+                && !on_rail.contains(&i))
+            .then(|| RailCandidate {
+                index: i,
+                name: names.get(i).cloned().unwrap_or_default(),
+                family,
+                value,
+            })
+        })
+        .collect()
+}
+
+/// `result` with each packed coordinate of `idx` at `above` over its internal lower guard
+/// (`0.0`: on it), everything else where it is, and the user's θ FIX mask (`start`'s), for
+/// the reason [`restart_params`] gives.
+pub(crate) fn at_rail_params(
+    result: &ModelParameters,
+    start: &ModelParameters,
+    idx: &[usize],
+    above: f64,
+) -> ModelParameters {
+    let crate::estimation::parameterization::PackedStart {
+        mut packed, bounds, ..
+    } = crate::estimation::parameterization::pack_with_bounds(result);
+    for &i in idx {
+        if let (Some(x), Some(&lo)) = (packed.get_mut(i), bounds.lower.get(i)) {
+            *x = lo + above;
+        }
+    }
+    let mut p = unpack_params(&packed, result);
+    p.theta_fixed = start.theta_fixed.clone();
+    p
+}
+
+/// The warning's list of near-rail coordinates, each with its value where the run stopped
+/// and the OFV of its own probe on the guard.
+fn rail_list(downhill: &[(RailCandidate, f64)]) -> String {
+    downhill
+        .iter()
+        .map(|(c, probe_ofv)| {
+            let (family, scale) = match c.family {
+                RailFamily::RandomEffect => ("random effect", "variance"),
+                RailFamily::BlockFactor => ("random effect", "conditional SD in its block"),
+                RailFamily::ResidualError => ("residual error", "SD"),
+            };
+            format!(
+                "the {family} {} ({scale} {:.3e}; OFV {probe_ofv:.6} with it on the guard)",
+                c.name, c.value
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Where a rail probe was judged: the stop re-scored evaluation-only, at the budget the
+/// probes ran at (#2839 review, row 4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct RailScore {
+    pub(crate) at_ofv: f64,
+    pub(crate) inner_maxiter: usize,
+}
+
+/// The sentence every rail warning opens with: where the run stopped, and what is lower.
+/// When the re-scored stop does not print as the run's OFV, it is named with its budget, so
+/// the two figures for one point do not read as a contradiction (the #2632 review, row 1,
+/// rule).
+fn rail_stop_sentence(downhill: &[(RailCandidate, f64)], stop_ofv: f64, at: RailScore) -> String {
+    let budget = if format!("{:.6}", at.at_ofv) == format!("{stop_ofv:.6}") {
+        String::new()
+    } else {
+        format!(
+            " (re-scored {:.6} at `inner_maxiter = {}`, as the probes were)",
+            at.at_ofv, at.inner_maxiter
+        )
+    };
+    format!(
+        "Outer optimization stopped at OFV {stop_ofv:.6}{budget} with {} just above ferx's \
+         internal lower guard, where the objective is still falling.",
+        rail_list(downhill),
+    )
+}
+
+fn it_them(n: usize) -> &'static str {
+    if n == 1 {
+        "it"
+    } else {
+        "them"
+    }
+}
+
+/// The warning of an adopted rail completion (#2832). Filed under `optimizer_health` on
+/// "resumed from just above the guard". Says only what is new: the adopted point is on the guard, so
+/// the post-fit collapse warning names the coordinates again with its own remedy.
+pub(crate) fn rail_restart_warning(
+    downhill: &[(RailCandidate, f64)],
+    stop_ofv: f64,
+    at: RailScore,
+    restarted_ofv: f64,
+) -> String {
+    format!(
+        "{} It was resumed from just above the guard with {} there and reached OFV = \
+         {restarted_ofv:.6}; the reported estimates are from the resumed run.",
+        rail_stop_sentence(downhill, stop_ofv, at),
+        it_them(downhill.len()),
+    )
+}
+
+/// The remedy both not-converged rail warnings end with. Optimizer-neutral: rail completion
+/// runs after every outer optimizer, so naming one would advise a fit already on it (#2839
+/// review, row 6).
+const RAIL_REMEDY: &str = "tighten `outer_xtol`, or try another `optimizer`";
+
+/// The warning of a rail completion whose resumed run ended no lower (#2832). Filed under
+/// `convergence` on "not reported as converged".
+pub(crate) fn rail_not_converged_warning(
+    downhill: &[(RailCandidate, f64)],
+    stop_ofv: f64,
+    at: RailScore,
+) -> String {
+    format!(
+        "{} A run resumed from just above the guard with {} there found no lower point, so \
+         the fit is not reported as converged: {RAIL_REMEDY}.",
+        rail_stop_sentence(downhill, stop_ofv, at),
+        it_them(downhill.len()),
+    )
+}
+
+/// The warning of an adopted rail completion whose resumed run stopped short of a guard
+/// again, with the objective still falling there (#2839 review, row 3): lower than the
+/// first stop, so it is reported, but no more a minimum. Names what the **resumed** run
+/// left short, which need not be what the first stop did. Filed under `convergence` on "not
+/// reported as converged", which `classify_warning` tests before the health phrase.
+pub(crate) fn rail_short_again_warning(
+    downhill: &[(RailCandidate, f64)],
+    stop_ofv: f64,
+    at: RailScore,
+    restarted_ofv: f64,
+    again: &[(RailCandidate, f64)],
+) -> String {
+    format!(
+        "{} It was resumed from just above the guard with {} there and reached OFV = \
+         {restarted_ofv:.6}, but stopped with {} just above the guard again. The reported \
+         estimates are from the resumed run, and the fit is not reported as converged: \
+         {RAIL_REMEDY}.",
+        rail_stop_sentence(downhill, stop_ofv, at),
+        it_them(downhill.len()),
+        rail_list(again),
+    )
+}
+
+/// One rail probe of a fit ([`probe_rail`]): its downhill candidates with their probe OFVs,
+/// the evaluations it spent, and the re-scored fit the probes were judged against.
+struct RailProbed {
+    downhill: Vec<(RailCandidate, f64)>,
+    evals: usize,
+    at: RailScore,
+}
+
+/// The rail probe of `fit`: `None` when it has no candidate (no evaluation spent). Else the
+/// fit is re-scored evaluation-only (`score`) and each candidate is probed alone on its
+/// guard (`probe`) at that same budget, and a candidate is downhill when its `ranked` probe
+/// is lower than the re-scored fit's by more than [`FLOOR_PROBE_GAIN`]. Both sides at one
+/// budget, as the #2629 near-floor probe scores both: a probe that moves a variance the EBEs
+/// read is a cold start for them, and judged against the run's own in-run score it reads a
+/// budget difference as a slope (#2839 review, row 4). A re-score that is not finite
+/// probes nothing. Each evaluation counts.
+fn probe_rail<T: StoppedFit>(
+    fit: &T,
+    candidates_of: &impl Fn(&T) -> Vec<RailCandidate>,
+    score: &impl Fn(&T) -> T,
+    probe: &impl Fn(&T, usize) -> T,
+    ranked: &impl Fn(&T) -> f64,
+    inner_maxiter: usize,
+) -> Option<RailProbed> {
+    let candidates = candidates_of(fit);
+    if candidates.is_empty() {
+        return None;
+    }
+    let at = score(fit);
+    let at_ofv = at.ofv();
+    let mut evals = 1;
+    let downhill = if ofv_is_valid(at_ofv) {
+        evals += candidates.len();
+        candidates
+            .into_iter()
+            .filter_map(|c| {
+                let p = probe(fit, c.index);
+                (ofv_is_valid(p.ofv()) && ranked(&at) - ranked(&p) > FLOOR_PROBE_GAIN).then(|| {
+                    let ofv = p.ofv();
+                    (c, ofv)
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(RailProbed {
+        downhill,
+        evals,
+        at: RailScore {
+            at_ofv,
+            inner_maxiter,
+        },
+    })
+}
+
+/// The decision behind rail completion (#2832), pure so every branch is unit-testable
+/// without a fit. [`probe_rail`] probes the stop (`candidates_of`, `score`, `probe`, at
+/// `inner_maxiter`); `restart(stop, idx)` resumes the fit with every coordinate of `idx`
+/// on its guard. Each candidate is probed on its own: a joint probe would miss a downhill
+/// coordinate whenever an uphill one (a small but real variance inside the span) rode along.
+/// The downhill candidates go on the guard together and the fit is resumed once; the resumed
+/// run is adopted only on a strictly lower `ranked` objective. Otherwise the stop is kept
+/// and is not converged: a point with a downhill probe is not a minimum. No downhill probe
+/// returns `first` with only its evaluation count moved (#2839 review, row 8: every probe
+/// is booked, restart or not).
+///
+/// An adopted resumed run is probed the same way (#2839 review, row 3): one that stopped
+/// short of a guard again, with the objective still falling there, is reported — it is
+/// lower than the first stop — but not converged, as the θ escape treats a restart that
+/// lands on the floor again.
+///
+/// `escape` is the θ floor escape's warning when that escape ran on the way to `first`: an
+/// adopted resumed run is a new result, so it carries that warning ahead of its own, and an
+/// escape that left `first` not converged leaves the resumed run not converged either — the
+/// resumed run starts from the escape's point, θ and all, so it cannot clear that verdict.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_rail_completion<T: StoppedFit>(
+    first: T,
+    escape: Option<String>,
+    candidates_of: impl Fn(&T) -> Vec<RailCandidate>,
+    score: impl Fn(&T) -> T,
+    probe: impl Fn(&T, usize) -> T,
+    restart: impl FnOnce(&T, &[usize]) -> T,
+    ranked: impl Fn(&T) -> f64,
+    inner_maxiter: usize,
+    verbose: bool,
+) -> T {
+    let Some(probed) = probe_rail(
+        &first,
+        &candidates_of,
+        &score,
+        &probe,
+        &ranked,
+        inner_maxiter,
+    ) else {
+        return first;
+    };
+    let mut first = first;
+    if probed.downhill.is_empty() {
+        *first.evals_mut() += probed.evals;
+        return first;
+    }
+    let RailProbed {
+        downhill,
+        evals: n_probes,
+        at,
+    } = probed;
+    let stop_ofv = first.ofv();
+    if verbose {
+        eprintln!(
+            "Outer optimizer stopped with {} just above the internal lower guard (OFV \
+             {stop_ofv:.6}); resuming from the guard.",
+            downhill
+                .iter()
+                .map(|(c, _)| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    let idx: Vec<usize> = downhill.iter().map(|(c, _)| c.index).collect();
+    let mut second = restart(&first, &idx);
+    if !(ofv_is_valid(second.ofv()) && ranked(&second) < ranked(&first)) {
+        *first.evals_mut() += *second.evals_mut() + n_probes;
+        *first.covariance_secs_mut() += *second.covariance_secs_mut();
+        *first.converged_mut() = false;
+        first
+            .warnings_mut()
+            .push(rail_not_converged_warning(&downhill, stop_ofv, at));
+        return first;
+    }
+    *second.evals_mut() += *first.evals_mut() + n_probes;
+    *second.covariance_secs_mut() += *first.covariance_secs_mut();
+    // The resumed run measures "left its start" against the point it was resumed from,
+    // a few ULPs to a few ln-units from where the first stopped, so a resumed run that
+    // barely moves reports `left_init = Some(false)` and runs the #2506 start probe on it
+    // (measured: `a_fit_with_a_real_budget_is_not_flagged_as_stalled`). The published
+    // verdict answers "are the estimates still on the user's start" (#1277 review), and a
+    // first run that left it is answered: the resumed run only continued from there.
+    if first.start_verdict_mut().map(|(l, _)| *l) == Some(Some(true)) {
+        if let Some((left, stationary)) = second.start_verdict_mut() {
+            *left = Some(true);
+            *stationary = false;
+        }
+    }
+    if let Some(w) = escape {
+        if !*first.converged_mut() {
+            *second.converged_mut() = false;
+        }
+        second.warnings_mut().push(w);
+    }
+    let again = probe_rail(
+        &second,
+        &candidates_of,
+        &score,
+        &probe,
+        &ranked,
+        inner_maxiter,
+    );
+    if let Some(a) = &again {
+        *second.evals_mut() += a.evals;
+    }
+    let w = match again.filter(|a| !a.downhill.is_empty()) {
+        None => rail_restart_warning(&downhill, stop_ofv, at, second.ofv()),
+        Some(a) => {
+            *second.converged_mut() = false;
+            rail_short_again_warning(&downhill, stop_ofv, at, second.ofv(), &a.downhill)
+        }
+    };
+    second.warnings_mut().push(w);
+    second
+}
+
+/// The tests' handle on rail completion (#2832): a switch that turns it off and a record of
+/// the coordinates it probed. Process-global, not thread-local, because `fit()` runs
+/// [`escape_floor`] on a pool thread; a test that sets [`OFF`](rail_switch::OFF) or reads
+/// [`PROBED`](rail_switch::PROBED) holds [`LOCK`](rail_switch::LOCK) for its whole body.
+/// With the switch off a fit behaves as it did before #2832, so a test that never takes the
+/// lock cannot be broken by one that does. The lock does **not** keep other tests' fits out
+/// of `PROBED`: any fit with a near-rail variance pushes into it, from any thread, so a
+/// test asserts only on names its own fixture alone uses (#2839 review, row 1).
+#[cfg(test)]
+pub(crate) mod rail_switch {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex;
+    pub(crate) static OFF: AtomicBool = AtomicBool::new(false);
+    pub(crate) static PROBED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    pub(crate) static LOCK: Mutex<()> = Mutex::new(());
+}
+
+fn rail_completion_enabled() -> bool {
+    #[cfg(test)]
+    {
+        !rail_switch::OFF.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// Rail completion on the run [`escape_floor`] is about to report (#2832): after the θ
+/// escape, which resets rail variances to their starts, so it reads the point that is
+/// actually reported. Skipped, like the θ escape, for an evaluation-only or cancelled fit
+/// and a non-finite objective.
+fn complete_rail<T: StoppedFit>(
+    reported: T,
+    escape: Option<String>,
+    start: &ModelParameters,
+    options: &FitOptions,
+    run: impl Fn(&ModelParameters, &FitOptions) -> T,
+    penalty: impl Fn(&ModelParameters) -> f64,
+) -> T {
+    if !runs_outer_optimizer(options)
+        || crate::cancel::is_cancelled(&options.cancel)
+        || !ofv_is_valid(reported.ofv())
+    {
+        return reported;
+    }
+    // The stop and its probes are scored at one budget, at least the default — the rule of
+    // `rescored_start` (#2619) and the #2629 near-floor probe (#2839 review, row 4).
+    let inner_maxiter = options
+        .inner_maxiter
+        .max(FitOptions::default().inner_maxiter);
+    let scored = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        inner_maxiter,
+        optimizer_trace: false,
+        ..options.clone()
+    };
+    resolve_rail_completion(
+        reported,
+        escape,
+        |r: &T| near_rail_variances(r.params()),
+        |r: &T| run(r.params(), &scored),
+        |r: &T, i| {
+            #[cfg(test)]
+            if let Some(c) = near_rail_variances(r.params())
+                .into_iter()
+                .find(|c| c.index == i)
+            {
+                rail_switch::PROBED
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(c.name);
+            }
+            run(&at_rail_params(r.params(), start, &[i], 0.0), &scored)
+        },
+        |r: &T, idx| {
+            run(
+                &at_rail_params(r.params(), start, idx, RAIL_RESTART_ABOVE),
+                options,
+            )
+        },
+        |r| r.ofv() + penalty(r.params()),
+        inner_maxiter,
+        options.verbose,
+    )
+}
+
 /// Run `run` from `start`, then escape the log-packing floor as described in the module
-/// doc. `run(params, options)` is the outer optimizer — the profiled or the unprofiled one
-/// — and is called at most six times: the fit, the evaluation-only probe
-/// (`outer_maxiter = 0`, no covariance step), the restart, the re-score of the restart's
-/// point and the probe of any θ it left below its probe point (#2629, two calls), and the
-/// start's re-score below.
+/// doc, then complete a variance stopped short of its guard ([`complete_rail`], #2832).
+/// `run(params, options)` is the outer optimizer — the profiled or the unprofiled one
+/// — and is called at most `7 + k` times for `k` near-rail variances: the fit, the
+/// evaluation-only probe (`outer_maxiter = 0`, no covariance step), the restart, the
+/// re-score of the restart's point and the probe of any θ it left below its probe point
+/// (#2629, two calls), one evaluation-only rail probe per near-rail variance and the rail
+/// restart, and the start's re-score below.
 /// `penalty` is added to `OuterResult::ofv` when the two fits are ranked (priors, NN
 /// regularisation), as `optimize_nlopt` ranks its attempts.
 ///
@@ -287,7 +789,10 @@ pub(crate) fn escape_floor<T: StoppedFit>(
 ) -> T {
     let first = run(start, options);
     let mut fit_start = *first.start_eval();
-    let mut reported = escape_floor_from(first, start, options, &run, &penalty);
+    let (mut reported, escape) = escape_floor_from(first, start, options, &run, &penalty);
+    if rail_completion_enabled() {
+        reported = complete_rail(reported, escape, start, options, &run, &penalty);
+    }
     let ranked = reported.ofv() + penalty(reported.params());
     if ranked.is_finite() {
         fit_start = rescored_start(fit_start, start, options, &run);
@@ -360,24 +865,28 @@ fn rescored_start<T: StoppedFit>(
     }
 }
 
-/// [`escape_floor`] after its first run: the probe and the restart.
+/// [`escape_floor`] after its first run: the probe and the restart. Also returns the
+/// escape's warning when it ran, for rail completion to carry ([`resolve_rail_completion`]).
+/// [`resolve_floor_escape`] calls its `restart` exactly when it goes on to push its one
+/// warning onto the result it returns, so that call is the marker.
 fn escape_floor_from<T: StoppedFit>(
     first: T,
     start: &ModelParameters,
     options: &FitOptions,
     run: impl Fn(&ModelParameters, &FitOptions) -> T,
     penalty: impl Fn(&ModelParameters) -> f64,
-) -> T {
+) -> (T, Option<String>) {
     if !runs_outer_optimizer(options)
         || crate::cancel::is_cancelled(&options.cancel)
         || !ofv_is_valid(first.ofv())
     {
-        return first;
+        return (first, None);
     }
     let floored = floored_thetas(first.params(), start);
     if floored.is_empty() {
-        return first;
+        return (first, None);
     }
+    let escaped = std::cell::Cell::new(false);
     let eval_only = FitOptions {
         outer_maxiter: 0,
         run_covariance_step: false,
@@ -395,11 +904,14 @@ fn escape_floor_from<T: StoppedFit>(
             })
             .collect()
     };
-    resolve_floor_escape(
+    let mut out = resolve_floor_escape(
         first,
         &names_of(&floored),
         &probe,
-        |stopped| run(&restart_params(stopped.params(), start), options),
+        |stopped| {
+            escaped.set(true);
+            run(&restart_params(stopped.params(), start), options)
+        },
         |r| r.ofv() + penalty(r.params()),
         |r| names_of(&floored_thetas(r.params(), start)),
         |r| {
@@ -438,7 +950,13 @@ fn escape_floor_from<T: StoppedFit>(
             })
         },
         options.verbose,
-    )
+    );
+    let warning = if escaped.get() {
+        out.warnings_mut().last().cloned()
+    } else {
+        None
+    };
+    (out, warning)
 }
 
 /// What [`escape_floor`] and [`resolve_floor_escape`] read and write of a fit:
@@ -455,6 +973,11 @@ pub(crate) trait StoppedFit {
     /// The fit's first evaluation ([`OuterResult::start_eval`]).
     fn start_eval(&self) -> &Option<StartEval>;
     fn start_eval_mut(&mut self) -> &mut Option<StartEval>;
+    /// The start verdicts measured against the user's start: [`OuterResult::left_init`]
+    /// and [`OuterResult::stationary_start`]. `None` for a fit that carries neither.
+    fn start_verdict_mut(&mut self) -> Option<(&mut Option<bool>, &mut bool)> {
+        None
+    }
 }
 
 impl StoppedFit for OuterResult {
@@ -481,6 +1004,9 @@ impl StoppedFit for OuterResult {
     }
     fn start_eval_mut(&mut self) -> &mut Option<StartEval> {
         &mut self.start_eval
+    }
+    fn start_verdict_mut(&mut self) -> Option<(&mut Option<bool>, &mut bool)> {
+        Some((&mut self.left_init, &mut self.stationary_start))
     }
 }
 

@@ -8089,6 +8089,9 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("trust radius")
         || lower.contains("degenerate")
         || lower.contains("resumed from the best point seen")
+        // #2832's adopted rail completion; its not-converged twin says "not reported as
+        // converged" and is filed by the convergence arm above first.
+        || lower.contains("resumed from just above the guard")
     {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
