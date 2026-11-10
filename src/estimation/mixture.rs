@@ -2282,6 +2282,14 @@ mod tests {
                                 && w.contains("was replaced by BOBYQA"),
                             "{requested:?}: {w}"
                         );
+                        // The advice half: what the user can pick instead.
+                        assert!(
+                            w.starts_with(
+                                "Mixture models are optimized with BOBYQA or an NLopt gradient \
+                                 method (SLSQP / L-BFGS / MMA);"
+                            ),
+                            "{requested:?}: message must say what a mixture can run: {w}"
+                        );
                         // The discriminator and its negative: the message names the
                         // optimizer that was asked for, and never the one that ran in
                         // its `Debug` spelling (which would read "the requested Bobyqa
