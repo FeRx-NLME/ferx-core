@@ -315,7 +315,8 @@ THETA and both objectives). If it ends no lower, or on the floor again, the fit 
 just above the floor, below 1/1000 of its start, where two more evaluations (that point, and the
 THETA at 1/1000 of its start) show the objective still falling as it rises
 ([#2629](https://github.com/FeRx-NLME/ferx-core/issues/2629)). A THETA whose objective rises off
-the floor is a genuine boundary estimate and is left alone. The check costs one evaluation on a fit
+the floor is a genuine boundary estimate and is left alone; only `n_iterations` counts the
+evaluation ([#2850](https://github.com/FeRx-NLME/ferx-core/issues/2850)). The check costs one evaluation on a fit
 that ended on the floor, two more after a restart that left a THETA that low, and nothing on any
 other. The restart gets a fresh `maxiter` budget, so `n_iterations` on such a fit can exceed it.
 

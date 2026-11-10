@@ -133,7 +133,8 @@ fn resolve(first: Stub, probe: f64, restart: impl FnOnce(&Stub) -> Stub) -> Stub
 
 /// The gate, both sides in one test: a downhill probe restarts and adopts the landed fit; an
 /// uphill probe (a genuine boundary optimum) never calls the restart and returns the stop
-/// untouched. A gate stuck either way reddens one half.
+/// with only the probe's one evaluation added — it ran, so `n_iterations` shows it, restart
+/// or not (#2839 review, row 8). A gate stuck either way reddens one half.
 #[test]
 fn a_floor_stop_restarts_only_when_the_probe_is_downhill() {
     // A2's probe at TVE0 = 0.055 (start 55): ≈ 0.058 below the floor.
@@ -164,13 +165,14 @@ fn a_floor_stop_restarts_only_when_the_probe_is_downhill() {
         uphill.converged,
         "a genuine boundary optimum keeps its verdict"
     );
-    assert_eq!(uphill.evals, 30);
+    assert_eq!(uphill.evals, 30 + 1, "fit + probe, with no restart");
     assert!(uphill.warnings.is_empty());
 }
 
 /// The threshold is strict and at `FLOOR_PROBE_GAIN`: a drop of exactly the gain is not a
 /// slope, one over it is. Exact in floating point: `FLOOR_PROBE_GAIN − 0.0` is the gain. And
-/// a non-finite probe is no evidence.
+/// a non-finite probe is no evidence. Every declined probe still ran, so each is counted
+/// once — the non-finite one too.
 #[test]
 fn the_probe_must_drop_by_more_than_the_gain() {
     let at_gain = Stub {
@@ -182,6 +184,11 @@ fn the_probe_must_drop_by_more_than_the_gain() {
         panic!("a drop of exactly the gain must not restart")
     });
     assert!(kept.converged && kept.warnings.is_empty());
+    assert_eq!(
+        kept.evals,
+        floor_stop().evals + 1,
+        "a flat probe is counted"
+    );
     let over = Stub {
         ofv: 2.0 * FLOOR_PROBE_GAIN,
         ..floor_stop()
@@ -199,6 +206,11 @@ fn the_probe_must_drop_by_more_than_the_gain() {
         panic!("half the gain must not restart")
     });
     assert!(kept.converged && kept.warnings.is_empty());
+    assert_eq!(
+        kept.evals,
+        first.evals + 1,
+        "a probe under the gain is counted"
+    );
     let over = first.ofv - FLOOR_PROBE_GAIN * 2.0;
     assert_eq!(resolve(first.clone(), over, |_| landed()).ofv, 101.911514);
     for bad in [f64::NAN, f64::NEG_INFINITY] {
@@ -206,6 +218,11 @@ fn the_probe_must_drop_by_more_than_the_gain() {
             panic!("a {bad} probe must not restart")
         });
         assert!(kept.converged);
+        assert_eq!(
+            kept.evals,
+            first.evals + 1,
+            "a {bad} probe ran, so it is counted"
+        );
     }
 }
 
