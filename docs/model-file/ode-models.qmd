@@ -951,9 +951,18 @@ stability signal used by the original Dormand–Prince stiffness detector. Conse
 verdicts switch to the stiff method without another RHS evaluation. Those verdict counters
 belong to the subject solve and survive event boundaries, even though the stepper workspace is
 rebuilt because a dose or forcing change invalidates its stages. Every 25 accepted steps `auto`
-also re-runs the Jacobian probe as a backstop. If either detector changes the verdict, it
-**swaps the stepper in place**: the segment keeps everything it has integrated so far and
-carries on with the other method, rather than restarting or re-solving.
+also re-runs the Jacobian probe as a backstop while the stepper is explicit. If either detector
+says stiff, it **swaps the stepper in place**: the segment keeps everything it has integrated
+so far and carries on with the stiff method, rather than restarting or re-solving.
+
+The switch is **one-way**. A segment that is on a stiff stepper, whether it started there or
+was switched onto it, stays on it until the segment ends; the periodic probe does not run for
+it. A single non-stiff Jacobian reading is weak evidence that a stiff stepper is no longer
+needed: on a stiff-ish target-mediated-disposition model, demoting on one such reading changed
+the objective by up to 0.14 and made it jitter along a parameter scan (#2845), because the
+explicit stepper is much less accurate than the stiff one on the tail even where the probe
+reads it as benign. The cost of staying is that a segment which really does relax pays the
+stiff stepper's price for its remainder; the next segment starts from a fresh probe.
 
 A switch onto a stiff method is guarded exactly like a start-of-segment escalation: if that half
 comes back non-finite or clamps at the minimum step, the segment is discarded and re-solved with
@@ -972,7 +981,8 @@ Being threshold tests, both detectors add a **discontinuity** in the objective a
 of θ: a segment whose stage estimate or `|Re λ|max` sits near its threshold can switch at θ
 and not at θ+h, and the two trajectories differ by far more than the solver tolerance. The
 start-of-segment probe and the escalation guard have the same property — re-probing adds up to
-eight more decision points per segment. Unlike `ode_stiff_abort_after` this is
+eight more decision points per segment, each of which can only move a segment from explicit to
+stiff. Unlike `ode_stiff_abort_after` this is
 still on by default, because on a segment that actually turns stiff the alternative is not a
 slightly different trajectory but a 143 %-wrong one. If a covariance step returns implausible
 standard errors on a model whose `ode_solver` warning reports mid-segment switches, re-run it
@@ -981,7 +991,8 @@ probe and the guard), to see whether the switching is what moved them.
 
 A benign segment stays on its stepper. Its per-step stage estimate is arithmetic over values
 RK45 already computed; it pays no extra RHS calls. The periodic backstop costs roughly one
-Jacobian probe per 25 accepted steps, counted across event intervals. To go back to one method
+Jacobian probe per 25 accepted steps, counted across event intervals, and only while the stepper
+is explicit. To go back to one method
 per segment, chosen at its start:
 
 ```

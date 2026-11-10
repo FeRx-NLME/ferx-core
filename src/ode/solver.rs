@@ -88,22 +88,11 @@ pub(crate) const MAX_CONSECUTIVE_MIN_STEP_CLAMPS: usize = 64;
 ///   which is what a long benign segment pays: it is re-probed, the verdict never changes, and
 ///   its trajectory is bit-identical to the pinned one. A segment shorter than 25 accepted
 ///   steps — a dosing interval with a handful of saves, the overwhelming majority — is never
-///   re-probed at all and pays nothing.
+///   re-probed at all and pays nothing. A segment already on a stiff stepper skips the probe
+///   (#2845): the slot passes and the counter resets, but nothing is evaluated.
 /// * **Latency.** A segment that has turned stiff takes hundreds to thousands of steps before
 ///   it exhausts `max_steps`, so 25 steps of delay is noise against the detection it buys.
 pub(crate) const AUTO_SWITCH_PROBE_INTERVAL: usize = 25;
-
-/// Stepper changes allowed inside one segment before the driver stops re-probing (#1080
-/// Part C).
-///
-/// A cap rather than a hysteresis band, because the probe is a threshold test on a continuous
-/// quantity: a trajectory that hovers at `|Re λ|max ≈` [`STIFF_RE_LAMBDA_THRESHOLD`] would
-/// otherwise be able to rebuild its stepper on every probe. Bounding the count keeps the worst
-/// case a fixed handful of rebuilds, and a segment that has already changed its mind this many
-/// times has no verdict worth acting on.
-///
-/// [`STIFF_RE_LAMBDA_THRESHOLD`]: crate::ode::stiffness::STIFF_RE_LAMBDA_THRESHOLD
-pub(crate) const MAX_AUTO_SWITCHES_PER_SEGMENT: usize = 8;
 
 /// Dormand-Prince 5(4)'s real-axis stability boundary, used by Hairer's free
 /// stage-based stiffness estimate. The estimate is dimensionless (`h * rho`),
@@ -229,8 +218,9 @@ pub enum OdeMethod {
     /// unclassifiable system stays explicit.
     ///
     /// This is the *starting* decision for each integrated segment. By default,
-    /// [`OdeSolverOptions::auto_switch`] re-probes periodically and may replace the active
-    /// stepper between accepted steps while retaining the state integrated so far. Disable
+    /// [`OdeSolverOptions::auto_switch`] watches an explicit segment and may replace the
+    /// stepper by a stiff one between accepted steps while retaining the state integrated so
+    /// far; a segment on a stiff stepper is never switched back (#2845). Disable
     /// that option to keep the starting method fixed for the duration of the segment. Both
     /// modes preserve the guarantees the other variants carry (dense output, event
     /// root-finding, `Dual2` sensitivities).
@@ -640,11 +630,13 @@ pub struct OdeSolverStats {
     /// stats, so escalations on the event-time path (TTE / adaptive dosing) are not counted
     /// here.
     pub auto_stiff_segments: usize,
-    /// Integrations whose stepper was changed **in place** part-way through, because a
-    /// mid-segment re-probe disagreed with the verdict the segment started on (#1080 Part C).
+    /// Integrations whose stepper was changed **in place** part-way through, from an explicit
+    /// method to a stiff one, because a mid-segment re-probe or the stage-based estimate said
+    /// stiff (#1080 Part C).
     ///
-    /// One per segment, not per switch — a segment that escalated and later came back down
-    /// counts once. A non-zero value says the segment's stiffness changed while it was being
+    /// One per segment. The switch is one-way (#2845): a segment never comes back down to the
+    /// explicit method, so a segment that starts on a stiff stepper is never counted here. A
+    /// non-zero value says the segment's stiffness changed while it was being
     /// integrated, which is the ordinary shape of a binding model after a dose (the fast mode
     /// `KON · C · R` does not exist until drug and target are both present) rather than a
     /// problem in itself. It matters for reading the other counters: the steps before a switch
@@ -1429,10 +1421,12 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
 /// route (analytical / analytic-sensitivity).
 ///
 /// The driver owns the stepper rather than receiving one, because under
-/// [`OdeMethod::Auto`] it may **replace** it part-way through: a mid-segment re-probe that
-/// disagrees with the verdict the segment started on swaps the stepper in place and carries on
-/// from the state already integrated (#1080 Part C). `method` is the starting choice — the
-/// segment-start probe's verdict, or the named method, which is never switched away from.
+/// [`OdeMethod::Auto`] it may **replace** an explicit one part-way through: a mid-segment
+/// re-probe or the stage-based estimate that says stiff swaps in the stiff stepper in place and
+/// carries on from the state already integrated (#1080 Part C). The switch is one-way: a
+/// stepper that is already stiff is kept to the end of the segment (#2845). `method` is the
+/// starting choice — the segment-start probe's verdict, or the named method, which is never
+/// switched away from.
 #[allow(clippy::too_many_arguments)]
 fn integrate_dense_g<T: PkNum>(
     method: OdeMethod,
@@ -1492,10 +1486,10 @@ fn integrate_dense_g<T: PkNum>(
     // guard runs pins its method for exactly this reason, so it cannot switch back.
     let switching = opts.method == OdeMethod::Auto && opts.auto_switch;
     let mut accepted_since_probe = auto_state.accepted_since_probe;
-    let mut switches = 0usize;
+    let mut switched = false;
     // A segment that starts on a stiff method was counted as an escalation by the caller (the
     // guard needs that count before the segment runs), so a later switch must not count it
-    // twice — nor may a segment that switches down and back up.
+    // twice.
     let mut escalation_counted = method != OdeMethod::EXPLICIT_FALLBACK;
 
     for _step in 0..opts.max_steps {
@@ -1589,7 +1583,7 @@ fn integrate_dense_g<T: PkNum>(
 
             // Mid-segment stiffness re-probe (#1080 Part C). Read the same discriminator the
             // starting decision used, at the state the segment has actually reached, and swap
-            // the stepper in place when it disagrees. Done here — after the step is committed
+            // an explicit stepper for a stiff one in place when it says stiff. Done here — after the step is committed
             // and its interpolated reads are taken — so the switch cannot disturb either the
             // trajectory behind it or the values already saved off it: the new stepper starts
             // from `(t, u)` exactly as a fresh segment would, and only the steps *after* this
@@ -1601,17 +1595,26 @@ fn integrate_dense_g<T: PkNum>(
             if switching {
                 accepted_since_probe += 1;
             }
+            let on_explicit = method == OdeMethod::EXPLICIT_FALLBACK;
             let stage_escalation = switching
-                && switches < MAX_AUTO_SWITCHES_PER_SEGMENT
-                && method == OdeMethod::EXPLICIT_FALLBACK
                 && stiffness_indicator.is_some_and(|indicator| auto_state.observe_rk45(indicator));
             // A verdict ratified by the step that reaches `tf` belongs to the next interval:
             // there is no remaining span for a replacement stepper to integrate here. Leave
             // it in `auto_state` so `integrate_resolved_g_inner` can consume it at the next
             // non-zero segment instead of reporting a switch that never took a step.
-            if switching && t < tf - 1e-15 && switches < MAX_AUTO_SWITCHES_PER_SEGMENT {
+            if switching && t < tf - 1e-15 {
                 let periodic_probe = accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL;
-                let verdict = if stage_escalation {
+                // The switch is one-way (#2845): a segment that is on a stiff stepper stays
+                // on it. A single probe reading below the threshold is not evidence the
+                // stiff stepper is no longer needed — the same model reads non-stiff in the
+                // tail of a segment whose explicit integration is far less accurate — and
+                // acting on it demoted `rodas4` to `rk45` mid-segment, so the OFV took the
+                // error of `rk45` and jumped with the step on which the probe happened to
+                // fall. The probe slot still passes, so the counter, and with it where the
+                // next explicit segment probes, is unchanged.
+                let verdict = if !on_explicit {
+                    None
+                } else if stage_escalation {
                     Some(super::stiffness::stiff_method_for(opts))
                 } else if periodic_probe {
                     Some(super::stiffness::resolve_method(rhs, &u, params, t, opts))
@@ -1635,7 +1638,7 @@ fn integrate_dense_g<T: PkNum>(
                     let newly_escalated =
                         !escalation_counted && method != OdeMethod::EXPLICIT_FALLBACK;
                     if let Some(s) = stats.as_deref_mut() {
-                        if switches == 0 {
+                        if !switched {
                             s.auto_switched_segments += 1;
                         }
                         if newly_escalated {
@@ -1643,13 +1646,12 @@ fn integrate_dense_g<T: PkNum>(
                         }
                     }
                     escalation_counted |= newly_escalated;
-                    switches += 1;
+                    switched = true;
                     auto_state.reset_rk45_verdict();
                     // The new stepper gets the whole abort budget. `stiff_abort_after` bounds
                     // how long *a method* is allowed to grind on a segment it cannot step, and
                     // the method just changed; the clamps behind this point measured the one
-                    // that was replaced. Bounded by `MAX_AUTO_SWITCHES_PER_SEGMENT`, so the
-                    // worst case is that many budgets rather than an unbounded reprieve.
+                    // that was replaced. The switch is one-way, so this happens at most once.
                     min_step_clamps = 0;
                 }
             }
@@ -2084,13 +2086,12 @@ fn until_threshold_with(
     let mut t = t0;
     let mut dt = opts.initial_dt.min((tf - t0) / 10.0).max(opts.min_dt);
     // Mid-segment switching, exactly as the dense driver does it (#1080 Part C): `auto` only,
-    // re-probed every `AUTO_SWITCH_PROBE_INTERVAL` accepted steps, capped per span. The
+    // re-probed every `AUTO_SWITCH_PROBE_INTERVAL` accepted steps while explicit. The
     // crossing search needs it at least as much as the dense path does — its answer *is* the
     // likelihood contribution (an event time, or a censoring), so a segment that turns stiff
     // and is integrated badly does not merely cost accuracy in a prediction.
     let switching = opts.method == OdeMethod::Auto && opts.auto_switch;
     let mut accepted_since_probe = 0usize;
-    let mut switches = 0usize;
     let mut ran_stiff = method != OdeMethod::EXPLICIT_FALLBACK;
 
     for _step in 0..opts.max_steps {
@@ -2176,26 +2177,26 @@ fn until_threshold_with(
             stepper.on_accept();
 
             // Mid-segment stiffness re-probe (#1080 Part C), the dense driver's rule in this
-            // driver's loop: read the same discriminator at the state just reached and swap the
-            // stepper in place when it disagrees. Taken after the crossing test, so a step that
+            // driver's loop: while the stepper is explicit, read the same discriminator at the
+            // state just reached and swap in a stiff one when it says stiff. Taken after the crossing test, so a step that
             // both advances and brackets the crossing still returns through the interpolant of
             // the stepper that produced it.
             accepted_since_probe += 1;
-            if switching
-                && switches < MAX_AUTO_SWITCHES_PER_SEGMENT
-                && accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL
-            {
+            if switching && accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL {
                 accepted_since_probe = 0;
-                let verdict = super::stiffness::resolve_method(rhs, u, params, t, opts);
-                if verdict != method {
-                    method = verdict;
-                    stepper = make_stepper::<f64>(u.len(), method);
-                    stepper.set_dense_required(true);
-                    err_exp = stepper.err_exp();
-                    ran_stiff |= method != OdeMethod::EXPLICIT_FALLBACK;
-                    switches += 1;
-                    // Fresh abort budget for the new stepper — see `integrate_dense_g`.
-                    clamps = 0;
+                // One-way, as in the dense driver (#2845): a stiff stepper is never
+                // demoted on a single probe reading, so there is nothing to probe for.
+                if method == OdeMethod::EXPLICIT_FALLBACK {
+                    let verdict = super::stiffness::resolve_method(rhs, u, params, t, opts);
+                    if verdict != method {
+                        method = verdict;
+                        stepper = make_stepper::<f64>(u.len(), method);
+                        stepper.set_dense_required(true);
+                        err_exp = stepper.err_exp();
+                        ran_stiff |= method != OdeMethod::EXPLICIT_FALLBACK;
+                        // Fresh abort budget for the new stepper — see `integrate_dense_g`.
+                        clamps = 0;
+                    }
                 }
             }
         }
@@ -4459,6 +4460,48 @@ mod tests {
         assert_eq!(
             stats.min_step_clamped_steps,
             MAX_CONSECUTIVE_MIN_STEP_CLAMPS
+        );
+    }
+
+    /// A segment on a stiff stepper skips the periodic probe but still passes its slot (#2845):
+    /// the counter that carries across segments is reset, so where the *next* explicit
+    /// segment first probes is exactly where it was when the stiff segment used to probe.
+    /// Left running, it would hand that segment a counter already past the interval and an
+    /// immediate probe at its first accepted step.
+    #[test]
+    fn a_stiff_segment_resets_the_probe_counter_it_hands_on() {
+        let rhs = |u: &[f64], _p: &[f64], t: f64, du: &mut [f64]| {
+            du[0] = u[1] * 10.0;
+            du[1] = u[0] * -10.0;
+            du[2] = (1.0 - u[2]) * if t < 1.0 { 500.0 } else { 0.1 };
+        };
+        let opts = OdeSolverOptions {
+            method: OdeMethod::Auto,
+            ..Default::default()
+        };
+        let mut stats = OdeSolverStats::default();
+        let mut state = OdeAutoSwitchState::default();
+        let _ = integrate_dense_g(
+            OdeMethod::Rodas4,
+            &rhs,
+            &[1.0, 0.0, 0.0],
+            (0.0, 24.0),
+            &[],
+            &[24.0],
+            &[],
+            &opts,
+            Some(&mut stats),
+            &mut state,
+        );
+        assert!(
+            stats.accepted_steps > 3 * AUTO_SWITCH_PROBE_INTERVAL,
+            "premise: several probe slots pass: {stats:?}"
+        );
+        assert_eq!(stats.auto_switched_segments, 0, "{stats:?}");
+        assert!(
+            state.accepted_since_probe < AUTO_SWITCH_PROBE_INTERVAL,
+            "the counter must have been reset at each passed slot: {}",
+            state.accepted_since_probe
         );
     }
 

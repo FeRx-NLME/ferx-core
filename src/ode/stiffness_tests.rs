@@ -1024,6 +1024,121 @@ fn a_benign_segment_is_never_switched() {
     }
 }
 
+/// `[x, y, z, chz]`: a slow-to-integrate rotation `(x, y)` at `ω = 10` (`Re λ = 0` throughout),
+/// and `z` pulled towards 1 at rate 500 for `t < 1` only — stiff at the segment's entry state
+/// and benign from `t = 1` on, the opposite of [`latent_binding_rhs`]. `chz` grows
+/// monotonically, so the same fixture feeds the event-time driver.
+///
+/// The rotation keeps the step size small after the stiff phase has ended, so the segment
+/// takes many more accepted steps than [`AUTO_SWITCH_PROBE_INTERVAL`] while every periodic
+/// probe past `t = 1` reads non-stiff — the situation (#2845) in which the probe used to demote
+/// the segment from Rodas4 to RK45 on a single reading.
+fn stiff_then_benign<T: PkNum>() -> impl Fn(&[T], &[T], f64, &mut [T]) {
+    move |u: &[T], _p: &[T], t: f64, du: &mut [T]| {
+        du[0] = u[1] * T::from_f64(10.0);
+        du[1] = u[0] * T::from_f64(-10.0);
+        let rate = if t < 1.0 { 500.0 } else { 0.1 };
+        du[2] = (T::from_f64(1.0) - u[2]) * T::from_f64(rate);
+        du[3] = (u[0] + T::from_f64(1.5)) * T::from_f64(0.05);
+    }
+}
+
+/// A segment that starts on the stiff stepper stays on it (#2845): the periodic probe may only
+/// promote an explicit stepper, never demote a stiff one, so the trajectory is bit-identical to
+/// the stepper pinned to the stiff method and the segment is not counted as switched.
+///
+/// On `main` the first probe past `t = 1` read non-stiff and swapped Rodas4 for RK45 — a
+/// different method for the rest of the segment, which is what moved the objective by up to
+/// 0.14 OFV (and made it jitter along a parameter scan) on a stiff-ish TMDD fit.
+#[test]
+fn a_segment_that_starts_stiff_is_not_demoted_when_it_relaxes() {
+    let rhs = stiff_then_benign::<f64>();
+    let u0 = [1.0, 0.0, 0.0, 0.0];
+    let saveat: Vec<f64> = (1..=24).map(|h| h as f64).collect();
+
+    assert!(
+        max_abs_re_eigenvalue(&rhs, &u0, &[], 0.0).unwrap() > STIFF_RE_LAMBDA_THRESHOLD,
+        "premise: the entry state must read stiff"
+    );
+    let late = [0.3, -0.9, 1.0, 5.0];
+    assert!(
+        max_abs_re_eigenvalue(&rhs, &late, &[], 5.0).unwrap() < STIFF_RE_LAMBDA_THRESHOLD,
+        "premise: every state past t = 1 must read non-stiff"
+    );
+
+    let pinned = OdeSolverOptions {
+        method: OdeMethod::Rodas4,
+        ..Default::default()
+    };
+    let mut pinned_stats = OdeSolverStats::default();
+    let stiff = solve_ode_with_stats(
+        &rhs,
+        &u0,
+        (0.0, 24.0),
+        &[],
+        &saveat,
+        &pinned,
+        Some(&mut pinned_stats),
+    );
+    assert!(
+        pinned_stats.attempted_steps > 4 * crate::ode::solver::AUTO_SWITCH_PROBE_INTERVAL,
+        "premise: enough steps for several probes past t = 1: {pinned_stats:?}"
+    );
+
+    let mut stats = OdeSolverStats::default();
+    let auto = solve_ode_with_stats(
+        &rhs,
+        &u0,
+        (0.0, 24.0),
+        &[],
+        &saveat,
+        &loose(),
+        Some(&mut stats),
+    );
+    assert_eq!(stats.auto_stiff_segments, 1, "{stats:?}");
+    assert_eq!(
+        stats.auto_switched_segments, 0,
+        "a stiff stepper is never switched away from: {stats:?}"
+    );
+    for (a, b) in stiff.iter().zip(&auto) {
+        assert_eq!(a.u, b.u, "t={}", a.t);
+    }
+}
+
+/// The event-time driver keeps the same rule: a span that starts stiff reports the crossing the
+/// pinned stiff stepper reports, to the bit.
+#[test]
+fn the_event_time_driver_does_not_demote_a_stiff_span_either() {
+    use crate::ode::solver::{solve_ode_until_threshold, ThresholdCrossing};
+
+    let rhs = stiff_then_benign::<f64>();
+    let crossing = |opts: &OdeSolverOptions| {
+        let mut u = [1.0, 0.0, 0.0, 0.0];
+        match solve_ode_until_threshold(&rhs, &mut u, (0.0, 24.0), &[], opts, 3, 1.0) {
+            ThresholdCrossing::Crossed(t) => (t, u),
+            other => panic!("premise: the span must cross the threshold: {other:?}"),
+        }
+    };
+    let stiff = crossing(&OdeSolverOptions {
+        method: OdeMethod::Rodas4,
+        ..Default::default()
+    });
+    let auto = crossing(&loose());
+    assert!(
+        stiff.0 > 1.0 + 4.0 * 0.1,
+        "premise: the crossing lies well past the stiff phase: {}",
+        stiff.0
+    );
+    assert_eq!(
+        auto.0.to_bits(),
+        stiff.0.to_bits(),
+        "{} vs {}",
+        auto.0,
+        stiff.0
+    );
+    assert_eq!(auto.1, stiff.1);
+}
+
 /// [`latent_binding_rhs`] with a cumulative-hazard accumulator on top (`dCHZ/dt = 0.05 · Cx`),
 /// the shape the event-time driver monitors: monotone non-decreasing, and driven by the state
 /// whose formation is what turns the system stiff.
