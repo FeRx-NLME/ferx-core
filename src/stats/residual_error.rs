@@ -2659,8 +2659,8 @@ pub fn compute_iwres_with_correlations(
 /// Compute pooled lag-1 autocorrelation diagnostics on IWRES across subjects.
 ///
 /// Each subject's IWRES is one series (this entry has no `Population` to group by;
-/// the fit's own statistic splits each subject at its occasions and residual
-/// blocks, #2798). Subjects with fewer than 2 finite IWRES values are skipped.
+/// the fit's own statistic splits each subject at its residual blocks and at
+/// occasions that do not run in time, #2798 / #2829). Subjects with fewer than 2 finite IWRES values are skipped.
 /// Returns `(lag1_r, durbin_watson)`, the Durbin–Watson statistic pair-normalised:
 /// `Σ (eₜ − eₜ₋₁)² / Σ (eₜ² + eₜ₋₁²)/2` over the same lag pairs, so independent
 /// residuals give 2 whatever the series lengths.
@@ -2669,18 +2669,62 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
     residual_autocorrelation(subjects.iter().map(|s| s.iwres.as_slice()))
 }
 
+/// Whether `subject`'s occasions **run in time** (#2829): each label is one
+/// contiguous run of observation rows, and every label change has a strictly later
+/// `obs_times` than the row before it. True for a subject with no occasions or one.
+///
+/// This is what tells sequential occasions (the visits of one subject: dosing
+/// intervals, study periods) from parallel ones (the arms of one study, a nested
+/// model's level cells), which restart the clock. No source flag can: a single
+/// `level X by COL in ID` is written into `iov_column`, so arms and visits reach the
+/// fit the same way, and only the rows differ.
+///
+/// - **Strict** at the boundary: two arms that both start at `t = 0`, one of them a
+///   single baseline row, are parallel.
+/// - The **internal** clock, `obs_times`, not `obs_raw_times`: an `EVID = 4`
+///   crossover keeps running across the reset, so its periods are in time.
+/// - A derived `iov_occasion` rule always passes: its labels count the edges at or
+///   before each time.
+pub(crate) fn occasions_run_in_time(subject: &crate::types::Subject) -> bool {
+    let occ = &subject.occasions;
+    let mut closed: Vec<u32> = Vec::new();
+    for j in 1..occ.len() {
+        if occ[j] == occ[j - 1] {
+            continue;
+        }
+        closed.push(occ[j - 1]);
+        let later = match (subject.obs_times.get(j), subject.obs_times.get(j - 1)) {
+            (Some(t), Some(prev)) => t > prev,
+            _ => false,
+        };
+        if !later || closed.contains(&occ[j]) {
+            return false;
+        }
+    }
+    true
+}
+
 /// The series the fit's Durbin–Watson statistic pairs within (#2798): `values`
 /// (one per observation row of `subject`) split into the rows sharing the key
-/// `(occasions[j], obs_rgroup[j])`, each part of the key read only when the subject
-/// carries it. Rows are grouped **by key**, not by contiguous run, and kept in row
-/// order; the groups come out in order of first appearance.
+/// `(occasions[j], obs_rgroup[j])`. The residual-block part is read whenever the
+/// subject carries it; the occasion part only when the subject's occasions do
+/// **not** run in time ([`occasions_run_in_time`], #2829). Rows are grouped **by
+/// key**, not by contiguous run, and kept in row order; the groups come out in order
+/// of first appearance.
 ///
 /// The key is what the fit grouped the rows by: the occasions are the prepared
 /// population's (an `iov_column`, a derived `iov_occasion` rule, or a nested
 /// model's level cells, `assign_level_cells`), and the residual blocks a
-/// `correlation … by` line's (`assign_residual_groups`). Whitened residuals split
-/// the same way: the Cholesky factor of a block-diagonal (up to permutation) `R`
-/// has no fill between blocks, so whitening never mixes two groups.
+/// `correlation … by` line's (`assign_residual_groups`). Occasions in time are one
+/// residual series: a pair joining one visit's last row to the next visit's first is
+/// a real lag pair, and with one observation per occasion it is the only kind there
+/// is (split there, a sparse TDM fit had no pair at all and no statistic). Parallel
+/// occasions restart the clock, so the same pair would join one arm's last visit to
+/// another arm's first.
+///
+/// Whitened residuals split the same way: the Cholesky factor of a block-diagonal
+/// (up to permutation) `R` has no fill between blocks, so whitening never mixes two
+/// residual blocks, and occasions are joined only inside one block.
 pub(crate) fn split_by_residual_group(
     values: &[f64],
     subject: &crate::types::Subject,
@@ -2688,10 +2732,15 @@ pub(crate) fn split_by_residual_group(
     // A subject's vector is either empty (the key part is absent: every row `None`)
     // or one entry per row, so `get` alone reads both cases.
     let part = |v: &[u32], j: usize| v.get(j).copied();
+    let occasions: &[u32] = if occasions_run_in_time(subject) {
+        &[]
+    } else {
+        &subject.occasions
+    };
     let mut keys: Vec<(Option<u32>, Option<u32>)> = Vec::new();
     let mut groups: Vec<Vec<f64>> = Vec::new();
     for (j, &e) in values.iter().enumerate() {
-        let key = (part(&subject.occasions, j), part(&subject.obs_rgroup, j));
+        let key = (part(occasions, j), part(&subject.obs_rgroup, j));
         match keys.iter().position(|k| *k == key) {
             Some(g) => groups[g].push(e),
             None => {
@@ -2706,7 +2755,8 @@ pub(crate) fn split_by_residual_group(
 /// The fit's statistic on raw IWRES (#2798): [`iwres_autocorrelation`] with each
 /// subject's series split by [`split_by_residual_group`] on the **prepared**
 /// `population` (the one the fit scored, whose occasions and residual blocks are
-/// set), so lag pairs never join one occasion's last row to the next one's first.
+/// set), so lag pairs never join one arm's or level cell's last row to the next
+/// one's first. Occasions that run in time stay one series (#2829).
 pub(crate) fn grouped_iwres_autocorrelation(
     population: &crate::types::Population,
     subjects: &[SubjectResult],
@@ -2737,7 +2787,8 @@ pub(crate) fn grouped_iwres_autocorrelation(
 /// not factor contributes nothing, as a subject with < 2 finite IWRES does.
 ///
 /// The whitened series is split like the raw one ([`split_by_residual_group`],
-/// #2798): pairs stay within one `(occasion, residual block)` cell.
+/// #2798): pairs stay within one residual block, and within one occasion when the
+/// subject's occasions are parallel (#2829).
 pub(crate) fn whitened_residual_autocorrelation(
     model: &crate::types::CompiledModel,
     population: &crate::types::Population,
@@ -4801,23 +4852,53 @@ mod tests {
 
     // ── #2798 PR B: pair-normalised, grouped Durbin–Watson ─────────────────────────
 
-    /// A one-subject population whose rows carry `occasions` (empty = none).
-    fn population_with_occasions(occasions: Vec<u32>) -> crate::types::Population {
-        let n = occasions.len().max(4);
+    /// A subject whose rows carry `occasions` at `obs_times`.
+    fn subject_at(occasions: Vec<u32>, obs_times: Vec<f64>) -> crate::types::Subject {
+        let n = obs_times.len();
+        crate::types::Subject {
+            obs_times,
+            observations: vec![0.0; n],
+            obs_cmts: vec![1; n],
+            occasions,
+            ..Default::default()
+        }
+    }
+
+    fn population_of(subjects: Vec<crate::types::Subject>) -> crate::types::Population {
         crate::types::Population {
-            subjects: vec![crate::types::Subject {
-                obs_times: (0..n).map(|j| j as f64).collect(),
-                observations: vec![0.0; n],
-                obs_cmts: vec![1; n],
-                occasions,
-                ..Default::default()
-            }],
+            subjects,
             covariate_names: vec![],
             dv_column: "DV".into(),
             input_columns: vec![],
             exclusions: None,
             warnings: vec![],
         }
+    }
+
+    /// The clock of a **parallel** layout (#2829): each occasion restarts at 0, as
+    /// the arms of an MBMA study do. Row `j`'s time is the number of earlier rows of
+    /// its own occasion.
+    fn restarting_times(occasions: &[u32]) -> Vec<f64> {
+        (0..occasions.len())
+            .map(|j| {
+                occasions[..j]
+                    .iter()
+                    .filter(|o| **o == occasions[j])
+                    .count() as f64
+            })
+            .collect()
+    }
+
+    /// A one-subject population whose rows carry `occasions` (empty = none, four
+    /// rows), each occasion restarting the clock: the parallel layout the split is
+    /// for.
+    fn population_with_occasions(occasions: Vec<u32>) -> crate::types::Population {
+        let times = if occasions.is_empty() {
+            (0..4).map(f64::from).collect()
+        } else {
+            restarting_times(&occasions)
+        };
+        population_of(vec![subject_at(occasions, times)])
     }
 
     /// B3: the denominator is pair-normalised. `e = [1, 2]` is one pair:
@@ -4835,15 +4916,17 @@ mod tests {
         );
     }
 
-    /// B1: the fit's statistic pairs rows of one occasion only. `e = [1, 1, −1, −1]`
-    /// whole is three pairs, `(0 + 4 + 0) / (1 + 1 + 1) = 4/3`; split at occasions
-    /// `[1, 1, 2, 2]` it is the two flat pairs, `0 / 2 = 0`.
+    /// B1: the fit's statistic pairs rows of one **parallel** occasion only (each
+    /// restarts the clock, #2829). `e = [1, 1, −1, −1]` whole is three pairs,
+    /// `(0 + 4 + 0) / (1 + 1 + 1) = 4/3`; split at occasions `[1, 1, 2, 2]` it is the
+    /// two flat pairs, `0 / 2 = 0`.
     ///
     /// Mutation that must redden this: a key that ignores `occasions`.
     #[test]
     fn grouped_dw_splits_at_occasions() {
         let res = make_subject(vec![1.0, 1.0, -1.0, -1.0]);
         let pop = population_with_occasions(vec![1, 1, 2, 2]);
+        assert!(!occasions_run_in_time(&pop.subjects[0]));
         let (r, dw) = grouped_iwres_autocorrelation(&pop, std::slice::from_ref(&res));
         assert!(dw.is_finite() && r.is_finite(), "({r}, {dw})");
         assert!(dw.abs() < 1e-15, "split at the occasion: DW 0, got {dw}");
@@ -4922,22 +5005,23 @@ mod tests {
                 .enumerate()
                 .flat_map(|(a, &len)| std::iter::repeat_n(a as u32 + 1, len))
                 .collect();
-            subjects.push(crate::types::Subject {
-                obs_times: (0..occ.len()).map(|j| j as f64).collect(),
-                observations: vec![0.0; occ.len()],
-                obs_cmts: vec![1; occ.len()],
-                occasions: occ,
-                ..Default::default()
-            });
+            // Each arm restarts the clock, as the naproxen arms do. Without that the
+            // two arms would be sequential occasions and joined (#2829), and joined
+            // white noise is calibrated too: the test would pass without the split.
+            let times = restarting_times(&occ);
+            subjects.push(subject_at(occ, times));
         }
-        let pop = crate::types::Population {
-            subjects,
-            covariate_names: vec![],
-            dv_column: "DV".into(),
-            input_columns: vec![],
-            exclusions: None,
-            warnings: vec![],
-        };
+        let pop = population_of(subjects);
+        assert!(
+            pop.subjects.iter().all(|s| !occasions_run_in_time(s)),
+            "every study must be split at its arms, or this no longer tests the split"
+        );
+        let n_series: usize = pop
+            .subjects
+            .iter()
+            .map(|s| split_by_residual_group(&vec![0.0; s.occasions.len()], s).len())
+            .sum();
+        assert_eq!(n_series, 36, "one series per arm");
         let mut rng = rand::rngs::SmallRng::seed_from_u64(2798);
         let normal = Normal::new(0.0, 1.0).unwrap();
         let n_draws = 4000;
@@ -4970,6 +5054,124 @@ mod tests {
         assert!((mean - 2.0).abs() < 0.03, "mean DW {mean}");
         assert!(rate < 0.03, "P(DW < 1.5) = {rate}");
         assert!(rate_hi < 0.03, "P(DW > 2.5) = {rate_hi}");
+    }
+
+    // ── #2829: occasions that run in time are one series ───────────────────────────
+
+    /// `(lag-1 r, DW)` of one subject's `iwres` under `occasions` at `obs_times`.
+    fn grouped_at(occasions: Vec<u32>, obs_times: Vec<f64>, iwres: Vec<f64>) -> (f64, f64) {
+        grouped_iwres_autocorrelation(
+            &population_of(vec![subject_at(occasions, obs_times)]),
+            &[make_subject(iwres)],
+        )
+    }
+
+    /// T1 / T2, the straddle: the same labels `[1, 1, 2, 2]` and the same residuals
+    /// `[1, 1, −1, −1]`, differing in `obs_times` alone. In time (`0, 1, 2, 3`) the
+    /// occasions are one series, bit for bit the ungrouped statistic, `4/3`. With the
+    /// clock restarting (`0, 1, 0, 1`) they are split, the B1 value `0`.
+    ///
+    /// Mutations that must redden this: `occasions_run_in_time` always `false` (the
+    /// in-time arm becomes 0); always `true` (the restarting arm becomes 4/3).
+    #[test]
+    fn grouped_dw_joins_occasions_that_run_in_time_and_splits_parallel_ones() {
+        let e = vec![1.0, 1.0, -1.0, -1.0];
+        let ungrouped = iwres_autocorrelation(&[make_subject(e.clone())]);
+        let in_time = grouped_at(vec![1, 1, 2, 2], vec![0.0, 1.0, 2.0, 3.0], e.clone());
+        let parallel = grouped_at(vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0], e);
+        assert!(in_time.1.is_finite() && parallel.1.is_finite() && ungrouped.1.is_finite());
+        assert_eq!(in_time.1.to_bits(), ungrouped.1.to_bits(), "DW in time");
+        assert_eq!(
+            in_time.0.to_bits(),
+            ungrouped.0.to_bits(),
+            "lag-1 r in time"
+        );
+        assert!((in_time.1 - 4.0 / 3.0).abs() < 1e-15, "{}", in_time.1);
+        assert!(parallel.1.abs() < 1e-15, "parallel: 0, got {}", parallel.1);
+        // The straddle itself: only the clock differs, and the statistic moves.
+        assert!(
+            (in_time.1 - parallel.1).abs() > 1.0,
+            "{} vs {}",
+            in_time.1,
+            parallel.1
+        );
+    }
+
+    /// T3: the boundary is **strict**. Occasions `[1, 2, 2]` at times `0, 0, 1`: the
+    /// second starts at the time the first ended, as a second arm starting at
+    /// baseline beside a one-row arm does, so they are parallel. `e = [1, −1, −1]`
+    /// split is the one flat pair, DW 0; joined it would be `(4 + 0) / (1 + 1) = 2`.
+    ///
+    /// Mutation that must redden this: `>` → `>=` at the label change.
+    #[test]
+    fn occasions_tied_in_time_at_the_boundary_are_parallel() {
+        let s = subject_at(vec![1, 2, 2], vec![0.0, 0.0, 1.0]);
+        assert!(!occasions_run_in_time(&s));
+        let (_, dw) = grouped_at(vec![1, 2, 2], vec![0.0, 0.0, 1.0], vec![1.0, -1.0, -1.0]);
+        assert!(dw.is_finite(), "{dw}");
+        assert!(dw.abs() < 1e-15, "tie at the boundary splits: 0, got {dw}");
+    }
+
+    /// T4: a label that comes back is not a run in time, however the clock moves.
+    /// Occasions `[1, 2, 1]` at increasing times split by key (B5): `e = [1, −1, 1]`
+    /// is the series `[1, 1]` and `[−1]`, DW 0; joined it would be `8 / 2 = 4`.
+    ///
+    /// Mutation that must redden this: the "label seen before" check dropped.
+    #[test]
+    fn an_occasion_label_that_returns_is_parallel() {
+        let s = subject_at(vec![1, 2, 1], vec![0.0, 1.0, 2.0]);
+        assert!(!occasions_run_in_time(&s));
+        let (_, dw) = grouped_at(vec![1, 2, 1], vec![0.0, 1.0, 2.0], vec![1.0, -1.0, 1.0]);
+        assert!(dw.is_finite(), "{dw}");
+        assert!(
+            dw.abs() < 1e-15,
+            "interleaved labels split by key: 0, got {dw}"
+        );
+    }
+
+    /// T5: the predicate reads the **internal** clock. An `EVID = 4` crossover with
+    /// one occasion per period has `obs_times` running on across the reset while
+    /// `obs_raw_times` (the `TIME` the file wrote) restarts; the periods are in
+    /// time and joined, `4/3`.
+    ///
+    /// Mutation that must redden this: the predicate reading `obs_raw_times` (0).
+    #[test]
+    fn occasions_in_time_are_read_off_the_internal_clock() {
+        let mut s = subject_at(vec![1, 1, 2, 2], vec![0.0, 1.0, 2.0, 3.0]);
+        s.obs_raw_times = vec![0.0, 1.0, 0.0, 1.0];
+        assert!(occasions_run_in_time(&s));
+        let (_, dw) = grouped_iwres_autocorrelation(
+            &population_of(vec![s]),
+            &[make_subject(vec![1.0, 1.0, -1.0, -1.0])],
+        );
+        assert!(dw.is_finite(), "{dw}");
+        assert!((dw - 4.0 / 3.0).abs() < 1e-15, "joined: 4/3, got {dw}");
+    }
+
+    /// T6: the decision is per subject. Subject A's occasions run in time and B's
+    /// restart, both `[1, 1, 2, 2]`. A, `e = [1, 1, −1, −1]`, is joined: steps
+    /// `0 + 4 + 0` over pair means `1 + 1 + 1`. B, `e = [1, 2, 3, 1]`, is split: pairs
+    /// (1, 2) and (3, 1), steps `1 + 4` over `2.5 + 5`. DW = `9 / 10.5`.
+    ///
+    /// Mutations that must redden this: one decision for the population — split
+    /// everyone when any subject is parallel (`5 / 9.5`), or join everyone unless all
+    /// are (`10 / 17`).
+    #[test]
+    fn occasions_in_time_are_decided_per_subject() {
+        let pop = population_of(vec![
+            subject_at(vec![1, 1, 2, 2], vec![0.0, 1.0, 2.0, 3.0]),
+            subject_at(vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0]),
+        ]);
+        let res = [
+            make_subject(vec![1.0, 1.0, -1.0, -1.0]),
+            make_subject(vec![1.0, 2.0, 3.0, 1.0]),
+        ];
+        let (_, dw) = grouped_iwres_autocorrelation(&pop, &res);
+        assert!(dw.is_finite(), "{dw}");
+        assert!(
+            (dw - 9.0 / 10.5).abs() < 1e-15,
+            "per subject: 9/10.5, got {dw}"
+        );
     }
 }
 
