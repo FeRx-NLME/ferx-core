@@ -9143,7 +9143,10 @@ pub struct FitResult {
     /// scales: an Ω override's class **variance**, a σ override's σ (the scale the base
     /// `se_sigma` reports). `0.0` for a fixed override
     /// ([`MixtureOverrideParam::fixed`]), as the other `se_*` vectors report a pinned
-    /// coordinate. `None` with no override or no covariance matrix.
+    /// coordinate, **and** for an override the covariance step held on the internal guard,
+    /// which is not `fixed` but has an entry with its `class` in
+    /// [`FitResult::held_at_bound`]: read that list before printing a `0.0` as an SE.
+    /// `None` with no override or no covariance matrix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub se_mixture_overrides: Option<Vec<f64>>,
     /// The outer optimizer's own verdict on whether the fit left its initial

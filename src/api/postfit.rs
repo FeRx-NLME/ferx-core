@@ -2051,9 +2051,9 @@ pub(crate) fn apply_held_at_bound(params: &ModelParameters, result: &mut FitResu
         if h.reason != HeldReason::CollapsedAtGuard || !step_held(cov.as_ref(), h.packed_index) {
             continue;
         }
-        // A `[mixture]` override has no `se_*` slot (its covariance row is already the
-        // zero row); its `(kind, index)` names the base parameter, whose SE it must not
-        // touch (#2809).
+        // A `[mixture]` override's slot is `se_mixture_overrides` (#2833), already `0.0`:
+        // the step left its covariance row zero. Its `(kind, index)` names the base
+        // parameter, whose SE it must not touch (#2809).
         if h.class.is_some() {
             continue;
         }

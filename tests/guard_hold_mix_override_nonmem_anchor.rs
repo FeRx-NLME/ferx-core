@@ -166,7 +166,10 @@ fn held_override_standard_errors_match_nonmem_with_the_override_fixed() {
 /// The straddle that makes `fixed`'s source observable: the covariance step held this
 /// coordinate (`cov_fixed[6]`), yet it is **not** fixed by the model (`fixed == false`).
 /// Mutations: read `fixed` from `cov_fixed` → the row renders `---` (fixed), not `N/A`;
-/// match `held_at_bound` on `(kind, index)` alone → the base `ETA_CL` row turns `N/A`.
+/// drop the held arm of `override_rows` → the row prints its SE (0.0). How an entry is
+/// matched to an override, `(class, kind, index)`, is pinned by `held_matching_is_by_class`
+/// (`src/io/output_mixture_override_tests.rs`), not here: this fixture has one override and
+/// no base entry, so a looser match renders the same rows.
 #[test]
 fn held_override_renders_held_and_its_base_keeps_its_se() {
     let f = evaluate();

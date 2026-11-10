@@ -241,6 +241,14 @@ fn rendered_override_rows_cover_the_input_space() {
         row(&summary, "add_MIX2"),
         "  add_MIX2             = 0.700000  SE = 0.035000"
     );
+    // A σ override on a proportional base reads like a proportional SIGMA row: its CV%
+    // is σ·100 (review r1 row 1 — the additive fixture above never reaches that arm).
+    let mut prop = result();
+    prop.sigma_types[1] = SigmaType::Proportional;
+    assert_eq!(
+        row(&format_mixture_override_rows(&prop), "add_MIX2"),
+        "  add_MIX2             = 0.700000  (CV% = 70.0)  SE = 0.035000"
+    );
     let yaml = yaml_of(&free);
     assert!(
         yaml.contains(
