@@ -30310,13 +30310,14 @@ fn apply_binary_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, b: &T) {
 }
 
 /// The interpreter's unary operations that act on one value: `exp`, the guarded `ln`,
-/// `abs`, and `floor`/`ceil`/`round` (value-only, so a constant). The one definition both
-/// [`eval_bytecode_g`] and the compiled RHS (`rhs_regcode`) apply.
+/// the guarded `sqrt`, `abs`, and `floor`/`ceil`/`round` (value-only, so a constant). The one
+/// definition both [`eval_bytecode_g`] and the compiled RHS (`rhs_regcode`) apply.
 #[inline(always)]
 fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
     match op {
         Op::Exp => v.exp(),
         Op::Ln => v.guard_floor(1e-30).ln(),
+        Op::Sqrt => v.guard_floor(0.0).sqrt(),
         Op::Abs => v.abs(),
         Op::Floor => T::from_f64(v.val().floor()),
         Op::Ceil => T::from_f64(v.val().ceil()),
@@ -30533,13 +30534,9 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                     }
                 });
             }
-            op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
+            op @ (Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
                 let v = pop!();
                 push!(apply_unary(op, v));
-            }
-            Op::Sqrt => {
-                let v = pop!();
-                push!(v.guard_floor(0.0).sqrt());
             }
             Op::InvLogit => {
                 let v = pop!();

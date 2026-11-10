@@ -440,7 +440,7 @@ in the last bits (measured: within `4e-15` relative on random programs). An opti
 reads it can then take a slightly different path: on the benchmarks below the objective
 values agree to five or more significant digits, some with one or two iterations more or
 fewer. A block keeps the interpreter if it uses a statement-level `if (cond) { ... }` block,
-`sqrt`, `inv_logit`, `logit` or `mod`, or reads anything other than the states, the individual
+`inv_logit`, `logit`, `tanh`, `softplus`, `sin`, `cos`, `pnorm` or `mod`, or reads anything other than the states, the individual
 parameters, its own intermediate variables, literals and the time variables.
 
 Whole fits (FOCEI with the covariance step, one thread) with forward native code alone
@@ -493,6 +493,25 @@ Before and after, one thread, Linux, the mean of two interleaved runs:
 The neutropenia model written jump-free with `abs` ran in 32–36 s on both builds, so the
 inline `if` now costs what the hand rewrite did.
 
+#### Square root {#native-sqrt}
+
+`sqrt` is compiled like `exp` and `ln` (#2844). Its argument is floored at zero first, as
+everywhere else in the model language, so a slightly negative value from rounding gives `0`
+instead of a `NaN`, and the floor keeps the sign of a zero (`sqrt(-0.0)` is `-0.0` on every
+engine). Before this a block containing `sqrt` stayed on the interpreter; the free-drug
+quadratic of a quasi-steady-state TMDD model is written with one.
+
+A synthetic 24-subject quasi-steady-state TMDD model with that quadratic written as
+`0.5 * (B + sqrt(B * B + 4 * KSS * CT))`, FOCEI for 15 iterations, one thread, macOS, the median
+of three runs:
+
+| Form of the quadratic | Before (s) | After (s) | OFV |
+|---|---:|---:|---|
+| `sqrt(...)` | 24.4 | 10.3 | −34.2661, identical |
+| `(...)^0.5` | 6.3 | 6.3 | −34.2661, identical |
+
+The `^0.5` form is still about 1.6× faster on this fixture; the gap was 3.9× before.
+
 #### Which engine ran it {#rhs-route-note}
 
 A fit reports the right-hand side's engine when it is not native code, once, as an
@@ -501,17 +520,18 @@ informational entry in `warnings` / `warning_details` (category `ode_rhs_route`)
 ([#2681](https://github.com/FeRx-NLME/ferx-core/issues/2681)):
 
 - `W_ODE_RHS_INTERPRETED`: the block keeps the interpreter. The message names the
-  construct (an `if (…) { … }` statement, `sqrt`, a read of `L` before it is assigned, …)
+  construct (an `if (…) { … }` statement, `tanh`, a read of `L` before it is assigned, …)
   and the statement it is in (`d/dt(sm)`, the assignment to `E`). `sin` and `cos`
   ([#2720](https://github.com/FeRx-NLME/ferx-core/issues/2720)) are among the functions
   the compiler does not translate, as are `pnorm`, `tanh`, `softplus`, `logit` and `inv_logit`.
+  `sqrt` is translated ([#2844](https://github.com/FeRx-NLME/ferx-core/issues/2844)).
 - `W_ODE_RHS_NOT_NATIVE`: the block compiled, but runs as register code, because
   `FERX_NO_RHS_JIT=1` is set, Cranelift cannot target the host, or the native compiler did
   not build the program.
 
 A compiled block that runs as native code gets no entry. To keep a block compiled, rewrite
 the construct the message names: an `if (…) { … }` statement as inline `if`s (see
-[Inline conditionals](#inline-conditionals)); a `sqrt` of individual parameters only moves
+[Inline conditionals](#inline-conditionals)); a `tanh` of individual parameters only moves
 to `[individual_parameters]`.
 
 ### Sensitivities in PK space {#pk-space-sensitivities}

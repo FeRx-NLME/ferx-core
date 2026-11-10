@@ -400,6 +400,7 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
                 Inst::Div(x, y) => b.ins().fdiv(r(x), r(y)),
                 Inst::Neg(x) => b.ins().fneg(r(x)),
                 Inst::Abs(x) => b.ins().fabs(r(x)),
+                Inst::Sqrt(x) => b.ins().sqrt(r(x)),
                 Inst::Floor(x) => b.ins().floor(r(x)),
                 Inst::Ceil(x) => b.ins().ceil(r(x)),
                 Inst::Call1(s, x) => {

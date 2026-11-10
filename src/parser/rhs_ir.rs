@@ -86,6 +86,8 @@ pub(super) enum Inst {
     Div(V, V),
     Neg(V),
     Abs(V),
+    /// `f64::sqrt`: the hardware instruction, correctly rounded as Rust's is.
+    Sqrt(V),
     Floor(V),
     Ceil(V),
     Call1(Shim1, V),
@@ -494,6 +496,22 @@ impl<'a> Lower<'a> {
         });
         self.unary(a, l, h1, h2)
     }
+    /// `DualV::sqrt`, unguarded: `h1 = 0.5/s`, `h2 = −0.25/(s·s·s)` with `s = √x`.
+    fn sqrt(&mut self, a: &[V]) -> Lanes {
+        let s = self.ins(Inst::Sqrt(a[0]));
+        if self.lanes() == 1 {
+            return vec![s];
+        }
+        let half = self.k(0.5);
+        let h1 = self.ins(Inst::Div(half, s));
+        let h2 = (self.layout.m > 0).then(|| {
+            let q = self.k(-0.25);
+            let ss = self.ins(Inst::Mul(s, s));
+            let sss = self.ins(Inst::Mul(ss, s));
+            self.ins(Inst::Div(q, sss))
+        });
+        self.unary(a, s, h1, h2)
+    }
     fn neg(&mut self, a: &[V]) -> Lanes {
         a.iter().map(|&x| self.ins(Inst::Neg(x))).collect()
     }
@@ -595,6 +613,7 @@ pub(super) trait Alg {
     /// The type's own `ln`, unguarded.
     fn ln(&mut self, a: &[V]) -> Lanes;
     fn abs(&mut self, a: &[V]) -> Lanes;
+    fn sqrt(&mut self, a: &[V]) -> Lanes;
     fn pow(&mut self, a: &[V], e: &[V]) -> Lanes;
 
     fn ins(&mut self, i: Inst) -> V {
@@ -692,6 +711,9 @@ impl Alg for Lower<'_> {
     fn abs(&mut self, a: &[V]) -> Lanes {
         Lower::abs(self, a)
     }
+    fn sqrt(&mut self, a: &[V]) -> Lanes {
+        Lower::sqrt(self, a)
+    }
     fn pow(&mut self, a: &[V], e: &[V]) -> Lanes {
         Lower::pow(self, a, e)
     }
@@ -778,6 +800,14 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
                     let floor = al.constant(lo);
                     let g = al.select(keep, &x, &floor);
                     al.ln(&g)
+                }
+                Unary::Sqrt => {
+                    // `guard_floor(0.0)`, as `Ln`'s above.
+                    let lo = al.k(0.0);
+                    let keep = al.ins(Inst::Cmp(Cc::Ge, x[0], lo));
+                    let floor = al.constant(lo);
+                    let g = al.select(keep, &x, &floor);
+                    al.sqrt(&g)
                 }
                 Unary::Abs => al.abs(&x),
                 Unary::Floor => {
@@ -886,6 +916,7 @@ pub(super) fn reverse(fwd: &Func) -> Func {
             Inst::Div(x, y) => Inst::Div(r(x), r(y)),
             Inst::Neg(x) => Inst::Neg(r(x)),
             Inst::Abs(x) => Inst::Abs(r(x)),
+            Inst::Sqrt(x) => Inst::Sqrt(r(x)),
             Inst::Floor(x) => Inst::Floor(r(x)),
             Inst::Ceil(x) => Inst::Ceil(r(x)),
             Inst::Call1(s, x) => Inst::Call1(s, r(x)),
@@ -964,6 +995,12 @@ pub(super) fn reverse(fwd: &Func) -> Func {
                 let d = b.push(Inst::Select(nonneg, g, ng));
                 acc(&mut b, &mut adj, live, x, d, false);
             }
+            Inst::Sqrt(x) => {
+                let half = b.k(0.5);
+                let gh = b.push(Inst::Mul(g, half));
+                let d = b.push(Inst::Div(gh, map[i]));
+                acc(&mut b, &mut adj, live, x, d, false);
+            }
             Inst::Call1(Shim1::Exp, x) => {
                 let d = b.push(Inst::Mul(g, map[i]));
                 acc(&mut b, &mut adj, live, x, d, false);
@@ -1038,6 +1075,7 @@ pub(super) fn interpret(f: &Func, args: &mut [&mut [f64]]) {
             Inst::Div(a, b) => r(a) / r(b),
             Inst::Neg(a) => -r(a),
             Inst::Abs(a) => r(a).abs(),
+            Inst::Sqrt(a) => r(a).sqrt(),
             Inst::Floor(a) => r(a).floor(),
             Inst::Ceil(a) => r(a).ceil(),
             Inst::Call1(Shim1::Exp, a) => r(a).exp(),
@@ -1098,6 +1136,10 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
             }
             Inst::Neg(a) => (-r(a), -d(a)),
             Inst::Abs(a) => (r(a).abs(), if r(a) >= 0.0 { d(a) } else { -d(a) }),
+            Inst::Sqrt(a) => {
+                let s = r(a).sqrt();
+                (s, 0.5 * d(a) / s)
+            }
             Inst::Floor(a) => (r(a).floor(), 0.0),
             Inst::Ceil(a) => (r(a).ceil(), 0.0),
             Inst::Call1(Shim1::Exp, a) => {

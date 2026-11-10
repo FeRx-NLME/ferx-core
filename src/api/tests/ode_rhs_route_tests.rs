@@ -34,8 +34,8 @@ fn model(rhs: &str) -> CompiledModel {
 }
 
 const COMPILED: &str = "-(CL / V) * central";
-// `sqrt` keeps the interpreter (an inline `if` no longer does, #2680).
-const INTERPRETED: &str = "-(CL / V) * sqrt(central)";
+// `tanh` keeps the interpreter (an inline `if` no longer does, #2680).
+const INTERPRETED: &str = "-(CL / V) * tanh(central)";
 
 fn subject(id: &str) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
@@ -114,7 +114,7 @@ fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
         "{}",
         e.message
     );
-    assert!(e.message.contains("`sqrt`"), "{}", e.message);
+    assert!(e.message.contains("`tanh`"), "{}", e.message);
     assert!(e.message.contains("`d/dt(central)`"), "{}", e.message);
     assert_eq!(
         r.warnings.iter().filter(|w| **w == e.message).count(),
@@ -170,6 +170,46 @@ fn check_reports_the_same_note_as_an_info_row() {
     assert!(postfit::ode_rhs_route_warning(&closed).is_none());
 }
 
+/// `sqrt` compiles (#2844): a fit and `ferx check` of a `sqrt` RHS report no route note, while
+/// a `tanh` RHS, which still keeps the interpreter, reports it — both sides of the gate on
+/// the same model shape, so a gate that lets everything through, or nothing, fails here.
+#[test]
+fn a_sqrt_rhs_is_compiled_and_a_tanh_one_is_still_interpreted() {
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..Default::default()
+    }
+    .quiet();
+    let pop = population();
+
+    let sqrt = model("-(CL / V) * sqrt(central)");
+    let r = fit(&sqrt, &pop, &sqrt.default_params, &opts).expect("fit");
+    assert!(route_entries(&r).is_empty(), "{:?}", r.warnings);
+    assert!(
+        !r.warnings.iter().any(|w| w.starts_with("W_ODE_RHS_")),
+        "{:?}",
+        r.warnings
+    );
+    assert!(check_ode_rhs_route(&sqrt).is_none());
+
+    let tanh = model(INTERPRETED);
+    let r = fit(&tanh, &pop, &tanh.default_params, &opts).expect("fit");
+    let entries = route_entries(&r);
+    assert_eq!(entries.len(), 1, "{:?}", r.warnings);
+    assert!(
+        entries[0].message.contains("`tanh`"),
+        "{}",
+        entries[0].message
+    );
+    assert!(
+        !entries[0].message.contains("`sqrt`"),
+        "{}",
+        entries[0].message
+    );
+    assert!(check_ode_rhs_route(&tanh).is_some());
+}
+
 /// The model-file entry point reaches the row: `validate_model_file` on a file with an
 /// interpreted RHS lists it, under its code.
 #[test]
@@ -191,7 +231,7 @@ fn validate_model_file_lists_the_row() {
 [structural_model]
   ode(obs_cmt=central, states=[central])
 [odes]
-  d/dt(central) = -(CL / V) * sqrt(central)
+  d/dt(central) = -(CL / V) * tanh(central)
 [scaling]
   y = central / V
 [error_model]
@@ -206,5 +246,5 @@ fn validate_model_file_lists_the_row() {
         .iter()
         .find(|d| d.code == "W_ODE_RHS_INTERPRETED")
         .unwrap_or_else(|| panic!("{:?}", report.diagnostics));
-    assert!(row.message.contains("`sqrt`"), "{}", row.message);
+    assert!(row.message.contains("`tanh`"), "{}", row.message);
 }

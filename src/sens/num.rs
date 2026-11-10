@@ -384,7 +384,13 @@ impl PkNum for f64 {
     }
     #[inline]
     fn guard_floor(self, lo: f64) -> Self {
-        self.max(lo)
+        // `f64::max` leaves the sign of a zero unspecified (`max(-0.0, 0.0)` is `+0.0` on
+        // arm64, measured); this keeps `self`, as the dual types and the native select do.
+        if self >= lo {
+            self
+        } else {
+            lo
+        }
     }
     #[inline]
     fn ln_gamma(self) -> Self {
@@ -1000,6 +1006,26 @@ mod tests {
         assert_eq!(g.grad[0], 0.0);
         // A value already above the floor is untouched.
         assert_eq!(Dual1::<1>::var(5.0, 0).guard_floor(lo).value, 5.0);
+    }
+
+    /// A zero at the floor keeps its sign on `f64` and on the duals alike (`f64::max` does
+    /// not promise that: it gives `+0.0` for `(-0.0).max(0.0)` on arm64), so `sqrt(-0.0)` is
+    /// `-0.0` on every route and not a per-platform answer.
+    #[test]
+    fn guard_floor_keeps_the_sign_of_a_zero_at_the_floor() {
+        assert!((-0.0f64).guard_floor(0.0).is_sign_negative());
+        assert!(0.0f64.guard_floor(0.0).is_sign_positive());
+        assert!(Dual1::<1>::var(-0.0, 0)
+            .guard_floor(0.0)
+            .value
+            .is_sign_negative());
+        assert!(Dual2::<1>::var(-0.0, 0)
+            .guard_floor(0.0)
+            .value
+            .is_sign_negative());
+        // Below the floor and `NaN` still land on `+lo`.
+        assert!((-1.0f64).guard_floor(0.0).is_sign_positive());
+        assert_eq!(f64::NAN.guard_floor(0.0), 0.0);
     }
 
     /// The `ln_gamma` `Dual2` rule: its analytic 1st (digamma) and 2nd (trigamma)

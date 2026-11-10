@@ -1121,6 +1121,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
         let x = self.v;
         self.unary(x.ln(), 1.0 / x, -1.0 / (x * x), || 2.0 / (x * x * x))
     }
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     fn sqrt(self) -> Self {
         let s = self.v.sqrt();
         self.unary(s, 0.5 / s, -0.25 / (s * s * s), || {
