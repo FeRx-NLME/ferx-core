@@ -1017,7 +1017,8 @@ impl StoppedFit for OuterResult {
 /// judge the same objective when priors or an NN penalty are on (#2460 review, row 6). The
 /// restart is adopted only on a strictly lower `ranked` objective, so the escape never
 /// reports a higher one. `floored_in` names the θ a result left on the floor, so a restart
-/// that collapses again is caught and named. The probe counts as one evaluation.
+/// that collapses again is caught and named. The probe counts as one evaluation, with or
+/// without a restart, and whether or not it scored finite: it ran.
 ///
 /// `near_floor` asks the same of an adopted restart's θ left below its probe point
 /// ([`near_floor_thetas`], #2629): `None` when there are none (or the fit was cancelled),
@@ -1045,7 +1046,11 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
     verbose: bool,
 ) -> T {
     let probe_ofv = probe.ofv();
+    let mut first = first;
     if !(ofv_is_valid(probe_ofv) && ranked(&first) - ranked(probe) > FLOOR_PROBE_GAIN) {
+        // The probe ran, so it is counted, whatever it scored — a non-finite one too
+        // (#2832 review, row 8). Rail completion's rule: `resolve_rail_completion`.
+        *first.evals_mut() += 1;
         return first;
     }
     let floor_ofv = first.ofv();
@@ -1056,7 +1061,6 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
             names.join(", "),
         );
     }
-    let mut first = first;
     let mut second = restart(&first);
     if !(ofv_is_valid(second.ofv()) && ranked(&second) < ranked(&first)) {
         *first.evals_mut() += *second.evals_mut() + 1;
