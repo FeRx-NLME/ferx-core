@@ -5148,6 +5148,50 @@ mod tests {
         assert!((dw - 4.0 / 3.0).abs() < 1e-15, "joined: 4/3, got {dw}");
     }
 
+    /// Review round 1, finding 1 (#2857): the clock is read **only where the label
+    /// changes**. Inside one occasion the time may tie (two endpoints or replicate
+    /// samples at one time) or even fall, and the occasions still run in time.
+    /// `[1, 1, 2, 2]` with `e = [1, 1, −1, −1]` is joined, `4/3`, at `0, 0, 1, 1` (a tie
+    /// inside each run) and at `1, 0, 2, 3` (a fall inside the first).
+    ///
+    /// Mutation that must redden this: the predicate also requiring a strictly
+    /// later time inside a run (both layouts split, DW 0).
+    #[test]
+    fn time_inside_an_occasion_may_tie_or_fall() {
+        for times in [vec![0.0, 0.0, 1.0, 1.0], vec![1.0, 0.0, 2.0, 3.0]] {
+            let label = format!("{times:?}");
+            let s = subject_at(vec![1, 1, 2, 2], times.clone());
+            assert!(occasions_run_in_time(&s), "{label}");
+            let (_, dw) = grouped_at(vec![1, 1, 2, 2], times, vec![1.0, 1.0, -1.0, -1.0]);
+            assert!(dw.is_finite(), "{label}: {dw}");
+            assert!(
+                (dw - 4.0 / 3.0).abs() < 1e-15,
+                "{label}: joined 4/3, got {dw}"
+            );
+        }
+    }
+
+    /// Review round 1, finding 2 (#2857): the clock is read at **every** label
+    /// change, not the first alone. `[1, 1, 2, 2, 3, 3]` at `0, 1, 2, 3, 0, 1`: the
+    /// first boundary is in time, the second restarts, and no label comes back, so
+    /// only the time at the second boundary makes the subject parallel.
+    /// `e = [1, 1, −1, −1, 1, 1]` split is three flat pairs, DW 0; joined it would be
+    /// `(0 + 4 + 0 + 4 + 0) / 5 = 1.6`.
+    ///
+    /// Mutation that must redden this: the time checked at the first label change
+    /// only.
+    #[test]
+    fn a_later_occasion_that_restarts_the_clock_is_parallel() {
+        let (occ, times) = (vec![1, 1, 2, 2, 3, 3], vec![0.0, 1.0, 2.0, 3.0, 0.0, 1.0]);
+        assert!(!occasions_run_in_time(&subject_at(
+            occ.clone(),
+            times.clone()
+        )));
+        let (_, dw) = grouped_at(occ, times, vec![1.0, 1.0, -1.0, -1.0, 1.0, 1.0]);
+        assert!(dw.is_finite(), "{dw}");
+        assert!(dw.abs() < 1e-15, "split at every occasion: 0, got {dw}");
+    }
+
     /// T6: the decision is per subject. Subject A's occasions run in time and B's
     /// restart, both `[1, 1, 2, 2]`. A, `e = [1, 1, −1, −1]`, is joined: steps
     /// `0 + 4 + 0` over pair means `1 + 1 + 1`. B, `e = [1, 2, 3, 1]`, is split: pairs

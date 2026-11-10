@@ -176,9 +176,9 @@ declares: its `iov_column` (which a single `level` also sets), or the innermost
 level's name when levels are nested. With no grouping declared, it suggests the
 line `by` any data column that labels the group, and a `kappa` at that grouping
 as the alternative. A model with compartments keeps the structural advice. The
-statistic pairs only rows of one arm or level cell (they restart the clock), so
-declaring the arms also stops it pairing one arm's last visit with the next arm's
-first. A grouping whose groups follow one another in time, such as visits, is one
+statistic pairs only rows of one arm or level cell when they restart the clock,
+so declaring the arms also stops it pairing one arm's last visit with the next
+arm's first. A grouping whose groups follow one another in time, such as visits, is one
 series, and the advice then names no column
 ([IWRES Autocorrelation](../output.qmd#iwres-autocorrelation)). The bundled
 `mbma_naproxen` model, whose arms are not declared, gets the no-grouping advice

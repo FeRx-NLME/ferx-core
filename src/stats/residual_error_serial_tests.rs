@@ -664,6 +664,15 @@ fn grouped_dw_groups_by_key_not_by_contiguous_run() {
         r.iwres = iwres;
         r
     };
+    for (occ, times) in [
+        (vec![1, 2, 1, 2], vec![0.0, 0.0, 1.0, 1.0]),
+        (vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0]),
+    ] {
+        assert!(
+            !occasions_run_in_time(&pop_of(occ.clone(), times).subjects[0]),
+            "{occ:?} must be parallel, or the key is never read"
+        );
+    }
     let interleaved = grouped_iwres_autocorrelation(
         &pop_of(vec![1, 2, 1, 2], vec![0.0, 0.0, 1.0, 1.0]),
         &[res_of(vec![1.0, -1.0, 2.0, 3.0])],
