@@ -2168,7 +2168,7 @@ mod tests {
         assert!(
             res.warnings
                 .iter()
-                .any(|w| w.contains("BOBYQA") && w.contains("Bfgs")),
+                .any(|w| w.contains("BOBYQA") && w.contains("`bfgs`")),
             "expected an optimizer-downgrade warning, got {:?}",
             res.warnings
         );
@@ -2223,7 +2223,9 @@ mod tests {
         Honoured,
         /// `auto`: runs BOBYQA, silently.
         SilentBobyqa,
-        /// Runs BOBYQA and says so, naming the requested optimizer.
+        /// Runs BOBYQA and says so, naming the requested optimizer as the user spells it
+        /// in a model file (`Optimizer::label`), written out here so the test does not
+        /// borrow the spelling from the code under test.
         Replaced(&'static str),
     }
 
@@ -2237,9 +2239,9 @@ mod tests {
             Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
                 OnMixture::Honoured
             }
-            Optimizer::Bfgs => OnMixture::Replaced("Bfgs"),
-            Optimizer::Lbfgs => OnMixture::Replaced("Lbfgs"),
-            Optimizer::TrustRegion => OnMixture::Replaced("TrustRegion"),
+            Optimizer::Bfgs => OnMixture::Replaced("bfgs"),
+            Optimizer::Lbfgs => OnMixture::Replaced("lbfgs"),
+            Optimizer::TrustRegion => OnMixture::Replaced("trust_region"),
         }
     }
 
@@ -2290,15 +2292,20 @@ mod tests {
                             ),
                             "{requested:?}: message must say what a mixture can run: {w}"
                         );
-                        // The discriminator and its negative: the message names the
-                        // optimizer that was asked for, and never the one that ran in
-                        // its `Debug` spelling (which would read "the requested Bobyqa
-                        // optimizer ... was replaced by BOBYQA").
+                        // The discriminator and its negatives: the message names the
+                        // optimizer that was asked for, in option spelling; never the
+                        // one that ran ("the requested `bobyqa` optimizer ... was
+                        // replaced by BOBYQA"); and never a Rust `Debug` name such as
+                        // `TrustRegion`, which no model file contains.
                         assert!(
-                            w.contains(&format!("the requested {name} optimizer")),
+                            w.contains(&format!("the requested `{name}` optimizer")),
                             "{requested:?}: message must name {name}: {w}"
                         );
-                        assert!(!w.contains("Bobyqa"), "{requested:?}: {w}");
+                        assert!(!w.contains("`bobyqa`"), "{requested:?}: {w}");
+                        assert!(
+                            !w.contains(&format!("{requested:?}")) && !w.contains("Bobyqa"),
+                            "{requested:?}: no Debug spelling in a user-facing message: {w}"
+                        );
                     }
                 }
 

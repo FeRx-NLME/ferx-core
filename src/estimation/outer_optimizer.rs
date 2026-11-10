@@ -214,25 +214,32 @@ pub(crate) fn resolve_outer_optimizer(
     // BFGS / trust-region paths, which do not carry the mixture objective) falls
     // back to BOBYQA.
     if has_mixture {
-        return match requested {
+        // Exhaustive, no wildcard: a new variant must say here whether it carries
+        // the mixture objective.
+        let resolved = match requested {
             Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
-                (requested, None)
+                requested
             }
-            // `Auto` is the mixture default and downgrades silently by design;
-            // any *explicitly* chosen optimizer that the mixture path can't drive
-            // (built-in BFGS/L-BFGS, trust-region, Gauss-Newton — none carry the
-            // mixture objective) is run under BOBYQA instead, so say so rather than
-            // dropping the choice invisibly.
-            Optimizer::Auto => (Optimizer::Bobyqa, None),
-            other => (
-                Optimizer::Bobyqa,
-                Some(format!(
-                    "Mixture models are optimized with BOBYQA or an NLopt gradient method \
-                     (SLSQP / L-BFGS / MMA); the requested {other:?} optimizer does not carry \
-                     the mixture objective and was replaced by BOBYQA."
-                )),
-            ),
+            // `Auto` is the mixture default; the built-in BFGS / L-BFGS and
+            // trust-region paths do not carry the mixture objective.
+            Optimizer::Auto | Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => {
+                Optimizer::Bobyqa
+            }
         };
+        // The warning is owed exactly when an *explicit* choice did not run — keyed
+        // on the outcome, not on a second list of variants, so "replaced" can never
+        // be said of an optimizer that ran as requested (#2852). `Auto` asked for
+        // no optimizer in particular and resolves silently by design.
+        let replaced = requested != Optimizer::Auto && resolved != requested;
+        let warning = replaced.then(|| {
+            format!(
+                "Mixture models are optimized with BOBYQA or an NLopt gradient method \
+                 (SLSQP / L-BFGS / MMA); the requested `{}` optimizer does not carry \
+                 the mixture objective and was replaced by BOBYQA.",
+                requested.label()
+            )
+        });
+        return (resolved, warning);
     }
     (
         requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
