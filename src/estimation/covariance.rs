@@ -3320,15 +3320,17 @@ pub(crate) struct RegularizedInverse {
 /// The fold compares with `>` rather than folding through `f64::max`; both let a `NaN` fall
 /// through here, but the explicit comparison says so where a reader can see it.
 /// Every standard error the fit will **report**, flattened: θ on its natural scale, the Ω
-/// lower triangle through the multivariate Cholesky Jacobian, σ, Ω_IOV, and the `block_sigma`
-/// ρ's. Exactly the numbers `FitResult` carries, produced by the one function that produces
-/// them, so the diagnostic cannot measure a different transform than the user reads.
+/// lower triangle through the multivariate Cholesky Jacobian, σ, Ω_IOV, the `block_sigma`
+/// ρ's and the `[mixture]` per-class overrides (#2833). Exactly the numbers `FitResult`
+/// carries, produced by the one function that produces them, so the diagnostic cannot
+/// measure a different transform than the user reads.
 fn reported_standard_errors(cov: &DMatrix<f64>, template: &ModelParameters) -> Vec<f64> {
     let owned = Some(cov.clone());
     let (se_theta, se_omega, se_sigma, se_kappa) =
         crate::api::postfit::extract_standard_errors(&owned, template);
     let rho = crate::api::postfit::extract_residual_correlation_se(&owned, template);
-    [se_theta, se_omega, se_sigma, se_kappa, rho]
+    let overrides = crate::api::postfit::extract_mixture_override_se(&owned, template);
+    [se_theta, se_omega, se_sigma, se_kappa, rho, overrides]
         .into_iter()
         .flatten()
         .flatten()
@@ -5212,6 +5214,57 @@ mod tests {
         assert_eq!(
             super::reported_variance_inflation(&cov, None, &free_idx, n, &template),
             1.0
+        );
+    }
+
+    /// #2833 review r1 row 2: a `[mixture]` override's SE is a reported standard error, so
+    /// the eigenvalue-floor inflation check sees it. The fixture inflates **only** the
+    /// override's packed row (variance 4 against 1), so every base SE has ratio 1 and the
+    /// answer is 4 exactly when the override is in the list. Mutation: leave
+    /// `extract_mixture_override_se` out of `reported_standard_errors` → 1.0.
+    #[test]
+    fn the_inflation_metric_sees_a_mixture_override() {
+        let omega = crate::types::OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+        let sigma = crate::types::SigmaVector {
+            values: vec![0.1],
+            names: vec!["EPS".into()],
+        };
+        let template = crate::types::ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            theta: vec![5.0],
+            theta_names: vec!["TVCL".into()],
+            theta_lower: vec![0.1],
+            theta_upper: vec![50.0],
+            theta_fixed: vec![false],
+            omega: omega.clone(),
+            omega_fixed: vec![false],
+            sigma: sigma.clone(),
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+            mixture: Some(crate::types::MixtureParams {
+                omega: vec![
+                    omega,
+                    crate::types::OmegaMatrix::from_diagonal(&[0.25], vec!["ETA_CL".into()]),
+                ],
+                sigma: vec![sigma.clone(), sigma],
+                omega_override_addr: vec![(1, 0)],
+                omega_override_fixed: vec![false],
+                sigma_override_addr: vec![],
+                sigma_override_fixed: vec![],
+            }),
+        };
+        // Packed layout: TVCL | ETA_CL | EPS | ETA_CL_MIX2.
+        let n = 4;
+        let free_idx: Vec<usize> = (0..n).collect();
+        let cov_ref = DMatrix::<f64>::identity(n, n);
+        let mut cov = cov_ref.clone();
+        cov[(3, 3)] = 4.0;
+        let got = super::reported_variance_inflation(&cov, Some(&cov_ref), &free_idx, n, &template);
+        assert!(
+            (got - 4.0).abs() < 1e-12,
+            "override inflation {got}, want 4"
         );
     }
 
