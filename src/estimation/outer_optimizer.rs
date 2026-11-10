@@ -208,12 +208,16 @@ pub(crate) fn resolve_outer_optimizer(
     // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
     // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
     // honoured — those route through `optimize_nlopt`, whose objective closure
-    // branches to `mixture_gradient`. Every other choice (including `auto`, and
-    // the built-in BFGS / trust-region paths, which do not carry the mixture
-    // objective) falls back to BOBYQA.
+    // branches to `mixture_gradient`. An explicit `bobyqa` is honoured too: it is
+    // the optimizer the mixture path runs, so nothing was replaced and no warning
+    // is owed (#2852). Every other choice (including `auto`, and the built-in
+    // BFGS / trust-region paths, which do not carry the mixture objective) falls
+    // back to BOBYQA.
     if has_mixture {
         return match requested {
-            Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => (requested, None),
+            Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
+                (requested, None)
+            }
             // `Auto` is the mixture default and downgrades silently by design;
             // any *explicitly* chosen optimizer that the mixture path can't drive
             // (built-in BFGS/L-BFGS, trust-region, Gauss-Newton — none carry the
