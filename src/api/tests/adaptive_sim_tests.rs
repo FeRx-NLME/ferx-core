@@ -3388,6 +3388,8 @@ fn simple_titration_spec() -> AdaptiveDosingSpec {
         levels: None,
         target_window: None,
         auc_target: None,
+        round_to: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 50.0,
@@ -4139,6 +4141,8 @@ fn from_spec_three_witnesses_equals_handwritten_closure() {
         levels: None,
         target_window: None,
         auc_target: None,
+        round_to: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 50.0,
@@ -4724,6 +4728,8 @@ fn from_spec_dv_collapses_to_ipred_as_sigma_to_zero() {
         levels: None,
         target_window: None,
         auc_target: None,
+        round_to: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 50.0,
@@ -8149,48 +8155,116 @@ const ODE_1571_SELECTED: &str = r#"
   FREE continuous
 "#;
 
-/// #2731: the assay draws from `assay_resid_var`, which has no observation row to evaluate
-/// a magnitude on, so a `CMT=N:` expression would be dropped from the draw with the run
-/// reporting success. Bare `CMT=N:` lines on the same model and data are the straddle: they
-/// must run, so the `Err` is this reject and nothing else.
-#[test]
-fn both_entry_points_reject_a_cmt_line_magnitude() {
-    let bare_src = ODE_1571_SELECTED
-        .replace(
-            "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } else {\n    DV ~ proportional(PROP_UNBOUND)\n  }",
-            "  CMT=1: DV ~ proportional(PROP_TOTAL)\n  CMT=2: DV ~ proportional(PROP_UNBOUND)",
-        );
-    assert_ne!(bare_src, ODE_1571_SELECTED, "the twin must differ");
-    let scaled_src = bare_src.replace(
-        "proportional(PROP_TOTAL)",
-        "proportional(PROP_TOTAL * (1.0 + FREE))",
-    );
-    assert_ne!(scaled_src, bare_src, "the twin must differ");
-    let bare = parse_model_string(&bare_src).expect("parse bare");
-    let scaled = parse_model_string(&scaled_src).expect("parse scaled");
+/// The adaptive options and spec every #2741 form check runs under: `pop_1571`'s subject
+/// carries `FREE`, so every data check passes. `dv` adds a `Dv` monitor on CMT 1 (the
+/// programmatic path) and assay error on the spec, so the assay draws through the
+/// magnitude; without it the run reads no residual error at all.
+fn ruv_magnitude_run(
+    src: &str,
+    dv: bool,
+) -> (
+    Result<AdaptiveSimulationResult, crate::diagnostics::EngineError>,
+    Result<AdaptiveSimulationResult, crate::diagnostics::EngineError>,
+) {
+    let model = parse_model_string(src).expect("parse");
     let pop = pop_1571(Some("FREE"));
     let opts = AdaptiveSimulateOptions {
         seed: Some(1),
         decision_times: vec![12.0, 36.0],
+        monitors: if dv {
+            vec![MonitorSpec::new("A", 1, ObserveMode::Dv)]
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     };
-    let spec = simple_titration_spec();
-    let spec_opts = AdaptiveSimulateOptions::default();
-    let want = "magnitude expression on a `CMT=N:` line";
+    let programmatic =
+        simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts);
+    let mut spec = simple_titration_spec();
+    if dv {
+        spec.observe = None;
+        spec.with_assay_error = true;
+        spec.assay_cmt = Some(1);
+    }
+    let spec_opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        ..Default::default()
+    };
+    let spec =
+        simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &spec, &spec_opts);
+    (programmatic, spec)
+}
 
-    let err = simulate_adaptive(&scaled, &pop, &scaled.default_params, 1, fixed_bolus, &opts)
-        .expect_err("simulate_adaptive must reject a CMT-line magnitude");
-    assert_eq!(err.code(), Some("E_ADAPTIVE_UNSUPPORTED"), "{err}");
-    assert!(err.to_string().contains(want), "{err}");
-    assert!(err.to_string().contains("without the expression"), "{err}");
-    assert!(err.to_string().contains("Use bare sigma names"), "{err}");
-    let err =
-        simulate_adaptive_from_spec(&scaled, &pop, &scaled.default_params, 1, &spec, &spec_opts)
-            .expect_err("simulate_adaptive_from_spec must reject a CMT-line magnitude");
-    assert!(err.to_string().contains(want), "{err}");
+/// #2741 T11: every residual-error magnitude form runs through both public entry points,
+/// with and without assay error. #2746 refused them all (`E_ADAPTIVE_UNSUPPORTED`) while
+/// the assay drew from the bare σ; the assay now applies the magnitude, so the refusal is
+/// gone. The forms: a σ multiplier, a `weight =`, a `power(σ, P)` exponent, and a
+/// magnitude on a `CMT=N:` line, each with its bare twin asserted different.
+///
+/// Regression: the refusal restored, on any form or either entry point.
+#[test]
+fn both_entry_points_run_every_ruv_magnitude_form() {
+    const SELECTED_BLOCK: &str = "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } \
+                                  else {\n    DV ~ proportional(PROP_UNBOUND)\n  }";
+    let single = ODE_1571_SELECTED.replace(SELECTED_BLOCK, "  DV ~ proportional(PROP_TOTAL)");
+    let cmt_lines = ODE_1571_SELECTED.replace(
+        SELECTED_BLOCK,
+        "  CMT=1: DV ~ proportional(PROP_TOTAL)\n  CMT=2: DV ~ proportional(PROP_UNBOUND)",
+    );
+    assert_ne!(single, ODE_1571_SELECTED, "the bare twin must differ");
+    assert_ne!(cmt_lines, ODE_1571_SELECTED, "the CMT twin must differ");
 
-    simulate_adaptive(&bare, &pop, &bare.default_params, 1, fixed_bolus, &opts)
-        .expect("bare CMT lines must run");
+    let forms = [
+        (
+            "multiplier",
+            single.replace(
+                "proportional(PROP_TOTAL)",
+                "proportional(PROP_TOTAL * (1.0 + FREE))",
+            ),
+        ),
+        (
+            "weight",
+            single.replace(
+                "DV ~ proportional(PROP_TOTAL)",
+                "DV ~ combined(PROP_TOTAL, PROP_UNBOUND) weight = (1.0 + FREE)",
+            ),
+        ),
+        (
+            "power",
+            single
+                .replace(
+                    "theta TVV(50.0, 1.0, 500.0)",
+                    "theta TVV(50.0, 1.0, 500.0)\n  theta POW(3.0, 0.1, 5.0)",
+                )
+                .replace("proportional(PROP_TOTAL)", "power(PROP_TOTAL, POW)"),
+        ),
+        (
+            "CMT line",
+            cmt_lines.replace(
+                "proportional(PROP_TOTAL)",
+                "proportional(PROP_TOTAL * (1.0 + FREE))",
+            ),
+        ),
+    ];
+    for (name, src) in &forms {
+        assert!(
+            src != &single && src != &cmt_lines,
+            "{name}: the magnitude twin must differ from its bare twin"
+        );
+        assert!(
+            parse_model_string(src).unwrap().has_custom_ruv_magnitude(),
+            "{name}: a magnitude form"
+        );
+        for dv in [false, true] {
+            let (p, s) = ruv_magnitude_run(src, dv);
+            assert!(
+                p.is_ok(),
+                "{name}, dv {dv}, simulate_adaptive: {:?}",
+                p.err()
+            );
+            assert!(s.is_ok(), "{name}, dv {dv}, from_spec: {:?}", s.err());
+        }
+    }
 }
 
 #[test]
@@ -9149,17 +9223,29 @@ fn assay_residual_variance_reads_the_parameter_sets_correlation() {
         rho: -0.9,
         ..model.residual_correlations[0].clone()
     }];
-    let fitted = super::adaptive::assay_resid_var(&model, &params, 1, 10.0, 1.0)
-        .expect("cmt 1 has an error model");
+    let cov = HashMap::new();
+    let row = crate::sim::adaptive::AssayRow {
+        cmt: 1,
+        ipred: 10.0,
+        time: 0.0,
+        tad: 0.0,
+        cov: &cov,
+    };
+    let var = |params: &ModelParameters, ruv_scale: f64| {
+        super::adaptive::assay_resid_var(&model, params, &row, ruv_scale)
+            .expect("a bare model has no magnitude to refuse")
+            .expect("cmt 1 has an error model")
+    };
+    let fitted = var(&params, 1.0);
     assert!((fitted - 1.4).abs() < 1e-12, "fitted ρ: {fitted}, want 1.4");
     // ruv_scale multiplies the whole variance.
-    let scaled = super::adaptive::assay_resid_var(&model, &params, 1, 10.0, 2.0).unwrap();
+    let scaled = var(&params, 2.0);
     assert!(
         (scaled - 2.8).abs() < 1e-12,
         "ruv_scale 2: {scaled}, want 2.8"
     );
     params.residual_correlations.clear();
-    let declared = super::adaptive::assay_resid_var(&model, &params, 1, 10.0, 1.0).unwrap();
+    let declared = var(&params, 1.0);
     assert!(
         (declared - 7.0).abs() < 1e-12,
         "fallback: {declared}, want 7"

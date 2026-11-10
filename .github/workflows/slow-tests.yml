@@ -108,13 +108,18 @@ jobs:
   # a shard's share of it per the plan's M8), and a shard takes 42 min: 70% of a
   # 60-min inner budget. The full-nn budget (95) is the same construction with nn's
   # extra lib tests on one shard, and stays unmeasured until a full-nn run lands.
-  # Each job ceiling adds 15 min for checkout, toolchain and cache restore. `summary`
+  # Each job ceiling adds 15 min for checkout, toolchain and cache restore. The core
+  # ceiling adds 15 more for the canakinumab fetch step's cap (#1938), which only the
+  # core leg runs, and 2 for the cargo step's `--kill-after=2m` grace: 15 setup + 15
+  # fetch + 60 inner + 2 kill-after = 92. Without the fetch's 15 a slow fetch on a
+  # shard near its 60-min budget would push the job past its ceiling, and a job killed
+  # by `timeout-minutes` is `cancelled`, not red (see the cargo step). `summary`
   # warns when a shard passes 70% of its budget, so the next rebalance arrives as a
   # warning, not as a red night.
   shards:
     name: Slow regression tests (${{ matrix.leg }} ${{ matrix.shard }}/${{ strategy.job-total }})
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ matrix.leg == 'core' && 75 || 110 }}
+    timeout-minutes: ${{ matrix.leg == 'core' && 92 || 110 }}
     strategy:
       # A failing shard must NOT cancel the others: every shard reports, like
       # `--no-fail-fast` within one.
@@ -190,13 +195,29 @@ jobs:
         #
         # `continue-on-error`: a Europe PMC outage must not cost the rest of the suite.
         # Every core shard sets FERX_REQUIRE_EXTERNAL_DATA=1, so a failed fetch still
-        # turns the run red, through the anchor's own panic, which names the cause. The
-        # 15-minute cap keeps a hung download inside the job ceiling.
+        # turns the run red, through the anchor's own panic, which names the cause.
+        #
+        # Time (#1938, #2818, #2824). The script's own budget is `--deadline-seconds 720`
+        # (12 min) across all attempts and backoffs. The attempts spread over it (waits
+        # doubling from 15 s to a 120 s cap: with fast failures, starts at 0, 15, 45, …
+        # 465, 540 s), so a few-minute outage is waited out, and none starts in the last
+        # 180 s, which are kept for one full download (the slowest measured took 174 s,
+        # run 42608366633). The response
+        # headers are waited for only until the deadline, and before every body read the
+        # socket timeout is re-capped at the time left, so a trickling, stalling or silent
+        # server ends there and the script prints which attempt failed how. Should that
+        # re-cap ever be unavailable, the worst case is the deadline plus one
+        # `--timeout 120`: 840 s, still inside the 15-min (900 s) step cap, which is the
+        # 15 the core job ceiling reserves for this step (see `timeout-minutes` above).
+        # `tests/mbma_canakinumab_fetch_script.rs` checks both sums. A wrong upstream
+        # hash is a failed attempt that is retried, never an accepted file; the exit
+        # message reads the complete downloads' hashes: one wrong hash on ≥ 2 → the
+        # file changed (re-pin), ≥ 2 different → flaky, fewer than 2 → re-run.
         if: matrix.leg == 'core' && steps.plan.outputs.present == 'true'
         continue-on-error: true
         timeout-minutes: 15
         run: |
-          python3 tools/mbma_canakinumab_fetch.py
+          python3 tools/mbma_canakinumab_fetch.py --deadline-seconds 720 --timeout 120
           python3 tools/mbma_canakinumab_fetch.py --check
 
       - name: cargo test (ci-test profile + slow-tests)

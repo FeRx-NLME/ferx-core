@@ -6530,7 +6530,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
 /// (`moving_bounds_separable` reads the resolved infusion windows and lag times), so a
 /// subject can decline at the probe point and be served at its EBE. Both halves of that
 /// are pinned below.
-mod outer_fd_fallback {
+pub(crate) mod outer_fd_fallback {
     use super::*;
     use std::path::Path;
 
@@ -6567,7 +6567,7 @@ mod outer_fd_fallback {
   DV ~ proportional(PROP_ERR)
 "#;
 
-    fn mk_pop(subjects: Vec<Subject>) -> Population {
+    pub(crate) fn mk_pop(subjects: Vec<Subject>) -> Population {
         Population {
             subjects,
             covariate_names: Vec::new(),
@@ -6582,7 +6582,7 @@ mod outer_fd_fallback {
     /// infusion into the depot. An oral infusion routes the subject to the event walk,
     /// and the walk declines an SS infusion under a lag time
     /// (`ss_lagtime_walk_unsupported`), so the twin falls back while its sibling stays exact.
-    fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
+    pub(crate) fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
         let model =
             crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
         let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -6643,10 +6643,17 @@ mod outer_fd_fallback {
             outer_fd_fallback_warning(&model, &pop, &log).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
         assert!(
-            w.contains("could not be given the exact analytic outer gradient")
-                && w.contains("a trial point where it could not be formed"),
-            "must not attribute every decline to the provider's scope; got: {w}"
+            w.contains("could not be given the exact analytic outer gradient"),
+            "got: {w}"
         );
+        // #2713: the decline is named by its cause. The walk declines this subject's SS
+        // infusion under a lag in its recording, so the recording clause and not the
+        // mode-system one.
+        assert!(
+            w.contains("(1 with a shape no analytic recorder serves, or a recording that failed"),
+            "a recorder decline must be named as one; got: {w}"
+        );
+        assert!(!w.contains("inner Hessian"), "got: {w}");
         assert!(
             w.contains("OUT_OF_SCOPE"),
             "must name the declining subject, not the in-scope one; got: {w}"
@@ -6655,6 +6662,157 @@ mod outer_fd_fallback {
         assert!(
             w.contains("model-level route, not the per-subject one"),
             "must reconcile the warning with `gradient_method_outer`; got: {w}"
+        );
+    }
+
+    /// #2713: the warning breaks the declined subjects down by cause, one clause per cause
+    /// some subject declined for, so a fit with a large fallback share says which remedy
+    /// applies. Each clause is asserted present exactly when its cause was recorded, count
+    /// included; a subject that declined for both causes counts in both; and a log no route
+    /// stamped a cause on (the quadrature's) keeps the generic sentence.
+    #[test]
+    fn warning_names_each_decline_cause() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        const MODE: &str = "with an inner Hessian at the EBE that was singular, or indefinite \
+             at an EBE that was not stationary (an EBE off a strict mode), at some trial point";
+        const RECORDING: &str = "with a shape no analytic recorder serves, or a recording \
+             that failed or came back non-finite at some trial point";
+        const GENERIC: &str = "a trial point where it could not be formed";
+        let warn = |causes: &[(usize, DeclineCause)]| {
+            let log = OuterFdDeclineLog::new(2);
+            for &(i, c) in causes {
+                log.record(i);
+                log.record_cause(i, c);
+            }
+            outer_fd_fallback_warning(&model, &pop, &log).expect("must warn")
+        };
+        let only = |w: &str, present: &[&str]| {
+            for clause in [MODE, RECORDING, GENERIC] {
+                assert_eq!(
+                    w.contains(clause),
+                    present.contains(&clause),
+                    "clause {clause:?}; got: {w}"
+                );
+            }
+        };
+        let w = warn(&[(0, DeclineCause::ModeSystem), (1, DeclineCause::ModeSystem)]);
+        only(&w, &[MODE]);
+        assert!(w.contains(&format!("(2 {MODE})")), "got: {w}");
+
+        let w = warn(&[(1, DeclineCause::Recording)]);
+        only(&w, &[RECORDING]);
+        assert!(w.contains(&format!("(1 {RECORDING})")), "got: {w}");
+
+        // Subject 0 declined at its mode system on one trial point and in its recording on
+        // another: it counts in both, beside subject 1's recording.
+        let w = warn(&[
+            (0, DeclineCause::ModeSystem),
+            (0, DeclineCause::Recording),
+            (1, DeclineCause::Recording),
+        ]);
+        only(&w, &[MODE, RECORDING]);
+        assert!(
+            w.contains(&format!("(1 {MODE}; 2 {RECORDING})")),
+            "got: {w}"
+        );
+
+        let log = OuterFdDeclineLog::new(2);
+        log.record(1);
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
+        only(&w, &[GENERIC]);
+    }
+
+    /// #2713: the per-subject gate reads the adjoint's mode-system flag. The analytic
+    /// fixture subject, at a grid point where the exact `H` is indefinite, declines as
+    /// `ModeSystem`; the out-of-scope twin declines as `Recording` at the same point, so a
+    /// gate that maps every decline to one cause reddens one leg.
+    #[test]
+    fn the_gate_reports_the_adjoints_cause() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).expect("pt");
+        let grid = [-2.5, -1.5, -0.75, 0.75, 1.5, 2.5];
+        let mut points = Vec::new();
+        for &a in &grid {
+            for &b in &grid {
+                for &c in &grid {
+                    points.push([a, b, c]);
+                }
+            }
+        }
+        let eta = points
+            .into_iter()
+            .find(|e| {
+                crate::sens::ode_provider::adjoint::exact_inner_hessian(
+                    &model, &analytic, params, e,
+                )
+                .is_some_and(|h| h.cholesky().is_none())
+            })
+            .expect("a point where the exact H is indefinite");
+        let cause = |s: &Subject| {
+            subject_analytic_outer_gradient_dx(&model, s, &pt, &eta, true, false)
+                .0
+                .err()
+        };
+        assert_eq!(cause(&analytic), Some(DeclineCause::ModeSystem));
+        assert_eq!(cause(&declining), Some(DeclineCause::Recording));
+    }
+
+    /// #2713: the assembly records the cause it was handed. A forced decline is a
+    /// mode-system one, so on the fixture where subject 1 also declines in its recording
+    /// the warning counts one of each; unforced, only the recording. Mutation that reddens
+    /// it: dropping `record_cause` from the non-IOV assembly.
+    #[test]
+    fn the_assembly_records_each_decline_cause() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = record_one_gradient_eval(&model, &pop);
+        assert_eq!(
+            (
+                log.n_cause(DeclineCause::ModeSystem),
+                log.n_cause(DeclineCause::Recording)
+            ),
+            (0, 1),
+            "unforced: subject 1 declines in its recording"
+        );
+        let params = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let ehs: Vec<DVector<f64>> = (0..2).map(|_| DVector::zeros(model.n_eta)).collect();
+        let hms: Vec<DMatrix<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DMatrix::zeros(s.observations.len(), model.n_eta))
+            .collect();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let log = OuterFdDeclineLog::new(2);
+        log.force_decline(0);
+        let _ = population_gradient_sens_mixed(
+            &x,
+            params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &opts,
+            OuterTrial::unknown(),
+            &log,
+        );
+        assert_eq!(
+            (
+                log.n_cause(DeclineCause::ModeSystem),
+                log.n_cause(DeclineCause::Recording)
+            ),
+            (1, 1),
+            "forced: subject 0 at its mode system, subject 1 in its recording"
         );
     }
 
@@ -16478,4 +16636,125 @@ mod start_warm_rescore {
         assert_eq!(start.warm_rescored_from, None, "{start:?}");
         assert_eq!(start.n_unconverged, 27, "{start:?}");
     }
+}
+
+/// #2799: `eval_budget_spent` is the budget state *after* a stagnation latch on the last
+/// permitted evaluation has been attributed to the guard. On `one_cpt_iv` / SLSQP with the
+/// #2462 verification leg off (the rule BOBYQA's polish keeps; under the verification a spent
+/// budget is final and never reset), a 106-evaluation budget ends inside the latch: NLopt
+/// returns `MaxEvalReached`, the plateau check takes the stop, and the fit is converged with
+/// `eval_budget_spent == false`. The guard-off twin at the same budget runs out on its own
+/// descent: `MaxEvalReached` and `true`. Measured window (macOS arm64): budgets 105–107 all
+/// straddle; 106 sits in its middle. Mutation: fill `eval_budget_spent` from
+/// `max_eval_reached` as it stood *before* the latch reset → the latched run reads `true`.
+#[test]
+fn eval_budget_spent_is_read_after_the_latch_reset() {
+    use crate::estimation::outer_optimizer::{
+        optimize_nlopt_once, OuterFdDeclineLog, EVAL_BUDGET_OVERRIDE, UNPROFILED_VERIFY_OFF,
+    };
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    const BUDGET: u32 = 106;
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let _off = WarmPredictorOff::new();
+    let run = |guard: bool| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Slsqp,
+            stagnation_guard: guard,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        UNPROFILED_VERIFY_OFF.with(|o| o.set(true));
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(Some(BUDGET)));
+        let out = optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            &[],
+        );
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+        UNPROFILED_VERIFY_OFF.with(|o| o.set(false));
+        out
+    };
+    let (on, on_outcome) = run(true);
+    let (off, off_outcome) = run(false);
+    // The straddle: both runs end on the budget, one inside the latch and one outside it.
+    assert!(on_outcome.stagnation_latched, "the guarded run must latch");
+    assert!(!off_outcome.stagnation_latched, "guard off never latches");
+    assert_eq!(on.optimizer_stop.as_deref(), Some("MaxEvalReached"));
+    assert_eq!(off.optimizer_stop.as_deref(), Some("MaxEvalReached"));
+    assert!(
+        !on.eval_budget_spent,
+        "a latch on the last permitted eval is the guard's stop, not the budget's"
+    );
+    assert!(on.converged, "the plateau check accepts the latched stop");
+    assert!(off.eval_budget_spent, "the unguarded run spent its budget");
+    assert!(!off.converged);
+}
+
+/// #2799 r1 #2: the internal BFGS (`optimizer = bfgs`) publishes `eval_budget_spent` when its
+/// loop runs off the end of `outer_maxiter`, and not when it converges. `one_cpt_iv` with a
+/// 2-iteration budget cannot reach either stop rule; a 500-iteration budget converges on it
+/// through the relative-change stop, and a 1-iteration budget with a tolerance every gradient
+/// meets converges through the gradient-norm stop on its last permitted iteration. Mutation:
+/// drop the `exited_early = true` on either convergence `break` → its run reads `true`;
+/// fill `false` → the short run.
+#[test]
+fn internal_bfgs_reports_a_spent_iteration_budget() {
+    use crate::estimation::outer_optimizer::{optimize_bfgs, OuterFdDeclineLog};
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let run_gtol = |maxiter: usize, gtol: f64| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bfgs,
+            outer_maxiter: maxiter,
+            outer_gtol: gtol,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        optimize_bfgs(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+        )
+    };
+    let run = |maxiter: usize| run_gtol(maxiter, FitOptions::default().outer_gtol);
+    let short = run(2);
+    assert!(!short.converged);
+    assert!(short.eval_budget_spent, "{:?}", short.warnings);
+    let long = run(500);
+    assert!(
+        long.converged,
+        "the straddle needs a converging twin: {:?}",
+        long.warnings
+    );
+    assert!(!long.eval_budget_spent);
+    // The gradient-norm stop on the last permitted iteration: a budget of 1 with a tolerance
+    // every gradient meets converges on iteration 1, inside the range, so it is not spent.
+    let gtol = run_gtol(1, 1e12);
+    assert!(gtol.converged, "{:?}", gtol.warnings);
+    assert_eq!(gtol.n_iterations, 1);
+    assert!(!gtol.eval_budget_spent);
 }

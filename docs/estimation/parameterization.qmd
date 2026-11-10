@@ -482,6 +482,65 @@ noticing. If you need an exact zero on a log-packed Theta, declare a negative
 lower bound — `theta TVBETA(0.0, -5.0, 5.0) FIX` — which selects identity
 packing and holds the zero exactly.
 
+## Held parameters {#held-parameters}
+
+A free coordinate the optimizer leaves on one of the lower rails above has
+*collapsed*: an Omega or kappa variance at $e^{-12} = 6.144 \times 10^{-6}$, a
+sigma at $e^{-8}$, or a THETA with no declared lower bound on the internal
+`1e-10` floor. The `parameter_at_runaway_guard` warning reports it as a
+`collapse` ([warnings](../warnings.qmd)). Its standard error is not a standard
+error. The covariance step's curvature along a packed coordinate on the rail is
+real, but it is so small that the packed (log-scale) SE comes out around 10. On
+the reporting scale the delta method multiplies that by $2\omega^2$, which turns
+it into a small, plausible-looking number such as `0.00012`. That number
+describes an interval of $e^{-6 \pm 20}$.
+
+So ferx (#2797) reports no SE for it. It is listed in `FitResult::held_at_bound`
+with the reason `collapsed_at_guard`, alongside the profiled levels that sit on
+their declared box (`profiled_bound`, #2112). Every renderer prints its SE as
+`N/A`, and the YAML writes `se: ~` and `held: <reason>`. A runaway (an upper
+rail, or any off-diagonal on its ±10 rail) is never held. Its fit is already
+rejected with `converged: false`, and holding it would hide the evidence.
+
+### Conditional on the held rows, only after a clean verdict
+
+The step builds `R` (and `S`) over the usual free coordinates and runs its
+usual positive-definiteness verdict on them. The collapsed coordinate is
+included, so every diagnostic is unchanged: the eigenvalue floor, the fallback
+to `S` and the stationarity test. Only then:
+
+| the step's `R` | what the step reports | `cov_fixed` | stored `se_*` |
+|---|---|---|---|
+| clean (nothing clipped, no `S` fallback) | the covariance **conditional** on the held coordinate at its estimate: the inverse of `R`'s sub-block over the rest, with a zero row and column for the held coordinate (exactly the matrix a `FIX` gives) | marks it | `0.0`, as a `FIX` parameter's |
+| floored, or replaced by `S⁻¹` | the unconditional matrix, unchanged | does not mark it | the unconditional value |
+| no matrix | nothing | (empty) | none |
+
+The order matters. At a poor point the collapsed coordinate can itself be the
+direction along which `R` is indefinite. On the #2797 fixture with sigma moved
+from 0.10 to 0.02, `R` has a minimum eigenvalue of −21.96, which the floor
+clips and reports as `severe`. Holding the coordinate *before* the verdict would
+remove that eigenvalue, return a clean-looking matrix and cut sigma's SE by
+98.6%. Holding it after the verdict leaves the floor warning, the matrix and
+every SE as they were.
+
+At a stationary collapse the hold barely moves anything else. On the same
+fixture at its optimum, the other SEs move by at most $5.4 \times 10^{-6}$
+relative, and they equal a run with the coordinate `FIX`, to the bit, on both
+the analytic R-matrix and the finite-difference stencil.
+
+`held_at_bound` says that the SE is not available. `cov_fixed` says whether the
+other SEs are conditional on the held coordinate. The guard warning says the
+same in words: "the other standard errors are computed with them held at the
+floor" after a clean `R`, and only "their standard errors are not reported"
+otherwise. Its `details.parameters[].held` mirrors `cov_fixed`. Every consumer of
+the matrix treats a held collapse as the same coordinate `FIX`: the covariance step
+under every `covariance_method`, profiled or not, SIR and the asymptotic draws
+(#2816). A `[mixture]` per-class override (`omega(k)` or `sigma(k)`) on the rail is
+held under the same rule (#2809). Its `held_at_bound` entry carries `class: k`, and
+its `kind` and `index` name the base parameter it overrides. So the base parameter
+keeps its own SE, and the other SEs equal a run with the override `FIX`. Per-class
+override estimates and their SEs are not printed in this version.
+
 ## Where the packed space surfaces
 
 It is not purely internal; it shows up in several user-visible places.

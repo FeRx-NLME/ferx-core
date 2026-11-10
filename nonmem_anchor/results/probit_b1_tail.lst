@@ -1,0 +1,320 @@
+Fri Nov  6 11:31:45 AM UTC 2026
+$PROBLEM ferx #2603 B1-probit tail arm: MAXEVAL=0 at TVL=-2.8 (P near 3e-3), every level 0
+$INPUT ID STUDY TIME DV CMT EVID MDV TRT
+$DATA probit_b1.csv IGNORE=@
+$PRED
+ TVL  = THETA(1)
+ EMAX = THETA(2)
+ PLA = 0
+ IF (STUDY.EQ.1.AND.TIME.EQ.0) PLA = THETA(3)
+ IF (STUDY.EQ.1.AND.TIME.EQ.4) PLA = THETA(4)
+ IF (STUDY.EQ.1.AND.TIME.EQ.8) PLA = THETA(5)
+ IF (STUDY.EQ.1.AND.TIME.EQ.12) PLA = -(THETA(3)+THETA(4)+THETA(5))
+ IF (STUDY.EQ.2.AND.TIME.EQ.0) PLA = THETA(6)
+ IF (STUDY.EQ.2.AND.TIME.EQ.4) PLA = THETA(7)
+ IF (STUDY.EQ.2.AND.TIME.EQ.8) PLA = THETA(8)
+ IF (STUDY.EQ.2.AND.TIME.EQ.12) PLA = -(THETA(6)+THETA(7)+THETA(8))
+ IF (STUDY.EQ.3.AND.TIME.EQ.0) PLA = THETA(9)
+ IF (STUDY.EQ.3.AND.TIME.EQ.4) PLA = THETA(10)
+ IF (STUDY.EQ.3.AND.TIME.EQ.8) PLA = THETA(11)
+ IF (STUDY.EQ.3.AND.TIME.EQ.12) PLA = -(THETA(9)+THETA(10)+THETA(11))
+ IF (STUDY.EQ.4.AND.TIME.EQ.0) PLA = THETA(12)
+ IF (STUDY.EQ.4.AND.TIME.EQ.4) PLA = THETA(13)
+ IF (STUDY.EQ.4.AND.TIME.EQ.8) PLA = THETA(14)
+ IF (STUDY.EQ.4.AND.TIME.EQ.12) PLA = -(THETA(12)+THETA(13)+THETA(14))
+ IF (STUDY.EQ.5.AND.TIME.EQ.0) PLA = THETA(15)
+ IF (STUDY.EQ.5.AND.TIME.EQ.4) PLA = THETA(16)
+ IF (STUDY.EQ.5.AND.TIME.EQ.8) PLA = THETA(17)
+ IF (STUDY.EQ.5.AND.TIME.EQ.12) PLA = -(THETA(15)+THETA(16)+THETA(17))
+ IF (STUDY.EQ.6.AND.TIME.EQ.0) PLA = THETA(18)
+ IF (STUDY.EQ.6.AND.TIME.EQ.4) PLA = THETA(19)
+ IF (STUDY.EQ.6.AND.TIME.EQ.8) PLA = THETA(20)
+ IF (STUDY.EQ.6.AND.TIME.EQ.12) PLA = -(THETA(18)+THETA(19)+THETA(20))
+ IF (STUDY.EQ.7.AND.TIME.EQ.0) PLA = THETA(21)
+ IF (STUDY.EQ.7.AND.TIME.EQ.4) PLA = THETA(22)
+ IF (STUDY.EQ.7.AND.TIME.EQ.8) PLA = THETA(23)
+ IF (STUDY.EQ.7.AND.TIME.EQ.12) PLA = -(THETA(21)+THETA(22)+THETA(23))
+ IF (STUDY.EQ.8.AND.TIME.EQ.0) PLA = THETA(24)
+ IF (STUDY.EQ.8.AND.TIME.EQ.4) PLA = THETA(25)
+ IF (STUDY.EQ.8.AND.TIME.EQ.8) PLA = THETA(26)
+ IF (STUDY.EQ.8.AND.TIME.EQ.12) PLA = -(THETA(24)+THETA(25)+THETA(26))
+ IF (STUDY.EQ.9.AND.TIME.EQ.0) PLA = THETA(27)
+ IF (STUDY.EQ.9.AND.TIME.EQ.4) PLA = THETA(28)
+ IF (STUDY.EQ.9.AND.TIME.EQ.8) PLA = THETA(29)
+ IF (STUDY.EQ.9.AND.TIME.EQ.12) PLA = -(THETA(27)+THETA(28)+THETA(29))
+ IF (STUDY.EQ.10.AND.TIME.EQ.0) PLA = THETA(30)
+ IF (STUDY.EQ.10.AND.TIME.EQ.4) PLA = THETA(31)
+ IF (STUDY.EQ.10.AND.TIME.EQ.8) PLA = THETA(32)
+ IF (STUDY.EQ.10.AND.TIME.EQ.12) PLA = -(THETA(30)+THETA(31)+THETA(32))
+ LP = TVL + PLA + ETA(1) + EMAX * TRT
+ P  = PHI(LP)
+ Y = P
+ IF (DV.NE.1) Y = 1 - P
+$THETA
+ -2.8 FIX  ; TVL
+ 0.3 FIX   ; EMAX
+ 0 FIX  ; PLACEBO s1 t0
+ 0 FIX  ; PLACEBO s1 t4
+ 0 FIX  ; PLACEBO s1 t8
+ 0 FIX  ; PLACEBO s2 t0
+ 0 FIX  ; PLACEBO s2 t4
+ 0 FIX  ; PLACEBO s2 t8
+ 0 FIX  ; PLACEBO s3 t0
+ 0 FIX  ; PLACEBO s3 t4
+ 0 FIX  ; PLACEBO s3 t8
+ 0 FIX  ; PLACEBO s4 t0
+ 0 FIX  ; PLACEBO s4 t4
+ 0 FIX  ; PLACEBO s4 t8
+ 0 FIX  ; PLACEBO s5 t0
+ 0 FIX  ; PLACEBO s5 t4
+ 0 FIX  ; PLACEBO s5 t8
+ 0 FIX  ; PLACEBO s6 t0
+ 0 FIX  ; PLACEBO s6 t4
+ 0 FIX  ; PLACEBO s6 t8
+ 0 FIX  ; PLACEBO s7 t0
+ 0 FIX  ; PLACEBO s7 t4
+ 0 FIX  ; PLACEBO s7 t8
+ 0 FIX  ; PLACEBO s8 t0
+ 0 FIX  ; PLACEBO s8 t4
+ 0 FIX  ; PLACEBO s8 t8
+ 0 FIX  ; PLACEBO s9 t0
+ 0 FIX  ; PLACEBO s9 t4
+ 0 FIX  ; PLACEBO s9 t8
+ 0 FIX  ; PLACEBO s10 t0
+ 0 FIX  ; PLACEBO s10 t4
+ 0 FIX  ; PLACEBO s10 t8
+$OMEGA 0.09 FIX
+$ESTIMATION METHOD=COND LAPLACE LIKE MAXEVAL=0 PRINT=5 NOABORT SIGL=12 NSIG=4 FORMAT=s1PE23.16
+$TABLE ID STUDY TIME LP P ETA1 NOPRINT ONEHEADER NOAPPEND FORMAT=s1PE23.16 FILE=probit_b1_tail.tab
+
+NM-TRAN MESSAGES
+  
+ WARNINGS AND ERRORS (IF ANY) FOR PROBLEM    1
+             
+ (WARNING  2) NM-TRAN INFERS THAT THE DATA ARE POPULATION.
+
+License Registered to:  InsightRX
+Expiration Date:    14 AUG 2027
+Current Date:        6 NOV 2026
+Days until program expires : 283
+1NONLINEAR MIXED EFFECTS MODEL PROGRAM (NONMEM) VERSION 7.6.0 (nm760)
+ ORIGINALLY DEVELOPED BY STUART BEAL, LEWIS SHEINER, AND ALISON BOECKMANN
+ CURRENT DEVELOPERS ARE ROBERT BAUER, ICON DEVELOPMENT SOLUTIONS,
+ AND ALISON BOECKMANN. IMPLEMENTATION, EFFICIENCY, AND STANDARDIZATION
+ PERFORMED BY NOUS INFOSYSTEMS.
+
+ PROBLEM NO.:         1
+ ferx #2603 B1-probit tail arm: MAXEVAL=0 at TVL=-2.8 (P near 3e-3), ever
+0DATA CHECKOUT RUN:              NO
+ DATA SET LOCATED ON UNIT NO.:    2
+ THIS UNIT TO BE REWOUND:        NO
+ CREATE/ADD TO FDATA.csv:        YES
+ NO. OF DATA RECS IN DATA SET:     2400
+ NO. OF DATA ITEMS IN DATA SET:   8
+ ID DATA ITEM IS DATA ITEM NO.:   1
+ DEP VARIABLE IS DATA ITEM NO.:   4
+ MDV DATA ITEM IS DATA ITEM NO.:  7
+0LABELS FOR DATA ITEMS:
+ ID STUDY TIME DV CMT EVID MDV TRT
+0(NONBLANK) LABELS FOR PRED-DEFINED ITEMS:
+ LP P
+0FORMAT FOR DATA:
+ (8E3.0)
+
+ TOT. NO. OF OBS RECS:     2400
+ TOT. NO. OF INDIVIDUALS:       10
+0LENGTH OF THETA:  32
+0DEFAULT THETA BOUNDARY TEST OMITTED:    NO
+0OMEGA HAS SIMPLE DIAGONAL FORM WITH DIMENSION:   1
+0DEFAULT OMEGA BOUNDARY TEST OMITTED:    NO
+0INITIAL ESTIMATE OF THETA:
+ LOWER BOUND    INITIAL EST    UPPER BOUND
+ -0.2800E+01    -0.2800E+01    -0.2800E+01
+  0.3000E+00     0.3000E+00     0.3000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+  0.0000E+00     0.0000E+00     0.0000E+00
+0INITIAL ESTIMATE OF OMEGA:
+ 0.9000E-01
+0OMEGA CONSTRAINED TO BE THIS INITIAL ESTIMATE
+0TABLES STEP OMITTED:    NO
+ NO. OF TABLES:           1
+ SEED NUMBER (SEED):    11456
+ NPDTYPE:    0
+ INTERPTYPE:    0
+ RANMETHOD:             3U
+ MC SAMPLES (ESAMPLE):    300
+ WRES SQUARE ROOT TYPE (WRESCHOL): EIGENVALUE
+0-- TABLE   1 --
+0RECORDS ONLY:    ALL
+04 COLUMNS APPENDED:    NO
+ PRINTED:                NO
+ HEADERS:               ONE
+ FILE TO BE FORWARDED:   NO
+ FORMAT:                s1PE23.16
+ IDFORMAT:
+ LFORMAT:
+ RFORMAT:
+ FIXED_EFFECT_ETAS:
+0USER-CHOSEN ITEMS:
+ ID STUDY TIME LP P ETA1
+1
+
+
+ #TBLN:      1
+ #METH: Laplacian Conditional Estimation (Evaluation)
+
+ ESTIMATION STEP OMITTED:                 YES
+ SHRINK INFO WITH EVALUATION (EVALSHRINK) NO
+ ANALYSIS TYPE:                           POPULATION
+ CONDITIONAL ESTIMATES USED:              YES
+ CENTERED ETA:                            NO
+ EPS-ETA INTERACTION:                     NO
+ LAPLACIAN OBJ. FUNC.:                    YES
+ NUMERICAL 2ND DERIVATIVES:               NO
+ PRED F SET TO A LIKELIHOOD:              YES
+ NUMERICAL DERIVATIVE
+       FILE REQUEST (NUMDER):               NONE
+ MAP (ETAHAT) ESTIMATION METHOD (OPTMAP):   0
+ ETA HESSIAN EVALUATION METHOD (ETADER):    0
+ INITIAL ETA FOR MAP ESTIMATION (MCETA):    0
+ SIGDIGITS FOR MAP ESTIMATION (SIGLO):      12
+ GRADIENT SIGDIGITS OF
+       FIXED EFFECTS PARAMETERS (SIGL):     12
+ NOPRIOR SETTING (NOPRIOR):                 0
+ NOCOV SETTING (NOCOV):                     OFF
+ DERCONT SETTING (DERCONT):                 OFF
+ FINAL ETA RE-EVALUATION (FNLETA):          1
+ EXCLUDE NON-INFLUENTIAL (NON-INFL.) ETAS
+       IN SHRINKAGE (ETASTYPE):             NO
+ NON-INFL. ETA CORRECTION (NONINFETA):      0
+ RAW OUTPUT FILE (FILE): probit_b1_tail.ext
+ EXCLUDE TITLE (NOTITLE):                   NO
+ EXCLUDE COLUMN LABELS (NOLABEL):           NO
+ FORMAT FOR ADDITIONAL FILES (FORMAT):       1PE23.16
+ PARAMETER ORDER FOR OUTPUTS (ORDER):       TSOL
+ KNUTHSUMOFF:                               0
+ INCLUDE LNTWOPI:                           NO
+ INCLUDE CONSTANT TERM TO PRIOR (PRIORC):   NO
+ INCLUDE CONSTANT TERM TO OMEGA (ETA) (OLNTWOPI):NO
+ ADDITIONAL CONVERGENCE TEST (CTYPE=4)?:    NO
+ EM OR BAYESIAN METHOD USED:                 NONE
+
+
+ THE FOLLOWING LABELS ARE EQUIVALENT
+ PRED=NPRED
+ RES=NRES
+ WRES=NWRES
+ IWRS=NIWRES
+ IPRD=NIPRED
+ IRS=NIRES
+
+ Elapsed evaluation time in seconds:     0.02
+ Elapsed postprocess time in seconds:     0.01
+1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                  LAPLACIAN CONDITIONAL ESTIMATION (EVALUATION)                 ********************
+ #OBJT:**************                       MINIMUM VALUE OF OBJECTIVE FUNCTION                      ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+
+
+
+ #OBJV:********************************************          3882.834       *********************************************
+1
+ ************************************************************************************************************************
+ ********************                                                                                ********************
+ ********************                  LAPLACIAN CONDITIONAL ESTIMATION (EVALUATION)                 ********************
+ ********************                             FINAL PARAMETER ESTIMATE                           ********************
+ ********************                                                                                ********************
+ ************************************************************************************************************************
+ 
+
+
+ THETA - VECTOR OF FIXED EFFECTS PARAMETERS   *********
+
+
+         TH 1      TH 2      TH 3      TH 4      TH 5      TH 6      TH 7      TH 8      TH 9      TH10      TH11      TH12     
+          TH13      TH14      TH15      TH16      TH17      TH18      TH19      TH20      TH21      TH22      TH23      TH24     
+         TH25      TH26      TH27      TH28      TH29      TH30      TH31      TH32     
+ 
+        -2.80E+00  3.00E-01  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00
+          0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00
+         0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00  0.00E+00
+ 
+
+
+ OMEGA - COV MATRIX FOR RANDOM EFFECTS - ETAS  ********
+
+
+         ETA1     
+ 
+ ETA1
++        9.00E-02
+ 
+1
+
+
+ OMEGA - CORR MATRIX FOR RANDOM EFFECTS - ETAS  *******
+
+
+         ETA1     
+ 
+ ETA1
++        3.00E-01
+ 
+ Elapsed finaloutput time in seconds:     0.02
+ #CPUT: Total CPU Time in Seconds,        0.100
+Stop Time:
+Fri Nov  6 11:31:48 AM UTC 2026

@@ -219,9 +219,14 @@ mod binary_smoke {
         let wrap = |block: &str| {
             format!("[parameters]\n  theta TH0(0.0, -10.0, 10.0)\n{block}\n[fit_options]\n  method = focei\n")
         };
-        // Unsupported link.
+        // A link that disagrees with the predictor's key (#2603).
         assert!(parse_model_string(&wrap(
             "[binary_model]\n  cmt = 3\n  logit = TH0\n  link = probit"
+        ))
+        .is_err());
+        // Unsupported link.
+        assert!(parse_model_string(&wrap(
+            "[binary_model]\n  cmt = 3\n  logit = TH0\n  link = cloglog"
         ))
         .is_err());
         // Unknown key.

@@ -53,21 +53,34 @@ const DEFAULT_THREADS_CAP: usize = 8;
 
 /// Core cap arithmetic for the unpinned default thread count, split out from
 /// [`default_thread_count`] so it is testable without depending on the host's actual
-/// core count: leave one core free for the OS/other work, and don't scale past
+/// core count: leave one core free for the OS/other work (but never drop below two workers where
+/// two cores exist), and don't scale past
 /// [`DEFAULT_THREADS_CAP`] even on much larger machines, since most fits see no benefit
 /// from spreading across every core and (notably on Apple Silicon) not all cores are equal.
+///
+/// Never fewer than two workers where two cores exist: leaving one free on a two-core host
+/// left a single worker, every fit serial (measured equal to one core on a 2-core
+/// affinity, #2706 follow-up), so the free core bought nothing but half the throughput.
 pub(crate) fn cap_default_threads(available: usize) -> usize {
-    available.saturating_sub(1).clamp(1, DEFAULT_THREADS_CAP)
+    available
+        .saturating_sub(1)
+        .max(available.min(2))
+        .clamp(1, DEFAULT_THREADS_CAP)
 }
 
 /// Default worker-thread count used when nothing pins an explicit count (`threads` unset
 /// or `auto`/`0`, and no explicit `--threads`/[`configure_global_thread_pool`] call). See
 /// [`cap_default_threads`] for the cap logic (#707).
 pub(crate) fn default_thread_count() -> usize {
-    let available = std::thread::available_parallelism()
+    cap_default_threads(available_cpus())
+}
+
+/// `std::thread::available_parallelism()`, `1` when it cannot be read. Respects cgroup
+/// quotas and affinity masks, so it is the host's usable width inside a container too.
+pub(crate) fn available_cpus() -> usize {
+    std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1);
-    cap_default_threads(available)
+        .unwrap_or(1)
 }
 
 /// The process-wide worker count a caller explicitly asked for (currently: the CLI's
@@ -81,10 +94,10 @@ pub(crate) fn default_thread_count() -> usize {
 static EXPLICIT_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Declare the worker count this process should fit with, overriding the automatic default
-/// (available cores minus one, capped at 8). Intended for a CLI binary applying its
-/// `--threads N` before the first fit; library callers that want a pinned thread count for
-/// a single fit should use `FitOptions::threads` instead, which exclusively leases a pool
-/// for that call.
+/// (available cores minus one, at least two where two cores exist, capped at 8). Intended for
+/// a CLI binary applying its `--threads N` before the first fit; library callers that want a
+/// pinned thread count for a single fit should use `FitOptions::threads` instead, which
+/// exclusively leases a pool for that call.
 ///
 /// **This does not build Rayon's global pool** (#1460), despite the name it has carried
 /// since #707. It used to: `--threads N` called `build_global` with `N`, and then every
@@ -142,12 +155,13 @@ pub(crate) fn reconfiguration_result(already: usize, requested: usize) -> Result
 /// spawn-and-tear-down a fresh `N × 32 MiB` pool (which oversubscribes CPUs and can
 /// exhaust address space).
 ///
-/// Sized by [`default_thread_count`] (available cores minus one, capped at 8 — #707): most
-/// fits gain little from spreading across every core, and not all cores are equal on
-/// asymmetric platforms (e.g. Apple Silicon E-cores). A caller that declared an explicit
-/// process-wide width via [`configure_global_thread_pool`] (the CLI's `--threads N`) is
-/// honored instead — that call records [`EXPLICIT_THREADS`] before this pool is built, and
-/// this is then the only pool `N` sizes (#1460).
+/// Sized by [`effective_default_threads`]: a width declared via
+/// [`configure_global_thread_pool`] if any — that call records [`EXPLICIT_THREADS`] before
+/// this pool is built, and this is then the only pool `N` sizes (#1460) — else a positive
+/// `RAYON_NUM_THREADS` (#2800), else [`default_thread_count`] (available cores minus one, at
+/// least two where two cores exist, capped at 8 — #707): most fits gain little from
+/// spreading across every core, and not all cores are equal on asymmetric platforms (e.g.
+/// Apple Silicon E-cores).
 ///
 /// Returns `None` only if the one-time build fails (e.g. resource limits); callers then
 /// run on the ambient pool rather than aborting the fit.
@@ -485,54 +499,294 @@ pub(crate) fn install_on_fit_pool<R: Send>(
         .validate()
         .map_err(super::entry_refusals::ode_solver_options)?;
     let f = scope.armed(f);
+    let resolved = fit_thread_resolution(options.threads);
+    let pinned = resolved.source == ThreadSource::Pinned;
     if !scope.is_empty() {
-        return match options.threads.filter(|&n| n > 0) {
-            Some(n) => Ok(fit_scope_pool(scope, n)
+        return if pinned {
+            Ok(fit_scope_pool(scope, resolved.n)
                 .map_err(EngineError::uncoded)?
-                .install(f)),
-            None => Ok(shared_fit_scope_pool(scope, effective_default_threads())
+                .install(f))
+        } else {
+            Ok(shared_fit_scope_pool(scope, resolved.n)
                 .map_err(EngineError::uncoded)?
-                .install(f)),
+                .install(f))
         };
     }
-    match options.threads.filter(|&n| n > 0) {
+    if pinned {
         // A pinned positive `threads` leases an idle pool or builds a new one,
         // preserving independently budgeted concurrent fits.
-        Some(n) => Ok(fit_pool_cache()
-            .acquire(n, FitScope::default())
+        Ok(fit_pool_cache()
+            .acquire(resolved.n, FitScope::default())
             .map_err(EngineError::uncoded)?
-            .install(f)),
-        None => Ok(match default_fit_pool() {
+            .install(f))
+    } else {
+        Ok(match default_fit_pool() {
             Some(pool) => pool.install(f),
             None => f(),
-        }),
+        })
     }
 }
 
 /// The thread count an unpinned `fit()` actually runs on: the explicitly configured
-/// process-wide width when the CLI called [`configure_global_thread_pool`], otherwise the
-/// capped [`default_thread_count`] (#707).
+/// process-wide width when the CLI called [`configure_global_thread_pool`], else a positive
+/// `RAYON_NUM_THREADS` (#2800), otherwise the capped [`default_thread_count`] (#707).
 ///
 /// [`default_fit_pool`] sizes itself with this, and [`PoolPlan::from_budget`] resolves a
 /// `total_threads = 0` budget with it — the two must agree, or a `from_budget(0, …)` plan
 /// would silently disagree with the pool an unpinned fit uses (#1115).
 pub(crate) fn effective_default_threads() -> usize {
-    resolve_default_threads(EXPLICIT_THREADS.load(std::sync::atomic::Ordering::Acquire))
+    effective_default_resolution().n
 }
 
-/// [`effective_default_threads`] without the process-global read, so the precedence is
-/// testable (`explicit` wins, `0` means "nothing was declared").
+/// [`effective_default_threads`] together with where the count came from, for the fit's
+/// thread warnings.
+pub(crate) fn effective_default_resolution() -> DefaultThreads {
+    fit_thread_resolution(None)
+}
+
+/// The worker count a `fit()` with this `FitOptions::threads` runs on, and who chose it.
+/// [`install_on_fit_pool`] picks its pool from this and the fit's thread warnings name its
+/// source, so the width a warning reports and the pool the fit leased cannot disagree.
+pub(crate) fn fit_thread_resolution(threads: Option<usize>) -> DefaultThreads {
+    resolve_fit_threads(
+        threads,
+        EXPLICIT_THREADS.load(std::sync::atomic::Ordering::Acquire),
+        rayon_num_threads_env(),
+        available_cpus(),
+    )
+}
+
+/// The whole precedence for one fit, with every input injected (#2800):
+///
+/// 1. a positive `pinned` (`FitOptions::threads`: the R argument, `[fit_options] threads`,
+///    or a CLI `--threads N` that overrode the file — #1416 merges those upstream);
+/// 2. a process-wide width declared through [`configure_global_thread_pool`];
+/// 3. a positive `RAYON_NUM_THREADS`;
+/// 4. the capped default of `available`.
+///
+/// `pinned = Some(0)` is "the engine default" — the CLI's `--threads auto` and R's
+/// `threads = 0` — so it falls through to 2–4 and the environment applies to it.
+pub(crate) fn resolve_fit_threads(
+    pinned: Option<usize>,
+    explicit: usize,
+    env: Option<&str>,
+    available: usize,
+) -> DefaultThreads {
+    match pinned.filter(|&n| n > 0) {
+        Some(n) => DefaultThreads {
+            n,
+            source: ThreadSource::Pinned,
+            env_ignored: None,
+        },
+        None => resolve_default_threads(explicit, env, available),
+    }
+}
+
+/// The environment variable an unpinned fit honours as a worker count (#2800).
+pub(crate) const RAYON_NUM_THREADS_ENV: &str = "RAYON_NUM_THREADS";
+
+/// `RAYON_NUM_THREADS` as this process first saw it, read **once**.
+///
+/// Once per process because the shared [`default_fit_pool`] is sized on first use and can
+/// never be resized: re-reading the variable per fit would report a width no pool has — the
+/// disagreement #1115 forbids. Rayon reads it once for its global pool for the same reason.
+fn rayon_num_threads_env() -> Option<&'static str> {
+    static RAW: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    RAW.get_or_init(|| std::env::var(RAYON_NUM_THREADS_ENV).ok())
+        .as_deref()
+}
+
+/// Who chose the worker count of a fit (#2800). Reported in the fit's thread warnings so a
+/// user can see why a fit ran the width it did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadSource {
+    /// A positive `FitOptions::threads`: `[fit_options] threads`, the R `threads` argument,
+    /// or a CLI `--threads N` overriding the file (#1416).
+    Pinned,
+    /// A process-wide width declared through [`configure_global_thread_pool`].
+    Declared,
+    /// A positive integer in `RAYON_NUM_THREADS`.
+    Env,
+    /// The engine default: cores minus one, at least two where two exist, capped at 8.
+    Auto,
+}
+
+impl ThreadSource {
+    /// The parenthetical the thread warnings carry.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            ThreadSource::Pinned => "pinned by `threads`",
+            ThreadSource::Declared => "pinned process-wide by `--threads`",
+            ThreadSource::Env => "from `RAYON_NUM_THREADS`",
+            ThreadSource::Auto => "engine default",
+        }
+    }
+}
+
+/// The resolved worker count of an unpinned fit, where it came from, and the
+/// `RAYON_NUM_THREADS` value that was set but could not be used, if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DefaultThreads {
+    pub(crate) n: usize,
+    pub(crate) source: ThreadSource,
+    /// The raw variable when it was set, non-empty, and not a non-negative integer — it was
+    /// ignored and the fit must say so. `None` for a valid pin, for `0` (Rayon's own
+    /// spelling of "the default", as `threads = 0` is ferx's) and for an empty value.
+    pub(crate) env_ignored: Option<String>,
+}
+
+/// [`effective_default_resolution`] without the process-global reads, so the precedence is
+/// testable with the environment injected — never `std::env::set_var`, which races every
+/// other test in the binary.
+///
+/// Precedence: a declared process-wide width (`explicit > 0`), then a positive
+/// `RAYON_NUM_THREADS`, then the capped default of `available`. An env pin is an explicit
+/// request, so — like `explicit` — it is used as given: no "minus one", no cap at 8.
+///
+/// The variable is parsed exactly as Rayon parses it (`usize::from_str`, no trimming, `0`
+/// meaning "the default"), so the fits and anything still sized by Rayon's global pool
+/// (a bootstrap's replicate lanes) agree on what counts as a pin.
 ///
 /// Deliberately *not* `rayon::current_num_threads()` on the explicit branch: that reads the
 /// ambient pool, and reading it is what made `--threads N` build a global pool nobody ran on
 /// (#1460). It also silently builds Rayon's global pool when called off-worker, so an
 /// engine that never wants one must not ask.
-pub(crate) fn resolve_default_threads(explicit: usize) -> usize {
+pub(crate) fn resolve_default_threads(
+    explicit: usize,
+    env: Option<&str>,
+    available: usize,
+) -> DefaultThreads {
+    let auto = |env_ignored| DefaultThreads {
+        n: cap_default_threads(available),
+        source: ThreadSource::Auto,
+        env_ignored,
+    };
     if explicit > 0 {
-        explicit
-    } else {
-        default_thread_count()
+        return DefaultThreads {
+            n: explicit,
+            source: ThreadSource::Declared,
+            env_ignored: None,
+        };
     }
+    match env {
+        None | Some("") => auto(None),
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(0) => auto(None),
+            Ok(n) => DefaultThreads {
+                n,
+                source: ThreadSource::Env,
+                env_ignored: None,
+            },
+            Err(_) => auto(Some(raw.to_string())),
+        },
+    }
+}
+
+/// The thread warnings `fit()` reports after its chain: [`fit_thread_resolution`] for this
+/// call's `threads`, handed to [`thread_warnings`]. One function so the hand-off — which
+/// source, which ignored env value — is the code [`fit_thread_warnings_with`] tests, not a
+/// copy of it in `fit.rs` (#2813 review row 1).
+pub(crate) fn fit_thread_warnings(
+    threads: Option<usize>,
+    n_used: usize,
+    n_subjects: usize,
+    saem: bool,
+) -> Vec<String> {
+    fit_thread_warnings_with(
+        threads,
+        EXPLICIT_THREADS.load(std::sync::atomic::Ordering::Acquire),
+        rayon_num_threads_env(),
+        available_cpus(),
+        n_used,
+        n_subjects,
+        saem,
+    )
+}
+
+/// [`fit_thread_warnings`] with every process-global input injected.
+pub(crate) fn fit_thread_warnings_with(
+    threads: Option<usize>,
+    explicit: usize,
+    env: Option<&str>,
+    available: usize,
+    n_used: usize,
+    n_subjects: usize,
+    saem: bool,
+) -> Vec<String> {
+    let r = resolve_fit_threads(threads, explicit, env, available);
+    thread_warnings(
+        n_used,
+        r.source,
+        r.env_ignored.as_deref(),
+        available,
+        n_subjects,
+        saem,
+    )
+}
+
+/// The thread warnings a fit reports after its chain (#2800, #1811), as a pure function
+/// of what was measured so each sentence is testable without a fit.
+///
+/// `requested` is the resolved count and `source` who chose it; `n_used` is the width the
+/// fit actually ran on (they differ only if the shared pool's build failed and the fit fell
+/// back to the ambient pool). `env_ignored` is consulted only for an unpinned fit, the one
+/// case in which the variable was read at all.
+pub(crate) fn thread_warnings(
+    n_used: usize,
+    source: ThreadSource,
+    env_ignored: Option<&str>,
+    available: usize,
+    n_subjects: usize,
+    saem: bool,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(raw) = env_ignored {
+        out.push(format!(
+            "{RAYON_NUM_THREADS_ENV} = \"{raw}\" is not a positive integer and was ignored; \
+             the fit used the engine default of {n_used} thread(s)"
+        ));
+    }
+    // An `Auto` count never exceeds `available` by construction, so only an explicit
+    // request can oversubscribe. No clamp: a pin is honoured as given (#1811).
+    if source != ThreadSource::Auto && n_used > available {
+        let advice = match source {
+            ThreadSource::Env => {
+                format!("unset {RAYON_NUM_THREADS_ENV} or lower it to at most {available}")
+            }
+            // `threads = 0` resolves to the declared width, so it cannot lower it.
+            ThreadSource::Declared => format!("lower --threads to at most {available}"),
+            _ => format!("consider threads = 0 (engine default) or at most {available}"),
+        };
+        out.push(format!(
+            "{n_used} threads requested ({}) exceed the {available} logical CPU(s) available, \
+             so workers time-share the cores — {advice}",
+            source.describe()
+        ));
+    }
+    if n_subjects > 0 && n_used > n_subjects {
+        // `threads = 0` is not a valid Rayon pool size, so for n_subjects = 1
+        // we still suggest a 1-thread pool.
+        let suggested = n_subjects.max(1);
+        out.push(format!(
+            "{n_used} threads configured ({}) but only {n_subjects} subject(s) — consider \
+             threads = {suggested} to reduce scheduling overhead (no speed benefit beyond \
+             n_subjects)",
+            source.describe()
+        ));
+    }
+    // SAEM-specific: MH scheduling has higher per-subject overhead than FOCE.
+    // Skip when n_subjects < 2 (n_subjects/2 = 0 is meaningless and the prior
+    // warning already covers the n_threads > n_subjects case).
+    if saem && n_subjects >= 2 {
+        let suggested = (n_subjects / 2).max(1);
+        if n_used > suggested {
+            out.push(format!(
+                "SAEM with more threads than subjects/2 may be slower due to MH scheduling \
+                 overhead. Consider threads = {suggested} for SAEM."
+            ));
+        }
+    }
+    out
 }
 
 /// Whether a cheap population-wide pass has enough work to repay Rayon dispatch.

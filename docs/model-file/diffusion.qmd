@@ -86,7 +86,7 @@ observations, with inflations that do not depend on what was observed, so a
 diffusion term cannot follow a subject's drift — it re-weights the fit instead.
 Measured on a two-compartment population fitted as one compartment (40 subjects
 × 14 observations, 5 % proportional error; one variable changed, the
-`[diffusion]` block):
+`[diffusion]` block; Durbin-Watson as computed through 0.4.0, before it was pair-normalised):
 
 | Model | OFV | Durbin-Watson | Fitted CL (truth 1.0) |
 |---|---|---|---|

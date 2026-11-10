@@ -385,6 +385,7 @@ pub(crate) fn subject_adjoint_gradient_at(
 /// gradient's own recording: one more sweep per BSV effect, no second recording (#2549).
 /// The response is `None` where the gradient is (the adjoint declined) or the inner Hessian
 /// is singular.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
     model: &CompiledModel,
     subject: &Subject,
@@ -403,6 +404,7 @@ pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
 /// [`subject_adjoint_gradient_with_eta_dx_at`] for any objective the adjoint serves: under
 /// Laplace/AGQ (`Objective::Agq`) the response of the conditional mode the quadrature is
 /// centred on, from the exact inner Hessian, out of the quadrature gradient's own tape.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_gradient_and_eta_dx_at(
     model: &CompiledModel,
     subject: &Subject,
@@ -875,6 +877,12 @@ fn adjoint_gradient(
     eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let (template, x) = (pt.template, pt.x);
+    // A reused `out` starts each pass without a cause, so a decline elsewhere cannot
+    // inherit the last pass's (#2713).
+    let mut eta_dx = eta_dx;
+    if let Some(o) = eta_dx.as_deref_mut() {
+        o.mode_system_declined = false;
+    }
     let mut sc = scope(model, subject, pt, eta_hat)?;
     let objective = match objective {
         // No random effects: both anchors are the empty `H`, and `Ψ = F`.
@@ -1954,7 +1962,7 @@ fn record_analytic_events<T: VmNum>(
         || uses_time;
     // `first[i]`: the record whose evaluation record `i` reuses (itself when none);
     // `None` when every record is its own.
-    let first: Option<Vec<usize>> = if per_record && T::RECORDS_TAPE {
+    let first: Option<std::rc::Rc<[usize]>> = if per_record && T::RECORDS_TAPE {
         // A taped type evaluates every record of a time-varying subject. Reusing one
         // evaluation is the same function but a different tape: the reverse sweep then
         // sums the records' adjoints into one node before passing them on, and that
@@ -1964,8 +1972,11 @@ fn record_analytic_events<T: VmNum>(
         // static subject predates the index and is kept on every type.
         None
     } else {
-        crate::pk::first_record_with_same_pk_inputs(
+        // Built once per EBE search, not per evaluation (#2558): `SharingScope`.
+        crate::pk::sharing_scope::first_record_with_same_pk_inputs(
             model,
+            subject,
+            crate::pk::sharing_scope::ShareSite::Recorder,
             records.iter().map(|&(occ, cov, _)| (group(occ), cov)),
         )
     };
@@ -4269,7 +4280,7 @@ fn run<const N: usize, const M: usize>(
         ng.as_ref(),
     )?;
     let fz = if interaction { None } else { pop_v.as_deref() };
-    let w = mode_solve(&h, &grad_f, &grad_l, || {
+    let Some(w) = mode_solve(&h, &grad_f, &grad_l, || {
         let mut g = inner_search_gradient::<N>(model, subject, lay, theta, eta, &ctx, &pv, fz)?;
         if let Some(j) = ng.as_ref() {
             for (gk, qk) in g.iter_mut().zip(&j.g) {
@@ -4277,7 +4288,12 @@ fn run<const N: usize, const M: usize>(
             }
         }
         Some(g)
-    })?;
+    }) else {
+        if let Some(o) = eta_dx {
+            o.mode_system_declined = true;
+        }
+        return None;
+    };
 
     // ---- 3. Ψ = F − wᵀ∇_η l on the scalar tape, one single-lane sweep -----------------
     rtape_reset();
@@ -4461,6 +4477,11 @@ pub(crate) struct ModeOut {
     pub(crate) want_hessian: bool,
     pub(crate) eta_dx: Option<Vec<DVector<f64>>>,
     pub(crate) hessian: Option<DMatrix<f64>>,
+    /// The FOCE/FOCEI pass declined at its mode system `H w = ∇_η F` ([`mode_solve`]): `H`
+    /// singular at `η̂`, or indefinite at an `η̂` that is not stationary. Any other decline
+    /// (scope, a failed or non-finite recording) leaves it `false` (#2713). Reset at the
+    /// start of every pass; [`Self::clear`] keeps it.
+    pub(crate) mode_system_declined: bool,
 }
 
 impl ModeOut {

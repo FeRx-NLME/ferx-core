@@ -187,3 +187,101 @@ fn gn_tr_two_cpt_oral_cov_ofv_matches_slsqp_baseline() {
         TOLERANCE,
     );
 }
+
+/// #2740: `method = gn` on an M3 BLOQ FOCEI model must recover NONMEM's MLE.
+///
+/// M3 takes the kernel fixed-EBE score, which had no EBE-response correction (`tᵢ = 0`),
+/// so GN stepped along a gradient that disagreed with its own objective (θ: 49.86 vs a
+/// reconverged central difference of 6.86). The trust region collapsed and GN stopped
+/// 10.6 OFV above FOCEI. It now takes each subject's exact total derivative. The
+/// reference is the NONMEM 7.5.1 LAPLACE M3 fit `bloq_convergence.rs` anchors L-BFGS
+/// to (`tests/nonmem/warfarin_bloq.lst`), at the same tolerances.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn gn_warfarin_bloq_m3_matches_nonmem() {
+    let model = parse_model_file(Path::new("examples/warfarin_bloq.ferx"))
+        .expect("warfarin BLOQ model must parse");
+    let population = read_nonmem_csv(Path::new("data/warfarin_bloq.csv"), None, None)
+        .expect("warfarin BLOQ data must load");
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceGn;
+    opts.outer_maxiter = 200;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("GN fit must succeed");
+    assert!(
+        result.ofv.is_finite(),
+        "OFV must be finite, got {}",
+        result.ofv
+    );
+    eprintln!(
+        "[#2740] GN warfarin_bloq: OFV {:.6}, θ {:?}, σ {:?}, converged {}",
+        result.ofv, result.theta, result.sigma, result.converged
+    );
+
+    let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
+    for (name, got, want, tol) in [
+        ("TVCL", result.theta[0], 0.132801, 0.01),
+        ("TVV", result.theta[1], 7.73139, 0.01),
+        ("TVKA", result.theta[2], 0.809824, 0.02),
+        ("PROP", result.sigma[0], 0.0107600, 0.02),
+        ("ω²(CL)", result.omega[(0, 0)], 0.0288494, 0.05),
+        ("ω²(V)", result.omega[(1, 1)], 0.00954401, 0.05),
+        ("ω²(KA)", result.omega[(2, 2)], 0.335772, 0.05),
+    ] {
+        assert!(
+            rel(got, want) < tol,
+            "{name} {got} vs NONMEM {want} (rel {:.3e})",
+            rel(got, want)
+        );
+    }
+}
+
+/// #2777: on `examples/one_cpt_transit.ferx` GN drives `TVV` onto its upper bound (500)
+/// with the gradient still pushing outward. Before the fix, rho was measured against the
+/// unclamped step's predicted reduction, which counted the reduction from the coordinate
+/// the clamp holds still, so rho was a fixed 0.214 at every radius and the fit stopped on
+/// "trust radius collapsed" at 1513.94. With the bound-active coordinate held and rho on
+/// the clamped step it ends at 1492.1729 (Linux x86_64). The bound stays active, and the
+/// gap to FOCEI (1215.98, in a different basin with `TVMTT` on its upper bound) is not
+/// this test's object.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn gn_one_cpt_transit_does_not_collapse_on_the_volume_bound() {
+    let model = parse_model_file(Path::new("examples/one_cpt_transit.ferx"))
+        .expect("one_cpt_transit model must parse");
+    let population = read_nonmem_csv(Path::new("data/datsim_oral.csv"), None, None)
+        .expect("datsim_oral data must load");
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceGn;
+    opts.outer_maxiter = 500;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("GN fit must return a result");
+
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("trust radius collapsed")),
+        "GN collapsed its trust region: {:?}",
+        result.warnings
+    );
+    assert!(result.ofv.is_finite(), "OFV must be finite: {}", result.ofv);
+    // Measured 1492.1729 after the fix against 1513.94 before; 5 OFV of headroom.
+    assert!(
+        result.ofv < 1497.0,
+        "GN OFV {} regressed toward the collapsed 1513.94",
+        result.ofv
+    );
+}

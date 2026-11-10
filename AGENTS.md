@@ -638,5 +638,6 @@ both.
 ## Pull Requests
 
 When creating a PR in this repo, always read `.github/PULL_REQUEST_TEMPLATE.md` and fill every section before calling `gh pr create`.
+Its **Tests** section asks for *Same pattern elsewhere* and *Consumers checked* (#2637); use rust-analyzer find-references (installed by `rust-toolchain.toml`) for the reference counts.
 
 After reviewing a PR, always post your comments on the PR.

@@ -1,0 +1,17 @@
+# Code owners for the numerical core (#2636).
+#
+# A failure in these directories is a wrong-but-plausible number, not a crash,
+# so review needs someone who knows the oracle rules in AGENTS.md: non-degenerate
+# fixtures, measured tolerances, dual-vs-FD parity. Any one listed owner's
+# approval satisfies the code-owner review; it is enforced by "Require review
+# from Code Owners" on the `main-protection` ruleset.
+#
+# Everything else is unowned, so any maintainer's approval suffices there.
+# `tests/codeowners.rs` fails if a path below stops existing, so a rename cannot
+# silently drop ownership.
+
+/src/estimation/ @roninsightrx @TeunP @hiddevandebeek
+/src/sens/       @roninsightrx @TeunP @hiddevandebeek
+/src/stats/      @roninsightrx @TeunP @hiddevandebeek
+/src/pk/         @roninsightrx @TeunP @hiddevandebeek
+/src/ode/        @roninsightrx @TeunP @hiddevandebeek

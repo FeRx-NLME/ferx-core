@@ -1,0 +1,29 @@
+# Fixture B1-probit of #2603 and its NONMEM anchor: fixture B1 of #2562 / #2111
+# (`profile_logit_b1.ferx`) under a probit link. Written by `simulate_probit_b1.py`. 10
+# studies x 4 visits x 2 arms x 30 Bernoulli rows, 2400 rows, ID = study, synthetic (seed
+# 2603), drawn with P(Y = 1) = Phi(LP): TVL -0.3, EMAX 0.6, SD of the study eta 0.3, so the
+# arm-visit probabilities run from about 0.17 to 0.87 and the link is live everywhere.
+# Data: `probit_b1.csv` beside this file.
+#
+# The level changes at every visit and TRT between the arms of one study, so each record is
+# scored at its own level and its own arm. NONMEM codes this model with every level a THETA
+# (each study's last visit dependent, as ferx lays it out) and `P = PHI(LP)` in
+# `probit_b1_laplace.ctl`, under `METHOD=COND LAPLACE LIKE`.
+
+[parameters]
+  theta TVL(-0.2, -5.0, 5.0)
+  theta EMAX(0.3, -5.0, 5.0)
+  theta PLACEBO[STUDY, TIME, contrast = sum_to_zero_within](0.0, -10.0, 10.0)
+  omega ETA_S ~ 0.09
+
+[covariates]
+  STUDY categorical
+  TRT   continuous
+
+[binary_model]
+  cmt    = 1
+  link   = probit
+  probit = TVL + PLACEBO + ETA_S + EMAX * TRT
+
+[fit_options]
+  method     = laplace

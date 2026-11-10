@@ -1190,6 +1190,8 @@ pub fn run_vi(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum: _,
     } = cov_out;
     warnings.extend(cov_warnings);
 
@@ -1285,6 +1287,9 @@ pub fn run_vi(
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
         mixture_posteriors: None,
+        newton_decrement,
+        optimizer_stop: None,
+        eval_budget_spent: false,
     })
 }
 

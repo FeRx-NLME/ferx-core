@@ -1,0 +1,56 @@
+# Adaptive (feedback) dosing — weight-based vancomycin with rounded doses (#944)
+#
+# `examples/adaptive_vanco_mgkg.ferx` with `round_to = 250`: every dose the controller
+# sets — the 15 mg/kg start dose and each +/-25% step — is rounded to the nearest
+# multiple of 250 mg (ties up), then clamped to the multiples inside `dose_bounds`, and
+# the rounded dose is carried to the next decision. So a 40 kg patient starts at 500 mg
+# (15 * 40 = 600 rounds down) and is capped at 1000 mg (30 * 40 = 1200 aligns down to the
+# last multiple inside the bounds).
+#
+# The lower bound is 250, not 0: with `round_to`, a lower bound of 0 would let a dose
+# round to 0, and a running dose of 0 cannot rise again under percentage steps, so it is
+# refused. Any positive lower bound up to 250 is lifted to 250.
+#
+# A step that the rounding absorbs (say 1000 +10% = 1100, which rounds back to 1000) is
+# logged like a step clamped at a bound: the rule fired, the dose is unchanged.
+#
+# Validated dose-for-dose against an independent mrgsolve run: the `round_to` arm of
+# tests/reference/vanco_mgkg_mrgsolve/, checked by tests/adaptive_vanco_mgkg_anchor.rs.
+# As in the unrounded example, ETA_CL carries a vanishing variance and the anchor
+# supplies eta = 0, so each patient is the typical-value patient mrgsolve runs.
+#
+# See docs/model-file/adaptive-dosing.qmd for the block reference.
+
+[parameters]
+  theta TVCL(6.0,  0.1,  50.0)   # clearance at 70 kg (L/h)
+  theta TVV(0.7,  0.05,   5.0)   # volume per kg (L/kg); CENT/V is the concentration
+  omega ETA_CL ~ 1e-10
+  sigma ADD ~ 1.0                # nominal; the latent `observe` signal is un-noised
+
+[individual_parameters]
+  CL = TVCL * (WT / 70) * exp(ETA_CL)
+  V  = TVV * WT
+
+[structural_model]
+  ode(states=[CENT])
+
+[odes]
+  d/dt(CENT) = -(CL / V) * CENT
+
+[scaling]
+  y = CENT / V                   # concentration (mg/L)
+
+[error_model]
+  DV ~ additive(ADD)
+
+[adaptive_dosing]
+  observe     = CENT / V                  # titrate on the latent trough
+  at          = every 12 from 0 to 144    # a decision before each q12h dose
+  start_dose  = 15 * WT                   # 15 mg/kg, evaluated per subject
+  route       = infuse(cmt=1, over=1)     # 1-h IV infusion
+  dose_bounds = [250, min(30 * WT, 4000)] # at least 250 mg; at most 30 mg/kg and 4000 mg
+  round_to    = 250                       # doses are multiples of 250 mg
+  confirm     = 2                         # act on two consecutive breaches
+  target_window = [15, 25]
+  when signal < 15 : increase 25%
+  when signal > 25 : decrease 25%
