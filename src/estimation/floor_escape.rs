@@ -16,7 +16,7 @@
 //! `api::postfit::collapsed_coordinates`) while the OFV falls as it rises. One evaluation
 //! answers it: the objective with each floored θ at [`FLOOR_PROBE_REL`] of its start. If
 //! the probe is no lower, the floor is a genuine boundary optimum and the fit is returned
-//! untouched. Otherwise the fit is restarted from its own estimates with the floored θ
+//! with only its evaluation count moved. Otherwise the fit is restarted from its own estimates with the floored θ
 //! (and any variance coordinate on its lower rail, which a collapsed θ drags with it) back
 //! at their starts. Measured on A2, that restart lands on NONMEM's optimum (Δ ≈ 2.5e-8)
 //! from every start that collapses. A restart that ends no lower, or on the floor again,
@@ -1049,7 +1049,7 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
     let mut first = first;
     if !(ofv_is_valid(probe_ofv) && ranked(&first) - ranked(probe) > FLOOR_PROBE_GAIN) {
         // The probe ran, so it is counted, whatever it scored — a non-finite one too
-        // (#2832 review, row 8). Rail completion's rule: `resolve_rail_completion`.
+        // (#2839 review, row 8). Rail completion's rule: `resolve_rail_completion`.
         *first.evals_mut() += 1;
         return first;
     }

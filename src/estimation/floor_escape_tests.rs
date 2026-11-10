@@ -134,7 +134,7 @@ fn resolve(first: Stub, probe: f64, restart: impl FnOnce(&Stub) -> Stub) -> Stub
 /// The gate, both sides in one test: a downhill probe restarts and adopts the landed fit; an
 /// uphill probe (a genuine boundary optimum) never calls the restart and returns the stop
 /// with only the probe's one evaluation added — it ran, so `n_iterations` shows it, restart
-/// or not (#2832 review, row 8). A gate stuck either way reddens one half.
+/// or not (#2839 review, row 8). A gate stuck either way reddens one half.
 #[test]
 fn a_floor_stop_restarts_only_when_the_probe_is_downhill() {
     // A2's probe at TVE0 = 0.055 (start 55): ≈ 0.058 below the floor.
