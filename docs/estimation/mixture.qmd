@@ -84,7 +84,10 @@ honoured. The exception is a start whose classes are indistinguishable (the same
 probability and the same objective under every class), where no gradient optimizer can
 separate them. `auto` runs BOBYQA there and warns `W_MIXTURE_SYMMETRIC_START`; see
 [mixture models](optimizers.qmd#auto-mixture) on the optimizers page, which has the
-measurements. Give the classes different initial values.
+measurements. Give the classes different initial values. The check is exact, so classes
+that start only close to each other are fitted with L-BFGS without a warning; if a fit
+ends with two nearly merged classes, refit from different class starts or set
+`optimizer = bobyqa`.
 
 ## Output
 

@@ -199,10 +199,11 @@ pub(crate) fn resolve_outer_optimizer(
     // analytic outer gradient is in scope, BOBYQA otherwise. BOBYQA was `auto`'s mixture
     // choice until #2739, as "robust against label switching". Measured on the public
     // mixture fixtures (`tests/nonmem/mixture_iv*.csv`, 100 seeded random starts each),
-    // L-BFGS reached the best optimum as often as BOBYQA (100 vs 100, 71 vs 74, 99 vs 99)
-    // in 5–8× fewer evaluations. The one start it cannot leave is a permutation-symmetric
-    // one, which `optimize_population` detects and runs under BOBYQA
-    // (`mixture::classes_indistinguishable`). The built-in BFGS / trust-region /
+    // L-BFGS reached the best optimum in 100, 71 and 99 of 100 fits against BOBYQA's 100, 74
+    // and 99 (within 3 of 100) in 5–8× fewer evaluations. The one start it cannot leave is a
+    // permutation-symmetric one, which `optimize_population` detects and runs under BOBYQA
+    // (`mixture::classes_indistinguishable`). The check is exact: a merely close start
+    // (clearances 1.70 and 1.71) is not caught and runs L-BFGS. The built-in BFGS / trust-region /
     // Gauss–Newton paths do not carry the mixture objective and fall back to BOBYQA.
     if has_mixture {
         return match requested {
@@ -11072,8 +11073,8 @@ fn declined_subject_gradient(
 ///
 /// Recording instead of probing also removes every gate this diagnostic would otherwise
 /// need, because a decline can only be recorded on an evaluation that actually happened:
-/// a derivative-free BOBYQA fit (including the silent mixture `Auto` → BOBYQA downgrade in
-/// [`resolve_outer_optimizer`]),
+/// a derivative-free BOBYQA fit (including the mixture `Auto` → BOBYQA choice at an
+/// indistinguishable start, see [`resolve_fit_optimizer`]),
 /// a `reconverge_gradient_interval = 1` fit that bypasses the analytic branch on every
 /// eval, a GN / trust-region fit, and an `outer_maxiter = 0` evaluation-only run all reach
 /// the end with an empty log and say nothing.

@@ -6887,7 +6887,7 @@ mod outer_fd_fallback {
     }
 
     /// A log nobody wrote to is silent. This is the property that makes every route gate
-    /// unnecessary: BOBYQA (including the mixture `Auto` downgrade), GN, trust-region,
+    /// unnecessary: BOBYQA (including the mixture `Auto` choice at an indistinguishable start), GN, trust-region,
     /// `reconverge_gradient_interval = 1` and `outer_maxiter = 0` all reach the end
     /// without touching the analytic branch, so there is nothing to report.
     #[test]

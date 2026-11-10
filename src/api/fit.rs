@@ -724,7 +724,7 @@ fn fit_unstamped(
     crate::api::check_theta_length(model, &init_params.theta)?;
     crate::api::check_param_shape(model, &crate::api::ParamBlock::all_of(init_params))?;
     // Mixture models (#977). Phase 3 wires the K-fold log-sum-exp FOCE/FOCEI
-    // objective via the derivative-free (BOBYQA) outer optimizer. Estimators the mixture
+    // objective into the outer optimizer (BOBYQA or an NLopt gradient method). Estimators the mixture
     // objective is not wired for, FOCEI quadrature and per-class Ω/Σ under Bayes are
     // refused rather than silently ignoring the mixture structure; so are `init_params`
     // with no per-class Ω/Σ (`E_PARAM_SHAPE` / `E_MIXTURE_METHOD`, #1788). Inter-occasion

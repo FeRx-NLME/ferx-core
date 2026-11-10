@@ -130,8 +130,9 @@ per model: `nlopt_lbfgs` when the exact analytic FOCE/FOCEI gradient is
 available, and `bobyqa` (derivative-free quadratic trust-region, robust to
 noisy FD gradients) when the outer loop has to fall back to finite
 differences — a model outside the analytic scope, or `gradient = fd`. Models
-with more than 64 free parameters take `nlopt_lbfgs` regardless, and mixture
-models take `bobyqa` regardless. A FOCE/FOCEI fit reports the pick as
+with more than 64 free parameters take `nlopt_lbfgs` regardless. A `[mixture]`
+model follows the same rule, except that one started with indistinguishable
+classes takes `bobyqa`. A FOCE/FOCEI fit reports the pick as
 `auto (<resolved>)`; see
 [Outer Optimizers](estimation/optimizers.qmd#the-auto-default) for the rules,
 their exceptions, and the benchmarks behind them. To pin one, set `optimizer = ...` in

@@ -2777,6 +2777,51 @@ mod indistinguishable_tests {
         )));
     }
 
+    /// The scan reads every subject. `tests/nonmem/mixture_iv.csv` has subjects 1–15 at WT 60
+    /// and 16–30 at WT 90, and class 2's clearance is scaled by `WT / ref`, which is exactly
+    /// 1.0 for the subjects at `ref`, so the classes are bit-identical on those and apart on the
+    /// rest. A check that stops after the first subject calls the first start symmetric, and one
+    /// that reads only the last calls the second symmetric. Both must come back `false`, and the
+    /// all-symmetric control (`WT / ref` is 1.0 for every subject) must stay `true`.
+    #[test]
+    fn a_subject_anywhere_in_the_data_that_separates_the_classes_is_found() {
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("tests/nonmem/mixture_iv.csv"),
+            Some(&["WT"]),
+            None,
+        )
+        .expect("data loads");
+        let wt = |i: usize| pop.subjects[i].covariates["WT"];
+        assert_eq!(wt(0), 60.0, "the first subject is at WT 60");
+        assert_eq!(
+            wt(pop.subjects.len() - 1),
+            90.0,
+            "the last subject is at WT 90"
+        );
+        let scaled = |reference: &str| {
+            edit(
+                "else TVCL2 * exp(ETA_CL)",
+                &format!("else TVCL2 * exp(ETA_CL) * (WT / {reference})"),
+            )
+        };
+        let judge = |src: &str| {
+            let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+            classes_indistinguishable(&model, &pop, &model.default_params)
+        };
+        assert!(
+            !judge(&scaled("60.0")),
+            "subjects 16–30 separate the classes; the symmetric first subject must not decide"
+        );
+        assert!(
+            !judge(&scaled("90.0")),
+            "subjects 1–15 separate the classes; the symmetric last subject must not decide"
+        );
+        assert!(
+            judge(&scaled("WT")),
+            "WT / WT is 1.0 for every subject: nothing separates the classes"
+        );
+    }
+
     /// A three-class start where two classes are identical and the third differs. The identical
     /// pair is still permutation-symmetric, so a gradient optimizer keeps them merged and can
     /// only reach the best solution in which they are: the guard must flag it. Requiring every

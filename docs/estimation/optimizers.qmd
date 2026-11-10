@@ -187,6 +187,8 @@ On the estimated-Ω variant both optimizers end in the same collapsed-class loca
 
 The one start L-BFGS cannot leave is one where the classes are **indistinguishable**: the same mixing probability and the same objective for every subject under every class, for example two classes with the same initial typical values at a mixing logit of 0. The objective is then symmetric under swapping the classes, and so is its gradient. A gradient optimizer moves both classes the same way, never separates them, and stops on that saddle reporting convergence: on `mixture_iv` at OFV 350.27, against the optimum's 301.58. `auto` checks for such a start and runs `bobyqa` from it, whose probe steps break the symmetry. The fit says so with `W_MIXTURE_SYMMETRIC_START` and records `auto (bobyqa)`. Giving the classes different initial values avoids it. The check compares the classes exactly, so classes that differ in any parameter, a class Ω or Σ, or the mixing probability are distinguishable.
 
+The check is exact, so it does not cover a start whose classes are only **close**, and `auto` runs L-BFGS from there with no warning. Close starts are not a saddle, and on the fixtures they usually do well. With clearances of 1.70 and 1.71, L-BFGS reached the optimum on both `mixture_iv` fixtures. On the estimated-Ω fixture that start went the other way: L-BFGS ended in the collapsed-class optimum at OFV 310.02 and BOBYQA at 299.86. That is one start. The random-start table above counts starts like it, and neither optimizer comes out ahead there. If a fit ends with two classes that have nearly merged, refit with different class starts, or pin `optimizer = bobyqa`.
+
 ### `gradient = fd` moves the optimizer too {#gradient-fd-moves-the-optimizer}
 
 Because `auto` resolves off the availability of the analytic gradient, changing
@@ -216,8 +218,8 @@ one the unforced arm would use. `ferx check` reports it too, against the
 The warning is silent whenever nothing was actually coupled — `optimizer`
 pinned; a model out of analytic scope anyway, where `auto` picks `bobyqa` either
 way; a model above `BOBYQA_MAX_DIM`, where `auto` takes `nlopt_lbfgs` on a
-finite-difference gradient regardless; a [mixture](mixture.qmd) model, whose
-`auto` is `bobyqa` whatever the gradient; an evaluation-only
+finite-difference gradient regardless; a [mixture](mixture.qmd) model started
+with indistinguishable classes, whose `auto` is `bobyqa` whatever the gradient; an evaluation-only
 (`maxiter = 0`) run, which constructs no optimizer at all; and an SDE model,
 which the engine forces onto finite differences whatever you asked for.
 
