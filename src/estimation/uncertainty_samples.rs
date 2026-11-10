@@ -1099,6 +1099,8 @@ mod tests {
             exclusions: None,
             packed_estimate: None,
             mixture_overrides: None,
+            mixture_override_params: Vec::new(),
+            se_mixture_overrides: None,
             left_init: None,
             stationary_start: false,
             omega_is_diagonal: None,

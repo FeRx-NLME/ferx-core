@@ -602,6 +602,184 @@ fn format_sigma_rows(result: &FitResult) -> String {
     out
 }
 
+/// Why `[mixture]` override `o` has no standard error (#2833), or `None` when it has one:
+/// a [`FitResult::held_at_bound`] entry of **its** class, family and base index. Matching
+/// on `(kind, index)` alone would name the base parameter, which is [`se_held`]'s job;
+/// matching any `class.is_some()` would hold every override of the base when one is.
+pub(crate) fn override_held(result: &FitResult, o: &MixtureOverrideParam) -> Option<HeldReason> {
+    result
+        .held_at_bound
+        .iter()
+        .find(|h| h.class == Some(o.class) && h.kind == o.kind && h.index == o.index)
+        .map(|h| h.reason)
+}
+
+/// The SE state of one override row, in render precedence (#2833).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OverrideSe {
+    /// In `held_at_bound`: `N/A` (console, table), `se: ~` + `held:` (YAML).
+    Held(HeldReason),
+    /// Fixed by the model or held at its initial value by the estimator: `---`.
+    Fixed,
+    /// Free: its SE, or `None` when the covariance step produced none.
+    Free(Option<f64>),
+}
+
+/// One `[mixture]` per-class override as every renderer shows it (#2833).
+struct OverrideRow<'a> {
+    param: &'a MixtureOverrideParam,
+    /// The fitted value: a class variance (Ω) or σ (Σ), as `mixture_overrides` reports it.
+    value: f64,
+    se: OverrideSe,
+}
+
+impl OverrideRow<'_> {
+    /// The base parameter's name, e.g. `ETA_CL` for `ETA_CL_MIX2`.
+    fn base_name<'r>(&self, result: &'r FitResult) -> &'r str {
+        let names = match self.param.kind {
+            ParameterKind::Omega => &result.eta_names,
+            _ => &result.sigma_names,
+        };
+        names.get(self.param.index).map_or("", String::as_str)
+    }
+
+    /// `---` / `N/A` / the SE, for the console.
+    fn se_text(&self) -> String {
+        match self.se {
+            OverrideSe::Held(_) => "N/A".to_string(),
+            OverrideSe::Fixed => "---".to_string(),
+            OverrideSe::Free(se) => se_cell(se),
+        }
+    }
+}
+
+/// The override rows of `result` (#2833), in `mixture_overrides` order. Empty with no
+/// override, and when the result records values without one descriptor each (a hand-built
+/// result, a bundle older than the descriptors): such a row cannot be named. The one
+/// source every renderer reads, so the console, the YAML and the table cannot disagree.
+fn override_rows(result: &FitResult) -> Vec<OverrideRow<'_>> {
+    let Some(values) = result.mixture_overrides.as_deref() else {
+        return Vec::new();
+    };
+    if result.mixture_override_params.len() != values.len() {
+        return Vec::new();
+    }
+    result
+        .mixture_override_params
+        .iter()
+        .zip(values)
+        .enumerate()
+        .map(|(k, (param, &value))| {
+            // Held first: a held override is never also fixed (the guard hold is not in
+            // the model's FIX mask), so the order matters only for a hand-built result.
+            let se = if let Some(reason) = override_held(result, param) {
+                OverrideSe::Held(reason)
+            } else if param.fixed {
+                OverrideSe::Fixed
+            } else {
+                OverrideSe::Free(
+                    result
+                        .se_mixture_overrides
+                        .as_ref()
+                        .and_then(|v| v.get(k).copied()),
+                )
+            };
+            OverrideRow { param, value, se }
+        })
+        .collect()
+}
+
+/// The `--- Mixture per-class overrides ---` section of [`print_results`] and
+/// [`format_summary`] (#2833), header included, or `""` without an override. An Ω row
+/// reads like an OMEGA row (`name = variance  (CV% = …)  SE = …`), a σ row like a SIGMA
+/// row; `[FIX]` with `SE = ---` for a fixed override, `SE = N/A` for a held one.
+fn format_mixture_override_rows(result: &FitResult) -> String {
+    use std::fmt::Write;
+    let rows = override_rows(result);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let show_cv = status_shows_cv(&result.covariance_status);
+    let mut out = String::from("\n--- Mixture per-class overrides ---\n");
+    for row in &rows {
+        let name = row.param.name.as_str();
+        let label = if row.se == OverrideSe::Fixed {
+            fixed_label(name)
+        } else {
+            name.to_string()
+        };
+        let se = row.se_text();
+        let _ = match row.param.kind {
+            ParameterKind::Omega => {
+                let t = eta_type(result, row.base_name(result));
+                let note = note_suffix(variance_note(t, row.value, false), show_cv);
+                writeln!(
+                    out,
+                    "  {:<20} = {:.6}{}  SE = {}",
+                    label, row.value, note, se
+                )
+            }
+            _ => match result.sigma_types.get(row.param.index).copied() {
+                Some(SigmaType::Proportional) => writeln!(
+                    out,
+                    "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
+                    label,
+                    row.value,
+                    row.value * 100.0,
+                    se
+                ),
+                _ => writeln!(out, "  {:<20} = {:.6}  SE = {}", label, row.value, se),
+            },
+        };
+    }
+    out
+}
+
+/// The top-level `mixture_overrides:` section of the fit YAML (#2833), or `""` without an
+/// override. Its own section, never nested under `omega:` / `sigma:`: the `[priors]
+/// from_fit` reader takes every key there as a base parameter. Each entry carries its
+/// `class`, `base` name and `kind`, an Ω override's `variance` (and the `cv_pct`/`sd` line
+/// of its base η's type) or a σ override's `estimate`, then `se` with the same `fixed:` /
+/// `held:` keys the base blocks use.
+fn mixture_overrides_yaml(result: &FitResult) -> String {
+    use std::fmt::Write;
+    let rows = override_rows(result);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nmixture_overrides:\n");
+    for row in &rows {
+        let p = row.param;
+        let _ = writeln!(out, "  {}:", p.name);
+        let _ = writeln!(out, "    class: {}", p.class);
+        let _ = writeln!(out, "    base: {}", row.base_name(result));
+        match p.kind {
+            ParameterKind::Omega => {
+                let _ = writeln!(out, "    kind: omega");
+                let _ = writeln!(out, "    variance: {:.6}", row.value);
+                if let Some(line) =
+                    variance_yaml_line(eta_type(result, row.base_name(result)), row.value)
+                {
+                    let _ = writeln!(out, "{}", line);
+                }
+            }
+            _ => {
+                let _ = writeln!(out, "    kind: sigma");
+                let _ = writeln!(out, "    estimate: {:.6}", row.value);
+            }
+        }
+        let _ = match row.se {
+            OverrideSe::Fixed => writeln!(out, "    fixed: true\n    se: ~"),
+            OverrideSe::Held(reason) => {
+                writeln!(out, "    se: ~\n    held: {}", reason.as_str())
+            }
+            OverrideSe::Free(Some(se)) => writeln!(out, "    se: {:.6}", se),
+            OverrideSe::Free(None) => writeln!(out, "    se: ~"),
+        };
+    }
+    out
+}
+
 /// A weighted kappa's (#1031) weight source text and, when the dataset gave a
 /// typical weight `n > 0` and the variance is non-negative, `(n, var / n)` —
 /// the variance of a typical arm, from which the weight line's CV% or SD and
@@ -1505,6 +1683,7 @@ pub fn print_results(result: &FitResult) {
     };
     eprintln!("\n--- SIGMA Estimates ({}) ---", err_type);
     eprint!("{}", format_sigma_rows(result));
+    eprint!("{}", format_mixture_override_rows(result));
 
     // IOV (KAPPA) estimates
     if result.omega_iov.is_some() {
@@ -1807,6 +1986,7 @@ pub fn format_summary(result: &FitResult) -> String {
     let _ = writeln!(out, "\n--- SIGMA ({}) ---", err_type);
     // The console's rows verbatim, as OMEGA and KAPPA above.
     out.push_str(&format_sigma_rows(result));
+    out.push_str(&format_mixture_override_rows(result));
 
     // --- Diagnostics ---
     let _ = writeln!(out, "\n--- Diagnostics ---");
@@ -2822,11 +3002,11 @@ fn yaml_quote(s: &str) -> String {
 /// fit recorded them (#1177). A bundle saved before that, or a hand-built
 /// result, falls back to inferring the layout from the size `n` of a
 /// packed-space matrix on the result (its covariance matrix) — the count of
-/// coordinates left after θ and σ — which is a guess: it ignores any trailing
-/// mixture-override / `block_sigma` coordinates, and when `n_eta == n_kappa >
-/// 1` with exactly one of the two a block, both assignments give the same
-/// count and the block is assumed to be Ω. Labels only; nothing that gates a
-/// candidate reads the inferred layout.
+/// coordinates left after θ, σ, the trailing mixture overrides and the
+/// `block_sigma` correlations ([`trailing_packed_count`], #2833) — which is a
+/// guess: when `n_eta == n_kappa > 1` with exactly one of the two a block, both
+/// assignments give the same count and the block is assumed to be Ω. Labels
+/// only; nothing that gates a candidate reads the inferred layout.
 pub(crate) fn packed_layout(result: &FitResult, n: usize) -> (bool, bool) {
     if let Some(od) = result.omega_is_diagonal {
         let kd = result
@@ -2844,7 +3024,7 @@ pub(crate) fn packed_layout(result: &FitResult, n: usize) -> (bool, bool) {
     let n_kappa_diag = n_kappa;
     // `omega_packed_len(0, false) == 0`, so this covers the no-IOV case too.
     let n_kappa_full = crate::estimation::parameterization::omega_packed_len(n_kappa, false);
-    let n_remaining = n.saturating_sub(n_theta + n_sigma);
+    let n_remaining = n.saturating_sub(n_theta + n_sigma + trailing_packed_count(result));
 
     // Try all four diagonal/block combinations; take the first match.
     //
@@ -2869,8 +3049,27 @@ pub(crate) fn packed_layout(result: &FitResult, n: usize) -> (bool, bool) {
         .unwrap_or((n_eta <= 1, n_kappa <= 1))
 }
 
+/// The packed coordinates after Ω_IOV (#2833): one per `[mixture]` override — counted from
+/// its recorded values, else its descriptors — and one per `block_sigma` correlation.
+fn trailing_packed_count(result: &FitResult) -> usize {
+    let n_overrides = result
+        .mixture_overrides
+        .as_ref()
+        .map_or(result.mixture_override_params.len(), Vec::len);
+    n_overrides + result.residual_correlations.len()
+}
+
 /// Build the ordered parameter name list that matches `pack_params` layout:
-/// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
+/// `[theta..., omega_packed..., sigma..., kappa_packed..., mixture overrides...,
+/// block_sigma correlations...]`.
+///
+/// A mixture override is named from [`FitResult::mixture_override_params`] (#2833): an Ω
+/// override packs `ln L_ee` like a base diagonal, so `log_chol_{name}`; a σ override packs
+/// `ln σ` like a base σ, so its bare name (`EPS_MIX2`). A `block_sigma` correlation follows,
+/// as `EPS_A~EPS_B` (the trace's [`crate::estimation::parameterization::coordinate_names`]
+/// spelling). A result that records override values but no descriptors (a hand-built one,
+/// or a bundle written before the field) leaves those rows and every one after them to the
+/// `param_N` padding, since it cannot say which is which.
 ///
 /// For a diagonal omega/kappa each entry is `log_chol_{eta_name}` — the packed
 /// value is `log(L_ii)` where `omega = L Lᵀ` (Cholesky diagonal, log-transformed).
@@ -2922,6 +3121,24 @@ pub(crate) fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
                     ));
                 }
             }
+        }
+    }
+
+    let n_override_values = result.mixture_overrides.as_ref().map_or(0, Vec::len);
+    if result.mixture_override_params.len() == n_override_values {
+        for p in &result.mixture_override_params {
+            match p.kind {
+                ParameterKind::Omega => names.push(format!("log_chol_{}", p.name)),
+                _ => names.push(p.name.clone()),
+            }
+        }
+        for c in &result.residual_correlations {
+            let ni = result.sigma_names.get(c.sigma_i).filter(|s| !s.is_empty());
+            let nj = result.sigma_names.get(c.sigma_j).filter(|s| !s.is_empty());
+            names.push(match (ni, nj) {
+                (Some(a), Some(b)) => format!("{a}~{b}"),
+                _ => format!("SIGMA({},{})", c.sigma_i + 1, c.sigma_j + 1),
+            });
         }
     }
 
@@ -3632,6 +3849,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    write!(f, "{}", mixture_overrides_yaml(result)).map_err(|e| e.to_string())?;
+
     // Importance-sampling marginal log-likelihood section
     if let Some(ref imp) = result.importance_sampling {
         writeln!(f, "\nimportance_sampling:").map_err(|e| e.to_string())?;
@@ -4131,6 +4350,26 @@ pub fn parameter_table(result: &FitResult) -> String {
         ));
     }
 
+    for row in override_rows(result) {
+        let family = match row.param.kind {
+            ParameterKind::Omega => "OMEGA var",
+            _ => "SIGMA SD",
+        };
+        let (se, held) = match row.se {
+            OverrideSe::Free(se) => (se, false),
+            OverrideSe::Held(_) => (None, true),
+            OverrideSe::Fixed => (None, false),
+        };
+        lines.push(parameter_table_row(
+            &row.param.name,
+            row.value,
+            se,
+            row.se == OverrideSe::Fixed,
+            held,
+            &format!("{family} (class {})", row.param.class),
+        ));
+    }
+
     if let Some(iov) = result.omega_iov.as_ref() {
         let kappa_fixed = |i: usize| result.kappa_fixed.get(i).copied().unwrap_or(false);
         for i in 0..iov.nrows() {
@@ -4312,6 +4551,8 @@ mod tests {
             exclusions: None,
             packed_estimate: None,
             mixture_overrides: None,
+            mixture_override_params: Vec::new(),
+            se_mixture_overrides: None,
             left_init: None,
             stationary_start: false,
             omega_is_diagonal: None,
@@ -5834,6 +6075,8 @@ mod tests {
             exclusions: None,
             packed_estimate: None,
             mixture_overrides: None,
+            mixture_override_params: Vec::new(),
+            se_mixture_overrides: None,
             left_init: None,
             stationary_start: false,
             omega_is_diagonal: None,
@@ -9728,3 +9971,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "output_mixture_override_tests.rs"]
+mod mixture_override_tests;

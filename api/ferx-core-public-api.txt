@@ -3492,6 +3492,7 @@ pub ferx_core::types::FitResult::max_unconverged_subjects: u32
 pub ferx_core::types::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::types::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::types::FitResult::method_wall_times_secs: alloc::vec::Vec<f64>
+pub ferx_core::types::FitResult::mixture_override_params: alloc::vec::Vec<ferx_core::MixtureOverrideParam>
 pub ferx_core::types::FitResult::mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::types::FitResult::model_name: alloc::string::String
@@ -3540,6 +3541,7 @@ pub ferx_core::types::FitResult::saem_n_subjects_hmc: core::option::Option<usize
 pub ferx_core::types::FitResult::saem_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::scoring_settings: core::option::Option<ferx_core::ScoringSettings>
 pub ferx_core::types::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::types::FitResult::se_mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::se_omega: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::se_residual_correlations: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::FitResult::se_sigma: core::option::Option<alloc::vec::Vec<f64>>
@@ -3645,6 +3647,13 @@ pub struct ferx_core::types::MixtureMuRef
 pub ferx_core::types::MixtureMuRef::eta_name: alloc::string::String
 pub ferx_core::types::MixtureMuRef::log_transformed: bool
 pub ferx_core::types::MixtureMuRef::theta_names: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub struct ferx_core::types::MixtureOverrideParam
+pub ferx_core::types::MixtureOverrideParam::class: usize
+pub ferx_core::types::MixtureOverrideParam::fixed: bool
+pub ferx_core::types::MixtureOverrideParam::index: usize
+pub ferx_core::types::MixtureOverrideParam::kind: ferx_core::ParameterKind
+pub ferx_core::types::MixtureOverrideParam::name: alloc::string::String
+pub ferx_core::types::MixtureOverrideParam::packed_index: usize
 pub struct ferx_core::types::MixtureParams
 pub ferx_core::types::MixtureParams::omega: alloc::vec::Vec<ferx_core::OmegaMatrix>
 pub ferx_core::types::MixtureParams::omega_override_addr: alloc::vec::Vec<(usize, usize)>
@@ -5156,6 +5165,7 @@ pub ferx_core::FitResult::max_unconverged_subjects: u32
 pub ferx_core::FitResult::method: ferx_core::EstimationMethod
 pub ferx_core::FitResult::method_chain: alloc::vec::Vec<ferx_core::EstimationMethod>
 pub ferx_core::FitResult::method_wall_times_secs: alloc::vec::Vec<f64>
+pub ferx_core::FitResult::mixture_override_params: alloc::vec::Vec<ferx_core::MixtureOverrideParam>
 pub ferx_core::FitResult::mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::model_hash: core::option::Option<alloc::string::String>
 pub ferx_core::FitResult::model_name: alloc::string::String
@@ -5204,6 +5214,7 @@ pub ferx_core::FitResult::saem_n_subjects_hmc: core::option::Option<usize>
 pub ferx_core::FitResult::saem_seed: core::option::Option<u64>
 pub ferx_core::FitResult::scoring_settings: core::option::Option<ferx_core::ScoringSettings>
 pub ferx_core::FitResult::se_kappa: core::option::Option<alloc::vec::Vec<f64>>
+pub ferx_core::FitResult::se_mixture_overrides: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::se_omega: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::se_residual_correlations: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::FitResult::se_sigma: core::option::Option<alloc::vec::Vec<f64>>
@@ -5327,6 +5338,13 @@ pub struct ferx_core::MixtureMuRef
 pub ferx_core::MixtureMuRef::eta_name: alloc::string::String
 pub ferx_core::MixtureMuRef::log_transformed: bool
 pub ferx_core::MixtureMuRef::theta_names: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub struct ferx_core::MixtureOverrideParam
+pub ferx_core::MixtureOverrideParam::class: usize
+pub ferx_core::MixtureOverrideParam::fixed: bool
+pub ferx_core::MixtureOverrideParam::index: usize
+pub ferx_core::MixtureOverrideParam::kind: ferx_core::ParameterKind
+pub ferx_core::MixtureOverrideParam::name: alloc::string::String
+pub ferx_core::MixtureOverrideParam::packed_index: usize
 pub struct ferx_core::MixtureParams
 pub ferx_core::MixtureParams::omega: alloc::vec::Vec<ferx_core::OmegaMatrix>
 pub ferx_core::MixtureParams::omega_override_addr: alloc::vec::Vec<(usize, usize)>

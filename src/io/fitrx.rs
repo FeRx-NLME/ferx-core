@@ -405,6 +405,19 @@ struct FitWire {
         with = "crate::io::serde_nan::opt_vec"
     )]
     mixture_overrides: Option<Vec<f64>>,
+    /// One descriptor per `mixture_overrides` entry (#2833): name, family, base index,
+    /// class, packed row, FIX state. Absent for a fit with no override and in a bundle
+    /// written before the field, which then loads empty (rows go unlabelled, nothing
+    /// else reads it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mixture_override_params: Vec<crate::types::MixtureOverrideParam>,
+    /// Standard errors parallel to `mixture_overrides` (#2833), on its scales.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_vec"
+    )]
+    se_mixture_overrides: Option<Vec<f64>>,
     /// The variational-inference result (#2058), in the layout of the YAML
     /// writer's `vi:` section. Absent for every other method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1845,6 +1858,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         iov_occasion: r.iov_occasion.clone(),
         packed_estimate: r.packed_estimate.clone(),
         mixture_overrides: r.mixture_overrides.clone(),
+        mixture_override_params: r.mixture_override_params.clone(),
+        se_mixture_overrides: r.se_mixture_overrides.clone(),
         vi: r.vi.as_ref().map(|v| ViWire::from_result(v, r)),
     }
 }
@@ -3603,6 +3618,24 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
             ));
         }
     }
+    // #2833: the override descriptors and SEs are each absent or parallel to the values.
+    let n_overrides = w.mixture_overrides.as_ref().map_or(0, Vec::len);
+    if !w.mixture_override_params.is_empty() && w.mixture_override_params.len() != n_overrides {
+        return bail(format!(
+            "mixture_override_params ({}) does not match mixture_overrides ({})",
+            w.mixture_override_params.len(),
+            n_overrides
+        ));
+    }
+    if let Some(se) = &w.se_mixture_overrides {
+        if se.len() != n_overrides {
+            return bail(format!(
+                "se_mixture_overrides ({}) does not match mixture_overrides ({})",
+                se.len(),
+                n_overrides
+            ));
+        }
+    }
     // `cov_fixed` is empty or parallel to the covariance matrix.
     let cov_dim = w.covariance_matrix.as_ref().map(|m| m.rows);
     if !w.cov_fixed.is_empty() && cov_dim != Some(w.cov_fixed.len()) {
@@ -3979,6 +4012,8 @@ fn wire_to_fit_result(
         // consumers validate it against the estimates above before reusing it.
         packed_estimate: w.packed_estimate,
         mixture_overrides: w.mixture_overrides,
+        mixture_override_params: w.mixture_override_params,
+        se_mixture_overrides: w.se_mixture_overrides,
         left_init: w.left_init,
         stationary_start: w.stationary_start,
         omega_is_diagonal: w.omega_is_diagonal,
@@ -6217,6 +6252,91 @@ mod tests {
         );
         let old: FitWire = serde_json::from_value(value).unwrap();
         assert!(old.mixture_overrides.is_none());
+    }
+
+    /// #2833 T5: the override descriptors and SEs round-trip; a bundle without them (what
+    /// one written before #2833 is) loads empty / `None`; a descriptor list or SE vector
+    /// that is not parallel to `mixture_overrides` is refused.
+    ///
+    /// Mutations — drop either wire field (write or read): the round-trip `assert_eq!`
+    /// dies; drop `serde(default)`: the old bundle fails to load; drop either length check:
+    /// the mismatched bundle loads.
+    #[test]
+    fn roundtrip_mixture_override_params_and_se() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.mixture_overrides = Some(vec![0.3, 0.7]);
+        r.mixture_override_params = vec![
+            crate::types::MixtureOverrideParam {
+                name: "eta_CL_MIX2".into(),
+                kind: crate::types::ParameterKind::Omega,
+                index: 0,
+                class: 2,
+                packed_index: 6,
+                fixed: false,
+            },
+            crate::types::MixtureOverrideParam {
+                name: "prop_MIX3".into(),
+                kind: crate::types::ParameterKind::Sigma,
+                index: 0,
+                class: 3,
+                packed_index: 7,
+                fixed: true,
+            },
+        ];
+        r.se_mixture_overrides = Some(vec![0.064_975_8, 0.0]);
+        let path = saved(&dir, &r);
+        let back = load_fit(&path).unwrap().fit;
+        assert_eq!(back.mixture_override_params, r.mixture_override_params);
+        assert_eq!(back.se_mixture_overrides, r.se_mixture_overrides);
+
+        // Written only when set.
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        for key in ["mixture_override_params", "se_mixture_overrides"] {
+            assert!(plain.get(key).is_none(), "{key}: written when absent");
+        }
+
+        // A bundle from before #2833: both keys gone, loads with the values alone.
+        let old = dir.path().join("old.fitrx");
+        rewrite_bundle(&path, &old, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, |f| {
+                    let o = f.as_object_mut().unwrap();
+                    assert!(o.remove("mixture_override_params").is_some());
+                    assert!(o.remove("se_mixture_overrides").is_some());
+                })
+            } else {
+                body
+            })
+        });
+        let loaded = load_fit(&old).unwrap().fit;
+        assert!(loaded.mixture_override_params.is_empty());
+        assert!(loaded.se_mixture_overrides.is_none());
+        assert_eq!(loaded.mixture_overrides, r.mixture_overrides);
+
+        // Not parallel to the values: refused, each with its own message.
+        for (key, short, msg) in [
+            (
+                "mixture_override_params",
+                serde_json::json!([serde_json::to_value(&r.mixture_override_params[0]).unwrap()]),
+                "mixture_override_params (1) does not match mixture_overrides (2)",
+            ),
+            (
+                "se_mixture_overrides",
+                serde_json::json!([0.1, 0.2, 0.3]),
+                "se_mixture_overrides (3) does not match mixture_overrides (2)",
+            ),
+        ] {
+            let edited = dir.path().join(format!("{key}.fitrx"));
+            rewrite_bundle(&path, &edited, |name, body| {
+                Some(if name == "fit.json" {
+                    edit_json(body, |f| f[key] = short.clone())
+                } else {
+                    body
+                })
+            });
+            assert_eq!(load_corrupt(load_fit(&edited)), msg);
+        }
     }
 
     /// #1685 T4, probe D (re-measured at `045ca1b2`: `load_fit` returned 30 subjects

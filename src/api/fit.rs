@@ -2723,6 +2723,8 @@ fn fit_inner(
         extract_standard_errors(&result.covariance_matrix, &result.params);
     let se_residual_correlations =
         extract_residual_correlation_se(&result.covariance_matrix, &result.params);
+    let se_mixture_overrides =
+        crate::api::extract_mixture_override_se(&result.covariance_matrix, &result.params);
 
     // Optional SIR step
     let mut warnings = result.warnings;
@@ -3340,6 +3342,12 @@ fn fit_inner(
             .mixture
             .as_ref()
             .and_then(crate::estimation::parameterization::mixture_override_values),
+        // Each override's name, class, packed row and FIX state, so a renderer can label it
+        // (#2833).
+        mixture_override_params: crate::estimation::parameterization::mixture_override_params(
+            &result.params,
+        ),
+        se_mixture_overrides,
         left_init: result.left_init,
         stationary_start: result.stationary_start,
         omega_is_diagonal: Some(result.params.omega.diagonal),
