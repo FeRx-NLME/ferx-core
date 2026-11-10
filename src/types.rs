@@ -9617,6 +9617,13 @@ pub struct FitOptions {
     /// model whose every objective evaluation is seconds). The fit is otherwise
     /// bit-identical either way — nothing downstream reads `final_gradient`.
     pub report_final_gradient: bool,
+    /// Read by nothing. It was never a `[fit_options]` key, and no optimizer takes its
+    /// L-BFGS history length from it. The field goes at the next minor release, with
+    /// `gn_lambda` (#1841).
+    #[deprecated(
+        since = "0.4.1",
+        note = "never read; removed at the next minor release (#1841)"
+    )]
     pub lbfgs_memory: usize,
     /// Run a gradient-free global pre-search (NLopt GN_CRS2_LM) before local optimization.
     pub global_search: bool,
@@ -10492,6 +10499,7 @@ impl Default for FitOptions {
             optimizer: Optimizer::Auto,
             inner_optimizer: InnerOptimizer::Auto,
             report_final_gradient: true,
+            #[allow(deprecated)] // removed with the field at the next minor (#1841)
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
