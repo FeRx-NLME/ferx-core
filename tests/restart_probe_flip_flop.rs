@@ -20,9 +20,14 @@
 //! branch and the ODE twin (`flip_flop_pop_ode.ferx`) through the plateau branch, so between
 //! them they cover both acceptance rules that read the displacement.
 //!
-//! Full fits, but cheap ones: the two converged fits take 0.8 s together in the `ci-test`
-//! profile, so they run on every PR like `tests/ebe_basin_shift.rs`'s restart fits. Numbers
-//! measured on Linux x86_64.
+//! The two converged fits are Tier 3 and gated with `slow-tests`. They take 0.8 s together in
+//! a local release build, but 15 s (closed form) and 81 s (ODE twin) in `Tests + coverage
+//! (core)`'s instrumented `ci-cov` profile (PR #2821, run 42619572756), so the local figure
+//! is not the cost a PR pays. What stays per-PR: the budget test below, which reaches the
+//! probe and its restart chain through `restart_leg` on every PR, and the Tier-1 tests in
+//! `outer_optimizer_tests.rs` for the gate (`start_probe_due`) and the verdict
+//! (`settle_restart_probe`, the provenance wording). Numbers measured on Linux x86_64 (CI)
+//! and macOS arm64, which agree at every bound below.
 
 use ferx_core::parser::model_parser::parse_full_model;
 use ferx_core::types::{FitResult, WarningCode};
@@ -109,15 +114,18 @@ fn assert_restart_reported_converged(model: &str, cold_ofv: f64) {
         (result.ofv - OPTIMUM).abs(),
         result.n_iterations
     );
-    // The leg, not a digit string. Realised |Δ| 0 on both fixtures (the notice prints 6
-    // decimals); the probe's own restarts quote −3047.53 and −3050.98, at least 0.3 away.
+    // The leg, not a digit string. Realised |Δ| 0 on both fixtures on Linux x86_64 and macOS
+    // arm64 (the notice prints 6 decimals; the trapped first leg runs before any restart, so
+    // the platforms' choice of the winning point cannot reach it); the probe's own restarts
+    // quote −3047.53 and −3050.98, at least 0.3 away.
     assert!(
         cold.is_finite() && (cold - cold_ofv).abs() < 1e-3,
         "{model}: the notice names the fit's trapped leg (cold ≈ {cold_ofv}), not a probe \
          leg (≈ −3047.53 / −3050.98): {}",
         notices[0]
     );
-    // Realised 3.44e-7 (ODE twin) and 3.57e-7 (closed form); the bound has ~28× headroom.
+    // Realised 3.44e-7 (ODE twin) and 3.57e-7 (closed form) on Linux x86_64, 4.68e-7 and
+    // 2.98e-7 on macOS arm64; the bound has 21× headroom over the worst.
     // `main` ends at the same OFV, so this pins that the verification moved no estimate
     // materially, not that it found a better one.
     assert!(
@@ -147,11 +155,19 @@ fn assert_restart_reported_converged(model: &str, cold_ofv: f64) {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn a_verified_basin_shift_restart_is_converged_closed_form() {
     assert_restart_reported_converged(CLOSED_FORM, -3051.324118);
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn a_verified_basin_shift_restart_is_converged_ode_twin() {
     assert_restart_reported_converged(ODE_TWIN, -3051.295773);
 }
@@ -184,11 +200,17 @@ fn the_restart_probe_spends_only_what_is_left_of_the_fits_budget() {
         "MEASURE #2707 budget {budget}: {} evaluations, converged {}",
         result.n_iterations, result.converged
     );
-    // The straddle: the fit must have reached the probe, which starts after the fit's own
-    // 87 evaluations, or the bound below is met without one.
+    // The straddle: the fit must have reached the probe and been cut by the budget. Its own
+    // legs end at 87 evaluations, so a fit without the probe stops far below the budget, and
+    // reaching it can only be the probe's legs spending what was left. Realised 160 with
+    // `converged: false` on Linux x86_64 and macOS arm64.
     assert!(
-        result.n_iterations > 100,
-        "the probe ran ({} evaluations)",
+        !result.converged,
+        "the probe was cut by the budget, so the fit is not converged"
+    );
+    assert!(
+        result.n_iterations >= budget,
+        "the probe spent what was left of the budget ({} evaluations, budget {budget})",
         result.n_iterations
     );
     // L-BFGS checks `maxeval` only between line searches, so a run can end a few

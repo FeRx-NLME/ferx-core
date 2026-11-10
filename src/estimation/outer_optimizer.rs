@@ -4381,6 +4381,13 @@ fn perturbed_start(x: &[f64], fixed: &[bool], lower: &[f64], upper: &[f64]) -> O
 /// attempt, not by the attempt itself.
 type StartProbe<'a> = dyn Fn(&ModelParameters, f64, usize) + 'a;
 
+/// Whose chain a restart leg is on (#2707): the fit's, which is handed the start probe and
+/// announces its restart, or a start probe's own, which neither probes nor announces.
+enum RestartLegOwner<'a> {
+    Fit(&'a StartProbe<'a>),
+    Probe { spent_before: usize },
+}
+
 /// When an NLopt attempt hands its unmoved start to the #2506 [`StartProbe`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ProbeWhen {
@@ -5564,19 +5571,20 @@ pub(crate) fn optimize_nlopt(
     let probed: std::cell::RefCell<Option<ProbedAttempt>> = std::cell::RefCell::new(None);
     // One #1277 / #1565 restart leg, from `stalled`'s estimates: run, settled against its
     // start probe when it was handed one (#2707), with the legs' evaluations summed and the
-    // restart's warning pushed. `spent_before` is what was spent before `stalled` began and
-    // its own `n_iterations` does not count: 0 on the fit's chain, whose every leg already
-    // counts the ones before it; on a probe's own chain, what was spent before the probe.
-    // `probe` is `None` on a probe's own legs, so a probe never probes. `announce` pushes the
-    // restart's warning; a probe's own legs do not, since a verified probe's warnings are
-    // reported as the fit's (`verified_start_result`), and a notice that a run the user never
-    // asked for "was resumed" — with that run's evaluation counts — describes nothing they
-    // fitted.
-    let restart_leg = |stalled: &OuterResult,
-                       cause: RestartCause,
-                       spent_before: usize,
-                       probe: Option<&StartProbe>,
-                       announce: bool| {
+    // restart's warning pushed. `owner` says whose chain the leg is on. The fit's own leg is
+    // handed the probe and announces its restart. A probe's own leg never probes, and does
+    // not announce: a verified probe's warnings are reported as the fit's
+    // (`verified_start_result`), and a notice that a run the user never asked for "was
+    // resumed" — with that run's evaluation counts — describes nothing they fitted. Its
+    // `spent_before` is what was spent before the probe began, which `stalled`'s own
+    // `n_iterations` does not count; on the fit's chain every leg already counts the ones
+    // before it.
+    let restart_leg = |stalled: &OuterResult, cause: RestartCause, owner: RestartLegOwner| {
+        let (spent_before, probe) = match owner {
+            RestartLegOwner::Fit(probe) => (0, Some(probe)),
+            RestartLegOwner::Probe { spent_before } => (spent_before, None),
+        };
+        let announce = probe.is_some();
         // `escape_from = init_params`, not the point this leg starts at. The
         // restart begins at the stalled estimates, so measuring the published
         // escape verdict against *its own* start would report a fit that
@@ -5672,7 +5680,15 @@ pub(crate) fn optimize_nlopt(
                     options.verbose,
                     crate::cancel::is_cancelled(&options.cancel),
                     (result, outcome.restart_cause()),
-                    |stalled, cause| restart_leg(stalled, cause, spent_evals, None, false),
+                    |stalled, cause| {
+                        restart_leg(
+                            stalled,
+                            cause,
+                            RestartLegOwner::Probe {
+                                spent_before: spent_evals,
+                            },
+                        )
+                    },
                     penalized,
                 );
                 (finished, None)
@@ -5716,7 +5732,7 @@ pub(crate) fn optimize_nlopt(
         options.verbose,
         crate::cancel::is_cancelled(&options.cancel),
         (first, restart_cause),
-        |stalled, cause| restart_leg(stalled, cause, 0, Some(&restart_probe), true),
+        |stalled, cause| restart_leg(stalled, cause, RestartLegOwner::Fit(&restart_probe)),
         &penalized,
     );
     // The covariance step, once, on the attempt reported, at the exact packed vector it
