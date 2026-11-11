@@ -3490,6 +3490,72 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
     assert!(w.contains("used fixed-EBE outer gradients"), "{w}");
 }
 
+/// #2713: a FOCEI gradient declined at its mode system says so. Off the mode, on a grid
+/// point where the exact `H` is indefinite (`laplace_serves_the_prior_precision_anchor_fallback`'s
+/// search), `mode_solve` declines and the pass sets `mode_system_declined`, with the mode
+/// response asked for too. The straddle: at the EBE the same subject is served, and the
+/// flag left on the reused `ModeOut` is cleared. Mutations that redden it: dropping the
+/// flag in `run`, or not resetting it at the start of a pass.
+#[test]
+fn a_mode_system_decline_is_named() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &one.default_params;
+    let x = pack_params(params);
+    let pt = PackedPoint::new(params, &x).expect("packed point");
+    let grid = [-2.5, -1.5, -0.75, 0.75, 1.5, 2.5];
+    let mut points = Vec::new();
+    for &a in &grid {
+        for &b in &grid {
+            for &c in &grid {
+                points.push([a, b, c]);
+            }
+        }
+    }
+    let eta = points
+        .into_iter()
+        .find(|e| {
+            exact_inner_hessian(&one, &s, params, e)
+                .expect("recorded")
+                .cholesky()
+                .is_none()
+        })
+        .expect("a point where the exact H is indefinite");
+    let ebe = find_ebe(&one, &s, params, 500, 1e-11, None, None, 0).eta;
+    for want_dx in [false, true] {
+        let mut out = ModeOut {
+            want_dx,
+            ..ModeOut::default()
+        };
+        let g =
+            subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
+        assert!(
+            g.is_none() && out.mode_system_declined,
+            "want_dx = {want_dx}: off the mode, H indefinite must decline at the mode system"
+        );
+        let g = subject_adjoint_gradient_and_mode_at(
+            &one,
+            &s,
+            &pt,
+            ebe.as_slice(),
+            Objective::Focei,
+            &mut out,
+        );
+        assert!(
+            g.is_some() && !out.mode_system_declined,
+            "want_dx = {want_dx}: the EBE is served, and the reused flag is cleared"
+        );
+    }
+}
+
 #[test]
 fn laplace_kernel_is_the_production_objective() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();

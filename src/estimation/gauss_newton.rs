@@ -609,14 +609,14 @@ pub fn run_foce_gn(
             non_stationary_optimum,
         } = out;
         warnings.extend(cov_warnings);
-        // #2785: the LM stop rule is a small step, which a stall satisfies too.
+        // #2785: the GN stop rule is a small step, which a stall satisfies too.
         crate::estimation::covariance::demote_non_stationary_optimum(
             non_stationary_optimum,
             &mut converged,
             &mut warnings,
         );
 
-        // #1303: `converged` here is the LM loop's own stop rule (a small
+        // #1303: `converged` here is the GN loop's own stop rule (a small
         // parameter/objective step), which a run whose objective went `NaN`
         // partway can still satisfy. Gate it on the objective this result
         // publishes.

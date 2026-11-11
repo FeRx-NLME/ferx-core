@@ -197,9 +197,14 @@ jobs:
         # Every core shard sets FERX_REQUIRE_EXTERNAL_DATA=1, so a failed fetch still
         # turns the run red, through the anchor's own panic, which names the cause.
         #
-        # Time (#1938, #2818). The script's own budget is `--deadline-seconds 720`
-        # (12 min) across all attempts and backoffs, and before every read the socket
-        # timeout is re-capped at the time left, so a trickling, stalling or silent
+        # Time (#1938, #2818, #2824). The script's own budget is `--deadline-seconds 720`
+        # (12 min) across all attempts and backoffs. The attempts spread over it (waits
+        # doubling from 15 s to a 120 s cap: with fast failures, starts at 0, 15, 45, …
+        # 465, 540 s), so a few-minute outage is waited out, and none starts in the last
+        # 180 s, which are kept for one full download (the slowest measured took 174 s,
+        # run 42608366633). The response
+        # headers are waited for only until the deadline, and before every body read the
+        # socket timeout is re-capped at the time left, so a trickling, stalling or silent
         # server ends there and the script prints which attempt failed how. Should that
         # re-cap ever be unavailable, the worst case is the deadline plus one
         # `--timeout 120`: 840 s, still inside the 15-min (900 s) step cap, which is the

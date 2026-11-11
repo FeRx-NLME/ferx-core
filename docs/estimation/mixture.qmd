@@ -84,7 +84,10 @@ honoured. The exception is a start whose classes are indistinguishable (the same
 probability and the same objective under every class), where no gradient optimizer can
 separate them. `auto` runs BOBYQA there and warns `W_MIXTURE_SYMMETRIC_START`; see
 [mixture models](optimizers.qmd#auto-mixture) on the optimizers page, which has the
-measurements. Give the classes different initial values.
+measurements. Give the classes different initial values. The check is exact, so classes
+that start only close to each other are fitted with L-BFGS without a warning; if a fit
+ends with two nearly merged classes, refit from different class starts or set
+`optimizer = bobyqa`.
 
 ## Output
 
@@ -155,6 +158,40 @@ usual 10–25 % between the two estimators):
 All four agree to **< 1 %**. The `p(1)` row compares NONMEM's direct
 $P(1)=\theta_4$ SE to ferx's logit-scale SE mapped through
 $\operatorname{SE}(p) = p(1-p)\operatorname{SE}(\text{logit})$.
+
+#### Per-class overrides
+
+An `omega(k)` / `sigma(k)` override is an estimated coordinate like any other, and
+since #2833 it is reported with its estimate, SE and %RSE in the console, the fit
+YAML's `mixture_overrides:` section and `parameter_table`, named `<base>_MIX<k>`
+(see [Mixture per-class overrides](../output.qmd#mixture-overrides)). Each override
+packs the log of its class SD, so its SE is put on the reported scale by the delta
+method: $\operatorname{SE}(\omega^2_k) = 2\,\omega^2_k\,\operatorname{SE}(\ln \omega_k)$
+for an Ω override (exact because an Ω override is accepted on a diagonal base only)
+and $\operatorname{SE}(\sigma_k) = \sigma_k\,\operatorname{SE}(\ln \sigma_k)$ for a σ
+override.
+
+Cross-checked against NONMEM at ferx's FOCEI estimate on a 2-class, 80-subject
+population with both overrides interior (`nonmem_anchor/mix_override_se.ctl`: each
+override is a second `ETA` / `EPS` used only for `MIXNUM.EQ.2`, `$EST MAXEVAL=0`,
+`$COV MATRIX=R SIGL=8`). OFVs agree to 9e-8; NONMEM's σ SEs are converted from the
+variance by $\operatorname{SE}(\sigma^2)/2\sigma$:
+
+| SE | NONMEM (`SIGL=8`) | ferx (analytic R) | relative gap |
+|---|---|---|---|
+| `TVCL1` | 0.0536804 | 0.0536807 | 6.2e-6 |
+| `TVCL2` | 0.246881 | 0.246863 | 7.2e-5 |
+| `TVV` | 0.0772119 | 0.0772116 | 4.2e-6 |
+| `MIXL` | 0.263654 | 0.263651 | 9.8e-6 |
+| `ETA_CL` | 0.0168770 | 0.0168769 | 1.1e-6 |
+| `EPS` | 0.00583841 | 0.00583828 | 2.2e-5 |
+| **`ETA_CL_MIX2`** | 0.0649761 | 0.0649758 | 3.8e-6 |
+| **`EPS_MIX2`** | 0.0106680 | 0.0106675 | 4.1e-5 |
+
+`SIGL=8` matters here. At `SIGL=12` NONMEM's own finite-difference step moves
+`TVCL2` by 1 % and `EPS_MIX2` by 0.66 %, at `SIGL=14` `TVCL2` by 9 %, while ferx's
+analytic and finite-difference R agree with each other and with `SIGL=8`.
+`tests/mixture_override_se_nonmem_anchor.rs` pins each SE against its own bound.
 
 #### The `s` and `rsr` estimators
 
@@ -348,9 +385,10 @@ from the K-fold mixture marginal at the SAEM optimum, exactly as for FOCEI.
 Per-class **σ** overrides (`sigma(k)`) are the one piece not yet re-estimated
 under SAEM — they are held at their initial values (with a warning), and every
 class-`k` subject is *scored* under that held σ, so the free base σ is estimated
-only from the classes that actually share it. Being held, the overrides report a
-standard error of 0, as `FIX`ed parameters do; route the model to FOCEI if they
-must be fit. HMC and the conditional-distribution pass are disabled for a mixture
+only from the classes that actually share it. Being held, the overrides are reported
+as fixed, as `FIX`ed parameters are: `[FIX]` with SE `---` in the console and the
+parameter table, `fixed: true` in the YAML (#2833). Route the model to FOCEI if
+they must be fit. HMC and the conditional-distribution pass are disabled for a mixture
 (they are class-unaware); the MH E-step is used.
 
 Two further SAEM-specific rules follow from the separated M-step:

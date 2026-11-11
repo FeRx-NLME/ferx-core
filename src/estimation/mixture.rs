@@ -2243,7 +2243,7 @@ mod tests {
         assert!(
             res.warnings
                 .iter()
-                .any(|w| w.contains("BOBYQA") && w.contains("Bfgs")),
+                .any(|w| w.contains("BOBYQA") && w.contains("`bfgs`")),
             "expected an optimizer-downgrade warning, got {:?}",
             res.warnings
         );
@@ -2267,6 +2267,148 @@ mod tests {
             "auto optimizer must not emit a downgrade warning, got {:?}",
             res.warnings
         );
+    }
+
+    #[test]
+    fn mixture_explicit_bobyqa_does_not_warn() {
+        // #2852: an explicit `optimizer = bobyqa` is the optimizer the mixture path
+        // runs, so the fit must not claim the choice "was replaced by BOBYQA".
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            optimizer: crate::types::Optimizer::Bobyqa,
+            outer_maxiter: 2,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("explicit-bobyqa mixture fit should return Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("does not carry the mixture objective")),
+            "explicit bobyqa runs as requested and must not warn, got {:?}",
+            res.warnings
+        );
+    }
+
+    /// What `resolve_outer_optimizer` owes one requested optimizer on a mixture model.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum OnMixture {
+        /// Runs as requested, no warning.
+        Honoured,
+        /// `auto`: follows the non-mixture rule (#2739), silently — L-BFGS on the
+        /// analytic outer gradient, BOBYQA on finite differences.
+        SilentAuto,
+        /// Runs BOBYQA and says so, naming the requested optimizer as the user spells it
+        /// in a model file (`Optimizer::label`), written out here so the test does not
+        /// borrow the spelling from the code under test.
+        Replaced(&'static str),
+    }
+
+    /// The warning's whole input space on the optimizer axis (#2852). Exhaustive on
+    /// purpose, with no wildcard: a new `Optimizer` variant does not compile until it
+    /// has a row here, and then belongs in `ALL_OPTIMIZERS` below.
+    fn on_mixture(requested: crate::types::Optimizer) -> OnMixture {
+        use crate::types::Optimizer;
+        match requested {
+            Optimizer::Auto => OnMixture::SilentAuto,
+            Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
+                OnMixture::Honoured
+            }
+            Optimizer::Bfgs => OnMixture::Replaced("bfgs"),
+            Optimizer::Lbfgs => OnMixture::Replaced("lbfgs"),
+            Optimizer::TrustRegion => OnMixture::Replaced("trust_region"),
+        }
+    }
+
+    #[test]
+    fn mixture_replacement_warning_covers_every_optimizer() {
+        use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+        use crate::types::Optimizer;
+        const ALL_OPTIMIZERS: [Optimizer; 8] = [
+            Optimizer::Auto,
+            Optimizer::Bfgs,
+            Optimizer::Lbfgs,
+            Optimizer::Slsqp,
+            Optimizer::NloptLbfgs,
+            Optimizer::Mma,
+            Optimizer::Bobyqa,
+            Optimizer::TrustRegion,
+        ];
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        for requested in ALL_OPTIMIZERS {
+            // The analytic flag is read only by the `auto` rule, which a mixture now
+            // follows too (#2739); neither value may change what an explicit choice
+            // runs or whether a warning is owed.
+            for analytic in [true, false] {
+                let (resolved, warning) =
+                    resolve_outer_optimizer(requested, &model, true, analytic);
+                match on_mixture(requested) {
+                    OnMixture::Honoured => {
+                        assert_eq!(resolved, requested, "{requested:?} runs as requested");
+                        assert_eq!(warning, None, "{requested:?} is honoured: no warning");
+                    }
+                    OnMixture::SilentAuto => {
+                        // Spelled out rather than read off `resolve_auto_given_analytic`,
+                        // so the row does not borrow its answer from the code under test.
+                        let want = if analytic {
+                            Optimizer::NloptLbfgs
+                        } else {
+                            Optimizer::Bobyqa
+                        };
+                        assert_eq!(resolved, want, "auto on a mixture, analytic = {analytic}");
+                        assert_eq!(warning, None, "auto resolves silently");
+                    }
+                    OnMixture::Replaced(name) => {
+                        assert_eq!(resolved, Optimizer::Bobyqa, "{requested:?} runs BOBYQA");
+                        let w = warning
+                            .unwrap_or_else(|| panic!("{requested:?} on a mixture must warn"));
+                        assert!(
+                            w.contains("does not carry the mixture objective")
+                                && w.contains("was replaced by BOBYQA"),
+                            "{requested:?}: {w}"
+                        );
+                        // The advice half: what the user can pick instead.
+                        assert!(
+                            w.starts_with(
+                                "Mixture models are optimized with BOBYQA or an NLopt gradient \
+                                 method (SLSQP / L-BFGS / MMA);"
+                            ),
+                            "{requested:?}: message must say what a mixture can run: {w}"
+                        );
+                        // The discriminator and its negatives: the message names the
+                        // optimizer that was asked for, in option spelling; never the
+                        // one that ran ("the requested `bobyqa` optimizer ... was
+                        // replaced by BOBYQA"); and never a Rust `Debug` name such as
+                        // `TrustRegion`, which no model file contains.
+                        assert!(
+                            w.contains(&format!("the requested `{name}` optimizer")),
+                            "{requested:?}: message must name {name}: {w}"
+                        );
+                        assert!(!w.contains("`bobyqa`"), "{requested:?}: {w}");
+                        assert!(
+                            !w.contains(&format!("{requested:?}")) && !w.contains("Bobyqa"),
+                            "{requested:?}: no Debug spelling in a user-facing message: {w}"
+                        );
+                    }
+                }
+
+                // Without a mixture nothing is ever replaced: no warning for any
+                // optimizer, and an explicit choice is returned unchanged.
+                let (resolved, warning) =
+                    resolve_outer_optimizer(requested, &model, false, analytic);
+                assert_eq!(warning, None, "{requested:?} without a mixture: no warning");
+                if requested == Optimizer::Auto {
+                    assert_ne!(
+                        resolved,
+                        Optimizer::Auto,
+                        "auto resolves to a concrete optimizer"
+                    );
+                } else {
+                    assert_eq!(resolved, requested, "{requested:?} without a mixture");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2775,6 +2917,51 @@ mod indistinguishable_tests {
             "else TVCL2 * exp(ETA_CL)",
             "else TVCL2 * exp(2 * ETA_CL)",
         )));
+    }
+
+    /// The scan reads every subject. `tests/nonmem/mixture_iv.csv` has subjects 1–15 at WT 60
+    /// and 16–30 at WT 90, and class 2's clearance is scaled by `WT / ref`, which is exactly
+    /// 1.0 for the subjects at `ref`, so the classes are bit-identical on those and apart on the
+    /// rest. A check that stops after the first subject calls the first start symmetric, and one
+    /// that reads only the last calls the second symmetric. Both must come back `false`, and the
+    /// all-symmetric control (`WT / ref` is 1.0 for every subject) must stay `true`.
+    #[test]
+    fn a_subject_anywhere_in_the_data_that_separates_the_classes_is_found() {
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("tests/nonmem/mixture_iv.csv"),
+            Some(&["WT"]),
+            None,
+        )
+        .expect("data loads");
+        let wt = |i: usize| pop.subjects[i].covariates["WT"];
+        assert_eq!(wt(0), 60.0, "the first subject is at WT 60");
+        assert_eq!(
+            wt(pop.subjects.len() - 1),
+            90.0,
+            "the last subject is at WT 90"
+        );
+        let scaled = |reference: &str| {
+            edit(
+                "else TVCL2 * exp(ETA_CL)",
+                &format!("else TVCL2 * exp(ETA_CL) * (WT / {reference})"),
+            )
+        };
+        let judge = |src: &str| {
+            let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+            classes_indistinguishable(&model, &pop, &model.default_params)
+        };
+        assert!(
+            !judge(&scaled("60.0")),
+            "subjects 16–30 separate the classes; the symmetric first subject must not decide"
+        );
+        assert!(
+            !judge(&scaled("90.0")),
+            "subjects 1–15 separate the classes; the symmetric last subject must not decide"
+        );
+        assert!(
+            judge(&scaled("WT")),
+            "WT / WT is 1.0 for every subject: nothing separates the classes"
+        );
     }
 
     /// A three-class start where two classes are identical and the third differs. The identical

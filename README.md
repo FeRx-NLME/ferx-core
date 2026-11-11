@@ -94,7 +94,7 @@ Set via `method` in `[fit_options]`:
 |--------|-------------|
 | `foce` | First-Order Conditional Estimation |
 | `focei` | FOCE with Interaction (default) |
-| `gn` | Gauss-Newton (BHHH) with Levenberg-Marquardt damping |
+| `gn` | Gauss-Newton (BHHH) with a trust region |
 | `gn_hybrid` | Gauss-Newton followed by FOCEI polish |
 | `saem` | Stochastic Approximation EM |
 | `imp` | Importance Sampling (typically chained after another method for OFV evaluation) |

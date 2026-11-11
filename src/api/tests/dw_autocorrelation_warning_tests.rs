@@ -272,6 +272,10 @@ const ACCOUNTED: &[(&str, &str)] = &[
         "increase maxiter for a tighter fit.",
     ),
     ("Outer optimization did not converge", "did not converge"),
+    (
+        "The outer optimizer stopped without converging (#2713).",
+        "such as `if`, `abs` or `max`.",
+    ),
     ("threads configured", "(no speed benefit beyond n_subjects)"),
     (
         "Stochastic differential equations ([diffusion]",
@@ -342,8 +346,17 @@ fn assert_fit_pushes_only_the_helpers_message_on(
         result.dw_statistic
     );
 
-    let expected = dw_autocorrelation_warning(result.dw_statistic, &dw_advice(model, &opts))
-        .expect("a DW below 1.5 must produce a message");
+    let mut notes = Vec::new();
+    let prepared = fitted_population(
+        model,
+        &opts.iov_occasion,
+        opts.iov_column.is_some(),
+        std::borrow::Cow::Borrowed(pop),
+        &mut notes,
+    );
+    let expected =
+        dw_autocorrelation_warning(result.dw_statistic, &dw_advice(model, &opts, &prepared))
+            .expect("a DW below 1.5 must produce a message");
 
     let accounted = |w: &str| {
         w == expected
@@ -486,12 +499,16 @@ fn fit_pushes_the_compartment_free_message_for_an_algebraic_model() {
 /// The grouping reaches the pushed message through the **fit's** options: the
 /// same line model with `iov_column = OCC` in `[fit_options]`, fitted under the
 /// parsed options, pushes `by OCC` (#2815 review round 1, row 2). `dw_advice`
-/// takes `options` because the occasion rule a fit runs under is the caller's
+/// takes `options` because the column a fit groups by is the caller's
 /// (#1783); every other test calls it directly, and the end-to-end fixture above
 /// declares no grouping, so its advice is the same whatever options reach it.
 ///
-/// Mutation that must redden this: `dw_advice(model, &FitOptions::default())` at
-/// the call site in `fit_inner`.
+/// Each subject is two **parallel** occasions (two parabolas, the clock restarting
+/// at the second), since the advice names the column only where the statistic
+/// split at it (#2829).
+///
+/// Mutation that must redden this: `dw_advice(model, &FitOptions::default(), ..)`
+/// at the call site in `fit_inner`.
 #[test]
 fn fit_pushes_the_grouping_its_options_carry() {
     let parsed = crate::parser::model_parser::parse_full_model(
@@ -512,7 +529,15 @@ fn fit_pushes_the_grouping_its_options_carry() {
         parabola_subject("3", 7.0),
     ];
     for s in &mut subjects {
-        s.covariates.insert("OCC".into(), 1.0);
+        let n = s.obs_times.len();
+        s.obs_times = [s.obs_times.clone(), s.obs_times.clone()].concat();
+        let second: Vec<f64> = s.observations.iter().map(|y| y + 3.0).collect();
+        s.observations.extend(second);
+        s.obs_cmts = vec![1; 2 * n];
+        s.cens = vec![0; 2 * n];
+        // What the reader writes for `iov_column = OCC`.
+        s.occasions = [vec![1; n], vec![2; n]].concat();
+        assert!(!crate::stats::residual_error::occasions_run_in_time(s));
     }
     let mut pop = population(subjects);
     pop.covariate_names = vec!["OCC".into()];
@@ -856,15 +881,82 @@ fn grouped_model(class: Class, grouping: Grouping) -> crate::types::ParsedModel 
     parsed
 }
 
-/// The advice and positive message for one cell.
-fn cell(class: Class, grouping: Grouping) -> (DwAdvice, String) {
-    let parsed = grouped_model(class, grouping);
-    let advice = dw_advice(&parsed.model, &parsed.fit_options);
-    let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
-    (advice, msg)
+/// How a cell's rows are laid out in time (#2829).
+#[derive(Clone, Copy, Debug)]
+enum Rows {
+    /// The grouping's two groups one after the other on one clock (visits).
+    InTime,
+    /// The second group restarts the clock (arms).
+    Parallel,
 }
 
-/// A closed-form PK model, under every grouping: today's text, byte for byte.
+const LAYOUTS: [Rows; 2] = [Rows::InTime, Rows::Parallel];
+
+/// One four-row subject of a cell: two rows in each of the grouping's two groups,
+/// carrying the labels the reader would write (`Subject::occasions` from
+/// `iov_column`, which a single level also sets; the level columns as per-row
+/// covariates for a nested model). Doses at 0, 24 and 48 give `iov_occasion = dose`
+/// something to count; `time(24, 48)` cuts the in-time clock `6, 30, 54, 78` into
+/// three windows.
+fn cell_subject(id: &str, parsed: &crate::types::ParsedModel, rows: Rows) -> Subject {
+    let mut s = biexponential_subject(id, 1.0, 1.0);
+    s.doses = [0.0, 24.0, 48.0]
+        .iter()
+        .map(|t| DoseEvent::new(*t, 100.0, 1, 0.0, false, 0.0))
+        .collect();
+    s.obs_times = match rows {
+        Rows::InTime => vec![6.0, 30.0, 54.0, 78.0],
+        Rows::Parallel => vec![6.0, 30.0, 6.0, 30.0],
+    };
+    s.observations = vec![1.0; 4];
+    s.obs_cmts = vec![1; 4];
+    s.cens = vec![0; 4];
+    if parsed.fit_options.iov_column.is_some() {
+        s.occasions = vec![1, 1, 2, 2];
+    }
+    s.obs_covariates = [1.0, 1.0, 2.0, 2.0]
+        .iter()
+        .map(|arm| HashMap::from([("STUDYID".to_string(), 1.0), ("ARMID".to_string(), *arm)]))
+        .collect();
+    s
+}
+
+/// The population the fit would score for `subjects`: `fitted_population`, which
+/// derives an `iov_occasion` rule's labels and writes a nested model's cells.
+fn prepared(parsed: &crate::types::ParsedModel, subjects: Vec<Subject>) -> Population {
+    let mut pop = population(subjects);
+    pop.covariate_names = vec!["STUDYID".into(), "ARMID".into()];
+    let mut notes = Vec::new();
+    fitted_population(
+        &parsed.model,
+        &parsed.fit_options.iov_occasion,
+        parsed.fit_options.iov_column.is_some(),
+        std::borrow::Cow::Owned(pop),
+        &mut notes,
+    )
+    .into_owned()
+}
+
+/// Whether every subject's occasions run in time, the predicate the advice and the
+/// statistic share.
+fn all_in_time(pop: &Population) -> bool {
+    pop.subjects
+        .iter()
+        .all(crate::stats::residual_error::occasions_run_in_time)
+}
+
+/// The advice and positive message for one cell, on a one-subject population laid
+/// out as `rows`, and whether its prepared occasions run in time.
+fn cell(class: Class, grouping: Grouping, rows: Rows) -> (DwAdvice, String, bool) {
+    let parsed = grouped_model(class, grouping);
+    let pop = prepared(&parsed, vec![cell_subject("1", &parsed, rows)]);
+    let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
+    let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
+    (advice, msg, all_in_time(&pop))
+}
+
+/// A closed-form PK model, under every grouping and layout: today's text, byte for
+/// byte.
 ///
 /// Mutation that must redden this: `is_algebraic()` → `ode_spec.is_none()` in
 /// `dw_advice` (true for a closed form too); any rewording of today's text.
@@ -876,26 +968,30 @@ fn pk_analytic_keeps_todays_text_under_every_grouping() {
             parsed.model.ode_spec.is_none(),
             "the row exists to straddle `ode_spec.is_none()`; {g:?}"
         );
-        let (advice, msg) = cell(Class::PkAnalytic, g);
-        assert_eq!(advice, DwAdvice::Compartmental, "{g:?}");
-        assert_eq!(msg, COMPARTMENTAL, "{g:?}");
-        assert!(
-            !msg.contains("`correlation") && !msg.contains("kappa"),
-            "{g:?}: {msg}"
-        );
+        for rows in LAYOUTS {
+            let (advice, msg, _) = cell(Class::PkAnalytic, g, rows);
+            assert_eq!(advice, DwAdvice::Compartmental, "{g:?} {rows:?}");
+            assert_eq!(msg, COMPARTMENTAL, "{g:?} {rows:?}");
+            assert!(
+                !msg.contains("`correlation") && !msg.contains("kappa"),
+                "{g:?} {rows:?}: {msg}"
+            );
+        }
     }
 }
 
-/// An ODE model, under every grouping: today's text, byte for byte — the #1285
-/// property, no SDE / `[diffusion]` sentence, and no extra one either.
+/// An ODE model, under every grouping and layout: today's text, byte for byte — the
+/// #1285 property, no SDE / `[diffusion]` sentence, and no extra one either.
 #[test]
 fn ode_keeps_todays_text_under_every_grouping() {
     for g in GROUPINGS {
-        let (advice, msg) = cell(Class::Ode, g);
-        assert_eq!(advice, DwAdvice::Compartmental, "{g:?}");
-        assert_eq!(msg, COMPARTMENTAL, "{g:?}");
-        for banned in ["`correlation", "SDE", "diffusion"] {
-            assert!(!msg.contains(banned), "{g:?}: `{banned}` in {msg}");
+        for rows in LAYOUTS {
+            let (advice, msg, _) = cell(Class::Ode, g, rows);
+            assert_eq!(advice, DwAdvice::Compartmental, "{g:?} {rows:?}");
+            assert_eq!(msg, COMPARTMENTAL, "{g:?} {rows:?}");
+            for banned in ["`correlation", "SDE", "diffusion"] {
+                assert!(!msg.contains(banned), "{g:?} {rows:?}: `{banned}` in {msg}");
+            }
         }
     }
 }
@@ -905,31 +1001,38 @@ fn ode_keeps_todays_text_under_every_grouping() {
 const NOT_FOR_ALGEBRAIC: [&str; 4] = ["transit", "compartment", "ka/F", "cs("];
 
 /// Compartment-free, no grouping: declare one and correlate by it, with a
-/// placeholder column, never a concrete one.
+/// placeholder column, never a concrete one. Whatever the clock does.
 #[test]
 fn algebraic_without_grouping_names_a_level_and_a_placeholder_column() {
-    let (advice, msg) = cell(Class::Algebraic, Grouping::None);
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert_eq!(msg, ALGEBRAIC_UNGROUPED);
-    for must in [
-        "kappa … at",
-        "correlation ar1(RHO) by COL",
-        "innermost level's name",
-        "foce",
-        "focei",
-        "car1",
-    ] {
-        assert!(msg.contains(must), "missing `{must}`: {msg}");
-    }
-    for banned in NOT_FOR_ALGEBRAIC.iter().chain(&["OCC", "ARM", "STUDY"]) {
-        assert!(!msg.contains(banned), "`{banned}` in {msg}");
+    for rows in LAYOUTS {
+        let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::None, rows);
+        assert!(in_time, "{rows:?}: no occasions, nothing to split at");
+        assert_eq!(advice, DwAdvice::Algebraic { group: None }, "{rows:?}");
+        assert_eq!(msg, ALGEBRAIC_UNGROUPED, "{rows:?}");
+        for must in [
+            "kappa … at",
+            "correlation ar1(RHO) by COL",
+            "innermost level's name",
+            "foce",
+            "focei",
+            "car1",
+        ] {
+            assert!(msg.contains(must), "missing `{must}`: {msg}");
+        }
+        for banned in NOT_FOR_ALGEBRAIC.iter().chain(&["OCC", "ARM", "STUDY"]) {
+            assert!(!msg.contains(banned), "`{banned}` in {msg}");
+        }
     }
 }
 
-/// Compartment-free with `iov_column = OCC`: correlate by that column.
+/// A2. Compartment-free with `iov_column = OCC` on **parallel** occasions: the
+/// statistic split at the column, so correlate by it.
+///
+/// Mutation that must redden this: `dw_advice` never naming a group.
 #[test]
-fn algebraic_with_iov_column_correlates_by_the_column() {
-    let (advice, msg) = cell(Class::Algebraic, Grouping::IovColumn);
+fn algebraic_with_a_parallel_iov_column_correlates_by_the_column() {
+    let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovColumn, Rows::Parallel);
+    assert!(!in_time, "the fixture must be parallel");
     assert_eq!(
         advice,
         DwAdvice::Algebraic {
@@ -937,7 +1040,13 @@ fn algebraic_with_iov_column_correlates_by_the_column() {
         }
     );
     assert_eq!(msg, algebraic_grouped("OCC"));
-    for must in ["by OCC`", "ar1(RHO)", "car1(RHO)", "foce or focei"] {
+    for must in [
+        "by OCC`",
+        "`OCC` group",
+        "ar1(RHO)",
+        "car1(RHO)",
+        "foce or focei",
+    ] {
         assert!(msg.contains(must), "missing `{must}`: {msg}");
     }
     for banned in NOT_FOR_ALGEBRAIC.iter().chain(&["COL", "kappa"]) {
@@ -945,13 +1054,81 @@ fn algebraic_with_iov_column_correlates_by_the_column() {
     }
 }
 
+/// A1 (#2829). Compartment-free with `iov_column = OCC` on occasions that **run in
+/// time**: the statistic was taken over the whole subject, so the advice names no
+/// column. The twin of the test above: the same model and labels, only the clock
+/// differs.
+///
+/// Mutation that must redden this, and only this among the one-subject cells: the
+/// `occasions_run_in_time` read dropped from `dw_advice` (`by OCC` again).
+#[test]
+fn algebraic_with_an_iov_column_in_time_gets_the_ungrouped_text() {
+    let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
+    assert_eq!(parsed.fit_options.iov_column.as_deref(), Some("OCC"));
+    assert!(
+        !crate::api::run::occasions_are_derived(&parsed.model, &parsed.fit_options),
+        "the straddle: a column wrote these labels, not a rule"
+    );
+    let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovColumn, Rows::InTime);
+    assert!(in_time, "the fixture must run in time");
+    assert_eq!(advice, DwAdvice::Algebraic { group: None });
+    assert_eq!(msg, ALGEBRAIC_UNGROUPED);
+    assert!(
+        msg.contains("by COL` line") && msg.contains("COL any"),
+        "{msg}"
+    );
+    assert!(!msg.contains("OCC"), "{msg}");
+}
+
+/// A4 (#2829, plan amendment 1). A population of one subject in time and one
+/// parallel, under `iov_column = OCC`: the statistic split **some** subject at the
+/// column, so the advice names it.
+///
+/// Mutation that must redden this: "some subject" → "every subject" in `dw_advice`.
+#[test]
+fn algebraic_iov_column_split_in_some_subjects_correlates_by_the_column() {
+    let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
+    for order in [
+        [Rows::InTime, Rows::Parallel],
+        [Rows::Parallel, Rows::InTime],
+    ] {
+        let pop = prepared(
+            &parsed,
+            vec![
+                cell_subject("1", &parsed, order[0]),
+                cell_subject("2", &parsed, order[1]),
+            ],
+        );
+        let in_time: Vec<bool> = pop
+            .subjects
+            .iter()
+            .map(crate::stats::residual_error::occasions_run_in_time)
+            .collect();
+        assert!(
+            in_time.contains(&true) && in_time.contains(&false),
+            "the population must be mixed: {in_time:?}"
+        );
+        let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
+        let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
+        assert_eq!(msg, algebraic_grouped("OCC"), "{order:?}");
+        assert!(
+            msg.contains("`OCC` group") && msg.contains("by OCC`"),
+            "{order:?}: {msg}"
+        );
+        assert!(!msg.contains("COL any"), "{order:?}: {msg}");
+    }
+}
+
 /// Compartment-free with one `level ARM by ARMID in ID`: the level's **column** —
-/// a one-level model has no named level a `by` can read.
+/// a one-level model has no named level a `by` can read — where its groups are
+/// parallel, and the ungrouped text where they run in time (a single level is
+/// `iov_column` by construction, so it reads the clock as the column does, #2829).
 ///
 /// Mutation that must redden this: the level's name in place of its column.
 #[test]
 fn algebraic_single_level_correlates_by_its_column() {
-    let (advice, msg) = cell(Class::Algebraic, Grouping::SingleLevel);
+    let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::SingleLevel, Rows::Parallel);
+    assert!(!in_time);
     assert_eq!(
         advice,
         DwAdvice::Algebraic {
@@ -964,16 +1141,24 @@ fn algebraic_single_level_correlates_by_its_column() {
     for banned in NOT_FOR_ALGEBRAIC {
         assert!(!msg.contains(banned), "`{banned}` in {msg}");
     }
+    let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::SingleLevel, Rows::InTime);
+    assert!(in_time);
+    assert_eq!(advice, DwAdvice::Algebraic { group: None });
+    assert!(msg == ALGEBRAIC_UNGROUPED && !msg.contains("ARM"), "{msg}");
 }
 
 /// Compartment-free with nested `STUDY > ARM`: the **innermost** level's **name**,
-/// which reads its groups nested by key.
+/// which reads its groups nested by key, where the cells are parallel. Cells that
+/// run in time are one series like any other occasions (no exemption for a declared
+/// level, #2829), and get the ungrouped text.
 ///
 /// Mutations that must redden this: the column in place of the name (the opposite
-/// direction of the single-level row); the outermost level in place of the innermost.
+/// direction of the single-level row); the outermost level in place of the
+/// innermost; the nested arm placed before the `occasions_run_in_time` read.
 #[test]
 fn algebraic_nested_levels_correlate_by_the_innermost_level_name() {
-    let (advice, msg) = cell(Class::Algebraic, Grouping::Nested);
+    let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::Nested, Rows::Parallel);
+    assert!(!in_time);
     assert_eq!(
         advice,
         DwAdvice::Algebraic {
@@ -985,14 +1170,17 @@ fn algebraic_nested_levels_correlate_by_the_innermost_level_name() {
     for banned in NOT_FOR_ALGEBRAIC.iter().chain(&["ARMID", "STUDY"]) {
         assert!(!msg.contains(banned), "`{banned}` in {msg}");
     }
+    let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::Nested, Rows::InTime);
+    assert!(in_time);
+    assert_eq!(advice, DwAdvice::Algebraic { group: None });
+    assert!(msg == ALGEBRAIC_UNGROUPED && !msg.contains("ARM"), "{msg}");
 }
 
-/// Compartment-free with `iov_occasion = time(...)` or `dose` and a kappa: the
-/// occasions come from the timeline, so no column labels them, and the rule
-/// overrides the `iov_column` the fixture also sets. The ungrouped text.
-///
-/// Mutation that must redden this: dropping the derived-occasions arm of
-/// `dw_advice`.
+/// Compartment-free with `iov_occasion = time(...)` or `dose` and a kappa, on one
+/// running clock: the occasions come from the timeline through
+/// `fitted_population`, they run in time (asserted), and the statistic is taken over
+/// the whole subject. The ungrouped text, although the fixture also sets
+/// `iov_column`.
 #[test]
 fn algebraic_derived_occasions_get_the_ungrouped_text() {
     for g in [Grouping::IovTime, Grouping::IovDose] {
@@ -1000,25 +1188,60 @@ fn algebraic_derived_occasions_get_the_ungrouped_text() {
         assert_eq!(
             parsed.fit_options.iov_column.as_deref(),
             Some("OCC"),
-            "{g:?}: the straddle: a column is set, and only the rule keeps it out"
+            "{g:?}: a column is set, and must not reach the advice"
         );
         assert!(
             crate::api::run::occasions_are_derived(&parsed.model, &parsed.fit_options),
             "{g:?}: the fixture must derive its occasions"
         );
-        let (advice, msg) = cell(Class::Algebraic, g);
+        let pop = prepared(&parsed, vec![cell_subject("1", &parsed, Rows::InTime)]);
+        assert!(
+            pop.subjects[0].occasions.windows(2).any(|w| w[0] != w[1]),
+            "{g:?}: the rule must derive more than one occasion: {:?}",
+            pop.subjects[0].occasions
+        );
+        let (advice, msg, in_time) = cell(Class::Algebraic, g, Rows::InTime);
+        assert!(in_time, "{g:?}: derived occasions on a running clock");
         assert_eq!(advice, DwAdvice::Algebraic { group: None }, "{g:?}");
         assert_eq!(msg, ALGEBRAIC_UNGROUPED, "{g:?}");
         assert!(!msg.contains("OCC"), "{g:?}: {msg}");
     }
 }
 
-/// Compartment-free with `iov_column = OCC` and `iov_occasion = time(...)` but no
-/// kappa: the fit derives no occasions, so the column grouping stands and the
-/// advice correlates by it (#2815 review round 1, row 1).
+/// A derived rule on a clock that **restarts** (`time(24, 48)` over rows at
+/// `6, 30, 6, 30`): the window labels come back, `[0, 1, 0, 1]`, so the statistic is
+/// split at them — but no column labels a window, and the rule overrides the
+/// `iov_column` the fixture also sets. The ungrouped text, not `by OCC`.
 ///
-/// Mutation that must redden this: dropping the `n_kappa > 0` term, i.e. keying the
-/// arm on `iov_occasion != Column` alone.
+/// This is the one cell where the derived-rule arm of `dw_advice` and the
+/// `occasions_run_in_time` read disagree, so it is the arm's own test.
+///
+/// Mutation that must redden this, and only this: the `occasions_are_derived` arm
+/// dropped from `dw_advice`.
+#[test]
+fn algebraic_derived_windows_on_a_restarting_clock_name_no_column() {
+    let parsed = grouped_model(Class::Algebraic, Grouping::IovTime);
+    assert_eq!(parsed.fit_options.iov_column.as_deref(), Some("OCC"));
+    let pop = prepared(&parsed, vec![cell_subject("1", &parsed, Rows::Parallel)]);
+    assert_eq!(pop.subjects[0].occasions, vec![0, 1, 0, 1]);
+    let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovTime, Rows::Parallel);
+    assert!(
+        !in_time,
+        "the straddle: derived labels that do not run in time"
+    );
+    assert_eq!(advice, DwAdvice::Algebraic { group: None });
+    assert_eq!(msg, ALGEBRAIC_UNGROUPED);
+    assert!(msg.contains("COL any") && !msg.contains("OCC"), "{msg}");
+}
+
+/// A3. Compartment-free with `iov_column = OCC` and `iov_occasion = time(...)` but
+/// no kappa: the fit derives no occasions, so the column's labels stand (#2815
+/// review round 1, row 1). Parallel, the advice correlates by the column; in time,
+/// it names none (#2829).
+///
+/// Mutations that must redden this: dropping the `n_kappa > 0` term of
+/// `occasions_are_derived` (the parallel half loses its column); dropping the
+/// `occasions_run_in_time` read (the in-time half gains one).
 #[test]
 fn algebraic_derived_rule_without_a_kappa_keeps_the_column() {
     let parsed = grouped_model(Class::Algebraic, Grouping::IovTimeNoKappa);
@@ -1031,7 +1254,14 @@ fn algebraic_derived_rule_without_a_kappa_keeps_the_column() {
         &parsed.model,
         &parsed.fit_options
     ));
-    let (advice, msg) = cell(Class::Algebraic, Grouping::IovTimeNoKappa);
+    let pop = prepared(&parsed, vec![cell_subject("1", &parsed, Rows::Parallel)]);
+    assert_eq!(
+        pop.subjects[0].occasions,
+        vec![1, 1, 2, 2],
+        "the column's labels, not the windows'"
+    );
+    let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovTimeNoKappa, Rows::Parallel);
+    assert!(!in_time);
     assert_eq!(
         advice,
         DwAdvice::Algebraic {
@@ -1040,6 +1270,10 @@ fn algebraic_derived_rule_without_a_kappa_keeps_the_column() {
     );
     assert_eq!(msg, algebraic_grouped("OCC"));
     assert!(msg.contains("by OCC`") && !msg.contains("COL"), "{msg}");
+    let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovTimeNoKappa, Rows::InTime);
+    assert!(in_time);
+    assert_eq!(advice, DwAdvice::Algebraic { group: None });
+    assert!(msg.contains("COL any") && !msg.contains("OCC"), "{msg}");
 }
 
 /// The negative branch is the same for every model: no model-class remedy.
