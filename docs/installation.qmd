@@ -162,10 +162,9 @@ commit the image contains, and compare it with the feature you need:
 docker run --rm ghcr.io/ferx-nlme/ferx-r:latest cat /usr/local/share/ferx-core-rev
 ```
 
-The `latest` tag is the newest ferx-r `main` build and moves. From the first
-ferx-r release after 0.4.0, `release` follows the newest release and `X.Y.Z`
-names one release; a version tag is never replaced, so pin one for reproducible
-work.
+The `latest` tag is the newest ferx-r `main` build and moves. From ferx-r 0.5.0
+on, `release` follows the newest release and `X.Y.Z` names one release; a
+version tag is never replaced, so pin one for reproducible work.
 
 When several containers share a node, pass `--threads N` to match the cores each
 job was given. Inside a container ferx does not see a Kubernetes CPU request
