@@ -314,6 +314,7 @@ fn run_covariance_scoped(
         extract_standard_errors(&covariance_matrix, &params);
     let se_residual_correlations =
         crate::api::extract_residual_correlation_se(&covariance_matrix, &params);
+    let se_mixture_overrides = crate::api::extract_mixture_override_se(&covariance_matrix, &params);
     let (cov_eigenvalues, cov_condition_number) = cov_diagnostics(covariance_matrix.as_ref());
     // Bayesian fits never run a Hessian covariance step; guard so a covariance
     // request against a Bayesian fit reports NotRequested rather than Failed.
@@ -330,6 +331,7 @@ fn run_covariance_scoped(
     out.se_sigma = se_sigma;
     out.se_kappa = se_kappa;
     out.se_residual_correlations = se_residual_correlations;
+    out.se_mixture_overrides = se_mixture_overrides;
     out.cov_eigenvalues = cov_eigenvalues;
     out.cov_condition_number = cov_condition_number;
     // #1382: overwrite, never merge. `out` is a clone of the incoming fit, so a

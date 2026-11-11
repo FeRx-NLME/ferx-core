@@ -538,8 +538,9 @@ under every `covariance_method`, profiled or not, SIR and the asymptotic draws
 (#2816). A `[mixture]` per-class override (`omega(k)` or `sigma(k)`) on the rail is
 held under the same rule (#2809). Its `held_at_bound` entry carries `class: k`, and
 its `kind` and `index` name the base parameter it overrides. So the base parameter
-keeps its own SE, and the other SEs equal a run with the override `FIX`. Per-class
-override estimates and their SEs are not printed in this version.
+keeps its own SE, and the other SEs equal a run with the override `FIX`. The
+override's own row prints `N/A` (`held: <reason>` in the YAML) — see
+[Mixture per-class overrides](../output.qmd#mixture-overrides) (#2833).
 
 ## Where the packed space surfaces
 
@@ -550,7 +551,8 @@ It is not purely internal; it shows up in several user-visible places.
   the OFV **with respect to the packed vector**, not with respect to
   $(\theta, \Omega, \Sigma)$. Its `parameters:` list names the packed
   coordinates: `log_chol_<eta>` for an Omega diagonal, `chol_<i>_<j>` for an
-  off-diagonal. Reported standard errors on the natural scale are obtained
+  off-diagonal, `log_chol_<eta>_MIX<k>` / `<eps>_MIX<k>` for a `[mixture]` Ω / σ
+  override and `<eps_i>~<eps_j>` for a `block_sigma` correlation. Reported standard errors on the natural scale are obtained
   from it by the delta method. See [Output Files](../output.qmd).
 - **SIR.** The proposal, the resamples, and the retained
   `sir_resamples_packed` pool are all in packed space; SIR's bound-collapse

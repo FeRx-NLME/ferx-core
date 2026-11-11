@@ -13,7 +13,7 @@ It only applies to methods that *have* a single outer-loop minimisation over tha
 | method | does `optimizer` apply? |
 |---|---|
 | `foce` / `focei` | yes — picks the algorithm for the population OFV minimisation |
-| `gn` (pure Gauss-Newton) | no — GN runs its own Levenberg-Marquardt loop |
+| `gn` (pure Gauss-Newton) | no — GN runs its own trust-region loop |
 | `gn_hybrid` | yes for the FOCEI polish phase only; the preceding GN phase ignores it |
 | `saem` | **no** — SAEM has no single outer minimisation; the M-step uses a hardcoded NLopt algorithm and is not user-selectable. Setting `optimizer` under `method = saem` triggers a warning and is otherwise ignored. |
 | `[saem, focei]` (chain) | applies to the FOCEI polish stage only |
@@ -171,7 +171,7 @@ One case overrides that rule, and mixture models have one exception of their own
 
 Outside these overrides, the choice mirrors the analytic-vs-FD decision the outer loop already makes: `auto` lands on the gradient-based optimizer when there is an exact gradient to feed it. Limited benchmarking across ~10 real FOCEI datasets (#490) found `nlopt_lbfgs` fastest-to-optimum on every analytic-gradient problem (`bobyqa` was faster but often stopped short of the optimum, `slsqp` converged but much slower), while `bobyqa` was both fastest and most reliable when only finite differences were available (`nlopt_lbfgs`/`slsqp`/`mma` were very slow and often missed the basin). A residual `correlation` line with `kappa` once sent `auto` to L-BFGS on a finite-difference gradient (#2122); it has the exact gradient now and follows the general rule.
 
-For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)`, or `auto (bobyqa)` for a model outside the analytic scope or a mixture started with indistinguishable classes — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with BOBYQA is reported as `bobyqa` too, with a warning; an explicit NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
+For a FOCE/FOCEI fit the resolved optimizer is recorded in the fit output as `auto (<resolved>)` — e.g. `auto (nlopt_lbfgs)`, or `auto (bobyqa)` for a model outside the analytic scope or a mixture started with indistinguishable classes — so a run records which algorithm actually executed (#1540). An explicit `trust_region` (or, from the API, the built-in BFGS/L-BFGS) that the mixture override replaces with BOBYQA is reported as `bobyqa` too, with a warning; an explicit `bobyqa` or NLopt gradient optimizer (`slsqp` / `nlopt_lbfgs` / `mma`) is honoured, with no warning. One exception: `gn_hybrid` reports `gn` even though its FOCEI polish runs the resolved optimizer. These defaults may be refined as the analytic-gradient scope grows and more datasets are studied; pin `optimizer` explicitly to opt out of the automatic choice.
 
 ### Mixture models {#auto-mixture}
 
@@ -331,7 +331,8 @@ THETA and both objectives). If it ends no lower, or on the floor again, the fit 
 just above the floor, below 1/1000 of its start, where two more evaluations (that point, and the
 THETA at 1/1000 of its start) show the objective still falling as it rises
 ([#2629](https://github.com/FeRx-NLME/ferx-core/issues/2629)). A THETA whose objective rises off
-the floor is a genuine boundary estimate and is left alone. The check costs one evaluation on a fit
+the floor is a genuine boundary estimate and is left alone; only `n_iterations` counts the
+evaluation ([#2850](https://github.com/FeRx-NLME/ferx-core/issues/2850)). The check costs one evaluation on a fit
 that ended on the floor, two more after a restart that left a THETA that low, and nothing on any
 other. The restart gets a fresh `maxiter` budget, so `n_iterations` on such a fit can exceed it.
 
@@ -340,6 +341,41 @@ The same model has a genuine second mode, which this check rightly does not touc
 there when started near it. A start far from the expected estimates can reach a mode like that on
 any model. Compare fits from two or three starts, or use a [global pre-search](#global-pre-search),
 when the starts are uncertain.
+
+### A variance stopped short of its guard {#variance-short-of-guard}
+
+A variance is optimized as the log of its standard deviation (for Ω and κ, of the Cholesky
+diagonal), with an internal lower guard: −6 for Ω, κ and `[mixture]` Ω overrides, −8 for σ. When
+the data carry no variability for a random effect, the objective falls all the way to that guard,
+but the fall flattens geometrically on the log scale. A derivative-free optimizer can then shrink
+its trust region below its `xtol` stop before it reaches the guard and report `converged = true`
+at a point that is not a minimum. On a two-class `[mixture]` fixture
+([#2832](https://github.com/FeRx-NLME/ferx-core/issues/2832)) BOBYQA stopped the class-2 override
+1.2 log units above the guard, 0.159 OFV above the optimum. The base ω stopped short in the same
+way when the class labels were swapped. L-BFGS reached the guard on both.
+
+Since #2832, after the outer optimizer of a FOCE-family fit stops (and after the
+[log-packing floor](#log-packing-floor) check above), ferx looks at every free variance within 2
+log units of its guard but not on it: Ω and κ diagonals, σ, and `[mixture]` overrides. A block's
+coordinate is its Cholesky diagonal `L_ii`, as for the [collapse hold](parameterization.qmd#held-parameters), so
+`Ω_ii` itself need not be small; for a block's later rows the warning reports `L_ii` as the
+"conditional SD in its block". ferx re-scores the stop, evaluation-only, and evaluates the objective
+once per variance with that variance alone on its guard, all at one inner budget (`inner_maxiter`
+or the default 200, whichever is larger), so a difference in budget does not read as a slope. Each
+variance that is lower by more than `1e-6` is moved to the guard, and the fit is resumed once with
+it `1e-3` above the guard. Started exactly on the guard, BOBYQA walked one variance back off it.
+
+If the resumed run ends no lower, the first stop is kept, `converged = false`, with a `convergence`
+warning. If it ends lower, it is reported, with an `optimizer_health` warning that names each
+variance (a `[mixture]` override by its class, `ETA_CL_MIX2`), its value and both objectives. The
+resumed run is then checked the same way. When it ended on the guard, the post-fit collapse warning
+names the variance as well. When it stopped short of a guard again, with the objective still falling
+there, it is still reported (it is lower), but `converged = false`, with a `convergence` warning
+that names what it left short. A variance whose objective rises on the guard is a genuine small
+estimate, and the fit is left untouched, bit for bit; only `n_iterations` counts the evaluations.
+The check costs the re-score plus one evaluation per variance in that band, and nothing on any
+other fit. It covers FOCE, FOCEI, Laplace and AGQ, profiled or not, but not Gauss–Newton, SAEM or
+VI, which run their own loops.
 
 ### A BOBYQA tolerance stop is polished {#bobyqa-tolerance-polish}
 

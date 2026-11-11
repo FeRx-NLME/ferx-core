@@ -409,6 +409,50 @@ fit ran under — `os`/`arch` from the running binary's target, `in_docker`
 indicate a container), `username` (`$USER`/`%USERNAME%`, quoted/escaped since
 it's free-form text), and `ferx_version`.
 
+#### Mixture per-class overrides (`mixture_overrides:`) {#mixture-overrides}
+
+A `[mixture]` fit with `omega(k)` / `sigma(k)` overrides gets a top-level
+`mixture_overrides:` section after `omega_iov:` (#2833). Each entry is named as in
+the optimizer trace: the base name with a `_MIX<k>` suffix.
+
+```yaml
+mixture_overrides:
+  ETA_CL_MIX2:
+    class: 2
+    base: ETA_CL
+    kind: omega
+    variance: 0.266883
+    cv_pct: 55.31
+    se: 0.064976
+  EPS_MIX2:
+    class: 2
+    base: EPS
+    kind: sigma
+    estimate: 0.211171
+    se: 0.010668
+```
+
+- An Ω override reports the class **variance**, with the `cv_pct` / `sd` line of its
+  base η's type. A σ override reports `estimate` on the SD scale, as `sigma:` does.
+- `se` uses the base blocks' keys. A `FIX` override, or a σ override SAEM held at
+  its initial value, has `fixed: true` and `se: ~`. An override in `held_at_bound`
+  has `se: ~` and `held: <reason>`. Its base parameter keeps its own SE either way.
+- The section is separate from `omega:` / `sigma:` on purpose: `[priors] from_fit`
+  reads every entry there as a base parameter.
+- The console prints the same rows under `--- Mixture per-class overrides ---`,
+  after SIGMA: `[FIX]` with `SE = ---` when fixed, `SE = N/A` when held.
+  `parameter_table` lists them with types `OMEGA var (class k)` and
+  `SIGMA SD (class k)`.
+- In `covariance_matrix.parameters` an Ω override is `log_chol_<eta>_MIX<k>` (it
+  packs the log of the class SD, like a base diagonal) and a σ override is
+  `<eps>_MIX<k>`. A `block_sigma` correlation, packed last, is `<eps_i>~<eps_j>`.
+  Before #2833 all of these were `param_<n>`.
+
+The same data is on `FitResult` as `mixture_overrides` (values),
+`se_mixture_overrides` (SEs on the same scales; `0.0` when fixed) and
+`mixture_override_params` (name, `kind`, base `index`, `class`, `packed_index`,
+`fixed`).
+
 ### SIR intervals (`sir:`)
 
 A fit run with `sir = true`, or a `FitResult` returned by `run_sir`, gets a `sir:`
@@ -505,7 +549,11 @@ Both metrics are `NaN` when `omega_iov` diagonal is zero or fewer than two subje
 
 Two pooled autocorrelation diagnostics are reported after every fit:
 
-Both are pooled over **lag pairs**: two consecutive rows of one series. A series is the rows of one subject that share its occasion (an `iov_column`, a derived `iov_occasion`, or a nested model's innermost level cell) and its `correlation … by` block, in row order. So a pair never joins one arm's or occasion's last visit to the next one's first.
+Both are pooled over **lag pairs**: two consecutive rows of one series. A series is the rows of one subject that share a `correlation … by` block, in row order. A subject's occasions (an `iov_column`, a derived `iov_occasion`, or a nested model's innermost level cell) split it further only when they are **parallel**, such as the arms of one study or level cells, which restart the clock: a pair never joins one arm's last visit to the next arm's first. Occasions that **run in time**, such as dosing intervals or study periods, stay one series, so the last row of one visit and the first row of the next are a pair.
+
+A subject's occasions run in time when each label is one unbroken run of its observation rows and the time is strictly later at every change of label. The time is the one the fit uses, which keeps running across an `EVID = 4` reset. This is decided per subject, from the data. Before [#2829](https://github.com/FeRx-NLME/ferx-core/issues/2829) every occasion split the series, so a design with one observation per occasion had no pair at all and no statistic.
+
+Both diagnostics are `NaN` when no series has two rows, for example with one observation per arm.
 
 **`iwres_lag1_r`** — pooled lag-1 Pearson correlation of IWRES over those pairs. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.
 

@@ -120,11 +120,12 @@ fn pair_normalised_dw(series: &[Vec<f64>]) -> f64 {
     num / den
 }
 
-/// The `iov_column` cell with **no kappa** (#2798 carry-over from #2815). There
-/// `run::occasions_are_derived` is false, so `dw_advice` names the column (`by ARM`)
-/// — and the statistic must split there too, or the advice and the number would
-/// describe different groupings. Measured: the reader fills `Subject::occasions`
-/// from `iov_column` whether or not the model has a kappa, so the split happens.
+/// The `iov_column` cell with **no kappa** (#2798 carry-over from #2815). The arms
+/// restart the clock, so they are parallel occasions (#2829): `dw_advice` names the
+/// column (`by ARM`) — and the statistic must split there too, or the advice and the
+/// number would describe different groupings. Measured: the reader fills
+/// `Subject::occasions` from `iov_column` whether or not the model has a kappa, so
+/// the split happens.
 ///
 /// Mutation that must redden this: the occasions part of the split key dropped (or
 /// gated on `n_kappa > 0`).

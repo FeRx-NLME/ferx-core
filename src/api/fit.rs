@@ -414,30 +414,44 @@ pub(crate) enum DwAdvice {
     Algebraic { group: Option<String> },
 }
 
-/// The [`DwAdvice`] for `model` fitted under `options` (#2798).
+/// The [`DwAdvice`] for `model` fitted under `options` on `prepared` (#2798).
 ///
-/// `group` is what a `correlation … by` line would have to write to read the
-/// model's grouping:
+/// `group` names a grouping only when the statistic **split** there (#2829): when
+/// some subject of `prepared` (the population the fit scored) has occasions that do
+/// not run in time (`occasions_run_in_time`). It is then what a `correlation … by`
+/// line would have to write to read that grouping:
 /// - nested levels: the **innermost** level's **name** — `by ARM` naming a level
 ///   reads its groups nested by key (`residual_level`), where its column would read
 ///   the column within `ID` and merge arms of different studies;
 /// - `iov_column`, which a **single** `level X by COL in ID` also sets (the parser
 ///   writes the level's column into it): that **column**. A one-level model has no
-///   named level a `by` can read (`residual_level` needs more than one);
-/// - derived occasions (`iov_occasion = dose` / `time(...)` on a model with a
-///   kappa, `run::occasions_are_derived`): `None` — the occasions come from the
-///   timeline, so there is no column a `by` can read, and the rule overrides
-///   `iov_column`. Without a kappa the fit derives nothing and the `iov_column`
-///   grouping stands, so that cell takes the column arm;
-/// - no grouping: `None`.
+///   named level a `by` can read (`residual_level` needs more than one).
 ///
-/// `options`, not `model.fit_options`, because the occasion rule a fit runs under is
-/// the caller's (#1783).
-pub(crate) fn dw_advice(model: &CompiledModel, options: &FitOptions) -> DwAdvice {
+/// Otherwise `None`: the model declares no grouping, or every subject's occasions
+/// run in time and the statistic was taken over whole subjects. Also `None` for
+/// occasions a derived rule wrote (`iov_occasion = dose` / `time(...)` on a model
+/// with a kappa, `run::occasions_are_derived`): they come from the timeline, so no
+/// column labels them, and the rule overrides `iov_column`. On one running clock
+/// such labels are in time anyway; on a clock that restarts, `time(...)` windows
+/// come back and are split at, and this arm is what keeps the overridden column out.
+///
+/// `options`, not `model.fit_options`, because the column a fit groups by is the
+/// caller's (#1783).
+pub(crate) fn dw_advice(
+    model: &CompiledModel,
+    options: &FitOptions,
+    prepared: &Population,
+) -> DwAdvice {
     if !model.is_algebraic() {
         return DwAdvice::Compartmental;
     }
-    let group = if let Some(levels) = model.nested_levels() {
+    let split_at_occasions = prepared
+        .subjects
+        .iter()
+        .any(|s| !crate::stats::residual_error::occasions_run_in_time(s));
+    let group = if !split_at_occasions {
+        None
+    } else if let Some(levels) = model.nested_levels() {
         levels.levels.last().map(|l| l.name.clone())
     } else if crate::api::run::occasions_are_derived(model, options) {
         None
@@ -2745,6 +2759,8 @@ fn fit_inner(
         extract_standard_errors(&result.covariance_matrix, &result.params);
     let se_residual_correlations =
         extract_residual_correlation_se(&result.covariance_matrix, &result.params);
+    let se_mixture_overrides =
+        crate::api::extract_mixture_override_se(&result.covariance_matrix, &result.params);
 
     // Optional SIR step
     let mut warnings = result.warnings;
@@ -3216,8 +3232,9 @@ fn fit_inner(
 
     // Under a `correlation` line the raw IWRES are correlated by construction; the
     // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
-    // Either way each subject's series is split at its occasions and residual blocks
-    // (#2798), read off `population` — the prepared one this fit scored, whose
+    // Either way each subject's series is split at its residual blocks and at its
+    // parallel occasions (#2798); occasions that run in time stay one series (#2829).
+    // Both are read off `population` — the prepared one this fit scored, whose
     // occasions carry the `iov_column`, a derived rule's labels or the level cells.
     let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
         crate::stats::residual_error::whitened_residual_autocorrelation(
@@ -3303,7 +3320,7 @@ fn fit_inner(
         (Some(serial), Some(line)) => {
             dw_autocorrelation_warning_decorrelated(dw_statistic, &line, serial.kind)
         }
-        _ => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options)),
+        _ => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options, population)),
     };
     if let Some(msg) = dw_warning {
         warnings.push(msg);
@@ -3380,6 +3397,12 @@ fn fit_inner(
             .mixture
             .as_ref()
             .and_then(crate::estimation::parameterization::mixture_override_values),
+        // Each override's name, class, packed row and FIX state, so a renderer can label it
+        // (#2833).
+        mixture_override_params: crate::estimation::parameterization::mixture_override_params(
+            &result.params,
+        ),
+        se_mixture_overrides,
         left_init: result.left_init,
         stationary_start: result.stationary_start,
         omega_is_diagonal: Some(result.params.omega.diagonal),

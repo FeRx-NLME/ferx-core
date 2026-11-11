@@ -174,7 +174,6 @@ fn fast_opts(method: EstimationMethod, optimizer: Optimizer, mu_referencing: boo
         interaction: method == EstimationMethod::FoceI,
         mu_referencing,
         optimizer,
-        lbfgs_memory: 5,
         verbose: false,
         ..FitOptions::default()
     }
