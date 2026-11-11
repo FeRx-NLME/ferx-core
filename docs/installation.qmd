@@ -140,8 +140,8 @@ This should print a successful model fit with parameter estimates.
 ## Docker
 
 To use the `ferx` CLI without installing Rust, run the public image
-`ghcr.io/ferx-nlme/ferx-r` (`linux/amd64` and `linux/arm64`). It is published by
-the ferx R package and carries R, the ferx R package and the `ferx` binary. The
+`ghcr.io/ferx-nlme/ferx-r` (`linux/amd64` and `linux/arm64`). It is published
+from the ferx-r repository and carries R, the ferx R package and the `ferx` binary. The
 binary is built with the `ci`, `nn` and `survival` features, at the ferx-core
 commit that ferx-r's `src/rust/Cargo.lock` pins.
 
@@ -154,7 +154,9 @@ docker run --rm -v "$PWD:/work" ghcr.io/ferx-nlme/ferx-r:latest \
   ferx check model.ferx
 ```
 
-To see which ferx-core commit the image contains:
+That commit can lag ferx-core `main`, so a CLI flag or model-file feature
+described in this book may not be in the image yet. To see which ferx-core
+commit the image contains, and compare it with the feature you need:
 
 ```bash
 docker run --rm ghcr.io/ferx-nlme/ferx-r:latest cat /usr/local/share/ferx-core-rev
@@ -172,7 +174,7 @@ default it may use more threads than the job has.
 
 The R side, image digests, derived images and the RStudio image are covered in
 the [ferx-r README](https://github.com/FeRx-NLME/ferx-r#docker) and the
-[ferx book's installation chapter](https://ferx-nlme.org/ferx-book/chapters/01-installation.html).
+[ferx book's installation chapter](https://ferx-nlme.org/ferx-book/chapters/01-installation.html#sec-docker).
 
 ---
 
