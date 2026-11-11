@@ -88,7 +88,12 @@ subject, counting the stacked η and kappas over its occasions; past that, the f
 uses finite differences ([Gradients](structural-model.qmd#gradients)).
 
 In R, `ferx_mbma_data()` builds and checks such a dataset
-([Counted form](parameters.qmd#counted-form-theta-namen)).
+([Counted form](parameters.qmd#counted-form-theta-namen)). For a model already
+written in nlmixr2, `ferxtranslate::nlmixr2_to_ferx()` translates a
+compartment-free model (`pred <- ...; pred ~ add(sd)`) into this form, and its
+`weighting = "weight"` argument writes the inverse-variance weight as a
+`weight =` on the error line
+([translator#75](https://github.com/FeRx-NLME/translator/pull/75)).
 
 ## 2. Inverse-variance weighting
 
@@ -158,6 +163,13 @@ ones with `level NAME by COLUMN in PARENT`, then attach each kappa with
 `foce` or `focei` at `n_agq = 1` only
 ([What this release supports](iov.qmd#nested-levels-scope)).
 
+Each subject's inner problem is over its η plus one kappa per group of every
+level it contains, so a coarse `ID` such as a sponsor stacks every arm of every
+study into one problem and the fit slows much faster than the row count grows.
+Make `ID` the coarsest grouping that needs its own random effect, and declare a
+level only where its kappa is needed
+([Cost grows with the groups inside each subject](iov.qmd#nested-levels-cost)).
+
 ## 7. Within-arm residual correlation
 
 `correlation cs|ar1|car1(RHO) by ARM` lets the residuals of one arm's visits
@@ -210,6 +222,21 @@ study leaves `S` rank-deficient and `s` reports no SEs. On a block whose levels
 are each read by one subject, the `rsr` level SEs are not usable; read them from
 `r`, and ferx warns with `W_COV_RSR_ONE_SUBJECT_LEVELS`
 ([Standard errors](parameters.qmd#standard-errors)).
+
+An omega or kappa variance the optimizer leaves on ferx's internal lower guard
+($e^{-12} = 6.144 \times 10^{-6}$) has collapsed. ferx lists it in
+`held_at_bound` and prints its SE as `N/A`; when the covariance step's `R` is
+clean, every other SE is conditional on that variance at its estimate, as with a
+`FIX` ([Held parameters](../estimation/parameterization.qmd#held-parameters)).
+Read the fit's `Status:` line, not `converged` alone. `converged` means only
+that the optimizer's stop was verified. The status is `CONVERGED WITH ISSUES` or
+`NOT CONVERGED`, with its reasons, when for example the covariance step failed
+or a collapsed variance could not be held
+([Fit status](../output.qmd#fit-status)).
+
+An arm-level dataset is small enough that a fit takes well under a second, so
+`n_starts = 8` is a cheap check that the reported optimum is not a local one
+([Small datasets](../examples/multistart.qmd#small-datasets)).
 
 [SIR](../estimation/sir.qmd) (`sir = true`, beta) samples from the covariance
 step's proposal. It never samples a `FIX`ed sigma, so the fixed residual of the
