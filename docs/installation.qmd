@@ -15,6 +15,7 @@ Pick your platform:
 - [**Linux**](#linux) — fully supported
 - [**macOS**](#macos) — supported (Intel and Apple Silicon)
 - [**Windows**](#windows) — supported (native, or via WSL2)
+- [**Docker**](#docker) — the `ferx` CLI without installing Rust
 
 ---
 
@@ -133,6 +134,45 @@ cargo run --release -p ferx-cli -- examples/warfarin.ferx --data data/warfarin.c
 ```
 
 This should print a successful model fit with parameter estimates.
+
+---
+
+## Docker
+
+To use the `ferx` CLI without installing Rust, run the public image
+`ghcr.io/ferx-nlme/ferx-r` (`linux/amd64` and `linux/arm64`). It is published by
+the ferx R package and carries R, the ferx R package and the `ferx` binary. The
+binary is built with the `ci`, `nn` and `survival` features, at the ferx-core
+commit that ferx-r's `src/rust/Cargo.lock` pins.
+
+Mount your project at `/work`, the image's working directory:
+
+```bash
+docker run --rm -v "$PWD:/work" ghcr.io/ferx-nlme/ferx-r:latest \
+  ferx model.ferx --data data.csv
+docker run --rm -v "$PWD:/work" ghcr.io/ferx-nlme/ferx-r:latest \
+  ferx check model.ferx
+```
+
+To see which ferx-core commit the image contains:
+
+```bash
+docker run --rm ghcr.io/ferx-nlme/ferx-r:latest cat /usr/local/share/ferx-core-rev
+```
+
+The `latest` tag is the newest ferx-r `main` build and moves. From the first
+ferx-r release after 0.4.0, `release` follows the newest release and `X.Y.Z`
+names one release; a version tag is never replaced, so pin one for reproducible
+work.
+
+When several containers share a node, pass `--threads N` to match the cores each
+job was given. Inside a container ferx does not see a Kubernetes CPU request
+without a limit, or a Slurm allocation not enforced through cgroups, so by
+default it may use more threads than the job has.
+
+The R side, image digests, derived images and the RStudio image are covered in
+the [ferx-r README](https://github.com/FeRx-NLME/ferx-r#docker) and the
+[ferx book's installation chapter](https://ferx-nlme.org/ferx-book/chapters/01-installation.html).
 
 ---
 
