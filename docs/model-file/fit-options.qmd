@@ -1160,7 +1160,7 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | `step_norm` | BFGS | Step size |
 | `inner_iter_count` | (reserved) | Reserved for future per-iteration inner-loop count; currently `NA` |
 | `optimizer` | FOCE/FOCEI | Active NLopt algorithm |
-| `lm_lambda` | GN | Levenberg-Marquardt damping factor |
+| `lm_lambda` | GN | Trust radius in scaled parameter space ([details](../estimation/gauss-newton.qmd#convergence)). The name is kept from the Levenberg-Marquardt loop GN replaced in 0.1.0 |
 | `ofv_delta` | GN | Change in OFV from previous iteration |
 | `step_accepted` | GN | Whether the GN step was accepted |
 | `cond_nll` | SAEM | Conditional observation NLL |

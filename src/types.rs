@@ -8089,6 +8089,9 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("trust radius")
         || lower.contains("degenerate")
         || lower.contains("resumed from the best point seen")
+        // #2832's adopted rail completion; its not-converged twin says "not reported as
+        // converged" and is filed by the convergence arm above first.
+        || lower.contains("resumed from just above the guard")
     {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
@@ -8274,6 +8277,38 @@ pub struct LevelGroupEbe {
     pub labels: Vec<f64>,
     /// κ̂ of each of [`LevelKappaEbes::kappa_names`].
     pub kappa: Vec<f64>,
+}
+
+/// One estimated `[mixture]` per-class override (`omega(k)` / `sigma(k)`, #977), as listed in
+/// [`FitResult::mixture_override_params`] (#2833): what a renderer needs to name its row and
+/// read its state. Parallel to [`FitResult::mixture_overrides`] (its value) and
+/// [`FitResult::se_mixture_overrides`] (its standard error).
+///
+/// Not to be confused with [`MixtureClassOverride`], the parsed declaration.
+/// `#[non_exhaustive]` so a later field is not a breaking change; ferx builds it, a caller
+/// reads it.
+#[non_exhaustive]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MixtureOverrideParam {
+    /// The override's name, as
+    /// [`crate::estimation::parameterization::coordinate_names`] spells it: the base name with a
+    /// `_MIX{class}` suffix, e.g. `"ETA_CL_MIX2"`, `"EPS_MIX2"`.
+    pub name: String,
+    /// [`ParameterKind::Omega`] or [`ParameterKind::Sigma`].
+    pub kind: ParameterKind,
+    /// The index of the **base** η (Ω diagonal) or σ the override replaces in its class —
+    /// the same convention as [`HeldAtBound::index`] for an override entry.
+    pub index: usize,
+    /// The class, 1-based like the model file, the `_MIX{c}` name and
+    /// [`HeldAtBound::class`].
+    pub class: usize,
+    /// Its row in [`FitResult::covariance_matrix`].
+    pub packed_index: usize,
+    /// Held by the model: a user `FIX`, or an override an estimator held at its initial
+    /// value (SAEM's σ override, #985). Read from the model's packed FIX mask, **not** from
+    /// [`FitResult::cov_fixed`], which also marks a coordinate the covariance step held on
+    /// the internal guard — that one is listed in [`FitResult::held_at_bound`] instead.
+    pub fixed: bool,
 }
 
 /// One coordinate the covariance step reports no standard error for (#2797), as listed in
@@ -8720,11 +8755,12 @@ pub struct FitResult {
     /// EPS shrinkage: `1 - SD(IWRES)`.  `NaN` when fewer than 2 valid residuals.
     pub shrinkage_eps: f64,
     /// Pooled lag-1 Pearson correlation of IWRES across subjects.
-    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    /// `NaN` when no series has ≥ 2 valid IWRES values (a series is a subject's
+    /// rows, split at its `correlation … by` blocks and its parallel occasions).
     pub iwres_lag1_r: f64,
     /// Pooled Durbin-Watson statistic for IWRES within subjects.
     /// 2.0 = no autocorrelation; < 1.5 = positive; > 2.5 = negative.
-    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    /// `NaN` when no series has ≥ 2 valid IWRES values, as for `iwres_lag1_r`.
     pub dw_statistic: f64,
     /// Wall-clock time for the complete fit in seconds.
     pub wall_time_secs: f64,
@@ -9106,6 +9142,22 @@ pub struct FitResult {
     /// carries no `packed_estimate`; `None` otherwise and for hand-built results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixture_overrides: Option<Vec<f64>>,
+    /// One descriptor per entry of [`FitResult::mixture_overrides`], in the same order
+    /// (#2833): the override's name, family, base index, class, packed row and FIX state, so
+    /// a renderer can label its row. Empty for a fit with no override and for a result that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixture_override_params: Vec<MixtureOverrideParam>,
+    /// Standard errors of [`FitResult::mixture_overrides`] (#2833), parallel to it and on its
+    /// scales: an Ω override's class **variance**, a σ override's σ (the scale the base
+    /// `se_sigma` reports). `0.0` for a fixed override
+    /// ([`MixtureOverrideParam::fixed`]), as the other `se_*` vectors report a pinned
+    /// coordinate, **and** for an override the covariance step held on the internal guard,
+    /// which is not `fixed` but has an entry with its `class` in
+    /// [`FitResult::held_at_bound`]: read that list before printing a `0.0` as an SE.
+    /// `None` with no override or no covariance matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_mixture_overrides: Option<Vec<f64>>,
     /// The outer optimizer's own verdict on whether the fit left its initial
     /// estimates — its `INIT_ESCAPE_STEP_S` test (#751) in scaled packed space,
     /// on the point the reported estimates are built from. `Some(false)` is the
@@ -9622,6 +9674,13 @@ pub struct FitOptions {
     /// model whose every objective evaluation is seconds). The fit is otherwise
     /// bit-identical either way — nothing downstream reads `final_gradient`.
     pub report_final_gradient: bool,
+    /// Read by nothing. It was never a `[fit_options]` key, and no optimizer takes its
+    /// L-BFGS history length from it. The field goes at the next minor release, with
+    /// `gn_lambda` (#1841).
+    #[deprecated(
+        since = "0.4.1",
+        note = "never read; removed at the next minor release (#1841)"
+    )]
     pub lbfgs_memory: usize,
     /// Run a gradient-free global pre-search (NLopt GN_CRS2_LM) before local optimization.
     pub global_search: bool,
@@ -9853,7 +9912,15 @@ pub struct FitOptions {
     /// Base RNG seed for the Bayes sampler. Chain `c` uses a seed derived from
     /// this. `None` draws a nondeterministic seed.
     pub bayes_seed: Option<u64>,
-    /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
+    /// Read by nothing. Gauss-Newton has used a trust region, not Levenberg-Marquardt
+    /// damping, since 0.1.0 (#68), so there is no damping factor for this to set. The
+    /// `[fit_options]` key is still parsed and draws a warning (#1841); the key and this
+    /// field go at the next minor release.
+    #[deprecated(
+        since = "0.4.1",
+        note = "has no effect: Gauss-Newton has used a trust region since 0.1.0; \
+                the field is removed at the next minor release (#1841)"
+    )]
     pub gn_lambda: f64,
     /// L2 (weight-decay) regularization strength for `[covariate_nn]` weights
     /// (NN-only). Adds `nn_l2_lambda · Σ wᵢ²` over the network **weight** blocks
@@ -10489,6 +10556,7 @@ impl Default for FitOptions {
             optimizer: Optimizer::Auto,
             inner_optimizer: InnerOptimizer::Auto,
             report_final_gradient: true,
+            #[allow(deprecated)] // removed with the field at the next minor (#1841)
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
@@ -10520,6 +10588,7 @@ impl Default for FitOptions {
             bayes_chains: 4,
             bayes_thin: 1,
             bayes_seed: None,
+            #[allow(deprecated)] // removed with the field at the next minor (#1841)
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -11711,6 +11780,15 @@ impl FitOptions {
             if key == "method" || key == "methods" {
                 continue;
             }
+            // A deprecated key is read by no method, so it gets its own notice on every
+            // chain instead of the "not used by method" text, which would suggest that
+            // some other method reads it.
+            if let Some(notice) = deprecated_key_notice(key) {
+                if seen.insert(key.clone()) {
+                    warnings.push(notice.to_string());
+                }
+                continue;
+            }
             if applicable.contains(key.as_str()) {
                 continue;
             }
@@ -11870,6 +11948,29 @@ impl FitOptions {
             self.method.label()
         ))
     }
+}
+
+/// `[fit_options]` keys the parser still accepts but nothing reads, each with the
+/// warning [`FitOptions::unsupported_keys_warnings`] emits when it is set, on any method.
+///
+/// A key here is in no `method_specific_keys` list and not in [`framework_keys`]: the
+/// notice is its only diagnostic. Each entry is removed, key and field together, at the
+/// next minor release after it was added.
+pub(crate) fn deprecated_keys() -> &'static [(&'static str, &'static str)] {
+    &[(
+        "gn_lambda",
+        "fit option `gn_lambda` has no effect: Gauss-Newton has used a trust region, not \
+         Levenberg-Marquardt damping, since ferx 0.1.0. Remove the key from your settings; \
+         it will be rejected from the next minor release.",
+    )]
+}
+
+/// The [`deprecated_keys`] notice for `key`, if it is deprecated.
+fn deprecated_key_notice(key: &str) -> Option<&'static str> {
+    deprecated_keys()
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, notice)| *notice)
 }
 
 /// The `ode_*` subset of [`framework_keys`]: knobs that only ever reach the ODE
@@ -12057,7 +12158,6 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
-            "gn_lambda",
             "nn_l2",
             "nn_smooth",
         ],
@@ -12076,7 +12176,6 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_search",
             "global_maxeval",
             "stagnation_guard",
-            "gn_lambda",
             "reconverge_gradient_interval",
             "nn_l2",
             "nn_smooth",

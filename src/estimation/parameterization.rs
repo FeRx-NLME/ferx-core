@@ -882,6 +882,65 @@ pub(crate) fn mixture_override_values(mix: &crate::types::MixtureParams) -> Opti
     Some(omega.chain(sigma).collect())
 }
 
+/// One [`MixtureOverrideParam`](crate::types::MixtureOverrideParam) per override of
+/// `template`, in [`mixture_override_values`] order (#2833): Ω overrides, then Σ overrides,
+/// each in address order. The name is [`coordinate_names`]' string at the override's packed
+/// row, the offsets come from [`packed_segments`], and `fixed` from [`packed_fixed_mask`] —
+/// the model's FIX plus any override an estimator held at its initial value, both baked
+/// into the final parameters. Never from `cov_fixed_mask`, which also marks a guard-held
+/// coordinate (that one is a `held_at_bound` entry, rendered `N/A`, not `---`). Empty
+/// without an override.
+pub(crate) fn mixture_override_params(
+    template: &ModelParameters,
+) -> Vec<crate::types::MixtureOverrideParam> {
+    let Some(mix) = template.mixture.as_ref() else {
+        return Vec::new();
+    };
+    if mix.omega_override_addr.is_empty() && mix.sigma_override_addr.is_empty() {
+        return Vec::new();
+    }
+    let seg = packed_segments(template);
+    let names = coordinate_names(template);
+    let mask = packed_fixed_mask(template);
+    let omega = mix
+        .omega_override_addr
+        .iter()
+        .enumerate()
+        .map(|(k, &(c, e))| {
+            (
+                crate::types::ParameterKind::Omega,
+                c,
+                e,
+                seg.mixture_omega_start() + k,
+            )
+        });
+    let sigma = mix
+        .sigma_override_addr
+        .iter()
+        .enumerate()
+        .map(|(k, &(c, s))| {
+            (
+                crate::types::ParameterKind::Sigma,
+                c,
+                s,
+                seg.mixture_sigma_start() + k,
+            )
+        });
+    omega
+        .chain(sigma)
+        .map(
+            |(kind, class0, index, packed_index)| crate::types::MixtureOverrideParam {
+                name: names[packed_index].clone(),
+                kind,
+                index,
+                class: class0 + 1,
+                packed_index,
+                fixed: mask[packed_index],
+            },
+        )
+        .collect()
+}
+
 /// [`mixture_from_base`] with the override values on the natural scale, as
 /// [`mixture_override_values`] lays them out (#1765). The class matrices hold exactly
 /// these values, so a mixture rebuilt from its own `mixture_override_values` over the

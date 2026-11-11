@@ -537,7 +537,7 @@ The estimation engine uses a nested optimization structure:
 
 ### Gauss-Newton (BHHH) Optimizer
 
-An alternative estimation method using the BHHH (Berndt-Hall-Hall-Hausman) approximation to the Hessian is available in `estimation/gauss_newton.rs`. It uses the outer product of per-subject gradients (`H ≈ Σ gᵢgᵢᵀ`) with Levenberg-Marquardt damping and backtracking line search. Two variants are available:
+An alternative estimation method using the BHHH (Berndt-Hall-Hall-Hausman) approximation to the Hessian is available in `estimation/gauss_newton.rs`. It uses the outer product of per-subject gradients (`H ≈ Σ gᵢgᵢᵀ`) as the Hessian of a trust-region step: Steihaug truncated CG on the scaled BHHH system, with the radius set by the ratio of actual to predicted OFV reduction. Two variants are available:
 
 - **`method = gn`** (pure Gauss-Newton): Fast convergence for well-conditioned problems.
 - **`method = gn_hybrid`**: Runs GN first, then polishes with FOCEI via `outer_optimizer.rs` for robustness.
@@ -565,7 +565,7 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | `ode/rosenbrock.rs` | Linearly implicit Rosenbrock steppers (`rosenbrock23`/`rodas4`/`rodas5p`) for stiff systems — same `Stepper` trait, so every feature works with every method |
 | `ode/predictions.rs` | ODE-based predictions with dose event handling |
 | `dosing.rs` | Neutral dose-resolution (`resolve_subject_doses`, #324) + SS-equilibration policy (`SS_EQUILIBRATION_CYCLES`, `SsStopTracker`) — the single home shared by pk/ode/sens |
-| `estimation/gauss_newton.rs` | Gauss-Newton (BHHH) optimizer with LM damping; pure GN and GN+FOCEI hybrid |
+| `estimation/gauss_newton.rs` | Gauss-Newton (BHHH) trust-region optimizer; pure GN and GN+FOCEI hybrid |
 | `estimation/trust_region.rs` | Newton trust-region outer optimizer (argmin + Steihaug CG); FD gradient & Hessian with fixed EBEs |
 | `estimation/parameterization.rs` | Pack/unpack optimizer vector (log-theta, Cholesky-omega, log-sigma) |
 | `estimation/covariance.rs` | Covariance/SE step: FD-of-OFV Hessian, eigen-floor inverse, score cross-product, non-PD SIR fallback (`compute_covariance`, `run_covariance_step`) |
@@ -638,5 +638,6 @@ both.
 ## Pull Requests
 
 When creating a PR in this repo, always read `.github/PULL_REQUEST_TEMPLATE.md` and fill every section before calling `gh pr create`.
+Its **Tests** section asks for *Same pattern elsewhere* and *Consumers checked* (#2637); use rust-analyzer find-references (installed by `rust-toolchain.toml`) for the reference counts.
 
 After reviewing a PR, always post your comments on the PR.

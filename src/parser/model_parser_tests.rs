@@ -5029,7 +5029,7 @@ fn test_cov_inner_tol_rejects_non_positive_and_non_finite() {
 /// newly added arm is covered without anyone remembering to list it here.
 #[test]
 fn every_apply_fit_option_arm_is_advertised_or_deliberately_exempt() {
-    use crate::types::{framework_keys, method_specific_keys, EstimationMethod};
+    use crate::types::{deprecated_keys, framework_keys, method_specific_keys, EstimationMethod};
 
     // Keys that legitimately have an arm but no advertisement, because they never reach
     // `user_set_keys` and so can never trigger the warning: the `[data_selection]` keys
@@ -5140,6 +5140,8 @@ fn every_apply_fit_option_arm_is_advertised_or_deliberately_exempt() {
 
     let mut advertised: std::collections::BTreeSet<&'static str> =
         framework_keys().iter().copied().collect();
+    // A deprecated key is advertised by its own notice, not by a method's list.
+    advertised.extend(deprecated_keys().iter().map(|(k, _)| *k));
     for m in [
         EstimationMethod::Foce,
         EstimationMethod::FoceI,
@@ -5247,13 +5249,70 @@ fn test_inner_optimizer_under_focei_does_not_warn() {
     );
 }
 
+/// `gn_lambda` is read by nothing (#1841), so setting it draws the same deprecation notice
+/// on every method: GN and GN-hybrid, which used to list it as valid, and a method that
+/// never did. It is the *only* warning for the key: the generic "not used by method" text
+/// would suggest that some other method reads it.
 #[test]
-fn test_gn_lambda_under_focei_warns() {
-    let opts =
-        parse_fit_options(&["method = focei".to_string(), "gn_lambda = 0.05".to_string()]).unwrap();
+fn gn_lambda_draws_the_deprecation_notice_on_every_method() {
+    for method in ["gn", "gn_hybrid", "focei"] {
+        let opts =
+            parse_fit_options(&[format!("method = {method}"), "gn_lambda = 0.05".to_string()])
+                .unwrap();
+        let warnings = opts.unsupported_keys_warnings();
+        assert_eq!(warnings.len(), 1, "method {method}: {warnings:?}");
+        let w = &warnings[0];
+        // Sentence 1: the key, that it does nothing, and why.
+        assert!(
+            w.contains("`gn_lambda` has no effect"),
+            "method {method}: {w}"
+        );
+        assert!(
+            w.contains("Gauss-Newton has used a trust region")
+                && w.contains("not Levenberg-Marquardt damping")
+                && w.contains("since ferx 0.1.0"),
+            "method {method}: {w}"
+        );
+        // Sentence 2: what to do, and that the key is going away.
+        assert!(w.contains("Remove the key"), "method {method}: {w}");
+        assert!(w.contains("next minor release"), "method {method}: {w}");
+        assert!(!w.contains("is not used by method"), "method {method}: {w}");
+    }
+}
+
+/// `gn_lambda` set twice — in the model file and again in ferx-r `settings`, both of which go
+/// through `apply_fit_option` and push the key onto `user_set_keys` — still draws one notice.
+#[test]
+fn gn_lambda_set_twice_draws_one_notice() {
+    let mut opts = parse_fit_options(&["method = gn".to_string()]).unwrap();
+    apply_fit_option(&mut opts, "gn_lambda", "0.05").unwrap();
+    apply_fit_option(&mut opts, "gn_lambda", "0.01").unwrap();
+    assert_eq!(
+        opts.user_set_keys
+            .iter()
+            .filter(|k| k.as_str() == "gn_lambda")
+            .count(),
+        2,
+        "fixture must reach the dedup with the key recorded twice: {:?}",
+        opts.user_set_keys
+    );
     let warnings = opts.unsupported_keys_warnings();
-    assert_eq!(warnings.len(), 1, "got: {:?}", warnings);
-    assert!(warnings[0].contains("gn_lambda"));
+    assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+    assert!(warnings[0].contains("`gn_lambda`"), "got: {warnings:?}");
+}
+
+/// The notice keys on the key being *set*: the same methods without `gn_lambda` stay
+/// quiet, although the field still holds its default.
+#[test]
+fn gn_lambda_notice_is_absent_when_the_key_is_unset() {
+    for method in ["gn", "gn_hybrid", "focei"] {
+        let opts = parse_fit_options(&[format!("method = {method}")]).unwrap();
+        let warnings = opts.unsupported_keys_warnings();
+        assert!(
+            !warnings.iter().any(|w| w.contains("gn_lambda")),
+            "method {method}: {warnings:?}"
+        );
+    }
 }
 
 #[test]

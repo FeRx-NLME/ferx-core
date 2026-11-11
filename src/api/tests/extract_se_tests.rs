@@ -367,3 +367,111 @@ fn test_se_residual_correlation_truncated_cov_reports_zero() {
     let se = extract_residual_correlation_se(&Some(cov), &template).expect("rho SE");
     assert_eq!(se, vec![0.0]);
 }
+
+// ── [mixture] per-class overrides (#2833) ────────────────────────────────
+
+/// θ, a diagonal Ω, two σ, a κ, one Ω override (class 2 on `ETA_CL`), one σ override
+/// (class 2 on `ADD_ERR`) and one ρ — every segment of the packed vector, so an offset
+/// that forgets one lands on a neighbour. Packed:
+/// `[TVCL, ETA_CL, PROP_ERR, ADD_ERR, KAPPA_CL, ETA_CL_MIX2, ADD_ERR_MIX2, ρ]`.
+fn override_template() -> ModelParameters {
+    let iov = OmegaMatrix::from_diagonal(&[0.02], vec!["KAPPA_CL".into()]);
+    let mut template = make_template(Some(iov), vec![false]);
+    template.sigma = SigmaVector {
+        values: vec![0.3, 1.0],
+        names: vec!["PROP_ERR".into(), "ADD_ERR".into()],
+    };
+    template.sigma_fixed = vec![false; 2];
+    template.residual_correlations = vec![ResidualCorrelation {
+        sigma_i: 1,
+        sigma_j: 0,
+        rho: 0.6,
+    }];
+    template.residual_correlation_fixed = vec![false];
+    let class2_omega = OmegaMatrix::from_diagonal(&[0.25], vec!["ETA_CL".into()]);
+    let class2_sigma = SigmaVector {
+        values: vec![0.3, 0.7],
+        names: template.sigma.names.clone(),
+    };
+    template.mixture = Some(MixtureParams {
+        omega: vec![template.omega.clone(), class2_omega],
+        sigma: vec![template.sigma.clone(), class2_sigma],
+        omega_override_addr: vec![(1, 0)],
+        omega_override_fixed: vec![false],
+        sigma_override_addr: vec![(1, 1)],
+        sigma_override_fixed: vec![false],
+    });
+    template
+}
+
+/// #2833: an override's SE is read at its own packed row and put on the scale
+/// `mixture_overrides` reports — `SE(var) = 2·var·SE(ln sd)` for Ω, `SE(σ) = σ·SE(ln σ)`
+/// for Σ. The Ω rule is exact only because an Ω override is accepted on a diagonal base
+/// alone (`mixture_block_omega_override_rejected`); lifting that refusal breaks it.
+///
+/// Mutations, each a different number here: forget κ in the offset (reads rows 4/5, not
+/// 5/6); swap the Ω/Σ scaling; drop the factor 2; map the Σ rows through
+/// `omega_override_addr` (reads the class-2 Ω, not σ). A fixed override reports `0.0`.
+#[test]
+fn test_se_mixture_overrides_read_their_own_rows_on_the_natural_scale() {
+    use super::extract_mixture_override_se;
+
+    let template = override_template();
+    let n = 8;
+    let mut cov = DMatrix::<f64>::zeros(n, n);
+    for i in 0..n {
+        cov[(i, i)] = ((i + 1) as f64).powi(2); // SE on the packed scale = i + 1
+    }
+    let cov = Some(cov);
+
+    let params = crate::estimation::parameterization::mixture_override_params(&template);
+    let got: Vec<_> = params
+        .iter()
+        .map(|p| {
+            (
+                p.name.as_str(),
+                p.kind,
+                p.index,
+                p.class,
+                p.packed_index,
+                p.fixed,
+            )
+        })
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("ETA_CL_MIX2", ParameterKind::Omega, 0, 2, 5, false),
+            ("ADD_ERR_MIX2", ParameterKind::Sigma, 1, 2, 6, false),
+        ]
+    );
+
+    let se = extract_mixture_override_se(&cov, &template).expect("override SEs");
+    // Ω: 2 · 0.25 · 6 = 3.0.  Σ: 0.7 · 7 = 4.9.
+    assert_eq!(se.len(), 2);
+    approx::assert_relative_eq!(se[0], 3.0, max_relative = 1e-12);
+    approx::assert_relative_eq!(se[1], 4.9, max_relative = 1e-12);
+    // The base SEs and ρ's are untouched by the override segment.
+    let (_, se_omega, se_sigma, se_kappa) = extract_standard_errors(&cov, &template);
+    approx::assert_relative_eq!(se_omega.unwrap()[0], 2.0 * 0.09 * 2.0, max_relative = 1e-12);
+    approx::assert_relative_eq!(se_sigma.unwrap()[1], 1.0 * 4.0, max_relative = 1e-12);
+    approx::assert_relative_eq!(se_kappa.unwrap()[0], 2.0 * 0.02 * 5.0, max_relative = 1e-12);
+    let rho = super::extract_residual_correlation_se(&cov, &template).unwrap();
+    approx::assert_relative_eq!(rho[0], 8.0 * (1.0 - 0.36), max_relative = 1e-12);
+
+    // A FIX σ override is marked fixed and reports 0.0; the Ω override keeps its SE.
+    let mut fixed = template.clone();
+    fixed.mixture.as_mut().unwrap().sigma_override_fixed = vec![true];
+    let params = crate::estimation::parameterization::mixture_override_params(&fixed);
+    assert_eq!(
+        params.iter().map(|p| p.fixed).collect::<Vec<_>>(),
+        [false, true]
+    );
+    let se = extract_mixture_override_se(&cov, &fixed).unwrap();
+    assert_eq!(se[1], 0.0);
+    approx::assert_relative_eq!(se[0], 3.0, max_relative = 1e-12);
+
+    // No matrix → no SEs; no override → none at all.
+    assert!(extract_mixture_override_se(&None, &template).is_none());
+    assert!(extract_mixture_override_se(&cov, &make_template(None, vec![])).is_none());
+}

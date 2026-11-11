@@ -208,27 +208,38 @@ pub(crate) fn resolve_outer_optimizer(
     // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
     // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
     // honoured — those route through `optimize_nlopt`, whose objective closure
-    // branches to `mixture_gradient`. Every other choice (including `auto`, and
-    // the built-in BFGS / trust-region paths, which do not carry the mixture
-    // objective) falls back to BOBYQA.
+    // branches to `mixture_gradient`. An explicit `bobyqa` is honoured too: it is
+    // the optimizer the mixture path runs, so nothing was replaced and no warning
+    // is owed (#2852). Every other choice (including `auto`, and the built-in
+    // BFGS / trust-region paths, which do not carry the mixture objective) falls
+    // back to BOBYQA.
     if has_mixture {
-        return match requested {
-            Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => (requested, None),
-            // `Auto` is the mixture default and downgrades silently by design;
-            // any *explicitly* chosen optimizer that the mixture path can't drive
-            // (built-in BFGS/L-BFGS, trust-region, Gauss-Newton — none carry the
-            // mixture objective) is run under BOBYQA instead, so say so rather than
-            // dropping the choice invisibly.
-            Optimizer::Auto => (Optimizer::Bobyqa, None),
-            other => (
-                Optimizer::Bobyqa,
-                Some(format!(
-                    "Mixture models are optimized with BOBYQA or an NLopt gradient method \
-                     (SLSQP / L-BFGS / MMA); the requested {other:?} optimizer does not carry \
-                     the mixture objective and was replaced by BOBYQA."
-                )),
-            ),
+        // Exhaustive, no wildcard: a new variant must say here whether it carries
+        // the mixture objective.
+        let resolved = match requested {
+            Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
+                requested
+            }
+            // `Auto` is the mixture default; the built-in BFGS / L-BFGS and
+            // trust-region paths do not carry the mixture objective.
+            Optimizer::Auto | Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => {
+                Optimizer::Bobyqa
+            }
         };
+        // The warning is owed exactly when an *explicit* choice did not run — keyed
+        // on the outcome, not on a second list of variants, so "replaced" can never
+        // be said of an optimizer that ran as requested (#2852). `Auto` asked for
+        // no optimizer in particular and resolves silently by design.
+        let replaced = requested != Optimizer::Auto && resolved != requested;
+        let warning = replaced.then(|| {
+            format!(
+                "Mixture models are optimized with BOBYQA or an NLopt gradient method \
+                 (SLSQP / L-BFGS / MMA); the requested `{}` optimizer does not carry \
+                 the mixture objective and was replaced by BOBYQA.",
+                requested.label()
+            )
+        });
+        return (resolved, warning);
     }
     (
         requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
@@ -442,6 +453,16 @@ pub fn optimize_population(
     if let Some(w) = outer_fd_fallback_warning(model, population, &declines) {
         result.warnings.push(w);
     }
+    // #2713: a gradient-driven stop short of convergence reports how far its final
+    // gradient is from the exact one.
+    stop::attach_stop_report(
+        resolved,
+        model,
+        population,
+        init_params,
+        options,
+        &mut result,
+    );
     result
 }
 
@@ -10803,6 +10824,7 @@ fn subject_analytic_outer_gradient(
 
 /// [`subject_analytic_outer_gradient`], and with `want_eta_dx` the subject's mode response
 /// `dη̂/dx` formed from the same recording; the response is `None` wherever the gradient is.
+/// A declined gradient comes back as its [`DeclineCause`] (#2713).
 fn subject_analytic_outer_gradient_dx(
     model: &CompiledModel,
     subject: &Subject,
@@ -10810,23 +10832,36 @@ fn subject_analytic_outer_gradient_dx(
     eta_hat: &[f64],
     interaction: bool,
     want_eta_dx: bool,
-) -> (Option<Vec<f64>>, Option<Vec<DVector<f64>>>) {
-    if !want_eta_dx || (subject.observations.is_empty() && subject.obs_records.is_empty()) {
-        return (
-            subject_analytic_outer_gradient(model, subject, pt, eta_hat, interaction),
-            None,
-        );
+) -> (Result<Vec<f64>, DeclineCause>, Option<Vec<DVector<f64>>>) {
+    use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_and_mode_at, ModeOut};
+    // No data at all contributes nothing (`sens_outer_gradient::subject_gradient_at`).
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        return (Ok(vec![0.0; pt.x.len()]), None);
     }
-    let (g, dx) = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_with_eta_dx_at(
-        model,
-        subject,
-        pt,
-        eta_hat,
-        interaction,
-    );
-    match g.filter(|g| g.iter().all(|v| v.is_finite())) {
-        Some(g) => (Some(g), dx),
-        None => (None, None),
+    let objective = if interaction {
+        crate::sens::ode_provider::adjoint::Objective::Focei
+    } else {
+        crate::sens::ode_provider::adjoint::Objective::Foce
+    };
+    let mut out = ModeOut {
+        want_dx: want_eta_dx,
+        ..ModeOut::default()
+    };
+    let g = subject_adjoint_gradient_and_mode_at(model, subject, pt, eta_hat, objective, &mut out);
+    match g {
+        Some(g) if g.iter().all(|v| v.is_finite()) => (Ok(g), out.eta_dx),
+        _ if out.mode_system_declined => (Err(DeclineCause::ModeSystem), None),
+        _ => (Err(DeclineCause::Recording), None),
+    }
+}
+
+/// The analytic gradient where `x` is not the template's packed length: the adjoint
+/// declines, but a subject with no data at all keeps the zero gradient it gives one.
+fn packed_length_decline(subject: &Subject, np: usize) -> Result<Vec<f64>, DeclineCause> {
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        Ok(vec![0.0; np])
+    } else {
+        Err(DeclineCause::Recording)
     }
 }
 
@@ -11223,10 +11258,37 @@ pub(crate) struct OuterFdDeclineLog {
     /// admits is exactly such a gradient. Keyed on the route the subject took, not on the
     /// model-level predicate.
     reconverge_declined: bool,
+    /// Per declined subject, the [`DeclineCause`]s it declined for over the fit, one bit
+    /// each: a subject can decline at its mode system on some trial points and in its
+    /// recording on others (#2713).
+    causes: Vec<std::sync::atomic::AtomicU8>,
     /// Test switch: subjects whose analytic outer gradient is treated as declined, so a
     /// test can reach a *numerical* decline on a fixture the adjoint serves.
     #[cfg(test)]
     forced: Vec<std::sync::atomic::AtomicBool>,
+}
+
+/// Why the analytic outer gradient declined a subject (#2713). A large fallback share has
+/// two readings with different remedies, which the warning counts apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclineCause {
+    /// The mode system `H w = ∇_η F` would not solve: `H` singular at `η̂`, or indefinite at
+    /// an `η̂` that is not stationary, an EBE off a strict mode.
+    ModeSystem,
+    /// No recorder served the subject there: its data shape is outside the recorders'
+    /// scope, or the recording failed or came back non-finite at that point. Which of the
+    /// two is [`is_structural_decline`]'s question, asked for the salvage.
+    Recording,
+}
+
+impl DeclineCause {
+    /// This cause's bit in [`OuterFdDeclineLog::causes`].
+    fn bit(self) -> u8 {
+        match self {
+            DeclineCause::ModeSystem => 1,
+            DeclineCause::Recording => 2,
+        }
+    }
 }
 
 impl OuterFdDeclineLog {
@@ -11240,6 +11302,9 @@ impl OuterFdDeclineLog {
                 .collect(),
             skipped_salvages: AtomicUsize::new(0),
             reconverge_declined: false,
+            causes: (0..n_subjects)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             #[cfg(test)]
             forced: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
@@ -11261,9 +11326,28 @@ impl OuterFdDeclineLog {
         self.forced[i].store(true, Ordering::Relaxed);
     }
 
+    /// The cause a forced decline reports: a numerical one, at the mode system.
     #[cfg(test)]
-    fn is_forced(&self, i: usize) -> bool {
-        self.forced[i].load(Ordering::Relaxed)
+    fn forced_cause(&self, i: usize) -> Option<DeclineCause> {
+        self.forced[i]
+            .load(Ordering::Relaxed)
+            .then_some(DeclineCause::ModeSystem)
+    }
+
+    /// Record why subject `i` declined on this evaluation (#2713). Rayon workers,
+    /// `Relaxed`, as [`Self::record`].
+    pub(crate) fn record_cause(&self, i: usize, cause: DeclineCause) {
+        if let Some(bits) = self.causes.get(i) {
+            bits.fetch_or(cause.bit(), Ordering::Relaxed);
+        }
+    }
+
+    /// How many subjects declined for `cause` at least once.
+    fn n_cause(&self, cause: DeclineCause) -> usize {
+        self.causes
+            .iter()
+            .filter(|b| b.load(Ordering::Relaxed) & cause.bit() != 0)
+            .count()
     }
 
     /// Mark subject `i` as having taken the FD outer gradient on this evaluation.
@@ -11281,6 +11365,13 @@ impl OuterFdDeclineLog {
         if let Some(flag) = self.structural.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Whether subject `i` declined structurally on some evaluation.
+    fn is_structural(&self, i: usize) -> bool {
+        self.structural
+            .get(i)
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     /// How many declined subjects were structural declines.
@@ -11392,10 +11483,42 @@ pub(crate) fn outer_fd_fallback_warning(
     };
     Some(format!(
         "{n_fd} of {n_total} subjects could not be given the exact analytic outer \
-         gradient during this fit{example} (a shape no analytic recorder serves, or a trial \
-         point where it could not be formed) and {consequence} The reported \
-         outer gradient method is the model-level route, not the per-subject one.{skipped}"
+         gradient during this fit{example} ({why}) and {consequence} The reported \
+         outer gradient method is the model-level route, not the per-subject one.{skipped}",
+        why = decline_causes_clause(log),
     ))
+}
+
+/// The parenthesis of [`outer_fd_fallback_warning`] that says why the subjects declined
+/// (#2713): one clause per [`DeclineCause`] some subject declined for, with its count. The
+/// counts cover every trial point of the fit, rejected ones included, and a subject that
+/// declined for both causes counts under each. A log no route stamped a cause on (the
+/// quadrature's) keeps the generic sentence.
+fn decline_causes_clause(log: &OuterFdDeclineLog) -> String {
+    let parts: Vec<String> = [
+        (
+            DeclineCause::ModeSystem,
+            "with an inner Hessian at the EBE that was singular, or indefinite at an EBE \
+             that was not stationary (an EBE off a strict mode), at some trial point",
+        ),
+        (
+            DeclineCause::Recording,
+            "with a shape no analytic recorder serves, or a recording that failed or came \
+             back non-finite at some trial point",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(cause, text)| match log.n_cause(cause) {
+        0 => None,
+        n => Some(format!("{n} {text}")),
+    })
+    .collect();
+    if parts.is_empty() {
+        "a shape no analytic recorder serves, or a trial point where it could not be formed"
+            .to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 /// `population_gradient_sens_mixed_dx` without the mode responses.
@@ -11494,24 +11617,19 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                     options.interaction,
                     want_eta_dx,
                 ),
-                // `x` is not the template's packed length: the adjoint declines, but a subject
-                // with no observations keeps the zero gradient it gives one.
-                None => (
-                    (subject.observations.is_empty() && subject.obs_records.is_empty())
-                        .then(|| vec![0.0; x.len()]),
-                    None,
-                ),
+                None => (packed_length_decline(subject, x.len()), None),
             };
             #[cfg(test)]
-            let analytic = analytic.filter(|_| !declines.is_forced(i));
+            let analytic = declines.forced_cause(i).map_or(analytic, Err);
             let g = match analytic {
                 // Keep the exact analytic gradient for in-scope, finite subjects.
-                Some(g) => g,
+                Ok(g) => g,
                 // Out-of-scope (or non-finite analytic) → per-subject salvage (held-EBE,
                 // or reconverged for a structural decline, #1536), unless the trial point
                 // has blown up (#1520).
-                None => {
+                Err(cause) => {
                     declines.record(i);
+                    declines.record_cause(i, cause);
                     let structural =
                         is_structural_decline(model, subject, init_params, ehs[i].as_slice());
                     if structural {
@@ -11526,12 +11644,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                         declines,
                         || {
                             non_iov_declined_salvage(
-                                // A non-Gaussian subject's held-EBE score drops the EBE
-                                // response it depends on strongly (#1778): reconverge it.
-                                structural
-                                    || declines.reconverge_declined
-                                    || (!subject.obs_records.is_empty()
-                                        && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model)),
+                                declined_salvage_reconverges(model, subject, structural, declines),
                                 x,
                                 init_params,
                                 model,
@@ -11576,6 +11689,23 @@ pub(crate) fn population_gradient_sens_mixed_dx(
     (grad, eta_dx)
 }
 
+/// Whether a declined non-IOV subject takes the reconverged salvage in
+/// [`population_gradient_sens_mixed_dx`] rather than the held-EBE one: a structural decline
+/// (#1536), a log that reconverges every decline (#2136), or a non-Gaussian subject, whose
+/// held-EBE score drops the EBE response it depends on strongly (#1778). The stop report
+/// (#2713) asks the same question to count the subjects left on the held-EBE fallback.
+pub(crate) fn declined_salvage_reconverges(
+    model: &CompiledModel,
+    subject: &Subject,
+    structural: bool,
+    declines: &OuterFdDeclineLog,
+) -> bool {
+    structural
+        || declines.reconverge_declined
+        || (!subject.obs_records.is_empty()
+            && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model))
+}
+
 /// One IOV subject's exact analytic packed outer gradient at the stacked mode
 /// `stacked = [η̂, κ̂₁ … κ̂_K]`, or `None` when the adjoint declines it. `pt` is `None` when
 /// `x` is not the template's packed length: the adjoint declines then, but a subject with no
@@ -11590,17 +11720,20 @@ fn subject_iov_analytic_gradient(
     stacked: &DVector<f64>,
     np: usize,
     options: &FitOptions,
-) -> Option<Vec<f64>> {
+) -> Result<Vec<f64>, DeclineCause> {
     match pt {
-        Some(pt) => subject_analytic_outer_gradient(
-            model,
-            subject,
-            pt,
-            stacked.as_slice(),
-            options.interaction,
-        ),
-        None => (subject.observations.is_empty() && subject.obs_records.is_empty())
-            .then(|| vec![0.0; np]),
+        Some(pt) => {
+            subject_analytic_outer_gradient_dx(
+                model,
+                subject,
+                pt,
+                stacked.as_slice(),
+                options.interaction,
+                false,
+            )
+            .0
+        }
+        None => packed_length_decline(subject, np),
     }
 }
 
@@ -11622,7 +11755,7 @@ pub(crate) fn subject_iov_outer_gradient(
     options: &FitOptions,
 ) -> Vec<f64> {
     subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options).unwrap_or_else(
-        || {
+        |_| {
             subject_reconverged_fd_gradient_iov(
                 x,
                 init_params,
@@ -11671,9 +11804,10 @@ pub(crate) fn population_gradient_sens_iov_mixed(
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
             match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
             {
-                Some(g) => g,
-                None => {
+                Ok(g) => g,
+                Err(cause) => {
                     declines.record(i);
+                    declines.record_cause(i, cause);
                     declined_subject_gradient(
                         np,
                         population,
@@ -12196,6 +12330,9 @@ fn covariance_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
 }
+
+#[path = "outer_optimizer_stop.rs"]
+mod stop;
 
 #[cfg(test)]
 #[path = "outer_optimizer_tests.rs"]
