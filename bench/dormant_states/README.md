@@ -58,13 +58,23 @@ Full fits, covariance step on, one run each:
 | 8 (18) | with #2760 | 30.1 s | 27.7 s | 2.28 s | 50 | 678.4511 |
 | | speed-up | 6.0× | 6.1× | 4.5× | | sdtab + fit YAML byte-identical |
 
-The bundled linear-ODE examples (all six on the exact path; few states, so little to win: the point is that nothing is lost), full fits, median of 3:
+Every bundled ODE example the release CLI runs, `main` at e6244a7b (with #2747) against the #2760 branch at 1f87321a, full fits, median of 3, the same box idle. Few states, so little to win: the point is what moves and what does not.
 
-| example (bundled data) | `main` c5dac24b | with #2760 | outputs |
-|---|---|---|---|
-| `one_cpt_iv_ode` | 0.08 s | 0.08 s | byte-identical |
-| `two_cpt_iv_ode` | 0.37 s | 0.37 s | byte-identical |
-| `three_cpt_iv_ode` | 1.42 s | 1.42 s | byte-identical |
-| `warfarin_ode` | 0.28 s | 0.28 s | byte-identical |
-| `transit_2cpt` | 0.97 s | 0.94 s | byte-identical |
-| `bioavailability_ode` | 0.29 s | 0.28 s | byte-identical |
+| example (bundled data) | exact linear path | `main` e6244a7b | with #2760 | outputs |
+|---|---|---|---|---|
+| `one_cpt_iv_ode` | yes | 0.064 s | 0.063 s | byte-identical |
+| `two_cpt_iv_ode` | yes | 0.172 s | 0.178 s | byte-identical |
+| `three_cpt_iv_ode` | yes | 0.920 s | 0.917 s | byte-identical |
+| `warfarin_ode` | yes | 0.140 s | 0.141 s | byte-identical |
+| `transit_2cpt` | yes | 1.006 s | 0.984 s | byte-identical |
+| `warfarin_ode_bloq` | yes | 0.108 s | 0.108 s | byte-identical |
+| `warfarin_ode_lagtime` | yes | 0.424 s | 0.427 s | byte-identical |
+| `pkpd_nonmem` | yes | 0.132 s | 0.122 s | byte-identical |
+| `bioavailability_ode` | yes | 0.188 s | 0.176 s | sdtab byte-identical; YAML differs only in `final_gradient_max_abs` (1.76759e-6 vs 1.76808e-6) and a correlation's 16th digit |
+| `emax_pkpd` | yes | 0.103 s | 0.095 s | a different path to the same optimum: 127 → 135 iterations, OFV equal, estimates ≤ 2e-6 relative; bit-identical at the start (`maxiter = 0`) |
+| `mm_iv` | no | 0.139 s | 0.139 s | byte-identical |
+| `mm_oral` | no | 0.648 s | 0.653 s | byte-identical |
+| `tests/fixtures/mm_basin_shift` (200 subjects) | no | 14.33 s | 14.40 s | byte-identical |
+| `warfarin_sde` | no | 35.46 s | 35.86 s | byte-identical |
+
+The `[markov_model]` and `[event_model]` examples need feature builds the CLI does not have, and were not run.

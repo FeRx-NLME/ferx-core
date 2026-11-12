@@ -1239,6 +1239,10 @@ fn segment_in<T: PkNum>(
     let nl = live.len();
     #[cfg(test)]
     DORMANT_STATES.with(|c| c.set(c.get() + (n - nl)));
+    #[cfg(test)]
+    if std::any::type_name::<T>().contains("rtape") {
+        DORMANT_STATES_COV.with(|c| c.set(c.get() + (n - nl)));
+    }
     let m = nl + 1;
     for (li, &i) in live.iter().enumerate() {
         for (lj, &j) in live.iter().enumerate() {
@@ -1438,6 +1442,10 @@ thread_local! {
     /// Dormant states left out of an exponential, summed over this thread's segments: what
     /// lets a test tell that the reduction ran, rather than a fixture with none to reduce.
     pub(crate) static DORMANT_STATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The same count over the covariance step's number types alone (`sens::rtape`), so a
+    /// test can tell the reduction ran on the Hessian's own recording and not only on the
+    /// `f64` solves beside it.
+    pub(crate) static DORMANT_STATES_COV: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {

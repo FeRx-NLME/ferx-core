@@ -962,24 +962,6 @@ impl RhsRegProgram {
     }
 }
 
-/// Which derivatives are **structural zeros** — exactly `0` and identically so near the
-/// inputs, so every derivative of every order is `0` too — given which inputs are
-/// (`zu`, `zp`, `zs`: an untaped constant `0`, [`crate::sens::linsolve::structural_zero`]).
-/// `out[state]` is `true` for such a derivative and `false` for every other, including one
-/// the program does not write. Run on the inputs' values (`u`, `params`, `seeds`), through
-/// [`Self::exec`]'s own `f64` primitives, so it takes the branches the interpreter takes.
-///
-/// The rules are the exact ones: a sum or difference of structural zeros, a structural
-/// zero times (or divided by) a value that is finite (and, as a divisor, nonzero), a
-/// literal `0`, a comparison or logical result (the dual constants `0`/`1`), and the
-/// abs/floor/ceil/round of a structural zero. Everything else is not, so the analysis can
-/// only under-report — and the caller checks every lane of an output it reports before
-/// dropping its derivatives (`vtape::record_rhs`).
-///
-/// A taped number type records an RHS call as one opaque block whose every output is a
-/// tape node (`vtape::record_rhs`), so a gated term `G·k·x` with the gate `G = 0` reads as
-/// a live coefficient to the exact linear path's sparsity skips; this is what lets the
-/// block leave such an output off the tape (#2760).
 /// Whether `code` holds an instruction [`structural_zeros`] marks a structural zero without
 /// a structural-zero operand: a literal `0`, a product with the constant `0`, or a
 /// comparison or connective (whose `0` is the dual constant). Every other rule needs a
@@ -1012,6 +994,25 @@ pub(super) fn loaded_inputs(code: &[Flat]) -> (Vec<u32>, Vec<u32>, [bool; 4]) {
     (u, p, s)
 }
 
+/// Which derivatives are **structural zeros** — exactly `0` and identically so near the
+/// inputs, so every derivative of every order is `0` too — given which inputs are
+/// (`zu`, `zp`, `zs`: an untaped constant `0`, [`crate::sens::linsolve::structural_zero`]).
+/// `out[state]` is `true` for such a derivative and `false` for every other, including one
+/// the program does not write. Run on the inputs' values (`u`, `params`, `seeds`), through
+/// `RhsRegProgram::exec`'s own `f64` primitives, so it takes the branches the interpreter
+/// takes.
+///
+/// The rules are the exact ones: a sum or difference of structural zeros, a structural
+/// zero times (or divided by) a value that is finite (and, as a divisor, nonzero), a
+/// literal `0`, a comparison or logical result (the dual constants `0`/`1`), and the
+/// abs/floor/ceil/round of a structural zero. Everything else is not, so the analysis can
+/// only under-report — and the caller checks every lane of an output it reports before
+/// dropping its derivatives (`vtape::record_rhs`).
+///
+/// A taped number type records an RHS call as one opaque block whose every output is a
+/// tape node (`vtape::record_rhs`), so a gated term `G·k·x` with the gate `G = 0` reads as
+/// a live coefficient to the exact linear path's sparsity skips; this is what lets the
+/// block leave such an output off the tape (#2760).
 #[allow(clippy::too_many_arguments)]
 fn structural_zeros(
     code: &[Flat],

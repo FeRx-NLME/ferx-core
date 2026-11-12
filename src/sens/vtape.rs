@@ -393,8 +393,10 @@ pub(crate) fn record_rhs<const N: usize, const M: usize, const TH: bool>(
         // The outputs that are structural zeros (`RhsKernel::structural_zeros`) carry no
         // derivative of any order, so they stay off the tape as constants: the exact linear
         // path then sees them as the zeros they are (`ode::linear`'s sparsity skips and dormant
-        // states, #2760). Their adjoint is exactly 0 either way, so the sweep's values do
-        // not move. An output is dropped only if every lane the forward wrote is `0` too — the
+        // states, #2760). Their local partials toward every taped input are exact zeros,
+        // which the sweep skips, so the inputs' adjoints do not move
+        // (`dropping_a_blocks_structural_zero_outputs_moves_no_bit`). An output is dropped
+        // only if every lane the forward wrote is `0` too — the
         // analysis may under-report, and this keeps an over-report from ever losing a lane.
         let mut marks = DeadMarks(RHS_DEAD.take());
         marks.0.clear();

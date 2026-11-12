@@ -559,9 +559,6 @@ pub(crate) mod vm {
         }
     }
 
-    /// A compiled RHS a tape can record whole and differentiate later (`parser::rhs_jit`):
-    /// its native forward and reverse pass over a [`Layout`]'s lanes, `fn(u, params, seeds,
-    /// du)` and `fn(u, params, seeds, du, ū, p̄, s̄, dū)`.
     /// The inputs a compiled RHS loads ([`RhsKernel::structural_zero_inputs`]): its states,
     /// its `params` slots, and which of the four seeds.
     #[derive(Clone, Copy, Debug)]
@@ -571,6 +568,9 @@ pub(crate) mod vm {
         pub(crate) seeds: [bool; 4],
     }
 
+    /// A compiled RHS a tape can record whole and differentiate later (`parser::rhs_jit`):
+    /// its native forward and reverse pass over a [`Layout`]'s lanes, `fn(u, params, seeds,
+    /// du)` and `fn(u, params, seeds, du, ū, p̄, s̄, dū)`.
     pub(crate) trait RhsKernel: Send + Sync {
         /// How many elements of `u`, `params` and `du` the program touches.
         fn extent(&self) -> (usize, usize, usize);

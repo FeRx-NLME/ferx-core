@@ -2154,3 +2154,46 @@ fn a_structural_zero_against_a_non_finite_tangent_stays_on_the_tape() {
         "a non-finite tangent: the gated term stays taped with its NaN, got {kept:?}"
     );
 }
+
+/// The skip in `vtape::record_rhs` reads three things: the loaded states, the loaded
+/// `params` slots and the loaded seeds (#2761 review round 1). The gated fixtures always
+/// carry a structural-zero parameter (a gate that is off), so they decide on the `params`
+/// clause alone and leave the other two unpinned. Here the program has no zero source and
+/// every parameter is a live leaf, so a structural zero reaches it through a state or a
+/// seed only: the recorder must still run the analysis and drop that output. The control,
+/// with no structural zero among the inputs, tapes all three.
+#[test]
+fn a_structural_zero_state_or_seed_alone_makes_the_recorder_analyse() {
+    let prog = program("  d/dt(x1) = A * x2\n  d/dt(x2) = B * TAD\n  d/dt(x3) = B * x3");
+    let reg = RhsRegProgram::compile(&prog.stmts, &layout(&prog)).expect("compiles");
+    assert!(
+        !super::makes_structural_zeros(&reg.code),
+        "the program must have no zero source, or the skip is never asked"
+    );
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let _time = ModelTimeGuard::enter(1.75);
+    // Which outputs are taped, with `x2` and `TAD` (seed 2) at the given values: a `0` is
+    // the untaped constant, a structural zero.
+    let taped = |x2: f64, tad: f64| -> [bool; 3] {
+        crate::sens::vtape::vtape_reset(3);
+        let leaf = |v: f64| DualV::<2, 0, false>::leaf(v, [0.5, -0.25], []);
+        let mut u: Vec<_> = [1.0, x2, 3.0].iter().map(|&v| leaf(v)).collect();
+        if x2 == 0.0 {
+            u[1] = DualV::<2, 0, false>::constant(0.0);
+        }
+        let p: Vec<_> = (0..n_params).map(|_| leaf(0.7)).collect();
+        let mut s = [DualV::<2, 0, false>::constant(1.75); 4];
+        s[2] = DualV::<2, 0, false>::constant(tad);
+        let mut du = vec![DualV::<2, 0, false>::constant(0.0); 3];
+        let mut regs = vec![DualV::<2, 0, false>::constant(0.0); reg.n_regs()];
+        reg.run(&u, &p, &s, &mut du, &mut regs);
+        [
+            PkNum::is_taped(du[0]),
+            PkNum::is_taped(du[1]),
+            PkNum::is_taped(du[2]),
+        ]
+    };
+    assert_eq!(taped(2.0, 1.0), [true, true, true], "no structural zero");
+    assert_eq!(taped(0.0, 1.0), [false, true, true], "a zero state alone");
+    assert_eq!(taped(2.0, 0.0), [true, false, true], "a zero seed alone");
+}

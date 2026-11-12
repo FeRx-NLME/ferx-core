@@ -1855,8 +1855,9 @@ const GATED_ACCUMULATORS_ODE: &str = r#"
 /// what makes the parity a test of the reduced recording rather than of the full one.
 #[test]
 fn adjoint_with_dormant_gated_accumulators_matches_reconverged_fd() {
-    // Measured (Linux x86_64): dropped vs kept 7.0e-17, parity 3.4e-9.
-    dormant_accumulators_match_reconverged_fd(GATED_ACCUMULATORS_ODE, 1e-14, 3e-8);
+    // Measured (Linux x86_64): dropped vs kept 7.0e-17, parity 3.4e-9. Hessian vs reconverged
+    // FD 5.46e-10 (Linux aarch64, glibc 2.41; the same on macOS arm64), 10× headroom.
+    dormant_accumulators_match_reconverged_fd(GATED_ACCUMULATORS_ODE, 1e-14, 3e-8, 5e-9);
 }
 
 /// [`GATED_ACCUMULATORS_ODE`] with a peripheral compartment, and the accumulators between
@@ -1897,8 +1898,9 @@ const INTERLEAVED_ACCUMULATORS_ODE: &str = r#"
 
 #[test]
 fn adjoint_with_interleaved_dormant_accumulators_matches_reconverged_fd() {
-    // Measured (Linux x86_64): dropped vs kept 4.2e-16, parity 4.9e-9.
-    dormant_accumulators_match_reconverged_fd(INTERLEAVED_ACCUMULATORS_ODE, 5e-14, 5e-8);
+    // Measured (Linux x86_64): dropped vs kept 4.2e-16, parity 4.9e-9. Hessian vs reconverged
+    // FD 5.12e-11 (Linux aarch64, glibc 2.41; the same on macOS arm64), 10× headroom.
+    dormant_accumulators_match_reconverged_fd(INTERLEAVED_ACCUMULATORS_ODE, 5e-14, 5e-8, 5e-10);
 }
 
 /// The body of the two tests above: `src` is a gated-accumulator model on an `IDX` gate
@@ -1906,7 +1908,12 @@ fn adjoint_with_interleaved_dormant_accumulators_matches_reconverged_fd() {
 /// Asserts the exact path, more dormant states on the recording that drops its structural
 /// zeros than on the one that keeps them (`RHS_DEAD_KEPT`, the straddle), the two gradients
 /// equal to `gap_tol`, and reconverged-FD parity to `parity_tol`.
-fn dormant_accumulators_match_reconverged_fd(src: &str, gap_tol: f64, parity_tol: f64) {
+fn dormant_accumulators_match_reconverged_fd(
+    src: &str,
+    gap_tol: f64,
+    parity_tol: f64,
+    hessian_tol: f64,
+) {
     use crate::ode::linear::DORMANT_STATES;
     use crate::ode::solver::SolverStatsScope;
     use crate::sens::vtape::RHS_DEAD_KEPT;
@@ -2011,6 +2018,44 @@ fn dormant_accumulators_match_reconverged_fd(src: &str, gap_tol: f64, parity_tol
     // Reconverged FD (Richardson, EBE re-solved per point); the callers' bounds are their
     // measurements with 10× headroom.
     assert!(worst < parity_tol, "worst relative difference {worst:.2e}");
+    // The covariance step's R-matrix on the same subject (#2761 review round 1): its nested
+    // duals (`sens::rtape`) run the same reduced propagation, on a recording of their own.
+    // First that the reduction ran there, counted on the Hessian's thread over those types
+    // alone; then the Hessian against Richardson differences of the exact gradient with the
+    // EBE re-solved at every point.
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-12, true);
+    let dormant_cov = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .spawn_scoped(scope, || {
+                use crate::ode::linear::DORMANT_STATES_COV;
+                DORMANT_STATES_COV.with(|c| c.set(0));
+                subject_adjoint_cov_hessian(
+                    &model,
+                    &s,
+                    &params,
+                    &x,
+                    eta.as_slice(),
+                    Objective::Focei,
+                )
+                .expect("in scope");
+                DORMANT_STATES_COV.with(|c| c.get())
+            })
+            .expect("spawn")
+            .join()
+            .expect("join")
+    });
+    assert!(
+        dormant_cov > 0,
+        "the covariance recording left out no dormant state"
+    );
+    let (hess, _) = hessian_gaps_for(&model, &s, Objective::Focei);
+    eprintln!(
+        "dormant on the covariance types {dormant_cov}; Hessian vs reconverged FD {hess:.2e}"
+    );
+    assert!(hess < hessian_tol, "Hessian vs reconverged FD {hess:.2e}");
 }
 
 /// The adjoint on the exact linear path (#852, Teun on #2093): its recordings run the
