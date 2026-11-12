@@ -637,6 +637,14 @@ pub(super) trait Alg {
             .map(|(&x, &y)| self.ins(Inst::Select(c, x, y)))
             .collect()
     }
+    /// `guard_floor(lo)`: `x` when `x ≥ lo`, else the constant `lo`, so a `NaN` floors. The
+    /// one test every type makes: `f64`'s `if v >= lo`, `DualV`'s `!(v ≥ lo)` → `constant(lo)`.
+    fn guard_floor(&mut self, x: &[V], lo: f64) -> Lanes {
+        let lo = self.k(lo);
+        let keep = self.ins(Inst::Cmp(Cc::Ge, x[0], lo));
+        let floor = self.constant(lo);
+        self.select(keep, x, &floor)
+    }
     /// Lane by lane — every type's `+`.
     fn add(&mut self, a: &[V], b: &[V]) -> Lanes {
         a.iter()
@@ -793,20 +801,11 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
             let l = match op {
                 Unary::Exp => al.exp(&x),
                 Unary::Ln => {
-                    // `guard_floor(1e-30)`: `f64::max` (a NaN floors) on one lane,
-                    // `DualV`'s `!(v ≥ lo)` → `constant(lo)` on a dual — the same test.
-                    let lo = al.k(1e-30);
-                    let keep = al.ins(Inst::Cmp(Cc::Ge, x[0], lo));
-                    let floor = al.constant(lo);
-                    let g = al.select(keep, &x, &floor);
+                    let g = al.guard_floor(&x, 1e-30);
                     al.ln(&g)
                 }
                 Unary::Sqrt => {
-                    // `guard_floor(0.0)`, as `Ln`'s above.
-                    let lo = al.k(0.0);
-                    let keep = al.ins(Inst::Cmp(Cc::Ge, x[0], lo));
-                    let floor = al.constant(lo);
-                    let g = al.select(keep, &x, &floor);
+                    let g = al.guard_floor(&x, 0.0);
                     al.sqrt(&g)
                 }
                 Unary::Abs => al.abs(&x),

@@ -440,8 +440,9 @@ in the last bits (measured: within `4e-15` relative on random programs). An opti
 reads it can then take a slightly different path: on the benchmarks below the objective
 values agree to five or more significant digits, some with one or two iterations more or
 fewer. A block keeps the interpreter if it uses a statement-level `if (cond) { ... }` block,
-`inv_logit`, `logit`, `tanh`, `softplus`, `sin`, `cos`, `pnorm` or `mod`, or reads anything other than the states, the individual
-parameters, its own intermediate variables, literals and the time variables.
+`inv_logit`, `logit`, `tanh`, `softplus`, `sin`, `cos`, `pnorm` or `mod`, or reads anything
+other than the states, the individual parameters, its own intermediate variables, literals and
+the time variables.
 
 Whole fits (FOCEI with the covariance step, one thread) with forward native code alone
 ("before") and with the direct stepper calls, the compiled reverse pass and the PK-space
@@ -503,7 +504,8 @@ quadratic of a quasi-steady-state TMDD model is written with one.
 
 A synthetic 24-subject quasi-steady-state TMDD model with that quadratic written as
 `0.5 * (B + sqrt(B * B + 4 * KSS * CT))`, FOCEI for 15 iterations, one thread, macOS, the median
-of three runs:
+of three runs (the model and the script that writes its data are in
+[#2844](https://github.com/FeRx-NLME/ferx-core/issues/2844)):
 
 | Form of the quadratic | Before (s) | After (s) | OFV |
 |---|---:|---:|---|

@@ -1713,7 +1713,8 @@ fn sqrt_of_a_signed_zero_has_one_sign_on_every_route() {
 
 /// The exact derivatives of `sqrt` against central finite differences of the `f64` program,
 /// through the register code (`Dual2`, the full Hessian) and the native code (`DualF`, the
-/// packed one): the QSS free-drug root, a `sqrt` of a product, and a bare state. The arguments
+/// packed one) and the compiled reverse pass (a taped `DualV` block, the outer gradient's
+/// route): the QSS free-drug root, a `sqrt` of a product, and a bare state. The arguments
 /// are positive: at a floored one the production dual types already differ (`Dual1`/`Dual2`
 /// return a zero derivative, `DualV::sqrt` a `0·∞` NaN), and the compiled code keeps whichever
 /// the type gives, which `sqrt_is_the_interpreter_bit_for_bit_on_every_route_at_the_edges` pins.
@@ -1776,6 +1777,34 @@ fn sqrt_derivatives_match_finite_differences() {
             }
         }
         assert!(x2[2].grad[2] > 0.0 && xf[2].g[2] > 0.0, "a live sqrt rises");
+        // The outer gradient's route: a taped `DualV` block, swept by the compiled reverse
+        // pass. A unit adjoint on one output's value gives its leaf value adjoints — the
+        // gradient in the leaves `x1`, `x3` and every parameter (`x2` is a free input).
+        let mut p = vec![0.9; crate::types::MAX_PK_PARAMS + 2];
+        for (k, &slot) in prog.indiv_to_params_slot.iter().take(3).enumerate() {
+            p[slot] = x[3 + k];
+        }
+        let s = [1.75, 0.0, 0.0, f64::EPSILON];
+        let leaf_of = |i: usize| match i {
+            0 => 0,
+            2 => 1,
+            _ => 2 + prog.indiv_to_params_slot[i - 3],
+        };
+        for o in 0..3 {
+            let mut out_bar = vec![0.0; 3 * 2];
+            out_bar[o * 2] = 1.0;
+            let (adj, _) =
+                taped_leaf_adjoints::<1, 0, false>(reg, (&x[..3], &p, &s), &out_bar, true);
+            for i in [0, 2, 3, 4, 5] {
+                let fd = (step(&[(i, h)])[o] - step(&[(i, -h)])[o]) / (2.0 * h);
+                let got = adj[leaf_of(i) * 2];
+                assert!(
+                    got.is_finite() && fd.is_finite(),
+                    "taped block ∂f{o}/∂{i} at {x:?}: {got} vs {fd}"
+                );
+                worst_g = worst_g.max((got - fd).abs() / (1.0 + fd.abs()));
+            }
+        }
     }
     // Measured (Mac arm64): gradient 1.7e-11 (central differences at h = 1e-5), Hessian 1.8e-8
     // (second differences at h = 1e-4, rounding-bound); the bounds keep 6× and 11× headroom.
