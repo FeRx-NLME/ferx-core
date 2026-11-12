@@ -67,11 +67,6 @@ pub(crate) fn gn_scale(x: &[f64], options: &FitOptions) -> Vec<f64> {
 /// at a radius of 1e-5…3e-8 ended the loop as converged.
 pub(crate) const GN_COLLAPSED_RADIUS: f64 = 1e-3;
 
-/// Fraction of the trust radius below which a step counts as interior: the quadratic
-/// model's own minimiser lies inside the region, so the radius did not cap it. Steihaug
-/// CG returns a step on the boundary (`‖δ‖ = Δ` to rounding) whenever the radius binds.
-pub(crate) const GN_INTERIOR_STEP_FRACTION: f64 = 0.99;
-
 /// Warning for a loop that ended because the trust radius fell below `1e-10` after a
 /// rejected step. Worded "without convergence" so `classify_warning` files it
 /// `Critical`/`Convergence`: it is the run's one non-convergence message (#1049).
@@ -87,25 +82,22 @@ pub(crate) const GN_BUDGET_WARNING: &str =
     "Gauss-Newton: max iterations reached without convergence";
 
 /// Whether an accepted step ends the GN loop as converged on the small-change rule:
-/// the OFV moved by less than `1e-6` relative, from iteration 4 on, **and** the step says
-/// something about stationarity (#2738). It does when the radius it was taken at had not
-/// collapsed (`radius ≥ GN_COLLAPSED_RADIUS`), or when the step was interior to the region
-/// (`‖δ_s‖ < 0.99·radius`) — then the quadratic model's minimiser, the Newton step, is
-/// itself that small, which is a Newton-decrement test. A boundary step at a collapsed
-/// radius is neither: the loop goes on, and ends on the collapse or the budget, with
-/// `converged = false`.
+/// the OFV moved by less than `1e-6` relative, from iteration 4 on, **and** the radius the
+/// step was solved under had not collapsed (`radius ≥ GN_COLLAPSED_RADIUS`, #2738). Below
+/// that radius a small change says nothing about the gradient, so the loop goes on and
+/// ends on the collapse or the budget with `converged = false`.
+///
+/// There is deliberately no "interior step" exception: a Steihaug step strictly inside
+/// the region is not evidence of stationarity, because truncated CG also returns its
+/// partial iterate there when it exhausts its iteration budget with a large residual. A
+/// genuinely converging run is not held back by this either: near the optimum the model
+/// predicts well (`rho > 0.75`), so each accepted step doubles the radius and it is back
+/// above the floor within a few iterations.
 ///
 /// `radius` is the radius the step was solved under, not the post-acceptance one (an
-/// accepted `rho > 0.75` step doubles it); `step_norm_s` is the scaled step's norm.
-pub(crate) fn gn_small_change_converged(
-    rel_change: f64,
-    iter: usize,
-    radius: f64,
-    step_norm_s: f64,
-) -> bool {
-    rel_change < 1e-6
-        && iter > 3
-        && (radius >= GN_COLLAPSED_RADIUS || step_norm_s < GN_INTERIOR_STEP_FRACTION * radius)
+/// accepted `rho > 0.75` step doubles it).
+pub(crate) fn gn_small_change_converged(rel_change: f64, iter: usize, radius: f64) -> bool {
+    rel_change < 1e-6 && iter > 3 && radius >= GN_COLLAPSED_RADIUS
 }
 
 /// Whether a pure Gauss–Newton loop spent its iteration budget (#2799): it ran (`maxiter >
@@ -551,7 +543,7 @@ pub fn run_foce_gn(
 
         // Check convergence. A small change on a boundary step at a collapsed radius is
         // not convergence (#2738): the loop continues to the collapse or the budget.
-        if gn_small_change_converged(rel_change, iter, radius_before, delta_s.norm()) {
+        if gn_small_change_converged(rel_change, iter, radius_before) {
             converged = true;
             if verbose {
                 eprintln!("  Converged: relative OFV change = {:.2e}", rel_change);
@@ -3347,44 +3339,32 @@ mod tests {
         }
     }
 
-    /// #2738: the small-change stop needs the step to say something about stationarity.
-    /// Each pair differs in one input and straddles one arm of the gate. The first row is
-    /// the `warfarin_bloq` tail (rel 5.02e-7 at iteration 31, boundary step at radius
-    /// 9.5e-6), which the old `rel_change < 1e-6 && iter > 3` rule called converged.
-    /// Mutations: drop the radius-floor arm → the healthy-radius row fails; drop the
-    /// interior arm → the interior row fails; drop both (the old rule) → the first row
-    /// passes as converged; `>=` → `>` at the floor → the floor row fails.
+    /// #2738: the small-change stop counts only off a collapsed radius. Each pair differs
+    /// in one input and straddles one condition. The first row is the `warfarin_bloq` tail
+    /// (rel 5.02e-7 at iteration 31, step at radius 9.5e-6), which the old
+    /// `rel_change < 1e-6 && iter > 3` rule called converged. A small step strictly inside
+    /// a collapsed radius is not convergence either: truncated CG returns such a step when
+    /// it exhausts its budget with a large residual (review of #2738), so the rule takes no
+    /// step norm at all. Mutations: drop the radius conjunct (the old rule) → the first row
+    /// passes; `>=` → `>` at the floor → the floor row fails; drop either original
+    /// conjunct → its row fails.
     #[test]
-    fn small_change_is_convergence_only_off_a_collapsed_boundary_step() {
-        let r = 9.5367e-6;
-        // Collapsed radius, step on its boundary: not convergence.
-        assert!(!gn_small_change_converged(5.02e-7, 31, r, r));
+    fn small_change_is_not_convergence_at_a_collapsed_radius() {
+        // Collapsed radius: not convergence, at any relative change.
+        assert!(!gn_small_change_converged(5.02e-7, 31, 9.5367e-6));
+        assert!(!gn_small_change_converged(4.57e-9, 16, 2.9802e-8));
         // Same step under a radius that had not collapsed: the old verdict stands.
-        assert!(gn_small_change_converged(5.02e-7, 31, 0.5, 0.5));
-        assert!(gn_small_change_converged(
-            5.02e-7,
-            31,
-            GN_COLLAPSED_RADIUS,
-            GN_COLLAPSED_RADIUS
-        ));
+        assert!(gn_small_change_converged(5.02e-7, 31, 0.5));
+        assert!(gn_small_change_converged(5.02e-7, 31, GN_COLLAPSED_RADIUS));
         assert!(!gn_small_change_converged(
             5.02e-7,
             31,
-            GN_COLLAPSED_RADIUS * 0.999,
             GN_COLLAPSED_RADIUS * 0.999
         ));
-        // Collapsed radius, interior (Newton) step: the model's minimiser is that close.
-        assert!(gn_small_change_converged(5.02e-7, 31, r, 0.5 * r));
-        assert!(!gn_small_change_converged(
-            5.02e-7,
-            31,
-            r,
-            GN_INTERIOR_STEP_FRACTION * r
-        ));
-        // The two original conditions still gate every arm.
-        assert!(!gn_small_change_converged(2e-6, 31, 0.5, 0.5));
-        assert!(!gn_small_change_converged(5.02e-7, 3, 0.5, 0.5));
-        assert!(gn_small_change_converged(5.02e-7, 4, 0.5, 0.5));
+        // The two original conditions still gate it.
+        assert!(!gn_small_change_converged(2e-6, 31, 0.5));
+        assert!(!gn_small_change_converged(5.02e-7, 3, 0.5));
+        assert!(gn_small_change_converged(5.02e-7, 4, 0.5));
     }
 
     /// #1049: a stop that is not a spent budget carries its own reason and not
