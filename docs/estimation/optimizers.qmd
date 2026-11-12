@@ -474,11 +474,13 @@ re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather t
 leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) do not take the leg.
 
 A `[mixture]` fit does (#2745), since `optimizer = auto` sends it to L-BFGS when the analytic outer
-gradient is in scope. It takes the first leg only, not the rounds below, whose cold solve and Newton
-step score a single population. Each evaluation of a mixture objective solves every class, so its
-leg costs that many times a single population's. Measured on macOS arm64, the leg gained 3.0e-8
-and 0 on `mixture_iv` and `mixture_iv_iov` (both stops were already the minimum) and 0 on the 120-subject
-`mixture_2cpt_oral_iov` example, where it added 12 evaluations to a 35-evaluation fit (449 s to 595 s).
+gradient is in scope. It takes the legs from the incumbent's modes, each class solved at the leg's
+tolerance, but not the rounds below, whose cold solve and Newton step score a single population.
+Each evaluation of a mixture objective solves every class, so its leg costs that many times a single
+population's. On Linux aarch64 the leg gained 9.1e-13 and 1.1e-13 on `mixture_iv` and
+`mixture_iv_iov` (both stops were already the minimum) for 4 and 6 more evaluations (25 against 21,
+36 against 30). On the 120-subject `mixture_2cpt_oral_iov` example it gained 1.8e-8 and added 11
+evaluations to a 35-evaluation fit (395 s to 484 s, macOS arm64).
 
 #### Rounds from outside the incumbent's modes
 

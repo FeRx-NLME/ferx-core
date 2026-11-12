@@ -16722,12 +16722,16 @@ const MIXTURE_FIXTURES: [(&str, &str, Option<&str>); 2] = [
 ];
 
 /// #2745: a mixture's L-BFGS stop gets the verification leg. Measured on `mixture_iv` /
-/// `mixture_iv_iov` (macOS arm64): one leg each, gaining 3.0e-8 and 0, its first evaluation
-/// 2.0e-6 and 6e-9 from the loose fit's OFV, and the leg-on fit within 1e-8 of the leg-off
-/// one (301.582018391 / 470.814251781, both converged). The leg finds nothing on either, so
-/// this pins that it ran, started at the incumbent and did not disturb the fit; the straddle
-/// is the next test. It does not pin the per-class seed: clearing `cached_etas_by_class` at
-/// the leg's start leaves it green, because a cold class solve reaches the same modes here.
+/// `mixture_iv_iov` (Linux aarch64, with the leg at its own tolerance): one leg each, gaining
+/// 9.1e-13 and 1.1e-13, its first evaluation 1.9e-7 and 3.3e-8 from the loose fit's OFV, and
+/// the leg-on fit 1.4e-12 and 0 from the leg-off one (301.582018391 / 470.814251781, both
+/// converged); 25 against 21 evaluations and 36 against 30. macOS arm64 reads the same first
+/// evaluations, gains of 5.7e-13 and 1.1e-13, and 5.7e-14 between the fits. The bounds below
+/// are 10× the worst first evaluation and 700× the worst fit difference. The leg finds
+/// nothing on either, so this pins that it ran, started at the incumbent and did not disturb
+/// the fit; the straddle is two tests down. It does not pin the per-class seed: clearing
+/// `cached_etas_by_class` at the leg's start leaves it green, because a cold class solve
+/// reaches the same modes here.
 #[test]
 fn a_mixture_stop_gets_one_verification_leg() {
     for (model, csv, occ) in MIXTURE_FIXTURES {
@@ -16742,7 +16746,7 @@ fn a_mixture_stop_gets_one_verification_leg() {
             .first
             .expect("the leg's first evaluation is feasible");
         assert!(
-            (first - off.ofv).abs() < 1e-5,
+            (first - off.ofv).abs() < 2e-6,
             "{csv}: the leg starts at the incumbent, first {first} vs {}",
             off.ofv
         );
@@ -16762,10 +16766,57 @@ fn a_mixture_stop_gets_one_verification_leg() {
             off.n_iterations
         );
         assert!(
-            (on.ofv - off.ofv).abs() < 1e-6,
+            (on.ofv - off.ofv).abs() < 1e-9,
             "{csv}: {} vs {}",
             on.ofv,
             off.ofv
+        );
+    }
+}
+
+/// #2745 review round 1 #1/#2: a mixture's leg solves every class at the leg tolerance. The
+/// mixture branch of the objective was handed the fit's options, not the leg's, so the leg was
+/// a restart at the fit's own `inner_tol` — the configuration that gains exactly 0 from a stuck
+/// stop (#2462) — and every other `a_mixture_*` test stayed green. Read where the tolerance is
+/// consumed (`mixture_ofv_with_modes`), not where it is chosen. With the leg off, or with the
+/// mixture calls handed `options` again, no evaluation runs at `UNPROFILED_VERIFY_INNER_TOL`.
+#[test]
+fn a_mixture_leg_solves_its_classes_at_the_leg_tolerance() {
+    use crate::estimation::mixture::MIXTURE_OFV_INNER_TOLS;
+    let fit_tol = FitOptions::default().inner_tol;
+    assert!(
+        fit_tol > UNPROFILED_VERIFY_INNER_TOL,
+        "the two tolerances must differ for this test to tell them apart"
+    );
+    for (model, csv, occ) in MIXTURE_FIXTURES {
+        let tols_of = |on: bool| {
+            MIXTURE_OFV_INNER_TOLS.with(|t| t.borrow_mut().clear());
+            let (_, legs) = mixture_fit(model, csv, occ, on);
+            (
+                MIXTURE_OFV_INNER_TOLS.with(|t| t.borrow_mut().split_off(0)),
+                legs.len(),
+            )
+        };
+        let (on, n_legs) = tols_of(true);
+        let (off, _) = tols_of(false);
+        let at = |tols: &[f64], tol: f64| tols.iter().filter(|t| **t == tol).count();
+        assert_eq!(n_legs, 1, "{csv}");
+        assert!(
+            at(&on, UNPROFILED_VERIFY_INNER_TOL) > 0,
+            "{csv}: the leg's evaluations run at the leg tolerance: {on:?}"
+        );
+        assert!(
+            at(&on, fit_tol) > 0,
+            "{csv}: the fit before the leg runs at its own: {on:?}"
+        );
+        assert_eq!(
+            at(&on, UNPROFILED_VERIFY_INNER_TOL) + at(&on, fit_tol),
+            on.len(),
+            "{csv}: no third tolerance: {on:?}"
+        );
+        assert!(
+            !off.is_empty() && at(&off, fit_tol) == off.len(),
+            "{csv}: with the leg off every evaluation is at the fit's tolerance: {off:?}"
         );
     }
 }

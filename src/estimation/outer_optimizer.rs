@@ -6295,8 +6295,8 @@ pub(crate) const UNPROFILED_VERIFY_GAIN: f64 = 3e-5;
 /// stops are bare `Failure`s the plateau rule accepts or tolerance stops met mid-descent.
 /// Not a quadrature objective, which has reachable stops
 /// (`gradient_run_has_reachable_stops`) and its own noise floor. A mixture takes the
-/// first, incumbent-seeded leg (#2745) but not the [`LegStart`] passes, which score the
-/// single-population objective.
+/// incumbent-seeded legs (#2745), each class's inner solve at the leg tolerance, but not
+/// the [`LegStart`] passes, which score the single-population objective.
 pub(crate) fn unprofiled_verify_applies(algo: nlopt::Algorithm, reachable_stops: bool) -> bool {
     matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp) && !reachable_stops
 }
@@ -6573,7 +6573,8 @@ pub(crate) fn verified_stop_owes_a_restart(best: f64, cold: f64) -> bool {
         || cold_solve_beats_best_seen(Some(cold), Some(best)).is_some()
 }
 
-/// The fit's own state a pass can leave behind, restored when the pass is discarded.
+/// The fit's own state a pass can leave behind, restored when the pass is discarded, and
+/// whether the fit takes passes at all (`mixture`).
 pub(crate) struct PassState<'a> {
     pub(crate) basin_probe_fired: &'a std::cell::Cell<bool>,
     pub(crate) stagnation_latched: &'a std::sync::atomic::AtomicBool,
@@ -6600,12 +6601,12 @@ pub(crate) fn drive_leg_passes<V>(
     stop_is_free: impl FnOnce() -> bool,
     mut pass: impl FnMut(LegStart, &V) -> V,
 ) -> V {
+    if state.mixture {
+        return warm;
+    }
     let mut verdict = warm;
     let mut stop_is_free = Some(stop_is_free);
     for start in [LegStart::ColdModes, LegStart::NewtonStep] {
-        if state.mixture {
-            break;
-        }
         let probe_fired = state.basin_probe_fired.get();
         if !leg_pass_applies(start, end_of(&verdict), probe_fired, cancelled()) {
             continue;
@@ -7205,13 +7206,21 @@ fn optimize_nlopt_attempt_probed(
                     .then_some(state.cached_etas_by_class.as_slice());
                 let mut m = if grad.is_some() && model.n_kappa > 0 {
                     let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
-                        model, population, &params, options, warm,
+                        model,
+                        population,
+                        &params,
+                        eval_options,
+                        warm,
                     );
                     mixmodes = Some(modes);
                     m
                 } else {
                     crate::estimation::mixture::mixture_ofv(
-                        model, population, &params, options, warm,
+                        model,
+                        population,
+                        &params,
+                        eval_options,
+                        warm,
                     )
                 };
                 let stats = InnerLoopStats {
@@ -7489,7 +7498,7 @@ fn optimize_nlopt_attempt_probed(
                         model,
                         population,
                         &params,
-                        options,
+                        eval_options,
                         mev,
                         mixmodes.as_ref(),
                     )
@@ -7499,7 +7508,7 @@ fn optimize_nlopt_attempt_probed(
                             population,
                             &x,
                             init_params,
-                            options,
+                            eval_options,
                         )
                     })
                 } else {
