@@ -3418,39 +3418,7 @@ fn fallback_certifier_honours_the_stall_stop_on_a_noise_floored_objective() {
 fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     use crate::parser::model_parser::parse_model_string;
     let model = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
-    let subject = Subject {
-        obs_rgroup: Vec::new(),
-        id: "1".into(),
-        doses: vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs_times: vec![0.5, 1.0, 2.0, 6.0, 12.0, 24.5, 25.0, 26.0, 30.0, 36.0],
-        obs_raw_times: Vec::new(),
-        observations: vec![3.0, 6.0, 8.0, 9.0, 8.5, 12.0, 14.0, 16.0, 15.0, 14.0],
-        obs_cmts: vec![1; 10],
-        covariates: HashMap::new(),
-        dose_covariates: Vec::new(),
-        obs_covariates: Vec::new(),
-        pk_only_times: Vec::new(),
-        pk_only_raw_times: Vec::new(),
-        reset_period_times: Vec::new(),
-        pk_only_covariates: Vec::new(),
-        reset_times: Vec::new(),
-        reset_covariates: Vec::new(),
-        cmt_toggles: Vec::new(),
-        cens: vec![0; 10],
-        occasions: vec![1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
-        obs_l2: Vec::new(),
-        dose_occasions: vec![1, 2],
-        reset_occasions: Vec::new(),
-        pk_only_occasions: Vec::new(),
-        fremtype: Vec::new(),
-        obs_records: vec![],
-        endpoint_covariates: Vec::new(),
-        filled_cells: Vec::new(),
-        simulated_mixnum: None,
-    };
+    let subject = transit_iov_walk_subject();
     let params = model.default_params.clone();
     let solve = |tol: f64| {
         let r = find_ebe_iov(
@@ -3505,6 +3473,115 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
         "at tol 1e-10 the solve must converge with its gradient below tol, not stop on a plateau \
          or give up (converged {conv}, max |g| {gmax:e})"
     );
+}
+
+/// #2868 on a closed form with an ODE twin, IOV side: a transit + IOV subject earns the
+/// integrating step only at an iterate the twin serves. The model-level gate is open for
+/// both solves (asserted), so the difference between them is the per-iterate filter's: a
+/// cold start the absorption walk serves keeps the roundoff step on every call, and a start at
+/// `κ_occ2 = 6`, where the second dose's pair is in flip-flop, takes `1e-3` on its first.
+/// Dropping the filter reddens the cold solve, and a filter that never opens the warm one.
+#[test]
+fn a_transit_iov_fd_search_takes_the_integrating_step_only_where_the_twin_serves() {
+    use crate::parser::model_parser::parse_model_string;
+    let mut model = parse_model_string(TRANSIT_IOV_MODEL).expect("parse transit IOV");
+    model.gradient_method = GradientMethod::Fd;
+    let subject = transit_iov_walk_subject();
+    let params = model.default_params.clone();
+    assert_eq!(
+        model_integrating_fd_step(&model),
+        Some(1e-3),
+        "the transit model counts its ODE twin as its integrator"
+    );
+    // Stacked layout [η_V, κ_occ1, κ_occ2]; at κ_occ2 = 6, ke = 0.2·e⁶/10 = 8.07 ≥ KTR = 4.
+    let flipped = [0.0, 0.0, 6.0];
+    assert!(
+        std::ptr::eq(
+            crate::pk::effective_model_for_eval_iov(&model, &subject, &params.theta, &[0.0; 3]),
+            &model
+        ),
+        "fixture drift: κ = 0 must be served by the absorption walk"
+    );
+    assert!(
+        !std::ptr::eq(
+            crate::pk::effective_model_for_eval_iov(&model, &subject, &params.theta, &flipped),
+            &model
+        ),
+        "fixture drift: κ_occ2 = 6 must send the subject to the twin"
+    );
+    let steps = |init: Option<&[f64]>, init_is_mode: bool| {
+        arm_ebe_fd_calls();
+        find_ebe_iov(
+            &model,
+            &subject,
+            &params,
+            200,
+            1e-6,
+            init,
+            None,
+            EbeVariance::Conditional,
+            init_is_mode,
+        );
+        let calls = take_ebe_fd_calls();
+        assert!(!calls.is_empty(), "an FD solve differences its objective");
+        calls.into_iter().map(|c| c.0).collect::<Vec<_>>()
+    };
+
+    let cold = steps(None, false);
+    assert!(
+        cold.iter().all(Option::is_none),
+        "a walk-served solve keeps the roundoff step on every call: {cold:?}"
+    );
+    // Certified, so the start is kept: uncertified, its objective is over the ODE + IOV
+    // start-rejection gate and the search restarts at κ = 0, in the walk's domain.
+    let warm = steps(Some(&flipped), true);
+    assert_eq!(
+        warm.first(),
+        Some(&Some(1e-3)),
+        "a twin-served start takes the integrating step: {warm:?}"
+    );
+    assert!(
+        warm.iter().all(|h| h.is_none() || *h == Some(1e-3)),
+        "one of the two steps: {warm:?}"
+    );
+}
+
+/// Two doses on two occasions, ten observations, for [`TRANSIT_IOV_MODEL`]: at κ = 0 the
+/// absorption walk serves every (dose, interval) pair.
+fn transit_iov_walk_subject() -> Subject {
+    Subject {
+        obs_rgroup: Vec::new(),
+        id: "1".into(),
+        doses: vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        obs_times: vec![0.5, 1.0, 2.0, 6.0, 12.0, 24.5, 25.0, 26.0, 30.0, 36.0],
+        obs_raw_times: Vec::new(),
+        observations: vec![3.0, 6.0, 8.0, 9.0, 8.5, 12.0, 14.0, 16.0, 15.0, 14.0],
+        obs_cmts: vec![1; 10],
+        covariates: HashMap::new(),
+        dose_covariates: Vec::new(),
+        obs_covariates: Vec::new(),
+        pk_only_times: Vec::new(),
+        pk_only_raw_times: Vec::new(),
+        reset_period_times: Vec::new(),
+        pk_only_covariates: Vec::new(),
+        reset_times: Vec::new(),
+        reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
+        cens: vec![0; 10],
+        occasions: vec![1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+        obs_l2: Vec::new(),
+        dose_occasions: vec![1, 2],
+        reset_occasions: Vec::new(),
+        pk_only_occasions: Vec::new(),
+        fremtype: Vec::new(),
+        obs_records: vec![],
+        endpoint_covariates: Vec::new(),
+        filled_cells: Vec::new(),
+        simulated_mixnum: None,
+    }
 }
 
 /// #1082 PR3: the one nested model the analytic walks decline — a closed-form transit
@@ -7092,7 +7169,7 @@ fn the_iov_fd_inner_gradient_steps_by_the_engine_from_eta() {
             let s = unlabelled_dose_subject(&m);
             m.gradient_method = GradientMethod::Fd;
             IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
-            EBE_FD_CALLS.with(|c| c.borrow_mut().clear());
+            arm_ebe_fd_calls();
             let ebe = find_ebe_iov(
                 &m,
                 &s,
@@ -7105,7 +7182,7 @@ fn the_iov_fd_inner_gradient_steps_by_the_engine_from_eta() {
                 false,
             );
             let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
-            let calls = EBE_FD_CALLS.with(|c| c.take());
+            let calls = take_ebe_fd_calls();
             assert!(
                 ebe.nll.is_finite() && ebe.nll < 1e19,
                 "{label}, reltol {reltol:?}: EBE objective {}",

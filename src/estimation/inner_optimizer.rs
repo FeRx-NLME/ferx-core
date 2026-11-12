@@ -2747,7 +2747,7 @@ fn find_ebe_solve(
     // `agrad`'s scratch for its analytic-gradient call, kept separate from `obj`'s above.
     // The `match analytic_eta_nll_gradient_with_schedule(...) { ... }` below has its
     // scrutinee's `&mut …borrow_mut()` temporaries live for the *whole* match — including
-    // the `None` arm, which calls `gradient_fd(&obj, ..)` and so re-enters `obj` while
+    // the `None` arm, which calls `fd` and so re-enters `obj` while
     // those borrows are still outstanding. Sharing one RefCell pair between `obj` and
     // `agrad` would panic there with "already borrowed"; separate cells keep the fallback
     // re-entrant.
@@ -3617,9 +3617,28 @@ thread_local! {
     pub(crate) static INNER_AGRAD_ROUTE: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
     /// The `(integrating_step, origin)` of every `ebe_gradient_fd` call on this thread, so a
-    /// test can read which step and which origin each inner solve handed it (#2868).
-    pub(crate) static EBE_FD_CALLS: RefCell<Vec<(Option<f64>, Option<Vec<f64>>)>> =
-        const { RefCell::new(Vec::new()) };
+    /// test can read which step and which origin each inner solve handed it (#2868). `None`
+    /// until a test arms it ([`arm_ebe_fd_calls`]), so the worker threads of the cached fit
+    /// pools, which nothing arms, do not grow it across the lib test run.
+    pub(crate) static EBE_FD_CALLS: RefCell<Option<Vec<EbeFdCall>>> = const { RefCell::new(None) };
+}
+
+/// One `ebe_gradient_fd` call: its `integrating_step` and its `origin`.
+#[cfg(test)]
+pub(crate) type EbeFdCall = (Option<f64>, Option<Vec<f64>>);
+
+/// Start recording [`EBE_FD_CALLS`] on this thread, from empty.
+#[cfg(test)]
+pub(crate) fn arm_ebe_fd_calls() {
+    EBE_FD_CALLS.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// The calls recorded on this thread since [`arm_ebe_fd_calls`], disarming it.
+#[cfg(test)]
+pub(crate) fn take_ebe_fd_calls() -> Vec<EbeFdCall> {
+    EBE_FD_CALLS
+        .with(|c| c.borrow_mut().take())
+        .expect("arm_ebe_fd_calls before take_ebe_fd_calls")
 }
 
 /// IOV inner optimizer: optimizes [bsv_psi, kappa_1, ..., kappa_K] jointly,
@@ -7554,7 +7573,7 @@ const FD_GRADIENT_STEP: f64 = 1e-7;
 const ODE_FD_GRADIENT_STEP: f64 = 1e-3;
 
 /// The `ode_reltol` at which the integrating step is [`ODE_FD_GRADIENT_STEP`]: the default.
-const ODE_FD_GRADIENT_STEP_RELTOL: f64 = 1e-4;
+const ODE_FD_GRADIENT_STEP_RELTOL: f64 = crate::ode::solver::DEFAULT_RELTOL;
 
 /// The integrating step of the FD inner gradient at `ode_reltol = reltol` (#2868):
 /// [`ODE_FD_GRADIENT_STEP`] scaled by `(reltol / 1e-4)^(1/3)`, between [`FD_GRADIENT_STEP`]
@@ -7564,7 +7583,8 @@ const ODE_FD_GRADIENT_STEP_RELTOL: f64 = 1e-4;
 /// `examples/warfarin_sde` at `1e-6` / `1e-8`, from six starts (every θ scaled by 0.90 to 1.10),
 /// it ended a median 0.009 OFV above the roundoff step, while this rule (`2.15e-4` there)
 /// ended 0.0013 below it, at a median wall ratio of 1.06 (0.81 to 1.30 per start). Exactly
-/// `1e-3` at the default, so the default-tolerance TMDD figures above stand.
+/// `1e-3` at the default, so the default-tolerance TMDD figures above stand. At an `ode_reltol`
+/// looser than the default the step stays at `1e-3`, a direction no fit has measured.
 fn integrating_fd_step(reltol: f64) -> f64 {
     (ODE_FD_GRADIENT_STEP * (reltol / ODE_FD_GRADIENT_STEP_RELTOL).cbrt())
         .clamp(FD_GRADIENT_STEP, ODE_FD_GRADIENT_STEP)
@@ -7577,7 +7597,10 @@ fn integrating_fd_step(reltol: f64) -> f64 {
 /// step only adds truncation error. On `examples/emax_pkpd` (on that path under the default
 /// `auto`) at seven fixed θ scaled by 0.90 to 1.10, `1e-3` left the FD route 3.6e-5 OFV from the
 /// analytic one where `1e-7` left 1.1e-5. A segment the propagator declines is integrated at
-/// the roundoff step, as before #2868; no measured fit has declined one.
+/// the roundoff step, as before #2868; no measured fit has declined one. A closed-form transit
+/// or inverse-Gaussian absorption model counts its ODE twin as its integrator, so it gets the
+/// step too, and the inner solves take it only at an iterate the twin serves (their per-iterate
+/// stall predicate).
 fn model_integrating_fd_step(model: &CompiledModel) -> Option<f64> {
     let opts = model.integrator_spec()?.effective_solver_opts();
     (opts.method != crate::ode::OdeMethod::Linear).then(|| integrating_fd_step(opts.reltol))
@@ -7605,8 +7628,9 @@ fn ebe_gradient_fd(
 ) -> Vec<f64> {
     #[cfg(test)]
     EBE_FD_CALLS.with(|c| {
-        c.borrow_mut()
-            .push((integrating_step, origin.map(<[f64]>::to_vec)))
+        if let Some(calls) = c.borrow_mut().as_mut() {
+            calls.push((integrating_step, origin.map(<[f64]>::to_vec)));
+        }
     });
     match integrating_step {
         Some(step) => gradient_fd_step(obj, x, origin, n, step),

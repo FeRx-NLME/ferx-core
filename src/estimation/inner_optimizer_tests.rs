@@ -7598,14 +7598,14 @@ fn an_fd_inner_search_on_an_ode_subject_reaches_the_analytic_mode() {
     let (mut fd_model, _, _) = tmdd_2868_fixture();
     fd_model.gradient_method = GradientMethod::Fd;
     INNER_AGRAD_ROUTE.with(|c| c.set((0, 0, 0)));
-    EBE_FD_CALLS.with(|c| c.borrow_mut().clear());
+    arm_ebe_fd_calls();
     let fd = find_ebe(&fd_model, &subject, &params, 200, 1e-5, None, None, 0);
     let (a, e, f) = INNER_AGRAD_ROUTE.with(|c| c.get());
     assert!(
         a == 0 && e == 0 && f > 0,
         "fd: {a} analytic / {e} exact / {f} FD"
     );
-    let calls = EBE_FD_CALLS.with(|c| c.take());
+    let calls = take_ebe_fd_calls();
     assert!(
         calls.len() == f && calls.iter().all(|c| *c == (Some(1e-3), None)),
         "every FD step of an ODE solve at the default tolerance takes the 1e-3 step from η: \
@@ -7619,10 +7619,10 @@ fn an_fd_inner_search_on_an_ode_subject_reaches_the_analytic_mode() {
                 abstol: Some(1e-9),
                 ..Default::default()
             });
-        EBE_FD_CALLS.with(|c| c.borrow_mut().clear());
+        arm_ebe_fd_calls();
         find_ebe(&fd_model, &subject, &params, 200, 1e-5, None, None, 0);
     }
-    let tight_calls = EBE_FD_CALLS.with(|c| c.take());
+    let tight_calls = take_ebe_fd_calls();
     assert!(
         !tight_calls.is_empty()
             && tight_calls.iter().all(|c| c
@@ -7635,9 +7635,9 @@ fn an_fd_inner_search_on_an_ode_subject_reaches_the_analytic_mode() {
     let (mut cf_model, cf_subject) = wellidentified_oral_fixture();
     cf_model.gradient_method = GradientMethod::Fd;
     let cf_params = cf_model.default_params.clone();
-    EBE_FD_CALLS.with(|c| c.borrow_mut().clear());
+    arm_ebe_fd_calls();
     find_ebe(&cf_model, &cf_subject, &cf_params, 200, 1e-5, None, None, 0);
-    let cf_calls = EBE_FD_CALLS.with(|c| c.take());
+    let cf_calls = take_ebe_fd_calls();
     assert!(
         !cf_calls.is_empty() && cf_calls.iter().all(|c| *c == (None, None)),
         "every FD step of a closed-form solve takes the roundoff step: {cf_calls:?}"
@@ -7675,9 +7675,9 @@ fn an_fd_inner_search_on_an_ode_subject_reaches_the_analytic_mode() {
             "method {method:?}"
         );
         let lin_params = lin_model.default_params.clone();
-        EBE_FD_CALLS.with(|c| c.borrow_mut().clear());
+        arm_ebe_fd_calls();
         find_ebe(&lin_model, &subject, &lin_params, 200, 1e-5, None, None, 0);
-        let lin_calls = EBE_FD_CALLS.with(|c| c.take());
+        let lin_calls = take_ebe_fd_calls();
         assert!(
             !lin_calls.is_empty() && lin_calls.iter().all(|c| *c == (want, None)),
             "method {method:?} resolving to {resolved:?}: want step {want:?}, {lin_calls:?}"
@@ -7693,9 +7693,10 @@ fn an_fd_inner_search_on_an_ode_subject_reaches_the_analytic_mode() {
     let gap = fd.nll - an.nll;
     let eta_gap = (&fd.eta - &an.eta).abs().max();
     eprintln!("#2868 subject 13: nll fd − analytic {gap:.3e}, η̂ gap {eta_gap:.3e}");
-    // Measured (macOS arm64): 5.891e-6 in nll and 6.860e-5 in η̂ at the integrating step,
-    // 3.043e-1 and 1.320e-2 with `ODE_FD_GRADIENT_STEP` set back to 1e-7. The bounds keep
-    // 17× / 15× headroom over the fix and sit 3000× / 13× under the regression.
+    // Measured at the integrating step: 6.546e-6 in nll and 7.012e-5 in η̂ on Linux x86_64,
+    // 5.891e-6 and 6.860e-5 on macOS arm64. With `ODE_FD_GRADIENT_STEP` set back to 1e-7:
+    // 3.043e-1 and 1.320e-2 on macOS arm64. The bounds keep 15× / 14× headroom over the Linux
+    // figures and sit 3000× / 13× under the regression.
     assert!(
         gap.abs() < 1e-4,
         "FD inner search stopped {gap:.3e} in nll from the mode"
@@ -7768,10 +7769,20 @@ fn ebe_gradient_fd_steps_by_the_integrator_and_scales_from_the_origin() {
 
     let (g, h) = half_steps(Some(&mu), None);
     close("roundoff", &h, &[3.5e-7, 2.5e-7, 1.3e-7]);
+    // The difference before #2868, written out: `1e-7·(1 + |x|)`, origin ignored.
+    let quadratic = |x: &[f64]| x.iter().map(|v| v * v).sum::<f64>();
+    let before: Vec<f64> = (0..3)
+        .map(|i| {
+            let h = 1e-7 * (1.0 + x[i].abs());
+            let (mut plus, mut minus) = (x.to_vec(), x.to_vec());
+            plus[i] = x[i] + h;
+            minus[i] = x[i] - h;
+            (quadratic(&plus) - quadratic(&minus)) / (2.0 * h)
+        })
+        .collect();
     assert_eq!(
-        g,
-        gradient_fd(&obj, &x, 3),
-        "roundoff: bit-identical to gradient_fd"
+        g, before,
+        "roundoff: bit-identical to the difference before #2868"
     );
     let (_, h) = half_steps(Some(&mu), Some(1e-3));
     close("integrating, from μ", &h, &[1.5e-3, 1.5e-3, 1.3e-3]);
@@ -7781,4 +7792,54 @@ fn ebe_gradient_fd_steps_by_the_integrator_and_scales_from_the_origin() {
     close("integrating, from 0", &h, &[3.5e-3, 2.5e-3, 1.3e-3]);
     // Central differences of a quadratic are exact up to roundoff at any step.
     close("gradient", &g, &[5.0, -3.0, 0.6]);
+}
+
+/// #2868 on a closed form with an ODE twin: a transit subject earns the integrating step only
+/// at an iterate the twin serves. The fixture is the crossing case above, whose search starts
+/// in the closed form's domain and ends past the flip-flop abscissa, so one solve has a
+/// roundoff leg and an integrating leg. The model-level gate is open throughout (asserted), so
+/// the first call's roundoff step is the per-iterate filter's alone: dropping it hands every
+/// call `1e-3`, and a filter that never opens hands none of them `1e-3`.
+#[test]
+fn a_transit_fd_search_takes_the_integrating_step_only_past_the_flip_flop_abscissa() {
+    let subject = flip_flop_transit_subject();
+    let mut m = flip_flop_transit_model(4.0, 110.0, 24.0, 0.0);
+    m.gradient_method = GradientMethod::Fd;
+    let p = m.default_params.clone();
+    assert_eq!(
+        model_integrating_fd_step(&m),
+        Some(1e-3),
+        "the transit model counts its ODE twin as its integrator"
+    );
+
+    arm_ebe_fd_calls();
+    let res = find_ebe(&m, &subject, &p, 200, 1e-6, None, None, 0);
+    let calls = take_ebe_fd_calls();
+
+    // The straddle, asserted so the fixture cannot silently stop crossing.
+    assert!(
+        !crate::pk::absorption_flip_flop_at(&m, &subject, &p.theta, &[0.0, 0.0]),
+        "fixture drift: the cold start must be in the closed form's domain"
+    );
+    assert!(
+        crate::pk::absorption_flip_flop_at(&m, &subject, &p.theta, res.eta.as_slice()),
+        "fixture drift: the FD solve must end past the abscissa (eta_hat = {:?})",
+        res.eta.as_slice()
+    );
+
+    assert_eq!(
+        calls.first(),
+        Some(&(None, None)),
+        "the in-domain start is a closed-form solve and keeps the roundoff step"
+    );
+    assert!(
+        calls.contains(&(Some(1e-3), None)),
+        "once past the abscissa the twin integrates and the step is 1e-3: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|c| *c == (None, None) || *c == (Some(1e-3), None)),
+        "one of the two steps, from η: {calls:?}"
+    );
 }
