@@ -1486,11 +1486,6 @@ fn integrate_dense_g<T: PkNum>(
     // guard runs pins its method for exactly this reason, so it cannot switch back.
     let switching = opts.method == OdeMethod::Auto && opts.auto_switch;
     let mut accepted_since_probe = auto_state.accepted_since_probe;
-    let mut switched = false;
-    // A segment that starts on a stiff method was counted as an escalation by the caller (the
-    // guard needs that count before the segment runs), so a later switch must not count it
-    // twice.
-    let mut escalation_counted = method != OdeMethod::EXPLICIT_FALLBACK;
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
@@ -1583,11 +1578,11 @@ fn integrate_dense_g<T: PkNum>(
 
             // Mid-segment stiffness re-probe (#1080 Part C). Read the same discriminator the
             // starting decision used, at the state the segment has actually reached, and swap
-            // an explicit stepper for a stiff one in place when it says stiff. Done here — after the step is committed
-            // and its interpolated reads are taken — so the switch cannot disturb either the
-            // trajectory behind it or the values already saved off it: the new stepper starts
-            // from `(t, u)` exactly as a fresh segment would, and only the steps *after* this
-            // point are taken by it.
+            // an explicit stepper for a stiff one in place when it says stiff. Done here —
+            // after the step is committed and its interpolated reads are taken — so the switch
+            // cannot disturb either the trajectory behind it or the values already saved off
+            // it: the new stepper starts from `(t, u)` exactly as a fresh segment would, and
+            // only the steps *after* this point are taken by it.
             //
             // Reads `PkNum::val` only, like every other comparison a driver makes, so the
             // `T = f64` prediction and the `T = Dual2` sensitivity solve switch at the same
@@ -1596,6 +1591,8 @@ fn integrate_dense_g<T: PkNum>(
                 accepted_since_probe += 1;
             }
             let on_explicit = method == OdeMethod::EXPLICIT_FALLBACK;
+            // Not gated on `on_explicit`: only RK45 returns a stage estimate, so a stiff
+            // stepper never feeds `observe_rk45`, and the verdict below is gated already.
             let stage_escalation = switching
                 && stiffness_indicator.is_some_and(|indicator| auto_state.observe_rk45(indicator));
             // A verdict ratified by the step that reaches `tf` belongs to the next interval:
@@ -1629,24 +1626,19 @@ fn integrate_dense_g<T: PkNum>(
                     stepper = make_stepper::<T>(n, method);
                     stepper.set_dense_required(!interp_at.is_empty());
                     err_exp = stepper.err_exp();
-                    // Both counters are per *segment*, however many times it changes its mind.
-                    // An escalation is an escalation whether the probe reached that verdict at
-                    // the entry state or twenty-five steps in, so a switch onto a stiff method
-                    // joins `auto_stiff_segments` too — which is what keeps the guard's "N of M
-                    // escalations were discarded" count adding up. A segment that started stiff
-                    // was already counted by the caller.
-                    let newly_escalated =
-                        !escalation_counted && method != OdeMethod::EXPLICIT_FALLBACK;
+                    // The switch is one-way, so this block runs at most once per segment, only
+                    // on one that started explicit, and always lands on a stiff method: it is
+                    // the segment's one switch and its one escalation. An escalation is an
+                    // escalation whether the probe reached that verdict at the entry state or
+                    // twenty-five steps in, so the switch joins `auto_stiff_segments` too —
+                    // which is what keeps the guard's "N of M escalations were discarded"
+                    // count adding up. A segment that started stiff was counted by the caller
+                    // and never gets here. Counting every swap is also what makes a demotion,
+                    // were one ever reintroduced, show up as a second switch.
                     if let Some(s) = stats.as_deref_mut() {
-                        if !switched {
-                            s.auto_switched_segments += 1;
-                        }
-                        if newly_escalated {
-                            s.auto_stiff_segments += 1;
-                        }
+                        s.auto_switched_segments += 1;
+                        s.auto_stiff_segments += 1;
                     }
-                    escalation_counted |= newly_escalated;
-                    switched = true;
                     auto_state.reset_rk45_verdict();
                     // The new stepper gets the whole abort budget. `stiff_abort_after` bounds
                     // how long *a method* is allowed to grind on a segment it cannot step, and
@@ -2178,9 +2170,9 @@ fn until_threshold_with(
 
             // Mid-segment stiffness re-probe (#1080 Part C), the dense driver's rule in this
             // driver's loop: while the stepper is explicit, read the same discriminator at the
-            // state just reached and swap in a stiff one when it says stiff. Taken after the crossing test, so a step that
-            // both advances and brackets the crossing still returns through the interpolant of
-            // the stepper that produced it.
+            // state just reached and swap in a stiff one when it says stiff. Taken after the
+            // crossing test, so a step that both advances and brackets the crossing still
+            // returns through the interpolant of the stepper that produced it.
             accepted_since_probe += 1;
             if switching && accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL {
                 accepted_since_probe = 0;
@@ -2193,7 +2185,9 @@ fn until_threshold_with(
                         stepper = make_stepper::<f64>(u.len(), method);
                         stepper.set_dense_required(true);
                         err_exp = stepper.err_exp();
-                        ran_stiff |= method != OdeMethod::EXPLICIT_FALLBACK;
+                        // `resolve_method` returns explicit or stiff, and explicit was
+                        // filtered out above, so the run is now on a stiff stepper.
+                        ran_stiff = true;
                         // Fresh abort budget for the new stepper — see `integrate_dense_g`.
                         clamps = 0;
                     }

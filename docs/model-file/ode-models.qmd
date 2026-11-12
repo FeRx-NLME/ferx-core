@@ -850,7 +850,7 @@ step counts, and ride along in the `ode_solver` warning's `details` payload:
   escalated at the segment's start or a mid-segment re-probe did. Always `0` under a named
   method, so any non-zero value is `auto` at work.
 - **auto-switched segments** — of those, the ones whose stepper changed *part-way through the
-  segment* (see below). One per segment, however many times it changed its mind.
+  segment* (see below). A segment switches at most once, since the switch is one-way.
 - **auto-stiff rejections** — escalations whose result was thrown away and re-solved
   explicitly. A subset of the first, and normally `0`. A non-zero count means the probe was
   right that the system is stiff but the method it picked could not integrate it — try naming
@@ -981,9 +981,9 @@ prediction.
 Being threshold tests, both detectors add a **discontinuity** in the objective as a function
 of θ: a segment whose stage estimate or `|Re λ|max` sits near its threshold can switch at θ
 and not at θ+h, and the two trajectories differ by far more than the solver tolerance. The
-start-of-segment probe and the escalation guard have the same property — re-probing adds up to
-eight more decision points per segment, each of which can only move a segment from explicit to
-stiff. Unlike `ode_stiff_abort_after` this is
+start-of-segment probe and the escalation guard have the same property. On an explicit segment
+the probe adds a decision point every 25 accepted steps and the stage estimate one per step; at
+most one fires, and only towards stiff. Unlike `ode_stiff_abort_after` this is
 still on by default, because on a segment that actually turns stiff the alternative is not a
 slightly different trajectory but a 143 %-wrong one. If a covariance step returns implausible
 standard errors on a model whose `ode_solver` warning reports mid-segment switches, re-run it

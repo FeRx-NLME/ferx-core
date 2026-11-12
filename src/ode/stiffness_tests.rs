@@ -1047,9 +1047,10 @@ fn stiff_then_benign<T: PkNum>() -> impl Fn(&[T], &[T], f64, &mut [T]) {
 /// promote an explicit stepper, never demote a stiff one, so the trajectory is bit-identical to
 /// the stepper pinned to the stiff method and the segment is not counted as switched.
 ///
-/// On `main` the first probe past `t = 1` read non-stiff and swapped Rodas4 for RK45 — a
+/// Before #2845 the first probe past `t = 1` read non-stiff and swapped Rodas4 for RK45 — a
 /// different method for the rest of the segment, which is what moved the objective by up to
-/// 0.14 OFV (and made it jitter along a parameter scan) on a stiff-ish TMDD fit.
+/// 0.4 OFV at default tolerances (and made it jitter along a parameter scan) on the #2845 TMDD
+/// model.
 #[test]
 fn a_segment_that_starts_stiff_is_not_demoted_when_it_relaxes() {
     let rhs = stiff_then_benign::<f64>();
@@ -1060,6 +1061,7 @@ fn a_segment_that_starts_stiff_is_not_demoted_when_it_relaxes() {
         max_abs_re_eigenvalue(&rhs, &u0, &[], 0.0).unwrap() > STIFF_RE_LAMBDA_THRESHOLD,
         "premise: the entry state must read stiff"
     );
+    // Past `t = 1` the system is linear with a constant Jacobian, so one state stands for all.
     let late = [0.3, -0.9, 1.0, 5.0];
     assert!(
         max_abs_re_eigenvalue(&rhs, &late, &[], 5.0).unwrap() < STIFF_RE_LAMBDA_THRESHOLD,
@@ -1137,6 +1139,122 @@ fn the_event_time_driver_does_not_demote_a_stiff_span_either() {
         stiff.0
     );
     assert_eq!(auto.1, stiff.1);
+}
+
+/// `[x, y, z, chz, w]`: [`stiff_then_benign`]'s rotation and accumulator, `z` benign for
+/// `t < 1`, stiff (rate 500) on `[1, 3)` and benign again from `t = 3` — an explicit segment
+/// that the re-probe promotes part-way through and that then relaxes. `w` starts at 0 and
+/// decays at rate 0.1 before `t = 3` and at `late_rate` after: it stays exactly 0, so
+/// `late_rate` changes the Jacobian the probe reads and nothing else.
+fn benign_stiff_then<T: PkNum>(late_rate: f64) -> impl Fn(&[T], &[T], f64, &mut [T]) {
+    move |u: &[T], _p: &[T], t: f64, du: &mut [T]| {
+        du[0] = u[1] * T::from_f64(10.0);
+        du[1] = u[0] * T::from_f64(-10.0);
+        let rate = if (1.0..3.0).contains(&t) { 500.0 } else { 0.1 };
+        du[2] = (T::from_f64(1.0) - u[2]) * T::from_f64(rate);
+        du[3] = (u[0] + T::from_f64(1.5)) * T::from_f64(0.05);
+        du[4] = u[4] * T::from_f64(if t < 3.0 { -0.1 } else { -late_rate });
+    }
+}
+
+/// A segment the re-probe promoted to the stiff stepper keeps it when the system relaxes again
+/// (#2845) — the other way into a stiff stepper mid-segment, which
+/// [`a_segment_that_starts_stiff_is_not_demoted_when_it_relaxes`] does not reach.
+///
+/// The reference is the same segment with `w` stiff after `t = 3`: its probes keep reading
+/// stiff, so it stays on the stiff stepper under any switching rule. `w ≡ 0`, so both systems
+/// evaluate the same right-hand side at every time and take bit-identical steps on one
+/// stepper. A demotion after `t = 3` puts only the relaxed twin back on RK45, and the
+/// trajectories part.
+#[test]
+fn a_segment_promoted_mid_segment_is_not_demoted_when_it_relaxes() {
+    const N: usize = 2;
+    let relaxes = benign_stiff_then::<f64>(0.1);
+    let stays_stiff = benign_stiff_then::<f64>(500.0);
+    let u0 = [1.0, 0.0, 0.0, 0.0, 0.0];
+    let saveat: Vec<f64> = (1..=24).map(|h| h as f64).collect();
+
+    // The straddle: the relaxed twin reads non-stiff after `t = 3` and the reference does not,
+    // so only the relaxed twin is open to a demotion. Each phase is linear with a constant
+    // Jacobian, so one state stands for all of it.
+    let late = [0.3, -0.9, 1.0, 5.0, 0.0];
+    assert!(
+        max_abs_re_eigenvalue(&relaxes, &u0, &[], 0.0).unwrap() < STIFF_RE_LAMBDA_THRESHOLD,
+        "premise: the entry state must read non-stiff, so the segment starts explicit"
+    );
+    assert!(
+        max_abs_re_eigenvalue(&relaxes, &late, &[], 2.0).unwrap() > STIFF_RE_LAMBDA_THRESHOLD,
+        "premise: the system must read stiff on [1, 3)"
+    );
+    assert!(
+        max_abs_re_eigenvalue(&relaxes, &late, &[], 5.0).unwrap() < STIFF_RE_LAMBDA_THRESHOLD,
+        "premise: the relaxed twin must read non-stiff past t = 3"
+    );
+    assert!(
+        max_abs_re_eigenvalue(&stays_stiff, &late, &[], 5.0).unwrap() > STIFF_RE_LAMBDA_THRESHOLD,
+        "premise: the reference must still read stiff past t = 3"
+    );
+
+    let run = |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64])| {
+        let mut stats = OdeSolverStats::default();
+        let sol = solve_ode_with_stats(
+            &rhs,
+            &u0,
+            (0.0, 24.0),
+            &[],
+            &saveat,
+            &loose(),
+            Some(&mut stats),
+        );
+        (sol, stats)
+    };
+    let (relaxed, relaxed_stats) = run(&relaxes);
+    let (reference, reference_stats) = run(&stays_stiff);
+
+    assert_eq!(
+        reference_stats.auto_switched_segments, 1,
+        "premise: the segment must be promoted part-way through: {reference_stats:?}"
+    );
+    assert!(
+        reference.iter().chain(&relaxed).all(|p| p.u[4] == 0.0),
+        "premise: w must stay exactly 0, so the late rate moves no value"
+    );
+    assert!(
+        relaxed_stats.attempted_steps > 4 * crate::ode::solver::AUTO_SWITCH_PROBE_INTERVAL,
+        "premise: enough steps for several probes past t = 3: {relaxed_stats:?}"
+    );
+    assert_eq!(
+        relaxed_stats.auto_switched_segments, 1,
+        "one switch, onto the stiff stepper, and none back: {relaxed_stats:?}"
+    );
+    for (a, b) in reference.iter().zip(&relaxed) {
+        assert_eq!(a.u, b.u, "t={}", a.t);
+    }
+
+    // The same rule in the sensitivity solve: the jet switches at the same step and does not
+    // switch back either, so the analytic gradient differentiates the reported trajectory.
+    let dual_rhs = benign_stiff_then::<Dual1<N>>(0.1);
+    let u_dual: Vec<Dual1<N>> = vec![
+        Dual1::<N>::var(u0[0], 0),
+        Dual1::<N>::var(u0[1], 1),
+        Dual1::<N>::constant(u0[2]),
+        Dual1::<N>::constant(u0[3]),
+        Dual1::<N>::constant(u0[4]),
+    ];
+    let mut dual_stats = OdeSolverStats::default();
+    crate::ode::solver::solve_ode_g_with_stats(
+        &dual_rhs,
+        &u_dual,
+        (0.0, 24.0),
+        &[],
+        &saveat,
+        &loose(),
+        Some(&mut dual_stats),
+    );
+    assert_eq!(
+        relaxed_stats, dual_stats,
+        "the step sequence must not depend on T"
+    );
 }
 
 /// [`latent_binding_rhs`] with a cumulative-hazard accumulator on top (`dCHZ/dt = 0.05 · Cx`),
@@ -1237,6 +1355,60 @@ fn a_stalled_mid_segment_switch_is_discarded_and_re_solved_explicitly() {
     assert!(
         stats.min_step_clamped_steps >= stats.discarded_clamped_steps,
         "{stats:?}"
+    );
+}
+
+/// The event-time guard covers a span that reached the stiff stepper mid-way too: the same
+/// `du/dt = u²` blow-up, with a linear accumulator as the monitor. The span starts explicit,
+/// switches part-way, and the stiff attempt fails, so the guard re-solves it on the explicit
+/// stepper — which makes the outcome pinned RK45's, bit for bit, at the cost of the discarded
+/// attempt's calls on top. A switch that does not mark the span as having run stiff returns
+/// the stiff attempt's own failure unexamined: measured, a different message and state, in
+/// 1,577 RHS calls against the re-solved run's 61,578 and pinned RK45's 60,001.
+#[test]
+fn a_failed_mid_span_switch_is_re_solved_explicitly_by_the_event_time_guard() {
+    use crate::ode::solver::solve_ode_until_threshold;
+    use std::cell::Cell;
+
+    let calls = Cell::new(0usize);
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| {
+        calls.set(calls.get() + 1);
+        du[0] = u[0] * u[0];
+        du[1] = 1.0;
+    };
+    let u0 = [5.0, 0.0];
+    assert!(
+        max_abs_re_eigenvalue(&rhs, &u0, &[], 0.0).unwrap() < STIFF_RE_LAMBDA_THRESHOLD,
+        "premise: the entry state must read non-stiff, so the span starts explicit"
+    );
+    let solve = |opts: &OdeSolverOptions| {
+        calls.set(0);
+        let mut u = u0;
+        let outcome = solve_ode_until_threshold(&rhs, &mut u, (0.0, 0.25), &[], opts, 1, 1.0);
+        (format!("{outcome:?}"), u.map(f64::to_bits), calls.get())
+    };
+    let explicit = solve(&OdeSolverOptions {
+        method: OdeMethod::Rk45,
+        ..loose()
+    });
+    let auto = solve(&loose());
+
+    assert!(
+        explicit.0.starts_with("Failed"),
+        "premise: the blow-up must fail: {}",
+        explicit.0
+    );
+    assert_eq!(
+        (&auto.0, auto.1),
+        (&explicit.0, explicit.1),
+        "the failed stiff attempt must be discarded and the span re-solved explicitly"
+    );
+    assert!(
+        auto.2 > explicit.2,
+        "premise: auto must have run a stiff attempt before the re-solve ({} calls against \
+         pinned rk45's {}), or the span never switched",
+        auto.2,
+        explicit.2
     );
 }
 
