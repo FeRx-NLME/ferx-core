@@ -233,8 +233,8 @@ pub(crate) fn cmt_off_time(
 
 /// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
 /// at event records, and an implied dose is not one. Measured against NONMEM 7.5.1
-/// (`nonmem_anchor/addl_*`), it takes its lag from the dose row whose `ADDL` implies it
-/// and everything else — `F`, the disposition the interval ending at it runs under, and
+/// (`nonmem_anchor/addl_*`), it takes its lag (the compartment's and, since #2367, a
+/// route's own) from the dose row whose `ADDL` implies it, and everything else — `F`, the disposition the interval ending at it runs under, and
 /// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
 /// or after the dose in (`TIME`, file order). The reader stores the governing record's
 /// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
