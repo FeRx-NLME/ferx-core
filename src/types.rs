@@ -6889,6 +6889,17 @@ pub struct SubjectResult {
     /// Normalized prediction discrepancies (simulation-based, no decorrelation).
     /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
     pub npd: Vec<f64>,
+    /// Monte-Carlo expected prediction `E_sim[y]` from the NPDE simulation (NONMEM's
+    /// `$TABLE EPRED`). Empty unless `[fit_options] npde_nsim > 0`. Emitted as the
+    /// `EPRED` column.
+    #[serde(default)]
+    pub epred: Vec<f64>,
+    /// Monte-Carlo population-weighted residual `Σ_sim^(-1/2) (y − E_sim[y])`
+    /// (Monolix `PWRES`, NONMEM `EWRES`), symmetric-root decorrelated. Empty unless
+    /// `[fit_options] npde_nsim > 0`. Emitted as the `PWRES` and `EWRES` columns.
+    /// See [`crate::stats::npde::SubjectNpde::pwres`].
+    #[serde(default)]
+    pub pwres: Vec<f64>,
     pub ofv_contribution: f64,
     pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
