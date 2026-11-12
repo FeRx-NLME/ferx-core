@@ -124,24 +124,29 @@ term.
 The GN loop ends at the first of:
 
 - **Converged, small change:** an accepted step changes the OFV by less than $10^{-6}$ relative
-  to $\max(\lvert\text{OFV}\rvert, 1)$, from iteration 4 on. One such step is enough.
+  to $\max(\lvert\text{OFV}\rvert, 1)$, from iteration 4 on, and the step was not capped by a
+  collapsed radius: either the radius it was taken at is at least $10^{-3}$, or the step is
+  interior to the region (shorter than 0.99 of the radius), so the quadratic model's own
+  minimiser is that close. One such step is enough. A tiny step on the boundary of a radius
+  below $10^{-3}$ changes the OFV little *because* it is tiny, whatever the gradient, so it does
+  not count; the loop goes on and ends on one of the rules below
+  ([#2738](https://github.com/FeRx-NLME/ferx-core/issues/2738)).
 - **Converged, stationary point:** the predicted reduction is below $10^{-10}$ and the scaled
   gradient norm is below $10^{-8}$.
 - **Not converged, trust radius collapsed:** the radius falls below $10^{-10}$, after rejected
   steps or degenerate-BHHH retries. The fit adds the warning "Gauss-Newton: trust radius
-  collapsed" (or "degenerate BHHH Hessian, trust radius collapsed").
+  collapsed without convergence" (or "degenerate BHHH Hessian, trust radius collapsed without
+  convergence"), classified critical, like the budget warning.
 - **Not converged, budget spent:** `maxiter` iterations ran, with the warning "Gauss-Newton:
-  max iterations reached without convergence". A collapsed radius or a cancelled fit currently
-  carries that warning too, next to its own
+  max iterations reached without convergence". Only this stop carries it: a collapsed radius or
+  a cancelled fit reports its own reason alone
   ([#1049](https://github.com/FeRx-NLME/ferx-core/issues/1049)).
 
 This is the loop's verdict, not yet the fit's. Pure `gn` re-checks `converged` afterwards: a
 cold re-solve of the EBEs at the final estimates
 ([#2097](https://github.com/FeRx-NLME/ferx-core/issues/2097)), the covariance step's check that
 the end point is stationary ([#2785](https://github.com/FeRx-NLME/ferx-core/issues/2785)), and a
-check that the final objective is finite can each demote it. The small-change rule has no gradient condition, so
-a tiny step taken after the radius has shrunk also satisfies it
-([#2738](https://github.com/FeRx-NLME/ferx-core/issues/2738)).
+check that the final objective is finite can each demote it.
 
 The optimizer trace (`optimizer_trace = true`) logs one row per step. For GN rows its
 `lm_lambda` column holds the trust radius: the radius the step was tried with on a rejected row,
