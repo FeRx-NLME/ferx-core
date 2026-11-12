@@ -2671,7 +2671,7 @@ fn covariance_step(
             FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
         };
 
-        let fd_floor = fd_step_floors(template, &model.default_params);
+        let fd_floor = fd_step_floors(template, model);
         let stencil = fd_ofv_hessian(
             n,
             x_hat,

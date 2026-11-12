@@ -1397,11 +1397,8 @@ impl<'a> SubjectScoreContext<'a> {
             if self.fixed[k] {
                 continue;
             }
-            let floor = crate::estimation::parameterization::fd_step_floor(
-                self.template,
-                &self.model.default_params,
-                k,
-            );
+            let floor =
+                crate::estimation::parameterization::fd_step_floor(self.template, self.model, k);
             let h = crate::estimation::parameterization::fd_step(1e-4, self.x[k], floor);
             let mut xp = self.x.to_vec();
             let mut xm = self.x.to_vec();
