@@ -635,6 +635,27 @@ preview` shows what is pending. The R wrapper (`../ferx-r`) tracks its own
 user-facing changes in `NEWS.md`, so a cross-repo change may need an entry in
 both.
 
+## Priority labels
+
+Issues and PRs are triaged with four GitHub priority labels (`gh label list`);
+they live only on GitHub, not anywhere in the tree. The axis is **correctness
+severity × how common the trigger**:
+
+| Label | Priority | Scope |
+|-------|----------|-------|
+| `P0` | Critical | silent wrong results / data corruption in common use |
+| `P1` | High | correctness bug or wrong result in realistic use, or loud failure blocking common workflows |
+| `P2` | Medium | edge-case correctness, important features, UX/diagnostics |
+| `P3` | Low | performance, refactors, nice-to-haves, research |
+
+So P0/P1 are about a *wrong answer* (P0 silent in common use, P1 in realistic
+use or a loud blocker), P2 widens to edge-case correctness plus features and
+diagnostics, and P3 is everything not about a wrong result.
+
+**The applied label is the source of truth.** A `P1`/`P2` typed into an issue
+*title* is prose and can disagree with the label actually set — e.g. #1716 is
+titled `(#359 P1)` but carries the `P2` label. Trust the label, not the title.
+
 ## Pull Requests
 
 When creating a PR in this repo, always read `.github/PULL_REQUEST_TEMPLATE.md` and fill every section before calling `gh pr create`.
