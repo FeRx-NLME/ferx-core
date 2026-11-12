@@ -7051,3 +7051,83 @@ fn section_has_barrier_needs_a_rise_and_a_fall() {
     assert!(!section_has_barrier(&nan_seed, &x, &seed));
     assert!(!section_has_barrier(&inf_mid, &x, &seed));
 }
+
+/// #2868: the IOV search's FD gradient takes the integrating step on an adaptively integrated
+/// ODE subject and the roundoff step on a closed-form one or one on the exact matrix-exponential
+/// path, and is stepped from η: it moves `ψ = η + μ`, so it hands `ebe_gradient_fd` μ as the
+/// origin. Read off the calls themselves, on the engines of one model, so the gate straddles:
+/// the regressions this catches are the IOV arm passing no integrating step (or one for a
+/// closed form or a `linear` solve, hence the `auto` leg on this affine `[odes]`), a step that
+/// ignores the fit's tolerance (hence the `1e-6` leg, armed as `fit` arms it), or no origin.
+#[test]
+fn the_iov_fd_inner_gradient_steps_by_the_engine_from_eta() {
+    use crate::ode::OdeMethod;
+    let mu = [0.7];
+    // (fit's ode_method, its ode_reltol, the method the ODE fixture resolves to, and the step
+    // an ODE subject takes: 1e-3·(reltol / 1e-4)^(1/3) when adaptive, roundoff when linear).
+    for (method, reltol, resolved, ode_step) in [
+        (None, None, OdeMethod::Linear, None),
+        (Some(OdeMethod::Rk45), None, OdeMethod::Rk45, Some(1e-3)),
+        (
+            Some(OdeMethod::Rk45),
+            Some(1e-6),
+            OdeMethod::Rk45,
+            Some(2.154_434_690_031_884e-4),
+        ),
+    ] {
+        let _fit =
+            crate::ode::solver::arm_ode_solver_override(crate::ode::solver::OdeSolverOverride {
+                method,
+                reltol,
+                ..Default::default()
+            });
+        for (label, mut m) in unlabelled_dose_models() {
+            if let Some(spec) = m.integrator_spec() {
+                assert_eq!(
+                    spec.effective_solver_opts().method,
+                    resolved,
+                    "{label}, method {method:?}: the leg must resolve to its engine"
+                );
+            }
+            let s = unlabelled_dose_subject(&m);
+            m.gradient_method = GradientMethod::Fd;
+            IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+            EBE_FD_CALLS.with(|c| c.borrow_mut().clear());
+            let ebe = find_ebe_iov(
+                &m,
+                &s,
+                &m.default_params,
+                200,
+                1e-5,
+                None,
+                Some(&mu),
+                EbeVariance::Conditional,
+                false,
+            );
+            let (analytic, fd) = IOV_AGRAD_ROUTE.with(|c| c.get());
+            let calls = EBE_FD_CALLS.with(|c| c.take());
+            assert!(
+                ebe.nll.is_finite() && ebe.nll < 1e19,
+                "{label}, reltol {reltol:?}: EBE objective {}",
+                ebe.nll
+            );
+            assert!(
+                analytic == 0 && fd > 0 && calls.len() == fd,
+                "{label}, reltol {reltol:?}: {analytic} analytic / {fd} FD steps, {} FD calls",
+                calls.len()
+            );
+            let want = ode_step.filter(|_| label.starts_with("ode"));
+            assert!(
+                calls.iter().all(|(step, origin)| {
+                    origin.as_deref() == Some(&mu[..])
+                        && match (step, want) {
+                            (Some(h), Some(w)) => (h / w - 1.0).abs() < 1e-12,
+                            (None, None) => true,
+                            _ => false,
+                        }
+                }),
+                "{label}, method {method:?}, reltol {reltol:?}: want {want:?}, {calls:?}"
+            );
+        }
+    }
+}

@@ -2877,6 +2877,19 @@ fn find_ebe_solve(
     let opted_out = inner_analytic_opted_out(model);
     let profile = inner_profile_enabled();
     let fused_first_gradient = RefCell::new(None::<Vec<f64>>);
+    // Central differences, both FD arms below (#2868).
+    let integrating_step = model_integrating_fd_step(model);
+    let fd = |e: &[f64]| {
+        #[cfg(test)]
+        INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
+        ebe_gradient_fd(
+            &obj,
+            e,
+            None,
+            n_eta,
+            integrating_step.filter(|_| stall_at(e)),
+        )
+    };
     let agrad = |e: &[f64]| -> Vec<f64> {
         if let Some(g) = fused_first_gradient.borrow_mut().take() {
             return g;
@@ -2895,11 +2908,7 @@ fn find_ebe_solve(
             g
         };
         if !use_analytic {
-            return exact().unwrap_or_else(|| {
-                #[cfg(test)]
-                INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
-                gradient_fd(&obj, e, n_eta)
-            });
+            return exact().unwrap_or_else(|| fd(e));
         }
         let t0 = std::time::Instant::now();
         // Invalidated by emptying, so the key buffer survives for the refill below.
@@ -2945,9 +2954,7 @@ fn find_ebe_solve(
                     GRADIENT_TIMINGS.record_analytic(t0.elapsed().as_nanos() as u64);
                     return g;
                 }
-                #[cfg(test)]
-                INNER_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1, c.get().2 + 1)));
-                let g = gradient_fd(&obj, e, n_eta);
+                let g = fd(e);
                 GRADIENT_TIMINGS.record_fd(t0.elapsed().as_nanos() as u64);
                 if profile {
                     PROFILE_INNER_FD_FALLBACK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3609,6 +3616,10 @@ thread_local! {
     /// on the analytic route" distinguishable from "no step ran" (#2209).
     pub(crate) static INNER_AGRAD_ROUTE: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
+    /// The `(integrating_step, origin)` of every `ebe_gradient_fd` call on this thread, so a
+    /// test can read which step and which origin each inner solve handed it (#2868).
+    pub(crate) static EBE_FD_CALLS: RefCell<Vec<(Option<f64>, Option<Vec<f64>>)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// IOV inner optimizer: optimizes [bsv_psi, kappa_1, ..., kappa_K] jointly,
@@ -3876,6 +3887,19 @@ fn find_ebe_iov_seeded(
             frozen,
         )
     };
+    // Central differences, every FD arm below: stepped from η, not ψ (#2868).
+    let integrating_step = model_integrating_fd_step(model);
+    let fd = |p: &[f64]| {
+        #[cfg(test)]
+        IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
+        ebe_gradient_fd(
+            &obj,
+            p,
+            Some(&mu),
+            n_flat,
+            integrating_step.filter(|_| stall_at(p)),
+        )
+    };
     let agrad = |p: &[f64]| -> Vec<f64> {
         if !analytic_iov_inner {
             // The kernel's exact gradient where it serves the subject, a cross-row
@@ -3886,18 +3910,12 @@ fn find_ebe_iov_seeded(
                     IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
                     g
                 }
-                None => {
-                    #[cfg(test)]
-                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-                    gradient_fd(&obj, p, n_flat)
-                }
+                None => fd(p),
             };
         }
         let Some(layout) = &layout else {
             // An unprepared nested subject: no axes, so no walk (`sens_of` declines it).
-            #[cfg(test)]
-            IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-            return gradient_fd(&obj, p, n_flat);
+            return fd(p);
         };
         let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
         // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`; the
@@ -3935,11 +3953,7 @@ fn find_ebe_iov_seeded(
                     IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0 + 1, c.get().1)));
                     g
                 }
-                None => {
-                    #[cfg(test)]
-                    IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-                    gradient_fd(&obj, p, n_flat)
-                }
+                None => fd(p),
             },
         }
     };
@@ -7520,13 +7534,101 @@ fn backtracking_line_search(
     (0.0, f0)
 }
 
+/// Central-difference step of the FD inner gradient on an objective that never integrates,
+/// per unit of `1 + |x|`, where only roundoff limits the difference.
+const FD_GRADIENT_STEP: f64 = 1e-7;
+
+/// Central-difference step of the FD inner gradient on an objective that integrates (#2868),
+/// per unit of `1 + |η|`. An adaptive solve is a different function of η at every step
+/// sequence, so a difference over `2e-7` reads the jump between two sequences as slope, and
+/// the search stops on it at an EBE that is not the mode. On the full-TMDD fixture of #2845
+/// (30 subjects, `rodas4`, `gradient = fd`, default tolerances, 25 `TVKON` points from 1.300
+/// to 1.348, OFV against the analytic inner gradient at the same tolerance), the worst point
+/// was 75.9 OFV off at `1e-7`, 0.135 at `1e-5`, 0.009 at `1e-4`, 0.012 at `1e-3` and 0.205 at
+/// `1e-2`. Under `rk45`, whose step sequence changes more often, `1e-4` still left 0.506 and
+/// `1e-3` 0.125. At `1e-5` / `1e-8` the roundoff step still left 22.9 and the step
+/// [`integrating_fd_step`] gives 0.0011; at `1e-6` / `1e-9`, 0.015 and 0.0007. Taking the
+/// difference at the tightened [`ODE_FD_JACOBIAN_RELTOL`] did no better at `1e-3` and cost
+/// 6× the wall. Same value as [`ODE_FD_JACOBIAN_STEP`], for the same reason. This is the step
+/// at [`ODE_FD_GRADIENT_STEP_RELTOL`]; [`integrating_fd_step`] scales it to the fit's.
+const ODE_FD_GRADIENT_STEP: f64 = 1e-3;
+
+/// The `ode_reltol` at which the integrating step is [`ODE_FD_GRADIENT_STEP`]: the default.
+const ODE_FD_GRADIENT_STEP_RELTOL: f64 = 1e-4;
+
+/// The integrating step of the FD inner gradient at `ode_reltol = reltol` (#2868):
+/// [`ODE_FD_GRADIENT_STEP`] scaled by `(reltol / 1e-4)^(1/3)`, between [`FD_GRADIENT_STEP`]
+/// and [`ODE_FD_GRADIENT_STEP`]. A central difference errs by `h²·f‴/6` from truncation and by
+/// `ε/h` from noise in the objective, so its best step grows as `ε^(1/3)`, and the integrator's
+/// noise is of order `ode_reltol`. A fixed `1e-3` is too long at a tight tolerance: on
+/// `examples/warfarin_sde` at `1e-6` / `1e-8`, from six starts (every θ scaled by 0.90 to 1.10),
+/// it ended a median 0.009 OFV above the roundoff step, while this rule (`2.15e-4` there)
+/// ended 0.0013 below it, at a median wall ratio of 1.06 (0.81 to 1.30 per start). Exactly
+/// `1e-3` at the default, so the default-tolerance TMDD figures above stand.
+fn integrating_fd_step(reltol: f64) -> f64 {
+    (ODE_FD_GRADIENT_STEP * (reltol / ODE_FD_GRADIENT_STEP_RELTOL).cbrt())
+        .clamp(FD_GRADIENT_STEP, ODE_FD_GRADIENT_STEP)
+}
+
+/// [`integrating_fd_step`] at the tolerance `model` integrates at on this thread, where the
+/// fit's override is in force; `None` when it never integrates adaptively. That is a model
+/// with no integrator, and one whose solve resolves to the matrix exponential
+/// ([`OdeMethod::Linear`](crate::ode::OdeMethod::Linear), #852): exact to roundoff, so a long
+/// step only adds truncation error. On `examples/emax_pkpd` (on that path under the default
+/// `auto`) at seven fixed θ scaled by 0.90 to 1.10, `1e-3` left the FD route 3.6e-5 OFV from the
+/// analytic one where `1e-7` left 1.1e-5. A segment the propagator declines is integrated at
+/// the roundoff step, as before #2868; no measured fit has declined one.
+fn model_integrating_fd_step(model: &CompiledModel) -> Option<f64> {
+    let opts = model.integrator_spec()?.effective_solver_opts();
+    (opts.method != crate::ode::OdeMethod::Linear).then(|| integrating_fd_step(opts.reltol))
+}
+
 /// Central finite difference gradient (optimized step size)
 fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
+    gradient_fd_step(obj, x, None, n, FD_GRADIENT_STEP)
+}
+
+/// The inner search's FD gradient: [`gradient_fd`] on an objective that never integrates, the
+/// given `integrating_step` on one that does — `Some` exactly when
+/// [`model_integrating_fd_step`] gives one and the inner solve's per-iterate
+/// [`inner_stall_enabled_at`] / [`inner_stall_enabled_at_iov`] holds. `origin` is the point
+/// the integrating step scales from, `x − origin` being η: the IOV search moves `ψ = η + μ`,
+/// and a step scaled by `|ψ|` would grow with the typical value `μ` carries. `None` is the
+/// origin. The roundoff step ignores it, so an objective that never integrates differences
+/// exactly as before #2868.
+fn ebe_gradient_fd(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &[f64],
+    origin: Option<&[f64]>,
+    n: usize,
+    integrating_step: Option<f64>,
+) -> Vec<f64> {
+    #[cfg(test)]
+    EBE_FD_CALLS.with(|c| {
+        c.borrow_mut()
+            .push((integrating_step, origin.map(<[f64]>::to_vec)))
+    });
+    match integrating_step {
+        Some(step) => gradient_fd_step(obj, x, origin, n, step),
+        None => gradient_fd(obj, x, n),
+    }
+}
+
+/// Central differences of `obj` at `x`, coordinate `i` stepped by
+/// `step · (1 + |x[i] − origin[i]|)` (the origin past its end, or when `None`, is 0).
+fn gradient_fd_step(
+    obj: &dyn Fn(&[f64]) -> f64,
+    x: &[f64],
+    origin: Option<&[f64]>,
+    n: usize,
+    step: f64,
+) -> Vec<f64> {
     let t0 = std::time::Instant::now();
     let mut g = vec![0.0; n];
     let mut x_work = x.to_vec();
     for i in 0..n {
-        let h = 1e-7 * (1.0 + x[i].abs());
+        let o = origin.and_then(|o| o.get(i)).copied().unwrap_or(0.0);
+        let h = step * (1.0 + (x[i] - o).abs());
         x_work[i] = x[i] + h;
         let fp = obj(&x_work);
         x_work[i] = x[i] - h;

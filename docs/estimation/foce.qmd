@@ -327,6 +327,24 @@ Measured on an 8-state neutropenia model with an `if` in `[odes]`, 5112 subjects
 
 The spread that remains is the fit's own tolerance acting on predictions and on which EBE mode a subject lands in. It is not specific to the FD route. A state far below `ode_abstol`, as in `log(state + c)` at its floor, has no usable derivative on any route.
 
+### The FD gradient of the EBE search {#fd-ebe-gradient}
+
+The EBE search takes an exact gradient of the inner objective wherever the recorders serve the subject. Under `gradient = fd`, or for a subject they decline, it takes a central difference. An adaptive integrator does not solve two nearby points with the same step sequence, so their values differ by up to about `ode_reltol` for reasons unrelated to $\eta$. A step of `1e-7` reads that jump as slope, and the search stops short of the mode wherever the jump is larger than the true slope.
+
+So on a model with an integrator, the search differences with a step of `1e-3` per unit of $1 + |\eta|$ at the default `ode_reltol = 1e-4`, the step the [FD Jacobian](#fd-jacobian-tolerance) uses. At a tighter tolerance the step shrinks as `ode_reltol^(1/3)`: truncation error grows as the square of the step and integration noise as its inverse, so the best step follows the cube root of the noise. A closed form keeps a step of `1e-7`, and so does a model on the exact matrix-exponential path (`ode_method = linear`, or `auto` on an affine `[odes]` block), whose solve has no step sequence to jump between. An IOV search with μ-referencing scales the step by $|\eta|$, not by the μ-shifted coordinate it searches over.
+
+Measured on the full-TMDD model of [#2845](https://github.com/FeRx-NLME/ferx-core/issues/2845), 30 subjects, FOCEI, `maxiter = 0`, at 25 values of `TVKON` from 1.300 to 1.348, macOS arm64 ([#2868](https://github.com/FeRx-NLME/ferx-core/issues/2868)). Each cell is the worst distance from the analytic route's objective at the same settings:
+
+| `ode_method`, `ode_reltol` / `ode_abstol` | step `1e-7` (before) | integrating step (now) |
+|---|---|---|
+| `rodas4`, `1e-4` / `1e-6` (default) | 75.9 | 0.012 |
+| `rodas4`, `1e-5` / `1e-8` | 22.9 | 0.0011 |
+| `rodas4`, `1e-6` / `1e-9` | 0.015 | 0.0007 |
+| `rk45`, `1e-4` / `1e-6` | 109.3 | 0.125 |
+| `auto`, `1e-4` / `1e-6` | 173.1 | 0.115 |
+
+Each point is also cheaper: a search that stalls keeps iterating on noise. A fit at a tight tolerance gains less, because the roundoff step stalls less there. On `examples/warfarin_sde` at `1e-6` / `1e-8`, from six starts with every θ scaled by 0.90 to 1.10, the median final OFV was 0.001 lower and the median wall 6% longer, with the wall ratio per start running from 0.81 to 1.30; on four of the six starts the fit reached the old final OFV sooner. From the example's own start the fit ended 0.0037 lower and took 1.39 times as long.
+
 ### Moving boundaries and one-sided derivatives {#moving-boundaries}
 
 A moving boundary — a lagged dose arrival, the rate-on of a lagged infusion, an infusion or zero-order window end — is **not a data record**, so it supplies no parameters of its own: it subdivides the interval that the next record terminates, and every piece of that interval runs on that record's snapshot (#1073). A boundary falling *strictly inside* a record interval therefore has the same covariate snapshot on both sides, and the covariate field jump that used to be injected there is simply absent. Any forcing that straddles the instant — another dose's infusion, a zero-order window, a built-in `R_in` — is still carried in both velocities, so the rate and mass jumps stay exact.

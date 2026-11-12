@@ -841,8 +841,10 @@ pub(crate) fn format_salvage_note(ids: &[&str], n_total: usize) -> Option<String
 ///
 /// Measured on the TMDD QSS fixture from its true parameters: the FD inner (EBE) gradient reads
 /// integration noise and stalls 49 OFV above the analytic route at the default tolerance,
-/// recovering to 24 OFV at `1e-6` / `1e-8` and fully at `1e-9`. So the advice has two halves and
-/// each is gated on being true:
+/// recovering to 24 OFV at `1e-6` / `1e-8` and fully at `1e-9`. Those figures predate the
+/// integrating step of the FD inner gradient (#2868), which on the full-TMDD fixture of #2845 took
+/// the same kind of stall from 75.9 OFV to 0.012 at the default tolerance; the QSS fixture has not
+/// been re-measured. So the advice has two halves and each is gated on being true:
 ///
 /// * tighten — only when the current tolerance is looser than the plateau, and the `1e-9`
 ///   escalation is named because `1e-6` recovers only part of the stall on that model;
