@@ -112,7 +112,7 @@ fn from_budget_spends_the_budget_on_the_outer_level_first() {
 #[test]
 fn a_zero_budget_falls_back_to_the_engine_default() {
     // `0` means "the engine default", not "let Rayon decide" — whatever an
-    // unpinned `fit()` would run on. That is cores-minus-one capped at 8, unless
+    // unpinned `fit()` would run on. That is cores minus one, at least two where two cores exist, capped at 8, unless
     // a CLI explicitly sized the process-wide pool, so the plan has to resolve it
     // through the same helper `default_fit_pool` sizes itself with.
     let expected = crate::api::effective_default_threads();

@@ -625,8 +625,8 @@ pub(crate) fn nn_regularization_unapplied_warning(
 /// same process can use different thread counts). When `None`, the shared
 /// big-stack fit pool is used, sized to the width a front end declared with
 /// [`configure_global_thread_pool`](crate::configure_global_thread_pool) if any,
-/// else a positive `RAYON_NUM_THREADS` (#2800), else available cores minus one
-/// capped at 8 (#707).
+/// else a positive `RAYON_NUM_THREADS` (#2800), else available cores minus one,
+/// at least two where two cores exist, capped at 8 (#707).
 /// Rayon's own global pool is not used either way, and `--threads N` no longer
 /// sizes it (#1460).
 ///

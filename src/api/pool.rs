@@ -880,8 +880,8 @@ impl PoolPlan {
     /// `3 × 2`, leaving two threads unused rather than oversubscribing.
     ///
     /// `total_threads = 0` means "the engine default" — whatever an unpinned
-    /// `fit()` would run on, which is available-cores-minus-one capped at 8
-    /// unless a CLI sized the process-wide pool via
+    /// `fit()` would run on, which is available cores minus one, at least two where
+    /// two cores exist, capped at 8, unless a CLI sized the process-wide pool via
     /// [`configure_global_thread_pool`], in which case that explicit width wins.
     /// `n_units = 0` yields a single-replicate plan.
     pub fn from_budget(total_threads: usize, n_units: usize) -> Self {
