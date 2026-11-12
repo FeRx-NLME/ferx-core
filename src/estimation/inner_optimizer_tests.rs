@@ -7695,8 +7695,9 @@ fn an_fd_inner_search_on_an_ode_subject_reaches_the_analytic_mode() {
     eprintln!("#2868 subject 13: nll fd − analytic {gap:.3e}, η̂ gap {eta_gap:.3e}");
     // Measured at the integrating step: 6.546e-6 in nll and 7.012e-5 in η̂ on Linux x86_64,
     // 5.891e-6 and 6.860e-5 on macOS arm64. With `ODE_FD_GRADIENT_STEP` set back to 1e-7:
-    // 3.043e-1 and 1.320e-2 on macOS arm64. The bounds keep 15× / 14× headroom over the Linux
-    // figures and sit 3000× / 13× under the regression.
+    // 4.210e-3 and 1.975e-3 on Linux x86_64, 3.043e-1 and 1.320e-2 on macOS arm64. The bounds
+    // keep 15× / 14× headroom over the Linux fix and sit 42× / 2× under the Linux regression, so
+    // the nll bound is the one that catches it; the η̂ bound only just does on Linux.
     assert!(
         gap.abs() < 1e-4,
         "FD inner search stopped {gap:.3e} in nll from the mode"
