@@ -928,6 +928,8 @@ pub(crate) fn compute_subject_results(
                 // Filled post-fit (only when npde_nsim > 0); see compute_npde_npd.
                 npde: vec![],
                 npd: vec![],
+                epred: vec![],
+                pwres: vec![],
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
