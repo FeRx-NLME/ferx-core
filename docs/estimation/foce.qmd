@@ -343,7 +343,10 @@ Measured on the full-TMDD model of [#2845](https://github.com/FeRx-NLME/ferx-cor
 | `rk45`, `1e-4` / `1e-6` | 109.3 | 0.125 |
 | `auto`, `1e-4` / `1e-6` | 173.1 | 0.115 |
 
-Each point is also cheaper: a search that stalls keeps iterating on noise. A fit at a tight tolerance gains less, because the roundoff step stalls less there. On `examples/warfarin_sde` at `1e-6` / `1e-8`, from six starts with every θ scaled by 0.90 to 1.10, the median final OFV was 0.001 lower and the median wall 6% longer, with the wall ratio per start running from 0.81 to 1.30; on four of the six starts the fit reached the old final OFV sooner. From the example's own start the fit ended 0.0037 lower and took 1.39 times as long.
+Each point is also cheaper: a search that stalls keeps iterating on noise. On Linux x86_64 every row falls by a similar factor: under `rodas4` at the default, 37.9 before and 0.0093 now. A whole fit can take longer, because it no longer stops early. On `examples/warfarin_sde` (macOS arm64, every θ scaled by 0.90 to 1.10):
+
+- **Default tolerance, seven starts:** every fit ended lower, by a median 0.049 OFV. It reached the old final OFV a median 4% sooner, and its total wall was a median 11% longer.
+- **`1e-6` / `1e-8`, six starts:** the gain is smaller, because the roundoff step stalls less there. The median final OFV was 0.001 lower and the median wall 6% longer.
 
 ### Moving boundaries and one-sided derivatives {#moving-boundaries}
 
