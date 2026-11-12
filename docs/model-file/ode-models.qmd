@@ -503,16 +503,26 @@ engine). Before this a block containing `sqrt` stayed on the interpreter; the fr
 quadratic of a quasi-steady-state TMDD model is written with one.
 
 A synthetic 24-subject quasi-steady-state TMDD model with that quadratic written as
-`0.5 * (B + sqrt(B * B + 4 * KSS * CT))`, FOCEI for 15 iterations, one thread, macOS, the median
-of three runs (the model and the script that writes its data are in
-[#2844](https://github.com/FeRx-NLME/ferx-core/issues/2844)):
+`0.5 * (B + sqrt(B * B + 4 * KSS * CT))` or as `(...)^0.5`, FOCEI, one thread, Linux x86_64
+(the model and the script that writes its data are in
+[#2844](https://github.com/FeRx-NLME/ferx-core/issues/2844)). One objective evaluation
+(`maxiter = 0`: the inner EBE solve, no outer gradient) at two fixed parameter points, the
+median of nine runs:
 
-| Form of the quadratic | Before (s) | After (s) | OFV |
-|---|---:|---:|---|
-| `sqrt(...)` | 24.4 | 10.3 | −34.2661, identical |
-| `(...)^0.5` | 6.3 | 6.3 | −34.2661, identical |
+| Form of the quadratic | Point | Before (s) | After (s) |
+|---|---|---:|---:|
+| `sqrt(...)` | initial estimates | 0.442 | 0.171 |
+| `sqrt(...)` | near the optimum | 0.362 | 0.147 |
+| `(...)^0.5` | initial estimates | 0.273 | 0.273 |
+| `(...)^0.5` | near the optimum | 0.249 | 0.249 |
 
-The `^0.5` form is still about 1.6× faster on this fixture; the gap was 3.9× before.
+The objective is identical across builds and forms at each point. An evaluation of the `sqrt`
+form now costs 0.6 of the `^0.5` form; before, it cost 1.4–1.6 times as much. A full fit of the
+`sqrt` form goes from 13.9 s to 4.3 s at the same OFV (−34.2661). Do not compare the two forms
+by full-fit time: their objectives differ in the seventh significant digit from the second
+evaluation on,
+so the optimizer takes a different path for each, and which form is faster to convergence
+depends on the path, not on the cost of an evaluation.
 
 #### Which engine ran it {#rhs-route-note}
 
