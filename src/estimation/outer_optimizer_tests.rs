@@ -16870,6 +16870,56 @@ fn a_mixture_stop_its_leg_does_not_settle_is_not_converged() {
     );
 }
 
+/// #2837 review round 1 #5: [`carry_kept_class_modes`] records after a kept leg and restores
+/// after one that was not.
+#[test]
+fn a_leg_that_was_not_kept_hands_back_the_kept_class_modes() {
+    let (mut kept, mut live) = (0, 7);
+    carry_kept_class_modes(&mut kept, true, &mut live);
+    assert_eq!((kept, live), (7, 7), "a kept leg's modes are recorded");
+    live = 9;
+    carry_kept_class_modes(&mut kept, false, &mut live);
+    assert_eq!((kept, live), (7, 7), "a dropped leg's modes are replaced");
+    live = 11;
+    carry_kept_class_modes(&mut kept, true, &mut live);
+    assert_eq!((kept, live), (11, 11));
+}
+
+/// #2837 review round 1 #5, at fit level: a mixture leg that follows one the fit did not keep
+/// starts from the kept incumbent's per-class modes, not the dropped leg's. The legs are
+/// forced to the cap and every leg after the first is dropped
+/// (`UNPROFILED_VERIFY_DROP_LATER_LEGS`), because whether a leg is kept otherwise turns on
+/// the last digit of the objective: unforced, `mixture_iv` drops legs 1 to 3 on macOS arm64
+/// and only leg 3 on Linux aarch64. Leg 1 starts from the kept leg's modes, so every later
+/// leg must too.
+#[test]
+fn a_mixture_leg_after_a_dropped_one_starts_from_the_kept_class_modes() {
+    for (model, csv, occ) in MIXTURE_FIXTURES {
+        MIXTURE_LEG_START_MODES.with(|m| m.borrow_mut().clear());
+        UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(true));
+        UNPROFILED_VERIFY_DROP_LATER_LEGS.with(|c| c.set(true));
+        let (_, legs) = mixture_fit(model, csv, occ, true);
+        UNPROFILED_VERIFY_DROP_LATER_LEGS.with(|c| c.set(false));
+        UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(false));
+        let starts = MIXTURE_LEG_START_MODES.with(|m| m.borrow_mut().split_off(0));
+        assert_eq!(starts.len(), legs.len(), "{csv}: one start per leg");
+        assert!(
+            starts.len() > 2,
+            "{csv}: a dropped leg is followed: {legs:?}"
+        );
+        assert!(
+            starts.iter().all(|s| !s.is_empty()),
+            "{csv}: per-class modes"
+        );
+        for i in 2..starts.len() {
+            assert!(
+                starts[i] == starts[1],
+                "{csv}: leg {i} follows a dropped leg and must start from the kept modes"
+            );
+        }
+    }
+}
+
 /// #2745: a mixture takes the first leg and no pass; a single population takes both.
 #[test]
 fn a_mixture_takes_no_leg_pass() {

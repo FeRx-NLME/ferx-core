@@ -6510,6 +6510,20 @@ pub(crate) fn keep_verify_leg<G: Clone>(
     }
 }
 
+/// The per-class modes a mixture's next #2462 leg starts from (#2837 review round 1 #5). A
+/// mixture's warm start is `cached_etas_by_class`, which lives in the optimizer state and so
+/// is out of [`keep_verify_leg`]'s reach when a leg ends: it is settled here, when the next
+/// leg takes the state back. After a kept leg (or the fit before the first leg) `live` holds
+/// the incumbent's modes and is recorded; after a leg that was not kept it holds that leg's
+/// incumbent's, a point the fit dropped, and the kept ones go back in.
+pub(crate) fn carry_kept_class_modes<M: Clone>(kept: &mut M, last_leg_kept: bool, live: &mut M) {
+    if last_leg_kept {
+        kept.clone_from(live);
+    } else {
+        live.clone_from(kept);
+    }
+}
+
 /// Where a leg starts. Every leg starts at the incumbent's own modes (#2549) unless it opens
 /// one of the further passes a verified stop gets (#2645): a round of
 /// [`unprofiled_verify_legs`] from somewhere the warm legs cannot reach, which replaces the
@@ -6688,6 +6702,14 @@ thread_local! {
     /// [`LegStart`] passes `drive_leg_passes` reached on this thread, for the tests (#2745).
     pub(crate) static LEG_PASSES_APPLIED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// The per-class modes each #2462 leg of a mixture started from on this thread, for the
+    /// tests ([`carry_kept_class_modes`]).
+    pub(crate) static MIXTURE_LEG_START_MODES: std::cell::RefCell<Vec<Vec<Vec<DVector<f64>>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Test switch: every #2462 leg after the first kept one is treated as not kept, so a
+    /// dropped leg is followed by another whatever the last digits of the objective do.
+    pub(crate) static UNPROFILED_VERIFY_DROP_LATER_LEGS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -8181,6 +8203,10 @@ fn optimize_nlopt_attempt_probed(
         let cold_at_stop = std::cell::RefCell::new(None::<FinalInnerSolve>);
         // Set for the first leg of a pass ([`leg_pass_applies`]).
         let next_start = std::cell::Cell::new(LegStart::Incumbent);
+        // A mixture's per-class modes at the kept incumbent, and whether the leg before this
+        // one was kept ([`carry_kept_class_modes`]). Empty for a single population.
+        let mut kept_class_modes: Vec<Vec<DVector<f64>>> = Vec::new();
+        let mut last_leg_kept = true;
         let mut run_leg = |left: u32| {
             if plateau_tracker.lock().unwrap().2 == 0 {
                 return None;
@@ -8294,6 +8320,16 @@ fn optimize_nlopt_attempt_probed(
             if let Some(modes) = held.filter(|m| m.len() == state.cached_etas.len()) {
                 state.cached_etas = modes;
             }
+            carry_kept_class_modes(
+                &mut kept_class_modes,
+                last_leg_kept,
+                &mut state.cached_etas_by_class,
+            );
+            #[cfg(test)]
+            if init_params.mixture.is_some() {
+                MIXTURE_LEG_START_MODES
+                    .with(|m| m.borrow_mut().push(state.cached_etas_by_class.clone()));
+            }
             *leg_best.borrow_mut() = BestPoint::new();
             leg_first.set(None);
             let mut leg = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
@@ -8318,7 +8354,15 @@ fn optimize_nlopt_attempt_probed(
                 last_gradient.lock().unwrap().take(),
                 best_solve.lock().unwrap().take(),
             );
-            if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
+            #[cfg(test)]
+            let judged = best.filter(|_| {
+                kept_leg_best.is_none() || !UNPROFILED_VERIFY_DROP_LATER_LEGS.with(|c| c.get())
+            });
+            #[cfg(not(test))]
+            let judged = best;
+            last_leg_kept =
+                keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, judged, &mut live);
+            if last_leg_kept {
                 *best_seen.lock().unwrap() = leg_best.borrow().clone();
             }
             kept_best_seen.set(kept_leg_best);
