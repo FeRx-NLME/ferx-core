@@ -300,6 +300,34 @@ fn two_events_at_one_time_step_two_orders_and_give_a_zero_gap() {
     assert_near(&g3.surv, &[2.0 / 3.0, 2.0 / 3.0]);
 }
 
+/// A censoring record that is not the last one does not end follow-up (allowed under
+/// `clock = forward`): the subject censored at 3 with an event at 6 and a censoring at 9
+/// is at risk until 9, so its event at 6 has a risk set of 2 and the curve runs to 9.
+/// Ending follow-up at the first censoring leaves the event at 6 with a risk set of 1;
+/// ending it at the last event drops the row at 9.
+#[test]
+fn a_censoring_that_is_not_the_last_record_does_not_end_follow_up() {
+    let p = pop(vec![
+        subj(
+            "1",
+            vec![
+                rec(3.0, EventType::RightCensored),
+                rec(6.0, EventType::Exact),
+                rec(9.0, EventType::RightCensored),
+            ],
+        ),
+        stream("2", 8.0, &[]),
+    ]);
+    let mut o = opts(20);
+    o.max_order = Some(1);
+    let v = run(RTTE, &p, &o).unwrap();
+    let m = &v.strata[0].mcf.observed;
+    assert_eq!(m.time, [6.0, 8.0, 9.0]);
+    assert_eq!(m.n_risk, [2, 2, 1]);
+    assert_eq!(m.n_event, [1, 0, 0]);
+    assert_eq!(v.horizon, 9.0);
+}
+
 // ── T8: follow-up of the replicates ──────────────────────────────────────────
 
 /// `replicate_follow_up` on one subject: under `Observed` the events after its observed
@@ -448,6 +476,54 @@ fn simulator_gives_one_stream_per_subject_per_replicate() {
     assert!(v.warnings.is_empty(), "{:?}", v.warnings);
 }
 
+/// The reader of the simulated rows on hand-built rows, one filter at a time: a
+/// censoring row is not an event, a row on another cmt is not this endpoint's, and a
+/// row of a subject with no record on the endpoint is not in the VPC. Events land in
+/// their own replicate and subject.
+#[test]
+fn replicate_events_reads_only_the_endpoints_event_rows() {
+    let row = |sim: usize, id: &str, cmt: usize, time: f64, observed: bool| SimulationResult {
+        draw: 1,
+        sim,
+        id: id.into(),
+        time,
+        cmt,
+        ipred: f64::NAN,
+        outcome: SimOutcome::Event { time, observed },
+        mixnum: None,
+    };
+    let streams = [
+        Stream {
+            id: "a".into(),
+            events: vec![],
+            end: 9.0,
+            stratum: 0,
+        },
+        Stream {
+            id: "b".into(),
+            events: vec![],
+            end: 9.0,
+            stratum: 0,
+        },
+    ];
+    let results = [
+        row(1, "a", 2, 1.0, true),
+        row(1, "a", 2, 4.0, true),
+        row(1, "a", 2, 9.0, false),
+        row(1, "b", 3, 2.0, true),
+        row(1, "zz", 2, 3.0, true),
+        row(1, "b", 2, 9.0, false),
+        row(2, "b", 2, 5.0, true),
+        row(2, "b", 2, 9.0, false),
+        SimulationResult {
+            outcome: SimOutcome::Continuous { value: 1.0 },
+            ..row(2, "a", 2, 6.0, true)
+        },
+    ];
+    let reps = replicate_events(&results, 2, &streams, 2);
+    assert_eq!(reps, [[vec![1.0, 4.0], vec![]], [vec![], vec![5.0]]]);
+}
+
 // ── T9: which orders ─────────────────────────────────────────────────────────
 
 /// Ten subjects have three or more events and nine have four, so the default highest
@@ -566,6 +642,18 @@ fn assert_refusal<T: std::fmt::Debug>(got: Result<T, EngineError>, text: &str) {
     assert_eq!(e.to_string(), text);
 }
 
+/// `vpc_tte` on the same population, for the messages whose text depends on the entry
+/// point: both sides of each such gate are asserted in one test.
+fn run_tte(src: &str, p: &Population) -> Result<crate::api::TteVpc, EngineError> {
+    let m = model(src);
+    let o = crate::api::VpcTteOptions {
+        n_sim: 20,
+        ..Default::default()
+    };
+    crate::api::vpc_tte(&m, p, &m.default_params, &o)
+}
+
+/// Each entry point refuses the other's kind of endpoint and names the one to use.
 #[test]
 fn refuses_a_single_event_endpoint() {
     let p = pop(vec![subj("1", vec![rec(1.0, EventType::Exact)])]);
@@ -574,6 +662,14 @@ fn refuses_a_single_event_endpoint() {
         "vpc_rtte: cmt 2 is a single-event TTE endpoint. Use `vpc_tte` for its Kaplan–Meier \
          VPC.",
     );
+    assert_refusal(
+        run_tte(RTTE, &p),
+        "vpc_tte: cmt 2 is a repeated-events (RTTE) endpoint. Use `vpc_rtte` for its \
+         Kaplan–Meier and mean-cumulative-function VPC.",
+    );
+    // Each accepts its own kind.
+    assert!(run(RTTE, &p, &opts(20)).is_ok());
+    assert!(run_tte(SINGLE, &p).is_ok());
 }
 
 #[test]
@@ -596,6 +692,12 @@ fn refuses_several_tte_endpoints_without_cmt() {
     assert_refusal(
         run(TWO_ENDPOINTS, &pop(r1()), &opts(20)),
         "vpc_rtte: the model has TTE endpoints on cmt 2, 3; set `cmt` to the one to check.",
+    );
+    assert_refusal(
+        run_tte(TWO_ENDPOINTS, &pop(r1())),
+        "vpc_tte: the model has TTE endpoints on cmt 2, 3; set `cmt` to the one to check. \
+         Under competing risks 1 − KM of one cause is not its cumulative incidence: the curve \
+         is that cause's survival with the other causes as censoring.",
     );
 }
 
@@ -633,6 +735,11 @@ fn refuses_interval_censoring() {
         run(RTTE, &p, &opts(20)),
         "vpc_rtte: subject 8 has an interval-censored record on cmt 2. The repeated-events \
          curves need exact or right-censored times.",
+    );
+    assert_refusal(
+        run_tte(SINGLE, &p),
+        "vpc_tte: subject 8 has an interval-censored record on cmt 2. A Kaplan–Meier curve \
+         needs exact or right-censored times.",
     );
 }
 
