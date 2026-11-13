@@ -5,7 +5,8 @@
 //! sequence of `f64` operations — `DualV`'s `mul_body` is `g = a.g·b.v + a.v·b.g` per
 //! tangent, and so on — so the whole program, over a given [`Layout`], is a straight-line
 //! program over `f64`s: loads of the inputs' lanes, IEEE arithmetic, selects for the
-//! guards, calls for `exp`/`ln`/`powf`/`round`, and stores of the derivatives' lanes.
+//! guards, `sqrt` (correctly rounded, as Rust's), calls for `exp`/`ln`/`powf`/`round`, and
+//! stores of the derivatives' lanes.
 //!
 //! That one form serves two consumers:
 //!
@@ -88,6 +89,8 @@ pub(super) enum Inst {
     Abs(V),
     Floor(V),
     Ceil(V),
+    /// `f64::sqrt`: IEEE-754 square root, correctly rounded, so no shim is needed.
+    Sqrt(V),
     Call1(Shim1, V),
     /// `powf(a, e)`.
     Powf(V, V),
@@ -494,6 +497,22 @@ impl<'a> Lower<'a> {
         });
         self.unary(a, l, h1, h2)
     }
+    /// `DualV::sqrt`, unguarded: `h1 = 0.5/s`, `h2 = −0.25/(s·s·s)` with `s = √x`.
+    fn sqrt(&mut self, a: &[V]) -> Lanes {
+        let s = self.ins(Inst::Sqrt(a[0]));
+        if self.lanes() == 1 {
+            return vec![s];
+        }
+        let half = self.k(0.5);
+        let h1 = self.ins(Inst::Div(half, s));
+        let h2 = (self.layout.m > 0).then(|| {
+            let mq = self.k(-0.25);
+            let ss = self.ins(Inst::Mul(s, s));
+            let sss = self.ins(Inst::Mul(ss, s));
+            self.ins(Inst::Div(mq, sss))
+        });
+        self.unary(a, s, h1, h2)
+    }
     fn neg(&mut self, a: &[V]) -> Lanes {
         a.iter().map(|&x| self.ins(Inst::Neg(x))).collect()
     }
@@ -594,6 +613,8 @@ pub(super) trait Alg {
     fn exp(&mut self, a: &[V]) -> Lanes;
     /// The type's own `ln`, unguarded.
     fn ln(&mut self, a: &[V]) -> Lanes;
+    /// The type's own `sqrt`, unguarded.
+    fn sqrt(&mut self, a: &[V]) -> Lanes;
     fn abs(&mut self, a: &[V]) -> Lanes;
     fn pow(&mut self, a: &[V], e: &[V]) -> Lanes;
 
@@ -689,6 +710,9 @@ impl Alg for Lower<'_> {
     fn ln(&mut self, a: &[V]) -> Lanes {
         Lower::ln(self, a)
     }
+    fn sqrt(&mut self, a: &[V]) -> Lanes {
+        Lower::sqrt(self, a)
+    }
     fn abs(&mut self, a: &[V]) -> Lanes {
         Lower::abs(self, a)
     }
@@ -778,6 +802,15 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
                     let floor = al.constant(lo);
                     let g = al.select(keep, &x, &floor);
                     al.ln(&g)
+                }
+                Unary::Sqrt => {
+                    // `apply_unary`'s `v ≥ 0` test, then `guard_floor(0.0)`'s constant zero:
+                    // a `NaN` floors and `−0.0` passes through, on one lane and on a dual.
+                    let z = al.k(0.0);
+                    let keep = al.ins(Inst::Cmp(Cc::Ge, x[0], z));
+                    let floor = al.constant(z);
+                    let g = al.select(keep, &x, &floor);
+                    al.sqrt(&g)
                 }
                 Unary::Abs => al.abs(&x),
                 Unary::Floor => {
@@ -888,6 +921,7 @@ pub(super) fn reverse(fwd: &Func) -> Func {
             Inst::Abs(x) => Inst::Abs(r(x)),
             Inst::Floor(x) => Inst::Floor(r(x)),
             Inst::Ceil(x) => Inst::Ceil(r(x)),
+            Inst::Sqrt(x) => Inst::Sqrt(r(x)),
             Inst::Call1(s, x) => Inst::Call1(s, r(x)),
             Inst::Powf(x, y) => Inst::Powf(r(x), r(y)),
             Inst::Cmp(c, x, y) => Inst::Cmp(c, r(x), r(y)),
@@ -972,6 +1006,13 @@ pub(super) fn reverse(fwd: &Func) -> Func {
                 let d = b.push(Inst::Div(g, fw(x)));
                 acc(&mut b, &mut adj, live, x, d, false);
             }
+            Inst::Sqrt(x) => {
+                // `s = √x`: `dx = g·(0.5/s)`, the tape's `h1` times the adjoint.
+                let half = b.k(0.5);
+                let h1 = b.push(Inst::Div(half, map[i]));
+                let d = b.push(Inst::Mul(g, h1));
+                acc(&mut b, &mut adj, live, x, d, false);
+            }
             Inst::Powf(x, y) => {
                 // `r = xʸ`: `dx = g·y·x^(y−1)`; `dy = g·r·ln x` for `x > 0`, and `0` where
                 // the logarithm does not exist (`0^y` is flat in `y` for `y > 0`).
@@ -1040,6 +1081,7 @@ pub(super) fn interpret(f: &Func, args: &mut [&mut [f64]]) {
             Inst::Abs(a) => r(a).abs(),
             Inst::Floor(a) => r(a).floor(),
             Inst::Ceil(a) => r(a).ceil(),
+            Inst::Sqrt(a) => r(a).sqrt(),
             Inst::Call1(Shim1::Exp, a) => r(a).exp(),
             Inst::Call1(Shim1::Ln, a) => r(a).ln(),
             Inst::Call1(Shim1::Round, a) => r(a).round(),
@@ -1100,6 +1142,10 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
             Inst::Abs(a) => (r(a).abs(), if r(a) >= 0.0 { d(a) } else { -d(a) }),
             Inst::Floor(a) => (r(a).floor(), 0.0),
             Inst::Ceil(a) => (r(a).ceil(), 0.0),
+            Inst::Sqrt(a) => {
+                let s = r(a).sqrt();
+                (s, 0.5 / s * d(a))
+            }
             Inst::Call1(Shim1::Exp, a) => {
                 let e = r(a).exp();
                 (e, e * d(a))

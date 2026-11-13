@@ -30331,6 +30331,18 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
     match op {
         Op::Exp => v.exp(),
         Op::Ln => v.guard_floor(1e-30).ln(),
+        // `guard_floor(0.0)` behind the `v >= 0` test the duals' own guard and the `f64` lane
+        // VM (`eval_bytecode`) use, so `−0.0` passes through on every type: `f64::max(−0.0,
+        // 0.0)` may return either zero, which would make the sign of `sqrt(−0.0)` depend on
+        // the platform and differ from the lane VM's (#2844).
+        Op::Sqrt => {
+            let g = if v.val() >= 0.0 {
+                v
+            } else {
+                v.guard_floor(0.0)
+            };
+            g.sqrt()
+        }
         Op::Abs => v.abs(),
         Op::Floor => T::from_f64(v.val().floor()),
         Op::Ceil => T::from_f64(v.val().ceil()),
@@ -30547,13 +30559,9 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                     }
                 });
             }
-            op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
+            op @ (Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
                 let v = pop!();
                 push!(apply_unary(op, v));
-            }
-            Op::Sqrt => {
-                let v = pop!();
-                push!(v.guard_floor(0.0).sqrt());
             }
             Op::InvLogit => {
                 let v = pop!();
