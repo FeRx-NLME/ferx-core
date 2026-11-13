@@ -2532,8 +2532,9 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
 /// infusion ending at `0.1 + 0.7 = 0.7999999999999999` merges with an `SS=1` record at
 /// `0.8`). The walker still equilibrates the record's state there, and an exact
 /// comparison read the record as not reached for the whole segment — train off, earlier
-/// doses live (PR #1589 review finding 1: −51 % at t = 6). [`Self::at_segment`] is the
-/// only constructor, so no caller can apply the gate without the tolerance.
+/// doses live (PR #1589 review finding 1: −51 % at t = 6). [`Self::at_segment`] and its
+/// indexed twin [`Self::at_segment_indexed`] are the only constructors, and both add the
+/// tolerance in one place (`with_cutoff`), so no caller can apply the gate without it.
 ///
 /// It also carries the **EVID=3/4 reset** (#1587), keyed the same way: on the dose
 /// *record*, never its lagged arrival. NONMEM cancels a dose whose record precedes a reset
@@ -2560,9 +2561,37 @@ impl ResetGate {
     /// `reset_floor` it means no EVID=3/4 reset.
     #[inline]
     pub(crate) fn at_segment(doses: &[DoseEvent], reset_floor: f64, t_seg: f64) -> Self {
+        Self::with_cutoff(reset_floor, t_seg, |reached| {
+            crate::dosing::ss_reset_cutoff(doses, reached)
+        })
+    }
+
+    /// [`Self::at_segment`], with the `SS=1` cutoff found by binary search in `index`
+    /// (built from these `doses`) instead of a scan of every dose (#2754). The same
+    /// tolerance, the same cutoff, so the same gate.
+    #[inline]
+    pub(crate) fn at_segment_indexed(
+        index: &crate::dosing::DoseIndex,
+        doses: &[DoseEvent],
+        reset_floor: f64,
+        t_seg: f64,
+    ) -> Self {
+        Self::with_cutoff(reset_floor, t_seg, |reached| {
+            index.ss_cutoff(doses, reached)
+        })
+    }
+
+    /// The one place the `EVENT_MATCH_TOL` reach is added: `cutoff` maps the reached time
+    /// to the `SS=1` record in force there.
+    #[inline]
+    fn with_cutoff(
+        reset_floor: f64,
+        t_seg: f64,
+        cutoff: impl FnOnce(f64) -> Option<usize>,
+    ) -> Self {
         let reached = t_seg + EVENT_MATCH_TOL;
         Self {
-            cutoff: crate::dosing::ss_reset_cutoff(doses, reached),
+            cutoff: cutoff(reached),
             reached,
             reset_floor,
             t_seg,

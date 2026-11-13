@@ -351,6 +351,18 @@ twin), and the IOV walk seeded every θ on its own axis, which left a DCM with I
 outer gradient at all (#1339; on the busulfan reference, 546 BOBYQA evaluations against 41
 L-BFGS ones). Both are gone with the adjoint, which has no θ limit.
 
+### Finite-difference steps on the weights
+
+Where a weight is finite-differenced (the reconverged FD gradient, the FD covariance stencil),
+its step is `h·(1 + |w|)`. That is the unit floor of
+[`fd_hessian_step`](fit-options.qmd#fd-hessian-step-choice), never the `|θ₀|` floor an
+identity-packed θ declared below 1 takes. A weight's θ₀ is its initial draw, not a magnitude
+anyone declared, and the objective's sensitivity to the weight does not scale with that draw.
+On `two_cpt_oral_cov` (8 subjects) with a `CRCL`/`WT` network, a first-layer weight at 1e-4
+gets a reconverged-FD gradient 6.4e-3 off the exact adjoint gradient under the `|θ₀|` floor,
+and 1.1e-8 off under the unit floor, at the default `inner_tol` (#2406; the test
+`a_small_covariate_nn_weight_gets_its_exact_gradient_from_the_fd_route` pins it).
+
 ## Regularization (`nn_l2`, `nn_smooth`)
 
 Because an unregularized DCM can invent spurious covariate-driven

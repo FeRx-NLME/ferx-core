@@ -233,8 +233,8 @@ pub(crate) fn cmt_off_time(
 
 /// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
 /// at event records, and an implied dose is not one. Measured against NONMEM 7.5.1
-/// (`nonmem_anchor/addl_*`), it takes its lag from the dose row whose `ADDL` implies it
-/// and everything else — `F`, the disposition the interval ending at it runs under, and
+/// (`nonmem_anchor/addl_*`), it takes its lag (the compartment's and, since #2367, a
+/// route's own) from the dose row whose `ADDL` implies it, and everything else — `F`, the disposition the interval ending at it runs under, and
 /// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
 /// or after the dose in (`TIME`, file order). The reader stores the governing record's
 /// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
@@ -6889,6 +6889,17 @@ pub struct SubjectResult {
     /// Normalized prediction discrepancies (simulation-based, no decorrelation).
     /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
     pub npd: Vec<f64>,
+    /// Monte-Carlo expected prediction `E_sim[y]` from the NPDE simulation (NONMEM's
+    /// `$TABLE EPRED`). Empty unless `[fit_options] npde_nsim > 0`. Emitted as the
+    /// `EPRED` column.
+    #[serde(default)]
+    pub epred: Vec<f64>,
+    /// Monte-Carlo population-weighted residual `Σ_sim^(-1/2) (y − E_sim[y])`
+    /// (Monolix `PWRES`, NONMEM `EWRES`), symmetric-root decorrelated. Empty unless
+    /// `[fit_options] npde_nsim > 0`. Emitted as the `PWRES` and `EWRES` columns.
+    /// See [`crate::stats::npde::SubjectNpde::pwres`].
+    #[serde(default)]
+    pub pwres: Vec<f64>,
     pub ofv_contribution: f64,
     pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
