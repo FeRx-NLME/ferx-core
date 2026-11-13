@@ -766,7 +766,10 @@ fn classify_warning_covariance_prefix_does_not_claim_convergence() {
         "Outer optimization did not converge".to_string(),
         "[FOCEI] Outer optimization did not converge".to_string(),
         crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string(),
-        "Gauss-Newton: max iterations reached without convergence".to_string(),
+        crate::estimation::gauss_newton::GN_BUDGET_WARNING.to_string(),
+        // #1049: the collapse stops are non-convergence too, so they file with it.
+        crate::estimation::gauss_newton::GN_COLLAPSE_WARNING.to_string(),
+        crate::estimation::gauss_newton::GN_DEGENERATE_COLLAPSE_WARNING.to_string(),
         // trust_region.rs, the four forms.
         "Trust-region did not converge: reached the iteration budget (maxiter = 50). The \
          estimates and any standard errors are reported at a non-stationary point; raise \
@@ -1447,14 +1450,14 @@ fn classify_warning_roundtrips_every_engine_message() {
         ("cancelled by user", Info, "cancelled"),
         // -- gauss_newton.rs -------------------------------------------
         (
-            "Gauss-Newton: trust radius collapsed",
-            Warning,
-            "optimizer_health",
+            "Gauss-Newton: trust radius collapsed without convergence",
+            Critical,
+            "convergence",
         ),
         (
-            "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed",
-            Warning,
-            "optimizer_health",
+            "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed without convergence",
+            Critical,
+            "convergence",
         ),
         (
             "Gauss-Newton: max iterations reached without convergence",

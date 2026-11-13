@@ -2723,6 +2723,8 @@ fn fit_inner(
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
             sr.npde = sn.npde;
             sr.npd = sn.npd;
+            sr.epred = sn.epred;
+            sr.pwres = sn.pwres;
         }
     }
 

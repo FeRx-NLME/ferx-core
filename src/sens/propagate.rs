@@ -939,6 +939,10 @@ fn propagate_bounds_g<T: PkNum>(
     dose_lag_dual: &[T],
     dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
+    // A `DoseIndex` over these `doses` and `dose_lagtimes` (#2754): the reset gate's `SS=1`
+    // cutoff, the doses that can carry a rate, and the doses with a boundary near this
+    // interval come from it instead of a scan of every dose.
+    index: &crate::dosing::DoseIndex,
 ) {
     // Dual clock position of dose `k`'s arrival, `τ_k = t_k + ALAG`. With an estimated
     // lagtime this boundary **moves**: `dose_lag_dual[k]` carries `∂ALAG/∂(θ,η)`, so the
@@ -972,14 +976,26 @@ fn propagate_bounds_g<T: PkNum>(
     // Only boundaries that genuinely *move* are recorded: with no lagtime and no modeled
     // window nothing does, so this stays empty and `dual_pos` below is the same no-op scan it
     // was pre-#486 — the ordinary fixed-dose subject (the hot path) pays nothing.
+    //
+    // Only doses with an arrival or window end near `[bounds[0], bounds[last]]` are visited
+    // (#2754): an entry can match a break only within `1e-9` of it, and every break lies in
+    // that range, so the other doses' entries were dead — yet each cost a dual add and a push,
+    // per dose per interval, which made this list most of a lagged walk. The candidates come
+    // in dose order, so the surviving entries, and so every first match, are the scan's.
     let has_lag = !dose_lag_dual.is_empty();
     let mut moving_bounds: Vec<(f64, T)> = Vec::new();
-    let gate = crate::ode::predictions::ResetGate::at_segment(
+    let gate = crate::ode::predictions::ResetGate::at_segment_indexed(
+        index,
         doses,
         reset_floor,
         bounds.first().copied().unwrap_or(f64::NEG_INFINITY),
     );
-    for (k, d) in doses.iter().enumerate() {
+    let near = match (bounds.first(), bounds.last()) {
+        (Some(&lo), Some(&hi)) => index.near_moving_points(lo, hi),
+        _ => Vec::new(),
+    };
+    for k in near {
+        let d = &doses[k];
         let (t_start, dual_start) = dose_start(k, d);
         if !gate.live(doses, k) {
             continue;
@@ -1025,6 +1041,7 @@ fn propagate_bounds_g<T: PkNum>(
             reset_floor,
             mid,
             false,
+            index,
         );
         apply_step_g(state, dt, pk, pk_model, rates);
     }
@@ -1056,6 +1073,9 @@ fn active_rates_g<T: PkNum>(
     reset_floor: f64,
     mid: f64,
     strict_start: bool,
+    // A `DoseIndex` over these `doses` (#2754): binary-search reset cutoff, and only the
+    // doses that can carry a rate (`duration > 0`), in dose order — the scan's sums exactly.
+    index: &crate::dosing::DoseIndex,
 ) -> (T, T, T, T) {
     let mut rate_central = T::from_f64(0.0);
     let mut rate_periph1 = T::from_f64(0.0);
@@ -1067,8 +1087,10 @@ fn active_rates_g<T: PkNum>(
     // an event — so the two can differ only on a sliver interval that ends on a record and
     // starts just over `EVENT_MATCH_TOL` below it, whose telescoping jet error is O(its
     // width).)
-    let gate = crate::ode::predictions::ResetGate::at_segment(doses, reset_floor, mid);
-    for (k, d) in doses.iter().enumerate() {
+    let gate =
+        crate::ode::predictions::ResetGate::at_segment_indexed(index, doses, reset_floor, mid);
+    for &k in index.infusing() {
+        let d = &doses[k];
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
         let t_end = t_start + d.duration;
@@ -1228,12 +1250,16 @@ fn obs_boundary_correction<T: PkNum>(
     dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
     t: f64,
+    index: &crate::dosing::DoseIndex,
 ) -> Option<(T, bool)> {
     let has_lag = !dose_lag_dual.is_empty();
     // A window stopped by a reset — EVID=3/4 or an `SS=1` record reached at `t` (#1586) — has
     // no moving boundary to correct.
-    let gate = crate::ode::predictions::ResetGate::at_segment(doses, reset_floor, t);
-    for (k, d) in doses.iter().enumerate() {
+    let gate = crate::ode::predictions::ResetGate::at_segment_indexed(index, doses, reset_floor, t);
+    // Only doses with an arrival or window end near `t` can match within `1e-9` (#2754); they
+    // come in dose order, so the first match is the scan's, and no dual is built for the rest.
+    for k in index.near_moving_points(t, t) {
+        let d = &doses[k];
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
         if !gate.live(doses, k) {
@@ -1368,6 +1394,8 @@ fn equilibrate_ss_g<T: PkNum>(
     // as the main walk does for the current pulse — closing the closed-form SS × modeled-dose
     // gap. `None` (a fixed-window infusion) recovers the pre-#486 f64 window behaviour.
     let synthetic_inf: Vec<Option<(T, T)>> = if is_inf { vec![inf] } else { Vec::new() };
+    let synthetic_index = crate::dosing::DoseIndex::new(&synthetic_dose, &synthetic_lag);
+    let empty_index = crate::dosing::DoseIndex::default();
     let bounds: Vec<f64> = if is_inf {
         vec![0.0, dose.duration, dose.ii]
     } else {
@@ -1387,10 +1415,16 @@ fn equilibrate_ss_g<T: PkNum>(
         if forced && !is_inf {
             s[cmt_idx] = s[cmt_idx] + pk.f * T::from_f64(dose.amt);
         }
-        let (doses, lag, inf_dual): (&[DoseEvent], &[f64], &[Option<(T, T)>]) = if forced {
-            (&synthetic_dose, &synthetic_lag, &synthetic_inf)
+        let (doses, lag, inf_dual, index): (&[DoseEvent], &[f64], &[Option<(T, T)>], _) = if forced
+        {
+            (
+                &synthetic_dose,
+                &synthetic_lag,
+                &synthetic_inf,
+                &synthetic_index,
+            )
         } else {
-            (&[], &[], &[])
+            (&[], &[], &[], &empty_index)
         };
         propagate_bounds_g(
             &mut s,
@@ -1402,6 +1436,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &[],
             inf_dual,
             f64::NEG_INFINITY,
+            index,
         );
         Some(s)
     };
@@ -1441,6 +1476,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &[],
             &synthetic_inf,
             f64::NEG_INFINITY,
+            &synthetic_index,
         );
         cycles_run = cycle + 1;
         if ss_dual_cycle_should_stop(cycle, &state, &mut cur, &mut prev) {
@@ -1646,6 +1682,9 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     let governing_record = crate::dosing::governing_record_indices(schedule.events.len(), |i| {
         crate::pk::event_driven::is_record(schedule.events[i].kind)
     });
+    // The dose list indexed once per walk — the schedule's own when `eff_doses` are the doses
+    // it was built from — so no interval, arrival or observation rescans it (#2754).
+    let dose_index = schedule.dose_index_for(eff_doses, schedule.rates_valid_for(eff_doses));
 
     for (i, ev) in schedule.events.iter().enumerate() {
         if ev.kind == EventKind::Reset {
@@ -1676,6 +1715,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 dose_lag_dual,
                 dose_inf_dual,
                 reset_floor,
+                &dose_index,
             );
             cur_t = ev.time;
         }
@@ -1702,8 +1742,13 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 // lag needs no separate suppression here — the walk threads `∂/∂lag`
                 // through the dual sub-interval lengths on either side of the arrival, and
                 // with no jump between them the two flows compose to one fixed-length flow.
-                if !crate::ode::predictions::ResetGate::at_segment(eff_doses, reset_floor, ev.time)
-                    .live(eff_doses, ev.orig_idx)
+                if !crate::ode::predictions::ResetGate::at_segment_indexed(
+                    &dose_index,
+                    eff_doses,
+                    reset_floor,
+                    ev.time,
+                )
+                .live(eff_doses, ev.orig_idx)
                 {
                     continue;
                 }
@@ -1777,6 +1822,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     dose_inf_dual,
                     reset_floor,
                     ev.time,
+                    &dose_index,
                 ) {
                     Some((delta, strict_start)) => {
                         obs_state = state.clone();
@@ -1789,6 +1835,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                             reset_floor,
                             ev.time,
                             strict_start,
+                            &dose_index,
                         );
                         apply_step_g(
                             &mut obs_state,
@@ -2112,8 +2159,16 @@ mod tests {
             };
             // Each route must reach the read it is here for, or the row tests nothing.
             assert_eq!(
-                obs_boundary_correction::<Dual2<1>>(&doses, &lagtimes, &lag_dual, &[], 0.0, 13.0)
-                    .is_some(),
+                obs_boundary_correction::<Dual2<1>>(
+                    &doses,
+                    &lagtimes,
+                    &lag_dual,
+                    &[],
+                    0.0,
+                    13.0,
+                    &crate::dosing::DoseIndex::new(&doses, &lagtimes),
+                )
+                .is_some(),
                 lag > 0.0,
                 "{route}: the t = 13 record does not take the read this row is for"
             );
