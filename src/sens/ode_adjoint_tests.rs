@@ -9079,8 +9079,10 @@ fn a_toggle_alone_takes_the_event_driven_walk() {
 /// instead of the third-order jet its `n = 1` bucket used to run unseeded. The jet's value
 /// part is that same arithmetic, so `q` must agree **bit for bit**, on every subject of the
 /// drug-driven ODE-hazard anchor (an ODE walk with a `[scaling]` readout and an
-/// `[event_model]` on its states, at the anchor's `reltol = 1e-9`). If the stepper's error
-/// control read a jet's derivative lanes, the two would take different steps and part here.
+/// `[event_model]` on its states, at the anchor's `reltol = 1e-9`, on Dormand–Prince). If the
+/// stepper's error control read a jet's derivative lanes, the two would take different steps
+/// and part here. This pins one stepper and one term kind, at points where every derivative
+/// is finite; it does not hold where one is infinite (see the `n = 0` arm).
 #[cfg(feature = "survival")]
 #[test]
 fn ng_jets3_without_random_effects_is_the_jet_value() {

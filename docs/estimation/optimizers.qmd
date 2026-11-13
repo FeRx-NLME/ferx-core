@@ -419,7 +419,9 @@ to 5.3e-4 above NONMEM's optimum and were reported `converged = true`. A restart
 settings gained exactly nothing from any of them.
 
 So since #2462 every such stop that would be reported converged is first checked by a
-*verification leg*: the same optimizer, run again from the best point, with
+*verification leg*, unless the model has no random effects (no `omega` and no `kappa`, #2763):
+with no inner solve there is no tolerance for the leg to tighten. The leg is the same optimizer,
+run again from the best point, with
 
 - the inner loop at `inner_tol = 1e-10` (or your own, if tighter) for that leg only,
 - the leg's own best point, ranked at that tolerance,
@@ -455,7 +457,10 @@ own because its inner solves run to `1e-10`. Over the A2 grid the legs cost 19% 
 in total and doubled the wall time (9.7 s to 20.7 s for 80 fits); on `warfarin_iov` they add 21
 evaluations to a 49-evaluation fit. The fit's reported OFV is still the final cold
 re-solve at your `inner_tol`, so a repaired stop reports, say, +2.75e-7 rather than the +4e-8 the
-leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace) and mixtures do not take the leg.
+leg itself reached. Quadrature objectives (`n_agq > 1`, Laplace), mixtures and models with no
+random effects do not take the leg. On every bundled model with no random effects the leg gained
+nothing (at most 3.4e-13 OFV), and without it each fit ends with the same OFV and the same
+`converged`, so it is skipped.
 
 #### Rounds from outside the incumbent's modes
 
