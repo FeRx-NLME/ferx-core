@@ -1154,17 +1154,24 @@ and called itself converged. The returned estimates are the same in both.
 | `no OFV to compare (start 0 returned)` | The returned start has no OFV, as for `method = vi` under `vi_final_ofv = none`. |
 
 The cutoff is fixed at 1.0 OFV. It is not tied to a convergence tolerance: in 30
-multi-start fits of the example models, starts that stopped on the same optimum
-were at most 2.3e-6 apart under the gradient optimizers and at most 0.33 under
-`bobyqa`, and the nearest different stop was 5.00 away
+multi-start fits of the example models (macOS arm64), starts that stopped on the
+same optimum or the same ridge were at most 2.3e-6 apart in OFV under the
+gradient optimizers and at most 0.33 under `bobyqa`, and the nearest different
+stop was 5.00 away
 ([#2867](https://github.com/FeRx-NLME/ferx-core/issues/2867)). For any other
 cutoff, read the table.
+
+The line compares objective values, not estimates. On a flat objective, starts
+within 1.0 OFV of each other can still differ in θ: the `bobyqa` start 0.33 above
+the best had `TVVMAX` 5.76 and `TVKM` 17.0 against 7.47 and 22.2, further along
+the same Vmax/Km ridge. The `theta` column of the table shows whether the
+estimates agree.
 
 A converged start far above the best is reported at `Info` severity and does not
 change the [fit status](../output.qmd#fit-status). It describes the objective
 surface and the width of the perturbation, not the returned fit. It occurred in
-12 of those 30 fits, none of them at `start_sigma` ≤ 0.5 on a model without a
-covariate network.
+12 of those 30 fits (macOS arm64), none of them at `start_sigma` ≤ 0.5 on a
+model without a covariate network.
 
 The per-start table is `FitResult.starts`, one row per start in start order
 (empty when `n_starts = 1`):
@@ -1174,9 +1181,10 @@ The per-start table is `FitResult.starts`, one row per start in start order
 | `start` | Start index. `0` is the model file's initial values. |
 | `ofv` | The start's reported OFV. Absent for a failed start and for a non-finite OFV. |
 | `objective` | The penalized objective the start was ranked on. Present only under `nn_l2` / `nn_smooth`. |
-| `converged`, `status` | The start's own `converged` and [fit status](../output.qmd#fit-status). |
+| `converged` | The start's own `converged`. |
+| `status`, `status_reasons` | The start's own [fit status](../output.qmd#fit-status), as its token (`converged`, `converged_with_issues`, `not_converged`) and the labels of its reasons. It is what the fit's status would be had this start been returned, before the fit-level multi-start notes are added. Absent for a failed start. |
 | `n_iterations`, `wall_time_secs` | Of this start alone. The starts run in parallel, so the times do not add up to the fit's. |
-| `theta` | The start's final θ, so two optima can be told apart without a refit. |
+| `theta` | The start's final θ, so two optima can be told apart without a refit. A non-finite value is written as `null`. |
 | `selected` | `true` on the returned start. |
 | `error`, `error_code` | A failed start's message, and its [error code](../warnings.qmd#fit-error-codes) when it has one. |
 

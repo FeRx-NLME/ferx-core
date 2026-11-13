@@ -23,7 +23,7 @@ With `n_starts = 8` and `start_sigma = 0.5`:
 - **Start 0** uses the exact initial values from `[parameters]` (Vmax=12, Km=20).
 - **Starts 1–7** multiply each log-packed theta by `exp(N(0, 0.5))`, giving a spread of roughly ×0.6–×1.6 around the initial values. With `start_sigma = 0.5` this is wider than the default 0.3 — appropriate for a ridge-shaped surface.
 - All 8 runs execute in parallel. On an 8-core machine wall-clock time equals a single run.
-- The converged run with the lowest OFV is returned. If start 0 was already at the global optimum, the estimates are what a single run gives.
+- The converged run with the lowest OFV is returned. If start 0 was already at the global optimum, the estimates are those of a single run to within the optimizer's stopping noise (the returned start can be another one that reached the same optimum).
 - One `Multi-start:` line on `FitResult.warnings` says how the starts compare, and `FitResult.starts` has a row per start.
 
 ## Running it

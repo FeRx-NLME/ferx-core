@@ -323,7 +323,8 @@ absent when there is nothing to list.
 
 A fit with `n_starts > 1` adds a `multi_start:` block before
 `covariance_matrix:`. A single-start fit has none. This one is
-`examples/mm_multistart.ferx` with `start_sigma = 1.5` (θ shortened):
+`examples/mm_multistart.ferx` with `start_sigma = 1.5` (macOS arm64; two of
+the eight rows shown):
 
 ```yaml
 multi_start:
@@ -340,8 +341,10 @@ multi_start:
   n_within: 7
   range: 5.273825
   starts:
-    - {start: 0, ofv: -221.877048, converged: true, status: converged, n_iterations: 84, wall_time_secs: 1.912345, selected: false, theta: [7.457722, 22.146652, 18.475210, 2.414018]}
-    - {start: 4, ofv: -216.603223, converged: true, status: converged, n_iterations: 334, wall_time_secs: 5.123456, selected: false, theta: [50.000000, 40.137733, 3.919750, 0.361034]}
+    - {start: 0, ofv: -221.877048, converged: true, status: converged, n_iterations: 84, wall_time_secs: 1.318677, selected: false, theta: [7.457722, 22.146652, 18.475210, 2.414018]}
+    # ... starts 1 to 3
+    - {start: 4, ofv: -216.603223, converged: true, status: converged, n_iterations: 334, wall_time_secs: 2.698044, selected: false, theta: [50.000000, 40.137733, 3.919750, 0.361034]}
+    # ... starts 5 to 7
 ```
 
 | Key | Meaning |
@@ -354,7 +357,7 @@ multi_start:
 | `agree_within` | The cutoff for `n_within`, fixed at 1.0 |
 | `n_compared`, `n_within` | The converged starts with a usable value, and how many of them are within the cutoff of `best`. Every start with a usable value when none converged |
 | `range` | The largest distance above `best` among the compared starts |
-| `starts` | One row per start; a failed start has `status: failed`, `ofv: null`, an `error` and, when its refusal is coded, an `error_code`. Under a penalty each row also carries `objective` |
+| `starts` | One row per start. `status` is the start's own status token, followed by `status_reasons` when it has any. A failed start has `status: failed`, `ofv: null`, an `error` and, when its refusal is coded, an `error_code`. Under a penalty each row also carries `objective`. A non-finite θ is `null` |
 
 The rows are [`FitResult.starts`](model-file/fit-options.qmd#multi-start-spread),
 which the fit JSON and the `.fitrx` bundle carry as `starts`.
