@@ -1144,9 +1144,12 @@ fn overridden_zero_variance_fails_fit_even_though_the_file_is_fine() {
 /// So the exemption has a price, and it is measured here rather than described:
 /// a declared free `~ 0.0` (stored as the `1e-8` regularisation floor) is
 /// evaluated at the rail variance `exp(-12) ≈ 6.14e-6`, 614× higher, with no
-/// diagnostic. That is pre-existing and not specific to Ω — a
-/// `theta TVCL(0.05, 0.1, 10.0)` starts at `0.1` the same way — so it is
-/// tracked as a follow-up rather than fixed inside a rail check.
+/// diagnostic. That is not specific to Ω — a `theta TVCL(0.05, 0.1, 10.0)` is
+/// scored at `0.1` the same way. The θ half is reported since #2865, as
+/// `W_THETA_INIT_OUTSIDE_BOUNDS`
+/// (`an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit`
+/// below). The Ω half pinned here is still silent: #2865 left the internal
+/// rails at `maxiter = 0` as they were.
 ///
 /// This goes through `fit()` rather than composing `pack_params` /
 /// `clamp_to_bounds` by hand: composing them would assert that
@@ -1287,6 +1290,192 @@ fn theta_start_outside_its_declared_range_is_reported_by_check_and_refused_by_fi
 
     let _ = std::fs::remove_file(&model_path);
     let _ = std::fs::remove_file(&ok_path);
+}
+
+/// #2865. At `maxiter = 0` a θ start outside its own declared range is clamped
+/// and **scored at the bound**. That is reported as a warning by `ferx check`
+/// and by `fit()`, with one message, and the numbers in the message are the
+/// numbers the run produced.
+///
+/// What each half is for:
+///
+/// * **The message against the run.** The warning says the OFV is that of
+///   `TVCL = 2e-1`. So the fit's reported TVCL must be `0.2`, its OFV must be
+///   the OFV of a file that *declares* `0.2`, and must not be the OFV of a file
+///   whose range admits the declared `0.5`. A message naming a value the run
+///   did not use fails here, which the unit tests on the string cannot see.
+/// * **No OFV changes.** The warning is the only difference from before #2865:
+///   the run is `Ok`, as `--dofv`, `ferx gam --no-fit` and the bootstrap Δofv
+///   sweep need — each is a `fit()` at `outer_maxiter = 0` — and its OFV equals
+///   the in-range twin's bit for bit.
+/// * **The straddle.** The same file with one outer iteration is refused with
+///   `E_THETA_INIT_OUTSIDE_BOUNDS` by both, so the warning cannot be passing on
+///   a check that stopped refusing.
+/// * **The category.** Start-side, not a boundary *estimate*: that category
+///   drives bootstrap's default-on replicate filter.
+///
+/// Tier 2: one objective evaluation per `fit()` call, no search.
+#[test]
+fn an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit() {
+    const EVAL_ONLY: &str = "\n[fit_options]\n  maxiter = 0\n  covariance = false\n";
+    let src = format!(
+        "{}{EVAL_ONLY}",
+        box_model_src("theta TVCL(0.5, 0.001, 0.2)")
+    );
+    let model_path = temp_model("box_theta_eval_only", &src);
+
+    // ── `ferx check`, no `--data` ──
+    let report = validate_model_file(model_path.to_str().unwrap(), None);
+    assert!(
+        report.valid,
+        "a warning, so the file validates: {:?}",
+        report.diagnostics
+    );
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.code == "W_THETA_INIT_OUTSIDE_BOUNDS")
+        .unwrap_or_else(|| panic!("code absent: {:?}", report.diagnostics));
+    assert_eq!(d.block.as_deref(), Some("parameters"));
+    assert!(d.suggestion.is_some());
+    assert!(
+        !report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E_THETA_INIT_OUTSIDE_BOUNDS"),
+        "the error and the warning are one verdict, never both: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        d.message
+            .contains("starts at 5e-1, above its own declared upper bound of 2e-1")
+            && d.message
+                .contains("those of TVCL = 2e-1, not of the declared 5e-1"),
+        "{}",
+        d.message
+    );
+
+    // ── `fit()` ──
+    let parsed = parse_full_model_file(&model_path).unwrap();
+    let pop = read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).unwrap();
+    assert_eq!(parsed.fit_options.outer_maxiter, 0, "premise: eval-only");
+    let res = fit(
+        &parsed.model,
+        &pop,
+        &parsed.model.default_params,
+        &parsed.fit_options,
+    )
+    .expect("an eval-only run is warned, never refused");
+    assert!(
+        res.warnings.iter().any(|w| *w == d.message),
+        "the same message must reach `FitResult.warnings`; got {:?}",
+        res.warnings
+    );
+
+    // The message against the run: scored at 0.2, as it says.
+    assert!(
+        (res.theta[0] - 0.2).abs() < 0.2 * 1e-12,
+        "the run reports TVCL at the bound the message names: {}",
+        res.theta[0]
+    );
+    let eval_of = |tag: &str, theta_line: &str| {
+        let path = temp_model(tag, &format!("{}{EVAL_ONLY}", box_model_src(theta_line)));
+        let parsed = parse_full_model_file(&path).unwrap();
+        let res = fit(
+            &parsed.model,
+            &pop,
+            &parsed.model.default_params,
+            &parsed.fit_options,
+        )
+        .unwrap_or_else(|e| panic!("`{theta_line}` must evaluate: {e}"));
+        let _ = std::fs::remove_file(&path);
+        res
+    };
+    let at_bound = eval_of("box_theta_eval_at_bound", "theta TVCL(0.2, 0.001, 10.0)");
+    let at_declared = eval_of("box_theta_eval_wide", "theta TVCL(0.5, 0.001, 10.0)");
+    assert!(
+        res.ofv.is_finite() && at_bound.ofv.is_finite() && at_declared.ofv.is_finite(),
+        "{} {} {}",
+        res.ofv,
+        at_bound.ofv,
+        at_declared.ofv
+    );
+    assert_eq!(
+        res.ofv.to_bits(),
+        at_bound.ofv.to_bits(),
+        "the OFV is the bound's, bit for bit: {} vs {}",
+        res.ofv,
+        at_bound.ofv
+    );
+    // Measured on macOS arm64: -200.2526 at 0.2 against 2544.1094 at 0.5. The
+    // bound below is 1 OFV, three orders under that gap.
+    assert!(
+        (res.ofv - at_declared.ofv).abs() > 1.0,
+        "and not the declared start's: {} vs {}",
+        res.ofv,
+        at_declared.ofv
+    );
+    // Neither twin is warned: both score exactly what they declare.
+    for twin in [&at_bound, &at_declared] {
+        assert!(
+            !twin
+                .warnings
+                .iter()
+                .any(|w| w.contains("W_THETA_INIT_OUTSIDE_BOUNDS")),
+            "{:?}",
+            twin.warnings
+        );
+    }
+
+    // The category: a start-side finding, not a boundary estimate.
+    let entry = res
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.contains("W_THETA_INIT_OUTSIDE_BOUNDS"))
+        .expect("structured entry present");
+    assert_eq!(entry.category.as_str(), "init_outside_bounds");
+    assert!(
+        !res.warnings_structured
+            .iter()
+            .any(|w| w.category.as_str() == "boundary_estimate"
+                && w.message.contains("W_THETA_INIT_OUTSIDE_BOUNDS")),
+        "a clamped *start* must not be filed as a boundary estimate"
+    );
+
+    // ── the straddle: one outer iteration, and both refuse ──
+    let searching_path = temp_model(
+        "box_theta_eval_only_searching",
+        &format!(
+            "{}\n[fit_options]\n  maxiter = 1\n  covariance = false\n",
+            box_model_src("theta TVCL(0.5, 0.001, 0.2)")
+        ),
+    );
+    let searching_report = validate_model_file(searching_path.to_str().unwrap(), None);
+    assert!(
+        !searching_report.valid,
+        "{:?}",
+        searching_report.diagnostics
+    );
+    assert!(
+        !searching_report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "W_THETA_INIT_OUTSIDE_BOUNDS"),
+        "{:?}",
+        searching_report.diagnostics
+    );
+    let searching = parse_full_model_file(&searching_path).unwrap();
+    let err = fit(
+        &searching.model,
+        &pop,
+        &searching.model.default_params,
+        &searching.fit_options,
+    )
+    .expect_err("with a search the same declaration is refused");
+    assert_eq!(err.code(), Some("E_THETA_INIT_OUTSIDE_BOUNDS"));
+
+    let _ = std::fs::remove_file(&model_path);
+    let _ = std::fs::remove_file(&searching_path);
 }
 
 /// The warning half reaches **both** channels (#1251, and the #1033 shape).

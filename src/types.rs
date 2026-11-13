@@ -7852,6 +7852,15 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // `reject_on_boundary`. A near-miss phrasing there would silently drop
         // bootstrap replicates.
         (WarningSeverity::Warning, WarningCode::InitOutsideBounds)
+    } else if lower.contains("w_theta_init_outside_bounds") {
+        // #2865: the evaluation-only half of `E_THETA_INIT_OUTSIDE_BOUNDS` — a
+        // `theta` start outside its own declared range at `maxiter = 0`, clamped
+        // and scored at the bound. The same category as the arm above (a start
+        // the box moved), through its own arm because neither token contains the
+        // other. A token arm for the same reason too: the message quotes a
+        // "bound", and the "optimizer bound" prose arm is `BoundaryEstimate`,
+        // which would drop bootstrap replicates.
+        (WarningSeverity::Warning, WarningCode::InitOutsideBounds)
     } else if lower.contains("w_stalled_at_init") {
         // #997 §2: the fit never left its initial estimates. Matched on its `W_`
         // token and placed with the other token arms, ahead of every prose one.
