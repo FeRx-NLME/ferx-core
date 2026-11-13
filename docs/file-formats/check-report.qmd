@@ -464,6 +464,12 @@ The model runs, but on a path that is experimental or that quietly drops a capab
 | `W_EBE_START_DEPENDENT` | warning | Three triggers. A cold re-solve of the EBEs at the final estimates scores more than 0.05 OFV units worse than the reported objective, or returns a non-finite objective ([#833](https://github.com/FeRx-NLME/ferx-core/issues/833), [#2646](https://github.com/FeRx-NLME/ferx-core/issues/2646)); the message names the subjects it missed on. A cold re-solve scores more than 0.05 OFV units below the objective the optimizer minimised, and no restart replaced the run; the fit is then reported `converged: false` ([#1565](https://github.com/FeRx-NLME/ferx-core/issues/1565)). Or the `inner_screen` Sobol screen moved some subjects' EBEs to a lower individual objective than the descent from η = 0 reached; the message names them, the first ten and then a count ([#2013](https://github.com/FeRx-NLME/ferx-core/issues/2013)). |
 | `W_VI_BAD_BASIN` | warning | At the end of a `method = vi` run, the excess of the sampled data term over its value at the variational means is more than 25 times the `Σ dᵢ/2` a posterior-shaped `q` would give. The ELBO is not a usable bound there, the optimizer has almost certainly settled in a bad basin, and the fit is reported `converged: false`. Re-run from better starting values, or chain `method = [focei, vi]`. |
 
+#### Mixture
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `W_MIXTURE_MERGED_CLASSES` | warning | A `[mixture]` fit ended with fewer distinct classes than `nsub`. Two classes are *merged* when both carry posterior mass and no subject's data favours one over the other by more than 1 log-likelihood unit, `max_i |nll_ia − nll_ib| < 1`, read off the posteriors as `ln(PMIX_ia/PMIX_ib) − ln(p_ia/p_ib)`; the test is on the objective, so it also catches classes equal but written two different ways. A class is *empty* when no subject's posterior probability of it reaches 1e-2. The message names each merged pair and empty class. Such a fit is often a local optimum: refit with the class starts further apart, or with `optimizer = bobyqa`, and compare the objective. See [Mixture models](../estimation/mixture.qmd#merged-or-empty-classes) and [#2907](https://github.com/FeRx-NLME/ferx-core/issues/2907). |
+
 #### IMP and IMPMAP
 
 | Code | Severity | Meaning |

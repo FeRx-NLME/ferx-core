@@ -104,6 +104,34 @@ that branches on `MIXNUM` are all computed with `MIXNUM` set to that class. So a
 subject the fit assigns to class 2 gets class-2 typical values throughout its
 sdtab row, not the class-1 default.
 
+### Merged or empty classes
+
+A mixture objective has local optima where fewer than `nsub` classes are in use.
+Two classes can end up describing the same subpopulation, or one class can end up
+holding nobody. After every mixture fit, ferx checks the final posteriors for both
+and warns `W_MIXTURE_MERGED_CLASSES`, naming each pair or class it finds (#2907):
+
+- **Merged pair.** Both classes carry posterior mass, and no subject's data favours
+  one over the other by more than 1 log-likelihood unit:
+  $\max_i |\text{nll}_{ia} - \text{nll}_{ib}| < 1$. That is how far each subject's
+  posterior class odds moved from its prior odds,
+  $\ln(\text{PMIX}_{ia}/\text{PMIX}_{ib}) - \ln(p_{ia}/p_{ib})$. The test is on the
+  objective, not on the parameters, so it also catches classes that are equal but
+  written two different ways.
+- **Empty class.** No subject's posterior probability of the class reaches 0.01.
+
+The thresholds were measured on `tests/nonmem/mixture_iv.csv` with Ω and Σ
+estimated. Started from clearances 1.70 / 1.71, L-BFGS ends in a collapsed optimum
+(OFV 310.02, class clearances 1.71 / 1.76, ω_CL 0.35, which absorbs the
+bimodality). There the largest factor is 0.09. At the two-class optimum (OFV 299.86)
+it is 15.05, and at the NONMEM-matching optima of the Ω/Σ-fixed fixture and of
+`mixture_iv_iov.csv` (301.58, 470.81) it is 11.45 and 19.29. A mixing logit held at
+−9 leaves class 1 with a largest posterior of 3e-4, which is reported empty.
+
+The warning does not change the fit. When it fires, refit with the class starts
+further apart, or with `optimizer = bobyqa`, and compare the objectives: on the
+fixture above, BOBYQA from the same 1.70 / 1.71 start reaches 299.86.
+
 ## Validation against NONMEM
 
 A two-class clearance mixture (`tests/nonmem/mixture_iv.ctl` and the

@@ -75,6 +75,142 @@ pub fn class_params(params: &ModelParameters, k: usize) -> ModelParameters {
     p
 }
 
+/// Largest per-subject log Bayes factor between two classes below which the post-fit check
+/// calls them merged (#2907). See [`merged_classes_from`] for the measurement it was set from.
+pub(crate) const MERGED_CLASS_LOG_BF: f64 = 1.0;
+
+/// Posterior class probability that no subject reaches in a class the post-fit check calls
+/// empty (#2907).
+pub(crate) const EMPTY_CLASS_PMIX: f64 = 1e-2;
+
+/// One finding of the post-fit merged-class check (#2907). Classes are 1-based, as `MIXNUM`
+/// spells them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ClassCollapse {
+    /// Every subject's posterior probability of `class` is below [`EMPTY_CLASS_PMIX`];
+    /// `max_pmix` is the largest.
+    Empty { class: usize, max_pmix: f64 },
+    /// Both classes carry posterior mass, and no subject's data favours one over the other
+    /// by more than [`MERGED_CLASS_LOG_BF`]; `max_log_bf` is the largest such factor.
+    Merged { a: usize, b: usize, max_log_bf: f64 },
+}
+
+/// The post-fit merged-class check (#2907) on the converged posteriors: `logp[i][k]` is
+/// subject `i`'s prior `ln p_ik` and `pmix[i][k]` its posterior `PMIX_ik`, both in subject
+/// order.
+///
+/// A pair is judged on the objective, not on its parameters: classes that are equal but
+/// written two different ways have different parameters and the same likelihood. Since
+/// `PMIX_ik ∝ p_ik · exp(−nll_ik)`, subject `i`'s log Bayes factor between classes `a` and `b`
+/// is
+///
+/// ```text
+/// |nll_ia − nll_ib| = |ln(PMIX_ia / PMIX_ib) − (ln p_ia − ln p_ib)|
+/// ```
+///
+/// the amount the subject's data moved its class odds away from the prior odds. When no
+/// subject moves them by more than [`MERGED_CLASS_LOG_BF`], the data cannot tell the two
+/// classes apart. A factor that is not finite (a posterior that underflowed to 0) separates
+/// the pair, as it is the largest possible.
+///
+/// A class whose posterior is below [`EMPTY_CLASS_PMIX`] in every subject holds nobody, and
+/// is reported as empty; a pair with an empty class is not also reported as merged, since the
+/// factor of a class with no mass says nothing about the fit.
+///
+/// Pairwise, so with three classes two merged ones beside a third are reported.
+pub(crate) fn merged_classes_from(logp: &[Vec<f64>], pmix: &[Vec<f64>]) -> Vec<ClassCollapse> {
+    let k = pmix.first().map_or(0, Vec::len);
+    if k < 2 || pmix.len() != logp.len() {
+        return Vec::new();
+    }
+    let max_pmix: Vec<f64> = (0..k)
+        .map(|c| pmix.iter().map(|p| p[c]).fold(0.0, f64::max))
+        .collect();
+    let empty: Vec<bool> = max_pmix.iter().map(|&m| m < EMPTY_CLASS_PMIX).collect();
+    let mut out: Vec<ClassCollapse> = (0..k)
+        .filter(|&c| empty[c])
+        .map(|c| ClassCollapse::Empty {
+            class: c + 1,
+            max_pmix: max_pmix[c],
+        })
+        .collect();
+    for a in 0..k {
+        for b in a + 1..k {
+            if empty[a] || empty[b] {
+                continue;
+            }
+            let mut max_log_bf = 0.0f64;
+            for (lp, pm) in logp.iter().zip(pmix) {
+                let bf = ((pm[a] / pm[b]).ln() - (lp[a] - lp[b])).abs();
+                // NaN (0/0, ∞ − ∞) and ∞ both separate the pair; `f64::max` would drop NaN.
+                max_log_bf = if bf.is_finite() {
+                    max_log_bf.max(bf)
+                } else {
+                    f64::INFINITY
+                };
+                if max_log_bf >= MERGED_CLASS_LOG_BF {
+                    break;
+                }
+            }
+            if max_log_bf < MERGED_CLASS_LOG_BF {
+                out.push(ClassCollapse::Merged {
+                    a: a + 1,
+                    b: b + 1,
+                    max_log_bf,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// [`merged_classes_from`] at the final estimates: evaluates every subject's prior mixing
+/// probabilities at `theta` and pairs them with the fit's posteriors `pmix` (subject order).
+/// Empty for a model without a mixture.
+pub(crate) fn merged_classes(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    pmix: &[Vec<f64>],
+) -> Vec<ClassCollapse> {
+    let Some(spec) = model.mixture.as_ref() else {
+        return Vec::new();
+    };
+    let logp: Vec<Vec<f64>> = population
+        .subjects
+        .iter()
+        .map(|s| eval_mixing_log_probs(spec, theta, &s.covariates))
+        .collect();
+    merged_classes_from(&logp, pmix)
+}
+
+/// The `W_MIXTURE_MERGED_CLASSES` warning for `findings`, or `None` when there are none.
+pub(crate) fn merged_classes_warning(findings: &[ClassCollapse]) -> Option<String> {
+    if findings.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = findings
+        .iter()
+        .map(|f| match f {
+            ClassCollapse::Empty { class, max_pmix } => format!(
+                "class {class} is empty (no subject's posterior probability of it exceeds \
+                 {max_pmix:.2e})"
+            ),
+            ClassCollapse::Merged { a, b, max_log_bf } => format!(
+                "classes {a} and {b} have merged (no subject's data favours either by more \
+                 than {max_log_bf:.3} log-likelihood units)"
+            ),
+        })
+        .collect();
+    Some(format!(
+        "W_MIXTURE_MERGED_CLASSES: at the final estimates {}. The fit has fewer distinct \
+         classes than `nsub`, which is often a local optimum rather than the best mixture: \
+         refit with class starts further apart, or with `optimizer = bobyqa`, and compare the \
+         objective (#2907).",
+        parts.join("; ")
+    ))
+}
+
 /// Combine one subject's per-class scores into its mixture contribution.
 ///
 /// Given `ln p_ik` (`logp`) and `nll_ik` (`nll`), returns
@@ -834,6 +970,112 @@ pub fn mixture_gradient_fd(
 #[cfg(test)]
 mod tests {
     use super::{any_contributing, combine_subject};
+
+    mod merged_classes {
+        use super::super::{
+            combine_subject, merged_classes_from, merged_classes_warning, ClassCollapse,
+            EMPTY_CLASS_PMIX, MERGED_CLASS_LOG_BF,
+        };
+
+        /// `(logp, pmix)` per subject from per-class probabilities and nll's, through the
+        /// objective's own `combine_subject`, so the check reads posteriors built the way
+        /// the fit builds them.
+        fn posteriors(p: &[f64], nll: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+            let logp: Vec<f64> = p.iter().map(|v| v.ln()).collect();
+            let pmix = nll.iter().map(|n| combine_subject(&logp, n).1).collect();
+            (vec![logp; nll.len()], pmix)
+        }
+
+        #[test]
+        fn separated_classes_draw_no_finding() {
+            // One subject decisively per class: factors of 6 nats each way.
+            let (lp, pm) = posteriors(&[0.5, 0.5], &[vec![10.0, 16.0], vec![16.0, 10.0]]);
+            assert!(merged_classes_from(&lp, &pm).is_empty());
+            assert_eq!(merged_classes_warning(&[]), None);
+        }
+
+        #[test]
+        fn a_pair_under_the_factor_is_merged_and_one_subject_over_it_separates() {
+            // Every subject's data moves its odds by 0.4 of the threshold, under unequal mixing
+            // (0.3 / 0.7), so the prior has to be taken out for the factor to read right.
+            let d = 0.4 * MERGED_CLASS_LOG_BF;
+            let near = vec![vec![5.0, 5.0 + d], vec![7.0 + d, 7.0], vec![3.0, 3.0]];
+            let (lp, pm) = posteriors(&[0.3, 0.7], &near);
+            let got = merged_classes_from(&lp, &pm);
+            match got.as_slice() {
+                [ClassCollapse::Merged {
+                    a: 1,
+                    b: 2,
+                    max_log_bf,
+                }] => {
+                    assert!((max_log_bf - d).abs() < 1e-9, "factor {max_log_bf} vs {d}");
+                }
+                other => panic!("want classes 1 and 2 merged, got {other:?}"),
+            }
+            // The threshold straddled: one subject at 1.5× the factor separates the pair.
+            let mut far = near.clone();
+            far.push(vec![4.0, 4.0 + 1.5 * MERGED_CLASS_LOG_BF]);
+            let (lp, pm) = posteriors(&[0.3, 0.7], &far);
+            assert!(merged_classes_from(&lp, &pm).is_empty());
+        }
+
+        #[test]
+        fn three_classes_name_only_the_merged_pair() {
+            // Classes 1 and 3 identical, class 2 far from both.
+            let nll = vec![vec![5.0, 15.0, 5.0], vec![9.0, 2.0, 9.0]];
+            let (lp, pm) = posteriors(&[0.2, 0.5, 0.3], &nll);
+            let got = merged_classes_from(&lp, &pm);
+            assert!(
+                matches!(got.as_slice(), [ClassCollapse::Merged { a: 1, b: 3, .. }]),
+                "{got:?}"
+            );
+            let w = merged_classes_warning(&got).unwrap();
+            assert!(w.starts_with("W_MIXTURE_MERGED_CLASSES: "), "{w}");
+            assert!(w.contains("classes 1 and 3 have merged"), "{w}");
+            assert!(
+                !w.contains("classes 1 and 2") && !w.contains("classes 2 and 3"),
+                "{w}"
+            );
+            assert!(!w.contains("empty"), "{w}");
+        }
+
+        #[test]
+        fn an_empty_class_is_reported_and_not_also_as_merged() {
+            // Class 2's mixing probability is 1e-6, and its likelihood no better than class
+            // 1's, so its posterior stays below the empty threshold in every subject. Equal
+            // nll's would also make the pair "merged"; the empty finding replaces that.
+            let p2 = 1e-6;
+            let nll = vec![vec![5.0, 5.0], vec![8.0, 8.5]];
+            let (lp, pm) = posteriors(&[1.0 - p2, p2], &nll);
+            assert!(pm.iter().all(|p| p[1] < EMPTY_CLASS_PMIX));
+            let got = merged_classes_from(&lp, &pm);
+            assert!(
+                matches!(got.as_slice(), [ClassCollapse::Empty { class: 2, .. }]),
+                "{got:?}"
+            );
+            let w = merged_classes_warning(&got).unwrap();
+            assert!(w.contains("class 2 is empty"), "{w}");
+            assert!(!w.contains("merged ("), "{w}");
+            // The straddle: one subject whose data favours class 2 strongly enough to give it
+            // posterior mass makes the class non-empty, and the pair separated.
+            let mut nll = nll;
+            nll.push(vec![30.0, 5.0]);
+            let (lp, pm) = posteriors(&[1.0 - p2, p2], &nll);
+            assert!(merged_classes_from(&lp, &pm).is_empty());
+        }
+
+        #[test]
+        fn an_underflowed_posterior_separates_the_pair() {
+            // PMIX_i2 underflows to exactly 0 (factor ~1000 nats): ln(1/0) = ∞, which must
+            // count as separating, not be dropped by a NaN-discarding max.
+            let lp = vec![vec![0.5f64.ln(); 2]; 2];
+            let pm = vec![vec![1.0, 0.0], vec![0.5, 0.5]];
+            assert!(merged_classes_from(&lp, &pm).is_empty());
+            // 0/0 (both underflowed) is NaN: separating too.
+            let pm = vec![vec![0.0, 0.0], vec![0.5, 0.5]];
+            assert!(merged_classes_from(&lp, &pm).is_empty());
+        }
+    }
 
     #[test]
     fn any_contributing_scores_nonwinning_classes() {
