@@ -739,6 +739,90 @@ pub(crate) fn multistart_prefers(b_ofv: f64, b_conv: bool, c_ofv: f64, c_conv: b
     }
 }
 
+/// Pick the start a multi-start fit returns, and record what every start did (#2867).
+///
+/// `results` is one entry per start, in start order. Returns the winner (`None` when every
+/// start failed), the failed starts' `start k: <error>` texts, and one [`StartRecord`] per
+/// start with `selected` set on the winner's row.
+///
+/// The ranking is [`multistart_prefers`] over `rank_ofv` and `converged`, first start
+/// winning a tie. The records are written beside it and never read by it. `penalized` says
+/// `rank_ofv` is not the reported OFV (`nn_l2` / `nn_smooth`), so each row carries it as
+/// `objective`.
+pub(crate) fn select_start(
+    results: Vec<(usize, Result<FitResult, EngineError>)>,
+    rank_ofv: impl Fn(&FitResult) -> f64,
+    penalized: bool,
+) -> (Option<(usize, FitResult)>, Vec<String>, Vec<StartRecord>) {
+    let mut best: Option<(usize, FitResult)> = None;
+    let mut failed_starts: Vec<String> = Vec::new();
+    let mut starts: Vec<StartRecord> = Vec::with_capacity(results.len());
+    for (k, res) in results {
+        match res {
+            Ok(mut r) => {
+                // The status reads `warnings_structured`, which a start's result does not
+                // carry yet: classify its warnings first, or the row misses every critical
+                // warning that is not typed at source. Idempotent, and the winner is rebuilt
+                // again once the fit-level notes are added.
+                rebuild_warnings_structured(&mut r);
+                let status = r.status();
+                let ofv = Some(r.ofv).filter(|v| v.is_finite());
+                starts.push(StartRecord {
+                    start: k,
+                    ofv,
+                    penalized,
+                    objective: ofv
+                        .filter(|_| penalized)
+                        .map(|_| rank_ofv(&r))
+                        .filter(|v| v.is_finite()),
+                    converged: r.converged,
+                    status: Some(status.token().to_string()),
+                    status_reasons: status.reasons().iter().map(|x| x.label()).collect(),
+                    n_iterations: r.n_iterations,
+                    wall_time_secs: r.wall_time_secs,
+                    theta: r.theta.clone(),
+                    selected: false,
+                    error: None,
+                    error_code: None,
+                });
+                let better = match &best {
+                    None => true,
+                    Some((_, b)) => {
+                        multistart_prefers(rank_ofv(b), b.converged, rank_ofv(&r), r.converged)
+                    }
+                };
+                if better {
+                    best = Some((k, r));
+                }
+            }
+            Err(e) => {
+                starts.push(StartRecord {
+                    start: k,
+                    ofv: None,
+                    penalized: false,
+                    objective: None,
+                    converged: false,
+                    status: None,
+                    status_reasons: Vec::new(),
+                    n_iterations: 0,
+                    wall_time_secs: 0.0,
+                    theta: Vec::new(),
+                    selected: false,
+                    error: Some(e.to_string()),
+                    error_code: e.code().map(str::to_string),
+                });
+                failed_starts.push(format!("start {k}: {e}"));
+            }
+        }
+    }
+    if let Some((k, _)) = &best {
+        if let Some(row) = starts.iter_mut().find(|s| s.start == *k) {
+            row.selected = true;
+        }
+    }
+    (best, failed_starts, starts)
+}
+
 pub(crate) use crate::estimation::nn_reg::applies_nn_regularization;
 
 /// A pre-run warning when `nn_l2` / `nn_smooth` are set but the chain's final
@@ -1213,24 +1297,7 @@ fn fit_unstamped(
     // opposite of what the penalty asks for. `+ 0.0` when unregularized.
     let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, population, options);
     let rank_ofv = |r: &FitResult| r.ofv + nn_reg.penalty_value(&r.theta);
-    let mut best: Option<(usize, FitResult)> = None;
-    let mut failed_starts: Vec<String> = Vec::new();
-    for (k, res) in results {
-        match res {
-            Ok(r) => {
-                let better = match &best {
-                    None => true,
-                    Some((_, b)) => {
-                        multistart_prefers(rank_ofv(b), b.converged, rank_ofv(&r), r.converged)
-                    }
-                };
-                if better {
-                    best = Some((k, r));
-                }
-            }
-            Err(e) => failed_starts.push(format!("start {k}: {e}")),
-        }
-    }
+    let (best, failed_starts, starts) = select_start(results, rank_ofv, nn_reg.is_active());
 
     match best {
         // Every start failed: say *why*, or a search table reads "All
@@ -1254,12 +1321,11 @@ fn fit_unstamped(
                 result.warnings.push(format!(
                     "No multi-start run converged ({n} starts); returning best OFV from start {k}"
                 ));
-            } else if k > 0 {
-                result.warnings.push(format!(
-                    "Multi-start: best result from start {k}/{n} (OFV = {:.4})",
-                    result.ofv
-                ));
             }
+            // #2867: what the starts did, on every multi-start fit — "all agree" is the
+            // answer the user ran multi-start for, so it is said when start 0 wins too.
+            result.warnings.push(StartSpread::of(&starts).line());
+            result.starts = starts;
             // Surface any SS-equilibration non-convergence seen during this fit's prediction passes
             // (#867). The capped nonlinear pulse-train can silently under-report the SS trough and
             // bias estimates low; the sink deduplicated it across every objective evaluation and
@@ -3677,6 +3743,7 @@ fn fit_inner(
         optimizer: optimizer_label,
         n_starts: options.n_starts,
         multi_start_seed: options.multi_start_seed,
+        starts: Vec::new(),
         saem_seed: options.saem_seed,
         sir_seed: None,
         sir_settings: None,

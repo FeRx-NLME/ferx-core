@@ -249,7 +249,7 @@ The per-subject empirical-Bayes search that the outer objective is built from.
 | `inner_restarts` | integer | `1` | Guarded multi-start count for the inner (per-subject EBE) optimizer, to escape a **multimodal individual objective**. A subject that a single warm-started BFGS would leave in the wrong basin re-solves from `N` Ω-scaled cold-start seeds and keeps the lowest-objective mode; unimodal subjects are bit-identical to `0` and pay only a flatness probe. Set `0` to disable — see [Escaping a multimodal individual objective](#escaping-a-multimodal-individual-objective). |
 | `inner_screen` | integer ≥ 0 | `100` | Size `N` of the Sobol screen the cold multi-start runs before its per-coordinate seeds, to find an individual mode that lies off every axis (the flip-flop `ka ↔ CL/V` twin). The `3` lowest of `N` quasi-random points from `N(0, 4Ω)` are descended, and one replaces the EBE only when it reaches a different, lower mode; unimodal subjects are bit-identical to `0`. Runs only where `inner_restarts` does, so `inner_restarts = 0` disables it too. Set `0` to disable — see [The Sobol screen](#inner-screen). |
 | `inner_twin_seed` | `true`, `false` | `true` | Seed the cold multi-start with the subject's flip-flop twin before the screen: on a closed-form `one_cpt_oral` model whose `V` and `KA` are each log-normal on a random effect of their own, one descent from `η_V`, `η_KA` moved together by `ln(k/ka)`. Kept only when it reaches a different, lower mode; every other model takes no seed. Runs only where `inner_restarts` does. Set `false` to disable — see [The flip-flop twin seed](#inner-twin-seed). |
-| `reconverge_gradient_interval` | integer ≥ 0 | `0` | How often to re-solve each subject's inner EBE loop during the population gradient instead of holding the EBEs (η̂) and FOCE Hessian fixed. `0` (default) never reconverges — the cheap fixed-EBE gradient is used. `1` reconverges on every gradient evaluation, at roughly **5–6× the per-gradient cost**; `N` reconverges on evaluations `0, N, 2N, …` and uses the cheap gradient in between. Raise it when a gradient optimizer stalls above the derivative-free optimum. IOV models (`kappa`/`block_kappa`) always reconverge and ignore this setting. Models with an `[event_model]`, `[binary_model]` or `[markov_model]` endpoint and random effects take the exact marginal gradient, which carries the EBE response itself (see [TTE: the outer gradient](../estimation/tte.qmd#outer-gradient-reconverged)). The reconverged gradient steps packed coordinate `i` by `1e-4·(s_i + |x_i|)`, with the floor `s_i` of `fd_hessian_step` below, so a small identity-packed θ is stepped relative to its declared value rather than through zero; the mixture FD gradient (`1e-5·s_i`) and SAEM's and VI's θ differences (floor `|θ₀|` for any packing) do the same ([#2187](https://github.com/FeRx-NLME/ferx-core/issues/2187)). See [Gradient accuracy vs cost](../estimation/foce.qmd#gradient-accuracy-vs-cost-reconverged-ebes). |
+| `reconverge_gradient_interval` | integer ≥ 0 | `0` | How often to re-solve each subject's inner EBE loop during the population gradient instead of holding the EBEs (η̂) and FOCE Hessian fixed. `0` (default) never reconverges — the cheap fixed-EBE gradient is used. `1` reconverges on every gradient evaluation, at roughly **5–6× the per-gradient cost**; `N` reconverges on evaluations `0, N, 2N, …` and uses the cheap gradient in between. Raise it when a gradient optimizer stalls above the derivative-free optimum. IOV models (`kappa`/`block_kappa`) always reconverge and ignore this setting. Models with an `[event_model]`, `[binary_model]` or `[markov_model]` endpoint and random effects take the exact marginal gradient, which carries the EBE response itself (see [TTE: the outer gradient](../estimation/tte.qmd#outer-gradient-reconverged)). The reconverged gradient steps packed coordinate `i` by `1e-4·(s_i + |x_i|)`, with the floor `s_i` of `fd_hessian_step` below, so a small identity-packed θ is not stepped across 0; the mixture FD gradient (`1e-5·s_i`) and SAEM's and VI's θ differences (floor `|θ₀|` for any packing) do the same ([#2187](https://github.com/FeRx-NLME/ferx-core/issues/2187)). See [Gradient accuracy vs cost](../estimation/foce.qmd#gradient-accuracy-vs-cost-reconverged-ebes) and [when it grows](../estimation/foce.qmd#small-theta-fd-step). |
 | `mu_referencing` | `true`, `false` | `true` | Re-centre inner-loop ETA estimates on the current population mean (auto-detected from `[individual_parameters]`). See the [FAQ entry](../faq.qmd#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2) for details. Set `false` to reproduce pre-automatic-mu behaviour. Under a `[mixture]` model this also switches off the class-aware mu-referencing θ shift for SAEM and estimating IMP/IMPMAP (see [Mixture models](../estimation/mixture.qmd#mu-referencing-under-a-mixture)). |
 
 #### Choosing `inner_tol` {#choosing-inner-tol}
@@ -339,7 +339,7 @@ The post-fit covariance step. See [Covariance Step](../estimation/foce.qmd#covar
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `analytic_cov_hessian` | `true`, `false` | `true` | Use the **exact analytic R-matrix** for the covariance step when the model is in scope, instead of the finite-difference-of-OFV Hessian (#436). The analytic route is the adjoint gradient's identity one order up (`Uᵀ∇²Ψ U`, #486; see [FOCE / FOCEI](../estimation/foce.qmd)), by reverse over forward through the same recorder and likelihood kernel, so it carries no `fd_hessian_step` to tune and no `ε/h²` differencing noise. It covers the subjects the exact outer gradient covers, for every objective — FOCE, FOCEI, `laplace` and AGQ under either anchor — on closed-form and `[odes]` models, IOV and M3 censoring included, for up to 48 random effects (stacked `[η, κ]` under IOV; 8 under Laplace's exact anchor). The full scope lives on the estimation pages rather than here: [the R-matrix's scope](../estimation/foce.qmd#sensitivity-assembly) and, for quadrature fits, [When it applies](../estimation/agq.qmd#when-it-applies), which also covers the anchor having to be positive-definite at the subject's mode. TTE, categorical and Markov endpoints are in scope, and so is a FOCE/FOCEI mixture. A model-level exclusion (a mixture under `laplace`/AGQ, an SDE model, `gradient = fd`, …) keeps the whole fit on the finite-difference stencil, which is correct for all of them. A subject-level one does not: since [#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514) the covariance step assembles the exact term for every in-scope subject and finite-differences only the declining subjects' own terms, adding them into the same information sum $\sum_i R_i$. Each term is then an estimate of *itself* — the observed information is a per-subject sum, so this is not a blend of two approximations of one matrix — and the fit reports a `W_COV_ANALYTIC_SALVAGE` note naming the salvaged subjects. When at least half the population declines, the whole-population stencil is taken instead: there is no analytic majority left to carry the cost, and rebuilding it subject by subject measured +4% wall for a matrix identical to 7 significant figures. Set `analytic_cov_hessian = false` to force finite differences for an in-scope model (e.g. to reproduce standard errors from a pre-#436 run). |
-| `fd_hessian_step` | float | `1e-2` | Initial relative step size for the finite-difference Hessian used in the covariance step. Ignored when the analytic R-matrix (`analytic_cov_hessian`) serves the fit, which differences nothing at the population level. The actual perturbation for packed coordinate `i` is `fd_hessian_step * (s_i + |x_hat[i]|)`, with `s_i = 1` except on an identity-packed θ (one with a negative lower bound) whose declared initial value θ₀ satisfies `0 < |θ₀| < 1`, where `s_i = |θ₀|` ([#2147](https://github.com/FeRx-NLME/ferx-core/issues/2147)), and on a `[covariate_nn]` weight, where `s_i = 1` always (the weight's packed value *is* its natural scale; see [Finite-difference steps on the weights](covariate-nn.qmd#finite-difference-steps-on-the-weights)). Without the floor a θ of 0.0077 would be stepped by ~0.01, through zero. The same floor applies to the per-subject score's finite differences behind `covariance_method = s` / `rsr`, and a mixture's mixing-probability derivative — taken in θ's own units, so for any packing — steps `1e-6·max(|θ|, |θ₀|)` when `0 < |θ₀| < 1`. A θ whose estimate lands far below its θ₀ in magnitude is still stepped relative to θ₀; declare θ₀ at the parameter's scale. ferx automatically halves this value up to 8 times if any diagonal stencil evaluates to a non-finite value, so in most cases the default requires no tuning. Choosing it by hand is [a trade between two errors](#fd-hessian-step-choice). A `profile`d fit's `A_p` stencil defaults to `3e-3` ([why](parameters.qmd#profiled-level-blocks)); an explicit value is used as written. Must be positive and finite. |
+| `fd_hessian_step` | float | `1e-2` | Initial relative step size for the finite-difference Hessian used in the covariance step. Ignored when the analytic R-matrix (`analytic_cov_hessian`) serves the fit, which differences nothing at the population level. The actual perturbation for packed coordinate `i` is `fd_hessian_step * (s_i + |x_hat[i]|)`, with `s_i = 1` except on an identity-packed θ (one with a negative lower bound) whose declared initial value θ₀ satisfies `0 < |θ₀| < 1`, where `s_i = |θ₀|` ([#2147](https://github.com/FeRx-NLME/ferx-core/issues/2147)), and on a `[covariate_nn]` weight, where `s_i = 1` always (the weight's packed value *is* its natural scale; see [Finite-difference steps on the weights](covariate-nn.qmd#finite-difference-steps-on-the-weights)). Without the floor a θ of 0.0077 would be stepped by ~0.01, through zero. The same floor applies to the per-subject score's finite differences behind `covariance_method = s` / `rsr`, and a mixture's mixing-probability derivative — taken in θ's own units, so for any packing — steps `1e-6·max(|θ|, |θ₀|)` when `0 < |θ₀| < 1`. A θ whose estimate lands far below its θ₀ in magnitude is still stepped relative to θ₀; declare θ₀ at the parameter's scale. [A tighter re-solve can grow it](../estimation/foce.qmd#small-theta-fd-step). ferx automatically halves this value up to 8 times if any diagonal stencil evaluates to a non-finite value, so in most cases the default requires no tuning. Choosing it by hand is [a trade between two errors](#fd-hessian-step-choice). A `profile`d fit's `A_p` stencil defaults to `3e-3` ([why](parameters.qmd#profiled-level-blocks)); an explicit value is used as written. Must be positive and finite. |
 
 #### Reconverging the EBEs for the covariance step {#cov-inner-tol}
 
@@ -1122,6 +1122,77 @@ warnings.
 | `multi_start_seed` | `42` | RNG seed for the multi-start theta perturbations. Independent of `seed` (SAEM) so that changing the SAEM seed does not silently alter which perturbed starting points are used in FOCE multi-start runs. |
 
 Multi-start is most useful for models prone to local minima: nonlinear elimination (Michaelis-Menten), full-block omega, or many covariate parameters. On an 8-core machine `n_starts = 8` costs the same wall-clock time as a single run but has ~8× lower probability of a local minimum.
+
+### What the starts did {#multi-start-spread}
+
+Every multi-start fit reports how its starts compare, whichever start wins. The
+[`multi_start`](../warnings.qmd#codes-run) info line reads, for
+`examples/mm_multistart.ferx` as shipped:
+
+```
+Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 6); all 8 converged starts within 1.0 of best (range 0.0000)
+```
+
+and for the same model with `start_sigma = 1.5`:
+
+```
+Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 2); 7 of 8 converged starts within 1.0 of best; 1 converged above it: start 4 (+5.27)
+```
+
+The first says the optimum is stable: start 6 is lower than start 0 by 1e-7 OFV,
+which is not a better optimum. The second says one start stopped somewhere else
+and called itself converged. The returned estimates are the same in both.
+
+| Part of the line | Meaning |
+|---|---|
+| `8 starts, 5 converged, 2 not converged, 1 failed` | Each start is counted once. A failed start returned no result; its error is in the `k of n starts failed` line and in the table below. |
+| `best OFV … (start k)` | The returned start. `(start k, not converged)` when no start converged. Under [`nn_l2` / `nn_smooth`](#covariate-nn-regularization-nn_l2-nn_smooth) it reads `best penalized objective`, because that is the value the starts are ranked on. |
+| `7 of 8 converged starts within 1.0 of best` | The converged starts are compared with the returned one. `range` is the largest distance among them. When no start converged, every start with an OFV is compared instead. |
+| `1 converged above it: start 4 (+5.27)` | The converged starts more than 1.0 above the returned one, with their distance. The first three are named. |
+| `1 not converged at a lower OFV: start 3 (-3.21)` | A converged start is always preferred, so a start that did not converge can have stopped lower than the returned one. |
+| `2 without a usable OFV` | Starts whose OFV is `NaN` or a divergence sentinel. They are left out of the count and the range. |
+| `no OFV to compare (start 0 returned)` | The returned start has no OFV, as for `method = vi` under `vi_final_ofv = none`. Under a penalty it reads `no penalized objective to compare` when the returned start has no finite penalized objective; the starts are then not compared on their OFV, which did not rank them. |
+
+The cutoff is fixed at 1.0 OFV. It is not tied to a convergence tolerance: in 30
+multi-start fits of the example models (macOS arm64), starts that stopped on the
+same optimum or the same ridge were at most 2.3e-6 apart in OFV under the
+gradient optimizers and at most 0.33 under `bobyqa`, and the nearest different
+stop was 5.00 away
+([#2867](https://github.com/FeRx-NLME/ferx-core/issues/2867)). For any other
+cutoff, read the table.
+
+The line compares objective values, not estimates. On a flat objective, starts
+within 1.0 OFV of each other can still differ in θ: the `bobyqa` start 0.33 above
+the best had `TVVMAX` 5.76 and `TVKM` 17.0 against 7.47 and 22.2, further along
+the same Vmax/Km ridge. The `theta` column of the table shows whether the
+estimates agree.
+
+A converged start far above the best is reported at `Info` severity and does not
+change the [fit status](../output.qmd#fit-status). It describes the objective
+surface and the width of the perturbation, not the returned fit. It occurred in
+12 of those 30 fits (macOS arm64), none of them at `start_sigma` ≤ 0.5 on a
+model without a covariate network.
+
+The per-start table is `FitResult.starts`, one row per start in start order
+(empty when `n_starts = 1`):
+
+| Field | Meaning |
+|---|---|
+| `start` | Start index. `0` is the model file's initial values. |
+| `ofv` | The start's reported OFV. Absent for a failed start and for a non-finite OFV. |
+| `penalized` | `true` when the start was ranked on a penalized objective and not on `ofv`: a start that ran under an active `nn_l2` / `nn_smooth` penalty. |
+| `objective` | The penalized objective a `penalized` start was ranked on. Absent when the start is not `penalized`, and when that value is not finite. |
+| `converged` | The start's own `converged`. |
+| `status`, `status_reasons` | The start's own [fit status](../output.qmd#fit-status), as its token (`converged`, `converged_with_issues`, `not_converged`) and the labels of its reasons. It is what the fit's status would be had this start been returned, before the fit-level multi-start notes are added. Absent for a failed start. |
+| `n_iterations`, `wall_time_secs` | Of this start alone. The starts run in parallel, so the times do not add up to the fit's. |
+| `theta` | The start's final θ, so two optima can be told apart without a refit. A non-finite value is written as `null`. |
+| `selected` | `true` on the returned start. |
+| `error`, `error_code` | A failed start's message, and its [error code](../warnings.qmd#fit-error-codes) when it has one. |
+
+The same rows are written to the fit YAML's
+[`multi_start:` block](../output.qmd#multi-start-block), the fit JSON and the
+`.fitrx` bundle. Only these rows are kept; the other starts' full results are
+dropped.
 
 ## Global Search
 

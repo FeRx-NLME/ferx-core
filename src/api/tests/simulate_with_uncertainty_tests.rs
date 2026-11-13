@@ -831,6 +831,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         optimizer: "bobyqa".to_string(),
         n_starts: 1,
         multi_start_seed: None,
+        starts: Vec::new(),
         saem_seed: None,
         sir_seed: None,
         sir_settings: None,

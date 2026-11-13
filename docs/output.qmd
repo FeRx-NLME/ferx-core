@@ -319,6 +319,49 @@ every warning that carries a structured `details` payload — see [Where
 `details` is written](warnings.qmd#where-details-is-written). Both blocks are
 absent when there is nothing to list.
 
+### The `multi_start:` block {#multi-start-block}
+
+A fit with `n_starts > 1` adds a `multi_start:` block before
+`covariance_matrix:`. A single-start fit has none. This one is
+`examples/mm_multistart.ferx` with `start_sigma = 1.5` (macOS arm64; two of
+the eight rows shown):
+
+```yaml
+multi_start:
+  n_starts: 8
+  seed: 42
+  selected_start: 2
+  n_converged: 8
+  n_not_converged: 0
+  n_failed: 0
+  compared: ofv
+  best: -221.877049
+  agree_within: 1.0
+  n_compared: 8
+  n_within: 7
+  range: 5.273825
+  starts:
+    - {start: 0, ofv: -221.877048, converged: true, status: converged, n_iterations: 84, wall_time_secs: 1.318677, selected: false, theta: [7.457722, 22.146652, 18.475210, 2.414018]}
+    # ... starts 1 to 3
+    - {start: 4, ofv: -216.603223, converged: true, status: converged, n_iterations: 334, wall_time_secs: 2.698044, selected: false, theta: [50.000000, 40.137733, 3.919750, 0.361034]}
+    # ... starts 5 to 7
+```
+
+| Key | Meaning |
+|---|---|
+| `seed` | `multi_start_seed`, when one was set |
+| `selected_start` | The start whose result the file reports |
+| `n_converged`, `n_not_converged`, `n_failed` | Each start counted once |
+| `compared` | `ofv`, or `penalized_objective` under `nn_l2` / `nn_smooth`: the value `best`, `range` and the count are measured on |
+| `best` | That value on the selected start; `null` when it has none |
+| `agree_within` | The cutoff for `n_within`, fixed at 1.0 |
+| `n_compared`, `n_within` | The converged starts with a usable value, and how many of them are within the cutoff of `best`. Every start with a usable value when none converged |
+| `range` | The largest distance above `best` among the compared starts |
+| `starts` | One row per start. `status` is the start's own status token, followed by `status_reasons` when it has any. A failed start has `status: failed`, `ofv: null`, an `error` and, when its refusal is coded, an `error_code`. A start ranked on a penalized objective also carries `objective`, `null` when that value is not finite. A non-finite θ is `null` |
+
+The rows are [`FitResult.starts`](model-file/fit-options.qmd#multi-start-spread),
+which the fit JSON and the `.fitrx` bundle carry as `starts`.
+
 ### Key Fields
 
 #### Run status and objective
@@ -711,6 +754,8 @@ Where it appears:
 | `gradient_method_outer` | Gradient method used in the outer loop, e.g. `finite differences` |
 | `uses_ode_solver` | `true` if the model uses the ODE solver, `false` for analytical PK |
 | `n_threads_used` | Number of Rayon threads used during estimation |
+| `n_starts`, `multi_start_seed` | The multi-start settings the fit ran under (`1` and absent for a single-start fit) |
+| `starts` | One [`StartRecord`](model-file/fit-options.qmd#multi-start-spread) per start of a multi-start fit; empty when `n_starts = 1` |
 | `nlopt_missing_algorithms` | NLopt algorithms that were requested but unavailable in this build (empty when all available) |
 | `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step's `R` matrix runs on the finite-difference route (`2n²`), populated only when `run_covariance_step = true`, `n_parameters > 30` and the step's estimator reads `R` — never under `covariance_method = s`, which builds no `R`, and never when the analytic `R` assembly (`analytic_cov_hessian`, the default) is expected to cover every subject, since it runs none. When only a minority of subjects is outside the analytic scope, the count is the same `2n²` but each evaluation covers just those subjects. Predicted before the fit, so a subject that bails out of the analytic assembly at run time can still make the step costlier than this says |
 | `environment` | [`EnvironmentInfo`](#environment-info) — OS, CPU architecture, whether running in a container, and OS username |

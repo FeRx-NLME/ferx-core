@@ -795,7 +795,7 @@ impl MixtureScoreContext {
 /// is absolute in its own units — 1.2 % of a θ of 8e-4. There it is `1e-5·|θ₀|` (#2187).
 ///
 /// Each probe is clamped to `init_params`' packed box — the box the outer optimizer
-/// searches — and the difference divided by the clamped span, as `central_diff_packed`
+/// searches — and the difference divided by the clamped span, as `central_diff_packed_gated`
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
@@ -816,7 +816,7 @@ pub fn mixture_gradient_fd(
         let mut xm = x.to_vec();
         xp[i] = (x[i] + h).min(bounds.upper[i]);
         xm[i] = (x[i] - h).max(bounds.lower[i]);
-        // Collapsed probes only — see `central_diff_packed`: an absolute cutoff on the span
+        // Collapsed probes only — see `central_diff_packed_gated`: an absolute cutoff on the span
         // would zero a θ declared below ~1e-11 (#2187 review).
         if xp[i] <= xm[i] {
             continue;
