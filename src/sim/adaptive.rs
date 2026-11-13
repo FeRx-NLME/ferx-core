@@ -1154,10 +1154,15 @@ impl DoseGrid {
     }
 
     /// The lowest multiple of the step that `increase p%` raises, on a grid with no
-    /// upper bound (#2810): every multiple below it is absorbed. Found with
-    /// [`Self::step_percent`]. The search starts at `floor(50 / p)` multiples, never
-    /// above the answer: a multiple is raised only once `k * p / 100` reaches a half.
-    pub(crate) fn lowest_raised_by(step: f64, p: f64) -> f64 {
+    /// upper bound (#2810): every multiple below it is absorbed. `None` when the step
+    /// raises no finite multiple up to index 2^52.
+    ///
+    /// Found by bisection on [`Self::step_percent`] itself, not from `50 / p`: the tie
+    /// nudge in `round_to_grid` is relative, so for a small percentage the engine raises
+    /// a dose somewhat below `50 * step / p` (#2890 review r1 rows 1 and 2), and `50 / p`
+    /// is infinite for a percentage near the smallest `f64`.
+    pub(crate) fn lowest_raised_by(step: f64, p: f64) -> Option<f64> {
+        const MAX_INDEX: f64 = 4_503_599_627_370_496.0; // 2^52
         let open = Self {
             step,
             low: 0.0,
@@ -1165,13 +1170,27 @@ impl DoseGrid {
         };
         let raised = |k: f64| {
             let d = grid_point(k, step);
-            open.step_percent(d, p, true) > d
+            d.is_finite() && open.step_percent(d, p, true) > d
         };
-        let mut k = (50.0 / p).floor().max(1.0);
-        while !raised(k) {
-            k += 1.0;
+        // The first power of two that is raised, then the first index between it and
+        // the power before it.
+        let mut hi = 1.0;
+        while !raised(hi) {
+            hi *= 2.0;
+            if hi > MAX_INDEX {
+                return None;
+            }
         }
-        grid_point(k, step)
+        let mut lo = hi / 2.0;
+        while hi - lo > 1.0 {
+            let mid = ((lo + hi) / 2.0).floor();
+            if raised(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(grid_point(hi, step))
     }
 }
 
@@ -2389,23 +2408,53 @@ mod tests {
     /// does not (372.5), so it starts at 500. On a decimal grid, `0.1` under 25%: 0.1
     /// gives 0.125 (back to 0.1), 0.2 gives 0.25, a tie, up to 0.3.
     ///
+    /// Small percentages (#2890 review r1 rows 1 and 2): the tie nudge is relative, so
+    /// the engine raises a dose below `50 * s / p`. At `s = 1` the reviewer's bisection
+    /// gave 16667 for 0.003%, 49996 for 0.001% (not 50000) and 45454546 for 1e-6% (not
+    /// 50000000). `1e-310%` must return: `50 / p` is infinite there.
+    ///
+    /// Each value is also checked against the engine: it is raised and the multiple
+    /// below it is not.
+    ///
     /// Mutations: returning `50 * s / p` unrounded gives 510.2 for 49%; ties down gives
-    /// 750 for 25%.
+    /// 750 for 25%; starting the search at `floor(50 / p)` gives 50000 for 0.001% and
+    /// does not return for 1e-310%.
     #[test]
     fn lowest_raised_by_is_the_first_multiple_the_step_moves() {
+        let open = |s: f64| DoseGrid {
+            step: s,
+            low: 0.0,
+            high: f64::INFINITY,
+        };
         for (s, p, want) in [
-            (250.0, 25.0, 500.0),
-            (250.0, 10.0, 1250.0),
-            (250.0, 50.0, 250.0),
-            (250.0, 49.0, 500.0),
-            (0.1, 25.0, 0.2),
+            (250.0, 25.0, Some(500.0)),
+            (250.0, 10.0, Some(1250.0)),
+            (250.0, 50.0, Some(250.0)),
+            (250.0, 49.0, Some(500.0)),
+            (0.1, 25.0, Some(0.2)),
+            (1.0, 0.003, Some(16667.0)),
+            (1.0, 0.001, Some(49996.0)),
+            (1.0, 1e-6, Some(45_454_546.0)),
+            (1.0, 1e-310, None),
         ] {
+            let got = DoseGrid::lowest_raised_by(s, p).expect("a multiple is raised");
+            if let Some(want) = want {
+                assert_eq!(got.to_bits(), f64::to_bits(want), "s = {s}, p = {p}");
+            }
+            let below = got - s;
+            assert!(
+                open(s).step_percent(got, p, true) > got,
+                "s = {s}, p = {p}: {got}"
+            );
             assert_eq!(
-                DoseGrid::lowest_raised_by(s, p).to_bits(),
-                f64::to_bits(want),
-                "s = {s}, p = {p}"
+                open(s).step_percent(below, p, true).to_bits(),
+                below.to_bits(),
+                "s = {s}, p = {p}: {below}"
             );
         }
+        // No finite multiple is raised: 1e308 is absorbed (1.25e308 rounds back) and
+        // the next multiple is infinite.
+        assert_eq!(DoseGrid::lowest_raised_by(1e308, 25.0), None);
     }
 
     /// P3: a `round_to` that is not a finite number `> 0`, on a spec built in code (the

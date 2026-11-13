@@ -250,11 +250,12 @@ fn the_shipped_rounded_example_warns_for_the_subject_the_grid_holds_at_250() {
         absorbed_warnings(&r),
         [
             "W_ADAPTIVE_STEP_ABSORBED: with round_to = 250, `increase 25%` (the smallest \
-          increase step) cannot raise the lowest dose of 1 of 2 subject(s): the step rounds \
-          back to the same dose, so each time that rule fires there the dose stays where it \
-          is. From the start dose on: '20' at 250. The lowest dose this step can raise is \
-          500. To let these doses rise, use a smaller round_to or a larger increase step; a \
-          dose_bounds low of at least 500 keeps every dose out of this range."
+          increase step) cannot raise a dose that 1 of 2 subject(s) can be at: the step \
+          rounds back to the same dose, so each time that rule fires there the dose stays \
+          where it is. From the start dose on: '20' at 250. The lowest dose this step can \
+          raise is 500. To let these doses rise, use a smaller round_to or a larger increase \
+          step, or, where a subject's upper bound allows, a start dose and a dose_bounds low \
+          of at least 500."
         ]
     );
     assert!(!absorbed_warnings(&r)[0].contains("'40'"));
@@ -344,12 +345,13 @@ fn each_subject_is_checked_on_its_own_plan_and_the_two_cases_are_named_apart() {
         absorbed_warnings(&r),
         [
             "W_ADAPTIVE_STEP_ABSORBED: with round_to = 250, `increase 10%` (the smallest \
-          increase step) cannot raise the lowest dose of 2 of 3 subject(s): the step rounds \
-          back to the same dose, so each time that rule fires there the dose stays where it \
-          is. From the start dose on: 'a' at 1000. Once the decrease rules have brought the \
-          dose down: 'b' at 750. The lowest dose this step can raise is 1250. To let these \
-          doses rise, use a smaller round_to or a larger increase step; a dose_bounds low \
-          of at least 1250 keeps every dose out of this range."
+          increase step) cannot raise a dose that 2 of 3 subject(s) can be at: the step \
+          rounds back to the same dose, so each time that rule fires there the dose stays \
+          where it is. From the start dose on: 'a' at 1000. Once the decrease rules have \
+          brought the dose down: 'b' at 750. The lowest dose this step can raise is 1250. To \
+          let these doses rise, use a smaller round_to or a larger increase step, or, where \
+          a subject's upper bound allows, a start dose and a dose_bounds low of at least \
+          1250."
         ]
     );
     assert!(!absorbed_warnings(&r)[0].contains("'c'"));
@@ -372,15 +374,139 @@ fn an_oracle_subject_is_named_with_its_replicates() {
     let r = run_n(&p, &pop(&[("1", 70.0)]), 3).expect("runs");
     assert_eq!(absorbed_warnings(&r).len(), 1, "{:?}", r.warnings);
     let w = absorbed_warnings(&r)[0];
-    assert!(w.contains("of 1 of 1 subject(s)"), "{w}");
+    assert!(w.contains("a dose that 1 of 1 subject(s) can be at"), "{w}");
     assert!(
-        w.contains("From the start dose on: '1' at 500 (in 3 of 3 replicate(s), first in 1)."),
+        w.contains("From the start dose on: '1' in 3 of 3 replicate(s), first in 1 at 500."),
+        "{w}"
+    );
+}
+
+/// The replicate count is the number of replicates the step is absorbed in, not the
+/// number of replicates (#2890 review r1 row 4). `start_dose = 62.5 * CL` is 375 at the
+/// typical clearance, so a draw below it is placed at 250, where `increase 25%` is
+/// absorbed, and a draw above it at 500 or more, where it is not. The rule never fires
+/// (`signal < 0`), so each replicate's first ledger dose is its placed start dose: the
+/// expected count and first replicate are read from the ledger. Both kinds of
+/// replicate must occur, which is asserted.
+///
+/// Mutations: `{n_sim} of {n_sim}` or `{n} of {n}` in the text; the first replicate of
+/// the run named in place of the first absorbed one.
+#[test]
+fn an_oracle_subject_counts_only_the_replicates_the_step_is_absorbed_in() {
+    const N: usize = 12;
+    let p = model(&block(
+        "62.5 * CL",
+        "[1, 4000]",
+        "  dose_knowledge = oracle\n",
+        "signal < 0 : increase 25%",
+    ));
+    let r = run_n(&p, &pop(&[("1", 70.0)]), N).expect("runs");
+    let starts: Vec<(usize, f64)> = r
+        .ledger
+        .iter()
+        .filter(|e| e.dose_idx == 0)
+        .map(|e| (e.sim, e.amt))
+        .collect();
+    assert_eq!(starts.len(), N, "{starts:?}");
+    let mut stuck: Vec<usize> = starts
+        .iter()
+        .filter(|(_, amt)| amt.to_bits() == 250.0f64.to_bits())
+        .map(|&(sim, _)| sim)
+        .collect();
+    stuck.sort_unstable();
+    assert!(!stuck.is_empty() && stuck.len() < N, "{starts:?}");
+    assert!(
+        stuck[0] > 1,
+        "the first replicate must not be absorbed: {starts:?}"
+    );
+
+    assert_eq!(absorbed_warnings(&r).len(), 1, "{:?}", r.warnings);
+    let w = absorbed_warnings(&r)[0];
+    let want = format!(
+        "From the start dose on: '1' in {} of {N} replicate(s), first in {} at 250. The",
+        stuck.len(),
+        stuck[0]
+    );
+    assert!(w.contains(&want), "want {want:?} in {w}");
+}
+
+/// An oracle subject whose replicates differ in case is named in both groups, each
+/// with its own count, first replicate and dose (#2890 review r1 row 6). Subject `s1`:
+/// replicates 1 and 3 absorbed at the start dose 250, replicate 2 once stepped down to
+/// 500. It is one subject in the count.
+///
+/// Mutations: grouping the subject by its first replicate only (one group, "3 of 3");
+/// counting it once per group ("2 of 12").
+#[test]
+fn an_oracle_subject_whose_replicates_differ_is_named_in_both_groups() {
+    use crate::sim::adaptive::AbsorbedIncrease::{FromStart, OnceSteppedDown};
+    let p = model(&block(
+        "500",
+        "[250, 4000]",
+        "",
+        "signal < 0 : increase 10%",
+    ));
+    let spec = p.adaptive_dosing.as_ref().expect("block present");
+    let population = pop(&[("s1", 70.0), ("s2", 70.0)]);
+    let plan = |replicate, found| AbsorbedPlan {
+        subject: 0,
+        replicate: Some(replicate),
+        found,
+    };
+    let plans = vec![
+        plan(3, FromStart(250.0)),
+        plan(2, OnceSteppedDown(500.0)),
+        plan(1, FromStart(250.0)),
+    ];
+    let w = absorbed_step_warning(spec, &population, 3, plans).expect("a line");
+    assert!(w.contains("a dose that 1 of 2 subject(s) can be at"), "{w}");
+    assert!(
+        w.contains(
+            "From the start dose on: 's1' in 2 of 3 replicate(s), first in 1 at 250. Once \
+             the decrease rules have brought the dose down: 's1' in 1 of 3 replicate(s), \
+             first in 2 at 500. The lowest"
+        ),
+        "{w}"
+    );
+}
+
+/// When the step raises no finite dose on the grid, the line gives no lowest dose and
+/// no dose remedy: `round_to = 1e308` under `increase 10%` (the next multiple is
+/// infinite). The other two remedies stay.
+///
+/// Mutations: printing a placeholder dose; dropping the whole remedy sentence.
+#[test]
+fn a_step_that_raises_no_dose_gives_no_lowest_dose() {
+    let p = model(&block(
+        "500",
+        "[250, 4000]",
+        "",
+        "signal < 0 : increase 10%",
+    ));
+    let mut spec = p.adaptive_dosing.clone().expect("block present");
+    spec.round_to = Some(1e308);
+    let population = pop(&[("s1", 70.0)]);
+    let plans = vec![AbsorbedPlan {
+        subject: 0,
+        replicate: None,
+        found: crate::sim::adaptive::AbsorbedIncrease::FromStart(500.0),
+    }];
+    let w = absorbed_step_warning(&spec, &population, 1, plans).expect("a line");
+    assert!(
+        w.ends_with(
+            "where it is. From the start dose on: 's1' at 500. To let these doses rise, use \
+             a smaller round_to or a larger increase step."
+        ),
+        "{w}"
+    );
+    assert!(
+        !w.contains("lowest dose") && !w.contains("upper bound"),
         "{w}"
     );
 }
 
 /// More subjects than are named: the first ten in population order, then a count. The
-/// plans are handed over in reverse, as replicates of a parallel run can arrive.
+/// plans are handed over in reverse: the line must not depend on arrival order.
 ///
 /// Mutations: no cap; the count of all subjects in place of the rest; arrival order.
 #[test]
@@ -404,7 +530,10 @@ fn subjects_past_the_tenth_are_counted_not_named() {
         })
         .collect();
     let w = absorbed_step_warning(spec, &population, 1, plans).expect("a line");
-    assert!(w.contains("of 12 of 12 subject(s)"), "{w}");
+    assert!(
+        w.contains("a dose that 12 of 12 subject(s) can be at"),
+        "{w}"
+    );
     assert!(
         w.contains(
             "From the start dose on: 's1' at 500, 's2' at 500, 's3' at 500, 's4' at 500, \

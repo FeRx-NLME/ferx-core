@@ -723,11 +723,15 @@ pub(super) struct AbsorbedPlan {
 const ABSORBED_STEP_SHOWN: usize = 10;
 
 /// `W_ADAPTIVE_STEP_ABSORBED` (#2810): with `round_to`, the smallest `increase N%`
-/// rounds back to the same dose at the lowest dose some subjects can be at, so that rule
-/// fires there and the dose does not move. `None` when no plan in `plans` has such a
-/// dose. One line for the run: the subjects are counted, then named (the first
+/// rounds back to the same dose at a dose some subjects can be at, so that rule fires
+/// there and the dose does not move. `None` when no plan in `plans` has such a dose. One
+/// line for the run: the subjects are counted, then named (the first
 /// [`ABSORBED_STEP_SHOWN`] of each group) with the dose, split by whether the start dose
-/// itself is absorbed. An oracle subject is named with the replicates it happened in.
+/// itself is absorbed.
+///
+/// An oracle subject's plan differs per replicate, so it is named per group with the
+/// number of replicates in that group, the first of them, and that replicate's dose. It
+/// is in both groups when its replicates differ in case (#2890 review r1 row 6).
 pub(super) fn absorbed_step_warning(
     spec: &crate::sim::adaptive::AdaptiveDosingSpec,
     population: &Population,
@@ -737,28 +741,32 @@ pub(super) fn absorbed_step_warning(
     use crate::sim::adaptive::{AbsorbedIncrease, DoseGrid};
     let (s, p) = (spec.round_to?, spec.smallest_increase_percent()?);
     plans.sort_by_key(|a| (a.subject, a.replicate));
-    // One entry per subject: its first plan, and how many of its plans were found.
-    let mut subjects: Vec<(AbsorbedPlan, usize)> = Vec::new();
-    for a in plans {
-        match subjects.last_mut() {
-            Some((first, n)) if first.subject == a.subject => *n += 1,
-            _ => subjects.push((a, 1)),
-        }
-    }
-    if subjects.is_empty() {
+    let mut ids: Vec<usize> = plans.iter().map(|a| a.subject).collect();
+    ids.dedup();
+    if ids.is_empty() {
         return None;
     }
     let group = |from_start: bool| {
+        // One entry per subject in this group: its first plan here, and how many.
+        let mut subjects: Vec<(AbsorbedPlan, usize)> = Vec::new();
+        for a in plans
+            .iter()
+            .filter(|a| matches!(a.found, AbsorbedIncrease::FromStart(_)) == from_start)
+        {
+            match subjects.last_mut() {
+                Some((first, n)) if first.subject == a.subject => *n += 1,
+                _ => subjects.push((*a, 1)),
+            }
+        }
         let named: Vec<String> = subjects
             .iter()
-            .filter(|(a, _)| matches!(a.found, AbsorbedIncrease::FromStart(_)) == from_start)
             .map(|(a, n)| {
                 let id = &population.subjects[a.subject].id;
                 let dose = a.found.dose();
                 match a.replicate {
                     None => format!("'{id}' at {dose}"),
                     Some(k) => {
-                        format!("'{id}' at {dose} (in {n} of {n_sim} replicate(s), first in {k})")
+                        format!("'{id}' in {n} of {n_sim} replicate(s), first in {k} at {dose}")
                     }
                 }
             })
@@ -783,15 +791,25 @@ pub(super) fn absorbed_step_warning(
     let stepped_down = group(false)
         .map(|l| format!(" Once the decrease rules have brought the dose down: {l}."))
         .unwrap_or_default();
-    let lowest = DoseGrid::lowest_raised_by(s, p);
+    // The third remedy holds only where a subject's upper bound leaves room for it, and
+    // needs the start dose raised with the low bound (#2890 review r1 row 3).
+    let (lowest, or_higher_doses) = match DoseGrid::lowest_raised_by(s, p) {
+        Some(d) => (
+            format!(" The lowest dose this step can raise is {d}."),
+            format!(
+                ", or, where a subject's upper bound allows, a start dose and a dose_bounds \
+                 low of at least {d}"
+            ),
+        ),
+        None => (String::new(), String::new()),
+    };
     Some(format!(
         "W_ADAPTIVE_STEP_ABSORBED: with round_to = {s}, `increase {p}%` (the smallest \
-         increase step) cannot raise the lowest dose of {} of {} subject(s): the step \
+         increase step) cannot raise a dose that {} of {} subject(s) can be at: the step \
          rounds back to the same dose, so each time that rule fires there the dose stays \
-         where it is.{from_start}{stepped_down} The lowest dose this step can raise is \
-         {lowest}. To let these doses rise, use a smaller round_to or a larger increase \
-         step; a dose_bounds low of at least {lowest} keeps every dose out of this range.",
-        subjects.len(),
+         where it is.{from_start}{stepped_down}{lowest} To let these doses rise, use a \
+         smaller round_to or a larger increase step{or_higher_doses}.",
+        ids.len(),
         population.subjects.len(),
     ))
 }
