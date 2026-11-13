@@ -956,8 +956,10 @@ pub(crate) struct InnerSolvePolicy {
     /// for the cold placeholder at every evaluation and re-runs the guarded multi-start each
     /// time, which cannot move it: on `examples/mm_iv.ferx` with one unused η, 920 multi-starts
     /// in 470 solves, none of which moved an EBE. Unlike `init_is_mode` it does not say the
-    /// starts are modes *at these parameters*, so the IOV solve's start gates, which read only
-    /// that, still apply. Set by [`PrevEtas::Solved`]; `false`, the `Default`, otherwise.
+    /// starts are modes *at these parameters*, so the IOV solve's start gates — its seed gate
+    /// and, since #2730, its multi-start gate — read only that and still apply: an IOV
+    /// subject's exactly-zero mode is cold there at every evaluation. Set by
+    /// [`PrevEtas::Solved`]; `false`, the `Default`, otherwise.
     pub(crate) init_is_warm: bool,
     /// Return a warm start unchanged when [`FallbackCertifier::certifies_in_place`] already
     /// certifies it, without running the search (#2279). A point the inner solve returned as
