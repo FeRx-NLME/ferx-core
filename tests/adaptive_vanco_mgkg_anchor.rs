@@ -16,6 +16,14 @@
 //! (`common::typical_value_etas`): the model's `omega ~ 1e-10` would otherwise draw an η
 //! of order 1e-5 on CL, a one-sided trough drift against the typical-value mrgsolve run.
 //!
+//! The `round_to` arm (#944 PR3) runs `examples/adaptive_vanco_mgkg_rounded.ferx`
+//! (`round_to = 250`, `dose_bounds = [250, min(30 * WT, 4000)]`) on two other weights,
+//! 40 and 80 kg, against `expected_round_to.md`: between them a rounded start dose, a tie
+//! that goes up, a cap that needs aligning (where clamping before rounding overshoots
+//! it), and a step that starts from the carried rounded dose. Each is asserted on the
+//! frozen table by `vanco_mgkg_round_to_kit_is_non_degenerate`, so a regenerated kit that
+//! lost one fails by name.
+//!
 //! Non-degeneracy: two weights, so the two subjects' ledgers differ from the first dose
 //! on; the `min` binds for the 150 kg subject only (4000 < 30·150) while the 50 kg subject
 //! is capped at 30·WT, so the ledgers part again at t = 60 — a plan evaluated once per run
@@ -31,12 +39,17 @@ mod common;
 
 const KIT: &str = "tests/reference/vanco_mgkg_mrgsolve";
 const EXAMPLE: &str = "examples/adaptive_vanco_mgkg.ferx";
+const EXAMPLE_ROUNDED: &str = "examples/adaptive_vanco_mgkg_rounded.ferx";
 
 /// One row of `expected.md`: `(time, trough, fired, amt)`.
 type RefRow = (f64, f64, String, f64);
 
 fn reference() -> Vec<Vec<RefRow>> {
-    let md = std::fs::read_to_string(format!("{KIT}/expected.md")).expect("expected.md");
+    reference_from("expected.md")
+}
+
+fn reference_from(file: &str) -> Vec<Vec<RefRow>> {
+    let md = std::fs::read_to_string(format!("{KIT}/{file}")).expect("reference table");
     let mut subjects: Vec<Vec<RefRow>> = Vec::new();
     for line in md.lines() {
         if line.starts_with("## Subject") {
@@ -57,19 +70,18 @@ fn reference() -> Vec<Vec<RefRow>> {
     subjects
 }
 
-fn kit_population() -> Population {
-    read_nonmem_csv(
-        Path::new(&format!("{KIT}/vanco_mgkg_subjects.csv")),
-        None,
-        None,
-    )
-    .expect("subjects load")
+fn kit_population(file: &str) -> Population {
+    read_nonmem_csv(Path::new(&format!("{KIT}/{file}")), None, None).expect("subjects load")
+}
+
+fn run_example(example: &str, subjects: &str) -> AdaptiveSimulationResult {
+    let parsed = parse_full_model_file(Path::new(example)).expect("example parses");
+    let spec = parsed.adaptive_dosing.as_ref().expect("block attached");
+    common::simulate_from_spec_at_typical_value(&parsed.model, &kit_population(subjects), spec)
 }
 
 fn run() -> AdaptiveSimulationResult {
-    let parsed = parse_full_model_file(Path::new(EXAMPLE)).expect("example parses");
-    let spec = parsed.adaptive_dosing.as_ref().expect("block attached");
-    common::simulate_from_spec_at_typical_value(&parsed.model, &kit_population(), spec)
+    run_example(EXAMPLE, "vanco_mgkg_subjects.csv")
 }
 
 /// Cross-solver trough band (mg/L), ferx (RK45 at the model's default tolerances) against
@@ -83,11 +95,27 @@ const TROUGH_TOL: f64 = 1e-7;
 
 #[test]
 fn vanco_mgkg_matches_mrgsolve() {
-    let res = run();
-    let reference = reference();
+    let worst = assert_matches(&run(), &reference());
+    eprintln!("worst ferx-vs-mrgsolve trough gap: {worst:.3e} mg/L");
+}
+
+/// The `round_to = 250` arm (#944 PR3) against `expected_round_to.md`, under the same
+/// trough band. The worst gap is printed: 1.358e-9 mg/L on Linux aarch64
+/// (`tools/linux-test.sh`) and the same on macOS arm64, ~70x inside `TROUGH_TOL`. Every
+/// amount is a multiple of 250, so the doses compare by bits.
+#[test]
+fn vanco_mgkg_round_to_matches_mrgsolve() {
+    let res = run_example(EXAMPLE_ROUNDED, "vanco_mgkg_round_subjects.csv");
+    let worst = assert_matches(&res, &reference_from("expected_round_to.md"));
+    eprintln!("worst ferx-vs-mrgsolve trough gap (round_to): {worst:.3e} mg/L");
+}
+
+/// Every decision of `res` against the frozen `reference`: the trough within
+/// [`TROUGH_TOL`], the dose by bits, the rule that acted. Returns the worst trough gap.
+fn assert_matches(res: &AdaptiveSimulationResult, reference: &[Vec<RefRow>]) -> f64 {
     assert_eq!(reference.len(), 2, "two subjects in the kit");
     let mut worst: f64 = 0.0;
-    for (id, want) in ["1", "2"].iter().zip(&reference) {
+    for (id, want) in ["1", "2"].iter().zip(reference) {
         let got: Vec<_> = res.decisions.iter().filter(|d| d.subject == *id).collect();
         assert_eq!(got.len(), want.len(), "subject {id}: one decision per row");
         let ledger: Vec<_> = res.ledger.iter().filter(|e| e.subject == *id).collect();
@@ -121,7 +149,7 @@ fn vanco_mgkg_matches_mrgsolve() {
             );
         }
     }
-    eprintln!("worst ferx-vs-mrgsolve trough gap: {worst:.3e} mg/L");
+    worst
 }
 
 /// The scenario the anchor relies on, read off the frozen reference so a regenerated kit
@@ -148,4 +176,78 @@ fn vanco_mgkg_kit_is_non_degenerate() {
     assert!(s1
         .windows(2)
         .any(|w| w[1].2 == "increase" && w[1].3 == w[0].3));
+}
+
+/// One row of `expected_round_to.md`'s `raw` column: the dose before rounding (the start
+/// dose at decision 0, the stepped dose when a rule fired), `None` on a re-issue.
+fn raw_column() -> Vec<Vec<Option<f64>>> {
+    let md = std::fs::read_to_string(format!("{KIT}/expected_round_to.md")).expect("table");
+    let mut subjects: Vec<Vec<Option<f64>>> = Vec::new();
+    for line in md.lines() {
+        if line.starts_with("## Subject") {
+            subjects.push(Vec::new());
+            continue;
+        }
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        // `| decision | time | trough | fired | amt | margin | raw |`
+        if cells.len() >= 8 && cells[1].parse::<usize>().is_ok() {
+            subjects
+                .last_mut()
+                .expect("a subject header first")
+                .push(cells[7].parse().ok());
+        }
+    }
+    subjects
+}
+
+/// The rounding cases the `round_to` arm exists for, read off the frozen table (#944
+/// PR3): the 40 kg subject's start dose 600 is rounded to 500; a tie goes up (625 -> 750
+/// at 40 kg, 1875 -> 2000 at 80 kg); the cap needs aligning and clamping first would
+/// overshoot it (40 kg: 1250 clamps to 1200, which rounds to 1250 > 1200; the table says
+/// 1000); and the 40 kg subject's second step starts from the carried 750, not the
+/// unrounded 625 (`raw = 937.5 = 750 * 1.25`, where 625 * 1.25 = 781.25 would round to
+/// 750, not the 1000 issued).
+#[test]
+fn vanco_mgkg_round_to_kit_is_non_degenerate() {
+    let r = reference_from("expected_round_to.md");
+    let raw = raw_column();
+    let (s1, s2) = (&r[0], &r[1]);
+    let (r1, r2) = (&raw[0], &raw[1]);
+    // Every dose on the grid, inside the written bounds.
+    for (s, wt) in [(s1, 40.0), (s2, 80.0)] {
+        for row in s.iter() {
+            assert!(row.3.is_finite() && row.3 % 250.0 == 0.0, "{row:?}");
+            assert!(
+                (250.0..=f64::min(30.0 * wt, 4000.0)).contains(&row.3),
+                "{row:?}"
+            );
+        }
+    }
+    // A rounded start dose.
+    assert_eq!((r1[0], s1[0].3), (Some(600.0), 500.0));
+    // A tie that goes up, on both subjects.
+    let tie_up = |s: &Vec<RefRow>, raw: &Vec<Option<f64>>| {
+        s.iter()
+            .zip(raw)
+            .any(|(row, x)| x.is_some_and(|x| x % 250.0 == 125.0 && row.3 == x + 125.0))
+    };
+    assert!(tie_up(s1, r1) && tie_up(s2, r2), "a tie on each subject");
+    // The aligned cap: the issued cap is a multiple below 30 * WT, and the step that hit
+    // it would round above 30 * WT after a clamp to it.
+    for (s, raw, wt, cap) in [(s1, r1, 40.0, 1000.0), (s2, r2, 80.0, 2250.0)] {
+        let hi = 30.0 * wt;
+        assert!(cap < hi && s.iter().any(|row| row.3 == cap), "cap {cap}");
+        assert!(raw
+            .iter()
+            .flatten()
+            .any(|&x| x > hi && ((hi / 250.0 + 0.5).floor() * 250.0) > hi));
+    }
+    // The carried dose: decision 3's step is 1.25 times decision 1's rounded dose.
+    assert_eq!((s1[1].3, r1[1]), (750.0, Some(625.0)));
+    assert_eq!((r1[3], s1[3].3), (Some(750.0 * 1.25), 1000.0));
+    assert_eq!(
+        ((625.0f64 * 1.25 / 250.0 + 0.5).floor() * 250.0),
+        750.0,
+        "carrying the unrounded dose would issue 750 at decision 3, not 1000"
+    );
 }

@@ -787,7 +787,8 @@ fn derived_runtime_roots_are_the_fixture_directories() {
 #[test]
 fn dot_rooted_reads_are_only_ci_config() {
     // `runtime_input_roots` skips dot-prefixed roots, which is safe exactly as long as the
-    // only dot-rooted paths the tests touch are the workflow files the CI guards assert on.
+    // only dot-rooted paths the tests touch are the workflow files the CI guards assert on,
+    // plus `.github/CODEOWNERS`, which `tests/codeowners.rs` pins (#2636) — repo config too.
     // Pin that: a fixture parked under a dot-directory must fail here — loudly, naming the
     // file — rather than be skipped by the harvest and silently left out of the filter.
     let root = repo_root();
@@ -797,6 +798,7 @@ fn dot_rooted_reads_are_only_ci_config() {
         .into_iter()
         .filter(|(_, literal)| literal.starts_with('.') && literal.contains('/'))
         .filter(|(_, literal)| !literal.starts_with(".github/workflows/"))
+        .filter(|(_, literal)| !literal.starts_with(".github/CODEOWNERS"))
         .map(|(source, literal)| format!("{source} -> {literal}"))
         .collect();
 

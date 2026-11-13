@@ -415,7 +415,7 @@ pub(crate) fn mixture_gradient_with_modes(
     }
 
     // Softmax mixing gradient: −2 Σ_i Σ_k w_ik ∂ln p_ik/∂θ_j (theta slots).
-    let theta_floor = fd_theta_step_floors(&model.default_params);
+    let theta_floor = fd_theta_step_floors(model);
     for (i, subject) in population.subjects.iter().enumerate() {
         let dlnp = mixing_logp_grad(spec, &params.theta, &subject.covariates, &theta_floor)?;
         for (cls, dlnp_c) in dlnp.iter().enumerate() {
@@ -753,7 +753,7 @@ impl MixtureScoreContext {
         let covariates = &population.subjects[i].covariates;
         // The p-form has no analytic mixing gradient; S, unlike the outer gradient, has no
         // whole-objective FD to fall back to, so difference the mixing map itself.
-        let floor = fd_theta_step_floors(&model.default_params);
+        let floor = fd_theta_step_floors(model);
         let dlnp = mixing_logp_grad(spec, &self.params.theta, covariates, &floor)
             .unwrap_or_else(|| mixing_logp_grad_fd(spec, &self.params.theta, covariates, &floor));
         let mut g = vec![0.0f64; packed_segments(&self.params).total()];
@@ -795,7 +795,7 @@ impl MixtureScoreContext {
 /// is absolute in its own units — 1.2 % of a θ of 8e-4. There it is `1e-5·|θ₀|` (#2187).
 ///
 /// Each probe is clamped to `init_params`' packed box — the box the outer optimizer
-/// searches — and the difference divided by the clamped span, as `central_diff_packed`
+/// searches — and the difference divided by the clamped span, as `central_diff_packed_gated`
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
@@ -806,7 +806,7 @@ pub fn mixture_gradient_fd(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     let bounds = crate::estimation::parameterization::compute_bounds(init_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
@@ -816,7 +816,7 @@ pub fn mixture_gradient_fd(
         let mut xm = x.to_vec();
         xp[i] = (x[i] + h).min(bounds.upper[i]);
         xm[i] = (x[i] - h).max(bounds.lower[i]);
-        // Collapsed probes only — see `central_diff_packed`: an absolute cutoff on the span
+        // Collapsed probes only — see `central_diff_packed_gated`: an absolute cutoff on the span
         // would zero a θ declared below ~1e-11 (#2187 review).
         if xp[i] <= xm[i] {
             continue;
@@ -928,7 +928,7 @@ mod tests {
             let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
             let spec = model.mixture.as_ref().unwrap();
             let theta = &model.default_params.theta;
-            let floor = fd_theta_step_floors(&model.default_params);
+            let floor = fd_theta_step_floors(&model);
             assert_eq!(floor, vec![1.0, tiny], "{mixing}: floors");
             // The closed form: softmax with logit g, or the p form p₁ = g (both unclamped
             // here, p₁ = 2.8e-4).
@@ -2168,7 +2168,7 @@ mod tests {
         assert!(
             res.warnings
                 .iter()
-                .any(|w| w.contains("BOBYQA") && w.contains("Bfgs")),
+                .any(|w| w.contains("BOBYQA") && w.contains("`bfgs`")),
             "expected an optimizer-downgrade warning, got {:?}",
             res.warnings
         );
@@ -2192,6 +2192,139 @@ mod tests {
             "auto optimizer must not emit a downgrade warning, got {:?}",
             res.warnings
         );
+    }
+
+    #[test]
+    fn mixture_explicit_bobyqa_does_not_warn() {
+        // #2852: an explicit `optimizer = bobyqa` is the optimizer the mixture path
+        // runs, so the fit must not claim the choice "was replaced by BOBYQA".
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            optimizer: crate::types::Optimizer::Bobyqa,
+            outer_maxiter: 2,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("explicit-bobyqa mixture fit should return Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("does not carry the mixture objective")),
+            "explicit bobyqa runs as requested and must not warn, got {:?}",
+            res.warnings
+        );
+    }
+
+    /// What `resolve_outer_optimizer` owes one requested optimizer on a mixture model.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum OnMixture {
+        /// Runs as requested, no warning.
+        Honoured,
+        /// `auto`: runs BOBYQA, silently.
+        SilentBobyqa,
+        /// Runs BOBYQA and says so, naming the requested optimizer as the user spells it
+        /// in a model file (`Optimizer::label`), written out here so the test does not
+        /// borrow the spelling from the code under test.
+        Replaced(&'static str),
+    }
+
+    /// The warning's whole input space on the optimizer axis (#2852). Exhaustive on
+    /// purpose, with no wildcard: a new `Optimizer` variant does not compile until it
+    /// has a row here, and then belongs in `ALL_OPTIMIZERS` below.
+    fn on_mixture(requested: crate::types::Optimizer) -> OnMixture {
+        use crate::types::Optimizer;
+        match requested {
+            Optimizer::Auto => OnMixture::SilentBobyqa,
+            Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
+                OnMixture::Honoured
+            }
+            Optimizer::Bfgs => OnMixture::Replaced("bfgs"),
+            Optimizer::Lbfgs => OnMixture::Replaced("lbfgs"),
+            Optimizer::TrustRegion => OnMixture::Replaced("trust_region"),
+        }
+    }
+
+    #[test]
+    fn mixture_replacement_warning_covers_every_optimizer() {
+        use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+        use crate::types::Optimizer;
+        const ALL_OPTIMIZERS: [Optimizer; 8] = [
+            Optimizer::Auto,
+            Optimizer::Bfgs,
+            Optimizer::Lbfgs,
+            Optimizer::Slsqp,
+            Optimizer::NloptLbfgs,
+            Optimizer::Mma,
+            Optimizer::Bobyqa,
+            Optimizer::TrustRegion,
+        ];
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        for requested in ALL_OPTIMIZERS {
+            // The analytic flag is read only by the non-mixture `auto` rule; neither
+            // value may change what a mixture runs or whether a warning is owed.
+            for analytic in [true, false] {
+                let (resolved, warning) =
+                    resolve_outer_optimizer(requested, &model, true, analytic);
+                match on_mixture(requested) {
+                    OnMixture::Honoured => {
+                        assert_eq!(resolved, requested, "{requested:?} runs as requested");
+                        assert_eq!(warning, None, "{requested:?} is honoured: no warning");
+                    }
+                    OnMixture::SilentBobyqa => {
+                        assert_eq!(resolved, Optimizer::Bobyqa);
+                        assert_eq!(warning, None, "auto downgrades silently");
+                    }
+                    OnMixture::Replaced(name) => {
+                        assert_eq!(resolved, Optimizer::Bobyqa, "{requested:?} runs BOBYQA");
+                        let w = warning
+                            .unwrap_or_else(|| panic!("{requested:?} on a mixture must warn"));
+                        assert!(
+                            w.contains("does not carry the mixture objective")
+                                && w.contains("was replaced by BOBYQA"),
+                            "{requested:?}: {w}"
+                        );
+                        // The advice half: what the user can pick instead.
+                        assert!(
+                            w.starts_with(
+                                "Mixture models are optimized with BOBYQA or an NLopt gradient \
+                                 method (SLSQP / L-BFGS / MMA);"
+                            ),
+                            "{requested:?}: message must say what a mixture can run: {w}"
+                        );
+                        // The discriminator and its negatives: the message names the
+                        // optimizer that was asked for, in option spelling; never the
+                        // one that ran ("the requested `bobyqa` optimizer ... was
+                        // replaced by BOBYQA"); and never a Rust `Debug` name such as
+                        // `TrustRegion`, which no model file contains.
+                        assert!(
+                            w.contains(&format!("the requested `{name}` optimizer")),
+                            "{requested:?}: message must name {name}: {w}"
+                        );
+                        assert!(!w.contains("`bobyqa`"), "{requested:?}: {w}");
+                        assert!(
+                            !w.contains(&format!("{requested:?}")) && !w.contains("Bobyqa"),
+                            "{requested:?}: no Debug spelling in a user-facing message: {w}"
+                        );
+                    }
+                }
+
+                // Without a mixture nothing is ever replaced: no warning for any
+                // optimizer, and an explicit choice is returned unchanged.
+                let (resolved, warning) =
+                    resolve_outer_optimizer(requested, &model, false, analytic);
+                assert_eq!(warning, None, "{requested:?} without a mixture: no warning");
+                if requested == Optimizer::Auto {
+                    assert_ne!(
+                        resolved,
+                        Optimizer::Auto,
+                        "auto resolves to a concrete optimizer"
+                    );
+                } else {
+                    assert_eq!(resolved, requested, "{requested:?} without a mixture");
+                }
+            }
+        }
     }
 
     #[test]

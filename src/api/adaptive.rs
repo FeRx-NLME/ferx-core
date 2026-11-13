@@ -948,18 +948,10 @@ where
     // models, so an adaptive-dosing dataset with an out-of-range or `CMT=0`-infusion seed dose now
     // returns a recoverable `Err` here instead of the engine silently dropping it. (It was a no-op
     // for ODE models before #899 — do not "simplify" this call away as dead code.)
+    // It also runs `check_cmt_toggles` (#2732), on the base data alone: a compartment on/off
+    // record is honoured by the driver (#2753), and an observation row of a compartment the
+    // data leave off is still refused, though a controller dose would turn it on.
     first_error(&check_dose_compartments(model, population))?;
-    // The adaptive walk has its own timeline, with no compartment on/off record (#2732).
-    if let Some(s) = population.subjects.iter().find(|s| s.has_cmt_toggles()) {
-        return Err(super::entry_refusals::adaptive_unsupported(
-            None,
-            format!(
-                "subject {} turns a compartment off (`EVID=2` with a negative `CMT`), which \
-                 adaptive dosing cannot honour.",
-                s.id
-            ),
-        ));
-    }
     first_error(&check_absorption_closed_form_support_diags(
         model, population,
     ))?;

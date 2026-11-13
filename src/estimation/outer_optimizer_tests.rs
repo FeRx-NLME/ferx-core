@@ -6561,7 +6561,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
 /// (`moving_bounds_separable` reads the resolved infusion windows and lag times), so a
 /// subject can decline at the probe point and be served at its EBE. Both halves of that
 /// are pinned below.
-mod outer_fd_fallback {
+pub(crate) mod outer_fd_fallback {
     use super::*;
     use std::path::Path;
 
@@ -6598,7 +6598,7 @@ mod outer_fd_fallback {
   DV ~ proportional(PROP_ERR)
 "#;
 
-    fn mk_pop(subjects: Vec<Subject>) -> Population {
+    pub(crate) fn mk_pop(subjects: Vec<Subject>) -> Population {
         Population {
             subjects,
             covariate_names: Vec::new(),
@@ -6613,7 +6613,7 @@ mod outer_fd_fallback {
     /// infusion into the depot. An oral infusion routes the subject to the event walk,
     /// and the walk declines an SS infusion under a lag time
     /// (`ss_lagtime_walk_unsupported`), so the twin falls back while its sibling stays exact.
-    fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
+    pub(crate) fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
         let model =
             crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
         let pop = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
@@ -6674,10 +6674,17 @@ mod outer_fd_fallback {
             outer_fd_fallback_warning(&model, &pop, &log).expect("a declining subject must warn");
         assert!(w.contains("1 of 2"), "got: {w}");
         assert!(
-            w.contains("could not be given the exact analytic outer gradient")
-                && w.contains("a trial point where it could not be formed"),
-            "must not attribute every decline to the provider's scope; got: {w}"
+            w.contains("could not be given the exact analytic outer gradient"),
+            "got: {w}"
         );
+        // #2713: the decline is named by its cause. The walk declines this subject's SS
+        // infusion under a lag in its recording, so the recording clause and not the
+        // mode-system one.
+        assert!(
+            w.contains("(1 with a shape no analytic recorder serves, or a recording that failed"),
+            "a recorder decline must be named as one; got: {w}"
+        );
+        assert!(!w.contains("inner Hessian"), "got: {w}");
         assert!(
             w.contains("OUT_OF_SCOPE"),
             "must name the declining subject, not the in-scope one; got: {w}"
@@ -6686,6 +6693,157 @@ mod outer_fd_fallback {
         assert!(
             w.contains("model-level route, not the per-subject one"),
             "must reconcile the warning with `gradient_method_outer`; got: {w}"
+        );
+    }
+
+    /// #2713: the warning breaks the declined subjects down by cause, one clause per cause
+    /// some subject declined for, so a fit with a large fallback share says which remedy
+    /// applies. Each clause is asserted present exactly when its cause was recorded, count
+    /// included; a subject that declined for both causes counts in both; and a log no route
+    /// stamped a cause on (the quadrature's) keeps the generic sentence.
+    #[test]
+    fn warning_names_each_decline_cause() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        const MODE: &str = "with an inner Hessian at the EBE that was singular, or indefinite \
+             at an EBE that was not stationary (an EBE off a strict mode), at some trial point";
+        const RECORDING: &str = "with a shape no analytic recorder serves, or a recording \
+             that failed or came back non-finite at some trial point";
+        const GENERIC: &str = "a trial point where it could not be formed";
+        let warn = |causes: &[(usize, DeclineCause)]| {
+            let log = OuterFdDeclineLog::new(2);
+            for &(i, c) in causes {
+                log.record(i);
+                log.record_cause(i, c);
+            }
+            outer_fd_fallback_warning(&model, &pop, &log).expect("must warn")
+        };
+        let only = |w: &str, present: &[&str]| {
+            for clause in [MODE, RECORDING, GENERIC] {
+                assert_eq!(
+                    w.contains(clause),
+                    present.contains(&clause),
+                    "clause {clause:?}; got: {w}"
+                );
+            }
+        };
+        let w = warn(&[(0, DeclineCause::ModeSystem), (1, DeclineCause::ModeSystem)]);
+        only(&w, &[MODE]);
+        assert!(w.contains(&format!("(2 {MODE})")), "got: {w}");
+
+        let w = warn(&[(1, DeclineCause::Recording)]);
+        only(&w, &[RECORDING]);
+        assert!(w.contains(&format!("(1 {RECORDING})")), "got: {w}");
+
+        // Subject 0 declined at its mode system on one trial point and in its recording on
+        // another: it counts in both, beside subject 1's recording.
+        let w = warn(&[
+            (0, DeclineCause::ModeSystem),
+            (0, DeclineCause::Recording),
+            (1, DeclineCause::Recording),
+        ]);
+        only(&w, &[MODE, RECORDING]);
+        assert!(
+            w.contains(&format!("(1 {MODE}; 2 {RECORDING})")),
+            "got: {w}"
+        );
+
+        let log = OuterFdDeclineLog::new(2);
+        log.record(1);
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("must warn");
+        only(&w, &[GENERIC]);
+    }
+
+    /// #2713: the per-subject gate reads the adjoint's mode-system flag. The analytic
+    /// fixture subject, at a grid point where the exact `H` is indefinite, declines as
+    /// `ModeSystem`; the out-of-scope twin declines as `Recording` at the same point, so a
+    /// gate that maps every decline to one cause reddens one leg.
+    #[test]
+    fn the_gate_reports_the_adjoints_cause() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).expect("pt");
+        let grid = [-2.5, -1.5, -0.75, 0.75, 1.5, 2.5];
+        let mut points = Vec::new();
+        for &a in &grid {
+            for &b in &grid {
+                for &c in &grid {
+                    points.push([a, b, c]);
+                }
+            }
+        }
+        let eta = points
+            .into_iter()
+            .find(|e| {
+                crate::sens::ode_provider::adjoint::exact_inner_hessian(
+                    &model, &analytic, params, e,
+                )
+                .is_some_and(|h| h.cholesky().is_none())
+            })
+            .expect("a point where the exact H is indefinite");
+        let cause = |s: &Subject| {
+            subject_analytic_outer_gradient_dx(&model, s, &pt, &eta, true, false)
+                .0
+                .err()
+        };
+        assert_eq!(cause(&analytic), Some(DeclineCause::ModeSystem));
+        assert_eq!(cause(&declining), Some(DeclineCause::Recording));
+    }
+
+    /// #2713: the assembly records the cause it was handed. A forced decline is a
+    /// mode-system one, so on the fixture where subject 1 also declines in its recording
+    /// the warning counts one of each; unforced, only the recording. Mutation that reddens
+    /// it: dropping `record_cause` from the non-IOV assembly.
+    #[test]
+    fn the_assembly_records_each_decline_cause() {
+        let (model, analytic, declining) = analytic_and_declining();
+        let pop = mk_pop(vec![analytic, declining]);
+        let log = record_one_gradient_eval(&model, &pop);
+        assert_eq!(
+            (
+                log.n_cause(DeclineCause::ModeSystem),
+                log.n_cause(DeclineCause::Recording)
+            ),
+            (0, 1),
+            "unforced: subject 1 declines in its recording"
+        );
+        let params = &model.default_params;
+        let PackedStart {
+            packed: x, bounds, ..
+        } = pack_with_bounds(params);
+        let ehs: Vec<DVector<f64>> = (0..2).map(|_| DVector::zeros(model.n_eta)).collect();
+        let hms: Vec<DMatrix<f64>> = pop
+            .subjects
+            .iter()
+            .map(|s| DMatrix::zeros(s.observations.len(), model.n_eta))
+            .collect();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let log = OuterFdDeclineLog::new(2);
+        log.force_decline(0);
+        let _ = population_gradient_sens_mixed(
+            &x,
+            params,
+            &model,
+            &pop,
+            &ehs,
+            &hms,
+            &bounds,
+            &opts,
+            OuterTrial::unknown(),
+            &log,
+        );
+        assert_eq!(
+            (
+                log.n_cause(DeclineCause::ModeSystem),
+                log.n_cause(DeclineCause::Recording)
+            ),
+            (1, 1),
+            "forced: subject 0 at its mode system, subject 1 in its recording"
         );
     }
 
@@ -7218,7 +7376,9 @@ mod outer_fd_fallback {
                         .filter(|&&step| {
                             let mut xw = x.clone();
                             xw[k] = (x[k] + step).clamp(bounds.lower[k], bounds.upper[k]);
-                            let f = reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts);
+                            let tol = stencil_inner_tol(opts.inner_tol);
+                            let (f, _) =
+                                reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts, tol);
                             !(f.is_finite() && f < 1e19)
                         })
                         .count();
@@ -7503,6 +7663,622 @@ mod outer_fd_fallback {
             .collect();
         for (label, rel) in ["population", "reporting", "subject"].iter().zip(&rels) {
             assert!(*rel < 1e-5, "{label}: rel {rel:e}");
+        }
+    }
+
+    /// #2406: the production reconverged-FD gradient of a `[covariate_nn]` weight declared
+    /// at `1e-4`, against the exact adjoint gradient at the same point and EBEs. Before
+    /// #2406 the weight took the `|θ₀|` floor, a step of about `1e-8` in its own units; it
+    /// now keeps the unit floor. `TVKA`, outside the network, is the control: the two
+    /// gradients must agree there too, or the comparison is in the wrong units.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn a_small_covariate_nn_weight_gets_its_exact_gradient_from_the_fd_route() {
+        let mut model = crate::parser::model_parser::parse_model_string(
+            "[parameters]
+  theta TVQ(6.0, 0.1, 50.0)
+  theta TVKA(0.5, 0.05, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma PROP ~ 0.1 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs     = [CRCL, WT]
+  center     = [90, 70]
+  scale      = [30, 15]
+  outputs    = [CL, V1, V2]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+  init       = [4.0, 40.0, 80.0]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1
+  Q  = TVQ
+  V2 = TYPICAL_PK.V2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+        )
+        .expect("model parses");
+        // The output layer's zero init leaves every first-layer weight's gradient at 0, so
+        // each weight gets a fixed non-zero value first; the one under test is then set to
+        // 1e-4, a first-layer weight drawn small.
+        let ranges = model.nn_weight_theta_ranges();
+        for i in ranges.iter().flat_map(|r| r.clone()) {
+            model.default_params.theta[i] = 0.3 * (1.7 * i as f64).sin();
+        }
+        let w = ranges.first().expect("the network has weights").start;
+        model.default_params.theta[w] = 1e-4;
+        let mut pop = crate::read_nonmem_csv(
+            std::path::Path::new("data/two_cpt_oral_cov.csv"),
+            None,
+            None,
+        )
+        .expect("data loads");
+        pop.subjects.truncate(8);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let params = &model.default_params;
+        let x = pack_params(params);
+        assert_eq!(
+            x[w], 1e-4,
+            "fixture: the weight is identity-packed at its θ₀"
+        );
+        let bounds = compute_bounds(params);
+        let (fd, exact) = crate::api::with_fit_scope(&opts, || {
+            let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+            let (ehs, _, _, kappas) =
+                run_inner_loop_warm(&model, &pop, params, 500, 1e-10, None, Some(&mu), 0, 0);
+            let fd =
+                reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, &opts);
+            let mut exact = vec![0.0; x.len()];
+            for (s, eh) in pop.subjects.iter().zip(&ehs) {
+                let g = crate::estimation::sens_outer_gradient::subject_packed_gradient(
+                    &model,
+                    s,
+                    params,
+                    &x,
+                    eh.as_slice(),
+                )
+                .expect("the adjoint serves every subject of this fixture");
+                // `subject_packed_gradient` is of the subject's −log L; the reconverged FD is of
+                // the OFV, −2 log L (the control coordinate pins the factor: both legs off by
+                // exactly 2 without it).
+                for (e, gi) in exact.iter_mut().zip(&g) {
+                    *e += 2.0 * gi;
+                }
+            }
+            (fd, exact)
+        })
+        .unwrap();
+        for (label, k) in [("weight", w), ("TVKA (control)", 1)] {
+            let (f, e) = (fd[k], exact[k]);
+            assert!(f.is_finite() && e.is_finite(), "{label}: fd {f} exact {e}");
+            assert!(
+                e.abs() > 1e-3,
+                "fixture: the {label} gradient is live ({e})"
+            );
+            let rel = (f - e).abs() / e.abs();
+            eprintln!("MEASURE #2406 {label}: fd {f:e} exact {e:e} rel {rel:e}");
+            // Measured (Linux x86_64): weight 1.1e-8, TVKA 4.7e-9; 1e-7 is 9× the weight's.
+            // Under the pre-#2406 |θ₀| floor the weight is 6.4e-3 off.
+            assert!(rel < 1e-7, "{label}: fd {f:e} vs exact {e:e}, rel {rel:e}");
+        }
+    }
+
+    /// #2406: the resolution gate is entered only for a coordinate whose floor is below 1 —
+    /// a floor-1 coordinate takes the ungated difference bit for bit and never calls the tight
+    /// twin — and a floored coordinate whose twin agrees keeps its #2187 step: on a clean
+    /// objective it is accepted at the first step, from two twin probes, and takes the twin's
+    /// difference there. The twin's slope in `x₀` is the objective's plus 1e-5, well inside
+    /// `RESOLVED_REL` but a different number, so the difference shows which side it came from.
+    #[test]
+    fn the_gradient_gate_leaves_floor_one_and_resolved_coordinates_alone() {
+        use crate::estimation::parameterization::fd_step;
+        let x = [2e-3, 1.5];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        };
+        let f = |v: &[f64]| 3.0 * v[0] + 5.0 * v[0] * v[0] + 0.5 * v[1] * v[1] + v[0] * v[1];
+        let bits = |g: &[f64]| g.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let panics = |_: &[f64]| -> Option<f64> { panic!("a floor-1 coordinate reached the gate") };
+        let gated = central_diff_packed_gated(&x, &fixed, &[1.0; 2], &bounds, f, Some(&panics));
+        let ungated = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, f);
+        assert_eq!(bits(&gated), bits(&ungated));
+
+        let floor = [2e-3, 1.0];
+        let calls = std::cell::Cell::new(0usize);
+        let shifted = |v: &[f64]| f(v) + 0.25 + 1e-5 * v[0];
+        let twin = |v: &[f64]| {
+            calls.set(calls.get() + 1);
+            Some(shifted(v))
+        };
+        let gated = central_diff_packed_gated(&x, &fixed, &floor, &bounds, f, Some(&twin));
+        let ungated = central_diff_packed(&x, &fixed, &floor, &bounds, f);
+        assert_eq!(
+            calls.get(),
+            2,
+            "accepted at the first step, on its two twin probes"
+        );
+        let h = fd_step(1e-4, x[0], floor[0]);
+        let at = |x0: f64| shifted(&[x0, x[1]]);
+        let twin_diff = (at(x[0] + h) - at(x[0] - h)) / ((x[0] + h) - (x[0] - h));
+        assert_eq!(gated[0].to_bits(), twin_diff.to_bits());
+        assert_ne!(
+            twin_diff.to_bits(),
+            ungated[0].to_bits(),
+            "fixture: the twin's difference is distinguishable from the stencil's"
+        );
+        assert!(
+            (gated[0] - ungated[0]).abs() < 2e-5,
+            "{gated:?} vs {ungated:?}"
+        );
+        assert_eq!(gated[1].to_bits(), ungated[1].to_bits());
+    }
+
+    /// #2406: a floored coordinate whose τ probes *stall* — warm-started at the mode, they stop
+    /// inside the tolerance ball when the perturbation is small — is grown until its twin agrees,
+    /// and takes the twin's difference there. The stall is modelled as a flat spot of
+    /// half-width `s = 1e-12` in the τ objective: it biases the τ slope by `s/h`, i.e. 1.7e-3 at
+    /// the #2187 step `h = 2e-10`, 3.3e-5 at floor 1e-4, and 3.3e-6 at floor 1e-3, the first
+    /// inside `RESOLVED_REL`. The τ/100 twin is the exact objective. The other coordinate,
+    /// floor 1, keeps its ungated difference bit for bit.
+    #[test]
+    fn the_gradient_gate_grows_a_stalled_step_and_returns_the_twin_difference() {
+        use crate::estimation::fd_resolution::{RESOLVED_REL, STEP_GROWTH};
+        use crate::estimation::parameterization::fd_step;
+
+        let x = [1e-6, 1.5];
+        let floor = [1e-6, 1.0];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        };
+        let g = |v: &[f64]| 3.0 * v[0] + 5.0 * v[0] * v[0] + 0.5 * v[1] * v[1];
+        let s = 1e-12;
+        let stalled = |v: &[f64]| g(v) - (v[0] - x[0]).clamp(-s, s);
+        let twin = |v: &[f64]| Some(g(v));
+        let want = 3.0 + 10.0 * x[0];
+
+        let gated = central_diff_packed_gated(&x, &fixed, &floor, &bounds, stalled, Some(&twin));
+        let ungated = central_diff_packed(&x, &fixed, &floor, &bounds, stalled);
+        let (rel_gated, rel_ungated) = (
+            (gated[0] - want).abs() / want,
+            (ungated[0] - want).abs() / want,
+        );
+        eprintln!("MEASURE #2406 stalled slope: gated {rel_gated:e}, ungated {rel_ungated:e}");
+        // The straddle: ungated, the stall is the 1.7e-3 the docstring derives.
+        assert!(
+            rel_ungated > 1e-3,
+            "fixture: the τ probes stall ({rel_ungated:e})"
+        );
+        // The value is the twin's difference at floor 1e-3, bit for bit — not the τ one there
+        // (3.3e-6 off), and not the twin's at any other floor.
+        let accepted = floor[0] * STEP_GROWTH * STEP_GROWTH * STEP_GROWTH;
+        let h = fd_step(1e-4, x[0], accepted);
+        let at = |x0: f64| g(&[x0, x[1]]);
+        let twin_diff = (at(x[0] + h) - at(x[0] - h)) / ((x[0] + h) - (x[0] - h));
+        assert_eq!(
+            gated[0].to_bits(),
+            twin_diff.to_bits(),
+            "{} vs {twin_diff}",
+            gated[0]
+        );
+        assert!(rel_gated < RESOLVED_REL, "{rel_gated:e}");
+        assert_eq!(gated[1].to_bits(), ungated[1].to_bits());
+    }
+
+    /// #2406: a floored coordinate whose τ probe is missing at every step up to the cap leaves
+    /// the gate with nothing, and takes the ungated difference at its own floor, with its
+    /// one-sided fallback — the covariance gate's fallback too — not the one at floor 1, the
+    /// largest step there is (review r1, row 2: on a `TVV/k` volume that step is the one
+    /// through `V ≤ 0`). `f = (x0 − 1)²` is missing below `x0`; one-sided at step `h` it reads
+    /// `2(x0 − 1) + h`.
+    #[test]
+    fn the_gradient_gate_falls_back_to_its_own_floor_when_a_side_stays_missing() {
+        let x = [1e-3];
+        let fixed = [false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0],
+            upper: vec![10.0],
+        };
+        let f = |v: &[f64]| {
+            if v[0] < x[0] {
+                f64::NAN
+            } else {
+                (v[0] - 1.0).powi(2)
+            }
+        };
+        let twin = |v: &[f64]| Some(f(v));
+        let gated = central_diff_packed_gated(&x, &fixed, &[1e-3], &bounds, f, Some(&twin));
+        let at_floor_one = central_diff_packed(&x, &fixed, &[1.0], &bounds, f);
+        let at_own_floor = central_diff_packed(&x, &fixed, &[1e-3], &bounds, f);
+        assert_eq!(
+            gated[0].to_bits(),
+            at_own_floor[0].to_bits(),
+            "{gated:?} vs {at_own_floor:?}"
+        );
+        assert_ne!(
+            at_floor_one[0], at_own_floor[0],
+            "fixture: the two steps differ"
+        );
+    }
+
+    /// The #2406 reproduction: `examples/two_cpt_oral_cov.ferx`'s model with a covariate
+    /// exponent `BETA` on CRCL, declared at `t0` (identity-packed, bounded `±5`; packed
+    /// coordinate 6) and entering as `(CRCL/100)^(BETA + c)`. Its sensitivity is O(1), not
+    /// `1/t0`, so the #2187 step `1e-4·t0` is the wrong one for it.
+    fn two_cpt_cov_beta(t0: f64, c: f64) -> (CompiledModel, Population) {
+        let src = format!(
+            "[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta THETA_WT(0.6, 0.01, 5.0)
+  theta BETA({t0:e}, -5.0, 5.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_Q  ~ 0.08
+  omega ETA_V2 ~ 0.08
+  omega ETA_KA ~ 0.20
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^(BETA + {c:e}) * exp(ETA_CL)
+  V1 = TVV1 * (WT / 70)^THETA_WT * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("model parses");
+        let mut pop = crate::read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("data loads");
+        pop.subjects.truncate(8);
+        (model, pop)
+    }
+
+    /// #2406: the R-matrix side of the gate, end to end through the covariance step, on
+    /// fixture A at its FOCEI estimate (`β̂ = 0.6798`; `THETA_WT` sits on its lower bound
+    /// there). The estimate is moved to `BETA = δ = 1e-4` by shifting the exponent,
+    /// `c = β̂ − δ`, so it is the same objective with `BETA` declared at `1e-4`. Under the
+    /// #2187 step its FD SE(BETA) was 96 % from the analytic one; the gate grows that
+    /// diagonal's step until the τ/100 re-solve agrees. SE(TVCL), floor 1, is the fixture's
+    /// own FD-vs-analytic gap, which the gate does not touch.
+    #[test]
+    fn the_covariance_gate_resolves_a_small_covariate_exponents_se() {
+        let beta_hat = 0.6797630658491339;
+        let delta = 1e-4;
+        let (m, p) = two_cpt_cov_beta(delta, beta_hat - delta);
+        let mut est = m.default_params.clone();
+        est.theta = vec![
+            5.2731892416136725,
+            44.80341226071577,
+            9.584412470148976,
+            92.16535593441313,
+            1.4074112031924877,
+            0.010000000000000005,
+            delta,
+        ];
+        est.omega = crate::types::OmegaMatrix::from_matrix(
+            DMatrix::from_diagonal(&DVector::from_vec(vec![
+                0.04468165236754428,
+                0.12184225657519575,
+                0.05501817239402348,
+                0.060478622240645215,
+                0.1913558297443002,
+            ])),
+            est.omega.eta_names.clone(),
+            true,
+        );
+        est.sigma.values = vec![0.0160462218419714];
+        let se = |analytic: bool| -> Vec<f64> {
+            let opts = FitOptions {
+                method: EstimationMethod::FoceI,
+                interaction: true,
+                outer_maxiter: 0,
+                run_covariance_step: true,
+                covariance_method: crate::types::CovarianceMethod::Hessian,
+                covariance_method_set: true,
+                analytic_cov_hessian: analytic,
+                ..FitOptions::default()
+            };
+            let r = crate::fit(&m, &p, &est, &opts).unwrap();
+            r.se_theta
+                .clone()
+                .expect("fixture: the covariance step succeeds")
+        };
+        let (exact, fd) = (se(true), se(false));
+        let rel = |k: usize| (fd[k] - exact[k]).abs() / exact[k];
+        let (rel_beta, rel_cl) = (rel(6), rel(0));
+        eprintln!(
+            "MEASURE #2406 cov SE(BETA) {:e} vs {:e}: {rel_beta:e}; SE(TVCL) {rel_cl:e}",
+            fd[6], exact[6]
+        );
+        assert!(exact[6] > 0.1, "fixture: SE(BETA) {}", exact[6]);
+        // Measured (macOS arm64): SE(BETA) 4.1e-5, SE(TVCL) 3.9e-4.
+        assert!(rel_beta < 2e-4, "SE(BETA): rel {rel_beta:e}");
+        assert!(rel_cl < 2e-3, "SE(TVCL): rel {rel_cl:e}");
+    }
+
+    /// One coordinate `ib` of the reconverged population gradient through
+    /// [`central_diff_packed_gated`] at the default point, with the number of population
+    /// re-solves it took, its ungated twin, and the exact gradient at a 1e-12 inner solve.
+    fn gated_gradient_cell(
+        model: &CompiledModel,
+        pop: &Population,
+        opts: &FitOptions,
+        ib: usize,
+    ) -> (f64, usize, f64, f64) {
+        gated_gradient_cell_twin(model, pop, opts, ib, true)
+    }
+
+    /// [`gated_gradient_cell`], with `twin_resolves = false` making every τ/100 re-solve read
+    /// as unresolved: what `inner_resolved` gives when one subject falls to Nelder–Mead or
+    /// stops unconverged there. The re-solves still run and are counted.
+    fn gated_gradient_cell_twin(
+        model: &CompiledModel,
+        pop: &Population,
+        opts: &FitOptions,
+        ib: usize,
+        twin_resolves: bool,
+    ) -> (f64, usize, f64, f64) {
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let bounds = compute_bounds(params);
+        let floors = fd_step_floors(params, model);
+        let mut only = vec![true; x.len()];
+        only[ib] = false;
+        crate::api::with_fit_scope(opts, || {
+            let mu = compute_mu_k(model, &params.theta, opts.mu_referencing);
+            let (ehs, _, _, kappas) =
+                run_inner_loop_warm(model, pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+            let warm = joint_warm_starts(&ehs, &kappas);
+            let n = std::cell::Cell::new(0usize);
+            let probe = |xv: &[f64], tol: f64| {
+                n.set(n.get() + 1);
+                reconverged_probe_ofv(xv, params, model, pop, &warm, opts, tol)
+            };
+            let tol = stencil_inner_tol(opts.inner_tol);
+            let tight = |xv: &[f64]| {
+                let (v, st) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+                (twin_resolves && crate::estimation::fd_resolution::inner_resolved(&st))
+                    .then_some(v)
+            };
+            let gated = central_diff_packed_gated(
+                &x,
+                &only,
+                &floors,
+                &bounds,
+                |xv| probe(xv, tol).0,
+                Some(&tight),
+            )[ib];
+            let evals = n.replace(0);
+            let ungated =
+                central_diff_packed(&x, &only, &floors, &bounds, |xv| probe(xv, tol).0)[ib];
+            let (ehs_t, hms_t, _, kappas_t) =
+                run_inner_loop_warm(model, pop, params, 2000, 1e-12, None, Some(&mu), 0, 0);
+            let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, pop, opts);
+            let priors = build_prior_set(model, params);
+            let exact = exact_reporting_gradient(
+                &x, params, model, pop, &ehs_t, &hms_t, &kappas_t, &bounds, opts, &nn_reg, &priors,
+            )
+            .expect("fixture: exact gradient in scope")[ib];
+            (gated, evals, ungated, exact)
+        })
+        .unwrap()
+    }
+
+    /// #2406: the gate on fixture A's `BETA`, against the exact gradient. Under the #2187 step
+    /// the reconverged difference was 53 % off at `t0 = 1e-10` and 0.28 % at `1e-4`; the gate
+    /// grows the step until the τ/100 twin agrees. A `V = TVV_S/k` volume, whose sensitivity
+    /// *does* scale as `1/k`, is accepted at its first step: two τ probes and two twins.
+    #[test]
+    fn the_gradient_gate_resolves_a_small_covariate_exponent_and_keeps_a_scaled_volume_step() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        for t0 in [1e-10, 1e-4] {
+            let (m, p) = two_cpt_cov_beta(t0, 0.0);
+            let (gated, evals, ungated, exact) = gated_gradient_cell(&m, &p, &opts, 6);
+            assert!(
+                gated.is_finite() && exact.abs() > 1.0,
+                "fixture A: {gated} vs {exact}"
+            );
+            let (rel, rel_ungated) = (
+                (gated - exact).abs() / exact.abs(),
+                (ungated - exact).abs() / exact.abs(),
+            );
+            eprintln!("MEASURE #2406 A t0={t0:e}: gated {rel:e} [{evals} re-solves], ungated {rel_ungated:e}");
+            assert!(
+                rel_ungated > 1e-3,
+                "fixture A at t0={t0:e}: the #2187 step is off ({rel_ungated:e})"
+            );
+            assert!(rel < 1e-7, "A t0={t0:e}: rel {rel:e}");
+        }
+        let (m, p) = warfarin_scaled_v(1e-6);
+        let (gated, evals, ungated, exact) = gated_gradient_cell(&m, &p, &opts, 1);
+        let rel = (gated - exact).abs() / exact.abs();
+        eprintln!(
+            "MEASURE #2406 B k=1e-6: gated {rel:e} [{evals} re-solves], ungated {:e}",
+            (ungated - exact).abs() / exact.abs()
+        );
+        assert_eq!(evals, 4, "B is accepted at its first step");
+        assert!(rel < 1e-5, "B: rel {rel:e}");
+    }
+
+    /// #2406 review r1, row 1: fixture B at its stationary point, where the gradient is too
+    /// small for the relative test or the noise guard ever to pass. The gate grew the step until
+    /// truncation error made the difference large enough to pass them, and accepted
+    /// `k·g = −1.11e-2` at `k = 1e-4…1e-8` (`−2.2e-4` at `1e-2`) after 12 re-solves, where the
+    /// ungated difference is `−4.37e-6`; the truncation test now stops at floor 1 and keeps floor
+    /// 0's difference, 8 re-solves. `TVV_S = 7.611829143·k` is the stationary value (a secant on
+    /// the exact gradient gives it for every `k`), checked here by the exact gradient itself.
+    /// Measured (Linux x86_64): gated `k·g = −4.3571e-6` and ungated `−4.3577e-6` against an
+    /// exact `1.1e-8`, at both `k`, against an off-optimum `k·g` of 13.3.
+    #[test]
+    fn the_gradient_gate_keeps_a_scaled_volumes_step_at_its_stationary_point() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        for k in [1e-2, 1e-6] {
+            let (mut m, p) = warfarin_scaled_v(k);
+            m.default_params.theta[1] = 7.611829143 * k;
+            let (gated, evals, ungated, exact) = gated_gradient_cell(&m, &p, &opts, 1);
+            let (gated, ungated, exact) = (gated * k, ungated * k, exact * k);
+            eprintln!(
+                "MEASURE #2406 B stationary k={k:e}: gated {gated:e} [{evals} re-solves], \
+                 ungated {ungated:e}, exact {exact:e}"
+            );
+            // At the stationary point to well inside the FD error under test (4.4e-6): the
+            // ten-digit TVV_S leaves an exact k·g of 1.1e-8 at both k (Linux x86_64).
+            assert!(
+                exact.abs() < 1e-7,
+                "fixture: not at the stationary point ({exact:e})"
+            );
+            assert!(gated.is_finite() && ungated.is_finite());
+            // Floor 0, then floor 1 to see the move: τ and τ/100 at each.
+            assert_eq!(
+                evals, 8,
+                "k={k:e}: stopped on the truncation test at floor 1"
+            );
+            // No worse than the ungated step, 4.37e-6 from the exact gradient here; the gate
+            // without the truncation test was 2550× worse at k = 1e-6.
+            assert!(
+                (gated - exact).abs() <= 1.01 * (ungated - exact).abs(),
+                "k={k:e}: gated {gated:e} vs ungated {ungated:e}, exact {exact:e}"
+            );
+        }
+    }
+
+    /// #2406 review r2: fixture B at `k = 1e-6` with the τ/100 twin unresolved at every floor,
+    /// off the optimum and at the stationary point. The gate learned nothing, so it must keep
+    /// the ungated difference, bit for bit: the same two τ probes at `floor0`. Returning the
+    /// cap's τ difference instead gave `k·g = −2.85e13` at both points, against an exact 13.3
+    /// and 1.1e-8 (TeunP, macOS arm64). Measured with the fix (macOS arm64): gated = ungated =
+    /// 13.339523609018514 off the optimum and −4.357688762219833e-6 at the stationary point,
+    /// 21 re-solves each (τ at all seven floors, and the first τ/100 probe at each).
+    #[test]
+    fn the_gradient_gate_without_a_resolved_twin_keeps_the_ungated_step() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let k = 1e-6;
+        for stationary in [false, true] {
+            let (mut m, p) = warfarin_scaled_v(k);
+            if stationary {
+                m.default_params.theta[1] = 7.611829143 * k;
+            }
+            let (gated, evals, ungated, exact) = gated_gradient_cell_twin(&m, &p, &opts, 1, false);
+            let (gated, ungated, exact) = (gated * k, ungated * k, exact * k);
+            eprintln!(
+                "MEASURE #2406 B no-twin stationary={stationary} k={k:e}: gated {gated:e} \
+                 [{evals} re-solves], ungated {ungated:e}, exact {exact:e}"
+            );
+            assert!(gated.is_finite() && ungated.is_finite());
+            assert_eq!(
+                gated.to_bits(),
+                ungated.to_bits(),
+                "stationary={stationary}: gated {gated:e} vs ungated {ungated:e}, exact {exact:e}"
+            );
+        }
+    }
+
+    /// #2406: every production caller of the reconverged FD gradient hands
+    /// [`central_diff_packed_gated`] its tight twin — population, reporting, and per-subject.
+    /// Fixture A at `t0 = 1e-4`, where the #2187 step is 0.28 % off. The reference is the same
+    /// model declared at `BETA = 1` with the exponent shifted back by `c = t0 − 1`: one function
+    /// of the same exponent, stepped at floor 1, which the gate does not touch. A caller passing
+    /// no twin reads the #2187 error and names itself.
+    #[test]
+    fn every_reconverged_fd_gradient_caller_takes_the_gate() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let ib = 6;
+        let t0 = 1e-4;
+        let grads = |m: &CompiledModel, p: &Population| -> [f64; 3] {
+            let params = &m.default_params;
+            let x = pack_params(params);
+            let bounds = compute_bounds(params);
+            crate::api::with_fit_scope(&opts, || {
+                let mu = compute_mu_k(m, &params.theta, opts.mu_referencing);
+                let (ehs, _, _, kappas) =
+                    run_inner_loop_warm(m, p, params, 500, 1e-8, None, Some(&mu), 0, 0);
+                let pop_g =
+                    reconverged_fd_gradient(&x, params, m, p, &ehs, &kappas, &bounds, &opts);
+                let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(m, p, &opts);
+                let priors = build_prior_set(m, params);
+                let rep_g = reporting_fd_gradient(
+                    &x, params, m, p, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                );
+                let sub_g = subject_reconverged_fd_gradient(
+                    &x,
+                    params,
+                    m,
+                    &p.subjects[0],
+                    &ehs[0],
+                    &bounds,
+                    &opts,
+                );
+                [pop_g[ib], rep_g[ib], sub_g[ib]]
+            })
+            .unwrap()
+        };
+        let (m, p) = two_cpt_cov_beta(t0, 0.0);
+        let small = grads(&m, &p);
+        let (m1, p1) = two_cpt_cov_beta(1.0, t0 - 1.0);
+        let reference = grads(&m1, &p1);
+        let rels: Vec<f64> = ["population", "reporting", "subject"]
+            .iter()
+            .zip(small.iter().zip(reference.iter()))
+            .map(|(label, (s, r))| {
+                assert!(s.is_finite() && r.is_finite(), "{label}: {s} vs {r}");
+                assert!(
+                    r.abs() > 1e-2,
+                    "fixture: {label} gradient in BETA is live ({r})"
+                );
+                let rel = (s - r).abs() / r.abs();
+                eprintln!(
+                    "MEASURE #2406 callers {label}: t0=1e-4 {s:e}, floor-1 twin {r:e}, rel {rel:e}"
+                );
+                rel
+            })
+            .collect();
+        // Measured (macOS arm64): population and reporting 2.0e-7, subject 3.8e-6 — the
+        // floor-1 reference's own error, since the gated population leg is 5.8e-9 from the
+        // exact gradient (above). With a caller's twin removed that leg reads the #2187 step.
+        for ((label, rel), bound) in ["population", "reporting", "subject"]
+            .iter()
+            .zip(&rels)
+            .zip([1e-6, 1e-6, 2e-5])
+        {
+            assert!(*rel < bound, "{label}: rel {rel:e}");
         }
     }
 
@@ -16727,4 +17503,125 @@ mod start_warm_rescore {
         assert_eq!(start.warm_rescored_from, None, "{start:?}");
         assert_eq!(start.n_unconverged, 27, "{start:?}");
     }
+}
+
+/// #2799: `eval_budget_spent` is the budget state *after* a stagnation latch on the last
+/// permitted evaluation has been attributed to the guard. On `one_cpt_iv` / SLSQP with the
+/// #2462 verification leg off (the rule BOBYQA's polish keeps; under the verification a spent
+/// budget is final and never reset), a 106-evaluation budget ends inside the latch: NLopt
+/// returns `MaxEvalReached`, the plateau check takes the stop, and the fit is converged with
+/// `eval_budget_spent == false`. The guard-off twin at the same budget runs out on its own
+/// descent: `MaxEvalReached` and `true`. Measured window (macOS arm64): budgets 105–107 all
+/// straddle; 106 sits in its middle. Mutation: fill `eval_budget_spent` from
+/// `max_eval_reached` as it stood *before* the latch reset → the latched run reads `true`.
+#[test]
+fn eval_budget_spent_is_read_after_the_latch_reset() {
+    use crate::estimation::outer_optimizer::{
+        optimize_nlopt_once, OuterFdDeclineLog, EVAL_BUDGET_OVERRIDE, UNPROFILED_VERIFY_OFF,
+    };
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+
+    const BUDGET: u32 = 106;
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let _off = WarmPredictorOff::new();
+    let run = |guard: bool| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Slsqp,
+            stagnation_guard: guard,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        UNPROFILED_VERIFY_OFF.with(|o| o.set(true));
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(Some(BUDGET)));
+        let out = optimize_nlopt_once(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            false,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+            None,
+            &[],
+        );
+        EVAL_BUDGET_OVERRIDE.with(|o| o.set(None));
+        UNPROFILED_VERIFY_OFF.with(|o| o.set(false));
+        out
+    };
+    let (on, on_outcome) = run(true);
+    let (off, off_outcome) = run(false);
+    // The straddle: both runs end on the budget, one inside the latch and one outside it.
+    assert!(on_outcome.stagnation_latched, "the guarded run must latch");
+    assert!(!off_outcome.stagnation_latched, "guard off never latches");
+    assert_eq!(on.optimizer_stop.as_deref(), Some("MaxEvalReached"));
+    assert_eq!(off.optimizer_stop.as_deref(), Some("MaxEvalReached"));
+    assert!(
+        !on.eval_budget_spent,
+        "a latch on the last permitted eval is the guard's stop, not the budget's"
+    );
+    assert!(on.converged, "the plateau check accepts the latched stop");
+    assert!(off.eval_budget_spent, "the unguarded run spent its budget");
+    assert!(!off.converged);
+}
+
+/// #2799 r1 #2: the internal BFGS (`optimizer = bfgs`) publishes `eval_budget_spent` when its
+/// loop runs off the end of `outer_maxiter`, and not when it converges. `one_cpt_iv` with a
+/// 2-iteration budget cannot reach either stop rule; a 500-iteration budget converges on it
+/// through the relative-change stop, and a 1-iteration budget with a tolerance every gradient
+/// meets converges through the gradient-norm stop on its last permitted iteration. Mutation:
+/// drop the `exited_early = true` on either convergence `break` → its run reads `true`;
+/// fill `false` → the short run.
+#[test]
+fn internal_bfgs_reports_a_spent_iteration_budget() {
+    use crate::estimation::outer_optimizer::{optimize_bfgs, OuterFdDeclineLog};
+    use crate::parser::model_parser::parse_model_file;
+    use crate::read_nonmem_csv;
+    use std::path::Path;
+    let model = parse_model_file(Path::new("examples/one_cpt_iv.ferx")).expect("model parses");
+    let pop = read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None).expect("data loads");
+    let run_gtol = |maxiter: usize, gtol: f64| {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer: Optimizer::Bfgs,
+            outer_maxiter: maxiter,
+            outer_gtol: gtol,
+            run_covariance_step: false,
+            report_final_gradient: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        optimize_bfgs(
+            &model,
+            &pop,
+            &model.default_params,
+            &opts,
+            &OuterFdDeclineLog::new(pop.subjects.len()),
+            None,
+        )
+    };
+    let run = |maxiter: usize| run_gtol(maxiter, FitOptions::default().outer_gtol);
+    let short = run(2);
+    assert!(!short.converged);
+    assert!(short.eval_budget_spent, "{:?}", short.warnings);
+    let long = run(500);
+    assert!(
+        long.converged,
+        "the straddle needs a converging twin: {:?}",
+        long.warnings
+    );
+    assert!(!long.eval_budget_spent);
+    // The gradient-norm stop on the last permitted iteration: a budget of 1 with a tolerance
+    // every gradient meets converges on iteration 1, inside the range, so it is not spent.
+    let gtol = run_gtol(1, 1e12);
+    assert!(gtol.converged, "{:?}", gtol.warnings);
+    assert_eq!(gtol.n_iterations, 1);
+    assert!(!gtol.eval_budget_spent);
 }

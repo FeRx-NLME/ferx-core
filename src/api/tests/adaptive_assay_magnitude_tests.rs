@@ -222,6 +222,7 @@ fn bare_model_readings_keep_their_bits() {
         route: crate::sim::adaptive::AdaptiveRoute::Bolus { cmt: 1 },
         dose_bounds: ((0.0).into(), (400.0).into()),
         confirm: 1,
+        round_to: None,
         dose_knowledge: Default::default(),
         levels: None,
         target_window: None,

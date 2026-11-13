@@ -186,20 +186,55 @@ pub(crate) fn cmt_off_times(
         .iter()
         .map(|d| {
             let record = d.implied.map_or(d.time, |i| doses[i.parent].time);
-            toggles
-                .iter()
-                .filter(|c| !c.on && c.state == d.cmt_idx())
-                .filter_map(|c| pk_only_times.get(c.pk_only).copied())
-                .filter(|&t| t >= record)
-                .fold(f64::INFINITY, f64::min)
+            cmt_off_time(
+                record,
+                d.cmt_idx(),
+                toggles,
+                pk_only_times,
+                CoTimedOff::Stops,
+            )
         })
         .collect()
 }
 
+/// How an off row at exactly a dose's record time counts in [`cmt_off_time`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoTimedOff {
+    /// The engines' order for a data record: the dose sorts ahead of the row, so the row
+    /// stops it ([`cmt_off_times`]).
+    Stops,
+    /// A dose an adaptive controller decided (#2753). The decision sees the state after
+    /// every on/off row at its time, so its dose is a record after the row, as the reader
+    /// orders a dose row listed after it: the row does not stop it.
+    After,
+}
+
+/// The time the input of a dose recorded at `record` into state `cmt_idx` stops: the first
+/// off row on that compartment at or after the record (strictly after, under
+/// [`CoTimedOff::After`]), `+∞` when none follows. The one rule for `DoseEvent::off_at`,
+/// shared by [`cmt_off_times`] and the adaptive driver's controller doses.
+pub(crate) fn cmt_off_time(
+    record: f64,
+    cmt_idx: usize,
+    toggles: &[CmtToggle],
+    pk_only_times: &[f64],
+    cotimed: CoTimedOff,
+) -> f64 {
+    toggles
+        .iter()
+        .filter(|c| !c.on && c.state == cmt_idx)
+        .filter_map(|c| pk_only_times.get(c.pk_only).copied())
+        .filter(|&t| match cotimed {
+            CoTimedOff::Stops => t >= record,
+            CoTimedOff::After => t > record,
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
 /// at event records, and an implied dose is not one. Measured against NONMEM 7.5.1
-/// (`nonmem_anchor/addl_*`), it takes its lag from the dose row whose `ADDL` implies it
-/// and everything else — `F`, the disposition the interval ending at it runs under, and
+/// (`nonmem_anchor/addl_*`), it takes its lag (the compartment's and, since #2367, a
+/// route's own) from the dose row whose `ADDL` implies it, and everything else — `F`, the disposition the interval ending at it runs under, and
 /// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
 /// or after the dose in (`TIME`, file order). The reader stores the governing record's
 /// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
@@ -1337,6 +1372,19 @@ impl Subject {
             d.off_at = off_at;
         }
         Cow::Owned(owned)
+    }
+
+    /// `DoseEvent::off_at` for a dose an adaptive controller decided at `t` into state
+    /// `cmt_idx` (#2753): see [`CoTimedOff::After`]. The driver sets it at injection and the
+    /// frozen replay on each ledger dose, so the two cut the same input at the same row.
+    pub(crate) fn controller_dose_off_at(&self, t: f64, cmt_idx: usize) -> f64 {
+        cmt_off_time(
+            t,
+            cmt_idx,
+            &self.cmt_toggles,
+            &self.pk_only_times,
+            CoTimedOff::After,
+        )
     }
 
     /// True when any dose record on this subject is flagged steady-state
@@ -6841,6 +6889,17 @@ pub struct SubjectResult {
     /// Normalized prediction discrepancies (simulation-based, no decorrelation).
     /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
     pub npd: Vec<f64>,
+    /// Monte-Carlo expected prediction `E_sim[y]` from the NPDE simulation (NONMEM's
+    /// `$TABLE EPRED`). Empty unless `[fit_options] npde_nsim > 0`. Emitted as the
+    /// `EPRED` column.
+    #[serde(default)]
+    pub epred: Vec<f64>,
+    /// Monte-Carlo population-weighted residual `Σ_sim^(-1/2) (y − E_sim[y])`
+    /// (Monolix `PWRES`, NONMEM `EWRES`), symmetric-root decorrelated. Empty unless
+    /// `[fit_options] npde_nsim > 0`. Emitted as the `PWRES` and `EWRES` columns.
+    /// See [`crate::stats::npde::SubjectNpde::pwres`].
+    #[serde(default)]
+    pub pwres: Vec<f64>,
     pub ofv_contribution: f64,
     pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
@@ -7696,7 +7755,15 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     // rewrite instead of a one-line edit. Scoped to this statement rather than
     // the whole fn so a future duplicated arm in another chain still lints.
     #[allow(clippy::if_same_then_else)]
-    let (severity, category) = if lower.contains("w_vi_bad_basin") {
+    let (severity, category) = if lower.starts_with("multi-start:") {
+        // #2799: the multi-start notes `fit()` appends to the returned run — "k of n starts
+        // failed: <errors>" and "best result from start k/n". A prefix-token arm ahead of
+        // *every* other arm, because the failure note interpolates the sibling starts' own
+        // error text: a "did not converge" or covariance-failure phrase in it would land on a
+        // Critical arm and mark a healthy returned fit as failing. The note is about runs that
+        // were not returned, so it is informational.
+        (WarningSeverity::Info, WarningCode::MultiStart)
+    } else if lower.contains("w_vi_bad_basin") {
         // #1098: VI's final bound-quality check demotes `converged`; keep this
         // distinct from a budget-limited convergence failure so programmatic
         // consumers can choose new starts or a chained initializer.
@@ -8033,6 +8100,9 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("trust radius")
         || lower.contains("degenerate")
         || lower.contains("resumed from the best point seen")
+        // #2832's adopted rail completion; its not-converged twin says "not reported as
+        // converged" and is filed by the convergence arm above first.
+        || lower.contains("resumed from just above the guard")
     {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
@@ -8153,6 +8223,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("_max_time`") {
         // #2687: the fit stopped on its wall-clock limit, so `converged` is false.
         (WarningSeverity::Warning, WarningCode::Convergence)
+    } else if lower.contains("logical cpu(s) available")
+        || (lower.contains("rayon_num_threads") && lower.contains("was ignored"))
+    {
+        // #1811 / #2800: an explicit count oversubscribes the cores, or a set
+        // `RAYON_NUM_THREADS` could not be used — the user asked for something the
+        // fit did not (or could not usefully) do.
+        (WarningSeverity::Warning, WarningCode::Threads)
     } else if lower.contains("thread count overridden") {
         // #1416: a front end's explicit `--threads` beat the model file's
         // `[fit_options] threads`. A Warning, not Info, for the same reason the
@@ -8211,6 +8288,155 @@ pub struct LevelGroupEbe {
     pub labels: Vec<f64>,
     /// κ̂ of each of [`LevelKappaEbes::kappa_names`].
     pub kappa: Vec<f64>,
+}
+
+/// One estimated `[mixture]` per-class override (`omega(k)` / `sigma(k)`, #977), as listed in
+/// [`FitResult::mixture_override_params`] (#2833): what a renderer needs to name its row and
+/// read its state. Parallel to [`FitResult::mixture_overrides`] (its value) and
+/// [`FitResult::se_mixture_overrides`] (its standard error).
+///
+/// Not to be confused with [`MixtureClassOverride`], the parsed declaration.
+/// `#[non_exhaustive]` so a later field is not a breaking change; ferx builds it, a caller
+/// reads it.
+#[non_exhaustive]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MixtureOverrideParam {
+    /// The override's name, as
+    /// [`crate::estimation::parameterization::coordinate_names`] spells it: the base name with a
+    /// `_MIX{class}` suffix, e.g. `"ETA_CL_MIX2"`, `"EPS_MIX2"`.
+    pub name: String,
+    /// [`ParameterKind::Omega`] or [`ParameterKind::Sigma`].
+    pub kind: ParameterKind,
+    /// The index of the **base** η (Ω diagonal) or σ the override replaces in its class —
+    /// the same convention as [`HeldAtBound::index`] for an override entry.
+    pub index: usize,
+    /// The class, 1-based like the model file, the `_MIX{c}` name and
+    /// [`HeldAtBound::class`].
+    pub class: usize,
+    /// Its row in [`FitResult::covariance_matrix`].
+    pub packed_index: usize,
+    /// Held by the model: a user `FIX`, or an override an estimator held at its initial
+    /// value (SAEM's σ override, #985). Read from the model's packed FIX mask, **not** from
+    /// [`FitResult::cov_fixed`], which also marks a coordinate the covariance step held on
+    /// the internal guard — that one is listed in [`FitResult::held_at_bound`] instead.
+    pub fixed: bool,
+}
+
+/// One coordinate the covariance step reports no standard error for (#2797), as listed in
+/// [`FitResult::held_at_bound`]: its SE displays as not available, and — when the step held
+/// it (it is marked in [`FitResult::cov_fixed`]) — every other SE is conditional on it at
+/// its estimate.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HeldAtBound {
+    /// The parameter's name as in the estimate table: `"ETA_KA"`, `"K_ARM"`, `"TVE0"`.
+    pub name: String,
+    /// The family the parameter is reported under.
+    pub kind: ParameterKind,
+    /// Its index within that family: into `theta`, the Ω diagonal, `sigma`, or the κ
+    /// (Ω_IOV) diagonal. For a `[mixture]` per-class override (`class` is `Some`), the
+    /// index of the **base** η or σ the override replaces in that class.
+    pub index: usize,
+    /// Its row in [`FitResult::covariance_matrix`] and [`FitResult::cov_fixed`].
+    pub packed_index: usize,
+    /// Why it is held.
+    pub reason: HeldReason,
+    /// `Some(c)` when the entry is a `[mixture]` per-class override — `omega(c)` or
+    /// `sigma(c)`, 1-based like the model file, the `_MIX{c}` name and NONMEM's `MIXNUM`
+    /// (#2809). The entry is then the override, **not** the base parameter that `kind` and
+    /// `index` name: a consumer matching entries to the base estimate table by
+    /// `(kind, index)` must skip it. `None` for a base parameter, and absent from the
+    /// serialised form, so a bundle with no override entry is byte-unchanged; a reader
+    /// that predates the field drops it and would read the override as the base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<usize>,
+}
+
+/// Why a coordinate is in [`FitResult::held_at_bound`].
+#[non_exhaustive]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldReason {
+    /// A profiled level the bounded profile solve ended on its block's declared box
+    /// (#2112); [`FitResult::profiled_levels_at_bound`] lists the same levels.
+    ProfiledBound,
+    /// A free coordinate collapsed onto ferx's internal lower guard (#2797): an Ω or κ
+    /// diagonal or a σ at the floor of its log packing, or a θ on the internal 1e-10 floor
+    /// that replaces an undeclared lower bound. The same coordinates the
+    /// `parameter_at_runaway_guard` warning calls a collapse.
+    CollapsedAtGuard,
+    /// A reason this build does not know (#2817): read from a `.fitrx` bundle or
+    /// `FitResult` JSON written by a later ferx that added one. ferx never produces it.
+    /// The entry still counts as held, so its SE displays as not available; it is
+    /// neither a profiled bound nor a guard collapse, so nothing that acts on either
+    /// treats it as one. Written back as `"unknown"` — the original token is not kept.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Reads a `held_at_bound` list leniently (#2817): an entry whose `kind` this build does
+/// not know (a parameter family a later ferx added) is dropped instead of failing the
+/// whole `.fitrx` bundle or `FitResult` JSON. Nothing could use such an entry: there is
+/// no family to display its SE under, and a build that cannot pack the family cannot
+/// draw from or hold it. An unknown `reason` is not dropped. It reads as
+/// [`HeldReason::Unknown`] and stays held. `ParameterKind` itself is left strict, since
+/// priors and every per-family `match` read it.
+pub(crate) fn held_at_bound_lenient<'de, D>(d: D) -> Result<Vec<HeldAtBound>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    enum KindRead {
+        Theta,
+        Omega,
+        Sigma,
+        Kappa,
+        #[serde(other)]
+        Unknown,
+    }
+    #[derive(serde::Deserialize)]
+    struct HeldRead {
+        name: String,
+        kind: KindRead,
+        index: usize,
+        packed_index: usize,
+        reason: HeldReason,
+        // #2809: the `[mixture]` class must survive this read, or an override entry
+        // loads as its base parameter.
+        #[serde(default)]
+        class: Option<usize>,
+    }
+    let rows: Vec<HeldRead> = serde::Deserialize::deserialize(d)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|h| {
+            let kind = match h.kind {
+                KindRead::Theta => ParameterKind::Theta,
+                KindRead::Omega => ParameterKind::Omega,
+                KindRead::Sigma => ParameterKind::Sigma,
+                KindRead::Kappa => ParameterKind::Kappa,
+                KindRead::Unknown => return None,
+            };
+            Some(HeldAtBound {
+                name: h.name,
+                kind,
+                index: h.index,
+                packed_index: h.packed_index,
+                reason: h.reason,
+                class: h.class,
+            })
+        })
+        .collect())
+}
+
+impl HeldReason {
+    /// The snake_case token the YAML and `.fitrx` outputs write.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldReason::ProfiledBound => "profiled_bound",
+            HeldReason::CollapsedAtGuard => "collapsed_at_guard",
+            HeldReason::Unknown => "unknown",
+        }
+    }
 }
 
 /// Full fit result
@@ -8535,11 +8761,12 @@ pub struct FitResult {
     /// EPS shrinkage: `1 - SD(IWRES)`.  `NaN` when fewer than 2 valid residuals.
     pub shrinkage_eps: f64,
     /// Pooled lag-1 Pearson correlation of IWRES across subjects.
-    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    /// `NaN` when no series has ≥ 2 valid IWRES values (a series is a subject's
+    /// rows, split at its `correlation … by` blocks and its parallel occasions).
     pub iwres_lag1_r: f64,
     /// Pooled Durbin-Watson statistic for IWRES within subjects.
     /// 2.0 = no autocorrelation; < 1.5 = positive; > 2.5 = negative.
-    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    /// `NaN` when no series has ≥ 2 valid IWRES values, as for `iwres_lag1_r`.
     pub dw_statistic: f64,
     /// Wall-clock time for the complete fit in seconds.
     pub wall_time_secs: f64,
@@ -8738,6 +8965,27 @@ pub struct FitResult {
     /// a non-stationary point is not (#2785). Kept so a reader can see which.
     #[serde(default)]
     pub optimizer_stop: Option<String>,
+    /// Whether the outer optimizer spent its evaluation budget (`maxiter`) on the leg that
+    /// produced the reported estimates (#2799) — the typed form of the "increase maxiter"
+    /// warnings. Read from the optimizer's final state, after a stagnation latch that
+    /// landed on the last permitted evaluation has been attributed to the guard rather than
+    /// the budget, and after a polish that spent it (which [`Self::optimizer_stop`], taken
+    /// from the primary leg, does not see). Set by every outer optimizer with a `maxiter`
+    /// budget: NLopt (profiled or not), the trust region (`MaxItersReached`), pure
+    /// Gauss–Newton and `optimizer = bfgs` (a loop that ran out of iterations). `false` for
+    /// SAEM, IMP, IMPMAP, Bayes and VI, which report their own iteration caps in warnings,
+    /// and for the Gauss–Newton hybrid, whose polish runs a fixed budget rather than the
+    /// user's. Read by [`Self::status`].
+    #[serde(default)]
+    pub eval_budget_spent: bool,
+    /// Whether no stage of the run estimated: it scored the given values by request
+    /// (#2799). That is `maxiter = 0` on an estimator that reads it as NONMEM's
+    /// `MAXEVAL=0` (FOCE, FOCEI, Laplace/AGQ, pure Gauss–Newton, profiled and mixture fits),
+    /// or a standalone `imp_eval_only` / `agq_eval_only` chain. Not `maxiter = 0` alone:
+    /// SAEM, IMP, IMPMAP, Bayes, VI and the Gauss–Newton hybrid's polish search
+    /// regardless of it. Read by [`Self::status`].
+    #[serde(default)]
+    pub evaluation_only: bool,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
@@ -8900,6 +9148,22 @@ pub struct FitResult {
     /// carries no `packed_estimate`; `None` otherwise and for hand-built results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixture_overrides: Option<Vec<f64>>,
+    /// One descriptor per entry of [`FitResult::mixture_overrides`], in the same order
+    /// (#2833): the override's name, family, base index, class, packed row and FIX state, so
+    /// a renderer can label its row. Empty for a fit with no override and for a result that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixture_override_params: Vec<MixtureOverrideParam>,
+    /// Standard errors of [`FitResult::mixture_overrides`] (#2833), parallel to it and on its
+    /// scales: an Ω override's class **variance**, a σ override's σ (the scale the base
+    /// `se_sigma` reports). `0.0` for a fixed override
+    /// ([`MixtureOverrideParam::fixed`]), as the other `se_*` vectors report a pinned
+    /// coordinate, **and** for an override the covariance step held on the internal guard,
+    /// which is not `fixed` but has an entry with its `class` in
+    /// [`FitResult::held_at_bound`]: read that list before printing a `0.0` as an SE.
+    /// `None` with no override or no covariance matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_mixture_overrides: Option<Vec<f64>>,
     /// The outer optimizer's own verdict on whether the fit left its initial
     /// estimates — its `INIT_ESCAPE_STEP_S` test (#751) in scaled packed space,
     /// on the point the reported estimates are built from. `Some(false)` is the
@@ -8964,8 +9228,35 @@ pub struct FitResult {
     /// its bound: its row and column of `covariance_matrix` are zero, its `se_theta` is
     /// `0.0` and printed as not available, as a FIX θ's is, and every other standard error
     /// is conditional on it. Empty when no level sits on a bound.
+    ///
+    /// **Deprecated** in favour of [`Self::held_at_bound`], which lists these levels as
+    /// [`HeldReason::ProfiledBound`] entries alongside every other held coordinate. Still
+    /// filled, from the same source, for one release.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiled_levels_at_bound: Vec<usize>,
+    /// Every coordinate whose standard error is not available because it sits on a bound
+    /// (#2797), in packed order: the profiled levels on their declared box
+    /// ([`HeldReason::ProfiledBound`]) and the free coordinates collapsed on ferx's internal
+    /// guard ([`HeldReason::CollapsedAtGuard`]). Filled from the reported estimate, whether
+    /// or not the covariance step ran or succeeded.
+    ///
+    /// The list says "this SE is not available"; [`Self::cov_fixed`] says whether the step
+    /// held the coordinate, and so whether every other SE is conditional on it. A collapse
+    /// is held only when the step's `R` was clean (no eigenvalue floor, no `S` fallback):
+    /// otherwise the matrix and the SEs are the unconditional ones, the coordinate is not
+    /// marked in `cov_fixed`, and its stored `se_*` keeps the unconditional value. A held
+    /// coordinate's stored `se_*` is `0.0`, as a FIX parameter's is (never `NaN`, which
+    /// would break every consumer that sums or folds SEs). Display reads this list, not the
+    /// number.
+    ///
+    /// Read leniently: an entry of a parameter family this build does not know is
+    /// dropped on load rather than failing the whole read (#2817).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "held_at_bound_lenient"
+    )]
+    pub held_at_bound: Vec<HeldAtBound>,
 }
 
 /// Free-parameter counts by Delattre et al. (2014) class, plus the record count
@@ -9023,6 +9314,12 @@ impl FitResult {
                 "schema_version".to_string(),
                 serde_json::json!(Self::JSON_SCHEMA_VERSION),
             );
+            // #2799: the derived usability verdict, as `schema_version` is derived: there is no
+            // stored field, so a reader gets it from the same facts the result carries.
+            map.insert(
+                "status".to_string(),
+                serde_json::to_value(self.status()).expect("FitStatus is serializable"),
+            );
         }
         v
     }
@@ -9035,7 +9332,8 @@ impl FitResult {
     /// `NaN` (an `Option<f64>` reads it as `None`). A plain
     /// `serde_json::from_str::<FitResult>` refuses such a file — any fit whose
     /// diagnostics came out undefined, e.g. `dw_statistic` when no subject has
-    /// two IWRES values. The `schema_version` key is ignored.
+    /// two IWRES values. The `schema_version` and `status` keys are ignored (the status is
+    /// recomputed from the fields by [`Self::status`]).
     pub fn from_json_str(text: &str) -> Result<FitResult, serde_json::Error> {
         let value: serde_json::Value = serde_json::from_str(text)?;
         serde::Deserialize::deserialize(crate::io::serde_nan::NullAsNan(value))
@@ -9055,9 +9353,17 @@ pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize
 /// [`omega_se_at`] over a borrowed SE slice, for a caller holding the packed
 /// vector without its `Option<Vec<_>>` (`OmegaRowsInput`, #1859).
 pub(crate) fn omega_se_at_in(se: &[f64], n_eta: usize, i: usize, j: usize) -> Option<f64> {
+    se.get(omega_se_slot(se.len(), n_eta, i, j)?).copied()
+}
+
+/// The position of Ω element `(i, j)` in an `se_omega` vector of length `len`, or `None`
+/// when that layout has no slot for it. The one reading of the layout, shared by the
+/// lookup ([`omega_se_at_in`]) and the writer that zeroes a held variance's SE
+/// (`apply_held_at_bound`, #2797), so the two cannot disagree on a block Ω.
+pub(crate) fn omega_se_slot(len: usize, n_eta: usize, i: usize, j: usize) -> Option<usize> {
     let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
     let n_lt = crate::estimation::parameterization::omega_packed_len(n_eta, false);
-    if se.len() == n_lt && n_lt != n_eta {
+    if len == n_lt && n_lt != n_eta {
         // Full lower-triangle format (block omega). The packed index is the
         // shared column-major `chol_lt_idx` (same convention as `pack_params`).
         //
@@ -9069,21 +9375,10 @@ pub(crate) fn omega_se_at_in(se: &[f64], n_eta: usize, i: usize, j: usize) -> Op
         // answer. This is only reachable by an external caller: every in-repo
         // caller loops `i,j < n_eta`, so the guard is inert internally. The
         // guard also keeps `chol_lt_idx`'s `debug_assert!(i < n)` from firing.
-        if r < n_eta {
-            se.get(crate::estimation::parameterization::chol_lt_idx(
-                r, c, n_eta,
-            ))
-            .copied()
-        } else {
-            None
-        }
+        (r < n_eta).then(|| crate::estimation::parameterization::chol_lt_idx(r, c, n_eta))
     } else {
         // Diagonal-only format: only (i, i) is available.
-        if r == c {
-            se.get(r).copied()
-        } else {
-            None
-        }
+        (r == c).then_some(r)
     }
 }
 
@@ -9385,6 +9680,13 @@ pub struct FitOptions {
     /// model whose every objective evaluation is seconds). The fit is otherwise
     /// bit-identical either way — nothing downstream reads `final_gradient`.
     pub report_final_gradient: bool,
+    /// Read by nothing. It was never a `[fit_options]` key, and no optimizer takes its
+    /// L-BFGS history length from it. The field goes at the next minor release, with
+    /// `gn_lambda` (#1841).
+    #[deprecated(
+        since = "0.4.1",
+        note = "never read; removed at the next minor release (#1841)"
+    )]
     pub lbfgs_memory: usize,
     /// Run a gradient-free global pre-search (NLopt GN_CRS2_LM) before local optimization.
     pub global_search: bool,
@@ -9616,7 +9918,15 @@ pub struct FitOptions {
     /// Base RNG seed for the Bayes sampler. Chain `c` uses a seed derived from
     /// this. `None` draws a nondeterministic seed.
     pub bayes_seed: Option<u64>,
-    /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
+    /// Read by nothing. Gauss-Newton has used a trust region, not Levenberg-Marquardt
+    /// damping, since 0.1.0 (#68), so there is no damping factor for this to set. The
+    /// `[fit_options]` key is still parsed and draws a warning (#1841); the key and this
+    /// field go at the next minor release.
+    #[deprecated(
+        since = "0.4.1",
+        note = "has no effect: Gauss-Newton has used a trust region since 0.1.0; \
+                the field is removed at the next minor release (#1841)"
+    )]
     pub gn_lambda: f64,
     /// L2 (weight-decay) regularization strength for `[covariate_nn]` weights
     /// (NN-only). Adds `nn_l2_lambda · Σ wᵢ²` over the network **weight** blocks
@@ -9980,8 +10290,10 @@ pub struct FitOptions {
     pub mu_referencing: bool,
     /// Number of rayon worker threads used for the per-subject parallel loops
     /// (inner EBE search, SAEM MH steps, SIR weighting, likelihood reductions).
-    /// `None` or `Some(0)` uses available cores minus one, clamped to 1..8,
-    /// unless explicitly configured through `configure_global_thread_pool`.
+    /// `None` or `Some(0)` uses the engine default: the width declared through
+    /// `configure_global_thread_pool` if any, else a positive `RAYON_NUM_THREADS`
+    /// (used as given, read once per process — #2800), else available cores minus
+    /// one, at least two where two exist, capped at 8.
     /// `Some(n)` for positive `n` exclusively leases a pool of that width for
     /// this call. Idle pools are reused within a bounded cache; concurrent fits
     /// keep independent budgets even when their ODE overrides are identical.
@@ -10250,6 +10562,7 @@ impl Default for FitOptions {
             optimizer: Optimizer::Auto,
             inner_optimizer: InnerOptimizer::Auto,
             report_final_gradient: true,
+            #[allow(deprecated)] // removed with the field at the next minor (#1841)
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
@@ -10281,6 +10594,7 @@ impl Default for FitOptions {
             bayes_chains: 4,
             bayes_thin: 1,
             bayes_seed: None,
+            #[allow(deprecated)] // removed with the field at the next minor (#1841)
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -11268,6 +11582,30 @@ impl FitOptions {
         self.method_chain().iter().all(|m| eval_only.contains(m))
     }
 
+    /// Whether no stage of the run estimates (#2799), the source of
+    /// [`FitResult::evaluation_only`]: every stage is either a standalone evaluator
+    /// ([`Self::evaluation_only_chain`]'s `imp_eval_only` / `agq_eval_only`) or one that reads
+    /// `outer_maxiter = 0` as NONMEM `MAXEVAL=0`. Those are the stages `fit()` routes through
+    /// `optimize_population` (FOCE, FOCEI, Laplace — profiled and mixture fits included, and
+    /// the trust region beneath them), which short-circuits to `evaluate_at_initial_params`,
+    /// and pure Gauss–Newton, whose loop runs `1..=maxiter`. Not SAEM, IMP, IMPMAP, Bayes or
+    /// VI, which carry their own iteration counts, nor the Gauss–Newton hybrid, whose FOCEI
+    /// polish runs a fixed 100-evaluation budget whatever `maxiter` says.
+    pub(crate) fn evaluation_only_run(&self) -> bool {
+        let eval_only = self.eval_only_methods();
+        self.method_chain().iter().all(|m| {
+            eval_only.contains(m)
+                || (self.outer_maxiter == 0
+                    && matches!(
+                        m,
+                        EstimationMethod::Foce
+                            | EstimationMethod::FoceI
+                            | EstimationMethod::FoceGn
+                            | EstimationMethod::Laplace
+                    ))
+        })
+    }
+
     /// The chain stage that would run the post-fit covariance step: the last stage that
     /// estimates, ignoring a trailing run of evaluation-only stages (#615).
     ///
@@ -11448,6 +11786,15 @@ impl FitOptions {
             if key == "method" || key == "methods" {
                 continue;
             }
+            // A deprecated key is read by no method, so it gets its own notice on every
+            // chain instead of the "not used by method" text, which would suggest that
+            // some other method reads it.
+            if let Some(notice) = deprecated_key_notice(key) {
+                if seen.insert(key.clone()) {
+                    warnings.push(notice.to_string());
+                }
+                continue;
+            }
             if applicable.contains(key.as_str()) {
                 continue;
             }
@@ -11607,6 +11954,29 @@ impl FitOptions {
             self.method.label()
         ))
     }
+}
+
+/// `[fit_options]` keys the parser still accepts but nothing reads, each with the
+/// warning [`FitOptions::unsupported_keys_warnings`] emits when it is set, on any method.
+///
+/// A key here is in no `method_specific_keys` list and not in [`framework_keys`]: the
+/// notice is its only diagnostic. Each entry is removed, key and field together, at the
+/// next minor release after it was added.
+pub(crate) fn deprecated_keys() -> &'static [(&'static str, &'static str)] {
+    &[(
+        "gn_lambda",
+        "fit option `gn_lambda` has no effect: Gauss-Newton has used a trust region, not \
+         Levenberg-Marquardt damping, since ferx 0.1.0. Remove the key from your settings; \
+         it will be rejected from the next minor release.",
+    )]
+}
+
+/// The [`deprecated_keys`] notice for `key`, if it is deprecated.
+fn deprecated_key_notice(key: &str) -> Option<&'static str> {
+    deprecated_keys()
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, notice)| *notice)
 }
 
 /// The `ode_*` subset of [`framework_keys`]: knobs that only ever reach the ODE
@@ -11794,7 +12164,6 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
-            "gn_lambda",
             "nn_l2",
             "nn_smooth",
         ],
@@ -11813,7 +12182,6 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_search",
             "global_maxeval",
             "stagnation_guard",
-            "gn_lambda",
             "reconverge_gradient_interval",
             "nn_l2",
             "nn_smooth",
@@ -11992,6 +12360,11 @@ pub struct ParsedModel {
     /// bindings still in hand instead of silently dropping them.
     pub bindings: crate::parser::model_parser::ParseBindings,
 }
+
+// #2799: the usability verdict beside `converged`, in its own file.
+#[path = "types_fit_status.rs"]
+mod fit_status;
+pub use fit_status::{FitStatus, StatusReason};
 
 /// Factories that build minimal `CompiledModel` instances for unit tests.
 /// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests

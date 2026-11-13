@@ -97,6 +97,10 @@ pub struct OuterResult {
     /// `Failure`, …) on the NLopt path — lifted onto
     /// [`crate::types::FitResult::optimizer_stop`]. `None` where no optimizer reports one.
     pub optimizer_stop: Option<String>,
+    /// Whether the outer optimizer spent its evaluation budget on the leg that produced
+    /// these estimates (#2799), lifted onto [`crate::types::FitResult::eval_budget_spent`].
+    /// The final state, after the latch and polish adjustments; `false` off the NLopt path.
+    pub eval_budget_spent: bool,
     /// Fallback proposal covariance for the SIR sampler, set when the FD
     /// Hessian is non-PD. Built from the `|eigenvalue|`-rectified free-block
     /// Hessian, inflated 4×, and embedded into the full packed parameter space.
@@ -204,27 +208,38 @@ pub(crate) fn resolve_outer_optimizer(
     // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
     // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
     // honoured — those route through `optimize_nlopt`, whose objective closure
-    // branches to `mixture_gradient`. Every other choice (including `auto`, and
-    // the built-in BFGS / trust-region paths, which do not carry the mixture
-    // objective) falls back to BOBYQA.
+    // branches to `mixture_gradient`. An explicit `bobyqa` is honoured too: it is
+    // the optimizer the mixture path runs, so nothing was replaced and no warning
+    // is owed (#2852). Every other choice (including `auto`, and the built-in
+    // BFGS / trust-region paths, which do not carry the mixture objective) falls
+    // back to BOBYQA.
     if has_mixture {
-        return match requested {
-            Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => (requested, None),
-            // `Auto` is the mixture default and downgrades silently by design;
-            // any *explicitly* chosen optimizer that the mixture path can't drive
-            // (built-in BFGS/L-BFGS, trust-region, Gauss-Newton — none carry the
-            // mixture objective) is run under BOBYQA instead, so say so rather than
-            // dropping the choice invisibly.
-            Optimizer::Auto => (Optimizer::Bobyqa, None),
-            other => (
-                Optimizer::Bobyqa,
-                Some(format!(
-                    "Mixture models are optimized with BOBYQA or an NLopt gradient method \
-                     (SLSQP / L-BFGS / MMA); the requested {other:?} optimizer does not carry \
-                     the mixture objective and was replaced by BOBYQA."
-                )),
-            ),
+        // Exhaustive, no wildcard: a new variant must say here whether it carries
+        // the mixture objective.
+        let resolved = match requested {
+            Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
+                requested
+            }
+            // `Auto` is the mixture default; the built-in BFGS / L-BFGS and
+            // trust-region paths do not carry the mixture objective.
+            Optimizer::Auto | Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => {
+                Optimizer::Bobyqa
+            }
         };
+        // The warning is owed exactly when an *explicit* choice did not run — keyed
+        // on the outcome, not on a second list of variants, so "replaced" can never
+        // be said of an optimizer that ran as requested (#2852). `Auto` asked for
+        // no optimizer in particular and resolves silently by design.
+        let replaced = requested != Optimizer::Auto && resolved != requested;
+        let warning = replaced.then(|| {
+            format!(
+                "Mixture models are optimized with BOBYQA or an NLopt gradient method \
+                 (SLSQP / L-BFGS / MMA); the requested `{}` optimizer does not carry \
+                 the mixture objective and was replaced by BOBYQA.",
+                requested.label()
+            )
+        });
+        return (resolved, warning);
     }
     (
         requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
@@ -438,6 +453,16 @@ pub fn optimize_population(
     if let Some(w) = outer_fd_fallback_warning(model, population, &declines) {
         result.warnings.push(w);
     }
+    // #2713: a gradient-driven stop short of convergence reports how far its final
+    // gradient is from the exact one.
+    stop::attach_stop_report(
+        resolved,
+        model,
+        population,
+        init_params,
+        options,
+        &mut result,
+    );
     result
 }
 
@@ -1260,6 +1285,7 @@ fn evaluate_at_initial_params(
         cond_dist: None,
         newton_decrement,
         optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 
@@ -9354,6 +9380,10 @@ fn optimize_nlopt_attempt_probed(
         mcem_objective_trail: None,
         newton_decrement,
         optimizer_stop,
+        // #2799: the final budget state — after the polish (`PolishEnd::BudgetSpent`), a
+        // verified stop and a stagnation latch on the last permitted eval have each had their
+        // say above, so it is the same fact the "increase maxiter" warning is gated on.
+        eval_budget_spent: max_eval_reached,
     };
     (
         result,
@@ -9777,11 +9807,15 @@ fn optimize_bfgs(
     // Best accepted iterate, so an interrupted run's checkpoint holds it (#1317).
     let mut best = BestPoint::new();
 
+    // #2799: as in pure Gauss–Newton, every `break` below sets this, so a loop that runs off
+    // the end of `outer_maxiter` spent its budget.
+    let mut exited_early = false;
     for iter in 1..=options.outer_maxiter {
         n_iterations = iter;
 
         if crate::cancel::is_cancelled(&options.cancel) {
             warnings.push("cancelled by user".to_string());
+            exited_early = true;
             break;
         }
 
@@ -9796,6 +9830,7 @@ fn optimize_bfgs(
                 eprintln!("Converged at iteration {} (|g| = {:.2e})", iter, g_norm);
             }
             converged = true;
+            exited_early = true;
             break;
         }
 
@@ -9825,6 +9860,7 @@ fn optimize_bfgs(
                 if options.verbose {
                     eprintln!("Stopping: line search stalled at iteration {}", iter);
                 }
+                exited_early = true;
                 break;
             }
             s_hist.clear();
@@ -9959,6 +9995,7 @@ fn optimize_bfgs(
                 );
             }
             converged = true;
+            exited_early = true;
             break;
         }
     }
@@ -10056,6 +10093,10 @@ fn optimize_bfgs(
         cond_dist: None,
         newton_decrement,
         optimizer_stop: None,
+        eval_budget_spent: crate::estimation::gauss_newton::gn_loop_budget_spent(
+            options.outer_maxiter,
+            exited_early,
+        ),
     }
 }
 
@@ -10096,19 +10137,27 @@ pub(crate) fn reconverged_fd_gradient(
 ) -> Vec<f64> {
     let fixed = packed_fixed_mask(init_params);
     let warm = joint_warm_starts(warm_etas, warm_kappas);
-    let eval =
-        |xv: &[f64]| reconverged_probe_ofv(xv, init_params, model, population, &warm, options);
+    let probe = |xv: &[f64], tol: f64| {
+        reconverged_probe_ofv(xv, init_params, model, population, &warm, options, tol)
+    };
+    let tol = stencil_inner_tol(options.inner_tol);
+    let eval = |xv: &[f64]| probe(xv, tol).0;
+    let tight = |xv: &[f64]| {
+        let (v, stats) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+        crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
+    };
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
-    let floor = fd_step_floors(init_params, &model.default_params);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    let floor = fd_step_floors(init_params, model);
+    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
 }
 
 /// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
 /// loop warm from `warm` at the stencil tolerance. Matches the objective closure's
 /// definition, 2·pop_nll, and its guard: a probe the objective would reject (non-finite,
-/// or excess EBE non-convergence) is the same `1e20` wall, which [`central_diff_packed`]
-/// treats as missing rather than as a value (#2378).
+/// or excess EBE non-convergence) is the same `1e20` wall, which [`central_diff_packed_gated`]
+/// treats as missing rather than as a value (#2378). `tol` is the inner tolerance — the
+/// stencil's, or its tight twin's — and the inner loop's stats come back with the value.
 fn reconverged_probe_ofv(
     xv: &[f64],
     init_params: &ModelParameters,
@@ -10116,7 +10165,8 @@ fn reconverged_probe_ofv(
     population: &Population,
     warm: &[DVector<f64>],
     options: &FitOptions,
-) -> f64 {
+    tol: f64,
+) -> (f64, InnerLoopStats) {
     let params = unpack_params(xv, init_params);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
@@ -10124,7 +10174,7 @@ fn reconverged_probe_ofv(
         population,
         &params,
         options.inner_maxiter,
-        stencil_inner_tol(options.inner_tol),
+        tol,
         Some(warm),
         Some(&mu_k),
         options.min_obs_for_convergence_check as usize,
@@ -10134,12 +10184,14 @@ fn reconverged_probe_ofv(
     );
     let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
     let n_subj = population.subjects.len();
-    if !raw.is_finite() || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
+    let v = if !raw.is_finite()
+        || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
     {
         1e20
     } else {
         raw
-    }
+    };
+    (v, ebe_stats)
 }
 
 /// The gradient of the objective the covariance step's `R` is the Hessian of, at `x` (#2541):
@@ -10364,14 +10416,27 @@ fn reporting_fd_gradient(
     let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
     let warm = joint_warm_starts(warm_etas, warm_kappas);
-    let eval = |xv: &[f64]| -> f64 {
+    // `tight` re-solves at the gate's τ/100 (#2406): the mixture branch reads its inner
+    // tolerance from the options it is handed, so it takes an override clone.
+    let tight_options = FitOptions {
+        inner_tol: crate::estimation::fd_resolution::tight_tol(options.inner_tol),
+        ..options.clone()
+    };
+    let stencil_tol = stencil_inner_tol(options.inner_tol);
+    let probe = |xv: &[f64], tight: bool| -> (f64, InnerLoopStats) {
         let params = unpack_params(xv, init_params);
         // Mirror the objective closure's own two branches, so the mixture path
         // differentiates the K-fold log-sum-exp it minimised rather than a
         // single-class stand-in for it.
         let (raw, stats) = if params.mixture.is_some() {
-            let m =
-                crate::estimation::mixture::mixture_ofv(model, population, &params, options, None);
+            let mixture_options = if tight { &tight_options } else { options };
+            let m = crate::estimation::mixture::mixture_ofv(
+                model,
+                population,
+                &params,
+                mixture_options,
+                None,
+            );
             let stats = InnerLoopStats {
                 n_unconverged: m.ebe_stats.n_unconverged,
                 n_fallback: m.ebe_stats.n_fallback,
@@ -10386,7 +10451,11 @@ fn reporting_fd_gradient(
                 population,
                 &params,
                 options.inner_maxiter,
-                stencil_inner_tol(options.inner_tol),
+                if tight {
+                    crate::estimation::fd_resolution::tight_tol(stencil_tol)
+                } else {
+                    stencil_tol
+                },
                 Some(&warm),
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
@@ -10398,15 +10467,22 @@ fn reporting_fd_gradient(
             (2.0 * nll, ebe_stats)
         };
         let raw = raw + nn_reg.penalty_value(&params.theta) + priors.penalty(xv);
-        if !raw.is_finite() || ebe_guard_rejects(&stats, n_subj, raw, options.max_unconverged_frac)
+        let v = if !raw.is_finite()
+            || ebe_guard_rejects(&stats, n_subj, raw, options.max_unconverged_frac)
         {
             1e20
         } else {
             raw
-        }
+        };
+        (v, stats)
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    let eval = |xv: &[f64]| probe(xv, false).0;
+    let tight = |xv: &[f64]| {
+        let (v, stats) = probe(xv, true);
+        crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
+    };
+    let floor = fd_step_floors(init_params, model);
+    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
@@ -10424,13 +10500,28 @@ fn reporting_fd_gradient(
 /// Coordinate `k` is stepped by [`fd_step`]`(1e-4, xₖ, floor[k])`, `floor` from
 /// [`fd_step_floors`]: `1e-4·(1 + |xₖ|)` on every coordinate but a small identity-packed θ,
 /// which is stepped relative to its declared magnitude rather than by an absolute `1e-4` in
-/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187).
-fn central_diff_packed(
+/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187). A
+/// `[covariate_nn]` weight is identity-packed too but keeps the unit floor, since its θ₀ is
+/// a draw rather than a declared magnitude (#2406).
+///
+/// That relative step is only as good as the probes resolve it, so a coordinate whose floor is
+/// below 1 goes through the resolution gate of
+/// [`resolve_floored_step`](crate::estimation::fd_resolution::resolve_floored_step) (#2406):
+/// `tight` is `eval` re-solved at τ/100, `None` where a solve fell to Nelder–Mead or did not
+/// converge, and the step grows ×10 until the two agree or growth runs into truncation error.
+/// A coordinate whose `tight` was `None` at every floor keeps its first step's difference.
+/// Without `tight` no coordinate is gated, and a floor-1 coordinate takes the ungated difference
+/// either way. A floored one for which no floor gave a difference takes the ungated difference
+/// at its own floor, with its one-sided fallback — the covariance gate's fallback too. Floor 1
+/// was the worst step there: on a `V = TVV/k` volume it is the step through `V ≤ 0` that made
+/// the probe go missing (#2406 review r1).
+fn central_diff_packed_gated(
     x: &[f64],
     fixed: &[bool],
     floor: &[f64],
     bounds: &PackedBounds,
     eval: impl Fn(&[f64]) -> f64,
+    tight: Option<&dyn Fn(&[f64]) -> Option<f64>>,
 ) -> Vec<f64> {
     let n = x.len();
     let eps = 1e-4;
@@ -10442,7 +10533,43 @@ fn central_diff_packed(
         if fixed[k] {
             continue;
         }
-        let h = fd_step(eps, x[k], floor[k]);
+        let floor_k = floor[k];
+        if let Some(tight) = tight.filter(|_| floor_k < 1.0) {
+            let resolved =
+                crate::estimation::fd_resolution::resolve_floored_step(floor_k, |fl, at_tight| {
+                    let h = fd_step(eps, x[k], fl);
+                    let xp = (x[k] + h).min(bounds.upper[k]);
+                    let xm = (x[k] - h).max(bounds.lower[k]);
+                    if xp <= xm {
+                        return None;
+                    }
+                    let mut probe = |xk: f64| {
+                        xw[k] = xk;
+                        let v = if at_tight {
+                            tight(&xw)
+                        } else {
+                            Some(eval(&xw))
+                        };
+                        xw[k] = x[k];
+                        v.filter(|&v| usable(v))
+                    };
+                    let fp = probe(xp)?;
+                    let fm = probe(xm)?;
+                    Some(crate::estimation::fd_resolution::Difference {
+                        value: (fp - fm) / (xp - xm),
+                        numer: (fp - fm).abs(),
+                        scale: fp.abs().max(fm.abs()),
+                        span: xp - xm,
+                    })
+                });
+            if let Some(r) = resolved {
+                if r.value.is_finite() {
+                    grad[k] = r.value;
+                }
+                continue;
+            }
+        }
+        let h = fd_step(eps, x[k], floor_k);
         let xp = (x[k] + h).min(bounds.upper[k]);
         let xm = (x[k] - h).max(bounds.lower[k]);
         // Skip only probes that collapsed onto one point (a box pinned to `x`). The span is
@@ -10477,6 +10604,19 @@ fn central_diff_packed(
         }
     }
     grad
+}
+
+/// [`central_diff_packed_gated`] without the gate: the difference every coordinate took before
+/// #2406, which the tests pin the shared policy on.
+#[cfg(test)]
+fn central_diff_packed(
+    x: &[f64],
+    fixed: &[bool],
+    floor: &[f64],
+    bounds: &PackedBounds,
+    eval: impl Fn(&[f64]) -> f64,
+) -> Vec<f64> {
+    central_diff_packed_gated(x, fixed, floor, bounds, eval, None)
 }
 
 /// Per-subject packed gradient `dᵢ = d(nllᵢ)/dx` at the **held** EBE `η̂ᵢ` and held
@@ -10757,12 +10897,11 @@ pub(crate) fn subject_reconverged_fd_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let fixed = packed_fixed_mask(init_params);
     // Subject marginal NLL at a packed point, re-solving this subject's EBE
     // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
     // (`foce_subject_nll`, summed by `pop_nll`); a non-finite or sentinel side is missing
-    // to `central_diff_packed`, which takes the one-sided difference (#2378).
-    let eval = |xv: &[f64]| -> f64 {
+    // to `central_diff_packed_gated`, which takes the one-sided difference (#2378).
+    let probe = |xv: &[f64], tol: f64| -> (f64, bool) {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let ebe = find_ebe_for_stage(
@@ -10770,13 +10909,13 @@ pub(crate) fn subject_reconverged_fd_gradient(
             subject,
             &params,
             options.inner_maxiter,
-            stencil_inner_tol(options.inner_tol),
+            tol,
             Some(warm_eta.as_slice()),
             Some(&mu_k),
             0,
             options,
         );
-        crate::stats::likelihood::foce_subject_nll_cov(
+        let nll = crate::stats::likelihood::foce_subject_nll_cov(
             model,
             subject,
             &params.theta,
@@ -10786,10 +10925,32 @@ pub(crate) fn subject_reconverged_fd_gradient(
             &params.sigma.values,
             model.residual_cov_at(&params),
             options.interaction,
-        )
+        );
+        (nll, crate::estimation::fd_resolution::ebe_resolved(&ebe))
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    subject_central_diff(x, init_params, model, bounds, options, probe)
+}
+
+/// The per-subject reconverged-FD gradients' shared difference: `probe(x, tol)` is the
+/// subject's objective re-solved at `tol` and whether that solve counts as resolved, taken at
+/// the stencil tolerance and, on a floored coordinate, at its tight twin (#2406).
+fn subject_central_diff(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    probe: impl Fn(&[f64], f64) -> (f64, bool),
+) -> Vec<f64> {
+    let fixed = packed_fixed_mask(init_params);
+    let tol = stencil_inner_tol(options.inner_tol);
+    let eval = |xv: &[f64]| probe(xv, tol).0;
+    let tight = |xv: &[f64]| {
+        let (v, resolved) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+        resolved.then_some(v)
+    };
+    let floor = fd_step_floors(init_params, model);
+    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
 }
 
 /// Per-subject reconverged-FD packed gradient for an **IOV** subject: **re-converges that
@@ -10811,8 +10972,7 @@ fn subject_reconverged_fd_gradient_iov(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let fixed = packed_fixed_mask(init_params);
-    let eval = |xv: &[f64]| -> f64 {
+    let probe = |xv: &[f64], tol: f64| -> (f64, bool) {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let ebe = find_ebe_for_stage(
@@ -10820,13 +10980,13 @@ fn subject_reconverged_fd_gradient_iov(
             subject,
             &params,
             options.inner_maxiter,
-            stencil_inner_tol(options.inner_tol),
+            tol,
             Some(warm.as_slice()),
             Some(&mu_k),
             0,
             options,
         );
-        crate::stats::likelihood::foce_subject_nll_iov_cov(
+        let nll = crate::stats::likelihood::foce_subject_nll_iov_cov(
             model,
             subject,
             &params.theta,
@@ -10841,10 +11001,10 @@ fn subject_reconverged_fd_gradient_iov(
                 .omega_iov
                 .as_ref()
                 .expect("IOV model (n_kappa > 0) has omega_iov"),
-        )
+        );
+        (nll, crate::estimation::fd_resolution::ebe_resolved(&ebe))
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    subject_central_diff(x, init_params, model, bounds, options, probe)
 }
 
 /// The exact analytic per-subject packed **outer** gradient at the packed point `pt` the
@@ -10876,6 +11036,7 @@ fn subject_analytic_outer_gradient(
 
 /// [`subject_analytic_outer_gradient`], and with `want_eta_dx` the subject's mode response
 /// `dη̂/dx` formed from the same recording; the response is `None` wherever the gradient is.
+/// A declined gradient comes back as its [`DeclineCause`] (#2713).
 fn subject_analytic_outer_gradient_dx(
     model: &CompiledModel,
     subject: &Subject,
@@ -10883,23 +11044,36 @@ fn subject_analytic_outer_gradient_dx(
     eta_hat: &[f64],
     interaction: bool,
     want_eta_dx: bool,
-) -> (Option<Vec<f64>>, Option<Vec<DVector<f64>>>) {
-    if !want_eta_dx || (subject.observations.is_empty() && subject.obs_records.is_empty()) {
-        return (
-            subject_analytic_outer_gradient(model, subject, pt, eta_hat, interaction),
-            None,
-        );
+) -> (Result<Vec<f64>, DeclineCause>, Option<Vec<DVector<f64>>>) {
+    use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_and_mode_at, ModeOut};
+    // No data at all contributes nothing (`sens_outer_gradient::subject_gradient_at`).
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        return (Ok(vec![0.0; pt.x.len()]), None);
     }
-    let (g, dx) = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_with_eta_dx_at(
-        model,
-        subject,
-        pt,
-        eta_hat,
-        interaction,
-    );
-    match g.filter(|g| g.iter().all(|v| v.is_finite())) {
-        Some(g) => (Some(g), dx),
-        None => (None, None),
+    let objective = if interaction {
+        crate::sens::ode_provider::adjoint::Objective::Focei
+    } else {
+        crate::sens::ode_provider::adjoint::Objective::Foce
+    };
+    let mut out = ModeOut {
+        want_dx: want_eta_dx,
+        ..ModeOut::default()
+    };
+    let g = subject_adjoint_gradient_and_mode_at(model, subject, pt, eta_hat, objective, &mut out);
+    match g {
+        Some(g) if g.iter().all(|v| v.is_finite()) => (Ok(g), out.eta_dx),
+        _ if out.mode_system_declined => (Err(DeclineCause::ModeSystem), None),
+        _ => (Err(DeclineCause::Recording), None),
+    }
+}
+
+/// The analytic gradient where `x` is not the template's packed length: the adjoint
+/// declines, but a subject with no data at all keeps the zero gradient it gives one.
+fn packed_length_decline(subject: &Subject, np: usize) -> Result<Vec<f64>, DeclineCause> {
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        Ok(vec![0.0; np])
+    } else {
+        Err(DeclineCause::Recording)
     }
 }
 
@@ -11296,10 +11470,37 @@ pub(crate) struct OuterFdDeclineLog {
     /// admits is exactly such a gradient. Keyed on the route the subject took, not on the
     /// model-level predicate.
     reconverge_declined: bool,
+    /// Per declined subject, the [`DeclineCause`]s it declined for over the fit, one bit
+    /// each: a subject can decline at its mode system on some trial points and in its
+    /// recording on others (#2713).
+    causes: Vec<std::sync::atomic::AtomicU8>,
     /// Test switch: subjects whose analytic outer gradient is treated as declined, so a
     /// test can reach a *numerical* decline on a fixture the adjoint serves.
     #[cfg(test)]
     forced: Vec<std::sync::atomic::AtomicBool>,
+}
+
+/// Why the analytic outer gradient declined a subject (#2713). A large fallback share has
+/// two readings with different remedies, which the warning counts apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclineCause {
+    /// The mode system `H w = ∇_η F` would not solve: `H` singular at `η̂`, or indefinite at
+    /// an `η̂` that is not stationary, an EBE off a strict mode.
+    ModeSystem,
+    /// No recorder served the subject there: its data shape is outside the recorders'
+    /// scope, or the recording failed or came back non-finite at that point. Which of the
+    /// two is [`is_structural_decline`]'s question, asked for the salvage.
+    Recording,
+}
+
+impl DeclineCause {
+    /// This cause's bit in [`OuterFdDeclineLog::causes`].
+    fn bit(self) -> u8 {
+        match self {
+            DeclineCause::ModeSystem => 1,
+            DeclineCause::Recording => 2,
+        }
+    }
 }
 
 impl OuterFdDeclineLog {
@@ -11313,6 +11514,9 @@ impl OuterFdDeclineLog {
                 .collect(),
             skipped_salvages: AtomicUsize::new(0),
             reconverge_declined: false,
+            causes: (0..n_subjects)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             #[cfg(test)]
             forced: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
@@ -11334,9 +11538,28 @@ impl OuterFdDeclineLog {
         self.forced[i].store(true, Ordering::Relaxed);
     }
 
+    /// The cause a forced decline reports: a numerical one, at the mode system.
     #[cfg(test)]
-    fn is_forced(&self, i: usize) -> bool {
-        self.forced[i].load(Ordering::Relaxed)
+    fn forced_cause(&self, i: usize) -> Option<DeclineCause> {
+        self.forced[i]
+            .load(Ordering::Relaxed)
+            .then_some(DeclineCause::ModeSystem)
+    }
+
+    /// Record why subject `i` declined on this evaluation (#2713). Rayon workers,
+    /// `Relaxed`, as [`Self::record`].
+    pub(crate) fn record_cause(&self, i: usize, cause: DeclineCause) {
+        if let Some(bits) = self.causes.get(i) {
+            bits.fetch_or(cause.bit(), Ordering::Relaxed);
+        }
+    }
+
+    /// How many subjects declined for `cause` at least once.
+    fn n_cause(&self, cause: DeclineCause) -> usize {
+        self.causes
+            .iter()
+            .filter(|b| b.load(Ordering::Relaxed) & cause.bit() != 0)
+            .count()
     }
 
     /// Mark subject `i` as having taken the FD outer gradient on this evaluation.
@@ -11354,6 +11577,13 @@ impl OuterFdDeclineLog {
         if let Some(flag) = self.structural.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Whether subject `i` declined structurally on some evaluation.
+    fn is_structural(&self, i: usize) -> bool {
+        self.structural
+            .get(i)
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     /// How many declined subjects were structural declines.
@@ -11465,10 +11695,42 @@ pub(crate) fn outer_fd_fallback_warning(
     };
     Some(format!(
         "{n_fd} of {n_total} subjects could not be given the exact analytic outer \
-         gradient during this fit{example} (a shape no analytic recorder serves, or a trial \
-         point where it could not be formed) and {consequence} The reported \
-         outer gradient method is the model-level route, not the per-subject one.{skipped}"
+         gradient during this fit{example} ({why}) and {consequence} The reported \
+         outer gradient method is the model-level route, not the per-subject one.{skipped}",
+        why = decline_causes_clause(log),
     ))
+}
+
+/// The parenthesis of [`outer_fd_fallback_warning`] that says why the subjects declined
+/// (#2713): one clause per [`DeclineCause`] some subject declined for, with its count. The
+/// counts cover every trial point of the fit, rejected ones included, and a subject that
+/// declined for both causes counts under each. A log no route stamped a cause on (the
+/// quadrature's) keeps the generic sentence.
+fn decline_causes_clause(log: &OuterFdDeclineLog) -> String {
+    let parts: Vec<String> = [
+        (
+            DeclineCause::ModeSystem,
+            "with an inner Hessian at the EBE that was singular, or indefinite at an EBE \
+             that was not stationary (an EBE off a strict mode), at some trial point",
+        ),
+        (
+            DeclineCause::Recording,
+            "with a shape no analytic recorder serves, or a recording that failed or came \
+             back non-finite at some trial point",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(cause, text)| match log.n_cause(cause) {
+        0 => None,
+        n => Some(format!("{n} {text}")),
+    })
+    .collect();
+    if parts.is_empty() {
+        "a shape no analytic recorder serves, or a trial point where it could not be formed"
+            .to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 /// `population_gradient_sens_mixed_dx` without the mode responses.
@@ -11567,24 +11829,19 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                     options.interaction,
                     want_eta_dx,
                 ),
-                // `x` is not the template's packed length: the adjoint declines, but a subject
-                // with no observations keeps the zero gradient it gives one.
-                None => (
-                    (subject.observations.is_empty() && subject.obs_records.is_empty())
-                        .then(|| vec![0.0; x.len()]),
-                    None,
-                ),
+                None => (packed_length_decline(subject, x.len()), None),
             };
             #[cfg(test)]
-            let analytic = analytic.filter(|_| !declines.is_forced(i));
+            let analytic = declines.forced_cause(i).map_or(analytic, Err);
             let g = match analytic {
                 // Keep the exact analytic gradient for in-scope, finite subjects.
-                Some(g) => g,
+                Ok(g) => g,
                 // Out-of-scope (or non-finite analytic) → per-subject salvage (held-EBE,
                 // or reconverged for a structural decline, #1536), unless the trial point
                 // has blown up (#1520).
-                None => {
+                Err(cause) => {
                     declines.record(i);
+                    declines.record_cause(i, cause);
                     let structural =
                         is_structural_decline(model, subject, init_params, ehs[i].as_slice());
                     if structural {
@@ -11599,12 +11856,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                         declines,
                         || {
                             non_iov_declined_salvage(
-                                // A non-Gaussian subject's held-EBE score drops the EBE
-                                // response it depends on strongly (#1778): reconverge it.
-                                structural
-                                    || declines.reconverge_declined
-                                    || (!subject.obs_records.is_empty()
-                                        && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model)),
+                                declined_salvage_reconverges(model, subject, structural, declines),
                                 x,
                                 init_params,
                                 model,
@@ -11649,6 +11901,23 @@ pub(crate) fn population_gradient_sens_mixed_dx(
     (grad, eta_dx)
 }
 
+/// Whether a declined non-IOV subject takes the reconverged salvage in
+/// [`population_gradient_sens_mixed_dx`] rather than the held-EBE one: a structural decline
+/// (#1536), a log that reconverges every decline (#2136), or a non-Gaussian subject, whose
+/// held-EBE score drops the EBE response it depends on strongly (#1778). The stop report
+/// (#2713) asks the same question to count the subjects left on the held-EBE fallback.
+pub(crate) fn declined_salvage_reconverges(
+    model: &CompiledModel,
+    subject: &Subject,
+    structural: bool,
+    declines: &OuterFdDeclineLog,
+) -> bool {
+    structural
+        || declines.reconverge_declined
+        || (!subject.obs_records.is_empty()
+            && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model))
+}
+
 /// One IOV subject's exact analytic packed outer gradient at the stacked mode
 /// `stacked = [η̂, κ̂₁ … κ̂_K]`, or `None` when the adjoint declines it. `pt` is `None` when
 /// `x` is not the template's packed length: the adjoint declines then, but a subject with no
@@ -11663,17 +11932,20 @@ fn subject_iov_analytic_gradient(
     stacked: &DVector<f64>,
     np: usize,
     options: &FitOptions,
-) -> Option<Vec<f64>> {
+) -> Result<Vec<f64>, DeclineCause> {
     match pt {
-        Some(pt) => subject_analytic_outer_gradient(
-            model,
-            subject,
-            pt,
-            stacked.as_slice(),
-            options.interaction,
-        ),
-        None => (subject.observations.is_empty() && subject.obs_records.is_empty())
-            .then(|| vec![0.0; np]),
+        Some(pt) => {
+            subject_analytic_outer_gradient_dx(
+                model,
+                subject,
+                pt,
+                stacked.as_slice(),
+                options.interaction,
+                false,
+            )
+            .0
+        }
+        None => packed_length_decline(subject, np),
     }
 }
 
@@ -11695,7 +11967,7 @@ pub(crate) fn subject_iov_outer_gradient(
     options: &FitOptions,
 ) -> Vec<f64> {
     subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options).unwrap_or_else(
-        || {
+        |_| {
             subject_reconverged_fd_gradient_iov(
                 x,
                 init_params,
@@ -11744,9 +12016,10 @@ pub(crate) fn population_gradient_sens_iov_mixed(
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
             match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
             {
-                Some(g) => g,
-                None => {
+                Ok(g) => g,
+                Err(cause) => {
                     declines.record(i);
+                    declines.record_cause(i, cause);
                     declined_subject_gradient(
                         np,
                         population,
@@ -12269,6 +12542,9 @@ fn covariance_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
 }
+
+#[path = "outer_optimizer_stop.rs"]
+mod stop;
 
 #[cfg(test)]
 #[path = "outer_optimizer_tests.rs"]

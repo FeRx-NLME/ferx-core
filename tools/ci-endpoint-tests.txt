@@ -54,4 +54,5 @@ tte_ode_solve_failed
 tte_residuals_nonmem_anchor
 tte_smoke
 vi_dcm_omega_recovery
+vpc_tte_self_consistency
 zero_omega_fit

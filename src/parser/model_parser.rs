@@ -1,7 +1,7 @@
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
-    validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, DoseKnowledge, DoseStep, DoseValue, IntervalStep,
+    round_to_message, validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec,
+    AdaptiveRoute, AdaptiveRule, Comparison, DoseKnowledge, DoseStep, DoseValue, IntervalStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -7372,13 +7372,13 @@ pub fn parse_full_model_with(
     // Only compiled when the `survival` feature is enabled; the field
     // `model.endpoints` is always present (cfg-gated) and stays empty otherwise.
     //
-    // Theta/eta indices used in event_model expressions are collected here so
-    // that check_unused_parameters (below) can suppress false "not referenced"
-    // warnings for parameters that only appear in [event_model].
-    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    // Theta/eta indices read anywhere outside `[individual_parameters]` are collected
+    // here, so that check_unused_parameters (below) does not report them "not
+    // referenced". Despite the name the set is not only [event_model]'s: a custom RUV
+    // magnitude, a `correlation` line's ρ, a `[covariate_model]` relation, a `[scaling]`
+    // readout and a `[mixture]` mixing expression (#2766) add theirs too.
     let mut event_model_used_thetas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
-    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_etas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     // Every endpoint block's parameter expressions as synthetic assignments,
@@ -7543,6 +7543,27 @@ pub fn parse_full_model_with(
     {
         decl.record_cmts = level_record_cmts(&model.endpoints, &decl.index_covariate);
     }
+    // #2808: the CMTs whose discrete-state records a reader can make define a level, the
+    // binary and DTMM endpoints. A positive set, so a discrete family added later is not
+    // advised a `[binary_model]` read until it is listed here (review r1b #2).
+    #[cfg(feature = "survival")]
+    {
+        #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+        let mut level_capable_cmts = model.binary_cmts();
+        #[cfg(feature = "markov")]
+        {
+            level_capable_cmts.extend(model.dtmm_cmts());
+            level_capable_cmts.sort_unstable();
+        }
+        for decl in model
+            .indiv_param_partials
+            .theta_blocks
+            .level_blocks
+            .iter_mut()
+        {
+            decl.level_capable_cmts.clone_from(&level_capable_cmts);
+        }
+    }
 
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
     // parsing) so that parameters used only in [event_model] are not falsely
@@ -7619,6 +7640,17 @@ pub fn parse_full_model_with(
              that switches during the integration, so the switching time moves with it. Exact \
              derivatives cannot see that, so this model uses finite-difference gradients."
         ));
+    }
+
+    // A θ used only in a [mixture] mixing expression (logit(1) = MIXL, p(1) = P1) is not
+    // referenced in [individual_parameters] or [event_model], but it IS estimated — the
+    // mixing fraction. Scan the expressions the same way the event-model blocks do (#2766).
+    if let Some(spec) = &model.mixture {
+        for expr in &spec.mixing {
+            visit_expr_nodes(&expr.expr, &mut |e: &Expression| {
+                note_theta_eta(e, &mut event_model_used_thetas, &mut event_model_used_etas)
+            });
+        }
     }
 
     model.parse_warnings.extend(check_unused_parameters(
@@ -7877,8 +7909,8 @@ pub(crate) const MAX_CMT_INDEX: usize = 255;
 
 /// Built-in sdtab column names that [derived] names must not clash with.
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
-    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EBE_OFV", "N_OBS",
-    "TAFD", "TAD", "CENS", "OCC", "CMT",
+    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EPRED", "PWRES",
+    "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD", "CENS", "OCC", "CMT",
 ];
 
 /// Split a token slice at top-level commas (depth 0 inside parentheses).
@@ -11460,6 +11492,7 @@ fn parse_adaptive_dosing_block(
     let mut dose_bounds: Option<(DoseValue, DoseValue)> = None;
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<DoseValue>> = None;
+    let mut round_to: Option<f64> = None;
     let mut dose_knowledge = DoseKnowledge::Known;
     let mut intervals: Option<Vec<f64>> = None;
     let mut start_interval: Option<f64> = None;
@@ -11571,6 +11604,16 @@ fn parse_adaptive_dosing_block(
                 }
                 levels = Some(l);
             }
+            "round_to" => {
+                // A positive grid step, the same for every subject (#944). Its pairing
+                // with `levels` and the bounds is checked by `validate`.
+                let s = val
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .ok_or_else(|| round_to_message(val))?;
+                round_to = Some(s);
+            }
             "dose_knowledge" => {
                 dose_knowledge = match val {
                     "known" => DoseKnowledge::Known,
@@ -11664,6 +11707,7 @@ fn parse_adaptive_dosing_block(
         dose_bounds,
         confirm,
         levels,
+        round_to,
         dose_knowledge,
         intervals,
         start_interval,
@@ -12994,6 +13038,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
         }
         "vi_seed" => opts.vi_seed = parse_u64_opt("vi_seed")?,
+        // Deprecated (#1841): still parsed so an existing model keeps loading, but read by
+        // nothing; `deprecated_keys` carries the warning it draws on every method.
+        #[allow(deprecated)]
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         // Covariate-NN (DCM) regularization strengths. Non-negative; 0 = off
         // (strict no-op — existing fits stay byte-identical). Settable from the
@@ -19963,6 +20010,7 @@ fn parse_parameters(
                                 eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
                                 record_cmts: Vec::new(),
+                                level_capable_cmts: Vec::new(),
                                 read_bare: false,
                             });
                             (levels, theta_names, Some(index_covariate), columns)
@@ -24617,6 +24665,12 @@ pub struct LevelBlockDecl {
     /// CTMM generator is built once per subject from the baseline, and one time-to-event
     /// data row can yield zero or two records, so neither defines levels.
     pub(crate) record_cmts: Vec<usize>,
+    /// Set by the parse: the CMTs of the model's `[binary_model]` and DTMM `[markov_model]`
+    /// endpoints, sorted (#2808) — the endpoints whose discrete-state records a reader of
+    /// this block would make define levels. The binder's no-levels refusal advises reading
+    /// the block in one of them only when the data has a record on one: a CTMM state row
+    /// defines no level whatever reads it, and its CMT has no other endpoint.
+    pub(crate) level_capable_cmts: Vec<usize>,
     /// Set by the parse: some expression reads this block bare, through
     /// `index_covariate` — the model's referenced covariates include it (#2623 review).
     /// Bare is the only way to read a data-driven block: the parse refuses a

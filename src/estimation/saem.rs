@@ -7306,6 +7306,7 @@ pub fn run_saem(
         mcem_objective_trail: None,
         newton_decrement,
         optimizer_stop: None,
+        eval_budget_spent: false,
     })
 }
 

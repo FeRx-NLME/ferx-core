@@ -174,7 +174,6 @@ fn fast_opts(method: EstimationMethod, optimizer: Optimizer, mu_referencing: boo
         interaction: method == EstimationMethod::FoceI,
         mu_referencing,
         optimizer,
-        lbfgs_memory: 5,
         verbose: false,
         ..FitOptions::default()
     }
@@ -3116,6 +3115,14 @@ fn test_npde_post_hoc_matches_the_fit_under_a_derived_rule() {
         .collect();
     assert!(at_fit.iter().all(|(npd, _)| !npd.is_empty()));
     assert_eq!(npde_bits(&post_hoc), at_fit);
+    // #2871: the fit's post-fit step carries EPRED / PWRES from the same pass onto
+    // `SubjectResult`, bit for bit.
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+    for (sr, sn) in res.subjects.iter().zip(&post_hoc) {
+        assert!(!sr.epred.is_empty() && !sr.pwres.is_empty());
+        assert_eq!(bits(&sr.epred), bits(&sn.epred), "subject {} EPRED", sr.id);
+        assert_eq!(bits(&sr.pwres), bits(&sn.pwres), "subject {} PWRES", sr.id);
+    }
 }
 
 // ── #1955: a derived `iov_occasion` rule reaches simulate ────────────────

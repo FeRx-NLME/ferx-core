@@ -95,6 +95,16 @@ pub(crate) fn ctmm_unsupported(message: impl Into<String>) -> EngineError {
     coded("E_CTMM_UNSUPPORTED", Some("markov_model"), message.into())
 }
 
+/// `E_VPC_TTE_INPUT`: an input `vpc_tte` would draw a wrong Kaplan–Meier curve or band
+/// from (#1886) — several TTE endpoints and no `cmt`, a repeated-events endpoint, left
+/// truncation, an interval-censored record, bad band probabilities, too few replicates,
+/// too many strata, and the like. `ferx check` has no VPC options, so only `vpc_tte`
+/// raises it.
+#[cfg(feature = "survival")]
+pub(crate) fn vpc_tte_input(message: impl Into<String>) -> EngineError {
+    coded("E_VPC_TTE_INPUT", None, message.into())
+}
+
 /// `E_TTE_NOT_SIMULATABLE`: a TTE endpoint and population the event-time simulator
 /// cannot draw from — more than one recurrent stream on a subject, a recurrent cause
 /// beside a competing single-event one, an EVID=3/4 reset under a recurrent or an
@@ -232,7 +242,9 @@ pub(crate) fn adaptive_spec(message: impl Into<String>) -> Diagnostic {
 /// `E_ADAPTIVE_DOSE_VALUE`: an `[adaptive_dosing]` dose expression (`start_dose`,
 /// `dose_bounds`, `levels`) whose value for one subject breaks a dose invariant — not
 /// finite, negative, a `start_dose` outside the bounds or off the ladder, a rung outside
-/// the bounds, a ladder that does not increase (#944). Checked for every subject before
+/// the bounds, a ladder that does not increase, no multiple of `round_to` within the
+/// bounds, or a low bound of 0 with `round_to` under percentage steps (#944). Checked for
+/// every subject before
 /// any subject runs, except an oracle subject (`dose_knowledge = oracle`), checked in each
 /// replicate after its draw; the message names the subject (and that replicate) and the
 /// values read.

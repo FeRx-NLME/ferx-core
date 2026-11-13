@@ -67,30 +67,37 @@ matrix stays on the raw score $g_i$.
 
 This approximation is equivalent to the Gauss-Newton Hessian for log-likelihood objectives and is guaranteed positive semi-definite.
 
-### Levenberg-Marquardt Damping
+### Trust region
 
-To improve stability away from the minimum, the Hessian is regularized:
+Each iteration takes one trust-region step on the quadratic model built from the gradient and
+$H_{\text{BHHH}}$. Before the solve, every coordinate is divided by a per-parameter scale (fixed
+from the initial estimates; identity with `scale_params = false`) so the system is better
+conditioned. The radius is measured in this scaled space.
 
-$$
-H_{\text{LM}} = H_{\text{BHHH}} + \lambda \, \text{diag}(H_{\text{BHHH}})
-$$
+- **The step:** $\delta$ approximately minimises $g^T\delta + \tfrac12\,\delta^T H_{\text{BHHH}}\,\delta$
+  subject to $\lVert\delta\rVert \le \Delta$, by Steihaug truncated conjugate gradients. CG stops
+  once its residual is small, steps to the boundary when it would leave the region or meets a
+  direction of non-positive curvature, and runs at most
+  $\max(\lceil\sqrt{n}\rceil, 5)$ iterations for $n$ packed parameters.
+  There is no damping factor, Cholesky solve or line search.
+- **The trial point:** the inner loop re-estimates every subject's EBEs at $x + \delta$
+  (warm-started from the current EBEs), so the trial OFV is the FOCE/FOCEI objective, not the
+  quadratic model.
+- **The ratio:** $\rho$ is the actual OFV reduction divided by the reduction the quadratic model
+  predicts. A non-finite trial OFV counts as $\rho < 0$, and so does a step clamped at a bound
+  whose predicted reduction is no longer positive.
+- **The radius:** $\Delta$ starts at 1 and never exceeds 10.
 
-The damping factor $\lambda$ is adapted during optimization:
-- **On successful step** (OFV decreases): $\lambda \leftarrow 0.3 \, \lambda$ (minimum $10^{-6}$)
-- **On rejected step** (OFV increases): $\lambda \leftarrow 10 \, \lambda$
-- If $\lambda > 10^6$, the algorithm stops
+| $\rho$ | Step | Radius |
+|--------|------|--------|
+| $< 0.25$ | rejected | $\Delta / 4$ |
+| $0.25$ to $0.75$ | accepted | unchanged |
+| $> 0.75$ | accepted | $\min(2\Delta,\ 10)$ |
 
-The Newton step is obtained by solving:
-
-$$
-H_{\text{LM}} \, \delta = -\nabla \text{OFV}
-$$
-
-via Cholesky decomposition. If the Cholesky fails (singular Hessian), $\lambda$ is increased and the iteration is retried.
-
-### Line Search
-
-Each step uses backtracking line search (up to 15 halvings). At each trial point, EBEs are re-estimated via the inner loop (warm-started from the previous EBEs), ensuring the FOCE objective is evaluated consistently.
+A rejected step costs an iteration but keeps the current estimates. When the quadratic model
+predicts almost no reduction ($< 10^{-10}$) while the gradient is not zero, the BHHH matrix is
+degenerate along the step: the radius is divided by 4 and the next iteration starts, with no
+trial point evaluated. That iteration still counts toward `maxiter`.
 
 ### Bounds and stalled steps
 
@@ -114,9 +121,37 @@ term.
 
 ### Convergence
 
-The algorithm converges when:
-- Relative OFV change $< 10^{-6}$ for at least 3 iterations, or
-- Maximum iterations are reached
+The GN loop ends at the first of:
+
+- **Converged, small change:** an accepted step changes the OFV by less than $10^{-6}$ relative
+  to $\max(\lvert\text{OFV}\rvert, 1)$, from iteration 4 on, and the trust radius the step
+  was taken at is at least $10^{-3}$. One such step is enough. Below that radius a step changes
+  the OFV little *because* it is tiny, whatever the gradient, so it does not count; the loop goes
+  on and ends on one of the rules below
+  ([#2738](https://github.com/FeRx-NLME/ferx-core/issues/2738)). Near a real optimum the
+  quadratic model predicts well, so accepted steps double the radius and it climbs back above
+  $10^{-3}$ within a few iterations.
+- **Converged, stationary point:** the predicted reduction is below $10^{-10}$ and the scaled
+  gradient norm is below $10^{-8}$.
+- **Not converged, trust radius collapsed:** the radius falls below $10^{-10}$, after rejected
+  steps or degenerate-BHHH retries. The fit adds the warning "Gauss-Newton: trust radius
+  collapsed without convergence" (or "degenerate BHHH Hessian, trust radius collapsed without
+  convergence"), classified critical, like the budget warning.
+- **Not converged, budget spent:** `maxiter` iterations ran, with the warning "Gauss-Newton:
+  max iterations reached without convergence". Only this stop carries it: a collapsed radius or
+  a cancelled fit reports its own reason alone
+  ([#1049](https://github.com/FeRx-NLME/ferx-core/issues/1049)).
+
+This is the loop's verdict, not yet the fit's. Pure `gn` re-checks `converged` afterwards: a
+cold re-solve of the EBEs at the final estimates
+([#2097](https://github.com/FeRx-NLME/ferx-core/issues/2097)), the covariance step's check that
+the end point is stationary ([#2785](https://github.com/FeRx-NLME/ferx-core/issues/2785)), and a
+check that the final objective is finite can each demote it.
+
+The optimizer trace (`optimizer_trace = true`) logs one row per step. For GN rows its
+`lm_lambda` column holds the trust radius: the radius the step was tried with on a rejected row,
+and the radius after the update on an accepted one. The column keeps its old name, from the
+Levenberg-Marquardt loop GN ran before 0.1.0, so existing readers still find it.
 
 ## Hybrid Mode (GN + FOCEI)
 
@@ -134,10 +169,12 @@ The final result is whichever phase produced the lower OFV. This combines the fa
   method     = gn          # or gn_hybrid
   maxiter    = 100         # max GN iterations
   covariance = true
-  gn_lambda  = 0.01        # initial Levenberg-Marquardt damping (default 0.01)
 ```
 
-The initial Levenberg-Marquardt damping factor defaults to 0.01 and adapts automatically. Set `gn_lambda` explicitly (range ~0.001–0.1) if the default causes early step rejection on ill-conditioned models. Setting `gn_lambda` on a non-GN method (e.g. `foce`) emits a warning and is ignored.
+The trust region has no user setting: the starting radius, its cap and the CG budget are fixed
+as described under [Trust region](#trust-region). `gn_lambda`, the Levenberg-Marquardt damping
+factor of the loop GN replaced in 0.1.0, has no effect. ferx still accepts the key but warns when
+it is set, on any method, and the next minor release removes it.
 
 ## When to Use
 

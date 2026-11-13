@@ -131,7 +131,7 @@ reached when the fit was saved.
 | `ebes.csv` | CSV | yes | One row per subject: `ID, <eta names...>, ofv_contribution, n_obs` |
 | `ebes_kappa.csv` | CSV | only when `n_kappa > 0` | One row per (subject, occasion): `ID, OCC, <kappa names...>` |
 | `conddist.csv` | CSV | only when `[fit_options] conddist = true` (SAEM-only) | One row per (subject, eta): `ID, ETA, COND_MEAN, COND_SD, COND_MODE` |
-| `predictions.csv` | CSV | yes | One row per observation: `ID, TIME, DV, PRED, IPRED, CWRES, IWRES, EBE_OFV, N_OBS` plus optional `CENS`, `OCC` |
+| `predictions.csv` | CSV | yes | One row per observation: `ID, TIME, DV, PRED, IPRED, CWRES, IWRES, EBE_OFV, N_OBS` plus optional `NPDE, NPD, EPRED, PWRES` (after `IWRES`), `CENS`, `OCC` |
 | `predictions_discrete.csv` | CSV | only when the fit has binary-endpoint records | One row per record: `ID, CMT, TIME, DV, PRED, IPRED, IWRES` |
 | `predictions_tte.csv` | CSV | only when the fit has time-to-event records | One row per record: `ID, CMT, TIME, DV, COXSNELL, MARTINGALE, DEVIANCE, PIT` |
 | `covtab.csv` | CSV | only with a `[covariates]` block | One row per input record: `ID, TIME, EVID, <covariates...>` |
@@ -324,6 +324,27 @@ coordinates.
 told from a degenerate one without reading it off a zero diagonal. It is absent when
 there is no matrix or no mask for it, and otherwise has the matrix's dimension; any
 other length is refused on save and on load.
+
+`held_at_bound` (#2797) lists the parameters whose standard error is not available,
+in packed order, each as `{name, kind, index, packed_index, reason}`, with `reason`
+`profiled_bound` or `collapsed_at_guard`
+([held parameters](../estimation/parameterization.qmd#held-parameters)). It is absent
+when the list is empty. An entry for a `[mixture]` per-class override also has
+`class`, its 1-based class (#2809). Its `kind` and `index` then name the **base**
+parameter it overrides, so a reader matching entries to the base estimates must skip
+an entry that has `class`. A base entry has no `class` key. A reader built before
+#2809 drops the key and would read the override as its base parameter.
+
+A bundle written before `held_at_bound` existed carries only `profiled_levels_at_bound`;
+on load those levels become `profiled_bound` entries, so old and new bundles read the
+same way.
+
+A `reason` the reading build does not know — one a later ferx added — loads as
+`unknown` instead of failing the bundle (#2817). The entry still counts as held, so
+its standard error shows as `N/A`. Re-saving writes it back as `unknown`; the original
+token is not kept. An entry whose `kind` the build does not know (a parameter family
+a later ferx added) is dropped on load, since there is no family to show it under; the
+rest of the list loads. Both rules apply when a `FitResult` JSON file is read, too.
 
 #### Engine results
 
@@ -593,7 +614,7 @@ pass itself uses) rather than stored redundantly.
 ## `predictions.csv`
 
 ```
-ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS[,CENS[,OCC]]
+ID,TIME,DV,PRED,IPRED,CWRES,IWRES[,NPDE,NPD,EPRED,PWRES],EBE_OFV,N_OBS[,CENS[,OCC]]
 1,0.5,5.3653,3.9165677732979756,5.354088670487155,0.8369821497673978,0.19482332597649954,-27.117019931625446,11
 ```
 
@@ -604,6 +625,9 @@ ID,TIME,DV,PRED,IPRED,CWRES,IWRES,EBE_OFV,N_OBS[,CENS[,OCC]]
   two subjects may share an ID, so it is what catches blocks written out of order.
 - `CENS` and `OCC` columns are present only when at least one subject in the
   population has censoring or occasions, respectively.
+- `NPDE`, `NPD`, `EPRED` and `PWRES` are present only when the fit ran with
+  `npde_nsim > 0`. A file written before `EPRED`/`PWRES` existed loads with them
+  empty. (`EWRES` is written to the sdtab only, as a second name for `PWRES`.)
 - NaN values (e.g. CWRES/IWRES for censored observations) are written as
   empty fields, not as `"NaN"`.
 

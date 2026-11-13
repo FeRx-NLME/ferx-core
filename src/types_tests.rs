@@ -766,7 +766,10 @@ fn classify_warning_covariance_prefix_does_not_claim_convergence() {
         "Outer optimization did not converge".to_string(),
         "[FOCEI] Outer optimization did not converge".to_string(),
         crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string(),
-        "Gauss-Newton: max iterations reached without convergence".to_string(),
+        crate::estimation::gauss_newton::GN_BUDGET_WARNING.to_string(),
+        // #1049: the collapse stops are non-convergence too, so they file with it.
+        crate::estimation::gauss_newton::GN_COLLAPSE_WARNING.to_string(),
+        crate::estimation::gauss_newton::GN_DEGENERATE_COLLAPSE_WARNING.to_string(),
         // trust_region.rs, the four forms.
         "Trust-region did not converge: reached the iteration budget (maxiter = 50). The \
          estimates and any standard errors are reported at a non-stationary point; raise \
@@ -934,6 +937,30 @@ fn classify_warning_dw_is_warning() {
     let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
     assert_eq!(w.severity, WarningSeverity::Warning);
     assert_eq!(w.category.as_str(), "dw_autocorrelation");
+}
+
+/// #2798: every positive-DW message, whatever the model class, lands in
+/// `dw_autocorrelation`. The compartment-free text reaches that arm only after
+/// ~60 earlier ones, so a wording that hits one of their keys (`degenerate`,
+/// `did not converge`, `covariance step`, …) would silently re-file it; ferx-r
+/// classifies through this same function. The full messages, not a prefix.
+#[test]
+fn classify_warning_dw_advice_messages_are_dw() {
+    use crate::api::{dw_autocorrelation_warning, DwAdvice};
+    for advice in [
+        DwAdvice::Compartmental,
+        DwAdvice::Algebraic { group: None },
+        DwAdvice::Algebraic {
+            group: Some("ARM".into()),
+        },
+    ] {
+        for dw in [1.2, 2.8] {
+            let msg = dw_autocorrelation_warning(dw, &advice).expect("outside the band");
+            let w = classify_warning(&msg);
+            assert_eq!(w.severity, WarningSeverity::Warning, "{msg}");
+            assert_eq!(w.category.as_str(), "dw_autocorrelation", "{msg}");
+        }
+    }
 }
 
 /// #2041: the reader's missing-covariate warning is `data_quality` on its token,
@@ -1421,14 +1448,14 @@ fn classify_warning_roundtrips_every_engine_message() {
         ("cancelled by user", Info, "cancelled"),
         // -- gauss_newton.rs -------------------------------------------
         (
-            "Gauss-Newton: trust radius collapsed",
-            Warning,
-            "optimizer_health",
+            "Gauss-Newton: trust radius collapsed without convergence",
+            Critical,
+            "convergence",
         ),
         (
-            "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed",
-            Warning,
-            "optimizer_health",
+            "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed without convergence",
+            Critical,
+            "convergence",
         ),
         (
             "Gauss-Newton: max iterations reached without convergence",
@@ -1601,7 +1628,7 @@ fn classify_warning_roundtrips_every_engine_message() {
             "multi_start",
         ),
         (
-            "12 threads configured but only 10 subject(s)",
+            "12 threads configured (engine default) but only 10 subject(s)",
             Info,
             "threads",
         ),
@@ -4668,4 +4695,99 @@ fn time_after_dose_at_a_decision_before_every_record_is_zero() {
         0.0,
         "at the first dose: that dose's"
     );
+}
+
+/// #2799: the multi-start notes `fit()` appends to the returned run classify `(Info,
+/// MultiStart)` whatever sibling-start error text they interpolate. Each phrase below is one a
+/// Critical prose arm claims on its own (convergence, covariance failure, condition number), and
+/// the control row shows that phrase *without* the prefix still lands Critical, so the pair
+/// straddles the arm. Mutation: delete the `multi-start:` prefix arm → every prefixed row
+/// classifies Critical and this test names it.
+#[test]
+fn multi_start_notes_classify_info_whatever_error_text_they_carry() {
+    let embedded = [
+        "Outer optimizer did not converge after 3 iterations",
+        "Covariance step failed: Hessian is not positive definite",
+        "Covariance step: Hessian is not positive definite",
+        "condition number 3.2e9 exceeds 1e6",
+        "optimizer stopped without converging (Failure)",
+    ];
+    for phrase in embedded {
+        let bare = classify_warning(phrase);
+        assert_eq!(
+            bare.severity,
+            WarningSeverity::Critical,
+            "control: `{phrase}` must be Critical on its own, or this row tests nothing"
+        );
+        for msg in [
+            format!("Multi-start: 1 of 4 starts failed: start 2: {phrase}"),
+            format!("[FOCEI] Multi-start: 2 of 3 starts failed: x; {phrase}"),
+        ] {
+            let w = classify_warning(&msg);
+            assert_eq!(
+                (w.severity, w.category),
+                (WarningSeverity::Info, WarningCode::MultiStart),
+                "{msg}"
+            );
+        }
+    }
+    let best = classify_warning("Multi-start: best result from start 2/4 (OFV = 123.4560)");
+    assert_eq!(
+        (best.severity, best.category),
+        (WarningSeverity::Info, WarningCode::MultiStart)
+    );
+    // The no-run-converged note is a real verdict on the returned run and keeps its class.
+    let none = classify_warning(
+        "No multi-start run converged (4 starts); returning best OFV from start 2",
+    );
+    assert_eq!(
+        (none.severity, none.category),
+        (WarningSeverity::Critical, WarningCode::Convergence)
+    );
+}
+
+/// #2799: `FitOptions::evaluation_only_run`, the source of `FitResult::evaluation_only`. Every
+/// stage must be an evaluator: `maxiter = 0` on a method that reads it as `MAXEVAL=0` (FOCE,
+/// FOCEI, Laplace, pure GN), or a standalone `imp_eval_only` / `agq_eval_only`. SAEM, IMP,
+/// IMPMAP, Bayes, VI and the GN hybrid (fixed 100-eval polish) search regardless, so
+/// `maxiter = 0` on them is not evaluation-only; one estimating stage in a chain makes the run
+/// estimate. Mutation: widen the method list to any method → the SAEM/VI/hybrid rows; drop the
+/// `eval_only_methods` arm → the IMP/AGQ rows.
+#[test]
+fn evaluation_only_run_reads_each_estimators_own_meaning_of_maxiter_zero() {
+    use EstimationMethod::*;
+    let opts = |methods: &[EstimationMethod], maxiter: usize, imp: bool, agq: bool| FitOptions {
+        method: methods[methods.len() - 1],
+        methods: if methods.len() > 1 {
+            methods.to_vec()
+        } else {
+            Vec::new()
+        },
+        outer_maxiter: maxiter,
+        imp_eval_only: imp,
+        agq_eval_only: agq,
+        ..FitOptions::default()
+    };
+    #[rustfmt::skip]
+    let rows: Vec<(&str, FitOptions, bool)> = vec![
+        ("foce maxiter 0", opts(&[Foce], 0, false, false), true),
+        ("focei maxiter 0", opts(&[FoceI], 0, false, false), true),
+        ("laplace maxiter 0", opts(&[Laplace], 0, false, false), true),
+        ("pure gn maxiter 0", opts(&[FoceGn], 0, false, false), true),
+        ("focei maxiter 500", opts(&[FoceI], 500, false, false), false),
+        ("gn hybrid maxiter 0", opts(&[FoceGnHybrid], 0, false, false), false),
+        ("saem maxiter 0", opts(&[Saem], 0, false, false), false),
+        ("imp maxiter 0", opts(&[Imp], 0, false, false), false),
+        ("impmap maxiter 0", opts(&[Impmap], 0, false, false), false),
+        ("bayes maxiter 0", opts(&[Bayes], 0, false, false), false),
+        ("vi maxiter 0", opts(&[Vi], 0, false, false), false),
+        ("standalone imp_eval_only", opts(&[Imp], 500, true, false), true),
+        ("standalone agq_eval_only", opts(&[Laplace], 500, false, true), true),
+        ("focei then imp_eval_only", opts(&[FoceI, Imp], 500, true, false), false),
+        ("focei maxiter 0 then imp_eval_only", opts(&[FoceI, Imp], 0, true, false), true),
+        ("saem then focei, maxiter 0", opts(&[Saem, FoceI], 0, false, false), false),
+    ];
+    for (name, o, want) in rows {
+        assert_eq!(o.evaluation_only_run(), want, "{name}");
+    }
 }
