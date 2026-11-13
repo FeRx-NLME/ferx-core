@@ -2393,7 +2393,7 @@ fn dose_event_resolve_rate_repels_a_non_finite_duration_or_rate() {
     //
     // The property that makes the engines repel instead is that the resolved
     // dose's **time** is non-finite: that is what every walk's timeline guard
-    // reads (`timeline_has_non_finite` / `EventSchedule::non_finite_event_time`,
+    // reads (`times_have_non_finite` / `EventSchedule::non_finite_event_time`,
     // and `predict_concentration`'s `t_eff` guard). The `(rate, duration)` pair
     // cannot carry it — `is_real_infusion` demands both finite and positive, so
     // a non-finite pair falls to the bolus branch, which reads only `amt`.

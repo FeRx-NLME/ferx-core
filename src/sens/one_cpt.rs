@@ -35,7 +35,7 @@ pub fn one_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v: T) -> T {
 /// its parameter sensitivity through the impulse. The single-dose path passes a
 /// constant `amt` via [`one_cpt_iv_bolus_g`]; the only formula lives here.
 pub fn one_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -55,7 +55,7 @@ pub fn one_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, ka: T, f_bio: T) ->
 /// As [`one_cpt_oral_g`] but with a generic amount `amt` (issue #524). The
 /// initial-condition path passes `A₀` as a dual with `F = 1`.
 pub fn one_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, ka: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -63,12 +63,12 @@ pub fn one_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, ka: T, f_bio: T) 
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
         return c;
     }
-    if ka.val() <= 0.0 {
+    if ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return T::from_f64(0.0);
     }
     let k = cl / v;
     let d = f_bio * amt;
-    if (ka.val() - k.val()).abs() < 1e-6 {
+    if ka.br_absdiff_lt(k, 1e-6) {
         (d * ka / v) * t * (-(k * t)).exp()
     } else {
         (d * ka / (v * (ka - k))) * ((-(k * t)).exp() - (-(ka * t)).exp())
@@ -100,28 +100,32 @@ pub fn one_cpt_transit_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, n: T, mtt: T, f_
 /// flip-flop (#386), and the subject was scored against a confident zero. It returns
 /// before `convolve_1cpt`, so `mgf`'s `debug_assert` still never sees it.
 pub fn one_cpt_transit_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // A `NaN` parameter is served as `NaN` (#2134), before — and in preference to — the
     // non-physical-parameter penalty below, so a `NaN` alongside e.g. a finite `CL ≤ 0`
     // still reaches the objective.
-    if [cl, v, n, mtt].iter().any(|x| x.val().is_nan()) {
+    if [cl, v, n, mtt].iter().any(|x| x.br_is_nan()) {
         return nan_jet(cl + v + n + mtt);
     }
-    if v.val() <= 0.0 || cl.val() <= 0.0 || n.val() < 0.0 || mtt.val() <= 0.0 {
+    if v.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || cl.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || n.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
+        || mtt.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    {
         return T::from_f64(0.0);
     }
     let ke = cl / v;
     let ktr = (n + T::from_f64(1.0)) / mtt;
     // `ke = ∞/∞` is `NaN` too, served the same way.
-    if ke.val().is_nan() || ktr.val().is_nan() {
+    if ke.br_is_nan() || ktr.br_is_nan() {
         return nan_jet(ke + ktr);
     }
     // Proceed only when `ke < KTR` is *definitely* true. Written `!(ke < ktr)` rather
     // than `ke >= ktr` so nothing but a finite in-domain pair reaches `mgf`'s
     // `debug_assert` (#386).
-    if !(ke.val() < ktr.val()) {
+    if !(ke.br_cmp(crate::sens::num::BranchCmp::Lt, ktr)) {
         return T::from_f64(0.0);
     }
     let abs = TransitAbsorption { n, mtt };
@@ -148,25 +152,29 @@ pub fn one_cpt_ig_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, mat: T, cv2: T, f_bio
 /// A `NaN` `ke` or abscissa is served as `NaN` before the guard (#2134), matching
 /// [`one_cpt_transit_amt_g`].
 pub fn one_cpt_ig_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // A `NaN` parameter wins over the non-physical-parameter penalty (#2134), as in
     // `one_cpt_transit_amt_g`.
-    if [cl, v, mat, cv2].iter().any(|x| x.val().is_nan()) {
+    if [cl, v, mat, cv2].iter().any(|x| x.br_is_nan()) {
         return nan_jet(cl + v + mat + cv2);
     }
-    if v.val() <= 0.0 || cl.val() <= 0.0 || mat.val() <= 0.0 || cv2.val() <= 0.0 {
+    if v.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || cl.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || mat.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || cv2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    {
         return T::from_f64(0.0);
     }
     let ke = cl / v;
     // MGF abscissa of convergence: ke < 1/(2·MAT·CV²). A `NaN` is served as `NaN`
     // (#2134, see `one_cpt_transit_amt_g`).
     let abscissa = T::from_f64(1.0) / (T::from_f64(2.0) * mat * cv2);
-    if ke.val().is_nan() || abscissa.val().is_nan() {
+    if ke.br_is_nan() || abscissa.br_is_nan() {
         return nan_jet(ke + abscissa);
     }
-    if !(ke.val() < abscissa.val()) {
+    if !(ke.br_cmp(crate::sens::num::BranchCmp::Lt, abscissa)) {
         return T::from_f64(0.0);
     }
     let abs = IgAbsorption {
@@ -178,7 +186,7 @@ pub fn one_cpt_ig_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_b
 
 /// 1-cpt infusion (zero-order input of duration `dur`, rate `rate`).
 pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, v: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -192,7 +200,7 @@ pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, 
     let k = cl / v;
     let r_cl = T::from_f64(rate) / cl;
     let one = T::from_f64(1.0);
-    if t.val() <= dur {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Le, dur) {
         r_cl * (one - (-(k * t)).exp())
     } else {
         r_cl * (one - (-(k * T::from_f64(dur))).exp()) * (-(k * (t - T::from_f64(dur)))).exp()
@@ -213,7 +221,7 @@ pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, 
 /// `∂/∂dur` jet is exact on whichever side is selected; real observation times
 /// essentially never land exactly on `dur`.
 pub fn one_cpt_zero_order_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -221,14 +229,14 @@ pub fn one_cpt_zero_order_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
         return c;
     }
-    if dur.val() <= 0.0 {
+    if dur.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return T::from_f64(0.0);
     }
     let k = cl / v;
     let d = f_bio * T::from_f64(amt);
     let r_cl = d / (dur * cl);
     let one = T::from_f64(1.0);
-    if t.val() <= dur.val() {
+    if t.br_cmp(crate::sens::num::BranchCmp::Le, dur) {
         r_cl * (one - (-(k * t)).exp())
     } else {
         r_cl * (one - (-(k * dur)).exp()) * (-(k * (t - dur))).exp()
@@ -237,7 +245,7 @@ pub fn one_cpt_zero_order_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio
 
 /// 1-cpt IV bolus at steady state (interval `ii`).
 pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -250,7 +258,7 @@ pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> 
     }
     let k = cl / v;
     let denom = T::from_f64(1.0) - (-(k * T::from_f64(ii))).exp();
-    if denom.val() <= 0.0 {
+    if denom.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return T::from_f64(0.0);
     }
     (T::from_f64(amt) / v) * (-(k * t)).exp() / denom
@@ -258,7 +266,7 @@ pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> 
 
 /// 1-cpt oral at steady state (interval `ii`), with the `KA ≈ k` L'Hôpital limit.
 pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -266,16 +274,16 @@ pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, 
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
         return c;
     }
-    if ka.val() <= 0.0 || ii <= 0.0 {
+    if ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) || ii <= 0.0 {
         return T::from_f64(0.0);
     }
     let k = cl / v;
     let d = f_bio * T::from_f64(amt);
-    if (ka.val() - k.val()).abs() < 1e-6 {
+    if ka.br_absdiff_lt(k, 1e-6) {
         // Σ_{n≥0} (τ+nII)·e^{-k(τ+nII)} = e^{-kτ}·[τ/(1-x) + II·x/(1-x)²], x=e^{-kII}.
         let x = (-(k * T::from_f64(ii))).exp();
         let omx = T::from_f64(1.0) - x;
-        if omx.val() <= 0.0 {
+        if omx.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
             return T::from_f64(0.0);
         }
         let s = t / omx + (x * T::from_f64(ii)) / (omx * omx);
@@ -283,7 +291,9 @@ pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, 
     } else {
         let denom_k = T::from_f64(1.0) - (-(k * T::from_f64(ii))).exp();
         let denom_ka = T::from_f64(1.0) - (-(ka * T::from_f64(ii))).exp();
-        if denom_k.val() <= 0.0 || denom_ka.val() <= 0.0 {
+        if denom_k.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+            || denom_ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        {
             return T::from_f64(0.0);
         }
         (d * ka / (v * (ka - k))) * ((-(k * t)).exp() / denom_k - (-(ka * t)).exp() / denom_ka)
@@ -303,7 +313,7 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     cl: T,
     v: T,
 ) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -319,7 +329,7 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     }
     let k = cl / v;
     let denom = T::from_f64(1.0) - (-(k * T::from_f64(ii))).exp();
-    if denom.val() <= 0.0 {
+    if denom.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return T::from_f64(0.0);
     }
     let r_over_cl = T::from_f64(rate) / cl;
@@ -339,7 +349,7 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     }
     // Past pulses (n ≥ 1) are always "after-infusion".
     let past = r_over_cl * one_minus_e_kt_inf * (-(k * (t + T::from_f64(ii - dur)))).exp() / denom;
-    if t.val() <= dur {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Le, dur) {
         r_over_cl * (T::from_f64(1.0) - (-(k * t)).exp()) + past
     } else {
         r_over_cl * one_minus_e_kt_inf * (-(k * (t - T::from_f64(dur)))).exp() / denom
@@ -371,7 +381,7 @@ pub fn one_cpt_conc_g<T: PkNum>(
     // `pk::single_dose_concentration` does: a degenerate `CL`/`V` drops the dose (0 even
     // when `F` is `NaN` or infinite, which the post-multiply below would turn `NaN`), a
     // `NaN` one serves `NaN`. Before arrival the leaf kernels read 0.
-    if t.val() >= 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
         if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
             return c;
         }

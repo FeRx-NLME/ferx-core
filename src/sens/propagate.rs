@@ -93,13 +93,30 @@ pub(crate) fn superposed_dose_override(cl: f64, v: f64) -> Option<f64> {
 /// curvature `H̃` factor, and the subject's `NaN` objective escapes the `1e20` repel (#2134).
 #[inline]
 pub(crate) fn dose_override_g<T: PkNum>(cl: T, v: T) -> Option<T> {
-    superposed_dose_override(cl.val(), v.val()).map(|c| {
+    // `superposed_dose_override` through the branch API (#2786), test for test.
+    let c = if cl_or_v_degenerate_g(cl, v) {
+        Some(0.0)
+    } else if cl.br_is_nan() || v.br_is_nan() {
+        Some(f64::NAN)
+    } else {
+        None
+    };
+    c.map(|c| {
         if c.is_nan() {
             crate::sens::one_cpt::nan_jet(cl * v)
         } else {
             T::from_f64(c)
         }
     })
+}
+
+/// [`cl_or_v_degenerate`] on the values, through the branch API (#2786): a recording type
+/// checks each comparison it takes instead of baking the decision in.
+#[inline]
+pub(crate) fn cl_or_v_degenerate_g<T: PkNum>(cl: T, v: T) -> bool {
+    use crate::sens::num::BranchCmp as B;
+    let bad = |x: T| x.br_cmp_c(B::Le, 0.0) || x.br_cmp_c(B::Eq, f64::INFINITY);
+    bad(cl) || bad(v)
 }
 
 /// The walk's half of [`cl_or_v_degenerate`], applied ahead of every propagation step:
@@ -119,13 +136,14 @@ pub(crate) fn dose_override_g<T: PkNum>(cl: T, v: T) -> Option<T> {
 /// cached-eigendata arms — goes through this one function.
 #[inline]
 pub(crate) fn skip_step_on_cl_v<T: PkNum>(state: &mut [T], cl: T, v: T, rates: &[T]) -> bool {
-    if cl_or_v_degenerate(cl.val(), v.val()) {
+    use crate::sens::num::BranchCmp as B;
+    if cl_or_v_degenerate_g(cl, v) {
         for a in state.iter_mut() {
             *a = T::from_f64(0.0);
         }
         return true;
     }
-    (cl.val().is_nan() || v.val().is_nan()) && state.iter().chain(rates).all(|a| a.val() == 0.0)
+    (cl.br_is_nan() || v.br_is_nan()) && state.iter().chain(rates).all(|a| a.br_cmp_c(B::Eq, 0.0))
 }
 
 /// 1-cpt IV/central propagator: evolve `state[0]` (central amount) over `dt` with
@@ -156,7 +174,9 @@ pub fn propagate_one_cpt_oral_g<T: PkNum>(
     rate_central: T,
     rate_depot: T,
 ) {
-    if skip_step_on_cl_v(state, cl, v, &[rate_central, rate_depot]) || ka.val() <= 0.0 {
+    if skip_step_on_cl_v(state, cl, v, &[rate_central, rate_depot])
+        || ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    {
         return;
     }
     let ke = cl / v;
@@ -166,7 +186,7 @@ pub fn propagate_one_cpt_oral_g<T: PkNum>(
     let e_ke = (-(ke * dtt)).exp();
     let a_d_0 = state[0];
     let a_c_0 = state[1];
-    let near = (ka.val() - ke.val()).abs() < 1e-9;
+    let near = ka.br_absdiff_lt(ke, 1e-9);
 
     // Depot decays exponentially (decoupled).
     state[0] = a_d_0 * e_ka;
@@ -233,7 +253,10 @@ pub struct TwoCptEigen<T: PkNum> {
 /// + eigenvalue solve). `None` ⇒ callers skip propagation, matching the old f64
 /// propagators' early return.
 pub fn two_cpt_eigen_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> Option<TwoCptEigen<T>> {
-    if cl_or_v_degenerate(cl.val(), v1.val()) || v2.val() <= 0.0 || q.val() <= 0.0 {
+    if cl_or_v_degenerate(cl.val(), v1.val())
+        || v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || q.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    {
         return None;
     }
     let (alpha, beta, k21) = crate::sens::two_cpt::macro_rates_g(cl, v1, q, v2);
@@ -260,7 +283,7 @@ pub fn propagate_two_cpt_core_g<T: PkNum>(
     let dtt = dt;
 
     let denom_ss = k21 * k10;
-    let (a_ss_1, a_ss_2) = if denom_ss.val() > 1e-30 {
+    let (a_ss_1, a_ss_2) = if denom_ss.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1e-30) {
         (
             (k21 * rate_central + k21 * rate_periph) / denom_ss,
             (k12 * rate_central + (k10 + k12) * rate_periph) / denom_ss,
@@ -273,9 +296,9 @@ pub fn propagate_two_cpt_core_g<T: PkNum>(
     let h2_0 = state[1] - a_ss_2;
 
     let denom = beta - alpha;
-    let (c1, c2) = if k12.val().abs() < 1e-30 {
+    let (c1, c2) = if k12.br_abs_lt(1e-30) {
         (T::from_f64(0.0), T::from_f64(0.0))
-    } else if denom.val().abs() < 1e-30 {
+    } else if denom.br_abs_lt(1e-30) {
         let s_homog = h2_0 / k12;
         (s_homog * T::from_f64(0.5), s_homog * T::from_f64(0.5))
     } else {
@@ -348,7 +371,7 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     state[0] = a_d_0 * e_ka;
 
     let denom_depot = (ka - alpha) * (ka - beta);
-    let (cap_a, cap_b) = if denom_depot.val().abs() < 1e-12 {
+    let (cap_a, cap_b) = if denom_depot.br_abs_lt(1e-12) {
         (T::from_f64(0.0), T::from_f64(0.0))
     } else {
         let a = ka * a_d_0 * (k21 - ka) / denom_depot;
@@ -360,8 +383,8 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     let h_p_0 = a_p_0 - cap_b;
 
     let denom = beta - alpha;
-    let (c1, c2) = if k12.val().abs() < 1e-30 || denom.val().abs() < 1e-30 {
-        let kk = if k12.val().abs() < 1e-30 {
+    let (c1, c2) = if k12.br_abs_lt(1e-30) || denom.br_abs_lt(1e-30) {
+        let kk = if k12.br_abs_lt(1e-30) {
             T::from_f64(1e-30)
         } else {
             k12
@@ -394,7 +417,9 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     // `rate_*` are structurally 0 or positive (never crossing during
     // differentiation), so the `.val()` guards are derivative-safe and just skip
     // the no-infusion intervals.
-    if rate_central.val() > 0.0 || rate_periph1.val() > 0.0 {
+    if rate_central.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
+        || rate_periph1.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
+    {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0)];
         propagate_two_cpt_core_g(&mut inflow, dt, e, rate_central, rate_periph1);
         state[1] = state[1] + inflow[0];
@@ -407,9 +432,9 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     // depot_ss = R/ka). `e^{A·dt}·x_ss` is this propagator's homogeneous evolution,
     // obtained by recursing once with zero rates (the `.val()` guard bounds the
     // recursion to depth 1 and is derivative-safe).
-    if rate_depot.val() > 0.0 {
+    if rate_depot.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
         let denom_ss = k21 * k10;
-        let (c_ss, p_ss) = if denom_ss.val() > 1e-30 {
+        let (c_ss, p_ss) = if denom_ss.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1e-30) {
             (rate_depot / k10, k12 * rate_depot / denom_ss)
         } else {
             (T::from_f64(0.0), T::from_f64(0.0))
@@ -446,7 +471,7 @@ pub fn propagate_two_cpt_oral_g<T: PkNum>(
     rate_depot: T,
 ) {
     if skip_step_on_cl_v(state, cl, v1, &[rate_central, rate_periph1, rate_depot])
-        || ka.val() <= 0.0
+        || ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
     {
         return;
     }
@@ -499,11 +524,11 @@ pub fn three_cpt_eigen_g<T: PkNum>(
     q3: T,
     v3: T,
 ) -> Option<ThreeCptEigen<T>> {
-    if cl_or_v_degenerate(cl.val(), v1.val())
-        || v2.val() <= 0.0
-        || q2.val() <= 0.0
-        || v3.val() <= 0.0
-        || q3.val() <= 0.0
+    if cl_or_v_degenerate_g(cl, v1)
+        || v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || q2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || v3.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || q3.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
     {
         return None;
     }
@@ -547,7 +572,7 @@ fn build_three_cpt_mode_g<T: PkNum>(mu: T, k12: T, k13: T, k21: T, k31: T) -> Th
 
 #[inline]
 fn apply_three_cpt_mode_g<T: PkNum>(m: &ThreeCptModeG<T>, c: T, p1: T, p2: T, dt: T) -> (T, T, T) {
-    if m.norm.val().abs() < 1e-30 {
+    if m.norm.br_abs_lt(1e-30) {
         return (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0));
     }
     let proj = m.w[0] * c + m.w[1] * p1 + m.w[2] * p2;
@@ -649,7 +674,7 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     let denom_depot = (ka - alpha) * (ka - beta) * (ka - gamma);
     let d21 = k21 - ka;
     let d31 = k31 - ka;
-    let (cap_a, cap_b, cap_c) = if denom_depot.val().abs() < 1e-12 {
+    let (cap_a, cap_b, cap_c) = if denom_depot.br_abs_lt(1e-12) {
         (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0))
     } else {
         let scale = -(ka * a_d_0) / denom_depot;
@@ -675,7 +700,10 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     // three-state system an IV model has — the oral peripherals reuse the IV
     // closed form rather than needing a new one. `.val()` guards are
     // derivative-safe (each rate is structurally 0 or positive).
-    if rate_central.val() > 0.0 || rate_periph1.val() > 0.0 || rate_periph2.val() > 0.0 {
+    if rate_central.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
+        || rate_periph1.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
+        || rate_periph2.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
+    {
         let mut inflow = [T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0)];
         propagate_three_cpt_core_g(&mut inflow, dt, e, rate_central, rate_periph1, rate_periph2);
         state[1] = state[1] + inflow[0];
@@ -688,8 +716,11 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     // and delivers R into central (central_ss = R/k10, p1_ss = k12·R/(k21·k10),
     // p2_ss = k13·R/(k31·k10)); the homogeneous evolution is obtained by recursing
     // once with zero rates (the guard bounds it to depth 1).
-    if rate_depot.val() > 0.0 {
-        let (c_ss, p1_ss, p2_ss) = if k10.val() > 1e-30 && k21.val() > 1e-30 && k31.val() > 1e-30 {
+    if rate_depot.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
+        let (c_ss, p1_ss, p2_ss) = if k10.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1e-30)
+            && k21.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1e-30)
+            && k31.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1e-30)
+        {
             (
                 rate_depot / k10,
                 k12 * rate_depot / (k21 * k10),
@@ -739,7 +770,7 @@ pub fn propagate_three_cpt_oral_g<T: PkNum>(
         cl,
         v1,
         &[rate_central, rate_periph1, rate_periph2, rate_depot],
-    ) || ka.val() <= 0.0
+    ) || ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
     {
         return;
     }
@@ -1487,7 +1518,7 @@ fn ss_bolus_state_at_phase_g<T: PkNum>(
     // propagate the PK system backward.
     let phase = T::from_f64(dose.ii) - lag;
     state[cmt_idx] = state[cmt_idx] + pk.f * T::from_f64(dose.amt);
-    if phase.val() > 0.0 {
+    if phase.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
         apply_step_g(
             &mut state,
             phase,
@@ -1539,13 +1570,14 @@ pub(crate) fn observe_central_g<T: PkNum>(
     v: T,
     dosed: bool,
 ) -> T {
-    if cl_or_v_degenerate(cl.val(), v.val()) {
+    use crate::sens::num::BranchCmp as B;
+    if cl_or_v_degenerate_g(cl, v) {
         return T::from_f64(0.0);
     }
-    if cl.val().is_nan() || v.val().is_nan() {
+    if cl.br_is_nan() || v.br_is_nan() {
         // `!= 0.0` is true for a `NaN` amount, which is then kept either way.
         // Through `nan_jet`, not a bare `NaN`: see `dose_override_g`.
-        return if dosed || read.iter().any(|a| a.val() != 0.0) {
+        return if dosed || read.iter().any(|a| a.br_cmp_c(B::Ne, 0.0)) {
             crate::sens::one_cpt::nan_jet(cl * v)
         } else {
             T::from_f64(0.0)
@@ -1553,7 +1585,7 @@ pub(crate) fn observe_central_g<T: PkNum>(
     }
     let conc = read[central_slot] / v;
     // `<` is false for a `NaN`, which therefore passes through.
-    if conc.val() < 0.0 {
+    if conc.br_cmp_c(B::Lt, 0.0) {
         T::from_f64(0.0)
     } else {
         conc
@@ -1631,6 +1663,27 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     }
     let (n_states, central_slot) = state_layout_g(pk_model);
 
+    // A recording keeps the schedule's order, which the lagged arrival times decide: each
+    // adjacent pair's relation (earlier, or tied) is a guard on the recorded times (#2786).
+    if T::RECORDS_BRANCHES && !dose_lag_dual.is_empty() {
+        use crate::sens::num::BranchCmp as B;
+        let at = |ev: &crate::pk::event_driven::Event| -> (T, f64) {
+            match ev.kind {
+                EventKind::Dose => {
+                    let lag = dose_lag_dual[ev.orig_idx];
+                    (T::from_f64(eff_doses[ev.orig_idx].time) + lag, ev.time)
+                }
+                _ => (T::from_f64(ev.time), ev.time),
+            }
+        };
+        for w in schedule.events.windows(2) {
+            let ((a, av), (b, bv)) = (at(&w[0]), at(&w[1]));
+            let cc = if av < bv { B::Lt } else { B::Eq };
+            if !a.br_cmp(cc, b) {
+                return preds;
+            }
+        }
+    }
     let mut state = vec![T::from_f64(0.0); n_states];
     let mut cur_t = schedule.events[0].time;
     let mut reset_floor = f64::NEG_INFINITY;
@@ -1648,6 +1701,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     });
 
     for (i, ev) in schedule.events.iter().enumerate() {
+        T::chunk_mark();
         if ev.kind == EventKind::Reset {
             state.iter_mut().for_each(|s| *s = T::from_f64(0.0));
             cur_t = ev.time;

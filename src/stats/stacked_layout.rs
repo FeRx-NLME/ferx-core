@@ -109,6 +109,22 @@ pub(crate) struct StackedLayout {
     nested: Option<NestedLayout>,
 }
 
+impl StackedLayout {
+    /// The layout's structure, hashed (never `0`): the key a compiled plan recorded under it
+    /// is filed by (#2786).
+    pub(crate) fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (self.n_eta, self.n_kappa).hash(&mut h);
+        self.groups.hash(&mut h);
+        self.nested.is_some().hash(&mut h);
+        if let Some(n) = &self.nested {
+            format!("{n:?}").hash(&mut h);
+        }
+        h.finish() | 1
+    }
+}
+
 /// An occasion → group map as a label-sorted list (labels are unique keys).
 fn sorted_occasions(map: &HashMap<u32, usize>) -> Vec<(u32, usize)> {
     let mut v: Vec<(u32, usize)> = map.iter().map(|(&o, &g)| (o, g)).collect();

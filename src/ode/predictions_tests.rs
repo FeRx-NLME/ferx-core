@@ -6764,7 +6764,7 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         &f_bio_d,
         // No `SS=1` record in these doses and no EVID=3/4 reset.
         ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
-        t,
+        D::from_f64(t),
         &mut dyd,
     );
     assert_relative_eq!(dyd[0].val(), fr1 * r1 + fr2 * r2, max_relative = 1e-12);
@@ -11541,7 +11541,7 @@ mod break_collision_1186 {
     /// no panic, and every prediction `NaN`.
     ///
     /// Mutation — restore `partial_cmp(..).unwrap()` → panic; delete the
-    /// `timeline_has_non_finite` guard → finite predictions and the assert below fires.
+    /// `times_have_non_finite` guard → finite predictions and the assert below fires.
     #[test]
     fn non_finite_lag_yields_non_finite_subject_not_panic() {
         let ode = spec();
@@ -11581,7 +11581,7 @@ mod break_collision_1186 {
     /// that fired unconditionally would pass.
     ///
     /// Mutation (run): revert any one engine's `abandon_non_finite_timeline` to the bare
-    /// `timeline_has_non_finite` → that engine's arm fires by name and the other three stay
+    /// `times_have_non_finite` → that engine's arm fires by name and the other three stay
     /// green.
     #[test]
     fn every_dense_engine_records_its_own_abandoned_walk() {
@@ -11682,12 +11682,12 @@ mod break_collision_1186 {
     /// .unwrap_or(Ordering::Equal)`, the spelling elsewhere in the codebase *as* the
     /// NaN-safe fix, is not a total order either, and `sort_by` panics when it detects
     /// one — but that detection is opportunistic (see
-    /// [`timeline_has_non_finite`](crate::ode::predictions::timeline_has_non_finite) for
+    /// [`times_have_non_finite`](crate::ode::predictions::times_have_non_finite) for
     /// the measurement), so it cannot be relied on as a test signal. What this asserts is
     /// therefore the *outcome*: no panic, and a non-finite subject on every engine.
     ///
     /// Mutations (run): restore `partial_cmp(..).unwrap()` on the objective builder →
-    /// panic; drop the objective's `timeline_has_non_finite` guard → finite predictions
+    /// panic; drop the objective's `times_have_non_finite` guard → finite predictions
     /// and the assert below fires.
     #[test]
     fn timeline_sort_never_panics_on_nan() {
@@ -13357,7 +13357,7 @@ fn ss_monotone_run_in_anchor_is_the_same_with_an_empty_lag_slice() {
 /// dose time must record nothing, so this cannot pass on a counter that fires on every run.
 ///
 /// Mutation: delete the record at `ode_predictions_adaptive_impl`'s guard (route it through
-/// the bare `timeline_has_non_finite` again) → the abandoned arm reads 0 and the first
+/// the bare `times_have_non_finite` again) → the abandoned arm reads 0 and the first
 /// assert fires naming the driver; no other test in the tree moves.
 #[test]
 fn the_adaptive_driver_records_an_abandoned_walk() {
@@ -13510,7 +13510,7 @@ fn the_adaptive_frozen_replay_records_an_abandoned_walk() {
 
 /// **The pairing is structural, not conventional (#1234 §5).**
 ///
-/// `timeline_has_non_finite` / `times_have_non_finite` decide *whether* a walk is abandoned;
+/// `times_have_non_finite` / `times_have_non_finite` decide *whether* a walk is abandoned;
 /// [`abandon_non_finite_timeline`](crate::ode::predictions::abandon_non_finite_timeline) also
 /// *records* it. Nothing in the type system stops a ninth guard from taking the bare
 /// predicate — it would compile, run, and silently put the diagnostic back to `0/0/0` for
@@ -13521,7 +13521,7 @@ fn the_adaptive_frozen_replay_records_an_abandoned_walk() {
 /// this lists both rather than allowing a directory:
 ///
 /// * `src/ode/predictions.rs` — twice, and both inside the shared helpers themselves
-///   (`timeline_has_non_finite`'s one-line body, and `abandon_non_finite_timeline`'s test).
+///   (`times_have_non_finite`'s one-line body, and `abandon_non_finite_timeline`'s test).
 ///   A third would be a guard that bypassed the recorder.
 /// * `src/sens/ode_provider.rs` — twice, the two analytic-sensitivity walks, which carry the
 ///   same predicate and deliberately do **not** record: their sweep is collected in a
@@ -13533,7 +13533,7 @@ fn the_adaptive_frozen_replay_records_an_abandoned_walk() {
 /// exclusion cannot quietly widen or vanish.
 ///
 /// Mutation (run): revert any one of the eight engine guards to
-/// `timeline_has_non_finite(&break_times)` → `src/ode/predictions.rs` reads 3 and this fires
+/// `times_have_non_finite(&break_times)` → `src/ode/predictions.rs` reads 3 and this fires
 /// naming the file. Adding a bare call in a new file fires with that file named.
 #[test]
 fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
@@ -13574,7 +13574,7 @@ fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
             // Comments are where these names legitimately appear everywhere — the guards'
             // own prose, the mutation notes, the field doc. Only code counts.
             let code = line.split("//").next().unwrap_or("");
-            for name in ["timeline_has_non_finite", "times_have_non_finite"] {
+            for name in ["times_have_non_finite"] {
                 // `fn <name>(` is the definition, not a call.
                 let defined = code.contains(&format!("fn {name}("));
                 if code.contains(&format!("{name}(")) && !defined {
@@ -13588,13 +13588,13 @@ fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
     // Non-degeneracy: a rename that made the scan match nothing would otherwise pass.
     assert_eq!(
         seen_name.len(),
-        2,
-        "both predicate names must still be called somewhere, or this test is scanning for \
-         strings that no longer exist: {seen_name:?}"
+        1,
+        "the predicate must still be called somewhere, or this test is scanning for a \
+         string that no longer exists: {seen_name:?}"
     );
 
     let expected: BTreeMap<String, usize> = [
-        ("src/ode/predictions.rs".to_string(), 2),
+        ("src/ode/predictions.rs".to_string(), 1),
         ("src/sens/ode_provider.rs".to_string(), 2),
     ]
     .into_iter()

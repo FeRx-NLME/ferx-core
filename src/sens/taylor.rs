@@ -48,53 +48,14 @@ pub(crate) const fn mul_len(p: usize, ord: usize) -> usize {
 /// The monomial structure of one `(P, ORD)`.
 pub(crate) struct Table {
     /// Exponent vector of each monomial (`P` entries each), graded order; index 0 is `1`.
+    #[cfg(test)]
     pub(crate) exps: Vec<Vec<u8>>,
     /// Total degree of each monomial.
     pub(crate) deg: Vec<u8>,
     /// `(i, j, k)`: monomial `i` times monomial `j` is monomial `k` (degree ≤ `ORD`).
     pub(crate) mul: Vec<(u16, u16, u16)>,
-    /// For each monomial of degree ≥ 1: `(β, v)` with `α = β + e_v` (`β` earlier).
-    pub(crate) parent: Vec<(u16, u8)>,
     /// The index of `e_v`, the first-degree monomial of each variable.
     pub(crate) var: Vec<u16>,
-    /// [`LiveBasis`] of each live count `n ≤ P`, built on first use.
-    live: Vec<OnceLock<LiveBasis>>,
-}
-
-/// The monomials of degree ≥ 1 that read only the first `n` variables, in the table's order,
-/// with each one's parent in that same compact numbering (#2549): what an evaluation of the
-/// polynomial on `n` live directions needs, computed once per `(table, n)` instead of on
-/// every call.
-pub(crate) struct LiveBasis {
-    /// Table index of each kept monomial.
-    pub(crate) idx: Vec<usize>,
-    /// `(b, v)`: kept monomial `j` is `δp_v` when `b == 0`, else kept monomial `b − 1`
-    /// times `δp_v`.
-    pub(crate) parent: Vec<(usize, usize)>,
-}
-
-impl Table {
-    /// [`LiveBasis`] for `n` live directions.
-    pub(crate) fn live(&self, n: usize) -> &LiveBasis {
-        self.live[n].get_or_init(|| {
-            let keep = |k: usize| self.exps[k].iter().skip(n).all(|&x| x == 0);
-            let idx: Vec<usize> = (1..self.exps.len()).filter(|&k| keep(k)).collect();
-            let mut compact = vec![usize::MAX; self.exps.len()];
-            for (j, &k) in idx.iter().enumerate() {
-                compact[k] = j;
-            }
-            let parent = idx
-                .iter()
-                .map(|&k| {
-                    let (b, v) = self.parent[k];
-                    // A kept monomial's parent reads a subset of its variables: kept too.
-                    let b = if b == 0 { 0 } else { compact[b as usize] + 1 };
-                    (b, v as usize)
-                })
-                .collect();
-            LiveBasis { idx, parent }
-        })
-    }
 }
 
 const MAX_P: usize = 12;
@@ -147,13 +108,6 @@ fn build(p: usize, ord: usize) -> Table {
             mul.push((i as u16, j as u16, index[&s]));
         }
     }
-    let mut parent = vec![(0u16, 0u8); exps.len()];
-    for (k, e) in exps.iter().enumerate().skip(1) {
-        let v = e.iter().position(|&x| x > 0).expect("degree ≥ 1");
-        let mut b = e.clone();
-        b[v] -= 1;
-        parent[k] = (index[&b], v as u8);
-    }
     let var = (0..p)
         .map(|v| {
             let mut e = vec![0u8; p];
@@ -162,11 +116,10 @@ fn build(p: usize, ord: usize) -> Table {
         })
         .collect();
     Table {
-        live: (0..=p).map(|_| OnceLock::new()).collect(),
+        #[cfg(test)]
         exps,
         deg,
         mul,
-        parent,
         var,
     }
 }

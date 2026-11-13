@@ -323,7 +323,7 @@ impl DoseEvent {
     /// A `NaN` `time` instead lands where every engine already looks. It is the
     /// same shape a `NaN` `ALAG` produces (`dose.time + lag`), so the #1189
     /// machinery absorbs it unchanged: each walk pushes `d.time` onto its
-    /// timeline, [`crate::ode::predictions::timeline_has_non_finite`] /
+    /// timeline, [`crate::ode::predictions::times_have_non_finite`] /
     /// `EventSchedule::non_finite_event_time` sees it, and the subject comes
     /// back `NaN` — which the estimation guards already read as a diverged solve
     /// and the optimizer as a wall. One repulsion channel for every non-finite

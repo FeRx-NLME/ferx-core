@@ -1811,197 +1811,6 @@ fn detect_covariate_mu_refs(
         .collect()
 }
 
-/// The mu-scale channels through which some thetas reach the predictions — what lets the
-/// adjoint gradient record those thetas as constants (#2706).
-///
-/// A **channel** is a top-level `[individual_parameters]` assignment `P = g⁻¹(g(A) + η_j)`
-/// in one of the covariate mu-reference shapes ([`split_typical_and_eta`], one or more
-/// thetas), whose typical value `A` reads thetas, covariates and literals only, whose name is
-/// assigned nowhere else, and whose BSV `η_j` nothing else reads — no other right-hand side
-/// ([`eta_read_outside_the_group`]) and no other block. A theta is **carried** when the
-/// channels are the only route by which it reaches the likelihood: some channel reads it,
-/// and its taint, stopped at every channel ([`thetas_read_outside_the_group`]), reaches no
-/// other block.
-///
-/// Then the predictions depend on a carried `θ_m` and on `η_j` only through
-/// `u_j = g(A_j) + η_j` (with `A_j` subject-constant when its covariates are), so every
-/// derivative order in `θ_m` is read off the `η` ones:
-/// `∂/∂θ_m = Σ_j (∂g(A_j)/∂θ_m) ∂/∂η_j`. `None` unless **every** theta the likelihood reads
-/// is carried: one left on the tape keeps the solve taped, and the reduction would only add
-/// work (measured +2.2% on a 2-cpt model whose `Q = TVQ` has no random effect).
-fn detect_theta_channels(
-    stmts: &[Statement],
-    theta_names: &[String],
-    eta_names: &[String],
-    n_bsv_eta: usize,
-    outside_idents: &HashSet<String>,
-) -> Option<ThetaChannels> {
-    let stripped = strip_link_offsets(stmts, n_bsv_eta);
-    let stmts = &stripped[..];
-    let mut counts = HashMap::new();
-    count_all_assignments(stmts, &mut counts);
-    let mut scope = InlineScope::new(stmts);
-    // (statement, η, parameter name, thetas read, covariates read)
-    let mut found: Vec<(&Statement, usize, String, Vec<usize>, Vec<String>)> = Vec::new();
-    for (si, s) in stmts.iter().enumerate() {
-        let Statement::Assign(name, raw) = s else {
-            continue;
-        };
-        if counts.get(name.as_str()).copied() == Some(1) {
-            let view = scope.view(si, raw);
-            if let Some((eta_idx, entry)) =
-                classify_typical_value(view, theta_names, eta_names, n_bsv_eta, |n| n >= 1)
-            {
-                let exclusive = !outside_idents.contains(&eta_names[eta_idx].to_ascii_uppercase())
-                    && !eta_read_outside_the_group(stmts, OwnerOf::Statement(s), eta_idx);
-                if exclusive {
-                    let thetas = entry
-                        .theta_names
-                        .iter()
-                        .filter_map(|t| theta_names.iter().position(|n| n == t))
-                        .collect();
-                    found.push((s, eta_idx, name.clone(), thetas, entry.covariate_names));
-                }
-            }
-        }
-        scope.record(si, name, raw);
-    }
-    let owners: Vec<&Statement> = found.iter().map(|f| f.0).collect();
-    let carried: Vec<bool> = (0..theta_names.len())
-        .map(|t| {
-            found.iter().any(|f| f.3.contains(&t))
-                && thetas_read_outside_the_group(
-                    stmts,
-                    theta_names,
-                    outside_idents,
-                    &owners,
-                    std::slice::from_ref(&theta_names[t]),
-                )
-                .is_empty()
-        })
-        .collect();
-    let channels: Vec<ThetaChannel> = found
-        .into_iter()
-        .filter(|f| f.3.iter().any(|&t| carried[t]))
-        .map(|(_, eta_idx, param, _, covariates)| ThetaChannel {
-            eta_idx,
-            param,
-            covariates,
-        })
-        .collect();
-    // Whether every theta the likelihood reads is carried: a theta the channels do not
-    // carry stays a tape leaf, and since the solve reads every parameter it keeps the whole
-    // recording taped, so a partial reduction only adds work.
-    let complete = (0..theta_names.len()).all(|t| {
-        carried[t] || {
-            let mut reads = outside_idents.contains(&theta_names[t].to_ascii_uppercase());
-            let mut tainted = HashSet::new();
-            spread_theta_taint(stmts, t, &[], &mut tainted);
-            reads |= !tainted.is_empty();
-            !reads
-        }
-    });
-    (complete && !channels.is_empty()).then_some(ThetaChannels { channels, carried })
-}
-
-/// `stmts` with every **link offset** dropped, for [`detect_theta_channels`] alone: inside
-/// an `exp(…)` whose argument sums exactly one bare BSV η with other terms, a term that
-/// reads a κ and nothing but κs, covariates and literals. Such a term moves `u_j` by an
-/// amount independent of θ and of `η_j`, so the channel identity holds with it in place;
-/// dropping it lets the shape match see `exp(ETA + KAPPA / sqrt(W))` (the weighted-κ
-/// rewrite, #1031) as the `exp(ETA + KAPPA)` it scales. The shared mu-reference shapes are
-/// left as they are, since SAEM's groups read them too. What a dropped term reads (κ,
-/// covariates) is nothing the θ and η exclusivity walks look at, so they are unchanged.
-fn strip_link_offsets(stmts: &[Statement], n_bsv: usize) -> Vec<Statement> {
-    let offset = |e: &Expression| {
-        let (mut kappa, mut other) = (false, false);
-        visit_expr_nodes(e, &mut |n| match n {
-            Expression::Eta(i) if *i >= n_bsv => kappa = true,
-            Expression::Literal(_)
-            | Expression::Covariate(_)
-            | Expression::BinOp(..)
-            | Expression::UnaryFn(..)
-            | Expression::Power(..) => {}
-            _ => other = true,
-        });
-        kappa && !other
-    };
-    let strip = |e: &mut Expression| {
-        visit_expr_nodes_mut(e, &mut |n| {
-            let Expression::UnaryFn(f, arg) = n else {
-                return;
-            };
-            if f != "exp" {
-                return;
-            }
-            let mut ts: Vec<&Expression> = Vec::new();
-            flatten_chain(&**arg, BinOp::Add, true, &mut ts);
-            let bare = ts
-                .iter()
-                .filter(|t| matches!(t, Expression::Eta(i) if *i < n_bsv))
-                .count();
-            let drop: Vec<bool> = ts.iter().map(|t| offset(t)).collect();
-            if bare != 1 || !drop.contains(&true) {
-                return;
-            }
-            let kept: Vec<Expression> = ts
-                .iter()
-                .zip(&drop)
-                .filter(|(_, d)| !**d)
-                .map(|(t, _)| (*t).clone())
-                .collect();
-            let mut it = kept.into_iter();
-            let first = it.next().expect("the bare η is kept");
-            **arg = it.fold(first, |a, t| {
-                Expression::BinOp(Box::new(a), BinOp::Add, Box::new(t))
-            });
-        });
-    };
-    fn walk(stmts: &[Statement], strip: &dyn Fn(&mut Expression)) -> Vec<Statement> {
-        stmts
-            .iter()
-            .map(|s| match s {
-                Statement::Assign(name, e) => {
-                    let mut e = e.clone();
-                    strip(&mut e);
-                    Statement::Assign(name.clone(), e)
-                }
-                Statement::If {
-                    branches,
-                    else_body,
-                } => Statement::If {
-                    branches: branches
-                        .iter()
-                        .map(|(c, b)| (c.clone(), walk(b, strip)))
-                        .collect(),
-                    else_body: else_body.as_ref().map(|b| walk(b, strip)),
-                },
-                other => other.clone(),
-            })
-            .collect()
-    }
-    walk(stmts, &strip)
-}
-
-/// One mu-scale channel of [`ThetaChannels`]: the individual parameter (a top-level name,
-/// so its var slot is its index in `indiv_param_names`), its exclusive BSV η, and the covariates its typical value reads (a
-/// subject on which any of them varies is not served: `A_j` would move with time).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ThetaChannel {
-    pub(crate) eta_idx: usize,
-    pub(crate) param: String,
-    pub(crate) covariates: Vec<String>,
-}
-
-/// The thetas that reach the likelihood only through mu-scale channels, and the channels
-/// ([`detect_theta_channels`]).
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ThetaChannels {
-    pub(crate) channels: Vec<ThetaChannel>,
-    /// Per theta (declaration order): carried by the channels alone.
-    pub(crate) carried: Vec<bool>,
-}
-
 /// Drop every group an assignment to `name` supersedes.
 ///
 /// A group is keyed on the eta it carries, so recording is a
@@ -4419,6 +4228,9 @@ pub fn parse_full_model_with(
     content: &str,
     bindings: &ParseBindings,
 ) -> Result<ParsedModel, String> {
+    // A new model may be built where a dropped one lived: no compiled plan of the old one
+    // may serve it (#2786).
+    crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
     let level_bindings = &bindings.levels;
     let mut extracted = extract_blocks(content)?;
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
@@ -6125,34 +5937,6 @@ pub fn parse_full_model_with(
     // What the closed-form log-normal sensitivity fallback needs, measured on
     // the statements rather than read off the labels above (#1669 review).
     indiv_param_partials.mu_ref_owners = mu_ref_owners;
-    // The names the engine reads without any other block spelling them — the dose
-    // attributes (`F`/`LAGTIME` by their routed slot, `F{n}`/`ALAG{n}`/`LAGTIME{n}`/`D{n}`/
-    // `R{n}` by name) and a reserved-name alias — are routes to the data as much as an
-    // `[odes]` read, so a theta reaching one is not carried. Every assignment target counts,
-    // a branch's included.
-    let mut channel_outside = outside_idents.clone();
-    {
-        let mut targets: HashMap<&str, usize> = HashMap::new();
-        count_all_assignments(&indiv_stmts, &mut targets);
-        for name in targets.keys() {
-            let slot = indiv_var_names
-                .iter()
-                .position(|n| n == name)
-                .and_then(|i| ode_slot_map.get(i).copied());
-            if crate::types::DoseAttrConsumption::of(name, slot).is_some()
-                || reserved_flag_slot(name).is_some()
-            {
-                channel_outside.insert(name.to_ascii_uppercase());
-            }
-        }
-    }
-    indiv_param_partials.theta_channels = detect_theta_channels(
-        &indiv_stmts,
-        &theta_names,
-        &all_eta_names,
-        eta_names_bsv.len(),
-        &channel_outside,
-    );
     indiv_param_partials.lognormal_eta_chain = Some(lognormal_eta_chain_exact(
         &indiv_stmts,
         &indiv_var_names,
@@ -30270,7 +30054,7 @@ fn apply_binary_in<T: crate::sens::num::vm::VmNum>(a: &mut T, op: Op, b: &T) {
         Op::Sub => a.sub_in(b),
         Op::RSub => a.rsub_in(b),
         Op::Mul => a.mul_in(b),
-        Op::Div if b.val().abs() < 1e-30 => *a = T::from_f64(0.0),
+        Op::Div if b.br_abs_lt(1e-30) => *a = T::from_f64(0.0),
         Op::Div => a.div_in(b),
         _ => unreachable!("apply_binary_in: {op:?} is not an arithmetic binary op"),
     }
@@ -30296,15 +30080,13 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
 /// jet carries `sin⁽ⁿ⁾` through n = 4 (the covariance step's nested dual reads all four).
 #[inline]
 fn sin_g<T: crate::sens::num::PkNum>(x: T) -> T {
-    let (s, c) = (x.val().sin(), x.val().cos());
-    x.lift4(s, c, -s, -c, s)
+    x.sin()
 }
 
 /// `cos(x)` on any number type (#2720); see [`sin_g`].
 #[inline]
 fn cos_g<T: crate::sens::num::PkNum>(x: T) -> T {
-    let (s, c) = (x.val().sin(), x.val().cos());
-    x.lift4(c, -s, -c, s, c)
+    x.cos()
 }
 
 /// `pnorm(x)` on any number type (#2603): the value is
@@ -30314,19 +30096,7 @@ fn cos_g<T: crate::sens::num::PkNum>(x: T) -> T {
 /// as such: the polynomial factors would make `0 · ∞ = NaN` once `x²` overflows (review r1 #10).
 #[inline]
 fn pnorm_g<T: crate::sens::num::PkNum>(x: T) -> T {
-    use crate::stats::special::{pnorm, INV_SQRT_2PI};
-    let v = x.val();
-    let d = (-0.5 * v * v).exp() * INV_SQRT_2PI;
-    if d == 0.0 {
-        return x.lift4(pnorm(v), 0.0, 0.0, 0.0, 0.0);
-    }
-    x.lift4(
-        pnorm(v),
-        d,
-        -v * d,
-        (v * v - 1.0) * d,
-        (3.0 * v - v * v * v) * d,
-    )
+    x.jet_unary(crate::sens::num::JetFn::Pnorm)
 }
 
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
@@ -30372,7 +30142,43 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
 ) -> T {
     stack.clear();
     stack.reserve(bc.max_stack);
-    let mut pc: usize = 0;
+    let v = eval_bytecode_range_g(
+        bc,
+        0,
+        bc.ops.len(),
+        theta,
+        eta,
+        covariates,
+        vars,
+        nn_outputs,
+        stack,
+    );
+    debug_assert!(
+        stack.is_empty(),
+        "eval_bytecode_g: bytecode finished at stack depth {}, expected 1",
+        stack.len() + 1
+    );
+    v
+}
+
+/// [`eval_bytecode_g`] over the operations `start..end`: their value, popped off `stack`.
+#[allow(clippy::too_many_arguments)]
+fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
+    bc: &Bytecode,
+    start: usize,
+    end: usize,
+    theta: &[T],
+    eta: &[T],
+    covariates: &[f64],
+    vars: &[T],
+    nn_outputs: &[Vec<T>],
+    stack: &mut Vec<T>,
+) -> T {
+    use crate::sens::num::BranchCmp;
+    // A recording type (#2786) takes comparisons, their combinations and an `if`'s
+    // condition as data: an ODE step evaluates this where either arm holds.
+    let rec = T::RECORDS_BRANCHES;
+    let mut pc: usize = start;
     let ops = bc.ops.as_slice();
     let consts = bc.constants.as_slice();
     let k = T::from_f64;
@@ -30391,7 +30197,7 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
         };
     }
 
-    while pc < ops.len() {
+    while pc < end {
         match ops[pc] {
             // Operand fusion: a push consumed directly by a binary arithmetic op is
             // applied to the stack top in place (`apply_scalar_in` /
@@ -30535,48 +30341,162 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                 let v = pop!();
                 push!(pnorm_g(v));
             }
+            Op::Logit if rec => {
+                // The clamp as selections, `logit` read at a safe point outside `(0, 1)`.
+                let v = pop!();
+                let (lo, hi) = (1e-15_f64, 1.0 - 1e-15);
+                let inside = T::select_if(BranchCmp::Gt, v, k(lo), k(1.0), k(0.0));
+                let inside = T::select_if(BranchCmp::Lt, v, k(hi), inside, k(0.0));
+                let safe = T::select_if(BranchCmp::Ne, inside, k(0.0), v, k(0.5));
+                let r = T::select_if(BranchCmp::Ge, v, k(hi), k((hi / lo).ln()), safe.logit());
+                push!(T::select_if(BranchCmp::Le, v, k(lo), k((lo / hi).ln()), r));
+            }
             Op::Logit => {
                 let v = pop!();
                 // Match the scalar path's clamp to (0,1); the clamped region is
                 // flat (zero jet for duals).
-                let r = if v.val() <= 1e-15 {
+                let r = if v.br_cmp_c(crate::sens::num::BranchCmp::Le, 1e-15) {
                     k((1e-15_f64 / (1.0 - 1e-15)).ln())
-                } else if v.val() >= 1.0 - 1e-15 {
+                } else if v.br_cmp_c(crate::sens::num::BranchCmp::Ge, 1.0 - 1e-15) {
                     k(((1.0 - 1e-15_f64) / 1e-15).ln())
                 } else {
                     v.logit()
                 };
                 push!(r);
             }
+            Op::CmpLt if rec => {
+                let r = pop!();
+                let l = pop!();
+                push!(T::select_if(BranchCmp::Lt, l, r, k(1.0), k(0.0)));
+            }
             Op::CmpLt => {
                 let r = pop!();
                 let l = pop!();
-                push!(k(if l.val() < r.val() { 1.0 } else { 0.0 }));
+                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Lt, r) {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::CmpLe if rec => {
+                let r = pop!();
+                let l = pop!();
+                push!(T::select_if(BranchCmp::Le, l, r, k(1.0), k(0.0)));
             }
             Op::CmpLe => {
                 let r = pop!();
                 let l = pop!();
-                push!(k(if l.val() <= r.val() { 1.0 } else { 0.0 }));
+                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Le, r) {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::CmpGt if rec => {
+                let r = pop!();
+                let l = pop!();
+                push!(T::select_if(BranchCmp::Gt, l, r, k(1.0), k(0.0)));
             }
             Op::CmpGt => {
                 let r = pop!();
                 let l = pop!();
-                push!(k(if l.val() > r.val() { 1.0 } else { 0.0 }));
+                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Gt, r) {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::CmpGe if rec => {
+                let r = pop!();
+                let l = pop!();
+                push!(T::select_if(BranchCmp::Ge, l, r, k(1.0), k(0.0)));
             }
             Op::CmpGe => {
                 let r = pop!();
                 let l = pop!();
-                push!(k(if l.val() >= r.val() { 1.0 } else { 0.0 }));
+                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Ge, r) {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::CmpEq if rec => {
+                let r = pop!();
+                let l = pop!();
+                push!(T::select_if(BranchCmp::Eq, l, r, k(1.0), k(0.0)));
             }
             Op::CmpEq => {
                 let r = pop!();
                 let l = pop!();
-                push!(k(if l.val() == r.val() { 1.0 } else { 0.0 }));
+                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Eq, r) {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::CmpNe if rec => {
+                let r = pop!();
+                let l = pop!();
+                push!(T::select_if(BranchCmp::Ne, l, r, k(1.0), k(0.0)));
             }
             Op::CmpNe => {
                 let r = pop!();
                 let l = pop!();
-                push!(k(if l.val() != r.val() { 1.0 } else { 0.0 }));
+                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Ne, r) {
+                    1.0
+                } else {
+                    0.0
+                }));
+            }
+            Op::LogicAnd if rec => {
+                let b = pop!();
+                let a = pop!();
+                let bb = T::select_if(BranchCmp::Ne, b, k(0.0), k(1.0), k(0.0));
+                push!(T::select_if(BranchCmp::Ne, a, k(0.0), bb, k(0.0)));
+            }
+            Op::LogicOr if rec => {
+                let b = pop!();
+                let a = pop!();
+                let bb = T::select_if(BranchCmp::Ne, b, k(0.0), k(1.0), k(0.0));
+                push!(T::select_if(BranchCmp::Ne, a, k(0.0), k(1.0), bb));
+            }
+            Op::LogicNot if rec => {
+                let v = pop!();
+                push!(T::select_if(BranchCmp::Eq, v, k(0.0), k(1.0), k(0.0)));
+            }
+            Op::IsPresent if rec => {
+                let v = pop!();
+                push!(T::select_if(BranchCmp::Eq, v, v, k(1.0), k(0.0)));
+            }
+            Op::JumpIfFalse(target) if rec && !stack.last().is_some_and(|v| v.is_constant()) => {
+                // Both arms, each reading its inputs through `select(arm live, x,
+                // value_only(x))` — in the arm not taken they are constants, so a
+                // non-finite local derivative there meets a zero adjoint without reaching
+                // `x` — and the selection of the two on the condition.
+                let cond = pop!();
+                let target = target as usize;
+                let (then_end, arm_end) = match ops.get(target.wrapping_sub(1)) {
+                    Some(&Op::Jump(e)) if (e as usize) >= target => (target - 1, e as usize),
+                    _ => (target, target),
+                };
+                let arm = |live: BranchCmp, range: (usize, usize)| -> T {
+                    let mask = |x: &[T]| -> Vec<T> {
+                        x.iter()
+                            .map(|&v| T::select_if(live, cond, k(0.0), v, v.value_only()))
+                            .collect()
+                    };
+                    let (th, et, va) = (mask(theta), mask(eta), mask(vars));
+                    let nn: Vec<Vec<T>> = nn_outputs.iter().map(|o| mask(o)).collect();
+                    let mut st = Vec::new();
+                    eval_bytecode_range_g(
+                        bc, range.0, range.1, &th, &et, covariates, &va, &nn, &mut st,
+                    )
+                };
+                let t = arm(BranchCmp::Ne, (pc + 1, then_end));
+                let e = arm(BranchCmp::Eq, (target, arm_end));
+                push!(T::select_if(BranchCmp::Ne, cond, k(0.0), t, e));
+                pc = arm_end;
+                continue;
             }
             Op::LogicAnd => {
                 let b = pop!();
@@ -30602,7 +30522,7 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             }
             Op::IsPresent => {
                 let v = pop!();
-                push!(k(if v.val().is_nan() { 0.0 } else { 1.0 }));
+                push!(k(if v.br_is_nan() { 0.0 } else { 1.0 }));
             }
             Op::JumpIfFalse(target) => {
                 let v = pop!();
@@ -30618,11 +30538,6 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
         }
         pc += 1;
     }
-    debug_assert!(
-        stack.len() == 1,
-        "eval_bytecode_g: bytecode finished at stack depth {}, expected 1",
-        stack.len()
-    );
     stack.pop().unwrap_or_else(|| k(0.0))
 }
 
@@ -30779,10 +30694,14 @@ fn eval_statements_g<T: crate::sens::num::vm::VmNum>(
     nn: &[Vec<T>],
 ) {
     // `If` conditions are evaluated on `f64` views; the outputs' view is taken once per walk.
-    let nn_val: Vec<Vec<f64>> = nn
-        .iter()
-        .map(|net| net.iter().map(|v| v.val()).collect())
-        .collect();
+    // A recording type evaluates them on its own type, and reads no view.
+    let nn_val: Vec<Vec<f64>> = if T::RECORDS_BRANCHES {
+        Vec::new()
+    } else {
+        nn.iter()
+            .map(|net| net.iter().map(|v| v.val()).collect())
+            .collect()
+    };
     eval_statements_g_inner::<T>(
         stmts, theta, eta, cov, vars, du, bc_stack, skip, nn, &nn_val,
     )
@@ -30827,14 +30746,116 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
             Statement::If {
                 branches,
                 else_body,
+            } if T::RECORDS_BRANCHES => {
+                // A recording type (#2786): conditions as data and every body evaluated, each
+                // on the state before the `if` with its inputs read through `select(branch
+                // live, x, value_only(x))` (a branch not taken meets its non-finite local
+                // derivatives with a zero adjoint, never reaching `x`), merged by nested
+                // selections from the last branch back.
+                use crate::sens::num::BranchCmp::Ne;
+                let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
+                let conds: Vec<T> = branches
+                    .iter()
+                    .map(|(cond, _)| {
+                        let mut bc = Bytecode::new();
+                        compile_condition_into(&mut bc, cond);
+                        bc.max_stack = compute_max_stack(&bc.ops);
+                        eval_bytecode_g::<T>(&bc, theta, eta, cov, vars, nn, bc_stack)
+                    })
+                    .collect();
+                // Whether each branch is the one taken: its condition, and no earlier one.
+                let mut prev = zero;
+                let mut lives = Vec::with_capacity(conds.len());
+                for &c in &conds {
+                    let ci = T::select_if(Ne, c, zero, one, zero);
+                    lives.push(T::select_if(Ne, prev, zero, zero, ci));
+                    prev = T::select_if(Ne, c, zero, one, prev);
+                }
+                let else_live = T::select_if(Ne, prev, zero, zero, one);
+                let snap_vars = vars.to_vec();
+                let snap_du: Option<Vec<T>> = du_opt.as_deref().map(|d| d.to_vec());
+                let mut run = |body: &[Statement], live: T| -> (Vec<T>, Option<Vec<T>>) {
+                    let mask = |x: &[T]| -> Vec<T> {
+                        x.iter()
+                            .map(|&v| T::select_if(Ne, live, zero, v, v.value_only()))
+                            .collect()
+                    };
+                    let (th, et) = (mask(theta), mask(eta));
+                    let nn_m: Vec<Vec<T>> = nn.iter().map(|o| mask(o)).collect();
+                    let masked = mask(&snap_vars);
+                    let mut v = masked.clone();
+                    let mut d = snap_du.clone();
+                    eval_statements_g_inner::<T>(
+                        body,
+                        &th,
+                        &et,
+                        cov,
+                        &mut v,
+                        d.as_deref_mut(),
+                        bc_stack,
+                        skip,
+                        &nn_m,
+                        nn_val,
+                    );
+                    // A variable the body left as it was is the state before the `if`.
+                    for (i, x) in v.iter_mut().enumerate() {
+                        if x.same_node(&masked[i]) {
+                            *x = snap_vars[i];
+                        }
+                    }
+                    (v, d)
+                };
+                let (mut acc_v, mut acc_d) = match else_body {
+                    Some(eb) => run(eb, else_live),
+                    None => (snap_vars.clone(), snap_du.clone()),
+                };
+                for (i, (_, body)) in branches.iter().enumerate().rev() {
+                    let (bv, bd) = run(body, lives[i]);
+                    let c = conds[i];
+                    for (a, b) in acc_v.iter_mut().zip(&bv) {
+                        if !a.same_node(b) {
+                            *a = T::select_if(Ne, c, zero, *b, *a);
+                        }
+                    }
+                    if let (Some(ad), Some(bd)) = (acc_d.as_mut(), bd.as_ref()) {
+                        for (a, b) in ad.iter_mut().zip(bd) {
+                            if !a.same_node(b) {
+                                *a = T::select_if(Ne, c, zero, *b, *a);
+                            }
+                        }
+                    }
+                }
+                vars.copy_from_slice(&acc_v);
+                if let (Some(d), Some(ad)) = (du_opt.as_deref_mut(), acc_d) {
+                    d.copy_from_slice(&ad);
+                }
+            }
+            Statement::If {
+                branches,
+                else_body,
             } => {
-                // Conditions are value-based; evaluate on `.val()` views.
-                let theta_val: Vec<f64> = theta.iter().map(|v| v.val()).collect();
-                let eta_val: Vec<f64> = eta.iter().map(|v| v.val()).collect();
-                let vars_val: Vec<f64> = vars.iter().map(|v| v.val()).collect();
+                // Conditions are value-based; evaluate on `.val()` views. A recording type
+                // (#2786) evaluates the condition's bytecode instead, whose comparisons
+                // its branch API records.
+                let views = (!T::RECORDS_BRANCHES).then(|| {
+                    let view = |x: &[T]| x.iter().map(|v| v.val()).collect::<Vec<f64>>();
+                    (view(theta), view(eta), view(vars))
+                });
                 let mut taken = false;
                 for (cond, body) in branches {
-                    if eval_condition_indexed(cond, &theta_val, &eta_val, cov, &vars_val, nn_val) {
+                    let holds = match &views {
+                        Some((theta_val, eta_val, vars_val)) => {
+                            eval_condition_indexed(cond, theta_val, eta_val, cov, vars_val, nn_val)
+                        }
+                        None => {
+                            let mut bc = Bytecode::new();
+                            compile_condition_into(&mut bc, cond);
+                            bc.max_stack = compute_max_stack(&bc.ops);
+                            eval_bytecode_g::<T>(&bc, theta, eta, cov, vars, nn, bc_stack).val()
+                                != 0.0
+                        }
+                    };
+                    if holds {
                         eval_statements_g_inner::<T>(
                             body,
                             theta,
@@ -33538,26 +33559,6 @@ impl IndivParamProgram {
         })
     }
 
-    /// The program's variables at the given var slots (a top-level individual parameter's
-    /// slot is its index in `indiv_param_names`, see `n_top_level_vars`), evaluated as
-    /// [`Self::eval_params_g`] does: what the adjoint reads a mu-scale channel's typical
-    /// value off (#2706).
-    pub(crate) fn eval_var_slots_g<T: crate::sens::num::vm::VmNum>(
-        &self,
-        theta: &[T],
-        eta: &[T],
-        covariates: &HashMap<String, f64>,
-        nn: &[Vec<T>],
-        slots: &[usize],
-    ) -> Option<Vec<T>> {
-        if slots.iter().any(|&v| v >= self.n_top_level_vars) {
-            return None;
-        }
-        Some(self.eval_vars_g(theta, eta, covariates, nn, |vars| {
-            slots.iter().map(|&v| vars[v]).collect()
-        }))
-    }
-
     /// The shared body of [`Self::eval_params_g`] and [`Self::eval_var_slots_g`]: run the
     /// program and hand `read` every variable.
     fn eval_vars_g<T: crate::sens::num::vm::VmNum, R>(
@@ -33585,8 +33586,10 @@ impl IndivParamProgram {
         // walk. `skip` empty ⇒ original full path.
         let skip: &[bool] = &self.cov_static_mask;
         if !skip.is_empty() {
+            // The slots folded are constant in θ and η: the values read here only fill the
+            // walk's arguments, so a recording type reads the ones it saw (`seen_value`).
             let mut theta_v: Vec<f64> = crate::scratch::take();
-            theta_v.extend(theta.iter().map(|t| t.val()));
+            theta_v.extend(theta.iter().map(|t| t.seen_value()));
             let static_vals = self.eval_cov_static_f64(&theta_v, &cov_vec);
             for (v, &is_static) in skip.iter().enumerate() {
                 if is_static {
@@ -34709,10 +34712,6 @@ pub struct IndivParamPartials {
     /// fixture that never went through the parser, which every consumer treats as "every
     /// individual parameter is random" (the conservative answer).
     pub(crate) random_indiv_params: Option<Vec<String>>,
-    /// The thetas the adjoint gradient reads off the η-derivatives instead of taping
-    /// (#2706, [`detect_theta_channels`]). `None` when no theta qualifies, and for
-    /// hand-built fixtures.
-    pub(crate) theta_channels: Option<ThetaChannels>,
 }
 
 impl IndivParamPartials {
@@ -34739,7 +34738,6 @@ impl IndivParamPartials {
             mu_ref_owners: std::collections::BTreeMap::new(),
             derived_reads: Vec::new(),
             random_indiv_params: None,
-            theta_channels: None,
         }
     }
 
@@ -34813,7 +34811,6 @@ fn build_indiv_param_partials(
         nested_levels: None,
         mu_ref_owners: std::collections::BTreeMap::new(),
         derived_reads: Vec::new(),
-        theta_channels: None,
         random_indiv_params: None,
     }
 }
@@ -36258,7 +36255,7 @@ mod ode_linearity;
 mod ode_switch;
 
 #[path = "rhs_regcode.rs"]
-mod rhs_regcode;
+pub(crate) mod rhs_regcode;
 
 #[cfg(test)]
 #[path = "model_parser_tests.rs"]

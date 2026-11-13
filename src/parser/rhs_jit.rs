@@ -31,7 +31,6 @@
 //! binding does).
 use super::ir::{self, Cc, Func, Inst, Layout, Shim1};
 use super::Flat;
-use crate::sens::num::vm::RhsKernel;
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
 use cranelift_codegen::settings::{self, Configurable};
@@ -47,29 +46,8 @@ type RhsFn = unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64);
 pub(super) type PrepFn = unsafe extern "C" fn(*const f64, *const f64, *mut f64);
 pub(super) type MainFn =
     unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64, *const f64);
-/// The reverse pass: `(u, params, seeds, du, ū, p̄, s̄, dū)`.
-type VjpFn = unsafe extern "C" fn(
-    *const f64,
-    *const f64,
-    *const f64,
-    *mut f64,
-    *mut f64,
-    *mut f64,
-    *mut f64,
-    *const f64,
-);
-
-extern "C" fn shim_exp(x: f64) -> f64 {
-    x.exp()
-}
-extern "C" fn shim_ln(x: f64) -> f64 {
-    x.ln()
-}
 extern "C" fn shim_powf(x: f64, e: f64) -> f64 {
     x.powf(e)
-}
-extern "C" fn shim_round(x: f64) -> f64 {
-    x.round()
 }
 
 /// The highest state, parameter and derivative index the program touches (+1), so a call
@@ -255,7 +233,7 @@ fn emit(code: &[Flat], n_regs: usize, layout: Layout, part: Part<'_>) -> Func {
 }
 
 /// The register an instruction writes.
-fn def_of(f: &Flat) -> Option<u16> {
+fn def_of(f: &Flat) -> Option<u32> {
     let mut g = *f;
     let (d, _) = super::regs_of(&mut g);
     d.map(|r| *r)
@@ -336,11 +314,20 @@ impl<F> Drop for Compiled<F> {
 
 /// Lower `funcs` into one module and finalize it; the addresses in `funcs`' order.
 fn compile(funcs: &[(&str, &Func)]) -> Option<(JITModule, Vec<*const u8>)> {
+    compile_with(funcs, MAX_INSTS, FAST_ALLOC_INSTS)
+}
+
+/// [`compile`] with its own size limits (#2786 prototype: a whole subject's recording).
+pub(super) fn compile_with(
+    funcs: &[(&str, &Func)],
+    max_insts: usize,
+    fast_alloc_insts: usize,
+) -> Option<(JITModule, Vec<*const u8>)> {
     let insts: usize = funcs.iter().map(|(_, f)| f.insts.len()).sum();
-    if insts > MAX_INSTS {
+    if insts > max_insts {
         return None;
     }
-    let mut module = new_module(insts > FAST_ALLOC_INSTS)?;
+    let mut module = new_module(insts > fast_alloc_insts)?;
     // A failure past this point must free what `module` mapped: it has no `Drop` that does.
     let ids: Option<Vec<_>> = funcs
         .iter()
@@ -402,18 +389,27 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
                 Inst::Abs(x) => b.ins().fabs(r(x)),
                 Inst::Floor(x) => b.ins().floor(r(x)),
                 Inst::Ceil(x) => b.ins().ceil(r(x)),
+                Inst::Call1(Shim1::Sqrt, x) => b.ins().sqrt(r(x)),
                 Inst::Call1(s, x) => {
-                    let f: extern "C" fn(f64) -> f64 = match s {
-                        Shim1::Exp => shim_exp,
-                        Shim1::Ln => shim_ln,
-                        Shim1::Round => shim_round,
-                    };
+                    let f = s.f();
                     let callee = b.ins().iconst(ptr, f as usize as i64);
                     let call = b.ins().call_indirect(unary_ref, callee, &[r(x)]);
                     b.inst_results(call)[0]
                 }
                 Inst::Powf(x, y) => {
                     let f: extern "C" fn(f64, f64) -> f64 = shim_powf;
+                    let callee = b.ins().iconst(ptr, f as usize as i64);
+                    let call = b.ins().call_indirect(binary_ref, callee, &[r(x), r(y)]);
+                    b.inst_results(call)[0]
+                }
+                Inst::Gamma {
+                    upper,
+                    i,
+                    j,
+                    a: x,
+                    x: y,
+                } => {
+                    let f = ir::gamma_shim(upper, i, j);
                     let callee = b.ins().iconst(ptr, f as usize as i64);
                     let call = b.ins().call_indirect(binary_ref, callee, &[r(x), r(y)]);
                     b.inst_results(call)[0]
@@ -433,6 +429,20 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
                 Inst::And(x, y) => b.ins().band(r(x), r(y)),
                 Inst::Or(x, y) => b.ins().bor(r(x), r(y)),
                 Inst::Select(c, x, y) => b.ins().select(r(c), r(x), r(y)),
+                Inst::StopGrad(x) => r(x),
+                Inst::HostArg(_) | Inst::Host(_) | Inst::HostOut(_) => {
+                    let (fp, arg): (extern "C" fn(f64) -> f64, Value) = match *inst {
+                        Inst::HostArg(x) => (ir::host::arg_native, r(x)),
+                        Inst::Host(f) => {
+                            (ir::host::call_native, b.ins().f64const(f.index() as f64))
+                        }
+                        Inst::HostOut(k) => (ir::host::out_native, b.ins().f64const(k as f64)),
+                        _ => unreachable!(),
+                    };
+                    let callee = b.ins().iconst(ptr, fp as usize as i64);
+                    let call = b.ins().call_indirect(unary_ref, callee, &[arg]);
+                    b.inst_results(call)[0]
+                }
                 Inst::Store { arg, off, v: x } => {
                     b.ins()
                         .store(flags, r(x), args[arg as usize], (off * 8) as i32);
@@ -456,8 +466,6 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
 #[derive(Clone)]
 pub(super) struct JitCode {
     inner: Arc<JitInner>,
-    /// The same allocation as a tape's [`RhsKernel`], so recording a call borrows it.
-    kernel: Arc<dyn RhsKernel>,
 }
 
 struct JitInner {
@@ -467,7 +475,6 @@ struct JitInner {
     plan: HoistPlan,
     full: Box<[OnceLock<Option<Compiled<RhsFn>>>]>,
     pairs: Box<[OnceLock<Option<Compiled<(PrepFn, MainFn)>>>]>,
-    vjps: Box<[OnceLock<Option<Compiled<VjpFn>>>]>,
 }
 
 // SAFETY: the native code is immutable once finalized and reentrant (it touches only its
@@ -497,17 +504,8 @@ impl JitCode {
             plan: hoist_plan(code),
             full: slots(),
             pairs: slots(),
-            vjps: slots(),
         });
-        JitCode {
-            kernel: inner.clone(),
-            inner,
-        }
-    }
-
-    /// This program as a tape's [`RhsKernel`].
-    pub(super) fn kernel(&self) -> &Arc<dyn RhsKernel> {
-        &self.kernel
+        JitCode { inner }
     }
 
     /// Whether a native function exists (or can be built) for `layout`.
@@ -524,12 +522,6 @@ impl JitCode {
     /// The hoisted pair over `layout` ([`HoistPlan`]), built on first use.
     pub(super) fn resolve_hoisted(&self, layout: Layout) -> Option<Resolved<'_, (PrepFn, MainFn)>> {
         self.inner.resolve_hoisted(layout)
-    }
-
-    /// The reverse pass over `layout`, built on first use.
-    #[cfg(test)]
-    pub(super) fn resolve_vjp(&self, layout: Layout) -> Option<Resolved<'_, VjpFn>> {
-        self.inner.resolve_vjp(layout)
     }
 }
 
@@ -576,83 +568,12 @@ impl JitInner {
         Some(self.resolved(c.f, layout))
     }
 
-    fn resolve_vjp(&self, layout: Layout) -> Option<Resolved<'_, VjpFn>> {
-        let s = ir::slot(layout)?;
-        let inner = self;
-        let c = inner.vjps[s]
-            .get_or_init(|| {
-                let fwd = emit(&inner.code, inner.n_regs, layout, Part::Full);
-                let rev = ir::reverse(&fwd);
-                let (module, a) = compile(&[("rhs_vjp", &rev)])?;
-                // SAFETY: defined with exactly `VjpFn`'s signature (eight pointers).
-                let f = unsafe { std::mem::transmute::<*const u8, VjpFn>(a[0]) };
-                Some(Compiled {
-                    f,
-                    module: Some(module),
-                })
-            })
-            .as_ref()?;
-        Some(self.resolved(c.f, layout))
-    }
-
     fn resolved<F: Copy>(&self, f: F, layout: Layout) -> Resolved<'_, F> {
         Resolved {
             f,
             extent: self.extent,
             lanes: layout.lanes(),
             plan: &self.plan,
-        }
-    }
-}
-
-impl RhsKernel for JitInner {
-    fn extent(&self) -> (usize, usize, usize) {
-        (self.extent.u, self.extent.params, self.extent.du)
-    }
-    fn writes_every_du(&self) -> bool {
-        self.extent.du_dense
-    }
-    fn has_forward(&self, layout: Layout) -> bool {
-        self.resolve(layout).is_some()
-    }
-    fn has_reverse(&self, layout: Layout) -> bool {
-        self.resolve_vjp(layout).is_some()
-    }
-    unsafe fn forward(
-        &self,
-        layout: Layout,
-        u: *const f64,
-        params: *const f64,
-        seeds: *const f64,
-        du: *mut f64,
-    ) {
-        if let Some(f) = self.resolve(layout) {
-            f.call(u, params, seeds, du)
-        }
-    }
-    unsafe fn reverse(
-        &self,
-        layout: Layout,
-        u: *const f64,
-        params: *const f64,
-        seeds: *const f64,
-        u_bar: *mut f64,
-        p_bar: *mut f64,
-        s_bar: *mut f64,
-        du_bar: *const f64,
-    ) {
-        if let Some(f) = self.resolve_vjp(layout) {
-            // The reverse pass never touches `du` (its forward half drops the stores).
-            f.vjp(
-                u,
-                params,
-                seeds,
-                std::ptr::null_mut(),
-                u_bar,
-                p_bar,
-                s_bar,
-                du_bar,
-            )
         }
     }
 }
@@ -733,28 +654,5 @@ impl Resolved<'_, (PrepFn, MainFn)> {
         cache: *const f64,
     ) {
         (self.f.1)(u, params, seeds, du, cache)
-    }
-}
-
-impl Resolved<'_, VjpFn> {
-    /// Add `dūᵀ·∂du/∂(u, params, seeds)` into `ū`, `p̄` and `s̄`.
-    ///
-    /// # Safety
-    /// As [`Resolved::call`] for the primal slices; each adjoint buffer is laid out like
-    /// its primal (`ū` like `u`, …, `dū` like `du`).
-    #[allow(clippy::too_many_arguments)]
-    #[inline(always)]
-    pub(super) unsafe fn vjp(
-        &self,
-        u: *const f64,
-        params: *const f64,
-        seeds: *const f64,
-        du: *mut f64,
-        u_bar: *mut f64,
-        p_bar: *mut f64,
-        s_bar: *mut f64,
-        du_bar: *const f64,
-    ) {
-        (self.f)(u, params, seeds, du, u_bar, p_bar, s_bar, du_bar)
     }
 }

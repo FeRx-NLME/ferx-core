@@ -73,10 +73,34 @@ impl Arith {
 }
 
 /// A unary operation applied to a materialised value.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Unary {
     Exp,
     Ln,
+    /// `PkNum::ln`, unguarded: kernel recordings only. [`Unary::Ln`] is the interpreter's
+    /// `Op::Ln`, floored at `1e-30` (the VM's `guard_floor`).
+    LnRaw,
+    /// Kernel recordings only: `sin`, the polygammas (the derivatives of `LnGamma`), and the
+    /// `k`-th derivative of `exprel(z) = (e^z − 1)/z` (`ode::linear::exprel_derivs`).
+    Sin,
+    Digamma,
+    Trigamma,
+    Tetragamma,
+    ExpRel(u8),
+    /// The `k`-th derivative of a function given by its jet (`JetFn`): kernel recordings only.
+    Jet(crate::sens::num::JetFn, u8),
+    /// The value as a constant (`PkNum::value_only`): kernel recordings only.
+    StopGrad,
+    /// `PkNum::sqrt`, unguarded. Only a kernel recording (`kernel_jit`, #2786) emits it; the
+    /// RHS compiler keeps `Op::Sqrt`'s `-0.0` guard on the interpreter, so this arm's
+    /// `Op::Sqrt` is reached by no register program the interpreter runs.
+    Sqrt,
+    /// `PkNum::inv_logit`, `logit`, `cos`, `acos` (unguarded): kernel recordings only.
+    InvLogit,
+    Logit,
+    Cos,
+    Acos,
+    LnGamma,
     Abs,
     Floor,
     Ceil,
@@ -88,6 +112,22 @@ impl Unary {
         match self {
             Unary::Exp => Op::Exp,
             Unary::Ln => Op::Ln,
+            Unary::Sqrt => Op::Sqrt,
+            Unary::InvLogit => Op::InvLogit,
+            Unary::Logit => Op::Logit,
+            Unary::Cos => Op::Cos,
+            Unary::Acos
+            | Unary::LnGamma
+            | Unary::LnRaw
+            | Unary::Sin
+            | Unary::Digamma
+            | Unary::Trigamma
+            | Unary::Tetragamma
+            | Unary::ExpRel(_)
+            | Unary::Jet(..)
+            | Unary::StopGrad => {
+                unreachable!("only a kernel recording emits these, never interpreted")
+            }
             Unary::Abs => Op::Abs,
             Unary::Floor => Op::Floor,
             Unary::Ceil => Op::Ceil,
@@ -174,128 +214,192 @@ enum Ins {
 /// A lowered instruction: every operand is an index into the one register file, so an
 /// instruction is a single dispatch. The arithmetic primitive of each arm is the
 /// interpreter's own for that operation and operand form (see the module docs).
+/// A register of a [`Flat`] program: a recording's (#2786) can number past 65k.
+pub(super) type Reg = u32;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Flat {
     /// `r[d] = u[i]` (`0` past `u.len()`, as the binding fills a short `u`).
     LoadState {
-        d: u16,
+        d: Reg,
         i: u32,
     },
     /// `r[d] = params[slot]` (`0` past `params.len()`, as the binding reads it).
     LoadParam {
-        d: u16,
+        d: Reg,
         slot: u32,
     },
-    /// `r[d] = seeds[k]`: the `T`, `TAFD`, `TAD` and `MACHEPS` slots.
+    /// `r[d] = seeds[k]`: the `T`, `TAFD`, `TAD` and `MACHEPS` slots; for a kernel
+    /// recording (#2786), its literal pool.
     LoadSeed {
-        d: u16,
-        k: u8,
+        d: Reg,
+        k: u32,
     },
     /// `r[d] = k(c)`: a literal the interpreter pushes as a dual constant.
     LoadK {
-        d: u16,
+        d: Reg,
         c: f64,
     },
     Add {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     Sub {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     RSub {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     Mul {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     Div {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// `a / b` unguarded — `PkNum`'s division (`DualV::div_body`), which a kernel recording
+    /// (`kernel_jit`, #2786) emits; `Div` is the interpreter's guarded one.
+    DivRaw {
+        d: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// Kernel recordings only (#2786): a host call. `HostArg`s queue its arguments' values in
+    /// order, `Host` runs the analysis on them, and each `HostOut` reads one of its outputs, a
+    /// constant of the computation (no derivative).
+    HostArg {
+        a: Reg,
+    },
+    Host {
+        f: crate::sens::num::HostFn,
+    },
+    HostOut {
+        d: Reg,
+        k: u32,
+    },
+    /// Kernel recordings only (#2786): an ODE segment as a loop call. `LoopArg`s list its
+    /// inputs (the initial state, then the outer values its bodies read), `Loop` names the
+    /// recording's loop `id`, and each `LoopOut` defines one output (a state component at a
+    /// save point). Never inside a chunk: the plan runs the call itself.
+    /// Kernel recordings only (#2786): `r[d] = r[c] ≠ 0 ? r[a] : r[b]` (`c` a condition).
+    Select {
+        d: Reg,
+        c: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// Kernel recordings only (#2786, `PkNum::order_gate`): `r[d] = r[b]` in a compiled
+    /// variant whose derivative order reaches `k`, `r[a]` below it. Resolved per variant
+    /// before lowering (`kernel_jit::resolve_gates`).
+    Gate {
+        d: Reg,
+        a: Reg,
+        b: Reg,
+        k: u8,
+    },
+    LoopArg {
+        a: Reg,
+    },
+    Loop {
+        id: u32,
+    },
+    LoopOut {
+        d: Reg,
+        k: u32,
+    },
+    /// `∂^(i+j) P(a, x) / ∂aⁱ ∂xʲ` (of `Q` when `upper`); `i = j = 0` is [`PkNum::gamma_pq`]
+    /// as one primitive. Only a kernel recording emits it (#2786).
+    GammaPq {
+        d: Reg,
+        a: Reg,
+        x: Reg,
+        upper: bool,
+        i: u8,
+        j: u8,
     },
     AddK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     SubK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     RSubK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     MulK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     /// A division by a literal, through `apply_scalar_in`'s guard.
     DivK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     Pow {
-        d: u16,
-        a: u16,
-        e: u16,
+        d: Reg,
+        a: Reg,
+        e: Reg,
     },
     Unary {
-        d: u16,
+        d: Reg,
         op: Unary,
-        a: u16,
+        a: Reg,
     },
     /// `du[state] = r[a]`.
     Deriv {
         state: u32,
-        a: u16,
+        a: Reg,
     },
     /// `r[d] = k(1)` when `r[a].val() cc r[b].val()`, else `k(0)`: the interpreter's `Cmp*`.
     Cmp {
-        d: u16,
+        d: Reg,
         cc: Cc,
-        a: u16,
-        b: u16,
+        a: Reg,
+        b: Reg,
     },
     /// `r[d] = k(1)` when both values are nonzero (`LogicAnd`).
     And {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     /// `r[d] = k(1)` when either value is nonzero (`LogicOr`).
     Or {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     /// `r[d] = k(1)` when the value is zero (`LogicNot`).
     Not {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
     },
     /// `r[d] = k(1)` unless the value is `NaN` (`IsPresent`).
     Present {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
     },
     /// Continue at `to` (the else arm) when `r[c].val() == 0` (`JumpIfFalse`). The then arm
     /// runs from the next instruction to a [`Flat::Jump`] at `to − 1`, which continues past the
     /// else arm; each arm ends with the [`Flat::Move`]s of its results.
     Branch {
-        c: u16,
+        c: Reg,
         to: u32,
     },
     Jump {
@@ -303,9 +407,477 @@ enum Flat {
     },
     /// `r[d] = r[a]`: an arm's result into the register both arms of an `if` write.
     Move {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
     },
+}
+
+/// Structural hashing of an instruction, literals by their bits ([`Flat::same`]'s notion of
+/// equality): what the compiled path's caches key programs on (#2786), with no text rendering.
+impl std::hash::Hash for Flat {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        std::mem::discriminant(self).hash(h);
+        match *self {
+            Flat::LoadState { d, i } => {
+                d.hash(h);
+                i.hash(h);
+            }
+            Flat::LoadParam { d, slot } => {
+                d.hash(h);
+                slot.hash(h);
+            }
+            Flat::LoadSeed { d, k } => {
+                d.hash(h);
+                k.hash(h);
+            }
+            Flat::LoadK { d, c } => {
+                d.hash(h);
+                c.to_bits().hash(h);
+            }
+            Flat::Add { d, a, b } => {
+                d.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::Sub { d, a, b } => {
+                d.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::RSub { d, a, b } => {
+                d.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::Mul { d, a, b } => {
+                d.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::Div { d, a, b } => {
+                d.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::DivRaw { d, a, b } => {
+                d.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::HostArg { a } => {
+                a.hash(h);
+            }
+            Flat::Host { f } => {
+                f.hash(h);
+            }
+            Flat::HostOut { d, k } => {
+                d.hash(h);
+                k.hash(h);
+            }
+            Flat::Select { d, c, a, b } => {
+                d.hash(h);
+                c.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::Gate { d, a, b, k } => {
+                d.hash(h);
+                a.hash(h);
+                b.hash(h);
+                k.hash(h);
+            }
+            Flat::LoopArg { a } => {
+                a.hash(h);
+            }
+            Flat::Loop { id } => {
+                id.hash(h);
+            }
+            Flat::LoopOut { d, k } => {
+                d.hash(h);
+                k.hash(h);
+            }
+            Flat::GammaPq {
+                d,
+                a,
+                x,
+                upper,
+                i,
+                j,
+            } => {
+                d.hash(h);
+                a.hash(h);
+                x.hash(h);
+                upper.hash(h);
+                i.hash(h);
+                j.hash(h);
+            }
+            Flat::AddK { d, a, c } => {
+                d.hash(h);
+                a.hash(h);
+                c.to_bits().hash(h);
+            }
+            Flat::SubK { d, a, c } => {
+                d.hash(h);
+                a.hash(h);
+                c.to_bits().hash(h);
+            }
+            Flat::RSubK { d, a, c } => {
+                d.hash(h);
+                a.hash(h);
+                c.to_bits().hash(h);
+            }
+            Flat::MulK { d, a, c } => {
+                d.hash(h);
+                a.hash(h);
+                c.to_bits().hash(h);
+            }
+            Flat::DivK { d, a, c } => {
+                d.hash(h);
+                a.hash(h);
+                c.to_bits().hash(h);
+            }
+            Flat::Pow { d, a, e } => {
+                d.hash(h);
+                a.hash(h);
+                e.hash(h);
+            }
+            Flat::Unary { d, op, a } => {
+                d.hash(h);
+                op.hash(h);
+                a.hash(h);
+            }
+            Flat::Deriv { state, a } => {
+                state.hash(h);
+                a.hash(h);
+            }
+            Flat::Cmp { d, cc, a, b } => {
+                d.hash(h);
+                cc.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::And { d, a, b } => {
+                d.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::Or { d, a, b } => {
+                d.hash(h);
+                a.hash(h);
+                b.hash(h);
+            }
+            Flat::Not { d, a } => {
+                d.hash(h);
+                a.hash(h);
+            }
+            Flat::Present { d, a } => {
+                d.hash(h);
+                a.hash(h);
+            }
+            Flat::Branch { c, to } => {
+                c.hash(h);
+                to.hash(h);
+            }
+            Flat::Jump { to } => {
+                to.hash(h);
+            }
+            Flat::Move { d, a } => {
+                d.hash(h);
+                a.hash(h);
+            }
+        }
+    }
+}
+
+impl Flat {
+    /// Equal instruction for instruction, literals bit for bit (`-0.0` is not `0.0`, a `NaN`
+    /// is itself): two programs that are `same` compute the same values.
+    pub(super) fn same(&self, other: &Flat) -> bool {
+        match (*self, *other) {
+            (Flat::LoadState { d: d0, i: i0 }, Flat::LoadState { d: d1, i: i1 }) => {
+                d0 == d1 && i0 == i1
+            }
+            (Flat::LoadParam { d: d0, slot: slot0 }, Flat::LoadParam { d: d1, slot: slot1 }) => {
+                d0 == d1 && slot0 == slot1
+            }
+            (Flat::LoadSeed { d: d0, k: k0 }, Flat::LoadSeed { d: d1, k: k1 }) => {
+                d0 == d1 && k0 == k1
+            }
+            (Flat::LoadK { d: d0, c: c0 }, Flat::LoadK { d: d1, c: c1 }) => {
+                d0 == d1 && c0.to_bits() == c1.to_bits()
+            }
+            (
+                Flat::Add {
+                    d: d0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::Add {
+                    d: d1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && a0 == a1 && b0 == b1,
+            (
+                Flat::Sub {
+                    d: d0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::Sub {
+                    d: d1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && a0 == a1 && b0 == b1,
+            (
+                Flat::RSub {
+                    d: d0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::RSub {
+                    d: d1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && a0 == a1 && b0 == b1,
+            (
+                Flat::Mul {
+                    d: d0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::Mul {
+                    d: d1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && a0 == a1 && b0 == b1,
+            (
+                Flat::Div {
+                    d: d0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::Div {
+                    d: d1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && a0 == a1 && b0 == b1,
+            (
+                Flat::DivRaw {
+                    d: d0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::DivRaw {
+                    d: d1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && a0 == a1 && b0 == b1,
+            (Flat::HostArg { a: a0 }, Flat::HostArg { a: a1 }) => a0 == a1,
+            (Flat::Host { f: f0 }, Flat::Host { f: f1 }) => f0 == f1,
+            (Flat::HostOut { d: d0, k: k0 }, Flat::HostOut { d: d1, k: k1 }) => {
+                d0 == d1 && k0 == k1
+            }
+            (
+                Flat::Select {
+                    d: d0,
+                    c: c0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::Select {
+                    d: d1,
+                    c: c1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && c0 == c1 && a0 == a1 && b0 == b1,
+            (
+                Flat::Gate {
+                    d: d0,
+                    a: a0,
+                    b: b0,
+                    k: k0,
+                },
+                Flat::Gate {
+                    d: d1,
+                    a: a1,
+                    b: b1,
+                    k: k1,
+                },
+            ) => d0 == d1 && a0 == a1 && b0 == b1 && k0 == k1,
+            (Flat::LoopArg { a: a0 }, Flat::LoopArg { a: a1 }) => a0 == a1,
+            (Flat::Loop { id: id0 }, Flat::Loop { id: id1 }) => id0 == id1,
+            (Flat::LoopOut { d: d0, k: k0 }, Flat::LoopOut { d: d1, k: k1 }) => {
+                d0 == d1 && k0 == k1
+            }
+            (
+                Flat::GammaPq {
+                    d: d0,
+                    a: a0,
+                    x: x0,
+                    upper: upper0,
+                    i: i0,
+                    j: j0,
+                },
+                Flat::GammaPq {
+                    d: d1,
+                    a: a1,
+                    x: x1,
+                    upper: upper1,
+                    i: i1,
+                    j: j1,
+                },
+            ) => d0 == d1 && a0 == a1 && x0 == x1 && upper0 == upper1 && i0 == i1 && j0 == j1,
+            (
+                Flat::AddK {
+                    d: d0,
+                    a: a0,
+                    c: c0,
+                },
+                Flat::AddK {
+                    d: d1,
+                    a: a1,
+                    c: c1,
+                },
+            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
+            (
+                Flat::SubK {
+                    d: d0,
+                    a: a0,
+                    c: c0,
+                },
+                Flat::SubK {
+                    d: d1,
+                    a: a1,
+                    c: c1,
+                },
+            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
+            (
+                Flat::RSubK {
+                    d: d0,
+                    a: a0,
+                    c: c0,
+                },
+                Flat::RSubK {
+                    d: d1,
+                    a: a1,
+                    c: c1,
+                },
+            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
+            (
+                Flat::MulK {
+                    d: d0,
+                    a: a0,
+                    c: c0,
+                },
+                Flat::MulK {
+                    d: d1,
+                    a: a1,
+                    c: c1,
+                },
+            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
+            (
+                Flat::DivK {
+                    d: d0,
+                    a: a0,
+                    c: c0,
+                },
+                Flat::DivK {
+                    d: d1,
+                    a: a1,
+                    c: c1,
+                },
+            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
+            (
+                Flat::Pow {
+                    d: d0,
+                    a: a0,
+                    e: e0,
+                },
+                Flat::Pow {
+                    d: d1,
+                    a: a1,
+                    e: e1,
+                },
+            ) => d0 == d1 && a0 == a1 && e0 == e1,
+            (
+                Flat::Unary {
+                    d: d0,
+                    op: op0,
+                    a: a0,
+                },
+                Flat::Unary {
+                    d: d1,
+                    op: op1,
+                    a: a1,
+                },
+            ) => d0 == d1 && op0 == op1 && a0 == a1,
+            (
+                Flat::Deriv {
+                    state: state0,
+                    a: a0,
+                },
+                Flat::Deriv {
+                    state: state1,
+                    a: a1,
+                },
+            ) => state0 == state1 && a0 == a1,
+            (
+                Flat::Cmp {
+                    d: d0,
+                    cc: cc0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::Cmp {
+                    d: d1,
+                    cc: cc1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && cc0 == cc1 && a0 == a1 && b0 == b1,
+            (
+                Flat::And {
+                    d: d0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::And {
+                    d: d1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && a0 == a1 && b0 == b1,
+            (
+                Flat::Or {
+                    d: d0,
+                    a: a0,
+                    b: b0,
+                },
+                Flat::Or {
+                    d: d1,
+                    a: a1,
+                    b: b1,
+                },
+            ) => d0 == d1 && a0 == a1 && b0 == b1,
+            (Flat::Not { d: d0, a: a0 }, Flat::Not { d: d1, a: a1 }) => d0 == d1 && a0 == a1,
+            (Flat::Present { d: d0, a: a0 }, Flat::Present { d: d1, a: a1 }) => {
+                d0 == d1 && a0 == a1
+            }
+            (Flat::Branch { c: c0, to: to0 }, Flat::Branch { c: c1, to: to1 }) => {
+                c0 == c1 && to0 == to1
+            }
+            (Flat::Jump { to: to0 }, Flat::Jump { to: to1 }) => to0 == to1,
+            (Flat::Move { d: d0, a: a0 }, Flat::Move { d: d1, a: a1 }) => d0 == d1 && a0 == a1,
+            _ => false,
+        }
+    }
 }
 
 /// Where each of the RHS's `vars` slots comes from, as `OdeRhsProgram`'s binding fills it:
@@ -332,7 +904,7 @@ impl RhsLayout<'_> {
             });
         }
         let k = self.seed_slots.iter().position(|&s| s == slot)?;
-        Some(Flat::LoadSeed { d: 0, k: k as u8 })
+        Some(Flat::LoadSeed { d: 0, k: k as u32 })
     }
 }
 
@@ -708,25 +1280,6 @@ impl RhsRegProgram {
         T::LANES.is_some_and(|l| self.jit.as_ref().is_some_and(|j| j.has(l)))
     }
 
-    /// Record the call whole on `T`'s tape (`VmArith::tape_rhs`): `false`, with nothing
-    /// written, when the type or the kernel cannot.
-    #[inline]
-    pub(super) fn try_tape_block<T: VmNum>(
-        &self,
-        u: &[T],
-        params: &[T],
-        seeds: &[T; 4],
-        du: &mut [T],
-    ) -> bool {
-        #[cfg(test)]
-        if RHS_JIT_DISABLED.with(|c| c.get()) {
-            return false;
-        }
-        self.jit
-            .as_ref()
-            .is_some_and(|j| T::tape_rhs(j.kernel(), u, params, seeds, du))
-    }
-
     /// Registers the program uses; [`Self::run`]'s `regs` must hold at least this many.
     pub(super) fn n_regs(&self) -> usize {
         self.n_regs
@@ -745,11 +1298,6 @@ impl RhsRegProgram {
         regs: &mut [T],
     ) {
         if self.run_native(u, params, seeds, du) {
-            return;
-        }
-        // A taped call: one tape block whose reverse rule is the compiled reverse pass,
-        // where the type has one, instead of a node per operation.
-        if T::RECORDS_TAPE && self.try_tape_block(u, params, seeds, du) {
             return;
         }
         self.exec(&self.code, u, params, seeds, du, &mut regs[..self.n_regs]);
@@ -885,6 +1433,23 @@ impl RhsRegProgram {
         du: &mut [T],
         r: &mut [T],
     ) {
+        self.exec_range(code, 0, code.len(), u, params, seeds, du, r)
+    }
+
+    /// [`Self::exec`] over the instructions `start..end`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn exec_range<T: VmNum>(
+        &self,
+        code: &[Flat],
+        start: usize,
+        end: usize,
+        u: &[T],
+        params: &[T],
+        seeds: &[T; 4],
+        du: &mut [T],
+        r: &mut [T],
+    ) {
         let k = T::from_f64;
         macro_rules! bin {
             ($d:expr, $a:expr, $f:expr) => {{
@@ -894,8 +1459,15 @@ impl RhsRegProgram {
             }};
         }
         let b01 = |c: bool| k(if c { 1.0 } else { 0.0 });
-        let mut pc = 0;
-        while let Some(f) = code.get(pc) {
+        // A recording type (#2786) records a condition as data — the comparisons and their
+        // combinations as selections — and both arms of an `if` on it ([`Self::both_arms`]):
+        // an ODE step evaluates the right-hand side at states where either arm holds.
+        let rec = T::RECORDS_BRANCHES;
+        let (zero, one) = (k(0.0), k(1.0));
+        use crate::sens::num::BranchCmp::{Eq, Ne};
+        let mut pc = start;
+        while pc < end {
+            let f = &code[pc];
             pc += 1;
             match *f {
                 Flat::LoadState { d, i } => {
@@ -927,17 +1499,51 @@ impl RhsRegProgram {
                     let y = r[b as usize];
                     bin!(d, a, |x: &mut T| apply_binary_in(x, Op::Div, &y))
                 }
+                Flat::DivRaw { d, a, b } => {
+                    let y = r[b as usize];
+                    bin!(d, a, |x: &mut T| x.div_in(&y))
+                }
                 Flat::AddK { d, a, c } => bin!(d, a, |x: &mut T| x.add_scalar_in(c)),
                 Flat::SubK { d, a, c } => bin!(d, a, |x: &mut T| x.sub_scalar_in(c)),
                 Flat::RSubK { d, a, c } => bin!(d, a, |x: &mut T| x.rsub_scalar_in(c)),
                 Flat::MulK { d, a, c } => bin!(d, a, |x: &mut T| x.mul_scalar_in(c)),
                 Flat::DivK { d, a, c } => bin!(d, a, |x: &mut T| apply_scalar_in(x, Op::Div, c)),
                 Flat::Pow { d, a, e } => r[d as usize] = r[a as usize].pow(r[e as usize]),
+                Flat::GammaPq {
+                    d,
+                    a,
+                    x,
+                    upper,
+                    i,
+                    j,
+                } => {
+                    debug_assert!(i == 0 && j == 0, "a partial is never interpreted");
+                    r[d as usize] = r[a as usize].gamma_pq(r[x as usize], upper)
+                }
                 Flat::Unary { d, op, a } => r[d as usize] = apply_unary(op.op(), r[a as usize]),
                 Flat::Deriv { state, a } => {
                     if let Some(x) = du.get_mut(state as usize) {
                         *x = r[a as usize];
                     }
+                }
+                Flat::Cmp { d, cc, a, b } if rec => {
+                    r[d as usize] =
+                        T::select_if(cc.branch(), r[a as usize], r[b as usize], one, zero)
+                }
+                Flat::And { d, a, b } if rec => {
+                    let rb = T::select_if(Ne, r[b as usize], zero, one, zero);
+                    r[d as usize] = T::select_if(Ne, r[a as usize], zero, rb, zero)
+                }
+                Flat::Or { d, a, b } if rec => {
+                    let rb = T::select_if(Ne, r[b as usize], zero, one, zero);
+                    r[d as usize] = T::select_if(Ne, r[a as usize], zero, one, rb)
+                }
+                Flat::Not { d, a } if rec => {
+                    r[d as usize] = T::select_if(Eq, r[a as usize], zero, one, zero)
+                }
+                // `x == x` is false exactly for a `NaN`.
+                Flat::Present { d, a } if rec => {
+                    r[d as usize] = T::select_if(Eq, r[a as usize], r[a as usize], one, zero)
                 }
                 Flat::Cmp { d, cc, a, b } => {
                     r[d as usize] = b01(cc.holds(r[a as usize].val(), r[b as usize].val()))
@@ -950,6 +1556,19 @@ impl RhsRegProgram {
                 }
                 Flat::Not { d, a } => r[d as usize] = b01(r[a as usize].val() == 0.0),
                 Flat::Present { d, a } => r[d as usize] = b01(!r[a as usize].val().is_nan()),
+                Flat::HostArg { .. } | Flat::Host { .. } | Flat::HostOut { .. } => {
+                    unreachable!("only a kernel recording makes a host call")
+                }
+                Flat::LoopArg { .. }
+                | Flat::Loop { .. }
+                | Flat::LoopOut { .. }
+                | Flat::Select { .. }
+                | Flat::Gate { .. } => {
+                    unreachable!("only a kernel recording makes a loop call, a select or a gate")
+                }
+                Flat::Branch { c, to } if rec && !r[c as usize].is_constant() => {
+                    pc = self.both_arms(code, pc, to as usize, c, u, params, seeds, du, r);
+                }
                 Flat::Branch { c, to } => {
                     if r[c as usize].val() == 0.0 {
                         pc = to as usize;
@@ -959,6 +1578,103 @@ impl RhsRegProgram {
                 Flat::Move { d, a } => r[d as usize] = r[a as usize],
             }
         }
+    }
+
+    /// Both arms of an `if` on the data condition `r[c]` (a recording type, #2786), the
+    /// then-arm at `then_start..else_start` (its closing `Jump` excluded), the else-arm up to
+    /// that `Jump`'s target; returns the instruction after the `if`. Every register and
+    /// derivative an arm writes becomes the selection of the two on `r[c]`.
+    ///
+    /// Each arm reads its inputs through `select(arm live, x, value_only(x))`: in the arm not
+    /// taken the inputs are constants, so a non-finite local derivative there (a negative
+    /// base's power, a negative `sqrt`) meets a zero adjoint inside the arm and never reaches
+    /// `x` — the selection hands the arm's adjoints to the constant.
+    #[allow(clippy::too_many_arguments)]
+    fn both_arms<T: VmNum>(
+        &self,
+        code: &[Flat],
+        then_start: usize,
+        else_start: usize,
+        c: u32,
+        u: &[T],
+        params: &[T],
+        seeds: &[T; 4],
+        du: &mut [T],
+        r: &mut [T],
+    ) -> usize {
+        use crate::sens::num::BranchCmp::{Eq, Ne};
+        let zero = T::from_f64(0.0);
+        let cond = r[c as usize];
+        let (then_end, end) = match code.get(else_start.wrapping_sub(1)) {
+            Some(&Flat::Jump { to }) if (to as usize) >= else_start => {
+                (else_start - 1, to as usize)
+            }
+            _ => (else_start, else_start),
+        };
+        // The registers and derivatives an arm reads and writes.
+        let scan = |range: std::ops::Range<usize>| {
+            let (mut reads, mut writes, mut derivs) = (Vec::new(), Vec::new(), Vec::new());
+            for f in &code[range] {
+                let mut g = *f;
+                if let Flat::Deriv { state, .. } = g {
+                    derivs.push(state as usize);
+                }
+                let (d, us) = regs_of(&mut g);
+                reads.extend(us.into_iter().flatten().map(|x| *x as usize));
+                if let Some(d) = d {
+                    writes.push(*d as usize);
+                }
+            }
+            (reads, writes, derivs)
+        };
+        let snap_r = r.to_vec();
+        let snap_du = du.to_vec();
+        let mut arm = |range: std::ops::Range<usize>, live: crate::sens::num::BranchCmp| {
+            r.copy_from_slice(&snap_r);
+            du.copy_from_slice(&snap_du);
+            let (reads, _, _) = scan(range.clone());
+            for i in reads {
+                let x = snap_r[i];
+                r[i] = T::select_if(live, cond, zero, x, x.value_only());
+            }
+            self.exec_range(code, range.start, range.end, u, params, seeds, du, r);
+            (r.to_vec(), du.to_vec())
+        };
+        let (r_then, du_then) = arm(then_start..then_end, Ne);
+        let (r_else, du_else) = arm(else_start..end, Eq);
+        r.copy_from_slice(&snap_r);
+        du.copy_from_slice(&snap_du);
+        let (_, w_then, d_then) = scan(then_start..then_end);
+        let (_, w_else, d_else) = scan(else_start..end);
+        for i in w_then.iter().chain(&w_else).copied() {
+            let t = if w_then.contains(&i) {
+                r_then[i]
+            } else {
+                snap_r[i]
+            };
+            let e = if w_else.contains(&i) {
+                r_else[i]
+            } else {
+                snap_r[i]
+            };
+            r[i] = T::select_if(Ne, cond, zero, t, e);
+        }
+        for s in d_then.iter().chain(&d_else).copied() {
+            if s < du.len() {
+                let t = if d_then.contains(&s) {
+                    du_then[s]
+                } else {
+                    snap_du[s]
+                };
+                let e = if d_else.contains(&s) {
+                    du_else[s]
+                } else {
+                    snap_du[s]
+                };
+                du[s] = T::select_if(Ne, cond, zero, t, e);
+            }
+        }
+        end
     }
 }
 
@@ -977,23 +1693,23 @@ fn lower(
     layout: &RhsLayout<'_>,
 ) -> Result<RhsRegProgram, RhsRefusal> {
     let mut next = n_tmp;
-    let mut alloc = || -> Option<u16> {
-        let r = u16::try_from(next).ok()?;
+    let mut alloc = || -> Option<u32> {
+        let r = u32::try_from(next).ok()?;
         next += 1;
         Some(r)
     };
     let mut prologue: Vec<Flat> = Vec::new();
     let mut body: Vec<Flat> = Vec::new();
     // Current register of a slot: its prologue load, or the value last assigned to it.
-    let mut slot_reg: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+    let mut slot_reg: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     // The refusals below are a construct; the loop adds the statement's site.
     let mut operand = |s: Src,
-                       slot_reg: &mut std::collections::HashMap<u32, u16>,
+                       slot_reg: &mut std::collections::HashMap<u32, u32>,
                        prologue: &mut Vec<Flat>,
                        body: &mut Vec<Flat>|
-     -> Result<u16, RhsConstruct> {
+     -> Result<u32, RhsConstruct> {
         Ok(match s {
-            Src::Tmp(t) => u16::try_from(t).map_err(|_| RhsConstruct::Shape)?,
+            Src::Tmp(t) => u32::try_from(t).map_err(|_| RhsConstruct::Shape)?,
             Src::Var(slot) => match slot_reg.get(&slot) {
                 Some(&r) => r,
                 // A slot read before any assignment: one of the binding's inputs, loaded
@@ -1025,7 +1741,7 @@ fn lower(
     for (n, i) in ins.iter().enumerate() {
         let site = sites[n];
         let at = |construct| RhsRefusal { construct, site };
-        let reg = |r: u32| u16::try_from(r).map_err(|_| at(RhsConstruct::Shape));
+        let reg = |r: u32| u32::try_from(r).map_err(|_| at(RhsConstruct::Shape));
         let to = |pos: usize| u32::try_from(pos).map_err(|_| at(RhsConstruct::Shape));
         // An `if`'s markers out of order: the builder emitted something it never does.
         let unbalanced = || at(RhsConstruct::InlineIf);
@@ -1167,7 +1883,7 @@ fn lower(
 }
 
 /// The register an instruction writes, and the ones it reads.
-fn regs_of(f: &mut Flat) -> (Option<&mut u16>, [Option<&mut u16>; 2]) {
+fn regs_of(f: &mut Flat) -> (Option<&mut u32>, [Option<&mut u32>; 2]) {
     match f {
         Flat::LoadState { d, .. }
         | Flat::LoadParam { d, .. }
@@ -1177,8 +1893,10 @@ fn regs_of(f: &mut Flat) -> (Option<&mut u16>, [Option<&mut u16>; 2]) {
         | Flat::Sub { d, a, b }
         | Flat::RSub { d, a, b }
         | Flat::Mul { d, a, b }
-        | Flat::Div { d, a, b } => (Some(d), [Some(a), Some(b)]),
+        | Flat::Div { d, a, b }
+        | Flat::DivRaw { d, a, b } => (Some(d), [Some(a), Some(b)]),
         Flat::Pow { d, a, e } => (Some(d), [Some(a), Some(e)]),
+        Flat::GammaPq { d, a, x, .. } => (Some(d), [Some(a), Some(x)]),
         Flat::AddK { d, a, .. }
         | Flat::SubK { d, a, .. }
         | Flat::RSubK { d, a, .. }
@@ -1191,8 +1909,15 @@ fn regs_of(f: &mut Flat) -> (Option<&mut u16>, [Option<&mut u16>; 2]) {
         Flat::Not { d, a } | Flat::Present { d, a } | Flat::Move { d, a } => {
             (Some(d), [Some(a), None])
         }
-        Flat::Deriv { a, .. } | Flat::Branch { c: a, .. } => (None, [Some(a), None]),
-        Flat::Jump { .. } => (None, [None, None]),
+        Flat::Deriv { a, .. }
+        | Flat::Branch { c: a, .. }
+        | Flat::HostArg { a }
+        | Flat::LoopArg { a } => (None, [Some(a), None]),
+        Flat::Jump { .. } | Flat::Host { .. } | Flat::Loop { .. } => (None, [None, None]),
+        Flat::HostOut { d, .. } | Flat::LoopOut { d, .. } => (Some(d), [None, None]),
+        Flat::Select { .. } | Flat::Gate { .. } => {
+            unreachable!("never register-allocated: kernel recordings only")
+        }
     }
 }
 
@@ -1224,9 +1949,9 @@ fn reuse_registers(mut code: Vec<Flat>, n_virtual: usize) -> (Vec<Flat>, usize) 
             last_use[*r as usize] = i;
         }
     }
-    let mut phys: Vec<Option<u16>> = vec![None; n_virtual];
-    let mut free: Vec<u16> = Vec::new();
-    let mut n_phys: u16 = 0;
+    let mut phys: Vec<Option<u32>> = vec![None; n_virtual];
+    let mut free: Vec<u32> = Vec::new();
+    let mut n_phys: u32 = 0;
     for (i, f) in code.iter_mut().enumerate() {
         let (def, uses) = regs_of(f);
         for r in uses.into_iter().flatten() {
@@ -1535,6 +2260,8 @@ impl Builder {
 mod ir;
 #[path = "rhs_jit.rs"]
 mod jit;
+#[path = "kernel_jit.rs"]
+pub(crate) mod kernel_jit;
 
 thread_local! {
     /// Lane buffers for a non-contiguous type's native call (`run_native`).

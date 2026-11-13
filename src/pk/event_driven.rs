@@ -258,8 +258,11 @@ impl EventSchedule {
         doses: &[DoseEvent],
         dose_lagtimes: &[f64],
     ) -> Self {
+        // A plan's recording builds what its runs replay: runtime work only (#2786).
         #[cfg(test)]
-        SCHEDULE_BUILDS.with(|c| c.set(c.get() + 1));
+        if !crate::parser::model_parser::rhs_regcode::kernel_jit::recording_open() {
+            SCHEDULE_BUILDS.with(|c| c.set(c.get() + 1));
+        }
         assert_eq!(
             doses.len(),
             subject.doses.len(),

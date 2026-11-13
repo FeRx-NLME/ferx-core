@@ -337,10 +337,12 @@ fn gap_transition<T: crate::sens::num::PkNum>(
     }
 
     let arg: Vec<T> = q.iter().map(|&x| x * T::from_f64(dt)).collect();
-    if arg
-        .iter()
-        .any(|x| !x.val().is_finite() || x.val().abs() > MAX_EXP_ARG_ABS)
-    {
+    // Through the branch API (#2786): `|x| < ∞` is finite.
+    if arg.iter().any(|x| {
+        !x.br_abs_lt(f64::INFINITY)
+            || x.abs()
+                .br_cmp_c(crate::sens::num::BranchCmp::Gt, MAX_EXP_ARG_ABS)
+    }) {
         return Ok(GapOutcome::Degenerate);
     }
     // `Expm::exp` reads its argument row-major. Handed the column-major `Q·Δt` it sees the
@@ -353,7 +355,7 @@ fn gap_transition<T: crate::sens::num::PkNum>(
     let p = expm.get(slot)[a.state + b.state * s];
     // Underflow / non-positive probability for an *observed* transition:
     // this is the degenerate case, not a hard error — repel the optimizer.
-    if !p.val().is_finite() || p.val() <= 0.0 {
+    if !p.br_abs_lt(f64::INFINITY) || p.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return Ok(GapOutcome::Degenerate);
     }
     Ok(GapOutcome::Prob { p, dt })
@@ -384,7 +386,7 @@ pub(crate) fn has_negative_offdiagonal(q: &DMatrix<f64>) -> bool {
 pub(crate) fn has_negative_offdiagonal_g<T: crate::sens::num::PkNum>(q: &[T], s: usize) -> bool {
     for k in 0..s {
         for j in 0..s {
-            if j != k && q[j + k * s].val() < -1e-12 {
+            if j != k && q[j + k * s].br_cmp_c(crate::sens::num::BranchCmp::Lt, -1e-12) {
                 return true;
             }
         }
@@ -545,7 +547,15 @@ pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
         // cannot be *rewarded* with a negative term. Where the clamp binds the term is
         // the constant `ln 1 = 0`, with no derivative. Entry-level generator validity
         // stays the builder's responsibility (not re-checked here).
-        if p.val() > 1.0 {
+        // A recording type (#2786) selects the clamp rather than branching on it: a
+        // near-certain `p` sits within rounding of 1, on either side from one evaluation to
+        // the next. `−ln 1 = 0`, so the value is the skipped term's.
+        if T::RECORDS_BRANCHES {
+            let one = T::from_f64(1.0);
+            nll = nll - T::select_if(crate::sens::num::BranchCmp::Gt, p, one, one, p).ln();
+            continue;
+        }
+        if p.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1.0) {
             continue;
         }
         nll = nll - p.ln();

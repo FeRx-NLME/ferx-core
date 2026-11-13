@@ -235,8 +235,8 @@ const GOLDEN_NLL_BITS: &[(&str, u64)] = &[
 ];
 
 /// T2: the visitor refactor moved no bit. Every golden cell's NLL is the captured
-/// pre-change value, so the refactored add order is the old one; the #2437 dual instance
-/// of the same loops is pinned by its own parity tests (`eta_hessian_step_tests`).
+/// pre-change value, so the refactored add order is the old one; the recorded instance
+/// of the same loops is pinned by the plan parity tests (`non_gaussian_eta_hessian_tests`).
 ///
 /// Dies on: any reassociation of a record's term (e.g. `dh + (−log h)`, or adding
 /// `log h` to `nll` separately), a term visited but not added, or a changed sentinel path.

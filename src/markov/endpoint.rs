@@ -153,16 +153,11 @@ pub fn ctmm_subject_eta_grad(
     if subject.obs_records.is_empty() {
         return Some((0.0, vec![0.0; model.n_eta]));
     }
+    // The subject's compiled term (#2786).
+    use crate::sens::ode_provider::adjoint::terms::{term_gradient_planned, TermKind};
     let term = CtmmTerm { model, subject };
-    let f = crate::survival::FixedTheta { theta, term: &term };
-    if eta.is_empty() {
-        use crate::sens::eta_jets::EtaFunction;
-        return Some((f.eval::<f64>(&[])?, Vec::new()));
-    }
-    // η-only: the generator program reads θ as constants, so the dual carries one lane per
-    // random effect, and `expm` on it costs (1 + n_η) exponentials per gap — under the
-    // 2S×2S Fréchet solve a first-order (θ, η) jet needed — with no width cap.
-    crate::survival::eta_gradient_by_bucket(eta, &f)
+    let (q, g) = term_gradient_planned(model, subject, TermKind::Ctmm, &term, theta, eta)?;
+    (q.is_finite() && g.iter().all(|v| v.is_finite())).then_some((q, g))
 }
 
 /// Every CTMM endpoint's data term on the subject as a function of `(θ, η)`, on any number
@@ -231,35 +226,24 @@ impl CtmmTerm<'_> {
     }
 }
 
-/// Exact `(value, ∂²/∂η²)` of [`ctmm_subject_nll`] for the FOCEI Laplace term (#2437):
-/// [`CtmmTerm`] at fixed θ on η-jets, at the same 1× scale as the value — a drug-driven
-/// generator through its occupancy ODE on the same jets (#2482). `None` — the caller
-/// finite-differences the Hessian — on exactly the subjects [`ctmm_subject_eta_grad`]
-/// declines (an unresolvable program, a degenerate generator), and when η is past the
-/// widest dispatch bucket.
+/// Exact `(value, ∂²/∂η²)` of [`ctmm_subject_nll`] from the subject's [`CtmmTerm`] plan
+/// (#2786) — a drug-driven generator through its occupancy ODE in the same recording. `None`
+/// on exactly the subjects [`ctmm_subject_eta_grad`] declines.
+#[cfg(test)]
 pub(crate) fn ctmm_subject_eta_hessian(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> Option<(f64, nalgebra::DMatrix<f64>)> {
-    crate::sens::eta_jets::eta_hessian(
-        &crate::survival::FixedTheta {
-            theta,
-            term: &CtmmTerm { model, subject },
-        },
-        eta,
-    )
+    use crate::sens::ode_provider::adjoint::terms::TermKind;
+    let term = CtmmTerm { model, subject };
+    crate::survival::term_eta_hessian(model, subject, TermKind::Ctmm, &term, theta, eta)
 }
 
 /// Sum the CTMM-endpoint NLL over every `Ctmm` CMT for one subject, mirroring the
 /// per-endpoint TTE / binary dispatch. Returns `0.0` when the model has no CTMM
 /// endpoint or the subject has no discrete-state records for it.
-///
-/// This doubles as the FOCEI finite-difference η-Hessian closure at the interaction site,
-/// for the endpoints `ctmm_subject_eta_hessian` declines (#2437): evaluated at a
-/// perturbed η it rebuilds `Q(η)` and re-scores every transition, so
-/// `data_term_hessian_fd` picks up the CTMM curvature w.r.t. η.
 pub fn ctmm_subject_nll(
     model: &CompiledModel,
     subject: &Subject,
@@ -583,18 +567,22 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
             .collect::<Option<_>>()?;
         // The value path's guards at the sub-nodes, as declines.
         let mut vars = vars0.clone();
+        // Through the branch API (#2786): `|x| < ∞` is finite.
+        use crate::sens::num::BranchCmp::{Gt, Lt};
         for st in &nodes {
-            if st.iter().any(|x| !x.val().is_finite()) {
+            if st.iter().any(|x| !x.br_abs_lt(f64::INFINITY)) {
                 return None;
             }
             let q = prog.generator_at_g(theta, eta, &cov_vec, &mut vars, st);
             for j in 0..s {
                 for k in 0..s {
-                    let v = q[j * s + k].val();
-                    if !v.is_finite() || v.abs() * dt > crate::markov::MAX_EXP_ARG_ABS {
+                    let v = q[j * s + k];
+                    if !v.br_abs_lt(f64::INFINITY)
+                        || (v.abs() * T::from_f64(dt)).br_cmp_c(Gt, crate::markov::MAX_EXP_ARG_ABS)
+                    {
                         return None;
                     }
-                    if j != k && v < -1e-12 {
+                    if j != k && v.br_cmp_c(Lt, -1e-12) {
                         return None;
                     }
                 }
@@ -602,17 +590,45 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
         }
         let n_ode = nodes[0].len();
         let work = std::cell::RefCell::new((vars, vec![T::from_f64(0.0); n_ode]));
-        let rhs = |u: &[T], _: &[T], tau: f64, du: &mut [T]| {
+        let rhs = |u: &[T], _: &[T], tau: T, du: &mut [T]| {
             let mut w = work.borrow_mut();
             let (vars, st) = &mut *w;
             // The state at `tau`, interpolated between the bracketing sub-nodes as the
-            // value path interpolates it.
-            let frac = (tau / dt).clamp(0.0, 1.0) * (n_sub as f64);
-            let lo = (frac.floor() as usize).min(n_sub);
-            let hi = (lo + 1).min(n_sub);
-            let w_hi = T::from_f64(frac - lo as f64);
-            for (o, (x, y)) in st.iter_mut().zip(nodes[lo].iter().zip(nodes[hi].iter())) {
-                *o = *x + (*y - *x) * w_hi;
+            // value path interpolates it. A recording type (#2786) records the step's time as
+            // an input, so it selects the bracket branch-free; every other type takes it by
+            // value.
+            if T::RECORDS_BRANCHES {
+                let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
+                let r = tau / T::from_f64(dt);
+                let r = T::select_if(Lt, r, zero, zero, r);
+                let r = T::select_if(Gt, r, one, one, r);
+                let frac = r * T::from_f64(n_sub as f64);
+                let fl = frac.floor_c();
+                for (j, o) in st.iter_mut().enumerate() {
+                    let mut acc = nodes[n_sub][j];
+                    for lo in (0..n_sub).rev() {
+                        let (x, y) = (nodes[lo][j], nodes[lo + 1][j]);
+                        let w_hi = frac - T::from_f64(lo as f64);
+                        let here = x + (y - x) * w_hi;
+                        acc = T::select_if(
+                            crate::sens::num::BranchCmp::Eq,
+                            fl,
+                            T::from_f64(lo as f64),
+                            here,
+                            acc,
+                        );
+                    }
+                    *o = acc;
+                }
+            } else {
+                let tau = tau.val();
+                let frac = (tau / dt).clamp(0.0, 1.0) * (n_sub as f64);
+                let lo = (frac.floor() as usize).min(n_sub);
+                let hi = (lo + 1).min(n_sub);
+                let w_hi = T::from_f64(frac - lo as f64);
+                for (o, (x, y)) in st.iter_mut().zip(nodes[lo].iter().zip(nodes[hi].iter())) {
+                    *o = *x + (*y - *x) * w_hi;
+                }
             }
             let q = prog.generator_at_g(theta, eta, &cov_vec, vars, st);
             // Forward Kolmogorov, `dP/dτ = P·Q`, row-major.
@@ -630,12 +646,29 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
         for i in 0..s {
             u0[i * s + i] = T::from_f64(1.0);
         }
-        let sol = crate::ode::solve_ode_g(&rhs, &u0, (0.0, dt), &[], &[dt], &opts);
+        // `solve_ode_g`'s own path, over a right-hand side taking time as `T`.
+        let sol = crate::ode::solver::solve_ode_g_with_auto_state(
+            &rhs,
+            &u0,
+            (0.0, dt),
+            &[],
+            &[dt],
+            &opts.for_integration(),
+            &mut crate::ode::solver::OdeAutoSwitchState::default(),
+        );
         let p = sol.last()?.u[w[0].state * s + w[1].state];
-        if !(p.val().is_finite() && p.val() > 0.0) {
+        if !(p.br_abs_lt(f64::INFINITY) && p.br_cmp_c(Gt, 0.0)) {
             return None;
         }
-        let p = if p.val() > 1.0 { T::from_f64(1.0) } else { p };
+        let one = T::from_f64(1.0);
+        let p = if T::RECORDS_BRANCHES {
+            // Selected, not branched on (#2786): `p` within rounding of 1 flips sides.
+            T::select_if(Gt, p, one, one, p)
+        } else if p.br_cmp_c(Gt, 1.0) {
+            one
+        } else {
+            p
+        };
         nll = nll - p.ln();
     }
     Some(nll)

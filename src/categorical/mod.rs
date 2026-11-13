@@ -59,6 +59,17 @@ fn inv_logit(x: f64) -> f64 {
 /// (below `x = −2`), where it would underflow.
 #[inline]
 fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) -> T {
+    // A recording type (#2786) records each term as one primitive of its jet.
+    if T::RECORDS_BRANCHES {
+        use crate::sens::num::JetFn;
+        return match link {
+            LinkFn::Probit => {
+                let s = if y > 0.5 { 1.0 } else { -1.0 };
+                (T::from_f64(s) * lp).jet_unary(JetFn::NegLogNormCdf)
+            }
+            LinkFn::Logit => lp.jet_unary(JetFn::Softplus) - T::from_f64(y) * lp,
+        };
+    }
     match link {
         LinkFn::Probit => {
             let s = if y > 0.5 { 1.0 } else { -1.0 };
@@ -411,15 +422,11 @@ pub(crate) fn discrete_subject_eta_grad(
     if subject.obs_records.is_empty() {
         return Some((0.0, vec![0.0; model.n_eta]));
     }
+    // The subject's compiled term (#2786).
+    use crate::sens::ode_provider::adjoint::terms::{term_gradient_planned, TermKind};
     let term = DiscreteTerm { model, subject };
-    let nll = crate::survival::FixedTheta { theta, term: &term };
-    if eta.is_empty() {
-        use crate::sens::eta_jets::EtaFunction;
-        return Some((nll.eval::<f64>(&[])?, Vec::new()));
-    }
-    // η-only: the program reads θ as constants, so the dual carries one lane per random
-    // effect and no width cap applies.
-    crate::survival::eta_gradient_by_bucket(eta, &nll)
+    let (q, g) = term_gradient_planned(model, subject, TermKind::Discrete, &term, theta, eta)?;
+    (q.is_finite() && g.iter().all(|v| v.is_finite())).then_some((q, g))
 }
 
 /// Every discrete endpoint's data term on the subject as a function of `(θ, η)`, on any
@@ -461,7 +468,8 @@ impl crate::survival::SubjectTerm for DiscreteTerm<'_> {
                 let lp = with_model_time(*time, || prog.eval_g(th, et, cov))?
                     .into_iter()
                     .next()?;
-                if !lp.val().is_finite() {
+                // `|lp| < ∞`: finite, through the branch API (#2786).
+                if !lp.br_abs_lt(f64::INFINITY) {
                     return None;
                 }
                 // The same per-record kernel the value path runs (#2437).
@@ -481,23 +489,18 @@ impl crate::survival::SubjectTerm for DiscreteTerm<'_> {
     }
 }
 
-/// Exact `(value, ∂²/∂η²)` of [`discrete_subject_nll`] for the FOCEI Laplace term (#2437):
-/// [`DiscreteTerm`] at fixed θ on η-jets, at the same 1× scale as the value. `None` — the
-/// caller finite-differences the Hessian — when a binary endpoint has no dual program, a
-/// predictor is non-finite, or η is past the widest dispatch bucket.
+/// Exact `(value, ∂²/∂η²)` of [`discrete_subject_nll`] from the subject's [`DiscreteTerm`]
+/// plan (#2786). `None` when the term does not record or on a non-finite derivative.
+#[cfg(test)]
 pub(crate) fn discrete_subject_eta_hessian(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> Option<(f64, nalgebra::DMatrix<f64>)> {
-    crate::sens::eta_jets::eta_hessian(
-        &crate::survival::FixedTheta {
-            theta,
-            term: &DiscreteTerm { model, subject },
-        },
-        eta,
-    )
+    use crate::sens::ode_provider::adjoint::terms::TermKind;
+    let term = DiscreteTerm { model, subject };
+    crate::survival::term_eta_hessian(model, subject, TermKind::Discrete, &term, theta, eta)
 }
 
 /// Whether [`discrete_subject_eta_grad`] can serve every binary endpoint of `model`: each

@@ -42,7 +42,7 @@ pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
     let q = s1 * s2 * third - s2 * s2 * s2 * T::from_f64(2.0 / 27.0) - s0;
 
     // Guard p = 0 (matches production `p.min(-1e-30)`); inactive for valid PK.
-    let p_safe = if p.val() < -1e-30 {
+    let p_safe = if p.br_cmp_c(crate::sens::num::BranchCmp::Lt, -1e-30) {
         p
     } else {
         T::from_f64(-1e-30)
@@ -50,9 +50,9 @@ pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
     let m = (-(p_safe * third)).sqrt() * T::from_f64(2.0);
     // arg = 3q / (p_safe·m), clamped to [-1, 1] (identity in the interior).
     let arg_raw = (q * T::from_f64(3.0)) / (p_safe * m);
-    let arg = if arg_raw.val() > 1.0 {
+    let arg = if arg_raw.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1.0) {
         T::from_f64(1.0)
-    } else if arg_raw.val() < -1.0 {
+    } else if arg_raw.br_cmp_c(crate::sens::num::BranchCmp::Lt, -1.0) {
         T::from_f64(-1.0)
     } else {
         arg_raw
@@ -67,17 +67,18 @@ pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
     // Sort by value: alpha > beta > gamma. The concentration is symmetric under
     // root permutation, so selecting the dual by `.val()` is exact at distinct
     // roots (the sort is locally constant there).
-    let (l0v, l1v, l2v) = (lambda0.val(), lambda1.val(), lambda2.val());
-    let alpha = if l0v >= l1v && l0v >= l2v {
+    // Through the branch API (#2786): the comparisons a recording type checks.
+    use crate::sens::num::BranchCmp as B;
+    let alpha = if lambda0.br_cmp(B::Ge, lambda1) && lambda0.br_cmp(B::Ge, lambda2) {
         lambda0
-    } else if l1v >= l2v {
+    } else if lambda1.br_cmp(B::Ge, lambda2) {
         lambda1
     } else {
         lambda2
     };
-    let gamma = if l0v <= l1v && l0v <= l2v {
+    let gamma = if lambda0.br_cmp(B::Le, lambda1) && lambda0.br_cmp(B::Le, lambda2) {
         lambda0
-    } else if l1v <= l2v {
+    } else if lambda1.br_cmp(B::Le, lambda2) {
         lambda1
     } else {
         lambda2
@@ -177,7 +178,7 @@ pub(crate) fn three_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>) 
         ..
     } = *d;
 
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -185,7 +186,9 @@ pub(crate) fn three_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>) 
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if v2.val() <= 0.0 || v3.val() <= 0.0 {
+    if v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || v3.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    {
         return T::from_f64(0.0);
     }
 
@@ -196,7 +199,7 @@ pub(crate) fn three_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>) 
     // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
     // for physical PK params (distinct real eigenvalues); return 0 rather than the
     // confluent limit form — a deliberate edge (PR #381, review #1).
-    if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
+    if ab.br_abs_lt(1e-12) || ag.br_abs_lt(1e-12) || bg.br_abs_lt(1e-12) {
         return T::from_f64(0.0);
     }
     let d = amt / v1;
@@ -247,7 +250,7 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
         ..
     } = *d;
 
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -255,7 +258,9 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if v2.val() <= 0.0 || v3.val() <= 0.0 {
+    if v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || v3.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -265,12 +270,12 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
-    if ab.val().abs() < 1e-12
-        || ag.val().abs() < 1e-12
-        || bg.val().abs() < 1e-12
-        || alpha.val().abs() < 1e-12
-        || beta.val().abs() < 1e-12
-        || gamma.val().abs() < 1e-12
+    if ab.br_abs_lt(1e-12)
+        || ag.br_abs_lt(1e-12)
+        || bg.br_abs_lt(1e-12)
+        || alpha.br_abs_lt(1e-12)
+        || beta.br_abs_lt(1e-12)
+        || gamma.br_abs_lt(1e-12)
     {
         return T::from_f64(0.0);
     }
@@ -280,7 +285,7 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
     let g_coeff = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
     let one = T::from_f64(1.0);
     let dd = T::from_f64(dur);
-    if t.val() <= dur {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Le, dur) {
         let tt = t;
         a_coeff * (one - (-(alpha * tt)).exp())
             + b_coeff * (one - (-(beta * tt)).exp())
@@ -353,7 +358,7 @@ pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: 
         ..
     } = *d;
 
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -361,7 +366,10 @@ pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: 
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if v2.val() <= 0.0 || v3.val() <= 0.0 || ka.val() <= 0.0 {
+    if v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || v3.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    {
         return T::from_f64(0.0);
     }
 
@@ -372,7 +380,7 @@ pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: 
     // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
     // for physical PK params (distinct real eigenvalues); return 0 rather than the
     // confluent limit form — a deliberate edge (PR #381, review #1).
-    if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
+    if ab.br_abs_lt(1e-12) || ag.br_abs_lt(1e-12) || bg.br_abs_lt(1e-12) {
         return T::from_f64(0.0);
     }
     let coeff = f_bio * amt * ka / v1;
@@ -383,7 +391,7 @@ pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: 
 
     // Bateman per eigenvalue λ with L'Hôpital limit when ka ≈ λ.
     let bateman = |lambda: T| -> T {
-        if (ka.val() - lambda.val()).abs() < 1e-6 {
+        if ka.br_absdiff_lt(lambda, 1e-6) {
             tt * (-(lambda * tt)).exp()
         } else {
             ((-(lambda * tt)).exp() - (-(ka * tt)).exp()) / (ka - lambda)
@@ -396,7 +404,7 @@ pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: 
 /// SS geometric-series factor `1/(1 − e^{−λ·ii})`.
 fn ss_coeff_g<T: PkNum>(lambda: T, ii: f64) -> T {
     let denom = T::from_f64(1.0) - (-(lambda * T::from_f64(ii))).exp();
-    if denom.val() > 0.0 {
+    if denom.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
         T::from_f64(1.0) / denom
     } else {
         T::from_f64(0.0)
@@ -436,7 +444,7 @@ pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &Thr
         ..
     } = *d;
 
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -444,7 +452,10 @@ pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &Thr
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if v2.val() <= 0.0 || v3.val() <= 0.0 || ii <= 0.0 {
+    if v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || v3.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || ii <= 0.0
+    {
         return T::from_f64(0.0);
     }
 
@@ -455,7 +466,7 @@ pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &Thr
     // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
     // for physical PK params (distinct real eigenvalues); return 0 rather than the
     // confluent limit form — a deliberate edge (PR #381, review #1).
-    if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
+    if ab.br_abs_lt(1e-12) || ag.br_abs_lt(1e-12) || bg.br_abs_lt(1e-12) {
         return T::from_f64(0.0);
     }
     let d = T::from_f64(amt) / v1;
@@ -517,7 +528,7 @@ pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
         ..
     } = *d;
 
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -525,7 +536,11 @@ pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if v2.val() <= 0.0 || v3.val() <= 0.0 || ka.val() <= 0.0 || ii <= 0.0 {
+    if v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || v3.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || ii <= 0.0
+    {
         return T::from_f64(0.0);
     }
 
@@ -536,7 +551,7 @@ pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
     // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
     // for physical PK params (distinct real eigenvalues); return 0 rather than the
     // confluent limit form — a deliberate edge (PR #381, review #1).
-    if ab.val().abs() < 1e-12 || ag.val().abs() < 1e-12 || bg.val().abs() < 1e-12 {
+    if ab.br_abs_lt(1e-12) || ag.br_abs_lt(1e-12) || bg.br_abs_lt(1e-12) {
         return T::from_f64(0.0);
     }
     let coeff = f_bio * T::from_f64(amt) * ka / v1;
@@ -548,10 +563,10 @@ pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
     // SS Bateman per eigenvalue λ, with L'Hôpital limit when ka ≈ λ:
     //   Σ_n (τ + n·II)·e^{−λ(τ+nII)} = e^{−λτ}·[τ/(1−x) + II·x/(1−x)²], x=e^{−λII}.
     let bateman_ss = |lambda: T| -> T {
-        if (ka.val() - lambda.val()).abs() < 1e-6 {
+        if ka.br_absdiff_lt(lambda, 1e-6) {
             let x = (-(lambda * T::from_f64(ii))).exp();
             let omx = T::from_f64(1.0) - x;
-            if omx.val() <= 0.0 {
+            if omx.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
                 return T::from_f64(0.0);
             }
             (-(lambda * tt)).exp() * (tt / omx + (x * T::from_f64(ii)) / (omx * omx))
@@ -615,7 +630,7 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
         ..
     } = *d;
 
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -623,7 +638,10 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if v2.val() <= 0.0 || v3.val() <= 0.0 || ii <= 0.0 {
+    if v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || v3.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || ii <= 0.0
+    {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
@@ -633,12 +651,12 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
     let ab = alpha - beta;
     let ag = alpha - gamma;
     let bg = beta - gamma;
-    if ab.val().abs() < 1e-12
-        || ag.val().abs() < 1e-12
-        || bg.val().abs() < 1e-12
-        || alpha.val().abs() < 1e-12
-        || beta.val().abs() < 1e-12
-        || gamma.val().abs() < 1e-12
+    if ab.br_abs_lt(1e-12)
+        || ag.br_abs_lt(1e-12)
+        || bg.br_abs_lt(1e-12)
+        || alpha.br_abs_lt(1e-12)
+        || beta.br_abs_lt(1e-12)
+        || gamma.br_abs_lt(1e-12)
     {
         return T::from_f64(0.0);
     }
@@ -675,7 +693,7 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
             * ss_coeff_g(lambda, ii)
     };
 
-    if t.val() <= dur {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Le, dur) {
         let tt = t;
         a_coeff * (one - (-(alpha * tt)).exp())
             + b_coeff * (one - (-(beta * tt)).exp())
@@ -735,7 +753,7 @@ pub(crate) fn three_cpt_conc_d<T: PkNum>(
     // `pk::single_dose_concentration` does: a degenerate `CL`/`V` drops the dose (0 even
     // when `F` is `NaN` or infinite, which the post-multiply below would turn `NaN`), a
     // `NaN` one serves `NaN`. Before arrival the leaf kernels read 0.
-    if t.val() >= 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
         if let Some(c) = crate::sens::propagate::dose_override_g(d.cl, d.v1) {
             return c;
         }

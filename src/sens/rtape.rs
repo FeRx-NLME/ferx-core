@@ -24,10 +24,25 @@ struct RTape {
     off: Vec<u32>,
     ent: Vec<(u32, f64)>,
     adj: Vec<f64>,
+    /// Block nodes ([`rblock`]), by their marker's position.
+    blocks: Vec<Block>,
+}
+
+/// A computation recorded as one node (#2786): its outputs are leaves after a marker, and the
+/// sweep, on reaching the marker, maps their adjoints to its inputs' through `rev` — one call
+/// for every lane with an adjoint, `rev(k, out_adj, in_adj)` over `k` lanes' blocks, adding
+/// into `in_adj`.
+type BlockRev = Box<dyn Fn(usize, &[f64], &mut [f64])>;
+
+struct Block {
+    at: u32,
+    ins: Vec<u32>,
+    outs: Vec<u32>,
+    rev: BlockRev,
 }
 
 thread_local! {
-    static RT: UnsafeCell<RTape> = const { UnsafeCell::new(RTape { off: Vec::new(), ent: Vec::new(), adj: Vec::new() }) };
+    static RT: UnsafeCell<RTape> = const { UnsafeCell::new(RTape { off: Vec::new(), ent: Vec::new(), adj: Vec::new(), blocks: Vec::new() }) };
 }
 
 #[inline]
@@ -58,6 +73,7 @@ pub(crate) fn rtape_reset() {
     let t = rt();
     t.off.clear();
     t.ent.clear();
+    t.blocks.clear();
     t.off.push(0);
 }
 
@@ -75,6 +91,7 @@ pub(crate) fn rtape_trim(nodes: usize) {
             off: Vec::new(),
             ent: Vec::new(),
             adj: Vec::new(),
+            blocks: Vec::new(),
         };
         t.off.push(0);
     }
@@ -90,6 +107,22 @@ pub(crate) fn rinput(v: f64) -> R {
     }
 }
 
+/// A block node: `outs` new values computed from `ins`, whose reverse rule is `rev`
+/// (`rev(k, out_adj, in_adj)`: for each of `k` lanes' blocks, add `out_adjᵀ ∂outs/∂ins`
+/// into `in_adj`). Returns the outputs as tape values.
+pub(crate) fn rblock(ins: &[R], outs: &[f64], rev: BlockRev) -> Vec<R> {
+    let marker = rinput(0.0);
+    let out: Vec<R> = outs.iter().map(|&v| rinput(v)).collect();
+    let t = rt();
+    t.blocks.push(Block {
+        at: marker.i,
+        ins: ins.iter().map(|x| x.i).collect(),
+        outs: out.iter().map(|x| x.i).collect(),
+        rev,
+    });
+    out
+}
+
 /// Backward sweep with `L` lanes; lane `l` is seeded with 1 on `outs[l]`. Returns the
 /// node-major adjoint buffer `adj[node·L + lane]`.
 pub(crate) fn rsweep<const L: usize>(outs: &[R; L]) -> &'static [f64] {
@@ -103,8 +136,50 @@ pub(crate) fn rsweep<const L: usize>(outs: &[R; L]) -> &'static [f64] {
         }
     }
     let (off, ent) = (&t.off[..], &t.ent[..]);
+    let blocks = &t.blocks[..];
+    let mut bi = blocks.len();
     let adj = t.adj.as_mut_ptr();
+    let (mut oa, mut ia) = (Vec::new(), Vec::new());
     for i in (0..n).rev() {
+        // A block's marker: its outputs (later nodes) hold their adjoints now.
+        if bi > 0 && blocks[bi - 1].at as usize == i {
+            bi -= 1;
+            let b = &blocks[bi];
+            // Linear in the outputs' adjoints: a lane with none adds nothing.
+            let mut lanes = [0usize; L];
+            let mut k = 0;
+            oa.clear();
+            for l in 0..L {
+                // SAFETY: every output is a node below `n`.
+                let at = oa.len();
+                oa.extend(
+                    b.outs
+                        .iter()
+                        .map(|&o| unsafe { *adj.add(o as usize * L + l) }),
+                );
+                if oa[at..].iter().all(|&g| g == 0.0) {
+                    oa.truncate(at);
+                } else {
+                    lanes[k] = l;
+                    k += 1;
+                }
+            }
+            if k > 0 {
+                let ni = b.ins.len();
+                ia.clear();
+                ia.resize(k * ni, 0.0);
+                (b.rev)(k, &oa, &mut ia);
+                for (s, &l) in lanes[..k].iter().enumerate() {
+                    for (&x, &g) in b.ins.iter().zip(&ia[s * ni..(s + 1) * ni]) {
+                        if x != NONE {
+                            // SAFETY: an input is a node below the marker.
+                            unsafe { *adj.add(x as usize * L + l) += g };
+                        }
+                    }
+                }
+            }
+            continue;
+        }
         // SAFETY: `i < n` and every entry's parent is an earlier node (`push` only ever
         // records existing ids), so all offsets are inside the `n·L` buffer; the read of
         // node `i`'s lanes completes before any write to a parent's.
@@ -532,6 +607,48 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     const SECOND_ORDER: bool = false;
     const JET_ORDER: usize = B::JET_ORDER + 1;
     const WORK: usize = (1 + N) * B::WORK;
+    // The branch API on the base value (#2786): a recording base records the decision, so a
+    // nested dual over it — the kernel's `f`-derivative helper — decides as the base does.
+    const RECORDS_BRANCHES: bool = B::RECORDS_BRANCHES;
+    #[inline]
+    fn br_cmp(self, cc: crate::sens::num::BranchCmp, other: Self) -> bool {
+        self.v.br_cmp(cc, other.v)
+    }
+    #[inline]
+    fn br_cmp_c(self, cc: crate::sens::num::BranchCmp, c: f64) -> bool {
+        self.v.br_cmp_c(cc, c)
+    }
+    #[inline]
+    fn br_shift_cmp(self, base: f64, cc: crate::sens::num::BranchCmp, c: f64) -> bool {
+        self.v.br_shift_cmp(base, cc, c)
+    }
+    #[inline]
+    fn br_abs_lt(self, tol: f64) -> bool {
+        self.v.br_abs_lt(tol)
+    }
+    #[inline]
+    fn br_absdiff_lt(self, other: Self, tol: f64) -> bool {
+        self.v.br_absdiff_lt(other.v, tol)
+    }
+    #[inline]
+    fn br_is_nan(self) -> bool {
+        self.v.br_is_nan()
+    }
+    /// Every part selected on the values' condition.
+    #[inline]
+    fn select_if(cc: crate::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self {
+        DualT {
+            v: B::select_if(cc, x.v, y.v, a.v, b.v),
+            g: std::array::from_fn(|k| B::select_if(cc, x.v, y.v, a.g[k], b.g[k])),
+        }
+    }
+    #[inline]
+    fn value_only(self) -> Self {
+        DualT {
+            v: self.v.value_only(),
+            g: [B::from_f64(0.0); N],
+        }
+    }
     #[inline]
     fn is_constant(self) -> bool {
         self.v.is_constant() && self.g.iter().all(|d| d.is_constant() && d.val() == 0.0)
@@ -569,7 +686,7 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         // derivative) is kept, so this differentiates the function the gradient records.
         if e.is_constant() {
             let n = e.v.val();
-            if self.v.val() == 0.0 {
+            if self.v.br_cmp_c(crate::sens::num::BranchCmp::Eq, 0.0) {
                 return DualT::constant(0.0f64.powf(n));
             }
             let d1 = B::from_f64(n) * self.v.pow(B::from_f64(n - 1.0));
@@ -578,7 +695,7 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         (e * self.ln()).exp()
     }
     fn abs(self) -> Self {
-        if self.v.val() >= 0.0 {
+        if self.v.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
             self
         } else {
             -self
@@ -604,7 +721,7 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         self.chain(x.acos(), d)
     }
     fn guard_floor(self, lo: f64) -> Self {
-        if !(self.v.val() >= lo) {
+        if !self.v.br_cmp_c(crate::sens::num::BranchCmp::Ge, lo) {
             DualT::constant(lo)
         } else {
             self
@@ -699,8 +816,8 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> 
         let g = std::array::from_fn(|k| p1 * self.g[k]);
         let mut h = self.h;
         for k in 0..N {
-            for l in crate::sens::vtape::hrange::<D, M>(k) {
-                let t = crate::sens::vtape::hidx::<D>(k, l);
+            for l in hrange::<D, M>(k) {
+                let t = hidx::<D>(k, l);
                 h[t] = p1 * self.h[t] + p2 * self.g[k] * self.g[l];
             }
         }
@@ -709,7 +826,7 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> 
     /// The packed Hessian entry `(k, l)` (full mode).
     #[inline]
     pub fn hess(&self, k: usize, l: usize) -> B {
-        self.h[crate::sens::vtape::tri(k, l)]
+        self.h[tri(k, l)]
     }
 }
 
@@ -785,8 +902,8 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> DualH<N, M, B, D> 
         let g = std::array::from_fn(|k| B::dot2(self.g[k], o.v, self.v, o.g[k]));
         let mut h = self.h;
         for k in 0..N {
-            for l in crate::sens::vtape::hrange::<D, M>(k) {
-                let t = crate::sens::vtape::hidx::<D>(k, l);
+            for l in hrange::<D, M>(k) {
+                let t = hidx::<D>(k, l);
                 h[t] = B::dot4(
                     self.h[t], o.v, self.v, o.h[t], self.g[k], o.g[l], self.g[l], o.g[k],
                 );
@@ -862,6 +979,50 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
     const SECOND_ORDER: bool = true;
     const JET_ORDER: usize = B::JET_ORDER + 2;
     const WORK: usize = (1 + N + M) * B::WORK;
+    // The branch API on the base value (#2786): a recording base records the decision, so a
+    // nested dual over it — the kernel's `f`-derivative helper — decides as the base does.
+    const RECORDS_BRANCHES: bool = B::RECORDS_BRANCHES;
+    #[inline]
+    fn br_cmp(self, cc: crate::sens::num::BranchCmp, other: Self) -> bool {
+        self.v.br_cmp(cc, other.v)
+    }
+    #[inline]
+    fn br_cmp_c(self, cc: crate::sens::num::BranchCmp, c: f64) -> bool {
+        self.v.br_cmp_c(cc, c)
+    }
+    #[inline]
+    fn br_shift_cmp(self, base: f64, cc: crate::sens::num::BranchCmp, c: f64) -> bool {
+        self.v.br_shift_cmp(base, cc, c)
+    }
+    #[inline]
+    fn br_abs_lt(self, tol: f64) -> bool {
+        self.v.br_abs_lt(tol)
+    }
+    #[inline]
+    fn br_absdiff_lt(self, other: Self, tol: f64) -> bool {
+        self.v.br_absdiff_lt(other.v, tol)
+    }
+    #[inline]
+    fn br_is_nan(self) -> bool {
+        self.v.br_is_nan()
+    }
+    /// Every part selected on the values' condition.
+    #[inline]
+    fn select_if(cc: crate::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self {
+        DualH {
+            v: B::select_if(cc, x.v, y.v, a.v, b.v),
+            g: std::array::from_fn(|k| B::select_if(cc, x.v, y.v, a.g[k], b.g[k])),
+            h: std::array::from_fn(|k| B::select_if(cc, x.v, y.v, a.h[k], b.h[k])),
+        }
+    }
+    #[inline]
+    fn value_only(self) -> Self {
+        DualH {
+            v: self.v.value_only(),
+            g: [B::from_f64(0.0); N],
+            h: [B::from_f64(0.0); M],
+        }
+    }
     #[inline]
     fn is_constant(self) -> bool {
         self.v.is_constant()
@@ -901,7 +1062,7 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
         // The constant-exponent power rule, as [`DualT::pow`] (#2093 review).
         if e.is_constant() {
             let n = e.v.val();
-            if self.v.val() == 0.0 {
+            if self.v.br_cmp_c(crate::sens::num::BranchCmp::Eq, 0.0) {
                 return DualH::constant(0.0f64.powf(n));
             }
             let c = B::from_f64;
@@ -912,7 +1073,7 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
         (e * self.ln()).exp()
     }
     fn abs(self) -> Self {
-        if self.v.val() >= 0.0 {
+        if self.v.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
             self
         } else {
             -self
@@ -943,7 +1104,7 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
         self.chain2(x.acos(), d1, d1 * x / w)
     }
     fn guard_floor(self, lo: f64) -> Self {
-        if !(self.v.val() >= lo) {
+        if !self.v.br_cmp_c(crate::sens::num::BranchCmp::Ge, lo) {
             DualH::constant(lo)
         } else {
             self
@@ -988,6 +1149,43 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
         let p1 = self.v.lift3(d1, d2, d3, d4);
         let p2 = self.v.lift2(d2, d3, d4);
         self.chain2(self.v.lift4(v, d1, d2, d3, d4), p1, p2)
+    }
+}
+
+/// Packed lower-triangle index of the symmetric pair `(k, l)`.
+#[inline]
+pub(crate) const fn tri(k: usize, l: usize) -> usize {
+    if l <= k {
+        k * (k + 1) / 2 + l
+    } else {
+        l * (l + 1) / 2 + k
+    }
+}
+
+/// The second-order entries a dual carries for row `k`: the packed lower triangle
+/// `(k, 0..=k)` of a full Hessian, or with `TH` (directional mode, `M = N`) only the pure
+/// second derivative `(k, k)` along tangent direction `k` — the diagonal of a product or
+/// chain rule never reads an off-diagonal entry, so it is a closed algebra. A first-order
+/// dual (`M = 0`) carries none.
+#[inline]
+#[allow(clippy::reversed_empty_ranges)]
+const fn hrange<const TH: bool, const M: usize>(k: usize) -> std::ops::RangeInclusive<usize> {
+    if M == 0 {
+        1..=0
+    } else if TH {
+        k..=k
+    } else {
+        0..=k
+    }
+}
+
+/// Storage index of second-order entry `(k, l)` ([`hrange`]).
+#[inline]
+const fn hidx<const TH: bool>(k: usize, l: usize) -> usize {
+    if TH {
+        k
+    } else {
+        tri(k, l)
     }
 }
 
@@ -1039,7 +1237,7 @@ mod tests {
         };
         let yh = xh.pow(DualH::constant(2.0));
         assert_eq!((yh.v, yh.g[0]), (4.0, -4.0));
-        assert_eq!(yh.h[crate::sens::vtape::tri(0, 0)], 2.0, "∂²(x²)/∂t₀² = 2");
+        assert_eq!(yh.h[tri(0, 0)], 2.0, "∂²(x²)/∂t₀² = 2");
         let live = DualT::<2, f64> {
             v: 2.0,
             g: [0.0, 1.0],

@@ -91,8 +91,15 @@ fn prog_covers_required_pk_slots(
 /// `lag_val` its value (kept separate to branch on `.val()` without a borrow).
 #[inline]
 fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> Option<T> {
+    use crate::sens::num::BranchCmp as B;
     let t_eff = dose.time + lag_val;
-    if t_eff <= t_obs {
+    // A recording decides on its own lag, through the branch API (#2786): the same sum.
+    let arrived = if T::RECORDS_BRANCHES {
+        lag_d.br_shift_cmp(dose.time, B::Le, t_obs)
+    } else {
+        t_eff <= t_obs
+    };
+    if arrived {
         // `elapsed = (t_obs − dose.time) − lagtime`.
         Some(T::from_f64(t_obs - dose.time) - lag_d)
     } else if dose.ss && dose.ii > 0.0 && t_obs >= dose.time {
@@ -101,8 +108,16 @@ fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T
         // locally constant, so `∂elapsed/∂lagtime = −1` still holds.
         let raw = t_obs - t_eff;
         let n = (-raw / dose.ii).ceil();
+        if T::RECORDS_BRANCHES {
+            // `n` is a step function of the lag: keep it, `n − 1 < (t_eff − t_obs)/II ≤ n`,
+            // on the recorded quotient (the same operations: `−(a − b) = b − a` exactly).
+            let q = (T::from_f64(dose.time) + lag_d - T::from_f64(t_obs)) / T::from_f64(dose.ii);
+            if !(q.br_cmp_c(B::Gt, n - 1.0) && q.br_cmp_c(B::Le, n)) {
+                return None;
+            }
+        }
         let wrapped = T::from_f64(t_obs - dose.time + n * dose.ii) - lag_d;
-        if wrapped.val() < 0.0 {
+        if wrapped.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
             None
         } else {
             Some(wrapped)
@@ -202,7 +217,7 @@ impl<T: PkNum> SeededPkDuals<T> {
     /// ([`crate::sens::propagate::cl_or_v_degenerate`], #2104), on the seeded values.
     #[inline]
     fn cl_or_v_degenerate(&self) -> bool {
-        crate::sens::propagate::cl_or_v_degenerate(self.cl_d.val(), self.v1_d.val())
+        crate::sens::propagate::cl_or_v_degenerate_g(self.cl_d, self.v1_d)
     }
 
     /// `crate::sens::propagate::dose_override_g` on the seeded values, for the
@@ -971,7 +986,7 @@ pub(crate) fn nn_output_chain_supported(model: &CompiledModel) -> bool {
 /// transient `D ≤ 0` / `R ≤ 0` from turning `amt/D` into a non-finite rate (#486).
 #[inline]
 fn clamp_dual_floor<T: crate::sens::num::PkNum>(x: T, floor: f64) -> T {
-    if x.val() > floor {
+    if x.br_cmp_c(crate::sens::num::BranchCmp::Gt, floor) {
         x
     } else {
         T::from_f64(floor)
@@ -1382,7 +1397,11 @@ pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
             .map(|(j, c)| {
                 // Clamp the concentration jet to ≥ 0 BEFORE any readout — production clamps
                 // `conc.max(0.0)` and only then applies the readout (returned unclamped).
-                let c = if c.val() < 0.0 { T::from_f64(0.0) } else { *c };
+                let c = if c.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
+                    T::from_f64(0.0)
+                } else {
+                    *c
+                };
                 let Some(ro) = readout else {
                     return c;
                 };
@@ -1473,7 +1492,7 @@ pub(crate) fn add_closed_form_init_g<T: crate::sens::num::vm::VmNum>(
         let a0 = prog.eval_scale_g(theta, eta, &subject.covariates, &vars);
         // Only a non-finite amount is skipped. A zero one still carries `∂A₀/∂(θ, η)`, which
         // reaches `∂C` as `kernel · ∂A₀` (#527): skipping it zeroes that gradient.
-        if !a0.val().is_finite() {
+        if !a0.br_abs_lt(f64::INFINITY) {
             continue;
         }
         for (j, &t) in subject.obs_times.iter().enumerate() {
@@ -1588,6 +1607,7 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
     // adds them before the readout and scaling; the two never coexist on the closed form).
     let mut conc: Vec<T> = crate::scratch::take_for(subject.obs_times.len());
     conc.extend(subject.obs_times.iter().map(|&t_obs| {
+        T::chunk_mark();
         let fd = superpose_doses(
             &seeded,
             flags,
@@ -1596,7 +1616,7 @@ pub(crate) fn analytic_static_predictions<T: crate::sens::num::vm::VmNum>(
             reset_floor_at(subject, t_obs),
         );
         // Mirror production's `conc.max(0.0)`.
-        if fd.val() < 0.0 {
+        if fd.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
             T::from_f64(0.0)
         } else {
             fd

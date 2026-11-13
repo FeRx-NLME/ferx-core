@@ -410,24 +410,23 @@ impl RecordIndex {
 /// The front door is `check_dose_attr_finiteness` (`E_DOSE_ATTR_NONFINITE`), which
 /// rejects a non-finite `ALAG`/`F` at typical values before the fit starts; this guard
 /// is for the mid-fit θ/η excursion that no init-time check can see.
+///
+/// Takes an iterator, so the dense builders (`break_times.iter().copied()`) and the
+/// event-driven engines (`(time, kind, idx)` tuples) share this one definition without a
+/// temporary `Vec` on a per-subject hot path; and any [`PkNum`](crate::sens::num::PkNum), so
+/// the gradient walks, whose times carry jets (#2786), ask it too — through the branch API,
+/// `|t| < ∞`, which a `NaN` fails as well.
 #[inline]
-pub(crate) fn timeline_has_non_finite(break_times: &[f64]) -> bool {
-    times_have_non_finite(break_times.iter().copied())
-}
-
-/// [`timeline_has_non_finite`] for a walk whose timeline is not a `&[f64]` — the two
-/// event-driven engines carry `(time, kind, idx)` tuples. Takes an iterator so those
-/// call sites share this one definition instead of open-coding `!is_finite()`, and
-/// without allocating a temporary `Vec` on a per-subject hot path.
-#[inline]
-pub(crate) fn times_have_non_finite(mut times: impl Iterator<Item = f64>) -> bool {
-    times.any(|t| !t.is_finite())
+pub(crate) fn times_have_non_finite<T: crate::sens::num::PkNum>(
+    mut times: impl Iterator<Item = T>,
+) -> bool {
+    times.any(|t| !t.br_abs_lt(f64::INFINITY))
 }
 
 /// **The engine guard: `true` when this walk must be abandoned, and the abandonment recorded.**
 ///
 /// The predicate and the counter are deliberately one call (#1234). Nothing about
-/// [`timeline_has_non_finite`] makes recording structural, and the counter is only worth
+/// [`times_have_non_finite`] makes recording structural, and the counter is only worth
 /// having if every abandoning engine bumps it: a ninth guard written as a bare predicate would
 /// compile, run, and put the diagnostic back to `0/0/0` for that walk — indistinguishable from
 /// a subject there was nothing to integrate for, which is the whole defect. Going through here
@@ -593,13 +592,17 @@ fn push_breaks_after_origin(break_times: &mut Vec<f64>, extra_breaks: &[f64], or
 ///   unconsidered.
 /// * `u.len() == states[i].len()` (i.e. `ode.n_states`) — a short `u` would write rows of the
 ///   wrong width for every downstream `st[chz_state]` read.
-/// * `first_break` is finite. Both callers run `timeline_has_non_finite` first and return early;
+/// * `first_break` is finite. Both callers run `times_have_non_finite` first and return early;
 ///   a `NaN` here would make every comparison false and fill nothing, silently.
-fn fill_prestart_states(
+/// Generic in the number type (#2786): the static dual walk (`sens::ode_provider`) seeds its
+/// pre-start rows here too, marking each in `filled`, so a recording scores a pre-start time
+/// exactly as the value path does.
+pub(crate) fn fill_prestart_states<T: crate::sens::num::PkNum>(
     times: &[f64],
-    states: &mut [Vec<f64>],
-    first_break: Option<f64>,
-    u: &[f64],
+    states: &mut [Vec<T>],
+    first_break: Option<T>,
+    u: &[T],
+    mut filled: Option<&mut [bool]>,
 ) {
     debug_assert_eq!(
         times.len(),
@@ -607,20 +610,23 @@ fn fill_prestart_states(
         "fill_prestart_states: one state row per requested time"
     );
     debug_assert!(
-        first_break.is_none_or(|b| b.is_finite()),
-        "fill_prestart_states: callers guard `timeline_has_non_finite` before this point"
+        first_break.is_none_or(|b| b.br_abs_lt(f64::INFINITY)),
+        "fill_prestart_states: callers guard `times_have_non_finite` before this point"
     );
     let Some(first_break) = first_break else {
         return;
     };
     for (i, &t) in times.iter().enumerate() {
-        if t < first_break {
+        if T::from_f64(t).br_cmp(crate::sens::num::BranchCmp::Lt, first_break) {
             debug_assert_eq!(
                 u.len(),
                 states[i].len(),
                 "fill_prestart_states: seeded state is not the system's width"
             );
             states[i] = u.to_vec();
+            if let Some(f) = filled.as_deref_mut() {
+                f[i] = true;
+            }
         }
     }
 }
@@ -1325,6 +1331,24 @@ where
     FUnf: Fn(&[T]) -> Option<Vec<T>>,
     FFor: Fn(&[T]) -> Option<Vec<T>>,
 {
+    // A recording type (#2786) records the steady state as one call: both maps once, this very
+    // search at run time on the values, the derivatives implicit through `advance_forced`.
+    if T::RECORDS_BRANCHES {
+        let solve: Box<crate::parser::model_parser::rhs_regcode::kernel_jit::SolveFn> =
+            Box::new(move |maps| {
+                equilibrate_ss_input_rate_g::<f64, _, _>(n, ii, reltol, abstol, maps[0], maps[1])
+                    .map(|u| {
+                        (
+                            u,
+                            crate::parser::model_parser::rhs_regcode::kernel_jit::Found::Fixed(1),
+                        )
+                    })
+            });
+        let maps: [&dyn Fn(&[T]) -> Option<Vec<T>>; 2] = [&advance_unforced, &advance_forced];
+        if let Some(r) = T::ss_fixed_point(n, &[], &vec![0.0; n], &maps, solve) {
+            return r;
+        }
+    }
     // A top-level entry in its own right: `sens::ode_provider` calls this directly for the dual
     // SS equilibration, not only through `equilibrate_ss_pk_state`. Neither arm below ever
     // reaches `note_ss_nonconvergence_if_capped`, so clear the warning observation here too or
@@ -2492,6 +2516,20 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
     dose_mass: T,
 ) -> T {
     let mut local = T::from_f64(0.0);
+    if T::RECORDS_BRANCHES {
+        // A recording type (#2786) records this inside an ODE step, where `tad` moves from
+        // stage to stage: a branch here would not hold along the trajectory. Every cycle is
+        // summed, each masked by a selection (its kernel read at a safe age where it has not
+        // started); the cycles past the value path's stop add below its `1e-10` floor.
+        use crate::sens::num::BranchCmp::Gt;
+        let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
+        for j in 0..SS_EQUILIBRATION_CYCLES {
+            let tad_j = tad + ii * T::from_f64(j as f64);
+            let safe = T::select_if(Gt, tad_j, zero, tad_j, one);
+            local = local + T::select_if(Gt, tad_j, zero, prep.rate(safe, dose_mass), zero);
+        }
+        return local;
+    }
     let mut j = 0usize;
     while j < SS_EQUILIBRATION_CYCLES {
         let tad_j = tad + ii * T::from_f64(j as f64);
@@ -2542,24 +2580,28 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
 /// own dose, and a dose row after a co-timed EVID=3 row (the reader shifts a reset that
 /// lands at or before an earlier dose past it, `RESET_SEGMENT_GAP`, so a dose row
 /// *before* a co-timed reset reaches the engines with `record < reset`).
+///
+/// Generic over the segment's time type (#2786): `f64` on every walk but a recording
+/// type's, whose segment times can move with the inputs — its decisions then go through
+/// the branch API, the same comparisons on the same values.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ResetGate {
+pub(crate) struct ResetGate<G = f64> {
     cutoff: Option<usize>,
-    reached: f64,
-    reset_floor: f64,
-    t_seg: f64,
+    reached: G,
+    reset_floor: G,
+    t_seg: G,
 }
 
-impl ResetGate {
+impl<G: crate::sens::num::PkNum> ResetGate<G> {
     /// The gate for a segment starting at `t_seg` over `doses`, under the EVID=3/4
     /// `reset_floor` the walker has reached there. `NEG_INFINITY` for `t_seg` reaches no
     /// `SS=1` record (the synthetic non-SS pulse trains, which have none to reach); for
     /// `reset_floor` it means no EVID=3/4 reset.
     #[inline]
-    pub(crate) fn at_segment(doses: &[DoseEvent], reset_floor: f64, t_seg: f64) -> Self {
-        let reached = t_seg + EVENT_MATCH_TOL;
+    pub(crate) fn at_segment(doses: &[DoseEvent], reset_floor: G, t_seg: G) -> Self {
+        let reached = t_seg + G::from_f64(EVENT_MATCH_TOL);
         Self {
-            cutoff: crate::dosing::ss_reset_cutoff(doses, reached),
+            cutoff: crate::dosing::ss_reset_cutoff_g(doses, reached),
             reached,
             reset_floor,
             t_seg,
@@ -2582,15 +2624,16 @@ impl ResetGate {
     /// starts on is the whole answer.
     #[inline]
     pub(crate) fn live(&self, doses: &[DoseEvent], k: usize) -> bool {
+        use crate::sens::num::BranchCmp::{Ge, Lt};
         crate::dosing::ss_reset_live(doses, self.cutoff, k)
-            && crate::dosing::evid_reset_live(doses[k].time, self.reset_floor)
-            && self.t_seg < doses[k].off_at
+            && G::from_f64(doses[k].time).br_cmp(Ge, self.reset_floor)
+            && self.t_seg.br_cmp_c(Lt, doses[k].off_at)
     }
 
     /// Whether this segment has reached `d`'s record, so its implied pulse train is on.
     #[inline]
     fn record_reached(&self, d: &DoseEvent) -> bool {
-        d.time <= self.reached
+        G::from_f64(d.time).br_cmp(crate::sens::num::BranchCmp::Le, self.reached)
     }
 }
 
@@ -2622,14 +2665,17 @@ impl ResetGate {
 /// subjects, which always route to the TV-cov walk instead).
 #[inline]
 #[allow(clippy::too_many_arguments)] // mirrors the dose context threaded into the RHS wrappers
-pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
+pub(crate) fn add_prepared_input_rate_forcing<
+    T: crate::sens::num::PkNum,
+    G: crate::sens::num::PkNum,
+>(
     ode: &OdeSpec,
     prepared: &PreparedForcings<T>,
     doses: &[DoseEvent],
     dose_lagtimes: &[T],
     dose_f_bio: &[T],
-    gate: ResetGate,
-    t: f64,
+    gate: ResetGate<G>,
+    t: T,
     dy: &mut [T],
 ) {
     debug_assert!(
@@ -2677,7 +2723,7 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
             // the onset discontinuity is supplied separately as the `K_ROUTE_ONSET` rate-on
             // saltation.
             let t_eff = T::from_f64(d.time) + lag + dose_rate.route_lag;
-            let tad = T::from_f64(t) - t_eff;
+            let tad = t - t_eff;
             let dose_mass =
                 dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt);
             let prep = &dose_rate.prep;
@@ -2700,6 +2746,14 @@ pub(crate) fn add_prepared_input_rate_forcing<T: crate::sens::num::PkNum>(
                 let f_bio_k = dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0));
                 let window = d.bioavailable_infusion(f_bio_k.val()).1;
                 prep.rate_infused(tad, dose_mass, T::from_f64(window))
+            } else if T::RECORDS_BRANCHES {
+                // A recording type (#2786) records this inside an ODE step, where the stage
+                // time crosses the dose: the window is a selection, the kernel evaluated at a
+                // safe age before it, and its contribution zero there.
+                use crate::sens::num::BranchCmp::Gt;
+                let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
+                let safe = T::select_if(Gt, tad, zero, tad, one);
+                T::select_if(Gt, tad, zero, prep.rate(safe, dose_mass), zero)
             } else {
                 if tad.val() <= 0.0 {
                     continue;
@@ -4770,7 +4824,7 @@ fn ode_predictions_with_extra_breaks_and_stats(
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
 
     // A non-finite break time makes the whole subject non-finite (#1189) — see
-    // [`timeline_has_non_finite`]. `predictions` and `chz_states` are already
+    // [`times_have_non_finite`]. `predictions` and `chz_states` are already
     // NaN-prefilled, so returning them here is exactly that outcome.
     //
     // Ordered **before** the #1223 fill below, deliberately: on a broken timeline every record
@@ -4785,7 +4839,13 @@ fn ode_predictions_with_extra_breaks_and_stats(
     // it, so without this it keeps its NaN prefill and the TTE likelihood repels the subject with
     // its `1e20` sentinel. One function with `ode_dense_solve_states`, which is the point: see
     // [`fill_prestart_states`] for why there is no second copy to keep in step.
-    fill_prestart_states(chz_times, &mut chz_states, break_times.first().copied(), &u);
+    fill_prestart_states(
+        chz_times,
+        &mut chz_states,
+        break_times.first().copied(),
+        &u,
+        None,
+    );
 
     // Most-recent system-reset time; `NEG_INFINITY` until the first reset is
     // crossed. Threaded into `integrate_segment` so infusions / zero-order windows
@@ -6019,7 +6079,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
     }
 
     // A non-finite break time makes the subject unsolvable (#1189) — see
-    // [`timeline_has_non_finite`]. This driver already has a typed error channel, so
+    // [`times_have_non_finite`]. This driver already has a typed error channel, so
     // it uses that rather than returning a NaN run the caller must re-diagnose. Placed
     // before the #700 exact-bit guards below, whose message would otherwise name the
     // wrong cause for a `NaN` time.
@@ -9422,7 +9482,7 @@ fn ode_dense_solve_states_seeded(
     // case where every saveat is at or after the first event. One function with the #570
     // one-solve share; see [`fill_prestart_states`] for why there is no second copy to keep in
     // step (#1223).
-    fill_prestart_states(saveat, &mut result, break_times.first().copied(), &u);
+    fill_prestart_states(saveat, &mut result, break_times.first().copied(), &u, None);
 
     // Walk every break as a **left boundary** — bound `0..len`, the walk
     // `ode_predictions` and `ode_predictions_with_states` use (#731) — so a dose

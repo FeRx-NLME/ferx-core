@@ -210,7 +210,7 @@ fn expm_dual2_gradient_and_hessian_match_fd() {
 // ── linear_segment_g ──────────────────────────────────────────────────────────────────────
 
 /// One compartment with a constant infusion: `du/dt = −k·u + R`.
-fn one_cpt_infusion<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+fn one_cpt_infusion<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
     du[0] = p[1] - p[0] * u[0];
 }
 
@@ -285,11 +285,12 @@ fn segment_reads_jets_the_forcing_sensitivity_dwarfs() {
     for c in [1e20, 1e170] {
         for u0 in [c, 1.0] {
             for k in [1, 2] {
-                let rhs = move |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
-                    let one = Dual2::<1>::from_f64(1.0);
-                    let forcing = if k == 1 { p[0] } else { p[0] * p[0] };
-                    du[0] = Dual2::<1>::from_f64(c) * forcing - (one + p[0]) * u[0];
-                };
+                let rhs =
+                    move |u: &[Dual2<1>], p: &[Dual2<1>], _t: Dual2<1>, du: &mut [Dual2<1>]| {
+                        let one = Dual2::<1>::from_f64(1.0);
+                        let forcing = if k == 1 { p[0] } else { p[0] * p[0] };
+                        du[0] = Dual2::<1>::from_f64(c) * forcing - (one + p[0]) * u[0];
+                    };
                 let label = format!("C = {c:e}, u0 = {u0:e}, k = {k}");
                 let (hard, _) = linear_segment_g(
                     &rhs,
@@ -332,7 +333,7 @@ fn segment_declines_an_rhs_whose_jets_are_not_affine() {
     // check passes — but ∂f/∂p = u² is not, and the column read for it (≈ s) disagrees with
     // the RHS's own derivative at `u0`. Only the derivative half of the self-check can see it;
     // accepting the segment returns a gradient that is off by the probe scale.
-    let rhs = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+    let rhs = |u: &[Dual2<1>], p: &[Dual2<1>], _t: Dual2<1>, du: &mut [Dual2<1>]| {
         du[0] = p[0] * u[0] * u[0] - u[0];
     };
     assert!(linear_segment_g(
@@ -348,7 +349,7 @@ fn segment_declines_an_rhs_whose_jets_are_not_affine() {
 
 /// Two compartments, depot absorption, constant infusion into central — the shape the
 /// integrator comparison below runs on.
-fn two_cpt_depot<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+fn two_cpt_depot<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
     let (ka, k10, k12, k21, rate) = (p[0], p[1], p[2], p[3], p[4]);
     du[0] = -ka * u[0];
     du[1] = ka * u[0] - (k10 + k12) * u[1] + k21 * u[2] + rate;
@@ -617,7 +618,7 @@ fn segment_keeps_a_large_forcing_jet_finite() {
     // `inf`; the RHS reads no state, so no self-check reads the corrupted state jet. Exact:
     // u(t) = 1e292·R·t, so ∂u/∂R = 1e292·t and ∂²u/∂R² = 0.
     let big = 1e292;
-    let rhs = |_u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+    let rhs = |_u: &[Dual2<1>], p: &[Dual2<1>], _t: Dual2<1>, du: &mut [Dual2<1>]| {
         du[0] = Dual2::<1>::from_f64(big) * p[0];
     };
     let t = 1.0;
@@ -681,13 +682,13 @@ fn every_dual_overrides_jet_max_abs() {
     // The adjoint's duals (#486): the η-tangent tape type, and the covariance Hessian's
     // nested forward-over-reverse pair. The reverse-only `R` has no local jet.
     use crate::sens::rtape::{DualH, DualT, R};
-    use crate::sens::vtape::DualV;
-    let mut v = DualV::<2, 3>::constant(1.0);
+    use crate::sens::vfree::DualF;
+    let mut v = DualF::<2, 3>::constant(1.0);
     v.g = [0.5, -3.0];
     v.h = [0.0, 4.0, 0.0];
-    assert_eq!(through_trait(v), 4.0, "DualV: the Hessian payload counts");
+    assert_eq!(through_trait(v), 4.0, "DualF: the Hessian payload counts");
     v.h[0] = f64::NAN;
-    assert!(through_trait(v).is_nan(), "DualV: NaN is not discarded");
+    assert!(through_trait(v).is_nan(), "DualF: NaN is not discarded");
     assert_eq!(through_trait(R::c(7.0)), 0.0);
     let mut t = DualT::<2, f64>::constant(1.0);
     t.g = [2.0, -5.0];
@@ -810,117 +811,27 @@ fn matmul_keeps_a_zero_whose_only_derivative_is_its_hessian() {
     assert_ne!(got[2].h[0], 0.0, "the Hessian-only zero was dropped");
 }
 
-/// The outer gradient's type: a `DualV` on the θ-tape that is exactly zero with zero
-/// η-jets (`θ − θ₀` at `θ = θ₀`) is not structural — its derivative lives on the tape,
-/// not in the jets. The skipping `matmul` must give the same θ-gradient through a reverse
-/// sweep as the dense reference. Mutation: `structural_zero` testing value and jets only
-/// (`jet_max_abs() == 0`, dropping the tape check in `is_constant`) → the taped zero is
-/// skipped and `∂S/∂p` loses the term.
-#[test]
-fn matmul_keeps_a_taped_zero_in_the_outer_gradient_type() {
-    use crate::sens::vtape::{vadj_index, vadj_init, vsweep, vtape_reset, DualV};
-    // S(p, q) = Σ_ij w_ij (A·A)_ij, with A's (0,3) entry the taped leaf p (value 0).
-    fn sweep_ds(
-        mul: fn(&[DualV<1, 0>], &[DualV<1, 0>], usize) -> Vec<DualV<1, 0>>,
-    ) -> (f64, f64, f64) {
-        let n = 4;
-        vtape_reset(2);
-        let p = DualV::<1, 0>::leaf(0.0, [0.0], []);
-        let q = DualV::<1, 0>::leaf(0.8, [0.0], []);
-        assert!(p.i != crate::sens::vtape::NONE, "premise: p is on the tape");
-        let c = DualV::<1, 0>::constant;
-        let mut a = vec![c(0.0); n * n];
-        for i in 0..n {
-            a[i * n + i] = q * c(-1.0 - 0.1 * i as f64);
-            if i + 1 < n {
-                a[(i + 1) * n + i] = q * c(0.5);
-            }
-        }
-        a[3] = p;
-        let a2 = mul(&a, &a, n);
-        let mut s = c(0.0);
-        for (k, v) in a2.iter().enumerate() {
-            s = s + *v * c(1.0 + 0.25 * k as f64);
-        }
-        let adj = vadj_init::<1>();
-        adj[vadj_index::<1, 1>(s.i, 0, 0)] = 1.0;
-        let out = vsweep::<1, 1>(s.i as usize + 1);
-        (
-            s.v,
-            out[vadj_index::<1, 1>(p.i, 0, 0)],
-            out[vadj_index::<1, 1>(q.i, 0, 0)],
-        )
-    }
-    let (sv, dp, dq) = sweep_ds(matmul::<DualV<1, 0>>);
-    let (rv, rp, rq) = sweep_ds(matmul_reference::<DualV<1, 0>>);
-    // The values are the dense loop's bit for bit. The adjoints are compared to rounding:
-    // a taped type folds each entry into one tape node (`PkNum::dot_fold`), which sums the
-    // same adjoints in another order than the dense loop's node per operation.
-    assert_eq!(sv.to_bits(), rv.to_bits());
-    let close = |a: f64, b: f64| (a - b).abs() <= 1e-14 * (1.0 + b.abs());
-    assert!(close(dq, rq), "∂S/∂q: skip {dq} vs dense {rq}");
-    assert!(close(dp, rp), "∂S/∂p: skip {dp} vs dense {rp}");
-    assert_ne!(
-        dp, 0.0,
-        "premise: the taped zero carries a θ-derivative into S"
-    );
-
-    // And against the function itself: central differences of the same S in plain `f64`.
-    // S is quadratic in (p, q), so a central difference is exact up to rounding.
-    fn s_f64(p: f64, q: f64) -> f64 {
-        let n = 4;
-        let mut a = vec![0.0; n * n];
-        for i in 0..n {
-            a[i * n + i] = q * (-1.0 - 0.1 * i as f64);
-            if i + 1 < n {
-                a[(i + 1) * n + i] = q * 0.5;
-            }
-        }
-        a[3] = p;
-        matmul_reference(&a, &a, n)
-            .iter()
-            .enumerate()
-            .map(|(k, v)| v * (1.0 + 0.25 * k as f64))
-            .sum()
-    }
-    let h = 1e-4;
-    let fd_p = (s_f64(h, 0.8) - s_f64(-h, 0.8)) / (2.0 * h);
-    let fd_q = (s_f64(0.0, 0.8 + h) - s_f64(0.0, 0.8 - h)) / (2.0 * h);
-    // Measured: ∂S/∂p −1.52 vs FD −1.5199999999993, ∂S/∂q 11.424 vs 11.4240000000043 — about
-    // 5e-13 relative, rounding only (S is quadratic); bound 1e-9.
-    assert!(
-        (dp - fd_p).abs() <= 1e-9 * (1.0 + fd_p.abs()),
-        "∂S/∂p {dp} vs FD {fd_p}"
-    );
-    assert!(
-        (dq - fd_q).abs() <= 1e-9 * (1.0 + fd_q.abs()),
-        "∂S/∂q {dq} vs FD {fd_q}"
-    );
-}
-
-/// Copilot's second dependency on the outer gradient's own type: an untaped `DualV` that is
+/// Copilot's second dependency on the outer gradient's own type: an untaped `DualF` that is
 /// zero in value and η-gradient but carries a second-order η-payload (`h`). It is not
-/// constant, so it must be multiplied. Mutation: `DualV::is_constant` checking `g` but not
+/// constant, so it must be multiplied. Mutation: `DualF::is_constant` checking `g` but not
 /// `h` → it is skipped and the product's `h` differs from the dense reference.
 #[test]
 fn matmul_keeps_an_outer_type_zero_whose_only_derivative_is_its_hessian() {
-    use crate::sens::vtape::{DualV, NONE};
+    use crate::sens::vfree::DualF;
     let n = 3;
-    let c = DualV::<1, 1>::constant;
+    let c = DualF::<1, 1>::constant;
     let mut a = vec![c(0.0); n * n];
     for i in 0..n {
-        a[i * n + i] = DualV {
+        a[i * n + i] = DualF {
             v: -0.4 - 0.3 * i as f64,
             g: [1.0],
             h: [0.2],
-            i: NONE,
         };
     }
-    a[2] = DualV {
+    a[2] = DualF {
         v: 0.0,
         g: [0.0],
         h: [1.5],
-        i: NONE,
     };
     assert!(
         !a[2].is_constant(),
@@ -1089,7 +1000,7 @@ mod pre_expm {
         // Solve (V − U)·R = (V + U), one column at a time against one factorization.
         let mut q: Vec<T> = v.iter().zip(&u).map(|(&vi, &ui)| vi - ui).collect();
         let p: Vec<T> = v.iter().zip(&u).map(|(&vi, &ui)| vi + ui).collect();
-        let mut piv = vec![0usize; n];
+        let mut piv = vec![T::from_f64(0.0); n];
         if !lu_factor_in_place_g(&mut q, &mut piv, n) {
             return None;
         }
@@ -1114,7 +1025,7 @@ mod pre_expm {
     }
 
     pub(super) fn linear_segment_old<T: PkNum>(
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &dyn Fn(&[T], &[T], T, &mut [T]),
         u0: &[T],
         t_span: (f64, f64),
         params: &[T],
@@ -1151,7 +1062,7 @@ mod pre_expm {
         // segment rather than returning a wrong gradient.
         let mut probe = vec![zero; n];
         let mut b = vec![zero; n];
-        rhs(&probe, params, t_mid, &mut b);
+        rhs(&probe, params, T::from_f64(t_mid), &mut b);
         let magnitude = b
             .iter()
             .chain(u0)
@@ -1168,7 +1079,7 @@ mod pre_expm {
         let inv_scale = T::from_f64(1.0 / scale);
         for j in 0..n {
             probe[j] = T::from_f64(scale);
-            rhs(&probe, params, t_mid, &mut col);
+            rhs(&probe, params, T::from_f64(t_mid), &mut col);
             probe[j] = zero;
             for i in 0..n {
                 a[i * n + j] = (col[i] - b[i]) * inv_scale;
@@ -1182,7 +1093,7 @@ mod pre_expm {
         // In the value and in the derivative components alike: a column whose jets were lost to
         // cancellation reproduces the RHS's value exactly and its gradient not at all.
         let reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
-            rhs(x, params, t, direct);
+            rhs(x, params, T::from_f64(t), direct);
             (0..n).all(|i| {
                 let mut assembled = b[i];
                 let mut scale = b[i].val().abs();
@@ -1393,15 +1304,16 @@ fn the_expm_workspace_is_the_pre_expm_kernel_bit_for_bit() {
             assert_eq!(want, got, "case {case}, DualF, h = {h}");
         }
         // The whole segment: an affine RHS `A·u + b` read back off the closure.
-        let rhs = |u: &[DualF<2, 0>], _p: &[DualF<2, 0>], _t: f64, du: &mut [DualF<2, 0>]| {
-            for i in 0..n {
-                let mut acc = bd[i];
-                for j in 0..n {
-                    acc = acc + ad[i * n + j] * u[j];
+        let rhs =
+            |u: &[DualF<2, 0>], _p: &[DualF<2, 0>], _t: DualF<2, 0>, du: &mut [DualF<2, 0>]| {
+                for i in 0..n {
+                    let mut acc = bd[i];
+                    for j in 0..n {
+                        acc = acc + ad[i * n + j] * u[j];
+                    }
+                    du[i] = acc;
                 }
-                du[i] = acc;
-            }
-        };
+            };
         let u0: Vec<_> = (0..n)
             .map(|i| lift(100.0 * (i == 0) as u8 as f64, i))
             .collect();
@@ -1441,7 +1353,6 @@ fn only_types_without_a_tape_are_pooled_and_shared() {
     assert!(pade_shared::<DualF<20, 0>>());
     assert!(!pade_shared::<R>());
     assert!(!pade_shared::<DualT<2, R>>());
-    assert!(!pade_shared::<crate::sens::vtape::DualV<2, 0>>());
 }
 
 #[test]
@@ -1618,7 +1529,7 @@ fn spectral_segment_equals_pade_in_values_and_jets() {
 /// `(e^{λΔ} − 1)/λ` and still equals Padé.
 #[test]
 fn spectral_handles_a_zero_eigenvalue() {
-    fn absorbed<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+    fn absorbed<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
         du[0] = -p[0] * u[0];
         du[1] = p[0] * u[0] - p[1] * u[1];
         du[2] = p[1] * u[1];
@@ -1645,12 +1556,12 @@ fn spectral_handles_a_zero_eigenvalue() {
 /// pair both decline to Padé, which then gives the answer it always gave.
 #[test]
 fn spectral_declines_repeated_and_complex_spectra() {
-    fn transit<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+    fn transit<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
         du[0] = -p[0] * u[0];
         du[1] = p[0] * u[0] - p[0] * u[1];
         du[2] = p[0] * u[1] - p[0] * u[2];
     }
-    fn rotation<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+    fn rotation<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
         du[0] = -p[0] * u[0] + p[1] * u[1];
         du[1] = -p[1] * u[0] - p[0] * u[1];
     }
@@ -1691,7 +1602,7 @@ fn the_singleton_precheck_sees_only_acyclic_compartments() {
     // `spectral_of`, which accepts them.
     let cycle = [-1.0, 1.0, 1.0, -1.0];
     assert!(!repeated_singleton_eigenvalue(&cycle, nonzero(&cycle), 2));
-    assert!(spectral_of::<f64>(&cycle, 2, &cycle, nonzero(&cycle)).is_some());
+    assert!(spectral_f64(&cycle, 2, nonzero(&cycle)).is_some());
     // Distinct acyclic rates pass through.
     #[rustfmt::skip]
     let oral = [
@@ -1699,14 +1610,14 @@ fn the_singleton_precheck_sees_only_acyclic_compartments() {
          1.5, -0.2,
     ];
     assert!(!repeated_singleton_eigenvalue(&oral, nonzero(&oral), 2));
-    assert!(spectral_of::<f64>(&oral, 2, &oral, nonzero(&oral)).is_some());
+    assert!(spectral_f64(&oral, 2, nonzero(&oral)).is_some());
 }
 
 /// Spectral vs Padé on `rhs`, seeding `p[seed[0]]`, `p[seed[1]]` as the two `Dual2` axes:
 /// whether the spectral path served it, and the worst relative gap over values, gradients
 /// and Hessians at every saved time.
 fn spectral_vs_pade_dual2(
-    rhs: &dyn Fn(&[Dual2<2>], &[Dual2<2>], f64, &mut [Dual2<2>]),
+    rhs: &dyn Fn(&[Dual2<2>], &[Dual2<2>], Dual2<2>, &mut [Dual2<2>]),
     p0: &[f64],
     seed: [usize; 2],
     u0: &[f64],
@@ -1749,7 +1660,7 @@ fn spectral_vs_pade_dual2(
 /// jet. Lifted from `g(z) = expm1(z)/z`'s series, the jets match Padé's to round-off.
 #[test]
 fn spectral_phi_is_exact_where_its_quotient_cancels() {
-    fn slow<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+    fn slow<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
         du[0] = p[2] - p[0] * u[0];
         du[1] = p[0] * u[0] - p[1] * u[1];
     }
@@ -1776,7 +1687,7 @@ fn spectral_phi_is_exact_where_its_quotient_cancels() {
 /// whose exact value is 0 (`∂²u₁/∂k₂²`).
 #[test]
 fn spectral_is_exact_on_a_stiff_spectrum() {
-    fn chain<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+    fn chain<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
         du[0] = p[3] - p[0] * u[0];
         du[1] = p[0] * u[0] - p[1] * u[1];
         du[2] = p[1] * u[1] - p[2] * u[2];
@@ -1801,7 +1712,7 @@ fn spectral_is_exact_on_a_stiff_spectrum() {
 /// both pass it.
 #[test]
 fn spectral_declines_a_non_normal_chain_by_its_projector_size() {
-    fn transit<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+    fn transit<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
         du[0] = -p[0] * u[0];
         for i in 1..5 {
             du[i] = p[i - 1] * u[i - 1] - p[i] * u[i];
@@ -1831,7 +1742,7 @@ fn spectral_declines_a_non_normal_chain_by_its_projector_size() {
         kappa > SPECTRAL_MAX_KAPPA,
         "κ = {kappa:e} must exceed the bound"
     );
-    assert!(spectral_of::<f64>(&a, 5, &a, nonzero(&a)).is_none());
+    assert!(spectral_f64(&a, 5, nonzero(&a)).is_none());
     let u0 = [100.0, 0.0, 0.0, 0.0, 0.0];
     let run = || {
         linear_segment_g::<f64>(&transit, &u0, (0.0, 6.0), &p, &[1.0, 3.0, 6.0], &[])
@@ -1887,7 +1798,7 @@ fn spectral_f64_and_dual_values_are_the_same_bits() {
 /// abandons the spectral result, and the segment ends as Padé's does.
 #[test]
 fn a_spectral_state_that_fails_its_check_falls_back_to_pade() {
-    fn growth<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+    fn growth<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
         du[0] = p[0] * u[0];
         du[1] = u[0] - p[1] * u[1];
     }
@@ -1950,7 +1861,7 @@ fn exprel_derivs_is_one_value_and_continuous_at_its_switch() {
 /// cannot pass on a fixture where it is 0 anyway.
 #[test]
 fn a_zero_valued_rate_with_a_derivative_is_a_coupling() {
-    fn back<T: PkNum>(u: &[T], p: &[T], _t: f64, du: &mut [T]) {
+    fn back<T: PkNum>(u: &[T], p: &[T], _t: T, du: &mut [T]) {
         du[0] = -p[0] * u[0] + p[1] * u[1];
         du[1] = p[0] * u[0] - p[2] * u[1];
     }

@@ -2411,7 +2411,7 @@ pub(crate) fn predict_iov_in<K: AsRef<[f64]>>(
     preds
 }
 
-/// The superposition engine's [`timeline_has_non_finite`](crate::ode::predictions::timeline_has_non_finite)
+/// The superposition engine's [`times_have_non_finite`](crate::ode::predictions::times_have_non_finite)
 /// (#1189, #1284): true when any dose's effective arrival `dose.time + lagtime` is
 /// non-finite, so the whole subject must come back non-finite.
 ///
@@ -5547,7 +5547,7 @@ mod tests {
     /// (#1189's silent-drop shape, closed on this engine by #1284).
     ///
     /// `predict_concentration` sums closed forms over doses instead of walking a
-    /// break-time timeline, so it has no `timeline_has_non_finite` to run. Both
+    /// break-time timeline, so it has no `times_have_non_finite` to run. Both
     /// of its arms test `t_eff` against `t`, and every comparison against `NaN`
     /// is false, so the dose was simply skipped and the *remaining* trajectory —
     /// here, nothing at all — was returned as a valid prediction. Worse than the

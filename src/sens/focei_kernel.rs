@@ -24,7 +24,7 @@
 //! predictions carry `G`, so its tangents are exactly `Σ_m G_mk ∂R/∂f_m`.
 #![allow(clippy::needless_range_loop)]
 
-use crate::sens::num::PkNum;
+use crate::sens::num::{BranchCmp, PkNum};
 use crate::sens::rtape::DualT;
 use crate::stats::residual_error::{LoadingForm, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
@@ -62,7 +62,7 @@ impl<T: PkNum> OmegaT<T> {
         // L⁻¹, lower triangular, by forward substitution.
         let mut li = vec![vec![c(0.0); n]; n];
         for i in 0..n {
-            if !(chol[i][i].val() > 0.0) {
+            if !chol[i][i].br_cmp_c(BranchCmp::Gt, 0.0) {
                 return None;
             }
             li[i][i] = c(1.0) / chol[i][i];
@@ -259,11 +259,16 @@ impl<'a> LikCtx<'a> {
                     .filter(|m| m.len() == 2 * n_sigma)
                     .map(|m| m[n_sigma + idx])
                 {
-                    Some(pw) if pw.val() != 1.0 => {
-                        if f.val() == 0.0 {
+                    Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
+                        if f.br_cmp_c(BranchCmp::Eq, 0.0) {
                             T::from_f64(0.0)
                         } else {
-                            T::from_f64(if f.val() < 0.0 { -1.0 } else { 1.0 }) * f.abs().pow(pw)
+                            let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            T::from_f64(sign) * f.abs().pow(pw)
                         }
                     }
                     _ => form.coeff_g(f),
@@ -339,24 +344,17 @@ impl<'a> LikCtx<'a> {
     }
 }
 
+/// `0 < x < ∞` — a variance a row can be scored with — as a branch: `false` on `NaN`.
+#[inline]
+fn positive_finite<T: PkNum>(x: T) -> bool {
+    x.br_cmp_c(BranchCmp::Gt, 0.0) && x.br_cmp_c(BranchCmp::Lt, f64::INFINITY)
+}
+
 /// `log Φ(z)` with production's value (`log_normal_cdf`) and its exact derivatives
 /// (`h = φ/Φ`, `h′ = −h(z + h)`, `h″`).
 #[inline]
 fn log_phi<T: PkNum>(z: T) -> T {
-    let zv = z.val();
-    let h = crate::stats::special::inv_mills(zv);
-    let h1 = -h * (zv + h);
-    // (log Φ)‴ = h″ = −h′(z + h) − h(1 + h′): the Laplace kernel's second-order dual
-    // differentiates the `(log Φ)″` factor; (log Φ)⁗ = h‴ = −h″(z + 2h) − 2h′(1 + h′), for
-    // the covariance step's nested dual.
-    let h2 = -h1 * (zv + h) - h * (1.0 + h1);
-    z.lift4(
-        crate::stats::special::log_normal_cdf(zv),
-        h,
-        h1,
-        h2,
-        -h2 * (zv + 2.0 * h) - 2.0 * h1 * (1.0 + h1),
-    )
+    z.jet_unary(crate::sens::num::JetFn::LogNormCdf)
 }
 
 /// Inverse Mills ratio `h(z) = φ/Φ` with `h′ = −h(z + h)`, lifted to fourth order so the
@@ -364,15 +362,7 @@ fn log_phi<T: PkNum>(z: T) -> T {
 /// `h‴` unknown, #2093 review).
 #[inline]
 fn inv_mills<T: PkNum>(z: T) -> T {
-    let zv = z.val();
-    let h = crate::stats::special::inv_mills(zv);
-    let h1 = -h * (zv + h);
-    // h″ = −h′(z + h) − h(1 + h′); h‴ = −h″(z + 2h) − 2h′(1 + h′);
-    // h⁗ = −h‴(z + 2h) − 3h″(1 + 2h′).
-    let h2 = -h1 * (zv + h) - h * (1.0 + h1);
-    let h3 = -h2 * (zv + 2.0 * h) - 2.0 * h1 * (1.0 + h1);
-    let h4 = -h3 * (zv + 2.0 * h) - 3.0 * h2 * (1.0 + 2.0 * h1);
-    z.lift4(h, h1, h2, h3, h4)
+    z.jet_unary(crate::sens::num::JetFn::InvMills)
 }
 
 /// One censored row's `−2·log Φ(z)` and the `H̃` coefficients `(g2, cz, cm)` of
@@ -539,7 +529,7 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
         match ctx.censored(j) {
             None => {
                 let vd = ctx.variance_v(j, fd, ruv, &pk);
-                if !(vd.v.val().is_finite() && vd.v.val() > 0.0) {
+                if !positive_finite(vd.v) {
                     return None;
                 }
                 let r = lift(c(y)) - fd;
@@ -565,7 +555,7 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
             }
             Some(cens) => {
                 let (v, d, d2) = ctx.variance(j, f[j], ruv.v, p);
-                if !(v.val().is_finite() && v.val() > 0.0) {
+                if !positive_finite(v) {
                     return None;
                 }
                 let (l2, g2, cz, cm) = m3_terms(y, f[j], v, d, d2, cens);
@@ -707,7 +697,7 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
                 None => ctx.variance_v(j, r_eval[j], one, p),
             },
         );
-        if !(rd.val().is_finite() && rd.val() > 0.0) {
+        if !positive_finite(rd) {
             return None;
         }
         rdiag.push(rd);
@@ -733,11 +723,11 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
     // `1 + tr S` to ~1e11 and the correction loses every digit (#1498): above
     // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, `R̃` is factored at observation size.
     let woodbury = rm.is_none() && {
-        let tr: f64 = quant
-            .iter()
-            .map(|&j| (0..N).map(|k| lg[j][k].val() * lg[j][k].val()).sum::<f64>() / rdiag[j].val())
-            .sum();
-        1.0 + tr <= WOODBURY_MAX_INFO_TRACE || woodbury_forced()
+        let tr = quant.iter().fold(c(0.0), |acc, &j| {
+            let s = (0..N).fold(c(0.0), |a, k| a + lg[j][k] * lg[j][k]);
+            acc + s / rdiag[j]
+        });
+        (one + tr).br_cmp_c(BranchCmp::Le, WOODBURY_MAX_INFO_TRACE) || woodbury_forced()
     };
     if !woodbury {
         // R̃ = R⁰_q + (LᵀG)ᵀ(LᵀG), FREM rows decoupled (`apply_frem_r_matrix_overrides`).
@@ -907,7 +897,7 @@ fn row_l<T: PkNum>(
         return Some(r * r / v + v.ln());
     }
     let v = ctx.variance_v(j, vf, ruv, p);
-    if !(v.val().is_finite() && v.val() > 0.0) {
+    if !positive_finite(v) {
         return None;
     }
     Some(match ctx.censored(j) {
@@ -1115,7 +1105,7 @@ pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
         for a in 0..active {
             let ga = hd2 * gj[a];
             for b in 0..=a {
-                let v = ga * gj[b] + hd1 * qj[crate::sens::vtape::tri(a, b)];
+                let v = ga * gj[b] + hd1 * qj[crate::sens::rtape::tri(a, b)];
                 h[a][b] = h[a][b] + v;
                 if a != b {
                     h[b][a] = h[b][a] + v;
@@ -1250,7 +1240,7 @@ pub(crate) fn chol<T: PkNum>(a: &[Vec<T>]) -> Option<Vec<Vec<T>>> {
         for k in 0..j {
             d = d - l[j][k] * l[j][k];
         }
-        if !(d.val() > 0.0) {
+        if !d.br_cmp_c(BranchCmp::Gt, 0.0) {
             return None;
         }
         let ljj = d.sqrt();

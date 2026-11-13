@@ -1031,7 +1031,13 @@ pub(crate) fn infusion_has_rate_channel(d: &DoseEvent) -> bool {
 /// the one thing the `fd_oracle` / `parity` tests (`sens/ode_adjoint_tests.rs`), which
 /// difference the production objective, cannot forgive.
 pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
-    dose.ss && dose.ii > 0.0 && lag > 0.0
+    ss_seeded_at_record_g(dose, lag)
+}
+
+/// [`ss_seeded_at_record`] for a lag of any type: a recording type (#2786) decides it
+/// through its branch API.
+pub(crate) fn ss_seeded_at_record_g<G: crate::sens::num::PkNum>(dose: &DoseEvent, lag: G) -> bool {
+    dose.ss && dose.ii > 0.0 && lag.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
 }
 
 /// Whether this steady-state dose's periodic state is equilibrated at its
@@ -1053,7 +1059,15 @@ pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
 /// (`nonmem_anchor/ss_arrival_flow_*`, ADVAN13; `ss_reset_tie_*`, ADVAN2), while the
 /// event-driven walks, which already flowed, matched.
 pub(crate) fn ss_equilibrates_at_arrival(dose: &DoseEvent, lag: f64) -> bool {
-    dose.ss && dose.ii > 0.0 && !ss_seeded_at_record(dose, lag)
+    ss_equilibrates_at_arrival_g(dose, lag)
+}
+
+/// [`ss_equilibrates_at_arrival`] for a lag of any type (#2786).
+pub(crate) fn ss_equilibrates_at_arrival_g<G: crate::sens::num::PkNum>(
+    dose: &DoseEvent,
+    lag: G,
+) -> bool {
+    dose.ss && dose.ii > 0.0 && !ss_seeded_at_record_g(dose, lag)
 }
 
 /// Whether this seeded steady-state dose is the **bolus** case the dual event walk
@@ -1101,6 +1115,17 @@ pub(crate) fn ss_bolus_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
 /// crossing.
 pub(crate) fn ss_seed_phase(dose: &DoseEvent, lag: f64) -> f64 {
     (dose.ii - lag).max(0.0)
+}
+
+/// [`ss_seed_phase`] for a lag of any type (#2786): `II − lag` where positive, else `0`
+/// (a `NaN` phase floors, as `f64::max` does).
+pub(crate) fn ss_seed_phase_g<G: crate::sens::num::PkNum>(dose: &DoseEvent, lag: G) -> G {
+    let p = G::from_f64(dose.ii) - lag;
+    if p.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
+        p
+    } else {
+        G::from_f64(0.0)
+    }
 }
 
 /// End time of the previous cycle's infusion when it is **still running at the
@@ -1310,9 +1335,18 @@ pub(crate) fn tad_at(doses: &[DoseEvent], dose_lagtimes: &[f64], t: f64) -> f64 
 /// window's membership (#1586). O(n), no allocation.
 #[inline]
 pub(crate) fn ss_reset_cutoff(doses: &[DoseEvent], t: f64) -> Option<usize> {
+    ss_reset_cutoff_g(doses, t)
+}
+
+/// [`ss_reset_cutoff`] at a time of any type: a recording type (#2786) decides `record ≤ t`
+/// through its branch API.
+pub(crate) fn ss_reset_cutoff_g<G: crate::sens::num::PkNum>(
+    doses: &[DoseEvent],
+    t: G,
+) -> Option<usize> {
     let mut best: Option<usize> = None;
     for (i, d) in doses.iter().enumerate() {
-        if !(d.ss && d.ii > 0.0) || d.time > t {
+        if !(d.ss && d.ii > 0.0) || G::from_f64(d.time).br_cmp(crate::sens::num::BranchCmp::Gt, t) {
             continue;
         }
         best = match best {

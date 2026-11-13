@@ -441,7 +441,7 @@ pub fn solve_ekf(
     break_times.sort_by(|a, b| a.total_cmp(b));
     break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     // A non-finite break time makes the subject non-finite (#1189) — see
-    // `ode::predictions::timeline_has_non_finite`. `results` is prefilled with the
+    // `ode::predictions::times_have_non_finite`. `results` is prefilled with the
     // caller's default point, so overwrite it with NaN ipreds rather than returning a
     // finite-looking filter pass built on a timeline that could not be ordered.
     if crate::ode::predictions::abandon_non_finite_timeline(break_times.iter().copied(), None) {
@@ -1636,7 +1636,7 @@ mod tests {
     /// because this walk's sort is the same one, not because a fitted dataset gets here.
     ///
     /// Mutation: restore `partial_cmp(..).unwrap()` → panic; delete the
-    /// `timeline_has_non_finite` guard → finite `ipred`s and the assert below fires.
+    /// `times_have_non_finite` guard → finite `ipred`s and the assert below fires.
     #[test]
     fn ekf_non_finite_break_is_non_finite_not_a_panic() {
         let doses = vec![

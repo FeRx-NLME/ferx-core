@@ -58,7 +58,7 @@
 //! [`crate::sens::linsolve::lu_factor_in_place_g`]).
 
 use super::predictions::DirectStep;
-use super::solver::{scale_tol, DirectCall, OdeMethod, OdeSolverOptions, StageRhs};
+use super::solver::{scale_tol, DirectCall, OdeMethod, OdeSolverOptions, StageRhs, StepClock};
 use crate::sens::linsolve::{lu_factor_in_place_g, lu_solve_in_place_g};
 use crate::sens::num::PkNum;
 
@@ -494,7 +494,7 @@ struct RosWorkspace<T> {
     jac: Vec<T>,
     /// `W = I/(γh) − J`, overwritten by its LU factorization each attempt.
     w: Vec<T>,
-    piv: Vec<usize>,
+    piv: Vec<T>,
     /// `f(u, t)` at the step start.
     f0: Vec<T>,
     /// `∂f/∂t` at the step start.
@@ -614,7 +614,7 @@ impl FdColumnsGuard {
 /// drop, so a caller must not keep it past the call it was looked up for.
 #[inline]
 pub(crate) fn registered_direct<T: PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &crate::ode::solver::RhsG<'_, T>,
 ) -> Option<&'static DirectStep<'static>> {
     if std::any::TypeId::of::<T>() != std::any::TypeId::of::<f64>() {
         return None;
@@ -623,7 +623,7 @@ pub(crate) fn registered_direct<T: PkNum>(
     if DIRECT_STEP_OFF.with(|c| c.get()) {
         return None;
     }
-    let addr = rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ();
+    let addr = rhs as *const crate::ode::solver::RhsG<'_, T> as *const ();
     let d = FD_COLUMNS.with(|c| c.get())?;
     // SAFETY: see above; the entry's `direct` is live while its guard is.
     (d.rhs == addr)
@@ -637,10 +637,10 @@ pub(crate) fn registered_direct<T: PkNum>(
 #[inline(always)]
 pub(crate) fn call_direct<T: PkNum>(
     direct: &DirectStep<'_>,
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &crate::ode::solver::RhsG<'_, T>,
     u: &[T],
     params: &[T],
-    t: f64,
+    t: T,
     du: &mut [T],
 ) {
     debug_assert_eq!(std::any::TypeId::of::<T>(), std::any::TypeId::of::<f64>());
@@ -652,7 +652,7 @@ pub(crate) fn call_direct<T: PkNum>(
             std::slice::from_raw_parts_mut(du.as_mut_ptr().cast::<f64>(), du.len()),
         )
     };
-    if !direct.eval(uf, pf, t, duf) {
+    if !direct.eval(uf, pf, t.val(), duf) {
         rhs(u, params, t, du);
     }
 }
@@ -661,6 +661,17 @@ impl Drop for FdColumnsGuard {
     fn drop(&mut self) {
         FD_COLUMNS.with(|c| c.set(self.prev));
     }
+}
+
+/// The [`HostFn::FdSteps`](crate::sens::num::HostFn) analysis: `args = [u (n), t]` → the
+/// forward-difference steps `√(ε·max(|x|, FD_FLOOR))` of each state and of the time, as
+/// [`RosWorkspace::refresh_jacobian`] forms them.
+pub(crate) fn fd_steps(args: &[f64], out: &mut Vec<f64>) {
+    out.clear();
+    out.extend(
+        args.iter()
+            .map(|x| (f64::EPSILON * x.abs().max(FD_FLOOR)).sqrt()),
+    );
 }
 
 /// Why a step attempt could not be scored.
@@ -679,7 +690,7 @@ impl<T: PkNum> RosWorkspace<T> {
             n,
             jac: vec![zero; n * n],
             w: vec![zero; n * n],
-            piv: vec![0; n],
+            piv: vec![T::from_f64(0.0); crate::sens::linsolve::lu_piv_len::<T>(n)],
             f0: vec![zero; n],
             ft: vec![zero; n],
             ks: vec![vec![zero; n]; stages],
@@ -715,21 +726,45 @@ impl<T: PkNum> RosWorkspace<T> {
     fn refresh_jacobian<R: StageRhs<T> + ?Sized>(
         &mut self,
         stage: &R,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &crate::ode::solver::RhsG<'_, T>,
         u: &[T],
         params: &[T],
-        t: f64,
+        clock: &StepClock<T>,
     ) {
         let n = self.n;
-        stage.call(u, params, t, &mut self.f0);
+        let t = clock.t;
+        stage.call(u, params, clock.start(), &mut self.f0);
 
         // A direct step takes its `n` columns as direct calls, not the registered batch:
         // the same bits, and measured faster (the batch 1.01–1.09× slower on 8- and 12-state
         // Rodas5P chains, #2468 review).
-        if R::DIRECT || !self.registered_columns(rhs, u, params, t) {
-            self.scalar_columns(stage, u, params, t);
+        if !T::RECORDS_BRANCHES && (R::DIRECT || !self.registered_columns(rhs, u, params, t)) {
+            self.scalar_columns(stage, u, params, clock);
         }
 
+        // A recording type (#2786) takes every step size from the values at run time
+        // ([`fd_steps`]) and forms the same quotients on them.
+        if T::RECORDS_BRANCHES {
+            let mut args = u[..n].to_vec();
+            args.push(clock.start());
+            let d = T::host(crate::sens::num::HostFn::FdSteps, &args);
+            let one = T::from_f64(1.0);
+            for j in 0..n {
+                self.u_tmp.copy_from_slice(u);
+                self.u_tmp[j] = u[j] + d[j];
+                stage.call(&self.u_tmp, params, clock.start(), &mut self.f_tmp);
+                let inv = one / d[j];
+                for i in 0..n {
+                    self.jac[i * n + j] = (self.f_tmp[i] - self.f0[i]) * inv;
+                }
+            }
+            stage.call(u, params, clock.ts + d[n], &mut self.f_tmp);
+            let inv = one / d[n];
+            for i in 0..n {
+                self.ft[i] = (self.f_tmp[i] - self.f0[i]) * inv;
+            }
+            return;
+        }
         let delt = (f64::EPSILON * t.abs().max(FD_FLOOR)).sqrt();
         let inv = T::from_f64(1.0 / delt);
         // An autonomous `rhs` returns `f0` again at `t + δ`, so the quotient is `(f0 − f0)/δ`:
@@ -750,32 +785,43 @@ impl<T: PkNum> RosWorkspace<T> {
             }
             return;
         }
-        stage.call(u, params, t + delt, &mut self.f_tmp);
+        stage.call(
+            u,
+            params,
+            clock.shifted(T::from_f64(delt), delt),
+            &mut self.f_tmp,
+        );
         for i in 0..n {
             self.ft[i] = T::scaled_diff(self.f_tmp[i], self.f0[i], 1.0 / delt);
         }
     }
 
     /// Whether `rhs` is the closure an [`FdColumnsGuard`] registered as autonomous.
-    fn registered_autonomous(rhs: &dyn Fn(&[T], &[T], f64, &mut [T])) -> bool {
+    fn registered_autonomous(rhs: &crate::ode::solver::RhsG<'_, T>) -> bool {
         #[cfg(test)]
         if FT_SKIP_OFF.with(|c| c.get()) {
             return false;
         }
         FD_COLUMNS.with(|c| c.get()).is_some_and(|e| {
-            e.autonomous && e.rhs == rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ()
+            e.autonomous && e.rhs == rhs as *const crate::ode::solver::RhsG<'_, T> as *const ()
         })
     }
 
     /// The `n` forward-difference columns of `J`, one right-hand-side call each.
     #[inline(always)]
-    fn scalar_columns<R: StageRhs<T> + ?Sized>(&mut self, rhs: &R, u: &[T], params: &[T], t: f64) {
+    fn scalar_columns<R: StageRhs<T> + ?Sized>(
+        &mut self,
+        rhs: &R,
+        u: &[T],
+        params: &[T],
+        clock: &StepClock<T>,
+    ) {
         let n = self.n;
         for j in 0..n {
             let delt = (f64::EPSILON * u[j].val().abs().max(FD_FLOOR)).sqrt();
             self.u_tmp.copy_from_slice(u);
             self.u_tmp[j] = u[j] + T::from_f64(delt);
-            rhs.call(&self.u_tmp, params, t, &mut self.f_tmp);
+            rhs.call(&self.u_tmp, params, clock.start(), &mut self.f_tmp);
             for i in 0..n {
                 self.jac[i * n + j] = T::scaled_diff(self.f_tmp[i], self.f0[i], 1.0 / delt);
             }
@@ -788,7 +834,7 @@ impl<T: PkNum> RosWorkspace<T> {
     /// `false` (nothing written) for any other `rhs`, and whenever the evaluator declines.
     fn registered_columns(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &crate::ode::solver::RhsG<'_, T>,
         u: &[T],
         params: &[T],
         t: f64,
@@ -798,7 +844,7 @@ impl<T: PkNum> RosWorkspace<T> {
             return false;
         }
         let Some(columns) = FD_COLUMNS.with(|c| c.get()).and_then(|e| {
-            (e.rhs == rhs as *const dyn Fn(&[T], &[T], f64, &mut [T]) as *const ())
+            (e.rhs == rhs as *const crate::ode::solver::RhsG<'_, T> as *const ())
                 .then_some(e.columns)
                 .flatten()
         }) else {
@@ -834,13 +880,27 @@ impl<T: PkNum> RosWorkspace<T> {
         true
     }
 
+    /// [`Self::factor_w`] with the singular verdict as a value
+    /// ([`crate::sens::linsolve::lu_factor_flag_g`]).
+    fn factor_w_flag(&mut self, clock: &StepClock<T>, gamma: f64) -> T {
+        let n = self.n;
+        let inv_gamma_h = clock.inv_times_dt(gamma);
+        for idx in 0..n * n {
+            self.w[idx] = -self.jac[idx];
+        }
+        for i in 0..n {
+            self.w[i * n + i] = self.w[i * n + i] + inv_gamma_h;
+        }
+        crate::sens::linsolve::lu_factor_flag_g(&mut self.w, &mut self.piv, n)
+    }
+
     /// `W = I/(γh) − J`, factored in place over the `J` [`refresh_jacobian`] left behind.
     ///
     /// This is the part that genuinely depends on `dt`, so it re-runs on every attempt —
     /// an `O(n³)` factorization, but no right-hand-side evaluations at all.
-    fn factor_w(&mut self, dt: f64, gamma: f64) -> Result<(), StepFailure> {
+    fn factor_w(&mut self, clock: &StepClock<T>, gamma: f64) -> Result<(), StepFailure> {
         let n = self.n;
-        let inv_gamma_h = T::from_f64(1.0 / (gamma * dt));
+        let inv_gamma_h = clock.inv_times_dt(gamma);
         for idx in 0..n * n {
             self.w[idx] = -self.jac[idx];
         }
@@ -862,10 +922,10 @@ impl<T: PkNum> RosWorkspace<T> {
         rhs: &R,
         u: &[T],
         params: &[T],
-        t: f64,
-        dt: f64,
+        clock: &StepClock<T>,
         tab: &RosTableau,
     ) {
+        let dt = clock.dt;
         let n = self.n;
         let s = tab.stages;
         // Every buffer cut to `n` up front, so the loops index without bounds checks; the
@@ -910,7 +970,7 @@ impl<T: PkNum> RosWorkspace<T> {
                 // Stage 1 evaluates at (u, t), already in `f0`.
                 f_tmp.copy_from_slice(f0);
             } else {
-                rhs.call(u_tmp, params, t + tab.alpha[i] * dt, f_tmp);
+                rhs.call(u_tmp, params, clock.at(tab.alpha[i]), f_tmp);
             }
             // rhs_i = f_i + h·γ_i·f_t + (1/h)·Σ_{j<i} c_ij k_j, left to right (folded per
             // entry on a taped type, as above).
@@ -923,12 +983,12 @@ impl<T: PkNum> RosWorkspace<T> {
                     rhs_tmp[idx] = T::axpy_fold(f_tmp[idx], &terms[..1 + i]);
                 }
             } else {
-                let hd = T::from_f64(dt * tab.d[i]);
+                let hd = clock.dt_times(tab.d[i]);
                 for idx in 0..n {
                     rhs_tmp[idx] = f_tmp[idx] + ft[idx] * hd;
                 }
                 for (j, kj) in ks[..i].iter().enumerate() {
-                    let wt = T::from_f64(tab.c[i][j] / dt);
+                    let wt = clock.over_dt(tab.c[i][j]);
                     let kj = &kj[..n];
                     for idx in 0..n {
                         rhs_tmp[idx] = rhs_tmp[idx] + kj[idx] * wt;
@@ -969,15 +1029,13 @@ impl<T: PkNum> RosWorkspace<T> {
         rhs: &R,
         u: &[T],
         params: &[T],
-        t: f64,
-        dt: f64,
+        clock: &StepClock<T>,
     ) {
         let n = self.n;
-        let gh = ROS23_GAMMA * dt;
-        let inv_gh = T::from_f64(1.0 / gh);
-        let hgamma = T::from_f64(gh);
-        let half_h = T::from_f64(0.5 * dt);
-        let h = T::from_f64(dt);
+        let inv_gh = clock.inv_times_dt(ROS23_GAMMA);
+        let hgamma = clock.times_dt(ROS23_GAMMA);
+        let half_h = clock.times_dt(0.5);
+        let h = clock.h();
 
         // k₁ = W̃⁻¹(f₀ + hγ·f_t)
         for i in 0..n {
@@ -992,7 +1050,7 @@ impl<T: PkNum> RosWorkspace<T> {
         for i in 0..n {
             self.u_tmp[i] = u[i] + self.ks[0][i] * half_h;
         }
-        rhs.call(&self.u_tmp, params, t + 0.5 * dt, &mut self.f_mid);
+        rhs.call(&self.u_tmp, params, clock.at(0.5), &mut self.f_mid);
 
         // k₂ = W̃⁻¹(f₁ − k₁) + k₁
         for i in 0..n {
@@ -1009,7 +1067,7 @@ impl<T: PkNum> RosWorkspace<T> {
         }
 
         // k₃ = W̃⁻¹(f₂ − c₃₂(k₂ − f₁) − 2(k₁ − f₀) + hγ·f_t)
-        rhs.call(&self.u_new, params, t + dt, &mut self.f_tmp);
+        rhs.call(&self.u_new, params, clock.end(), &mut self.f_tmp);
         let c32 = T::from_f64(ROS23_C32);
         let two = T::from_f64(2.0);
         for i in 0..n {
@@ -1018,7 +1076,7 @@ impl<T: PkNum> RosWorkspace<T> {
                 - (self.ks[0][i] - self.f0[i]) * two;
         }
         lu_solve_in_place_g(&self.w, &self.piv, n, &mut self.rhs_tmp);
-        let sixth_h = T::from_f64(dt / 6.0);
+        let sixth_h = clock.dt_over(6.0);
         for i in 0..n {
             let k3 = self.rhs_tmp[i] * inv_gh;
             self.err[i] = (self.ks[0][i] - self.ks[1][i] * two + k3) * sixth_h;
@@ -1052,6 +1110,9 @@ pub(crate) struct RosStepper<T> {
     method: OdeMethod,
     /// Whether the last attempt produced a usable `u_new` (false only on a singular `W`).
     usable: bool,
+    /// A recording type's verdict on the last attempt's `W` (#2786): `1` or `0` as data,
+    /// carried for the run's driver to read; every other type's is `usable`'s.
+    usable_t: T,
     /// Whether `ws.f0` / `ws.jac` / `ws.ft` still describe the current `(u, t)`.
     ///
     /// Set once they are built and cleared in [`on_accept`](super::solver::Stepper::on_accept),
@@ -1077,6 +1138,7 @@ impl<T: PkNum> RosStepper<T> {
             ws: RosWorkspace::new(n, stages),
             method,
             usable: false,
+            usable_t: T::from_f64(0.0),
             jac_valid: false,
             mark: 0,
         }
@@ -1101,7 +1163,7 @@ impl<T: PkNum> RosStepper<T> {
     fn attempt_with<R: StageRhs<T> + ?Sized>(
         &mut self,
         stage: &R,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &crate::ode::solver::RhsG<'_, T>,
         u: &[T],
         params: &[T],
         t: f64,
@@ -1109,15 +1171,16 @@ impl<T: PkNum> RosStepper<T> {
         opts: &OdeSolverOptions,
     ) -> f64 {
         let gamma = method_gamma(self.method);
+        let clock = StepClock::new(t, dt);
         // `(u, t)` only moves on an accepted step, so after a rejection `f0`, `J` and `f_t`
         // are still the ones this step start needs — see `RosWorkspace::refresh_jacobian`.
         if !self.jac_valid {
-            self.ws.refresh_jacobian(stage, rhs, u, params, t);
+            self.ws.refresh_jacobian(stage, rhs, u, params, &clock);
             self.jac_valid = true;
         }
 
         self.mark = T::tape_mark();
-        if self.ws.factor_w(dt, gamma).is_err() {
+        if self.ws.factor_w(&clock, gamma).is_err() {
             // Singular `W`: no stage could be solved, so there is no `u_new` to score or to
             // force-accept. The driver shrinks `dt`, or gives up at `min_dt`.
             self.usable = false;
@@ -1125,9 +1188,9 @@ impl<T: PkNum> RosStepper<T> {
         }
         self.usable = true;
         match self.method {
-            OdeMethod::Rosenbrock23 => self.ws.ros23_stages(stage, u, params, t, dt),
-            OdeMethod::Rodas4 => self.ws.rodas_stages(stage, u, params, t, dt, &RODAS4),
-            OdeMethod::Rodas5P => self.ws.rodas_stages(stage, u, params, t, dt, &RODAS5P),
+            OdeMethod::Rosenbrock23 => self.ws.ros23_stages(stage, u, params, &clock),
+            OdeMethod::Rodas4 => self.ws.rodas_stages(stage, u, params, &clock, &RODAS4),
+            OdeMethod::Rodas5P => self.ws.rodas_stages(stage, u, params, &clock, &RODAS5P),
             other @ (OdeMethod::Rk45 | OdeMethod::Vern7 | OdeMethod::Auto | OdeMethod::Linear) => {
                 unreachable!("{other:?} does not use the Rosenbrock stepper")
             }
@@ -1136,10 +1199,99 @@ impl<T: PkNum> RosStepper<T> {
     }
 }
 
+impl<T: PkNum> super::solver::StepBody<T> for RosStepper<T> {
+    fn needs_start(&self) -> bool {
+        !self.jac_valid
+    }
+    fn start(
+        &mut self,
+        rhs: &crate::ode::solver::RhsG<'_, T>,
+        u: &[T],
+        params: &[T],
+        clock: &StepClock<T>,
+    ) {
+        self.ws.refresh_jacobian(rhs, rhs, u, params, clock);
+        self.jac_valid = true;
+    }
+    fn step(
+        &mut self,
+        rhs: &crate::ode::solver::RhsG<'_, T>,
+        u: &[T],
+        params: &[T],
+        clock: &StepClock<T>,
+    ) {
+        self.jac_valid = true;
+        let gamma = method_gamma(self.method);
+        if T::RECORDS_BRANCHES {
+            // A singular `W` is a rejected attempt at run time, not a different recording.
+            self.usable_t = self.ws.factor_w_flag(clock, gamma);
+            self.usable = true;
+        } else {
+            self.usable = self.ws.factor_w(clock, gamma).is_ok();
+            self.usable_t = T::from_f64(if self.usable { 1.0 } else { 0.0 });
+            if !self.usable {
+                return;
+            }
+        }
+        match self.method {
+            OdeMethod::Rosenbrock23 => self.ws.ros23_stages(rhs, u, params, clock),
+            OdeMethod::Rodas4 => self.ws.rodas_stages(rhs, u, params, clock, &RODAS4),
+            OdeMethod::Rodas5P => self.ws.rodas_stages(rhs, u, params, clock, &RODAS5P),
+            other @ (OdeMethod::Rk45 | OdeMethod::Vern7 | OdeMethod::Auto | OdeMethod::Linear) => {
+                unreachable!("{other:?} does not use the Rosenbrock stepper")
+            }
+        }
+    }
+    fn carried_into(&self, out: &mut Vec<T>) {
+        let w = &self.ws;
+        out.clear();
+        for v in [&w.f0, &w.jac, &w.ft, &w.u_tmp, &w.u_new, &w.err]
+            .into_iter()
+            .chain(w.ks.iter())
+        {
+            out.extend_from_slice(v);
+        }
+        out.push(self.usable_t);
+    }
+    fn set_carried(&mut self, v: &[T]) {
+        let w = &mut self.ws;
+        let mut at = 0;
+        for dst in [
+            &mut w.f0,
+            &mut w.jac,
+            &mut w.ft,
+            &mut w.u_tmp,
+            &mut w.u_new,
+            &mut w.err,
+        ]
+        .into_iter()
+        .chain(w.ks.iter_mut())
+        {
+            let m = dst.len();
+            dst.copy_from_slice(&v[at..at + m]);
+            at += m;
+        }
+        // A recording type (#2786) reads its carried state as variables: its step decides
+        // `usable` itself (the factorization's guarded verdict), never from a carried value.
+        self.usable = T::RECORDS_BRANCHES || v[at].val() == 1.0;
+        self.jac_valid = true;
+    }
+    fn err(&mut self, u: &[T], _dt: f64, opts: &OdeSolverOptions) -> f64 {
+        if !self.usable {
+            return f64::INFINITY;
+        }
+        self.ws.err_norm(u, opts)
+    }
+    fn reset_start(&mut self) {
+        self.jac_valid = false;
+        self.usable = false;
+    }
+}
+
 impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
     fn attempt(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &crate::ode::solver::RhsG<'_, T>,
         u: &[T],
         params: &[T],
         t: f64,

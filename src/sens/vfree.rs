@@ -1,21 +1,35 @@
-//! A tape-free forward dual for the adjoint's η-only recordings.
+//! A forward dual, the tests' independent derivative reference (#2786).
 //!
-//! [`DualF<N, M>`] is a [`DualV<N, M>`] that can never be on the tape: the value, its `N`
-//! η-tangents and the `M`-entry η-Hessian payload, without the tape index. Every
-//! operation runs `DualV`'s own untaped arithmetic (it builds a free `DualV`, applies the
-//! operation, and keeps the parts), so the jets are bit-identical to a tape-free `DualV`
-//! recording. What it saves is the index: with no `u32` beside the lanes and no runtime
-//! test of it, a value stays in registers. On the inner loop's stiff-ODE recordings a
-//! first-order `DualV<3, 0>` ran ~15× slower per operation than a plain dual of the same
-//! width (the struct round-tripped through memory, a store-forwarding stall per op).
-//!
-//! Used by `canonical_jets` (the η-Jacobian, the exact inner Hessian and the quadrature
-//! anchors' jets); the outer gradient's recordings, which tape θ, keep `DualV`.
+//! [`DualF<N, M>`] carries a value, its `N` tangents and, with `M = N(N+1)/2`, the packed
+//! Hessian `h[tri(k, l)] = ∂²/∂t_k∂t_l` (`M = 0`: first order). Every operation is the
+//! textbook chain rule on those parts, written here once and shared with nothing the
+//! production path runs: the plans' recordings (`parser::kernel_jit`) are checked against
+//! it, so a defect in either shows as a disagreement.
 #![allow(clippy::needless_range_loop)]
 
 use super::num::PkNum;
-use super::vtape::DualV;
 use std::ops::{Add, Div, Mul, Neg, Sub};
+
+/// Packed lower-triangle index of the symmetric pair `(k, l)`.
+#[inline]
+pub(crate) const fn tri(k: usize, l: usize) -> usize {
+    if l <= k {
+        k * (k + 1) / 2 + l
+    } else {
+        l * (l + 1) / 2 + k
+    }
+}
+
+/// The packed Hessian entries of row `k` a dual carries: `(k, 0..=k)`, none at first order.
+#[inline]
+#[allow(clippy::reversed_empty_ranges)]
+const fn hrange<const M: usize>(k: usize) -> std::ops::RangeInclusive<usize> {
+    if M == 0 {
+        1..=0
+    } else {
+        0..=k
+    }
+}
 
 /// See the module docs.
 ///
@@ -30,7 +44,10 @@ pub struct DualF<const N: usize, const M: usize> {
 }
 
 impl<const N: usize, const M: usize> DualF<N, M> {
-    /// An input with value, η-tangents and Hessian payload.
+    /// Whether the native code runs this width out of line ([`crate::sens::num::outlined`]),
+    /// where a constant operand takes the generic operation.
+    pub(crate) const WIDE: bool = crate::sens::num::outlined(N, std::mem::size_of::<Self>());
+    /// An input with value, tangents and Hessian payload.
     #[inline]
     pub fn free(v: f64, g: [f64; N], h: [f64; M]) -> Self {
         DualF { v, g, h }
@@ -41,18 +58,6 @@ impl<const N: usize, const M: usize> DualF<N, M> {
             v,
             g: [0.0; N],
             h: [0.0; M],
-        }
-    }
-    #[inline(always)]
-    fn up(self) -> DualV<N, M> {
-        DualV::free(self.v, self.g, self.h)
-    }
-    #[inline(always)]
-    fn down(d: DualV<N, M>) -> Self {
-        DualF {
-            v: d.v,
-            g: d.g,
-            h: d.h,
         }
     }
     /// Bit-identity of value, tangents and payload (the bytecode VM's no-op check).
@@ -69,70 +74,162 @@ impl<const N: usize, const M: usize> DualF<N, M> {
                 .zip(&other.h)
                 .all(|(a, b)| a.to_bits() == b.to_bits())
     }
-    #[inline(always)]
+    /// `φ(self)` with `φ = hv`, `φ′ = h1`, `φ″ = h2`.
+    #[inline]
+    fn unary(self, hv: f64, h1: f64, h2: f64) -> Self {
+        let mut g = [0.0; N];
+        let mut h = [0.0; M];
+        for k in 0..N {
+            g[k] = h1 * self.g[k];
+            for l in hrange::<M>(k) {
+                let t = tri(k, l);
+                h[t] = h1 * self.h[t] + h2 * self.g[k] * self.g[l];
+            }
+        }
+        DualF { v: hv, g, h }
+    }
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
+    #[inline]
     pub(crate) fn add_c(self, c: f64) -> Self {
-        Self::down(self.up().add_c(c))
+        DualF {
+            v: self.v + c,
+            ..self
+        }
     }
-    #[inline(always)]
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
+    #[inline]
     pub(crate) fn sub_c(self, c: f64) -> Self {
-        Self::down(self.up().sub_c(c))
+        DualF {
+            v: self.v - c,
+            ..self
+        }
     }
-    #[inline(always)]
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
+    #[inline]
     pub(crate) fn rsub_c(self, c: f64) -> Self {
-        Self::down(self.up().rsub_c(c))
+        Self::constant(c) - self
     }
-    #[inline(always)]
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
+    #[inline]
     pub(crate) fn mul_c(self, c: f64) -> Self {
-        Self::down(self.up().mul_c(c))
+        if Self::WIDE {
+            return self * Self::constant(c);
+        }
+        let mut r = self;
+        r.v *= c;
+        r.g.iter_mut().for_each(|x| *x *= c);
+        r.h.iter_mut().for_each(|x| *x *= c);
+        r
     }
-    #[inline(always)]
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
+    #[inline]
     pub(crate) fn div_c(self, c: f64) -> Self {
-        Self::down(self.up().div_c(c))
+        if Self::WIDE {
+            return self / Self::constant(c);
+        }
+        let ib = 1.0 / c;
+        let mut r = self;
+        r.v /= c;
+        r.g.iter_mut().for_each(|x| *x *= ib);
+        r.h.iter_mut().for_each(|x| *x *= ib);
+        r
     }
 }
 
-macro_rules! binop {
-    ($tr:ident, $f:ident) => {
-        impl<const N: usize, const M: usize> $tr for DualF<N, M> {
-            type Output = Self;
-            #[inline(always)]
-            fn $f(self, o: Self) -> Self {
-                Self::down(self.up().$f(o.up()))
+impl<const N: usize, const M: usize> Add for DualF<N, M> {
+    type Output = Self;
+    #[inline]
+    fn add(self, o: Self) -> Self {
+        let mut r = self;
+        r.v += o.v;
+        for k in 0..N {
+            r.g[k] += o.g[k];
+        }
+        for t in 0..M {
+            r.h[t] += o.h[t];
+        }
+        r
+    }
+}
+
+impl<const N: usize, const M: usize> Sub for DualF<N, M> {
+    type Output = Self;
+    #[inline]
+    fn sub(self, o: Self) -> Self {
+        let mut r = self;
+        r.v -= o.v;
+        for k in 0..N {
+            r.g[k] -= o.g[k];
+        }
+        for t in 0..M {
+            r.h[t] -= o.h[t];
+        }
+        r
+    }
+}
+
+impl<const N: usize, const M: usize> Mul for DualF<N, M> {
+    type Output = Self;
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
+    #[inline]
+    fn mul(self, o: Self) -> Self {
+        let mut g = [0.0; N];
+        let mut h = [0.0; M];
+        for k in 0..N {
+            g[k] = self.g[k] * o.v + self.v * o.g[k];
+            for l in hrange::<M>(k) {
+                let t = tri(k, l);
+                h[t] = self.h[t] * o.v + self.v * o.h[t] + self.g[k] * o.g[l] + self.g[l] * o.g[k];
             }
         }
-    };
+        DualF {
+            v: self.v * o.v,
+            g,
+            h,
+        }
+    }
 }
-binop!(Add, add);
-binop!(Sub, sub);
-binop!(Mul, mul);
-binop!(Div, div);
+
+impl<const N: usize, const M: usize> Div for DualF<N, M> {
+    type Output = Self;
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
+    #[inline]
+    fn div(self, o: Self) -> Self {
+        let q = self.v / o.v;
+        let ib = 1.0 / o.v;
+        let mut g = [0.0; N];
+        for k in 0..N {
+            g[k] = (self.g[k] - q * o.g[k]) * ib;
+        }
+        // c·b = a  ⇒  c_kl = (a_kl − c_k b_l − c_l b_k − c b_kl)/b
+        let mut h = [0.0; M];
+        for k in 0..N {
+            for l in hrange::<M>(k) {
+                let t = tri(k, l);
+                h[t] = (self.h[t] - g[k] * o.g[l] - g[l] * o.g[k] - q * o.h[t]) * ib;
+            }
+        }
+        DualF { v: q, g, h }
+    }
+}
 
 impl<const N: usize, const M: usize> Neg for DualF<N, M> {
     type Output = Self;
-    #[inline(always)]
+    #[inline]
     fn neg(self) -> Self {
-        Self::down(-self.up())
+        let mut r = self;
+        r.v = -r.v;
+        r.g.iter_mut().for_each(|x| *x = -*x);
+        r.h.iter_mut().for_each(|x| *x = -*x);
+        r
     }
 }
 
-macro_rules! unary {
-    ($($f:ident),*) => {
-        $(
-            #[inline]
-            fn $f(self) -> Self {
-                Self::down(self.up().$f())
-            }
-        )*
-    };
-}
-
 impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
-    const SECOND_ORDER: bool = <DualV<N, M> as PkNum>::SECOND_ORDER;
-    /// No tape: the jet's own order.
+    const SECOND_ORDER: bool = true;
     const JET_ORDER: usize = if M > 0 { 2 } else { 1 };
-    const WORK: usize = 1 + N + M;
-    const TAYLOR2_EXACT: bool = <DualV<N, M> as PkNum>::TAYLOR2_EXACT;
-    const ETA_HESSIAN: bool = <DualV<N, M> as PkNum>::ETA_HESSIAN;
+    const TAYLOR2_EXACT: bool = true;
+    const ETA_HESSIAN: bool = M > 0;
     #[inline]
     fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
         Some(DualF::same_bits(self, other))
@@ -147,44 +244,104 @@ impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
     }
     #[inline]
     fn var(x: f64, dim: usize) -> Self {
-        Self::down(<DualV<N, M> as PkNum>::var(x, dim))
+        let mut d = DualF::constant(x);
+        if dim < N {
+            d.g[dim] = 1.0;
+        }
+        d
     }
     #[inline]
     fn val(self) -> f64 {
         self.v
     }
-    unary!(exp, ln, sqrt, abs, inv_logit, logit, cos, acos, ln_gamma);
-    #[inline]
+    fn exp(self) -> Self {
+        let e = self.v.exp();
+        self.unary(e, e, e)
+    }
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
+    fn ln(self) -> Self {
+        let x = self.v;
+        self.unary(x.ln(), 1.0 / x, -1.0 / (x * x))
+    }
+    fn sqrt(self) -> Self {
+        let s = self.v.sqrt();
+        self.unary(s, 0.5 / s, -0.25 / (s * s * s))
+    }
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     fn pow(self, e: Self) -> Self {
-        Self::down(self.up().pow(e.up()))
+        if e.is_constant() {
+            let (a, n) = (self.v, e.v);
+            if a == 0.0 {
+                return DualF::constant(a.powf(n));
+            }
+            return self.unary(
+                a.powf(n),
+                n * a.powf(n - 1.0),
+                n * (n - 1.0) * a.powf(n - 2.0),
+            );
+        }
+        (e * self.ln()).exp()
     }
-    #[inline]
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
+    fn abs(self) -> Self {
+        if self.v >= 0.0 {
+            self
+        } else {
+            -self
+        }
+    }
+    fn inv_logit(self) -> Self {
+        let u = 1.0 / (1.0 + (-self.v).exp());
+        let d1 = u * (1.0 - u);
+        self.unary(u, d1, d1 * (1.0 - 2.0 * u))
+    }
+    fn logit(self) -> Self {
+        let x = self.v;
+        let d1 = 1.0 / (x * (1.0 - x));
+        self.unary((x / (1.0 - x)).ln(), d1, -(1.0 - 2.0 * x) * d1 * d1)
+    }
+    fn cos(self) -> Self {
+        let x = self.v;
+        self.unary(x.cos(), -x.sin(), -x.cos())
+    }
+    fn acos(self) -> Self {
+        let x = self.v;
+        let s = 1.0 - x * x;
+        self.unary(x.acos(), -1.0 / s.sqrt(), -x / (s * s.sqrt()))
+    }
+    // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     fn guard_floor(self, lo: f64) -> Self {
-        Self::down(self.up().guard_floor(lo))
+        // `!(v >= lo)` floors a NaN too, matching `f64::max` on the value path.
+        if !(self.v >= lo) {
+            DualF::constant(lo)
+        } else {
+            self
+        }
     }
-    #[inline]
+    fn ln_gamma(self) -> Self {
+        let x = self.v;
+        self.unary(
+            crate::stats::special::ln_gamma(x),
+            crate::stats::special::digamma(x),
+            crate::stats::special::trigamma(x),
+        )
+    }
     fn jets_finite(self) -> bool {
-        self.up().jets_finite()
+        self.g.iter().all(|x| x.is_finite()) && self.h.iter().all(|x| x.is_finite())
     }
-    #[inline]
     fn jet_max_abs(self) -> f64 {
-        self.up().jet_max_abs()
+        crate::sens::num::nan_max_abs(self.g.iter().chain(&self.h).copied())
     }
-    #[inline]
     fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
-        Self::down(self.up().lift2(v, d1, d2))
+        self.unary(v, d1, d2)
     }
-    #[inline]
-    fn lift3(self, v: f64, d1: f64, d2: f64, d3: f64) -> Self {
-        Self::down(self.up().lift3(v, d1, d2, d3))
+    fn lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self {
+        self.unary(v, d1, d2)
     }
-    #[inline]
-    fn lift4(self, v: f64, d1: f64, d2: f64, d3: f64, d4: f64) -> Self {
-        Self::down(self.up().lift4(v, d1, d2, d3, d4))
+    fn lift4(self, v: f64, d1: f64, d2: f64, _d3: f64, _d4: f64) -> Self {
+        self.unary(v, d1, d2)
     }
-    /// [`DualV::lincomb`]'s untaped arm, term for term (no slice of `DualV`s to build).
-    /// Inlined, so the stage's constant coefficients unroll its loops.
-    #[inline(always)]
+    /// `u + h·Σ cⱼkⱼ`, part for part.
     fn lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self {
         let mut sv = 0.0;
         for j in 0..cs.len() {
@@ -212,12 +369,12 @@ impl<const N: usize, const M: usize> PkNum for DualF<N, M> {
 }
 
 impl<const N: usize, const M: usize> crate::sens::num::vm::VmArith for DualF<N, M> {
-    /// `DualV<N, M>`'s untaped arithmetic, which is what every operation here runs.
     const LANES: Option<crate::sens::num::vm::Layout> = Some(crate::sens::num::vm::Layout {
         n: N as u16,
         m: M as u16,
         th: false,
-        wide: DualV::<N, M>::WIDE,
+        wide: Self::WIDE,
+        tan: 0,
     });
     const CONTIGUOUS: bool = true;
     #[inline]

@@ -147,13 +147,17 @@ const ERF_GERM_HALF_WIDTH: f64 = 1e-3;
 /// (i.e. `x = 0`) is a real point of the IG CDF, reached at observation time
 /// `t = MAT`.
 pub fn erf_g<T: PkNum>(x: T) -> T {
-    if x.val().abs() < ERF_GERM_HALF_WIDTH {
+    if x.br_abs_lt(ERF_GERM_HALF_WIDTH) {
         // erf(x) = (2/√π)(x − x³/3 + …); the cubic germ is accurate in value, grad,
         // and Hessian through x = 0 (where the raw `P(½,x²)` clamp loses erf'(0)).
         let c = T::from_f64(TWO_OVER_SQRT_PI);
         return c * (x - x * x * x / T::from_f64(3.0));
     }
-    let sign = if x.val() < 0.0 { -1.0 } else { 1.0 };
+    let sign = if x.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
+        -1.0
+    } else {
+        1.0
+    };
     T::from_f64(sign) * regularized_gamma_p(T::from_f64(0.5), x * x)
 }
 
@@ -168,7 +172,7 @@ pub fn erf_g<T: PkNum>(x: T) -> T {
 /// well-conditioned (`erf ≤ erf(1) ≈ 0.843`) and reuses [`erf_g`]'s near-zero germ,
 /// so `erfc'(0) = −2/√π` stays exact.
 pub fn erfc_g<T: PkNum>(x: T) -> T {
-    if x.val() > 1.0 {
+    if x.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1.0) {
         regularized_gamma_q(T::from_f64(0.5), x * x)
     } else {
         T::from_f64(1.0) - erf_g(x)
@@ -200,7 +204,7 @@ pub fn normal_cdf_g<T: PkNum>(z: T) -> T {
 /// `MIN_PROB`, where it clamps flat to avoid `−∞` contaminating the likelihood.
 pub fn log_normal_cdf_g<T: PkNum>(z: T) -> T {
     let p = normal_cdf_g(z);
-    if p.val() < MIN_PROB {
+    if p.br_cmp_c(crate::sens::num::BranchCmp::Lt, MIN_PROB) {
         T::from_f64(MIN_PROB.ln())
     } else {
         p.ln()
@@ -235,6 +239,82 @@ pub(crate) fn mills_excess<T: PkNum>(t: T) -> T {
 /// [`normal_cdf`] all the way out: `Φ` rounds to `1` from about `8.3`, and `normal_cdf(+∞) = 1`
 /// since #2762 — the `x > 38 ⇒ 1` arm this used to carry for that rejected exactly the inputs
 /// `normal_cdf` now gets right, so it went (one gate, not two). `NaN` stays `NaN`.
+/// `Φ` and its first four derivatives, `φ`, `−xφ`, `(x² − 1)φ`, `(3x − x³)φ` — each `0`
+/// where `φ` is (past `|x| ≈ 38.6`, and at `±∞`), where the polynomial factors would make
+/// `0 · ∞ = NaN` once `x²` overflows.
+pub(crate) fn pnorm_jet(x: f64) -> [f64; 5] {
+    let d = (-0.5 * x * x).exp() * INV_SQRT_2PI;
+    if d == 0.0 {
+        return [pnorm(x), 0.0, 0.0, 0.0, 0.0];
+    }
+    [
+        pnorm(x),
+        d,
+        -x * d,
+        (x * x - 1.0) * d,
+        (3.0 * x - x * x * x) * d,
+    ]
+}
+
+/// `softplus(x) = ln(1 + eˣ)` (`max(x, 0) + ln1p(e^{−|x|})`, without overflow) and its
+/// first four derivatives: the logistic `p` and its own first three.
+pub(crate) fn softplus_jet(x: f64) -> [f64; 5] {
+    let [p, q, d2, d3, _] = logistic_jet(x);
+    [x.max(0.0) + (-x.abs()).exp().ln_1p(), p, q, d2, d3]
+}
+
+/// `tanh` and its first four derivatives.
+pub(crate) fn tanh_jet(x: f64) -> [f64; 5] {
+    let t = x.tanh();
+    let d1 = 1.0 - t * t;
+    [
+        t,
+        d1,
+        -2.0 * t * d1,
+        -2.0 * d1 * (1.0 - 3.0 * t * t),
+        8.0 * t * d1 * (2.0 - 3.0 * t * t),
+    ]
+}
+
+/// `[log Φ, (log Φ)′, …, (log Φ)⁗]` at `x`: production's value (`log_normal_cdf`) and the
+/// derivatives from the inverse Mills ratio `h = φ/Φ` — `(log Φ)′ = h`, `h′ = −h(x + h)`,
+/// `h″ = −h′(x + h) − h(1 + h′)`, `h‴ = −h″(x + 2h) − 2h′(1 + h′)`.
+pub(crate) fn log_normal_cdf_jet(x: f64) -> [f64; 5] {
+    let [h, h1, h2, h3, _] = inv_mills_jet(x);
+    [log_normal_cdf(x), h, h1, h2, h3]
+}
+
+/// `[h, h′, h″, h‴, h⁗]` of the inverse Mills ratio `h = φ/Φ` at `x`, by its recursion
+/// `h′ = −h(x + h)`, `h″ = −h′(x + h) − h(1 + h′)`, `h‴ = −h″(x + 2h) − 2h′(1 + h′)`,
+/// `h⁗ = −h‴(x + 2h) − 3h″(1 + 2h′)`.
+pub(crate) fn inv_mills_jet(x: f64) -> [f64; 5] {
+    let h = inv_mills(x);
+    let h1 = -h * (x + h);
+    let h2 = -h1 * (x + h) - h * (1.0 + h1);
+    let h3 = -h2 * (x + 2.0 * h) - 2.0 * h1 * (1.0 + h1);
+    let h4 = -h3 * (x + 2.0 * h) - 3.0 * h2 * (1.0 + 2.0 * h1);
+    [h, h1, h2, h3, h4]
+}
+
+/// The logistic `s = 1/(1 + e⁻ˣ)` (each sign's overflow-free spelling) and its first four
+/// derivatives: `q = s(1 − s)`, `q(1 − 2s)`, `q(1 − 6s + 6s²)`, `q(1 − 2s)(1 − 12s + 12s²)`.
+pub(crate) fn logistic_jet(x: f64) -> [f64; 5] {
+    let s = if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    };
+    let q = s * (1.0 - s);
+    [
+        s,
+        q,
+        q * (1.0 - 2.0 * s),
+        q * (1.0 - 6.0 * s + 6.0 * s * s),
+        q * (1.0 - 2.0 * s) * (1.0 - 12.0 * s + 12.0 * s * s),
+    ]
+}
+
 pub(crate) fn pnorm(x: f64) -> f64 {
     if x < -37.0 {
         let t = -x;
@@ -569,14 +649,7 @@ pub(crate) fn pentagamma(x: f64) -> f64 {
 /// `x = a + 1` switch. Transit fits sit mostly in the continued-fraction regime
 /// (`x = (KTR − k)·t` grows with the dosing interval while `a = n + 1` stays small).
 pub fn regularized_gamma_p<T: PkNum>(a: T, x: T) -> T {
-    if x.val() <= 0.0 {
-        return T::from_f64(0.0);
-    }
-    if x.val() < a.val() + 1.0 {
-        gamma_p_series(a, x)
-    } else {
-        T::from_f64(1.0) - gamma_q_cf(a, x)
-    }
+    a.gamma_pq(x, false)
 }
 
 /// Regularized **upper** incomplete gamma `Q(a, x) = 1 − P(a, x) = Γ(a, x)/Γ(a)` —
@@ -592,13 +665,81 @@ pub fn regularized_gamma_p<T: PkNum>(a: T, x: T) -> T {
 /// `gamma_q_cf` iterations), so `Q + P = 1` holds for the values **and** their
 /// derivatives cancel to zero.
 pub fn regularized_gamma_q<T: PkNum>(a: T, x: T) -> T {
+    a.gamma_pq(x, true)
+}
+
+/// [`regularized_gamma_p`] (`upper = false`) or [`regularized_gamma_q`] (`upper = true`):
+/// the body [`PkNum::gamma_pq`] runs for every number type. A recording type (#2786)
+/// records the function as one primitive instead, whose derivatives
+/// [`gamma_pq_partial`] takes from this same body.
+pub(crate) fn gamma_pq_g<T: PkNum>(a: T, x: T, upper: bool) -> T {
+    let one = T::from_f64(1.0);
     if x.val() <= 0.0 {
-        return T::from_f64(1.0);
+        return if upper { one } else { T::from_f64(0.0) };
     }
-    if x.val() < a.val() + 1.0 {
-        T::from_f64(1.0) - gamma_p_series(a, x)
+    match (x.val() < a.val() + 1.0, upper) {
+        (true, false) => gamma_p_series(a, x),
+        (true, true) => one - gamma_p_series(a, x),
+        (false, false) => one - gamma_q_cf(a, x),
+        (false, true) => gamma_q_cf(a, x),
+    }
+}
+
+/// `∂^(i+j) P / ∂aⁱ ∂xʲ` at `(a, x)` — of `Q` when `upper`, which is `1 − P`, so every
+/// partial but the value is the negated one of `P` — for `i + j ≤ 3`; `NaN` above, where no
+/// layout differentiates (a misuse shows as a non-finite derivative, which the checks
+/// reject). The primitive's local derivatives (#2786): [`gamma_pq_g`] over a two-variable
+/// Taylor polynomial of the order asked, so they are the derivatives the dual types carry
+/// through the same iteration, rounded once more. The last point's polynomial is kept per
+/// thread, as a recorded program asks for several partials at one point in a row.
+pub(crate) fn gamma_pq_partial(a: f64, x: f64, upper: bool, i: u8, j: u8) -> f64 {
+    use crate::sens::taylor::Taylor;
+    use std::cell::Cell;
+    let ord = (i + j) as usize;
+    if ord == 0 {
+        return gamma_pq_g(a, x, upper);
+    }
+    if ord > 3 {
+        return f64::NAN;
+    }
+    thread_local! {
+        /// `(a, x, order)` and the partials `[∂a, ∂x, ∂aa, ∂ax, ∂xx, ∂aaa, ∂aax, ∂axx, ∂xxx]`
+        /// of `P` (unset past the order).
+        static LAST: Cell<(u64, u64, usize, [f64; 9])> = const { Cell::new((0, 0, 0, [0.0; 9])) };
+    }
+    let (ka, kx) = (a.to_bits(), x.to_bits());
+    let (la, lx, lord, mut d) = LAST.get();
+    if la != ka || lx != kx || lord < ord {
+        // `c_α = ∂^α f / α!` in graded order: `1, a, x, a², ax, x², a³, a²x, ax², x³`.
+        fn fill<const O: usize, const L: usize>(a: f64, x: f64, d: &mut [f64; 9]) {
+            let p = gamma_pq_g(Taylor::<2, O, L>::seed(a, 0), Taylor::seed(x, 1), false);
+            const FACT: [f64; 9] = [1.0, 1.0, 2.0, 1.0, 2.0, 6.0, 2.0, 2.0, 6.0];
+            for (k, f) in FACT.iter().enumerate().take(L - 1) {
+                d[k] = p.c[k + 1] * f;
+            }
+        }
+        match ord {
+            1 => fill::<1, 3>(a, x, &mut d),
+            2 => fill::<2, 6>(a, x, &mut d),
+            _ => fill::<3, 10>(a, x, &mut d),
+        }
+        LAST.set((ka, kx, ord, d));
+    }
+    let k = match (i, j) {
+        (1, 0) => 0,
+        (0, 1) => 1,
+        (2, 0) => 2,
+        (1, 1) => 3,
+        (0, 2) => 4,
+        (3, 0) => 5,
+        (2, 1) => 6,
+        (1, 2) => 7,
+        _ => 8,
+    };
+    if upper {
+        -d[k]
     } else {
-        gamma_q_cf(a, x)
+        d[k]
     }
 }
 

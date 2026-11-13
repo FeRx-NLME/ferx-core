@@ -537,6 +537,12 @@ pub(crate) fn effective_solver_options(baked: OdeSolverOptions) -> OdeSolverOpti
     }
 }
 
+/// The override in force on this thread (see `LOCAL_OVERRIDE`): what a compiled recording's
+/// ODE segment was recorded under, and must run under (#2786).
+pub(crate) fn current_ode_override() -> Option<Option<OdeSolverOverride>> {
+    LOCAL_OVERRIDE.get()
+}
+
 pub(crate) fn install_worker_ode_override(ov: OdeSolverOverride) {
     LOCAL_OVERRIDE.set(Some(Some(ov)));
 }
@@ -743,7 +749,7 @@ pub struct OdeSolverStats {
     pub discarded_unfinished_segments: usize,
     /// Engine walks abandoned **before integrating** because their timeline could not be
     /// ordered — a `NaN`/`inf` dose time, lagtime, route lag or infusion duration
-    /// (`ode::predictions::timeline_has_non_finite`, #1189).
+    /// (`ode::predictions::times_have_non_finite`, #1189).
     ///
     /// The odd one out, and deliberately: every other counter here reports work that *happened*,
     /// so an abandoned walk leaves all of them at zero. That reading is not distinguishable from
@@ -917,6 +923,146 @@ impl OdeSolverStats {
     }
 }
 
+/// A right-hand side over a number type, time included: `f(u, params, t, du)`. Time is a `T`
+/// so a recording type (#2786) can carry a step's stage times as inputs of the code it records;
+/// at `T = f64` it is the `f64` right-hand side, unchanged.
+pub(crate) type RhsG<'a, T> = dyn Fn(&[T], &[T], T, &mut [T]) + 'a;
+
+/// A generic right-hand side from a public `f64`-time one: time handed in by value.
+pub(crate) fn rhs_of_f64_time<'a, T: PkNum>(
+    f: &'a dyn Fn(&[T], &[T], f64, &mut [T]),
+) -> impl Fn(&[T], &[T], T, &mut [T]) + 'a {
+    move |u, p, t, du| f(u, p, t.val(), du)
+}
+
+/// A step attempt's clock: its start `t` and size `dt` as `f64`, what every decision reads,
+/// and as `T`, what the stage arithmetic reads — constants for a number type, a recording
+/// type's inputs for the step it records (#2786). Each helper is the `f64` expression the
+/// steppers have always formed, so a number type's stages are unchanged bit for bit; a
+/// recording type forms the same operations on its inputs.
+#[derive(Clone, Copy)]
+pub(crate) struct StepClock<T> {
+    pub(crate) t: f64,
+    pub(crate) dt: f64,
+    pub(crate) ts: T,
+    pub(crate) dts: T,
+}
+
+impl<T: PkNum> StepClock<T> {
+    #[inline]
+    pub(crate) fn new(t: f64, dt: f64) -> Self {
+        StepClock {
+            t,
+            dt,
+            ts: T::from_f64(t),
+            dts: T::from_f64(dt),
+        }
+    }
+    /// The step's start time.
+    #[inline]
+    pub(crate) fn start(&self) -> T {
+        if T::RECORDS_BRANCHES {
+            self.ts
+        } else {
+            T::from_f64(self.t)
+        }
+    }
+    /// `t + c·dt`.
+    #[inline]
+    pub(crate) fn at(&self, c: f64) -> T {
+        if T::RECORDS_BRANCHES {
+            self.ts + T::from_f64(c) * self.dts
+        } else {
+            T::from_f64(self.t + c * self.dt)
+        }
+    }
+    /// `t + dt`.
+    #[inline]
+    pub(crate) fn end(&self) -> T {
+        if T::RECORDS_BRANCHES {
+            self.ts + self.dts
+        } else {
+            T::from_f64(self.t + self.dt)
+        }
+    }
+    /// `t + x`, `x` an `f64` offset known only as a value (a finite-difference step).
+    #[inline]
+    pub(crate) fn shifted(&self, x: T, xf: f64) -> T {
+        if T::RECORDS_BRANCHES {
+            self.ts + x
+        } else {
+            T::from_f64(self.t + xf)
+        }
+    }
+    /// `dt`.
+    #[inline]
+    pub(crate) fn h(&self) -> T {
+        if T::RECORDS_BRANCHES {
+            self.dts
+        } else {
+            T::from_f64(self.dt)
+        }
+    }
+    /// `dt·c`.
+    #[inline]
+    pub(crate) fn dt_times(&self, c: f64) -> T {
+        if T::RECORDS_BRANCHES {
+            self.dts * T::from_f64(c)
+        } else {
+            T::from_f64(self.dt * c)
+        }
+    }
+    /// `c·dt`.
+    #[inline]
+    pub(crate) fn times_dt(&self, c: f64) -> T {
+        if T::RECORDS_BRANCHES {
+            T::from_f64(c) * self.dts
+        } else {
+            T::from_f64(c * self.dt)
+        }
+    }
+    /// `c / dt`.
+    #[inline]
+    pub(crate) fn over_dt(&self, c: f64) -> T {
+        if T::RECORDS_BRANCHES {
+            T::from_f64(c) / self.dts
+        } else {
+            T::from_f64(c / self.dt)
+        }
+    }
+    /// `dt / c`.
+    #[inline]
+    pub(crate) fn dt_over(&self, c: f64) -> T {
+        if T::RECORDS_BRANCHES {
+            self.dts / T::from_f64(c)
+        } else {
+            T::from_f64(self.dt / c)
+        }
+    }
+    /// `1 / (c·dt)`.
+    #[inline]
+    pub(crate) fn inv_times_dt(&self, c: f64) -> T {
+        if T::RECORDS_BRANCHES {
+            T::from_f64(1.0) / (T::from_f64(c) * self.dts)
+        } else {
+            T::from_f64(1.0 / (c * self.dt))
+        }
+    }
+    /// [`PkNum::lincomb`] at this step's `dt`: `u + dt·(Σ cⱼ·kⱼ)`.
+    #[inline]
+    pub(crate) fn lincomb(&self, u: T, cs: &[f64], ks: &[T]) -> T {
+        if T::RECORDS_BRANCHES {
+            let mut acc = T::from_f64(cs[0]) * ks[0];
+            for j in 1..cs.len() {
+                acc = acc + T::from_f64(cs[j]) * ks[j];
+            }
+            u + self.dts * acc
+        } else {
+            T::lincomb(u, self.dt, cs, ks)
+        }
+    }
+}
+
 /// The one thing a method has to provide; everything else about integrating is shared.
 ///
 /// A stepper owns its stage workspace and knows how to (a) attempt a step and score it, and
@@ -936,7 +1082,7 @@ pub(crate) trait Stepper<T: PkNum> {
     /// [`interpolate_component`](Stepper::interpolate_component) describe this attempt.
     fn attempt(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &RhsG<'_, T>,
         u: &[T],
         params: &[T],
         t: f64,
@@ -986,6 +1132,126 @@ pub(crate) trait Stepper<T: PkNum> {
     }
 }
 
+/// A compiled recording's ODE runtime op (#2786) runs the drivers below at `T = f64` over its
+/// own steppers, which carry every derivative lane of the state beside its value: while one is
+/// set on this thread, [`make_stepper`] asks it for the stepper, and the dense driver reports
+/// each point it records so the op can take that point's lanes.
+pub(crate) trait LaneHook {
+    /// The stepper for `method` over `n` states.
+    fn stepper(&self, n: usize, method: OdeMethod) -> Box<dyn Stepper<f64>>;
+    /// A solve starts (again) from the segment's initial state.
+    fn begin(&self);
+    /// The current state was recorded: into the `saveat` list (`soft = false`) or the
+    /// `interp_at` list.
+    fn point(&self, soft: bool);
+    /// An `interp_at` point read off the step just accepted, at `theta` of `dt`.
+    fn interp(&self, theta: f64, dt: f64, i_state: usize);
+    /// The interpolated point's state is complete (every component read).
+    fn interp_done(&self);
+    /// A point the solve did not reach, padded with the last state (`NaN` lanes when diverged).
+    fn tail(&self, soft: bool, diverged: bool);
+}
+
+thread_local! {
+    static LANE_HOOK: std::cell::RefCell<Option<std::rc::Rc<dyn LaneHook>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with `hook` serving this thread's `f64` drivers.
+pub(crate) fn with_lane_hook<R>(hook: std::rc::Rc<dyn LaneHook>, f: impl FnOnce() -> R) -> R {
+    let prev = LANE_HOOK.with(|h| h.replace(Some(hook)));
+    let r = f();
+    LANE_HOOK.with(|h| *h.borrow_mut() = prev);
+    r
+}
+
+/// The hook serving this thread's drivers at `T = f64`, if any.
+#[inline]
+fn lane_hook<T: PkNum>() -> Option<std::rc::Rc<dyn LaneHook>> {
+    if std::any::TypeId::of::<T>() != std::any::TypeId::of::<f64>() {
+        return None;
+    }
+    LANE_HOOK.with(|h| h.borrow().clone())
+}
+
+/// A stepper's step as code a recording type records, and as the state its value shadows
+/// carry (#2786). A step is a *start* (what the step start needs once per `(u, t)`: RK45's
+/// `k1`, a Rosenbrock Jacobian) and a *step* over `dt`; each reads `u`, the clock and the
+/// carried state, and writes the carried state, with no decision of its own — every decision
+/// stays in the driver, on values.
+pub(crate) trait StepBody<T: PkNum>: Stepper<T> {
+    /// Whether the step start is not yet computed for the current `(u, t)`.
+    fn needs_start(&self) -> bool;
+    /// Compute the step start.
+    fn start(&mut self, rhs: &RhsG<'_, T>, u: &[T], params: &[T], clock: &StepClock<T>);
+    /// The step's stages over `clock` (the start computed): no error norm.
+    fn step(&mut self, rhs: &RhsG<'_, T>, u: &[T], params: &[T], clock: &StepClock<T>);
+    /// The state the start and the step write, in a fixed order, into `out`.
+    fn carried_into(&self, out: &mut Vec<T>);
+    /// Set the carried state, the start included.
+    fn set_carried(&mut self, v: &[T]);
+    /// The error norm of the last step, on values (`∞` for an unusable one).
+    fn err(&mut self, u: &[T], dt: f64, opts: &OdeSolverOptions) -> f64;
+    /// Back to a fresh stepper's state for what a step reads: the start not computed (a
+    /// reused stepper, #2786; the carried state is set before it is read).
+    fn reset_start(&mut self);
+}
+
+/// [`make_stepper`] as a [`StepBody`].
+pub(crate) fn make_step_body<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn StepBody<T>> {
+    match method {
+        OdeMethod::Vern7 => Box::new(super::explicit_rk::ErkStepper::new(
+            n,
+            &super::explicit_rk::VERN7,
+        )),
+        stiff @ (OdeMethod::Rosenbrock23 | OdeMethod::Rodas4 | OdeMethod::Rodas5P) => {
+            Box::new(super::rosenbrock::RosStepper::new(n, stiff))
+        }
+        OdeMethod::Rk45 | OdeMethod::Auto | OdeMethod::Linear => Box::new(Rk45Stepper::new(n)),
+    }
+}
+
+/// A compiled recording's ODE segment at run time (#2786): the adaptive integration of
+/// [`integrate_resolved_g_inner`] past the exact-linear path, at `f64`, under the caller's
+/// [`LaneHook`].
+pub(crate) fn integrate_nonlinear_f64(
+    rhs: &RhsG<'_, f64>,
+    u0: &[f64],
+    t_span: (f64, f64),
+    saveat: &[f64],
+    interp_at: &[f64],
+    opts: &OdeSolverOptions,
+    auto_state: &mut OdeAutoSwitchState,
+) -> (Vec<SolPointG<f64>>, Vec<SolPointG<f64>>) {
+    // A compiled plan's segment (#2786) is the derivative path's integration, counted as the
+    // dual sweeps' were; the run a recording makes of it is not (whether one happens depends
+    // on what the plan cache holds).
+    if crate::parser::model_parser::rhs_regcode::kernel_jit::recording_open() {
+        return integrate_resolved_g_inner(
+            rhs,
+            u0,
+            t_span,
+            &[],
+            saveat,
+            interp_at,
+            opts,
+            None,
+            auto_state,
+        );
+    }
+    integrate_resolved_g(
+        rhs,
+        u0,
+        t_span,
+        &[],
+        saveat,
+        interp_at,
+        opts,
+        None,
+        auto_state,
+    )
+}
+
 /// Build the stepper for `method`, sized for an `n`-state system.
 ///
 /// This is the **only** place a method name selects an implementation. Consumers take a
@@ -995,6 +1261,11 @@ pub(crate) trait Stepper<T: PkNum> {
 /// fail to compile here (and in the three sibling matches in [`super::rosenbrock`]) rather
 /// than route silently into the Rosenbrock stepper and panic inside a fit's worker thread.
 pub(crate) fn make_stepper<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn Stepper<T>> {
+    if let Some(hook) = lane_hook::<T>() {
+        let s: Box<dyn Stepper<f64>> = hook.stepper(n, method);
+        // SAFETY: `lane_hook` serves `T = f64` only, so the two box types are the same.
+        return unsafe { std::mem::transmute::<Box<dyn Stepper<f64>>, Box<dyn Stepper<T>>>(s) };
+    }
     match method {
         OdeMethod::Rk45 => Box::new(PooledRk45::take(n)),
         OdeMethod::Vern7 => Box::new(super::explicit_rk::ErkStepper::new(
@@ -1037,7 +1308,7 @@ pub(crate) fn hermite_g<T: PkNum>(s: f64, h: f64, y0: T, d0: T, y1: T, d1: T) ->
 /// right-hand-side evaluation per accepted step (~1 of 7 stages, ≈9% of FOCEI ODE wall time).
 /// After a *rejected* step `(u, t)` has not moved, so `k1` stays valid too; the first attempt
 /// has no prior `k1`, hence `have_k1`.
-struct Rk45Stepper<T> {
+pub(crate) struct Rk45Stepper<T> {
     n: usize,
     k1: Vec<T>,
     k2: Vec<T>,
@@ -1117,7 +1388,7 @@ impl<T: PkNum> Drop for PooledRk45<T> {
 impl<T: PkNum> Stepper<T> for PooledRk45<T> {
     fn attempt(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &RhsG<'_, T>,
         u: &[T],
         params: &[T],
         t: f64,
@@ -1173,7 +1444,7 @@ impl<T: PkNum> Rk45Stepper<T> {
         self.mark = 0;
     }
 
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         let z = T::from_f64(0.0);
         Self {
             n,
@@ -1198,12 +1469,12 @@ impl<T: PkNum> Rk45Stepper<T> {
 pub(crate) trait StageRhs<T> {
     /// Calls reach the model's machine code directly ([`DirectCall`]).
     const DIRECT: bool = false;
-    fn call(&self, u: &[T], params: &[T], t: f64, du: &mut [T]);
+    fn call(&self, u: &[T], params: &[T], t: T, du: &mut [T]);
 }
 
-impl<T> StageRhs<T> for dyn Fn(&[T], &[T], f64, &mut [T]) + '_ {
+impl<T> StageRhs<T> for dyn Fn(&[T], &[T], T, &mut [T]) + '_ {
     #[inline(always)]
-    fn call(&self, u: &[T], params: &[T], t: f64, du: &mut [T]) {
+    fn call(&self, u: &[T], params: &[T], t: T, du: &mut [T]) {
         self(u, params, t, du)
     }
 }
@@ -1213,13 +1484,13 @@ impl<T> StageRhs<T> for dyn Fn(&[T], &[T], f64, &mut [T]) + '_ {
 /// code declines.
 pub(crate) struct DirectCall<'a, T> {
     pub(crate) direct: &'a super::predictions::DirectStep<'a>,
-    pub(crate) rhs: &'a dyn Fn(&[T], &[T], f64, &mut [T]),
+    pub(crate) rhs: &'a RhsG<'a, T>,
 }
 
 impl<T: PkNum> StageRhs<T> for DirectCall<'_, T> {
     const DIRECT: bool = true;
     #[inline(always)]
-    fn call(&self, u: &[T], params: &[T], t: f64, du: &mut [T]) {
+    fn call(&self, u: &[T], params: &[T], t: T, du: &mut [T]) {
         super::rosenbrock::call_direct(self.direct, self.rhs, u, params, t, du)
     }
 }
@@ -1241,6 +1512,21 @@ impl<T: PkNum> Rk45Stepper<T> {
         dt_eff: f64,
         opts: &OdeSolverOptions,
     ) -> f64 {
+        self.stages(rhs, u, params, &StepClock::new(t, dt_eff));
+        self.err_norm(u, dt_eff, opts)
+    }
+
+    /// The step's stages and its proposed state `u5` over `clock` — the arithmetic only, no
+    /// decision: what a recording type records as the step's code (#2786).
+    #[allow(clippy::needless_range_loop)]
+    #[inline(always)]
+    pub(crate) fn stages<R: StageRhs<T> + ?Sized>(
+        &mut self,
+        rhs: &R,
+        u: &[T],
+        params: &[T],
+        clock: &StepClock<T>,
+    ) {
         let n = self.n;
         // The Butcher combinations keep the exact association of the original f64 loop
         // (`dt·(B31·k1 + B32·k2)`, not `(dt·B31)·k1 + …`), so instantiating at `T = f64`
@@ -1280,59 +1566,60 @@ impl<T: PkNum> Rk45Stepper<T> {
         );
         let (u_tmp, u5, u) = (&mut u_tmp[..n], &mut u5[..n], &u[..n]);
         if !*have_k1 {
-            rhs.call(u, params, t, k1);
+            rhs.call(u, params, clock.start(), k1);
             *have_k1 = true;
         }
         *mark = T::tape_mark();
 
+        let b21 = clock.dt_times(B21);
         for i in 0..n {
-            u_tmp[i] = u[i] + T::from_f64(dt_eff * B21) * k1[i];
+            u_tmp[i] = u[i] + b21 * k1[i];
         }
-        rhs.call(u_tmp, params, t + A2 * dt_eff, k2);
+        rhs.call(u_tmp, params, clock.at(A2), k2);
 
         for i in 0..n {
-            u_tmp[i] = T::lincomb(u[i], dt_eff, &[B31, B32], &[k1[i], k2[i]]);
+            u_tmp[i] = clock.lincomb(u[i], &[B31, B32], &[k1[i], k2[i]]);
         }
-        rhs.call(u_tmp, params, t + A3 * dt_eff, k3);
+        rhs.call(u_tmp, params, clock.at(A3), k3);
 
         for i in 0..n {
-            u_tmp[i] = T::lincomb(u[i], dt_eff, &[B41, B42, B43], &[k1[i], k2[i], k3[i]]);
+            u_tmp[i] = clock.lincomb(u[i], &[B41, B42, B43], &[k1[i], k2[i], k3[i]]);
         }
-        rhs.call(u_tmp, params, t + A4 * dt_eff, k4);
+        rhs.call(u_tmp, params, clock.at(A4), k4);
 
         for i in 0..n {
-            u_tmp[i] = T::lincomb(
+            u_tmp[i] = clock.lincomb(u[i], &[B51, B52, B53, B54], &[k1[i], k2[i], k3[i], k4[i]]);
+        }
+        rhs.call(u_tmp, params, clock.at(A5), k5);
+
+        for i in 0..n {
+            u_tmp[i] = clock.lincomb(
                 u[i],
-                dt_eff,
-                &[B51, B52, B53, B54],
-                &[k1[i], k2[i], k3[i], k4[i]],
-            );
-        }
-        rhs.call(u_tmp, params, t + A5 * dt_eff, k5);
-
-        for i in 0..n {
-            u_tmp[i] = T::lincomb(
-                u[i],
-                dt_eff,
                 &[B61, B62, B63, B64, B65],
                 &[k1[i], k2[i], k3[i], k4[i], k5[i]],
             );
         }
-        rhs.call(u_tmp, params, t + dt_eff, k6);
+        rhs.call(u_tmp, params, clock.end(), k6);
 
         // 5th-order solution.
         for i in 0..n {
-            u5[i] = T::lincomb(
+            u5[i] = clock.lincomb(
                 u[i],
-                dt_eff,
                 &[B71, B73, B74, B75, B76],
                 &[k1[i], k3[i], k4[i], k5[i], k6[i]],
             );
         }
+        rhs.call(u5, params, clock.end(), k7);
+    }
 
-        // Error estimate (5th − 4th). Computed on values only — the step sequence must not
-        // depend on derivative components.
-        rhs.call(u5, params, t + dt_eff, k7);
+    /// The error estimate (5th − 4th) of the last [`Self::stages`], on values only — the
+    /// step sequence must not depend on derivative components.
+    #[allow(clippy::needless_range_loop)]
+    pub(crate) fn err_norm(&self, u: &[T], dt_eff: f64, opts: &OdeSolverOptions) -> f64 {
+        let n = self.n;
+        let (k1, k3, k4, k5, k6, k7, u5) = (
+            &self.k1, &self.k3, &self.k4, &self.k5, &self.k6, &self.k7, &self.u5,
+        );
         let mut err_norm = 0.0;
         for i in 0..n {
             let err_i = dt_eff
@@ -1349,10 +1636,66 @@ impl<T: PkNum> Rk45Stepper<T> {
     }
 }
 
+impl<T: PkNum> StepBody<T> for Rk45Stepper<T> {
+    fn needs_start(&self) -> bool {
+        !self.have_k1
+    }
+    fn start(&mut self, rhs: &RhsG<'_, T>, u: &[T], params: &[T], clock: &StepClock<T>) {
+        rhs(&u[..self.n], params, clock.start(), &mut self.k1[..self.n]);
+        self.have_k1 = true;
+    }
+    fn step(&mut self, rhs: &RhsG<'_, T>, u: &[T], params: &[T], clock: &StepClock<T>) {
+        self.have_k1 = true;
+        self.stages(rhs, u, params, clock);
+    }
+    fn carried_into(&self, out: &mut Vec<T>) {
+        out.clear();
+        for v in [
+            &self.k1,
+            &self.k2,
+            &self.k3,
+            &self.k4,
+            &self.k5,
+            &self.k6,
+            &self.k7,
+            &self.u_tmp,
+            &self.u5,
+        ] {
+            out.extend_from_slice(v);
+        }
+    }
+    fn set_carried(&mut self, v: &[T]) {
+        let n = self.n;
+        for (j, dst) in [
+            &mut self.k1,
+            &mut self.k2,
+            &mut self.k3,
+            &mut self.k4,
+            &mut self.k5,
+            &mut self.k6,
+            &mut self.k7,
+            &mut self.u_tmp,
+            &mut self.u5,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            dst.copy_from_slice(&v[j * n..(j + 1) * n]);
+        }
+        self.have_k1 = true;
+    }
+    fn err(&mut self, u: &[T], dt: f64, opts: &OdeSolverOptions) -> f64 {
+        self.err_norm(u, dt, opts)
+    }
+    fn reset_start(&mut self) {
+        self.have_k1 = false;
+    }
+}
+
 impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     fn attempt(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &RhsG<'_, T>,
         u: &[T],
         params: &[T],
         t: f64,
@@ -1436,7 +1779,7 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
 #[allow(clippy::too_many_arguments)]
 fn integrate_dense_g<T: PkNum>(
     method: OdeMethod,
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &RhsG<'_, T>,
     u0: &[T],
     t_span: (f64, f64),
     params: &[T],
@@ -1448,15 +1791,24 @@ fn integrate_dense_g<T: PkNum>(
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     let n = u0.len();
     let (t0, tf) = t_span;
+    let hook = lane_hook::<T>();
+    if let Some(h) = &hook {
+        h.begin();
+    }
 
     if (tf - t0).abs() < 1e-15 {
-        let at = |times: &[f64]| -> Vec<SolPointG<T>> {
+        let at = |times: &[f64], soft: bool| -> Vec<SolPointG<T>> {
             times
                 .iter()
-                .map(|&t| SolPointG { t, u: u0.to_vec() })
+                .map(|&t| {
+                    if let Some(h) = &hook {
+                        h.point(soft);
+                    }
+                    SolPointG { t, u: u0.to_vec() }
+                })
                 .collect()
         };
-        return (at(saveat), at(interp_at));
+        return (at(saveat, false), at(interp_at, true));
     }
 
     let mut u = u0.to_vec();
@@ -1560,8 +1912,16 @@ fn integrate_dense_g<T: PkNum>(
                 let ti = interp_at[interp_idx];
                 let theta = ((ti - t) / dt_eff).clamp(0.0, 1.0);
                 let ui: Vec<T> = (0..n)
-                    .map(|j| stepper.interpolate_component(theta, &u, dt_eff, j))
+                    .map(|j| {
+                        if let Some(h) = &hook {
+                            h.interp(theta, dt_eff, j);
+                        }
+                        stepper.interpolate_component(theta, &u, dt_eff, j)
+                    })
                     .collect();
+                if let Some(h) = &hook {
+                    h.interp_done();
+                }
                 interp_results.push(SolPointG { t: ti, u: ui });
                 interp_idx += 1;
             }
@@ -1571,6 +1931,9 @@ fn integrate_dense_g<T: PkNum>(
             stepper.on_accept();
 
             while save_idx < saveat.len() && (t - saveat[save_idx]).abs() < 1e-12 {
+                if let Some(h) = &hook {
+                    h.point(false);
+                }
                 results.push(SolPointG {
                     t: saveat[save_idx],
                     u: u.clone(),
@@ -1727,6 +2090,9 @@ fn integrate_dense_g<T: PkNum>(
         u.clone()
     };
     while save_idx < saveat.len() {
+        if let Some(h) = &hook {
+            h.tail(false, diverged);
+        }
         results.push(SolPointG {
             t: saveat[save_idx],
             u: tail.clone(),
@@ -1734,6 +2100,9 @@ fn integrate_dense_g<T: PkNum>(
         save_idx += 1;
     }
     while interp_idx < interp_at.len() {
+        if let Some(h) = &hook {
+            h.tail(true, diverged);
+        }
         interp_results.push(SolPointG {
             t: interp_at[interp_idx],
             u: tail.clone(),
@@ -2344,7 +2713,7 @@ pub fn solve_ode_g<T: crate::sens::num::PkNum>(
 /// [`solve_ode_certified`], and like it the only `solve_ode_g*` route that honours
 /// [`OdeMethod::Linear`].
 pub(crate) fn solve_ode_g_certified<T: crate::sens::num::PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &RhsG<'_, T>,
     u0: &[T],
     t_span: (f64, f64),
     params: &[T],
@@ -2383,7 +2752,7 @@ pub fn solve_ode_g_with_stats<T: crate::sens::num::PkNum>(
 /// intervals of one prediction/sensitivity walk.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn solve_ode_g_with_auto_state<T: crate::sens::num::PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &RhsG<'_, T>,
     u0: &[T],
     t_span: (f64, f64),
     params: &[T],
@@ -2410,8 +2779,9 @@ pub fn solve_ode_g_dense<T: crate::sens::num::PkNum>(
     stats: Option<&mut OdeSolverStats>,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     let mut auto_state = OdeAutoSwitchState::default();
+    let rhs = rhs_of_f64_time(rhs);
     integrate_resolved_g(
-        rhs,
+        &rhs,
         u0,
         t_span,
         params,
@@ -2531,12 +2901,23 @@ pub(crate) fn record_abandoned_non_finite_timeline(stats: Option<&mut OdeSolverS
     }
 }
 
+/// `n` segments of the exact linear path a compiled plan integrates instead, into the open
+/// [`SolverStatsScope`] (#2786): its recording declined them, and the plan replays that.
+pub(crate) fn note_linear_declines(n: usize) {
+    if stats_sink_active() {
+        record_to_stats_sink(&OdeSolverStats {
+            linear_declined_segments: n,
+            ..Default::default()
+        });
+    }
+}
+
 /// [`integrate_resolved_g_inner`] with the thread-local [`SolverStatsScope`] tee.
 ///
 /// Off the diagnostic path this is one `Cell` read per segment and the same call as before.
 #[allow(clippy::too_many_arguments)]
 fn integrate_resolved_g<T: PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &RhsG<'_, T>,
     u0: &[T],
     t_span: (f64, f64),
     params: &[T],
@@ -2546,7 +2927,9 @@ fn integrate_resolved_g<T: PkNum>(
     stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
-    if !stats_sink_active() {
+    // A recording type's solve (#2786) records a plan, which happens or not by what the plan
+    // cache holds: not an integration the counters describe.
+    if !stats_sink_active() || T::RECORDS_BRANCHES {
         return integrate_resolved_g_inner(
             rhs, u0, t_span, params, saveat, interp_at, opts, stats, auto_state,
         );
@@ -2597,7 +2980,7 @@ fn integrate_resolved_g<T: PkNum>(
 /// a derivative.
 #[allow(clippy::too_many_arguments)]
 fn integrate_resolved_g_inner<T: PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &RhsG<'_, T>,
     u0: &[T],
     t_span: (f64, f64),
     params: &[T],
@@ -2627,6 +3010,7 @@ fn integrate_resolved_g_inner<T: PkNum>(
             if let Some(s) = stats.as_deref_mut() {
                 s.linear_declined_segments += 1;
             }
+            T::note_linear_decline();
         }
         return integrate_resolved_g_inner(
             rhs,
@@ -2639,6 +3023,15 @@ fn integrate_resolved_g_inner<T: PkNum>(
             stats,
             auto_state,
         );
+    }
+    // A recording type (#2786) records the segment as a call that runs the rest of this
+    // function at run time, over steppers carrying its lanes.
+    if T::RECORDS_BRANCHES {
+        if let Some(out) =
+            T::ode_segment(rhs, u0, t_span, params, saveat, interp_at, opts, auto_state)
+        {
+            return out;
+        }
     }
     // A zero-length span returns `u0` at every requested time without stepping, so there is
     // no stepper to choose and no reason to pay for a Jacobian. Dosing timelines produce these

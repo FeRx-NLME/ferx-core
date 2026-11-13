@@ -1190,7 +1190,10 @@ pub(crate) fn loadings_variance_g<T: crate::sens::num::PkNum>(
     rho: impl Fn(usize) -> T,
 ) -> T {
     match loadings_variance_sum(loadings, sigma, correlations, rho) {
-        Some(v) if variance_is_guarded(v.val()) => T::from_f64(MIN_VARIANCE),
+        // `variance_is_guarded` through the branch API (a recording records it, #2786).
+        Some(v) if !v.br_cmp_c(crate::sens::num::BranchCmp::Ge, f64::MIN_POSITIVE) => {
+            T::from_f64(MIN_VARIANCE)
+        }
         Some(v) => v,
         None => T::from_f64(f64::NAN),
     }
@@ -1291,11 +1294,13 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
     if !cov.is_dense() {
         return r;
     }
+    // The pairing reads the loadings' slots only (the value covariance it also returns is
+    // recomputed below on `T`): no value of a generic number is read.
     let lf: Vec<Vec<(usize, f64)>> = lt
         .iter()
-        .map(|l| l.iter().map(|&(i, c)| (i, c.val())).collect())
+        .map(|l| l.iter().map(|&(i, _)| (i, 0.0)).collect())
         .collect();
-    let sigma_v: Vec<f64> = sigma.iter().map(|x| x.val()).collect();
+    let sigma_v = vec![0.0; sigma.len()];
     for (j, k, _) in match_partners(
         &lf,
         &subject.obs_times,
@@ -1310,20 +1315,18 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
         r[k][j] = c;
     }
     if let (Some(serial), Some(rho_t)) = (cov.serial, serial_rho) {
-        match serial_pairs_jet(
-            serial,
+        match serial_pairs_shape(
+            serial.kind,
             &subject.obs_rgroup,
             &subject.obs_times,
             &subject.obs_raw_times,
             n,
         ) {
             Some(pairs) => {
-                for (j, k, [c, d1, d2, d3, d4]) in pairs {
-                    // C_jk(ρ) with four ρ-derivatives, so the serial ρ is differentiated
-                    // exactly to every order a recording reads (the exact anchor's covariance
-                    // nested dual reads the fourth).
-                    let v = rho_t.lift4(c, d1, d2, d3, d4)
-                        * same_slot_covariance(&lt[j], &lt[k], sigma);
+                for (j, k, shape) in pairs {
+                    // C_jk(ρ) on `T`, so the serial ρ is differentiated exactly to every
+                    // order (#2786: a recording takes the power, not a jet at ρ's value).
+                    let v = shape.coefficient(rho_t) * same_slot_covariance(&lt[j], &lt[k], sigma);
                     r[j][k] = r[j][k] + v;
                     r[k][j] = r[k][j] + v;
                 }
@@ -1657,6 +1660,75 @@ fn serial_pairs_jet(
     obs_raw_times: &[f64],
     n: usize,
 ) -> Option<Vec<(usize, usize, [f64; 5])>> {
+    let rho = serial.rho;
+    Some(
+        serial_pairs_shape(serial.kind, obs_rgroup, obs_times, obs_raw_times, n)?
+            .into_iter()
+            .map(|(j, k, shape)| (j, k, shape.jet(rho)))
+            .filter(|(_, _, c)| c.iter().any(|&x| x != 0.0))
+            .collect(),
+    )
+}
+
+/// How a serial pair's coefficient depends on `ρ`: `ρ` itself (`cs`), or `ρᵉ` with
+/// `e = |p_j − p_k|` (`ar1`, an integer) or `e = |t_j − t_k|` (`car1`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SerialShape {
+    Linear,
+    Power(f64),
+    IntPower(i32),
+}
+
+impl SerialShape {
+    /// `[C, ∂C/∂ρ, …, ∂⁴C/∂ρ⁴]` at `rho`, each term written so a zero falling-factorial
+    /// coefficient never multiplies a pole at `ρ = 0`.
+    fn jet(self, rho: f64) -> [f64; 5] {
+        match self {
+            SerialShape::Linear => [rho, 1.0, 0.0, 0.0, 0.0],
+            SerialShape::IntPower(lag) => std::array::from_fn(|order| {
+                let order = order as i32;
+                if lag < order {
+                    0.0
+                } else {
+                    let coef: i32 = (0..order).map(|i| lag - i).product();
+                    coef as f64 * rho.powi(lag - order)
+                }
+            }),
+            SerialShape::Power(e) => std::array::from_fn(|order| {
+                let coef: f64 = (0..order).map(|i| e - i as f64).product();
+                if coef == 0.0 {
+                    0.0
+                } else {
+                    coef * rho.powf(e - order as f64)
+                }
+            }),
+        }
+    }
+
+    /// `C(ρ)` on `T`: `ρ`, `ρ` multiplied by itself `lag` times, or `ρᵉ` (`1` at `e = 0`).
+    pub(crate) fn coefficient<T: crate::sens::num::PkNum>(self, rho: T) -> T {
+        match self {
+            SerialShape::Linear => rho,
+            SerialShape::IntPower(lag) => (1..lag)
+                .fold(if lag == 0 { T::from_f64(1.0) } else { rho }, |a, _| {
+                    a * rho
+                }),
+            SerialShape::Power(e) if e == 0.0 => T::from_f64(1.0),
+            SerialShape::Power(e) => rho.pow(T::from_f64(e)),
+        }
+    }
+}
+
+/// Each serial pair `(j, k)` with its coefficient's [`SerialShape`]: the pairs of one
+/// residual group (`obs_rgroup`, `0` none), `ar1`'s lag from each row's position in its
+/// group's time order. `None` when the population lacks its residual blocks.
+fn serial_pairs_shape(
+    kind: crate::types::ResidualSerialKind,
+    obs_rgroup: &[u32],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    n: usize,
+) -> Option<Vec<(usize, usize, SerialShape)>> {
     if n == 0 {
         return Some(Vec::new());
     }
@@ -1665,7 +1737,7 @@ fn serial_pairs_jet(
     }
     let time = |j: usize| crate::types::written_time(obs_times, obs_raw_times, j);
     let mut pos = vec![0usize; n];
-    if serial.kind == crate::types::ResidualSerialKind::Ar1 {
+    if kind == crate::types::ResidualSerialKind::Ar1 {
         let mut order: Vec<usize> = (0..n).filter(|&j| obs_rgroup[j] != 0).collect();
         order.sort_by(|&a, &b| {
             obs_rgroup[a]
@@ -1694,39 +1766,16 @@ fn serial_pairs_jet(
             if obs_rgroup[k] != g {
                 continue;
             }
-            let rho = serial.rho;
-            // `ρᵉ` and its first four ρ-derivatives (the exact anchor's covariance nested dual
-            // reads all four), each term written so a zero falling-factorial coefficient
-            // (`e ∈ {0, 1, 2, 3}`) never multiplies a pole at `ρ = 0`.
-            let power = |e: f64| -> [f64; 5] {
-                std::array::from_fn(|order| {
-                    let coef: f64 = (0..order).map(|i| e - i as f64).product();
-                    if coef == 0.0 {
-                        0.0
-                    } else {
-                        coef * rho.powf(e - order as f64)
-                    }
-                })
-            };
-            let c = match serial.kind {
-                crate::types::ResidualSerialKind::Cs => [rho, 1.0, 0.0, 0.0, 0.0],
+            let shape = match kind {
+                crate::types::ResidualSerialKind::Cs => SerialShape::Linear,
                 crate::types::ResidualSerialKind::Ar1 => {
-                    let lag = pos[j].abs_diff(pos[k]) as i32;
-                    std::array::from_fn(|order| {
-                        let order = order as i32;
-                        if lag < order {
-                            0.0
-                        } else {
-                            let coef: i32 = (0..order).map(|i| lag - i).product();
-                            coef as f64 * rho.powi(lag - order)
-                        }
-                    })
+                    SerialShape::IntPower(pos[j].abs_diff(pos[k]) as i32)
                 }
-                crate::types::ResidualSerialKind::Car1 => power((time(j) - time(k)).abs()),
+                crate::types::ResidualSerialKind::Car1 => {
+                    SerialShape::Power((time(j) - time(k)).abs())
+                }
             };
-            if c.iter().any(|&x| x != 0.0) {
-                out.push((j, k, c));
-            }
+            out.push((j, k, shape));
         }
     }
     Some(out)

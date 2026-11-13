@@ -5,8 +5,8 @@ use crate::ode::solver::{solve_ode_with_stats, OdeSolverStats};
 use crate::sens::dual1::Dual1;
 
 /// `du/dt = A u` for a diagonal `A` — eigenvalues are the diagonal, exactly.
-fn diagonal_rhs<T: PkNum>(rates: &'static [f64]) -> impl Fn(&[T], &[T], f64, &mut [T]) {
-    move |u: &[T], _p: &[T], _t: f64, du: &mut [T]| {
+fn diagonal_rhs<T: PkNum>(rates: &'static [f64]) -> impl Fn(&[T], &[T], T, &mut [T]) {
+    move |u: &[T], _p: &[T], _t: T, du: &mut [T]| {
         for (i, r) in rates.iter().enumerate() {
             du[i] = u[i] * T::from_f64(*r);
         }
@@ -16,8 +16,13 @@ fn diagonal_rhs<T: PkNum>(rates: &'static [f64]) -> impl Fn(&[T], &[T], f64, &mu
 /// A three-state fast-binding system in the shape that motivates the whole feature: the fast
 /// eigenvalue is carried by `KON · central`, so it is identically zero before any drug is
 /// present and only appears once a dose lands (`[central, target, complex]`).
-fn binding_rhs<T: PkNum>(kon: f64, koff: f64) -> impl Fn(&[T], &[T], f64, &mut [T]) {
-    move |u: &[T], _p: &[T], _t: f64, du: &mut [T]| {
+/// A `T`-time right-hand side as the public API's `f64`-time one.
+fn f64_time<T: PkNum>(f: impl Fn(&[T], &[T], T, &mut [T])) -> impl Fn(&[T], &[T], f64, &mut [T]) {
+    move |u, p, t, du| f(u, p, T::from_f64(t), du)
+}
+
+fn binding_rhs<T: PkNum>(kon: f64, koff: f64) -> impl Fn(&[T], &[T], T, &mut [T]) {
+    move |u: &[T], _p: &[T], _t: T, du: &mut [T]| {
         let bind = u[0] * u[1] * T::from_f64(kon) - u[2] * T::from_f64(koff);
         du[0] = -u[0] * T::from_f64(0.1) - bind;
         du[1] = T::from_f64(0.5) - u[1] * T::from_f64(0.05) - bind;
@@ -31,8 +36,8 @@ fn binding_rhs<T: PkNum>(kon: f64, koff: f64) -> impl Fn(&[T], &[T], f64, &mut [
 /// the segment starts genuinely non-stiff and only becomes stiff once drug has been absorbed
 /// and target has accumulated — the shape a segment-start probe cannot see and an in-place
 /// switch exists for (#1080 Part C).
-fn latent_binding_rhs<T: PkNum>(kon: f64, koff: f64) -> impl Fn(&[T], &[T], f64, &mut [T]) {
-    move |u: &[T], _p: &[T], _t: f64, du: &mut [T]| {
+fn latent_binding_rhs<T: PkNum>(kon: f64, koff: f64) -> impl Fn(&[T], &[T], T, &mut [T]) {
+    move |u: &[T], _p: &[T], _t: T, du: &mut [T]| {
         let absorb = u[0] * T::from_f64(1.0);
         let bind = u[1] * u[2] * T::from_f64(kon) - u[3] * T::from_f64(koff);
         du[0] = -absorb;
@@ -1027,9 +1032,9 @@ fn a_benign_segment_is_never_switched() {
 /// [`latent_binding_rhs`] with a cumulative-hazard accumulator on top (`dCHZ/dt = 0.05 · Cx`),
 /// the shape the event-time driver monitors: monotone non-decreasing, and driven by the state
 /// whose formation is what turns the system stiff.
-fn latent_binding_with_hazard<T: PkNum>(kon: f64, koff: f64) -> impl Fn(&[T], &[T], f64, &mut [T]) {
+fn latent_binding_with_hazard<T: PkNum>(kon: f64, koff: f64) -> impl Fn(&[T], &[T], T, &mut [T]) {
     let core = latent_binding_rhs::<T>(kon, koff);
-    move |u: &[T], p: &[T], t: f64, du: &mut [T]| {
+    move |u: &[T], p: &[T], t: T, du: &mut [T]| {
         core(u, p, t, du);
         du[4] = u[3] * T::from_f64(0.05);
     }
@@ -1205,7 +1210,7 @@ fn the_switch_happens_at_the_same_step_at_f64_and_at_a_dual() {
     );
     let mut dual_stats = OdeSolverStats::default();
     let dual = crate::ode::solver::solve_ode_g_with_stats(
-        &dual_rhs,
+        &f64_time(&dual_rhs),
         &u_dual,
         (0.0, 24.0),
         &[],
@@ -1250,8 +1255,8 @@ fn coarse_min_dt() -> OdeSolverOptions {
 /// often it is asked, while the oscillation itself needs a step far below `coarse_min_dt`'s
 /// floor. Every step therefore clamps, on the explicit stepper, with no stiffness anywhere for
 /// a re-probe to find.
-fn rotating_rhs<T: PkNum>(w: f64) -> impl Fn(&[T], &[T], f64, &mut [T]) {
-    move |u: &[T], _p: &[T], _t: f64, du: &mut [T]| {
+fn rotating_rhs<T: PkNum>(w: f64) -> impl Fn(&[T], &[T], T, &mut [T]) {
+    move |u: &[T], _p: &[T], _t: T, du: &mut [T]| {
         du[0] = u[1] * T::from_f64(w);
         du[1] = u[0] * T::from_f64(-w);
     }
@@ -1271,9 +1276,9 @@ fn rotating_rhs<T: PkNum>(w: f64) -> impl Fn(&[T], &[T], f64, &mut [T]) {
 /// whose amplification factor at `hλ = -5` is well above 1 — grows it by orders of magnitude
 /// per step until the trajectory is meaningless. Anything larger would clamp on *both*, and a
 /// stiff half that clamps is a stall the guard is right to discard.
-fn clamps_then_turns_stiff<T: PkNum>() -> impl Fn(&[T], &[T], f64, &mut [T]) {
-    move |u: &[T], _p: &[T], t: f64, du: &mut [T]| {
-        if t < 1.0 {
+fn clamps_then_turns_stiff<T: PkNum>() -> impl Fn(&[T], &[T], T, &mut [T]) {
+    move |u: &[T], _p: &[T], t: T, du: &mut [T]| {
+        if t.val() < 1.0 {
             du[0] = u[1] * T::from_f64(200.0);
             du[1] = u[0] * T::from_f64(-200.0);
             du[2] = T::from_f64(1e-6);
@@ -1502,8 +1507,8 @@ fn the_abort_budget_starts_again_when_the_stepper_is_swapped() {
 /// without touching the trajectory at all. At `K = 1e6` over `t = 200` the jets carry `2e8`
 /// and `4e16` times the value, which puts them past `f64::MAX` while the value sits at
 /// `1e304`, four decades below it.
-fn jet_overflow_rhs<T: PkNum>(k: f64) -> impl Fn(&[T], &[T], f64, &mut [T]) {
-    move |u: &[T], p: &[T], _t: f64, du: &mut [T]| {
+fn jet_overflow_rhs<T: PkNum>(k: f64) -> impl Fn(&[T], &[T], T, &mut [T]) {
+    move |u: &[T], p: &[T], _t: T, du: &mut [T]| {
         du[0] = -u[0] * T::from_f64(100.0);
         du[1] = u[1] * p[0] * T::from_f64(k);
     }
@@ -1537,7 +1542,7 @@ fn auto_rejects_an_escalation_whose_jets_overflowed_while_its_values_did_not() {
     let params = [Dual2::<N>::var(3.5 / JET_OVERFLOW_K, 0)];
     let mut stats = OdeSolverStats::default();
     let out = crate::ode::solver::solve_ode_g_with_stats(
-        &rhs,
+        &f64_time(&rhs),
         &u0,
         (0.0, 200.0),
         &params,
@@ -1604,7 +1609,7 @@ fn a_named_stiff_method_is_not_jet_guarded() {
     let params = [Dual2::<N>::var(3.5 / JET_OVERFLOW_K, 0)];
     let mut stats = OdeSolverStats::default();
     let out = crate::ode::solver::solve_ode_g_with_stats(
-        &rhs,
+        &f64_time(&rhs),
         &u0,
         (0.0, 200.0),
         &params,
@@ -1633,7 +1638,7 @@ fn a_healthy_escalation_records_no_jet_rejection() {
     ];
     let mut stats = OdeSolverStats::default();
     let out = crate::ode::solver::solve_ode_g_with_stats(
-        &rhs,
+        &f64_time(&rhs),
         &u0,
         (0.0, 5.0),
         &[],
@@ -1664,7 +1669,7 @@ fn a_segment_entered_with_dead_jets_is_not_rejected_again() {
     let params = [Dual2::<N>::var(3.5 / JET_OVERFLOW_K, 0)];
     let mut stats = OdeSolverStats::default();
     let out = crate::ode::solver::solve_ode_g_with_stats(
-        &rhs,
+        &f64_time(&rhs),
         &u0,
         (0.0, 1.0),
         &params,

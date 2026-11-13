@@ -626,7 +626,7 @@ fn a_run_with_no_feasible_evaluation_is_not_told_to_raise_maxiter() {
 /// nothing in U4 would notice.
 ///
 /// The fixture is #1296's / #1303's, reused unchanged: a two-state ODE population one of
-/// whose subjects carries a `NaN` dose time, so `timeline_has_non_finite` `NaN`-fills it
+/// whose subjects carries a `NaN` dose time, so `times_have_non_finite` `NaN`-fills it
 /// and the objective is `NaN` for the whole population. That lands in this arm rather than
 /// the guard's for a reason worth stating, because it is the arm's own entry condition:
 /// `ebe_guard_rejects` needs `raw_ofv.is_finite()` for its fraction trigger and

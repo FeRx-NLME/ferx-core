@@ -1,11 +1,11 @@
-//! #2437: the FOCEI Laplace term's non-Gaussian data-term η-Hessians. Every endpoint with a
-//! dual program runs its one generic likelihood on η-jets (`sens::eta_jets`); the parity
-//! matrix below pins, per cell, that it takes the exact route, that the route's value is
-//! the production `f64` value path's, and that its Hessian matches a Richardson stencil of
-//! that production value — the one oracle that shares nothing with the dual. The cells
-//! span the endpoint kinds, the record kinds and the boundary values where a formula
-//! switches arm. The finite-difference fallback for the endpoints the duals cannot serve
-//! is pinned last.
+//! #2437 / #2786: the FOCEI Laplace term's non-Gaussian data-term η-Hessians, from the
+//! subject's compiled term plan. The parity matrix below pins, per cell, that the marginal's
+//! whole-term Hessian is the endpoint's own plan's, that the plan's value is the production
+//! `f64` value path's, and that its Hessian matches a Richardson stencil of that production
+//! value — the one oracle that shares nothing with the recording. The cells span the
+//! endpoint kinds, the record kinds and the boundary values where a formula switches arm.
+//! The widths and endpoints the retired duals could not serve are pinned next, and the
+//! repelled subjects last.
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
@@ -71,37 +71,59 @@ fn event(time: f64, event_type: EventType, entry_time: f64) -> ObsRecord {
     }
 }
 
-/// One cell of the parity matrix: its exact `(value, H)` and route, and the production
-/// value path at any η.
+/// One cell of the parity matrix: the endpoint's own exact `(value, H)`, the marginal's
+/// whole-term Hessian, and the production value path at any η.
 struct Cell<'a> {
     label: String,
     eta: Vec<f64>,
-    route: EtaHessianRoute,
     exact: Option<(f64, DMatrix<f64>)>,
-    hessian: DMatrix<f64>,
+    hessian: Option<DMatrix<f64>>,
     value: Box<dyn Fn(&[f64]) -> f64 + 'a>,
+}
+
+/// The η-Hessian of a one-η subject term on the tests' forward dual (`vfree::DualF`): an
+/// oracle that shares no code with the plans and, unlike a stencil of an adaptively
+/// integrated objective, has no `tol/h²` roundoff — the solver's steps are differentiated
+/// as taken, exactly as the recording does.
+fn dual_hessian1<S: crate::survival::SubjectTerm>(
+    term: &S,
+    theta: &[f64],
+    eta: f64,
+) -> DMatrix<f64> {
+    use crate::sens::vfree::DualF;
+    let th: Vec<DualF<1, 1>> = theta.iter().map(|&v| DualF::constant(v)).collect();
+    let e = [DualF::free(eta, [1.0], [0.0])];
+    let y = term.eval(&th, &e).expect("the dual evaluates the term");
+    DMatrix::from_element(1, 1, y.h[0])
+}
+
+/// The marginal's curvature of `s`'s whole non-Gaussian term at `eta`.
+fn whole_term(model: &CompiledModel, s: &Subject, eta: &[f64]) -> Option<DMatrix<f64>> {
+    let theta = &model.default_params.theta;
+    crate::survival::non_gaussian_eta_jets2(model, s, theta, eta).map(|(_, _, h)| h)
 }
 
 /// Check one cell; `Err` names what failed, so the matrix reports every bad cell at once.
 fn check(c: &Cell<'_>) -> Result<f64, String> {
     let label = &c.label;
-    if c.route != EtaHessianRoute::Exact {
-        return Err(format!("{label}: took {:?}", c.route));
-    }
     let (v, h) = c
         .exact
         .as_ref()
-        .ok_or(format!("{label}: exact kernel declined"))?;
-    if (&c.hessian - h).abs().max() != 0.0 {
+        .ok_or(format!("{label}: the endpoint's plan declined"))?;
+    let whole = c
+        .hessian
+        .as_ref()
+        .ok_or(format!("{label}: the whole term's plan declined"))?;
+    if (whole - h).abs().max() != 0.0 {
         return Err(format!(
-            "{label}: the routed Hessian is not the exact kernel's"
+            "{label}: the marginal's Hessian is not the endpoint's plan's"
         ));
     }
     let f0 = (c.value)(&c.eta);
     if !(f0.is_finite() && f0.abs() < 1e3) {
         return Err(format!("{label}: fixture value {f0}"));
     }
-    // One generic kernel, so the values agree to round-off. Not to the bit: a dual power
+    // One generic kernel, so the values agree to round-off. Not to the bit: a recorded power
     // with a variable exponent is `exp(e·ln x)`, not `powf` (Weibull measured 1 ULP apart).
     if !((v - f0).abs() <= 1e-14 * f0.abs()) {
         return Err(format!("{label}: dual value {v} vs value path {f0}"));
@@ -120,17 +142,12 @@ fn check(c: &Cell<'_>) -> Result<f64, String> {
 
 fn binary_cell<'a>(label: &str, model: &'a CompiledModel, s: &'a Subject, eta: &[f64]) -> Cell<'a> {
     let theta = model.default_params.theta.clone();
-    let omega = model.default_params.omega.matrix.clone();
-    let mode = crate::categorical::discrete_subject_nll(model, s, &theta, eta);
-    let (hessian, route) = discrete_data_term_eta_hessian(model, s, &theta, eta, mode, &omega)
-        .expect("a binary curvature is always measurable");
     let exact = crate::categorical::discrete_subject_eta_hessian(model, s, &theta, eta);
     Cell {
         label: label.into(),
         eta: eta.to_vec(),
-        route,
         exact,
-        hessian,
+        hessian: whole_term(model, s, eta),
         value: Box::new(move |e| crate::categorical::discrete_subject_nll(model, s, &theta, e)),
     }
 }
@@ -138,75 +155,51 @@ fn binary_cell<'a>(label: &str, model: &'a CompiledModel, s: &'a Subject, eta: &
 #[cfg(feature = "markov")]
 fn ctmm_cell<'a>(label: &str, model: &'a CompiledModel, s: &'a Subject, eta: &[f64]) -> Cell<'a> {
     let theta = model.default_params.theta.clone();
-    let omega = model.default_params.omega.matrix.clone();
-    let mode = crate::markov::endpoint::ctmm_subject_nll(model, s, &theta, eta);
-    let (hessian, route) = ctmm_data_term_eta_hessian(model, s, &theta, eta, mode, &omega)
-        .unwrap_or((DMatrix::zeros(0, 0), EtaHessianRoute::FiniteDifference));
     let exact = crate::markov::endpoint::ctmm_subject_eta_hessian(model, s, &theta, eta);
     Cell {
         label: label.into(),
         eta: eta.to_vec(),
-        route,
         exact,
-        hessian,
+        hessian: whole_term(model, s, eta),
         value: Box::new(move |e| crate::markov::endpoint::ctmm_subject_nll(model, s, &theta, e)),
     }
 }
 
-fn tte_cell<'a>(
-    label: &str,
-    model: &'a CompiledModel,
-    records: &'a [ObsRecord],
-    cov: &'a std::collections::HashMap<String, f64>,
-    eta: &[f64],
-) -> Cell<'a> {
+/// The TTE subject's exact `(value, H)` from its TTE term's plan.
+fn tte_exact(model: &CompiledModel, s: &Subject, eta: &[f64]) -> Option<(f64, DMatrix<f64>)> {
+    use crate::sens::ode_provider::adjoint::terms::TermKind;
+    let term = crate::survival::TteTerm::new(model, s);
+    let theta = &model.default_params.theta;
+    crate::survival::term_eta_hessian(model, s, TermKind::Tte, &term, theta, eta)
+}
+
+fn tte_cell<'a>(label: &str, model: &'a CompiledModel, s: &'a Subject, eta: &[f64]) -> Cell<'a> {
     let Some(EndpointLikelihood::Tte {
-        hazard,
-        recurrence,
-        hazard_program,
-        ..
+        hazard, recurrence, ..
     }) = model.endpoints.get(&2)
     else {
         panic!("{label}: fixture precondition: a TTE endpoint on CMT 2");
     };
-    let HazardSpec::Analytic { family, .. } = hazard else {
-        panic!("{label}: fixture precondition: an analytic hazard");
-    };
-    let theta = model.default_params.theta.clone();
-    let omega = model.default_params.omega.matrix.clone();
-    let value = move |e: &[f64]| {
-        crate::survival::tte_data_term(records, hazard, *recurrence, &theta, e, cov)
-    };
-    let theta = model.default_params.theta.clone();
-    let (hessian, route) = tte_data_term_eta_hessian(
-        hazard,
-        *recurrence,
-        hazard_program.as_ref(),
-        records,
-        cov,
-        &theta,
-        eta,
-        &value,
-        || value(eta),
-        &omega,
+    assert!(
+        matches!(hazard, HazardSpec::Analytic { .. }),
+        "{label}: fixture precondition: an analytic hazard"
     );
-    let exact = hazard_program.as_ref().and_then(|prog| {
-        crate::survival::analytic_tte_eta_hessian(
-            records,
-            *family,
+    let theta = model.default_params.theta.clone();
+    let value = move |e: &[f64]| {
+        crate::survival::tte_data_term(
+            &s.obs_records,
+            hazard,
             *recurrence,
-            prog,
             &theta,
-            eta,
-            cov,
+            e,
+            &s.covariates,
         )
-    });
+    };
     Cell {
         label: label.into(),
         eta: eta.to_vec(),
-        route,
-        exact,
-        hessian,
+        exact: tte_exact(model, s, eta),
+        hessian: whole_term(model, s, eta),
         value: Box::new(value),
     }
 }
@@ -416,13 +409,17 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
             [0.3, -0.2],
         ),
     ];
-    let mut cov = std::collections::HashMap::new();
-    cov.insert("X".to_string(), 0.8);
-    let tte_models: Vec<(&str, CompiledModel, &[ObsRecord], [f64; 2])> = tte
+    let tte_models: Vec<(&str, CompiledModel, Subject, [f64; 2])> = tte
         .into_iter()
         .map(|(label, body, records, eta)| {
             let model = parse(&format!("{params}[event_model]\n  cmt    = 2\n  {body}\n"));
-            (label, model, records, eta)
+            let mut s = Subject {
+                id: "1".into(),
+                obs_records: records.to_vec(),
+                ..Default::default()
+            };
+            s.covariates.insert("X".to_string(), 0.8);
+            (label, model, s, eta)
         })
         .collect();
 
@@ -444,71 +441,54 @@ fn every_endpoint_cell_is_exact_and_matches_its_value_path() {
             &[0.3, -0.2],
         ));
     }
-    for (label, model, records, eta) in &tte_models {
-        cells.push(tte_cell(label, model, records, &cov, eta));
+    for (label, model, s, eta) in &tte_models {
+        cells.push(tte_cell(label, model, s, eta));
     }
 
     let failures: Vec<String> = cells.iter().filter_map(|c| check(c).err()).collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// The routes the duals cannot serve fall back to the FD stencil, and the dispatch cap
-/// straddles: 48 η (the widest bucket) is exact, 49 is FD. A drug-driven (ODE-accumulated) hazard
-/// reaching this helper without a program takes the stencil (the objective itself tries the
-/// dual walk first, #2482). Each FD fallback must still agree with the Richardson reference
-/// to the stencil's own accuracy. A time-inhomogeneous CTMM generator has a program since
-/// #2482 — its occupancy ODE runs on the duals — so it takes the exact route.
+/// What the retired duals could not serve, each now exact from its plan: a binary predictor
+/// 49 η wide (past the old 48-η dispatch cap, where the marginal fell back to a stencil),
+/// against the Richardson reference of its closed-form value path; and a drug-driven
+/// (ODE-accumulated) hazard and a time-inhomogeneous CTMM generator reading a PK state,
+/// against the forward dual ([`dual_hessian1`]) — a stencil of their adaptively integrated
+/// value is off by `~tol/h²` (measured 0.295 relative on the CTMM at `h = 2e-3`), far
+/// coarser than the disagreement it would have to detect.
 #[test]
-fn endpoints_without_a_dual_program_fall_back_to_finite_differences() {
-    // The cap: η count 48 (exact) and 49 (FD) on one binary predictor. A 48-wide
-    // second-order dual needs a fit's stack (`FIT_RAYON_STACK_SIZE`), not a test thread's.
-    let wide = |n: usize, want_route: EtaHessianRoute| {
-        let omegas: String = (0..n).map(|k| format!("  omega E{k} ~ 0.1\n")).collect();
-        let lp: Vec<String> = (0..n)
-            .map(|k| format!("{} * E{k}", 0.02 * (k + 1) as f64))
-            .collect();
-        let model = parse(&format!(
-            "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n{omegas}[binary_model]\n  cmt   = 3\n  \
-             logit = TH0 + {}\n",
-            lp.join(" + ")
-        ));
-        let mut s = Subject {
-            id: "1".into(),
-            ..Default::default()
-        };
-        s.obs_records = [(0.0, 1), (1.0, 0), (2.0, 1)]
-            .into_iter()
-            .map(|(t, y)| discrete(t, y, 3))
-            .collect();
-        let theta = model.default_params.theta.clone();
-        let eta = vec![0.1; n];
-        let omega = model.default_params.omega.matrix.clone();
-        let mode = crate::categorical::discrete_subject_nll(&model, &s, &theta, &eta);
-        let (got, route) = discrete_data_term_eta_hessian(&model, &s, &theta, &eta, mode, &omega)
-            .expect("a binary curvature is always measurable");
-        assert_eq!(route, want_route, "{n} η");
-        let want = richardson_hessian(
-            |e| crate::categorical::discrete_subject_nll(&model, &s, &theta, e),
-            &eta,
-            2e-3,
-        );
-        let err = rel_err(&got, &want);
-        // Measured (Linux x86_64 and macOS arm64): 4.0e-9 at 48 η (exact), 1.1e-7 at 49 η (FD) — the
-        // Richardson reference's roundoff over 48² entries, and the FD stencil's own error.
-        eprintln!("binary, {n} η ({route:?}): {err:.3e}");
-        assert!(err < 1e-6, "{n} η: {err:.3e}");
+fn endpoints_the_duals_could_not_serve_are_exact_from_their_plans() {
+    let n = 49;
+    let omegas: String = (0..n).map(|k| format!("  omega E{k} ~ 0.1\n")).collect();
+    let lp: Vec<String> = (0..n)
+        .map(|k| format!("{} * E{k}", 0.02 * (k + 1) as f64))
+        .collect();
+    let model = parse(&format!(
+        "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n{omegas}[binary_model]\n  cmt   = 3\n  \
+         logit = TH0 + {}\n",
+        lp.join(" + ")
+    ));
+    let mut s = Subject {
+        id: "1".into(),
+        ..Default::default()
     };
-    for (n, want_route) in [
-        (48, EtaHessianRoute::Exact),
-        (49, EtaHessianRoute::FiniteDifference),
-    ] {
-        std::thread::Builder::new()
-            .stack_size(crate::FIT_RAYON_STACK_SIZE)
-            .spawn(move || wide(n, want_route))
-            .expect("spawn")
-            .join()
-            .expect("width straddle");
-    }
+    s.obs_records = [(0.0, 1), (1.0, 0), (2.0, 1)]
+        .into_iter()
+        .map(|(t, y)| discrete(t, y, 3))
+        .collect();
+    let theta = model.default_params.theta.clone();
+    let eta = vec![0.1; n];
+    let got = whole_term(&model, &s, &eta).expect("a 49-η binary term records");
+    let want = richardson_hessian(
+        |e| crate::categorical::discrete_subject_nll(&model, &s, &theta, e),
+        &eta,
+        2e-3,
+    );
+    let err = rel_err(&got, &want);
+    // Measured 4.0e-9 at 48 η on the retired duals: the Richardson reference's roundoff over
+    // 48² entries.
+    eprintln!("binary, {n} η: {err:.3e}");
+    assert!(err < 1e-6, "{n} η: {err:.3e}");
 
     // A drug-driven hazard: `examples/pktte_joint.ferx`'s, one dose, one exact event.
     let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(concat!(
@@ -516,21 +496,17 @@ fn endpoints_without_a_dual_program_fall_back_to_finite_differences() {
         "/examples/pktte_joint.ferx"
     )))
     .expect("example parses");
-    let (cmt, hazard, recurrence, hazard_program) = model
+    let (cmt, hazard, recurrence) = model
         .endpoints
         .iter()
         .find_map(|(cmt, ep)| match ep {
             EndpointLikelihood::Tte {
-                hazard,
-                recurrence,
-                hazard_program,
-                ..
-            } => Some((*cmt, hazard, *recurrence, hazard_program)),
+                hazard, recurrence, ..
+            } => Some((*cmt, hazard, *recurrence)),
             _ => None,
         })
         .expect("a TTE endpoint");
     assert!(matches!(hazard, HazardSpec::OdeAccumulated { .. }));
-    assert!(hazard_program.is_none());
     let mut s = Subject {
         id: "1".into(),
         doses: vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
@@ -544,28 +520,22 @@ fn endpoints_without_a_dual_program_fall_back_to_finite_differences() {
     }];
     let theta = model.default_params.theta.clone();
     let eta = [0.2];
-    let omega = model.default_params.omega.matrix.clone();
     let records = s.obs_records.clone();
-    let tte_fn = |e: &[f64]| tte_endpoint_nll(&model, &s, hazard, recurrence, &records, &theta, e);
-    let f0 = tte_fn(&eta);
-    let (got, route) = tte_data_term_eta_hessian(
-        hazard,
-        recurrence,
-        None,
-        &records,
-        &s.covariates,
-        &theta,
-        &eta,
-        tte_fn,
-        || f0,
-        &omega,
+    let got = whole_term(&model, &s, &eta).expect("a drug-driven hazard records");
+    // The value is the production path's.
+    let (v, _, _) =
+        crate::survival::non_gaussian_eta_jets2(&model, &s, &theta, &eta).expect("records");
+    let want_v = tte_endpoint_nll(&model, &s, hazard, recurrence, &records, &theta, &eta);
+    assert!(
+        (v - want_v).abs() <= 1e-12 * want_v.abs(),
+        "value {v} vs {want_v}"
     );
-    assert_eq!(route, EtaHessianRoute::FiniteDifference);
-    let want = richardson_hessian(tte_fn, &eta, 2e-3);
+    let want = dual_hessian1(&crate::survival::TteTerm::new(&model, &s), &theta, eta[0]);
     let err = rel_err(&got, &want);
-    // Measured 2.4e-7 (Linux x86_64 and macOS arm64).
-    eprintln!("drug-driven TTE (FD): {err:.3e}");
-    assert!(err < 1e-5, "drug-driven TTE FD fallback off by {err:.3e}");
+    eprintln!("drug-driven TTE: {err:.3e}");
+    // Measured 0 on Linux x86_64: the dual takes the same operations; 1e-12 leaves room for a
+    // reassociation, and an error in a derivative rule misses by far more.
+    assert!(err < 1e-12, "drug-driven TTE off by {err:.3e}");
 
     // A time-inhomogeneous CTMM: `examples/ctmm_pd_2state.ferx`'s generator reads `central`.
     #[cfg(feature = "markov")]
@@ -591,17 +561,27 @@ fn endpoints_without_a_dual_program_fall_back_to_finite_differences() {
             .collect();
         let theta = model.default_params.theta.clone();
         let eta = [0.2];
-        let omega = model.default_params.omega.matrix.clone();
-        let mode = crate::markov::endpoint::ctmm_subject_nll(&model, &s, &theta, &eta);
-        let (_, route) =
-            ctmm_data_term_eta_hessian(&model, &s, &theta, &eta, mode, &omega).expect("served");
-        // Exact: `markov::endpoint`'s `a_drug_driven_ctmm_is_differentiated_exactly` pins the
-        // values against Richardson differences.
-        assert_eq!(route, EtaHessianRoute::Exact);
+        let got = whole_term(&model, &s, &eta).expect("a drug-driven generator records");
+        let (v, _, _) =
+            crate::survival::non_gaussian_eta_jets2(&model, &s, &theta, &eta).expect("records");
+        let want_v = crate::markov::endpoint::ctmm_subject_nll(&model, &s, &theta, &eta);
+        assert!(
+            (v - want_v).abs() <= 1e-12 * want_v.abs(),
+            "value {v} vs {want_v}"
+        );
+        let term = crate::markov::endpoint::CtmmTerm {
+            model: &model,
+            subject: &s,
+        };
+        let want = dual_hessian1(&term, &theta, eta[0]);
+        let err = rel_err(&got, &want);
+        eprintln!("drug-driven CTMM: {err:.3e}");
+        // Measured 0 on Linux x86_64 (see the TTE cell).
+        assert!(err < 1e-12, "drug-driven CTMM off by {err:.3e}");
     }
 }
 
-/// A subject the value path repels (`1e20`) has no curvature to give: each exact kernel
+/// A subject the value path repels (`1e20`) has no curvature to give: each plan
 /// declines it rather than differentiate the flat sentinel to a zero Hessian. One cell per
 /// endpoint guard — a TTE exact event at zero hazard, a binary predictor that overflows,
 /// a CTMM generator with a negative rate — each asserted to be the sentinel first.
@@ -612,36 +592,31 @@ fn a_repelled_subject_declines_the_exact_hessian() {
          cmt    = 2\n  family = exponential\n  scale  = TA * ETA_S\n",
     );
     let Some(EndpointLikelihood::Tte {
-        hazard,
-        recurrence,
-        hazard_program,
-        ..
+        hazard, recurrence, ..
     }) = tte.endpoints.get(&2)
     else {
         panic!("fixture precondition: a TTE endpoint on CMT 2");
     };
-    let HazardSpec::Analytic { family, .. } = hazard else {
-        panic!("fixture precondition: an analytic hazard");
+    let ts = Subject {
+        id: "1".into(),
+        obs_records: vec![event(3.0, EventType::Exact, 0.0)],
+        ..Default::default()
     };
-    let records = [event(3.0, EventType::Exact, 0.0)];
-    let cov = std::collections::HashMap::new();
     let theta = tte.default_params.theta.clone();
-    let v = crate::survival::tte_data_term(&records, hazard, *recurrence, &theta, &[0.0], &cov);
+    let v = crate::survival::tte_data_term(
+        &ts.obs_records,
+        hazard,
+        *recurrence,
+        &theta,
+        &[0.0],
+        &ts.covariates,
+    );
     assert_eq!(
         v, 1e20,
         "fixture precondition: h = 0 at an exact event is repelled"
     );
-    let prog = hazard_program.as_ref().expect("program");
-    assert!(crate::survival::analytic_tte_eta_hessian(
-        &records,
-        *family,
-        *recurrence,
-        prog,
-        &theta,
-        &[0.0],
-        &cov
-    )
-    .is_none());
+    assert!(tte_exact(&tte, &ts, &[0.0]).is_none());
+    assert!(whole_term(&tte, &ts, &[0.0]).is_none());
 
     let binary = parse(
         "[parameters]\n  theta TH0(0.2, -10.0, 10.0)\n  omega ETA_A ~ 0.25\n[binary_model]\n  \
@@ -661,6 +636,7 @@ fn a_repelled_subject_declines_the_exact_hessian() {
     assert!(
         crate::categorical::discrete_subject_eta_hessian(&binary, &bs, &theta, &[1.0]).is_none()
     );
+    assert!(whole_term(&binary, &bs, &[1.0]).is_none());
 
     #[cfg(feature = "markov")]
     {
@@ -683,5 +659,6 @@ fn a_repelled_subject_declines_the_exact_hessian() {
             crate::markov::endpoint::ctmm_subject_eta_hessian(&ctmm, &cs, &theta, &[-1.0])
                 .is_none()
         );
+        assert!(whole_term(&ctmm, &cs, &[-1.0]).is_none());
     }
 }

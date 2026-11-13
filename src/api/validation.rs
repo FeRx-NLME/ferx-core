@@ -3844,7 +3844,7 @@ pub(crate) fn typical_dose_snapshots<'a>(
 /// *panicked* the objective path and both dense builders
 /// (`called Option::unwrap() on a None value`, from a `partial_cmp(..).unwrap()` sort);
 /// it now yields a typed non-finite subject
-/// ([`timeline_has_non_finite`](crate::ode::predictions::timeline_has_non_finite)),
+/// ([`times_have_non_finite`](crate::ode::predictions::times_have_non_finite)),
 /// which the estimation guards absorb as a diverged solve. That is the right behaviour
 /// for a *mid-fit* θ/η excursion, but a wasteful and opaque one when the model is
 /// already broken at its starting point — a covariate relationship that divides by a

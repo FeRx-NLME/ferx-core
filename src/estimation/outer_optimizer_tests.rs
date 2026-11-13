@@ -8920,6 +8920,9 @@ fn predicted_remaining_gain_is_withheld_when_the_exact_path_declines_a_segment()
         let (x, ehs, _, kappas) = ebes_at(&m, p, &pop, &opts);
         let exact = gain_with(&m, &pop, p, &x, &ehs, &kappas, &opts);
         FORCE_LINEAR_DECLINE.set(true);
+        // The seam is no value a compiled plan's guard reads (#2786): the plans recorded on
+        // the exact path go, so the declined pass records its own.
+        crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
         let declined = gain_with(&m, &pop, p, &x, &ehs, &kappas, &opts);
         FORCE_LINEAR_DECLINE.set(false);
         (exact, declined)

@@ -74,46 +74,17 @@ impl Activation {
     /// [`Self::apply`] on any number type: the same branches on the value, so the value
     /// is bit-identical and the derivatives are those of the branch taken.
     pub(crate) fn apply_g<T: crate::sens::num::PkNum>(self, x: T) -> T {
-        let v = x.val();
-        let one = T::from_f64(1.0);
+        use crate::sens::num::{BranchCmp, JetFn};
         match self {
             Activation::Identity => x,
+            // A select, not a branch: a network's every sign pattern is one recording.
             Activation::Relu => {
-                if v > 0.0 {
-                    x
-                } else {
-                    T::from_f64(0.0)
-                }
+                let zero = T::from_f64(0.0);
+                T::select_if(BranchCmp::Gt, x, zero, x, zero)
             }
-            Activation::Softplus => {
-                if v > 20.0 {
-                    x
-                } else if v < -20.0 {
-                    x.exp()
-                } else {
-                    (one + x.exp()).ln()
-                }
-            }
-            Activation::Tanh => {
-                let t = v.tanh();
-                let d1 = 1.0 - t * t;
-                // tanh⁽ⁿ⁾ through n = 4: the covariance step's nested dual reads all four.
-                x.lift4(
-                    t,
-                    d1,
-                    -2.0 * t * d1,
-                    -2.0 * d1 * (1.0 - 3.0 * t * t),
-                    8.0 * t * d1 * (2.0 - 3.0 * t * t),
-                )
-            }
-            Activation::Sigmoid => {
-                if v >= 0.0 {
-                    one / (one + (-x).exp())
-                } else {
-                    let ex = x.exp();
-                    ex / (one + ex)
-                }
-            }
+            Activation::Softplus => x.jet_unary(JetFn::Softplus),
+            Activation::Tanh => x.jet_unary(JetFn::Tanh),
+            Activation::Sigmoid => x.jet_unary(JetFn::Logistic),
             Activation::Exp => x.exp(),
         }
     }

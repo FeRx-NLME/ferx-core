@@ -649,17 +649,12 @@ fn nn_reduce_off() -> bool {
 /// `|B| = n_r + n_z + N` directions instead of `n` (16 against 147 on the 141-weight
 /// `warfarin_dcm`), and the weights' own curvature comes from the networks alone.
 ///
-/// The outer gradient (`run`) reads the same reduction: the outputs as tape leaves, and the
-/// weights' adjoint as one backward pass through each network.
 #[cfg(feature = "nn")]
 pub(super) struct NnReduction<'s> {
     /// Raw outputs per network at the current weights.
     pub(super) z: Vec<Vec<f64>>,
     /// Per network: its first packed weight coordinate, its weight count, and its inputs.
     pub(super) nets: Vec<(usize, usize, &'s std::collections::HashMap<String, f64>)>,
-    /// Per network, the forward pass `z` came from, kept for the gradient's backward pass
-    /// (`MlpMapper::vjp_at`), so a gradient evaluates each network once.
-    pub(super) forward: Vec<crate::nn::NnForward>,
 }
 
 #[cfg(feature = "nn")]
@@ -679,7 +674,6 @@ impl<'s> NnReduction<'s> {
         }
         let mut z = Vec::new();
         let mut nets = Vec::new();
-        let mut forward = Vec::new();
         for nn in &model.covariate_nns {
             let n_w = nn.mapper.mlp().n_weights();
             let end = nn.weights_offset + n_w;
@@ -696,16 +690,16 @@ impl<'s> NnReduction<'s> {
             {
                 return None;
             }
-            let fwd = nn
-                .mapper
-                .forward_kept_raw(&theta[nn.weights_offset..end], rep)?;
-            z.push(fwd.output().to_vec());
-            forward.push(fwd);
+            z.push(
+                nn.mapper
+                    .forward_raw(&theta[nn.weights_offset..end], rep)
+                    .ok()?,
+            );
             nets.push((nn.weights_offset, n_w, rep));
         }
         let n_w: usize = nets.iter().map(|n| n.1).sum();
         let n_z: usize = z.iter().map(Vec::len).sum();
-        (n_w > n_z).then_some(NnReduction { z, nets, forward })
+        (n_w > n_z).then_some(NnReduction { z, nets })
     }
 
     fn hessian<const N: usize>(
@@ -1004,8 +998,22 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
     let leaves_outer = ThetaLeaves::with_nn(&th, preset.as_ref().map(|(o, _)| o.as_slice()));
     #[cfg(not(feature = "nn"))]
     let leaves_outer = ThetaLeaves::theta(&th);
+    // The subject's compiled plan (#2786) serves `(f, G)` — and the exact anchor's `Q` — as
+    // one block node; until its layout has matched this recording, the recording serves and
+    // is the check.
+    let second = matches!(objective, Objective::Agq { exact: true, .. });
+    let plan = (n_obs > 0 && nn_z.is_none() && sc.layout.is_none())
+        .then(|| {
+            let th_dirs: Vec<(R, [R; K])> = th
+                .iter()
+                .map(|t| (t.v.part(0), t.g.map(|d| d.part(0))))
+                .collect();
+            PlannedFg::<N>::forward(model, subject, sc.width, &th_dirs, &el, dirs, second)
+        })
+        .flatten();
+    let planned = plan.as_ref().map(|p| p.block(n_obs));
     // A subject with no Gaussian rows (an endpoint-only one) has nothing to record.
-    let preds = if n_obs == 0 && !subject.obs_records.is_empty() {
+    let preds = if planned.is_some() || (n_obs == 0 && !subject.obs_records.is_empty()) {
         Vec::new()
     } else {
         record(
@@ -1018,20 +1026,36 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             &et,
         )?
     };
-    if preds.len() != n_obs {
-        return None;
-    }
     let comp = |y: &Out<J>, c: usize| -> Out {
         DualT {
             v: y.v.part(c),
             g: y.g.map(|d| d.part(c)),
         }
     };
-    let f: Vec<Out> = preds.iter().map(|y| comp(y, 0)).collect();
-    let g: Vec<[Out; N]> = preds
-        .iter()
-        .map(|y| std::array::from_fn(|k| comp(y, 1 + k)))
-        .collect();
+    // `Q` (the exact anchor's), packed `tri(k, l)` over the plan's or the pass's width:
+    // the same entries for `k, l < pn`.
+    let (f, g, q): PlannedOut<N> = match planned {
+        Some(fgq) => fgq,
+        None => {
+            if preds.len() != n_obs {
+                return None;
+            }
+            let f: Vec<Out> = preds.iter().map(|y| comp(y, 0)).collect();
+            let g: Vec<[Out; N]> = preds
+                .iter()
+                .map(|y| std::array::from_fn(|k| comp(y, 1 + k)))
+                .collect();
+            let q: Vec<Vec<Out>> = if second {
+                preds
+                    .iter()
+                    .map(|y| (0..M).map(|t| comp(y, 1 + N + t)).collect())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (f, g, q)
+        }
+    };
 
     // The population parameters along the same directions, each through its packing chain.
     let xo = |i: usize| -> Out {
@@ -1097,9 +1121,11 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
             // The anchor H_a — the exact Hessian over an η-dual whose predictions carry
             // (f, G, Q), or FOCEI's H̃ — jittered as production's proposal is.
             let mut h_a: Vec<Vec<Out>> = if exact {
-                let q: Vec<[Out; M]> = preds
+                let q: Vec<[Out; M]> = q
                     .iter()
-                    .map(|y| std::array::from_fn(|t| comp(y, 1 + N + t)))
+                    .map(|y| {
+                        std::array::from_fn(|t| y.get(t).copied().unwrap_or(Out::constant(0.0)))
+                    })
                     .collect();
                 crate::sens::focei_kernel::exact_inner_hessian_kernel(
                     ctx, &f, &g, &q, &eo, &p, sc.width,
@@ -1129,6 +1155,7 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                 #[cfg(not(feature = "nn"))]
                 let leaves_plain = ThetaLeaves::theta(&th_o);
                 let mut terms: Vec<Out> = Vec::new();
+                let node_plans = n_obs > 0 && nn_z.is_none() && sc.layout.is_none();
                 for (z, c) in agq_grid::<N>(n_agq, sc.width) {
                     // b = η + √2·L⁻ᵀz, and the predictions recorded at b.
                     let mut step = [Out::constant(0.0); N];
@@ -1143,9 +1170,35 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
                         eo[k] + Out::constant(std::f64::consts::SQRT_2) * step[k]
                     });
                     let bv: Vec<f64> = b.iter().map(|v| v.val()).collect();
-                    // An endpoint-only subject has no Gaussian rows to record.
+                    // An endpoint-only subject has no Gaussian rows to record; a planned one
+                    // takes the node's predictions from its plan (#2786).
+                    let node_planned = node_plans
+                        .then(|| {
+                            super::with_plan_width(
+                                model,
+                                subject,
+                                None,
+                                &params.theta,
+                                &bv[..sc.width],
+                                &mut |pn, pl| {
+                                    if pn > N {
+                                        return None;
+                                    }
+                                    plan_block(
+                                        std::slice::from_ref(pl),
+                                        crate::sens::num::vm::Layout::F64,
+                                        &theta,
+                                        &b[..pn],
+                                    )
+                                },
+                            )
+                        })
+                        .flatten()
+                        .filter(|y| y.len() == n_obs);
                     let fb = if n_obs == 0 {
                         Vec::new()
+                    } else if let Some(y) = node_planned {
+                        y.into_iter().map(|o| o[0]).collect()
                     } else {
                         record(
                             model,
@@ -1200,6 +1253,321 @@ fn pass<const N: usize, const M: usize, J: Jet<N>>(
     })
 }
 
+use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+
+/// A covariance pass's `(f, G)` — and under the exact anchor `Q` — from the subject's
+/// compiled plan (#2786): its forward over the `pn` η (one-hot, to first order, or second for
+/// `Q`) differentiated forward along the pass's `K` directions ([`Layout::tan`]): θ seeded
+/// through its packing chain, η along its tangent.
+///
+/// [`Layout::tan`]: crate::sens::num::vm::Layout
+struct PlannedFg<const N: usize> {
+    /// The plan's random effects: the subject's own, at most the pass's padded `N` (the
+    /// padding's `G` is zero).
+    pn: usize,
+    /// `Q`'s lanes (`pn(pn+1)/2` under the exact anchor, else none).
+    nq: usize,
+    plan: std::sync::Arc<crate::parser::model_parser::rhs_regcode::kernel_jit::Plan>,
+    layout: crate::sens::num::vm::Layout,
+    /// The forward's outputs, and the forward kept for the block's reverses.
+    du: Vec<f64>,
+    fwd: std::sync::Arc<crate::parser::model_parser::rhs_regcode::kernel_jit::Fwd>,
+    /// The block's inputs: η, θ's values, θ's tangents (`K` per θ).
+    ins: Vec<R>,
+}
+
+/// A planned pass's outputs on the tape: `f`, `G` and (exact anchor) `Q` per observation.
+type PlannedOut<const N: usize> = (Vec<Out>, Vec<[Out; N]>, Vec<Vec<Out>>);
+
+impl<const N: usize> PlannedFg<N> {
+    /// The base layout's lanes (value, `pn` tangents, `nq` second-order).
+    fn lb(&self) -> usize {
+        1 + self.pn + self.nq
+    }
+    /// Lane of base lane `x`'s tangent along direction `a`.
+    fn t_lane(lb: usize, x: usize, a: usize) -> usize {
+        lb + x * K + a
+    }
+
+    /// The forward through the first of the subject's validated plans whose guard holds,
+    /// carrying `Q` when `second`.
+    fn forward(
+        model: &CompiledModel,
+        subject: &Subject,
+        width: usize,
+        th: &[(R, [R; K])],
+        el: &[R; N],
+        dirs: &[Dir<N>],
+        second: bool,
+    ) -> Option<Self> {
+        let thv: Vec<f64> = th.iter().map(|t| t.0.v).collect();
+        let ev: Vec<f64> = el[..width].iter().map(|e| e.v).collect();
+        let n_obs = subject.observations.len();
+        let (pn, nq, layout, du, plan, fwd) =
+            super::with_plan_width(model, subject, None, &thv, &ev, &mut |pn, pl| {
+                if pn > N {
+                    return None;
+                }
+                let nq = if second { pn * (pn + 1) / 2 } else { 0 };
+                let layout = crate::sens::num::vm::Layout {
+                    n: pn as u16,
+                    m: nq as u16,
+                    th: false,
+                    wide: false,
+                    tan: K as u8,
+                };
+                let (l, lb) = (layout.lanes(), 1 + pn + nq);
+                let mut u = vec![0.0; pn * l];
+                for k in 0..pn {
+                    u[k * l] = el[k].v;
+                    u[k * l + 1 + k] = 1.0;
+                    for (a, d) in dirs.iter().enumerate() {
+                        u[k * l + Self::t_lane(lb, 0, a)] = d.eta[k];
+                    }
+                }
+                let mut p = vec![0.0; th.len() * l];
+                for (i, (v, t)) in th.iter().enumerate() {
+                    p[i * l] = v.v;
+                    for a in 0..K {
+                        p[i * l + Self::t_lane(lb, 0, a)] = t[a].v;
+                    }
+                }
+                let mut du = vec![0.0; (n_obs + 1) * l];
+                let f = pl.forward_layout(layout, &u, &p, &mut du)?;
+                (du[n_obs * l] == 1.0)
+                    .then(|| (pn, nq, layout, du, pl.clone(), std::sync::Arc::new(f)))
+            })?;
+        let mut ins: Vec<R> = el[..pn].to_vec();
+        ins.extend(th.iter().map(|t| t.0));
+        ins.extend(th.iter().flat_map(|t| t.1));
+        Some(PlannedFg {
+            pn,
+            nq,
+            plan,
+            layout,
+            du,
+            fwd,
+            ins,
+        })
+    }
+
+    /// The outputs' lanes in the block's order: per observation `f`, each `G_k`, each `Q_t`,
+    /// each value then its `K` tangents.
+    fn out_lanes(&self, n_obs: usize) -> Vec<usize> {
+        let (l, lb) = (self.layout.lanes(), self.lb());
+        let mut out = Vec::with_capacity(n_obs * lb * (1 + K));
+        for j in 0..n_obs {
+            for x in 0..lb {
+                out.push(j * l + x);
+                out.extend((0..K).map(|a| j * l + Self::t_lane(lb, x, a)));
+            }
+        }
+        out
+    }
+
+    /// `(f, G, Q)` as a block node over the tape: its reverse is the plan's.
+    fn block(&self, n_obs: usize) -> PlannedOut<N> {
+        crate::parser::model_parser::rhs_regcode::kernel_jit::STATS
+            .cov
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (pn, nq, lb) = (self.pn, self.nq, self.lb());
+        let lanes = self.out_lanes(n_obs);
+        let vals: Vec<f64> = lanes.iter().map(|&i| self.du[i]).collect();
+        let (plan, layout, fwd) = (self.plan.clone(), self.layout, self.fwd.clone());
+        let (nu, np) = (pn * layout.lanes(), plan.n_theta() * layout.lanes());
+        let n_th = plan.n_theta();
+        let rev_lanes = lanes.clone();
+        // This block's inputs never change: its reverses all read the kept forward.
+        let rev = Box::new(move |seeds: usize, oa: &[f64], ia: &mut [f64]| {
+            let l = layout.lanes();
+            let (no, ni) = (rev_lanes.len(), oa.len() / seeds.max(1));
+            debug_assert_eq!(no, ni);
+            let w = n_obs * l;
+            let mut du_bar = vec![0.0; seeds * w];
+            for sd in 0..seeds {
+                for (&i, &a) in rev_lanes.iter().zip(&oa[sd * no..(sd + 1) * no]) {
+                    du_bar[sd * w + i] = a;
+                }
+            }
+            let (mut ub, mut pb) = (vec![0.0; seeds * nu], vec![0.0; seeds * np]);
+            if !plan.reverse_from(&fwd, layout, seeds, &mut ub, &mut pb, &du_bar) {
+                ia.fill(f64::NAN);
+                return;
+            }
+            let n_in = ia.len() / seeds.max(1);
+            for sd in 0..seeds {
+                let (ub, pb) = (&ub[sd * nu..], &pb[sd * np..]);
+                let ia = &mut ia[sd * n_in..(sd + 1) * n_in];
+                for k in 0..pn {
+                    ia[k] = ub[k * l];
+                }
+                for i in 0..n_th {
+                    ia[pn + i] = pb[i * l];
+                    for a in 0..K {
+                        ia[pn + n_th + i * K + a] = pb[i * l + Self::t_lane(lb, 0, a)];
+                    }
+                }
+            }
+        });
+        let out = crate::sens::rtape::rblock(&self.ins, &vals, rev);
+        let mut it = out.chunks_exact(1 + K);
+        let mut take = || {
+            let c = it.next().expect("one chunk per output");
+            DualT {
+                v: c[0],
+                g: std::array::from_fn(|a| c[1 + a]),
+            }
+        };
+        let (mut f, mut g, mut q) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..n_obs {
+            f.push(take());
+            g.push(std::array::from_fn(|k| {
+                if k < pn {
+                    take()
+                } else {
+                    Out::constant(0.0)
+                }
+            }));
+            q.push((0..nq).map(|_| take()).collect());
+        }
+        (f, g, q)
+    }
+}
+
+/// A plan's forward over `base` differentiated along the pass's `K` directions
+/// ([`kj::Plan`] at `base` with `tan = K`), as one block node on the tape (#2786): θ and η
+/// are pass values (a value and `K` tangents each, on the tape), η also seeded one-hot on
+/// `base`'s own tangents. Per output, its `base` lanes as pass values. The first of `plans`
+/// whose guard holds serves.
+fn plan_block(
+    plans: &[std::sync::Arc<kj::Plan>],
+    base: crate::sens::num::vm::Layout,
+    theta: &[Out],
+    eta: &[Out],
+) -> Option<Vec<Vec<Out>>> {
+    let layout = crate::sens::num::vm::Layout {
+        tan: K as u8,
+        ..base
+    };
+    let (l, lb) = (layout.lanes(), base.lanes());
+    let (ne, nt) = (eta.len(), theta.len());
+    let fill = |xs: &[Out], one_hot: bool| -> Vec<f64> {
+        let mut u = vec![0.0; xs.len() * l];
+        for (k, x) in xs.iter().enumerate() {
+            u[k * l] = x.v.v;
+            if one_hot && base.n > 0 {
+                u[k * l + 1 + k] = 1.0;
+            }
+            for a in 0..K {
+                u[k * l + lb + a] = x.g[a].v;
+            }
+        }
+        u
+    };
+    let (u, p) = (fill(eta, true), fill(theta, false));
+    let (plan, fwd, du) = plans.iter().find_map(|pl| {
+        if pl.n_theta() != nt {
+            return None;
+        }
+        let no = pl.n_out();
+        let mut du = vec![0.0; (no + 1) * l];
+        let f = pl.forward_layout(layout, &u, &p, &mut du)?;
+        (du[no * l] == 1.0).then(|| (pl.clone(), std::sync::Arc::new(f), du))
+    })?;
+    let no = plan.n_out();
+    // Per output, per base lane: the value, then its `K` tangents.
+    let lanes: Vec<usize> = (0..no)
+        .flat_map(|j| {
+            (0..lb).flat_map(move |x| {
+                std::iter::once(j * l + x).chain((0..K).map(move |a| j * l + lb + x * K + a))
+            })
+        })
+        .collect();
+    let vals: Vec<f64> = lanes.iter().map(|&i| du[i]).collect();
+    if !vals.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let mut ins: Vec<R> = Vec::with_capacity((ne + nt) * (1 + K));
+    for x in eta.iter().chain(theta) {
+        ins.push(x.v);
+        ins.extend(x.g);
+    }
+    let rev = Box::new(move |seeds: usize, oa: &[f64], ia: &mut [f64]| {
+        let (nl, w) = (lanes.len(), no * l);
+        let mut du_bar = vec![0.0; seeds * w];
+        for sd in 0..seeds {
+            for (&i, &a) in lanes.iter().zip(&oa[sd * nl..(sd + 1) * nl]) {
+                du_bar[sd * w + i] = a;
+            }
+        }
+        let (nu, np) = (ne * l, nt * l);
+        let (mut ub, mut pb) = (vec![0.0; seeds * nu], vec![0.0; seeds * np]);
+        if !plan.reverse_from(&fwd, layout, seeds, &mut ub, &mut pb, &du_bar) {
+            ia.fill(f64::NAN);
+            return;
+        }
+        let n_in = ia.len() / seeds.max(1);
+        for sd in 0..seeds {
+            let ia = &mut ia[sd * n_in..(sd + 1) * n_in];
+            let slots = ub[sd * nu..(sd + 1) * nu]
+                .chunks_exact(l)
+                .chain(pb[sd * np..(sd + 1) * np].chunks_exact(l));
+            for (x, s) in slots.enumerate() {
+                ia[x * (1 + K)] = s[0];
+                for a in 0..K {
+                    ia[x * (1 + K) + 1 + a] = s[lb + a];
+                }
+            }
+        }
+    });
+    let out = crate::sens::rtape::rblock(&ins, &vals, rev);
+    let per: Vec<Out> = out
+        .chunks_exact(1 + K)
+        .map(|c| DualT {
+            v: c[0],
+            g: std::array::from_fn(|a| c[1 + a]),
+        })
+        .collect();
+    Some(per.chunks_exact(lb).map(|c| c.to_vec()).collect())
+}
+
+/// [`ng_out`] through the term's plan ([`plan_block`] over its second-order layout).
+#[cfg(feature = "survival")]
+fn ng_out_planned<const N: usize>(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[Out],
+    eta: &[Out; N],
+) -> Option<crate::sens::focei_kernel::NonGauss<Out, N>> {
+    let n = model.n_eta;
+    if n > N {
+        return None;
+    }
+    let thv: Vec<f64> = theta.iter().map(|t| t.v.v).collect();
+    let etv: Vec<f64> = eta[..n].iter().map(|e| e.v.v).collect();
+    let plans = super::terms::non_gaussian_plans(model, subject, &thv, &etv)?;
+    let y = plan_block(&plans, super::terms::layout2(n), theta, &eta[..n])?;
+    let y = y.first()?;
+    let zero = Out::constant(0.0);
+    let q = y[0];
+    if !(q.val().is_finite() && q.val() < crate::survival::REPEL_SENTINEL_FLOOR) {
+        return None;
+    }
+    Some(crate::sens::focei_kernel::NonGauss {
+        q,
+        g: std::array::from_fn(|k| if k < n { y[1 + k] } else { zero }),
+        h: std::array::from_fn(|k| {
+            std::array::from_fn(|l| {
+                if k < n && l < n {
+                    y[super::terms::h_lane(n, k, l)]
+                } else {
+                    zero
+                }
+            })
+        }),
+    })
+}
+
 /// `(F, ∇_η l)` for FOCE / FOCEI (`objective`).
 fn objective_terms<const N: usize>(
     ctx: &LikCtx,
@@ -1227,6 +1595,9 @@ fn ng_out<const N: usize>(
     eta: &[Out; N],
 ) -> Option<crate::sens::focei_kernel::NonGauss<Out, N>> {
     use crate::survival::{NonGaussianTerm, SubjectTerm};
+    if let Some(y) = ng_out_planned(model, subject, theta, eta) {
+        return Some(y);
+    }
     fn go<const N: usize, const B: usize, const MB: usize>(
         model: &CompiledModel,
         subject: &Subject,
@@ -1300,6 +1671,17 @@ fn ng_at<const N: usize>(
     b: &[Out; N],
 ) -> Option<Out> {
     use crate::survival::{NonGaussianTerm, SubjectTerm};
+    // Through the term's plan at the value layout (#2786).
+    let n = model.n_eta;
+    let thv: Vec<f64> = theta.iter().map(|t| t.v.v).collect();
+    let bv: Vec<f64> = b[..n].iter().map(|e| e.v.v).collect();
+    if let Some(y) = super::terms::non_gaussian_plans(model, subject, &thv, &bv)
+        .and_then(|plans| plan_block(&plans, crate::sens::num::vm::Layout::F64, theta, &b[..n]))
+        .and_then(|y| y.first().map(|o| o[0]))
+    {
+        return (y.val().is_finite() && y.val() < crate::survival::REPEL_SENTINEL_FLOOR)
+            .then_some(y);
+    }
     let y = NonGaussianTerm::new(model, subject).eval(theta, &b[..model.n_eta])?;
     (y.val().is_finite() && y.val() < crate::survival::REPEL_SENTINEL_FLOOR).then_some(y)
 }

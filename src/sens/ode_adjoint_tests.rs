@@ -7,6 +7,7 @@ use super::*;
 use crate::estimation::inner_optimizer::find_ebe;
 use crate::estimation::parameterization::pack_params;
 use crate::parser::model_parser::parse_model_string;
+use crate::sens::vfree::DualF;
 use crate::types::{DoseEvent, Subject};
 use std::collections::HashMap;
 
@@ -1548,7 +1549,7 @@ fn shared_inputs_subject(model: &CompiledModel, distinct: impl Fn(usize) -> bool
 /// Regressions each comparison catches, run as mutations: sharing records of different κ
 /// groups (IOV); writing an implied dose's parent lag into an evaluation the dose at 6
 /// shares, both when other records read it too and when the two doses are its only
-/// readers; copying from the wrong record; and letting the taped `DualV` share (the
+/// readers; copying from the wrong record; and letting the taped `DualF` share (the
 /// gradient row).
 #[test]
 fn records_sharing_an_evaluation_match_their_unshared_twin_bitwise() {
@@ -4534,281 +4535,6 @@ fn one_cpt_oral_n_eta(n: usize) -> String {
     .replace("exp(0 + ", "exp(")
 }
 
-/// The width rule the covariance diagnostics report (`cov_width_declines`) is the one the
-/// Hessian dispatch runs on: a nine-effect subject is declined under the exact anchor and
-/// served under FOCEI, and each answer is checked against the dispatch itself, so the
-/// regularization warning cannot promise a route the dispatch refuses (Copilot on #2093).
-/// The PK-space closed form (`pk_space_predictions`) against the generic one it replaces on
-/// static closed-form subjects: the FOCEI and FOCE gradients, the η-Jacobian and the exact
-/// inner Hessian agree to rounding, on 1-/2-compartment fixtures with 2 to 5 live PK
-/// parameters (block Ω, combined error, lag + LTBS, infusions). A Taylor term dropped or
-/// misweighted is a gap of order the term itself, far above this bound; the hit counter
-/// shows the fast path ran where it applies (second order, or taped), and the Laplace
-/// exact anchor (order 3) shows it stood aside.
-#[test]
-fn the_pk_space_closed_form_is_the_generic_one() {
-    use super::{PK_SPACE_FORCE, PK_SPACE_HITS, PK_SPACE_OFF};
-    let two_doses = |rate: f64| {
-        vec![
-            DoseEvent::new(0.0, 100.0, 1, rate, false, 0.0),
-            DoseEvent::new(12.0, 100.0, 1, rate, false, 0.0),
-        ]
-    };
-    let cases: Vec<(&str, CompiledModel, Vec<DoseEvent>, Vec<f64>)> = vec![
-        (
-            "1-cpt oral",
-            parse_model_string(ONE_CPT_ORAL).unwrap(),
-            two_doses(0.0),
-            vec![0.1, -0.05, 0.2],
-        ),
-        (
-            "2-cpt iv infusion, block Ω, combined",
-            parse_model_string(TWO_CPT_IV_COMBINED).unwrap(),
-            two_doses(50.0),
-            vec![0.1, -0.05],
-        ),
-        (
-            "1-cpt oral, lag + LTBS",
-            parse_model_string(ONE_CPT_ORAL_LAG_LTBS).unwrap(),
-            two_doses(0.0),
-            vec![0.1, -0.05, 0.1],
-        ),
-        (
-            "1-cpt oral, 5 η",
-            parse_model_string(&one_cpt_oral_n_eta(5)).unwrap(),
-            two_doses(0.0),
-            vec![0.1, -0.05, 0.2, 0.03, -0.02],
-        ),
-    ];
-    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
-    let mut worst = 0.0f64;
-    for (label, model, doses, eta_ref) in &cases {
-        let s = subject(model, doses.clone(), &TIMES, eta_ref);
-        let params = moved_params(model);
-        let x = pack_params(&params);
-        for interaction in [true, false] {
-            let eta = ebe_for(model, &s, &params, 1e-10, interaction);
-            let both = |off: bool| {
-                PK_SPACE_OFF.with(|c| c.set(off));
-                PK_SPACE_FORCE.with(|c| c.set(!off));
-                PK_SPACE_HITS.with(|c| c.set(0));
-                let g = subject_adjoint_packed_gradient(
-                    model,
-                    &s,
-                    &params,
-                    &x,
-                    eta.as_slice(),
-                    interaction,
-                )
-                .expect("in scope");
-                let j =
-                    exact_eta_jacobian(model, &s, &params.theta, eta.as_slice()).expect("jacobian");
-                let h = exact_inner_hessian(model, &s, &params, eta.as_slice()).expect("hessian");
-                let hits = PK_SPACE_HITS.with(|c| c.get());
-                PK_SPACE_OFF.with(|c| c.set(false));
-                PK_SPACE_FORCE.with(|c| c.set(false));
-                (g, j, h, hits)
-            };
-            let (g0, j0, h0, off_hits) = both(true);
-            let (g1, j1, h1, hits) = both(false);
-            assert_eq!(off_hits, 0, "{label}: the switch must turn the path off");
-            // The taped gradient recording and the inner Hessian's second-order one take
-            // the PK-space path; the η-Jacobian (first order, tape-free) keeps the generic
-            // path by design, so it is compared here but not counted.
-            assert!(
-                hits >= 2,
-                "{label}: the PK-space path did not run ({hits} hits)"
-            );
-            for (a, b) in g1
-                .iter()
-                .zip(&g0)
-                .chain(j1.iter().zip(j0.iter()))
-                .chain(h1.iter().zip(h0.iter()))
-            {
-                assert!(a.is_finite() && b.is_finite(), "{label}");
-                worst = worst.max(rel(*a, *b));
-            }
-            assert!(
-                g0.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-2,
-                "{label}: a vanishing gradient tests nothing"
-            );
-        }
-    }
-    eprintln!("PK-space vs generic closed form: worst relative gap {worst:.2e}");
-    // Measured 9.6e-15: rounding (the polynomial and the closed form associate
-    // differently); 100× headroom, still ten orders below a misweighted Taylor term.
-    assert!(worst < 1e-12, "PK-space vs generic: {worst:.2e}");
-    // The exact anchor's recording tapes the η-Hessian (order 3), and the covariance
-    // step's nested duals observe three orders (four under the exact anchor): each takes
-    // the PK-space path at its own order now, and must agree with the generic one.
-    let (_, model, doses, eta_ref) = &cases[0];
-    let s = subject(model, doses.clone(), &TIMES, eta_ref);
-    let worst_hi = pk_space_twin_high_order(model, &s, "1-cpt oral");
-    eprintln!("PK-space vs generic closed form, orders 3–4: worst relative gap {worst_hi:.2e}");
-    assert!(worst_hi < 1e-10, "orders 3–4: {worst_hi:.2e}");
-}
-
-/// The Laplace gradient (its taped exact-anchor recording, order 3) and the FOCEI and
-/// Laplace covariance Hessians (the nested duals, orders 3 and 4) with the PK-space path
-/// on and off: the worst relative gap, after asserting the path ran each time.
-fn pk_space_twin_high_order(model: &CompiledModel, s: &Subject, label: &str) -> f64 {
-    use super::{PK_SPACE_FORCE, PK_SPACE_HITS, PK_SPACE_OFF};
-    let params = moved_params(model);
-    let x = pack_params(&params);
-    let laplace = Objective::Agq {
-        n_agq: 1,
-        exact: true,
-    };
-    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
-    let mut worst = 0.0f64;
-    let eta = ebe_for(model, s, &params, 1e-10, true);
-    let run = |off: bool| {
-        PK_SPACE_OFF.with(|c| c.set(off));
-        PK_SPACE_FORCE.with(|c| c.set(!off));
-        PK_SPACE_HITS.with(|c| c.set(0));
-        let g = subject_adjoint_gradient(model, s, &params, &x, eta.as_slice(), laplace)
-            .expect("in scope");
-        let g_hits = PK_SPACE_HITS.with(|c| c.get());
-        let hf =
-            subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), Objective::Focei)
-                .expect("FOCEI covariance Hessian");
-        let hl = subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), laplace)
-            .expect("Laplace covariance Hessian");
-        let hits = PK_SPACE_HITS.with(|c| c.get());
-        PK_SPACE_OFF.with(|c| c.set(false));
-        PK_SPACE_FORCE.with(|c| c.set(false));
-        (g, hf, hl, g_hits, hits)
-    };
-    let (g0, hf0, hl0, _, off_hits) = run(true);
-    let (g1, hf1, hl1, g_hits, hits) = run(false);
-    assert_eq!(off_hits, 0, "{label}: the switch must turn the path off");
-    // The canonical pass (order 2) and the taped exact-anchor recording (order 3).
-    assert!(
-        g_hits >= 2,
-        "{label}: the exact anchor's recording did not lift ({g_hits})"
-    );
-    assert!(
-        hits > g_hits,
-        "{label}: the covariance passes did not lift ({hits})"
-    );
-    for (a, b) in g1
-        .iter()
-        .zip(&g0)
-        .chain(hf1.iter().zip(hf0.iter()))
-        .chain(hl1.iter().zip(hl0.iter()))
-    {
-        assert!(a.is_finite() && b.is_finite(), "{label}");
-        worst = worst.max(rel(*a, *b));
-    }
-    assert!(
-        hf0.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-2,
-        "{label}: a vanishing Hessian tests nothing"
-    );
-    worst
-}
-
-/// The ODE engine's PK-space path against its generic recording: the FOCEI and FOCE
-/// gradients, the η-Jacobian and inner Hessian (order ≤ 2), then the Laplace gradient and
-/// both covariance Hessians (orders 3 and 4), on static ODE subjects — RK45 and Rosenbrock,
-/// multi-dose infusion, four η, a transit chain.
-#[test]
-fn the_pk_space_ode_walk_is_the_generic_one() {
-    use super::{PK_SPACE_FORCE, PK_SPACE_HITS, PK_SPACE_OFF};
-    let mut rodas = tight(parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap());
-    rodas.ode_spec.as_mut().unwrap().solver_opts.method = crate::ode::solver::OdeMethod::Rodas5P;
-    let infusions = vec![
-        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
-        DoseEvent::new(8.0, 100.0, 1, 50.0, false, 0.0),
-    ];
-    let bolus = vec![
-        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
-    ];
-    let cases: Vec<(&str, CompiledModel, Vec<DoseEvent>, Vec<f64>)> = vec![
-        (
-            "one_cpt_oral_ode",
-            tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap()),
-            bolus.clone(),
-            vec![0.1, -0.05],
-        ),
-        (
-            "two_cpt_infusion",
-            tight(parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap()),
-            infusions.clone(),
-            vec![0.1, -0.05, 0.08],
-        ),
-        ("two_cpt_rodas5p", rodas, infusions, vec![0.1, -0.05, 0.08]),
-        (
-            "additive_four_eta",
-            tight(parse_model_string(ADDITIVE_FOUR_ETA).unwrap()),
-            bolus.clone(),
-            vec![0.1, -0.05, 0.2, -0.1],
-        ),
-        (
-            "chain_4",
-            tight(parse_model_string(&chain_model(4)).unwrap()),
-            bolus,
-            vec![0.1, -0.05, 0.1],
-        ),
-    ];
-    let rel = |a: f64, b: f64| (a - b).abs() / (1.0 + b.abs());
-    let (mut worst2, mut worst_hi) = (0.0f64, 0.0f64);
-    for (label, model, doses, eta_ref) in &cases {
-        let s = subject(model, doses.clone(), &TIMES, eta_ref);
-        let params = moved_params(model);
-        let x = pack_params(&params);
-        for interaction in [true, false] {
-            let eta = ebe_for(model, &s, &params, 1e-10, interaction);
-            let both = |off: bool| {
-                PK_SPACE_OFF.with(|c| c.set(off));
-                PK_SPACE_FORCE.with(|c| c.set(!off));
-                PK_SPACE_HITS.with(|c| c.set(0));
-                let g = subject_adjoint_packed_gradient(
-                    model,
-                    &s,
-                    &params,
-                    &x,
-                    eta.as_slice(),
-                    interaction,
-                )
-                .expect("in scope");
-                let j =
-                    exact_eta_jacobian(model, &s, &params.theta, eta.as_slice()).expect("jacobian");
-                let h = exact_inner_hessian(model, &s, &params, eta.as_slice()).expect("hessian");
-                let hits = PK_SPACE_HITS.with(|c| c.get());
-                PK_SPACE_OFF.with(|c| c.set(false));
-                PK_SPACE_FORCE.with(|c| c.set(false));
-                (g, j, h, hits)
-            };
-            let (g0, j0, h0, _) = both(true);
-            let (g1, j1, h1, hits) = both(false);
-            assert!(
-                hits >= 2,
-                "{label}: the PK-space path did not run ({hits} hits)"
-            );
-            for (a, b) in g1
-                .iter()
-                .zip(&g0)
-                .chain(j1.iter().zip(j0.iter()))
-                .chain(h1.iter().zip(h0.iter()))
-            {
-                assert!(a.is_finite() && b.is_finite(), "{label}");
-                worst2 = worst2.max(rel(*a, *b));
-            }
-        }
-        worst_hi = worst_hi.max(pk_space_twin_high_order(model, &s, label));
-        eprintln!("{label}: worst so far {worst2:.2e} (order 2), {worst_hi:.2e} (orders 3–4)");
-    }
-    assert!(
-        worst2 < 1e-10,
-        "PK-space vs generic ODE, order 2: {worst2:.2e}"
-    );
-    assert!(
-        worst_hi < 1e-9,
-        "PK-space vs generic ODE, orders 3–4: {worst_hi:.2e}"
-    );
-}
-
 #[test]
 fn the_covariance_width_rule_is_the_dispatchs() {
     let laplace = Objective::Agq {
@@ -5415,7 +5141,7 @@ const CIRCADIAN: &str = r#"
 
 /// #2720: `sin`/`cos` with a random effect in the argument, through every order the
 /// recorders read. The FOCE/FOCEI gradient differentiates the lifted `φ′`, the Laplace
-/// exact anchor's taped-Hessian sweep `φ″` (`DualV::lift3`), and the covariance step's
+/// exact anchor's taped-Hessian sweep `φ″` (`DualF::lift3`), and the covariance step's
 /// nested dual `φ‴`/`φ⁗` (`DualT::lift3`, `DualH::lift4`) — each against the reconverged
 /// FD of the production objective, which shares no derivative code with the adjoint.
 ///
@@ -5774,61 +5500,6 @@ const COVARIATE_NN_IV: &str = r#"
   DV ~ proportional(PROP)
 "#;
 
-/// [`COVARIATE_NN_IV`] with **two** networks: `CL` from one over both inputs, `V1`/`V2`
-/// from another over `WT` alone, each with its own weight block and inputs.
-#[cfg(feature = "nn")]
-const COVARIATE_NN_TWO_NETS: &str = r#"
-[parameters]
-  theta TVQ(6.0, 0.1, 50.0)
-  omega ETA_CL ~ 0.1
-  omega ETA_V1 ~ 0.1
-  sigma PROP ~ 0.04 (sd)
-
-[covariate_nn CLNET]
-  inputs     = [CRCL, WT]
-  center     = [90, 70]
-  scale      = [30, 15]
-  outputs    = [CL]
-  layers     = [3]
-  activation = tanh
-  output     = softplus
-  init       = [4.5]
-
-[covariate_nn VNET]
-  inputs     = [WT]
-  center     = [70]
-  scale      = [15]
-  outputs    = [V1, V2]
-  layers     = [2]
-  activation = tanh
-  output     = softplus
-  init       = [60.0, 50.0]
-
-[individual_parameters]
-  CL = CLNET.CL * exp(ETA_CL)
-  V1 = VNET.V1 * exp(ETA_V1)
-  Q  = TVQ
-  V2 = VNET.V2
-
-[structural_model]
-  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
-
-[error_model]
-  DV ~ proportional(PROP)
-"#;
-
-/// [`COVARIATE_NN_IV`] on the user-ODE engine: the same kinetics as `[odes]`.
-#[cfg(feature = "nn")]
-fn covariate_nn_ode_src() -> String {
-    COVARIATE_NN_IV.replace(
-        "[structural_model]\n  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)\n",
-        "[structural_model]\n  ode(states=[central, peripheral])\n\n[odes]\n  \
-         d/dt(central) = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral\n  \
-         d/dt(peripheral) = (Q/V1) * central - (Q/V2) * peripheral\n\n[scaling]\n  \
-         y = central / V1\n",
-    )
-}
-
 /// The fixture's subject (two doses, the shared times, covariates `CRCL = 72`, `WT = 81`,
 /// observations on its predictions with residuals of both signs) for any covariate-NN
 /// model `src`, with θ moved off the `init` symmetric point.
@@ -5887,12 +5558,10 @@ fn covariate_nn_matches_reconverged_fd() {
 /// (the ambient thread-local they read had no writer since #2093), so `TYPICAL_PK.CL > 1`
 /// read `0 > 1` on every recording and took the `else` arm while the production predictor
 /// took the `if` one. The outputs now reach the conditions with the program's arguments.
-/// Against the reconverged FD of production's objective, with the leaves and with every
-/// network taped.
+/// Against the reconverged FD of production's objective.
 #[cfg(feature = "nn")]
 #[test]
 fn a_condition_on_a_network_output_takes_the_production_branch() {
-    use super::NN_OUTPUT_LEAVES_OFF;
     let src = COVARIATE_NN_IV.replace(
         "  CL = TYPICAL_PK.CL * exp(ETA_CL)\n",
         "  if (TYPICAL_PK.CL > 1.0) {\n    CL = TYPICAL_PK.CL * exp(ETA_CL)\n  } else {\n    \
@@ -5900,114 +5569,11 @@ fn a_condition_on_a_network_output_takes_the_production_branch() {
     );
     assert_ne!(src, COVARIATE_NN_IV, "the fixture must carry the branch");
     let (model, s) = covariate_nn_fixture_from(&src);
-    let mut worst = 0.0f64;
-    for off in [false, true] {
-        NN_OUTPUT_LEAVES_OFF.with(|c| c.set(off));
-        let fd = fd_oracle(&model, &s, true);
-        NN_OUTPUT_LEAVES_OFF.with(|c| c.set(false));
-        eprintln!("NN-output condition, leaves off = {off}: vs reconverged FD {fd:.2e}");
-        worst = worst.max(fd);
-    }
+    let worst = fd_oracle(&model, &s, true);
+    eprintln!("NN-output condition vs reconverged FD {worst:.2e}");
     // Measured worst 3.1e-7 on Linux (the FD's own noise; the same as the branch-free
     // fixture's); ~10× headroom. The `else` arm misses by O(1).
     assert!(worst < 3e-6, "NN-output condition vs FD {worst:.2e}");
-}
-
-/// The outer gradient of a covariate-NN subject reads the networks' outputs as tape leaves
-/// and pulls their adjoints back through each network (`nn_output_leaves`), and must equal
-/// the gradient with every network taped over its weights, under FOCEI, FOCE, Laplace's
-/// exact anchor (the taped second-order recording) and AGQ's Gauss–Newton one. On four
-/// engines: the closed-form IV walk, the same model with **two** networks (each network's
-/// mapper, offset and inputs paired with its own leaves), the closed-form oral model
-/// `warfarin_dcm` runs on, and the user-ODE recorder. Only the summation order of the
-/// weights' chain rule differs. The counter shows the leaves were read, the switch that
-/// they stood aside; every network's weight block is asserted live.
-#[cfg(feature = "nn")]
-#[test]
-fn covariate_nn_output_leaf_gradient_equals_the_taped_networks() {
-    use super::{NN_OUTPUT_LEAF_HITS, NN_OUTPUT_LEAVES_OFF};
-    let oral = COVARIATE_NN_IV
-        .replace(
-            "  theta TVQ(6.0, 0.1, 50.0)\n",
-            "  theta TVQ(6.0, 0.1, 50.0)\n  theta TVKA(1.2, 0.05, 10.0)\n",
-        )
-        .replace(
-            "pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)",
-            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
-        )
-        .replace(
-            "  V2 = TYPICAL_PK.V2\n",
-            "  V2 = TYPICAL_PK.V2\n  KA = TVKA\n",
-        );
-    let ode = covariate_nn_ode_src();
-    let mut worst = 0.0f64;
-    for (fixture, src) in [
-        ("closed-form IV", COVARIATE_NN_IV),
-        ("two networks", COVARIATE_NN_TWO_NETS),
-        ("closed-form oral", oral.as_str()),
-        ("ODE", ode.as_str()),
-    ] {
-        let (model, s) = covariate_nn_fixture_from(src);
-        let params = moved_params(&model);
-        let x = pack_params(&params);
-        for (objective, interaction, name) in [
-            (Objective::Focei, true, "FOCEI"),
-            (Objective::Foce, false, "FOCE"),
-            (
-                Objective::Agq {
-                    n_agq: 1,
-                    exact: true,
-                },
-                true,
-                "Laplace",
-            ),
-            (
-                Objective::Agq {
-                    n_agq: 3,
-                    exact: false,
-                },
-                true,
-                "AGQ-3",
-            ),
-        ] {
-            let label = format!("{fixture}, {name}");
-            let eta = ebe_for(&model, &s, &params, 1e-12, interaction);
-            let run = |off: bool| {
-                NN_OUTPUT_LEAVES_OFF.with(|c| c.set(off));
-                NN_OUTPUT_LEAF_HITS.with(|c| c.set(0));
-                let g =
-                    subject_adjoint_gradient(&model, &s, &params, &x, eta.as_slice(), objective);
-                NN_OUTPUT_LEAVES_OFF.with(|c| c.set(false));
-                (g, NN_OUTPUT_LEAF_HITS.with(|c| c.get()))
-            };
-            let (taped, off_hits) = run(true);
-            let (leaves, hits) = run(false);
-            let (taped, leaves) = (
-                taped.unwrap_or_else(|| panic!("{label}: taped gradient in scope")),
-                leaves.unwrap_or_else(|| panic!("{label}: leaf gradient in scope")),
-            );
-            assert_eq!(off_hits, 0, "{label}: the switch must tape the networks");
-            assert_eq!(hits, 1, "{label}: the output leaves were not read");
-            for nn in &model.covariate_nns {
-                let (w, n_w) = (nn.weights_offset, nn.mapper.mlp().n_weights());
-                assert!(
-                    (w..w + n_w).filter(|&i| taped[i].abs() > 1e-3).count() > n_w / 2,
-                    "{label}: a vanishing weight gradient tests nothing (network at {w})"
-                );
-            }
-            for (a, b) in leaves.iter().zip(&taped) {
-                assert!(a.is_finite() && b.is_finite(), "{label}: {a} vs {b}");
-                worst = worst.max((a - b).abs() / (1.0 + b.abs()));
-            }
-        }
-    }
-    eprintln!("covariate NN: output-leaf vs taped-network gradient {worst:.2e}");
-    // Measured worst 9.8e-15 on Linux over the four fixtures (1.4e-16 on the IV one alone);
-    // ~10× headroom.
-    assert!(
-        worst < 1e-13,
-        "output-leaf vs taped-network gradient {worst:.2e}"
-    );
 }
 
 /// The covariance Hessian of a covariate-NN subject is assembled in the networks' output
@@ -6091,7 +5657,7 @@ fn covariate_nn_reduced_hessian_equals_the_full_one() {
 }
 
 /// The exact anchor through a `tanh` network: its taped-Hessian sweep differentiates the
-/// activation's `φ″` (`DualV::lift3`), and the covariance step's nested dual its `φ‴`
+/// activation's `φ″` (`DualF::lift3`), and the covariance step's nested dual its `φ‴`
 /// (`DualH::lift4`). With either order missing the sweep records `NaN` and the subject
 /// declines to finite differences, which `fd_oracle_agq` / `hessian_gaps_for` refuse
 /// (they `expect` the adjoint), so each order has its own failing assertion here.
@@ -7240,7 +6806,7 @@ fn the_closed_form_assembles_over_the_active_width() {
     for j in 0..TIMES.len() {
         g[j][2] = 0.0;
         for k in 0..3 {
-            q[j][crate::sens::vtape::tri(2, k)] = 0.0;
+            q[j][crate::sens::vfree::tri(2, k)] = 0.0;
         }
     }
     // The 3-wide ParT: Ω padded with the inert unit diagonal, as `stacked_omega` pads.
@@ -7638,7 +7204,7 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
             .collect();
         let x = fixed_eta_theta_adjoint(&model, &s, &theta, &eta, true, &weights)
             .unwrap_or_else(|| panic!("{name}: out of the recorders' scope"));
-        let n_axis = theta_axis(&model).unwrap().min(theta.len());
+        let n_axis = theta.len();
         let fwd = forward_theta_jacobian(&model, &s, &theta, &eta, n_axis);
         let jac = x.jac.as_ref().expect("asked for");
         let n_theta = theta.len();
@@ -7676,39 +7242,6 @@ fn the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents() {
         worst_all = worst_all.max(worst);
     }
     eprintln!("fixed-η θ adjoint vs forward tangents: worst relative difference {worst_all:e}");
-}
-/// The lift is taken where its jet type is no more work per operation than the recording's
-/// (`pk_space_predictions`). Each case names the fit it decides: a taped FOCEI recording over
-/// as many PK slots lifts (the tape is what it drops); a two-η Michaelis–Menten fit over four
-/// live slots does not, at order 2 or under Laplace's directional order 3, where
-/// `Taylor<4, 3>`'s 165-term product was measured slower than the recording it replaced.
-#[test]
-fn the_lift_is_taken_where_it_is_less_work() {
-    use crate::sens::num::PkNum;
-    let lifts = |order: usize, n: usize, work: usize| {
-        super::pk_space_work(order, n).is_some_and(|w| w <= work)
-    };
-    // Five η over five slots, FOCEI's taped recording.
-    assert!(lifts(2, 5, <DualV<6, 21> as PkNum>::WORK));
-    // Two η over four slots: FOCEI, and Laplace's exact anchor (`DualV<N, N, true>`).
-    assert!(!lifts(2, 4, <DualV<2, 3> as PkNum>::WORK));
-    assert!(!lifts(3, 4, <DualV<2, 2, true> as PkNum>::WORK));
-    // The exact anchor's widths, counted at their stored lanes (`1 + 2N`, all taped): eight
-    // η over two slots lifts; four η over two, and 24 over four, do not. Four η over two
-    // slots was measured (a Laplace gradient, three η, two on PK slots): lifted 1.75× the
-    // generic recording's time, at a 4.5e-15 gap — so not lifting it is the faster choice.
-    assert_eq!(<DualV<4, 4, true> as PkNum>::WORK, 27);
-    assert!(lifts(3, 2, <DualV<8, 8, true> as PkNum>::WORK));
-    assert!(!lifts(3, 2, <DualV<4, 4, true> as PkNum>::WORK));
-    assert!(!lifts(3, 4, <DualV<24, 24, true> as PkNum>::WORK));
-    // Many η over few slots lifts even untaped.
-    assert!(lifts(2, 2, <DualF<8, 36> as PkNum>::WORK));
-    // Past the widest bucket there is no lift at all.
-    assert_eq!(super::pk_space_work(2, 9), None);
-    assert_eq!(super::pk_space_work(4, 7), None);
-    // The costs themselves: `1 + p + p(p+1)/2` at the bucket, and the Taylor product.
-    assert_eq!(super::pk_space_work(2, 5), Some(28));
-    assert_eq!(super::pk_space_work(3, 4), Some(165));
 }
 
 /// The exact outer gradient of a subject carrying non-Gaussian records: the term `q`
