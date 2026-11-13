@@ -467,6 +467,8 @@ fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         cwres: vec![0.0; n],
         npde: vec![],
         npd: vec![],
+        epred: vec![],
+        pwres: vec![],
         ofv_contribution: 0.0,
         cens: vec![0; n],
         n_obs: n,
