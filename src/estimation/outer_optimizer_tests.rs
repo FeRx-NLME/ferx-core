@@ -13789,25 +13789,12 @@ fn unprofiled_stop_needs_verify_takes_every_stop_that_could_be_reported_converge
 #[test]
 fn unprofiled_verify_applies_to_foce_gradient_fits_only() {
     use nlopt::Algorithm as A;
-    assert!(unprofiled_verify_applies(A::Lbfgs, false, false, 1));
-    assert!(unprofiled_verify_applies(A::Slsqp, false, false, 1));
-    assert!(!unprofiled_verify_applies(A::Bobyqa, false, false, 1));
-    assert!(!unprofiled_verify_applies(A::Mma, false, false, 1));
-    assert!(!unprofiled_verify_applies(A::Lbfgs, true, false, 1), "AGQ");
-    assert!(
-        !unprofiled_verify_applies(A::Lbfgs, false, true, 1),
-        "mixture"
-    );
-    // #2763: no random effects, no inner solve for the leg to tighten — under both gradient
-    // optimizers, and only at zero (one random effect, BSV or IOV alone, keeps the leg).
-    assert!(
-        !unprofiled_verify_applies(A::Lbfgs, false, false, 0),
-        "n_eta = 0"
-    );
-    assert!(
-        !unprofiled_verify_applies(A::Slsqp, false, false, 0),
-        "n_eta = 0"
-    );
+    assert!(unprofiled_verify_applies(A::Lbfgs, false, false));
+    assert!(unprofiled_verify_applies(A::Slsqp, false, false));
+    assert!(!unprofiled_verify_applies(A::Bobyqa, false, false));
+    assert!(!unprofiled_verify_applies(A::Mma, false, false));
+    assert!(!unprofiled_verify_applies(A::Lbfgs, true, false), "AGQ");
+    assert!(!unprofiled_verify_applies(A::Lbfgs, false, true), "mixture");
 }
 
 /// Every exit of the #2462 loop, with the legs scripted.
@@ -14075,67 +14062,31 @@ fn with_verify_leg<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<UnprofiledLeg>
     )
 }
 
-/// #2763, the call site: `optimize_nlopt_attempt_probed` hands `unprofiled_verify_applies`
-/// `n_eta + n_kappa`, which only the pure predicate's test covered. A fit with no random
-/// effects takes no leg, and a fit whose only random effect is a `kappa` takes one. Each
-/// half dies on one wrong argument: a literal `1` (the change removed) gives the pooled
-/// fit its legs back, and `n_eta` alone takes them from the IOV-only fit.
+/// #2763: a model with no random effects still takes the leg. With no inner solve there is
+/// no tolerance for it to tighten, but it also restarts the optimizer from the best point,
+/// and that alone repairs early stops: skipping it at `n_eta + n_kappa = 0` left 7 of 25 such
+/// fits `converged` at a worse point on Linux x86_64 (`one_cpt_iv_pooled` under SLSQP +5.1e-5
+/// OFV with final max|grad| 1.64, `pktte_tdep` with all six θ free under L-BFGS +2.1e-5 and
+/// `TVGAM` 1% off; see #2765). This dies if the skip comes back.
 #[test]
-fn a_fit_takes_the_verify_leg_only_with_random_effects() {
-    let fit = |prep: crate::PreparedRun| {
-        let opts = FitOptions {
-            verbose: false,
-            run_covariance_step: false,
-            ..prep.parsed.fit_options.clone()
-        };
-        let m = &prep.parsed.model;
-        let shape = (m.n_eta, m.n_kappa);
-        let (r, legs) = with_verify_leg(true, || {
-            optimize_population(m, &prep.population, &prep.init_params, &opts)
-        });
-        (shape, r, legs)
-    };
-
-    let pooled = crate::api::prepare_run(
+fn a_fit_without_random_effects_still_takes_the_verify_leg() {
+    let prep = crate::api::prepare_run(
         "examples/one_cpt_iv_pooled.ferx",
         Some("data/one_cpt_iv.csv"),
     )
     .expect("prepares");
-    let (shape, r, legs) = fit(pooled);
-    assert_eq!(shape, (0, 0), "fixture: no random effects");
+    let m = &prep.parsed.model;
+    assert_eq!((m.n_eta, m.n_kappa), (0, 0), "fixture: no random effects");
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    let (r, legs) = with_verify_leg(true, || {
+        optimize_population(m, &prep.population, &prep.init_params, &opts)
+    });
     assert!(r.converged, "{:?}", r.warnings);
-    assert!(legs.is_empty(), "no random effects, no leg: {legs:?}");
-
-    // `warfarin_iov` with its three `omega`s and their `ETA`s removed: IOV alone.
-    let text = std::fs::read_to_string("examples/warfarin_iov.ferx").expect("model");
-    let edited = text
-        .replace("  omega ETA_CL ~ 0.09\n", "")
-        .replace("  omega ETA_V  ~ 0.04\n", "")
-        .replace("  omega ETA_KA ~ 0.30\n", "")
-        .replace("exp(ETA_CL + KAPPA_CL)", "exp(KAPPA_CL)")
-        .replace("TVV  * exp(ETA_V)", "TVV")
-        .replace("TVKA * exp(ETA_KA)", "TVKA");
-    assert!(!edited.contains("ETA_"), "fixture moved");
-    let path = std::env::temp_dir().join(format!(
-        "ferx_2763_iov_only_{}_{:?}.ferx",
-        std::process::id(),
-        std::thread::current().id()
-    ));
-    std::fs::write(&path, edited).expect("writes the fixture");
-    let iov = crate::api::prepare_run(
-        path.to_str().expect("utf-8 path"),
-        Some("data/warfarin_iov.csv"),
-    );
-    let _ = std::fs::remove_file(&path);
-    let (shape, r, legs) = fit(iov.expect("prepares"));
-    assert_eq!(shape, (0, 1), "fixture: one kappa, no eta");
-    eprintln!(
-        "IOV only: converged {}, ofv {}, leg gains {:?}",
-        r.converged,
-        r.ofv,
-        legs.iter().map(|l| l.gain).collect::<Vec<_>>()
-    );
-    assert!(!legs.is_empty(), "a kappa alone keeps the leg");
+    assert!(!legs.is_empty(), "no random effects still takes the leg");
 }
 
 /// #2462, the stuck side. From (TVE0, EMAX, ET50) = (60, 6, 3.2), A2's unprofiled fit

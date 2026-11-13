@@ -2239,8 +2239,7 @@ fn stagnation_window(n: usize, short_window: bool) -> usize {
 /// Only the quadrature objectives (Laplace, FOCEI with `n_agq > 1`) do: they stop on
 /// objective change and step size, like BOBYQA, where FOCE/FOCEI get unreachable `1e-12`
 /// stops and rely on the gradient norm, the stagnation guard and the #2462 verification
-/// legs (with random effects only: `unprofiled_verify_applies`). Their gradient is exact
-/// now, so this is a cost/accuracy choice (see the stop
+/// legs. Their gradient is exact now, so this is a cost/accuracy choice (see the stop
 /// setting in `optimize_nlopt_attempt` for the measurement), not a noise floor. One predicate, read both where the tolerances are set and by
 /// [`use_short_stagnation_window`], so the two cannot drift apart.
 fn gradient_run_has_reachable_stops(options: &FitOptions) -> bool {
@@ -6014,10 +6013,9 @@ pub(crate) fn bobyqa_stop_needs_polish(
 /// stop takes the same #1782 polish legs from the best point at the `POLISH_*` tolerances,
 /// with the last leg's stop deciding `converged`. So does a quadrature gradient run's bare
 /// `Failure` or `RoundoffLimited` — a line search that found no decrease, which FOCE/FOCEI's
-/// #2462 verification legs catch (on a model with random effects; with none there is no
-/// inner solve to tighten, `unprofiled_verify_applies`) and the quadrature has none for:
-/// from one perturbed start `pk2_big` Laplace ended on one at −3446.13 and the plateau check
-/// called it converged, 39 OFV above the optimum. The caller polishes either only where a gain is predicted (the BHHH
+/// #2462 verification legs catch and the quadrature has none for: from one perturbed start
+/// `pk2_big` Laplace ended on one at −3446.13 and the plateau check called it converged, 39 OFV
+/// above the optimum. The caller polishes either only where a gain is predicted (the BHHH
 /// decrement). A latched, spent, forced or cancelled stop is never polished; for BOBYQA only
 /// its tolerance stops are, as before.
 pub(crate) fn tolerance_stop_needs_polish(
@@ -6236,27 +6234,15 @@ pub(crate) const UNPROFILED_VERIFY_GAIN: f64 = 3e-5;
 /// stops are bare `Failure`s the plateau rule accepts or tolerance stops met mid-descent.
 /// Not a quadrature objective, which has reachable stops
 /// (`gradient_run_has_reachable_stops`) and its own noise floor, and not a mixture, whose
-/// objective is a different solve. And not a model with no random effects
-/// (`n_random_effects = n_eta + n_kappa = 0`, #2763). The leg exists to tighten the inner
-/// tolerance, and with no inner solve there is nothing to tighten. It also restarts the
-/// optimizer from the best point with the stagnation guard off, which could in principle
-/// move a stop on its own; measured, it did not. On every bundled such model
-/// (`one_cpt_iv_pooled`, `binary_logistic`, `ctmm_2state`, `mctmm_3state`,
-/// `nonmem_anchor/pktte_tdep_fit.ferx` with its hazard θ free) the leg gained 0 OFV (3.4e-13
-/// on `ctmm_2state`), and without it each fit stops `converged` at the same OFV. In review
-/// 17 such fits, far starts and default ODE tolerances included (`two_cpt_iv` and `mm_iv`
-/// pooled, `pktte_tdep` with all six θ free), gave the same OFV and the same `converged`
-/// verdict with and without the leg.
+/// objective is a different solve.
 pub(crate) fn unprofiled_verify_applies(
     algo: nlopt::Algorithm,
     reachable_stops: bool,
     is_mixture: bool,
-    n_random_effects: usize,
 ) -> bool {
     matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp)
         && !reachable_stops
         && !is_mixture
-        && n_random_effects > 0
 }
 
 /// Does a stop need a verification leg before it may be called converged (#2462)? Every
@@ -7061,7 +7047,6 @@ fn optimize_nlopt_attempt_probed(
             algo,
             gradient_run_has_reachable_stops(options),
             init_params.mixture.is_some(),
-            model.n_eta + model.n_kappa,
         );
     let leg_options = FitOptions {
         inner_tol: options.inner_tol.min(UNPROFILED_VERIFY_INNER_TOL),
