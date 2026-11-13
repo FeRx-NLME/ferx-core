@@ -9960,6 +9960,11 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
         state.cached_etas, cold_modes,
         "warm starts are the cold solve's η then κ"
     );
+    assert_eq!(
+        state.cached_etas_kind,
+        PrevEtas::Solved,
+        "the cold solve's modes are a solve's output, an exactly-zero one included (#2688)"
+    );
     assert!(
         state.pred_jac.is_none(),
         "the warm modes' response goes with them"
@@ -10844,6 +10849,48 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
         "rejected start: the zero fill was restored as a solve's modes, so later evaluations \
          skipped their cold multi-start ({ms_informed} multi-starts in {solves} solves)"
     );
+}
+
+/// `restart_from_modes` is the one place a cold incumbent's and a verification leg's held
+/// modes enter the cache, and it has to label them: `Solved` with the modes, or an
+/// exactly-zero one among them is multi-started at the next evaluation while the nonzero
+/// ones are warm (#2691 review row 3). Without modes, or with a count that is not one per
+/// subject, the start is the cold placeholder and must say so, or the next evaluation
+/// skips the multi-start a cold start owes.
+#[test]
+fn a_restart_from_held_modes_labels_the_cache() {
+    let xs = vec![0.1, 0.2, 0.3];
+    let state_with_a_solved_cache = || {
+        let mut state = new_nlopt_state(2, 2, &xs, SalvageGuardPolicy::Off);
+        state.cached_etas = vec![DVector::from_element(2, 0.3); 2];
+        state.cached_etas_kind = PrevEtas::Solved;
+        state
+    };
+    // Subject 1's held mode is exactly zero: the case the label exists for.
+    let held = vec![DVector::from_element(2, -0.5), DVector::zeros(2)];
+
+    let mut state = state_with_a_solved_cache();
+    state.restart_from_modes(Some(held.clone()));
+    assert_eq!(state.cached_etas, held);
+    assert_eq!(state.cached_etas_kind, PrevEtas::Solved);
+
+    for (label, modes) in [
+        ("none", None),
+        ("one subject short", Some(held[..1].to_vec())),
+    ] {
+        let mut state = state_with_a_solved_cache();
+        state.restart_from_modes(modes);
+        assert!(
+            state
+                .cached_etas
+                .iter()
+                .all(|e| e.iter().all(|&v| v == 0.0)),
+            "{label}: a cold start is the zero placeholder, got {:?}",
+            state.cached_etas
+        );
+        assert_eq!(state.cached_etas.len(), 2, "{label}: one start per subject");
+        assert_eq!(state.cached_etas_kind, PrevEtas::Placeholder, "{label}");
+    }
 }
 
 /// A final solve seeded from modes an earlier pass returned ([`best_final_candidate`]'s, the

@@ -1927,6 +1927,19 @@ impl NloptState {
         self.pred_anchor.clear();
         self.seed_hessians = None;
     }
+
+    /// [`Self::reset_to_cold_start`], then `modes` as the next evaluation's warm starts when
+    /// there is one per subject: a cold incumbent's or a verification leg's held modes. They
+    /// are a solve's output, so the cache is [`PrevEtas::Solved`] and an exactly-zero mode
+    /// among them is warm like the rest (#2688). With `None`, or a count that does not match,
+    /// the start stays cold.
+    fn restart_from_modes(&mut self, modes: Option<Vec<DVector<f64>>>) {
+        self.reset_to_cold_start();
+        if let Some(modes) = modes.filter(|m| m.len() == self.cached_etas.len()) {
+            self.cached_etas = modes;
+            self.cached_etas_kind = PrevEtas::Solved;
+        }
+    }
 }
 
 /// Latches `stagnation_stopped` once recent evals show no OFV progress.
@@ -3624,12 +3637,11 @@ fn absorb_cold_incumbent(
     model: &CompiledModel,
     solve: IncumbentSolve,
 ) {
-    state.reset_to_cold_start();
-    let modes = outer_cache_warm_starts(model, &solve.etas, &solve.kappas);
-    if modes.len() == state.cached_etas.len() {
-        state.cached_etas = modes;
-        state.cached_etas_kind = PrevEtas::Solved;
-    }
+    state.restart_from_modes(Some(outer_cache_warm_starts(
+        model,
+        &solve.etas,
+        &solve.kappas,
+    )));
     if ofv < state.best_ofv {
         state.best_ofv = ofv;
     }
@@ -8196,11 +8208,7 @@ fn optimize_nlopt_attempt_probed(
             // cold solve's modes the same way, so that leg's first evaluation is a warm
             // re-solve of them and a subject the cold solve left unconverged is not what
             // the guard judges (#2645).
-            state.reset_to_cold_start();
-            if let Some(modes) = held.filter(|m| m.len() == state.cached_etas.len()) {
-                state.cached_etas = modes;
-                state.cached_etas_kind = PrevEtas::Solved;
-            }
+            state.restart_from_modes(held);
             *leg_best.borrow_mut() = BestPoint::new();
             leg_first.set(None);
             let mut leg = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
