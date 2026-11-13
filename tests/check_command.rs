@@ -1337,7 +1337,11 @@ fn an_eval_only_theta_start_outside_its_range_warns_from_both_check_and_fit() {
         .find(|d| d.code == "W_THETA_INIT_OUTSIDE_BOUNDS")
         .unwrap_or_else(|| panic!("code absent: {:?}", report.diagnostics));
     assert_eq!(d.block.as_deref(), Some("parameters"));
-    assert!(d.suggestion.is_some());
+    assert_eq!(
+        d.suggestion.as_deref(),
+        Some("move TVCL's initial estimate inside (1e-3, 2e-1), or widen the declared range"),
+        "the help line `ferx check` prints under the warning"
+    );
     assert!(
         !report
             .diagnostics

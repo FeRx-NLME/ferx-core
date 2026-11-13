@@ -406,8 +406,10 @@ causes are:
   ordinary declaration of a small parameter, with its own lower bound below its
   own upper — packs to a lower of $-23.03$ against an upper of $-25.33$.
 
-This is the one start-side check with **no `maxiter = 0` exemption**. The others
-are exempt because a clamped start does not stick without a search; an empty box
+This is the one start-side **error** that is raised at `maxiter = 0` too. The
+other errors are not raised there, because a clamped start does not stick
+without a search (a `theta` outside its declared range becomes a warning
+instead, see below); an empty box
 is not clamped at all — `clamp_to_bounds()` cannot clamp into an interval that
 does not exist — and an evaluation-only run clamps too, so exempting it would
 leave the aborting case unreported. The remedy is to rescale the parameter (fit
@@ -430,7 +432,10 @@ Three things the comparison deliberately does not do:
   clamped value through a search, and that stickiness is what the errors are
   about. The clamp still decides the one number such a run reports, so a
   `theta` outside its **declared** range is reported there as a warning,
-  `W_THETA_INIT_OUTSIDE_BOUNDS`: `theta TVCL(0.5, 0.001, 0.2)` at `maxiter = 0`
+  `W_THETA_INIT_OUTSIDE_BOUNDS`. "Evaluation-only" means `maxiter = 0` under
+  `foce`, `focei`, `laplace` or `gn`; `saem`, `imp`, `impmap`, `bayes`, `vi` and
+  `gn_hybrid` search whatever `maxiter` says and keep the error.
+  `theta TVCL(0.5, 0.001, 0.2)` at `maxiter = 0`
   is scored at `0.2`, and on `examples/warfarin.ferx` that is an OFV of
   $-200.2526$ where the declared `0.5` scores $2544.1094$ (measured on macOS
   arm64). The message names

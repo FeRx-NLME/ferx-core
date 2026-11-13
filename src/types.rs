@@ -11291,6 +11291,29 @@ pub enum HessianAnchor {
 }
 
 impl EstimationMethod {
+    /// Whether this estimator reads `outer_maxiter = 0` as NONMEM `MAXEVAL=0`: one
+    /// objective evaluation at the initial estimates and no search.
+    ///
+    /// Those are the stages `fit()` routes through `optimize_population` (FOCE, FOCEI,
+    /// Laplace, which short-circuits to `evaluate_at_initial_params`) and pure
+    /// Gauss–Newton, whose loop runs `1..=maxiter`. Not SAEM, IMP, IMPMAP, Bayes or VI,
+    /// which carry their own iteration counts, nor the Gauss–Newton hybrid, whose FOCEI
+    /// polish runs a fixed budget whatever `maxiter` says.
+    ///
+    /// The one membership list behind [`FitOptions::evaluation_only_run`] and the
+    /// start-side checks' "does a search run" gate (`api::validation::outer_search_runs`).
+    /// They were two lists, and the second one missed VI and the hybrid (#2865 review).
+    /// An allow-list, so a new estimator counts as searching until it is added here.
+    pub(crate) fn evaluates_at_maxiter_zero(self) -> bool {
+        matches!(
+            self,
+            EstimationMethod::Foce
+                | EstimationMethod::FoceI
+                | EstimationMethod::FoceGn
+                | EstimationMethod::Laplace
+        )
+    }
+
     /// Whether this method's objective is an integral over the random effects, so
     /// `n_eta = 0` leaves it nothing to integrate (#1050). The single membership
     /// rule for the "requires at least one random effect" family:
@@ -11603,15 +11626,7 @@ impl FitOptions {
     pub(crate) fn evaluation_only_run(&self) -> bool {
         let eval_only = self.eval_only_methods();
         self.method_chain().iter().all(|m| {
-            eval_only.contains(m)
-                || (self.outer_maxiter == 0
-                    && matches!(
-                        m,
-                        EstimationMethod::Foce
-                            | EstimationMethod::FoceI
-                            | EstimationMethod::FoceGn
-                            | EstimationMethod::Laplace
-                    ))
+            eval_only.contains(m) || (self.outer_maxiter == 0 && m.evaluates_at_maxiter_zero())
         })
     }
 

@@ -1954,6 +1954,13 @@ fn the_eval_only_warning_says_when_the_value_scored_is_not_the_declared_bound() 
         "{floor}"
     );
     assert!(floor.contains(&format!(" 1e-10 {STAND_IN}")), "{floor}");
+    // The remedy's second half names the value scored, not the declared bound:
+    // declaring `0` as the start would be scored at `1e-10` again.
+    assert!(
+        floor.contains("to score 1e-10, declare that as the start."),
+        "{floor}"
+    );
+    assert!(!floor.contains("to score 0e0"), "{floor}");
 
     // Declared upper of 1e12: scored at the cap.
     let cap = only_message(&eval_only_diags("theta TVCL(1e13, 0.001, 1e12)"));
@@ -1966,6 +1973,11 @@ fn the_eval_only_warning_says_when_the_value_scored_is_not_the_declared_bound() 
         "{cap}"
     );
     assert!(cap.contains(&format!(" 1e9 {STAND_IN}")), "{cap}");
+    assert!(
+        cap.contains("to score 1e9, declare that as the start."),
+        "{cap}"
+    );
+    assert!(!cap.contains("to score 1e12"), "{cap}");
 
     // The ordinary case: the value scored *is* the declared bound.
     let plain = only_message(&eval_only_diags("theta TVCL(0.5, 0.001, 0.2)"));
@@ -2029,29 +2041,140 @@ fn the_eval_only_warning_is_silent_where_nothing_is_moved() {
 
 /// Regression: reading "`maxiter = 0`" as "nothing searches".
 ///
-/// `saem`, `imp`, `impmap` and `bayes` carry their own iteration counts, so
-/// under them a start outside its range is held through a search at
+/// `saem`, `imp`, `impmap`, `bayes` and `vi` carry their own iteration counts,
+/// and the Gauss–Newton hybrid's FOCEI polish runs a fixed budget, so under
+/// each of them a start outside its range is held through a search at
 /// `maxiter = 0` too. They keep the refusal; the warning's "does not search"
-/// would be false there.
+/// would be false there. The first version of the gate listed four of the six
+/// by hand and warned on `vi` and `gn_hybrid`: on warfarin `gn_hybrid` ended
+/// at TVCL 0.1327 under a warning saying the estimates were those of 0.2
+/// (#2865 review, row 1).
+///
+/// Both sides in one test: the four estimators that read `maxiter = 0` as
+/// `MAXEVAL=0` warn, the six that search refuse, and a chain refuses as soon
+/// as one of its stages searches.
 #[test]
 fn a_stage_that_searches_at_maxiter_zero_is_still_refused() {
+    use EstimationMethod::*;
     let model = model_with_parameters(&params_with_theta("theta TVCL(0.5, 0.001, 0.2)"));
-    for method in [
-        EstimationMethod::Saem,
-        EstimationMethod::Imp,
-        EstimationMethod::Impmap,
-        EstimationMethod::Bayes,
-    ] {
+    let codes = |methods: &[EstimationMethod]| {
         let opts = FitOptions {
-            method,
+            method: methods[methods.len() - 1],
+            methods: if methods.len() > 1 {
+                methods.to_vec()
+            } else {
+                Vec::new()
+            },
             ..eval_only()
         };
-        let d = check_packed_start_in_box(&model.default_params, &opts);
+        check_packed_start_in_box(&model.default_params, &opts)
+            .iter()
+            .map(|x| x.code.clone())
+            .collect::<Vec<_>>()
+    };
+    for method in [Saem, Imp, Impmap, Bayes, Vi, FoceGnHybrid] {
         assert_eq!(
-            d.iter().map(|x| x.code.as_str()).collect::<Vec<_>>(),
+            codes(&[method]),
             ["E_THETA_INIT_OUTSIDE_BOUNDS"],
-            "{method:?} searches at maxiter = 0: {d:#?}"
+            "{method:?} searches at maxiter = 0"
         );
+    }
+    for method in [Foce, FoceI, FoceGn, Laplace] {
+        assert_eq!(
+            codes(&[method]),
+            ["W_THETA_INIT_OUTSIDE_BOUNDS"],
+            "{method:?} evaluates once at maxiter = 0"
+        );
+    }
+    assert_eq!(
+        codes(&[FoceGnHybrid, FoceI]),
+        ["E_THETA_INIT_OUTSIDE_BOUNDS"],
+        "one searching stage is enough"
+    );
+    assert_eq!(
+        codes(&[Foce, FoceI]),
+        ["W_THETA_INIT_OUTSIDE_BOUNDS"],
+        "a chain of evaluators is still an evaluation"
+    );
+}
+
+/// Regression: advising a widening that does not score the declared start, in
+/// the message or in the help line (#2865 review, rows 2 and 3).
+///
+/// "Widen the range to include it" is true only if ferx can hold the number
+/// once the range admits it. Following that advice on
+/// `theta TVCL(1e13, 0.001, 1e12)` gives `theta TVCL(1e13, 0.001, 1e14)`, which
+/// is in range, unreported at `maxiter = 0`, and scored at `1e9`.
+///
+/// Both sides of the gate, in one test. Each side asserts its own sentence and
+/// the absence of the other's, in the message and in the help line.
+#[test]
+fn the_eval_only_warning_offers_a_widening_only_where_it_scores_the_start() {
+    let one = |line: &str| {
+        let d = eval_only_diags(line);
+        assert_eq!(d.len(), 1, "`{line}`: {d:#?}");
+        (
+            d[0].message.clone(),
+            d[0].suggestion.clone().expect("a help line"),
+        )
+    };
+    const NO: &str = "cannot be scored while the lower bound is 0 or more: such a theta is \
+                      held on the log scale, between 1e-10 and 1e9;";
+
+    // Widening works: an ordinary start, a negative start under a lower bound
+    // of 0 (admitting it selects identity packing), and an identity-packed
+    // theta above the cap.
+    for (line, value, help) in [
+        (
+            "theta TVCL(0.5, 0.001, 0.2)",
+            "5e-1",
+            "move TVCL's initial estimate inside (1e-3, 2e-1), or widen the declared range",
+        ),
+        (
+            "theta TVCL(-5.0, 0.0, 10.0)",
+            "-5e0",
+            "move TVCL's initial estimate inside (1e-10, 1e1), or widen the declared range",
+        ),
+        (
+            "theta TVCL(1e13, -1.0, 1e12)",
+            "1e13",
+            "move TVCL's initial estimate inside (-1e0, 1e12), or widen the declared range",
+        ),
+    ] {
+        let (msg, got_help) = one(line);
+        assert!(
+            msg.contains(&format!(
+                "To score {value}, widen the declared range to include it;"
+            )),
+            "`{line}`: {msg}"
+        );
+        assert!(!msg.contains("cannot be scored"), "`{line}`: {msg}");
+        assert_eq!(got_help, help, "`{line}`");
+    }
+
+    // Widening does not: above the cap, exactly zero, and below the floor, each
+    // under a lower bound that keeps log packing.
+    for (line, value, help) in [
+        (
+            "theta TVCL(1e13, 0.001, 1e12)",
+            "1e13",
+            "move TVCL's initial estimate inside (1e-3, 1e9)",
+        ),
+        (
+            "theta TVCL(0.0, 0.1, 10.0)",
+            "0e0",
+            "move TVCL's initial estimate inside (1e-1, 1e1)",
+        ),
+        (
+            "theta TVCL(1e-12, 0.1, 10.0)",
+            "1e-12",
+            "move TVCL's initial estimate inside (1e-1, 1e1)",
+        ),
+    ] {
+        let (msg, got_help) = one(line);
+        assert!(msg.contains(&format!("{value} {NO}")), "`{line}`: {msg}");
+        assert!(!msg.contains("widen"), "`{line}`: {msg}");
+        assert_eq!(got_help, help, "`{line}`");
     }
 }
 

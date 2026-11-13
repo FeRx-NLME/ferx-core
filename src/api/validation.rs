@@ -8090,19 +8090,26 @@ fn residual_correlation_inert(model: &CompiledModel, population: &Population) ->
     )]
 }
 
+/// Whether any stage of the run searches, so a start clamped into its box is **held**
+/// there rather than scored once.
+///
+/// `maxiter > 0` always searches. At `maxiter = 0` a stage searches unless its estimator
+/// reads that as `MAXEVAL=0` (`EstimationMethod::evaluates_at_maxiter_zero`, the engine's
+/// own list). The list used to be spelled here, as saem / imp / impmap / bayes, and so
+/// missed `vi` and `gn_hybrid`: both search at `maxiter = 0`, and both were treated as
+/// evaluation-only by every start-side check (#2865 review).
+///
+/// Not `!FitOptions::evaluation_only_run()`: that also counts a standalone
+/// `imp_eval_only` / `agq_eval_only` run as evaluation-only at any `maxiter`, and the
+/// start-side checks have never exempted those.
 fn outer_search_runs(options: &FitOptions) -> bool {
     if options.outer_maxiter > 0 {
         return true;
     }
-    options.method_chain().iter().any(|m| {
-        matches!(
-            m,
-            EstimationMethod::Saem
-                | EstimationMethod::Imp
-                | EstimationMethod::Impmap
-                | EstimationMethod::Bayes
-        )
-    })
+    options
+        .method_chain()
+        .iter()
+        .any(|m| !m.evaluates_at_maxiter_zero())
 }
 
 /// Which declaration a flagged variance coordinate came from — the keyword the
@@ -8764,7 +8771,7 @@ const THETA_START_EVAL_ONLY_TOKEN: &str = "W_THETA_INIT_OUTSIDE_BOUNDS";
 /// |---|---|---|
 /// | any coordinate whose box is **empty** (`lower > upper`) | either | **error**, and not exempt at `maxiter = 0` |
 /// | any coordinate the **packer itself** altered (#1307) | ferx's | warning, and not exempt at `maxiter = 0` |
-/// | θ strictly outside its **declared** lower / upper | the user's | **error** |
+/// | θ strictly outside its **declared** lower / upper | the user's | **error** when a search runs; warning `W_THETA_INIT_OUTSIDE_BOUNDS` on an evaluation-only run (#2865) |
 /// | θ above the hidden `1e9` cap | ferx's | warning |
 /// | Ω / Ω_IOV / mixture-Ω **diagonal**, below `−6` | ferx's | *not reported here* — [`check_variance_init_rails`] owns it, as an error (#1229) |
 /// | Ω / Ω_IOV / mixture-Ω **diagonal**, above `+6` | ferx's | warning |
@@ -9184,6 +9191,37 @@ pub(crate) fn check_packed_start_in_box(
             } else {
                 String::new()
             };
+            // "Widen the range" only scores the declared start if ferx can hold
+            // that number once the range admits it. A negative start can always be
+            // held: admitting it makes the lower bound negative, which selects
+            // identity packing. A start of 0, or one outside
+            // `[LOG_PACK_FLOOR, THETA_PACK_CEIL]`, cannot be held under log packing:
+            // `theta TVCL(1e13, 0.001, 1e14)` is in range, unreported at
+            // `maxiter = 0`, and scored at `1e9` (#2865 review). So the advice is
+            // gated, and the other branch says why there is nothing to widen to.
+            let lower = init_params.theta_lower[hit.index];
+            let widening_scores_it = !crate::estimation::parameterization::theta_packs_log(lower)
+                || hit.value < 0.0
+                || (LOG_PACK_FLOOR..=THETA_PACK_CEIL).contains(&hit.value);
+            let score_declared = if widening_scores_it {
+                format!(
+                    "To score {:e}, widen the declared range to include it;",
+                    hit.value
+                )
+            } else {
+                format!(
+                    "{:e} cannot be scored while the lower bound is 0 or more: such a theta is \
+                     held on the log scale, between {LOG_PACK_FLOOR:e} and {THETA_PACK_CEIL:e};",
+                    hit.value
+                )
+            };
+            // The help line follows the same gate: it must not offer the widening
+            // the message has just ruled out.
+            let suggestion = if widening_scores_it {
+                suggestion
+            } else {
+                format!("move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e})")
+            };
             diags.push(
                 Diagnostic::warning(
                     THETA_START_EVAL_ONLY_TOKEN,
@@ -9193,10 +9231,9 @@ pub(crate) fn check_packed_start_in_box(
                          evaluates the objective once and does not search (`maxiter = 0`), and \
                          the start is clamped into its box first, so the OFV and every \
                          prediction and estimate reported are those of {name} = {effective:e}, \
-                         not of the declared {value:e}.{stand_in} To score {value:e}, widen the \
-                         declared range to include it; to score {effective:e}, declare that as \
-                         the start. A run that searches refuses this declaration with \
-                         E_THETA_INIT_OUTSIDE_BOUNDS.",
+                         not of the declared {value:e}.{stand_in} {score_declared} to score \
+                         {effective:e}, declare that as the start. A run that searches refuses \
+                         this declaration with E_THETA_INIT_OUTSIDE_BOUNDS.",
                         value = hit.value,
                         bound = hit.bound,
                         side = hit.side.direction(),

@@ -1212,8 +1212,9 @@ Two things are deliberately outside the check. **Sigma**: a free
 optimum, so it is not rejected. **Runs where nothing searches**: with
 `maxiter = 0` (NONMEM `MAXEVAL=0`) a zero variance is accepted — which is what
 lets `ferx gam --no-fit`, and any evaluation at fixed parameters, keep working.
-`saem`, `imp`, `impmap` and `bayes` carry their own iteration counts and are
-checked regardless of `maxiter`.
+`saem`, `imp`, `impmap`, `bayes` and `vi` carry their own iteration counts, and
+`gn_hybrid` runs a fixed polish budget, so all six are checked regardless of
+`maxiter`.
 
 ::: {.callout-warning}
 ## `maxiter = 0` still clamps the start
