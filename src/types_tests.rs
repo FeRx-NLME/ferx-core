@@ -1620,7 +1620,8 @@ fn classify_warning_roundtrips_every_engine_message() {
             "mu_referencing",
         ),
         (
-            "Multi-start: best result from start 3/8",
+            "Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 3); \
+             all 8 converged starts within 1.0 of best (range 0.0000)",
             Info,
             "multi_start",
         ),
@@ -4728,11 +4729,22 @@ fn multi_start_notes_classify_info_whatever_error_text_they_carry() {
             );
         }
     }
-    let best = classify_warning("Multi-start: best result from start 2/4 (OFV = 123.4560)");
-    assert_eq!(
-        (best.severity, best.category),
-        (WarningSeverity::Info, WarningCode::MultiStart)
-    );
+    // #2867: the summary line says "not converged" of the starts that were not returned, and
+    // stays informational for the same reason.
+    for msg in [
+        "Multi-start: 4 starts, 4 converged; best OFV 123.4560 (start 2); \
+         all 4 converged starts within 1.0 of best (range 0.0000)",
+        "Multi-start: 4 starts, 2 converged, 2 not converged; best OFV 123.4560 (start 2); \
+         all 2 converged starts within 1.0 of best (range 0.0000); \
+         1 not converged at a lower OFV: start 3 (-3.21)",
+    ] {
+        let best = classify_warning(msg);
+        assert_eq!(
+            (best.severity, best.category),
+            (WarningSeverity::Info, WarningCode::MultiStart),
+            "{msg}"
+        );
+    }
     // The no-run-converged note is a real verdict on the returned run and keeps its class.
     let none = classify_warning(
         "No multi-start run converged (4 starts); returning best OFV from start 2",

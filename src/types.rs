@@ -8995,6 +8995,11 @@ pub struct FitResult {
     /// `n_starts == 1` (no perturbation applied) or when no seed was set and
     /// the run used a random seed derived from the system clock.
     pub multi_start_seed: Option<u64>,
+    /// What each start of a multi-start fit did (#2867): one [`StartRecord`] per start, in
+    /// start order, exactly one of them `selected`. Empty when `n_starts == 1`. The other
+    /// starts' full results are not kept; these rows are what remains of them.
+    #[serde(default)]
+    pub starts: Vec<StartRecord>,
     /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
     /// when no explicit seed was set in `[fit_options]`.
     pub saem_seed: Option<u64>,
@@ -12354,6 +12359,12 @@ pub struct ParsedModel {
 #[path = "types_fit_status.rs"]
 mod fit_status;
 pub use fit_status::{FitStatus, StatusReason};
+
+// #2867: what each start of a multi-start fit did, and the summary of their spread.
+#[path = "types_multi_start.rs"]
+mod multi_start;
+pub use multi_start::StartRecord;
+pub(crate) use multi_start::{StartSpread, START_AGREE_OFV};
 
 /// Factories that build minimal `CompiledModel` instances for unit tests.
 /// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests

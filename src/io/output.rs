@@ -3202,6 +3202,72 @@ fn write_yaml_warning_details(
     f.write_all(out.as_bytes()).map_err(|e| e.to_string())
 }
 
+/// The `multi_start:` block (#2867): the spread of a multi-start fit's starts and one row
+/// per start, from [`FitResult::starts`]. Empty for a fit with no rows (`n_starts = 1`), so
+/// a single-start YAML is unchanged. Rows are flow maps; strings are JSON-quoted.
+pub(crate) fn multi_start_yaml(result: &FitResult) -> Result<String, String> {
+    use std::fmt::Write;
+    if result.starts.is_empty() {
+        return Ok(String::new());
+    }
+    fn json<T: serde::Serialize + ?Sized>(v: &T) -> Result<String, String> {
+        serde_json::to_string(v).map_err(|e| e.to_string())
+    }
+    let opt = |v: Option<f64>| v.map_or("null".to_string(), |v| format!("{v:.6}"));
+    let spread = crate::types::StartSpread::of(&result.starts);
+    let mut out = String::from("\nmulti_start:\n");
+    let _ = writeln!(out, "  n_starts: {}", spread.n_starts);
+    if let Some(seed) = result.multi_start_seed {
+        let _ = writeln!(out, "  seed: {seed}");
+    }
+    if let Some((k, _)) = spread.selected {
+        let _ = writeln!(out, "  selected_start: {k}");
+    }
+    let _ = writeln!(out, "  n_converged: {}", spread.n_converged);
+    let _ = writeln!(out, "  n_not_converged: {}", spread.n_not_converged);
+    let _ = writeln!(out, "  n_failed: {}", spread.n_failed);
+    // What `best`, `range` and the count are measured on: the value that ranked the starts.
+    let compared = if spread.penalized {
+        "penalized_objective"
+    } else {
+        "ofv"
+    };
+    let _ = writeln!(out, "  compared: {compared}");
+    let _ = writeln!(out, "  best: {}", opt(spread.best));
+    let _ = writeln!(out, "  agree_within: {:.1}", crate::types::START_AGREE_OFV);
+    let _ = writeln!(out, "  n_compared: {}", spread.n_compared);
+    let _ = writeln!(out, "  n_within: {}", spread.n_within);
+    let _ = writeln!(out, "  range: {}", opt(spread.range));
+    let _ = writeln!(out, "  starts:");
+    for s in &result.starts {
+        let mut row = format!("start: {}, ofv: {}", s.start, opt(s.ofv));
+        if s.objective.is_some() {
+            let _ = write!(row, ", objective: {}", opt(s.objective));
+        }
+        let status = s.status.as_ref().map_or("failed", |st| st.token());
+        let _ = write!(
+            row,
+            ", converged: {}, status: {status}, n_iterations: {}, wall_time_secs: {:.6}, \
+             selected: {}",
+            s.converged, s.n_iterations, s.wall_time_secs, s.selected
+        );
+        let theta: Vec<String> = s
+            .theta
+            .iter()
+            .map(|v| opt(Some(*v).filter(|v| v.is_finite())))
+            .collect();
+        let _ = write!(row, ", theta: [{}]", theta.join(", "));
+        if let Some(e) = &s.error {
+            let _ = write!(row, ", error: {}", json(e)?);
+        }
+        if let Some(c) = &s.error_code {
+            let _ = write!(row, ", error_code: {}", json(c)?);
+        }
+        let _ = writeln!(out, "    - {{{row}}}");
+    }
+    Ok(out)
+}
+
 pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String> {
     use std::io::Write;
 
@@ -4105,6 +4171,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    f.write_all(multi_start_yaml(result)?.as_bytes())
+        .map_err(|e| e.to_string())?;
+
     // Covariance matrix block (optimizer parameterization).
     // Emitted when the covariance step succeeded or was regularized, giving
     // downstream tools (bootstrap, SIR, uncertainty propagation) the full
@@ -4533,6 +4602,7 @@ mod tests {
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
+            starts: Vec::new(),
             saem_seed: None,
             sir_seed: None,
             sir_settings: None,
@@ -6057,6 +6127,7 @@ mod tests {
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
+            starts: Vec::new(),
             saem_seed: None,
             sir_seed: None,
             sir_settings: None,

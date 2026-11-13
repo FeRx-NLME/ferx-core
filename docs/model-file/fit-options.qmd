@@ -1047,6 +1047,68 @@ warnings.
 
 Multi-start is most useful for models prone to local minima: nonlinear elimination (Michaelis-Menten), full-block omega, or many covariate parameters. On an 8-core machine `n_starts = 8` costs the same wall-clock time as a single run but has ~8× lower probability of a local minimum.
 
+### What the starts did {#multi-start-spread}
+
+Every multi-start fit reports how its starts compare, whichever start wins. The
+[`multi_start`](../warnings.qmd#codes-run) info line reads, for
+`examples/mm_multistart.ferx` as shipped:
+
+```
+Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 6); all 8 converged starts within 1.0 of best (range 0.0000)
+```
+
+and for the same model with `start_sigma = 1.5`:
+
+```
+Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 2); 7 of 8 converged starts within 1.0 of best; 1 converged above it: start 4 (+5.27)
+```
+
+The first says the optimum is stable: start 6 is lower than start 0 by 1e-7 OFV,
+which is not a better optimum. The second says one start stopped somewhere else
+and called itself converged. The returned estimates are the same in both.
+
+| Part of the line | Meaning |
+|---|---|
+| `8 starts, 5 converged, 2 not converged, 1 failed` | Each start is counted once. A failed start returned no result; its error is in the `k of n starts failed` line and in the table below. |
+| `best OFV … (start k)` | The returned start. `(start k, not converged)` when no start converged. Under [`nn_l2` / `nn_smooth`](#covariate-nn-regularization-nn_l2-nn_smooth) it reads `best penalized objective`, because that is the value the starts are ranked on. |
+| `7 of 8 converged starts within 1.0 of best` | The converged starts are compared with the returned one. `range` is the largest distance among them. When no start converged, every start with an OFV is compared instead. |
+| `1 converged above it: start 4 (+5.27)` | The converged starts more than 1.0 above the returned one, with their distance. The first three are named. |
+| `1 not converged at a lower OFV: start 3 (-3.21)` | A converged start is always preferred, so a start that did not converge can have stopped lower than the returned one. |
+| `2 without a usable OFV` | Starts whose OFV is `NaN` or a divergence sentinel. They are left out of the count and the range. |
+| `no OFV to compare (start 0 returned)` | The returned start has no OFV, as for `method = vi` under `vi_final_ofv = none`. |
+
+The cutoff is fixed at 1.0 OFV. It is not tied to a convergence tolerance: in 30
+multi-start fits of the example models, starts that stopped on the same optimum
+were at most 2.3e-6 apart under the gradient optimizers and at most 0.33 under
+`bobyqa`, and the nearest different stop was 5.00 away
+([#2867](https://github.com/FeRx-NLME/ferx-core/issues/2867)). For any other
+cutoff, read the table.
+
+A converged start far above the best is reported at `Info` severity and does not
+change the [fit status](../output.qmd#fit-status). It describes the objective
+surface and the width of the perturbation, not the returned fit. It occurred in
+12 of those 30 fits, none of them at `start_sigma` ≤ 0.5 on a model without a
+covariate network.
+
+The per-start table is `FitResult.starts`, one row per start in start order
+(empty when `n_starts = 1`):
+
+| Field | Meaning |
+|---|---|
+| `start` | Start index. `0` is the model file's initial values. |
+| `ofv` | The start's reported OFV. Absent for a failed start and for a non-finite OFV. |
+| `objective` | The penalized objective the start was ranked on. Present only under `nn_l2` / `nn_smooth`. |
+| `converged`, `status` | The start's own `converged` and [fit status](../output.qmd#fit-status). |
+| `n_iterations`, `wall_time_secs` | Of this start alone. The starts run in parallel, so the times do not add up to the fit's. |
+| `theta` | The start's final θ, so two optima can be told apart without a refit. |
+| `selected` | `true` on the returned start. |
+| `error`, `error_code` | A failed start's message, and its [error code](../warnings.qmd#fit-error-codes) when it has one. |
+
+The same rows are written to the fit YAML's
+[`multi_start:` block](../output.qmd#multi-start-block), the fit JSON and the
+`.fitrx` bundle. Only these rows are kept; the other starts' full results are
+dropped.
+
 ## Global Search
 
 Setting `global_search = true` runs a gradient-free pre-search (NLopt CRS2-LM) before the local optimizer. This helps escape local minima on challenging datasets.

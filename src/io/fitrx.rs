@@ -340,6 +340,10 @@ struct FitWire {
     n_starts: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     multi_start_seed: Option<u64>,
+    /// The per-start records of a multi-start fit (#2867). Absent for a single-start fit,
+    /// and in a bundle written before the field, which then loads with no rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    starts: Vec<crate::types::StartRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     saem_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1830,6 +1834,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         optimizer: r.optimizer.clone(),
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
+        starts: r.starts.clone(),
         saem_seed: r.saem_seed,
         // `sir_settings.seed` is canonical when SIR ran (#1770): it is the seed the draws
         // used and the one `run_sir` repeats, and the field a caller edits to change a
@@ -3986,6 +3991,7 @@ fn wire_to_fit_result(
         optimizer: w.optimizer,
         n_starts: w.n_starts,
         multi_start_seed: w.multi_start_seed,
+        starts: w.starts,
         saem_seed: w.saem_seed,
         sir_seed: w.sir_seed,
         sir_settings,
@@ -7648,6 +7654,74 @@ mod tests {
             err.to_string(),
             "unsupported .fitrx format_version \"1\"; expected \"2\""
         );
+    }
+
+    /// #2867: the per-start rows of a multi-start fit survive a save and load unchanged —
+    /// a row that ran, one with no OFV, one under a penalty and a failed one with its code —
+    /// and a single-start fit writes no `starts` key, so its `fit.json` is what it was. A
+    /// bundle without the key loads with no rows.
+    #[test]
+    fn the_per_start_rows_round_trip() {
+        use crate::types::{FitStatus, StartRecord, StatusReason};
+        let dir = tempfile::tempdir().unwrap();
+        let single = saved(&dir, &minimal_fit_result());
+        assert!(fit_json(&single).get("starts").is_none());
+        assert!(load_fit(&single).unwrap().fit.starts.is_empty());
+
+        let ran = StartRecord {
+            start: 0,
+            ofv: Some(-221.877048),
+            objective: None,
+            converged: true,
+            status: Some(FitStatus::ConvergedWithIssues {
+                reasons: vec![StatusReason::BudgetSpent],
+            }),
+            n_iterations: 84,
+            wall_time_secs: 1.25,
+            theta: vec![7.4577, 22.1467],
+            selected: true,
+            error: None,
+            error_code: None,
+        };
+        let mut r = minimal_fit_result();
+        r.n_starts = 4;
+        r.starts = vec![
+            ran.clone(),
+            StartRecord {
+                start: 1,
+                ofv: None,
+                status: Some(FitStatus::Converged),
+                selected: false,
+                ..ran.clone()
+            },
+            StartRecord {
+                start: 2,
+                objective: Some(-200.5),
+                converged: false,
+                status: Some(FitStatus::NotConverged {
+                    reasons: Vec::new(),
+                }),
+                selected: false,
+                ..ran.clone()
+            },
+            StartRecord {
+                start: 3,
+                ofv: None,
+                objective: None,
+                converged: false,
+                status: None,
+                n_iterations: 0,
+                wall_time_secs: 0.0,
+                theta: Vec::new(),
+                selected: false,
+                error: Some("n_agq must be at least 1".into()),
+                error_code: Some("E_AGQ_NODES_ZERO".into()),
+            },
+        ];
+        let path = saved(&dir, &r);
+        let json = fit_json(&path);
+        assert_eq!(json["starts"].as_array().map(Vec::len), Some(4));
+        assert_eq!(load_fit(&path).unwrap().fit.starts, r.starts);
     }
 
     /// #2695: no key has a default for a file that predates it. A v2 `fit.json` missing
