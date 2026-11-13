@@ -5847,9 +5847,10 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // Per-decision occasion PK + per-window eta for the IOV path (#701). `Some` ⇒
     // draw-time κ varies by decision window: `decision_pk[g]` is the PK at decision g
     // under occasion g's κ (drives the pre-dose readout, the injected dose's F, and
-    // the LOCF carry into the following segment), and `eta_occ[g]` is the full
+    // the LOCF carry past the subject's last record), and `eta_occ[g]` is the full
     // `[η_bsv | κ_g]` threaded into `read_observable` / `integrate_segment` for every
-    // event in window g. `None` on both ⇒ no IOV, byte-identical to the pre-#701 path
+    // segment a record of occasion g ends — so the window after decision g runs under
+    // κ_{g+1} when a record sits on decision g+1 (#2771). `None` on both ⇒ no IOV, byte-identical to the pre-#701 path
     // (the fixed `eta` is used throughout). IOV implies `event_pk = Some` (κ makes PK
     // per-occasion, so obs / pk-only records carry their occasion snapshot).
     decision_pk: Option<&[PkParams]>,

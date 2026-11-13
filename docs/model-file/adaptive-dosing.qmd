@@ -208,7 +208,8 @@ first decision's PK at. κ is drawn per occasion, so a supplied subject reads κ
 oracle subject reads the κ of the first decision's occasion, the one the driver resolves
 the first dose's attributes under. With a record at the next decision, the disposition
 over the first window follows that record's occasion ([#943](https://github.com/FeRx-NLME/ferx-core/issues/943)), so the
-oracle's κ and the κ its first trough reflects can differ.
+oracle's κ and the κ its first trough reflects can differ
+(see [Which κ a decision window runs under](#window-kappa)).
 
 **The oracle is never silent.** `dose_knowledge = oracle` is a perfect-information
 comparison arm, a standard benchmark in model-informed dosing studies. Each subject
@@ -491,9 +492,12 @@ wins.
 | before the subject's first record | the baseline covariates and the t = 0 parameters |
 | after an observation, EVID=2 or dose row | that row's covariates and parameters |
 | after an EVID=3/4 reset, with no record in between | the reset row's covariates and parameters |
-| on an IOV model | the same record, under the `kappa` of the decision's own window |
+| on an IOV model | the same record, under the κ of the decision's own occasion |
 
 A subject whose covariates never change reads the same values at every decision.
+Under IOV the state a decision reads can have been integrated under a different κ
+than the one the decision reads its parameters under: see
+[Which κ a decision window runs under](#window-kappa).
 
 The state a decision reads (`ctx.state`) follows the rule `predict()` uses: an
 interval is integrated under the record that ends it. A reset row is a record,
@@ -504,6 +508,64 @@ changes what the controller sees before the reset, not any prediction.
 A reset row's own `$PK` is anchored to NONMEM (`reset_init_snapshot_J`). NONMEM
 has no feedback dosing, so the decision rule itself has no NONMEM counterpart. It
 is tested against `predict()` on the realized doses and against closed forms.
+
+### Which κ a decision window runs under {#window-kappa}
+
+On an IOV model the driver draws one κ per decision. Occasion `g` starts at decision
+`g`, and a data record belongs to the occasion of the latest decision at or before its
+time. A record on a decision (within 1e-9) belongs to that decision's occasion.
+
+Between records the driver applies the rule every ferx engine uses, which is also
+NONMEM's: **an interval runs under the record that ends it**
+(see [Occasions](iov.qmd#occasions)). A decision time is not a record, so it ends no
+interval. The piece between a record and the next decision runs under the next record
+ahead. After the subject's last record nothing is ahead, and each window runs under
+its own decision's κ.
+
+So the window from decision `g` to decision `g+1` runs under **κ of the record that
+ends it**. With a record on decision `g+1`, that is the next occasion's κ, not the
+decision's own.
+
+With decisions at 0 and 24 and a dose at 0, the clearance over the first window is:
+
+| Data records at | Clearance over (0, 24] |
+|---|---|
+| 0, 24, 48 | κ₁ throughout |
+| 0, 12, 24 | κ₀ over (0, 12], κ₁ over (12, 24] |
+| 0, 23, 47 | κ₀ over (0, 23], κ₁ over (23, 24], from the record at 47 |
+| 0, 23 | κ₀ throughout: no record follows 23 |
+
+Each row is tested against the clearance backed out of the simulated concentrations
+(`a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece`, #2771).
+The first row is the layout the mrgsolve anchors use: day `g` on occasion `g+1`
+(#943).
+
+**To run a window under its own decision's κ, do not put a record on the next
+decision.** Put the last record of the window just before it (23 instead of 24). The
+piece from that record to the decision still runs under the next record's κ, so keep
+it short. Moving the record has two costs:
+
+- There is no trajectory row at the decision time. The pre-dose value is still in
+  the decision log (`observed_signals`), which is what the controller read.
+- A record also carries the covariates for the interval it ends, so moving it moves
+  where a time-varying covariate changes.
+
+Both layouts agree with `predict()` on the realized doses and the same occasions.
+The choice is about which κ you want a dosing interval to run under.
+
+Some quantities are read at the decision, under the decision's own κ (κ of occasion
+`g` at decision `g`), whatever κ the window's disposition follows:
+
+| Quantity | κ it reads |
+|---|---|
+| The parameters behind the monitored signal (a `V` in `observe = central / V`) | the decision's own |
+| The bioavailability `F` of a dose the controller issues, and the infusion window `F` scales | the decision's own |
+| The lag check on a controller dose (a non-zero lag is refused, see [Current scope and limits](#current-scope-and-limits)) | the decision's own |
+| A `dose_knowledge = oracle` dose | the first decision's, κ₀ ([Which subjects' values are known](#which-subjects-values-are-known)) |
+| The `F` of a pre-scheduled base dose | the occasion at the dose's own time |
+
+A controller infusion carries its own rate, so no modeled `D{n}` or `R{n}` is read
+for it.
 
 ### One controller per subject
 
@@ -1177,10 +1239,10 @@ cannot see a failure in the solver itself.
   straddles a reset carries a node at the state the reset found and one at
   the state it left, so the drop integrates exactly.
 - **Inter-occasion variability (IOV) is supported** — a fresh occasion `kappa` is
-  drawn per **decision window** (occasion = decision index) and threaded through the
-  per-event PK, so occasion-to-occasion shifts in CL/V drive the trajectory, the
-  monitored signal, and every reactive dose; the frozen-replay verifier validates the
-  per-occasion bookkeeping. A **pre-scheduled base regimen** (a loading dose) composes with
+  drawn per **decision** (occasion `g` starts at decision `g`) and threaded through the
+  per-event PK. A window runs under the κ of the record that ends it, see
+  [Which κ a decision window runs under](#window-kappa). The frozen-replay verifier
+  validates the per-occasion bookkeeping. A **pre-scheduled base regimen** (a loading dose) composes with
   IOV (#931): each base dose's `F` resolves under the κ of the occasion active at its
   administration time — see *Pre-scheduled base regimens* above. It also composes with
   time-varying covariates — the
@@ -1190,8 +1252,7 @@ cannot see a failure in the solver itself.
   drawn on a dedicated per-(subject, replicate) substream (disjoint from the η and
   assay streams), so a non-IOV run is unchanged and enabling a `Dv` monitor never
   shifts the draws. `auc_target` reads each segment under the κ it was integrated with
-  (#943), the governing record's: with records only at the decisions, a window carries
-  the **next** window's κ, as its trajectory does.
+  (#943).
   Between-subject η is still drawn per subject/replicate; parameter-uncertainty
   propagation is a later layer.
 - **Deterministic ODE only** — a stochastic (`[diffusion]` / SDE) model is rejected

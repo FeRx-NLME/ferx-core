@@ -406,6 +406,113 @@ fn under_iov_a_supplied_subject_reads_kappa_zero_and_an_oracle_one_the_first_occ
     }
 }
 
+/// The table in `docs/model-file/adaptive-dosing.qmd`, "Which κ a decision window runs
+/// under" (#2771): decisions at 0 and 24, one bolus at 0, κ on CL. Each piece of the first
+/// window runs under the κ of the next record at or after its end; past the subject's last
+/// record it keeps the κ of the latest decision or record behind it.
+///
+/// | Records | `(0, 24]` |
+/// |---|---|
+/// | 0, 24, 48 | all κ₁ |
+/// | 0, 12, 24 | `(0, 12]` κ₀, `(12, 24]` κ₁ |
+/// | 0, 23, 47 | `(0, 23]` κ₀, `(23, 24]` κ₁ (the record at 47) |
+/// | 0, 23 | all κ₀ (nothing after 23) |
+///
+/// The oracle is outside the engine: the CL in force over a piece is backed out of the
+/// concentrations at its ends, `CL = −V/Δt · ln(C_b/C_a)`, with `C(0⁺) = d₀/V`, the
+/// mid-window value from the trajectory row and `C(24)` from the trough the decision at 24
+/// read. It is compared with `TVCL·exp(κ_g)` from the run's own κ substream. Worst relative
+/// gap over the 21 pieces of three replicates, macOS arm64: 2.8e-15, on a one-hour
+/// `(23, 24]` piece (bound 1e-12). The other occasion's CL is asserted at least 1e-2 away,
+/// so neither κ can pass for the other.
+///
+/// Already pinned elsewhere: the first row by `auc_target_reads_each_window_under_its_segments_kappa`
+/// (through the window AUC) and by
+/// `under_iov_a_supplied_subject_reads_kappa_zero_and_an_oracle_one_the_first_occasion`
+/// (through the trough); a mid-window record's own κ by `auc_target_reads_a_reset_rows_own_kappa`
+/// (a reset row). The two `23` rows had no test.
+///
+/// Mutation run: `governing_segment_pk_at` returning the carry (the last record behind the
+/// segment) instead of the next record ahead fails row 1, at `(0, 24]` under κ₀. Row 4
+/// has no one-line mutation; it pins the trailing carry the docs describe.
+#[test]
+fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
+    const SEED: u64 = 17;
+    let b = "  observe = CENT / V
+  at = [0, 24]
+  start_dose = 400
+  route = bolus(cmt=1)
+  dose_bounds = [0, 4000]
+  when signal > 1000000 : decrease 25%";
+    let p = model_with(true, "0", b);
+    let v = TVV * 70.0;
+    let rel = |a: f64, b: f64| ((a - b) / b).abs();
+    // (record times, the pieces of (0, 24] as (start, end, occasion in force)).
+    type Piece = (f64, f64, usize);
+    let layouts: [(&[f64], &[Piece]); 4] = [
+        (&[0.0, 24.0, 48.0], &[(0.0, 24.0, 1)]),
+        (&[0.0, 12.0, 24.0], &[(0.0, 12.0, 0), (12.0, 24.0, 1)]),
+        (&[0.0, 23.0, 47.0], &[(0.0, 23.0, 0), (23.0, 24.0, 1)]),
+        (&[0.0, 23.0], &[(0.0, 23.0, 0), (23.0, 24.0, 0)]),
+    ];
+    for (times, pieces) in layouts {
+        let mut data = String::from("ID,TIME,DV,AMT,EVID,CMT,MDV,WT\n");
+        for t in times {
+            data.push_str(&format!("1,{t},0,0,0,1,0,70\n"));
+        }
+        let r = run(&p, &pop(&data), &[("1", 0.0)], 3).expect("runs");
+        for sim in 1..=3 {
+            let d0 = first_dose(&r, "1", sim);
+            assert_eq!(d0, 400.0, "{times:?} sim {sim}: the fixed start dose");
+            let trough = r
+                .decisions
+                .iter()
+                .find(|d| d.sim == sim && d.time == 24.0)
+                .expect("decision at 24")
+                .observed_signals[0]
+                .value;
+            let conc = |t: f64| {
+                let c = if t == 0.0 {
+                    d0 / v
+                } else if t == 24.0 {
+                    trough
+                } else {
+                    r.trajectories
+                        .iter()
+                        .find(|x| x.sim == sim && x.time == t)
+                        .expect("a trajectory row at the record")
+                        .ipred
+                };
+                assert!(
+                    c.is_finite() && c > 0.0,
+                    "{times:?} sim {sim}: C({t}) = {c}"
+                );
+                c
+            };
+            let cl = [0, 1].map(|g| TVCL * drawn_kappa(&p, SEED, "1", sim, g).exp());
+            assert!(
+                rel(cl[0], cl[1]) > 1e-2,
+                "sim {sim}: κ₀ and κ₁ must differ for the fixture to see it: {cl:?}"
+            );
+            for &(a, b, g) in pieces {
+                let backed_out = -v / (b - a) * (conc(b) / conc(a)).ln();
+                assert!(
+                    rel(backed_out, cl[g]) < 1e-12,
+                    "records {times:?} sim {sim}: ({a}, {b}] runs under CL {backed_out}, \
+                     want κ_{g}'s {} (the other occasion's is {})",
+                    cl[g],
+                    cl[1 - g]
+                );
+                assert!(
+                    rel(backed_out, cl[1 - g]) > 1e-2,
+                    "records {times:?} sim {sim}: ({a}, {b}] must not match κ_{}",
+                    1 - g
+                );
+            }
+        }
+    }
+}
+
 // ── The first decision: covariates and TIME ───────────────────────────────────────
 
 /// A supplied subject whose WT changes before the first decision (t = 12) doses from CL
