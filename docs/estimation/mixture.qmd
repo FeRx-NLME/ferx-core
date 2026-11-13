@@ -95,7 +95,16 @@ NONMEM reserved variables:
 A `ferx model.ferx --simulate` run adds a third: **`MIXNUM`**, the class each subject
 was *simulated* under (1-based), written before `MIXEST`. It is the generating class,
 so on a simulated dataset it is the truth `MIXEST` can be checked against. Data read
-from a file has no `MIXNUM` column.
+from a file has no `MIXNUM` column unless `[output]` asks for one.
+
+Listing `MIXNUM` in `[output]` writes the class, as NONMEM's `$TABLE MIXNUM` does and
+as `MIXNUM` means in every expression: the simulated class where the data were drawn
+under one, the fitted `MIXEST` otherwise, on every row of the subject — binary and
+time-to-event rows included. It is never a data column that happens to be called
+`MIXNUM` (no expression can read such a column either); with one present, `fit()` and
+`ferx check` warn `W_OUTPUT_MIXNUM_IS_CLASS`, so rename the column to table it. On a
+simulated dataset the requested column replaces the generating-class column rather than
+sitting beside it under the same name (#2784).
 
 Every other per-subject diagnostic is evaluated **in that subject's `MIXEST`
 class**: the reported $\hat\eta$ are the winning class's EBEs, and `IPRED`,

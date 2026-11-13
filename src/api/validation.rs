@@ -9371,6 +9371,7 @@ pub(crate) fn check_model_data_warnings_rule(
     // Warning half of the kappa-weight check (#1031) — a sample-size weight that
     // moves within an occasion. The error half rides the fatal list.
     diags.extend(check_kappa_weight_variation(model, population));
+    diags.extend(output_mixnum_is_class(model, population));
     diags.extend(residual_correlation_inert(model, population));
     diags.extend(residual_correlation_partly_confounded(
         model, population, iov_rule,
@@ -11157,6 +11158,34 @@ pub(crate) fn bind_for_check(
     crate::api::covariate_stats::bind_covariate_stats_diag(parsed, model_text, population)
 }
 
+/// `W_OUTPUT_MIXNUM_IS_CLASS` (#2784): `[output] MIXNUM` on a `[mixture]` model whose
+/// data also carry a `MIXNUM` column. The sdtab column is the class, so a user who listed
+/// it expecting their covariate is told. A data column of that name is unreachable from
+/// the model already (an expression reads the built-in). In the warning bundle
+/// ([`check_model_data_warnings`]) so `fit()` reports it as `ferx check` does.
+pub(crate) fn output_mixnum_is_class(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<Diagnostic> {
+    let col = model
+        .output_columns
+        .iter()
+        .find(|c| super::output_columns::is_mixture_class_column(model, c))?;
+    let data_col = population
+        .covariate_names
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case(col))?;
+    Some(Diagnostic::warning(
+        "W_OUTPUT_MIXNUM_IS_CLASS",
+        format!(
+            "W_OUTPUT_MIXNUM_IS_CLASS: [output] column `{col}` on a [mixture] model is the \
+             mixture class (the simulated class where the data were drawn under one, else \
+             the fitted MIXEST), as NONMEM's `$TABLE MIXNUM` is; it is not the data column \
+             `{data_col}`. Rename that column to write it to sdtab"
+        ),
+    ))
+}
+
 /// Validate `model.output_columns` against known quantities, emitting
 /// `W_OUTPUT_DUPLICATE` and `E_OUTPUT_UNKNOWN_COLUMN` diagnostics.
 pub fn validate_output_columns(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
@@ -11188,6 +11217,12 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
             continue;
         }
+        // `MIXNUM` on a `[mixture]` model is the class (#2784), whatever the data carry;
+        // a data column of that name is reported by `output_mixnum_is_class`, from the
+        // warning bundle `fit()` reports, not from this list `fit()` reads error-first.
+        if super::output_columns::is_mixture_class_column(model, col) {
+            continue;
+        }
         // Valid if it's a covariate, indiv param, or derived name. Synthetic
         // readout parameters (`__ferx_ro_*`, #486) are internal — not user-requestable.
         let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
@@ -11207,6 +11242,9 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             );
             candidates.extend(derived_names.iter().copied());
             candidates.extend(OUTPUT_MANDATORY.iter().copied());
+            if model.mixture.is_some() {
+                candidates.push(super::output_columns::MIXNUM_COLUMN);
+            }
             diags.push(Diagnostic::error(
                 "E_OUTPUT_UNKNOWN_COLUMN",
                 format!(

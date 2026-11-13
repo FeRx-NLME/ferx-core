@@ -2391,10 +2391,14 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     let any_mixture = n_mix_classes > 0;
     let mut mixest_col = Vec::with_capacity(n_total);
     // The generating class of a `--simulate` population (#2372), next to the fitted one.
+    // An `[output] MIXNUM` on a `[mixture]` model (#2784) arrives as an extra column
+    // holding the class, simulated or fitted; it replaces this one rather than sitting
+    // beside it under the same name.
     let any_mixnum = population
         .subjects
         .iter()
-        .any(|s| s.simulated_mixnum.is_some());
+        .any(|s| s.simulated_mixnum.is_some())
+        && !mixnum_requested(result);
     let mut mixnum_col = Vec::with_capacity(n_total);
     let mut pmix_cols: Vec<Vec<f64>> = vec![Vec::with_capacity(n_total); n_mix_classes];
 
@@ -2623,6 +2627,26 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
 /// `CWRES` is deliberately blank: the conditional weighted residual is defined through
 /// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
 /// `IWRES` carries the standardized (Pearson) residual instead.
+/// Whether the fit's `[output]` asked for `MIXNUM` on a `[mixture]` model (#2784):
+/// `compute_extra_output_columns` then writes the class as an extra column of exactly
+/// that name.
+fn mixnum_requested(result: &FitResult) -> bool {
+    result
+        .subjects
+        .iter()
+        .any(|sr| sr.extra_columns.iter().any(|(n, _)| n == "MIXNUM"))
+}
+
+/// The `MIXNUM` cell of subject `si`'s non-Gaussian rows: the class its data were
+/// simulated under (#2372) or, when `[output] MIXNUM` asked for the class on a mixture
+/// fit, its fitted `MIXEST` failing that (#2784) — the value the extra column carries on
+/// the subject's Gaussian rows. A subject-level scalar, like `EBE_OFV`.
+fn subject_mixnum(result: &FitResult, population: &Population, si: usize, requested: bool) -> f64 {
+    let simulated = population.subjects[si].simulated_mixnum;
+    let fitted = requested.then(|| result.subjects[si].mixest).flatten();
+    simulated.or(fitted).map_or(f64::NAN, |k| k as f64)
+}
+
 fn append_discrete_rows(
     cols: &mut [(String, Vec<f64>)],
     result: &FitResult,
@@ -2632,6 +2656,7 @@ fn append_discrete_rows(
     if n_discrete == 0 {
         return;
     }
+    let mixnum_requested = mixnum_requested(result);
     for (name, values) in cols.iter_mut() {
         for (si, sr) in result.subjects.iter().enumerate() {
             for row in &sr.discrete_rows {
@@ -2645,10 +2670,9 @@ fn append_discrete_rows(
                     "IWRES" => row.iwres,
                     "EBE_OFV" => sr.ofv_contribution,
                     // A subject-level scalar, like EBE_OFV: the class the record was
-                    // simulated under (#2372).
-                    "MIXNUM" => population.subjects[si]
-                        .simulated_mixnum
-                        .map_or(f64::NAN, |k| k as f64),
+                    // simulated under (#2372), or the fitted one under `[output]
+                    // MIXNUM` (#2784).
+                    "MIXNUM" => subject_mixnum(result, population, si, mixnum_requested),
                     // `N_OBS` deliberately blank: `SubjectResult::n_obs` counts Gaussian
                     // observations only, so a binary-only fit would write `N_OBS = 0` on
                     // every row of a table plainly full of observations. Blank is honest;
@@ -2691,6 +2715,7 @@ fn append_tte_rows(
     if n_tte == 0 {
         return;
     }
+    let mixnum_requested = mixnum_requested(result);
     let n_before = cols.first().map_or(0, |(_, v)| v.len());
     for name in TTE_RESIDUAL_COLUMNS {
         cols.push((name.to_string(), vec![f64::NAN; n_before]));
@@ -2704,9 +2729,7 @@ fn append_tte_rows(
                     "DV" => row.dv,
                     "CMT" => row.cmt as f64,
                     "EBE_OFV" => sr.ofv_contribution,
-                    "MIXNUM" => population.subjects[si]
-                        .simulated_mixnum
-                        .map_or(f64::NAN, |k| k as f64),
+                    "MIXNUM" => subject_mixnum(result, population, si, mixnum_requested),
                     "COXSNELL" => row.coxsnell,
                     "MARTINGALE" => row.martingale,
                     "DEVIANCE" => row.deviance,
@@ -6421,6 +6444,94 @@ mod tests {
             mixnum,
             &vec![2.0, 2.0],
             "the Gaussian row, then the discrete row"
+        );
+    }
+
+    /// `[output] MIXNUM` on a mixture fit (#2784) arrives as an extra column holding the
+    /// class. On a simulated population the sdtab must then carry **one** `MIXNUM`
+    /// column — the requested one — not the engine's simulated-class column beside it
+    /// under the same name.
+    ///
+    /// Dies on: `any_mixnum` ignoring the request (two `MIXNUM` columns).
+    #[test]
+    fn sdtab_output_mixnum_replaces_the_simulated_class_column() {
+        let mut s0 = sdtab_subject_result("1", 2);
+        s0.pmix = Some(vec![0.2, 0.8]);
+        s0.mixest = Some(2);
+        s0.extra_columns = vec![("MIXNUM".into(), vec![1.0, 1.0])];
+        let result = minimal_sdtab_result(vec![s0]);
+        let mut p0 = sdtab_subject("1", 2, vec![1, 1]);
+        p0.simulated_mixnum = Some(1);
+        let population = Population {
+            subjects: vec![p0],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let cols = sdtab(&result, &population);
+        let mixnum: Vec<&Vec<f64>> = cols
+            .iter()
+            .filter(|(n, _)| n == "MIXNUM")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(mixnum, vec![&vec![1.0, 1.0]], "exactly one MIXNUM column");
+        // Control: without the request the engine column is still written.
+        let mut plain = result.clone();
+        plain.subjects[0].extra_columns.clear();
+        let n = sdtab(&plain, &population)
+            .iter()
+            .filter(|(n, _)| n == "MIXNUM")
+            .count();
+        assert_eq!(n, 1, "the simulated-class column without [output] MIXNUM");
+    }
+
+    /// Under `[output] MIXNUM` on a fit of data read from a file (no simulated class), a
+    /// discrete row's `MIXNUM` is the subject's fitted `MIXEST` — the value the extra
+    /// column carries on its Gaussian rows (#2784) — where before it read the simulated
+    /// class only and was blank. Without the request it stays blank.
+    ///
+    /// Dies on: `subject_mixnum` ignoring `mixest`, or reading it unrequested.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn sdtab_output_mixnum_fills_a_discrete_row_with_the_fitted_class() {
+        let mut s0 = sdtab_subject_result("1", 1);
+        s0.pmix = Some(vec![0.1, 0.9]);
+        s0.mixest = Some(2);
+        s0.extra_columns = vec![("MIXNUM".into(), vec![2.0])];
+        s0.discrete_rows.push(crate::types::DiscreteObsDiagnostic {
+            cmt: 2,
+            time: 4.0,
+            dv: 1.0,
+            pred: 0.5,
+            ipred: 0.6,
+            iwres: 0.8,
+        });
+        let result = minimal_sdtab_result(vec![s0]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 1, vec![1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let cols = sdtab(&result, &population);
+        let mixnum = &cols.iter().find(|(n, _)| n == "MIXNUM").expect("MIXNUM").1;
+        assert_eq!(
+            mixnum,
+            &vec![2.0, 2.0],
+            "the Gaussian row, then the discrete row"
+        );
+
+        let mut plain = result.clone();
+        plain.subjects[0].extra_columns.clear();
+        assert!(
+            sdtab(&plain, &population)
+                .iter()
+                .all(|(n, _)| n != "MIXNUM"),
+            "no MIXNUM column without the request or a simulated class"
         );
     }
 

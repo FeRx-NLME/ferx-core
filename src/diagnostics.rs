@@ -82,6 +82,7 @@
 //! | `W_ABSORPTION_TWIN_DECLINED` | an analytic transit / IG model's ODE twin could not be built; the model stays closed-form with no ODE fallback (#1008) |
 //! | `E_OUTPUT_UNKNOWN_COLUMN` | a name in `[output]` is not recognised as any known quantity |
 //! | `W_OUTPUT_DUPLICATE`      | a name in `[output]` is already in the mandatory sdtab minimum |
+//! | `W_OUTPUT_MIXNUM_IS_CLASS` | `[output] MIXNUM` on a `[mixture]` model whose data carry a `MIXNUM` column: the sdtab column is the class (simulated, else the fitted `MIXEST`), not that data (#2784) |
 //! | `W_ADDL_MISSING_II`       | ADDL > 0 on a dose row but II is zero or missing; additional doses not expanded |
 //! | `W_COMPARTMENT_FREE_DOSES` | dose records in the dataset of a compartment-free (`$PRED`-equivalent) model, which applies no dose — reported once with the event (post-`ADDL`) and dosed-subject counts; the dose-level checks that read a topology (`E_MODELED_*_NO_PARAM`, `E_DOSE_CMT_*`) are skipped for this class, so the rows land here (#1443) |
 //! | `W_MISSING_DV`            | EVID=0 observation row with a missing DV and no MDV=1; skipped rather than scored as DV=0 |
