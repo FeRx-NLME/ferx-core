@@ -17430,11 +17430,21 @@ fn frozen_replay_tv_applies_cmt_toggles_like_the_closed_form() {
     eprintln!("time-varying replay vs closed form: worst rel {worst:e}");
     assert!(worst < TOG_TOL, "worst rel {worst:e}: {got:?} vs {want:?}");
 
-    // The same subject with `depot` never turned back on by an arrival is far away: the
-    // closed form with the doses at 6 and 12 dropped.
-    let never_on = tog_closed_form(&[(0.0, Some(100.0)), (3.0, None)], &TOG_OBS);
+    // The same subject without the arrival turn-on is far away. Only the dose at 6 depends
+    // on it: `depot` is off from 3, so without the turn-on that dose sits in a compartment
+    // held at zero flow until the off row at 8 zeroes it. The dose at 12 lands either way,
+    // because the on row at 9 has `depot` on by then. So the twin drops the dose at 6 alone.
+    let no_turn_on = tog_closed_form(
+        &[
+            (0.0, Some(100.0)),
+            (3.0, None),
+            (8.0, None),
+            (12.0, Some(100.0)),
+        ],
+        &TOG_OBS,
+    );
     assert!(
-        worst_rel(&never_on, &want) > 0.1,
+        worst_rel(&no_turn_on, &want) > 0.1,
         "the arrival turn-on must move the answer"
     );
 }

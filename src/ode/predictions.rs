@@ -7702,8 +7702,11 @@ fn adaptive_frozen_replay_tv(
         // so an off row inside the train kills the rest of it, and an in-memory subject can
         // hold an off row at exactly a base dose's time. The driver skipped those doses and
         // the loop applied them, so the verifier refused a correct run. The gate's other two
-        // tests cannot fire here: no `SS=1` dose reaches this path, and every dose fires at
-        // its own break (its time is in `record_bits`), which no reset floor can postdate.
+        // tests cannot fire here. No `SS=1` dose reaches this path. And no reset floor can
+        // postdate a dose's record: the floor is a break this walk has visited, so it is at
+        // or before the break the dose fires at, and that break is at or before the dose's
+        // time (a lag-free dose's time is pushed as a break, and the dedup keeps the lower
+        // of a merged pair), while `evid_reset_live` is `record >= floor`.
         // `dose_lagtimes` is all zeros, so the helper's lagged arrival is `d.time`.
         first_event = first_event.min(apply_prescheduled_boluses_at(
             &mut u,
