@@ -17538,7 +17538,8 @@ fn a_mixture_leg_after_a_dropped_one_starts_from_the_kept_class_modes() {
     }
 }
 
-/// #2745: a mixture takes the first leg and no pass; a single population takes both.
+/// #2745: a mixture takes its legs but neither leg pass (the cold-modes restart, the Newton
+/// step); a single population takes both passes.
 #[test]
 fn a_mixture_takes_no_leg_pass() {
     for (mixture, want) in [
