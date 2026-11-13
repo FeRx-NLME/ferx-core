@@ -533,6 +533,13 @@ A missing Ω~IOV~ on `simulate()` reuses an existing code, since the cause is th
 |------|----------|---------|
 | `E_VPC_TTE_INPUT` | error | An input the Kaplan–Meier VPC (`vpc_tte()`) would draw a wrong curve or band from: several TTE endpoints and no `cmt`, a `cmt` that is not a TTE endpoint, a repeated-events endpoint, left truncation, an interval-censored record, more than one record per subject on the endpoint, a duplicated subject id, no record on the endpoint, band probabilities not strictly inside (0, 1) and increasing, too few replicates for them, a grid time that is not finite and non-negative, or a stratification covariate a subject lacks or with more than 10 values ([#1886](https://github.com/FeRx-NLME/ferx-core/issues/1886)). See [Kaplan–Meier VPC](../estimation/tte.qmd#km-vpc). |
 
+#### Time-to-event npde {#codes-npde-tte}
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_NPDE_TTE_INPUT` | error | An input the TTE npde (`compute_tte_npde()`) would score wrongly: no TTE endpoint, more than one (competing risks), a repeated-events endpoint, left truncation, an interval-censored record, more than one record per subject on the endpoint, a time that is not finite and non-negative, a duplicated subject id, no record on the endpoint, or `nsim = 0`. A fit with `npde_nsim > 0` reports the same input as the warning `W_NPDE_TTE_SKIPPED` and still succeeds. |
+| `W_NPDE_TTE_SKIPPED` | warning | A fit with `npde_nsim > 0` could not score its time-to-event records: a repeated-events endpoint, competing risks, left truncation, an interval-censored record, or a failed reference simulation. The warning quotes the reason. The `NPDE` / `NPD` cells of the TTE rows are blank; every other row is scored as usual and the fit succeeds. |
+
 #### File entry points {#codes-file-entry-points}
 
 Refusals of the file entry points (`fit_from_files()`, `prepare_run()`, `run_model_with_data()`, `run_model_simulate()` and their variants, which `ferx` runs) and of `fit()` itself, for inputs `ferx check` does not read ([#1788](https://github.com/FeRx-NLME/ferx-core/issues/1788)).

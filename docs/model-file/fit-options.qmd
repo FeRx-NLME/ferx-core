@@ -403,7 +403,7 @@ How the dataset is interpreted, and what diagnostics are produced alongside the 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1` (below LLOQ) or `CENS=-1` (above ULOQ). `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.qmd)). |
-| `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde-npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. The same simulation also yields the [`EPRED` and `PWRES`/`EWRES`](#population-weighted-residuals-epred-pwres-ewres) columns. A typical value is `1000`. Cost scales linearly with the count. |
+| `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde-npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. The same simulation also yields the [`EPRED` and `PWRES`/`EWRES`](#population-weighted-residuals-epred-pwres-ewres) columns. A typical value is `1000`. Cost scales linearly with the count. A single-event time-to-event record is scored too, with its own draws ([Time-to-event records](#npde-tte-records)); on a drug-driven hazard that is one event-time solve per subject per replicate. |
 | `npde_seed` | integer | — | RNG seed for the NPDE/NPD simulation, for reproducible diagnostics. Unset falls back to a fixed default. Only used when `npde_nsim > 0`. |
 | `iov_column` | string | — | Name of the occasion column in the dataset (e.g. `OCC`). Supplies occasions when the model uses `kappa` or `block_kappa` declarations. The column must contain integer occasion indices. Case-insensitive. Supported with `foce`, `focei`, `saem`, `imp` and `impmap`. See [IOV documentation](iov.qmd). |
 | `iov_occasion` | `column`, `dose`, `time(t₁, …)` | `column` | Derive the IOV occasion partition from the model instead of a data column. `dose`: each administration starts a new occasion. `time(24, 48)`: time-window breakpoints. When set to `dose`/`time(...)`, this overrides `iov_column` (with a warning). See [Declaring occasions in the model](iov.qmd#declaring-occasions-in-the-model). |
@@ -592,6 +592,44 @@ fitted as an ordinary observation at its `DV`, so it is also scored as one here
 and does not void its subject's NPDE (#1499). NPDE also requires more replicates than a subject
 has observations (`npde_nsim > n_obs`) for a full-rank simulated covariance;
 otherwise that subject's NPDE is `NaN` (NPD is still computed).
+
+### Time-to-event records {#npde-tte-records}
+
+With `npde_nsim > 0` a **single-event** time-to-event record gets a score in the
+`NPDE` and `NPD` columns of its sdtab row
+([#1889](https://github.com/FeRx-NLME/ferx-core/issues/1889)). The two columns hold
+the same number there: one event per subject leaves nothing to decorrelate. `EPRED`,
+`EWRES` and `PWRES` stay blank on a TTE row, since a single event has no replicate
+mean to subtract.
+
+The record is scored against the model's population predictive distribution of the
+event time. With `F̂(y)` the fraction of the `K = npde_nsim` simulated replicates of
+the subject that have an event before `y`:
+
+- an observed event at `t` has `pd = F̂(t)`;
+- a time right-censored at `c` has `pd` drawn uniformly between `F̂(c)` and 1. The data
+  say only that the event lies past `c`, so the score is imputed from the part of the
+  predictive distribution past `c`.
+
+`NPDE = Φ⁻¹(pd)` after the same `[1/(2K), 1 − 1/(2K)]` clamp. An event earlier than the
+model predicts has a negative score, the direction a low concentration has. Under a
+correct model the scores are N(0, 1) when censoring is independent of the event time
+given the model, the assumption the likelihood itself makes.
+
+On a joint PK-TTE subject the concentration rows keep their scores unchanged: the TTE
+record is scored from separate draws and never enters the within-subject
+decorrelation. The seed is the same `npde_seed`.
+
+Repeated events, competing risks, left truncation and interval-censored records have
+no score yet. The fit still succeeds: the TTE cells stay blank and the fit carries one
+`W_NPDE_TTE_SKIPPED` warning that says which of these it met. The other rows are
+scored as usual.
+
+`stats::npde::compute_tte_npde` computes the same scores after the fit; with the
+fitted parameters and the recorded `npde_seed` it reproduces the stored cells bit for
+bit. Called directly it returns `E_NPDE_TTE_INPUT` for an input it cannot score. The
+rule, the validation and what the R `npde` package can and cannot check are in
+[Simulation-based npde](../estimation/tte.qmd#tte-npde).
 
 ### Inter-occasion variability (IOV)
 

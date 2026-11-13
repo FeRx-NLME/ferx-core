@@ -74,6 +74,9 @@ use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 
+#[cfg(feature = "survival")]
+pub use super::npde_tte::{compute_tte_npde, TteNpde};
+
 /// Seed used when the caller leaves `npde_seed` unset, so the diagnostic is
 /// reproducible across invocations.
 const DEFAULT_NPDE_SEED: u64 = 42;
@@ -656,7 +659,7 @@ fn empirical_score(y: f64, sims: impl Iterator<Item = f64>) -> f64 {
 
 /// Clamp an empirical-CDF probability away from 0 and 1 to `[1/(2K), 1 − 1/(2K)]`
 /// so the inverse-normal transform stays finite (npde-package convention).
-fn clamp_prob(p: f64, k: usize) -> f64 {
+pub(super) fn clamp_prob(p: f64, k: usize) -> f64 {
     let lo = 1.0 / (2.0 * k as f64);
     let hi = 1.0 - lo;
     p.clamp(lo, hi)

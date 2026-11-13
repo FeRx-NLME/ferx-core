@@ -161,6 +161,16 @@ pub(crate) fn derived_cmt_time_varying_warnings(
     out
 }
 
+/// `W_NPDE_TTE_SKIPPED`: why a fit with `npde_nsim > 0` left its time-to-event rows
+/// without a score (#1889), quoting the reason `compute_tte_npde` or the simulator gave.
+#[cfg(feature = "survival")]
+fn tte_npde_skipped_warning(why: &EngineError) -> String {
+    format!(
+        "W_NPDE_TTE_SKIPPED: the time-to-event records were not scored, so the NPDE / NPD \
+         cells of their rows are blank. Every other row is scored as usual. Reason: {why}"
+    )
+}
+
 #[cfg(test)]
 #[path = "tests/dw_autocorrelation_warning_tests.rs"]
 mod dw_autocorrelation_warning_tests;
@@ -2676,6 +2686,42 @@ fn fit_inner(
             sr.npd = sn.npd;
             sr.epred = sn.epred;
             sr.pwres = sn.pwres;
+        }
+    }
+
+    // The single-event time-to-event records' npde (#1889), from draws of their own, so
+    // the Gaussian scores above are what they are without it. A model with no TTE
+    // endpoint makes no call. An input the score would be wrong on (repeated events,
+    // competing risks, left truncation, an interval-censored record) and a failed
+    // reference simulation are a warning, never a failed fit: those fits succeeded
+    // before the score existed.
+    #[cfg(feature = "survival")]
+    if options.npde_nsim > 0 && !model.tte_cmts().is_empty() {
+        match crate::stats::npde::compute_tte_npde(
+            model,
+            population,
+            &result.params,
+            options.npde_nsim,
+            options.npde_seed,
+            None,
+        ) {
+            Ok((per_subj, npde_warnings)) => {
+                // One score per record, in `tte_rows` order; a subject with no TTE
+                // record has neither. Zipped by subject, never flattened.
+                for (sr, scores) in subjects.iter_mut().zip(per_subj) {
+                    for (row, score) in sr.tte_rows.iter_mut().zip(scores) {
+                        row.npde = score.npde;
+                    }
+                }
+                // What happened to the reference draws themselves: a replicate with a
+                // degenerate hazard or a failed event-time solve counted as "no event".
+                result.warnings.extend(
+                    npde_warnings
+                        .into_iter()
+                        .filter(|w| w.starts_with("W_TTE_")),
+                );
+            }
+            Err(why) => result.warnings.push(tte_npde_skipped_warning(&why)),
         }
     }
 

@@ -105,6 +105,17 @@ pub(crate) fn vpc_tte_input(message: impl Into<String>) -> EngineError {
     coded("E_VPC_TTE_INPUT", None, message.into())
 }
 
+/// `E_NPDE_TTE_INPUT`: an input `compute_tte_npde` would score wrongly (#1889) — no TTE
+/// endpoint, more than one (competing risks), a repeated-events endpoint, left
+/// truncation, an interval-censored record, more than one record per subject on the
+/// endpoint, a time that is not finite and non-negative, a duplicated subject id, no
+/// record on the endpoint, or `nsim = 0`. At fit time the same input is the warning
+/// `W_NPDE_TTE_SKIPPED`, never this error.
+#[cfg(feature = "survival")]
+pub(crate) fn npde_tte_input(message: impl Into<String>) -> EngineError {
+    coded("E_NPDE_TTE_INPUT", None, message.into())
+}
+
 /// `E_TTE_NOT_SIMULATABLE`: a TTE endpoint and population the event-time simulator
 /// cannot draw from — more than one recurrent stream on a subject, a recurrent cause
 /// beside a competing single-event one, an EVID=3/4 reset under a recurrent or an
