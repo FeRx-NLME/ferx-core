@@ -592,7 +592,7 @@ fn the_binary_refusal_names_a_changing_level_block_and_how_to_re_key_it() {
     assert_eq!(refused.len(), 1, "{refused:?}");
     assert_eq!(
         refused[0].message,
-        "[binary_model] on CMT=1: the logit predictor references θ level block `PLACEBO`, \
+        "[binary_model] on CMT=1: the linear predictor references θ level block `PLACEBO`, \
          whose level changes between records, which is time-varying for subject `7`, but that \
          subject carries no per-record covariate snapshot aligned with its binary records (it \
          also has time-to-event records, or was built in memory without \
@@ -888,8 +888,8 @@ fn the_gather_index_check_reads_each_binary_record() {
     assert!(codes(2.0).is_empty(), "in range");
 }
 
-/// How the #2623 fixtures read the block: bare (the documented form), as an explicit
-/// `PLACEBO[STUDY]` gather, or not at all.
+/// How the #2623 fixtures read the block: bare (the documented form), as a subscripted
+/// `PLACEBO[STUDY]` (refused at parse since #2744), or not at all.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Read {
     Bare,
@@ -998,68 +998,94 @@ const NO_LEVELS: &str = "theta PLACEBO[STUDY]: the block has no levels.";
 const NO_GAUSSIAN: &str = "The data carries no Gaussian observation rows";
 const NO_READER: &str = "none of its discrete-state records is on an endpoint whose expression \
                          reads the block through its implicit index";
+/// Conditional on no bare read, which since #2744 means nothing reads the block at all.
+const UNREAD: &str = "Nothing reads it:";
+/// The per-level check's wording for an all-dead block on Gaussian data, a different arm
+/// whose block may well be read (`0 * PLACEBO`), so it keeps pointing at the expression.
 const CHECK: &str = "Check the expression that reads it";
 const READ_BARE: &str = "a data-driven block is read bare, as `PLACEBO`; its index is implicit.";
-/// Conditional on an explicit `PLACEBO[COLUMN]` read. `KEYED_ANY` is its prefix, the
-/// negative assertion: with the list empty `KEYED` would be absent anyway (review r1 #2).
-const KEYED: &str = "An explicit read indexes the block by the value its column holds, not by \
-                     its level: `PLACEBO[STUDY]`. Write `PLACEBO` instead.";
-const KEYED_ANY: &str = "An explicit read";
 /// Conditional on a bare read whose only readers define no level (review r1 #1): a
 /// Gaussian prediction or a CTMM generator …
 const BARE_NO_DEFINER: &str = "The block is read bare, but only by a Gaussian prediction, a \
                                `[markov_model]` CTMM generator or an `[event_model]` hazard, and \
                                none of them defines a level on this data";
-const BARE_WHY: &str = "it has no Gaussian rows, a CTMM generator is built once per subject from \
-                        the baseline, and one time-to-event row can yield zero or two records, \
-                        so neither kind of record defines a level.";
+const BARE_WHY: &str = "a CTMM generator is built once per subject from the baseline, and one \
+                        time-to-event row can yield zero or two records, so neither kind of \
+                        record defines a level.";
+/// #2819: the reason for the Gaussian reader, given in the non-definer arm only when the
+/// advice follows. Each discriminator spans the colon, so it pins where the reason sits.
+const BARE_WHY_GAUSSIAN: &str = "this data: it has no Gaussian rows, a CTMM generator";
+/// #2819: … and dropped when the cannot-estimate sentence follows, which states it.
+const BARE_WHY_SHORT: &str = "this data: a CTMM generator";
 const BARE_ADVICE: &str =
     "Read the block in a `[binary_model]` predictor or a DTMM `[markov_model]` transition.";
 /// … or a level-defining endpoint the data has no record for.
 const BARE_NO_RECORDS: &str = "The block is read bare by an endpoint whose records define levels \
                                (CMT 1), but the data has no record there.";
-/// Every bare-read sentence, for the cells where none belongs.
-const BARE_ANY: [&str; 4] = [BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE, BARE_NO_RECORDS];
+/// #2751: the closing sentence when the data has no discrete-state record, so no reader
+/// the model could add defines a level on it. It ends both the unread arm (review r1 #1)
+/// and the non-definer bare-read arm.
+const BARE_NO_DEFINER_DATA: &str = "Only Gaussian rows and the discrete-state records of a \
+                                    `[binary_model]` or DTMM `[markov_model]` endpoint define a \
+                                    level, and this data has neither, so it cannot estimate the \
+                                    block.";
+/// #2819: the half of the next step both arms share, wherever `BARE_NO_DEFINER_DATA` is.
+const ADD_ROWS: &str = "add rows that define a level, scored by an expression that reads it.";
+/// #2819: the unread arm's next step. It spans the sentence boundary, so it pins that the
+/// step follows the cannot-estimate sentence.
+const DROP_STEP: &str = "so it cannot estimate the block. Drop the block, or add rows";
+/// #2819 review r1 #1: the bare non-definer arm's next step. Not "drop the block": the
+/// bare `PLACEBO` would then read as a covariate.
+const SCALAR_STEP: &str = "so it cannot estimate the block. Declare it as one `theta PLACEBO` \
+                           without the index, or add rows";
+/// Every bare-read sentence, and the closing sentences the unread arm shares, for the cells
+/// where none belongs.
+const BARE_ANY: [&str; 10] = [
+    BARE_NO_DEFINER,
+    BARE_WHY,
+    BARE_WHY_GAUSSIAN,
+    BARE_WHY_SHORT,
+    BARE_ADVICE,
+    BARE_NO_DEFINER_DATA,
+    ADD_ROWS,
+    DROP_STEP,
+    SCALAR_STEP,
+    BARE_NO_RECORDS,
+];
 /// The pre-#2623 wording, still right when the data has no row at all.
 const NO_ROWS: &str = "the data carries no observation rows";
 
 /// #2623. The refusal's input space is data (binary-only, Gaussian-only, mixed) × how
-/// the predictors read the block (bare, `PLACEBO[STUDY]`, not at all). Only the
-/// binary-only data with no bare read has no row that defines a level, and only those
-/// two cells carry the new refusal; the explicit-read sentence appears in the indexed
-/// cell alone. Every other cell is unchanged: bare and indexed reads bind (the indexed
-/// one only because `STUDY` is exactly 1..3), and an unread block on data with Gaussian
-/// rows is refused by the per-level checks, which already point at the expression.
+/// the predictors read the block (bare, or not at all — a subscripted read is refused
+/// at parse, #2744, see `a_subscripted_read_never_reaches_the_binder`). Only the
+/// binary-only data with no bare read has no row that defines a level, and only that
+/// cell carries the new refusal. Every other cell is unchanged: bare reads bind, and an
+/// unread block on data with Gaussian rows is refused by the per-level checks, which
+/// already point at the expression.
 ///
-/// Mutations: drop the discrete-record test and both binary cells say "no observation
-/// rows"; leave `keyed_reads` empty in the parse and the indexed cell loses `KEYED`;
-/// append `KEYED` unconditionally and the unread cell gains it; delete any sentence of
-/// the message and its constant's assertion fails.
+/// Mutations: drop the discrete-record test and the binary cell says "no observation
+/// rows"; delete any sentence of the message and its constant's assertion fails.
 #[test]
 fn no_reading_endpoint_cells() {
     for rows in [Rows::Binary, Rows::Gaussian, Rows::Mixed] {
-        for read in [Read::Bare, Read::Indexed, Read::Unread] {
+        for read in [Read::Bare, Read::Unread] {
             let cell = format!("{rows:?} × {read:?}");
             let got = bind_read(rows, read, true);
             match (rows, read) {
-                (Rows::Binary, Read::Indexed | Read::Unread) => {
+                (Rows::Binary, Read::Unread) => {
                     let d = got.expect_err(&cell);
                     assert_eq!(d.code, "E_THETA_LEVEL_BINDING", "{cell}");
                     let m = &d.message;
-                    for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER, CHECK, READ_BARE] {
+                    for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER, UNREAD, READ_BARE] {
                         assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
                     }
                     assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
                     for sentence in BARE_ANY {
                         assert!(!m.contains(sentence), "{cell}: not read bare: {m}");
                     }
-                    if read == Read::Indexed {
-                        assert!(m.contains(KEYED), "{cell}: names the explicit read: {m}");
-                    } else {
-                        assert!(!m.contains(KEYED_ANY), "{cell}: no explicit read: {m}");
-                    }
                 }
-                (_, Read::Bare | Read::Indexed) => {
+                (_, Read::Indexed) => unreachable!("refused at parse; not iterated"),
+                (_, Read::Bare) => {
                     assert!(got.is_ok(), "{cell}: {got:?}");
                 }
                 (Rows::Gaussian | Rows::Mixed, Read::Unread) => {
@@ -1072,7 +1098,7 @@ fn no_reading_endpoint_cells() {
             }
         }
     }
-    // The Gaussian path's own wording, which the new refusal echoes.
+    // The per-level check keeps its own wording on Gaussian data, and not the binder's.
     let m = bind_read(Rows::Gaussian, Read::Unread, true)
         .expect_err("unread on Gaussian data")
         .message;
@@ -1092,7 +1118,7 @@ fn a_population_with_no_rows_still_says_so() {
     let d = bind_read(Rows::Binary, Read::Unread, false).expect_err("no rows");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
     assert!(d.message.contains(NO_ROWS), "{}", d.message);
-    for sentence in [NO_GAUSSIAN, NO_READER, CHECK, READ_BARE, KEYED_ANY]
+    for sentence in [NO_GAUSSIAN, NO_READER, UNREAD, READ_BARE]
         .into_iter()
         .chain(BARE_ANY)
     {
@@ -1105,24 +1131,54 @@ fn a_population_with_no_rows_still_says_so() {
 }
 
 /// Assert the bare-read refusal of review r1 #1 on `m`: the shared facts, then exactly
-/// one bare-read arm — `no_records` picks which — and never the "read it bare" advice,
-/// which would tell the user to do what they already did.
-fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool) {
+/// one bare-read arm — `no_records` picks which; in the non-definer arm `definable` (a
+/// discrete-state record off a CTMM, #2808) picks the advice — and never the "read it
+/// bare" advice, which would tell the user to do what they already did.
+fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool, definable: bool) {
     for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER] {
         assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
     }
-    for sentence in [CHECK, READ_BARE, NO_ROWS] {
+    for sentence in [UNREAD, CHECK, READ_BARE, NO_ROWS] {
         assert!(!m.contains(sentence), "{cell}: already read bare: {m}");
     }
     let (want, not): (&[&str], &[&str]) = if no_records {
         (
             &[BARE_NO_RECORDS],
-            &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
+            &[
+                BARE_NO_DEFINER,
+                BARE_WHY,
+                BARE_WHY_GAUSSIAN,
+                BARE_WHY_SHORT,
+                BARE_ADVICE,
+                BARE_NO_DEFINER_DATA,
+                ADD_ROWS,
+                DROP_STEP,
+                SCALAR_STEP,
+            ],
+        )
+    } else if definable {
+        (
+            &[BARE_NO_DEFINER, BARE_WHY, BARE_WHY_GAUSSIAN, BARE_ADVICE],
+            &[
+                BARE_NO_RECORDS,
+                BARE_WHY_SHORT,
+                BARE_NO_DEFINER_DATA,
+                ADD_ROWS,
+                DROP_STEP,
+                SCALAR_STEP,
+            ],
         )
     } else {
         (
-            &[BARE_NO_DEFINER, BARE_WHY, BARE_ADVICE],
-            &[BARE_NO_RECORDS],
+            &[
+                BARE_NO_DEFINER,
+                BARE_WHY,
+                BARE_WHY_SHORT,
+                BARE_NO_DEFINER_DATA,
+                SCALAR_STEP,
+                ADD_ROWS,
+            ],
+            &[BARE_NO_RECORDS, BARE_WHY_GAUSSIAN, BARE_ADVICE, DROP_STEP],
         )
     };
     for sentence in want {
@@ -1138,15 +1194,13 @@ fn assert_bare_read_refusal(cell: &str, m: &str, no_records: bool) {
 
 /// Review r1 #1: a block read bare by a Gaussian `y` on binary-only data is read
 /// through its implicit index, only not by a reader whose rows define levels — so the
-/// refusal says that, not "check the expression". The binary predictor here reads it
-/// explicitly, so the explicit-read sentence is named in this arm too.
+/// refusal says that, not "check the expression". The binary predictor does not read it.
 ///
-/// Mutations: drop `read_bare` (always false) and the cell gets `CHECK`; route every
+/// Mutations: drop `read_bare` (always false) and the cell gets `UNREAD`; route every
 /// bare read to the no-records arm and it gets `BARE_NO_RECORDS`.
 #[test]
 fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
-    let text = read_model(Rows::Mixed, Read::Indexed)
-        .replace("BASE = B + PLACEBO[STUDY]", "BASE = B + PLACEBO");
+    let text = read_model(Rows::Mixed, Read::Unread).replace("BASE = B\n", "BASE = B + PLACEBO\n");
     let mut parsed = parse_full_model(&text).unwrap();
     let decl = &parsed.model.theta_blocks().level_blocks()[0];
     assert!(
@@ -1164,15 +1218,14 @@ fn a_gaussian_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
     let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
         .expect_err("no Gaussian rows");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
-    assert_bare_read_refusal("y bare", &d.message, false);
-    assert!(d.message.contains(KEYED), "{}", d.message);
+    assert_bare_read_refusal("y bare", &d.message, false, true);
 }
 
 /// Review r2 #5: a block read bare by an `[event_model]` hazard alone is read through its
 /// implicit index too, but a time-to-event row defines no level (#2562), so the refusal
 /// is the bare-read arm that names the hazard, not "check the expression".
 ///
-/// Mutation: drop `read_bare` and the cell gets `CHECK`; drop the hazard from the arm's
+/// Mutation: drop `read_bare` and the cell gets `UNREAD`; drop the hazard from the arm's
 /// reader list and `BARE_NO_DEFINER` is missing.
 #[test]
 fn a_hazard_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
@@ -1191,15 +1244,14 @@ fn a_hazard_bare_read_on_binary_rows_is_not_blamed_on_the_expression() {
     let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
         .expect_err("a hazard defines no levels");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
-    assert_bare_read_refusal("hazard bare", &d.message, false);
-    assert!(!d.message.contains(KEYED_ANY), "{}", d.message);
+    assert_bare_read_refusal("hazard bare", &d.message, false, true);
 }
 
 /// Review r1 #1, the Markov cells: a block read bare by a CTMM generator alone (whose
 /// records define no level, #2562), and one read bare by a DTMM on CMT 1 when the data's
 /// records are all on another endpoint (CMT 5). Each names its own arm.
 ///
-/// Mutations: drop `read_bare` and both get `CHECK`; drop the `record_cmts` test and the
+/// Mutations: drop `read_bare` and both get `UNREAD`; drop the `record_cmts` test and the
 /// DTMM cell gets the CTMM arm; swap the arms and each gets the other's sentence.
 #[cfg(feature = "markov")]
 #[test]
@@ -1223,8 +1275,8 @@ fn a_markov_bare_read_names_why_it_defines_no_level() {
     let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, ctmm, &mut pop)
         .expect_err("a CTMM defines no levels");
     assert_eq!(d.code, "E_THETA_LEVEL_BINDING");
-    assert_bare_read_refusal("ctmm bare", &d.message, false);
-    assert!(!d.message.contains(KEYED_ANY), "{}", d.message);
+    // #2808: its records are all on the CTMM, so no reader could define a level.
+    assert_bare_read_refusal("ctmm bare", &d.message, false, false);
 
     let dtmm = r"
 [parameters]
@@ -1254,39 +1306,415 @@ fn a_markov_bare_read_names_why_it_defines_no_level() {
     let mut pop = state_population();
     let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, dtmm, &mut pop)
         .expect_err("no record on CMT 1");
-    assert_bare_read_refusal("dtmm bare, records elsewhere", &d.message, true);
+    assert_bare_read_refusal("dtmm bare, records elsewhere", &d.message, true, true);
 }
 
-/// #2623: every explicit read is named, once each, in read order. Two reads of the block
-/// by two columns, and the first column read a second time.
+/// #2744: the subscripted read #2623 named in the binder's no-levels refusal is refused
+/// at parse now, on every data shape, so no binder cell can see it. The parse-side
+/// message is pinned sentence by sentence in the parser's own tests; this pins its
+/// code. A parse refusal, not the binder's `E_THETA_LEVEL_BINDING`: it fires before any
+/// data is read.
 ///
-/// Mutation: keep only the first use, or stop deduplicating, and the list differs.
+/// Mutation: drop the parse refusal and every row parses.
 #[test]
-fn every_explicit_read_is_named_once() {
-    let text = read_model(Rows::Binary, Read::Unread)
-        .replace(
-            "STUDY categorical",
-            "STUDY categorical\n  GRP   categorical",
-        )
-        .replace(
-            "logit = TVL",
-            "logit = TVL + PLACEBO[STUDY] + 0.5 * PLACEBO[GRP] - PLACEBO[STUDY]",
+fn a_subscripted_read_never_reaches_the_binder() {
+    for rows in [Rows::Binary, Rows::Gaussian, Rows::Mixed] {
+        let Err(err) = parse_full_model(&read_model(rows, Read::Indexed)) else {
+            panic!("{rows:?}: a subscripted read must not parse");
+        };
+        assert!(
+            err.contains("`PLACEBO[STUDY]`: `PLACEBO` is a data-driven θ level block"),
+            "{rows:?}: {err}"
         );
-    let mut parsed = parse_full_model(&text).unwrap();
-    assert_eq!(
-        parsed.model.theta_blocks().level_blocks()[0].keyed_reads,
-        ["STUDY", "GRP"]
-    );
-    let mut pop = read_population(Rows::Binary, true);
-    for s in &mut pop.subjects {
-        let study = s.covariates["STUDY"];
-        s.covariates.insert("GRP".into(), study);
+        assert_eq!(
+            crate::api::validation::parse_error_to_diagnostic(&err).code,
+            "E_PARSE",
+            "{rows:?}"
+        );
     }
-    let m = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
-        .expect_err("no reading endpoint")
-        .message;
+}
+
+/// #2751: the clause naming the data's time-to-event records.
+const EVENT_CLAUSE: &str = ", and its time-to-event records define no level";
+/// #2751: the clause naming the data's count records.
+const COUNT_CLAUSE: &str =
+    ", and its count records define no level, since no endpoint scores a count record";
+
+/// The record kinds a #2751 cell's data carries, none of them on an endpoint that reads
+/// the block (CMT 3 and up; the reading endpoints are on CMT 1).
+#[derive(Debug, Clone, Copy)]
+struct Kinds {
+    discrete: bool,
+    events: bool,
+    counts: bool,
+}
+
+/// [`read_population`]'s three studies, record-free, each given one record of each
+/// kind in `kinds`: a discrete-state record on CMT 3, an exact TTE event on CMT 2 and a
+/// count on CMT 4. No Gaussian row, so no row defines a level.
+fn records_population(kinds: Kinds) -> Population {
+    let mut pop = read_population(Rows::Binary, false);
+    for s in &mut pop.subjects {
+        if kinds.discrete {
+            s.obs_records.push(ObsRecord::DiscreteState {
+                time: 1.0,
+                raw_time: 1.0,
+                state: 1,
+                cmt: 3,
+            });
+        }
+        if kinds.events {
+            s.obs_records.push(ObsRecord::Event {
+                time: 2.0,
+                event_type: crate::types::EventType::Exact,
+                entry_time: 0.0,
+                cmt: 2,
+            });
+        }
+        if kinds.counts {
+            s.obs_records.push(ObsRecord::Count {
+                time: 3.0,
+                raw_time: 3.0,
+                count: 4,
+                cmt: 4,
+            });
+        }
+    }
+    pop
+}
+
+/// How a #2751 cell's model reads the block: not at all, bare by a level-defining endpoint
+/// (a `[binary_model]` on CMT 1, whose CMT the data has no record on), or bare by a reader
+/// that defines no level (a Gaussian prediction).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Reader {
+    Unread,
+    Definer,
+    NonDefiner,
+}
+
+fn reader_model(reader: Reader) -> String {
+    match reader {
+        Reader::Unread => read_model(Rows::Binary, Read::Unread),
+        Reader::Definer => read_model(Rows::Binary, Read::Bare),
+        Reader::NonDefiner => read_model(Rows::Gaussian, Read::Bare),
+    }
+}
+
+/// #2795 review r1b #1: the data paragraph is closed by its own full stop before the read
+/// arm starts. Since #2751 that paragraph is assembled from optional clauses, so the stop
+/// is a code path of its own, and deleting it leaves every clause and arm sentence intact.
+fn assert_data_paragraph_closed(cell: &str, m: &str) {
     assert!(
-        m.contains("not by its level: `PLACEBO[STUDY]`, `PLACEBO[GRP]`. Write `PLACEBO` instead."),
-        "{m}"
+        m.contains(". Nothing reads it:")
+            || m.contains(". The block is read bare by an endpoint")
+            || m.contains(". The block is read bare, but only"),
+        "{cell}: the data paragraph is not closed before the read arm: {m}"
     );
+}
+
+/// #2751. The refusal's input space is the record kinds the data carries (none; or any
+/// non-empty set of discrete-state, time-to-event and count, none of them defining a
+/// level) × how the block is read (unread, bare by a level-defining endpoint, bare only by
+/// a reader that defines none). Gaussian rows, or a discrete-state record on a reading
+/// endpoint, define a level and never reach the refusal. Each cell asserts both sides of
+/// the data-vs-expression gate: the population with records blames the expression and
+/// names exactly the kinds present, and the same model on the population stripped of its
+/// records says the data has no rows and blames nothing else.
+///
+/// Mutations: gate on discrete-state records alone (the #2623 gate) and every event-only
+/// and count-only cell says `NO_ROWS`; drop a kind's clause, or emit it unconditionally,
+/// and that kind's present or absent cells fail; give the `[binary_model]` advice whenever
+/// a discrete-state record is present and the discrete non-definer cells fail; delete the
+/// data paragraph's full stop and every cell fails.
+#[test]
+fn record_kind_cells() {
+    let sets = [
+        (false, true, false),
+        (false, false, true),
+        (false, true, true),
+        (true, false, false),
+        (true, true, true),
+    ];
+    for reader in [Reader::Unread, Reader::Definer, Reader::NonDefiner] {
+        let text = reader_model(reader);
+        for (discrete, events, counts) in sets {
+            let kinds = Kinds {
+                discrete,
+                events,
+                counts,
+            };
+            let cell = format!("{kinds:?} × {reader:?}");
+            let bind = |pop: &mut Population| {
+                let mut parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{cell}: {e}"));
+                crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, pop)
+            };
+            let d = bind(&mut records_population(kinds)).expect_err(&cell);
+            assert_eq!(d.code, "E_THETA_LEVEL_BINDING", "{cell}");
+            let m = &d.message;
+            // Data side: the data has rows, so it is not blamed.
+            assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
+            assert_data_paragraph_closed(&cell, m);
+            for sentence in [NO_LEVELS, NO_GAUSSIAN] {
+                assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
+            }
+            for (present, clause) in [
+                (discrete, NO_READER),
+                (events, EVENT_CLAUSE),
+                (counts, COUNT_CLAUSE),
+            ] {
+                assert_eq!(
+                    m.contains(clause),
+                    present,
+                    "{cell}: {clause:?} present = {present} in {m}"
+                );
+            }
+            // Expression side: exactly one read arm. The discrete-state record sits on CMT 3,
+            // which no binary or DTMM endpoint scores, so no cell here has a record a reader
+            // could make define a level: the unread and non-definer arms end on the
+            // cannot-estimate sentence (#2808). `ctmm_records_define_no_level_cells` holds the
+            // other side of that gate.
+            let want: &[&str] = match reader {
+                Reader::Unread => &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA, DROP_STEP, ADD_ROWS],
+                Reader::Definer => &[BARE_NO_RECORDS],
+                Reader::NonDefiner => &[
+                    BARE_NO_DEFINER,
+                    BARE_WHY_SHORT,
+                    BARE_WHY,
+                    BARE_NO_DEFINER_DATA,
+                    SCALAR_STEP,
+                    ADD_ROWS,
+                ],
+            };
+            for sentence in [UNREAD, READ_BARE].into_iter().chain(BARE_ANY) {
+                assert_eq!(
+                    m.contains(sentence),
+                    want.contains(&sentence),
+                    "{cell}: {sentence:?} in {m}"
+                );
+            }
+            // The other side of the gate, same model: no record of any kind.
+            let none = bind(&mut records_population(Kinds {
+                discrete: false,
+                events: false,
+                counts: false,
+            }))
+            .expect_err(&cell)
+            .message;
+            assert!(none.contains(NO_ROWS), "{cell}, no rows: {none}");
+            for sentence in [
+                NO_GAUSSIAN,
+                NO_READER,
+                EVENT_CLAUSE,
+                COUNT_CLAUSE,
+                UNREAD,
+                READ_BARE,
+            ]
+            .into_iter()
+            .chain(BARE_ANY)
+            {
+                assert!(
+                    !none.contains(sentence),
+                    "{cell}, no rows: {sentence:?} in {none}"
+                );
+            }
+        }
+    }
+}
+
+/// #2751, end to end through the CSV reader `ferx check --data` uses: a Weibull TTE model
+/// on TTE-only data, with the block read bare by the hazard or not at all. The reader
+/// routes every row to an `Event` record, so the data has observation rows and the refusal
+/// names them, never `NO_ROWS`. This is the measured repro of the issue: before the fix
+/// both cells said "the data carries no observation rows".
+///
+/// Mutation: gate on discrete-state records alone and both cells say `NO_ROWS`.
+#[test]
+fn tte_only_csv_is_not_called_rowless() {
+    use std::io::Write;
+    let bare =
+        "[parameters]\n  theta TVSCALE(20.0, 0.1, 500.0)\n  theta TVSHAPE(1.5, 0.1, 10.0)\n  \
+                theta PLACEBO[STUDY](0.0, -5.0, 5.0)\n[covariates]\n  STUDY categorical\n\
+                [event_model]\n  cmt    = 2\n  family = weibull\n  \
+                scale  = TVSCALE * exp(PLACEBO)\n  shape  = TVSHAPE\n";
+    let mut data = tempfile::Builder::new().suffix(".csv").tempfile().unwrap();
+    writeln!(data, "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,STUDY").unwrap();
+    for i in 1..=6u32 {
+        writeln!(
+            data,
+            "{i},{},{},0,0,2,0,0,{}",
+            5 + i,
+            i % 2,
+            1 + (i - 1) % 3
+        )
+        .unwrap();
+    }
+    data.flush().unwrap();
+    // #2819 review r1 #1: each arm's next step, applied, clears every error; the step the
+    // bare arm must not give (drop the declaration) trades this refusal for a missing
+    // covariate, since the bare `PLACEBO` then reads as one.
+    let decl = "  theta PLACEBO[STUDY](0.0, -5.0, 5.0)\n";
+    let unread_text = bare.replace(" * exp(PLACEBO)", "");
+    for (label, text, want) in [
+        ("unread, block dropped", unread_text.replace(decl, ""), None),
+        (
+            "bare, scalar theta",
+            bare.replace("PLACEBO[STUDY](0.0", "PLACEBO(0.0"),
+            None,
+        ),
+        (
+            "bare, block dropped",
+            bare.replace(decl, ""),
+            Some("E_MISSING_COVARIATE"),
+        ),
+    ] {
+        let mut model = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        model.write_all(text.as_bytes()).unwrap();
+        model.flush().unwrap();
+        let report = crate::api::validate_model_file(
+            model.path().to_str().unwrap(),
+            Some(data.path().to_str().unwrap()),
+        );
+        let errors: Vec<&str> = report
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == crate::diagnostics::Severity::Error)
+            .map(|d| d.code.as_str())
+            .collect();
+        assert_eq!(errors, want.into_iter().collect::<Vec<_>>(), "{label}");
+    }
+    for (label, text, unread) in [
+        ("hazard bare", bare.to_string(), false),
+        ("unread", bare.replace(" * exp(PLACEBO)", ""), true),
+    ] {
+        let mut model = tempfile::Builder::new().suffix(".ferx").tempfile().unwrap();
+        model.write_all(text.as_bytes()).unwrap();
+        model.flush().unwrap();
+        let report = crate::api::validate_model_file(
+            model.path().to_str().unwrap(),
+            Some(data.path().to_str().unwrap()),
+        );
+        let d = report
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "E_THETA_LEVEL_BINDING")
+            .unwrap_or_else(|| panic!("{label}: {:?}", report.diagnostics));
+        let m = &d.message;
+        assert!(!m.contains(NO_ROWS), "{label}: blames the data: {m}");
+        for sentence in [NO_LEVELS, NO_GAUSSIAN, EVENT_CLAUSE] {
+            assert!(m.contains(sentence), "{label}: missing {sentence:?} in {m}");
+        }
+        for sentence in [NO_READER, COUNT_CLAUSE] {
+            assert!(!m.contains(sentence), "{label}: {sentence:?} in {m}");
+        }
+        assert_eq!(m.contains(UNREAD), unread, "{label}: {m}");
+        // Neither arm has a reader that could define a level on TTE-only data (r1 #1), so
+        // both end on the cannot-estimate sentence and the next step (#2819).
+        for sentence in [BARE_NO_DEFINER_DATA, ADD_ROWS] {
+            assert!(m.contains(sentence), "{label}: missing {sentence:?} in {m}");
+        }
+        // Each arm's own next step, and not the other's (review r1 #1).
+        assert_eq!(m.contains(DROP_STEP), unread, "{label}: {m}");
+        assert_eq!(m.contains(SCALAR_STEP), !unread, "{label}: {m}");
+        // #2819: the bare cell states "no Gaussian rows" in the data clause and the closing
+        // sentence only, not a third time in the reason for the Gaussian reader.
+        assert_eq!(m.contains(BARE_WHY_SHORT), !unread, "{label}: {m}");
+        assert!(!m.contains(BARE_WHY_GAUSSIAN), "{label}: {m}");
+    }
+}
+
+/// #2808. A CTMM's state rows are discrete-state records, but no reader can make them
+/// define a level, and their CMT has no other endpoint. So on data whose discrete-state
+/// records are all on a CTMM, the refusal ends on the cannot-estimate sentence in the
+/// unread and the non-definer arms, never on the "read it in a `[binary_model]`" advice.
+/// The input space is data (CTMM-only, or CTMM plus one record on a non-reading DTMM) × read state
+/// (unread, bare by the CTMM alone, bare by a binary endpoint whose CMT has no record).
+/// Each pair of rows on the same model differs only by the off-CTMM record, so the two
+/// straddle the gate: the CTMM-only row asserts the cannot-estimate sentence and not the
+/// advice, the mixed row the reverse.
+///
+/// Mutations: gate on any discrete-state record (the pre-#2808 `discrete`) and every
+/// CTMM-only row fails; gate on none (always cannot-estimate) and every mixed row fails;
+/// stop the parse filling `level_capable_cmts` and the mixed rows fail.
+#[cfg(feature = "markov")]
+#[test]
+fn ctmm_records_define_no_level_cells() {
+    let ctmm = |read: &str| {
+        format!(
+            "[parameters]\n  theta LQ01(-0.7, -6.0, 3.0)\n  theta LQ10(-1.2, -6.0, 3.0)\n  \
+             theta TVL(-0.3, -5.0, 5.0)\n  theta PLACEBO[STUDY](0.0)\n[covariates]\n  \
+             STUDY categorical\n[markov_model gen]\n  type   = ctmm\n  cmt    = 5\n  \
+             states = [awake=0, asleep=1]\n  \
+             transition awake  -> asleep = exp(LQ01{ctmm_read})\n  \
+             transition asleep -> awake  = exp(LQ10)\n[binary_model]\n  cmt   = 1\n  \
+             logit = TVL{binary_read}\n[markov_model other]\n  type   = dtmm\n  cmt    = 2\n  \
+             states = [awake=0, asleep=1]\n  transition awake  -> asleep = inv_logit(TVL)\n  \
+             transition asleep -> awake  = inv_logit(TVL)\n",
+            ctmm_read = if read == "ctmm" { " + PLACEBO" } else { "" },
+            binary_read = if read == "binary" { " + PLACEBO" } else { "" },
+        )
+    };
+    for (read, reader) in [
+        ("none", Reader::Unread),
+        ("ctmm", Reader::NonDefiner),
+        ("binary", Reader::Definer),
+    ] {
+        let text = ctmm(read);
+        let parsed = parse_full_model(&text).unwrap_or_else(|e| panic!("{read}: {e}"));
+        assert_eq!(
+            parsed.model.theta_blocks().level_blocks()[0].level_capable_cmts,
+            [1, 2],
+            "fixture precondition: the binary and DTMM CMTs, not the CTMM's"
+        );
+        for mixed in [false, true] {
+            let cell = format!("read {read} × mixed {mixed}");
+            let mut pop = state_population();
+            if mixed {
+                // One record on the DTMM at CMT 2, which does not read the block, so it
+                // defines no level either and the refusal is still reached; but a reader
+                // there could make it define one, so the advice is actionable.
+                pop.subjects[0].obs_records.push(ObsRecord::DiscreteState {
+                    time: 9.0,
+                    raw_time: 9.0,
+                    state: 1,
+                    cmt: 2,
+                });
+            }
+            let mut parsed = parse_full_model(&text).unwrap();
+            let d = crate::api::levels::bind_theta_levels_diag(&mut parsed, &text, &mut pop)
+                .expect_err(&cell);
+            assert_eq!(d.code, "E_THETA_LEVEL_BINDING", "{cell}");
+            let m = &d.message;
+            for sentence in [NO_LEVELS, NO_GAUSSIAN, NO_READER] {
+                assert!(m.contains(sentence), "{cell}: missing {sentence:?} in {m}");
+            }
+            assert!(!m.contains(NO_ROWS), "{cell}: blames the data: {m}");
+            assert_data_paragraph_closed(&cell, m);
+            let want: &[&str] = match (reader, mixed) {
+                (Reader::Unread, false) => {
+                    &[UNREAD, READ_BARE, BARE_NO_DEFINER_DATA, DROP_STEP, ADD_ROWS]
+                }
+                (Reader::Unread, true) => &[UNREAD, READ_BARE],
+                (Reader::NonDefiner, false) => &[
+                    BARE_NO_DEFINER,
+                    BARE_WHY_SHORT,
+                    BARE_WHY,
+                    BARE_NO_DEFINER_DATA,
+                    SCALAR_STEP,
+                    ADD_ROWS,
+                ],
+                (Reader::NonDefiner, true) => {
+                    &[BARE_NO_DEFINER, BARE_WHY_GAUSSIAN, BARE_WHY, BARE_ADVICE]
+                }
+                (Reader::Definer, _) => &[BARE_NO_RECORDS],
+            };
+            for sentence in [UNREAD, READ_BARE].into_iter().chain(BARE_ANY) {
+                assert_eq!(
+                    m.contains(sentence),
+                    want.contains(&sentence),
+                    "{cell}: {sentence:?} in {m}"
+                );
+            }
+        }
+    }
 }

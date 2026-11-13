@@ -709,7 +709,8 @@ pub fn simulate_with_options_diag(
 
 /// [`simulate_with_options_diag`], building the drawn-parameter table only when
 /// `with_parameters` (#2505): the row-only wrapper discards it, so it does not pay for it.
-fn simulate_with_options_impl(
+/// `vpc_tte` calls it for the rows and warnings without the table (#1886).
+pub(super) fn simulate_with_options_impl(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -2040,6 +2041,8 @@ fn drawn_derived_columns(
                 cwres: vec![f64::NAN; n_obs],
                 npde: Vec::new(),
                 npd: Vec::new(),
+                epred: Vec::new(),
+                pwres: Vec::new(),
                 ofv_contribution: f64::NAN,
                 cens: subject.cens.clone(),
                 n_obs,

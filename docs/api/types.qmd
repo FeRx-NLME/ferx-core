@@ -123,7 +123,7 @@ pub struct FitOptions {
     pub interaction: bool,             // FOCEI flag
     pub verbose: bool,                 // Default: true
     pub optimizer: Optimizer,          // Default: Auto
-    pub lbfgs_memory: usize,           // Default: 5
+    pub lbfgs_memory: usize,           // Deprecated since 0.4.1: never read; removed at the next minor
     pub global_search: bool,           // Default: false
     pub global_maxeval: usize,         // Default: 0 (auto)
     // SAEM-specific
@@ -165,6 +165,7 @@ pub struct FitResult {
     pub omega_is_diagonal: Option<bool>, // packed layout of Ω (diagonal vs `block_omega`); None on hand-built results
     pub kappa_is_diagonal: Option<bool>, // same for the IOV κ block
     pub cov_fixed: Vec<bool>,     // rows of `covariance_matrix` the step held; empty without a matrix
+    pub held_at_bound: Vec<HeldAtBound>, // parameters with no SE: on a profiled bound, or collapsed on the internal guard (#2797)
     pub trace_csv: Option<String>, // the optimizer trace's text, when `optimizer_trace = true`
     pub interface_extras: Option<String>, // an interface's own JSON, stored and returned byte for byte
     pub n_iterations: usize,

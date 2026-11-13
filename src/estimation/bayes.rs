@@ -2262,6 +2262,9 @@ pub fn run_bayes(
         start_eval: None,
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement: None,
+        optimizer_stop: None,
+        eval_budget_spent: false,
     })
 }
 

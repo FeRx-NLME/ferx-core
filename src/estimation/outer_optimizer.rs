@@ -90,6 +90,17 @@ pub struct OuterResult {
     /// lifted onto [`crate::types::FitResult::final_gradient_source`], where the
     /// distinction is documented. `None` exactly when `final_gradient` is `None`.
     pub final_gradient_source: Option<String>,
+    /// The covariance step's Newton decrement at the estimate (#2785), lifted onto
+    /// [`crate::types::FitResult::newton_decrement`]. `None` when no step tested it.
+    pub newton_decrement: Option<f64>,
+    /// The outer optimizer's own stop state (#2785) — NLopt's status (`FtolReached`,
+    /// `Failure`, …) on the NLopt path — lifted onto
+    /// [`crate::types::FitResult::optimizer_stop`]. `None` where no optimizer reports one.
+    pub optimizer_stop: Option<String>,
+    /// Whether the outer optimizer spent its evaluation budget on the leg that produced
+    /// these estimates (#2799), lifted onto [`crate::types::FitResult::eval_budget_spent`].
+    /// The final state, after the latch and polish adjustments; `false` off the NLopt path.
+    pub eval_budget_spent: bool,
     /// Fallback proposal covariance for the SIR sampler, set when the FD
     /// Hessian is non-PD. Built from the `|eigenvalue|`-rectified free-block
     /// Hessian, inflated 4×, and embedded into the full packed parameter space.
@@ -197,27 +208,38 @@ pub(crate) fn resolve_outer_optimizer(
     // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
     // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
     // honoured — those route through `optimize_nlopt`, whose objective closure
-    // branches to `mixture_gradient`. Every other choice (including `auto`, and
-    // the built-in BFGS / trust-region paths, which do not carry the mixture
-    // objective) falls back to BOBYQA.
+    // branches to `mixture_gradient`. An explicit `bobyqa` is honoured too: it is
+    // the optimizer the mixture path runs, so nothing was replaced and no warning
+    // is owed (#2852). Every other choice (including `auto`, and the built-in
+    // BFGS / trust-region paths, which do not carry the mixture objective) falls
+    // back to BOBYQA.
     if has_mixture {
-        return match requested {
-            Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => (requested, None),
-            // `Auto` is the mixture default and downgrades silently by design;
-            // any *explicitly* chosen optimizer that the mixture path can't drive
-            // (built-in BFGS/L-BFGS, trust-region, Gauss-Newton — none carry the
-            // mixture objective) is run under BOBYQA instead, so say so rather than
-            // dropping the choice invisibly.
-            Optimizer::Auto => (Optimizer::Bobyqa, None),
-            other => (
-                Optimizer::Bobyqa,
-                Some(format!(
-                    "Mixture models are optimized with BOBYQA or an NLopt gradient method \
-                     (SLSQP / L-BFGS / MMA); the requested {other:?} optimizer does not carry \
-                     the mixture objective and was replaced by BOBYQA."
-                )),
-            ),
+        // Exhaustive, no wildcard: a new variant must say here whether it carries
+        // the mixture objective.
+        let resolved = match requested {
+            Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
+                requested
+            }
+            // `Auto` is the mixture default; the built-in BFGS / L-BFGS and
+            // trust-region paths do not carry the mixture objective.
+            Optimizer::Auto | Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => {
+                Optimizer::Bobyqa
+            }
         };
+        // The warning is owed exactly when an *explicit* choice did not run — keyed
+        // on the outcome, not on a second list of variants, so "replaced" can never
+        // be said of an optimizer that ran as requested (#2852). `Auto` asked for
+        // no optimizer in particular and resolves silently by design.
+        let replaced = requested != Optimizer::Auto && resolved != requested;
+        let warning = replaced.then(|| {
+            format!(
+                "Mixture models are optimized with BOBYQA or an NLopt gradient method \
+                 (SLSQP / L-BFGS / MMA); the requested `{}` optimizer does not carry \
+                 the mixture objective and was replaced by BOBYQA.",
+                requested.label()
+            )
+        });
+        return (resolved, warning);
     }
     (
         requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
@@ -431,6 +453,16 @@ pub fn optimize_population(
     if let Some(w) = outer_fd_fallback_warning(model, population, &declines) {
         result.warnings.push(w);
     }
+    // #2713: a gradient-driven stop short of convergence reports how far its final
+    // gradient is from the exact one.
+    stop::attach_stop_report(
+        resolved,
+        model,
+        population,
+        init_params,
+        options,
+        &mut result,
+    );
     result
 }
 
@@ -1180,6 +1212,7 @@ fn evaluate_at_initial_params(
     // Mixture (#983 Phase 6): the covariance step now builds its FD Hessian on the
     // K-fold mixture OFV (`compute_covariance` branches on `template.mixture`), so
     // it runs for mixtures exactly like the single-population path.
+    let newton_decrement;
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
         let out = crate::estimation::covariance::run_covariance_step(
             &x,
@@ -1198,8 +1231,11 @@ fn evaluate_at_initial_params(
             warnings: cov_warnings,
             sir_fallback_proposal,
             method: covariance_method,
+            newton_decrement: decrement,
+            non_stationary_optimum: _,
         } = out;
         warnings.extend(cov_warnings);
+        newton_decrement = decrement;
         (
             matrix,
             wall_time_secs,
@@ -1247,6 +1283,9 @@ fn evaluate_at_initial_params(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
+        newton_decrement,
+        optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 
@@ -5567,6 +5606,8 @@ pub(crate) fn optimize_nlopt(
             warnings,
             sir_fallback_proposal,
             method,
+            newton_decrement,
+            non_stationary_optimum,
         } = crate::estimation::covariance::run_covariance_step(
             &x_hat,
             init_params,
@@ -5583,6 +5624,15 @@ pub(crate) fn optimize_nlopt(
         result.covariance_wall_time_secs = wall_time_secs;
         result.sir_fallback_proposal = sir_fallback_proposal;
         result.warnings.extend(warnings);
+        result.newton_decrement = newton_decrement;
+        // #2785: whatever NLopt and the plateau rule concluded, the point the fit reports
+        // is not stationary — the stop the issue traced was a bare `Failure` the #751
+        // plateau check accepted on an OFV trace that had stopped falling.
+        crate::estimation::covariance::demote_non_stationary_optimum(
+            non_stationary_optimum,
+            &mut result.converged,
+            &mut result.warnings,
+        );
     }
     result
 }
@@ -8418,6 +8468,9 @@ fn optimize_nlopt_attempt_probed(
     // used — it still reads O(1) at these genuine optima; the resolution block
     // explains why.)
     let mut stationarity_check_pending = false;
+    // #2785: NLopt's own word, published beside the verdict below, which can overrule it in
+    // either direction.
+    let optimizer_stop = Some(nlopt_stop_label(&result));
     let mut converged = match &result {
         Ok((status, _)) => {
             if options.verbose {
@@ -8999,6 +9052,7 @@ fn optimize_nlopt_attempt_probed(
     // mixtures too. The `final_ehs`/`final_hms` handed in are the MIXEST-class
     // EBEs; the mixture branch reconverges per class internally and does not use
     // them as a warm start.
+    let newton_decrement;
     let (covariance_matrix, covariance_wall_time_secs, sir_fallback_proposal, covariance_method) = {
         let out = if defer_covariance {
             crate::estimation::covariance::CovStepOutcome::skipped()
@@ -9021,8 +9075,15 @@ fn optimize_nlopt_attempt_probed(
             warnings: cov_warnings,
             sir_fallback_proposal,
             method: covariance_method,
+            newton_decrement: decrement,
+            non_stationary_optimum,
         } = out;
         warnings.extend(cov_warnings);
+        newton_decrement = decrement;
+        // #2785: the "did not converge" line below covers this demotion too.
+        if non_stationary_optimum {
+            converged = false;
+        }
         (
             matrix,
             wall_time_secs,
@@ -9140,6 +9201,12 @@ fn optimize_nlopt_attempt_probed(
         start_eval: inherited_start.unwrap_or(start_eval.get()),
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement,
+        optimizer_stop,
+        // #2799: the final budget state — after the polish (`PolishEnd::BudgetSpent`), a
+        // verified stop and a stagnation latch on the last permitted eval have each had their
+        // say above, so it is the same fact the "increase maxiter" warning is gated on.
+        eval_budget_spent: max_eval_reached,
     };
     (
         result,
@@ -9152,6 +9219,19 @@ fn optimize_nlopt_attempt_probed(
             plateau_checked: stationarity_check_pending,
         },
     )
+}
+
+/// NLopt's stop state as the fit publishes it (#2785): the `SuccessState` / `FailState`
+/// variant name (`FtolReached`, `Failure`, `RoundoffLimited`, …), the same word the verbose
+/// log prints after "NLopt finished:" / "NLopt stopped:". `converged` is a verdict built on
+/// this and on checks after it, and can overrule it either way — a bare `Failure` at a
+/// plateau is converged (#751), an `FtolReached` at a non-stationary point is not (#2785) —
+/// so the raw state is kept beside it for a reader asking why.
+fn nlopt_stop_label<T>(result: &Result<(nlopt::SuccessState, T), (nlopt::FailState, T)>) -> String {
+    match result {
+        Ok((status, _)) => format!("{status:?}"),
+        Err((fail, _)) => format!("{fail:?}"),
+    }
 }
 
 /// Whether a run that stopped mid-descent is worth restarting from its own best
@@ -9531,11 +9611,15 @@ fn optimize_bfgs(
     // Best accepted iterate, so an interrupted run's checkpoint holds it (#1317).
     let mut best = BestPoint::new();
 
+    // #2799: as in pure Gauss–Newton, every `break` below sets this, so a loop that runs off
+    // the end of `outer_maxiter` spent its budget.
+    let mut exited_early = false;
     for iter in 1..=options.outer_maxiter {
         n_iterations = iter;
 
         if crate::cancel::is_cancelled(&options.cancel) {
             warnings.push("cancelled by user".to_string());
+            exited_early = true;
             break;
         }
 
@@ -9550,6 +9634,7 @@ fn optimize_bfgs(
                 eprintln!("Converged at iteration {} (|g| = {:.2e})", iter, g_norm);
             }
             converged = true;
+            exited_early = true;
             break;
         }
 
@@ -9579,6 +9664,7 @@ fn optimize_bfgs(
                 if options.verbose {
                     eprintln!("Stopping: line search stalled at iteration {}", iter);
                 }
+                exited_early = true;
                 break;
             }
             s_hist.clear();
@@ -9713,6 +9799,7 @@ fn optimize_bfgs(
                 );
             }
             converged = true;
+            exited_early = true;
             break;
         }
     }
@@ -9754,8 +9841,14 @@ fn optimize_bfgs(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum,
     } = out;
     warnings.extend(cov_warnings);
+    // #2785: the "did not converge" line below covers this demotion too.
+    if non_stationary_optimum {
+        converged = false;
+    }
 
     // #1303 — same gate as the NLopt path above, on this path's own `final_ofv`,
     // which is likewise recomputed by the final inner loop and can therefore
@@ -9802,6 +9895,12 @@ fn optimize_bfgs(
         impmap_trace: None,
         bayes: None,
         cond_dist: None,
+        newton_decrement,
+        optimizer_stop: None,
+        eval_budget_spent: crate::estimation::gauss_newton::gn_loop_budget_spent(
+            options.outer_maxiter,
+            exited_early,
+        ),
     }
 }
 
@@ -9846,7 +9945,7 @@ pub(crate) fn reconverged_fd_gradient(
         |xv: &[f64]| reconverged_probe_ofv(xv, init_params, model, population, &warm, options);
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
@@ -10151,7 +10250,7 @@ fn reporting_fd_gradient(
             raw
         }
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
@@ -10170,7 +10269,9 @@ fn reporting_fd_gradient(
 /// Coordinate `k` is stepped by [`fd_step`]`(1e-4, xₖ, floor[k])`, `floor` from
 /// [`fd_step_floors`]: `1e-4·(1 + |xₖ|)` on every coordinate but a small identity-packed θ,
 /// which is stepped relative to its declared magnitude rather than by an absolute `1e-4` in
-/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187).
+/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187). A
+/// `[covariate_nn]` weight is identity-packed too but keeps the unit floor, since its θ₀ is
+/// a draw rather than a declared magnitude (#2406).
 fn central_diff_packed(
     x: &[f64],
     fixed: &[bool],
@@ -10534,7 +10635,7 @@ pub(crate) fn subject_reconverged_fd_gradient(
             options.interaction,
         )
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
@@ -10589,7 +10690,7 @@ fn subject_reconverged_fd_gradient_iov(
                 .expect("IOV model (n_kappa > 0) has omega_iov"),
         )
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     central_diff_packed(x, &fixed, &floor, bounds, eval)
 }
 
@@ -10622,6 +10723,7 @@ fn subject_analytic_outer_gradient(
 
 /// [`subject_analytic_outer_gradient`], and with `want_eta_dx` the subject's mode response
 /// `dη̂/dx` formed from the same recording; the response is `None` wherever the gradient is.
+/// A declined gradient comes back as its [`DeclineCause`] (#2713).
 fn subject_analytic_outer_gradient_dx(
     model: &CompiledModel,
     subject: &Subject,
@@ -10629,23 +10731,36 @@ fn subject_analytic_outer_gradient_dx(
     eta_hat: &[f64],
     interaction: bool,
     want_eta_dx: bool,
-) -> (Option<Vec<f64>>, Option<Vec<DVector<f64>>>) {
-    if !want_eta_dx || (subject.observations.is_empty() && subject.obs_records.is_empty()) {
-        return (
-            subject_analytic_outer_gradient(model, subject, pt, eta_hat, interaction),
-            None,
-        );
+) -> (Result<Vec<f64>, DeclineCause>, Option<Vec<DVector<f64>>>) {
+    use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_and_mode_at, ModeOut};
+    // No data at all contributes nothing (`sens_outer_gradient::subject_gradient_at`).
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        return (Ok(vec![0.0; pt.x.len()]), None);
     }
-    let (g, dx) = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_with_eta_dx_at(
-        model,
-        subject,
-        pt,
-        eta_hat,
-        interaction,
-    );
-    match g.filter(|g| g.iter().all(|v| v.is_finite())) {
-        Some(g) => (Some(g), dx),
-        None => (None, None),
+    let objective = if interaction {
+        crate::sens::ode_provider::adjoint::Objective::Focei
+    } else {
+        crate::sens::ode_provider::adjoint::Objective::Foce
+    };
+    let mut out = ModeOut {
+        want_dx: want_eta_dx,
+        ..ModeOut::default()
+    };
+    let g = subject_adjoint_gradient_and_mode_at(model, subject, pt, eta_hat, objective, &mut out);
+    match g {
+        Some(g) if g.iter().all(|v| v.is_finite()) => (Ok(g), out.eta_dx),
+        _ if out.mode_system_declined => (Err(DeclineCause::ModeSystem), None),
+        _ => (Err(DeclineCause::Recording), None),
+    }
+}
+
+/// The analytic gradient where `x` is not the template's packed length: the adjoint
+/// declines, but a subject with no data at all keeps the zero gradient it gives one.
+fn packed_length_decline(subject: &Subject, np: usize) -> Result<Vec<f64>, DeclineCause> {
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        Ok(vec![0.0; np])
+    } else {
+        Err(DeclineCause::Recording)
     }
 }
 
@@ -11042,10 +11157,37 @@ pub(crate) struct OuterFdDeclineLog {
     /// admits is exactly such a gradient. Keyed on the route the subject took, not on the
     /// model-level predicate.
     reconverge_declined: bool,
+    /// Per declined subject, the [`DeclineCause`]s it declined for over the fit, one bit
+    /// each: a subject can decline at its mode system on some trial points and in its
+    /// recording on others (#2713).
+    causes: Vec<std::sync::atomic::AtomicU8>,
     /// Test switch: subjects whose analytic outer gradient is treated as declined, so a
     /// test can reach a *numerical* decline on a fixture the adjoint serves.
     #[cfg(test)]
     forced: Vec<std::sync::atomic::AtomicBool>,
+}
+
+/// Why the analytic outer gradient declined a subject (#2713). A large fallback share has
+/// two readings with different remedies, which the warning counts apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclineCause {
+    /// The mode system `H w = ∇_η F` would not solve: `H` singular at `η̂`, or indefinite at
+    /// an `η̂` that is not stationary, an EBE off a strict mode.
+    ModeSystem,
+    /// No recorder served the subject there: its data shape is outside the recorders'
+    /// scope, or the recording failed or came back non-finite at that point. Which of the
+    /// two is [`is_structural_decline`]'s question, asked for the salvage.
+    Recording,
+}
+
+impl DeclineCause {
+    /// This cause's bit in [`OuterFdDeclineLog::causes`].
+    fn bit(self) -> u8 {
+        match self {
+            DeclineCause::ModeSystem => 1,
+            DeclineCause::Recording => 2,
+        }
+    }
 }
 
 impl OuterFdDeclineLog {
@@ -11059,6 +11201,9 @@ impl OuterFdDeclineLog {
                 .collect(),
             skipped_salvages: AtomicUsize::new(0),
             reconverge_declined: false,
+            causes: (0..n_subjects)
+                .map(|_| std::sync::atomic::AtomicU8::new(0))
+                .collect(),
             #[cfg(test)]
             forced: (0..n_subjects)
                 .map(|_| std::sync::atomic::AtomicBool::new(false))
@@ -11080,9 +11225,28 @@ impl OuterFdDeclineLog {
         self.forced[i].store(true, Ordering::Relaxed);
     }
 
+    /// The cause a forced decline reports: a numerical one, at the mode system.
     #[cfg(test)]
-    fn is_forced(&self, i: usize) -> bool {
-        self.forced[i].load(Ordering::Relaxed)
+    fn forced_cause(&self, i: usize) -> Option<DeclineCause> {
+        self.forced[i]
+            .load(Ordering::Relaxed)
+            .then_some(DeclineCause::ModeSystem)
+    }
+
+    /// Record why subject `i` declined on this evaluation (#2713). Rayon workers,
+    /// `Relaxed`, as [`Self::record`].
+    pub(crate) fn record_cause(&self, i: usize, cause: DeclineCause) {
+        if let Some(bits) = self.causes.get(i) {
+            bits.fetch_or(cause.bit(), Ordering::Relaxed);
+        }
+    }
+
+    /// How many subjects declined for `cause` at least once.
+    fn n_cause(&self, cause: DeclineCause) -> usize {
+        self.causes
+            .iter()
+            .filter(|b| b.load(Ordering::Relaxed) & cause.bit() != 0)
+            .count()
     }
 
     /// Mark subject `i` as having taken the FD outer gradient on this evaluation.
@@ -11100,6 +11264,13 @@ impl OuterFdDeclineLog {
         if let Some(flag) = self.structural.get(i) {
             flag.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Whether subject `i` declined structurally on some evaluation.
+    fn is_structural(&self, i: usize) -> bool {
+        self.structural
+            .get(i)
+            .is_some_and(|f| f.load(Ordering::Relaxed))
     }
 
     /// How many declined subjects were structural declines.
@@ -11211,10 +11382,42 @@ pub(crate) fn outer_fd_fallback_warning(
     };
     Some(format!(
         "{n_fd} of {n_total} subjects could not be given the exact analytic outer \
-         gradient during this fit{example} (a shape no analytic recorder serves, or a trial \
-         point where it could not be formed) and {consequence} The reported \
-         outer gradient method is the model-level route, not the per-subject one.{skipped}"
+         gradient during this fit{example} ({why}) and {consequence} The reported \
+         outer gradient method is the model-level route, not the per-subject one.{skipped}",
+        why = decline_causes_clause(log),
     ))
+}
+
+/// The parenthesis of [`outer_fd_fallback_warning`] that says why the subjects declined
+/// (#2713): one clause per [`DeclineCause`] some subject declined for, with its count. The
+/// counts cover every trial point of the fit, rejected ones included, and a subject that
+/// declined for both causes counts under each. A log no route stamped a cause on (the
+/// quadrature's) keeps the generic sentence.
+fn decline_causes_clause(log: &OuterFdDeclineLog) -> String {
+    let parts: Vec<String> = [
+        (
+            DeclineCause::ModeSystem,
+            "with an inner Hessian at the EBE that was singular, or indefinite at an EBE \
+             that was not stationary (an EBE off a strict mode), at some trial point",
+        ),
+        (
+            DeclineCause::Recording,
+            "with a shape no analytic recorder serves, or a recording that failed or came \
+             back non-finite at some trial point",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(cause, text)| match log.n_cause(cause) {
+        0 => None,
+        n => Some(format!("{n} {text}")),
+    })
+    .collect();
+    if parts.is_empty() {
+        "a shape no analytic recorder serves, or a trial point where it could not be formed"
+            .to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 /// `population_gradient_sens_mixed_dx` without the mode responses.
@@ -11313,24 +11516,19 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                     options.interaction,
                     want_eta_dx,
                 ),
-                // `x` is not the template's packed length: the adjoint declines, but a subject
-                // with no observations keeps the zero gradient it gives one.
-                None => (
-                    (subject.observations.is_empty() && subject.obs_records.is_empty())
-                        .then(|| vec![0.0; x.len()]),
-                    None,
-                ),
+                None => (packed_length_decline(subject, x.len()), None),
             };
             #[cfg(test)]
-            let analytic = analytic.filter(|_| !declines.is_forced(i));
+            let analytic = declines.forced_cause(i).map_or(analytic, Err);
             let g = match analytic {
                 // Keep the exact analytic gradient for in-scope, finite subjects.
-                Some(g) => g,
+                Ok(g) => g,
                 // Out-of-scope (or non-finite analytic) → per-subject salvage (held-EBE,
                 // or reconverged for a structural decline, #1536), unless the trial point
                 // has blown up (#1520).
-                None => {
+                Err(cause) => {
                     declines.record(i);
+                    declines.record_cause(i, cause);
                     let structural =
                         is_structural_decline(model, subject, init_params, ehs[i].as_slice());
                     if structural {
@@ -11345,12 +11543,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                         declines,
                         || {
                             non_iov_declined_salvage(
-                                // A non-Gaussian subject's held-EBE score drops the EBE
-                                // response it depends on strongly (#1778): reconverge it.
-                                structural
-                                    || declines.reconverge_declined
-                                    || (!subject.obs_records.is_empty()
-                                        && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model)),
+                                declined_salvage_reconverges(model, subject, structural, declines),
                                 x,
                                 init_params,
                                 model,
@@ -11395,6 +11588,23 @@ pub(crate) fn population_gradient_sens_mixed_dx(
     (grad, eta_dx)
 }
 
+/// Whether a declined non-IOV subject takes the reconverged salvage in
+/// [`population_gradient_sens_mixed_dx`] rather than the held-EBE one: a structural decline
+/// (#1536), a log that reconverges every decline (#2136), or a non-Gaussian subject, whose
+/// held-EBE score drops the EBE response it depends on strongly (#1778). The stop report
+/// (#2713) asks the same question to count the subjects left on the held-EBE fallback.
+pub(crate) fn declined_salvage_reconverges(
+    model: &CompiledModel,
+    subject: &Subject,
+    structural: bool,
+    declines: &OuterFdDeclineLog,
+) -> bool {
+    structural
+        || declines.reconverge_declined
+        || (!subject.obs_records.is_empty()
+            && crate::estimation::gauss_newton::fixed_ebe_score_drops_ebe_response(model))
+}
+
 /// One IOV subject's exact analytic packed outer gradient at the stacked mode
 /// `stacked = [η̂, κ̂₁ … κ̂_K]`, or `None` when the adjoint declines it. `pt` is `None` when
 /// `x` is not the template's packed length: the adjoint declines then, but a subject with no
@@ -11409,17 +11619,20 @@ fn subject_iov_analytic_gradient(
     stacked: &DVector<f64>,
     np: usize,
     options: &FitOptions,
-) -> Option<Vec<f64>> {
+) -> Result<Vec<f64>, DeclineCause> {
     match pt {
-        Some(pt) => subject_analytic_outer_gradient(
-            model,
-            subject,
-            pt,
-            stacked.as_slice(),
-            options.interaction,
-        ),
-        None => (subject.observations.is_empty() && subject.obs_records.is_empty())
-            .then(|| vec![0.0; np]),
+        Some(pt) => {
+            subject_analytic_outer_gradient_dx(
+                model,
+                subject,
+                pt,
+                stacked.as_slice(),
+                options.interaction,
+                false,
+            )
+            .0
+        }
+        None => packed_length_decline(subject, np),
     }
 }
 
@@ -11441,7 +11654,7 @@ pub(crate) fn subject_iov_outer_gradient(
     options: &FitOptions,
 ) -> Vec<f64> {
     subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options).unwrap_or_else(
-        || {
+        |_| {
             subject_reconverged_fd_gradient_iov(
                 x,
                 init_params,
@@ -11490,9 +11703,10 @@ pub(crate) fn population_gradient_sens_iov_mixed(
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
             match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
             {
-                Some(g) => g,
-                None => {
+                Ok(g) => g,
+                Err(cause) => {
                     declines.record(i);
+                    declines.record_cause(i, cause);
                     declined_subject_gradient(
                         np,
                         population,
@@ -12015,6 +12229,9 @@ fn covariance_gradient(
         x, n_subj, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
     )
 }
+
+#[path = "outer_optimizer_stop.rs"]
+mod stop;
 
 #[cfg(test)]
 #[path = "outer_optimizer_tests.rs"]

@@ -558,7 +558,9 @@ fn whitened_autocorrelation_reads_the_subjects_own_residual_scale() {
         warnings: vec![],
     };
     let got = whitened_residual_autocorrelation(&model, &pop, &params, std::slice::from_ref(&res));
-    let want = residual_autocorrelation(std::iter::once(z.as_slice()));
+    // Split by block (#2798): ARM [1, 1, 2, 1, 2] is rows {0, 1, 3} and {2, 4}.
+    let blocks = [vec![z[0], z[1], z[3]], vec![z[2], z[4]]];
+    let want = residual_autocorrelation(blocks.iter().map(Vec::as_slice));
     assert!(got.0.is_finite() && got.1.is_finite(), "{got:?}");
     assert_relative_eq!(got.0, want.0, max_relative = 1e-12);
     assert_relative_eq!(got.1, want.1, max_relative = 1e-12);
@@ -606,7 +608,9 @@ fn whitened_autocorrelation_is_the_statistic_of_l_inverse_residuals() {
         warnings: vec![],
     };
     let got = whitened_residual_autocorrelation(&model, &pop, &params, std::slice::from_ref(&res));
-    let want = residual_autocorrelation(std::iter::once(z.as_slice()));
+    // Split by block (#2798): ARM [1, 1, 2, 1, 2] is rows {0, 1, 3} and {2, 4}.
+    let blocks = [vec![z[0], z[1], z[3]], vec![z[2], z[4]]];
+    let want = residual_autocorrelation(blocks.iter().map(Vec::as_slice));
     assert!(got.0.is_finite() && got.1.is_finite(), "{got:?}");
     assert_relative_eq!(got.0, want.0, max_relative = 1e-12);
     assert_relative_eq!(got.1, want.1, max_relative = 1e-12);
@@ -615,4 +619,243 @@ fn whitened_autocorrelation_is_the_statistic_of_l_inverse_residuals() {
         (raw.1 - want.1).abs() > 0.1,
         "raw {raw:?} vs whitened {want:?}"
     );
+    // B4 (#2798), by hand: the blocks [0.8, −0.3, 0.4] and [1.1, −0.9] have squared
+    // steps 1.21 + 0.49 + 4.00 = 5.70 over pair means 0.365 + 0.125 + 1.01 = 1.5, so
+    // DW = 3.8. The whole series would pair across the blocks: 5.35 / 2.185 = 2.4485.
+    // This fixture has no `occasions`, so the split here is `obs_rgroup` alone.
+    assert!(pop.subjects[0].occasions.is_empty());
+    assert!(
+        (got.1 - 3.8).abs() < 1e-12,
+        "whitened DW split by residual block: 3.8, got {}",
+        got.1
+    );
+}
+
+/// B5 (#2798): rows are grouped by key, not by contiguous run. Two occasions written
+/// interleaved, `[1, 2, 1, 2]`, give the same series — and the same statistic — as the
+/// same rows written contiguously, `[1, 1, 2, 2]`, with the values reordered to match.
+/// Each occasion's values are `[1, 2]` and `[−1, 3]`: steps 1 and 16 over pair means
+/// 2.5 and 5, DW = 17 / 7.5.
+///
+///
+/// Both layouts are parallel (#2829): the interleaved one because its labels come
+/// back, the contiguous one because its clock restarts at the second occasion.
+///
+/// Mutation that must redden this: grouping by contiguous run of the key (the
+/// interleaved layout would then be four one-row series and no pair at all).
+#[test]
+fn grouped_dw_groups_by_key_not_by_contiguous_run() {
+    let pop_of = |occasions: Vec<u32>, obs_times: Vec<f64>| crate::types::Population {
+        subjects: vec![Subject {
+            obs_times,
+            observations: vec![0.0; 4],
+            obs_cmts: vec![1; 4],
+            occasions,
+            ..Default::default()
+        }],
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let res_of = |iwres: Vec<f64>| {
+        let mut r = crate::types::test_helpers::dummy_subject("1", 0, 4);
+        r.iwres = iwres;
+        r
+    };
+    for (occ, times) in [
+        (vec![1, 2, 1, 2], vec![0.0, 0.0, 1.0, 1.0]),
+        (vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0]),
+    ] {
+        assert!(
+            !occasions_run_in_time(&pop_of(occ.clone(), times).subjects[0]),
+            "{occ:?} must be parallel, or the key is never read"
+        );
+    }
+    let interleaved = grouped_iwres_autocorrelation(
+        &pop_of(vec![1, 2, 1, 2], vec![0.0, 0.0, 1.0, 1.0]),
+        &[res_of(vec![1.0, -1.0, 2.0, 3.0])],
+    );
+    let contiguous = grouped_iwres_autocorrelation(
+        &pop_of(vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0]),
+        &[res_of(vec![1.0, 2.0, -1.0, 3.0])],
+    );
+    assert!(interleaved.1.is_finite() && contiguous.1.is_finite());
+    assert!(
+        (contiguous.1 - 17.0 / 7.5).abs() < 1e-12,
+        "contiguous: {}",
+        contiguous.1
+    );
+    assert_eq!(interleaved.1.to_bits(), contiguous.1.to_bits());
+    assert_eq!(interleaved.0.to_bits(), contiguous.0.to_bits());
+}
+
+/// #2798 review row 2: the key is the **pair** `(occasion, residual block)`, not
+/// either part alone, nor occasions-if-present-else-block. Two occasions crossed with
+/// two blocks give four cells of two rows each; every other key joins rows across a
+/// cell boundary and lands on a different value, which the test computes and asserts
+/// apart (so the straddle cannot quietly become a tautology).
+///
+/// Rows `e = [1, 2 | 3, 1 | −1, 1 | 2, 2]`, cells `(1,0) (1,1) (2,0) (2,1)`:
+/// pairs (1,2) (3,1) (−1,1) (2,2), Σ diff² = 1 + 4 + 4 + 0 = 9,
+/// Σ (eₜ²+eₜ₋₁²)/2 = 2.5 + 5 + 1 + 4 = 12.5, DW = 0.72.
+/// Occasion alone: 11 / 21.5 = 0.5116. Block alone: 19 / 17.5 = 1.0857.
+#[test]
+fn grouped_dw_keys_on_occasion_and_block_together() {
+    // The two occasions are parallel: each restarts the clock (#2829).
+    let pop_of = |occasions: Vec<u32>, obs_rgroup: Vec<u32>| crate::types::Population {
+        subjects: vec![Subject {
+            obs_times: (0..8).map(|j| f64::from(j % 4)).collect(),
+            observations: vec![0.0; 8],
+            obs_cmts: vec![1; 8],
+            occasions,
+            obs_rgroup,
+            ..Default::default()
+        }],
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let mut res = crate::types::test_helpers::dummy_subject("1", 0, 8);
+    res.iwres = vec![1.0, 2.0, 3.0, 1.0, -1.0, 1.0, 2.0, 2.0];
+    let res = [res];
+    let occ = vec![1, 1, 1, 1, 2, 2, 2, 2];
+    let grp = vec![0, 0, 1, 1, 0, 0, 1, 1];
+    assert!(!occasions_run_in_time(
+        &pop_of(occ.clone(), grp.clone()).subjects[0]
+    ));
+    let both = grouped_iwres_autocorrelation(&pop_of(occ.clone(), grp.clone()), &res).1;
+    let occ_only = grouped_iwres_autocorrelation(&pop_of(occ, vec![]), &res).1;
+    let grp_only = grouped_iwres_autocorrelation(&pop_of(vec![], grp), &res).1;
+    assert!(both.is_finite() && occ_only.is_finite() && grp_only.is_finite());
+    assert!(
+        (occ_only - 11.0 / 21.5).abs() < 1e-12,
+        "occasion only: {occ_only}"
+    );
+    assert!(
+        (grp_only - 19.0 / 17.5).abs() < 1e-12,
+        "block only: {grp_only}"
+    );
+    assert!(
+        (both - 9.0 / 12.5).abs() < 1e-12,
+        "(occasion, block): {both}, occasion alone {occ_only}, block alone {grp_only}"
+    );
+}
+
+/// T7 (#2829): only the **occasion** part of the key is gated on the clock. The
+/// fixture of the test above with the occasions in time (`obs_times = 0..8`): the
+/// occasions are joined, the two residual blocks still split, so the statistic is
+/// the block-alone one, `19 / 17.5`, bit for bit what the same rows give with no
+/// occasions at all. The parallel twin (clock restarting) is `9 / 12.5`.
+///
+/// Mutation that must redden this: the residual-block part gated by the predicate
+/// too (in time, nothing splits: the whole series, `15 / 22.5`).
+#[test]
+fn occasions_in_time_still_split_at_residual_blocks() {
+    let pop_of = |occasions: Vec<u32>, obs_times: Vec<f64>| crate::types::Population {
+        subjects: vec![Subject {
+            obs_times,
+            observations: vec![0.0; 8],
+            obs_cmts: vec![1; 8],
+            occasions,
+            obs_rgroup: vec![0, 0, 1, 1, 0, 0, 1, 1],
+            ..Default::default()
+        }],
+        covariate_names: vec![],
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    };
+    let mut res = crate::types::test_helpers::dummy_subject("1", 0, 8);
+    res.iwres = vec![1.0, 2.0, 3.0, 1.0, -1.0, 1.0, 2.0, 2.0];
+    let res = [res];
+    let occ = vec![1, 1, 1, 1, 2, 2, 2, 2];
+    let running: Vec<f64> = (0..8).map(f64::from).collect();
+    let restarting: Vec<f64> = (0..8).map(|j| f64::from(j % 4)).collect();
+    let in_time = grouped_iwres_autocorrelation(&pop_of(occ.clone(), running.clone()), &res);
+    let no_occ = grouped_iwres_autocorrelation(&pop_of(vec![], running), &res);
+    let parallel = grouped_iwres_autocorrelation(&pop_of(occ, restarting), &res);
+    assert!(in_time.1.is_finite() && no_occ.1.is_finite() && parallel.1.is_finite());
+    assert!(
+        (in_time.1 - 19.0 / 17.5).abs() < 1e-12,
+        "block only: {}",
+        in_time.1
+    );
+    assert_eq!(in_time.1.to_bits(), no_occ.1.to_bits());
+    assert_eq!(in_time.0.to_bits(), no_occ.0.to_bits());
+    assert!(
+        (parallel.1 - 9.0 / 12.5).abs() < 1e-12,
+        "(occasion, block): {}",
+        parallel.1
+    );
+}
+
+/// T7b (#2829, plan amendment 1): the **whitened** statistic inherits the gate,
+/// because it lives in `split_by_residual_group` and not in the raw entry. One
+/// residual block (`ARM` constant) holding occasions `[1, 1, 2, 2]`: in time the
+/// result is bit for bit the one with no occasions; with the clock restarted at the
+/// boundary it differs.
+///
+/// The model is `cs`, whose `R` does not read the times, so the three fixtures
+/// whiten to the same `w` and only the split can tell them apart.
+///
+/// Mutation that must redden this: the gate moved from `split_by_residual_group` to
+/// `grouped_iwres_autocorrelation` (the whitened path then splits the in-time arm).
+#[test]
+fn whitened_dw_joins_occasions_that_run_in_time() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVY(10.0, 1.0, 100.0)\n  theta RHO(0.4) FIX\n  sigma ADD_ERR ~ 1.5 (sd)\n\
+         [individual_parameters]\n  Y0 = TVY\n[structural_model]\n  y = Y0\n[error_model]\n  \
+         DV ~ additive(ADD_ERR)\n  correlation cs(RHO) by ARM\n",
+    )
+    .expect("parses");
+    let params = model.default_params.clone();
+    let z = [0.8, -0.3, 1.1, 0.4];
+    let run = |occasions: Vec<u32>, obs_times: Vec<f64>| {
+        let mut s = subject_with(&[Some(1.0); 4]);
+        s.obs_times = obs_times;
+        s.obs_rgroup = residual_groups(&model, &s);
+        assert_eq!(s.obs_rgroup, vec![1; 4], "one residual block");
+        s.occasions = occasions;
+        let ipred = vec![10.0; 4];
+        let r = r_matrix_maybe_scaled(
+            &model.error_spec,
+            &ipred,
+            &[1; 4],
+            &s,
+            &params.sigma.values,
+            model.residual_cov_at(&params),
+            None,
+        );
+        assert!(r[(0, 1)].abs() > 0.1, "the block must be correlated: {r}");
+        let e = r.clone().cholesky().expect("PD").l() * nalgebra::DVector::from_row_slice(&z);
+        s.observations = (0..4).map(|j| ipred[j] + e[j]).collect();
+        let mut res = crate::types::test_helpers::dummy_subject("1", 0, 4);
+        res.ipred = ipred;
+        res.iwres = (0..4).map(|j| e[j] / r[(j, j)].sqrt()).collect();
+        let pop = crate::types::Population {
+            subjects: vec![s],
+            covariate_names: vec!["ARM".into()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        whitened_residual_autocorrelation(&model, &pop, &params, std::slice::from_ref(&res))
+    };
+    let running = vec![0.0, 1.0, 2.0, 3.0];
+    let in_time = run(vec![1, 1, 2, 2], running.clone());
+    let no_occ = run(vec![], running);
+    let parallel = run(vec![1, 1, 2, 2], vec![0.0, 1.0, 0.0, 1.0]);
+    assert!(in_time.1.is_finite() && no_occ.1.is_finite() && parallel.1.is_finite());
+    assert_eq!(in_time.1.to_bits(), no_occ.1.to_bits(), "DW");
+    assert_eq!(in_time.0.to_bits(), no_occ.0.to_bits(), "lag-1 r");
+    // By hand on `z`: whole, steps 1.21 + 1.96 + 0.49 over 0.365 + 0.65 + 0.685;
+    // split at the occasion, steps 1.21 + 0.49 over 0.365 + 0.685.
+    assert_relative_eq!(in_time.1, 3.66 / 1.7, max_relative = 1e-12);
+    assert_relative_eq!(parallel.1, 1.70 / 1.05, max_relative = 1e-12);
 }

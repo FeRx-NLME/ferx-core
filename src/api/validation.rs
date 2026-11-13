@@ -5100,7 +5100,7 @@ pub(crate) fn check_survival_tv_covariates(
                         return refuse(
                             "binary_model",
                             format!(
-                                "[binary_model] on CMT={cmt}: the logit predictor references \
+                                "[binary_model] on CMT={cmt}: the linear predictor references \
                                  {}, which is time-varying for subject `{}`, but that subject \
                                  carries no per-record covariate snapshot aligned with its \
                                  binary records (it also has time-to-event records, or was \

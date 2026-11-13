@@ -450,6 +450,27 @@ fn a_pinned_plan_also_caps_a_multi_start_fit() {
 }
 
 #[test]
+fn a_fit_names_a_pinned_thread_count_as_the_source_of_its_width() {
+    // The `fit()` end of the #2800 wiring (#2813 review row 1): with one more worker than
+    // subjects the subjects note fires, and it must say the width came from `threads`.
+    // The environment cannot change this cell — a pin is never overridden by it — so the
+    // test needs no `set_var`.
+    let model = one_cpt_model();
+    let pop = population();
+    let mut opts = short_fit_opts();
+    opts.threads = Some(pop.subjects.len() + 1);
+
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    assert_eq!(result.n_threads_used, pop.subjects.len() + 1);
+    let note = result
+        .warnings
+        .iter()
+        .find(|w| w.contains("threads configured"))
+        .unwrap_or_else(|| panic!("no subjects note in {:?}", result.warnings));
+    assert!(note.contains("(pinned by `threads`)"), "{note}");
+}
+
+#[test]
 fn a_fit_is_bit_identical_across_thread_counts() {
     // The reduction order guard from #703, re-pinned from the tool's angle: a
     // bootstrap that changes `threads_per_fit` must not change the estimates.
@@ -531,9 +552,11 @@ fn work_outside_a_fit_runs_on_a_ferx_pool_of_the_requested_width() {
     // pool was never built at all, which no core count can fake.
     // Both routes to a pool are exercised, and which one a given width takes is a
     // property of the host: the shared default pool when it is already that wide (no new
-    // threads at all), a lease from `fit()`'s own cache otherwise. `default_thread_count()`
-    // is the first by construction and `+ 5` cannot be, on any machine.
-    for n in [default_thread_count(), default_thread_count() + 5, 3] {
+    // threads at all), a lease from `fit()`'s own cache otherwise.
+    // `effective_default_threads()` is the first by construction and `+ 5` cannot be,
+    // on any machine.
+    let shared = crate::api::effective_default_threads();
+    for n in [shared, shared + 5, 3] {
         let (index, width) = install_on_pool_sized(n, || {
             (rayon::current_thread_index(), rayon::current_num_threads())
         });

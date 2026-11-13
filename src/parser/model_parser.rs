@@ -1,7 +1,7 @@
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
-    validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, DoseStep, DoseValue, IntervalStep,
+    round_to_message, validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec,
+    AdaptiveRoute, AdaptiveRule, Comparison, DoseKnowledge, DoseStep, DoseValue, IntervalStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -2959,8 +2959,11 @@ fn classify_theta_eta_linked(
 #[derive(Debug, Clone, Default)]
 struct IndivVarDeps {
     thetas: std::collections::BTreeSet<usize>,
+    /// Reads an η or a κ (`[individual_parameters]` parses κ as `Expression::Eta`).
     has_eta: bool,
     reads_time: bool,
+    /// Reads the mixture class `MIXNUM`, which the simulation draws (#944).
+    reads_mixnum: bool,
 }
 
 /// [`IndivVarDeps`] of every variable assigned in `stmts`. An `if`/`else` contributes its
@@ -2977,6 +2980,7 @@ fn indiv_var_deps(
         thetas: HashSet<usize>,
         has_eta: bool,
         reads_time: bool,
+        reads_mixnum: bool,
         vars: HashSet<String>,
     }
     impl Deps {
@@ -2984,6 +2988,7 @@ fn indiv_var_deps(
             self.thetas.extend(other.thetas.iter().copied());
             self.has_eta |= other.has_eta;
             self.reads_time |= other.reads_time;
+            self.reads_mixnum |= other.reads_mixnum;
             self.vars.extend(other.vars.iter().cloned());
         }
     }
@@ -3002,6 +3007,7 @@ fn indiv_var_deps(
             }
             Expression::Eta(_) => d.has_eta = true,
             Expression::Time => d.reads_time = true,
+            Expression::MixNum => d.reads_mixnum = true,
             Expression::Variable(v) => {
                 d.vars.insert(v.clone());
             }
@@ -3060,6 +3066,7 @@ fn indiv_var_deps(
                 out.thetas.extend(d.thetas.iter().copied());
                 out.has_eta |= d.has_eta;
                 out.reads_time |= d.reads_time;
+                out.reads_mixnum |= d.reads_mixnum;
                 stack.extend(d.vars.iter().map(String::as_str));
             }
             (name.clone(), out)
@@ -6156,6 +6163,16 @@ pub fn parse_full_model_with(
     // desugared statements, so `[covariate_model]` thetas are classified too.
     let theta_eta_linked =
         classify_theta_eta_linked(&indiv_stmts, theta_names.len(), &nn_theta_deps);
+    // The individual parameters a draw reaches (#944): an η or κ, or `MIXNUM`, through any
+    // intermediate or `if` condition. Every other one is a function of θ, covariates and
+    // `TIME` alone, so an `[adaptive_dosing]` dose expression may read it for any subject.
+    let mut random_indiv: Vec<String> = indiv_var_deps(&indiv_stmts, &nn_theta_deps)
+        .into_iter()
+        .filter(|(_, d)| d.has_eta || d.reads_mixnum)
+        .map(|(name, _)| name)
+        .collect();
+    random_indiv.sort();
+    indiv_param_partials.random_indiv_params = Some(random_indiv);
     // Which `[odes]` conditions move with an estimated parameter (#2649). Needs the same
     // desugared statements, so the dependencies a condition's parameters carry are complete.
     if let Some(program) = ode_spec.as_mut().and_then(|o| o.rhs_program.as_mut()) {
@@ -6560,19 +6577,26 @@ pub fn parse_full_model_with(
 
     // #944: the `[adaptive_dosing]` dose expressions are stored as source and compiled
     // at simulate time, like `observe`. Check them against the model here, so a syntax
-    // error or a read a dose expression may not make (a state, `TIME`, κ, an individual
-    // parameter, η, `MIXNUM`) is a parse error that `ferx check` reports. A covariate
-    // absent from the data needs the data, so that stays at simulate time.
+    // error or a read a dose expression may never make (a state, `TIME`, κ, `MIXNUM`
+    // unless `dose_knowledge = oracle`) is a parse error that `ferx check` reports, as is
+    // an oracle block that reads nothing the oracle applies to. A covariate absent from
+    // the data needs the data, and whether a subject may read its individual parameters
+    // needs the supplied η, so both stay at simulate time.
     if let Some(spec) = adaptive_dosing.as_ref() {
+        let mut reads_truth = false;
         for (key, src) in spec.dose_expressions() {
-            check_adaptive_dose_expression(
+            reads_truth |= !check_adaptive_dose_expression(
                 src,
                 key,
                 &model,
                 &declared_covariate_names,
                 spec.at[0],
-            )?;
+                spec.dose_knowledge,
+            )?
+            .subject_values
+            .is_empty();
         }
+        check_dose_knowledge_used(spec.dose_knowledge, reads_truth)?;
     }
 
     // #993, the `[adaptive_dosing]` half. `observe` is compiled through the very
@@ -7348,13 +7372,13 @@ pub fn parse_full_model_with(
     // Only compiled when the `survival` feature is enabled; the field
     // `model.endpoints` is always present (cfg-gated) and stays empty otherwise.
     //
-    // Theta/eta indices used in event_model expressions are collected here so
-    // that check_unused_parameters (below) can suppress false "not referenced"
-    // warnings for parameters that only appear in [event_model].
-    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    // Theta/eta indices read anywhere outside `[individual_parameters]` are collected
+    // here, so that check_unused_parameters (below) does not report them "not
+    // referenced". Despite the name the set is not only [event_model]'s: a custom RUV
+    // magnitude, a `correlation` line's ρ, a `[covariate_model]` relation, a `[scaling]`
+    // readout and a `[mixture]` mixing expression (#2766) add theirs too.
     let mut event_model_used_thetas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
-    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_etas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     // Every endpoint block's parameter expressions as synthetic assignments,
@@ -7499,19 +7523,15 @@ pub fn parse_full_model_with(
     // #2562: the gathers an endpoint block reads count for the pre-fit index check too, and
     // they were parsed after `theta_blocks` took its first copy.
     model.indiv_param_partials.theta_blocks.uses = VectorThetaScope::uses();
-    // #2623: the explicit `NAME[COLUMN]` reads of each level block, and whether any
-    // expression reads it bare, for the binder's no-levels refusal.
+    // #2623: whether any expression reads each level block, for the binder's no-levels
+    // refusal. A data-driven block can only be read bare (#2744).
+    for decl in model
+        .indiv_param_partials
+        .theta_blocks
+        .level_blocks
+        .iter_mut()
     {
-        let blocks = &mut model.indiv_param_partials.theta_blocks;
-        for decl in blocks.level_blocks.iter_mut() {
-            decl.read_bare = model.referenced_covariates.contains(&decl.index_covariate);
-            decl.keyed_reads.clear();
-            for u in blocks.uses.iter().filter(|u| u.block == decl.name) {
-                if !decl.keyed_reads.contains(&u.index_covariate) {
-                    decl.keyed_reads.push(u.index_covariate.clone());
-                }
-            }
-        }
+        decl.read_bare = model.referenced_covariates.contains(&decl.index_covariate);
     }
     // #2562: which discrete-state endpoints read each level block, for the binder.
     #[cfg(feature = "survival")]
@@ -7522,6 +7542,27 @@ pub fn parse_full_model_with(
         .iter_mut()
     {
         decl.record_cmts = level_record_cmts(&model.endpoints, &decl.index_covariate);
+    }
+    // #2808: the CMTs whose discrete-state records a reader can make define a level, the
+    // binary and DTMM endpoints. A positive set, so a discrete family added later is not
+    // advised a `[binary_model]` read until it is listed here (review r1b #2).
+    #[cfg(feature = "survival")]
+    {
+        #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
+        let mut level_capable_cmts = model.binary_cmts();
+        #[cfg(feature = "markov")]
+        {
+            level_capable_cmts.extend(model.dtmm_cmts());
+            level_capable_cmts.sort_unstable();
+        }
+        for decl in model
+            .indiv_param_partials
+            .theta_blocks
+            .level_blocks
+            .iter_mut()
+        {
+            decl.level_capable_cmts.clone_from(&level_capable_cmts);
+        }
     }
 
     // Warn about declared-but-unused parameters. Runs here (after [event_model]
@@ -7599,6 +7640,17 @@ pub fn parse_full_model_with(
              that switches during the integration, so the switching time moves with it. Exact \
              derivatives cannot see that, so this model uses finite-difference gradients."
         ));
+    }
+
+    // A θ used only in a [mixture] mixing expression (logit(1) = MIXL, p(1) = P1) is not
+    // referenced in [individual_parameters] or [event_model], but it IS estimated — the
+    // mixing fraction. Scan the expressions the same way the event-model blocks do (#2766).
+    if let Some(spec) = &model.mixture {
+        for expr in &spec.mixing {
+            visit_expr_nodes(&expr.expr, &mut |e: &Expression| {
+                note_theta_eta(e, &mut event_model_used_thetas, &mut event_model_used_etas)
+            });
+        }
     }
 
     model.parse_warnings.extend(check_unused_parameters(
@@ -7728,19 +7780,12 @@ pub fn parse_full_model_with(
             //    name is load-bearing without a textual reference (#1443).
             .filter(|(i, name)| {
                 use crate::types::DoseAttr;
-                let exempt = if is_algebraic {
-                    false
-                } else if is_ode {
-                    ode_slot_map
-                        .get(*i)
-                        .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot))
-                        || DoseAttr::from_indexed_name(name).is_some()
-                } else {
-                    matches!(
-                        DoseAttr::from_indexed_name(name),
-                        Some((DoseAttr::Duration | DoseAttr::Rate, _))
-                    )
-                };
+                let exempt = !is_algebraic
+                    && (DoseAttr::is_read_by_name(name, is_ode)
+                        || is_ode
+                            && ode_slot_map
+                                .get(*i)
+                                .is_some_and(|slot| RESERVED_PK_SLOTS.contains(slot)));
                 !exempt
             })
             .map(|(_, name)| name.clone())
@@ -7864,8 +7909,8 @@ pub(crate) const MAX_CMT_INDEX: usize = 255;
 
 /// Built-in sdtab column names that [derived] names must not clash with.
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
-    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EBE_OFV", "N_OBS",
-    "TAFD", "TAD", "CENS", "OCC", "CMT",
+    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EPRED", "PWRES",
+    "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD", "CENS", "OCC", "CMT",
 ];
 
 /// Split a token slice at top-level commas (depth 0 inside parentheses).
@@ -8929,7 +8974,7 @@ fn restrict_and_validate_indiv_stmts(
     // blocks shared this helper.
     let predictor = match block {
         "event_model" => "a hazard expression",
-        "binary_model" => "the logit predictor",
+        "binary_model" => "the linear predictor",
         "markov_model" => "a transition probability",
         _ => "a predictor expression",
     };
@@ -9782,7 +9827,9 @@ fn parse_event_model_block(
 /// - `logit` — required; the linear predictor `lp` (log-odds of `P(Y=1)`) as a
 ///   θ/η/covariate/`[individual_parameters]` expression. `TIME` resolves per observation
 ///   (the data term sets the model-time guard per record).
-/// - `link`  — optional; `logit` (default). `probit`/`cloglog` are not yet supported.
+/// - `probit` — instead of `logit`: the same predictor under the probit link, `P(Y=1) = Φ(lp)`
+///   (#2603). Exactly one of `logit` / `probit` is given.
+/// - `link`  — optional; `logit` (default) or `probit`. It must agree with the predictor's key.
 #[cfg(feature = "survival")]
 fn parse_binary_model_block(
     lines: &[String],
@@ -9812,8 +9859,13 @@ fn parse_binary_model_block(
     let ctx = ParseCtx::new(theta_names, eta_names, &indiv_param_names);
 
     let mut cmt_opt: Option<usize> = None;
-    let mut logit_expr: Option<Expression> = None;
-    let mut link = LinkFn::Logit;
+    // The predictor, under the key that names its link (`logit =` / `probit =`, #2603).
+    let mut predictor: Option<(LinkFn, Expression)> = None;
+    let mut declared_link: Option<LinkFn> = None;
+    let key_of = |l: LinkFn| match l {
+        LinkFn::Logit => "logit",
+        LinkFn::Probit => "probit",
+    };
 
     for line in lines {
         let trimmed = line.trim();
@@ -9833,30 +9885,67 @@ fn parse_binary_model_block(
                     format!("[binary_model]: invalid cmt `{value}` — expected a positive integer")
                 })?);
             }
-            "logit" => {
-                logit_expr = Some(parse_scalar_expression(value, ctx)?);
+            "logit" | "probit" => {
+                let this = if key == "logit" {
+                    LinkFn::Logit
+                } else {
+                    LinkFn::Probit
+                };
+                if let Some((prev, _)) = predictor {
+                    // Before #2603 a repeated `logit =` was last-wins, silently; it is refused
+                    // now, as two predictors under different keys are (review r1 #8).
+                    let given = if prev == this {
+                        format!("`{key}` is given twice")
+                    } else {
+                        format!(
+                            "the predictor is given twice (`{}` and `{key}`)",
+                            key_of(prev)
+                        )
+                    };
+                    return Err(format!(
+                        "[binary_model]: {given} — a block has one linear predictor, written \
+                         under the key that names its link"
+                    ));
+                }
+                predictor = Some((this, parse_scalar_expression(value, ctx)?));
             }
             "link" => {
-                link = match value {
+                declared_link = Some(match value {
                     "logit" => LinkFn::Logit,
+                    "probit" => LinkFn::Probit,
                     other => {
                         return Err(format!(
-                            "[binary_model]: link `{other}` is not yet supported — only `logit` \
-                             (the default) is available; probit/cloglog are planned."
+                            "[binary_model]: link `{other}` is not supported — the links are \
+                             `logit` (the default) and `probit`"
                         ))
                     }
-                };
+                });
             }
             other => {
                 return Err(format!(
-                    "[binary_model]: unknown key `{other}` — valid keys: cmt, logit, link"
+                    "[binary_model]: unknown key `{other}` — valid keys: cmt, logit, probit, link"
                 ));
             }
         }
     }
 
     let cmt = cmt_opt.ok_or("[binary_model]: missing required key `cmt`")?;
-    let logit_expr = logit_expr.ok_or("[binary_model]: missing required key `logit`")?;
+    let (link, logit_expr) = predictor.ok_or(
+        "[binary_model]: missing the linear predictor — write `logit = …` (logit link) or \
+         `probit = …` (probit link)",
+    )?;
+    if let Some(declared) = declared_link {
+        if declared != link {
+            return Err(format!(
+                "[binary_model]: `link = {}` but the predictor is written `{} = …` — under \
+                 `link = {}` write the predictor as `{} = …`",
+                key_of(declared),
+                key_of(link),
+                key_of(declared),
+                key_of(declared)
+            ));
+        }
+    }
     // For the mixed-BIC θ classification (#1177); see `parse_event_model_block`.
     endpoint_stmts.push(Statement::Assign(
         format!("__ferx_binary_model_{cmt}_logit"),
@@ -11403,6 +11492,8 @@ fn parse_adaptive_dosing_block(
     let mut dose_bounds: Option<(DoseValue, DoseValue)> = None;
     let mut confirm: u32 = 1;
     let mut levels: Option<Vec<DoseValue>> = None;
+    let mut round_to: Option<f64> = None;
+    let mut dose_knowledge = DoseKnowledge::Known;
     let mut intervals: Option<Vec<f64>> = None;
     let mut start_interval: Option<f64> = None;
     // The `every` step of `at`, kept for the intervals-on-the-grid check (#945).
@@ -11513,6 +11604,27 @@ fn parse_adaptive_dosing_block(
                 }
                 levels = Some(l);
             }
+            "round_to" => {
+                // A positive grid step, the same for every subject (#944). Its pairing
+                // with `levels` and the bounds is checked by `validate`.
+                let s = val
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|s| s.is_finite() && *s > 0.0)
+                    .ok_or_else(|| round_to_message(val))?;
+                round_to = Some(s);
+            }
+            "dose_knowledge" => {
+                dose_knowledge = match val {
+                    "known" => DoseKnowledge::Known,
+                    "oracle" => DoseKnowledge::Oracle,
+                    other => {
+                        return Err(format!(
+                            "[adaptive_dosing]: dose_knowledge must be `known` or `oracle`, got `{other}`"
+                        ))
+                    }
+                };
+            }
             "intervals" => {
                 let l = parse_float_array(val)
                     .map_err(|e| format!("[adaptive_dosing]: bad intervals: {e}"))?;
@@ -11595,6 +11707,8 @@ fn parse_adaptive_dosing_block(
         dose_bounds,
         confirm,
         levels,
+        round_to,
+        dose_knowledge,
         intervals,
         start_interval,
         target_window,
@@ -12924,6 +13038,9 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             }
         }
         "vi_seed" => opts.vi_seed = parse_u64_opt("vi_seed")?,
+        // Deprecated (#1841): still parsed so an existing model keeps loading, but read by
+        // nothing; `deprecated_keys` carries the warning it draws on every method.
+        #[allow(deprecated)]
         "gn_lambda" => opts.gn_lambda = parse_f64("gn_lambda")?,
         // Covariate-NN (DCM) regularization strengths. Non-negative; 0 = off
         // (strict no-op — existing fits stay byte-identical). Settable from the
@@ -13841,25 +13958,37 @@ fn warn_if_time_alias_folds(
 }
 
 /// Refuse what an `[adaptive_dosing]` dose expression (`start_dose`, a side of
-/// `dose_bounds`, a rung of `levels`; #944) may not read.
+/// `dose_bounds`, a rung of `levels`; #944) may never read, and return the subject
+/// values it reads that are known only for some subjects.
 ///
-/// A dose expression is evaluated once per subject, at the first decision, from θ and
-/// the data covariates in force there. The shared output compiler would accept more —
-/// a state compiles and reads the (zero) state slice, `TIME` reads 0.0 outside the
-/// driver, an individual parameter reads the (zero) PK slice — so each is refused here,
-/// by name, rather than silently evaluated to a number that means nothing. The
-/// parser runs it at model level, so `ferx check` reports it;
+/// A dose expression is evaluated once per subject, at the first decision. It may read
+/// θ and the data covariates in force there, and — for a subject whose values are known
+/// at dosing time — the subject's individual parameters and random effects. The shared
+/// output compiler would accept more: a state compiles and reads the (zero) state slice
+/// and `TIME` reads 0.0 outside the driver, so each is refused here, by name, rather than
+/// silently evaluated to a number that means nothing. A κ is drawn per occasion, so it is
+/// never known. The parser runs this at model level, so `ferx check` reports it;
 /// `compile_dose_exprs` runs it again on a spec built in code. A syntax error is
-/// reported with the key as its context. Individual parameters and random effects are
-/// refused outright here: which subjects' values are known at dosing time is #944's
-/// next step.
+/// reported with the key as its context.
+///
+/// Returns what the expression reads of the subject, in first-read order
+/// ([`DoseExprReads`]): the individual parameters, all of which need the subject's PK at
+/// the first decision, and among them and the random effects the **subject values** — an
+/// individual parameter a draw reaches (an η, a κ or `MIXNUM`; `random_indiv_params`), a
+/// random effect, `MIXNUM`. Whether a subject may read a subject value depends on whether
+/// its η are supplied, so that is decided before the run, per subject
+/// (`E_ADAPTIVE_DOSE_KNOWLEDGE`), not here. An individual parameter no draw reaches
+/// (`TVCLW = TVCL * (WT / 70)`) is known for every subject. `MIXNUM` is refused here
+/// unless `knowledge` is [`DoseKnowledge::Oracle`]: supplied η refuse a `[mixture]` model,
+/// so no subject's class is ever known.
 pub(crate) fn check_adaptive_dose_expression(
     src: &str,
     key: &str,
     model: &CompiledModel,
     declared_covariates: &[String],
     at0: f64,
-) -> Result<(), String> {
+    knowledge: DoseKnowledge,
+) -> Result<DoseExprReads, String> {
     let ctx = ParseCtx::new(
         &model.theta_names,
         &model.eta_names,
@@ -13877,48 +14006,90 @@ pub(crate) fn check_adaptive_dose_expression(
         return Err(format!(
             "[adaptive_dosing] {key} reads {k}, an inter-occasion random effect. It is drawn \
              for each occasion, so it is never known at dosing time, even for a subject whose \
-             random effects are supplied."
+             random effects are supplied. Read the individual parameter instead: it is \
+             evaluated at the first decision, with {k} = 0 for a supplied subject."
         ));
     }
     let states: &[String] = model
         .ode_spec
         .as_ref()
         .map_or(&[], |o| o.state_names.as_slice());
-    // A subject's own parameter value: not known at dosing time unless supplied, and
-    // supplied values are #944's next step, so refused with the route that works today.
-    const OWN_VALUE: &str = " A dose expression may read data covariates and θ; it \
-        cannot read a subject's own parameter values yet. To dose from a known value, carry \
-        it as a data column (e.g. CL_KNOWN) and read that.";
     let mut refusal: Option<String> = None;
+    let mut reads = DoseExprReads::default();
+    let push = |v: &mut Vec<String>, n: &str| {
+        if !v.iter().any(|r| r == n) {
+            v.push(n.to_string());
+        }
+    };
     visit_expr_nodes(&expr, &mut |e: &Expression| {
         if refusal.is_some() {
             return;
         }
-        refusal = match e {
+        match e {
             Expression::Variable(n) | Expression::Covariate(n) if states.contains(n) => {
-                Some(format!(
+                refusal = Some(format!(
                     "{n}, a state of the model. A dose expression is evaluated once per \
-                     subject, at the first decision; it may read data covariates and θ. To \
-                     respond to the drug level, write a `when signal …` rule."
-                ))
+                     subject, at the first decision; it may read data covariates, θ and \
+                     the subject's individual parameters. To respond to the drug level, \
+                     write a `when signal …` rule."
+                ));
             }
-            Expression::Variable(n) => Some(format!("{n}, an individual parameter.{OWN_VALUE}")),
-            Expression::Eta(i) => Some(format!(
-                "{}, a random effect.{OWN_VALUE}",
-                model.eta_names.get(*i).map_or("an η", String::as_str)
-            )),
-            Expression::MixNum => Some(
-                "MIXNUM, the subject's mixture class, which the simulation draws; no \
-                 prescriber knows it at dosing time."
-                    .to_string(),
+            Expression::Variable(n) => {
+                push(&mut reads.indiv_params, n);
+                if model.indiv_param_is_random(n) {
+                    push(&mut reads.subject_values, n);
+                }
+            }
+            Expression::Eta(i) => push(
+                &mut reads.subject_values,
+                model.eta_names.get(*i).map_or("an η", String::as_str),
             ),
-            _ => None,
-        };
+            Expression::MixNum if knowledge != DoseKnowledge::Oracle => {
+                refusal = Some(
+                    "MIXNUM, the subject's mixture class, which the simulation draws; no \
+                     prescriber knows it at dosing time. For a perfect-information \
+                     comparison arm, set dose_knowledge = oracle, which is flagged in the \
+                     results."
+                        .to_string(),
+                );
+            }
+            Expression::MixNum => push(&mut reads.subject_values, "MIXNUM"),
+            _ => {}
+        }
     });
     match refusal {
         Some(what) => Err(format!("[adaptive_dosing] {key} reads {what}")),
-        None => Ok(()),
+        None => Ok(reads),
     }
+}
+
+/// What one `[adaptive_dosing]` dose expression reads of the subject (#944), each name
+/// once, in first-read order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct DoseExprReads {
+    /// Every individual parameter read: each needs the subject's PK at the first decision.
+    pub(crate) indiv_params: Vec<String>,
+    /// The reads a draw reaches — individual parameters with an η, κ or `MIXNUM` upstream,
+    /// random effects, `MIXNUM` — known only for a subject whose η are supplied.
+    pub(crate) subject_values: Vec<String>,
+}
+
+/// `dose_knowledge = oracle` must have something to apply to (#944): a block whose dose
+/// expressions read no individual parameter, random effect or mixture class would flag
+/// a run that read no simulated truth, so it is refused instead. `reads_truth` is
+/// whether any [`check_adaptive_dose_expression`] returned a read.
+pub(crate) fn check_dose_knowledge_used(
+    knowledge: DoseKnowledge,
+    reads_truth: bool,
+) -> Result<(), String> {
+    if knowledge == DoseKnowledge::Oracle && !reads_truth {
+        return Err(
+            "[adaptive_dosing] dose_knowledge = oracle has no effect: no dose expression \
+             reads an individual parameter, a random effect or MIXNUM."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Whether `expr` reads the model-time built-in, under either spelling: the
@@ -19800,13 +19971,14 @@ fn parse_parameters(
                     // Resolve the block to its level → θ map plus the θ names to
                     // append, then append once. Both bracket forms end here; the
                     // difference is only where the level list came from.
-                    let (levels, theta_names, index_covariate) = match spec {
+                    let (levels, theta_names, index_covariate, block_columns) = match spec {
                         ThetaBlockSpec::Count(n_levels) => (
                             (0..n_levels)
                                 .map(|i| LevelRule::Free((base + i) as u32))
                                 .collect(),
                             (1..=n_levels).map(|l| format!("{name}[{l}]")).collect(),
                             None,
+                            Vec::new(),
                         ),
                         ThetaBlockSpec::Columns { columns, contrast } => {
                             let index_covariate = level_index_column(&name);
@@ -19830,7 +20002,7 @@ fn parse_parameters(
                             };
                             level_block_decls.push(LevelBlockDecl {
                                 name: name.clone(),
-                                columns,
+                                columns: columns.clone(),
                                 contrast: binding.map(|b| b.contrast).unwrap_or(contrast),
                                 labels: binding.map(|b| b.labels.clone()).unwrap_or_default(),
                                 scale_share: None,
@@ -19838,10 +20010,10 @@ fn parse_parameters(
                                 eta_readers: Vec::new(),
                                 index_covariate: index_covariate.clone(),
                                 record_cmts: Vec::new(),
-                                keyed_reads: Vec::new(),
+                                level_capable_cmts: Vec::new(),
                                 read_bare: false,
                             });
-                            (levels, theta_names, Some(index_covariate))
+                            (levels, theta_names, Some(index_covariate), columns)
                         }
                     };
                     for theta_name in theta_names {
@@ -19857,6 +20029,7 @@ fn parse_parameters(
                         name: name.clone(),
                         spec: std::sync::Arc::new(GatherSpec { name, levels }),
                         index_covariate,
+                        columns: block_columns,
                         profiled,
                         linked: false,
                         profile_box,
@@ -23952,6 +24125,9 @@ pub(crate) const SUPPORTED_UNARY_FNS: &[&str] = &[
     // (`AMP * cos(2 * PI * (TIME - PHS) / 24)`), NONMEM's `SIN`/`COS`.
     "sin",
     "cos",
+    // #2603: the standard-normal CDF `Φ(x)`, NONMEM's `PHI` — a probit link written out
+    // (`y = pnorm(LP)`), the companion of `[binary_model] link = probit`.
+    "pnorm",
 ];
 
 /// Panic message for the (parser-guaranteed unreachable) tail of each
@@ -24128,6 +24304,11 @@ pub(crate) struct VectorThetaDecl {
     /// `None` for the explicit `theta NAME[N]` form, where a bare reference is
     /// an error and the user supplies the index column.
     pub(crate) index_covariate: Option<String>,
+    /// The data columns a level block is declared over (`STUDY, TIME`), for the
+    /// refusal of a subscripted read (#2744) to echo the declaration. Empty for the
+    /// counted form. Display only: whether a block is data-driven is
+    /// `index_covariate`, and nothing gates on this.
+    pub(crate) columns: Vec<String>,
     /// Declared `profile` (#1065): the levels are solved for at every outer
     /// evaluation rather than searched by the optimizer.
     pub(crate) profiled: bool,
@@ -24230,6 +24411,21 @@ fn level_block_unreadable_message(
     }
 }
 
+/// The refusal for a subscripted read of a data-driven θ level block (#2744).
+/// `spelling` is the read as written (`PLACEBO[STUDY]`, `PLACEBO[STUDY + 0]`,
+/// `PLACEBO[2]`), `columns` the block's declared columns. The index kinds share one
+/// wording: each is a number, and none of them is the record's level.
+fn data_driven_subscript_message(name: &str, spelling: &str, columns: &[String]) -> String {
+    let cols = columns.join(", ");
+    format!(
+        "`{spelling}`: `{name}` is a data-driven θ level block (`theta {name}[{cols}]`), \
+         read bare, as `{name}`: each record reads the level its own `{cols}` values \
+         select. A subscript would index the block by the number it evaluates to, which \
+         matches the record's level only by coincidence. To supply the index yourself, \
+         declare the counted form `theta {name}[N]` and read `{name}[COLUMN]`."
+    )
+}
+
 /// The `[odes]`-scope refusal for the first θ level block `src` reads, if any (#1637).
 /// For an expression that compiles as an ODE line but is written elsewhere (the
 /// joint PK-TTE `hazard =`), so its caller can name the line the user wrote.
@@ -24245,8 +24441,12 @@ fn ode_level_block_read(src: &str) -> Result<Option<String>, String> {
         if pos > 0 && tokens[pos - 1] == Token::Dot {
             continue;
         }
-        if lookup_vector_theta(name).is_some() {
-            let spelling = if tokens.get(pos + 1) == Some(&Token::LBracket) {
+        if let Some(decl) = lookup_vector_theta(name) {
+            // As in `parse_atom`'s ODE-scope refusal: a data-driven block's remedy
+            // reads it bare, since its subscripted read is refused (#2744).
+            let spelling = if tokens.get(pos + 1) == Some(&Token::LBracket)
+                && decl.index_covariate.is_none()
+            {
                 format!("{name}[{}]", render_index_tokens(&tokens, pos + 2))
             } else {
                 name.clone()
@@ -24465,14 +24665,16 @@ pub struct LevelBlockDecl {
     /// CTMM generator is built once per subject from the baseline, and one time-to-event
     /// data row can yield zero or two records, so neither defines levels.
     pub(crate) record_cmts: Vec<usize>,
-    /// Set by the parse: the plain data columns of the explicit `NAME[COLUMN]` reads of
-    /// this block (#2623), deduplicated in read order — the [`ThetaBlocks::uses`] naming
-    /// it. A data-driven block is read bare, through `index_covariate`; an explicit read
-    /// indexes it by the column itself and makes no endpoint a level-defining reader, so
-    /// the binder names this spelling when that leaves the block with no levels.
-    pub(crate) keyed_reads: Vec<String>,
+    /// Set by the parse: the CMTs of the model's `[binary_model]` and DTMM `[markov_model]`
+    /// endpoints, sorted (#2808) — the endpoints whose discrete-state records a reader of
+    /// this block would make define levels. The binder's no-levels refusal advises reading
+    /// the block in one of them only when the data has a record on one: a CTMM state row
+    /// defines no level whatever reads it, and its CMT has no other endpoint.
+    pub(crate) level_capable_cmts: Vec<usize>,
     /// Set by the parse: some expression reads this block bare, through
     /// `index_covariate` — the model's referenced covariates include it (#2623 review).
+    /// Bare is the only way to read a data-driven block: the parse refuses a
+    /// subscripted read (#2744), so `false` means nothing reads it.
     /// With [`Self::record_cmts`] it tells the binder's no-levels refusal whether the
     /// expression is the cause or the block's only readers define no level on the data
     /// (a Gaussian prediction on data with no Gaussian rows, a CTMM generator, a TTE hazard).
@@ -26007,8 +26209,8 @@ pub(crate) enum ProfileRouteBreak {
     /// No prediction reads the block, so its levels have nothing to be solved from
     /// (#2103 review #8).
     Unread,
-    /// Inside a logit link (`inv_logit`, `expit`) that is not the whole prediction
-    /// (#2111): scaled, added to, or inside another link.
+    /// Inside a link (`inv_logit`, `expit`, `pnorm`) that is not the whole prediction
+    /// (#2111, #2603): scaled, added to, or inside another link.
     InnerLink(String),
 }
 
@@ -26057,17 +26259,17 @@ fn binary_predictor_exprs(
         .flat_map(|lines| lines.iter())
         .filter_map(|line| {
             let (key, value) = line.trim().split_once('=')?;
-            (key.trim() == "logit")
+            matches!(key.trim(), "logit" | "probit")
                 .then(|| parse_scalar_expression(value.trim(), ctx).ok())
                 .flatten()
         })
         .collect()
 }
 
-/// Whether `f` is a logit link, the one function a profiled block may be read through
-/// (#2111).
-fn is_logit_link(f: &str) -> bool {
-    f == "inv_logit" || f == "expit"
+/// Whether `f` is a link, the one kind of function a profiled block may be read through:
+/// a logit link (`inv_logit`, `expit`, #2111) or a probit link (`pnorm`, #2603).
+fn is_link(f: &str) -> bool {
+    f == "inv_logit" || f == "expit" || f == "pnorm"
 }
 
 /// The route half of `E_PROFILE_NOT_LINEAR` (#1065): every prediction must read a
@@ -26256,9 +26458,10 @@ fn profile_route_message(block: &str, why: &ProfileRouteBreak, site: &ProfileRou
              prediction may read only one profiled block."
         ),
         ProfileRouteBreak::InnerLink(c) => format!(
-            "Here `{block}` reaches `y` through {c} {at}. A logit link is accepted only as the \
-             whole prediction, `y = inv_logit(c × {block} + …)`, on every branch of an `if` \
-             that chooses it, not scaled, added to or inside another link."
+            "Here `{block}` reaches `y` through {c} {at}. A link (`inv_logit`, `expit` or \
+             `pnorm`) is accepted only as the whole prediction, `y = inv_logit(c × {block} + …)` \
+             or `y = pnorm(c × {block} + …)`, on every branch of an `if` that chooses it, not \
+             scaled, added to or inside another link."
         ),
         ProfileRouteBreak::Unread => unreachable!("answered above"),
     };
@@ -26307,7 +26510,7 @@ impl ProfileWalk<'_, '_> {
             (!out.is_empty()).then_some(out)
         };
         match e {
-            Expression::UnaryFn(f, arg) if is_logit_link(f) => Some(vec![(arg, at, site.clone())]),
+            Expression::UnaryFn(f, arg) if is_link(f) => Some(vec![(arg, at, site.clone())]),
             Expression::Variable(n) | Expression::Covariate(n) => {
                 let defs = self.ctx.resolve(at, n);
                 if defs.is_empty()
@@ -26382,7 +26585,7 @@ impl ProfileWalk<'_, '_> {
             }
             // A link is peeled only as the whole prediction ([`Self::outer_link`]); one
             // reached here is scaled, added to, or nested.
-            Expression::UnaryFn(f, _) if is_logit_link(f) => {
+            Expression::UnaryFn(f, _) if is_link(f) => {
                 fail(ProfileRouteBreak::InnerLink(format!("`{f}(...)`")))
             }
             Expression::UnaryFn(f, _) => fail(ProfileRouteBreak::Construct(format!("`{f}(...)`"))),
@@ -26922,7 +27125,11 @@ const WORD_VALUED_KEYS: &[(&str, &str, WordValue)] = &[
         "clock",
         WordValue::Words(&["forward", "reset"]),
     ),
-    ("binary_model", "link", WordValue::Words(&["logit"])),
+    (
+        "binary_model",
+        "link",
+        WordValue::Words(&["logit", "probit"]),
+    ),
     ("markov_model", "type", WordValue::Words(&["ctmm", "dtmm"])),
     ("markov_model", "states", WordValue::Labels),
     // `parse_decision_schedule`: `[t1, …]` or `every Δ from t0 to t1`.
@@ -28460,6 +28667,7 @@ fn eval_expr<E: EvalEnv>(
                 "softplus" => crate::nn::Activation::Softplus.apply(v),
                 "sin" => v.sin(),
                 "cos" => v.cos(),
+                "pnorm" => crate::stats::special::pnorm(v),
                 // Unreachable: `parse_atom` admits only `SUPPORTED_UNARY_FNS`.
                 _ => unreachable!("{UNARY_FN_ARM_MISSING} (eval_expr, `{name}`)"),
             }
@@ -28639,6 +28847,9 @@ enum Op {
     /// evaluator, the dual jets lifted from the same values.
     Sin,
     Cos,
+    /// `pnorm(x)`, the standard-normal CDF `Φ(x)` (#2603): [`pnorm`](crate::stats::special::pnorm) on every
+    /// evaluator, the dual jets lifted from the same value (`pnorm_g`).
+    Pnorm,
     CmpLt,
     CmpLe,
     CmpGt,
@@ -28725,7 +28936,8 @@ fn ip_op_cost(op: &Op) -> u32 {
         | Op::Tanh
         | Op::Softplus
         | Op::Sin
-        | Op::Cos => 20,
+        | Op::Cos
+        | Op::Pnorm => 20,
         Op::Div | Op::Mod => 4,
         _ => 1,
     }
@@ -28773,6 +28985,7 @@ fn ip_deps_bytecode(bc: &Bytecode, d: &mut IpStmtDeps) {
             | Op::Softplus
             | Op::Sin
             | Op::Cos
+            | Op::Pnorm
             | Op::CmpLt
             | Op::CmpLe
             | Op::CmpGt
@@ -28946,6 +29159,7 @@ fn ip_op_pops(op: &Op) -> Option<usize> {
         | Op::Softplus
         | Op::Sin
         | Op::Cos
+        | Op::Pnorm
         | Op::LogicNot
         | Op::IsPresent
         | Op::Floor
@@ -29660,6 +29874,7 @@ fn scan_stack_depth(ops: &[Op]) -> (i32, i32) {
             | Op::Softplus
             | Op::Sin
             | Op::Cos
+            | Op::Pnorm
             | Op::LogicNot
             | Op::IsPresent
             | Op::Floor
@@ -29787,6 +30002,7 @@ fn compile_expr_into(bc: &mut Bytecode, expr: &Expression) {
                 "softplus" => bc.ops.push(Op::Softplus),
                 "sin" => bc.ops.push(Op::Sin),
                 "cos" => bc.ops.push(Op::Cos),
+                "pnorm" => bc.ops.push(Op::Pnorm),
                 "floor" => bc.ops.push(Op::Floor),
                 "ceil" => bc.ops.push(Op::Ceil),
                 "round" => bc.ops.push(Op::Round),
@@ -30043,6 +30259,7 @@ fn eval_bytecode_lanes<L: Lane>(
             Op::Softplus => unary!(|v| crate::nn::Activation::Softplus.apply(v)),
             Op::Sin => unary!(|v| v.sin()),
             Op::Cos => unary!(|v| v.cos()),
+            Op::Pnorm => unary!(crate::stats::special::pnorm),
             Op::CmpLt => binary!(|l, r| bool01(l < r)),
             Op::CmpLe => binary!(|l, r| bool01(l <= r)),
             Op::CmpGt => binary!(|l, r| bool01(l > r)),
@@ -30135,6 +30352,28 @@ fn sin_g<T: crate::sens::num::PkNum>(x: T) -> T {
 fn cos_g<T: crate::sens::num::PkNum>(x: T) -> T {
     let (s, c) = (x.val().sin(), x.val().cos());
     x.lift4(c, -s, -c, s, c)
+}
+
+/// `pnorm(x)` on any number type (#2603): the value is
+/// [`pnorm`](crate::stats::special::pnorm) bit for bit, and the jet carries `Φ⁽ⁿ⁾` through
+/// n = 4 — `φ`, `−xφ`, `(x² − 1)φ`, `(3x − x³)φ` — which the covariance step's nested dual
+/// reads. Where `φ` is `0` (past `|x| ≈ 38.6`, and at `±∞`) every derivative is `0`, returned
+/// as such: the polynomial factors would make `0 · ∞ = NaN` once `x²` overflows (review r1 #10).
+#[inline]
+fn pnorm_g<T: crate::sens::num::PkNum>(x: T) -> T {
+    use crate::stats::special::{pnorm, INV_SQRT_2PI};
+    let v = x.val();
+    let d = (-0.5 * v * v).exp() * INV_SQRT_2PI;
+    if d == 0.0 {
+        return x.lift4(pnorm(v), 0.0, 0.0, 0.0, 0.0);
+    }
+    x.lift4(
+        pnorm(v),
+        d,
+        -v * d,
+        (v * v - 1.0) * d,
+        (3.0 * v - v * v * v) * d,
+    )
 }
 
 /// `apply_binary_in` with a constant right operand `c` (a literal, covariate or
@@ -30338,6 +30577,10 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
             Op::Cos => {
                 let v = pop!();
                 push!(cos_g(v));
+            }
+            Op::Pnorm => {
+                let v = pop!();
+                push!(pnorm_g(v));
             }
             Op::Logit => {
                 let v = pop!();
@@ -32451,6 +32694,7 @@ fn bytecode_is_dynamic(bc: &Bytecode, dyn_vars: &[bool]) -> bool {
         | Op::Softplus
         | Op::Sin
         | Op::Cos
+        | Op::Pnorm
         | Op::CmpLt
         | Op::CmpLe
         | Op::CmpGt
@@ -33917,6 +34161,7 @@ fn resolve_condition_indices(
 //                            `Activation::Softplus` takes (a > 20 / a < −20 / else)
 //   UnaryFn("sin", a)      : cos(a) · a'
 //   UnaryFn("cos", a)      : −sin(a) · a'
+//   UnaryFn("pnorm", a)    : exp(−a²/2)/√(2π) · a'
 //   UnaryFn("floor"|"ceil"|"round", a) : 0 (piecewise constant; the integer
 //                            boundaries are undefined and ignored, as for Mod)
 //   Power(b, e)            : b^e · (e'·ln(b) + e · b'/b)  (general; subsumes
@@ -34200,6 +34445,18 @@ fn differentiate_with_chain(
                     // −sin(a) · a'
                     let s = Expression::UnaryFn("sin".into(), arg.clone());
                     sub(Expression::Literal(0.0), mul(s, da))
+                }
+                "pnorm" => {
+                    // φ(a) · a',   φ(a) = exp(−a²/2) / √(2π)
+                    let a = (**arg).clone();
+                    let phi = mul(
+                        Expression::Literal(crate::stats::special::INV_SQRT_2PI),
+                        Expression::UnaryFn(
+                            "exp".into(),
+                            Box::new(mul(Expression::Literal(-0.5), mul(a.clone(), a))),
+                        ),
+                    );
+                    mul(phi, da)
                 }
                 "floor" | "ceil" | "round" => {
                     // Piecewise constant: 0 almost everywhere, undefined on the
@@ -34494,6 +34751,11 @@ pub struct IndivParamPartials {
     /// all public, so recording it does not break a downstream struct literal.
     /// Empty without a `[derived]` block, and for hand-built fixtures.
     pub(crate) derived_reads: Vec<String>,
+    /// The individual parameters whose value depends on a draw — an η or κ, or `MIXNUM`,
+    /// through any intermediate or `if` condition (#944) — sorted. `None` for a hand-built
+    /// fixture that never went through the parser, which every consumer treats as "every
+    /// individual parameter is random" (the conservative answer).
+    pub(crate) random_indiv_params: Option<Vec<String>>,
     /// The thetas the adjoint gradient reads off the η-derivatives instead of taping
     /// (#2706, [`detect_theta_channels`]). `None` when no theta qualifies, and for
     /// hand-built fixtures.
@@ -34523,6 +34785,7 @@ impl IndivParamPartials {
             nested_levels: None,
             mu_ref_owners: std::collections::BTreeMap::new(),
             derived_reads: Vec::new(),
+            random_indiv_params: None,
             theta_channels: None,
         }
     }
@@ -34598,6 +34861,7 @@ fn build_indiv_param_partials(
         mu_ref_owners: std::collections::BTreeMap::new(),
         derived_reads: Vec::new(),
         theta_channels: None,
+        random_indiv_params: None,
     }
 }
 
@@ -35584,7 +35848,9 @@ fn parse_atom(
                 // `Theta(t)` read against the empty θ slice these contexts evaluate
                 // with (a silent 0, or an index-out-of-bounds panic).
                 if ctx.level_blocks != LevelBlockScope::Readable {
-                    let spelling = if subscripted {
+                    // The remedy's read: as written for a counted block, bare for a
+                    // data-driven one, whose subscripted read is itself refused (#2744).
+                    let spelling = if subscripted && decl.index_covariate.is_none() {
                         format!("{name}[{}]", render_index_tokens(tokens, pos + 2))
                     } else {
                         name.to_string()
@@ -35594,6 +35860,21 @@ fn parse_atom(
                         &spelling,
                         ctx.level_blocks,
                         "[odes]",
+                    ));
+                }
+                // #2744: a data-driven block is read bare. A subscript would index it by
+                // the number it evaluates to, which is a level only by coincidence: on a
+                // column holding exactly 1..N it equals the bare read, and otherwise it
+                // is a range error, a dead-level refusal, or (an index the pre-fit check
+                // cannot walk, such as `TIME` or a computed one) a fit at the divergence
+                // sentinel. Refused here, before the literal fold, so every reader — and
+                // every index shape — meets the same refusal.
+                if subscripted && decl.index_covariate.is_some() {
+                    let spelling = format!("{name}[{}]", render_index_tokens(tokens, pos + 2));
+                    return Err(data_driven_subscript_message(
+                        name,
+                        &spelling,
+                        &decl.columns,
                     ));
                 }
                 if subscripted {
