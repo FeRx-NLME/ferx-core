@@ -17382,6 +17382,62 @@ fn adaptive_driver_applies_cmt_toggles_like_the_closed_form() {
     .expect("frozen replay accepts the toggled run");
 }
 
+/// The time-varying replay honours on/off rows and the arrival turn-on (#2753, #2811),
+/// against the closed form and not against the driver it verifies. Since #2811 the driver,
+/// both replays and `event_driven_walk` share `land_live_arrival`, so a defect in it moves
+/// them together: the verifier and every oracle against `predict()` stay green, and only a
+/// reference outside the engines sees it. This is that reference for
+/// `adaptive_frozen_replay_tv`; the dose at 6 lands in `depot` while it is off.
+///
+/// Mutations measured: deleting the turn-on in `land_live_arrival` fails here (the dose at 6
+/// is added to a compartment still held at zero), and deleting `apply_cmt_toggles_at_break`
+/// in the replay fails here too.
+#[test]
+fn frozen_replay_tv_applies_cmt_toggles_like_the_closed_form() {
+    let ode = one_cpt_oral_ode_spec();
+    let pk = pk_tog();
+    let mut subject = with_toggles(make_subject(vec![], TOG_OBS.to_vec()), &TOG_ROWS);
+    // The realized ledger, as `verify_adaptive_frozen_replay` appends it.
+    for &t in &TOG_DECISIONS {
+        let mut d = DoseEvent::new(t, 100.0, 1, 0.0, false, 0.0);
+        d.off_at = subject.controller_dose_off_at(t, d.cmt_idx());
+        subject.doses.push(d);
+    }
+    let event_pk = crate::pk::EventPkParams {
+        dose: Vec::new(), // no base regimen: every dose is a ledger dose
+        obs: vec![pk; TOG_OBS.len()],
+        pk_only: vec![pk; TOG_ROWS.len()],
+        reset: Vec::new(),
+    };
+    let replay = |s: &Subject| {
+        adaptive_frozen_replay_tv(
+            &ode,
+            &pk.values,
+            &event_pk,
+            None,
+            None,
+            &[],
+            &[],
+            s,
+            &[1.0; 3],
+            &TOG_DECISIONS,
+        )
+    };
+    let got = replay(&subject);
+    let want = tog_closed_form(&tog_events(), &TOG_OBS);
+    let worst = worst_rel(&got, &want);
+    eprintln!("time-varying replay vs closed form: worst rel {worst:e}");
+    assert!(worst < TOG_TOL, "worst rel {worst:e}: {got:?} vs {want:?}");
+
+    // The same subject with `depot` never turned back on by an arrival is far away: the
+    // closed form with the doses at 6 and 12 dropped.
+    let never_on = tog_closed_form(&[(0.0, Some(100.0)), (3.0, None)], &TOG_OBS);
+    assert!(
+        worst_rel(&never_on, &want) > 0.1,
+        "the arrival turn-on must move the answer"
+    );
+}
+
 /// A controller infusion running across an off row on its compartment stops there and does
 /// not resume at the on row (#2753, `DoseEvent::off_at` on the controller dose), as a
 /// recorded infusion does. The 400-over-8-h infusion into `depot` is cut at the off row at
