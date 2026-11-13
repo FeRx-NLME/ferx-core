@@ -959,8 +959,8 @@ The switch is **one-way**. A segment that is on a stiff stepper, whether it star
 was switched onto it, stays on it until the segment ends; the periodic probe does not run for
 it. A single non-stiff Jacobian reading is weak evidence that a stiff stepper is no longer
 needed: on a stiff-ish target-mediated-disposition model, demoting on one such reading moved
-the objective by up to 0.4 (31 under `gradient = fd` at `ode_reltol = 1e-6`) and made it jitter
-along a parameter scan (#2845). That tail reads below the threshold yet is mildly stiff, so the
+the objective by up to 0.4 (39 under `gradient = fd` at `ode_reltol = 1e-6`; Linux x86_64) and
+made it jitter along a parameter scan (#2845). That tail reads below the threshold yet is mildly stiff, so the
 explicit stepper sits at its stability limit, far less accurate than the stiff one. Staying
 means a segment that really relaxes pays the stiff price for its remainder: on that model
 nothing at default tolerances, up to 30% at an equal tighter one, less at matched error.

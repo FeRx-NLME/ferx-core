@@ -1126,9 +1126,32 @@ fn the_event_time_driver_does_not_demote_a_stiff_span_either() {
         ..Default::default()
     });
     let auto = crossing(&loose());
+    // The premise is that a probe slot passes after `t = 1`, where a demoting probe would read
+    // non-stiff: at least one full probe interval of accepted steps between `t = 1` and the
+    // crossing. Counted on the dense driver with the same pinned stepper, which steps the same
+    // span with the same controller.
+    let pinned = OdeSolverOptions {
+        method: OdeMethod::Rodas4,
+        ..Default::default()
+    };
+    let accepted_to = |t_end: f64| {
+        let mut stats = OdeSolverStats::default();
+        solve_ode_with_stats(
+            &rhs,
+            &[1.0, 0.0, 0.0, 0.0],
+            (0.0, t_end),
+            &[],
+            &[t_end],
+            &pinned,
+            Some(&mut stats),
+        );
+        stats.accepted_steps
+    };
+    let after_relaxing = accepted_to(stiff.0) - accepted_to(1.0);
     assert!(
-        stiff.0 > 1.0 + 4.0 * 0.1,
-        "premise: the crossing lies well past the stiff phase: {}",
+        after_relaxing > crate::ode::solver::AUTO_SWITCH_PROBE_INTERVAL,
+        "premise: a probe slot must pass between t = 1 and the crossing at {}: {after_relaxing} \
+         accepted steps",
         stiff.0
     );
     assert_eq!(
@@ -1367,7 +1390,7 @@ fn a_stalled_mid_segment_switch_is_discarded_and_re_solved_explicitly() {
 /// 1,577 RHS calls against the re-solved run's 61,578 and pinned RK45's 60,001.
 #[test]
 fn a_failed_mid_span_switch_is_re_solved_explicitly_by_the_event_time_guard() {
-    use crate::ode::solver::solve_ode_until_threshold;
+    use crate::ode::solver::{solve_ode_until_threshold, ThresholdCrossing};
     use std::cell::Cell;
 
     let calls = Cell::new(0usize);
@@ -1393,6 +1416,39 @@ fn a_failed_mid_span_switch_is_re_solved_explicitly_by_the_event_time_guard() {
     });
     let auto = solve(&loose());
 
+    // The premise, asserted on the pass itself rather than inferred from a call count: the
+    // entry probe alone already makes auto dearer than pinned RK45 (60,004 calls against
+    // 60,001 with `auto_switch` off, which passed an `auto > explicit` bound).
+    calls.set(0);
+    let entry = resolve_method(&rhs, &u0, &[], 0.0, &loose());
+    let probe_calls = calls.get();
+    assert_eq!(
+        entry,
+        OdeMethod::EXPLICIT_FALLBACK,
+        "premise: the span starts explicit"
+    );
+    calls.set(0);
+    let mut u = u0;
+    let first = crate::ode::solver::until_threshold_with(
+        &rhs,
+        &mut u,
+        (0.0, 0.25),
+        &[],
+        &loose(),
+        1,
+        1.0,
+        entry,
+        None,
+    );
+    let first_calls = calls.get();
+    assert!(
+        first.ran_stiff && matches!(first.outcome, ThresholdCrossing::Failed(_)),
+        "premise: the span must switch onto the stiff stepper part-way and that attempt must \
+         fail (ran_stiff {}, {:?})",
+        first.ran_stiff,
+        first.outcome
+    );
+
     assert!(
         explicit.0.starts_with("Failed"),
         "premise: the blow-up must fail: {}",
@@ -1403,11 +1459,11 @@ fn a_failed_mid_span_switch_is_re_solved_explicitly_by_the_event_time_guard() {
         (&explicit.0, explicit.1),
         "the failed stiff attempt must be discarded and the span re-solved explicitly"
     );
-    assert!(
-        auto.2 > explicit.2,
-        "premise: auto must have run a stiff attempt before the re-solve ({} calls against \
-         pinned rk45's {}), or the span never switched",
+    assert_eq!(
         auto.2,
+        probe_calls + first_calls + explicit.2,
+        "auto is the entry probe ({probe_calls}), the switched attempt ({first_calls}) and the \
+         pinned re-solve ({}), and nothing else",
         explicit.2
     );
 }

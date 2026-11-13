@@ -344,10 +344,12 @@ pub struct OdeSolverOptions {
     /// it. Re-probing the Jacobian is not.
     ///
     /// So the trigger is the same discriminator the starting decision uses, re-read every
-    /// `AUTO_SWITCH_PROBE_INTERVAL` accepted steps, and the switch happens in place: the
-    /// segment keeps the state it has integrated so far and carries on with the other stepper,
-    /// rather than restarting or re-solving. Setting this to `false` restores the pre-#1080
-    /// Part C behaviour — one method per segment, chosen at its start.
+    /// `AUTO_SWITCH_PROBE_INTERVAL` accepted steps on the explicit stepper, and the switch
+    /// happens in place: the segment keeps the state it has integrated so far and carries on
+    /// with the stiff stepper, rather than restarting or re-solving. The switch is one-way
+    /// (#2845): a segment on the stiff stepper, from its start or after a switch, is never
+    /// probed again and stays on it to the segment's end. Setting this to `false` restores the
+    /// pre-#1080 Part C behaviour — one method per segment, chosen at its start.
     pub auto_switch: bool,
 }
 
@@ -2016,8 +2018,8 @@ fn failed(msg: String, ran_stiff: bool) -> ThresholdRun {
 }
 
 /// What one pass of [`until_threshold_with`] produced, for the guard above it.
-struct ThresholdRun {
-    outcome: ThresholdCrossing,
+pub(super) struct ThresholdRun {
+    pub(super) outcome: ThresholdCrossing,
     /// A step was force-accepted at `min_dt` **while a stiff stepper was active**. The run
     /// continued afterwards, so this is the only trace such a step leaves in an otherwise
     /// ordinary-looking outcome.
@@ -2031,11 +2033,11 @@ struct ThresholdRun {
     stiff_min_step_clamped: bool,
     /// A stiff stepper integrated some part of this run — because the segment-start probe
     /// escalated, or because a mid-segment re-probe switched onto one (#1080 Part C).
-    ran_stiff: bool,
+    pub(super) ran_stiff: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
-fn until_threshold_with(
+pub(super) fn until_threshold_with(
     rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
     u: &mut [f64],
     t_span: (f64, f64),
