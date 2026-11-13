@@ -386,7 +386,7 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
                  dependent."
             }
         };
-        let across = match across_blocks {
+        let across = match &across_blocks {
             None => String::new(),
             Some(by) => format!(
                 " The blocks of this line follow one another in time, so the statistic \
@@ -410,13 +410,20 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
     }
 }
 
-/// How a `correlation` line that spans a subject is written (#2858): `by ID` when
-/// every subject's `ID` is a number, else `by` a placeholder column with what it has
-/// to be. A `by` column is read as a number, so on a text `ID` the line `by ID` puts
-/// every row in no block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a `correlation` line that spans a subject is written (#2858): `by` the
+/// subject column when every subject's id is a number, else `by` a placeholder
+/// column with what it has to be. A `by` column is read as a number, so on a text
+/// id the line `by ID` puts every row in no block.
+///
+/// The subject column is named as the data spell it. `by` is case-sensitive while
+/// the reader's `ID` role is not: on a file whose header is `id`, the line `by ID`
+/// is refused ("covariate(s) not found in data (case-sensitive): ID"). A
+/// `[data] ID = SUBJ` mapping renames the column, and `by ID` then reads it
+/// (measured: the same objective as on a file with an `ID` header).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SubjectLine {
-    ById,
+    /// `by` this column: the data's subject column, `ID` unless spelt otherwise.
+    ById(String),
     ByNumericColumn,
 }
 
@@ -427,28 +434,72 @@ impl SubjectLine {
             .iter()
             .all(|s| s.id.parse::<f64>().is_ok())
         {
-            SubjectLine::ById
+            // The header as written; a population built without a file has none.
+            let header = prepared
+                .input_columns
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case("ID"))
+                .map_or("ID", String::as_str);
+            SubjectLine::ById(header.to_string())
         } else {
             SubjectLine::ByNumericColumn
         }
     }
 
-    fn column(self) -> &'static str {
+    fn column(&self) -> &str {
         match self {
-            SubjectLine::ById => "ID",
+            SubjectLine::ById(header) => header,
             SubjectLine::ByNumericColumn => "COL",
         }
     }
 
-    fn clause(self) -> &'static str {
+    fn clause(&self) -> &'static str {
         match self {
-            SubjectLine::ById => "",
+            SubjectLine::ById(_) => "",
             SubjectLine::ByNumericColumn => {
                 ", with COL a numeric data column that has one value per subject \
                  (`ID` is not numeric in this data)"
             }
         }
     }
+}
+
+/// The fewest cross-block pairs [`dw_cross_block_warning`] reads (#2858). The
+/// Durbin–Watson statistic over `n` independent pairs has a standard deviation of
+/// about `2/√n`, so the 1.5 threshold is `√n/4` deviations below 2: 1.96 at 62
+/// pairs. Measured on independent rows in `cross_block_dw_is_calibrated_on_white_noise`:
+/// a false-positive rate of 2.25% at 62 pairs, 13.3% at 20. The pooled warning has no such
+/// floor; this one is a second look at a subset, so it gets one.
+pub(crate) const DW_CROSS_BLOCK_MIN_PAIRS: usize = 62;
+
+/// The warning for positive autocorrelation **between consecutive blocks** of a
+/// `correlation` line (#2858), or `None`. `cross` is `whitened_cross_block_dw`: the
+/// count of lag pairs that join two blocks in time and the statistic over them.
+/// `pooled` is the fit's `dw_statistic`.
+///
+/// It speaks only when the pooled warning does not (`pooled` not below 1.5): that
+/// one already names the subject line when the statistic paired across blocks. The
+/// case it exists for is a line `by` the visits with several rows per visit, where
+/// the pairs inside a block, which the line models, outnumber the ones across and
+/// pull the pooled statistic into the band.
+pub(crate) fn dw_cross_block_warning(
+    cross: (usize, f64),
+    pooled: f64,
+    line: &str,
+    by: &SubjectLine,
+) -> Option<String> {
+    let (pairs, dw) = cross;
+    if pairs < DW_CROSS_BLOCK_MIN_PAIRS || !dw.is_finite() || dw >= 1.5 || pooled < 1.5 {
+        return None;
+    }
+    Some(format!(
+        "Positive autocorrelation between consecutive blocks of `{line}` (Durbin-Watson = \
+         {dw:.2} over the {pairs} pairs that join two blocks; {pooled:.2} over all pairs). \
+         The blocks follow one another in time, and the line leaves rows of different \
+         blocks independent. A line `by {}` correlates all rows of one subject{}.",
+        by.column(),
+        by.clause()
+    ))
 }
 
 /// Whether the decorrelated statistic paired rows **across** residual blocks on
@@ -3416,6 +3467,18 @@ fn fit_inner(
     };
     if let Some(msg) = dw_warning {
         warnings.push(msg);
+    }
+    if let (Some(line), Some(by)) = (
+        crate::api::validation::residual_correlation_line(model),
+        dw_across_blocks(population),
+    ) {
+        let cross = crate::stats::residual_error::whitened_cross_block_dw(
+            model,
+            population,
+            &result.params,
+            &subjects,
+        );
+        warnings.extend(dw_cross_block_warning(cross, dw_statistic, &line, &by));
     }
     // The published method is `None` whenever the step produced no matrix, so the method
     // gate inside is the only gate (#2415 review row 3).

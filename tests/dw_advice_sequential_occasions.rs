@@ -25,6 +25,9 @@
 //!
 //! ## Measured (macOS arm64, `9733956f` + this change)
 //!
+//! Linux x86_64 (slow-tests run 43406353558 on this branch) prints the same digits
+//! for every OFV, ρ̂ and statistic below that it reports.
+//!
 //! At the initial estimates, ρ = 0.3, model with a kappa at `OCC`:
 //!
 //! | data | line | OFV | DW | Durbin–Watson warning |
@@ -62,6 +65,9 @@ enum Grouping {
     SingleLevel,
     /// `level PER by PER in ID`, `level OCC by OCC in PER`: nested, both in time.
     Nested,
+    /// `iov_column = OCC` with no kappa: the occasions are declared and nothing
+    /// absorbs what they share.
+    IovColumnNoKappa,
 }
 
 const GROUPINGS: [Grouping; 3] = [Grouping::IovColumn, Grouping::SingleLevel, Grouping::Nested];
@@ -71,11 +77,17 @@ const GROUPINGS: [Grouping; 3] = [Grouping::IovColumn, Grouping::SingleLevel, Gr
 fn model(grouping: Grouping, line: &str) -> String {
     let (levels, fit_options) = match grouping {
         Grouping::IovColumn => ("  kappa K_E0 ~ 0.04\n", "  iov_column = OCC\n"),
+        Grouping::IovColumnNoKappa => ("", "  iov_column = OCC\n"),
         Grouping::SingleLevel => ("  level OCC by OCC in ID\n  kappa K_E0 ~ 0.04 at OCC\n", ""),
         Grouping::Nested => (
             "  level PER by PER in ID\n  level OCC by OCC in PER\n  kappa K_E0 ~ 0.04 at OCC\n",
             "",
         ),
+    };
+    let kappa = if levels.contains("kappa") {
+        " + K_E0"
+    } else {
+        ""
     };
     let (rho, line) = if line.is_empty() {
         (String::new(), String::new())
@@ -88,7 +100,7 @@ fn model(grouping: Grouping, line: &str) -> String {
     format!(
         "model seq\n[parameters]\n  theta TVE0(10.0, 0.1, 100.0)\n  theta TVSL(0.5, -10.0, 10.0)\n\
          {rho}  omega ETA_E0 ~ 1.0\n{levels}  sigma ADD_ERR ~ 0.5 (sd)\n\
-         [individual_parameters]\n  E0 = TVE0 + ETA_E0 + K_E0\n  SL = TVSL\n\
+         [individual_parameters]\n  E0 = TVE0 + ETA_E0{kappa}\n  SL = TVSL\n\
          [structural_model]\n  y = E0 + SL * TIME\n\
          [error_model]\n  DV ~ additive(ADD_ERR)\n{line}\
          [fit_options]\n  method = focei\n  covariance = false\n{fit_options}"
@@ -392,13 +404,15 @@ fn the_advised_line_fits_and_keeps_the_warning_live() {
 /// `by ID` −154.451388. The statistic under `by OCC` is taken across its blocks,
 /// which run in time: 1.678494, where the split at the blocks gave 1.838370.
 ///
-/// What this does **not** show: a warning. 1.68 is inside the band, and so is the
-/// converged fit (2.18). Three of a subject's eleven pairs cross an occasion, and
-/// the pooled statistic averages them with the eight the line models. The gap in
-/// the objective is the evidence here, not the statistic.
+/// The pooled statistic does not warn: 1.68 is inside the band. Three of a subject's
+/// eleven pairs cross an occasion, and it averages them with the eight the line
+/// models. The statistic over the 72 pairs that join two blocks is 1.17, and that
+/// is what speaks: the cross-block warning names the line `by ID`. Under `by ID`
+/// there is one block per subject, no such pair, and no such warning.
 ///
-/// Mutation that must redden this: the block gate dropped (the statistic under
-/// `by OCC` reads 1.838370).
+/// Mutations that must redden this: the block gate dropped (the statistic under
+/// `by OCC` reads 1.838370, and no pair joins two blocks); the cross-block warning
+/// not pushed by the fit.
 #[test]
 fn with_several_rows_per_occasion_the_subject_line_reaches_further() {
     for g in [Grouping::IovColumn, Grouping::SingleLevel] {
@@ -426,7 +440,17 @@ fn with_several_rows_per_occasion_the_subject_line_reaches_further() {
             "{g:?}: taken across the blocks, 1.678494; split at them, 1.838370; got {}",
             by_occ.dw_statistic
         );
-        assert!(dw_warnings(&by_occ).is_empty(), "{:#?}", by_occ.warnings);
+        let msg = the_dw_warning(&by_occ, &format!("rich {g:?} by OCC"));
+        for must in [
+            "between consecutive blocks of `correlation ar1(RHO) by OCC`",
+            "over the 72 pairs that join two blocks",
+            "1.68 over all pairs",
+            "A line `by ID` correlates all rows of one subject.",
+        ] {
+            assert!(msg.contains(must), "{g:?}: missing `{must}`: {msg}");
+        }
+        // Measured: 1.17 across the blocks, 0.33 under the threshold.
+        assert!(dw_warnings(&by_id).is_empty(), "{:#?}", by_id.warnings);
     }
 }
 
@@ -563,8 +587,10 @@ fn the_advised_line_converges_and_resolves_the_warning() {
     assert!(dw_warnings(&by_id).is_empty(), "{:#?}", by_id.warnings);
 
     // Three rows per occasion: `by OCC` is live, and `by ID` still reaches further
-    // (measured −211.834593 against −246.651176, a gap of 34.8). The statistic under
-    // `by OCC`, taken across its blocks, is 2.175118: inside the band, no warning.
+    // (measured −211.834593 against −246.651176, a gap of 34.8). The pooled statistic
+    // under `by OCC` is 2.175118, inside the band; over the 72 cross-block pairs it is
+    // 1.476, so the cross-block warning fires here too. That is 0.024 under the
+    // threshold, so it is printed, not asserted.
     let (_, rich_occ) = run(&model(g, "correlation ar1(RHO) by OCC"), RICH, 200);
     let (_, rich_id) = run(&model(g, "correlation ar1(RHO) by ID"), RICH, 200);
     eprintln!(
@@ -583,4 +609,138 @@ fn the_advised_line_converges_and_resolves_the_warning() {
         rich_id.ofv,
         rich_occ.ofv
     );
+    assert!(dw_warnings(&rich_id).is_empty(), "{:#?}", rich_id.warnings);
+
+    // Without a kappa nothing absorbs what an occasion shares, and the margin is
+    // wide: measured OFV −210.671097, pooled 1.938758, across blocks 1.3579.
+    let g = Grouping::IovColumnNoKappa;
+    let (_, plain) = run(&model(g, "correlation ar1(RHO) by OCC"), RICH, 200);
+    eprintln!(
+        "converged, rich, no kappa: by OCC {:.6} DW {:.6} {:?}",
+        plain.ofv,
+        plain.dw_statistic,
+        dw_warnings(&plain)
+    );
+    assert!(plain.converged);
+    assert!(
+        (1.5..=2.5).contains(&plain.dw_statistic),
+        "the pooled statistic is inside the band: {}",
+        plain.dw_statistic
+    );
+    let msg = the_dw_warning(&plain, "converged, rich, no kappa");
+    assert!(
+        msg.contains("between consecutive blocks of `correlation ar1(RHO) by OCC`")
+            && msg.contains("over the 72 pairs that join two blocks")
+            && msg.contains("A line `by ID` correlates all rows of one subject."),
+        "{msg}"
+    );
+}
+
+/// A copy of `sparse.csv` with its `ID` header respelt, in a directory of this
+/// test's own.
+fn sparse_with_id_header(test: &str, header: &str) -> (std::path::PathBuf, String) {
+    let text = std::fs::read_to_string(SPARSE).expect("fixture");
+    let text = text.replacen("ID,", &format!("{header},"), 1);
+    assert!(
+        text.starts_with(&format!("{header},TIME")),
+        "the header row"
+    );
+    let dir = std::env::temp_dir().join(format!("ferx_dw_advice_{test}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("sparse.csv");
+    std::fs::write(&path, text).expect("temp file");
+    let data = path.to_str().expect("utf-8 path").to_string();
+    (dir, data)
+}
+
+/// `by` is case-sensitive and the reader's `ID` role is not. On a file whose
+/// subject column is spelt `id`, the line `by ID` is refused, so the advice names
+/// the column as the file spells it, and that line fits.
+///
+/// Mutation that must redden this: `SubjectLine::of` naming `ID` whatever the
+/// header (the advice then names a line this file refuses).
+#[test]
+fn the_advice_names_the_subject_column_as_the_data_spell_it() {
+    let (dir, data) = sparse_with_id_header("lower_case_id", "id");
+    let g = Grouping::IovColumn;
+    let without = evaluate(&model(g, ""), &data);
+    let msg = the_dw_warning(&without, "header `id`");
+    assert!(
+        msg.contains("`correlation ar1(RHO) by id` line") && !msg.contains("by ID"),
+        "{msg}"
+    );
+    let by_id = evaluate(&model(g, "correlation ar1(RHO) by id"), &data);
+    eprintln!(
+        "header `id`: no line {:.6}, by id {:.6}",
+        without.ofv, by_id.ofv
+    );
+    assert!(
+        by_id.ofv < without.ofv - 10.0,
+        "{} vs {}",
+        by_id.ofv,
+        without.ofv
+    );
+
+    // The straddle: the spelling the advice must not use is refused on this file.
+    let parsed = parse_full_model(&model(g, "correlation ar1(RHO) by ID")).expect("parses");
+    let (pop, _) = read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        &data,
+        None,
+        parsed.fit_options.iov_column.as_deref(),
+        None,
+        &parsed.column_map,
+    )
+    .expect("data loads");
+    let opts = FitOptions {
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        ..parsed.fit_options.clone()
+    };
+    let err = fit(&parsed.model, &pop, &parsed.model.default_params, &opts)
+        .err()
+        .expect("`by ID` must be refused on a file whose header is `id`");
+    assert!(err.to_string().contains("not found in data"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `[data] ID = SUBJ` mapping renames the subject column to `ID`, so the advice
+/// says `by ID` and that line reads the mapped column: the same objective as on
+/// the file with an `ID` header (measured −50.043571 both).
+#[test]
+fn a_mapped_subject_column_is_read_by_id() {
+    let (dir, data) = sparse_with_id_header("mapped_id", "SUBJ");
+    let g = Grouping::IovColumn;
+    let mapped = |line: &str| {
+        format!(
+            "model seq\n[data]\n  path = {data}\n  ID = SUBJ\n{}",
+            model(g, line).replacen("model seq\n", "", 1)
+        )
+    };
+    let without = evaluate(&mapped(""), &data);
+    let msg = the_dw_warning(&without, "mapped");
+    assert!(
+        msg.contains("`correlation ar1(RHO) by ID` line") && !msg.contains("SUBJ"),
+        "{msg}"
+    );
+    let by_id = evaluate(&mapped("correlation ar1(RHO) by ID"), &data);
+    let reference = evaluate(&model(g, "correlation ar1(RHO) by ID"), SPARSE);
+    eprintln!(
+        "mapped ID = SUBJ: by ID {:.6}, on the ID file {:.6}",
+        by_id.ofv, reference.ofv
+    );
+    assert!(
+        by_id.ofv < without.ofv - 10.0,
+        "{} vs {}",
+        by_id.ofv,
+        without.ofv
+    );
+    assert!(
+        (by_id.ofv - reference.ofv).abs() < 1e-9,
+        "{} vs {}",
+        by_id.ofv,
+        reference.ofv
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

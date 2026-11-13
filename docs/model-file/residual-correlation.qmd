@@ -315,7 +315,9 @@ across them, and a warning reports dependence between consecutive rows of the
 subject. A line `by` the occasion column does not model that dependence: a block
 never joins rows of two occasions. Write the line `by` a column with one value per
 subject. `by ID` works when `ID` is numeric, since a `by` column is
-read as a number; with a text `ID`, use a numeric column that repeats it. The
+read as a number; with a text `ID`, use a numeric column that repeats it. `by` is
+case-sensitive: write the subject column as the file spells it (`by id` for a
+header `id`), or as `ID` when a `[data] ID = …` line maps it. The
 warning on a compartment-free model names this line
 ([#2858](https://github.com/FeRx-NLME/ferx-core/issues/2858)).
 
@@ -338,11 +340,27 @@ in time with a subject intercept and a kappa per occasion, fitted with `focei`
 | 1 | `ar1(RHO) by ID` | −124.23 | 0.82 | 2.16, silent |
 
 With three rows per occasion, `by OCC` is not inert (OFV −211.83 against −206.45
-without a line), but `by ID` fits 35 points better (−246.65). The statistic does
-not show this: under `by OCC` it is 2.18, inside the band. Only three of a
-subject's eleven pairs cross an occasion, and the pooled statistic averages them
-with the eight the line models. Compare the objective of the two lines; a silent
-Durbin–Watson statistic is not evidence that the grouping is right.
+without a line), but `by ID` fits 35 points better (−246.65). The pooled
+statistic does not show this: under `by OCC` it is 2.18, inside the band. Only
+three of a subject's eleven pairs cross an occasion, and it averages them with
+the eight the line models.
+
+So when blocks run in time, the fit also takes the statistic over the pairs that
+**join two blocks** alone. If that is below 1.5 while the pooled one is not, a
+second warning reports both values and names the line `by ID`:
+
+| Fit of `ar1(RHO) by OCC`, three rows per occasion | Pooled | Across blocks (72 pairs) | Warning |
+|---|---|---|---|
+| with a kappa per occasion | 2.18 | 1.48 | cross-block |
+| without a kappa | 1.94 | 1.36 | cross-block |
+| `ar1(RHO) by ID` instead | 2.36 | no such pair | none |
+
+The check needs at least 62 such pairs. Over `n` independent pairs the statistic
+has a standard deviation of about `2/√n`, so with fewer pairs a value below 1.5 is
+too often chance (13% of simulated data sets at 20 pairs, 2% at 62). With fewer
+pairs, compare the objective of the two lines; a silent Durbin–Watson statistic
+is not evidence that the grouping is right. The statistic over those pairs is in
+the warning only; `dw_statistic` stays the pooled one.
 
 A `by` column that no model expression reads is a required data column but is not
 listed in the "used in model expressions but not declared in `[covariates]`"

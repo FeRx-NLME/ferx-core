@@ -1024,3 +1024,78 @@ fn whitened_dw_joins_residual_blocks_that_run_in_time() {
     assert_relative_eq!(running.1, 3.66 / 1.7, max_relative = 1e-12);
     assert_relative_eq!(restarting.1, 1.70 / 1.05, max_relative = 1e-12);
 }
+
+/// #2858: `whitened_cross_block_dw` takes only the pairs that join two residual
+/// blocks in time. `cs(RHO) by ARM`, `z = [0.8, −0.3, 1.1, 0.4]`:
+///
+/// - `ARM = [1, 1, 2, 2]` on a running clock: one pair, `(−0.3, 1.1)`, step 1.96
+///   over mean 0.65.
+/// - the same with the clock restarted at the boundary: the blocks are parallel,
+///   no pair.
+/// - `ARM = [1, 1, 2, 2]` in time under occasions `[1, 2, 1, 2]`, whose labels come
+///   back and so are parallel: the block boundary is also an occasion boundary the
+///   pooled statistic does not cross, so it is left out here too.
+/// - one block: no pair.
+///
+/// Mutations that must redden this: the within-block pairs counted too (three
+/// pairs); the in-time read dropped (the restarting row counts one); the parallel-
+/// occasion clause dropped (the third row counts one).
+#[test]
+fn cross_block_dw_takes_only_pairs_that_join_blocks_in_time() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVY(10.0, 1.0, 100.0)\n  theta RHO(0.4) FIX\n  sigma ADD_ERR ~ 1.5 (sd)\n\
+         [individual_parameters]\n  Y0 = TVY\n[structural_model]\n  y = Y0\n[error_model]\n  \
+         DV ~ additive(ADD_ERR)\n  correlation cs(RHO) by ARM\n",
+    )
+    .expect("parses");
+    let params = model.default_params.clone();
+    let z = [0.8, -0.3, 1.1, 0.4];
+    let run = |arms: [f64; 4], occasions: Vec<u32>, obs_times: Vec<f64>| {
+        let mut s = subject_with(&arms.map(Some));
+        s.obs_times = obs_times;
+        s.obs_rgroup = residual_groups(&model, &s);
+        s.occasions = occasions;
+        let ipred = vec![10.0; 4];
+        let r = r_matrix_maybe_scaled(
+            &model.error_spec,
+            &ipred,
+            &[1; 4],
+            &s,
+            &params.sigma.values,
+            model.residual_cov_at(&params),
+            None,
+        );
+        let e = r.clone().cholesky().expect("PD").l() * nalgebra::DVector::from_row_slice(&z);
+        s.observations = (0..4).map(|j| ipred[j] + e[j]).collect();
+        let mut res = crate::types::test_helpers::dummy_subject("1", 0, 4);
+        res.ipred = ipred;
+        res.iwres = (0..4).map(|j| e[j] / r[(j, j)].sqrt()).collect();
+        let pop = crate::types::Population {
+            subjects: vec![s],
+            covariate_names: vec!["ARM".into()],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        whitened_cross_block_dw(&model, &pop, &params, std::slice::from_ref(&res))
+    };
+    let running = vec![0.0, 1.0, 2.0, 3.0];
+    let (pairs, dw) = run([1.0, 1.0, 2.0, 2.0], vec![], running.clone());
+    assert_eq!(pairs, 1);
+    assert!(dw.is_finite());
+    assert_relative_eq!(dw, 1.96 / 0.65, max_relative = 1e-12);
+
+    let (pairs, dw) = run([1.0, 1.0, 2.0, 2.0], vec![], vec![0.0, 1.0, 0.0, 1.0]);
+    assert_eq!((pairs, dw.is_nan()), (0, true), "parallel blocks");
+
+    let (pairs, dw) = run([1.0, 1.0, 2.0, 2.0], vec![1, 2, 1, 2], running.clone());
+    assert_eq!(
+        (pairs, dw.is_nan()),
+        (0, true),
+        "a parallel occasion boundary"
+    );
+
+    let (pairs, dw) = run([1.0; 4], vec![], running);
+    assert_eq!((pairs, dw.is_nan()), (0, true), "one block");
+}

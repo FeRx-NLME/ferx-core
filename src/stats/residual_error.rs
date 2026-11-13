@@ -2830,35 +2830,89 @@ pub(crate) fn whitened_residual_autocorrelation(
         .iter()
         .zip(subjects)
         .flat_map(|(subject, res)| {
-            let n = res.iwres.len();
-            if n != subject.observations.len() || res.iwres.iter().any(|v| !v.is_finite()) {
-                return Vec::new();
-            }
-            let err_keys = model.error_spec.obs_keys(subject);
-            let mult = model.ruv_obs_mult(subject, &params.theta);
-            let r = r_matrix_maybe_scaled(
-                &model.error_spec,
-                &res.ipred,
-                err_keys.as_ref(),
-                subject,
-                &params.sigma.values,
-                model.residual_cov_at(params),
-                mult.as_deref(),
-            );
-            let Some(chol) = r.clone().cholesky() else {
-                return Vec::new();
-            };
-            let e = nalgebra::DVector::from_iterator(
-                n,
-                (0..n).map(|j| res.iwres[j] * r[(j, j)].sqrt()),
-            );
-            chol.l()
-                .solve_lower_triangular(&e)
-                .map(|w| split_by_residual_group(w.as_slice(), subject))
+            whitened_rows(model, subject, params, res)
+                .map(|w| split_by_residual_group(&w, subject))
                 .unwrap_or_default()
         })
         .collect();
     residual_autocorrelation(series.iter().map(Vec::as_slice))
+}
+
+/// One subject's residuals decorrelated by its fitted `R`: `w = L⁻¹ D · iwres`
+/// (see [`whitened_residual_autocorrelation`]). `None` when the subject has a
+/// non-finite IWRES, its rows do not line up, or its `R` does not factor.
+fn whitened_rows(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    params: &crate::types::ModelParameters,
+    res: &SubjectResult,
+) -> Option<Vec<f64>> {
+    let n = res.iwres.len();
+    if n != subject.observations.len() || res.iwres.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mult = model.ruv_obs_mult(subject, &params.theta);
+    let r = r_matrix_maybe_scaled(
+        &model.error_spec,
+        &res.ipred,
+        err_keys.as_ref(),
+        subject,
+        &params.sigma.values,
+        model.residual_cov_at(params),
+        mult.as_deref(),
+    );
+    let chol = r.clone().cholesky()?;
+    let e = nalgebra::DVector::from_iterator(n, (0..n).map(|j| res.iwres[j] * r[(j, j)].sqrt()));
+    chol.l()
+        .solve_lower_triangular(&e)
+        .map(|w| w.as_slice().to_vec())
+}
+
+/// The Durbin–Watson statistic over the lag pairs that **join two residual blocks**
+/// (#2858), with their count: in every subject whose blocks run in time
+/// ([`residual_blocks_run_in_time`]), the consecutive rows `(j − 1, j)` of the
+/// decorrelated series whose blocks differ. `(0, NaN)` when there is none.
+///
+/// These are the pairs a `correlation … by` line over groups in time leaves
+/// independent. The pooled statistic averages them with the pairs inside a block,
+/// which the line models: with three rows per visit, two pairs in three are inside
+/// (measured on `tests/data/dw_sequential_algebraic/rich.csv` under `ar1(RHO) by
+/// OCC`: 1.36 across blocks, 2.11 inside, 1.94 pooled). Pair-normalised like the
+/// pooled one, so independent rows give 2.
+///
+/// A pair that also crosses a parallel occasion is left out, as the pooled
+/// statistic leaves it out.
+pub(crate) fn whitened_cross_block_dw(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    subjects: &[SubjectResult],
+) -> (usize, f64) {
+    let (mut pairs, mut num, mut den) = (0usize, 0.0_f64, 0.0_f64);
+    for (subject, res) in population.subjects.iter().zip(subjects) {
+        if !residual_blocks_run_in_time(subject) {
+            continue;
+        }
+        let Some(w) = whitened_rows(model, subject, params, res) else {
+            continue;
+        };
+        let occasions_joined = occasions_run_in_time(subject);
+        let label = |v: &[u32], j: usize| v.get(j).copied();
+        for j in 1..w.len() {
+            let blocks = &subject.obs_rgroup;
+            let occ = &subject.occasions;
+            if label(blocks, j) == label(blocks, j - 1)
+                || (!occasions_joined && label(occ, j) != label(occ, j - 1))
+            {
+                continue;
+            }
+            pairs += 1;
+            num += (w[j] - w[j - 1]).powi(2);
+            den += (w[j] * w[j] + w[j - 1] * w[j - 1]) / 2.0;
+        }
+    }
+    (pairs, if pairs == 0 { f64::NAN } else { num / den })
 }
 
 /// Pooled lag-1 Pearson correlation and Durbin–Watson statistic of residual series

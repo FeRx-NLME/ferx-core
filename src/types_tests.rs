@@ -954,7 +954,7 @@ fn classify_warning_dw_advice_messages_are_dw() {
             group: Some("ARM".into()),
         },
         DwAdvice::AlgebraicInTime {
-            by: crate::api::SubjectLine::ById,
+            by: crate::api::SubjectLine::ById("ID".into()),
         },
         DwAdvice::AlgebraicInTime {
             by: crate::api::SubjectLine::ByNumericColumn,
