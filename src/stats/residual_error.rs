@@ -4771,6 +4771,8 @@ mod tests {
             cwres: vec![],
             npde: vec![],
             npd: vec![],
+            epred: vec![],
+            pwres: vec![],
             ofv_contribution: 0.0,
             cens: vec![],
             n_obs: 0,

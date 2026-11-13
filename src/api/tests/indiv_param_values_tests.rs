@@ -131,6 +131,8 @@ fn sr_for(n_eta: usize) -> SubjectResult {
         cwres: vec![0.0],
         npde: vec![],
         npd: vec![],
+        epred: vec![],
+        pwres: vec![],
         ofv_contribution: 0.0,
         cens: vec![0],
         n_obs: 1,

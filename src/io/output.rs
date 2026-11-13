@@ -2370,6 +2370,8 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     let mut iwres_vec = Vec::with_capacity(n_total);
     let mut npde_vec = Vec::with_capacity(n_total);
     let mut npd_vec = Vec::with_capacity(n_total);
+    let mut epred_vec = Vec::with_capacity(n_total);
+    let mut pwres_vec = Vec::with_capacity(n_total);
     let mut ebe_ofv_col = Vec::with_capacity(n_total);
     let mut n_obs_col = Vec::with_capacity(n_total);
     // NPDE/NPD are only computed when `[fit_options] npde_nsim > 0`; emit the
@@ -2416,6 +2418,8 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             if any_npde {
                 npde_vec.push(sr.npde.get(j).copied().unwrap_or(f64::NAN));
                 npd_vec.push(sr.npd.get(j).copied().unwrap_or(f64::NAN));
+                epred_vec.push(sr.epred.get(j).copied().unwrap_or(f64::NAN));
+                pwres_vec.push(sr.pwres.get(j).copied().unwrap_or(f64::NAN));
             }
             ebe_ofv_col.push(sr.ofv_contribution);
             n_obs_col.push(sr.n_obs as f64);
@@ -2456,6 +2460,12 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     if any_npde {
         cols.push(("NPDE".to_string(), npde_vec));
         cols.push(("NPD".to_string(), npd_vec));
+        // EPRED / PWRES come out of the same simulation (#2871). `EWRES` is the
+        // NONMEM name for the same residual, written as a second column so a ported
+        // `$TABLE ... EWRES` post-processing script finds it under either name.
+        cols.push(("EPRED".to_string(), epred_vec));
+        cols.push(("EWRES".to_string(), pwres_vec.clone()));
+        cols.push(("PWRES".to_string(), pwres_vec));
     }
     cols.extend([
         ("EBE_OFV".to_string(), ebe_ofv_col),
@@ -5788,6 +5798,8 @@ mod tests {
             cwres: vec![0.0; n_obs],
             npde: vec![],
             npd: vec![],
+            epred: vec![],
+            pwres: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
@@ -6155,6 +6167,8 @@ mod tests {
         let mut sr = sdtab_subject_result("1", 2);
         sr.npde = vec![0.3, -1.2];
         sr.npd = vec![0.4, -1.0];
+        sr.epred = vec![5.5, 2.25];
+        sr.pwres = vec![0.7, f64::NAN];
         let result = minimal_sdtab_result(vec![sr]);
         let population = Population {
             subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
@@ -6178,6 +6192,26 @@ mod tests {
             .expect("NPD column should be present when populated");
         assert_eq!(npde, vec![0.3, -1.2]);
         assert_eq!(npd, vec![0.4, -1.0]);
+        // #2871: EPRED and the population-weighted residual under both its names,
+        // carried row for row (a `NaN` PWRES stays `NaN`, not dropped or zeroed).
+        let col = |n: &str| {
+            cols.iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{n} column should be present when populated"))
+        };
+        assert_eq!(col("EPRED"), vec![5.5, 2.25]);
+        for name in ["PWRES", "EWRES"] {
+            let v = col(name);
+            assert_eq!(v[0], 0.7, "{name}");
+            assert!(v[1].is_nan(), "{name}: {v:?}");
+        }
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(
+            at("NPD") < at("EPRED") && at("EPRED") < at("EWRES") && at("EWRES") < at("PWRES"),
+            "the simulation columns sit together after NPD: {names:?}"
+        );
     }
 
     #[test]
@@ -6195,8 +6229,11 @@ mod tests {
 
         let cols = sdtab(&result, &population);
         assert!(
-            cols.iter().all(|(name, _)| name != "NPDE" && name != "NPD"),
-            "NPDE/NPD columns should be absent when npde_nsim = 0"
+            cols.iter().all(|(name, _)| !matches!(
+                name.as_str(),
+                "NPDE" | "NPD" | "EPRED" | "PWRES" | "EWRES"
+            )),
+            "NPDE/NPD/EPRED/PWRES/EWRES columns should be absent when npde_nsim = 0"
         );
     }
 
@@ -6687,6 +6724,8 @@ mod tests {
             cwres: vec![-0.5, f64::NAN],
             npde: vec![],
             npd: vec![],
+            epred: vec![],
+            pwres: vec![],
             ofv_contribution: 3.0,
             cens: vec![0, 1],
             n_obs: 2,
