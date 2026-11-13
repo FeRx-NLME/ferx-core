@@ -403,7 +403,7 @@ How the dataset is interpreted, and what diagnostics are produced alongside the 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1` (below LLOQ) or `CENS=-1` (above ULOQ). `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.qmd)). |
-| `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde-npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. A typical value is `1000`. Cost scales linearly with the count. |
+| `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde-npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. The same simulation also yields the [`EPRED` and `PWRES`/`EWRES`](#population-weighted-residuals-epred-pwres-ewres) columns. A typical value is `1000`. Cost scales linearly with the count. |
 | `npde_seed` | integer | — | RNG seed for the NPDE/NPD simulation, for reproducible diagnostics. Unset falls back to a fixed default. Only used when `npde_nsim > 0`. |
 | `iov_column` | string | — | Name of the occasion column in the dataset (e.g. `OCC`). Supplies occasions when the model uses `kappa` or `block_kappa` declarations. The column must contain integer occasion indices. Case-insensitive. Supported with `foce`, `focei`, `saem`, `imp` and `impmap`. See [IOV documentation](iov.qmd). |
 | `iov_occasion` | `column`, `dose`, `time(t₁, …)` | `column` | Derive the IOV occasion partition from the model instead of a data column. `dose`: each administration starts a new occasion. `time(24, 48)`: time-window breakpoints. When set to `dose`/`time(...)`, this overrides `iov_column` (with a warning). See [Declaring occasions in the model](iov.qmd#declaring-occasions-in-the-model). |
@@ -649,6 +649,82 @@ either way (NPD carries no decorrelation) while its NPDE correlates 0.868 with
 ferx's by default and 0.997 with `WRESCHOL` on. So compare NPDE against a
 `WRESCHOL` table; comparing against the default one is comparing two different
 statistics.
+
+## Population-weighted residuals (EPRED / PWRES / EWRES)
+
+The NPDE simulation also yields two columns at no extra cost, written whenever
+`npde_nsim > 0` (#2871):
+
+- **`EPRED`**: the per-observation mean of the `K` simulated replicates,
+  `E_sim[y]`. This is NONMEM's `$TABLE EPRED`. It is not `PRED`: `PRED` is the
+  prediction at η = 0, while `EPRED` averages over η ~ Ω and ε, and the two differ
+  whenever the model is nonlinear in η. Under `CL = TVCL·exp(η)` the expected
+  concentration is not the typical-value one.
+- **`PWRES`**, also written as **`EWRES`** (the same values under Monolix's and
+  NONMEM's names): the population-weighted residual
+  `PWRES_i = Σ_sim^(-1/2) (y_i − EPRED_i)`, with `Σ_sim` the empirical
+  within-subject covariance of the replicates. This is the simulation-based
+  analogue of CWRES, with no FOCE linearization.
+
+### PWRES, CWRES or NPDE?
+
+| | built from | linear in `y` | valid after |
+|---|---|---|---|
+| CWRES | FOCE linearization around η̂ | yes | FOCE / FOCEI fits; poor for models strongly nonlinear in η |
+| PWRES / EWRES | first two moments of the simulation | yes | any estimator (SAEM, IMP, Bayes) |
+| NPDE | full simulated distribution (rank) | no | any estimator |
+
+PWRES keeps the magnitude of an outlier, which NPDE does not. NPDE is a rank, so it
+saturates near `Φ⁻¹(1/(2K))` and a 6-SD outlier scores the same as a 3.5-SD one.
+PWRES is linear in `y`, so the 6-SD outlier stays at about 6.
+
+**PWRES uses only the first two moments.** It is N(0, 1) under the true model only
+when the marginal distribution of `y` is Gaussian. A skewed marginal, such as
+log-normal IIV or a proportional error, can show a non-zero mean or a skewed
+spread even when the model is correct. NPDE has no such caveat, so it stays the
+primary simulation-based diagnostic. This is also why Monolix hides PWRES by
+default. Use PWRES to see how large a misfit is, and NPDE to decide whether there
+is one.
+
+Rows follow NPDE's rules. `PWRES` is `NaN` wherever `NPDE` is: for a subject with
+an M3-censored row, or one with `npde_nsim ≤ n_obs`. `EPRED` needs no
+decorrelation, so it is written on every row, censored ones included, like `PRED`.
+
+### Decorrelation: PWRES follows NONMEM's default, NPDE does not
+
+The two columns decorrelate with different factors of the same simulated
+covariance. The choices are independent and fixed:
+
+| column | factor | matches |
+|---|---|---|
+| `PWRES` / `EWRES` | symmetric inverse square root `V Λ^(-1/2) Vᵀ` | NONMEM's default `EWRES` and ferx's `CWRES` |
+| `NPDE` | Cholesky factor | `npde::autonpde()`, NONMEM's `NPDE` under `WRESCHOL` |
+
+Both factors give the same per-subject norm, `√(rᵀ Σ⁻¹ r)`, but different
+per-observation values whenever the observations are correlated. Compare ferx's
+`PWRES` against a NONMEM `EWRES` table written **without** `WRESCHOL`, and ferx's
+`NPDE` against one written **with** it.
+
+### NONMEM cross-validation of PWRES {#pwres-nonmem-cross-validation}
+
+`tests/pwres_iov_nonmem_anchor.rs` reuses the IOV anchor above: 60 subjects with
+9 correlated observations each, all parameters fixed, and
+`$TABLE EPRED EWRES ESAMPLE=2000` against `npde_nsim = 2000`
+(`nonmem_anchor/pwres_iov_anchor.ctl`). The random streams differ, so agreement is
+up to Monte-Carlo error:
+
+| NONMEM table | worst relative \|ΔEPRED\| | worst \|ΔEWRES\| | rms ΔEWRES |
+|---|---|---|---|
+| default (symmetric) | 0.027 | 0.207 | 0.053 |
+| `WRESCHOL` (Cholesky) | 0.027 | 1.809 | 0.504 |
+
+`EPRED` is identical in the two NONMEM runs. Only the decorrelation changes, and
+ferx's `PWRES` matches the default table, not the `WRESCHOL` one.
+
+The engine-side check is a closed form. For a model whose first two moments are
+exact, `y_j = B·exp(η_B) + η_S·t_j + ε_j`, ferx's `EPRED` and `PWRES` converge to
+`E[y] = B·e^{ω_B/2}` and to `Σ^(-1/2)(y − E[y])` from the exact covariance. See
+`src/stats/npde_pwres_tests.rs`.
 
 ## Estimation Methods
 

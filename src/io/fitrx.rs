@@ -2148,7 +2148,7 @@ fn write_predictions_csv<W: Write>(
 
     let mut header = String::from("ID,TIME,DV,PRED,IPRED,CWRES,IWRES");
     if any_npde {
-        header.push_str(",NPDE,NPD");
+        header.push_str(",NPDE,NPD,EPRED,PWRES");
     }
     header.push_str(",EBE_OFV,N_OBS");
     if any_cens {
@@ -2179,6 +2179,10 @@ fn write_predictions_csv<W: Write>(
                 row.push_str(&fmt_f64(sr.npde.get(j).copied().unwrap_or(f64::NAN)));
                 row.push(',');
                 row.push_str(&fmt_f64(sr.npd.get(j).copied().unwrap_or(f64::NAN)));
+                row.push(',');
+                row.push_str(&fmt_f64(sr.epred.get(j).copied().unwrap_or(f64::NAN)));
+                row.push(',');
+                row.push_str(&fmt_f64(sr.pwres.get(j).copied().unwrap_or(f64::NAN)));
             }
             row.push(',');
             row.push_str(&fmt_f64(sr.ofv_contribution));
@@ -2799,6 +2803,8 @@ fn parse_subjects(
             cwres: Vec::new(),
             npde: Vec::new(),
             npd: Vec::new(),
+            epred: Vec::new(),
+            pwres: Vec::new(),
             ofv_contribution: ofv,
             cens: Vec::new(),
             n_obs,
@@ -2841,6 +2847,9 @@ fn parse_subjects(
     // NPDE/NPD are optional — present only when the fit ran with npde_nsim > 0.
     let npde_i = col.get("NPDE").copied();
     let npd_i = col.get("NPD").copied();
+    // EPRED/PWRES (#2871) ride with NPDE; a file written before them carries none.
+    let epred_i = col.get("EPRED").copied();
+    let pwres_i = col.get("PWRES").copied();
     let cens_i = col.get("CENS").copied();
     // Validated per row against the subject we're filling: the ID order check alone
     // can't catch two same-ID blocks written in the wrong order.
@@ -2929,6 +2938,16 @@ fn parse_subjects(
         if let Some(j) = npd_i {
             subjects[idx]
                 .npd
+                .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
+        }
+        if let Some(j) = epred_i {
+            subjects[idx]
+                .epred
+                .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
+        }
+        if let Some(j) = pwres_i {
+            subjects[idx]
+                .pwres
                 .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
         }
         let c = match cens_i {
@@ -4840,6 +4859,10 @@ mod tests {
         r.subjects[0].npd = vec![0.15, -0.25, 0.35];
         r.subjects[1].npde = vec![-1.0, 1.0];
         r.subjects[1].npd = vec![-0.9, 0.9];
+        r.subjects[0].epred = vec![4.0, 3.0, 2.0];
+        r.subjects[0].pwres = vec![0.5, -0.6, 0.7];
+        r.subjects[1].epred = vec![1.5, 1.25];
+        r.subjects[1].pwres = vec![f64::NAN, f64::NAN];
         let p = dummy_population(&["S1", "S2"], 3);
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
 
@@ -4851,6 +4874,19 @@ mod tests {
             }
             for (x, y) in a.npd.iter().zip(b.npd.iter()) {
                 assert!((x - y).abs() < 1e-6, "npd {x} vs {y}");
+            }
+            // #2871: EPRED / PWRES ride in the same file; a NaN PWRES (a masked
+            // subject) loads back as NaN.
+            assert_eq!(a.epred.len(), b.epred.len(), "subject {} epred len", a.id);
+            assert_eq!(a.pwres.len(), b.pwres.len(), "subject {} pwres len", a.id);
+            for (x, y) in a.epred.iter().zip(&b.epred) {
+                assert!((x - y).abs() < 1e-6, "epred {x} vs {y}");
+            }
+            for (x, y) in a.pwres.iter().zip(&b.pwres) {
+                assert!(
+                    (x.is_nan() && y.is_nan()) || (x - y).abs() < 1e-6,
+                    "pwres {x} vs {y}"
+                );
             }
         }
     }
@@ -4868,6 +4904,7 @@ mod tests {
         for s in &loaded.fit.subjects {
             assert!(s.npde.is_empty(), "npde must stay empty when not written");
             assert!(s.npd.is_empty(), "npd must stay empty when not written");
+            assert!(s.epred.is_empty() && s.pwres.is_empty());
         }
     }
 

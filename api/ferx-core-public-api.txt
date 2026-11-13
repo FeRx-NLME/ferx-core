@@ -2450,8 +2450,10 @@ pub fn ferx_core::stats::likelihood::iov_occasion_groups(subject: &ferx_core::Su
 pub fn ferx_core::stats::likelihood::split_obs_by_occasion(subject: &ferx_core::Subject) -> alloc::vec::Vec<(u32, alloc::vec::Vec<usize>)>
 pub mod ferx_core::stats::npde
 pub struct ferx_core::stats::npde::SubjectNpde
+pub ferx_core::stats::npde::SubjectNpde::epred: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::npd: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::npde: alloc::vec::Vec<f64>
+pub ferx_core::stats::npde::SubjectNpde::pwres: alloc::vec::Vec<f64>
 pub fn ferx_core::stats::npde::compute_npde_npd(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::compute_npde_npd_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<(alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, alloc::vec::Vec<alloc::string::String>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::effective_seed(seed: core::option::Option<u64>) -> u64
@@ -3879,6 +3881,7 @@ pub ferx_core::types::SubjectResult::cens: alloc::vec::Vec<i8>
 pub ferx_core::types::SubjectResult::compartment_states: alloc::vec::Vec<alloc::vec::Vec<f64>>
 pub ferx_core::types::SubjectResult::cwres: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::discrete_rows: alloc::vec::Vec<ferx_core::DiscreteObsDiagnostic>
+pub ferx_core::types::SubjectResult::epred: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::eta: nalgebra::base::alias::DVector<f64>
 pub ferx_core::types::SubjectResult::extra_columns: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<f64>)>
 pub ferx_core::types::SubjectResult::id: alloc::string::String
@@ -3892,6 +3895,7 @@ pub ferx_core::types::SubjectResult::ofv_contribution: f64
 pub ferx_core::types::SubjectResult::per_obs_tad: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::pmix: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::SubjectResult::pred: alloc::vec::Vec<f64>
+pub ferx_core::types::SubjectResult::pwres: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::tte_rows: alloc::vec::Vec<ferx_core::TteObsDiagnostic>
 pub struct ferx_core::types::ThetaBlocks
 impl ferx_core::parser::model_parser::ThetaBlocks
@@ -5718,6 +5722,7 @@ pub ferx_core::SubjectResult::cens: alloc::vec::Vec<i8>
 pub ferx_core::SubjectResult::compartment_states: alloc::vec::Vec<alloc::vec::Vec<f64>>
 pub ferx_core::SubjectResult::cwres: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::discrete_rows: alloc::vec::Vec<ferx_core::DiscreteObsDiagnostic>
+pub ferx_core::SubjectResult::epred: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::eta: nalgebra::base::alias::DVector<f64>
 pub ferx_core::SubjectResult::extra_columns: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<f64>)>
 pub ferx_core::SubjectResult::id: alloc::string::String
@@ -5731,6 +5736,7 @@ pub ferx_core::SubjectResult::ofv_contribution: f64
 pub ferx_core::SubjectResult::per_obs_tad: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::pmix: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::SubjectResult::pred: alloc::vec::Vec<f64>
+pub ferx_core::SubjectResult::pwres: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::tte_rows: alloc::vec::Vec<ferx_core::TteObsDiagnostic>
 pub struct ferx_core::SuggestedStart
 pub ferx_core::SuggestedStart::params: ferx_core::ModelParameters

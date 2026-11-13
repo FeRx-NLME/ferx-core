@@ -633,6 +633,8 @@ pub(crate) fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResu
         cwres: (0..n_obs).map(|j| -0.02 * j as f64).collect(),
         npde: vec![],
         npd: vec![],
+        epred: vec![],
+        pwres: vec![],
         ofv_contribution: 12.34,
         cens: vec![0; n_obs],
         n_obs,

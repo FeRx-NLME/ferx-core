@@ -256,7 +256,7 @@ pub(crate) fn model_preds(
 /// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
 const OUTPUT_MANDATORY: &[&str] = &[
     "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
-    "EBE_OFV", "N_OBS", "TAFD", "TAD",
+    "EPRED", "PWRES", "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
 ];
 
 // ── Step 8: post-fit extra column computation ────────────────────────────────

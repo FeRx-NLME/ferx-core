@@ -1347,6 +1347,397 @@ pub(crate) fn evid_reset_live(record: f64, reset_floor: f64) -> bool {
     record >= reset_floor
 }
 
+/// A dose list indexed once, so the closed-form event walks ask it instead of rescanning
+/// every dose per interval, sub-interval, arrival and observation (#2754).
+///
+/// Before this index each of those queries was an `O(n_doses)` scan, so one walk over a
+/// subject with `n` dose records cost `O(n²)` — on a 200-dose history the bookkeeping, not
+/// the PK, was most of a fit. Every query here returns a **superset** of the doses the old
+/// scan acted on, in ascending dose order, and the callers run the unchanged per-dose code
+/// over that subset. A skipped dose is one the old loop provably did nothing for (no rate,
+/// no break, no boundary within the match tolerance), so the walks take the same branches
+/// and do the same arithmetic in the same order: values are bit-identical.
+///
+/// Built from one `(doses, dose_lagtimes)` pair and valid only for it. Times, `ss`/`ii`
+/// and lagtimes are subject- or schedule-static; `rate`/`duration` are not (bioavailability
+/// reshapes a window, a modeled dose resolves per η), which is why
+/// [`crate::pk::event_driven::EventSchedule`] reuses its own index only for doses that pass
+/// `rates_valid_for`, and a walk builds a fresh one otherwise.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DoseIndex {
+    /// Number of doses indexed — a guard that the caller queries with the same list.
+    n_doses: usize,
+    /// The `SS=1` records (`ss && ii > 0`) as `(time, k)`, sorted lexicographically
+    /// under `f64::partial_cmp` (so `-0.0` ties `0.0`, as in [`ss_reset_cutoff`]).
+    ss_records: Vec<(f64, usize)>,
+    /// Some `SS=1` record has a `NaN` time: [`Self::ss_cutoff`] then defers to the scan,
+    /// whose answer for a `NaN` comparison is not a sort order.
+    ss_scan_fallback: bool,
+    /// Every dose that can carry an input rate (`duration > 0`), ascending. Both halves of
+    /// the rate test — a running window and the #1121 residual of a seeded `SS=1` infusion
+    /// (which requires `is_real_infusion`, so `duration > 0`) — need it.
+    infusing: Vec<usize>,
+    /// Every infusion break `compute_propagation_bounds` can push — window start, window
+    /// end and seeded-`SS=1` residual end of each `rate > 0 && duration > 0` dose — sorted
+    /// ascending, `NaN` dropped (it never passes the open-interval test).
+    breaks: Vec<f64>,
+    /// `(value, k)` of every dose's arrival `t_k + lag_k`, and of every infusing dose's
+    /// window end `t_k + lag_k + D_k`, sorted by value; non-finite values dropped (they
+    /// never lie within a finite tolerance of anything).
+    moving_points: Vec<(f64, usize)>,
+}
+
+impl DoseIndex {
+    /// Index `doses` under per-dose `dose_lagtimes` (parallel to `doses`; a missing entry
+    /// is a zero lag, as every walk reads it). `O(n log n)`.
+    pub(crate) fn new(doses: &[DoseEvent], dose_lagtimes: &[f64]) -> Self {
+        let lag_of = |k: usize| dose_lagtimes.get(k).copied().unwrap_or(0.0);
+        let mut ss_records = Vec::new();
+        let mut infusing = Vec::new();
+        let mut breaks = Vec::new();
+        let mut moving_points = Vec::with_capacity(doses.len());
+        for (k, d) in doses.iter().enumerate() {
+            if d.ss && d.ii > 0.0 {
+                ss_records.push((d.time, k));
+            }
+            let lag = lag_of(k);
+            // The exact expressions the walks compute, so a point here is bit-identical
+            // to the value the per-dose code tests.
+            let t_start = d.time + lag;
+            if t_start.is_finite() {
+                moving_points.push((t_start, k));
+            }
+            if d.duration > 0.0 {
+                infusing.push(k);
+                let t_end = t_start + d.duration;
+                if t_end.is_finite() {
+                    moving_points.push((t_end, k));
+                }
+            }
+            if d.rate > 0.0 && d.duration > 0.0 {
+                let end = d.time + lag + d.duration;
+                breaks.extend([t_start, end].into_iter().filter(|b| !b.is_nan()));
+                if let Some(residual_end) = ss_residual_infusion_end(d, lag, 1.0) {
+                    if !residual_end.is_nan() {
+                        breaks.push(residual_end);
+                    }
+                }
+            }
+        }
+        let ss_scan_fallback = ss_records.iter().any(|(t, _)| t.is_nan());
+        if !ss_scan_fallback {
+            // Stable, so a time tie keeps ascending `k` — the lexicographic `(time, k)`.
+            ss_records.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("no NaN"));
+        }
+        breaks.sort_by(|a, b| a.total_cmp(b));
+        moving_points.sort_by(|a, b| a.0.total_cmp(&b.0));
+        Self {
+            n_doses: doses.len(),
+            ss_records,
+            ss_scan_fallback,
+            infusing,
+            breaks,
+            moving_points,
+        }
+    }
+
+    /// [`ss_reset_cutoff`]`(doses, t)`, by binary search. `doses` must be the list this
+    /// index was built from (it is only read on the scan fallback).
+    #[inline]
+    pub(crate) fn ss_cutoff(&self, doses: &[DoseEvent], t: f64) -> Option<usize> {
+        debug_assert_eq!(
+            doses.len(),
+            self.n_doses,
+            "DoseIndex queried with another list"
+        );
+        if self.ss_scan_fallback || t.is_nan() {
+            return ss_reset_cutoff(doses, t);
+        }
+        // The last record with `time ≤ t` carries the largest `(time, k)` among them.
+        let n = self.ss_records.partition_point(|&(time, _)| time <= t);
+        n.checked_sub(1).map(|i| self.ss_records[i].1)
+    }
+
+    /// The doses that can contribute an input rate anywhere (`duration > 0`), ascending.
+    #[inline]
+    pub(crate) fn infusing(&self) -> &[usize] {
+        &self.infusing
+    }
+
+    /// The infusion breaks `b` with `lo < b < hi`, ascending — the candidates
+    /// `compute_propagation_bounds` pushes for an interval, as a slice.
+    #[inline]
+    pub(crate) fn breaks_within(&self, lo: f64, hi: f64) -> &[f64] {
+        let from = self.breaks.partition_point(|&b| !(b > lo));
+        let len = self.breaks[from..].partition_point(|&b| b < hi);
+        &self.breaks[from..from + len]
+    }
+
+    /// Every dose with an arrival or window end within a margin of `[lo, hi]`, ascending
+    /// and deduplicated: a superset of the doses that have a moving boundary within the
+    /// walks' `1e-9` match tolerance of any time in `[lo, hi]`. The margin is far wider
+    /// than that tolerance, so rounding in the subtraction can never drop a match.
+    pub(crate) fn near_moving_points(&self, lo: f64, hi: f64) -> Vec<usize> {
+        let margin = 1e-6 * (1.0 + lo.abs().max(hi.abs()));
+        let (lo, hi) = (lo - margin, hi + margin);
+        let from = self.moving_points.partition_point(|&(v, _)| v < lo);
+        let mut ks: Vec<usize> = self.moving_points[from..]
+            .iter()
+            .take_while(|&&(v, _)| v <= hi)
+            .map(|&(_, k)| k)
+            .collect();
+        ks.sort_unstable();
+        ks.dedup();
+        ks
+    }
+}
+
+/// `DoseIndex` against the `O(n)` scans it replaces (#2754). Each query must return what
+/// the scan acted on — exactly for the cutoff and the breaks, a superset for the
+/// candidates — on dose lists built to hit every tie the scans resolve: co-timed `SS=1`
+/// records (row order decides), `-0.0` against `0.0`, a dose list out of time order (the
+/// adaptive shadow list), boluses mixed with infusions, lags, and the seeded-`SS=1`
+/// residual window.
+#[cfg(test)]
+mod dose_index_tests {
+    use super::{ss_reset_cutoff, ss_residual_infusion_end, DoseIndex};
+    use crate::types::DoseEvent;
+
+    /// A deterministic xorshift, so a failure reproduces.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Times on a coarse grid so ties are common; `-0.0` stands in for some zeros.
+    fn random_doses(rng: &mut Rng, n: usize) -> (Vec<DoseEvent>, Vec<f64>) {
+        let mut doses = Vec::with_capacity(n);
+        let mut lags = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut time = rng.below(12) as f64 * 0.5;
+            if time == 0.0 && rng.below(2) == 0 {
+                time = -0.0;
+            }
+            let rate = match rng.below(3) {
+                0 => 0.0,
+                1 => 50.0,
+                _ => 200.0,
+            };
+            let ss = rng.below(4) == 0;
+            let ii = if ss {
+                [0.0, 6.0, 12.0][rng.below(3) as usize]
+            } else {
+                0.0
+            };
+            doses.push(DoseEvent::new(time, 100.0, 1, rate, ss, ii));
+            lags.push([0.0, 0.0, 0.25, 1.5, 7.0][rng.below(5) as usize]);
+        }
+        (doses, lags)
+    }
+
+    /// The probe times: every dose time and arrival, each nudged by the match tolerances
+    /// either way, plus points between and beyond the grid.
+    fn probes(doses: &[DoseEvent], lags: &[f64]) -> Vec<f64> {
+        let mut ts = vec![
+            -1.0,
+            -0.0,
+            0.0,
+            0.1,
+            2.75,
+            100.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ];
+        for (d, &lag) in doses.iter().zip(lags) {
+            for base in [d.time, d.time + lag, d.time + lag + d.duration] {
+                for eps in [
+                    0.0, 1e-15, -1e-15, 1e-12, -1e-12, 5e-10, -5e-10, 2e-9, -2e-9,
+                ] {
+                    ts.push(base + eps);
+                }
+            }
+        }
+        ts
+    }
+
+    #[test]
+    fn the_ss_cutoff_is_the_scans_on_every_probe() {
+        let mut rng = Rng(0x2754);
+        for n in [0, 1, 2, 5, 17, 40] {
+            for _ in 0..30 {
+                let (doses, lags) = random_doses(&mut rng, n);
+                let index = DoseIndex::new(&doses, &lags);
+                for t in probes(&doses, &lags).into_iter().chain([f64::NAN]) {
+                    assert_eq!(
+                        index.ss_cutoff(&doses, t),
+                        ss_reset_cutoff(&doses, t),
+                        "t = {t:?}, doses = {doses:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A tie between `SS=1` records is decided by row order, and the scan reads
+    /// `-0.0 == 0.0` — a sort under `total_cmp` would put the `-0.0` row first and hand
+    /// back the wrong record. Built by hand so both cases are certainly present.
+    #[test]
+    fn a_co_timed_ss_tie_is_decided_by_row_order_and_signed_zero_ties() {
+        let doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(-0.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(5.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(5.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(3.0, 100.0, 1, 0.0, true, 12.0),
+        ];
+        let index = DoseIndex::new(&doses, &[]);
+        assert_eq!(index.ss_cutoff(&doses, 0.0), Some(1));
+        assert_eq!(ss_reset_cutoff(&doses, 0.0), Some(1));
+        assert_eq!(index.ss_cutoff(&doses, 4.0), Some(4));
+        assert_eq!(index.ss_cutoff(&doses, 5.0), Some(3));
+        assert_eq!(index.ss_cutoff(&doses, -1.0), None);
+    }
+
+    /// A `NaN` record time has no place in a sort; the index defers to the scan.
+    #[test]
+    fn a_nan_ss_record_time_falls_back_to_the_scan() {
+        let doses = vec![
+            DoseEvent::new(1.0, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(f64::NAN, 100.0, 1, 0.0, true, 12.0),
+            DoseEvent::new(2.0, 100.0, 1, 0.0, true, 12.0),
+        ];
+        let index = DoseIndex::new(&doses, &[]);
+        for t in [0.0, 1.0, 1.5, 3.0, f64::NAN] {
+            assert_eq!(
+                index.ss_cutoff(&doses, t),
+                ss_reset_cutoff(&doses, t),
+                "t = {t}"
+            );
+        }
+    }
+
+    /// What `compute_propagation_bounds`'s per-dose loop pushed for `(lo, hi)`, sorted.
+    fn breaks_by_scan(doses: &[DoseEvent], lags: &[f64], lo: f64, hi: f64) -> Vec<f64> {
+        let mut out = Vec::new();
+        for (k, d) in doses.iter().enumerate() {
+            if d.rate > 0.0 && d.duration > 0.0 {
+                let lag = lags.get(k).copied().unwrap_or(0.0);
+                let start = d.time + lag;
+                let end = d.time + lag + d.duration;
+                let residual = ss_residual_infusion_end(d, lag, 1.0);
+                for b in [Some(start), Some(end), residual].into_iter().flatten() {
+                    if b > lo && b < hi {
+                        out.push(b);
+                    }
+                }
+            }
+        }
+        out.sort_by(|a, b| a.total_cmp(b));
+        out
+    }
+
+    #[test]
+    fn the_breaks_within_an_interval_are_the_scans() {
+        let mut rng = Rng(0x1477);
+        for n in [0, 1, 3, 12, 40] {
+            for _ in 0..30 {
+                let (doses, lags) = random_doses(&mut rng, n);
+                let index = DoseIndex::new(&doses, &lags);
+                let ts = probes(&doses, &lags);
+                for _ in 0..40 {
+                    let a = ts[rng.below(ts.len() as u64) as usize];
+                    let b = ts[rng.below(ts.len() as u64) as usize];
+                    let (lo, hi) = (a.min(b) + 1e-15, a.max(b) - 1e-15);
+                    let got: Vec<u64> = index
+                        .breaks_within(lo, hi)
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect();
+                    let want: Vec<u64> = breaks_by_scan(&doses, &lags, lo, hi)
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect();
+                    assert_eq!(
+                        got, want,
+                        "({lo}, {hi}), doses = {doses:?}, lags = {lags:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every dose the walks' `1e-9` boundary match can pick within `[lo, hi]` is a
+    /// candidate, and the candidates come ascending and once each — the order the scan's
+    /// first match depends on.
+    #[test]
+    fn the_moving_point_candidates_cover_every_match_in_dose_order() {
+        let mut rng = Rng(0x486);
+        for n in [0, 1, 4, 20, 40] {
+            for _ in 0..30 {
+                let (doses, lags) = random_doses(&mut rng, n);
+                let index = DoseIndex::new(&doses, &lags);
+                let ts = probes(&doses, &lags);
+                for _ in 0..40 {
+                    let a = ts[rng.below(ts.len() as u64) as usize];
+                    let b = if rng.below(2) == 0 {
+                        a
+                    } else {
+                        ts[rng.below(ts.len() as u64) as usize]
+                    };
+                    let (lo, hi) = (a.min(b), a.max(b));
+                    let near = index.near_moving_points(lo, hi);
+                    assert!(
+                        near.windows(2).all(|w| w[0] < w[1]),
+                        "not ascending: {near:?}"
+                    );
+                    for (k, d) in doses.iter().enumerate() {
+                        let t_start = d.time + lags[k];
+                        let mut points = vec![t_start];
+                        if d.duration > 0.0 {
+                            points.push(t_start + d.duration);
+                        }
+                        // A point matches some `w ∈ [lo, hi]` iff it is within `1e-9` of
+                        // the interval; probe the nearest `w`.
+                        let matches = points.iter().any(|&p| {
+                            let w = p.clamp(lo, hi);
+                            (w - p).abs() < 1e-9
+                        });
+                        if matches {
+                            assert!(
+                                near.contains(&k),
+                                "dose {k} missing for [{lo}, {hi}]: {near:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The point of the index: on a long, evenly spaced history the candidates for one
+    /// inter-dose interval are a handful, not every dose (#2754's `O(n²)`).
+    #[test]
+    fn one_interval_of_a_long_history_sees_a_handful_of_doses() {
+        let doses: Vec<DoseEvent> = (0..400)
+            .map(|i| DoseEvent::new(12.0 * i as f64, 100.0, 1, 0.0, false, 0.0))
+            .collect();
+        let lags = vec![0.75; doses.len()];
+        let index = DoseIndex::new(&doses, &lags);
+        let near = index.near_moving_points(12.0 * 200.0 + 0.75, 12.0 * 201.0 + 0.75);
+        assert_eq!(near, vec![200, 201]);
+        assert!(index.infusing().is_empty(), "boluses carry no rate");
+        assert_eq!(index.ss_cutoff(&doses, 1e9), None);
+    }
+}
+
 #[cfg(test)]
 mod first_record_tests {
     use super::{first_record, FirstRecord};

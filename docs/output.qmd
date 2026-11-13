@@ -45,6 +45,9 @@ A CSV file with per-observation diagnostics, one row per observation per subject
 | `IPRED` | Individual prediction (eta = EBE) |
 | `CWRES` | Conditional weighted residual |
 | `IWRES` | Individual weighted residual |
+| `NPDE`, `NPD` | Simulation-based normalized prediction (distribution) errors; only with `npde_nsim > 0` |
+| `EPRED` | Monte-Carlo expected prediction `E_sim[y]` from the NPDE simulation; only with `npde_nsim > 0` |
+| `EWRES`, `PWRES` | Monte-Carlo population-weighted residual `Σ_sim^(-1/2)(y − EPRED)`, one value under its NONMEM and its Monolix name; only with `npde_nsim > 0` |
 | `EBE_OFV` | Each subject's contribution to the total OFV |
 | `N_OBS` | Number of observations for the subject |
 | `TAFD` | Time after first dose |
@@ -96,6 +99,17 @@ $H = \partial f/\partial\eta$ at $\hat\eta$, $\tilde{R} = H\Omega H^T + R$ is it
 $\tilde{R}^{-1/2}$ is the symmetric inverse square root. $R$ is evaluated at `IPRED` under
 FOCEI and at the population prediction under FOCE, the points the two objectives use. Rows
 censored for the fit (`bloq_method = m3`) are blank.
+
+**PWRES / EWRES** (population-weighted residual, Monolix's `PWRES`, NONMEM's `EWRES`;
+only with `npde_nsim > 0`) is the simulation-based analogue of CWRES:
+$$
+\text{PWRES} = \Sigma_{\text{sim}}^{-1/2}\,(y - \text{EPRED})
+$$
+where `EPRED` and $\Sigma_{\text{sim}}$ are the empirical mean and within-subject
+covariance of the NPDE simulation, with no linearization. It decorrelates with the
+same symmetric inverse square root as CWRES. See
+[Population-weighted residuals](model-file/fit-options.qmd#population-weighted-residuals-epred-pwres-ewres)
+for when to prefer it over CWRES and NPDE.
 
 #### CWRES under inter-occasion variability
 
