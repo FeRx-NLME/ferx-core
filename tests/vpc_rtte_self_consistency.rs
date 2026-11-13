@@ -9,7 +9,9 @@
 //! `vpc_rtte` then simulates `N` replicates of each dataset's design from the same
 //! model. If the bands and the follow-up of the replicates are right, the replicates
 //! are exchangeable with the data and an observed curve falls inside its 5–95 % band at
-//! a fixed time in about 90 % of datasets.
+//! a fixed time in about 89 % of datasets: a band read from `N` replicates with the type-7
+//! quantile covers an exchangeable observation with probability `0.90·(N − 1)/(N + 1)`,
+//! which is 0.891 for 200, not the nominal 0.90.
 //!
 //! Two curves are checked at H/4, H/2 and 3H/4: the mean cumulative function and the
 //! order-2 Kaplan–Meier curve on absolute time. The design is chosen so the follow-up
@@ -18,16 +20,16 @@
 //!
 //! - as shipped: 0.890 / 0.890 / 0.920 and 0.890 / 0.850 / 0.925;
 //! - `Observed` acting as `Horizon` (every replicate subject followed to `H`):
-//!   0.885 / 0.845 / 0.835 and 0.870 / 0.790 / 0.820, which fails at three points.
-//!   Replicates with no dropout keep more subjects at risk and the band narrows.
+//!   0.885 / 0.845 / 0.835 and 0.870 / 0.790 / 0.820, which fails on the order-2 curve
+//!   at H/2 and 3H/4. Replicates with no dropout keep more subjects at risk and the
+//!   band narrows.
 //!
-//! The shipped coverage is a little under 0.90 on average and the margin to the lower
-//! bound is small: two other seed sets gave a lowest point of 0.840 and 0.855 (pooled
-//! over the three sets, 600 datasets, every point is between 0.873 and 0.895). A band
-//! read from 200 replicates covers slightly less than its nominal 90 %. So this test
-//! pins these seeds, and a change that moves the draws can move a point across the
-//! bound without being a defect: re-measure the pooled coverage before reading a
-//! failure here as one.
+//! Two other seed sets gave a lowest point of 0.840 and 0.855, and pooled over the three
+//! sets (600 datasets) every point is between 0.873 and 0.895, around the expected
+//! 0.891. This test pins these seeds, and a point falls below the lower bound by chance
+//! in 0.33 % of seed sets (`pbinom(165, 200, 0.891)`). So a change that moves the draws can move a point
+//! across the bound without being a defect: re-measure the pooled coverage before
+//! reading a failure here as one.
 
 #[cfg(feature = "survival")]
 mod self_consistency {
@@ -172,7 +174,8 @@ mod self_consistency {
     }
 
     /// The 99 % binomial interval for `M = 200` datasets around the exchangeable
-    /// expectation 0.90: `qbinom(c(.005, .995), 200, .9) / 200` in R.
-    const LO: f64 = 0.84;
-    const HI: f64 = 0.95;
+    /// expectation `0.90·(N_SIM − 1)/(N_SIM + 1) = 0.891` (see the file doc):
+    /// `qbinom(c(.005, .995), 200, 0.891) / 200` in R (review r1 row 2).
+    const LO: f64 = 0.83;
+    const HI: f64 = 0.945;
 }

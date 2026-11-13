@@ -1044,8 +1044,10 @@ time, and give a gap of 0. An event at the very end of follow-up counts with the
 at risk, and the next order's gap is then censored at 0.
 
 `max_order` is the highest order `K`: absolute orders 1 to `K` and gap orders 2 to `K`. Left
-unset, it is the largest `k` for which at least 10 observed subjects have `k` or more events
-(at least 1), so that a default panel does not rest on a handful of subjects. A gap order that
+unset, it is the largest `k` for which at least 10 observed subjects, counted across all
+strata, have `k` or more events (at least 1). One `K` applies to every stratum, so a small
+stratum can show an order few of its own subjects reached; each curve's `n_subjects` says how
+many. A gap order that
 no observed subject in a stratum reached comes back with an empty observed curve and an empty
 band.
 
@@ -1074,6 +1076,12 @@ or at `H` when `H` is earlier. A recurrent subject's follow-up end is always obs
 unlike the single-event VPC, no censoring time has to be drawn. `VpcCensoring::Horizon`
 follows every replicate subject to `H`.
 
+The observed curves are never cut at `H`. With `sim.horizon` below the data's own follow-up,
+the MCF and the absolute-time curves are unaffected up to `H`. A gap-time curve is not: the
+data's risk set counts events up to each subject's follow-up end and the replicates' only up
+to `H`, so that comparison is approximate. Leave `sim.horizon` unset, or cut the data at `H`
+first, when the gap-time curves matter.
+
 When a subject's last record is an event, its follow-up ends at that event: the data say
 nothing later about it. The observed subject then has an event exactly at its follow-up end,
 which a replicate almost never has. The usual layout, one censoring row closing each subject,
@@ -1093,9 +1101,11 @@ The bands are checked for self-consistency in `tests/vpc_rtte_self_consistency.r
 datasets are drawn outside the simulator from a Poisson process with between-subject
 variability, about 80 % of subjects leaving before `H`, and each gets a 200-replicate VPC. The
 observed MCF lies inside its 5 %–95 % band in 89 %, 89 % and 92 % of datasets at H/4, H/2 and
-3H/4, and the observed order-2 absolute curve in 89 %, 85 % and 92.5 %, inside the 99 %
-binomial interval around 90 % (84 %–95 %). Following every replicate subject to `H` instead
-takes the order-2 curve to 79 % and 82 % at H/2 and 3H/4, out of it.
+3H/4, and the observed order-2 absolute curve in 89 %, 85 % and 92.5 %. A 5 %–95 % band
+read from 200 replicates covers an exchangeable observation 89.1 % of the time, not 90 %,
+and these are inside the 99 % binomial interval around that (83 %–94.5 %). Following every
+replicate subject to `H` instead takes the order-2 curve to 79 % and 82 % at H/2 and 3H/4,
+out of it.
 
 ### What it refuses
 

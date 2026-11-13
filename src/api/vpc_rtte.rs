@@ -81,7 +81,8 @@ pub struct VpcRtteOptions {
     pub cmt: Option<usize>,
     /// The highest event order `K`: absolute-time curves for orders `1..=K` and
     /// gap-time curves for `2..=K`. `None` takes the largest `k` for which at least 10
-    /// observed subjects have `k` or more events, and at least 1. `Some(0)` is refused.
+    /// observed subjects, counted across all strata, have `k` or more events, and at
+    /// least 1. One `K` applies to every stratum. `Some(0)` is refused.
     pub max_order: Option<usize>,
     /// Passed to the simulator. `sim.seed` seeds the replicates; `sim.horizon` is `H`,
     /// and when `None` `H` is the latest time recorded on `cmt`.

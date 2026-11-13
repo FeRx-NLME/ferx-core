@@ -412,7 +412,8 @@ fn observed_follow_up_ends_each_replicate_subject_at_its_own_time() {
 /// MCF estimates `0.15·t` at every `t` when the events and the risk set end together.
 /// Keeping a short subject's events after its follow-up end, with the risk set still
 /// cut at 4, credits the 30 long subjects with all 60 subjects' events past 4: the
-/// median at 20 becomes about `0.6 + 2·2.4 = 5.4` against 3.0.
+/// median at 20 becomes about `0.6 + 2·2.4 = 5.4` against 3.0. Realised error of the
+/// two medians: 0.017 and 0.017 (macOS arm64); the bound is 0.15.
 #[test]
 fn replicate_events_after_the_follow_up_end_are_dropped() {
     let mut o = opts(60);
@@ -423,8 +424,9 @@ fn replicate_events_after_the_follow_up_end_are_dropped() {
     assert_eq!(m.n_used, [60, 60]);
     for (k, want) in [(0, 0.6), (1, 3.0)] {
         let med = m.med[k].expect("60 replicates resolve the band");
+        eprintln!("replicate MCF median at grid point {k}: {med} (expected {want})");
         assert!(
-            med.is_finite() && (med - want).abs() < 0.3,
+            med.is_finite() && (med - want).abs() < 0.15,
             "median {med} at grid point {k}"
         );
         let (lo, hi) = (m.lo[k].unwrap(), m.hi[k].unwrap());
@@ -438,7 +440,8 @@ fn replicate_events_after_the_follow_up_end_are_dropped() {
 /// one per record: the simulator's rows for it hold exactly one censoring row, at `H`,
 /// and its event times increase below `H`. Then through the entry point, 30 such
 /// subjects under `Horizon`: the replicate MCF at 10 estimates `0.15·10 = 1.5`. Reading
-/// a stream once per observed record would give 6.
+/// a stream once per observed record would give 6. Realised error of the median: 0.033
+/// (macOS arm64); the bound is 0.15.
 #[test]
 fn simulator_gives_one_stream_per_subject_per_replicate() {
     let p = pop(cohort(1, 30, 20.0, &[3.0, 8.0, 15.0]));
@@ -472,8 +475,62 @@ fn simulator_gives_one_stream_per_subject_per_replicate() {
     o.grid = VpcGrid::Times(vec![10.0]);
     let v = run(RTTE, &p, &o).unwrap();
     let med = v.strata[0].mcf.med[0].unwrap();
-    assert!(med.is_finite() && (med - 1.5).abs() < 0.3, "median {med}");
+    eprintln!("replicate MCF median at 10: {med} (expected 1.5)");
+    assert!(med.is_finite() && (med - 1.5).abs() < 0.15, "median {med}");
     assert!(v.warnings.is_empty(), "{:?}", v.warnings);
+}
+
+/// The band of a gap-time curve is built from the replicates' gap-time curves (review r1
+/// row 1). 100 subjects followed to 20 at rate 0.15, every replicate followed to `H`.
+/// The second gap is exponential whatever the first event time was, so the replicate
+/// Kaplan–Meier curve of gap order 2 estimates `exp(−0.15·5) = 0.472` at 5. The
+/// absolute-time order-2 curve there is `P(N(5) < 2) = 1.75·exp(−0.75) = 0.827`: a
+/// band built from the replicates' absolute-time curves has its median there. Realised
+/// errors: 0.012 (gap) and 0.007 (absolute) on macOS arm64; the bound is 0.06, against
+/// 0.35 between the two curves.
+#[test]
+fn gap_band_is_built_from_the_replicates_gap_time_curves() {
+    let p = pop(cohort(1, 100, 20.0, &[3.0, 8.0, 15.0]));
+    let mut o = opts(60);
+    o.max_order = Some(2);
+    o.censoring = VpcCensoring::Horizon;
+    o.grid = VpcGrid::Times(vec![5.0]);
+    let v = run(RTTE, &p, &o).unwrap();
+    let s = &v.strata[0];
+    let gap = s.gap[0].med[0].expect("60 replicates resolve the band");
+    let abs = s.absolute[1].med[0].expect("60 replicates resolve the band");
+    eprintln!("replicate medians at 5: gap order 2 {gap} (expected 0.472), absolute order 2 {abs} (expected 0.827)");
+    assert!(
+        gap.is_finite() && (gap - (-0.75f64).exp()).abs() < 0.06,
+        "gap {gap}"
+    );
+    assert!(
+        abs.is_finite() && (abs - 1.75 * (-0.75f64).exp()).abs() < 0.06,
+        "absolute {abs}"
+    );
+}
+
+/// The simulator's warnings reach the result (review r1 row 4). At a rate of 1e6 the
+/// simulator expects 2e7 events before the horizon, skips every stream and says so, one
+/// `W_RTTE_DEGENERATE` per subject per replicate. Those replicate subjects have no
+/// events, so the replicate MCF is 0: without the warning that band would read as a
+/// model predicting no events.
+#[test]
+fn simulator_warnings_reach_the_result() {
+    let p = pop(cohort(1, 3, 20.0, &[3.0]));
+    let m = model(RTTE);
+    let mut params = m.default_params.clone();
+    params.theta[0] = 1e6;
+    let mut o = opts(20);
+    o.max_order = Some(1);
+    o.grid = VpcGrid::Times(vec![10.0]);
+    let v = vpc_rtte(&m, &p, &params, &o).unwrap();
+    assert_eq!(v.warnings.len(), 3 * 20, "{:?}", v.warnings.first());
+    assert!(v
+        .warnings
+        .iter()
+        .all(|w| w.starts_with("W_RTTE_DEGENERATE: subject '")));
+    assert_eq!(v.strata[0].mcf.med, [Some(0.0)]);
 }
 
 /// The reader of the simulated rows on hand-built rows, one filter at a time: a

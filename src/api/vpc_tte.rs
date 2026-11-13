@@ -43,9 +43,12 @@ const AUTO_GRID_POINTS: usize = 101;
 /// The times the band is evaluated at.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum VpcGrid {
-    /// `{0}`, the stratum's observed event and censoring times, and 101 evenly
-    /// spaced points on `[0, H]`. The observed times make the overlay exact; the
-    /// even points keep the band from skipping steps between sparse observed times.
+    /// `{0}`, the times of the observed curve, and 101 evenly spaced points on
+    /// `[0, H]`. For [`vpc_tte`] the observed times are the stratum's event and
+    /// censoring times; for [`vpc_rtte`](super::vpc_rtte) each curve uses its own (an
+    /// order's event and censoring times, or gaps). The observed times make the
+    /// overlay exact; the even points keep the band from skipping steps between
+    /// sparse observed times.
     #[default]
     Auto,
     /// Exactly these times (sorted, duplicates dropped).
@@ -58,12 +61,14 @@ pub enum VpcGrid {
 /// How the replicates are censored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VpcCensoring {
-    /// Censor each subject observed censored at its own time; draw an event subject's
-    /// censoring time from the reverse Kaplan–Meier censoring distribution given that it
-    /// exceeds the event time (see the module doc).
+    /// Follow each replicate subject as the data followed it. [`vpc_tte`]: censor each
+    /// subject observed censored at its own time, and draw an event subject's censoring
+    /// time from the reverse Kaplan–Meier censoring distribution given that it exceeds
+    /// the event time (see the module doc). [`vpc_rtte`](super::vpc_rtte): end each
+    /// subject's follow-up at its own observed follow-up end; nothing is drawn.
     #[default]
     Observed,
-    /// Censor every replicate at `H` only.
+    /// Follow every replicate subject to `H` only.
     Horizon,
 }
 
