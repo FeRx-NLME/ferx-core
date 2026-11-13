@@ -11158,7 +11158,8 @@ pub(crate) fn bind_for_check(
 }
 
 /// Validate `model.output_columns` against known quantities, emitting
-/// `W_OUTPUT_DUPLICATE` and `E_OUTPUT_UNKNOWN_COLUMN` diagnostics.
+/// `W_OUTPUT_DUPLICATE`, `W_OUTPUT_MIXNUM_IS_CLASS` and `E_OUTPUT_UNKNOWN_COLUMN`
+/// diagnostics.
 pub fn validate_output_columns(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     let derived_names: Vec<&str> = model
@@ -11188,6 +11189,24 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
             continue;
         }
+        // `MIXNUM` on a `[mixture]` model is the class (#2784), whatever the data
+        // carry. A data column of that name is unreachable from the model already (an
+        // expression reads the built-in), and the sdtab column will not be it either,
+        // so say so to the user who listed it expecting their covariate.
+        if super::output_columns::is_mixture_class_column(model, col) {
+            if let Some(data_col) = cov_names.iter().find(|c| c.eq_ignore_ascii_case(col)) {
+                diags.push(Diagnostic::warning(
+                    "W_OUTPUT_MIXNUM_IS_CLASS",
+                    format!(
+                        "[output] column `{col}` on a [mixture] model is the mixture class \
+                         (the simulated class where the data were drawn under one, else the \
+                         fitted MIXEST), as NONMEM's `$TABLE MIXNUM` is; it is not the data \
+                         column `{data_col}`. Rename that column to write it to sdtab"
+                    ),
+                ));
+            }
+            continue;
+        }
         // Valid if it's a covariate, indiv param, or derived name. Synthetic
         // readout parameters (`__ferx_ro_*`, #486) are internal — not user-requestable.
         let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
@@ -11207,6 +11226,9 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             );
             candidates.extend(derived_names.iter().copied());
             candidates.extend(OUTPUT_MANDATORY.iter().copied());
+            if model.mixture.is_some() {
+                candidates.push(super::output_columns::MIXNUM_COLUMN);
+            }
             diags.push(Diagnostic::error(
                 "E_OUTPUT_UNKNOWN_COLUMN",
                 format!(

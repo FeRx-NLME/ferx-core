@@ -430,6 +430,7 @@ An observed compartment is missing a scaling or error-model entry, a declared pe
 | `W_DERIVED_STEP_IGNORED` | warning | `step=` given for a DV-based integral (ignored; DV integrals always use observation times). |
 | `E_OUTPUT_UNKNOWN_COLUMN` | error | A name in `[output]` is not recognised as a covariate, individual parameter, or derived expression. |
 | `W_OUTPUT_DUPLICATE` | warning | A name in `[output]` is already written to sdtab automatically (e.g. `TAFD`, `TAD`, an eta name). |
+| `W_OUTPUT_MIXNUM_IS_CLASS` | warning | `[output] MIXNUM` on a `[mixture]` model whose data carry a column of that name. The sdtab column is the mixture class — the simulated class where there is one, else the fitted `MIXEST` — as NONMEM's `$TABLE MIXNUM` is, not the data column; rename the column to table it ([#2784](https://github.com/FeRx-NLME/ferx-core/issues/2784)). |
 
 ### Experimental and degraded paths {#codes-experimental-and-degraded}
 

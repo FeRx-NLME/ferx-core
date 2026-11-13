@@ -159,3 +159,143 @@ fn derived_columns_use_the_fitted_mixture_class() {
         "derived CL must use the MIXEST class (TVCL2 = 3), got {cld:?}"
     );
 }
+
+/// One subject whose data carry a `MIXNUM` column (value 7, no class of the model).
+fn one_subject_pop_with_mixnum_column() -> crate::types::Population {
+    use std::io::Write;
+    let mut csv = String::from("ID,TIME,DV,AMT,EVID,CMT,MIXNUM\n");
+    csv.push_str("1,0,0,100,1,1,7\n");
+    for t in TIMES {
+        csv.push_str(&format!("1,{t},1.0,0,0,1,7\n"));
+    }
+    let mut f = tempfile::NamedTempFile::new().unwrap();
+    f.write_all(csv.as_bytes()).unwrap();
+    crate::read_nonmem_csv(f.path(), None, None).unwrap()
+}
+
+/// `[output] MIXNUM`'s column on `population`, computed under fitted class `mixest`
+/// (0-based, as `compute_extra_output_columns` takes it).
+fn output_mixnum_column(
+    model: &CompiledModel,
+    population: &crate::types::Population,
+    mixest: Option<&[usize]>,
+) -> Option<Vec<f64>> {
+    let params = &model.default_params;
+    let eta_hats = vec![DVector::zeros(1)];
+    let h_matrices = vec![DMatrix::zeros(TIMES.len(), 1)];
+    let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]];
+    let (mut subjects, _) = compute_subject_results(
+        model,
+        population,
+        params,
+        &eta_hats,
+        &h_matrices,
+        &kappas,
+        true,
+        mixest,
+        false,
+    );
+    compute_extra_output_columns(
+        model,
+        population,
+        &params.theta,
+        &kappas,
+        &mut subjects,
+        mixest,
+    );
+    let hits: Vec<_> = subjects[0]
+        .extra_columns
+        .iter()
+        .filter(|(n, _)| n.eq_ignore_ascii_case("MIXNUM"))
+        .collect();
+    assert!(hits.len() <= 1, "one MIXNUM column at most: {hits:?}");
+    hits.first().map(|(_, v)| v.clone())
+}
+
+/// #2784: on a `[mixture]` model `[output] MIXNUM` is the class, as `MIXNUM` is in every
+/// expression — the fitted MIXEST, or the simulated class where the data were drawn
+/// under one — and never the data column of that name (here 7, no class at all).
+///
+/// Dies on: the echo reading the covariate (7), the class column not written, the
+/// simulated class not preferred over the fitted one.
+#[test]
+fn output_mixnum_is_the_class_not_the_data_column() {
+    let src = MIX_MODEL.to_string() + "\n[output]\n  mixnum\n";
+    let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+    let mut population = one_subject_pop_with_mixnum_column();
+    assert!(
+        population.covariate_names.iter().any(|c| c == "MIXNUM"),
+        "fixture: the data carry a MIXNUM column"
+    );
+    let n = TIMES.len();
+    assert_eq!(
+        output_mixnum_column(&model, &population, Some(&[1])),
+        Some(vec![2.0; n]),
+        "the fitted class (MIXEST = 2), not the data column"
+    );
+    population.subjects[0].simulated_mixnum = Some(1);
+    assert_eq!(
+        output_mixnum_column(&model, &population, Some(&[1])),
+        Some(vec![1.0; n]),
+        "the simulated class wins over the fitted one"
+    );
+}
+
+/// Without `[mixture]` there is no class, and the parser refuses `MIXNUM` in every
+/// block, `[output]` included — so a data column named `MIXNUM` is never echoed by
+/// `[output]` on any model (#2784): the only model that accepts the name reads it as
+/// the class.
+#[test]
+fn output_mixnum_is_refused_without_a_mixture() {
+    let src = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+
+[output]
+  MIXNUM
+";
+    let err = crate::parser::model_parser::parse_model_string(src).unwrap_err();
+    assert!(err.contains("MIXNUM") && err.contains("[mixture]"), "{err}");
+}
+
+/// #2784 validation: `[output] MIXNUM` on a `[mixture]` model is accepted without a data
+/// column (it used to be `E_OUTPUT_UNKNOWN_COLUMN`) and, beside a data column of that
+/// name, warns that the column written is the class and not that data — the silent
+/// substitution the issue reports.
+///
+/// Dies on: the mixture gate dropped from validation, the warning not raised, or raised
+/// with no data column.
+#[test]
+fn output_mixnum_validation_on_a_mixture_model() {
+    let src = MIX_MODEL.to_string() + "\n[output]\n  MIXNUM\n";
+    let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+
+    let no_column = validate_output_columns(&model, &one_subject_pop());
+    assert!(no_column.is_empty(), "class column accepted: {no_column:?}");
+
+    let with_column = validate_output_columns(&model, &one_subject_pop_with_mixnum_column());
+    let codes: Vec<&str> = with_column.iter().map(|d| d.code.as_str()).collect();
+    assert_eq!(codes, vec!["W_OUTPUT_MIXNUM_IS_CLASS"], "{with_column:?}");
+    let msg = &with_column[0].message;
+    assert!(
+        msg.contains("mixture class") && msg.contains("not the data column `MIXNUM`"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("fitted MIXEST") && msg.contains("Rename"),
+        "{msg}"
+    );
+}
