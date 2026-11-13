@@ -356,6 +356,131 @@ pub(crate) fn mixture_gradient_with_modes(
     eval: &MixtureEval,
     modes: Option<&MixtureClassModes>,
 ) -> Option<Vec<f64>> {
+    mixture_gradient_assembled(model, population, params, options, eval, modes, |_| None)
+}
+
+/// [`mixture_gradient_with_modes`] that **salvages** a declined (subject × class) term
+/// instead of returning `None` for the whole population (#2906), as #1529 does for a
+/// single population: every term the adjoint serves keeps its exact gradient, and only a
+/// declined `∂nll_ik/∂x` is replaced by that one subject's reconverged central
+/// difference under class `k` ([`class_subject_reconverged_gradient`]) — `2·n_free`
+/// solves of one subject in one class, where the whole-objective
+/// [`mixture_gradient_fd`] re-solves every subject in every class per probe. A term
+/// whose posterior weight is exactly zero carries no gradient and is not differenced.
+///
+/// Each subject that took a salvage is recorded on `declines` (structural when no
+/// recorder serves the subject's data shape under that class, as
+/// `outer_optimizer::is_structural_decline` asks), so the fit's #1154 warning reports
+/// it. Still `None` when the mixing map declines (a model-level gap, so the caller's
+/// whole-objective FD is the only gradient there is), or under IOV without `modes`.
+pub(crate) fn mixture_gradient_salvaged(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+    eval: &MixtureEval,
+    modes: Option<&MixtureClassModes>,
+    declines: &crate::estimation::outer_optimizer::OuterFdDeclineLog,
+) -> Option<Vec<f64>> {
+    mixture_gradient_assembled(model, population, params, options, eval, modes, |d| {
+        let subject = &population.subjects[d.subject];
+        declines.record(d.subject);
+        if d.cp.omega_iov.is_none() {
+            let _guard = MixtureClassGuard::enter(d.cls + 1);
+            if crate::estimation::outer_optimizer::is_structural_decline(
+                model,
+                subject,
+                d.cp,
+                d.eta.as_slice(),
+            ) {
+                declines.record_structural(d.subject);
+            }
+        }
+        Some(class_subject_reconverged_gradient(
+            model, subject, params, d.cls, d.eta, options,
+        ))
+    })
+}
+
+/// One (subject × class) term [`mixture_gradient_assembled`] could not take from the
+/// adjoint: what its salvage needs.
+struct DeclinedTerm<'a> {
+    /// The subject's index in the population.
+    subject: usize,
+    /// The class, 0-based.
+    cls: usize,
+    /// The class parameters, [`class_params`].
+    cp: &'a ModelParameters,
+    /// The subject's class-`cls` mode, stacked `[η̂, κ̂]` under IOV.
+    eta: &'a DVector<f64>,
+}
+
+/// `d(nll_ik)/dx_k` over the class-`cls` layout `pack_params(&class_params(params, cls))`
+/// for one subject, by central differences that **re-solve that subject's class-`cls` mode**
+/// (warm-started at `eta`) at every probe — so the EBE response is included, as it is in the
+/// adjoint's gradient it stands in for (#2906). Runs under `MIXNUM = cls + 1` on the
+/// calling thread, the convention [`mixture_ofv`]'s serial class solves use.
+///
+/// The template the difference walks differs from [`class_params`] in its FIX flags only:
+/// a base Ω/Σ coordinate the class overrides takes the override's flag (a free override of
+/// a FIX base is free here, and is routed onto the override by [`class_route`]), and the
+/// class layout's inert override tail is pinned, so no probe is spent on a coordinate
+/// `class_params` has already swapped out.
+fn class_subject_reconverged_gradient(
+    model: &CompiledModel,
+    subject: &crate::types::Subject,
+    params: &ModelParameters,
+    cls: usize,
+    eta: &DVector<f64>,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let mut cp = class_params(params, cls);
+    if let Some(mix) = cp.mixture.as_mut() {
+        for (a, &(c, e)) in mix.omega_override_addr.iter().enumerate() {
+            if c == cls {
+                if let Some(f) = cp.omega_fixed.get_mut(e) {
+                    *f = mix.omega_override_fixed.get(a).copied().unwrap_or(false);
+                }
+            }
+        }
+        for (b, &(c, t)) in mix.sigma_override_addr.iter().enumerate() {
+            if c == cls {
+                if let Some(f) = cp.sigma_fixed.get_mut(t) {
+                    *f = mix.sigma_override_fixed.get(b).copied().unwrap_or(false);
+                }
+            }
+        }
+        mix.omega_override_fixed.iter_mut().for_each(|f| *f = true);
+        mix.sigma_override_fixed.iter_mut().for_each(|f| *f = true);
+    }
+    let x_k = pack_params(&cp);
+    let bounds = crate::estimation::parameterization::compute_bounds(&cp);
+    let _guard = MixtureClassGuard::enter(cls + 1);
+    if cp.omega_iov.is_some() {
+        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient_iov(
+            &x_k, &cp, model, subject, eta, &bounds, options,
+        )
+    } else {
+        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+            &x_k, &cp, model, subject, eta, &bounds, options,
+        )
+    }
+}
+
+/// The posterior-weighted mixture gradient both [`mixture_gradient_with_modes`] (strict:
+/// `salvage` declines every term) and [`mixture_gradient_salvaged`] assemble. `salvage`
+/// fills a (subject × class) term the adjoint declined with `d(nll_ik)/dx_k` over the
+/// class layout, or `None` to give up on the whole gradient. It is called only for a
+/// term with non-zero posterior weight.
+fn mixture_gradient_assembled(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+    eval: &MixtureEval,
+    modes: Option<&MixtureClassModes>,
+    mut salvage: impl FnMut(DeclinedTerm<'_>) -> Option<Vec<f64>>,
+) -> Option<Vec<f64>> {
     let spec = model.mixture.as_ref()?;
     let mp = params.mixture.as_ref()?;
     if params.omega_iov.is_some() && modes.is_none() {
@@ -405,11 +530,24 @@ pub(crate) fn mixture_gradient_with_modes(
             Some(cls + 1),
         );
         for (i, gk_i) in g_k.iter().enumerate() {
-            let gi = gk_i.as_ref()?; // out-of-scope subject → FD fallback
             let w = eval.pmix[i][cls];
             if w == 0.0 {
                 continue;
             }
+            let salvaged;
+            let gi = match gk_i.as_ref().filter(|g| g.iter().all(|v| v.is_finite())) {
+                Some(g) => g,
+                // Out-of-scope or non-finite term → the caller's salvage (or `None`).
+                None => {
+                    salvaged = salvage(DeclinedTerm {
+                        subject: i,
+                        cls,
+                        cp: &cp,
+                        eta: &etas[i],
+                    })?;
+                    &salvaged
+                }
+            };
             route_class_gradient(&mut grad, gi, 2.0 * w, cls, params, mp);
         }
     }
@@ -2742,5 +2880,150 @@ mod tests {
                 assert!(v.is_finite() && v > 0.0, "{method:?}: θ[{j}] variance {v}");
             }
         }
+    }
+
+    /// #2906: the oral two-class mixture of `tests/outer_gradient_fd_fallback_warning.rs`
+    /// (lag 0.25), on the first four warfarin subjects. Subject 0's bolus is replaced by a
+    /// steady-state infusion into the depot, which the adjoint declines under a lag time
+    /// (`ss_lagtime_walk_unsupported`); the other three stay in scope.
+    fn mixture_with_one_declined_subject() -> (crate::types::CompiledModel, crate::types::Population)
+    {
+        use crate::types::{DoseEvent, RateMode};
+        let model = crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL1(0.15, 0.001, 10.0)
+  theta TVCL2(0.30, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+  ALAG = 0.25
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+        )
+        .unwrap();
+        let mut pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin.csv"),
+            None,
+            None,
+        )
+        .unwrap();
+        pop.subjects.truncate(4);
+        let mut dose = DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0);
+        dose.rate_mode = RateMode::Fixed;
+        pop.subjects[0].doses = vec![dose];
+        (model, pop)
+    }
+
+    /// #2906: one declined subject used to send the whole mixture gradient to
+    /// [`super::mixture_gradient_fd`] (`mixture_gradient_with_modes` → `None`). The salvaged
+    /// gradient keeps the adjoint's terms for subjects 1–3 and differences only subject 0's
+    /// (subject × class) terms. It must agree with the whole-objective central difference —
+    /// the independent oracle, which re-solves every subject in every class — on every
+    /// coordinate, and the subject must be recorded (structurally: no recorder serves an SS
+    /// infusion under a lag) so the #1154 warning reports it with the reconverged sentence,
+    /// never the held-EBE remedy.
+    ///
+    /// The fixture straddles the gate: the strict assembly declines it (so the salvage is
+    /// what produced the gradient), and subject 0's terms are live (zeroing them moves the
+    /// gradient by far more than the parity bound).
+    #[test]
+    fn a_declined_subject_is_salvaged_alone_and_recorded() {
+        use crate::estimation::outer_optimizer::{outer_fd_fallback_warning, OuterFdDeclineLog};
+        use crate::estimation::parameterization::pack_params;
+        let (model, pop) = mixture_with_one_declined_subject();
+        let opts = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::FoceI,
+            interaction: true,
+            // The oracle re-solves every subject cold at each probe, so it is the noisier
+            // side: at the default `inner_tol` it moves by ~6e-4 on TVCL2 / Ω(KA) between
+            // tolerances while the salvaged gradient holds to ~1e-5. At 1e-6 the measured
+            // worst gap is 9.2e-5 (macOS arm64), hence the 5e-4 bound below.
+            inner_tol: 1e-6,
+            ..Default::default()
+        };
+        let params = &model.default_params;
+        let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        assert!(
+            super::mixture_gradient_with_modes(&model, &pop, params, &opts, &eval, Some(&modes))
+                .is_none(),
+            "fixture: the strict assembly must decline subject 0"
+        );
+        let log = OuterFdDeclineLog::reconverging(pop.subjects.len());
+        let salvaged = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &eval,
+            Some(&modes),
+            &log,
+        )
+        .expect("the mixing map is in scope, so the salvage forms a gradient");
+        assert_eq!(log.declined_indices(), vec![0], "only subject 0 declined");
+
+        // The same assembly with subject 0's salvage zeroed: how much its terms carry.
+        let zeroed = super::mixture_gradient_assembled(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &eval,
+            Some(&modes),
+            |d| Some(vec![0.0; pack_params(d.cp).len()]),
+        )
+        .unwrap();
+
+        let x = pack_params(params);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+        assert_eq!(salvaged.len(), fd.len());
+        let (mut worst, mut live) = (0.0f64, 0.0f64);
+        for (j, ((&s, &f), &z)) in salvaged.iter().zip(&fd).zip(&zeroed).enumerate() {
+            assert!(
+                s.is_finite() && f.is_finite() && z.is_finite(),
+                "coord {j}: {s} {f} {z}"
+            );
+            let rel = (s - f).abs() / f.abs().max(1.0);
+            let moved = (s - z).abs() / f.abs().max(1.0);
+            assert!(rel.is_finite() && moved.is_finite(), "coord {j}");
+            worst = worst.max(rel);
+            live = live.max(moved);
+        }
+        eprintln!("MEASURE #2906 salvaged vs whole-objective FD: worst rel {worst:e}; subject 0's terms move it by {live:e}");
+        assert!(worst < 5e-4, "salvaged vs FD worst rel {worst:e}");
+        assert!(
+            live > 100.0 * worst,
+            "fixture: subject 0's salvaged terms must be live ({live:e} vs {worst:e})"
+        );
+
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("the decline warns");
+        assert!(
+            w.contains("1 of 4") && w.contains(&format!("subject {}", pop.subjects[0].id)),
+            "{w}"
+        );
+        assert!(
+            w.contains("no analytic recorder serves them") && !w.contains("fixed-EBE"),
+            "a structural mixture decline is reconverged, not held-EBE: {w}"
+        );
     }
 }
