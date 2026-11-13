@@ -3247,6 +3247,7 @@ fn simulate_with_uncertainty_derives_occasions_from_the_fits_rule() {
         n_sim_per_draw: 2,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(5),
+        horizon: None,
     };
     let rows = |pop: &Population, rule: Option<IovOccasionRule>| {
         let mut fit = fit.clone();
@@ -3384,6 +3385,7 @@ fn iov_simulate_warns_when_no_kappa_is_drawn() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(5),
+        horizon: None,
     };
     let uncertainty = |pop: &Population, rule: Option<IovOccasionRule>| {
         let mut fit = fit.clone();

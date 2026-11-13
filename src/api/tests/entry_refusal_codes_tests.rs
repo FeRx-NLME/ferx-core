@@ -105,6 +105,17 @@ fn opts(horizon: Option<f64>) -> SimulateOptions {
     }
 }
 
+/// Zero uncertainty draws, so a refusal it returns preceded any draw.
+fn unc_opts(horizon: Option<f64>) -> SimulateUncertaintyOptions {
+    SimulateUncertaintyOptions {
+        n_uncertainty_draws: 0,
+        n_sim_per_draw: 1,
+        seed: Some(1),
+        horizon,
+        ..Default::default()
+    }
+}
+
 const ONE_CPT_IV: &str = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  \
     theta TVV(40.0, 1.0, 500.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP ~ 0.02\n\
     [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V  = TVV\n[structural_model]\n  \
@@ -129,6 +140,11 @@ fn simulate_option_and_input_refusals_carry_their_codes() {
             ..Default::default()
         };
         simulate_with_options(&iv, pop, p, 1, &o)
+    };
+    let unc = |h: Option<f64>| {
+        let fit = super::simulate_with_uncertainty_tests::synthetic_fit(p);
+        let pop = population_of(vec![observed("1", &[1.0])], &[]);
+        simulate_with_uncertainty(&iv, &pop, &fit, &unc_opts(h))
     };
     let iov = parse_model_string(ODE_IOV).expect("parse");
     let mut no_iov = iov.default_params.clone();
@@ -161,6 +177,22 @@ fn simulate_option_and_input_refusals_carry_their_codes() {
             "E_SIMULATE_HORIZON",
             None,
             "SimulateOptions.horizon must be finite and > 0 (got 0)",
+        ),
+        // The same value checks through `simulate_with_uncertainty` (#2003), on a model
+        // with no TTE endpoint: the text names that entry point's own option.
+        row(
+            "uncertainty, horizon NaN",
+            unc(Some(f64::NAN)),
+            "E_SIMULATE_HORIZON",
+            None,
+            "SimulateUncertaintyOptions.horizon must be finite and > 0 (got NaN)",
+        ),
+        row(
+            "uncertainty, horizon zero",
+            unc(Some(0.0)),
+            "E_SIMULATE_HORIZON",
+            None,
+            "SimulateUncertaintyOptions.horizon must be finite and > 0 (got 0)",
         ),
         row(
             "propensity, empty population",
@@ -254,15 +286,10 @@ fn tte_simulation_refusals_carry_their_codes() {
     let sim = |m: &CompiledModel, pop: Population, h: Option<f64>| {
         simulate_with_options(m, &pop, &m.default_params, 1, &opts(h))
     };
-    let unc = |m: &CompiledModel, pop: Population| {
+    // Zero draws: every refusal below is raised before the first draw.
+    let unc = |m: &CompiledModel, pop: Population, h: Option<f64>| {
         let fit = super::simulate_with_uncertainty_tests::synthetic_fit(&m.default_params);
-        let o = SimulateUncertaintyOptions {
-            n_uncertainty_draws: 0,
-            n_sim_per_draw: 1,
-            seed: Some(1),
-            ..Default::default()
-        };
-        simulate_with_uncertainty(m, &pop, &fit, &o)
+        simulate_with_uncertainty(m, &pop, &fit, &unc_opts(h))
     };
     check_rows(vec![
         row(
@@ -353,30 +380,58 @@ fn tte_simulation_refusals_carry_their_codes() {
             "SimulateOptions.horizon (2) is below subject '4' entry_time (5); the \
              administrative horizon must be ≥ every subject's entry time",
         ),
-        // `simulate_with_uncertainty` takes no horizon (review r1 #4): the same two
-        // horizon-required cases are not an option to set there, so they are
-        // `E_TTE_NOT_SIMULATABLE`, naming the entry point that can simulate the model.
+        // `simulate_with_uncertainty` takes its own horizon (#2003): the same refusals,
+        // each naming `SimulateUncertaintyOptions.horizon` and never an option of the
+        // options path. The texts are compared whole, so a wrong option name fails.
         row(
-            "uncertainty, RTTE (no horizon option)",
-            unc(&rtte, one(tte_subject(vec![event(2, 0.0)]))),
-            "E_TTE_NOT_SIMULATABLE",
-            Some("event_model"),
+            "uncertainty, RTTE without a horizon",
+            unc(&rtte, one(tte_subject(vec![event(2, 0.0)])), None),
+            "E_SIMULATE_HORIZON",
+            None,
             "Repeated time-to-event (RTTE, `type = rtte`) simulation requires a finite, \
-             positive administrative horizon, and `simulate_with_uncertainty` takes none \
-             (`SimulateUncertaintyOptions` has no horizon). The recurrent event stream is \
-             generated up to that horizon. Simulate this model with \
-             `simulate_with_options` and `SimulateOptions.horizon` instead.",
+             positive administrative horizon: set `SimulateUncertaintyOptions.horizon`. \
+             The recurrent event stream is generated up to that horizon.",
         ),
         row(
-            "uncertainty, ODE-accumulated TTE (no horizon option)",
-            unc(&ode_tte, one(tte_subject(vec![event(3, 0.0)]))),
+            "uncertainty, RTTE with a NaN horizon",
+            unc(&rtte, one(tte_subject(vec![event(2, 0.0)])), Some(f64::NAN)),
+            "E_SIMULATE_HORIZON",
+            None,
+            "Repeated time-to-event (RTTE, `type = rtte`) simulation requires a finite, \
+             positive administrative horizon: set `SimulateUncertaintyOptions.horizon`. \
+             The recurrent event stream is generated up to that horizon.",
+        ),
+        row(
+            "uncertainty, ODE-accumulated TTE without a horizon",
+            unc(&ode_tte, one(tte_subject(vec![event(3, 0.0)])), None),
+            "E_SIMULATE_HORIZON",
+            None,
+            "ODE-accumulated TTE (joint PK-TTE) simulation requires a finite, positive \
+             administrative horizon: set `SimulateUncertaintyOptions.horizon`. A \
+             drug-driven hazard can vanish, so there is no implicit observation window.",
+        ),
+        row(
+            "uncertainty, horizon below an entry time",
+            unc(&single, one(tte_subject(vec![event(2, 5.0)])), Some(2.0)),
+            "E_SIMULATE_HORIZON",
+            None,
+            "SimulateUncertaintyOptions.horizon (2) is below subject '4' entry_time (5); \
+             the administrative horizon must be ≥ every subject's entry time",
+        ),
+        // A valid horizon lifts only the horizon refusal: what the event-time simulator
+        // cannot draw is still refused, with the text of the options path.
+        row(
+            "uncertainty, RTTE on two CMTs, valid horizon",
+            unc(
+                &two_rtte,
+                one(tte_subject(vec![event(2, 0.0), event(3, 0.0)])),
+                Some(20.0),
+            ),
             "E_TTE_NOT_SIMULATABLE",
             Some("event_model"),
-            "ODE-accumulated TTE (joint PK-TTE) simulation requires a finite, positive \
-             administrative horizon, and `simulate_with_uncertainty` takes none \
-             (`SimulateUncertaintyOptions` has no horizon). A drug-driven hazard can \
-             vanish, so there is no implicit observation window. Simulate this model with \
-             `simulate_with_options` and `SimulateOptions.horizon` instead.",
+            "RTTE simulation supports one recurrent stream per subject, but subject '4' \
+             has RTTE endpoints on multiple CMTs ({2, 3}); multi-cause RTTE simulation is \
+             a later slice",
         ),
     ]);
 }

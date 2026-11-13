@@ -183,7 +183,7 @@ found:
 | a CTMM model (`predict*`, `simulate*`) | `E_CTMM_UNSUPPORTED` |
 | TTE simulatable | `E_TTE_NOT_SIMULATABLE`, `E_SIMULATE_HORIZON` |
 | Ω~IOV~ present (`simulate*`) | `E_PARAM_SHAPE` |
-| `SimulateOptions.horizon` | `E_SIMULATE_HORIZON` |
+| `SimulateOptions.horizon`, `SimulateUncertaintyOptions.horizon` | `E_SIMULATE_HORIZON` |
 | propensity-score matching inputs | `E_PROPENSITY_INPUT` |
 | adaptive dosing: the model, the options, the spec, a subject's dose values, which subjects' values a dose may read, the controller's actions, supplied per-subject η | `E_ADAPTIVE_UNSUPPORTED`, `E_ADAPTIVE_OPTIONS`, `E_ADAPTIVE_SPEC`, `E_ADAPTIVE_DOSE_VALUE`, `E_ADAPTIVE_DOSE_KNOWLEDGE`, `E_ADAPTIVE_CONTROLLER_ACTION`, `E_SUPPLIED_ETAS`; an `observe` or dose-expression covariate the data lack, `E_MISSING_COVARIATE` |
 | individual survival curves (`predict_survival_at_etas_diag`): supplied per-subject η on a `[mixture]` model, with the wrong names, or missing for a subject | `E_SUPPLIED_ETAS` |
