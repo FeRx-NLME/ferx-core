@@ -48,9 +48,13 @@ cargo run --release -p ferx-cli -- examples/mm_multistart.ferx --data mm_multist
 ### Small datasets {#small-datasets}
 
 On a dataset of a few hundred rows or fewer, such as an arm-level model-based
-meta-analysis, a single fit takes well under a second, so eight starts cost
-almost nothing. That makes multi-start a cheap check that the reported optimum
-is not a local one, even when the model is not one of the high-risk types above.
+meta-analysis, a single fit usually takes well under a second, so eight starts
+cost almost nothing. That makes multi-start a cheap check that the reported
+optimum is not a local one, even when the model is not one of the high-risk
+types above. The exception is a model whose nested levels stack many random
+effects into one subject: on 192 rows such a fit took 0.56 to 6.97 s as the
+stacked width grew from 9 to 33
+([Cost grows with the groups inside each subject](../model-file/iov.qmd#nested-levels-cost)).
 
 Whether it finds anything depends on the model. On the naproxen MBMA
 (`examples/mbma_naproxen.ferx`, 18 trials, 36 arms, 122 observations) it found nothing

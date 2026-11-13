@@ -276,7 +276,8 @@ pub fn fit_from_files(
     Ok(result)
 }
 
-/// The outer optimizer reported on `FitResult::optimizer`: the one that actually ran.
+/// The outer optimizer reported on `FitResult::optimizer`: the one that actually ran, and the
+/// optimizer `build_info::gradient_method_outer` is to report the outer gradient of.
 ///
 /// For the FOCE/FOCEI path the requested optimizer is resolved through
 /// `estimation::outer_optimizer::resolve_outer_optimizer` — the function the outer loop
@@ -285,26 +286,33 @@ pub fn fit_from_files(
 /// explicit optimizer that cannot carry the mixture objective (built-in BFGS/L-BFGS,
 /// trust-region) with BOBYQA, which `Optimizer::resolve_auto` alone does not know about;
 /// that replacement is reported as `bobyqa`, and the outer loop's downgrade warning says
-/// why. A mixture whose classes start indistinguishable (`symmetric_start`) runs `auto` under
-/// BOBYQA and is reported so. `has_mixture` and `symmetric_start` are what the outer loop keys
-/// on, at the start the final stage ran from. `symmetric_start` is evaluated only on the
-/// methods that run the outer optimizer, since it costs `O(n_subj · K)` inner evaluations.
+/// why. A mixture whose classes start indistinguishable (`symmetric_pairs` non-empty) runs
+/// `auto` under BOBYQA and is reported so. `has_mixture` and `symmetric_pairs` are what the outer
+/// loop keys on, at the start the final stage ran from. `symmetric_pairs` is evaluated only on
+/// the methods that run the outer optimizer, since it costs `O(n_subj · K)` inner evaluations.
+///
+/// The returned optimizer is the resolved one, so the outer-gradient report and this label come
+/// from the same rule: at an indistinguishable mixture start both describe BOBYQA (`N/A`), where
+/// the model-level resolution alone would report the analytic gradient of an L-BFGS that never
+/// ran (#2749 review row 2). The methods with a fixed label return the requested optimizer,
+/// which `gradient_method_outer` does not read for them.
 pub(crate) fn reported_optimizer_label(
     method: EstimationMethod,
     options: &FitOptions,
     model: &CompiledModel,
     has_mixture: bool,
-    symmetric_start: impl FnOnce() -> bool,
-) -> String {
+    symmetric_pairs: impl FnOnce() -> Vec<(usize, usize)>,
+) -> (String, Optimizer) {
+    let fixed = |label: &str| (label.to_string(), options.optimizer);
     match method {
-        EstimationMethod::Saem => "saem".to_string(),
-        EstimationMethod::FoceGn => "gn".to_string(),
-        EstimationMethod::FoceGnHybrid => "gn".to_string(),
+        EstimationMethod::Saem => fixed("saem"),
+        EstimationMethod::FoceGn => fixed("gn"),
+        EstimationMethod::FoceGnHybrid => fixed("gn"),
         // IMP/IMPMAP never run the outer optimizer — their M-step uses an
         // internal BOBYQA regardless of `options.optimizer`, so report that
         // rather than a setting that had no effect.
-        EstimationMethod::Impmap => "impmap-bobyqa".to_string(),
-        EstimationMethod::Imp => "imp-bobyqa".to_string(),
+        EstimationMethod::Impmap => fixed("impmap-bobyqa"),
+        EstimationMethod::Imp => fixed("imp-bobyqa"),
         _ => {
             let (resolved, _) = crate::estimation::outer_optimizer::resolve_fit_optimizer(
                 options.optimizer,
@@ -314,13 +322,14 @@ pub(crate) fn reported_optimizer_label(
                     model,
                     options.interaction,
                 ),
-                symmetric_start(),
+                &symmetric_pairs(),
             );
-            if options.optimizer == Optimizer::Auto {
+            let label = if options.optimizer == Optimizer::Auto {
                 format!("auto ({})", resolved.label())
             } else {
                 resolved.label().to_string()
-            }
+            };
+            (label, resolved)
         }
     }
 }
@@ -2696,6 +2705,8 @@ fn fit_inner(
         for (sr, sn) in subjects.iter_mut().zip(per_subj) {
             sr.npde = sn.npde;
             sr.npd = sn.npd;
+            sr.epred = sn.epred;
+            sr.pwres = sn.pwres;
         }
     }
 
@@ -2978,12 +2989,6 @@ fn fit_inner(
 
     let grad_inner =
         crate::build_info::gradient_method_inner(&crate::build_info::BUILD_INFO, model);
-    let grad_outer = crate::build_info::gradient_method_outer(
-        &crate::build_info::BUILD_INFO,
-        final_method,
-        options.optimizer,
-        model,
-    );
 
     // Flush and close the trace file; capture path for FitResult. Guarded on
     // having installed one — see the `trace_installed` comment above.
@@ -3339,19 +3344,29 @@ fn fit_inner(
     //
     // Lazy: the scan is `O(n_subj · K)` inner objective evaluations, and the methods that report
     // a fixed label (SAEM, IMP / IMPMAP, GN) never read it.
-    let symmetric_start = || {
-        last_stage_start.as_ref().is_some_and(|(start, optimizer)| {
-            crate::estimation::outer_optimizer::symmetric_mixture_start(
-                model, population, start, *optimizer,
-            )
-        })
+    let symmetric_pairs = || {
+        last_stage_start
+            .as_ref()
+            .map_or_else(Vec::new, |(start, optimizer)| {
+                crate::estimation::outer_optimizer::symmetric_mixture_start(
+                    model, population, start, *optimizer,
+                )
+            })
     };
-    let optimizer_label = reported_optimizer_label(
+    let (optimizer_label, ran_optimizer) = reported_optimizer_label(
         final_method,
         options,
         model,
         init_params.mixture.is_some(),
-        symmetric_start,
+        symmetric_pairs,
+    );
+    // The optimizer the label resolved, not `options.optimizer`: `gradient_method_outer`'s own
+    // resolution is model-level and cannot see an indistinguishable mixture start (#2749 row 2).
+    let grad_outer = crate::build_info::gradient_method_outer(
+        &crate::build_info::BUILD_INFO,
+        final_method,
+        ran_optimizer,
+        model,
     );
 
     let mut fit_result = FitResult {

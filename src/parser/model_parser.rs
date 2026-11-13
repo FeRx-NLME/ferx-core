@@ -7372,13 +7372,13 @@ pub fn parse_full_model_with(
     // Only compiled when the `survival` feature is enabled; the field
     // `model.endpoints` is always present (cfg-gated) and stays empty otherwise.
     //
-    // Theta/eta indices used in event_model expressions are collected here so
-    // that check_unused_parameters (below) can suppress false "not referenced"
-    // warnings for parameters that only appear in [event_model].
-    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
+    // Theta/eta indices read anywhere outside `[individual_parameters]` are collected
+    // here, so that check_unused_parameters (below) does not report them "not
+    // referenced". Despite the name the set is not only [event_model]'s: a custom RUV
+    // magnitude, a `correlation` line's ρ, a `[covariate_model]` relation, a `[scaling]`
+    // readout and a `[mixture]` mixing expression (#2766) add theirs too.
     let mut event_model_used_thetas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
-    #[cfg_attr(not(feature = "survival"), allow(unused_mut))]
     let mut event_model_used_etas: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
     // Every endpoint block's parameter expressions as synthetic assignments,
@@ -7642,6 +7642,17 @@ pub fn parse_full_model_with(
         ));
     }
 
+    // A θ used only in a [mixture] mixing expression (logit(1) = MIXL, p(1) = P1) is not
+    // referenced in [individual_parameters] or [event_model], but it IS estimated — the
+    // mixing fraction. Scan the expressions the same way the event-model blocks do (#2766).
+    if let Some(spec) = &model.mixture {
+        for expr in &spec.mixing {
+            visit_expr_nodes(&expr.expr, &mut |e: &Expression| {
+                note_theta_eta(e, &mut event_model_used_thetas, &mut event_model_used_etas)
+            });
+        }
+    }
+
     model.parse_warnings.extend(check_unused_parameters(
         &thetas,
         &eta_names_bsv,
@@ -7898,8 +7909,8 @@ pub(crate) const MAX_CMT_INDEX: usize = 255;
 
 /// Built-in sdtab column names that [derived] names must not clash with.
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
-    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EBE_OFV", "N_OBS",
-    "TAFD", "TAD", "CENS", "OCC", "CMT",
+    "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EPRED", "PWRES",
+    "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD", "CENS", "OCC", "CMT",
 ];
 
 /// Split a token slice at top-level commas (depth 0 inside parentheses).

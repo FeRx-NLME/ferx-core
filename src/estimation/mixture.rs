@@ -75,9 +75,11 @@ pub fn class_params(params: &ModelParameters, k: usize) -> ModelParameters {
     p
 }
 
-/// Whether the mixture's classes cannot be told apart at `params`: every subject has the same
-/// mixing probability, and the same individual objective at η = 0 and at a probe η (0.3 prior SD
-/// on each random effect), for **some pair** of classes on every subject.
+/// The pairs of mixture classes that cannot be told apart at `params`, as class numbers the way
+/// `MIXNUM` spells them (`(1, 2)` is the first two classes), in ascending order. A pair is
+/// indistinguishable when every subject has the same mixing probability under both classes, and
+/// the same individual objective at η = 0 and at a probe η (0.3 prior SD on each random effect).
+/// Empty when every pair can be told apart, and for a model without a mixture.
 ///
 /// One such pair is enough. The mixture objective is then symmetric under swapping that pair, so
 /// its gradient is: a gradient optimizer started there moves both of them the same way and never
@@ -95,17 +97,20 @@ pub fn class_params(params: &ModelParameters, k: usize) -> ModelParameters {
 /// inputs. It can err only towards "symmetric", for classes that differ only away from the two
 /// η probed or only through κ (which `individual_nll` holds at 0), and that costs nothing but
 /// the faster optimizer.
-pub(crate) fn classes_indistinguishable(
+///
+/// Every pair is returned, not the first, so the warning can name each pair the user has to
+/// separate: with three identical classes, separating classes 1 and 2 still leaves 1 and 3.
+pub(crate) fn indistinguishable_class_pairs(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
-) -> bool {
+) -> Vec<(usize, usize)> {
     let (Some(spec), Some(mp)) = (model.mixture.as_ref(), params.mixture.as_ref()) else {
-        return false;
+        return Vec::new();
     };
     let k = mp.omega.len();
     if k < 2 {
-        return false;
+        return Vec::new();
     }
     let zeros = vec![0.0; model.n_eta];
     let probe: Vec<f64> = (0..model.n_eta)
@@ -144,10 +149,10 @@ pub(crate) fn classes_indistinguishable(
             logp[a].to_bits() == logp[b].to_bits() && nlls.iter().all(|n| n[a] == n[b])
         });
         if pairs.is_empty() {
-            return false;
+            return pairs;
         }
     }
-    !pairs.is_empty()
+    pairs.into_iter().map(|(a, b)| (a + 1, b + 1)).collect()
 }
 
 /// Combine one subject's per-class scores into its mixture contribution.
@@ -500,7 +505,7 @@ pub(crate) fn mixture_gradient_with_modes(
     }
 
     // Softmax mixing gradient: −2 Σ_i Σ_k w_ik ∂ln p_ik/∂θ_j (theta slots).
-    let theta_floor = fd_theta_step_floors(&model.default_params);
+    let theta_floor = fd_theta_step_floors(model);
     for (i, subject) in population.subjects.iter().enumerate() {
         let dlnp = mixing_logp_grad(spec, &params.theta, &subject.covariates, &theta_floor)?;
         for (cls, dlnp_c) in dlnp.iter().enumerate() {
@@ -838,7 +843,7 @@ impl MixtureScoreContext {
         let covariates = &population.subjects[i].covariates;
         // The p-form has no analytic mixing gradient; S, unlike the outer gradient, has no
         // whole-objective FD to fall back to, so difference the mixing map itself.
-        let floor = fd_theta_step_floors(&model.default_params);
+        let floor = fd_theta_step_floors(model);
         let dlnp = mixing_logp_grad(spec, &self.params.theta, covariates, &floor)
             .unwrap_or_else(|| mixing_logp_grad_fd(spec, &self.params.theta, covariates, &floor));
         let mut g = vec![0.0f64; packed_segments(&self.params).total()];
@@ -880,7 +885,7 @@ impl MixtureScoreContext {
 /// is absolute in its own units — 1.2 % of a θ of 8e-4. There it is `1e-5·|θ₀|` (#2187).
 ///
 /// Each probe is clamped to `init_params`' packed box — the box the outer optimizer
-/// searches — and the difference divided by the clamped span, as `central_diff_packed`
+/// searches — and the difference divided by the clamped span, as `central_diff_packed_gated`
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
@@ -891,7 +896,7 @@ pub fn mixture_gradient_fd(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     let bounds = crate::estimation::parameterization::compute_bounds(init_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
@@ -901,7 +906,7 @@ pub fn mixture_gradient_fd(
         let mut xm = x.to_vec();
         xp[i] = (x[i] + h).min(bounds.upper[i]);
         xm[i] = (x[i] - h).max(bounds.lower[i]);
-        // Collapsed probes only — see `central_diff_packed`: an absolute cutoff on the span
+        // Collapsed probes only — see `central_diff_packed_gated`: an absolute cutoff on the span
         // would zero a θ declared below ~1e-11 (#2187 review).
         if xp[i] <= xm[i] {
             continue;
@@ -1013,7 +1018,7 @@ mod tests {
             let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
             let spec = model.mixture.as_ref().unwrap();
             let theta = &model.default_params.theta;
-            let floor = fd_theta_step_floors(&model.default_params);
+            let floor = fd_theta_step_floors(&model);
             assert_eq!(floor, vec![1.0, tiny], "{mixing}: floors");
             // The closed form: softmax with logit g, or the p form p₁ = g (both unclamped
             // here, p₁ = 2.8e-4).
@@ -2839,11 +2844,22 @@ mod tests {
     }
 }
 
-/// [`classes_indistinguishable`]: each case changes one thing from an indistinguishable start
+/// [`indistinguishable_class_pairs`]: each case changes one thing from an indistinguishable start
 /// and must flip the answer, so every input the check reads is shown to matter.
 #[cfg(test)]
 mod indistinguishable_tests {
-    use super::classes_indistinguishable;
+    use super::indistinguishable_class_pairs;
+    use crate::types::{CompiledModel, ModelParameters, Population};
+
+    /// Whether any pair is indistinguishable: the question every case but the pair-naming ones
+    /// asks.
+    fn classes_indistinguishable(
+        model: &CompiledModel,
+        pop: &Population,
+        params: &ModelParameters,
+    ) -> bool {
+        !indistinguishable_class_pairs(model, pop, params).is_empty()
+    }
 
     /// The `tests/mixture_nonmem.rs` model at an indistinguishable start: both classes at
     /// CL 1.7, the mixing logit at 0 (p = ½ each).
@@ -2974,16 +2990,9 @@ mod indistinguishable_tests {
         );
     }
 
-    /// A three-class start where two classes are identical and the third differs. The identical
-    /// pair is still permutation-symmetric, so a gradient optimizer keeps them merged and can
-    /// only reach the best solution in which they are: the guard must flag it. Requiring every
-    /// class to match (the first cut) reported this distinguishable.
-    ///
-    /// The control is the same model with all three classes distinct, which must not be flagged,
-    /// so the test cannot pass by flagging every three-class start.
-    #[test]
-    fn two_identical_classes_beside_a_third_are_indistinguishable() {
-        const THREE: &str = r"
+    /// A three-class start where classes 1 and 2 are identical and class 3 differs, all at
+    /// p = ⅓.
+    const THREE: &str = r"
 [parameters]
   theta TVCL1(1.7, 0.01, 100.0)
   theta TVCL2(1.7, 0.01, 100.0)
@@ -3009,33 +3018,148 @@ mod indistinguishable_tests {
 [error_model]
   DV ~ proportional(EPS)
 ";
-        let judge = |src: &str| {
+
+    /// [`THREE`] with class 1 moved off and class 3 onto class 2's values: classes 2 and 3
+    /// identical, class 1 different. A check that reports the first pair whatever it found
+    /// names classes 1 and 2 here.
+    fn three_mirrored() -> String {
+        let mirror = THREE
+            .replace(
+                "theta TVCL1(1.7, 0.01, 100.0)",
+                "theta TVCL1(3.1, 0.01, 100.0)",
+            )
+            .replace(
+                "theta TVCL3(3.1, 0.01, 100.0)",
+                "theta TVCL3(1.7, 0.01, 100.0)",
+            );
+        assert!(mirror.contains("TVCL1(3.1") && mirror.contains("TVCL3(1.7"));
+        mirror
+    }
+
+    /// The indistinguishable pairs of a three-class model on `tests/nonmem/mixture_iv.csv`.
+    fn three_class_pairs(src: &str) -> Vec<(usize, usize)> {
+        let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
+        assert_eq!(model.mixture.as_ref().expect("mixture").n_classes, 3);
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("tests/nonmem/mixture_iv.csv"),
+            Some(&["WT"]),
+            None,
+        )
+        .expect("data loads");
+        indistinguishable_class_pairs(&model, &pop, &model.default_params)
+    }
+
+    /// The identical pair in [`THREE`] is still permutation-symmetric, so a gradient optimizer
+    /// keeps the two merged and can only reach the best solution in which they are: the guard
+    /// must flag it. Requiring every class to match (the first cut) reported this
+    /// distinguishable.
+    ///
+    /// The control is the same model with all three classes distinct, which must not be flagged,
+    /// so the test cannot pass by flagging every three-class start.
+    #[test]
+    fn two_identical_classes_beside_a_third_are_indistinguishable() {
+        let pairs = three_class_pairs;
+        assert_eq!(
+            pairs(THREE),
+            [(1, 2)],
+            "classes 1 and 2 are identical at equal p: that pair, and only it, cannot be separated"
+        );
+        // The third class differing is what the all-classes rule keyed on, so the control has to
+        // break the *pair*: class 2 moved off class 1.
+        assert_eq!(
+            pairs(&THREE.replace(
+                "theta TVCL2(1.7, 0.01, 100.0)",
+                "theta TVCL2(2.4, 0.01, 100.0)"
+            )),
+            []
+        );
+        // Equal classes but unequal mixing probabilities: the pair is weighted differently, so
+        // the gradient separates them.
+        assert_eq!(
+            pairs(&THREE.replace(
+                "theta MIXL2(0.0, -10.0, 10.0)",
+                "theta MIXL2(1.0, -10.0, 10.0)"
+            )),
+            []
+        );
+        assert_eq!(pairs(&three_mirrored()), [(2, 3)]);
+        // All three identical: every pair is returned, so the warning names each one the user
+        // has to separate, not just the first.
+        let all = THREE.replace(
+            "theta TVCL3(3.1, 0.01, 100.0)",
+            "theta TVCL3(1.7, 0.01, 100.0)",
+        );
+        assert_eq!(pairs(&all), [(1, 2), (1, 3), (2, 3)]);
+    }
+
+    /// Classes that differ only in a per-class Σ: the same predictions and prior, a different
+    /// residual variance. The base Σ is what every other case shares between the classes.
+    #[test]
+    fn a_class_sigma_override_is_distinguishable() {
+        assert!(!indistinguishable(&edit(
+            "  logit(1) = MIXL\n",
+            "  logit(1) = MIXL\n  sigma(2) EPS ~ 0.09\n",
+        )));
+    }
+
+    /// `W_MIXTURE_SYMMETRIC_START` names the pair the check found, through the same
+    /// `symmetric_mixture_start` → `resolve_fit_optimizer` route `optimize_population` takes. The
+    /// rule is pairwise, so the message must not say every class matches. Each fixture asserts
+    /// the pair it has and the negatives of the pairs it does not.
+    #[test]
+    fn the_symmetric_start_warning_names_the_pair() {
+        use crate::estimation::outer_optimizer::{resolve_fit_optimizer, symmetric_mixture_start};
+        use crate::types::Optimizer;
+        let warning = |src: &str| {
             let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
-            assert_eq!(model.mixture.as_ref().expect("mixture").n_classes, 3);
             let pop = crate::io::datareader::read_nonmem_csv(
                 std::path::Path::new("tests/nonmem/mixture_iv.csv"),
                 Some(&["WT"]),
                 None,
             )
             .expect("data loads");
-            classes_indistinguishable(&model, &pop, &model.default_params)
+            let pairs =
+                symmetric_mixture_start(&model, &pop, &model.default_params, Optimizer::Auto);
+            let (resolved, warnings) =
+                resolve_fit_optimizer(Optimizer::Auto, &model, true, true, &pairs);
+            assert_eq!(resolved, Optimizer::Bobyqa, "a symmetric start runs BOBYQA");
+            let [w] = warnings.as_slice() else {
+                panic!("one warning: {warnings:#?}")
+            };
+            assert!(w.starts_with("W_MIXTURE_SYMMETRIC_START"), "{w}");
+            assert!(!w.contains("every class"), "the rule is pairwise: {w}");
+            // The other three sentences: what "indistinguishable" means, what ran instead, and
+            // what to change.
+            assert!(
+                w.contains("the same mixing probability and the same objective under both classes"),
+                "{w}"
+            );
+            assert!(w.contains("ran BOBYQA instead of L-BFGS"), "{w}");
+            assert!(w.contains("different initial values"), "{w}");
+            w.clone()
         };
+        let w = warning(THREE);
+        assert!(w.contains("classes 1 and 2"), "{w}");
         assert!(
-            judge(THREE),
-            "classes 1 and 2 are identical at equal p: that pair cannot be separated"
+            !w.contains("classes 1 and 3") && !w.contains("classes 2 and 3"),
+            "{w}"
         );
-        // The third class differing is what the all-classes rule keyed on, so the control has to
-        // break the *pair*: class 2 moved off class 1.
-        assert!(!judge(&THREE.replace(
-            "theta TVCL2(1.7, 0.01, 100.0)",
-            "theta TVCL2(2.4, 0.01, 100.0)"
-        )));
-        // Equal classes but unequal mixing probabilities: the pair is weighted differently, so
-        // the gradient separates them.
-        assert!(!judge(&THREE.replace(
-            "theta MIXL2(0.0, -10.0, 10.0)",
-            "theta MIXL2(1.0, -10.0, 10.0)"
-        )));
+        let w = warning(&three_mirrored());
+        assert!(w.contains("classes 2 and 3"), "{w}");
+        assert!(
+            !w.contains("classes 1 and 2") && !w.contains("classes 1 and 3"),
+            "{w}"
+        );
+        // All three identical: every pair is named, not only the first.
+        let all = THREE.replace(
+            "theta TVCL3(3.1, 0.01, 100.0)",
+            "theta TVCL3(1.7, 0.01, 100.0)",
+        );
+        let w = warning(&all);
+        assert!(
+            w.contains("classes 1 and 2, classes 1 and 3, classes 2 and 3 start"),
+            "{w}"
+        );
     }
 
     /// The `tests/mixture_iov_nonmem.rs` model (IOV on CL, `p(1)` mixing): `individual_nll`

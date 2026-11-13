@@ -2041,6 +2041,8 @@ fn drawn_derived_columns(
                 cwres: vec![f64::NAN; n_obs],
                 npde: Vec::new(),
                 npd: Vec::new(),
+                epred: Vec::new(),
+                pwres: Vec::new(),
                 ofv_contribution: f64::NAN,
                 cens: subject.cens.clone(),
                 n_obs,
