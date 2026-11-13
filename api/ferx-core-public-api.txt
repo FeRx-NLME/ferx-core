@@ -84,6 +84,7 @@ pub ferx_core::api::SimulateOptions::iov_occasion: core::option::Option<ferx_cor
 pub ferx_core::api::SimulateOptions::match_method: core::option::Option<ferx_core::propensity_match::MatchMethod>
 pub ferx_core::api::SimulateOptions::seed: core::option::Option<u64>
 pub struct ferx_core::api::SimulateUncertaintyOptions
+pub ferx_core::api::SimulateUncertaintyOptions::horizon: core::option::Option<f64>
 pub ferx_core::api::SimulateUncertaintyOptions::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
 pub ferx_core::api::SimulateUncertaintyOptions::n_sim_per_draw: usize
 pub ferx_core::api::SimulateUncertaintyOptions::n_uncertainty_draws: usize
@@ -5605,6 +5606,7 @@ pub ferx_core::SimulateOptions::iov_occasion: core::option::Option<ferx_core::Io
 pub ferx_core::SimulateOptions::match_method: core::option::Option<ferx_core::propensity_match::MatchMethod>
 pub ferx_core::SimulateOptions::seed: core::option::Option<u64>
 pub struct ferx_core::SimulateUncertaintyOptions
+pub ferx_core::SimulateUncertaintyOptions::horizon: core::option::Option<f64>
 pub ferx_core::SimulateUncertaintyOptions::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
 pub ferx_core::SimulateUncertaintyOptions::n_sim_per_draw: usize
 pub ferx_core::SimulateUncertaintyOptions::n_uncertainty_draws: usize
