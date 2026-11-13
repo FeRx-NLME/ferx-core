@@ -491,10 +491,14 @@ fn a_multi_start_fit_reports_every_start_and_a_single_start_fit_none() {
         !multi.converged,
         "premise: outer_maxiter = 2 converges no start"
     );
-    assert!(matches!(
-        selected[0].status,
-        Some(FitStatus::NotConverged { .. })
-    ));
+    assert_eq!(selected[0].status.as_deref(), Some("not_converged"));
+    // `convergence` is the start's own "did not converge" warning, a plain string on its
+    // result: the row's status has it only because the start's warnings were classified
+    // before the status was taken.
+    assert_eq!(
+        selected[0].status_reasons,
+        vec!["budget_spent", "convergence"]
+    );
     assert!(lines_contain_not_converged(&multi.warnings));
     assert!(multi.starts.iter().all(|s| s.error.is_none()));
     // Start 0 ran from the model file's values, the others from perturbed ones.

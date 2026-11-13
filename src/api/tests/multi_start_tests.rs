@@ -114,7 +114,13 @@ fn test_per_start_saem_seed_derivation() {
 use super::{multistart_prefers, select_start};
 use crate::diagnostics::{Diagnostic, EngineError};
 use crate::types::test_helpers::empty_fit_result;
-use crate::types::{FitResult, FitStatus, StartRecord};
+use crate::types::{
+    classify_warning, FitResult, StartRecord, StartSpread, WarningCode, WarningSeverity,
+};
+
+/// A warning that reaches a result as a plain string and classifies `Critical`: nothing
+/// types it at source, so only the classifier can put it into a status.
+const ILL_CONDITIONED: &str = "condition number 3.2e9 exceeds 1e6";
 
 fn start_fit(ofv: f64, converged: bool, theta: f64) -> FitResult {
     FitResult {
@@ -147,7 +153,13 @@ fn old_selection(results: &[(usize, Result<FitResult, EngineError>)]) -> Option<
 
 fn mixed_results() -> Vec<(usize, Result<FitResult, EngineError>)> {
     vec![
-        (0, Ok(start_fit(12.0, true, 1.0))),
+        (
+            0,
+            Ok(FitResult {
+                warnings: vec![ILL_CONDITIONED.to_string()],
+                ..start_fit(12.0, true, 1.0)
+            }),
+        ),
         (1, Err(EngineError::uncoded("start refused"))),
         (2, Ok(start_fit(10.0, false, 2.0))),
         (3, Ok(start_fit(11.0, true, 3.0))),
@@ -181,16 +193,25 @@ fn select_start_records_every_start_and_picks_what_the_ranking_picks() {
     assert_eq!(selected, vec![3]);
     assert_eq!(starts[3].ofv, Some(winner.ofv));
     assert_eq!(starts[3].theta, winner.theta);
-    assert_eq!(starts[3].status, Some(FitStatus::Converged));
+    assert_eq!(starts[3].status.as_deref(), Some("converged"));
+    assert!(starts[3].status_reasons.is_empty());
     assert_eq!(
         (starts[3].n_iterations, starts[3].wall_time_secs),
         (7, 0.25)
     );
-    assert!(matches!(
-        starts[2].status,
-        Some(FitStatus::NotConverged { .. })
-    ));
+    assert_eq!(starts[2].status.as_deref(), Some("not_converged"));
     assert!(!starts[2].converged);
+    // Start 0's critical warning is a plain string on its result, with nothing in
+    // `warnings_structured` yet. Its row's status must count it all the same: it is what the
+    // fit's own status would say had this start been returned.
+    let critical = classify_warning(ILL_CONDITIONED);
+    assert_eq!(
+        (&critical.severity, &critical.category),
+        (&WarningSeverity::Critical, &WarningCode::ConditionNumber),
+        "premise: the fixture's warning is critical"
+    );
+    assert_eq!(starts[0].status.as_deref(), Some("converged_with_issues"));
+    assert_eq!(starts[0].status_reasons, vec!["condition_number"]);
     // No penalty: no second column.
     assert!(starts.iter().all(|s| s.objective.is_none()));
     // A NaN OFV is recorded as absent, on a start that still ran.
@@ -219,6 +240,7 @@ fn a_failed_start_keeps_its_message_and_code() {
             objective: None,
             converged: false,
             status: None,
+            status_reasons: Vec::new(),
             n_iterations: 0,
             wall_time_secs: 0.0,
             theta: Vec::new(),
@@ -262,6 +284,24 @@ fn select_start_records_the_ranked_objective_under_a_penalty() {
     let (best, _, starts) = select_start(results(), rank, false);
     assert_eq!(best.map(|b| b.0), Some(0));
     assert!(starts.iter().all(|s| s.objective.is_none()));
+
+    // A start whose ranked value is not finite (here a NaN θ makes the penalty NaN) keeps
+    // its OFV and records no objective. The summary then leaves it out, as the ranking did:
+    // it is not compared on its unpenalized −90 against the others' penalized values, where
+    // it would read as a converged start 9.75 above the best.
+    let mut with_nan = results();
+    with_nan.push((2, Ok(start_fit(-90.0, true, f64::NAN))));
+    let (best, _, starts) = select_start(with_nan, rank, true);
+    assert_eq!(best.map(|b| b.0), Some(0));
+    assert_eq!((starts[2].ofv, starts[2].objective), (Some(-90.0), None));
+    let spread = StartSpread::of(&starts);
+    assert_eq!((spread.n_compared, spread.n_unusable), (2, 1));
+    assert_eq!(
+        spread.line(),
+        "Multi-start: 3 starts, 3 converged; best penalized objective -99.7500 (start 0); \
+         1 of 2 converged starts within 1.0 of best; 1 converged above it: start 1 (+10.75); \
+         1 without a usable penalized objective"
+    );
 }
 
 /// The fit YAML's `multi_start:` block: the summary numbers and one row per start. Absent
@@ -293,7 +333,7 @@ fn multi_start_yaml_block_lists_the_summary_and_every_start() {
         "  n_within: 3".into(),
         "  range: 1.000000".into(),
         "  starts:".into(),
-        format!("    - {{start: 0, ofv: 12.000000, converged: true, status: converged, {ran}, selected: false, theta: [1.000000]}}"),
+        format!("    - {{start: 0, ofv: 12.000000, converged: true, status: converged_with_issues, status_reasons: [\"condition_number\"], {ran}, selected: false, theta: [1.000000]}}"),
         "    - {start: 1, ofv: null, converged: false, status: failed, n_iterations: 0, wall_time_secs: 0.000000, selected: false, theta: [], error: \"start refused\"}".into(),
         format!("    - {{start: 2, ofv: 10.000000, converged: false, status: not_converged, {ran}, selected: false, theta: [2.000000]}}"),
         format!("    - {{start: 3, ofv: 11.000000, converged: true, status: converged, {ran}, selected: true, theta: [3.000000]}}"),
@@ -307,6 +347,11 @@ fn multi_start_yaml_block_lists_the_summary_and_every_start() {
     // Without a seed the key is not written.
     fit.multi_start_seed = None;
     assert!(!multi_start_yaml(&fit).unwrap().contains("seed:"));
+
+    // A non-finite θ is written as `null`: a bare `NaN` is a string to a YAML 1.1 reader.
+    fit.starts[5].theta = vec![f64::NAN, f64::INFINITY, 5.0];
+    let yaml = multi_start_yaml(&fit).unwrap();
+    assert!(yaml.contains("theta: [null, null, 5.000000]}"), "{yaml}");
 
     // Under a penalty the block says what it compared and each row carries the objective;
     // a coded failure carries its code.

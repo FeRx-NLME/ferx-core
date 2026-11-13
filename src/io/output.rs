@@ -3254,12 +3254,16 @@ pub(crate) fn multi_start_yaml(result: &FitResult) -> Result<String, String> {
         if s.objective.is_some() {
             let _ = write!(row, ", objective: {}", opt(s.objective));
         }
-        let status = s.status.as_ref().map_or("failed", |st| st.token());
+        let status = s.status.as_deref().unwrap_or("failed");
+        let _ = write!(row, ", converged: {}, status: {status}", s.converged);
+        // As `model.status_reasons` above: JSON-quoted, since a label can hold `: `.
+        if !s.status_reasons.is_empty() {
+            let _ = write!(row, ", status_reasons: {}", json(&s.status_reasons)?);
+        }
         let _ = write!(
             row,
-            ", converged: {}, status: {status}, n_iterations: {}, wall_time_secs: {:.6}, \
-             selected: {}",
-            s.converged, s.n_iterations, s.wall_time_secs, s.selected
+            ", n_iterations: {}, wall_time_secs: {:.6}, selected: {}",
+            s.n_iterations, s.wall_time_secs, s.selected
         );
         let theta: Vec<String> = s
             .theta

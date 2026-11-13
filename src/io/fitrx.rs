@@ -7699,20 +7699,21 @@ mod tests {
     /// bundle without the key loads with no rows.
     #[test]
     fn the_per_start_rows_round_trip() {
-        use crate::types::{FitStatus, StartRecord, StatusReason};
+        use crate::types::StartRecord;
         let dir = tempfile::tempdir().unwrap();
         let single = saved(&dir, &minimal_fit_result());
         assert!(fit_json(&single).get("starts").is_none());
         assert!(load_fit(&single).unwrap().fit.starts.is_empty());
 
+        // The status is a token and labels, not a typed enum: a reason this build has never
+        // heard of (written by a later one) is read back as it was written.
         let ran = StartRecord {
             start: 0,
             ofv: Some(-221.877048),
             objective: None,
             converged: true,
-            status: Some(FitStatus::ConvergedWithIssues {
-                reasons: vec![StatusReason::BudgetSpent],
-            }),
+            status: Some("converged_with_issues".into()),
+            status_reasons: vec!["budget_spent".into(), "a_future_reason".into()],
             n_iterations: 84,
             wall_time_secs: 1.25,
             theta: vec![7.4577, 22.1467],
@@ -7727,7 +7728,8 @@ mod tests {
             StartRecord {
                 start: 1,
                 ofv: None,
-                status: Some(FitStatus::Converged),
+                status: Some("converged".into()),
+                status_reasons: Vec::new(),
                 selected: false,
                 ..ran.clone()
             },
@@ -7735,9 +7737,8 @@ mod tests {
                 start: 2,
                 objective: Some(-200.5),
                 converged: false,
-                status: Some(FitStatus::NotConverged {
-                    reasons: Vec::new(),
-                }),
+                status: Some("not_converged".into()),
+                status_reasons: Vec::new(),
                 selected: false,
                 ..ran.clone()
             },
@@ -7747,6 +7748,7 @@ mod tests {
                 objective: None,
                 converged: false,
                 status: None,
+                status_reasons: Vec::new(),
                 n_iterations: 0,
                 wall_time_secs: 0.0,
                 theta: Vec::new(),
@@ -7759,6 +7761,16 @@ mod tests {
         let json = fit_json(&path);
         assert_eq!(json["starts"].as_array().map(Vec::len), Some(4));
         assert_eq!(load_fit(&path).unwrap().fit.starts, r.starts);
+
+        // A start that ended on a non-finite θ must not make the bundle unloadable: the value
+        // is written as `null` and read back as `NaN`.
+        r.starts[2].theta = vec![f64::NAN, 22.1467];
+        let path = saved(&dir, &r);
+        assert!(fit_json(&path)["starts"][2]["theta"][0].is_null());
+        let loaded = load_fit(&path).unwrap().fit.starts;
+        assert!(loaded[2].theta[0].is_nan(), "{:?}", loaded[2].theta);
+        assert_eq!(loaded[2].theta[1], 22.1467);
+        assert_eq!(loaded[3], r.starts[3]);
     }
 
     /// #2695: no key has a default for a file that predates it. A v2 `fit.json` missing

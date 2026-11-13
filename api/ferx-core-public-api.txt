@@ -3826,7 +3826,8 @@ pub ferx_core::types::StartRecord::objective: core::option::Option<f64>
 pub ferx_core::types::StartRecord::ofv: core::option::Option<f64>
 pub ferx_core::types::StartRecord::selected: bool
 pub ferx_core::types::StartRecord::start: usize
-pub ferx_core::types::StartRecord::status: core::option::Option<ferx_core::FitStatus>
+pub ferx_core::types::StartRecord::status: core::option::Option<alloc::string::String>
+pub ferx_core::types::StartRecord::status_reasons: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::StartRecord::theta: alloc::vec::Vec<f64>
 pub ferx_core::types::StartRecord::wall_time_secs: f64
 pub struct ferx_core::types::Subject
@@ -5652,7 +5653,8 @@ pub ferx_core::StartRecord::objective: core::option::Option<f64>
 pub ferx_core::StartRecord::ofv: core::option::Option<f64>
 pub ferx_core::StartRecord::selected: bool
 pub ferx_core::StartRecord::start: usize
-pub ferx_core::StartRecord::status: core::option::Option<ferx_core::FitStatus>
+pub ferx_core::StartRecord::status: core::option::Option<alloc::string::String>
+pub ferx_core::StartRecord::status_reasons: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::StartRecord::theta: alloc::vec::Vec<f64>
 pub ferx_core::StartRecord::wall_time_secs: f64
 pub struct ferx_core::Strictness

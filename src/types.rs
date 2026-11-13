@@ -7757,7 +7757,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     #[allow(clippy::if_same_then_else)]
     let (severity, category) = if lower.starts_with("multi-start:") {
         // #2799: the multi-start notes `fit()` appends to the returned run — "k of n starts
-        // failed: <errors>" and "best result from start k/n". A prefix-token arm ahead of
+        // failed: <errors>" and the #2867 summary of the starts. A prefix-token arm ahead of
         // *every* other arm, because the failure note interpolates the sibling starts' own
         // error text: a "did not converge" or covariance-failure phrase in it would land on a
         // Critical arm and mark a healthy returned fit as failing. The note is about runs that

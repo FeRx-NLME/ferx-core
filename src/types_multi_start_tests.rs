@@ -3,7 +3,6 @@
 //! test of the cell that prints that clause.
 
 use super::{StartRecord, StartSpread, START_AGREE_OFV};
-use crate::types::FitStatus;
 
 /// A start that ran.
 fn ran(start: usize, ofv: f64, converged: bool) -> StartRecord {
@@ -12,13 +11,15 @@ fn ran(start: usize, ofv: f64, converged: bool) -> StartRecord {
         ofv: Some(ofv).filter(|v| v.is_finite()),
         objective: None,
         converged,
-        status: Some(if converged {
-            FitStatus::Converged
-        } else {
-            FitStatus::NotConverged {
-                reasons: Vec::new(),
+        status: Some(
+            if converged {
+                "converged"
+            } else {
+                "not_converged"
             }
-        }),
+            .to_string(),
+        ),
+        status_reasons: Vec::new(),
         n_iterations: 10,
         wall_time_secs: 0.5,
         theta: vec![1.0, 2.0],

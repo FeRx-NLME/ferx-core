@@ -599,7 +599,13 @@ pub(crate) fn select_start(
     let mut starts: Vec<StartRecord> = Vec::with_capacity(results.len());
     for (k, res) in results {
         match res {
-            Ok(r) => {
+            Ok(mut r) => {
+                // The status reads `warnings_structured`, which a start's result does not
+                // carry yet: classify its warnings first, or the row misses every critical
+                // warning that is not typed at source. Idempotent, and the winner is rebuilt
+                // again once the fit-level notes are added.
+                rebuild_warnings_structured(&mut r);
+                let status = r.status();
                 let ofv = Some(r.ofv).filter(|v| v.is_finite());
                 starts.push(StartRecord {
                     start: k,
@@ -609,7 +615,8 @@ pub(crate) fn select_start(
                         .map(|_| rank_ofv(&r))
                         .filter(|v| v.is_finite()),
                     converged: r.converged,
-                    status: Some(r.status()),
+                    status: Some(status.token().to_string()),
+                    status_reasons: status.reasons().iter().map(|x| x.label()).collect(),
                     n_iterations: r.n_iterations,
                     wall_time_secs: r.wall_time_secs,
                     theta: r.theta.clone(),
@@ -634,6 +641,7 @@ pub(crate) fn select_start(
                     objective: None,
                     converged: false,
                     status: None,
+                    status_reasons: Vec::new(),
                     n_iterations: 0,
                     wall_time_secs: 0.0,
                     theta: Vec::new(),

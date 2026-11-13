@@ -5,6 +5,7 @@
 //! Reporting only. Selection is `api::fit::multistart_prefers` over the starts' own results;
 //! nothing here is read by it.
 
+#[cfg(doc)]
 use super::FitStatus;
 
 /// One start of a multi-start fit (`n_starts > 1`): a row of
@@ -28,10 +29,19 @@ pub struct StartRecord {
     pub objective: Option<f64>,
     /// The start's own `converged`. `false` for a failed start.
     pub converged: bool,
-    /// The start's own [`FitResult::status`](super::FitResult::status). `None` for a failed
-    /// start.
+    /// The token of the start's own [`FitResult::status`](super::FitResult::status), taken
+    /// with the start's warnings classified: `converged`, `converged_with_issues` or
+    /// `not_converged` ([`FitStatus::token`]). `None` for a failed start.
+    ///
+    /// A string, not a [`FitStatus`], so that a `.fitrx` written by a build with a newer
+    /// status reason still loads here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub status: Option<FitStatus>,
+    pub status: Option<String>,
+    /// The labels of that status's reasons ([`StatusReason::label`](super::StatusReason::label)),
+    /// e.g. `budget_spent`, `condition_number`. Empty for a plain `converged` /
+    /// `not_converged` and for a failed start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_reasons: Vec<String>,
     /// Outer iterations the start ran.
     pub n_iterations: usize,
     /// Wall time of this start alone, in seconds. The starts run in parallel, so these do not
@@ -39,7 +49,8 @@ pub struct StartRecord {
     pub wall_time_secs: f64,
     /// The start's final θ, in [`FitResult::theta_names`](super::FitResult::theta_names)
     /// order, so two different optima can be told apart without a refit. Empty for a failed
-    /// start.
+    /// start. A non-finite value is written as `null` and read back as `NaN`.
+    #[serde(with = "crate::io::serde_nan::vec")]
     pub theta: Vec<f64>,
     /// `true` on the one start whose result the fit returned.
     pub selected: bool,
@@ -63,10 +74,11 @@ const NAMED_STARTS: usize = 3;
 
 impl StartRecord {
     /// The value this start was ranked on, when it is one the ranking treats as a real
-    /// objective (`estimation::outer_optimizer::ofv_is_valid`).
-    fn ranked(&self) -> Option<f64> {
-        self.objective
-            .or(self.ofv)
+    /// objective (`estimation::outer_optimizer::ofv_is_valid`): `objective` in a `penalized`
+    /// table, `ofv` otherwise. Never a mix: a start with no usable penalized objective is not
+    /// compared on its unpenalized OFV against the others' penalized values.
+    fn ranked(&self, penalized: bool) -> Option<f64> {
+        if penalized { self.objective } else { self.ofv }
             .filter(|v| crate::estimation::outer_optimizer::ofv_is_valid(*v))
     }
 
@@ -113,17 +125,18 @@ impl StartSpread {
     pub(crate) fn of(starts: &[StartRecord]) -> Self {
         let ran = || starts.iter().filter(|s| s.ran());
         let selected = starts.iter().find(|s| s.selected);
-        let best = selected.and_then(StartRecord::ranked);
+        let penalized = starts.iter().any(|s| s.objective.is_some());
+        let best = selected.and_then(|s| s.ranked(penalized));
         let selected_converged = selected.is_some_and(|s| s.converged);
         let mut spread = StartSpread {
             n_starts: starts.len(),
             n_converged: ran().filter(|s| s.converged).count(),
             n_not_converged: ran().filter(|s| !s.converged).count(),
             n_failed: starts.len() - ran().count(),
-            n_unusable: ran().filter(|s| s.ranked().is_none()).count(),
+            n_unusable: ran().filter(|s| s.ranked(penalized).is_none()).count(),
             selected: selected.map(|s| (s.start, s.converged)),
             best,
-            penalized: starts.iter().any(|s| s.objective.is_some()),
+            penalized,
             n_compared: 0,
             n_within: 0,
             range: None,
@@ -134,7 +147,9 @@ impl StartSpread {
             return spread;
         };
         for s in ran() {
-            let Some(v) = s.ranked() else { continue };
+            let Some(v) = s.ranked(penalized) else {
+                continue;
+            };
             let d = v - best;
             if s.converged == selected_converged {
                 spread.n_compared += 1;
