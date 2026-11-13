@@ -76,7 +76,7 @@ pub fn class_params(params: &ModelParameters, k: usize) -> ModelParameters {
 }
 
 /// Largest per-subject log Bayes factor between two classes below which the post-fit check
-/// calls them merged (#2907). See [`merged_classes_from`] for the measurement it was set from.
+/// calls them merged (#2907). See `merged_classes_from` for the measurement it was set from.
 pub(crate) const MERGED_CLASS_LOG_BF: f64 = 1.0;
 
 /// Posterior class probability that no subject reaches in a class the post-fit check calls
@@ -87,11 +87,11 @@ pub(crate) const EMPTY_CLASS_PMIX: f64 = 1e-2;
 /// spells them.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ClassCollapse {
-    /// Every subject's posterior probability of `class` is below [`EMPTY_CLASS_PMIX`];
+    /// Every subject's posterior probability of `class` is below `EMPTY_CLASS_PMIX`;
     /// `max_pmix` is the largest.
     Empty { class: usize, max_pmix: f64 },
     /// Both classes carry posterior mass, and no subject's data favours one over the other
-    /// by more than [`MERGED_CLASS_LOG_BF`]; `max_log_bf` is the largest such factor.
+    /// by more than `MERGED_CLASS_LOG_BF`; `max_log_bf` is the largest such factor.
     Merged { a: usize, b: usize, max_log_bf: f64 },
 }
 
@@ -109,11 +109,11 @@ pub(crate) enum ClassCollapse {
 /// ```
 ///
 /// the amount the subject's data moved its class odds away from the prior odds. When no
-/// subject moves them by more than [`MERGED_CLASS_LOG_BF`], the data cannot tell the two
+/// subject moves them by more than `MERGED_CLASS_LOG_BF`, the data cannot tell the two
 /// classes apart. A factor that is not finite (a posterior that underflowed to 0) separates
 /// the pair, as it is the largest possible.
 ///
-/// A class whose posterior is below [`EMPTY_CLASS_PMIX`] in every subject holds nobody, and
+/// A class whose posterior is below `EMPTY_CLASS_PMIX` in every subject holds nobody, and
 /// is reported as empty; a pair with an empty class is not also reported as merged, since the
 /// factor of a class with no mass says nothing about the fit.
 ///
@@ -164,7 +164,7 @@ pub(crate) fn merged_classes_from(logp: &[Vec<f64>], pmix: &[Vec<f64>]) -> Vec<C
     out
 }
 
-/// [`merged_classes_from`] at the final estimates: evaluates every subject's prior mixing
+/// `merged_classes_from` at the final estimates: evaluates every subject's prior mixing
 /// probabilities at `theta` and pairs them with the fit's posteriors `pmix` (subject order).
 /// Empty for a model without a mixture.
 pub(crate) fn merged_classes(
