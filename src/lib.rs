@@ -83,6 +83,10 @@ pub use api::{
     predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
     SurvivalPredictionOutput, SurvivalPredictionResult,
 };
+// VPC of a repeated-events endpoint: mean cumulative function and Kaplan–Meier by
+// event order (#1886).
+#[cfg(feature = "survival")]
+pub use api::{vpc_rtte, RtteMcfBand, RtteOrderBand, RtteVpc, RtteVpcStratum, VpcRtteOptions};
 // Kaplan–Meier VPC of a single-event TTE endpoint (#1886).
 #[cfg(feature = "survival")]
 pub use api::{
