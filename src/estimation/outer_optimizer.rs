@@ -7436,13 +7436,13 @@ fn optimize_nlopt_attempt_probed(
 
         // #2709: a pass stopped on a certain rejection reports the counts of the subjects it
         // solved; its unsolved placeholders are not results. Rejected by construction: the
-        // counts it stopped on already cross the threshold. On the FOCE path `raw_ofv` is
-        // finite (the placeholder contributions are `f64::default() = 0.0`), so
-        // `ebe_guard_rejects`' fraction arm fires from the observed stats alone. On the AGQ
-        // path `raw_ofv` is `INFINITY` (the quadrature skip), which makes the fraction arm
-        // return false — and a fraction-triggered stop has `n_start_rejected = 0` in the
-        // observed stats, so the hard-rejection arm also returns false. The `stopped_after`
-        // gate covers that case: a stopped pass is always a guard rejection.
+        // counts it stopped on already cross the threshold. `ebe_guard_rejects` alone does
+        // not always see that. Its fraction arm needs a finite `raw_ofv`, and `raw_ofv` can
+        // be non-finite here: on the AGQ path it is `INFINITY` (the quadrature skip), and a
+        // solved subject's term can be non-finite on any path. A fraction-triggered stop
+        // has `n_start_rejected = 0` in the observed stats, so the hard-rejection arm
+        // returns false too. The `stopped_after` gate covers that case: a stopped pass is
+        // always a guard rejection (see `GuardStop::record` for the counter this moves).
         let (ebe_stats, stopped_after) = stopped_pass_stats(guard_stop.as_ref(), ebe_stats);
         #[cfg(test)]
         if stopped_after.is_some() {

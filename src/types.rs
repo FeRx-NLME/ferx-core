@@ -8695,7 +8695,11 @@ pub struct FitResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_csv: Option<String>,
     /// Number of outer iterations in which at least one subject had an
-    /// unconverged EBE.  Always `0` for SAEM (which uses MH sampling).
+    /// unconverged EBE.  Always `0` for SAEM (which uses MH sampling). An evaluation whose
+    /// inner pass stopped once the EBE guard's rejection was certain (#2709) always counts
+    /// here. The full pass would instead have counted as a non-finite objective if its OFV
+    /// was non-finite and only the unconverged fraction tripped the guard. The evaluation is
+    /// rejected with the same penalty either way.
     pub ebe_convergence_warnings: u32,
     /// Worst-case number of unconverged subjects in a single outer iteration. An evaluation
     /// whose inner pass stopped once the EBE guard's rejection was certain (#2709) counts the

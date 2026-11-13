@@ -930,7 +930,7 @@ for the rejection to be certain, the rest are not solved
 ([#2709](https://github.com/FeRx-NLME/ferx-core/issues/2709)). The rejection is certain
 once more than `max_unconverged_frac` of the subjects are unconverged, or one is rejected
 at its inner start. Every value the optimizer receives is the same as with the full pass,
-so the fit is too, bit for bit.
+so the estimates and OFV are too, bit for bit. Only the fit-level counters below can differ.
 
 Two kinds of evaluation always solve every subject:
 
@@ -938,8 +938,11 @@ Two kinds of evaluation always solve every subject:
 - every evaluation of a run that has not yet had a feasible one, so `W_NO_FEASIBLE_EVAL`
   still reports the worst unconverged count over full passes.
 
-On a stopped evaluation the fit-level counters (`max_unconverged_subjects`,
-`total_ebe_fallbacks`) count the subjects that were solved.
+On a stopped evaluation the fit-level counters `max_unconverged_subjects`,
+`total_ebe_fallbacks` and `total_ebe_nm_polished` count the subjects that were solved. A
+stopped evaluation always counts in `ebe_convergence_warnings`. The full pass would instead
+have been counted as a non-finite objective if its OFV was not a finite number and only the
+unconverged fraction tripped the guard.
 
 The rejected trials are where this pays: they are often far from the data, where the inner
 loops are slowest. On nlmixr2data's `Infusion_2CPTMM` (120 subjects, a two-compartment

@@ -8094,15 +8094,17 @@ impl GuardStop {
 
     /// Records a finished subject's result and stops the pass when rejection is certain.
     ///
-    /// "Certain" means: `ebe_guard_rejects` on the full pass *must* return true, whatever the
-    /// remaining subjects do. A hard rejection makes it certain at once. An unconverged count
-    /// past the fraction threshold makes it certain because the count only grows and the
-    /// fraction arm fires on any *finite* OFV — and a non-finite OFV is rejected by its own
-    /// arm. So either way the evaluation is rejected. The predicate here is a monotone lower
-    /// bound of `ebe_guard_rejects`, not a re-implementation: it answers "already decided"
-    /// rather than "what would the guard say now". That is why `raw_ofv.is_finite()` does not
-    /// appear: the objective is not known until after every subject is scored, and the token
-    /// fires before then.
+    /// "Certain" means the full pass's evaluation is rejected whatever the remaining subjects
+    /// do. A hard rejection makes it certain at once. An unconverged count past the fraction
+    /// threshold makes it certain because the count only grows: on a finite OFV the guard's
+    /// fraction arm fires, and a non-finite OFV is rejected by the objective's own
+    /// non-finite arm. The optimizer receives the same penalty either way.
+    ///
+    /// What can differ is which counter the rejection lands in. The objective is not known
+    /// until every subject is scored, and the token fires before then, so it cannot tell
+    /// the two cases apart. A stopped evaluation is always counted as a guard rejection
+    /// (`FitResult.ebe_convergence_warnings`). The full pass, had its OFV been non-finite
+    /// with only the fraction arm tripped, would have been counted as non-finite instead.
     pub(crate) fn record(&self, subject: &Subject, ebe: &EbeResult) {
         self.solved.fetch_add(1, Ordering::Relaxed);
         if ebe.used_fallback {
