@@ -7911,6 +7911,9 @@ pub(crate) const MAX_CMT_INDEX: usize = 255;
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
     "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EPRED", "PWRES",
     "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD", "CENS", "OCC", "CMT",
+    // The mixture sdtab columns (#2784): a `[derived] MIXNUM` beside `[output] MIXNUM`
+    // would write two `MIXNUM` headers, the derived values hidden behind the class.
+    "MIXNUM", "MIXEST",
 ];
 
 /// Split a token slice at top-level commas (depth 0 inside parentheses).

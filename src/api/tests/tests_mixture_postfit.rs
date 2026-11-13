@@ -273,23 +273,38 @@ fn output_mixnum_is_refused_without_a_mixture() {
 
 /// #2784 validation: `[output] MIXNUM` on a `[mixture]` model is accepted without a data
 /// column (it used to be `E_OUTPUT_UNKNOWN_COLUMN`) and, beside a data column of that
-/// name, warns that the column written is the class and not that data — the silent
-/// substitution the issue reports.
+/// name, raises `W_OUTPUT_MIXNUM_IS_CLASS` from the warning bundle `fit()` and `ferx
+/// check` share — the silent substitution the issue reports.
 ///
-/// Dies on: the mixture gate dropped from validation, the warning not raised, or raised
-/// with no data column.
+/// Dies on: the mixture gate dropped from validation, the warning not raised, raised
+/// with no data column, or moved back into the error-first list `fit()` filters.
 #[test]
 fn output_mixnum_validation_on_a_mixture_model() {
     let src = MIX_MODEL.to_string() + "\n[output]\n  MIXNUM\n";
     let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+    let warning_codes = |pop: &crate::types::Population| -> Vec<String> {
+        check_model_data_warnings(&model, pop, &model.default_params)
+            .into_iter()
+            .filter(|d| d.code == "W_OUTPUT_MIXNUM_IS_CLASS")
+            .map(|d| d.message)
+            .collect()
+    };
 
-    let no_column = validate_output_columns(&model, &one_subject_pop());
-    assert!(no_column.is_empty(), "class column accepted: {no_column:?}");
+    let no_column = one_subject_pop();
+    assert!(validate_output_columns(&model, &no_column).is_empty());
+    assert!(
+        warning_codes(&no_column).is_empty(),
+        "no data column, no warning"
+    );
 
-    let with_column = validate_output_columns(&model, &one_subject_pop_with_mixnum_column());
-    let codes: Vec<&str> = with_column.iter().map(|d| d.code.as_str()).collect();
-    assert_eq!(codes, vec!["W_OUTPUT_MIXNUM_IS_CLASS"], "{with_column:?}");
-    let msg = &with_column[0].message;
+    let with_column = one_subject_pop_with_mixnum_column();
+    assert!(
+        validate_output_columns(&model, &with_column).is_empty(),
+        "not an error, and not in the list fit() reads error-first"
+    );
+    let msgs = warning_codes(&with_column);
+    assert_eq!(msgs.len(), 1, "{msgs:?}");
+    let msg = &msgs[0];
     assert!(
         msg.contains("mixture class") && msg.contains("not the data column `MIXNUM`"),
         "{msg}"
@@ -298,4 +313,61 @@ fn output_mixnum_validation_on_a_mixture_model() {
         msg.contains("fitted MIXEST") && msg.contains("Rename"),
         "{msg}"
     );
+}
+
+/// #2784 end to end: a `fit()` of a mixture model with `[output] MIXNUM` on data that
+/// carry a `MIXNUM` column reports `W_OUTPUT_MIXNUM_IS_CLASS` in `FitResult.warnings`
+/// and tables the fitted class — equal to `MIXEST` — not the data value 7.
+///
+/// Dies on: the warning reaching only `ferx check` (dropped by `fit()`'s `first_error`),
+/// or the sdtab echoing the covariate.
+#[test]
+fn fit_reports_output_mixnum_warning_and_tables_the_class() {
+    let src = MIX_MODEL.to_string() + "\n[output]\n  MIXNUM\n";
+    let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+    let population = one_subject_pop_with_mixnum_column();
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        outer_maxiter: 0,
+        run_covariance_step: false,
+        verbose: false,
+        threads: Some(1),
+        ..Default::default()
+    };
+    let result = fit(&model, &population, &model.default_params, &opts).expect("fit");
+    assert!(
+        result
+            .warnings
+            .iter()
+            .any(|w| w.contains("W_OUTPUT_MIXNUM_IS_CLASS")),
+        "{:?}",
+        result.warnings
+    );
+    let cols = crate::io::output::sdtab(&result, &population);
+    let col = |name: &str| -> Vec<Vec<f64>> {
+        cols.iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+            .collect()
+    };
+    let mixnum = col("MIXNUM");
+    assert_eq!(mixnum.len(), 1, "one MIXNUM column");
+    assert_eq!(mixnum, col("MIXEST"), "MIXNUM is the fitted class");
+    assert!(
+        mixnum[0].iter().all(|&k| k == 1.0 || k == 2.0),
+        "{mixnum:?}"
+    );
+}
+
+/// #2784: a `[derived]` column may not take a mixture sdtab name, or `[derived] MIXNUM`
+/// beside `[output] MIXNUM` would write two `MIXNUM` headers with the derived values
+/// hidden behind the class.
+#[test]
+fn derived_may_not_be_named_mixnum_or_mixest() {
+    for name in ["MIXNUM", "mixest"] {
+        let src = format!("{MIX_MODEL}\n[derived]\n  {name} = 99\n[output]\n  MIXNUM\n");
+        let err = crate::parser::model_parser::parse_model_string(&src).unwrap_err();
+        assert!(err.contains("E_DERIVED_NAME_CONFLICT"), "{name}: {err}");
+    }
 }
