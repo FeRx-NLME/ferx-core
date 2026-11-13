@@ -3303,8 +3303,12 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             let arrival_live = event_gate().live(&subject.doses, idx);
             // A live arrival turns its compartment on (#2732). Its boundary does not move, by
             // `toggled_cmt_has_moving_dose`, so nothing below differentiates across the switch.
+            //
+            // The same function the `f64` walks call (#2811). Only the turn-on is shared:
+            // their bolus jump (`ode::predictions::land_live_arrival`) is over `f64`, and the
+            // one here is over dual numbers and sits with the lag saltation further down.
             if arrival_live {
-                off_states.borrow_mut().retain(|&c| c != d.cmt_idx());
+                crate::ode::predictions::turn_on_at_live_arrival(&mut off_states.borrow_mut(), d);
             }
             // The anchor this arrival establishes, computed ONCE and used by every consumer in
             // this arm: the post side of the saltation below, and the segment the arrival opens.
