@@ -3824,6 +3824,7 @@ pub ferx_core::types::StartRecord::error_code: core::option::Option<alloc::strin
 pub ferx_core::types::StartRecord::n_iterations: usize
 pub ferx_core::types::StartRecord::objective: core::option::Option<f64>
 pub ferx_core::types::StartRecord::ofv: core::option::Option<f64>
+pub ferx_core::types::StartRecord::penalized: bool
 pub ferx_core::types::StartRecord::selected: bool
 pub ferx_core::types::StartRecord::start: usize
 pub ferx_core::types::StartRecord::status: core::option::Option<alloc::string::String>
@@ -5651,6 +5652,7 @@ pub ferx_core::StartRecord::error_code: core::option::Option<alloc::string::Stri
 pub ferx_core::StartRecord::n_iterations: usize
 pub ferx_core::StartRecord::objective: core::option::Option<f64>
 pub ferx_core::StartRecord::ofv: core::option::Option<f64>
+pub ferx_core::StartRecord::penalized: bool
 pub ferx_core::StartRecord::selected: bool
 pub ferx_core::StartRecord::start: usize
 pub ferx_core::StartRecord::status: core::option::Option<alloc::string::String>

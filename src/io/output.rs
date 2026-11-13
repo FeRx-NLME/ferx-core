@@ -3251,7 +3251,8 @@ pub(crate) fn multi_start_yaml(result: &FitResult) -> Result<String, String> {
     let _ = writeln!(out, "  starts:");
     for s in &result.starts {
         let mut row = format!("start: {}, ofv: {}", s.start, opt(s.ofv));
-        if s.objective.is_some() {
+        // On every penalized row, `null` when it has no finite one.
+        if s.penalized {
             let _ = write!(row, ", objective: {}", opt(s.objective));
         }
         let status = s.status.as_deref().unwrap_or("failed");

@@ -9,6 +9,7 @@ fn ran(start: usize, ofv: f64, converged: bool) -> StartRecord {
     StartRecord {
         start,
         ofv: Some(ofv).filter(|v| v.is_finite()),
+        penalized: false,
         objective: None,
         converged,
         status: Some(
@@ -297,6 +298,7 @@ fn a_penalized_fit_is_compared_on_the_objective_that_ranked_it() {
         .iter_mut()
         .zip([-1265.3763, -1265.3763, -1265.3763, -1240.1363])
     {
+        s.penalized = true;
         s.objective = Some(objective);
     }
     let s = StartSpread::of(&starts);
@@ -307,14 +309,46 @@ fn a_penalized_fit_is_compared_on_the_objective_that_ranked_it() {
         "Multi-start: 4 starts, 4 converged; best penalized objective -1265.3763 (start 1); \
          3 of 4 converged starts within 1.0 of best; 1 converged above it: start 3 (+25.24)"
     );
-    // The same table without the objective column reads the reported OFV.
+    // The same table, not penalized, reads the reported OFV.
     for s in &mut starts {
+        s.penalized = false;
         s.objective = None;
     }
     assert_eq!(
         line(&starts),
         "Multi-start: 4 starts, 4 converged; best OFV -1292.5264 (start 1); \
          all 4 converged starts within 1.0 of best (range 0.5000)"
+    );
+}
+
+/// A penalized table in which no start has a finite penalized objective. The ranking had
+/// nothing to compare, so it returned the first converged start, and the summary must not
+/// fall back to the OFVs it was never ranked on: here that would print "best OFV 10.0000
+/// (start 0)" over a converged start 5 OFV lower. Both sides of the gate: the same rows not
+/// penalized are compared on their OFV.
+#[test]
+fn a_penalized_table_with_no_finite_objective_is_not_compared_on_ofv() {
+    let mut starts = converged(&[10.0, 5.0, 10.5], 0);
+    for s in &mut starts {
+        s.penalized = true;
+    }
+    let s = StartSpread::of(&starts);
+    assert!(s.penalized);
+    assert_eq!((s.best, s.n_compared, s.n_unusable), (None, 0, 3));
+    assert_eq!(
+        s.line(),
+        "Multi-start: 3 starts, 3 converged; no penalized objective to compare (start 0 returned)"
+    );
+    for s in &mut starts {
+        s.penalized = false;
+    }
+    let s = StartSpread::of(&starts);
+    assert!(!s.penalized);
+    assert_eq!(s.best, Some(10.0));
+    assert!(
+        s.line().contains("best OFV 10.0000 (start 0)"),
+        "{}",
+        s.line()
     );
 }
 

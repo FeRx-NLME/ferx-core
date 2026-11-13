@@ -357,7 +357,7 @@ multi_start:
 | `agree_within` | The cutoff for `n_within`, fixed at 1.0 |
 | `n_compared`, `n_within` | The converged starts with a usable value, and how many of them are within the cutoff of `best`. Every start with a usable value when none converged |
 | `range` | The largest distance above `best` among the compared starts |
-| `starts` | One row per start. `status` is the start's own status token, followed by `status_reasons` when it has any. A failed start has `status: failed`, `ofv: null`, an `error` and, when its refusal is coded, an `error_code`. Under a penalty each row also carries `objective`. A non-finite θ is `null` |
+| `starts` | One row per start. `status` is the start's own status token, followed by `status_reasons` when it has any. A failed start has `status: failed`, `ofv: null`, an `error` and, when its refusal is coded, an `error_code`. A start ranked on a penalized objective also carries `objective`, `null` when that value is not finite. A non-finite θ is `null` |
 
 The rows are [`FitResult.starts`](model-file/fit-options.qmd#multi-start-spread),
 which the fit JSON and the `.fitrx` bundle carry as `starts`.

@@ -22,9 +22,14 @@ pub struct StartRecord {
     /// default `vi_final_ofv = none`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ofv: Option<f64>,
-    /// The value the selection ranked this start on, when that is not `ofv`: under `nn_l2` /
-    /// `nn_smooth` the starts are ranked on the penalized objective, `ofv` plus the penalty.
-    /// `None` when no penalty applies, and wherever `ofv` is `None`.
+    /// `true` when the selection ranked this start on a penalized objective and not on `ofv`:
+    /// a start that ran under an active `nn_l2` / `nn_smooth` penalty. `false` otherwise, and
+    /// for a failed start.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub penalized: bool,
+    /// The penalized objective a `penalized` start was ranked on, `ofv` plus the penalty.
+    /// `None` when the start is not `penalized`, and when that value is not finite (then the
+    /// start has nothing the ranking could compare).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub objective: Option<f64>,
     /// The start's own `converged`. `false` for a failed start.
@@ -125,7 +130,9 @@ impl StartSpread {
     pub(crate) fn of(starts: &[StartRecord]) -> Self {
         let ran = || starts.iter().filter(|s| s.ran());
         let selected = starts.iter().find(|s| s.selected);
-        let penalized = starts.iter().any(|s| s.objective.is_some());
+        // From the rows' own flag, not from "some row has an objective": when every start's
+        // penalized value is non-finite no row has one, and the table is penalized all the same.
+        let penalized = starts.iter().any(|s| s.penalized);
         let best = selected.and_then(|s| s.ranked(penalized));
         let selected_converged = selected.is_some_and(|s| s.converged);
         let mut spread = StartSpread {

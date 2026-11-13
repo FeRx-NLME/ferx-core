@@ -610,6 +610,7 @@ pub(crate) fn select_start(
                 starts.push(StartRecord {
                     start: k,
                     ofv,
+                    penalized,
                     objective: ofv
                         .filter(|_| penalized)
                         .map(|_| rank_ofv(&r))
@@ -638,6 +639,7 @@ pub(crate) fn select_start(
                 starts.push(StartRecord {
                     start: k,
                     ofv: None,
+                    penalized: false,
                     objective: None,
                     converged: false,
                     status: None,

@@ -237,6 +237,7 @@ fn a_failed_start_keeps_its_message_and_code() {
         StartRecord {
             start: 0,
             ofv: None,
+            penalized: false,
             objective: None,
             converged: false,
             status: None,
@@ -280,10 +281,22 @@ fn select_start_records_the_ranked_objective_under_a_penalty() {
     assert_eq!(starts[0].objective, Some(-99.75));
     assert_eq!(starts[1].objective, Some(-89.0));
     assert_eq!((starts[0].ofv, starts[1].ofv), (Some(-100.0), Some(-105.0)));
+    assert!(starts.iter().all(|s| s.penalized));
     // The same ranking without the flag picks the same start and writes no column.
     let (best, _, starts) = select_start(results(), rank, false);
     assert_eq!(best.map(|b| b.0), Some(0));
-    assert!(starts.iter().all(|s| s.objective.is_none()));
+    assert!(starts.iter().all(|s| !s.penalized && s.objective.is_none()));
+
+    // No start has a finite penalized value. The rows still say they were ranked on one, so
+    // the summary does not fall back to their OFVs, where the returned start 0 would be
+    // printed as "best" over start 1, 5 OFV lower.
+    let (best, _, starts) = select_start(results(), |_| f64::NAN, true);
+    assert_eq!(best.map(|b| b.0), Some(0));
+    assert!(starts.iter().all(|s| s.penalized && s.objective.is_none()));
+    assert_eq!(
+        StartSpread::of(&starts).line(),
+        "Multi-start: 2 starts, 2 converged; no penalized objective to compare (start 0 returned)"
+    );
 
     // A start whose ranked value is not finite (here a NaN θ makes the penalty NaN) keeps
     // its OFV and records no objective. The summary then leaves it out, as the ranking did:
@@ -353,11 +366,21 @@ fn multi_start_yaml_block_lists_the_summary_and_every_start() {
     let yaml = multi_start_yaml(&fit).unwrap();
     assert!(yaml.contains("theta: [null, null, 5.000000]}"), "{yaml}");
 
-    // Under a penalty the block says what it compared and each row carries the objective;
-    // a coded failure carries its code.
+    // Under a penalty the block says what it compared and each penalized row carries the
+    // objective, `null` when it has no finite one; a coded failure carries its code.
+    fit.starts[3].penalized = true;
     fit.starts[3].objective = Some(13.5);
+    fit.starts[0].penalized = true;
     fit.starts[1].error_code = Some("E_X".into());
     let yaml = multi_start_yaml(&fit).unwrap();
+    assert!(
+        yaml.contains("{start: 0, ofv: 12.000000, objective: null, converged: true"),
+        "{yaml}"
+    );
+    assert!(
+        yaml.contains("{start: 2, ofv: 10.000000, converged: false"),
+        "{yaml}"
+    );
     assert!(yaml.contains("  compared: penalized_objective\n"), "{yaml}");
     assert!(yaml.contains("  best: 13.500000\n"), "{yaml}");
     assert!(

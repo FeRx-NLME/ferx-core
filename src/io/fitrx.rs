@@ -7710,6 +7710,7 @@ mod tests {
         let ran = StartRecord {
             start: 0,
             ofv: Some(-221.877048),
+            penalized: false,
             objective: None,
             converged: true,
             status: Some("converged_with_issues".into()),
@@ -7735,6 +7736,7 @@ mod tests {
             },
             StartRecord {
                 start: 2,
+                penalized: true,
                 objective: Some(-200.5),
                 converged: false,
                 status: Some("not_converged".into()),
@@ -7745,6 +7747,7 @@ mod tests {
             StartRecord {
                 start: 3,
                 ofv: None,
+                penalized: false,
                 objective: None,
                 converged: false,
                 status: None,
