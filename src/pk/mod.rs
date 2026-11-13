@@ -1816,24 +1816,27 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// obs record), because in the reactive setting that observation genuinely occurs
 /// *during* that occasion. The static [`predict_iov`] instead reads the row's own `OCC`
 /// label ([`pk_only_row_occasion`], #1876). The two are consistent *within* their own
-/// path (the adaptive driver's `segment_occ_at` also uses [`occasion_of`], so
+/// path (the adaptive driver's `governing_segment_occ_at` also uses [`occasion_of`], so
 /// materialiser and driver agree); a future oracle that validates an adaptive IOV run
 /// *with EVID=2 rows* against `predict_iov` agrees only where the row's `OCC` names the
 /// decision window containing it.
 ///
-/// **Base dose at an occasion boundary — a second [`predict_iov`] divergence.** The
-/// driver assigns a *segment's* occasion from the last observation / EVID=2 record it
-/// crossed (`segment_occ_at`), i.e. the decision window active *during* the segment (the
-/// clearance in effect at that time — the physically faithful choice for real-time
-/// feedback, #701). `predict_iov` uses the #104 OCC end-of-interval rule: the segment
-/// ending at a *dose* record takes that dose's occasion. The two agree when every
-/// segment ends at an observation (the shipped anchor observes a trough at each decision),
-/// but differ for a base dose sitting at an occasion boundary with no coincident
-/// observation — the segment *before* that dose uses the prior window in the driver and
-/// the dose's window in `predict_iov`. An adaptive IOV oracle over such a configuration
-/// must validate against the driver's own frozen-replay verifier (bit-exact) or mrgsolve,
-/// not `predict_iov`. (This `dose` snapshot only fixes each dose's *F* at its
-/// administration occasion; the running disposition occasion is `segment_occ_at`'s job.)
+/// **Base dose at an occasion boundary — agreement with [`predict_iov`].** The driver
+/// assigns a *segment's* occasion from the record that ENDS it
+/// (`governing_segment_occ_at`, #1073), and a base dose row is a record (#1148). So the
+/// segment ending at a base dose takes that dose's occasion, as under `predict_iov`'s
+/// end-of-interval rule. Measured on #2771: base doses at 0 and 24, observations at 12,
+/// 36 and 60, decisions at 0, 24, 48 and 72 give `predict_iov`'s predictions to 2e-16
+/// relative. (This `dose` snapshot only fixes each dose's *F* at its administration
+/// occasion; the running disposition occasion is `governing_segment_occ_at`'s job.)
+///
+/// **A controller dose is the remaining [`predict_iov`] divergence.** A controller-issued
+/// dose is not a record in the driver, so it ends no segment. In `predict_iov` on the
+/// realized doses it is a dose row, which does. The two agree when a data record falls
+/// in every dosing window, and differ otherwise: measured on #2771 with a bolus at each
+/// of the same four decisions, observations at 0, 12, 48, 72 differ by 5.3 % at t = 48
+/// and observations at 0, 72 by 9.4 % at t = 72. The frozen-replay verifier passes on
+/// both, because it shares the driver's convention.
 ///
 /// **An `ADDL`-implied dose takes its governing record's occasion — agreement with
 /// [`predict_iov`], not a third divergence** (#2371). Since #1909 an implied dose's

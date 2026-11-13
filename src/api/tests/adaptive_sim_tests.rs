@@ -2242,15 +2242,11 @@ fn adaptive_base_multiple_doses_across_occasions_pass_verifiers() {
     // each base dose decays under its window's clearance. Base boluses at t=0 (occasion 0) and
     // t=24 (occasion 1); observations sit off the dose times.
     //
-    // Oracle note — why NOT `predict_iov` here: the adaptive driver assigns a segment's occasion
-    // from the last observation/EVID=2 record crossed (`segment_occ_at`, the #701 decision-window
-    // / end-of-interval convention — the clearance in effect *during* the segment, the physically
-    // faithful choice for real-time feedback). `predict_iov` follows the #104 OCC-column
-    // convention (the segment ending at a *dose* record uses that dose's occasion). The two agree
-    // when every segment ends at an observation (Test A, the mrgsolve anchor), but differ for a
-    // base dose at an occasion boundary with no coincident observation — as here — so `predict_iov`
-    // is not a valid oracle for this configuration. The driver's own verifiers are; the
-    // independent-engine multi-occasion check is the mrgsolve anchor. See
+    // Oracle note: this test asserts the driver's own verifiers only. `predict_iov` would be a
+    // valid oracle here too. A base dose row is a record in the driver (#1148), so the segment
+    // ending at the dose at 24 takes that dose's occasion under both conventions; measured on
+    // #2771, this fixture gives `predict_iov`'s predictions to 2e-16 relative. What does differ
+    // from `predict_iov` is a CONTROLLER dose with no record in its window. See
     // `compute_event_pk_params_iov`'s docstring.
     let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
     let doses = vec![

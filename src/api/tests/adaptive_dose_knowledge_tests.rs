@@ -407,107 +407,154 @@ fn under_iov_a_supplied_subject_reads_kappa_zero_and_an_oracle_one_the_first_occ
 }
 
 /// The table in `docs/model-file/adaptive-dosing.qmd`, "Which κ a decision window runs
-/// under" (#2771): decisions at 0 and 24, one bolus at 0, κ on CL. Each piece of the first
-/// window runs under the κ of the next record at or after its end; past the subject's last
-/// record it keeps the κ of the latest decision or record behind it.
+/// under" (#2771): a bolus at every decision, κ on CL. Each piece between two neighbouring
+/// records or decisions runs under the κ of the next record at or after its end, however
+/// many decisions later that record is. Past the subject's last record it runs under the κ
+/// of the latest decision at or before its start.
 ///
-/// | Records | `(0, 24]` |
-/// |---|---|
-/// | 0, 24, 48 | all κ₁ |
-/// | 0, 12, 24 | `(0, 12]` κ₀, `(12, 24]` κ₁ |
-/// | 0, 23, 47 | `(0, 23]` κ₀, `(23, 24]` κ₁ (the record at 47) |
-/// | 0, 23 | all κ₀ (nothing after 23) |
+/// | Decisions | Records | Pieces |
+/// |---|---|---|
+/// | 0, 24 | 0, 24, 48 | `(0, 24]` κ₁ |
+/// | 0, 24 | 0, 12, 24 | `(0, 12]` κ₀, `(12, 24]` κ₁ |
+/// | 0, 24 | 0, 23, 47 | `(0, 23]` κ₀, `(23, 24]` κ₁ (the record at 47) |
+/// | 0, 24 | 0, 23, 24, 48 | `(0, 23]` κ₀, `(23, 24]` κ₁: a record on the decision is harmless with one just before it |
+/// | 0, 24, 48 | 0, 12, 48 | `(0, 12]` κ₀, `(12, 24]` and `(24, 48]` κ₂: no record on a decision is not enough |
+/// | 0, 24, 48, 72 | 0, 72 | all three windows κ₃ |
+/// | 0, 24 | 0, 23 | `(0, 24]` κ₀ (nothing after 23) |
+/// | 0, 24, 48 | 0, 23 | `(0, 24]` κ₀, `(24, 48]` κ₁: past the last record, the window's own decision |
 ///
 /// The oracle is outside the engine: the CL in force over a piece is backed out of the
-/// concentrations at its ends, `CL = −V/Δt · ln(C_b/C_a)`, with `C(0⁺) = d₀/V`, the
-/// mid-window value from the trajectory row and `C(24)` from the trough the decision at 24
-/// read. It is compared with `TVCL·exp(κ_g)` from the run's own κ substream. Worst relative
-/// gap over the 21 pieces of three replicates, macOS arm64: 2.8e-15, on a one-hour
-/// `(23, 24]` piece (bound 1e-12). The other occasion's CL is asserted at least 1e-2 away,
-/// so neither κ can pass for the other.
+/// concentrations at its ends, `CL = −V/Δt · ln(C_b/C_a)`. At a decision the end value is
+/// the trough the decision read and the start value is that trough plus `dose/V`; between
+/// decisions it is the trajectory row. It is compared with `TVCL·exp(κ_g)` from the run's
+/// own κ substream. Worst relative gap over the 54 pieces of three replicates, macOS arm64:
+/// 2.8e-15, on a one-hour `(23, 24]` piece (bound 1e-12). Every other occasion's CL is
+/// asserted at least 1e-2 away, so no κ can pass for another.
 ///
 /// Already pinned elsewhere: the first row by `auc_target_reads_each_window_under_its_segments_kappa`
 /// (through the window AUC) and by
 /// `under_iov_a_supplied_subject_reads_kappa_zero_and_an_oracle_one_the_first_occasion`
 /// (through the trough); a mid-window record's own κ by `auc_target_reads_a_reset_rows_own_kappa`
-/// (a reset row). The two `23` rows had no test.
+/// (a reset row).
 ///
-/// Mutation run: `governing_segment_pk_at` returning the carry (the last record behind the
-/// segment) instead of the next record ahead fails row 1, at `(0, 24]` under κ₀. Row 4
-/// has no one-line mutation; it pins the trailing carry the docs describe.
+/// Mutations run, each failing this test:
+/// - `governing_segment_pk_at` returning the carry (the last record behind the segment)
+///   instead of the next record ahead: row 1, `(0, 24]` under κ₀.
+/// - the decision break no longer setting `last_pk = dp[g]` and `last_occ = Some(g)`, in
+///   the driver and its replay: the last row, `(24, 48]` under κ₀. The `0, 23` row with
+///   decisions at 0 and 24 cannot see this one: its κ₀ comes from the record at 23 alike.
 #[test]
 fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
     const SEED: u64 = 17;
-    let b = "  observe = CENT / V
-  at = [0, 24]
+    let v = TVV * 70.0;
+    let rel = |a: f64, b: f64| ((a - b) / b).abs();
+    // (decisions, record times, pieces as (start, end, occasion in force)).
+    type Piece = (f64, f64, usize);
+    let layouts: [(&[f64], &[f64], &[Piece]); 8] = [
+        (&[0.0, 24.0], &[0.0, 24.0, 48.0], &[(0.0, 24.0, 1)]),
+        (
+            &[0.0, 24.0],
+            &[0.0, 12.0, 24.0],
+            &[(0.0, 12.0, 0), (12.0, 24.0, 1)],
+        ),
+        (
+            &[0.0, 24.0],
+            &[0.0, 23.0, 47.0],
+            &[(0.0, 23.0, 0), (23.0, 24.0, 1)],
+        ),
+        (
+            &[0.0, 24.0],
+            &[0.0, 23.0, 24.0, 48.0],
+            &[(0.0, 23.0, 0), (23.0, 24.0, 1)],
+        ),
+        (
+            &[0.0, 24.0, 48.0],
+            &[0.0, 12.0, 48.0],
+            &[(0.0, 12.0, 0), (12.0, 24.0, 2), (24.0, 48.0, 2)],
+        ),
+        (
+            &[0.0, 24.0, 48.0, 72.0],
+            &[0.0, 72.0],
+            &[(0.0, 24.0, 3), (24.0, 48.0, 3), (48.0, 72.0, 3)],
+        ),
+        (
+            &[0.0, 24.0],
+            &[0.0, 23.0],
+            &[(0.0, 23.0, 0), (23.0, 24.0, 0)],
+        ),
+        (
+            &[0.0, 24.0, 48.0],
+            &[0.0, 23.0],
+            &[(0.0, 23.0, 0), (23.0, 24.0, 0), (24.0, 48.0, 1)],
+        ),
+    ];
+    for (at, times, pieces) in layouts {
+        let at_list: Vec<String> = at.iter().map(|t| t.to_string()).collect();
+        let b = format!(
+            "  observe = CENT / V
+  at = [{}]
   start_dose = 400
   route = bolus(cmt=1)
   dose_bounds = [0, 4000]
-  when signal > 1000000 : decrease 25%";
-    let p = model_with(true, "0", b);
-    let v = TVV * 70.0;
-    let rel = |a: f64, b: f64| ((a - b) / b).abs();
-    // (record times, the pieces of (0, 24] as (start, end, occasion in force)).
-    type Piece = (f64, f64, usize);
-    let layouts: [(&[f64], &[Piece]); 4] = [
-        (&[0.0, 24.0, 48.0], &[(0.0, 24.0, 1)]),
-        (&[0.0, 12.0, 24.0], &[(0.0, 12.0, 0), (12.0, 24.0, 1)]),
-        (&[0.0, 23.0, 47.0], &[(0.0, 23.0, 0), (23.0, 24.0, 1)]),
-        (&[0.0, 23.0], &[(0.0, 23.0, 0), (23.0, 24.0, 0)]),
-    ];
-    for (times, pieces) in layouts {
+  when signal > 1000000 : decrease 25%",
+            at_list.join(", ")
+        );
+        let p = model_with(true, "0", &b);
         let mut data = String::from("ID,TIME,DV,AMT,EVID,CMT,MDV,WT\n");
         for t in times {
             data.push_str(&format!("1,{t},0,0,0,1,0,70\n"));
         }
         let r = run(&p, &pop(&data), &[("1", 0.0)], 3).expect("runs");
         for sim in 1..=3 {
-            let d0 = first_dose(&r, "1", sim);
-            assert_eq!(d0, 400.0, "{times:?} sim {sim}: the fixed start dose");
-            let trough = r
-                .decisions
-                .iter()
-                .find(|d| d.sim == sim && d.time == 24.0)
-                .expect("decision at 24")
-                .observed_signals[0]
-                .value;
-            let conc = |t: f64| {
-                let c = if t == 0.0 {
-                    d0 / v
-                } else if t == 24.0 {
-                    trough
-                } else {
-                    r.trajectories
-                        .iter()
-                        .find(|x| x.sim == sim && x.time == t)
-                        .expect("a trajectory row at the record")
-                        .ipred
+            let tag = format!("decisions {at:?} records {times:?} sim {sim}");
+            let trough = |t: f64| {
+                r.decisions
+                    .iter()
+                    .find(|d| d.sim == sim && d.time == t)
+                    .expect("a decision at the time")
+                    .observed_signals[0]
+                    .value
+            };
+            let dose = |t: f64| {
+                r.ledger
+                    .iter()
+                    .find(|e| e.sim == sim && e.time == t)
+                    .expect("a dose at the decision")
+                    .amt
+            };
+            // The concentration at `t`: after the dose when `t` starts a piece, before it
+            // when `t` ends one.
+            let conc = |t: f64, starts: bool| {
+                let c = match (at.contains(&t), starts) {
+                    (true, true) => trough(t) + dose(t) / v,
+                    (true, false) => trough(t),
+                    (false, _) => {
+                        r.trajectories
+                            .iter()
+                            .find(|x| x.sim == sim && x.time == t)
+                            .expect("a trajectory row at the record")
+                            .ipred
+                    }
                 };
-                assert!(
-                    c.is_finite() && c > 0.0,
-                    "{times:?} sim {sim}: C({t}) = {c}"
-                );
+                assert!(c.is_finite() && c > 0.0, "{tag}: C({t}) = {c}");
                 c
             };
-            let cl = [0, 1].map(|g| TVCL * drawn_kappa(&p, SEED, "1", sim, g).exp());
-            assert!(
-                rel(cl[0], cl[1]) > 1e-2,
-                "sim {sim}: κ₀ and κ₁ must differ for the fixture to see it: {cl:?}"
-            );
+            let cl: Vec<f64> = (0..at.len())
+                .map(|g| TVCL * drawn_kappa(&p, SEED, "1", sim, g).exp())
+                .collect();
             for &(a, b, g) in pieces {
-                let backed_out = -v / (b - a) * (conc(b) / conc(a)).ln();
+                let backed_out = -v / (b - a) * (conc(b, false) / conc(a, true)).ln();
                 assert!(
                     rel(backed_out, cl[g]) < 1e-12,
-                    "records {times:?} sim {sim}: ({a}, {b}] runs under CL {backed_out}, \
-                     want κ_{g}'s {} (the other occasion's is {})",
-                    cl[g],
-                    cl[1 - g]
+                    "{tag}: ({a}, {b}] runs under CL {backed_out}, want κ_{g}'s {} (all: {cl:?})",
+                    cl[g]
                 );
-                assert!(
-                    rel(backed_out, cl[1 - g]) > 1e-2,
-                    "records {times:?} sim {sim}: ({a}, {b}] must not match κ_{}",
-                    1 - g
-                );
+                for (other, &cl_other) in cl.iter().enumerate().filter(|&(o, _)| o != g) {
+                    assert!(
+                        rel(backed_out, cl_other) > 1e-2,
+                        "{tag}: ({a}, {b}] must not match κ_{other}: {cl:?}"
+                    );
+                }
             }
         }
     }

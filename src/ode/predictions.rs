@@ -5879,7 +5879,8 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // the LOCF carry past the subject's last record), and `eta_occ[g]` is the full
     // `[η_bsv | κ_g]` threaded into `read_observable` / `integrate_segment` for every
     // segment a record of occasion g ends — so the window after decision g runs under
-    // κ_{g+1} when a record sits on decision g+1 (#2771). `None` on both ⇒ no IOV, byte-identical to the pre-#701 path
+    // κ_{g+1} when a record sits on decision g+1 (#2771). `None` on both ⇒ no IOV,
+    // byte-identical to the pre-#701 path
     // (the fixed `eta` is used throughout). IOV implies `event_pk = Some` (κ makes PK
     // per-occasion, so obs / pk-only records carry their occasion snapshot).
     decision_pk: Option<&[PkParams]>,
@@ -6350,8 +6351,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
 
         // #701 (IOV): a decision break opens its occasion window `g`. Set the LOCF PK
         // + occasion to occasion g's snapshot so the pre-dose readout, the injected
-        // dose's F, and any following non-record segment all use occasion g's
-        // parameters — not the previous occasion carried in `last_pk`/`last_occ`.
+        // dose's F, and any following segment PAST THE LAST RECORD all use occasion g's
+        // parameters — not the previous occasion carried in `last_pk`/`last_occ`. A
+        // segment with a record ahead takes that record's instead (#1073, #2771).
         // Unconditional (every decision break, including holds and post-`Stop`, so
         // every event reads its window's κ). The readout below then reads this snapshot.
         if let (Some(dp), Some(&g)) = (decision_pk, decision_index_of.get(&t_start.to_bits())) {
@@ -7629,7 +7631,7 @@ fn adaptive_frozen_replay_tv(
 
         // #701: open a decision window here, mirroring the driver — set the LOCF PK +
         // occasion to this decision's occasion snapshot so the coincident observation,
-        // and any following non-record segment, read occasion g's κ.
+        // and any following segment past the last record, read occasion g's κ.
         if let (Some(dp), Some(&g)) = (decision_pk, decision_index_of.get(&t_start.to_bits())) {
             last_pk = dp[g];
             last_occ = Some(g);
