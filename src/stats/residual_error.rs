@@ -2686,18 +2686,39 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
 /// - A derived `iov_occasion` rule always passes: its labels count the edges at or
 ///   before each time.
 pub(crate) fn occasions_run_in_time(subject: &crate::types::Subject) -> bool {
-    let occ = &subject.occasions;
+    labels_run_in_time(&subject.occasions, &subject.obs_times)
+}
+
+/// Whether `subject`'s **residual blocks** run in time (#2858): the rule of
+/// [`occasions_run_in_time`] on `obs_rgroup`, the blocks of a `correlation … by`
+/// line. Block 0, the rows in no block, is a label like any other. True for a
+/// subject with no blocks or one.
+///
+/// A line `by` a column whose groups follow one another in time (`by OCC` over
+/// visits) leaves the rows of two consecutive blocks independent, and a pair that
+/// joins one block's last row to the next block's first is then a real lag pair of
+/// the decorrelated residuals. Blocks that restart the clock (`by ARM`) are parallel
+/// and stay apart.
+pub(crate) fn residual_blocks_run_in_time(subject: &crate::types::Subject) -> bool {
+    labels_run_in_time(&subject.obs_rgroup, &subject.obs_times)
+}
+
+/// The one rule behind [`occasions_run_in_time`] and
+/// [`residual_blocks_run_in_time`]: every label of `labels` (one per observation
+/// row) is one contiguous run, and each change of label is at a strictly later
+/// `obs_times`.
+fn labels_run_in_time(labels: &[u32], obs_times: &[f64]) -> bool {
     let mut closed: Vec<u32> = Vec::new();
-    for j in 1..occ.len() {
-        if occ[j] == occ[j - 1] {
+    for j in 1..labels.len() {
+        if labels[j] == labels[j - 1] {
             continue;
         }
-        closed.push(occ[j - 1]);
-        let later = match (subject.obs_times.get(j), subject.obs_times.get(j - 1)) {
+        closed.push(labels[j - 1]);
+        let later = match (obs_times.get(j), obs_times.get(j - 1)) {
             (Some(t), Some(prev)) => t > prev,
             _ => false,
         };
-        if !later || closed.contains(&occ[j]) {
+        if !later || closed.contains(&labels[j]) {
             return false;
         }
     }
@@ -2706,11 +2727,11 @@ pub(crate) fn occasions_run_in_time(subject: &crate::types::Subject) -> bool {
 
 /// The series the fit's Durbin–Watson statistic pairs within (#2798): `values`
 /// (one per observation row of `subject`) split into the rows sharing the key
-/// `(occasions[j], obs_rgroup[j])`. The residual-block part is read whenever the
-/// subject carries it; the occasion part only when the subject's occasions do
-/// **not** run in time ([`occasions_run_in_time`], #2829). Rows are grouped **by
-/// key**, not by contiguous run, and kept in row order; the groups come out in order
-/// of first appearance.
+/// `(occasions[j], obs_rgroup[j])`. Each part is read only when it does **not** run
+/// in time: the occasions ([`occasions_run_in_time`], #2829) and the residual blocks
+/// ([`residual_blocks_run_in_time`], #2858) are tested apart, by the same rule. Rows
+/// are grouped **by key**, not by contiguous run, and kept in row order; the groups
+/// come out in order of first appearance.
 ///
 /// The key is what the fit grouped the rows by: the occasions are the prepared
 /// population's (an `iov_column`, a derived `iov_occasion` rule, or a nested
@@ -2724,7 +2745,11 @@ pub(crate) fn occasions_run_in_time(subject: &crate::types::Subject) -> bool {
 ///
 /// Whitened residuals split the same way: the Cholesky factor of a block-diagonal
 /// (up to permutation) `R` has no fill between blocks, so whitening never mixes two
-/// residual blocks, and occasions are joined only inside one block.
+/// residual blocks. Under the model the whitened rows of two blocks are independent,
+/// so a pair across blocks in time asks the statistic's own question: is there
+/// dependence the line does not explain? Split there, a line `by` the visits hid the
+/// cross-visit pairs from the statistic, and with one row per block left it `NaN`
+/// (#2858).
 pub(crate) fn split_by_residual_group(
     values: &[f64],
     subject: &crate::types::Subject,
@@ -2737,10 +2762,15 @@ pub(crate) fn split_by_residual_group(
     } else {
         &subject.occasions
     };
+    let blocks: &[u32] = if residual_blocks_run_in_time(subject) {
+        &[]
+    } else {
+        &subject.obs_rgroup
+    };
     let mut keys: Vec<(Option<u32>, Option<u32>)> = Vec::new();
     let mut groups: Vec<Vec<f64>> = Vec::new();
     for (j, &e) in values.iter().enumerate() {
-        let key = (part(occasions, j), part(&subject.obs_rgroup, j));
+        let key = (part(occasions, j), part(blocks, j));
         match keys.iter().position(|k| *k == key) {
             Some(g) => groups[g].push(e),
             None => {
@@ -2787,8 +2817,8 @@ pub(crate) fn grouped_iwres_autocorrelation(
 /// not factor contributes nothing, as a subject with < 2 finite IWRES does.
 ///
 /// The whitened series is split like the raw one ([`split_by_residual_group`],
-/// #2798): pairs stay within one residual block, and within one occasion when the
-/// subject's occasions are parallel (#2829).
+/// #2798): pairs stay within one residual block when the subject's blocks are
+/// parallel (#2858), and within one occasion when its occasions are (#2829).
 pub(crate) fn whitened_residual_autocorrelation(
     model: &crate::types::CompiledModel,
     population: &crate::types::Population,

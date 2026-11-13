@@ -547,9 +547,13 @@ const LINE: &str = "correlation cs(RHO) by ARM";
 /// was taken, that the line does not explain it, and the `ar1` advice.
 #[test]
 fn decorrelated_positive_message_under_cs_is_exact() {
-    let msg =
-        dw_autocorrelation_warning_decorrelated(1.43, LINE, crate::types::ResidualSerialKind::Cs)
-            .expect("below 1.5");
+    let msg = dw_autocorrelation_warning_decorrelated(
+        1.43,
+        LINE,
+        crate::types::ResidualSerialKind::Cs,
+        None,
+    )
+    .expect("below 1.5");
     assert_eq!(
         msg,
         "Positive autocorrelation remains in the residuals decorrelated by `correlation \
@@ -568,6 +572,7 @@ fn decorrelated_positive_message_under_ar1_is_exact() {
         1.2,
         "correlation ar1(RHO) by ARM",
         crate::types::ResidualSerialKind::Ar1,
+        None,
     )
     .expect("below 1.5");
     assert_eq!(
@@ -588,6 +593,7 @@ fn decorrelated_positive_message_under_car1_is_exact() {
         1.3,
         "correlation car1(RHO) by ARM",
         crate::types::ResidualSerialKind::Car1,
+        None,
     )
     .expect("below 1.5");
     assert_eq!(
@@ -603,14 +609,142 @@ fn decorrelated_positive_message_under_car1_is_exact() {
 
 #[test]
 fn decorrelated_negative_message_is_exact() {
-    let msg =
-        dw_autocorrelation_warning_decorrelated(2.7, LINE, crate::types::ResidualSerialKind::Cs)
-            .expect("above 2.5");
+    let msg = dw_autocorrelation_warning_decorrelated(
+        2.7,
+        LINE,
+        crate::types::ResidualSerialKind::Cs,
+        None,
+    )
+    .expect("above 2.5");
     assert_eq!(
         msg,
         "Negative autocorrelation in the residuals decorrelated by `correlation cs(RHO) by \
          ARM` (Durbin-Watson = 2.70). The residual correlation may be over-estimated, or the \
          error model misspecified."
+    );
+}
+
+/// The sentence the positive text gains when the statistic paired rows across
+/// blocks (#2858), for a numeric `ID`.
+const ACROSS_BLOCKS: &str = " The blocks of this line follow one another in time, so the \
+     statistic also pairs rows of consecutive blocks, which the line leaves independent. A \
+     line `by ID` correlates all rows of one subject.";
+
+/// The same for a text `ID`.
+const ACROSS_BLOCKS_TEXT_ID: &str = " The blocks of this line follow one another in time, so \
+     the statistic also pairs rows of consecutive blocks, which the line leaves independent. \
+     A line `by COL` correlates all rows of one subject, with COL a numeric data column that \
+     has one value per subject (`ID` is not numeric in this data).";
+
+/// #2858: when the statistic paired across blocks, every structure's positive text
+/// is today's text (pinned exactly above) plus one sentence, and the sentence
+/// depends only on how a subject-wide line is written. The negative text and the
+/// band do not change.
+///
+/// The discriminator and its negative are asserted per cell. Mutations that must
+/// redden this: the sentence dropped; `by ID` on a text `ID`; the sentence added
+/// to the negative text.
+#[test]
+fn decorrelated_positive_message_across_blocks_names_the_subject_line() {
+    use crate::types::ResidualSerialKind::{Ar1, Car1, Cs};
+    for (kind, line) in [
+        (Cs, "correlation cs(RHO) by OCC"),
+        (Ar1, "correlation ar1(RHO) by OCC"),
+        (Car1, "correlation car1(RHO) by OCC"),
+    ] {
+        let within =
+            dw_autocorrelation_warning_decorrelated(1.2, line, kind, None).expect("below 1.5");
+        assert!(
+            !within.contains("blocks of this line") && !within.contains("by ID"),
+            "{within}"
+        );
+        let by_id =
+            dw_autocorrelation_warning_decorrelated(1.2, line, kind, Some(SubjectLine::ById))
+                .expect("below 1.5");
+        assert_eq!(by_id, format!("{within}{ACROSS_BLOCKS}"), "{kind:?}");
+        assert!(
+            by_id.contains("A line `by ID` correlates") && !by_id.contains("COL"),
+            "{by_id}"
+        );
+        let by_col = dw_autocorrelation_warning_decorrelated(
+            1.2,
+            line,
+            kind,
+            Some(SubjectLine::ByNumericColumn),
+        )
+        .expect("below 1.5");
+        assert_eq!(
+            by_col,
+            format!("{within}{ACROSS_BLOCKS_TEXT_ID}"),
+            "{kind:?}"
+        );
+        assert!(
+            by_col.contains("A line `by COL` correlates")
+                && by_col.contains("`ID` is not numeric")
+                && !by_col.contains("by ID`"),
+            "{by_col}"
+        );
+        for across in [Some(SubjectLine::ById), Some(SubjectLine::ByNumericColumn)] {
+            assert_eq!(
+                dw_autocorrelation_warning_decorrelated(2.7, line, kind, across),
+                dw_autocorrelation_warning_decorrelated(2.7, line, kind, None),
+                "{kind:?}: the negative text does not change"
+            );
+            assert_eq!(
+                dw_autocorrelation_warning_decorrelated(2.0, line, kind, across),
+                None
+            );
+        }
+    }
+}
+
+/// #2858: `dw_across_blocks` says the statistic paired across blocks exactly when
+/// `split_by_residual_group` joined some subject's blocks: more than one block, in
+/// time. Each row is one subject's blocks, clock and id.
+///
+/// Mutations that must redden this: the "more than one block" read dropped (one
+/// block, or none, would answer `Some`: a single label runs in time); the in-time
+/// read dropped (the restarting row answers `Some`); `any` → `all` over the
+/// subjects (the mixed population answers `None`).
+#[test]
+fn dw_across_blocks_is_some_only_when_blocks_in_time_were_joined() {
+    let subject = |id: &str, blocks: &[u32], times: &[f64]| Subject {
+        id: id.to_string(),
+        obs_times: times.to_vec(),
+        observations: vec![0.0; times.len()],
+        obs_cmts: vec![1; times.len()],
+        obs_rgroup: blocks.to_vec(),
+        ..Default::default()
+    };
+    let running = [0.0, 1.0, 2.0, 3.0];
+    let restarting = [0.0, 1.0, 0.0, 1.0];
+    let of = |subjects: Vec<Subject>| dw_across_blocks(&population(subjects));
+    assert_eq!(
+        of(vec![subject("1", &[1, 1, 2, 2], &running)]),
+        Some(SubjectLine::ById)
+    );
+    assert_eq!(of(vec![subject("1", &[1, 1, 2, 2], &restarting)]), None);
+    assert_eq!(of(vec![subject("1", &[1, 2, 1, 2], &running)]), None);
+    assert_eq!(of(vec![subject("1", &[1, 1, 1, 1], &running)]), None);
+    assert_eq!(of(vec![subject("1", &[], &running)]), None);
+    // One subject whose blocks were joined is enough, wherever it sits.
+    for flip in [false, true] {
+        let mut subjects = vec![
+            subject("1", &[1, 1, 2, 2], &running),
+            subject("2", &[1, 1, 2, 2], &restarting),
+        ];
+        if flip {
+            subjects.reverse();
+        }
+        assert_eq!(of(subjects), Some(SubjectLine::ById), "flip {flip}");
+    }
+    // A text id anywhere: `by ID` cannot be read.
+    assert_eq!(
+        of(vec![
+            subject("1", &[1, 1, 2, 2], &running),
+            subject("S2", &[1, 1, 1, 1], &running),
+        ]),
+        Some(SubjectLine::ByNumericColumn)
     );
 }
 
@@ -623,16 +757,21 @@ fn decorrelated_warning_band_and_category() {
             dw_autocorrelation_warning_decorrelated(
                 dw,
                 LINE,
-                crate::types::ResidualSerialKind::Ar1
+                crate::types::ResidualSerialKind::Ar1,
+                None
             ),
             None,
             "dw = {dw}"
         );
     }
     for dw in [1.0, 3.0] {
-        let msg =
-            dw_autocorrelation_warning_decorrelated(dw, LINE, crate::types::ResidualSerialKind::Cs)
-                .unwrap();
+        let msg = dw_autocorrelation_warning_decorrelated(
+            dw,
+            LINE,
+            crate::types::ResidualSerialKind::Cs,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             crate::types::classify_warning(&msg).category,
             crate::types::WarningCode::DwAutocorrelation,
@@ -712,6 +851,7 @@ fn fit_pushes_the_decorrelated_cs_advice() {
         result.dw_statistic,
         "correlation cs(RHO) by ARM",
         crate::types::ResidualSerialKind::Cs,
+        None,
     )
     .expect("a DW below 1.5 warns");
     let dw_entries: Vec<&String> = result
@@ -773,7 +913,9 @@ const ALGEBRAIC_IN_TIME_TEXT_ID: &str = "Positive IWRES autocorrelation detected
      instead. The line needs method = foce or focei. A line `by` the occasions themselves \
      cannot model this: a block never joins rows of two occasions.";
 
-const IN_TIME: DwAdvice = DwAdvice::AlgebraicInTime { by_id: true };
+const IN_TIME: DwAdvice = DwAdvice::AlgebraicInTime {
+    by: SubjectLine::ById,
+};
 
 /// The compartment-free text for group `g`.
 fn algebraic_grouped(g: &str) -> String {
@@ -1128,7 +1270,12 @@ fn algebraic_in_time_names_id_only_when_it_is_numeric() {
         (advice, msg)
     };
     let (advice, msg) = message(&["1", "2"]);
-    assert_eq!(advice, DwAdvice::AlgebraicInTime { by_id: true });
+    assert_eq!(
+        advice,
+        DwAdvice::AlgebraicInTime {
+            by: SubjectLine::ById
+        }
+    );
     assert_eq!(msg, ALGEBRAIC_IN_TIME);
     assert!(
         msg.contains("by ID` line") && !msg.contains("COL") && !msg.contains("not numeric"),
@@ -1138,7 +1285,9 @@ fn algebraic_in_time_names_id_only_when_it_is_numeric() {
         let (advice, msg) = message(&ids);
         assert_eq!(
             advice,
-            DwAdvice::AlgebraicInTime { by_id: false },
+            DwAdvice::AlgebraicInTime {
+                by: SubjectLine::ByNumericColumn
+            },
             "{ids:?}"
         );
         assert_eq!(msg, ALGEBRAIC_IN_TIME_TEXT_ID, "{ids:?}");
@@ -1384,8 +1533,12 @@ fn negative_text_is_the_same_for_every_advice() {
         DwAdvice::Algebraic {
             group: Some("ARM".into()),
         },
-        DwAdvice::AlgebraicInTime { by_id: true },
-        DwAdvice::AlgebraicInTime { by_id: false },
+        DwAdvice::AlgebraicInTime {
+            by: SubjectLine::ById,
+        },
+        DwAdvice::AlgebraicInTime {
+            by: SubjectLine::ByNumericColumn,
+        },
     ] {
         let msg = dw_autocorrelation_warning(2.80, &advice).expect("above 2.5");
         assert_eq!(msg, negative, "{advice:?}");

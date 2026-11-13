@@ -354,10 +354,15 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
 /// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima,
 /// with the statistic split by arm and pair-normalised since #2798: `cs` leaves DW
 /// 1.63, `ar1` 1.96 — the classic whole-subject form read 1.43 and 1.69).
+///
+/// `across_blocks` is [`dw_across_blocks`]: `Some` when the statistic paired rows of
+/// consecutive blocks (#2858). The positive text then says so and names the line that
+/// would correlate them, since no structure of the line as written can.
 pub(crate) fn dw_autocorrelation_warning_decorrelated(
     dw: f64,
     line: &str,
     kind: crate::types::ResidualSerialKind,
+    across_blocks: Option<SubjectLine>,
 ) -> Option<String> {
     if !dw.is_finite() {
         return None;
@@ -381,9 +386,19 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
                  dependent."
             }
         };
+        let across = match across_blocks {
+            None => String::new(),
+            Some(by) => format!(
+                " The blocks of this line follow one another in time, so the statistic \
+                 also pairs rows of consecutive blocks, which the line leaves \
+                 independent. A line `by {}` correlates all rows of one subject{}.",
+                by.column(),
+                by.clause()
+            ),
+        };
         Some(format!(
             "Positive autocorrelation remains {what}: the within-group correlation does \
-             not explain it.{advice}"
+             not explain it.{advice}{across}"
         ))
     } else if dw > 2.5 {
         Some(format!(
@@ -393,6 +408,62 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
     } else {
         None
     }
+}
+
+/// How a `correlation` line that spans a subject is written (#2858): `by ID` when
+/// every subject's `ID` is a number, else `by` a placeholder column with what it has
+/// to be. A `by` column is read as a number, so on a text `ID` the line `by ID` puts
+/// every row in no block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SubjectLine {
+    ById,
+    ByNumericColumn,
+}
+
+impl SubjectLine {
+    pub(crate) fn of(prepared: &Population) -> Self {
+        if prepared
+            .subjects
+            .iter()
+            .all(|s| s.id.parse::<f64>().is_ok())
+        {
+            SubjectLine::ById
+        } else {
+            SubjectLine::ByNumericColumn
+        }
+    }
+
+    fn column(self) -> &'static str {
+        match self {
+            SubjectLine::ById => "ID",
+            SubjectLine::ByNumericColumn => "COL",
+        }
+    }
+
+    fn clause(self) -> &'static str {
+        match self {
+            SubjectLine::ById => "",
+            SubjectLine::ByNumericColumn => {
+                ", with COL a numeric data column that has one value per subject \
+                 (`ID` is not numeric in this data)"
+            }
+        }
+    }
+}
+
+/// Whether the decorrelated statistic paired rows **across** residual blocks on
+/// `prepared` (#2858), and if so how a line spanning the subject is written: some
+/// subject has more than one block and its blocks run in time
+/// (`residual_blocks_run_in_time`), so `split_by_residual_group` joined them.
+pub(crate) fn dw_across_blocks(prepared: &Population) -> Option<SubjectLine> {
+    prepared
+        .subjects
+        .iter()
+        .any(|s| {
+            s.obs_rgroup.windows(2).any(|w| w[0] != w[1])
+                && crate::stats::residual_error::residual_blocks_run_in_time(s)
+        })
+        .then(|| SubjectLine::of(prepared))
 }
 
 /// Which remedies the positive-DW warning may name (#2798): only ones the fitted
@@ -411,9 +482,8 @@ pub(crate) enum DwAdvice {
     /// A compartment-free model whose subjects carry occasions that all **run in
     /// time** (#2858): the statistic was taken across them, so a `correlation` line
     /// has to span the subject. A line `by` the occasions cannot, as a block never
-    /// joins rows of two occasions. `by_id` says whether `by ID` can be written:
-    /// a `by` column is read as a number, so a text `ID` puts every row in no block.
-    AlgebraicInTime { by_id: bool },
+    /// joins rows of two occasions. `by` is how the line that does is written.
+    AlgebraicInTime { by: SubjectLine },
 }
 
 /// The [`DwAdvice`] for `model` fitted under `options` on `prepared` (#2798).
@@ -434,8 +504,8 @@ pub(crate) enum DwAdvice {
 /// [`DwAdvice::AlgebraicInTime`] (#2858), whatever declared the occasions (a column,
 /// a level, nested levels or a derived rule): a line `by` that grouping is the one
 /// line that cannot model those pairs. Measured on `tests/data/dw_sequential_algebraic`:
-/// with one row per occasion `ar1(RHO) by OCC` leaves the OFV at −37.739613, ρ at its
-/// initial value and the statistic `NaN`, where `by ID` reaches −124.232414.
+/// with one row per occasion `ar1(RHO) by OCC` leaves the OFV at −37.739613 and ρ at
+/// its initial value, where `by ID` reaches −124.232414.
 ///
 /// Otherwise `group` is `None`: the model declares no grouping, or no subject has
 /// two occasions. Also `None` for
@@ -467,11 +537,9 @@ pub(crate) fn dw_advice(
             .iter()
             .any(|s| s.occasions.windows(2).any(|w| w[0] != w[1]));
         if across_occasions {
-            let by_id = prepared
-                .subjects
-                .iter()
-                .all(|s| s.id.parse::<f64>().is_ok());
-            return DwAdvice::AlgebraicInTime { by_id };
+            return DwAdvice::AlgebraicInTime {
+                by: SubjectLine::of(prepared),
+            };
         }
     }
     let group = if !split_at_occasions {
@@ -530,16 +598,8 @@ pub(crate) fn dw_autocorrelation_warning(dw: f64, advice: &DwAdvice) -> Option<S
                  them correlate, decaying with the number of visits between them; \
                  {CAR1_AND_METHOD}"
             ),
-            DwAdvice::AlgebraicInTime { by_id } => {
-                let (by, column) = if *by_id {
-                    ("ID", "")
-                } else {
-                    (
-                        "COL",
-                        ", with COL a numeric data column that has one value per subject \
-                         (`ID` is not numeric in this data)",
-                    )
-                };
+            DwAdvice::AlgebraicInTime { by } => {
+                let (by, column) = (by.column(), by.clause());
                 format!(
                     "{what} Consecutive rows of one subject may share what the structural \
                      model leaves out, across its occasions too: they follow one another in \
@@ -3346,9 +3406,12 @@ fn fit_inner(
         &model.residual_serial,
         crate::api::validation::residual_correlation_line(model),
     ) {
-        (Some(serial), Some(line)) => {
-            dw_autocorrelation_warning_decorrelated(dw_statistic, &line, serial.kind)
-        }
+        (Some(serial), Some(line)) => dw_autocorrelation_warning_decorrelated(
+            dw_statistic,
+            &line,
+            serial.kind,
+            dw_across_blocks(population),
+        ),
         _ => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options, population)),
     };
     if let Some(msg) = dw_warning {

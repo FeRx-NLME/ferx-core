@@ -288,8 +288,9 @@ it.
 
 The pooled Durbin–Watson statistic and lag-1 correlation (`dw_statistic`,
 `iwres_lag1_r`) are taken on each subject's residuals decorrelated by the fitted
-`R`, `L⁻¹(y − IPRED)` with `R = L Lᵀ`, and paired within each `by` block
-([IWRES autocorrelation](../output.qmd#iwres-autocorrelation)). Under the model
+`R`, `L⁻¹(y − IPRED)` with `R = L Lᵀ`, and paired within each `by` block when
+the blocks are parallel ([IWRES autocorrelation](../output.qmd#iwres-autocorrelation),
+[Occasions in time](#occasions-in-time)). Under the model
 these are independent, so a value outside `[1.5, 2.5]` reports dependence the line
 does **not** explain. On the naproxen data at NONMEM's optima:
 
@@ -312,12 +313,19 @@ When a subject's occasions follow one another in time (visits, dosing intervals,
 study periods), the statistic of a model without a `correlation` line is taken
 across them, and a warning reports dependence between consecutive rows of the
 subject. A line `by` the occasion column does not model that dependence: a block
-never joins rows of two occasions, and the statistic under the line is paired
-within blocks, so it no longer sees those pairs. Write the line `by` a column with
-one value per subject. `by ID` works when `ID` is numeric, since a `by` column is
+never joins rows of two occasions. Write the line `by` a column with one value per
+subject. `by ID` works when `ID` is numeric, since a `by` column is
 read as a number; with a text `ID`, use a numeric column that repeats it. The
 warning on a compartment-free model names this line
 ([#2858](https://github.com/FeRx-NLME/ferx-core/issues/2858)).
+
+The statistic under a `correlation` line follows the same rule as for occasions.
+Blocks that follow one another in time are one series, so a pair joins one block's
+last row to the next block's first; blocks that restart the clock, such as arms,
+stay apart. Under the model the decorrelated rows of two blocks are independent,
+so those pairs report dependence the line leaves out. A warning then says that the
+statistic paired rows of consecutive blocks and names the line `by ID`. Split at
+every block, `by OCC` with one row per occasion would leave no pair at all.
 
 Measured on 24 subjects with AR(1) residuals (ρ = 0.7 across the subject), a line
 in time with a subject intercept and a kappa per occasion, fitted with `focei`
@@ -326,13 +334,15 @@ in time with a subject intercept and a kappa per occasion, fitted with `focei`
 | Rows per occasion | Line | OFV | `ρ̂` | Durbin–Watson |
 |---|---|---|---|---|
 | 1 | none | −37.74 | | 0.97, warns |
-| 1 | `ar1(RHO) by OCC` | −37.74 | stays at its initial value | `NaN`, `W_RESIDUAL_CORRELATION_INERT` |
+| 1 | `ar1(RHO) by OCC` | −37.74 | stays at its initial value | 0.97, warns and names `by ID`; `W_RESIDUAL_CORRELATION_INERT` |
 | 1 | `ar1(RHO) by ID` | −124.23 | 0.82 | 2.16, silent |
 
 With three rows per occasion, `by OCC` is not inert (OFV −211.83 against −206.45
-without a line), but `by ID` fits 35 points better (−246.65): the dependence
-across occasions is still there, in pairs the statistic under `by OCC` no longer
-takes.
+without a line), but `by ID` fits 35 points better (−246.65). The statistic does
+not show this: under `by OCC` it is 2.18, inside the band. Only three of a
+subject's eleven pairs cross an occasion, and the pooled statistic averages them
+with the eight the line models. Compare the objective of the two lines; a silent
+Durbin–Watson statistic is not evidence that the grouping is right.
 
 A `by` column that no model expression reads is a required data column but is not
 listed in the "used in model expressions but not declared in `[covariates]`"

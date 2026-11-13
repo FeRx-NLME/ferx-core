@@ -8,6 +8,11 @@
 //! the statistic fired on: a block never joins rows of two occasions. The warning
 //! now advises a line that spans the subject, `by ID`.
 //!
+//! The statistic under a `correlation` line was blind in the same way: it paired
+//! within blocks only, so under `by OCC` it never took the cross-occasion pairs,
+//! and with one row per occasion it had none. Blocks that run in time are now one
+//! series, as occasions are, and the warning under such a line names `by ID` too.
+//!
 //! Every claim of the new text is run as a fit here, on
 //! `tests/data/dw_sequential_algebraic/` (24 subjects on one clock, a line in time
 //! with a subject intercept, AR(1) residuals with ρ = 0.7 across the whole subject;
@@ -25,16 +30,20 @@
 //! | data | line | OFV | DW | Durbin–Watson warning |
 //! |---|---|---|---|---|
 //! | sparse | none | −13.844880 | 0.9364 | the new advice |
-//! | sparse | `ar1(RHO) by OCC` | −13.844880 (10 ULP away) | `NaN` | none |
+//! | sparse | `ar1(RHO) by OCC` | −13.844880 (10 ULP away) | 0.9364 (was `NaN`) | "remains …", names `by ID` (was none) |
 //! | sparse | `ar1(RHO) by ID` | −50.043571 | 1.2346 | "remains … decorrelated by" |
 //! | rich | none | −105.896587 | 1.3318 | the new advice |
-//! | rich | `ar1(RHO) by OCC` | −142.124218 | 1.8384 | none |
+//! | rich | `ar1(RHO) by OCC` | −142.124218 | 1.6785 (was 1.8384) | none |
 //! | rich | `ar1(RHO) by ID` | −154.451388 | 1.7904 | none |
 //!
 //! Converged, sparse: no line −37.739613 (DW 0.9675, warns); `by OCC` −37.739613,
-//! ρ left at 0.3, DW `NaN`; `by ID` −124.232414, ρ̂ = 0.8152, DW 2.1623, silent.
+//! ρ left at 0.3, DW 0.9675 and the warning (was `NaN`, none); `by ID`
+//! −124.232414, ρ̂ = 0.8152, DW 2.1623, silent.
 //! Converged, rich: no line −206.449257 (DW 2.3365, the kappa absorbs it); `by OCC`
-//! −211.834593; `by ID` −246.651176.
+//! −211.834593, DW 2.1751, silent; `by ID` −246.651176.
+//!
+//! "Was" is the statistic split at every residual block, before this change joined
+//! blocks that run in time. No objective in these tables moved with it.
 
 use ferx_core::api::read_population_for;
 use ferx_core::parser::model_parser::parse_full_model;
@@ -243,15 +252,21 @@ fn occasions_in_time_are_advised_a_line_by_the_subject() {
 }
 
 /// "A line `by` the occasions themselves cannot model this: a block never joins
-/// rows of two occasions", with one row per occasion. The line `by OCC` leaves the
-/// objective of the model without it (to 10 ULP), the statistic has no pair
-/// (`NaN`) and the Durbin–Watson warning is gone; what speaks is
-/// `W_RESIDUAL_CORRELATION_INERT`. This is where the old advice led.
+/// rows of two occasions", with one row per occasion. This is where the old advice
+/// led. The line `by OCC` leaves the objective of the model without it (to 10 ULP)
+/// and `W_RESIDUAL_CORRELATION_INERT` says so.
 ///
-/// Not a mutation target of this change (no code here makes it true): it pins the
-/// fact the sentence states, so the sentence cannot outlive it.
+/// The statistic used to be `NaN` here and the Durbin–Watson warning gone, because
+/// it paired within blocks only. The blocks run in time, so it is now taken across
+/// them: `R` is diagonal, the decorrelated residuals are the IWRES, and the
+/// statistic is the one of the model without the line. The warning fires, says the
+/// statistic paired rows of consecutive blocks, and names the line `by ID`.
+///
+/// Mutations that must redden this: the block gate dropped from
+/// `split_by_residual_group` (`NaN`, no warning); `dw_across_blocks` always `None`
+/// (the warning loses its last two sentences).
 #[test]
-fn a_line_by_the_occasions_is_inert_with_one_row_each() {
+fn a_line_by_the_occasions_is_inert_and_the_warning_names_the_subject_line() {
     for g in [Grouping::IovColumn, Grouping::SingleLevel] {
         let without = evaluate(&model(g, ""), SPARSE);
         for kind in ["ar1", "car1"] {
@@ -265,12 +280,28 @@ fn a_line_by_the_occasions_is_inert_with_one_row_each() {
                 with.ofv, without.ofv, with.dw_statistic
             );
             assert_same_objective(with.ofv, without.ofv, &label);
-            assert!(with.dw_statistic.is_nan(), "{label}: {}", with.dw_statistic);
             assert!(
-                dw_warnings(&with).is_empty(),
-                "{label}: {:#?}",
-                with.warnings
+                with.dw_statistic.is_finite(),
+                "{label}: {}",
+                with.dw_statistic
             );
+            // Measured: the two agree in every printed digit (0.9363753830495355).
+            assert!(
+                (with.dw_statistic - without.dw_statistic).abs() < 1e-9,
+                "{label}: {} vs {}",
+                with.dw_statistic,
+                without.dw_statistic
+            );
+            let msg = the_dw_warning(&with, &label);
+            for must in [
+                format!("decorrelated by `correlation {kind}(RHO) by OCC`"),
+                "The blocks of this line follow one another in time".to_string(),
+                "the statistic also pairs rows of consecutive blocks".to_string(),
+                "A line `by ID` correlates all rows of one subject.".to_string(),
+            ] {
+                assert!(msg.contains(&must), "{label}: missing `{must}`: {msg}");
+            }
+            assert!(!msg.contains("by COL"), "{label}: {msg}");
             assert!(
                 with.warnings
                     .iter()
@@ -355,11 +386,19 @@ fn the_advised_line_fits_and_keeps_the_warning_live() {
 
 /// The same two lines with several rows per occasion, where `by OCC` is not inert:
 /// it models the pairs inside an occasion and none across. Both lines evaluated at
-/// the same parameters, the line `by ID` reaches the lower objective, and it keeps
-/// the cross-occasion pairs in the statistic where `by OCC` drops them.
+/// the same parameters, the line `by ID` reaches the lower objective.
 ///
-/// Measured (macOS arm64) at ρ = 0.3: no line −105.896587; `by OCC` −142.124218,
-/// 192 pairs; `by ID` −154.451388, 264 pairs.
+/// Measured (macOS arm64) at ρ = 0.3: no line −105.896587; `by OCC` −142.124218;
+/// `by ID` −154.451388. The statistic under `by OCC` is taken across its blocks,
+/// which run in time: 1.678494, where the split at the blocks gave 1.838370.
+///
+/// What this does **not** show: a warning. 1.68 is inside the band, and so is the
+/// converged fit (2.18). Three of a subject's eleven pairs cross an occasion, and
+/// the pooled statistic averages them with the eight the line models. The gap in
+/// the objective is the evidence here, not the statistic.
+///
+/// Mutation that must redden this: the block gate dropped (the statistic under
+/// `by OCC` reads 1.838370).
 #[test]
 fn with_several_rows_per_occasion_the_subject_line_reaches_further() {
     for g in [Grouping::IovColumn, Grouping::SingleLevel] {
@@ -381,12 +420,13 @@ fn with_several_rows_per_occasion_the_subject_line_reaches_further() {
             by_occ.ofv
         );
         assert!(by_occ.dw_statistic.is_finite() && by_id.dw_statistic.is_finite());
-        // 24 subjects × 12 rows: 11 pairs each across the subject, 4 × 2 inside
-        // the occasions. The two statistics are taken over different pairs.
+        // 0.16 separates the two splits; the bound leaves the platform 0.02.
         assert!(
-            (by_occ.dw_statistic - by_id.dw_statistic).abs() > 1e-3,
-            "{g:?}: the fixture must tell the two splits apart"
+            (by_occ.dw_statistic - 1.678494).abs() < 0.02,
+            "{g:?}: taken across the blocks, 1.678494; split at them, 1.838370; got {}",
+            by_occ.dw_statistic
         );
+        assert!(dw_warnings(&by_occ).is_empty(), "{:#?}", by_occ.warnings);
     }
 }
 
@@ -494,7 +534,20 @@ fn the_advised_line_converges_and_resolves_the_warning() {
     assert_eq!(dw_warnings(&without).len(), 1, "{:#?}", without.warnings);
     assert!((by_occ.ofv - without.ofv).abs() < 1e-4, "{}", by_occ.ofv);
     assert_eq!(rho(&by_occ), 0.3, "an inert ρ stays where it started");
-    assert!(by_occ.dw_statistic.is_nan());
+    // Inert, so its decorrelated residuals are the IWRES of the model without it:
+    // the same statistic (measured 0.9675346 both), and the warning names `by ID`.
+    assert!(by_occ.dw_statistic.is_finite());
+    assert!(
+        (by_occ.dw_statistic - without.dw_statistic).abs() < 1e-4,
+        "{} vs {}",
+        by_occ.dw_statistic,
+        without.dw_statistic
+    );
+    let msg = the_dw_warning(&by_occ, "converged by OCC");
+    assert!(
+        msg.contains("A line `by ID` correlates all rows of one subject."),
+        "{msg}"
+    );
     assert!(
         by_id.ofv < without.ofv - 50.0,
         "{} vs {}",
@@ -510,13 +563,16 @@ fn the_advised_line_converges_and_resolves_the_warning() {
     assert!(dw_warnings(&by_id).is_empty(), "{:#?}", by_id.warnings);
 
     // Three rows per occasion: `by OCC` is live, and `by ID` still reaches further
-    // (measured −211.834593 against −246.651176, a gap of 34.8).
+    // (measured −211.834593 against −246.651176, a gap of 34.8). The statistic under
+    // `by OCC`, taken across its blocks, is 2.175118: inside the band, no warning.
     let (_, rich_occ) = run(&model(g, "correlation ar1(RHO) by OCC"), RICH, 200);
     let (_, rich_id) = run(&model(g, "correlation ar1(RHO) by ID"), RICH, 200);
     eprintln!(
-        "converged, rich: by OCC {:.6} rho {:.6}; by ID {:.6} rho {:.6}",
+        "converged, rich: by OCC {:.6} rho {:.6} DW {:.6} {:?}; by ID {:.6} rho {:.6}",
         rich_occ.ofv,
         rho(&rich_occ),
+        rich_occ.dw_statistic,
+        dw_warnings(&rich_occ),
         rich_id.ofv,
         rho(&rich_id)
     );
