@@ -7838,6 +7838,19 @@ mod outer_fd_fallback {
         opts: &FitOptions,
         ib: usize,
     ) -> (f64, usize, f64, f64) {
+        gated_gradient_cell_twin(model, pop, opts, ib, true)
+    }
+
+    /// [`gated_gradient_cell`], with `twin_resolves = false` making every τ/100 re-solve read
+    /// as unresolved: what `inner_resolved` gives when one subject falls to Nelder–Mead or
+    /// stops unconverged there. The re-solves still run and are counted.
+    fn gated_gradient_cell_twin(
+        model: &CompiledModel,
+        pop: &Population,
+        opts: &FitOptions,
+        ib: usize,
+        twin_resolves: bool,
+    ) -> (f64, usize, f64, f64) {
         let params = &model.default_params;
         let x = pack_params(params);
         let bounds = compute_bounds(params);
@@ -7857,7 +7870,8 @@ mod outer_fd_fallback {
             let tol = stencil_inner_tol(opts.inner_tol);
             let tight = |xv: &[f64]| {
                 let (v, st) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
-                crate::estimation::fd_resolution::inner_resolved(&st).then_some(v)
+                (twin_resolves && crate::estimation::fd_resolution::inner_resolved(&st))
+                    .then_some(v)
             };
             let gated = central_diff_packed_gated(
                 &x,
@@ -7965,6 +7979,41 @@ mod outer_fd_fallback {
             assert!(
                 (gated - exact).abs() <= 1.01 * (ungated - exact).abs(),
                 "k={k:e}: gated {gated:e} vs ungated {ungated:e}, exact {exact:e}"
+            );
+        }
+    }
+
+    /// #2406 review r2: fixture B at `k = 1e-6` with the τ/100 twin unresolved at every floor,
+    /// off the optimum and at the stationary point. The gate learned nothing, so it must keep
+    /// the ungated difference, bit for bit: the same two τ probes at `floor0`. Returning the
+    /// cap's τ difference instead gave `k·g = −2.85e13` at both points, against an exact 13.3
+    /// and 1.1e-8 (TeunP, macOS arm64). Measured with the fix (macOS arm64): gated = ungated =
+    /// 13.339523609018514 off the optimum and −4.357688762219833e-6 at the stationary point,
+    /// 21 re-solves each (τ at all seven floors, and the first τ/100 probe at each).
+    #[test]
+    fn the_gradient_gate_without_a_resolved_twin_keeps_the_ungated_step() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let k = 1e-6;
+        for stationary in [false, true] {
+            let (mut m, p) = warfarin_scaled_v(k);
+            if stationary {
+                m.default_params.theta[1] = 7.611829143 * k;
+            }
+            let (gated, evals, ungated, exact) = gated_gradient_cell_twin(&m, &p, &opts, 1, false);
+            let (gated, ungated, exact) = (gated * k, ungated * k, exact * k);
+            eprintln!(
+                "MEASURE #2406 B no-twin stationary={stationary} k={k:e}: gated {gated:e} \
+                 [{evals} re-solves], ungated {ungated:e}, exact {exact:e}"
+            );
+            assert!(gated.is_finite() && ungated.is_finite());
+            assert_eq!(
+                gated.to_bits(),
+                ungated.to_bits(),
+                "stationary={stationary}: gated {gated:e} vs ungated {ungated:e}, exact {exact:e}"
             );
         }
     }

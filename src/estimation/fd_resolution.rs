@@ -139,23 +139,36 @@ fn accepts(loose: &Difference, tight: &Difference) -> bool {
 ///   way.
 ///
 /// Growth otherwise stops at floor 1 — the pre-#2187 step — or once the bounds clamp keeps the
-/// span from growing. There it returns the last difference it measured at any floor, τ/100
-/// where it existed, else τ, so a probe that goes missing only at the larger floors (a volume
-/// stepped through zero) keeps what the smaller ones resolved. `None` only when no floor gave
-/// one (the caller's own fallback for a missing probe takes over).
+/// span from growing. There it returns the last τ/100 difference measured at any floor, so a
+/// probe that goes missing only at the larger floors (a volume stepped through zero) keeps what
+/// the smaller ones resolved. A τ difference alone is no evidence about the step: with no τ/100
+/// difference at any floor it returns `floor0`'s τ difference, the ungated value, and does not
+/// move the step. On a `V = TVV/k` volume at `k = 1e-6` with the twin missing everywhere,
+/// returning the cap's τ difference instead gave `k·g = −2.85e13` against an exact 13.3
+/// (#2406 review r2). `None` only when `floor0`'s τ probe is missing and no floor gave a τ/100
+/// difference (the caller's own fallback for a missing probe takes over, at `floor0`).
 pub(crate) fn resolve_floored_step(
     floor0: f64,
     mut diff: impl FnMut(f64, bool) -> Option<Difference>,
 ) -> Option<Resolved> {
     let mut floor = floor0;
     let mut prev_span = 0.0_f64;
-    // The last difference measured at any floor, and the previous floor's τ/100 difference
-    // with its resolution error and floor (`None` where that floor had no τ/100 difference).
-    let mut last: Option<Resolved> = None;
+    // `floor0`'s τ difference, the last τ/100 difference measured at any floor, and the
+    // previous floor's τ/100 difference with its resolution error and floor (`None` where that
+    // floor had no τ/100 difference).
+    let mut first_loose: Option<Resolved> = None;
+    let mut last_tight: Option<Resolved> = None;
     let mut prev_tight: Option<(f64, f64, f64)> = None;
     loop {
         let mut clamped = false;
         if let Some(l) = diff(floor, false) {
+            if floor == floor0 {
+                first_loose = Some(Resolved {
+                    value: l.value,
+                    floor,
+                    stop: Stop::RanOut,
+                });
+            }
             match diff(floor, true) {
                 Some(t) => {
                     // Bit-identical: the τ/100 solve stopped where the τ one did, so their
@@ -182,20 +195,15 @@ pub(crate) fn resolve_floored_step(
                         });
                     }
                     prev_tight = Some((t.value, err, floor));
-                    last = Some(Resolved {
+                    last_tight = Some(Resolved {
                         value: t.value,
                         floor,
                         stop: Stop::RanOut,
                     });
                 }
-                None => {
-                    prev_tight = None;
-                    last = Some(Resolved {
-                        value: l.value,
-                        floor,
-                        stop: Stop::RanOut,
-                    });
-                }
+                // A missing twin keeps the earlier τ/100 difference: this floor's τ one is
+                // no evidence that the step should move.
+                None => prev_tight = None,
             }
             clamped = l.span <= prev_span;
             prev_span = l.span;
@@ -204,7 +212,7 @@ pub(crate) fn resolve_floored_step(
             prev_tight = None;
         }
         if floor >= 1.0 || clamped {
-            return last;
+            return last_tight.or(first_loose);
         }
         floor = (floor * STEP_GROWTH).min(1.0);
     }
@@ -324,7 +332,9 @@ mod tests {
     }
 
     /// A τ/100 solve that is unresolved — Nelder–Mead, or not converged — is not an
-    /// agreement: the step grows past it, and at the cap the τ difference is returned.
+    /// agreement: the step grows past it. With the twin unresolved at every floor the gate
+    /// learned nothing, so it returns `floor0`'s τ difference, the ungated value, not the cap's
+    /// (#2406 review r2). The τ difference moves with the floor, so the two are told apart.
     #[test]
     fn an_unresolved_twin_grows_the_step() {
         let (r, _) = run(1e-3, |fl, tight| {
@@ -334,14 +344,49 @@ mod tests {
         assert_eq!(r.stop, Stop::Accepted);
         assert_eq!(r.floor, 1e-2);
 
-        let (r, _) = run(1e-3, |fl, tight| (!tight).then(|| diff(5.0, fl)));
+        let (r, asked) = run(1e-3, |fl, tight| (!tight).then(|| diff(5.0 + fl, fl)));
         let r = r.unwrap();
         assert_eq!(r.stop, Stop::RanOut);
         assert_eq!(
             (r.floor, r.value),
-            (1.0, 5.0),
-            "the cap falls back to the τ difference"
+            (1e-3, 5.0 + 1e-3),
+            "no twin anywhere keeps floor 0's τ difference"
         );
+        assert_eq!(loose_floors(&asked), [1e-3, 1e-2, 1e-1, 1.0]);
+    }
+
+    /// #2406 review r2: a twin that goes missing at the larger floors, while their τ probes
+    /// still exist, does not replace the τ/100 difference a smaller floor measured with a
+    /// larger floor's τ one. Without the rule the cap's τ difference, 3.0, came back.
+    #[test]
+    fn a_twin_missing_at_the_larger_floors_keeps_the_earlier_tight_difference() {
+        let (r, asked) = run(1e-3, |fl, tight| {
+            if tight {
+                (fl < 5e-2).then(|| diff(2.0, fl))
+            } else {
+                Some(diff(if fl < 5e-2 { 2.5 } else { 3.0 }, fl))
+            }
+        });
+        let r = r.unwrap();
+        assert_eq!(r.stop, Stop::RanOut);
+        assert_eq!(
+            (r.floor, r.value),
+            (1e-2, 2.0),
+            "the last τ/100 difference measured"
+        );
+        assert_eq!(loose_floors(&asked), [1e-3, 1e-2, 1e-1, 1.0]);
+    }
+
+    /// With `floor0`'s τ probe missing and no twin anywhere, a larger floor's τ difference is
+    /// still no evidence: the gate returns `None`, and the caller's own missing-probe fallback
+    /// runs at `floor0`, as on the ungated path.
+    #[test]
+    fn no_floor0_probe_and_no_twin_returns_none() {
+        let (r, asked) = run(1e-3, |fl, tight| {
+            (!tight && fl > 5e-3).then(|| diff(5.0, fl))
+        });
+        assert_eq!(r, None);
+        assert_eq!(loose_floors(&asked), [1e-3, 1e-2, 1e-1, 1.0]);
     }
 
     /// Once the bounds clamp holds the probes' span, a larger floor is the same step:

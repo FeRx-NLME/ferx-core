@@ -1725,7 +1725,8 @@ pub(super) type TightOfv<'a> = &'a (dyn Fn(&[f64]) -> Option<f64> + Sync);
 /// diagonal of every free coordinate whose floor is below 1 (#2406); without `tight` no
 /// coordinate is gated. A gated coordinate's step grows until its second difference is
 /// resolved, the off-diagonal pairs it enters are taken at that grown step, and its diagonal
-/// entry is the τ/100 second difference.
+/// entry is the τ/100 second difference. Where no step had a τ/100 one, the step stays at its
+/// floor and the entry is the τ second difference there.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn fd_ofv_hessian_gated<F: Fn(&[f64]) -> f64 + Sync>(
     n: usize,

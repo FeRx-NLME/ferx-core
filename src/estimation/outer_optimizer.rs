@@ -10206,6 +10206,7 @@ fn reporting_fd_gradient(
 /// [`resolve_floored_step`](crate::estimation::fd_resolution::resolve_floored_step) (#2406):
 /// `tight` is `eval` re-solved at τ/100, `None` where a solve fell to Nelder–Mead or did not
 /// converge, and the step grows ×10 until the two agree or growth runs into truncation error.
+/// A coordinate whose `tight` was `None` at every floor keeps its first step's difference.
 /// Without `tight` no coordinate is gated, and a floor-1 coordinate takes the ungated difference
 /// either way. A floored one for which no floor gave a difference takes the ungated difference
 /// at its own floor, with its one-sided fallback — the covariance gate's fallback too. Floor 1
