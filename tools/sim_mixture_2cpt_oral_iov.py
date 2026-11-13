@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Simulate a two-compartment oral population with a lag, IOV on CL and a two-class mixture.
 
-The fixture for the mixture outer-optimizer measurements (`optimizer = auto` picks BOBYQA for
-every mixture model). Fitted by examples/mixture_2cpt_oral_iov.ferx.
+The fixture for the mixture outer-optimizer measurements of #2739 (BOBYQA, the old
+`optimizer = auto` choice for every mixture model, against L-BFGS, the new one). Fitted by
+examples/mixture_2cpt_oral_iov.ferx.
 
 Model, per subject i in latent class k (class 1 with probability P1), occasion o:
     CL = TVCL_k · exp(ETA_CL + KAPPA_CL[o]),  V1 = TVV1 · exp(ETA_V1),

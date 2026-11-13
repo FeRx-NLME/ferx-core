@@ -157,13 +157,13 @@ pub fn gradient_method_outer(
             //
             // `resolve_outer_optimizer`, not `resolve_fit_optimizer`: this report is
             // **model-level** and takes no population, so it cannot see whether a mixture's
-            // classes start indistinguishable (where `auto` runs BOBYQA, #2739). On such a fit
-            // this reads `analytic (…)` while `FitResult::optimizer` reads `auto (bobyqa)`.
-            // That is the same model-level-versus-run split `gradient_method_outer` already
-            // carries for a per-subject FD fallback — see
-            // `tests/outer_gradient_fd_fallback_warning.rs`, whose
-            // `out_of_scope_subject_warns_while_the_report_still_says_analytic` pins it — and
-            // the FD-fallback warning, not this field, is what reports the run.
+            // classes start indistinguishable (where `auto` runs BOBYQA, #2739). `fit()` passes
+            // the optimizer `resolve_fit_optimizer` already resolved for its label, which this
+            // call returns unchanged, so on such a fit both fields describe BOBYQA (#2749
+            // review row 2). A per-subject FD fallback is a different, run-time split this
+            // field still does not see — `tests/outer_gradient_fd_fallback_warning.rs`'s
+            // `out_of_scope_subject_warns_while_the_report_still_says_analytic` pins it, and the
+            // FD-fallback warning, not this field, is what reports the run.
             let analytic =
                 crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction);
             let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(

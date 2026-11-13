@@ -76,15 +76,17 @@ $$
 with class-$k$ parameters and a **separate empirical Bayes solve per
 (subject × class)**. The mixing-logit coefficients are ordinary thetas and any
 per-class $\Omega$/$\Sigma$ are estimated jointly. The outer gradient is analytic and
-posterior-weighted, exact also under IOV and with a block (correlated) $\Omega$, with an
-automatic finite-difference fallback for subjects outside analytic scope; `MIXNUM`-branched
-typical values are in scope. So `optimizer = auto` runs L-BFGS on a mixture as on any other
-model in that scope, and an explicit NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is
-honoured. The exception is a start whose classes are indistinguishable (the same mixing
-probability and the same objective under every class), where no gradient optimizer can
-separate them. `auto` runs BOBYQA there and warns `W_MIXTURE_SYMMETRIC_START`; see
-[mixture models](optimizers.qmd#auto-mixture) on the optimizers page, which has the
-measurements. Give the classes different initial values. The check is exact, so classes
+posterior-weighted, exact also under IOV and with a block (correlated) $\Omega$;
+`MIXNUM`-branched typical values are in scope. If any subject or class is outside that
+scope, the **whole** gradient falls back to finite differences, re-solving every subject,
+with no warning. So `optimizer = auto` runs L-BFGS on a mixture as on any other model in
+that scope, and an explicit NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured.
+The exception is a start where two classes are indistinguishable (every subject has the
+same mixing probability and the same objective under both), where no gradient optimizer
+can separate them. `auto` runs BOBYQA there and warns `W_MIXTURE_SYMMETRIC_START`, naming
+the pair; see [mixture models](optimizers.qmd#auto-mixture) on the optimizers page, which
+has the measurements and the cost of the finite-difference fallback. Give the two classes
+different initial values. The check is exact, so classes
 that start only close to each other are fitted with L-BFGS without a warning; if a fit
 ends with two nearly merged classes, refit from different class starts or set
 `optimizer = bobyqa`.
