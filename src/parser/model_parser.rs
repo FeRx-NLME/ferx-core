@@ -30230,8 +30230,8 @@ fn eval_bytecode_lanes<L: Lane>(
                 a.rem_euclid(b)
             }),
             Op::Exp => unary!(|v| v.exp()),
-            Op::Ln => unary!(|v| (if v >= 1e-30 { v } else { 1e-30 }).ln()),
-            Op::Sqrt => unary!(|v| (if v >= 0.0 { v } else { 0.0 }).sqrt()),
+            Op::Ln => unary!(|v| crate::sens::num::PkNum::guard_floor(v, 1e-30).ln()),
+            Op::Sqrt => unary!(|v| crate::sens::num::PkNum::guard_floor(v, 0.0).sqrt()),
             Op::Abs => unary!(|v| v.abs()),
             Op::Floor => unary!(|v| v.floor()),
             Op::Ceil => unary!(|v| v.ceil()),

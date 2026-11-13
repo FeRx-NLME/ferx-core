@@ -37318,6 +37318,35 @@ fn bytecode_lanes_are_bit_identical_scalar_evaluations() {
     assert!(eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut stack).is_none());
 }
 
+/// The bytecode VM floors `sqrt` and `ln` through the scalar `guard_floor`, so it gives a zero
+/// the same sign as every other route (`sqrt(-0.0)` is `-0.0`) on one lane and on four, and
+/// `NaN` and a negative floor to `+0.0` / `ln(1e-30)`. The ODE routes are pinned by
+/// `sqrt_of_a_signed_zero_has_one_sign_on_every_route`; this is the evaluator behind
+/// `eval_bytecode`.
+#[test]
+fn bytecode_guards_keep_the_sign_of_a_zero_on_every_lane_count() {
+    let inputs = [-0.0, 0.0, -1.0, f64::NAN];
+    for (f, want) in [
+        ("sqrt", [(-0.0f64).to_bits(), 0, 0, 0]),
+        ("ln", [(1e-30f64).ln().to_bits(); 4]),
+    ] {
+        let bc = compile_bytecode(&unary(f, varidx(0)));
+        let vars = vec![inputs];
+        let lanes = eval_bytecode_lanes(&bc, &[], &[], &[], &vars, &[], &mut Vec::new())
+            .expect("one op cannot split the lanes");
+        for (l, &x) in inputs.iter().enumerate() {
+            let one = eval_bytecode(&bc, &[], &[], &[], &[x], &[], &mut Vec::new());
+            assert_eq!(one.to_bits(), want[l], "{f}({x:?}), one lane: {one:?}");
+            assert_eq!(
+                lanes[l].to_bits(),
+                want[l],
+                "{f}({x:?}), lane {l}: {:?}",
+                lanes[l]
+            );
+        }
+    }
+}
+
 // ── #1691: the log-normal η-chain gate and an η-free definition it replaces ──
 
 /// The #1691 probe table, each row with the gate's answer and whether the

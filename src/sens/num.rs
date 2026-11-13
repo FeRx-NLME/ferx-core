@@ -127,8 +127,9 @@ pub trait PkNum:
     /// `acos` (3-cpt trigonometric cubic root solve).
     fn acos(self) -> Self;
     /// Lower-clamp the value to `lo` (branch on `.val()`), used by the bytecode
-    /// VM to reproduce the `Op::Ln`/`Op::Sqrt` domain guards (`v.max(lo)`) before
-    /// the transcendental call. For duals the clamped region is flat (zero jet).
+    /// VM to reproduce the `Op::Ln`/`Op::Sqrt` domain guards before the
+    /// transcendental call: `self` when `self >= lo`, else `lo`, so a `NaN` floors and
+    /// a zero at `lo = 0` keeps its sign. For duals the clamped region is flat (zero jet).
     fn guard_floor(self, lo: f64) -> Self;
     /// `ln Γ(self)` (log-gamma). The transit absorption forcing's `ln Γ(n + 1)`
     /// constant rides this on the analytic ODE sensitivity path, so for the dual
@@ -481,7 +482,7 @@ macro_rules! impl_pknum_delegate {
             #[inline]
             fn guard_floor(self, lo: f64) -> Self {
                 // `!(value >= lo)` (not `value < lo`) so a `NaN` value floors too,
-                // matching `f64::max(lo)` on the scalar path (`NaN.max(lo) == lo`) —
+                // matching the scalar `guard_floor` (`NaN` floors to `lo`) —
                 // otherwise a transient `NaN` would give a finite f64 prediction but a
                 // `NaN` dual gradient (the clamped region is flat, so the floored jet
                 // is zero) (#430).
@@ -987,7 +988,7 @@ mod tests {
     }
 
     /// `guard_floor(NaN)` must floor (return `lo`) on the duals exactly as it does on
-    /// `f64` (`NaN.max(lo) == lo`) — a sub-floor / `NaN` value lands in the flat
+    /// `f64` — a sub-floor / `NaN` value lands in the flat
     /// clamped region, so the dual's value is `lo` and its jet is zero. Without this,
     /// a transient `NaN` would give a finite f64 prediction but a `NaN` dual gradient
     /// (#430 review #2).
@@ -1008,24 +1009,32 @@ mod tests {
         assert_eq!(Dual1::<1>::var(5.0, 0).guard_floor(lo).value, 5.0);
     }
 
-    /// A zero at the floor keeps its sign on `f64` and on the duals alike (`f64::max` does
-    /// not promise that: it gives `+0.0` for `(-0.0).max(0.0)` on arm64), so `sqrt(-0.0)` is
-    /// `-0.0` on every route and not a per-platform answer.
+    /// A zero at the floor keeps its sign on `f64` and on every tape-free dual alike
+    /// (`f64::max` does not promise that: it gives `+0.0` for `(-0.0).max(0.0)` on arm64), so
+    /// `sqrt(-0.0)` is `-0.0` on every route and not a per-platform answer. The taped `R`
+    /// needs a recording and is not checked here.
     #[test]
     fn guard_floor_keeps_the_sign_of_a_zero_at_the_floor() {
-        assert!((-0.0f64).guard_floor(0.0).is_sign_negative());
-        assert!(0.0f64.guard_floor(0.0).is_sign_positive());
-        assert!(Dual1::<1>::var(-0.0, 0)
-            .guard_floor(0.0)
-            .value
-            .is_sign_negative());
-        assert!(Dual2::<1>::var(-0.0, 0)
-            .guard_floor(0.0)
-            .value
-            .is_sign_negative());
-        // Below the floor and `NaN` still land on `+lo`.
-        assert!((-1.0f64).guard_floor(0.0).is_sign_positive());
-        assert_eq!(f64::NAN.guard_floor(0.0), 0.0);
+        fn signs<T: PkNum>(name: &str) {
+            let z = |x: f64| T::var(x, 0).guard_floor(0.0).val();
+            assert!(z(-0.0).is_sign_negative(), "{name}: -0.0 keeps its sign");
+            assert!(z(0.0).is_sign_positive(), "{name}: +0.0 keeps its sign");
+            // Below the floor and `NaN` still land on `+lo`.
+            assert!(
+                z(-1.0).is_sign_positive(),
+                "{name}: below the floor is +0.0"
+            );
+            assert!(z(f64::NAN).to_bits() == 0, "{name}: NaN floors to +0.0");
+        }
+        signs::<f64>("f64");
+        signs::<Dual1<1>>("Dual1");
+        signs::<Dual2<1>>("Dual2");
+        signs::<DualMixed<1, 2>>("DualMixed");
+        signs::<crate::sens::vtape::DualV<1, 1, false>>("DualV");
+        signs::<crate::sens::vfree::DualF<1, 1>>("DualF");
+        signs::<crate::sens::taylor::Taylor<1, 3, 4>>("Taylor");
+        signs::<crate::sens::rtape::DualT<1, f64>>("DualT");
+        signs::<crate::sens::rtape::DualH<1, 1, f64, false>>("DualH");
     }
 
     /// The `ln_gamma` `Dual2` rule: its analytic 1st (digamma) and 2nd (trigamma)

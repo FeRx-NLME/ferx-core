@@ -1412,7 +1412,6 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
         ("  d/dt(x1) = tanh(x1)", "`tanh`", "`d/dt(x1)`"),
         ("  d/dt(x1) = inv_logit(x1)", "`inv_logit`", "`d/dt(x1)`"),
         ("  d/dt(x1) = logit(x1)", "`logit`", "`d/dt(x1)`"),
-        ("  d/dt(x1) = tanh(x1)", "`tanh`", "`d/dt(x1)`"),
         ("  d/dt(x1) = softplus(x1)", "`softplus`", "`d/dt(x1)`"),
         ("  d/dt(x1) = sin(x1)", "`sin`", "`d/dt(x1)`"),
         ("  d/dt(x1) = cos(x1)", "`cos`", "`d/dt(x1)`"),
@@ -1732,6 +1731,11 @@ fn sqrt_derivatives_match_finite_differences() {
         [3.0, 1.4, 1.6, 0.9, 0.6, 1.3],
     ];
     let f = |x: &[f64; 6]| rhs_at(&prog, reg, x, &|v, _| v);
+    // The `DualF` leg runs the native code, not the register code it falls back to.
+    assert!(
+        reg.has_native::<DualF<6, 21>>(),
+        "the DualF leg runs native"
+    );
     let h = 1e-5;
     let h2 = 1e-4;
     let mut worst_g = 0.0f64;
@@ -1795,6 +1799,15 @@ fn sqrt_derivatives_match_finite_differences() {
             out_bar[o * 2] = 1.0;
             let (adj, _) =
                 taped_leaf_adjoints::<1, 0, false>(reg, (&x[..3], &p, &s), &out_bar, true);
+            // The leg recorded one block: a tape shorter than the per-operation one, which
+            // `record_rhs` declining would leave it as.
+            let block_len = crate::sens::vtape::vtape_len();
+            taped_leaf_adjoints::<1, 0, false>(reg, (&x[..3], &p, &s), &out_bar, false);
+            assert!(
+                block_len < crate::sens::vtape::vtape_len(),
+                "the taped leg recorded a block: {block_len} vs {} per operation",
+                crate::sens::vtape::vtape_len()
+            );
             for i in [0, 2, 3, 4, 5] {
                 let fd = (step(&[(i, h)])[o] - step(&[(i, -h)])[o]) / (2.0 * h);
                 let got = adj[leaf_of(i) * 2];

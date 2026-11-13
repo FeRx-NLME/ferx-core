@@ -497,9 +497,9 @@ inline `if` now costs what the hand rewrite did.
 #### Square root {#native-sqrt}
 
 `sqrt` is compiled like `exp` and `ln` (#2844). Its argument is floored at zero first, as
-everywhere else in the model language, so a slightly negative value from rounding gives `0`
-instead of a `NaN`, and the floor keeps the sign of a zero (`sqrt(-0.0)` is `-0.0` on every
-engine). Before this a block containing `sqrt` stayed on the interpreter; the free-drug
+everywhere else in the model language, so a slightly negative value from rounding gives a
+prediction of `0` instead of a `NaN`, and the floor keeps the sign of a zero (`sqrt(-0.0)` is
+`-0.0` on every engine). Before this a block containing `sqrt` stayed on the interpreter; the free-drug
 quadratic of a quasi-steady-state TMDD model is written with one.
 
 A synthetic 24-subject quasi-steady-state TMDD model with that quadratic written as
@@ -520,9 +520,8 @@ The objective is identical across builds and forms at each point. An evaluation 
 form now costs 0.6 of the `^0.5` form; before, it cost 1.4–1.6 times as much. A full fit of the
 `sqrt` form goes from 13.9 s to 4.3 s at the same OFV (−34.2661). Do not compare the two forms
 by full-fit time: their objectives differ in the seventh significant digit from the second
-evaluation on,
-so the optimizer takes a different path for each, and which form is faster to convergence
-depends on the path, not on the cost of an evaluation.
+evaluation on, so the optimizer takes a different path for each, and which form is faster to
+convergence depends on the path, not on the cost of an evaluation.
 
 #### Which engine ran it {#rhs-route-note}
 

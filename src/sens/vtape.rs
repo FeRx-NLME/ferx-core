@@ -1179,7 +1179,7 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
     }
     // Mirrored by hand in `parser/rhs_ir.rs` (the ODE RHS's scalar code): edit both.
     fn guard_floor(self, lo: f64) -> Self {
-        // `!(v >= lo)` floors a NaN too, matching `f64::max` on the value path.
+        // `!(v >= lo)` floors a NaN too, matching the scalar `guard_floor` on the value path.
         if !(self.v >= lo) {
             DualV::constant(lo)
         } else {
