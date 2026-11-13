@@ -4522,16 +4522,19 @@ fn settle_start_probe(
 ///   finished and the probe's is the better fit. Unlike the first attempt's (#2506), this is
 ///   no stall to keep flagged: the restart's start is the previous leg's estimates, not the
 ///   user's, and a fit does not publish a point worse than one it already reached.
-/// - `None` — the restart, unconverged as its own rule left it.
+/// - `None` — the restart, unconverged as its own rule left it. A probe the budget cut before
+///   its verdict hands on the spent budget and its advice.
 ///
 /// Every probe's evaluations count in `n_iterations`, whichever result is kept. No probe ran
 /// (`probed` is `None`) unless the restart did not leave its start and displacement was all
-/// its acceptance rule rejected it on.
+/// its acceptance rule rejected it on. Returns the result, the restart cause, whether the
+/// reported point is the probe's, and whether the probe verified the point (`Some(true)`),
+/// which lets a mid-descent restart that ties its stalled leg be adopted.
 fn settle_restart_probe(
     restarted: (OuterResult, Option<RestartCause>),
     probed: Option<ProbedAttempt>,
     penalized: impl Fn(&OuterResult) -> f64,
-) -> (OuterResult, Option<RestartCause>, bool) {
+) -> (OuterResult, Option<RestartCause>, bool, bool) {
     let (mut restarted, cause) = restarted;
     match probed {
         Some((found, found_cause, Some(true))) => {
@@ -4545,19 +4548,43 @@ fn settle_restart_probe(
                 verified_start_result(found, left, restarted, start_wins),
                 found_cause,
                 !start_wins,
+                true,
             )
         }
         Some((mut found, found_cause, Some(false))) => {
             found.start_eval = restarted.start_eval;
             found.n_iterations += restarted.n_iterations;
-            (found, found_cause, true)
+            (found, found_cause, true, false)
         }
         Some((spent, _, None)) => {
             restarted.n_iterations += spent.n_iterations;
-            (restarted, cause, false)
+            // A probe cut by the budget before its verdict spent the rest of this fit's: the
+            // restart's own leg stopped short of it, so the spent budget and the advice the
+            // probe was given are the fit's (#2821 review r1).
+            if spent.eval_budget_spent && !restarted.eval_budget_spent {
+                restarted.eval_budget_spent = true;
+                restarted.warnings.extend(
+                    spent
+                        .warnings
+                        .into_iter()
+                        .filter(|w| w.starts_with(EVAL_BUDGET_WARNING_HEAD)),
+                );
+            }
+            (restarted, cause, false, false)
         }
-        None => (restarted, cause, false),
+        None => (restarted, cause, false, false),
     }
+}
+
+/// The opening of [`eval_budget_warning`], which a result's warnings are matched on.
+const EVAL_BUDGET_WARNING_HEAD: &str = "Outer optimization hit the evaluation budget";
+
+/// The warning an NLopt run that spent its evaluation budget unconverged carries.
+fn eval_budget_warning(outer_maxiter: usize) -> String {
+    format!(
+        "{EVAL_BUDGET_WARNING_HEAD} (maxiter = {outer_maxiter}) before converging; increase \
+         maxiter for a tighter fit."
+    )
 }
 
 /// The result reported for a start the probe verified (#2506): the probe's `converged`
@@ -5642,7 +5669,7 @@ pub(crate) fn optimize_nlopt(
             true,
             probe.map(|p| (p, ProbeWhen::DisplacementAloneRejects)),
         );
-        let (mut restarted, restarted_cause, from_probe) = settle_restart_probe(
+        let (mut restarted, restarted_cause, from_probe, verified) = settle_restart_probe(
             (restarted, restarted_outcome.restart_cause()),
             probe.and_then(|_| probed.take()),
             &penalized,
@@ -5670,7 +5697,7 @@ pub(crate) fn optimize_nlopt(
                 }
             });
         }
-        (restarted, restarted_cause)
+        (restarted, restarted_cause, verified)
     };
     // The probe. With `chain`, its leg runs the fit's own restart chain
     // ([`resolve_restart_chain`]) before its verdict is read (#2707): from a perturbation of
@@ -5807,13 +5834,14 @@ pub(crate) fn optimize_nlopt(
 /// share one evaluation budget (`RestartLeg::spent_evals`), and a restarted leg's own
 /// `basin_shift` already requires budget left, so the total stays bounded by `outer_maxiter`.
 /// A mid-descent stall keeps its single restart: a second stall reports as a stall. `restart`
-/// returns the restarted result and the restart cause *its* leg ended with. Pure, like
+/// returns the restarted result, the restart cause *its* leg ended with, and whether its start
+/// probe verified it (a tie then adopts it). Pure, like
 /// [`resolve_mid_descent_restart_adopting`], so every branch is unit-testable without NLopt.
 fn resolve_restart_chain<T>(
     verbose: bool,
     cancelled: bool,
     first: (T, Option<RestartCause>),
-    mut restart: impl FnMut(&T, RestartCause) -> (T, Option<RestartCause>),
+    mut restart: impl FnMut(&T, RestartCause) -> (T, Option<RestartCause>, bool),
     ofv_of: impl Fn(&T) -> f64,
 ) -> T {
     let (mut current, mut cause) = first;
@@ -5825,9 +5853,9 @@ fn resolve_restart_chain<T>(
             cancelled,
             (current, cause),
             |stalled, c| {
-                let (restarted, its_cause) = restart(stalled, c);
+                let (restarted, its_cause, verified) = restart(stalled, c);
                 next_cause = its_cause;
-                restarted
+                (restarted, verified)
             },
             &ofv_of,
         );
@@ -5925,8 +5953,8 @@ const MAX_BASIN_RESTARTS: usize = 3;
 ///   `outer_maxiter` the way any single run is — `maxeval` is a soft bound for
 ///   L-BFGS, checked between line searches, so a few evals of overshoot are
 ///   possible on either leg;
-/// - the restart is adopted only on a **strictly lower** penalized objective.
-///   Unlike the `left_init` retry above there is no second condition to check:
+/// - the restart is adopted only on a **strictly lower** penalized objective
+///   (a tie only in the two cases below). Unlike the `left_init` retry above there is no second condition to check:
 ///   this attempt starts *at* the reported point, so anywhere it ends is
 ///   somewhere the fit genuinely reached; and
 /// - `cancelled` short-circuits it, because a cancelled run stops through the
@@ -5960,18 +5988,21 @@ const MAX_BASIN_RESTARTS: usize = 3;
 /// [`ebe_basin_shift_warning`]), and a restart that starts at that point and cannot
 /// improve on it is the evidence that the point is a minimum of the reported objective
 /// after all — so its own verdict is the honest one to report. It still never reports a
-/// higher objective, for the same reason as the stall case.
+/// higher objective, for the same reason as the stall case. A mid-descent restart its start
+/// probe verified (#2707) takes a tie the same way: the probe came back to its point, which
+/// is the same evidence, and dropping it would discard that verdict and the probe's
+/// evaluations with it.
 ///
 /// Pulled out as a pure fn — `restart` is handed the stalled result and returns
-/// its successor — so every branch is unit-testable without driving two NLopt
-/// fits.
+/// its successor, and whether its probe verified it — so every branch is unit-testable
+/// without driving two NLopt fits.
 ///
 /// Returns the reported result and whether it is the restart's (adopted).
 fn resolve_mid_descent_restart_adopting<T>(
     verbose: bool,
     cancelled: bool,
     first: (T, Option<RestartCause>),
-    restart: impl FnOnce(&T, RestartCause) -> T,
+    restart: impl FnOnce(&T, RestartCause) -> (T, bool),
     ofv_of: impl Fn(&T) -> f64,
 ) -> (T, bool) {
     let (first, cause) = first;
@@ -5981,7 +6012,7 @@ fn resolve_mid_descent_restart_adopting<T>(
     if cancelled {
         return (first, false);
     }
-    let second = restart(&first, cause);
+    let (second, verified) = restart(&first, cause);
     // `ofv_is_valid` before the comparison, not `<` alone. A strict `<` rejects
     // `NaN` and `+inf` for free but **adopts `−inf`**, and a restart can return a
     // non-finite objective the same way any run can — `gate_converged_on_objective`
@@ -5992,10 +6023,12 @@ fn resolve_mid_descent_restart_adopting<T>(
     // (#1277 review).
     let second_ofv = ofv_of(&second);
     let first_ofv = ofv_of(&first);
+    let ties_go_to_the_restart = verified || cause == RestartCause::BasinShift;
     let adopt = ofv_is_valid(second_ofv)
-        && match cause {
-            RestartCause::MidDescent => second_ofv < first_ofv,
-            RestartCause::BasinShift => second_ofv <= first_ofv,
+        && if ties_go_to_the_restart {
+            second_ofv <= first_ofv
+        } else {
+            second_ofv < first_ofv
         };
     if !adopt {
         return (first, false);
@@ -6013,7 +6046,8 @@ fn resolve_mid_descent_restart_adopting<T>(
     (second, true)
 }
 
-/// [`resolve_mid_descent_restart_adopting`] without the flag: the form the unit tests read.
+/// [`resolve_mid_descent_restart_adopting`] without the flags, for an unprobed restart: the
+/// form the unit tests read.
 #[cfg(test)]
 fn resolve_mid_descent_restart<T>(
     verbose: bool,
@@ -6022,7 +6056,14 @@ fn resolve_mid_descent_restart<T>(
     restart: impl FnOnce(&T, RestartCause) -> T,
     ofv_of: impl Fn(&T) -> f64,
 ) -> T {
-    resolve_mid_descent_restart_adopting(verbose, cancelled, first, restart, ofv_of).0
+    resolve_mid_descent_restart_adopting(
+        verbose,
+        cancelled,
+        first,
+        |stalled, cause| (restart(stalled, cause), false),
+        ofv_of,
+    )
+    .0
 }
 
 /// The stall-retry decision behind [`optimize_nlopt`], factored out of the fit
@@ -8758,11 +8799,7 @@ fn optimize_nlopt_attempt_probed(
     // warning below. There is no automatic second optimization — a user who wants
     // SLSQP sets `optimizer = slsqp` as the primary (issue #657).
     if max_eval_reached && budget_advice_applies {
-        warnings.push(format!(
-            "Outer optimization hit the evaluation budget (maxiter = {}) before \
-             converging; increase maxiter for a tighter fit.",
-            options.outer_maxiter,
-        ));
+        warnings.push(eval_budget_warning(options.outer_maxiter));
         if options.verbose {
             eprintln!(
                 "NLopt hit the evaluation budget (maxiter = {}) without converging — \

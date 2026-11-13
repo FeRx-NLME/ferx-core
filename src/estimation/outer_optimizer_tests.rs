@@ -11067,9 +11067,9 @@ fn the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall() 
     // Three basin shifts, then a clean leg: four legs, the last one reported.
     let calls = Cell::new(0);
     let legs = [
-        (-20.0, Some(RestartCause::BasinShift)),
-        (-30.0, Some(RestartCause::BasinShift)),
-        (-40.0, None),
+        (-20.0, Some(RestartCause::BasinShift), false),
+        (-30.0, Some(RestartCause::BasinShift), false),
+        (-40.0, None, false),
     ];
     let got = resolve_restart_chain(
         false,
@@ -11093,7 +11093,7 @@ fn the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall() 
         (0.0, Some(RestartCause::BasinShift)),
         |prev: &f64, _| {
             calls.set(calls.get() + 1);
-            (prev - 1.0, Some(RestartCause::BasinShift))
+            (prev - 1.0, Some(RestartCause::BasinShift), false)
         },
         ofv,
     );
@@ -11108,7 +11108,7 @@ fn the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall() 
         (-10.0, Some(RestartCause::BasinShift)),
         |_: &f64, _| {
             calls.set(calls.get() + 1);
-            (-5.0, Some(RestartCause::BasinShift))
+            (-5.0, Some(RestartCause::BasinShift), false)
         },
         ofv,
     );
@@ -11127,7 +11127,7 @@ fn the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall() 
             } else {
                 None
             };
-            (prev - 1.0, next)
+            (prev - 1.0, next, false)
         },
         ofv,
     );
@@ -11145,11 +11145,43 @@ fn the_restart_chain_repeats_basin_shifts_and_stops_on_rejection_cap_or_stall() 
         (-10.0, Some(RestartCause::MidDescent)),
         |prev: &f64, _| {
             calls.set(calls.get() + 1);
-            (prev - 1.0, Some(RestartCause::MidDescent))
+            (prev - 1.0, Some(RestartCause::MidDescent), false)
         },
         ofv,
     );
     assert_eq!((got, calls.get()), (-11.0, 1));
+}
+
+/// #2821 review r1: a mid-descent restart its start probe verified is adopted when it ties
+/// the stalled leg, as a basin-shift restart is; an unverified one still needs a strictly
+/// lower objective. The pair differs only in the verified flag, so it straddles the rule.
+#[test]
+fn a_verified_mid_descent_restart_is_adopted_on_a_tie() {
+    use crate::estimation::outer_optimizer::{resolve_restart_chain, RestartCause};
+    let ofv = |x: &(f64, &str)| x.0;
+    let run = |verified: bool| {
+        resolve_restart_chain(
+            false,
+            false,
+            ((-10.0, "stalled"), Some(RestartCause::MidDescent)),
+            |_: &(f64, &str), c| {
+                assert_eq!(c, RestartCause::MidDescent);
+                ((-10.0, "restart"), None, verified)
+            },
+            ofv,
+        )
+    };
+    assert_eq!(run(true).1, "restart", "a verified tie is adopted");
+    assert_eq!(run(false).1, "stalled", "an unverified tie is not");
+    // Verified or not, a higher restart is never adopted.
+    let got = resolve_restart_chain(
+        false,
+        false,
+        ((-10.0, "stalled"), Some(RestartCause::MidDescent)),
+        |_: &(f64, &str), _| ((-9.0, "restart"), None, true),
+        ofv,
+    );
+    assert_eq!(got.1, "stalled");
 }
 
 /// Runs `f` on a one-thread pool and returns its result with the number of inner
@@ -15950,30 +15982,44 @@ fn a_restart_probe_reports_a_verified_or_lower_probe_and_leaves_any_other_restar
     let restart_ofv = restarted().ofv;
     let restart_cause = Some(RestartCause::MidDescent);
     let probe_cause = Some(RestartCause::BasinShift);
-    for (verdict, probe_delta, reports_probe, restart_left, probe_converged) in [
-        (Some(true), -1e-3, true, true, true),
-        (Some(true), -1e-3, true, false, true),
+    let budget_tag = "Outer optimization hit the evaluation budget (maxiter = 9) before \
+                      converging; increase maxiter for a tighter fit.";
+    for (verdict, probe_delta, reports_probe, restart_left, probe_converged, probe_left, budget) in [
+        (Some(true), -1e-3, true, true, true, true, false),
+        (Some(true), -1e-3, true, false, true, true, false),
+        // The probe's own displacement, not a constant: a reported probe that never left the
+        // user's start publishes that (#2821 review r1).
+        (Some(true), -1e-3, true, true, true, false, false),
         // Verified but higher: the restart's own point, with the probe's verdict.
-        (Some(true), 1e-3, false, true, true),
-        (Some(true), 1e-3, false, false, true),
+        (Some(true), 1e-3, false, true, true, true, false),
+        (Some(true), 1e-3, false, false, true, true, false),
         // Lower: the probe's result, whatever its own verdict.
-        (Some(false), -1.0, true, true, true),
-        (Some(false), -1.0, true, false, false),
-        (None, -1e-3, false, true, true),
+        (Some(false), -1.0, true, true, true, true, false),
+        (Some(false), -1.0, true, false, false, true, false),
+        (Some(false), -1.0, true, true, true, false, false),
+        (None, -1e-3, false, true, true, true, false),
+        // No verdict because the budget ran out: the restart, with the spent budget and the
+        // advice the probe was given, and none of the probe's other warnings.
+        (None, -1e-3, false, true, false, true, true),
     ] {
         let label = format!(
             "{verdict:?}, probe − restart = {probe_delta:+e}, restart left the user's start \
-             = {restart_left}"
+             = {restart_left}, probe left it = {probe_left}, probe spent the budget = {budget}"
         );
+        let mut probe_warnings = vec![probe_tag.to_string()];
+        if budget {
+            probe_warnings.push(budget_tag.to_string());
+        }
         let probe = OuterResult {
             ofv: restart_ofv + probe_delta,
             converged: probe_converged,
-            warnings: vec![probe_tag.to_string()],
-            left_init: Some(true),
+            warnings: probe_warnings,
+            left_init: Some(probe_left),
+            eval_budget_spent: budget,
             n_iterations: 4,
             ..evaluate_at_initial_params(&model, &pop, &off, &opts)
         };
-        let (result, cause, from_probe) = settle_restart_probe(
+        let (result, cause, from_probe, verified) = settle_restart_probe(
             (restarted_at(restart_left), restart_cause),
             Some((probe, probe_cause, verdict)),
             |r| r.ofv,
@@ -16021,17 +16067,34 @@ fn a_restart_probe_reports_a_verified_or_lower_probe_and_leaves_any_other_restar
         // The published displacement is the reported point's own, from the user's start:
         // the probe's when it is reported, else the restart's. A verified restart whose own
         // point wins is not read as a start the fit never left (`Some(false)`, stationary).
-        let left = if reports_probe { true } else { restart_left };
+        let left = if reports_probe {
+            probe_left
+        } else {
+            restart_left
+        };
         assert_eq!(result.left_init, Some(left), "{label}");
+        assert_eq!(verified, verdict == Some(true), "{label}: verified");
+        if verdict.is_none() {
+            assert_eq!(
+                (
+                    result.eval_budget_spent,
+                    result.warnings.iter().any(|w| w == budget_tag)
+                ),
+                (budget, budget),
+                "{label}: the probe's spent budget and its advice: {:?}",
+                result.warnings
+            );
+        }
         assert_eq!(
             result.stationary_start,
             verdict == Some(true) && !left,
             "{label}"
         );
     }
-    let (result, cause, from_probe) =
+    let (result, cause, from_probe, verified) =
         settle_restart_probe((restarted(), restart_cause), None, |r| r.ofv);
     assert!(!from_probe, "no probe: the restart's own notice");
+    assert!(!verified, "no probe: nothing verified");
     assert_eq!(
         (
             result.n_iterations,

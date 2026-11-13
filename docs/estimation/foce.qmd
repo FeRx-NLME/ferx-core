@@ -772,7 +772,8 @@ When they do not, the optimizer is **restarted once from the best point it reach
 ([#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277)), on whatever is left of the
 fit's `maxiter` budget. It usually costs nothing in the sense that matters: the restart is
 adopted only if it ends at a **strictly lower** objective, so it can never make a reported
-fit worse. On the two-compartment deep-compartment model in
+fit worse. The one tie it wins is a restart that
+[the check below](#restart-at-its-own-start) verified as an optimum. On the two-compartment deep-compartment model in
 `tests/fixtures/two_cpt_dcm_regularized.ferx`, started without an `init` line, L-BFGS quit
 at evaluation 12 with the trace
 still falling ~2600 OFV per evaluation; the restart ran to convergence 3886 OFV units lower
@@ -1216,7 +1217,9 @@ for any other reason. When the perturbed run instead ends more than 0.01 below t
 the restart was not finished, and the perturbed run's result is reported, with its own
 `converged` verdict. That is not done on the first attempt, whose stall at the user's
 initial estimates stays flagged; a restart's start is not the user's. When it reaches no
-verdict, the restart is reported `converged: false` as before. Either way the restart's
+verdict, the restart is reported `converged: false` as before. The perturbed run spends what
+is left of the fit's `maxiter` budget; when it runs out, the fit reports the budget spent
+(`eval_budget_spent`) and the advice to increase `maxiter`. Either way the restart's
 notice in `FitResult.warnings` says which run the reported estimates come from.
 
 On a simulated population of 80 subjects, 24 of them flip-flop

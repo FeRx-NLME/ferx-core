@@ -77,7 +77,13 @@ fn quoted_cold(message: &str) -> f64 {
 /// `outer_optimizer_tests.rs` (`settle_restart_probe`, the provenance wording); what this
 /// test pins is that the notice names exactly one of them and the fit is reported
 /// converged.
-fn assert_restart_reported_converged(model: &str, cold_ofv: f64) {
+///
+/// `probe_less_evals` is what the same fit spends with the restart's probe switched off; the
+/// fit must spend more, or it was reported converged without the probe that this tests.
+/// Measured with the probe gate forced shut: 87 (closed form) and 85 (ODE twin) on Linux
+/// x86_64, 83 and 71 on macOS arm64; the bound is the larger. With the probe the fits spend
+/// 197 / 202 (Linux) and 193 / 182 (macOS), so the margin is over 95 evaluations on both.
+fn assert_restart_reported_converged(model: &str, cold_ofv: f64, probe_less_evals: usize) {
     let result = fit_example(model);
     assert!(result.ofv.is_finite(), "{model}: OFV {}", result.ofv);
     // The straddle: the fit must still go through a basin-shift restart, or this tests a
@@ -124,6 +130,14 @@ fn assert_restart_reported_converged(model: &str, cold_ofv: f64) {
          leg (≈ −3047.53 / −3050.98): {}",
         notices[0]
     );
+    // The probe ran (#2821 review r1): a restart leg that moved past its own displacement
+    // rule would converge without it and keep every other assertion here green.
+    assert!(
+        result.n_iterations > probe_less_evals,
+        "{model}: {} evaluations, no more than the {probe_less_evals} the fit spends without \
+         the restart's probe",
+        result.n_iterations
+    );
     // Realised 3.44e-7 (ODE twin) and 3.57e-7 (closed form) on Linux x86_64, 4.68e-7 and
     // 2.98e-7 on macOS arm64; the bound has 21× headroom over the worst.
     // `main` ends at the same OFV, so this pins that the verification moved no estimate
@@ -160,7 +174,7 @@ fn assert_restart_reported_converged(model: &str, cold_ofv: f64) {
     ignore = "slow: opt in with --features slow-tests"
 )]
 fn a_verified_basin_shift_restart_is_converged_closed_form() {
-    assert_restart_reported_converged(CLOSED_FORM, -3051.324118);
+    assert_restart_reported_converged(CLOSED_FORM, -3051.324118, 87);
 }
 
 #[test]
@@ -169,7 +183,7 @@ fn a_verified_basin_shift_restart_is_converged_closed_form() {
     ignore = "slow: opt in with --features slow-tests"
 )]
 fn a_verified_basin_shift_restart_is_converged_ode_twin() {
-    assert_restart_reported_converged(ODE_TWIN, -3051.295773);
+    assert_restart_reported_converged(ODE_TWIN, -3051.295773, 85);
 }
 
 /// The probe and its restart chain run on what is left of the fit's `maxiter` budget, not on
@@ -219,5 +233,28 @@ fn the_restart_probe_spends_only_what_is_left_of_the_fits_budget() {
         result.n_iterations <= budget + 8,
         "{} evaluations against a budget of {budget}",
         result.n_iterations
+    );
+    // The probe spent the budget the restart's own leg stopped short of, so the fit reports
+    // it spent and gives the advice (#2821 review r1); before, it reported neither.
+    assert!(
+        result.eval_budget_spent,
+        "a budget spent by the probe is the fit's: {:?}",
+        result.warnings
+    );
+    let advice: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("increase maxiter"))
+        .collect();
+    assert_eq!(
+        advice.len(),
+        1,
+        "the fit gives the budget advice once: {:?}",
+        result.warnings
+    );
+    assert!(
+        advice[0].contains("(maxiter = 20)"),
+        "the advice names the fit's budget: {}",
+        advice[0]
     );
 }
