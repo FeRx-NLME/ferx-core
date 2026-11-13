@@ -302,6 +302,10 @@ pub(crate) fn symmetric_mixture_start(
     crate::estimation::mixture::indistinguishable_class_pairs(model, population, init_params)
 }
 
+/// The code [`mixture_symmetric_start_warning`] opens with. The floor escape and rail completion
+/// read it to carry the warning onto a resumed run they adopt (`floor_escape::carry_start_warning`).
+pub(crate) const MIXTURE_SYMMETRIC_START: &str = "W_MIXTURE_SYMMETRIC_START";
+
 /// The warning for a mixture with classes that start indistinguishable, where `auto` runs
 /// BOBYQA instead of L-BFGS ([`crate::estimation::mixture::indistinguishable_class_pairs`]).
 /// Names each pair, as class numbers (`MIXNUM`): the check is pairwise, so a third class
@@ -313,7 +317,7 @@ fn mixture_symmetric_start_warning(pairs: &[(usize, usize)]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "W_MIXTURE_SYMMETRIC_START: mixture {named} start indistinguishable: every subject has \
+        "{MIXTURE_SYMMETRIC_START}: mixture {named} start indistinguishable: every subject has \
          the same mixing probability and the same objective under both classes of a pair. A \
          gradient optimizer cannot separate such a pair, so `optimizer = auto` ran BOBYQA \
          instead of L-BFGS. Give the two classes of each pair different initial values (for \
