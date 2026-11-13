@@ -134,8 +134,9 @@ pub struct SimulateOptions {
 }
 
 /// What a `simulate*` entry point lets its caller supply as the TTE administrative
-/// horizon, for [`validate_tte_simulatable`]'s refusal when one is required.
-#[cfg(feature = "survival")]
+/// horizon. It carries the value and is the one owner of the option's name, which both
+/// horizon refusals quote: `validate_tte_simulatable`'s (a required horizon is missing) and
+/// `check_horizon_value`'s (the supplied value is unusable).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TteHorizon {
     /// `[simulation] horizon` or `SimulateOptions.horizon`, as supplied (`None`: not set).
@@ -146,21 +147,47 @@ pub(crate) enum TteHorizon {
     Uncertainty(Option<f64>),
 }
 
+impl TteHorizon {
+    /// The supplied horizon (`None`: not set).
+    fn value(self) -> Option<f64> {
+        match self {
+            TteHorizon::Given(h) | TteHorizon::Uncertainty(h) => h,
+        }
+    }
+
+    /// The API option this caller sets, as the value refusals name it.
+    fn option_name(self) -> &'static str {
+        match self {
+            TteHorizon::Given(_) => "SimulateOptions.horizon",
+            TteHorizon::Uncertainty(_) => "SimulateUncertaintyOptions.horizon",
+        }
+    }
+
+    /// Every way this caller can set the horizon, for the "set ..." half of the refusal
+    /// when a required one is missing. The options path is also reached from a
+    /// `[simulation]` block, so it names that key first.
+    #[cfg(feature = "survival")]
+    fn how_to_set(self) -> String {
+        let option = self.option_name();
+        match self {
+            TteHorizon::Given(_) => format!("`[simulation] horizon` (or `{option}`)"),
+            TteHorizon::Uncertainty(_) => format!("`{option}`"),
+        }
+    }
+}
+
 /// The value checks every horizon-taking `simulate*` entry point applies to a supplied
-/// horizon: finite and `> 0`, and not below any subject's TTE entry time. `option_name` is
-/// the option the caller set, named in the refusal. `None` passes.
+/// horizon: finite and `> 0`, and not below any subject's TTE entry time. The refusal names
+/// the option the caller set (`TteHorizon::option_name`). `None` passes.
 ///
 /// The `.ferx` parser already rejects a non-finite / non-positive horizon, but a direct
 /// caller of the API must get the same guard: a NaN window makes every `t_event < window`
 /// test false (silent NaN event times), and a `<= 0` horizon censors every subject at or
 /// before entry (#522 review).
 #[cfg_attr(not(feature = "survival"), allow(unused_variables))]
-fn check_horizon_value(
-    population: &Population,
-    horizon: Option<f64>,
-    option_name: &str,
-) -> Result<(), EngineError> {
-    let Some(h) = horizon else {
+fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(), EngineError> {
+    let option_name = horizon.option_name();
+    let Some(h) = horizon.value() else {
         return Ok(());
     };
     if !h.is_finite() || h <= 0.0 {
@@ -242,10 +269,8 @@ pub(crate) fn validate_tte_simulatable(
     use super::entry_refusals::{simulate_horizon, tte_not_simulatable};
     // The refusal for a required horizon that is missing or not finite and positive.
     // `what` names the endpoint kind, `why` the reason it needs one.
-    let (horizon, set_it) = match horizon {
-        TteHorizon::Given(h) => (h, "`[simulation] horizon` (or `SimulateOptions.horizon`)"),
-        TteHorizon::Uncertainty(h) => (h, "`SimulateUncertaintyOptions.horizon`"),
-    };
+    let set_it = horizon.how_to_set();
+    let horizon = horizon.value();
     let missing_horizon = |what: &str, why: &str| {
         simulate_horizon(format!(
             "{what} simulation requires a finite, positive administrative horizon: set \
@@ -819,7 +844,7 @@ pub(super) fn simulate_with_options_impl(
     first_error(&check_simulation_data(model, population))?;
 
     // Validate the TTE horizon on the library path too (#522 review).
-    check_horizon_value(population, opts.horizon, "SimulateOptions.horizon")?;
+    check_horizon_value(population, TteHorizon::Given(opts.horizon))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
@@ -2140,8 +2165,8 @@ pub struct SimulateUncertaintyOptions {
 ///
 /// For a TTE endpoint, `opts.horizon` is the administrative censoring horizon of every
 /// draw. A repeated-event or ODE-accumulated hazard requires one (`E_SIMULATE_HORIZON`
-/// otherwise), as on [`simulate_with_options`]; a draw equal to the point estimate
-/// reproduces that function's rows (#2003).
+/// otherwise), as on [`simulate_with_options`]. Each draw is simulated the way that
+/// function simulates the draw's parameters under the same horizon (#2003).
 ///
 /// Thin wrapper over [`simulate_with_uncertainty_diag`] that discards its
 /// [`SimulationOutput::warnings`]; the rows are the same, bit for bit.
@@ -2241,11 +2266,7 @@ fn simulate_with_uncertainty_impl(
     first_error(&check_simulation_data(model, population))?;
 
     // The same value checks, at the same position, as `simulate_with_options` (#2003).
-    check_horizon_value(
-        population,
-        opts.horizon,
-        "SimulateUncertaintyOptions.horizon",
-    )?;
+    check_horizon_value(population, TteHorizon::Uncertainty(opts.horizon))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),

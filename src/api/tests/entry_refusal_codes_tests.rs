@@ -178,6 +178,33 @@ fn simulate_option_and_input_refusals_carry_their_codes() {
             None,
             "SimulateOptions.horizon must be finite and > 0 (got 0)",
         ),
+        // The other two values the check refuses: an infinite horizon and a negative one.
+        row(
+            "horizon infinite",
+            simulate_with_options(
+                &iv,
+                &population_of(vec![observed("1", &[1.0])], &[]),
+                p,
+                1,
+                &opts(Some(f64::INFINITY)),
+            ),
+            "E_SIMULATE_HORIZON",
+            None,
+            "SimulateOptions.horizon must be finite and > 0 (got inf)",
+        ),
+        row(
+            "horizon negative",
+            simulate_with_options(
+                &iv,
+                &population_of(vec![observed("1", &[1.0])], &[]),
+                p,
+                1,
+                &opts(Some(-1.0)),
+            ),
+            "E_SIMULATE_HORIZON",
+            None,
+            "SimulateOptions.horizon must be finite and > 0 (got -1)",
+        ),
         // The same value checks through `simulate_with_uncertainty` (#2003), on a model
         // with no TTE endpoint: the text names that entry point's own option.
         row(
@@ -193,6 +220,20 @@ fn simulate_option_and_input_refusals_carry_their_codes() {
             "E_SIMULATE_HORIZON",
             None,
             "SimulateUncertaintyOptions.horizon must be finite and > 0 (got 0)",
+        ),
+        row(
+            "uncertainty, horizon infinite",
+            unc(Some(f64::INFINITY)),
+            "E_SIMULATE_HORIZON",
+            None,
+            "SimulateUncertaintyOptions.horizon must be finite and > 0 (got inf)",
+        ),
+        row(
+            "uncertainty, horizon negative",
+            unc(Some(-1.0)),
+            "E_SIMULATE_HORIZON",
+            None,
+            "SimulateUncertaintyOptions.horizon must be finite and > 0 (got -1)",
         ),
         row(
             "propensity, empty population",

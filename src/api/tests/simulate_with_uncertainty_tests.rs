@@ -4137,11 +4137,13 @@ fn uncertainty_draw_at_the_point_estimate_reproduces_simulate_with_options() {
 }
 
 /// The public entry with a horizon, on the two models that require one (#2003): accepted,
-/// every event row is at or before the horizon and some are censored exactly at it, every
-/// draw is present, and the row-only wrapper returns the `_diag` form's rows.
+/// no row is past the horizon, and **in every draw** each censor row sits at exactly the
+/// horizon and at least one does; every draw is present, and the row-only wrapper returns
+/// the `_diag` form's rows.
 ///
-/// Mutation: hand the entry validation `None` in place of `opts.horizon` and both models
-/// are refused (`E_SIMULATE_HORIZON`).
+/// Mutations: hand the entry validation `None` in place of `opts.horizon` and both models
+/// are refused (`E_SIMULATE_HORIZON`); halve the horizon for every draw but the first and
+/// the later draws censor at `h / 2`.
 #[cfg(feature = "survival")]
 #[test]
 fn uncertainty_horizon_censors_every_draw_at_the_horizon() {
@@ -4160,6 +4162,23 @@ fn uncertainty_horizon_censors_every_draw_at_the_horizon() {
         }
         let draw_ids: std::collections::BTreeSet<usize> = rows.iter().map(|r| r.draw).collect();
         assert_eq!(draw_ids, (1..=4).collect(), "{name}");
+        for draw in 1..=4 {
+            let censor_times: Vec<f64> = rows
+                .iter()
+                .filter(|r| r.draw == draw)
+                .filter_map(|r| match r.outcome {
+                    crate::types::SimOutcome::Event {
+                        observed: false,
+                        time,
+                    } => Some(time),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !censor_times.is_empty() && censor_times.iter().all(|t| *t == h),
+                "{name}: draw {draw} must censor at exactly {h}, got {censor_times:?}"
+            );
+        }
 
         let diag = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
             .unwrap_or_else(|e| panic!("{name}: diag: {e}"));
