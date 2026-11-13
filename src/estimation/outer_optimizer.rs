@@ -4107,7 +4107,13 @@ fn inner_solve_polled(
         Some(mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
-        InnerSolvePolicy::for_stage(options, model),
+        // A seed is a set of modes an earlier pass returned, so an exactly-zero one among
+        // them is warm like the rest (#2688); without one the solve is cold.
+        InnerSolvePolicy::for_stage(options, model).with_prev_etas(if seed.is_some() {
+            PrevEtas::Solved
+        } else {
+            PrevEtas::Placeholder
+        }),
         cancel,
         |_, ebe| ebe.screen_moved || ebe.twin_moved,
     );

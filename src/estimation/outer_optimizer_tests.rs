@@ -10768,12 +10768,14 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
         };
         let empty_by_pass = per_pass("EMPTY");
         let informed_by_pass = per_pass(&informed);
-        // Passes where the informed subject was NOT multi-started are the warm ones — the
-        // evaluations where the property matters (a solved zero mode is taken as warm). Cold
-        // re-solves and verification legs run from a zero-filled cache on purpose, so the empty
-        // subject is always multi-started there while an informed one's nonzero mode survives
-        // through the held-modes restore. That asymmetry is by design, and how many cold passes
-        // there are depends on the optimizer's trajectory (#1688). The test pins the warm path.
+        // Every pass, not a chosen few: a pass either starts cold (every subject at the zero
+        // placeholder, so both are multi-started alike) or from modes an earlier pass returned
+        // (so neither is), and a pass where EMPTY alone is multi-started has read its
+        // exactly-zero mode as the placeholder. How many passes a fit runs differs by platform
+        // (#1688, CI 219 against 218 locally), which is why this is asked per pass and not as
+        // a count over the fit. CI's pass 210 was such a pass: the final solve seeded from the
+        // incumbent's modes, which carried no kind (#2691 review row 1) and runs only when
+        // the cold final solve misses the incumbent.
         let offending: Vec<(Option<usize>, usize, usize)> = empty_by_pass
             .keys()
             .chain(informed_by_pass.keys())
@@ -10787,14 +10789,7 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
                     informed_by_pass.get(&p).copied().unwrap_or(0),
                 )
             })
-            // Only the first two passes: the first evaluation (pass 0) and the #2682 warm
-            // re-solve (pass 1). Later passes traverse a trajectory whose cold-re-solve and
-            // verification legs differ by platform (#1688, CI 219 vs local 218 passes), and a
-            // held-modes restore after `reset_to_cold_start` can leave the zero-mode subject
-            // cold while an informed one's nonzero mode survives. That is the cold re-solve
-            // working, not the warm-start fix. The per-pass warm property is pinned directly
-            // by the sibling test `the_fd_stencils_take_an_exactly_zero_mode_as_warm`.
-            .filter(|&(p, e, i)| p.is_some_and(|n| n <= 1) && e > i)
+            .filter(|&(_, e, i)| e > i)
             .collect();
         (
             start,
@@ -10848,6 +10843,66 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
         2 * ms_informed > solves,
         "rejected start: the zero fill was restored as a solve's modes, so later evaluations \
          skipped their cold multi-start ({ms_informed} multi-starts in {solves} solves)"
+    );
+}
+
+/// A final solve seeded from modes an earlier pass returned ([`best_final_candidate`]'s, the
+/// trust region's readout) takes an exactly-zero one among them as warm, like the nonzero
+/// ones beside it: no subject is multi-started. Unlabelled, the seed read as the cold
+/// placeholder and `EMPTY` alone was multi-started (#2691 review row 1) — one pass, and only
+/// on a fit whose cold final solve missed the incumbent, which is why it showed as one extra
+/// multi-start on one platform. The straddle: the cold solve of the same fixture does
+/// multi-start both subjects, so the gate is reachable here.
+#[test]
+fn a_seeded_final_solve_takes_an_exactly_zero_mode_as_warm() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::types::FitOptions;
+    let (pop, informed) = population_with_an_empty_subject();
+    let model = make_model();
+    let params = &model.default_params;
+    let opts = FitOptions {
+        inner_restarts: 1,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let mu_k = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    let solve = |seed: Option<&[DVector<f64>]>| {
+        pool.install(|| {
+            record_inner_solves(|| final_inner_solve(&model, &pop, params, &mu_k, seed, &opts))
+        })
+    };
+
+    let (cold, cold_rec) = solve(None);
+    assert!(
+        cold.etas[3].iter().all(|&v| v == 0.0) && cold.etas[0].iter().any(|&v| v != 0.0),
+        "fixture: the empty subject's mode must be exactly zero and an informed one's not: \
+         {:?} / {:?}",
+        cold.etas[3],
+        cold.etas[0]
+    );
+    for id in ["EMPTY", informed.as_str()] {
+        assert!(
+            cold_rec.multistarts.iter().any(|s| s == id),
+            "fixture: the cold solve must multi-start {id}, got {:?}",
+            cold_rec.multistarts
+        );
+    }
+
+    let (_, seeded_rec) = solve(Some(&cold.etas));
+    assert_eq!(
+        seeded_rec.solve_tols.len(),
+        pop.subjects.len(),
+        "the seeded pass must solve every subject on the recording thread"
+    );
+    assert!(
+        seeded_rec.multistarts.is_empty(),
+        "a final solve seeded from a solve's modes multi-started {:?}",
+        seeded_rec.multistarts
     );
 }
 
