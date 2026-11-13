@@ -4694,6 +4694,17 @@ fn apply_prescheduled_boluses_at(
     first_event
 }
 
+/// A **live** dose arrival turns its compartment back on (#2732): `dose`'s compartment
+/// leaves the off list `off`. The one spelling of the rule in the crate (#2811), for the
+/// `f64` walks through [`land_live_arrival`] and for the dual walk
+/// (`sens::ode_provider`), so the value and its gradient cannot switch a compartment on at
+/// different arrivals. The caller has already asked [`ResetGate::live`].
+#[inline]
+pub(crate) fn turn_on_at_live_arrival(off: &mut Vec<usize>, dose: &DoseEvent) {
+    let cmt_idx = dose.cmt_idx();
+    off.retain(|&c| c != cmt_idx);
+}
+
 /// What a **live** dose arrival does to the state: it turns its compartment back on, and a
 /// bolus adds `F·AMT` (#2732, #2811). The caller has already asked [`ResetGate::live`]; a
 /// dead dose must not reach this.
@@ -4708,8 +4719,8 @@ fn apply_prescheduled_boluses_at(
 /// The one spelling for every `f64` state walk: [`apply_prescheduled_boluses_at`] (the
 /// static dense engine, the adaptive driver and, since #2811, its time-varying replay) and
 /// [`event_driven_walk`]'s dose arm. The dual walk (`sens::ode_provider`, the `K_DOSE` arm)
-/// keeps its own turn-on line: its jump is over dual numbers and carries the lag
-/// saltation, so it cannot call this.
+/// shares the turn-on through [`turn_on_at_live_arrival`] and keeps its own jump, which is
+/// over dual numbers and carries the lag saltation.
 fn land_live_arrival(
     u: &mut [f64],
     ode: &OdeSpec,
@@ -4717,10 +4728,10 @@ fn land_live_arrival(
     f_bio: f64,
     off: &mut Vec<usize>,
 ) {
+    turn_on_at_live_arrival(off, dose);
     // dose.cmt is 1-based; state indices are 0-based. `cmt_idx` maps CMT=0 → compartment 1
     // (NONMEM default, #899).
     let cmt_idx = dose.cmt_idx();
-    off.retain(|&c| c != cmt_idx);
     if !is_real_infusion(dose) && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
         // Unreachable from a validated call (`check_dose_compartments` rejects
         // `cmt > n_states` since #899); kept as a bound for hand-built `OdeSpec`s.
