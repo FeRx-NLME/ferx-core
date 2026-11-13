@@ -2246,7 +2246,8 @@ fn adaptive_base_multiple_doses_across_occasions_pass_verifiers() {
     // valid oracle here too. A base dose row is a record in the driver (#1148), so the segment
     // ending at the dose at 24 takes that dose's occasion under both conventions; measured on
     // #2771, this fixture gives `predict_iov`'s predictions to 2e-16 relative. What does differ
-    // from `predict_iov` is a CONTROLLER dose with no record in its window. See
+    // from `predict_iov` is a CONTROLLER dose with no record from its decision up to, not
+    // including, the next. See
     // `compute_event_pk_params_iov`'s docstring.
     let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
     let doses = vec![

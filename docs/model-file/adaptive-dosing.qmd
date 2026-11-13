@@ -560,7 +560,8 @@ whichever later record comes next.
   log (`observed_signals`), which is what the controller read.
 
 `predict()` on the realized doses, with the same occasions, gives the same trajectory
-when a data record falls in every dosing window. It does not when a window has none.
+when every dosing decision has a data record at or after it and before the next
+decision (a record on the next decision does not count). It does not otherwise.
 In `predict()` the realized dose is a dose row, which is a record and ends an
 interval. In the adaptive run a controller dose is not. The run's own replay check
 passes either way, because it shares the adaptive convention.
