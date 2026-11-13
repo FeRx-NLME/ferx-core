@@ -206,12 +206,66 @@ struct ObsRow {
     stratum: usize,
 }
 
-fn refuse(message: String) -> EngineError {
+/// The entry point a shared helper refuses for, so each message carries the name of
+/// the function the caller called. [`vpc_rtte`](super::vpc_rtte) shares the endpoint,
+/// record, strata and grid helpers below.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Entry {
+    Tte,
+    Rtte,
+}
+
+impl std::fmt::Display for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Entry::Tte => "vpc_tte",
+            Entry::Rtte => "vpc_rtte",
+        })
+    }
+}
+
+pub(super) fn refuse(message: String) -> EngineError {
     super::entry_refusals::vpc_tte_input(message)
 }
 
-/// The endpoint `opts.cmt` names, or the model's only TTE endpoint.
-fn resolve_cmt(model: &CompiledModel, cmt: Option<usize>) -> Result<usize, EngineError> {
+/// The option checks both entry points make: the band probabilities, enough
+/// replicates for them, and the times of a [`VpcGrid::Times`] grid.
+pub(super) fn check_band_options(
+    who: Entry,
+    probs: [f64; 3],
+    n_sim: usize,
+    grid: &VpcGrid,
+) -> Result<(), EngineError> {
+    if !probs_valid(probs) {
+        return Err(refuse(format!(
+            "{who}: band probabilities {probs:?} must be strictly inside (0, 1) and strictly \
+             increasing."
+        )));
+    }
+    let need = min_curves_for(probs) + 1;
+    if n_sim < need {
+        return Err(refuse(format!(
+            "{who}: `n_sim = {n_sim}` is too few. The band at probabilities {probs:?} needs at \
+             least {need} replicates."
+        )));
+    }
+    if let VpcGrid::Times(t) = grid {
+        if let Some(bad) = t.iter().find(|t| !(t.is_finite() && **t >= 0.0)) {
+            return Err(refuse(format!(
+                "{who}: grid time {bad} is not a finite, non-negative number."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The endpoint `cmt` names, or the model's only TTE endpoint. It must be of the kind
+/// `who` draws: single-event for [`Entry::Tte`], repeated events for [`Entry::Rtte`].
+pub(super) fn resolve_cmt(
+    who: Entry,
+    model: &CompiledModel,
+    cmt: Option<usize>,
+) -> Result<usize, EngineError> {
     let tte = model.tte_cmts();
     let list = tte
         .iter()
@@ -220,44 +274,109 @@ fn resolve_cmt(model: &CompiledModel, cmt: Option<usize>) -> Result<usize, Engin
         .join(", ");
     let c = match (cmt, tte.as_slice()) {
         (_, []) => {
-            return Err(refuse(
-                "vpc_tte: the model declares no TTE endpoint ([event_model]).".to_string(),
-            ))
+            return Err(refuse(format!(
+                "{who}: the model declares no TTE endpoint ([event_model])."
+            )))
         }
         (Some(c), _) if !tte.contains(&c) => {
             return Err(refuse(format!(
-                "vpc_tte: `cmt = {c}` is not a TTE endpoint. The model's TTE endpoints are on \
+                "{who}: `cmt = {c}` is not a TTE endpoint. The model's TTE endpoints are on \
                  cmt {list}."
             )))
         }
         (Some(c), _) => c,
         (None, [only]) => *only,
         (None, _) => {
+            // Only a single-event curve can be misread as a cumulative incidence.
+            let competing = match who {
+                Entry::Tte => {
+                    " Under competing risks 1 − KM of one cause is not its cumulative \
+                     incidence: the curve is that cause's survival with the other causes as \
+                     censoring."
+                }
+                Entry::Rtte => "",
+            };
             return Err(refuse(format!(
-                "vpc_tte: the model has TTE endpoints on cmt {list}; set `cmt` to the one to \
-                 check. Under competing risks 1 − KM of one cause is not its cumulative \
-                 incidence: the curve is that cause's survival with the other causes as \
-                 censoring."
-            )))
+                "{who}: the model has TTE endpoints on cmt {list}; set `cmt` to the one to \
+                 check.{competing}"
+            )));
         }
     };
-    if matches!(
+    let repeated = matches!(
         model.endpoints.get(&c),
         Some(EndpointLikelihood::Tte {
             recurrence: TteRecurrence::Repeated { .. },
             ..
         })
-    ) {
+    );
+    match (who, repeated) {
+        (Entry::Tte, true) => Err(refuse(format!(
+            "{who}: cmt {c} is a repeated-events (RTTE) endpoint. Use `vpc_rtte` for its \
+             Kaplan–Meier and mean-cumulative-function VPC."
+        ))),
+        (Entry::Rtte, false) => Err(refuse(format!(
+            "{who}: cmt {c} is a single-event TTE endpoint. Use `vpc_tte` for its \
+             Kaplan–Meier VPC."
+        ))),
+        _ => Ok(c),
+    }
+}
+
+/// The refusal for a subject id that is in the population twice.
+pub(super) fn duplicate_id(who: Entry, id: &str) -> EngineError {
+    refuse(format!(
+        "{who}: subject id {id} appears more than once in the population. Simulated rows are \
+         matched to subjects by id."
+    ))
+}
+
+/// The refusal for a population with no record on the checked endpoint.
+pub(super) fn no_record(who: Entry, cmt: usize) -> EngineError {
+    refuse(format!("{who}: no subject has a record on cmt {cmt}."))
+}
+
+/// One record on the checked endpoint as `(time, is an event)`, after the checks both
+/// entry points make: a finite, non-negative time, no left truncation, and no interval
+/// censoring.
+pub(super) fn checked_record(
+    who: Entry,
+    id: &str,
+    cmt: usize,
+    time: f64,
+    entry_time: f64,
+    event_type: &EventType,
+) -> Result<(f64, bool), EngineError> {
+    if !(time.is_finite() && time >= 0.0) {
         return Err(refuse(format!(
-            "vpc_tte: cmt {c} is a repeated-events (RTTE) endpoint. A Kaplan–Meier VPC of \
-             repeated events is not supported yet."
+            "{who}: subject {id} has time {time} on cmt {cmt}, which is not a finite, \
+             non-negative number."
         )));
     }
-    Ok(c)
+    if entry_time > 0.0 {
+        return Err(refuse(format!(
+            "{who}: subject {id} has entry time {entry_time} on cmt {cmt}. Left \
+             truncation (delayed entry) is not supported yet."
+        )));
+    }
+    match event_type {
+        EventType::Exact => Ok((time, true)),
+        EventType::RightCensored => Ok((time, false)),
+        EventType::IntervalCensored { .. } => {
+            let needs = match who {
+                Entry::Tte => "A Kaplan–Meier curve needs",
+                Entry::Rtte => "The repeated-events curves need",
+            };
+            Err(refuse(format!(
+                "{who}: subject {id} has an interval-censored record on cmt {cmt}. {needs} \
+                 exact or right-censored times."
+            )))
+        }
+    }
 }
 
 /// Each subject's stratum value, or `None` for [`VpcStratify::None`].
-fn stratum_value(
+pub(super) fn stratum_value(
+    who: Entry,
     subject: &crate::types::Subject,
     stratify: &VpcStratify,
 ) -> Result<Option<f64>, EngineError> {
@@ -268,12 +387,53 @@ fn stratum_value(
             Some(v) => Some(*v),
             None => {
                 return Err(refuse(format!(
-                    "vpc_tte: subject {} has no covariate `{name}` to stratify on.",
+                    "{who}: subject {} has no covariate `{name}` to stratify on.",
                     subject.id
                 )))
             }
         },
     })
+}
+
+/// The strata of subjects whose stratum values are `per_subject`: the distinct values
+/// (sorted), their labels, and each subject's index into them.
+#[allow(clippy::type_complexity)]
+pub(super) fn build_strata(
+    who: Entry,
+    per_subject: &[Option<f64>],
+    stratify: &VpcStratify,
+) -> Result<(Vec<Option<f64>>, Vec<String>, Vec<usize>), EngineError> {
+    let mut values: Vec<Option<f64>> = per_subject.to_vec();
+    values.sort_by(|a, b| a.unwrap_or(0.0).total_cmp(&b.unwrap_or(0.0)));
+    values.dedup_by(|a, b| a.map(f64::to_bits) == b.map(f64::to_bits));
+    if let VpcStratify::Covariate(name) = stratify {
+        if values.len() > VPC_TTE_MAX_STRATA {
+            return Err(refuse(format!(
+                "{who}: covariate `{name}` has {} distinct values, more than the \
+                 {VPC_TTE_MAX_STRATA} strata a VPC can show. Bin it into a categorical covariate \
+                 and stratify on that.",
+                values.len()
+            )));
+        }
+    }
+    let labels = values
+        .iter()
+        .map(|v| match (stratify, v) {
+            (VpcStratify::Covariate(name), Some(v)) => format!("{name}={v}"),
+            (VpcStratify::Dose, Some(v)) => format!("dose={v}"),
+            _ => "all".to_string(),
+        })
+        .collect();
+    let index = per_subject
+        .iter()
+        .map(|v| {
+            values
+                .iter()
+                .position(|x| x.map(f64::to_bits) == v.map(f64::to_bits))
+                .expect("every value is in the deduplicated list")
+        })
+        .collect();
+    Ok((values, labels, index))
 }
 
 /// The observed rows on `cmt`, and the strata's values (sorted) and labels.
@@ -283,15 +443,12 @@ fn observed_rows(
     cmt: usize,
     stratify: &VpcStratify,
 ) -> Result<(Vec<ObsRow>, Vec<Option<f64>>, Vec<String>), EngineError> {
+    const WHO: Entry = Entry::Tte;
     let mut picked: Vec<(String, f64, bool, Option<f64>, Option<f64>)> = Vec::new();
     let mut seen: HashMap<&str, ()> = HashMap::new();
     for s in &population.subjects {
         if seen.insert(s.id.as_str(), ()).is_some() {
-            return Err(refuse(format!(
-                "vpc_tte: subject id {} appears more than once in the population. Simulated \
-                 rows are matched to subjects by id.",
-                s.id
-            )));
+            return Err(duplicate_id(WHO, &s.id));
         }
         let mut on_cmt = Vec::new();
         let mut all_censored = true;
@@ -309,32 +466,14 @@ fn observed_rows(
             if *rc != cmt {
                 continue;
             }
-            if !(time.is_finite() && *time >= 0.0) {
-                return Err(refuse(format!(
-                    "vpc_tte: subject {} has time {time} on cmt {cmt}, which is not a finite, \
-                     non-negative number.",
-                    s.id
-                )));
-            }
-            if *entry_time > 0.0 {
-                return Err(refuse(format!(
-                    "vpc_tte: subject {} has entry time {entry_time} on cmt {cmt}. Left \
-                     truncation (delayed entry) is not supported yet.",
-                    s.id
-                )));
-            }
-            let event = match event_type {
-                EventType::Exact => true,
-                EventType::RightCensored => false,
-                EventType::IntervalCensored { .. } => {
-                    return Err(refuse(format!(
-                        "vpc_tte: subject {} has an interval-censored record on cmt {cmt}. A \
-                         Kaplan–Meier curve needs exact or right-censored times.",
-                        s.id
-                    )))
-                }
-            };
-            on_cmt.push((*time, event));
+            on_cmt.push(checked_record(
+                WHO,
+                &s.id,
+                cmt,
+                *time,
+                *entry_time,
+                event_type,
+            )?);
         }
         match on_cmt.as_slice() {
             [] => {}
@@ -343,7 +482,7 @@ fn observed_rows(
                 *time,
                 *event,
                 all_censored.then_some(*time),
-                stratum_value(s, stratify)?,
+                stratum_value(WHO, s, stratify)?,
             )),
             more => {
                 return Err(refuse(format!(
@@ -356,63 +495,43 @@ fn observed_rows(
         }
     }
     if picked.is_empty() {
-        return Err(refuse(format!(
-            "vpc_tte: no subject has a record on cmt {cmt}."
-        )));
+        return Err(no_record(WHO, cmt));
     }
-    let mut values: Vec<Option<f64>> = picked.iter().map(|p| p.4).collect();
-    values.sort_by(|a, b| a.unwrap_or(0.0).total_cmp(&b.unwrap_or(0.0)));
-    values.dedup_by(|a, b| a.map(f64::to_bits) == b.map(f64::to_bits));
-    if let VpcStratify::Covariate(name) = stratify {
-        if values.len() > VPC_TTE_MAX_STRATA {
-            return Err(refuse(format!(
-                "vpc_tte: covariate `{name}` has {} distinct values, more than the \
-                 {VPC_TTE_MAX_STRATA} strata a VPC can show. Bin it into a categorical covariate \
-                 and stratify on that.",
-                values.len()
-            )));
-        }
-    }
-    let labels = values
-        .iter()
-        .map(|v| match (stratify, v) {
-            (VpcStratify::Covariate(name), Some(v)) => format!("{name}={v}"),
-            (VpcStratify::Dose, Some(v)) => format!("dose={v}"),
-            _ => "all".to_string(),
-        })
-        .collect();
+    let per_subject: Vec<Option<f64>> = picked.iter().map(|p| p.4).collect();
+    let (values, labels, index) = build_strata(WHO, &per_subject, stratify)?;
     let rows = picked
         .into_iter()
-        .map(|(id, time, event, censor_at, v)| {
-            let stratum = values
-                .iter()
-                .position(|x| x.map(f64::to_bits) == v.map(f64::to_bits))
-                .expect("every value is in the deduplicated list");
-            ObsRow {
-                id,
-                time,
-                event,
-                censor_at,
-                stratum,
-            }
+        .zip(index)
+        .map(|((id, time, event, censor_at, _), stratum)| ObsRow {
+            id,
+            time,
+            event,
+            censor_at,
+            stratum,
         })
         .collect();
     Ok((rows, values, labels))
 }
 
-/// The grid of one stratum.
-fn stratum_grid(grid: &VpcGrid, horizon: f64, observed: &KmCurve, reps: &[KmCurve]) -> Vec<f64> {
+/// The grid of one stratum's curve: `observed_times` are the times of its observed
+/// curve, `rep_times` those of each replicate curve (read only by [`VpcGrid::AllSteps`]).
+pub(super) fn stratum_grid<'a>(
+    grid: &VpcGrid,
+    horizon: f64,
+    observed_times: &[f64],
+    rep_times: impl Iterator<Item = &'a [f64]>,
+) -> Vec<f64> {
     let mut g: Vec<f64> = match grid {
         VpcGrid::Times(t) => t.clone(),
         VpcGrid::Auto | VpcGrid::AllSteps => {
             let mut g = vec![0.0];
-            g.extend(observed.time.iter().copied().filter(|&t| t <= horizon));
+            g.extend(observed_times.iter().copied().filter(|&t| t <= horizon));
             if *grid == VpcGrid::Auto {
                 let n = AUTO_GRID_POINTS - 1;
                 g.extend((0..=n).map(|k| horizon * k as f64 / n as f64));
             } else {
-                for c in reps {
-                    g.extend(c.time.iter().copied().filter(|&t| t <= horizon));
+                for times in rep_times {
+                    g.extend(times.iter().copied().filter(|&t| t <= horizon));
                 }
             }
             g
@@ -435,7 +554,7 @@ fn stratum_grid(grid: &VpcGrid, horizon: f64, observed: &KmCurve, reps: &[KmCurv
 ///
 /// `E_VPC_TTE_INPUT` for an input the curve would be wrong on: no TTE endpoint, a
 /// `cmt` that is not one, several TTE endpoints and no `cmt`, a repeated-events
-/// endpoint, left truncation, an interval-censored record, more than one record per
+/// endpoint (which [`vpc_rtte`](super::vpc_rtte) draws), left truncation, an interval-censored record, more than one record per
 /// subject on the endpoint, a duplicated subject id, no record on it at all, bad
 /// `probs`, too few `n_sim`, a grid time that is not finite and non-negative, a
 /// stratification covariate a subject lacks or with more than
@@ -447,28 +566,8 @@ pub fn vpc_tte(
     opts: &VpcTteOptions,
 ) -> Result<TteVpc, EngineError> {
     let probs = opts.probs;
-    if !probs_valid(probs) {
-        return Err(refuse(format!(
-            "vpc_tte: band probabilities {probs:?} must be strictly inside (0, 1) and strictly \
-             increasing."
-        )));
-    }
-    let need = min_curves_for(probs) + 1;
-    if opts.n_sim < need {
-        return Err(refuse(format!(
-            "vpc_tte: `n_sim = {}` is too few. The band at probabilities {probs:?} needs at \
-             least {need} replicates.",
-            opts.n_sim
-        )));
-    }
-    if let VpcGrid::Times(t) = &opts.grid {
-        if let Some(bad) = t.iter().find(|t| !(t.is_finite() && **t >= 0.0)) {
-            return Err(refuse(format!(
-                "vpc_tte: grid time {bad} is not a finite, non-negative number."
-            )));
-        }
-    }
-    let cmt = resolve_cmt(model, opts.cmt)?;
+    check_band_options(Entry::Tte, probs, opts.n_sim, &opts.grid)?;
+    let cmt = resolve_cmt(Entry::Tte, model, opts.cmt)?;
     let (rows, values, labels) = observed_rows(population, cmt, &opts.stratify)?;
     let horizon = opts.sim.horizon.unwrap_or_else(|| {
         rows.iter()
@@ -542,7 +641,12 @@ pub fn vpc_tte(
             .map(|r| kaplan_meier(&r[k].0, &r[k].1))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| refuse(format!("vpc_tte: a replicate {e}")))?;
-        let grid = stratum_grid(&opts.grid, horizon, &observed, &curves);
+        let grid = stratum_grid(
+            &opts.grid,
+            horizon,
+            &observed.time,
+            curves.iter().map(|c| c.time.as_slice()),
+        );
         let band = vpc_band(&curves, &grid, probs).map_err(|e| refuse(format!("vpc_tte: {e}")))?;
         strata.push(TteVpcStratum {
             label,
