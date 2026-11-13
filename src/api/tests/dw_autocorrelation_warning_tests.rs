@@ -751,6 +751,30 @@ const ALGEBRAIC_UNGROUPED: &str = "Positive IWRES autocorrelation detected (Durb
      between rows instead. The line needs method = foce or focei. A `level` for that \
      grouping with a `kappa … at` it can absorb the shared part instead.";
 
+/// The compartment-free text when the statistic paired rows across occasions that
+/// run in time (#2858), for a numeric `ID`.
+const ALGEBRAIC_IN_TIME: &str = "Positive IWRES autocorrelation detected (Durbin-Watson = \
+     1.20). Consecutive rows of one subject may share what the structural model leaves out, \
+     across its occasions too: they follow one another in time, so the statistic pairs rows \
+     of different occasions. A `correlation ar1(RHO) by ID` line in [error_model] correlates \
+     all rows of one subject, decaying with the number of visits between them; `car1(RHO)` \
+     decays the correlation with the time between rows instead. The line needs method = foce \
+     or focei. A line `by` the occasions themselves cannot model this: a block never joins \
+     rows of two occasions.";
+
+/// The same for a text `ID`, which a `by` cannot read.
+const ALGEBRAIC_IN_TIME_TEXT_ID: &str = "Positive IWRES autocorrelation detected \
+     (Durbin-Watson = 1.20). Consecutive rows of one subject may share what the structural \
+     model leaves out, across its occasions too: they follow one another in time, so the \
+     statistic pairs rows of different occasions. A `correlation ar1(RHO) by COL` line in \
+     [error_model] correlates all rows of one subject, with COL a numeric data column that \
+     has one value per subject (`ID` is not numeric in this data), decaying with the number \
+     of visits between them; `car1(RHO)` decays the correlation with the time between rows \
+     instead. The line needs method = foce or focei. A line `by` the occasions themselves \
+     cannot model this: a block never joins rows of two occasions.";
+
+const IN_TIME: DwAdvice = DwAdvice::AlgebraicInTime { by_id: true };
+
 /// The compartment-free text for group `g`.
 fn algebraic_grouped(g: &str) -> String {
     format!(
@@ -1040,15 +1064,16 @@ fn algebraic_with_a_parallel_iov_column_correlates_by_the_column() {
     }
 }
 
-/// A1 (#2829). Compartment-free with `iov_column = OCC` on occasions that **run in
-/// time**: the statistic was taken over the whole subject, so the advice names no
-/// column. The twin of the test above: the same model and labels, only the clock
-/// differs.
+/// A1 (#2829, #2858). Compartment-free with `iov_column = OCC` on occasions that
+/// **run in time**: the statistic was taken over the whole subject, so the advice
+/// correlates the subject, `by ID`, and says a line by the occasions cannot. The
+/// twin of the test above: the same model and labels, only the clock differs.
 ///
-/// Mutation that must redden this, and only this among the one-subject cells: the
-/// `occasions_run_in_time` read dropped from `dw_advice` (`by OCC` again).
+/// Mutations that must redden this: the `occasions_run_in_time` read dropped from
+/// `dw_advice` (`by OCC` again); the `AlgebraicInTime` arm dropped (the ungrouped
+/// text, which tells a model that has a grouping to declare one).
 #[test]
-fn algebraic_with_an_iov_column_in_time_gets_the_ungrouped_text() {
+fn algebraic_with_an_iov_column_in_time_correlates_the_subject() {
     let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
     assert_eq!(parsed.fit_options.iov_column.as_deref(), Some("OCC"));
     assert!(
@@ -1057,13 +1082,98 @@ fn algebraic_with_an_iov_column_in_time_gets_the_ungrouped_text() {
     );
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovColumn, Rows::InTime);
     assert!(in_time, "the fixture must run in time");
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert_eq!(msg, ALGEBRAIC_UNGROUPED);
+    assert_eq!(advice, IN_TIME);
+    assert_eq!(msg, ALGEBRAIC_IN_TIME);
+    for must in [
+        "by ID` line",
+        "all rows of one subject",
+        "across its occasions too",
+        "car1(RHO)",
+        "foce or focei",
+        "A line `by` the occasions themselves cannot",
+    ] {
+        assert!(msg.contains(must), "missing `{must}`: {msg}");
+    }
+    // Not the column the statistic was taken across, no placeholder, and none of
+    // the ungrouped text's "declare a grouping" advice: the model has one.
+    for banned in
+        NOT_FOR_ALGEBRAIC
+            .iter()
+            .chain(&["OCC", "COL", "kappa", "`level`", "labels the group"])
+    {
+        assert!(!msg.contains(banned), "`{banned}` in {msg}");
+    }
+}
+
+/// #2858. A `by` column is read as a number, so on a text `ID` the line `by ID`
+/// puts every row in no block (measured: OFV and ρ unmoved, `W_COVARIATE_MISSING`).
+/// The advice then asks for a numeric subject-level column instead of naming `ID`
+/// as the column to write. One text id among numeric ones is enough.
+///
+/// Both sides of the gate in one test. Mutations that must redden it: `by_id`
+/// always `true` (the text half names `by ID`); always `false` (the numeric half
+/// loses it); `all` → `any` over the subjects (the mixed population names `by ID`).
+#[test]
+fn algebraic_in_time_names_id_only_when_it_is_numeric() {
+    let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
+    let message = |ids: &[&str]| {
+        let subjects = ids
+            .iter()
+            .map(|id| cell_subject(id, &parsed, Rows::InTime))
+            .collect();
+        let pop = prepared(&parsed, subjects);
+        assert!(all_in_time(&pop));
+        let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
+        let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
+        (advice, msg)
+    };
+    let (advice, msg) = message(&["1", "2"]);
+    assert_eq!(advice, DwAdvice::AlgebraicInTime { by_id: true });
+    assert_eq!(msg, ALGEBRAIC_IN_TIME);
     assert!(
-        msg.contains("by COL` line") && msg.contains("COL any"),
+        msg.contains("by ID` line") && !msg.contains("COL") && !msg.contains("not numeric"),
         "{msg}"
     );
-    assert!(!msg.contains("OCC"), "{msg}");
+    for ids in [["S1", "S2"], ["1", "S2"], ["S1", "2"]] {
+        let (advice, msg) = message(&ids);
+        assert_eq!(
+            advice,
+            DwAdvice::AlgebraicInTime { by_id: false },
+            "{ids:?}"
+        );
+        assert_eq!(msg, ALGEBRAIC_IN_TIME_TEXT_ID, "{ids:?}");
+        assert!(
+            msg.contains("by COL` line")
+                && msg.contains("one value per subject")
+                && msg.contains("`ID` is not numeric")
+                && !msg.contains("by ID`"),
+            "{ids:?}: {msg}"
+        );
+    }
+}
+
+/// #2858. A declared grouping with **one** occasion per subject: no pair crosses
+/// occasions, so the in-time text's claim that the statistic pairs rows of
+/// different occasions would be false. The ungrouped text stands.
+///
+/// The twin of A1 on the labels alone (same model, same clock). Mutation that must
+/// redden this, and only this: the `across_occasions` read dropped from `dw_advice`.
+#[test]
+fn algebraic_with_one_occasion_per_subject_keeps_the_ungrouped_text() {
+    let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
+    let mut s = cell_subject("1", &parsed, Rows::InTime);
+    s.occasions = vec![1; 4];
+    let pop = prepared(&parsed, vec![s]);
+    assert!(all_in_time(&pop));
+    assert_eq!(pop.subjects[0].occasions, vec![1; 4]);
+    let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
+    assert_eq!(advice, DwAdvice::Algebraic { group: None });
+    let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
+    assert_eq!(msg, ALGEBRAIC_UNGROUPED);
+    assert!(
+        !msg.contains("across its occasions") && !msg.contains("by ID"),
+        "{msg}"
+    );
 }
 
 /// A4 (#2829, plan amendment 1). A population of one subject in time and one
@@ -1107,8 +1217,9 @@ fn algebraic_iov_column_split_in_some_subjects_correlates_by_the_column() {
 
 /// Compartment-free with one `level ARM by ARMID in ID`: the level's **column** —
 /// a one-level model has no named level a `by` can read — where its groups are
-/// parallel, and the ungrouped text where they run in time (a single level is
-/// `iov_column` by construction, so it reads the clock as the column does, #2829).
+/// parallel, and the in-time text where they run in time (a single level is
+/// `iov_column` by construction, so it reads the clock as the column does, #2829,
+/// #2858).
 ///
 /// Mutation that must redden this: the level's name in place of its column.
 #[test]
@@ -1129,14 +1240,14 @@ fn algebraic_single_level_correlates_by_its_column() {
     }
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::SingleLevel, Rows::InTime);
     assert!(in_time);
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert!(msg == ALGEBRAIC_UNGROUPED && !msg.contains("ARM"), "{msg}");
+    assert_eq!(advice, IN_TIME);
+    assert!(msg == ALGEBRAIC_IN_TIME && !msg.contains("ARM"), "{msg}");
 }
 
 /// Compartment-free with nested `STUDY > ARM`: the **innermost** level's **name**,
 /// which reads its groups nested by key, where the cells are parallel. Cells that
 /// run in time are one series like any other occasions (no exemption for a declared
-/// level, #2829), and get the ungrouped text.
+/// level, #2829), and get the in-time text (#2858).
 ///
 /// Mutations that must redden this: the column in place of the name (the opposite
 /// direction of the single-level row); the outermost level in place of the
@@ -1158,17 +1269,17 @@ fn algebraic_nested_levels_correlate_by_the_innermost_level_name() {
     }
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::Nested, Rows::InTime);
     assert!(in_time);
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert!(msg == ALGEBRAIC_UNGROUPED && !msg.contains("ARM"), "{msg}");
+    assert_eq!(advice, IN_TIME);
+    assert!(msg == ALGEBRAIC_IN_TIME && !msg.contains("ARM"), "{msg}");
 }
 
 /// Compartment-free with `iov_occasion = time(...)` or `dose` and a kappa, on one
 /// running clock: the occasions come from the timeline through
 /// `fitted_population`, they run in time (asserted), and the statistic is taken over
-/// the whole subject. The ungrouped text, although the fixture also sets
-/// `iov_column`.
+/// the whole subject. The in-time text (#2858), which names no occasion column,
+/// although the fixture also sets `iov_column`.
 #[test]
-fn algebraic_derived_occasions_get_the_ungrouped_text() {
+fn algebraic_derived_occasions_get_the_in_time_text() {
     for g in [Grouping::IovTime, Grouping::IovDose] {
         let parsed = grouped_model(Class::Algebraic, g);
         assert_eq!(
@@ -1188,8 +1299,8 @@ fn algebraic_derived_occasions_get_the_ungrouped_text() {
         );
         let (advice, msg, in_time) = cell(Class::Algebraic, g, Rows::InTime);
         assert!(in_time, "{g:?}: derived occasions on a running clock");
-        assert_eq!(advice, DwAdvice::Algebraic { group: None }, "{g:?}");
-        assert_eq!(msg, ALGEBRAIC_UNGROUPED, "{g:?}");
+        assert_eq!(advice, IN_TIME, "{g:?}");
+        assert_eq!(msg, ALGEBRAIC_IN_TIME, "{g:?}");
         assert!(!msg.contains("OCC"), "{g:?}: {msg}");
     }
 }
@@ -1223,7 +1334,7 @@ fn algebraic_derived_windows_on_a_restarting_clock_name_no_column() {
 /// A3. Compartment-free with `iov_column = OCC` and `iov_occasion = time(...)` but
 /// no kappa: the fit derives no occasions, so the column's labels stand (#2815
 /// review round 1, row 1). Parallel, the advice correlates by the column; in time,
-/// it names none (#2829).
+/// it correlates the subject (#2829, #2858).
 ///
 /// Mutations that must redden this: dropping the `n_kappa > 0` term of
 /// `occasions_are_derived` (the parallel half loses its column); dropping the
@@ -1258,8 +1369,8 @@ fn algebraic_derived_rule_without_a_kappa_keeps_the_column() {
     assert!(msg.contains("by OCC`") && !msg.contains("COL"), "{msg}");
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovTimeNoKappa, Rows::InTime);
     assert!(in_time);
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert!(msg.contains("COL any") && !msg.contains("OCC"), "{msg}");
+    assert_eq!(advice, IN_TIME);
+    assert!(msg == ALGEBRAIC_IN_TIME && !msg.contains("OCC"), "{msg}");
 }
 
 /// The negative branch is the same for every model: no model-class remedy.
@@ -1273,6 +1384,8 @@ fn negative_text_is_the_same_for_every_advice() {
         DwAdvice::Algebraic {
             group: Some("ARM".into()),
         },
+        DwAdvice::AlgebraicInTime { by_id: true },
+        DwAdvice::AlgebraicInTime { by_id: false },
     ] {
         let msg = dw_autocorrelation_warning(2.80, &advice).expect("above 2.5");
         assert_eq!(msg, negative, "{advice:?}");

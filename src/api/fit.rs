@@ -408,6 +408,12 @@ pub(crate) enum DwAdvice {
     /// the name such a line can read, or `None` when the model declares no grouping
     /// a `by` can name.
     Algebraic { group: Option<String> },
+    /// A compartment-free model whose subjects carry occasions that all **run in
+    /// time** (#2858): the statistic was taken across them, so a `correlation` line
+    /// has to span the subject. A line `by` the occasions cannot, as a block never
+    /// joins rows of two occasions. `by_id` says whether `by ID` can be written:
+    /// a `by` column is read as a number, so a text `ID` puts every row in no block.
+    AlgebraicInTime { by_id: bool },
 }
 
 /// The [`DwAdvice`] for `model` fitted under `options` on `prepared` (#2798).
@@ -423,8 +429,16 @@ pub(crate) enum DwAdvice {
 ///   writes the level's column into it): that **column**. A one-level model has no
 ///   named level a `by` can read (`residual_level` needs more than one).
 ///
-/// Otherwise `None`: the model declares no grouping, or every subject's occasions
-/// run in time and the statistic was taken over whole subjects. Also `None` for
+/// When no subject is split and some subject carries more than one occasion, the
+/// statistic paired rows **across** occasions that run in time, and the advice is
+/// [`DwAdvice::AlgebraicInTime`] (#2858), whatever declared the occasions (a column,
+/// a level, nested levels or a derived rule): a line `by` that grouping is the one
+/// line that cannot model those pairs. Measured on `tests/data/dw_sequential_algebraic`:
+/// with one row per occasion `ar1(RHO) by OCC` leaves the OFV at −37.739613, ρ at its
+/// initial value and the statistic `NaN`, where `by ID` reaches −124.232414.
+///
+/// Otherwise `group` is `None`: the model declares no grouping, or no subject has
+/// two occasions. Also `None` for
 /// occasions a derived rule wrote (`iov_occasion = dose` / `time(...)` on a model
 /// with a kappa, `run::occasions_are_derived`): they come from the timeline, so no
 /// column labels them, and the rule overrides `iov_column`. On one running clock
@@ -445,6 +459,21 @@ pub(crate) fn dw_advice(
         .subjects
         .iter()
         .any(|s| !crate::stats::residual_error::occasions_run_in_time(s));
+    if !split_at_occasions {
+        // More than one label in some subject: only then is there a pair that
+        // crosses occasions for the advice to speak about.
+        let across_occasions = prepared
+            .subjects
+            .iter()
+            .any(|s| s.occasions.windows(2).any(|w| w[0] != w[1]));
+        if across_occasions {
+            let by_id = prepared
+                .subjects
+                .iter()
+                .all(|s| s.id.parse::<f64>().is_ok());
+            return DwAdvice::AlgebraicInTime { by_id };
+        }
+    }
     let group = if !split_at_occasions {
         None
     } else if let Some(levels) = model.nested_levels() {
@@ -501,6 +530,26 @@ pub(crate) fn dw_autocorrelation_warning(dw: f64, advice: &DwAdvice) -> Option<S
                  them correlate, decaying with the number of visits between them; \
                  {CAR1_AND_METHOD}"
             ),
+            DwAdvice::AlgebraicInTime { by_id } => {
+                let (by, column) = if *by_id {
+                    ("ID", "")
+                } else {
+                    (
+                        "COL",
+                        ", with COL a numeric data column that has one value per subject \
+                         (`ID` is not numeric in this data)",
+                    )
+                };
+                format!(
+                    "{what} Consecutive rows of one subject may share what the structural \
+                     model leaves out, across its occasions too: they follow one another in \
+                     time, so the statistic pairs rows of different occasions. A \
+                     `correlation ar1(RHO) by {by}` line in [error_model] correlates all rows \
+                     of one subject{column}, decaying with the number of visits between \
+                     them; {CAR1_AND_METHOD} A line `by` the occasions themselves cannot \
+                     model this: a block never joins rows of two occasions."
+                )
+            }
             DwAdvice::Algebraic { group: None } => format!(
                 "{what} Rows of one subject may share what the structural model leaves \
                  out, such as the visits of one arm or occasion. A `correlation \

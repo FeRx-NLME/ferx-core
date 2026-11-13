@@ -195,8 +195,10 @@ as the alternative. A model with compartments keeps the structural advice. The
 statistic pairs only rows of one arm or level cell when they restart the clock,
 so declaring the arms also stops it pairing one arm's last visit with the next
 arm's first. A grouping whose groups follow one another in time, such as visits, is one
-series, and the advice then names no column
-([IWRES Autocorrelation](../output.qmd#iwres-autocorrelation)). The bundled
+series ([IWRES Autocorrelation](../output.qmd#iwres-autocorrelation)). The warning
+then suggests `correlation ar1(RHO) by ID`, a line whose block is the whole
+subject, because a line `by` the visits cannot correlate rows of two visits
+([Occasions in time](residual-correlation.qmd#occasions-in-time)). The bundled
 `mbma_naproxen` model, whose arms are not declared, gets the no-grouping advice
 (Durbin–Watson 1.22); a `kappa` on `E0` at the arm (`iov_column = ARM`) absorbs
 the shared part (1.87, silent) before any `correlation` line is added.

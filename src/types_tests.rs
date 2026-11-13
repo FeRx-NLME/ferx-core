@@ -950,6 +950,8 @@ fn classify_warning_dw_advice_messages_are_dw() {
         DwAdvice::Algebraic {
             group: Some("ARM".into()),
         },
+        DwAdvice::AlgebraicInTime { by_id: true },
+        DwAdvice::AlgebraicInTime { by_id: false },
     ] {
         for dw in [1.2, 2.8] {
             let msg = dw_autocorrelation_warning(dw, &advice).expect("outside the band");
