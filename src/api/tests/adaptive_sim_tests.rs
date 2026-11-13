@@ -2246,9 +2246,9 @@ fn adaptive_base_multiple_doses_across_occasions_pass_verifiers() {
     // valid oracle here too. A base dose row is a record in the driver (#1148), so the segment
     // ending at the dose at 24 takes that dose's occasion under both conventions; measured on
     // #2771, this fixture gives `predict_iov`'s predictions to 2e-16 relative. What does differ
-    // from `predict_iov` is a CONTROLLER dose with no record from its decision up to, not
-    // including, the next. See
-    // `compute_event_pk_params_iov`'s docstring.
+    // from `predict_iov` is a CONTROLLER dose whose first data record at or after it falls on or
+    // past the next decision. See `compute_event_pk_params_iov`'s docstring and
+    // `adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasion`.
     let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
     let doses = vec![
         DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), // occasion 0
@@ -9970,4 +9970,134 @@ fn iov_decision_before_the_first_record_verifies_and_matches_predict_iov_2125() 
     // The hold at 0.5 read the seeded state, not a decayed one.
     let reads = seen.lock().unwrap().clone();
     assert_eq!(reads[0], (0.5, 100.0));
+}
+
+/// When the adaptive run equals `predict_iov` on the realized doses under IOV (#2771), and
+/// when it does not (#2895). A fixed bolus at decisions 0, 24, 48 and 72; occasions on the
+/// static side are set per decision, for observations and dose rows alike.
+///
+/// A controller dose is not a record in the driver, so the segment that ends at it runs
+/// under the next DATA record at or after the decision. In `predict_iov` the same dose is
+/// a dose row, a record of the decision's own occasion. The two pick the same κ when that
+/// next data record lies before the next decision. With no data record at or after the
+/// decision, no observation remains to show a difference.
+///
+/// | Observations at | First record at or after each decision | Result |
+/// |---|---|---|
+/// | 0, 24, 48, 72 | 0, 24, 48, 72 | equal |
+/// | 0, 23, 47, 71 | 0, 47, 71, none | equal |
+/// | 0, 30, 47, 71 | 0, 30, 71, none | equal |
+/// | 0, 23, 47 | 0, 47, none, none | equal |
+/// | 0, 12, 48, 72 | 0, **48**, 48, 72 | differs |
+/// | 0, 23, 50, 71 | 0, **50**, 50, none | differs |
+/// | 0, 72 | 0, **72**, **72**, 72 | differs |
+///
+/// The expected side of each layout is written by hand, not computed from the rule, so the
+/// test cannot agree with itself. Worst relative gap on the equal layouts, macOS arm64: 0
+/// (bound 1e-12). On the differing layouts the worst gap per layout is 5.3e-2, 4.5e-1 and
+/// 9.4e-2 (bound 1e-2). Both sides are asserted here, so a change that makes every layout
+/// equal (#2895) or every layout differ fails this test.
+///
+/// Mutation run: `governing_segment_pk_at` returning the carry instead of the next record
+/// ahead fails the equal side, at observations 0, 24, 48, 72.
+#[test]
+fn adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasion() {
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let decisions = vec![0.0, 24.0, 48.0, 72.0];
+    let seed = 20260708u64;
+    let layouts: [(&[f64], bool); 7] = [
+        (&[0.0, 24.0, 48.0, 72.0], true),
+        (&[0.0, 23.0, 47.0, 71.0], true),
+        (&[0.0, 30.0, 47.0, 71.0], true),
+        (&[0.0, 23.0, 47.0], true),
+        (&[0.0, 12.0, 48.0, 72.0], false),
+        (&[0.0, 23.0, 50.0, 71.0], false),
+        (&[0.0, 72.0], false),
+    ];
+
+    // The η and κ the run draws, as in `adaptive_iov_matches_predict_iov_with_reconstructed_kappa`.
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let z_eta: Vec<f64> = (0..model.n_eta).map(|_| rng.sample(normal)).collect();
+    let eta_bsv: Vec<f64> = (&model.default_params.omega.chol
+        * nalgebra::DVector::from_column_slice(&z_eta))
+    .iter()
+    .copied()
+    .collect();
+    let omega_iov = model.default_params.omega_iov.as_ref().expect("omega_iov");
+    let base = crate::sim::adaptive::subject_kappa_base_seed(seed, "1", 1);
+    let kappas: Vec<Vec<f64>> = (0..decisions.len())
+        .map(|g| {
+            let z: Vec<f64> = (0..model.n_kappa)
+                .map(|k| crate::sim::adaptive::kappa_standard_normal(base, g, k))
+                .collect();
+            (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect();
+    for pair in kappas.windows(2) {
+        assert!(
+            (pair[0][0] - pair[1][0]).abs() > 0.05,
+            "κ must differ across adjacent occasions for the fixture to see it: {kappas:?}"
+        );
+    }
+
+    for (obs, equal) in layouts {
+        let pop = population(vec![subj("1", obs.to_vec(), vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(seed),
+            decision_times: decisions.clone(),
+            ..Default::default() // verify = true: the frozen replay passes on every layout
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect("adaptive IOV sim runs and passes the default verifier");
+        assert_eq!(res.ledger.len(), 4, "{obs:?}: a dose at every decision");
+
+        let static_doses: Vec<DoseEvent> = res
+            .ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+            .collect();
+        let occasion = |t: f64| crate::pk::occasion_of(&decisions, t).expect("in a window") as u32;
+        let mut static_subject = subj("1", obs.to_vec(), static_doses);
+        static_subject.occasions = obs.iter().map(|&t| occasion(t)).collect();
+        static_subject.dose_occasions = res.ledger.iter().map(|e| occasion(e.time)).collect();
+        let preds = crate::pk::predict_iov(
+            &model,
+            &static_subject,
+            &model.default_params.theta,
+            &eta_bsv,
+            &kappas,
+        );
+        assert_eq!(res.trajectories.len(), preds.len(), "{obs:?}");
+
+        // The worst relative gap over the observations, each asserted finite first.
+        let mut worst = 0.0_f64;
+        for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+            assert!(
+                traj.ipred.is_finite() && pred.is_finite() && pred > 0.0,
+                "{obs:?} t={}: adaptive {} predict_iov {pred}",
+                traj.time,
+                traj.ipred
+            );
+            let gap = ((traj.ipred - pred) / pred).abs();
+            assert!(gap.is_finite(), "{obs:?} t={}: gap {gap}", traj.time);
+            worst = worst.max(gap);
+        }
+        if equal {
+            assert!(
+                worst < 1e-12,
+                "observations {obs:?}: adaptive must equal predict_iov, worst gap {worst:e}"
+            );
+        } else {
+            assert!(
+                worst > 1e-2,
+                "observations {obs:?}: adaptive must differ from predict_iov (#2895), worst gap \
+                 {worst:e}"
+            );
+        }
+    }
 }

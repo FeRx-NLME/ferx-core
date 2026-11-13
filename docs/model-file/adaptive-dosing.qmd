@@ -560,11 +560,24 @@ whichever later record comes next.
   log (`observed_signals`), which is what the controller read.
 
 `predict()` on the realized doses, with the same occasions, gives the same trajectory
-when every dosing decision has a data record at or after it and before the next
-decision (a record on the next decision does not count). It does not otherwise.
-In `predict()` the realized dose is a dose row, which is a record and ends an
-interval. In the adaptive run a controller dose is not. The run's own replay check
-passes either way, because it shares the adaptive convention.
+when, for each dosing decision, the first data record at or after it comes before the
+next decision. A dosing decision with no data record at or after it does not matter:
+no observation is left to show a difference. Otherwise the two can differ
+([#2895](https://github.com/FeRx-NLME/ferx-core/issues/2895)). In `predict()` the
+realized dose is a dose row, which is a record and ends an interval. In the adaptive
+run a controller dose is not. The run's own replay check passes either way, because
+it shares the adaptive convention.
+
+With a dose at decisions 0, 24, 48 and 72
+(`adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasion`):
+
+| Data records at | Adaptive against `predict()` |
+|---|---|
+| 0, 24, 48, 72 | equal |
+| 0, 23, 47, 71 | equal |
+| 0, 23, 47 | equal |
+| 0, 12, 48, 72 | differs: the first record at or after 24 is at 48 |
+| 0, 72 | differs: the first record at or after 24 is at 72 |
 
 Some quantities are read at the decision, under the decision's own κ (κ of occasion
 `g` at decision `g`), whatever κ the window's disposition follows:

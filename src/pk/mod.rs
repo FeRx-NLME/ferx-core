@@ -1832,9 +1832,11 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 ///
 /// **A controller dose is the remaining [`predict_iov`] divergence.** A controller-issued
 /// dose is not a record in the driver, so it ends no segment. In `predict_iov` on the
-/// realized doses it is a dose row, which does. The two agree when every dosing decision
-/// has a data record at or after it and before the next decision (a record on the next
-/// decision does not count), and differ otherwise: measured on #2771 with a bolus at each
+/// realized doses it is a dose row, which does. The two agree when, for each dosing
+/// decision, the first data record at or after it comes before the next decision (a
+/// decision with no data record at or after it does not matter: no observation is left to
+/// show a difference). Otherwise they can differ (#2895,
+/// `adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasion`): measured on #2771 with a bolus at each
 /// of the same four decisions, observations at 0, 12, 48, 72 differ by 5.3 % at t = 48
 /// and observations at 0, 72 by 9.4 % at t = 72. The frozen-replay verifier passes on
 /// both, because it shares the driver's convention.
