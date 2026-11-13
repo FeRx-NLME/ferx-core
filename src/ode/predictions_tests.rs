@@ -17391,7 +17391,8 @@ fn adaptive_driver_applies_cmt_toggles_like_the_closed_form() {
 ///
 /// Mutations measured: deleting the turn-on in `land_live_arrival` fails here (the dose at 6
 /// is added to a compartment still held at zero), and deleting `apply_cmt_toggles_at_break`
-/// in the replay fails here too.
+/// in the replay fails here too (worst relative error 0.87). Realised on macOS arm64:
+/// 3.63e-6, so `TOG_TOL` is 8× that.
 #[test]
 fn frozen_replay_tv_applies_cmt_toggles_like_the_closed_form() {
     let ode = one_cpt_oral_ode_spec();
