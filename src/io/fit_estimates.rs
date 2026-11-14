@@ -115,7 +115,7 @@ pub(crate) fn read_fit_estimates(path: &Path) -> Result<Vec<SourceEstimate>, Str
 /// reference the YAML reader is round-tripped against.
 ///
 /// **The set is exactly what the fit report lists**, which is why the two θ
-/// exclusions below are shared with [`crate::io::output::write_estimates_yaml`]
+/// exclusions are shared with [`crate::io::output::write_estimates_yaml`]
 /// rather than spelled again: a `[covariate_nn]` weight and a large `theta
 /// NAME[COL]` level block are generated coefficients, summarized in blocks
 /// rather than named one per line, and neither is something a user could have
@@ -126,24 +126,8 @@ pub(crate) fn read_fit_estimates(path: &Path) -> Result<Vec<SourceEstimate>, Str
 pub(crate) fn from_fit_result(fit: &FitResult) -> Vec<SourceEstimate> {
     let mut out = Vec::new();
 
-    #[cfg(feature = "nn")]
-    let nn_theta: std::collections::HashSet<usize> = fit
-        .neural_networks
-        .iter()
-        .flat_map(|nn| nn.weights_offset..nn.weights_offset + nn.n_weights)
-        .collect();
-    #[cfg(not(feature = "nn"))]
-    let nn_theta: std::collections::HashSet<usize> = std::collections::HashSet::new();
-    let blocked_theta: std::collections::HashSet<usize> =
-        crate::io::output::compact_theta_blocks(&fit.theta_names)
-            .into_iter()
-            .flat_map(|(_, r)| r)
-            .collect();
-
-    for (i, name) in fit.theta_names.iter().enumerate() {
-        if nn_theta.contains(&i) || blocked_theta.contains(&i) {
-            continue;
-        }
+    for i in crate::io::output::listed_theta_indices(fit) {
+        let name = &fit.theta_names[i];
         out.push(SourceEstimate {
             kind: EstimateKind::Theta,
             name: name.clone(),
