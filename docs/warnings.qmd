@@ -435,7 +435,7 @@ covariance step that followed produced usable standard errors.
 
 | Code (`category`) | Severity | Flags | Typical agent response |
 |-------------------|----------|-------|------------------------|
-| `dw_autocorrelation` | Warning | IWRES autocorrelation (Durbin–Watson out of range). | Revisit the residual-error / structural model. The positive message's advice depends on the model: structural remedies for a model with compartments, a `correlation ar1(RHO) by …` line for a compartment-free one ([MBMA](model-file/mbma.qmd#within-arm-residual-correlation)). |
+| `dw_autocorrelation` | Warning | IWRES autocorrelation: the pooled Durbin–Watson statistic is out of range, or, under a `correlation … by` line whose blocks run in time, the statistic over the pairs that join two blocks is below 1.5 while the pooled one is in range ([Occasions in time](model-file/residual-correlation.qmd#occasions-in-time)). | Revisit the residual-error / structural model. The positive message's advice depends on the model: structural remedies for a model with compartments, a `correlation ar1(RHO) by …` line for a compartment-free one ([MBMA](model-file/mbma.qmd#within-arm-residual-correlation)). |
 | `eta_normality` | Warning | ETA departs from normality. | Consider a mixture or transform. |
 
 ### Censoring, resampling, and experimental features {#codes-methods}
@@ -777,7 +777,7 @@ Treat `details` as optional: check for its presence rather than assuming it.
 
 | Code | `details` keys |
 |------|----------------|
-| `dw_autocorrelation` | `durbin_watson`, `iwres_lag1_autocorr` |
+| `dw_autocorrelation` | `durbin_watson`, `iwres_lag1_autocorr` (both the pooled values, also on the cross-block warning, whose own statistic and pair count are in the message only) |
 | `eps_shrinkage` | `eps_shrinkage` (fraction), `eps_shrinkage_pct` |
 | `eta_shrinkage` | `threshold_pct`, `high_shrinkage_etas` (array of `{eta, shrinkage_pct}`) |
 | `boundary_estimate` | `parameters` (array of `{parameter, estimate, bound, side}`) |

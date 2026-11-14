@@ -355,6 +355,11 @@ second warning reports both values and names the line `by ID`:
 | without a kappa | 1.94 | 1.36 | cross-block |
 | `ar1(RHO) by ID` instead | 2.36 | no such pair | none |
 
+Under `cs` both warnings name `ar1(RHO) by ID`, not `cs(RHO) by ID`: compound
+symmetry over a whole subject is the covariance a subject-level random effect
+already gives, so next to one it adds nothing (measured on the same data without a
+kappa: `cs(RHO) by ID` converges to the objective of the model without a line).
+
 The check needs at least 62 such pairs. Over `n` independent pairs the statistic
 has a standard deviation of about `2/√n`, so with fewer pairs a value below 1.5 is
 too often chance (13% of simulated data sets at 20 pairs, 2% at 62). With fewer

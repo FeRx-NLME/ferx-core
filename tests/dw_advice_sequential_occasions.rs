@@ -443,7 +443,9 @@ fn with_several_rows_per_occasion_the_subject_line_reaches_further() {
         let msg = the_dw_warning(&by_occ, &format!("rich {g:?} by OCC"));
         for must in [
             "between consecutive blocks of `correlation ar1(RHO) by OCC`",
-            "over the 72 pairs that join two blocks",
+            // The statistic itself (review of #2883, row 4): 1.17 is the sum over
+            // all 72 pairs; the last pair alone reads otherwise.
+            "Durbin-Watson = 1.17 over the 72 pairs that join two blocks",
             "1.68 over all pairs",
             "A line `by ID` correlates all rows of one subject.",
         ] {
@@ -632,6 +634,43 @@ fn the_advised_line_converges_and_resolves_the_warning() {
         msg.contains("between consecutive blocks of `correlation ar1(RHO) by OCC`")
             && msg.contains("over the 72 pairs that join two blocks")
             && msg.contains("A line `by ID` correlates all rows of one subject."),
+        "{msg}"
+    );
+
+    // Under `cs` the advice must not be "a line `by ID`" (review of #2883, row 1):
+    // `cs` over a whole subject is the covariance the subject's additive eta already
+    // gives. Measured by the reviewer (macOS arm64): `cs(RHO) by OCC` −206.449257 with
+    // the cross-block warning (1.28 over 72 pairs, 1.70 pooled); `cs(RHO) by ID`
+    // −132.318001, the objective of the model without a line.
+    let (_, no_line) = run(&model(g, ""), RICH, 200);
+    let (_, cs_occ) = run(&model(g, "correlation cs(RHO) by OCC"), RICH, 200);
+    let (_, cs_id) = run(&model(g, "correlation cs(RHO) by ID"), RICH, 200);
+    eprintln!(
+        "converged, rich, no kappa: no line {:.6}; cs by OCC {:.6} DW {:.6} {:?}; cs by ID {:.6}",
+        no_line.ofv,
+        cs_occ.ofv,
+        cs_occ.dw_statistic,
+        dw_warnings(&cs_occ),
+        cs_id.ofv
+    );
+    assert!(
+        (cs_id.ofv - no_line.ofv).abs() < 1e-3,
+        "`cs by ID` adds nothing next to an additive eta: {} vs {}",
+        cs_id.ofv,
+        no_line.ofv
+    );
+    assert!(
+        cs_occ.ofv < cs_id.ofv - 30.0,
+        "{} vs {}",
+        cs_occ.ofv,
+        cs_id.ofv
+    );
+    let msg = the_dw_warning(&cs_occ, "converged, rich, no kappa, cs by OCC");
+    assert!(
+        msg.contains("between consecutive blocks of `correlation cs(RHO) by OCC`")
+            && msg.contains("A `correlation ar1(RHO) by ID` line correlates all rows")
+            && msg.contains("`cs` over a whole subject")
+            && !msg.contains("A line `by ID`"),
         "{msg}"
     );
 }

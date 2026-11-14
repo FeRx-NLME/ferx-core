@@ -391,9 +391,8 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
             Some(by) => format!(
                 " The blocks of this line follow one another in time, so the statistic \
                  also pairs rows of consecutive blocks, which the line leaves \
-                 independent. A line `by {}` correlates all rows of one subject{}.",
-                by.column(),
-                by.clause()
+                 independent.{}",
+                by.sentence(kind)
             ),
         };
         Some(format!(
@@ -453,6 +452,31 @@ impl SubjectLine {
         }
     }
 
+    /// The sentence naming the line that spans a subject, for a model whose
+    /// `correlation` line has structure `kind` (review of #2883, row 1).
+    ///
+    /// Under `ar1` / `car1` only the `by` changes. Under `cs` the structure has to
+    /// change too: compound symmetry over a whole subject is the covariance a
+    /// subject-level random effect gives, so next to an additive one ρ and its
+    /// variance are not identified together. Measured on
+    /// `tests/data/dw_sequential_algebraic/rich.csv`: `cs(RHO) by ID` converges to
+    /// −132.318001, the objective of the model without a line, with ρ left at 0.30.
+    fn sentence(&self, kind: crate::types::ResidualSerialKind) -> String {
+        let (by, clause) = (self.column(), self.clause());
+        match kind {
+            crate::types::ResidualSerialKind::Cs => format!(
+                " A `correlation ar1(RHO) by {by}` line correlates all rows of one \
+                 subject{clause}, decaying with the number of visits between them; \
+                 `car1(RHO)` decays it with the time between rows instead. `cs` over a \
+                 whole subject is the correlation a subject-level random effect already \
+                 gives, so it would add nothing."
+            ),
+            crate::types::ResidualSerialKind::Ar1 | crate::types::ResidualSerialKind::Car1 => {
+                format!(" A line `by {by}` correlates all rows of one subject{clause}.")
+            }
+        }
+    }
+
     fn clause(&self) -> &'static str {
         match self {
             SubjectLine::ById(_) => "",
@@ -482,23 +506,32 @@ pub(crate) const DW_CROSS_BLOCK_MIN_PAIRS: usize = 62;
 /// case it exists for is a line `by` the visits with several rows per visit, where
 /// the pairs inside a block, which the line models, outnumber the ones across and
 /// pull the pooled statistic into the band.
+///
+/// A non-finite `pooled` is silent. No fit reaches it: every pair that joins two
+/// blocks is also a pooled pair, so the pooled statistic is finite whenever this
+/// one is.
 pub(crate) fn dw_cross_block_warning(
     cross: (usize, f64),
     pooled: f64,
     line: &str,
+    kind: crate::types::ResidualSerialKind,
     by: &SubjectLine,
 ) -> Option<String> {
     let (pairs, dw) = cross;
-    if pairs < DW_CROSS_BLOCK_MIN_PAIRS || !dw.is_finite() || dw >= 1.5 || pooled < 1.5 {
+    if pairs < DW_CROSS_BLOCK_MIN_PAIRS
+        || !dw.is_finite()
+        || dw >= 1.5
+        || !pooled.is_finite()
+        || pooled < 1.5
+    {
         return None;
     }
     Some(format!(
         "Positive autocorrelation between consecutive blocks of `{line}` (Durbin-Watson = \
          {dw:.2} over the {pairs} pairs that join two blocks; {pooled:.2} over all pairs). \
          The blocks follow one another in time, and the line leaves rows of different \
-         blocks independent. A line `by {}` correlates all rows of one subject{}.",
-        by.column(),
-        by.clause()
+         blocks independent.{}",
+        by.sentence(kind)
     ))
 }
 
@@ -3439,7 +3472,8 @@ fn fit_inner(
     // Under a `correlation` line the raw IWRES are correlated by construction; the
     // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
     // Either way each subject's series is split at its residual blocks and at its
-    // parallel occasions (#2798); occasions that run in time stay one series (#2829).
+    // occasions when these are parallel (#2798); blocks and occasions that run in
+    // time stay one series (#2829, #2858).
     // Both are read off `population` — the prepared one this fit scored, whose
     // occasions carry the `iov_column`, a derived rule's labels or the level cells.
     let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
@@ -3519,32 +3553,39 @@ fn fit_inner(
     });
 
     // DW autocorrelation warnings
-    let dw_warning = match (
-        &model.residual_serial,
-        crate::api::validation::residual_correlation_line(model),
-    ) {
-        (Some(serial), Some(line)) => dw_autocorrelation_warning_decorrelated(
+    let serial_line = model
+        .residual_serial
+        .as_ref()
+        .zip(crate::api::validation::residual_correlation_line(model));
+    let across_blocks = serial_line
+        .as_ref()
+        .and_then(|_| dw_across_blocks(population));
+    let dw_warning = match &serial_line {
+        Some((serial, line)) => dw_autocorrelation_warning_decorrelated(
             dw_statistic,
-            &line,
+            line,
             serial.kind,
-            dw_across_blocks(population),
+            across_blocks.clone(),
         ),
-        _ => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options, population)),
+        None => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options, population)),
     };
     if let Some(msg) = dw_warning {
         warnings.push(msg);
     }
-    if let (Some(line), Some(by)) = (
-        crate::api::validation::residual_correlation_line(model),
-        dw_across_blocks(population),
-    ) {
+    if let (Some((serial, line)), Some(by)) = (&serial_line, &across_blocks) {
         let cross = crate::stats::residual_error::whitened_cross_block_dw(
             model,
             population,
             &result.params,
             &subjects,
         );
-        warnings.extend(dw_cross_block_warning(cross, dw_statistic, &line, &by));
+        warnings.extend(dw_cross_block_warning(
+            cross,
+            dw_statistic,
+            line,
+            serial.kind,
+            by,
+        ));
     }
     // The published method is `None` whenever the step produced no matrix, so the method
     // gate inside is the only gate (#2415 review row 3).

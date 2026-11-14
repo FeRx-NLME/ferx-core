@@ -636,6 +636,14 @@ const ACROSS_BLOCKS_TEXT_ID: &str = " The blocks of this line follow one another
      A line `by COL` correlates all rows of one subject, with COL a numeric data column that \
      has one value per subject (`ID` is not numeric in this data).";
 
+/// The subject-line sentence under `cs` (review of #2883, row 1): the structure
+/// changes with the `by`, since `cs` over a whole subject is what a subject-level
+/// random effect already gives.
+const SUBJECT_LINE_UNDER_CS: &str = " A `correlation ar1(RHO) by ID` line correlates all rows of \
+     one subject, decaying with the number of visits between them; `car1(RHO)` decays it with \
+     the time between rows instead. `cs` over a whole subject is the correlation a \
+     subject-level random effect already gives, so it would add nothing.";
+
 /// #2858: when the statistic paired across blocks, every structure's positive text
 /// is today's text (pinned exactly above) plus one sentence, and the sentence
 /// depends only on how a subject-wide line is written. The negative text and the
@@ -647,6 +655,8 @@ const ACROSS_BLOCKS_TEXT_ID: &str = " The blocks of this line follow one another
 #[test]
 fn decorrelated_positive_message_across_blocks_names_the_subject_line() {
     use crate::types::ResidualSerialKind::{Ar1, Car1, Cs};
+    const BLOCKS: &str = " The blocks of this line follow one another in time, so the statistic \
+         also pairs rows of consecutive blocks, which the line leaves independent.";
     for (kind, line) in [
         (Cs, "correlation cs(RHO) by OCC"),
         (Ar1, "correlation ar1(RHO) by OCC"),
@@ -665,11 +675,6 @@ fn decorrelated_positive_message_across_blocks_names_the_subject_line() {
             Some(SubjectLine::ById("ID".into())),
         )
         .expect("below 1.5");
-        assert_eq!(by_id, format!("{within}{ACROSS_BLOCKS}"), "{kind:?}");
-        assert!(
-            by_id.contains("A line `by ID` correlates") && !by_id.contains("COL"),
-            "{by_id}"
-        );
         let by_col = dw_autocorrelation_warning_decorrelated(
             1.2,
             line,
@@ -677,17 +682,45 @@ fn decorrelated_positive_message_across_blocks_names_the_subject_line() {
             Some(SubjectLine::ByNumericColumn),
         )
         .expect("below 1.5");
-        assert_eq!(
-            by_col,
-            format!("{within}{ACROSS_BLOCKS_TEXT_ID}"),
-            "{kind:?}"
-        );
-        assert!(
-            by_col.contains("A line `by COL` correlates")
-                && by_col.contains("`ID` is not numeric")
-                && !by_col.contains("by ID`"),
-            "{by_col}"
-        );
+        if kind == Cs {
+            // Review of #2883, row 1: `cs by ID` next to a subject-level random
+            // effect is the confounded line, so the sentence names `ar1` / `car1`
+            // and never a bare "a line `by ID`".
+            assert_eq!(by_id, format!("{within}{BLOCKS}{SUBJECT_LINE_UNDER_CS}"));
+            assert!(
+                by_id.contains("`correlation ar1(RHO) by ID` line")
+                    && by_id.contains("`car1(RHO)`")
+                    && by_id.contains("`cs` over a whole subject")
+                    && !by_id.contains("A line `by ID`"),
+                "{by_id}"
+            );
+            assert!(
+                by_col.contains("`correlation ar1(RHO) by COL` line")
+                    && by_col.contains("`ID` is not numeric")
+                    && by_col.contains("`cs` over a whole subject")
+                    && !by_col.contains("by ID"),
+                "{by_col}"
+            );
+        } else {
+            assert_eq!(by_id, format!("{within}{ACROSS_BLOCKS}"), "{kind:?}");
+            assert!(
+                by_id.contains("A line `by ID` correlates")
+                    && !by_id.contains("COL")
+                    && !by_id.contains("`cs` over a whole subject"),
+                "{by_id}"
+            );
+            assert_eq!(
+                by_col,
+                format!("{within}{ACROSS_BLOCKS_TEXT_ID}"),
+                "{kind:?}"
+            );
+            assert!(
+                by_col.contains("A line `by COL` correlates")
+                    && by_col.contains("`ID` is not numeric")
+                    && !by_col.contains("by ID`"),
+                "{by_col}"
+            );
+        }
         for across in [
             Some(SubjectLine::ById("ID".into())),
             Some(SubjectLine::ByNumericColumn),
@@ -768,24 +801,48 @@ fn dw_across_blocks_is_some_only_when_blocks_in_time_were_joined() {
 /// speaks; a non-finite statistic); either sentence of the text deleted.
 #[test]
 fn cross_block_warning_text_and_gates() {
+    use crate::types::ResidualSerialKind::{Ar1, Car1, Cs};
     const LINE: &str = "correlation ar1(RHO) by OCC";
+    const LEAD: &str = "Positive autocorrelation between consecutive blocks of `correlation \
+         ar1(RHO) by OCC` (Durbin-Watson = 1.36 over the 72 pairs that join two blocks; 1.94 \
+         over all pairs). The blocks follow one another in time, and the line leaves rows of \
+         different blocks independent.";
     let by_id = SubjectLine::ById("ID".into());
     let n = DW_CROSS_BLOCK_MIN_PAIRS;
-    let msg = dw_cross_block_warning((72, 1.3579), 1.9388, LINE, &by_id).expect("fires");
-    assert_eq!(
-        msg,
-        "Positive autocorrelation between consecutive blocks of `correlation ar1(RHO) by \
-         OCC` (Durbin-Watson = 1.36 over the 72 pairs that join two blocks; 1.94 over all \
-         pairs). The blocks follow one another in time, and the line leaves rows of \
-         different blocks independent. A line `by ID` correlates all rows of one subject."
+    for kind in [Ar1, Car1] {
+        let msg = dw_cross_block_warning((72, 1.3579), 1.9388, LINE, kind, &by_id).expect("fires");
+        assert_eq!(
+            msg,
+            format!("{LEAD} A line `by ID` correlates all rows of one subject."),
+            "{kind:?}"
+        );
+        assert!(!msg.contains("COL") && !msg.contains("`cs` over"), "{msg}");
+        assert_eq!(
+            crate::types::classify_warning(&msg).category,
+            crate::types::WarningCode::DwAutocorrelation,
+            "{msg}"
+        );
+    }
+    // Under `cs` the sentence names the structure too (review of #2883, row 1).
+    let cs = dw_cross_block_warning((72, 1.3579), 1.9388, LINE, Cs, &by_id).expect("fires");
+    assert_eq!(cs, format!("{LEAD}{SUBJECT_LINE_UNDER_CS}"));
+    assert!(
+        cs.contains("`correlation ar1(RHO) by ID` line") && !cs.contains("A line `by ID`"),
+        "{cs}"
     );
     assert_eq!(
-        crate::types::classify_warning(&msg).category,
+        crate::types::classify_warning(&cs).category,
         crate::types::WarningCode::DwAutocorrelation,
-        "{msg}"
+        "{cs}"
     );
-    let text_id = dw_cross_block_warning((72, 1.3579), 1.9388, LINE, &SubjectLine::ByNumericColumn)
-        .expect("fires");
+    let text_id = dw_cross_block_warning(
+        (72, 1.3579),
+        1.9388,
+        LINE,
+        Ar1,
+        &SubjectLine::ByNumericColumn,
+    )
+    .expect("fires");
     assert!(
         text_id.ends_with(
             "A line `by COL` correlates all rows of one subject, with COL a numeric data \
@@ -793,27 +850,20 @@ fn cross_block_warning_text_and_gates() {
         ) && !text_id.contains("by ID`"),
         "{text_id}"
     );
-    assert!(!msg.contains("COL"), "{msg}");
     // Each gate, the firing side then the silent one.
-    assert!(dw_cross_block_warning((n, 1.3), 2.0, LINE, &by_id).is_some());
-    assert_eq!(
-        dw_cross_block_warning((n - 1, 1.3), 2.0, LINE, &by_id),
-        None
-    );
-    assert!(dw_cross_block_warning((n, 1.4999), 2.0, LINE, &by_id).is_some());
-    assert_eq!(dw_cross_block_warning((n, 1.5), 2.0, LINE, &by_id), None);
-    assert!(dw_cross_block_warning((n, 1.3), 1.5, LINE, &by_id).is_some());
-    assert_eq!(dw_cross_block_warning((n, 1.3), 1.4999, LINE, &by_id), None);
-    assert_eq!(
-        dw_cross_block_warning((n, f64::NAN), 2.0, LINE, &by_id),
-        None
-    );
-    assert_eq!(
-        dw_cross_block_warning((0, f64::NAN), 2.0, LINE, &by_id),
-        None
-    );
-    // A pooled statistic that is `NaN` is not "below 1.5": the subset still speaks.
-    assert!(dw_cross_block_warning((n, 1.3), f64::NAN, LINE, &by_id).is_some());
+    let fires = |cross, pooled| dw_cross_block_warning(cross, pooled, LINE, Ar1, &by_id);
+    assert!(fires((n, 1.3), 2.0).is_some());
+    assert_eq!(fires((n - 1, 1.3), 2.0), None);
+    assert!(fires((n, 1.4999), 2.0).is_some());
+    assert_eq!(fires((n, 1.5), 2.0), None);
+    assert!(fires((n, 1.3), 1.5).is_some());
+    assert_eq!(fires((n, 1.3), 1.4999), None);
+    assert_eq!(fires((n, f64::NAN), 2.0), None);
+    assert_eq!(fires((0, f64::NAN), 2.0), None);
+    // A non-finite pooled statistic is silent (review of #2883, row 5). No fit
+    // reaches this cell: every cross-block pair is also a pooled pair.
+    assert_eq!(fires((n, 1.3), f64::NAN), None);
+    assert_eq!(fires((n, 1.3), f64::INFINITY), None);
 }
 
 /// #2858: the floor on the pair count. On independent rows the statistic over
