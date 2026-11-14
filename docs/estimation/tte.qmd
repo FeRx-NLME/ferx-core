@@ -1250,8 +1250,10 @@ time is still in it. `ferx_core::stats::km::kaplan_meier_mean_covariate` compute
 per row of the Kaplan–Meier curve. Read at a time, the curve takes the set at risk *at* that
 time: the value of the first row at or after it. Before the first row it is the mean over
 everyone, and past the last time it is undefined. A step plot of the rows therefore steps just
-after each row's time; Xpose 4 plots the value just after the step, the same function seen
-from the right.
+after each row's time. At an event time, Xpose 4's `kaplan.plot` plots the value just after
+the step, the same function seen from the right. At a time with only censorings its observed
+curve carries the previous value, while its simulated curve takes the set at that time, so
+its two curves differ there; ferx applies the one rule to both.
 
 The floor applies to the observed curve and to each replicate on its own: a replicate with too
 few subjects at risk at a grid time is left out of the band there, and `n_used` shows how many

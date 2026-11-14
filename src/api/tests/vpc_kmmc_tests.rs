@@ -311,8 +311,9 @@ fn band_collapses_to_the_population_mean_at_time_zero() {
 
 /// K7b. `level: Some(2)` gives the share of at-risk subjects at level 2, not the mean
 /// of the codes: `Z` cycles 0, 1, 2 over 30 subjects with events at 1..30, so 10 of 30
-/// are at 2 at t = 1, and at t = 29 the two subjects left are 29 (`Z` = 1) and 30
-/// (`Z` = 2), a share of 1/2. Ignoring `level` gives 1 and 1.5.
+/// are at 2 at t = 1, and at t = 29 the two subjects left are 29 (`Z` = 2) and 30
+/// (`Z` = 0), a share of 1/2. Ignoring `level` gives the mean of the codes, 1 at both
+/// times, so both assertions fail.
 #[test]
 fn level_gives_the_share_at_that_level() {
     let p = pop((1..=30)
@@ -347,8 +348,6 @@ fn driver_floors_the_band_and_the_observed_curve() {
     assert!(s.observed.at(26.0, 1).is_some());
 
     let (rows, _, _) = observed_rows(Entry::Kmmc, &p, 2, &VpcStratify::None).unwrap();
-    let mut v = o.vpc.clone();
-    v.sim.horizon = Some(r.horizon);
     let (reps, _) = simulate_replicates(
         &m,
         &p,
@@ -383,7 +382,6 @@ fn driver_floors_the_band_and_the_observed_curve() {
     assert!(floored < unfloored, "straddle: {floored} vs {unfloored}");
     assert!(floored > 0, "some replicate keeps 10 at risk at 26");
     assert_eq!(s.n_used[1], floored);
-    let _ = v;
 }
 
 // ── K8: messages ─────────────────────────────────────────────────────────────
