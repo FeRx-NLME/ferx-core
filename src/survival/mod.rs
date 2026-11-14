@@ -2073,6 +2073,11 @@ fn simulate_rtte_stream<R: rand::Rng>(
 // as the sole caller `emit_subject_rows`, which carries this same allow: the args
 // are heterogeneous with no cohesive struct to bundle, and splitting them would
 // only diverge from that sibling.
+///
+/// A degenerate analytic hazard draw (#763) is reported as one `W_TTE_DEGENERATE_HAZARD`
+/// line per affected cause of this call. The `simulate*` entry points, which call this
+/// once per replicate, go through `simulate_tte_reporting` instead and report each
+/// (subject, CMT) once for the whole run (#1648).
 #[allow(clippy::too_many_arguments)]
 pub fn simulate_tte<R: rand::Rng>(
     model: &crate::types::CompiledModel,
@@ -2085,6 +2090,48 @@ pub fn simulate_tte<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<crate::api::SimulationResult>,
     warnings: &mut Vec<String>,
+) {
+    let mut degenerate = Vec::new();
+    simulate_tte_reporting(
+        model,
+        subject,
+        theta,
+        eta,
+        draw,
+        sim,
+        horizon,
+        rng,
+        results,
+        warnings,
+        &mut degenerate,
+    );
+    // After the call's other lines. A call never produces both kinds: a single cause is
+    // either an analytic draw or an ODE solve, and a competing-risks subject with a failed
+    // ODE cause returns before the degenerate check.
+    warnings.extend(
+        degenerate
+            .into_iter()
+            .map(|cmt| degenerate_hazard_warning(&subject.id, cmt)),
+    );
+}
+
+/// The body of [`simulate_tte`], reporting each cause whose analytic hazard draw
+/// degenerated (#763) as its CMT in `degenerate` instead of as a warning line, so a caller
+/// that simulates many replicates can report a (subject, CMT) once (#1648). Rows, the RNG
+/// stream and every other warning are those of [`simulate_tte`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    theta: &[f64],
+    eta: &[f64],
+    draw: usize,
+    sim: usize,
+    horizon: Option<f64>,
+    rng: &mut R,
+    results: &mut Vec<crate::api::SimulationResult>,
+    warnings: &mut Vec<String>,
+    degenerate: &mut Vec<usize>,
 ) {
     // Repeated events (RTTE, Slice 3.3) are a *recurrent* process, not competing
     // single events: a subject's rows at the RTTE CMT are one stream to be
@@ -2188,10 +2235,10 @@ pub fn simulate_tte<R: rand::Rng>(
                     params,
                     entry_time,
                 } => {
-                    let (t, observed, degenerate) =
+                    let (t, observed, is_degenerate) =
                         draw_tte_outcome(*family, params, *entry_time, *window, rng);
-                    if degenerate {
-                        warnings.push(degenerate_hazard_warning(&subject.id, *cmt));
+                    if is_degenerate {
+                        degenerate.push(*cmt);
                     }
                     (t, observed)
                 }
@@ -2279,7 +2326,7 @@ pub fn simulate_tte<R: rand::Rng>(
             if !event {
                 for (i, (cmt, _, kind)) in causes.iter().enumerate() {
                     if matches!(kind, CauseKind::Analytic { .. }) && latents[i] >= f64::MAX {
-                        warnings.push(degenerate_hazard_warning(&subject.id, *cmt));
+                        degenerate.push(*cmt);
                     }
                 }
             }
@@ -2295,11 +2342,144 @@ pub fn simulate_tte<R: rand::Rng>(
 /// no event) — collected into [`crate::api::SimulationOutput::warnings`] (#763).
 #[cfg(feature = "survival")]
 fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
+    degenerate_hazard_text(id, cmt, "", "")
+}
+
+/// The one owner of the `W_TTE_DEGENERATE_HAZARD` text. `extent` says in how many
+/// replicates the draw degenerated and `censored_where` in which of them the subject is
+/// censored; both are empty for a single replicate, which gives the per-call line.
+#[cfg(feature = "survival")]
+fn degenerate_hazard_text(id: &str, cmt: usize, extent: &str, censored_where: &str) -> String {
     format!(
         "W_TTE_DEGENERATE_HAZARD: subject '{id}' (CMT={cmt}) drew a non-positive / non-finite \
-         effective hazard rate; no event was generated and the subject is censored at the \
-         observation window (#763). Check the hazard parameters / covariate values."
+         effective hazard rate{extent}; no event was generated and the subject is censored at \
+         the observation window{censored_where} (#763). Check the hazard parameters / \
+         covariate values."
     )
+}
+
+/// How many indices a `W_TTE_DEGENERATE_HAZARD` line names before it counts the rest.
+const DEGENERATE_INDEX_CAP: usize = 10;
+
+/// Every degenerate analytic hazard draw (#763) of one simulation run, so the run reports
+/// each (subject, CMT) on one `W_TTE_DEGENERATE_HAZARD` line with the number of replicates
+/// affected, where it used to repeat an identical line per replicate (#1648).
+///
+/// One tally is threaded through the simulate chokepoint, as `SimulatedFlipFlopTally`
+/// is, and rendered once by the entry point that sees every draw. The row-only entry
+/// points drop it. It reads no random number and writes no row.
+#[derive(Default)]
+pub(crate) struct DegenerateHazardTally {
+    /// Replicates simulated: every `sim` of every draw that ran.
+    replicates: usize,
+    /// Draws simulated. An uncertainty draw that was skipped never reaches the chokepoint
+    /// and is not counted.
+    draws: usize,
+    /// Per (subject id, CMT), in first-seen order: the `(draw, sim)` of each affected
+    /// replicate, in simulation order.
+    hits: Vec<(String, usize, Vec<(usize, usize)>)>,
+}
+
+impl DegenerateHazardTally {
+    /// Count one draw of `n_sim` replicates, once the chokepoint is about to simulate it.
+    pub(crate) fn count_draw(&mut self, n_sim: usize) {
+        self.draws += 1;
+        self.replicates += n_sim;
+    }
+
+    /// Record that `id`'s cause on `cmt` degenerated in replicate `(draw, sim)`.
+    pub(crate) fn record(&mut self, id: &str, cmt: usize, draw: usize, sim: usize) {
+        match self
+            .hits
+            .iter_mut()
+            .find(|(seen, c, _)| seen == id && *c == cmt)
+        {
+            Some((_, _, at)) => at.push((draw, sim)),
+            None => self.hits.push((id.to_string(), cmt, vec![(draw, sim)])),
+        }
+    }
+
+    /// One line per (subject, CMT) for a run of one parameter set, naming the affected
+    /// replicates by their `sim` index.
+    pub(crate) fn warnings_by_replicate(&self) -> Vec<String> {
+        self.render(false)
+    }
+
+    /// One line per (subject, CMT) for a run over uncertainty draws, naming the affected
+    /// **draws**: a `sim` index repeats in every draw, so it does not identify a replicate.
+    /// A run of a single draw has no such ambiguity and reads as
+    /// [`DegenerateHazardTally::warnings_by_replicate`].
+    pub(crate) fn warnings_by_draw(&self) -> Vec<String> {
+        self.render(self.draws > 1)
+    }
+
+    fn render(&self, by_draw: bool) -> Vec<String> {
+        let n = self.replicates;
+        self.hits
+            .iter()
+            .map(|(id, cmt, at)| {
+                let k = at.len();
+                // A single replicate: the per-call text, byte for byte.
+                if n <= 1 {
+                    return degenerate_hazard_warning(id, *cmt);
+                }
+                let those = if k == 1 {
+                    " in that replicate"
+                } else {
+                    " in those replicates"
+                };
+                let (extent, censored_where) = match (by_draw, k == n) {
+                    (false, true) => (format!(" in all {n} replicates"), " in every replicate"),
+                    (false, false) => {
+                        let sims: Vec<usize> = at.iter().map(|(_, sim)| *sim).collect();
+                        (
+                            format!(" in {k} of {n} replicates ({})", index_list("sim", &sims)),
+                            those,
+                        )
+                    }
+                    (true, true) => (
+                        format!(
+                            " in all {n} replicates of all {} simulated uncertainty draws",
+                            self.draws
+                        ),
+                        " in every replicate",
+                    ),
+                    (true, false) => {
+                        let mut draws: Vec<usize> = at.iter().map(|(draw, _)| *draw).collect();
+                        draws.dedup();
+                        (
+                            format!(
+                                " in {k} of {n} replicates, in {} of {} simulated uncertainty \
+                                 draws ({})",
+                                draws.len(),
+                                self.draws,
+                                index_list("draw", &draws)
+                            ),
+                            those,
+                        )
+                    }
+                };
+                degenerate_hazard_text(id, *cmt, &extent, censored_where)
+            })
+            .collect()
+    }
+}
+
+/// `"sim 3, 17, 41"`: the first [`DEGENERATE_INDEX_CAP`] indices under the row field's
+/// name, then how many more there are.
+fn index_list(label: &str, indices: &[usize]) -> String {
+    let shown: Vec<String> = indices
+        .iter()
+        .take(DEGENERATE_INDEX_CAP)
+        .map(usize::to_string)
+        .collect();
+    let rest = indices.len().saturating_sub(DEGENERATE_INDEX_CAP);
+    let more = if rest > 0 {
+        format!(" and {rest} more")
+    } else {
+        String::new()
+    };
+    format!("{label} {}{more}", shown.join(", "))
 }
 
 /// Diagnostic for a subject whose ODE-accumulated event-time solve failed (#2087):
@@ -2442,6 +2622,10 @@ pub(crate) mod endpoint_order_test_helpers;
 #[cfg(test)]
 #[path = "endpoint_order_tests.rs"]
 mod endpoint_order_tests;
+
+#[cfg(test)]
+#[path = "degenerate_tally_tests.rs"]
+mod degenerate_tally_tests;
 
 #[cfg(test)]
 mod tests {

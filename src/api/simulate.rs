@@ -747,8 +747,10 @@ pub fn simulate_with_options(
 /// rows and any non-fatal warnings. [`simulate_with_options`] is the thin wrapper that returns
 /// only the rows.
 ///
-/// Five sources feed `warnings`, in this order: per-subject simulation diagnostics (a
-/// degenerate hazard draw, #763; a degenerate recurrent stream skipped, #762), one
+/// Six sources feed `warnings`, in this order: per-subject simulation diagnostics (a
+/// degenerate recurrent stream skipped, #762; a failed event-time solve, #2087), one
+/// `W_TTE_DEGENERATE_HAZARD` line per subject and CMT whose analytic hazard draw
+/// degenerated, with the replicates it happened in (#763, #1648), one
 /// `W_SIMULATED_FLIP_FLOP` count of the simulated individuals dosed before one of their
 /// observations whose sampled η entered a twin-less transit / IG closed form's flip-flop
 /// regime, so their entire dose-driven concentration was clamped to zero (#1823), capped
@@ -875,6 +877,7 @@ pub(super) fn simulate_with_options_impl(
         None => {
             let mut warnings = Vec::new();
             let mut flip_flop = SimulatedFlipFlopTally::default();
+            let mut degenerate = DegenerateHazardTally::default();
             // One scope around the whole pass, not one per subject: this loop is serial (the
             // RNG draw order is part of `simulate`'s contract), so the thread-local scope sees
             // every subject's integrations. #1304.
@@ -892,10 +895,12 @@ pub(super) fn simulate_with_options_impl(
                     &mut rng,
                     &mut warnings,
                     &mut flip_flop,
+                    &mut degenerate,
                     with_parameters.then_some(&mut table),
                 )
             });
             let results = results?;
+            warnings.extend(degenerate.warnings_by_replicate());
             warnings.extend(flip_flop.warning(model));
             warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
             warnings.extend(iov_warning);
@@ -1003,6 +1008,7 @@ pub(super) fn simulate_with_options_impl(
     let omega_inv = &params.omega.inv;
     let mut warnings = Vec::new();
     let mut flip_flop = SimulatedFlipFlopTally::default();
+    let mut degenerate = DegenerateHazardTally::default();
     // Same scope the non-propensity branch opens. Both branches, not the shared chokepoint
     // below them: `simulate_inner_with_draw` is also what `simulate_with_uncertainty_diag`
     // calls once per draw, and that caller opens one scope around all of its draws (with its
@@ -1021,10 +1027,12 @@ pub(super) fn simulate_with_options_impl(
             &mut rng,
             &mut warnings,
             &mut flip_flop,
+            &mut degenerate,
             with_parameters.then_some(&mut table),
         )
     });
     let results = results?;
+    warnings.extend(degenerate.warnings_by_replicate());
     warnings.extend(flip_flop.warning(model));
     warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
     warnings.extend(iov_warning);
@@ -1040,6 +1048,28 @@ pub(super) fn simulate_with_options_impl(
         warnings,
         parameters: table,
     })
+}
+
+#[cfg(feature = "survival")]
+use crate::survival::DegenerateHazardTally;
+
+/// Without the `survival` feature there is no TTE endpoint and so nothing to tally: the
+/// stand-in keeps the chokepoint's signature the same in both builds.
+#[cfg(not(feature = "survival"))]
+#[derive(Default)]
+struct DegenerateHazardTally;
+
+#[cfg(not(feature = "survival"))]
+impl DegenerateHazardTally {
+    fn count_draw(&mut self, _n_sim: usize) {}
+
+    fn warnings_by_replicate(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn warnings_by_draw(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 fn simulate_inner<R: rand::Rng>(
@@ -1076,6 +1106,8 @@ fn simulate_inner<R: rand::Rng>(
         rng,
         &mut warnings,
         &mut flip_flop,
+        // Dropped, as the flip-flop tally is: these entry points return rows only.
+        &mut DegenerateHazardTally::default(),
         None,
     )
 }
@@ -1105,11 +1137,13 @@ fn emit_subject_rows<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
     warnings: &mut Vec<String>,
+    degenerate: &mut DegenerateHazardTally,
 ) -> DrawnPrediction {
-    // `horizon` and `warnings` are consumed only by the TTE path below; without the
-    // `survival` feature there are no TTE endpoints, so discard them to avoid unused-arg warns.
+    // `horizon`, `warnings` and `degenerate` are consumed only by the TTE path below;
+    // without the `survival` feature there are no TTE endpoints, so discard them to avoid
+    // unused-arg warns.
     #[cfg(not(feature = "survival"))]
-    let _ = (horizon, &mut *warnings);
+    let _ = (horizon, &mut *warnings, &mut *degenerate);
 
     // Predict IPRED. For IOV models (`n_kappa > 0`) route through the
     // occasion-aware `predict_iov`, drawing one independent κ ~ N(0, Ω_IOV) per
@@ -1222,19 +1256,28 @@ fn emit_subject_rows<R: rand::Rng>(
     }
 
     // TTE simulation path (requires survival feature)
+    // A degenerate analytic hazard draw (#763) goes to the run's tally, which reports each
+    // (subject, CMT) once (#1648), not to `warnings` once per replicate.
     #[cfg(feature = "survival")]
-    crate::survival::simulate_tte(
-        model,
-        subject,
-        &params.theta,
-        eta_slice,
-        draw,
-        sim,
-        horizon,
-        rng,
-        results,
-        warnings,
-    );
+    {
+        let mut degenerate_cmts = Vec::new();
+        crate::survival::simulate_tte_reporting(
+            model,
+            subject,
+            &params.theta,
+            eta_slice,
+            draw,
+            sim,
+            horizon,
+            rng,
+            results,
+            warnings,
+            &mut degenerate_cmts,
+        );
+        for cmt in degenerate_cmts {
+            degenerate.record(&subject.id, cmt, draw, sim);
+        }
+    }
 
     // Binary / discrete-endpoint simulation path (#760 Slice 1b). Like the TTE path
     // above, these rows live in `obs_records` and are invisible to the Gaussian
@@ -1676,6 +1719,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     rng: &mut R,
     warnings: &mut Vec<String>,
     flip_flop: &mut SimulatedFlipFlopTally,
+    degenerate: &mut DegenerateHazardTally,
     mut table: Option<&mut SimulatedParameters>,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     use rand_distr::Normal;
@@ -1768,6 +1812,10 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     let mut results = Vec::new();
 
+    // Past every refusal above: this draw's `n_sim` replicates are simulated, so they are
+    // the denominator the #1648 degenerate-hazard lines report against.
+    degenerate.count_draw(n_sim);
+
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         // What each subject of this replicate was drawn with, for the parameter table
@@ -1817,6 +1865,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         rng,
                         &mut results,
                         &mut *warnings,
+                        &mut *degenerate,
                     );
                     if table.is_some() {
                         drawn.push(DrawnSubject::new(
@@ -1853,6 +1902,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         rng,
                         &mut results,
                         &mut *warnings,
+                        &mut *degenerate,
                     );
                     // Every row the subject emitted — Gaussian, TTE and categorical alike —
                     // reports the class it ran under (#2372).
@@ -2183,7 +2233,9 @@ pub fn simulate_with_uncertainty(
 /// [`simulate_with_options_diag`].
 ///
 /// `results` is exactly what [`simulate_with_uncertainty`] returns. `warnings` carries, in this
-/// order: the per-subject simulation diagnostics (a degenerate hazard draw, #763 / #762), one
+/// order: the per-subject simulation diagnostics (#762, #2087), one `W_TTE_DEGENERATE_HAZARD`
+/// line per subject and CMT whose analytic hazard draw degenerated, with the number of
+/// replicates and the uncertainty draws it happened in (#763, #1648), one
 /// `W_UNCERTAINTY_DRAWS_SKIPPED` warning naming every draw skipped because it landed in the
 /// flip-flop regime of a twin-less transit / IG closed form (#786, #1485), one
 /// `W_SIMULATED_FLIP_FLOP` count of the eligible individuals *inside* the draws that ran
@@ -2370,6 +2422,9 @@ pub(super) fn simulate_uncertainty_draws(
     // tallied individual is an η within an otherwise serviceable draw — so both warnings
     // can fire on one run.
     let mut flip_flop = SimulatedFlipFlopTally::default();
+    // One #1648 tally across the same draws: a (subject, CMT) whose analytic hazard draw
+    // degenerated is reported once, against the replicates and draws that ran.
+    let mut degenerate = DegenerateHazardTally::default();
     // The draw-independent half of the chokepoint's list, run once at the first draw that is
     // simulated (#1288). Not "at draw 1": the skip below can pass over draw 1, and a check
     // keyed to it would then never run. Lazily, so a run whose every draw is skipped is
@@ -2408,10 +2463,14 @@ pub(super) fn simulate_uncertainty_draws(
             rng,
             sim_warnings,
             &mut flip_flop,
+            &mut degenerate,
             table.as_deref_mut(),
         )?;
         results.append(&mut rows);
     }
+    // After every per-subject line and before the two run-level findings below. A run whose
+    // every draw was skipped simulated nothing, so this is empty when the refusal fires.
+    sim_warnings.extend(degenerate.warnings_by_draw());
     if let Some(reason) = first_reason {
         if skipped.len() == draws.len() {
             first_error(&all_uncertainty_draws_skipped_diags(
@@ -2548,7 +2607,8 @@ impl SimulatedParameters {
 /// no event (#763), or a hazard so extreme its recurrent stream is skipped rather than
 /// materialised (#762) — is handled *per subject* (censored / skipped, the run
 /// continues) and named here, instead of silently vanishing into the censored rows or
-/// aborting the whole run. Since #1280 / #1304 it also carries the shared non-fit diagnostics
+/// aborting the whole run. A degenerate hazard draw is named once per subject and CMT for
+/// the whole run, with the replicates affected, not once per replicate (#1648). Since #1280 / #1304 it also carries the shared non-fit diagnostics
 /// bundle: parse warnings, data-reader warnings, the model/data checks (`W_STEADY_STATE_*`,
 /// `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …), experimental-feature notices, and this pass's
 /// ODE-solver diagnostics (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a clean simulation of a

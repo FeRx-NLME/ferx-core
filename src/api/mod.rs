@@ -474,6 +474,9 @@ mod ctmm_time_dependent_pk_tests;
 #[path = "tests/entry_point_errors_tests.rs"]
 mod entry_point_errors_tests;
 // #1774: the codes of the predict / simulate / adaptive refusals `ferx check` cannot reach.
+#[cfg(all(test, feature = "survival"))]
+#[path = "tests/degenerate_hazard_once_tests.rs"]
+mod degenerate_hazard_once_tests;
 #[cfg(test)]
 #[path = "tests/entry_refusal_codes_tests.rs"]
 mod entry_refusal_codes_tests;
