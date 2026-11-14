@@ -2342,28 +2342,33 @@ pub(crate) fn simulate_tte_reporting<R: rand::Rng>(
 /// no event) — collected into [`crate::api::SimulationOutput::warnings`] (#763).
 #[cfg(feature = "survival")]
 fn degenerate_hazard_warning(id: &str, cmt: usize) -> String {
-    degenerate_hazard_text(id, cmt, "", "")
+    degenerate_hazard_text(id, cmt, "")
 }
 
-/// The one owner of the `W_TTE_DEGENERATE_HAZARD` text. `extent` says in how many
-/// replicates the draw degenerated and `censored_where` in which of them the subject is
-/// censored; both are empty for a single replicate, which gives the per-call line.
+/// The one owner of the `W_TTE_DEGENERATE_HAZARD` text. `censored_in` says in which
+/// replicates the subject was censored because of the degenerate draw; it is empty for a
+/// single replicate, which gives the per-call line.
+///
+/// The count sits on the censoring claim, not on "drew", because that is what is counted:
+/// under competing risks a degenerate cause is reported only when the subject ends
+/// censored, and a replicate in which another cause fired is not (#1648 review r1).
 #[cfg(feature = "survival")]
-fn degenerate_hazard_text(id: &str, cmt: usize, extent: &str, censored_where: &str) -> String {
+fn degenerate_hazard_text(id: &str, cmt: usize, censored_in: &str) -> String {
     format!(
         "W_TTE_DEGENERATE_HAZARD: subject '{id}' (CMT={cmt}) drew a non-positive / non-finite \
-         effective hazard rate{extent}; no event was generated and the subject is censored at \
-         the observation window{censored_where} (#763). Check the hazard parameters / \
-         covariate values."
+         effective hazard rate; no event was generated and the subject is censored at the \
+         observation window{censored_in} (#763). Check the hazard parameters / covariate \
+         values."
     )
 }
 
 /// How many indices a `W_TTE_DEGENERATE_HAZARD` line names before it counts the rest.
 const DEGENERATE_INDEX_CAP: usize = 10;
 
-/// Every degenerate analytic hazard draw (#763) of one simulation run, so the run reports
-/// each (subject, CMT) on one `W_TTE_DEGENERATE_HAZARD` line with the number of replicates
-/// affected, where it used to repeat an identical line per replicate (#1648).
+/// Every degenerate analytic hazard draw (#763) of one simulation run that left its subject
+/// censored, so the run reports each (subject, CMT) on one `W_TTE_DEGENERATE_HAZARD` line
+/// with the number of replicates affected, where it used to repeat an identical line per
+/// replicate (#1648).
 ///
 /// One tally is threaded through the simulate chokepoint, as `SimulatedFlipFlopTally`
 /// is, and rendered once by the entry point that sees every draw. The row-only entry
@@ -2375,9 +2380,11 @@ pub(crate) struct DegenerateHazardTally {
     /// Draws simulated. An uncertainty draw that was skipped never reaches the chokepoint
     /// and is not counted.
     draws: usize,
-    /// Per (subject id, CMT), in first-seen order: the `(draw, sim)` of each affected
-    /// replicate, in simulation order.
-    hits: Vec<(String, usize, Vec<(usize, usize)>)>,
+    /// Per (subject's position in the population, CMT): the subject's id and the
+    /// `(draw, sim)` of each affected replicate, in simulation order. Keyed on the
+    /// position, not the id: two subjects may share an id (the data reader starts a new
+    /// subject whenever `ID` changes, so `1, 2, 1` is two subjects named `1`).
+    hits: Vec<(usize, usize, String, Vec<(usize, usize)>)>,
 }
 
 impl DegenerateHazardTally {
@@ -2387,15 +2394,25 @@ impl DegenerateHazardTally {
         self.replicates += n_sim;
     }
 
-    /// Record that `id`'s cause on `cmt` degenerated in replicate `(draw, sim)`.
-    pub(crate) fn record(&mut self, id: &str, cmt: usize, draw: usize, sim: usize) {
+    /// Record that the subject at `position` (named `id`) was censored in replicate
+    /// `(draw, sim)` because its cause on `cmt` degenerated.
+    pub(crate) fn record(
+        &mut self,
+        position: usize,
+        id: &str,
+        cmt: usize,
+        draw: usize,
+        sim: usize,
+    ) {
         match self
             .hits
             .iter_mut()
-            .find(|(seen, c, _)| seen == id && *c == cmt)
+            .find(|(at_position, c, _, _)| *at_position == position && *c == cmt)
         {
-            Some((_, _, at)) => at.push((draw, sim)),
-            None => self.hits.push((id.to_string(), cmt, vec![(draw, sim)])),
+            Some((_, _, _, at)) => at.push((draw, sim)),
+            None => self
+                .hits
+                .push((position, cmt, id.to_string(), vec![(draw, sim)])),
         }
     }
 
@@ -2413,53 +2430,43 @@ impl DegenerateHazardTally {
         self.render(self.draws > 1)
     }
 
+    /// The lines in population order, then CMT order: the order a reader scans the data in,
+    /// and the same for every seed.
     fn render(&self, by_draw: bool) -> Vec<String> {
         let n = self.replicates;
-        self.hits
-            .iter()
-            .map(|(id, cmt, at)| {
+        let mut hits: Vec<&(usize, usize, String, Vec<(usize, usize)>)> =
+            self.hits.iter().collect();
+        hits.sort_by_key(|(position, cmt, _, _)| (*position, *cmt));
+        hits.into_iter()
+            .map(|(_, cmt, id, at)| {
                 let k = at.len();
                 // A single replicate: the per-call text, byte for byte.
                 if n <= 1 {
                     return degenerate_hazard_warning(id, *cmt);
                 }
-                let those = if k == 1 {
-                    " in that replicate"
-                } else {
-                    " in those replicates"
-                };
-                let (extent, censored_where) = match (by_draw, k == n) {
-                    (false, true) => (format!(" in all {n} replicates"), " in every replicate"),
+                let censored_in = match (by_draw, k == n) {
+                    (false, true) => format!(" in all {n} replicates"),
                     (false, false) => {
                         let sims: Vec<usize> = at.iter().map(|(_, sim)| *sim).collect();
-                        (
-                            format!(" in {k} of {n} replicates ({})", index_list("sim", &sims)),
-                            those,
-                        )
+                        format!(" in {k} of {n} replicates ({})", index_list("sim", &sims))
                     }
-                    (true, true) => (
-                        format!(
-                            " in all {n} replicates of all {} simulated uncertainty draws",
-                            self.draws
-                        ),
-                        " in every replicate",
+                    (true, true) => format!(
+                        " in all {n} replicates of all {} simulated uncertainty draws",
+                        self.draws
                     ),
                     (true, false) => {
                         let mut draws: Vec<usize> = at.iter().map(|(draw, _)| *draw).collect();
                         draws.dedup();
-                        (
-                            format!(
-                                " in {k} of {n} replicates, in {} of {} simulated uncertainty \
-                                 draws ({})",
-                                draws.len(),
-                                self.draws,
-                                index_list("draw", &draws)
-                            ),
-                            those,
+                        format!(
+                            " in {k} of {n} replicates, in {} of {} simulated uncertainty draws \
+                             ({})",
+                            draws.len(),
+                            self.draws,
+                            index_list("draw", &draws)
                         )
                     }
                 };
-                degenerate_hazard_text(id, *cmt, &extent, censored_where)
+                degenerate_hazard_text(id, *cmt, &censored_in)
             })
             .collect()
     }

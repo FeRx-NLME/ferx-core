@@ -1127,6 +1127,9 @@ pub(crate) fn obs_row_time(subject: &Subject, j: usize) -> f64 {
 fn emit_subject_rows<R: rand::Rng>(
     model: &CompiledModel,
     subject: &Subject,
+    // The subject's position in the population: what the #1648 tally keys on, since two
+    // subjects may share an id.
+    subject_index: usize,
     kappa_draw: Option<&crate::stats::nested_levels::KappaDraw>,
     params: &ModelParameters,
     eta_slice: &[f64],
@@ -1143,7 +1146,7 @@ fn emit_subject_rows<R: rand::Rng>(
     // without the `survival` feature there are no TTE endpoints, so discard them to avoid
     // unused-arg warns.
     #[cfg(not(feature = "survival"))]
-    let _ = (horizon, &mut *warnings, &mut *degenerate);
+    let _ = (horizon, &mut *warnings, &mut *degenerate, subject_index);
 
     // Predict IPRED. For IOV models (`n_kappa > 0`) route through the
     // occasion-aware `predict_iov`, drawing one independent κ ~ N(0, Ω_IOV) per
@@ -1275,7 +1278,7 @@ fn emit_subject_rows<R: rand::Rng>(
             &mut degenerate_cmts,
         );
         for cmt in degenerate_cmts {
-            degenerate.record(&subject.id, cmt, draw, sim);
+            degenerate.record(subject_index, &subject.id, cmt, draw, sim);
         }
     }
 
@@ -1855,6 +1858,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     let predicted = emit_subject_rows(
                         model,
                         subject,
+                        i,
                         kappa_draws.get(i),
                         params,
                         &eta_slice,
@@ -1892,6 +1896,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     let predicted = emit_subject_rows(
                         model,
                         subject,
+                        i,
                         kappa_draws.get(i),
                         class.params,
                         &eta_slice,

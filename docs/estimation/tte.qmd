@@ -1155,9 +1155,9 @@ censoring overstates survival. Rather than let these look like ordinary censorin
 the affected subjects (`W_TTE_DEGENERATE_HAZARD` / `W_RTTE_DEGENERATE` /
 `W_TTE_SOLVE_FAILED`); `ferx … --simulate`
 echoes them alongside the fit warnings. `W_TTE_DEGENERATE_HAZARD` is one line per subject
-and CMT for the whole run: it gives the number of replicates in which the draw degenerated
-and names them (`sim` indices, or the uncertainty draws under
-`simulate_with_uncertainty_diag`). The plain `simulate()` / `simulate_with_seed()` /
+and CMT for the whole run, in population order: it gives the number of replicates in which
+the subject ended censored because of the degenerate draw and names them (`sim` indices, or
+the uncertainty draws under `simulate_with_uncertainty_diag`). The plain `simulate()` / `simulate_with_seed()` /
 `simulate_with_options()` entry points apply the same per-subject handling but return only
 the rows.
 :::
