@@ -1,8 +1,8 @@
 $PROBLEM SS=1 infusions whose duration exceeds II (overlapping pulses), 2cpt
 ; T_inf = 1.5 II (ID 1), 2.5 II (IDs 2, 4, 5), exactly 2 II (ID 3); ALAG 3 (IDs 4, 6);
 ; WT steps at t = 10 (IDs 5, 6). Every subject takes a non-SS infusion at t = 24 onto
-; residual drug. NOT YET RUN: the expected PRED is ss_infusion_overlap_ref_2cpt.csv
-; (exact pulse-train superposition outside ferx, ss_infusion_overlap_ref.py).
+; residual drug. Run with NONMEM 7.6.0 (results/ss_infusion_overlap_2cpt.tab); its PRED
+; matches ss_infusion_overlap_ref_2cpt.csv (exact pulse-train superposition, ss_infusion_overlap_ref.py).
 $INPUT ID TIME DV AMT RATE EVID CMT MDV WT SS II LG
 $DATA ss_infusion_overlap.csv IGNORE=@
 
