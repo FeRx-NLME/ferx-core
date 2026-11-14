@@ -927,6 +927,9 @@ const TTE_ENTRY: &str = "predictions_tte.csv";
 const N_OBS_TTE: &str = "n_obs_tte";
 #[cfg(feature = "survival")]
 const TTE_KEY_COLUMNS: [&str; 4] = ["ID", "CMT", "TIME", "DV"];
+/// The optional ninth column of `predictions_tte.csv` (#1889): the record's npde.
+#[cfg(feature = "survival")]
+const TTE_NPDE_COLUMN: &str = "NPDE";
 #[cfg(feature = "survival")]
 const TTE_HEADER_LEN: usize = TTE_KEY_COLUMNS.len() + crate::io::output::TTE_RESIDUAL_COLUMNS.len();
 #[cfg(feature = "survival")]
@@ -2230,7 +2233,15 @@ fn write_predictions_discrete_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<
 /// value under the wrong header.
 #[cfg(feature = "survival")]
 fn write_predictions_tte_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), FitrxError> {
-    writeln!(w, "{}", TTE_HEADER.join(","))?;
+    // The npde column is written only when some record has a score (#1889), so a fit
+    // without one writes the entry it always did, byte for byte.
+    let with_npde = crate::types::any_tte_npde(&r.subjects);
+    let mut header = TTE_HEADER.join(",");
+    if with_npde {
+        header.push(',');
+        header.push_str(TTE_NPDE_COLUMN);
+    }
+    writeln!(w, "{header}")?;
     for s in &r.subjects {
         for t in &s.tte_rows {
             let mut line = format!(
@@ -2243,6 +2254,10 @@ fn write_predictions_tte_csv<W: Write>(w: &mut W, r: &FitResult) -> Result<(), F
             for name in crate::io::output::TTE_RESIDUAL_COLUMNS {
                 line.push(',');
                 line.push_str(&fmt_f64(tte_residual(t, name)));
+            }
+            if with_npde {
+                line.push(',');
+                line.push_str(&fmt_f64(t.npde));
             }
             writeln!(w, "{line}")?;
         }
@@ -3109,12 +3124,19 @@ fn attach_tte_rows(
 
     let mut lines = csv.lines();
     let header = lines.next().ok_or_else(|| corrupt("empty".into()))?;
-    if header.split(',').ne(TTE_HEADER) {
-        return Err(corrupt(format!(
-            "header {header:?}, expected {:?}",
-            TTE_HEADER.join(",")
-        )));
-    }
+    // Two headers are accepted (#1889): the eight columns every bundle since #911
+    // carries, and those plus a trailing `NPDE`, written only when a record has a score.
+    let base = TTE_HEADER.join(",");
+    let has_npde = match header.strip_prefix(base.as_str()) {
+        Some("") => false,
+        Some(rest) if rest.strip_prefix(',') == Some(TTE_NPDE_COLUMN) => true,
+        _ => {
+            return Err(corrupt(format!(
+                "header {header:?}, expected {base:?} or \"{base},{TTE_NPDE_COLUMN}\""
+            )))
+        }
+    };
+    let n_fields = TTE_HEADER.len() + usize::from(has_npde);
     let mut rows = lines.filter(|line| !line.trim().is_empty()).enumerate();
     for (s, n) in subjects.iter_mut().zip(counts) {
         for _ in 0..n {
@@ -3125,12 +3147,12 @@ fn attach_tte_rows(
                 ))
             })?;
             let fields = parse_csv_row(line);
-            if fields.len() != TTE_HEADER.len() {
+            if fields.len() != n_fields {
                 return Err(corrupt(format!(
                     "row {} has {} fields, expected {}",
                     i + 1,
                     fields.len(),
-                    TTE_HEADER.len()
+                    n_fields
                 )));
             }
             if fields[0] != s.id {
@@ -3155,9 +3177,13 @@ fn attach_tte_rows(
                 martingale: f64::NAN,
                 deviance: f64::NAN,
                 pit: f64::NAN,
+                npde: f64::NAN,
             };
             for (name, cell) in TTE_HEADER.iter().zip(&fields).skip(TTE_KEY_COLUMNS.len()) {
                 *tte_residual_mut(&mut row, name) = num(cell)?;
+            }
+            if has_npde {
+                row.npde = num(&fields[TTE_HEADER.len()])?;
             }
             s.tte_rows.push(row);
         }
@@ -8116,6 +8142,7 @@ mod tests {
             martingale: 0.1 + 0.2,
             deviance,
             pit: 1e-300,
+            npde: f64::NAN,
         }
     }
 
@@ -8252,6 +8279,182 @@ mod tests {
             std::fs::read(&back_csv).unwrap(),
             std::fs::read(&live_csv).unwrap()
         );
+    }
+
+    /// `tte_fit_911` with npde scores on its records (#1889): full-digit values, one
+    /// record left unscored (NaN), and a negative zero.
+    #[cfg(feature = "survival")]
+    fn tte_fit_1889() -> (FitResult, Population) {
+        let (mut r, p) = tte_fit_911();
+        r.subjects[0].tte_rows[0].npde = -1.25;
+        r.subjects[2].tte_rows[0].npde = 0.1 + 0.2;
+        r.subjects[2].tte_rows[1].npde = -0.0;
+        r.subjects[2].tte_rows[2].npde = 2.807033768343811;
+        (r, p)
+    }
+
+    #[cfg(feature = "survival")]
+    fn tte_npde_bits(r: &FitResult) -> Vec<Vec<u64>> {
+        r.subjects
+            .iter()
+            .map(|s| s.tte_rows.iter().map(|t| t.npde.to_bits()).collect())
+            .collect()
+    }
+
+    /// T11 (#1889): a bundle whose TTE records carry an npde writes a ninth `NPDE`
+    /// column, and the restored rows and the restored sdtab equal the live ones bit for
+    /// bit, the score included.
+    ///
+    /// Dies on: the column not written (restored scores are NaN); the ninth cell read
+    /// into `pit` (the entry text and the `pit` bits); a score written through a
+    /// rounding format (`0.1 + 0.2`).
+    #[cfg(feature = "survival")]
+    #[test]
+    fn roundtrip_tte_npde() {
+        use crate::io::output::sdtab;
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_1889();
+        let path = save_911(&dir, "npde.fitrx", &r, &p);
+        let entry = entry_text(&path, "predictions_tte.csv").unwrap();
+        let lines: Vec<&str> = entry.lines().collect();
+        assert_eq!(
+            lines[0],
+            "ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT,NPDE"
+        );
+        assert_eq!(
+            lines[1],
+            "S1,2,5.0,1.0,-1e-17,0.30000000000000004,-0.0,1e-300,-1.25"
+        );
+        // The unscored record: an empty ninth cell.
+        assert_eq!(lines[2], "S1,2,7.5,,0.75,0.30000000000000004,-0.5,1e-300,");
+        assert_eq!(
+            lines[3],
+            "S1,2,2.0,0.0,0.30000000000000004,0.30000000000000004,-0.75,1e-300,0.30000000000000004"
+        );
+        assert_eq!(lines.len(), 6);
+
+        let loaded = load_fit(&path).unwrap().fit;
+        assert_eq!(tte_npde_bits(&loaded), tte_npde_bits(&r));
+        for (si, (got, want)) in loaded.subjects.iter().zip(&r.subjects).enumerate() {
+            assert_eq!(
+                tte_bits(&got.tte_rows),
+                tte_bits(&want.tte_rows),
+                "subject {si}"
+            );
+        }
+        let (live, back) = (sdtab(&r, &p), sdtab(&loaded, &p));
+        assert!(
+            live.iter().any(|(n, _)| n == "NPDE"),
+            "premise: NPDE column"
+        );
+        assert_eq!(live.len(), back.len());
+        for ((name, want), (back_name, got)) in live.iter().zip(&back) {
+            assert_eq!(name, back_name);
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(got), bits(want), "column {name}");
+        }
+    }
+
+    /// T12 (#1889): a fit with no TTE npde writes the entry it wrote before the score
+    /// existed, byte for byte, and an eight-column entry loads with every score NaN,
+    /// both the one this build writes and one cut down from a scored bundle.
+    ///
+    /// Dies on: the ninth column always written; only the nine-column header accepted
+    /// (the bundle is `Corrupt`); a missing score read as 0.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn a_bundle_without_tte_npde_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (plain, p) = tte_fit_911();
+        let path = save_911(&dir, "plain.fitrx", &plain, &p);
+        assert_eq!(
+            entry_text(&path, "predictions_tte.csv").unwrap(),
+            "ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT\n\
+             S1,2,5.0,1.0,-1e-17,0.30000000000000004,-0.0,1e-300\n\
+             S1,2,7.5,,0.75,0.30000000000000004,-0.5,1e-300\n\
+             S1,2,2.0,0.0,0.30000000000000004,0.30000000000000004,-0.75,1e-300\n\
+             S1,2,4.0,1.0,1e-300,0.30000000000000004,0.5,1e-300\n\
+             S1,2,6.0,1.0,0.0,0.30000000000000004,inf,1e-300\n"
+        );
+        let loaded = load_fit(&path).unwrap().fit;
+        assert!(loaded
+            .subjects
+            .iter()
+            .all(|s| s.tte_rows.iter().all(|t| t.npde.is_nan())));
+        assert_eq!(
+            loaded
+                .subjects
+                .iter()
+                .map(|s| s.tte_rows.len())
+                .sum::<usize>(),
+            5
+        );
+
+        // A scored bundle with its ninth column cut off by hand: the pre-#1889 shape.
+        let (scored, p) = tte_fit_1889();
+        let nine = save_911(&dir, "scored.fitrx", &scored, &p);
+        let eight = dir.path().join("eight.fitrx");
+        rewrite_bundle(&nine, &eight, |name, body| {
+            if name != "predictions_tte.csv" {
+                return Some(body);
+            }
+            let text = String::from_utf8(body).unwrap();
+            let mut out = String::new();
+            for line in text.lines() {
+                out.push_str(&line[..line.rfind(',').unwrap()]);
+                out.push('\n');
+            }
+            Some(out.into_bytes())
+        });
+        let loaded = load_fit(&eight).unwrap().fit;
+        for (si, (got, want)) in loaded.subjects.iter().zip(&scored.subjects).enumerate() {
+            assert_eq!(
+                tte_bits(&got.tte_rows),
+                tte_bits(&want.tte_rows),
+                "subject {si}"
+            );
+            assert!(got.tte_rows.iter().all(|t| t.npde.is_nan()), "subject {si}");
+        }
+    }
+
+    /// T13 (#1889): any header but the two accepted ones is `Corrupt`, and the message
+    /// names both.
+    ///
+    /// Dies on: any header starting with the eight columns accepted (the ten-column
+    /// and the misnamed ninth); the message naming one header only.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn other_tte_headers_are_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let (r, p) = tte_fit_1889();
+        let good = save_911(&dir, "good.fitrx", &r, &p);
+        let edited = dir.path().join("edited.fitrx");
+        let eight = "ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE,PIT";
+        for header in [
+            "ID,CMT,TIME,DV,COXSNELL,MARTINGALE,DEVIANCE".to_string(),
+            format!("{eight},NPDE,NPD"),
+            format!("{eight},NPD"),
+            format!("{eight}X"),
+            format!("{eight},"),
+        ] {
+            rewrite_bundle(&good, &edited, |name, body| {
+                if name != "predictions_tte.csv" {
+                    return Some(body);
+                }
+                let text = String::from_utf8(body).unwrap();
+                let rest = &text[text.find('\n').unwrap()..];
+                Some(format!("{header}{rest}").into_bytes())
+            });
+            let msg = load_corrupt(load_fit(&edited));
+            assert_eq!(
+                msg,
+                format!(
+                    "predictions_tte.csv: header {header:?}, expected {eight:?} or \
+                     \"{eight},NPDE\""
+                ),
+                "header {header:?}"
+            );
+        }
     }
 
     /// The bundle at `src` as a writer before #911 left it: no `predictions_tte.csv`, and
