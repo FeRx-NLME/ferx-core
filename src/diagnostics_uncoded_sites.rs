@@ -25,10 +25,11 @@ const UNCODED_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/api/adaptive.rs",
         "run_adaptive_population",
-        3,
+        4,
         "internal only (#1983 coded every input refusal and controller action): the driver's \
          AdaptiveDriverError::Runtime arm (a Dv monitor with no assay or no σ, both refused before \
-         any subject runs), the snapshot verifier and the frozen-replay verifier",
+         any subject runs), the snapshot verifier, the decision-record verifier (#2895) and the \
+         frozen-replay verifier",
     ),
     (
         "src/api/simulate.rs",

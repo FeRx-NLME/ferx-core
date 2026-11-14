@@ -1140,6 +1140,35 @@ fn dose_knowledge_is_parsed_and_an_unused_oracle_is_refused() {
     );
 }
 
+/// `decision_covariates` (#2895): `locf` by default, `nocb` when set, an unknown value
+/// refused with both accepted values named.
+///
+/// Regressions: the default not LOCF; `nocb` read as `locf`; an unknown value accepted.
+#[test]
+fn decision_covariates_is_parsed_with_locf_as_the_default() {
+    use crate::sim::adaptive::DecisionCovariates;
+    let with = |v: &str| {
+        dose_model(false, "500").replace(
+            "dose_bounds = [0, 4000]",
+            &format!("dose_bounds = [0, 4000]\n  decision_covariates = {v}"),
+        )
+    };
+    let parsed = |src: &str| {
+        crate::parser::model_parser::parse_full_model(src)
+            .expect("parses")
+            .adaptive_dosing
+            .expect("block")
+            .decision_covariates
+    };
+    assert_eq!(parsed(&dose_model(false, "500")), DecisionCovariates::Locf);
+    assert_eq!(parsed(&with("locf")), DecisionCovariates::Locf);
+    assert_eq!(parsed(&with("nocb")), DecisionCovariates::Nocb);
+    assert_eq!(
+        full_err(&with("next")),
+        "[adaptive_dosing]: decision_covariates must be `locf` or `nocb`, got `next`"
+    );
+}
+
 /// The key named in a refusal is the key the expression is under.
 ///
 /// Regression: every refusal hard-coding `start_dose` (the shared arm's discriminator).

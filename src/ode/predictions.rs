@@ -5540,8 +5540,9 @@ impl AdaptiveRecordIndex {
     /// Time of the record that GOVERNS the segment ending at `t_end` (#1073): `t_end`
     /// itself when a record sits there, otherwise the **next record ahead** — a boundary
     /// that is not a data record (a lagged dose arrival, an infusion end, a zero-order
-    /// cutoff, a per-route onset, a decision break) supplies no parameters and merely
-    /// subdivides the interval that record terminates. `None` past the final record:
+    /// cutoff, a per-route onset) supplies no parameters and merely subdivides the interval
+    /// that record terminates. A decision is a record of the walk but not of this index
+    /// ([`governing_at`] puts it in, #2895). `None` past the final record:
     /// nothing ahead terminates the segment, so the caller keeps the last record that ran
     /// — the trailing rule the static engines share through
     /// [`crate::dosing::governing_record_indices`].
@@ -5573,13 +5574,152 @@ impl AdaptiveRecordIndex {
     }
 }
 
-/// The record that governs the segment ending at `t_end` (#1073): the first record at
-/// [`AdaptiveRecordIndex::governing`]'s time, or `None` past the final record. The one
-/// lookup behind [`governing_segment_pk_at`], [`governing_segment_occ_at`] and
-/// [`governing_segment_cov_at`], so a segment's PK, κ and covariate row come from the same
-/// record.
+/// The record that governs the segment ending at `t_end` (#1073): the first **data**
+/// record at [`AdaptiveRecordIndex::governing`]'s time, or `None` past the final one.
+/// The NOCB row of [`decision_record_covs`] reads it; the walk reads [`governing_at`].
 fn governing_record_at(t_end: f64, records: &AdaptiveRecordIndex) -> Option<AdaptiveRecord> {
     records.governing(t_end).and_then(|t| records.at(t))
+}
+
+/// Every decision of an adaptive run as a record (#2895): the parameters a piece of the
+/// walk that ends at decision `g` runs under when no data record ends it first.
+///
+/// A controller dose is not a data record and a hold leaves nothing at all, yet in the
+/// static dataset that reproduces a run — the realized doses plus an `EVID=2` record at
+/// each decision — the decision's row ends the interval before it. Without this the piece
+/// ran under the next **data** record, however many decisions later (#2771): under IOV
+/// that is a later occasion's κ (9.4 % at t = 72 with records only at 0 and 72), under a
+/// `TIME`-reading PK a later `TIME`, and under a time-varying covariate a row the
+/// dataset's LOCF fill would not give.
+///
+/// `pk[g]` is `pk_param_fn` at decision `g`: θ, `[η | κ_g]` (or η off IOV), the row
+/// [`decision_record_covs`] picks (`cov[g]`), and the `TIME` written at the decision. The
+/// decision's occasion is `g` itself. Every scheduled decision is a record, the ones after
+/// a `Stop` too, since an occasion starts at each one whether the controller acts or not.
+///
+/// It also carries `readout`, the IOV `decision_pk[g]` (#701): the PK decision `g`
+/// *reads*, at the row in force and under κ_g. Under `decision_covariates = locf` the two
+/// are the same `pk_param_fn` call; they part under `nocb`.
+pub(crate) struct DecisionRecords<'a> {
+    pub(crate) times: &'a [f64],
+    pub(crate) pk: Vec<PkParams>,
+    pub(crate) cov: Vec<&'a HashMap<String, f64>>,
+    pub(crate) readout: Option<Vec<PkParams>>,
+}
+
+/// What governs the segment ending at `t_end` ([`governing_at`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Governing {
+    /// A data record of the subject.
+    Record(AdaptiveRecord),
+    /// Decision `g` (#2895), with no data record at or before it ahead of `t_end`.
+    Decision(usize),
+    /// Past the final record and decision: the caller's LOCF carry.
+    Past,
+}
+
+/// The one lookup behind [`governing_segment_pk_at`], [`governing_segment_occ_at`] and
+/// [`governing_segment_cov_at`], so a segment's PK, κ and covariate row come from the
+/// same record (#1073). The first of the next data record and the next decision at or
+/// after `t_end`; on a tie the data record, so a layout with a record on every decision
+/// runs exactly as before #2895. Decision and data-record times are bit-identical to their
+/// break times (the driver's survival guards), so the comparison needs no tolerance.
+///
+/// `decisions = None` — the constant-PK path, and driver unit tests that build no
+/// decision records — is the pre-#2895 rule.
+fn governing_at(
+    t_end: f64,
+    records: &AdaptiveRecordIndex,
+    decisions: Option<&DecisionRecords>,
+) -> Governing {
+    let record_t = records.governing(t_end);
+    if let Some(d) = decisions {
+        let g = d.times.partition_point(|&t| t < t_end);
+        if let Some(&t_g) = d.times.get(g) {
+            if record_t.is_none_or(|r| t_g < r) {
+                return Governing::Decision(g);
+            }
+        }
+    }
+    // `governing` only ever returns a time drawn from the record grid, so `at` cannot miss.
+    record_t
+        .and_then(|t| records.at(t))
+        .map_or(Governing::Past, Governing::Record)
+}
+
+/// `subject` with each `ADDL`-implied dose governed as if a record sat at every decision
+/// (#2895). An implied dose takes its governing record's covariates, `TIME` and occasion
+/// (#1909, #2371) — the first record at or after it. With every decision a record, that is
+/// the first decision at or after the dose when it comes before the reader's governing
+/// record (a data record at the same time keeps priority), or when the dose had no record
+/// ahead at all. Such a dose then takes decision `g`'s `TIME`, its occasion and `covs[g]`,
+/// the row [`decision_record_covs`] gives decision `g` on the subject as read.
+///
+/// Borrowed unchanged when nothing moves — every subject without an implied dose, and
+/// every layout with a data record on each decision. The static `Subject` stays as the
+/// reader built it: `predict()` has no decisions.
+pub(crate) fn with_implied_doses_governed_by_decisions<'a>(
+    subject: &'a Subject,
+    decision_times: &[f64],
+    covs: &[&HashMap<String, f64>],
+) -> std::borrow::Cow<'a, Subject> {
+    let regovern = |k: usize| -> Option<usize> {
+        let d = &subject.doses[k];
+        let imp = d.implied?;
+        let g = decision_times.partition_point(|&t| t < d.time);
+        let &t_g = decision_times.get(g)?;
+        let no_record_ahead = imp.gov_time < d.time;
+        (no_record_ahead || t_g < imp.gov_time).then_some(g)
+    };
+    let moved: Vec<(usize, usize)> = (0..subject.doses.len())
+        .filter_map(|k| regovern(k).map(|g| (k, g)))
+        .collect();
+    if moved.is_empty() {
+        return std::borrow::Cow::Borrowed(subject);
+    }
+    let mut s = subject.clone();
+    if s.dose_covariates.len() != s.doses.len() {
+        s.dose_covariates = (0..subject.doses.len())
+            .map(|k| subject.dose_cov(k).clone())
+            .collect();
+    }
+    for (k, g) in moved {
+        let t_g = decision_times[g];
+        if let Some(imp) = s.doses[k].implied.as_mut() {
+            imp.gov_time = t_g;
+            imp.param_time = subject.param_time_at(t_g);
+        }
+        s.dose_covariates[k] = covs[g].clone();
+    }
+    std::borrow::Cow::Owned(s)
+}
+
+/// The covariate row decision `g` carries as a record (#2895), for each decision time:
+/// under [`DecisionCovariates::Locf`] the row in force there ([`locf_decision_cov`], the
+/// row the controller reads); under [`DecisionCovariates::Nocb`] the row of the next data
+/// record at or after it, or the row in force past the last one.
+///
+/// [`DecisionCovariates::Locf`]: crate::sim::adaptive::DecisionCovariates::Locf
+/// [`DecisionCovariates::Nocb`]: crate::sim::adaptive::DecisionCovariates::Nocb
+pub(crate) fn decision_record_covs<'a>(
+    rule: crate::sim::adaptive::DecisionCovariates,
+    records: &AdaptiveRecordIndex,
+    decision_times: &[f64],
+    subject: &'a Subject,
+) -> Vec<&'a HashMap<String, f64>> {
+    use crate::sim::adaptive::DecisionCovariates;
+    decision_times
+        .iter()
+        .map(|&t| {
+            let locf = locf_decision_cov(records, t, subject, &subject.covariates);
+            match rule {
+                DecisionCovariates::Nocb => {
+                    governing_record_at(t, records).map_or(locf, |rec| rec.cov(subject))
+                }
+                _ => locf,
+            }
+        })
+        .collect()
 }
 
 /// Covariate twin of [`governing_segment_pk_at`] (#943): the row of the record whose
@@ -5592,12 +5732,18 @@ fn governing_record_at(t_end: f64, records: &AdaptiveRecordIndex) -> Option<Adap
 fn governing_segment_cov_at<'a>(
     t_end: f64,
     records: &AdaptiveRecordIndex,
+    decisions: Option<&DecisionRecords<'a>>,
     subject: &'a Subject,
     last_cov: &'a HashMap<String, f64>,
 ) -> &'a HashMap<String, f64> {
-    match governing_record_at(t_end, records) {
-        Some(rec) => rec.cov(subject),
-        None => last_cov,
+    match governing_at(t_end, records, decisions) {
+        Governing::Record(rec) => rec.cov(subject),
+        Governing::Decision(g) => {
+            decisions
+                .expect("a decision governs only with decision records")
+                .cov[g]
+        }
+        Governing::Past => last_cov,
     }
 }
 
@@ -5631,14 +5777,19 @@ fn governing_segment_cov_at<'a>(
 fn governing_segment_pk_at(
     t_end: f64,
     records: &AdaptiveRecordIndex,
+    decisions: Option<&DecisionRecords>,
     event_pk: &crate::pk::EventPkParams,
     last_pk: PkParams,
 ) -> PkParams {
-    match governing_record_at(t_end, records) {
-        Some(rec) => rec.pk(event_pk),
-        // Past the final record. (`governing` only ever returns a time drawn from the record
-        // grid, so `at` cannot miss.)
-        None => last_pk,
+    match governing_at(t_end, records, decisions) {
+        Governing::Record(rec) => rec.pk(event_pk),
+        Governing::Decision(g) => {
+            decisions
+                .expect("a decision governs only with decision records")
+                .pk[g]
+        }
+        // Past the final record and decision.
+        Governing::Past => last_pk,
     }
 }
 
@@ -5690,12 +5841,15 @@ impl AdaptiveRecordOcc {
 fn governing_segment_occ_at(
     t_end: f64,
     records: &AdaptiveRecordIndex,
+    decisions: Option<&DecisionRecords>,
     occ: &AdaptiveRecordOcc,
     last_occ: Option<usize>,
 ) -> Option<usize> {
-    match governing_record_at(t_end, records) {
-        Some(rec) => occ.of(rec),
-        None => last_occ,
+    match governing_at(t_end, records, decisions) {
+        Governing::Record(rec) => occ.of(rec),
+        // Occasion `g` starts at decision `g`.
+        Governing::Decision(g) => Some(g),
+        Governing::Past => last_occ,
     }
 }
 
@@ -5912,12 +6066,18 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // under occasion g's κ (drives the pre-dose readout, the injected dose's F, and
     // the LOCF carry past the subject's last record), and `eta_occ[g]` is the full
     // `[η_bsv | κ_g]` threaded into `read_observable` / `integrate_segment` for every
-    // segment a record of occasion g ends — so the window after decision g runs under
-    // κ_{g+1} when a record sits on decision g+1 (#2771). `None` on both ⇒ no IOV,
+    // segment a record of occasion g ends — and a decision is a record (#2895), so the
+    // piece ending at decision g+1 runs under κ_{g+1}. `None` on both ⇒ no IOV,
     // byte-identical to the pre-#701 path
     // (the fixed `eta` is used throughout). IOV implies `event_pk = Some` (κ makes PK
     // per-occasion, so obs / pk-only records carry their occasion snapshot).
-    decision_pk: Option<&[PkParams]>,
+    //
+    // Since #2895 this also carries every decision as a record ([`DecisionRecords`]):
+    // `decision_pk` is its `readout`, and a segment that ends at a decision with no data
+    // record first runs under the decision's own snapshot. `Some` on every per-event-PK
+    // path in production; `None` ⇒ the pre-#2895 rule (the constant path, and driver unit
+    // tests that build no decision records).
+    decision_records: Option<&DecisionRecords>,
     eta_occ: Option<&[Vec<f64>]>,
     theta: &[f64],
     eta: &[f64],
@@ -5939,6 +6099,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
     let n = ode.n_states;
     let tv = event_pk.is_some();
     let iov = eta_occ.is_some();
+    // What each decision reads under IOV (#701); the records themselves govern segments
+    // through `decisions` (#2895).
+    let decision_pk = decision_records.and_then(|d| d.readout.as_deref());
 
     // --- Preconditions -----------------------------------------------------
     // The checks a function of the inputs alone answers — `max_decisions`, a monitor's
@@ -6387,7 +6550,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
         // + occasion to occasion g's snapshot so the pre-dose readout, the injected
         // dose's F, and any following segment PAST THE LAST RECORD all use occasion g's
         // parameters — not the previous occasion carried in `last_pk`/`last_occ`. A
-        // segment with a record ahead takes that record's instead (#1073, #2771).
+        // segment that a data record or a later decision ends takes that record's instead
+        // (#1073, #2895), so in production this carry reaches only the walk past the last
+        // decision.
         // Unconditional (every decision break, including holds and post-`Stop`, so
         // every event reads its window's κ). The readout below then reads this snapshot.
         if let (Some(dp), Some(&g)) = (decision_pk, decision_index_of.get(&t_start.to_bits())) {
@@ -7056,20 +7221,21 @@ pub(crate) fn ode_predictions_adaptive_impl(
 
             // PK governing the segment `(t_start, t_end]`: the record that TERMINATES
             // it (NONMEM end-of-interval convention) — `t_end` itself when a record sits
-            // there, else the next record ahead (#1073) — on the TV path (#700), the
+            // there, else the next record or decision ahead (#1073, #2895) — on the TV
+            // path (#700), the
             // frozen snapshot otherwise. On the TV path it is written
             // into `ext_params`'s PK slots (leaving the TAFD/TAD anchors intact) for
             // the ODE RHS and passed through as the readout PK for any observation
             // `integrate_segment` records internally.
             let seg_pk = match event_pk {
-                Some(ev) => governing_segment_pk_at(t_end, &records, ev, last_pk),
+                Some(ev) => governing_segment_pk_at(t_end, &records, decision_records, ev, last_pk),
                 None => PkParams::default(),
             };
             // Occasion governing this segment (#701) — the twin of `seg_pk`'s
             // end-of-interval resolution, so the eta threaded into `integrate_segment`
             // carries the same occasion's κ as `seg_pk`.
             let seg_occ = if iov {
-                governing_segment_occ_at(t_end, &records, &record_occ, last_occ)
+                governing_segment_occ_at(t_end, &records, decision_records, &record_occ, last_occ)
             } else {
                 None
             };
@@ -7089,7 +7255,7 @@ pub(crate) fn ode_predictions_adaptive_impl(
             // integrated with. The `[scaling]` divisor inside `scale_readout` keeps the
             // subject's t = 0 covariates, as `simulate()` divides by (#2129).
             let seg_cov = if tv && auc.is_some() {
-                governing_segment_cov_at(t_end, &records, subject, last_cov)
+                governing_segment_cov_at(t_end, &records, decision_records, subject, last_cov)
             } else {
                 &shadow.covariates
             };
@@ -7330,8 +7496,9 @@ pub(crate) fn verify_adaptive_frozen_replay(
     event_pk: Option<&crate::pk::EventPkParams>,
     // Per-decision occasion PK + per-window eta for the IOV path (#701); see
     // `ode_predictions_adaptive_impl`. Reused directly from the driver so the replay
-    // applies the identical per-occasion κ over the identical windows — bit-aligned.
-    decision_pk: Option<&[PkParams]>,
+    // applies the identical per-occasion κ over the identical windows — bit-aligned. The
+    // decision records (#2895) likewise.
+    decision_records: Option<&DecisionRecords>,
     eta_occ: Option<&[Vec<f64>]>,
     theta: &[f64],
     eta: &[f64],
@@ -7390,7 +7557,7 @@ pub(crate) fn verify_adaptive_frozen_replay(
                 ode,
                 pk_params_flat,
                 ev,
-                decision_pk,
+                decision_records,
                 eta_occ,
                 theta,
                 eta,
@@ -7483,7 +7650,7 @@ fn adaptive_frozen_replay_tv(
     // per-event snapshot, never this one.
     pk_params_flat: &[f64],
     event_pk: &crate::pk::EventPkParams,
-    decision_pk: Option<&[PkParams]>,
+    decision_records: Option<&DecisionRecords>,
     eta_occ: Option<&[Vec<f64>]>,
     theta: &[f64],
     eta: &[f64],
@@ -7493,6 +7660,9 @@ fn adaptive_frozen_replay_tv(
 ) -> Vec<f64> {
     let n_obs = subject.obs_times.len();
     let iov = eta_occ.is_some();
+    // What each decision reads under IOV (#701); the records themselves govern segments
+    // through `decisions` (#2895).
+    let decision_pk = decision_records.and_then(|d| d.readout.as_deref());
 
     let obs_map = build_obs_index_map(&subject.obs_times);
 
@@ -7803,14 +7973,16 @@ fn adaptive_frozen_replay_tv(
         if k + 1 < break_times.len() {
             let t_end = break_times[k + 1];
             // Segment PK = the record that TERMINATES `(t_start, t_end]` — itself when
-            // a record sits at `t_end`, else the next record ahead (#1073) — via the
+            // a record sits at `t_end`, else the next record or decision ahead (#1073,
+            // #2895) — via the
             // identical `governing_segment_pk_at` the driver used, so the two stay
             // bit-aligned.
-            let seg_pk = governing_segment_pk_at(t_end, &records, event_pk, last_pk);
+            let seg_pk =
+                governing_segment_pk_at(t_end, &records, decision_records, event_pk, last_pk);
             // Occasion twin of `seg_pk` (#701), so the threaded eta carries the same
             // occasion's κ — the identical resolution the driver used.
             let seg_occ = if iov {
-                governing_segment_occ_at(t_end, &records, &record_occ, last_occ)
+                governing_segment_occ_at(t_end, &records, decision_records, &record_occ, last_occ)
             } else {
                 None
             };

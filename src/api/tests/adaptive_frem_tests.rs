@@ -175,6 +175,7 @@ fn spec_hold() -> AdaptiveDosingSpec {
         auc_target: None,
         round_to: None,
         dose_knowledge: Default::default(),
+        decision_covariates: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: -1e9,
