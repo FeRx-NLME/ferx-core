@@ -698,6 +698,7 @@ fn a_cancelled_inner_pass_scores_no_objective() {
                 None,
                 PrevEtas::Placeholder,
                 cancel,
+                None,
             )
         };
 
