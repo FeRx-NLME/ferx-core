@@ -1015,6 +1015,242 @@ pub(crate) fn individual_nll_prepared(
     )
 }
 
+/// The splits `c` the proportional / combined row bound
+/// ([`gaussian_row_term_lower_bound`]) maximises over. Each one gives a valid bound
+/// on its own, so the set only decides how tight the result is: for a pure
+/// proportional row with `σ = 0.2` the best split sits near `c ≈ 0.11`, where the
+/// bound is ~0.2 below the exact minimum over `f`.
+const ROW_BOUND_SPLITS: [f64; 10] = [0.02, 0.04, 0.06, 0.08, 0.11, 0.15, 0.2, 0.3, 0.45, 0.65];
+
+/// How a row's proportional σ slot enters its scored variance, so its bound can
+/// replay the scorer's own floating-point operations (#2608 review round 2).
+///
+/// `m: None` is the bare-σ path (`residual_variance`: `fs = f·σ`, `fs·fs`); `Some(m)`
+/// is the `#484` magnitude path (`loadings_variance_sum`: `c = f·m`, `c·c·σ·σ`, left
+/// to right). Mathematically one formula, in `f64` they are not: with a magnitude
+/// of `1e-200` the second underflows to `0` where the reassociated `(m·σ)²` does
+/// not, so a bound built from the reassociated form can sit **above** the scored
+/// term. Both fields are stored as magnitudes — every operation squares them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PropLoading {
+    pub(crate) sigma: f64,
+    pub(crate) mult: Option<f64>,
+}
+
+impl PropLoading {
+    /// The scored proportional contribution at a prediction of magnitude `l`, in
+    /// the scorer's order. Every step is a product of non-negative numbers, and an
+    /// IEEE product rounds monotonically in each argument, so for any `|f| ≥ l` the
+    /// scored contribution is `≥` this value — exactly, not to a tolerance.
+    fn at(&self, l: f64) -> f64 {
+        match self.mult {
+            None => {
+                let fs = l * self.sigma;
+                fs * fs
+            }
+            Some(m) => {
+                let c = l * m;
+                c * c * self.sigma * self.sigma
+            }
+        }
+    }
+}
+
+/// The smallest `y²` the split bound is evaluated at. Below it the split terms
+/// (`c²y²`) and the scorer's `r·r` are at or near the subnormal range, where the
+/// mathematical inequalities the split relies on are not reproduced by the
+/// arithmetic, so the row takes the split-free floor instead.
+const ROW_BOUND_MIN_Y2: f64 = 1e-200;
+
+/// A lower bound, valid for **every** prediction `f`, on one Gaussian row's
+/// contribution `r²/v + ln v` (`r = y − f`) to the un-halved data term.
+///
+/// `a` is the row's additive variance **as the scorer computes it** (the caller
+/// replays the scorer's operations), and `prop` its proportional slot, if any. The
+/// scored variance is `guard(P(f) + a)` — `P(f)` the proportional contribution in
+/// the scorer's arithmetic ([`PropLoading`]), `guard`
+/// [`guard_variance`](crate::stats::residual_error::guard_variance).
+///
+/// Two facts carry the proof, both exact in `f64` because rounding is monotone and
+/// the guard only ever raises a variance. (i) The scored `v` is at least
+/// `v_min = max(a, f64::MIN_POSITIVE)`: `fl(P + a) ≥ a` for `P ≥ 0`, a variance
+/// `≥ MIN_POSITIVE` is scored as it is, and anything smaller is replaced by
+/// `MIN_VARIANCE > MIN_POSITIVE`. (ii) For `|f| ≥ l` the scored `v` is at least
+/// `fl(P(l) + a)` ([`PropLoading::at`]).
+///
+/// * **Additive** (`prop = None`): `v` is the constant `a` (or `MIN_VARIANCE`), so
+///   `ln v_min` is the bound, attained at `r = 0`.
+/// * **Proportional / combined**: split on a fraction `c ∈ (0, 1)`. If
+///   `|y − f| ≥ c|y|`, then `r² ≥ c²y²` and the term is at least
+///   `inf_{v ≥ v_min} c²y²/v + ln v`, which is `1 + ln(c²y²)` when `c²y² ≥ v_min`
+///   (the stationary point `v = c²y²`) and `c²y²/v_min + ln v_min` otherwise (the
+///   function increases on `[v_min, ∞)`). If `|y − f| < c|y|`, then
+///   `|f| > (1 − c)|y|`, so by (ii) the term is at least `ln fl(P((1 − c)|y|) + a)`
+///   (`r²/v ≥ 0`). The smaller of the two holds for every `f`; the largest over the
+///   splits is returned, and `ln v_min` (any `f`) is the floor.
+///
+/// The split's `r²`/`y²` steps are real-number inequalities, so they carry the
+/// gate's rounding margin; a `y²` below [`ROW_BOUND_MIN_Y2`] (where those steps meet
+/// underflow) takes the floor instead. A pure proportional row has **no** useful
+/// bound from `v` alone (`v → 0` as `f → 0`, #2443), which is why the split on `r`
+/// is needed. A `NaN` `y` returns the floor; an overflowing `y²` returns `∞`, which
+/// the caller must refuse (see [`prepared_data_term_lower_bound`]).
+pub(crate) fn gaussian_row_term_lower_bound(y: f64, a: f64, prop: Option<PropLoading>) -> f64 {
+    let v_min = a.max(f64::MIN_POSITIVE);
+    let floor = v_min.ln();
+    let Some(prop) = prop else {
+        return floor;
+    };
+    let y2 = y * y;
+    if y2.is_infinite() {
+        // `c²y²` overflows while the scorer's `r·r` need not, so the far-side bound
+        // would claim `∞` for a finite term — no valid split exists here. `∞` tells
+        // the caller to decline the subject.
+        return f64::INFINITY;
+    }
+    if !(y2 >= ROW_BOUND_MIN_Y2) {
+        return floor;
+    }
+    let mut best = floor;
+    for c in ROW_BOUND_SPLITS {
+        let q = c * c * y2;
+        let far = if q >= v_min {
+            1.0 + q.ln()
+        } else {
+            q / v_min + floor
+        };
+        let near = (prop.at((1.0 - c) * y.abs()) + a).max(v_min).ln();
+        best = best.max(far.min(near));
+    }
+    best
+}
+
+/// A prediction-free lower bound on the un-halved data term (`data_ll`) of
+/// [`individual_nll_prepared`] at **any** η, for the SAEM / Bayes MH early-rejection
+/// gate (#2608): `lb` is the sum of the per-row bounds, `abs` the sum of their
+/// magnitudes and `n_rows` the row count, which the gate turns into its rounding
+/// margin.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DataTermLowerBound {
+    pub(crate) lb: f64,
+    pub(crate) abs: f64,
+    pub(crate) n_rows: usize,
+}
+
+/// [`DataTermLowerBound`] for `subject`, or `None` where the data term of
+/// [`individual_nll_prepared`] holds a contribution this function does not bound.
+///
+/// It mirrors that function's row loop (the non-dense arm with no frozen
+/// variance) and every row it scores:
+///
+/// * a Gaussian row is bounded by [`gaussian_row_term_lower_bound`] from its loading
+///   shape, its additive variance and proportional slot computed with the scorer's
+///   own floating-point operations (bare σ, or the `#484` magnitude multiplier);
+/// * an M3-censored row contributes `−2·log Φ(·) ≥ 0`, bounded by `0`;
+/// * a non-Gaussian-endpoint row the loop skips (`#905`) contributes nothing.
+///
+/// It declines (`None`) a subject whose bound overflows (an observation so large
+/// that `y²` is not finite), and the contributions it does not bound: an SDE model's
+/// process noise, `iiv_on_ruv` (the variance scale depends on η), a dense
+/// residual covariance (`block_sigma` / serial correlation — the cross terms can
+/// lower the variance), FREM covariate rows, a `power(...)` magnitude exponent,
+/// and a subject with TTE / categorical / CTMM records (whose `−log p` can be
+/// negative and has no bound here).
+pub(crate) fn prepared_data_term_lower_bound(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    sigma_values: &[f64],
+    prep: &IndividualNllPrep,
+) -> Option<DataTermLowerBound> {
+    if model.is_sde()
+        || model.residual_error_eta.is_some()
+        || model.residual_cov_theta(theta).is_dense()
+        || subject.fremtype.iter().any(|&ft| ft > 0)
+    {
+        return None;
+    }
+    #[cfg(feature = "survival")]
+    if !subject.obs_records.is_empty() {
+        return None;
+    }
+    let n_sigma = sigma_values.len();
+    let bloq = model.bloq_in_force();
+    let mut out = DataTermLowerBound {
+        lb: 0.0,
+        abs: 0.0,
+        n_rows: subject.observations.len(),
+    };
+    for (j, &y) in subject.observations.iter().enumerate() {
+        // The same #905 skip as the scoring loop: such a row contributes nothing.
+        #[cfg(feature = "survival")]
+        if !model.endpoints.is_empty()
+            && subject
+                .obs_cmts
+                .get(j)
+                .is_some_and(|c| model.endpoints.contains_key(c))
+        {
+            continue;
+        }
+        if bloq.is_censored_row(subject.cens.get(j).copied().unwrap_or(0)) {
+            continue;
+        }
+        let key = *prep.err_keys.get(j)?;
+        // Replay the scorer's arithmetic, not the algebra (#2608 review round 2):
+        // the row loop takes the `#484` magnitude path (`variance_at_scaled`:
+        // `c = coeff·m`, `c·c·σ·σ`) whenever the subject has a magnitude row, else
+        // the bare-σ path (`residual_variance`: `σ·σ`, `(f·σ)·(f·σ)`).
+        let mult_row: Option<&[f64]> = prep
+            .ruv_mult
+            .as_ref()
+            .and_then(|m| m.get(j))
+            .map(Vec::as_slice);
+        let mult = mult_row.unwrap_or(&[]);
+        let (shape, n) = model.error_spec.sigma_loading_shape(key, n_sigma);
+        let mut a = 0.0;
+        let mut prop = None;
+        for &(idx, c0, slope) in &shape[..n] {
+            let s = *sigma_values.get(idx)?;
+            let m = mult.get(idx).copied().unwrap_or(1.0);
+            if slope != 0.0 {
+                if c0 != 0.0
+                    || slope != 1.0
+                    || prop.is_some()
+                    || crate::stats::residual_error::slot_exponent(mult, n_sigma, idx)
+                        .is_some_and(|p| p != 1.0)
+                {
+                    return None;
+                }
+                prop = Some(PropLoading {
+                    sigma: s.abs(),
+                    mult: mult_row.map(|_| m.abs()),
+                });
+            } else {
+                if c0 != 1.0 || a != 0.0 {
+                    return None;
+                }
+                // `c = 1·m = m` exactly; `σ·σ` on the bare path is the same value
+                // as `1·1·σ·σ`, so one expression serves both.
+                a = m * m * s * s;
+            }
+        }
+        let row = gaussian_row_term_lower_bound(y, a, prop);
+        // A finite row can still overflow the bound's own arithmetic: `y²` is `∞`
+        // for `|y| > ~1.3e154` while the scored `b·f²` stays finite for a small
+        // enough `b`. An infinite bound is not a bound — the gate would read
+        // `∞ ≥ ∞` and reject a proposal the full evaluation accepts — so the
+        // subject is declined. A `NaN` row bound cannot arise (the floor is
+        // finite and `f64::max` drops a `NaN` split), but declining it costs
+        // nothing.
+        if !row.is_finite() {
+            return None;
+        }
+        out.lb += row;
+        out.abs += row.abs();
+    }
+    Some(out)
+}
+
 /// Inner-loop form of [`individual_nll_into_with_schedule`] with subject-static
 /// residual dispatch and magnitude inputs prepared by the caller, plus a
 /// caller-owned prediction vector reused across objective evaluations.

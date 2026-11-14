@@ -15,8 +15,8 @@ use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::pk::EventPkParams;
 use crate::stats::likelihood::{
     individual_nll, individual_nll_iov, individual_nll_iov_with_scratch_and_schedule,
-    individual_nll_prepared, is_usable_subject_nll, IndividualNllPrep, IndividualNllScratch,
-    SUBJECT_SENTINEL_NLL,
+    individual_nll_prepared, is_usable_subject_nll, prepared_data_term_lower_bound, quad_form,
+    DataTermLowerBound, IndividualNllPrep, IndividualNllScratch, SUBJECT_SENTINEL_NLL,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -1948,6 +1948,14 @@ pub(crate) struct MhScratch {
     z: DVector<f64>,
     perturbation: DVector<f64>,
     eta_prop: Vec<f64>,
+    /// Test-only: switch the early-rejection gate ([`mh_early_rejects`]) off, so a
+    /// test can run the same chain with and without it and compare bit for bit.
+    #[cfg(test)]
+    early_reject_off: bool,
+    /// Test-only: how many proposals the gate rejected without a prediction, so a
+    /// bit-identity test can assert its fixture actually reached the gate.
+    #[cfg(test)]
+    early_rejections: usize,
 }
 
 impl Default for MhScratch {
@@ -1958,6 +1966,10 @@ impl Default for MhScratch {
             z: DVector::zeros(0),
             perturbation: DVector::zeros(0),
             eta_prop: Vec::new(),
+            #[cfg(test)]
+            early_reject_off: false,
+            #[cfg(test)]
+            early_rejections: 0,
         }
     }
 }
@@ -2104,6 +2116,136 @@ pub(crate) fn mh_steps(
     )
 }
 
+/// Relative rounding margin of the MH early-rejection gate ([`mh_early_rejects`]).
+///
+/// The gate compares a lower bound computed in one order of operations against a
+/// threshold the full evaluation would have compared its own, differently rounded,
+/// sum against. Summing `n` terms in `f64` is off by at most `≈ n·2⁻⁵³` of the sum of
+/// their magnitudes; `1e-8` of that magnitude sum (plus `1e-12` per row) clears it by
+/// orders of magnitude for any subject up to ~10⁶ rows, and costs nothing measurable
+/// in firing rate — the bound is never within `1e-8` relative of a threshold except
+/// by coincidence.
+const MH_EARLY_REJECT_MARGIN: f64 = 1e-8;
+
+/// Test-only switches for the early-rejection gate, so a test can run a whole fit
+/// (whose MH kernels sit on rayon workers, out of reach of a thread-local) with the
+/// gate off and compare it bit for bit with the gate on. `OFF` disables the gate in
+/// every kernel; `FIRED` counts its rejections across the process. A test that
+/// flips `OFF` holds `LOCK` for writing; a test that relies on the gate firing holds
+/// it for reading. Other tests that run SAEM concurrently are unaffected by `OFF`
+/// beyond what this module's tests prove — the gate changes no decision.
+#[cfg(test)]
+pub(crate) mod early_reject_hooks {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::RwLock;
+    pub(crate) static OFF: AtomicBool = AtomicBool::new(false);
+    pub(crate) static FIRED: AtomicUsize = AtomicUsize::new(0);
+    pub(crate) static LOCK: RwLock<()> = RwLock::new(());
+}
+
+/// What the MH early-rejection gate needs for one subject's kernel call: the
+/// prediction-free data bound and the η-independent part of the objective it is
+/// added to (`offset`, with its magnitude for the rounding margin).
+///
+/// `offset` is `log|Ω|` for the BSV objective (`individual_nll_prepared`); under IOV
+/// it adds the κ terms the η steps hold fixed, `Σ_k κ_kᵀΩ_IOV⁻¹κ_k + K·log|Ω_IOV|`,
+/// computed with the same `quad_form` the IOV objective uses
+/// (`individual_nll_iov_frozen_in`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct MhGate {
+    pub(crate) bound: DataTermLowerBound,
+    pub(crate) offset: f64,
+    pub(crate) offset_abs: f64,
+}
+
+/// [`MhGate`] for one kernel call, or `None` where the gate does not apply.
+///
+/// Declines: any subject [`prepared_data_term_lower_bound`] declines; a non-finite
+/// `offset` (a non-finite `log|Ω|` makes the BSV objective return the sentinel
+/// instead of the sum the gate bounds); and, under IOV, a model with nested IOV
+/// levels (whose κ prior is the `NestedLayout` form, not the one-level sum built
+/// here) or with non-Gaussian endpoints (the IOV scoring loop has no `#905`
+/// endpoint-row skip, so the bound's skip would not mirror it).
+#[allow(clippy::too_many_arguments)]
+fn mh_gate_for(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    prep: &IndividualNllPrep,
+    kappas_opt: Option<(&[Vec<f64>], &OmegaMatrix)>,
+) -> Option<MhGate> {
+    #[cfg(test)]
+    if early_reject_hooks::OFF.load(std::sync::atomic::Ordering::SeqCst) {
+        return None;
+    }
+    let (mut offset, mut offset_abs) = (omega.log_det, omega.log_det.abs());
+    if let Some((kappas, omega_iov)) = kappas_opt {
+        if model.has_nested_levels() {
+            return None;
+        }
+        #[cfg(feature = "survival")]
+        if !model.endpoints.is_empty() {
+            return None;
+        }
+        // `kappas` empty routes the IOV objective to the plain BSV one: no κ terms.
+        if !kappas.is_empty() {
+            let mut kappa_prior = 0.0;
+            for kap in kappas {
+                kappa_prior += quad_form(&omega_iov.inv, kap);
+            }
+            let kappa_log_det = (kappas.len() as f64) * omega_iov.log_det;
+            offset += kappa_prior + kappa_log_det;
+            offset_abs += kappa_prior.abs() + kappa_log_det.abs();
+        }
+    }
+    if !offset.is_finite() {
+        return None;
+    }
+    let bound = prepared_data_term_lower_bound(model, subject, theta, sigma_values, prep)?;
+    Some(MhGate {
+        bound,
+        offset,
+        offset_abs,
+    })
+}
+
+/// The MH early-rejection gate (#2608; Solonen et al. 2012): does the proposal's
+/// objective **certainly** fail the acceptance test, so its prediction need not be
+/// computed?
+///
+/// The kernels accept iff `log_u < nll − nll_prop`, and nothing consumes the RNG
+/// between the proposal and `log_u`, so drawing `log_u` first changes no stream and
+/// fixes the threshold `T = nll − log_u` before the evaluation. `nll_prop` is
+/// `½(ηᵀΩ⁻¹η + offset + data)` ([`MhGate`]) and `data ≥ bound.lb` for every η
+/// ([`prepared_data_term_lower_bound`]), so when `½(ηᵀΩ⁻¹η + offset + bound.lb)`
+/// clears `T` by more than the rounding margin, the full evaluation would have
+/// rejected too — the decision, and therefore the chain, is bit-identical; only the
+/// rejected proposal gets cheaper.
+///
+/// It never fires when the threshold is not an ordinary finite value below the
+/// `SUBJECT_SENTINEL_NLL` rail (a current state on the rail accepts a sentinel
+/// proposal through `1e20 − 1e20 = 0 > log_u`), or when `offset` is not finite.
+fn mh_early_rejects(gate: &MhGate, eta_prior: f64, nll_current: f64, log_u: f64) -> bool {
+    let threshold = nll_current - log_u;
+    if !(threshold.is_finite() && threshold < 0.1 * SUBJECT_SENTINEL_NLL)
+        || !gate.offset.is_finite()
+    {
+        return false;
+    }
+    let lb = 0.5 * (eta_prior + gate.offset + gate.bound.lb);
+    let scale =
+        eta_prior.abs() + gate.offset_abs + gate.bound.abs + nll_current.abs() + log_u.abs() + 1.0;
+    let margin = MH_EARLY_REJECT_MARGIN * scale + 1e-12 * gate.bound.n_rows as f64;
+    let fires = lb >= threshold + margin;
+    #[cfg(test)]
+    if fires {
+        early_reject_hooks::FIRED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    fires
+}
+
 /// [`mh_steps`] with the proposal's lower-triangular shape `l` supplied by the
 /// caller instead of read from `chol(Ω)`: proposals are
 /// `η + step_scale · (eta_block_scale ⊙ l·z)`. Any fixed `l` keeps the move a
@@ -2139,7 +2281,17 @@ pub(crate) fn mh_steps_with_proposal(
         z,
         perturbation,
         eta_prop,
+        #[cfg(test)]
+        early_reject_off,
+        #[cfg(test)]
+        early_rejections,
     } = scratch;
+    // The early-rejection gate (#2608): η-independent, so once per call. Under IOV
+    // the κs are held fixed through the η steps, so their prior is part of the
+    // constant offset.
+    let gate = mh_gate_for(model, subject, theta, omega, sigma_values, prep, kappas_opt);
+    #[cfg(test)]
+    let gate = gate.filter(|_| !*early_reject_off);
 
     for _ in 0..n_steps {
         for slot in z.iter_mut() {
@@ -2150,6 +2302,21 @@ pub(crate) fn mh_steps_with_proposal(
         for j in 0..n_eta {
             let bs = eta_block_scale.map_or(1.0, |s| s[j]);
             eta_prop[j] = eta[j] + step_scale * bs * perturbation[j];
+        }
+
+        // Drawn before the evaluation, not after: nothing between here and the
+        // acceptance test consumes the RNG, so the stream is unchanged, and the
+        // threshold is known before the prediction is (#2608).
+        let log_u: f64 = rng.random::<f64>().ln();
+        if let Some(gate) = &gate {
+            let eta_prior = quad_form(&omega.inv, eta_prop);
+            if mh_early_rejects(gate, eta_prior, nll, log_u) {
+                #[cfg(test)]
+                {
+                    *early_rejections += 1;
+                }
+                continue;
+            }
         }
 
         // Both arms reuse the caller's buffers. For IOV models correctness of
@@ -2188,7 +2355,6 @@ pub(crate) fn mh_steps_with_proposal(
         // Symmetric proposal q(η_prop|η) = q(η|η_prop) cancels in the ratio,
         // so the prior+likelihood difference encoded in `individual_nll` is
         // the full acceptance criterion.
-        let log_u: f64 = rng.random::<f64>().ln();
         if log_u < nll - nll_prop {
             eta.copy_from_slice(eta_prop);
             nll = nll_prop;
@@ -2252,14 +2418,37 @@ pub(crate) fn mh_steps_componentwise(
     let MhScratch {
         nll: nll_scratch,
         prep,
+        #[cfg(test)]
+        early_reject_off,
+        #[cfg(test)]
+        early_rejections,
         ..
     } = scratch;
+    // Same gate as the block kernel (#2608).
+    let gate = mh_gate_for(model, subject, theta, omega, sigma_values, prep, kappas_opt);
+    #[cfg(test)]
+    let gate = gate.filter(|_| !*early_reject_off);
 
     for _ in 0..n_sweeps {
         for j in 0..n_eta {
             let z: f64 = rng.sample(StandardNormal);
             let old_j = eta[j];
             eta[j] = old_j + step_scales[j] * cw_sd[j] * z;
+
+            // Drawn before the evaluation; the stream is unchanged (see the block
+            // kernel).
+            let log_u: f64 = rng.random::<f64>().ln();
+            if let Some(gate) = &gate {
+                let eta_prior = quad_form(&omega.inv, eta);
+                if mh_early_rejects(gate, eta_prior, nll, log_u) {
+                    #[cfg(test)]
+                    {
+                        *early_rejections += 1;
+                    }
+                    eta[j] = old_j; // reject — restore
+                    continue;
+                }
+            }
 
             let nll_prop = if let Some((kappas, omega_iov)) = kappas_opt {
                 individual_nll_iov_with_scratch_and_schedule(
@@ -2289,7 +2478,6 @@ pub(crate) fn mh_steps_componentwise(
             };
 
             // Symmetric scalar proposal cancels, same as the block kernel.
-            let log_u: f64 = rng.random::<f64>().ln();
             if log_u < nll - nll_prop {
                 nll = nll_prop;
                 per_eta_accepted[j] += 1;
@@ -13181,6 +13369,10 @@ DV ~ additive(EPS)
 #[cfg(test)]
 #[path = "saem_hotpath_tests.rs"]
 mod hotpath_tests;
+
+#[cfg(test)]
+#[path = "saem_early_reject_tests.rs"]
+mod early_reject_tests;
 
 #[cfg(test)]
 #[path = "saem_mstep_sa_tests.rs"]
