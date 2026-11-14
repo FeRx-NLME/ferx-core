@@ -256,8 +256,8 @@ pub(crate) fn event_before(time: f64, observed: bool, y: f64) -> bool {
 }
 
 /// Per subject, how many of the `nsim` reference replicates had an event before its
-/// scored time, and how many replicates were drawn for it (`nsim` for a scored
-/// subject, 0 for one with no record), with every batch's simulator warnings.
+/// scored time, and the denominator of that count (`nsim` for a scored subject, 0 for
+/// one with no record), with every batch's simulator warnings.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reference_counts(
     model: &CompiledModel,
@@ -275,6 +275,18 @@ pub(crate) fn reference_counts(
         .flatten()
         .map(|r| r.0)
         .fold(0.0_f64, |a, b| if b > a { b } else { a });
+    if horizon == 0.0 {
+        // Every scored time is 0 (review r1 #9). No event lies strictly before time 0,
+        // so every count is exactly 0 and there is nothing to simulate: an event scores
+        // at the lower clamp and a censored time is imputed on the whole of (0, 1). The
+        // simulator would refuse a horizon of 0 with a message about an option this
+        // function's caller never set.
+        let denominators = records
+            .iter()
+            .map(|r| if r.is_some() { nsim } else { 0 })
+            .collect();
+        return Ok((vec![0; records.len()], denominators, Vec::new()));
+    }
     let by_id: HashMap<&str, usize> = population
         .subjects
         .iter()

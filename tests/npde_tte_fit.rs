@@ -358,26 +358,93 @@ mod npde_tte_fit {
         }
     }
 
+    /// A drug-driven hazard: the cumulative hazard is an ODE state.
+    const ODE_HAZARD: &str = r"
+[parameters]
+  theta TVCL(1.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVH0(0.02, 0.001, 1.0)
+  theta TVBETA(0.5, FIX)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+
+[individual_parameters]
+  CL   = TVCL * exp(ETA_CL)
+  V    = TVV
+  H0   = TVH0
+  BETA = TVBETA
+
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+
+[odes]
+  d/dt(central) = -(CL/V) * central
+
+[scaling]
+  obs_scale = V
+
+[event_model]
+  cmt    = 2
+  hazard = H0 * exp(BETA * (central / V))
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
     /// A reference simulation the simulator refuses is the same single warning, quoting
     /// the simulator's own message, with no claim that the model kind is unsupported
-    /// (review r1 #5). Every record here is at time 0, so the latest scored time, the
-    /// simulation horizon, is 0, which the simulator refuses.
+    /// (review r1 #5). The fit accepts an `EVID` 3 reset on a subject of a drug-driven
+    /// hazard; the event-time simulator does not.
     ///
     /// Dies on: a simulator `Err` propagated out of the fit; its message replaced by a
     /// refusal's.
     #[test]
     fn a_refused_reference_simulation_is_the_same_warning() {
-        let model = parse_model_string(EXP).expect("model parses");
-        let pop = common::tte_pop_from_pairs(&[(0.0, 0), (0.0, 0), (0.0, 0)]);
+        let model = parse_model_string(ODE_HAZARD).expect("model parses");
+        let subjects = (0..6)
+            .map(|i| {
+                let mut s = common::subject(
+                    &format!("{}", i + 1),
+                    vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+                    vec![1.0, 6.0],
+                    vec![9.0 + 0.3 * i as f64, 5.5 + 0.2 * i as f64],
+                    vec![1, 1],
+                );
+                s.obs_records = vec![ObsRecord::Event {
+                    time: 8.0 + 3.0 * i as f64,
+                    event_type: if i % 2 == 0 {
+                        EventType::Exact
+                    } else {
+                        EventType::RightCensored
+                    },
+                    entry_time: 0.0,
+                    cmt: 2,
+                }];
+                s
+            })
+            .collect();
+        let mut pop = Population {
+            covariate_names: vec![],
+            dv_column: "DV".to_string(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+            subjects,
+        };
+        pop.subjects[3].reset_times = vec![7.0];
         let result = fit(&model, &pop, &model.default_params, &options(200)).expect("fit");
         assert!(tte_scores(&result).iter().flatten().all(|v| v.is_nan()));
         let warnings = skipped(&result);
         assert_eq!(warnings.len(), 1, "{:?}", result.warnings);
         assert_eq!(
             *warnings[0],
-            format!("{SKIPPED}SimulateOptions.horizon must be finite and > 0 (got 0)")
+            format!(
+                "{SKIPPED}ODE-accumulated TTE simulation does not support EVID=3/4 resets (a \
+                 full reset zeros the cumulative hazard mid-flight; selective per-state reset \
+                 is a later slice); subject '4' has resets"
+            )
         );
-        assert!(!warnings[0].contains("not supported"));
+        assert!(!warnings[0].contains("not supported yet"));
     }
 
     /// A correct fit of a cure-fraction model carries no hazard warning (review r1 #1).
@@ -408,6 +475,12 @@ mod npde_tte_fit {
             None,
         )
         .expect("post-fit scores");
+        // Only the time-to-event warnings: the simulator also drains a process-wide
+        // sink that other tests of this binary may write to.
+        let direct: Vec<String> = direct
+            .into_iter()
+            .filter(|w| w.starts_with("W_TTE_"))
+            .collect();
         assert_eq!(direct.len(), 1, "{direct:?}");
         assert!(
             direct[0].starts_with("W_TTE_DEGENERATE_HAZARD: "),

@@ -103,6 +103,18 @@ fn pop(records: Vec<Vec<ObsRecord>>) -> Population {
     }
 }
 
+/// The time-to-event warnings among `warnings`. The simulator drains the process-wide
+/// steady-state warning sink (`dosing.rs`, #1289), so what `compute_tte_npde` returns
+/// in a test can hold warnings written by unrelated tests running at the same time.
+/// An assertion on the whole list fails beside the rest of the lib tests (review r2
+/// #12); assert on this instead.
+fn tte_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .filter(|w| w.starts_with("W_TTE_"))
+        .collect()
+}
+
 fn scores(m: &CompiledModel, p: &Population, nsim: usize, seed: u64) -> Vec<Vec<TteNpde>> {
     compute_tte_npde(m, p, &m.default_params, nsim, Some(seed), None)
         .expect("scored")
@@ -441,6 +453,7 @@ fn scores_are_uniform_under_the_true_model_and_not_under_a_wrong_one() {
 
     let pds = |params: &ModelParameters| -> Vec<f64> {
         let (out, warnings) = compute_tte_npde(&m, &p, params, 1000, Some(7), None).unwrap();
+        let warnings = tte_warnings(warnings);
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(
             out.iter().filter(|s| s[0].imputed).count(),
@@ -667,6 +680,7 @@ fn ode_hazard_and_joint_subjects() {
     let times = [10.0, 40.0, 80.0];
     let p = joint_population(&m, &times.map(|t| Some((t, true))));
     let (out, warnings) = compute_tte_npde(&m, &p, &m.default_params, k, Some(4), None).unwrap();
+    let warnings = tte_warnings(warnings);
     assert!(warnings.is_empty(), "{warnings:?}");
     for (s, &t) in out.iter().zip(&times) {
         let want = 1.0 - (-0.02 * t).exp();
@@ -735,6 +749,7 @@ fn no_event_replicates_count_and_their_warnings_fold() {
     let (before, drawn, raw) =
         reference_counts(&m, &p, &m.default_params, 250, 5, None, 2, &scored).unwrap();
     assert_eq!(drawn, vec![250; 3]);
+    let raw = tte_warnings(raw);
     assert!(raw.len() > 250, "{} raw warnings", raw.len());
     assert!(raw
         .iter()
@@ -743,6 +758,7 @@ fn no_event_replicates_count_and_their_warnings_fold() {
     assert!(before[1] > 50 && before[1] < 120, "{before:?}");
 
     let (out, warnings) = compute_tte_npde(&m, &p, &m.default_params, 250, Some(5), None).unwrap();
+    let warnings = tte_warnings(warnings);
     let [w] = warnings.as_slice() else {
         panic!("one folded warning, got {}", warnings.len())
     };
@@ -852,4 +868,35 @@ fn a_fit_keeps_only_failed_solves_of_the_reference_draws() {
         ]
     );
     assert!(fit_time_warnings(vec![]).is_empty());
+}
+
+/// Every scored time at 0 (review r1 #9): no event lies strictly before time 0, so the
+/// scores are exact without a simulation. An event sits at the lower clamp; a censored
+/// time is its own uniform on (0, 1). Before, this input was refused with a message
+/// about `SimulateOptions.horizon`, an option the caller never set.
+///
+/// Dies on: the early return removed (the simulator refuses a horizon of 0); a
+/// censored record given the lower clamp too; a record-less subject given a score.
+#[test]
+fn all_scored_times_at_zero_are_scored_without_simulating() {
+    let m = model(EXP_IIV);
+    let p = pop(vec![event(0.0), censor(0.0), vec![], censor(0.0)]);
+    let (out, warnings) =
+        compute_tte_npde(&m, &p, &m.default_params, 200, Some(9), None).expect("scored");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let lo = 1.0 / 400.0;
+    assert_eq!((out[0][0].pd, out[0][0].imputed), (lo, false));
+    assert!(out[2].is_empty());
+    for i in [1, 3] {
+        let row = &out[i][0];
+        assert!(row.imputed);
+        assert_eq!(
+            row.pd,
+            clamp_prob(impute_uniform(9, i), 200),
+            "subject index {i}"
+        );
+        assert!(row.npde.is_finite());
+    }
+    assert_ne!(out[1][0].pd, out[3][0].pd);
+    assert_ne!(out[1][0].pd, lo);
 }
