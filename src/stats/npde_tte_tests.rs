@@ -166,11 +166,19 @@ fn event_before_hand_values() {
 
 /// T2, the named test for the conditioning. Twenty subjects, all right-censored at the
 /// `c` where `F(c) = 0.95`, no random effect. A censored score lies on `[F̂(c), 1]`, so
-/// every one is at least 0.95 less four Monte-Carlo SDs of `F̂`.
+/// every one is at least 0.95 less four Monte-Carlo SDs of `F̂`, and their mean is near
+/// the middle of that interval, 0.975.
+///
+/// The mean bound 0.9625 sits halfway between 0.975 and 0.95, the mean a censored time
+/// scored as an event (`pd = F̂(c)`) would give. Its distance to either is several
+/// standard deviations of a 20-subject mean (about 0.0035 for the imputed scores,
+/// 0.0015 for `F̂` alone); the realised mean is printed.
 ///
 /// Dies on: imputing from the unconditional distribution (`pd = u`), where each row
-/// passes with probability about 0.08 and all twenty with about 1e-22; `imputed` not
-/// set on a censored row.
+/// passes with probability about 0.08 and all twenty with about 1e-22; a censored time
+/// scored as an event (the mean); `imputed` not set on a censored row. T4, which also
+/// kills the first two, runs only under `slow-tests`, so this is the per-PR test for
+/// both.
 #[test]
 fn censored_scores_lie_above_the_censoring_quantile() {
     let m = model(EXP_FIXED);
@@ -181,6 +189,7 @@ fn censored_scores_lie_above_the_censoring_quantile() {
     let out = scores(&m, &p, k, 11);
     assert_eq!(out.len(), 20);
     let mut lowest = f64::INFINITY;
+    let mut sum = 0.0;
     for s in &out {
         let [row] = s.as_slice() else {
             panic!("one score per subject, got {}", s.len())
@@ -192,8 +201,11 @@ fn censored_scores_lie_above_the_censoring_quantile() {
         if row.pd < lowest {
             lowest = row.pd;
         }
+        sum += row.pd;
     }
-    eprintln!("T2: lowest censored pd {lowest:.4}, floor {floor:.4}");
+    let mean = sum / out.len() as f64;
+    eprintln!("T2: lowest censored pd {lowest:.4}, floor {floor:.4}; mean {mean:.4}, bound 0.9625");
+    assert!(mean > 0.9625, "mean censored pd {mean}");
     // The scores are not one repeated value: each subject has its own uniform.
     assert!(out.iter().any(|s| s[0].pd != out[0][0].pd));
 }
@@ -442,7 +454,15 @@ fn dropout_design(n: usize, seed: u64) -> (Population, usize) {
 ///
 /// Dies on: unconditional imputation (the correct twin moves past the bound); the
 /// twins swapped (both halves fail); a censored time scored as an event.
+///
+/// Gated under `slow-tests` (review of #2909): it simulates 2 × 1,000,000 draws, about
+/// 7 s in a debug build, 98 % of this module's run time. A calibration study, not a
+/// unit test. The two kernel mutations above are killed per PR by T2 as well.
 #[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
 fn scores_are_uniform_under_the_true_model_and_not_under_a_wrong_one() {
     const BOUND: f64 = 0.0616;
     let n = 1000;
