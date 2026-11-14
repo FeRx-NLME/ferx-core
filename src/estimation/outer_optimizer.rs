@@ -1,6 +1,6 @@
 use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, stencil_inner_tol,
-    InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
+    InnerHessianSeed, InnerLoopStats, InnerSolvePolicy, PrevEtas,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{
@@ -668,6 +668,7 @@ fn freeze_flat_thetas(
             options.inner_restarts,
             InnerHessianSeed::for_options(options),
             options,
+            PrevEtas::Placeholder,
         );
         (
             2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options),
@@ -1709,6 +1710,8 @@ fn run_inner_loop_and_nll(
     params: &ModelParameters,
     options: &FitOptions,
     prev_etas: Option<&[DVector<f64>]>,
+    // What `prev_etas` are ([`PrevEtas`]).
+    prev: PrevEtas,
     mu_k: Option<&[f64]>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
     cancel: Option<&crate::cancel::CancelFlag>,
@@ -1720,7 +1723,7 @@ fn run_inner_loop_and_nll(
     f64,
 ) {
     let (etas, h_matrices, stats, kappas, nll, _, _) = run_inner_loop_and_nll_prepared(
-        model, population, params, options, prev_etas, None, mu_k, None, schedules, false, cancel,
+        model, population, params, options, prev_etas, None, mu_k, None, schedules, prev, cancel,
     );
     (etas, h_matrices, stats, kappas, nll)
 }
@@ -1772,9 +1775,10 @@ fn run_inner_loop_and_nll_prepared(
     // The fused AGQ gradient's inputs, and whether it forms the mode response (#2549).
     agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds, bool)>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
-    // `prev_etas` are converged modes at `params` ([`InnerSolvePolicy::init_is_mode`]):
-    // only the first evaluation seeded from the flat-theta pre-flight passes `true` (#2076).
-    init_is_mode: bool,
+    // What `prev_etas` are ([`PrevEtas`]): converged modes at `params` only on the first
+    // evaluation seeded from the flat-theta pre-flight (#2076), an earlier pass's modes on
+    // the evaluations after it.
+    prev: PrevEtas,
     // Polled per subject (#574). Only a caller whose guard keeps a hard-rejected pass
     // out of every accepted state passes `Some`: the NLopt objective and the global
     // pre-search. The built-in BFGS loop passes `None` and polls between iterations.
@@ -1794,10 +1798,8 @@ fn run_inner_loop_and_nll_prepared(
         // The Gauss-Newton anchor never reuses it, and the gradient path recomputes the
         // whole second-order jet for its Laplace derivative sweep anyway, so capturing there
         // would be a full provider pass per subject thrown away.
-        let policy = InnerSolvePolicy {
-            init_is_mode,
-            ..agq_inner_solve_policy(model, options, agq_gradient_inputs.is_some())
-        };
+        let policy = agq_inner_solve_policy(model, options, agq_gradient_inputs.is_some())
+            .with_prev_etas(prev);
         let take_terminal_work =
             |_: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
                 (ebe.terminal_hessian.clone(), ebe.nll)
@@ -1922,9 +1924,9 @@ fn run_inner_loop_and_nll_prepared(
     }
     let policy = InnerSolvePolicy {
         accelerate_exact_outer: true,
-        init_is_mode,
         ..InnerSolvePolicy::for_stage(options, model)
-    };
+    }
+    .with_prev_etas(prev);
     let finish_subject =
         |subject: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
             subject_nll(
@@ -1999,10 +2001,13 @@ fn run_inner_loop_and_nll_prepared(
 /// State passed through NLopt's user-data mechanism
 struct NloptState {
     cached_etas: Vec<DVector<f64>>,
-    /// `cached_etas` are the flat-theta pre-flight's converged modes at this leg's start,
-    /// still unconsumed: the next inner pass takes them as warm starts whatever their
-    /// values ([`InnerSolvePolicy::init_is_mode`], #2076). Cleared by that pass.
-    cached_etas_are_modes: bool,
+    /// What `cached_etas` are. `ModesHere` while the flat-theta pre-flight's converged
+    /// modes at this leg's start are still unconsumed: the next inner pass takes them as
+    /// warm starts whatever their values ([`InnerSolvePolicy::init_is_mode`], #2076).
+    /// `Solved` once an adopted pass wrote them, so an EBE that is exactly zero is not
+    /// mistaken for the cold placeholder and multi-started again at every evaluation.
+    /// `Placeholder` for the zero fill of a cold start.
+    cached_etas_kind: PrevEtas,
     /// The incumbent's mode response `dη̂/dx` and the point it was taken at, for the
     /// Almquist Eq. 48 warm start `η̂ + (dη̂/dx)(x − x₀)`, taken whole (#2549,
     /// [`crate::estimation::sens_outer_gradient::predict_warm_etas`]).
@@ -2054,10 +2059,23 @@ impl NloptState {
         for e in self.cached_etas.iter_mut() {
             e.fill(0.0);
         }
-        self.cached_etas_are_modes = false;
+        self.cached_etas_kind = PrevEtas::Placeholder;
         self.pred_jac = None;
         self.pred_anchor.clear();
         self.seed_hessians = None;
+    }
+
+    /// [`Self::reset_to_cold_start`], then `modes` as the next evaluation's warm starts when
+    /// there is one per subject: a cold incumbent's or a verification leg's held modes. They
+    /// are a solve's output, so the cache is [`PrevEtas::Solved`] and an exactly-zero mode
+    /// among them is warm like the rest (#2688). With `None`, or a count that does not match,
+    /// the start stays cold.
+    fn restart_from_modes(&mut self, modes: Option<Vec<DVector<f64>>>) {
+        self.reset_to_cold_start();
+        if let Some(modes) = modes.filter(|m| m.len() == self.cached_etas.len()) {
+            self.cached_etas = modes;
+            self.cached_etas_kind = PrevEtas::Solved;
+        }
     }
 }
 
@@ -2199,6 +2217,9 @@ fn guarded_eval_line(
 struct ColdStart {
     solved: StartSolve,
     cached_etas: Vec<DVector<f64>>,
+    /// What `cached_etas` was read as, restored with it. The re-solve reads its warm start
+    /// as [`PrevEtas::Solved`]: the cold solve's modes, an exactly-zero η̂ among them (#2688).
+    cached_etas_kind: PrevEtas,
     contribs: Vec<f64>,
     mixeval: Option<crate::estimation::mixture::MixtureEval>,
     mixmodes: Option<crate::estimation::mixture::MixtureClassModes>,
@@ -2480,7 +2501,7 @@ fn new_nlopt_state(
 ) -> NloptState {
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
-        cached_etas_are_modes: false,
+        cached_etas_kind: PrevEtas::Placeholder,
         pred_jac: None,
         pred_anchor: Vec::new(),
         seed_hessians: None,
@@ -2604,6 +2625,7 @@ fn run_global_presearch(
             &params,
             options,
             Some(&cached_zero),
+            PrevEtas::Placeholder,
             Some(&mu_k),
             Some(&schedule_cache),
             options.cancel.as_ref(),
@@ -2644,6 +2666,8 @@ fn run_global_presearch(
             &params,
             options,
             Some(&state.cached_etas),
+            // Always the zero fill below: the pre-search keeps no modes between evals.
+            PrevEtas::Placeholder,
             Some(&mu_k),
             Some(&schedule_cache),
             options.cancel.as_ref(),
@@ -3750,11 +3774,11 @@ fn absorb_cold_incumbent(
     model: &CompiledModel,
     solve: IncumbentSolve,
 ) {
-    state.reset_to_cold_start();
-    let modes = outer_cache_warm_starts(model, &solve.etas, &solve.kappas);
-    if modes.len() == state.cached_etas.len() {
-        state.cached_etas = modes;
-    }
+    state.restart_from_modes(Some(outer_cache_warm_starts(
+        model,
+        &solve.etas,
+        &solve.kappas,
+    )));
     if ofv < state.best_ofv {
         state.best_ofv = ofv;
     }
@@ -4232,7 +4256,13 @@ fn inner_solve_polled(
         Some(mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
-        InnerSolvePolicy::for_stage(options, model),
+        // A seed is a set of modes an earlier pass returned, so an exactly-zero one among
+        // them is warm like the rest (#2688); without one the solve is cold.
+        InnerSolvePolicy::for_stage(options, model).with_prev_etas(if seed.is_some() {
+            PrevEtas::Solved
+        } else {
+            PrevEtas::Placeholder
+        }),
         cancel,
         |_, ebe| ebe.screen_moved || ebe.twin_moved,
     );
@@ -5312,6 +5342,7 @@ fn tight_per_subject_gradients(
             0,
             InnerHessianSeed::for_options(options),
             options,
+            PrevEtas::Solved,
         );
         // The decrement assumes every η̂ is a mode; one that did not converge (or a
         // start the inner loop refused) still yields a finite gradient, formed as if
@@ -7055,7 +7086,7 @@ fn optimize_nlopt_attempt_probed(
         .filter(|e| restart.is_none() && optimizer_start_s == x0_start_s && e.len() == n_subj)
     {
         state.cached_etas = etas.to_vec();
-        state.cached_etas_are_modes = true;
+        state.cached_etas_kind = PrevEtas::ModesHere;
     }
 
     // External counter mirrors state.n_evals — nlopt doesn't hand `state`
@@ -7312,7 +7343,7 @@ fn optimize_nlopt_attempt_probed(
             } else {
                 let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
                 let predicted: Option<Vec<DVector<f64>>> = match &state.pred_jac {
-                    Some(jac) if !state.cached_etas_are_modes => {
+                    Some(jac) if state.cached_etas_kind != PrevEtas::ModesHere => {
                         #[cfg(test)]
                         crate::estimation::inner_optimizer::record_prediction(
                             &state.cached_etas,
@@ -7329,6 +7360,11 @@ fn optimize_nlopt_attempt_probed(
                     }
                     _ => None,
                 };
+                // Read once: pre-flight modes are at this leg's start, the next evaluation is
+                // elsewhere. They stay a solve's output whether or not this pass is adopted;
+                // the zero placeholder stays one unless it is (the adoption below).
+                let prev = state.cached_etas_kind;
+                state.cached_etas_kind = prev.after_pass(false);
                 let (ehs, hms, ebe_stats, kappas, nll, prepared, nll_i) =
                     run_inner_loop_and_nll_prepared(
                         model,
@@ -7350,7 +7386,7 @@ fn optimize_nlopt_attempt_probed(
                             warm_predictor,
                         )),
                         Some(&schedule_cache),
-                        std::mem::take(&mut state.cached_etas_are_modes),
+                        prev,
                         options.cancel.as_ref(),
                     );
                 contribs = nll_i.iter().map(|v| 2.0 * v).collect();
@@ -7361,6 +7397,7 @@ fn optimize_nlopt_attempt_probed(
                 // evaluation is the cold one, as it was before #2682, and so is the warm-start
                 // cache — no incumbent exists yet to have earned a non-zero one (#1290).
                 state.cached_etas = cold.cached_etas;
+                state.cached_etas_kind = cold.cached_etas_kind;
                 let accepted = warm_rescore_accepted(
                     &solved.2,
                     n_subj,
@@ -7410,6 +7447,10 @@ fn optimize_nlopt_attempt_probed(
                 };
                 cold_start = Some(ColdStart {
                     cached_etas: std::mem::replace(&mut state.cached_etas, warm),
+                    cached_etas_kind: std::mem::replace(
+                        &mut state.cached_etas_kind,
+                        PrevEtas::Solved,
+                    ),
                     solved,
                     contribs: std::mem::take(&mut contribs),
                     mixeval: mixeval.take(),
@@ -7665,6 +7706,7 @@ fn optimize_nlopt_attempt_probed(
             // η̂, rather than restarting an IOV subject's κ at 0 (#2261) — except on an
             // ODE + IOV model, see `outer_cache_warm_starts` (#2508).
             state.cached_etas = outer_cache_warm_starts(model, &ehs, &kappas);
+            state.cached_etas_kind = state.cached_etas_kind.after_pass(true);
             // The next evaluation predicts its warm start from this incumbent's mode
             // response; a gradient-free evaluation keeps the last response, re-anchored here.
             if warm_predictor {
@@ -7893,6 +7935,7 @@ fn optimize_nlopt_attempt_probed(
                         probe_options.inner_restarts,
                         InnerHessianSeed::for_options(probe_options),
                         probe_options,
+                        PrevEtas::Placeholder,
                     );
                     let cold = 2.0
                         * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, probe_options);
@@ -8347,10 +8390,7 @@ fn optimize_nlopt_attempt_probed(
             // cold solve's modes the same way, so that leg's first evaluation is a warm
             // re-solve of them and a subject the cold solve left unconverged is not what
             // the guard judges (#2645).
-            state.reset_to_cold_start();
-            if let Some(modes) = held.filter(|m| m.len() == state.cached_etas.len()) {
-                state.cached_etas = modes;
-            }
+            state.restart_from_modes(held);
             carry_kept_class_modes(
                 &mut kept_class_modes,
                 last_leg_kept,
@@ -9509,11 +9549,16 @@ fn optimize_bfgs(
         Some(etas) if etas.len() == n_subj => etas.to_vec(),
         _ => vec![DVector::zeros(n_eta); n_subj],
     };
-    // Whether `cached_etas` still holds those converged modes, unconsumed: the first
-    // `fdfg` call takes them as warm starts whatever their values
-    // ([`InnerSolvePolicy::init_is_mode`]) and clears the flag.
-    let cached_etas_are_modes =
-        std::cell::Cell::new(first_eval_etas.is_some_and(|e| e.len() == n_subj));
+    // What `cached_etas` are. `ModesHere` while they still hold those converged modes,
+    // unconsumed: the first `fdfg` call takes them as warm starts whatever their values
+    // ([`InnerSolvePolicy::init_is_mode`]). Every `fdfg` result becomes the cache, so
+    // from then on they are `Solved` — an exactly-zero EBE among them included.
+    let cached_etas_kind =
+        std::cell::Cell::new(if first_eval_etas.is_some_and(|e| e.len() == n_subj) {
+            PrevEtas::ModesHere
+        } else {
+            PrevEtas::Placeholder
+        });
 
     // Covariate-NN (DCM) regularizer. No-op when both λ are 0. Penalty is added
     // to the optimizer-facing `f_only`/`fdfg` values (and `fdfg`'s gradient) but
@@ -9555,6 +9600,8 @@ fn optimize_bfgs(
             &params,
             options,
             Some(prev_etas),
+            // A line-search probe is never at the point the cache's modes were solved at.
+            cached_etas_kind.get().after_pass(false),
             Some(&mu_k),
             None,
             None, // the built-in BFGS loop polls between iterations (#574)
@@ -9601,7 +9648,7 @@ fn optimize_bfgs(
                 Some(&mu_k),
                 None,
                 None,
-                cached_etas_are_modes.take(),
+                cached_etas_kind.replace(PrevEtas::Solved),
                 None, // the built-in BFGS loop polls between iterations (#574)
             );
             let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();
@@ -9962,6 +10009,7 @@ fn optimize_bfgs(
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
         options,
+        cached_etas_kind.get(),
     );
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
@@ -10126,6 +10174,8 @@ fn reconverged_probe_ofv(
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
         options,
+        // The modes the gradient is taken at.
+        PrevEtas::Solved,
     );
     let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
     let n_subj = population.subjects.len();
@@ -10407,6 +10457,8 @@ fn reporting_fd_gradient(
                 options.inner_restarts,
                 InnerHessianSeed::for_options(options),
                 options,
+                // The final modes.
+                PrevEtas::Solved,
             );
             let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
             (2.0 * nll, ebe_stats)

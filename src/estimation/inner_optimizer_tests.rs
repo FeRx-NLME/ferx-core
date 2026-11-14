@@ -1674,6 +1674,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 screen: 0,
                 twin_seed: false,
                 init_is_mode: false,
+                init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
             },
@@ -1756,6 +1757,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 screen: 0,
                 twin_seed: false,
                 init_is_mode: false,
+                init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
             },
@@ -1785,6 +1787,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 screen: 0,
                 twin_seed: false,
                 init_is_mode: false,
+                init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
             },
@@ -1863,6 +1866,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         screen: 0,
         twin_seed: false,
         init_is_mode: false,
+        init_is_warm: false,
         keep_certified_start: false,
         unseeded_iov_warm: false,
     };
@@ -3859,6 +3863,7 @@ mod frozen_ebe_variance {
                 interaction: false,
                 ..Default::default()
             },
+            PrevEtas::Placeholder,
         );
         assert_eq!(
             stats.n_fallback, 0,

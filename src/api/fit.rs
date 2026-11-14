@@ -367,10 +367,15 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
 /// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima,
 /// with the statistic split by arm and pair-normalised since #2798: `cs` leaves DW
 /// 1.63, `ar1` 1.96 — the classic whole-subject form read 1.43 and 1.69).
+///
+/// `across_blocks` is [`dw_across_blocks`]: `Some` when the statistic paired rows of
+/// consecutive blocks (#2858). The positive text then says so and names the line that
+/// would correlate them, since no structure of the line as written can.
 pub(crate) fn dw_autocorrelation_warning_decorrelated(
     dw: f64,
     line: &str,
     kind: crate::types::ResidualSerialKind,
+    across_blocks: Option<SubjectLine>,
 ) -> Option<String> {
     if !dw.is_finite() {
         return None;
@@ -394,9 +399,18 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
                  dependent."
             }
         };
+        let across = match &across_blocks {
+            None => String::new(),
+            Some(by) => format!(
+                " The blocks of this line follow one another in time, so the statistic \
+                 also pairs rows of consecutive blocks, which the line leaves \
+                 independent.{}",
+                by.sentence(kind)
+            ),
+        };
         Some(format!(
             "Positive autocorrelation remains {what}: the within-group correlation does \
-             not explain it.{advice}"
+             not explain it.{advice}{across}"
         ))
     } else if dw > 2.5 {
         Some(format!(
@@ -406,6 +420,147 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
     } else {
         None
     }
+}
+
+/// How a `correlation` line that spans a subject is written (#2858): `by` the
+/// subject column when every subject's id is a number, else `by` a placeholder
+/// column with what it has to be. A `by` column is read as a number, so on a text
+/// id the line `by ID` puts every row in no block.
+///
+/// The subject column is named as the data spell it. `by` is case-sensitive while
+/// the reader's `ID` role is not: on a file whose header is `id`, the line `by ID`
+/// is refused ("covariate(s) not found in data (case-sensitive): ID"). A
+/// `[data] ID = SUBJ` mapping renames the column, and `by ID` then reads it
+/// (measured: the same objective as on a file with an `ID` header).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubjectLine {
+    /// `by` this column: the data's subject column, `ID` unless spelt otherwise.
+    ById(String),
+    ByNumericColumn,
+}
+
+impl SubjectLine {
+    pub(crate) fn of(prepared: &Population) -> Self {
+        if prepared
+            .subjects
+            .iter()
+            .all(|s| s.id.parse::<f64>().is_ok())
+        {
+            // The header as written; a population built without a file has none.
+            let header = prepared
+                .input_columns
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case("ID"))
+                .map_or("ID", String::as_str);
+            SubjectLine::ById(header.to_string())
+        } else {
+            SubjectLine::ByNumericColumn
+        }
+    }
+
+    fn column(&self) -> &str {
+        match self {
+            SubjectLine::ById(header) => header,
+            SubjectLine::ByNumericColumn => "COL",
+        }
+    }
+
+    /// The sentence naming the line that spans a subject, for a model whose
+    /// `correlation` line has structure `kind` (review of #2883, row 1).
+    ///
+    /// Under `ar1` / `car1` only the `by` changes. Under `cs` the structure has to
+    /// change too: compound symmetry over a whole subject is the covariance a
+    /// subject-level random effect gives, so next to an additive one ρ and its
+    /// variance are not identified together. Measured on
+    /// `tests/data/dw_sequential_algebraic/rich.csv`: `cs(RHO) by ID` converges to
+    /// −132.318001, the objective of the model without a line, with ρ left at 0.30.
+    fn sentence(&self, kind: crate::types::ResidualSerialKind) -> String {
+        let (by, clause) = (self.column(), self.clause());
+        match kind {
+            crate::types::ResidualSerialKind::Cs => format!(
+                " A `correlation ar1(RHO) by {by}` line correlates all rows of one \
+                 subject{clause}, decaying with the number of visits between them; \
+                 `car1(RHO)` decays it with the time between rows instead. `cs` over a \
+                 whole subject is the correlation a subject-level random effect already \
+                 gives, so it would add nothing."
+            ),
+            crate::types::ResidualSerialKind::Ar1 | crate::types::ResidualSerialKind::Car1 => {
+                format!(" A line `by {by}` correlates all rows of one subject{clause}.")
+            }
+        }
+    }
+
+    fn clause(&self) -> &'static str {
+        match self {
+            SubjectLine::ById(_) => "",
+            SubjectLine::ByNumericColumn => {
+                ", with COL a numeric data column that has one value per subject \
+                 (`ID` is not numeric in this data)"
+            }
+        }
+    }
+}
+
+/// The fewest cross-block pairs [`dw_cross_block_warning`] reads (#2858). The
+/// Durbin–Watson statistic over `n` independent pairs has a standard deviation of
+/// about `2/√n`, so the 1.5 threshold is `√n/4` deviations below 2: 1.96 at 62
+/// pairs. Measured on independent rows in `cross_block_dw_is_calibrated_on_white_noise`:
+/// a false-positive rate of 2.25% at 62 pairs, 13.3% at 20. The pooled warning has no such
+/// floor; this one is a second look at a subset, so it gets one.
+pub(crate) const DW_CROSS_BLOCK_MIN_PAIRS: usize = 62;
+
+/// The warning for positive autocorrelation **between consecutive blocks** of a
+/// `correlation` line (#2858), or `None`. `cross` is `whitened_cross_block_dw`: the
+/// count of lag pairs that join two blocks in time and the statistic over them.
+/// `pooled` is the fit's `dw_statistic`.
+///
+/// It speaks only when the pooled warning does not (`pooled` not below 1.5): that
+/// one already names the subject line when the statistic paired across blocks. The
+/// case it exists for is a line `by` the visits with several rows per visit, where
+/// the pairs inside a block, which the line models, outnumber the ones across and
+/// pull the pooled statistic into the band.
+///
+/// A non-finite `pooled` is silent. No fit reaches it: every pair that joins two
+/// blocks is also a pooled pair, so the pooled statistic is finite whenever this
+/// one is.
+pub(crate) fn dw_cross_block_warning(
+    cross: (usize, f64),
+    pooled: f64,
+    line: &str,
+    kind: crate::types::ResidualSerialKind,
+    by: &SubjectLine,
+) -> Option<String> {
+    let (pairs, dw) = cross;
+    if pairs < DW_CROSS_BLOCK_MIN_PAIRS
+        || !dw.is_finite()
+        || dw >= 1.5
+        || !pooled.is_finite()
+        || pooled < 1.5
+    {
+        return None;
+    }
+    Some(format!(
+        "Positive autocorrelation between consecutive blocks of `{line}` (Durbin-Watson = \
+         {dw:.2} over the {pairs} pairs that join two blocks; {pooled:.2} over all pairs). \
+         The blocks follow one another in time, and the line leaves rows of different \
+         blocks independent.{}",
+        by.sentence(kind)
+    ))
+}
+
+/// Whether the decorrelated statistic paired rows **across** residual blocks on
+/// `prepared` (#2858), and if so how a line spanning the subject is written: some
+/// subject has more than one block and its blocks run in time
+/// (`residual_blocks_run_in_time`), so `split_by_residual_group` joined them.
+pub(crate) fn dw_across_blocks(prepared: &Population) -> Option<SubjectLine> {
+    prepared
+        .subjects
+        .iter()
+        .any(|s| {
+            s.obs_rgroup.windows(2).any(|w| w[0] != w[1])
+                && crate::stats::residual_error::residual_blocks_run_in_time(s)
+        })
+        .then(|| SubjectLine::of(prepared))
 }
 
 /// Which remedies the positive-DW warning may name (#2798): only ones the fitted
@@ -421,6 +576,11 @@ pub(crate) enum DwAdvice {
     /// the name such a line can read, or `None` when the model declares no grouping
     /// a `by` can name.
     Algebraic { group: Option<String> },
+    /// A compartment-free model whose subjects carry occasions that all **run in
+    /// time** (#2858): the statistic was taken across them, so a `correlation` line
+    /// has to span the subject. A line `by` the occasions cannot, as a block never
+    /// joins rows of two occasions. `by` is how the line that does is written.
+    AlgebraicInTime { by: SubjectLine },
 }
 
 /// The [`DwAdvice`] for `model` fitted under `options` on `prepared` (#2798).
@@ -436,8 +596,16 @@ pub(crate) enum DwAdvice {
 ///   writes the level's column into it): that **column**. A one-level model has no
 ///   named level a `by` can read (`residual_level` needs more than one).
 ///
-/// Otherwise `None`: the model declares no grouping, or every subject's occasions
-/// run in time and the statistic was taken over whole subjects. Also `None` for
+/// When no subject is split and some subject carries more than one occasion, the
+/// statistic paired rows **across** occasions that run in time, and the advice is
+/// [`DwAdvice::AlgebraicInTime`] (#2858), whatever declared the occasions (a column,
+/// a level, nested levels or a derived rule): a line `by` that grouping is the one
+/// line that cannot model those pairs. Measured on `tests/data/dw_sequential_algebraic`:
+/// with one row per occasion `ar1(RHO) by OCC` leaves the OFV at −37.739613 and ρ at
+/// its initial value, where `by ID` reaches −124.232414.
+///
+/// Otherwise `group` is `None`: the model declares no grouping, or no subject has
+/// two occasions. Also `None` for
 /// occasions a derived rule wrote (`iov_occasion = dose` / `time(...)` on a model
 /// with a kappa, `run::occasions_are_derived`): they come from the timeline, so no
 /// column labels them, and the rule overrides `iov_column`. On one running clock
@@ -458,6 +626,19 @@ pub(crate) fn dw_advice(
         .subjects
         .iter()
         .any(|s| !crate::stats::residual_error::occasions_run_in_time(s));
+    if !split_at_occasions {
+        // More than one label in some subject: only then is there a pair that
+        // crosses occasions for the advice to speak about.
+        let across_occasions = prepared
+            .subjects
+            .iter()
+            .any(|s| s.occasions.windows(2).any(|w| w[0] != w[1]));
+        if across_occasions {
+            return DwAdvice::AlgebraicInTime {
+                by: SubjectLine::of(prepared),
+            };
+        }
+    }
     let group = if !split_at_occasions {
         None
     } else if let Some(levels) = model.nested_levels() {
@@ -514,6 +695,18 @@ pub(crate) fn dw_autocorrelation_warning(dw: f64, advice: &DwAdvice) -> Option<S
                  them correlate, decaying with the number of visits between them; \
                  {CAR1_AND_METHOD}"
             ),
+            DwAdvice::AlgebraicInTime { by } => {
+                let (by, column) = (by.column(), by.clause());
+                format!(
+                    "{what} Consecutive rows of one subject may share what the structural \
+                     model leaves out, across its occasions too: they follow one another in \
+                     time, so the statistic pairs rows of different occasions. A \
+                     `correlation ar1(RHO) by {by}` line in [error_model] correlates all rows \
+                     of one subject{column}, decaying with the number of visits between \
+                     them; {CAR1_AND_METHOD} A line `by` the occasions themselves cannot \
+                     model this: a block never joins rows of two occasions."
+                )
+            }
             DwAdvice::Algebraic { group: None } => format!(
                 "{what} Rows of one subject may share what the structural model leaves \
                  out, such as the visits of one arm or occasion. A `correlation \
@@ -722,8 +915,8 @@ pub(crate) fn nn_regularization_unapplied_warning(
 /// same process can use different thread counts). When `None`, the shared
 /// big-stack fit pool is used, sized to the width a front end declared with
 /// [`configure_global_thread_pool`](crate::configure_global_thread_pool) if any,
-/// else a positive `RAYON_NUM_THREADS` (#2800), else available cores minus one
-/// capped at 8 (#707).
+/// else a positive `RAYON_NUM_THREADS` (#2800), else available cores minus one,
+/// at least two where two cores exist, capped at 8 (#707).
 /// Rayon's own global pool is not used either way, and `--threads N` no longer
 /// sizes it (#1460).
 ///
@@ -2193,6 +2386,7 @@ fn fit_inner(
                     stage_opts.inner_restarts,
                     crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&stage_opts),
                     &stage_opts,
+                    crate::estimation::inner_optimizer::PrevEtas::Solved,
                 );
             let nll = crate::estimation::agq::agq_population_nll(
                 model,
@@ -2302,6 +2496,7 @@ fn fit_inner(
                         stage_opts.inner_restarts,
                         crate::estimation::inner_optimizer::InnerHessianSeed::None,
                         &stage_opts,
+                        crate::estimation::inner_optimizer::PrevEtas::Placeholder,
                     );
                 let nll = crate::estimation::outer_optimizer::pop_nll(
                     model,
@@ -3314,7 +3509,8 @@ fn fit_inner(
     // Under a `correlation` line the raw IWRES are correlated by construction; the
     // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
     // Either way each subject's series is split at its residual blocks and at its
-    // parallel occasions (#2798); occasions that run in time stay one series (#2829).
+    // occasions when these are parallel (#2798); blocks and occasions that run in
+    // time stay one series (#2829, #2858).
     // Both are read off `population` — the prepared one this fit scored, whose
     // occasions carry the `iov_column`, a derived rule's labels or the level cells.
     let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
@@ -3394,17 +3590,39 @@ fn fit_inner(
     });
 
     // DW autocorrelation warnings
-    let dw_warning = match (
-        &model.residual_serial,
-        crate::api::validation::residual_correlation_line(model),
-    ) {
-        (Some(serial), Some(line)) => {
-            dw_autocorrelation_warning_decorrelated(dw_statistic, &line, serial.kind)
-        }
-        _ => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options, population)),
+    let serial_line = model
+        .residual_serial
+        .as_ref()
+        .zip(crate::api::validation::residual_correlation_line(model));
+    let across_blocks = serial_line
+        .as_ref()
+        .and_then(|_| dw_across_blocks(population));
+    let dw_warning = match &serial_line {
+        Some((serial, line)) => dw_autocorrelation_warning_decorrelated(
+            dw_statistic,
+            line,
+            serial.kind,
+            across_blocks.clone(),
+        ),
+        None => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options, population)),
     };
     if let Some(msg) = dw_warning {
         warnings.push(msg);
+    }
+    if let (Some((serial, line)), Some(by)) = (&serial_line, &across_blocks) {
+        let cross = crate::stats::residual_error::whitened_cross_block_dw(
+            model,
+            population,
+            &result.params,
+            &subjects,
+        );
+        warnings.extend(dw_cross_block_warning(
+            cross,
+            dw_statistic,
+            line,
+            serial.kind,
+            by,
+        ));
     }
     // The published method is `None` whenever the step produced no matrix, so the method
     // gate inside is the only gate (#2415 review row 3).

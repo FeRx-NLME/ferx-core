@@ -8771,7 +8771,8 @@ pub struct FitResult {
     pub shrinkage_eps: f64,
     /// Pooled lag-1 Pearson correlation of IWRES across subjects.
     /// `NaN` when no series has ≥ 2 valid IWRES values (a series is a subject's
-    /// rows, split at its `correlation … by` blocks and its parallel occasions).
+    /// rows, split at its `correlation … by` blocks and its occasions where these
+    /// are parallel; blocks and occasions that run in time stay one series).
     pub iwres_lag1_r: f64,
     /// Pooled Durbin-Watson statistic for IWRES within subjects.
     /// 2.0 = no autocorrelation; < 1.5 = positive; > 2.5 = negative.
@@ -9513,7 +9514,7 @@ pub struct FitOptions {
     /// loop's warm start then carries the chosen basin forward, so the scan runs
     /// only on cold solves: the pre-flight, the first evaluation of each optimizer
     /// leg (including a #1565 basin restart) and the final re-solve (an all-zero
-    /// start counts as cold, #2014). The `global_search` pre-search's probes run
+    /// start counts as cold unless an earlier pass returned it as the mode, #2014, #2688). The `global_search` pre-search's probes run
     /// without it. Subjects on the event-driven path
     /// (system resets / time-varying covariates) re-seed every random effect;
     /// every other subject is probed per coordinate for a weakly-identified

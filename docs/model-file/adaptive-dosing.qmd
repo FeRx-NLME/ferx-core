@@ -290,6 +290,12 @@ Likewise, because ties go up, 500 `decrease 25%` gives 375, which rounds back to
 500. Choose the step and the percentages together so the lowest doses can still
 move, or check `rule_fired` against the realized `amt` in the ledger.
 
+The run warns (`W_ADAPTIVE_STEP_ABSORBED`) when the smallest `increase N%` is absorbed
+at a dose a subject can be at: its start dose, or the lowest dose the decrease rules
+bring it to. The warning names those subjects with the dose, and the lowest dose that
+step can raise. A dose at the upper bound, and a dose that only cannot go down, do not
+warn.
+
 `round_to` does not combine with `levels`: a ladder is already discrete, so write
 the rounded doses as the rungs. Without `round_to`, nothing changes: doses are clamped
 to `dose_bounds` only, as before.
