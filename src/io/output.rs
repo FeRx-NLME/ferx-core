@@ -229,7 +229,7 @@ fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
 /// is not `100 · sd_at_typical_weight` (#1858).
 #[cfg(test)]
 fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
-    estimates::spread_field(t, var).map(|(k, v)| format!("    {k}: {}", v.yaml()))
+    estimates::spread_field(t, var).map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
 }
 
 /// A weighted kappa's `cv_pct_at_typical_weight` YAML line: `cv_pct` of the
@@ -239,7 +239,7 @@ fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
 /// [`estimates::typical_cv_field`], the field the `omega_iov:` section writes.
 #[cfg(test)]
 fn typical_cv_yaml_line(t: Option<EtaParamType>, var_at: f64) -> Option<String> {
-    estimates::typical_cv_field(t, var_at).map(|(k, v)| format!("    {k}: {}", v.yaml()))
+    estimates::typical_cv_field(t, var_at).map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
 }
 
 /// The type of the ETA called `name`, looked up **by name** in

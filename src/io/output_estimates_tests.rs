@@ -136,11 +136,25 @@ fn yaml_estimate_fields(
             section = OWNED.contains(&key).then(|| key.to_string());
             entry = None;
         } else if indent == base + 2 && section.is_some() {
-            entry = Some(t.trim_end_matches(':').to_string());
+            let name = t.trim_end_matches(':');
+            // A quoted name (always under `estimates:`, else only `YES`-like ones) is
+            // `yaml_quote`d, whose escapes are JSON's.
+            entry = Some(if name.starts_with('"') {
+                serde_json::from_str::<String>(name).unwrap_or_else(|e| panic!("{name}: {e}"))
+            } else {
+                name.to_string()
+            });
         } else if indent == base + 4 {
             if let (Some(s), Some(e)) = (&section, &entry) {
                 let (k, v) = t.split_once(": ").unwrap_or_else(|| panic!("{line}"));
-                out.insert((s.clone(), e.clone(), k.to_string()), v.to_string());
+                // A quoted scalar compares by the string it denotes: a `base` name is
+                // quoted under `estimates:` and bare at the top level.
+                let v = if v.starts_with('"') {
+                    serde_json::from_str::<String>(v).unwrap_or_else(|e| panic!("{v}: {e}"))
+                } else {
+                    v.to_string()
+                };
+                out.insert((s.clone(), e.clone(), k.to_string()), v);
             }
         }
     }
@@ -308,4 +322,83 @@ fn an_unrenderable_block_sigma_gives_null_estimates_not_a_partial_table() {
     let mut r = rich_result();
     r.residual_correlations[0].sigma_i = 7;
     assert_eq!(r.to_json_value()["estimates"], serde_json::Value::Null);
+}
+
+/// The documented cross-format path must address the same parameter in both files, and
+/// YAML 1.1 (R's `yaml::read_yaml`) reads a bare `YES` / `OFF` / `NULL` key as
+/// `TRUE` / `FALSE` / null. So a name YAML would misread is quoted wherever it is written,
+/// and every name is quoted under `estimates:`; the JSON has the plain strings.
+#[test]
+fn yaml_quotes_names_yaml_would_misread() {
+    let mut r = rich_result();
+    r.theta_names[0] = "YES".into(); // was CL
+    r.eta_names[0] = "NULL".into(); // was eta_CL: also the Ω override's `base`
+    r.eta_param_info[0].eta_name = "NULL".into();
+    r.sigma_names[1] = "OFF".into(); // was add: also the σ override's `base`, `OFF__prop`
+    assert_yaml_and_json_agree(&r);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m-fit.yaml");
+    write_estimates_yaml(&r, path.to_str().unwrap()).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let split = text.find("\nestimates:\n").unwrap();
+    let (top, nested) = text.split_at(split);
+
+    // Top level: only the misread names are quoted, so every other byte is as before.
+    for name in ["YES", "NULL", "OFF"] {
+        assert!(
+            top.contains(&format!("\n  \"{name}\":\n")),
+            "{name}:\n{top}"
+        );
+        assert!(!top.contains(&format!("\n  {name}:\n")), "{name}:\n{top}");
+    }
+    assert!(
+        top.contains("\n  KA:\n") && top.contains("\n  OFF__prop:\n"),
+        "{top}"
+    );
+    assert!(top.contains("    base: \"OFF\"\n"), "{top}");
+    assert!(top.contains("    base: \"NULL\"\n"), "{top}");
+
+    // Under `estimates:` every name is quoted, ordinary ones included.
+    for name in ["YES", "NULL", "OFF", "KA", "OFF__prop", "add_MIX2"] {
+        assert!(
+            nested.contains(&format!("\n    \"{name}\":\n")),
+            "{name}:\n{nested}"
+        );
+    }
+    assert!(nested.contains("      base: \"OFF\"\n"), "{nested}");
+    // Fixed vocabulary is not a name and stays bare.
+    assert!(nested.contains("      kind: sigma\n"), "{nested}");
+
+    let est = r.to_json_value()["estimates"].clone();
+    assert_eq!(est["theta"]["YES"]["estimate"], 1.5);
+    assert_eq!(est["omega"]["NULL"]["variance"], 0.09);
+    assert_eq!(est["mixture_overrides"]["add_MIX2"]["base"], "OFF");
+
+    // The `[priors] from_fit` reader of the YAML gets the plain names back.
+    let read = crate::io::fit_estimates::parse_estimates_yaml(&text).unwrap();
+    for name in ["YES", "NULL", "OFF", "KA"] {
+        assert!(read.iter().any(|e| e.name == name), "{name}: {read:?}");
+    }
+    assert!(!read.iter().any(|e| e.name.contains('"')), "{read:?}");
+}
+
+#[test]
+fn yaml_name_quotes_exactly_the_implicit_scalars_unless_asked() {
+    for misread in [
+        "YES", "yes", "Y", "n", "No", "ON", "off", "TRUE", "False", "NULL", "~",
+    ] {
+        assert_eq!(yaml_name(misread, false), yaml_quote(misread), "{misread}");
+    }
+    for plain in [
+        "CL",
+        "YESNO",
+        "ON_RATE",
+        "eta_NULL",
+        "PLACEBO[L=2]",
+        "ETA_V__ETA_CL",
+    ] {
+        assert_eq!(yaml_name(plain, false), plain, "{plain}");
+        assert_eq!(yaml_name(plain, true), yaml_quote(plain), "{plain}");
+    }
 }

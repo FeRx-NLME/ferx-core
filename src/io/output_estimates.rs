@@ -31,8 +31,12 @@ pub(crate) enum Value {
     Null,
     Bool(bool),
     Int(usize),
-    /// A bare word: a σ `type`, a `held` reason, a base parameter name.
+    /// A bare word from ferx's own vocabulary: a σ `type`, a `held` reason, a `kind`.
     Token(String),
+    /// A name the model file chose (a `mixture_overrides` entry's `base`): quoted under
+    /// `estimates:`, and in a top-level section only when YAML would misread it bare
+    /// ([`yaml_name`]).
+    Name(String),
     /// Free-form text, quoted in the YAML ([`yaml_quote`]).
     Text(String),
 }
@@ -43,7 +47,9 @@ impl Value {
         v.map_or(Value::Null, Value::Num)
     }
 
-    pub(crate) fn yaml(&self) -> String {
+    /// The value as a YAML scalar. `quote_names` is set under `estimates:`, where every
+    /// [`Value::Name`] is quoted.
+    pub(crate) fn yaml(&self, quote_names: bool) -> String {
         match self {
             Value::Num(v) => format!("{v:.6}"),
             Value::Pct(v) => format!("{v:.2}"),
@@ -52,6 +58,7 @@ impl Value {
             Value::Bool(b) => b.to_string(),
             Value::Int(n) => n.to_string(),
             Value::Token(s) => s.clone(),
+            Value::Name(s) => yaml_name(s, quote_names),
             Value::Text(s) => yaml_quote(s),
         }
     }
@@ -64,8 +71,27 @@ impl Value {
             Value::Null => serde_json::Value::Null,
             Value::Bool(b) => (*b).into(),
             Value::Int(n) => (*n).into(),
-            Value::Token(s) | Value::Text(s) => s.clone().into(),
+            Value::Token(s) | Value::Name(s) | Value::Text(s) => s.clone().into(),
         }
+    }
+}
+
+/// A name the model file chose (a θ, η, σ or κ name, an `A__B` off-diagonal, a base
+/// name) as a YAML key or scalar: always quoted when `always` (under `estimates:`),
+/// otherwise only when YAML 1.1 — which R's `yaml` package implements — would read it
+/// bare as something other than that string. Every legal identifier is a plain scalar
+/// except the boolean and null spellings: `YES`, `no`, `On`, `OFF`, `y`, `N`, `TRUE`,
+/// `NULL`, … would come back as `TRUE` / `FALSE` / `NULL` and address a different key than
+/// the JSON's `"YES"` (#2911). The check is case-insensitive, so it also quotes a few
+/// mixed-case spellings YAML would read as strings; that costs only the quotes.
+pub(crate) fn yaml_name(name: &str, always: bool) -> String {
+    const IMPLICIT: &[&str] = &[
+        "y", "n", "yes", "no", "true", "false", "on", "off", "null", "~", "",
+    ];
+    if always || IMPLICIT.contains(&name.to_ascii_lowercase().as_str()) {
+        yaml_quote(name)
+    } else {
+        name.to_string()
     }
 }
 
@@ -153,8 +179,12 @@ impl Section {
     }
 
     /// The section's header and entries, every line prefixed by `indent`.
+    ///
+    /// Under `estimates:` (a non-empty `indent`) every user-chosen name is quoted; the
+    /// top-level copy quotes only the names YAML would misread bare, keeping its bytes.
     fn yaml_at(&self, indent: &str) -> String {
         use std::fmt::Write;
+        let nested = !indent.is_empty();
         let mut out = format!("{indent}{}:", self.key);
         // An empty section nested under `estimates:` is `{}`, so a YAML parser reads the
         // empty map the JSON has rather than `null`. The top-level copy keeps its old bytes.
@@ -166,9 +196,9 @@ impl Section {
         }
         out.push('\n');
         for e in &self.entries {
-            let _ = writeln!(out, "{indent}  {}:", e.name);
+            let _ = writeln!(out, "{indent}  {}:", yaml_name(&e.name, nested));
             for (k, v) in &e.fields {
-                let _ = writeln!(out, "{indent}    {k}: {}", v.yaml());
+                let _ = writeln!(out, "{indent}    {k}: {}", v.yaml(nested));
             }
         }
         out
@@ -532,7 +562,7 @@ pub(crate) fn mixture_overrides_section(result: &FitResult) -> Option<Section> {
         let base = row.base_name(result);
         let mut e = Entry::new(p.name.clone());
         e.push("class", Value::Int(p.class));
-        e.push("base", Value::Token(base.to_string()));
+        e.push("base", Value::Name(base.to_string()));
         match p.kind {
             ParameterKind::Omega => {
                 e.push("kind", Value::Token("omega".into()));

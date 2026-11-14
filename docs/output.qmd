@@ -267,6 +267,11 @@ is the supported path for code that has to read both formats. In the JSON:
   significant figures only in the JSON.
 - JSON `null` is the YAML's `~`, and also a non-finite value the YAML prints as
   `NaN` / `inf` / `.inf`.
+- Under the YAML's `estimates:`, every parameter name — and a mixture
+  override's `base` — is double-quoted (`"TVCL":`), so a name YAML would
+  otherwise read as a boolean or null (`YES`, `NO`, `ON`, `OFF`, `NULL`, …)
+  reaches a YAML reader as the same string the JSON has. The top-level sections
+  quote only those names and leave every other one bare, as before.
 - Keys within a section are sorted, not in declaration order; read them by
   name. Declaration order is `theta_names` / `eta_names` / `sigma_names`.
 - `estimates` is derived output, like `status`: reading the JSON back as a

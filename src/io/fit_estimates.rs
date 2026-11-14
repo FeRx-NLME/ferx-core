@@ -285,7 +285,7 @@ pub(crate) fn parse_estimates_yaml(text: &str) -> Result<Vec<SourceEstimate>, St
             // keeps a mis-identified section from inventing a parameter called
             // `- name`.
             if let Some(name) = trimmed.strip_suffix(':').filter(|n| !n.starts_with('-')) {
-                entry = Some((name.to_string(), None, None, false));
+                entry = Some((unquote_name(name), None, None, false));
             }
             continue;
         }
@@ -317,6 +317,18 @@ pub(crate) fn parse_estimates_yaml(text: &str) -> Result<Vec<SourceEstimate>, St
         );
     }
     Ok(out)
+}
+
+/// An entry name as the writer spelled it: bare, or — for a name YAML would misread
+/// bare, such as `YES` or `NULL` (#2911) — double-quoted by `yaml_quote`, whose escapes
+/// are JSON's.
+fn unquote_name(name: &str) -> String {
+    if name.len() >= 2 && name.starts_with('"') && name.ends_with('"') {
+        if let Ok(s) = serde_json::from_str::<String>(name) {
+            return s;
+        }
+    }
+    name.to_string()
 }
 
 /// `~` (the writer's null) and anything unparseable read as absent.
