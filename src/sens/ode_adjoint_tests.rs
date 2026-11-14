@@ -2169,23 +2169,40 @@ const TRIANGULAR_CHAIN_ODE: &str = r#"
   DV ~ proportional(PROP_ERR)
 "#;
 
-/// #2761 review row 5: the outer gradient's taped recording reads a triangular `A` as
-/// acyclic, the same construction the `f64` objective takes. Before #2760 the recorded
-/// block kept `A`'s structural zeros as tape nodes, so on the tape `A` was one cyclic
-/// block (eigensolver eigenvalues, no masks) while the objective took the acyclic form.
-/// That moved `emax_pkpd`'s start gradient by 7.9e-13 relative and its optimizer path by
-/// 8 iterations, a gap far inside every FD-parity bound, so only the construction itself
-/// can be asserted. Straddle: the same gradient with the block keeping its zeros
-/// (`RHS_DEAD_KEPT`, the recording before #2760) must read cyclic, so a fixture that
-/// never reached the coupling graph on the taped type cannot pass.
+/// #2761 review row 5: the outer gradient's taped recording builds `A`'s coupling graph
+/// exactly as the `f64` objective does. Before #2760 the recorded block kept `A`'s
+/// structural zeros as tape nodes, so on the tape a triangular `A` was one cyclic block
+/// (eigensolver eigenvalues, no masks) while the objective took the acyclic form. That
+/// moved `emax_pkpd`'s start gradient by 7.9e-13 relative and its optimizer path by 8
+/// iterations, a gap far inside every FD-parity bound, so the construction itself is
+/// what is asserted.
 ///
 /// Dies on: structural-zero outputs kept on the tape in `vtape::record_rhs` (the
-/// `RHS_DEAD_KEPT` gate forced on); the taped type never reaching `spectral` (total 0).
+/// `RHS_DEAD_KEPT` gate forced on); `DualV` reading a taped zero as an edge.
 #[test]
-fn taped_gradient_reads_a_triangular_generator_as_acyclic_like_the_objective() {
-    use crate::ode::linear::SPECTRAL_TAPED_CYCLIC;
+fn taped_gradient_builds_a_triangular_generators_graph_like_the_objective() {
+    taped_graphs_match_the_objective(TRIANGULAR_CHAIN_ODE);
+}
+
+/// The same on a generator that is genuinely cyclic (`central ⇄ peripheral`, fed by an
+/// acyclic `depot`), where "some compartment on a cycle" reads `true` with the zeros
+/// dropped or kept: only the reachability tells the two recordings apart (#2953 review
+/// row 2).
+#[test]
+fn taped_gradient_builds_a_cyclic_generators_graph_like_the_objective() {
+    taped_graphs_match_the_objective(TWOCPT_DEPOT_LINEAR_ODE);
+}
+
+/// The body of the two tests above: `src` is a linear model dosed into state 1. Records
+/// every `spectral` call's reachability (`SPECTRAL_GRAPHS`) for the `f64` predictions and
+/// for one adjoint gradient at the same θ and η, and asserts that every taped graph is one
+/// the objective built. Straddle: with the block keeping its zeros (`RHS_DEAD_KEPT`, the
+/// recording before #2760) some taped graph is not, so a fixture whose graph the kept
+/// zeros cannot change, or that never reaches the taped spectral call, cannot pass.
+fn taped_graphs_match_the_objective(src: &str) {
+    use crate::ode::linear::SPECTRAL_GRAPHS;
     use crate::sens::vtape::RHS_DEAD_KEPT;
-    let model = parse_model_string(TRIANGULAR_CHAIN_ODE).unwrap();
+    let model = parse_model_string(src).unwrap();
     assert_eq!(
         model
             .ode_spec
@@ -2196,7 +2213,8 @@ fn taped_gradient_reads_a_triangular_generator_as_acyclic_like_the_objective() {
         crate::ode::OdeMethod::Linear,
         "the fixture must take the exact path"
     );
-    // Two doses into `depot`, so the second lands with drug in every compartment.
+    // Two doses: two segments, so two `spectral` calls per recording (the graph comes from
+    // `A` alone, not from the state).
     let doses = vec![
         DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
         DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
@@ -2207,7 +2225,7 @@ fn taped_gradient_reads_a_triangular_generator_as_acyclic_like_the_objective() {
         &model,
         &s,
         &model.default_params.theta,
-        &[0.1, -0.05],
+        &vec![0.05; model.n_eta],
     );
     s.observations = preds
         .iter()
@@ -2215,32 +2233,52 @@ fn taped_gradient_reads_a_triangular_generator_as_acyclic_like_the_objective() {
         .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
         .collect();
     assert!(in_scope(&model, &s), "the subject must be in adjoint scope");
-    let counts = |keep: bool| {
-        let params = moved_params(&model);
-        let x = pack_params(&params);
-        let eta = ebe_for(&model, &s, &params, 1e-10, true);
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-10, true);
+    // The graphs one closure call built, split into (taped, `f64`).
+    let take = || {
+        let all = SPECTRAL_GRAPHS.with(|g| std::mem::take(&mut *g.borrow_mut()));
+        let (t, f): (Vec<_>, Vec<_>) = all.into_iter().partition(|(taped, _)| *taped);
+        let strip = |v: Vec<(bool, [u8; 6])>| v.into_iter().map(|(_, d)| d).collect::<Vec<_>>();
+        (strip(t), strip(f))
+    };
+    SPECTRAL_GRAPHS.with(|g| g.borrow_mut().clear());
+    crate::pk::compute_predictions_with_tv(&model, &s, &params.theta, eta.as_slice());
+    let (_, objective) = take();
+    let taped = |keep: bool| {
         RHS_DEAD_KEPT.with(|c| c.set(keep));
-        SPECTRAL_TAPED_CYCLIC.with(|c| c.set((0, 0)));
         let g = subject_adjoint_packed_gradient(&model, &s, &params, &x, eta.as_slice(), true);
         RHS_DEAD_KEPT.with(|c| c.set(false));
         let g = g.expect("in scope");
         assert!(g.iter().all(|v| v.is_finite()), "{g:?}");
-        SPECTRAL_TAPED_CYCLIC.with(|c| c.get())
+        take().0
     };
-    let (all, cyclic) = counts(false);
-    let (all_kept, cyclic_kept) = counts(true);
+    let dropped = taped(false);
+    let kept = taped(true);
+    let foreign = |v: &[[u8; 6]]| v.iter().filter(|d| !objective.contains(d)).count();
     eprintln!(
-        "taped spectral calls: {cyclic} of {all} cyclic; kept zeros {cyclic_kept} of {all_kept}"
-    );
-    assert!(all > 0, "the taped type never reached the spectral path");
-    assert_eq!(
-        cyclic, 0,
-        "the taped recording read A as cyclic in {cyclic} of {all} calls"
+        "objective graphs {objective:?}; taped {dropped:?} ({} foreign); kept {kept:?} ({} foreign)",
+        foreign(&dropped),
+        foreign(&kept)
     );
     assert!(
-        all_kept > 0 && cyclic_kept > 0,
-        "the straddle: keeping the zeros on the tape must read A as cyclic \
-         ({cyclic_kept} of {all_kept})"
+        !objective.is_empty(),
+        "the f64 objective never reached the spectral path"
+    );
+    assert!(
+        !dropped.is_empty(),
+        "the taped type never reached the spectral path"
+    );
+    assert_eq!(
+        foreign(&dropped),
+        0,
+        "the taped recording built a graph the objective did not: {dropped:?} vs {objective:?}"
+    );
+    assert!(
+        foreign(&kept) > 0,
+        "the straddle: keeping the zeros on the tape must change the graph: {kept:?} vs \
+         {objective:?}"
     );
 }
 
