@@ -7320,6 +7320,7 @@ pub fn parse_full_model_with(
             &ruv_theta_names,
             &ruv_eta_names,
             &covariate_decls,
+            &ruv_indiv_definitions(&indiv_stmts),
         )?;
         model.ruv_magnitude = rm;
         // A covariate that appears *only* in a magnitude / `weight =` expression
@@ -22938,6 +22939,179 @@ const RUV_FORBIDDEN_NAMES: &[&str] = &["IPRED", "PRED", "DV", "TAFD", "IRES", "I
 /// (`compile_ruv_mag_deriv_program`): sigma `0`, `MACHEPS` `1`, `TAD` `2`.
 const RUV_RESERVED_VARS: [&str; 4] = ["MACHEPS", "macheps", "TAD", "tad"];
 
+/// What a name assigned in `[individual_parameters]` means inside a
+/// residual-magnitude / exponent expression (#2915).
+///
+/// Every other block reads such a name as the value it was assigned, so the
+/// error model does too — but the magnitude is evaluated per observation from
+/// θ, covariates, `TIME` and `TAD` alone (`RuvMagFn` has no η and no
+/// individual-parameter vector), so a name can only be honoured by
+/// substituting its definition. That is exact when the definition is a single
+/// η-free top-level assignment, and impossible otherwise; the second case keeps
+/// the reason so the error can name it instead of calling the name an
+/// undeclared covariate.
+#[derive(Debug, Clone)]
+enum RuvIndivDef {
+    /// The definition, with earlier `[individual_parameters]` names already
+    /// substituted, so it reads only θ, covariates and built-ins.
+    Inline(Expression),
+    /// Why the name has no η-free definition to substitute.
+    Refused(String),
+}
+
+/// Replace every leaf `Variable`/`Covariate` named in `defs` (only the
+/// `Covariate` spelling when `variables` is false) with a clone of its
+/// `Inline` body. A substituted body is **not** walked again: a definition
+/// that reads a covariate of its own name (`WT = if (WT < 0) 70 else WT`)
+/// must not re-fire on its output. Returns the names substituted, in order.
+fn substitute_ruv_indiv_defs(
+    expr: &mut Expression,
+    defs: &HashMap<String, RuvIndivDef>,
+    variables: bool,
+    hit: &mut Vec<String>,
+) {
+    fn cond(c: &mut Condition, d: &HashMap<String, RuvIndivDef>, v: bool, h: &mut Vec<String>) {
+        match c {
+            Condition::Compare(l, _, r) => {
+                substitute_ruv_indiv_defs(l, d, v, h);
+                substitute_ruv_indiv_defs(r, d, v, h);
+            }
+            Condition::And(l, r) | Condition::Or(l, r) => {
+                cond(l, d, v, h);
+                cond(r, d, v, h);
+            }
+            Condition::Not(x) => cond(x, d, v, h),
+            Condition::Present(e) => substitute_ruv_indiv_defs(e, d, v, h),
+        }
+    }
+    match expr {
+        Expression::Covariate(_) | Expression::Variable(_) => {
+            let name = match &*expr {
+                Expression::Covariate(n) => n,
+                Expression::Variable(n) if variables => n,
+                _ => return,
+            };
+            if let Some(RuvIndivDef::Inline(body)) = defs.get(name) {
+                hit.push(name.clone());
+                *expr = body.clone();
+            }
+        }
+        Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+            substitute_ruv_indiv_defs(l, defs, variables, hit);
+            substitute_ruv_indiv_defs(r, defs, variables, hit);
+        }
+        Expression::UnaryFn(_, a) => substitute_ruv_indiv_defs(a, defs, variables, hit),
+        Expression::ThetaGather { idx, .. } => substitute_ruv_indiv_defs(idx, defs, variables, hit),
+        Expression::Conditional(c, t, e) => {
+            cond(c, defs, variables, hit);
+            substitute_ruv_indiv_defs(t, defs, variables, hit);
+            substitute_ruv_indiv_defs(e, defs, variables, hit);
+        }
+        _ => {}
+    }
+}
+
+/// The names a residual-magnitude expression may read from
+/// `[individual_parameters]` (#2915), keyed by name.
+///
+/// A name is `Inline` when it is assigned exactly once in the block, at top
+/// level, from a right-hand side that — after substituting the earlier
+/// `Inline` names — reads no η, no mixture class and no neural-network output,
+/// and no `Refused` name. Everything else assigned in the block is `Refused`
+/// with the reason, so the error says what stops it rather than sending the
+/// user to `[covariates]`.
+fn ruv_indiv_definitions(stmts: &[Statement]) -> HashMap<String, RuvIndivDef> {
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    count_all_assignments(stmts, &mut counts);
+    let mut defs: HashMap<String, RuvIndivDef> = HashMap::new();
+    for s in stmts {
+        let Statement::Assign(name, raw) = s else {
+            continue;
+        };
+        if counts.get(name.as_str()).copied().unwrap_or(0) != 1 {
+            continue;
+        }
+        let mut body = raw.clone();
+        let mut hit = Vec::new();
+        substitute_ruv_indiv_defs(&mut body, &defs, true, &mut hit);
+        let mut reason: Option<String> = None;
+        visit_expr_nodes(&body, &mut |e: &Expression| {
+            if reason.is_some() {
+                return;
+            }
+            reason = match e {
+                Expression::Eta(_) => Some("depends on a random effect (eta)".to_string()),
+                Expression::MixNum => Some("depends on the mixture class (MIXNUM)".to_string()),
+                Expression::NnOutput { .. } => {
+                    Some("depends on a neural-network output".to_string())
+                }
+                Expression::Covariate(n) | Expression::Variable(n) => match defs.get(n) {
+                    Some(RuvIndivDef::Refused(why)) => Some(format!("reads `{n}`, which {why}")),
+                    _ => None,
+                },
+                _ => None,
+            };
+        });
+        let def = match reason {
+            Some(why) => RuvIndivDef::Refused(why),
+            None => RuvIndivDef::Inline(body),
+        };
+        defs.insert(name.clone(), def);
+    }
+    // Names with no single top-level definition: reassigned, or assigned only
+    // inside an `if/else`, so the value depends on which statements ran.
+    for name in counts.keys() {
+        if !defs.contains_key(*name) {
+            defs.insert(
+                name.to_string(),
+                RuvIndivDef::Refused(
+                    "is assigned more than once or inside an `if/else` branch, so it has no \
+                     single definition to substitute"
+                        .to_string(),
+                ),
+            );
+        }
+    }
+    defs
+}
+
+/// Resolve the `[individual_parameters]` names a parsed residual-magnitude /
+/// exponent expression reads (#2915): substitute each `Inline` definition and
+/// refuse a `Refused` one by name. Only `Covariate` leaves are candidates — in
+/// the RUV scope a `Variable` is the scaled sigma or a reserved built-in.
+/// Returns the names substituted, so a later validation error can say the
+/// offending reference came in through one.
+fn resolve_ruv_indiv_names(
+    expr: &mut Expression,
+    defs: &HashMap<String, RuvIndivDef>,
+    what: &str,
+) -> Result<Vec<String>, String> {
+    let mut refused: Option<String> = None;
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if refused.is_some() {
+            return;
+        }
+        if let Expression::Covariate(n) = e {
+            if let Some(RuvIndivDef::Refused(why)) = defs.get(n) {
+                refused = Some(format!(
+                    "[error_model] {what} references `{n}`, which [individual_parameters] \
+                     assigns but which {why}. A residual magnitude is evaluated per observation \
+                     from thetas, covariates, TIME and TAD only, so it can read a value \
+                     computed in [individual_parameters] only when that value is assigned once, \
+                     at top level, without a random effect — write the expression here instead"
+                ));
+            }
+        }
+    });
+    if let Some(e) = refused {
+        return Err(e);
+    }
+    let mut hit = Vec::new();
+    substitute_ruv_indiv_defs(expr, defs, false, &mut hit);
+    hit.dedup();
+    Ok(hit)
+}
+
 /// Validate a parsed residual-magnitude expression (#484). The magnitude may
 /// depend only on θ, the scaled sigma itself, `TIME`, `TAD`, and declared
 /// covariates — never on η/EBE or the prediction. Unlike the rest of the
@@ -23049,8 +23223,9 @@ fn validate_ruv_expr(
                     if !declared {
                         err = Some(format!(
                             "{what} references undeclared covariate `{}` (declare it in \
-                             [covariates]; an undeclared name silently evaluates to 0 and would \
-                             make the magnitude a constant)",
+                             [covariates], or assign it in [individual_parameters]; an \
+                             undeclared name silently evaluates to 0 and would make the \
+                             magnitude a constant)",
                             name
                         ));
                     }
@@ -23185,6 +23360,7 @@ fn build_ruv_magnitude(
     theta_names: &[String],
     eta_names: &[String],
     covariate_decls: &Option<Vec<CovariateDecl>>,
+    indiv_defs: &HashMap<String, RuvIndivDef>,
 ) -> Result<
     (
         Option<RuvMagnitude>,
@@ -23235,9 +23411,28 @@ fn build_ruv_magnitude(
             // A residual magnitude reads θ by name (#484), so it reads a block too.
             level_blocks: LevelBlockScope::Readable,
         };
-        let expr = parse_scalar_expression(src, ctx)
+        let mut expr = parse_scalar_expression(src, ctx)
             .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
-        validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref())?;
+        // A name assigned in [individual_parameters] reads its value, as in every
+        // other block (#2915). Substituted before validation, so the definition
+        // is held to the same θ / covariate / TIME / TAD rule as inline text.
+        let what_long = if sigma_name.is_some() {
+            "residual-magnitude expression"
+        } else {
+            "power exponent"
+        };
+        let inlined = resolve_ruv_indiv_names(&mut expr, indiv_defs, what_long)?;
+        validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref()).map_err(|e| {
+            if inlined.is_empty() {
+                e
+            } else {
+                let names: Vec<String> = inlined.iter().map(|n| format!("`{n}`")).collect();
+                format!(
+                    "{e} (after substituting the [individual_parameters] definition of {})",
+                    names.join(", ")
+                )
+            }
+        })?;
         // `note_theta_eta` counts a gather as every θ of its block (#1638): a
         // magnitude reading `ERRSCALE[STUDY]` is θ-dependent, so GN must take its
         // magnitude-aware fallback, and the levels are not "unreferenced". η is

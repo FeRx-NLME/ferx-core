@@ -9709,6 +9709,171 @@ fn test_ruv_magnitude_rejects_covariate_without_covariates_block() {
     assert!(err.contains("undeclared covariate"), "got: {err}");
 }
 
+// ── #2915: [error_model] magnitudes read [individual_parameters] names ──────
+
+/// A one-compartment model whose magnitude is `mag` and whose
+/// [individual_parameters] block carries the extra lines `indiv` (#2915).
+/// Declares `WT` so an inlined body may read it.
+fn ruv_indiv_model(indiv: &str, mag: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_K(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+{indiv}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional({mag})
+[covariates]
+  WT continuous
+"#
+    )
+}
+
+/// The value the magnitude multiplies its sigma by at each `WT` row.
+fn ruv_indiv_mults(model_str: &str, wts: &[f64]) -> Vec<f64> {
+    let model = parse_full_model(model_str).unwrap().model;
+    let rows: Vec<(usize, f64)> = wts.iter().map(|w| (1, *w)).collect();
+    let s = magnitude_rows_subject(&rows, "WT");
+    let theta = model.default_params.theta.clone();
+    model
+        .ruv_obs_mult(&s, &theta)
+        .unwrap()
+        .into_iter()
+        .map(|r| r[0])
+        .collect()
+}
+
+/// The issue's case: a name assigned in [individual_parameters] is read as its
+/// value, not refused as an undeclared covariate. The literal is not 1, so a
+/// regression that read the name as 0 (undeclared) or dropped the factor (1)
+/// both fail.
+#[test]
+fn ruv_magnitude_reads_a_constant_assigned_in_individual_parameters() {
+    let m = ruv_indiv_mults(&ruv_indiv_model("  ISPK = 3", "PROP_ERR * ISPK"), &[70.0]);
+    assert_eq!(m, vec![3.0]);
+}
+
+/// A θ- and covariate-dependent definition, through a chain of two names: the
+/// runtime value follows the per-observation covariate, and the θ-derivative
+/// program (the adjoint's) sees the inlined θ, so the magnitude counts as
+/// θ-dependent and `∂mult/∂RUV_K = WT/70`.
+#[test]
+fn ruv_magnitude_inlines_a_theta_covariate_chain_from_individual_parameters() {
+    let src = ruv_indiv_model("  WTN = WT / 70\n  ISPK = RUV_K * WTN", "PROP_ERR * ISPK");
+    assert_eq!(ruv_indiv_mults(&src, &[70.0, 35.0]), vec![1.5, 0.75]);
+    let model = parse_full_model(&src).unwrap().model;
+    assert!(model.has_theta_dependent_ruv_magnitude());
+    assert!(model.referenced_covariates.iter().any(|c| c == "WT"));
+    let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+    let deriv = rm.per_sigma_deriv[0].as_ref().expect("deriv program");
+    let cov = HashMap::from([("WT".to_string(), 35.0)]);
+    let grad = deriv_theta_grad(deriv, &[0.2, 10.0, 1.5], &cov, 1.0, 1.0);
+    approx::assert_relative_eq!(grad[2], 0.5, max_relative = 1e-12);
+    assert_eq!(grad[0], 0.0);
+}
+
+/// A substituted body is not walked again. [individual_parameters] refuses a
+/// self-reference (`WT = f(WT)`) as a forward reference, so the parser never
+/// builds this map; the guard is pinned on the helper, since a re-walk would
+/// recurse without bound on any body containing its own name.
+#[test]
+fn ruv_indiv_substitution_does_not_rewalk_its_output() {
+    let body = Expression::BinOp(
+        Box::new(Expression::Covariate("WT".to_string())),
+        BinOp::Mul,
+        Box::new(Expression::Literal(2.0)),
+    );
+    let defs = HashMap::from([("WT".to_string(), RuvIndivDef::Inline(body))]);
+    let mut expr = Expression::Covariate("WT".to_string());
+    let mut hit = Vec::new();
+    substitute_ruv_indiv_defs(&mut expr, &defs, false, &mut hit);
+    assert_eq!(hit, vec!["WT".to_string()]);
+    let v = eval_expression(
+        &expr,
+        &[],
+        &[],
+        &HashMap::from([("WT".to_string(), 35.0)]),
+        &HashMap::new(),
+        &[],
+    );
+    assert_eq!(v, 70.0);
+}
+
+/// A name whose value depends on η is refused by name, with the reason — not
+/// sent to [covariates], which is the wrong fix for a derived quantity. Also
+/// pins the transitive case: the η reaches `A` only through `CL`.
+#[test]
+fn ruv_magnitude_refuses_an_eta_dependent_individual_parameter() {
+    for (indiv, mag, why) in [
+        ("", "PROP_ERR * CL", "`CL`, which [individual_parameters] assigns but which depends on a random effect"),
+        (
+            "  A = CL * 2",
+            "PROP_ERR * A",
+            "`A`, which [individual_parameters] assigns but which reads `CL`, which depends on a random effect",
+        ),
+    ] {
+        let err = expect_parse_err(&ruv_indiv_model(indiv, mag));
+        assert!(err.contains(why), "{mag}: {err}");
+        assert!(!err.contains("undeclared covariate"), "{mag}: {err}");
+        assert!(!err.contains("declare it in"), "{mag}: {err}");
+    }
+}
+
+/// A name assigned inside an `if/else`, or twice, has no single definition:
+/// refused with that reason. `if` with no `else` and a later override are the
+/// two shapes — both would read a different value than the statement order
+/// produces if the first top-level line were substituted.
+#[test]
+fn ruv_magnitude_refuses_a_conditional_or_reassigned_individual_parameter() {
+    for indiv in [
+        "  if (WT > 70) {\n    ISPK = 2\n  } else {\n    ISPK = 1\n  }",
+        "  ISPK = 1\n  if (WT > 70) {\n    ISPK = 2\n  }",
+    ] {
+        let err = expect_parse_err(&ruv_indiv_model(indiv, "PROP_ERR * ISPK"));
+        assert!(
+            err.contains("`ISPK`, which [individual_parameters] assigns")
+                && err.contains("assigned more than once or inside an `if/else` branch"),
+            "{indiv}: {err}"
+        );
+        assert!(!err.contains("undeclared covariate"), "{indiv}: {err}");
+    }
+}
+
+/// An inlined body is held to the magnitude's own rules: a covariate it reads
+/// must be declared, and the message says the reference came in through the
+/// substituted name (else the user hunts for `AGE` in an error model that
+/// never wrote it).
+#[test]
+fn ruv_magnitude_inlined_body_keeps_the_declared_covariate_rule() {
+    let err = expect_parse_err(&ruv_indiv_model("  ISPK = AGE / 40", "PROP_ERR * ISPK"));
+    assert!(err.contains("undeclared covariate `AGE`"), "{err}");
+    assert!(
+        err.contains("after substituting the [individual_parameters] definition of `ISPK`"),
+        "{err}"
+    );
+}
+
+/// A genuinely undefined name keeps the original error, and the advice now
+/// names both places a name can be defined.
+#[test]
+fn ruv_magnitude_undefined_name_still_rejected() {
+    let err = expect_parse_err(&ruv_indiv_model("", "PROP_ERR * NOPE"));
+    assert!(err.contains("undeclared covariate `NOPE`"), "{err}");
+    assert!(
+        err.contains("declare it in [covariates], or assign it in [individual_parameters]"),
+        "{err}"
+    );
+    assert!(!err.contains("after substituting"), "{err}");
+}
+
 #[test]
 fn test_parse_full_model_block_sigma_single_endpoint_order_mismatch_errs() {
     // Single-endpoint error models use the leading sigma slots positionally, so
@@ -12580,7 +12745,11 @@ fn endpoint_magnitude_keeps_the_plain_line_rules() {
         ("TPF * 2.0", "references no declared sigma"),
         ("PROP_ERR_PK * ADD_ERR_PD", "references multiple sigmas"),
         ("ADD_ERR_PD * ETA_CL", "random effect"),
-        ("ADD_ERR_PD * CL", "undeclared covariate `CL`"),
+        // `CL` is η-bearing in [individual_parameters] (#2915), not undeclared.
+        (
+            "ADD_ERR_PD * CL",
+            "`CL`, which [individual_parameters] assigns",
+        ),
         ("ADD_ERR_PD * IPRED", "may not reference `IPRED`"),
         ("ADD_ERR_PD * NOPE", "undeclared covariate `NOPE`"),
     ] {
@@ -32695,13 +32864,20 @@ fn conditional_name_read_by_each_downstream_block_is_refused() {
         let err = refused_with_valid_twin(&src, name);
         assert_conditional_read(&err, name, &format!("named in `{block}`"));
     }
-    // `[error_model]` reads no individual parameter even when it is assigned on
-    // every path (its twin is refused as an undeclared covariate), so only the
-    // message changes: the conditional name is named as such, not as a column.
+    // `[error_model]` reads an individual parameter only through a single
+    // top-level η-free definition (#2915), so a name assigned on every path of
+    // an `if/else` is refused there too — by name, as a branch-assigned value,
+    // not as a column. Only the message differs: the conditional name is named
+    // as such.
     let src =
         cond_ode_model(&s, rhs, "").replace("proportional(PROP_ERR)", "proportional(PROP_ERR * S)");
     let twin_err = parse_err(&else_twin(&src, "S"));
-    assert!(twin_err.contains("undeclared covariate `S`"), "{twin_err}");
+    assert!(
+        twin_err.contains("`S`, which [individual_parameters] assigns")
+            && twin_err.contains("inside an `if/else` branch")
+            && !twin_err.contains("undeclared covariate"),
+        "{twin_err}"
+    );
     assert_conditional_read(&parse_err(&src), "S", "named in `[error_model]`");
 }
 
