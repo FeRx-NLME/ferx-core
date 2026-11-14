@@ -14571,6 +14571,33 @@ fn with_verify_leg<R>(on: bool, f: impl FnOnce() -> R) -> (R, Vec<UnprofiledLeg>
     )
 }
 
+/// #2763: a model with no random effects still takes the leg. With no inner solve there is
+/// no tolerance for it to tighten, but it also restarts the optimizer from the best point,
+/// and that alone repairs early stops: skipping it at `n_eta + n_kappa = 0` left 7 of 25 such
+/// fits `converged` at a worse point on Linux x86_64 (`one_cpt_iv_pooled` under SLSQP +5.1e-5
+/// OFV with final max|grad| 1.64, `pktte_tdep` with all six θ free under L-BFGS +2.1e-5 and
+/// `TVGAM` 1% off; see #2765). This dies if the skip comes back.
+#[test]
+fn a_fit_without_random_effects_still_takes_the_verify_leg() {
+    let prep = crate::api::prepare_run(
+        "examples/one_cpt_iv_pooled.ferx",
+        Some("data/one_cpt_iv.csv"),
+    )
+    .expect("prepares");
+    let m = &prep.parsed.model;
+    assert_eq!((m.n_eta, m.n_kappa), (0, 0), "fixture: no random effects");
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        ..prep.parsed.fit_options.clone()
+    };
+    let (r, legs) = with_verify_leg(true, || {
+        optimize_population(m, &prep.population, &prep.init_params, &opts)
+    });
+    assert!(r.converged, "{:?}", r.warnings);
+    assert!(!legs.is_empty(), "no random effects still takes the leg");
+}
+
 /// #2462, the stuck side. From (TVE0, EMAX, ET50) = (60, 6, 3.2), A2's unprofiled fit
 /// stops converged 4.10e-4 above NONMEM, and a warm-seeded leg from that incumbent
 /// fails its first line search on a Nelder–Mead fallback dip. With the leg the fit ends in

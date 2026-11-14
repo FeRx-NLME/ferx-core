@@ -3824,8 +3824,21 @@ fn ng_jets3(
         }};
     }
     let jets = match n {
-        // No random effects: the value, with empty derivatives.
-        0 | 1 => go!(1),
+        // No random effects: only the value `q` is read (the gradient, Hessian and third
+        // derivative are empty), so it is evaluated over `f64` rather than through the ODE
+        // walk on an unseeded third-order jet (#2763). The jet's value part is the `f64`
+        // arithmetic, so on the Dormand–Prince ODE-hazard anchor `q` is the same bit for bit
+        // (`ng_jets3_without_random_effects_is_the_jet_value`). Not at every point: where a
+        // derivative is infinite (`sqrt(0)`) `Taylor::compose` puts `inf · 0 = NaN` in the
+        // value lane, so the jet declined (the FD gradient) where this arm serves a finite
+        // `q`, and the Rosenbrock steppers have `f64`-only branches.
+        0 => Some(NgJets {
+            q: f.eval::<f64>(&[])?,
+            g: Vec::new(),
+            h: Vec::new(),
+            t: Vec::new(),
+        }),
+        1 => go!(1),
         2 => go!(2),
         3 | 4 => go!(4),
         5..=8 => go!(8),
