@@ -8,7 +8,7 @@ use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::{ebe_response_correction, subject_nll_pop_grad_with_cache};
 use crate::estimation::inner_optimizer::{
-    run_inner_loop_warm_map, InnerHessianSeed, InnerSolvePolicy,
+    run_inner_loop_warm_map, InnerHessianSeed, InnerSolvePolicy, PrevEtas,
 };
 use crate::estimation::outer_optimizer::{
     ebe_screen_moved_warning, final_ebe_check, final_inner_solve, gate_converged_on_objective,
@@ -42,10 +42,11 @@ struct FoceiProblem<'a> {
     init_params: &'a ModelParameters,
     bounds: PackedBounds,
     cached_etas: std::sync::Mutex<Vec<DVector<f64>>>,
-    /// `cached_etas` are converged modes at the start point, not yet consumed: the next
-    /// inner pass takes them as warm starts whatever their values
-    /// (`InnerSolvePolicy::init_is_mode`, #2076) and clears the flag.
-    cached_etas_are_modes: std::sync::atomic::AtomicBool,
+    /// What `cached_etas` are: `ModesHere` while they are converged modes at the start
+    /// point, not yet consumed — the next inner pass takes them as warm starts whatever
+    /// their values (`InnerSolvePolicy::init_is_mode`, #2076) — and `Solved` once a pass
+    /// wrote them, so an exactly-zero EBE is not re-solved as a cold start.
+    cached_etas_kind: std::sync::Mutex<PrevEtas>,
     grad_cache: std::sync::Mutex<Option<GradCache>>,
     /// Covariate-NN (DCM) regularizer. No-op when both λ are 0. Added to the
     /// optimizer objective (`cost`/`ofv_fixed`), gradient and Hessian, not to
@@ -67,9 +68,11 @@ impl FoceiProblem<'_> {
         };
         let mu_k = compute_mu_k(self.model, &params.theta, self.options.mu_referencing);
         // `run_inner_loop_warm_seeded`'s solve, with the #2076 certificate carried through.
-        let init_is_mode = self
-            .cached_etas_are_modes
-            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        // Every pass's modes become the cache below.
+        let prev = std::mem::replace(
+            &mut *self.cached_etas_kind.lock().unwrap(),
+            PrevEtas::Solved,
+        );
         let (etas, h_mats, _, _kappas, _) = run_inner_loop_warm_map(
             self.model,
             self.population,
@@ -82,9 +85,9 @@ impl FoceiProblem<'_> {
             self.options.inner_restarts,
             InnerSolvePolicy {
                 seed: InnerHessianSeed::for_options(self.options),
-                init_is_mode,
                 ..InnerSolvePolicy::for_stage(self.options, self.model)
-            },
+            }
+            .with_prev_etas(prev),
             None,
             |_, _| (),
         );
@@ -830,8 +833,12 @@ pub(crate) fn optimize_trust_region_seeded(
             Some(etas) if etas.len() == n_subj => etas.to_vec(),
             _ => vec![DVector::zeros(n_eta); n_subj],
         }),
-        cached_etas_are_modes: std::sync::atomic::AtomicBool::new(
-            first_eval_etas.is_some_and(|e| e.len() == n_subj),
+        cached_etas_kind: std::sync::Mutex::new(
+            if first_eval_etas.is_some_and(|e| e.len() == n_subj) {
+                PrevEtas::ModesHere
+            } else {
+                PrevEtas::Placeholder
+            },
         ),
         grad_cache: std::sync::Mutex::new(None),
         priors: crate::estimation::outer_optimizer::build_prior_set(model, init_params),
@@ -1293,7 +1300,7 @@ mod tests {
             init_params: &model.default_params,
             bounds,
             cached_etas: std::sync::Mutex::new(vec![DVector::zeros(model.n_eta); n_subj]),
-            cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+            cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
             priors: crate::estimation::outer_optimizer::build_prior_set(
@@ -1353,7 +1360,7 @@ mod tests {
             init_params: &model.default_params,
             bounds,
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(n_eta); n_subj]),
-            cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+            cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
             priors: crate::estimation::outer_optimizer::build_prior_set(
@@ -1452,7 +1459,7 @@ mod tests {
             init_params: &model.default_params,
             bounds,
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(model.n_eta); n_subj]),
-            cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+            cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
             priors: crate::estimation::outer_optimizer::build_prior_set(
@@ -1766,7 +1773,7 @@ mod tests {
                     DVector::zeros(model.n_eta);
                     population.subjects.len()
                 ]),
-                cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+                cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
                 grad_cache: std::sync::Mutex::new(None),
                 priors: crate::estimation::outer_optimizer::build_prior_set(&model, init),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
@@ -1861,7 +1868,7 @@ mod tests {
                     DVector::zeros(model.n_eta);
                     population.subjects.len()
                 ]),
-                cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+                cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
                 grad_cache: std::sync::Mutex::new(None),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(model, population, options),
                 priors: crate::estimation::outer_optimizer::build_prior_set(model, init),

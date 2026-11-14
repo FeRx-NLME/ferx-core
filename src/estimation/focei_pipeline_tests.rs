@@ -82,6 +82,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                         opts.inner_restarts,
                         seed,
                         &opts,
+                        PrevEtas::Placeholder,
                     );
                     for warm in [None, Some(reference.0.as_slice())] {
                         let separate = run_inner_loop_warm_seeded(
@@ -96,6 +97,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                             opts.inner_restarts,
                             seed,
                             &opts,
+                            PrevEtas::Placeholder,
                         );
                         let expected_nll = if iov {
                             crate::stats::likelihood::foce_population_nll_iov(
@@ -129,6 +131,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                             params,
                             &opts,
                             warm,
+                            PrevEtas::Placeholder,
                             Some(&mu),
                             None,
                             None,
@@ -181,6 +184,7 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             opts.inner_restarts,
             InnerHessianSeed::for_options(&opts),
             &opts,
+            PrevEtas::Placeholder,
         );
         let expected = pop_nll_opts(
             &model,
@@ -191,7 +195,17 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             &separate.3,
             &opts,
         );
-        let fused = run_inner_loop_and_nll(&model, &pop, params, &opts, None, None, None, None);
+        let fused = run_inner_loop_and_nll(
+            &model,
+            &pop,
+            params,
+            &opts,
+            None,
+            PrevEtas::Placeholder,
+            None,
+            None,
+            None,
+        );
         assert_eq!(expected.to_bits(), fused.4.to_bits());
     }
 }
@@ -634,6 +648,7 @@ fn the_stage_seeded_inner_pass_ignores_a_cancel() {
             0,
             InnerHessianSeed::for_options(&stage),
             &stage,
+            PrevEtas::Placeholder,
         )
         .2
     });
@@ -681,7 +696,7 @@ fn a_cancelled_inner_pass_scores_no_objective() {
                 None,
                 gradient_inputs,
                 None,
-                false,
+                PrevEtas::Placeholder,
                 cancel,
             )
         };

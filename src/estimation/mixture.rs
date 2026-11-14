@@ -23,7 +23,7 @@
 
 use nalgebra::{DMatrix, DVector};
 
-use crate::estimation::inner_optimizer::{find_ebe_for_stage, InnerLoopStats};
+use crate::estimation::inner_optimizer::{find_ebe_for_stage_with_prev, InnerLoopStats, PrevEtas};
 use crate::estimation::parameterization::{
     fd_step_floors, fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments,
     theta_packs_log, unpack_params, PackedBounds,
@@ -247,7 +247,9 @@ fn any_contributing(flags: &[bool], probs: &[f64]) -> bool {
 /// Evaluate the mixture FOCE objective at `params` (#977 Phase 3).
 ///
 /// `warm` optionally carries the previous iteration's per-class EBEs
-/// (`[class][subject]`) to warm-start each class's inner solve.
+/// (`[class][subject]`) to warm-start each class's inner solve. They are taken as modes a
+/// solve returned, so an exactly-zero one is warm like any other and does not rerun the
+/// cold inner multi-start; pass `None` for a cold start.
 pub fn mixture_ofv(
     model: &CompiledModel,
     population: &Population,
@@ -316,7 +318,7 @@ pub(crate) fn mixture_ofv_with_modes(
                 .and_then(|w| w.get(cls))
                 .and_then(|wc| wc.get(i))
                 .map(|e| e.as_slice());
-            let ebe = find_ebe_for_stage(
+            let ebe = find_ebe_for_stage_with_prev(
                 model,
                 subject,
                 &cp,
@@ -326,6 +328,8 @@ pub(crate) fn mixture_ofv_with_modes(
                 None,
                 options.inner_restarts,
                 options,
+                // An earlier pass's class modes, an exactly-zero one included.
+                PrevEtas::Solved,
             );
             fd_h_redone[cls][i] = ebe.fd_h_redone;
             // Inter-occasion variability (#985): `find_ebe` already routes to the
@@ -3154,6 +3158,67 @@ mod tests {
                 assert!(v.is_finite() && v > 0.0, "{method:?}: θ[{j}] variance {v}");
             }
         }
+    }
+
+    /// A class solve warm from an earlier pass's class modes takes an exactly-zero one — the
+    /// prior mode of a subject with no observations — as warm, as the standard inner loop
+    /// does (`PrevEtas::Solved`). The outer loop hands every evaluation after the first the
+    /// previous one's class modes, so read by value alone the empty subject reran its cold
+    /// multi-start in every class at every evaluation. The straddle: from no warm start the
+    /// same subject is multi-started in each class, and the warm pass does solve it.
+    #[test]
+    fn a_mixture_class_solve_takes_an_exactly_zero_warm_mode_as_warm() {
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        // A dose-only subject: nothing informs its η, so its mode is exactly the prior's.
+        let pop = read_pop(&format!("{}99,0,0,100,1,1,75\n", bimodal_csv(2, 1.0, 3.0)));
+        let empty = "99".to_string();
+        assert!(pop
+            .subjects
+            .iter()
+            .any(|s| s.id == empty && s.observations.is_empty()));
+        let opts = crate::types::FitOptions {
+            inner_restarts: 1,
+            ..Default::default()
+        };
+        let params = &model.default_params;
+        let k = 2;
+        let count = |ids: &[String]| ids.iter().filter(|id| **id == empty).count();
+
+        let (cold, cold_rec) =
+            record_inner_solves(|| super::mixture_ofv(&model, &pop, params, &opts, None));
+        assert_eq!(
+            count(&cold_rec.multistarts),
+            k,
+            "fixture: a cold pass multi-starts the empty subject once per class"
+        );
+        let at = pop.subjects.iter().position(|s| s.id == empty).unwrap();
+        for (cls, etas) in cold.etas_by_class.iter().enumerate() {
+            assert!(
+                etas[at].iter().all(|&v| v == 0.0),
+                "fixture: class {cls}'s mode of the empty subject is {:?}, not exactly zero",
+                etas[at]
+            );
+        }
+
+        let (_, warm_rec) = record_inner_solves(|| {
+            super::mixture_ofv(&model, &pop, params, &opts, Some(&cold.etas_by_class))
+        });
+        let solved: Vec<String> = warm_rec
+            .solve_tols
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(
+            count(&solved),
+            k,
+            "the warm pass solves the empty subject per class"
+        );
+        assert_eq!(
+            count(&warm_rec.multistarts),
+            0,
+            "an exactly-zero warm class mode was multi-started as a cold start"
+        );
     }
 
     /// #2906: the oral two-class mixture of `tests/outer_gradient_fd_fallback_warning.rs`

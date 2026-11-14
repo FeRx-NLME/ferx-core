@@ -7167,6 +7167,8 @@ pub fn run_saem(
                     0, // SAEM final EBE is warm-started; no inner multi-start
                     crate::estimation::inner_optimizer::InnerHessianSeed::None,
                     options,
+                    // The chain's state, no solve's; inert anyway without restarts or a seed.
+                    crate::estimation::inner_optimizer::PrevEtas::Placeholder,
                 );
             let ofv = 2.0
                 * pop_nll(
