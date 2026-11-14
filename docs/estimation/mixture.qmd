@@ -78,9 +78,11 @@ with class-$k$ parameters and a **separate empirical Bayes solve per
 per-class $\Omega$/$\Sigma$ are estimated jointly. Estimation defaults to the
 derivative-free BOBYQA outer optimizer; an analytic posterior-weighted outer
 gradient is available — exact also under IOV and with a block (correlated) $\Omega$ — so a
-user-selected NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured, with an automatic
-finite-difference fallback for subjects outside analytic scope. `MIXNUM`-branched typical
-values are in scope.
+user-selected NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured. A subject outside
+analytic scope is salvaged on its own: the other subjects keep their exact gradient, and only
+that subject's per-class terms are finite-differenced, re-solving its class modes at each
+probe. Such a subject is named in the "could not be given the exact analytic outer gradient"
+warning, as for a single population (#2906). `MIXNUM`-branched typical values are in scope.
 
 ## Output
 
