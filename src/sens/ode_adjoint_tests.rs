@@ -2141,6 +2141,109 @@ fn dormant_accumulators_match_reconverged_fd(
     assert!(hess < hessian_tol, "Hessian vs reconverged FD {hess:.2e}");
 }
 
+/// A chain `depot → central → effect` with η-free rate constants: `A` is lower-triangular,
+/// so every compartment is acyclic, and its rates are distinct, so the spectral path takes it.
+const TRIANGULAR_CHAIN_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  theta TVKE0(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV * exp(ETA_V)
+  KA  = TVKA
+  KE0 = TVKE0
+[structural_model]
+  ode(states=[depot, central, effect])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - CL / V * central
+  d/dt(effect)  =  KE0 * (central / V - effect)
+[scaling]
+  y = central / V + effect
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #2761 review row 5: the outer gradient's taped recording reads a triangular `A` as
+/// acyclic, the same construction the `f64` objective takes. Before #2760 the recorded
+/// block kept `A`'s structural zeros as tape nodes, so on the tape `A` was one cyclic
+/// block (eigensolver eigenvalues, no masks) while the objective took the acyclic form.
+/// That moved `emax_pkpd`'s start gradient by 7.9e-13 relative and its optimizer path by
+/// 8 iterations, a gap far inside every FD-parity bound, so only the construction itself
+/// can be asserted. Straddle: the same gradient with the block keeping its zeros
+/// (`RHS_DEAD_KEPT`, the recording before #2760) must read cyclic, so a fixture that
+/// never reached the coupling graph on the taped type cannot pass.
+///
+/// Dies on: structural-zero outputs kept on the tape in `vtape::record_rhs` (the
+/// `RHS_DEAD_KEPT` gate forced on); the taped type never reaching `spectral` (total 0).
+#[test]
+fn taped_gradient_reads_a_triangular_generator_as_acyclic_like_the_objective() {
+    use crate::ode::linear::SPECTRAL_TAPED_CYCLIC;
+    use crate::sens::vtape::RHS_DEAD_KEPT;
+    let model = parse_model_string(TRIANGULAR_CHAIN_ODE).unwrap();
+    assert_eq!(
+        model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "the fixture must take the exact path"
+    );
+    // Two doses into `depot`, so the second lands with drug in every compartment.
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [1.0, 3.0, 8.0, 23.0, 25.0, 30.0, 47.0];
+    let mut s = subject_shell(doses, &times);
+    let preds = crate::pk::compute_predictions_with_tv(
+        &model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    assert!(in_scope(&model, &s), "the subject must be in adjoint scope");
+    let counts = |keep: bool| {
+        let params = moved_params(&model);
+        let x = pack_params(&params);
+        let eta = ebe_for(&model, &s, &params, 1e-10, true);
+        RHS_DEAD_KEPT.with(|c| c.set(keep));
+        SPECTRAL_TAPED_CYCLIC.with(|c| c.set((0, 0)));
+        let g = subject_adjoint_packed_gradient(&model, &s, &params, &x, eta.as_slice(), true);
+        RHS_DEAD_KEPT.with(|c| c.set(false));
+        let g = g.expect("in scope");
+        assert!(g.iter().all(|v| v.is_finite()), "{g:?}");
+        SPECTRAL_TAPED_CYCLIC.with(|c| c.get())
+    };
+    let (all, cyclic) = counts(false);
+    let (all_kept, cyclic_kept) = counts(true);
+    eprintln!(
+        "taped spectral calls: {cyclic} of {all} cyclic; kept zeros {cyclic_kept} of {all_kept}"
+    );
+    assert!(all > 0, "the taped type never reached the spectral path");
+    assert_eq!(
+        cyclic, 0,
+        "the taped recording read A as cyclic in {cyclic} of {all} calls"
+    );
+    assert!(
+        all_kept > 0 && cyclic_kept > 0,
+        "the straddle: keeping the zeros on the tape must read A as cyclic \
+         ({cyclic_kept} of {all_kept})"
+    );
+}
+
 /// The adjoint on the exact linear path (#852, Teun on #2093): its recordings run the
 /// matrix exponential over the tape types, whose derivative self-check reads
 /// `jet_max_abs`. Each subject's gradient must match reconverged FD, and the recording

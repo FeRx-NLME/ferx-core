@@ -548,6 +548,12 @@ thread_local! {
     pub(crate) static SPECTRAL_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Segments the spectral path propagated on this thread.
     pub(super) static SPECTRAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Calls to `spectral` on the outer gradient's taped type (`sens::vtape`) on this
+    /// thread: `.0` all of them, `.1` those whose coupling graph put some compartment on a
+    /// cycle. A test can then tell the taped recording saw `A`'s structural zeros as
+    /// structural, the way the `f64` objective does (#2761 row 5).
+    pub(crate) static SPECTRAL_TAPED_CYCLIC: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
 #[inline]
@@ -582,6 +588,14 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
             m | (1 << i)
         }
     });
+    #[cfg(test)]
+    if std::any::type_name::<T>().contains("vtape") {
+        let cyclic = acyclic_mask(present, n) != ((1u16 << n) - 1) as u8;
+        SPECTRAL_TAPED_CYCLIC.with(|c| {
+            let (all, cyc) = c.get();
+            c.set((all + 1, cyc + usize::from(cyclic)));
+        });
+    }
     if repeated_singleton_eigenvalue(vals, present, n) {
         return None;
     }
