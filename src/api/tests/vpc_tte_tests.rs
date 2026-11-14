@@ -300,7 +300,8 @@ fn event_subjects_keep_the_horizon_without_observed_censoring() {
 
 /// Without a horizon, `H` is the latest recorded time; with one below a subject's own
 /// censoring time, `H` wins: no replicate is followed past it, and the automatic grid
-/// stops at it.
+/// stops at it. The observed curve stops at it too (#2950): events 6–25 and the
+/// censoring at 30 are censorings at 5, so at 6 the observed value is empty.
 #[test]
 fn horizon_defaults_to_latest_record_and_wins_when_below_it() {
     let mut subjects: Vec<Subject> = (1..=25)
@@ -344,6 +345,120 @@ fn horizon_defaults_to_latest_record_and_wins_when_below_it() {
     o.grid = VpcGrid::Times(vec![4.0, 6.0]);
     let v = run(EXP_TTE, &p, &o).unwrap();
     assert_eq!(v.strata[0].n_used, [20, 0]);
+    assert_eq!(v.strata[0].observed.time.last(), Some(&5.0));
+    assert!(v.strata[0].obs_on_grid[0].is_some());
+    assert_eq!(v.strata[0].obs_on_grid[1], None);
+}
+
+// ── #2950: the observed data are read on [0, H] ──────────────────────────────
+
+const G_HORIZON: f64 = 10.0;
+
+/// Fixture G, on cmt 2 with `H = 10`: events at 2, 4, 6, 8 (three subjects each), a
+/// censoring at 5, `X10` an event exactly at `H`, `E12` and `E15` events past `H`, and
+/// `C18` a censoring past `H`.
+fn fixture_g() -> Vec<Subject> {
+    let mut g: Vec<Subject> = Vec::new();
+    for (k, t) in [2.0, 4.0, 6.0, 8.0].into_iter().enumerate() {
+        for j in 0..3 {
+            g.push(subj(&format!("S{k}{j}"), vec![rec(t, EventType::Exact, 2)]));
+        }
+    }
+    g.push(subj("C5", vec![rec(5.0, EventType::RightCensored, 2)]));
+    g.push(subj("X10", vec![rec(10.0, EventType::Exact, 2)]));
+    g.push(subj("E12", vec![rec(12.0, EventType::Exact, 2)]));
+    g.push(subj("E15", vec![rec(15.0, EventType::Exact, 2)]));
+    g.push(subj("C18", vec![rec(18.0, EventType::RightCensored, 2)]));
+    g
+}
+
+/// The data cut at `h` by hand, independently of the engine: a record after `h` becomes
+/// a right-censored record at `h`; one at or before `h` is unchanged.
+fn cut_by_hand(subjects: &[Subject], h: f64) -> Vec<Subject> {
+    subjects
+        .iter()
+        .map(|s| {
+            let records = s
+                .obs_records
+                .iter()
+                .map(|r| match r {
+                    ObsRecord::Event { time, cmt, .. } if *time > h => {
+                        rec(h, EventType::RightCensored, *cmt)
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            subj(&s.id, records)
+        })
+        .collect()
+}
+
+/// `sim.horizon = H` below the data's follow-up equals calling on the data cut at `H`
+/// first: the whole `TteVpc`, under both censorings and on two grids, one with a point
+/// past `H` where the uncut observed curve is still defined. The straddle is asserted
+/// first: G has records past `H`, so the two populations differ.
+///
+/// Mutations that redden it: no cut (the observed curve runs to 18); a cut that keeps
+/// the event flag (`E12`, `E15` become events at `H`); the cut under `Observed` only.
+/// Not `>=` for `>`: that mutation also turns `X10`'s event at `H` into a censoring in
+/// the hand-cut data, so both sides agree by construction;
+/// `observed_curve_reads_the_data_cut_at_the_horizon` kills it (measured).
+#[test]
+fn horizon_below_follow_up_equals_the_data_cut_at_the_horizon() {
+    let g = fixture_g();
+    let cut = cut_by_hand(&g, G_HORIZON);
+    let times = |s: &[Subject]| -> Vec<f64> {
+        s.iter()
+            .flat_map(|s| s.obs_records.iter())
+            .map(|r| match r {
+                ObsRecord::Event { time, .. } => *time,
+                _ => unreachable!("fixture G holds event records only"),
+            })
+            .collect()
+    };
+    assert!(
+        times(&g).iter().any(|&t| t > G_HORIZON),
+        "G has records past H"
+    );
+    assert!(
+        times(&cut).iter().all(|&t| t <= G_HORIZON),
+        "the cut has none"
+    );
+
+    for censoring in [VpcCensoring::Observed, VpcCensoring::Horizon] {
+        for grid in [VpcGrid::Auto, VpcGrid::Times(vec![3.0, 9.0, 10.0, 15.0])] {
+            let mut o = opts(20);
+            o.censoring = censoring;
+            o.grid = grid.clone();
+            o.sim.horizon = Some(G_HORIZON);
+            let got = run(EXP_TTE, &pop(g.clone()), &o).unwrap();
+            let want = run(EXP_TTE, &pop(cut.clone()), &o).unwrap();
+            assert_eq!(got, want, "{censoring:?}, {grid:?}");
+        }
+    }
+}
+
+/// The readable twin: the observed curve of G at `H = 10` ends at `H`, where `X10`'s
+/// event is an event and `E12`, `E15`, `C18` are censorings; at the grid point 15 the
+/// observed value is empty. Uncut, the curve ran to 18 and was defined at 15.
+#[test]
+fn observed_curve_reads_the_data_cut_at_the_horizon() {
+    let mut o = opts(20);
+    o.sim.horizon = Some(G_HORIZON);
+    o.grid = VpcGrid::Times(vec![9.0, 15.0]);
+    let v = run(EXP_TTE, &pop(fixture_g()), &o).unwrap();
+    let s = &v.strata[0];
+    assert_eq!(s.n_subjects, 17);
+    let c = &s.observed;
+    assert_eq!(c.time.last(), Some(&10.0), "the curve ends at H");
+    let k = c.time.len() - 1;
+    assert_eq!(
+        (c.n_risk[k], c.n_event[k], c.n_censor[k]),
+        (4, 1, 3),
+        "at H: X10's event, and E12, E15 and C18 censored there"
+    );
+    assert!(s.obs_on_grid[0].is_some(), "9 is before H");
+    assert_eq!(s.obs_on_grid[1], None, "15 is past H");
 }
 
 /// `AllSteps` puts every replicate step time on the grid, so it is at least as long as
