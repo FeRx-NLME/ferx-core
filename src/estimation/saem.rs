@@ -5240,6 +5240,34 @@ pub fn run_saem(
     } else {
         None
     };
+    // #2721: the accumulation phase as stochastic approximation on the marginal score
+    // (`saem_polyak`). Decided here, started at the first accumulation iteration.
+    let mut polyak_pending = options.saem_accumulation == crate::types::SaemAccumulation::Polyak;
+    if polyak_pending {
+        let gap = if saem_mix.is_some() {
+            Some("a mixture model")
+        } else if n_kappa > 0 {
+            Some("inter-occasion variability")
+        } else if model.residual_error_eta.is_some() {
+            Some("an eta on the residual error")
+        } else if model.frem_config.is_some() {
+            Some("FREM")
+        } else if !cov_mu_groups.is_empty() {
+            Some("a covariate mu-reference group")
+        } else if k2 == 0 {
+            Some("a fit without accumulation iterations")
+        } else {
+            None
+        };
+        if let Some(g) = gap {
+            warnings.push(format!(
+                "SAEM: `saem_accumulation = polyak` does not cover {g}; the fit keeps the classic accumulation."
+            ));
+            polyak_pending = false;
+        }
+    }
+    let mut polyak: Option<crate::estimation::saem_polyak::PolyakAccum> = None;
+    let mut polyak_failed_steps: u64 = 0;
     // Previous iterations' η draws, most recent first, at most
     // `mstep_draws - 1` of them. Held here rather than in `SaemState` because
     // nothing outside the M-step reads them — but every closed-form
@@ -5404,6 +5432,76 @@ pub fn run_saem(
         } else {
             (Vec::new(), Vec::new(), Vec::new())
         };
+
+        if polyak_pending && k == k1 + 1 {
+            use crate::estimation::saem_polyak::{AccumScope, MuCoord, Point, PolyakAccum};
+            polyak_pending = false;
+            let params_now = saem_state_to_params(&state, init_params, n_kappa);
+            let mu: Vec<MuCoord> = if use_closed_form_mstep {
+                mu_ref_pairs
+                    .iter()
+                    .map(|&(t, e)| MuCoord {
+                        theta: t,
+                        eta: e,
+                        additive: additive_shift[t],
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let sc = AccumScope::new(&params_now, mu, n_eta);
+            let lower: Vec<f64> = log_theta_lower
+                .iter()
+                .chain(&log_sigma_lower)
+                .copied()
+                .collect();
+            let upper: Vec<f64> = log_theta_upper
+                .iter()
+                .chain(&log_sigma_upper)
+                .copied()
+                .collect();
+            let started = match state.omega_mat.clone().try_inverse() {
+                None => Err("Ω is singular at the start of accumulation".to_string()),
+                Some(oi) => {
+                    let p = Point {
+                        theta: &state.theta,
+                        sigma: &state.sigma_vals,
+                        omega_inv: &oi,
+                        packs_log: &theta_packs_log_mask,
+                        lower: &lower,
+                        upper: &upper,
+                    };
+                    PolyakAccum::start(
+                        sc,
+                        model,
+                        population,
+                        &params_now,
+                        &p,
+                        &mut state.etas,
+                        &mut state.nll_cache,
+                        &state.step_scales,
+                        n_mh_steps,
+                        options.saem_control_variate,
+                        master_seed ^ 0x2721,
+                    )
+                }
+            };
+            match started {
+                Ok(acc) => {
+                    if verbose {
+                        eprintln!(
+                            "SAEM polyak accumulation: control-variate variance ratio {:.3}",
+                            acc.cv_ratio
+                        );
+                    }
+                    polyak = Some(acc);
+                }
+                Err(e) => warnings.push(format!(
+                    "SAEM: `saem_accumulation = polyak` fell back to the classic accumulation: {e}."
+                )),
+            }
+        }
+        let polyak_now = polyak.is_some() && k > k1;
 
         // ---- Step 1: MH simulation (parallelized) ----
         // Symmetric random-walk MH in eta_true space, identical schedule
@@ -6084,7 +6182,7 @@ pub fn run_saem(
         // is a running average of the warming chain rather than the latest
         // snapshot), so the first Ω update after burn-in reflects the warmed-up
         // chain, not the cold-start spread.
-        if k > omega_burnin {
+        if k > omega_burnin && !polyak_now {
             // ---- Step 3a: Omega_bsv (closed form) ----
             // Restore FIX-ed rows / columns from the template. An eta flagged FIX
             // keeps its initial variance AND its initial off-diagonal couplings
@@ -6185,7 +6283,7 @@ pub fn run_saem(
         } else {
             None
         };
-        if run_mstep {
+        if run_mstep && !polyak_now {
             // #1445 / #1464: the σ half of the joint θ/σ maximiser takes its
             // own Robbins-Monro step, per component. The exploration cap stays
             // on a component the frozen-η objective identifies only weakly, and
@@ -6659,6 +6757,119 @@ pub fn run_saem(
             }
         }
 
+        // #2721: the stochastic-approximation step on the marginal score, replacing Steps 3
+        // and 4 during accumulation (`saem_polyak`).
+        if polyak_now {
+            let acc = polyak.as_mut().expect("polyak_now implies an accumulator");
+            let params_now = saem_state_to_params(&state, init_params, n_kappa);
+            let lower: Vec<f64> = log_theta_lower
+                .iter()
+                .chain(&log_sigma_lower)
+                .copied()
+                .collect();
+            let upper: Vec<f64> = log_theta_upper
+                .iter()
+                .chain(&log_sigma_upper)
+                .copied()
+                .collect();
+            let dir = state.omega_mat.clone().try_inverse().and_then(|oi| {
+                let p = crate::estimation::saem_polyak::Point {
+                    theta: &state.theta,
+                    sigma: &state.sigma_vals,
+                    omega_inv: &oi,
+                    packs_log: &theta_packs_log_mask,
+                    lower: &lower,
+                    upper: &upper,
+                };
+                let (h, fisher) = acc.score(model, population, &params_now, &p, &state.etas)?;
+                acc.direction(
+                    &h,
+                    &fisher,
+                    &oi,
+                    n_subjects,
+                    crate::estimation::saem_polyak::polyak_gamma(k - k1),
+                )
+            });
+            match dir {
+                None => polyak_failed_steps += 1,
+                Some(d) => {
+                    let sc = &acc.sc;
+                    let (n_mu, n_data) = (sc.mu.len(), sc.data.len());
+                    for (r, m) in sc.mu.iter().enumerate() {
+                        let t = m.theta;
+                        let moved = if m.additive {
+                            let old = unpack_theta(t, log_theta[t]);
+                            let new = (old + d[r])
+                                .clamp(init_params.theta_lower[t], init_params.theta_upper[t]);
+                            log_theta[t] = pack_theta(t, new);
+                            unpack_theta(t, log_theta[t]) - old
+                        } else {
+                            let old = log_theta[t];
+                            log_theta[t] =
+                                (old + d[r]).clamp(log_theta_lower[t], log_theta_upper[t]);
+                            log_theta[t] - old
+                        };
+                        // Keep each individual parameter `μ + η` where it was.
+                        for eta in state.etas.iter_mut() {
+                            eta[m.eta] -= moved;
+                        }
+                        recentre_eta_draws(&mut extra_eta_draws, m.eta, moved);
+                    }
+                    for (r, &i) in sc.data.iter().enumerate() {
+                        if i < n_theta {
+                            log_theta[i] = (log_theta[i] + d[n_mu + r])
+                                .clamp(log_theta_lower[i], log_theta_upper[i]);
+                        } else {
+                            let j = i - n_theta;
+                            log_sigma[j] = (log_sigma[j] + d[n_mu + r])
+                                .clamp(log_sigma_lower[j], log_sigma_upper[j]);
+                        }
+                    }
+                    // Ω: halve its part of the step until Ω stays positive definite
+                    // with every free diagonal above the SAEM floor.
+                    let mut frac = 1.0;
+                    for _ in 0..30 {
+                        let mut om = state.omega_mat.clone();
+                        for (r, &(a, b)) in sc.om.iter().enumerate() {
+                            om[(a, b)] += frac * d[n_mu + n_data + r];
+                            om[(b, a)] = om[(a, b)];
+                        }
+                        let diag_ok = (0..n_eta).all(|j| om[(j, j)] >= SAEM_OMEGA_DIAG_FLOOR);
+                        if diag_ok && om.clone().cholesky().is_some() {
+                            state.omega_mat = om;
+                            break;
+                        }
+                        frac *= 0.5;
+                    }
+                    state.theta = (0..n_theta)
+                        .map(|i| unpack_theta(i, log_theta[i]))
+                        .collect();
+                    state.sigma_vals = log_sigma.iter().map(|&v| v.exp()).collect();
+                }
+            }
+            // Polyak–Ruppert: average the second half of accumulation.
+            if k - k1 > k2 / 2 {
+                let sc = &acc.sc;
+                let mut c = nalgebra::DVector::<f64>::zeros(sc.n());
+                for (r, m) in sc.mu.iter().enumerate() {
+                    c[r] = if m.additive {
+                        unpack_theta(m.theta, log_theta[m.theta])
+                    } else {
+                        log_theta[m.theta]
+                    };
+                }
+                for (r, &i) in sc.data.iter().enumerate() {
+                    c[sc.mu.len() + r] = if i < n_theta {
+                        log_theta[i]
+                    } else {
+                        log_sigma[i - n_theta]
+                    };
+                }
+                let om = state.omega_mat.clone();
+                acc.accumulate(&c, &om);
+            }
+        }
+
         // #1458: remember this iteration's draw for the K-draw M-step objective.
         // Pushed after the M-step, so the next iteration averages over draws
         // strictly older than its own, and after the mu-reference re-centring
@@ -6928,6 +7139,39 @@ pub fn run_saem(
 
     if verbose {
         eprintln!("SAEM iterations complete. Computing final EBEs and OFV...");
+    }
+
+    // #2721: the Polyak–Ruppert average is the estimate.
+    if let Some(acc) = polyak.as_ref() {
+        if let Some((c, om)) = acc.average() {
+            let sc = &acc.sc;
+            for (r, m) in sc.mu.iter().enumerate() {
+                log_theta[m.theta] = if m.additive {
+                    pack_theta(m.theta, c[r])
+                } else {
+                    c[r]
+                };
+            }
+            for (r, &i) in sc.data.iter().enumerate() {
+                let v = c[sc.mu.len() + r];
+                if i < n_theta {
+                    log_theta[i] = v;
+                } else {
+                    log_sigma[i - n_theta] = v;
+                }
+            }
+            state.omega_mat = om;
+            state.theta = (0..n_theta)
+                .map(|i| unpack_theta(i, log_theta[i]))
+                .collect();
+            state.sigma_vals = log_sigma.iter().map(|&v| v.exp()).collect();
+        }
+        if polyak_failed_steps > 0 {
+            warnings.push(format!(
+                "SAEM: {polyak_failed_steps} accumulation step(s) of `saem_accumulation = polyak` could not \
+                 form the score and were skipped."
+            ));
+        }
     }
 
     // ---- Post-SAEM: build final parameters ----
@@ -13189,3 +13433,7 @@ mod mstep_sa_tests;
 #[cfg(test)]
 #[path = "saem_sigma_release_tests.rs"]
 mod sigma_release_tests;
+
+#[cfg(test)]
+#[path = "saem_gain_diag_tests.rs"]
+mod gain_diag_tests;

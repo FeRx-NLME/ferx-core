@@ -12877,6 +12877,20 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
+        "accumulation" | "saem_accumulation" => {
+            opts.saem_accumulation = match value.to_lowercase().as_str() {
+                "classic" | "em" | "default" => crate::types::SaemAccumulation::Classic,
+                "polyak" | "averaged" => crate::types::SaemAccumulation::Polyak,
+                other => {
+                    return Err(format!(
+                        "fit option `{key}`: unknown value `{other}` — expected classic/polyak"
+                    ));
+                }
+            };
+        }
+        "control_variate" | "saem_control_variate" => {
+            opts.saem_control_variate = parse_bool(key)?;
+        }
         "mstep_draws" | "saem_mstep_draws" => {
             let v = parse_usize(key)?;
             if v == 0 {
