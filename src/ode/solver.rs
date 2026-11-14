@@ -386,11 +386,14 @@ impl OdeSolverOptions {
     }
 }
 
+/// The default `ode_reltol`.
+pub(crate) const DEFAULT_RELTOL: f64 = 1e-4;
+
 impl Default for OdeSolverOptions {
     fn default() -> Self {
         Self {
             abstol: 1e-6,
-            reltol: 1e-4,
+            reltol: DEFAULT_RELTOL,
             max_steps: 10000,
             initial_dt: 0.1,
             min_dt: 1e-12,
