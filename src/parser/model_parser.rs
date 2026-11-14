@@ -23138,11 +23138,27 @@ impl<'a> RuvIndivScope<'a> {
 /// assigns that name the error model would read a different value than every
 /// other block, so it is refused. Returns the names substituted, so a later
 /// validation error can say the offending reference came in through one.
+///
+/// A name that is both a θ and assigned in the block (`theta CL` with
+/// `CL = CL * exp(ETA_CL)`, the usual typical-value spelling) parses here as
+/// `Theta`, because θ names resolve first; every other block reads it as the
+/// assigned value, so it is turned back into a block name and judged like one
+/// (review 4) — substituted, or refused for the reason it cannot be. Only the
+/// magnitude's own leaves are rewritten: inside a definition a `Theta` is the
+/// θ the right-hand side read before the name was assigned.
 fn resolve_ruv_indiv_names(
     expr: &mut Expression,
     scope: &RuvIndivScope<'_>,
+    theta_names: &[String],
     what: &str,
 ) -> Result<Vec<String>, String> {
+    visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
+        if let Expression::Theta(i) = e {
+            if let Some(name) = theta_names.get(*i).filter(|n| scope.assigns(n)) {
+                *e = Expression::Covariate(name.clone());
+            }
+        }
+    });
     let mut err: Option<String> = None;
     let mut hit: Vec<String> = Vec::new();
     let mut total = 0_usize;
@@ -23510,7 +23526,7 @@ fn build_ruv_magnitude(
         } else {
             "power exponent"
         };
-        let inlined = resolve_ruv_indiv_names(&mut expr, &indiv_scope, what_long)?;
+        let inlined = resolve_ruv_indiv_names(&mut expr, &indiv_scope, theta_names, what_long)?;
         if !inlined.is_empty() {
             // The parse recorded gather sites against the names as written; the
             // substituted tree may read other columns, or a literal (review 2).

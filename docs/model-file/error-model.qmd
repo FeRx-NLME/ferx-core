@@ -412,6 +412,12 @@ that reason. A covariate the substituted definition reads must be declared in
 `[covariates]`, like one written in the expression itself. A name that is
 neither declared nor assigned is rejected too, since it would silently read `0`.
 
+This includes a θ that the block reassigns under its own name — `theta CL` with
+`CL = CL * exp(ETA_CL)`. In the error model `CL` means the assigned value, as in
+`[structural_model]`, not the raw θ: that one is rejected for its η, while an
+η-free `RUV_K = RUV_K * WT / 70` is substituted. To read the θ itself, give the
+individual parameter a different name (`theta TVCL`, `CL = TVCL * …`).
+
 Two more refusals keep the error model from reading a different value than the
 rest of the model: a name the block assigns that `[error_model]` would read as
 its own built-in (`TAD`, `MACHEPS`) or as the scaled sigma — rename the

@@ -10088,6 +10088,43 @@ fn ruv_magnitude_refuses_an_eta_dependent_individual_parameter() {
     }
 }
 
+/// A θ that [individual_parameters] reassigns under its own name (`theta CL`,
+/// `CL = CL * exp(ETA_CL)`) is read in the error model as the assigned value,
+/// like every other block — not as the raw θ, which θ-first name resolution
+/// would otherwise hand the magnitude silently (#2915 review 4). The η-bearing
+/// spelling is refused by name; the η-free one is substituted, and its value
+/// (θ × WT/70) differs from the raw θ at WT ≠ 70, so a regression back to the
+/// θ leaf fails on the 140 row.
+#[test]
+fn ruv_magnitude_reads_a_theta_reassigned_in_individual_parameters_as_its_value() {
+    let eta_model = r#"
+[parameters]
+  theta CL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * CL)
+"#;
+    let err = expect_parse_err(eta_model);
+    assert!(
+        err.contains(
+            "`CL`, which [individual_parameters] assigns but which depends on a random effect"
+        ),
+        "{err}"
+    );
+
+    // RUV_K defaults to 1.5; the assigned value is RUV_K * WT / 70.
+    let model = ruv_indiv_model("  RUV_K = RUV_K * WT / 70", "PROP_ERR * RUV_K");
+    let got = ruv_indiv_mults(&model, &[70.0, 140.0]);
+    assert_eq!(got, vec![1.5, 3.0]);
+}
+
 /// A name assigned inside an `if/else`, or twice, has no single definition:
 /// refused with that reason. `if` with no `else` and a later override are the
 /// two shapes — both would read a different value than the statement order
