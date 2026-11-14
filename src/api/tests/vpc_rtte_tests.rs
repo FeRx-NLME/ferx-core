@@ -554,12 +554,14 @@ fn replicate_events_reads_only_the_endpoints_event_rows() {
             id: "a".into(),
             events: vec![],
             end: 9.0,
+            ends_on_event: false,
             stratum: 0,
         },
         Stream {
             id: "b".into(),
             events: vec![],
             end: 9.0,
+            ends_on_event: false,
             stratum: 0,
         },
     ];
@@ -579,6 +581,65 @@ fn replicate_events_reads_only_the_endpoints_event_rows() {
     ];
     let reps = replicate_events(&results, 2, &streams, 2);
     assert_eq!(reps, [[vec![1.0, 4.0], vec![]], [vec![], vec![5.0]]]);
+}
+
+// ── Warnings about the data's follow-up (review r1 rows 3 and 7) ─────────────
+
+/// R1 has two subjects whose last record is an event (B at 8, E at 4): the result says
+/// so, with the count. A cohort closed by censoring records says nothing. A subject
+/// with an event and then a censoring record at the same time ends on the censoring.
+#[test]
+fn warns_when_subjects_end_on_an_event_record() {
+    let v = run(RTTE, &pop(r1()), &opts(20)).unwrap();
+    assert_eq!(
+        v.warnings,
+        [
+            "W_VPC_RTTE_ENDS_ON_EVENT: 2 of 6 subjects on cmt 2 have an event as their last \
+          record, so their follow-up ends at that event. Such a subject has an event exactly \
+          at its follow-up end, which a simulated subject almost never has. If follow-up went \
+          on after the last event, add a censoring record at its end."
+        ]
+    );
+    let closed = pop(cohort(1, 12, 20.0, &[3.0, 8.0]));
+    assert_eq!(run(RTTE, &closed, &opts(20)).unwrap().warnings, [""; 0]);
+    let tied = pop(vec![subj(
+        "1",
+        vec![
+            rec(4.0, EventType::Exact),
+            rec(4.0, EventType::RightCensored),
+        ],
+    )]);
+    assert_eq!(run(RTTE, &tied, &opts(20)).unwrap().warnings, [""; 0]);
+}
+
+/// A horizon below the follow-up end of 30 of 60 subjects, with gap-time curves asked
+/// for: the result says the gap-time comparison is approximate. Nothing is said when
+/// the horizon is not below any follow-up end, when it is unset, or when no gap-time
+/// curve is returned (`max_order = 1`), since the other curves are unaffected.
+#[test]
+fn warns_when_the_horizon_is_below_the_follow_up_and_gap_curves_are_returned() {
+    let p = short_and_long();
+    let warned = |horizon: Option<f64>, max_order: usize| {
+        let mut o = opts(20);
+        o.max_order = Some(max_order);
+        o.sim.horizon = horizon;
+        run(RTTE, &p, &o).unwrap().warnings
+    };
+    assert_eq!(
+        warned(Some(10.0), 2),
+        [
+            "W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP: `sim.horizon = 10` is below the follow-up end \
+          of 30 of 60 subjects on cmt 2. The observed curves are not cut at the horizon and the \
+          replicates are, so each gap-time comparison is approximate. The mean cumulative \
+          function and the absolute-time curves are unaffected up to the horizon. Leave \
+          `sim.horizon` unset, or cut the data at the horizon first."
+        ]
+    );
+    assert_eq!(warned(Some(10.0), 1), [""; 0]);
+    assert_eq!(warned(Some(20.0), 2), [""; 0]);
+    assert_eq!(warned(None, 2), [""; 0]);
+    // Below every follow-up end: all 60.
+    assert!(warned(Some(2.0), 2)[0].contains("of 60 of 60 subjects"));
 }
 
 // ── T9: which orders ─────────────────────────────────────────────────────────

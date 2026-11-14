@@ -169,7 +169,9 @@ pub struct RtteVpc {
     /// The highest event order returned, as given or as chosen from the data.
     pub max_order: usize,
     pub strata: Vec<RtteVpcStratum>,
-    /// The simulator's warnings (a degenerate recurrent hazard, …).
+    /// The warnings of this check about the data's follow-up
+    /// (`W_VPC_RTTE_ENDS_ON_EVENT`, `W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP`), then the
+    /// simulator's (a degenerate recurrent hazard, …).
     pub warnings: Vec<String>,
 }
 
@@ -180,6 +182,8 @@ struct Stream {
     events: Vec<f64>,
     /// Its follow-up end: the time of its last record, event or censoring.
     end: f64,
+    /// Whether that last record is an event.
+    ends_on_event: bool,
     stratum: usize,
 }
 
@@ -260,7 +264,7 @@ fn observed_streams(
     cmt: usize,
     stratify: &VpcStratify,
 ) -> Result<(Vec<Stream>, Vec<Option<f64>>, Vec<String>), EngineError> {
-    let mut picked: Vec<(String, Vec<f64>, f64)> = Vec::new();
+    let mut picked: Vec<(String, Vec<f64>, f64, bool)> = Vec::new();
     let mut per_subject: Vec<Option<f64>> = Vec::new();
     let mut seen: HashMap<&str, ()> = HashMap::new();
     for s in &population.subjects {
@@ -269,6 +273,7 @@ fn observed_streams(
         }
         let mut events = Vec::new();
         let mut end: Option<f64> = None;
+        let mut ends_on_event = false;
         for r in &s.obs_records {
             let ObsRecord::Event {
                 time,
@@ -294,12 +299,13 @@ fn observed_streams(
                 events.push(t);
             }
             end = Some(t);
+            ends_on_event = is_event;
         }
         let Some(end) = end else {
             continue;
         };
         per_subject.push(stratum_value(WHO, s, stratify)?);
-        picked.push((s.id.clone(), events, end));
+        picked.push((s.id.clone(), events, end, ends_on_event));
     }
     if picked.is_empty() {
         return Err(no_record(WHO, cmt));
@@ -308,10 +314,11 @@ fn observed_streams(
     let streams = picked
         .into_iter()
         .zip(index)
-        .map(|((id, events, end), stratum)| Stream {
+        .map(|((id, events, end, ends_on_event), stratum)| Stream {
             id,
             events,
             end,
+            ends_on_event,
             stratum,
         })
         .collect();
@@ -363,6 +370,49 @@ fn default_max_order(streams: &[Stream]) -> usize {
     k
 }
 
+/// What the data's follow-up does to the comparison, for [`RtteVpc::warnings`].
+/// `horizon` is `H`. Left unset by the caller it is the latest follow-up end, which is
+/// below nobody's, so only a horizon the caller set can raise the second warning.
+///
+/// - `W_VPC_RTTE_ENDS_ON_EVENT`: subjects whose last record is an event. Their
+///   follow-up ends at that event, so the observed subject has an event exactly at its
+///   follow-up end, where a simulated subject has one with probability 0.
+/// - `W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP`: a horizon below some subject's follow-up end
+///   when gap-time curves are returned. The observed streams are not cut at the horizon
+///   and the replicates are, which changes who is in a gap-time risk set and where a gap
+///   is censored. The mean cumulative function and the absolute-time curves are the
+///   same up to the horizon either way, so with `max_order = 1` nothing is said.
+fn follow_up_warnings(
+    streams: &[Stream],
+    cmt: usize,
+    horizon: f64,
+    max_order: usize,
+) -> Vec<String> {
+    let total = streams.len();
+    let mut warnings = Vec::new();
+    let on_event = streams.iter().filter(|s| s.ends_on_event).count();
+    if on_event > 0 {
+        warnings.push(format!(
+            "W_VPC_RTTE_ENDS_ON_EVENT: {on_event} of {total} subjects on cmt {cmt} have an \
+             event as their last record, so their follow-up ends at that event. Such a subject \
+             has an event exactly at its follow-up end, which a simulated subject almost never \
+             has. If follow-up went on after the last event, add a censoring record at its end."
+        ));
+    }
+    let beyond = streams.iter().filter(|s| s.end > horizon).count();
+    if max_order >= 2 && beyond > 0 {
+        warnings.push(format!(
+            "W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP: `sim.horizon = {horizon}` is below the \
+             follow-up end of {beyond} of {total} subjects on cmt {cmt}. The observed curves \
+             are not cut at the horizon and the replicates are, so each gap-time comparison is \
+             approximate. The mean cumulative function and the absolute-time curves are \
+             unaffected up to the horizon. Leave `sim.horizon` unset, or cut the data at the \
+             horizon first."
+        ));
+    }
+    warnings
+}
+
 /// A visual predictive check for one repeated-events (`type = rtte`) endpoint.
 ///
 /// Simulates `opts.n_sim` replicates of `population` under `params` with one simulator
@@ -410,9 +460,12 @@ pub fn vpc_rtte(
             .fold(f64::NEG_INFINITY, f64::max)
     });
 
+    let mut warnings = follow_up_warnings(&streams, cmt, horizon, max_order);
+
     let mut sim_opts = opts.sim.clone();
     sim_opts.horizon = Some(horizon);
     let out = simulate_with_options_impl(model, population, params, opts.n_sim, &sim_opts, false)?;
+    warnings.extend(out.warnings);
     let reps = replicate_events(&out.results, cmt, &streams, opts.n_sim);
 
     // `check_band_options` validated `probs`, the one thing a band refuses.
@@ -509,7 +562,7 @@ pub fn vpc_rtte(
         censoring: opts.censoring,
         max_order,
         strata,
-        warnings: out.warnings,
+        warnings,
     })
 }
 

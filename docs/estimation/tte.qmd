@@ -1080,12 +1080,15 @@ The observed curves are never cut at `H`. With `sim.horizon` below the data's ow
 the MCF and the absolute-time curves are unaffected up to `H`. A gap-time curve is not: the
 data's risk set counts events up to each subject's follow-up end and the replicates' only up
 to `H`, so that comparison is approximate. Leave `sim.horizon` unset, or cut the data at `H`
-first, when the gap-time curves matter.
+first, when the gap-time curves matter. The result's `warnings` carry
+`W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP` with the number of subjects followed past `H` whenever
+gap-time curves are returned.
 
 When a subject's last record is an event, its follow-up ends at that event: the data say
 nothing later about it. The observed subject then has an event exactly at its follow-up end,
 which a replicate almost never has. The usual layout, one censoring row closing each subject,
-does not have this.
+does not have this. The result's `warnings` carry `W_VPC_RTTE_ENDS_ON_EVENT` with the number
+of such subjects.
 
 #### Validation of the repeated-events curves {#km-vpc-rtte-validation}
 
@@ -1133,7 +1136,8 @@ within 1.1e-16 and the cumulative hazard exactly. The band is checked for self-c
 `tests/vpc_tte_self_consistency.rs`. 200 datasets are drawn outside the simulator from the
 model, with about 45 % censored, and each gets a 200-replicate VPC. The observed curve then
 lies inside the 5 %–95 % band in 92.5 %, 89.5 % and 91 % of datasets at H/4, H/2 and 3H/4,
-inside the 99 % binomial interval around 90 % (84.5 %–95.5 %). Dropping the per-subject
+inside the 99 % binomial interval (83 %–94.5 %) around the 89.1 % a band read from 200
+replicates covers. Dropping the per-subject
 censoring takes the coverage at 3H/4 to 82 %, out of it.
 
 ::: {.callout-note}
