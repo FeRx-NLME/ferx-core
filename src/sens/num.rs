@@ -559,6 +559,15 @@ pub(crate) mod vm {
         }
     }
 
+    /// The inputs a compiled RHS loads ([`RhsKernel::structural_zero_inputs`]): its states,
+    /// its `params` slots, and which of the four seeds.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) struct LoadedInputs<'a> {
+        pub(crate) states: &'a [u32],
+        pub(crate) params: &'a [u32],
+        pub(crate) seeds: [bool; 4],
+    }
+
     /// A compiled RHS a tape can record whole and differentiate later (`parser::rhs_jit`):
     /// its native forward and reverse pass over a [`Layout`]'s lanes, `fn(u, params, seeds,
     /// du)` and `fn(u, params, seeds, du, ū, p̄, s̄, dū)`.
@@ -572,6 +581,35 @@ pub(crate) mod vm {
         fn has_forward(&self, layout: Layout) -> bool;
         /// Whether a reverse pass exists (or can be built) for `layout`.
         fn has_reverse(&self, layout: Layout) -> bool;
+        /// Mark in `out` (one entry per derivative, at the extent) each derivative that is a
+        /// structural zero — exactly `0`, with every derivative of every order `0` — given the
+        /// inputs' values (`u`, `params`, `seeds`) and which inputs are structural zeros
+        /// (`zu`, `zp`, `zs`). `false`, with `out` unspecified, when the kernel cannot tell;
+        /// then every output must be treated as live. It may under-report, never over-report.
+        ///
+        /// See [`Self::structural_zero_inputs`] for when a caller may skip it.
+        #[allow(clippy::too_many_arguments)]
+        fn structural_zeros(
+            &self,
+            _u: &[f64],
+            _params: &[f64],
+            _seeds: &[f64; 4],
+            _zu: &[bool],
+            _zp: &[bool],
+            _zs: &[bool; 4],
+            _out: &mut [bool],
+        ) -> bool {
+            false
+        }
+        /// When [`Self::structural_zeros`] can mark an output only through a structural-zero
+        /// *input*, the inputs it reads: then, if none of them is one (an index past an input
+        /// slice counts as one, as the binding reads it), it marks nothing and the caller may
+        /// skip it. `None`, the conservative answer and the default, when it may also mark
+        /// one from inputs none of which is a structural zero (a literal `0`, a product with
+        /// `0`, a comparison), so the caller always runs it.
+        fn structural_zero_inputs(&self) -> Option<LoadedInputs<'_>> {
+            None
+        }
         /// The forward over `layout`.
         ///
         /// # Safety
