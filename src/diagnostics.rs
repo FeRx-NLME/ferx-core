@@ -28,7 +28,7 @@
 //! | `E_PARSE`                 | the model file failed to parse; on block `data_selection`, a `[data_selection]` clause that does not compile into a row filter, which `run_sir` / `run_covariance` reach from recorded reader settings edited after the fit (#1774) |
 //! | `E_MISSING_BLOCK`         | a required `[block]` is absent; on block `simulation`, `run_model_simulate` on a model file with no `[simulation]` block (#1788) |
 //! | `E_UNKNOWN_BLOCK`         | a `[block]` header is not a recognised block name |
-//! | `E_DEPRECATED_BLOCK`      | a `[block]` that was ferx syntax and is no longer read |
+//! | `W_DEPRECATED_BLOCK`      | a `[block]` that was ferx syntax and is no longer read; it was already inert, so it is ignored with a warning rather than failing the parse (#2913) |
 //! | `E_BLOCK_INSTANCE_NAME`   | a `[block NAME]` instance name is present where none is taken, or missing where one is required |
 //! | `E_BLOCK_FEATURE_DISABLED`| a `[block]` needs a cargo feature this binary was not built with |
 //! | `E_NN_FEATURE_DISABLED`   | a `[covariate_nn]` block needs `--features nn` |

@@ -15141,19 +15141,53 @@ fn test_known_block_names_track_the_build_features() {
 /// parser stopped reading it silently, and `nearest_block_name` finds nothing
 /// close enough to suggest (`initial_conditions` is far past edit distance 2),
 /// so the generic path would leave the user with no explanation at all.
+///
+/// It is a warning, not an error (#2913): the block was already inert, so a
+/// stored model carrying one must keep parsing across an upgrade.
 #[test]
-fn test_deprecated_block_is_rejected_with_its_remediation() {
+fn test_deprecated_block_is_a_warning_with_its_remediation() {
     assert_eq!(nearest_block_name("initial_values"), None);
     let src = model_with_extra_block("[initial_values]\n  theta = [0.2, 10.0]\n  sigma = [0.02]\n");
-    let err = parse_model_string(&src).expect_err("deprecated block must be an error");
+    let model = parse_model_string(&src).expect("a deprecated block must not fail the parse");
+    let hits: Vec<&String> = model
+        .parse_warnings
+        .iter()
+        .filter(|w| w.contains("W_DEPRECATED_BLOCK"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", model.parse_warnings);
+    let w = hits[0];
     assert!(
-        err.starts_with("Deprecated block `[initial_values]` (line 16) is no longer read:"),
-        "{err}"
+        w.starts_with("Deprecated block `[initial_values]` (line 16) is ignored:"),
+        "{w}"
     );
-    assert!(err.contains("declared inline in `[parameters]`"), "{err}");
-    assert!(err.contains("delete it"), "{err}");
+    assert!(w.contains("declared inline in `[parameters]`"), "{w}");
+    assert!(w.contains("delete it"), "{w}");
+    assert!(w.contains("never affected the fit"), "{w}");
     // Not the generic bucket: no "valid blocks" dump, no did-you-mean.
-    assert!(!err.contains("Valid blocks"), "{err}");
+    assert!(!w.contains("Valid blocks"), "{w}");
+}
+
+/// The deprecated block's lines are dropped at extraction, so nothing
+/// downstream — the absorption twin re-emits `unnamed` — can read them, and a
+/// repeated header warns once.
+#[test]
+fn test_deprecated_block_lines_are_dropped_at_extraction() {
+    let src = model_with_extra_block(
+        "[initial_values]\n  theta = [0.2, 10.0]\n\n[initial_values]\n  sigma = [0.02]\n",
+    );
+    let extracted = extract_blocks(&src).expect("extracts");
+    assert!(!extracted.unnamed.contains_key("initial_values"));
+    assert!(!extracted.block_lines.contains_key("initial_values"));
+    assert_eq!(extracted.warnings.len(), 1, "{:?}", extracted.warnings);
+}
+
+/// A deprecated block never masks a real header error: an unknown block in the
+/// same file still fails the parse.
+#[test]
+fn test_deprecated_block_does_not_mask_an_unknown_block() {
+    let src = model_with_extra_block("[initial_values]\n  theta = [0.2]\n\n[foo]\n  k = 1\n");
+    let err = parse_model_string(&src).expect_err("unknown block must still be an error");
+    assert!(err.starts_with("Unknown block `[foo]`"), "{err}");
 }
 
 /// An unknown header written with an instance name is echoed as written, so
