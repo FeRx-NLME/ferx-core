@@ -474,8 +474,8 @@ fn refuses_two_tte_endpoints_without_cmt() {
 fn refuses_repeated_events() {
     assert_refusal(
         run(RTTE, &uniform_pop(3, 1.0, true), &opts(20)),
-        "vpc_tte: cmt 2 is a repeated-events (RTTE) endpoint. A Kaplan–Meier VPC of repeated \
-         events is not supported yet.",
+        "vpc_tte: cmt 2 is a repeated-events (RTTE) endpoint. Use `vpc_rtte` for its \
+         Kaplan–Meier and mean-cumulative-function VPC.",
     );
 }
 
