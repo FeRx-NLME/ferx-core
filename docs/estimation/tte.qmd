@@ -1100,6 +1100,33 @@ fit, exactly, and the absolute curves of orders 1 to 3 and the gap curves of ord
 within 1.1e-16. survfit cannot express two events at one time in one subject, so that case is
 pinned by its exact closed form instead.
 
+| Reference | Fixture | Agreement |
+|---|---|---|
+| `survival::survfit` 3.8.12 | `tests/fixtures/rtte_survfit` (80 subjects, 2 strata) | MCF exact; absolute orders 1–3 and gap orders 2–3 within 1.1e-16 (`tests/rtte_survfit_reference.rs`) |
+| `reda::mcf` 0.5.6 | the same fixture | MCF within 4.4e-16, with `numRisk` equal to ferx's at-risk count on all 40 rows |
+| `reda::mcf` 0.5.6 | two events at time 5 in one subject (the layout survfit refuses) | `MCF(5) = 37/30` and `MCF(8) = 19/10` exactly, the closed form ferx is pinned to |
+
+reda refuses an event at a subject's follow-up end `cᵢ`, which the fixture has 19 times, so
+for reda each such subject gets a censoring appended at `cᵢ + ε`. The two layouts give the
+same MCF: for `t ≤ cᵢ` the subject is at risk under both, and on `(cᵢ, cᵢ + ε]` it is at risk
+only under reda's, but every time in the fixture is a whole number and `ε < 1`, so no event
+falls in that interval. The extra rows reda reports at the `cᵢ + ε` are dropped by matching on
+ferx's times; `ε = 0.5` and `ε = 1e-9` give identical results. reda also refuses a censoring
+that is not a subject's last record when an event follows it. ferx accepts that layout, so it
+is not compared. Neither reda comparison is a committed test.
+
+**`vpc::vpc_tte(rtte = TRUE)` is not a reference.** Its Kaplan–Meier step is survfit itself;
+what differs is which rows it builds for "order `k`", and in vpc 1.2.4 none of its modes is
+ferx's curve. In the default gap mode (`rtte_calc_diff = TRUE`) it sorts each subject's gaps
+by length after computing them, so its "order `k`" is the `k`-th *shortest* gap, not the gap
+before the `k`-th event (up to 0.14 in S on the fixture above). With
+`rtte_calc_diff = FALSE` order `k` is conditional on reaching `k − 1` events: subjects with
+fewer drop out instead of being censored at their follow-up end (up to 0.34 at orders 2 and
+3). With `rtte_conditional = FALSE` one subject enters the risk set up to `k` times, so the
+curve is not a Kaplan–Meier estimate of the time to the `k`-th event. A VPC drawn by vpc's own
+RTTE mode will therefore not overlay `vpc_rtte()`'s curves, and the difference is in vpc's
+row construction, not in either Kaplan–Meier step.
+
 The bands are checked for self-consistency in `tests/vpc_rtte_self_consistency.rs`. 200
 datasets are drawn outside the simulator from a Poisson process with between-subject
 variability, about 80 % of subjects leaving before `H`, and each gets a 200-replicate VPC. The
