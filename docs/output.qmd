@@ -45,6 +45,9 @@ A CSV file with per-observation diagnostics, one row per observation per subject
 | `IPRED` | Individual prediction (eta = EBE) |
 | `CWRES` | Conditional weighted residual |
 | `IWRES` | Individual weighted residual |
+| `NPDE`, `NPD` | Simulation-based normalized prediction (distribution) errors; only with `npde_nsim > 0` |
+| `EPRED` | Monte-Carlo expected prediction `E_sim[y]` from the NPDE simulation; only with `npde_nsim > 0` |
+| `EWRES`, `PWRES` | Monte-Carlo population-weighted residual `Σ_sim^(-1/2)(y − EPRED)`, one value under its NONMEM and its Monolix name; only with `npde_nsim > 0` |
 | `EBE_OFV` | Each subject's contribution to the total OFV |
 | `N_OBS` | Number of observations for the subject |
 | `TAFD` | Time after first dose |
@@ -96,6 +99,17 @@ $H = \partial f/\partial\eta$ at $\hat\eta$, $\tilde{R} = H\Omega H^T + R$ is it
 $\tilde{R}^{-1/2}$ is the symmetric inverse square root. $R$ is evaluated at `IPRED` under
 FOCEI and at the population prediction under FOCE, the points the two objectives use. Rows
 censored for the fit (`bloq_method = m3`) are blank.
+
+**PWRES / EWRES** (population-weighted residual, Monolix's `PWRES`, NONMEM's `EWRES`;
+only with `npde_nsim > 0`) is the simulation-based analogue of CWRES:
+$$
+\text{PWRES} = \Sigma_{\text{sim}}^{-1/2}\,(y - \text{EPRED})
+$$
+where `EPRED` and $\Sigma_{\text{sim}}$ are the empirical mean and within-subject
+covariance of the NPDE simulation, with no linearization. It decorrelates with the
+same symmetric inverse square root as CWRES. See
+[Population-weighted residuals](model-file/fit-options.qmd#population-weighted-residuals-epred-pwres-ewres)
+for when to prefer it over CWRES and NPDE.
 
 #### CWRES under inter-occasion variability
 
@@ -207,6 +221,63 @@ per-subject records (`eta`, `ipred`, residuals, …), warnings, and provenance
 Library callers get the identical payload in-process, without touching the
 filesystem, via `FitResult::to_json_value() -> serde_json::Value`.
 
+### Parameter estimates keyed by name (`estimates`) {#fit-json-estimates}
+
+The vectors above (`theta` beside `theta_names`, `omega` as a flat matrix) are
+`FitResult`'s own fields. For reading final estimates back — substituting them
+into a model, a report, a comparison across runs — **both** fit files carry a
+top-level `estimates` block with the same layout: the sections, entry names and
+field names of the YAML's [parameter estimates](#parameter-estimates). One path
+reads either file, with no branch on the format:
+
+```r
+fit <- if (grepl("\\.json$", path)) jsonlite::read_json(path) else yaml::read_yaml(path)
+fit$estimates$theta$TVCL$estimate
+```
+
+In the YAML, `estimates:` repeats the top-level `theta:` / `omega:` / `sigma:` /
+… sections nested one level down; the top-level copies stay, so a reader that
+already uses `yaml$theta$TVCL$estimate` keeps working. The `estimates:` block
+is the supported path for code that has to read both formats. In the JSON:
+
+```json
+"estimates": {
+  "theta": {
+    "TVCL": { "estimate": 0.13291, "se": 0.0071, "rse_pct": 5.34 },
+    "TVV":  { "estimate": 7.7301, "fixed": true, "se": null, "rse_pct": null }
+  },
+  "omega": {
+    "ETA_CL":         { "variance": 0.0286, "cv_pct": 17.03, "se": 0.0081 },
+    "ETA_V__ETA_CL":  { "covariance": 0.0061, "se": 0.0040, "correlation": 0.37 }
+  },
+  "sigma": {
+    "PROP_ERR": { "estimate": 0.1496, "variance": 0.0224, "type": "proportional", "cv_pct": 14.96, "se": 0.011 }
+  }
+}
+```
+
+- The sections are `theta`, `omega` and `sigma` (always present, possibly an
+  empty map — `{}` in both files) and `block_sigma`, `omega_iov` and
+  `mixture_overrides` (present when the fit has them). All three renderings —
+  the YAML's top-level sections, its `estimates:` block and the JSON's
+  `estimates` — come from one table, so they cannot list different parameters
+  or fields.
+- The JSON values are full `f64` precision, where the YAML rounds to six
+  decimals (two for `rse_pct` / `cv_pct`). An estimate below ~1e-4 keeps its
+  significant figures only in the JSON.
+- JSON `null` is the YAML's `~`, and also a non-finite value the YAML prints as
+  `NaN` / `inf` / `.inf`.
+- Under the YAML's `estimates:`, every parameter name — and a mixture
+  override's `base` — is double-quoted (`"TVCL":`), so a name YAML would
+  otherwise read as a boolean or null (`YES`, `NO`, `ON`, `OFF`, `NULL`, …)
+  reaches a YAML reader as the same string the JSON has. The top-level sections
+  quote only those names and leave every other one bare, as before.
+- Keys within a section are sorted, not in declaration order; read them by
+  name. Declaration order is `theta_names` / `eta_names` / `sigma_names`.
+- `estimates` is derived output, like `status`: reading the JSON back as a
+  `FitResult` ignores it. It is `null` only for a result the YAML writer
+  refuses (a `block_sigma` correlation naming a σ index the fit does not have).
+
 ## Fit YAML (`{model}-fit.yaml`)
 
 A YAML file containing parameter estimates, standard errors, and model diagnostics.
@@ -218,6 +289,10 @@ model:
   converged: true
   final_gradient_max_abs: 2.290000e-4
   final_gradient_source: optimizer
+  newton_decrement: 4.311000e-9
+  optimizer_stop: Failure
+  status: converged_with_issues
+  status_reasons: ["covariance_failed", "collapsed_at_guard: ETA_KA"]
   method: FOCE
   covariance_method: r
 objective_function:
@@ -250,6 +325,11 @@ sigma:
   sigma_1:
     estimate: 0.010638
     se: 0.000788
+estimates:              # theta/omega/sigma/... again, one level down (#2911)
+  theta:
+    TVCL:
+      estimate: 0.132735
+      # … every section and field exactly as above
 covariance_matrix:
   # optimizer parameterization: theta log-transformed when lower bound >= 0
   # (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored
@@ -280,6 +360,10 @@ environment:
   ferx_version: 0.2.0
 ```
 
+`estimates:` repeats the parameter sections under one key so that
+`estimates.theta.TVCL.estimate` reads this file and `{model}-fit.json` alike —
+see [Parameter estimates keyed by name](#fit-json-estimates).
+
 The `covariance_matrix:` block is only present when the covariance step ran
 successfully or was regularised. The values are in **optimizer space** — thetas
 and sigma are on the log scale (or identity scale when the lower bound is
@@ -301,6 +385,49 @@ every warning that carries a structured `details` payload — see [Where
 `details` is written](warnings.qmd#where-details-is-written). Both blocks are
 absent when there is nothing to list.
 
+### The `multi_start:` block {#multi-start-block}
+
+A fit with `n_starts > 1` adds a `multi_start:` block before
+`covariance_matrix:`. A single-start fit has none. This one is
+`examples/mm_multistart.ferx` with `start_sigma = 1.5` (macOS arm64; two of
+the eight rows shown):
+
+```yaml
+multi_start:
+  n_starts: 8
+  seed: 42
+  selected_start: 2
+  n_converged: 8
+  n_not_converged: 0
+  n_failed: 0
+  compared: ofv
+  best: -221.877049
+  agree_within: 1.0
+  n_compared: 8
+  n_within: 7
+  range: 5.273825
+  starts:
+    - {start: 0, ofv: -221.877048, converged: true, status: converged, n_iterations: 84, wall_time_secs: 1.318677, selected: false, theta: [7.457722, 22.146652, 18.475210, 2.414018]}
+    # ... starts 1 to 3
+    - {start: 4, ofv: -216.603223, converged: true, status: converged, n_iterations: 334, wall_time_secs: 2.698044, selected: false, theta: [50.000000, 40.137733, 3.919750, 0.361034]}
+    # ... starts 5 to 7
+```
+
+| Key | Meaning |
+|---|---|
+| `seed` | `multi_start_seed`, when one was set |
+| `selected_start` | The start whose result the file reports |
+| `n_converged`, `n_not_converged`, `n_failed` | Each start counted once |
+| `compared` | `ofv`, or `penalized_objective` under `nn_l2` / `nn_smooth`: the value `best`, `range` and the count are measured on |
+| `best` | That value on the selected start; `null` when it has none |
+| `agree_within` | The cutoff for `n_within`, fixed at 1.0 |
+| `n_compared`, `n_within` | The converged starts with a usable value, and how many of them are within the cutoff of `best`. Every start with a usable value when none converged |
+| `range` | The largest distance above `best` among the compared starts |
+| `starts` | One row per start. `status` is the start's own status token, followed by `status_reasons` when it has any. A failed start has `status: failed`, `ofv: null`, an `error` and, when its refusal is coded, an `error_code`. A start ranked on a penalized objective also carries `objective`, `null` when that value is not finite. A non-finite θ is `null` |
+
+The rows are [`FitResult.starts`](model-file/fit-options.qmd#multi-start-spread),
+which the fit JSON and the `.fitrx` bundle carry as `starts`.
+
 ### Key Fields
 
 #### Run status and objective
@@ -319,6 +446,22 @@ absent when there is nothing to list.
   reads](estimation/optimizers.qmd#what-the-reporting-gradient-reads). Both keys
   are omitted when the fit reported no gradient; a non-finite component is
   written as `.nan`.
+- **newton_decrement**: the OFV a Newton step from the estimates is predicted to
+  remove, `½·gᵀH⁻¹g`, taken by the covariance step. Its square root is the distance
+  to the minimum in standard errors, so unlike `final_gradient_max_abs` it does not
+  depend on how a coordinate is scaled. Above 1 it demotes `converged` for FOCE,
+  FOCEI, Laplace / AGQ and Gauss–Newton (`W_NON_STATIONARY_OPTIMUM`). Omitted when
+  the covariance step did not test it — see [What `converged`
+  guarantees](estimation/optimizers.qmd#what-converged-guarantees) (#2785).
+- **optimizer_stop**: the NLopt stop state of the leg that produced the estimates
+  (`FtolReached`, `XtolReached`, `MaxEvalReached`, `Failure`, `RoundoffLimited`,
+  …). `converged` is a verdict built on it, not a copy: a bare `Failure` at a
+  plateau is converged, an `FtolReached` at a non-stationary point is not. Omitted
+  for optimizers other than NLopt's (#2785).
+- **status** / **status_reasons**: the usability verdict beside `converged`
+  (`converged`, `converged_with_issues` or `not_converged`) and the reasons that
+  qualify it, always present (`[]` when there are none). See [Fit
+  status](#fit-status) (#2799).
 - **ofv**: Objective Function Value (-2 log-likelihood)
 - **aic**: Akaike Information Criterion (OFV + 2p)
 - **bic**: Bayesian Information Criterion (OFV + p * ln(n), with n the number of
@@ -388,6 +531,50 @@ fit ran under — `os`/`arch` from the running binary's target, `in_docker`
 (whether `/.dockerenv`, `KUBERNETES_SERVICE_HOST`, or `/proc/1/cgroup`
 indicate a container), `username` (`$USER`/`%USERNAME%`, quoted/escaped since
 it's free-form text), and `ferx_version`.
+
+#### Mixture per-class overrides (`mixture_overrides:`) {#mixture-overrides}
+
+A `[mixture]` fit with `omega(k)` / `sigma(k)` overrides gets a top-level
+`mixture_overrides:` section after `omega_iov:` (#2833). Each entry is named as in
+the optimizer trace: the base name with a `_MIX<k>` suffix.
+
+```yaml
+mixture_overrides:
+  ETA_CL_MIX2:
+    class: 2
+    base: ETA_CL
+    kind: omega
+    variance: 0.266883
+    cv_pct: 55.31
+    se: 0.064976
+  EPS_MIX2:
+    class: 2
+    base: EPS
+    kind: sigma
+    estimate: 0.211171
+    se: 0.010668
+```
+
+- An Ω override reports the class **variance**, with the `cv_pct` / `sd` line of its
+  base η's type. A σ override reports `estimate` on the SD scale, as `sigma:` does.
+- `se` uses the base blocks' keys. A `FIX` override, or a σ override SAEM held at
+  its initial value, has `fixed: true` and `se: ~`. An override in `held_at_bound`
+  has `se: ~` and `held: <reason>`. Its base parameter keeps its own SE either way.
+- The section is separate from `omega:` / `sigma:` on purpose: `[priors] from_fit`
+  reads every entry there as a base parameter.
+- The console prints the same rows under `--- Mixture per-class overrides ---`,
+  after SIGMA: `[FIX]` with `SE = ---` when fixed, `SE = N/A` when held.
+  `parameter_table` lists them with types `OMEGA var (class k)` and
+  `SIGMA SD (class k)`.
+- In `covariance_matrix.parameters` an Ω override is `log_chol_<eta>_MIX<k>` (it
+  packs the log of the class SD, like a base diagonal) and a σ override is
+  `<eps>_MIX<k>`. A `block_sigma` correlation, packed last, is `<eps_i>~<eps_j>`.
+  Before #2833 all of these were `param_<n>`.
+
+The same data is on `FitResult` as `mixture_overrides` (values),
+`se_mixture_overrides` (SEs on the same scales; `0.0` when fixed) and
+`mixture_override_params` (name, `kind`, base `index`, `class`, `packed_index`,
+`fixed`).
 
 ### SIR intervals (`sir:`)
 
@@ -485,12 +672,20 @@ Both metrics are `NaN` when `omega_iov` diagonal is zero or fewer than two subje
 
 Two pooled autocorrelation diagnostics are reported after every fit:
 
-**`iwres_lag1_r`** — pooled lag-1 Pearson correlation of IWRES across subjects. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.
+Both are pooled over **lag pairs**: two consecutive rows of one series. A series is the rows of one subject, in row order. It is split at the subject's occasions (an `iov_column`, a derived `iov_occasion`, or a nested model's innermost level cell) and at its `correlation … by` blocks, each only when they are **parallel**, such as the arms of one study or level cells, which restart the clock: a pair never joins one arm's last visit to the next arm's first. Occasions or blocks that **run in time**, such as dosing intervals, study periods or a `correlation … by OCC` line over visits, stay one series, so the last row of one visit and the first row of the next are a pair.
 
-**`dw_statistic`** — pooled Durbin-Watson statistic:
+A subject's occasions (and, by the same rule, its blocks) run in time when each label is one unbroken run of its observation rows and the time is strictly later at every change of label. The time is the one the fit uses, which keeps running across an `EVID = 4` reset. This is decided per subject, from the data. Before [#2829](https://github.com/FeRx-NLME/ferx-core/issues/2829) every occasion split the series, so a design with one observation per occasion had no pair at all and no statistic.
+
+Both diagnostics are `NaN` when no series has two rows, for example with one observation per arm.
+
+**`iwres_lag1_r`** — pooled lag-1 Pearson correlation of IWRES over those pairs. Values near 0 indicate no serial dependence; values approaching ±1 indicate strong autocorrelation.
+
+**`dw_statistic`** — pooled Durbin-Watson statistic, pair-normalised:
 $$
-\text{DW} = \frac{\sum_i \sum_t (e_{i,t} - e_{i,t-1})^2}{\sum_i \sum_t e_{i,t}^2}
+\text{DW} = \frac{\sum_{\text{pairs}} (e_{t} - e_{t-1})^2}{\sum_{\text{pairs}} \tfrac12\,(e_{t}^2 + e_{t-1}^2)}
 $$
+
+The denominator runs over the same pairs as the numerator, so independent residuals give 2 however short the series are. The classic form, $\sum e_t^2$ over every row, has expectation about $2 \cdot \text{pairs}/\text{rows}$: 1.70 on the 122 rows of the naproxen MBMA, where it warned on 12% of white-noise draws. The pair-normalised, per-series statistic has mean 2.00 there and warns on about 1% of draws on each side, about 2% in all (the classic form's 12% was all on the low side; its high-DW warning fired on 0.0% of draws). This changed after 0.4.0 ([#2798](https://github.com/FeRx-NLME/ferx-core/issues/2798)), so DW values from earlier versions are not comparable. Under a `correlation` line the residuals are decorrelated first ([Diagnostics](model-file/residual-correlation.qmd#diagnostics)).
 
 | DW range | Interpretation |
 |----------|---------------|
@@ -498,9 +693,9 @@ $$
 | < 1.5 | Positive autocorrelation — structural model likely missing dynamics |
 | > 2.5 | Negative autocorrelation — possible over-parameterization or misspecified error model |
 
-Subjects with fewer than 2 finite IWRES values are excluded from both statistics. Both fields are `NaN` when no subject qualifies.
+A series with fewer than 2 finite IWRES values contributes no pair. Both fields are `NaN` when there is no pair at all.
 
-When `dw_statistic < 1.5`, ferx emits a warning suggesting a transit absorption model, additional compartment, or IOV on ka/F. When `dw_statistic > 2.5`, the warning suggests over-parameterization or a misspecified error model.
+When `dw_statistic < 1.5`, ferx warns. On a model with compartments the warning suggests a transit absorption model, an additional compartment, or IOV on ka/F; on a compartment-free model it suggests a `correlation` line ([`dw_autocorrelation`](warnings.qmd#codes-residuals)). When `dw_statistic > 2.5`, the warning suggests over-parameterization or a misspecified error model.
 
 The warning used to add "SDE process noise may also help" on ODE models. It no longer does: the Kalman filter behind `[diffusion]` propagates the state covariance but never corrects the state mean with the observed data, so it inflates the observation variance instead of supplying the dynamics the statistic is reporting — see [what the filter does not do](model-file/diffusion.qmd#what-the-filter-does-not-do).
 
@@ -518,7 +713,52 @@ models. The `IWRES` column itself is unchanged.
 |-------|---------|
 | `Computed` | Covariance step succeeded; SE values are valid |
 | `Failed` | Hessian was singular or inversion failed; SE fields are `None` |
-| `NotRequested` | `covariance = false` was set; SE fields are `None` |
+| `NotRequested` | `covariance = false` was set, or no step belongs to the run (a Bayes fit, or a standalone `imp_eval_only` / `agq_eval_only` evaluation); SE fields are `None` |
+
+### Fit status
+
+`FitResult::status()` returns a `FitStatus`: one verdict on whether the fit can be
+used as it stands, read from facts the result already carries. It is computed
+when you ask for it, never stored, so it is current after `run_covariance` and
+available on a fit loaded from a `.fitrx` or JSON file. The console prints it as
+a `Status:` line after `Final gradient:`, the YAML writes `status:` and
+`status_reasons:`, and the JSON carries a derived `status` key (#2799).
+
+The rule:
+
+| `converged` | Reasons | Status |
+|---|---|---|
+| `false` | any | `NOT CONVERGED` (with its reasons, if any) |
+| `true` | none | `CONVERGED` |
+| `true` | at least one | `CONVERGED WITH ISSUES` |
+
+`converged` itself is unchanged. It still means the optimizer's stop was
+verified, and the status never rewrites it. Multi-start selection still reads
+`converged` and OFV, not the status.
+
+Each reason has one source, and they are listed in this order:
+
+| Reason | Source |
+|---|---|
+| `evaluation_only` | `evaluation_only`: no stage estimated. That is `maxiter = 0` on FOCE, FOCEI, Laplace/AGQ or pure Gauss–Newton (which read it as NONMEM's `MAXEVAL=0`), or a standalone `imp_eval_only` / `agq_eval_only` run |
+| `budget_spent` | `eval_budget_spent`: the outer optimizer used its whole `maxiter` budget. Set by NLopt (profiled or not), the trust region, pure Gauss–Newton and `optimizer = bfgs`. Not by SAEM, IMP, IMPMAP, Bayes or VI, which report their own iteration caps in warnings, nor by the Gauss–Newton hybrid, whose polish runs a fixed budget |
+| a warning code, e.g. `condition_number` | each distinct code of a `Critical` [structured warning](warnings.qmd#severity), in order of first appearance. An earlier chain stage's counts. `covariance_failed` never appears here |
+| `covariance_failed` | `covariance_status` is `Failed` |
+| `collapsed_at_guard: ETA_KA, …` | a coordinate collapsed onto ferx's internal guard ([held parameters](estimation/parameterization.qmd#held-parameters)) that a covariance step ran on and did **not** hold, because the step failed, floored `R` or fell back to `S` |
+
+A collapse the step held (marked in `cov_fixed`) is not a reason: its SE is
+reported as not available and every other SE is conditional on it, which is a
+clean answer. Neither is a collapse with no covariance step, which leaves no
+`R` to judge it, nor a profiled level on its declared box. The guard warning
+still names those.
+
+So `maxiter = 0` prints `NOT CONVERGED (evaluation_only)` rather than a bare
+`NOT CONVERGED`. A standalone `imp_eval_only` or `agq_eval_only` run is also an
+evaluation, but it reports `converged = true` whenever its objective is finite, so it
+prints `CONVERGED WITH ISSUES (evaluation_only)`. The two read differently because the
+status never rewrites `converged`; the shared reason is what says no stage estimated. A converged fit whose covariance step failed beside an unheld
+collapse prints `CONVERGED WITH ISSUES (covariance_failed, collapsed_at_guard: ETA_KA)`:
+the optimizer stopped, and the point it stopped at needs a second look.
 
 ### Which covariance estimator produced these numbers {#covariance-estimator}
 
@@ -580,6 +820,8 @@ Where it appears:
 | `gradient_method_outer` | Gradient method used in the outer loop, e.g. `finite differences` |
 | `uses_ode_solver` | `true` if the model uses the ODE solver, `false` for analytical PK |
 | `n_threads_used` | Number of Rayon threads used during estimation |
+| `n_starts`, `multi_start_seed` | The multi-start settings the fit ran under (`1` and absent for a single-start fit) |
+| `starts` | One [`StartRecord`](model-file/fit-options.qmd#multi-start-spread) per start of a multi-start fit; empty when `n_starts = 1` |
 | `nlopt_missing_algorithms` | NLopt algorithms that were requested but unavailable in this build (empty when all available) |
 | `covariance_n_evals_estimated` | Estimated number of OFV evaluations the covariance step's `R` matrix runs on the finite-difference route (`2n²`), populated only when `run_covariance_step = true`, `n_parameters > 30` and the step's estimator reads `R` — never under `covariance_method = s`, which builds no `R`, and never when the analytic `R` assembly (`analytic_cov_hessian`, the default) is expected to cover every subject, since it runs none. When only a minority of subjects is outside the analytic scope, the count is the same `2n²` but each evaluation covers just those subjects. Predicted before the fit, so a subject that bails out of the analytic assembly at run time can still make the step costlier than this says |
 | `environment` | [`EnvironmentInfo`](#environment-info) — OS, CPU architecture, whether running in a container, and OS username |

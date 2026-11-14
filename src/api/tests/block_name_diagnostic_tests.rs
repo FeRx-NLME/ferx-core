@@ -7,7 +7,7 @@
 //! recovery, and the codes, against the exact strings `check_block_names`
 //! emits (the parser side pins the strings themselves).
 
-use super::parse_error_to_diagnostic;
+use super::{parse_error_to_diagnostic, parse_warning_to_diagnostic};
 
 #[test]
 fn unknown_block_maps_to_e_unknown_block_with_block_line_and_suggestion() {
@@ -68,14 +68,23 @@ fn unparseable_line_parenthetical_is_ignored() {
     assert_eq!(d.message, err);
 }
 
+/// A deprecated block is a parse *warning* (#2913); `ferx check` still lifts its
+/// block and line out of the message, as it does for the block-header errors.
 #[test]
-fn deprecated_block_maps_to_e_deprecated_block() {
-    let err = "Deprecated block `[initial_values]` (line 25) is no longer read: \
-               initial estimates are declared inline in `[parameters]` — delete it.";
-    let d = parse_error_to_diagnostic(err);
-    assert_eq!(d.code, "E_DEPRECATED_BLOCK");
+fn deprecated_block_warning_maps_to_w_deprecated_block() {
+    let w = "Deprecated block `[initial_values]` (line 25) is ignored: \
+             initial estimates are declared inline in `[parameters]` — delete it. \
+             (W_DEPRECATED_BLOCK)";
+    let d = parse_warning_to_diagnostic(w);
+    assert_eq!(d.code, "W_DEPRECATED_BLOCK");
+    assert_eq!(d.severity, crate::diagnostics::Severity::Warning);
     assert_eq!(d.block.as_deref(), Some("initial_values"));
     assert_eq!(d.line, Some(25));
+    assert!(!d.message.contains("(line 25)"), "{}", d.message);
+    // Any other warning keeps its text and gets no block / line lifted out.
+    let other = parse_warning_to_diagnostic("Deprecated block `[x]` (line 3) unrelated");
+    assert_eq!(other.code, "W_PARSE");
+    assert!(other.block.is_none() && other.line.is_none());
 }
 
 #[test]

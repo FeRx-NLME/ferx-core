@@ -211,7 +211,7 @@ const SHORT_FIT: &str = "  maxiter = 3\n  inner_maxiter = 20";
 
 /// The token of `outer_fd_fallback_warning`: some subjects' outer gradient was
 /// not the exact analytic one at run time. The same phrase that
-/// `tests/outer_gradient_fd_fallback_warning.rs` matches, where
+/// `api/tests/outer_fd_fallback_warning_tests.rs` matches, where
 /// `out_of_scope_subject_warns_while_the_report_still_says_analytic` produces
 /// the warning in a real fit, so a wording change reddens that test rather than
 /// silently emptying the check below.
@@ -245,55 +245,29 @@ fn assert_analytic_ran(result: &FitResult, case: &str) {
 
 #[test]
 fn assert_analytic_ran_sees_a_runtime_decline() {
-    // The case `assert_analytic_ran` exists for: the model-level label reads
-    // "analytic" while the adjoint declines a subject at run time. An oral model with a
-    // lag time, and subject 1 of the counted form given a steady-state infusion into the
-    // depot, does that: the infusion routes the subject to the event walk, which declines
-    // an SS infusion under a lag (as in `tests/outer_gradient_fd_fallback_warning.rs`). A gather-free slot and the wide-block ladder do not: the
-    // column-chunked jet keeps a 26-level block analytic, and
-    // `reconverge_gradient_interval` forces FD without logging a decline.
+    // The case `assert_analytic_ran` exists for: the model-level label reads "analytic"
+    // while a subject fell back to FD at run time, so the only evidence is the fallback
+    // warning. Since #2786 the plans serve every regular-path shape, so no data shape
+    // reachable from an integration test declines a subject (the decline is forced by the
+    // `#[cfg(test)]` seam `kernel_jit::fail_plans_of`, used by
+    // `api/tests/outer_fd_fallback_warning_tests.rs`, where
+    // `out_of_scope_subject_warns_while_the_report_still_says_analytic` pins that a real
+    // decline produces exactly this token). So the control is the checker against the same
+    // fit with that token appended: it must accept the real fit and reject the tampered one.
     let form = &FORMS[0];
-    let text = model(form, form.gather_line, SHORT_FIT)
-        .replace("  theta TVV(", "  theta TVF(0.7, 0.05, 1.0)\n  theta TVV(")
-        .replace("V = TVV * exp(ETA_V)", "V = TVV * exp(ETA_V)\n  F = TVF")
-        .replace(
-            "pk one_cpt_iv(cl=CL, v=V)",
-            "pk one_cpt_oral(cl=CL, v=V, ka=1.5, lagtime=0.4, f=F)",
-        );
+    let result = fit(&model(form, form.gather_line, SHORT_FIT));
+    assert_analytic_ran(&result, "clean control");
+    let mut declined = result.clone();
+    declined
+        .warnings
+        .push(format!("1 of 3 subjects {OUTER_FD_FALLBACK}"));
     assert!(
-        text.matches("TVF").count() == 2 && text.contains("lagtime=0.4, f=F"),
-        "every edit must take: {text}"
-    );
-    // `SS`/`II` columns for every row; subject 1's dose becomes an SS infusion.
-    let data: String = DATA
-        .lines()
-        .enumerate()
-        .map(|(i, l)| match (i, l) {
-            (0, h) => format!("{h},SS,II\n"),
-            (_, "1,0,.,1,100,1,0,1,1") => "1,0,.,1,100,1,50,1,1,1,24\n".to_string(),
-            (_, r) => format!("{r},0,0\n"),
-        })
-        .collect();
-    assert!(
-        data.contains("1,0,.,1,100,1,50,1,1,1,24\n"),
-        "subject 1's dose must become an SS infusion"
-    );
-    let result = fit_on(&text, &data);
-    assert!(
-        result.gradient_method_outer.starts_with("analytic"),
+        declined.gradient_method_outer.starts_with("analytic"),
         "the label must stay analytic for this to be the case under test: {}",
-        result.gradient_method_outer
-    );
-    assert!(
-        result
-            .warnings
-            .iter()
-            .any(|w| w.contains(OUTER_FD_FALLBACK)),
-        "the declined subject must carry the fallback warning: {:?}",
-        result.warnings
+        declined.gradient_method_outer
     );
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        assert_analytic_ran(&result, "runtime-decline control")
+        assert_analytic_ran(&declined, "runtime-decline control")
     }));
     assert!(
         caught.is_err(),

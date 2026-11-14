@@ -331,6 +331,7 @@ pub(crate) fn subject_adjoint_gradient_at(
 /// gradient's own recording: one more sweep per BSV effect, no second recording (#2549).
 /// The response is `None` where the gradient is (the adjoint declined) or the inner Hessian
 /// is singular.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
     model: &CompiledModel,
     subject: &Subject,
@@ -349,6 +350,7 @@ pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
 /// [`subject_adjoint_gradient_with_eta_dx_at`] for any objective the adjoint serves: under
 /// Laplace/AGQ (`Objective::Agq`) the response of the conditional mode the quadrature is
 /// centred on, from the exact inner Hessian, out of the quadrature gradient's own tape.
+#[cfg(test)]
 pub(crate) fn subject_adjoint_gradient_and_eta_dx_at(
     model: &CompiledModel,
     subject: &Subject,
@@ -912,6 +914,12 @@ fn adjoint_gradient(
     eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let (template, x) = (pt.template, pt.x);
+    // A reused `out` starts each pass without a cause, so a decline elsewhere cannot
+    // inherit the last pass's (#2713).
+    let mut eta_dx = eta_dx;
+    if let Some(o) = eta_dx.as_deref_mut() {
+        o.mode_system_declined = false;
+    }
     let sc = scope(model, subject, pt, eta_hat)?;
     let objective = match objective {
         // No random effects: both anchors are the empty `H`, and `Ψ = F`.
@@ -2192,6 +2200,64 @@ fn canonical_jets1(
     Some(p)
 }
 
+/// The subject's predictions at `eta` (the stacked `[η, κ]` under IOV) into `out`, from the
+/// compiled plan's value-only forward ([`kj_fwd::Plan::run_values`]) instead of the native
+/// predictor; `false` leaves the native predictor to answer. Served only where the plan is
+/// straight-line code (`chunks_only`): a closed form, or an `[odes]` model on the exact linear
+/// path. Both are one implementation with the native walk (the same generic kernels over `f64`
+/// and over the recording type, host analyses shared), so the values are bit-equal to it (pinned
+/// by `plan_values_are_bit_equal_to_the_native_predictor` and
+/// `linear_ode_plan_values_are_bit_equal_to_the_native_predictor`). A nonlinear ODE drives a
+/// solver loop, so its plan is not `chunks_only` and declines; so do a closed form rerouted to
+/// its ODE twin, an SDE and a FREM model, and a recording that is open.
+pub(crate) fn plan_values(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    eta: &[f64],
+    out: &mut Vec<f64>,
+) -> bool {
+    if subject.observations.is_empty()
+        || model.is_sde()
+        || model.frem_config.is_some()
+        || kj_fwd::recording_open()
+    {
+        return false;
+    }
+    let Some((eff, _, eta_p, lay)) = resolve(model, subject, theta, eta, layout) else {
+        return false;
+    };
+    // A closed form rerouted to its ODE twin is a different formula from the native walk's.
+    if eff.ode_spec.is_some() && model.ode_spec.is_none() {
+        crate::scratch::give(eta_p);
+        return false;
+    }
+    let n_obs = subject.observations.len();
+    out.clear();
+    out.resize(n_obs, 0.0);
+    let served = with_plan_in(
+        eff,
+        subject,
+        lay.as_deref(),
+        theta,
+        None,
+        &eta_p,
+        &mut |plan| {
+            if plan.n_out() != n_obs {
+                return None;
+            }
+            // Declined, not unserved: the plan is fine for the gradient, and must not be marked bad.
+            if !plan.chunks_only() {
+                return Some(false);
+            }
+            plan.run_values(theta, &eta_p, out).then_some(true)
+        },
+    );
+    crate::scratch::give(eta_p);
+    served == Some(true)
+}
+
 /// An SDE subject's variance-row plan's `kj::SubjectKey` kind (kernels are 8, the covariance
 /// step's reduced basis 9).
 const SDE_P_KIND: u8 = 10;
@@ -2462,15 +2528,79 @@ fn plan_forward_in(
     for (j, &v) in theta.iter().chain(sigma.unwrap_or(&[])).enumerate() {
         p[j * l] = v;
     }
+    let owner = subject as *const Subject as usize;
     with_plan_in(model, subject, lay, theta, sigma, eta, &mut |plan| {
-        let mut du = vec![0.0; (n_obs + 1) * l];
-        let fwd = plan.forward_layout(layout, &u, &p, &mut du)?;
-        if du[n_obs * l] != 1.0 {
-            return None;
+        // The forward the subject's inner solve ended on, at exactly this point: adopted, not
+        // computed again ([`keep_forward`]). Only the plain predictions' plan.
+        if sigma.is_none() {
+            if let Some(fwd) = plan.adopt(owner, layout, theta, eta) {
+                let mut du = vec![0.0; n_obs * l];
+                for i in 0..n_obs {
+                    du[i * l..(i + 1) * l].copy_from_slice(plan.kept_out(&fwd, i));
+                }
+                if !plan.kept_guard(&fwd) {
+                    return None;
+                }
+                return Some((plan.clone(), du, fwd));
+            }
         }
-        du.truncate(n_obs * l);
-        Some((plan.clone(), du, fwd))
+        serve_forward(plan, layout, &u, &p, n_obs)
     })
+}
+
+/// `plan`'s forward at `layout` over the inputs `u` (η) and `p` (θ, σ): its observation lanes
+/// and the kept forward, `None` where its guard does not hold at them.
+fn serve_forward(
+    plan: &PlanArc,
+    layout: crate::sens::num::vm::Layout,
+    u: &[f64],
+    p: &[f64],
+    n_obs: usize,
+) -> Option<(PlanArc, Vec<f64>, kj_fwd::Fwd)> {
+    let l = layout.lanes();
+    let mut du = vec![0.0; (n_obs + 1) * l];
+    let fwd = plan.forward_layout(layout, u, p, &mut du)?;
+    if du[n_obs * l] != 1.0 {
+        return None;
+    }
+    du.truncate(n_obs * l);
+    Some((plan.clone(), du, fwd))
+}
+
+/// [`plan_forward`] at the values-only layout, trying `first` (a plan that served this
+/// subject at its mode) before the registry: a quadrature node is the same subject at another
+/// η, so its guard usually holds and the lookup is skipped; where it does not, the lookup
+/// serves as before.
+pub(super) fn plan_forward_f64(
+    first: Option<&PlanArc>,
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    eta: &[f64],
+) -> Option<(PlanArc, Vec<f64>, kj_fwd::Fwd)> {
+    let layout = crate::sens::num::vm::Layout::F64;
+    if let Some(plan) = first.filter(|p| {
+        p.n_out() == subject.observations.len()
+            && p.n_eta() == eta.len()
+            && p.n_theta() == theta.len()
+    }) {
+        let mut u = kj_fwd::Buf::new(eta.len());
+        u.copy_from_slice(eta);
+        let mut p = kj_fwd::Buf::new(theta.len());
+        p.copy_from_slice(theta);
+        if let Some(r) = serve_forward(plan, layout, &u, &p, subject.observations.len()) {
+            return Some(r);
+        }
+    }
+    plan_forward(model, subject, lay, theta, eta, layout)
+}
+
+/// Keep, for the outer gradient, the forward the subject's inner solve last took at `eta`
+/// ([`kj_fwd::keep_last_run`]): [`plan_forward`] adopts it at the same `(θ, η̂)` instead of
+/// running the plan again.
+pub(crate) fn keep_forward(subject: &Subject, theta: &[f64], eta: &[f64]) {
+    kj_fwd::keep_last_run(subject as *const Subject as usize, theta, eta);
 }
 
 /// The observations' lanes of a plan's forward over `n` random effects: per observation the
@@ -4335,7 +4465,7 @@ fn run(
     } else {
         planned_pop.as_ref().map(|(_, v, _)| v.clone())
     };
-    let w = mode_solve(&h, &grad_f, &grad_l, || {
+    let Some(w) = mode_solve(&h, &grad_f, &grad_l, || {
         let mut g =
             inner_search_gradient(model, subject, lay, theta, eta, &ctx, &pv, fz.as_deref())?;
         if let Some(j) = ng.as_ref() {
@@ -4344,7 +4474,12 @@ fn run(
             }
         }
         Some(g)
-    })?;
+    }) else {
+        if let Some(o) = eta_dx {
+            o.mode_system_declined = true;
+        }
+        return None;
+    };
 
     // ---- 3. Ψ = F − wᵀ∇_η l and (with the mode response) its rows, from the lanes -----
     // Row `r` is `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows of `H⁻¹`, so
@@ -4356,19 +4491,14 @@ fn run(
     }
     let n_outs = coefs.len();
     // Each output's adjoint row: its combination of the kernel outputs' rows.
-    let rows_of: Vec<Vec<f64>> = coefs
-        .iter()
-        .map(|c| {
-            (0..inp.vals.len())
-                .map(|i| c.iter().zip(&base).map(|(a, r)| a * r[i]).sum())
-                .collect()
-        })
-        .collect();
+    // Combined per leaf, at the leaves that are read: most of a recording's inputs are not.
+    let row_at =
+        |o: usize, i: usize| -> f64 { coefs[o].iter().zip(&base).map(|(a, r)| a * r[i]).sum() };
     #[cfg(test)]
     if n_outs > 1 && FAIL_RESPONSE_LANES.with(|f| f.get()) {
         return None;
     }
-    let out_adj = |o: usize, x: kernel::Leaf| -> f64 { x.adj(&rows_of[o]) };
+    let out_adj = |o: usize, x: kernel::Leaf| -> f64 { x.adj_with(|i| row_at(o, i)) };
     let psi_of = |x: kernel::Leaf| out_adj(0, x);
 
     // ---- 4. the outputs' θ-derivatives: through the predictions, step 2's per-lane ------
@@ -4491,6 +4621,11 @@ pub(crate) struct ModeOut {
     pub(crate) want_hessian: bool,
     pub(crate) eta_dx: Option<Vec<DVector<f64>>>,
     pub(crate) hessian: Option<DMatrix<f64>>,
+    /// The FOCE/FOCEI pass declined at its mode system `H w = ∇_η F` ([`mode_solve`]): `H`
+    /// singular at `η̂`, or indefinite at an `η̂` that is not stationary. Any other decline
+    /// (scope, a failed or non-finite recording) leaves it `false` (#2713). Reset at the
+    /// start of every pass; [`Self::clear`] keeps it.
+    pub(crate) mode_system_declined: bool,
 }
 
 impl ModeOut {
@@ -4603,17 +4738,17 @@ fn run_agq(
     // ---- 1. values at η̂ (the plan's second-order forward): f, G, Q; the exact H and the
     // anchor. An endpoint-only subject has no Gaussian rows to record.
     let n_obs = subject.observations.len();
+    // Only the exact anchor (which differentiates through `H`) reads `Q`; the Gauss-Newton
+    // anchor runs first order and `agq_planned` contracts the exact inner Hessian by reverse.
+    let lay_mode = if exact {
+        terms::layout2(n)
+    } else {
+        terms::layout1(n)
+    };
     let p1 = if n_obs == 0 {
         None
     } else {
-        Some(plan_forward(
-            model,
-            subject,
-            lay,
-            theta,
-            eta,
-            terms::layout2(n),
-        )?)
+        Some(plan_forward(model, subject, lay, theta, eta, lay_mode)?)
     };
     // An SDE subject's EKF variance rows, the kernel's rows `n..2n`, a plan of their own.
     let p_var = if n_obs > 0 && model.is_sde() {
@@ -4624,7 +4759,7 @@ fn run_agq(
             theta,
             Some(&params.sigma.values),
             eta,
-            terms::layout2(n),
+            lay_mode,
         )?)
     } else {
         None
@@ -4634,11 +4769,10 @@ fn run_agq(
         .chain(&p_var)
         .flat_map(|p| p.1.iter().copied())
         .collect();
-    let pl = PredLanes::new(lanes_all.as_slice(), n, true);
+    let pl = PredLanes::new(lanes_all.as_slice(), n, exact);
     let n_rows = pl.rows();
     let f1: Vec<f64> = (0..n_rows).map(|j| pl.v(j)).collect();
     let g1: Vec<Vec<f64>> = (0..n_rows).map(|j| pl.row_g(j).to_vec()).collect();
-    let q1: Vec<Vec<f64>> = (0..n_rows).map(|j| pl.row_q(j).to_vec()).collect();
     // A subject's non-Gaussian records (TTE, binary, CTMM): the term's η-jets to third order
     // at η̂, over the BSV block (the leading one of the stacked `[η, κ]` under IOV). Both
     // anchors carry its `∇²q`, as production's do (`exact_inner_hessian`, `exact_htilde`).
@@ -4648,7 +4782,8 @@ fn run_agq(
     } else {
         Some(ng_jets3(model, subject, theta, &eta[..n_bsv])?)
     };
-    let h_exact = {
+    let h_exact = if exact {
+        let q1: Vec<Vec<f64>> = (0..n_rows).map(|j| pl.row_q(j).to_vec()).collect();
         let h =
             crate::sens::focei_kernel::exact_inner_hessian_kernel(&ctx, &f1, &g1, &q1, eta, &pv)?;
         let mut h = DMatrix::from_fn(n, n, |a, b| h[a][b]);
@@ -4659,10 +4794,11 @@ fn run_agq(
                 }
             }
         }
-        h
+        Some(h)
+    } else {
+        None
     };
-    let h_inner = h_exact.clone();
-    let mut h_a: Vec<Vec<f64>> = if exact {
+    let mut h_a: Vec<Vec<f64>> = if let Some(h_exact) = h_exact.as_ref() {
         (0..n)
             .map(|a| (0..n).map(|b| h_exact[(a, b)]).collect())
             .collect()
@@ -4729,7 +4865,7 @@ fn run_agq(
         &so,
         &pv,
         &grid,
-        &h_inner,
+        h_exact.as_ref(),
         exact,
         held,
         ng.as_ref(),

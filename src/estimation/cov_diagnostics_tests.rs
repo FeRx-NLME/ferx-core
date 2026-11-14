@@ -2080,3 +2080,154 @@ fn the_newton_decrement_is_half_g_transpose_h_inverse_g() {
     let h_inv = nalgebra::DMatrix::from_row_slice(2, 2, &[2.0, 1.0, 1.0, 3.0]);
     assert_eq!(newton_decrement(&g, &h_inv), 3.5);
 }
+
+// ── #2785: the stationarity test of an estimate its method minimised ───────────────────────
+
+#[test]
+fn the_minimum_test_runs_for_minimisers_on_an_unclipped_r_only() {
+    use EstimationMethod as M;
+    for m in [M::Foce, M::FoceI, M::FoceGn, M::FoceGnHybrid, M::Laplace] {
+        assert!(tests_minimum_stationarity(m, 0), "{m:?}, R unclipped");
+        // A floored `R⁻¹` reads `1/floor` along the clipped direction: the decrement there
+        // measures the floor, which has its own warning.
+        assert!(!tests_minimum_stationarity(m, 1), "{m:?}, R clipped");
+    }
+    for m in [M::Saem, M::Imp, M::Impmap, M::Vi, M::Bayes] {
+        assert!(
+            !tests_minimum_stationarity(m, 0),
+            "{m:?} never minimised R's objective"
+        );
+    }
+}
+
+#[test]
+fn the_reading_with_nothing_held_is_the_newton_decrement_and_the_step_in_ses() {
+    // The fixture of `the_newton_decrement_is_half_g_transpose_h_inverse_g`: δ = H⁻¹g = (3, 4),
+    // SEs √(2·2) = 2 and √(2·3) = √6, so the steps are 1.5 and 4/√6 SEs.
+    let g = nalgebra::DVector::from_vec(vec![1.0, 1.0]);
+    let h_inv = nalgebra::DMatrix::from_row_slice(2, 2, &[2.0, 1.0, 1.0, 3.0]);
+    let r = stationarity_reading(&g, &h_inv, &[false, false]).expect("finite input");
+    assert_eq!(r.decrement, newton_decrement(&g, &h_inv));
+    assert_eq!(r.step_se[0], 1.5);
+    assert!((r.step_se[1] - 4.0 / 6f64.sqrt()).abs() < 1e-15, "{r:?}");
+}
+
+#[test]
+fn a_held_coordinate_leaves_by_schur_complement_not_by_deleting_its_row() {
+    // H = (H⁻¹)⁻¹ = ⅕·[[3, −1], [−1, 2]], so with coordinate 1 held the free block's own
+    // inverse is (H₀₀)⁻¹ = 5/3 — the Schur complement 2 − 1·⅓·1. Deleting the row instead
+    // keeps (H⁻¹)₀₀ = 2 and a decrement of 1.0, which this pins against.
+    let g = nalgebra::DVector::from_vec(vec![1.0, 1.0]);
+    let h_inv = nalgebra::DMatrix::from_row_slice(2, 2, &[2.0, 1.0, 1.0, 3.0]);
+    let r = stationarity_reading(&g, &h_inv, &[false, true]).expect("finite input");
+    assert!((r.decrement - 5.0 / 6.0).abs() < 1e-15, "{r:?}");
+    assert_eq!(r.step_se[1], 0.0, "a held coordinate takes no step");
+    let want = (5.0 / 3.0) / (10.0f64 / 3.0).sqrt();
+    assert!((r.step_se[0] - want).abs() < 1e-15, "{r:?}");
+    // Every coordinate held: nothing can move, so nothing is predicted.
+    let all = stationarity_reading(&g, &h_inv, &[true, true]).expect("finite input");
+    assert_eq!(all.decrement, 0.0);
+    assert_eq!(all.step_se, vec![0.0, 0.0]);
+}
+
+#[test]
+fn the_reading_makes_no_claim_on_non_finite_input() {
+    let h_inv = nalgebra::DMatrix::from_row_slice(2, 2, &[2.0, 1.0, 1.0, 3.0]);
+    for bad in [f64::NAN, f64::INFINITY] {
+        let g = nalgebra::DVector::from_vec(vec![bad, 1.0]);
+        assert_eq!(
+            stationarity_reading(&g, &h_inv, &[false, false]),
+            None,
+            "g {bad}"
+        );
+        let g = nalgebra::DVector::from_vec(vec![1.0, 1.0]);
+        let h = nalgebra::DMatrix::from_row_slice(2, 2, &[2.0, bad, bad, 3.0]);
+        assert_eq!(
+            stationarity_reading(&g, &h, &[false, false]),
+            None,
+            "H⁻¹ {bad}"
+        );
+    }
+}
+
+#[test]
+fn a_coordinate_is_held_only_on_a_bound_its_descent_leaves_the_box_through() {
+    let (lo, hi) = (vec![-1.0; 6], vec![1.0; 6]);
+    // 0: on the upper bound, descent (−g > 0) outward → held.
+    // 1: on the upper bound, descent inward → free.
+    // 2: on the lower bound, descent outward → held.
+    // 3: interior with a large slope → free.
+    // 4: within the 1e-8 round-trip tolerance of the upper bound, descent outward → held.
+    // 5: 1e-6 inside the upper bound — a real interior point — descent outward → free.
+    let x = [1.0, 1.0, -1.0, 0.0, 1.0 - 1e-10, 1.0 - 1e-6];
+    let g = [-5.0, 5.0, 5.0, 5.0, -5.0, -5.0];
+    assert_eq!(
+        held_at_bound(&x, &g, &lo, &hi),
+        vec![true, false, true, false, true, false]
+    );
+    // An unbounded coordinate is never held.
+    let inf = [f64::INFINITY];
+    assert_eq!(
+        held_at_bound(&[1e300], &[-1.0], &[-1e300], &inf),
+        vec![false]
+    );
+}
+
+#[test]
+fn the_largest_steps_come_first_and_a_held_coordinate_is_never_named() {
+    let steps = [0.5, -4.0, 0.0, 2.0, f64::NAN];
+    // NaN first (no positive curvature: the coordinate the reader most needs), then by |z|;
+    // the held coordinate (exactly 0) is skipped.
+    let got = largest_newton_steps(&steps, 3);
+    assert_eq!(got.len(), 3);
+    assert_eq!(got[0].0, 4);
+    assert!(got[0].1.is_nan());
+    assert_eq!(&got[1..], &[(1, -4.0), (3, 2.0)]);
+    assert_eq!(largest_newton_steps(&[0.0, 0.0], 3), vec![]);
+}
+
+#[test]
+fn the_non_stationary_optimum_warning_says_each_thing_once() {
+    let w = format_non_stationary_optimum_warning(
+        EstimationMethod::FoceI,
+        12.5,
+        &[
+            ("theta[CL]".to_string(), 3.25),
+            ("theta[WT_V]".to_string(), -1.04),
+        ],
+    );
+    // The token and the demotion, which `classify_warning` and the strictness gate key on.
+    assert!(
+        w.starts_with("W_NON_STATIONARY_OPTIMUM: the FOCEI estimate"),
+        "{w}"
+    );
+    assert!(w.contains("not reported as converged"), "{w}");
+    // The decrement and its distance in SEs (√12.5 = 3.54), and the threshold.
+    assert!(
+        w.contains("by an estimated 12.500 units, about 3.5 standard errors"),
+        "{w}"
+    );
+    assert!(
+        w.contains("fails above 1.0 OFV unit, one standard error"),
+        "{w}"
+    );
+    // The coordinates, as the move a minimiser makes: −δ/SE.
+    assert!(
+        w.contains("in standard errors: theta[CL] -3.2, theta[WT_V] +1.0."),
+        "{w}"
+    );
+    assert!(
+        w.contains("standard errors taken on the objective's slope"),
+        "{w}"
+    );
+    assert!(w.contains("Restart the fit from these estimates"), "{w}");
+    let entry = classify_warning(&w);
+    assert_eq!(entry.severity, WarningSeverity::Critical, "{w}");
+    assert_eq!(entry.category, WarningCode::Convergence, "{w}");
+
+    // No coordinate to name: the sentence goes, the rest stays.
+    let bare = format_non_stationary_optimum_warning(EstimationMethod::Foce, 2.0, &[]);
+    assert!(!bare.contains("Newton steps, in standard errors"), "{bare}");
+    assert!(bare.contains("the FOCE estimate"), "{bare}");
+    assert!(bare.contains("not reported as converged"), "{bare}");
+}

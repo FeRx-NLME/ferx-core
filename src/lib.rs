@@ -3,6 +3,7 @@ pub mod build_info;
 pub mod cancel;
 #[cfg(feature = "survival")]
 pub mod categorical;
+pub(crate) mod cold_sort;
 pub mod diagnostics;
 pub(crate) mod dosing;
 pub mod edit;
@@ -15,6 +16,7 @@ pub mod markov;
 pub mod model_selection;
 pub mod nn;
 pub mod ode;
+pub(crate) mod par;
 pub mod parser;
 pub mod pk;
 pub mod propensity_match;
@@ -82,6 +84,16 @@ pub use types::*;
 pub use api::{
     predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
     SurvivalPredictionOutput, SurvivalPredictionResult,
+};
+// VPC of a repeated-events endpoint: mean cumulative function and Kaplan–Meier by
+// event order (#1886).
+#[cfg(feature = "survival")]
+pub use api::{vpc_rtte, RtteMcfBand, RtteOrderBand, RtteVpc, RtteVpcStratum, VpcRtteOptions};
+// Kaplan–Meier VPC of a single-event TTE endpoint (#1886).
+#[cfg(feature = "survival")]
+pub use api::{
+    vpc_tte, TteVpc, TteVpcStratum, VpcCensoring, VpcGrid, VpcStratify, VpcTteOptions,
+    VPC_TTE_MAX_STRATA,
 };
 
 /// Positive proof that the `debug_assert!` guards in this crate are LIVE

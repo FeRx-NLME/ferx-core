@@ -38,6 +38,7 @@
 //! one fit; the counts in [`GaOutcome`] are of *proposals*, the oracle knows
 //! how many were new.
 
+use crate::cold_sort::ColdSort;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use serde::Deserialize;
@@ -288,7 +289,7 @@ pub fn run(
         // ── the next generation ─────────────────────────────────────────
         let shared = shared_fitness(&population, &fitness, options);
         let mut order: Vec<usize> = (0..population.len()).collect();
-        order.sort_by(|a, b| fitness[*a].total_cmp(&fitness[*b]));
+        order.cold_sort_by(&|a, b| fitness[*a].total_cmp(&fitness[*b]));
         let mut next: Vec<Genome> = order[..elites]
             .iter()
             .map(|i| population[*i].clone())
@@ -466,7 +467,7 @@ fn mutate(g: &mut Genome, alleles: &[usize], p: f64, rng: &mut StdRng) {
 /// `niche_radius` apart, greedily by fitness — the downhill seeds.
 fn niche_seeds(population: &[Genome], fitness: &[f64], options: &GaOptions) -> Vec<usize> {
     let mut order: Vec<usize> = (0..population.len()).collect();
-    order.sort_by(|a, b| fitness[*a].total_cmp(&fitness[*b]));
+    order.cold_sort_by(&|a, b| fitness[*a].total_cmp(&fitness[*b]));
     let mut seeds: Vec<usize> = Vec::new();
     for i in order {
         if seeds.len() >= options.niches {

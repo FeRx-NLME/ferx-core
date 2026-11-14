@@ -2513,10 +2513,17 @@ fn sde_imh_proposal_is_the_exact_objective_s() {
     let (want, without) = (prec(&p_obs), prec(&[]));
     let got = &prop.chol_l * prop.chol_l.transpose();
     let rel = |a: &DMatrix<f64>, b: &DMatrix<f64>| (a - b).norm() / b.norm();
+    assert!(
+        p_plan
+            .iter()
+            .zip(&p_obs)
+            .all(|(a, b)| a.is_finite() && b.is_finite()),
+        "non-finite precision"
+    );
     let worst_p = p_plan
         .iter()
         .zip(&p_obs)
-        .fold(0.0f64, |w, (a, b)| w.max((a - b).abs() / b.abs()));
+        .fold(0.0f64, |w, (a, b)| w.max((a - b).abs() / b.abs())); // nan-ok: operands asserted finite above; b is a positive precision entry
     let step = g
         .dot(&want.clone().cholesky().expect("SPD").solve(&g))
         .sqrt();

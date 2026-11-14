@@ -16,7 +16,7 @@ use super::spec::{
     SigmaDecl, StructuralEngine, StructuralSpec, ThetaDecl, TimeVaryingDecl,
 };
 use super::ModelText;
-use crate::types::{FitResult, PkModel};
+use crate::types::{DoseAttr, FitResult, PkModel};
 
 // ── Line grammars ───────────────────────────────────────────────────────────
 //
@@ -1742,6 +1742,39 @@ pub(crate) fn mentions(expr: &str, name: &str) -> bool {
 
 // ── Declaration pruning ─────────────────────────────────────────────────────
 
+/// How a model's doses reach its engine, which fixes what the engine reads by
+/// name. A compartment-free model (#811) and an endpoint-only one have no route:
+/// nothing is dosed, so `F1` or `D2` there is an ordinary name, unused if unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoseRoute {
+    /// `pk NAME(...)`.
+    Analytic,
+    /// `ode(...)` or `ode_template NAME(...)`.
+    Ode,
+}
+
+impl DoseRoute {
+    fn of(text: &ModelText) -> Option<DoseRoute> {
+        text.block_lines("structural_model").iter().find_map(|l| {
+            match l.split(['(', ' ', '\t']).next() {
+                Some("pk") => Some(DoseRoute::Analytic),
+                Some("ode" | "ode_template") => Some(DoseRoute::Ode),
+                _ => None,
+            }
+        })
+    }
+
+    /// Whether the engine reads the `[individual_parameters]` name `name`
+    /// without any equation mentioning it. The bare `F`/`lagtime`/`alag` count
+    /// on the ODE route only: on an analytic model the `pk` line's `f=` /
+    /// `lagtime=` role *is* the reference, and a parameter the line does not
+    /// bind really is unused.
+    fn reads_by_name(self, name: &str) -> bool {
+        let is_ode = self == DoseRoute::Ode;
+        (is_ode && is_ode_reserved_name(name)) || DoseAttr::is_read_by_name(name, is_ode)
+    }
+}
+
 /// Delete `theta` / `omega` declarations and `[individual_parameters]`
 /// assignments that nothing references any more, to a fixed point.
 ///
@@ -1758,7 +1791,8 @@ pub(crate) fn mentions(expr: &str, name: &str) -> bool {
 /// occurrences would keep an orphaned `Q` forever. Instead the live set starts
 /// at the blocks that *consume* parameters — `[structural_model]`, `[odes]`,
 /// `[scaling]`, `[error_model]`, everything that is not itself a declaration —
-/// and grows through the declarations those reach.
+/// plus the dose attributes the engine reads by name ([`DoseRoute`]) — and grows
+/// through the declarations those reach.
 ///
 /// # Errors
 ///
@@ -1842,21 +1876,22 @@ fn prune_unreferenced(text: &mut ModelText) -> Result<(), String> {
     }
     let mut live = text.identifiers_excluding(&declaration_lines);
 
-    // An ODE model's engine reads bioavailability and the absorption lag off
-    // an `[individual_parameters]` *name* (`ode_param_slots`), not off any
-    // equation, so `F = TVF` / `lagtime = TLAG` is referenced by nothing
-    // textual and would otherwise be pruned as dead — silently taking the
-    // dose attribute, its θ and its η with it. Root those names, and only
-    // where they carry that meaning: on an analytic model the `pk` line's
-    // `f=` / `lagtime=` role *is* the reference, and a parameter the line
-    // does not bind really is unused.
-    if !text
-        .block_lines("structural_model")
-        .iter()
-        .any(|l| l.starts_with("pk "))
-    {
+    // The engine reads some dose attributes off an `[individual_parameters]`
+    // *name*, not off any equation, so `F = TVF` / `D1 = TVD1 * exp(KAPPA_D1)` is
+    // referenced by nothing textual and would otherwise be pruned as dead —
+    // silently taking the attribute, its θ and its η with it. Root those names,
+    // and only where they carry that meaning (`DoseRoute::reads_by_name`).
+    //
+    // This is decided without the dataset, which the edit layer never sees, so a
+    // `D1` no `RATE=-2` record consults is kept too. That is the side to err on:
+    // an edit that keeps an inert parameter leaves the count where the author put
+    // it, and one that deletes a live `D1` makes every coded dose unfittable (#2789).
+    //
+    // Only an `[individual_parameters]` assignment can be one: a θ, ω or κ that
+    // happens to be called `D1` is not what the engine looks up.
+    if let Some(route) = DoseRoute::of(text) {
         for d in &decls {
-            if is_ode_reserved_name(&d.name) {
+            if individual.contains(&d.span.start) && route.reads_by_name(&d.name) {
                 live.insert(d.name.clone());
             }
         }

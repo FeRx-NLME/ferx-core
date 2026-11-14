@@ -2283,6 +2283,7 @@ fn joint_pktte_serves_ss_gaussian_rows_and_the_ss_hazard() {
         for interaction in [true, false] {
             let w = super::tests::fd_oracle(&m, s, interaction);
             eprintln!("joint PK-TTE SS {label} interaction={interaction}: worst {w:.2e}");
+            assert!(w.is_finite(), "{label} interaction={interaction}: {w}");
             worst = worst.max(w);
         }
     }

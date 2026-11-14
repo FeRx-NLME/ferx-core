@@ -1041,6 +1041,8 @@ pub fn run_vi(
             0,
             crate::estimation::inner_optimizer::InnerHessianSeed::None,
             options,
+            // Variational means, no solve's; inert anyway without restarts or a seed.
+            crate::estimation::inner_optimizer::PrevEtas::Placeholder,
         );
 
     // Judged on the run that actually happened, not on the `vi_iters` ceiling — under
@@ -1190,6 +1192,8 @@ pub fn run_vi(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum: _,
     } = cov_out;
     warnings.extend(cov_warnings);
 
@@ -1285,6 +1289,9 @@ pub fn run_vi(
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
         mixture_posteriors: None,
+        newton_decrement,
+        optimizer_stop: None,
+        eval_budget_spent: false,
     })
 }
 

@@ -73,10 +73,10 @@
 //! which is the entire cost. Dimensionality is therefore bounded by [`MAX_AGQ_GRID`]
 //! instead, and a sparse (Smolyak) rule is the real answer for `d = 5..8` (issue #251).
 
+use crate::cold_sort::ColdSort;
 use crate::sens::ode_provider::adjoint::ModeOut;
 use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 
@@ -177,7 +177,7 @@ pub(crate) fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
         .collect();
     // Ascending node order: the grid is then deterministic and reproducible run to run,
     // independent of whatever order the eigensolver happened to converge in.
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("GH nodes are finite"));
+    pairs.cold_sort_by(&|a, b| a.0.partial_cmp(&b.0).expect("GH nodes are finite"));
     pairs.into_iter().unzip()
 }
 
@@ -674,10 +674,8 @@ fn agq_subject_evaluate(
     // normalization term algebraically.
     if nodes.len() == 1 && laplace_one_point_fast_enabled() {
         let reusable_nll = terminal_mode_nll.filter(|_| laplace_mode_nll_reuse_enabled());
-        let mode_nll = reusable_nll.map_or_else(
-            || stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule),
-            |nll| nll,
-        );
+        let mode_nll = reusable_nll
+            .unwrap_or_else(|| stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule));
         let nll = mode_nll + 0.5 * proposal.log_det_inv_scale;
         return if nll.is_finite() {
             nll
@@ -926,11 +924,10 @@ fn agq_population_nll_impl(
         uncached_log_weights = weights.iter().map(|w| w.ln()).collect::<Vec<_>>();
         &uncached_log_weights
     };
-    let per_subject: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subject: Vec<f64> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
@@ -949,7 +946,7 @@ fn agq_population_nll_impl(
                 terminal_work.map(|all| all[i].1),
             )
         })
-        .collect();
+    };
     per_subject.iter().sum()
 }
 
@@ -1050,11 +1047,10 @@ fn agq_population_evaluate_impl(
     let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
 
     let exact_anchor = matches!(anchor, HessianAnchor::Exact);
-    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
@@ -1095,7 +1091,7 @@ fn agq_population_evaluate_impl(
             );
             (nll, score, mode)
         })
-        .collect();
+    };
     let nll = per_subject.iter().map(|(nll, _, _)| nll).sum();
     let gradient = per_subject.iter().try_fold(
         vec![0.0; x.len()],
@@ -1397,11 +1393,8 @@ impl<'a> SubjectScoreContext<'a> {
             if self.fixed[k] {
                 continue;
             }
-            let floor = crate::estimation::parameterization::fd_step_floor(
-                self.template,
-                &self.model.default_params,
-                k,
-            );
+            let floor =
+                crate::estimation::parameterization::fd_step_floor(self.template, self.model, k);
             let h = crate::estimation::parameterization::fd_step(1e-4, self.x[k], floor);
             let mut xp = self.x.to_vec();
             let mut xm = self.x.to_vec();
@@ -1458,11 +1451,10 @@ pub(crate) fn population_gradient_mixed(
     let want_eta_dx = eta_dx.as_ref().is_some_and(|s| s.want_dx);
     let want_hessian = want_eta_dx && matches!(options.hessian_anchor(), HessianAnchor::Exact);
     let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
-    let scores: Vec<_> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let scores: Vec<_> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let mut mode = ModeOut {
                 want_dx: want_eta_dx,
                 want_hessian,
@@ -1477,7 +1469,7 @@ pub(crate) fn population_gradient_mixed(
             );
             (score, mode)
         })
-        .collect();
+    };
     let mut result = vec![0.0; x.len()];
     let mut per = Vec::with_capacity(scores.len());
     let mut hessians = Vec::with_capacity(scores.len());
@@ -1543,18 +1535,17 @@ pub fn agq_population_gradient(
     let _ = params;
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
-    let per_subject: Vec<Option<Vec<f64>>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subject: Vec<Option<Vec<f64>>> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
             let mut g = vec![0.0f64; n_packed];
             agq_subject_packed_gradient(model, subject, &pt, &b_hat, n_nodes, anchor, &mut g)
                 .map(|()| g)
         })
-        .collect();
+    };
 
     let mut out = vec![0.0f64; n_packed];
     for g in per_subject {

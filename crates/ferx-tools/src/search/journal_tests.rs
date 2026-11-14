@@ -168,6 +168,28 @@ fn a_cached_fit_round_trips_and_a_missing_one_is_none() {
 }
 
 #[test]
+fn a_cached_fit_with_a_non_finite_value_still_loads() {
+    // `store_fit` writes a NaN as JSON `null`; a plain `serde_json::from_str`
+    // refused that, turning every fit with an undefined diagnostic into a cache
+    // miss. `load_fit` reads through `FitResult::from_json_str`, which maps it
+    // back to NaN.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let journal = Journal::create(dir.path(), &[]).expect("create");
+    let mut row = record("a", "aa");
+    row.has_fit = true;
+    let mut fit = converged_fit(42.0);
+    fit.ofv = f64::NAN;
+    journal.append(&row, Some(&fit));
+    journal.into_result().expect("no write failure");
+
+    let text = std::fs::read_to_string(fit_path(dir.path(), "aa")).expect("cached fit");
+    assert!(text.contains("\"ofv\":null"), "the NaN is stored as null");
+    let loaded = load_fit(dir.path(), "aa").expect("a NaN no longer makes the fit unreadable");
+    assert!(loaded.ofv.is_nan());
+    assert_eq!(loaded.theta, fit.theta);
+}
+
+#[test]
 fn an_unreadable_cached_fit_is_none_rather_than_a_panic() {
     // The cache is a cache: a corrupt file costs the reused candidate its
     // `FitResult`, never the run.

@@ -60,6 +60,8 @@
 - [ ] Unit test(s) added in the same module (`cargo test --lib` passes)
 - [ ] Regression test added that fails without this fix
 - [ ] No new tests needed (why: `______`)
+- **Same pattern elsewhere** (fixes only): <!-- how you searched the rest of the code for the same defect (sibling callers, twin engines), and what you found -->
+- **Consumers checked**: <!-- per changed `pub` / `pub(crate)` fn or type: reference count (rust-analyzer find-references), callers changed vs deliberately left -->
 
 ## Example (user-facing features only)
 <!-- If this adds or changes any user-visible behaviour (new fit option, new DSL syntax,

@@ -91,19 +91,25 @@ pub(crate) const MAX_CONSECUTIVE_MIN_STEP_CLAMPS: usize = 64;
 ///   re-probed at all and pays nothing.
 /// * **Latency.** A segment that has turned stiff takes hundreds to thousands of steps before
 ///   it exhausts `max_steps`, so 25 steps of delay is noise against the detection it buys.
+///
+/// **The switch is one-way** (#2845): a segment may escalate from the explicit
+/// stepper to a stiff one part-way through, but is never demoted back. Once a segment is on a
+/// stiff stepper it stops being re-probed, so it changes stepper at most once.
+///
+/// Demotion on a single probe reading was what made `auto` carry `rk45`'s error and jitter on
+/// a TMDD model where the stiff steppers are right: the probe read the relaxing tail as
+/// non-stiff, swapped to `rk45`, and integrated the rest of the segment at explicit accuracy —
+/// at a step chosen by a probe counter that runs across segments, so *where* it landed moved
+/// with θ and the objective jittered by a third to a half of the outer optimizer's plateau
+/// window. On that fixture (`ode_reltol = 1e-6`, macOS arm64, as reported on #2845) blocking
+/// only the demotion took the OFV error against a `vern7` reference from -4.7e-3 to -1e-4, the
+/// same as a pinned `rodas4`.
+/// A stiff stepper integrates a non-stiff tail correctly, only at a higher per-step cost, and
+/// the *next* segment is probed afresh at its entry state, so the cost is bounded by one
+/// segment. The one-way rule also replaces the per-segment switch cap #1080 Part C carried
+/// against a trajectory hovering at the threshold: with no way down there is nothing to
+/// oscillate between.
 pub(crate) const AUTO_SWITCH_PROBE_INTERVAL: usize = 25;
-
-/// Stepper changes allowed inside one segment before the driver stops re-probing (#1080
-/// Part C).
-///
-/// A cap rather than a hysteresis band, because the probe is a threshold test on a continuous
-/// quantity: a trajectory that hovers at `|Re λ|max ≈` [`STIFF_RE_LAMBDA_THRESHOLD`] would
-/// otherwise be able to rebuild its stepper on every probe. Bounding the count keeps the worst
-/// case a fixed handful of rebuilds, and a segment that has already changed its mind this many
-/// times has no verdict worth acting on.
-///
-/// [`STIFF_RE_LAMBDA_THRESHOLD`]: crate::ode::stiffness::STIFF_RE_LAMBDA_THRESHOLD
-pub(crate) const MAX_AUTO_SWITCHES_PER_SEGMENT: usize = 8;
 
 /// Dormand-Prince 5(4)'s real-axis stability boundary, used by Hairer's free
 /// stage-based stiffness estimate. The estimate is dimensionless (`h * rho`),
@@ -655,8 +661,8 @@ pub struct OdeSolverStats {
     /// Integrations whose stepper was changed **in place** part-way through, because a
     /// mid-segment re-probe disagreed with the verdict the segment started on (#1080 Part C).
     ///
-    /// One per segment, not per switch — a segment that escalated and later came back down
-    /// counts once. A non-zero value says the segment's stiffness changed while it was being
+    /// The switch is one-way — explicit to stiff, never back (#2845) — so a segment switches at
+    /// most once and this counts escalations reached mid-segment. A non-zero value says the segment's stiffness changed while it was being
     /// integrated, which is the ordinary shape of a binding model after a dose (the fast mode
     /// `KON · C · R` does not exist until drug and target are both present) rather than a
     /// problem in itself. It matters for reading the other counters: the steps before a switch
@@ -1135,6 +1141,29 @@ pub(crate) trait Stepper<T: PkNum> {
     /// override this; returning `None` falls back to the periodic Jacobian probe.
     fn stiffness_indicator(&self, _dt: f64) -> Option<f64> {
         None
+    }
+
+    /// [`Self::attempt`] with the right-hand side's native calls already bound to this
+    /// integration's parameters ([`super::predictions::DirectStep::bind`]): the same values, for
+    /// a stepper that can make use of it. Any other stepper takes [`Self::attempt`].
+    #[allow(clippy::too_many_arguments)]
+    fn attempt_bound(
+        &mut self,
+        _bound: &super::predictions::BoundStep<'_>,
+        rhs: &RhsG<'_, T>,
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        self.attempt(rhs, u, params, t, dt, opts)
+    }
+
+    /// The consecutive attempts of [`plain_attempts`], monomorphised per stepper so the whole
+    /// loop sees the concrete step code.
+    fn burst(&mut self, c: &mut Burst<'_, T>) -> Option<(f64, f64)> {
+        plain_attempts(self, c)
     }
 }
 
@@ -1780,6 +1809,22 @@ impl<T: PkNum> Stepper<T> for PooledRk45<T> {
     fn stiffness_indicator(&self, dt: f64) -> Option<f64> {
         self.get().stiffness_indicator(dt)
     }
+    fn attempt_bound(
+        &mut self,
+        bound: &super::predictions::BoundStep<'_>,
+        rhs: &RhsG<'_, T>,
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        self.get_mut()
+            .attempt_bound(bound, rhs, u, params, t, dt, opts)
+    }
+    fn burst(&mut self, c: &mut Burst<'_, T>) -> Option<(f64, f64)> {
+        self.get_mut().burst(c)
+    }
 }
 
 impl<T: PkNum> Rk45Stepper<T> {
@@ -1844,6 +1889,22 @@ pub(crate) struct DirectCall<'a, T> {
     pub(crate) rhs: &'a RhsG<'a, T>,
 }
 
+impl<T: PkNum> StageRhs<T> for super::predictions::BoundStep<'_> {
+    #[inline(always)]
+    fn call(&self, u: &[T], params: &[T], t: T, du: &mut [T]) {
+        debug_assert_eq!(std::any::TypeId::of::<T>(), std::any::TypeId::of::<f64>());
+        // SAFETY: a `BoundStep` is only handed out at `T = f64` (`registered_direct`).
+        let (uf, pf, duf) = unsafe {
+            (
+                std::slice::from_raw_parts(u.as_ptr().cast::<f64>(), u.len()),
+                std::slice::from_raw_parts(params.as_ptr().cast::<f64>(), params.len()),
+                std::slice::from_raw_parts_mut(du.as_mut_ptr().cast::<f64>(), du.len()),
+            )
+        };
+        self.eval(uf, pf, t.val(), duf)
+    }
+}
+
 impl<T: PkNum> StageRhs<T> for DirectCall<'_, T> {
     #[inline(always)]
     fn call(&self, u: &[T], params: &[T], t: T, du: &mut [T]) {
@@ -1868,8 +1929,27 @@ impl<T: PkNum> Rk45Stepper<T> {
         dt_eff: f64,
         opts: &OdeSolverOptions,
     ) -> f64 {
-        self.stages(rhs, u, params, &StepClock::new(t, dt_eff));
-        self.err_norm(u, dt_eff, opts)
+        let n = self.n;
+        self.attempt_len(n, rhs, u, params, t, dt_eff, opts)
+    }
+
+    /// [`Self::attempt_with`] at a state size the caller passes as a literal, so the stage
+    /// loops are unrolled and index without checks; `n` must be `self.n`.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn attempt_len<R: StageRhs<T> + ?Sized>(
+        &mut self,
+        n: usize,
+        rhs: &R,
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt_eff: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        debug_assert_eq!(n, self.n);
+        self.stages_len(n, rhs, u, params, &StepClock::new(t, dt_eff));
+        self.err_norm_len(n, u, dt_eff, opts)
     }
 
     /// The step's stages and its proposed state `u5` over `clock` — the arithmetic only, no
@@ -1884,6 +1964,19 @@ impl<T: PkNum> Rk45Stepper<T> {
         clock: &StepClock<T>,
     ) {
         let n = self.n;
+        self.stages_len(n, rhs, u, params, clock)
+    }
+
+    #[allow(clippy::needless_range_loop)]
+    #[inline(always)]
+    fn stages_len<R: StageRhs<T> + ?Sized>(
+        &mut self,
+        n: usize,
+        rhs: &R,
+        u: &[T],
+        params: &[T],
+        clock: &StepClock<T>,
+    ) {
         // The Butcher combinations keep the exact association of the original f64 loop
         // (`dt·(B31·k1 + B32·k2)`, not `(dt·B31)·k1 + …`), so instantiating at `T = f64`
         // reproduces the historical trajectory bit for bit.
@@ -1971,30 +2064,28 @@ impl<T: PkNum> Rk45Stepper<T> {
     /// The error estimate (5th − 4th) of the last [`Self::stages`], on values only — the
     /// step sequence must not depend on derivative components.
     #[allow(clippy::needless_range_loop)]
-    pub(crate) fn err_norm(&self, u: &[T], dt_eff: f64, opts: &OdeSolverOptions) -> f64 {
-        rk45_err_norm(
-            self.n,
-            |b, i| self.block(b)[i].val(),
-            |i| u[i].val(),
-            dt_eff,
-            opts,
-        )
+    #[inline(always)]
+    fn err_norm_len(&self, n: usize, u: &[T], dt_eff: f64, opts: &OdeSolverOptions) -> f64 {
+        let blocks = self.blocks_n(n);
+        let u = &u[..n];
+        rk45_err_norm(n, |b, i| blocks[b][i].val(), |i| u[i].val(), dt_eff, opts)
     }
 
-    /// Carried block `b` (the [`StepBody::carried_into`] order: `k1..k7`, `u_tmp`, `u5`).
+    /// Every carried block cut to `n` (the [`StepBody::carried_into`] order), so a loop over
+    /// `0..n` indexes them without bounds checks.
     #[inline(always)]
-    fn block(&self, b: usize) -> &[T] {
-        match b {
-            0 => &self.k1,
-            1 => &self.k2,
-            2 => &self.k3,
-            3 => &self.k4,
-            4 => &self.k5,
-            5 => &self.k6,
-            6 => &self.k7,
-            7 => &self.u_tmp,
-            _ => &self.u5,
-        }
+    fn blocks_n(&self, n: usize) -> [&[T]; 9] {
+        [
+            &self.k1[..n],
+            &self.k2[..n],
+            &self.k3[..n],
+            &self.k4[..n],
+            &self.k5[..n],
+            &self.k6[..n],
+            &self.k7[..n],
+            &self.u_tmp[..n],
+            &self.u5[..n],
+        ]
     }
 }
 
@@ -2133,8 +2224,186 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     }
 
     fn stiffness_indicator(&self, dt: f64) -> Option<f64> {
-        rk45_stiffness(self.n, |b, i| self.block(b)[i].val(), dt)
+        let blocks = self.blocks_n(self.n);
+        rk45_stiffness(self.n, |b, i| blocks[b][i].val(), dt)
     }
+
+    fn attempt_bound(
+        &mut self,
+        bound: &super::predictions::BoundStep<'_>,
+        _rhs: &RhsG<'_, T>,
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt_eff: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        // The common small state sizes get their own copy of the step with `n` a literal.
+        match self.n {
+            1 => self.attempt_len(1, bound, u, params, t, dt_eff, opts),
+            2 => self.attempt_len(2, bound, u, params, t, dt_eff, opts),
+            3 => self.attempt_len(3, bound, u, params, t, dt_eff, opts),
+            4 => self.attempt_len(4, bound, u, params, t, dt_eff, opts),
+            _ => self.attempt_with(bound, u, params, t, dt_eff, opts),
+        }
+    }
+}
+
+/// The input and carried state of [`plain_attempts`]: one segment's step loop, lent for a run of
+/// attempts. Plain fields, copied into locals at entry and written back at exit.
+pub(crate) struct Burst<'a, T> {
+    pub(crate) bound: &'a super::predictions::BoundStep<'a>,
+    pub(crate) rhs: &'a RhsG<'a, T>,
+    pub(crate) params: &'a [T],
+    pub(crate) opts: &'a OdeSolverOptions,
+    pub(crate) saveat: &'a [f64],
+    pub(crate) interp_at: &'a [f64],
+    pub(crate) interp_idx: usize,
+    pub(crate) tf: f64,
+    pub(crate) err_exp: f64,
+    pub(crate) u: &'a mut [T],
+    pub(crate) t: f64,
+    pub(crate) dt: f64,
+    pub(crate) steps_left: usize,
+    pub(crate) save_idx: usize,
+    pub(crate) results: &'a mut Vec<SolPointG<T>>,
+    pub(crate) auto_state: &'a mut OdeAutoSwitchState,
+    pub(crate) accepted_since_probe: usize,
+    /// `auto` may still switch this segment: it is on the explicit stepper, whose stiffness
+    /// stages can ratify a verdict, and the switch is one-way (#2845) — so it alone is probed,
+    /// escalated and counted toward the next probe.
+    pub(crate) on_explicit: bool,
+    pub(crate) attempted: usize,
+    pub(crate) accepted: usize,
+    pub(crate) rejected: usize,
+}
+
+/// The next step's length: not past `tf`, and ending on the next `saveat` time when it falls
+/// inside the step.
+#[inline(always)]
+fn next_dt_eff(dt: f64, t: f64, tf: f64, saveat: &[f64], save_idx: usize, min_dt: f64) -> f64 {
+    let mut dt_eff = dt.min(tf - t);
+    if save_idx < saveat.len() && t + dt_eff > saveat[save_idx] + 1e-15 {
+        dt_eff = (saveat[save_idx] - t).max(min_dt);
+    }
+    dt_eff
+}
+
+/// Consecutive attempts of the step loop that need no decision beyond accept / reject, run in
+/// one small frame so the step state stays in registers: the common accepted or rejected step
+/// is committed and the controller applied exactly as [`integrate_dense_g`] does for it.
+///
+/// Returns at the first attempt that needs the driver — an unusable one, a `min_dt`
+/// force-accept, a step that crosses an `interp_at` time, a periodic or ratified stiffness
+/// verdict — *without having committed it*: `Some((dt_eff, err_norm))` is that attempt's result,
+/// for the driver to finish. `None` means the segment ended or the step budget ran out.
+#[inline(always)]
+fn plain_attempts<T: PkNum, S: Stepper<T> + ?Sized>(
+    s: &mut S,
+    c: &mut Burst<'_, T>,
+) -> Option<(f64, f64)> {
+    let (bound, rhs, params, opts) = (c.bound, c.rhs, c.params, c.opts);
+    let (saveat, interp_at, tf, err_exp) = (c.saveat, c.interp_at, c.tf, c.err_exp);
+    let min_dt = opts.min_dt;
+    let (mut t, mut dt, mut save_idx, mut steps) = (c.t, c.dt, c.save_idx, c.steps_left);
+    let mut since_probe = c.accepted_since_probe;
+    let (mut accepted, mut rejected) = (0usize, 0usize);
+    let u: &mut [T] = &mut *c.u;
+    let exit = loop {
+        if steps == 0 || t >= tf - 1e-15 {
+            break None;
+        }
+        steps -= 1;
+        let dt_eff = next_dt_eff(dt, t, tf, saveat, save_idx, min_dt);
+        let err_norm = s.attempt_bound(bound, rhs, u, params, t, dt_eff, opts);
+        if !s.attempt_usable() || (!(err_norm <= 1.0) && dt_eff <= min_dt) {
+            break Some((dt_eff, err_norm));
+        }
+        if err_norm <= 1.0 {
+            let t_new = t + dt_eff;
+            if (interp_idx_due(interp_at, c.interp_idx, t_new))
+                || (c.on_explicit
+                    && since_probe + 1 >= AUTO_SWITCH_PROBE_INTERVAL
+                    && t_new < tf - 1e-15)
+            {
+                break Some((dt_eff, err_norm));
+            }
+            if c.on_explicit {
+                if let Some(ind) = s.stiffness_indicator(dt_eff) {
+                    let kept = *c.auto_state;
+                    if c.auto_state.observe_rk45(ind) {
+                        *c.auto_state = kept;
+                        break Some((dt_eff, err_norm));
+                    }
+                }
+            }
+            t = t_new;
+            copy_state(u, s.u_new());
+            s.on_accept();
+            while save_idx < saveat.len() && (t - saveat[save_idx]).abs() < 1e-12 {
+                c.results.push(SolPointG {
+                    t: saveat[save_idx],
+                    u: u.to_vec(),
+                });
+                save_idx += 1;
+            }
+            since_probe += c.on_explicit as usize;
+            accepted += 1;
+        } else {
+            s.on_reject();
+            rejected += 1;
+        }
+        // Adapt the step (memoryless I-controller).
+        let factor = if !err_norm.is_finite() {
+            NONFINITE_ERR_SHRINK_FACTOR
+        } else if err_norm > 1e-15 {
+            0.9 * err_norm.powf(-err_exp)
+        } else {
+            5.0
+        };
+        dt = (dt_eff * factor.clamp(0.2, 5.0)).max(min_dt);
+    };
+    c.t = t;
+    c.dt = dt;
+    c.save_idx = save_idx;
+    c.steps_left = steps;
+    c.accepted_since_probe = since_probe;
+    c.attempted += accepted + rejected;
+    c.accepted += accepted;
+    c.rejected += rejected;
+    exit
+}
+
+/// `dst.copy_from_slice(src)`, with the small state sizes copied inline rather than through a
+/// `memcpy` call.
+#[inline(always)]
+fn copy_state<T: Copy>(dst: &mut [T], src: &[T]) {
+    assert_eq!(dst.len(), src.len());
+    match dst.len() {
+        1 => dst[0] = src[0],
+        2 => {
+            dst[0] = src[0];
+            dst[1] = src[1];
+        }
+        3 => {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+        }
+        4 => {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+            dst[3] = src[3];
+        }
+        _ => dst.copy_from_slice(src),
+    }
+}
+
+/// Whether the next `interp_at` time falls inside a step ending at `t_new`.
+#[inline(always)]
+fn interp_idx_due(interp_at: &[f64], idx: usize, t_new: f64) -> bool {
+    idx < interp_at.len() && interp_at[idx] <= t_new + 1e-12
 }
 
 /// The shared adaptive driver: integrate `t_span`, saving the state at every `saveat` time and
@@ -2228,11 +2497,6 @@ fn integrate_dense_g<T: PkNum>(
     // guard runs pins its method for exactly this reason, so it cannot switch back.
     let switching = opts.method == OdeMethod::Auto && opts.auto_switch;
     let mut accepted_since_probe = auto_state.accepted_since_probe;
-    let mut switches = 0usize;
-    // A segment that starts on a stiff method was counted as an escalation by the caller (the
-    // guard needs that count before the segment runs), so a later switch must not count it
-    // twice — nor may a segment that switches down and back up.
-    let mut escalation_counted = method != OdeMethod::EXPLICIT_FALLBACK;
     // The moving switches (#2649), watched on values (`T = f64`: the prediction, and a
     // recording's run over its lanes). A recorded segment's hook knows how many; otherwise the
     // model's right-hand side says so at its first evaluation (`note_switches`), and a model
@@ -2251,21 +2515,80 @@ fn integrate_dense_g<T: PkNum>(
         du: Vec::new(),
     };
     let mut probe = watch && hook.is_none();
+    // A registered native right-hand side, bound once to this segment's parameters: every
+    // attempt then calls its machine code without re-checking what cannot have changed.
+    let bound = if watch && hook.is_none() {
+        super::rosenbrock::registered_direct(rhs).and_then(|d| {
+            // SAFETY: `registered_direct` serves `T = f64` only.
+            let pf =
+                unsafe { std::slice::from_raw_parts(params.as_ptr().cast::<f64>(), params.len()) };
+            d.bind(pf, n)
+        })
+    } else {
+        None
+    };
     // The switch functions at `(u, t)`, once a step has needed them.
     let mut g_old: Vec<f64> = Vec::new();
 
-    for _step in 0..opts.max_steps {
-        if t >= tf - 1e-15 {
-            break;
+    let mut steps_left = opts.max_steps;
+    while steps_left > 0 {
+        // A run of plain attempts, in a frame of its own; it hands back the first one that
+        // needs this driver, attempted but not committed.
+        let mut pending = None;
+        if let (Some(b), false, 0, 0) = (&bound, probe, sw.k, consecutive_min_step_clamps) {
+            let mut c = Burst {
+                bound: b,
+                rhs,
+                params,
+                opts,
+                saveat,
+                interp_at,
+                interp_idx,
+                tf,
+                err_exp,
+                u: &mut u,
+                t,
+                dt,
+                steps_left,
+                save_idx,
+                results: &mut results,
+                auto_state: &mut *auto_state,
+                accepted_since_probe,
+                on_explicit: switching && method == OdeMethod::EXPLICIT_FALLBACK,
+                attempted: 0,
+                accepted: 0,
+                rejected: 0,
+            };
+            pending = stepper.burst(&mut c);
+            (t, dt, save_idx, steps_left) = (c.t, c.dt, c.save_idx, c.steps_left);
+            accepted_since_probe = c.accepted_since_probe;
+            if let Some(s) = stats.as_deref_mut() {
+                s.attempted_steps += c.attempted;
+                s.accepted_steps += c.accepted;
+                s.rejected_steps += c.rejected;
+            }
+            if pending.is_none() {
+                break;
+            }
+        } else {
+            steps_left -= 1;
+            if t >= tf - 1e-15 {
+                break;
+            }
         }
 
-        // Don't overshoot tf or the next saveat.
-        let mut dt_eff = dt.min(tf - t);
-        if save_idx < saveat.len() && t + dt_eff > saveat[save_idx] + 1e-15 {
-            dt_eff = (saveat[save_idx] - t).max(opts.min_dt);
-        }
-
-        let mut err_norm = stepper.attempt(rhs, &u, params, t, dt_eff, opts);
+        let (dt_eff, mut err_norm) = match pending {
+            Some(p) => p,
+            None => {
+                let dt_eff = next_dt_eff(dt, t, tf, saveat, save_idx, opts.min_dt);
+                let e = match &bound {
+                    Some(b) => stepper.attempt_bound(b, rhs, &u, params, t, dt_eff, opts),
+                    None => stepper.attempt(rhs, &u, params, t, dt_eff, opts),
+                };
+                (dt_eff, e)
+            }
+        };
+        let mut dt_eff = dt_eff;
         let usable = stepper.attempt_usable();
 
         // An unusable attempt at `min_dt` is unrecoverable: the step cannot be shrunk further
@@ -2412,18 +2735,21 @@ fn integrate_dense_g<T: PkNum>(
             // Reads `PkNum::val` only, like every other comparison a driver makes, so the
             // `T = f64` prediction and the `T = Dual2` sensitivity solve switch at the same
             // step and the analytic gradient keeps differentiating the reported trajectory.
-            if switching {
+            //
+            // One-way (#2845, see `AUTO_SWITCH_PROBE_INTERVAL`): only a segment
+            // still on the explicit stepper is re-probed or counted toward the next probe, so a
+            // stiff segment is never demoted back to `rk45` on a single probe reading.
+            let on_explicit = switching && method == OdeMethod::EXPLICIT_FALLBACK;
+            if on_explicit {
                 accepted_since_probe += 1;
             }
-            let stage_escalation = switching
-                && switches < MAX_AUTO_SWITCHES_PER_SEGMENT
-                && method == OdeMethod::EXPLICIT_FALLBACK
+            let stage_escalation = on_explicit
                 && stiffness_indicator.is_some_and(|indicator| auto_state.observe_rk45(indicator));
             // A verdict ratified by the step that reaches `tf` belongs to the next interval:
             // there is no remaining span for a replacement stepper to integrate here. Leave
             // it in `auto_state` so `integrate_resolved_g_inner` can consume it at the next
             // non-zero segment instead of reporting a switch that never took a step.
-            if switching && t < tf - 1e-15 && switches < MAX_AUTO_SWITCHES_PER_SEGMENT {
+            if on_explicit && t < tf - 1e-15 {
                 let periodic_probe = accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL;
                 let verdict = if stage_escalation {
                     Some(super::stiffness::stiff_method_for(opts))
@@ -2435,35 +2761,28 @@ fn integrate_dense_g<T: PkNum>(
                 if periodic_probe {
                     accepted_since_probe = 0;
                 }
+                // Only an escalation can pass this filter: the segment is on the explicit
+                // stepper here, and both verdicts are either it or a stiff method.
                 if let Some(verdict) = verdict.filter(|&verdict| verdict != method) {
                     method = verdict;
                     stepper = make_stepper::<T>(n, method);
                     stepper.set_dense_required(!interp_at.is_empty());
                     err_exp = stepper.err_exp();
-                    // Both counters are per *segment*, however many times it changes its mind.
                     // An escalation is an escalation whether the probe reached that verdict at
                     // the entry state or twenty-five steps in, so a switch onto a stiff method
                     // joins `auto_stiff_segments` too — which is what keeps the guard's "N of M
                     // escalations were discarded" count adding up. A segment that started stiff
-                    // was already counted by the caller.
-                    let newly_escalated =
-                        !escalation_counted && method != OdeMethod::EXPLICIT_FALLBACK;
+                    // was counted by the caller, and never reaches this switch.
                     if let Some(s) = stats.as_deref_mut() {
-                        if switches == 0 {
-                            s.auto_switched_segments += 1;
-                        }
-                        if newly_escalated {
-                            s.auto_stiff_segments += 1;
-                        }
+                        s.auto_switched_segments += 1;
+                        s.auto_stiff_segments += 1;
                     }
-                    escalation_counted |= newly_escalated;
-                    switches += 1;
                     auto_state.reset_rk45_verdict();
                     // The new stepper gets the whole abort budget. `stiff_abort_after` bounds
                     // how long *a method* is allowed to grind on a segment it cannot step, and
                     // the method just changed; the clamps behind this point measured the one
-                    // that was replaced. Bounded by `MAX_AUTO_SWITCHES_PER_SEGMENT`, so the
-                    // worst case is that many budgets rather than an unbounded reprieve.
+                    // that was replaced. The switch is one-way, so this is at most one extra
+                    // budget per segment.
                     min_step_clamps = 0;
                 }
             }
@@ -2910,7 +3229,6 @@ fn until_threshold_with(
     // and is integrated badly does not merely cost accuracy in a prediction.
     let switching = opts.method == OdeMethod::Auto && opts.auto_switch;
     let mut accepted_since_probe = 0usize;
-    let mut switches = 0usize;
     let mut ran_stiff = method != OdeMethod::EXPLICIT_FALLBACK;
 
     for _step in 0..opts.max_steps {
@@ -2999,10 +3317,11 @@ fn until_threshold_with(
             // driver's loop: read the same discriminator at the state just reached and swap the
             // stepper in place when it disagrees. Taken after the crossing test, so a step that
             // both advances and brackets the crossing still returns through the interpolant of
-            // the stepper that produced it.
+            // the stepper that produced it. One-way, as there (#2845): a span already on a
+            // stiff stepper is not re-probed, so it is never demoted back to `rk45`.
             accepted_since_probe += 1;
             if switching
-                && switches < MAX_AUTO_SWITCHES_PER_SEGMENT
+                && method == OdeMethod::EXPLICIT_FALLBACK
                 && accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL
             {
                 accepted_since_probe = 0;
@@ -3013,7 +3332,6 @@ fn until_threshold_with(
                     stepper.set_dense_required(true);
                     err_exp = stepper.err_exp();
                     ran_stiff |= method != OdeMethod::EXPLICIT_FALLBACK;
-                    switches += 1;
                     // Fresh abort budget for the new stepper — see `integrate_dense_g`.
                     clamps = 0;
                 }
@@ -3363,6 +3681,24 @@ pub(crate) fn note_linear_declines(n: usize) {
     }
 }
 
+/// `NaN` in every component, jets included, at every `saveat` and `interp_at` time: what a
+/// segment entered with a non-finite state returns without stepping (#2788). `v · NaN`, as in
+/// `integrate_dense_g`'s diverged tail, so a dual's gradient and Hessian block are `NaN` too.
+fn nan_trajectory<T: PkNum>(
+    u0: &[T],
+    saveat: &[f64],
+    interp_at: &[f64],
+) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
+    let nan: Vec<T> = u0.iter().map(|&v| v * T::from_f64(f64::NAN)).collect();
+    let at = |times: &[f64]| -> Vec<SolPointG<T>> {
+        times
+            .iter()
+            .map(|&t| SolPointG { t, u: nan.clone() })
+            .collect()
+    };
+    (at(saveat), at(interp_at))
+}
+
 /// [`integrate_resolved_g_inner`] with the thread-local [`SolverStatsScope`] tee.
 ///
 /// Off the diagnostic path this is one `Cell` read per segment and the same call as before.
@@ -3441,6 +3777,31 @@ fn integrate_resolved_g_inner<T: PkNum>(
     mut stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
+    // A segment handed a non-finite state has nothing to integrate (#2788). Every stepper
+    // couples the components through `u`, so its error norm is `NaN` from the first attempt:
+    // the step shrinks to `min_dt`, force-accepts `MAX_CONSECUTIVE_MIN_STEP_CLAMPS` times and
+    // stops diverged with a `NaN` tail (#1539) — after a stiffness probe that may have put it on
+    // an implicit stepper and the escalation guard's explicit re-solve on top. The exact linear
+    // path declines it at its self-check first. That is the same all-`NaN` result at the cost
+    // of hundreds of RHS evaluations, and an inner line search probing an absurd η reaches it
+    // on every later segment of the subject: measured on the melphalan 2-cpt model at a FOCEI
+    // plateau, 64% of the declined linear segments started all-`NaN`. Return that result
+    // directly, counted as the stepper counted it — an unfinished segment that diverged — so
+    // the fit's `ode_solver` warning reads the same. A zero-length span is left alone: no
+    // stepper runs there, and it returns `u0` as it was.
+    if (t_span.1 - t_span.0).abs() >= 1e-15
+        && u0.iter().any(|&v| {
+            // A recordable test (`val` would fail a recording), `false` on `NaN`.
+            use crate::sens::num::BranchCmp::{Gt, Lt};
+            !(v.br_cmp_c(Gt, f64::NEG_INFINITY) && v.br_cmp_c(Lt, f64::INFINITY))
+        })
+    {
+        if let Some(s) = stats.as_deref_mut() {
+            s.unfinished_segments += 1;
+            s.diverged_segments += 1;
+        }
+        return nan_trajectory(u0, saveat, interp_at);
+    }
     // A certified-linear model's segment is propagated exactly (#852). Every integration entry
     // point funnels through here, so the dense segments, the steady-state run-in cycles and the
     // `Dual2`/`Dual2` sensitivity solves all take the same exact path without being threaded
@@ -3902,11 +4263,7 @@ mod tests {
             assert_eq!(effective_solver_options(baked).reltol, 1e-11);
             // ...including inside a nested fan-out, which is where the real integrations
             // happen.
-            use rayon::prelude::*;
-            let seen: Vec<f64> = (0..8)
-                .into_par_iter()
-                .map(|_| effective_solver_options(baked).reltol)
-                .collect();
+            let seen: Vec<f64> = crate::par::map(8, |_| effective_solver_options(baked).reltol);
             assert!(
                 seen.iter().all(|&r| r == 1e-11),
                 "a worker of the override pool integrated at the baked tolerance: {seen:?}"
@@ -5545,15 +5902,14 @@ mod tests {
         assert!(stats.unfinished_segments >= stats.diverged_segments);
     }
 
-    /// T2: the tail fill also covers a segment that **enters** already non-finite — the
-    /// post-dose segment after a divergence — so no separate entry check exists. Two legs, each
-    /// stopping by a different break: the non-finite clamp break (default options), and
-    /// `ode_stiff_abort_after`, which fires before the clamp break can. A stop on a non-finite
-    /// state is a divergence whatever break took it, and is not counted as a budgeted abort.
+    /// T2: a segment that **enters** already non-finite — the post-dose segment after a
+    /// divergence — comes back `NaN` in every component and is counted as a divergence, not as
+    /// a budgeted abort, under the default options and under `ode_stiff_abort_after`. Since
+    /// #2788 it is not stepped at all (`a_non_finite_entry_state_is_not_integrated`); the two
+    /// legs pin that the entry guard keeps the counts the stepper's breaks produced.
     ///
-    /// Engine: `integrate_dense_g` at `T = f64`, through `solve_ode_with_stats`. Mutation that
-    /// reddens it: pad with `NaN` only when the break was the non-finite clamp break (the
-    /// budget leg).
+    /// Engine: `integrate_resolved_g_inner`'s entry guard at `T = f64`, through
+    /// `solve_ode_with_stats`. Mutation that reddens it: drop the guard's stats record.
     #[test]
     fn the_nan_tail_covers_a_segment_that_enters_non_finite() {
         for (label, budget) in [("clamp break", None), ("stiff_abort_after", Some(2))] {
@@ -5933,5 +6289,134 @@ mod tests {
         );
         let bare = run(&falling, None);
         assert!(bare.starts_with("monitored state 0 decreased ("), "{bare}");
+    }
+
+    /// A segment entered with a non-finite state returns `NaN` at every save and interpolation
+    /// time without evaluating the RHS once (#2788): no stiffness probe, no stepper, no linear
+    /// extraction. Before, an all-`NaN` entry paid the probe, `MAX_CONSECUTIVE_MIN_STEP_CLAMPS`
+    /// forced steps and, on an escalation, the explicit re-solve too — 64% of the linear
+    /// segments the melphalan FOCEI plateau declined to the adaptive stepper.
+    ///
+    /// Every method, because the guard sits above the one place they diverge; a partly
+    /// non-finite state too, which the steppers already turned into an all-`NaN` tail (#1539).
+    /// The finite control pins that the counter can see a solve, so `0` is not vacuous; the
+    /// zero-length span pins the gate's other side, where `u0` comes back untouched.
+    ///
+    /// Mutation (run): delete the guard — every non-finite arm reports RHS calls and attempted
+    /// steps. The counts it records are pinned by `the_nan_tail_covers_a_segment_that_enters_non_finite`.
+    #[test]
+    fn a_non_finite_entry_state_is_not_integrated() {
+        use std::cell::Cell;
+        let calls = Cell::new(0usize);
+        // A stiff two-compartment generator, so `auto` would escalate.
+        let rhs = |u: &[f64], p: &[f64], _t: f64, du: &mut [f64]| {
+            calls.set(calls.get() + 1);
+            du[0] = -p[0] * u[0] + p[1] * u[1];
+            du[1] = p[0] * u[0] - p[1] * u[1];
+        };
+        let params = [1e6, 2.0];
+        let saveat = [0.5, 1.0];
+        let interp = [0.25];
+        for method in [
+            OdeMethod::Auto,
+            OdeMethod::Rk45,
+            OdeMethod::Rodas4,
+            OdeMethod::Linear,
+        ] {
+            let opts = OdeSolverOptions {
+                method,
+                ..OdeSolverOptions::default()
+            };
+            for u0 in [[f64::NAN, f64::NAN], [f64::NAN, 1.0], [f64::INFINITY, 1.0]] {
+                calls.set(0);
+                let mut stats = OdeSolverStats::default();
+                let mut auto_state = OdeAutoSwitchState::default();
+                let (saved, interpolated) = integrate_resolved_g(
+                    &rhs,
+                    &u0,
+                    (0.0, 1.0),
+                    &params,
+                    &saveat,
+                    &interp,
+                    &opts,
+                    Some(&mut stats),
+                    &mut auto_state,
+                );
+                let label = format!("{method:?} from {u0:?}");
+                assert_eq!(calls.get(), 0, "{label}: the RHS was evaluated");
+                let diverged = OdeSolverStats {
+                    unfinished_segments: 1,
+                    diverged_segments: 1,
+                    ..OdeSolverStats::default()
+                };
+                assert_eq!(stats, diverged, "{label}");
+                let times: Vec<f64> = saved.iter().map(|p| p.t).collect();
+                assert_eq!(times, saveat, "{label}");
+                assert_eq!(interpolated.len(), 1, "{label}");
+                assert_eq!(interpolated[0].t, 0.25, "{label}");
+                for p in saved.iter().chain(&interpolated) {
+                    assert!(p.u.iter().all(|v| v.is_nan()), "{label}: {:?}", p.u);
+                }
+            }
+
+            calls.set(0);
+            let mut stats = OdeSolverStats::default();
+            let finite = integrate_resolved_g(
+                &rhs,
+                &[1.0, 0.0],
+                (0.0, 1.0),
+                &params,
+                &saveat,
+                &[],
+                &opts,
+                Some(&mut stats),
+                &mut OdeAutoSwitchState::default(),
+            );
+            assert!(
+                calls.get() > 0,
+                "{method:?}: the control never reached the RHS"
+            );
+            assert!(
+                finite.0.iter().all(|p| p.u.iter().all(|v| v.is_finite())),
+                "{method:?}"
+            );
+
+            let zero_length = integrate_resolved_g(
+                &rhs,
+                &[f64::NAN, 1.0],
+                (1.0, 1.0),
+                &params,
+                &[1.0],
+                &[],
+                &opts,
+                None,
+                &mut OdeAutoSwitchState::default(),
+            );
+            assert!(zero_length.0[0].u[0].is_nan(), "{method:?}");
+            assert_eq!(zero_length.0[0].u[1], 1.0, "{method:?}");
+        }
+    }
+
+    /// The dual instantiation's `NaN` reaches the jets as well as the value, as the diverged
+    /// tail's does (#1539): a constant `NaN` would carry a zero gradient into FOCEI.
+    ///
+    /// Mutation (run): build the result from `T::from_f64(f64::NAN)` — the gradient reads 0.
+    #[test]
+    fn a_non_finite_dual_entry_state_carries_nan_jets() {
+        use crate::sens::dual2::Dual2;
+        let rhs = |u: &[Dual2<1>], p: &[Dual2<1>], _t: f64, du: &mut [Dual2<1>]| {
+            du[0] = -(p[0] * u[0]);
+        };
+        let res = solve_ode_g(
+            &rhs,
+            &[Dual2::<1>::var(f64::NAN, 0)],
+            (0.0, 1.0),
+            &[Dual2::<1>::var(0.1, 0)],
+            &[1.0],
+            &OdeSolverOptions::default(),
+        );
+        assert!(res[0].u[0].value.is_nan());
+        assert!(res[0].u[0].grad[0].is_nan());
+        assert!(res[0].u[0].hess[0][0].is_nan());
     }
 }

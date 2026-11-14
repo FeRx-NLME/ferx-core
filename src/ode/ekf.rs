@@ -3438,9 +3438,8 @@ mod tests {
                 let (fp, fm) = (eval(&up), eval(&um));
                 for i in 0..n {
                     let fd = (fp[i] - fm[i]) / (2.0 * h);
-                    assert!(exact[i * n + j].is_finite());
+                    assert!(exact[i * n + j].is_finite() && fd.is_finite());
                     worst = worst.max((exact[i * n + j] - fd).abs() / (1.0 + fd.abs()));
-                    // nan-ok: finite asserted above
                 }
             }
         }
@@ -3879,15 +3878,16 @@ mod tests {
             for o in 0..n_out {
                 let fd = (fp[o] - fm[o]) / (2.0 * h);
                 assert!(fd.is_finite() && p_bar[o].is_finite(), "{label} output {o}");
+                assert!(want[o].is_finite(), "{label} output {o}");
                 let scale = fd.abs().max(1e-3 * want[o].abs()).max(1e-12);
-                case_worst = case_worst.max((p_bar[o] - fd).abs() / scale); // nan-ok: finite asserted above
+                case_worst = case_worst.max((p_bar[o] - fd).abs() / scale); // nan-ok: operands asserted finite above; scale >= 1e-12
                 if o % 2 == 1 {
-                    moved = moved.max(fd.abs() / want[o].abs().max(1e-12)); // nan-ok: finite asserted above
+                    moved = moved.max(fd.abs() / want[o].abs().max(1e-12));
                 }
             }
             eprintln!("{label}: worst scaled error {case_worst:e}");
-            worst = worst.max(case_worst);
-            // The window is live in the covariance, not only in the mean.
+            worst = worst.max(case_worst); // nan-ok: case_worst folds asserted-finite terms
+                                           // The window is live in the covariance, not only in the mean.
             assert!(moved > 1e-3, "{label}: D does not reach p_obs ({moved:e})");
         }
         eprintln!("recorded EKF moving window vs central FD, worst scaled error: {worst:e}");

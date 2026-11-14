@@ -337,7 +337,8 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
 - An expression argument must reference **exactly one** declared sigma — the one
   whose magnitude it scales.
 - The magnitude may depend only on `TIME`, declared covariates, thetas, and the
-  scaled sigma. It may **not** depend on a random effect (η), on an individual
+  scaled sigma (and on η-free names assigned in `[individual_parameters]`, see
+  [below](#magnitude-indiv-names)). It may **not** depend on a random effect (η), on an individual
   parameter, or on the prediction (`IPRED`/`PRED`/`DV`) — the multiplier must be
   independent of the inner empirical-Bayes loop. `TAD` — the data-derived time
   after dose, steady-state aware, no lag time (#1182) — is available beside
@@ -386,16 +387,65 @@ A bare sigma name keeps the legacy behaviour exactly ($m_k \equiv 1$).
   covariates and `TIME` — including every `weight =` model — has no direct-θ
   channel at all, and keeps the fast closed forms everywhere.
 
-### Not available with adaptive dosing {#magnitude-adaptive}
+### Names assigned in `[individual_parameters]` {#magnitude-indiv-names}
 
-Adaptive dosing (`simulate_adaptive*`) refuses any residual-error magnitude
-(`E_ADAPTIVE_UNSUPPORTED`): a magnitude expression, a
-[`weight =`](#residual-weighting-weight-...), a [`power(...)`](#power) exponent,
-or a magnitude on a `CMT=N:` line. The controller assay draws a `Dv` reading
-from the bare sigma, so the factor would otherwise be dropped from the signal
-while the run reported success (#2741). The refusal applies to every adaptive run
-on such a model, including one with only `Ipred` monitors, which reads no residual
-error. Plain `simulate()` applies the magnitude.
+A name assigned in `[individual_parameters]` reads its assigned value in a
+magnitude expression, as in every other block (#2915). The definition is
+substituted into the expression, so it is held to the same rules as text written
+inline. That works when the name is assigned **once, at top level, without a
+random effect** (directly or through an earlier name):
+
+```
+[individual_parameters]
+  ISPK = 1
+  WTN  = WT / 70
+  RUVF = RUV_K * WTN
+
+[error_model]
+  DV ~ additive(S * ISPK * RUVF)
+```
+
+A name that depends on η (an individual parameter such as `CL`), on `MIXNUM`, or
+on a neural-network output, or that is assigned more than once or inside an
+`if/else` branch, has no single η-free value to substitute and is rejected with
+that reason. A covariate the substituted definition reads must be declared in
+`[covariates]`, like one written in the expression itself. A name that is
+neither declared nor assigned is rejected too, since it would silently read `0`.
+
+This includes a θ that the block reassigns under its own name — `theta CL` with
+`CL = CL * exp(ETA_CL)`. In the error model `CL` means the assigned value, as in
+`[structural_model]`, not the raw θ: that one is rejected for its η, while an
+η-free `RUV_K = RUV_K * WT / 70` is substituted. To read the θ itself, give the
+individual parameter a different name (`theta TVCL`, `CL = TVCL * …`).
+
+Two more refusals keep the error model from reading a different value than the
+rest of the model: a name the block assigns that `[error_model]` would read as
+its own built-in (`TAD`, `MACHEPS`) or as the scaled sigma — rename the
+variable — and a definition that would grow past 10,000 expression nodes once
+every name in it is substituted (a deep chain of intermediates that each read
+the previous one twice).
+
+### With adaptive dosing {#magnitude-adaptive}
+
+Adaptive dosing (`simulate_adaptive*`) applies the residual-error magnitude to a `Dv`
+monitor's assay draw, as `simulate()` applies it to an observation row
+([#2741](https://github.com/FeRx-NLME/ferx-core/issues/2741)). This covers a magnitude
+expression, a [`weight =`](#residual-weighting-weight-...), a [`power(...)`](#power)
+exponent and a magnitude on a `CMT=N:` line, with IIV on the residual error,
+`block_sigma`, FREM and `MIXNUM`. The magnitude is evaluated at the decision:
+
+- **Covariates**: the row in force at the decision.
+- **`TIME`**: the time as written, the same value the monitor reads.
+- **`TAD`**: the time after the last dose given *before* the reading, the base regimen
+  plus the controller's own earlier doses. A dose decided at the same decision comes
+  after the reading. Before any dose, `TAD` is the time since the subject's first
+  record, so a first dose decided at 4 on a subject with a record at 0 reads `TAD = 4`.
+
+A magnitude that evaluates to zero, a negative number or a non-finite value at a
+decision stops the run with `E_RUV_MAGNITUDE_NONPOSITIVE`. The data check behind that
+code sees the observation rows only, at the initial θ. A decision can sit on a row it
+never evaluates, such as an `EVID=2` row, and the run can use a θ it never evaluated,
+such as a fitted one. A model without a magnitude draws exactly what it drew before.
 
 ### On `CMT=N:` lines and in `if/else` branches {#endpoint-magnitude}
 
@@ -438,9 +488,10 @@ Restrictions on these forms:
   rejected, because a row holds one multiplier per sigma. Declare a second sigma.
 - **`weight =` and `power(...)` stay refused** on `CMT=N:` lines and in `if/else` branches.
   Write the factor as a magnitude expression instead of a `weight =`.
-- **Adaptive dosing** (`simulate_adaptive*`) refuses these magnitudes, as it refuses
-  [every magnitude](#magnitude-adaptive), because the assay
-  draws from the bare sigma. It refuses a covariate-selected error model in any case.
+- **Adaptive dosing** (`simulate_adaptive*`) applies a `CMT=N:` magnitude to the assay
+  draw of a `Dv` monitor on that compartment, as it applies
+  [every magnitude](#magnitude-adaptive). It refuses a covariate-selected error model in
+  any case.
 
 #### Comparison with NONMEM {#endpoint-magnitude-nonmem-anchor}
 
@@ -562,6 +613,47 @@ That term depends only on the data, so it is identical for every model fitted to
 the same rows with the same weight column and cancels out of every ΔOFV,
 likelihood-ratio test, and AIC comparison. Only the absolute number differs from
 a published figure.
+
+### OFV conventions across tools {#ofv-conventions}
+
+Two constants separate one tool's objective from another's: the `N·log 2π` term
+(`N` = number of observations), and the Jacobian of a weighting written as a
+change of variable. ferx reports `−2 log L` **without** `N·log 2π`, the NONMEM
+convention, on the **natural scale** of `DV`. `W` is the `weight =` expression: a
+**standard-deviation** factor, so a row's residual variance is $W^2\sigma^2$. A
+precision weight $w = 1/W^2$ (what `DV·√w` uses) carries the same information.
+
+To turn another tool's figure into ferx's `weight = W` OFV, add:
+
+| Run | Its reported figure | Add |
+|---|---|---|
+| ferx, `DV ~ additive(S) weight = W` | `ofv` | 0 |
+| NONMEM, natural scale, `Y = F + W*EPS(1)` | `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT` (`#OBJV`) | 0 |
+| NONMEM, same model | `... WITH CONSTANT` | $-N\log 2\pi$ |
+| ferx / NONMEM hand-built: `DV/W` in the data, prediction `/W`, the same σ as the `weight =` fit | OFV without constant | $+\sum_j 2\ln W_j$ |
+| nlmixr2 FOCEi hand-built with a precision weight: `DV·√w`, prediction `·√w`, `add()` sd the same as the `weight =` fit's σ | `fit$objf` (any `adjLik`) | $-\sum_j \ln w_j \;=\; +\sum_j 2\ln W_j$ |
+| nlmixr2, same fit | $-2\,$`logLik(fit)` | $-N\log 2\pi - \sum_j \ln w_j$ |
+
+Measured on one dataset (6 subjects, 18 rows, `W` from 0.3 to 2.5, a model linear
+in its only η so FOCE is the exact marginal), every run at the same initial
+estimates (`maxiter = 0` / `MAXEVAL=0` / `est = "posthoc"`), against the exact
+Gaussian marginal computed outside all three tools:
+
+| | Natural scale | Hand-built |
+|---|---|---|
+| exact marginal, no `N·log 2π` | 44.0745525243 | 41.1483038026 |
+| ferx (`weight = W` / `y = E0/W`) | 44.0745525243 | 41.1483038026 |
+| NONMEM 7.6.0 `#OBJV` | 44.0745525243 | 41.1483038026 |
+| nlmixr2 7.0.1 (nlmixr2est 7.1.0) `objf` | — | 41.1483038026 |
+
+The difference between the columns is $\sum_j 2\ln W_j = 2.9262487217$ for this
+data, and $N\log 2\pi = 33.0817871954$ is what nlmixr2's `−2·logLik` adds. In
+nlmixr2's FOCEi `objf` the `adjLik` switch changes nothing: it gave the same
+figure set to `TRUE` and `FALSE`.
+
+Both constants depend only on the data, so they cancel from every ΔOFV between
+models fitted to the same rows with the same weights. They matter only when an
+absolute objective is compared across tools, or against a published figure.
 
 ### Rules and restrictions (current)
 

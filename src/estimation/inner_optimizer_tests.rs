@@ -260,6 +260,40 @@ fn m3_censored_dterm_df_matches_fd() {
     }
 }
 
+/// #2772 on the inner gradient's censored row (`residual_inner_obs`): `coef = h·m` and the
+/// `iiv_on_ruv` column `h·z`. Past `h = φ/Φ`'s underflow both limits are `0`, but at a limit
+/// far enough out that `z = +∞` the factors are infinite, and `0·∞` was `NaN`. Both tails,
+/// plus the `±1e300` row, where `z` is still finite. Both rows are past `h`'s underflow, so
+/// the oracle is the exact limit `0`, not the `±1e300` row.
+#[test]
+fn residual_inner_obs_is_zero_where_inv_mills_underflows() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_RUV ~ 0.05\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n",
+    )
+    .expect("parse");
+    let sigma = &model.default_params.sigma.values;
+    let (f, ruv_scale) = (1.0, 1.1);
+    let v = ruv_scale * model.residual_variance_at(1, f, sigma);
+    let d = ruv_scale * model.error_spec.dvar_df(1, f, sigma);
+    for (near, far, cens) in [(1e300, 1e308, 1), (-1e300, -1e308, -1)] {
+        let (_, z, _) = crate::stats::special::m3_censored_kernel(near, f, v, d, cens);
+        assert!(z.is_finite(), "control {near:e}: z={z}");
+        let (h, z, m) = crate::stats::special::m3_censored_kernel(far, f, v, d, cens);
+        assert!(
+            h == 0.0 && z == f64::INFINITY && m.is_infinite(),
+            "{far:e}: z={z}, m={m}"
+        );
+        for y in [near, far] {
+            let (coef, ruv_term, _) = residual_inner_obs(
+                &model, 1, y, f, sigma, None, ruv_scale, true, cens, None, 0.0,
+            )
+            .expect("positive variance");
+            assert!(coef == 0.0, "h·m at y={y:e}, cens={cens}: {coef}");
+            assert!(ruv_term == 0.0, "h·z at y={y:e}, cens={cens}: {ruv_term}");
+        }
+    }
+}
+
 #[test]
 fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
     use crate::parser::model_parser::parse_model_string;
@@ -1644,6 +1678,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 screen: 0,
                 twin_seed: false,
                 init_is_mode: false,
+                init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
             },
@@ -1726,6 +1761,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 screen: 0,
                 twin_seed: false,
                 init_is_mode: false,
+                init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
             },
@@ -1755,6 +1791,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 screen: 0,
                 twin_seed: false,
                 init_is_mode: false,
+                init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
             },
@@ -1833,6 +1870,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         screen: 0,
         twin_seed: false,
         init_is_mode: false,
+        init_is_warm: false,
         keep_certified_start: false,
         unseeded_iov_warm: false,
     };
@@ -3833,6 +3871,7 @@ mod frozen_ebe_variance {
                 interaction: false,
                 ..Default::default()
             },
+            PrevEtas::Placeholder,
         );
         assert_eq!(
             stats.n_fallback, 0,
@@ -7603,7 +7642,9 @@ fn fused_value_is_the_native_objective_value() {
     // (model, data, bound): closed form and a nonlinear (Michaelis-Menten) ODE.
     let cases = [
         ("examples/warfarin.ferx", "data/warfarin.csv", 1e-12),
+        ("examples/two_cpt_iv_ode.ferx", "data/two_cpt_iv.csv", 1e-12),
         ("examples/mm_oral.ferx", "data/mm_oral.csv", 1e-6),
+        ("examples/mm_iv.ferx", "data/mm_iv.csv", 1e-6),
     ];
     for (mf, df, bound) in cases {
         let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
@@ -7611,6 +7652,7 @@ fn fused_value_is_the_native_objective_value() {
         let params = model.default_params.clone();
         let mut worst = 0.0_f64;
         let mut n_fused = 0usize;
+        let mut n_bits = 0usize;
         for subj in pop.subjects.iter().take(6) {
             for scale in [0.0, 0.3, -0.5] {
                 let eta: Vec<f64> = (0..model.n_eta)
@@ -7671,17 +7713,135 @@ fn fused_value_is_the_native_objective_value() {
                     None,
                 );
                 assert!(v.is_finite() && want.is_finite());
+                n_bits += usize::from(v.to_bits() == want.to_bits());
                 let gap = (v - want).abs() / (1.0 + want.abs());
                 assert!(gap.is_finite());
                 worst = worst.max(gap); // nan-ok: gap asserted finite above
             }
         }
         eprintln!(
-            "fused value vs native objective, {mf}: {n_fused} points, worst relative gap {worst:.3e}"
+            "fused value vs native objective, {mf}: {n_fused} points ({n_bits} bit-equal), worst relative gap {worst:.3e}"
         );
         assert!(
             worst < bound,
             "{mf}: fused value gap {worst:.3e} >= {bound:.0e}"
         );
+        // The inner solve memoises this value next to native ones (`obj`'s memo), so the line
+        // search compares one engine's values only if they are bit-equal. Measured on Linux
+        // x86_64: every point of all four classes (closed form, linear ODE, nonlinear ODE
+        // oral and IV) is bit-equal at the gradient pass's first-order layout.
+        assert_eq!(
+            n_bits, n_fused,
+            "{mf}: the memoised fused value must be bit-equal"
+        );
     }
+}
+
+/// The objective memo of one inner solve is one engine's values. The gradient pass's fused value
+/// ([`analytic_eta_nll_value_gradient_with_schedule`]) is the native objective to ~1e-15 on an ODE
+/// objective but not bit for bit (measured: 69 of 600 points over mm thetas x1..x10, worst
+/// relative gap 2e-15; `x3` and `x10` take the Rosenbrock stepper), so `find_ebe_solve` puts it in
+/// the memo for a closed-form objective only. Both sides of that gate in one test: an ODE
+/// subject at stiff thetas leaves the memo untouched by the plan, a closed-form one fills it.
+#[test]
+fn ode_objective_memo_holds_native_values_only_at_stiff_points() {
+    use std::path::Path;
+    let puts = |mf: &str, df: &str, scales: &[f64]| {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+        let pop = crate::read_nonmem_csv(Path::new(df), None, None).expect("data");
+        let before = MEMO_PLAN_PUTS.with(|c| c.get());
+        for &ts in scales {
+            let mut params = model.default_params.clone();
+            for (k, th) in params.theta.iter_mut().enumerate() {
+                *th *= if k % 2 == 0 { ts } else { 1.0 / ts };
+            }
+            for subj in pop.subjects.iter().take(8) {
+                let _ = find_ebe(&model, subj, &params, 500, 1e-8, None, None, 0);
+            }
+        }
+        MEMO_PLAN_PUTS.with(|c| c.get()) - before
+    };
+    let ode = puts(
+        "examples/mm_oral.ferx",
+        "data/mm_oral.csv",
+        &[1.0, 3.0, 10.0],
+    );
+    let closed = puts("examples/warfarin.ferx", "data/warfarin.csv", &[1.0]);
+    assert_eq!(ode, 0, "an ODE objective's memo took a plan value");
+    assert!(
+        closed > 0,
+        "the closed-form route stopped memoising the fused value"
+    );
+}
+
+/// The size of what the gate above avoids: at stiff thetas the plan's value differs from the
+/// native objective in the last bits only (measured worst 2e-15 relative; bound with headroom).
+#[test]
+fn fused_value_gap_to_native_at_stiff_points_is_last_bits() {
+    use std::path::Path;
+    let (mf, df) = ("examples/mm_oral.ferx", "data/mm_oral.csv");
+    let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+    let pop = crate::read_nonmem_csv(Path::new(df), None, None).expect("data");
+    let (mut n, mut n_bad) = (0usize, 0usize);
+    let mut worst = 0.0_f64;
+    for ts in [1.0, 3.0, 10.0, 0.3, 0.1] {
+        let mut params = model.default_params.clone();
+        for (k, th) in params.theta.iter_mut().enumerate() {
+            *th *= if k % 2 == 0 { ts } else { 1.0 / ts };
+        }
+        for subj in pop.subjects.iter().take(20) {
+            for scale in [0.0, 0.3, -0.5, 1.0, -1.5, 2.5] {
+                let eta: Vec<f64> = (0..model.n_eta)
+                    .map(|k| scale * (1.0 + 0.1 * k as f64))
+                    .collect();
+                let keys = model.error_spec.obs_keys(subj);
+                let mult = model.ruv_obs_mult(subj, &params.theta);
+                let mut v = None;
+                analytic_eta_nll_value_gradient_with_schedule(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    None,
+                    mult.as_deref(),
+                    keys.as_ref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(model.n_eta),
+                    &mut DVector::zeros(model.n_eta),
+                    None,
+                    Some(&mut v),
+                )
+                .expect("in scope");
+                let Some(v) = v else { continue };
+                let want = individual_nll_into_prepared_with_schedule_frozen(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    &mut pk::EventPkParams::default(),
+                    None,
+                    keys.as_ref(),
+                    mult.as_deref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(eta.len()),
+                    &mut DVector::zeros(eta.len()),
+                    None,
+                );
+                assert!(v.is_finite() && want.is_finite());
+                n += 1;
+                n_bad += usize::from(v.to_bits() != want.to_bits());
+                let gap = (v - want).abs() / (1.0 + want.abs());
+                assert!(gap.is_finite());
+                worst = worst.max(gap); // nan-ok: gap asserted finite above
+            }
+        }
+    }
+    eprintln!("{n} points, {n_bad} differ in bits, worst relative gap {worst:.3e}");
+    assert!(n > 0 && worst < 1e-12, "fused value gap {worst:.3e}");
 }

@@ -19,7 +19,7 @@
 //! Deliberately not asserted: the OFV, which the guard must not be able to move at an
 //! accepted point, and which #1515 established is not evidence about a gradient anyway.
 
-use ferx_core::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
+use crate::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
 use std::path::Path;
 
 fn skipped_salvages_in(warnings: &[String]) -> Option<usize> {
@@ -34,9 +34,8 @@ fn skipped_salvages_in(warnings: &[String]) -> Option<usize> {
 #[test]
 fn a_blown_up_first_trial_skips_the_salvage_under_slsqp_and_never_under_lbfgs() {
     // The bundled example plus one subject the adjoint declines for good: a constant lag
-    // time, and subject 0's dose a steady-state infusion into the depot, which routes it to
-    // the event walk and the walk declines (`ss_lagtime_walk_unsupported`). (Until #486 the
-    // example's `if`-block subjects declined on their own; the adjoint serves them.)
+    // time, subject 0's dose a steady-state infusion into the depot, and every plan of that
+    // subject forced to fail (`fail_plans_of`).
     let src = std::fs::read_to_string("examples/warfarin_if.ferx").expect("bundled example");
     let src = src
         .replace(
@@ -51,11 +50,14 @@ fn a_blown_up_first_trial_skips_the_salvage_under_slsqp_and_never_under_lbfgs() 
         src.contains("lagtime=ALAG") && src.contains("ALAG = 0.3"),
         "every edit must take"
     );
-    let model = ferx_core::parser::model_parser::parse_model_string(&src).expect("edited example");
+    let model = crate::parser::model_parser::parse_model_string(&src).expect("edited example");
     let mut pop =
         read_nonmem_csv(Path::new("data/warfarin_if.csv"), None, None).expect("bundled data");
     let dose = &mut pop.subjects[0].doses[0];
-    *dose = ferx_core::DoseEvent::new(dose.time, dose.amt, 1, 50.0, true, 24.0);
+    *dose = crate::DoseEvent::new(dose.time, dose.amt, 1, 50.0, true, 24.0);
+    // No regular-path shape declines after #2786, so force it (a `#[cfg(test)]` seam, which is
+    // why this file moved from `tests/` into the lib).
+    crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&pop.subjects[0]);
     for (optimizer, expect_skips) in [(Optimizer::Slsqp, true), (Optimizer::NloptLbfgs, false)] {
         let opts = FitOptions {
             method: EstimationMethod::FoceI,

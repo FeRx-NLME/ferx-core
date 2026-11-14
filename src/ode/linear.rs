@@ -609,7 +609,7 @@ thread_local! {
     /// Test switch: propagate every segment by Padé, as before the spectral path.
     pub(crate) static SPECTRAL_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Segments the spectral path propagated on this thread.
-    pub(super) static SPECTRAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static SPECTRAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[inline]

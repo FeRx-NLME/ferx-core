@@ -141,7 +141,6 @@ fn fast_foce_opts() -> FitOptions {
         interaction: false,
         mu_referencing: false,
         optimizer: Optimizer::Slsqp,
-        lbfgs_memory: 5,
         verbose: false,
         ..FitOptions::default()
     }

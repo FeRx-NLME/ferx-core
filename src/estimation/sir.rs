@@ -7,6 +7,7 @@
 //! SIR provides a non-parametric estimate of parameter uncertainty that is
 //! more robust than the asymptotic covariance matrix.
 
+use crate::cold_sort::ColdSort;
 use crate::diagnostics::EngineError;
 use crate::estimation::covariance::{free_coordinate_units, unit_coordinate_scales, CoordUnits};
 use crate::estimation::inner_optimizer::{run_inner_loop_warm_map, InnerSolvePolicy};
@@ -24,7 +25,6 @@ use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use rand_distr::{weighted::WeightedIndex, ChiSquared, Distribution, StandardNormal};
-use rayon::prelude::*;
 
 /// Results from the SIR procedure.
 #[derive(Debug, Clone)]
@@ -813,7 +813,7 @@ pub(crate) fn condition_free_proposal(
         // keep the proposal strictly PD so the Cholesky below succeeds.
         lambdas[i] = lam.max(1e-12);
     }
-    capped.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    capped.cold_sort_by(&|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     // A healthy block must not be perturbed. Round-tripping it through `V Λ Vᵀ`
     // changes it at ~1e-16 relative, which changes every drawn sample and
@@ -938,7 +938,7 @@ fn all_invalid_weights_message(
     );
     if !per_coord.is_empty() {
         let mut top: Vec<(usize, usize)> = per_coord.into_iter().collect();
-        top.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        top.cold_sort_by(&|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         top.truncate(3);
         let listed = top
             .iter()
@@ -1009,7 +1009,10 @@ fn screen_draw(
 ///   [`FitResult::ebe_kappas`](crate::FitResult::ebe_kappas)), which `fit()` and
 ///   [`run_sir`](crate::run_sir) hand, so a draw re-solves κ from κ̂ rather than from 0
 ///   (#2261). `η̂` alone remains valid.
-/// * `proposal_cov` - Covariance matrix in packed (log-transformed) parameter space
+/// * `proposal_cov` - Covariance matrix in packed (log-transformed) parameter space. A
+///   coordinate collapsed on the internal guard whose diagonal here is exactly zero (the
+///   covariance step held it, #2797) is held at its estimate like a `FIX` parameter and not
+///   sampled (#2816)
 /// * `ofv_hat` - the **data** OFV (−2 log L) at the estimates, i.e. what every
 ///   optimizer reports as `OuterResult::ofv`. Under parameter priors (#254) the
 ///   penalty is added internally, to this baseline and to every draw alike, so
@@ -1205,6 +1208,18 @@ fn run_sir_in_box(
         )));
     }
 
+    // A random-effect variance the covariance step held on its guard (#2797: a
+    // `CollapsedAtGuard` coordinate whose row of the matrix is zero) is a FIX parameter of
+    // that matrix, so it is one here too (#2816) and SIR equals the same fit with it `FIX`.
+    // The gate reads the *proposal*: a floored `R` or a non-PD fallback has no zero row
+    // there, so a collapse that step did not hold stays sampled. It reads the proposal's
+    // diagonal, so it runs after the shape check above (#2830 review r1 #1).
+    for p in crate::api::held_guard_coordinates(params) {
+        if crate::api::step_held(Some(proposal_cov), p) {
+            fixed_mask[p] = true;
+        }
+    }
+
     // Restrict the proposal to the free subspace. `compute_covariance` zeroes
     // the rows/cols of FIX-ed parameters, and `compute_bounds` pins their
     // bounds to `lower == upper == x_hat[i]`. Sampling on the full space would
@@ -1390,10 +1405,9 @@ fn run_sir_in_box(
         .map(|ofv| ofv + priors.penalty(x_k))
     };
 
-    let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) = samples
-        .par_iter()
-        .zip(z_vectors.par_iter())
-        .map(|(x_k, z)| {
+    let (log_weights, outcomes): (Vec<f64>, Vec<SampleOutcome>) =
+        crate::par::map(samples.len().min(z_vectors.len()), |k| {
+            let (x_k, z) = (&samples[k], &z_vectors[k]);
             if crate::cancel::is_cancelled(&options.cancel) {
                 return (f64::NEG_INFINITY, SampleOutcome::Cancelled);
             }
@@ -1431,6 +1445,7 @@ fn run_sir_in_box(
                 SampleOutcome::Accepted,
             )
         })
+        .into_iter()
         .unzip();
 
     // Step 2: Normalize weights using log-sum-exp trick
@@ -1820,7 +1835,7 @@ pub(crate) fn percentile_ci(values: &[f64]) -> (f64, f64) {
         return (f64::NAN, f64::NAN);
     }
     let mut sorted = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = sorted.len();
     let lo_idx = ((n as f64) * 0.025).floor() as usize;
     let hi_idx = ((n as f64) * 0.975).ceil() as usize;

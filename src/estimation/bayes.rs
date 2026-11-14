@@ -19,6 +19,7 @@
 //!   - inverse-Wishart via the Bartlett decomposition of a Wishart draw, then
 //!     matrix inversion ([`inverse_wishart_draw`], [`wishart_draw`]).
 
+use crate::cold_sort::ColdSort;
 use crate::estimation::bayes_mu_design::{within_bounds, DrawOutcome, MuDesign};
 use crate::estimation::mixture::combine_subject;
 use crate::estimation::outer_optimizer::OuterResult;
@@ -34,7 +35,6 @@ use nalgebra::{Cholesky, DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 use rand_distr::{ChiSquared, Distribution, Gamma, StandardNormal};
-use rayon::prelude::*;
 
 /// Draw from an inverse-gamma distribution `InvGamma(shape, scale)` with the
 /// standard (Wikipedia) parameterization: density `∝ x^(−shape−1) exp(−scale/x)`,
@@ -132,7 +132,7 @@ pub fn summarize_param(name: &str, chains: &[Vec<f64>]) -> PosteriorSummary {
     } else {
         0.0
     };
-    all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    all.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let bulk = ess_bulk(chains);
     let tail = ess_tail(chains);
     PosteriorSummary {
@@ -1064,437 +1064,478 @@ pub fn run_bayes(
         vec![vec![0.0; n_eta]; n_subjects]
     };
 
-    let chain_outputs: Vec<Option<ChainOutput>> = (0..n_chains)
-        .into_par_iter()
-        .map(|chain| {
-            let mut rng =
-                StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
-            let mut scratch = EventPkParams::default();
-            // The block MH kernel owns its own buffers (`MhScratch`), which
-            // carry the η-independent NLL inputs alongside the `EventPkParams`.
-            let mut mh_scratch = crate::estimation::saem::MhScratch::default();
-            let mut eta_sum: Vec<DVector<f64>> =
-                (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
-            let mut eta_record_count = 0u64;
-            let mut n_divergent_total = 0u64;
-            let mut conj_tally = ConjugateTally::default();
-            // One-shot latch for the baseline freshness check below.
-            #[cfg(debug_assertions)]
-            let mut baseline_checked = false;
+    let chain_outputs: Vec<Option<ChainOutput>> = crate::par::map(n_chains, |chain| {
+        let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(chain as u64 * 0x9E3779B9));
+        let mut scratch = EventPkParams::default();
+        // The block MH kernel owns its own buffers (`MhScratch`), which
+        // carry the η-independent NLL inputs alongside the `EventPkParams`.
+        let mut mh_scratch = crate::estimation::saem::MhScratch::default();
+        let mut eta_sum: Vec<DVector<f64>> =
+            (0..n_subjects).map(|_| DVector::zeros(n_eta)).collect();
+        let mut eta_record_count = 0u64;
+        let mut n_divergent_total = 0u64;
+        let mut conj_tally = ConjugateTally::default();
+        // One-shot latch for the baseline freshness check below.
+        #[cfg(debug_assertions)]
+        let mut baseline_checked = false;
 
-            // Chain state.
-            let mut theta = init_params.theta.clone();
-            let mut sigma = init_params.sigma.values.clone();
-            let mut omega_mat = init_params.omega.matrix.clone();
-            let mut omega_cur = OmegaMatrix::from_matrix(
-                omega_mat.clone(),
-                init_params.omega.eta_names.clone(),
-                init_params.omega.diagonal,
-            );
-            let mut etas: Vec<Vec<f64>> = eta_start.clone();
+        // Chain state.
+        let mut theta = init_params.theta.clone();
+        let mut sigma = init_params.sigma.values.clone();
+        let mut omega_mat = init_params.omega.matrix.clone();
+        let mut omega_cur = OmegaMatrix::from_matrix(
+            omega_mat.clone(),
+            init_params.omega.eta_names.clone(),
+            init_params.omega.diagonal,
+        );
+        let mut etas: Vec<Vec<f64>> = eta_start.clone();
 
-            // IOV state: per-subject, per-occasion kappa vectors (empty when no
-            // IOV, which routes `subject_nll` to the plain kernel). One occasion
-            // list per subject from the OCC column.
-            let mut kappas: Vec<Vec<Vec<f64>>> = (0..n_subjects)
+        // IOV state: per-subject, per-occasion kappa vectors (empty when no
+        // IOV, which routes `subject_nll` to the plain kernel). One occasion
+        // list per subject from the OCC column.
+        let mut kappas: Vec<Vec<Vec<f64>>> = (0..n_subjects)
+            .map(|i| {
+                let n_occ = if n_kappa > 0 {
+                    crate::stats::stacked_layout::group_count(&population.subjects[i])
+                } else {
+                    0
+                };
+                vec![vec![0.0; n_kappa]; n_occ]
+            })
+            .collect();
+        // The sampled κ, summed per subject and cell like η: the final EBE pass
+        // starts each occasion at its posterior mean, not at 0 (#2377).
+        let mut kappa_sum: Vec<Vec<DVector<f64>>> = kappas
+            .iter()
+            .map(|ks| ks.iter().map(|_| DVector::zeros(n_kappa)).collect())
+            .collect();
+        let mut omega_iov_cur: Option<OmegaMatrix> = init_params.omega_iov.clone();
+        // Per-subject kappa-MH step scale (adapted in warmup).
+        let mut kappa_scale = 0.6_f64;
+        let mut acc_kappa = 0u64;
+        let mut prop_kappa = 0u64;
+
+        // Unconstrained population vector + its prior centre.
+        let pack = |theta: &[f64], sigma: &[f64]| -> Vec<f64> {
+            pop_coords
+                .iter()
+                .map(|c| match *c {
+                    PopCoord::Theta { idx, log } => {
+                        if log {
+                            theta[idx].max(TINY).ln()
+                        } else {
+                            theta[idx]
+                        }
+                    }
+                    PopCoord::Sigma { idx } => sigma[idx].max(TINY).ln(),
+                })
+                .collect()
+        };
+        let u0 = pack(&theta, &sigma);
+
+        // Per-coordinate random-walk step sizes for the (θ, σ) block. A single
+        // shared scalar mixed badly for parameters on very different scales or
+        // with very different identifiability (e.g. a weakly-identified 3-cpt
+        // peripheral volume vs a well-determined clearance); each coordinate now
+        // adapts its own scale and is updated componentwise.
+        let n_pop = pop_coords.len();
+        let mut rw_scales = vec![0.1_f64; n_pop];
+        let mut acc_pop = vec![0u64; n_pop];
+        let mut prop_pop = vec![0u64; n_pop];
+        // Global η step: the HMC leapfrog step and the mixture MH kernel.
+        let mut eta_scale = 0.6_f64;
+        let mut acc_eta = 0u64;
+        let mut prop_eta = 0u64;
+        // Per-subject proposals of the block + componentwise MH η kernel
+        // (#1626): each subject adapts its own step, and from mid-warmup
+        // its own posterior-shaped proposal.
+        let mut eta_props: Vec<EtaProposal> =
+            (0..n_subjects).map(|_| EtaProposal::new(n_eta)).collect();
+        // Cumulative η-accept counters for the progress display only (the
+        // adaptation counters above are reset every window, so they read ~0 right
+        // after a reset).
+        let mut acc_eta_disp = 0u64;
+        let mut prop_eta_disp = 0u64;
+
+        // Adaptive-covariance (Haario 2001) proposal for the (θ,σ) block. A
+        // Welford-accumulated covariance of the unconstrained pop vector seeds a
+        // JOINT proposal that moves along parameter correlations the
+        // per-coordinate scales cannot (e.g. the V3↔Q3 ridge in a 3-cpt model).
+        // Componentwise runs during the bootstrap phase (first half of warmup);
+        // once the covariance is well-conditioned the sampler switches to the
+        // joint proposal, frozen at the end of warmup so the sampling phase is
+        // non-adaptive (valid MCMC).
+        let mut u_mean = vec![0.0_f64; n_pop];
+        let mut u_m2 = DMatrix::<f64>::zeros(n_pop, n_pop);
+        let mut n_cov = 0usize;
+        let mut prop_chol: Option<DMatrix<f64>> = None;
+        let mut joint_scale = 1.0_f64;
+        let mut joint_acc = 0u64;
+        let mut joint_prop = 0u64;
+        let bootstrap_end = (n_warmup / 2).max(1);
+        let am_base = 2.38 * 2.38 / (n_pop.max(1) as f64); // Haario optimal scaling
+
+        let mut chain_draws: Vec<Vec<f64>> = vec![Vec::new(); n_params];
+
+        let total_sweeps = n_warmup + n_sample;
+        for sweep in 0..total_sweeps {
+            // Cooperative cancel: a Gibbs sweep (the η/κ/pop/Ω moves below) is the
+            // dominant per-chain cost, so poll the flag at the sweep boundary so an
+            // interrupt set from the host (e.g. R) takes effect within one sweep
+            // rather than running every chain to completion. A cancelled chain
+            // returns no output; the post-loop check rejects all partial draws.
+            if crate::cancel::is_cancelled(&options.cancel) {
+                if verbose {
+                    eprintln!("Bayes: cancelled at chain {} sweep {}", chain, sweep);
+                }
+                return None;
+            }
+
+            // (re)compute the per-subject NLL at the current (θ, Ω, σ, η, κ).
+            let mut nll: Vec<f64> = (0..n_subjects)
                 .map(|i| {
-                    let n_occ = if n_kappa > 0 {
-                        crate::stats::stacked_layout::group_count(&population.subjects[i])
-                    } else {
-                        0
-                    };
-                    vec![vec![0.0; n_kappa]; n_occ]
+                    subject_nll(
+                        model,
+                        &population.subjects[i],
+                        &theta,
+                        &etas[i],
+                        &kappas[i],
+                        &omega_cur,
+                        omega_iov_cur.as_ref(),
+                        &sigma,
+                        &mut scratch,
+                        schedules[i].as_ref(),
+                    )
                 })
                 .collect();
-            // The sampled κ, summed per subject and cell like η: the final EBE pass
-            // starts each occasion at its posterior mean, not at 0 (#2377).
-            let mut kappa_sum: Vec<Vec<DVector<f64>>> = kappas
-                .iter()
-                .map(|ks| ks.iter().map(|_| DVector::zeros(n_kappa)).collect())
+
+            // Componentwise proposal SD, √Ω_jj (shared by every subject).
+            let cw_sd: Vec<f64> = (0..n_eta)
+                .map(|j| omega_cur.matrix[(j, j)].max(OMEGA_DIAG_FLOOR).sqrt())
                 .collect();
-            let mut omega_iov_cur: Option<OmegaMatrix> = init_params.omega_iov.clone();
-            // Per-subject kappa-MH step scale (adapted in warmup).
-            let mut kappa_scale = 0.6_f64;
-            let mut acc_kappa = 0u64;
-            let mut prop_kappa = 0u64;
 
-            // Unconstrained population vector + its prior centre.
-            let pack = |theta: &[f64], sigma: &[f64]| -> Vec<f64> {
-                pop_coords
-                    .iter()
-                    .map(|c| match *c {
-                        PopCoord::Theta { idx, log } => {
-                            if log {
-                                theta[idx].max(TINY).ln()
-                            } else {
-                                theta[idx]
-                            }
-                        }
-                        PopCoord::Sigma { idx } => sigma[idx].max(TINY).ln(),
-                    })
-                    .collect()
-            };
-            let u0 = pack(&theta, &sigma);
-
-            // Per-coordinate random-walk step sizes for the (θ, σ) block. A single
-            // shared scalar mixed badly for parameters on very different scales or
-            // with very different identifiability (e.g. a weakly-identified 3-cpt
-            // peripheral volume vs a well-determined clearance); each coordinate now
-            // adapts its own scale and is updated componentwise.
-            let n_pop = pop_coords.len();
-            let mut rw_scales = vec![0.1_f64; n_pop];
-            let mut acc_pop = vec![0u64; n_pop];
-            let mut prop_pop = vec![0u64; n_pop];
-            // Global η step: the HMC leapfrog step and the mixture MH kernel.
-            let mut eta_scale = 0.6_f64;
-            let mut acc_eta = 0u64;
-            let mut prop_eta = 0u64;
-            // Per-subject proposals of the block + componentwise MH η kernel
-            // (#1626): each subject adapts its own step, and from mid-warmup
-            // its own posterior-shaped proposal.
-            let mut eta_props: Vec<EtaProposal> =
-                (0..n_subjects).map(|_| EtaProposal::new(n_eta)).collect();
-            // Cumulative η-accept counters for the progress display only (the
-            // adaptation counters above are reset every window, so they read ~0 right
-            // after a reset).
-            let mut acc_eta_disp = 0u64;
-            let mut prop_eta_disp = 0u64;
-
-            // Adaptive-covariance (Haario 2001) proposal for the (θ,σ) block. A
-            // Welford-accumulated covariance of the unconstrained pop vector seeds a
-            // JOINT proposal that moves along parameter correlations the
-            // per-coordinate scales cannot (e.g. the V3↔Q3 ridge in a 3-cpt model).
-            // Componentwise runs during the bootstrap phase (first half of warmup);
-            // once the covariance is well-conditioned the sampler switches to the
-            // joint proposal, frozen at the end of warmup so the sampling phase is
-            // non-adaptive (valid MCMC).
-            let mut u_mean = vec![0.0_f64; n_pop];
-            let mut u_m2 = DMatrix::<f64>::zeros(n_pop, n_pop);
-            let mut n_cov = 0usize;
-            let mut prop_chol: Option<DMatrix<f64>> = None;
-            let mut joint_scale = 1.0_f64;
-            let mut joint_acc = 0u64;
-            let mut joint_prop = 0u64;
-            let bootstrap_end = (n_warmup / 2).max(1);
-            let am_base = 2.38 * 2.38 / (n_pop.max(1) as f64); // Haario optimal scaling
-
-            let mut chain_draws: Vec<Vec<f64>> = vec![Vec::new(); n_params];
-
-            let total_sweeps = n_warmup + n_sample;
-            for sweep in 0..total_sweeps {
-                // Cooperative cancel: a Gibbs sweep (the η/κ/pop/Ω moves below) is the
-                // dominant per-chain cost, so poll the flag at the sweep boundary so an
-                // interrupt set from the host (e.g. R) takes effect within one sweep
-                // rather than running every chain to completion. A cancelled chain
-                // returns no output; the post-loop check rejects all partial draws.
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    if verbose {
-                        eprintln!("Bayes: cancelled at chain {} sweep {}", chain, sweep);
-                    }
-                    return None;
-                }
-
-                // (re)compute the per-subject NLL at the current (θ, Ω, σ, η, κ).
-                let mut nll: Vec<f64> = (0..n_subjects)
-                    .map(|i| {
-                        subject_nll(
-                            model,
+            // ---- 1. η block ----
+            // HMC (gradient-guided, on the analytic Dual2 η-gradient) when opted in
+            // (n_leapfrog > 0, analytical-PK subject); otherwise the
+            // chol(Ω)-preconditioned block random walk. Same routing as SAEM.
+            for i in 0..n_subjects {
+                let did_hmc = if using_hmc {
+                    if let Some((new_eta, new_nll, accepted, divergent)) =
+                        crate::estimation::hmc::hmc_step(
                             &population.subjects[i],
-                            &theta,
                             &etas[i],
+                            nll[i],
+                            model,
+                            &theta,
+                            &omega_cur,
+                            &sigma,
+                            eta_scale,
+                            n_leapfrog,
+                            &mut rng,
+                        )
+                    {
+                        etas[i] = new_eta;
+                        nll[i] = new_nll;
+                        acc_eta += accepted as u64;
+                        prop_eta += 1;
+                        acc_eta_disp += accepted as u64;
+                        prop_eta_disp += 1;
+                        // Count post-warmup divergences for the diagnostic.
+                        if sweep >= n_warmup && divergent {
+                            n_divergent_total += 1;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+
+                if !did_hmc {
+                    // Mixture (#985): target the class-marginal η posterior via the
+                    // marginal MH kernel (HMC is off for mixtures). Otherwise the
+                    // single-population kernel; IOV samples η | κ (kappas fixed).
+                    let (na, nll_new) = if model.mixture.is_some() {
+                        mh_steps_mixture(
+                            &mut etas[i],
+                            nll[i],
+                            &population.subjects[i],
+                            model,
+                            &theta,
                             &kappas[i],
                             &omega_cur,
                             omega_iov_cur.as_ref(),
                             &sigma,
+                            eta_scale,
+                            &mut rng,
+                            n_eta_mh,
                             &mut scratch,
                             schedules[i].as_ref(),
                         )
-                    })
-                    .collect();
-
-                // Componentwise proposal SD, √Ω_jj (shared by every subject).
-                let cw_sd: Vec<f64> = (0..n_eta)
-                    .map(|j| omega_cur.matrix[(j, j)].max(OMEGA_DIAG_FLOOR).sqrt())
-                    .collect();
-
-                // ---- 1. η block ----
-                // HMC (gradient-guided, on the analytic Dual2 η-gradient) when opted in
-                // (n_leapfrog > 0, analytical-PK subject); otherwise the
-                // chol(Ω)-preconditioned block random walk. Same routing as SAEM.
-                for i in 0..n_subjects {
-                    let did_hmc = if using_hmc {
-                        if let Some((new_eta, new_nll, accepted, divergent)) =
-                            crate::estimation::hmc::hmc_step(
-                                &population.subjects[i],
-                                &etas[i],
-                                nll[i],
-                                model,
-                                &theta,
-                                &omega_cur,
-                                &sigma,
-                                eta_scale,
-                                n_leapfrog,
-                                &mut rng,
-                            )
-                        {
-                            etas[i] = new_eta;
-                            nll[i] = new_nll;
-                            acc_eta += accepted as u64;
-                            prop_eta += 1;
-                            acc_eta_disp += accepted as u64;
-                            prop_eta_disp += 1;
-                            // Count post-warmup divergences for the diagnostic.
-                            if sweep >= n_warmup && divergent {
-                                n_divergent_total += 1;
-                            }
-                            true
-                        } else {
-                            false
-                        }
                     } else {
-                        false
-                    };
-
-                    if !did_hmc {
-                        // Mixture (#985): target the class-marginal η posterior via the
-                        // marginal MH kernel (HMC is off for mixtures). Otherwise the
-                        // single-population kernel; IOV samples η | κ (kappas fixed).
-                        let (na, nll_new) = if model.mixture.is_some() {
-                            mh_steps_mixture(
+                        let kappas_opt =
+                            omega_iov_cur.as_ref().map(|oi| (kappas[i].as_slice(), oi));
+                        mh_scratch.begin_subject(model, &population.subjects[i], &theta, n_eta);
+                        let ep = &mut eta_props[i];
+                        let (na, nll_block) = mh_steps_with_proposal(
+                            &mut etas[i],
+                            nll[i],
+                            &population.subjects[i],
+                            model,
+                            &theta,
+                            &omega_cur,
+                            &sigma,
+                            ep.shape.as_ref().unwrap_or(&omega_cur.chol),
+                            ep.scale,
+                            None,
+                            &mut rng,
+                            n_eta_mh,
+                            &mut mh_scratch,
+                            schedules[i].as_ref(),
+                            kappas_opt,
+                        );
+                        ep.acc += na as u64;
+                        ep.prop += n_eta_mh as u64;
+                        if n_cw_sweeps > 0 {
+                            let (acc_cw, _n_prop, nll_cw) = mh_steps_componentwise(
                                 &mut etas[i],
-                                nll[i],
-                                &population.subjects[i],
-                                model,
-                                &theta,
-                                &kappas[i],
-                                &omega_cur,
-                                omega_iov_cur.as_ref(),
-                                &sigma,
-                                eta_scale,
-                                &mut rng,
-                                n_eta_mh,
-                                &mut scratch,
-                                schedules[i].as_ref(),
-                            )
-                        } else {
-                            let kappas_opt =
-                                omega_iov_cur.as_ref().map(|oi| (kappas[i].as_slice(), oi));
-                            mh_scratch.begin_subject(model, &population.subjects[i], &theta, n_eta);
-                            let ep = &mut eta_props[i];
-                            let (na, nll_block) = mh_steps_with_proposal(
-                                &mut etas[i],
-                                nll[i],
+                                nll_block,
                                 &population.subjects[i],
                                 model,
                                 &theta,
                                 &omega_cur,
                                 &sigma,
-                                ep.shape.as_ref().unwrap_or(&omega_cur.chol),
-                                ep.scale,
-                                None,
+                                &ep.cw_scales,
+                                &cw_sd,
                                 &mut rng,
-                                n_eta_mh,
+                                n_cw_sweeps,
                                 &mut mh_scratch,
                                 schedules[i].as_ref(),
                                 kappas_opt,
                             );
-                            ep.acc += na as u64;
-                            ep.prop += n_eta_mh as u64;
-                            if n_cw_sweeps > 0 {
-                                let (acc_cw, _n_prop, nll_cw) = mh_steps_componentwise(
-                                    &mut etas[i],
-                                    nll_block,
-                                    &population.subjects[i],
-                                    model,
-                                    &theta,
-                                    &omega_cur,
-                                    &sigma,
-                                    &ep.cw_scales,
-                                    &cw_sd,
-                                    &mut rng,
-                                    n_cw_sweeps,
-                                    &mut mh_scratch,
-                                    schedules[i].as_ref(),
-                                    kappas_opt,
-                                );
-                                for (slot, a) in ep.cw_acc.iter_mut().zip(&acc_cw) {
-                                    *slot += *a as u64;
-                                }
-                                ep.cw_prop += n_cw_sweeps as u64;
-                                (na, nll_cw)
-                            } else {
-                                (na, nll_block)
+                            for (slot, a) in ep.cw_acc.iter_mut().zip(&acc_cw) {
+                                *slot += *a as u64;
                             }
-                        };
-                        nll[i] = nll_new;
-                        acc_eta += na as u64;
-                        prop_eta += n_eta_mh as u64;
-                        acc_eta_disp += na as u64;
-                        prop_eta_disp += n_eta_mh as u64;
-                    }
-                }
-
-                // ---- 1b. κ block: sample κ_ik | η, θ, Ω, Ω_iov, data (η fixed) ----
-                if should_sample_kappa_block(n_kappa, omega_iov_cur.as_ref()) {
-                    let oi = omega_iov_cur
-                        .as_ref()
-                        .expect("should_sample_kappa_block requires OMEGA_IOV");
-                    for i in 0..n_subjects {
-                        // Mixture (#985): the marginal κ kernel, so the acceptance
-                        // ratio compares like with like (`nll[i]` is the K-class
-                        // marginal the η block left behind).
-                        let (na, np, nll_new) = if model.mixture.is_some() {
-                            mh_kappa_steps_mixture(
-                                &mut kappas[i],
-                                nll[i],
-                                &population.subjects[i],
-                                model,
-                                &theta,
-                                &etas[i],
-                                &omega_cur,
-                                oi,
-                                &sigma,
-                                kappa_scale,
-                                &mut rng,
-                                &mut scratch,
-                            )
+                            ep.cw_prop += n_cw_sweeps as u64;
+                            (na, nll_cw)
                         } else {
-                            mh_kappa_steps(
-                                &mut kappas[i],
-                                nll[i],
-                                &population.subjects[i],
-                                model,
-                                &theta,
-                                &etas[i],
-                                &omega_cur,
-                                oi,
-                                &sigma,
-                                kappa_scale,
-                                &mut rng,
-                                schedules[i].as_ref(),
-                                &mut scratch,
-                            )
-                        };
-                        nll[i] = nll_new;
-                        acc_kappa += na as u64;
-                        prop_kappa += np as u64;
-                    }
-                }
-
-                // ---- 2. Ω block (conjugate full conditional) ----
-                if !omega_all_fixed {
-                    if init_params.omega.diagonal {
-                        // Diagonal Ω: each variance has an INDEPENDENT inverse-gamma
-                        // full conditional. Drawing a dense inverse-Wishart and then
-                        // zeroing the off-diagonals is wrong — the marginal of an IW
-                        // diagonal element carries df ν0−p+1, so the variance
-                        // posteriors are mis-scaled (bias grows with η-dimension and
-                        // small N). Using the IW diagonal-marginal IG((ν0−p+1)/2,
-                        // Λ0_jj/2) as the per-variance prior keeps the implied prior
-                        // identical to the dense path while giving each variance the
-                        // full N "observations" (η_ij ~ N(0, ω_j²)).
-                        let a0 = (nu0 - n_eta as f64 + 1.0) / 2.0;
-                        for j in 0..n_eta {
-                            if init_params.omega_fixed.get(j).copied().unwrap_or(false)
-                                || !init_params.omega.free_mask[(j, j)]
-                            {
-                                continue; // FIX-ed or structurally-absent variance.
-                            }
-                            let ss: f64 = etas.iter().map(|e| e[j] * e[j]).sum();
-                            let shape = a0 + n_subjects as f64 / 2.0;
-                            let scale = (lambda0[(j, j)] / 2.0 + ss / 2.0).max(TINY);
-                            omega_mat[(j, j)] =
-                                inverse_gamma_draw(shape, scale, &mut rng).max(OMEGA_DIAG_FLOOR);
+                            (na, nll_block)
                         }
+                    };
+                    nll[i] = nll_new;
+                    acc_eta += na as u64;
+                    prop_eta += n_eta_mh as u64;
+                    acc_eta_disp += na as u64;
+                    prop_eta_disp += n_eta_mh as u64;
+                }
+            }
+
+            // ---- 1b. κ block: sample κ_ik | η, θ, Ω, Ω_iov, data (η fixed) ----
+            if should_sample_kappa_block(n_kappa, omega_iov_cur.as_ref()) {
+                let oi = omega_iov_cur
+                    .as_ref()
+                    .expect("should_sample_kappa_block requires OMEGA_IOV");
+                for i in 0..n_subjects {
+                    // Mixture (#985): the marginal κ kernel, so the acceptance
+                    // ratio compares like with like (`nll[i]` is the K-class
+                    // marginal the η block left behind).
+                    let (na, np, nll_new) = if model.mixture.is_some() {
+                        mh_kappa_steps_mixture(
+                            &mut kappas[i],
+                            nll[i],
+                            &population.subjects[i],
+                            model,
+                            &theta,
+                            &etas[i],
+                            &omega_cur,
+                            oi,
+                            &sigma,
+                            kappa_scale,
+                            &mut rng,
+                            &mut scratch,
+                        )
+                    } else {
+                        mh_kappa_steps(
+                            &mut kappas[i],
+                            nll[i],
+                            &population.subjects[i],
+                            model,
+                            &theta,
+                            &etas[i],
+                            &omega_cur,
+                            oi,
+                            &sigma,
+                            kappa_scale,
+                            &mut rng,
+                            schedules[i].as_ref(),
+                            &mut scratch,
+                        )
+                    };
+                    nll[i] = nll_new;
+                    acc_kappa += na as u64;
+                    prop_kappa += np as u64;
+                }
+            }
+
+            // ---- 2. Ω block (conjugate full conditional) ----
+            if !omega_all_fixed {
+                if init_params.omega.diagonal {
+                    // Diagonal Ω: each variance has an INDEPENDENT inverse-gamma
+                    // full conditional. Drawing a dense inverse-Wishart and then
+                    // zeroing the off-diagonals is wrong — the marginal of an IW
+                    // diagonal element carries df ν0−p+1, so the variance
+                    // posteriors are mis-scaled (bias grows with η-dimension and
+                    // small N). Using the IW diagonal-marginal IG((ν0−p+1)/2,
+                    // Λ0_jj/2) as the per-variance prior keeps the implied prior
+                    // identical to the dense path while giving each variance the
+                    // full N "observations" (η_ij ~ N(0, ω_j²)).
+                    let a0 = (nu0 - n_eta as f64 + 1.0) / 2.0;
+                    for j in 0..n_eta {
+                        if init_params.omega_fixed.get(j).copied().unwrap_or(false)
+                            || !init_params.omega.free_mask[(j, j)]
+                        {
+                            continue; // FIX-ed or structurally-absent variance.
+                        }
+                        let ss: f64 = etas.iter().map(|e| e[j] * e[j]).sum();
+                        let shape = a0 + n_subjects as f64 / 2.0;
+                        let scale = (lambda0[(j, j)] / 2.0 + ss / 2.0).max(TINY);
+                        omega_mat[(j, j)] =
+                            inverse_gamma_draw(shape, scale, &mut rng).max(OMEGA_DIAG_FLOOR);
+                    }
+                    omega_cur = OmegaMatrix::from_matrix(
+                        omega_mat.clone(),
+                        init_params.omega.eta_names.clone(),
+                        init_params.omega.diagonal,
+                    );
+                } else {
+                    let mut s = DMatrix::<f64>::zeros(n_eta, n_eta);
+                    for e in &etas {
+                        let ev = DVector::from_column_slice(e);
+                        s += &ev * ev.transpose();
+                    }
+                    let psi_post = &lambda0 + s;
+                    if let Some(draw) =
+                        inverse_wishart_draw(nu0 + n_subjects as f64, &psi_post, &mut rng)
+                    {
+                        let mut m = draw;
+                        impose_omega_structure(
+                            &mut m,
+                            &init_params.omega.free_mask,
+                            &init_params.omega_fixed,
+                            &init_params.omega.matrix,
+                            OMEGA_DIAG_FLOOR,
+                        );
+                        omega_mat = m;
                         omega_cur = OmegaMatrix::from_matrix(
                             omega_mat.clone(),
                             init_params.omega.eta_names.clone(),
                             init_params.omega.diagonal,
                         );
-                    } else {
-                        let mut s = DMatrix::<f64>::zeros(n_eta, n_eta);
-                        for e in &etas {
-                            let ev = DVector::from_column_slice(e);
-                            s += &ev * ev.transpose();
-                        }
-                        let psi_post = &lambda0 + s;
-                        if let Some(draw) =
-                            inverse_wishart_draw(nu0 + n_subjects as f64, &psi_post, &mut rng)
-                        {
-                            let mut m = draw;
-                            impose_omega_structure(
-                                &mut m,
-                                &init_params.omega.free_mask,
-                                &init_params.omega_fixed,
-                                &init_params.omega.matrix,
-                                OMEGA_DIAG_FLOOR,
-                            );
-                            omega_mat = m;
-                            omega_cur = OmegaMatrix::from_matrix(
-                                omega_mat.clone(),
-                                init_params.omega.eta_names.clone(),
-                                init_params.omega.diagonal,
-                            );
-                        }
                     }
                 }
+            }
 
-                // ---- 2c. Ω_iov block (conjugate inverse-Wishart over kappas) ----
-                // Posterior IW(ν0 + N_occ, Λ0_iov + Σᵢ Σₖ κᵢₖκᵢₖᵀ); the structural
-                // template (free_mask, fixed rows, OMEGA_IOV_DIAG_FLOOR) is re-imposed
-                // via impose_omega_structure, the same helper the Ω block uses.
-                if n_kappa > 0 && !omega_iov_all_fixed {
-                    if let (Some(oi_ref), Some(lam)) =
-                        (init_params.omega_iov.as_ref(), lambda0_iov.as_ref())
+            // ---- 2c. Ω_iov block (conjugate inverse-Wishart over kappas) ----
+            // Posterior IW(ν0 + N_occ, Λ0_iov + Σᵢ Σₖ κᵢₖκᵢₖᵀ); the structural
+            // template (free_mask, fixed rows, OMEGA_IOV_DIAG_FLOOR) is re-imposed
+            // via impose_omega_structure, the same helper the Ω block uses.
+            if n_kappa > 0 && !omega_iov_all_fixed {
+                if let (Some(oi_ref), Some(lam)) =
+                    (init_params.omega_iov.as_ref(), lambda0_iov.as_ref())
+                {
+                    let mut s = DMatrix::<f64>::zeros(n_kappa, n_kappa);
+                    let mut n_occ_total = 0usize;
+                    for ks in &kappas {
+                        for kap in ks {
+                            let kv = DVector::from_column_slice(kap);
+                            s += &kv * kv.transpose();
+                            n_occ_total += 1;
+                        }
+                    }
+                    let psi_post = lam + s;
+                    if let Some(draw) =
+                        inverse_wishart_draw(nu0_iov + n_occ_total as f64, &psi_post, &mut rng)
                     {
-                        let mut s = DMatrix::<f64>::zeros(n_kappa, n_kappa);
-                        let mut n_occ_total = 0usize;
-                        for ks in &kappas {
-                            for kap in ks {
-                                let kv = DVector::from_column_slice(kap);
-                                s += &kv * kv.transpose();
-                                n_occ_total += 1;
-                            }
-                        }
-                        let psi_post = lam + s;
-                        if let Some(draw) =
-                            inverse_wishart_draw(nu0_iov + n_occ_total as f64, &psi_post, &mut rng)
-                        {
-                            let mut m = draw;
-                            impose_omega_structure(
-                                &mut m,
-                                &oi_ref.free_mask,
-                                &init_params.kappa_fixed,
-                                &oi_ref.matrix,
-                                OMEGA_IOV_DIAG_FLOOR,
-                            );
-                            omega_iov_cur = Some(OmegaMatrix::from_matrix_with_mask(
-                                m,
-                                oi_ref.eta_names.clone(),
-                                oi_ref.diagonal,
-                                oi_ref.free_mask.clone(),
-                            ));
-                        }
+                        let mut m = draw;
+                        impose_omega_structure(
+                            &mut m,
+                            &oi_ref.free_mask,
+                            &init_params.kappa_fixed,
+                            &oi_ref.matrix,
+                            OMEGA_IOV_DIAG_FLOOR,
+                        );
+                        omega_iov_cur = Some(OmegaMatrix::from_matrix_with_mask(
+                            m,
+                            oi_ref.eta_names.clone(),
+                            oi_ref.diagonal,
+                            oi_ref.free_mask.clone(),
+                        ));
                     }
                 }
+            }
 
-                // Refresh the cached per-subject NLL. Blocks 2/2c drew a new Ω /
-                // Ω_iov, so the cached `nll` still carries the pre-draw η-prior,
-                // κ-prior and log|Ω| terms. Two consumers need it exact:
+            // Refresh the cached per-subject NLL. Blocks 2/2c drew a new Ω /
+            // Ω_iov, so the cached `nll` still carries the pre-draw η-prior,
+            // κ-prior and log|Ω| terms. Two consumers need it exact:
+            //
+            // - block 2b scores its Metropolis ratio against it (it evaluates
+            //   only the *proposed* state, and keeps `nll` in step itself —
+            //   see `MuDesign::draw`);
+            // - block 3 likewise recomputes only the *proposal* NLL, so a
+            //   stale baseline leaves those terms uncancelled — a constant
+            //   per-sweep offset δ on every θ/σ accept that biases σ and
+            //   non-mu-ref θ.
+            //
+            // (Unconditional when either runs: cheaper to always refresh than
+            // to track which of the earlier blocks fired.)
+            if n_pop > 0 || mu_design.is_some() {
+                for i in 0..n_subjects {
+                    nll[i] = subject_nll(
+                        model,
+                        &population.subjects[i],
+                        &theta,
+                        &etas[i],
+                        &kappas[i],
+                        &omega_cur,
+                        omega_iov_cur.as_ref(),
+                        &sigma,
+                        &mut scratch,
+                        schedules[i].as_ref(),
+                    );
+                }
+            }
+
+            // ---- 2b. mu-ref θ block (exact Gaussian full conditional) ----
+            // For P_i = θ·exp(η_i) with η ~ N(0, Ω), the population mean
+            // μ = log θ has full conditional μ ~ N(μ_old + η̄, Ω/N); with
+            // covariate coefficients that enter log P_i linearly it is the
+            // Gaussian regression conditional of `MuDesign`. The draw is a
+            // proposal: it re-centres η to hold every design φ_i, and is
+            // accepted by Metropolis–Hastings on the real target
+            // (`−Σ subject_nll`, the same likelihood every block scores), so
+            // it is exact for any typical value; on an affine design whose
+            // data depend on θ only through φ, the ratio is 1 and it is the
+            // Gibbs draw. A draw outside a θ bound is rejected, where the old
+            // move clamped it. This is what makes the chains mix.
+            if let Some(design) = mu_design.as_ref() {
+                // The baseline `draw` scores against must describe the state the
+                // chain is actually in — the refresh above, not a vector left
+                // over from before the Ω draw. That is otherwise an argument
+                // about block order with nothing to fail on: measured on this
+                // branch, moving the refresh back below this block leaves all 68
+                // bayes tests green while shifting the two-compartment covariate
+                // OFV from −2300.345 to −2305.302 and every θ in its third digit.
                 //
-                // - block 2b scores its Metropolis ratio against it (it evaluates
-                //   only the *proposed* state, and keeps `nll` in step itself —
-                //   see `MuDesign::draw`);
-                // - block 3 likewise recomputes only the *proposal* NLL, so a
-                //   stale baseline leaves those terms uncancelled — a constant
-                //   per-sweep offset δ on every θ/σ accept that biases σ and
-                //   non-mu-ref θ.
-                //
-                // (Unconditional when either runs: cheaper to always refresh than
-                // to track which of the earlier blocks fired.)
-                if n_pop > 0 || mu_design.is_some() {
+                // Checked once per chain, so the cost is one population pass per
+                // chain per run, and only where `debug_assert` is live — which
+                // includes the `ci-cov` profile the per-PR coverage jobs build
+                // (#1248).
+                #[cfg(debug_assertions)]
+                if !baseline_checked {
+                    baseline_checked = true;
                     for i in 0..n_subjects {
-                        nll[i] = subject_nll(
+                        let fresh = subject_nll(
                             model,
                             &population.subjects[i],
                             &theta,
@@ -1506,39 +1547,102 @@ pub fn run_bayes(
                             &mut scratch,
                             schedules[i].as_ref(),
                         );
+                        debug_assert_eq!(
+                            nll[i], fresh,
+                            "subject {i}: the conjugate move was handed a stale NLL \
+                                 baseline — the refresh must run after the Omega blocks and \
+                                 before this one, for every model that has a design"
+                        );
                     }
                 }
+                let mut subject_nlls = |th: &[f64], es: &[Vec<f64>]| -> Vec<f64> {
+                    (0..n_subjects)
+                        .map(|i| {
+                            subject_nll(
+                                model,
+                                &population.subjects[i],
+                                th,
+                                &es[i],
+                                &kappas[i],
+                                &omega_cur,
+                                omega_iov_cur.as_ref(),
+                                &sigma,
+                                &mut scratch,
+                                schedules[i].as_ref(),
+                            )
+                        })
+                        .collect()
+                };
+                let (outcome, _log_alpha) = design.draw(
+                    &mut theta,
+                    &mut etas,
+                    &omega_cur,
+                    &init_params.theta_lower,
+                    &init_params.theta_upper,
+                    population,
+                    &mut rng,
+                    &mut nll,
+                    &mut subject_nlls,
+                );
+                if sweep >= n_warmup {
+                    conj_tally.record(outcome);
+                }
+            }
 
-                // ---- 2b. mu-ref θ block (exact Gaussian full conditional) ----
-                // For P_i = θ·exp(η_i) with η ~ N(0, Ω), the population mean
-                // μ = log θ has full conditional μ ~ N(μ_old + η̄, Ω/N); with
-                // covariate coefficients that enter log P_i linearly it is the
-                // Gaussian regression conditional of `MuDesign`. The draw is a
-                // proposal: it re-centres η to hold every design φ_i, and is
-                // accepted by Metropolis–Hastings on the real target
-                // (`−Σ subject_nll`, the same likelihood every block scores), so
-                // it is exact for any typical value; on an affine design whose
-                // data depend on θ only through φ, the ratio is 1 and it is the
-                // Gibbs draw. A draw outside a θ bound is rejected, where the old
-                // move clamped it. This is what makes the chains mix.
-                if let Some(design) = mu_design.as_ref() {
-                    // The baseline `draw` scores against must describe the state the
-                    // chain is actually in — the refresh above, not a vector left
-                    // over from before the Ω draw. That is otherwise an argument
-                    // about block order with nothing to fail on: measured on this
-                    // branch, moving the refresh back below this block leaves all 68
-                    // bayes tests green while shifting the two-compartment covariate
-                    // OFV from −2300.345 to −2305.302 and every θ in its third digit.
-                    //
-                    // Checked once per chain, so the cost is one population pass per
-                    // chain per run, and only where `debug_assert` is live — which
-                    // includes the `ci-cov` profile the per-PR coverage jobs build
-                    // (#1248).
-                    #[cfg(debug_assertions)]
-                    if !baseline_checked {
-                        baseline_checked = true;
-                        for i in 0..n_subjects {
-                            let fresh = subject_nll(
+            // ---- 3. (θ, σ) block ----
+            // Moving one θ/σ changes every subject's likelihood, so each move
+            // recomputes the full per-subject NLL; η and Ω are fixed, so their
+            // prior terms cancel in the ratio. Two kernels: componentwise random
+            // walk during the bootstrap phase, then a joint adaptive-covariance
+            // proposal (once `prop_chol` is built) that moves along correlations.
+            if n_pop > 0 {
+                let inv_var = 1.0 / (POP_PRIOR_SD * POP_PRIOR_SD);
+
+                // (a) Componentwise random walk — one coordinate at a time, each
+                // with its own adaptive scale. ALWAYS runs, so it carries mixing
+                // regardless of whether the joint proposal exists or is well
+                // scaled (a mixture kernel: the joint move below can only help).
+                for c in 0..n_pop {
+                    let (idx, log, is_theta) = match pop_coords[c] {
+                        PopCoord::Theta { idx, log } => (idx, log, true),
+                        PopCoord::Sigma { idx } => (idx, true, false),
+                    };
+                    let u_old = if is_theta {
+                        if log {
+                            theta[idx].max(TINY).ln()
+                        } else {
+                            theta[idx]
+                        }
+                    } else {
+                        sigma[idx].max(TINY).ln()
+                    };
+                    let u_new = u_old + rw_scales[c] * rng.sample::<f64, _>(StandardNormal);
+                    // A θ outside its declared bounds has zero posterior
+                    // density: reject without evaluating (#1626).
+                    if is_theta {
+                        let v = if log { u_new.exp() } else { u_new };
+                        if !within_bounds(
+                            v,
+                            idx,
+                            &init_params.theta_lower,
+                            &init_params.theta_upper,
+                        ) {
+                            prop_pop[c] += 1;
+                            continue;
+                        }
+                    }
+
+                    // Mutate the single coordinate in place (no full θ/σ vector
+                    // clone per move) and restore it on reject.
+                    let old_val = if is_theta { theta[idx] } else { sigma[idx] };
+                    if is_theta {
+                        theta[idx] = if log { u_new.exp() } else { u_new };
+                    } else {
+                        sigma[idx] = u_new.exp();
+                    }
+                    let nll_prop: Vec<f64> = (0..n_subjects)
+                        .map(|i| {
+                            subject_nll(
                                 model,
                                 &population.subjects[i],
                                 &theta,
@@ -1549,351 +1653,242 @@ pub fn run_bayes(
                                 &sigma,
                                 &mut scratch,
                                 schedules[i].as_ref(),
-                            );
-                            debug_assert_eq!(
-                                nll[i], fresh,
-                                "subject {i}: the conjugate move was handed a stale NLL \
-                                 baseline — the refresh must run after the Omega blocks and \
-                                 before this one, for every model that has a design"
-                            );
+                            )
+                        })
+                        .collect();
+                    let sum_cur: f64 = nll.iter().sum();
+                    let sum_prop: f64 = nll_prop.iter().sum();
+                    let d_nlp = 0.5 * ((u_new - u0[c]).powi(2) - (u_old - u0[c]).powi(2)) * inv_var;
+                    prop_pop[c] += 1;
+                    if rng.random::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
+                        nll = nll_prop;
+                        acc_pop[c] += 1;
+                    } else if is_theta {
+                        theta[idx] = old_val;
+                    } else {
+                        sigma[idx] = old_val;
+                    }
+                }
+
+                // (b) Joint adaptive-covariance (Haario) proposal — an ADDITIONAL
+                // move, available once `prop_chol` is built. Proposes all
+                // coordinates together along the estimated posterior covariance,
+                // catching correlations the per-coordinate walk cannot (e.g. a
+                // V3↔Q3 ridge). u' = u + √joint_scale · L z.
+                if let Some(ref l) = prop_chol {
+                    let u_cur = pack(&theta, &sigma);
+                    let z = DVector::from_iterator(
+                        n_pop,
+                        (0..n_pop).map(|_| rng.sample::<f64, _>(StandardNormal)),
+                    );
+                    let step = joint_scale.sqrt() * (l * z);
+                    let u_prop: Vec<f64> = (0..n_pop).map(|c| u_cur[c] + step[c]).collect();
+                    let mut theta_prop = theta.clone();
+                    let mut sigma_prop = sigma.clone();
+                    for (c, &up) in pop_coords.iter().zip(&u_prop) {
+                        match *c {
+                            PopCoord::Theta { idx, log } => {
+                                theta_prop[idx] = if log { up.exp() } else { up };
+                            }
+                            PopCoord::Sigma { idx } => sigma_prop[idx] = up.exp(),
                         }
                     }
-                    let mut subject_nlls = |th: &[f64], es: &[Vec<f64>]| -> Vec<f64> {
+                    let in_bounds = pop_coords.iter().all(|c| match *c {
+                        PopCoord::Theta { idx, .. } => within_bounds(
+                            theta_prop[idx],
+                            idx,
+                            &init_params.theta_lower,
+                            &init_params.theta_upper,
+                        ),
+                        PopCoord::Sigma { .. } => true,
+                    });
+                    let nll_prop: Vec<f64> = if !in_bounds {
+                        Vec::new()
+                    } else {
                         (0..n_subjects)
                             .map(|i| {
                                 subject_nll(
                                     model,
                                     &population.subjects[i],
-                                    th,
-                                    &es[i],
+                                    &theta_prop,
+                                    &etas[i],
                                     &kappas[i],
                                     &omega_cur,
                                     omega_iov_cur.as_ref(),
-                                    &sigma,
+                                    &sigma_prop,
                                     &mut scratch,
                                     schedules[i].as_ref(),
                                 )
                             })
                             .collect()
                     };
-                    let (outcome, _log_alpha) = design.draw(
-                        &mut theta,
-                        &mut etas,
-                        &omega_cur,
-                        &init_params.theta_lower,
-                        &init_params.theta_upper,
-                        population,
-                        &mut rng,
-                        &mut nll,
-                        &mut subject_nlls,
-                    );
-                    if sweep >= n_warmup {
-                        conj_tally.record(outcome);
-                    }
-                }
-
-                // ---- 3. (θ, σ) block ----
-                // Moving one θ/σ changes every subject's likelihood, so each move
-                // recomputes the full per-subject NLL; η and Ω are fixed, so their
-                // prior terms cancel in the ratio. Two kernels: componentwise random
-                // walk during the bootstrap phase, then a joint adaptive-covariance
-                // proposal (once `prop_chol` is built) that moves along correlations.
-                if n_pop > 0 {
-                    let inv_var = 1.0 / (POP_PRIOR_SD * POP_PRIOR_SD);
-
-                    // (a) Componentwise random walk — one coordinate at a time, each
-                    // with its own adaptive scale. ALWAYS runs, so it carries mixing
-                    // regardless of whether the joint proposal exists or is well
-                    // scaled (a mixture kernel: the joint move below can only help).
+                    let sum_cur: f64 = nll.iter().sum();
+                    let sum_prop: f64 = nll_prop.iter().sum();
+                    let mut d_nlp = 0.0;
                     for c in 0..n_pop {
-                        let (idx, log, is_theta) = match pop_coords[c] {
-                            PopCoord::Theta { idx, log } => (idx, log, true),
-                            PopCoord::Sigma { idx } => (idx, true, false),
-                        };
-                        let u_old = if is_theta {
-                            if log {
-                                theta[idx].max(TINY).ln()
-                            } else {
-                                theta[idx]
-                            }
-                        } else {
-                            sigma[idx].max(TINY).ln()
-                        };
-                        let u_new = u_old + rw_scales[c] * rng.sample::<f64, _>(StandardNormal);
-                        // A θ outside its declared bounds has zero posterior
-                        // density: reject without evaluating (#1626).
-                        if is_theta {
-                            let v = if log { u_new.exp() } else { u_new };
-                            if !within_bounds(
-                                v,
-                                idx,
-                                &init_params.theta_lower,
-                                &init_params.theta_upper,
-                            ) {
-                                prop_pop[c] += 1;
-                                continue;
-                            }
-                        }
-
-                        // Mutate the single coordinate in place (no full θ/σ vector
-                        // clone per move) and restore it on reject.
-                        let old_val = if is_theta { theta[idx] } else { sigma[idx] };
-                        if is_theta {
-                            theta[idx] = if log { u_new.exp() } else { u_new };
-                        } else {
-                            sigma[idx] = u_new.exp();
-                        }
-                        let nll_prop: Vec<f64> = (0..n_subjects)
-                            .map(|i| {
-                                subject_nll(
-                                    model,
-                                    &population.subjects[i],
-                                    &theta,
-                                    &etas[i],
-                                    &kappas[i],
-                                    &omega_cur,
-                                    omega_iov_cur.as_ref(),
-                                    &sigma,
-                                    &mut scratch,
-                                    schedules[i].as_ref(),
-                                )
-                            })
-                            .collect();
-                        let sum_cur: f64 = nll.iter().sum();
-                        let sum_prop: f64 = nll_prop.iter().sum();
-                        let d_nlp =
-                            0.5 * ((u_new - u0[c]).powi(2) - (u_old - u0[c]).powi(2)) * inv_var;
-                        prop_pop[c] += 1;
-                        if rng.random::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
-                            nll = nll_prop;
-                            acc_pop[c] += 1;
-                        } else if is_theta {
-                            theta[idx] = old_val;
-                        } else {
-                            sigma[idx] = old_val;
-                        }
+                        d_nlp += 0.5
+                            * ((u_prop[c] - u0[c]).powi(2) - (u_cur[c] - u0[c]).powi(2))
+                            * inv_var;
                     }
-
-                    // (b) Joint adaptive-covariance (Haario) proposal — an ADDITIONAL
-                    // move, available once `prop_chol` is built. Proposes all
-                    // coordinates together along the estimated posterior covariance,
-                    // catching correlations the per-coordinate walk cannot (e.g. a
-                    // V3↔Q3 ridge). u' = u + √joint_scale · L z.
-                    if let Some(ref l) = prop_chol {
-                        let u_cur = pack(&theta, &sigma);
-                        let z = DVector::from_iterator(
-                            n_pop,
-                            (0..n_pop).map(|_| rng.sample::<f64, _>(StandardNormal)),
-                        );
-                        let step = joint_scale.sqrt() * (l * z);
-                        let u_prop: Vec<f64> = (0..n_pop).map(|c| u_cur[c] + step[c]).collect();
-                        let mut theta_prop = theta.clone();
-                        let mut sigma_prop = sigma.clone();
-                        for (c, &up) in pop_coords.iter().zip(&u_prop) {
-                            match *c {
-                                PopCoord::Theta { idx, log } => {
-                                    theta_prop[idx] = if log { up.exp() } else { up };
-                                }
-                                PopCoord::Sigma { idx } => sigma_prop[idx] = up.exp(),
-                            }
-                        }
-                        let in_bounds = pop_coords.iter().all(|c| match *c {
-                            PopCoord::Theta { idx, .. } => within_bounds(
-                                theta_prop[idx],
-                                idx,
-                                &init_params.theta_lower,
-                                &init_params.theta_upper,
-                            ),
-                            PopCoord::Sigma { .. } => true,
-                        });
-                        let nll_prop: Vec<f64> = if !in_bounds {
-                            Vec::new()
-                        } else {
-                            (0..n_subjects)
-                                .map(|i| {
-                                    subject_nll(
-                                        model,
-                                        &population.subjects[i],
-                                        &theta_prop,
-                                        &etas[i],
-                                        &kappas[i],
-                                        &omega_cur,
-                                        omega_iov_cur.as_ref(),
-                                        &sigma_prop,
-                                        &mut scratch,
-                                        schedules[i].as_ref(),
-                                    )
-                                })
-                                .collect()
-                        };
-                        let sum_cur: f64 = nll.iter().sum();
-                        let sum_prop: f64 = nll_prop.iter().sum();
-                        let mut d_nlp = 0.0;
-                        for c in 0..n_pop {
-                            d_nlp += 0.5
-                                * ((u_prop[c] - u0[c]).powi(2) - (u_cur[c] - u0[c]).powi(2))
-                                * inv_var;
-                        }
-                        joint_prop += 1;
-                        if in_bounds && rng.random::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
-                            theta = theta_prop;
-                            sigma = sigma_prop;
-                            nll = nll_prop;
-                            joint_acc += 1;
-                        }
-                    }
-
-                    // Welford update of the pop-vector covariance (warmup only; the
-                    // proposal is frozen for the sampling phase). The estimate is
-                    // built from the componentwise-driven exploration, which keeps
-                    // moving even when the joint proposal is poorly scaled.
-                    if sweep < n_warmup {
-                        let u_now = pack(&theta, &sigma);
-                        n_cov += 1;
-                        let nc = n_cov as f64;
-                        // delta vs the OLD mean, then update the mean, then delta2 vs
-                        // the NEW mean — Welford's covariance recurrence.
-                        let delta: Vec<f64> = (0..n_pop).map(|c| u_now[c] - u_mean[c]).collect();
-                        for c in 0..n_pop {
-                            u_mean[c] += delta[c] / nc;
-                        }
-                        let delta2: Vec<f64> = (0..n_pop).map(|c| u_now[c] - u_mean[c]).collect();
-                        for i in 0..n_pop {
-                            for j in 0..n_pop {
-                                u_m2[(i, j)] += delta[i] * delta2[j];
-                            }
-                        }
+                    joint_prop += 1;
+                    if in_bounds && rng.random::<f64>().ln() < (sum_cur - sum_prop) - d_nlp {
+                        theta = theta_prop;
+                        sigma = sigma_prop;
+                        nll = nll_prop;
+                        joint_acc += 1;
                     }
                 }
 
-                // Per-subject η moments for the posterior-shaped proposal.
+                // Welford update of the pop-vector covariance (warmup only; the
+                // proposal is frozen for the sampling phase). The estimate is
+                // built from the componentwise-driven exploration, which keeps
+                // moving even when the joint proposal is poorly scaled.
                 if sweep < n_warmup {
-                    for (ep, eta) in eta_props.iter_mut().zip(&etas) {
-                        ep.observe(eta);
-                    }
-                }
-
-                // ---- warmup adaptation of the step sizes ----
-                if sweep < n_warmup && (sweep + 1) % 50 == 0 {
-                    // Componentwise scales (bootstrap kernel).
+                    let u_now = pack(&theta, &sigma);
+                    n_cov += 1;
+                    let nc = n_cov as f64;
+                    // delta vs the OLD mean, then update the mean, then delta2 vs
+                    // the NEW mean — Welford's covariance recurrence.
+                    let delta: Vec<f64> = (0..n_pop).map(|c| u_now[c] - u_mean[c]).collect();
                     for c in 0..n_pop {
-                        if prop_pop[c] > 0 {
-                            let r = acc_pop[c] as f64 / prop_pop[c] as f64;
-                            rw_scales[c] *= (r - 0.234).exp();
-                            rw_scales[c] = rw_scales[c].clamp(1e-4, 100.0);
-                            acc_pop[c] = 0;
-                            prop_pop[c] = 0;
+                        u_mean[c] += delta[c] / nc;
+                    }
+                    let delta2: Vec<f64> = (0..n_pop).map(|c| u_now[c] - u_mean[c]).collect();
+                    for i in 0..n_pop {
+                        for j in 0..n_pop {
+                            u_m2[(i, j)] += delta[i] * delta2[j];
                         }
                     }
-                    // Global scale of the joint Haario proposal (≈0.234 target).
-                    if joint_prop > 0 {
-                        let r = joint_acc as f64 / joint_prop as f64;
-                        joint_scale *= (r - 0.234).exp();
-                        joint_scale = joint_scale.clamp(1e-4, 1e4);
-                        joint_acc = 0;
-                        joint_prop = 0;
-                    }
-                    // (Re)build the joint proposal Cholesky once past the bootstrap
-                    // phase and with enough samples for a well-conditioned estimate.
-                    if n_pop > 0 && sweep + 1 >= bootstrap_end && n_cov > 2 * n_pop {
-                        let cov = &u_m2 / ((n_cov - 1) as f64);
-                        let mut p = am_base * cov;
-                        for i in 0..n_pop {
-                            p[(i, i)] += 1e-9; // regularize against a singular estimate
-                        }
-                        if let Some(ch) = Cholesky::new(p) {
-                            prop_chol = Some(ch.l());
-                        }
-                    }
-                    if prop_eta > 0 {
-                        let r = acc_eta as f64 / prop_eta as f64;
-                        // Target acceptance differs by kernel: ~0.234 is optimal for the
-                        // random-walk block move, but HMC wants a much higher rate
-                        // (~0.7); adapting the HMC leapfrog step toward 0.234 inflates it
-                        // until trajectories diverge (over-dispersing η, biasing σ). Same
-                        // split SAEM uses for its η scale.
-                        let target = if using_hmc { 0.7 } else { 0.234 };
-                        eta_scale *= (r - target).exp();
-                        eta_scale = eta_scale.clamp(1e-4, 100.0);
-                    }
-                    acc_eta = 0;
-                    prop_eta = 0;
-                    let build_shape = sweep + 1 >= bootstrap_end;
-                    for ep in eta_props.iter_mut() {
-                        ep.adapt(build_shape);
-                    }
-                    if prop_kappa > 0 {
-                        let r = acc_kappa as f64 / prop_kappa as f64;
-                        kappa_scale *= (r - 0.234).exp();
-                        kappa_scale = kappa_scale.clamp(1e-4, 100.0);
-                    }
-                    acc_kappa = 0;
-                    prop_kappa = 0;
-                }
-
-                // ---- record retained draws ----
-                if sweep >= n_warmup && (sweep - n_warmup) % thin == 0 {
-                    let mut p = 0;
-                    for &t in &theta {
-                        chain_draws[p].push(t);
-                        p += 1;
-                    }
-                    for &(i, j) in &omega_coords {
-                        chain_draws[p].push(omega_mat[(i, j)]);
-                        p += 1;
-                    }
-                    for &s in &sigma {
-                        chain_draws[p].push(s);
-                        p += 1;
-                    }
-                    if let Some(ref oi) = omega_iov_cur {
-                        for &(i, j) in &omega_iov_coords {
-                            chain_draws[p].push(oi.matrix[(i, j)]);
-                            p += 1;
-                        }
-                    }
-                    for i in 0..n_subjects {
-                        eta_sum[i] += DVector::from_column_slice(&etas[i]);
-                        for (total, k) in kappa_sum[i].iter_mut().zip(&kappas[i]) {
-                            *total += DVector::from_column_slice(k);
-                        }
-                    }
-                    eta_record_count += 1;
-                }
-
-                if verbose && (sweep + 1) % progress_every == 0 {
-                    let phase = if sweep < n_warmup { "warmup" } else { "sample" };
-                    // η-accept over the sweeps since the last progress line (a recent
-                    // window, not cumulative — so it tracks the adapted rate).
-                    let eta_acc = if prop_eta_disp > 0 {
-                        100.0 * acc_eta_disp as f64 / prop_eta_disp as f64
-                    } else {
-                        0.0
-                    };
-                    acc_eta_disp = 0;
-                    prop_eta_disp = 0;
-                    eprintln!(
-                        "  Bayes chain {}/{}  sweep {:>5}/{} [{}]  η-accept≈{:.0}%",
-                        chain + 1,
-                        n_chains,
-                        sweep + 1,
-                        total_sweeps,
-                        phase,
-                        eta_acc
-                    );
                 }
             }
 
-            Some((
-                chain_draws,
-                eta_sum,
-                kappa_sum,
-                eta_record_count,
-                n_divergent_total,
-                conj_tally,
-            ))
-        })
-        .collect();
+            // Per-subject η moments for the posterior-shaped proposal.
+            if sweep < n_warmup {
+                for (ep, eta) in eta_props.iter_mut().zip(&etas) {
+                    ep.observe(eta);
+                }
+            }
+
+            // ---- warmup adaptation of the step sizes ----
+            if sweep < n_warmup && (sweep + 1) % 50 == 0 {
+                // Componentwise scales (bootstrap kernel).
+                for c in 0..n_pop {
+                    if prop_pop[c] > 0 {
+                        let r = acc_pop[c] as f64 / prop_pop[c] as f64;
+                        rw_scales[c] *= (r - 0.234).exp();
+                        rw_scales[c] = rw_scales[c].clamp(1e-4, 100.0);
+                        acc_pop[c] = 0;
+                        prop_pop[c] = 0;
+                    }
+                }
+                // Global scale of the joint Haario proposal (≈0.234 target).
+                if joint_prop > 0 {
+                    let r = joint_acc as f64 / joint_prop as f64;
+                    joint_scale *= (r - 0.234).exp();
+                    joint_scale = joint_scale.clamp(1e-4, 1e4);
+                    joint_acc = 0;
+                    joint_prop = 0;
+                }
+                // (Re)build the joint proposal Cholesky once past the bootstrap
+                // phase and with enough samples for a well-conditioned estimate.
+                if n_pop > 0 && sweep + 1 >= bootstrap_end && n_cov > 2 * n_pop {
+                    let cov = &u_m2 / ((n_cov - 1) as f64);
+                    let mut p = am_base * cov;
+                    for i in 0..n_pop {
+                        p[(i, i)] += 1e-9; // regularize against a singular estimate
+                    }
+                    if let Some(ch) = Cholesky::new(p) {
+                        prop_chol = Some(ch.l());
+                    }
+                }
+                if prop_eta > 0 {
+                    let r = acc_eta as f64 / prop_eta as f64;
+                    // Target acceptance differs by kernel: ~0.234 is optimal for the
+                    // random-walk block move, but HMC wants a much higher rate
+                    // (~0.7); adapting the HMC leapfrog step toward 0.234 inflates it
+                    // until trajectories diverge (over-dispersing η, biasing σ). Same
+                    // split SAEM uses for its η scale.
+                    let target = if using_hmc { 0.7 } else { 0.234 };
+                    eta_scale *= (r - target).exp();
+                    eta_scale = eta_scale.clamp(1e-4, 100.0);
+                }
+                acc_eta = 0;
+                prop_eta = 0;
+                let build_shape = sweep + 1 >= bootstrap_end;
+                for ep in eta_props.iter_mut() {
+                    ep.adapt(build_shape);
+                }
+                if prop_kappa > 0 {
+                    let r = acc_kappa as f64 / prop_kappa as f64;
+                    kappa_scale *= (r - 0.234).exp();
+                    kappa_scale = kappa_scale.clamp(1e-4, 100.0);
+                }
+                acc_kappa = 0;
+                prop_kappa = 0;
+            }
+
+            // ---- record retained draws ----
+            if sweep >= n_warmup && (sweep - n_warmup) % thin == 0 {
+                let mut p = 0;
+                for &t in &theta {
+                    chain_draws[p].push(t);
+                    p += 1;
+                }
+                for &(i, j) in &omega_coords {
+                    chain_draws[p].push(omega_mat[(i, j)]);
+                    p += 1;
+                }
+                for &s in &sigma {
+                    chain_draws[p].push(s);
+                    p += 1;
+                }
+                if let Some(ref oi) = omega_iov_cur {
+                    for &(i, j) in &omega_iov_coords {
+                        chain_draws[p].push(oi.matrix[(i, j)]);
+                        p += 1;
+                    }
+                }
+                for i in 0..n_subjects {
+                    eta_sum[i] += DVector::from_column_slice(&etas[i]);
+                    for (total, k) in kappa_sum[i].iter_mut().zip(&kappas[i]) {
+                        *total += DVector::from_column_slice(k);
+                    }
+                }
+                eta_record_count += 1;
+            }
+
+            if verbose && (sweep + 1) % progress_every == 0 {
+                let phase = if sweep < n_warmup { "warmup" } else { "sample" };
+                // η-accept over the sweeps since the last progress line (a recent
+                // window, not cumulative — so it tracks the adapted rate).
+                let eta_acc = if prop_eta_disp > 0 {
+                    100.0 * acc_eta_disp as f64 / prop_eta_disp as f64
+                } else {
+                    0.0
+                };
+                acc_eta_disp = 0;
+                prop_eta_disp = 0;
+                eprintln!(
+                    "  Bayes chain {}/{}  sweep {:>5}/{} [{}]  η-accept≈{:.0}%",
+                    chain + 1,
+                    n_chains,
+                    sweep + 1,
+                    total_sweeps,
+                    phase,
+                    eta_acc
+                );
+            }
+        }
+
+        Some((
+            chain_draws,
+            eta_sum,
+            kappa_sum,
+            eta_record_count,
+            n_divergent_total,
+            conj_tally,
+        ))
+    });
 
     // Bail before the summary stage can observe partial/empty chain draws.
     if crate::cancel::is_cancelled(&options.cancel) {
@@ -2085,6 +2080,7 @@ pub fn run_bayes(
             pmix: meval.pmix.clone(),
             mixest: meval.mixest.clone(),
             n_fd_h_redone: meval.n_fd_h_redone,
+            class_nll: meval.class_nll.clone(),
         };
         (
             meval.mixest_etas,
@@ -2262,6 +2258,9 @@ pub fn run_bayes(
         start_eval: None,
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement: None,
+        optimizer_stop: None,
+        eval_budget_spent: false,
     })
 }
 

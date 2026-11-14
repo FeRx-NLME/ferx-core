@@ -3,7 +3,6 @@ use crate::stats::residual_error::{residual_rd, residual_rd2, ResidualCov};
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 
 /// Route predictions through analytical PK or ODE solver depending on model,
 /// honouring per-event PK parameters when the subject has time-varying
@@ -1104,6 +1103,45 @@ pub(crate) fn population_variance_preds_iov(
     ))
 }
 
+/// Whether the objective's value-only predictions may come from the subject's compiled plan
+/// ([`crate::sens::ode_provider::adjoint::plan_values`]) instead of the native predictor: a
+/// closed-form model (plain or IOV) or an `[odes]` model on the exact linear path, without a
+/// lagtime, where the plan's forward is bit-equal to the native walk and cheaper than it. Not a
+/// nonlinear `[odes]` model (its values come from a solver loop the plan does not serve), and not
+/// a lagged one (the recorded onset arithmetic measured up to 5 ulp off the native walk).
+pub(crate) fn plan_value_route(model: &CompiledModel) -> bool {
+    #[cfg(test)]
+    if PLAN_VALUES_OFF.with(|c| c.get()) {
+        return false;
+    }
+    !model.has_lagtime()
+        && model
+            .ode_spec
+            .as_ref()
+            .is_none_or(|o| o.effective_solver_opts().method == crate::ode::OdeMethod::Linear)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: the objective's value pass stays on the native predictor (a test of the
+    /// native walk's own bookkeeping, e.g. its schedule builds).
+    pub(crate) static PLAN_VALUES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `preds` from the plan when [`plan_value_route`] admits the model and the plan serves the
+/// point; `false` when the native predictor must answer.
+fn plan_value_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    eta: &[f64],
+    out: &mut Vec<f64>,
+) -> bool {
+    plan_value_route(model)
+        && crate::sens::ode_provider::adjoint::plan_values(model, subject, layout, theta, eta, out)
+}
+
 /// [`individual_nll_into_prepared_with_schedule`] with an optional frozen residual
 /// variance (#1722).
 ///
@@ -1166,19 +1204,23 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
             pred_recycle
         }
         None => {
-            let hint = std::mem::take(pred_recycle);
-            *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
-                model, subject, theta, eta, scratch, schedule, hint,
-            );
+            if !plan_value_preds(model, subject, None, theta, eta, pred_recycle) {
+                let hint = std::mem::take(pred_recycle);
+                *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
+                    model, subject, theta, eta, scratch, schedule, hint,
+                );
+            }
             pred_recycle
         }
     };
     #[cfg(not(feature = "survival"))]
     let preds = {
-        let hint = std::mem::take(pred_recycle);
-        *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
-            model, subject, theta, eta, scratch, schedule, hint,
-        );
+        if !plan_value_preds(model, subject, None, theta, eta, pred_recycle) {
+            let hint = std::mem::take(pred_recycle);
+            *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
+                model, subject, theta, eta, scratch, schedule, hint,
+            );
+        }
         pred_recycle
     };
     // For SDE models, compute per-observation EKF process-noise variance and
@@ -4014,11 +4056,10 @@ pub fn foce_population_nll_iov(
     // (e.g. 4 vs 15 threads). Collecting into an ordered `Vec` and summing
     // serially makes the objective bit-reproducible regardless of thread count
     // while keeping the expensive per-subject work parallel (#703).
-    let per_subj: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subj: Vec<f64> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let kappas = if i < kappas_per_subject.len() {
                 kappas_per_subject[i].as_slice()
             } else {
@@ -4037,7 +4078,7 @@ pub fn foce_population_nll_iov(
                 omega_iov,
             )
         })
-        .collect();
+    };
     per_subj.iter().sum()
 }
 
@@ -4090,11 +4131,10 @@ pub(crate) fn foce_population_nll_cov(
     // sum serially. A parallel `.sum()` would make the OFV depend on the
     // thread count (f64 addition is non-associative; rayon splits by worker
     // count). See `foce_population_nll_iov` and #703.
-    let per_subj: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subj: Vec<f64> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             foce_subject_nll_cov(
                 model,
                 subject,
@@ -4107,7 +4147,7 @@ pub(crate) fn foce_population_nll_cov(
                 interaction,
             )
         })
-        .collect();
+    };
     per_subj.iter().sum()
 }
 
@@ -4737,9 +4777,22 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
 
     // Data NLL — single continuous prediction with per-event occasion kappa
     // (proper cross-occasion carryover; issue #104).
-    let preds = pk::predict_iov_in(
-        model, subject, layout, theta, eta, kappas, pk_scratch, schedule,
-    );
+    let mut stacked = crate::scratch::take_with_capacity(layout.n_stacked());
+    stacked.extend_from_slice(eta);
+    for k in kappas {
+        stacked.extend_from_slice(k.as_ref());
+    }
+    let mut planned = Vec::new();
+    let preds = if nested.is_none()
+        && plan_value_preds(model, subject, Some(layout), theta, &stacked, &mut planned)
+    {
+        planned
+    } else {
+        pk::predict_iov_in(
+            model, subject, layout, theta, eta, kappas, pk_scratch, schedule,
+        )
+    };
+    crate::scratch::give(stacked);
     // FREM covariate pseudo-observations use the covariate sigma (EPSCOV), not
     // the PK residual error, so the FREM etas are sampled against the right
     // variance (mirrors the FOCE paths and the non-IOV individual_nll).

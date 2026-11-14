@@ -1,3 +1,4 @@
+use crate::cold_sort::ColdSort;
 use crate::types::*;
 
 fn fixed_label(name: &str) -> String {
@@ -26,10 +27,28 @@ fn se_cell(se: Option<f64>) -> String {
 
 /// The `(SE, %RSE)` cells of a THETA table row: both `N/A` when the SE is
 /// missing or not finite (#2225).
-/// Whether θ `i` is a profiled level the covariance step held on its declared bound
-/// (#2112): its SE is not available, as a FIX θ's is not, but it was estimated.
+/// Why parameter `i` of family `kind` has no standard error (#2797), or `None` when it
+/// has one: it is in `FitResult::held_at_bound` — a profiled level on its declared bound
+/// (#2112) or a coordinate collapsed on the internal guard. Its SE is not available, as a
+/// FIX parameter's is not, but it was estimated. The one predicate every renderer reads,
+/// so the console, the YAML and the parameter table cannot disagree. A hand-built result
+/// that sets only the deprecated `profiled_levels_at_bound` is still honoured.
+pub(crate) fn se_held(result: &FitResult, kind: ParameterKind, i: usize) -> Option<HeldReason> {
+    result
+        .held_at_bound
+        .iter()
+        // A `[mixture]` override's `(kind, index)` names its base parameter (#2809).
+        .find(|h| h.class.is_none() && h.kind == kind && h.index == i)
+        .map(|h| h.reason)
+        .or_else(|| {
+            (kind == ParameterKind::Theta && result.profiled_levels_at_bound.contains(&i))
+                .then_some(HeldReason::ProfiledBound)
+        })
+}
+
+/// Whether θ `i` is held ([`se_held`]).
 fn theta_held_at_bound(result: &FitResult, i: usize) -> bool {
-    result.profiled_levels_at_bound.contains(&i)
+    se_held(result, ParameterKind::Theta, i).is_some()
 }
 
 /// θ `i`'s label, SE and %RSE cells in the console θ tables (`print_results` and
@@ -139,6 +158,19 @@ fn final_gradient_line(result: &FitResult) -> Option<String> {
     ))
 }
 
+/// The `Status:` line (#2799): [`FitResult::status`]'s label, then its reason labels in
+/// parentheses when there are any. Printed by `print_results` and `format_summary` after the
+/// `Final gradient:` line, which #1934 pins directly under `Converged:`.
+pub(crate) fn status_line(result: &FitResult) -> String {
+    let status = result.status();
+    let reasons: Vec<String> = status.reasons().iter().map(|r| r.label()).collect();
+    if reasons.is_empty() {
+        format!("Status:     {}", status.label())
+    } else {
+        format!("Status:     {} ({})", status.label(), reasons.join(", "))
+    }
+}
+
 /// SD from a variance: `sqrt(var)`, or `0` for a non-positive variance.
 fn sd_from_var(var: f64) -> f64 {
     if var > 0.0 {
@@ -186,7 +218,8 @@ fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
     }
 }
 
-/// The YAML line describing a random-effect variance on its scale (#1643):
+/// The YAML line describing a random-effect variance on its scale (#1643), rendered from
+/// [`estimates::spread_field`], the field the `omega:` / `omega_iov:` sections write:
 /// `cv_pct` for log-normal (and unknown, as before), `sd` for additive and
 /// logit, nothing for custom. Indented for an `omega`/`omega_iov` entry.
 ///
@@ -195,30 +228,19 @@ fn spread_note(t: Option<EtaParamType>, var: f64, at: &str) -> Option<String> {
 /// carries the typical arm — with, for log-normal and unknown, a
 /// `cv_pct_at_typical_weight` ([`typical_cv_yaml_line`]), since the exact CV%
 /// is not `100 · sd_at_typical_weight` (#1858).
+#[cfg(test)]
 fn variance_yaml_line(t: Option<EtaParamType>, var: f64) -> Option<String> {
-    match t {
-        None | Some(EtaParamType::LogNormal) => {
-            Some(format!("    cv_pct: {}", yaml_cv_pct(cv_pct(var))))
-        }
-        Some(EtaParamType::Additive | EtaParamType::Logit | EtaParamType::LogitProbability) => {
-            Some(format!("    sd: {:.6}", sd_from_var(var)))
-        }
-        Some(EtaParamType::Custom) => None,
-    }
+    estimates::spread_field(t, var).map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
 }
 
 /// A weighted kappa's `cv_pct_at_typical_weight` YAML line: `cv_pct` of the
 /// typical arm's variance `var_at` (`var / n`), the CV% the console's weight
 /// line prints, for log-normal and unknown types; `None` for the rest, whose
-/// `sd_at_typical_weight` already is the console's figure.
+/// `sd_at_typical_weight` already is the console's figure. Rendered from
+/// [`estimates::typical_cv_field`], the field the `omega_iov:` section writes.
+#[cfg(test)]
 fn typical_cv_yaml_line(t: Option<EtaParamType>, var_at: f64) -> Option<String> {
-    match t {
-        None | Some(EtaParamType::LogNormal) => Some(format!(
-            "    cv_pct_at_typical_weight: {}",
-            yaml_cv_pct(cv_pct(var_at))
-        )),
-        _ => None,
-    }
+    estimates::typical_cv_field(t, var_at).map(|(k, v)| format!("    {k}: {}", v.yaml(false)))
 }
 
 /// The type of the ETA called `name`, looked up **by name** in
@@ -383,9 +405,10 @@ pub struct OmegaRowsOptions {
 
 /// The `--- OMEGA Estimates ---` diagonal rows of [`print_results`].
 fn format_omega_rows(result: &FitResult) -> String {
-    format_omega_rows_from(
+    format_omega_rows_held(
         &OmegaRowsInput::from_result(result),
         OmegaRowsOptions::default(),
+        &|i| se_held(result, ParameterKind::Omega, i).is_some(),
     )
 }
 
@@ -453,6 +476,16 @@ fn typical_value_clause(
 /// rows. One line per `\n`; empty for a zero-row `omega`. Off-diagonal
 /// block-Ω correlations are not part of the rows.
 pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) -> String {
+    format_omega_rows_held(input, opts, &|_| false)
+}
+
+/// [`format_omega_rows_from`] with `held(i)` marking the ETAs whose SE is not available
+/// (#2797, [`se_held`]): their SE cell prints `N/A`.
+fn format_omega_rows_held(
+    input: &OmegaRowsInput,
+    opts: OmegaRowsOptions,
+    held: &dyn Fn(usize) -> bool,
+) -> String {
     use std::fmt::Write;
     // Destructured so a flag added later fails to compile here until honoured.
     let OmegaRowsOptions {
@@ -478,7 +511,8 @@ pub fn format_omega_rows_from(input: &OmegaRowsInput, opts: OmegaRowsOptions) ->
             se_cell(
                 input
                     .se_omega
-                    .and_then(|se| crate::types::omega_se_at_in(se, n_eta, i, i)),
+                    .and_then(|se| crate::types::omega_se_at_in(se, n_eta, i, i))
+                    .filter(|_| !held(i)),
             )
         };
         let eta_type = input.eta_param_types.get(i).copied().flatten();
@@ -536,7 +570,13 @@ fn format_sigma_rows(result: &FitResult) -> String {
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            se_cell(result.se_sigma.as_ref().and_then(|se| se.get(i).copied()))
+            se_cell(
+                result
+                    .se_sigma
+                    .as_ref()
+                    .and_then(|se| se.get(i).copied())
+                    .filter(|_| se_held(result, ParameterKind::Sigma, i).is_none()),
+            )
         };
         let _ = match result.sigma_types.get(i).copied() {
             Some(SigmaType::Proportional) => writeln!(
@@ -548,6 +588,139 @@ fn format_sigma_rows(result: &FitResult) -> String {
                 se_str,
             ),
             _ => writeln!(out, "  {:<20} = {:.6}  SE = {}", label, s, se_str),
+        };
+    }
+    out
+}
+
+/// Why `[mixture]` override `o` has no standard error (#2833), or `None` when it has one:
+/// a [`FitResult::held_at_bound`] entry of **its** class, family and base index. Matching
+/// on `(kind, index)` alone would name the base parameter, which is [`se_held`]'s job;
+/// matching any `class.is_some()` would hold every override of the base when one is.
+pub(crate) fn override_held(result: &FitResult, o: &MixtureOverrideParam) -> Option<HeldReason> {
+    result
+        .held_at_bound
+        .iter()
+        .find(|h| h.class == Some(o.class) && h.kind == o.kind && h.index == o.index)
+        .map(|h| h.reason)
+}
+
+/// The SE state of one override row, in render precedence (#2833).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum OverrideSe {
+    /// In `held_at_bound`: `N/A` (console, table), `se: ~` + `held:` (YAML).
+    Held(HeldReason),
+    /// Fixed by the model or held at its initial value by the estimator: `---`.
+    Fixed,
+    /// Free: its SE, or `None` when the covariance step produced none.
+    Free(Option<f64>),
+}
+
+/// One `[mixture]` per-class override as every renderer shows it (#2833).
+struct OverrideRow<'a> {
+    param: &'a MixtureOverrideParam,
+    /// The fitted value: a class variance (Ω) or σ (Σ), as `mixture_overrides` reports it.
+    value: f64,
+    se: OverrideSe,
+}
+
+impl OverrideRow<'_> {
+    /// The base parameter's name, e.g. `ETA_CL` for `ETA_CL_MIX2`.
+    fn base_name<'r>(&self, result: &'r FitResult) -> &'r str {
+        let names = match self.param.kind {
+            ParameterKind::Omega => &result.eta_names,
+            _ => &result.sigma_names,
+        };
+        names.get(self.param.index).map_or("", String::as_str)
+    }
+
+    /// `---` / `N/A` / the SE, for the console.
+    fn se_text(&self) -> String {
+        match self.se {
+            OverrideSe::Held(_) => "N/A".to_string(),
+            OverrideSe::Fixed => "---".to_string(),
+            OverrideSe::Free(se) => se_cell(se),
+        }
+    }
+}
+
+/// The override rows of `result` (#2833), in `mixture_overrides` order. Empty with no
+/// override, and when the result records values without one descriptor each (a hand-built
+/// result, a bundle older than the descriptors): such a row cannot be named. The one
+/// source every renderer reads, so the console, the YAML and the table cannot disagree.
+fn override_rows(result: &FitResult) -> Vec<OverrideRow<'_>> {
+    let Some(values) = result.mixture_overrides.as_deref() else {
+        return Vec::new();
+    };
+    if result.mixture_override_params.len() != values.len() {
+        return Vec::new();
+    }
+    result
+        .mixture_override_params
+        .iter()
+        .zip(values)
+        .enumerate()
+        .map(|(k, (param, &value))| {
+            // Held first: a held override is never also fixed (the guard hold is not in
+            // the model's FIX mask), so the order matters only for a hand-built result.
+            let se = if let Some(reason) = override_held(result, param) {
+                OverrideSe::Held(reason)
+            } else if param.fixed {
+                OverrideSe::Fixed
+            } else {
+                OverrideSe::Free(
+                    result
+                        .se_mixture_overrides
+                        .as_ref()
+                        .and_then(|v| v.get(k).copied()),
+                )
+            };
+            OverrideRow { param, value, se }
+        })
+        .collect()
+}
+
+/// The `--- Mixture per-class overrides ---` section of [`print_results`] and
+/// [`format_summary`] (#2833), header included, or `""` without an override. An Ω row
+/// reads like an OMEGA row (`name = variance  (CV% = …)  SE = …`), a σ row like a SIGMA
+/// row; `[FIX]` with `SE = ---` for a fixed override, `SE = N/A` for a held one.
+fn format_mixture_override_rows(result: &FitResult) -> String {
+    use std::fmt::Write;
+    let rows = override_rows(result);
+    if rows.is_empty() {
+        return String::new();
+    }
+    let show_cv = status_shows_cv(&result.covariance_status);
+    let mut out = String::from("\n--- Mixture per-class overrides ---\n");
+    for row in &rows {
+        let name = row.param.name.as_str();
+        let label = if row.se == OverrideSe::Fixed {
+            fixed_label(name)
+        } else {
+            name.to_string()
+        };
+        let se = row.se_text();
+        let _ = match row.param.kind {
+            ParameterKind::Omega => {
+                let t = eta_type(result, row.base_name(result));
+                let note = note_suffix(variance_note(t, row.value, false), show_cv);
+                writeln!(
+                    out,
+                    "  {:<20} = {:.6}{}  SE = {}",
+                    label, row.value, note, se
+                )
+            }
+            _ => match result.sigma_types.get(row.param.index).copied() {
+                Some(SigmaType::Proportional) => writeln!(
+                    out,
+                    "  {:<20} = {:.6}  (CV% = {:.1})  SE = {}",
+                    label,
+                    row.value,
+                    row.value * 100.0,
+                    se
+                ),
+                _ => writeln!(out, "  {:<20} = {:.6}  SE = {}", label, row.value, se),
+            },
         };
     }
     out
@@ -642,7 +815,9 @@ pub struct KappaRowsOptions {
 /// followed by its weighted-kappa line (#1031) when it has one.
 fn format_kappa_rows(result: &FitResult) -> String {
     KappaRowsInput::from_result(result).map_or_else(String::new, |input| {
-        format_kappa_rows_from(&input, KappaRowsOptions::default())
+        format_kappa_rows_held(&input, KappaRowsOptions::default(), &|i| {
+            se_held(result, ParameterKind::Kappa, i).is_some()
+        })
     })
 }
 
@@ -652,6 +827,16 @@ fn format_kappa_rows(result: &FitResult) -> String {
 /// `\n`; empty for a zero-row `omega_iov`. Off-diagonal `block_kappa`
 /// correlations are not part of the rows.
 pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) -> String {
+    format_kappa_rows_held(input, opts, &|_| false)
+}
+
+/// [`format_kappa_rows_from`] with `held(i)` marking the kappas whose SE is not available
+/// (#2797, [`se_held`]): their SE cell prints `N/A`.
+fn format_kappa_rows_held(
+    input: &KappaRowsInput,
+    opts: KappaRowsOptions,
+    held: &dyn Fn(usize) -> bool,
+) -> String {
     use std::fmt::Write;
     let (arrow, kappa) = if opts.ascii {
         ("->", "kappa")
@@ -678,7 +863,12 @@ pub fn format_kappa_rows_from(input: &KappaRowsInput, opts: KappaRowsOptions) ->
         let se_str = if is_fixed {
             "---".to_string()
         } else {
-            se_cell(input.se_kappa.and_then(|se| se.get(i).copied()))
+            se_cell(
+                input
+                    .se_kappa
+                    .and_then(|se| se.get(i).copied())
+                    .filter(|_| !held(i)),
+            )
         };
         let weight = kappa_weight_facts(input.kappa_weights, input.kappa_weight_typical, i, var);
         let kappa_type = input.kappa_param_types.get(i).copied();
@@ -1045,7 +1235,7 @@ pub fn block_summary(values: &[f64]) -> (f64, f64, f64) {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
     let mut sorted: Vec<f64> = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted.cold_sort_by(&|a, b| a.total_cmp(b));
     let n = sorted.len();
     (sorted[0], sorted[(n - 1) / 2], sorted[n - 1])
 }
@@ -1319,6 +1509,7 @@ pub fn print_results(result: &FitResult) {
     if let Some(line) = final_gradient_line(result) {
         eprintln!("{line}");
     }
+    eprintln!("{}", status_line(result));
     if result.method_chain.len() > 1 {
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
         eprintln!("Estimation chain:  {}", chain.join(" → "));
@@ -1438,6 +1629,7 @@ pub fn print_results(result: &FitResult) {
     };
     eprintln!("\n--- SIGMA Estimates ({}) ---", err_type);
     eprint!("{}", format_sigma_rows(result));
+    eprint!("{}", format_mixture_override_rows(result));
 
     // IOV (KAPPA) estimates
     if result.omega_iov.is_some() {
@@ -1642,6 +1834,7 @@ pub fn format_summary(result: &FitResult) -> String {
     if let Some(line) = final_gradient_line(result) {
         let _ = writeln!(out, "{line}");
     }
+    let _ = writeln!(out, "{}", status_line(result));
     let _ = writeln!(out, "Iterations: {}", result.n_iterations);
     let _ = writeln!(
         out,
@@ -1739,6 +1932,7 @@ pub fn format_summary(result: &FitResult) -> String {
     let _ = writeln!(out, "\n--- SIGMA ({}) ---", err_type);
     // The console's rows verbatim, as OMEGA and KAPPA above.
     out.push_str(&format_sigma_rows(result));
+    out.push_str(&format_mixture_override_rows(result));
 
     // --- Diagnostics ---
     let _ = writeln!(out, "\n--- Diagnostics ---");
@@ -2122,6 +2316,8 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     let mut iwres_vec = Vec::with_capacity(n_total);
     let mut npde_vec = Vec::with_capacity(n_total);
     let mut npd_vec = Vec::with_capacity(n_total);
+    let mut epred_vec = Vec::with_capacity(n_total);
+    let mut pwres_vec = Vec::with_capacity(n_total);
     let mut ebe_ofv_col = Vec::with_capacity(n_total);
     let mut n_obs_col = Vec::with_capacity(n_total);
     // NPDE/NPD are only computed when `[fit_options] npde_nsim > 0`; emit the
@@ -2141,10 +2337,14 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     let any_mixture = n_mix_classes > 0;
     let mut mixest_col = Vec::with_capacity(n_total);
     // The generating class of a `--simulate` population (#2372), next to the fitted one.
+    // An `[output] MIXNUM` on a `[mixture]` model (#2784) arrives as an extra column
+    // holding the class, simulated or fitted; it replaces this one rather than sitting
+    // beside it under the same name.
     let any_mixnum = population
         .subjects
         .iter()
-        .any(|s| s.simulated_mixnum.is_some());
+        .any(|s| s.simulated_mixnum.is_some())
+        && !mixnum_requested(result);
     let mut mixnum_col = Vec::with_capacity(n_total);
     let mut pmix_cols: Vec<Vec<f64>> = vec![Vec::with_capacity(n_total); n_mix_classes];
 
@@ -2168,6 +2368,8 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
             if any_npde {
                 npde_vec.push(sr.npde.get(j).copied().unwrap_or(f64::NAN));
                 npd_vec.push(sr.npd.get(j).copied().unwrap_or(f64::NAN));
+                epred_vec.push(sr.epred.get(j).copied().unwrap_or(f64::NAN));
+                pwres_vec.push(sr.pwres.get(j).copied().unwrap_or(f64::NAN));
             }
             ebe_ofv_col.push(sr.ofv_contribution);
             n_obs_col.push(sr.n_obs as f64);
@@ -2208,6 +2410,12 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
     if any_npde {
         cols.push(("NPDE".to_string(), npde_vec));
         cols.push(("NPD".to_string(), npd_vec));
+        // EPRED / PWRES come out of the same simulation (#2871). `EWRES` is the
+        // NONMEM name for the same residual, written as a second column so a ported
+        // `$TABLE ... EWRES` post-processing script finds it under either name.
+        cols.push(("EPRED".to_string(), epred_vec));
+        cols.push(("EWRES".to_string(), pwres_vec.clone()));
+        cols.push(("PWRES".to_string(), pwres_vec));
     }
     cols.extend([
         ("EBE_OFV".to_string(), ebe_ofv_col),
@@ -2365,6 +2573,26 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
 /// `CWRES` is deliberately blank: the conditional weighted residual is defined through
 /// the Gaussian residual-variance model, and there is none for a Bernoulli outcome.
 /// `IWRES` carries the standardized (Pearson) residual instead.
+/// Whether the fit's `[output]` asked for `MIXNUM` on a `[mixture]` model (#2784):
+/// `compute_extra_output_columns` then writes the class as an extra column of exactly
+/// that name.
+fn mixnum_requested(result: &FitResult) -> bool {
+    result
+        .subjects
+        .iter()
+        .any(|sr| sr.extra_columns.iter().any(|(n, _)| n == "MIXNUM"))
+}
+
+/// The `MIXNUM` cell of subject `si`'s non-Gaussian rows: the class its data were
+/// simulated under (#2372) or, when `[output] MIXNUM` asked for the class on a mixture
+/// fit, its fitted `MIXEST` failing that (#2784) — the value the extra column carries on
+/// the subject's Gaussian rows. A subject-level scalar, like `EBE_OFV`.
+fn subject_mixnum(result: &FitResult, population: &Population, si: usize, requested: bool) -> f64 {
+    let simulated = population.subjects[si].simulated_mixnum;
+    let fitted = requested.then(|| result.subjects[si].mixest).flatten();
+    simulated.or(fitted).map_or(f64::NAN, |k| k as f64)
+}
+
 fn append_discrete_rows(
     cols: &mut [(String, Vec<f64>)],
     result: &FitResult,
@@ -2374,6 +2602,7 @@ fn append_discrete_rows(
     if n_discrete == 0 {
         return;
     }
+    let mixnum_requested = mixnum_requested(result);
     for (name, values) in cols.iter_mut() {
         for (si, sr) in result.subjects.iter().enumerate() {
             for row in &sr.discrete_rows {
@@ -2387,10 +2616,9 @@ fn append_discrete_rows(
                     "IWRES" => row.iwres,
                     "EBE_OFV" => sr.ofv_contribution,
                     // A subject-level scalar, like EBE_OFV: the class the record was
-                    // simulated under (#2372).
-                    "MIXNUM" => population.subjects[si]
-                        .simulated_mixnum
-                        .map_or(f64::NAN, |k| k as f64),
+                    // simulated under (#2372), or the fitted one under `[output]
+                    // MIXNUM` (#2784).
+                    "MIXNUM" => subject_mixnum(result, population, si, mixnum_requested),
                     // `N_OBS` deliberately blank: `SubjectResult::n_obs` counts Gaussian
                     // observations only, so a binary-only fit would write `N_OBS = 0` on
                     // every row of a table plainly full of observations. Blank is honest;
@@ -2433,6 +2661,7 @@ fn append_tte_rows(
     if n_tte == 0 {
         return;
     }
+    let mixnum_requested = mixnum_requested(result);
     let n_before = cols.first().map_or(0, |(_, v)| v.len());
     for name in TTE_RESIDUAL_COLUMNS {
         cols.push((name.to_string(), vec![f64::NAN; n_before]));
@@ -2446,9 +2675,7 @@ fn append_tte_rows(
                     "DV" => row.dv,
                     "CMT" => row.cmt as f64,
                     "EBE_OFV" => sr.ofv_contribution,
-                    "MIXNUM" => population.subjects[si]
-                        .simulated_mixnum
-                        .map_or(f64::NAN, |k| k as f64),
+                    "MIXNUM" => subject_mixnum(result, population, si, mixnum_requested),
                     "COXSNELL" => row.coxsnell,
                     "MARTINGALE" => row.martingale,
                     "DEVIANCE" => row.deviance,
@@ -2754,11 +2981,11 @@ fn yaml_quote(s: &str) -> String {
 /// fit recorded them (#1177). A bundle saved before that, or a hand-built
 /// result, falls back to inferring the layout from the size `n` of a
 /// packed-space matrix on the result (its covariance matrix) — the count of
-/// coordinates left after θ and σ — which is a guess: it ignores any trailing
-/// mixture-override / `block_sigma` coordinates, and when `n_eta == n_kappa >
-/// 1` with exactly one of the two a block, both assignments give the same
-/// count and the block is assumed to be Ω. Labels only; nothing that gates a
-/// candidate reads the inferred layout.
+/// coordinates left after θ, σ, the trailing mixture overrides and the
+/// `block_sigma` correlations ([`trailing_packed_count`], #2833) — which is a
+/// guess: when `n_eta == n_kappa > 1` with exactly one of the two a block, both
+/// assignments give the same count and the block is assumed to be Ω. Labels
+/// only; nothing that gates a candidate reads the inferred layout.
 pub(crate) fn packed_layout(result: &FitResult, n: usize) -> (bool, bool) {
     if let Some(od) = result.omega_is_diagonal {
         let kd = result
@@ -2776,7 +3003,7 @@ pub(crate) fn packed_layout(result: &FitResult, n: usize) -> (bool, bool) {
     let n_kappa_diag = n_kappa;
     // `omega_packed_len(0, false) == 0`, so this covers the no-IOV case too.
     let n_kappa_full = crate::estimation::parameterization::omega_packed_len(n_kappa, false);
-    let n_remaining = n.saturating_sub(n_theta + n_sigma);
+    let n_remaining = n.saturating_sub(n_theta + n_sigma + trailing_packed_count(result));
 
     // Try all four diagonal/block combinations; take the first match.
     //
@@ -2801,8 +3028,27 @@ pub(crate) fn packed_layout(result: &FitResult, n: usize) -> (bool, bool) {
         .unwrap_or((n_eta <= 1, n_kappa <= 1))
 }
 
+/// The packed coordinates after Ω_IOV (#2833): one per `[mixture]` override — counted from
+/// its recorded values, else its descriptors — and one per `block_sigma` correlation.
+fn trailing_packed_count(result: &FitResult) -> usize {
+    let n_overrides = result
+        .mixture_overrides
+        .as_ref()
+        .map_or(result.mixture_override_params.len(), Vec::len);
+    n_overrides + result.residual_correlations.len()
+}
+
 /// Build the ordered parameter name list that matches `pack_params` layout:
-/// `[theta..., omega_packed..., sigma..., kappa_packed...]`.
+/// `[theta..., omega_packed..., sigma..., kappa_packed..., mixture overrides...,
+/// block_sigma correlations...]`.
+///
+/// A mixture override is named from [`FitResult::mixture_override_params`] (#2833): an Ω
+/// override packs `ln L_ee` like a base diagonal, so `log_chol_{name}`; a σ override packs
+/// `ln σ` like a base σ, so its bare name (`EPS_MIX2`). A `block_sigma` correlation follows,
+/// as `EPS_A~EPS_B` (the trace's [`crate::estimation::parameterization::coordinate_names`]
+/// spelling). A result that records override values but no descriptors (a hand-built one,
+/// or a bundle written before the field) leaves those rows and every one after them to the
+/// `param_N` padding, since it cannot say which is which.
 ///
 /// For a diagonal omega/kappa each entry is `log_chol_{eta_name}` — the packed
 /// value is `log(L_ii)` where `omega = L Lᵀ` (Cholesky diagonal, log-transformed).
@@ -2854,6 +3100,24 @@ pub(crate) fn packed_param_names(result: &FitResult, n: usize) -> Vec<String> {
                     ));
                 }
             }
+        }
+    }
+
+    let n_override_values = result.mixture_overrides.as_ref().map_or(0, Vec::len);
+    if result.mixture_override_params.len() == n_override_values {
+        for p in &result.mixture_override_params {
+            match p.kind {
+                ParameterKind::Omega => names.push(format!("log_chol_{}", p.name)),
+                _ => names.push(p.name.clone()),
+            }
+        }
+        for c in &result.residual_correlations {
+            let ni = result.sigma_names.get(c.sigma_i).filter(|s| !s.is_empty());
+            let nj = result.sigma_names.get(c.sigma_j).filter(|s| !s.is_empty());
+            names.push(match (ni, nj) {
+                (Some(a), Some(b)) => format!("{a}~{b}"),
+                _ => format!("SIGMA({},{})", c.sigma_i + 1, c.sigma_j + 1),
+            });
         }
     }
 
@@ -2917,6 +3181,77 @@ fn write_yaml_warning_details(
     f.write_all(out.as_bytes()).map_err(|e| e.to_string())
 }
 
+/// The `multi_start:` block (#2867): the spread of a multi-start fit's starts and one row
+/// per start, from [`FitResult::starts`]. Empty for a fit with no rows (`n_starts = 1`), so
+/// a single-start YAML is unchanged. Rows are flow maps; strings are JSON-quoted.
+pub(crate) fn multi_start_yaml(result: &FitResult) -> Result<String, String> {
+    use std::fmt::Write;
+    if result.starts.is_empty() {
+        return Ok(String::new());
+    }
+    fn json<T: serde::Serialize + ?Sized>(v: &T) -> Result<String, String> {
+        serde_json::to_string(v).map_err(|e| e.to_string())
+    }
+    let opt = |v: Option<f64>| v.map_or("null".to_string(), |v| format!("{v:.6}"));
+    let spread = crate::types::StartSpread::of(&result.starts);
+    let mut out = String::from("\nmulti_start:\n");
+    let _ = writeln!(out, "  n_starts: {}", spread.n_starts);
+    if let Some(seed) = result.multi_start_seed {
+        let _ = writeln!(out, "  seed: {seed}");
+    }
+    if let Some((k, _)) = spread.selected {
+        let _ = writeln!(out, "  selected_start: {k}");
+    }
+    let _ = writeln!(out, "  n_converged: {}", spread.n_converged);
+    let _ = writeln!(out, "  n_not_converged: {}", spread.n_not_converged);
+    let _ = writeln!(out, "  n_failed: {}", spread.n_failed);
+    // What `best`, `range` and the count are measured on: the value that ranked the starts.
+    let compared = if spread.penalized {
+        "penalized_objective"
+    } else {
+        "ofv"
+    };
+    let _ = writeln!(out, "  compared: {compared}");
+    let _ = writeln!(out, "  best: {}", opt(spread.best));
+    let _ = writeln!(out, "  agree_within: {:.1}", crate::types::START_AGREE_OFV);
+    let _ = writeln!(out, "  n_compared: {}", spread.n_compared);
+    let _ = writeln!(out, "  n_within: {}", spread.n_within);
+    let _ = writeln!(out, "  range: {}", opt(spread.range));
+    let _ = writeln!(out, "  starts:");
+    for s in &result.starts {
+        let mut row = format!("start: {}, ofv: {}", s.start, opt(s.ofv));
+        // On every penalized row, `null` when it has no finite one.
+        if s.penalized {
+            let _ = write!(row, ", objective: {}", opt(s.objective));
+        }
+        let status = s.status.as_deref().unwrap_or("failed");
+        let _ = write!(row, ", converged: {}, status: {status}", s.converged);
+        // As `model.status_reasons` above: JSON-quoted, since a label can hold `: `.
+        if !s.status_reasons.is_empty() {
+            let _ = write!(row, ", status_reasons: {}", json(&s.status_reasons)?);
+        }
+        let _ = write!(
+            row,
+            ", n_iterations: {}, wall_time_secs: {:.6}, selected: {}",
+            s.n_iterations, s.wall_time_secs, s.selected
+        );
+        let theta: Vec<String> = s
+            .theta
+            .iter()
+            .map(|v| opt(Some(*v).filter(|v| v.is_finite())))
+            .collect();
+        let _ = write!(row, ", theta: [{}]", theta.join(", "));
+        if let Some(e) = &s.error {
+            let _ = write!(row, ", error: {}", json(e)?);
+        }
+        if let Some(c) = &s.error_code {
+            let _ = write!(row, ", error_code: {}", json(c)?);
+        }
+        let _ = writeln!(out, "    - {{{row}}}");
+    }
+    Ok(out)
+}
+
 pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String> {
     use std::io::Write;
 
@@ -2938,6 +3273,31 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         let source = result.final_gradient_source.as_deref().unwrap_or("unknown");
         writeln!(f, "  final_gradient_source: {source}").map_err(|e| e.to_string())?;
     }
+    // #2785: the scale-aware stationarity measure `converged` is gated on, and the
+    // optimizer's own stop state, which the verdict can overrule either way. Each omitted
+    // when the fit has none to report.
+    if let Some(d) = result.newton_decrement {
+        let v = if d.is_nan() {
+            ".nan".to_string()
+        } else {
+            fmt_cov_entry(d)
+        };
+        writeln!(f, "  newton_decrement: {v}").map_err(|e| e.to_string())?;
+    }
+    if let Some(stop) = &result.optimizer_stop {
+        writeln!(f, "  optimizer_stop: {stop}").map_err(|e| e.to_string())?;
+    }
+    // #2799: the usability verdict beside `converged`, always present. The reasons are
+    // JSON-quoted, as in `warnings:` below: a collapse label carries parameter names.
+    let status = result.status();
+    writeln!(f, "  status: {}", status.token()).map_err(|e| e.to_string())?;
+    let reasons = status
+        .reasons()
+        .iter()
+        .map(|r| serde_json::to_string(&r.label()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    writeln!(f, "  status_reasons: [{}]", reasons.join(", ")).map_err(|e| e.to_string())?;
     writeln!(f, "  method: {}", result.method.label()).map_err(|e| e.to_string())?;
     if result.method_chain.len() > 1 {
         let chain: Vec<&str> = result.method_chain.iter().map(|m| m.label()).collect();
@@ -3033,59 +3393,15 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     writeln!(f, "  n_observations: {}", result.n_obs).map_err(|e| e.to_string())?;
     writeln!(f, "  n_parameters: {}", result.n_parameters).map_err(|e| e.to_string())?;
 
-    // Identify indices that belong to a `[covariate_nn]` weight block so we
-    // can skip them in the per-theta listing below and emit them in a
-    // compact `neural_networks:` block instead. Empty set when no NN blocks
-    // are present (Option E: see plans/dcm-and-low-dim-node.md).
-    #[cfg(feature = "nn")]
-    let nn_theta_indices: std::collections::HashSet<usize> = result
-        .neural_networks
-        .iter()
-        .flat_map(|nn| nn.weights_offset..nn.weights_offset + nn.n_weights)
-        .collect();
-    #[cfg(not(feature = "nn"))]
-    let nn_theta_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
-
     // #1064: an unstructured-placebo block can carry hundreds of coefficients. Four
     // keys each would bury the structural parameters under 3,200 lines of
     // nuisance, so a large block is emitted below as a compact coefficient list
     // under `theta_blocks:` rather than as top-level keys.
+    // The per-θ listing skips those, and `[covariate_nn]` weights, which go to a compact
+    // `neural_networks:` block (`estimates::listed_theta_indices`).
     let theta_blocks = compact_theta_blocks(&result.theta_names);
-    let blocked_theta_indices: std::collections::HashSet<usize> =
-        theta_blocks.iter().flat_map(|(_, r)| r.clone()).collect();
 
-    writeln!(f, "\ntheta:").map_err(|e| e.to_string())?;
-    for (i, name) in result.theta_names.iter().enumerate() {
-        if nn_theta_indices.contains(&i) || blocked_theta_indices.contains(&i) {
-            continue;
-        }
-        let est = result.theta[i];
-        let is_fixed = result.theta_fixed.get(i).copied().unwrap_or(false);
-        let se = result.se_theta.as_ref().map(|v| v[i]);
-        let rse = se.map(|s| rse_pct(est, s));
-        writeln!(f, "  {}:", name).map_err(|e| e.to_string())?;
-        writeln!(f, "    estimate: {:.6}", est).map_err(|e| e.to_string())?;
-        if is_fixed {
-            writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
-            writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
-            writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
-        } else if theta_held_at_bound(result, i) {
-            writeln!(f, "    at_bound: true").map_err(|e| e.to_string())?;
-            writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
-            writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
-        } else {
-            match se {
-                Some(s) => {
-                    writeln!(f, "    se: {:.6}", s).map_err(|e| e.to_string())?;
-                    writeln!(f, "    rse_pct: {:.2}", rse.unwrap()).map_err(|e| e.to_string())?;
-                }
-                None => {
-                    writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
-                    writeln!(f, "    rse_pct: ~").map_err(|e| e.to_string())?;
-                }
-            }
-        }
-    }
+    write!(f, "{}", estimates::theta_section(result).yaml()).map_err(|e| e.to_string())?;
 
     // #1065: every profiled block, compacted below or not.
     if !result.profiled_blocks.is_empty() {
@@ -3127,11 +3443,23 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
                     ),
                     // A profiled level held on its bound (#2112): estimated, but held by
                     // the covariance step, so no SE.
-                    _ if theta_held_at_bound(result, i) => writeln!(
-                        f,
-                        "      - {{ label: \"{}\", estimate: {:.6}, at_bound: true, se: ~, rse_pct: ~ }}",
-                        label, result.theta[i]
-                    ),
+                    _ if theta_held_at_bound(result, i) => {
+                        let reason = se_held(result, ParameterKind::Theta, i)
+                            .unwrap_or(HeldReason::ProfiledBound);
+                        let at_bound = if reason == HeldReason::ProfiledBound {
+                            "at_bound: true, "
+                        } else {
+                            ""
+                        };
+                        writeln!(
+                            f,
+                            "      - {{ label: \"{}\", estimate: {:.6}, {}se: ~, rse_pct: ~, held: {} }}",
+                            label,
+                            result.theta[i],
+                            at_bound,
+                            reason.as_str()
+                        )
+                    }
                     Some(se) => writeln!(
                         f,
                         "      - {{ label: \"{}\", estimate: {:.6}, se: {:.6}, rse_pct: {:.2} }}",
@@ -3202,7 +3530,6 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
-    let n_eta = result.omega.nrows();
     // #1111: the `[covariate_model]` relation table — what covariate model ran,
     // what each symbolic centring statistic resolved to, and each generated θ
     // with its estimate and SE. Emitted so a covariate search reads the run's
@@ -3259,261 +3586,20 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
-    writeln!(f, "\nomega:").map_err(|e| e.to_string())?;
-    for i in 0..n_eta {
-        let var = result.omega[(i, i)];
-        let is_fixed = result.omega_fixed.get(i).copied().unwrap_or(false);
-        let se = crate::types::omega_se_at(&result.se_omega, n_eta, i, i);
-        let key = result
-            .eta_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("omega_{}_{}", i + 1, i + 1));
-        writeln!(f, "  {}:", key).map_err(|e| e.to_string())?;
-        writeln!(f, "    variance: {:.6}", var).map_err(|e| e.to_string())?;
-        if let Some(line) = variance_yaml_line(eta_type(result, &key), var) {
-            writeln!(f, "{}", line).map_err(|e| e.to_string())?;
-        }
-        if is_fixed {
-            writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
-            writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
-        } else {
-            match se {
-                Some(s) => writeln!(f, "    se: {:.6}", s).map_err(|e| e.to_string())?,
-                None => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
-            }
-        }
+    // #2911: the estimate sections, built once and shared with `fit.json`'s `estimates`.
+    write!(f, "{}", estimates::omega_section(result).yaml()).map_err(|e| e.to_string())?;
+    write!(f, "{}", estimates::sigma_section(result).yaml()).map_err(|e| e.to_string())?;
+    if let Some(s) = estimates::block_sigma_section(result)? {
+        write!(f, "{}", s.yaml()).map_err(|e| e.to_string())?;
     }
-    // Off-diagonal covariances
-    for i in 0..n_eta {
-        for j in 0..i {
-            let cov = result.omega[(i, j)];
-            if cov.abs() > 1e-15 {
-                let name_i = result
-                    .eta_names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("eta_{}", i + 1));
-                let name_j = result
-                    .eta_names
-                    .get(j)
-                    .cloned()
-                    .unwrap_or_else(|| format!("eta_{}", j + 1));
-                let param_corr = param_corr_fallback(
-                    result.omega_param_corr.as_ref(),
-                    cov,
-                    result.omega[(i, i)],
-                    result.omega[(j, j)],
-                    i,
-                    j,
-                );
-                let se_cov = crate::types::omega_se_at(&result.se_omega, n_eta, i, j);
-                writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
-                writeln!(f, "    covariance: {:.6}", cov).map_err(|e| e.to_string())?;
-                match se_cov {
-                    Some(s) => writeln!(f, "    se: {:.6}", s).map_err(|e| e.to_string())?,
-                    None => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
-                }
-                writeln!(f, "    correlation: {:.6}", param_corr).map_err(|e| e.to_string())?;
-            }
-        }
+    if let Some(s) = estimates::omega_iov_section(result) {
+        write!(f, "{}", s.yaml()).map_err(|e| e.to_string())?;
     }
-
-    let err_type_str = match result.error_model {
-        ErrorModel::Additive => "additive",
-        ErrorModel::Proportional => "proportional",
-        ErrorModel::Combined => "combined",
-        ErrorModel::LogCombined => "log_combined",
-    };
-    writeln!(f, "\nsigma:  # error model: {}", err_type_str).map_err(|e| e.to_string())?;
-    // Sigma is stored on the SD scale (see src/stats/residual_error.rs).
-    // `variance` is therefore `estimate^2` for both component types. `cv_pct`
-    // is only emitted for proportional components, where `sigma * 100` is
-    // the coefficient of variation directly; an additive sigma's value lives
-    // in observation units and has no scale-free CV interpretation.
-    // `result.sigma_types` is parallel to `result.sigma`.
-    for (i, &s) in result.sigma.iter().enumerate() {
-        let is_fixed = result.sigma_fixed.get(i).copied().unwrap_or(false);
-        let se = result.se_sigma.as_ref().and_then(|v| v.get(i).copied());
-        let key = result
-            .sigma_names
-            .get(i)
-            .cloned()
-            .unwrap_or_else(|| format!("sigma_{}", i + 1));
-        let sigma_type = result.sigma_types.get(i).copied();
-        let kind_str = match sigma_type {
-            Some(SigmaType::Proportional) => "proportional",
-            Some(SigmaType::Additive) => "additive",
-            None => "unknown",
-        };
-        writeln!(f, "  {}:", key).map_err(|e| e.to_string())?;
-        writeln!(f, "    estimate: {:.6}", s).map_err(|e| e.to_string())?;
-        writeln!(f, "    variance: {:.6}", s * s).map_err(|e| e.to_string())?;
-        writeln!(f, "    type: {}", kind_str).map_err(|e| e.to_string())?;
-        if matches!(sigma_type, Some(SigmaType::Proportional)) {
-            writeln!(f, "    cv_pct: {:.2}", s * 100.0).map_err(|e| e.to_string())?;
-        }
-        if is_fixed {
-            writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
-            writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
-        } else {
-            match se {
-                Some(sv) => writeln!(f, "    se: {:.6}", sv).map_err(|e| e.to_string())?,
-                None => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
-            }
-        }
+    if let Some(s) = estimates::mixture_overrides_section(result) {
+        write!(f, "{}", s.yaml()).map_err(|e| e.to_string())?;
     }
-
-    if !result.residual_correlations.is_empty() {
-        writeln!(f, "\nblock_sigma:").map_err(|e| e.to_string())?;
-        for (k, corr) in result.residual_correlations.iter().enumerate() {
-            let name_i = result.sigma_names.get(corr.sigma_i).ok_or_else(|| {
-                format!(
-                    "residual correlation sigma_i index {} is out of bounds",
-                    corr.sigma_i
-                )
-            })?;
-            let name_j = result.sigma_names.get(corr.sigma_j).ok_or_else(|| {
-                format!(
-                    "residual correlation sigma_j index {} is out of bounds",
-                    corr.sigma_j
-                )
-            })?;
-            let sigma_i = result.sigma.get(corr.sigma_i).ok_or_else(|| {
-                format!(
-                    "residual correlation sigma_i index {} has no estimate",
-                    corr.sigma_i
-                )
-            })?;
-            let sigma_j = result.sigma.get(corr.sigma_j).ok_or_else(|| {
-                format!(
-                    "residual correlation sigma_j index {} has no estimate",
-                    corr.sigma_j
-                )
-            })?;
-            // Since #847 a bare `block_sigma (...) = [...]` **estimates** the
-            // off-diagonal (NONMEM `$SIGMA BLOCK(n)`); only `... FIX` pins it. A
-            // pre-#847 `FitResult` carries no flags at all, and back then every
-            // correlation was fixed by construction — hence the `true` default.
-            let correlation_fixed = result
-                .residual_correlation_fixed
-                .get(k)
-                .copied()
-                .unwrap_or(true);
-            // The covariance `rho·sigma_i·sigma_j` is fixed only when *all three*
-            // factors are: a free rho or a free SD moves it during the fit.
-            let sigma_is_fixed = |i: usize| result.sigma_fixed.get(i).copied().unwrap_or(false);
-            let covariance_fixed =
-                correlation_fixed && sigma_is_fixed(corr.sigma_i) && sigma_is_fixed(corr.sigma_j);
-            writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
-            writeln!(f, "    covariance: {:.6}", corr.rho * sigma_i * sigma_j)
-                .map_err(|e| e.to_string())?;
-            writeln!(f, "    covariance_fixed: {}", covariance_fixed).map_err(|e| e.to_string())?;
-            writeln!(f, "    correlation: {:.6}", corr.rho).map_err(|e| e.to_string())?;
-            writeln!(f, "    correlation_fixed: {}", correlation_fixed)
-                .map_err(|e| e.to_string())?;
-            // SE on the natural rho scale. `~` for a FIXed correlation and for a
-            // fit whose covariance step did not run — the same convention the
-            // theta/omega/sigma blocks above use.
-            let corr_se = if correlation_fixed {
-                None
-            } else {
-                result
-                    .se_residual_correlations
-                    .as_ref()
-                    .and_then(|v| v.get(k))
-                    .copied()
-            };
-            match corr_se {
-                Some(se) => writeln!(f, "    correlation_se: {:.6}", se),
-                None => writeln!(f, "    correlation_se: ~"),
-            }
-            .map_err(|e| e.to_string())?;
-        }
-    }
-
-    // IOV (KAPPA) block
-    if let Some(ref iov) = result.omega_iov {
-        writeln!(f, "\nomega_iov:").map_err(|e| e.to_string())?;
-        let n_kappa = iov.nrows();
-        for i in 0..n_kappa {
-            let var = iov[(i, i)];
-            let is_fixed = result.kappa_fixed.get(i).copied().unwrap_or(false);
-            let se = result.se_kappa.as_ref().and_then(|v| v.get(i).copied());
-            let name = result
-                .kappa_names
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| format!("kappa_{}", i + 1));
-            writeln!(f, "  {}:", name).map_err(|e| e.to_string())?;
-            // Nested levels (#1082 PR4): the level the κ is drawn at.
-            if let Some(level) = result.kappa_levels.get(i) {
-                writeln!(f, "    level: {}", yaml_quote(level)).map_err(|e| e.to_string())?;
-            }
-            writeln!(f, "    variance: {:.6}", var).map_err(|e| e.to_string())?;
-            if let Some(line) = variance_yaml_line(result.kappa_param_types.get(i).copied(), var) {
-                writeln!(f, "{}", line).map_err(|e| e.to_string())?;
-            }
-            // A weighted kappa (#1660): `variance`/`sd` are the weight-1 γ², so
-            // add the weight and the typical arm's spread the console prints:
-            // its SD always, and for a CV% type its exact CV% (#1858).
-            if let Some((w, typical)) =
-                kappa_weight_facts(&result.kappa_weights, &result.kappa_weight_typical, i, var)
-            {
-                writeln!(f, "    weight: {}", yaml_quote(w)).map_err(|e| e.to_string())?;
-                if let Some((n, var_at)) = typical {
-                    writeln!(f, "    weight_typical: {:.6}", n).map_err(|e| e.to_string())?;
-                    writeln!(f, "    sd_at_typical_weight: {:.6}", sd_from_var(var_at))
-                        .map_err(|e| e.to_string())?;
-                    let kappa_type = result.kappa_param_types.get(i).copied();
-                    if let Some(line) = typical_cv_yaml_line(kappa_type, var_at) {
-                        writeln!(f, "{}", line).map_err(|e| e.to_string())?;
-                    }
-                }
-            }
-            if is_fixed {
-                writeln!(f, "    fixed: true").map_err(|e| e.to_string())?;
-                writeln!(f, "    se: ~").map_err(|e| e.to_string())?;
-            } else {
-                match se {
-                    Some(sv) => writeln!(f, "    se: {:.6}", sv).map_err(|e| e.to_string())?,
-                    None => writeln!(f, "    se: ~").map_err(|e| e.to_string())?,
-                }
-            }
-        }
-        // Off-diagonal covariances/correlations (block_kappa). Keyed as
-        // `{name_i}__{name_j}` to keep the per-name structure of the diagonal
-        // entries; falls back to numeric indices if names are missing.
-        for i in 0..n_kappa {
-            for j in 0..i {
-                let cov = iov[(i, j)];
-                if cov.abs() <= 1e-15 {
-                    continue;
-                }
-                let name_i = result
-                    .kappa_names
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_else(|| format!("kappa_{}", i + 1));
-                let name_j = result
-                    .kappa_names
-                    .get(j)
-                    .cloned()
-                    .unwrap_or_else(|| format!("kappa_{}", j + 1));
-                let param_corr = param_corr_fallback(
-                    result.omega_iov_param_corr.as_ref(),
-                    cov,
-                    iov[(i, i)],
-                    iov[(j, j)],
-                    i,
-                    j,
-                );
-                writeln!(f, "  {}__{}:", name_i, name_j).map_err(|e| e.to_string())?;
-                writeln!(f, "    covariance: {:.6}", cov).map_err(|e| e.to_string())?;
-                writeln!(f, "    correlation: {:.6}", param_corr).map_err(|e| e.to_string())?;
-            }
-        }
-    }
+    // The same sections under `estimates:`, the path `fit.json` uses too (#2911).
+    write!(f, "{}", estimates::estimates_yaml(result)?).map_err(|e| e.to_string())?;
 
     // Importance-sampling marginal log-likelihood section
     if let Some(ref imp) = result.importance_sampling {
@@ -3769,6 +3855,9 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         }
     }
 
+    f.write_all(multi_start_yaml(result)?.as_bytes())
+        .map_err(|e| e.to_string())?;
+
     // Covariance matrix block (optimizer parameterization).
     // Emitted when the covariance step succeeded or was regularized, giving
     // downstream tools (bootstrap, SIR, uncertainty propagation) the full
@@ -3854,14 +3943,23 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
 /// parameter is labelled `[FIX]` and has no SE; so does a free one whose SE
 /// the covariance step did not produce (`se = None`). Both print `---`. The
 /// %RSE of an estimate at zero (`|est| <= 1e-12`, where [`rse_pct`] is `NaN`)
-/// is undefined and also prints `---`, beside its SE.
-fn parameter_table_row(name: &str, est: f64, se: Option<f64>, fixed: bool, kind: &str) -> String {
+/// is undefined and also prints `---`, beside its SE. A free parameter whose SE is not
+/// available because it sits on a bound (`held`, [`se_held`], #2797) prints `N/A` in both.
+fn parameter_table_row(
+    name: &str,
+    est: f64,
+    se: Option<f64>,
+    fixed: bool,
+    held: bool,
+    kind: &str,
+) -> String {
     let label = if fixed {
         fixed_label(name)
     } else {
         name.to_string()
     };
     let (se_str, rse_str) = match se.filter(|_| !fixed) {
+        _ if held && !fixed => ("N/A".to_string(), "N/A".to_string()),
         Some(s) => {
             let rse = rse_pct(est, s);
             let rse_str = if rse.is_finite() {
@@ -3961,6 +4059,7 @@ pub fn parameter_table(result: &FitResult) -> String {
             result.theta[i],
             result.se_theta.as_ref().and_then(|se| se.get(i).copied()),
             result.theta_fixed.get(i).copied().unwrap_or(false),
+            theta_held_at_bound(result, i),
             "THETA",
         ));
     }
@@ -3973,6 +4072,7 @@ pub fn parameter_table(result: &FitResult) -> String {
             result.omega[(i, i)],
             crate::types::omega_se_at(&result.se_omega, n_eta, i, i),
             eta_fixed(i),
+            se_held(result, ParameterKind::Omega, i).is_some(),
             "OMEGA var",
         ));
     }
@@ -3987,6 +4087,7 @@ pub fn parameter_table(result: &FitResult) -> String {
             result.omega[(i, j)],
             crate::types::omega_se_at(&result.se_omega, n_eta, i, j),
             eta_fixed(i) && eta_fixed(j),
+            false,
             "OMEGA cov",
         ));
     }
@@ -3997,7 +4098,28 @@ pub fn parameter_table(result: &FitResult) -> String {
             s,
             result.se_sigma.as_ref().and_then(|se| se.get(i).copied()),
             result.sigma_fixed.get(i).copied().unwrap_or(false),
+            se_held(result, ParameterKind::Sigma, i).is_some(),
             "SIGMA SD",
+        ));
+    }
+
+    for row in override_rows(result) {
+        let family = match row.param.kind {
+            ParameterKind::Omega => "OMEGA var",
+            _ => "SIGMA SD",
+        };
+        let (se, held) = match row.se {
+            OverrideSe::Free(se) => (se, false),
+            OverrideSe::Held(_) => (None, true),
+            OverrideSe::Fixed => (None, false),
+        };
+        lines.push(parameter_table_row(
+            &row.param.name,
+            row.value,
+            se,
+            row.se == OverrideSe::Fixed,
+            held,
+            &format!("{family} (class {})", row.param.class),
         ));
     }
 
@@ -4009,6 +4131,7 @@ pub fn parameter_table(result: &FitResult) -> String {
                 iov[(i, i)],
                 result.se_kappa.as_ref().and_then(|se| se.get(i).copied()),
                 kappa_fixed(i),
+                se_held(result, ParameterKind::Kappa, i).is_some(),
                 "KAPPA var",
             ));
         }
@@ -4019,6 +4142,7 @@ pub fn parameter_table(result: &FitResult) -> String {
                 iov[(i, j)],
                 None,
                 kappa_fixed(i) && kappa_fixed(j),
+                false,
                 "KAPPA cov",
             ));
         }
@@ -4141,6 +4265,7 @@ mod tests {
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
             profiled_levels_at_bound: Vec::new(),
+            held_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -4161,6 +4286,7 @@ mod tests {
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
+            starts: Vec::new(),
             saem_seed: None,
             sir_seed: None,
             sir_settings: None,
@@ -4179,10 +4305,16 @@ mod tests {
             exclusions: None,
             packed_estimate: None,
             mixture_overrides: None,
+            mixture_override_params: Vec::new(),
+            se_mixture_overrides: None,
             left_init: None,
             stationary_start: false,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
+            newton_decrement: None,
+            optimizer_stop: None,
+            eval_budget_spent: false,
+            evaluation_only: false,
         }
     }
 
@@ -4399,6 +4531,124 @@ mod tests {
         assert!(!s.contains("Final gradient"), "{s}");
     }
 
+    /// #2799: three results, one per status, with the reason sets the classifier gives.
+    fn status_cases() -> Vec<(&'static str, FitResult)> {
+        use crate::types::{classify_warning, HeldAtBound, HeldReason, ParameterKind};
+        let base = || {
+            let mut r = comprehensive_result();
+            r.warnings.clear();
+            r.warnings_structured.clear();
+            r.held_at_bound.clear();
+            r.eval_budget_spent = false;
+            r.evaluation_only = false;
+            r.covariance_status = crate::types::CovarianceStatus::Computed;
+            r
+        };
+        let mut converged = base();
+        converged.converged = true;
+        // Bill's shape (#2799 plan row 7): converged, step failed, a collapse it did not hold.
+        let mut issues = base();
+        issues.converged = true;
+        issues.covariance_status = crate::types::CovarianceStatus::Failed;
+        issues.cov_fixed.clear();
+        issues.held_at_bound = vec![HeldAtBound {
+            name: "ETA_STUDY".into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index: 3,
+            reason: HeldReason::CollapsedAtGuard,
+            class: None,
+        }];
+        let w = "Covariance step failed: Hessian is not positive definite".to_string();
+        issues.warnings_structured = vec![classify_warning(&w)];
+        issues.warnings = vec![w];
+        let mut eval = base();
+        eval.converged = false;
+        eval.evaluation_only = true;
+        vec![
+            ("converged", converged),
+            ("issues", issues),
+            ("evaluation only", eval),
+        ]
+    }
+
+    /// #2799: `ferx summary` prints the `Status:` line, after `Final gradient:` (whose
+    /// adjacency to `Converged:` #1934 pins) and before `Iterations:`, one case per status:
+    /// no parentheses on an empty list, the reasons in order otherwise. `print_results` shares
+    /// `status_line`. Mutation: drop the line from `format_summary` → every case.
+    #[test]
+    fn format_summary_prints_the_status_line() {
+        let want = [
+            "Status:     CONVERGED\n",
+            "Status:     CONVERGED WITH ISSUES (covariance_failed, collapsed_at_guard: ETA_STUDY)\n",
+            "Status:     NOT CONVERGED (evaluation_only)\n",
+        ];
+        for ((name, mut r), line) in status_cases().into_iter().zip(want) {
+            r.final_gradient = Some(vec![1.0e-3]);
+            r.final_gradient_source = Some("optimizer".into());
+            let s = format_summary(&r);
+            assert!(s.contains(line), "{name}: {s}");
+            assert!(!s.contains("()"), "{name}: {s}");
+            let at = |needle: &str| s.find(needle).unwrap_or_else(|| panic!("{needle}: {s}"));
+            assert!(
+                at("Final gradient:") < at("Status:") && at("Status:") < at("Iterations:"),
+                "{name}: {s}"
+            );
+        }
+    }
+
+    /// #2799: the fit YAML writes `status:` and `status_reasons:` in the `model:` block,
+    /// always, one case per status (`[]` on an empty list). Mutation: drop either line → every
+    /// case.
+    #[test]
+    fn estimates_yaml_writes_status_and_reasons() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let want = [
+            ("converged", "[]"),
+            (
+                "converged_with_issues",
+                r#"["covariance_failed", "collapsed_at_guard: ETA_STUDY"]"#,
+            ),
+            ("not_converged", r#"["evaluation_only"]"#),
+        ];
+        for ((name, r), (token, reasons)) in status_cases().into_iter().zip(want) {
+            let path = dir.path().join(format!("{token}.yaml"));
+            write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+            let yaml = std::fs::read_to_string(&path).expect("yaml read");
+            assert!(
+                yaml.contains(&format!("  status: {token}\n")),
+                "{name}: {yaml}"
+            );
+            assert!(
+                yaml.contains(&format!("  status_reasons: {reasons}\n")),
+                "{name}: {yaml}"
+            );
+        }
+    }
+
+    /// #2785: the fit YAML records the Newton decrement and the NLopt stop state in the
+    /// `model:` block, beside the verdict they qualify, and omits each when the fit has none.
+    #[test]
+    fn write_estimates_yaml_records_the_decrement_and_the_stop_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let yaml_of = |d: Option<f64>, stop: Option<&str>, name: &str| {
+            let mut r = comprehensive_result();
+            r.newton_decrement = d;
+            r.optimizer_stop = stop.map(String::from);
+            let path = dir.path().join(name);
+            write_estimates_yaml(&r, path.to_str().unwrap()).expect("yaml write");
+            std::fs::read_to_string(&path).expect("yaml read")
+        };
+        let yaml = yaml_of(Some(337.4), Some("Failure"), "both.yaml");
+        assert!(yaml.contains("  newton_decrement: 3.374000e+2\n"), "{yaml}");
+        assert!(yaml.contains("  optimizer_stop: Failure\n"), "{yaml}");
+        let yaml = yaml_of(Some(f64::NAN), None, "nan.yaml");
+        assert!(yaml.contains("  newton_decrement: .nan\n"), "{yaml}");
+        assert!(!yaml.contains("optimizer_stop"), "{yaml}");
+        let yaml = yaml_of(None, None, "none.yaml");
+        assert!(!yaml.contains("newton_decrement"), "{yaml}");
+    }
+
     /// #1934: the fit YAML records |g|∞ and its source in the `model:` block,
     /// omits both keys when there is no gradient, and spells a non-finite norm
     /// as YAML's `.nan` rather than Rust's `NaN` (a string to a YAML reader), and
@@ -4580,12 +4830,12 @@ mod tests {
 
             let file = tempfile::NamedTempFile::new().unwrap();
             write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
-            let yaml = std::fs::read_to_string(file.path()).unwrap();
+            let yaml = top_level_yaml(&std::fs::read_to_string(file.path()).unwrap());
             if compact {
                 assert!(
                     yaml.contains(
                         "      - { label: \"L=2\", estimate: 0.500000, at_bound: true, se: ~, \
-                         rse_pct: ~ }\n"
+                         rse_pct: ~, held: profiled_bound }\n"
                     ),
                     "{yaml}"
                 );
@@ -4597,7 +4847,7 @@ mod tests {
                 assert!(
                     yaml.contains(
                         "  PLACEBO[L=2]:\n    estimate: 0.500000\n    at_bound: true\n    se: ~\n    \
-                         rse_pct: ~\n"
+                         rse_pct: ~\n    held: profiled_bound\n"
                     ),
                     "{yaml}"
                 );
@@ -4623,6 +4873,216 @@ mod tests {
             assert_eq!(yaml.matches("at_bound: true").count(), 1, "{yaml}");
             assert!(!yaml.contains("fixed: true"), "{yaml}");
         }
+    }
+
+    /// T4 (#2809): a `[mixture]` override entry names its base `(kind, index)`, so
+    /// `se_held` must skip it — or the base's SE prints `N/A` in every renderer — while a
+    /// base entry at the same `(kind, index)` still counts (both sides of the gate).
+    #[test]
+    fn se_held_never_reads_a_mixture_override_entry_as_its_base() {
+        let mut r = crate::types::test_helpers::minimal_fit_result();
+        let entry = |name: &str, class| HeldAtBound {
+            name: name.into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index: 3,
+            reason: HeldReason::CollapsedAtGuard,
+            class,
+        };
+        r.held_at_bound = vec![entry("eta_CL_MIX2", Some(2))];
+        assert_eq!(se_held(&r, ParameterKind::Omega, 0), None);
+        let table = parameter_table(&r);
+        let row = table
+            .lines()
+            .find(|l| l.starts_with("eta_CL "))
+            .unwrap_or_else(|| panic!("{table}"));
+        assert!(!row.contains("N/A"), "{table}");
+        assert!(row.contains("0.010000"), "{table}");
+
+        r.held_at_bound = vec![entry("eta_CL", None)];
+        assert_eq!(
+            se_held(&r, ParameterKind::Omega, 0),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+    }
+
+    /// #2797 test 2: every renderer reads `se_held`, for every kind × reason. A held row
+    /// prints `N/A` (console and parameter table) or `se: ~` plus `held: <reason>` (YAML),
+    /// a profiled level keeps its `at_bound: true`, and — the negative — a row that is not
+    /// held prints its number. The stored SE of a held row is deliberately non-zero here,
+    /// so a renderer that reads the number instead of the list prints it and fails.
+    #[test]
+    fn a_held_parameter_prints_no_se_in_every_renderer() {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let mut r = make_sigma_only_result(ErrorModel::Proportional, vec![0.1, 0.2]);
+        r.sigma_names = vec!["PROP_A".into(), "PROP_B".into()];
+        r.sigma_fixed = vec![false; 2];
+        r.se_sigma = Some(vec![0.0123, 0.0456]);
+        r.theta = vec![0.5, 2.0, 3.0];
+        r.theta_names = vec!["TVCL".into(), "TVV".into(), "TVKA".into()];
+        r.theta_fixed = vec![false; 3];
+        r.se_theta = Some(vec![0.0311, 0.0322, 0.0333]);
+        r.eta_names = vec!["ETA_CL".into(), "ETA_KA".into()];
+        r.omega = DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![0.09, 6.1e-6]));
+        r.omega_fixed = vec![false; 2];
+        r.se_omega = Some(vec![0.0177, 0.0188]);
+        r.kappa_names = vec!["K_CL".into(), "K_KA".into()];
+        r.omega_iov = Some(DMatrix::from_diagonal(&nalgebra::DVector::from_vec(vec![
+            0.04, 6.1e-6,
+        ])));
+        r.kappa_fixed = vec![false; 2];
+        r.se_kappa = Some(vec![0.0144, 0.0155]);
+        let held = |name: &str, kind, index, packed_index, reason| HeldAtBound {
+            name: name.into(),
+            kind,
+            index,
+            packed_index,
+            reason,
+            class: None,
+        };
+        r.held_at_bound = vec![
+            held("TVV", ParameterKind::Theta, 1, 1, HeldReason::ProfiledBound),
+            held(
+                "TVKA",
+                ParameterKind::Theta,
+                2,
+                2,
+                HeldReason::CollapsedAtGuard,
+            ),
+            held(
+                "ETA_KA",
+                ParameterKind::Omega,
+                1,
+                4,
+                HeldReason::CollapsedAtGuard,
+            ),
+            held(
+                "PROP_B",
+                ParameterKind::Sigma,
+                1,
+                6,
+                HeldReason::CollapsedAtGuard,
+            ),
+            held(
+                "K_KA",
+                ParameterKind::Kappa,
+                1,
+                8,
+                HeldReason::CollapsedAtGuard,
+            ),
+        ];
+        // The predicate itself, each kind × reason, and its negative.
+        assert_eq!(
+            se_held(&r, ParameterKind::Theta, 1),
+            Some(HeldReason::ProfiledBound)
+        );
+        assert_eq!(
+            se_held(&r, ParameterKind::Theta, 2),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+        assert_eq!(se_held(&r, ParameterKind::Theta, 0), None);
+        assert_eq!(
+            se_held(&r, ParameterKind::Omega, 1),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+        assert_eq!(se_held(&r, ParameterKind::Omega, 0), None);
+        assert_eq!(
+            se_held(&r, ParameterKind::Sigma, 1),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+        assert_eq!(
+            se_held(&r, ParameterKind::Kappa, 1),
+            Some(HeldReason::CollapsedAtGuard)
+        );
+        assert_eq!(se_held(&r, ParameterKind::Kappa, 0), None);
+
+        // Console (`format_summary`, whose rows `print_results` shares).
+        let summary = format_summary(&r);
+        let line = |name: &str| {
+            summary
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name}: {summary}"))
+                .to_string()
+        };
+        for name in ["TVV", "TVKA"] {
+            assert_eq!(
+                line(name).split_whitespace().collect::<Vec<_>>()[2..],
+                ["N/A", "N/A"],
+                "{summary}"
+            );
+        }
+        assert!(line("TVCL").contains("0.031100"), "{summary}");
+        assert!(line("ETA_KA").ends_with("SE = N/A"), "{summary}");
+        assert!(line("ETA_CL").contains("SE = 0.017700"), "{summary}");
+        assert!(line("PROP_B").ends_with("SE = N/A"), "{summary}");
+        assert!(line("PROP_A").ends_with("SE = 0.012300"), "{summary}");
+        let print = format_kappa_rows(&r);
+        assert!(print.contains("SE = N/A"), "{print}");
+        assert!(print.contains("SE = 0.014400"), "{print}");
+        assert!(!print.contains("0.015500"), "{print}");
+
+        // Parameter table.
+        let table = parameter_table(&r);
+        let cells = |name: &str| {
+            let l = table
+                .lines()
+                .find(|l| l.starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("{name}: {table}"));
+            l.split_whitespace().collect::<Vec<_>>()[2..4].join(" ")
+        };
+        for name in ["TVV", "TVKA", "ETA_KA", "PROP_B", "K_KA"] {
+            assert_eq!(cells(name), "N/A N/A", "{name}: {table}");
+        }
+        for (name, se) in [
+            ("TVCL", "0.031100"),
+            ("ETA_CL", "0.017700"),
+            ("PROP_A", "0.012300"),
+            ("K_CL", "0.014400"),
+        ] {
+            assert!(cells(name).starts_with(se), "{name}: {table}");
+        }
+
+        // YAML.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
+        let yaml = top_level_yaml(&std::fs::read_to_string(file.path()).unwrap());
+        assert!(
+            yaml.contains("  TVV:\n    estimate: 2.000000\n    at_bound: true\n    se: ~\n    rse_pct: ~\n    held: profiled_bound\n"),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains("  TVKA:\n    estimate: 3.000000\n    se: ~\n    rse_pct: ~\n    held: collapsed_at_guard\n"),
+            "{yaml}"
+        );
+        for name in ["ETA_KA", "PROP_B", "K_KA"] {
+            let block = yaml
+                .split(&format!("  {name}:\n"))
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name}: {yaml}"));
+            let block: Vec<&str> = block
+                .lines()
+                .take_while(|l| l.starts_with("    "))
+                .collect();
+            let block = block.join("\n");
+            assert!(
+                block.contains("    se: ~\n    held: collapsed_at_guard"),
+                "{name}: {block}"
+            );
+        }
+        assert!(yaml.contains("    se: 0.017700\n"), "{yaml}");
+        assert!(yaml.contains("    se: 0.012300\n"), "{yaml}");
+        assert!(yaml.contains("    se: 0.014400\n"), "{yaml}");
+        assert!(
+            !yaml.contains("0.018800") && !yaml.contains("0.045600"),
+            "{yaml}"
+        );
+        assert_eq!(yaml.matches("at_bound: true").count(), 1, "{yaml}");
+        assert_eq!(
+            yaml.matches("held: collapsed_at_guard").count(),
+            4,
+            "{yaml}"
+        );
     }
 
     #[test]
@@ -5051,7 +5511,7 @@ mod tests {
 
     #[test]
     fn sigma_yaml_combined_distinguishes_components() {
-        let yaml = yaml_for(ErrorModel::Combined, vec![0.2, 0.5]);
+        let yaml = top_level_yaml(&yaml_for(ErrorModel::Combined, vec![0.2, 0.5]));
         // First sigma is proportional (CV%), second is additive (no CV).
         assert!(yaml.contains("type: proportional"), "yaml=\n{}", yaml);
         assert!(yaml.contains("type: additive"), "yaml=\n{}", yaml);
@@ -5082,6 +5542,8 @@ mod tests {
             cwres: vec![0.0; n_obs],
             npde: vec![],
             npd: vec![],
+            epred: vec![],
+            pwres: vec![],
             ofv_contribution: 0.0,
             cens: vec![0; n_obs],
             n_obs,
@@ -5330,6 +5792,7 @@ mod tests {
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
             profiled_levels_at_bound: Vec::new(),
+            held_at_bound: Vec::new(),
             eta_log_transformed: Vec::new(),
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -5350,6 +5813,7 @@ mod tests {
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
+            starts: Vec::new(),
             saem_seed: None,
             sir_seed: None,
             sir_settings: None,
@@ -5368,10 +5832,16 @@ mod tests {
             exclusions: None,
             packed_estimate: None,
             mixture_overrides: None,
+            mixture_override_params: Vec::new(),
+            se_mixture_overrides: None,
             left_init: None,
             stationary_start: false,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
+            newton_decrement: None,
+            optimizer_stop: None,
+            eval_budget_spent: false,
+            evaluation_only: false,
         }
     }
 
@@ -5442,6 +5912,8 @@ mod tests {
         let mut sr = sdtab_subject_result("1", 2);
         sr.npde = vec![0.3, -1.2];
         sr.npd = vec![0.4, -1.0];
+        sr.epred = vec![5.5, 2.25];
+        sr.pwres = vec![0.7, f64::NAN];
         let result = minimal_sdtab_result(vec![sr]);
         let population = Population {
             subjects: vec![sdtab_subject("1", 2, vec![1, 1])],
@@ -5465,6 +5937,26 @@ mod tests {
             .expect("NPD column should be present when populated");
         assert_eq!(npde, vec![0.3, -1.2]);
         assert_eq!(npd, vec![0.4, -1.0]);
+        // #2871: EPRED and the population-weighted residual under both its names,
+        // carried row for row (a `NaN` PWRES stays `NaN`, not dropped or zeroed).
+        let col = |n: &str| {
+            cols.iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{n} column should be present when populated"))
+        };
+        assert_eq!(col("EPRED"), vec![5.5, 2.25]);
+        for name in ["PWRES", "EWRES"] {
+            let v = col(name);
+            assert_eq!(v[0], 0.7, "{name}");
+            assert!(v[1].is_nan(), "{name}: {v:?}");
+        }
+        let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+        let at = |n: &str| names.iter().position(|x| *x == n).unwrap();
+        assert!(
+            at("NPD") < at("EPRED") && at("EPRED") < at("EWRES") && at("EWRES") < at("PWRES"),
+            "the simulation columns sit together after NPD: {names:?}"
+        );
     }
 
     #[test]
@@ -5482,8 +5974,11 @@ mod tests {
 
         let cols = sdtab(&result, &population);
         assert!(
-            cols.iter().all(|(name, _)| name != "NPDE" && name != "NPD"),
-            "NPDE/NPD columns should be absent when npde_nsim = 0"
+            cols.iter().all(|(name, _)| !matches!(
+                name.as_str(),
+                "NPDE" | "NPD" | "EPRED" | "PWRES" | "EWRES"
+            )),
+            "NPDE/NPD/EPRED/PWRES/EWRES columns should be absent when npde_nsim = 0"
         );
     }
 
@@ -5595,6 +6090,94 @@ mod tests {
             mixnum,
             &vec![2.0, 2.0],
             "the Gaussian row, then the discrete row"
+        );
+    }
+
+    /// `[output] MIXNUM` on a mixture fit (#2784) arrives as an extra column holding the
+    /// class. On a simulated population the sdtab must then carry **one** `MIXNUM`
+    /// column — the requested one — not the engine's simulated-class column beside it
+    /// under the same name.
+    ///
+    /// Dies on: `any_mixnum` ignoring the request (two `MIXNUM` columns).
+    #[test]
+    fn sdtab_output_mixnum_replaces_the_simulated_class_column() {
+        let mut s0 = sdtab_subject_result("1", 2);
+        s0.pmix = Some(vec![0.2, 0.8]);
+        s0.mixest = Some(2);
+        s0.extra_columns = vec![("MIXNUM".into(), vec![1.0, 1.0])];
+        let result = minimal_sdtab_result(vec![s0]);
+        let mut p0 = sdtab_subject("1", 2, vec![1, 1]);
+        p0.simulated_mixnum = Some(1);
+        let population = Population {
+            subjects: vec![p0],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let cols = sdtab(&result, &population);
+        let mixnum: Vec<&Vec<f64>> = cols
+            .iter()
+            .filter(|(n, _)| n == "MIXNUM")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(mixnum, vec![&vec![1.0, 1.0]], "exactly one MIXNUM column");
+        // Control: without the request the engine column is still written.
+        let mut plain = result.clone();
+        plain.subjects[0].extra_columns.clear();
+        let n = sdtab(&plain, &population)
+            .iter()
+            .filter(|(n, _)| n == "MIXNUM")
+            .count();
+        assert_eq!(n, 1, "the simulated-class column without [output] MIXNUM");
+    }
+
+    /// Under `[output] MIXNUM` on a fit of data read from a file (no simulated class), a
+    /// discrete row's `MIXNUM` is the subject's fitted `MIXEST` — the value the extra
+    /// column carries on its Gaussian rows (#2784) — where before it read the simulated
+    /// class only and was blank. Without the request it stays blank.
+    ///
+    /// Dies on: `subject_mixnum` ignoring `mixest`, or reading it unrequested.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn sdtab_output_mixnum_fills_a_discrete_row_with_the_fitted_class() {
+        let mut s0 = sdtab_subject_result("1", 1);
+        s0.pmix = Some(vec![0.1, 0.9]);
+        s0.mixest = Some(2);
+        s0.extra_columns = vec![("MIXNUM".into(), vec![2.0])];
+        s0.discrete_rows.push(crate::types::DiscreteObsDiagnostic {
+            cmt: 2,
+            time: 4.0,
+            dv: 1.0,
+            pred: 0.5,
+            ipred: 0.6,
+            iwres: 0.8,
+        });
+        let result = minimal_sdtab_result(vec![s0]);
+        let population = Population {
+            subjects: vec![sdtab_subject("1", 1, vec![1])],
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        };
+        let cols = sdtab(&result, &population);
+        let mixnum = &cols.iter().find(|(n, _)| n == "MIXNUM").expect("MIXNUM").1;
+        assert_eq!(
+            mixnum,
+            &vec![2.0, 2.0],
+            "the Gaussian row, then the discrete row"
+        );
+
+        let mut plain = result.clone();
+        plain.subjects[0].extra_columns.clear();
+        assert!(
+            sdtab(&plain, &population)
+                .iter()
+                .all(|(n, _)| n != "MIXNUM"),
+            "no MIXNUM column without the request or a simulated class"
         );
     }
 
@@ -5974,6 +6557,8 @@ mod tests {
             cwres: vec![-0.5, f64::NAN],
             npde: vec![],
             npd: vec![],
+            epred: vec![],
+            pwres: vec![],
             ofv_contribution: 3.0,
             cens: vec![0, 1],
             n_obs: 2,
@@ -7976,7 +8561,7 @@ mod tests {
         // entry, followed by the #1660 weight keys and (#1858) the typical
         // arm's exact CV%, which only a CV% type gets: one such key in a file
         // with a log-normal, an additive, a logit and a custom weighted kappa.
-        let yaml = yaml_of(&mk(true, true));
+        let yaml = top_level_yaml(&yaml_of(&mk(true, true)));
         let entry = "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n    \
                      weight: \"NARM\"\n    weight_typical: 4.000000\n    \
                      sd_at_typical_weight: 0.111952\n    \
@@ -7999,7 +8584,7 @@ mod tests {
         );
         // Unweighted: byte-identical to the weighted file less its weight keys,
         // and the log-normal entry is the pre-#1666 one.
-        let plain = yaml_of(&mk(false, true));
+        let plain = top_level_yaml(&yaml_of(&mk(false, true)));
         assert!(
             plain.contains("  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n    se: ~\n"),
             "{plain}"
@@ -8383,7 +8968,7 @@ mod tests {
     #[test]
     fn yaml_reports_a_weighted_kappa() {
         let w = weighted_result();
-        let yaml = yaml_of(&w);
+        let yaml = top_level_yaml(&yaml_of(&w));
         let entry = "  K_ADD:\n    variance: 156.036966\n    sd: 12.491476\n    \
                      weight: \"NARM\"\n    weight_typical: 4.000000\n    \
                      sd_at_typical_weight: 6.245738\n    se: ~\n";
@@ -8402,7 +8987,7 @@ mod tests {
 
         // Unweighted kappas (and every ETA): byte-identical to the same fit
         // with no weights at all.
-        let plain = yaml_of(&classified_result());
+        let plain = top_level_yaml(&yaml_of(&classified_result()));
         assert!(!plain.contains("weight"), "{plain}");
         let stripped: String = yaml
             .lines()
@@ -9258,3 +9843,30 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "output_mixture_override_tests.rs"]
+mod mixture_override_tests;
+
+/// `yaml` without its `estimates:` block (#2911): the header and every indented line
+/// under it. For tests pinning the top-level estimate sections by counting a key across
+/// the whole file — the block repeats those sections, and `output_estimates_tests` pins
+/// it field for field against them.
+#[cfg(test)]
+pub(crate) fn top_level_yaml(yaml: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in yaml.split_inclusive('\n') {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            skipping = line == "estimates:\n";
+        }
+        if !skipping {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+#[path = "output_estimates.rs"]
+mod estimates;
+pub(crate) use estimates::{estimates_json, listed_theta_indices};

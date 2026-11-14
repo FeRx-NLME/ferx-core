@@ -300,7 +300,12 @@ pub(crate) fn predict_diag_undrained(
         }
         (results, stats)
     };
-    let predict_subjects = || assemble(population.subjects.par_iter().map(predict_one).collect());
+    let predict_subjects = || {
+        let subjects = &population.subjects;
+        assemble(crate::par::map(subjects.len(), |i| {
+            predict_one(&subjects[i])
+        }))
+    };
     let predict_subjects_serial =
         || assemble(population.subjects.iter().map(predict_one).collect());
 

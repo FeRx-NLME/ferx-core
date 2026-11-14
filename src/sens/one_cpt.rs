@@ -47,7 +47,7 @@ pub fn one_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T) -> T {
 }
 
 /// 1-cpt oral (first-order absorption): `(F·D·KA/V)·B(k, KA, t)`, the Bateman function one
-/// smooth function through `KA = k` ([`bateman`]).
+/// smooth function through `KA = k` (`bateman`).
 pub fn one_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, ka: T, f_bio: T) -> T {
     one_cpt_oral_amt_g(T::from_f64(amt), t, cl, v, ka, f_bio)
 }
@@ -240,7 +240,7 @@ pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> 
 }
 
 /// 1-cpt oral at steady state (interval `ii`): `(F·D·KA/V)·B_ss(k, KA, t)`, smooth through
-/// `KA = k` ([`bateman_ss`]).
+/// `KA = k` (`bateman_ss`).
 pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, f_bio: T) -> T {
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);

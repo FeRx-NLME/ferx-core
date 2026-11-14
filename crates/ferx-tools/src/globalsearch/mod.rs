@@ -33,6 +33,7 @@
 //! `docs/tools/global-search.qmd` states when a global search beats the
 //! stepwise tools and when it does not.
 
+use crate::cold_sort::ColdSort;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -1328,7 +1329,7 @@ pub(crate) fn search(
         ..
     } = evaluator;
     let mut order: Vec<usize> = (0..rows.len()).filter(|i| rows[*i].eligible()).collect();
-    order.sort_by(|a, b| rows[*a].fitness.total_cmp(&rows[*b].fitness));
+    order.cold_sort_by(&|a, b| rows[*a].fitness.total_cmp(&rows[*b].fitness));
     for (rank, i) in order.iter().enumerate() {
         rows[*i].rank = Some(rank + 1);
     }

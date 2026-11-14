@@ -4653,8 +4653,13 @@ mod ode_hazard_exact_tests {
                 )
                 .unwrap();
                 let (cum_d, haz_d) = ode_cumhaz_hazard(&model, s, chz, &theta, &eta, &times);
-                assert!(cum[0].is_finite() && haz[0].is_finite() && cum_d[0].is_finite());
-                worst_v = worst_v
+                assert!(
+                    cum[0].is_finite()
+                        && haz[0].is_finite()
+                        && cum_d[0].is_finite()
+                        && haz_d[0].is_finite()
+                );
+                worst_v = worst_v // nan-ok: all four values asserted finite above; the divisors are the dense cumulative hazard and hazard
                     .max((cum[0] - cum_d[0]).abs() / cum_d[0].abs())
                     .max((haz[0] - haz_d[0]).abs() / haz_d[0].abs());
                 let (_, g) = tte_subject_eta_grad(&model, s, &theta, &eta).expect("exact");

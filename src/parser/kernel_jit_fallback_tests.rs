@@ -311,10 +311,11 @@ fn outer_gradient_gap(m: &CompiledModel, pop: &Population, o: &FitOptions) -> f6
                 &x, params, m, s, &ebe.eta, &bounds, o,
             )
         });
+        assert!(exact.iter().all(|v| v.is_finite()), "{exact:?}");
         let scale = exact.iter().fold(1.0f64, |a, v| a.max(v.abs()));
         for (a, b) in exact.iter().zip(&fd) {
             assert!(a.is_finite() && b.is_finite(), "{exact:?} vs {fd:?}");
-            worst = worst.max((a - b).abs() / scale);
+            worst = worst.max((a - b).abs() / scale); // nan-ok: a, b, scale finite asserted above; scale >= 1
         }
     }
     worst
@@ -322,11 +323,15 @@ fn outer_gradient_gap(m: &CompiledModel, pop: &Population, o: &FitOptions) -> f6
 
 #[test]
 fn non_gaussian_curvature_falls_back_to_fd() {
-    for (model, data) in [
+    // The CTMM example needs `markov`; the base `ci,survival` set does not compile it in.
+    #[allow(unused_mut)]
+    let mut cases = vec![
         ("examples/tte_exponential.ferx", "data/tte_exponential.csv"),
         ("examples/binary_logistic.ferx", "data/binary_logistic.csv"),
-        ("examples/ctmm_2state.ferx", "data/ctmm_2state.csv"),
-    ] {
+    ];
+    #[cfg(feature = "markov")]
+    cases.push(("examples/ctmm_2state.ferx", "data/ctmm_2state.csv"));
+    for (model, data) in cases {
         let (m, p) = example(model, data);
         let (e, f) = pair(&m, &p, &opts(EstimationMethod::Laplace));
         // Measured, worst of the three (TTE): 2.1e-4 / 5.3e-3 / 5.9e-4.
@@ -395,16 +400,20 @@ fn mixture_falls_back_to_fd() {
     let params = &model.default_params;
     let grad = || {
         let eval = crate::estimation::mixture::mixture_ofv(&model, &pop, params, &o, None);
-        crate::estimation::mixture::mixture_gradient(&model, &pop, params, &o, &eval)
-            .expect("a mixture gradient")
+        let log = crate::estimation::outer_optimizer::OuterFdDeclineLog::new(pop.subjects.len());
+        crate::estimation::mixture::mixture_gradient_salvaged(
+            &model, &pop, params, &o, &eval, None, &log,
+        )
+        .expect("a mixture gradient")
     };
     let exact = grad();
     let fd = plans_failing(grad);
+    assert!(exact.iter().all(|v| v.is_finite()), "{exact:?}");
     let scale = exact.iter().fold(1.0f64, |a, v| a.max(v.abs()));
     let mut worst = 0.0f64;
     for (a, b) in exact.iter().zip(&fd) {
         assert!(a.is_finite() && b.is_finite(), "{exact:?} vs {fd:?}");
-        worst = worst.max((a - b).abs() / scale);
+        worst = worst.max((a - b).abs() / scale); // nan-ok: a, b, scale finite asserted above; scale >= 1
     }
     eprintln!("mixture: worst outer-gradient gap {worst:.3e}");
     // Measured 1.3e-6.

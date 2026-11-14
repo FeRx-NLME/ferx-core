@@ -193,6 +193,10 @@ impl Leaf {
     pub(super) fn adj(self, row: &[f64]) -> f64 {
         self.i.map_or(0.0, |i| row[i as usize])
     }
+    /// [`Self::adj`] over a row computed per entry.
+    pub(super) fn adj_with(self, row: impl FnOnce(usize) -> f64) -> f64 {
+        self.i.map_or(0.0, |i| row(i as usize))
+    }
 }
 
 /// A kernel's inputs, in leaf order.

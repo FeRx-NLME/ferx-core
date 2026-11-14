@@ -417,9 +417,19 @@ fn derivs(op: Unary, x: f64, second: bool) -> [f64; 3] {
             [e, e, e]
         }
         Unary::LnRaw => [x.ln(), 1.0 / x, if second { -1.0 / (x * x) } else { 0.0 }],
-        Unary::Sqrt => {
+        Unary::Sqrt | Unary::SqrtRhs => {
+            let x = if op == Unary::SqrtRhs && !(x >= 0.0) {
+                0.0
+            } else {
+                x
+            };
             let s = x.sqrt();
-            [s, 0.5 / s, if second { -0.25 / (s * s * s) } else { 0.0 }]
+            // Flat at a non-positive argument (#2892): no `0.5/0`.
+            if !(x > 0.0) {
+                [s, 0.0, 0.0]
+            } else {
+                [s, 0.5 / s, if second { -0.25 / (s * s * s) } else { 0.0 }]
+            }
         }
         Unary::InvLogit => {
             let u = 1.0 / (1.0 + (-x).exp());

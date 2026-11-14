@@ -770,6 +770,9 @@ fn with_build_count_1thread<T: Send>(f: impl FnOnce() -> T + Send) -> (T, u64) {
 /// invisible as well as effective.
 #[test]
 fn mh_steps_consumes_the_cached_schedule_on_both_arms() {
+    // The schedule is the native walk's: a closed-form objective scored through the compiled
+    // plan (`plan_value_route`) would build none, so this test pins the walk itself.
+    crate::stats::likelihood::PLAN_VALUES_OFF.with(|c| c.set(true));
     for (arm, model, pop) in [
         ("non-iov", analytic_model(), tv_population(false)),
         ("iov", iov_model(), tv_population(true)),
@@ -857,6 +860,7 @@ fn mh_steps_consumes_the_cached_schedule_on_both_arms() {
             "{arm}: no proposal accepted; the sweep is inert"
         );
     }
+    crate::stats::likelihood::PLAN_VALUES_OFF.with(|c| c.set(false));
 }
 
 /// The θ/σ M-step objective, same property, same per-arm split. Tested on the

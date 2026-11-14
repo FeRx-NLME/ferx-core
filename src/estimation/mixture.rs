@@ -23,7 +23,7 @@
 
 use nalgebra::{DMatrix, DVector};
 
-use crate::estimation::inner_optimizer::{find_ebe_for_stage, InnerLoopStats};
+use crate::estimation::inner_optimizer::{find_ebe_for_stage_with_prev, InnerLoopStats, PrevEtas};
 use crate::estimation::parameterization::{
     fd_step_floors, fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments,
     theta_packs_log, unpack_params, PackedBounds,
@@ -59,6 +59,10 @@ pub struct MixtureEval {
     /// Subjects with a contributing class whose FD Jacobian ran at the fit's tolerance
     /// because its own tighter solve could not finish (#2701).
     pub(crate) n_fd_h_redone: usize,
+    /// Per-class objective `nll_ik` per subject (`[subject][class]`), the scores `pmix` was
+    /// built from. Kept in log space for the merged-class check (#2907): a `PMIX` that
+    /// underflowed to 0 has lost the comparison this preserves.
+    pub(crate) class_nll: Vec<Vec<f64>>,
 }
 
 /// A class-`k` (0-based) view of `params`: base theta / FIX flags, with the
@@ -72,6 +76,132 @@ pub fn class_params(params: &ModelParameters, k: usize) -> ModelParameters {
     p.omega = mix.omega[k].clone();
     p.sigma = mix.sigma[k].clone();
     p
+}
+
+/// Largest per-subject log Bayes factor between two classes below which the post-fit check
+/// calls them merged (#2907). See `merged_classes_from` for the measurement it was set from.
+pub(crate) const MERGED_CLASS_LOG_BF: f64 = 1.0;
+
+/// Posterior class probability that no subject reaches in a class the post-fit check calls
+/// empty (#2907).
+pub(crate) const EMPTY_CLASS_PMIX: f64 = 1e-2;
+
+/// One finding of the post-fit merged-class check (#2907). Classes are 1-based, as `MIXNUM`
+/// spells them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ClassCollapse {
+    /// Every subject's posterior probability of `class` is below `EMPTY_CLASS_PMIX`;
+    /// `max_pmix` is the largest.
+    Empty { class: usize, max_pmix: f64 },
+    /// Both classes carry posterior mass, and no subject's data favours one over the other
+    /// by more than `MERGED_CLASS_LOG_BF`; `max_log_bf` is the largest such factor.
+    Merged { a: usize, b: usize, max_log_bf: f64 },
+}
+
+/// The post-fit merged-class check (#2907) at the final evaluation: `nll[i][k]` is subject
+/// `i`'s class objective `nll_ik` and `pmix[i][k]` its posterior `PMIX_ik`, both in subject
+/// order (`MixtureEval::class_nll` and `MixtureEval::pmix`).
+///
+/// A pair is judged on the objective, not on its parameters: classes that are equal but
+/// written two different ways have different parameters and the same likelihood. Subject
+/// `i`'s log Bayes factor between classes `a` and `b` is `|nll_ia − nll_ib|`, the amount its
+/// data moved its class odds away from the prior odds (`PMIX_ik ∝ p_ik · exp(−nll_ik)`). When
+/// no subject moves them by more than `MERGED_CLASS_LOG_BF`, the data cannot tell the two
+/// classes apart.
+///
+/// The factor is read off `nll` and not reconstructed from `PMIX`: in a fit with three or more
+/// classes, a subject dominated by a third class can have both `PMIX_ia` and `PMIX_ib`
+/// underflow to 0 although `nll_ia = nll_ib`, and `0 / 0` would call the pair separated. A
+/// factor that is not finite (a class objective that is `NaN` or infinite) separates the pair,
+/// so a failed score never produces the warning.
+///
+/// A class whose posterior is below `EMPTY_CLASS_PMIX` in every subject holds nobody, and is
+/// reported as empty; a pair with an empty class is not also reported as merged, since the
+/// factor of a class with no mass says nothing about the fit. A non-finite posterior makes its
+/// class non-empty, for the same reason.
+///
+/// Pairwise, so with three classes two merged ones beside a third are reported.
+pub(crate) fn merged_classes_from(nll: &[Vec<f64>], pmix: &[Vec<f64>]) -> Vec<ClassCollapse> {
+    let k = pmix.first().map_or(0, Vec::len);
+    if k < 2 || pmix.len() != nll.len() || nll.iter().any(|n| n.len() != k) {
+        return Vec::new();
+    }
+    // `None` when some subject's posterior of the class is not finite: such a class is never
+    // called empty (`f64::max` would drop the `NaN` and leave a maximum of 0).
+    let max_pmix: Vec<Option<f64>> = (0..k)
+        .map(|c| {
+            pmix.iter().try_fold(0.0f64, |m, p| {
+                let v = p[c];
+                v.is_finite().then(|| m.max(v))
+            })
+        })
+        .collect();
+    let empty: Vec<bool> = max_pmix
+        .iter()
+        .map(|m| m.is_some_and(|m| m < EMPTY_CLASS_PMIX))
+        .collect();
+    let mut out: Vec<ClassCollapse> = (0..k)
+        .filter(|&c| empty[c])
+        .map(|c| ClassCollapse::Empty {
+            class: c + 1,
+            max_pmix: max_pmix[c].unwrap_or(0.0),
+        })
+        .collect();
+    for a in 0..k {
+        for b in a + 1..k {
+            if empty[a] || empty[b] {
+                continue;
+            }
+            let mut max_log_bf = 0.0f64;
+            for n in nll {
+                let bf = (n[a] - n[b]).abs();
+                // NaN (∞ − ∞) and ∞ both separate the pair; `f64::max` would drop NaN.
+                max_log_bf = if bf.is_finite() {
+                    max_log_bf.max(bf)
+                } else {
+                    f64::INFINITY
+                };
+                if max_log_bf >= MERGED_CLASS_LOG_BF {
+                    break;
+                }
+            }
+            if max_log_bf < MERGED_CLASS_LOG_BF {
+                out.push(ClassCollapse::Merged {
+                    a: a + 1,
+                    b: b + 1,
+                    max_log_bf,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The `W_MIXTURE_MERGED_CLASSES` warning for `findings`, or `None` when there are none.
+pub(crate) fn merged_classes_warning(findings: &[ClassCollapse]) -> Option<String> {
+    if findings.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = findings
+        .iter()
+        .map(|f| match f {
+            ClassCollapse::Empty { class, max_pmix } => format!(
+                "class {class} is empty (no subject's posterior probability of it exceeds \
+                 {max_pmix:.2e})"
+            ),
+            ClassCollapse::Merged { a, b, max_log_bf } => format!(
+                "classes {a} and {b} have merged (no subject's data favours either by more \
+                 than {max_log_bf:.3} log-likelihood units)"
+            ),
+        })
+        .collect();
+    Some(format!(
+        "W_MIXTURE_MERGED_CLASSES: at the final estimates {}. The fit has fewer distinct \
+         classes than `nsub`, which is often a local optimum rather than the best mixture: \
+         refit with class starts further apart, or with `optimizer = bobyqa`, and compare the \
+         objective (#2907).",
+        parts.join("; ")
+    ))
 }
 
 /// Combine one subject's per-class scores into its mixture contribution.
@@ -116,7 +246,9 @@ fn any_contributing(flags: &[bool], probs: &[f64]) -> bool {
 /// Evaluate the mixture FOCE objective at `params` (#977 Phase 3).
 ///
 /// `warm` optionally carries the previous iteration's per-class EBEs
-/// (`[class][subject]`) to warm-start each class's inner solve.
+/// (`[class][subject]`) to warm-start each class's inner solve. They are taken as modes a
+/// solve returned, so an exactly-zero one is warm like any other and does not rerun the
+/// cold inner multi-start; pass `None` for a cold start.
 pub fn mixture_ofv(
     model: &CompiledModel,
     population: &Population,
@@ -185,7 +317,7 @@ pub(crate) fn mixture_ofv_with_modes(
                 .and_then(|w| w.get(cls))
                 .and_then(|wc| wc.get(i))
                 .map(|e| e.as_slice());
-            let ebe = find_ebe_for_stage(
+            let ebe = find_ebe_for_stage_with_prev(
                 model,
                 subject,
                 &cp,
@@ -195,6 +327,8 @@ pub(crate) fn mixture_ofv_with_modes(
                 None,
                 options.inner_restarts,
                 options,
+                // An earlier pass's class modes, an exactly-zero one included.
+                PrevEtas::Solved,
             );
             fd_h_redone[cls][i] = ebe.fd_h_redone;
             // Inter-occasion variability (#985): `find_ebe` already routes to the
@@ -251,6 +385,7 @@ pub(crate) fn mixture_ofv_with_modes(
     // Combine per subject via log-sum-exp; pick MIXEST for warm-start / postfit.
     let mut ofv = 0.0;
     let mut pmix = Vec::with_capacity(n);
+    let mut class_nll = Vec::with_capacity(n);
     let mut mixest = Vec::with_capacity(n);
     let mut mixest_etas = Vec::with_capacity(n);
     let mut mixest_h_mats = Vec::with_capacity(n);
@@ -263,6 +398,7 @@ pub(crate) fn mixture_ofv_with_modes(
         let logp = eval_mixing_log_probs(spec, &params.theta, &subject.covariates);
         let nll_i: Vec<f64> = (0..k).map(|cls| nll[cls][i]).collect();
         let (contrib, probs, best) = combine_subject(&logp, &nll_i);
+        class_nll.push(nll_i);
         ofv += contrib;
         // Convergence is scored over *every* class that contributes meaningfully to
         // this subject's marginal, not just the winning (`best`) class: each class's
@@ -313,6 +449,7 @@ pub(crate) fn mixture_ofv_with_modes(
             n_start_rejected,
         },
         n_fd_h_redone,
+        class_nll,
     };
     let modes = MixtureClassModes {
         h_mats: hmats_by_class,
@@ -357,7 +494,7 @@ pub(crate) fn mixture_gradient_with_modes(
     modes: Option<&MixtureClassModes>,
 ) -> Option<Vec<f64>> {
     let rows =
-        mixture_subject_gradients(model, population, params, options, eval, modes, true, |f| {
+        mixture_subject_gradients(model, population, params, options, eval, modes, None, |f| {
             f()
         })?;
     let mut grad = vec![0.0f64; packed_segments(params).total()];
@@ -369,13 +506,89 @@ pub(crate) fn mixture_gradient_with_modes(
     Some(grad)
 }
 
+/// [`mixture_gradient_with_modes`] that **salvages** a declined (subject × class) term
+/// instead of returning `None` for the whole population (#2906), as #1529 does for a
+/// single population: every term the adjoint serves keeps its exact gradient, and only a
+/// declined `∂nll_ik/∂x` is replaced by that one subject's reconverged central
+/// difference under class `k` ([`class_subject_reconverged_gradient`]) — `2·n_free`
+/// solves of one subject in one class, where the whole-objective
+/// [`mixture_gradient_fd`] re-solves every subject in every class per probe. A term
+/// whose posterior weight is exactly zero carries no gradient and is not differenced.
+///
+/// Each subject that took a salvage is recorded on `declines` (structural when no
+/// recorder serves the subject's data shape under that class, as
+/// `outer_optimizer::is_structural_decline` asks), so the fit's #1154 warning reports
+/// it. Still `None` when the mixing map declines (a model-level gap, so the caller's
+/// whole-objective FD is the only gradient there is), or under IOV without `modes`.
+pub(crate) fn mixture_gradient_salvaged(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    options: &FitOptions,
+    eval: &MixtureEval,
+    modes: Option<&MixtureClassModes>,
+    declines: &crate::estimation::outer_optimizer::OuterFdDeclineLog,
+) -> Option<Vec<f64>> {
+    let salvage = |d: DeclinedTerm<'_>| {
+        let subject = &population.subjects[d.subject];
+        declines.record(d.subject);
+        if d.cp.omega_iov.is_none() {
+            let _guard = MixtureClassGuard::enter(d.cls + 1);
+            if crate::estimation::outer_optimizer::is_structural_decline(
+                model,
+                subject,
+                d.cp,
+                d.eta.as_slice(),
+            ) {
+                declines.record_structural(d.subject);
+            }
+        }
+        Some(class_subject_reconverged_gradient(
+            model, subject, params, d.cls, d.eta, options,
+        ))
+    };
+    let rows = mixture_subject_gradients(
+        model,
+        population,
+        params,
+        options,
+        eval,
+        modes,
+        Some(&salvage),
+        |f| f(),
+    )?;
+    let mut grad = vec![0.0f64; packed_segments(params).total()];
+    for row in &rows {
+        for (g, v) in grad.iter_mut().zip(row) {
+            *g += 2.0 * v;
+        }
+    }
+    Some(grad)
+}
+
+/// One (subject × class) term the adjoint declined: what its salvage needs.
+pub(crate) struct DeclinedTerm<'a> {
+    /// The subject's index in the population.
+    pub(crate) subject: usize,
+    /// The class, 0-based.
+    pub(crate) cls: usize,
+    /// The class parameters, [`class_params`].
+    pub(crate) cp: &'a ModelParameters,
+    /// The subject's class-`cls` mode, stacked `[η̂, κ̂]` under IOV.
+    pub(crate) eta: &'a DVector<f64>,
+}
+
+/// A salvage of a declined term: `d(nll_ik)/dx_k` over the class layout, or `None` to give up.
+pub(crate) type SalvageTerm<'a> = dyn Fn(DeclinedTerm<'_>) -> Option<Vec<f64>> + Sync + 'a;
+
 /// Each subject's mixture gradient `∂nllᵢ/∂x = Σ_k w_ik (∂nll_ik/∂x − ∂ln p_ik/∂x)` over the
 /// mixture's packed layout — `w_ik = PMIX_ik` (from `eval`), `∂nll_ik/∂x` the class's exact
 /// FOCE/FOCEI subject gradient at its own mode under `MIXNUM = k`, routed by
 /// [`route_class_gradient`], and `∂ln p_ik/∂θ` the mixing map's. [`mixture_gradient_with_modes`]
-/// sums them; the BHHH Newton decrement reads them per subject. `salvage`: a class gradient the
-/// adjoint declines takes the subject's reconverged central difference (not under IOV);
-/// otherwise the decline is `None` for the whole. `each` runs each subject's row on its worker
+/// sums them; the BHHH Newton decrement reads them per subject. `salvage`: with a log, a class
+/// gradient the adjoint declines takes the subject's reconverged central difference
+/// ([`class_subject_reconverged_gradient`]) and the subject is recorded on the log; without
+/// one the decline is `None` for the whole. `each` runs each subject's row on its worker
 /// (a caller's per-subject check wraps it there).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn mixture_subject_gradients(
@@ -385,11 +598,10 @@ pub(crate) fn mixture_subject_gradients(
     options: &FitOptions,
     eval: &MixtureEval,
     modes: Option<&MixtureClassModes>,
-    salvage: bool,
+    salvage: Option<&SalvageTerm<'_>>,
     each: impl Fn(&dyn Fn() -> Option<Vec<f64>>) -> Option<Vec<f64>> + Sync,
 ) -> Option<Vec<Vec<f64>>> {
     use crate::sens::ode_provider::adjoint::PackedPoint;
-    use rayon::prelude::*;
     let spec = model.mixture.as_ref()?;
     let mp = params.mixture.as_ref()?;
     let iov = params.omega_iov.is_some();
@@ -397,7 +609,7 @@ pub(crate) fn mixture_subject_gradients(
         return None;
     }
     let dtheta_dx = theta_chain_factors(params);
-    let theta_floor = fd_theta_step_floors(&model.default_params);
+    let theta_floor = fd_theta_step_floors(model);
     // Class k's packed layout [θ, Ω(base slots), σ, …], unpacked once per class.
     let classes: Vec<(ModelParameters, Vec<f64>)> = (0..mp.omega.len())
         .map(|cls| {
@@ -411,11 +623,10 @@ pub(crate) fn mixture_subject_gradients(
         .map(|(cp, x_k)| PackedPoint::new(cp, x_k))
         .collect();
     let n = packed_segments(params).total();
-    population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             each(&|| {
                 let dlnp = mixing_logp_grad_fd(
                     model,
@@ -425,7 +636,7 @@ pub(crate) fn mixture_subject_gradients(
                     &theta_floor,
                 );
                 let mut g = vec![0.0f64; n];
-                for (cls, (cp, x_k)) in classes.iter().enumerate() {
+                for (cls, (cp, _x_k)) in classes.iter().enumerate() {
                     let w = eval.pmix[i][cls];
                     if w == 0.0 {
                         continue;
@@ -454,17 +665,12 @@ pub(crate) fn mixture_subject_gradients(
                     });
                     let g_c = match exact {
                         Some(g_c) => g_c,
-                        None if salvage && !iov => {
-                            crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
-                                x_k,
-                                cp,
-                                model,
-                                subject,
-                                &eta,
-                                &crate::estimation::parameterization::compute_bounds(cp),
-                                options,
-                            )
-                        }
+                        None if salvage.is_some() => salvage?(DeclinedTerm {
+                            subject: i,
+                            cls,
+                            cp,
+                            eta: &eta,
+                        })?,
                         None => return None,
                     };
                     route_class_gradient(&mut g, &g_c, w, cls, params, mp);
@@ -473,7 +679,61 @@ pub(crate) fn mixture_subject_gradients(
                 Some(g)
             })
         })
+        .into_iter()
         .collect()
+    }
+}
+
+/// `d(nll_ik)/dx_k` over the class-`cls` layout `pack_params(&class_params(params, cls))`
+/// for one subject, by central differences that **re-solve that subject's class-`cls` mode**
+/// (warm-started at `eta`) at every probe — so the EBE response is included, as it is in the
+/// adjoint's gradient it stands in for (#2906). Runs under `MIXNUM = cls + 1` on the
+/// calling thread, the convention [`mixture_ofv`]'s serial class solves use.
+///
+/// The template the difference walks differs from [`class_params`] in its FIX flags only:
+/// a base Ω/Σ coordinate the class overrides takes the override's flag (a free override of
+/// a FIX base is free here, and is routed onto the override by [`class_route`]), and the
+/// class layout's inert override tail is pinned, so no probe is spent on a coordinate
+/// `class_params` has already swapped out.
+fn class_subject_reconverged_gradient(
+    model: &CompiledModel,
+    subject: &crate::types::Subject,
+    params: &ModelParameters,
+    cls: usize,
+    eta: &DVector<f64>,
+    options: &FitOptions,
+) -> Vec<f64> {
+    let mut cp = class_params(params, cls);
+    if let Some(mix) = cp.mixture.as_mut() {
+        for (a, &(c, e)) in mix.omega_override_addr.iter().enumerate() {
+            if c == cls {
+                if let Some(f) = cp.omega_fixed.get_mut(e) {
+                    *f = mix.omega_override_fixed.get(a).copied().unwrap_or(false);
+                }
+            }
+        }
+        for (b, &(c, t)) in mix.sigma_override_addr.iter().enumerate() {
+            if c == cls {
+                if let Some(f) = cp.sigma_fixed.get_mut(t) {
+                    *f = mix.sigma_override_fixed.get(b).copied().unwrap_or(false);
+                }
+            }
+        }
+        mix.omega_override_fixed.iter_mut().for_each(|f| *f = true);
+        mix.sigma_override_fixed.iter_mut().for_each(|f| *f = true);
+    }
+    let x_k = pack_params(&cp);
+    let bounds = crate::estimation::parameterization::compute_bounds(&cp);
+    let _guard = MixtureClassGuard::enter(cls + 1);
+    if cp.omega_iov.is_some() {
+        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient_iov(
+            &x_k, &cp, model, subject, eta, &bounds, options,
+        )
+    } else {
+        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+            &x_k, &cp, model, subject, eta, &bounds, options,
+        )
+    }
 }
 
 /// θ → packed chain factor `dθ_j/dx_j`: `θ_j` for a log-packed θ, 1 for an identity one.
@@ -580,7 +840,6 @@ pub(crate) fn mixture_cov_hessian(
     use crate::sens::ode_provider::adjoint::{
         subject_adjoint_cov_hessian_at, subject_adjoint_gradient_at, PackedPoint,
     };
-    use rayon::prelude::*;
     // The class objective is FOCE/FOCEI's (`mixture_ofv` scores `foce_subject_nll_*`).
     if !matches!(objective, Objective::Foce | Objective::Focei) {
         return None;
@@ -611,11 +870,10 @@ pub(crate) fn mixture_cov_hessian(
         .map(|&l| theta_packs_log(l))
         .collect();
     let n_theta = params.theta.len();
-    let per_subject: Vec<Option<DMatrix<f64>>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subject: Vec<Option<DMatrix<f64>>> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let (dlnp, d2lnp) =
                 mixing_logp_derivs(model, spec, &params.theta, &subject.covariates, true)?;
             let mut h = DMatrix::<f64>::zeros(n, n);
@@ -667,7 +925,7 @@ pub(crate) fn mixture_cov_hessian(
             h += &gbar * gbar.transpose();
             h.iter().all(|v| v.is_finite()).then_some(h)
         })
-        .collect();
+    };
     let mut acc = DMatrix::<f64>::zeros(n, n);
     for h in per_subject {
         acc += h?;
@@ -794,7 +1052,7 @@ impl MixtureScoreContext {
             .expect("mixture score on a non-mixture model");
         let mp = self.params.mixture.as_ref().expect("mixture parameters");
         let covariates = &population.subjects[i].covariates;
-        let floor = fd_theta_step_floors(&model.default_params);
+        let floor = fd_theta_step_floors(model);
         let dlnp = mixing_logp_grad_fd(model, spec, &self.params.theta, covariates, &floor);
         let mut g = vec![0.0f64; packed_segments(&self.params).total()];
         for (cls, view) in self.classes.iter().enumerate() {
@@ -835,7 +1093,7 @@ impl MixtureScoreContext {
 /// is absolute in its own units — 1.2 % of a θ of 8e-4. There it is `1e-5·|θ₀|` (#2187).
 ///
 /// Each probe is clamped to `init_params`' packed box — the box the outer optimizer
-/// searches — and the difference divided by the clamped span, as `central_diff_packed`
+/// searches — and the difference divided by the clamped span, as `central_diff_packed_gated`
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
@@ -846,7 +1104,7 @@ pub fn mixture_gradient_fd(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let floor = fd_step_floors(init_params, &model.default_params);
+    let floor = fd_step_floors(init_params, model);
     let bounds = crate::estimation::parameterization::compute_bounds(init_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
@@ -856,7 +1114,7 @@ pub fn mixture_gradient_fd(
         let mut xm = x.to_vec();
         xp[i] = (x[i] + h).min(bounds.upper[i]);
         xm[i] = (x[i] - h).max(bounds.lower[i]);
-        // Collapsed probes only — see `central_diff_packed`: an absolute cutoff on the span
+        // Collapsed probes only — see `central_diff_packed_gated`: an absolute cutoff on the span
         // would zero a θ declared below ~1e-11 (#2187 review).
         if xp[i] <= xm[i] {
             continue;
@@ -874,6 +1132,147 @@ pub fn mixture_gradient_fd(
 #[cfg(test)]
 mod tests {
     use super::{any_contributing, combine_subject};
+
+    mod merged_classes {
+        use super::super::{
+            combine_subject, merged_classes_from, merged_classes_warning, ClassCollapse,
+            EMPTY_CLASS_PMIX, MERGED_CLASS_LOG_BF,
+        };
+
+        /// `(nll, pmix)` per subject from per-class probabilities and nll's, with the
+        /// posteriors built through the objective's own `combine_subject`, so the check reads
+        /// them the way the fit builds them.
+        fn posteriors(p: &[f64], nll: &[Vec<f64>]) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+            let logp: Vec<f64> = p.iter().map(|v| v.ln()).collect();
+            let pmix = nll.iter().map(|n| combine_subject(&logp, n).1).collect();
+            (nll.to_vec(), pmix)
+        }
+
+        #[test]
+        fn separated_classes_draw_no_finding() {
+            // One subject decisively per class: factors of 6 nats each way.
+            let (nl, pm) = posteriors(&[0.5, 0.5], &[vec![10.0, 16.0], vec![16.0, 10.0]]);
+            assert!(merged_classes_from(&nl, &pm).is_empty());
+            assert_eq!(merged_classes_warning(&[]), None);
+        }
+
+        #[test]
+        fn a_pair_under_the_factor_is_merged_and_one_subject_over_it_separates() {
+            // Every subject's data moves its odds by 0.4 of the threshold, under unequal
+            // mixing (0.3 / 0.7): the prior does not enter the factor.
+            let d = 0.4 * MERGED_CLASS_LOG_BF;
+            let near = vec![vec![5.0, 5.0 + d], vec![7.0 + d, 7.0], vec![3.0, 3.0]];
+            let (nl, pm) = posteriors(&[0.3, 0.7], &near);
+            let got = merged_classes_from(&nl, &pm);
+            match got.as_slice() {
+                [ClassCollapse::Merged {
+                    a: 1,
+                    b: 2,
+                    max_log_bf,
+                }] => {
+                    assert!((max_log_bf - d).abs() < 1e-9, "factor {max_log_bf} vs {d}");
+                }
+                other => panic!("want classes 1 and 2 merged, got {other:?}"),
+            }
+            // The threshold straddled: one subject at 1.5× the factor separates the pair.
+            let mut far = near.clone();
+            far.push(vec![4.0, 4.0 + 1.5 * MERGED_CLASS_LOG_BF]);
+            let (nl, pm) = posteriors(&[0.3, 0.7], &far);
+            assert!(merged_classes_from(&nl, &pm).is_empty());
+        }
+
+        #[test]
+        fn three_classes_name_only_the_merged_pair() {
+            // Classes 1 and 3 identical, class 2 far from both.
+            let nll = vec![vec![5.0, 15.0, 5.0], vec![9.0, 2.0, 9.0]];
+            let (nl, pm) = posteriors(&[0.2, 0.5, 0.3], &nll);
+            let got = merged_classes_from(&nl, &pm);
+            assert!(
+                matches!(got.as_slice(), [ClassCollapse::Merged { a: 1, b: 3, .. }]),
+                "{got:?}"
+            );
+            let w = merged_classes_warning(&got).unwrap();
+            assert!(w.starts_with("W_MIXTURE_MERGED_CLASSES: "), "{w}");
+            assert!(w.contains("classes 1 and 3 have merged"), "{w}");
+            assert!(
+                !w.contains("classes 1 and 2") && !w.contains("classes 2 and 3"),
+                "{w}"
+            );
+            assert!(!w.contains("empty"), "{w}");
+        }
+
+        #[test]
+        fn an_empty_class_is_reported_and_not_also_as_merged() {
+            // Class 2's mixing probability is 1e-6, and its likelihood no better than class
+            // 1's, so its posterior stays below the empty threshold in every subject. Equal
+            // nll's would also make the pair "merged"; the empty finding replaces that.
+            let p2 = 1e-6;
+            let nll = vec![vec![5.0, 5.0], vec![8.0, 8.5]];
+            let (nl, pm) = posteriors(&[1.0 - p2, p2], &nll);
+            assert!(pm.iter().all(|p| p[1] < EMPTY_CLASS_PMIX));
+            let got = merged_classes_from(&nl, &pm);
+            assert!(
+                matches!(got.as_slice(), [ClassCollapse::Empty { class: 2, .. }]),
+                "{got:?}"
+            );
+            let w = merged_classes_warning(&got).unwrap();
+            assert!(w.contains("class 2 is empty"), "{w}");
+            assert!(!w.contains("merged ("), "{w}");
+            // The straddle: one subject whose data favours class 2 strongly enough to give it
+            // posterior mass makes the class non-empty, and the pair separated.
+            let mut nll = nll;
+            nll.push(vec![30.0, 5.0]);
+            let (nl, pm) = posteriors(&[1.0 - p2, p2], &nll);
+            assert!(merged_classes_from(&nl, &pm).is_empty());
+        }
+
+        #[test]
+        fn a_subject_where_both_posteriors_underflow_still_counts_the_pair_merged() {
+            // Review round 1: three classes, classes 1 and 2 identical. Subject 1 is dominated
+            // by class 3 by ~1000 nats, so its PMIX_1 and PMIX_2 underflow to exactly 0, and a
+            // factor rebuilt from PMIX would be 0 / 0. Read from the nll's it is 0.
+            let nll = vec![
+                vec![1005.0, 1005.0, 2.0],
+                vec![3.0, 3.0, 20.0],
+                vec![4.0, 4.0, 30.0],
+            ];
+            let (nl, pm) = posteriors(&[0.3, 0.3, 0.4], &nll);
+            assert!(
+                pm[0][0] == 0.0 && pm[0][1] == 0.0,
+                "fixture must underflow: {pm:?}"
+            );
+            let got = merged_classes_from(&nl, &pm);
+            assert!(
+                matches!(got.as_slice(), [ClassCollapse::Merged { a: 1, b: 2, .. }]),
+                "{got:?}"
+            );
+        }
+
+        #[test]
+        fn a_non_finite_class_objective_separates_the_pair() {
+            // An infinite or NaN nll (a failed score) never produces the warning.
+            let pm = vec![vec![0.5, 0.5], vec![0.5, 0.5]];
+            for bad in [f64::INFINITY, f64::NAN] {
+                let nll = vec![vec![bad, bad], vec![2.0, 2.0]];
+                assert!(merged_classes_from(&nll, &pm).is_empty(), "nll {bad}");
+            }
+        }
+
+        #[test]
+        fn a_non_finite_posterior_does_not_make_its_class_empty() {
+            // Review round 1: class 2's posterior is tiny everywhere except one NaN, which a
+            // NaN-dropping max would fold to a maximum below the threshold. Classes are kept
+            // separated by their nll's, so the only possible finding is the empty one.
+            let nll = vec![vec![1.0, 10.0], vec![1.0, 10.0]];
+            let tiny = vec![vec![1.0, 1e-6], vec![1.0, 1e-6]];
+            assert!(matches!(
+                merged_classes_from(&nll, &tiny).as_slice(),
+                [ClassCollapse::Empty { class: 2, .. }]
+            ));
+            let nan = vec![vec![1.0, 1e-6], vec![f64::NAN, f64::NAN]];
+            assert!(merged_classes_from(&nll, &nan).is_empty());
+        }
+    }
 
     #[test]
     fn any_contributing_scores_nonwinning_classes() {
@@ -966,6 +1365,8 @@ mod tests {
             let model = crate::parser::model_parser::parse_model_string(&src).unwrap();
             let spec = model.mixture.as_ref().unwrap();
             let theta = &model.default_params.theta;
+            let floor = crate::estimation::parameterization::fd_theta_step_floors(&model);
+            assert_eq!(floor, vec![1.0, tiny], "{mixing}: floors");
             let (grad, hess) = mixing_logp_derivs(&model, spec, theta, &none, true).expect("exact");
             let (d, d2) = if logit {
                 let p1 = 1.0 / (1.0 + (-g).exp());
@@ -2202,7 +2603,7 @@ mod tests {
         assert!(
             res.warnings
                 .iter()
-                .any(|w| w.contains("BOBYQA") && w.contains("Bfgs")),
+                .any(|w| w.contains("BOBYQA") && w.contains("`bfgs`")),
             "expected an optimizer-downgrade warning, got {:?}",
             res.warnings
         );
@@ -2226,6 +2627,139 @@ mod tests {
             "auto optimizer must not emit a downgrade warning, got {:?}",
             res.warnings
         );
+    }
+
+    #[test]
+    fn mixture_explicit_bobyqa_does_not_warn() {
+        // #2852: an explicit `optimizer = bobyqa` is the optimizer the mixture path
+        // runs, so the fit must not claim the choice "was replaced by BOBYQA".
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        let pop = read_pop(&bimodal_csv(3, 1.0, 3.0));
+        let opts = crate::types::FitOptions {
+            optimizer: crate::types::Optimizer::Bobyqa,
+            outer_maxiter: 2,
+            ..crate::types::FitOptions::default()
+        };
+        let res = crate::api::fit(&model, &pop, &model.default_params, &opts)
+            .expect("explicit-bobyqa mixture fit should return Ok");
+        assert!(
+            !res.warnings
+                .iter()
+                .any(|w| w.contains("does not carry the mixture objective")),
+            "explicit bobyqa runs as requested and must not warn, got {:?}",
+            res.warnings
+        );
+    }
+
+    /// What `resolve_outer_optimizer` owes one requested optimizer on a mixture model.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum OnMixture {
+        /// Runs as requested, no warning.
+        Honoured,
+        /// `auto`: runs BOBYQA, silently.
+        SilentBobyqa,
+        /// Runs BOBYQA and says so, naming the requested optimizer as the user spells it
+        /// in a model file (`Optimizer::label`), written out here so the test does not
+        /// borrow the spelling from the code under test.
+        Replaced(&'static str),
+    }
+
+    /// The warning's whole input space on the optimizer axis (#2852). Exhaustive on
+    /// purpose, with no wildcard: a new `Optimizer` variant does not compile until it
+    /// has a row here, and then belongs in `ALL_OPTIMIZERS` below.
+    fn on_mixture(requested: crate::types::Optimizer) -> OnMixture {
+        use crate::types::Optimizer;
+        match requested {
+            Optimizer::Auto => OnMixture::SilentBobyqa,
+            Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
+                OnMixture::Honoured
+            }
+            Optimizer::Bfgs => OnMixture::Replaced("bfgs"),
+            Optimizer::Lbfgs => OnMixture::Replaced("lbfgs"),
+            Optimizer::TrustRegion => OnMixture::Replaced("trust_region"),
+        }
+    }
+
+    #[test]
+    fn mixture_replacement_warning_covers_every_optimizer() {
+        use crate::estimation::outer_optimizer::resolve_outer_optimizer;
+        use crate::types::Optimizer;
+        const ALL_OPTIMIZERS: [Optimizer; 8] = [
+            Optimizer::Auto,
+            Optimizer::Bfgs,
+            Optimizer::Lbfgs,
+            Optimizer::Slsqp,
+            Optimizer::NloptLbfgs,
+            Optimizer::Mma,
+            Optimizer::Bobyqa,
+            Optimizer::TrustRegion,
+        ];
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        for requested in ALL_OPTIMIZERS {
+            // The analytic flag is read only by the non-mixture `auto` rule; neither
+            // value may change what a mixture runs or whether a warning is owed.
+            for analytic in [true, false] {
+                let (resolved, warning) =
+                    resolve_outer_optimizer(requested, &model, true, analytic);
+                match on_mixture(requested) {
+                    OnMixture::Honoured => {
+                        assert_eq!(resolved, requested, "{requested:?} runs as requested");
+                        assert_eq!(warning, None, "{requested:?} is honoured: no warning");
+                    }
+                    OnMixture::SilentBobyqa => {
+                        assert_eq!(resolved, Optimizer::Bobyqa);
+                        assert_eq!(warning, None, "auto downgrades silently");
+                    }
+                    OnMixture::Replaced(name) => {
+                        assert_eq!(resolved, Optimizer::Bobyqa, "{requested:?} runs BOBYQA");
+                        let w = warning
+                            .unwrap_or_else(|| panic!("{requested:?} on a mixture must warn"));
+                        assert!(
+                            w.contains("does not carry the mixture objective")
+                                && w.contains("was replaced by BOBYQA"),
+                            "{requested:?}: {w}"
+                        );
+                        // The advice half: what the user can pick instead.
+                        assert!(
+                            w.starts_with(
+                                "Mixture models are optimized with BOBYQA or an NLopt gradient \
+                                 method (SLSQP / L-BFGS / MMA);"
+                            ),
+                            "{requested:?}: message must say what a mixture can run: {w}"
+                        );
+                        // The discriminator and its negatives: the message names the
+                        // optimizer that was asked for, in option spelling; never the
+                        // one that ran ("the requested `bobyqa` optimizer ... was
+                        // replaced by BOBYQA"); and never a Rust `Debug` name such as
+                        // `TrustRegion`, which no model file contains.
+                        assert!(
+                            w.contains(&format!("the requested `{name}` optimizer")),
+                            "{requested:?}: message must name {name}: {w}"
+                        );
+                        assert!(!w.contains("`bobyqa`"), "{requested:?}: {w}");
+                        assert!(
+                            !w.contains(&format!("{requested:?}")) && !w.contains("Bobyqa"),
+                            "{requested:?}: no Debug spelling in a user-facing message: {w}"
+                        );
+                    }
+                }
+
+                // Without a mixture nothing is ever replaced: no warning for any
+                // optimizer, and an explicit choice is returned unchanged.
+                let (resolved, warning) =
+                    resolve_outer_optimizer(requested, &model, false, analytic);
+                assert_eq!(warning, None, "{requested:?} without a mixture: no warning");
+                if requested == Optimizer::Auto {
+                    assert_ne!(
+                        resolved,
+                        Optimizer::Auto,
+                        "auto resolves to a concrete optimizer"
+                    );
+                } else {
+                    assert_eq!(resolved, requested, "{requested:?} without a mixture");
+                }
+            }
+        }
     }
 
     #[test]
@@ -2643,5 +3177,225 @@ mod tests {
                 assert!(v.is_finite() && v > 0.0, "{method:?}: θ[{j}] variance {v}");
             }
         }
+    }
+
+    /// A class solve warm from an earlier pass's class modes takes an exactly-zero one — the
+    /// prior mode of a subject with no observations — as warm, as the standard inner loop
+    /// does (`PrevEtas::Solved`). The outer loop hands every evaluation after the first the
+    /// previous one's class modes, so read by value alone the empty subject reran its cold
+    /// multi-start in every class at every evaluation. The straddle: from no warm start the
+    /// same subject is multi-started in each class, and the warm pass does solve it.
+    #[test]
+    fn a_mixture_class_solve_takes_an_exactly_zero_warm_mode_as_warm() {
+        use crate::estimation::inner_optimizer::record_inner_solves;
+        let model = crate::parser::model_parser::parse_model_string(MIX_FIT_MODEL).unwrap();
+        // A dose-only subject: nothing informs its η, so its mode is exactly the prior's.
+        let pop = read_pop(&format!("{}99,0,0,100,1,1,75\n", bimodal_csv(2, 1.0, 3.0)));
+        let empty = "99".to_string();
+        assert!(pop
+            .subjects
+            .iter()
+            .any(|s| s.id == empty && s.observations.is_empty()));
+        let opts = crate::types::FitOptions {
+            inner_restarts: 1,
+            ..Default::default()
+        };
+        let params = &model.default_params;
+        let k = 2;
+        let count = |ids: &[String]| ids.iter().filter(|id| **id == empty).count();
+
+        let (cold, cold_rec) =
+            record_inner_solves(|| super::mixture_ofv(&model, &pop, params, &opts, None));
+        assert_eq!(
+            count(&cold_rec.multistarts),
+            k,
+            "fixture: a cold pass multi-starts the empty subject once per class"
+        );
+        let at = pop.subjects.iter().position(|s| s.id == empty).unwrap();
+        for (cls, etas) in cold.etas_by_class.iter().enumerate() {
+            assert!(
+                etas[at].iter().all(|&v| v == 0.0),
+                "fixture: class {cls}'s mode of the empty subject is {:?}, not exactly zero",
+                etas[at]
+            );
+        }
+
+        let (_, warm_rec) = record_inner_solves(|| {
+            super::mixture_ofv(&model, &pop, params, &opts, Some(&cold.etas_by_class))
+        });
+        let solved: Vec<String> = warm_rec
+            .solve_tols
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(
+            count(&solved),
+            k,
+            "the warm pass solves the empty subject per class"
+        );
+        assert_eq!(
+            count(&warm_rec.multistarts),
+            0,
+            "an exactly-zero warm class mode was multi-started as a cold start"
+        );
+    }
+
+    /// #2906: the oral two-class mixture of `api/tests/outer_fd_fallback_warning_tests.rs`
+    /// (lag 0.25), on the first four warfarin subjects. Subject 0's bolus is replaced by a
+    /// steady-state infusion into the depot, which the adjoint declines under a lag time
+    /// (`ss_lagtime_walk_unsupported`); the other three stay in scope.
+    fn mixture_with_one_declined_subject() -> (crate::types::CompiledModel, crate::types::Population)
+    {
+        use crate::types::{DoseEvent, RateMode};
+        let model = crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL1(0.15, 0.001, 10.0)
+  theta TVCL2(0.30, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+  ALAG = 0.25
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+        )
+        .unwrap();
+        let mut pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin.csv"),
+            None,
+            None,
+        )
+        .unwrap();
+        pop.subjects.truncate(4);
+        let mut dose = DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0);
+        dose.rate_mode = RateMode::Fixed;
+        pop.subjects[0].doses = vec![dose];
+        // No regular-path shape declines since #2786, so the decline is forced: every plan of
+        // subject 0 fails, and the other three stay in scope.
+        crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&pop.subjects[0]);
+        (model, pop)
+    }
+
+    /// #2906: one declined subject used to send the whole mixture gradient to
+    /// [`super::mixture_gradient_fd`] (`mixture_gradient_with_modes` → `None`). The salvaged
+    /// gradient keeps the adjoint's terms for subjects 1–3 and differences only subject 0's
+    /// (subject × class) terms. It must agree with the whole-objective central difference —
+    /// the independent oracle, which re-solves every subject in every class — on every
+    /// coordinate, and the subject must be recorded (structurally: no recorder serves an SS
+    /// infusion under a lag) so the #1154 warning reports it with the reconverged sentence,
+    /// never the held-EBE remedy.
+    ///
+    /// The fixture straddles the gate: the strict assembly declines it (so the salvage is
+    /// what produced the gradient), and subject 0's terms are live (zeroing them moves the
+    /// gradient by far more than the parity bound).
+    #[test]
+    fn a_declined_subject_is_salvaged_alone_and_recorded() {
+        use crate::estimation::outer_optimizer::{outer_fd_fallback_warning, OuterFdDeclineLog};
+        use crate::estimation::parameterization::pack_params;
+        let (model, pop) = mixture_with_one_declined_subject();
+        let opts = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::FoceI,
+            interaction: true,
+            // The oracle re-solves every subject cold at each probe, so it is the noisier
+            // side: at the default `inner_tol` it moves by ~6e-4 on TVCL2 / Ω(KA) between
+            // tolerances while the salvaged gradient holds to ~1e-5. At 1e-6 the measured
+            // worst gap is 9.2e-5 (macOS arm64), hence the 5e-4 bound below.
+            inner_tol: 1e-6,
+            ..Default::default()
+        };
+        let params = &model.default_params;
+        let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        assert!(
+            super::mixture_gradient_with_modes(&model, &pop, params, &opts, &eval, Some(&modes))
+                .is_none(),
+            "fixture: the strict assembly must decline subject 0"
+        );
+        let log = OuterFdDeclineLog::reconverging(pop.subjects.len());
+        let salvaged = super::mixture_gradient_salvaged(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &eval,
+            Some(&modes),
+            &log,
+        )
+        .expect("the mixing map is in scope, so the salvage forms a gradient");
+        assert_eq!(log.declined_indices(), vec![0], "only subject 0 declined");
+
+        // The same assembly with subject 0's salvage zeroed: how much its terms carry.
+        let zero = |d: super::DeclinedTerm<'_>| Some(vec![0.0; pack_params(d.cp).len()]);
+        let zeroed: Vec<f64> = {
+            let rows = super::mixture_subject_gradients(
+                &model,
+                &pop,
+                params,
+                &opts,
+                &eval,
+                Some(&modes),
+                Some(&zero),
+                |f| f(),
+            )
+            .unwrap();
+            let mut g = vec![0.0; salvaged.len()];
+            for r in &rows {
+                for (a, v) in g.iter_mut().zip(r) {
+                    *a += 2.0 * v;
+                }
+            }
+            g
+        };
+
+        let x = pack_params(params);
+        let fd = super::mixture_gradient_fd(&model, &pop, &x, params, &opts);
+        assert_eq!(salvaged.len(), fd.len());
+        let (mut worst, mut live) = (0.0f64, 0.0f64);
+        for (j, ((&s, &f), &z)) in salvaged.iter().zip(&fd).zip(&zeroed).enumerate() {
+            assert!(
+                s.is_finite() && f.is_finite() && z.is_finite(),
+                "coord {j}: {s} {f} {z}"
+            );
+            let rel = (s - f).abs() / f.abs().max(1.0);
+            let moved = (s - z).abs() / f.abs().max(1.0);
+            assert!(rel.is_finite() && moved.is_finite(), "coord {j}");
+            worst = worst.max(rel);
+            live = live.max(moved);
+        }
+        eprintln!("MEASURE #2906 salvaged vs whole-objective FD: worst rel {worst:e}; subject 0's terms move it by {live:e}");
+        assert!(worst < 5e-4, "salvaged vs FD worst rel {worst:e}");
+        assert!(
+            live > 100.0 * worst,
+            "fixture: subject 0's salvaged terms must be live ({live:e} vs {worst:e})"
+        );
+
+        let w = outer_fd_fallback_warning(&model, &pop, &log).expect("the decline warns");
+        assert!(
+            w.contains("1 of 4") && w.contains(&format!("subject {}", pop.subjects[0].id)),
+            "{w}"
+        );
+        assert!(
+            w.contains("no analytic recorder serves them") && !w.contains("fixed-EBE"),
+            "a structural mixture decline is reconverged, not held-EBE: {w}"
+        );
     }
 }

@@ -252,9 +252,14 @@ pub fn read_records(path: &Path) -> Vec<CandidateRecord> {
 }
 
 /// Read a cached fit, or `None` when it is absent or unreadable.
+///
+/// Through [`FitResult::from_json_str`], the reader every other fit JSON goes
+/// through: a non-finite float `store_fit` wrote as `null` reads back as `NaN`
+/// instead of making the whole fit unreadable, and the binary carries one
+/// `FitResult` deserializer instead of two.
 pub fn load_fit(dir: &Path, hash: &str) -> Option<FitResult> {
     let text = std::fs::read_to_string(fit_path(dir, hash)).ok()?;
-    serde_json::from_str(&text).ok()
+    FitResult::from_json_str(&text).ok()
 }
 
 /// Write a fit to the cache, through a `.part` sibling so a reader never sees a

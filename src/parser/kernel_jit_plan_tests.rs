@@ -1447,3 +1447,139 @@ fn colliding_keys_are_told_apart_by_their_content() {
     assert_eq!(v(1), v(1));
     COLLIDE.with(|c| c.set(false));
 }
+
+/// `sqrt` at a non-positive argument is flat in a compiled plan, as on every `PkNum` type
+/// (#2892): a zero gradient and Hessian, not the `0.5 / 0 = inf` (`NaN` once multiplied by a
+/// zero tangent) the unguarded rule puts in the jets. The `0.25` control straddles the gate
+/// (live derivative `0.5/√x = 1`, curvature `−0.25/√x³ = −2`).
+#[test]
+fn sqrt_at_zero_is_flat_in_a_compiled_plan() {
+    for x in [0.0, -0.0, -1e-18] {
+        let (_, g, h) = derivs_of(&[x], 1, true, &|t| Some(vec![t[0].sqrt()])).unwrap();
+        assert!(g[0][0] == 0.0 && h[0][0] == 0.0, "sqrt({x:e}): {g:?} {h:?}");
+    }
+    let (v, g, h) = derivs_of(&[0.25], 1, true, &|t| Some(vec![t[0].sqrt()])).unwrap();
+    assert_eq!(v[0], 0.5);
+    assert!((g[0][0] - 1.0).abs() < 1e-12 && (h[0][0] + 2.0).abs() < 1e-12);
+}
+
+/// A plan resolves each `(layout, direction)` once, in a slot read without a lock: the same
+/// key gives the same kernels (one slice), and a key past the slots still serves, resolved per
+/// call (so the tail of a plan's layouts never goes missing).
+#[test]
+fn resolved_kernels_are_shared_per_key_and_serve_past_the_slots() {
+    begin();
+    let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 0.3)).collect();
+    let y = vec![et[0] * et[1] + et[0]];
+    let rec = end(Some(y.iter().map(|v| v.reg()).collect())).expect("records");
+    let base = Layout {
+        n: 2,
+        m: 0,
+        th: false,
+        wide: false,
+        tan: 0,
+    };
+    let plan = rec.plan(base, 2, 0).expect("plans");
+    let mut shared = 0;
+    for tan in 0..(RESOLVED_SLOTS as u8 + 4) {
+        let lay = Layout { tan, ..base };
+        let a = plan.fns(lay, false).expect("resolves");
+        let b = plan.fns(lay, false).expect("resolves");
+        assert_eq!(a.len(), b.len());
+        if matches!(a, Fns::Shared(_)) {
+            assert!(
+                std::ptr::eq(a.as_ptr(), b.as_ptr()),
+                "tan {tan}: one resolution"
+            );
+            shared += 1;
+        } else {
+            assert!(
+                matches!(b, Fns::Own(_)),
+                "tan {tan}: past the slots, per call"
+            );
+        }
+    }
+    assert_eq!(
+        shared, RESOLVED_SLOTS,
+        "the slots fill, in order, then stop"
+    );
+}
+
+// ---- the linear kernels' plan values are the native f64 path's bits (#2786) ---------------
+
+fn k_expm<T: PkNum>(e: &[T], aug: bool, scale: f64) -> Vec<T> {
+    let k = |c: f64| T::from_f64(c);
+    let a = if aug {
+        // The augmented generator of a one-state segment: [[-CL/V·Δ, b/c·Δ], [0, 0]].
+        [
+            -(k(0.31) * e[0].exp()) * k(scale),
+            k(0.7) * e[1].exp() * k(scale),
+            k(0.0),
+            k(0.0),
+        ]
+    } else {
+        [
+            -(k(0.31) * e[0].exp()) * k(scale),
+            k(0.05) * e[1].exp() * k(scale),
+            k(0.9) * e[0].exp() * k(scale),
+            -(k(0.4) * e[1].exp()) * k(scale),
+        ]
+    };
+    let mut x = crate::ode::linear::Expm::<T>::new(2);
+    let slot = x.exp(&a).expect("exponentiates");
+    x.get(slot).to_vec()
+}
+
+fn k_solve<T: PkNum>(e: &[T]) -> Vec<T> {
+    let k = |c: f64| T::from_f64(c);
+    let a = [
+        k(1e-3) + e[0],
+        k(2.0),
+        k(1.0),
+        k(0.5),
+        k(1.0) + e[1],
+        k(-1.0),
+        k(2.0) + e[0] * e[1],
+        k(0.25),
+        k(3.0),
+    ];
+    let b = [k(1.0) + e[0] * e[0], e[1], k(2.0)];
+    crate::sens::linsolve::solve_linear_system_g(&a, &b, 3).expect("nonsingular")
+}
+
+#[test]
+fn the_linear_kernels_plan_values_are_the_native_bits() {
+    type F = Box<dyn Fn(&[Tr]) -> Vec<Tr>>;
+    type G = Box<dyn Fn(&[f64]) -> Vec<f64>>;
+    let mut cases: Vec<(String, F, G)> = Vec::new();
+    for aug in [true, false] {
+        for scale in [0.5, 3.0, 24.0, 200.0] {
+            cases.push((
+                format!("expm aug={aug} scale={scale}"),
+                Box::new(move |e| k_expm::<Tr>(e, aug, scale)),
+                Box::new(move |e| k_expm::<f64>(e, aug, scale)),
+            ));
+        }
+    }
+    cases.push((
+        "solve".into(),
+        Box::new(k_solve::<Tr>),
+        Box::new(k_solve::<f64>),
+    ));
+    let mut bad = Vec::new();
+    for (name, f, g) in &cases {
+        for eta in [[0.0, 0.0], [0.1, -0.05], [-0.2, 0.15], [0.3, 0.2]] {
+            let got = run2(f, [0.3, 0.2], eta);
+            let want = g(&eta);
+            for (j, (a, b)) in got.iter().zip(&want).enumerate() {
+                if a[0].to_bits() != b.to_bits() {
+                    bad.push(format!(
+                        "{name} at {eta:?} out {j}: plan {} native {b}",
+                        a[0]
+                    ));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+}

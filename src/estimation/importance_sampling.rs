@@ -35,6 +35,7 @@
 //! IS weights include both the η and κ priors. This makes the IS -2LL directly
 //! comparable to FOCE and NONMEM's `$EST METHOD=IMP LAPLACIAN=1`.
 
+use crate::cold_sort::ColdSort;
 use crate::estimation::impmap::draw_obs_nll;
 use crate::pk::event_driven::EventSchedule;
 use crate::pk::{compute_predictions_with_tv_into, predict_iov, EventPkParams};
@@ -51,7 +52,6 @@ use rand::rngs::StdRng;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand_distr::{ChiSquared, Distribution, StandardNormal};
-use rayon::prelude::*;
 
 /// `2π` as `f64`.  Used in the Gaussian-prior log-density.
 const TWO_PI: f64 = std::f64::consts::TAU;
@@ -690,11 +690,10 @@ pub fn run_importance_sampling(
             .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
     };
 
-    let per_subject: Vec<SubjectIsOutput> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+    let per_subject: Vec<SubjectIsOutput> = {
+        let __r0 = &population.subjects;
+        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
+            let subject = &__r0[i];
             if crate::cancel::is_cancelled(cancel) {
                 return SubjectIsOutput::cancelled(subject.id.clone());
             }
@@ -880,7 +879,7 @@ pub fn run_importance_sampling(
                 )
             }
         })
-        .collect();
+    };
 
     if crate::cancel::is_cancelled(&options.cancel) {
         return Err("cancelled by user".to_string());
@@ -903,7 +902,7 @@ pub fn run_importance_sampling(
     // Var(−2 LL) = 4 · Var(LL) = 4 · Σᵢ Var(log p̂(yᵢ)).
     let mc_se = 2.0 * var_ll.max(0.0).sqrt();
 
-    ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ess_fracs.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let ess_min = *ess_fracs.first().unwrap_or(&0.0);
     let ess_median = if ess_fracs.is_empty() {
         0.0
@@ -1053,11 +1052,10 @@ pub fn run_importance_sampling_mixture(
         );
     }
 
-    let per_subject: Vec<SubjectIsOutput> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+    let per_subject: Vec<SubjectIsOutput> = {
+        let __r0 = &population.subjects;
+        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
+            let subject = &__r0[i];
             if crate::cancel::is_cancelled(cancel) {
                 return SubjectIsOutput::cancelled(subject.id.clone());
             }
@@ -1165,7 +1163,7 @@ pub fn run_importance_sampling_mixture(
                 ess_fraction,
             }
         })
-        .collect();
+    };
 
     if crate::cancel::is_cancelled(&options.cancel) {
         return Err("cancelled by user".to_string());
@@ -1186,7 +1184,7 @@ pub fn run_importance_sampling_mixture(
     let minus2_ll = -2.0 * ll;
     let mc_se = 2.0 * var_ll.max(0.0).sqrt();
 
-    ess_fracs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ess_fracs.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let ess_min = *ess_fracs.first().unwrap_or(&0.0);
     let ess_median = if ess_fracs.is_empty() {
         0.0
@@ -3770,7 +3768,7 @@ mod tests {
         let mut chi = sobol_qmc_draws(2, k, 3, nu, false)
             .chi_sq
             .expect("t proposal");
-        chi.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        chi.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap());
         let mut ks = 0.0_f64;
         for (i, &x) in chi.iter().enumerate() {
             let f = crate::stats::special::regularized_gamma_p(0.5 * nu, 0.5 * x);

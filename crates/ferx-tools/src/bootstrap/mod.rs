@@ -19,6 +19,7 @@
 //! it away. [`ParameterSummary`] reports both intervals side by side so the
 //! disagreement between them is visible.
 
+use crate::cold_sort::ColdSort;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1263,7 +1264,7 @@ pub fn run_bootstrap_with_progress(
     }
 
     replicates.extend(reused);
-    replicates.sort_by_key(|r| r.index);
+    replicates.cold_sort_by_key(&|r| r.index);
 
     // ── Δofv ────────────────────────────────────────────────────────────────
     if options.dofv {
@@ -1366,7 +1367,7 @@ fn load_resumable(
             kept.push(r);
         }
     }
-    kept.sort_by_key(|r| r.index);
+    kept.cold_sort_by_key(&|r| r.index);
 
     // With `run_base_model = false` the stored base fit is not part of this run,
     // so it is not carried forward — it would reappear as a `sample = 0` row the

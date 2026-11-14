@@ -2,6 +2,7 @@
 //! intervals — the contents of PsN's `bootstrap_results.csv`.
 
 use super::{BootstrapOptions, ReplicateResult};
+use crate::cold_sort::ColdSort;
 
 /// Summary statistics for one estimated parameter.
 #[derive(Debug, Clone)]
@@ -236,7 +237,7 @@ pub fn summarize(
             f64::NAN
         };
         let mut sorted = values.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).expect("finite values sort"));
+        sorted.cold_sort_by(&|a, b| a.partial_cmp(b).expect("finite values sort"));
         let median = percentile(&sorted, 50.0).unwrap_or(f64::NAN);
         let ci_percentile = match (
             percentile(&sorted, alpha),

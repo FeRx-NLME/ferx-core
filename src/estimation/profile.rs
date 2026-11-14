@@ -49,7 +49,6 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 
 use crate::estimation::covariance::{fd_ofv_hessian, CovStepOutcome};
 use crate::estimation::inner_optimizer::{
@@ -1429,24 +1428,21 @@ impl ProfileCtx<'_> {
                 )
             },
         );
-        let mut states: Vec<SubjectState> = (0..self.population.subjects.len())
-            .into_par_iter()
-            .map(|i| {
-                let mut s = SubjectState {
-                    eta: etas[i].clone(),
-                    h: hms[i].clone(),
-                    kappas: kaps.get(i).cloned().unwrap_or_default(),
-                    nll: 0.0,
-                    unconverged: false,
-                    fallback: false,
-                    nm_polished: false,
-                    off_mode: start_off_mode.get(i).is_some_and(|m| m.0),
-                    excused: start_off_mode.get(i).is_some_and(|m| m.1),
-                };
-                s.nll = self.fit_term(i, &p, &s.eta, &s.h, &s.kappas);
-                s
-            })
-            .collect();
+        let mut states: Vec<SubjectState> = crate::par::map(self.population.subjects.len(), |i| {
+            let mut s = SubjectState {
+                eta: etas[i].clone(),
+                h: hms[i].clone(),
+                kappas: kaps.get(i).cloned().unwrap_or_default(),
+                nll: 0.0,
+                unconverged: false,
+                fallback: false,
+                nm_polished: false,
+                off_mode: start_off_mode.get(i).is_some_and(|m| m.0),
+                excused: start_off_mode.get(i).is_some_and(|m| m.1),
+            };
+            s.nll = self.fit_term(i, &p, &s.eta, &s.h, &s.kappas);
+            s
+        });
         if !states.iter().all(|s| s.nll.is_finite()) {
             return Err(ProfileFailure::NonFinite);
         }
@@ -1462,17 +1458,17 @@ impl ProfileCtx<'_> {
             #[cfg(test)]
             fail_after: FORCE_PROFILE_GROUP_FAILURE.with(std::cell::Cell::get),
         };
-        let outcomes: Vec<(Result<GroupOutcome, ProfileFailure>, ProfileCounts)> = layout
-            .groups
-            .par_iter()
-            .map(|g| {
+        let outcomes: Vec<(Result<GroupOutcome, ProfileFailure>, ProfileCounts)> = {
+            let __r0 = &layout.groups;
+            crate::par::map(__r0.len(), |__i| {
+                let g = &__r0[__i];
                 let sub: Vec<SubjectState> =
                     g.subjects.iter().map(|&i| states[i].clone()).collect();
                 let mut counts = ProfileCounts::default();
                 let out = self.solve_group(g, &p, &theta0, sub, &route, &mut counts);
                 (out, counts)
             })
-            .collect();
+        };
         let mut this = ProfileCounts::default();
         for (_, c) in &outcomes {
             this.add(c);
@@ -1612,31 +1608,38 @@ impl ProfileCtx<'_> {
             // mode only, as the level gradient below; otherwise the second differences of
             // its re-solved term ([`Self::resolved_hessian`]), never the held matrix, which
             // through a link can contract at 0.96 per step.
-            let exact: Vec<Option<DMatrix<f64>>> = g
-                .subjects
-                .par_iter()
-                .zip(states.par_iter())
-                .map(|(&i, s)| {
+            let exact: Vec<Option<DMatrix<f64>>> = {
+                let __r0 = &g.subjects;
+                let __r1 = &states;
+                crate::par::map(__r0.len().min(__r1.len()), |__i| {
+                    let (&i, s) = (&__r0[__i], &__r1[__i]);
                     let pt = pt
                         .as_ref()
                         .filter(|_| g.linked && !s.off_mode && !route.declines_matrix(i))?;
                     self.exact_hessian(i, pt, s)
                 })
-                .collect();
+            };
             let held_parts = |m_steps: &[f64]| -> Vec<DMatrix<f64>> {
-                g.subjects
-                    .par_iter()
-                    .zip(states.par_iter())
-                    .zip(subj_loc.par_iter())
-                    .zip(exact.par_iter())
-                    .map(|(((&i, s), loc), e)| match e {
-                        Some(e) => e.clone(),
-                        None => {
-                            let st: Vec<f64> = loc.iter().map(|&l| m_steps[l]).collect();
-                            self.held_hessian(i, &p, s, &st)
-                        }
-                    })
-                    .collect()
+                {
+                    let __r0 = &g.subjects;
+                    let __r1 = &states;
+                    let __r2 = &subj_loc;
+                    let __r3 = &exact;
+                    crate::par::map(
+                        __r0.len().min(__r1.len()).min(__r2.len()).min(__r3.len()),
+                        |__i| {
+                            let (((&i, s), loc), e) =
+                                (((&__r0[__i], &__r1[__i]), &__r2[__i]), &__r3[__i]);
+                            match e {
+                                Some(e) => e.clone(),
+                                None => {
+                                    let st: Vec<f64> = loc.iter().map(|&l| m_steps[l]).collect();
+                                    self.held_hessian(i, &p, s, &st)
+                                }
+                            }
+                        },
+                    )
+                }
             };
             let n_exact = exact.iter().filter(|e| e.is_some()).count();
             let m = if !g.linked {
@@ -1654,23 +1657,29 @@ impl ProfileCtx<'_> {
                 } else {
                     m_steps.clone()
                 };
-                let parts: Vec<DMatrix<f64>> = g
-                    .subjects
-                    .par_iter()
-                    .zip(states.par_iter())
-                    .zip(subj_loc.par_iter())
-                    .zip(exact.par_iter())
-                    .map(|(((&i, s), loc), e)| match e {
-                        Some(e) => e.clone(),
-                        None => {
-                            let st: Vec<f64> = loc
-                                .iter()
-                                .map(|&l| LINKED_HESSIAN_STEP_SE * scale[l])
-                                .collect();
-                            self.resolved_hessian(i, &p, s, &st)
-                        }
-                    })
-                    .collect();
+                let parts: Vec<DMatrix<f64>> = {
+                    let __r0 = &g.subjects;
+                    let __r1 = &states;
+                    let __r2 = &subj_loc;
+                    let __r3 = &exact;
+                    crate::par::map(
+                        __r0.len().min(__r1.len()).min(__r2.len()).min(__r3.len()),
+                        |__i| {
+                            let (((&i, s), loc), e) =
+                                (((&__r0[__i], &__r1[__i]), &__r2[__i]), &__r3[__i]);
+                            match e {
+                                Some(e) => e.clone(),
+                                None => {
+                                    let st: Vec<f64> = loc
+                                        .iter()
+                                        .map(|&l| LINKED_HESSIAN_STEP_SE * scale[l])
+                                        .collect();
+                                    self.resolved_hessian(i, &p, s, &st)
+                                }
+                            }
+                        },
+                    )
+                };
                 for (e, loc) in exact.iter().zip(&subj_loc) {
                     if e.is_none() {
                         counts.resolves += 2 * loc.len() * loc.len();
@@ -1704,12 +1713,12 @@ impl ProfileCtx<'_> {
             };
             let steps: Vec<f64> = level_se.iter().map(|s| fd_step * s).collect();
             // Per subject: the gradient, and whether the adjoint served it.
-            let parts: Vec<(Vec<f64>, bool)> = g
-                .subjects
-                .par_iter()
-                .zip(states.par_iter())
-                .zip(subj_loc.par_iter())
-                .map(|((&i, s), loc)| {
+            let parts: Vec<(Vec<f64>, bool)> = {
+                let __r0 = &g.subjects;
+                let __r1 = &states;
+                let __r2 = &subj_loc;
+                crate::par::map(__r0.len().min(__r1.len()).min(__r2.len()), |__i| {
+                    let ((&i, s), loc) = ((&__r0[__i], &__r1[__i]), &__r2[__i]);
                     if let Some(pt) = pt.as_ref().filter(|_| !s.off_mode && !route.declines(i)) {
                         if let Some(gr) = self.total_gradient_adjoint(i, pt, s) {
                             return (gr, true);
@@ -1718,7 +1727,7 @@ impl ProfileCtx<'_> {
                     let st: Vec<f64> = loc.iter().map(|&l| steps[l]).collect();
                     (self.total_gradient_fd(i, &p, s, &st), false)
                 })
-                .collect();
+            };
             for (a, (((_, served), s), loc)) in parts.iter().zip(&states).zip(&subj_loc).enumerate()
             {
                 if *served {
@@ -1797,12 +1806,14 @@ impl ProfileCtx<'_> {
                 for (&c, &b) in g.coords.iter().zip(&trial) {
                     q.theta[layout.coords[c]] = b;
                 }
-                let next: Vec<SubjectState> = g
-                    .subjects
-                    .par_iter()
-                    .zip(states.par_iter())
-                    .map(|(&i, s)| self.resolve(i, &q, &s.warm()))
-                    .collect();
+                let next: Vec<SubjectState> = {
+                    let __r0 = &g.subjects;
+                    let __r1 = &states;
+                    crate::par::map(__r0.len().min(__r1.len()), |__i| {
+                        let (&i, s) = (&__r0[__i], &__r1[__i]);
+                        self.resolve(i, &q, &s.warm())
+                    })
+                };
                 counts.resolves += next.len();
                 let o: f64 = next.iter().map(|s| s.nll).sum();
                 // Armijo, with a floor at the objective's own noise: within it, the step
@@ -2493,6 +2504,16 @@ pub(crate) fn profiled_converged(
     }
 }
 
+/// Whether a profiled fit's outer optimizer spent its evaluation budget (#2799): the loop
+/// ran out before a leg (`BudgetSpent`), or a leg ended on `MaxEvalReached`. The one
+/// predicate behind both [`profiled_verdict_warning`]'s budget advice and
+/// `OuterResult::eval_budget_spent`.
+pub(crate) fn profiled_budget_spent(end: PolishEnd, last: &NloptReturn) -> bool {
+    matches!(end, PolishEnd::BudgetSpent)
+        || (matches!(end, PolishEnd::Settled)
+            && matches!(last, Ok((nlopt::SuccessState::MaxEvalReached, _))))
+}
+
 /// The warning a profiled fit gets for how its verification ended, or `None` when it is
 /// converged. A function rather than inline `format!`s so each message is tested where
 /// it is written.
@@ -2526,10 +2547,7 @@ pub(crate) fn profiled_verdict_warning(
              verification legs (the last lowered the objective by {last_gain:.3e}), so \
              it is not reported as converged; re-run from these estimates."
         )),
-        PolishEnd::BudgetSpent => Some(budget()),
-        PolishEnd::Settled if matches!(last, Ok((nlopt::SuccessState::MaxEvalReached, _))) => {
-            Some(budget())
-        }
+        _ if profiled_budget_spent(end, last) => Some(budget()),
         _ if !converged => {
             let status = match last {
                 Ok((s, _)) => format!("{s:?}"),
@@ -2913,6 +2931,9 @@ pub(crate) fn optimize_profiled(
     };
 
     let mut converged = false;
+    // #2799: whether the profiled outer optimizer spent its evaluation budget, from the same
+    // predicate as its "increase maxiter" warning.
+    let mut eval_budget_spent = false;
     // The start verdict published as `left_init` / `stationary_start` (#2506). Set only
     // when the profiled levels are the only free coordinates (#2591).
     let mut start_verdict: (Option<bool>, bool) = (None, false);
@@ -3075,6 +3096,7 @@ pub(crate) fn optimize_profiled(
             },
         );
         converged = profiled_converged(algo, end, &result, cancelled(), left_init());
+        eval_budget_spent = profiled_budget_spent(end, &result);
         warnings.extend(profiled_verdict_warning(end, &result, converged));
     } else {
         // Evaluation only (`maxiter = 0`, NONMEM `MAXEVAL=0`), or nothing to search: the
@@ -3191,6 +3213,9 @@ pub(crate) fn optimize_profiled(
         start_eval: start_eval.into_inner().unwrap(),
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement: None,
+        optimizer_stop: None,
+        eval_budget_spent,
     }
 }
 
@@ -3375,6 +3400,9 @@ fn failed_result(
         start_eval: None,
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement: None,
+        optimizer_stop: None,
+        eval_budget_spent: false,
     }
 }
 
@@ -3486,6 +3514,8 @@ impl ProfileCtx<'_> {
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         };
         let fail = |reason: String| (failed(reason), None);
         let layout = self.layout;
@@ -3661,6 +3691,8 @@ impl ProfileCtx<'_> {
                     warnings: Vec::new(),
                     sir_fallback_proposal: None,
                     method: Some(CovarianceMethod::CrossProduct),
+                    newton_decrement: None,
+                    non_stationary_optimum: false,
                 },
                 Err(reason) => CovStepOutcome {
                     matrix: None,
@@ -3668,6 +3700,8 @@ impl ProfileCtx<'_> {
                     warnings: vec![reason],
                     sir_fallback_proposal: None,
                     method: None,
+                    newton_decrement: None,
+                    non_stationary_optimum: false,
                 },
             };
         }
@@ -3753,6 +3787,8 @@ impl ProfileCtx<'_> {
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         };
         let blocks = match self.level_blocks(hold, x_hat, free, solve) {
             Ok(v) => v,
@@ -3820,6 +3856,8 @@ impl ProfileCtx<'_> {
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         };
         let options = self.options;
         let n = x_hat.len();
@@ -3827,7 +3865,7 @@ impl ProfileCtx<'_> {
         if !f0.is_finite() {
             return fail(PROFILE_NOT_FINITE_AT_ESTIMATE.to_string());
         }
-        let floor = fd_step_floors(hold, &self.model.default_params);
+        let floor = fd_step_floors(hold, self.model);
         let Some(stencil) = fd_ofv_hessian(
             n,
             x_hat,
@@ -3874,6 +3912,8 @@ impl ProfileCtx<'_> {
             warnings: vec![reason],
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         };
         let options = self.options;
         let n = x_hat.len();
@@ -3882,7 +3922,19 @@ impl ProfileCtx<'_> {
         // the non-PD fallback's |λ|-rectified proposal (`build_non_pd_fallback_proposal`,
         // as the unprofiled step builds it, at the same 4× inflation), with the reason.
         let (cov_s, non_pd) = match a_p.clone().cholesky() {
-            Some(ch) => (ch.inverse() * 2.0, None),
+            // #2797: on a positive-definite `A_p`, the structural coordinates collapsed on the
+            // internal guard are held — `A_p⁻¹` becomes the inverse of its sub-block over the
+            // rest, embedded with zero rows — so the level blocks and the sandwich built from
+            // it below are conditional on them too. Only after the verdict, as in the
+            // unprofiled step.
+            Some(ch) => {
+                let held = crate::estimation::covariance::held_free_positions(x_hat, hold, free);
+                let cov = crate::estimation::covariance::condition_on_held(a_p, &held, |sub, _| {
+                    sub.clone().cholesky().map(|c| c.inverse() * 2.0)
+                })
+                .unwrap_or_else(|| ch.inverse() * 2.0);
+                (cov, None)
+            }
             None => {
                 let sym = (a_p + a_p.transpose()) * 0.5;
                 let Some(eigvals) = crate::estimation::covariance::extract_eigenvalues(&sym) else {
@@ -3937,6 +3989,8 @@ impl ProfileCtx<'_> {
                 warnings: vec![reason],
                 sir_fallback_proposal: Some(full),
                 method: None,
+                newton_decrement: None,
+                non_stationary_optimum: false,
             };
         }
         // `rsr`: `R⁻¹SR⁻¹` with `full` as `R⁻¹`, through the unprofiled step's own
@@ -3970,6 +4024,8 @@ impl ProfileCtx<'_> {
             warnings: Vec::new(),
             sir_fallback_proposal: None,
             method: Some(method),
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }
     }
 
@@ -4025,6 +4081,15 @@ impl ProfileCtx<'_> {
         );
         let inv = crate::estimation::covariance::invert_cross_product(&s, &units)
             .ok_or_else(|| crate::estimation::covariance::S_SINGULAR_MSG.to_string())?;
+        // #2816: `S⁻¹` conditional on the coordinates collapsed on the guard, once `S` itself
+        // inverted cleanly — the unprofiled step's rule (#2797), so a held collapse is the
+        // same coordinate `FIX`. `unheld` is the template `free_all` indexes.
+        let held = crate::estimation::covariance::held_free_positions(x_hat, &unheld, &free_all);
+        let inv = crate::estimation::covariance::condition_on_held(&s, &held, |sub, keep| {
+            let keep_units: Vec<_> = keep.iter().map(|&a| units[a]).collect();
+            crate::estimation::covariance::invert_cross_product(sub, &keep_units)
+        })
+        .unwrap_or(inv);
         if self.options.verbose {
             eprintln!("  Covariance step successful (profile)");
         }
@@ -4067,7 +4132,7 @@ impl ProfileCtx<'_> {
         let a_steps: Vec<f64> = free
             .iter()
             .map(|&i| {
-                let floor = fd_step_floor(hold, &self.model.default_params, i);
+                let floor = fd_step_floor(hold, self.model, i);
                 fd_step(profile_fd_hessian_step(self.options), x_hat[i], floor)
             })
             .collect();
@@ -4082,33 +4147,30 @@ impl ProfileCtx<'_> {
         // whether they are the adjoint's).
         #[allow(clippy::type_complexity)]
         let parts: Vec<(DMatrix<f64>, DMatrix<f64>, Option<DMatrix<f64>>, bool)> =
-            (0..self.population.subjects.len())
-                .into_par_iter()
-                .map(|i| {
-                    let exact = pt
-                        .as_ref()
-                        .filter(|_| !solve.off_mode[i] && forced != Some(i))
-                        .and_then(|pt| self.subject_blocks_adjoint(i, pt, free, solve));
-                    match exact {
-                        Some((a, b, d)) => (d, b, Some(a), true),
-                        None => {
-                            let (d, b) = self.subject_blocks_fd(
-                                i,
-                                hold,
-                                x_hat,
-                                free,
-                                solve,
-                                &theta_steps,
-                                &level_steps,
-                            );
-                            let a = adjoint.then(|| {
-                                self.subject_structural_fd(i, hold, x_hat, free, solve, &a_steps)
-                            });
-                            (d, b, a, false)
-                        }
+            crate::par::map(self.population.subjects.len(), |i| {
+                let exact = pt
+                    .as_ref()
+                    .filter(|_| !solve.off_mode[i] && forced != Some(i))
+                    .and_then(|pt| self.subject_blocks_adjoint(i, pt, free, solve));
+                match exact {
+                    Some((a, b, d)) => (d, b, Some(a), true),
+                    None => {
+                        let (d, b) = self.subject_blocks_fd(
+                            i,
+                            hold,
+                            x_hat,
+                            free,
+                            solve,
+                            &theta_steps,
+                            &level_steps,
+                        );
+                        let a = adjoint.then(|| {
+                            self.subject_structural_fd(i, hold, x_hat, free, solve, &a_steps)
+                        });
+                        (d, b, a, false)
                     }
-                })
-                .collect();
+                }
+            });
         let fd_subjects: Vec<usize> = (0..parts.len()).filter(|&i| !parts[i].3).collect();
         let a = adjoint.then(|| {
             // In subject order, so the sum does not depend on the thread count.
@@ -4184,7 +4246,7 @@ impl ProfileCtx<'_> {
         let theta_steps: Vec<f64> = free
             .iter()
             .map(|&i| {
-                let floor = fd_step_floor(hold, &self.model.default_params, i);
+                let floor = fd_step_floor(hold, self.model, i);
                 fd_step(self.options.fd_hessian_step, x_hat[i], floor)
             })
             .collect();

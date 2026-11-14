@@ -21,9 +21,9 @@
 use crate::diagnostics::Diagnostic;
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
-    dose_plan_violation, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, ControllerCtx, ControllerDecision, DoseAction, DosePlanViolation, DoseStep,
-    IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
+    dose_plan_violation, percent_step, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute,
+    AdaptiveRule, Comparison, ControllerCtx, ControllerDecision, DoseAction, DoseGrid,
+    DosePlanViolation, DoseStep, IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
 };
 use crate::types::CompiledModel;
 
@@ -60,6 +60,9 @@ struct AdaptiveController {
     // ── plan (immutable) ──
     route: AdaptiveRoute,
     dose_bounds: (f64, f64),
+    /// The dose grid (`round_to`, #944): every dose this controller sets lands on it.
+    /// `None` without `round_to`, where doses are only clamped to `dose_bounds`.
+    grid: Option<DoseGrid>,
     confirm: u32,
     rules: Vec<AdaptiveRule>,
     levels: Option<Vec<f64>>,
@@ -95,14 +98,26 @@ impl AdaptiveController {
             (Some(l), Some(d)) => l.iter().position(|&x| x == d).unwrap_or(0),
             _ => 0,
         };
+        // The start dose goes onto the grid by the same path as every step (#944). A
+        // plan that passed `dose_plan_violation` has a grid whenever `round_to` is set.
+        let grid = spec.dose_grid(plan.dose_bounds);
+        // V7 refuses bounds with no multiple before any subject runs; without it a set
+        // `round_to` would fall back to the unrounded clamp here, silently.
+        debug_assert!(
+            spec.round_to.is_none() || grid.is_some(),
+            "round_to is set but dose_bounds {:?} hold no multiple of it (V7 not checked)",
+            plan.dose_bounds
+        );
+        let dose = grid.map_or(plan.start_dose, |g| g.place(plan.start_dose));
         Self {
             route: spec.route.clone(),
             dose_bounds: plan.dose_bounds,
+            grid,
             confirm: spec.confirm,
             rules: spec.rules.clone(),
             levels: plan.levels.clone(),
             intervals: spec.intervals.clone(),
-            dose: plan.start_dose,
+            dose,
             level,
             rung,
             last_rule: None,
@@ -209,13 +224,19 @@ impl AdaptiveController {
         })
     }
 
-    /// Move the running dose one step up/down, clamped to `dose_bounds`.
+    /// Move the running dose one step up/down, clamped to `dose_bounds` — or, with
+    /// `round_to`, placed on the dose grid (rounded, then clamped to the aligned bounds,
+    /// #944). The placed dose is what is carried, so the next step starts from the dose
+    /// actually given, and a re-issue (`emit_dose`) gives it as is, never rounding it again. A step
+    /// the grid absorbs leaves the dose unchanged, as a step clamped at a bound does.
     fn step_dose(&mut self, step: DoseStep, up: bool) {
         let (lo, hi) = self.dose_bounds;
         match (step, &self.levels) {
             (DoseStep::Percent(p), _) => {
-                let factor = if up { 1.0 + p / 100.0 } else { 1.0 - p / 100.0 };
-                self.dose = (self.dose * factor).clamp(lo, hi);
+                self.dose = match &self.grid {
+                    Some(g) => g.step_percent(self.dose, p, up),
+                    None => percent_step(self.dose, p, up).clamp(lo, hi),
+                };
             }
             (DoseStep::Level, Some(levels)) => {
                 self.level = if up {
@@ -407,7 +428,7 @@ impl CompiledDoseExprs {
                 .map(|n| (n.to_string(), subject_value_read(model, pk, eta, n))),
         );
         ResolvedDosePlan {
-            violation: dose_plan_violation(&plan),
+            violation: dose_plan_violation(spec, &plan),
             plan,
             reads,
         }
@@ -680,6 +701,7 @@ mod tests {
             levels: levels.map(|l| l.into_iter().map(Into::into).collect()),
             target_window: None,
             auc_target: None,
+            round_to: None,
             dose_knowledge: Default::default(),
             rules,
             intervals: None,
@@ -1040,6 +1062,7 @@ mod tests {
             levels: None,
             target_window: None,
             auc_target: None,
+            round_to: None,
             dose_knowledge: Default::default(),
             rules: vec![rule(Comparison::Gt, 1000.0, AdaptiveAction::Hold)],
             intervals: None,
@@ -1262,5 +1285,176 @@ mod tests {
             IntervalStep::Shorten,
         );
         assert_eq!(r.label(), "signal < 10 : shorten");
+    }
+
+    // ── round_to: the dose grid (#944 PR3) ─────────────────────────────────────────
+    //
+    // The oracles are hand-computed: with `s = 250` every grid dose is an exact integer,
+    // so each expected amount is compared by bits.
+
+    /// `spec` with `round_to = 250`, bolus, confirm 1, and the one rule `rule_action`
+    /// firing whenever the signal is below 10.
+    fn grid_spec(start: f64, bounds: (f64, f64), action: AdaptiveAction) -> AdaptiveDosingSpec {
+        let mut s = spec(
+            start,
+            AdaptiveRoute::Bolus { cmt: 1 },
+            bounds,
+            1,
+            None,
+            vec![rule(Comparison::Lt, 10.0, action)],
+        );
+        s.round_to = Some(250.0);
+        s
+    }
+
+    /// Like [`run`], keeping the rule each decision names.
+    fn decisions(spec: &AdaptiveDosingSpec, signals: &[f64]) -> Vec<ControllerDecision> {
+        let factory = build_adaptive_controller(spec);
+        let mut controller = factory(&spec.literal_dose_plan().expect("a block of numbers"));
+        let empty_cov: HashMap<String, f64> = HashMap::new();
+        signals
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let mut sig = HashMap::new();
+                sig.insert(ADAPTIVE_SIGNAL.to_string(), s);
+                controller(&ControllerCtx {
+                    t: i as f64,
+                    state: &[],
+                    covariates: &empty_cov,
+                    history: &[],
+                    decision_index: i,
+                    signals: &sig,
+                    interval: None,
+                })
+            })
+            .collect()
+    }
+
+    fn amt(actions: &[DoseAction]) -> f64 {
+        match actions {
+            [DoseAction::Bolus { amt, .. }] => *amt,
+            other => panic!("expected one bolus, got {other:?}"),
+        }
+    }
+
+    /// 500 → +30% → 750 → +30% → 1000: each step starts from the dose actually given.
+    /// Carrying the unrounded 650 would give 845 → 750 at the second step (#944 audit 1
+    /// row 15). The third decision fires no rule and re-issues 1000 as is.
+    ///
+    /// Mutation: `step_dose` carries `x` and only the emitted amount is rounded.
+    #[test]
+    fn round_to_carries_the_rounded_dose() {
+        let s = grid_spec(
+            500.0,
+            (250.0, 4000.0),
+            AdaptiveAction::Increase(DoseStep::Percent(30.0)),
+        );
+        let out = run(&s, &[0.0, 0.0, 50.0]);
+        assert_eq!(amt(&out[0]).to_bits(), 750.0f64.to_bits(), "{out:?}");
+        assert_eq!(amt(&out[1]).to_bits(), 1000.0f64.to_bits(), "{out:?}");
+        assert_eq!(amt(&out[2]).to_bits(), 1000.0f64.to_bits(), "{out:?}");
+    }
+
+    /// `hi = 1150, s = 250`: a step to 1300 rounds to 1250, then clamps to the aligned
+    /// 1000. Clamping first gives 1150, which rounds to 1250, above the written bound
+    /// (#944 audit 1 row 13).
+    ///
+    /// Mutation: clamp to the raw bounds, then round.
+    #[test]
+    fn round_to_rounds_then_clamps_to_the_aligned_bound() {
+        let s = grid_spec(
+            1000.0,
+            (250.0, 1150.0),
+            AdaptiveAction::Increase(DoseStep::Percent(30.0)),
+        );
+        let out = run(&s, &[0.0]);
+        assert_eq!(amt(&out[0]).to_bits(), 1000.0f64.to_bits(), "{out:?}");
+    }
+
+    /// The start dose takes the same path as a step: 375 is a tie between 250 and 500
+    /// and goes up; 100 with a lower bound of `1e-6` rounds to 0, and the aligned lower
+    /// bound, 250, lifts it — a dose, not a hold (#944 audit 1 row 14).
+    ///
+    /// Mutations: the start dose not placed on the grid; ties sent down; the aligned
+    /// lower bound taken as the raw `lo`.
+    #[test]
+    fn round_to_places_the_start_dose_on_the_grid() {
+        let maintain = AdaptiveAction::Maintain;
+        let tie = grid_spec(375.0, (1e-6, 4000.0), maintain.clone());
+        assert_eq!(amt(&run(&tie, &[50.0])[0]).to_bits(), 500.0f64.to_bits());
+        let lifted = grid_spec(100.0, (1e-6, 4000.0), maintain);
+        assert_eq!(amt(&run(&lifted, &[50.0])[0]).to_bits(), 250.0f64.to_bits());
+    }
+
+    /// 500 +10% is 550, which rounds back to 500: the rule fires and the dose stays —
+    /// the same record a step clamped at a bound produces (`rule_fired`, unchanged
+    /// `amt`). The next step from the carried 500 is again absorbed, not 605 → 500.
+    ///
+    /// Mutation: an absorbed step reported as no rule.
+    #[test]
+    fn round_to_an_absorbed_step_names_the_rule_and_keeps_the_dose() {
+        let s = grid_spec(
+            500.0,
+            (250.0, 4000.0),
+            AdaptiveAction::Increase(DoseStep::Percent(10.0)),
+        );
+        let out = decisions(&s, &[0.0, 0.0]);
+        for (i, d) in out.iter().enumerate() {
+            assert_eq!(
+                amt(&d.actions).to_bits(),
+                500.0f64.to_bits(),
+                "decision {i}"
+            );
+            assert!(
+                d.rule.is_some(),
+                "decision {i}: the rule that fired is named"
+            );
+        }
+    }
+
+    /// A grid that already holds every dose the controller would set leaves the run
+    /// unchanged: 1000 → +50% 1500 → −50% 750 → +100% 1500 on `s = 250` with the bounds
+    /// on the grid and never reached. The actions equal those without `round_to`, by
+    /// bits (#944 D2, second half).
+    ///
+    /// Mutation: rounding that moves an on-grid value (e.g. a tie bias of a whole step).
+    #[test]
+    fn round_to_on_a_grid_holding_every_dose_equals_no_round_to() {
+        let mut s = spec(
+            1000.0,
+            AdaptiveRoute::Bolus { cmt: 1 },
+            (250.0, 4000.0),
+            1,
+            None,
+            vec![
+                rule(
+                    Comparison::Lt,
+                    10.0,
+                    AdaptiveAction::Increase(DoseStep::Percent(50.0)),
+                ),
+                rule(
+                    Comparison::Gt,
+                    90.0,
+                    AdaptiveAction::Decrease(DoseStep::Percent(50.0)),
+                ),
+                rule(
+                    Comparison::Lt,
+                    20.0,
+                    AdaptiveAction::Increase(DoseStep::Percent(100.0)),
+                ),
+            ],
+        );
+        let signals = [0.0, 95.0, 15.0, 50.0];
+        let plain = run(&s, &signals);
+        s.round_to = Some(250.0);
+        let gridded = run(&s, &signals);
+        let bits = |o: &[Vec<DoseAction>]| o.iter().map(|a| amt(a).to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&plain), bits(&gridded), "{plain:?} vs {gridded:?}");
+        assert_eq!(
+            bits(&plain),
+            [1500.0f64, 750.0, 1500.0, 1500.0].map(f64::to_bits),
+            "the doses are the ones named above: {plain:?}"
+        );
     }
 }

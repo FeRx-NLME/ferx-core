@@ -1427,8 +1427,14 @@ pub(crate) fn affine_parts(
 /// the sweep along one input register (the tangent of every value that depends on it), and
 /// the region's values.
 fn tangents(start: usize) -> impl Fn(u32) -> HashMap<u32, Tr, FxBuild> {
-    let (region, vals) = rec(|r| (r.code[start..].to_vec(), r.vals.clone()));
-    let h = move |r: u32| Tr::mk(vals.get(r as usize).copied().unwrap_or(f64::NAN), r, true);
+    let region = rec(|r| r.code[start..].to_vec());
+    // The values are read from the open recording when asked: copying them all here made a
+    // stiff segment's Jacobians quadratic in the recording. A register the region reads was
+    // written before this call, and a register's value is never rewritten.
+    let h = move |r: u32| {
+        let v = rec(|rc| rc.vals.get(r as usize).copied().unwrap_or(f64::NAN));
+        Tr::mk(v, r, true)
+    };
     move |seed: u32| {
         let mut tan: HashMap<u32, Tr, FxBuild> = HashMap::default();
         tan.insert(seed, Tr::k(1.0));
@@ -1561,7 +1567,12 @@ fn tangent(g: &Flat, h: &impl Fn(u32) -> Tr, tan: &HashMap<u32, Tr, FxBuild>) ->
                     let above = |p: Tr, q: Tr| Tr::select_if(BranchCmp::Ge, v, Tr::k(1e-30), p, q);
                     above(x / above(v, Tr::k(1.0)), Tr::k(0.0))
                 }
-                Unary::Sqrt => x / (q * Tr::k(2.0)),
+                // Flat at a non-positive argument (#2892), the divisor read as `1` there so the
+                // arm not taken stays finite.
+                Unary::Sqrt | Unary::SqrtRhs => {
+                    let pos = |p: Tr, q: Tr| Tr::select_if(BranchCmp::Gt, v, Tr::k(0.0), p, q);
+                    pos(x / (pos(q, Tr::k(1.0)) * Tr::k(2.0)), Tr::k(0.0))
+                }
                 Unary::InvLogit => q * (Tr::k(1.0) - q) * x,
                 Unary::Logit => x / (v * (Tr::k(1.0) - v)),
                 Unary::Cos => -(v.sin() * x),
@@ -1666,6 +1677,7 @@ impl Recording {
                     Unary::Ln => (if v(a) >= 1e-30 { v(a) } else { 1e-30 }).ln(),
                     Unary::Abs => v(a).abs(),
                     Unary::Sqrt => v(a).sqrt(),
+                    Unary::SqrtRhs => (if v(a) >= 0.0 { v(a) } else { 0.0 }).sqrt(),
                     Unary::InvLogit => 1.0 / (1.0 + (-v(a)).exp()),
                     Unary::Logit => (v(a) / (1.0 - v(a))).ln(),
                     Unary::Cos => v(a).cos(),
@@ -1996,7 +2008,7 @@ impl SubjectKey {
     ) -> Self {
         let m = registered(model as *const _ as usize);
         SubjectKey {
-            scope: m.as_ref().map_or(0, |e| e.2),
+            scope: m.as_ref().map_or(0, |e| e.1),
             model: model.plan_id.get(),
             solver: m.map_or_else(|| solver_desc(model), |e| e.0[0].clone()),
             subject: registered(subject as *const _ as usize)
@@ -2025,7 +2037,7 @@ pub(crate) struct Prints<'a> {
 
 /// Per address: (descriptors — a model's solver options; a subject's design and observed
 /// values —, live registrations, scope).
-type PrintMap = HashMap<usize, ([Desc; 2], usize, u64), FxBuild>;
+type PrintMap = HashMap<usize, (Arc<[Desc; 2]>, usize, u64), FxBuild>;
 static NEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static PRINTS: RwLock<Option<Arc<PrintMap>>> = RwLock::new(None);
 static PRINTS_VERSION: AtomicUsize = AtomicUsize::new(0);
@@ -2051,7 +2063,7 @@ pub(crate) fn register<'a>(
             .get(&add[0].0)
             .map_or_else(|| NEXT_SCOPE.fetch_add(1, Relaxed), |e| e.2);
         for (a, d) in &add {
-            m.entry(*a).or_insert((d.clone(), 0, scope)).1 += 1;
+            m.entry(*a).or_insert((Arc::new(d.clone()), 0, scope)).1 += 1;
         }
     });
     Prints {
@@ -2095,7 +2107,7 @@ fn edit_prints(f: impl FnOnce(&mut PrintMap)) {
 
 /// The registry's entry at `addr`: the thread re-reads the registry only when its version
 /// moved, so a lookup takes no lock.
-fn registered(addr: usize) -> Option<([Desc; 2], usize, u64)> {
+fn registered(addr: usize) -> Option<(Arc<[Desc; 2]>, u64)> {
     let v = PRINTS_VERSION.load(Relaxed);
     PRINTS_SEEN.with(|c| {
         let mut c = c.borrow_mut();
@@ -2105,7 +2117,9 @@ fn registered(addr: usize) -> Option<([Desc; 2], usize, u64)> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *c = (v, g.clone());
         }
-        c.1.as_ref().and_then(|m| m.get(&addr)).cloned()
+        c.1.as_ref()
+            .and_then(|m| m.get(&addr))
+            .map(|e| (e.0.clone(), e.2))
     })
 }
 
@@ -2307,7 +2321,7 @@ pub(crate) fn note_failure(k: &SubjectKey, why: &str) {
 
 /// The failures' entry for `model`'s fit (its [`register`]ed scope).
 fn failure_key(model: &crate::types::CompiledModel) -> (u64, u64) {
-    let scope = registered(model as *const _ as usize).map_or(0, |e| e.2);
+    let scope = registered(model as *const _ as usize).map_or(0, |e| e.1);
     (scope, model.plan_id.get())
 }
 
@@ -2381,6 +2395,7 @@ fn drop_scope(scope: u64) {
 
 /// Forget the plans and bad marks of the model `id`, as its [`crate::types::PlanId`] drops.
 pub(crate) fn drop_model(id: u64) {
+    clear_kept();
     let mut s = subjects()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2401,6 +2416,7 @@ pub(crate) fn drop_model(id: u64) {
 /// Forget every unregistered plan (a test's empty cache); a registered fit's are its own.
 #[cfg(test)]
 pub(crate) fn reset() {
+    clear_kept();
     drop_scope(0);
 }
 
@@ -3137,6 +3153,31 @@ pub(super) fn canonical_zero(x: f64) -> f64 {
     x + 0.0
 }
 
+/// Distinct `(layout, direction)` keys a plan resolves lock-free.
+const RESOLVED_SLOTS: usize = 16;
+
+/// A plan's kernels over one key, resolved once.
+struct Resolved {
+    key: (Layout, bool),
+    kerns: Option<Vec<Kern>>,
+}
+
+/// A plan's resolved kernels: borrowed from its slot, or owned past the slots.
+enum Fns<'a> {
+    Shared(&'a [Kern]),
+    Own(Vec<Kern>),
+}
+
+impl std::ops::Deref for Fns<'_> {
+    type Target = [Kern];
+    fn deref(&self) -> &[Kern] {
+        match self {
+            Fns::Shared(s) => s,
+            Fns::Own(v) => v,
+        }
+    }
+}
+
 /// A plan step's kernels at one layout.
 pub(crate) enum Kern {
     Chunk(Arc<Tiered>),
@@ -3175,8 +3216,11 @@ pub(crate) struct Plan {
     n_theta: usize,
     outs: Vec<u32>,
     guard: Option<u32>,
-    fast: OnceLock<Option<Arc<Vec<Kern>>>>,
-    resolved: Mutex<HashMap<(Layout, bool), Option<Arc<Vec<Kern>>>>>,
+    /// Every call is a chunk ([`Plan::chunks_only`]).
+    chunky: bool,
+    /// Each `(layout, direction)`'s resolved kernels, claimed once by the first caller into
+    /// a free slot and read without a lock after ([`Plan::fns`]).
+    resolved: [OnceLock<Resolved>; RESOLVED_SLOTS],
     /// The solver override an ODE plan was recorded under (`None` for a plan with no ODE
     /// segment): another phase of the fit (tighter tolerances, another method) must not run it.
     ode_override: Option<Option<crate::ode::solver::OdeSolverOverride>>,
@@ -3669,7 +3713,7 @@ impl Recording {
     /// A template's plan `p` with this recording's literals and loop calls (`src`: per call,
     /// where they sit).
     fn serve(&self, p: &Plan, src: &[Box<[u32]>]) -> Plan {
-        let calls = p
+        let calls: Vec<Call> = p
             .calls
             .iter()
             .zip(src)
@@ -3690,6 +3734,7 @@ impl Recording {
             })
             .collect();
         Plan {
+            chunky: calls.iter().all(|c| matches!(c, Call::Chunk { .. })),
             calls,
             n_slots: p.n_slots,
             layout: p.layout,
@@ -3698,8 +3743,7 @@ impl Recording {
             n_theta: p.n_theta,
             outs: p.outs.clone(),
             guard: p.guard,
-            fast: OnceLock::new(),
-            resolved: Mutex::new(HashMap::new()),
+            resolved: Default::default(),
             ode_override: self.ode.then(crate::ode::solver::current_ode_override),
             declined: self.declined,
         }
@@ -3967,6 +4011,7 @@ impl Recording {
             None => None,
         };
         let plan = Plan {
+            chunky: calls.iter().all(|c| matches!(c, Call::Chunk { .. })),
             calls,
             n_slots,
             layout,
@@ -3975,8 +4020,7 @@ impl Recording {
             n_theta,
             outs: outs?,
             guard,
-            fast: OnceLock::new(),
-            resolved: Mutex::new(HashMap::new()),
+            resolved: Default::default(),
             ode_override: None,
             declined: 0,
         };
@@ -3989,6 +4033,17 @@ thread_local! {
     #[cfg(test)]
     static CALLS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static BUF: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    /// Kept forwards [`Plan::adopt`] has handed out on this thread (a test counts the reuse).
+    #[cfg(test)]
+    static ADOPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Value passes [`Plan::run_values`] has served on this thread (a test counts them).
+    #[cfg(test)]
+    static VALUE_RUNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The plan whose [`Plan::run`] last filled `BUF` on this thread, if that run held.
+    static LAST_RUN: std::cell::Cell<Option<LastRun>> = const { std::cell::Cell::new(None) };
+    /// [`Plan::run_values`]'s buffer: apart from `BUF`, so a value pass leaves the last
+    /// gradient forward ([`Plan::run`]) in `BUF` for [`keep_last_run`].
+    static VBUF: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
     static ADJ: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
     /// Buffers of finished passes, reused by the next ones on this thread (`take`/`give`).
     static POOL: RefCell<Vec<Vec<f64>>> = const { RefCell::new(Vec::new()) };
@@ -4037,6 +4092,95 @@ impl std::ops::DerefMut for Buf {
 impl Drop for Buf {
     fn drop(&mut self) {
         give(std::mem::take(&mut self.0));
+    }
+}
+
+/// What the thread's last [`Plan::run`] left in `BUF`.
+#[derive(Clone, Copy)]
+struct LastRun {
+    plan: usize,
+    layout: Layout,
+    need: usize,
+    n_eta: usize,
+    n_theta: usize,
+}
+
+/// A subject's forward at the end of its inner solve ([`keep_last_run`]): the slots of a
+/// chunk-only plan at its inner layout, which [`Plan::adopt`] turns back into a [`Fwd`] for the
+/// outer gradient's reverse, so that does not run the same forward again at `η̂`.
+struct Kept {
+    plan: usize,
+    layout: Layout,
+    buf: Vec<f64>,
+}
+
+fn kept_table() -> &'static Mutex<HashMap<usize, Kept, FxBuild>> {
+    static T: OnceLock<Mutex<HashMap<usize, Kept, FxBuild>>> = OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+/// The slot lanes of `buf` hold the forward at `(theta, eta)`: lane 0 of each input slot.
+fn inputs_match(buf: &[f64], l: usize, n_eta: usize, theta: &[f64], eta: &[f64]) -> bool {
+    eta.len() == n_eta
+        && eta
+            .iter()
+            .enumerate()
+            .all(|(k, v)| buf[k * l].to_bits() == v.to_bits())
+        && theta
+            .iter()
+            .enumerate()
+            .all(|(j, v)| buf[(n_eta + j) * l].to_bits() == v.to_bits())
+}
+
+/// Keep, for `owner` (the subject), the forward this thread's last [`Plan::run`] left in
+/// `BUF`, when that was a chunk-only plan's run at exactly `(theta, eta)`. Replaces what the
+/// owner had kept.
+pub(crate) fn keep_last_run(owner: usize, theta: &[f64], eta: &[f64]) {
+    let Some(last) = LAST_RUN.with(|c| c.get()) else {
+        return;
+    };
+    let l = last.layout.lanes();
+    let kept = BUF.with(|b| {
+        let b = b.borrow();
+        let buf = b.get(..last.need)?;
+        if last.n_theta != theta.len() || !inputs_match(buf, l, last.n_eta, theta, eta) {
+            return None;
+        }
+        let mut v = take(last.need);
+        v.copy_from_slice(buf);
+        Some(v)
+    });
+    if let Some(buf) = kept {
+        let old = kept_table().lock().unwrap().insert(
+            owner,
+            Kept {
+                plan: last.plan,
+                layout: last.layout,
+                buf,
+            },
+        );
+        if let Some(o) = old {
+            give(o.buf);
+        }
+    }
+}
+
+/// Value passes served on this thread so far.
+#[cfg(test)]
+pub(crate) fn value_runs() -> usize {
+    VALUE_RUNS.with(|c| c.get())
+}
+
+/// Forwards adopted on this thread so far.
+#[cfg(test)]
+pub(crate) fn adopts() -> usize {
+    ADOPTS.with(|c| c.get())
+}
+
+/// Drop every kept forward (a new fit or a dropped model: the plans they belong to may go).
+pub(crate) fn clear_kept() {
+    for (_, k) in kept_table().lock().unwrap().drain() {
+        give(k.buf);
     }
 }
 
@@ -4093,14 +4237,23 @@ impl Plan {
         self.n_eta
     }
 
-    /// Every chunk's entry point over `(layout, rev)`, resolved once.
-    fn fns(&self, layout: Layout, rev: bool) -> Option<Arc<Vec<Kern>>> {
-        let mut r = self.resolved.lock().unwrap();
-        if let Some(v) = r.get(&(layout, rev)) {
-            return v.clone();
+    /// Every chunk's entry point over `(layout, rev)`, resolved once and then read lock-free.
+    /// More distinct keys than slots (none in practice) resolve on every call instead.
+    fn fns(&self, layout: Layout, rev: bool) -> Option<Fns<'_>> {
+        for slot in &self.resolved {
+            let e = slot.get_or_init(|| Resolved {
+                key: (layout, rev),
+                kerns: self.resolve(layout, rev),
+            });
+            if e.key == (layout, rev) {
+                return e.kerns.as_deref().map(Fns::Shared);
+            }
         }
-        let v: Option<Vec<Kern>> = self
-            .calls
+        self.resolve(layout, rev).map(Fns::Own)
+    }
+
+    fn resolve(&self, layout: Layout, rev: bool) -> Option<Vec<Kern>> {
+        self.calls
             .iter()
             .map(|c| match c {
                 Call::Chunk { prog, .. } => prog.get(layout, rev).map(Kern::Chunk),
@@ -4112,10 +4265,7 @@ impl Plan {
                     CallKind::Repeat(r) => Some(Kern::Repeat(r.clone())),
                 },
             })
-            .collect();
-        let v = v.map(Arc::new);
-        r.insert((layout, rev), v.clone());
-        v
+            .collect()
     }
 
     /// The forward over `layout` into `buf` (`n_slots × lanes`), η and θ already in place:
@@ -4258,9 +4408,10 @@ impl Plan {
     /// Run over the inner loop's layout at `(theta, eta)` (η seeded one-hot), writing each
     /// output's lanes to `out` (`n_out × lanes`); `false` when a guard fails.
     pub(crate) fn run(&self, theta: &[f64], eta: &[f64], out: &mut [f64]) -> bool {
-        let Some(fns) = self.fast.get_or_init(|| self.fns(self.layout, false)) else {
+        let Some(fns) = self.fns(self.layout, false) else {
             return false;
         };
+        LAST_RUN.with(|c| c.set(None));
         BUF.with(|b| {
             let mut b = b.borrow_mut();
             let need = self.n_slots * self.lanes;
@@ -4280,7 +4431,7 @@ impl Plan {
                 s.fill(0.0);
                 s[0] = theta[j];
             }
-            if self.forward_into(fns, buf, self.layout) != Some(true) {
+            if self.forward_into(&fns, buf, self.layout) != Some(true) {
                 return false;
             }
             if let Some(g) = self.guard {
@@ -4291,7 +4442,87 @@ impl Plan {
             for (i, &o) in self.outs.iter().enumerate() {
                 out[i * l..(i + 1) * l].copy_from_slice(&buf[o as usize * l..(o as usize + 1) * l]);
             }
+            LAST_RUN.with(|c| {
+                c.set(self.chunky.then_some(LastRun {
+                    plan: self as *const Plan as usize,
+                    layout: self.layout,
+                    need,
+                    n_eta: self.n_eta,
+                    n_theta: self.n_theta,
+                }))
+            });
             true
+        })
+    }
+
+    /// Whether every call is a chunk: the plan then holds the whole prediction as straight-line
+    /// code (an exact linear segment is one), with no loop call a solver controller drives.
+    pub(crate) fn chunks_only(&self) -> bool {
+        self.chunky
+    }
+
+    /// The outputs' values at `(theta, eta)`, no derivative lanes, into `out` (`n_out`): the
+    /// forward at [`Layout::F64`] over this thread's buffer, with no kept forward, no run logs
+    /// and no allocation. `false` when a guard fails or a call cannot run.
+    pub(crate) fn run_values(&self, theta: &[f64], eta: &[f64], out: &mut [f64]) -> bool {
+        let Some(fns) = self.fns(Layout::F64, false) else {
+            return false;
+        };
+        VBUF.with(|b| {
+            let mut b = b.borrow_mut();
+            if b.len() < self.n_slots {
+                b.resize(self.n_slots, 0.0);
+            }
+            let buf = &mut b[..self.n_slots];
+            buf[..self.n_eta].copy_from_slice(&eta[..self.n_eta]);
+            buf[self.n_eta..self.n_eta + self.n_theta].copy_from_slice(&theta[..self.n_theta]);
+            if self.forward_into(&fns, buf, Layout::F64) != Some(true) {
+                return false;
+            }
+            if self.guard.is_some_and(|g| buf[g as usize] != 1.0) {
+                return false;
+            }
+            for (o, &s) in out.iter_mut().zip(&self.outs) {
+                *o = buf[s as usize];
+            }
+            #[cfg(test)]
+            VALUE_RUNS.with(|c| c.set(c.get() + 1));
+            true
+        })
+    }
+
+    /// `owner`'s forward kept at the end of its inner solve ([`keep_last_run`]) as a [`Fwd`] at
+    /// `layout`, when this plan made it at exactly `(theta, eta)` and `layout` is the inner
+    /// one; taken, so one gradient reads it. Its slots are the ones [`Self::forward_kept`] would
+    /// compute (the same chunks over the same inputs), a chunk-only plan having no run logs.
+    pub(crate) fn adopt(
+        &self,
+        owner: usize,
+        layout: Layout,
+        theta: &[f64],
+        eta: &[f64],
+    ) -> Option<Fwd> {
+        if !self.chunky || layout != self.layout {
+            return None;
+        }
+        let me = self as *const Plan as usize;
+        let mut t = kept_table().lock().unwrap();
+        let k = t.get(&owner)?;
+        if k.plan != me || k.layout != layout || k.buf.len() != self.n_slots * self.lanes {
+            return None;
+        }
+        if theta.len() != self.n_theta || !inputs_match(&k.buf, self.lanes, self.n_eta, theta, eta)
+        {
+            return None;
+        }
+        let k = t.remove(&owner)?;
+        #[cfg(test)]
+        ADOPTS.with(|c| c.set(c.get() + 1));
+        Some(Fwd {
+            plan: me,
+            layout,
+            buf: k.buf,
+            logs: Vec::new(),
         })
     }
 

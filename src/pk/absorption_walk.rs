@@ -577,7 +577,8 @@ pub(crate) fn closed_form_sens_walk_g<T: PkNum>(
 ///
 /// The last clause keeps the twin wherever the walk's **gradient** would not be analytic
 /// ([`crate::sens::provider::absorption_walk_sens_in_scope`]): the twin's ODE provider serves
-/// a wider scope (96 stacked IOV axes against the dual walk's 24), and the walk must not
+/// a wider scope (uncapped stacked IOV axes, `sens/ode_adjoint.rs`, against the dual
+/// walk's 24), and the walk must not
 /// trade a subject's analytic gradient for finite differences. Prediction and gradient read
 /// this one predicate, so they stay on the same engine.
 pub(crate) fn walk_eligible(model: &CompiledModel, subject: &Subject) -> bool {

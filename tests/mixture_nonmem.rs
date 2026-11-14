@@ -160,6 +160,17 @@ fn mixture_fit_matches_nonmem() {
     let p1 = 1.0 / (1.0 + (-th[3]).exp());
     assert!((p1 - NM_P1).abs() < 0.05, "p(1) {} vs NONMEM {}", p1, NM_P1);
 
+    // Two distinct classes at the NONMEM optimum: the merged-class check stays silent
+    // (#2907; the largest per-subject class log Bayes factor here is 11.45, against the
+    // threshold of 1).
+    assert!(
+        !res.warnings
+            .iter()
+            .any(|w| w.contains("W_MIXTURE_MERGED_CLASSES")),
+        "{:?}",
+        res.warnings
+    );
+
     // ── Standard errors vs NONMEM $COVARIANCE (#983 Phase 6) ────────────────────
     // The mixture covariance step now runs (it was skipped before): its FD Hessian
     // is built on the K-fold mixture OFV, and SE = sqrt(diag(R^-1)). Compared to
@@ -825,4 +836,127 @@ fn imp_estimating_mixture_cold_start_does_not_collapse() {
         res.theta[0],
         res.theta[1]
     );
+}
+
+// ── #2907: the post-fit merged-class check on the public fixture ────────────────
+
+/// The `mixture_iv` model with Ω and Σ estimated: the variant with a real collapsed local
+/// optimum at OFV 310.02, where the classes nearly merge and ω_CL absorbs the bimodality
+/// (#2739).
+fn free_omega_model(cl1: &str, cl2: &str) -> String {
+    MODEL
+        .replace("TVCL1(1.2,", &format!("TVCL1({cl1},"))
+        .replace("TVCL2(2.5,", &format!("TVCL2({cl2},"))
+        .replace("~ 0.09 FIX", "~ 0.09")
+        .replace("~ 0.04 FIX", "~ 0.04")
+}
+
+fn merged_warning(res: &ferx_core::FitResult) -> Option<&String> {
+    res.warnings
+        .iter()
+        .find(|w| w.starts_with("W_MIXTURE_MERGED_CLASSES"))
+}
+
+/// Evaluation-only (`outer_maxiter = 0`), so it returns immediately. The pair straddles the
+/// check: identical classes (both clearances 1.7, mixing logit 0) give every subject a
+/// factor of exactly 0 and warn, naming the pair; the test's own separated start
+/// (1.2 / 2.5) does not.
+#[test]
+fn merged_class_warning_straddles_identical_and_separated_starts() {
+    let pop: ferx_core::Population = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .unwrap();
+    let mut opts = FitOptions::default();
+    opts.interaction = true;
+    opts.outer_maxiter = 0;
+    opts.run_covariance_step = false;
+
+    let same = parse_model_string(&free_omega_model("1.7", "1.7")).unwrap();
+    let res = fit(&same, &pop, &same.default_params, &opts).expect("eval Ok");
+    let w = merged_warning(&res).unwrap_or_else(|| panic!("{:?}", res.warnings));
+    assert!(w.contains("classes 1 and 2 have merged"), "{w}");
+    assert!(!w.contains("empty"), "{w}");
+
+    let apart = parse_model_string(&free_omega_model("1.2", "2.5")).unwrap();
+    let res = fit(&apart, &pop, &apart.default_params, &opts).expect("eval Ok");
+    assert_eq!(merged_warning(&res), None, "{:?}", res.warnings);
+}
+
+/// The case #2907 exists for. From clearances 1.70 / 1.71, which the start check of #2749
+/// cannot call symmetric, L-BFGS ends in the collapsed optimum (OFV 310.02) and BOBYQA in
+/// the two-class one (299.86). Measured (macOS arm64, `ci-fast`): at the collapsed optimum
+/// the largest per-subject log Bayes factor between the classes is 0.092 (TVCL 1.707 /
+/// 1.762, ω_CL 0.353); at the two-class optimum it is 15.05. The threshold of 1 sits 11×
+/// above the first and 15× below the second.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests (mixture fits to convergence)"
+)]
+fn near_symmetric_start_collapsed_optimum_warns_merged_classes() {
+    let pop: ferx_core::Population = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .unwrap();
+    let model = parse_model_string(&free_omega_model("1.70", "1.71")).unwrap();
+    let mut opts = FitOptions::default();
+    opts.interaction = true;
+    opts.run_covariance_step = false;
+
+    opts.optimizer = ferx_core::Optimizer::NloptLbfgs;
+    let collapsed = fit(&model, &pop, &model.default_params, &opts).expect("fit Ok");
+    // Pin that the fixture still reaches the collapsed optimum, or the warning below
+    // would be tested on a fit that never collapsed.
+    assert!(
+        (collapsed.ofv - 310.02).abs() < 0.1,
+        "L-BFGS from 1.70 / 1.71 OFV {}, expected the collapsed 310.02",
+        collapsed.ofv
+    );
+    let w = merged_warning(&collapsed).unwrap_or_else(|| panic!("{:?}", collapsed.warnings));
+    assert!(w.contains("classes 1 and 2 have merged"), "{w}");
+
+    opts.optimizer = ferx_core::Optimizer::Bobyqa;
+    let separated = fit(&model, &pop, &model.default_params, &opts).expect("fit Ok");
+    assert!(
+        separated.ofv < 300.5,
+        "BOBYQA from 1.70 / 1.71 OFV {}, expected the two-class 299.86",
+        separated.ofv
+    );
+    assert_eq!(merged_warning(&separated), None, "{:?}", separated.warnings);
+}
+
+/// An empty class: the mixing logit held at −9 (p(1) ≈ 1.2e-4) leaves class 1 with a largest
+/// posterior of 3.05e-4 across subjects (measured, macOS arm64, `ci-fast`), 33× under the
+/// 1e-2 threshold. Its largest factor against class 2 is 1.20, so the merged test alone
+/// would miss it; the warning must call it empty.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests (mixture fit to convergence)"
+)]
+fn held_tiny_mixing_fraction_warns_empty_class() {
+    let pop: ferx_core::Population = read_nonmem_csv(
+        Path::new("tests/nonmem/mixture_iv.csv"),
+        Some(&["WT"]),
+        None,
+    )
+    .unwrap();
+    let model = parse_model_string(&free_omega_model("1.2", "2.5").replace(
+        "theta MIXL(0.0, -10.0, 10.0)",
+        "theta MIXL(-9.0, -10.0, 10.0) FIX",
+    ))
+    .unwrap();
+    let mut opts = FitOptions::default();
+    opts.interaction = true;
+    opts.run_covariance_step = false;
+    opts.optimizer = ferx_core::Optimizer::NloptLbfgs;
+    let res = fit(&model, &pop, &model.default_params, &opts).expect("fit Ok");
+    let w = merged_warning(&res).unwrap_or_else(|| panic!("{:?}", res.warnings));
+    assert!(w.contains("class 1 is empty"), "{w}");
+    assert!(!w.contains("have merged"), "{w}");
 }

@@ -33,7 +33,7 @@ pub(super) fn agq_planned(
     so: &StackedOmega,
     pv: &ParT<f64>,
     grid: &[(Vec<f64>, f64, Vec<f64>)],
-    h_inner: &DMatrix<f64>,
+    h_exact: Option<&DMatrix<f64>>,
     exact: bool,
     held: bool,
     ng: Option<&AgqNg>,
@@ -65,11 +65,12 @@ pub(super) fn agq_planned(
     // produced them (the predictions', the variances').
     type Node = (Vec<f64>, Fwd, Option<Fwd>);
     let mut nodes: Vec<Node> = Vec::with_capacity(grid.len());
+    let mode_plan = mode_fwd.map(|m| &m.0);
     for (_, _, b) in grid {
         if n_obs == 0 {
             continue;
         }
-        let (plan, mut du, f) = plan_forward(model, subject, lay, theta, &b[..], Layout::F64)?;
+        let (plan, mut du, f) = plan_forward_f64(mode_plan, model, subject, lay, theta, &b[..])?;
         let var = if sde {
             let (pp, dp, pf) =
                 plan_forward_in(model, subject, lay, theta, Some(sigma), &b[..], Layout::F64)?;
@@ -344,12 +345,33 @@ pub(super) fn agq_planned(
     };
     let mut a_seed = vec![0.0; 1 + n];
     a_seed[0] = 1.0;
-    // Only the exact anchor reads `Q`, so only its reverse 1 seeds it.
+    // Only the exact anchor reads `Q`, so only its reverse 1 seeds it. The Gauss-Newton anchor
+    // ran the mode forward first order, so one first-order reverse carries `A` and the `n`
+    // components of `∇_η l` (seeds `0..=n`): `A`'s η lanes, the exact inner Hessian's
+    // contraction through the plans, and (linearly) every later `-wᵀ∇_η l` / mode-response
+    // θ adjoint, with no second-order lane and no separate pass.
     let r1 = if exact { full } else { first };
     let lf = r1.lanes();
     let mut du_bar = vec![0.0; n_rows * lf];
     seed_preds(&a_seed, &mut du_bar, lf);
-    let (ub, pb) = reverse_at_mode(1, &du_bar, r1)?;
+    let combined = if exact {
+        None
+    } else {
+        let w_out = n_rows * lf;
+        let mut du = vec![0.0; (1 + n) * w_out];
+        du[..w_out].copy_from_slice(&du_bar);
+        for o in 0..n {
+            let c: Vec<f64> = (0..=n)
+                .map(|i| if i == 1 + o { 1.0 } else { 0.0 })
+                .collect();
+            seed_preds(&c, &mut du[(1 + o) * w_out..(2 + o) * w_out], lf);
+        }
+        Some(reverse_at_mode(1 + n, &du, first)?)
+    };
+    let (ub, pb) = match &combined {
+        Some((u, p)) => (u[..n * lf].to_vec(), p[..n_cols].to_vec()),
+        None => reverse_at_mode(1, &du_bar, r1)?,
+    };
     let mut grad_eta: Vec<f64> = (0..n).map(|k| ba(0, er[k]) + ub[k * lf]).collect();
     if let (Some(ngr), Some(ng)) = (ng_r.as_ref(), ng) {
         let d = ng_eta_contraction(&ng.jets, ngr, |v| ba(0, v))?;
@@ -357,6 +379,26 @@ pub(super) fn agq_planned(
             grad_eta[k] += d[k];
         }
     }
+    // The inner Hessian the mode response solves with: the exact one, handed in under the
+    // exact anchor; else the unit seeds' rows d(grad_eta l)_o / d eta_k, symmetrised, plus the
+    // non-Gaussian second derivative.
+    let h_inner = match h_exact {
+        Some(h) => h.clone(),
+        None => {
+            let (u, _) = combined.as_ref()?;
+            let h = DMatrix::from_fn(n, n, |o, k| ba(1 + o, er[k]) + u[((1 + o) * n + k) * lf]);
+            let mut h = (h.clone() + h.transpose()) * 0.5;
+            if let Some(ng) = ng {
+                for a in 0..n_bsv {
+                    for b in 0..n_bsv {
+                        h[(a, b)] += ng.jets.h[a][b];
+                    }
+                }
+            }
+            h
+        }
+    };
+    let h_inner = &h_inner;
     // A's θ adjoint: at η̂, then through every node's predictions (their blocks' reverses).
     let mut theta_a: Vec<f64> = pb[..n_cols].to_vec();
     for (t, d) in theta_a.iter_mut().zip(&theta_nodes) {
@@ -397,7 +439,21 @@ pub(super) fn agq_planned(
     for (s, c) in coefs.iter().enumerate() {
         seed_preds(c, &mut du_bar[s * w_out..(s + 1) * w_out], l1);
     }
-    let (_, pb2) = reverse_at_mode(seeds, &du_bar, first)?;
+    let pb2 = match &combined {
+        // Linear in the seeds: each combination's theta adjoint is its mix of the unit seeds'.
+        Some((_, pbc)) => {
+            let mut out = vec![0.0; seeds * n_cols];
+            for (s, c) in coefs.iter().enumerate() {
+                for o in 0..n {
+                    for j in 0..n_cols {
+                        out[s * n_cols + j] += c[1 + o] * pbc[(1 + o) * n_cols + j];
+                    }
+                }
+            }
+            out
+        }
+        None => reverse_at_mode(seeds, &du_bar, first)?.1,
+    };
     let theta_of = |s: usize| -> Vec<f64> { pb2[s * n_cols..(s + 1) * n_cols].to_vec() };
     let comb_adj = |c: &[f64], v: Leaf| -> f64 {
         c.iter()

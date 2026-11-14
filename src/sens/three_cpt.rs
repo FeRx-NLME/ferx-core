@@ -4,7 +4,7 @@
 //! sensitivities). Mirrors [`crate::pk::three_compartment`]; only the central-
 //! compartment concentration is needed for the likelihood. The macro-rate cubic
 //! starts from the trigonometric solution on the values and is polished in the
-//! number type ([`macro_rates_three_cpt_g`]).
+//! number type (`macro_rates_three_cpt_g`).
 // PK closed forms carry many positional params (dose descriptors + 6 PK params);
 // the wide signatures are inherent, not a smell.
 #![allow(clippy::too_many_arguments)]
@@ -256,7 +256,7 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
 }
 
 /// 3-cpt oral (first-order absorption): `(F·D·KA/V1)·Σ c·B(λ, KA, t)` over the disposition
-/// modes, the Bateman function one smooth function through `KA = λ` ([`bateman`]).
+/// modes, the Bateman function one smooth function through `KA = λ` (`bateman`).
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_oral_g<T: PkNum>(
     amt: f64,
@@ -369,7 +369,7 @@ pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &Thr
 }
 
 /// 3-cpt oral at steady state: `(F·D·KA/V1)·Σ c·B_ss(λ, KA, t)`, smooth through `KA = λ`
-/// ([`bateman_ss`]).
+/// (`bateman_ss`).
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_oral_ss_g<T: PkNum>(
     amt: f64,

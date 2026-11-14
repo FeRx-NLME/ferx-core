@@ -1542,6 +1542,39 @@ fn addl_implied_lag_subject(model: &CompiledModel, tv: bool) -> Subject {
     s
 }
 
+/// The implied dose (`doses[1]`) of `s` carries its parent's lag in slot `lag`, **and** that
+/// differs from the governing record's (#1909, #2367). The governing value is computed, not
+/// assumed: on a twin whose dose 1 is an ordinary dose (no parent), the same snapshot
+/// builder reads dose 1's lag at its own inputs — the governing record's, which is what the
+/// implied dose read before the copy. So the pair straddles the copy under the old
+/// behaviour: dropping the copy fails the first assertion, and a fixture edit that made the
+/// two lags equal fails the second.
+fn assert_implied_lag_is_the_parents(
+    model: &CompiledModel,
+    s: &Subject,
+    theta: &[f64],
+    lag: usize,
+    label: &str,
+) {
+    let mut dose = Vec::new();
+    crate::pk::compute_dose_pk_params_into(model, s, theta, &[0.0, 0.0], &mut dose);
+    let parent = dose[0].values[lag];
+    assert_eq!(
+        dose[1].values[lag], parent,
+        "{label}: the implied dose takes the parent's lag"
+    );
+    let mut own = s.clone();
+    own.doses[1].implied = None;
+    let mut own_dose = Vec::new();
+    crate::pk::compute_dose_pk_params_into(model, &own, theta, &[0.0, 0.0], &mut own_dose);
+    let governing = own_dose[1].values[lag];
+    assert!(
+        governing.is_finite() && (governing - parent).abs() > 0.1 * parent.abs(),
+        "{label}: the governing record's lag {governing} must differ from the parent's \
+         {parent}, or the copy assertion cannot fail"
+    );
+}
+
 #[test]
 fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
     // (ODE, IOV, time-varying X, bound): one row per seeder that copies the lag — the
@@ -1569,10 +1602,60 @@ fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
         if !iov {
             // The copy is live: the parent's lag is half the governing record's.
             let lag = model.active_dose_attr_map().lag_slot(1);
-            let mut dose = Vec::new();
             let theta = &model.default_params.theta;
-            crate::pk::compute_dose_pk_params_into(&model, &s, theta, &[0.0, 0.0], &mut dose);
-            assert_eq!(dose[1].values[lag], dose[0].values[lag], "{label}");
+            assert_implied_lag_is_the_parents(&model, &s, theta, lag, &label);
+            let params = moved_params(&model);
+            let (gf, gl) = objective_gaps(&model, &s, &params, &[0.1, -0.05]);
+            assert!(
+                gf < 1e-10 && gl < 1e-10,
+                "{label}: kernel vs production {gf:.2e}, {gl:.2e}"
+            );
+        }
+        let worst = parity(&model, &s);
+        eprintln!("addl implied lag ({label}) vs reconverged FD {worst:.2e}");
+        assert!(
+            worst < bound,
+            "{label}: worst relative difference {worst:.2e}"
+        );
+    }
+}
+
+/// [`addl_lag_src`]'s ODE model with the lag written as the route's own (#2367): the dose
+/// into central is absorbed by `first_order(ka=KA, lag=LAGR)`, with no compartment lag.
+fn addl_route_lag_src(iov: bool) -> String {
+    addl_lag_src(true, iov)
+        .replace("LAGTIME =", "LAGR =")
+        .replace(
+            "ode(states=[depot, central])\n[odes]\n  d/dt(depot) = -KA * depot\n  \
+             d/dt(central) = KA * depot - (CL/V) * central",
+            "ode(states=[central])\n[odes]\n  \
+             d/dt(central) = first_order(ka=KA, lag=LAGR) - (CL/V) * central",
+        )
+}
+
+#[test]
+fn an_addl_implied_dose_route_lag_from_its_parent_matches_reconverged_fd() {
+    // (IOV, time-varying X, bound): the ODE rows of the test above, with the lag on the
+    // route. Measured vs reconverged FD on macOS arm64: 2.6e-7, 2.7e-7 and 2.1e-7. Each
+    // bound is 5× that. If the walks' seed vectors do not copy the route lag while the
+    // predictor's snapshots do, the gaps are 52, 1.1 and 2.0.
+    let cases = [
+        (false, true, 1.3e-6),
+        (true, true, 1.4e-6),
+        (true, false, 1.1e-6),
+    ];
+    for (iov, tv, bound) in cases {
+        let label = format!("route lag, iov {iov}, tv {tv}");
+        let src = addl_route_lag_src(iov);
+        let model = with_tol(parse_model_string(&src).unwrap(), 1e-8, 1e-10);
+        let ode = model.ode_spec.as_ref().expect("ode model");
+        assert!(ode.n_states == 1 && !model.has_lagtime(), "{label}: {src}");
+        let lag = ode.input_rate[0].lag_slot.expect("a lagged route");
+        let s = addl_implied_lag_subject(&model, tv);
+        if !iov {
+            // The copy is live: the parent's route lag is half the governing record's.
+            let theta = &model.default_params.theta;
+            assert_implied_lag_is_the_parents(&model, &s, theta, lag, &label);
             let params = moved_params(&model);
             let (gf, gl) = objective_gaps(&model, &s, &params, &[0.1, -0.05]);
             assert!(
@@ -3597,6 +3680,72 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
     }
     let w = outer_fd_fallback_warning(&one, &population, &log).expect("the salvage is reported");
     assert!(w.contains("used fixed-EBE outer gradients"), "{w}");
+}
+
+/// #2713: a FOCEI gradient declined at its mode system says so. Off the mode, on a grid
+/// point where the exact `H` is indefinite (`laplace_serves_the_prior_precision_anchor_fallback`'s
+/// search), `mode_solve` declines and the pass sets `mode_system_declined`, with the mode
+/// response asked for too. The straddle: at the EBE the same subject is served, and the
+/// flag left on the reused `ModeOut` is cleared. Mutations that redden it: dropping the
+/// flag in `run`, or not resetting it at the start of a pass.
+#[test]
+fn a_mode_system_decline_is_named() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &one.default_params;
+    let x = pack_params(params);
+    let pt = PackedPoint::new(params, &x).expect("packed point");
+    let grid = [-2.5, -1.5, -0.75, 0.75, 1.5, 2.5];
+    let mut points = Vec::new();
+    for &a in &grid {
+        for &b in &grid {
+            for &c in &grid {
+                points.push([a, b, c]);
+            }
+        }
+    }
+    let eta = points
+        .into_iter()
+        .find(|e| {
+            exact_inner_hessian(&one, &s, params, e)
+                .expect("recorded")
+                .cholesky()
+                .is_none()
+        })
+        .expect("a point where the exact H is indefinite");
+    let ebe = find_ebe(&one, &s, params, 500, 1e-11, None, None, 0).eta;
+    for want_dx in [false, true] {
+        let mut out = ModeOut {
+            want_dx,
+            ..ModeOut::default()
+        };
+        let g =
+            subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
+        assert!(
+            g.is_none() && out.mode_system_declined,
+            "want_dx = {want_dx}: off the mode, H indefinite must decline at the mode system"
+        );
+        let g = subject_adjoint_gradient_and_mode_at(
+            &one,
+            &s,
+            &pt,
+            ebe.as_slice(),
+            Objective::Focei,
+            &mut out,
+        );
+        assert!(
+            g.is_some() && !out.mode_system_declined,
+            "want_dx = {want_dx}: the EBE is served, and the reused flag is cleared"
+        );
+    }
 }
 
 #[test]
@@ -8842,6 +8991,7 @@ fn sde_per_row_inner_gradients_match_fd_of_the_production_objective() {
             w.max((g[a] - fd[a]).abs() / (1.0 + fd[a].abs()))
         });
         eprintln!("sde {name}: per-row inner gradient vs FD {w:.3e}");
+        assert!(w.is_finite(), "{name}: {w}");
         worst = worst.max(w);
         if name == "diagonal" {
             let mut value = None;
@@ -8908,6 +9058,7 @@ fn sde_per_row_inner_gradients_match_fd_of_the_production_objective() {
         w.max((g[a] - fd).abs() / (1.0 + fd.abs()))
     });
     eprintln!("sde iov: per-row inner gradient vs FD {w:.3e}");
+    assert!(w.is_finite(), "iov: {w}");
     worst = worst.max(w);
     // Measured 1.1e-10 (diagonal), 1.1e-10 (dense), 1.6e-10 (IOV): the differences' own error.
     assert!(worst < 2e-9, "{worst:.2e}");
@@ -8956,6 +9107,7 @@ fn sde_fixed_eta_scores_match_fd() {
         a[k] += st;
         b[k] -= st;
         let fd = (l(&a, &p.sigma.values, &eta) - l(&b, &p.sigma.values, &eta)) / (2.0 * st);
+        assert!(dt[k].is_finite() && fd.is_finite(), "theta {k}");
         worst = worst.max((dt[k] - fd).abs() / (1.0 + fd.abs()));
     }
     for k in 0..p.sigma.values.len() {
@@ -8964,6 +9116,7 @@ fn sde_fixed_eta_scores_match_fd() {
         a[k] += st;
         b[k] -= st;
         let fd = (l(&p.theta, &a, &eta) - l(&p.theta, &b, &eta)) / (2.0 * st);
+        assert!(ds[k].is_finite() && fd.is_finite(), "sigma {k}");
         worst = worst.max((ds[k] - fd).abs() / (1.0 + fd.abs()));
     }
     let g = fixed_theta_data_eta_grad(&model, &s, &p.theta, &p.sigma.values, &eta).expect("served");
@@ -8975,6 +9128,7 @@ fn sde_fixed_eta_scores_match_fd() {
         b[k] -= st;
         let fd = (l(&p.theta, &p.sigma.values, &a) - l(&p.theta, &p.sigma.values, &b)) / (2.0 * st)
             - prior[k];
+        assert!(g[k].is_finite() && fd.is_finite(), "eta {k}");
         worst = worst.max((g[k] - fd).abs() / (1.0 + fd.abs()));
     }
     eprintln!("sde fixed-eta scores worst {worst:.3e}");
@@ -9369,4 +9523,465 @@ fn templates_in_one_hash_bucket_are_told_apart_by_their_content() {
     let (n, k) = templated_twin(&cf, &a, &other_data(&a));
     assert!(k > 0 && k == n, "the twin is templated: {k} of {n}");
     kj::COLLIDE.with(|c| c.set(false));
+}
+
+// ---- value-only objective through the plan (#2786, A1/A2) ---------------------------------
+
+/// The Michaelis–Menten (nonlinear) ODE of the fit benchmarks: no exact linear path, so its
+/// plan drives a solver loop.
+const MM_ODE: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(40.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TVKM(5.0, 0.0, 100.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V ~ 0.15
+  omega ETA_KA ~ 0.20
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  KM = TVKM
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - ((CL * KM / (KM + central / V)) / V) * central
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The plan's value-only predictions at several `eta` against the native predictor's, bit for
+/// bit; returns whether the plan served every point (`plan_values`). `native` is the
+/// production predictor at `(theta, eta)`.
+fn plan_values_vs_native(
+    model: &CompiledModel,
+    s: &Subject,
+    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
+    etas: &[Vec<f64>],
+    native: &dyn Fn(&[f64]) -> Vec<f64>,
+) -> bool {
+    let (served, worst) = plan_values_ulps(model, s, layout, etas, native);
+    assert_eq!(worst, 0, "plan and native differ by {worst} ulp");
+    served
+}
+
+/// [`plan_values_vs_native`]'s measurement: whether the plan served every point, and the
+/// largest gap in ulps over every served row (a NaN or infinite row is a failure here).
+fn plan_values_ulps(
+    model: &CompiledModel,
+    s: &Subject,
+    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
+    etas: &[Vec<f64>],
+    native: &dyn Fn(&[f64]) -> Vec<f64>,
+) -> (bool, i64) {
+    let theta = &moved_params(model).theta;
+    let (mut served, mut worst) = (true, 0i64);
+    for eta in etas {
+        let mut got = Vec::new();
+        let ok = plan_values(model, s, layout, theta, eta, &mut got);
+        served &= ok;
+        if !ok {
+            continue;
+        }
+        let want = native(eta);
+        assert_eq!(got.len(), want.len());
+        for (j, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert!(a.is_finite() && b.is_finite(), "row {j}: {a} vs {b}");
+            worst = worst.max((a.to_bits() as i64 - b.to_bits() as i64).abs()); // nan-ok: integer ULP distance, no NaN
+        }
+    }
+    (served, worst)
+}
+
+fn multidose_subject(model: &CompiledModel, times: &[f64], n_eta: usize) -> Subject {
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    subject(model, doses, times, &vec![0.05; n_eta])
+}
+
+/// Which model classes the plan's value pass serves, and that where it serves it is the native
+/// predictor's bits (multi-dose subjects, so a later dose lands on residual drug): a closed form
+/// and a closed-form IOV subject with κ ≠ 0 are bit-equal; every `[odes]` model stays native
+/// (`plan_values` declines it) — a linear system's recorded matrix exponential measured 1–2 ulp
+/// off the native path, a nonlinear one's values differ more, and a linear one forced onto RK45
+/// drives a solver loop. The objective's route (`plan_value_route`) is the closed forms.
+#[test]
+fn plan_values_are_bit_equal_to_the_native_predictor() {
+    use crate::stats::likelihood::plan_value_route;
+    let etas3 = vec![
+        vec![0.0, 0.0, 0.0],
+        vec![0.1, -0.05, 0.08],
+        vec![-0.2, 0.15, -0.1],
+    ];
+    let times = [0.5, 1.0, 3.0, 12.6, 13.0, 18.0, 30.0];
+    // Closed form: bit-equal and routed.
+    let cf = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = multidose_subject(&cf, &TIMES, 3);
+    let theta = moved_params(&cf).theta;
+    let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&cf, &s, &theta, e);
+    assert!(
+        plan_values_vs_native(&cf, &s, None, &etas3, &native),
+        "closed form served"
+    );
+    assert!(plan_value_route(&cf));
+    // A linear `[odes]` model is served and routed (bit-equal; its shapes are pinned by
+    // `linear_ode_plan_values_are_bit_equal_to_the_native_predictor`); a nonlinear one and a
+    // linear one forced onto RK45 drive a solver loop, so the plan declines and they are not routed.
+    let mut rk = parse_model_string(&lin_3state()).unwrap();
+    rk.ode_spec.as_mut().unwrap().solver_opts.method = crate::ode::OdeMethod::Rk45;
+    for (label, src, served) in [
+        ("linear", parse_model_string(&lin_3state()).unwrap(), true),
+        ("rk45", rk, false),
+        ("mm", parse_model_string(MM_ODE).unwrap(), false),
+    ] {
+        let s = multidose_subject(&src, &times, if label == "mm" { 3 } else { 2 });
+        let theta = moved_params(&src).theta;
+        let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&src, &s, &theta, e);
+        let etas = if label == "mm" {
+            etas3.clone()
+        } else {
+            vec![vec![0.0; 2], vec![0.1, -0.05]]
+        };
+        assert_eq!(
+            plan_values_vs_native(&src, &s, None, &etas, &native),
+            served,
+            "{label} served: {served}"
+        );
+        assert_eq!(plan_value_route(&src), served, "{label} routed: {served}");
+    }
+    // The lagged linear model is not routed whatever the plan serves.
+    assert!(!plan_value_route(
+        &parse_model_string(TWOCPT_DEPOT_LINEAR_ODE).unwrap()
+    ));
+    // IOV: stacked [η, κ₁, κ₂, κ₃], κ ≠ 0, doses landing on residual drug across occasions.
+    for (src, served) in [(CF_IOV, true), (ODE_IOV, true)] {
+        let m = parse_model_string(src).unwrap();
+        let s = iov_subject(&m);
+        let lay = crate::stats::stacked_layout::StackedLayout::sens_of(&m, &s).unwrap();
+        let theta = moved_params(&m).theta;
+        let stacked = vec![0.1, -0.05, 0.1, -0.05, -0.08, 0.04, 0.05, 0.06];
+        let native = |e: &[f64]| {
+            let k = vec![e[2..4].to_vec(), e[4..6].to_vec(), e[6..8].to_vec()];
+            crate::pk::predict_iov(&m, &s, &theta, &e[..2], &k)
+        };
+        let etas = vec![stacked, vec![0.0; 8]];
+        assert_eq!(
+            plan_values_vs_native(&m, &s, Some(&lay), &etas, &native),
+            served,
+            "IOV model served: {served}"
+        );
+        assert_eq!(plan_value_route(&m), served);
+    }
+}
+
+/// The IOV objective scores the plan's values: its value is the same bits as with the plan
+/// declined (a recording open on this thread makes `plan_values` decline, so the native walk
+/// answers), and the plan did serve the first.
+#[test]
+fn the_iov_objective_scores_plan_values_and_falls_back_to_native() {
+    let m = parse_model_string(CF_IOV).unwrap();
+    let s = iov_subject(&m);
+    let params = moved_params(&m);
+    let kappas = vec![vec![0.1, -0.05], vec![-0.08, 0.04], vec![0.05, 0.06]];
+    let score = || {
+        crate::stats::likelihood::individual_nll_iov(
+            &m,
+            &s,
+            &params.theta,
+            &[0.1, -0.05],
+            &kappas,
+            &params.omega,
+            params.omega_iov.as_ref(),
+            &params.sigma.values,
+        )
+    };
+    let runs = kj_fwd::value_runs();
+    let via_plan = score();
+    assert!(
+        kj_fwd::value_runs() > runs,
+        "the plan served the value pass"
+    );
+    kj_fwd::begin();
+    let native = score();
+    let _ = kj_fwd::end(None);
+    assert!(via_plan.is_finite());
+    assert_eq!(via_plan.to_bits(), native.to_bits());
+}
+
+/// The outer gradient reads the forward the subject's inner solve ended on instead of running
+/// the plan again at `η̂` (A5): adopted exactly once (a counter), the gradient is the same bits
+/// as the one from a fresh forward, and a plan that drives a solver loop (no run logs kept) or a
+/// point off the kept one (`θ` moved a ulp) is not adopted.
+#[test]
+fn the_outer_gradient_adopts_the_inner_solves_last_forward_bitwise() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let lin = parse_model_string(TWOCPT_DEPOT_LINEAR_ODE).unwrap();
+    let s = multidose_subject(&lin, &[0.5, 1.0, 3.0, 12.6, 13.0, 18.0, 30.0], 3);
+    let template = moved_params(&lin);
+    let x = pack_params(&template);
+    // The point the outer gradient unpacks, which is the one the fit's inner solve ran at.
+    let params = unpack_params(&x, &template);
+    let gradient = |eta: &[f64]| {
+        subject_adjoint_gradient(&lin, &s, &template, &x, eta, Objective::Focei).expect("served")
+    };
+    let eta = ebe_for(&lin, &s, &params, 1e-10, true);
+    let before = kj::adopts();
+    let adopted = gradient(eta.as_slice());
+    assert_eq!(kj::adopts(), before + 1, "the kept forward is adopted");
+    // Taken: the second gradient at the same point runs the forward.
+    let fresh = gradient(eta.as_slice());
+    assert_eq!(kj::adopts(), before + 1, "a kept forward is read once");
+    assert_eq!(adopted.len(), fresh.len());
+    for (i, (a, b)) in adopted.iter().zip(&fresh).enumerate() {
+        assert!(a.is_finite() && b.is_finite());
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "coordinate {i}: adopted {a} fresh {b}"
+        );
+    }
+    // A point off the kept one (η̂ a ulp away) is not the kept forward.
+    let _ = ebe_for(&lin, &s, &params, 1e-10, true);
+    let mut off = eta.clone();
+    off[0] = f64::from_bits(off[0].to_bits() + 1);
+    let _ = gradient(off.as_slice());
+    assert_eq!(kj::adopts(), before + 1, "a different η̂ is not adopted");
+    // A solver-loop plan keeps no run logs, so its forward is never kept.
+    let mm = parse_model_string(MM_ODE).unwrap();
+    let sm = multidose_subject(&mm, &TIMES, 3);
+    let tm = moved_params(&mm);
+    let xm = pack_params(&tm);
+    let pm = unpack_params(&xm, &tm);
+    let em = ebe_for(&mm, &sm, &pm, 1e-10, true);
+    let b = kj::adopts();
+    subject_adjoint_gradient(&mm, &sm, &tm, &xm, em.as_slice(), Objective::Focei).expect("served");
+    assert_eq!(kj::adopts(), b, "a loop plan is not adopted");
+}
+
+/// Every closed-form class the objective's plan route serves is the native predictor's bits:
+/// multi-dose, LTBS, a bolus and an infusion on a two-compartment model with a correlated block,
+/// a time-varying covariate, an estimated bioavailability under a rate-defined dose, and a
+/// steady-state dose, each at η = 0 and at two moved points. The lagged models are the straddle:
+/// the plan serves them but a few ulp off the native walk, so they are not routed.
+#[test]
+fn plan_values_are_bit_equal_across_the_closed_form_classes() {
+    let dose = |t, amt, cmt, rate, ss, ii| DoseEvent::new(t, amt, cmt, rate, ss, ii);
+    let two = vec![
+        dose(0.0, 100.0, 1, 0.0, false, 0.0),
+        dose(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let infusion = vec![
+        dose(0.0, 100.0, 1, 20.0, false, 0.0),
+        dose(8.0, 100.0, 1, 20.0, false, 0.0),
+    ];
+    let steady = vec![
+        dose(0.0, 100.0, 1, 0.0, true, 12.0),
+        dose(24.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [0.5, 1.0, 3.0, 12.6, 13.0, 18.0, 30.0];
+    let lag_only =
+        ONE_CPT_ORAL_LAG_LTBS.replace("log(DV) ~ additive(ADD_ERR)", "DV ~ additive(ADD_ERR)");
+    let ltbs_only = ONE_CPT_ORAL.replace(
+        "DV ~ proportional(PROP_ERR)",
+        "log(DV) ~ additive(PROP_ERR)",
+    );
+    let cases: Vec<(&str, &str, Option<Vec<DoseEvent>>, bool)> = vec![
+        ("oral", ONE_CPT_ORAL, Some(two.clone()), true),
+        ("lag+ltbs", ONE_CPT_ORAL_LAG_LTBS, Some(two.clone()), false),
+        ("lag", &lag_only, Some(two.clone()), false),
+        ("ltbs", &ltbs_only, Some(two.clone()), true),
+        ("2cpt bolus", TWO_CPT_IV_COMBINED, Some(two.clone()), true),
+        (
+            "2cpt infusion",
+            TWO_CPT_IV_COMBINED,
+            Some(infusion.clone()),
+            true,
+        ),
+        ("tv covariate", CF_TVCOV, None, true),
+        ("F + rate", CF_ORAL_F, Some(infusion), true),
+        ("steady state", ONE_CPT_ORAL, Some(steady), true),
+    ];
+    for (label, src, doses, routed) in cases {
+        let m = parse_model_string(src).unwrap();
+        let n = m.n_eta;
+        let s = match doses {
+            Some(d) => subject(&m, d, &times, &vec![0.05; n]),
+            None => cf_tvcov_subject(&m),
+        };
+        let theta = moved_params(&m).theta;
+        let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&m, &s, &theta, e);
+        let etas = vec![
+            vec![0.0; n],
+            vec![0.1; n],
+            (0..n).map(|k| 0.15 - 0.1 * k as f64).collect(),
+        ];
+        let (served, worst) = plan_values_ulps(&m, &s, None, &etas, &native);
+        if routed {
+            assert!(
+                served && worst == 0,
+                "{label}: served {served}, {worst} ulp"
+            );
+        } else {
+            // The straddle: the lagged models are served by the plan but not bit-equal, so the
+            // route must keep them native.
+            assert!(worst > 0, "{label}: {worst} ulp; route it if it is equal");
+            assert!(!crate::stats::likelihood::plan_value_route(&m));
+        }
+    }
+}
+
+// ---- linear `[odes]` plan values are the native path's bits (#2786) -----------------------
+
+const LIN_1STATE: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.06
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV * exp(ETA_V)
+[structural_model]
+  ode(states=[central])
+[odes]
+  d/dt(central) = -(CL/V) * central
+[scaling]
+  y = central / V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// [`TWOCPT_DEPOT_LINEAR_ODE`] without the lagtime (a lagged model is not routed).
+fn lin_3state() -> String {
+    TWOCPT_DEPOT_LINEAR_ODE
+        .replace("  theta TVLAG(0.4, 0.01, 5.0)\n", "")
+        .replace("  omega ETA_LAG ~ 0.05\n", "")
+        .replace("  LAGTIME = TVLAG * exp(ETA_LAG)\n", "")
+}
+
+/// The plan's value-only predictions of every linear `[odes]` shape (1-, 2-, 3-state, infusion,
+/// multi-dose, a time-varying covariate, IOV) against the native predictor's bits, at η = 0 and
+/// at moved points, on the spectral path and on the Padé path.
+#[test]
+fn linear_ode_plan_values_are_bit_equal_to_the_native_predictor() {
+    use crate::ode::linear::{SPECTRAL_HITS, SPECTRAL_OFF};
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let times = [0.5, 1.0, 3.0, 12.6, 13.0, 18.0, 30.0];
+    let bolus = |cmt: usize| {
+        vec![
+            DoseEvent::new(0.0, 100.0, cmt, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, cmt, 0.0, false, 0.0),
+        ]
+    };
+    let infusion = vec![
+        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(8.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(16.0, 100.0, 1, 50.0, false, 0.0),
+    ];
+    let wt_at = |t: f64| 60.0 + 1.5 * t;
+    let mut cases: Vec<(&str, CompiledModel, Subject, usize)> = Vec::new();
+    let m = parse_model_string(LIN_1STATE).unwrap();
+    let s = multidose_subject(&m, &times, 2);
+    cases.push(("1-state", m, s, 2));
+    let m = parse_model_string(ONE_CPT_ORAL_ODE).unwrap();
+    let s = multidose_subject(&m, &times, 2);
+    cases.push(("2-state", m, s, 2));
+    let m = parse_model_string(&lin_3state()).unwrap();
+    let s = multidose_subject(&m, &times, 2);
+    cases.push(("3-state", m, s, 2));
+    let m = parse_model_string(TWO_CPT_INF_COMBINED_BLOCK).unwrap();
+    let s = subject(
+        &m,
+        infusion,
+        &[1.0, 2.0, 4.0, 7.9, 9.0, 12.0, 17.0, 20.0, 30.0],
+        &[0.05; 3],
+    );
+    cases.push(("infusion", m, s, 3));
+    let m = parse_model_string(ODE_TVCOV).unwrap();
+    let mut s = subject_shell(bolus(1), &times);
+    s.covariates.insert("WT".into(), 70.0);
+    s.obs_covariates = times
+        .iter()
+        .map(|&t| HashMap::from([("WT".to_string(), wt_at(t))]))
+        .collect();
+    s.dose_covariates = [0.0, 12.0]
+        .iter()
+        .map(|&t| HashMap::from([("WT".to_string(), wt_at(t))]))
+        .collect();
+    cases.push(("tvcov", m, s, 2));
+    for pade in [false, true] {
+        SPECTRAL_OFF.with(|c| c.set(pade));
+        // A plan recorded under the other propagation would serve this one's points.
+        kj::reset();
+        for (label, m, s, ne) in &cases {
+            let theta = moved_params(m).theta;
+            let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(m, s, &theta, e);
+            let etas: Vec<Vec<f64>> = vec![
+                vec![0.0; *ne],
+                (0..*ne).map(|i| 0.1 - 0.07 * i as f64).collect(),
+                (0..*ne).map(|i| -0.2 + 0.11 * i as f64).collect(),
+            ];
+            let hits = SPECTRAL_HITS.with(|c| c.get());
+            let (served, worst) = plan_values_ulps(m, s, None, &etas, &native);
+            let hits = SPECTRAL_HITS.with(|c| c.get()) - hits;
+            eprintln!(
+                "{label} pade={pade}: served {served} worst {worst} ulp (spectral segments {hits})"
+            );
+            // Forced onto Padé the plan is not a straight-line chunk and declines; the native
+            // walk then answers (bit-equal by construction), which is the safe outcome.
+            assert!(served || pade, "{label} pade={pade}: plan serves");
+            assert_eq!(worst, 0, "{label} pade={pade}: {worst} ulp");
+        }
+    }
+    SPECTRAL_OFF.with(|c| c.set(false));
+    // KA = CL/V exactly and within the spectral gap bound (1e-4): the native path takes Padé
+    // there, so a plan recorded on the spectral path must decline (its guard on the analysis's
+    // verdict fails) rather than serve a spectral value; where it serves, it is the native bits.
+    kj::reset();
+    let (_, m, s, _) = &cases[1];
+    let theta = moved_params(m).theta;
+    let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(m, s, &theta, e);
+    let r = (theta[2] * theta[1] / theta[0]).ln();
+    let mut served_near = Vec::new();
+    for eta in [
+        [0.0, 0.0],
+        [0.1, -0.05],
+        [r, 0.0],
+        [r + 3e-5, 0.0],
+        [r + 1e-3, 0.0],
+    ] {
+        let (served, worst) = plan_values_ulps(m, s, None, &[eta.to_vec()], &native);
+        eprintln!("near-repeat {eta:?}: served {served} worst {worst} ulp");
+        assert_eq!(worst, 0, "near-repeat {eta:?}: {worst} ulp");
+        served_near.push(served);
+    }
+    assert!(
+        served_near[0] && served_near[1],
+        "the well-separated points are served"
+    );
+    // IOV: stacked [η, κ₁, κ₂, κ₃].
+    let m = parse_model_string(ODE_IOV).unwrap();
+    let s = iov_subject(&m);
+    let lay = crate::stats::stacked_layout::StackedLayout::sens_of(&m, &s).unwrap();
+    let theta = moved_params(&m).theta;
+    let native = |e: &[f64]| {
+        let k = vec![e[2..4].to_vec(), e[4..6].to_vec(), e[6..8].to_vec()];
+        crate::pk::predict_iov(&m, &s, &theta, &e[..2], &k)
+    };
+    let etas = vec![
+        vec![0.1, -0.05, 0.1, -0.05, -0.08, 0.04, 0.05, 0.06],
+        vec![0.0; 8],
+    ];
+    let (served, worst) = plan_values_ulps(&m, &s, Some(&lay), &etas, &native);
+    eprintln!("iov: served {served} worst {worst} ulp");
+    assert!(served, "iov: plan serves");
+    assert_eq!(worst, 0, "iov: {worst} ulp");
 }

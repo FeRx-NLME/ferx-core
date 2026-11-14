@@ -129,7 +129,7 @@ impl HostFn {
 }
 
 /// A scalar function given by its own jet: value and first four derivatives at a point
-/// ([`JetFn::jet`]). A recording type (#2786) records `f(x)` as one primitive whose `k`-th
+/// (`JetFn::jet`). A recording type (#2786) records `f(x)` as one primitive whose `k`-th
 /// derivative is the jet's entry `k`; every other type lifts the jet ([`PkNum::jet_unary`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum JetFn {
@@ -1242,6 +1242,53 @@ mod tests {
     fn pknum_all_methods_covered_for_each_impl() {
         exercise::<f64>(0.7);
         exercise::<Dual2<1>>(Dual2::var(0.7, 0));
+    }
+
+    /// `sqrt` at a zero argument — `0.0`, `-0.0`, a rounded-negative `-1e-18`, each raw and
+    /// through the bytecode VM's `guard_floor(0.0)` — is flat on **every** `PkNum` type: a
+    /// constant with a finite, zero jet (#2892). A `0.5 / 0 = inf` in the chain would be `inf`
+    /// with a live tangent and `NaN` with a floored one, so which derivative engine served a
+    /// subject would depend on whether `sqrt`'s argument touched zero. Each input is seeded
+    /// *live* (a unit tangent), so the old rule shows up as a non-finite or non-constant
+    /// result; the `0.25` control straddles the gate, so an implementation that is flat
+    /// everywhere fails too. The compiled plan's recorder (`Tr`) is pinned the same way, at
+    /// the plan level, by `kernel_jit::sqrt_at_zero_is_flat_in_a_compiled_plan`.
+    #[test]
+    fn sqrt_at_zero_is_flat_on_every_pknum_type() {
+        use crate::sens::taylor::Taylor;
+
+        fn check<T: PkNum>(name: &str, mk: impl Fn(f64) -> T) {
+            for x in [0.0, -0.0, -1e-18] {
+                for floored in [false, true] {
+                    let a = if floored {
+                        mk(x).guard_floor(0.0)
+                    } else {
+                        mk(x)
+                    };
+                    let y = a.sqrt();
+                    assert!(
+                        y.jets_finite() && y.is_constant(),
+                        "{name}: sqrt({x:e}, floored = {floored}) is not flat \
+                         (val = {}, jets_finite = {}, constant = {})",
+                        y.val(),
+                        y.jets_finite(),
+                        y.is_constant()
+                    );
+                    if floored || x == 0.0 {
+                        assert_eq!(y.val(), 0.0, "{name}: sqrt({x:e}) value");
+                    }
+                }
+            }
+            let y = mk(0.25).sqrt();
+            assert_eq!(y.val(), 0.5, "{name}: sqrt(0.25) value");
+            assert!(
+                y.jets_finite() && !y.is_constant(),
+                "{name}: sqrt(0.25) must carry a live derivative"
+            );
+        }
+
+        check("Dual2", |x| Dual2::<1>::var(x, 0));
+        check("Taylor", |x| Taylor::<1, 2, 3>::seed(x, 0));
     }
 
     /// `guard_floor(NaN)` must floor (return `lo`) on the duals exactly as it does on

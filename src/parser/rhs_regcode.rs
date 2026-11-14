@@ -29,10 +29,11 @@
 //! values lane for lane; see `rhs_ir`'s docs for why a dead arm cannot leak into a derivative.
 //!
 //! A program with any operation whose `f64` meaning the generic primitives do not reproduce
-//! exactly (`sqrt`'s guard, `inv_logit`, `logit`, `mod`), that reads anything but its states,
-//! parameters, seeds, its own locals and literals (θ, η, covariates, gathers, network
-//! outputs, the mixture class; `TIME` is the time seed by the time a program is compiled), or
-//! that reads a local before assigning it, is not compiled and keeps the interpreter.
+//! exactly (`inv_logit`, `logit`, `tanh`, `softplus`, `sin`, `cos`, `pnorm`, `mod`), that
+//! reads anything but its states, parameters, seeds, its own locals and literals (θ, η,
+//! covariates, gathers, network outputs, the mixture class; `TIME` is the time seed by the
+//! time a program is compiled), or that reads a local before assigning it, is not compiled
+//! and keeps the interpreter. `sqrt` is translated (#2844): its guard is `apply_unary`'s.
 use super::{apply_binary_in, apply_scalar_in, apply_unary, Bytecode, Op, Statement};
 use crate::sens::num::vm::VmNum;
 use ir::Cc;
@@ -91,10 +92,14 @@ enum Unary {
     Jet(crate::sens::num::JetFn, u8),
     /// The value as a constant (`PkNum::value_only`): kernel recordings only.
     StopGrad,
-    /// `PkNum::sqrt`, unguarded. Only a kernel recording (`kernel_jit`, #2786) emits it; the
-    /// RHS compiler keeps `Op::Sqrt`'s `-0.0` guard on the interpreter, so this arm's
-    /// `Op::Sqrt` is reached by no register program the interpreter runs.
+    /// `PkNum::sqrt` as a kernel recording (`kernel_jit`, #2786) emits it: flat at a
+    /// non-positive argument, the value `√x` with zero jets and no `inf·0` for a reverse pass
+    /// to carry (#2892). A negative argument stays `NaN`, as the `f64` prediction has it.
     Sqrt,
+    /// `Op::Sqrt` as the RHS compiler emits it (#2844): the interpreter's own guard, where a
+    /// non-positive argument is the constant `±0` (a zero keeps its sign) or `+0` (negative,
+    /// `NaN`), with zero jets.
+    SqrtRhs,
     /// `PkNum::inv_logit`, `logit`, `cos`, `acos` (unguarded): kernel recordings only.
     InvLogit,
     Logit,
@@ -112,7 +117,7 @@ impl Unary {
         match self {
             Unary::Exp => Op::Exp,
             Unary::Ln => Op::Ln,
-            Unary::Sqrt => Op::Sqrt,
+            Unary::Sqrt | Unary::SqrtRhs => Op::Sqrt,
             Unary::InvLogit => Op::InvLogit,
             Unary::Logit => Op::Logit,
             Unary::Cos => Op::Cos,
@@ -1071,7 +1076,6 @@ pub(crate) fn rhs_route_note(
 /// [`Builder::expr`] translates.
 fn refused_construct(op: Op) -> Option<RhsConstruct> {
     Some(match op {
-        Op::Sqrt => RhsConstruct::Function("sqrt"),
         Op::InvLogit => RhsConstruct::Function("inv_logit"),
         Op::Logit => RhsConstruct::Function("logit"),
         Op::Tanh => RhsConstruct::Function("tanh"),
@@ -1110,6 +1114,7 @@ fn refused_construct(op: Op) -> Option<RhsConstruct> {
         | Op::Pow
         | Op::Exp
         | Op::Ln
+        | Op::Sqrt
         | Op::Abs
         | Op::Floor
         | Op::Ceil
@@ -1131,23 +1136,16 @@ pub(crate) struct HoistCache {
 #[derive(Clone, Copy)]
 pub(crate) struct NativeF64<'a>(jit::Resolved<'a, (jit::PrepFn, jit::MainFn)>);
 
+/// The native `main` function of [`NativeF64`]: `(u, params, seeds, du, cache)`.
+pub(crate) type NativeMain =
+    unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64, *const f64);
+
 impl NativeF64<'_> {
-    /// [`RhsRegProgram::try_native`] at `f64`, bit for bit: `true` when it ran (and wrote
-    /// `du`), `false` with nothing written when a slice is shorter than the program reads.
+    /// The parameter-only values in `cache` for `params`: recomputed unless the key says they
+    /// are these parameters' already. `fits` covers `params`.
     #[inline(always)]
-    pub(crate) fn run(
-        &self,
-        u: &[f64],
-        params: &[f64],
-        seeds: &[f64; 4],
-        du: &mut [f64],
-        cache: &mut HoistCache,
-    ) -> bool {
+    fn fill(&self, params: &[f64], seeds: &[f64; 4], cache: &mut HoistCache) {
         let pair = &self.0;
-        if !pair.fits(u.len(), params.len(), du.len()) {
-            return false;
-        }
-        // `fits` covers every slot the program loads.
         let slots = pair.param_slots();
         let fresh = cache.key.len() == slots.len() + 1
             && slots
@@ -1163,9 +1161,46 @@ impl NativeF64<'_> {
             cache.key.push(seeds[3].to_bits());
             cache.vals.clear();
             cache.vals.resize(pair.cache_len(), 0.0);
-            // SAFETY: `fits` checked `params`; `cache` holds `cache_len` values.
+            // SAFETY: the caller checked `fits`; `cache` holds `cache_len` values.
             unsafe { pair.prep(params.as_ptr(), seeds.as_ptr(), cache.vals.as_mut_ptr()) };
         }
+    }
+
+    /// The `main` function and its filled cache for a caller that makes many calls at these
+    /// `params` itself ([`Self::run`] without its per-call checks): `None` when a slice of
+    /// `u_len` / `params.len()` / `du_len` is shorter than the program reads. Each call is then
+    /// `main(u, params, seeds, du, cache)`, valid while `params` is unchanged and the cache is
+    /// not refilled for other parameters.
+    pub(crate) fn main_call(
+        &self,
+        (u_len, du_len): (usize, usize),
+        params: &[f64],
+        seeds: &[f64; 4],
+        cache: &mut HoistCache,
+    ) -> Option<(NativeMain, *const f64)> {
+        if !self.0.fits(u_len, params.len(), du_len) {
+            return None;
+        }
+        self.fill(params, seeds, cache);
+        Some((self.0.main_fn(), cache.vals.as_ptr()))
+    }
+
+    /// [`RhsRegProgram::try_native`] at `f64`, bit for bit: `true` when it ran (and wrote
+    /// `du`), `false` with nothing written when a slice is shorter than the program reads.
+    #[inline(always)]
+    pub(crate) fn run(
+        &self,
+        u: &[f64],
+        params: &[f64],
+        seeds: &[f64; 4],
+        du: &mut [f64],
+        cache: &mut HoistCache,
+    ) -> bool {
+        let pair = &self.0;
+        if !pair.fits(u.len(), params.len(), du.len()) {
+            return false;
+        }
+        self.fill(params, seeds, cache);
         // SAFETY: `fits` checked the slices, and the key says `cache` was filled from
         // these parameters.
         unsafe {
@@ -2131,12 +2166,16 @@ impl Builder {
                 self.ins.push(Ins::Pow { dst, a, e });
                 stack.push(Src::Tmp(dst));
             }
-            (op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round), _) => {
+            (
+                op @ (Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::Floor | Op::Ceil | Op::Round),
+                _,
+            ) => {
                 let a = stack.pop().ok_or(SHAPE)?;
                 let dst = self.tmp().ok_or(SHAPE)?;
                 let op = match op {
                     Op::Exp => Unary::Exp,
                     Op::Ln => Unary::Ln,
+                    Op::Sqrt => Unary::SqrtRhs,
                     Op::Abs => Unary::Abs,
                     Op::Floor => Unary::Floor,
                     Op::Ceil => Unary::Ceil,
@@ -2187,8 +2226,8 @@ impl Builder {
             // `compile_expr_into` gives an `if` (`conditional` consumes the one it emits), the
             // reads the RHS is not handed (θ, η, covariates, gathers, network outputs, the
             // mixture class), an out-of-range variable, and the ops whose `f64` meaning the
-            // generic primitives do not reproduce bit for bit (`Sqrt`'s `-0.0` guard,
-            // `InvLogit`, `Logit`, `Tanh`, `Softplus`, `Sin`, `Cos`, `Pnorm`, `Mod`). Listed one by one: a new `Op`
+            // generic primitives do not reproduce bit for bit (`InvLogit`, `Logit`, `Tanh`,
+            // `Softplus`, `Sin`, `Cos`, `Pnorm`, `Mod`). Listed one by one: a new `Op`
             // must be decided here, not swallowed by a wildcard.
             (
                 Op::PushVar(_)
@@ -2199,7 +2238,6 @@ impl Builder {
                 | Op::PushMixNum
                 | Op::PushNnOutput(_, _)
                 | Op::PushThetaGather(_)
-                | Op::Sqrt
                 | Op::InvLogit
                 | Op::Logit
                 | Op::Tanh
@@ -2226,8 +2264,8 @@ impl Builder {
     /// ends one op later, the then arm runs that op too, as its path does, and both continue
     /// after it.
     ///
-    /// A construct an arm cannot translate is reported as itself (a `sqrt` in an arm is
-    /// `sqrt`); an `if` whose bytecode is not in this shape is [`RhsConstruct::InlineIf`].
+    /// A construct an arm cannot translate is reported as itself (a `tanh` in an arm is
+    /// `tanh`); an `if` whose bytecode is not in this shape is [`RhsConstruct::InlineIf`].
     fn conditional(
         &mut self,
         ops: &[Op],

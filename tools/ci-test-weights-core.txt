@@ -27,7 +27,6 @@
 29 iov_ode_algebraic_past_axis_cap
 29 wide_ode_nonmem_anchor
 27 run_covariance_fitrx_roundtrip
-25 fd_salvage_guard_fires_in_a_fit
 19 new_optimizers
 16 weighted_error_all_methods
 14 derived_output
@@ -47,7 +46,6 @@
 5 ci_test_shards
 5 theta_level_blocks
 4 iov_pk_only_nonmem_anchor
-4 outer_gradient_fd_fallback_warning
 4 saem_additive_mu_nonmem_anchor
 4 sir_proposal_identity_theta_units
 3 frem_warfarin

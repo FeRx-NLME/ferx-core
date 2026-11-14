@@ -3713,8 +3713,11 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // dose), the pre side of its crossing keeps the compartment's rate switched off
             // (`was_off`): the field jumps across the moving boundary by that one component.
             let was_off = off_states.borrow().contains(&d.cmt_idx());
+            // The turn-on itself is the function the `f64` walks call (#2811). Only it is
+            // shared: their bolus jump (`ode::predictions::land_live_arrival`) is over `f64`,
+            // and the one here is over dual numbers and sits with the lag saltation below.
             if arrival_live {
-                off_states.borrow_mut().retain(|&c| c != d.cmt_idx());
+                crate::ode::predictions::turn_on_at_live_arrival(&mut off_states.borrow_mut(), d);
             }
             // The anchor this arrival establishes, computed ONCE and used by every consumer in
             // this arm: the post side of the saltation below, and the segment the arrival opens.

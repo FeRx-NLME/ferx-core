@@ -985,6 +985,18 @@ pub(crate) struct InnerSolvePolicy {
     /// outer evaluation seeded from the flat-theta pre-flight's EBEs (#2076); `false`, the
     /// `Default`, otherwise.
     pub(crate) init_is_mode: bool,
+    /// The pass's `eta_init` are modes an earlier inner pass returned, perhaps at other
+    /// parameters, so a subject handed one is a warm start whatever its
+    /// values ([`is_warm_start`]), as under `init_is_mode`. Without it a mode that is exactly
+    /// zero — a subject with no observations, a random effect no prediction reads — is taken
+    /// for the cold placeholder at every evaluation and re-runs the guarded multi-start each
+    /// time, which cannot move it: on `examples/mm_iv.ferx` with one unused η, 920 multi-starts
+    /// in 470 solves, none of which moved an EBE. Unlike `init_is_mode` it does not say the
+    /// starts are modes *at these parameters*, so the IOV solve's start gates — its seed gate
+    /// and, since #2730, its multi-start gate — read only that and still apply: an IOV
+    /// subject's exactly-zero mode is cold there at every evaluation. Set by
+    /// [`PrevEtas::Solved`]; `false`, the `Default`, otherwise.
+    pub(crate) init_is_warm: bool,
     /// Return a warm start unchanged when [`FallbackCertifier::certifies_in_place`] already
     /// certifies it, without running the search (#2279). A point the inner solve returned as
     /// converged passes that certificate, so it is a fixed point of a re-solve under this
@@ -1020,8 +1032,50 @@ impl InnerSolvePolicy {
             screen: options.inner_screen,
             twin_seed: options.inner_twin_seed,
             init_is_mode: false,
+            init_is_warm: false,
             keep_certified_start: false,
             unseeded_iov_warm: false,
+        }
+    }
+
+    /// This policy for a pass whose `eta_init` are `prev` ([`PrevEtas`]).
+    pub(crate) fn with_prev_etas(self, prev: PrevEtas) -> Self {
+        Self {
+            init_is_mode: prev == PrevEtas::ModesHere,
+            init_is_warm: prev == PrevEtas::Solved,
+            ..self
+        }
+    }
+
+    /// Whether `eta_init` is a warm start under this pass's certificates ([`is_warm_start`]).
+    fn is_warm(&self, eta_init: Option<&[f64]>) -> bool {
+        is_warm_start(eta_init, self.init_is_mode || self.init_is_warm)
+    }
+}
+
+/// What the EBEs an outer driver hands its next inner pass are, which decides whether an
+/// all-zero start is the cold placeholder ([`is_warm_start`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrevEtas {
+    /// The all-zero placeholder of a cold start (a first evaluation, a reset), or nothing
+    /// known about them: an all-zero start is cold.
+    Placeholder,
+    /// Modes an earlier inner pass returned: warm whatever their values
+    /// ([`InnerSolvePolicy::init_is_warm`]).
+    Solved,
+    /// Converged modes at the parameters of this very pass: the flat-theta pre-flight's,
+    /// handed to the first evaluation ([`InnerSolvePolicy::init_is_mode`], #2076).
+    ModesHere,
+}
+
+impl PrevEtas {
+    /// What the cache holds once the pass that read it as `self` has run: the modes an inner
+    /// pass returned, whether the driver adopted that pass's EBEs or kept the ones it read.
+    /// Only a placeholder that nothing replaced stays one.
+    pub(crate) fn after_pass(self, adopted: bool) -> Self {
+        match self {
+            PrevEtas::Placeholder if !adopted => PrevEtas::Placeholder,
+            _ => PrevEtas::Solved,
         }
     }
 }
@@ -1918,12 +1972,25 @@ fn section_has_barrier(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], seed: &[f64]) -> 
 /// The starts of the guarded multi-start's axis scan: `base` with one scanned coordinate
 /// replaced by `centre[i] ± (m + 1)·sd[i]` for `m` in `1..=restarts`, coordinate by
 /// coordinate, the negative seed of each pair first. A coordinate of zero prior SD has none.
+///
+/// With `omega` (the BSV Ω, over the leading coordinates it covers), a seed moves the
+/// coordinates correlated with `i` too, by their conditional mean `Ω_ji/Ω_ii · Δ` for the
+/// move `Δ` of coordinate `i` — along Ω's own column for `i`, so the seed's move is the
+/// `(m + 1)` prior SDs it is meant to be (#2788). Holding them, as without `omega`, crosses
+/// the prior's ridge: on the melphalan model at a FOCEI plateau (ρ(η_CL, η_V) = 0.9995) a
+/// two-SD η_CL seed with η_V held sat at `ηᵀΩ⁻¹η ≈ 6e5`, objective 3e5, and the descents from
+/// those seeds — into `V2 = 1e-60 … 1e110`, a hopelessly stiff ODE — made that plateau's cold
+/// solve of 68 subjects take 78 s; it takes 1.3 s on the same optimizer path now. A
+/// coordinate uncorrelated with `i` (every one, for a diagonal Ω) is not touched, so its seeds
+/// are bit-identical. The IOV scan passes the BSV Ω, which covers the leading η block of its
+/// flat vector: a κ coordinate (past `Ω`'s rows) is neither shifted nor shifts anything.
 fn axis_seed_starts(
     base: &[f64],
     centre: &[f64],
     scan: &[bool],
     sd: &[f64],
     restarts: usize,
+    omega: Option<&DMatrix<f64>>,
 ) -> Vec<Vec<f64>> {
     let mut starts = Vec::new();
     for i in 0..base.len() {
@@ -1935,6 +2002,14 @@ fn axis_seed_starts(
             for k in [-step, step] {
                 let mut start = base.to_vec();
                 start[i] = centre[i] + k;
+                if let Some(om) = omega.filter(|om| i < om.nrows() && om[(i, i)] > 0.0) {
+                    let delta = start[i] - base[i];
+                    for (j, sj) in start.iter_mut().enumerate().take(om.nrows()) {
+                        if j != i && om[(j, i)] != 0.0 {
+                            *sj += om[(j, i)] / om[(i, i)] * delta;
+                        }
+                    }
+                }
                 starts.push(start);
             }
         }
@@ -2072,6 +2147,36 @@ pub(crate) fn find_ebe_for_stage(
     restarts: usize,
     stage: &crate::types::FitOptions,
 ) -> EbeResult {
+    find_ebe_for_stage_with_prev(
+        model,
+        subject,
+        params,
+        max_iter,
+        tol,
+        eta_init,
+        mu_k,
+        restarts,
+        stage,
+        PrevEtas::Placeholder,
+    )
+}
+
+/// [`find_ebe_for_stage`] from an `eta_init` that is `prev` ([`PrevEtas`]): a mixture class
+/// solve warm from the previous evaluation's class modes passes [`PrevEtas::Solved`], so an
+/// exactly-zero one is not re-solved as a cold start.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn find_ebe_for_stage_with_prev(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    max_iter: usize,
+    tol: f64,
+    eta_init: Option<&[f64]>,
+    mu_k: Option<&[f64]>,
+    restarts: usize,
+    stage: &crate::types::FitOptions,
+    prev: PrevEtas,
+) -> EbeResult {
     let schedule = cacheable_schedule(model, subject);
     find_ebe_impl(
         model,
@@ -2090,7 +2195,8 @@ pub(crate) fn find_ebe_for_stage(
             screen: stage.inner_screen,
             twin_seed: stage.inner_twin_seed,
             ..InnerSolvePolicy::default()
-        },
+        }
+        .with_prev_etas(prev),
     )
 }
 
@@ -2188,6 +2294,8 @@ pub(crate) fn find_ebe_cached_from(
 // subjects an inner pass actually solved rather than which it finished (#574 review).
 #[cfg(test)]
 thread_local! {
+    /// Plan values `find_ebe_solve` has put in an objective memo.
+    pub(crate) static MEMO_PLAN_PUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -2311,6 +2419,12 @@ pub(crate) struct InnerRecording {
     pub(crate) ends: Vec<IovEnd>,
     /// Every inner solve, IOV or not: its subject and the tolerance it ran at.
     pub(crate) solve_tols: Vec<(String, f64)>,
+    /// Every cold multi-start entered (non-IOV solves): its subject.
+    pub(crate) multistarts: Vec<String>,
+    /// The pass each `multistarts` entry ran in, parallel to it (#2691 CI trace). `None` where
+    /// no pass index was set. Pushed on the recording thread with the entry, so complete when
+    /// `multistarts` is.
+    pub(crate) multistart_passes: Vec<Option<usize>>,
     pub(crate) passes: Vec<PassRecord>,
     /// Every warm-start prediction the outer loop handed a pass (#2549).
     pub(crate) predictions: Vec<PredictionRecord>,
@@ -2421,6 +2535,10 @@ thread_local! {
     /// Descents this thread has started from an IOV axis seed (#2730).
     pub(crate) static IOV_AXIS_SEEDS_RUN: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// The largest `ΔᵀΩ⁻¹Δ` of an IOV axis seed's move `Δ` of the BSV block away from the
+    /// incumbent, on this thread; `NaN` once any was non-finite (#2788).
+    pub(crate) static IOV_SEED_MAX_BSV_MAHA: std::cell::Cell<f64> =
+        const { std::cell::Cell::new(0.0) };
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     /// This thread's [`MULTISTART_PROFILE`] moves — twin seed, screen, axis scan — so a test
@@ -2605,8 +2723,9 @@ fn find_ebe_impl_from(
     // seeding policy differs between the two solves.
     //
     // An all-zero "warm" start is a cold placeholder (the outer loop's first evaluation and
-    // `freeze_flat_thetas` both pass zeros as `prev_etas`), so it counts as cold.
-    let genuinely_warm = is_warm_start(eta_init, policy.init_is_mode);
+    // `freeze_flat_thetas` both pass zeros as `prev_etas`), so it counts as cold unless the
+    // policy says it came from a solve.
+    let genuinely_warm = policy.is_warm(eta_init);
     let both = !(genuinely_warm || policy.seed == InnerHessianSeed::None);
     let share = both.then_some(&screen_share);
     let normal = solve(false, share).expect("an unforced solve always returns a result");
@@ -2631,9 +2750,11 @@ type ScreenDescent = Option<(Vec<f64>, InnerExit, f64)>;
 /// multi-start did exactly that until #2014, and never ran before an estimating fit's final
 /// cold re-solve. Every cold/warm decision in the inner solve goes through this one test.
 ///
-/// `init_is_mode` ([`InnerSolvePolicy::init_is_mode`]) is the caller's certificate that
-/// `eta_init` is a converged mode at these parameters, which makes any `Some` warm, zeros
-/// included (#2076).
+/// `init_is_mode` is the caller's certificate that `eta_init` came from a solve, which makes
+/// any `Some` warm, zeros included: a converged mode at these parameters
+/// ([`InnerSolvePolicy::init_is_mode`], #2076) or a mode an earlier inner pass returned
+/// ([`InnerSolvePolicy::init_is_warm`]); the non-IOV solve passes either
+/// ([`InnerSolvePolicy::is_warm`]), the IOV solve the first.
 fn is_warm_start(eta_init: Option<&[f64]>, init_is_mode: bool) -> bool {
     eta_init.is_some_and(|w| init_is_mode || w.iter().any(|&v| v != 0.0))
 }
@@ -2829,11 +2950,36 @@ fn find_ebe_solve(
         key.extend(e.iter().map(|x| x.to_bits()));
         m.push((key, v));
     };
+    // Every value the walk has scored this solve, with the predictions it left: the 4-slot
+    // memo above decides which value a lookup returns (a fused gradient pass's value can sit
+    // beside the walk's), and only on its miss is the walk's own, a pure function of η, read
+    // back from here instead of walked again. An ODE walk is what a repeat is worth skipping;
+    // a closed form re-walks for less than the lookup costs.
+    let walked: RefCell<std::collections::HashMap<Vec<u64>, (f64, Vec<f64>)>> =
+        RefCell::new(std::collections::HashMap::new());
+    let track_walks = model.ode_spec.is_some();
     let obj = |e: &[f64]| -> f64 {
         if let Some(v) = memo_get(e) {
             return v;
         }
-        let v = obj_uncached(e);
+        if !track_walks {
+            let v = obj_uncached(e);
+            memo_put(e, v);
+            return v;
+        }
+        let key: Vec<u64> = e.iter().map(|x| x.to_bits()).collect();
+        let held = walked.borrow().get(&key).cloned();
+        let v = if let Some((v, preds)) = held {
+            *pred_recycle.borrow_mut() = preds;
+            *preds_at.borrow_mut() = key;
+            v
+        } else {
+            let v = obj_uncached(e);
+            walked
+                .borrow_mut()
+                .insert(key, (v, pred_recycle.borrow().clone()));
+            v
+        };
         memo_put(e, v);
         v
     };
@@ -2959,7 +3105,16 @@ fn find_ebe_solve(
             Some(g) => {
                 // The objective's value at `e`, from the pass that just took its gradient:
                 // the search's next `obj(e)` is a memo hit instead of a second walk.
-                if let Some(v) = fused_value {
+                //
+                // Not on an ODE objective (`enable_stall`): there the plan's compiled integration
+                // and the native one differ in the last bits (the Rosenbrock stages' exact `J`
+                // takes another tangent rule for a division and `ln`, ~1e-15 relative, 0.2% of
+                // an mm fit's gradient points), and the memo must hold one engine's values for
+                // the line search to compare. Aligning the rules instead costs mm +19%
+                // instructions and moves its iterates; skipping the put costs +0.3%.
+                if let Some(v) = fused_value.filter(|_| !enable_stall) {
+                    #[cfg(test)]
+                    MEMO_PLAN_PUTS.with(|c| c.set(c.get() + 1));
                     memo_put(e, v);
                 }
                 {
@@ -3047,7 +3202,7 @@ fn find_ebe_solve(
         inner_optimizer_mode(),
         crate::types::InnerOptimizer::NelderMead
     ) && !inner_use_lbfgs(n_eta);
-    let warm_start = is_warm_start(eta_init, policy.init_is_mode);
+    let warm_start = policy.is_warm(eta_init);
     // Every Nelder–Mead end point below is certified on stationarity with the gradient,
     // metric and stall predicate this BFGS used — never on NM's own simplex spread (#1527).
     let cert = FallbackCertifier {
@@ -3267,9 +3422,16 @@ fn find_ebe_solve(
     // rather than the solves in which one ran (#2589).
     let mut screen_moved = false;
     let mut twin_moved = false;
-    if restarts > 0 && !is_warm_start(eta_init, policy.init_is_mode) {
+    if restarts > 0 && !policy.is_warm(eta_init) {
         #[cfg(test)]
-        EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
+        {
+            EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
+            with_recording(|r| {
+                r.multistarts.push(subject.id.clone());
+                let p = r.current_pass;
+                r.multistart_passes.push(p);
+            });
+        }
         // ── Flip-flop twin seed (`[fit_options] inner_twin_seed`, #2095) ────────
         // The commonest off-axis mode the screen below exists for has a closed form: on a
         // one-compartment oral model, `(CL, V, ka)` and `(CL, V·k/ka, k)` with `k = CL/V`
@@ -3379,7 +3541,14 @@ fn find_ebe_solve(
             .map(|p| p.var.max(0.0).sqrt())
             .collect();
         let mut axis_moved = false;
-        for mut cand in axis_seed_starts(&eta, &vec![0.0; n_eta], &scan_coord, &sds, restarts) {
+        for mut cand in axis_seed_starts(
+            &eta,
+            &vec![0.0; n_eta],
+            &scan_coord,
+            &sds,
+            restarts,
+            Some(&params.omega.matrix),
+        ) {
             let ok = inner_minimize_with_grad(
                 &obj,
                 &agrad,
@@ -3507,6 +3676,11 @@ fn find_ebe_solve(
         schedule,
     );
     let fd_h_redone = fd_h_redone_on_this_thread() > redone_before;
+    // The forward the solve's last gradient (or this Jacobian) took at `η̂`, for the outer
+    // gradient's reverse at the same point.
+    if use_analytic {
+        crate::sens::ode_provider::adjoint::keep_forward(subject, &params.theta, &eta_true);
+    }
     let ipreds = (preds_at
         .borrow()
         .iter()
@@ -3629,13 +3803,10 @@ pub(crate) fn ebe_h_matrices_at(
     etas: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
 ) -> Vec<DMatrix<f64>> {
-    use rayon::prelude::*;
-    population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| ebe_h_matrix_of(model, subject, params, etas[i].as_slice(), &kappas[i]))
-        .collect()
+    let subjects = &population.subjects;
+    crate::par::map(subjects.len(), |i| {
+        ebe_h_matrix_of(model, &subjects[i], params, etas[i].as_slice(), &kappas[i])
+    })
 }
 
 /// Whether `subject`'s `H` is the IOV one: the same branch `find_ebe_impl` takes.
@@ -4209,7 +4380,8 @@ fn find_ebe_iov_seeded(
     // differs in one occasion's κ is as invisible to a single descent as one in η, and the
     // reset / TV-covariate subjects whose individual objective is multimodal are the same
     // ones here. The same gates apply: cold starts only, every coordinate on a family-1
-    // subject and the flat ones otherwise, seeds from each coordinate's own prior SD.
+    // subject and the flat ones otherwise, seeds from each coordinate's own prior SD, an η
+    // seed moving the correlated η along Ω's column (#2788).
     //
     // Three differences. A seed is placed about the prior's centre, which for ψ is `μ`, not
     // 0. A candidate must also lie more than `SCREEN_MIN_OMEGA_DIST` from the incumbent in
@@ -4233,6 +4405,10 @@ fn find_ebe_iov_seeded(
         let sds: Vec<f64> = prior.iter().map(|p| p.var.max(0.0).sqrt()).collect();
         let mut centre = vec![0.0; n_flat];
         centre[..n_eta].copy_from_slice(&mu);
+        // The BSV block's seeds follow Ω's column (#2788); `axis_seed_starts` shifts only the
+        // leading `n_eta` coordinates Ω covers, so a κ seed, and the κ block of an η seed, are
+        // left to their own priors.
+        let bsv_omega = Some(&params.omega.matrix);
         let scan_coord: Vec<bool> = if scan_all {
             vec![true; n_flat]
         } else {
@@ -4241,16 +4417,25 @@ fn find_ebe_iov_seeded(
                 .enumerate()
                 .map(|(i, flat)| {
                     let only_i: Vec<bool> = (0..n_flat).map(|j| j == i).collect();
-                    flat || axis_seed_starts(&x, &centre, &only_i, &sds, restarts)
+                    flat || axis_seed_starts(&x, &centre, &only_i, &sds, restarts, bsv_omega)
                         .iter()
                         .any(|seed| section_has_barrier(&obj, &x, seed))
                 })
                 .collect()
         };
         let mut axis_moved = false;
-        for mut cand in axis_seed_starts(&x, &centre, &scan_coord, &sds, restarts) {
+        for mut cand in axis_seed_starts(&x, &centre, &scan_coord, &sds, restarts, bsv_omega) {
             #[cfg(test)]
-            IOV_AXIS_SEEDS_RUN.with(|n| n.set(n.get() + 1));
+            {
+                IOV_AXIS_SEEDS_RUN.with(|n| n.set(n.get() + 1));
+                let moved: Vec<f64> = (0..n_eta).map(|j| cand[j] - x[j]).collect();
+                let maha = ebe_prior_maha(&moved, &params.omega);
+                IOV_SEED_MAX_BSV_MAHA.with(|c| {
+                    if !(maha <= c.get()) {
+                        c.set(maha);
+                    }
+                });
+            }
             let ok = inner_minimize_with_grad(
                 &obj, &agrad, &mut cand, n_flat, max_iter, tol, None, None, None, &stall_at, false,
             );
@@ -5230,12 +5415,18 @@ fn residual_inner_obs(
         // Signed kernel: right-censored (`cens < 0`) rows use the upper tail, so
         // `h·m` / `h·z` match `individual_nll_iov`'s `m3_logcdf` data term.
         let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df, cens);
-        let ruv_term = if ruv_active {
-            h * z * (v_resid / v)
+        if h == 0.0 {
+            // A certain row past `h`'s underflow: all limits are `0`, and at `z = +∞` the
+            // products would be `0·∞` (#2772).
+            (0.0, 0.0, 0.0)
         } else {
-            0.0
-        };
-        (h * m, ruv_term, h * z / (2.0 * v))
+            let ruv_term = if ruv_active {
+                h * z * (v_resid / v)
+            } else {
+                0.0
+            };
+            (h * m, ruv_term, h * z / (2.0 * v))
+        }
     } else {
         let ruv_term = if ruv_active {
             ruv_data_dterm(y - f, v) * (v_resid / v)
@@ -8084,6 +8275,8 @@ pub(crate) fn run_inner_loop_warm_seeded(
     // derived from it here ([`EbeVariance::for_options`]) rather than handed in, so no
     // caller can pass a convention that disagrees with its own options (#1722).
     stage: &crate::types::FitOptions,
+    // What `prev_etas` are: a solve's output keeps an exactly-zero EBE warm.
+    prev: PrevEtas,
 ) -> (
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
@@ -8103,7 +8296,8 @@ pub(crate) fn run_inner_loop_warm_seeded(
         InnerSolvePolicy {
             seed,
             ..InnerSolvePolicy::for_stage(stage, model)
-        },
+        }
+        .with_prev_etas(prev),
         // Not cancellable mid-pass (#574): this entry point feeds final readout passes,
         // Gauss–Newton and the trust region, which would carry a placeholder into a
         // returned result or an accepted state. Those poll at their own boundaries.
@@ -8336,8 +8530,6 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
     Vec<Vec<DVector<f64>>>,
     Vec<T>,
 ) {
-    use rayon::prelude::*;
-
     #[cfg(test)]
     let mut pass = 0;
     #[cfg(test)]
@@ -8346,11 +8538,10 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
         r.n_passes += 1;
         r.current_pass = Some(pass);
     });
-    let results: Vec<(EbeResult, T)> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let results: Vec<(EbeResult, T)> = {
+        let subjects = &population.subjects;
+        crate::par::map(subjects.len(), |i| {
+            let subject = &subjects[i];
             let init = prev_etas.map(|pe| pe[i].as_slice());
             // Cooperative cancel, polled per subject (#574): one outer evaluation of a
             // large ODE population is minutes of EBE solves, and the outer loops only
@@ -8406,7 +8597,7 @@ fn run_inner_loop_warm_map_impl<T: Send + Default>(
             let extra = finish_subject(subject, &ebe);
             (ebe, extra)
         })
-        .collect();
+    };
     #[cfg(test)]
     with_recording(|r| {
         r.current_pass = None;

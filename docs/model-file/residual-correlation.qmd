@@ -288,19 +288,84 @@ it.
 
 The pooled Durbin–Watson statistic and lag-1 correlation (`dw_statistic`,
 `iwres_lag1_r`) are taken on each subject's residuals decorrelated by the fitted
-`R`, `L⁻¹(y − IPRED)` with `R = L Lᵀ`. Under the model these are independent, so a
-value outside `[1.5, 2.5]` reports dependence the line does **not** explain. On the
-naproxen data at NONMEM's optima:
+`R`, `L⁻¹(y − IPRED)` with `R = L Lᵀ`, and paired within each `by` block when
+the blocks are parallel ([IWRES autocorrelation](../output.qmd#iwres-autocorrelation),
+[Occasions in time](#occasions-in-time)). Under the model
+these are independent, so a value outside `[1.5, 2.5]` reports dependence the line
+does **not** explain. On the naproxen data at NONMEM's optima:
 
-| | raw IWRES | decorrelated |
+| | raw IWRES, whole subject | decorrelated, per arm |
 |---|---|---|
-| `cs` | 0.99 | 1.43 — warns, with the `ar1` advice |
-| `ar1` | 0.94 | 1.69 — silent |
+| `cs` | 1.11 | 1.63 — silent |
+| `ar1` | 1.06 | 1.96 — silent |
 
 Compound symmetry correlates every two visits of an arm equally, and what is left
-is the decay with distance that `ar1` carries. Under `car1` a warning names `ar1`
+is the decay with distance that `ar1` carries: `cs` leaves more of it (1.63 against
+1.96), though no longer past the 1.5 threshold. Through 0.4.0 the statistic paired
+across arms and divided by every row's square (1.43 and 1.69, so `cs` warned).
+When `cs` does warn, the warning names `ar1`. Under `car1` a warning names `ar1`
 as the alternative that decays with the visit order instead of the time. The `IWRES` column is unchanged
 (per-row standardised).
+
+### Occasions in time
+
+When a subject's occasions follow one another in time (visits, dosing intervals,
+study periods), the statistic of a model without a `correlation` line is taken
+across them, and a warning reports dependence between consecutive rows of the
+subject. A line `by` the occasion column does not model that dependence: a block
+never joins rows of two occasions. Write the line `by` a column with one value per
+subject. `by ID` works when `ID` is numeric, since a `by` column is
+read as a number; with a text `ID`, use a numeric column that repeats it. `by` is
+case-sensitive: write the subject column as the file spells it (`by id` for a
+header `id`), or as `ID` when a `[data] ID = …` line maps it. The
+warning on a compartment-free model names this line
+([#2858](https://github.com/FeRx-NLME/ferx-core/issues/2858)).
+
+The statistic under a `correlation` line follows the same rule as for occasions.
+Blocks that follow one another in time are one series, so a pair joins one block's
+last row to the next block's first; blocks that restart the clock, such as arms,
+stay apart. Under the model the decorrelated rows of two blocks are independent,
+so those pairs report dependence the line leaves out. A warning then says that the
+statistic paired rows of consecutive blocks and names the line `by ID`. Split at
+every block, `by OCC` with one row per occasion would leave no pair at all.
+
+Measured on 24 subjects with AR(1) residuals (ρ = 0.7 across the subject), a line
+in time with a subject intercept and a kappa per occasion, fitted with `focei`
+(macOS arm64; `tests/dw_advice_sequential_occasions.rs`):
+
+| Rows per occasion | Line | OFV | `ρ̂` | Durbin–Watson |
+|---|---|---|---|---|
+| 1 | none | −37.74 | | 0.97, warns |
+| 1 | `ar1(RHO) by OCC` | −37.74 | stays at its initial value | 0.97, warns and names `by ID`; `W_RESIDUAL_CORRELATION_INERT` |
+| 1 | `ar1(RHO) by ID` | −124.23 | 0.82 | 2.16, silent |
+
+With three rows per occasion, `by OCC` is not inert (OFV −211.83 against −206.45
+without a line), but `by ID` fits 35 points better (−246.65). The pooled
+statistic does not show this: under `by OCC` it is 2.18, inside the band. Only
+three of a subject's eleven pairs cross an occasion, and it averages them with
+the eight the line models.
+
+So when blocks run in time, the fit also takes the statistic over the pairs that
+**join two blocks** alone. If that is below 1.5 while the pooled one is not, a
+second warning reports both values and names the line `by ID`:
+
+| Fit of `ar1(RHO) by OCC`, three rows per occasion | Pooled | Across blocks (72 pairs) | Warning |
+|---|---|---|---|
+| with a kappa per occasion | 2.18 | 1.48 | cross-block |
+| without a kappa | 1.94 | 1.36 | cross-block |
+| `ar1(RHO) by ID` instead | 2.36 | no such pair | none |
+
+Under `cs` both warnings name `ar1(RHO) by ID`, not `cs(RHO) by ID`: compound
+symmetry over a whole subject is the covariance a subject-level random effect
+already gives, so next to one it adds nothing (measured on the same data without a
+kappa: `cs(RHO) by ID` converges to the objective of the model without a line).
+
+The check needs at least 62 such pairs. Over `n` independent pairs the statistic
+has a standard deviation of about `2/√n`, so with fewer pairs a value below 1.5 is
+too often chance (13% of simulated data sets at 20 pairs, 2% at 62). With fewer
+pairs, compare the objective of the two lines; a silent Durbin–Watson statistic
+is not evidence that the grouping is right. The statistic over those pairs is in
+the warning only; `dw_statistic` stays the pooled one.
 
 A `by` column that no model expression reads is a required data column but is not
 listed in the "used in model expressions but not declared in `[covariates]`"

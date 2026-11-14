@@ -5,7 +5,8 @@
 //! sequence of `f64` operations — the forward dual's `mul_body` is `g = a.g·b.v + a.v·b.g` per
 //! tangent, and so on — so the whole program, over a given [`Layout`], is a straight-line
 //! program over `f64`s: loads of the inputs' lanes, IEEE arithmetic, selects for the
-//! guards, calls for `exp`/`ln`/`powf`/`round`, and stores of the derivatives' lanes.
+//! guards, `sqrt` (correctly rounded, as Rust's), calls for `exp`/`ln`/`powf`/`round`, and
+//! stores of the derivatives' lanes.
 //!
 //! That one form serves two consumers:
 //!
@@ -1207,7 +1208,27 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
             let x = al.reg(a);
             let l = match op {
                 Unary::Exp => al.exp(&x),
-                Unary::Sqrt => al.sqrt(&x),
+                Unary::Sqrt => {
+                    // `PkNum::sqrt`'s flat arm (#2892): at a non-positive argument the constant
+                    // `√x` (a zero keeps its sign, a negative stays `NaN`) with zero jets. The
+                    // dead `sqrt` runs on `1`, so neither arm computes an `inf` or a `NaN` a
+                    // reverse pass could multiply into an adjoint.
+                    let z = al.k(0.0);
+                    let one = al.k(1.0);
+                    let pos = al.ins(Inst::Cmp(Cc::Gt, x[0], z));
+                    let ones = al.constant(one);
+                    let g = al.select(pos, &x, &ones);
+                    let root = al.sqrt(&g);
+                    // The constant's value `√x` with no dependence on `x` for a reverse pass:
+                    // `±0 · 0` keeps a zero's sign, and a negative argument is `NaN`.
+                    let nonneg = al.ins(Inst::Cmp(Cc::Ge, x[0], z));
+                    let zero = al.ins(Inst::Select(nonneg, x[0], z));
+                    let v0 = al.ins(Inst::Mul(zero, z));
+                    let nan = al.k(f64::NAN);
+                    let v1 = al.ins(Inst::Select(nonneg, v0, nan));
+                    let flat = al.constant(v1);
+                    al.select(pos, &root, &flat)
+                }
                 Unary::InvLogit => al.inv_logit(&x),
                 Unary::Logit => al.logit(&x),
                 Unary::Cos => al.cos(&x),
@@ -1234,6 +1255,25 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
                     let floor = al.constant(lo);
                     let g = al.select(keep, &x, &floor);
                     al.ln(&g)
+                }
+                Unary::SqrtRhs => {
+                    // `apply_unary`'s `Sqrt`: the type's `sqrt` of a positive argument, else
+                    // the constant `±0` (a `−0.0` or `+0` argument) or `+0` (negative, `NaN`).
+                    // The dead `sqrt` runs on `1`, so neither arm computes an `inf` or a
+                    // `NaN` a reverse pass could multiply into an adjoint; the constant's
+                    // value is `select(v ≥ 0, v, 0) · 0`, which keeps a zero's sign and has a
+                    // zero derivative.
+                    let z = al.k(0.0);
+                    let one = al.k(1.0);
+                    let pos = al.ins(Inst::Cmp(Cc::Gt, x[0], z));
+                    let ones = al.constant(one);
+                    let g = al.select(pos, &x, &ones);
+                    let root = al.sqrt(&g);
+                    let nonneg = al.ins(Inst::Cmp(Cc::Ge, x[0], z));
+                    let zero = al.ins(Inst::Select(nonneg, x[0], z));
+                    let v0 = al.ins(Inst::Mul(zero, z));
+                    let flat = al.constant(v0);
+                    al.select(pos, &root, &flat)
                 }
                 Unary::Abs => al.abs(&x),
                 Unary::Floor => {

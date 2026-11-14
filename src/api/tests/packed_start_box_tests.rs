@@ -20,6 +20,7 @@
 //!   predicate stops firing altogether.
 
 use super::*;
+use crate::diagnostics::Severity;
 use crate::estimation::parameterization::{
     coordinate_kinds, coordinates_outside_bounds, pack_params, pack_with_bounds, BoxSide,
     PackedCoordKind,
@@ -106,6 +107,20 @@ fn block_omega_model(omega_line: &str) -> CompiledModel {
 fn box_diags(params_block: &str) -> Vec<Diagnostic> {
     let model = model_with_parameters(params_block);
     check_packed_start_in_box(&model.default_params, &FitOptions::default())
+}
+
+/// An evaluation-only run: `maxiter = 0` and no stage that searches anyway.
+fn eval_only() -> FitOptions {
+    FitOptions {
+        outer_maxiter: 0,
+        ..FitOptions::default()
+    }
+}
+
+/// The check on an evaluation-only run.
+fn eval_only_diags(theta_line: &str) -> Vec<Diagnostic> {
+    let model = model_with_parameters(&params_with_theta(theta_line));
+    check_packed_start_in_box(&model.default_params, &eval_only())
 }
 
 fn only_message(diags: &[Diagnostic]) -> String {
@@ -543,37 +558,44 @@ fn a_sigma_start_outside_either_rail_is_a_warning_that_does_not_refuse_the_fit()
 
 // ── T7: the eval-only exemption, asserted as a straddle ───────────────────
 
-/// Regression: removing the `outer_search_runs` gate.
+/// Regression: removing the `outer_search_runs` gate, in either direction.
 ///
 /// An eval-only run clamps too — it just does not *hold* the clamped value
-/// through a search, which is the stickiness this check exists to warn about.
+/// through a search, which is the stickiness the **error** exists for.
 /// `tests/check_command.rs::an_eval_only_fit_reports_the_rail_not_the_declared_zero`
 /// pins that `fit()` succeeds at `outer_maxiter = 0`, so an eval-only error
-/// reddens it too.
+/// reddens it too. Since #2865 the same start is a **warning** there, because
+/// the one OFV such a run reports is the OFV of the bound.
 ///
-/// Asserted as a **straddle** — the same start under `= 0` and under `= 1` —
-/// so it cannot go quietly green by the predicate never firing at all.
+/// Asserted as a **straddle** — the same start under `= 0` and under `= 1`,
+/// with the code and the severity on both sides — so neither verdict can take
+/// over the other's side, and it cannot go green by the predicate never firing.
 #[test]
-fn the_eval_only_exemption_is_a_straddle_not_a_blanket_silence() {
+fn an_eval_only_run_warns_where_a_searching_run_refuses() {
     let model = model_with_parameters(&params_with_theta("theta TVCL(0.05, 0.1, 10.0)"));
     let p = &model.default_params;
 
-    let eval_only = FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    };
     let searching = FitOptions {
         outer_maxiter: 1,
         ..FitOptions::default()
     };
-    assert!(
-        check_packed_start_in_box(p, &eval_only).is_empty(),
-        "an eval-only run is exempt"
-    );
+    let at_zero = check_packed_start_in_box(p, &eval_only());
     assert_eq!(
-        check_packed_start_in_box(p, &searching).len(),
-        1,
-        "and one outer iteration is enough to make it matter"
+        at_zero
+            .iter()
+            .map(|d| (d.code.as_str(), d.severity))
+            .collect::<Vec<_>>(),
+        [("W_THETA_INIT_OUTSIDE_BOUNDS", Severity::Warning)],
+        "an eval-only run is warned, not refused"
+    );
+    let with_search = check_packed_start_in_box(p, &searching);
+    assert_eq!(
+        with_search
+            .iter()
+            .map(|d| (d.code.as_str(), d.severity))
+            .collect::<Vec<_>>(),
+        [("E_THETA_INIT_OUTSIDE_BOUNDS", Severity::Error)],
+        "and one outer iteration is enough to make it a refusal"
     );
 }
 
@@ -696,10 +718,10 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 /// the box while another drifted in — this fails on the *identity* of the
 /// coordinate, so either direction reddens.
 ///
-/// The thirteen entries below are all `OmegaDiagonal` / `Below`, i.e. all already
-/// in #1229's scope: ten simulate-only adaptive-dosing models declaring
+/// The fourteen entries below are all `OmegaDiagonal` / `Below`, i.e. all already
+/// in #1229's scope: eleven simulate-only adaptive-dosing models declaring
 /// `omega ~ 1e-10` (the ninth is the #945 mrgsolve kit's model, the tenth #944's
-/// mg/kg example), two `reset_init_snapshot_*` anchors declaring `~ 0.0`, and
+/// mg/kg example, the eleventh its `round_to` twin), two `reset_init_snapshot_*` anchors declaring `~ 0.0`, and
 /// `tests/fixtures/iov_scaling.ferx` declaring `kappa KAPPA_V ~ 0.000001`.
 /// **Zero** θ, Σ, off-diagonal or upper-rail hits — which is what makes this
 /// change safe for everything shipped.
@@ -708,7 +730,7 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 /// Round 1's review verified the wider scope by hand and the committed test did
 /// not inherit it: `.ferx` files also live in `tests/fixtures/`, `tests/nonmem/`,
 /// `tests/reference/` and `tools/`, and `tests/fixtures/` is where the next
-/// fixture lands. The eleventh entry is exactly what the narrower sweep missed
+/// fixture lands. The `tests/fixtures/` entry is exactly what the narrower sweep missed
 /// (#1309 review).
 ///
 /// Both start-side predicates are ratcheted here, not just the out-of-box one.
@@ -718,7 +740,7 @@ fn the_two_start_checks_partition_the_out_of_box_coordinates() {
 /// no corpus guard at all. The corpus carries **zero** inverted boxes; this is
 /// what keeps that true.
 #[test]
-fn no_shipped_model_file_starts_outside_its_box_except_the_known_thirteen() {
+fn no_shipped_model_file_starts_outside_its_box_except_the_known_fourteen() {
     let allowed: std::collections::BTreeSet<&str> = [
         "examples/adaptive_platelet_ladder.ferx::ETA_CL",
         "examples/adaptive_vanco_auc.ferx::ETA_CL",
@@ -726,6 +748,7 @@ fn no_shipped_model_file_starts_outside_its_box_except_the_known_thirteen() {
         "examples/adaptive_vanco_iov_loading.ferx::ETA_CL",
         "examples/adaptive_vanco_loading.ferx::ETA_CL",
         "examples/adaptive_vanco_mgkg.ferx::ETA_CL",
+        "examples/adaptive_vanco_mgkg_rounded.ferx::ETA_CL",
         "examples/adaptive_vanco_renal.ferx::ETA_CL",
         "examples/adaptive_vanco_renal_iov.ferx::ETA_CL",
         "examples/adaptive_vanco_renal_loading.ferx::ETA_CL",
@@ -936,12 +959,14 @@ fn the_empty_box_error_survives_the_eval_only_exemption() {
     assert_eq!(d[0].code, "E_INIT_BOUNDS_INVERTED");
 
     // The other side of the straddle: a merely out-of-box start on the same
-    // model shape stays exempt, so this test pins the *difference* rather than
-    // the exemption having been deleted wholesale.
+    // model shape is not an **error** at `maxiter = 0` (it is a warning since
+    // #2865), so this test pins the *difference* rather than the exemption
+    // having been deleted wholesale.
     let outside = model_with_parameters(&params_with_theta("theta TVCL(0.05, 0.1, 10.0)"));
+    let d = check_packed_start_in_box(&outside.default_params, &eval_only);
     assert!(
-        check_packed_start_in_box(&outside.default_params, &eval_only).is_empty(),
-        "a clamped-but-orderable start is still exempt at maxiter = 0"
+        d.iter().all(|x| x.severity != Severity::Error),
+        "a clamped-but-orderable start is never refused at maxiter = 0: {d:#?}"
     );
 }
 
@@ -1701,21 +1726,28 @@ fn a_fixed_correlation_above_the_old_unit_clamp_is_still_held_exactly() {
     );
 }
 
-/// Regression: the `claimed` set suppressing this arm at `maxiter = 0` while
-/// producing nothing itself.
+/// Regression: a coordinate two arms can see being reported by neither, or by
+/// both.
 ///
-/// `claimed` was built unconditionally from the two walks that sit *after* the
-/// eval-only early return. `theta TVCL(-5.0, 0.0, 10.0)` has both a `ValueFloor`
-/// move and a declared-range violation, so at `maxiter = 0` the move was
-/// filtered as "someone else will report it" and then nobody did — `ferx check`
-/// and `fit()` said **nothing at all** about a run that scores `1e-10` rather
-/// than the declared `-5`. That is the precise guarantee the arm exists to make.
+/// `theta TVCL(-5.0, 0.0, 10.0)` has both a `ValueFloor` move and a
+/// declared-range violation. `claimed` once held the declared-range walk
+/// unconditionally while that walk sat *after* the eval-only early return, so at
+/// `maxiter = 0` the move was filtered as "someone else will report it" and then
+/// nobody did — `ferx check` and `fit()` said **nothing at all** about a run
+/// that scores `1e-10` rather than the declared `-5` (#1307 review round 1).
 ///
-/// Asserted as a straddle: the same declaration with a search *is* claimed, and
-/// reports the declared-range error instead. Without that half this would pass
-/// for a check that had simply started double-reporting.
+/// Since #2865 the declared-range walk emits on every run, so it claims the
+/// coordinate on every run and the report is exactly one diagnostic either way:
+/// the warning at `maxiter = 0`, the error with a search. The eval-only message
+/// has to carry what the not-representable one used to say there — the value
+/// scored is the `1e-10` floor, which is neither the declared start nor the
+/// declared bound.
+///
+/// The rail walk is the arm that is still silent at `maxiter = 0`;
+/// `a_double_move_names_the_value_the_fit_actually_uses` is where the
+/// not-representable arm speaks for it.
 #[test]
-fn a_doubly_claimed_coordinate_is_still_reported_when_the_other_walk_is_exempt() {
+fn a_doubly_claimed_coordinate_is_reported_exactly_once_on_every_run() {
     let params = params_with_theta("theta TVCL(-5.0, 0.0, 10.0)");
     let model = model_with_parameters(&params);
     let p = &model.default_params;
@@ -1728,16 +1760,17 @@ fn a_doubly_claimed_coordinate_is_still_reported_when_the_other_walk_is_exempt()
     );
     assert_eq!(pack_with_bounds(p).moves.len(), 1);
 
-    // Eval-only: the other walk never runs, so this arm must speak.
-    let eval_only = FitOptions {
-        outer_maxiter: 0,
-        ..FitOptions::default()
-    };
-    let d = check_packed_start_in_box(p, &eval_only);
+    // Eval-only: the declared-range warning speaks, once, and names the floor.
+    let d = check_packed_start_in_box(p, &eval_only());
     assert_eq!(
         d.iter().map(|x| x.code.as_str()).collect::<Vec<_>>(),
-        ["W_INIT_NOT_REPRESENTABLE"],
-        "an eval-only run scores 1e-10 and must say so — {d:#?}"
+        ["W_THETA_INIT_OUTSIDE_BOUNDS"],
+        "an eval-only run scores 1e-10 and must say so, once — {d:#?}"
+    );
+    assert!(
+        d[0].message.contains("those of TVCL = 1e-10,"),
+        "the value scored is the floor, not the declared bound of 0: {}",
+        d[0].message
     );
 
     // With a search: the declared-range error is emitted, so this arm stands
@@ -1788,4 +1821,398 @@ fn a_double_move_names_the_value_the_fit_actually_uses() {
     // The intermediate still appears, as the floor's own output, so the cause
     // explains the chain instead of skipping a step.
     assert!(msg.contains("floor of 1e-10"), "{msg}");
+}
+
+// ── #2865: the evaluation-only half of the declared-range verdict ──────────
+//
+// `W_THETA_INIT_OUTSIDE_BOUNDS` is a user-facing message, so every sentence of
+// it is pinned below and the PR records which test dies when each is deleted.
+// Its input space, enumerated before the prose was written:
+//
+// | input | cells | test |
+// |---|---|---|
+// | side | below the lower / above the upper | `…names_the_theta_its_start_the_bound_and_the_value_scored` |
+// | value scored | the declared bound / ferx's floor / ferx's cap | `…says_when_the_value_scored_is_not_the_declared_bound` |
+// | how many θ | one / several | `…is_one_warning_per_theta` |
+// | held | free / `FIX` | `…is_silent_where_nothing_is_moved` |
+// | position | outside / exactly on a bound / inside / no finite bound | same |
+// | run | `maxiter = 0` / `maxiter > 0` / `maxiter = 0` under saem, imp, impmap, bayes | `an_eval_only_run_warns_where_a_searching_run_refuses`, `a_stage_that_searches_at_maxiter_zero_is_still_refused` |
+// | box | orderable / empty | `at_maxiter_zero_an_empty_box_stays_an_error_and_gets_no_warning` |
+
+/// Regression: a message that names the wrong side, the wrong number, or no
+/// number — the #2846 failure, where every figure in a bug report was taken at
+/// a bound nobody had declared as the start.
+///
+/// Two arms that differ in the side only. Each asserts its own side **and the
+/// absence of the other's words**, so a message hardcoding one side, or naming
+/// both, fails the arm it is wrong for.
+#[test]
+fn the_eval_only_warning_names_the_theta_its_start_the_bound_and_the_value_scored() {
+    let below = only_message(&eval_only_diags("theta TVCL(0.05, 0.1, 10.0)"));
+    assert!(
+        below.contains("`theta TVCL` starts at 5e-2, below its own declared lower bound of 1e-1."),
+        "{below}"
+    );
+    assert!(
+        !below.contains("above") && !below.contains("upper"),
+        "{below}"
+    );
+    assert!(
+        below.contains("those of TVCL = 1e-1, not of the declared 5e-2."),
+        "must name the value scored and the value declared: {below}"
+    );
+
+    let above = only_message(&eval_only_diags("theta TVCL(0.5, 0.001, 0.2)"));
+    assert!(
+        above.contains("`theta TVCL` starts at 5e-1, above its own declared upper bound of 2e-1."),
+        "{above}"
+    );
+    assert!(
+        !above.contains("below") && !above.contains("lower"),
+        "{above}"
+    );
+    assert!(
+        above.contains("those of TVCL = 2e-1, not of the declared 5e-1."),
+        "{above}"
+    );
+
+    for msg in [&below, &above] {
+        // Why the number is the bound's: nothing searches, and the clamp runs.
+        assert!(
+            msg.contains("does not search (`maxiter = 0`)")
+                && msg.contains("the start is clamped into its box first"),
+            "{msg}"
+        );
+        // What is affected: the OFV first, since that is what such a run is for.
+        assert!(
+            msg.contains("so the OFV and every prediction and estimate reported are those of"),
+            "{msg}"
+        );
+    }
+
+    // The remedy, both ways, with this fixture's own numbers on each.
+    assert!(
+        below.contains("To score 5e-2, widen the declared range to include it;"),
+        "{below}"
+    );
+    assert!(
+        below.contains("to score 1e-1, declare that as the start."),
+        "{below}"
+    );
+    assert!(
+        above.contains("To score 5e-1, widen the declared range to include it;"),
+        "{above}"
+    );
+    assert!(
+        above.contains("to score 2e-1, declare that as the start."),
+        "{above}"
+    );
+}
+
+/// Regression: the last sentence of the message going stale.
+///
+/// It tells the reader what the same file does once `maxiter` is raised, and
+/// names the code. Asserted against the check itself, so the sentence is
+/// compared with the behaviour it describes and not with a string: if the
+/// searching verdict is renamed or downgraded, this fails.
+#[test]
+fn the_eval_only_warning_names_the_refusal_a_searching_run_gives() {
+    let model = model_with_parameters(&params_with_theta("theta TVCL(0.5, 0.001, 0.2)"));
+    let p = &model.default_params;
+    let warned = only_message(&check_packed_start_in_box(p, &eval_only()));
+    let refused = check_packed_start_in_box(p, &FitOptions::default());
+    assert_eq!(refused.len(), 1, "{refused:#?}");
+    assert_eq!(refused[0].severity, Severity::Error);
+    assert!(
+        warned.contains(&format!(
+            "A run that searches refuses this declaration with {}.",
+            refused[0].code
+        )),
+        "{warned}"
+    );
+}
+
+/// Regression: quoting a declared bound and a scored value that do not match,
+/// with no reason given — or giving the reason when they do match.
+///
+/// The value scored is the declared bound unless ferx cannot represent that
+/// bound: a declared lower at or below the `1e-10` log floor, or a declared
+/// upper above the `1e9` cap. Both sides of that gate are asserted here, in one
+/// test, so a gate stuck on either branch fails.
+#[test]
+fn the_eval_only_warning_says_when_the_value_scored_is_not_the_declared_bound() {
+    const STAND_IN: &str = "is the nearest value to that bound that ferx can represent.";
+
+    // Declared lower of 0: scored at the floor.
+    let floor = only_message(&eval_only_diags("theta TVCL(-5.0, 0.0, 10.0)"));
+    assert!(
+        floor.contains("below its own declared lower bound of 0e0."),
+        "{floor}"
+    );
+    assert!(
+        floor.contains("those of TVCL = 1e-10, not of the declared -5e0."),
+        "{floor}"
+    );
+    assert!(floor.contains(&format!(" 1e-10 {STAND_IN}")), "{floor}");
+    // The remedy's second half names the value scored, not the declared bound:
+    // declaring `0` as the start would be scored at `1e-10` again.
+    assert!(
+        floor.contains("to score 1e-10, declare that as the start."),
+        "{floor}"
+    );
+    assert!(!floor.contains("to score 0e0"), "{floor}");
+
+    // Declared upper of 1e12: scored at the cap.
+    let cap = only_message(&eval_only_diags("theta TVCL(1e13, 0.001, 1e12)"));
+    assert!(
+        cap.contains("above its own declared upper bound of 1e12."),
+        "{cap}"
+    );
+    assert!(
+        cap.contains("those of TVCL = 1e9, not of the declared 1e13."),
+        "{cap}"
+    );
+    assert!(cap.contains(&format!(" 1e9 {STAND_IN}")), "{cap}");
+    assert!(
+        cap.contains("to score 1e9, declare that as the start."),
+        "{cap}"
+    );
+    assert!(!cap.contains("to score 1e12"), "{cap}");
+
+    // The ordinary case: the value scored *is* the declared bound.
+    let plain = only_message(&eval_only_diags("theta TVCL(0.5, 0.001, 0.2)"));
+    assert!(!plain.contains("nearest value"), "{plain}");
+}
+
+/// Regression: one warning for the whole file, or one θ's numbers on another's
+/// line.
+#[test]
+fn the_eval_only_warning_is_one_warning_per_theta() {
+    let params = "  theta TVCL(0.5, 0.001, 0.2)\n\
+                  \x20 theta TVV(0.01, 0.1, 500.0)\n\
+                  \x20 omega ETA_CL ~ 0.09\n\
+                  \x20 sigma PROP_ERR ~ 0.04\n";
+    let model = model_with_parameters(params);
+    let d = check_packed_start_in_box(&model.default_params, &eval_only());
+    assert_eq!(
+        d.iter().map(|x| x.code.as_str()).collect::<Vec<_>>(),
+        ["W_THETA_INIT_OUTSIDE_BOUNDS", "W_THETA_INIT_OUTSIDE_BOUNDS"],
+        "{d:#?}"
+    );
+    assert!(
+        d[0].message.contains("`theta TVCL` starts at 5e-1, above")
+            && d[0].message.contains("those of TVCL = 2e-1,")
+            && !d[0].message.contains("TVV"),
+        "{}",
+        d[0].message
+    );
+    assert!(
+        d[1].message.contains("`theta TVV` starts at 1e-2, below")
+            && d[1].message.contains("those of TVV = 1e-1,")
+            && !d[1].message.contains("TVCL"),
+        "{}",
+        d[1].message
+    );
+}
+
+/// Regression: warning on a run that scores exactly what the file declares.
+///
+/// Four shapes where nothing is moved: a `FIX`ed θ outside its range (its box
+/// is pinned to its own value, so the run scores the declared number), a start
+/// exactly on a bound (the clamp is a no-op), a start inside its range, and a
+/// θ with no finite bound.
+///
+/// Each silent shape sits next to the same declaration made to fire, so the
+/// silence cannot be the check having stopped firing at `maxiter = 0`.
+#[test]
+fn the_eval_only_warning_is_silent_where_nothing_is_moved() {
+    for quiet in [
+        "theta TVCL(0.5, 0.001, 0.2, FIX)",
+        "theta TVCL(0.2, 0.001, 0.2)",
+        "theta TVCL(0.1, 0.001, 0.2)",
+        "theta TVCL(0.5)",
+    ] {
+        let d = eval_only_diags(quiet);
+        assert!(d.is_empty(), "`{quiet}` moves nothing: {d:#?}");
+    }
+    let d = eval_only_diags("theta TVCL(0.5, 0.001, 0.2)");
+    assert_eq!(d.len(), 1, "the free, strictly-outside twin fires: {d:#?}");
+}
+
+/// Regression: reading "`maxiter = 0`" as "nothing searches".
+///
+/// `saem`, `imp`, `impmap`, `bayes` and `vi` carry their own iteration counts,
+/// and the Gauss–Newton hybrid's FOCEI polish runs a fixed budget, so under
+/// each of them a start outside its range is held through a search at
+/// `maxiter = 0` too. They keep the refusal; the warning's "does not search"
+/// would be false there. The first version of the gate listed four of the six
+/// by hand and warned on `vi` and `gn_hybrid`: on warfarin `gn_hybrid` ended
+/// at TVCL 0.1327 under a warning saying the estimates were those of 0.2
+/// (#2865 review, row 1).
+///
+/// Both sides in one test: the four estimators that read `maxiter = 0` as
+/// `MAXEVAL=0` warn, the six that search refuse, and a chain refuses as soon
+/// as one of its stages searches.
+#[test]
+fn a_stage_that_searches_at_maxiter_zero_is_still_refused() {
+    use EstimationMethod::*;
+    let model = model_with_parameters(&params_with_theta("theta TVCL(0.5, 0.001, 0.2)"));
+    let codes = |methods: &[EstimationMethod]| {
+        let opts = FitOptions {
+            method: methods[methods.len() - 1],
+            methods: if methods.len() > 1 {
+                methods.to_vec()
+            } else {
+                Vec::new()
+            },
+            ..eval_only()
+        };
+        check_packed_start_in_box(&model.default_params, &opts)
+            .iter()
+            .map(|x| x.code.clone())
+            .collect::<Vec<_>>()
+    };
+    for method in [Saem, Imp, Impmap, Bayes, Vi, FoceGnHybrid] {
+        assert_eq!(
+            codes(&[method]),
+            ["E_THETA_INIT_OUTSIDE_BOUNDS"],
+            "{method:?} searches at maxiter = 0"
+        );
+    }
+    for method in [Foce, FoceI, FoceGn, Laplace] {
+        assert_eq!(
+            codes(&[method]),
+            ["W_THETA_INIT_OUTSIDE_BOUNDS"],
+            "{method:?} evaluates once at maxiter = 0"
+        );
+    }
+    assert_eq!(
+        codes(&[FoceGnHybrid, FoceI]),
+        ["E_THETA_INIT_OUTSIDE_BOUNDS"],
+        "one searching stage is enough"
+    );
+    assert_eq!(
+        codes(&[Foce, FoceI]),
+        ["W_THETA_INIT_OUTSIDE_BOUNDS"],
+        "a chain of evaluators is still an evaluation"
+    );
+}
+
+/// Regression: advising a widening that does not score the declared start, in
+/// the message or in the help line (#2865 review, rows 2 and 3).
+///
+/// "Widen the range to include it" is true only if ferx can hold the number
+/// once the range admits it. Following that advice on
+/// `theta TVCL(1e13, 0.001, 1e12)` gives `theta TVCL(1e13, 0.001, 1e14)`, which
+/// is in range, unreported at `maxiter = 0`, and scored at `1e9`.
+///
+/// Both sides of the gate, in one test. Each side asserts its own sentence and
+/// the absence of the other's, in the message and in the help line.
+#[test]
+fn the_eval_only_warning_offers_a_widening_only_where_it_scores_the_start() {
+    let one = |line: &str| {
+        let d = eval_only_diags(line);
+        assert_eq!(d.len(), 1, "`{line}`: {d:#?}");
+        (
+            d[0].message.clone(),
+            d[0].suggestion.clone().expect("a help line"),
+        )
+    };
+    const NO: &str = "cannot be scored while the lower bound is 0 or more: such a theta is \
+                      held on the log scale, between 1e-10 and 1e9;";
+
+    // Widening works: an ordinary start, a negative start under a lower bound
+    // of 0 (admitting it selects identity packing), and an identity-packed
+    // theta above the cap.
+    for (line, value, help) in [
+        (
+            "theta TVCL(0.5, 0.001, 0.2)",
+            "5e-1",
+            "move TVCL's initial estimate inside (1e-3, 2e-1), or widen the declared range",
+        ),
+        (
+            "theta TVCL(-5.0, 0.0, 10.0)",
+            "-5e0",
+            "move TVCL's initial estimate inside (1e-10, 1e1), or widen the declared range",
+        ),
+        (
+            "theta TVCL(1e13, -1.0, 1e12)",
+            "1e13",
+            "move TVCL's initial estimate inside (-1e0, 1e12), or widen the declared range",
+        ),
+    ] {
+        let (msg, got_help) = one(line);
+        assert!(
+            msg.contains(&format!(
+                "To score {value}, widen the declared range to include it;"
+            )),
+            "`{line}`: {msg}"
+        );
+        assert!(!msg.contains("cannot be scored"), "`{line}`: {msg}");
+        assert_eq!(got_help, help, "`{line}`");
+    }
+
+    // Widening does not: above the cap, exactly zero, and below the floor, each
+    // under a lower bound that keeps log packing.
+    for (line, value, help) in [
+        (
+            "theta TVCL(1e13, 0.001, 1e12)",
+            "1e13",
+            "move TVCL's initial estimate inside (1e-3, 1e9)",
+        ),
+        (
+            "theta TVCL(0.0, 0.1, 10.0)",
+            "0e0",
+            "move TVCL's initial estimate inside (1e-1, 1e1)",
+        ),
+        (
+            "theta TVCL(1e-12, 0.1, 10.0)",
+            "1e-12",
+            "move TVCL's initial estimate inside (1e-1, 1e1)",
+        ),
+    ] {
+        let (msg, got_help) = one(line);
+        assert!(msg.contains(&format!("{value} {NO}")), "`{line}`: {msg}");
+        assert!(!msg.contains("widen"), "`{line}`: {msg}");
+        assert_eq!(got_help, help, "`{line}`");
+    }
+}
+
+/// Regression: an empty box picking up the eval-only warning as well.
+///
+/// `theta TVCL(1.0, 5.0, 2.0)` is below its declared lower *and* has an empty
+/// box. There is no bound to be scored at — the clamp has no interval — so the
+/// warning's claim would be false; the empty-box error is the whole report.
+#[test]
+fn at_maxiter_zero_an_empty_box_stays_an_error_and_gets_no_warning() {
+    let d = eval_only_diags("theta TVCL(1.0, 5.0, 2.0)");
+    assert_eq!(
+        d.iter().map(|x| x.code.as_str()).collect::<Vec<_>>(),
+        ["E_INIT_BOUNDS_INVERTED"],
+        "{d:#?}"
+    );
+}
+
+/// Regression: the warning being filed as a boundary **estimate**, or under no
+/// start-side category at all.
+///
+/// `classify_warning` matches substrings of the flat message. This one quotes
+/// a "bound", and the "optimizer bound" prose arm is `BoundaryEstimate`, whose
+/// category drops bootstrap replicates and rejects search candidates by
+/// default. The token is not a substring of `W_INIT_OUTSIDE_BOUNDS` either, so
+/// it needs its own arm; without one the message falls through.
+#[test]
+fn the_eval_only_warning_classifies_as_a_start_side_finding() {
+    use crate::types::{classify_warning, WarningCode, WarningSeverity};
+    for line in [
+        "theta TVCL(0.5, 0.001, 0.2)",
+        "theta TVCL(0.05, 0.1, 10.0)",
+        "theta TVCL(-5.0, 0.0, 10.0)",
+    ] {
+        let msg = only_message(&eval_only_diags(line));
+        assert!(msg.starts_with("W_THETA_INIT_OUTSIDE_BOUNDS: "), "{msg}");
+        let c = classify_warning(&msg);
+        assert_eq!(c.category, WarningCode::InitOutsideBounds, "{msg}");
+        assert_eq!(c.severity, WarningSeverity::Warning, "{msg}");
+    }
 }

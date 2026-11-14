@@ -1287,4 +1287,183 @@ mod tests {
             check("ig", x, &eval_ig, &dual_ig);
         }
     }
+
+    // ── IG at low CV (#2769) ─────────────────────────────────────────────────
+
+    /// `(CV, t, C₁, C₂)`: the 1-cpt and 2-cpt central concentration for 100 mg into
+    /// `CL 2, V 10` (2-cpt adds `Q 3, V2 20`), `MAT 1`, `F 1`, at 60 digits — by `mpmath`
+    /// quadrature of the IG density against the disposition kernel, which agrees with an
+    /// `mpmath` evaluation of the closed form to ≤ 1.3e-58 at every row
+    /// (the script is in the PR that fixed #2769). The three times bracket `t = MAT`, where
+    /// `z₂ ≈ −2/CV` is deepest relative to the size of the second CDF term.
+    const IG_LOW_CV_REF: [(f64, f64, f64, f64); 18] = [
+        (0.2, 0.97, 4.6602148034953166, 4.4842422420689227),
+        (0.2, 1.0, 5.2403568290409183, 5.0236533377926398),
+        (0.2, 1.1, 6.9074637947108364, 6.5266336168696154),
+        (0.1, 0.97, 3.9417845380775431, 3.867045103684288),
+        (0.1, 1.0, 5.1202975750652359, 5.0065998230995991),
+        (0.1, 1.1, 8.2091735377646246, 7.903913384453903),
+        (0.06, 0.97, 3.1405928601070539, 3.1068540215820986),
+        (0.06, 1.0, 5.072085911692386, 5.0024835079602182),
+        (0.06, 1.1, 9.2732956020049948, 8.9854934619505002),
+        (0.05, 0.97, 2.7784496575877398, 2.7544253798946019),
+        (0.05, 1.0, 5.0600428455249029, 5.0017439069237642),
+        (0.05, 1.1, 9.5348474848572057, 9.2485788661335398),
+        (0.03, 0.97, 1.5806649543465496, 1.5735756717823345),
+        (0.03, 1.0, 5.0359843080902185, 5.0006419208705699),
+        (0.03, 1.1, 9.7951240055036127, 9.5086526252949053),
+        (0.01, 0.97, 0.011780295596705113, 0.011770731460977946),
+        (0.01, 1.0, 5.0119778790129245, 5.0000729315698582),
+        (0.01, 1.1, 9.8020063374527132, 9.5145987143457512),
+    ];
+
+    /// The IG closed form (`one_cpt_ig_g`, `two_cpt_ig_g`) against an `mpmath`
+    /// reference outside both ferx engines, from `CV = 0.2` down to `CV = 0.01` (#2769).
+    /// Before the fix every row from `CV = 0.05` down was wrong — `~1e48` at `0.05`,
+    /// `inf` at `0.03` and `0.01` — because `log_normal_cdf_g` floored `ln Φ(z₂)` at
+    /// `ln 1e-300` while the closed form adds it to `2λ/μ* ≈ 2/CV²`.
+    #[test]
+    fn ig_closed_form_matches_mpmath_down_to_cv_one_percent() {
+        use crate::sens::one_cpt::one_cpt_ig_g;
+        use crate::sens::two_cpt::two_cpt_ig_g;
+        for &(cv, t, c1, c2) in &IG_LOW_CV_REF {
+            let cv2 = cv * cv;
+            let g1 = one_cpt_ig_g::<f64>(100.0, t, 2.0, 10.0, 1.0, cv2, 1.0);
+            let g2 = two_cpt_ig_g::<f64>(100.0, t, 2.0, 10.0, 3.0, 20.0, 1.0, cv2, 1.0);
+            for (label, got, want) in [("1-cpt", g1, c1), ("2-cpt", g2, c2)] {
+                assert!(got.is_finite(), "{label} CV {cv} t {t}: {got} not finite");
+                // Measured worst (macOS arm64): 1-cpt 3.7e-13, 2-cpt 4.8e-14, the 1-cpt at
+                // CV 0.01 — the closed form adds `ln Φ(z₂) ≈ −2/CV²` to `2λ/μ* ≈ 2/CV²`
+                // and keeps their difference to ~`2e4·ε`. 2e-12 leaves ~5× headroom.
+                assert_relative_eq!(got, want, max_relative = 2e-12);
+            }
+        }
+    }
+
+    /// Exact `Dual2` gradient and Hessian of the 1-cpt and 2-cpt IG closed forms at low
+    /// CV against central differences (#2769). `z₂ ≈ −2/CV` passes `−26.5` at
+    /// `CV ≈ 0.075`, and from there the old `ln Q(½, z²/2)` jet's Hessian was `0/0 = NaN`
+    /// — at `CV = 0.06`, where the *value* was still right, the IG Hessian came back
+    /// `NaN`. The FD steps are relative to each parameter, since `λ = MAT/CV²` reaches
+    /// `1e4`.
+    #[test]
+    fn ig_dual_matches_fd_at_low_cv() {
+        let mut worst = (0.0_f64, 0.0_f64);
+        for &cv in &[0.06_f64, 0.03, 0.01] {
+            let lambda = 1.0 / (cv * cv);
+            for &t in &[0.97_f64, 1.0, 1.1] {
+                let label = format!("CV {cv} t {t}");
+                // 1-cpt over (mat, lambda, ke).
+                let x1 = [1.0, lambda, 0.2];
+                let d1 = ig_dual_conc(x1[0], x1[1], t, x1[2], 10.0);
+                let w1 = check_ig_jet(
+                    &format!("1-cpt {label}"),
+                    &x1,
+                    &|x| ig_conc(x[0], x[1], t, x[2], 10.0),
+                    d1.grad,
+                    d1.hess,
+                    &|x| ig_dual_conc(x[0], x[1], t, x[2], 10.0).grad,
+                );
+                // 2-cpt over (cl, v1, q, v2, mat, lambda).
+                let x2 = [2.0, 10.0, 3.0, 20.0, 1.0, lambda];
+                let d2 = ig_tc_dual(x2[0], x2[1], x2[2], x2[3], x2[4], x2[5], t, 100.0);
+                let w2 = check_ig_jet(
+                    &format!("2-cpt {label}"),
+                    &x2,
+                    &|x| ig_tc(x[0], x[1], x[2], x[3], x[4], x[5], t, 100.0),
+                    d2.grad,
+                    d2.hess,
+                    &|x| ig_tc_dual(x[0], x[1], x[2], x[3], x[4], x[5], t, 100.0).grad,
+                );
+                worst = (worst.0.max(w1.0).max(w2.0), worst.1.max(w1.1).max(w2.1));
+                // nan-ok: each operand asserted finite in check_ig_jet
+            }
+        }
+        // The fixture must reach the old NaN zone (`z₂ < −26.5`) at its *largest* CV,
+        // or the finiteness checks would test nothing: `z₂ = −√(λ/t)(t·r/μ + 1)`,
+        // `r = √(1 − 2μ²k/λ)`, at CV 0.06, t = 1.1, k = ke = 0.2 (the shallowest cell).
+        let (lam, t, k) = (1.0 / (0.06_f64 * 0.06), 1.1_f64, 0.2_f64);
+        let z2 = -(lam / t).sqrt() * (t * (1.0 - 2.0 * k / lam).sqrt() + 1.0);
+        assert!(
+            z2 < -26.5,
+            "fixture no longer reaches the old NaN zone: z₂ = {z2}"
+        );
+        assert!(worst.0.is_finite() && worst.1.is_finite());
+    }
+
+    /// Gradient vs a central difference of the value, Hessian vs a central difference
+    /// of the exact gradient, each step relative to its coordinate and each error
+    /// relative to the largest entry of its gradient / Hessian row (entries span many
+    /// orders, e.g. `∂C/∂λ` against `∂C/∂ke`). Every jet entry and every error must be
+    /// finite first, so a `NaN` jet fails naming the entry. Returns the worst
+    /// `(gradient, Hessian)` scaled error.
+    fn check_ig_jet<const N: usize>(
+        label: &str,
+        x: &[f64; N],
+        f: &dyn Fn([f64; N]) -> f64,
+        grad: [f64; N],
+        hess: [[f64; N]; N],
+        dual_grad: &dyn Fn([f64; N]) -> [f64; N],
+    ) -> (f64, f64) {
+        for i in 0..N {
+            assert!(grad[i].is_finite(), "{label}: grad[{i}] = {}", grad[i]);
+            for j in 0..N {
+                assert!(
+                    hess[i][j].is_finite(),
+                    "{label}: hess[{i}][{j}] = {}",
+                    hess[i][j]
+                );
+            }
+        }
+        let gscale = grad.iter().fold(0.0_f64, |m, g| m.max(g.abs())); // nan-ok: grad asserted finite above
+        let (mut wg, mut wh) = (0.0_f64, 0.0_f64);
+        for j in 0..N {
+            let h = 1e-6 * x[j].abs();
+            let (mut xp, mut xm) = (*x, *x);
+            xp[j] += h;
+            xm[j] -= h;
+            let fd = (f(xp) - f(xm)) / (2.0 * h);
+            let eg = (grad[j] - fd).abs() / gscale;
+            assert!(
+                eg.is_finite(),
+                "{label}: grad[{j}] FD error not finite (fd {fd})"
+            );
+            assert!(
+                eg <= IG_FD_TOL,
+                "{label}: grad[{j}] {} vs FD {fd} (scaled error {eg:.2e})",
+                grad[j]
+            );
+            wg = wg.max(eg); // nan-ok: asserted finite above
+            let h2 = 1e-4 * x[j].abs();
+            let (mut xp, mut xm) = (*x, *x);
+            xp[j] += h2;
+            xm[j] -= h2;
+            let (gp, gm) = (dual_grad(xp), dual_grad(xm));
+            for i in 0..N {
+                let fd2 = (gp[i] - gm[i]) / (2.0 * h2);
+                let hscale = hess[i].iter().fold(0.0_f64, |m, v| m.max(v.abs())); // nan-ok: hess asserted finite above
+                let eh = (hess[i][j] - fd2).abs() / hscale;
+                assert!(
+                    eh.is_finite(),
+                    "{label}: hess[{i}][{j}] FD error not finite (fd {fd2})"
+                );
+                assert!(
+                    eh <= IG_FD_TOL,
+                    "{label}: hess[{i}][{j}] {} vs FD {fd2} (scaled error {eh:.2e})",
+                    hess[i][j]
+                );
+                wh = wh.max(eh); // nan-ok: asserted finite above
+            }
+        }
+        (wg, wh)
+    }
+
+    /// Bound for [`check_ig_jet`]'s scaled errors. Measured worst over
+    /// [`ig_dual_matches_fd_at_low_cv`] (macOS arm64): gradient 2.4e-6, Hessian 5.4e-4.
+    /// The Hessian figure is the FD's own truncation, not the jet: the worst cells are the
+    /// `mat` columns at `CV = 0.01`, where a step of `1e-4·MAT` against an absorption
+    /// width of `CV·MAT` gives `(1e-4/0.01)² = 1e-4`, and shrinking the step tenfold
+    /// trades it for rounding on the smallest cross entries (1e-2). 2e-3 leaves ~4×
+    /// headroom; the defect it guards is a `NaN`, caught by the `is_finite` lines first.
+    const IG_FD_TOL: f64 = 2e-3;
 }

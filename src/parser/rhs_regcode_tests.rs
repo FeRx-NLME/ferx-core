@@ -28,7 +28,7 @@ impl Rng {
 }
 
 /// A random expression over the RHS's names, using every operation the compiler
-/// translates (and literals that hit the guards: a near-zero divisor, `ln` of a
+/// translates (and literals that hit the guards: a near-zero divisor, `ln` and `sqrt` of a
 /// non-positive value, `0^x`).
 fn expr(rng: &mut Rng, names: &[&str], depth: usize) -> String {
     if depth == 0 || rng.below(4) == 0 {
@@ -41,13 +41,14 @@ fn expr(rng: &mut Rng, names: &[&str], depth: usize) -> String {
     }
     let a = expr(rng, names, depth - 1);
     let b = expr(rng, names, depth - 1);
-    match rng.below(15) {
+    match rng.below(16) {
         // An inline `if`, nested when an arm draws another, and the `min`/`max` that
         // desugar to one. An arm that ends in a leaf fuses with the op after the `if` on the
         // else path only (`x + (if (…) a else B)`), which `conditional` must reproduce.
         12 => format!("(if ({}) {a} else {b})", cond(rng, names, depth - 1)),
         13 => format!("min({a}, {b})"),
         14 => format!("max({a}, {b})"),
+        15 => format!("sqrt({a})"),
         0 => format!("({a} + {b})"),
         1 => format!("({a} - {b})"),
         2 => format!("({a} * {b})"),
@@ -307,7 +308,7 @@ fn compiled_rhs_is_the_interpreter_bit_for_bit_on_random_programs() {
 fn a_program_outside_the_translatable_shape_is_not_compiled() {
     // The ops whose f64 meaning the generic primitives do not reproduce.
     for odes in [
-        "  d/dt(x1) = sqrt(x1)\n  d/dt(x2) = -x2\n  d/dt(x3) = 0",
+        "  d/dt(x1) = tanh(x1)\n  d/dt(x2) = -x2\n  d/dt(x3) = 0",
         "  d/dt(x1) = inv_logit(x1)\n  d/dt(x2) = -x2\n  d/dt(x3) = 0",
         "  d/dt(x1) = logit(x1)\n  d/dt(x2) = -x2\n  d/dt(x3) = 0",
     ] {
@@ -323,6 +324,9 @@ fn a_program_outside_the_translatable_shape_is_not_compiled() {
     let prog = program("  d/dt(x1) = -A * x1\n  d/dt(x2) = A * x1 - B * x2\n  d/dt(x3) = C");
     assert!(prog.reg.is_some());
     let prog = program("  d/dt(x1) = if (x1 < 1) A else B\n  d/dt(x2) = -x2\n  d/dt(x3) = 0");
+    assert!(prog.reg.is_some());
+    // `sqrt` translates (#2844).
+    let prog = program("  d/dt(x1) = sqrt(x1)\n  d/dt(x2) = -x2\n  d/dt(x3) = 0");
     assert!(prog.reg.is_some());
 }
 
@@ -611,7 +615,7 @@ fn forward_over_reverse_is_the_hessian_on_random_programs() {
                     continue;
                 }
                 assert!(
-                    got.is_finite(),
+                    got.is_finite() && want.is_finite(),
                     "case {case} H[{i}][{j}]: {got} vs {want}\n{odes}"
                 );
                 worst = worst.max((got - want).abs() / (1.0 + want.abs()));
@@ -895,11 +899,10 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
         // An inline `if` compiles (#2680), so what an arm cannot translate is named as
         // itself, not as the `if`.
         (
-            "  d/dt(x1) = if (x1 < 1) sqrt(x1) else B",
-            "`sqrt`",
+            "  d/dt(x1) = if (x1 < 1) tanh(x1) else B",
+            "`tanh`",
             "`d/dt(x1)`",
         ),
-        ("  d/dt(x1) = sqrt(x1)", "`sqrt`", "`d/dt(x1)`"),
         ("  d/dt(x1) = inv_logit(x1)", "`inv_logit`", "`d/dt(x1)`"),
         ("  d/dt(x1) = logit(x1)", "`logit`", "`d/dt(x1)`"),
         ("  d/dt(x1) = tanh(x1)", "`tanh`", "`d/dt(x1)`"),
@@ -909,13 +912,13 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
         ("  d/dt(x1) = pnorm(x1)", "`pnorm`", "`d/dt(x1)`"),
         // The site is the assignment, not the derivative that reads it.
         (
-            "  E = sqrt(A)\n  d/dt(x1) = -E * x1",
-            "`sqrt`",
+            "  E = tanh(A)\n  d/dt(x1) = -E * x1",
+            "`tanh`",
             "the assignment to `E`",
         ),
         // A later statement: the first refusal in program order is the one named.
         (
-            "  d/dt(x1) = -x1\n  d/dt(x2) = logit(x2) + sqrt(x1)\n  d/dt(x3) = 0",
+            "  d/dt(x1) = -x1\n  d/dt(x2) = logit(x2) + sin(x1)\n  d/dt(x3) = 0",
             "`logit`",
             "`d/dt(x2)`",
         ),
@@ -937,7 +940,13 @@ fn each_parsable_refusal_names_its_construct_and_statement() {
         );
     }
     // The other side of the gate, an inline `if` included.
-    for odes in ["  d/dt(x1) = -A * x1", "  d/dt(x1) = if (x1 < 1) A else B"] {
+    // `sqrt` among them (#2844), so its removal from the refusals is pinned here too.
+    for odes in [
+        "  d/dt(x1) = -A * x1",
+        "  d/dt(x1) = if (x1 < 1) A else B",
+        "  d/dt(x1) = sqrt(x1)",
+        "  E = sqrt(A)\n  d/dt(x1) = -E * x1",
+    ] {
         let prog = program(&format!("{odes}{REST}"));
         assert!(prog.reg.is_some(), "{odes}");
         assert!(
@@ -1019,8 +1028,8 @@ fn every_sentence_of_the_interpreter_note_is_pinned() {
     let block_msg = note(&format!(
         "  if (A > 1) {{\n    d/dt(x1) = -x1\n  }} else {{\n    d/dt(x1) = x1\n  }}{REST}"
     ));
-    let sqrt_msg = note(&format!("  d/dt(x1) = sqrt(x1){REST}"));
-    for msg in [&block_msg, &sqrt_msg] {
+    let tanh_msg = note(&format!("  d/dt(x1) = tanh(x1){REST}"));
+    for msg in [&block_msg, &tanh_msg] {
         assert!(
             msg.contains(
                 "the [odes] right-hand side runs on the bytecode interpreter, not compiled \
@@ -1037,7 +1046,7 @@ fn every_sentence_of_the_interpreter_note_is_pinned() {
         );
     }
     // The note ends with the pointer to the docs: nothing follows it.
-    for msg in [&block_msg, &sqrt_msg] {
+    for msg in [&block_msg, &tanh_msg] {
         assert!(msg.ends_with("under \"Native right-hand side\"."), "{msg}");
     }
 }
@@ -1108,7 +1117,7 @@ fn a_compiled_rhs_without_native_code_reports_the_register_code() {
     // The test switch is neither the environment variable nor the host.
     assert_eq!(details["cause"], "declined");
     assert!(matches!(
-        RhsConstruct::Function("sqrt"),
+        RhsConstruct::Function("tanh"),
         RhsConstruct::Function(_)
     ));
 }
@@ -1146,6 +1155,7 @@ fn the_native_tangent_jacobian_matches_the_jet_fallback() {
                     "case {case}:\n{odes}\n{x} vs {y}"
                 );
                 if x.is_finite() {
+                    assert!(x.is_finite() && y.is_finite(), "case {case}: {x} vs {y}");
                     worst = worst.max((x - y).abs() / y.abs().max(1.0));
                 }
             }
@@ -1155,4 +1165,194 @@ fn the_native_tangent_jacobian_matches_the_jet_fallback() {
     eprintln!("native vs jet tangent Jacobian: worst relative difference {worst:e}");
     assert!(checked > 100, "only {checked} native cases");
     assert!(worst < 1e-12, "{worst:e}");
+}
+
+/// The QSS-TMDD shape that motivated compiling `sqrt` (#2844), plus a bare `sqrt` of a state
+/// so the guard's inputs reach it directly.
+const SQRT_ODES: &str = "  d/dt(x1) = sqrt(x1)
+  d/dt(x2) = sqrt(x2 - A) * B
+  d/dt(x3) = 0.5 * ((x3 - x2 - C) + sqrt((x3 - x2 - C) * (x3 - x2 - C) + 4 * C * x3))";
+
+/// `sqrt` at its guard, on every route: the `f64` lane VM, the generic interpreter on the
+/// duals, the register code and the native code, bit for bit — at a negative argument, `0`,
+/// `−0.0`, a `NaN`, a tiny value and an ordinary one. And the guard's meaning, pinned on the
+/// values: a negative or `NaN` argument floors to `+0`, `−0.0` passes through (the `v ≥ 0`
+/// test, not `f64::max`, whose signed-zero result is not specified), and a non-positive
+/// argument is a constant, with exactly zero jets — not the `inf · 0 = NaN` of a dual's own
+/// `sqrt` at `0`, whose bits optimised code does not reproduce across routes (#2844).
+/// (The tiny value is `1e-100`, not smaller: below ~`1e-123` a dual's `h2 = −0.25/s³`
+/// overflows on every route alike, which is `sqrt`'s singularity, not the guard.)
+#[test]
+fn sqrt_at_its_guard_is_the_interpreter_bit_for_bit_on_every_route() {
+    use crate::sens::dual2::Dual2;
+    let prog = program(SQRT_ODES);
+    let reg = prog.reg.as_ref().expect("`sqrt` compiles (#2844)");
+    assert!(prog.route_note().is_none(), "{:?}", prog.route_note());
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let p: Vec<f64> = (0..n_params).map(|i| 0.4 + i as f64 / 5.0).collect();
+    let s = [1.75, 0.0, 0.0, f64::EPSILON];
+    for x in [-1.0, 0.0, -0.0, f64::NAN, 1e-100, 2.25] {
+        let u = [x, x, x];
+        let label = format!("x = {x:?}");
+        // f64: the production lane VM against the register code.
+        let mut vars = bind(&prog, &u, &p, &s);
+        let (mut du_ref, mut du_reg) = (vec![9.0; 3], vec![9.0; 3]);
+        let mut stack = Vec::new();
+        let _time = ModelTimeGuard::enter(1.75);
+        eval_statements_indexed_with_stack(
+            &prog.stmts,
+            &[],
+            &[],
+            &[],
+            &mut vars,
+            Some(&mut du_ref),
+            &[],
+            &mut stack,
+        );
+        let du_lane = du_ref.clone();
+        let mut regs = vec![0.0; reg.n_regs()];
+        super::RHS_JIT_DISABLED.with(|c| c.set(true));
+        reg.run(&u, &p, &s, &mut du_reg, &mut regs);
+        super::RHS_JIT_DISABLED.with(|c| c.set(false));
+        assert!(
+            bits_eq(&du_ref, &du_reg),
+            "{label}: f64 lane VM {du_ref:?} vs register {du_reg:?}"
+        );
+        // f64: the generic interpreter agrees with the lane VM too.
+        assert!(check_on(&prog, &u, &p, &s, &label));
+        // The guard's meaning on `d/dt(x1) = sqrt(x1)`.
+        let want = match x {
+            v if v.is_nan() || v < 0.0 => 0.0f64,
+            v => v.sqrt(),
+        };
+        assert_eq!(du_lane[0].to_bits(), want.to_bits(), "{label}: sqrt(x1)");
+        let lift_2 = |v: &[f64]| -> Vec<Dual2<2>> {
+            v.iter()
+                .enumerate()
+                .map(|(i, &v)| <Dual2<2> as PkNum>::var(v, i % 2))
+                .collect()
+        };
+        let (u2, p2, s2) = (lift_2(&u), lift_2(&p), lift_2(&s));
+        assert!(check_on(
+            &prog,
+            &u2,
+            &p2,
+            &[s2[0], s2[1], s2[2], s2[3]],
+            &label
+        ));
+        // The jets of `sqrt(x1)` on the register code over `Dual2`: zero where the argument
+        // is not positive, live otherwise (the guard's constant has no derivative).
+        let s24 = [s2[0], s2[1], s2[2], s2[3]];
+        let mut du2 = vec![<Dual2<2> as PkNum>::from_f64(9.0); 3];
+        let mut regs2 = vec![<Dual2<2> as PkNum>::from_f64(0.0); reg.n_regs()];
+        reg.run(&u2, &p2, &s24, &mut du2, &mut regs2);
+        let want2 = if x.is_nan() || x < 0.0 { 0.0 } else { x.sqrt() };
+        assert_eq!(
+            du2[0].value.to_bits(),
+            want2.to_bits(),
+            "{label}: Dual2 value"
+        );
+        if x > 0.0 {
+            assert!(du2[0].grad[0] > 0.0, "{label}: live jet {:?}", du2[0].grad);
+        } else {
+            assert!(
+                du2[0].grad.iter().all(|g| g.to_bits() == 0)
+                    && du2[0].hess.iter().flatten().all(|h| h.to_bits() == 0),
+                "{label}: jets {:?}",
+                du2[0].grad
+            );
+        }
+        // Native against the register code on `f64`.
+        let raw = (&u[..], &p[..], &s);
+        check_native(reg, raw, &label);
+    }
+}
+
+/// `sqrt`'s jets on the compiled routes against central finite differences of the `f64`
+/// RHS: the register code (`Dual2`), at points
+/// where every `sqrt` argument is positive, plus the reverse pass against forward tangents.
+#[test]
+fn sqrt_derivatives_match_finite_differences() {
+    use crate::sens::dual2::Dual2;
+    let prog = program(SQRT_ODES);
+    let reg = prog.reg.as_ref().expect("`sqrt` compiles");
+    // `[x1, x2, x3, A, B, C]`.
+    let points = [
+        [0.4, 1.2, 0.5, 0.3, 0.7, 1.1],
+        [3.0, 2.4, 1.6, 0.9, 0.6, 1.3],
+    ];
+    let f = |x: &[f64; 6]| rhs_at(&prog, reg, x, &|v, _| v);
+    let h = 1e-5;
+    let h2 = 1e-4;
+    let mut worst_g = 0.0f64;
+    let mut worst_h = 0.0f64;
+    let mut live = 0usize;
+    for x in &points {
+        assert!(x[1] - x[3] > 0.0, "every sqrt argument is positive");
+        let y = f(x);
+        let x2 = rhs_at(&prog, reg, x, &|v, i| <Dual2<6> as PkNum>::var(v, i));
+        let step = |d: &[(usize, f64)]| {
+            let mut z = *x;
+            for &(i, e) in d {
+                z[i] += e;
+            }
+            f(&z)
+        };
+        for o in 0..3 {
+            assert_eq!(x2[o].value.to_bits(), y[o].to_bits(), "value, Dual2");
+            for i in 0..6 {
+                let fd = (step(&[(i, h)])[o] - step(&[(i, -h)])[o]) / (2.0 * h);
+                for got in [x2[o].grad[i]] {
+                    assert!(got.is_finite() && fd.is_finite());
+                    worst_g = worst_g.max((got - fd).abs() / (1.0 + fd.abs()));
+                }
+                for j in 0..=i {
+                    let fd = (step(&[(i, h2), (j, h2)])[o]
+                        - step(&[(i, h2), (j, -h2)])[o]
+                        - step(&[(i, -h2), (j, h2)])[o]
+                        + step(&[(i, -h2), (j, -h2)])[o])
+                        / (4.0 * h2 * h2);
+                    live += usize::from(fd.abs() > 1e-3);
+                    for got in [x2[o].hess[i][j]] {
+                        assert!(got.is_finite() && fd.is_finite());
+                        worst_h = worst_h.max((got - fd).abs() / (1.0 + fd.abs()));
+                    }
+                }
+            }
+        }
+    }
+    // The second derivatives are genuinely non-zero (sqrt's curvature is under test).
+    assert!(live > 10, "only {live} live Hessian entries");
+    eprintln!("sqrt derivatives vs FD: gradient {worst_g:e}, Hessian {worst_h:e}");
+    // Measured (macOS arm64): gradient 3.8e-11 (central differences at h = 1e-5), Hessian
+    // 3.9e-8 (second differences at h = 1e-4, rounding-bound). The bounds keep ~10× headroom.
+    assert!(worst_g < 4e-10, "gradient vs FD {worst_g:e}");
+    assert!(worst_h < 4e-7, "Hessian vs FD {worst_h:e}");
+
+    // The reverse pass (what a taped recording of the native block differentiates).
+    use super::ir::Layout;
+    let mut rng = Rng(0x5157_2844_0000_0001);
+    let mut worst = 0.0f64;
+    for l in [
+        Layout::F64,
+        Layout {
+            n: 2,
+            m: 0,
+            th: false,
+            wide: false,
+            tan: 0,
+        },
+        Layout {
+            n: 2,
+            m: 2,
+            th: true,
+            wide: false,
+            tan: 0,
+        },
+    ] {
+        let w = check_reverse(reg, l, &mut rng, &format!("{l:?}"));
+        assert!(w.is_finite(), "{l:?}: {w}");
+        worst = worst.max(w);
+    }
+    assert!(worst < 1e-12, "reverse vs forward tangents {worst:e}");
 }

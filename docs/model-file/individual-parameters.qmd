@@ -20,7 +20,11 @@ Each line assigns a PK parameter using an arithmetic expression that can referen
 - **Eta random effects** -- names defined as omega parameters (e.g., `ETA_CL`, `ETA_V`)
 - **Covariates** -- column names from the data file (e.g., `WT`, `CRCL`)
 - **Event time** -- the built-ins `TIME` and `time`
-- **Constants** -- numeric literals (e.g., `70`, `0.75`)
+- **Constants** -- numeric literals (e.g., `70`, `0.75`), including scientific
+  notation with an optional exponent sign in either case (`1e-10`, `2.5e2`,
+  `1.5E+3`). A malformed literal such as `1e` (no exponent digits) or `2.3.4` is a
+  parse error (`Bad number: 1e`). `[structural_model]` expressions read literals
+  the same way.
 
 ## Evaluation Order
 

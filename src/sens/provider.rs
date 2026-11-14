@@ -813,8 +813,9 @@ const ABSORPTION_WALK_AXES: usize = 24;
 /// trades the twin's analytic ODE sensitivities for finite differences:
 ///
 /// * IOV: the closed-form IOV scope, and a stacked width `n_eta + K·n_kappa` below the dual
-///   walk's cap (`MAX_TVCOV_AXES = 24`; the outer seeds at least one θ column beside it). The
-///   twin's ODE IOV provider reaches 96, so a many-occasion subject past 24 stays there;
+///   walk's cap (`ABSORPTION_WALK_AXES = 24`; the outer seeds at least one θ column beside
+///   it). The twin's ODE IOV gradient (the adjoint) is uncapped in `ode_adjoint.rs`,
+///   so a many-occasion subject past 24 stays there;
 /// * time-varying covariates: the closed-form TV-walk scope (`tvcov_analytical_supported`).
 pub(crate) fn absorption_walk_sens_in_scope(model: &CompiledModel, subject: &Subject) -> bool {
     if model.n_kappa > 0 {
@@ -877,8 +878,9 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // weights reach the PK parameters only through the network output, so their columns
     // were chained in after the program walk (the pre-#2093 `nn_param_derivatives_at_cov`)
     // and the outer walk seeded them in column chunks of `MAX_TVCOV_AXES - n_eta`
-    // (`subject_sensitivities_tvcov`). The chunking needs at least one θ column per
-    // chunk, hence `n_eta < MAX_TVCOV_AXES` whenever there is a θ column at all.
+    // (`subject_sensitivities_tvcov`; that constant is now `ABSORPTION_WALK_AXES`). The
+    // chunking needs at least one θ column per chunk, hence `n_eta < ABSORPTION_WALK_AXES`
+    // whenever there is a θ column at all.
     if tvcov_program_axes(model) > ABSORPTION_WALK_AXES
         || (model.n_theta > 0 && model.n_eta >= ABSORPTION_WALK_AXES)
     {
@@ -967,7 +969,7 @@ pub(crate) fn n_program_theta(model: &CompiledModel) -> usize {
 /// Dual width of one TV-cov program evaluation: the declared θ, the η, and — for a
 /// `[covariate_nn]` model — one axis per network output (`ModelNnAxisGuard`), so the
 /// program walk yields `∂p/∂z` alongside `∂p/∂(θ,η)`. This, not `model.n_theta + n_eta`,
-/// is what the `1..=MAX_TVCOV_AXES` dispatch must accommodate (#1300).
+/// is what the `1..=ABSORPTION_WALK_AXES` dispatch must accommodate (#1300).
 fn tvcov_program_axes(model: &CompiledModel) -> usize {
     n_program_theta(model) + model.n_eta + nn_output_count(model)
 }

@@ -17,6 +17,15 @@
 //!   simulated covariance (the Brendel/Comets procedure) *before* the empirical
 //!   CDF and inverse-normal transform.
 //!
+//! - **EPRED / PWRES** (#2871), from the same replicates at no extra cost: `EPRED`
+//!   is the per-observation replicate mean (NONMEM's Monte-Carlo `EPRED`), and
+//!   `PWRES = Σ_sim^(-1/2) (y − EPRED)` (Monolix `PWRES`, NONMEM `EWRES`) is the
+//!   simulation-based analogue of CWRES. PWRES decorrelates with the **symmetric**
+//!   inverse square root, NONMEM's default for every weighted residual, while NPDE
+//!   keeps the Cholesky factor; the two conventions are independent choices. PWRES
+//!   uses only the first two moments, so it is N(0, 1) under the true model only
+//!   when `y`'s marginal is Gaussian.
+//!
 //! Empirical-CDF probabilities that land at 0 or 1 are clamped to
 //! `[1/(2K), 1 − 1/(2K)]` before `Φ⁻¹`, per the `npde`-package convention, so the
 //! transformed scores stay finite.
@@ -63,7 +72,6 @@ use crate::types::{BloqMethod, CompiledModel, IovOccasionRule, ModelParameters, 
 use nalgebra::{DMatrix, DVector};
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
 
 /// Seed used when the caller leaves `npde_seed` unset, so the diagnostic is
 /// reproducible across invocations.
@@ -88,6 +96,16 @@ pub struct SubjectNpde {
     /// (`K <= n_obs`) or when the subject has any censored observation; `npd` is
     /// still finite on the uncensored rows there.
     pub npde: Vec<f64>,
+    /// Monte-Carlo expected prediction `E_sim[y]`: the per-observation mean of the
+    /// simulated replicates, NONMEM's `$TABLE EPRED`. Finite on censored rows and
+    /// whatever the replicate count — it scores nothing — and `NaN` only on a row
+    /// whose replicates are not all finite.
+    pub epred: Vec<f64>,
+    /// Monte-Carlo population-weighted residual `Σ_sim^(-1/2) (y − E_sim[y])`
+    /// (Monolix `PWRES`, NONMEM `EWRES`), decorrelated with the **symmetric**
+    /// inverse square root of the simulated covariance, NONMEM's default. `NaN`
+    /// exactly where `npde` is.
+    pub pwres: Vec<f64>,
 }
 
 /// Compute NPDE and NPD for every subject by Monte-Carlo simulation under the
@@ -247,11 +265,10 @@ pub fn compute_npde_npd_diag(
     // reference is the fitted mixture's predictive distribution rather than class 1's.
     let classes = crate::api::SimClasses::new(model, params, base_seed)?;
     let scores = crate::api::install_on_engine_pool(|| {
-        population
-            .subjects
-            .par_iter()
-            .enumerate()
-            .map(|(i, subject)| {
+        {
+            let __r0 = &population.subjects;
+            crate::par::map(__r0.len(), |i| {
+                let subject = &__r0[i];
                 let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed.wrapping_add(i as u64));
                 let n_obs = subject.observations.len();
 
@@ -398,15 +415,24 @@ pub fn compute_npde_npd_diag(
                     &sims,
                     model.bloq_in_force(),
                 );
-                let npde = npde_scores(
+                let Decorrelated { npde, pwres } = npde_scores(
                     &subject.observations,
                     &subject.cens,
                     &sims,
                     model.bloq_in_force(),
                 );
-                (SubjectNpde { npd, npde }, flip_flop)
+                let epred = epred(&sims);
+                (
+                    SubjectNpde {
+                        npd,
+                        npde,
+                        epred,
+                        pwres,
+                    },
+                    flip_flop,
+                )
             })
-            .collect::<Vec<_>>()
+        }
     });
     let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
     let scores: Vec<SubjectNpde> = scores
@@ -441,38 +467,90 @@ fn npd_scores(
         .collect()
 }
 
-/// Per-observation empirical-CDF normal scores after decorrelating the observed
-/// and simulated vectors with the empirical mean and Cholesky factor of the
-/// simulated covariance. Returns an all-`NaN` vector when the covariance is
-/// rank-deficient (`K <= n_obs`), when it stays non-PD after jitter, or when the
-/// subject has an observation censored *for this fit* (decorrelation would mix
-/// the LLOQ into the uncensored rows). Under `bloq_method = drop` a `CENS != 0`
-/// row is not censored for the fit, so it neither loses its own score nor voids
-/// the subject's (#1499).
+/// The decorrelated half of the per-subject scores: NPDE and PWRES share one
+/// empirical mean and covariance, and differ in the factor each decorrelates
+/// with and in what is done with the decorrelated vector.
+#[derive(Debug, Clone, PartialEq)]
+struct Decorrelated {
+    /// Cholesky-decorrelated, then ranked against the decorrelated replicates.
+    npde: Vec<f64>,
+    /// Symmetric-root-decorrelated residual `Σ_sim^(-1/2) (y − E_sim[y])`, not
+    /// ranked.
+    pwres: Vec<f64>,
+}
+
+impl Decorrelated {
+    fn nan(n: usize) -> Self {
+        Self {
+            npde: vec![f64::NAN; n],
+            pwres: vec![f64::NAN; n],
+        }
+    }
+}
+
+/// Per-observation empirical mean of the simulated replicates — the `EPRED`
+/// column (NONMEM's Monte-Carlo `EPRED`, not the FOCE `f0`). A row with any
+/// non-finite replicate is `NaN`, as its covariance would be.
+///
+/// Emitted for every row, censored or not, and whatever `K`: like `PRED` it is a
+/// prediction rather than a score of the observed value, so neither the LLOQ an
+/// M3 row carries nor a rank-deficient covariance touches it.
+fn epred(sims: &DMatrix<f64>) -> Vec<f64> {
+    let k = sims.ncols();
+    if k == 0 {
+        return vec![f64::NAN; sims.nrows()];
+    }
+    sims.row_iter().map(|r| r.sum() / k as f64).collect()
+}
+
+/// Per-observation scores after decorrelating the observed and simulated vectors
+/// with the empirical mean and covariance of the simulations:
+///
+/// - **NPDE**: decorrelated with the **Cholesky** factor `L` (`w = L⁻¹ (x − mean)`,
+///   the Brendel/Comets and `npde`-package convention, NONMEM's under `WRESCHOL`),
+///   then the empirical-CDF normal score of the observed `w` against the
+///   replicates'.
+/// - **PWRES / EWRES**: decorrelated with the **symmetric** inverse square root
+///   `Σ^(-1/2) = V Λ^(-1/2) Vᵀ`, NONMEM's default for every weighted residual
+///   (`CWRES` and `EWRES` alike, #1182). Not ranked: linear in `y`, so it keeps
+///   the magnitude an NPDE saturates at `Φ⁻¹(1/(2K))`.
+///
+/// The two factors give the same per-subject norm (`‖L⁻¹r‖ = ‖Σ^(-1/2)r‖ =
+/// √(rᵀΣ⁻¹r)`) and different per-observation values whenever the observations
+/// are correlated, so the choice is a convention and is made independently for
+/// each column.
+///
+/// Both are all-`NaN` when the covariance is rank-deficient (`K <= n_obs`), when
+/// it stays non-PD after jitter, or when the subject has an observation censored
+/// *for this fit* (decorrelation would mix the LLOQ into the uncensored rows).
+/// Under `bloq_method = drop` a `CENS != 0` row is not censored for the fit, so it
+/// neither loses its own score nor voids the subject's (#1499).
 fn npde_scores(
     observed: &[f64],
     cens: &[i8],
     sims: &DMatrix<f64>,
     bloq_method: BloqMethod,
-) -> Vec<f64> {
+) -> Decorrelated {
     let n = observed.len();
     let k = sims.ncols();
     if n == 0 {
-        return Vec::new();
+        return Decorrelated::nan(0);
     }
     // Need K > n_obs for a full-rank empirical covariance; censoring invalidates
     // the within-subject decorrelation entirely.
     if k <= n || bloq_method.has_censored_row(cens) {
-        return vec![f64::NAN; n];
+        return Decorrelated::nan(n);
     }
 
-    // Empirical mean (per observation = per row).
+    // Empirical mean (per observation = per row): the EPRED the residual is
+    // centred on.
     let mean: DVector<f64> = sims.column_sum() / k as f64;
 
     // Centered replicates and the empirical covariance via a single gemm:
     // cov = C·Cᵀ / (K-1), where C is the column-centered n×K matrix. The K vs K-1
     // divisor only scales the decorrelation matrix uniformly, which leaves the
-    // within-dimension ranking — and hence the NPDE — unchanged.
+    // within-dimension ranking — and hence the NPDE — unchanged; it scales PWRES
+    // by `√((K−1)/K)`, a 2.5e-4 relative shift at K = 2000.
     let mut centered = sims.clone();
     for mut col in centered.column_iter_mut() {
         col -= &mean;
@@ -481,21 +559,26 @@ fn npde_scores(
 
     // Cholesky L of the covariance; retry once with a small diagonal jitter if it
     // is only numerically (not structurally — K > n is guaranteed above) non-PD.
-    let chol = nalgebra::Cholesky::new(cov.clone()).or_else(|| {
-        let mean_diag = (0..n).map(|j| cov[(j, j)]).sum::<f64>() / n as f64;
-        let jitter = if mean_diag > 0.0 {
-            mean_diag * 1e-6
-        } else {
-            1e-12
-        };
-        for j in 0..n {
-            cov[(j, j)] += jitter;
+    // The jitter, when taken, stays in `cov` so both factors decorrelate the same
+    // matrix.
+    let chol = match nalgebra::Cholesky::new(cov.clone()) {
+        Some(c) => Some(c),
+        None => {
+            let mean_diag = (0..n).map(|j| cov[(j, j)]).sum::<f64>() / n as f64;
+            let jitter = if mean_diag > 0.0 {
+                mean_diag * 1e-6
+            } else {
+                1e-12
+            };
+            for j in 0..n {
+                cov[(j, j)] += jitter;
+            }
+            nalgebra::Cholesky::new(cov.clone())
         }
-        nalgebra::Cholesky::new(cov)
-    });
+    };
     let l = match chol {
         Some(c) => c.l(),
-        None => return vec![f64::NAN; n],
+        None => return Decorrelated::nan(n),
     };
 
     // Decorrelate via forward substitution: w = L⁻¹ (x − mean). One batched solve
@@ -511,9 +594,33 @@ fn npde_scores(
         DMatrix::from_iterator(n, 1, observed.iter().zip(mean.iter()).map(|(y, m)| y - m));
     let obs_d = solve(&obs_centered);
 
-    (0..n)
+    let npde = (0..n)
         .map(|j| empirical_score(obs_d[j], sims_d.row(j).iter().copied()))
-        .collect()
+        .collect();
+    let pwres = symmetric_whiten(cov, &obs_centered);
+    Decorrelated { npde, pwres }
+}
+
+/// `Σ^(-1/2) r` with the symmetric (eigen) inverse square root
+/// `V Λ^(-1/2) Vᵀ`. `cov` has already passed a Cholesky, so it is symmetric
+/// positive definite and every eigenvalue is positive up to round-off; one that
+/// is not (a covariance Cholesky accepted at the edge of PD) makes the whole
+/// vector `NaN` rather than amplifying round-off into the residual. A non-finite
+/// residual entry (an observed `NaN`) propagates to every row, as it would
+/// through the Cholesky solve.
+fn symmetric_whiten(cov: DMatrix<f64>, r: &DMatrix<f64>) -> Vec<f64> {
+    let n = r.nrows();
+    let eig = nalgebra::SymmetricEigen::new(cov);
+    if eig.eigenvalues.iter().any(|&l| !l.is_finite() || l <= 0.0) {
+        return vec![f64::NAN; n];
+    }
+    let v = &eig.eigenvectors;
+    // Vᵀ r, scaled by Λ^(-1/2), mapped back by V.
+    let mut z = v.transpose() * r;
+    for (zi, &li) in z.iter_mut().zip(eig.eigenvalues.iter()) {
+        *zi /= li.sqrt();
+    }
+    (v * z).iter().copied().collect()
 }
 
 /// Empirical-CDF normal score of `y` against the simulated values `sims`:
@@ -556,6 +663,10 @@ fn clamp_prob(p: f64, k: usize) -> f64 {
 #[cfg(test)]
 #[path = "npde_block_sigma_tests.rs"]
 mod block_sigma_tests;
+
+#[cfg(test)]
+#[path = "npde_pwres_tests.rs"]
+mod pwres_tests;
 
 #[cfg(test)]
 mod tests {
@@ -768,7 +879,7 @@ mod tests {
         let sims = sims_matrix(&rows);
         let observed = [0.3, -0.4];
         let raw = npd_scores(&observed, &[0, 0], &sims, BloqMethod::Drop);
-        let dec = npde_scores(&observed, &[0, 0], &sims, BloqMethod::Drop);
+        let dec = npde_scores(&observed, &[0, 0], &sims, BloqMethod::Drop).npde;
         assert!(dec.iter().all(|v| v.is_finite()));
         assert_relative_eq!(dec[0], raw[0], epsilon = 0.15);
         assert_relative_eq!(dec[1], raw[1], epsilon = 0.15);
@@ -779,14 +890,18 @@ mod tests {
         // K = 2 replicates but n_obs = 2 → K <= n_obs → singular covariance → NaN.
         let sims = sims_matrix(&[vec![1.0, 2.0], vec![1.5, 2.5]]);
         let out = npde_scores(&[1.0, 2.0], &[0, 0], &sims, BloqMethod::Drop);
-        assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|v| v.is_nan()));
+        assert_eq!(out.npde.len(), 2);
+        assert!(out.npde.iter().chain(&out.pwres).all(|v| v.is_nan()));
+        // EPRED needs no covariance, so it survives the rank guard.
+        assert_eq!(epred(&sims), vec![1.25, 2.25]);
     }
 
     #[test]
     fn npde_scores_empty_for_zero_observations() {
         let sims = DMatrix::<f64>::zeros(0, 10);
-        assert!(npde_scores(&[], &[], &sims, BloqMethod::Drop).is_empty());
+        let out = npde_scores(&[], &[], &sims, BloqMethod::Drop);
+        assert!(out.npde.is_empty() && out.pwres.is_empty());
+        assert!(epred(&sims).is_empty());
     }
 
     #[test]
@@ -800,10 +915,10 @@ mod tests {
             .collect();
         let sims = sims_matrix(&rows);
         let out = npde_scores(&[5.0, 10.0], &[0, 0], &sims, BloqMethod::Drop);
-        assert_eq!(out.len(), 2);
+        assert_eq!(out.npde.len(), 2);
         assert!(
-            out.iter().all(|v| v.is_finite()),
-            "jitter path must yield finite NPDE, got {out:?}"
+            out.npde.iter().chain(&out.pwres).all(|v| v.is_finite()),
+            "jitter path must yield finite NPDE and PWRES, got {out:?}"
         );
     }
 
@@ -816,7 +931,10 @@ mod tests {
         rows[3][0] = f64::NAN;
         let sims = sims_matrix(&rows);
         let out = npde_scores(&[1.0, 2.0], &[0, 0], &sims, BloqMethod::Drop);
-        assert!(out.iter().all(|v| v.is_nan()));
+        assert!(out.npde.iter().chain(&out.pwres).all(|v| v.is_nan()));
+        // EPRED: only the row holding the NaN replicate is lost.
+        let e = epred(&sims);
+        assert!(e[0].is_nan() && e[1].is_finite(), "{e:?}");
     }
 
     /// #1499 straddle, subject level: one flagged row voids the whole subject's
@@ -832,13 +950,13 @@ mod tests {
         let sims = sims_matrix(&rows);
         let m3 = npde_scores(&[10.0, 20.0], &[0, 1], &sims, BloqMethod::M3);
         assert!(
-            m3.iter().all(|v| v.is_nan()),
-            "M3: a censored row voids the subject's NPDE, got {m3:?}"
+            m3.npde.iter().chain(&m3.pwres).all(|v| v.is_nan()),
+            "M3: a censored row voids the subject's NPDE and PWRES, got {m3:?}"
         );
 
         let drop = npde_scores(&[10.0, 20.0], &[0, 1], &sims, BloqMethod::Drop);
         assert!(
-            drop.iter().all(|v| v.is_finite()),
+            drop.npde.iter().chain(&drop.pwres).all(|v| v.is_finite()),
             "under `drop` nothing is censored for the fit, got {drop:?}"
         );
         let unflagged = npde_scores(&[10.0, 20.0], &[0, 0], &sims, BloqMethod::Drop);

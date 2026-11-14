@@ -649,6 +649,10 @@ impl Resolved<'_, (PrepFn, MainFn)> {
     pub(super) unsafe fn prep(&self, params: *const f64, seeds: *const f64, cache: *mut f64) {
         (self.f.0)(params, seeds, cache)
     }
+    /// [`Self::main`]'s native function, for a caller that makes the calls itself.
+    pub(super) fn main_fn(&self) -> MainFn {
+        self.f.1
+    }
     /// The RHS from a filled `cache`.
     ///
     /// # Safety

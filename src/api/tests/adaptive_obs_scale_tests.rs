@@ -329,6 +329,7 @@ fn from_spec_hold(observe: Option<&str>, with_assay_error: bool) -> AdaptiveDosi
         target_window: None,
         auc_target: None,
         // Required by the block; it never fires (no reading is below −1e9).
+        round_to: None,
         dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,

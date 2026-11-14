@@ -375,6 +375,15 @@ fn positive_finite<T: PkNum>(x: T) -> bool {
 /// (`h = φ/Φ`, `h′ = −h(z + h)`, `h″`).
 #[inline]
 fn log_phi<T: PkNum>(z: T) -> T {
+    // Past `h`'s underflow the row is certain and every derivative is `h` times a polynomial:
+    // limit `0` (#2772). Taken here, not left to the jet evaluator (which also returns `0`):
+    // at `z = +∞` the chain `0 · z′` is `0 · ∞ = NaN` for a `z` whose own derivatives overflow
+    // (`z = r/w` with `r ≈ 1e308`), so the value alone is returned. A recordable test.
+    if inv_mills(z).br_cmp_c(BranchCmp::Eq, 0.0) {
+        return z
+            .jet_unary(crate::sens::num::JetFn::LogNormCdf)
+            .value_only();
+    }
     z.jet_unary(crate::sens::num::JetFn::LogNormCdf)
 }
 
@@ -395,6 +404,13 @@ fn m3_terms<T: PkNum>(y: f64, f: T, v: T, d: T, d2: T, cens: i8) -> (T, T, T, T)
     let r = c(y) - f;
     let z = c(sgn) * r / w;
     let h = inv_mills(z);
+    // A recordable test (`val` would fail a recording).
+    if h.br_cmp_c(BranchCmp::Eq, 0.0) {
+        // A certain row past `h`'s underflow: `g2`, `cz` and `cm` are `h` times polynomials
+        // in `z` and `m`, limit `0`, and `z²` overflows from `|z| ≈ 1.3e154` (#2772).
+        // `log_phi` is the value only here (its own `h == 0` arm).
+        return (c(-2.0) * log_phi(z), c(0.0), c(0.0), c(0.0));
+    }
     let m = c(sgn) * (c(1.0) / w + r * d / (c(2.0) * v * w));
     let w3 = v * w;
     let w5 = v * v * w;
@@ -1424,13 +1440,16 @@ mod tests {
     /// #2762 on the adjoint's M3 kernel (`m3_terms`, behind the exact FOCEI gradient, `H̃`
     /// and R-matrix). It lifts the f64 `log_normal_cdf` / `inv_mills` by hand, so the value-
     /// path likelihood test never reaches it (#2767 review r1 #4). A censored limit at `±1e300`
-    /// puts `z` past the `normal_cdf` overflow, where `log_normal_cdf` was `NaN`. It must score
-    /// bit for bit like `±1e6`, where `Φ` already rounds to `1`: value and `g2` (the `H̃` term
-    /// every M3 row adds), each with its jet in `f`.
+    /// puts `z` past the `normal_cdf` overflow, where `log_normal_cdf` was `NaN`. The row is
+    /// certain, so every term and its jet in `f` is exactly `0`.
     ///
-    /// Not asserted: `cz`/`cm`. They form `h·z²`, which is `0·∞ = NaN` once `z²` overflows,
-    /// and they enter `H̃` only under `iiv_on_ruv`. That is the residual tracked in the
-    /// follow-up issue, not something this gate changes.
+    /// #2772 extends it to every term and to `z = +∞`. Past `h = φ/Φ`'s underflow the
+    /// `iiv_on_ruv` cross terms `cz`/`cm` form `h·z²`, `0·∞` once `z²` overflows (`±1e300`),
+    /// and at `z = +∞` (`±1e308`) `log_phi`'s own `h′ = −h(z + h)` is `0·∞` too. All their
+    /// limits are `0`. The oracle is that exact `0`, not a neighbouring row: `±1e6` is
+    /// `z = 1e7`, past `h`'s underflow too, so it takes the same guards and a wrong guard
+    /// constant would agree with itself there (#2782 review r1 #1). `==`, not bits, so the
+    /// guard's `+0` and a computed `−0` both pass while `NaN` still fails.
     #[test]
     fn m3_terms_score_a_limit_past_the_normal_cdf_overflow_as_certain() {
         // Proportional error at f = 1, σ = 0.1: v = σ²f², d = 2σ²f, d2 = 2σ², all carried
@@ -1441,25 +1460,55 @@ mod tests {
             let two = Dual2::<1>::from_f64(2.0);
             m3_terms(limit, f, s2 * f * f, two * s2 * f, two * s2, cens)
         };
-        for (far, near, cens) in [(1e300, 1e6, 1), (-1e300, -1e6, -1)] {
-            // The straddle: (z/√2)² finite for the near limit, overflowing for the far one.
-            let sq = |limit: f64| ((limit - 1.0) / 0.1 / std::f64::consts::SQRT_2).powi(2);
-            assert!(sq(near).is_finite() && sq(far) == f64::INFINITY, "{far:e}");
-            let (got, want) = (terms(far, cens), terms(near, cens));
-            for (name, g, w) in [("value", got.0, want.0), ("g2", got.1, want.1)] {
-                assert!(w.val().is_finite(), "{name} control at {near:e}");
-                assert_eq!(g.val().to_bits(), w.val().to_bits(), "{name} at {far:e}");
-                assert_eq!(
-                    g.grad[0].to_bits(),
-                    w.grad[0].to_bits(),
-                    "∂{name}/∂f at {far:e}"
-                );
-                assert_eq!(
-                    g.hess[0][0].to_bits(),
-                    w.hess[0][0].to_bits(),
-                    "∂²{name}/∂f² at {far:e}"
-                );
+        let z = |limit: f64, cens: i8| (if cens < 0 { -1.0 } else { 1.0 }) * (limit - 1.0) / 0.1;
+        for (near, sq_over, inf, cens) in [(1e6, 1e300, 1e308, 1), (-1e6, -1e300, -1e308, -1)] {
+            // The straddles: z² finite at the control, overflowing at `sq_over`, and z
+            // itself infinite at `inf`.
+            assert!(z(near, cens).powi(2).is_finite(), "{near:e}");
+            assert!(z(sq_over, cens).is_finite() && z(sq_over, cens).powi(2) == f64::INFINITY);
+            assert_eq!(z(inf, cens), f64::INFINITY, "{inf:e}");
+            for x in [near, sq_over, inf] {
+                let got = terms(x, cens);
+                for (name, g) in [
+                    ("value", got.0),
+                    ("g2", got.1),
+                    ("cz", got.2),
+                    ("cm", got.3),
+                ] {
+                    assert!(g.val() == 0.0, "{name} at {x:e}: {}", g.val());
+                    assert!(g.grad[0] == 0.0, "∂{name}/∂f at {x:e}: {}", g.grad[0]);
+                    assert!(
+                        g.hess[0][0] == 0.0,
+                        "∂²{name}/∂f² at {x:e}: {}",
+                        g.hess[0][0]
+                    );
+                }
             }
         }
+    }
+
+    /// #2772 residual risk after the merge with #2786: `log_phi` is also called directly (the
+    /// exact-anchor, the lifted nested and the value-path likelihood rows), not only through
+    /// `m3_terms`. At `z = +∞` reached as `r / w` with `r ≈ 1e308`, `z`'s own derivatives
+    /// overflow, so the chain `h · z′` with `h = 0` is `0 · ∞`. The oracle is the exact `0`
+    /// jet; `==` so `NaN` fails. The straddle: `near` is `h > 0`-free but finite-chain
+    /// (`z = 1e7`), `inf` is `z = +∞`.
+    #[test]
+    fn log_phi_at_a_certain_row_has_a_zero_jet_where_z_overflows() {
+        for (limit, sgn) in [(1e6, 1.0), (1e300, 1.0), (1e308, 1.0), (-1e308, -1.0)] {
+            let f = Dual2::<1>::var(1.0, 0);
+            let s2 = Dual2::<1>::from_f64(0.01);
+            let w = (s2 * f * f).sqrt();
+            let z = Dual2::<1>::from_f64(sgn) * (Dual2::<1>::from_f64(limit) - f) / w;
+            let g = log_phi(z);
+            assert!(g.val() == 0.0, "value at {limit:e}: {}", g.val());
+            assert!(g.grad[0] == 0.0, "d/df at {limit:e}: {}", g.grad[0]);
+            assert!(g.hess[0][0] == 0.0, "d2/df2 at {limit:e}: {}", g.hess[0][0]);
+        }
+        // The straddle: the chain really is non-finite at the extreme, finite at the control.
+        let f = Dual2::<1>::var(1.0, 0);
+        let w = (Dual2::<1>::from_f64(0.01) * f * f).sqrt();
+        let z = (Dual2::<1>::from_f64(1e308) - f) / w;
+        assert!(z.val() == f64::INFINITY && !z.grad[0].is_finite());
     }
 }

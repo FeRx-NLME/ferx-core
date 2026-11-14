@@ -931,6 +931,214 @@ joint model; macOS arm64 agrees to every digit shown. The inner η-gradient is e
 is why the identities hold to ~1e-11. Test:
 `tests/tte_residuals_nonmem_anchor.rs`.
 
+## Kaplan–Meier VPC {#km-vpc}
+
+`vpc_tte()` checks a fitted single-event TTE model against its data. It simulates `n_sim`
+replicates of the observed design in one simulator call (it never refits). Then it returns
+the observed Kaplan–Meier curve beside the pointwise band of the replicate curves, per
+stratum.
+
+```rust
+let opts = VpcTteOptions {
+    n_sim: 500,
+    stratify: VpcStratify::Covariate("SEX".into()),
+    sim: SimulateOptions { seed: Some(1), ..Default::default() },
+    ..Default::default()
+};
+let vpc = vpc_tte(&model, &population, &fit_params, &opts)?;
+for s in &vpc.strata {
+    // s.grid, s.obs_on_grid, s.lo / s.med / s.hi, s.n_used, s.observed (KmCurve)
+}
+```
+
+Each stratum carries the observed curve with its Nelson–Aalen cumulative hazard
+(`observed`: time, number at risk, events, censorings, survival, cumulative hazard), the grid,
+the observed curve read on the grid, the band, and how many replicates are still under
+follow-up at each grid time. The defaults are 200 replicates, a 5 %–95 % band with the median,
+the automatic grid, observed censoring and no strata.
+
+### The curve and the band
+
+The curve uses R `survival::survfit`'s tie convention: at a tied time, events count before
+censorings, so the subjects censored at that time are still in the risk set of its events.
+`ferx_core::stats::km::kaplan_meier` computes it. The band at each grid time is R's default
+quantile (type 7, the one `vpc::vpc_tte` uses) over the replicate curves still defined there.
+A replicate past its last follow-up time is left out unless its curve has reached zero; it
+is not counted as 0 or 1. A band point with fewer replicates than `⌈1 / min(p, 1 − p)⌉ − 1`
+(19 for 5 %/95 %) is empty: with fewer than about 1/p curves the p-tail holds less than one
+curve, so its quantile is only an interpolation between the two most extreme values. So
+`n_sim` must be at least one more than that, 20 for the default band.
+
+The automatic grid is 0, the stratum's observed times and 101 evenly spaced points up to the
+horizon `H`. `VpcGrid::Times` takes your own times. `VpcGrid::AllSteps` adds every step of
+every replicate curve, which gives exact step ribbons on a large grid.
+
+### Censoring in the replicates
+
+The simulator censors a right-censored record at its own time and draws an event record
+unbounded, and a horizon replaces every record's window. So `vpc_tte()` simulates to `H`
+(`sim.horizon`, or the latest time recorded on the endpoint) and then, under the default
+`VpcCensoring::Observed`, gives each subject a censoring time: a draw after it becomes a
+censoring there. A subject observed censored keeps its own time. A subject observed with an
+event was never seen censored, only known to be censored later than its event time, so it
+draws a censoring time from the reverse Kaplan–Meier curve of the observed censorings in
+its own stratum, conditional on exceeding its event time (`H` if no censoring is left past
+it). Every subject's replicate censoring time then has its stratum's censoring distribution,
+so the replicates are exchangeable with the data when censoring is independent of the event
+time within a stratum. Keeping `H` for event
+subjects, the common administrative-end shortcut, censors the replicates too little: with
+45 % censored the band covered the data in 85.5 % of datasets at 3H/4 for a nominal 90 %,
+against 91 % with the draw. A
+horizon below a subject's censoring time wins. `VpcCensoring::Horizon` censors every
+replicate at `H` only. The draws are seeded by `sim.seed`.
+
+`VpcStratify::Covariate(name)` groups subjects by the exact covariate value at their first
+record, up to 10 values; bin a continuous covariate first. `VpcStratify::Dose` groups by the
+first dose's amount.
+
+### Repeated events {#km-vpc-rtte}
+
+`vpc_rtte()` is the same check for a repeated-events endpoint (`type = rtte`). It takes the
+options of `vpc_tte()` plus `max_order`, and returns three families of curves per stratum,
+each an observed curve beside the band of the same curve over the replicates.
+
+```rust
+let opts = VpcRtteOptions {
+    n_sim: 500,
+    max_order: Some(3),
+    sim: SimulateOptions { seed: Some(1), ..Default::default() },
+    ..Default::default()
+};
+let vpc = vpc_rtte(&model, &population, &fit_params, &opts)?;
+for s in &vpc.strata {
+    // s.mcf       the mean cumulative function (observed: McfCurve)
+    // s.absolute  Kaplan–Meier by event order on absolute time, orders 1..=3
+    // s.gap       Kaplan–Meier by event order on gap time, orders 2..=3
+}
+```
+
+Every curve carries `grid`, `obs_on_grid`, `lo`, `med`, `hi` and `n_used` as a `vpc_tte()`
+stratum does, with the same band rule, grids and strata.
+
+#### The three curves {#km-vpc-rtte-curves}
+
+A subject's follow-up ends at the time of its last record on the endpoint, an event or a
+censoring. A censoring row that is not the last record does not end follow-up.
+
+- **Mean cumulative function (MCF).** The expected number of events per subject by time
+  `t`, estimated as the Nelson–Aalen sum `Σ d(s) / Y(s)`: `d(s)` counts all events at `s` and
+  `Y(s)` the subjects still under follow-up at `s`, whatever number of events they have had.
+  A subject with no event counts in `Y` until its follow-up ends.
+  `ferx_core::stats::km::mean_cumulative` computes it.
+- **Absolute time, order `k`.** The Kaplan–Meier curve of the time to the `k`-th event,
+  censored at the end of follow-up for a subject with fewer than `k` events. It is the
+  probability of fewer than `k` events by `t`. Every subject is in it.
+- **Gap time, order `k`.** The Kaplan–Meier curve of the time from the `(k − 1)`-th event to
+  the `k`-th, among the subjects that had `k − 1` events, censored at the time left until the
+  end of follow-up. Gap order 1 is absolute order 1, so the gap curves start at order 2.
+
+Ties follow the same convention as the single-event curve. Two events at one time in one
+subject both count in the MCF, step the absolute curves of two consecutive orders at the same
+time, and give a gap of 0. An event at the very end of follow-up counts with the subject still
+at risk, and the next order's gap is then censored at 0.
+
+`max_order` is the highest order `K`: absolute orders 1 to `K` and gap orders 2 to `K`. Left
+unset, it is the largest `k` for which at least 10 observed subjects, counted across all
+strata, have `k` or more events (at least 1). One `K` applies to every stratum, so a small
+stratum can show an order few of its own subjects reached; each curve's `n_subjects` says how
+many. A gap order that
+no observed subject in a stratum reached comes back with an empty observed curve and an empty
+band.
+
+#### Reading a gap-time band {#km-vpc-rtte-gap}
+
+A gap-time curve of order 2 or higher is **not** an estimate of the gap-time distribution. Its
+subjects are selected by having had `k − 1` events, and the follow-up they have left depends
+on how long their earlier gaps were, so subjects with short gaps are over-represented and
+long gaps are censored more often. The band is the distribution, over the replicates, of the
+same statistic computed the same way: the Kaplan–Meier curve of the `k`-th gap among that
+replicate's subjects that reached `k − 1` events. Those are different subjects in each
+replicate. The observed curve and the replicates carry the same selection, so comparing them
+is a valid predictive check, and a model that fits should have its observed curve inside the
+band. A replicate in which no subject reached `k − 1` events has no curve; it is left out of
+the band and `n_used` shows it.
+
+#### Follow-up of the replicates {#km-vpc-rtte-follow-up}
+
+The simulator regenerates one event stream per subject per replicate and follows every
+subject to the horizon `H` (`sim.horizon`, or the latest time recorded on the endpoint). The
+data usually have subjects leaving earlier. A band from replicates all followed to `H` has more
+subjects at risk late than the data had, and is too narrow there. Under the default
+`VpcCensoring::Observed`, each replicate subject is therefore cut at its own observed
+follow-up end: its simulated events after that time are dropped and its follow-up ends there,
+or at `H` when `H` is earlier. A recurrent subject's follow-up end is always observed, so,
+unlike the single-event VPC, no censoring time has to be drawn. `VpcCensoring::Horizon`
+follows every replicate subject to `H`.
+
+The observed curves are never cut at `H`. With `sim.horizon` below the data's own follow-up,
+the MCF and the absolute-time curves are unaffected up to `H`. A gap-time curve is not: the
+data's risk set counts events up to each subject's follow-up end and the replicates' only up
+to `H`, so that comparison is approximate. Leave `sim.horizon` unset, or cut the data at `H`
+first, when the gap-time curves matter. The result's `warnings` carry
+`W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP` with the number of subjects followed past `H` whenever
+gap-time curves are returned.
+
+When a subject's last record is an event, its follow-up ends at that event: the data say
+nothing later about it. The observed subject then has an event exactly at its follow-up end,
+which a replicate almost never has. The usual layout, one censoring row closing each subject,
+does not have this. The result's `warnings` carry `W_VPC_RTTE_ENDS_ON_EVENT` with the number
+of such subjects.
+
+#### Validation of the repeated-events curves {#km-vpc-rtte-validation}
+
+NONMEM has no Kaplan–Meier or MCF estimator, so R's `survfit` is the external reference
+here too. `tests/rtte_survfit_reference.rs` runs `vpc_rtte()` on 80 subjects in two strata
+with whole-unit times (13 with no event, 19 with an event at their follow-up end) and matches
+survfit 3.8.12 row for row: the MCF against the cumulative hazard of the counting-process
+fit, exactly, and the absolute curves of orders 1 to 3 and the gap curves of orders 2 and 3
+within 1.1e-16. survfit cannot express two events at one time in one subject, so that case is
+pinned by its exact closed form instead.
+
+The bands are checked for self-consistency in `tests/vpc_rtte_self_consistency.rs`. 200
+datasets are drawn outside the simulator from a Poisson process with between-subject
+variability, about 80 % of subjects leaving before `H`, and each gets a 200-replicate VPC. The
+observed MCF lies inside its 5 %–95 % band in 89 %, 89 % and 92 % of datasets at H/4, H/2 and
+3H/4, and the observed order-2 absolute curve in 89 %, 85 % and 92.5 %. A 5 %–95 % band
+read from 200 replicates covers an exchangeable observation 89.1 % of the time, not 90 %,
+and these are inside the 99 % binomial interval around that (83 %–94.5 %). Following every
+replicate subject to `H` instead takes the order-2 curve to 79 % and 82 % at H/2 and 3H/4,
+out of it.
+
+### What it refuses
+
+`vpc_tte()` returns `E_VPC_TTE_INPUT` rather than a wrong curve for: several TTE endpoints and
+no `cmt` (under competing risks, 1 − KM of one cause is not its cumulative incidence; with
+`cmt` set, the curve is that cause's survival with the other causes as censoring); a
+repeated-events endpoint, which `vpc_rtte()` draws; left truncation; interval-censored
+records; more than one record per subject on the endpoint; too few replicates or invalid band
+probabilities; and a stratification covariate a subject lacks or that has more than 10 values.
+
+`vpc_rtte()` returns the same code for: several TTE endpoints and no `cmt`; a single-event
+endpoint, which `vpc_tte()` draws; left truncation (the simulator supports it for repeated
+events, but these risk sets have no delayed entry yet); interval-censored records; a
+subject's records out of time order; `max_order = 0`; and the same replicate, probability and
+stratification checks.
+
+Cumulative-incidence VPCs, binned strata and left truncation are planned follow-ups.
+
+### Validation against survfit and by self-consistency
+
+NONMEM has no Kaplan–Meier estimator, so there is no NONMEM run to anchor against. R's
+`survfit` is the external reference. `tests/km_survfit_reference.rs` matches survfit 3.8.12
+row for row on 120 subjects in two strata with frequent ties: the counts exactly, survival
+within 1.1e-16 and the cumulative hazard exactly. The band is checked for self-consistency in
+`tests/vpc_tte_self_consistency.rs`. 200 datasets are drawn outside the simulator from the
+model, with about 45 % censored, and each gets a 200-replicate VPC. The observed curve then
+lies inside the 5 %–95 % band in 92.5 %, 89.5 % and 91 % of datasets at H/4, H/2 and 3H/4,
+inside the 99 % binomial interval (83 %–94.5 %) around the 89.1 % a band read from 200
+replicates covers. Dropping the per-subject
+censoring takes the coverage at 3H/4 to 82 %, out of it.
+
 ::: {.callout-note}
 ## Per-subject simulation diagnostics
 

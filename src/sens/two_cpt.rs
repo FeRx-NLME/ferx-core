@@ -243,7 +243,7 @@ pub fn two_cpt_zero_order_g<T: PkNum>(
 }
 
 /// 2-cpt oral (first-order absorption): `(F·D·KA/V1)·Σ c·B(λ, KA, t)` over the disposition
-/// modes, the Bateman function one smooth function through `KA = λ` ([`bateman`]).
+/// modes, the Bateman function one smooth function through `KA = λ` (`bateman`).
 pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T) -> T {
     two_cpt_oral_d(amt, t, &TwoCpt::new(cl, v1, q, v2), ka, f_bio)
 }
@@ -516,7 +516,7 @@ pub(crate) fn two_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &TwoCp
 }
 
 /// 2-cpt oral at steady state: `(F·D·KA/V1)·Σ c·B_ss(λ, KA, t)`, smooth through `KA = λ`
-/// ([`bateman_ss`]).
+/// (`bateman_ss`).
 pub fn two_cpt_oral_ss_g<T: PkNum>(
     amt: f64,
     t: T,

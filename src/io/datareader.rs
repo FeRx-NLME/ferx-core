@@ -1,3 +1,4 @@
+use crate::cold_sort::ColdSort;
 use crate::io::filter_expr::{FilterClause, RowContext};
 use crate::types::{
     CovariateDecl, CovariateRow, CovariateTable, DoseEvent, ExclusionSummary, Population, RateMode,
@@ -3821,7 +3822,7 @@ fn parse_subject(
     // pre-existing behavior.
     let n_doses = doses.len();
     let mut perm: Vec<usize> = (0..n_doses).collect();
-    perm.sort_by(|&a, &b| doses[a].time.partial_cmp(&doses[b].time).unwrap());
+    perm.cold_sort_by(&|&a, &b| doses[a].time.partial_cmp(&doses[b].time).unwrap());
     let mut sorted_doses: Vec<DoseEvent> = perm.iter().map(|&i| doses[i].clone()).collect();
     let sorted_dose_rec: Vec<usize> = perm.iter().map(|&i| dose_rec[i]).collect();
     let mut sorted_dose_occ: Vec<u32> = if occ_col.is_some() {
@@ -3839,7 +3840,7 @@ fn parse_subject(
     // of engine order; `param_time_at` binary-searches it. An EVID=4 row is both a
     // reset and a dose at one `(engine, written)` pair, kept once. Sorted here, ahead of
     // the #1909 pass, which reads it.
-    reset_period_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+    reset_period_times.cold_sort_by(&|a, b| a.0.total_cmp(&b.0));
     reset_period_times.dedup();
 
     // ── An ADDL-implied dose runs under the `$PK` of the record that governs it (#1909) ──
@@ -3965,7 +3966,7 @@ fn parse_subject(
     // so the common path does not deep-clone one `HashMap` per reset for nothing.
     if !reset_times.windows(2).all(|w| w[0] <= w[1]) {
         let mut rperm: Vec<usize> = (0..reset_times.len()).collect();
-        rperm.sort_by(|&a, &b| {
+        rperm.cold_sort_by(&|&a, &b| {
             reset_times[a]
                 .partial_cmp(&reset_times[b])
                 .unwrap_or(std::cmp::Ordering::Equal)
@@ -4147,7 +4148,7 @@ fn parse_subject(
         }
         reset_period_times.push((t.next_down(), written));
         reset_period_times.push((t, written));
-        reset_period_times.sort_by(|a, b| a.0.total_cmp(&b.0));
+        reset_period_times.cold_sort_by(&|a, b| a.0.total_cmp(&b.0));
         reset_period_times.dedup();
     }
 
