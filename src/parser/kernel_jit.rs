@@ -2668,34 +2668,33 @@ pub(crate) struct Tiered {
     queued: std::sync::atomic::AtomicBool,
 }
 
-/// Queue `k` on the compile threads, started on first use: compiles run off the callers'
-/// path, which keep running the current tier (every tier computes the same values, bit for
-/// bit) until the native entry point is swapped in. One thread per core: a thread runs only
-/// while the queue holds work, so a burst of new kernels (a fit's first iterations) compiles
-/// in parallel on whichever cores are free, and an empty queue costs nothing.
+/// Queue `k` for compilation off the caller's path. A call comes from a worker of the fit's
+/// pool, so the compile is spawned on that pool: no thread of its own, and no pool beside the
+/// one `FitOptions.threads` sized. The callers keep running the current tier (every tier
+/// computes the same values, bit for bit) until the native entry point is swapped in. A caller
+/// that is not a pool worker has no pool to spawn on (`rayon::spawn` would start the global
+/// one) and compiles in place: a compile is microseconds per kernel, see the table below.
 fn compile_queue(k: std::sync::Weak<Tiered>) {
-    type Rx = Arc<Mutex<std::sync::mpsc::Receiver<std::sync::Weak<Tiered>>>>;
-    static Q: OnceLock<Mutex<std::sync::mpsc::Sender<std::sync::Weak<Tiered>>>> = OnceLock::new();
-    let tx = Q.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<std::sync::Weak<Tiered>>();
-        let rx: Rx = Arc::new(Mutex::new(rx));
-        let n = std::thread::available_parallelism().map_or(1, |n| n.get());
-        for i in 0..n {
-            let rx = rx.clone();
-            std::thread::Builder::new()
-                .name(format!("ferx-kjit-compile-{i}"))
-                .spawn(move || loop {
-                    let next = rx.lock().unwrap().recv();
-                    let Ok(w) = next else { return };
-                    if let Some(t) = w.upgrade() {
-                        t.compile_wanted();
-                    }
-                })
-                .expect("a compile thread starts");
+    let run = move || {
+        if let Some(t) = k.upgrade() {
+            compile_guarded(&t.queued, || t.compile_wanted());
         }
-        Mutex::new(tx)
-    });
-    let _ = tx.lock().unwrap().send(k);
+    };
+    if rayon::current_thread_index().is_some() {
+        rayon::spawn(run);
+    } else {
+        run();
+    }
+}
+
+/// Run a compile; if it panics, release the kernel's `queued` flag and stay on the tier already
+/// reached (every tier computes the same values), instead of unwinding into a pool worker
+/// (rayon aborts the process on an unhandled panic in a spawned job) or leaving `queued` set
+/// forever, which would keep the kernel off every later promotion.
+fn compile_guarded(queued: &std::sync::atomic::AtomicBool, compile: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(compile)).is_err() {
+        queued.store(false, Relaxed);
+    }
 }
 
 /// The tiers' promotion points, from per-IR-instruction costs measured on this crate's
@@ -5216,4 +5215,24 @@ fn lower_chunk_opt(
         f: p,
         _module: module,
     })
+}
+
+#[cfg(test)]
+mod compile_guard_tests {
+    use super::compile_guarded;
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    /// A compile that panics must release `queued` (so a later promotion can queue again) and
+    /// not unwind into the caller; one that returns leaves `queued` to its own protocol.
+    #[test]
+    fn a_panicking_compile_releases_the_queued_flag() {
+        let queued = AtomicBool::new(true);
+        compile_guarded(&queued, || {});
+        assert!(queued.load(Relaxed));
+        compile_guarded(&queued, || panic!("compile failed"));
+        assert!(
+            !queued.load(Relaxed),
+            "a panicked compile must release `queued`"
+        );
+    }
 }
