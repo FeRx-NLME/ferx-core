@@ -548,6 +548,13 @@ A missing Ω~IOV~ on `simulate()` reuses an existing code, since the cause is th
 | `W_VPC_RTTE_ENDS_ON_EVENT` | warning | In `vpc_rtte()`, some subjects' last record on the repeated-events endpoint is an event, so their follow-up ends at that event. Such an observed subject has an event exactly at its follow-up end, which a simulated subject almost never has. The message gives the count. If follow-up went on after the last event, add a censoring record at its end ([#1886](https://github.com/FeRx-NLME/ferx-core/issues/1886)). |
 | `W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP` | warning | In `vpc_rtte()`, `sim.horizon` is below some subjects' follow-up end and gap-time curves are returned. The observed curves are not cut at the horizon and the replicates are, so each gap-time comparison is approximate; the mean cumulative function and the absolute-time curves are unaffected up to the horizon. The message gives the count. Leave `sim.horizon` unset, or cut the data at the horizon first ([#1886](https://github.com/FeRx-NLME/ferx-core/issues/1886)). See [Follow-up of the replicates](../estimation/tte.qmd#km-vpc-rtte-follow-up). |
 
+#### Time-to-event npde {#codes-npde-tte}
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `E_NPDE_TTE_INPUT` | error | An input the TTE npde (`compute_tte_npde()`) would score wrongly: no TTE endpoint, more than one (competing risks), a repeated-events endpoint, left truncation, an interval-censored record, more than one record per subject on the endpoint, a time that is not finite and non-negative, a duplicated subject id, no record on the endpoint, or `nsim = 0`. A fit with `npde_nsim > 0` reports the same input as the warning `W_NPDE_TTE_SKIPPED` and still succeeds. |
+| `W_NPDE_TTE_SKIPPED` | warning | A fit with `npde_nsim > 0` could not score its time-to-event records: a repeated-events endpoint, competing risks, left truncation, an interval-censored record, or a failed reference simulation. The warning quotes the reason. The `NPDE` / `NPD` cells of the TTE rows are blank; every other row is scored as usual and the fit succeeds. |
+
 #### File entry points {#codes-file-entry-points}
 
 Refusals of the file entry points (`fit_from_files()`, `prepare_run()`, `run_model_with_data()`, `run_model_simulate()` and their variants, which `ferx` runs) and of `fit()` itself, for inputs `ferx check` does not read ([#1788](https://github.com/FeRx-NLME/ferx-core/issues/1788)).
