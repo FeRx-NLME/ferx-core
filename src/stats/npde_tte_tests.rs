@@ -752,13 +752,17 @@ fn ode_hazard_and_joint_subjects() {
 }
 
 /// D6. A replicate with no event is in the denominator, and its per-subject simulator
-/// warning comes back once, with a count, not once per replicate. A Gompertz hazard
-/// with `gamma < 0` has a cure fraction: a replicate that never has an event is a
-/// legitimate "never", which the simulator reports as `W_TTE_DEGENERATE_HAZARD`.
-/// Measured: 493 raw warnings over 3 subjects × 250 replicates.
+/// warning comes back once, with a count, not once per replicate or per batch. A
+/// Gompertz hazard with `gamma < 0` has a cure fraction: a replicate that never has an
+/// event is a legitimate "never", which the simulator reports as
+/// `W_TTE_DEGENERATE_HAZARD`. The simulator already reports it once per (subject, CMT)
+/// per run (#1648); the reference runs in batches of [`BATCH`], so the batches' tallies
+/// are folded before rendering. Measured: 3 lines, one per subject, each counted over
+/// all 250 replicates (9 lines, 3 per batch, without the fold of #2933 × #2909).
 ///
-/// Dies on: the fold skipped (493 strings); a no-event replicate dropped from the
-/// denominator (fewer than 250 drawn); the count in the folded text wrong.
+/// Dies on: the batch tallies rendered per batch (9 lines, or "of 100 replicates"); a
+/// no-event replicate dropped from the denominator (fewer than 250 drawn); a count that
+/// is not the subject's own no-event replicates; the count in the folded text wrong.
 #[test]
 fn no_event_replicates_count_and_their_warnings_fold() {
     let m = model(
@@ -768,12 +772,32 @@ fn no_event_replicates_count_and_their_warnings_fold() {
     let scored = scored_records(&p, 2).unwrap();
     let (before, drawn, raw) =
         reference_counts(&m, &p, &m.default_params, 250, 5, None, 2, &scored).unwrap();
+    // The fixture must span more than one batch.
+    const _: () = assert!(BATCH < 250);
     assert_eq!(drawn, vec![250; 3]);
     let raw = tte_warnings(raw);
-    assert!(raw.len() > 250, "{} raw warnings", raw.len());
-    assert!(raw
-        .iter()
-        .all(|w| w.starts_with("W_TTE_DEGENERATE_HAZARD: ")));
+    assert_eq!(raw.len(), 3, "one line per subject: {raw:#?}");
+    for (i, w) in raw.iter().enumerate() {
+        let head = format!(
+            "W_TTE_DEGENERATE_HAZARD: subject '{}' (CMT=2) ",
+            p.subjects[i].id
+        );
+        assert!(w.starts_with(&head), "{w}");
+        // "censored at the observation window in k of 250 replicates (sim …)".
+        let k: usize = w
+            .split("observation window in ")
+            .nth(1)
+            .and_then(|r| r.split(" of 250 replicates (sim ").next())
+            .and_then(|k| k.parse().ok())
+            .unwrap_or_else(|| panic!("no count over 250 replicates in {w}"));
+        // A no-event replicate has no event before anything, so k and before[i] are
+        // disjoint replicates; subject index 1 is scored at the horizon, where every
+        // replicate with an event inside it counts.
+        assert!(
+            k > 0 && k + before[i] <= 250,
+            "k = {k}, before = {before:?}"
+        );
+    }
     // The cure fraction is exp(−α/|γ|) = exp(−0.4) ≈ 0.67: about a third have an event.
     assert!(before[1] > 50 && before[1] < 120, "{before:?}");
 
@@ -784,11 +808,10 @@ fn no_event_replicates_count_and_their_warnings_fold() {
     };
     assert!(w.starts_with(&raw[0]), "{w}");
     assert!(
-        w.ends_with(&format!(
-            " [{} `W_TTE_DEGENERATE_HAZARD` warnings were raised over the 250 npde reference \
-             replicates; the first is shown.]",
-            raw.len()
-        )),
+        w.ends_with(
+            " [3 `W_TTE_DEGENERATE_HAZARD` warnings were raised over the 250 npde reference \
+             replicates; the first is shown.]"
+        ),
         "{w}"
     );
     assert!(out.iter().all(|s| s[0].pd.is_finite()));

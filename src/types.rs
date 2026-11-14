@@ -8742,14 +8742,22 @@ pub struct FitResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_csv: Option<String>,
     /// Number of outer iterations in which at least one subject had an
-    /// unconverged EBE.  Always `0` for SAEM (which uses MH sampling).
+    /// unconverged EBE.  Always `0` for SAEM (which uses MH sampling). An evaluation whose
+    /// inner pass stopped once the EBE guard's rejection was certain (#2709) always counts
+    /// here. The full pass would instead have counted as a non-finite objective if its OFV
+    /// was non-finite and only the unconverged fraction tripped the guard. The evaluation is
+    /// rejected with the same penalty either way.
     pub ebe_convergence_warnings: u32,
-    /// Worst-case number of unconverged subjects in a single outer iteration.
+    /// Worst-case number of unconverged subjects in a single outer iteration. An evaluation
+    /// whose inner pass stopped once the EBE guard's rejection was certain (#2709) counts the
+    /// subjects it solved, so its count is a lower bound; a run with no feasible evaluation
+    /// never stops one.
     pub max_unconverged_subjects: u32,
     /// How many times, summed over every inner loop (not a count of distinct subjects), an
     /// inner solve returned a fallback's point (`EbeResult::used_fallback`): the recovery
     /// after the primary search failed its certificate, or the runaway-EBE guard's. A solve
-    /// whose fallback point a multi-start candidate then replaced is not counted (#2589).
+    /// whose fallback point a multi-start candidate then replaced is not counted (#2589), nor
+    /// a subject an inner pass left unsolved once the EBE guard's rejection was certain (#2709).
     /// Counted only by the outer loop under an NLopt optimizer (`auto`, `bobyqa`, `slsqp`,
     /// `mma`, and `nlopt_lbfgs` with its model-file aliases `lbfgs` / `bfgs`), for FOCE,
     /// FOCEI, Laplace and AGQ alike; by a fit with a `profile`d level block; and by Bayes'
@@ -8763,7 +8771,8 @@ pub struct FitResult {
     /// stop was not a mode and the stationarity certificate moved it there with the gradient.
     /// The primary search's moved point is not a fallback. Always `0` under every other
     /// `inner_optimizer`, and counted only on the paths that count `total_ebe_fallbacks`
-    /// (#2571).
+    /// (#2571). A subject an inner pass left unsolved once the EBE guard's rejection was
+    /// certain (#2709) is not counted.
     pub total_ebe_nm_polished: u32,
     /// Outcome of the post-estimation covariance step.
     pub covariance_status: CovarianceStatus,

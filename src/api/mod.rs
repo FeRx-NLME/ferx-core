@@ -152,6 +152,8 @@ pub use run::{
 };
 pub(crate) use simulate::check_theta_length;
 #[cfg(feature = "survival")]
+pub(crate) use simulate::simulate_with_options_tallied;
+#[cfg(feature = "survival")]
 pub use vpc_kmmc::{vpc_kmmc, KmmcVpc, KmmcVpcStratum, VpcKmmcOptions};
 #[cfg(feature = "survival")]
 pub use vpc_rtte::{vpc_rtte, RtteMcfBand, RtteOrderBand, RtteVpc, RtteVpcStratum, VpcRtteOptions};
