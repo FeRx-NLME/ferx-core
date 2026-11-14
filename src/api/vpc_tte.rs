@@ -23,6 +23,14 @@
 //! replicates too little censoring and a band too narrow: measured coverage 0.855
 //! for a nominal 0.90 at 3H/4 with 45 % censored, against 0.91 with the draw.
 //! [`VpcCensoring::Horizon`] skips the step and censors every replicate at `H`.
+//!
+//! **The data on `[0, H]` only.** The observed records are cut at `H` the same way
+//! [`vpc_rtte`](super::vpc_rtte) cuts its streams (#2950): a record after `H` becomes a
+//! censoring at `H`, and an event exactly at `H` is kept. The result is the one for the
+//! data cut at `H` first. On `[0, H]` the curve and its band are the same either way;
+//! what changes is the raw `observed` curve, which now ends at `H` instead of running
+//! past the band, and `obs_on_grid` at a [`VpcGrid::Times`] point past `H`, now `None`.
+//! With `sim.horizon` unset `H` is the latest record and nothing is cut.
 
 use super::simulate::simulate_with_options_impl;
 use super::{SimulateOptions, SimulationResult};
@@ -102,6 +110,7 @@ pub struct VpcTteOptions {
     pub cmt: Option<usize>,
     /// Passed to the simulator. `sim.seed` seeds the replicates and the censoring draws;
     /// `sim.horizon` is `H`, and when `None` `H` is the latest time recorded on `cmt`.
+    /// The observed data are read on `[0, H]` only (see the module doc).
     pub sim: SimulateOptions,
 }
 
@@ -688,12 +697,22 @@ pub fn vpc_tte(
     let probs = opts.probs;
     check_band_options(Entry::Tte, probs, opts.n_sim, &opts.grid)?;
     let cmt = resolve_cmt(Entry::Tte, model, opts.cmt)?;
-    let (rows, values, labels) = observed_rows(Entry::Tte, population, cmt, &opts.stratify)?;
+    let (mut rows, values, labels) = observed_rows(Entry::Tte, population, cmt, &opts.stratify)?;
     let horizon = opts.sim.horizon.unwrap_or_else(|| {
         rows.iter()
             .map(|r| r.time)
             .fold(f64::NEG_INFINITY, f64::max)
     });
+    // The data on [0, H] only (module doc): a record after H is a censoring at H, an
+    // event at H is kept. `censor_at` is left as it was: past H it could only censor a
+    // replicate draw later than H, and no draw is.
+    for r in &mut rows {
+        if r.time > horizon {
+            r.time = horizon;
+            r.event = false;
+        }
+    }
+
     let n_strata = values.len();
     let (reps, warnings) = simulate_replicates(
         model,
