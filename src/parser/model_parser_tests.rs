@@ -9869,6 +9869,89 @@ fn ruv_magnitude_diamond_is_judged_linearly() {
     assert_eq!(m, vec![21.0]);
 }
 
+/// A model whose magnitude reads a counted θ block `RUV[3]` through an
+/// index assigned in [individual_parameters] (#2915 review 2). `GRP` is a
+/// declared column. θ = [TVCL, TVV, RUV[1..3]].
+fn ruv_gather_model(indiv: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV[3](1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+{indiv}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * RUV[IDX])
+[covariates]
+  GRP continuous
+"#
+    )
+}
+
+/// The gather index columns the pre-fit check will walk.
+fn ruv_gather_index_columns(model: &CompiledModel) -> Vec<(String, String)> {
+    model
+        .theta_blocks()
+        .index_columns()
+        .map(|(b, c, _)| (b.to_string(), c.to_string()))
+        .collect()
+}
+
+/// Review 2 (#2915): the parse records `RUV[IDX]` as a gather over a data
+/// column `IDX` before substitution makes the index the literal `2`. That
+/// stale record made fit/predict demand an `IDX` column the expression never
+/// reads (`E_THETA_GATHER_INDEX_MISSING`). After substitution the literal is
+/// folded to level 2's θ, as `RUV[2]` written inline is, and no column is
+/// recorded.
+#[test]
+fn ruv_magnitude_assigned_literal_gather_index_folds_and_records_no_column() {
+    let model = parse_full_model(&ruv_gather_model("  IDX = 2"))
+        .unwrap()
+        .model;
+    assert!(
+        ruv_gather_index_columns(&model).is_empty(),
+        "{:?}",
+        ruv_gather_index_columns(&model)
+    );
+    let s = magnitude_rows_subject(&[(1, 1.0)], "GRP");
+    let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
+    assert_eq!(rows[0][0], 2.2);
+}
+
+/// The column the substituted index reads is the one recorded — `GRP`, never
+/// the name as written — so the pre-fit level check walks the right column,
+/// and each row reads its own level.
+#[test]
+fn ruv_magnitude_assigned_column_gather_index_records_the_substituted_column() {
+    let model = parse_full_model(&ruv_gather_model("  IDX = GRP"))
+        .unwrap()
+        .model;
+    assert_eq!(
+        ruv_gather_index_columns(&model),
+        vec![("RUV".to_string(), "GRP".to_string())]
+    );
+    let s = magnitude_rows_subject(&[(1, 1.0), (1, 3.0)], "GRP");
+    let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
+    assert_eq!((rows[0][0], rows[1][0]), (1.1, 3.3));
+}
+
+/// A substituted literal index is range-checked like a written one.
+#[test]
+fn ruv_magnitude_assigned_literal_gather_index_out_of_range_is_refused() {
+    let err = expect_parse_err(&ruv_gather_model("  IDX = 5"));
+    assert!(
+        err.contains("`RUV[5]`: level index must be an integer in 1..=3"),
+        "{err}"
+    );
+}
+
 /// A name whose value depends on η is refused by name, with the reason — not
 /// sent to [covariates], which is the wrong fix for a derived quantity. Also
 /// pins the transitive case: the η reaches `A` only through `CL`.

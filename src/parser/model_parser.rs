@@ -23497,6 +23497,7 @@ fn build_ruv_magnitude(
             // A residual magnitude reads θ by name (#484), so it reads a block too.
             level_blocks: LevelBlockScope::Readable,
         };
+        let gather_mark = gather_uses_len();
         let mut expr = parse_scalar_expression(src, ctx)
             .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
         // A name assigned in [individual_parameters] reads its value, as in every
@@ -23508,6 +23509,13 @@ fn build_ruv_magnitude(
             "power exponent"
         };
         let inlined = resolve_ruv_indiv_names(&mut expr, &indiv_scope, what_long)?;
+        if !inlined.is_empty() {
+            // The parse recorded gather sites against the names as written; the
+            // substituted tree may read other columns, or a literal (review 2).
+            truncate_gather_uses(gather_mark);
+            renormalize_rewritten_gathers(&mut expr)
+                .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
+        }
         validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref()).map_err(|e| {
             if inlined.is_empty() {
                 e
@@ -24831,6 +24839,63 @@ fn record_gather_use(block: &str, index_covariate: &str, n_levels: usize) {
             v.push(use_);
         }
     });
+}
+
+/// How many gather sites the active parse has recorded — a mark for
+/// [`truncate_gather_uses`].
+fn gather_uses_len() -> usize {
+    GATHER_USES.with(|c| c.borrow().len())
+}
+
+/// Forget the gather sites recorded after `mark`. Only sites that one parse
+/// *added* are dropped: a site it re-recorded was deduplicated against an
+/// earlier reader and stays.
+fn truncate_gather_uses(mark: usize) {
+    GATHER_USES.with(|c| c.borrow_mut().truncate(mark));
+}
+
+/// Re-derive what the parser derives from a counted block's index, on a tree
+/// that was rewritten after parsing (#2915 review 2): substituting an
+/// `[individual_parameters]` name into an index changes which column it reads,
+/// or makes it a literal. A column index is recorded for the pre-fit level
+/// check ([`record_gather_use`]); a literal one is range-checked and, on a
+/// free level, folded to the plain θ read — both exactly as written text
+/// would be. A data-driven block's bare read carries its index column
+/// implicitly and is never recorded, so it is left alone here too.
+fn renormalize_rewritten_gathers(expr: &mut Expression) -> Result<(), String> {
+    let mut err: Option<String> = None;
+    visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
+        if err.is_some() {
+            return;
+        }
+        let Expression::ThetaGather { spec, idx } = e else {
+            return;
+        };
+        let counted = lookup_vector_theta(&spec.name).is_some_and(|d| d.index_covariate.is_none());
+        if !counted {
+            return;
+        }
+        let n_levels = spec.levels.len();
+        match idx.as_ref() {
+            Expression::Covariate(col) => record_gather_use(&spec.name, col, n_levels),
+            Expression::Literal(v) => {
+                let v = *v;
+                if v.fract() != 0.0 || v < 1.0 || v as usize > n_levels {
+                    err = Some(format!(
+                        "`{}[{v}]`: level index must be an integer in 1..={n_levels}",
+                        spec.name
+                    ));
+                } else if let LevelRule::Free(t) = spec.levels[v as usize - 1] {
+                    *e = Expression::Theta(t as usize);
+                }
+            }
+            _ => {}
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Identifiability convention applied to a a level block θ block (#1064).
