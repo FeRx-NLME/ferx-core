@@ -663,6 +663,10 @@ impl Tr {
     pub(crate) fn reg(self) -> u32 {
         self.r
     }
+    /// A literal `1`: data only, so its value is the same on every evaluation.
+    fn is_unit(self) -> bool {
+        !self.dep && self.v == 1.0
+    }
 }
 
 impl Add for Tr {
@@ -680,12 +684,24 @@ impl Sub for Tr {
 impl Mul for Tr {
     type Output = Self;
     fn mul(self, o: Self) -> Self {
+        // `x · 1` is `x` bit for bit (NaN, ±∞ and ±0 included): a literal one records nothing,
+        // so a spelling that multiplies by it (`weight = 1` → `κ/√1`) is the same program as
+        // the plain one, not a second program with its own rounding.
+        if o.is_unit() {
+            return self;
+        }
+        if self.is_unit() {
+            return o;
+        }
         self.bin(o, T_MUL, self.v * o.v, |d, a, b| Flat::Mul { d, a, b })
     }
 }
 impl Div for Tr {
     type Output = Self;
     fn div(self, o: Self) -> Self {
+        if o.is_unit() {
+            return self;
+        }
         self.bin(o, T_DIV, self.v / o.v, |d, a, b| Flat::DivRaw { d, a, b })
     }
 }
@@ -1035,9 +1051,15 @@ impl crate::sens::num::vm::VmArith for Tr {
         *self = self.scalar(c, T_RSUBK, c - self.v, |d, a, c| Flat::RSubK { d, a, c });
     }
     fn mul_scalar_in(&mut self, c: f64) {
+        if c == 1.0 {
+            return;
+        }
         *self = self.scalar(c, T_MULK, self.v * c, |d, a, c| Flat::MulK { d, a, c });
     }
     fn div_scalar_in(&mut self, c: f64) {
+        if c == 1.0 {
+            return;
+        }
         let v = if c.abs() < 1e-30 { 0.0 } else { self.v / c };
         *self = self.scalar(c, T_DIVK, v, |d, a, c| Flat::DivK { d, a, c });
     }

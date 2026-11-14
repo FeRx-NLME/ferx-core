@@ -9981,3 +9981,87 @@ fn linear_ode_plan_values_are_bit_equal_to_the_native_predictor() {
     assert!(served, "iov: plan serves");
     assert_eq!(worst, 0, "iov: {worst} ulp");
 }
+
+/// A weighted kappa (`weight = W`, #1031) is `exp(ETA + KAPPA/sqrt(W))`; its exact outer gradient
+/// must match the reconverged-FD oracle at a non-unit weight as at `W = 1`, where the spelling
+/// is also the plain `κ` (bit for bit, below).
+fn weighted_kappa_src(weight: &str) -> String {
+    format!(
+        "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n  \
+         theta TVKA(1.5, 0.01, 50.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.04\n  \
+         kappa KAPPA_CL ~ 0.05{weight}\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n  KA = TVKA\n\
+         [structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  iov_column = OCC\n"
+    )
+}
+
+fn weighted_kappa_subject(model: &CompiledModel) -> Subject {
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 14.0, 18.0, 24.0];
+    let mut s = subject_shell(doses, &times);
+    s.occasions = times
+        .iter()
+        .map(|&t| if t < 12.0 { 1 } else { 2 })
+        .collect();
+    s.dose_occasions = vec![1, 2];
+    let preds = crate::pk::compute_predictions_with_tv(
+        model,
+        &s,
+        &model.default_params.theta,
+        &[0.1, -0.05],
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
+        .collect();
+    s
+}
+
+#[test]
+fn weighted_kappa_gradient_matches_reconverged_fd() {
+    for weight in [" weight = 1", " weight = 2.5"] {
+        let model = parse_model_string(&weighted_kappa_src(weight)).unwrap();
+        assert!(model.has_weighted_kappa());
+        let s = weighted_kappa_subject(&model);
+        for interaction in [false, true] {
+            let worst = parity_for(&model, &s, interaction);
+            // Measured 2.8e-12 worst (Richardson reconverged FD); bound 1e-10 leaves ~35x.
+            assert!(
+                worst < 1e-10,
+                "{weight}, interaction {interaction}: worst relative difference {worst:.2e}"
+            );
+        }
+    }
+}
+
+/// `weight = 1` is the degenerate weight: the plan it records is the plain `κ`'s, so the exact
+/// outer gradient is the same bits, not merely the same to rounding (the #1082 oracle, where one
+/// L-BFGS step turns a 1-ulp gradient difference into a different iterate).
+#[test]
+fn unit_weight_gradient_is_the_plain_kappas_bit_for_bit() {
+    let plain = parse_model_string(&weighted_kappa_src("")).unwrap();
+    let unit = parse_model_string(&weighted_kappa_src(" weight = 1")).unwrap();
+    let (sp, su) = (
+        weighted_kappa_subject(&plain),
+        weighted_kappa_subject(&unit),
+    );
+    for interaction in [false, true] {
+        let grad = |m: &CompiledModel, s: &Subject| {
+            let p = moved_params(m);
+            let eta = ebe_for(m, s, &p, 1e-11, interaction);
+            subject_adjoint_packed_gradient(m, s, &p, &pack_params(&p), eta.as_slice(), interaction)
+                .expect("in scope")
+        };
+        let bits = |v: Vec<f64>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(
+            bits(grad(&plain, &sp)),
+            bits(grad(&unit, &su)),
+            "interaction {interaction}"
+        );
+    }
+}
