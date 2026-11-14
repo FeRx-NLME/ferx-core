@@ -108,16 +108,18 @@ sdtab row, not the class-1 default.
 
 A mixture objective has local optima where fewer than `nsub` classes are in use.
 Two classes can end up describing the same subpopulation, or one class can end up
-holding nobody. After every mixture fit, ferx checks the final posteriors for both
+holding nobody. After every mixture fit, ferx checks the final evaluation for both
 and warns `W_MIXTURE_MERGED_CLASSES`, naming each pair or class it finds (#2907):
 
 - **Merged pair.** Both classes carry posterior mass, and no subject's data favours
   one over the other by more than 1 log-likelihood unit:
   $\max_i |\text{nll}_{ia} - \text{nll}_{ib}| < 1$. That is how far each subject's
   posterior class odds moved from its prior odds,
-  $\ln(\text{PMIX}_{ia}/\text{PMIX}_{ib}) - \ln(p_{ia}/p_{ib})$. The test is on the
-  objective, not on the parameters, so it also catches classes that are equal but
-  written two different ways.
+  $\ln(\text{PMIX}_{ia}/\text{PMIX}_{ib}) - \ln(p_{ia}/p_{ib})$. It is computed from
+  the class objectives, not rebuilt from $\text{PMIX}$, so a subject that a third class
+  dominates so strongly that both posteriors underflow to 0 still counts. The test is
+  on the objective, not on the parameters, so it also catches classes that are equal
+  but written two different ways.
 - **Empty class.** No subject's posterior probability of the class reaches 0.01.
 
 The thresholds were measured on `tests/nonmem/mixture_iv.csv` with Ω and Σ

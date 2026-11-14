@@ -2702,12 +2702,7 @@ fn fit_inner(
         }
         // #2907: a fit that ends with two classes merged, or one class empty, has fewer
         // distinct classes than `nsub` — often a local optimum the user should know about.
-        let collapse = crate::estimation::mixture::merged_classes(
-            model,
-            population,
-            &result.params.theta,
-            &mp.pmix,
-        );
+        let collapse = crate::estimation::mixture::merged_classes_from(&mp.class_nll, &mp.pmix);
         result
             .warnings
             .extend(crate::estimation::mixture::merged_classes_warning(
