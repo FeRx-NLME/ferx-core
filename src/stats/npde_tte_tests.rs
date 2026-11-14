@@ -752,12 +752,19 @@ fn ode_hazard_and_joint_subjects() {
 }
 
 /// D6. A replicate with no event is in the denominator, and its per-subject simulator
-/// warning comes back once, with a count, not once per replicate. A Gompertz hazard
-/// with `gamma < 0` has a cure fraction: a replicate that never has an event is a
-/// legitimate "never", which the simulator reports as `W_TTE_DEGENERATE_HAZARD`.
-/// Measured: 493 raw warnings over 3 subjects × 250 replicates.
+/// warning comes back once, with a count, not once per replicate or per batch. A
+/// Gompertz hazard with `gamma < 0` has a cure fraction: a replicate that never has an
+/// event is a legitimate "never", which the simulator reports as
+/// `W_TTE_DEGENERATE_HAZARD`.
 ///
-/// Dies on: the fold skipped (493 strings); a no-event replicate dropped from the
+/// Since #2933 (#1648) the simulator itself reports that warning once per subject and
+/// CMT per call, with the number of replicates it happened in. The reference draws run
+/// in calls of `BATCH` replicates, so 250 replicates are 3 calls (100, 100, 50) and
+/// every one of the 3 subjects, each with a cure fraction of about two thirds, has a
+/// line in every call: 9 raw lines (measured), each naming its call's replicate count.
+/// Before #2933 there was one line per replicate (493 measured).
+///
+/// Dies on: the fold skipped (9 strings); a no-event replicate dropped from the
 /// denominator (fewer than 250 drawn); the count in the folded text wrong.
 #[test]
 fn no_event_replicates_count_and_their_warnings_fold() {
@@ -770,10 +777,24 @@ fn no_event_replicates_count_and_their_warnings_fold() {
         reference_counts(&m, &p, &m.default_params, 250, 5, None, 2, &scored).unwrap();
     assert_eq!(drawn, vec![250; 3]);
     let raw = tte_warnings(raw);
-    assert!(raw.len() > 250, "{} raw warnings", raw.len());
+    let calls = 250_usize.div_ceil(BATCH);
+    assert_eq!(calls, 3);
+    assert_eq!(
+        raw.len(),
+        3 * calls,
+        "one line per subject per call: {raw:#?}"
+    );
     assert!(raw
         .iter()
         .all(|w| w.starts_with("W_TTE_DEGENERATE_HAZARD: ")));
+    // Each line counts the replicates of its own call (#1648), not one replicate.
+    for (k, w) in raw.iter().enumerate() {
+        let n = if k / 3 < 2 { 100 } else { 50 };
+        assert!(
+            w.contains(&format!(" of {n} replicates (sim ")),
+            "line {k}: {w}"
+        );
+    }
     // The cure fraction is exp(−α/|γ|) = exp(−0.4) ≈ 0.67: about a third have an event.
     assert!(before[1] > 50 && before[1] < 120, "{before:?}");
 
