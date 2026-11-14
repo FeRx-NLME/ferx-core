@@ -804,13 +804,23 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
                     al.ln(&g)
                 }
                 Unary::Sqrt => {
-                    // `apply_unary`'s `v ≥ 0` test, then `guard_floor(0.0)`'s constant zero:
-                    // a `NaN` floors and `−0.0` passes through, on one lane and on a dual.
+                    // `apply_unary`'s `Sqrt`: the type's `sqrt` of a positive argument, else
+                    // the constant `±0` (a `−0.0` or `+0` argument) or `+0` (negative, `NaN`).
+                    // The dead `sqrt` runs on `1`, so neither arm computes an `inf` or a
+                    // `NaN` a reverse pass could multiply into an adjoint; the constant's
+                    // value is `select(v ≥ 0, v, 0) · 0`, which keeps a zero's sign and has a
+                    // zero derivative.
                     let z = al.k(0.0);
-                    let keep = al.ins(Inst::Cmp(Cc::Ge, x[0], z));
-                    let floor = al.constant(z);
-                    let g = al.select(keep, &x, &floor);
-                    al.sqrt(&g)
+                    let one = al.k(1.0);
+                    let pos = al.ins(Inst::Cmp(Cc::Gt, x[0], z));
+                    let ones = al.constant(one);
+                    let g = al.select(pos, &x, &ones);
+                    let root = al.sqrt(&g);
+                    let nonneg = al.ins(Inst::Cmp(Cc::Ge, x[0], z));
+                    let zero = al.ins(Inst::Select(nonneg, x[0], z));
+                    let v0 = al.ins(Inst::Mul(zero, z));
+                    let flat = al.constant(v0);
+                    al.select(pos, &root, &flat)
                 }
                 Unary::Abs => al.abs(&x),
                 Unary::Floor => {

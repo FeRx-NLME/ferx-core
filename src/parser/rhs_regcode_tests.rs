@@ -1642,9 +1642,13 @@ const SQRT_ODES: &str = "  d/dt(x1) = sqrt(x1)
 
 /// `sqrt` at its guard, on every route: the `f64` lane VM, the generic interpreter on the
 /// duals, the register code and the native code, bit for bit — at a negative argument, `0`,
-/// `−0.0`, a `NaN`, a subnormal-adjacent value and an ordinary one. And the guard's meaning,
-/// pinned on the values: a negative or `NaN` argument floors to `+0`, `−0.0` passes through
-/// (the `v ≥ 0` test, not `f64::max`, whose signed-zero result is not specified).
+/// `−0.0`, a `NaN`, a tiny value and an ordinary one. And the guard's meaning, pinned on the
+/// values: a negative or `NaN` argument floors to `+0`, `−0.0` passes through (the `v ≥ 0`
+/// test, not `f64::max`, whose signed-zero result is not specified), and a non-positive
+/// argument is a constant, with exactly zero jets — not the `inf · 0 = NaN` of a dual's own
+/// `sqrt` at `0`, whose bits optimised code does not reproduce across routes (#2844).
+/// (The tiny value is `1e-100`, not smaller: below ~`1e-123` a dual's `h2 = −0.25/s³`
+/// overflows on every route alike, which is `sqrt`'s singularity, not the guard.)
 #[test]
 fn sqrt_at_its_guard_is_the_interpreter_bit_for_bit_on_every_route() {
     use crate::sens::dual1::Dual1;
@@ -1655,7 +1659,7 @@ fn sqrt_at_its_guard_is_the_interpreter_bit_for_bit_on_every_route() {
     let n_params = crate::types::MAX_PK_PARAMS + 2;
     let p: Vec<f64> = (0..n_params).map(|i| 0.4 + i as f64 / 5.0).collect();
     let s = [1.75, 0.0, 0.0, f64::EPSILON];
-    for x in [-1.0, 0.0, -0.0, f64::NAN, 1e-300, 2.25] {
+    for x in [-1.0, 0.0, -0.0, f64::NAN, 1e-100, 2.25] {
         let u = [x, x, x];
         let label = format!("x = {x:?}");
         // f64: the production lane VM against the register code.
@@ -1705,6 +1709,26 @@ fn sqrt_at_its_guard_is_the_interpreter_bit_for_bit_on_every_route() {
             &[sf[0], sf[1], sf[2], sf[3]],
             &label
         ));
+        // The jets of `sqrt(x1)` on the register and the native code: zero where the
+        // argument is not positive (`lift_f` keeps `x`'s sign and zeros), live otherwise.
+        let sf4 = [sf[0], sf[1], sf[2], sf[3]];
+        let mut du_native = vec![DualF::<2, 0>::constant(9.0); 3];
+        let mut regs = vec![DualF::<2, 0>::constant(0.0); reg.n_regs()];
+        reg.run(&uf, &pf, &sf4, &mut du_native, &mut regs);
+        let a = uf[0].v; // `0.5 · x`
+        let want_f = if a.is_nan() || a < 0.0 { 0.0 } else { a.sqrt() };
+        for du in [run_without_jit(reg, &uf, &pf, &sf4), du_native] {
+            assert_eq!(du[0].v.to_bits(), want_f.to_bits(), "{label}: DualF value");
+            if x > 0.0 {
+                assert!(du[0].g[0] > 0.0, "{label}: live jet {:?}", du[0].g);
+            } else {
+                assert!(
+                    du[0].g.iter().all(|g| g.to_bits() == 0),
+                    "{label}: jets {:?}",
+                    du[0].g
+                );
+            }
+        }
         let lift_v = |v: &[f64]| -> Vec<DualV<2, 3>> {
             v.iter()
                 .enumerate()

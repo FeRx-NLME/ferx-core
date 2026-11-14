@@ -442,7 +442,8 @@ values agree to five or more significant digits, some with one or two iterations
 fewer. A block keeps the interpreter if it uses a statement-level `if (cond) { ... }` block,
 `inv_logit`, `logit`, `tanh`, `softplus`, `sin`, `cos`, `pnorm` or `mod`, or reads anything
 other than the states, the individual parameters, its own intermediate variables, literals and
-the time variables. `sqrt` compiles (as `sqrt(max(x, 0))`, the interpreter's guard), so a
+the time variables. `sqrt` compiles (as `sqrt(max(x, 0))`, the interpreter's guard, with a
+zero derivative where the argument is not positive), so a
 quasi-steady-state root such as `0.5 * (B + sqrt(B * B + 4 * KSS * CT))` no longer needs to be
 written with `^ 0.5` to get native code.
 

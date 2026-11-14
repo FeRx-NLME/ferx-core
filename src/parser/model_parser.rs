@@ -30331,17 +30331,19 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
     match op {
         Op::Exp => v.exp(),
         Op::Ln => v.guard_floor(1e-30).ln(),
-        // `guard_floor(0.0)` behind the `v >= 0` test the duals' own guard and the `f64` lane
-        // VM (`eval_bytecode`) use, so `−0.0` passes through on every type: `f64::max(−0.0,
-        // 0.0)` may return either zero, which would make the sign of `sqrt(−0.0)` depend on
-        // the platform and differ from the lane VM's (#2844).
+        // A positive argument is the type's own `sqrt`. Anything else is a constant, so the
+        // derivative there is zero (`Dual1::sqrt`'s convention): `inf · 0` would otherwise put
+        // a `NaN` in the jets, whose bits optimised code does not reproduce from one route to
+        // the next (#2844). The value is the `f64` lane VM's (`eval_bytecode`): `±0` passes
+        // through as `sqrt(±0) = ±0`, and a negative or `NaN` argument floors to `+0`. The
+        // `v >= 0` test, not `f64::max`, whose signed-zero result is not specified.
         Op::Sqrt => {
-            let g = if v.val() >= 0.0 {
-                v
+            let x = v.val();
+            if x > 0.0 {
+                v.sqrt()
             } else {
-                v.guard_floor(0.0)
-            };
-            g.sqrt()
+                T::from_f64(if x >= 0.0 { x } else { 0.0 })
+            }
         }
         Op::Abs => v.abs(),
         Op::Floor => T::from_f64(v.val().floor()),
