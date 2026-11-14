@@ -5900,17 +5900,30 @@ fn test_parse_fit_options_applies_known_keys() {
 #[test]
 fn test_parse_data_block_path() {
     let (path, map) = parse_data_block(&["path = warfarin.csv".to_string()]).unwrap();
-    assert_eq!(path, "warfarin.csv");
+    assert_eq!(path.as_deref(), Some("warfarin.csv"));
     assert!(map.is_empty());
     // Quoted paths (e.g. containing spaces) are accepted, quotes stripped.
     let (path, _) = parse_data_block(&["path = \"my data.csv\"".to_string()]).unwrap();
-    assert_eq!(path, "my data.csv");
+    assert_eq!(path.as_deref(), Some("my data.csv"));
 }
 
+/// #2914: `path` is optional — a block carrying only column maps parses, with
+/// no path and the maps intact, so a caller-supplied dataset can use them.
 #[test]
-fn test_parse_data_block_missing_path_is_error() {
-    let err = parse_data_block(&[]).unwrap_err();
-    assert!(err.contains("missing required key `path`"), "{err}");
+fn test_parse_data_block_without_path_keeps_column_map() {
+    let (path, map) =
+        parse_data_block(&["TIME = TAFD".to_string(), "DV = CONC".to_string()]).unwrap();
+    assert_eq!(path, None);
+    assert_eq!(
+        map,
+        vec![
+            ("TIME".to_string(), "TAFD".to_string()),
+            ("DV".to_string(), "CONC".to_string())
+        ]
+    );
+    let (path, map) = parse_data_block(&[]).unwrap();
+    assert_eq!(path, None);
+    assert!(map.is_empty());
 }
 
 #[test]
@@ -5938,7 +5951,7 @@ fn test_parse_data_block_column_mapping() {
         "DV = CONC".to_string(),
     ])
     .unwrap();
-    assert_eq!(path, "mydata.csv");
+    assert_eq!(path.as_deref(), Some("mydata.csv"));
     assert_eq!(
         map,
         vec![

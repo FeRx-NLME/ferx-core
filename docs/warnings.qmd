@@ -219,7 +219,7 @@ reports each one it can reach, so the two do not disagree:
 | the AGQ grid under IOV | `E_AGQ_GRID_TOO_LARGE` | with `--data` |
 | a derived `iov_occasion` that gives one occasion per subject | `E_IOV_SINGLE_OCCASION` | with `--data` |
 
-The file entry points add three: no data path and no `[data]` block
+The file entry points add three: no data path and no `[data] path`
 (`E_DATA_PATH_MISSING`); on `run_model_simulate()`, no `[simulation]` block
 (`E_MISSING_BLOCK`), a design with nothing to observe (`E_SIMULATION_DESIGN`), a
 design missing a covariate the model reads (`E_MISSING_COVARIATE`), a TTE
