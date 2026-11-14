@@ -1066,9 +1066,10 @@ replicate at `H` only. The draws are seeded by `sim.seed`.
 The observed data are read on `[0, H]` only, as `vpc_rtte()` reads its streams: a record
 after `H` becomes a censoring at `H`, and an event exactly at `H` is kept. So a `sim.horizon`
 below the data's follow-up gives exactly the result of calling `vpc_tte()` on the data cut at
-`H` first. The curve and its band on `[0, H]` are the same either way. What changes is the raw
-`observed` curve, which now ends at `H` instead of running past the band, and the observed
-value at a `VpcGrid::Times` point past `H`, which is now empty
+`H` first. At every time up to `H` the curve and its band are the same either way. What
+changes: the raw `observed` curve now ends at `H` instead of running past the band; the
+observed value at a `VpcGrid::Times` point past `H` is now empty; and the automatic grids can
+gain the point `H` itself, because the observed curve now steps there
 ([#2950](https://github.com/FeRx-NLME/ferx-core/issues/2950)). With `sim.horizon` unset nothing
 is cut.
 

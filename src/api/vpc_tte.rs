@@ -27,10 +27,12 @@
 //! **The data on `[0, H]` only.** The observed records are cut at `H` the same way
 //! [`vpc_rtte`](super::vpc_rtte) cuts its streams (#2950): a record after `H` becomes a
 //! censoring at `H`, and an event exactly at `H` is kept. The result is the one for the
-//! data cut at `H` first. On `[0, H]` the curve and its band are the same either way;
-//! what changes is the raw `observed` curve, which now ends at `H` instead of running
-//! past the band, and `obs_on_grid` at a [`VpcGrid::Times`] point past `H`, now `None`.
-//! With `sim.horizon` unset `H` is the latest record and nothing is cut.
+//! data cut at `H` first. At every time up to `H` the curve and its band are the same
+//! either way. What changes: the raw `observed` curve now ends at `H` instead of running
+//! past the band; `obs_on_grid` at a [`VpcGrid::Times`] point past `H` is now `None`;
+//! and [`VpcGrid::Auto`] or [`VpcGrid::AllSteps`] can gain the point `H` itself, since
+//! the observed curve now steps there (the last even point is not always `H` to the
+//! bit). With `sim.horizon` unset `H` is the latest record and nothing is cut.
 
 use super::simulate::simulate_with_options_impl;
 use super::{SimulateOptions, SimulationResult};
@@ -705,7 +707,9 @@ pub fn vpc_tte(
     });
     // The data on [0, H] only (module doc): a record after H is a censoring at H, an
     // event at H is kept. `censor_at` is left as it was: past H it could only censor a
-    // replicate draw later than H, and no draw is.
+    // replicate draw later than H, and no draw is. The censoring curve G does change at
+    // H (a row censored past H now counts there), but not before H, and a draw landing
+    // at H instead of past it gives c = H, which censors no draw ≤ H either.
     for r in &mut rows {
         if r.time > horizon {
             r.time = horizon;
