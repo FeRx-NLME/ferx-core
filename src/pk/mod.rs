@@ -1830,16 +1830,12 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// relative. (This `dose` snapshot only fixes each dose's *F* at its administration
 /// occasion; the running disposition occasion is `governing_segment_occ_at`'s job.)
 ///
-/// **A controller dose is the remaining [`predict_iov`] divergence.** A controller-issued
-/// dose is not a record in the driver, so it ends no segment. In `predict_iov` on the
-/// realized doses it is a dose row, which does. The two agree when, for each dosing
-/// decision, the first data record at or after it comes before the next decision (a
-/// decision with no data record at or after it does not matter: no observation is left to
-/// show a difference). Otherwise they can differ (#2895,
-/// `adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasion`): measured on #2771 with a bolus at each
-/// of the same four decisions, observations at 0, 12, 48, 72 differ by 5.3 % at t = 48
-/// and observations at 0, 72 by 9.4 % at t = 72. The frozen-replay verifier passes on
-/// both, because it shares the driver's convention.
+/// **A controller dose, and a hold.** Neither is a data record, but every decision is a
+/// record of the driver (#2895), and in [`predict_iov`] on the run's static equivalent an
+/// `EVID=2` row at each decision with no data row is too. The two then agree to the bit on
+/// every record layout, a held decision included
+/// (`the_run_equals_predict_iov_on_the_realized_doses_plus_a_record_per_decision`). Before
+/// #2895 they parted wherever a decision had no data record before the next one.
 ///
 /// **An `ADDL`-implied dose takes its governing record's occasion — agreement with
 /// [`predict_iov`], not a third divergence** (#2371). Since #1909 an implied dose's

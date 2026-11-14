@@ -103,6 +103,7 @@ pub(super) fn fixed_dose_spec(observe: Option<&str>, at: &[f64], dose: f64) -> A
         auc_target: None,
         round_to: None,
         dose_knowledge: Default::default(),
+        decision_covariates: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: -1e9,
@@ -349,13 +350,39 @@ fn auc_target_follows_a_covariate_that_changes_inside_a_window() {
             &DECISIONS,
         )
     };
-    let decision_off_grid = segs_off(R24);
+    // The decision at 24 is a record (#2895): `(12, 24]` runs under the row it carries — the
+    // LOCF row, the one at 12, under `decision_covariates = locf` (the default), and the row
+    // of the next data record, the one at 30, under `nocb`. `nocb` is the pre-#2895 value.
+    let decision_off_grid = segs_off(R12);
     run_tv(
         &tv_csv(&off_grid),
         &decision_off_grid,
         "decision with no data row",
     );
-    // The in-force row at 24 (the one at 12) for the readout, under the PK of the row at 30.
+    let nocb_off_grid = segs_off(R24);
+    {
+        let m = parse_model_string(MODEL_TV).expect("parse");
+        let pop = read_pop(&tv_csv(&off_grid), &TV_COVS);
+        let mut spec = fixed_dose_spec(Some(TV_OBSERVE), &DECISIONS, 100.0);
+        spec.decision_covariates = crate::sim::adaptive::DecisionCovariates::Nocb;
+        assert_window_aucs(
+            &m,
+            &pop,
+            &spec,
+            1,
+            &nocb_off_grid,
+            AUC_TOL,
+            "decision with no data row, nocb",
+        );
+    }
+    assert_distinct(
+        &decision_off_grid,
+        &nocb_off_grid,
+        AUC_TOL,
+        "locf vs nocb at a decision with no data row",
+    );
+    // A readout that mixes rows: the in-force row at 24 (the one at 12) for the signal's `FU`,
+    // under the PK of the row at 30.
     let (cl, v) = (5.0 * R24.0 / 100.0, 50.0 * R24.1 / 70.0);
     let in_force_fu = exact_window_aucs(
         &[
@@ -720,65 +747,62 @@ fn auc_target_reads_a_reset_rows_own_kappa() {
     );
 }
 
-// ── Past the final record: the covariate row travels with the PK carry ─────────────────
+// ── Past the final record: every decision is a record (#2895) ──────────────────────────
 
-/// An `ADDL` train past the last data record (review r1 #1). The dose at 0 implies doses at
-/// 12, 24 and 36; the only other record is the observation at 6. Each implied dose with no
-/// record ahead keeps its parent row (#1909), so `(6, 36]` runs under the dose row at 0.
-/// `(36, 48]` has no governing record: it runs under the PK the walk carries (the implied
-/// dose at 36, so the row at 0) and must read that same row — not the row in force at 48,
-/// which skips implied doses (#2528) and is the observation's at 6.
+/// An `ADDL` train past the last data record (review r1 #1, revised by #2895). The dose at 0
+/// implies doses at 12, 24 and 36; the only other record is the observation at 6. Every
+/// decision is a record, so each implied dose is governed by the first decision at or after
+/// it (24, 24 and 48), and every piece from 6 on runs under a decision's row: the row in force
+/// there, the observation's at 6 (implied doses are no record for that, #2528). Under `nocb`
+/// no data record follows any decision, so it falls back to the same row.
 ///
-/// Mutation: past the final record, read the in-force row (`locf_decision_cov`) instead of
-/// the carried one — this test dies (a 16% move in window 1, measured in review).
+/// Before #2895 each implied dose had no record ahead and kept its parent row (#1909), so
+/// `(6, 48]` ran under the dose row at 0, `(36, 48]` through the PK carry; that convention is
+/// asserted away. The carry past the last record no longer reaches a window AUC at all: every
+/// window ends at a decision, and the decision governs the piece that ends there.
 #[test]
-fn auc_target_past_the_last_record_reads_the_carried_row() {
+fn auc_target_past_the_last_record_runs_under_the_decision_records() {
     let rows = [
         (0.0, 1, 100.0, 12.0, 3, R0.0, R0.1, R0.2),
         obs_row(6.0, R12),
     ];
     // Base 100 at 0, 12, 24, 36, plus the controller's 100 at each decision.
     let boluses = [(0.0, 200.0), (12.0, 100.0), (24.0, 200.0), (36.0, 100.0)];
-    let with_tail = |tail_fu: f64| {
-        let tail = tv_seg(36.0, 48.0, R0);
+    let after_6 = |row| {
         exact_window_aucs(
             &[
                 tv_seg(0.0, 6.0, R12),
-                tv_seg(6.0, 12.0, R0),
-                tv_seg(12.0, 24.0, R0),
-                tv_seg(24.0, 36.0, R0),
-                Seg {
-                    factor: tail.factor / R0.2 * tail_fu,
-                    ..tail
-                },
+                tv_seg(6.0, 12.0, row),
+                tv_seg(12.0, 24.0, row),
+                tv_seg(24.0, 36.0, row),
+                tv_seg(36.0, 48.0, row),
             ],
             &boluses,
             &[],
             &DECISIONS,
         )
     };
-    let want = with_tail(R0.2);
+    let want = after_6(R12);
     run_tv(&tv_csv(&rows), &want, "ADDL train past the last record");
     assert_distinct(
         &want,
-        &with_tail(R12.2),
+        &after_6(R0),
         AUC_TOL,
-        "in-force row past the last record",
+        "parent row past the last record (before #2895)",
     );
 }
 
-/// The IOV twin of [`auc_target_past_the_last_record_reads_the_carried_row`], where a
-/// decision resets the carry. `V` reads both `WT` and κ, and the signal names `FU`. The dose
-/// at 0 implies one at 12; the observation at 6 is the last data record. `(12, 24]` runs
-/// under the carry the implied dose left (its parent row at 0, κ_0). The decision at 24 then
-/// resets the carry to `decision_pk[1]`, built from the row in force there (the observation
-/// at 6) under κ_1, so `(24, 48]` reads that row. The carried row is the one the PK came
-/// from at both points, which "the last record" alone would get wrong at the second.
+/// The IOV twin of [`auc_target_past_the_last_record_runs_under_the_decision_records`]
+/// (revised by #2895). `V` reads both `WT` and κ, and the signal names `FU`. The dose at 0
+/// implies one at 12; the observation at 6 is the last data record. Every decision is a
+/// record: the implied dose at 12 is governed by the decision at 24, so `(6, 12]` runs under
+/// its row (the observation's at 6) and its occasion (κ_1), as does `(12, 24]`; `(24, 48]`
+/// runs under the decision at 48 (κ_2).
 ///
-/// Mutations: read the in-force row past the last record — window 0 moves; read the last
-/// record's row (`last_at`, the implied dose at 12) — window 1 moves.
+/// Before #2895, `(6, 24]` ran under the implied dose's parent row at 0 and κ_0, and
+/// `(24, 48]` under the carry the decision at 24 set (κ_1); both are asserted away.
 #[test]
-fn auc_target_past_the_last_record_follows_a_decision_reset_under_iov() {
+fn auc_target_past_the_last_record_follows_the_decision_records_under_iov() {
     const MODEL_TV_IOV: &str = r#"
 [parameters]
   theta TVCL(5.0, 0.1, 50.0)
@@ -816,20 +840,17 @@ fn auc_target_past_the_last_record_follows_a_decision_reset_under_iov() {
         }
     };
     let boluses = [(0.0, 200.0), (12.0, 100.0), (24.0, 100.0)];
-    let aucs = |tail0_fu: f64, tail1_fu: f64| {
-        exact_window_aucs(
-            &[
-                seg(0.0, 6.0, R12, R12.2, kappa[0]),
-                seg(6.0, 12.0, R0, R0.2, kappa[0]),
-                seg(12.0, 24.0, R0, tail0_fu, kappa[0]),
-                seg(24.0, 48.0, R12, tail1_fu, kappa[1]),
-            ],
-            &boluses,
-            &[],
-            &DECISIONS,
-        )
-    };
-    let want = aucs(R0.2, R12.2);
+    let want = exact_window_aucs(
+        &[
+            seg(0.0, 6.0, R12, R12.2, kappa[0]),
+            seg(6.0, 12.0, R12, R12.2, kappa[1]),
+            seg(12.0, 24.0, R12, R12.2, kappa[1]),
+            seg(24.0, 48.0, R12, R12.2, kappa[2]),
+        ],
+        &boluses,
+        &[],
+        &DECISIONS,
+    );
     assert_window_aucs(
         &m,
         &pop,
@@ -837,20 +858,20 @@ fn auc_target_past_the_last_record_follows_a_decision_reset_under_iov() {
         IOV_SEED,
         &want,
         AUC_TOL,
-        "IOV, decision resets the carry",
+        "IOV, every decision a record",
     );
-    assert_distinct(
-        &want,
-        &aucs(R12.2, R12.2),
-        AUC_TOL,
-        "in-force row before the decision",
+    let before_2895 = exact_window_aucs(
+        &[
+            seg(0.0, 6.0, R12, R12.2, kappa[0]),
+            seg(6.0, 12.0, R0, R0.2, kappa[0]),
+            seg(12.0, 24.0, R0, R0.2, kappa[0]),
+            seg(24.0, 48.0, R12, R12.2, kappa[1]),
+        ],
+        &boluses,
+        &[],
+        &DECISIONS,
     );
-    assert_distinct(
-        &want,
-        &aucs(R0.2, R0.2),
-        AUC_TOL,
-        "last record's row after the decision",
-    );
+    assert_distinct(&want, &before_2895, AUC_TOL, "the pre-#2895 rule");
 }
 
 // ── Merged-PR geometries at a window boundary ───────────────────────────────────────────
