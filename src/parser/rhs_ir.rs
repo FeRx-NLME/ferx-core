@@ -2,7 +2,7 @@
 //!
 //! A [`super::RhsRegProgram`] runs over `f64` or a dual whose value and derivative parts
 //! are all `f64`s ("lanes"). Every arithmetic operation of such a dual is itself a short
-//! sequence of `f64` operations — `DualV`'s `mul_body` is `g = a.g·b.v + a.v·b.g` per
+//! sequence of `f64` operations — the forward dual's `mul_body` is `g = a.g·b.v + a.v·b.g` per
 //! tangent, and so on — so the whole program, over a given [`Layout`], is a straight-line
 //! program over `f64`s: loads of the inputs' lanes, IEEE arithmetic, selects for the
 //! guards, `sqrt` (correctly rounded, as Rust's), calls for `exp`/`ln`/`powf`/`round`, and
@@ -41,11 +41,199 @@ pub(super) enum Shim1 {
     Exp,
     Ln,
     Round,
+    /// IEEE square root (exact): lowered to the native instruction, not a call.
+    Sqrt,
+    Cos,
+    Sin,
+    Acos,
+    /// `stats::special`'s `ln_gamma` and its derivatives.
+    LnGamma,
+    Digamma,
+    Trigamma,
+    Tetragamma,
+    Pentagamma,
+    /// `−sin` (`sin`'s second derivative).
+    NegSin,
+    /// The `k`-th derivative of `exprel(z) = (e^z − 1)/z`, `NaN` past the fourth.
+    ExpRel(u8),
+    /// The `k`-th derivative of a function given by its jet, `NaN` past the fourth.
+    Jet(crate::sens::num::JetFn, u8),
+    /// `NaN`: a derivative order no layout reaches, so a misuse shows as non-finite.
+    Nan,
+}
+
+impl Shim1 {
+    /// The polygamma `ψ⁽ᵏ⁻¹⁾` as the derivative of order `k` of `ln Γ` (`k ≥ 1`); `NaN` past
+    /// tetragamma (no layout differentiates further).
+    pub(super) fn polygamma(k: u8) -> Shim1 {
+        match k {
+            0 => Shim1::LnGamma,
+            1 => Shim1::Digamma,
+            2 => Shim1::Trigamma,
+            3 => Shim1::Tetragamma,
+            4 => Shim1::Pentagamma,
+            _ => Shim1::Nan,
+        }
+    }
+    /// The function a native call (or the interpreter) makes for this shim.
+    pub(super) fn f(self) -> NativeUnary {
+        extern "C" fn exp(x: f64) -> f64 {
+            x.exp()
+        }
+        extern "C" fn ln(x: f64) -> f64 {
+            x.ln()
+        }
+        extern "C" fn round(x: f64) -> f64 {
+            x.round()
+        }
+        extern "C" fn sqrt(x: f64) -> f64 {
+            x.sqrt()
+        }
+        extern "C" fn cos(x: f64) -> f64 {
+            x.cos()
+        }
+        extern "C" fn sin(x: f64) -> f64 {
+            x.sin()
+        }
+        extern "C" fn acos(x: f64) -> f64 {
+            x.acos()
+        }
+        extern "C" fn ln_gamma(x: f64) -> f64 {
+            crate::stats::special::ln_gamma(x)
+        }
+        extern "C" fn digamma(x: f64) -> f64 {
+            crate::stats::special::digamma(x)
+        }
+        extern "C" fn trigamma(x: f64) -> f64 {
+            crate::stats::special::trigamma(x)
+        }
+        extern "C" fn tetragamma(x: f64) -> f64 {
+            crate::stats::special::tetragamma(x)
+        }
+        extern "C" fn pentagamma(x: f64) -> f64 {
+            crate::stats::special::pentagamma(x)
+        }
+        extern "C" fn exprel<const K: u8>(x: f64) -> f64 {
+            if K as usize > 4 {
+                f64::NAN
+            } else {
+                crate::ode::linear::exprel_k(x, K as usize)
+            }
+        }
+        extern "C" fn neg_sin(x: f64) -> f64 {
+            -x.sin()
+        }
+        extern "C" fn nan(_: f64) -> f64 {
+            f64::NAN
+        }
+        match self {
+            Shim1::Exp => exp,
+            Shim1::Ln => ln,
+            Shim1::Round => round,
+            Shim1::Sqrt => sqrt,
+            Shim1::Cos => cos,
+            Shim1::Sin => sin,
+            Shim1::Acos => acos,
+            Shim1::LnGamma => ln_gamma,
+            Shim1::Digamma => digamma,
+            Shim1::Trigamma => trigamma,
+            Shim1::Tetragamma => tetragamma,
+            Shim1::Pentagamma => pentagamma,
+            Shim1::NegSin => neg_sin,
+            Shim1::ExpRel(0) => exprel::<0>,
+            Shim1::ExpRel(1) => exprel::<1>,
+            Shim1::ExpRel(2) => exprel::<2>,
+            Shim1::ExpRel(3) => exprel::<3>,
+            Shim1::ExpRel(4) => exprel::<4>,
+            Shim1::ExpRel(_) | Shim1::Nan => nan,
+            Shim1::Jet(f, k) => jet_shim(f, k),
+        }
+    }
+}
+
+/// A native unary function.
+pub(super) type NativeUnary = extern "C" fn(f64) -> f64;
+
+/// [`Shim1::Jet`]'s function: entry `k` of `f`'s jet (`NaN` past the fourth).
+fn jet_shim(f: crate::sens::num::JetFn, k: u8) -> NativeUnary {
+    use crate::sens::num::JetFn;
+    extern "C" fn j<const F: u8, const K: u8>(x: f64) -> f64 {
+        if K as usize > 4 {
+            f64::NAN
+        } else {
+            JetFn::from_index(F).jet(x)[K as usize]
+        }
+    }
+    macro_rules! entries {
+        ($f:expr, $k:expr, $($i:literal),*) => {
+            match ($f, $k) {
+                $(
+                    ($i, 0) => j::<$i, 0> as NativeUnary,
+                    ($i, 1) => j::<$i, 1>,
+                    ($i, 2) => j::<$i, 2>,
+                    ($i, 3) => j::<$i, 3>,
+                    ($i, 4) => j::<$i, 4>,
+                )*
+                _ => j::<0, 5>,
+            }
+        };
+    }
+    entries!(f.index(), k, 0, 1, 2, 3, 4, 5, 6, 7)
+}
+
+/// The host calls' runtime: the queued arguments and the last call's outputs, per thread. The
+/// interpreters and the native code go through the same three functions.
+pub(super) mod host {
+    use std::cell::RefCell;
+    thread_local! {
+        static ST: RefCell<(Vec<f64>, Vec<f64>)> = const { RefCell::new((Vec::new(), Vec::new())) };
+    }
+    pub(in crate::parser) fn arg(v: f64) {
+        ST.with(|s| s.borrow_mut().0.push(v));
+    }
+    pub(in crate::parser) fn call(f: crate::sens::num::HostFn) {
+        ST.with(|s| {
+            let (args, out) = &mut *s.borrow_mut();
+            f.run(args, out);
+            args.clear();
+        });
+    }
+    pub(in crate::parser) fn out(k: u32) -> f64 {
+        ST.with(|s| s.borrow().1.get(k as usize).copied().unwrap_or(f64::NAN))
+    }
+    pub(in crate::parser) extern "C" fn arg_native(v: f64) -> f64 {
+        arg(v);
+        0.0
+    }
+    pub(in crate::parser) extern "C" fn call_native(f: f64) -> f64 {
+        call(crate::sens::num::HostFn::from_index(f as u16));
+        0.0
+    }
+    pub(in crate::parser) extern "C" fn out_native(k: f64) -> f64 {
+        out(k as u32)
+    }
+}
+
+/// The native function of an [`Inst::Gamma`].
+pub(super) fn gamma_shim(upper: bool, i: u8, j: u8) -> extern "C" fn(f64, f64) -> f64 {
+    extern "C" fn sh<const U: bool, const I: u8, const J: u8>(a: f64, x: f64) -> f64 {
+        crate::stats::special::gamma_pq_partial(a, x, U, I, J)
+    }
+    macro_rules! table {
+        ($($i:literal $j:literal),*) => {
+            match (upper, i, j) {
+                $((false, $i, $j) => sh::<false, $i, $j>, (true, $i, $j) => sh::<true, $i, $j>,)*
+                // Past third order: `NaN` (`gamma_pq_partial`).
+                _ => sh::<false, 4, 0>,
+            }
+        };
+    }
+    table!(0 0, 1 0, 0 1, 2 0, 1 1, 0 2, 3 0, 2 1, 1 2, 0 3)
 }
 
 /// A comparison, producing a condition for [`Inst::Select`]: Rust's (and IEEE's) ordered
 /// comparisons, and `!=`, which holds when either side is `NaN`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Cc {
     Lt,
     Le,
@@ -56,6 +244,19 @@ pub(super) enum Cc {
 }
 
 impl Cc {
+    /// The same comparison for the branch API ([`PkNum::br_cmp`](crate::sens::num::PkNum)).
+    #[inline(always)]
+    pub(super) fn branch(self) -> crate::sens::num::BranchCmp {
+        use crate::sens::num::BranchCmp;
+        match self {
+            Cc::Lt => BranchCmp::Lt,
+            Cc::Le => BranchCmp::Le,
+            Cc::Gt => BranchCmp::Gt,
+            Cc::Ge => BranchCmp::Ge,
+            Cc::Eq => BranchCmp::Eq,
+            Cc::Ne => BranchCmp::Ne,
+        }
+    }
     /// `a cc b`, as the interpreter's `Cmp*` ops decide it.
     #[inline(always)]
     pub(super) fn holds(self, a: f64, b: f64) -> bool {
@@ -89,16 +290,31 @@ pub(super) enum Inst {
     Abs(V),
     Floor(V),
     Ceil(V),
-    /// `f64::sqrt`: IEEE-754 square root, correctly rounded, so no shim is needed.
-    Sqrt(V),
     Call1(Shim1, V),
     /// `powf(a, e)`.
     Powf(V, V),
+    /// `∂^(i+j) P(a, x) / ∂aⁱ ∂xʲ` (of `Q` when `upper`): the incomplete gamma primitive and
+    /// its local derivatives (`stats::special::gamma_pq_partial`).
+    Gamma {
+        upper: bool,
+        i: u8,
+        j: u8,
+        a: V,
+        x: V,
+    },
     Cmp(Cc, V, V),
     And(V, V),
     Or(V, V),
     /// `cond ? a : b`.
     Select(V, V, V),
+    /// Its operand's value, with no derivative: the identity forward, no adjoint in
+    /// [`reverse`] (`PkNum::value_only`). Not the operand itself: a reverse pass through
+    /// `d − value_only(d)` would otherwise cancel `d`'s own derivative.
+    StopGrad(V),
+    /// A host call ([`host`]): queue an argument, run, read output `k`.
+    HostArg(V),
+    Host(crate::sens::num::HostFn),
+    HostOut(u32),
     /// `arg[off] = v`.
     Store {
         arg: u8,
@@ -141,9 +357,8 @@ impl Func {
 
 pub(crate) use crate::sens::num::vm::Layout;
 
-/// The payload entries of row `k`: `(l, t)` with `h_t = ∂²/∂η_k∂η_l` (`vtape::hrange`/
-/// `hidx`).
-fn pairs(layout: &Layout, k: usize) -> Vec<(usize, usize)> {
+/// The payload entries of row `k`: `(l, t)` with `h_t = ∂²/∂η_k∂η_l`.
+pub(super) fn pairs(layout: &Layout, k: usize) -> Vec<(usize, usize)> {
     if layout.m == 0 {
         Vec::new()
     } else if layout.th {
@@ -162,18 +377,27 @@ const MAX_N: usize = 48;
 /// Every layout a native function can be built for has a fixed slot, so a call finds its
 /// function with one index instead of a lookup: `f64`, then the first-order duals, the
 /// packed second-order ones and the directional ones, each by direction count and by
-/// whether its constant operands run as full products (`wide`).
-pub(super) const N_SLOTS: usize = 2 * (1 + 3 * MAX_N);
+/// whether its constant operands run as full products (`wide`); the tangent layouts of `f64`
+/// (`Layout::tan`, the exact Jacobian) by direction count.
+pub(super) const N_SLOTS: usize = 2 * (1 + 4 * MAX_N);
 
 pub(super) const fn slot(l: Layout) -> Option<usize> {
     let n = l.n as usize;
     let base = if n == 0 {
-        if l.m == 0 {
-            0
-        } else {
+        let tan = l.tan as usize;
+        if l.m != 0 || tan > MAX_N {
             return None;
         }
+        // `f64` and its forward tangents (`tangent_packed`), after the dual slots.
+        if tan == 0 {
+            0
+        } else {
+            3 * MAX_N + tan
+        }
     } else {
+        if l.tan != 0 {
+            return None;
+        }
         if n > MAX_N || l.lanes() > MAX_LANES {
             return None;
         }
@@ -203,8 +427,8 @@ struct Arm {
     outer: Option<V>,
     /// Where the `if` ends, known once the then arm's [`Flat::Jump`] is reached.
     end: Option<usize>,
-    then_vals: Vec<(u16, Lanes)>,
-    else_vals: Vec<(u16, Lanes)>,
+    then_vals: Vec<(u32, Lanes)>,
+    else_vals: Vec<(u32, Lanes)>,
 }
 
 /// Emits [`Flat`] instructions over a [`Layout`]'s lanes into a [`Func`].
@@ -331,10 +555,10 @@ impl<'a> Lower<'a> {
             });
         }
     }
-    pub(super) fn reg(&self, r: u16) -> Lanes {
+    pub(super) fn reg(&self, r: u32) -> Lanes {
         self.regs[r as usize].clone()
     }
-    pub(super) fn set(&mut self, d: u16, l: Lanes) {
+    pub(super) fn set(&mut self, d: u32, l: Lanes) {
         self.regs[d as usize] = l;
     }
     fn select(&mut self, c: V, a: &[V], b: &[V]) -> Lanes {
@@ -344,7 +568,7 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
-    // ── The primitives, as `f64` and `DualV`'s untaped bodies compute them (`+` and `−`
+    // ── The primitives, as `f64` and the forward dual's untaped bodies compute them (`+` and `−`
     // are lane by lane, [`Alg`]'s). ──
 
     /// `mul_body`: `g_k = a.g_k·b.v + a.v·b.g_k`,
@@ -482,7 +706,7 @@ impl<'a> Lower<'a> {
         let e = self.ins(Inst::Call1(Shim1::Exp, a[0]));
         self.unary(a, e, e, Some(e))
     }
-    /// `DualV::ln`, unguarded: `h1 = 1/x`, `h2 = −1/(x·x)`.
+    /// the forward dual's `ln`, unguarded: `h1 = 1/x`, `h2 = −1/(x·x)`.
     fn ln(&mut self, a: &[V]) -> Lanes {
         let l = self.ins(Inst::Call1(Shim1::Ln, a[0]));
         if self.lanes() == 1 {
@@ -497,26 +721,168 @@ impl<'a> Lower<'a> {
         });
         self.unary(a, l, h1, h2)
     }
-    /// `DualV::sqrt`, unguarded: `h1 = 0.5/s`, `h2 = −0.25/(s·s·s)` with `s = √x`.
+    /// the forward dual's `sqrt`, unguarded: `h1 = 0.5/s`, `h2 = −0.25/(s·s·s)`.
     fn sqrt(&mut self, a: &[V]) -> Lanes {
-        let s = self.ins(Inst::Sqrt(a[0]));
+        let s = self.ins(Inst::Call1(Shim1::Sqrt, a[0]));
         if self.lanes() == 1 {
             return vec![s];
         }
         let half = self.k(0.5);
         let h1 = self.ins(Inst::Div(half, s));
         let h2 = (self.layout.m > 0).then(|| {
-            let mq = self.k(-0.25);
+            let q = self.k(-0.25);
             let ss = self.ins(Inst::Mul(s, s));
             let sss = self.ins(Inst::Mul(ss, s));
-            self.ins(Inst::Div(mq, sss))
+            self.ins(Inst::Div(q, sss))
         });
         self.unary(a, s, h1, h2)
+    }
+    /// the forward dual's `inv_logit`: `u = 1/(1+e^{−x})`, `h1 = u(1−u)`, `h2 = h1(1−2u)`.
+    fn inv_logit(&mut self, a: &[V]) -> Lanes {
+        let one = self.k(1.0);
+        let nx = self.ins(Inst::Neg(a[0]));
+        let e = self.ins(Inst::Call1(Shim1::Exp, nx));
+        let den = self.ins(Inst::Add(one, e));
+        let u = self.ins(Inst::Div(one, den));
+        if self.lanes() == 1 {
+            return vec![u];
+        }
+        let omu = self.ins(Inst::Sub(one, u));
+        let d1 = self.ins(Inst::Mul(u, omu));
+        let h2 = (self.layout.m > 0).then(|| {
+            let two = self.k(2.0);
+            let tu = self.ins(Inst::Mul(two, u));
+            let t = self.ins(Inst::Sub(one, tu));
+            self.ins(Inst::Mul(d1, t))
+        });
+        self.unary(a, u, d1, h2)
+    }
+    /// the forward dual's `logit`: `ln(x/(1−x))`, `h1 = 1/(x(1−x))`, `h2 = −(1−2x)·h1·h1`.
+    fn logit(&mut self, a: &[V]) -> Lanes {
+        let one = self.k(1.0);
+        let x = a[0];
+        let omx = self.ins(Inst::Sub(one, x));
+        let q = self.ins(Inst::Div(x, omx));
+        let v = self.ins(Inst::Call1(Shim1::Ln, q));
+        if self.lanes() == 1 {
+            return vec![v];
+        }
+        let xo = self.ins(Inst::Mul(x, omx));
+        let d1 = self.ins(Inst::Div(one, xo));
+        let h2 = (self.layout.m > 0).then(|| {
+            let two = self.k(2.0);
+            let tx = self.ins(Inst::Mul(two, x));
+            let t = self.ins(Inst::Sub(one, tx));
+            let nt = self.ins(Inst::Neg(t));
+            let p = self.ins(Inst::Mul(nt, d1));
+            self.ins(Inst::Mul(p, d1))
+        });
+        self.unary(a, v, d1, h2)
+    }
+    /// the forward dual's `cos`: `h1 = −sin x`, `h2 = −cos x`.
+    fn cos(&mut self, a: &[V]) -> Lanes {
+        let c = self.ins(Inst::Call1(Shim1::Cos, a[0]));
+        if self.lanes() == 1 {
+            return vec![c];
+        }
+        let s = self.ins(Inst::Call1(Shim1::Sin, a[0]));
+        let h1 = self.ins(Inst::Neg(s));
+        let h2 = (self.layout.m > 0).then(|| self.ins(Inst::Neg(c)));
+        self.unary(a, c, h1, h2)
+    }
+    /// the forward dual's `acos`: `s = 1 − x·x`, `h1 = −1/√s`, `h2 = −x/(s·√s)`.
+    fn acos(&mut self, a: &[V]) -> Lanes {
+        let v = self.ins(Inst::Call1(Shim1::Acos, a[0]));
+        if self.lanes() == 1 {
+            return vec![v];
+        }
+        let one = self.k(1.0);
+        let xx = self.ins(Inst::Mul(a[0], a[0]));
+        let s = self.ins(Inst::Sub(one, xx));
+        let rs = self.ins(Inst::Call1(Shim1::Sqrt, s));
+        let m1 = self.k(-1.0);
+        let h1 = self.ins(Inst::Div(m1, rs));
+        let h2 = (self.layout.m > 0).then(|| {
+            let nx = self.ins(Inst::Neg(a[0]));
+            let srs = self.ins(Inst::Mul(s, rs));
+            self.ins(Inst::Div(nx, srs))
+        });
+        self.unary(a, v, h1, h2)
+    }
+    /// the forward dual's `ln_gamma`: `h1 = ψ(x)`, `h2 = ψ'(x)`.
+    fn ln_gamma(&mut self, a: &[V]) -> Lanes {
+        let v = self.ins(Inst::Call1(Shim1::LnGamma, a[0]));
+        if self.lanes() == 1 {
+            return vec![v];
+        }
+        let h1 = self.ins(Inst::Call1(Shim1::Digamma, a[0]));
+        let h2 = (self.layout.m > 0).then(|| self.ins(Inst::Call1(Shim1::Trigamma, a[0])));
+        self.unary(a, v, h1, h2)
+    }
+    /// A primitive `f(a, x)` from its partials `(i, j) ↦ ∂^(i+j)f`, second order first (the
+    /// shim keeps the last point's partials to the highest order asked):
+    /// `g_k = f_a·a_k + f_x·x_k`, `h_t = f_a·a_h + f_x·x_h + f_aa·a_k·a_l
+    /// + f_ax·(a_k·x_l + a_l·x_k) + f_xx·x_k·x_l`.
+    fn binary_prim(&mut self, a: &[V], x: &[V], part: impl Fn(u8, u8) -> Inst) -> Lanes {
+        let n = self.n();
+        let mut out = vec![0; self.lanes()];
+        let second =
+            (self.layout.m > 0).then(|| [part(2, 0), part(1, 1), part(0, 2)].map(|p| self.ins(p)));
+        out[0] = self.ins(part(0, 0));
+        if self.lanes() == 1 {
+            return out;
+        }
+        let fa = self.ins(part(1, 0));
+        let fx = self.ins(part(0, 1));
+        for k in 0..n {
+            let s = self.ins(Inst::Mul(fa, a[1 + k]));
+            let t = self.ins(Inst::Mul(fx, x[1 + k]));
+            out[1 + k] = self.ins(Inst::Add(s, t));
+            for (l, t) in pairs(&self.layout, k) {
+                let h = 1 + n + t;
+                let [faa, fax, fxx] = second.expect("a payload has its second derivatives");
+                let mut acc = self.ins(Inst::Mul(fa, a[h]));
+                let y = self.ins(Inst::Mul(fx, x[h]));
+                acc = self.ins(Inst::Add(acc, y));
+                let y = self.ins(Inst::Mul(a[1 + k], a[1 + l]));
+                let y = self.ins(Inst::Mul(faa, y));
+                acc = self.ins(Inst::Add(acc, y));
+                let y = self.ins(Inst::Mul(a[1 + k], x[1 + l]));
+                let z = self.ins(Inst::Mul(a[1 + l], x[1 + k]));
+                let y = self.ins(Inst::Add(y, z));
+                let y = self.ins(Inst::Mul(fax, y));
+                acc = self.ins(Inst::Add(acc, y));
+                let y = self.ins(Inst::Mul(x[1 + k], x[1 + l]));
+                let y = self.ins(Inst::Mul(fxx, y));
+                out[h] = self.ins(Inst::Add(acc, y));
+            }
+        }
+        out
+    }
+    fn gamma_pq(&mut self, a: &[V], x: &[V], upper: bool, i: u8, j: u8) -> Lanes {
+        let (av, xv) = (a[0], x[0]);
+        self.binary_prim(a, x, |di, dj| Inst::Gamma {
+            upper,
+            i: i + di,
+            j: j + dj,
+            a: av,
+            x: xv,
+        })
+    }
+    /// A unary primitive whose `k`-th derivative is `Call1(shim(k), x)`.
+    fn unary_chain(&mut self, a: &[V], shim: impl Fn(u8) -> Shim1) -> Lanes {
+        let v = self.ins(Inst::Call1(shim(0), a[0]));
+        if self.lanes() == 1 {
+            return vec![v];
+        }
+        let h1 = self.ins(Inst::Call1(shim(1), a[0]));
+        let h2 = (self.layout.m > 0).then(|| self.ins(Inst::Call1(shim(2), a[0])));
+        self.unary(a, v, h1, h2)
     }
     fn neg(&mut self, a: &[V]) -> Lanes {
         a.iter().map(|&x| self.ins(Inst::Neg(x))).collect()
     }
-    /// `DualV::pow`: a constant exponent (no tangent) is `powf` lifted with
+    /// the forward dual's `pow`: a constant exponent (no tangent) is `powf` lifted with
     /// `h1 = n·powf(a, n − 1)` and `h2 = n·(n − 1)·powf(a, n − 2)` (the constant `powf(a,
     /// n)` at `a = 0`); otherwise `exp(e · ln a)`.
     ///
@@ -584,7 +950,7 @@ impl<'a> Lower<'a> {
         }
     }
     fn abs(&mut self, a: &[V]) -> Lanes {
-        // `f64::abs` on one lane; `DualV::abs`'s `v ≥ 0` select on a dual.
+        // `f64::abs` on one lane; the forward dual's `abs`'s `v ≥ 0` select on a dual.
         if self.lanes() == 1 {
             return vec![self.ins(Inst::Abs(a[0]))];
         }
@@ -608,6 +974,8 @@ pub(super) trait Alg {
     fn mul(&mut self, a: &[V], b: &[V]) -> Lanes;
     /// `a / b`, or the constant zero when `|b| < 1e-30` (`apply_binary_in`'s guard).
     fn guarded_div(&mut self, a: &[V], b: &[V]) -> Lanes;
+    /// `a / b` unguarded (the forward dual's `div_body`).
+    fn raw_div(&mut self, a: &[V], b: &[V]) -> Lanes;
     /// A constant right operand, as the type's `*_scalar_in`.
     fn scalar(&mut self, op: Arith, a: &[V], c: f64) -> Lanes;
     fn exp(&mut self, a: &[V]) -> Lanes;
@@ -615,8 +983,15 @@ pub(super) trait Alg {
     fn ln(&mut self, a: &[V]) -> Lanes;
     /// The type's own `sqrt`, unguarded.
     fn sqrt(&mut self, a: &[V]) -> Lanes;
+    fn inv_logit(&mut self, a: &[V]) -> Lanes;
+    fn logit(&mut self, a: &[V]) -> Lanes;
+    fn cos(&mut self, a: &[V]) -> Lanes;
+    fn acos(&mut self, a: &[V]) -> Lanes;
+    fn ln_gamma(&mut self, a: &[V]) -> Lanes;
     fn abs(&mut self, a: &[V]) -> Lanes;
     fn pow(&mut self, a: &[V], e: &[V]) -> Lanes;
+    fn gamma_pq(&mut self, a: &[V], x: &[V], upper: bool, i: u8, j: u8) -> Lanes;
+    fn unary_chain(&mut self, a: &[V], shim: &dyn Fn(u8) -> Shim1) -> Lanes;
 
     fn ins(&mut self, i: Inst) -> V {
         self.func().push(i)
@@ -674,10 +1049,10 @@ pub(super) trait Alg {
             });
         }
     }
-    fn reg(&self, r: u16) -> Lanes {
+    fn reg(&self, r: u32) -> Lanes {
         self.regs_ref()[r as usize].clone()
     }
-    fn set(&mut self, d: u16, l: Lanes) {
+    fn set(&mut self, d: u32, l: Lanes) {
         self.regs()[d as usize] = l;
     }
 }
@@ -701,6 +1076,9 @@ impl Alg for Lower<'_> {
     fn guarded_div(&mut self, a: &[V], b: &[V]) -> Lanes {
         Lower::guarded_div(self, a, b)
     }
+    fn raw_div(&mut self, a: &[V], b: &[V]) -> Lanes {
+        Lower::div(self, a, b)
+    }
     fn scalar(&mut self, op: Arith, a: &[V], c: f64) -> Lanes {
         Lower::scalar(self, op, a, c)
     }
@@ -713,11 +1091,32 @@ impl Alg for Lower<'_> {
     fn sqrt(&mut self, a: &[V]) -> Lanes {
         Lower::sqrt(self, a)
     }
+    fn inv_logit(&mut self, a: &[V]) -> Lanes {
+        Lower::inv_logit(self, a)
+    }
+    fn logit(&mut self, a: &[V]) -> Lanes {
+        Lower::logit(self, a)
+    }
+    fn cos(&mut self, a: &[V]) -> Lanes {
+        Lower::cos(self, a)
+    }
+    fn acos(&mut self, a: &[V]) -> Lanes {
+        Lower::acos(self, a)
+    }
+    fn ln_gamma(&mut self, a: &[V]) -> Lanes {
+        Lower::ln_gamma(self, a)
+    }
     fn abs(&mut self, a: &[V]) -> Lanes {
         Lower::abs(self, a)
     }
     fn pow(&mut self, a: &[V], e: &[V]) -> Lanes {
         Lower::pow(self, a, e)
+    }
+    fn gamma_pq(&mut self, a: &[V], x: &[V], upper: bool, i: u8, j: u8) -> Lanes {
+        Lower::gamma_pq(self, a, x, upper, i, j)
+    }
+    fn unary_chain(&mut self, a: &[V], shim: &dyn Fn(u8) -> Shim1) -> Lanes {
+        Lower::unary_chain(self, a, shim)
     }
 }
 
@@ -764,6 +1163,10 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
             let l = al.guarded_div(&al.reg(a), &al.reg(b));
             al.set(d, l);
         }
+        Flat::DivRaw { d, a, b } => {
+            let l = al.raw_div(&al.reg(a), &al.reg(b));
+            al.set(d, l);
+        }
         Flat::AddK { d, a, c }
         | Flat::SubK { d, a, c }
         | Flat::RSubK { d, a, c }
@@ -790,20 +1193,70 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
             let l = al.pow(&al.reg(a), &al.reg(e));
             al.set(d, l);
         }
+        Flat::GammaPq {
+            d,
+            a,
+            x,
+            upper,
+            i,
+            j,
+        } => {
+            let l = al.gamma_pq(&al.reg(a), &al.reg(x), upper, i, j);
+            al.set(d, l);
+        }
         Flat::Unary { d, op, a } => {
             let x = al.reg(a);
             let l = match op {
                 Unary::Exp => al.exp(&x),
+                Unary::Sqrt => {
+                    // `PkNum::sqrt`'s flat arm (#2892): at a non-positive argument the constant
+                    // `√x` (a zero keeps its sign, a negative stays `NaN`) with zero jets. The
+                    // dead `sqrt` runs on `1`, so neither arm computes an `inf` or a `NaN` a
+                    // reverse pass could multiply into an adjoint.
+                    let z = al.k(0.0);
+                    let one = al.k(1.0);
+                    let pos = al.ins(Inst::Cmp(Cc::Gt, x[0], z));
+                    let ones = al.constant(one);
+                    let g = al.select(pos, &x, &ones);
+                    let root = al.sqrt(&g);
+                    // The constant's value `√x` with no dependence on `x` for a reverse pass:
+                    // `±0 · 0` keeps a zero's sign, and a negative argument is `NaN`.
+                    let nonneg = al.ins(Inst::Cmp(Cc::Ge, x[0], z));
+                    let zero = al.ins(Inst::Select(nonneg, x[0], z));
+                    let v0 = al.ins(Inst::Mul(zero, z));
+                    let nan = al.k(f64::NAN);
+                    let v1 = al.ins(Inst::Select(nonneg, v0, nan));
+                    let flat = al.constant(v1);
+                    al.select(pos, &root, &flat)
+                }
+                Unary::InvLogit => al.inv_logit(&x),
+                Unary::Logit => al.logit(&x),
+                Unary::Cos => al.cos(&x),
+                Unary::Acos => al.acos(&x),
+                Unary::LnRaw => al.ln(&x),
+                Unary::StopGrad => {
+                    let v = al.ins(Inst::StopGrad(x[0]));
+                    al.constant(v)
+                }
+                Unary::Sin => al.unary_chain(&x, &|k| {
+                    [Shim1::Sin, Shim1::Cos, Shim1::NegSin][k as usize % 3]
+                }),
+                Unary::Digamma => al.unary_chain(&x, &|k| Shim1::polygamma(1 + k)),
+                Unary::Trigamma => al.unary_chain(&x, &|k| Shim1::polygamma(2 + k)),
+                Unary::Tetragamma => al.unary_chain(&x, &|k| Shim1::polygamma(3 + k)),
+                Unary::ExpRel(k) => al.unary_chain(&x, &|j| Shim1::ExpRel(k + j)),
+                Unary::Jet(f, k) => al.unary_chain(&x, &|j| Shim1::Jet(f, k + j)),
+                Unary::LnGamma => al.ln_gamma(&x),
                 Unary::Ln => {
                     // `guard_floor(1e-30)`: `f64::max` (a NaN floors) on one lane,
-                    // `DualV`'s `!(v ≥ lo)` → `constant(lo)` on a dual — the same test.
+                    // the forward dual's `!(v ≥ lo)` → `constant(lo)` on a dual — the same test.
                     let lo = al.k(1e-30);
                     let keep = al.ins(Inst::Cmp(Cc::Ge, x[0], lo));
                     let floor = al.constant(lo);
                     let g = al.select(keep, &x, &floor);
                     al.ln(&g)
                 }
-                Unary::Sqrt => {
+                Unary::SqrtRhs => {
                     // `apply_unary`'s `Sqrt`: the type's `sqrt` of a positive argument, else
                     // the constant `±0` (a `−0.0` or `+0` argument) or `+0` (negative, `NaN`).
                     // The dead `sqrt` runs on `1`, so neither arm computes an `inf` or a
@@ -875,6 +1328,29 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
             let l = bool01(al, c);
             al.set(d, l);
         }
+        Flat::HostArg { a } => {
+            let x = al.reg(a)[0];
+            al.ins(Inst::HostArg(x));
+        }
+        Flat::Host { f } => {
+            al.ins(Inst::Host(f));
+        }
+        Flat::HostOut { d, k } => {
+            let v = al.ins(Inst::HostOut(k));
+            let l = al.constant(v);
+            al.set(d, l);
+        }
+        Flat::LoopArg { .. } | Flat::Loop { .. } | Flat::LoopOut { .. } => {
+            unreachable!("a loop call is the plan's, never a chunk's")
+        }
+        Flat::Gate { .. } => unreachable!("resolved per variant before lowering"),
+        Flat::Select { d, c, a, b } => {
+            let z = al.k(0.0);
+            let cv = al.reg(c)[0];
+            let cond = al.ins(Inst::Cmp(Cc::Ne, cv, z));
+            let l = al.select(cond, &al.reg(a), &al.reg(b));
+            al.set(d, l);
+        }
         Flat::Branch { .. } | Flat::Jump { .. } | Flat::Move { .. } => {
             unreachable!("`Lower::flat` handles an `if`'s control instructions")
         }
@@ -898,6 +1374,65 @@ pub(super) fn forward(code: &[Flat], n_regs: usize, layout: Layout) -> Func {
     }
     l.reach(code.len());
     f
+}
+
+/// `f` with each repeated host call `Call1(s, x)` replaced by its first occurrence: a shim is a
+/// pure function, so the repeat is the same bits, and the derivative passes emit one each time
+/// they reach a primitive's next order (`exprel`'s `h₁` from the value's chain, again from its
+/// tangent). Only on a function with no `if` arms (every `live` is `None`, as [`tangent`] and
+/// [`reverse`] leave a folded chunk), so the first occurrence dominates the repeat; the
+/// returned `prefix` counts what stays of the first `prefix` instructions.
+pub(super) fn dedup_calls(f: &Func, prefix: usize) -> (Func, usize) {
+    if f.live.iter().any(Option::is_some) {
+        return (f.clone(), prefix);
+    }
+    let mut out = Func::new(f.n_args);
+    let mut map: Vec<V> = Vec::with_capacity(f.insts.len());
+    let mut seen: std::collections::HashMap<V, Vec<(Shim1, V)>> = Default::default();
+    let mut kept_prefix = 0;
+    for (i, &inst) in f.insts.iter().enumerate() {
+        let m = |x: V| map[x as usize];
+        let inst = match inst {
+            Inst::Load { .. } | Inst::Const(_) | Inst::Host(_) | Inst::HostOut(_) => inst,
+            Inst::Add(x, y) => Inst::Add(m(x), m(y)),
+            Inst::Sub(x, y) => Inst::Sub(m(x), m(y)),
+            Inst::Mul(x, y) => Inst::Mul(m(x), m(y)),
+            Inst::Div(x, y) => Inst::Div(m(x), m(y)),
+            Inst::Neg(x) => Inst::Neg(m(x)),
+            Inst::Abs(x) => Inst::Abs(m(x)),
+            Inst::Floor(x) => Inst::Floor(m(x)),
+            Inst::Ceil(x) => Inst::Ceil(m(x)),
+            Inst::Call1(s, x) => Inst::Call1(s, m(x)),
+            Inst::Powf(x, y) => Inst::Powf(m(x), m(y)),
+            Inst::Gamma { upper, i, j, a, x } => Inst::Gamma {
+                upper,
+                i,
+                j,
+                a: m(a),
+                x: m(x),
+            },
+            Inst::Cmp(c, x, y) => Inst::Cmp(c, m(x), m(y)),
+            Inst::And(x, y) => Inst::And(m(x), m(y)),
+            Inst::Or(x, y) => Inst::Or(m(x), m(y)),
+            Inst::Select(c, x, y) => Inst::Select(m(c), m(x), m(y)),
+            Inst::StopGrad(x) => Inst::StopGrad(m(x)),
+            Inst::HostArg(x) => Inst::HostArg(m(x)),
+            Inst::Store { arg, off, v } => Inst::Store { arg, off, v: m(v) },
+        };
+        if let Inst::Call1(s, x) = inst {
+            let at = seen.entry(x).or_default();
+            if let Some(&(_, v)) = at.iter().find(|(t, _)| *t == s) {
+                map.push(v);
+                continue;
+            }
+            at.push((s, out.insts.len() as V));
+        }
+        map.push(out.push(inst));
+        if i < prefix {
+            kept_prefix += 1;
+        }
+    }
+    (out, kept_prefix)
 }
 
 /// The reverse pass of a forward [`Func`] of `n` arguments: a function of `2n` arguments
@@ -931,13 +1466,22 @@ pub(super) fn reverse(fwd: &Func) -> Func {
             Inst::Abs(x) => Inst::Abs(r(x)),
             Inst::Floor(x) => Inst::Floor(r(x)),
             Inst::Ceil(x) => Inst::Ceil(r(x)),
-            Inst::Sqrt(x) => Inst::Sqrt(r(x)),
             Inst::Call1(s, x) => Inst::Call1(s, r(x)),
             Inst::Powf(x, y) => Inst::Powf(r(x), r(y)),
+            Inst::Gamma { upper, i, j, a, x } => Inst::Gamma {
+                upper,
+                i,
+                j,
+                a: r(a),
+                x: r(x),
+            },
             Inst::Cmp(c, x, y) => Inst::Cmp(c, r(x), r(y)),
             Inst::And(x, y) => Inst::And(r(x), r(y)),
             Inst::Or(x, y) => Inst::Or(r(x), r(y)),
             Inst::Select(c, x, y) => Inst::Select(r(c), r(x), r(y)),
+            Inst::HostArg(x) => Inst::HostArg(r(x)),
+            Inst::StopGrad(x) => Inst::StopGrad(r(x)),
+            Inst::Host(_) | Inst::HostOut(_) => *inst,
         };
         map[i] = b.push(m);
     }
@@ -977,6 +1521,8 @@ pub(super) fn reverse(fwd: &Func) -> Func {
             // A load is never emitted in an arm (the prologue loads every input).
             Inst::Load { arg, off } => loads.push(((arg, off), g)),
             Inst::Const(_) | Inst::Store { .. } | Inst::Cmp(..) | Inst::And(..) | Inst::Or(..) => {}
+            // A host call's outputs are constants of the computation, as is a stopped value.
+            Inst::HostArg(_) | Inst::Host(_) | Inst::HostOut(_) | Inst::StopGrad(_) => {}
             Inst::Floor(_) | Inst::Ceil(_) | Inst::Call1(Shim1::Round, _) => {}
             Inst::Add(x, y) => {
                 acc(&mut b, &mut adj, live, x, g, false);
@@ -1016,12 +1562,71 @@ pub(super) fn reverse(fwd: &Func) -> Func {
                 let d = b.push(Inst::Div(g, fw(x)));
                 acc(&mut b, &mut adj, live, x, d, false);
             }
-            Inst::Sqrt(x) => {
-                // `s = √x`: `dx = g·(0.5/s)`, the tape's `h1` times the adjoint.
+            Inst::Call1(Shim1::Sqrt, x) => {
                 let half = b.k(0.5);
-                let h1 = b.push(Inst::Div(half, map[i]));
-                let d = b.push(Inst::Mul(g, h1));
+                let gh = b.push(Inst::Mul(g, half));
+                let d = b.push(Inst::Div(gh, map[i]));
                 acc(&mut b, &mut adj, live, x, d, false);
+            }
+            Inst::Call1(Shim1::Cos, x) => {
+                let s = b.push(Inst::Call1(Shim1::Sin, fw(x)));
+                let d = b.push(Inst::Mul(g, s));
+                acc(&mut b, &mut adj, live, x, d, true);
+            }
+            Inst::Call1(Shim1::Sin, x) => {
+                let c = b.push(Inst::Call1(Shim1::Cos, fw(x)));
+                let d = b.push(Inst::Mul(g, c));
+                acc(&mut b, &mut adj, live, x, d, false);
+            }
+            Inst::Call1(Shim1::LnGamma, x) => {
+                let p = b.push(Inst::Call1(Shim1::Digamma, fw(x)));
+                let d = b.push(Inst::Mul(g, p));
+                acc(&mut b, &mut adj, live, x, d, false);
+            }
+            Inst::Call1(Shim1::Digamma, x) => {
+                let p = b.push(Inst::Call1(Shim1::Trigamma, fw(x)));
+                let d = b.push(Inst::Mul(g, p));
+                acc(&mut b, &mut adj, live, x, d, false);
+            }
+            Inst::Call1(s @ (Shim1::Trigamma | Shim1::Tetragamma), x) => {
+                let next = if s == Shim1::Trigamma {
+                    Shim1::Tetragamma
+                } else {
+                    Shim1::Pentagamma
+                };
+                let p = b.push(Inst::Call1(next, fw(x)));
+                let d = b.push(Inst::Mul(g, p));
+                acc(&mut b, &mut adj, live, x, d, false);
+            }
+            Inst::Call1(Shim1::NegSin, x) => {
+                let c = b.push(Inst::Call1(Shim1::Cos, fw(x)));
+                let d = b.push(Inst::Mul(g, c));
+                acc(&mut b, &mut adj, live, x, d, true);
+            }
+            Inst::Call1(Shim1::Jet(f, k), x) => {
+                let p = b.push(Inst::Call1(Shim1::Jet(f, k.saturating_add(1)), fw(x)));
+                let d = b.push(Inst::Mul(g, p));
+                acc(&mut b, &mut adj, live, x, d, false);
+            }
+            Inst::Call1(Shim1::ExpRel(k), x) => {
+                let p = b.push(Inst::Call1(Shim1::ExpRel(k.saturating_add(1)), fw(x)));
+                let d = b.push(Inst::Mul(g, p));
+                acc(&mut b, &mut adj, live, x, d, false);
+            }
+            // Nothing differentiates pentagamma again; a NaN adjoint makes a misuse loud (a
+            // non-finite gradient the checks reject) rather than silently wrong.
+            Inst::Call1(Shim1::Pentagamma | Shim1::Nan, x) => {
+                let nan = b.k(f64::NAN);
+                let d = b.push(Inst::Mul(g, nan));
+                acc(&mut b, &mut adj, live, x, d, false);
+            }
+            Inst::Call1(Shim1::Acos, x) => {
+                let one = b.k(1.0);
+                let xx = b.push(Inst::Mul(fw(x), fw(x)));
+                let s = b.push(Inst::Sub(one, xx));
+                let rs = b.push(Inst::Call1(Shim1::Sqrt, s));
+                let d = b.push(Inst::Div(g, rs));
+                acc(&mut b, &mut adj, live, x, d, true);
             }
             Inst::Powf(x, y) => {
                 // `r = xʸ`: `dx = g·y·x^(y−1)`; `dy = g·r·ln x` for `x > 0`, and `0` where
@@ -1038,6 +1643,27 @@ pub(super) fn reverse(fwd: &Func) -> Func {
                 let z = b.k(0.0);
                 let pos = b.push(Inst::Cmp(Cc::Gt, fw(x), z));
                 let dy = b.push(Inst::Select(pos, dy, z));
+                acc(&mut b, &mut adj, live, y, dy, false);
+            }
+            Inst::Gamma {
+                upper,
+                i,
+                j,
+                a: x,
+                x: y,
+            } => {
+                let p = |i, j| Inst::Gamma {
+                    upper,
+                    i,
+                    j,
+                    a: fw(x),
+                    x: fw(y),
+                };
+                let pa = b.push(p(i + 1, j));
+                let dx = b.push(Inst::Mul(g, pa));
+                acc(&mut b, &mut adj, live, x, dx, false);
+                let px = b.push(p(i, j + 1));
+                let dy = b.push(Inst::Mul(g, px));
                 acc(&mut b, &mut adj, live, y, dy, false);
             }
             Inst::Select(c, x, y) => {
@@ -1071,6 +1697,280 @@ pub(super) fn reverse(fwd: &Func) -> Func {
     b
 }
 
+/// Forward-mode tangents of a [`Func`] of `n` arguments in `k` directions: a function of
+/// `2n` arguments whose argument `n + a` holds the tangents of argument `a`, direction `j`
+/// of location `off` at `off·k + j`. Every load reads its tangents, every store writes its
+/// value's. Over [`reverse`] this is forward-over-reverse: Hessian-vector products of the
+/// function the reverse differentiates, one derivative order above the plan's own, with no
+/// layout of that order (#2786).
+///
+/// Tangents are kept sparse: a value no input reaches has none, and emits nothing. A dead
+/// arm needs no mask here — its value is only read through the [`Inst::Select`] that chose
+/// it, and the select picks the taken arm's tangent.
+pub(super) fn tangent(f: &Func, k: usize) -> Func {
+    type Tan = Option<Vec<V>>;
+    // `Σ ± scale·tangent`, sparse: `None` when every term is.
+    fn lin(b: &mut Func, k: usize, terms: &[(&Tan, Option<V>, bool)]) -> Tan {
+        let live: Vec<_> = terms.iter().filter(|t| t.0.is_some()).collect();
+        if live.is_empty() {
+            return None;
+        }
+        Some(
+            (0..k)
+                .map(|j| {
+                    let mut acc: Option<V> = None;
+                    for &&(tv, scale, neg) in &live {
+                        let mut d = tv.as_ref().expect("filtered")[j];
+                        if let Some(s) = scale {
+                            d = b.push(Inst::Mul(d, s));
+                        }
+                        acc = Some(match (acc, neg) {
+                            (None, false) => d,
+                            (None, true) => b.push(Inst::Neg(d)),
+                            (Some(a), false) => b.push(Inst::Add(a, d)),
+                            (Some(a), true) => b.push(Inst::Sub(a, d)),
+                        });
+                    }
+                    acc.expect("non-empty")
+                })
+                .collect(),
+        )
+    }
+    let n = f.n_args;
+    let mut b = Func::new(2 * n);
+    let mut map = vec![V::MAX; f.insts.len()];
+    let mut tan: Vec<Tan> = vec![None; f.insts.len()];
+    for (i, inst) in f.insts.iter().enumerate() {
+        b.cur = f.live[i].map(|c| map[c as usize]);
+        let fw = |x: V| map[x as usize];
+        // The value: the instruction, remapped (a store is emitted after its tangents).
+        let m = match *inst {
+            Inst::Store { .. } => None,
+            Inst::Load { .. } | Inst::Const(_) | Inst::Host(_) | Inst::HostOut(_) => Some(*inst),
+            Inst::Add(x, y) => Some(Inst::Add(fw(x), fw(y))),
+            Inst::Sub(x, y) => Some(Inst::Sub(fw(x), fw(y))),
+            Inst::Mul(x, y) => Some(Inst::Mul(fw(x), fw(y))),
+            Inst::Div(x, y) => Some(Inst::Div(fw(x), fw(y))),
+            Inst::Neg(x) => Some(Inst::Neg(fw(x))),
+            Inst::Abs(x) => Some(Inst::Abs(fw(x))),
+            Inst::Floor(x) => Some(Inst::Floor(fw(x))),
+            Inst::Ceil(x) => Some(Inst::Ceil(fw(x))),
+            Inst::Call1(s, x) => Some(Inst::Call1(s, fw(x))),
+            Inst::Powf(x, y) => Some(Inst::Powf(fw(x), fw(y))),
+            Inst::Gamma { upper, i, j, a, x } => Some(Inst::Gamma {
+                upper,
+                i,
+                j,
+                a: fw(a),
+                x: fw(x),
+            }),
+            Inst::Cmp(c, x, y) => Some(Inst::Cmp(c, fw(x), fw(y))),
+            Inst::And(x, y) => Some(Inst::And(fw(x), fw(y))),
+            Inst::Or(x, y) => Some(Inst::Or(fw(x), fw(y))),
+            Inst::Select(c, x, y) => Some(Inst::Select(fw(c), fw(x), fw(y))),
+            Inst::HostArg(x) => Some(Inst::HostArg(fw(x))),
+            Inst::StopGrad(x) => Some(Inst::StopGrad(fw(x))),
+        };
+        if let Some(m) = m {
+            map[i] = b.push(m);
+        }
+        let fw = |x: V| map[x as usize];
+        let t = |x: V| &tan[x as usize];
+        // `x ↦ s(x)·dx` for a unary `f` with `f′ = ±s`.
+        let unary = |b: &mut Func, x: V, s: Shim1, neg: bool| -> Tan {
+            t(x).as_ref()?;
+            let p = b.push(Inst::Call1(s, fw(x)));
+            lin(b, k, &[(t(x), Some(p), neg)])
+        };
+        let new: Tan = match *inst {
+            Inst::Load { arg, off } => Some(
+                (0..k)
+                    .map(|j| {
+                        b.push(Inst::Load {
+                            arg: n + arg,
+                            off: off * k as u32 + j as u32,
+                        })
+                    })
+                    .collect(),
+            ),
+            Inst::Store { arg, off, v } => {
+                let z = b.k(0.0);
+                for j in 0..k {
+                    let d = t(v).as_ref().map_or(z, |tv| tv[j]);
+                    b.push(Inst::Store {
+                        arg: n + arg,
+                        off: off * k as u32 + j as u32,
+                        v: d,
+                    });
+                }
+                b.push(Inst::Store { arg, off, v: fw(v) });
+                None
+            }
+            Inst::Const(_) | Inst::Cmp(..) | Inst::And(..) | Inst::Or(..) => None,
+            Inst::HostArg(_) | Inst::Host(_) | Inst::HostOut(_) | Inst::StopGrad(_) => None,
+            Inst::Floor(_) | Inst::Ceil(_) | Inst::Call1(Shim1::Round, _) => None,
+            Inst::Add(x, y) => lin(&mut b, k, &[(t(x), None, false), (t(y), None, false)]),
+            Inst::Sub(x, y) => lin(&mut b, k, &[(t(x), None, false), (t(y), None, true)]),
+            Inst::Neg(x) => lin(&mut b, k, &[(t(x), None, true)]),
+            Inst::Mul(x, y) => lin(
+                &mut b,
+                k,
+                &[(t(x), Some(fw(y)), false), (t(y), Some(fw(x)), false)],
+            ),
+            Inst::Div(x, y) if t(x).is_some() || t(y).is_some() => {
+                // `q = x/y`: `dq = (dx − q·dy)/y`.
+                let one = b.k(1.0);
+                let r = b.push(Inst::Div(one, fw(y)));
+                let q = b.push(Inst::Mul(map[i], r));
+                lin(&mut b, k, &[(t(x), Some(r), false), (t(y), Some(q), true)])
+            }
+            Inst::Abs(x) if t(x).is_some() => {
+                // `|x|′` as the reverse takes it: `+1` for `x ≥ 0`.
+                let z = b.k(0.0);
+                let nonneg = b.push(Inst::Cmp(Cc::Ge, fw(x), z));
+                let (one, m1) = (b.k(1.0), b.k(-1.0));
+                let sg = b.push(Inst::Select(nonneg, one, m1));
+                lin(&mut b, k, &[(t(x), Some(sg), false)])
+            }
+            Inst::Call1(Shim1::Exp, x) => lin(&mut b, k, &[(t(x), Some(map[i]), false)]),
+            Inst::Call1(Shim1::Ln, x) if t(x).is_some() => {
+                let one = b.k(1.0);
+                let r = b.push(Inst::Div(one, fw(x)));
+                lin(&mut b, k, &[(t(x), Some(r), false)])
+            }
+            Inst::Call1(Shim1::Sqrt, x) if t(x).is_some() => {
+                let half = b.k(0.5);
+                let r = b.push(Inst::Div(half, map[i]));
+                lin(&mut b, k, &[(t(x), Some(r), false)])
+            }
+            Inst::Call1(Shim1::Acos, x) if t(x).is_some() => {
+                let one = b.k(1.0);
+                let xx = b.push(Inst::Mul(fw(x), fw(x)));
+                let s = b.push(Inst::Sub(one, xx));
+                let rs = b.push(Inst::Call1(Shim1::Sqrt, s));
+                let r = b.push(Inst::Div(one, rs));
+                lin(&mut b, k, &[(t(x), Some(r), true)])
+            }
+            Inst::Div(..) | Inst::Abs(_) => None,
+            Inst::Call1(Shim1::Ln | Shim1::Sqrt | Shim1::Acos, _) => None,
+            Inst::Call1(Shim1::Cos, x) => unary(&mut b, x, Shim1::Sin, true),
+            Inst::Call1(Shim1::Sin, x) => unary(&mut b, x, Shim1::Cos, false),
+            Inst::Call1(Shim1::NegSin, x) => unary(&mut b, x, Shim1::Cos, true),
+            Inst::Call1(Shim1::LnGamma, x) => unary(&mut b, x, Shim1::Digamma, false),
+            Inst::Call1(Shim1::Digamma, x) => unary(&mut b, x, Shim1::Trigamma, false),
+            Inst::Call1(Shim1::Trigamma, x) => unary(&mut b, x, Shim1::Tetragamma, false),
+            Inst::Call1(Shim1::Tetragamma, x) => unary(&mut b, x, Shim1::Pentagamma, false),
+            Inst::Call1(Shim1::Pentagamma | Shim1::Nan, x) => unary(&mut b, x, Shim1::Nan, false),
+            Inst::Call1(Shim1::ExpRel(e), x) => {
+                unary(&mut b, x, Shim1::ExpRel(e.saturating_add(1)), false)
+            }
+            Inst::Call1(Shim1::Jet(g, e), x) => {
+                unary(&mut b, x, Shim1::Jet(g, e.saturating_add(1)), false)
+            }
+            Inst::Powf(x, y) if t(x).is_some() || t(y).is_some() => {
+                // As the reverse: `y·x^(y−1)` and, for `x > 0`, `r·ln x`.
+                let one = b.k(1.0);
+                let ym1 = b.push(Inst::Sub(fw(y), one));
+                let p = b.push(Inst::Powf(fw(x), ym1));
+                let dx = b.push(Inst::Mul(fw(y), p));
+                let lx = b.push(Inst::Call1(Shim1::Ln, fw(x)));
+                let rl = b.push(Inst::Mul(map[i], lx));
+                let z = b.k(0.0);
+                let pos = b.push(Inst::Cmp(Cc::Gt, fw(x), z));
+                let dy = b.push(Inst::Select(pos, rl, z));
+                lin(
+                    &mut b,
+                    k,
+                    &[(t(x), Some(dx), false), (t(y), Some(dy), false)],
+                )
+            }
+            Inst::Gamma {
+                upper,
+                i: gi,
+                j: gj,
+                a: x,
+                x: y,
+            } if t(x).is_some() || t(y).is_some() => {
+                let p = |i, j| Inst::Gamma {
+                    upper,
+                    i,
+                    j,
+                    a: fw(x),
+                    x: fw(y),
+                };
+                let pa = b.push(p(gi + 1, gj));
+                let px = b.push(p(gi, gj + 1));
+                lin(
+                    &mut b,
+                    k,
+                    &[(t(x), Some(pa), false), (t(y), Some(px), false)],
+                )
+            }
+            Inst::Powf(..) | Inst::Gamma { .. } => None,
+            Inst::Select(c, x, y) if t(x).is_some() || t(y).is_some() => {
+                let z = b.k(0.0);
+                Some(
+                    (0..k)
+                        .map(|j| {
+                            let a = t(x).as_ref().map_or(z, |v| v[j]);
+                            let e = t(y).as_ref().map_or(z, |v| v[j]);
+                            b.push(Inst::Select(fw(c), a, e))
+                        })
+                        .collect(),
+                )
+            }
+            Inst::Select(..) => None,
+        };
+        tan[i] = new;
+    }
+    b.cur = None;
+    b
+}
+
+/// [`tangent`] in `k` directions with the tangents packed into the value arguments: a
+/// function of the same arguments over slots of `l·(1 + k)` lanes, location `i·l + lane` of
+/// the base function at `i·l(1+k) + lane` and its tangent along `j` at
+/// `i·l(1+k) + l + lane·k + j` (`Layout::tan`). Argument 2 (the literals, indexed by slot
+/// alone) has no tangents: their loads are zeros.
+pub(super) fn tangent_packed(f: &Func, k: usize, l: usize, seed_tangents: bool) -> Func {
+    let t = tangent(f, k);
+    let n = f.n_args;
+    let wl = (l * (1 + k)) as u32;
+    let (l32, k32) = (l as u32, k as u32);
+    let place = |arg: u8, off: u32| -> (u8, u32) {
+        if arg < n {
+            let (i, lane) = (off / l32, off % l32);
+            (arg, i * wl + lane)
+        } else {
+            let (loc, j) = (off / k32, off % k32);
+            let (i, lane) = (loc / l32, loc % l32);
+            (arg - n, i * wl + l32 + lane * k32 + j)
+        }
+    };
+    let mut out = Func::new(n);
+    out.insts = t
+        .insts
+        .iter()
+        .map(|inst| match *inst {
+            Inst::Load { arg, off } if arg == n + 2 && !seed_tangents => {
+                let _ = off;
+                Inst::Const(0f64.to_bits())
+            }
+            Inst::Load { arg, off } => {
+                let (arg, off) = place(arg, off);
+                Inst::Load { arg, off }
+            }
+            Inst::Store { arg, off, v } => {
+                let (arg, off) = place(arg, off);
+                Inst::Store { arg, off, v }
+            }
+            i => i,
+        })
+        .collect();
+    out.live = t.live.clone();
+    out
+}
+
 /// Run a [`Func`] in Rust: the reference semantics the native lowering must reproduce, and
 /// the tests' oracle for [`reverse`].
 #[cfg(test)]
@@ -1091,11 +1991,26 @@ pub(super) fn interpret(f: &Func, args: &mut [&mut [f64]]) {
             Inst::Abs(a) => r(a).abs(),
             Inst::Floor(a) => r(a).floor(),
             Inst::Ceil(a) => r(a).ceil(),
-            Inst::Sqrt(a) => r(a).sqrt(),
             Inst::Call1(Shim1::Exp, a) => r(a).exp(),
             Inst::Call1(Shim1::Ln, a) => r(a).ln(),
             Inst::Call1(Shim1::Round, a) => r(a).round(),
+            Inst::Call1(Shim1::Sqrt, a) => r(a).sqrt(),
+            Inst::Call1(Shim1::Cos, a) => r(a).cos(),
+            Inst::Call1(Shim1::Sin, a) => r(a).sin(),
+            Inst::Call1(Shim1::Acos, a) => r(a).acos(),
+            Inst::Call1(Shim1::LnGamma, a) => crate::stats::special::ln_gamma(r(a)),
+            Inst::Call1(Shim1::Digamma, a) => crate::stats::special::digamma(r(a)),
+            Inst::Call1(Shim1::Trigamma, a) => crate::stats::special::trigamma(r(a)),
+            Inst::Call1(Shim1::Tetragamma, a) => crate::stats::special::tetragamma(r(a)),
+            Inst::Call1(Shim1::Pentagamma, a) => crate::stats::special::pentagamma(r(a)),
+            Inst::Call1(
+                s @ (Shim1::NegSin | Shim1::ExpRel(_) | Shim1::Jet(..) | Shim1::Nan),
+                a,
+            ) => (s.f())(r(a)),
             Inst::Powf(a, b) => r(a).powf(r(b)),
+            Inst::Gamma { upper, i, j, a, x } => {
+                crate::stats::special::gamma_pq_partial(r(a), r(x), upper, i, j)
+            }
             Inst::Cmp(cc, a, b) => {
                 c[i] = cc.holds(r(a), r(b));
                 0.0
@@ -1119,6 +2034,16 @@ pub(super) fn interpret(f: &Func, args: &mut [&mut [f64]]) {
                 args[arg as usize][off as usize] = r(v);
                 0.0
             }
+            Inst::HostArg(a) => {
+                host::arg(r(a));
+                0.0
+            }
+            Inst::Host(f) => {
+                host::call(f);
+                0.0
+            }
+            Inst::HostOut(k) => host::out(k),
+            Inst::StopGrad(a) => r(a),
         };
     }
 }
@@ -1152,16 +2077,52 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
             Inst::Abs(a) => (r(a).abs(), if r(a) >= 0.0 { d(a) } else { -d(a) }),
             Inst::Floor(a) => (r(a).floor(), 0.0),
             Inst::Ceil(a) => (r(a).ceil(), 0.0),
-            Inst::Sqrt(a) => {
-                let s = r(a).sqrt();
-                (s, 0.5 / s * d(a))
-            }
             Inst::Call1(Shim1::Exp, a) => {
                 let e = r(a).exp();
                 (e, e * d(a))
             }
             Inst::Call1(Shim1::Ln, a) => (r(a).ln(), d(a) / r(a)),
             Inst::Call1(Shim1::Round, a) => (r(a).round(), 0.0),
+            Inst::Call1(Shim1::Sqrt, a) => {
+                let s = r(a).sqrt();
+                (s, 0.5 * d(a) / s)
+            }
+            Inst::Call1(Shim1::Cos, a) => (r(a).cos(), -r(a).sin() * d(a)),
+            Inst::Call1(Shim1::Sin, a) => (r(a).sin(), r(a).cos() * d(a)),
+            Inst::Call1(Shim1::Acos, a) => (r(a).acos(), -d(a) / (1.0 - r(a) * r(a)).sqrt()),
+            Inst::Call1(Shim1::LnGamma, a) => (
+                crate::stats::special::ln_gamma(r(a)),
+                crate::stats::special::digamma(r(a)) * d(a),
+            ),
+            Inst::Call1(Shim1::Digamma, a) => (
+                crate::stats::special::digamma(r(a)),
+                crate::stats::special::trigamma(r(a)) * d(a),
+            ),
+            Inst::Call1(Shim1::Trigamma, a) => (
+                crate::stats::special::trigamma(r(a)),
+                crate::stats::special::tetragamma(r(a)) * d(a),
+            ),
+            Inst::Call1(Shim1::Tetragamma, a) => (
+                crate::stats::special::tetragamma(r(a)),
+                crate::stats::special::pentagamma(r(a)) * d(a),
+            ),
+            Inst::Call1(Shim1::Pentagamma, a) => {
+                (crate::stats::special::pentagamma(r(a)), f64::NAN)
+            }
+            Inst::Call1(Shim1::NegSin, a) => (-r(a).sin(), -r(a).cos() * d(a)),
+            Inst::Call1(s @ Shim1::ExpRel(k), a) => (
+                (s.f())(r(a)),
+                (Shim1::ExpRel(k.saturating_add(1)).f())(r(a)) * d(a),
+            ),
+            Inst::Call1(s @ Shim1::Jet(f, k), a) => (
+                (s.f())(r(a)),
+                (Shim1::Jet(f, k.saturating_add(1)).f())(r(a)) * d(a),
+            ),
+            Inst::Call1(Shim1::Nan, _) => (f64::NAN, f64::NAN),
+            Inst::Gamma { upper, i, j, a, x } => {
+                let f = |i, j| crate::stats::special::gamma_pq_partial(r(a), r(x), upper, i, j);
+                (f(i, j), f(i + 1, j) * d(a) + f(i, j + 1) * d(x))
+            }
             Inst::Powf(a, b) => {
                 let p = r(a).powf(r(b));
                 let da = r(b) * r(a).powf(r(b) - 1.0) * d(a);
@@ -1195,6 +2156,16 @@ pub(super) fn interpret_tangent(f: &Func, args: &[&[f64]], dargs: &mut [Vec<f64>
                 dargs[arg as usize][off as usize] = d(v);
                 (0.0, 0.0)
             }
+            Inst::HostArg(a) => {
+                host::arg(r(a));
+                (0.0, 0.0)
+            }
+            Inst::Host(f) => {
+                host::call(f);
+                (0.0, 0.0)
+            }
+            Inst::HostOut(k) => (host::out(k), 0.0),
+            Inst::StopGrad(a) => (r(a), 0.0),
         };
         x[i] = val;
         dx[i] = tan;

@@ -626,7 +626,7 @@ or without time-varying covariates) and ODE. SS=1 also composes with
 `LAGTIME` — the lagged SS curve at time `t` equals the un-lagged curve
 at `t - lagtime`. See [Steady-State Doses](model-file/steady-state.qmd)
 for the full reference, including the data-validation warnings emitted
-for malformed rows (missing `II`, overlapping infusions).
+for malformed rows (missing `II`).
 
 ## Multiple Doses
 

@@ -182,6 +182,11 @@ fn run_covariance_scoped(
     )?;
     let model_ref = inputs.model();
     let pop_ref = inputs.population();
+    // The plans' keys read these fingerprints; the plans leave with the call.
+    let _prints = crate::parser::model_parser::rhs_regcode::kernel_jit::register(
+        model_ref,
+        &pop_ref.subjects,
+    );
 
     // This entry point re-runs the inner loop (EBEs → the prediction walk), so
     // it needs the same dose-compartment precondition `fit()` enforces (#375) —

@@ -358,7 +358,7 @@ impl DoseEvent {
     /// A `NaN` `time` instead lands where every engine already looks. It is the
     /// same shape a `NaN` `ALAG` produces (`dose.time + lag`), so the #1189
     /// machinery absorbs it unchanged: each walk pushes `d.time` onto its
-    /// timeline, [`crate::ode::predictions::timeline_has_non_finite`] /
+    /// timeline, [`crate::ode::predictions::times_have_non_finite`] /
     /// `EventSchedule::non_finite_event_time` sees it, and the subject comes
     /// back `NaN` — which the estimation guards already read as a diverged solve
     /// and the optimizer as a wall. One repulsion channel for every non-finite
@@ -552,21 +552,29 @@ impl DoseEvent {
         }
     }
 
-    /// A clone of this dose repositioned to the origin of a single steady-state
-    /// cycle: `time = 0`, with `ss`/`ii` cleared so the event-driven equilibration
-    /// walk replays it as an ordinary within-cycle dose. Preserves the
-    /// bioavailability-reshaped `(rate, duration)` this dose already carries —
-    /// unlike [`Self::new`], which would recompute `duration = amt/rate` and drop
-    /// `F` (#419). Lives here because it constructs a `DoseEvent` by functional
-    /// update, which the now-private `cmt` field forbids outside this
-    /// module (#912).
-    pub(crate) fn synthetic_cycle_dose(&self) -> DoseEvent {
-        DoseEvent {
+    /// The infusions one steady-state cycle of this dose replays, at the cycle origin with
+    /// `ss`/`ii` cleared: the newest pulse over `[0, r)` and, when the pulses overlap
+    /// (`T_inf > II`), the `m` earlier ones that run through the whole cycle as one window of
+    /// rate `m·rate` (`crate::dosing::ss_overlap_split_g`). Preserves the
+    /// bioavailability-reshaped `(rate, duration)` this dose already carries — unlike
+    /// [`Self::new`], which would recompute `duration = amt/rate` and drop `F` (#419). Lives
+    /// here because it constructs a `DoseEvent` by functional update, which the private `cmt`
+    /// field forbids outside this module (#912).
+    pub(crate) fn ss_cycle_doses(&self) -> Vec<DoseEvent> {
+        let (m, r) = crate::dosing::ss_overlap_split_g(self.duration, self.ii);
+        let at = |rate: f64, duration: f64| DoseEvent {
             time: 0.0,
             ss: false,
             ii: 0.0,
+            rate,
+            duration,
             ..self.clone()
+        };
+        let mut out = vec![at(self.rate, r)];
+        if m > 0 {
+            out.push(at(m as f64 * self.rate, self.ii));
         }
+        out
     }
 }
 
@@ -3631,7 +3639,7 @@ pub struct RuvMagnitude {
     /// this flag and route those subjects to their magnitude-aware
     /// finite-difference fallback instead.
     pub theta_dependent: bool,
-    /// Parallel to `per_sigma`: the compiled `Dual1` θ-derivative program for the
+    /// Parallel to `per_sigma`: the compiled `Dual2` θ-derivative program for the
     /// same non-bare slot (#576/#486), or `None` for a bare slot. Lets the
     /// analytic outer θ/σ gradient differentiate the magnitude directly — a new
     /// direct-θ term in `∂R/∂θ` — instead of falling back to FD. The runtime
@@ -3656,7 +3664,7 @@ pub struct RuvMagnitude {
     /// exponent reach every estimator through the plumbing the magnitude
     /// already has (see `residual_error::slot_exponent`).
     pub per_sigma_exponent: Vec<Option<RuvMagFn>>,
-    /// Parallel to `per_sigma_exponent`: the `Dual1` θ-derivative program of each
+    /// Parallel to `per_sigma_exponent`: the `Dual2` θ-derivative program of each
     /// exponent, so the analytic outer θ gradient carries `∂R/∂p · ∂p/∂θ`.
     pub per_sigma_exponent_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
     /// Whether any multiplier or exponent expression reads the `TAD` built-in
@@ -4014,7 +4022,7 @@ pub struct AnalyticalInit {
 /// order and feeds it, plus individual params / covariates, to the shared
 /// `PkNum`-generic evaluator `crate::parser::model_parser::OdeOutputProgram::eval_output_g`
 /// — the same one the ODE provider uses — so FOCE/FOCEI sensitivities stay
-/// analytic over `Dual2`/`Dual1` (no finite-difference fallback on the
+/// analytic over `Dual2`/`Dual2` (no finite-difference fallback on the
 /// supported paths).
 ///
 /// `#[non_exhaustive]`: constructed only inside the crate (the parser).
@@ -4924,8 +4932,45 @@ pub(crate) struct NestedLevels {
     pub(crate) readers: Vec<Vec<String>>,
 }
 
+/// The identity of a constructed model, keying its compiled plans (#2786). Minted from a global
+/// counter, never reused, so a model built at a dropped one's address cannot be served its
+/// plans; a clone is a new model and mints its own. Dropping it purges the model's plans.
+#[derive(Debug)]
+pub struct PlanId(u64);
+
+impl PlanId {
+    /// A fresh identity.
+    pub fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        PlanId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+    pub(crate) fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for PlanId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for PlanId {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PlanId {
+    fn drop(&mut self) {
+        crate::parser::model_parser::rhs_regcode::kernel_jit::drop_model(self.0);
+    }
+}
+
 /// A compiled model ready for estimation
 pub struct CompiledModel {
+    /// The model's identity: keys its compiled plans.
+    pub plan_id: PlanId,
     pub name: String,
     pub pk_model: PkModel,
     pub error_model: ErrorModel,
@@ -5549,8 +5594,7 @@ impl GradientMethod {
     /// **The one predicate** every consumer of the flag reads — the outer gradient and the
     /// `auto` optimizer pick, the inner η-gradient route, the covariance R-matrix scope and
     /// the IOV FD reason. A union, like [`GradientMethod::effective`]: `Fd` from either side
-    /// wins and `Auto` is neutral. SDE is not folded in here — each reader already declines
-    /// an SDE model on its own scope.
+    /// wins and `Auto` is neutral.
     pub(crate) fn forced_fd(model: &CompiledModel) -> bool {
         model.gradient_method == GradientMethod::Fd || LOCAL_FORCED_FD.get().unwrap_or(false)
     }
@@ -5561,8 +5605,7 @@ impl GradientMethod {
     ///
     /// `fit()`, `run_covariance` and `run_sir` resolve this per call (#1613): each arms
     /// its own `options.gradient_method` for the duration of the run, and every reader
-    /// asks [`GradientMethod::forced_fd`], which also reads the model's flag; an SDE model
-    /// is declined by each reader's own scope. This function is the same rule for a
+    /// asks [`GradientMethod::forced_fd`], which also reads the model's flag. This function is the same rule for a
     /// caller that holds the pair but runs nothing — `check` mirrors it — and
     /// `run_model_with_data` still stamps it onto the model it hands back, which outlives
     /// the fit.
@@ -5577,12 +5620,11 @@ impl GradientMethod {
     ///   `model.gradient_method` by hand and never touched `options` — reading the
     ///   options alone would miss it, and the loop honours the model.
     ///
-    /// Taking either source's `Fd`, plus `is_sde`, is right in all three cases and
-    /// idempotent on an already-stamped model.
+    /// Taking either source's `Fd` is right in all three cases and idempotent on an
+    /// already-stamped model.
     pub(crate) fn effective(model: &CompiledModel, options: &FitOptions) -> GradientMethod {
         if model.gradient_method == GradientMethod::Fd
             || options.gradient_method == GradientMethod::Fd
-            || model.is_sde()
         {
             GradientMethod::Fd
         } else {
@@ -6339,47 +6381,6 @@ impl CompiledModel {
         self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, Some(cmt))
     }
 
-    /// True when `subject` has a steady-state dose into a built-in absorption
-    /// input-rate compartment that the analytic dual SS fixed point does **not**
-    /// serve: SS into a `zero_order` spanning window (the pointwise `R_in` fixed
-    /// point doesn't build it), or SS combined with an absorption lag on the dosed
-    /// compartment — either a compartment `lagtime`/`ALAG` ([`Self::has_lagtime_on_cmt`])
-    /// or a per-route `lag=` on the forcing ([`crate::pk::absorption::InputRateForcing`]'s
-    /// `lag_slot`, #859). All are hard-rejected upstream (`E_ABSORPTION_SS_ZERO_ORDER`
-    /// / `E_ABSORPTION_SS_LAG`, `api::check_absorption_dosing` — whose `has_ss_lag`
-    /// covers a per-route lag via `route_lag_cmts`); the ODE walk gates
-    /// (`event_walk_scope` behind `event_walk_subject_supported`, and `ode_iov_walk_scope`)
-    /// re-check it as belt-and-suspenders so the
-    /// analytic-vs-FD routing stays self-consistent if either upstream check is
-    /// relaxed. This must therefore mirror the upstream predicate exactly — the
-    /// per-route `lag_slot` clause was added with #859 (which made a `first_order`
-    /// route lag analytic, so without it a relaxed upstream reject would route an
-    /// SS + route-lag model onto the analytic SS seed, which does not carry the
-    /// per-route onset). Single source of truth for those three sites (#835 review)
-    /// — keeping the scope in one place so it cannot drift between them (cf. the
-    /// #814 attribution-drift class of bug). Scoped to the SS-dosed compartment:
-    /// an SS dose into a plain compartment on a model that separately declares
-    /// absorption for a different route is unaffected (its `R_in` is inert for
-    /// that dose).
-    pub(crate) fn ss_absorption_out_of_scope(&self, subject: &Subject) -> bool {
-        let Some(ode) = self.ode_spec.as_ref() else {
-            return false;
-        };
-        subject.doses.iter().any(|d| {
-            // Match the forcing 0-based and probe the lagtime 1-based so a `CMT=0` dose (the
-            // default dose compartment == compartment 1) is scoped like `CMT=1` (#899, #913 review)
-            // — otherwise a `CMT=0` SS dose into a zero-order / lagged absorption compartment
-            // slips this out-of-scope guard and is silently mis-served.
-            d.ss && d.ii > 0.0
-                && ode.input_rate.iter().any(|f| {
-                    f.cmt == d.cmt_idx()
-                        && (f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
-                            || f.lag_slot.is_some()
-                            || self.has_lagtime_on_cmt(d.cmt_1based()))
-                })
-        })
-    }
-
     /// True when the model wires in a bioavailability `F`/`Fn` parameter (on
     /// either engine). Mirrors [`Self::has_lagtime`]: [`PK_IDX_F`] is in
     /// `pk_indices` when `f=` binds it on the analytical `[structural_model]`
@@ -6551,7 +6552,7 @@ impl CompiledModel {
     /// loops are analytic on FOCE and FOCEI (#644/#659) — including combined with `iiv_on_ruv` on
     /// the closed-form (#673/#677) and ODE (#486) paths, since the outer assembly is
     /// provider-agnostic. Per-subject FD fallbacks remain only for magnitude combined with an
-    /// M3-censored row or more θ than the magnitude program's `Dual1`
+    /// M3-censored row or more θ than the magnitude program's `Dual2`
     /// dispatch serves (see #486's remaining-FD register). The FD forward NLL is itself
     /// magnitude-aware, so those fallbacks stay exact.
     #[inline]
@@ -7825,6 +7826,10 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // "non-finite", "stability-limited", "singular Jacobian", …), which prose arms below
         // would claim as an estimation or solver-health problem.
         (WarningSeverity::Warning, WarningCode::Simulation)
+    } else if lower.starts_with("w_plan_fd_fallback") {
+        // #2786: a compiled plan failed and its subjects took finite differences. Token arm
+        // ahead of the prose ones: the message quotes the plan layer's own failure reason.
+        (WarningSeverity::Warning, WarningCode::GradientFallback)
     } else if lower.starts_with("w_ode_rhs_") {
         // #2681: which engine runs the `[odes]` RHS. Informational, and a token arm ahead of
         // the prose ones: the message names the construct, and "interpreter" or a function

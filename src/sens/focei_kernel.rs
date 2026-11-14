@@ -3,11 +3,10 @@
 //! `G = ∂f/∂η`, `η`, and the population parameters the likelihood reads ([`ParT`]: Ω by
 //! its Cholesky factor, σ, `block_sigma` ρ, the serial ρ, θ for FREM rows).
 //!
-//! The adjoint gradient (`sens::ode_provider::adjoint`) evaluates them twice:
-//! * over a forward η-dual in f64, for `∇_η F` and `H = ∇²_η l`;
-//! * on the scalar reverse tape [`R`](crate::sens::rtape::R), for `Ψ = F − wᵀ∇_η l` and
-//!   its partials with respect to every input, from one sweep and with no hand-derived
-//!   seeds or finite differences.
+//! The adjoint gradient (`sens::ode_provider::adjoint`) records them into a kernel plan
+//! (`ode_adjoint_kernel`) whose leaves are every input, so one multi-seed reverse gives
+//! `Ψ = F − wᵀ∇_η l`'s partials with respect to every input, with no hand-derived seeds or
+//! finite differences.
 //!
 //! Every formula mirrors the f64 production objective term for term:
 //! * FOCEI, diagonal residual: `foce_subject_nll_interaction` / `gaussian_foce_accum`,
@@ -24,8 +23,8 @@
 //! predictions carry `G`, so its tangents are exactly `Σ_m G_mk ∂R/∂f_m`.
 #![allow(clippy::needless_range_loop)]
 
-use crate::sens::num::PkNum;
-use crate::sens::rtape::DualT;
+use crate::sens::jet::DualT;
+use crate::sens::num::{BranchCmp, PkNum};
 use crate::stats::residual_error::{LoadingForm, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 
@@ -62,7 +61,7 @@ impl<T: PkNum> OmegaT<T> {
         // L⁻¹, lower triangular, by forward substitution.
         let mut li = vec![vec![c(0.0); n]; n];
         for i in 0..n {
-            if !(chol[i][i].val() > 0.0) {
+            if !chol[i][i].br_cmp_c(BranchCmp::Gt, 0.0) {
                 return None;
             }
             li[i][i] = c(1.0) / chol[i][i];
@@ -161,6 +160,10 @@ pub(crate) struct LikCtx<'a> {
     /// (`ErrorSpec::sigma_loading_shape`), read on access, so building the context allocates
     /// nothing per row — it is built for every subject at every gradient.
     keys: std::borrow::Cow<'a, [usize]>,
+    /// An SDE subject: the kernel's `f`/`g` (and `q`) carry `2n` rows, the `n` predictions then
+    /// the EKF's per-observation process-noise variances `p_obs` with their η-jets, and each
+    /// row's variance is the residual one plus its `p_obs` (`ekf_p_obs`).
+    pub(crate) sde: bool,
 }
 
 /// The most σ loadings one row has: the residual-error owner's bound.
@@ -180,6 +183,24 @@ impl<'a> LikCtx<'a> {
             params,
             cov,
             keys,
+            sde: model.is_sde(),
+        }
+    }
+
+    /// The subject's observation rows (the kernel's `f` holds `2n` under an SDE).
+    #[inline]
+    fn n(&self) -> usize {
+        self.subject.observations.len()
+    }
+
+    /// Row `j`'s EKF process-noise variance as the kernel sees it: `f[n + j]` under an SDE,
+    /// else zero.
+    #[inline]
+    fn extra<T: PkNum>(&self, f: &[T], j: usize) -> T {
+        if self.sde {
+            f[self.n() + j]
+        } else {
+            T::from_f64(0.0)
         }
     }
 
@@ -259,11 +280,16 @@ impl<'a> LikCtx<'a> {
                     .filter(|m| m.len() == 2 * n_sigma)
                     .map(|m| m[n_sigma + idx])
                 {
-                    Some(pw) if pw.val() != 1.0 => {
-                        if f.val() == 0.0 {
+                    Some(pw) if pw.br_cmp_c(BranchCmp::Ne, 1.0) => {
+                        if f.br_cmp_c(BranchCmp::Eq, 0.0) {
                             T::from_f64(0.0)
                         } else {
-                            T::from_f64(if f.val() < 0.0 { -1.0 } else { 1.0 }) * f.abs().pow(pw)
+                            let sign = if f.br_cmp_c(BranchCmp::Lt, 0.0) {
+                                -1.0
+                            } else {
+                                1.0
+                            };
+                            T::from_f64(sign) * f.abs().pow(pw)
                         }
                     }
                     _ => form.coeff_g(f),
@@ -329,7 +355,7 @@ impl<'a> LikCtx<'a> {
                 let (l, n) = self.loadings(j, f[j], p);
                 l[..n].to_vec()
             },
-            f.len(),
+            self.n(),
             self.subject,
             &p.sigma,
             self.cov,
@@ -339,30 +365,26 @@ impl<'a> LikCtx<'a> {
     }
 }
 
+/// `0 < x < ∞` — a variance a row can be scored with — as a branch: `false` on `NaN`.
+#[inline]
+fn positive_finite<T: PkNum>(x: T) -> bool {
+    x.br_cmp_c(BranchCmp::Gt, 0.0) && x.br_cmp_c(BranchCmp::Lt, f64::INFINITY)
+}
+
 /// `log Φ(z)` with production's value (`log_normal_cdf`) and its exact derivatives
 /// (`h = φ/Φ`, `h′ = −h(z + h)`, `h″`).
 #[inline]
 fn log_phi<T: PkNum>(z: T) -> T {
-    let zv = z.val();
-    let h = crate::stats::special::inv_mills(zv);
-    if h == 0.0 {
-        // Past `h`'s underflow `log Φ` is flat: every derivative is `h` times a polynomial
-        // in `z`, limit `0`. A constant, not a lift: at `z = +∞` both `h′ = −h(z + h)` and
-        // the chain rule's `0·z′` (with `z′` overflowed too) would be `0·∞` (#2772).
-        return T::from_f64(crate::stats::special::log_normal_cdf(zv));
+    // Past `h`'s underflow the row is certain and every derivative is `h` times a polynomial:
+    // limit `0` (#2772). Taken here, not left to the jet evaluator (which also returns `0`):
+    // at `z = +∞` the chain `0 · z′` is `0 · ∞ = NaN` for a `z` whose own derivatives overflow
+    // (`z = r/w` with `r ≈ 1e308`), so the value alone is returned. A recordable test.
+    if inv_mills(z).br_cmp_c(BranchCmp::Eq, 0.0) {
+        return z
+            .jet_unary(crate::sens::num::JetFn::LogNormCdf)
+            .value_only();
     }
-    let h1 = -h * (zv + h);
-    // (log Φ)‴ = h″ = −h′(z + h) − h(1 + h′): the Laplace kernel's second-order dual
-    // differentiates the `(log Φ)″` factor; (log Φ)⁗ = h‴ = −h″(z + 2h) − 2h′(1 + h′), for
-    // the covariance step's nested dual.
-    let h2 = -h1 * (zv + h) - h * (1.0 + h1);
-    z.lift4(
-        crate::stats::special::log_normal_cdf(zv),
-        h,
-        h1,
-        h2,
-        -h2 * (zv + 2.0 * h) - 2.0 * h1 * (1.0 + h1),
-    )
+    z.jet_unary(crate::sens::num::JetFn::LogNormCdf)
 }
 
 /// Inverse Mills ratio `h(z) = φ/Φ` with `h′ = −h(z + h)`, lifted to fourth order so the
@@ -370,15 +392,7 @@ fn log_phi<T: PkNum>(z: T) -> T {
 /// `h‴` unknown, #2093 review).
 #[inline]
 fn inv_mills<T: PkNum>(z: T) -> T {
-    let zv = z.val();
-    let h = crate::stats::special::inv_mills(zv);
-    let h1 = -h * (zv + h);
-    // h″ = −h′(z + h) − h(1 + h′); h‴ = −h″(z + 2h) − 2h′(1 + h′);
-    // h⁗ = −h‴(z + 2h) − 3h″(1 + 2h′).
-    let h2 = -h1 * (zv + h) - h * (1.0 + h1);
-    let h3 = -h2 * (zv + 2.0 * h) - 2.0 * h1 * (1.0 + h1);
-    let h4 = -h3 * (zv + 2.0 * h) - 3.0 * h2 * (1.0 + 2.0 * h1);
-    z.lift4(h, h1, h2, h3, h4)
+    z.jet_unary(crate::sens::num::JetFn::InvMills)
 }
 
 /// One censored row's `−2·log Φ(z)` and the `H̃` coefficients `(g2, cz, cm)` of
@@ -390,9 +404,11 @@ fn m3_terms<T: PkNum>(y: f64, f: T, v: T, d: T, d2: T, cens: i8) -> (T, T, T, T)
     let r = c(y) - f;
     let z = c(sgn) * r / w;
     let h = inv_mills(z);
-    if h.val() == 0.0 {
+    // A recordable test (`val` would fail a recording).
+    if h.br_cmp_c(BranchCmp::Eq, 0.0) {
         // A certain row past `h`'s underflow: `g2`, `cz` and `cm` are `h` times polynomials
         // in `z` and `m`, limit `0`, and `z²` overflows from `|z| ≈ 1.3e154` (#2772).
+        // `log_phi` is the value only here (its own `h == 0` arm).
         return (c(-2.0) * log_phi(z), c(0.0), c(0.0), c(0.0));
     }
     let m = c(sgn) * (c(1.0) / w + r * d / (c(2.0) * v * w));
@@ -408,13 +424,13 @@ fn m3_terms<T: PkNum>(y: f64, f: T, v: T, d: T, d2: T, cens: i8) -> (T, T, T, T)
 /// FOCEI `F` and the conditional `∇_η l` together. On the diagonal path one dual pass per
 /// row, in the directions the row reads (its prediction, and `η_r` under RUV IIV), gives
 /// `ℓ_j`, `∂ℓ_j/∂f`, `∂ℓ_j/∂η_r`, `V` and `∂V/∂f` at once, and both assemble from them.
-pub(crate) fn focei_f_grad<T: PkNum, const N: usize>(
+pub(crate) fn focei_f_grad<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    eta: &[T],
     p: &ParT<T>,
-) -> Option<(T, [T; N])> {
+) -> Option<(T, Vec<T>)> {
     if ctx.dense() {
         return Some((
             focei_f_dense(ctx, f, g, eta, p)?.0,
@@ -429,10 +445,10 @@ pub(crate) fn focei_f_grad<T: PkNum, const N: usize>(
 /// (the raw `1×` NLL of every TTE / binary / CTMM endpoint), η-gradient and η-Hessian —
 /// as production folds it in (`foce_subject_nll_interaction_with_tte`): `2q` beside the
 /// Gaussian `data_ll`, `∇²q` into `H̃`, so `∇_η l` gains `∇q`.
-pub(crate) struct NonGauss<T, const N: usize> {
+pub(crate) struct NonGauss<T> {
     pub(crate) q: T,
-    pub(crate) g: [T; N],
-    pub(crate) h: [[T; N]; N],
+    pub(crate) g: Vec<T>,
+    pub(crate) h: Vec<Vec<T>>,
 }
 
 /// `(F, ∇_η l)` of the objective of a subject carrying non-Gaussian records: production's
@@ -441,31 +457,28 @@ pub(crate) struct NonGauss<T, const N: usize> {
 /// `None` on a dense residual (production's non-Gaussian path is the diagonal one) or a
 /// failed factorisation.
 #[cfg(feature = "survival")]
-pub(crate) fn focei_f_grad_ng<T: PkNum, const N: usize>(
+pub(crate) fn focei_f_grad_ng<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    eta: &[T],
     p: &ParT<T>,
-    ng: &NonGauss<T, N>,
+    ng: &NonGauss<T>,
     interaction: bool,
-) -> Option<(T, [T; N])> {
+) -> Option<(T, Vec<T>)> {
     if ctx.dense() {
         return None;
     }
-    let (fv, grad, _) = match ctx.model.residual_error_eta {
-        None => focei_rows::<T, N, 1>(ctx, f, g, eta, p, None, Some(ng), interaction),
-        Some(r) => focei_rows::<T, N, 2>(ctx, f, g, eta, p, Some(r), Some(ng), interaction),
-    }?;
+    let (fv, grad, _) = focei_rows_k(ctx, f, g, eta, p, Some(ng), interaction)?;
     Some((fv, grad))
 }
 
 /// FOCEI's Gauss–Newton Hessian `H̃` (the AGQ Gauss–Newton anchor).
-pub(crate) fn focei_htilde<T: PkNum, const N: usize>(
+pub(crate) fn focei_htilde<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    eta: &[T],
     p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
     Some(focei_parts(ctx, f, g, eta, p)?.2)
@@ -473,20 +486,36 @@ pub(crate) fn focei_htilde<T: PkNum, const N: usize>(
 
 /// `(F, ∇_η l, H̃)` — `∇l` is left zero on the dense path, whose callers take it from
 /// [`inner_grad`].
-fn focei_parts<T: PkNum, const N: usize>(
+fn focei_parts<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    eta: &[T],
     p: &ParT<T>,
-) -> Option<(T, [T; N], Vec<Vec<T>>)> {
+) -> Option<(T, Vec<T>, Vec<Vec<T>>)> {
     if ctx.dense() {
         let (fv, ht) = focei_f_dense(ctx, f, g, eta, p)?;
-        return Some((fv, [T::from_f64(0.0); N], ht));
+        return Some((fv, vec![T::from_f64(0.0); eta.len()], ht));
     }
-    match ctx.model.residual_error_eta {
-        None => focei_rows::<T, N, 1>(ctx, f, g, eta, p, None, None, true),
-        Some(r) => focei_rows::<T, N, 2>(ctx, f, g, eta, p, Some(r), None, true),
+    focei_rows_k(ctx, f, g, eta, p, None, true)
+}
+
+/// [`focei_rows`] at the dual width the subject needs: direction 0 is the prediction, then
+/// `η_r` under RUV IIV, then the row's `p_obs` under an SDE.
+fn focei_rows_k<T: PkNum>(
+    ctx: &LikCtx,
+    f: &[T],
+    g: &[Vec<T>],
+    eta: &[T],
+    p: &ParT<T>,
+    ng: Option<&NonGauss<T>>,
+    interaction: bool,
+) -> Option<(T, Vec<T>, Vec<Vec<T>>)> {
+    let rr = ctx.model.residual_error_eta;
+    match (rr.is_some(), ctx.sde) {
+        (false, false) => focei_rows::<T, 1>(ctx, f, g, eta, p, rr, ng, interaction),
+        (true, false) | (false, true) => focei_rows::<T, 2>(ctx, f, g, eta, p, rr, ng, interaction),
+        (true, true) => focei_rows::<T, 3>(ctx, f, g, eta, p, rr, ng, interaction),
     }
 }
 
@@ -497,48 +526,63 @@ fn focei_parts<T: PkNum, const N: usize>(
 /// `interaction = false` drops `½·c̃ᵀc̃` and the censored curvature (production's FOCE form
 /// beside a non-Gaussian term), and `ng` adds that term (see [`NonGauss`]).
 #[allow(clippy::too_many_arguments)]
-fn focei_rows<T: PkNum, const N: usize, const K: usize>(
+fn focei_rows<T: PkNum, const K: usize>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    eta: &[T],
     p: &ParT<T>,
     rr: Option<usize>,
-    ng: Option<&NonGauss<T, N>>,
+    ng: Option<&NonGauss<T>>,
     interaction: bool,
-) -> Option<(T, [T; N], Vec<Vec<T>>)> {
+) -> Option<(T, Vec<T>, Vec<Vec<T>>)> {
     let c = |x: f64| T::from_f64(x);
     let one = c(1.0);
-    let unit = |k: usize| -> [T; N] { std::array::from_fn(|l| c(if l == k { 1.0 } else { 0.0 })) };
+    let nn = eta.len();
+    let unit =
+        |k: usize| -> Vec<T> { (0..nn).map(|l| c(if l == k { 1.0 } else { 0.0 })).collect() };
     let lift = |x: T| DualT::<K, T> {
         v: x,
         g: [c(0.0); K],
     };
     let pk = p.wrap::<K>();
-    let ed: [DualT<K, T>; N] = std::array::from_fn(|k| {
-        let mut d = lift(eta[k]);
-        if K > 1 && Some(k) == rr {
-            d.g[1] = one;
-        }
-        d
-    });
+    let ed: Vec<DualT<K, T>> = (0..nn)
+        .map(|k| {
+            let mut d = lift(eta[k]);
+            if K > 1 && Some(k) == rr {
+                d.g[1] = one;
+            }
+            d
+        })
+        .collect();
     let ruv = ctx.ruv_scale(&ed);
-    let n = f.len();
+    let n = ctx.n();
+    // The `p_obs` direction (an SDE's), last.
+    let ip = K - 1;
     let mut data = c(0.0);
     let mut bloq = c(0.0);
     let mut dl = vec![c(0.0); n];
-    let mut explicit = [c(0.0); N];
+    let mut explicit = vec![c(0.0); nn];
     // H̃ = Ω⁻¹ + Σ_t α_t·u_t·v_tᵀ; the terms come in symmetric pairs, so H̃ stays symmetric.
-    let mut terms: Vec<(T, [T; N], [T; N])> = Vec::with_capacity(n + 1);
+    let mut terms: Vec<(T, Vec<T>, Vec<T>)> = Vec::with_capacity(n + 1);
     for j in 0..n {
         let y = ctx.subject.observations[j];
         if let Some(row) = ctx.frem_row(j) {
             // FREM: prediction θ_i + η_e (unit η-sensitivity), fixed variance; no RUV
             // scale and no `c̃` column (`gaussian_foce_accum`'s `!is_pk_row`).
             let e = row.1;
-            let mut el: [DualT<K, T>; N] = std::array::from_fn(|k| lift(eta[k]));
+            let mut el: Vec<DualT<K, T>> = eta.iter().map(|&x| lift(x)).collect();
             el[e].g[0] = one;
-            let d = row_l(ctx, j, lift(f[j]), lift(f[j]), lift(one), &el, &pk)?;
+            let d = row_l(
+                ctx,
+                j,
+                lift(f[j]),
+                lift(f[j]),
+                lift(c(0.0)),
+                lift(one),
+                &el,
+                &pk,
+            )?;
             data = data + d.v;
             explicit[e] = explicit[e] + d.g[0];
             terms.push((one / ctx.frem_pred_var(row, eta, p).1, unit(e), unit(e)));
@@ -546,11 +590,18 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
         }
         let mut fd = lift(f[j]);
         fd.g[0] = one;
-        let gj = g[j];
+        let gj = &g[j];
         match ctx.censored(j) {
             None => {
-                let vd = ctx.variance_v(j, fd, ruv, &pk);
-                if !(vd.v.val().is_finite() && vd.v.val() > 0.0) {
+                let mut vd = ctx.variance_v(j, fd, ruv, &pk);
+                if ctx.sde {
+                    // `V = V_resid + p_obs` (`H̃` below holds `p_obs` η-independent, as
+                    // production does: `c̃` reads `∂V/∂f` only); `∇_η l` sees its η-jet.
+                    let mut pd = lift(f[n + j]);
+                    pd.g[ip] = one;
+                    vd = vd + pd;
+                }
+                if !positive_finite(vd.v) {
                     return None;
                 }
                 let r = lift(c(y)) - fd;
@@ -560,32 +611,43 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
                 if let Some(r) = rr {
                     explicit[r] = explicit[r] + lj.g[1];
                 }
+                if ctx.sde {
+                    for k in 0..nn {
+                        explicit[k] = explicit[k] + lj.g[ip] * g[n + j][k];
+                    }
+                }
                 let iv = one / vd.v;
                 let cs = vd.g[0] / vd.v;
                 // g·gᵀ/V + ½·c̃c̃ᵀ with c̃ = (∂V/∂f / V)·g, whose η_r entry is 2 under RUV IIV.
                 match (rr, interaction) {
-                    (_, false) => terms.push((iv, gj, gj)),
-                    (None, true) => terms.push((iv + c(0.5) * cs * cs, gj, gj)),
+                    (_, false) => terms.push((iv, gj.clone(), gj.clone())),
+                    (None, true) => terms.push((iv + c(0.5) * cs * cs, gj.clone(), gj.clone())),
                     (Some(r), true) => {
-                        let ck: [T; N] =
-                            std::array::from_fn(|k| if k == r { c(2.0) } else { cs * gj[k] });
-                        terms.push((iv, gj, gj));
-                        terms.push((c(0.5), ck, ck));
+                        let ck: Vec<T> = (0..nn)
+                            .map(|k| if k == r { c(2.0) } else { cs * gj[k] })
+                            .collect();
+                        terms.push((iv, gj.clone(), gj.clone()));
+                        terms.push((c(0.5), ck.clone(), ck));
                     }
                 }
             }
             Some(cens) => {
-                let (v, d, d2) = ctx.variance(j, f[j], ruv.v, p);
-                if !(v.val().is_finite() && v.val() > 0.0) {
+                let (v0, d, d2) = ctx.variance(j, f[j], ruv.v, p);
+                let v = v0 + ctx.extra(f, j);
+                if !positive_finite(v) {
                     return None;
                 }
                 let (l2, g2, cz, cm) = m3_terms(y, f[j], v, d, d2, cens);
                 bloq = bloq + l2;
-                // ∂ℓ/∂f and ∂ℓ/∂η_r of ℓ = −2·log Φ(±(y − f)/√V), with ∂V/∂η_r = 2V.
+                // ∂ℓ/∂f, ∂ℓ/∂η_r and ∂ℓ/∂p_obs of ℓ = −2·log Φ(±(y − f)/√V), with
+                // ∂V/∂η_r = 2·V_resid.
                 let mut vk = lift(v);
                 vk.g[0] = d;
-                if K > 1 {
-                    vk.g[1] = c(2.0) * v;
+                if rr.is_some() {
+                    vk.g[1] = c(2.0) * v0;
+                }
+                if ctx.sde {
+                    vk.g[ip] = one;
                 }
                 let sgn = if cens < 0 { -1.0 } else { 1.0 };
                 let lj = lift(c(-2.0)) * log_phi(lift(c(sgn)) * (lift(c(y)) - fd) / vk.sqrt());
@@ -593,13 +655,18 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
                 if let Some(r) = rr {
                     explicit[r] = explicit[r] + lj.g[1];
                 }
+                if ctx.sde {
+                    for k in 0..nn {
+                        explicit[k] = explicit[k] + lj.g[ip] * g[n + j][k];
+                    }
+                }
                 if interaction {
-                    terms.push((g2, gj, gj));
+                    terms.push((g2, gj.clone(), gj.clone()));
                     if let Some(r) = rr {
-                        let mut go = gj;
+                        let mut go = gj.clone();
                         go[r] = c(0.0);
                         terms.push((cz, unit(r), unit(r)));
-                        terms.push((cm, unit(r), go));
+                        terms.push((cm, unit(r), go.clone()));
                         terms.push((cm, go, unit(r)));
                     }
                 }
@@ -607,8 +674,8 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
         }
     }
     let oi = &p.omega.inv;
-    let mut ht: Vec<Vec<T>> = vec![vec![c(0.0); N]; N];
-    for a in 0..N {
+    let mut ht: Vec<Vec<T>> = vec![vec![c(0.0); nn]; nn];
+    for a in 0..nn {
         for b in 0..=a {
             let e = T::wsum3(
                 0.0,
@@ -622,8 +689,8 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
     // The non-Gaussian term: `2q` in the data, `∇²q` in `H̃`, `∇q` in `∇l` (`l = ½·data`).
     if let Some(ng) = ng {
         data = data + c(2.0) * ng.q;
-        for a in 0..N {
-            for b in 0..N {
+        for a in 0..nn {
+            for b in 0..nn {
                 ht[a][b] = ht[a][b] + ng.h[a][b];
             }
         }
@@ -632,7 +699,7 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
     let fv = c(0.5) * (data + ctx.prior(eta, p) + ld + bloq);
     let mut grad = assemble_grad(oi, eta, g, &dl, &explicit);
     if let Some(ng) = ng {
-        for k in 0..N {
+        for k in 0..nn {
             grad[k] = grad[k] + ng.g[k];
         }
     }
@@ -640,20 +707,22 @@ fn focei_rows<T: PkNum, const N: usize, const K: usize>(
 }
 
 /// `∇_k l = Σ_l Ω⁻¹_kl η_l + ½·Σ_j (∂ℓ_j/∂f)·G_jk + ½·explicit_k`.
-fn assemble_grad<T: PkNum, const N: usize>(
+fn assemble_grad<T: PkNum>(
     oi: &[Vec<T>],
-    eta: &[T; N],
-    g: &[[T; N]],
+    eta: &[T],
+    g: &[Vec<T>],
     dl: &[T],
-    explicit: &[T; N],
-) -> [T; N] {
+    explicit: &[T],
+) -> Vec<T> {
     let one = T::from_f64(1.0);
     let half = T::from_f64(0.5);
-    std::array::from_fn(|k| {
-        let prior = (0..N).map(|l| (oi[k][l], eta[l], one));
-        let rows = (0..dl.len()).map(|j| (half, dl[j], g[j][k]));
-        T::wsum3(0.0, prior.chain(rows)) + half * explicit[k]
-    })
+    (0..eta.len())
+        .map(|k| {
+            let prior = (0..eta.len()).map(|l| (oi[k][l], eta[l], one));
+            let rows = (0..dl.len()).map(|j| (half, dl[j], g[j][k]));
+            T::wsum3(0.0, prior.chain(rows)) + half * explicit[k]
+        })
+        .collect()
 }
 
 /// The FOCE (no interaction) subject objective: the Sheiner–Beal linearised marginal
@@ -668,41 +737,46 @@ fn assemble_grad<T: PkNum, const N: usize>(
 /// `log|R̃| = log|R| + log|Ω| + log|A|` with `A = Ω⁻¹ + GᵀR⁻¹G`, `b = GᵀR⁻¹r`: `N × N`
 /// work per subject instead of the `n × n` factorisation. A covariance coupling rows
 /// factors `R̃` directly.
-pub(crate) fn foce_f<T: PkNum, const N: usize>(
+pub(crate) fn foce_f<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    eta: &[T],
     fpop: Option<&[T]>,
     p: &ParT<T>,
 ) -> Option<T> {
     let c = |x: f64| T::from_f64(x);
     let one = c(1.0);
-    let n = f.len();
-    let unit = |k: usize| -> [T; N] { std::array::from_fn(|l| c(if l == k { 1.0 } else { 0.0 })) };
+    let n = ctx.n();
+    let nn = eta.len();
+    let unit =
+        |k: usize| -> Vec<T> { (0..nn).map(|l| c(if l == k { 1.0 } else { 0.0 })).collect() };
     // Per row: prediction, η-sensitivity, linearised mean f₀ and LᵀG (for GΩGᵀ = (LᵀG)ᵀ(LᵀG)).
     let lch = &p.omega.chol;
     let mut f0: Vec<T> = Vec::with_capacity(n);
-    let mut lg: Vec<[T; N]> = Vec::with_capacity(n);
+    let mut lg: Vec<Vec<T>> = Vec::with_capacity(n);
     for j in 0..n {
         let (fj, gj) = match ctx.frem_row(j) {
             Some(row) => (ctx.frem_pred_var(row, eta, p).0, unit(row.1)),
-            None => (f[j], g[j]),
+            None => (f[j], g[j].clone()),
         };
-        f0.push(fj - T::wsum3(0.0, (0..N).map(|k| (one, gj[k], eta[k]))));
-        lg.push(std::array::from_fn(|cc| {
-            T::wsum3(0.0, (cc..N).map(|r| (one, lch[r][cc], gj[r])))
-        }));
+        f0.push(fj - T::wsum3(0.0, (0..nn).map(|k| (one, gj[k], eta[k]))));
+        lg.push(
+            (0..nn)
+                .map(|cc| T::wsum3(0.0, (cc..nn).map(|r| (one, lch[r][cc], gj[r]))))
+                .collect(),
+        );
     }
     let r_eval: Vec<T> = match fpop {
         Some(fp) => fp.to_vec(),
         None => f0.clone(),
     };
     // R⁰'s diagonal (FREM rows overridden), and the censored rows' `−2·log Φ`.
+    // An SDE row adds its EKF `p_obs` (at the mode, held: the marginal linearises η out).
     let r0_diag = |j: usize, rd: T| -> T {
         match ctx.frem_row(j) {
             Some(row) => ctx.frem_pred_var(row, eta, p).1,
-            None => rd,
+            None => rd + ctx.extra(f, j),
         }
     };
     let dense = ctx.cov.is_dense();
@@ -718,13 +792,13 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
                 None => ctx.variance_v(j, r_eval[j], one, p),
             },
         );
-        if !(rd.val().is_finite() && rd.val() > 0.0) {
+        if !positive_finite(rd) {
             return None;
         }
         rdiag.push(rd);
         match ctx.censored(j) {
             Some(cens) if ctx.frem_row(j).is_none() => {
-                let rt = T::wsum3(0.0, (0..N).map(|k| (one, lg[j][k], lg[j][k]))) + rd;
+                let rt = T::wsum3(0.0, (0..nn).map(|k| (one, lg[j][k], lg[j][k]))) + rd;
                 let sgn = if cens < 0 { -1.0 } else { 1.0 };
                 bloq = bloq
                     + c(-2.0)
@@ -744,11 +818,11 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
     // `1 + tr S` to ~1e11 and the correction loses every digit (#1498): above
     // `WOODBURY_MAX_INFO_TRACE`, or when it is not finite, `R̃` is factored at observation size.
     let woodbury = rm.is_none() && {
-        let tr: f64 = quant
-            .iter()
-            .map(|&j| (0..N).map(|k| lg[j][k].val() * lg[j][k].val()).sum::<f64>() / rdiag[j].val())
-            .sum();
-        1.0 + tr <= WOODBURY_MAX_INFO_TRACE || woodbury_forced()
+        let tr = quant.iter().fold(c(0.0), |acc, &j| {
+            let s = (0..nn).fold(c(0.0), |a, k| a + lg[j][k] * lg[j][k]);
+            acc + s / rdiag[j]
+        });
+        (one + tr).br_cmp_c(BranchCmp::Le, WOODBURY_MAX_INFO_TRACE) || woodbury_forced()
     };
     if !woodbury {
         // R̃ = R⁰_q + (LᵀG)ᵀ(LᵀG), FREM rows decoupled (`apply_frem_r_matrix_overrides`).
@@ -764,7 +838,7 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
                         } else {
                             rm.as_ref().map_or(c(0.0), |m| m[ja][jb])
                         };
-                        T::wsum3(0.0, (0..N).map(|k| (one, lg[ja][k], lg[jb][k]))) + r0
+                        T::wsum3(0.0, (0..nn).map(|k| (one, lg[ja][k], lg[jb][k]))) + r0
                     })
                     .collect()
             })
@@ -779,8 +853,8 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
     // `Ω⁻¹ + GᵀD⁻¹G` keeps `cond(Ω)` (a near-rail `block_omega`) out of the subtraction,
     // which the trace gate above does not see.
     let iv: Vec<T> = quant.iter().map(|&j| one / rdiag[j]).collect();
-    let mut a: Vec<Vec<T>> = vec![vec![c(0.0); N]; N];
-    for k in 0..N {
+    let mut a: Vec<Vec<T>> = vec![vec![c(0.0); nn]; nn];
+    for k in 0..nn {
         for l in 0..=k {
             let e = T::wsum3(
                 if k == l { 1.0 } else { 0.0 },
@@ -790,13 +864,13 @@ pub(crate) fn foce_f<T: PkNum, const N: usize>(
             a[l][k] = e;
         }
     }
-    let b: Vec<T> = (0..N)
+    let b: Vec<T> = (0..nn)
         .map(|k| T::wsum3(0.0, (0..nq).map(|i| (iv[i], lg[quant[i]][k], res[i]))))
         .collect();
     let la = chol(&a)?;
     let ab = chol_solve(&la, &b);
     let quad = T::wsum3(0.0, (0..nq).map(|i| (iv[i], res[i], res[i])))
-        - T::wsum3(0.0, (0..N).map(|k| (one, b[k], ab[k])));
+        - T::wsum3(0.0, (0..nn).map(|k| (one, b[k], ab[k])));
     let mut log_r = c(0.0);
     for &j in &quant {
         log_r = log_r + rdiag[j].ln();
@@ -826,34 +900,51 @@ fn woodbury_forced() -> bool {
     false
 }
 
+/// The predictions and η as one-direction duals along `η_k`: prediction `j` carries
+/// `G_jk` and `η_m` the unit vector `e_k`, so a quantity built from them has `∂/∂η_k` in its
+/// tangent. One pass per `k` replaces a dual wide in every η, so no width is baked into a type.
+fn direction_duals<T: PkNum>(
+    f: &[T],
+    g: &[Vec<T>],
+    eta: &[T],
+    k: usize,
+) -> (Vec<DualT<1, T>>, Vec<DualT<1, T>>) {
+    let c = |x: f64| T::from_f64(x);
+    let fd = (0..f.len())
+        .map(|j| DualT {
+            v: f[j],
+            g: [g[j][k]],
+        })
+        .collect();
+    let ed = (0..eta.len())
+        .map(|m| DualT {
+            v: eta[m],
+            g: [c(if m == k { 1.0 } else { 0.0 })],
+        })
+        .collect();
+    (fd, ed)
+}
+
 /// Dense-`R` FOCEI `F`: `½(rᵀR⁻¹r + log|R| + ηᵀΩ⁻¹η + log|Ω| + log|H̃|)`.
-fn focei_f_dense<T: PkNum, const N: usize>(
+fn focei_f_dense<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    eta: &[T],
     p: &ParT<T>,
 ) -> Option<(T, Vec<Vec<T>>)> {
     let c = |x: f64| T::from_f64(x);
-    let n = f.len();
-    let fd: Vec<DualT<N, T>> = (0..n).map(|j| DualT { v: f[j], g: g[j] }).collect();
-    // η as a dual too, so `R·exp(2η_r)` (IIV on the residual) carries `∂R/∂η_r` in its
-    // tangents along with `Σ_m G_mk ∂R/∂f_m`.
-    let ed: [DualT<N, T>; N] = std::array::from_fn(|k| {
-        let mut gk = [c(0.0); N];
-        gk[k] = c(1.0);
-        DualT { v: eta[k], g: gk }
-    });
-    let ruv = ctx.ruv_scale(&ed);
-    let rd: Vec<Vec<DualT<N, T>>> = ctx
-        .r_matrix(&fd, &p.wrap::<N>())
+    let n = ctx.n();
+    let nn = eta.len();
+    let ruv = ctx.ruv_scale(eta);
+    let mut rv: Vec<Vec<T>> = ctx
+        .r_matrix(f, p)
         .into_iter()
         .map(|row| row.into_iter().map(|x| x * ruv).collect())
         .collect();
-    let rv: Vec<Vec<T>> = rd
-        .iter()
-        .map(|row| row.iter().map(|x| x.v).collect())
-        .collect();
+    for j in 0..n {
+        rv[j][j] = rv[j][j] + ctx.extra(f, j);
+    }
     let l = chol(&rv)?;
     let res: Vec<T> = (0..n)
         .map(|j| c(ctx.subject.observations[j]) - f[j])
@@ -863,20 +954,35 @@ fn focei_f_dense<T: PkNum, const N: usize>(
     for j in 0..n {
         data = data + res[j] * z[j];
     }
-    // R⁻¹G (n × N) and R⁻¹·∂_kR (n × n per k)
-    let rg: Vec<Vec<T>> = (0..N)
+    // R⁻¹G (n × N) and R⁻¹·∂_kR (n × n per k). `∂_kR` comes from `R` over a one-direction
+    // dual per `k` ([`direction_duals`]): its tangent is exactly `Σ_m G_mk ∂R/∂f_m`, plus
+    // `∂R/∂η_r` through the `exp(2η_r)` scale.
+    let rg: Vec<Vec<T>> = (0..nn)
         .map(|k| chol_solve(&l, &(0..n).map(|j| g[j][k]).collect::<Vec<T>>()))
         .collect();
-    let rd_k: Vec<Vec<Vec<T>>> = (0..N)
+    let rd_k: Vec<Vec<Vec<T>>> = (0..nn)
         .map(|k| {
+            let (fd, ed) = direction_duals(f, g, eta, k);
+            let ruv = ctx.ruv_scale(&ed);
+            let rd = ctx.r_matrix(&fd, &p.wrap::<1>());
             (0..n)
-                .map(|col| chol_solve(&l, &(0..n).map(|i| rd[i][col].g[k]).collect::<Vec<T>>()))
+                .map(|col| {
+                    chol_solve(
+                        &l,
+                        &(0..n)
+                            .map(|i| {
+                                let x = rd[i][col] * ruv;
+                                (if i == col { x + ctx.extra(&fd, i) } else { x }).g[0]
+                            })
+                            .collect::<Vec<T>>(),
+                    )
+                })
                 .collect()
         })
         .collect();
     let mut ht: Vec<Vec<T>> = p.omega.inv.clone();
-    for a in 0..N {
-        for b in 0..N {
+    for a in 0..nn {
+        for b in 0..nn {
             let mut hrh = c(0.0);
             for j in 0..n {
                 hrh = hrh + g[j][a] * rg[b][j];
@@ -898,7 +1004,7 @@ fn focei_f_dense<T: PkNum, const N: usize>(
 /// One row's inner data term: `r²/V + ln V` (Gaussian), `−2·log Φ(z)` (M3-censored,
 /// `z = ±(y − f)/√V`, `m3_logcdf`), or the FREM pseudo-observation term (prediction
 /// `θ_i + η_e`, read from `eta`/`p`), with `V` evaluated at `vf` (`f` itself, or FOCE's
-/// frozen population prediction). The single row definition behind both the value of `l`
+/// frozen population prediction) plus `extra` (an SDE row's EKF `p_obs`, else zero). The single row definition behind both the value of `l`
 /// and its η-gradient.
 #[allow(clippy::too_many_arguments)]
 fn row_l<T: PkNum>(
@@ -906,6 +1012,7 @@ fn row_l<T: PkNum>(
     j: usize,
     f: T,
     vf: T,
+    extra: T,
     ruv: T,
     eta: &[T],
     p: &ParT<T>,
@@ -917,8 +1024,8 @@ fn row_l<T: PkNum>(
         let r = c(y) - fp;
         return Some(r * r / v + v.ln());
     }
-    let v = ctx.variance_v(j, vf, ruv, p);
-    if !(v.val().is_finite() && v.val() > 0.0) {
+    let v = ctx.variance_v(j, vf, ruv, p) + extra;
+    if !positive_finite(v) {
         return None;
     }
     Some(match ctx.censored(j) {
@@ -936,10 +1043,10 @@ fn row_l<T: PkNum>(
 /// The inner (EBE) objective `l(η)` at the predictions `f`. `frozen` is FOCE's
 /// convention (`EbeVariance::Population`): the residual variance held at the population
 /// prediction, with no RUV-IIV scale; `None` is the conditional objective.
-pub(crate) fn inner_l<T: PkNum, const N: usize>(
+pub(crate) fn inner_l<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    eta: &[T; N],
+    eta: &[T],
     p: &ParT<T>,
     frozen: Option<&[T]>,
 ) -> Option<T> {
@@ -966,12 +1073,15 @@ pub(crate) fn data_l<T: PkNum>(
     };
     let vf = frozen.unwrap_or(f);
     if ctx.dense() {
-        let n = f.len();
-        let r: Vec<Vec<T>> = ctx
+        let n = ctx.n();
+        let mut r: Vec<Vec<T>> = ctx
             .r_matrix(vf, p)
             .into_iter()
             .map(|row| row.into_iter().map(|x| x * ruv).collect())
             .collect();
+        for j in 0..n {
+            r[j][j] = r[j][j] + ctx.extra(f, j);
+        }
         let l = chol(&r)?;
         let res: Vec<T> = (0..n)
             .map(|j| c(ctx.subject.observations[j]) - f[j])
@@ -984,8 +1094,8 @@ pub(crate) fn data_l<T: PkNum>(
         return Some(data);
     }
     let mut data = c(0.0);
-    for j in 0..f.len() {
-        data = data + row_l(ctx, j, f[j], vf[j], ruv, eta, p)?;
+    for j in 0..ctx.n() {
+        data = data + row_l(ctx, j, f[j], vf[j], ctx.extra(f, j), ruv, eta, p)?;
     }
     Some(data)
 }
@@ -1013,10 +1123,12 @@ fn d2_seed<T: PkNum>(x: T) -> D2<T> {
 
 /// Whether some row of the conditional [`inner_l`] reads η other than through its own
 /// prediction: the dense residual path (rows coupled through `R`), a FREM row (`θ_i + η_e`),
-/// or the RUV-IIV scale `exp(2η_r)`. Exactly the cases the chain rule through the
+/// the RUV-IIV scale `exp(2η_r)`, or an SDE's `p_obs` (a second η-dependent input per row).
+/// Exactly the cases the chain rule through the
 /// predictions does not cover.
 fn reads_eta_directly(ctx: &LikCtx) -> bool {
     ctx.dense()
+        || ctx.sde
         || ctx.model.residual_error_eta.is_some()
         || (0..ctx.subject.observations.len()).any(|j| ctx.frem_row(j).is_some())
 }
@@ -1054,28 +1166,22 @@ fn note_inner_hessian_route(subject: &Subject, generic: bool) {
 ///
 /// By the chain rule through the predictions ([`inner_hessian_through_predictions`]) unless a
 /// row reads η directly ([`reads_eta_directly`]), and otherwise by [`inner_l`] over a
-/// second-order `DualH` — the one decline rule and the one fallback, here rather than at each
+/// second-order dual — the one decline rule and the one fallback, here rather than at each
 /// site. `None` only where the objective itself is undefined at these jets (a row with no
 /// valid variance): the generic path fails at the same row, so it is not re-run.
 ///
-/// `active` is the subject's live width (`≤ N`): past it the bucket's inert padding
-/// directions carry exactly zero `G` and `Q`, so the closed form assembles the rows over
-/// `active` only, and the padding keeps the prior's unit diagonal.
-pub(crate) fn exact_inner_hessian_kernel<T: PkNum, const N: usize, const M: usize>(
+pub(crate) fn exact_inner_hessian_kernel<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    q: &[[T; M]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    q: &[Vec<T>],
+    eta: &[T],
     p: &ParT<T>,
-    active: usize,
 ) -> Option<Vec<Vec<T>>> {
-    debug_assert_eq!(M, N * (N + 1) / 2, "a bucket's packed Hessian is N(N+1)/2");
-    debug_assert!(active <= N, "active width {active} above the bucket {N}");
     if reads_eta_directly(ctx) {
         inner_hessian_generic(ctx, f, g, q, eta, p)
     } else {
-        inner_hessian_through_predictions(ctx, f, g.as_flattened(), q.as_flattened(), N, active, p)
+        inner_hessian_through_predictions(ctx, f, g, q, p)
     }
 }
 
@@ -1085,29 +1191,19 @@ pub(crate) fn exact_inner_hessian_kernel<T: PkNum, const N: usize, const M: usiz
 ///
 /// with `ℓⱼ′`, `ℓⱼ″` the derivatives of the row term [`row_l`] in its prediction, from one
 /// pass of `row_l` over a [`D2`]. Every row kind that reads η only through its prediction is
-/// covered by that one definition — Gaussian under any error model, M3-censored. The same
-/// Hessian as [`inner_hessian_generic`], which pushes every operation of every row through
-/// all `M` second-order lanes, and the prior's `N²` products besides; here a row costs one
-/// 4-component pass plus the `active(active+1)/2` assembly. The caller has established that no
-/// row reads η directly ([`exact_inner_hessian_kernel`]); `None` is an undefined row.
-///
-/// Width-independent on purpose: `g` and `q` are the rows' jets flattened with stride `n`
-/// (and the packed `n(n+1)/2`), so it is instantiated once per number type rather than once
-/// per random-effect bucket the exact anchor compiles. Rows are assembled over the first
-/// `active` directions; `tri` is prefix-compatible, so the packed entries read are the same.
+/// covered by that one definition — Gaussian under any error model, M3-censored. A row costs
+/// one 4-component pass plus the `n(n+1)/2` assembly. The caller has established that no row
+/// reads η directly ([`exact_inner_hessian_kernel`]); `None` is an undefined row.
 pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[T],
-    q: &[T],
-    n: usize,
-    active: usize,
+    g: &[Vec<T>],
+    q: &[Vec<T>],
     p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
     #[cfg(test)]
     note_inner_hessian_route(ctx.subject, false);
-    let m = n * (n + 1) / 2;
-    debug_assert!(g.len() == f.len() * n && q.len() == f.len() * m && active <= n);
+    let n = p.omega.inv.len();
     let half = T::from_f64(0.5);
     let pl = p.map(d2_const);
     // A non-FREM row does not read η; the array only fills `row_l`'s signature.
@@ -1119,14 +1215,14 @@ pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
         .collect();
     for j in 0..f.len() {
         let fj = d2_seed(f[j]);
-        let l = row_l(ctx, j, fj, fj, ruv, &el, &pl)?;
+        let l = row_l(ctx, j, fj, fj, d2_const(T::from_f64(0.0)), ruv, &el, &pl)?;
         // Row invariants hoisted: `½ℓ″`, `½ℓ′`, and `½ℓ″·G_a` per `a`.
         let (hd1, hd2) = (half * l.v.g[0], half * l.g[0].g[0]);
-        let (gj, qj) = (&g[j * n..(j + 1) * n], &q[j * m..(j + 1) * m]);
-        for a in 0..active {
+        let (gj, qj) = (&g[j], &q[j]);
+        for a in 0..n {
             let ga = hd2 * gj[a];
             for b in 0..=a {
-                let v = ga * gj[b] + hd1 * qj[crate::sens::vtape::tri(a, b)];
+                let v = ga * gj[b] + hd1 * qj[crate::sens::jet::tri(a, b)];
                 h[a][b] = h[a][b] + v;
                 if a != b {
                     h[b][a] = h[b][a] + v;
@@ -1137,53 +1233,57 @@ pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
     Some(h)
 }
 
-/// The exact inner Hessian as [`inner_l`] over a second-order `DualH` whose predictions carry
-/// `(f, G, Q)` and whose η are unit directions: the definition, and the route for rows that
-/// read η directly. `None` where `inner_l` is.
-pub(crate) fn inner_hessian_generic<T: PkNum, const N: usize, const M: usize>(
+/// The exact inner Hessian as [`inner_l`] over mixed second-order duals, one per pair
+/// `(a, b)`: the definition, and the route for rows that read η directly. The outer
+/// direction is `η_a` and the inner `η_b`, the predictions carry `(f, G_·b, G_·a, Q_·ab)` and
+/// η its two unit vectors, so `l`'s `∂²/∂η_a∂η_b` is the entry. `None` where `inner_l` is.
+pub(crate) fn inner_hessian_generic<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    q: &[[T; M]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    q: &[Vec<T>],
+    eta: &[T],
     p: &ParT<T>,
 ) -> Option<Vec<Vec<T>>> {
-    use crate::sens::rtape::DualH;
     #[cfg(test)]
     note_inner_hessian_route(ctx.subject, true);
+    let n = eta.len();
     let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
-    let fh: Vec<DualH<N, M, T>> = (0..f.len())
-        .map(|j| DualH {
-            v: f[j],
-            g: g[j],
-            h: q[j],
-        })
-        .collect();
-    let eh: [DualH<N, M, T>; N] = std::array::from_fn(|k| {
-        let mut gk = [zero; N];
-        gk[k] = one;
-        DualH {
-            v: eta[k],
-            g: gk,
-            h: [zero; M],
+    let pd = p.map(d2_const);
+    let mut h: Vec<Vec<T>> = vec![vec![zero; n]; n];
+    for a in 0..n {
+        for b in 0..=a {
+            let t = crate::sens::jet::tri(a, b);
+            let fh: Vec<D2<T>> = (0..f.len())
+                .map(|j| DualT {
+                    v: DualT {
+                        v: f[j],
+                        g: [g[j][b]],
+                    },
+                    g: [DualT {
+                        v: g[j][a],
+                        g: [q[j][t]],
+                    }],
+                })
+                .collect();
+            let eh: Vec<D2<T>> = (0..n)
+                .map(|m| DualT {
+                    v: DualT {
+                        v: eta[m],
+                        g: [if m == b { one } else { zero }],
+                    },
+                    g: [DualT {
+                        v: if m == a { one } else { zero },
+                        g: [zero],
+                    }],
+                })
+                .collect();
+            let e = inner_l(ctx, &fh, &eh, &pd, None)?.g[0].g[0];
+            h[a][b] = e;
+            h[b][a] = e;
         }
-    });
-    let l = inner_l(
-        ctx,
-        &fh,
-        &eh,
-        &p.map(|x| DualH {
-            v: x,
-            g: [zero; N],
-            h: [zero; M],
-        }),
-        None,
-    )?;
-    Some(
-        (0..N)
-            .map(|a| (0..N).map(|b| l.hess(a, b)).collect())
-            .collect(),
-    )
+    }
+    Some(h)
 }
 
 /// `∇_η l` at `(f, G, η)`, under the conditional or FOCE's `frozen` convention (see
@@ -1192,31 +1292,25 @@ pub(crate) fn inner_hessian_generic<T: PkNum, const N: usize, const M: usize>(
 /// `θ_i + η_e`), from a small dual over the row term [`row_l`] (the conditional case is
 /// [`focei_f_grad`]'s row pass); the prior adds `Ω⁻¹η`. The dense path couples rows, so
 /// there `l` itself is evaluated over an η-dual whose predictions carry `G`.
-pub(crate) fn inner_grad<T: PkNum, const N: usize>(
+pub(crate) fn inner_grad<T: PkNum>(
     ctx: &LikCtx,
     f: &[T],
-    g: &[[T; N]],
-    eta: &[T; N],
+    g: &[Vec<T>],
+    eta: &[T],
     p: &ParT<T>,
     frozen: Option<&[T]>,
-) -> Option<[T; N]> {
+) -> Option<Vec<T>> {
     let c = |x: f64| T::from_f64(x);
     if ctx.dense() {
-        let fd: Vec<DualT<N, T>> = (0..f.len()).map(|j| DualT { v: f[j], g: g[j] }).collect();
-        let ed: [DualT<N, T>; N] = std::array::from_fn(|k| {
-            let mut gk = [c(0.0); N];
-            gk[k] = c(1.0);
-            DualT { v: eta[k], g: gk }
-        });
-        let fz: Option<Vec<DualT<N, T>>> = frozen.map(|fz| {
-            fz.iter()
-                .map(|&x| DualT {
-                    v: x,
-                    g: [c(0.0); N],
-                })
-                .collect()
-        });
-        return Some(inner_l(ctx, &fd, &ed, &p.wrap::<N>(), fz.as_deref())?.g);
+        let p1 = p.wrap::<1>();
+        return (0..eta.len())
+            .map(|k| {
+                let (fd, ed) = direction_duals(f, g, eta, k);
+                let fz: Option<Vec<DualT<1, T>>> =
+                    frozen.map(|fz| fz.iter().map(|&x| DualT { v: x, g: [c(0.0)] }).collect());
+                Some(inner_l(ctx, &fd, &ed, &p1, fz.as_deref())?.g[0])
+            })
+            .collect();
     }
     let Some(fz) = frozen else {
         return Some(focei_f_grad(ctx, f, g, eta, p)?.1);
@@ -1224,16 +1318,27 @@ pub(crate) fn inner_grad<T: PkNum, const N: usize>(
     // FOCE's frozen variance: a row reads η only through f (FREM rows through η_e).
     let p1 = p.wrap::<1>();
     let lift = |x: T| DualT { v: x, g: [c(0.0)] };
-    let mut dl = vec![c(0.0); f.len()];
-    let mut explicit = [c(0.0); N];
-    for j in 0..f.len() {
-        let mut el: [DualT<1, T>; N] = std::array::from_fn(|k| lift(eta[k]));
+    let n = ctx.n();
+    let mut dl = vec![c(0.0); n];
+    let mut explicit = vec![c(0.0); eta.len()];
+    for j in 0..n {
+        let mut el: Vec<DualT<1, T>> = eta.iter().map(|&x| lift(x)).collect();
         if let Some((_, e, _)) = ctx.frem_row(j) {
             el[e].g[0] = c(1.0);
-            let d = row_l(ctx, j, lift(f[j]), lift(f[j]), lift(c(1.0)), &el, &p1)?;
+            let d = row_l(
+                ctx,
+                j,
+                lift(f[j]),
+                lift(f[j]),
+                lift(c(0.0)),
+                lift(c(1.0)),
+                &el,
+                &p1,
+            )?;
             explicit[e] = explicit[e] + d.g[0];
             continue;
         }
+        let px = lift(ctx.extra(f, j));
         dl[j] = row_l(
             ctx,
             j,
@@ -1242,11 +1347,32 @@ pub(crate) fn inner_grad<T: PkNum, const N: usize>(
                 g: [c(1.0)],
             },
             lift(fz[j]),
+            px,
             lift(c(1.0)),
             &el,
             &p1,
         )?
         .g[0];
+        if ctx.sde {
+            // ∂ℓ/∂p_obs times the row's η-jet of `p_obs`.
+            let dp = row_l(
+                ctx,
+                j,
+                lift(f[j]),
+                lift(fz[j]),
+                DualT {
+                    v: px.v,
+                    g: [c(1.0)],
+                },
+                lift(c(1.0)),
+                &el,
+                &p1,
+            )?
+            .g[0];
+            for k in 0..eta.len() {
+                explicit[k] = explicit[k] + dp * g[n + j][k];
+            }
+        }
     }
     let grad = assemble_grad(&p.omega.inv, eta, g, &dl, &explicit);
     Some(grad)
@@ -1261,7 +1387,7 @@ pub(crate) fn chol<T: PkNum>(a: &[Vec<T>]) -> Option<Vec<Vec<T>>> {
         for k in 0..j {
             d = d - l[j][k] * l[j][k];
         }
-        if !(d.val() > 0.0) {
+        if !d.br_cmp_c(BranchCmp::Gt, 0.0) {
             return None;
         }
         let ljj = d.sqrt();
@@ -1359,5 +1485,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// #2772 residual risk after the merge with #2786: `log_phi` is also called directly (the
+    /// exact-anchor, the lifted nested and the value-path likelihood rows), not only through
+    /// `m3_terms`. At `z = +∞` reached as `r / w` with `r ≈ 1e308`, `z`'s own derivatives
+    /// overflow, so the chain `h · z′` with `h = 0` is `0 · ∞`. The oracle is the exact `0`
+    /// jet; `==` so `NaN` fails. The straddle: `near` is `h > 0`-free but finite-chain
+    /// (`z = 1e7`), `inf` is `z = +∞`.
+    #[test]
+    fn log_phi_at_a_certain_row_has_a_zero_jet_where_z_overflows() {
+        for (limit, sgn) in [(1e6, 1.0), (1e300, 1.0), (1e308, 1.0), (-1e308, -1.0)] {
+            let f = Dual2::<1>::var(1.0, 0);
+            let s2 = Dual2::<1>::from_f64(0.01);
+            let w = (s2 * f * f).sqrt();
+            let z = Dual2::<1>::from_f64(sgn) * (Dual2::<1>::from_f64(limit) - f) / w;
+            let g = log_phi(z);
+            assert!(g.val() == 0.0, "value at {limit:e}: {}", g.val());
+            assert!(g.grad[0] == 0.0, "d/df at {limit:e}: {}", g.grad[0]);
+            assert!(g.hess[0][0] == 0.0, "d2/df2 at {limit:e}: {}", g.hess[0][0]);
+        }
+        // The straddle: the chain really is non-finite at the extreme, finite at the control.
+        let f = Dual2::<1>::var(1.0, 0);
+        let w = (Dual2::<1>::from_f64(0.01) * f * f).sqrt();
+        let z = (Dual2::<1>::from_f64(1e308) - f) / w;
+        assert!(z.val() == f64::INFINITY && !z.grad[0].is_finite());
     }
 }

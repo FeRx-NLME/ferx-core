@@ -82,7 +82,7 @@ src/                -- the ferx-core engine (one model, one dataset, one fit)
   estimation/       -- FOCE/FOCEI, SAEM, Gauss-Newton, IMP, SIR, trust-region
   stats/            -- Likelihood and residual computations
   io/               -- Data reading and output writing
-  sens/             -- Analytic derivatives (PkNum duals, the adjoint recorder and tapes)
+  sens/             -- Analytic derivatives (PkNum kernels, the adjoint and its compiled per-subject plans)
   nn/               -- Neural network components (DCM / NODE)
 crates/
   ferx-tools/       -- Workflows that run many fits (bootstrap, model searches)

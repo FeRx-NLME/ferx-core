@@ -12,7 +12,6 @@ use crate::estimation::parameterization::theta_packs_log;
 use crate::sens::ode_provider::adjoint::{Objective, PackedPoint};
 use crate::types::{CompiledModel, ModelParameters, Population, Subject};
 use nalgebra::DVector;
-use rayon::prelude::*;
 
 /// The exact per-subject FOCEI gradient `dFᵢ/dx` in the **packed** optimizer space, or
 /// `None` outside the adjoint's scope. `eta_hat` must be the EBE for `unpack_params(x)`.
@@ -124,11 +123,10 @@ pub fn per_subject_packed_gradients(
 ) -> Vec<Option<Vec<f64>>> {
     // One unpack for the population (every subject is at the same packed point).
     let pt = PackedPoint::new(template, x);
-    population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let _guard = mixture_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
             subject_gradient_at(
                 model,
@@ -138,7 +136,7 @@ pub fn per_subject_packed_gradients(
                 interaction,
             )
         })
-        .collect()
+    }
 }
 
 /// [`per_subject_packed_gradients`] for an **IOV** model: `eta_hats[i]` the BSV EBEs and
@@ -153,18 +151,17 @@ pub fn per_subject_packed_gradients_iov(
     interaction: bool,
 ) -> Vec<Option<Vec<f64>>> {
     let pt = PackedPoint::new(template, x);
-    population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
             for kap in &kappas[i] {
                 stacked.extend(kap.iter().copied());
             }
             subject_gradient_at(model, subject, pt.as_ref()?, &stacked, interaction)
         })
-        .collect()
+    }
 }
 
 /// θ→packed chain rule `∂θ/∂x`: `θ` when the parameter packs in log-space, else `1.0`.
@@ -175,35 +172,6 @@ pub(crate) fn theta_dx_chain(template: &ModelParameters, theta: &[f64], m: usize
     } else {
         1.0
     }
-}
-
-/// Per-subject `dη̂/dx` Jacobians (one `n_eta`-vector per packed coordinate) for the whole
-/// population, or `None` if any subject is unsupported: the exact mode response
-/// (`adjoint::subject_adjoint_eta_dx`) of the fit's own inner problem — FOCEI's conditional
-/// mode when `interaction`, FOCE's frozen-variance mode otherwise (#2093 review).
-pub fn population_eta_dx(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[DVector<f64>],
-    interaction: bool,
-) -> Option<Vec<Vec<DVector<f64>>>> {
-    let pt = PackedPoint::new(template, x)?;
-    population
-        .subjects
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            crate::sens::ode_provider::adjoint::subject_adjoint_eta_dx_at(
-                model,
-                s,
-                &pt,
-                eta_hats[i].as_slice(),
-                interaction,
-            )
-        })
-        .collect()
 }
 
 /// What an outer gradient evaluation hands the EBE warm start about each subject's mode

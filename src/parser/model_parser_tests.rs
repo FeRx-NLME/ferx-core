@@ -9571,7 +9571,7 @@ fn test_ruv_magnitude_theta_not_flagged_as_unused() {
 }
 
 /// `∂(program)/∂θ` through the live generic evaluator (`RuvMagDerivProgram::eval_g`,
-/// the one the adjoint tape records), seeded with `Dual1` θ leaves.
+/// the one the adjoint tape records), seeded with `Dual2` θ leaves.
 fn deriv_theta_grad<const N: usize>(
     p: &RuvMagDerivProgram,
     theta: &[f64; N],
@@ -9579,8 +9579,8 @@ fn deriv_theta_grad<const N: usize>(
     time: f64,
     tad: f64,
 ) -> Vec<f64> {
-    use crate::sens::dual1::Dual1;
-    let th: Vec<Dual1<N>> = (0..N).map(|m| Dual1::var(theta[m], m)).collect();
+    use crate::sens::dual2::Dual2;
+    let th: Vec<Dual2<N>> = (0..N).map(|m| Dual2::var(theta[m], m)).collect();
     p.eval_g(&th, cov, time, tad)
         .expect("θ count matches")
         .grad
@@ -9588,7 +9588,7 @@ fn deriv_theta_grad<const N: usize>(
 }
 
 /// xhigh review: `MACHEPS` inside a magnitude expression must resolve to
-/// `f64::EPSILON` in the `Dual1` θ-derivative program too (not just the
+/// `f64::EPSILON` in the `Dual2` θ-derivative program too (not just the
 /// value-only runtime closure) — `RuvMagDerivProgram` reserves a var slot
 /// for it now. Regression case: `WT + MACHEPS` guards a denominator; at
 /// `WT = 0.0` the pre-fix bug (`MACHEPS` silently resolving to `0.0` in the
@@ -18366,56 +18366,9 @@ fn bytecode_g_mod_carries_the_jet_of_both_operands() {
     assert_eq!((d.value, d.grad), (0.0, [0.0; 2]), "a mod 0");
 }
 
-/// `Op::Mod` on the taped-Hessian `DualV<_, _, true>` of the Laplace/AGQ exact
-/// anchor: the reverse sweep reaches the third derivative of each record, so the
-/// lift must say it is `0`. A `lift2` there records a `NaN` `φ‴` and the sweep
-/// comes back non-finite, which `Dual2` cannot see (#2150 review). With
-/// `S = w₀·f + w₁·∂ₓf + w₂·∂ᵧf + …` and `f = x mod y` affine between jumps,
-/// `∂S/∂x = w₀` and `∂S/∂y = −q·w₀` exactly.
-#[test]
-fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
-    use crate::sens::vtape::{vadj_index_h, vadj_init, vsweep_h, vtape_reset, DualV};
-    type V = DualV<2, 2, true>;
-    let expr = binop(BinOp::Mod, varidx(0), varidx(1));
-    let bc = compile_bytecode(&expr);
-    let w = [0.6, -1.1, 0.8, 0.5, -0.7];
-    for (x, y) in [(1.3_f64, 2.5_f64), (7.1, 2.5), (7.1, -2.5)] {
-        let q = x.div_euclid(y);
-        vtape_reset(1 + 2 + 2);
-        let vd = [
-            V::leaf(x, [1.0, 0.0], [0.0; 2]),
-            V::leaf(y, [0.0, 1.0], [0.0; 2]),
-        ];
-        let mut sd: Vec<V> = Vec::new();
-        let f = eval_bytecode_g::<V>(&bc, &[], &[], &[], &vd, &[], &mut sd);
-        assert_eq!(
-            f.v.to_bits(),
-            x.rem_euclid(y).to_bits(),
-            "value of {x} mod {y}"
-        );
-        assert_eq!((f.g, f.h), ([1.0, -q], [0.0; 2]), "jet of {x} mod {y}");
-        let adj = vadj_init::<1>();
-        for (comp, wc) in w.iter().enumerate() {
-            adj[vadj_index_h::<2, 2>(f.i, comp)] = *wc;
-        }
-        let adj = vsweep_h::<2, 2>(f.i as usize + 1).to_vec();
-        let got = vd.map(|l| adj[vadj_index_h::<2, 2>(l.i, 0)]);
-        assert!(
-            got.iter().all(|g| g.is_finite()),
-            "{x} mod {y}: sweep {got:?}"
-        );
-        assert!(
-            (got[0] - w[0]).abs() < 1e-12 && (got[1] + q * w[0]).abs() < 1e-12,
-            "{x} mod {y}: sweep {got:?}, want [{}, {}]",
-            w[0],
-            -q * w[0]
-        );
-    }
-}
-
 // ── In-place operand fusion in `eval_bytecode_g` ───────────────────────────
 //
-// For the outer `DualMixed` type `eval_bytecode_g` combines operands in place and
+// For the second-order `Dual2` type `eval_bytecode_g` combines operands in place and
 // applies a pushed constant / covariate / `TIME` / variable straight to the stack
 // top, and the compiler emits a literal-left `c ⊕ E` with the literal on top
 // (`Op::RSub` for `c - E`). The oracle below is the by-value evaluation those
@@ -18423,9 +18376,9 @@ fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
 // keep — including `Op::Div`'s `|b| < 1e-30 → 0` guard on both the stack and the
 // fused side.
 
-type Dm = crate::sens::dual_mixed::DualMixed<2, 3>;
+type Dm = crate::sens::dual2::Dual2<3>;
 
-/// By-value reference: every operand a full `DualMixed`, constants lifted to a
+/// By-value reference: every operand a full `Dual2`, constants lifted to a
 /// zero jet, the `Op::Div` guard applied — what `eval_bytecode_g` computed before
 /// operand fusion.
 fn dm_reference(e: &Expression, vars: &[Dm], covs: &[f64], time: f64) -> Dm {
@@ -18478,12 +18431,12 @@ fn dm_vars() -> Vec<Dm> {
     let signed_zero = Dm {
         value: 2.0,
         grad: [-0.0, 1.5, -0.0],
-        hess: [[-0.0, 0.25, -0.0], [0.25, -0.0, 0.0]],
+        hess: [[-0.0, 0.25, -0.0], [0.25, -0.0, 0.0], [-0.0, 0.0, 0.0]],
     };
     let infinite = Dm {
         value: 1.0,
         grad: [f64::INFINITY, -2.0, 0.0],
-        hess: [[0.0, 1.0, -0.0], [1.0, 0.0, 3.0]],
+        hess: [[0.0, 1.0, -0.0], [1.0, 0.0, 3.0], [0.0, 0.0, 0.0]],
     };
     vec![
         x * y + z,
@@ -27054,7 +27007,7 @@ fn power_form_with_unit_exponent_is_the_proportional_variance_bit_for_bit() {
 }
 
 /// `TAD` inside a magnitude expression is the record's data-derived time after
-/// dose, in both the runtime closure and the `Dual1` θ-program.
+/// dose, in both the runtime closure and the `Dual2` θ-program.
 #[test]
 fn magnitude_expression_reads_tad() {
     let content = r#"
@@ -34810,18 +34763,19 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         }
     }
 
-    // `Dual1`: the jets must be keyed too. Calls 0 and 1 carry the same parameter
+    // A first-order dual: the jets must be keyed too. Calls 0 and 1 carry the same parameter
     // *values* but seed Q on different axes, so a value-only key would replay Q's
     // jet from the wrong axis.
-    type D = crate::sens::dual1::Dual1<3>;
+    type D = crate::sens::jet::DualT<3, f64>;
+    use crate::sens::num::PkNum;
     let seed = |p: &[f64; 6], q_axis: usize| -> Vec<D> {
         vec![
-            D::var(p[0], 0),
+            <D as PkNum>::var(p[0], 0),
             D::constant(p[1]),
-            D::var(p[2], q_axis),
-            D::var(p[3], 2),
+            <D as PkNum>::var(p[2], q_axis),
+            <D as PkNum>::var(p[3], 2),
             D::constant(p[4]),
-            D::var(p[5], 0) + D::var(0.0, 1),
+            <D as PkNum>::var(p[5], 0) + <D as PkNum>::var(0.0, 1),
         ]
     };
     let dcalls: [(Vec<D>, [f64; 2], f64); 5] = [
@@ -34837,7 +34791,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
     let mut stack_p: Vec<D> = Vec::new();
     for (k, (p, u, t)) in dcalls.iter().enumerate() {
         let params = hoist_params::<D>(prog, p);
-        let ud = [D::constant(u[0]), D::var(u[1], 2)];
+        let ud = [D::constant(u[0]), <D as PkNum>::var(u[1], 2)];
         let mut want = [D::constant(0.0); 2];
         plain.eval_rhs_g::<D>(
             &ud,
@@ -34862,23 +34816,23 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             &mut vars_h,
             &mut stack_h,
         );
-        // The lift is live for `Dual1`: its scratch carries the cache tail.
+        // The lift is live for a first-order dual: its scratch carries the cache tail.
         assert_eq!(
             vars_h.len(),
             prog.hoist.as_ref().unwrap().n_ext,
-            "Dual1 uses the lift"
+            "a first-order dual uses the lift"
         );
         for j in 0..2 {
             assert!(
-                hoist_bits_eq(got[j].value, want[j].value),
+                hoist_bits_eq(got[j].v, want[j].v),
                 "dual call {k} du[{j}] value"
             );
             for a in 0..3 {
                 assert!(
-                    hoist_bits_eq(got[j].grad[a], want[j].grad[a]),
+                    hoist_bits_eq(got[j].g[a], want[j].g[a]),
                     "dual call {k} du[{j}] grad[{a}]: {} vs {}",
-                    got[j].grad[a],
-                    want[j].grad[a]
+                    got[j].g[a],
+                    want[j].g[a]
                 );
             }
         }
@@ -34886,7 +34840,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
 
     // Second-order duals skip the lift (their key would cost what the lift saves):
     // the scratch never grows a cache tail, and the result is the unlifted one.
-    type M = crate::sens::dual_mixed::DualMixed<2, 3>;
+    type M = crate::sens::dual2::Dual2<3>;
     let params = hoist_params::<M>(
         prog,
         &[
@@ -34915,7 +34869,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
     assert_eq!(
         vars_m.len(),
         prog.n_vars_total,
-        "DualMixed must not use the lift"
+        "Dual2 must not use the lift"
     );
     let mut want = [M::constant(0.0); 2];
     plain.eval_rhs_g::<M>(
@@ -34930,7 +34884,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         &mut Vec::new(),
     );
     for j in 0..2 {
-        assert!(got[j].same_bits(&want[j]), "DualMixed du[{j}]");
+        assert!(got[j].same_bits(&want[j]), "Dual2 du[{j}]");
     }
 }
 
@@ -35341,7 +35295,7 @@ const HOIST_BRANCH_ONLY_WRITE: &str = "
 
 /// Lifted vs unlifted over `(state, time)` calls on one parameter set — every call
 /// after the first a cache hit on a persistent scratch — for the f64 closure,
-/// `eval_rhs_g::<f64>` and `::<Dual1>`.
+/// `eval_rhs_g::<f64>` and `::<Dual2>`.
 fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &[(Vec<f64>, f64)]) {
     let model = hoist_model(src);
     let prog = hoist_program(&model);
@@ -35350,7 +35304,7 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
     let plain = hoist_program(&plain_model);
     let params = hoist_params::<f64>(prog, &[3.0, 30.0]);
     let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
-    type D = crate::sens::dual1::Dual1<2>;
+    type D = crate::sens::dual2::Dual2<2>;
     let dparams = hoist_params::<D>(prog, &[D::var(3.0, 0), D::var(30.0, 1)]);
     let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
     for (k, (u, t)) in calls.iter().enumerate() {
@@ -35422,12 +35376,12 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
             // Entry by entry: `same_bits` is part of the code under test.
             assert!(
                 hoist_bits_eq(dgot[j].value, dwant[j].value),
-                "call {k} du[{j}] Dual1 value"
+                "call {k} du[{j}] Dual2 value"
             );
             for a in 0..2 {
                 assert!(
                     hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
-                    "call {k} du[{j}] Dual1 grad[{a}]"
+                    "call {k} du[{j}] Dual2 grad[{a}]"
                 );
             }
         }
@@ -35539,7 +35493,7 @@ fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
 /// parameter alone (between time-varying-parameter snapshots that is exactly what
 /// happens to `V2` while `Q` stays put), on one persistent scratch, and require
 /// parity with the unlifted program for the f64 closure, `eval_rhs_g::<f64>` and
-/// `::<Dual1>`. A key comparison that skips any one slot replays a stale lift here.
+/// `::<Dual2>`. A key comparison that skips any one slot replays a stale lift here.
 #[test]
 fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
     // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
@@ -35551,7 +35505,7 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
     let plain = hoist_program(&plain_model);
     let rhs = &model.ode_spec.as_ref().unwrap().rhs;
-    type D = crate::sens::dual1::Dual1<2>;
+    type D = crate::sens::dual2::Dual2<2>;
     let base = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06];
     let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
     let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
@@ -35632,12 +35586,12 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             );
             assert!(
                 hoist_bits_eq(dgot[j].value, dwant[j].value),
-                "set {c} {p:?} du[{j}] Dual1 value"
+                "set {c} {p:?} du[{j}] Dual2 value"
             );
             for a in 0..2 {
                 assert!(
                     hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
-                    "set {c} {p:?} du[{j}] Dual1 grad[{a}]"
+                    "set {c} {p:?} du[{j}] Dual2 grad[{a}]"
                 );
             }
         }
@@ -35730,7 +35684,7 @@ fn rhs_hoist_key_tells_signed_zeros_apart() {
     }
 }
 
-/// A `Dual1` key must compare every gradient component: at fixed parameter
+/// A first-order dual's key must compare every gradient component: at fixed parameter
 /// *values*, change one jet entry of one parameter at a time between cache hits.
 #[test]
 fn rhs_hoist_dual1_key_compares_every_gradient_component() {
@@ -35741,23 +35695,24 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
     let prog = hoist_program(&model);
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
     let plain = hoist_program(&plain_model);
-    type D = crate::sens::dual1::Dual1<3>;
+    type D = crate::sens::jet::DualT<3, f64>;
+    use crate::sens::num::PkNum;
     let base: Vec<D> = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06]
         .iter()
         .enumerate()
-        .map(|(i, &v)| D::var(v, i % 3))
+        .map(|(i, &v)| <D as PkNum>::var(v, i % 3))
         .collect();
     let mut sets = vec![base.clone()];
     for p in [1usize, 2, 3, 5] {
         // V1, Q, V2, SH: the four the lifted code reads.
         for k in 0..3 {
             let mut s = base.clone();
-            s[p].grad[k] += 0.5;
+            s[p].g[k] += 0.5;
             sets.push(s);
             sets.push(base.clone());
         }
     }
-    let ud = [D::constant(80.0), D::var(9.0, 2)];
+    let ud = [D::constant(80.0), <D as PkNum>::var(9.0, 2)];
     let (mut vars, mut stack) = (Vec::<D>::new(), Vec::<D>::new());
     for (c, s) in sets.iter().enumerate() {
         let params = hoist_params::<D>(prog, s);
@@ -35787,16 +35742,13 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
         );
         // Compared entry by entry, not through `same_bits` — the function under test.
         for j in 0..2 {
-            assert!(
-                hoist_bits_eq(got[j].value, want[j].value),
-                "set {c} du[{j}] value"
-            );
+            assert!(hoist_bits_eq(got[j].v, want[j].v), "set {c} du[{j}] value");
             for k in 0..3 {
                 assert!(
-                    hoist_bits_eq(got[j].grad[k], want[j].grad[k]),
+                    hoist_bits_eq(got[j].g[k], want[j].g[k]),
                     "set {c} du[{j}] grad[{k}]: {} vs {}",
-                    got[j].grad[k],
-                    want[j].grad[k]
+                    got[j].g[k],
+                    want[j].g[k]
                 );
             }
         }
@@ -36583,7 +36535,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
     // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
     // both), which every program the compiler declines still takes.
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
-    type D1 = crate::sens::dual1::Dual1<3>;
+    type D1 = crate::sens::dual2::Dual2<3>;
     type D2 = crate::sens::dual2::Dual2<2>;
 
     let p1 = [4.0, 40.0, 0.7];
@@ -36714,7 +36666,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
         let seq: Vec<(Vec<f64>, [f64; 2], f64)> =
             calls.iter().map(|(p, u, t)| (ext(p), *u, *t)).collect();
         run_g::<f64>(name, lean, full, &seq, tafd_of, |t| t - last);
-        // Dual1: CL, V, Q on axes 0, 1, 2; TAD carries ∂/∂lag on axis 0.
+        // Dual2: CL, V, Q on axes 0, 1, 2; TAD carries ∂/∂lag on axis 0.
         let seq: Vec<(Vec<D1>, [f64; 2], f64)> = calls
             .iter()
             .map(|(p, u, t)| {

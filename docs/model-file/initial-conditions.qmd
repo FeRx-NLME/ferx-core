@@ -144,7 +144,7 @@ above — numerically equivalent, and still allocation-free.
   Use an ODE model if compartment amounts are required.
 - **Exact analytic gradients, including under IOV and time-varying covariates.**
   An `[initial_conditions]` baseline uses exact analytic FOCE/FOCEI gradients
-  under `gradient = auto` (issue #524): the `Dual2`/`Dual1` sensitivity kernels
+  under `gradient = auto` (issue #524): the sensitivity kernels
   carry the init impulse and its θ/η dependence, so the baseline never forces FD.
   As of issue #486 this holds for the full feature set — the closed-form baseline
   on the time-varying-covariate walk, and the baseline **under IOV** (kappa) on

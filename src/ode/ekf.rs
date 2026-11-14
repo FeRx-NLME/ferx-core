@@ -1,13 +1,14 @@
 //! Extended Kalman Filter for SDE-based ODE models.
 //!
 //! Given an Itô SDE  dX = f(X,t,θ) dt + diag(√σ²_w) dW  the EKF propagates
-//! both the mean state (via the existing RK45 solver) and the state covariance
+//! both the mean state (via the shared RK45 solver) and the state covariance
 //! matrix P between events, then applies a scalar Kalman update at each
 //! observation time.
 //!
 //! Covariance prediction (continuous-discrete EKF):
 //!   P̃ = F·P·Fᵀ + Q·Δt
-//! where F = ∂f/∂X (Jacobian, computed by central FD) and Q = diag(σ²_w).
+//! where F = ∂f/∂X is the **exact** state Jacobian (the right-hand side's forward tangent,
+//! one `DualT<1, T>` pass per state) and Q = diag(σ²_w).
 //!
 //! Measurement update at obs j (scalar observation of state obs_cmt):
 //!   S   = P̃[c,c] + R_j          (innovation variance)
@@ -16,117 +17,259 @@
 //!
 //! Only P[obs_cmt, obs_cmt] is returned per observation — the caller adds it
 //! to the residual variance to form V_total.
+//!
+//! The filter is written once over a number type `T` ([`solve_ekf_g`]): `T = f64` is the
+//! value path, and the recording type records it into a subject's compiled plan, so the
+//! mean, the covariance and the Jacobian all carry exact derivatives. Matrices are flat
+//! row-major `Vec<T>`; the state is a handful of compartments.
 
 use crate::dosing::{
     is_real_infusion, note_ss_nonconvergence_if_capped, SsStopTracker, SS_EQUILIBRATION_CYCLES,
 };
-use crate::ode::predictions::{active_infusions, ss_run_in_params};
-use crate::ode::solver::{solve_ode, OdeSolverOptions};
+use crate::ode::predictions::active_infusion_doses;
+use crate::ode::solver::{solve_ode_g_with_auto_state, OdeAutoSwitchState, OdeSolverOptions};
+use crate::sens::jet::DualT;
+use crate::sens::num::vm::VmNum;
+use crate::sens::num::BranchCmp;
 use crate::types::DoseEvent;
-use nalgebra::{DMatrix, DVector};
 
-const FD_H: f64 = 1e-5;
+/// A right-hand side `du = f(u, p, t)` the filter can evaluate over any number type, so the
+/// same code gives the mean (`T = f64` or the recording type) and, over `DualT<1, T>`, the
+/// exact Jacobian. `anchors` are the clocks the `[odes]` block reads besides `t`: the first
+/// dose time (`TAFD`) and the last effective dose time (`TAD`), `NaN` where absent. The `TAD`
+/// anchor is a number of the filter's type: a steady-state quiet window's is the (possibly
+/// modeled) infusion window's negative.
+pub(crate) trait EkfRhs {
+    fn eval<U: VmNum>(&self, u: &[U], p: &[U], t: U, anchors: Anchors<U>, du: &mut [U]);
 
-/// Compute the Jacobian F = ∂f/∂X at state `u` by central finite differences.
-fn fd_jacobian(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    u: &[f64],
-    p: &[f64],
-    t: f64,
-    n: usize,
-) -> DMatrix<f64> {
-    let mut jac = DMatrix::zeros(n, n);
-    let mut u_fwd = u.to_vec();
-    let mut u_bwd = u.to_vec();
-    let mut df_fwd = vec![0.0; n];
-    let mut df_bwd = vec![0.0; n];
+    /// The compiled `[odes]` program this right-hand side evaluates, when it is one: what the
+    /// mean integration's Rosenbrock step differentiates for its exact Jacobian
+    /// ([`integrate_mean`]). `None` for a host closure, which the step differences.
+    fn program(&self) -> Option<&crate::parser::model_parser::OdeRhsProgram> {
+        None
+    }
+}
 
-    for j in 0..n {
-        let h = FD_H * (1.0 + u[j].abs());
-        u_fwd[j] = u[j] + h;
-        u_bwd[j] = u[j] - h;
-        rhs(&u_fwd, p, t, &mut df_fwd);
-        rhs(&u_bwd, p, t, &mut df_bwd);
-        for i in 0..n {
-            jac[(i, j)] = (df_fwd[i] - df_bwd[i]) / (2.0 * h);
+/// The `(TAFD, TAD)` clock anchors of [`EkfRhs::eval`].
+pub(crate) type Anchors<T> = (f64, T);
+
+/// The compiled `[odes]` program as the filter's right-hand side.
+pub(crate) struct ProgramRhs<'a>(pub &'a crate::parser::model_parser::OdeRhsProgram);
+
+impl EkfRhs for ProgramRhs<'_> {
+    fn program(&self) -> Option<&crate::parser::model_parser::OdeRhsProgram> {
+        Some(self.0)
+    }
+
+    fn eval<U: VmNum>(&self, u: &[U], p: &[U], t: U, anchors: Anchors<U>, du: &mut [U]) {
+        let (mut vars, mut stack) = (Vec::new(), Vec::new());
+        crate::sens::ode_provider::eval_rhs_at_offset(
+            self.0,
+            u,
+            p,
+            t,
+            U::from_f64(0.0),
+            anchors.0,
+            anchors.1,
+            du,
+            &mut vars,
+            &mut stack,
+        );
+    }
+}
+
+/// `f` over `rhs` with the infusion rates `active` added, as an integrator's right-hand side.
+fn forced_eval<T: VmNum, R: EkfRhs>(
+    rhs: &R,
+    active: &[(usize, T)],
+    u: &[T],
+    p: &[T],
+    t: T,
+    anchors: Anchors<T>,
+    du: &mut [T],
+) {
+    rhs.eval::<T>(u, p, t, anchors, du);
+    for &(cmt, rate) in active {
+        if cmt < du.len() {
+            du[cmt] = du[cmt] + rate;
         }
-        u_fwd[j] = u[j];
-        u_bwd[j] = u[j];
+    }
+}
+
+type Mat<T> = Vec<T>;
+
+fn zeros<T: VmNum>(n: usize) -> Mat<T> {
+    vec![T::from_f64(0.0); n * n]
+}
+
+/// The Jacobian `F = ∂f/∂X` of the (forced) right-hand side at `u`: column `j` is the forward
+/// tangent in direction `e_j`. A recording type records the tangent as expressions, so the
+/// covariance's derivatives with respect to θ and η flow through `F` exactly.
+#[allow(clippy::too_many_arguments)]
+fn jacobian<T: VmNum, R: EkfRhs>(
+    rhs: &R,
+    active: &[(usize, T)],
+    u: &[T],
+    p: &[T],
+    t: T,
+    anchors: Anchors<T>,
+    n: usize,
+) -> Mat<T> {
+    type D<T> = DualT<1, T>;
+    let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
+    let lift = |x: T| D::<T> { v: x, g: [zero] };
+    let pd: Vec<D<T>> = p.iter().map(|&x| lift(x)).collect();
+    let act: Vec<(usize, D<T>)> = active.iter().map(|&(c, r)| (c, lift(r))).collect();
+    let mut jac = zeros::<T>(n);
+    let mut ud: Vec<D<T>> = u.iter().map(|&x| lift(x)).collect();
+    let mut du = vec![lift(zero); n];
+    let anchors = (anchors.0, lift(anchors.1));
+    for j in 0..n {
+        ud[j].g = [one];
+        forced_eval::<D<T>, R>(rhs, &act, &ud, &pd, lift(t), anchors, &mut du);
+        for i in 0..n {
+            jac[i * n + j] = du[i].g[0];
+        }
+        ud[j].g = [zero];
     }
     jac
 }
 
-/// Propagate P over a segment [t0, t1] using the linearised covariance ODE.
+/// One Crank–Nicolson (Cayley) step of the Riccati equation `dP/dt = F·P + P·Fᵀ + Q` with
+/// `F` evaluated at the midpoint state: `P⁺ = M⁻¹·(A·P·Aᵀ + Q·Δt)·M⁻ᵀ`, `A = I + F·Δt/2`,
+/// `M = I − F·Δt/2`, symmetrised, the diagonal clamped to `≥ 0`.
 ///
-/// We use a single Euler step on the Riccati equation:
-///   dP/dt = F·P + P·Fᵀ + Q
-/// with F and Q evaluated at the midpoint state. For typical PK segment
-/// lengths (≤ 1 h between observations) and the slow variance dynamics this
-/// is accurate to O(Δt²). A Runge-Kutta covariance propagation can be added
-/// later if needed for long dosing intervals.
-fn propagate_covariance(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    p_mat: &DMatrix<f64>,
-    u_mid: &[f64],
-    params: &[f64],
-    t_mid: f64,
-    dt: f64,
-    q_diag: &[f64],
+/// Second order, and A-stable: a decaying mode contracts at every step length. The explicit
+/// Euler step it replaces multiplied a state's variance by `1 − 2k·Δt` per step, which grows
+/// for a rate `k > 1/Δt` (an absorption `KA > 2 h⁻¹` at [`RICCATI_DT_MAX`]): the variance of a
+/// noisy fast compartment diverged, and a noiseless one's sensitivity did, overflowing the
+/// adjoint through a long steady-state train. The caller sub-steps at [`RICCATI_DT_MAX`].
+#[allow(clippy::too_many_arguments)]
+fn propagate_covariance<T: VmNum, R: EkfRhs>(
+    rhs: &R,
+    active: &[(usize, T)],
+    p_mat: &[T],
+    u_mid: &[T],
+    params: &[T],
+    t_mid: T,
+    anchors: Anchors<T>,
+    dt: T,
+    q_diag: &[T],
     n: usize,
-) -> DMatrix<f64> {
-    let f = fd_jacobian(rhs, u_mid, params, t_mid, n);
-    let q = DMatrix::from_diagonal(&DVector::from_vec(q_diag.to_vec()));
-    // Euler step: P_new = P + (F·P + P·Fᵀ + Q) · Δt
-    let dp = &f * p_mat + p_mat * f.transpose() + q;
-    let p_new = p_mat + dp * dt;
-    // Symmetrise and clamp diagonal to stay positive semi-definite
-    let p_sym = (&p_new + p_new.transpose()) * 0.5;
-    // Clamp diagonal to ≥ 0
-    let mut p_out = p_sym;
+) -> Mat<T> {
+    let f = jacobian(rhs, active, u_mid, params, t_mid, anchors, n);
+    let zero = T::from_f64(0.0);
+    // `I ± F·Δt/2`, row-major.
+    let id_pm = |s: f64| -> Mat<T> {
+        (0..n * n)
+            .map(|k| {
+                let id = if k / n == k % n { 1.0 } else { 0.0 };
+                T::from_f64(id) + T::from_f64(s * 0.5) * dt * f[k]
+            })
+            .collect()
+    };
+    let (mut m, a) = (id_pm(-1.0), id_pm(1.0));
+    let mul = |x: &[T], y: &[T], yt: bool| -> Mat<T> {
+        let mut z = zeros::<T>(n);
+        for i in 0..n {
+            for j in 0..n {
+                for k in 0..n {
+                    let yv = if yt { y[j * n + k] } else { y[k * n + j] };
+                    z[i * n + j] = z[i * n + j] + x[i * n + k] * yv;
+                }
+            }
+        }
+        z
+    };
+    let mut r = mul(&mul(&a, p_mat, false), &a, true);
     for i in 0..n {
-        if p_out[(i, i)] < 0.0 {
-            p_out[(i, i)] = 0.0;
+        r[i * n + i] = r[i * n + i] + q_diag[i] * dt;
+    }
+    let mut piv = vec![zero; crate::sens::linsolve::lu_piv_len::<T>(n)];
+    if !crate::sens::linsolve::lu_factor_in_place_g(&mut m, &mut piv, n) {
+        return vec![T::from_f64(f64::NAN); n * n];
+    }
+    // `M⁻¹·X·M⁻ᵀ` as two column solves: `Y = M⁻¹X`, then `M⁻¹Yᵀ` (its transpose, and `X` is
+    // symmetric).
+    let solve_t = |x: &[T]| -> Mat<T> {
+        let mut out = zeros::<T>(n);
+        for c in 0..n {
+            let mut col: Vec<T> = (0..n).map(|i| x[i * n + c]).collect();
+            crate::sens::linsolve::lu_solve_in_place_g(&m, &piv, n, &mut col);
+            for (i, v) in col.into_iter().enumerate() {
+                out[c * n + i] = v;
+            }
+        }
+        out
+    };
+    let p_new = solve_t(&solve_t(&r));
+    let half = T::from_f64(0.5);
+    let mut out = zeros::<T>(n);
+    for i in 0..n {
+        for j in 0..n {
+            out[i * n + j] = (p_new[i * n + j] + p_new[j * n + i]) * half;
+        }
+        if out[i * n + i].br_cmp_c(BranchCmp::Lt, 0.0) {
+            out[i * n + i] = zero;
         }
     }
-    p_out
+    out
 }
 
-/// Longest Euler sub-step of the Riccati propagation. 0.5 h per step keeps the relative
+/// Longest sub-step of the Riccati propagation. 0.5 h per step keeps the relative
 /// error under ~3% for typical PK; the walk and the steady-state run-in both sub-step at
 /// this, so a steady state expanded into explicit records and one seeded from an `SS=1`
 /// record propagate `P` through the same quadrature (#1260).
 const RICCATI_DT_MAX: f64 = 0.5;
 
 /// Advance `p_mat` from `(t_prev, u_prev)` to `(t, u)` along a mean trajectory the solver
-/// has already produced, sub-stepping the Euler Riccati step at [`RICCATI_DT_MAX`] with the
+/// has already produced, sub-stepping the Riccati step at [`RICCATI_DT_MAX`] with the
 /// state linearly interpolated across each sub-step midpoint.
+///
+/// The times are numbers of the filter's type: an end that moves with the parameters (a
+/// modeled or `F`-reshaped infusion window's end) carries its derivatives into every
+/// sub-step's length and midpoint, so the quadrature is differentiated as it is computed. The
+/// sub-step count is read on the value, the comparisons that fix it guarded.
 #[allow(clippy::too_many_arguments)]
-fn propagate_covariance_between(
-    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-    mut p_mat: DMatrix<f64>,
-    t_prev: f64,
-    u_prev: &[f64],
-    t: f64,
-    u: &[f64],
-    params: &[f64],
-    q_diag: &[f64],
+fn propagate_covariance_between<T: VmNum, R: EkfRhs>(
+    rhs: &R,
+    active: &[(usize, T)],
+    mut p_mat: Mat<T>,
+    t_prev: T,
+    u_prev: &[T],
+    t: T,
+    u: &[T],
+    params: &[T],
+    anchors: Anchors<T>,
+    q_diag: &[T],
     n: usize,
-) -> DMatrix<f64> {
+) -> Mat<T> {
     let dt = t - t_prev;
-    if dt <= 1e-15 {
+    if dt.br_cmp_c(BranchCmp::Le, 1e-15) {
         return p_mat;
     }
-    let n_steps = ((dt / RICCATI_DT_MAX).ceil() as usize).max(1);
-    let dt_sub = dt / n_steps as f64;
+    let n_steps = ((dt.seen_value() / RICCATI_DT_MAX).ceil() as usize).max(1);
+    if !dt.is_constant() {
+        // The verdicts that give `n_steps`: `(n − 1)·Δ < dt ≤ n·Δ` (`dt / Δ` is exact, Δ a
+        // power of two).
+        let _ = dt.br_cmp_c(BranchCmp::Le, n_steps as f64 * RICCATI_DT_MAX);
+        if n_steps > 1 {
+            let _ = dt.br_cmp_c(BranchCmp::Gt, (n_steps - 1) as f64 * RICCATI_DT_MAX);
+        }
+    }
+    let dt_sub = dt / T::from_f64(n_steps as f64);
     for s in 0..n_steps {
-        let alpha_mid = (s as f64 + 0.5) / n_steps as f64;
-        let u_mid: Vec<f64> = u_prev
+        let alpha = (s as f64 + 0.5) / n_steps as f64;
+        let alpha_mid = T::from_f64(alpha);
+        let u_mid: Vec<T> = u_prev
             .iter()
             .zip(u)
             .map(|(&a, &b)| a + alpha_mid * (b - a))
             .collect();
         let t_mid = t_prev + alpha_mid * dt;
-        p_mat = propagate_covariance(rhs, &p_mat, &u_mid, params, t_mid, dt_sub, q_diag, n);
+        p_mat = propagate_covariance(
+            rhs, active, &p_mat, &u_mid, params, t_mid, anchors, dt_sub, q_diag, n,
+        );
     }
     p_mat
 }
@@ -135,125 +278,186 @@ fn propagate_covariance_between(
 ///
 /// Returns `(P_updated, p_obs_cmt)` where `p_obs_cmt` is P[obs_cmt, obs_cmt]
 /// *before* the update — the component the caller adds to residual variance.
-fn kalman_update(
-    p_mat: &DMatrix<f64>,
-    obs_cmt: usize,
-    r_obs: f64,
-    n: usize,
-) -> (DMatrix<f64>, f64) {
-    let p_cc = p_mat[(obs_cmt, obs_cmt)];
+fn kalman_update<T: VmNum>(p_mat: &[T], obs_cmt: usize, r_obs: T, n: usize) -> (Mat<T>, T) {
+    let p_cc = p_mat[obs_cmt * n + obs_cmt];
     let s = p_cc + r_obs; // innovation variance
-    let p_obs = p_cc; // returned to caller before update
-
-    if s <= 0.0 {
-        return (p_mat.clone(), p_obs);
+    if s.br_cmp_c(BranchCmp::Le, 0.0) {
+        return (p_mat.to_vec(), p_cc);
     }
-
-    // Gain vector K = P[:,obs_cmt] / S
-    let k: DVector<f64> = p_mat.column(obs_cmt).into_owned() / s;
-
-    // Update: P⁺ = (I - K·eₒᵀ) · P
-    let mut p_new = p_mat.clone();
+    // Gain K = P[:,obs_cmt] / S; update P⁺ = (I - K·eₒᵀ)·P, symmetrised.
+    let k: Vec<T> = (0..n).map(|i| p_mat[i * n + obs_cmt] / s).collect();
+    let mut p_new = p_mat.to_vec();
     for i in 0..n {
         for j in 0..n {
-            p_new[(i, j)] -= k[i] * p_mat[(obs_cmt, j)];
+            p_new[i * n + j] = p_new[i * n + j] - k[i] * p_mat[obs_cmt * n + j];
         }
     }
-    // Symmetrise
-    let p_sym = (&p_new + p_new.transpose()) * 0.5;
-    (p_sym, p_obs)
+    let half = T::from_f64(0.5);
+    let mut out = zeros::<T>(n);
+    for i in 0..n {
+        for j in 0..n {
+            out[i * n + j] = (p_new[i * n + j] + p_new[j * n + i]) * half;
+        }
+    }
+    (out, p_cc)
+}
+
+/// The mean state over `span` saved at `saveat`, under the forced right-hand side. The span's
+/// ends are numbers of the filter's type. A recording type records the segment over their
+/// values (`PkNum::span_hint`), so an end that moves with the parameters moves the solve at run
+/// time; their derivatives are the flow over their jets (`rk4_dual`, exact to every order the
+/// recordings carry): the solve starts from the state flowed back by a moving start's jet, and
+/// its point at a moving end is flowed on by the end's. On `f64` both are no-ops.
+#[allow(clippy::too_many_arguments)]
+fn integrate_mean<T: VmNum, R: EkfRhs>(
+    rhs: &R,
+    active: &[(usize, T)],
+    u: &[T],
+    span: (T, T),
+    params: &[T],
+    anchors: Anchors<T>,
+    saveat: &[f64],
+    opts: &OdeSolverOptions,
+) -> Vec<crate::ode::solver::SolPointG<T>> {
+    let f = |u: &[T], p: &[T], t: T, du: &mut [T]| forced_eval(rhs, active, u, p, t, anchors, du);
+    // The step's `J` and `f_t` are the program's exact tangents at `T = f64`, as on the
+    // prediction paths, not differences of `f` — the filter's covariance differentiates the
+    // same `F` (`jacobian`), so mean and covariance see one Jacobian. The infusion rates added
+    // by `forced_eval` are constants of the segment and move neither.
+    let pj = rhs
+        .program()
+        .map(|prog| crate::sens::ode_provider::ProgJac::new(prog, anchors.0, anchors.1, &[]));
+    let jf = |u: &[T], p: &[T], t: T, j: &mut [T], ft: &mut [T]| {
+        pj.as_ref().is_some_and(|pj| pj.eval(u, p, t, j, ft))
+    };
+    let jr: &crate::ode::rosenbrock::JacFnG<'_, T> = &jf;
+    let _guard = pj
+        .is_some()
+        .then(|| crate::ode::rosenbrock::RhsGuard::register_jac_g::<T>(&f, &jr));
+    T::span_hint(span.0, span.1);
+    let (t0, t1) = (span.0.span_value(), span.1.span_value());
+    // `x` flowed over the value-zero `h` from offset `s0` past `t_v`.
+    let flow = |x: &[T], t_v: f64, s0: T, h: T| -> Vec<T> {
+        crate::sens::ode_provider::rk4_dual(x, s0, h, &mut |y: &[T], s: T, out: &mut [T]| {
+            forced_eval(rhs, active, y, params, T::from_f64(t_v) + s, anchors, out)
+        })
+    };
+    let u0 = match jet_part(span.0) {
+        Some(d) => flow(u, t0, d, -d),
+        None => u.to_vec(),
+    };
+    // Uncertified closure: never the exact path (see `solve_ode`).
+    let mut sol = solve_ode_g_with_auto_state(
+        &f,
+        &u0,
+        (t0, t1),
+        params,
+        saveat,
+        &opts.for_integration(),
+        &mut OdeAutoSwitchState::default(),
+    );
+    // Taken by the segment that recorded it; nothing else may.
+    let _ = T::take_span();
+    if let (Some(d), Some(last)) = (jet_part(span.1), sol.last_mut()) {
+        if last.t.to_bits() == t1.to_bits() {
+            last.u = flow(&last.u, t1, T::from_f64(0.0), d);
+        }
+    }
+    sol
+}
+
+/// A time's derivatives alone (its value zero), when it moves with the inputs of a recording.
+fn jet_part<T: VmNum>(t: T) -> Option<T> {
+    (T::RECORDS_BRANCHES && !t.is_constant()).then(|| t - t.value_only())
+}
+
+/// A solve's saved point's time as a number of the filter's type: the span's (possibly
+/// moving) `end` when it is that end, the constant otherwise.
+fn point_time<T: VmNum>(t: f64, end: T) -> T {
+    if t.to_bits() == end.seen_value().to_bits() {
+        end
+    } else {
+        T::from_f64(t)
+    }
 }
 
 /// Periodic steady state of the EKF's `(mean, covariance)` pair for an `SS=1` record
 /// (#1260): the state the filter would hold at the record had the dose been given every
 /// `II` since forever, with no observation in between.
 ///
-/// `solve_ekf` used to apply such a record as a single dose from a zero state with `P = 0`,
-/// so the Riccati Jacobian was linearised around a one-dose mean and `P` started a fresh
-/// accumulation at the record. Measured against the explicit 41-dose train the record
-/// stands for: `p_obs` 55 % low at the first observation, 2–3 % low after the first update,
-/// and the discarded mean 10–15 % low on a Michaelis–Menten model (120.5 OFV); on a linear
-/// model the mean is 55 % low and `P` at the record is `0` where the stationary value is
-/// `q / 2k`.
-///
 /// The pulse train is expanded the way the ODE path's nonlinear fallback does it
 /// (`equilibrate_ss_pk_state`): from `u = 0, P = 0`, cycles of *(apply dose; integrate
 /// `II`)* on that fallback's cycle-local clock — bolus, or an `F`-reshaped active window
-/// followed by a quiet one — until the concatenated `(u, P)` stops moving by [`SsStopTracker`]'s criterion or
-/// [`SS_EQUILIBRATION_CYCLES`] is spent, with the #867 non-convergence warning on a spent
-/// cap. No exact linear fixed point here: a bolus leaves `P` untouched, so `P`'s cycle map
-/// is the continuous Riccati flow over `II`, and the same Euler quadrature the walk uses is
-/// what makes an explicit train and this run-in agree to the stop tolerance (the oracle
-/// the issue was measured against). `P` is carried alongside `u` rather than seeded after
-/// it because on a nonlinear right-hand side the Jacobian along the cycle depends on the
-/// mean's own phase, which is exactly what the one-dose mean got wrong.
+/// followed by a quiet one — until the concatenated `(u, P)` stops moving by [`SsStopTracker`]'s
+/// criterion (read on the values, as the dual walks do) or [`SS_EQUILIBRATION_CYCLES`] is
+/// spent, with the #867 non-convergence warning on a spent cap. No exact linear fixed point
+/// here: a bolus leaves `P` untouched, so `P`'s cycle map is the continuous Riccati flow
+/// over `II`, and the same quadrature the walk uses is what makes an explicit train and
+/// this run-in agree to the stop tolerance. `P` is carried alongside `u` rather than seeded
+/// after it because on a nonlinear right-hand side the Jacobian along the cycle depends on
+/// the mean's own phase. A recording type records the cycle map once and the train as a
+/// run-time search on the values ([`ss_train`]), differentiating the converged pair implicitly.
 ///
-/// Cost, measured on the #1260 fixture (`sde_integration`'s Michaelis–Menten subject, one
-/// objective evaluation in a debug build): the run-in early-stops after 16–21 cycles, and
-/// the evaluation takes 569 ms with the `SS=1` record against 996 ms with the 41 explicit
-/// records it stands for and 58 ms with the record read as a single dose. It is the price
-/// of the train the record abbreviates, paid on every evaluation and every FD perturbation
-/// of the filter; a linear right-hand side has a closed-form pair (the ODE path's affine
-/// fixed point for the mean, a discrete Lyapunov solve for `P`) that would remove most of
-/// it, should a dataset with an `SS=1` record on every occasion ever need it.
+/// Cost, measured on the #1260 fixture (one objective evaluation, debug build): the run-in
+/// early-stops after 16–21 cycles; 569 ms with the `SS=1` record against 996 ms with the 41
+/// explicit records it stands for.
 ///
-/// Returns the zero pair — the pre-#1260 state — for the shapes the ODE run-in also
-/// declines: `II ≤ 0`, a compartment outside the state vector, or an infusion longer than
-/// `II` (overlapping pulses; `W_STEADY_STATE_INFUSION` names those at check time).
-fn equilibrate_ss_ekf(
-    rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
+/// Returns the zero pair for the shapes the ODE run-in also declines: `II ≤ 0` or a compartment
+/// outside the state vector.
+#[allow(clippy::too_many_arguments)]
+fn equilibrate_ss_ekf<T: VmNum, R: EkfRhs>(
+    rhs: &R,
     n: usize,
     dose: &DoseEvent,
-    f_bio: f64,
-    pk_params_flat: &[f64],
-    q_diag: &[f64],
+    f_bio: T,
+    (inf_rate, t_inf): (T, T),
+    params: &[T],
+    q_diag: &[T],
     opts: &OdeSolverOptions,
-) -> (Vec<f64>, DMatrix<f64>) {
-    let mut u = vec![0.0f64; n];
-    let mut p_mat = DMatrix::zeros(n, n);
+) -> (Vec<T>, Mat<T>) {
+    let zero = T::from_f64(0.0);
     let cmt_idx = dose.cmt_idx();
     if dose.ii <= 0.0 || cmt_idx >= n {
-        return (u, p_mat);
+        return (vec![zero; n], zeros::<T>(n));
     }
     let is_inf = is_real_infusion(dose);
-    let (inf_rate, t_inf) = dose.bioavailable_infusion(f_bio);
-    if is_inf && t_inf > dose.ii {
-        return (u, p_mat);
-    }
+    // Overlapping pulses (`T_inf > II`): `m` earlier ones run through the whole cycle, the
+    // newest for `r` (`dosing::ss_overlap_split_g`); `m = 0` otherwise.
+    let (m, t_inf) = crate::dosing::ss_overlap_split_g(t_inf, dose.ii);
+    let held = [(cmt_idx, inf_rate * T::from_f64(m as f64))];
+    let held: &[(usize, T)] = if m > 0 { &held } else { &[] };
     // Every window opens on a clock whose origin is its cycle's pulse — `(0, II)` for a
     // bolus cycle, `(0, T_inf)` then `(0, II − T_inf)` for an infusion — the clock the ODE
     // bolus/infusion run-in integrates on (`equilibrate_ss_pk_state`'s exact solve and its
-    // capped train alike). A right-hand side reading `T` / `TIME` therefore sees the same
-    // run-in on both engines; the objective mixes the ODE path's `IPRED` with this
-    // filter's `p_obs`, and a monotone `m·II` clock here would have equilibrated the two
-    // halves of one subject on different histories. `TAD` is anchored per window through
-    // `ss_run_in_params` — `0` for a window opening at the pulse, `−T_inf` for the quiet
-    // window that re-opens its clock after the active one — and `TAFD` is left `NaN`
-    // (#1139).
-    let ext_cycle = ss_run_in_params(pk_params_flat, 0.0);
-    let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
-        rhs(y, p, t, dy);
-        if cmt_idx < dy.len() {
-            dy[cmt_idx] += inf_rate;
-        }
-    };
-    // One window of the cycle: integrate the mean, then carry `P` along it.
-    let advance = |window_rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
-                   u: &mut Vec<f64>,
-                   p_mat: DMatrix<f64>,
-                   t0: f64,
-                   t1: f64,
-                   ext: &[f64]|
-     -> DMatrix<f64> {
-        let sol = solve_ode(window_rhs, u, (t0, t1), ext, &[t1], opts);
+    // capped train alike), so a right-hand side reading `T` / `TIME` sees the same run-in on
+    // both engines. `TAD` is anchored per window — `0` for a window opening at the pulse,
+    // `−T_inf` for the quiet window that re-opens its clock after the active one — and `TAFD`
+    // is left `NaN` (#1139).
+    let advance = |active: &[(usize, T)],
+                   u: &mut Vec<T>,
+                   p_mat: Mat<T>,
+                   t1: T,
+                   anchors: Anchors<T>|
+     -> Mat<T> {
+        let sol = integrate_mean(
+            rhs,
+            active,
+            u,
+            (zero, t1),
+            params,
+            anchors,
+            &[t1.seen_value()],
+            opts,
+        );
         let mut p_out = p_mat;
-        let mut t_prev = t0;
+        let mut t_prev = zero;
         let mut u_prev = u.clone();
         for pt in &sol {
+            let t = point_time(pt.t, t1);
             p_out = propagate_covariance_between(
-                window_rhs, p_out, t_prev, &u_prev, pt.t, &pt.u, ext, q_diag, n,
+                rhs, active, p_out, t_prev, &u_prev, t, &pt.u, params, anchors, q_diag, n,
             );
-            t_prev = pt.t;
+            t_prev = t;
             u_prev.clone_from(&pt.u);
         }
         if let Some(last) = sol.last() {
@@ -261,41 +465,125 @@ fn equilibrate_ss_ekf(
         }
         p_out
     };
-    let mut tracker = SsStopTracker::default();
-    let mut early_stopped = false;
-    let mut pair = vec![0.0f64; n + n * n];
-    for m in 0..SS_EQUILIBRATION_CYCLES {
+    let inf_active: Vec<(usize, T)> = std::iter::once((cmt_idx, inf_rate))
+        .chain(held.iter().copied())
+        .collect();
+    // One cycle of the train on the flat pair `[u; P]`: the dose, then its interval.
+    let cycle = |z: &[T]| -> Option<Vec<T>> {
+        let mut u = z[..n].to_vec();
+        let mut p_mat = z[n..].to_vec();
         if is_inf {
-            p_mat = advance(&wrapped_rhs, &mut u, p_mat, 0.0, t_inf, &ext_cycle);
-            let quiet = dose.ii - t_inf;
-            if quiet > 0.0 {
-                let ext_quiet = ss_run_in_params(pk_params_flat, -t_inf);
-                p_mat = advance(rhs, &mut u, p_mat, 0.0, quiet, &ext_quiet);
+            p_mat = advance(&inf_active, &mut u, p_mat, t_inf, (f64::NAN, zero));
+            let quiet = T::from_f64(dose.ii) - t_inf;
+            if quiet.br_cmp_c(BranchCmp::Gt, 0.0) {
+                p_mat = advance(held, &mut u, p_mat, quiet, (f64::NAN, -t_inf));
             }
         } else {
-            u[cmt_idx] += f_bio * dose.amt;
-            p_mat = advance(rhs, &mut u, p_mat, 0.0, dose.ii, &ext_cycle);
+            u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
+            p_mat = advance(&[], &mut u, p_mat, T::from_f64(dose.ii), (f64::NAN, zero));
         }
-        pair[..n].copy_from_slice(&u);
-        pair[n..].copy_from_slice(p_mat.as_slice());
+        u.extend(p_mat);
+        Some(u)
+    };
+    // A recording type (#2786) records the steady state as one call: the cycle map once, the
+    // train on the values at run time (the very loop below), the derivatives implicit.
+    let z = if T::RECORDS_BRANCHES {
+        let solve: Box<crate::parser::model_parser::rhs_regcode::kernel_jit::SolveFn> =
+            Box::new(move |maps| ss_train::<f64>(n, maps[0]));
+        match T::ss_fixed_point(n + n * n, &[], &vec![0.0; n + n * n], &[&cycle], solve) {
+            Some(r) => r.unwrap_or_else(|| vec![zero; n + n * n]),
+            None => unreachable!("a recording type records a fixed-point call"),
+        }
+    } else {
+        ss_train::<T>(n, &cycle).map_or_else(|| vec![zero; n + n * n], |(z, _)| z)
+    };
+    (z[..n].to_vec(), z[n..].to_vec())
+}
+
+/// The pulse train of [`equilibrate_ss_ekf`]: `cycle` applied from the zero pair until the
+/// concatenated `(u, P)` stops moving by [`SsStopTracker`]'s criterion (read on the values) or
+/// [`SS_EQUILIBRATION_CYCLES`] is spent, with the #867 non-convergence warning on a spent cap.
+/// The pair and what it is for a compiled plan's derivatives (`Found`): the fixed point of
+/// `cycle`, or the capped train's last iterate.
+fn ss_train<T: VmNum>(
+    n: usize,
+    cycle: &dyn Fn(&[T]) -> Option<Vec<T>>,
+) -> Option<(
+    Vec<T>,
+    crate::parser::model_parser::rhs_regcode::kernel_jit::Found,
+)> {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::Found;
+    let mut z = vec![T::from_f64(0.0); n + n * n];
+    let mut tracker = SsStopTracker::default();
+    let mut converged = false;
+    let mut cycles_run = 0;
+    let mut pair = vec![0.0f64; n + n * n];
+    for m in 0..SS_EQUILIBRATION_CYCLES {
+        z = cycle(&z)?;
+        cycles_run = m + 1;
+        for (x, y) in pair.iter_mut().zip(&z) {
+            *x = y.val();
+        }
         if tracker.should_stop(m, &pair) {
-            early_stopped = true;
+            converged = true;
             break;
         }
     }
     let (incr_prev, incr_last, incr_mag) = tracker.recent_increments();
-    note_ss_nonconvergence_if_capped(early_stopped, incr_prev, incr_last, incr_mag);
-    (u, p_mat)
+    note_ss_nonconvergence_if_capped(converged, incr_prev, incr_last, incr_mag);
+    let found = if converged {
+        Found::Fixed(0)
+    } else {
+        Found::Iterated {
+            map: 0,
+            count: cycles_run,
+        }
+    };
+    Some((z, found))
 }
 
-/// One observation point returned by `solve_ekf`.
-#[derive(Debug, Clone)]
-pub struct EkfObsPoint {
+/// An infusion's bioavailable `(rate, window)` (#419) as `T`s, the value
+/// [`DoseEvent::bioavailable_infusion`]'s: a duration-defined dose scales its rate by `F`, a
+/// rate-defined one its window. `modeled` is a modeled `RATE=-2` dose's `D` (duration-defined)
+/// or `RATE=-1` dose's `R` (rate-defined), floored as `resolve_rate` floors it, so the
+/// window and rate carry its derivatives; `None` reads the (resolved) dose record.
+fn infusion_of<T: VmNum>(dose: &DoseEvent, f_bio: T, modeled: Option<T>) -> (T, T) {
+    use crate::types::InfusionDef::{DurationDefined, RateDefined};
+    let amt = T::from_f64(dose.amt);
+    let (rate, dur) = match (dose.infusion_def, modeled) {
+        (DurationDefined, Some(d)) => {
+            let d = d.guard_floor(DoseEvent::DURATION_FLOOR);
+            (amt / d, d)
+        }
+        (RateDefined, Some(r)) => {
+            let r = r.guard_floor(DoseEvent::RATE_FLOOR);
+            (r, amt / r)
+        }
+        (_, None) => (T::from_f64(dose.rate), T::from_f64(dose.duration)),
+    };
+    match dose.infusion_def {
+        DurationDefined => (f_bio * rate, dur),
+        RateDefined => (rate, f_bio * dur),
+    }
+}
+
+/// One observation point returned by `solve_ekf_g`.
+#[derive(Debug, Clone, Copy)]
+pub struct EkfObsPoint<T = f64> {
     /// Predicted mean state value at the observable compartment.
-    pub ipred: f64,
+    pub ipred: T,
     /// EKF state covariance at the observable compartment (P[obs_cmt, obs_cmt])
     /// *before* assimilating this observation. Add to residual variance for V_total.
-    pub p_obs: f64,
+    pub p_obs: T,
+}
+
+impl<T: VmNum> EkfObsPoint<T> {
+    fn of(v: f64) -> Self {
+        EkfObsPoint {
+            ipred: T::from_f64(v),
+            p_obs: T::from_f64(v),
+        }
+    }
 }
 
 /// The EKF mean at the observed compartment, as the prediction it is reported as.
@@ -304,9 +592,9 @@ pub struct EkfObsPoint {
 /// (#1539): it used to be rewritten to `0.0` here, which served a plausible zero for a state
 /// the solver never integrated — once a state diverges the solver `NaN`-pads the rest of the
 /// segment, and this was the one reader that turned that back into a finite number.
-fn ekf_ipred(v: f64) -> f64 {
-    if v < 0.0 {
-        0.0
+fn ekf_ipred<T: VmNum>(v: T) -> T {
+    if v.br_cmp_c(BranchCmp::Lt, 0.0) {
+        T::from_f64(0.0)
     } else {
         v
     }
@@ -315,12 +603,20 @@ fn ekf_ipred(v: f64) -> f64 {
 /// Propagate mean and covariance through a subject's dose+obs timeline.
 ///
 /// `rhs`, `n_states`, `obs_cmt_idx` mirror `OdeSpec`. `diffusion_var` is the
-/// diagonal of Q (length == n_states). `r_obs_vec` is the per-observation
-/// measurement variance R (one entry per element of `obs_times`, in the same
-/// order). Using per-observation R ensures the Kalman update is correct for
-/// proportional and combined error models where R depends on the predicted value.
-/// The returned `p_obs` values are the pre-update EKF covariance components and
-/// are not inflated by R.
+/// diagonal of Q (length == n_states). `r_of(j, ipred)` is observation `j`'s
+/// measurement variance R given the filter's own prediction there, so the Kalman
+/// update is correct for proportional and combined error models, where R depends on the
+/// predicted value. The returned `p_obs` values are the pre-update EKF covariance
+/// components and are not inflated by R. `dose_f_bio` is each dose's bioavailability
+/// (`Fn`, #369) and `params` the PK parameters (both numbers of the filter's type, so their
+/// derivatives flow through the mean and the covariance); the EKF path applies no lagtime.
+/// `doses` are resolved (`resolve_subject_doses`); `modeled[k]`, when given, is dose `k`'s
+/// modeled `D`/`R` as such a number ([`infusion_of`]), and empty for a caller on `f64`.
+///
+/// An infusion's window end moves with `F` (rate-defined) or its modeled `D`/`R`: it is a
+/// break time of the filter's type, so the mean solve's span, the covariance quadrature's
+/// sub-steps and their midpoints all carry its derivatives — the discrete filter is
+/// differentiated as it is computed, with the timeline's order guarded.
 ///
 /// Dose events are handled identically to `ode_predictions`: boluses add to
 /// state; infusions inject a rate term into the wrapped RHS. Covariance is
@@ -328,20 +624,22 @@ fn ekf_ipred(v: f64) -> f64 {
 /// record replaces both mean and covariance with their periodic steady state
 /// ([`equilibrate_ss_ekf`], #1260).
 #[allow(clippy::too_many_arguments)]
-pub fn solve_ekf(
-    rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
+pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
+    rhs: &R,
     n_states: usize,
     obs_cmt_idx: usize,
-    diffusion_var: &[f64],
-    pk_params_flat: &[f64],
-    dose_attr_map: &crate::types::DoseAttrMap,
-    initial_state: &[f64],
+    diffusion_var: &[T],
+    params: &[T],
+    dose_f_bio: &[T],
+    modeled: &[Option<T>],
+    initial_state: &[T],
     doses: &[DoseEvent],
     obs_times: &[f64],
-    r_obs_vec: &[f64],
+    r_of: &dyn Fn(usize, T) -> T,
     opts: OdeSolverOptions,
-) -> Vec<EkfObsPoint> {
+) -> Vec<EkfObsPoint<T>> {
     use std::collections::HashMap;
+    let tf = T::from_f64;
 
     let n = n_states;
     let n_obs = obs_times.len();
@@ -352,28 +650,20 @@ pub fn solve_ekf(
     let mut u = if initial_state.len() == n {
         initial_state.to_vec()
     } else {
-        vec![0.0f64; n]
+        vec![T::from_f64(0.0); n]
     };
-    let mut p_mat = DMatrix::zeros(n, n);
-    let mut results = vec![
-        EkfObsPoint {
-            ipred: 0.0,
-            p_obs: 0.0
-        };
-        n_obs
-    ];
+    let mut p_mat = zeros::<T>(n);
+    let mut results = vec![EkfObsPoint::<T>::of(0.0); n_obs];
 
-    // The compiled `[odes]` RHS reads TAFD and TAD out of `params[MAX_PK_PARAMS]` and
-    // `params[MAX_PK_PARAMS + 1]`. `pk_params_flat` is a bare `PkParams::values`, i.e.
-    // exactly `MAX_PK_PARAMS` long, so `.get()` on either slot returns `None` and the RHS
-    // injects `NaN` — which multiplies into the state and the Jacobian, and is then
-    // laundered into a plausible `0.0` by the `is_nan()` clamp below while `p_obs` keeps
-    // the `NaN` and destroys the likelihood (#1131). Carry the same extended array the
-    // ODE predictors build; the TAD slot is re-anchored per segment in the walk below.
-    let mut ext_params = crate::ode::predictions::seed_ext_params(
-        pk_params_flat,
-        crate::ode::predictions::earliest_dose_time(doses),
-    );
+    // The `[odes]` RHS reads TAFD and TAD from two clocks the walk anchors: the first dose
+    // time for the whole subject, and the last effective dose time re-anchored per segment
+    // (#1131: they were `NaN` once, through a params slice too short to hold them).
+    let first_dose = crate::ode::predictions::earliest_dose_time(doses);
+    let first_dose = if first_dose.is_finite() {
+        first_dose
+    } else {
+        f64::NAN
+    };
     // Every observation index at a given time, not just the last one: multiple records
     // can share a time (simultaneous PK/PD samples on different compartments), and a
     // `HashMap<u64, usize>` keeps only one of them — the rest would keep the
@@ -386,13 +676,6 @@ pub fn solve_ekf(
     for (i, &t) in obs_times.iter().enumerate() {
         obs_map.entry(t.to_bits()).or_default().push(i);
     }
-
-    // Bioavailability resolved per dose compartment (`Fn`; issue #369), falling
-    // back to the bare `F` slot. (The EKF path does not apply lagtime.)
-    let dose_f_bio: Vec<f64> = doses
-        .iter()
-        .map(|d| dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
-        .collect();
 
     // Build break times (same logic as ode_predictions).
     //
@@ -422,35 +705,52 @@ pub fn solve_ekf(
         .cloned()
         .fold(0.0f64, f64::max)
         .max(if t_first.is_finite() { t_first } else { 0.0 });
+    // Each infusion's bioavailable `(rate, window)`, its derivatives with it.
+    let inf: Vec<(T, T)> = doses
+        .iter()
+        .enumerate()
+        .map(|(k, d)| {
+            if is_real_infusion(d) {
+                infusion_of(d, dose_f_bio[k], modeled.get(k).copied().flatten())
+            } else {
+                (tf(0.0), tf(0.0))
+            }
+        })
+        .collect();
     // `subject_integration_start`'s own dose-free fallback, spelled here because this
     // engine holds slices rather than a `&Subject`.
-    let mut break_times: Vec<f64> = vec![if t_first.is_finite() { t_first } else { 0.0 }];
+    let mut break_times: Vec<T> = vec![tf(if t_first.is_finite() { t_first } else { 0.0 })];
     for (k, dose) in doses.iter().enumerate() {
-        break_times.push(dose.time);
+        break_times.push(tf(dose.time));
         if is_real_infusion(dose) {
             // `F`-reshaped window end, matching `active_infusions`' own membership test
             // (`predictions.rs:1520-1531`) and `collect_dose_break_times`. An unscaled
             // `dose.duration` puts the break past the true end, so the admission test
             // `end >= t_end - EPS` fails and the infusion is never admitted in *any*
             // segment — measured on #1263 as `ipred = 0.0` everywhere for `F = 0.5`.
-            let (_, dur_eff) = dose.bioavailable_infusion(dose_f_bio[k]);
-            break_times.push(dose.time + dur_eff);
+            break_times.push(tf(dose.time) + inf[k].1);
+            // Earlier SS pulses still running after the record (`T_inf > II`); no lagtime here.
+            let (first, n) = crate::dosing::ss_residual_infusions_g(dose, tf(0.0), inf[k].1);
+            // Only the stops the walk reaches (it ends at `t_last`).
+            for j in crate::dosing::residual_end_indices_g(dose.time, first, dose.ii, n, t_last) {
+                break_times.push(tf(dose.time) + first - tf(j as f64 * dose.ii));
+            }
         }
     }
-    break_times.push(t_last);
-    break_times.sort_by(|a, b| a.total_cmp(b));
-    break_times.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    break_times.push(tf(t_last));
+    crate::sens::ode_provider::sort_times(&mut break_times);
+    break_times.dedup_by(|a, b| a.br_absdiff_lt(*b, 1e-15));
     // A non-finite break time makes the subject non-finite (#1189) — see
-    // `ode::predictions::timeline_has_non_finite`. `results` is prefilled with the
+    // `ode::predictions::times_have_non_finite`. `results` is prefilled with the
     // caller's default point, so overwrite it with NaN ipreds rather than returning a
     // finite-looking filter pass built on a timeline that could not be ordered.
-    if crate::ode::predictions::abandon_non_finite_timeline(break_times.iter().copied(), None) {
+    if crate::ode::predictions::abandon_non_finite_timeline(
+        break_times.iter().map(|t| t.seen_value()),
+        None,
+    ) {
         // `fill`, not a per-field loop: one spelling of the struct, so a field added to
         // `EkfObsPoint` cannot be left at its default here while the others go NaN.
-        results.fill(EkfObsPoint {
-            ipred: f64::NAN,
-            p_obs: f64::NAN,
-        });
+        results.fill(EkfObsPoint::<T>::of(f64::NAN));
         return results;
     }
 
@@ -476,8 +776,10 @@ pub fn solve_ekf(
     // `1e-15`, two breaks (a #1186 infusion-end / dose collision) can both claim one sample.
     let mut assimilated = vec![false; obs_times.len()];
     for k in 0..(break_times.len() - 1) {
-        let t_start = break_times[k];
-        let t_end = break_times[k + 1];
+        // The breaks as numbers of the filter's type (a window end moves), and their values
+        // for the record reads and the infusions' membership, which the guarded order fixes.
+        let (t_start_g, t_end_g) = (break_times[k], break_times[k + 1]);
+        let (t_start, t_end) = (t_start_g.seen_value(), t_end_g.seen_value());
 
         // Records read *at* t_start — the whole `EVENT_MATCH_TOL` band, through the same
         // helper as the ODE engines (#1226). A dose matches a break symmetrically within
@@ -517,7 +819,8 @@ pub fn solve_ekf(
                                 n,
                                 dose,
                                 dose_f_bio[di],
-                                pk_params_flat,
+                                inf[di],
+                                params,
                                 diffusion_var,
                                 &opts,
                             );
@@ -528,7 +831,7 @@ pub fn solve_ekf(
                         if !is_real_infusion(dose) {
                             let cmt_idx = dose.cmt_idx();
                             if cmt_idx < n {
-                                u[cmt_idx] += dose_f_bio[di] * dose.amt;
+                                u[cmt_idx] = u[cmt_idx] + dose_f_bio[di] * T::from_f64(dose.amt);
                             }
                         }
                     }
@@ -565,7 +868,7 @@ pub fn solve_ekf(
                     results[obs_idx].ipred = ipred;
                     continue;
                 }
-                let r = r_obs_vec.get(obs_idx).copied().unwrap_or(1.0);
+                let r = r_of(obs_idx, ipred);
                 let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
                 p_mat = p_new;
                 let point = EkfObsPoint { ipred, p_obs };
@@ -579,7 +882,7 @@ pub fn solve_ekf(
                 let bits = obs_times[obs_idx].to_bits();
                 for &j in &boundary_obs {
                     if !assimilated[j] && obs_times[j].to_bits() == bits {
-                        results[j] = point.clone();
+                        results[j] = point;
                         assimilated[j] = true;
                     }
                 }
@@ -587,66 +890,86 @@ pub fn solve_ekf(
         }
 
         let saveat = crate::ode::predictions::segment_saveat(obs_times, t_start, t_end);
+        // Which records a moving end reads is the verdict of each record's comparison with it.
+        for &t in obs_times {
+            if !t_start_g.is_constant() {
+                let _ = (tf(t) - t_start_g)
+                    .br_cmp_c(BranchCmp::Ge, crate::ode::predictions::EVENT_MATCH_TOL);
+            }
+            if !t_end_g.is_constant() {
+                let _ = tf(t).br_cmp(BranchCmp::Le, t_end_g);
+            }
+        }
 
-        if (t_end - t_start).abs() < 1e-15 {
+        if t_end_g.br_absdiff_lt(t_start_g, 1e-15) {
             continue;
         }
 
-        // Re-anchor TAD for this segment, *before* anything integrates with it — the
-        // ODE predictors write this slot per segment too, and a write placed after the
-        // solve reads the previous segment's anchor without failing to compile.
-        // `&[]`, not a zero-filled vector: this path applies no lagtime (see `dose_f_bio`
-        // above and the `active_infusions` call below), and `tad_anchor_for` reads a
+        // Re-anchor TAD for this segment, *before* anything integrates with it. `&[]`, not a
+        // zero-filled vector: this path applies no lagtime, and `tad_anchor_for` reads a
         // missing entry as zero lag.
-        ext_params[crate::types::MAX_PK_PARAMS + 1] =
-            crate::ode::predictions::tad_anchor_for(doses, &[], t_start);
+        let anchors = (
+            first_dose,
+            tf(crate::ode::predictions::tad_anchor_for(doses, &[], t_start)),
+        );
 
         // Active infusion rates for this segment (shared with the FOCEI ODE
         // path so the F·RATE / span / lag / reset semantics stay in lockstep).
-        // The EKF path has no per-dose lagtimes and no system resets.
-        let active = active_infusions(
+        // The EKF path has no per-dose lagtimes and no system resets. Membership is read on
+        // the values (the guarded order fixes it); the rate and window carry `F` and a
+        // modeled `D`/`R` ([`infusion_of`]).
+        let f_vals: Vec<f64> = dose_f_bio.iter().map(|f| f.seen_value()).collect();
+        let active: Vec<(usize, T)> = active_infusion_doses(
             &[],
             doses,
             t_start,
             t_end,
             &[],
-            &dose_f_bio,
+            &f_vals,
             f64::NEG_INFINITY,
             n,
-        );
-
-        let wrapped_rhs = |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
-            rhs(y, p, t, dy);
-            for &(cmt_idx, rate) in &active {
-                if cmt_idx < dy.len() {
-                    dy[cmt_idx] += rate;
-                }
-            }
-        };
+        )
+        .into_iter()
+        .map(|(k, cmt, _, pulses)| {
+            (
+                cmt,
+                if pulses == 1 {
+                    inf[k].0
+                } else {
+                    inf[k].0 * T::from_f64(pulses as f64)
+                },
+            )
+        })
+        .collect();
 
         // Integrate mean state
-        let sol = solve_ode(
-            &wrapped_rhs,
+        let sol = integrate_mean(
+            rhs,
+            &active,
             &u,
-            (t_start, t_end),
-            &ext_params,
+            (t_start_g, t_end_g),
+            params,
+            anchors,
             &saveat,
             &opts,
         );
 
         // Propagate covariance and update at obs times within this segment
-        let mut t_prev = t_start;
+        let mut t_prev = t_start_g;
         let mut u_prev = u.clone();
 
         for pt in &sol {
+            let t_pt = point_time(pt.t, t_end_g);
             p_mat = propagate_covariance_between(
-                &wrapped_rhs,
+                rhs,
+                &active,
                 p_mat,
                 t_prev,
                 &u_prev,
-                pt.t,
+                t_pt,
                 &pt.u,
-                &ext_params,
+                params,
+                anchors,
                 diffusion_var,
                 n,
             );
@@ -675,24 +998,21 @@ pub fn solve_ekf(
                 .chain(obs_map.get(&pt.t.next_up().to_bits()))
                 .flatten();
             if let Some(&first) = here.clone().find(|&&j| !assimilated[j]) {
-                let r = r_obs_vec.get(first).copied().unwrap_or(1.0);
+                let ipred = ekf_ipred(pt.u[obs_cmt_idx]);
+                let r = r_of(first, ipred);
                 let (p_new, p_obs) = kalman_update(&p_mat, obs_cmt_idx, r, n);
                 p_mat = p_new;
-                let v = pt.u[obs_cmt_idx];
-                let point = EkfObsPoint {
-                    ipred: ekf_ipred(v),
-                    p_obs,
-                };
+                let point = EkfObsPoint { ipred, p_obs };
                 for &j in here {
                     if !assimilated[j] {
-                        results[j] = point.clone();
+                        results[j] = point;
                         assimilated[j] = true;
                     }
                 }
             }
 
-            t_prev = pt.t;
-            u_prev = pt.u.clone();
+            t_prev = t_pt;
+            u_prev.clone_from(&pt.u);
         }
 
         if let Some(last) = sol.last() {
@@ -706,7 +1026,86 @@ pub fn solve_ekf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sens::num::PkNum;
     use approx::assert_relative_eq;
+
+    /// A hand-written `f64` right-hand side as an [`EkfRhs`]: the tests' closures are not
+    /// generic over a number type, so their tangent is a central finite difference of the
+    /// closure (a test oracle; the production path is the program's exact tangent, pinned by
+    /// `exact_jacobian_matches_central_fd_on_the_compiled_program`). The anchors land in the
+    /// extended-parameter slots the closures read.
+    struct FdRhs<'a>(&'a (dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync));
+
+    impl EkfRhs for FdRhs<'_> {
+        fn eval<U: VmNum>(&self, u: &[U], p: &[U], t: U, anchors: Anchors<U>, du: &mut [U]) {
+            let mut ext = vec![f64::NAN; crate::types::MAX_PK_PARAMS + 2];
+            for (e, x) in ext.iter_mut().zip(p).take(crate::types::MAX_PK_PARAMS) {
+                *e = x.val();
+            }
+            ext[crate::types::MAX_PK_PARAMS] = anchors.0;
+            ext[crate::types::MAX_PK_PARAMS + 1] = anchors.1.val();
+            let (n, t0) = (u.len(), t.val());
+            let u0: Vec<f64> = u.iter().map(|x| x.val()).collect();
+            let mut f0 = vec![0.0; n];
+            (self.0)(&u0, &ext, t0, &mut f0);
+            let mut jac = vec![0.0; n * n];
+            let (mut fp, mut fm) = (vec![0.0; n], vec![0.0; n]);
+            for j in 0..n {
+                let h = 1e-5 * (1.0 + u0[j].abs());
+                let (mut up, mut um) = (u0.clone(), u0.clone());
+                up[j] += h;
+                um[j] -= h;
+                (self.0)(&up, &ext, t0, &mut fp);
+                (self.0)(&um, &ext, t0, &mut fm);
+                for i in 0..n {
+                    jac[i * n + j] = (fp[i] - fm[i]) / (2.0 * h);
+                }
+            }
+            for i in 0..n {
+                let mut acc = U::from_f64(f0[i]);
+                for j in 0..n {
+                    acc = acc + U::from_f64(jac[i * n + j]) * (u[j] - U::from_f64(u0[j]));
+                }
+                du[i] = acc;
+            }
+        }
+    }
+
+    /// The pre-generic entry point the tests were written against: an `f64` closure, the
+    /// dose-attribute map for `F`, and a precomputed per-observation `R`.
+    #[allow(clippy::too_many_arguments)]
+    fn solve_ekf(
+        rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
+        n_states: usize,
+        obs_cmt_idx: usize,
+        diffusion_var: &[f64],
+        pk_params_flat: &[f64],
+        dose_attr_map: &crate::types::DoseAttrMap,
+        initial_state: &[f64],
+        doses: &[DoseEvent],
+        obs_times: &[f64],
+        r_obs_vec: &[f64],
+        opts: OdeSolverOptions,
+    ) -> Vec<EkfObsPoint> {
+        let dose_f: Vec<f64> = doses
+            .iter()
+            .map(|d| dose_attr_map.f_bio(d.cmt_raw(), pk_params_flat))
+            .collect();
+        solve_ekf_g::<f64, _>(
+            &FdRhs(rhs),
+            n_states,
+            obs_cmt_idx,
+            diffusion_var,
+            pk_params_flat,
+            &dose_f,
+            &[],
+            initial_state,
+            doses,
+            obs_times,
+            &|j, _| r_obs_vec.get(j).copied().unwrap_or(1.0),
+            opts,
+        )
+    }
 
     /// 1-cpt IV bolus ODE: dA/dt = -ke·A.
     fn one_cpt_rhs(y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]) {
@@ -1369,16 +1768,10 @@ mod tests {
 
         for (i, &t) in obs_times.iter().enumerate() {
             let p_analytic = (sigma2_w / (2.0 * ke)) * (1.0 - (-2.0 * ke * t).exp());
-            // 5% is a **discretisation floor, not a loose tolerance**: `propagate_covariance`
-            // steps the Riccati equation with forward Euler at `DT_MAX = 0.5`, so at `t = 1`
-            // it computes exactly `Q·0.5 + (Q − 2·ke·P₁)·0.5` — for this fixture
-            // `0.04·0.5 + (0.04 − 2·0.05·0.02)·0.5 = 0.039` — against a true `0.0380650`,
-            // i.e. 2.46% before any other source of error. The realised error falls with `t`
-            // as `P` approaches steady state (2.46% → 1.32% over t = 1…12), so this bound is
-            // set by the smallest `t` in the grid. Any oracle for this quantity inherits the
-            // same floor; see `ekf_covariance_matches_a_quadrature_oracle_on_a_time_varying_rate`
-            // (#1263), which measures it on a time-varying rate.
-            assert_relative_eq!(ekf_pts[i].p_obs, p_analytic, max_relative = 0.05);
+            // Measured (Crank-Nicolson Riccati step, Linux): realised error 4.95e-5 / 4.24e-5 /
+            // 3.40e-5 / 2.69e-5 at t = 1/4/8/12 (the old forward-Euler step sat at 2.46% ..
+            // 1.32%, a discretisation floor). Bounded at 1e-3, 20x headroom.
+            assert_relative_eq!(ekf_pts[i].p_obs, p_analytic, max_relative = 1e-3);
         }
     }
 
@@ -1636,7 +2029,7 @@ mod tests {
     /// because this walk's sort is the same one, not because a fitted dataset gets here.
     ///
     /// Mutation: restore `partial_cmp(..).unwrap()` → panic; delete the
-    /// `timeline_has_non_finite` guard → finite `ipred`s and the assert below fires.
+    /// `times_have_non_finite` guard → finite `ipred`s and the assert below fires.
     #[test]
     fn ekf_non_finite_break_is_non_finite_not_a_panic() {
         let doses = vec![
@@ -2040,14 +2433,15 @@ mod tests {
     /// **The seeded covariance is the stationary Riccati value, in closed form.**
     ///
     /// For `dA/dt = −k·A` the Riccati equation is scalar, `dP/dt = −2k·P + q`, whose
-    /// stationary value `q / 2k` is also the exact fixed point of the Euler map the walk
-    /// uses (`P ← P + (−2k·P + q)·Δt`), for every `Δt`. A bolus leaves `P` untouched, so
+    /// stationary value `q / 2k` is also the exact fixed point of the Crank–Nicolson map the
+    /// walk uses (`P ← P + (−2k·P⁺/₂ + q)·Δt`, `P⁺/₂` the average of `P` and the new `P`), for
+    /// every `Δt`. A bolus leaves `P` untouched, so
     /// the periodic trough of `P` *is* `q / 2k` with no quadrature error — and once seeded
     /// there it stays there until the first Kalman update, so `p_obs` at the **first**
     /// observation after the record reads `q / 2k` to the run-in's stop tolerance. (Later
     /// observations read the regrowth after the update at `R = 0.01` collapses `P`, and are
     /// not a statement about the seed.) Before #1260 `P` was `0` at the record and read the
-    /// Euler approximation of `q·(1 − e^{−2kΔ}) / 2k` — `0.185·q/2k` at `Δ = 2` here.
+    /// one-step approximation of `q·(1 − e^{−2kΔ}) / 2k` — `0.185·q/2k` at `Δ = 2` here.
     ///
     /// The mean is checked at every observation against the closed-form periodic peak
     /// `D·e^{−kΔ} / (1 − e^{−k·II})`, at the solver's default tolerance.
@@ -2262,16 +2656,15 @@ mod tests {
         }
     }
 
-    /// **An overlapping `SS=1` infusion (`T_inf > II`) is declined, not half-equilibrated.**
-    /// The ODE run-in returns a zero state for it and `W_STEADY_STATE_INFUSION` names it at
-    /// check time; the EKF returns the same zero pair, so the two engines agree on the
-    /// shape neither serves — bit-identical to the `SS=0` arm, which is what the filter
-    /// computed before #1260.
+    /// **An overlapping `SS=1` infusion (`T_inf > II`) is the explicit overlapping train.**
+    /// The run-in used to return a zero pair for it (the single-dose answer, as the ODE run-in
+    /// did); it now replays the always-running earlier pulse as a held rate, and the walk
+    /// carries it past the record (`dosing::ss_residual_infusions_g`).
     #[test]
-    fn ekf_overlapping_ss_infusion_is_the_single_dose_answer() {
+    fn ekf_overlapping_ss_infusion_is_the_explicit_train() {
         let pk = make_pk(1.0, 20.0);
         // AMT 100 at RATE 5: a 20 h window across II = 12.
-        let (ss, _, single, obs_times) = ss_fixture(100.0, 5.0);
+        let (ss, train, single, obs_times) = ss_fixture(100.0, 5.0);
         let run = |doses: &[DoseEvent]| {
             solve_ekf(
                 &one_cpt_rhs,
@@ -2287,12 +2680,19 @@ mod tests {
                 OdeSolverOptions::default(),
             )
         };
-        let (got, was) = (run(&ss), run(&single));
-        for (g, w) in got.iter().zip(&was) {
-            assert!(g.ipred.is_finite() && g.p_obs.is_finite());
-            assert_eq!(g.ipred.to_bits(), w.ipred.to_bits());
-            assert_eq!(g.p_obs.to_bits(), w.p_obs.to_bits());
-        }
+        let (got, want, was) = (run(&ss), run(&train), run(&single));
+        let (e_mean, e_cov) = worst_rel(&got, &want);
+        assert!(
+            e_mean < 1e-9 && e_cov < 1e-9,
+            "overlapping SS=1 infusion vs the explicit train: worst relative error ipred \
+             {e_mean:.3e}, p_obs {e_cov:.3e}"
+        );
+        let (d_mean, d_cov) = worst_rel(&was, &want);
+        assert!(
+            d_mean > 1e-1 && d_cov > 1e-1,
+            "the single-infusion arm must be far from the train: ipred {d_mean:.3e}, \
+             p_obs {d_cov:.3e}"
+        );
     }
 
     /// **A run-in that spends its cycle budget without converging warns** through the same
@@ -2423,14 +2823,9 @@ mod tests {
         );
         // And the straddle: the two-update answer really is different, so the assertion
         // above can fail.
-        let (p_new, _) = kalman_update(
-            &nalgebra::DMatrix::from_element(1, 1, dup[0].p_obs),
-            0,
-            0.01,
-            1,
-        );
+        let (p_new, _) = kalman_update(&[dup[0].p_obs], 0, 0.01, 1);
         assert!(
-            (p_new[(0, 0)] - dup[0].p_obs).abs() > 1e-9,
+            (p_new[0] - dup[0].p_obs).abs() > 1e-9,
             "a second update at the same instant must move p_mat, or this test is vacuous"
         );
     }
@@ -2859,22 +3254,15 @@ mod tests {
                 assert!(got.is_finite(), "c={c}: non-finite p_obs at t={t}: {got}");
                 let rel = ((got - want) / want).abs();
                 worst = worst.max(rel);
-                // Measured realised errors, all eight points:
-                //   c=0.00  2.456e-2 / 2.093e-2 / 1.671e-2 / 1.317e-2  at t = 1/4/8/12
-                //   c=0.05  2.526e-2 / 2.249e-2 / 1.754e-2 / 1.171e-2
-                // Worst 2.526e-2, and it *decreases* with t — this is the forward-Euler
-                // transient in `propagate_covariance`, which steps the Riccati equation at
-                // `DT_MAX = 0.5`: at t=1 that is two steps giving exactly
-                // `0.04·0.5 + (0.04 − 2·0.05·0.02)·0.5 = 0.039` against a true 0.0380650.
-                // So the floor here is the filter's own discretisation, not the oracle;
-                // `ekf_variance_matches_analytic_linear_sde` sits at 5% for the same reason.
-                //
-                // Bounded at 4e-2 — 1.6× over the realised worst case. Loose, and it has to
-                // be, but it still bites: the defect this fixture exists to catch (an engine
-                // that ignores the model-time term, so `c=0.05` returns the `c=0` curve) is
-                // 23% wrong at t=12, six times the bound.
+                // Measured realised errors (Crank-Nicolson Riccati step, Linux), all eight points:
+                //   c=0.00  4.953e-5 / 4.236e-5 / 3.400e-5 / 2.694e-5  at t = 1/4/8/12
+                //   c=0.05  1.561e-4 / 1.540e-4 / 1.468e-4 / 1.349e-4
+                // Worst 1.56e-4 (the forward-Euler step this replaced sat at 2.5e-2, its own
+                // discretisation floor). Bounded at 1e-3 - 6.4x headroom - and the defect this
+                // fixture exists to catch (an engine that ignores the model-time term, so
+                // `c=0.05` returns the `c=0` curve) is 23% wrong at t=12, 230x the bound.
                 assert!(
-                    rel < 4e-2,
+                    rel < 1e-3,
                     "c={c} t={t}: EKF p_obs {got:.10e} vs quadrature {want:.10e} \
                      (rel {rel:.3e})"
                 );
@@ -2962,5 +3350,548 @@ mod tests {
             );
             assert!(diverged[i].is_nan(), "t={t}: {diverged:?}");
         }
+    }
+
+    // ---- exact Jacobian and recording (the EKF written once over `T`) -------------------
+
+    /// A Michaelis–Menten SDE model (nonlinear, so its Jacobian moves along the trajectory)
+    /// with a proportional error, one random effect and an estimated diffusion.
+    const MM_SDE: &str = "[parameters]\n  theta TVVMAX(5.0, 0.1, 100.0)\n  theta TVKM(2.0, 0.1, 100.0)\n  \
+        theta TVV(10.0, 1.0, 100.0)\n  theta TVKA(1.0, 0.1, 10.0)\n  omega ETA_V ~ 0.05\n  \
+        sigma PROP ~ 0.1 (sd)\n[individual_parameters]\n  VMAX = TVVMAX\n  KM = TVKM\n  \
+        V = TVV * exp(ETA_V)\n  KA = TVKA\n[structural_model]\n  ode(obs_cmt=central, states=[depot, central])\n\
+        [odes]\n  d/dt(depot) = -KA * depot\n  d/dt(central) = KA * depot / V - VMAX * central / (KM + central)\n\
+        [diffusion]\n  central ~ 0.05\n[error_model]\n  DV ~ proportional(PROP)\n";
+
+    /// Tight tolerances, so the f64 solve is a differentiable oracle (a central difference at
+    /// a relative step of 1e-4 reads solver noise of order `reltol / 1e-4`).
+    fn tight() -> OdeSolverOptions {
+        OdeSolverOptions {
+            abstol: 1e-13,
+            reltol: 1e-11,
+            method: crate::ode::solver::OdeMethod::Rk45,
+            ..OdeSolverOptions::default()
+        }
+    }
+
+    struct Fixture {
+        model: crate::types::CompiledModel,
+        pk: Vec<f64>,
+        slots: [usize; 4],
+        doses: Vec<DoseEvent>,
+        obs: Vec<f64>,
+    }
+
+    fn fixture() -> Fixture {
+        let model = crate::parser::model_parser::parse_model_string(MM_SDE).expect("parses");
+        let p = &model.default_params;
+        let eta = vec![0.0; model.n_eta];
+        let pk = (model.pk_param_fn)(&p.theta, &eta, &std::collections::HashMap::new(), 0.0)
+            .values
+            .to_vec();
+        let slot = |name: &str| {
+            let i = model
+                .indiv_param_names
+                .iter()
+                .position(|n| n == name)
+                .expect("named parameter");
+            model.pk_indices[i]
+        };
+        let slots = [slot("VMAX"), slot("KM"), slot("V"), slot("KA")];
+        Fixture {
+            model,
+            pk,
+            slots,
+            doses: vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            obs: vec![0.5, 1.0, 2.0, 4.0, 5.5, 7.0, 9.0, 12.0],
+        }
+    }
+
+    /// The exact Jacobian is the compiled program's tangent: against a central difference of
+    /// the same program on a nonlinear right-hand side, at three states.
+    ///
+    /// Measured worst relative error 2.0e-11 (the difference's own truncation, `h² f'''`);
+    /// bound 1e-9 (50× headroom). Kills a tangent that drops the `KM + central` denominator's state
+    /// dependence, or one that is read at the wrong state.
+    #[test]
+    fn exact_jacobian_matches_central_fd_on_the_compiled_program() {
+        let fx = fixture();
+        let ode = fx.model.ode_spec.as_ref().unwrap();
+        let rhs = ProgramRhs(ode.rhs_program.as_ref().unwrap());
+        let n = 2;
+        let mut worst: f64 = 0.0;
+        for u in [[3.0, 1.5], [0.2, 4.0], [10.0, 0.05]] {
+            let exact = jacobian::<f64, _>(&rhs, &[], &u, &fx.pk, 1.0, (f64::NAN, f64::NAN), n);
+            for j in 0..n {
+                let h = 1e-5 * (1.0 + u[j].abs());
+                let eval = |x: &[f64; 2]| {
+                    let mut du = [0.0; 2];
+                    rhs.eval::<f64>(x, &fx.pk, 1.0, (f64::NAN, f64::NAN), &mut du);
+                    du
+                };
+                let (mut up, mut um) = (u, u);
+                up[j] += h;
+                um[j] -= h;
+                let (fp, fm) = (eval(&up), eval(&um));
+                for i in 0..n {
+                    let fd = (fp[i] - fm[i]) / (2.0 * h);
+                    assert!(exact[i * n + j].is_finite() && fd.is_finite());
+                    worst = worst.max((exact[i * n + j] - fd).abs() / (1.0 + fd.abs()));
+                }
+            }
+        }
+        eprintln!("exact-vs-FD Jacobian worst relative error: {worst:e}");
+        assert!(worst < 1e-9, "worst {worst:e}");
+    }
+
+    /// What the exact Jacobian changes in the value path: `p_obs` from the program's tangent
+    /// against the same filter with the old central-FD Jacobian (`FD_H = 1e-5`), default
+    /// solver options, on the MM model.
+    ///
+    /// Measured worst relative `p_obs` difference 6.2e-11 (printed); the exact path is the
+    /// better-conditioned one. Bound 1e-9 (16× headroom).
+    #[test]
+    fn exact_jacobian_moves_p_obs_by_the_fd_truncation_only() {
+        let fx = fixture();
+        let ode = fx.model.ode_spec.as_ref().unwrap();
+        let q = [0.0, 0.05];
+        let dose_f = vec![1.0; fx.doses.len()];
+        let r = |_: usize, f: f64| 0.01 * f * f + 1e-3;
+        let opts = ode.effective_solver_opts();
+        let exact = solve_ekf_g::<f64, _>(
+            &ProgramRhs(ode.rhs_program.as_ref().unwrap()),
+            2,
+            1,
+            &q,
+            &fx.pk,
+            &dose_f,
+            &[],
+            &[],
+            &fx.doses,
+            &fx.obs,
+            &r,
+            opts,
+        );
+        let fd = solve_ekf_g::<f64, _>(
+            &FdRhs(ode.rhs.as_ref()),
+            2,
+            1,
+            &q,
+            &fx.pk,
+            &dose_f,
+            &[],
+            &[],
+            &fx.doses,
+            &fx.obs,
+            &r,
+            opts,
+        );
+        let mut worst: f64 = 0.0;
+        for (a, b) in exact.iter().zip(&fd) {
+            assert!(a.p_obs.is_finite() && b.p_obs.is_finite() && a.p_obs > 0.0);
+            assert_eq!(a.ipred, b.ipred, "the mean does not read the Jacobian");
+            worst = worst.max((a.p_obs - b.p_obs).abs() / b.p_obs); // nan-ok: finite asserted above
+        }
+        eprintln!("exact-vs-FD-Jacobian p_obs worst relative difference: {worst:e}");
+        assert!(worst < 1e-9, "worst {worst:e}");
+    }
+
+    /// [`ProgramRhs`] with its program hidden: the same values, so the mean integration's
+    /// Rosenbrock step has nothing to take an exact Jacobian from and differences it.
+    struct HiddenProgram<'a>(ProgramRhs<'a>);
+
+    impl EkfRhs for HiddenProgram<'_> {
+        fn eval<U: VmNum>(&self, u: &[U], p: &[U], t: U, anchors: Anchors<U>, du: &mut [U]) {
+            self.0.eval(u, p, t, anchors, du);
+        }
+    }
+
+    /// The EKF's `f64` mean integration takes the program's exact Jacobian on a Rosenbrock
+    /// method, not a difference of its closure (`integrate_mean`).
+    ///
+    /// Three runs of one filter on `rodas4`: the program's exact `J` (production), the same
+    /// right-hand side with its program hidden (so differenced), and the exact run with the
+    /// registration switched off (`EXACT_JAC_OFF`, which must reproduce the differenced run bit
+    /// for bit). The exact and differenced means must differ (the registration is read) and
+    /// agree to the difference's truncation. Measured: the two means differ by 3.6e-9
+    /// relative (printed); bound `(1e-13, 1e-5)`. Kills `program()` returning `None` (exact ==
+    /// differenced), a registration keyed to the wrong address (same), and a jet that reads
+    /// the wrong anchors or state (the means then differ by far more than 1e-5).
+    #[test]
+    fn mean_integration_takes_the_exact_jacobian_on_a_rosenbrock_method() {
+        let fx = fixture();
+        let ode = fx.model.ode_spec.as_ref().unwrap();
+        let prog = ode.rhs_program.as_ref().unwrap();
+        let q = [0.0, 0.05];
+        let dose_f = vec![1.0; fx.doses.len()];
+        let r = |_: usize, f: f64| 0.01 * f * f + 1e-3;
+        let mut opts = ode.effective_solver_opts();
+        opts.method = crate::ode::solver::OdeMethod::Rodas4;
+        let exact = {
+            solve_ekf_g::<f64, _>(
+                &ProgramRhs(prog),
+                2,
+                1,
+                &q,
+                &fx.pk,
+                &dose_f,
+                &[],
+                &[],
+                &fx.doses,
+                &fx.obs,
+                &r,
+                opts.clone(),
+            )
+        };
+        let hidden = || {
+            solve_ekf_g::<f64, _>(
+                &HiddenProgram(ProgramRhs(prog)),
+                2,
+                1,
+                &q,
+                &fx.pk,
+                &dose_f,
+                &[],
+                &[],
+                &fx.doses,
+                &fx.obs,
+                &r,
+                opts.clone(),
+            )
+        };
+        let differenced = hidden();
+        crate::ode::rosenbrock::EXACT_JAC_OFF.with(|c| c.set(true));
+        let off = {
+            solve_ekf_g::<f64, _>(
+                &ProgramRhs(prog),
+                2,
+                1,
+                &q,
+                &fx.pk,
+                &dose_f,
+                &[],
+                &[],
+                &fx.doses,
+                &fx.obs,
+                &r,
+                opts.clone(),
+            )
+        };
+        crate::ode::rosenbrock::EXACT_JAC_OFF.with(|c| c.set(false));
+        let mut worst: f64 = 0.0;
+        for ((e, d), o) in exact.iter().zip(&differenced).zip(&off) {
+            assert!(e.ipred.is_finite() && d.ipred.is_finite());
+            assert_eq!(
+                d.ipred.to_bits(),
+                o.ipred.to_bits(),
+                "switch-off == differenced"
+            );
+            worst = worst.max((e.ipred - d.ipred).abs() / d.ipred.abs()); // nan-ok: finite asserted above
+        }
+        eprintln!("exact-vs-differenced Jacobian, mean relative difference: {worst:e}");
+        assert!(worst > 1e-13, "the exact Jacobian was not read: {worst:e}");
+        assert!(worst < 1e-5, "worst {worst:e}");
+    }
+
+    /// The filter recorded on the recording type (leaves: `VMAX`, `KM`, `V`, `KA`, the
+    /// diffusion variance and the proportional `σ²` of the Kalman `R`) gives a plan whose
+    /// forward reproduces the `f64` filter and whose one reverse gives the exact gradient of
+    /// every `ipred_j` and `p_obs_j` — against central differences of the `f64` filter at
+    /// tight solver tolerances.
+    ///
+    /// Measured worst relative error (printed); bound set from it with headroom. Kills a
+    /// Jacobian whose tangent is dropped on the recording (`p_obs` then has no `VMAX`/`KM`/`V`
+    /// derivative through `F`), a Kalman `R` held constant (no `σ²` derivative), and a plan
+    /// that replays the recording point's values.
+    #[test]
+    fn recorded_filter_gradient_matches_central_fd() {
+        use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+        use crate::sens::num::vm::Layout;
+        let fx = fixture();
+        let ode = fx.model.ode_spec.as_ref().unwrap();
+        let rhs = ProgramRhs(ode.rhs_program.as_ref().unwrap());
+        let dose_f = |_: usize| 1.0;
+        let opts = tight();
+        // leaves: VMAX, KM, V, KA, q, sig2
+        let x0 = [5.0, 2.0, 10.0, 1.0, 0.05, 0.01];
+        let n_in = x0.len();
+        let run_f64 = |x: &[f64]| -> Vec<f64> {
+            let mut pk = fx.pk.clone();
+            for (s, v) in fx.slots.iter().zip(x) {
+                pk[*s] = *v;
+            }
+            let f = vec![dose_f(0); fx.doses.len()];
+            let r = move |_: usize, f: f64| x[5] * f * f + 1e-3;
+            solve_ekf_g::<f64, _>(
+                &rhs,
+                2,
+                1,
+                &[0.0, x[4]],
+                &pk,
+                &f,
+                &[],
+                &[],
+                &fx.doses,
+                &fx.obs,
+                &r,
+                opts,
+            )
+            .iter()
+            .flat_map(|p| [p.ipred, p.p_obs])
+            .collect()
+        };
+        let want = run_f64(&x0);
+        let n_out = want.len();
+
+        kj::begin();
+        let lv: Vec<kj::Tr> = x0
+            .iter()
+            .enumerate()
+            .map(|(j, &v)| kj::Tr::theta(j, v))
+            .collect();
+        let mut params: Vec<kj::Tr> = fx.pk.iter().map(|&v| kj::Tr::from_f64(v)).collect();
+        for (s, l) in fx.slots.iter().zip(&lv) {
+            params[*s] = *l;
+        }
+        let one = kj::Tr::from_f64(1.0);
+        let sig2 = lv[5];
+        let r = move |_: usize, f: kj::Tr| sig2 * f * f + kj::Tr::from_f64(1e-3);
+        let pts = solve_ekf_g::<kj::Tr, _>(
+            &rhs,
+            2,
+            1,
+            &[kj::Tr::from_f64(0.0), lv[4]],
+            &params,
+            &vec![one; fx.doses.len()],
+            &[],
+            &[],
+            &fx.doses,
+            &fx.obs,
+            &r,
+            opts,
+        );
+        let regs: Vec<u32> = pts
+            .iter()
+            .flat_map(|p| [p.ipred.reg(), p.p_obs.reg()])
+            .collect();
+        let rec = kj::end(Some(regs)).expect("the filter records");
+        let plan = rec.plan(Layout::F64, 0, n_in).expect("plans");
+        let mut out = vec![0.0; n_out + 1];
+        let fwd = plan
+            .forward_layout(Layout::F64, &[], &x0, &mut out)
+            .expect("forward");
+        assert_eq!(out[n_out], 1.0, "guards hold at the recording point");
+        for (g, w) in out[..n_out].iter().zip(&want) {
+            assert_relative_eq!(*g, *w, max_relative = 1e-10);
+        }
+        // One reverse, a unit seed per output.
+        let mut du_bar = vec![0.0; n_out * n_out];
+        for o in 0..n_out {
+            du_bar[o * n_out + o] = 1.0;
+        }
+        let mut p_bar = vec![0.0; n_out * n_in];
+        assert!(plan.reverse_from(&fwd, Layout::F64, n_out, &mut [], &mut p_bar, &du_bar));
+
+        // A replay at another point is the filter there, not the recording point's.
+        let x1 = [4.0, 3.0, 12.0, 1.4, 0.08, 0.02];
+        let mut out1 = vec![0.0; n_out + 1];
+        plan.forward_layout(Layout::F64, &[], &x1, &mut out1)
+            .expect("forward");
+        if out1[n_out] == 1.0 {
+            let want1 = run_f64(&x1);
+            for (g, w) in out1[..n_out].iter().zip(&want1) {
+                assert_relative_eq!(*g, *w, max_relative = 1e-6);
+            }
+        }
+
+        let mut worst: f64 = 0.0;
+        for k in 0..n_in {
+            let h = 1e-4 * x0[k].abs();
+            let (mut xp, mut xm) = (x0, x0);
+            xp[k] += h;
+            xm[k] -= h;
+            let (fp, fm) = (run_f64(&xp), run_f64(&xm));
+            for o in 0..n_out {
+                let fd = (fp[o] - fm[o]) / (2.0 * h);
+                let ad = p_bar[o * n_in + k];
+                assert!(fd.is_finite() && ad.is_finite());
+                let scale = fd.abs().max(1e-3 * want[o].abs()).max(1e-12);
+                worst = worst.max((ad - fd).abs() / scale); // nan-ok: finite asserted above
+            }
+        }
+        eprintln!("recorded EKF gradient vs central FD, worst scaled error: {worst:e}");
+        assert!(worst < 1e-4, "worst {worst:e}");
+    }
+
+    /// The filter's derivative in a moving infusion window's `D` (a modeled `RATE=-2` dose,
+    /// handed in as `modeled`) — recorded on the recording type, one reverse — against central
+    /// differences of the `f64` filter on the doses resolved at `D ± h`, for the doses at 0 and
+    /// 6 (the second on residual drug, records both sides of each window end) and for an `SS=1`
+    /// record (`II = 6`, the window the steady-state cycle's active/quiet split) under a
+    /// `TAD`-reading right-hand side, whose quiet window's anchor is the window's negative.
+    /// Each record's window-adjacent Riccati sub-interval stays below `RICCATI_DT_MAX`, so the
+    /// `f64` filter has no sub-step-count jump inside the difference.
+    ///
+    /// Kills the window's derivative dropped from the mean solve's span, from the Riccati
+    /// sub-steps' lengths and midpoints, or from the steady-state cycle's split and `TAD` anchor.
+    #[test]
+    fn recorded_filter_follows_a_moving_infusion_window() {
+        use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+        use crate::sens::num::vm::Layout;
+        // `MM_SDE` with a modeled duration `D1` on the depot.
+        let with_d1 = |src: &str| {
+            crate::parser::model_parser::parse_model_string(
+                &src.replace(
+                    "  omega ETA_V",
+                    "  theta TVD1(1.9, 0.1, 10.0)\n  omega ETA_V",
+                )
+                .replace("  KA = TVKA\n", "  KA = TVKA\n  D1 = TVD1\n"),
+            )
+            .unwrap()
+        };
+        let plain = with_d1(MM_SDE);
+        let tad = with_d1(&MM_SDE.replace(
+            "VMAX * central / (KM + central)",
+            "VMAX * central / (KM + central) * (1 + 0.05 * TAD)",
+        ));
+        let modeled = |t: f64, ss: bool| {
+            DoseEvent::modeled(
+                t,
+                100.0,
+                1,
+                ss,
+                6.0,
+                crate::types::RateMode::ModeledDuration,
+            )
+        };
+        let obs = [
+            0.5, 1.0, 1.4, 1.8, 2.2, 2.6, 4.0, 6.5, 7.0, 7.4, 7.8, 8.2, 8.6, 10.0,
+        ];
+        let opts = tight();
+        let r = |_: usize, f: f64| 0.01 * f * f + 1e-3;
+        let d0 = 1.9;
+        let mut worst: f64 = 0.0;
+        for (label, model, doses) in [
+            (
+                "two doses",
+                &plain,
+                vec![modeled(0.0, false), modeled(6.0, false)],
+            ),
+            ("SS", &plain, vec![modeled(0.0, true), modeled(6.0, false)]),
+            (
+                "SS + TAD",
+                &tad,
+                vec![modeled(0.0, true), modeled(6.0, false)],
+            ),
+        ] {
+            let ode = model.ode_spec.as_ref().unwrap();
+            let rhs = &ProgramRhs(ode.rhs_program.as_ref().unwrap());
+            let p = &model.default_params;
+            let pk0 = (model.pk_param_fn)(&p.theta, &[0.0], &Default::default(), 0.0).values;
+            let slot = model.pk_indices[model
+                .indiv_param_names
+                .iter()
+                .position(|n| n == "D1")
+                .unwrap()];
+            let pk_at = |d: f64| {
+                let mut pk = pk0.to_vec();
+                pk[slot] = d;
+                pk
+            };
+            let resolve = |d: f64| -> Vec<DoseEvent> {
+                doses
+                    .iter()
+                    .map(|x| x.resolve_rate(&ode.dose_attr_map, &pk_at(d)))
+                    .collect()
+            };
+            let run_f64 = |d: f64| -> Vec<f64> {
+                let f = vec![1.0; doses.len()];
+                solve_ekf_g::<f64, _>(
+                    rhs,
+                    2,
+                    1,
+                    &[0.0, 0.05],
+                    &pk_at(d),
+                    &f,
+                    &[],
+                    &[],
+                    &resolve(d),
+                    &obs,
+                    &r,
+                    opts,
+                )
+                .iter()
+                .flat_map(|p| [p.ipred, p.p_obs])
+                .collect()
+            };
+            let want = run_f64(d0);
+            let n_out = want.len();
+            kj::begin();
+            let leaf = kj::Tr::theta(0, d0);
+            let mut params: Vec<kj::Tr> = pk_at(d0).iter().map(|&v| kj::Tr::from_f64(v)).collect();
+            params[slot] = leaf;
+            let rt = |_: usize, f: kj::Tr| kj::Tr::from_f64(0.01) * f * f + kj::Tr::from_f64(1e-3);
+            let pts = solve_ekf_g::<kj::Tr, _>(
+                rhs,
+                2,
+                1,
+                &[kj::Tr::from_f64(0.0), kj::Tr::from_f64(0.05)],
+                &params,
+                &vec![kj::Tr::from_f64(1.0); doses.len()],
+                &vec![Some(leaf); doses.len()],
+                &[],
+                &resolve(d0),
+                &obs,
+                &rt,
+                opts,
+            );
+            let regs: Vec<u32> = pts
+                .iter()
+                .flat_map(|p| [p.ipred.reg(), p.p_obs.reg()])
+                .collect();
+            let rec = kj::end(Some(regs)).expect("the filter records");
+            let plan = rec.plan(Layout::F64, 0, 1).expect("plans");
+            let mut out = vec![0.0; n_out + 1];
+            let fwd = plan
+                .forward_layout(Layout::F64, &[], &[d0], &mut out)
+                .expect("forward");
+            assert_eq!(
+                out[n_out], 1.0,
+                "{label}: guards hold at the recording point"
+            );
+            for (g, w) in out[..n_out].iter().zip(&want) {
+                assert_relative_eq!(*g, *w, max_relative = 1e-10);
+            }
+            let mut du_bar = vec![0.0; n_out * n_out];
+            for o in 0..n_out {
+                du_bar[o * n_out + o] = 1.0;
+            }
+            let mut p_bar = vec![0.0; n_out];
+            assert!(plan.reverse_from(&fwd, Layout::F64, n_out, &mut [], &mut p_bar, &du_bar));
+            let h = 1e-4 * d0;
+            let (fp, fm) = (run_f64(d0 + h), run_f64(d0 - h));
+            let mut moved: f64 = 0.0;
+            let mut case_worst: f64 = 0.0;
+            for o in 0..n_out {
+                let fd = (fp[o] - fm[o]) / (2.0 * h);
+                assert!(fd.is_finite() && p_bar[o].is_finite(), "{label} output {o}");
+                assert!(want[o].is_finite(), "{label} output {o}");
+                let scale = fd.abs().max(1e-3 * want[o].abs()).max(1e-12);
+                case_worst = case_worst.max((p_bar[o] - fd).abs() / scale); // nan-ok: operands asserted finite above; scale >= 1e-12
+                if o % 2 == 1 {
+                    moved = moved.max(fd.abs() / want[o].abs().max(1e-12));
+                }
+            }
+            eprintln!("{label}: worst scaled error {case_worst:e}");
+            worst = worst.max(case_worst); // nan-ok: case_worst folds asserted-finite terms
+                                           // The window is live in the covariance, not only in the mean.
+            assert!(moved > 1e-3, "{label}: D does not reach p_obs ({moved:e})");
+        }
+        eprintln!("recorded EKF moving window vs central FD, worst scaled error: {worst:e}");
+        // Measured: 7.5e-8 (two doses, SS), 6.0e-7 (SS + TAD) — the difference's own error.
+        assert!(worst < 1e-5, "worst {worst:e}");
     }
 }

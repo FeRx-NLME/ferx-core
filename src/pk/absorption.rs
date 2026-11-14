@@ -9,10 +9,10 @@
 //! ODE disposition (see `plans/absorption-models.md`). They use only
 //! `+ − * /`, `.ln()`, `.exp()`, and `ln_gamma` — all on the `PkNum`
 //! trait. The input-rate forcing is **generic over `T: PkNum`** (the `sens/`
-//! `*_g<T>` convention), so `transit()` and `igd()` models are evaluated over
-//! `Dual2` by `sens/ode_provider.rs` and get **exact analytic** FOCE/FOCEI/Bayes
+//! `*_g<T>` convention), so `transit()` and `igd()` models are recorded into
+//! compiled plans by `sens/ode_provider.rs` and get **exact analytic** FOCE/FOCEI/Bayes
 //! sensitivities, not finite differences (#430). (The Enzyme `autodiff` path
-//! these once targeted was retired in #367/#381; `Dual2` handles `max`/`min` by
+//! these once targeted was retired in #367/#381; the recording type handles `max`/`min` by
 //! comparison, so the old `f64::max`/`min` restriction no longer applies.)
 
 use crate::sens::num::PkNum;
@@ -541,6 +541,45 @@ pub enum PreparedInputRate<T = f64> {
     FirstOrder { ka: T },
 }
 
+impl<T: Copy> PreparedInputRate<T> {
+    /// The same constants through `f` (a lift to a jet type).
+    pub(crate) fn map<U>(self, f: impl Fn(T) -> U) -> PreparedInputRate<U> {
+        use PreparedInputRate::*;
+        match self {
+            Transit {
+                ktr,
+                ln_ktr,
+                n,
+                ln_gamma_np1,
+            } => Transit {
+                ktr: f(ktr),
+                ln_ktr: f(ln_ktr),
+                n: f(n),
+                ln_gamma_np1: f(ln_gamma_np1),
+            },
+            InverseGaussian {
+                mat,
+                c0,
+                inv_2cv2mat,
+            } => InverseGaussian {
+                mat: f(mat),
+                c0: f(c0),
+                inv_2cv2mat: f(inv_2cv2mat),
+            },
+            Weibull { beta, ln_td, c0 } => Weibull {
+                beta: f(beta),
+                ln_td: f(ln_td),
+                c0: f(c0),
+            },
+            ZeroOrder { dur, inv_dur } => ZeroOrder {
+                dur: f(dur),
+                inv_dur: f(inv_dur),
+            },
+            FirstOrder { ka } => FirstOrder { ka: f(ka) },
+        }
+    }
+}
+
 impl<T: PkNum> PreparedInputRate<T> {
     /// Domain floor for the strictly-positive input-rate parameters (transit
     /// `mtt`; inverse-Gaussian `mat`, `cv2`; Weibull `td`, `beta`) when clamping a
@@ -598,7 +637,11 @@ impl<T: PkNum> PreparedInputRate<T> {
     #[inline]
     fn transit(n: T, mtt: T) -> Self {
         let mtt = mtt.guard_floor(Self::MIN_PARAM);
-        let n = if n.val() >= 0.0 { n } else { T::from_f64(0.0) };
+        let n = if n.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
+            n
+        } else {
+            T::from_f64(0.0)
+        };
         let ktr = (n + T::from_f64(1.0)) / mtt;
         PreparedInputRate::Transit {
             ktr,
@@ -692,7 +735,9 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// sensitivities for `T = Dual2<N>` with no new special function (#430).
     #[inline]
     pub fn rate(&self, tad: T, dose: T) -> T {
-        if tad.val() <= 0.0 || dose.val() <= 0.0 {
+        if tad.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+            || dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        {
             return T::from_f64(0.0);
         }
         match *self {
@@ -740,7 +785,7 @@ impl<T: PkNum> PreparedInputRate<T> {
             // break at `tad = dur` so the adaptive solver resolves the step rather
             // than smearing it across one RK45 step.
             PreparedInputRate::ZeroOrder { dur, inv_dur } => {
-                if tad.val() <= dur.val() {
+                if tad.br_cmp(crate::sens::num::BranchCmp::Le, dur) {
                     dose * inv_dur
                 } else {
                     T::from_f64(0.0)
@@ -764,7 +809,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// provider); Weibull / first-order → elementary — so it carries exact `Dual2` sensitivities.
     #[inline]
     pub fn cdf(&self, s: T) -> T {
-        if s.val() <= 0.0 {
+        if s.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
             return T::from_f64(0.0);
         }
         match *self {
@@ -798,7 +843,7 @@ impl<T: PkNum> PreparedInputRate<T> {
                 // window) is rejected upstream (a spanning-window convolution, a follow-up), so
                 // this arm is defined only for completeness / a well-typed match.
                 let frac = s * inv_dur;
-                if frac.val() >= 1.0 {
+                if frac.br_cmp_c(crate::sens::num::BranchCmp::Ge, 1.0) {
                     T::from_f64(1.0)
                 } else {
                     frac
@@ -806,6 +851,45 @@ impl<T: PkNum> PreparedInputRate<T> {
             }
             PreparedInputRate::FirstOrder { ka } => T::from_f64(1.0) - (-(ka * s)).exp(),
         }
+    }
+
+    /// `G(s)` for an age `s` that is `≥ 0` by construction (a stage time minus an onset the
+    /// segment lies after): [`Self::cdf`] away from zero, and at the tie `s = 0` — the first
+    /// stage of a segment that opens at the onset — the right-hand Taylor continuation of `G`
+    /// through the jet of `s` ([`Self::cdf_onset_continued`]), which [`Self::cdf`]'s `s ≤ 0`
+    /// guard cannot give: `∂G/∂s = g(0⁺)` is nonzero for `first_order`, `Transit n = 0` and
+    /// `Weibull β = 1`, and the onset moves with the inputs when the lag or the window does.
+    /// `s < 0` (a stage rounded below its segment) is `0`.
+    #[inline]
+    fn cdf_from_onset(&self, s: T) -> T {
+        use crate::sens::num::BranchCmp::{Eq, Gt};
+        let zero = T::from_f64(0.0);
+        if T::RECORDS_BRANCHES {
+            // A recording type reads these inside an ODE step, where the stage time moves: a
+            // selection, with the kernel evaluated at a safe age before it.
+            let safe = T::select_if(Gt, s, zero, s, T::from_f64(1.0));
+            let away = T::select_if(Gt, s, zero, self.cdf(safe), zero);
+            T::select_if(Eq, s, zero, self.cdf_onset_continued(s), away)
+        } else if s.br_cmp_c(Gt, 0.0) {
+            self.cdf(s)
+        } else if s.br_cmp_c(Eq, 0.0) && !s.is_constant() {
+            self.cdf_onset_continued(s)
+        } else {
+            zero
+        }
+    }
+
+    /// `G(s)` for an `s` whose value is zero (its jet is the onset's own shift): the integral of
+    /// [`Self::rate_onset_continued`] over `[0, s]`, by Simpson's rule — exact, because the
+    /// continued density is a polynomial of degree ≤ 3 in the jet and a value-zero `s` carries
+    /// no derivative above the fourth. Exactly as exact as that continuation (a `NaN` where it
+    /// declines).
+    pub(crate) fn cdf_onset_continued(&self, s: T) -> T {
+        let tau = s - s.value_only();
+        let one = T::from_f64(1.0);
+        let g = |x: T| self.rate_onset_continued(x, one);
+        tau * T::from_f64(1.0 / 6.0)
+            * (g(T::from_f64(0.0)) + T::from_f64(4.0) * g(tau * T::from_f64(0.5)) + g(tau))
     }
 
     /// Appearance rate for a dose delivered as a **zero-order infusion** of duration `t_inf`
@@ -819,20 +903,21 @@ impl<T: PkNum> PreparedInputRate<T> {
     ///
     /// which is mass-exact (`∫₀^∞ R_in_inf dt = dose`) and reduces to the bolus [`Self::rate`] as
     /// `t_inf → 0`. `tad ≤ 0` / `dose ≤ 0` / `t_inf ≤ 0 ⇒ 0`. Carries exact `Dual2` sensitivities
-    /// via [`Self::cdf`]; the kink at `tad = t_inf` is a *fixed* boundary (the data-`RATE` window
-    /// does not move with the PK params), placed as a break on the ODE timeline by the caller.
+    /// via [`Self::cdf`].
+    ///
+    /// `tail_age` is the time since the window end for a segment that lies after it, `None`
+    /// for one before it: the window end is a break of every timeline and a kink of `R_in_inf`
+    /// (`∂R/∂T` jumps by `(dose/T)·g(0)`), so the segment — not each stage's rounding of
+    /// `tad − T` — says which side the stage is on, and the age is `≥ 0` on it.
     #[inline]
-    pub fn rate_infused(&self, tad: T, dose: T, t_inf: T) -> T {
-        if tad.val() <= 0.0 || dose.val() <= 0.0 || t_inf.val() <= 0.0 {
+    pub fn rate_infused(&self, tad: T, dose: T, t_inf: T, tail_age: Option<T>) -> T {
+        if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+            || t_inf.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        {
             return T::from_f64(0.0);
         }
-        let g_hi = self.cdf(tad);
-        let lower = tad - t_inf;
-        let g_lo = if lower.val() > 0.0 {
-            self.cdf(lower)
-        } else {
-            T::from_f64(0.0)
-        };
+        let g_hi = self.cdf_from_onset(tad);
+        let g_lo = tail_age.map_or(T::from_f64(0.0), |age| self.cdf_from_onset(age));
         (g_hi - g_lo) * dose / t_inf
     }
 
@@ -850,22 +935,30 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// (`!PkNum::TAYLOR2_EXACT`) gets `NaN` there, so its recording declines rather than
     /// truncating.
     pub(crate) fn rate_onset_continued(&self, tau: T, dose: T) -> T {
-        if dose.val() <= 0.0 {
+        if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
             return T::from_f64(0.0);
         }
         let exp_decay = |k: T| dose * k * (-(k * tau)).exp();
         match *self {
             PreparedInputRate::FirstOrder { ka } => return exp_decay(ka),
-            PreparedInputRate::Transit { ktr, n, .. } if n.val() <= 0.0 && n.is_constant() => {
+            PreparedInputRate::Transit { ktr, n, .. }
+                if n.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) && n.is_constant() =>
+            {
                 return exp_decay(ktr);
             }
-            PreparedInputRate::Transit { n, .. } if n.val() >= 4.0 => return T::from_f64(0.0),
+            PreparedInputRate::Transit { n, .. }
+                if n.br_cmp_c(crate::sens::num::BranchCmp::Ge, 4.0) =>
+            {
+                return T::from_f64(0.0)
+            }
             PreparedInputRate::Weibull { beta, c0, .. }
-                if beta.val() == 1.0 && beta.is_constant() =>
+                if beta.br_cmp_c(crate::sens::num::BranchCmp::Eq, 1.0) && beta.is_constant() =>
             {
                 return exp_decay(c0.exp());
             }
-            PreparedInputRate::Weibull { beta, .. } if beta.val() >= 5.0 => {
+            PreparedInputRate::Weibull { beta, .. }
+                if beta.br_cmp_c(crate::sens::num::BranchCmp::Ge, 5.0) =>
+            {
                 return T::from_f64(0.0);
             }
             PreparedInputRate::InverseGaussian { .. } | PreparedInputRate::ZeroOrder { .. } => {
@@ -901,12 +994,12 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// path.
     #[inline]
     pub(crate) fn rate_at_zero(&self, dose: T) -> T {
-        if dose.val() <= 0.0 {
+        if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
             return T::from_f64(0.0);
         }
         match *self {
             PreparedInputRate::Transit { ktr, n, .. } => {
-                if n.val() <= 0.0 {
+                if n.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
                     dose * ktr
                 } else {
                     T::from_f64(0.0)
@@ -914,10 +1007,10 @@ impl<T: PkNum> PreparedInputRate<T> {
             }
             PreparedInputRate::InverseGaussian { .. } => T::from_f64(0.0),
             PreparedInputRate::Weibull { beta, c0, .. } => {
-                let b = beta.val();
-                if b > 1.0 {
+                use crate::sens::num::BranchCmp::{Eq, Gt};
+                if beta.br_cmp_c(Gt, 1.0) {
                     T::from_f64(0.0)
-                } else if b == 1.0 {
+                } else if beta.br_cmp_c(Eq, 1.0) {
                     dose * c0.exp()
                 } else {
                     // β < 1: the true onset is +∞ (an integrable spike). Callers
@@ -964,16 +1057,16 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// (as `rate_at_zero` does), since the slope is discontinuous across each.
     #[inline]
     pub(crate) fn rate_dtad_at_zero(&self, dose: T) -> T {
-        if dose.val() <= 0.0 {
+        if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
             return T::from_f64(0.0);
         }
         match *self {
             PreparedInputRate::Transit { ktr, n, .. } => {
-                let nv = n.val();
-                if nv <= 0.0 {
+                use crate::sens::num::BranchCmp::{Eq, Le};
+                if n.br_cmp_c(Le, 0.0) {
                     // n ≤ 0 (or clamped): pure first-order kernel (rate ktr), slope −dose·ktr².
                     -dose * ktr * ktr
-                } else if nv == 1.0 {
+                } else if n.br_cmp_c(Eq, 1.0) {
                     // n = 1 (Erlang-2): onset value 0 (continuous) but slope jumps to
                     // +dose·ktr² — a curvature saltation with no first-order onset jump.
                     dose * ktr * ktr
@@ -986,10 +1079,10 @@ impl<T: PkNum> PreparedInputRate<T> {
             // Onset value and every derivative vanish (essential singularity).
             PreparedInputRate::InverseGaussian { .. } => T::from_f64(0.0),
             PreparedInputRate::Weibull { beta, c0, .. } => {
-                let b = beta.val();
-                if b > 1.0 {
+                use crate::sens::num::BranchCmp::{Eq, Gt};
+                if beta.br_cmp_c(Gt, 1.0) {
                     T::from_f64(0.0)
-                } else if b == 1.0 {
+                } else if beta.br_cmp_c(Eq, 1.0) {
                     // First-order with ka = 1/Td = exp(c0): slope −dose·(1/Td)².
                     let ka = c0.exp();
                     -dose * ka * ka
@@ -1031,7 +1124,7 @@ mod tests {
         ];
         for prep in cases {
             for &tad in &[0.5, 1.0, 2.5, 3.0, 4.0, 7.0] {
-                let infused = prep.rate_infused(tad, d, t_inf);
+                let infused = prep.rate_infused(tad, d, t_inf, (tad > t_inf).then(|| tad - t_inf));
                 let mut superposed = 0.0;
                 for k in 0..n {
                     let tk = (k as f64 + 0.5) * t_inf / n as f64; // sub-dose midpoints
@@ -1047,6 +1140,66 @@ mod tests {
         }
     }
 
+    /// The kernel's CDF continued through the onset (`cdf_onset_continued`): for a value-zero
+    /// age whose jet is the onset's own shift, `G(s) = Σ g⁽ᵐ⁻¹⁾(0)·sᵐ/m!`. Pinned against the
+    /// closed forms `G'(0) = g(0)`, `G''(0) = g'(0)` of the kernels with a finite onset
+    /// (`first_order`, `Transit n = 0`, `Weibull β = 1`), and zero for the kernels whose onset
+    /// is flat to every order (`inverse_gaussian`).
+    #[test]
+    fn cdf_onset_continued_has_the_kernels_onset_derivatives() {
+        use crate::sens::dual2::Dual2;
+        type D = Dual2<1>;
+        let s = D::var(0.0, 0);
+        let ka = 0.7;
+        let cases: Vec<(PreparedInputRate<D>, f64, f64)> = vec![
+            // G = 1 − exp(−ka·s): G' = ka, G'' = −ka².
+            (
+                PreparedInputRate::first_order(D::constant(ka)),
+                ka,
+                -ka * ka,
+            ),
+            (
+                PreparedInputRate::transit(D::constant(0.0), D::constant(1.0 / ka)),
+                ka,
+                -ka * ka,
+            ),
+            (
+                PreparedInputRate::weibull(D::constant(1.0 / ka), D::constant(1.0)),
+                ka,
+                -ka * ka,
+            ),
+            (
+                PreparedInputRate::inverse_gaussian(D::constant(2.0), D::constant(0.3)),
+                0.0,
+                0.0,
+            ),
+        ];
+        for (prep, g1, g2) in cases {
+            let g = prep.cdf_onset_continued(s);
+            assert_eq!(g.val(), 0.0, "{prep:?}");
+            assert!(
+                (g.grad[0] - g1).abs() < 1e-12,
+                "{prep:?}: G' {} vs {g1}",
+                g.grad[0]
+            );
+            assert!(
+                (g.hess[0][0] - g2).abs() < 1e-12,
+                "{prep:?}: G'' {} vs {g2}",
+                g.hess[0][0]
+            );
+            // `rate_infused` at the tie `tad = T`, whose tail age is the value-zero `s`: the
+            // jet in the window's end is `−(dose/T)·G'(0)` — what `cdf`'s `s ≤ 0` guard drops.
+            let (dose, t_inf) = (D::constant(100.0), D::constant(3.0));
+            let r = prep.rate_infused(D::constant(3.0), dose, t_inf, Some(s));
+            let head = prep.rate_infused(D::constant(3.0), dose, t_inf, None);
+            assert!(
+                (r.grad[0] - (head.grad[0] - 100.0 / 3.0 * g1)).abs() < 1e-12,
+                "{prep:?}: tie jet {}",
+                r.grad[0]
+            );
+        }
+    }
+
     /// `∫₀^∞ R_in_inf dt = dose` — the infusion delivers the full (bioavailable) mass, exactly
     /// like a bolus, regardless of the window `T`. Trapezoidal over a long horizon.
     #[test]
@@ -1055,9 +1208,10 @@ mod tests {
         let (d, t_inf, dt, upper) = (100.0_f64, 4.0_f64, 1e-3_f64, 200.0_f64);
         let steps = (upper / dt) as usize;
         let mut sum = 0.0;
-        let mut prev = prep.rate_infused(0.0, d, t_inf);
+        let mut prev = prep.rate_infused(0.0, d, t_inf, None);
         for i in 1..=steps {
-            let cur = prep.rate_infused(i as f64 * dt, d, t_inf);
+            let tad = i as f64 * dt;
+            let cur = prep.rate_infused(tad, d, t_inf, (tad > t_inf).then(|| tad - t_inf));
             sum += 0.5 * (prev + cur) * dt;
             prev = cur;
         }
@@ -1159,7 +1313,7 @@ mod tests {
 
     /// Dual-path counterpart to `transit_rate_is_finite_for_domain_excursions`:
     /// the same transient excursions (`mtt ≤ 0`, `n < 0`, `NaN`), but evaluated
-    /// over `Dual2` (here `DualMixed`), must yield a finite **value, gradient, and
+    /// over `Dual2`, must yield a finite **value, gradient, and
     /// Hessian** — not merely a finite `f64` value. This is the failure mode that
     /// turns a mid-search excursion *on the analytic FOCE/FOCEI/Bayes path* into a
     /// `NaN` gradient → `NaN` OFV (the f64 value test above can't see it — it has
@@ -1172,8 +1326,8 @@ mod tests {
     /// finite with both parameters' jets live.
     #[test]
     fn transit_dual_jets_finite_at_domain_excursions() {
-        use crate::sens::dual_mixed::DualMixed;
-        type D = DualMixed<2, 2>;
+        use crate::sens::dual2::Dual2;
+        type D = Dual2<2>;
         let forcing = InputRateForcing {
             cmt: 0,
             kind: InputRateKind::Transit,
@@ -1691,8 +1845,8 @@ mod tests {
     /// exactly flat (zero gradient) since the clamp pins it to a constant.
     #[test]
     fn weibull_dual_jets_finite_at_domain_excursions() {
-        use crate::sens::dual_mixed::DualMixed;
-        type D = DualMixed<2, 2>;
+        use crate::sens::dual2::Dual2;
+        type D = Dual2<2>;
         let forcing = InputRateForcing {
             cmt: 1,
             kind: InputRateKind::Weibull,
@@ -1752,8 +1906,8 @@ mod tests {
     /// FD-only checks miss. Covers β < 1, β = 1, β > 1.
     #[test]
     fn weibull_dual_gradient_matches_central_fd() {
-        use crate::sens::dual_mixed::DualMixed;
-        type D = DualMixed<2, 2>;
+        use crate::sens::dual2::Dual2;
+        type D = Dual2<2>;
         let forcing = InputRateForcing {
             cmt: 1,
             kind: InputRateKind::Weibull,
@@ -2251,8 +2405,8 @@ mod tests {
     /// fraction channel) would surface here in the default `--features ci` build.
     #[test]
     fn first_order_dual_gradient_matches_central_fd() {
-        use crate::sens::dual_mixed::DualMixed;
-        type D = DualMixed<2, 2>;
+        use crate::sens::dual2::Dual2;
+        type D = Dual2<2>;
         let forcing = InputRateForcing {
             cmt: 0,
             kind: InputRateKind::FirstOrder,

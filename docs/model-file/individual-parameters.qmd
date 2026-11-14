@@ -492,7 +492,7 @@ quantity (`MTT`, `ALAG1`, …) is read at its own dose record and is unaffected.
 
 On closed-form (non-IOV) 1-/2-/3-cpt models, a `TIME`-switched structural
 parameter gets the **exact analytic FOCE/FOCEI gradient** (the per-event time is
-threaded into the same event-driven `Dual2`/`Dual1` sensitivity walk used for
+threaded into the same event-driven sensitivity walk used for
 time-varying covariates), not finite differences — so the optimiser, its standard
 errors, and NONMEM's `METHOD=1 INTER` agree. Fitting a 60-subject 1-cpt IV bolus
 simulated with a CL switch at `TIME = 45` (`IF (TIME.GT.45) CL = TVCL_LATE …`):

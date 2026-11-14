@@ -52,54 +52,13 @@ const UNBOUND_AFTER_CL: &str = r"
   DV ~ proportional(PROP_ERR)
 ";
 
-/// The same model with `KEL = CL / V` in place of `S`. `KEL` is not
-/// `g(θ, cov)·exp(η)`, so the #1669 measured log-normal flag is false and **every**
-/// subject routes to finite differences — which makes the FD-fallback warning fire.
-/// It is here to prove the `fallback.is_empty()` assertion below can observe an
-/// all-FD population at all: that warning is only emitted for a mixed population
-/// *or* a model that reports analytic, and a guard nothing can trip is not a guard.
-/// The inner-FD control: a lag time, with subject 0 given a steady-state infusion into the
-/// depot below (`ss_infusion_population`). The infusion routes that subject to the event
-/// walk, which declines an SS infusion under a lag, so it takes the finite-difference inner
-/// gradient. (Until #486 the control was an unused derived intermediate, `KEL = CL / V`,
-/// which every subject routed to FD on; the adjoint serves that model.)
-const LAGGED: &str = r"
-[parameters]
-  theta THCL(0.134, 0.001, 10.0)
-  theta THV(8.11, 0.1, 500.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_V ~ 0.04
-  sigma PROP_ERR ~ 0.02 (sd)
-[individual_parameters]
-  CL = THCL * exp(ETA_CL)
-  V = THV * exp(ETA_V)
-[structural_model]
-  pk one_cpt_oral(cl=CL, v=V, ka=1.0, lagtime=0.5)
-[error_model]
-  DV ~ proportional(PROP_ERR)
-";
 fn warfarin() -> Population {
     read_nonmem_csv(Path::new("data/warfarin.csv"), None, None).expect("warfarin data must load")
 }
 
-/// Warfarin with subject 0's dose a steady-state infusion into the depot.
-fn ss_infusion_population() -> Population {
-    let mut pop = warfarin();
-    let d = &mut pop.subjects[0].doses[0];
-    *d = ferx_core::DoseEvent::new(d.time, d.amt, 1, 50.0, true, 24.0);
-    pop
-}
-
 /// OFV at the initial parameters under one inner-gradient route.
 fn eval_only_ofv(src: &str, gradient_method: GradientMethod) -> (f64, Vec<String>) {
-    eval_only_ofv_on(src, gradient_method, &warfarin())
-}
-
-fn eval_only_ofv_on(
-    src: &str,
-    gradient_method: GradientMethod,
-    population: &Population,
-) -> (f64, Vec<String>) {
+    let population = &warfarin();
     let model = parse_model_string(src).expect("model must parse");
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
@@ -124,28 +83,22 @@ fn an_unbound_parameters_slot_does_not_move_the_objective() {
     let (analytic, warnings) = eval_only_ofv(UNBOUND_AFTER_CL, GradientMethod::Auto);
     let (fd, _) = eval_only_ofv(UNBOUND_AFTER_CL, GradientMethod::Fd);
 
-    // The analytic arm must actually have run the analytic route; if every subject
-    // fell back to finite differences the comparison is FD against FD and cannot
-    // see the defect at all (AGENTS.md: ask which engine each fixture ran on).
+    // The analytic arm must actually have run the analytic route; if a subject fell back to
+    // finite differences the comparison is FD against FD and cannot see the defect at all
+    // (AGENTS.md: ask which engine each fixture ran on). Since #2786 no model shape declines
+    // the compiled plan, so the only way onto FD under `auto` is a plan that fails at run
+    // time, and both warnings that would report it say "finite-difference": the inner one
+    // ("N of M subjects use finite-difference inner gradients") and `W_PLAN_FD_FALLBACK`.
+    // No public fixture reaches either any more, so their wording is pinned where a plan
+    // failure can be forced: `fd_fallback_warning_counts_the_route_that_runs`
+    // (`estimation/inner_optimizer_tests.rs`) and `outer_fd_fallback_warning_tests.rs`.
     let fallback: Vec<&String> = warnings
         .iter()
-        .filter(|w| w.contains("finite-difference inner gradient"))
+        .filter(|w| w.contains("finite-difference"))
         .collect();
     assert!(
         fallback.is_empty(),
-        "the Auto arm must stay on the analytic inner gradient: {fallback:?}"
-    );
-    // The other side of that gate, in the same test: a subject the adjoint declines takes
-    // the FD inner gradient, so the warning this filter looks for must appear. Without this
-    // the guard above is satisfied by a warning the fit never emits, by a reworded message,
-    // or by an eval-only fit that skips the check.
-    let (_, fd_warnings) =
-        eval_only_ofv_on(LAGGED, GradientMethod::Auto, &ss_infusion_population());
-    assert!(
-        fd_warnings
-            .iter()
-            .any(|w| w.contains("finite-difference inner gradient")),
-        "a declining subject must report it, or the guard above is dead: {fd_warnings:?}"
+        "the Auto arm must stay on the analytic route: {fallback:?}"
     );
 
     // Measured on the reference platform — `tools/linux-test.sh --jobs 2 -- test

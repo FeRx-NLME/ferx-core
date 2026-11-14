@@ -102,7 +102,12 @@ pub(crate) fn hazard_and_cum_hazard_g<T: PkNum>(
             let gt = gamma * k(t);
             let exp_gt = gt.exp();
             let h_val = alpha * exp_gt * exp_loghr;
-            if gt.val().abs() < GOMPERTZ_SERIES_BELOW {
+            if gt.br_abs_lt(GOMPERTZ_SERIES_BELOW) {
+                // A recording type (#2786) records `exprel` as one primitive: the series'
+                // values would be literals of the point it saw.
+                if T::RECORDS_BRANCHES {
+                    return (h_val, alpha * exp_loghr * (k(t) * gt.exprel(4)));
+                }
                 // Near γt = 0 the quotient cancels (0/0 at γ = 0): H = α·e^loghr·t·exprel(γt)
                 // with exprel(x) = (eˣ − 1)/x from its series, entered with its first two
                 // derivatives. The limit written as its value (`γ = 0 ⇒ H = α·t`) would

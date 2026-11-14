@@ -7,33 +7,38 @@
 // the wide signatures are inherent, not a smell.
 #![allow(clippy::too_many_arguments)]
 
-use super::num::PkNum;
+use super::num::{bateman, bateman_ss, ss_factor, PkNum};
+use super::one_cpt::{modal_sum, mode_infusion, mode_infusion_ss};
 use crate::pk::analytical_absorption::{convolve_2cpt, IgAbsorption, TransitAbsorption};
 use crate::types::DoseEvent;
 
-/// Macro-rate constants `(α, β, k21)` from the PK params, via Vieta's `β = d/α`
-/// (avoids catastrophic cancellation). Branches on `.val()` only.
+/// Macro-rate constants `(α, β, k21)` from the PK params ([`quadratic_roots`]).
 pub(crate) fn macro_rates_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> (T, T, T) {
     let k10 = cl / v1;
     let k12 = q / v1;
     let k21 = q / v2;
-    let s = k10 + k12 + k21;
-    let d = k10 * k21;
+    let (alpha, beta) = quadratic_roots(k10 + k12 + k21, k10 * k21);
+    (alpha, beta, k21)
+}
+
+/// The roots `α ≥ β` of `λ² − s·λ + d` (`s, d ≥ 0`), the larger as a sum of positives and the
+/// smaller by Vieta's `β = d/α`, so neither cancels. Branches on `.val()` only.
+pub(crate) fn quadratic_roots<T: PkNum>(s: T, d: T) -> (T, T) {
     let disc = {
         let x = s * s - T::from_f64(4.0) * d;
-        if x.val() > 0.0 {
+        if x.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
             x.sqrt()
         } else {
             T::from_f64(0.0)
         }
     };
     let alpha = (s + disc) * T::from_f64(0.5);
-    let beta = if alpha.val() > 1e-30 {
+    let beta = if alpha.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1e-30) {
         d / alpha
     } else {
         T::from_f64(0.0)
     };
-    (alpha, beta, k21)
+    (alpha, beta)
 }
 
 /// A two-compartment disposition: the micro parameters and their macro rates
@@ -63,6 +68,21 @@ impl<T: PkNum> TwoCpt<T> {
             k21,
         }
     }
+
+    /// The disposition modes `(c, λ)` of the central impulse response `(1/V1)·Σ c·e^{−λt}`:
+    /// `c_α = (α − k21)/(α − β)`, `c_β = (k21 − β)/(α − β)` — both `≥ 0`, so no closed form
+    /// built on them cancels. `None` at `α = β`, which needs `CL = Q = 0` (a non-physical
+    /// disposition the discriminant clamp reaches only from `Q < 0`).
+    pub(crate) fn modes(&self) -> Option<[(T, T); 2]> {
+        let diff = self.alpha - self.beta;
+        if diff.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
+            return None;
+        }
+        Some([
+            ((self.alpha - self.k21) / diff, self.alpha),
+            ((self.k21 - self.beta) / diff, self.beta),
+        ])
+    }
 }
 
 /// Shared domain guard for the analytic 2-cpt transit closed forms (#386 PR D):
@@ -85,21 +105,21 @@ pub(crate) fn transit_2cpt_domain_ok<T: PkNum>(
     n: T,
     mtt: T,
 ) -> Option<(T, T, T)> {
-    if v1.val() <= 0.0
-        || cl.val() <= 0.0
-        || q.val() < 0.0
-        || v2.val() <= 0.0
-        || n.val() < 0.0
-        || mtt.val() <= 0.0
+    if v1.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || cl.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || q.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
+        || v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || n.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
+        || mtt.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
     {
         return None;
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
-    if (alpha - beta).val().abs() < 1e-12 {
+    if alpha.br_cmp(crate::sens::num::BranchCmp::Le, beta) {
         return None;
     }
     let ktr = (n + T::from_f64(1.0)) / mtt;
-    if !(alpha.val() < ktr.val()) {
+    if !(alpha.br_cmp(crate::sens::num::BranchCmp::Lt, ktr)) {
         return None;
     }
     Some((alpha, beta, k21))
@@ -127,16 +147,9 @@ pub fn two_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v1: T, q: T, v2: T)
 /// [`two_cpt_iv_bolus_amt_g`] over a precomputed disposition (its macro rates computed once per
 /// parameter set, not once per dose and observation).
 pub(crate) fn two_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &TwoCpt<T>) -> T {
-    let TwoCpt {
-        cl,
-        v1,
-        alpha,
-        beta,
-        k21,
-        ..
-    } = *d;
+    let TwoCpt { cl, v1, .. } = *d;
 
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -144,19 +157,10 @@ pub(crate) fn two_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &TwoCpt<T>) -> T
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-
-    let diff = alpha - beta;
-    // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
-    // poles, undefined at exact root coalescence. Measure-zero for physical PK
-    // params (distinct real eigenvalues); return 0 rather than the confluent
-    // (A+B·t)·e^{−αt} limit — a deliberate edge (PR #381, review #1).
-    if diff.val().abs() < 1e-12 {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let amt_v1 = amt / v1;
-    let a = amt_v1 * (alpha - k21) / diff;
-    let b = amt_v1 * (k21 - beta) / diff;
-    a * (-(alpha * t)).exp() + b * (-(beta * t)).exp()
+    };
+    (amt / v1) * modal_sum(&m, |lam| (-(lam * t)).exp())
 }
 
 /// 2-cpt infusion (zero-order input, duration `dur`, rate `rate`).
@@ -182,16 +186,9 @@ pub(crate) fn two_cpt_infusion_d<T: PkNum>(
     t: T,
     d: &TwoCpt<T>,
 ) -> T {
-    let TwoCpt {
-        cl,
-        v1,
-        alpha,
-        beta,
-        k21,
-        ..
-    } = *d;
+    let TwoCpt { cl, v1, .. } = *d;
 
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -202,23 +199,11 @@ pub(crate) fn two_cpt_infusion_d<T: PkNum>(
     if dur <= 0.0 {
         return two_cpt_iv_bolus_d(amt, t, d);
     }
-
-    let diff = alpha - beta;
-    if diff.val().abs() < 1e-12 || alpha.val().abs() < 1e-12 || beta.val().abs() < 1e-12 {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let r_v1 = T::from_f64(rate) / v1;
-    let a_coeff = r_v1 * (alpha - k21) / (diff * alpha);
-    let b_coeff = r_v1 * (k21 - beta) / (diff * beta);
-    let one = T::from_f64(1.0);
-    let dd = T::from_f64(dur);
-    if t.val() <= dur {
-        a_coeff * (one - (-(alpha * t)).exp()) + b_coeff * (one - (-(beta * t)).exp())
-    } else {
-        let dt = t - dd;
-        a_coeff * (one - (-(alpha * dd)).exp()) * (-(alpha * dt)).exp()
-            + b_coeff * (one - (-(beta * dd)).exp()) * (-(beta * dt)).exp()
-    }
+    };
+    let (r_v1, dd) = (T::from_f64(rate) / v1, T::from_f64(dur));
+    modal_sum(&m, |lam| mode_infusion(lam, r_v1, dd, t))
 }
 
 /// 2-cpt zero-order (box-car) absorption of duration `dur` — the closed-form
@@ -239,7 +224,7 @@ pub fn two_cpt_zero_order_g<T: PkNum>(
     dur: T,
     f_bio: T,
 ) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -247,29 +232,18 @@ pub fn two_cpt_zero_order_g<T: PkNum>(
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if dur.val() <= 0.0 {
+    if dur.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return T::from_f64(0.0);
     }
-    let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
-    let diff = alpha - beta;
-    if diff.val().abs() < 1e-12 || alpha.val().abs() < 1e-12 || beta.val().abs() < 1e-12 {
+    let Some(m) = TwoCpt::new(cl, v1, q, v2).modes() else {
         return T::from_f64(0.0);
-    }
-    let d = f_bio * T::from_f64(amt);
-    let r_v1 = d / (dur * v1);
-    let a_coeff = r_v1 * (alpha - k21) / (diff * alpha);
-    let b_coeff = r_v1 * (k21 - beta) / (diff * beta);
-    let one = T::from_f64(1.0);
-    if t.val() <= dur.val() {
-        a_coeff * (one - (-(alpha * t)).exp()) + b_coeff * (one - (-(beta * t)).exp())
-    } else {
-        let dt = t - dur;
-        a_coeff * (one - (-(alpha * dur)).exp()) * (-(alpha * dt)).exp()
-            + b_coeff * (one - (-(beta * dur)).exp()) * (-(beta * dt)).exp()
-    }
+    };
+    let r_v1 = f_bio * T::from_f64(amt) / (dur * v1);
+    modal_sum(&m, |lam| mode_infusion(lam, r_v1, dur, t))
 }
 
-/// 2-cpt oral (first-order absorption), with `ka ≈ α`/`ka ≈ β` L'Hôpital limits.
+/// 2-cpt oral (first-order absorption): `(F·D·KA/V1)·Σ c·B(λ, KA, t)` over the disposition
+/// modes, the Bateman function one smooth function through `KA = λ` (`bateman`).
 pub fn two_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v1: T, q: T, v2: T, ka: T, f_bio: T) -> T {
     two_cpt_oral_d(amt, t, &TwoCpt::new(cl, v1, q, v2), ka, f_bio)
 }
@@ -291,16 +265,10 @@ pub fn two_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v1: T, q: T, v2: T, ka:
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn two_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &TwoCpt<T>, ka: T, f_bio: T) -> T {
-    let TwoCpt {
-        cl,
-        v1,
-        alpha,
-        beta,
-        k21,
-        ..
-    } = *d;
+    let TwoCpt { cl, v1, .. } = *d;
 
-    if t.val() < 0.0 {
+    use crate::sens::num::BranchCmp as B;
+    if t.br_cmp_c(B::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -308,40 +276,14 @@ pub(crate) fn two_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &TwoCpt<T>, ka: T, f
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if ka.val() <= 0.0 {
+    if ka.br_cmp_c(B::Le, 0.0) {
         return T::from_f64(0.0);
     }
 
-    let diff = alpha - beta;
-    // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
-    // poles, undefined at exact root coalescence. Measure-zero for physical PK
-    // params (distinct real eigenvalues); return 0 rather than the confluent
-    // (A+B·t)·e^{−αt} limit — a deliberate edge (PR #381, review #1).
-    if diff.val().abs() < 1e-12 {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let d = f_bio * amt * ka / v1;
-    let tt = t;
-
-    // Combined ka→α (or ka→β) L'Hôpital limit: the e^{-ka·t} term shares the
-    // 1/(ka-α) pole and is folded in, contributing −(k21-β)/diff²·e^{-αt} (the
-    // piece a t-only limit drops). Mirror of `pk::two_compartment::two_cpt_oral_f`.
-    let p = if (ka.val() - alpha.val()).abs() < 1e-6 {
-        d * (-(alpha * tt)).exp() * ((alpha - k21) / diff * tt - (k21 - beta) / (diff * diff))
-    } else {
-        d * (k21 - alpha) / ((ka - alpha) * (beta - alpha)) * (-(alpha * tt)).exp()
     };
-    let q_val = if (ka.val() - beta.val()).abs() < 1e-6 {
-        d * (-(beta * tt)).exp() * ((k21 - beta) / diff * tt - (k21 - alpha) / (diff * diff))
-    } else {
-        d * (k21 - beta) / ((ka - beta) * (alpha - beta)) * (-(beta * tt)).exp()
-    };
-    let r = if (ka.val() - alpha.val()).abs() < 1e-6 || (ka.val() - beta.val()).abs() < 1e-6 {
-        T::from_f64(0.0)
-    } else {
-        d * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-(ka * tt)).exp()
-    };
-    p + q_val + r
+    (f_bio * amt * ka / v1) * modal_sum(&m, |lam| bateman(lam, ka, t))
 }
 
 /// 2-cpt with Savic transit-compartment absorption (`n` transit compartments,
@@ -390,11 +332,11 @@ pub fn two_cpt_transit_amt_g<T: PkNum>(
     mtt: T,
     f_bio: T,
 ) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // A `NaN` parameter is served as `NaN` (#2134), before the domain guard clamps it.
-    if [cl, v1, q, v2, n, mtt].iter().any(|x| x.val().is_nan()) {
+    if [cl, v1, q, v2, n, mtt].iter().any(|x| x.br_is_nan()) {
         return crate::sens::one_cpt::nan_jet(cl + v1);
     }
     // Shared disposition-domain guard (params valid, non-confluent, α<KTR, NaN-safe);
@@ -410,7 +352,7 @@ pub fn two_cpt_transit_amt_g<T: PkNum>(
 /// `two_cpt_transit` model (#386 PR D), used by the analytic gradient path. Transit
 /// rejects infusion/SS doses at parse, so only the absorbed-bolus route exists — a
 /// thin wrapper over [`two_cpt_transit_amt_g`] with `F` baked into the kernel.
-/// Generic over [`PkNum`] so prediction (`T = f64`) and the `Dual1`/`Dual2`
+/// Generic over [`PkNum`] so prediction (`T = f64`) and the `Dual2`/`Dual2`
 /// sensitivity share one definition.
 #[allow(clippy::too_many_arguments)]
 pub fn two_cpt_transit_conc_g<T: PkNum>(
@@ -443,21 +385,21 @@ pub(crate) fn ig_2cpt_domain_ok<T: PkNum>(
     mat: T,
     cv2: T,
 ) -> Option<(T, T, T)> {
-    if v1.val() <= 0.0
-        || cl.val() <= 0.0
-        || q.val() < 0.0
-        || v2.val() <= 0.0
-        || mat.val() <= 0.0
-        || cv2.val() <= 0.0
+    if v1.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || cl.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || q.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
+        || v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || mat.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || cv2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
     {
         return None;
     }
     let (alpha, beta, k21) = macro_rates_g(cl, v1, q, v2);
-    if (alpha - beta).val().abs() < 1e-12 {
+    if alpha.br_cmp(crate::sens::num::BranchCmp::Le, beta) {
         return None;
     }
     let abscissa = T::from_f64(1.0) / (T::from_f64(2.0) * mat * cv2);
-    if !(alpha.val() < abscissa.val()) {
+    if !(alpha.br_cmp(crate::sens::num::BranchCmp::Lt, abscissa)) {
         return None;
     }
     Some((alpha, beta, k21))
@@ -502,11 +444,11 @@ pub fn two_cpt_ig_amt_g<T: PkNum>(
     cv2: T,
     f_bio: T,
 ) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // A `NaN` parameter is served as `NaN` (#2134), before the domain guard clamps it.
-    if [cl, v1, q, v2, mat, cv2].iter().any(|x| x.val().is_nan()) {
+    if [cl, v1, q, v2, mat, cv2].iter().any(|x| x.br_is_nan()) {
         return crate::sens::one_cpt::nan_jet(cl + v1);
     }
     let Some((alpha, beta, k21)) = ig_2cpt_domain_ok(cl, v1, q, v2, mat, cv2) else {
@@ -538,16 +480,6 @@ pub fn two_cpt_ig_conc_g<T: PkNum>(
     two_cpt_ig_amt_g(T::from_f64(dose.amt), t, cl, v1, q, v2, mat, cv2, f_bio)
 }
 
-/// SS geometric-series factor `1/(1 − e^{−λ·ii})`.
-fn ss_coeff_g<T: PkNum>(lambda: T, ii: f64) -> T {
-    let denom = T::from_f64(1.0) - (-(lambda * T::from_f64(ii))).exp();
-    if denom.val() > 0.0 {
-        T::from_f64(1.0) / denom
-    } else {
-        T::from_f64(0.0)
-    }
-}
-
 /// 2-cpt IV bolus at steady state.
 pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v1: T, q: T, v2: T) -> T {
     two_cpt_iv_bolus_ss_d(amt, t, ii, &TwoCpt::new(cl, v1, q, v2))
@@ -556,21 +488,13 @@ pub fn two_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v1: T, q:
 /// [`two_cpt_iv_bolus_ss_g`] over a precomputed disposition (its macro rates computed once per
 /// parameter set, not once per dose and observation).
 pub(crate) fn two_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &TwoCpt<T>) -> T {
-    let TwoCpt {
-        cl,
-        v1,
-        q,
-        v2,
-        alpha,
-        beta,
-        k21,
-    } = *d;
+    let TwoCpt { cl, v1, q, v2, .. } = *d;
 
     // `q < 0` (e.g. a step or additive IIV driving Q negative) makes a disposition
     // eigenvalue negative, so the SS geometric `1/(1−e^{−λΙΙ})` flips sign and the
     // closed form returns a non-physical (or NaN, via a negative discriminant)
     // concentration. The production SS path returned 0 here; mirror it (PR #381 #3).
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -578,27 +502,21 @@ pub(crate) fn two_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &TwoCp
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if v2.val() <= 0.0 || q.val() < 0.0 || ii <= 0.0 {
+    if v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || q.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
+        || ii <= 0.0
+    {
         return T::from_f64(0.0);
     }
 
-    let diff = alpha - beta;
-    // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
-    // poles, undefined at exact root coalescence. Measure-zero for physical PK
-    // params (distinct real eigenvalues); return 0 rather than the confluent
-    // (A+B·t)·e^{−αt} limit — a deliberate edge (PR #381, review #1).
-    if diff.val().abs() < 1e-12 {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let amt_v1 = T::from_f64(amt) / v1;
-    let a = amt_v1 * (alpha - k21) / diff;
-    let b = amt_v1 * (k21 - beta) / diff;
-    let tt = t;
-    a * (-(alpha * tt)).exp() * ss_coeff_g(alpha, ii)
-        + b * (-(beta * tt)).exp() * ss_coeff_g(beta, ii)
+    };
+    (T::from_f64(amt) / v1) * modal_sum(&m, |lam| (-(lam * t)).exp() * ss_factor(lam, ii))
 }
 
-/// 2-cpt oral at steady state, with `ka ≈ α`/`ka ≈ β` L'Hôpital limits.
+/// 2-cpt oral at steady state: `(F·D·KA/V1)·Σ c·B_ss(λ, KA, t)`, smooth through `KA = λ`
+/// (`bateman_ss`).
 pub fn two_cpt_oral_ss_g<T: PkNum>(
     amt: f64,
     t: T,
@@ -623,17 +541,9 @@ pub(crate) fn two_cpt_oral_ss_d<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
-    let TwoCpt {
-        cl,
-        v1,
-        q,
-        v2,
-        alpha,
-        beta,
-        k21,
-    } = *d;
+    let TwoCpt { cl, v1, q, v2, .. } = *d;
 
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -641,56 +551,18 @@ pub(crate) fn two_cpt_oral_ss_d<T: PkNum>(
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if ka.val() <= 0.0 || v2.val() <= 0.0 || q.val() < 0.0 || ii <= 0.0 {
+    if ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || q.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
+        || ii <= 0.0
+    {
         return T::from_f64(0.0);
     }
 
-    let diff = alpha - beta;
-    // Confluent eigenvalues (α≈β): the spectral form carries 1/(α−β) residue
-    // poles, undefined at exact root coalescence. Measure-zero for physical PK
-    // params (distinct real eigenvalues); return 0 rather than the confluent
-    // (A+B·t)·e^{−αt} limit — a deliberate edge (PR #381, review #1).
-    if diff.val().abs() < 1e-12 {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let d = f_bio * T::from_f64(amt) * ka / v1;
-    let tt = t;
-
-    // L'Hôpital SS sum of (τ+nII)e^{−λ(τ+nII)} = e^{−λτ}[τ/(1−x) + II·x/(1−x)²].
-    let lhop = |lambda: T| -> T {
-        let x = (-(lambda * T::from_f64(ii))).exp();
-        let omx = T::from_f64(1.0) - x;
-        if omx.val() <= 0.0 {
-            return T::from_f64(0.0);
-        }
-        (-(lambda * tt)).exp() * (tt / omx + (x * T::from_f64(ii)) / (omx * omx))
     };
-
-    // Combined ka→α (or ka→β) L'Hôpital limit, SS form: add the
-    // −(k21-β)/diff²·e^{-ατ}·ss_coeff term the t-only limit drops (see
-    // `pk::two_compartment::two_cpt_oral_f_ss`).
-    let p = if (ka.val() - alpha.val()).abs() < 1e-6 {
-        d * ((alpha - k21) / diff * lhop(alpha)
-            - (k21 - beta) / (diff * diff) * (-(alpha * tt)).exp() * ss_coeff_g(alpha, ii))
-    } else {
-        d * (k21 - alpha) / ((ka - alpha) * (beta - alpha))
-            * (-(alpha * tt)).exp()
-            * ss_coeff_g(alpha, ii)
-    };
-    let q_val = if (ka.val() - beta.val()).abs() < 1e-6 {
-        d * ((k21 - beta) / diff * lhop(beta)
-            - (k21 - alpha) / (diff * diff) * (-(beta * tt)).exp() * ss_coeff_g(beta, ii))
-    } else {
-        d * (k21 - beta) / ((ka - beta) * (alpha - beta))
-            * (-(beta * tt)).exp()
-            * ss_coeff_g(beta, ii)
-    };
-    let r = if (ka.val() - alpha.val()).abs() < 1e-6 || (ka.val() - beta.val()).abs() < 1e-6 {
-        T::from_f64(0.0)
-    } else {
-        d * (k21 - ka) / ((alpha - ka) * (beta - ka)) * (-(ka * tt)).exp() * ss_coeff_g(ka, ii)
-    };
-    p + q_val + r
+    (f_bio * T::from_f64(amt) * ka / v1) * modal_sum(&m, |lam| bateman_ss(lam, ka, t, ii))
 }
 
 /// 2-cpt infusion at steady state (interval `ii`), for any `dur` — including
@@ -721,18 +593,10 @@ pub(crate) fn two_cpt_infusion_ss_d<T: PkNum>(
     ii: f64,
     d: &TwoCpt<T>,
 ) -> T {
-    let TwoCpt {
-        cl,
-        v1,
-        q,
-        v2,
-        alpha,
-        beta,
-        k21,
-    } = *d;
+    let TwoCpt { cl, v1, q, v2, .. } = *d;
 
     // See `two_cpt_iv_bolus_ss_g` for why SS guards `q < 0` (PR #381 #3).
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -740,58 +604,21 @@ pub(crate) fn two_cpt_infusion_ss_d<T: PkNum>(
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v1) {
         return c;
     }
-    if v2.val() <= 0.0 || q.val() < 0.0 || ii <= 0.0 {
+    if v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || q.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
+        || ii <= 0.0
+    {
         return T::from_f64(0.0);
     }
     if dur <= 0.0 {
         return two_cpt_iv_bolus_ss_d(amt, t, ii, d);
     }
 
-    let diff = alpha - beta;
-    if diff.val().abs() < 1e-12 || alpha.val().abs() < 1e-12 || beta.val().abs() < 1e-12 {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
+    };
     let r_v1 = T::from_f64(rate) / v1;
-    let a_coeff = r_v1 * (alpha - k21) / (diff * alpha);
-    let b_coeff = r_v1 * (k21 - beta) / (diff * beta);
-    let one = T::from_f64(1.0);
-    let dd = T::from_f64(dur);
-    if dur > ii {
-        // Overlapping infusions: superpose the past pulse train per eigenvalue
-        // (mirror of `crate::pk::two_cpt_infusion_ss`). `N` (count of pulses still
-        // infusing at phase `t`) is a locally-constant integer, seeded as a value.
-        let n_active = (((dur - t.val()) / ii).floor() + 1.0).max(0.0);
-        let nii = T::from_f64(n_active * ii);
-        let overlap = |c: T, lambda: T| -> T {
-            let sc = ss_coeff_g(lambda, ii);
-            let a = T::from_f64(n_active)
-                - (-(lambda * t)).exp() * (one - (-(lambda * nii)).exp()) * sc;
-            let d = (one - (-(lambda * dd)).exp()) * (-(lambda * (t - dd + nii))).exp() * sc;
-            c * (a + d)
-        };
-        return overlap(a_coeff, alpha) + overlap(b_coeff, beta);
-    }
-    let dt = t - dd;
-    // Past pulses (n ≥ 1): always "after-infusion".
-    let past_a = a_coeff
-        * (one - (-(alpha * dd)).exp())
-        * (-(alpha * dt)).exp()
-        * (-(alpha * T::from_f64(ii))).exp()
-        * ss_coeff_g(alpha, ii);
-    let past_b = b_coeff
-        * (one - (-(beta * dd)).exp())
-        * (-(beta * dt)).exp()
-        * (-(beta * T::from_f64(ii))).exp()
-        * ss_coeff_g(beta, ii);
-    if t.val() <= dur {
-        a_coeff * (one - (-(alpha * t)).exp())
-            + b_coeff * (one - (-(beta * t)).exp())
-            + past_a
-            + past_b
-    } else {
-        a_coeff * (one - (-(alpha * dd)).exp()) * (-(alpha * dt)).exp() * ss_coeff_g(alpha, ii)
-            + b_coeff * (one - (-(beta * dd)).exp()) * (-(beta * dt)).exp() * ss_coeff_g(beta, ii)
-    }
+    modal_sum(&m, |lam| mode_infusion_ss(lam, r_v1, dur, ii, t))
 }
 
 /// Central-compartment concentration contribution of a single dose at elapsed
@@ -827,7 +654,7 @@ pub(crate) fn two_cpt_conc_d<T: PkNum>(
     // `pk::single_dose_concentration` does: a degenerate `CL`/`V` drops the dose (0 even
     // when `F` is `NaN` or infinite, which the post-multiply below would turn `NaN`), a
     // `NaN` one serves `NaN`. Before arrival the leaf kernels read 0.
-    if t.val() >= 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
         if let Some(c) = crate::sens::propagate::dose_override_g(d.cl, d.v1) {
             return c;
         }

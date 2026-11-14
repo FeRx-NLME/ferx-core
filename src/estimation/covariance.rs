@@ -5,6 +5,7 @@
 //! population optimizers, the outer-gradient family, `OuterResult`, and
 //! `pop_nll`/`pop_nll_opts` (imported below).
 
+use crate::cold_sort::ColdSort;
 use crate::estimation::cov_diagnostics::{
     cov_objective_method, cov_objective_route, decrement_is_non_stationary,
     estimate_minimises_cov_objective, format_non_stationary_gradient_warning,
@@ -236,7 +237,7 @@ pub(crate) fn extract_eigenvalues(sym: &DMatrix<f64>) -> Option<Vec<f64>> {
         return None;
     }
     let mut eigvals: Vec<f64> = eig.eigenvalues.iter().cloned().collect();
-    eigvals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    eigvals.cold_sort_by(&|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     Some(eigvals)
 }
 
@@ -427,9 +428,10 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
     for halvings in 0..MAX_HALVINGS {
         let specs = fd_diag_specs(x_hat, free_idx, eps, floor);
         let report = cov_progress("step probe", specs.len(), options.verbose);
-        let vals: Vec<f64> = specs
-            .par_iter()
-            .map(|&p| {
+        let vals: Vec<f64> = {
+            let __r0 = &specs;
+            crate::par::map(__r0.len(), |__i| {
+                let &p = &__r0[__i];
                 if crate::cancel::is_cancelled(&options.cancel) {
                     report();
                     return f64::NAN;
@@ -438,7 +440,7 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
                 report();
                 v
             })
-            .collect();
+        };
         if crate::cancel::is_cancelled(&options.cancel) {
             return FdStep {
                 eps,
@@ -769,51 +771,48 @@ pub(crate) fn assemble_score_cross_product(
     // Closing it is #1817's territory. FOCE (`!interaction`) uses the Sheiner–Beal
     // gradient, which has no `log|H̃|` term, so `tᵢ` is not called for it.
     let report = cov_progress("score matrix", n_subj, options.verbose);
-    let scores: Vec<Result<Vec<f64>, String>> = (0..n_subj)
-        .into_par_iter()
-        .map(|i| {
-            // Cooperative cancel: skip the per-subject gradient and return a
-            // cheap zero score so the in-flight rayon queue drains fast. The
-            // caller (`compute_covariance`) re-checks the flag and discards this
-            // matrix before it is used, so the placeholder is never trusted.
-            if crate::cancel::is_cancelled(&options.cancel) {
-                report();
-                return Ok(vec![0.0; x_hat.len()]);
-            }
-            let kap_i = if i < kappas.len() {
-                kappas[i].as_slice()
-            } else {
-                &[]
-            };
-            if let Some(context) = &mixture {
-                let score = context.score(model, population, i, options);
-                report();
-                return Ok(score);
-            }
-            if let Some(context) = &quadrature {
-                // The subject score has NLL units already and cannot contain the
-                // optimizer's population-level EBE penalty. Never square a failed row.
-                let score = context.score(&population.subjects[i], eta_hats[i].as_slice(), kap_i)
-                    .ok_or_else(|| format!("Covariance step failed: could not obtain a converged, finite quadrature score for subject {}. SE estimates not available.", population.subjects[i].id));
-                report();
-                return score;
-            }
-            let gi = fixed_ebe_subject_score(
-                x_hat,
-                template,
-                model,
-                population,
-                i,
-                &eta_hats[i],
-                &h_matrices[i],
-                kap_i,
-                bounds,
-                options,
-            );
+    let scores: Vec<Result<Vec<f64>, String>> = crate::par::map(n_subj, |i| {
+        // Cooperative cancel: skip the per-subject gradient and return a
+        // cheap zero score so the in-flight rayon queue drains fast. The
+        // caller (`compute_covariance`) re-checks the flag and discards this
+        // matrix before it is used, so the placeholder is never trusted.
+        if crate::cancel::is_cancelled(&options.cancel) {
             report();
-            Ok(gi)
-        })
-        .collect();
+            return Ok(vec![0.0; x_hat.len()]);
+        }
+        let kap_i = if i < kappas.len() {
+            kappas[i].as_slice()
+        } else {
+            &[]
+        };
+        if let Some(context) = &mixture {
+            let score = context.score(model, population, i, options);
+            report();
+            return Ok(score);
+        }
+        if let Some(context) = &quadrature {
+            // The subject score has NLL units already and cannot contain the
+            // optimizer's population-level EBE penalty. Never square a failed row.
+            let score = context.score(&population.subjects[i], eta_hats[i].as_slice(), kap_i)
+                    .ok_or_else(|| format!("Covariance step failed: could not obtain a converged, finite quadrature score for subject {}. SE estimates not available.", population.subjects[i].id));
+            report();
+            return score;
+        }
+        let gi = fixed_ebe_subject_score(
+            x_hat,
+            template,
+            model,
+            population,
+            i,
+            &eta_hats[i],
+            &h_matrices[i],
+            kap_i,
+            bounds,
+            options,
+        );
+        report();
+        Ok(gi)
+    });
 
     let mut s = DMatrix::zeros(n_free, n_free);
     for gi in scores {
@@ -884,8 +883,8 @@ pub(super) mod forced_cov_decline {
 }
 
 /// The objective the analytic R-matrix differentiates: the one the fit minimised (see
-/// `analytic_cov_hessian`).
-fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
+/// `analytic_cov_hessian`), and whose per-subject gradients the BHHH decrement reads.
+pub(crate) fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
     use crate::sens::ode_provider::adjoint::Objective;
     match options.agq_nodes() {
         Some(n_agq) => Objective::Agq {
@@ -904,10 +903,7 @@ fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Ob
 /// declined. Dropping `gradient = fd` does not move a non-Gaussian model, and enabling
 /// `analytic_cov_hessian` does not move a mixture — both were promised unconditionally before
 /// (#1508 review §3). The three model-level gates are therefore collected side by side rather
-/// than short-circuited, and the per-subject width clause asks
-/// `sens::ode_provider::adjoint::cov_width_declines`, the rule the Hessian dispatch itself
-/// runs on — so a five-effect Laplace fit with `analytic_cov_hessian = false` is told that
-/// enabling the flag would not move it (Copilot review on #2093).
+/// than short-circuited.
 ///
 /// Returns an empty vec only when the analytic route was in fact taken — so a caller that has
 /// already observed `analytic_cov_hessian(..) == None` and still finds nothing here has found a
@@ -921,11 +917,10 @@ fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Ob
 /// a stencil that has just spent `2·n_free²` reconverged population objectives.
 fn analytic_cov_declines(
     model: &CompiledModel,
-    population: &Population,
     options: &FitOptions,
     is_mixture: bool,
 ) -> Vec<CovScopeDecline> {
-    let mut out = analytic_cov_scope_declines(model, population, options, is_mixture);
+    let mut out = analytic_cov_model_declines(model, options, is_mixture);
     if out.is_empty() {
         out.push(CovScopeDecline::PerSubjectBail);
     }
@@ -1011,26 +1006,22 @@ pub(crate) fn stencil_scope_failure_warning(reason: &str) -> String {
 }
 
 /// Which route the covariance step is expected to build `R` on, predicted before the fit from
-/// the same walk [`analytic_cov_declines`] reports (#2054): the model-level gates, then
-/// `cov_width_declines` per subject, then the salvage cut [`salvages_declined`] the assembly
-/// itself applies. The prediction can still be wrong when a subject bails at run time (a trial
-/// point the recorder cannot form) — then that subject joins the salvaged minority, or, past
-/// the cut, the whole population takes the stencil — which is why every message built from it
-/// is worded as an expectation.
+/// the same walk [`analytic_cov_declines`] reports (#2054): the model-level gates. The
+/// prediction can still be wrong when a subject bails at run time (a trial point the recorder
+/// cannot form) — then that subject joins the salvaged minority [`salvages_declined`] cuts, or,
+/// past the cut, the whole population takes the stencil — which is why every message built from
+/// it is worded as an expectation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PredictedRRoute {
     /// Every subject on the analytic assembly: no finite-difference objective at all.
     Analytic,
-    /// A strict minority of subjects declines; the `2·n²`-point stencil runs over those
-    /// `declined` of `n_subjects` alone (#1514).
-    Salvage { declined: usize, n_subjects: usize },
     /// The whole-population stencil.
     Stencil,
 }
 
 /// Whether the assembly salvages `declined` of `n_subjects` declining subjects on their own
-/// stencil, rather than taking the population stencil — the one cut both
-/// [`analytic_cov_assembly`] and [`predicted_r_route`] read. `declined > 0` is the caller's.
+/// stencil, rather than taking the population stencil ([`analytic_cov_assembly`]'s cut).
+/// `declined > 0` is the caller's.
 fn salvages_declined(declined: usize, n_subjects: usize) -> bool {
     (declined as f64) < SALVAGE_MAX_DECLINED_FRACTION * n_subjects as f64
 }
@@ -1043,23 +1034,13 @@ fn salvages_declined(declined: usize, n_subjects: usize) -> bool {
 /// [`PredictedRRoute::Analytic`].
 pub(crate) fn predicted_r_route(
     model: &CompiledModel,
-    population: &Population,
     options: &FitOptions,
     is_mixture: bool,
 ) -> PredictedRRoute {
-    if !analytic_cov_model_declines(model, options, is_mixture).is_empty() {
-        return PredictedRRoute::Stencil;
-    }
-    let n_subjects = population.subjects.len();
-    match width_declined_subjects(model, population, options) {
-        0 => PredictedRRoute::Analytic,
-        // The mixture objective is not a per-subject sum: no salvage, all or nothing.
-        _ if is_mixture => PredictedRRoute::Stencil,
-        declined if salvages_declined(declined, n_subjects) => PredictedRRoute::Salvage {
-            declined,
-            n_subjects,
-        },
-        _ => PredictedRRoute::Stencil,
+    if analytic_cov_model_declines(model, options, is_mixture).is_empty() {
+        PredictedRRoute::Analytic
+    } else {
+        PredictedRRoute::Stencil
     }
 }
 
@@ -1068,29 +1049,14 @@ pub(crate) fn predicted_r_route(
 /// [`analytic_cov_declines`]'s walk fires.
 pub(crate) fn analytic_r_expected(
     model: &CompiledModel,
-    population: &Population,
     options: &FitOptions,
     is_mixture: bool,
 ) -> bool {
-    predicted_r_route(model, population, options, is_mixture) == PredictedRRoute::Analytic
+    predicted_r_route(model, options, is_mixture) == PredictedRRoute::Analytic
 }
 
-/// The clauses of [`analytic_cov_declines`], empty when none fires.
-fn analytic_cov_scope_declines(
-    model: &CompiledModel,
-    population: &Population,
-    options: &FitOptions,
-    is_mixture: bool,
-) -> Vec<CovScopeDecline> {
-    let mut out = analytic_cov_model_declines(model, options, is_mixture);
-    if width_declined_subjects(model, population, options) > 0 {
-        out.push(CovScopeDecline::TooManyRandomEffects);
-    }
-    out
-}
-
-/// The model-level clauses of [`analytic_cov_declines`] — every one that sends the whole
-/// population to the stencil, whatever the subjects look like.
+/// The clauses of [`analytic_cov_declines`] — every one that sends the whole population to
+/// the stencil, whatever the subjects look like. Empty when none fires.
 fn analytic_cov_model_declines(
     model: &CompiledModel,
     options: &FitOptions,
@@ -1113,8 +1079,7 @@ fn analytic_cov_model_declines(
     }
     // The adjoint's profile Hessian serves every estimator and anchor; what it declines is
     // the model (a shape no recorder serves, a non-Gaussian endpoint outside FOCE/FOCEI's
-    // exact term), a subject wider than
-    // its buckets, or the user's `gradient = fd` opt-out from analytic derivatives.
+    // exact term) or the user's `gradient = fd` opt-out from analytic derivatives.
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         out.push(CovScopeDecline::ModelOutOfScope);
     }
@@ -1130,21 +1095,6 @@ fn analytic_cov_model_declines(
         out.push(CovScopeDecline::NonGaussianEndpoint);
     }
     out
-}
-
-/// How many subjects are too wide for the profile Hessian's buckets under the fit's
-/// objective — the per-subject clause, through the rule the Hessian dispatch itself runs on.
-fn width_declined_subjects(
-    model: &CompiledModel,
-    population: &Population,
-    options: &FitOptions,
-) -> usize {
-    let objective = cov_objective(options);
-    population
-        .subjects
-        .iter()
-        .filter(|s| crate::sens::ode_provider::adjoint::cov_width_declines(model, s, objective))
-        .count()
 }
 
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
@@ -1315,40 +1265,37 @@ fn per_subject_adjoint<R: Send>(
     let objective = cov_objective(options);
     // One unpack for the population: every subject is at `x`.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
-    Some(
-        population
-            .subjects
-            .par_iter()
-            .zip(eta_hats.par_iter())
-            .enumerate()
-            .map(|(i, (subject, eta_hat))| {
-                let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
-                // Cooperative cancel. The FD stencil checks on every perturbed point; this loop
-                // is `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs)
-                // assembly per subject, and for the default `covariance_method = r` there is no
-                // later checkpoint — so without this, the Ctrl-C affordance `saem.rs`
-                // advertises before the covariance step (#893) was inoperative. Returning
-                // `None` alone would drop into the *more* expensive FD stencil; the caller
-                // re-checks the flag and reports cancelled instead (PR #953 review finding 10).
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    return None;
-                }
-                #[cfg(test)]
-                if forced_cov_decline::declines(&subject.id) {
-                    return None;
-                }
-                #[cfg(test)]
-                if let Ok(mut watch) = SUBJECT_SWEEP_WATCH.lock() {
-                    if let Some((addr, n)) = watch.as_mut() {
-                        if *addr == template as *const ModelParameters as usize {
-                            *n += 1;
-                        }
+    Some({
+        let __r0 = &population.subjects;
+        let __r1 = &eta_hats;
+        crate::par::map(__r0.len().min(__r1.len()), |i| {
+            let (subject, eta_hat) = (&__r0[i], &__r1[i]);
+            let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
+            // Cooperative cancel. The FD stencil checks on every perturbed point; this loop
+            // is `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs)
+            // assembly per subject, and for the default `covariance_method = r` there is no
+            // later checkpoint — so without this, the Ctrl-C affordance `saem.rs`
+            // advertises before the covariance step (#893) was inoperative. Returning
+            // `None` alone would drop into the *more* expensive FD stencil; the caller
+            // re-checks the flag and reports cancelled instead (PR #953 review finding 10).
+            if crate::cancel::is_cancelled(&options.cancel) {
+                return None;
+            }
+            #[cfg(test)]
+            if forced_cov_decline::declines(&subject.id) {
+                return None;
+            }
+            #[cfg(test)]
+            if let Ok(mut watch) = SUBJECT_SWEEP_WATCH.lock() {
+                if let Some((addr, n)) = watch.as_mut() {
+                    if *addr == template as *const ModelParameters as usize {
+                        *n += 1;
                     }
                 }
-                f(subject, &pt, &b, objective)
-            })
-            .collect(),
-    )
+            }
+            f(subject, &pt, &b, objective)
+        })
+    })
 }
 
 /// The slope and the curvature of the OFV along each packed axis in `axes`, exact: `∂OFV/∂x_a`
@@ -1521,15 +1468,6 @@ pub(super) fn analytic_cov_assembly(
     ) else {
         return AnalyticCovAssembly::Unavailable;
     };
-    // The R-matrix passes record on each worker's reverse tape, which keeps its buffers
-    // between subjects so they are not reallocated per pass. Past the last subject nothing
-    // else needs them at that size, so release them on every worker of the pool (#2093):
-    // a 1M-node tape — what `rtape_trim`'s per-pass threshold lets a worker keep — is
-    // ~100 MB (offsets, entries and eight adjoint lanes per node), and stayed pinned for the
-    // rest of a long-lived process (an R session). This does not lower the step's own peak,
-    // which is the tape at its largest during the passes: measured +4–5 MB of peak RSS over
-    // `main` without the covariance step and +13–27 MB with it on the bundled models.
-    rayon::broadcast(|_| crate::sens::rtape::rtape_trim(0));
     let mut acc = DMatrix::<f64>::zeros(n, n);
     let mut declined: Vec<usize> = Vec::new();
     for (i, h) in per_subject.into_iter().enumerate() {
@@ -2199,7 +2137,7 @@ pub(crate) fn compute_covariance_for(
         return at_fit_tolerance(false).expect("a step that may take any route always completes");
     };
     if needs_r(options.covariance_method)
-        && predicted_r_route(model, population, options, template.mixture.is_some())
+        && predicted_r_route(model, options, template.mixture.is_some())
             == PredictedRRoute::Analytic
     {
         if let Some(out) = at_fit_tolerance(true) {
@@ -2874,7 +2812,7 @@ fn covariance_step(
             None => {
                 return Some(CovarianceStepResult::Unusable(
                     COV_CANCELLED_MSG.to_string(),
-                ))
+                ));
             }
         };
         // `+=`, not `copy_from`: on the salvage route `hess` already holds the analytic terms.
@@ -3107,7 +3045,7 @@ fn covariance_step(
                 None => {
                     return Some(CovarianceStepResult::Unusable(
                         COV_CANCELLED_MSG.to_string(),
-                    ))
+                    ));
                 }
             },
         };
@@ -3123,7 +3061,7 @@ fn covariance_step(
                         4.0,
                         &unit_coords,
                     ),
-                })
+                });
             }
             Err(reason) => return Some(CovarianceStepResult::Unusable(reason)),
         };
@@ -3313,7 +3251,7 @@ fn covariance_step(
         // on a fit that had no complaint to make. On the hybrid route it is the *salvaged*
         // subjects' clauses it names — the same walk, since every other subject passes it.
         let declines = if source.emits_fd_guidance() {
-            analytic_cov_declines(model, population, options, is_mixture)
+            analytic_cov_declines(model, options, is_mixture)
         } else {
             Vec::new()
         };
@@ -4061,9 +3999,7 @@ pub(crate) fn routed_covariance_method(
 /// no note is due — the step is off, `n ≤ 30`, `R` is expected on the analytic assembly for
 /// every subject (`route`, see [`predicted_r_route`]; #2054), or the estimator the step will
 /// actually run (after [`scale_routed_covariance_method`]) builds no `R` — else `Some` of
-/// `fd_r_objective_evals`, itself `None` on overflow (#1803). On
-/// [`PredictedRRoute::Salvage`] the count is the same `2·n²`, but each evaluation covers only
-/// the declined subjects; [`pre_fit_covariance_cost_note`] says so. Before #1803 the note fired
+/// `fd_r_objective_evals`, itself `None` on overflow (#1803). Before #1803 the note fired
 /// under `covariance_method = s` too, and quoted `n²`; before #2054 it ignored the route.
 pub(crate) fn pre_fit_covariance_cost(
     n: usize,
@@ -4079,36 +4015,22 @@ pub(crate) fn pre_fit_covariance_cost(
 }
 
 /// The pre-fit cost note for a [`pre_fit_covariance_cost`] result at `n` free coordinates, or
-/// `None` when no note is due. On overflow it still warns, without the (wrapped) number. On
-/// [`PredictedRRoute::Salvage`] it names the subject subset the stencil is expected to cover.
+/// `None` when no note is due. On overflow it still warns, without the (wrapped) number.
 /// Worded as an expectation: a subject the walk predicts in scope can still bail at run time.
 pub(crate) fn pre_fit_covariance_cost_note(
     n: usize,
     cost: Option<Option<usize>>,
-    route: PredictedRRoute,
 ) -> Option<String> {
     let count = match cost? {
         Some(n_evals) => n_evals.to_string(),
         None => "2n²".to_string(),
-    };
-    let scope = match route {
-        PredictedRRoute::Salvage {
-            declined,
-            n_subjects,
-        } => format!(
-            " over {declined} of {n_subjects} subjects (finite-difference Hessian for the \
-             subjects outside the analytic R-matrix; the rest are analytic)"
-        ),
-        PredictedRRoute::Analytic | PredictedRRoute::Stencil => {
-            " (finite-difference Hessian)".to_string()
-        }
     };
     let tail = match cost? {
         Some(_) => "This may take several minutes on complex models.",
         None => "Estimate exceeds usize range; expect this to be very slow.",
     };
     Some(format!(
-        "Covariance step: {n} parameters → {count} OFV evaluations expected{scope}. {tail}"
+        "Covariance step: {n} parameters → {count} OFV evaluations expected (finite-difference Hessian). {tail}"
     ))
 }
 
@@ -4146,7 +4068,7 @@ pub(crate) fn run_covariance_step_inner(
         model.free_packed_dim(),
         options,
         !model.priors.is_empty(),
-        analytic_r_expected(model, population, options, template.mixture.is_some()),
+        analytic_r_expected(model, options, template.mixture.is_some()),
     );
     if let Some(w) = scale_warning {
         warnings.push(w);
@@ -4348,13 +4270,14 @@ mod tests {
     use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
     use nalgebra::DMatrix;
 
-    /// Copilot on #2093: a nine-effect Laplace fit with `analytic_cov_hessian = false` is
-    /// told about the width clause too, so the remedy sentence (gated on the flag clearing
-    /// *every* clause) no longer promises the analytic route. Three effects, the flag alone.
+    /// A nine-effect Laplace fit with `analytic_cov_hessian = false` is told about the flag
+    /// alone: no subject is too wide for the exact R-matrix (it once declined past 8 effects
+    /// under Laplace's exact anchor, past 24 otherwise), so the remedy sentence — gated on the
+    /// flag clearing *every* clause — promises the analytic route at any width.
     #[test]
-    fn analytic_cov_declines_names_a_subject_too_wide_for_the_exact_anchor() {
+    fn analytic_cov_declines_names_no_width_clause_at_any_width() {
         use crate::estimation::cov_diagnostics::CovScopeDecline;
-        use crate::types::{EstimationMethod, FitOptions, Population, Subject};
+        use crate::types::{EstimationMethod, FitOptions};
         let model = |n_extra: usize| {
             let extra: String = (0..n_extra)
                 .map(|k| format!("  omega ETA_X{k} ~ 0.02\n"))
@@ -4371,34 +4294,17 @@ mod tests {
             ))
             .unwrap()
         };
-        let population = Population {
-            subjects: vec![Subject::default()],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
         let options = FitOptions {
             method: EstimationMethod::Laplace,
             analytic_cov_hessian: false,
             ..FitOptions::default()
         };
-        for (n_extra, want) in [
-            (0, vec![CovScopeDecline::Disabled]),
-            (
-                6,
-                vec![
-                    CovScopeDecline::Disabled,
-                    CovScopeDecline::TooManyRandomEffects,
-                ],
-            ),
-        ] {
+        for n_extra in [0, 6, 60] {
             let m = model(n_extra);
             assert_eq!(m.n_eta, 3 + n_extra);
             assert_eq!(
-                super::analytic_cov_declines(&m, &population, &options, false),
-                want,
+                super::analytic_cov_declines(&m, &options, false),
+                vec![CovScopeDecline::Disabled],
                 "{} η",
                 m.n_eta
             );
@@ -4413,31 +4319,18 @@ mod tests {
     #[test]
     fn the_scope_walk_reports_every_clause_and_the_routing_predicate_agrees() {
         use crate::estimation::cov_diagnostics::CovScopeDecline;
-        use crate::types::{FitOptions, GradientMethod, Population, Subject};
+        use crate::types::{FitOptions, GradientMethod};
         let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
                    omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n\
                    CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n\
                    pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n";
-        let population = Population {
-            subjects: vec![Subject::default()],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
         let in_scope = crate::parser::model_parser::parse_model_string(src).unwrap();
         let on = FitOptions::default();
         assert_eq!(
-            super::analytic_cov_declines(&in_scope, &population, &on, false),
+            super::analytic_cov_declines(&in_scope, &on, false),
             vec![CovScopeDecline::PerSubjectBail]
         );
-        assert!(super::analytic_r_expected(
-            &in_scope,
-            &population,
-            &on,
-            false
-        ));
+        assert!(super::analytic_r_expected(&in_scope, &on, false));
 
         let mut fd = crate::parser::model_parser::parse_model_string(src).unwrap();
         fd.gradient_method = GradientMethod::Fd;
@@ -4448,7 +4341,7 @@ mod tests {
             ..FitOptions::default()
         };
         assert_eq!(
-            super::analytic_cov_declines(&fd, &population, &off, true),
+            super::analytic_cov_declines(&fd, &off, true),
             vec![
                 CovScopeDecline::Disabled,
                 CovScopeDecline::Mixture,
@@ -4456,14 +4349,14 @@ mod tests {
             ],
             "every clause, in gate order"
         );
-        assert!(!super::analytic_r_expected(&fd, &population, &off, true));
+        assert!(!super::analytic_r_expected(&fd, &off, true));
         // Each clause alone moves the predicate.
         assert!(
-            !super::analytic_r_expected(&fd, &population, &on, false),
+            !super::analytic_r_expected(&fd, &on, false),
             "gradient = fd"
         );
         assert!(
-            !super::analytic_r_expected(&in_scope, &population, &off, false),
+            !super::analytic_r_expected(&in_scope, &off, false),
             "disabled"
         );
     }
@@ -4474,7 +4367,7 @@ mod tests {
     #[test]
     fn the_scope_walk_reads_the_calls_gradient_fd() {
         use crate::estimation::cov_diagnostics::CovScopeDecline;
-        use crate::types::{FitOptions, GradientMethod, Population, Subject};
+        use crate::types::{FitOptions, GradientMethod};
         let model = crate::parser::model_parser::parse_model_string(
             "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
              omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n\
@@ -4483,17 +4376,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(model.gradient_method, GradientMethod::Auto);
-        let population = Population {
-            subjects: vec![Subject::default()],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
         let opts = FitOptions::default();
         let has_fd = || {
-            super::analytic_cov_declines(&model, &population, &opts, false)
+            super::analytic_cov_declines(&model, &opts, false)
                 .contains(&CovScopeDecline::GradientFd)
         };
         assert!(!has_fd(), "control: unarmed, no gradient = fd clause");
@@ -4503,12 +4388,7 @@ mod tests {
                 has_fd(),
                 "fit's guard: the call's gradient = fd declines the R-matrix"
             );
-            assert!(!super::analytic_r_expected(
-                &model,
-                &population,
-                &opts,
-                false
-            ));
+            assert!(!super::analytic_r_expected(&model, &opts, false));
         }
         let fd_opts = FitOptions {
             gradient_method: GradientMethod::Fd,
@@ -4527,7 +4407,7 @@ mod tests {
     /// a mixture and on `analytic_cov_hessian`.
     #[test]
     fn the_analytic_r_matrix_is_not_rerouted_or_costed_as_a_stencil() {
-        use crate::types::{FitOptions, Population, Subject};
+        use crate::types::FitOptions;
         let n = COV_HESSIAN_MAX_DIM + 1;
         let defaulted = FitOptions {
             run_covariance_step: true,
@@ -4562,24 +4442,11 @@ mod tests {
              pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
         )
         .unwrap();
-        let population = Population {
-            subjects: vec![Subject::default()],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
-        assert!(super::analytic_r_expected(
-            &m,
-            &population,
-            &defaulted,
-            false
-        ));
+        assert!(super::analytic_r_expected(&m, &defaulted, false));
         // A FOCE/FOCEI mixture has its own exact R (`mixture::mixture_cov_hessian`); under
         // the quadrature it takes the stencil.
         assert!(
-            super::analytic_r_expected(&m, &population, &defaulted, true),
+            super::analytic_r_expected(&m, &defaulted, true),
             "a FOCE/FOCEI mixture is analytic"
         );
         let laplace = FitOptions {
@@ -4587,19 +4454,14 @@ mod tests {
             ..defaulted.clone()
         };
         assert!(
-            !super::analytic_r_expected(&m, &population, &laplace, true),
+            !super::analytic_r_expected(&m, &laplace, true),
             "a Laplace mixture takes the stencil"
         );
         let disabled = FitOptions {
             analytic_cov_hessian: false,
             ..defaulted
         };
-        assert!(!super::analytic_r_expected(
-            &m,
-            &population,
-            &disabled,
-            false
-        ));
+        assert!(!super::analytic_r_expected(&m, &disabled, false));
     }
 
     // ── #520 C1: the magnitudes the severity grade is made from ──────────────
@@ -5760,44 +5622,24 @@ mod tests {
 
     /// #1803 / #2054: the note's text, pinned whole on every arm so deleting any sentence
     /// reddens it, and still classified as the `covariance_step` Info it was before the count
-    /// changed. The salvage arm names the declined subset; the stencil arm does not.
+    /// changed.
     #[test]
     fn the_pre_fit_cost_note_quotes_the_r_count_or_says_it_overflowed() {
         use super::pre_fit_covariance_cost_note as note;
-        use super::PredictedRRoute;
         use crate::types::{classify_warning, WarningCode, WarningSeverity};
-        let salvage = PredictedRRoute::Salvage {
-            declined: 2,
-            n_subjects: 20,
-        };
-        let counted = note(31, Some(Some(1922)), PredictedRRoute::Stencil).expect("a note is due");
+        let counted = note(31, Some(Some(1922))).expect("a note is due");
         assert_eq!(
             counted,
             "Covariance step: 31 parameters → 1922 OFV evaluations expected (finite-difference \
              Hessian). This may take several minutes on complex models."
         );
-        let overflowed = note(31, Some(None), PredictedRRoute::Stencil).expect("a note is due");
+        let overflowed = note(31, Some(None)).expect("a note is due");
         assert_eq!(
             overflowed,
             "Covariance step: 31 parameters → 2n² OFV evaluations expected (finite-difference \
              Hessian). Estimate exceeds usize range; expect this to be very slow."
         );
-        let salvaged = note(31, Some(Some(1922)), salvage).expect("a note is due");
-        assert_eq!(
-            salvaged,
-            "Covariance step: 31 parameters → 1922 OFV evaluations expected over 2 of 20 \
-             subjects (finite-difference Hessian for the subjects outside the analytic \
-             R-matrix; the rest are analytic). This may take several minutes on complex models."
-        );
-        let salvaged_overflow = note(31, Some(None), salvage).expect("a note is due");
-        assert_eq!(
-            salvaged_overflow,
-            "Covariance step: 31 parameters → 2n² OFV evaluations expected over 2 of 20 \
-             subjects (finite-difference Hessian for the subjects outside the analytic \
-             R-matrix; the rest are analytic). Estimate exceeds usize range; expect this to be \
-             very slow."
-        );
-        for msg in [&counted, &overflowed, &salvaged, &salvaged_overflow] {
+        for msg in [&counted, &overflowed] {
             let entry = classify_warning(msg);
             assert_eq!(
                 (entry.severity, entry.category),
@@ -5807,7 +5649,7 @@ mod tests {
             // ferx-r's `ferx_get_warnings()` advice arm matches this exact token.
             assert!(msg.contains("OFV evaluations"), "{msg}");
         }
-        assert_eq!(note(31, None, salvage), None, "no cost, no note");
+        assert_eq!(note(31, None), None, "no cost, no note");
     }
 
     /// A variance mixture (per-class Ω/Σ overrides) so the packed vector carries

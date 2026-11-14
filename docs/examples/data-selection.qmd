@@ -49,7 +49,6 @@ This is the contents of [`examples/warfarin_data_selection.ferx`](https://github
 [fit_options]
   method   = foce
   maxiter  = 300
-  gradient = fd
 ```
 
 The `[data_selection]` block accepts two optional directives:

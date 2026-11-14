@@ -3,7 +3,6 @@ use crate::stats::residual_error::{residual_rd, residual_rd2, ResidualCov};
 use crate::stats::special::log_normal_cdf;
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 
 /// Route predictions through analytical PK or ODE solver depending on model,
 /// honouring per-event PK parameters when the subject has time-varying
@@ -501,15 +500,17 @@ fn tte_endpoint_nll_visit(
             crate::survival::analytic_tte_nll_visit_g(records, *family, recurrence, &params, visit)
         }
         HazardSpec::OdeAccumulated { chz_state } => {
-            let walk = crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(model, subject);
-            if walk {
-                if let Some(nll) = crate::survival::ode_tte_nll_visit_g::<f64>(
+            // A subject in the walk's scope is scored off the walk, whose exact derivatives
+            // the gradient takes. It declines only a non-finite trajectory (#2786: pre-start
+            // times and the pre-dose `TAD` anchor are served), which any other engine would
+            // integrate to the same divergence: repelled.
+            if crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(model, subject) {
+                return crate::survival::ode_tte_nll_visit_g::<f64>(
                     model, subject, *chz_state, records, theta, eta, visit,
-                ) {
-                    return nll;
-                }
+                )
+                .unwrap_or(SUBJECT_SENTINEL_NLL);
             }
-            match joint_share.filter(|_| !walk) {
+            match joint_share {
                 Some(s) => {
                     let ode = model.ode_spec.as_ref().expect("joint share ⟹ ode_spec");
                     let (cum, haz, tol) = shared_tte_curves(ode, s, *chz_state);
@@ -1102,6 +1103,45 @@ pub(crate) fn population_variance_preds_iov(
     ))
 }
 
+/// Whether the objective's value-only predictions may come from the subject's compiled plan
+/// ([`crate::sens::ode_provider::adjoint::plan_values`]) instead of the native predictor: a
+/// closed-form model (plain or IOV) or an `[odes]` model on the exact linear path, without a
+/// lagtime, where the plan's forward is bit-equal to the native walk and cheaper than it. Not a
+/// nonlinear `[odes]` model (its values come from a solver loop the plan does not serve), and not
+/// a lagged one (the recorded onset arithmetic measured up to 5 ulp off the native walk).
+pub(crate) fn plan_value_route(model: &CompiledModel) -> bool {
+    #[cfg(test)]
+    if PLAN_VALUES_OFF.with(|c| c.get()) {
+        return false;
+    }
+    !model.has_lagtime()
+        && model
+            .ode_spec
+            .as_ref()
+            .is_none_or(|o| o.effective_solver_opts().method == crate::ode::OdeMethod::Linear)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: the objective's value pass stays on the native predictor (a test of the
+    /// native walk's own bookkeeping, e.g. its schedule builds).
+    pub(crate) static PLAN_VALUES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `preds` from the plan when [`plan_value_route`] admits the model and the plan serves the
+/// point; `false` when the native predictor must answer.
+fn plan_value_preds(
+    model: &CompiledModel,
+    subject: &Subject,
+    layout: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    eta: &[f64],
+    out: &mut Vec<f64>,
+) -> bool {
+    plan_value_route(model)
+        && crate::sens::ode_provider::adjoint::plan_values(model, subject, layout, theta, eta, out)
+}
+
 /// [`individual_nll_into_prepared_with_schedule`] with an optional frozen residual
 /// variance (#1722).
 ///
@@ -1164,19 +1204,23 @@ pub(crate) fn individual_nll_into_prepared_with_schedule_frozen(
             pred_recycle
         }
         None => {
-            let hint = std::mem::take(pred_recycle);
-            *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
-                model, subject, theta, eta, scratch, schedule, hint,
-            );
+            if !plan_value_preds(model, subject, None, theta, eta, pred_recycle) {
+                let hint = std::mem::take(pred_recycle);
+                *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
+                    model, subject, theta, eta, scratch, schedule, hint,
+                );
+            }
             pred_recycle
         }
     };
     #[cfg(not(feature = "survival"))]
     let preds = {
-        let hint = std::mem::take(pred_recycle);
-        *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
-            model, subject, theta, eta, scratch, schedule, hint,
-        );
+        if !plan_value_preds(model, subject, None, theta, eta, pred_recycle) {
+            let hint = std::mem::take(pred_recycle);
+            *pred_recycle = pk::compute_predictions_with_tv_recycle_with_schedule(
+                model, subject, theta, eta, scratch, schedule, hint,
+            );
+        }
         pred_recycle
     };
     // For SDE models, compute per-observation EKF process-noise variance and
@@ -1658,11 +1702,8 @@ pub(crate) fn ekf_p_obs(
     );
     let error_model = model.error_model;
 
-    // Temporarily shadow ode_spec with updated diffusion_var for this call.
-    // We cannot mutate model.ode_spec, so we pass diffusion_var separately
-    // via a local OdeSpec-like struct. Since solve_ekf takes rhs + n_states
-    // + obs_cmt_idx + diffusion_var as separate args, we call it directly.
-    // TODO: unify EKF ipred with likelihood ipred to avoid double ODE evaluation
+    // `diffusion_var` is passed beside the spec (it moves with θ; the spec cannot). One filter
+    // solve: its Kalman `R` reads the filter's own mean, so no second ODE pass is made for it.
     let (_, p_obs) = crate::ode::ode_predictions_ekf_with_diffusion(
         ode,
         &pk.values,
@@ -1696,181 +1737,6 @@ pub(crate) fn ruv_scale_from(eta: &[f64], residual_error_eta: Option<usize>) -> 
         Some(k) => eta.get(k).map(|&e| (2.0 * e).exp()).unwrap_or(1.0),
         None => 1.0,
     }
-}
-
-/// Threshold separating a healthy CTMM likelihood / FD-Hessian entry from a
-/// degeneracy-sentinel-poisoned one. The CTMM data term repels with a `1e20`
-/// objective (an underflowed transition or a negative off-diagonal); a mode value
-/// or FD-Hessian entry at or beyond this bound is that sentinel leaking into the
-/// Laplace curvature, not a real value, and is dropped rather than folded into
-/// `log|H̃|`. Sits far above any legitimate CTMM curvature and far below the `1e20`
-/// sentinel. See [`foce_subject_nll`]'s CTMM FD-Hessian block (#759 review).
-#[cfg(feature = "markov")]
-const CTMM_FD_SENTINEL_GUARD: f64 = 1e18;
-
-/// The Laplace curvature of a Markov endpoint's data term, from
-/// [`guarded_markov_fd_hessian`].
-#[cfg(feature = "markov")]
-#[derive(Debug)]
-pub(crate) enum MarkovCurvature {
-    /// The mode itself scores the sentinel: the subject is already repelled through its NLL
-    /// and there is no curvature to add.
-    Repelled,
-    /// The η-Hessian of the data term at the mode.
-    Block(DMatrix<f64>),
-    /// The mode is valid but no finite-difference stencil around it stays inside the valid
-    /// region, so the curvature cannot be measured. The caller repels the subject rather than
-    /// fold a zero (or sentinel-sized) curvature into `log|H̃|`.
-    Unmeasurable,
-}
-
-/// Quarterings of the step tried by the boundary fallback in [`guarded_markov_fd_hessian`]
-/// before the curvature is declared unmeasurable (`4⁻⁸ ≈ 1.5e-5` of the Shi step), never
-/// below [`MARKOV_STENCIL_MIN_STEP`].
-#[cfg(feature = "markov")]
-const MARKOV_STENCIL_SHRINKS: i32 = 8;
-
-/// The smallest step the boundary fallback differences over — the Shi step's own floor. Below
-/// it a stencil reads values equal to rounding (`1 + η²` is exactly `1` for `|η| < 1e-8`) and
-/// returns a zero curvature that is an artifact, which is the very answer the fallback exists
-/// to avoid.
-#[cfg(feature = "markov")]
-const MARKOV_STENCIL_MIN_STEP: f64 = 1e-6;
-
-/// The FD Hessian w.r.t. η of a Markov endpoint's data term `f` at the mode, guarded against
-/// the `1e20` subject sentinel — the DTMM's (#2473) fallback in
-/// [`discrete_data_term_eta_hessian`] when the exact η-jet declines (no dual program, or η past
-/// the widest bucket).
-///
-/// The term repels a parameter regime with the finite sentinel (a matrix leaving `[0, 1]` or
-/// summing past 1 in any row). A valid mode on or next to that boundary can put a stencil
-/// point in it, and a sentinel inside a central difference is a `~1e20 / h²` curvature. The
-/// likelihood still has its real curvature there, so the block is neither folded poisoned nor
-/// dropped: each entry is measured with a stencil whose points are all valid —
-///
-/// 1. the healthy path is the central difference on `data_term_hessian_steps`, bit-identical
-///    to an unguarded fold;
-/// 2. otherwise, per entry, at a gradient-scaled step and then at successively quartered steps (never
-///    below `1e-6`): the
-///    central difference if its four points are valid, else a one-sided one on whichever side
-///    is valid — `(2f₀ − 5f₁ + 4f₂ − f₃)/s²` along the axis for a diagonal entry (`O(s²)`),
-///    the quadrant difference `(f(a,b) − f(a,0) − f(0,b) + f₀)/(ab)` for an off-diagonal one;
-/// 3. an entry with no valid stencil at any step makes the block [`MarkovCurvature::Unmeasurable`].
-#[cfg(feature = "markov")]
-pub(crate) fn guarded_markov_fd_hessian(
-    f: &dyn Fn(&[f64]) -> f64,
-    eta_hat: &[f64],
-    mode: f64,
-    omega: &DMatrix<f64>,
-) -> MarkovCurvature {
-    use crate::survival::{
-        data_term_hessian_fd, data_term_hessian_steps, DATA_TERM_HESSIAN_STEP_PER_SD,
-    };
-    if mode >= CTMM_FD_SENTINEL_GUARD {
-        return MarkovCurvature::Repelled;
-    }
-    let n = eta_hat.len();
-    if n == 0 {
-        return MarkovCurvature::Block(DMatrix::zeros(0, 0));
-    }
-    let sane = |x: f64| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD;
-    // The healthy path is accepted only when every value its stencil read was valid, not when
-    // the finished entries look sane: the four corners of an off-diagonal stencil can all be
-    // the sentinel and cancel exactly (`S − S − S + S = 0`), a plausible zero curvature. (The
-    // step rule's own pilots step back from a sentinel by themselves, so only the stencil is
-    // watched.) Nor below the step floor: pilots halving away from a sentinel can settle on a
-    // step where the term reads as constant to rounding, another plausible zero.
-    let steps = data_term_hessian_steps(f, eta_hat, mode, omega, DATA_TERM_HESSIAN_STEP_PER_SD);
-    let poisoned = std::cell::Cell::new(false);
-    let watched = |e: &[f64]| {
-        let v = f(e);
-        if !sane(v) {
-            poisoned.set(true);
-        }
-        v
-    };
-    let h = data_term_hessian_fd(watched, eta_hat, &steps);
-    if !poisoned.get() && steps.iter().all(|&s| s >= MARKOV_STENCIL_MIN_STEP) {
-        return MarkovCurvature::Block(h);
-    }
-
-    // Boundary fallback, on a Shi (2021) gradient-scaled step from a probe taken on a valid side.
-    let at = |moves: &[(usize, f64)]| {
-        let mut e = eta_hat.to_vec();
-        for &(j, d) in moves {
-            e[j] += d;
-        }
-        let v = f(&e);
-        sane(v).then_some(v)
-    };
-    let probe = 1e-5_f64;
-    let inv_sum: f64 = (0..n)
-        .map(|j| {
-            let g = match (at(&[(j, probe)]), at(&[(j, -probe)])) {
-                (Some(fp), Some(fm)) => (fp - fm) / (2.0 * probe),
-                (Some(fp), None) => (fp - mode) / probe,
-                (None, Some(fm)) => (mode - fm) / probe,
-                (None, None) => 0.0,
-            };
-            1.0 / g.abs().max(1e-10)
-        })
-        .sum();
-    let base =
-        ((n as f64 / inv_sum).powf(1.0 / 3.0) * f64::EPSILON.powf(1.0 / 3.0)).clamp(1e-6, 0.1);
-
-    let diagonal = |j: usize, s: f64| -> Option<f64> {
-        if let (Some(fp), Some(fm)) = (at(&[(j, 2.0 * s)]), at(&[(j, -2.0 * s)])) {
-            // the same central stencil as `data_term_hessian_fd` (step 2s)
-            return Some((fp - 2.0 * mode + fm) / (4.0 * s * s));
-        }
-        [s, -s].into_iter().find_map(|d| {
-            let (f1, f2, f3) = (at(&[(j, d)])?, at(&[(j, 2.0 * d)])?, at(&[(j, 3.0 * d)])?);
-            Some((2.0 * mode - 5.0 * f1 + 4.0 * f2 - f3) / (d * d))
-        })
-    };
-    let off_diagonal = |j: usize, k: usize, s: f64| -> Option<f64> {
-        let central = (|| {
-            Some(
-                (at(&[(j, s), (k, s)])? - at(&[(j, s), (k, -s)])? - at(&[(j, -s), (k, s)])?
-                    + at(&[(j, -s), (k, -s)])?)
-                    / (4.0 * s * s),
-            )
-        })();
-        central.or_else(|| {
-            [(s, s), (s, -s), (-s, s), (-s, -s)]
-                .into_iter()
-                .find_map(|(a, b)| {
-                    let fab = at(&[(j, a), (k, b)])?;
-                    let (fa, fb) = (at(&[(j, a)])?, at(&[(k, b)])?);
-                    Some((fab - fa - fb + mode) / (a * b))
-                })
-        })
-    };
-
-    let mut h = DMatrix::zeros(n, n);
-    for j in 0..n {
-        for k in 0..=j {
-            let entry = (0..=MARKOV_STENCIL_SHRINKS).find_map(|i| {
-                let s = base * 0.25_f64.powi(i);
-                if i > 0 && s < MARKOV_STENCIL_MIN_STEP {
-                    return None;
-                }
-                if j == k {
-                    diagonal(j, s)
-                } else {
-                    off_diagonal(j, k, s)
-                }
-            });
-            match entry.filter(|&x| sane(x)) {
-                Some(x) => {
-                    h[(j, k)] = x;
-                    h[(k, j)] = x;
-                }
-                None => return MarkovCurvature::Unmeasurable,
-            }
-        }
-    }
-    MarkovCurvature::Block(h)
 }
 
 /// `residual_correlations` carries the **live** `block_sigma` off-diagonals,
@@ -1920,6 +1786,35 @@ pub(crate) fn foce_subject_nll_cov(
     residual_cov: ResidualCov<'_>,
     interaction: bool,
 ) -> f64 {
+    foce_subject_nll_cov_at(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        residual_cov,
+        interaction,
+        None,
+    )
+}
+
+/// [`foce_subject_nll_cov`] given the predictions at `eta_hat` when the caller holds them
+/// (the inner objective's last evaluation at the mode), so the point is not predicted again.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_nll_cov_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    interaction: bool,
+    ipreds: Option<&[f64]>,
+) -> f64 {
     foce_subject_nll_cov_split(
         model,
         subject,
@@ -1930,6 +1825,7 @@ pub(crate) fn foce_subject_nll_cov(
         sigma_values,
         residual_cov,
         interaction,
+        ipreds,
         None,
     )
 }
@@ -1992,153 +1888,10 @@ pub(crate) fn foce_subject_contribution_parts(
         sigma_values,
         residual_cov,
         interaction,
+        None,
         Some(&mut parts),
     );
     parts
-}
-
-/// How the FOCEI Laplace term got a non-Gaussian data term's η-Hessian (#2437).
-#[cfg(feature = "survival")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EtaHessianRoute {
-    /// Second-order duals through the endpoint's program: no step, exact to round-off.
-    Exact,
-    /// The 4-point stencil on `data_term_hessian_steps`: the endpoint has no dual program
-    /// (an ODE-driven hazard or generator, an unresolvable expression), its η count is past
-    /// the second-order cap, or the exact kernel declined at this point.
-    FiniteDifference,
-}
-
-/// A TTE endpoint's data-term η-Hessian at `eta_hat`: exact for an analytic family with a
-/// dual program, else the FD stencil of `tte_fn` (whose value at the mode `f0` gives).
-#[cfg(feature = "survival")]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn tte_data_term_eta_hessian(
-    hazard: &HazardSpec,
-    recurrence: crate::types::TteRecurrence,
-    hazard_program: Option<&crate::parser::model_parser::EndpointExprProgram>,
-    records: &[ObsRecord],
-    covariates: &std::collections::HashMap<String, f64>,
-    theta: &[f64],
-    eta_hat: &[f64],
-    tte_fn: impl Fn(&[f64]) -> f64,
-    f0: impl FnOnce() -> f64,
-    omega: &DMatrix<f64>,
-) -> (DMatrix<f64>, EtaHessianRoute) {
-    if let (HazardSpec::Analytic { family, .. }, Some(prog)) = (hazard, hazard_program) {
-        if let Some((_, h)) = crate::survival::analytic_tte_eta_hessian(
-            records, *family, recurrence, prog, theta, eta_hat, covariates,
-        ) {
-            return (h, EtaHessianRoute::Exact);
-        }
-    }
-    let steps = crate::survival::data_term_hessian_steps(
-        &tte_fn,
-        eta_hat,
-        f0(),
-        omega,
-        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD,
-    );
-    (
-        crate::survival::data_term_hessian_fd(&tte_fn, eta_hat, &steps),
-        EtaHessianRoute::FiniteDifference,
-    )
-}
-
-/// The discrete (binary, DTMM) data term's η-Hessian at `eta_hat`: exact when every discrete
-/// endpoint has a dual program, else the FD stencil (`mode` is its value at `eta_hat`).
-///
-/// A DTMM's FD fallback goes through [`guarded_markov_fd_hessian`]: a perturbed-η matrix
-/// leaving `[0, 1]` scores the sentinel, which a plain stencil would fold as a `~1e20/h²`
-/// curvature (#2473). `None` — the caller repels the subject — when the mode is valid but no
-/// stencil around it is; a mode that is itself the sentinel contributes no curvature (the
-/// subject is already repelled by its value).
-#[cfg(feature = "survival")]
-pub(crate) fn discrete_data_term_eta_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &[f64],
-    mode: f64,
-    omega: &DMatrix<f64>,
-) -> Option<(DMatrix<f64>, EtaHessianRoute)> {
-    if let Some((_, h)) =
-        crate::categorical::discrete_subject_eta_hessian(model, subject, theta, eta_hat)
-    {
-        return Some((h, EtaHessianRoute::Exact));
-    }
-    let discrete_fn = |eta_eval: &[f64]| {
-        crate::categorical::discrete_subject_nll(model, subject, theta, eta_eval)
-    };
-    #[cfg(feature = "markov")]
-    if model.has_dtmm() {
-        let n = eta_hat.len();
-        return match guarded_markov_fd_hessian(&discrete_fn, eta_hat, mode, omega) {
-            MarkovCurvature::Block(h) => Some((h, EtaHessianRoute::FiniteDifference)),
-            MarkovCurvature::Repelled => {
-                Some((DMatrix::zeros(n, n), EtaHessianRoute::FiniteDifference))
-            }
-            MarkovCurvature::Unmeasurable => None,
-        };
-    }
-    let steps = crate::survival::data_term_hessian_steps(
-        &discrete_fn,
-        eta_hat,
-        mode,
-        omega,
-        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD,
-    );
-    Some((
-        crate::survival::data_term_hessian_fd(&discrete_fn, eta_hat, &steps),
-        EtaHessianRoute::FiniteDifference,
-    ))
-}
-
-/// The CTMM data term's η-Hessian at `eta_hat` (`mode` is its value there): exact for a
-/// homogeneous generator with a dual program, else the FD stencil.
-///
-/// `None` drops the block. When the mode itself is the degeneracy sentinel the subject is
-/// already repelled by its value; and a perturbed-η CTMM evaluation can hit the `1e20`
-/// sentinel (an observed transition underflowing, or a negative off-diagonal), which in a
-/// central-difference stencil yields a ~1e24 curvature that would poison `log|H̃|` and hence
-/// the OFV and SEs, so an FD block with any non-finite or sentinel-sized entry is dropped
-/// too (#759 review).
-#[cfg(all(feature = "survival", feature = "markov"))]
-pub(crate) fn ctmm_data_term_eta_hessian(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta_hat: &[f64],
-    mode: f64,
-    omega: &DMatrix<f64>,
-) -> Option<(DMatrix<f64>, EtaHessianRoute)> {
-    if mode >= CTMM_FD_SENTINEL_GUARD {
-        return None;
-    }
-    if let Some((_, h)) =
-        crate::markov::endpoint::ctmm_subject_eta_hessian(model, subject, theta, eta_hat)
-    {
-        return Some((h, EtaHessianRoute::Exact));
-    }
-    let ctmm_fn = |eta_eval: &[f64]| {
-        crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_eval)
-    };
-    // A time-inhomogeneous endpoint is only as accurate as its occupancy integration, so it
-    // takes the wider step (#2437).
-    let integrated = model.endpoints.values().any(|e| {
-        matches!(e, crate::types::EndpointLikelihood::Ctmm { generator_states, .. }
-            if !generator_states.is_empty())
-    });
-    let per_sd = if integrated {
-        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD_INTEGRATED
-    } else {
-        crate::survival::DATA_TERM_HESSIAN_STEP_PER_SD
-    };
-    let steps = crate::survival::data_term_hessian_steps(&ctmm_fn, eta_hat, mode, omega, per_sd);
-    let h = crate::survival::data_term_hessian_fd(&ctmm_fn, eta_hat, &steps);
-    h.iter()
-        .all(|x| x.is_finite() && x.abs() < CTMM_FD_SENTINEL_GUARD)
-        .then_some((h, EtaHessianRoute::FiniteDifference))
 }
 
 /// A subject's non-Gaussian data terms at the mode `eta_hat` (TTE endpoints, the discrete
@@ -2153,11 +1906,10 @@ fn non_gaussian_mode_terms(
     theta: &[f64],
     eta_hat: &DVector<f64>,
     joint_share: Option<&JointPkTteSolve>,
-    omega: &DMatrix<f64>,
     parts: &mut PartSink<'_>,
 ) -> (f64, DMatrix<f64>) {
     use crate::types::EndpointLikelihood;
-    // Compute TTE data NLL and FD Hessian, summed over all TTE CMTs.
+    // The TTE data NLL, summed over all TTE CMTs.
     // Iterate model.endpoints (typically 1–3 entries) rather than scanning
     // obs_records for unique CMTs — avoids the HashSet and one pass over records.
     // It is a `BTreeMap`, so both sums below run in ascending CMT order and are
@@ -2170,10 +1922,7 @@ fn non_gaussian_mode_terms(
 
     for (cmt, endpoint) in &model.endpoints {
         if let EndpointLikelihood::Tte {
-            hazard,
-            recurrence,
-            hazard_program,
-            ..
+            hazard, recurrence, ..
         } = endpoint
         {
             // A pooled buffer (#2549): this runs on every inner objective evaluation.
@@ -2191,21 +1940,7 @@ fn non_gaussian_mode_terms(
                 crate::scratch::give(records_for_cmt);
                 continue; // subject has no records for this TTE CMT
             }
-            // Closure that evaluates the TTE NLL at a given eta vector — re-solving
-            // the ODE per perturbed η for the ODE-accumulated (joint PK-TTE) case.
-            let tte_fn = |eta_eval: &[f64]| -> f64 {
-                tte_endpoint_nll(
-                    model,
-                    subject,
-                    hazard,
-                    *recurrence,
-                    &records_for_cmt,
-                    theta,
-                    eta_eval,
-                )
-            };
-            // #570: at the mode, read H/h off the shared solve when available; the
-            // FD-Hessian below still calls `tte_fn` at perturbed η (intrinsic to FD).
+            // #570: at the mode, read H/h off the shared solve when available.
             // The shared solve only where the walk does not serve the subject: the walk's
             // own value is the one its exact derivatives differentiate. The router makes
             // that choice for every caller (#901).
@@ -2223,43 +1958,6 @@ fn non_gaussian_mode_terms(
             tte_nll_at_mode += endpoint_nll;
             if parts.is_some() {
                 tte_parts.push((*cmt, endpoint_nll));
-            }
-            if n_eta > 0 {
-                // Exact for an analytic family with a dual program (`tte_data_term_eta_hessian`)
-                // and for an ODE-accumulated hazard the dual walk serves; the stencil remains
-                // for a hand-built `param_fn` and a subject outside the walk.
-                let ode_exact = match hazard {
-                    HazardSpec::OdeAccumulated { chz_state } => {
-                        crate::survival::ode_tte_eta_hessian(
-                            model,
-                            subject,
-                            *chz_state,
-                            &records_for_cmt,
-                            theta,
-                            eta_hat.as_slice(),
-                        )
-                    }
-                    HazardSpec::Analytic { .. } => None,
-                };
-                tte_h += match ode_exact {
-                    Some(h) => h,
-                    None => {
-                        // The FD fallback's pilot needs `tte_fn`'s own value at the mode.
-                        tte_data_term_eta_hessian(
-                            hazard,
-                            *recurrence,
-                            hazard_program.as_ref(),
-                            &records_for_cmt,
-                            &subject.covariates,
-                            theta,
-                            eta_hat.as_slice(),
-                            &tte_fn,
-                            || tte_fn(eta_hat.as_slice()),
-                            omega,
-                        )
-                        .0
-                    }
-                };
             }
             crate::scratch::give(records_for_cmt);
         }
@@ -2279,23 +1977,6 @@ fn non_gaussian_mode_terms(
             crate::categorical::discrete_subject_nll(model, subject, theta, eta_hat.as_slice());
         note(parts, "categorical", mode);
         tte_nll_at_mode += mode;
-        if n_eta > 0 {
-            match discrete_data_term_eta_hessian(
-                model,
-                subject,
-                theta,
-                eta_hat.as_slice(),
-                mode,
-                omega,
-            ) {
-                Some((h, _)) => tte_h += h,
-                // A valid mode whose curvature cannot be measured is not scored with none.
-                None => {
-                    note(parts, "DTMM curvature unmeasurable", f64::NAN);
-                    tte_nll_at_mode += SUBJECT_SENTINEL_NLL;
-                }
-            }
-        }
     }
 
     // CTMM (#759): same treatment — fold its NLL at the mode and FD Hessian
@@ -2306,11 +1987,43 @@ fn non_gaussian_mode_terms(
             crate::markov::endpoint::ctmm_subject_nll(model, subject, theta, eta_hat.as_slice());
         note(parts, "CTMM", mode);
         tte_nll_at_mode += mode;
-        if n_eta > 0 {
-            if let Some((h, _)) =
-                ctmm_data_term_eta_hessian(model, subject, theta, eta_hat.as_slice(), mode, omega)
-            {
-                tte_h += h;
+    }
+    // The curvature, exact: the whole term's η-Hessian from its plan (#2786). A subject a
+    // part already repels by its value takes none. One whose term cannot be recorded (never
+    // expected) takes the central-difference Hessian of the same NLL — the safety net — and is
+    // repelled only when that is not finite either.
+    if n_eta > 0 && tte_nll_at_mode < crate::survival::REPEL_SENTINEL_FLOOR {
+        match crate::survival::non_gaussian_eta_jets2(model, subject, theta, eta_hat.as_slice()) {
+            Some((_, _, h)) => tte_h += h,
+            None => {
+                // A stencil point the term repels (or cannot score) has no curvature to
+                // difference — at a mode on a feasibility boundary both sides are repelled —
+                // so the curvature is unmeasurable and the subject is repelled.
+                let poisoned = std::cell::Cell::new(false);
+                let nll = |e: &[f64]| {
+                    let mut acc = 0.0;
+                    accumulate_non_gaussian_nll(
+                        model,
+                        subject,
+                        theta,
+                        e,
+                        joint_share,
+                        1.0,
+                        &mut acc,
+                    );
+                    if !acc.is_finite() || acc >= crate::survival::REPEL_SENTINEL_FLOOR {
+                        poisoned.set(true);
+                    }
+                    acc
+                };
+                let eps: Vec<f64> = eta_hat.iter().map(|x| 1e-4 * x.abs().max(1.0)).collect();
+                let h = crate::survival::data_term_hessian_fd(nll, eta_hat.as_slice(), &eps);
+                if !poisoned.get() && h.iter().all(|v| v.is_finite()) {
+                    tte_h += h;
+                } else {
+                    note(parts, "non-Gaussian curvature unmeasurable", f64::NAN);
+                    tte_nll_at_mode += SUBJECT_SENTINEL_NLL;
+                }
             }
         }
     }
@@ -2329,6 +2042,7 @@ fn foce_subject_nll_cov_split(
     sigma_values: &[f64],
     residual_cov: ResidualCov<'_>,
     interaction: bool,
+    held_preds: Option<&[f64]>,
     #[cfg_attr(not(feature = "survival"), allow(unused_mut))] mut parts: PartSink<'_>,
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
@@ -2337,13 +2051,17 @@ fn foce_subject_nll_cov_split(
     // (the FD-Hessian's perturbed-η TTE solves below are at different η and stay separate).
     #[cfg(feature = "survival")]
     let joint_share = try_joint_pktte_shared_solve(model, subject, theta, eta_hat.as_slice());
+    let predict = || match held_preds {
+        Some(p) => p.to_vec(),
+        None => model_predictions(model, subject, theta, eta_hat.as_slice()),
+    };
     #[cfg(feature = "survival")]
     let ipreds = match &joint_share {
         Some(s) => s.preds.clone(),
-        None => model_predictions(model, subject, theta, eta_hat.as_slice()),
+        None => predict(),
     };
     #[cfg(not(feature = "survival"))]
-    let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
+    let ipreds = predict();
 
     // Per-observation custom residual magnitude (#484). η-independent, so one
     // evaluation here feeds both the data term and the Laplace curvature term.
@@ -2376,7 +2094,6 @@ fn foce_subject_nll_cov_split(
             theta,
             eta_hat,
             joint_share.as_ref(),
-            &omega.matrix,
             &mut parts,
         );
         return foce_subject_nll_interaction_with_tte(
@@ -3657,8 +3374,9 @@ fn gaussian_foce_accum(
 /// FOCEI objective cannot drift apart. Consumed by the SAEM f-SAEM kernel
 /// (`estimation::saem_imh`, #1449).
 ///
-/// Scope: the Gaussian observation rows of an analytical-PK subject with a
-/// diagonal residual R. SDE process noise, the FREM R-override, `block_sigma`
+/// Scope: the Gaussian observation rows of a subject with a diagonal residual R; an
+/// SDE subject's EKF variances `p_obs` (empty otherwise) add to each row's `V`, held
+/// η-independent as FOCEI's `H̃` holds them. The FREM R-override, `block_sigma`
 /// correlations and IIV on the residual are deliberately **not** threaded
 /// through; the caller gates those model shapes out rather than score them with
 /// an approximation this function would silently supply. Returns `None` when
@@ -3670,6 +3388,7 @@ pub(crate) fn conditional_eta_precision(
     theta: &[f64],
     eta_hat: &[f64],
     ipreds: &[f64],
+    p_obs: &[f64],
     h_matrix: &DMatrix<f64>,
     omega: &OmegaMatrix,
     sigma_values: &[f64],
@@ -3684,7 +3403,7 @@ pub(crate) fn conditional_eta_precision(
         &model.error_spec,
         sigma_values,
         model.bloq_in_force(),
-        &[],
+        p_obs,
         n_eta,
         None,
         model.residual_error_eta,
@@ -4224,11 +3943,7 @@ fn foce_subject_nll_iov_linearized_split(
     #[cfg(feature = "survival")]
     if !subject.obs_records.is_empty() {
         let eta_bsv = DVector::from_column_slice(eta_hat);
-        // The BSV block of the stacked prior `Ω_BSV ⊕ Ω_IOV…`, for the FD fallback's steps.
-        let omega_bsv = sigma_b.matrix.view((0, 0), (n_eta, n_eta)).clone_owned();
-        let (q, hq) = non_gaussian_mode_terms(
-            model, subject, theta, &eta_bsv, None, &omega_bsv, &mut parts,
-        );
+        let (q, hq) = non_gaussian_mode_terms(model, subject, theta, &eta_bsv, None, &mut parts);
         let n_b = b_hat.len();
         let mut h = DMatrix::<f64>::zeros(n_b, n_b);
         h.view_mut((0, 0), (n_eta, n_eta)).copy_from(&hq);
@@ -4341,11 +4056,10 @@ pub fn foce_population_nll_iov(
     // (e.g. 4 vs 15 threads). Collecting into an ordered `Vec` and summing
     // serially makes the objective bit-reproducible regardless of thread count
     // while keeping the expensive per-subject work parallel (#703).
-    let per_subj: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subj: Vec<f64> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let kappas = if i < kappas_per_subject.len() {
                 kappas_per_subject[i].as_slice()
             } else {
@@ -4364,7 +4078,7 @@ pub fn foce_population_nll_iov(
                 omega_iov,
             )
         })
-        .collect();
+    };
     per_subj.iter().sum()
 }
 
@@ -4417,11 +4131,10 @@ pub(crate) fn foce_population_nll_cov(
     // sum serially. A parallel `.sum()` would make the OFV depend on the
     // thread count (f64 addition is non-associative; rayon splits by worker
     // count). See `foce_population_nll_iov` and #703.
-    let per_subj: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subj: Vec<f64> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             foce_subject_nll_cov(
                 model,
                 subject,
@@ -4434,7 +4147,7 @@ pub(crate) fn foce_population_nll_cov(
                 interaction,
             )
         })
-        .collect();
+    };
     per_subj.iter().sum()
 }
 
@@ -5064,9 +4777,22 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
 
     // Data NLL — single continuous prediction with per-event occasion kappa
     // (proper cross-occasion carryover; issue #104).
-    let preds = pk::predict_iov_in(
-        model, subject, layout, theta, eta, kappas, pk_scratch, schedule,
-    );
+    let mut stacked = crate::scratch::take_with_capacity(layout.n_stacked());
+    stacked.extend_from_slice(eta);
+    for k in kappas {
+        stacked.extend_from_slice(k.as_ref());
+    }
+    let mut planned = Vec::new();
+    let preds = if nested.is_none()
+        && plan_value_preds(model, subject, Some(layout), theta, &stacked, &mut planned)
+    {
+        planned
+    } else {
+        pk::predict_iov_in(
+            model, subject, layout, theta, eta, kappas, pk_scratch, schedule,
+        )
+    };
+    crate::scratch::give(stacked);
     // FREM covariate pseudo-observations use the covariate sigma (EPSCOV), not
     // the PK residual error, so the FREM etas are sampled against the right
     // variance (mirrors the FOCE paths and the non-IOV individual_nll).
@@ -5085,6 +4811,14 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     let ruv_mult = model.ruv_obs_mult(subject, theta);
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+    // An SDE's EKF process-noise variance, on the BSV η (the filter reads one parameter set,
+    // κ = 0): the same `V = V_resid + p_obs` the IOV marginal (`foce_subject_nll_iov`) scores,
+    // so the EBE minimises the objective the outer loop differentiates.
+    let p_obs = if model.is_sde() {
+        ekf_p_obs(model, subject, theta, eta, sigma_values)
+    } else {
+        Vec::new()
+    };
     let mut data_ll = 0.0;
     // A dense `R` (a `correlation … by` line, #1082 PR5, or a `block_sigma`
     // off-diagonal, #979) scores the whole subject with the non-IOV objective's data
@@ -5101,7 +4835,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
             sigma_values,
             residual_cov,
             ruv_scale,
-            &[],
+            &p_obs,
             ruv_mult.as_deref(),
         ) {
             Some(term) => data_ll += term,
@@ -5120,6 +4854,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
                     ) * ruv_scale
                 }
             };
+            let v = v + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if model.bloq_in_force().is_censored_row(cens) {
                 data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
@@ -5393,6 +5128,7 @@ mod tests {
 
     fn make_model() -> CompiledModel {
         CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
@@ -7569,6 +7305,30 @@ mod tests {
         .expect("joint PK-TTE model must parse")
     }
 
+    /// [`joint_pktte_ode_model`] without its compiled `[odes]` program: a spec the walks
+    /// cannot record (`ode_hazard_walk_in_scope` requires `rhs_program`), while the share and
+    /// the dedicated solve integrate the same `ode.rhs` closure. The fixture for the TTE
+    /// router's non-walk arms — the one difference from the walk arm's model is the program,
+    /// so the curves are the plain model's.
+    #[cfg(feature = "survival")]
+    fn walk_declined_joint_pktte_model() -> CompiledModel {
+        let mut model = joint_pktte_ode_model();
+        model.ode_spec.as_mut().expect("ODE model").rhs_program = None;
+        model
+    }
+
+    /// The router's walk-arm predicate for `s` on the program-bearing model and on
+    /// [`walk_declined_joint_pktte_model`]: `(true, false)` is the straddle the non-walk arms'
+    /// tests stand on — the same subject, the walk taken exactly when the program is there.
+    #[cfg(feature = "survival")]
+    fn walk_scope_straddle(s: &Subject) -> (bool, bool) {
+        let in_scope = crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope;
+        (
+            in_scope(&joint_pktte_ode_model(), s),
+            in_scope(&walk_declined_joint_pktte_model(), s),
+        )
+    }
+
     /// #1885's ODE fixture (the plan's M4): [`joint_pktte_ode_model`]'s subject on oral
     /// 100 at 0/12/24, so the later doses land on residual drug, with PK observations at
     /// 2/6/14/26 and one exact event at `t_event` on CMT 2. With `reset`, one EVID=3
@@ -9337,11 +9097,10 @@ DV ~ proportional(PROP_ERR)
     /// tolerance, below every NONMEM anchor's bound (#901 plan, M5). Dies on: the share read
     /// for an in-scope subject, or the walk's terms not visited.
     ///
-    /// Skipping the walk arm outright is an **equivalent** mutation, not a hole: on its
-    /// scope the walk at `f64` reproduces the dedicated solve bit for bit (measured: rel 0 at
-    /// η ∈ {0.2, −0.4, 0, 0.7} on this fixture), and a skipped walk falls to the dedicated
-    /// solve, never the share. The walk's precedence is observable only against the share,
-    /// which this test and the declined-walk fallback below pin.
+    /// Skipping the walk arm falls to the share, which this test's `assert_ne` tells apart
+    /// from the walk. (On its scope the walk at `f64` reproduces the dedicated solve bit for
+    /// bit — measured rel 0 at η ∈ {0.2, −0.4, 0, 0.7} on this fixture — so the share is the
+    /// only engine the walk's precedence is observable against.)
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_walk_nll() {
@@ -9380,49 +9139,8 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
-    /// T6c (#901), walk fallback: a subject in the walk's scope whose walk returns `None`
-    /// (a TTE time before the first dose, which the walk cannot serve) is scored off the
-    /// **dedicated** solve, never the #570 share — the share is only for subjects outside
-    /// the walk's scope (#2482's routing), even when one exists.
-    ///
-    /// Dies on: the fallback reading the share, or the walk's `None` treated as the sentinel.
-    #[cfg(feature = "survival")]
-    #[test]
-    fn tte_record_terms_fall_back_from_a_declined_walk_to_the_dedicated_solve() {
-        let model = joint_pktte_ode_model();
-        let p = &model.default_params;
-        let (chz_state, _, _) = ode_tte_endpoint(&model);
-        let eta = [0.2];
-        let s = record_terms_subject(false, false, 5.0);
-        assert!(crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(&model, &s));
-        assert!(
-            crate::survival::ode_tte_nll_g::<f64>(
-                &model,
-                &s,
-                chz_state,
-                &s.obs_records,
-                &p.theta,
-                &eta
-            )
-            .is_none(),
-            "a pre-dose entry must be one the walk declines (straddle)"
-        );
-        let share = try_joint_pktte_shared_solve(&model, &s, &p.theta, &eta)
-            .expect("a share exists, so declining it is what is tested");
-        let terms = router_terms(&model, &s, Some(&share), &eta);
-        let dedicated = tte_ode_nll(&model, &s, chz_state, &s.obs_records, &p.theta, &eta);
-        assert_eq!(fold_terms(&terms).to_bits(), dedicated.to_bits());
-        let shared = tte_ode_nll_from_shared(
-            model.ode_spec.as_ref().unwrap(),
-            &share,
-            chz_state,
-            &s.obs_records,
-        );
-        assert_ne!(shared.to_bits(), dedicated.to_bits(), "engines must differ");
-    }
-
-    /// T6b (#901), shared arm: a steady-state dose takes the subject out of the walk's
-    /// scope while the #570 share still admits it, and the terms fold bit-identically to
+    /// T6b (#901), shared arm: a spec without a compiled `[odes]` program takes the subject
+    /// out of the walks' scope while the #570 share still admits it, and the terms fold bit-identically to
     /// the NLL the objective scores off that share (`tte_ode_nll_from_shared`), not to the
     /// dedicated solve's.
     ///
@@ -9430,14 +9148,15 @@ DV ~ proportional(PROP_ERR)
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_shared_solve_nll() {
-        let model = joint_pktte_ode_model();
+        let model = walk_declined_joint_pktte_model();
         let p = &model.default_params;
         let (chz_state, _, _) = ode_tte_endpoint(&model);
         let eta = [0.2];
         let s = record_terms_subject(false, true, 5.0);
-        assert!(
-            !crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(&model, &s),
-            "an SS dose must take the subject out of the walk's scope (straddle)"
+        assert_eq!(
+            walk_scope_straddle(&s),
+            (true, false),
+            "only the missing program may take the subject out of the walks' scope (straddle)"
         );
         let share = try_joint_pktte_shared_solve(&model, &s, &p.theta, &eta)
             .expect("the reset-free subject must take the #570 share (straddle)");
@@ -9615,8 +9334,8 @@ DV ~ proportional(PROP_ERR)
         assert!((rows[0].coxsnell - 0.10 * 104.0).abs() < 1e-12);
     }
 
-    /// T7 (#901), dedicated arm: an SS dose takes the subject out of the walk's scope and
-    /// an EVID-3 reset declines the share, and the terms fold bit-identically to the
+    /// T7 (#901), dedicated arm: a spec without a compiled `[odes]` program takes the subject
+    /// out of the walks' scope and an EVID-3 reset declines the share, and the terms fold bit-identically to the
     /// dedicated `tte_ode_nll`. Both declines are asserted first, so the test is about the
     /// dedicated arm and not about a scope that happened to be empty.
     ///
@@ -9624,14 +9343,15 @@ DV ~ proportional(PROP_ERR)
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_dedicated_solve_nll() {
-        let model = joint_pktte_ode_model();
+        let model = walk_declined_joint_pktte_model();
         let p = &model.default_params;
         let (chz_state, _, _) = ode_tte_endpoint(&model);
         let eta = [0.2];
         let r = record_terms_subject(true, true, 5.0);
-        assert!(
-            !crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(&model, &r),
-            "the SS subject must be out of the walk's scope (straddle)"
+        assert_eq!(
+            walk_scope_straddle(&r),
+            (true, false),
+            "only the missing program may take the subject out of the walks' scope (straddle)"
         );
         assert!(
             try_joint_pktte_shared_solve(&model, &r, &p.theta, &eta).is_none(),

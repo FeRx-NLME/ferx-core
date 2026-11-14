@@ -5,8 +5,7 @@
 //! the PK parameters) gives `f`, `∂f/∂pk`, `∂²f/∂pk²` exactly, no hand-derivation.
 //! The `*_hardcoded` form is kept only as an independent cross-check in tests.
 
-use super::dual2::Dual2;
-use super::num::PkNum;
+use super::num::{bateman, bateman_ss, one_minus_exp_rel, ss_factor, PkNum};
 use crate::pk::analytical_absorption::{convolve_1cpt, IgAbsorption, TransitAbsorption};
 use crate::types::DoseEvent;
 
@@ -35,7 +34,7 @@ pub fn one_cpt_iv_bolus_g<T: PkNum>(amt: f64, t: T, cl: T, v: T) -> T {
 /// its parameter sensitivity through the impulse. The single-dose path passes a
 /// constant `amt` via [`one_cpt_iv_bolus_g`]; the only formula lives here.
 pub fn one_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -47,7 +46,8 @@ pub fn one_cpt_iv_bolus_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T) -> T {
     (amt / v) * (-(k * t)).exp()
 }
 
-/// 1-cpt oral (first-order absorption), with the `KA ≈ k` L'Hôpital limit.
+/// 1-cpt oral (first-order absorption): `(F·D·KA/V)·B(k, KA, t)`, the Bateman function one
+/// smooth function through `KA = k` (`bateman`).
 pub fn one_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, ka: T, f_bio: T) -> T {
     one_cpt_oral_amt_g(T::from_f64(amt), t, cl, v, ka, f_bio)
 }
@@ -55,7 +55,7 @@ pub fn one_cpt_oral_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, ka: T, f_bio: T) ->
 /// As [`one_cpt_oral_g`] but with a generic amount `amt` (issue #524). The
 /// initial-condition path passes `A₀` as a dual with `F = 1`.
 pub fn one_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, ka: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -63,16 +63,10 @@ pub fn one_cpt_oral_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, ka: T, f_bio: T) 
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
         return c;
     }
-    if ka.val() <= 0.0 {
+    if ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return T::from_f64(0.0);
     }
-    let k = cl / v;
-    let d = f_bio * amt;
-    if (ka.val() - k.val()).abs() < 1e-6 {
-        (d * ka / v) * t * (-(k * t)).exp()
-    } else {
-        (d * ka / (v * (ka - k))) * ((-(k * t)).exp() - (-(ka * t)).exp())
-    }
+    (f_bio * amt * ka / v) * bateman(cl / v, ka, t)
 }
 
 /// 1-cpt with Savic transit-compartment absorption (`n` transit compartments,
@@ -100,28 +94,32 @@ pub fn one_cpt_transit_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, n: T, mtt: T, f_
 /// flip-flop (#386), and the subject was scored against a confident zero. It returns
 /// before `convolve_1cpt`, so `mgf`'s `debug_assert` still never sees it.
 pub fn one_cpt_transit_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // A `NaN` parameter is served as `NaN` (#2134), before — and in preference to — the
     // non-physical-parameter penalty below, so a `NaN` alongside e.g. a finite `CL ≤ 0`
     // still reaches the objective.
-    if [cl, v, n, mtt].iter().any(|x| x.val().is_nan()) {
+    if [cl, v, n, mtt].iter().any(|x| x.br_is_nan()) {
         return nan_jet(cl + v + n + mtt);
     }
-    if v.val() <= 0.0 || cl.val() <= 0.0 || n.val() < 0.0 || mtt.val() <= 0.0 {
+    if v.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || cl.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || n.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0)
+        || mtt.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    {
         return T::from_f64(0.0);
     }
     let ke = cl / v;
     let ktr = (n + T::from_f64(1.0)) / mtt;
     // `ke = ∞/∞` is `NaN` too, served the same way.
-    if ke.val().is_nan() || ktr.val().is_nan() {
+    if ke.br_is_nan() || ktr.br_is_nan() {
         return nan_jet(ke + ktr);
     }
     // Proceed only when `ke < KTR` is *definitely* true. Written `!(ke < ktr)` rather
     // than `ke >= ktr` so nothing but a finite in-domain pair reaches `mgf`'s
     // `debug_assert` (#386).
-    if !(ke.val() < ktr.val()) {
+    if !(ke.br_cmp(crate::sens::num::BranchCmp::Lt, ktr)) {
         return T::from_f64(0.0);
     }
     let abs = TransitAbsorption { n, mtt };
@@ -148,25 +146,29 @@ pub fn one_cpt_ig_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, mat: T, cv2: T, f_bio
 /// A `NaN` `ke` or abscissa is served as `NaN` before the guard (#2134), matching
 /// [`one_cpt_transit_amt_g`].
 pub fn one_cpt_ig_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // A `NaN` parameter wins over the non-physical-parameter penalty (#2134), as in
     // `one_cpt_transit_amt_g`.
-    if [cl, v, mat, cv2].iter().any(|x| x.val().is_nan()) {
+    if [cl, v, mat, cv2].iter().any(|x| x.br_is_nan()) {
         return nan_jet(cl + v + mat + cv2);
     }
-    if v.val() <= 0.0 || cl.val() <= 0.0 || mat.val() <= 0.0 || cv2.val() <= 0.0 {
+    if v.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || cl.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || mat.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+        || cv2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+    {
         return T::from_f64(0.0);
     }
     let ke = cl / v;
     // MGF abscissa of convergence: ke < 1/(2·MAT·CV²). A `NaN` is served as `NaN`
     // (#2134, see `one_cpt_transit_amt_g`).
     let abscissa = T::from_f64(1.0) / (T::from_f64(2.0) * mat * cv2);
-    if ke.val().is_nan() || abscissa.val().is_nan() {
+    if ke.br_is_nan() || abscissa.br_is_nan() {
         return nan_jet(ke + abscissa);
     }
-    if !(ke.val() < abscissa.val()) {
+    if !(ke.br_cmp(crate::sens::num::BranchCmp::Lt, abscissa)) {
         return T::from_f64(0.0);
     }
     let abs = IgAbsorption {
@@ -178,7 +180,7 @@ pub fn one_cpt_ig_amt_g<T: PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_b
 
 /// 1-cpt infusion (zero-order input of duration `dur`, rate `rate`).
 pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, v: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -189,14 +191,7 @@ pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, 
     if dur <= 0.0 {
         return one_cpt_iv_bolus_g(amt, t, cl, v);
     }
-    let k = cl / v;
-    let r_cl = T::from_f64(rate) / cl;
-    let one = T::from_f64(1.0);
-    if t.val() <= dur {
-        r_cl * (one - (-(k * t)).exp())
-    } else {
-        r_cl * (one - (-(k * T::from_f64(dur))).exp()) * (-(k * (t - T::from_f64(dur)))).exp()
-    }
+    mode_infusion(cl / v, T::from_f64(rate) / v, T::from_f64(dur), t)
 }
 
 /// 1-cpt zero-order (box-car) absorption of duration `dur` — the closed-form
@@ -213,7 +208,7 @@ pub fn one_cpt_infusion_g<T: PkNum>(rate: f64, dur: f64, amt: f64, t: T, cl: T, 
 /// `∂/∂dur` jet is exact on whichever side is selected; real observation times
 /// essentially never land exactly on `dur`.
 pub fn one_cpt_zero_order_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -221,23 +216,15 @@ pub fn one_cpt_zero_order_g<T: PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
         return c;
     }
-    if dur.val() <= 0.0 {
+    if dur.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return T::from_f64(0.0);
     }
-    let k = cl / v;
-    let d = f_bio * T::from_f64(amt);
-    let r_cl = d / (dur * cl);
-    let one = T::from_f64(1.0);
-    if t.val() <= dur.val() {
-        r_cl * (one - (-(k * t)).exp())
-    } else {
-        r_cl * (one - (-(k * dur)).exp()) * (-(k * (t - dur))).exp()
-    }
+    mode_infusion(cl / v, f_bio * T::from_f64(amt) / (dur * v), dur, t)
 }
 
 /// 1-cpt IV bolus at steady state (interval `ii`).
 pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -249,16 +236,13 @@ pub fn one_cpt_iv_bolus_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T) -> 
         return T::from_f64(0.0);
     }
     let k = cl / v;
-    let denom = T::from_f64(1.0) - (-(k * T::from_f64(ii))).exp();
-    if denom.val() <= 0.0 {
-        return T::from_f64(0.0);
-    }
-    (T::from_f64(amt) / v) * (-(k * t)).exp() / denom
+    (T::from_f64(amt) / v) * (-(k * t)).exp() * ss_factor(k, ii)
 }
 
-/// 1-cpt oral at steady state (interval `ii`), with the `KA ≈ k` L'Hôpital limit.
+/// 1-cpt oral at steady state (interval `ii`): `(F·D·KA/V)·B_ss(k, KA, t)`, smooth through
+/// `KA = k` (`bateman_ss`).
 pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, f_bio: T) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -266,28 +250,10 @@ pub fn one_cpt_oral_ss_g<T: PkNum>(amt: f64, t: T, ii: f64, cl: T, v: T, ka: T, 
     if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
         return c;
     }
-    if ka.val() <= 0.0 || ii <= 0.0 {
+    if ka.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) || ii <= 0.0 {
         return T::from_f64(0.0);
     }
-    let k = cl / v;
-    let d = f_bio * T::from_f64(amt);
-    if (ka.val() - k.val()).abs() < 1e-6 {
-        // Σ_{n≥0} (τ+nII)·e^{-k(τ+nII)} = e^{-kτ}·[τ/(1-x) + II·x/(1-x)²], x=e^{-kII}.
-        let x = (-(k * T::from_f64(ii))).exp();
-        let omx = T::from_f64(1.0) - x;
-        if omx.val() <= 0.0 {
-            return T::from_f64(0.0);
-        }
-        let s = t / omx + (x * T::from_f64(ii)) / (omx * omx);
-        (d * ka / v) * (-(k * t)).exp() * s
-    } else {
-        let denom_k = T::from_f64(1.0) - (-(k * T::from_f64(ii))).exp();
-        let denom_ka = T::from_f64(1.0) - (-(ka * T::from_f64(ii))).exp();
-        if denom_k.val() <= 0.0 || denom_ka.val() <= 0.0 {
-            return T::from_f64(0.0);
-        }
-        (d * ka / (v * (ka - k))) * ((-(k * t)).exp() / denom_k - (-(ka * t)).exp() / denom_ka)
-    }
+    (f_bio * T::from_f64(amt) * ka / v) * bateman_ss(cl / v, ka, t, ii)
 }
 
 /// 1-cpt infusion at steady state (interval `ii`), for any `dur` — including
@@ -303,7 +269,7 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     cl: T,
     v: T,
 ) -> T {
-    if t.val() < 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
     }
     // The shared #2104 rule: degenerate → 0, `NaN` → `NaN`, ahead of this form's own
@@ -317,32 +283,67 @@ pub fn one_cpt_infusion_ss_g<T: PkNum>(
     if dur <= 0.0 {
         return one_cpt_iv_bolus_ss_g(amt, t, ii, cl, v);
     }
-    let k = cl / v;
-    let denom = T::from_f64(1.0) - (-(k * T::from_f64(ii))).exp();
-    if denom.val() <= 0.0 {
-        return T::from_f64(0.0);
+    mode_infusion_ss(cl / v, T::from_f64(rate) / v, dur, ii, t)
+}
+
+// ── One disposition mode ─────────────────────────────────────────────────────
+//
+// A 1–3 compartment closed form is `Σ c·φ(λ)` over its disposition modes (rate `λ`, residue
+// `c`, [`modal_sum`]); the 1-cpt forms are the single mode `c = 1, λ = k`. The per-mode
+// responses `φ` below are written once, through `exprel` ([`one_minus_exp_rel`]), so none has a
+// pole at `λ = 0` or cancels at small `λ·τ`.
+
+/// `Σ c·f(λ)` over the `(c, λ)` modes.
+pub(crate) fn modal_sum<T: PkNum>(modes: &[(T, T)], f: impl Fn(T) -> T) -> T {
+    modes
+        .iter()
+        .fold(T::from_f64(0.0), |acc, &(c, lam)| acc + c * f(lam))
+}
+
+/// One mode's response at `t` to a zero-order input of `r_v` (rate per central volume) over
+/// `[0, dur]`: `r_v·(1 − e^{−λτ})/λ`, then decaying at `λ` after `dur`.
+pub(crate) fn mode_infusion<T: PkNum>(lam: T, r_v: T, dur: T, t: T) -> T {
+    if t.br_cmp(crate::sens::num::BranchCmp::Le, dur) {
+        r_v * t * one_minus_exp_rel(lam * t)
+    } else {
+        r_v * dur * one_minus_exp_rel(lam * dur) * (-(lam * (t - dur))).exp()
     }
-    let r_over_cl = T::from_f64(rate) / cl;
-    let one_minus_e_kt_inf = T::from_f64(1.0) - (-(k * T::from_f64(dur))).exp();
+}
+
+/// One mode's response at `t` to `dose` per unit residue: a bolus `amt·e^{−λt}`, an infusion
+/// ([`mode_infusion`] at the dose's rate; a zero-length one is a bolus), and their steady
+/// states.
+pub(crate) fn mode_dose<T: PkNum>(dose: &DoseEvent, lam: T, t: T) -> T {
+    let (rate, dur, ii) = (T::from_f64(dose.rate), dose.duration, dose.ii);
+    match (dose.is_infusion() && dur > 0.0, dose.ss && ii > 0.0) {
+        (true, true) => mode_infusion_ss(lam, rate, dur, ii, t),
+        (true, false) => mode_infusion(lam, rate, T::from_f64(dur), t),
+        (false, true) => T::from_f64(dose.amt) * (-(lam * t)).exp() * ss_factor(lam, ii),
+        (false, false) => T::from_f64(dose.amt) * (-(lam * t)).exp(),
+    }
+}
+
+/// [`mode_infusion`] at steady state (interval `ii`), for any `dur` — including overlapping
+/// pulses (`dur > ii`), where the `N` pulses still infusing at phase `t` are summed one by one
+/// (`N` depends on `t` only through its value, a locally-constant integer seeded as a
+/// constant) and the ended train decays geometrically.
+pub(crate) fn mode_infusion_ss<T: PkNum>(lam: T, r_v: T, dur: f64, ii: f64, t: T) -> T {
+    let (s, dd) = (ss_factor(lam, ii), T::from_f64(dur));
+    let infused = r_v * dd * one_minus_exp_rel(lam * dd);
     if dur > ii {
-        // Overlapping infusions: C = (R/CL)·[A + D] with `N` pulses still
-        // infusing at phase `t` (see `crate::pk::one_cpt_infusion_ss`). `N`
-        // depends on `t` only through its value (a locally-constant integer), so
-        // it is seeded as a constant and the dual derivatives flow through the
-        // exponentials.
         let n_active = (((dur - t.val()) / ii).floor() + 1.0).max(0.0);
-        let nii = T::from_f64(n_active * ii);
-        let a = T::from_f64(n_active)
-            - (-(k * t)).exp() * (T::from_f64(1.0) - (-(k * nii)).exp()) / denom;
-        let d = one_minus_e_kt_inf * (-(k * (t - T::from_f64(dur) + nii))).exp() / denom;
-        return r_over_cl * (a + d);
+        let active = (0..n_active as usize).fold(T::from_f64(0.0), |acc, j| {
+            let tj = t + T::from_f64(j as f64 * ii);
+            acc + r_v * tj * one_minus_exp_rel(lam * tj)
+        });
+        return active + infused * (-(lam * (t - dd + T::from_f64(n_active * ii)))).exp() * s;
     }
     // Past pulses (n ≥ 1) are always "after-infusion".
-    let past = r_over_cl * one_minus_e_kt_inf * (-(k * (t + T::from_f64(ii - dur)))).exp() / denom;
-    if t.val() <= dur {
-        r_over_cl * (T::from_f64(1.0) - (-(k * t)).exp()) + past
+    let past = infused * (-(lam * (t + T::from_f64(ii - dur)))).exp() * s;
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Le, dur) {
+        r_v * t * one_minus_exp_rel(lam * t) + past
     } else {
-        r_over_cl * one_minus_e_kt_inf * (-(k * (t - T::from_f64(dur)))).exp() / denom
+        infused * (-(lam * (t - dd))).exp() * s
     }
 }
 
@@ -371,7 +372,7 @@ pub fn one_cpt_conc_g<T: PkNum>(
     // `pk::single_dose_concentration` does: a degenerate `CL`/`V` drops the dose (0 even
     // when `F` is `NaN` or infinite, which the post-multiply below would turn `NaN`), a
     // `NaN` one serves `NaN`. Before arrival the leaf kernels read 0.
-    if t.val() >= 0.0 {
+    if t.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
         if let Some(c) = crate::sens::propagate::dose_override_g(cl, v) {
             return c;
         }
@@ -433,63 +434,63 @@ pub fn one_cpt_ig_conc_g<T: PkNum>(
     one_cpt_ig_amt_g(T::from_f64(dose.amt), t, cl, v, mat, cv2, f_bio)
 }
 
-// ── Sensitivity extraction (seed the active PK params as Dual2 variables) ─────
-
-/// `(f, ∂f/∂[CL,V], ∂²f/∂[CL,V]²)` for the IV bolus.
-pub fn iv_bolus_sens(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2]) {
-    let f = one_cpt_iv_bolus_g::<Dual2<2>>(
-        amt,
-        Dual2::constant(t),
-        Dual2::var(cl, 0),
-        Dual2::var(v, 1),
-    );
-    (f.value, f.grad, f.hess)
-}
-
-/// `(f, ∂f/∂[CL,V,KA,F], ∂²f/∂[CL,V,KA,F]²)` for oral.
-pub fn oral_sens(
-    amt: f64,
-    t: f64,
-    cl: f64,
-    v: f64,
-    ka: f64,
-    f_bio: f64,
-) -> (f64, [f64; 4], [[f64; 4]; 4]) {
-    let f = one_cpt_oral_g::<Dual2<4>>(
-        amt,
-        Dual2::constant(t),
-        Dual2::var(cl, 0),
-        Dual2::var(v, 1),
-        Dual2::var(ka, 2),
-        Dual2::var(f_bio, 3),
-    );
-    (f.value, f.grad, f.hess)
-}
-
-/// Independent hand-derived IV-bolus derivatives, used only to cross-check the
-/// dual path in tests (`k=CL/V`, `f=(D/V)e^{−kt}`).
-#[cfg(test)]
-fn iv_bolus_hardcoded(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2]) {
-    if t < 0.0 || v <= 0.0 || cl <= 0.0 {
-        return (0.0, [0.0; 2], [[0.0; 2]; 2]);
-    }
-    let k = cl / v;
-    let f = (amt / v) * (-k * t).exp();
-    let v2 = v * v;
-    let grad = [f * (-t / v), f * (k * t - 1.0) / v];
-    let hess = [
-        [f * t * t / v2, f * t * (2.0 - k * t) / v2],
-        [
-            f * t * (2.0 - k * t) / v2,
-            f * (k * k * t * t - 4.0 * k * t + 2.0) / v2,
-        ],
-    ];
-    (f, grad, hess)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sens::dual2::Dual2;
+
+    // ── Sensitivity extraction (seed the active PK params as Dual2 variables) ─────
+
+    /// `(f, ∂f/∂[CL,V], ∂²f/∂[CL,V]²)` for the IV bolus.
+    fn iv_bolus_sens(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2]) {
+        let f = one_cpt_iv_bolus_g::<Dual2<2>>(
+            amt,
+            Dual2::constant(t),
+            Dual2::var(cl, 0),
+            Dual2::var(v, 1),
+        );
+        (f.value, f.grad, f.hess)
+    }
+
+    /// `(f, ∂f/∂[CL,V,KA,F], ∂²f/∂[CL,V,KA,F]²)` for oral.
+    fn oral_sens(
+        amt: f64,
+        t: f64,
+        cl: f64,
+        v: f64,
+        ka: f64,
+        f_bio: f64,
+    ) -> (f64, [f64; 4], [[f64; 4]; 4]) {
+        let f = one_cpt_oral_g::<Dual2<4>>(
+            amt,
+            Dual2::constant(t),
+            Dual2::var(cl, 0),
+            Dual2::var(v, 1),
+            Dual2::var(ka, 2),
+            Dual2::var(f_bio, 3),
+        );
+        (f.value, f.grad, f.hess)
+    }
+
+    /// Independent hand-derived IV-bolus derivatives, used only to cross-check the
+    /// dual path in tests (`k=CL/V`, `f=(D/V)e^{−kt}`).
+    fn iv_bolus_hardcoded(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2]) {
+        if t < 0.0 || v <= 0.0 || cl <= 0.0 {
+            return (0.0, [0.0; 2], [[0.0; 2]; 2]);
+        }
+        let k = cl / v;
+        let f = (amt / v) * (-k * t).exp();
+        let v2 = v * v;
+        let grad = [f * (-t / v), f * (k * t - 1.0) / v];
+        let hess = [
+            [f * t * t / v2, f * t * (2.0 - k * t) / v2],
+            [
+                f * t * (2.0 - k * t) / v2,
+                f * (k * k * t * t - 4.0 * k * t + 2.0) / v2,
+            ],
+        ];
+        (f, grad, hess)
+    }
 
     /// Central FD grad + 4-point Hessian of an `N`-arg value closure.
     fn fd<const N: usize>(p: [f64; N], val: impl Fn([f64; N]) -> f64) -> ([f64; N], [[f64; N]; N]) {
@@ -554,12 +555,15 @@ mod tests {
         });
         for i in 0..4 {
             approx::assert_relative_eq!(gd[i], gfd[i], max_relative = 1e-4, epsilon = 1e-9);
+            // `epsilon` is the FD Hessian's own noise floor, `ε·|f|/h² ≈ 2e-6` at `h ≈ 2e-5`
+            // (6.2e-7 measured on the exactly-zero `∂²f/∂F²`); the mpmath reference
+            // (`closed_form_reference_tests`) pins the Hessian to 1e-11.
             for j in 0..4 {
                 approx::assert_relative_eq!(
                     hd[i][j],
                     hfd[i][j],
                     max_relative = 3e-3,
-                    epsilon = 1e-8
+                    epsilon = 5e-6
                 );
             }
         }

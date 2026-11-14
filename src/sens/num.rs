@@ -1,10 +1,9 @@
 //! `PkNum` — the small numeric interface a closed-form PK solution needs, so a
 //! single generic implementation serves both the scalar prediction (`T = f64`)
-//! and its exact sensitivities (`T = Dual2<N>`). No Enzyme, no codegen: the same
-//! source is monomorphised for each numeric type.
+//! and its exact sensitivities (`T = Dual2<N>`, or the plan-recording type
+//! `parser::kernel_jit::Tr`). The same source is monomorphised for each numeric type.
 
-use super::dual1::Dual1;
-use super::dual_mixed::DualMixed;
+use super::dual2::Dual2;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 /// Size above which a dual's arithmetic is called out of line rather than inlined at every
@@ -41,9 +40,235 @@ pub(crate) fn nan_max_abs(xs: impl IntoIterator<Item = f64>) -> f64 {
     })
 }
 
+/// An `f64` analysis the generic code runs on values ([`PkNum::host`]): a decision, or a
+/// quantity it uses without differentiating through it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum HostFn {
+    /// The spectral form of a linear ODE segment's generator
+    /// (`ode::linear::spectral_analysis`).
+    Spectral,
+    /// The scaling-and-squaring count of a matrix exponential (`ode::linear::pade_squarings`).
+    PadeSquarings,
+    /// A partial-pivoted LU factorization of the values (`sens::linsolve::lu_factor_host`).
+    LuFactor,
+    /// The forcing column's scale in an augmented generator (`ode::linear::forcing_scale`).
+    ForcingScale,
+}
+
+impl HostFn {
+    /// Every analysis, by index (a native call passes the index).
+    const ALL: [HostFn; 4] = [
+        HostFn::Spectral,
+        HostFn::PadeSquarings,
+        HostFn::LuFactor,
+        HostFn::ForcingScale,
+    ];
+    pub(crate) fn index(self) -> u16 {
+        Self::ALL.iter().position(|&f| f == self).expect("listed") as u16
+    }
+    pub(crate) fn from_index(i: u16) -> HostFn {
+        Self::ALL[i as usize]
+    }
+    /// Run the analysis on `args`' values into `out` — or reuse the result of the same
+    /// analysis on the same bits: one point's generator is analysed by its `f64` prediction and
+    /// by every derivative layout of its gradient, and the analyses are pure.
+    pub(crate) fn run(self, args: &[f64], out: &mut Vec<f64>) {
+        use std::cell::RefCell;
+        thread_local! {
+            /// The last few analyses: `(f, argument bits, result)`, most recent last.
+            static MEMO: RefCell<Vec<(HostFn, Vec<u64>, Vec<f64>)>> =
+                const { RefCell::new(Vec::new()) };
+        }
+        const KEEP: usize = 8;
+        // A hit copies the stored result straight into `out`; a miss reuses the evicted entry's
+        // buffers. Neither allocates once the memo is full.
+        let hit = MEMO.with(|m| {
+            let m = m.borrow();
+            m.iter()
+                .rev()
+                .find(|(g, bits, _)| {
+                    *g == self
+                        && bits.len() == args.len()
+                        && bits.iter().zip(args).all(|(b, a)| *b == a.to_bits())
+                })
+                .map(|(_, _, res)| {
+                    out.clear();
+                    out.extend_from_slice(res);
+                })
+                .is_some()
+        });
+        if hit {
+            return;
+        }
+        self.compute(args, out);
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            let (mut bits, mut res) = if m.len() == KEEP {
+                let (_, b, r) = m.remove(0);
+                (b, r)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            bits.clear();
+            bits.extend(args.iter().map(|a| a.to_bits()));
+            res.clear();
+            res.extend_from_slice(out);
+            m.push((self, bits, res));
+        });
+    }
+
+    fn compute(self, args: &[f64], out: &mut Vec<f64>) {
+        match self {
+            HostFn::Spectral => crate::ode::linear::spectral_analysis(args, out),
+            HostFn::PadeSquarings => crate::ode::linear::pade_squarings(args, out),
+            HostFn::LuFactor => crate::sens::linsolve::lu_factor_host(args, out),
+            HostFn::ForcingScale => crate::ode::linear::forcing_scale(args, out),
+        }
+    }
+}
+
+/// A scalar function given by its own jet: value and first four derivatives at a point
+/// (`JetFn::jet`). A recording type (#2786) records `f(x)` as one primitive whose `k`-th
+/// derivative is the jet's entry `k`; every other type lifts the jet ([`PkNum::jet_unary`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum JetFn {
+    /// `−log Φ(x)` (the probit record term).
+    NegLogNormCdf,
+    /// `ln(1 + eˣ)` (the logit record term, the softplus activation).
+    Softplus,
+    /// `Φ(x)`, the standard normal CDF (the model language's `pnorm`).
+    Pnorm,
+    /// `tanh(x)` (an activation).
+    Tanh,
+    /// `1/(1 + e⁻ˣ)` (the sigmoid activation).
+    Logistic,
+    /// `log Φ(x)` (the M3 censored row's likelihood).
+    LogNormCdf,
+    /// The inverse Mills ratio `φ(x)/Φ(x)` (the M3 censored row's curvature).
+    InvMills,
+    /// `eˣ − 1` (an interval-censored record's probability).
+    ExpM1,
+}
+
+impl JetFn {
+    /// `[f, f′, f″, f‴, f⁗]` at `x`.
+    pub(crate) fn jet(self, x: f64) -> [f64; 5] {
+        match self {
+            #[cfg(feature = "survival")]
+            JetFn::NegLogNormCdf => crate::categorical::neg_log_normal_cdf_jet(x),
+            // Only the binary endpoint's probit link builds it.
+            #[cfg(not(feature = "survival"))]
+            JetFn::NegLogNormCdf => [f64::NAN; 5],
+            JetFn::Softplus => crate::stats::special::softplus_jet(x),
+            JetFn::Pnorm => crate::stats::special::pnorm_jet(x),
+            JetFn::Tanh => crate::stats::special::tanh_jet(x),
+            JetFn::Logistic => crate::stats::special::logistic_jet(x),
+            JetFn::LogNormCdf => crate::stats::special::log_normal_cdf_jet(x),
+            JetFn::InvMills => crate::stats::special::inv_mills_jet(x),
+            JetFn::ExpM1 => {
+                let e = x.exp();
+                [x.exp_m1(), e, e, e, e]
+            }
+        }
+    }
+    pub(crate) const fn index(self) -> u8 {
+        self as u8
+    }
+    /// The function of [`Self::index`] `i`.
+    pub(crate) const fn from_index(i: u8) -> JetFn {
+        match i {
+            0 => JetFn::NegLogNormCdf,
+            1 => JetFn::Softplus,
+            2 => JetFn::Pnorm,
+            3 => JetFn::Tanh,
+            4 => JetFn::Logistic,
+            5 => JetFn::LogNormCdf,
+            6 => JetFn::InvMills,
+            _ => JetFn::ExpM1,
+        }
+    }
+}
+
+/// A comparison of two values, for [`PkNum::br_cmp`]: IEEE's ordered comparisons, and `Ne`,
+/// which holds when either side is `NaN` (Rust's `!=`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BranchCmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+impl BranchCmp {
+    /// `a cc b`, as Rust's operators decide it.
+    #[inline(always)]
+    pub fn holds(self, a: f64, b: f64) -> bool {
+        match self {
+            BranchCmp::Lt => a < b,
+            BranchCmp::Le => a <= b,
+            BranchCmp::Gt => a > b,
+            BranchCmp::Ge => a >= b,
+            BranchCmp::Eq => a == b,
+            BranchCmp::Ne => a != b,
+        }
+    }
+}
+
+// ── Divided differences of the exponential, for the 1–3 compartment closed forms ─────────────
+//
+// Every closed form is a sum of per-mode terms in `e^{−λt}`; where two rates meet (`KA` at a
+// disposition rate, a rate at 0) a term's quotient becomes 0/0. Each helper below is ONE smooth
+// function through that point, built on `exprel` — so it has no confluence branch, no
+// cancellation next to it, and exact derivatives of every order the number type carries.
+
+/// `(1 − e^{−x})/x`, with its limit `1` at `x = 0`: `exprel(−x)`, carried through the derivative
+/// orders the type observes (as `ode::linear` decides them).
+pub(crate) fn one_minus_exp_rel<T: PkNum>(x: T) -> T {
+    let orders = if x.is_constant() {
+        0
+    } else if T::JET_ORDER == 0 {
+        4
+    } else {
+        T::JET_ORDER
+    };
+    (-x).exprel(orders)
+}
+
+/// The Bateman function `(e^{−a·t} − e^{−b·t})/(b − a)`, and `t·e^{−a·t}` at `a = b`:
+/// `t·e^{−lo·t}·(1 − e^{−(hi−lo)·t})/((hi−lo)·t)` over the ordered rates. Symmetric in `a, b`;
+/// the order is a selection a recording re-makes on every evaluation (not a branch), and keeps
+/// both factors in range (`e^{−lo·t}` the larger exponential).
+pub(crate) fn bateman<T: PkNum>(a: T, b: T, t: T) -> T {
+    let lo = T::select_if(BranchCmp::Lt, a, b, a, b);
+    let hi = T::select_if(BranchCmp::Lt, a, b, b, a);
+    t * (-(lo * t)).exp() * one_minus_exp_rel((hi - lo) * t)
+}
+
+/// `1/(1 − e^{−x·ii})`: the steady-state accumulation of a mode decaying at `x` dosed every
+/// `ii`, with no cancellation at small `x·ii`. `0` off the domain `x > 0` (a non-physical rate);
+/// a `NaN` rate gives `NaN`.
+pub(crate) fn ss_factor<T: PkNum>(x: T, ii: f64) -> T {
+    if x.br_cmp_c(BranchCmp::Le, 0.0) {
+        return T::from_f64(0.0);
+    }
+    let xi = x * T::from_f64(ii);
+    T::from_f64(1.0) / (xi * one_minus_exp_rel(xi))
+}
+
+/// The steady-state Bateman function `Σₙ B(a, b, t + n·ii)`, `= (e^{−a·t}·s(a) −
+/// e^{−b·t}·s(b))/(b − a)` with `s` = [`ss_factor`], written `s(b)·(B(a,b,t) +
+/// e^{−a·t}·s(a)·B(a,b,ii))`: positive terms, one smooth function through `a = b`.
+pub(crate) fn bateman_ss<T: PkNum>(a: T, b: T, t: T, ii: f64) -> T {
+    let tail = (-(a * t)).exp() * ss_factor(a, ii) * bateman(a, b, T::from_f64(ii));
+    ss_factor(b, ii) * (bateman(a, b, t) + tail)
+}
+
 pub trait PkNum:
     Copy
-    // Every implementor is a plain numeric value type (`f64`, `Dual1`, `Dual2`, `DualMixed`)
+    // Every implementor is a plain numeric value type (`f64`, `Dual2`, the recorders' types)
     // that borrows nothing, so `'static` costs nothing and lets a `PkNum` be boxed behind a
     // trait object — how `crate::ode::solver::make_stepper` hands the shared integration
     // drivers whichever stepper the method selects.
@@ -55,7 +280,7 @@ pub trait PkNum:
     + Neg<Output = Self>
 {
     /// Whether this type carries a second-order (Hessian) jet. `false` for `f64` and the
-    /// gradient-only `Dual1`, `true` for the `Dual2`/`DualMixed` outer type. Lets a caller
+    /// first-order types, `true` for `Dual2`. Lets a caller
     /// skip building a Hessian it would discard (e.g. `tvcov_init_state` on the inner walk).
     const SECOND_ORDER: bool;
     /// Whether every derivative this type carries is of total order ≤ 2 in its inputs, so a
@@ -79,12 +304,6 @@ pub trait PkNum:
     /// adjoint's η-Hessian payload): what a [`Self::TAYLOR2_EXACT`] stand-in has to reproduce
     /// besides the tape's first θ-derivatives. Defaults to [`Self::SECOND_ORDER`].
     const ETA_HESSIAN: bool = Self::SECOND_ORDER;
-    /// Whether this value is on a reverse tape, i.e. something downstream differentiates
-    /// it once more. `false` for every type without one.
-    #[inline]
-    fn is_taped(self) -> bool {
-        false
-    }
     /// Whether this value carries no derivative at all (no jet, no tape), so a function of
     /// it may be evaluated on `f64` and lifted with [`Self::from_f64`]. Conservative:
     /// `false` unless an implementor can tell cheaply.
@@ -124,6 +343,13 @@ pub trait PkNum:
     fn logit(self) -> Self;
     /// `cos` (3-cpt trigonometric cubic root solve).
     fn cos(self) -> Self;
+    /// `sin` (the model language's, #2720): its jet lifted from the value, which a
+    /// recording type (#2786) records as one primitive instead.
+    #[inline]
+    fn sin(self) -> Self {
+        let (s, c) = (self.val().sin(), self.val().cos());
+        self.lift4(s, c, -s, -c, s)
+    }
     /// `acos` (3-cpt trigonometric cubic root solve).
     fn acos(self) -> Self;
     /// Lower-clamp the value to `lo` (branch on `.val()`), used by the bytecode
@@ -134,6 +360,189 @@ pub trait PkNum:
     /// constant rides this on the analytic ODE sensitivity path, so for the dual
     /// types it must carry 1st/2nd-order derivatives (digamma/trigamma) (#430).
     fn ln_gamma(self) -> Self;
+    /// `f` on the values of `args`: outputs that are constants of the computation (no
+    /// derivative flows through them). A recording type (#2786) records a call that runs `f`
+    /// again on every evaluation.
+    fn host(f: HostFn, args: &[Self]) -> Vec<Self> {
+        let vals: Vec<f64> = args.iter().map(|x| x.val()).collect();
+        let mut out = Vec::new();
+        f.run(&vals, &mut out);
+        out.into_iter().map(Self::from_f64).collect()
+    }
+    /// One adaptive ODE segment, for a recording type (#2786) that records it as a call the
+    /// solver's driver runs at run time; `None` — the generic integration — for every number
+    /// type. `auto` is the driver's auto-switch state.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn ode_segment(
+        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
+        _u0: &[Self],
+        _t_span: (f64, f64),
+        _params: &[Self],
+        _saveat: &[f64],
+        _interp_at: &[f64],
+        _opts: &crate::ode::OdeSolverOptions,
+        _auto: &mut dyn std::any::Any,
+    ) -> Option<(Vec<crate::ode::SolPointG<Self>>, Vec<crate::ode::SolPointG<Self>>)> {
+        None
+    }
+    /// `⌊self⌋` as a constant (no derivative): a recording type (#2786) records it, so it
+    /// follows the value on every evaluation.
+    #[inline]
+    fn floor_c(self) -> Self {
+        Self::from_f64(self.val().floor())
+    }
+    /// `f(self)` for a function given by its jet ([`JetFn`]): the jet lifted, on every type
+    /// but a recording one (#2786), which records one primitive.
+    #[inline]
+    fn jet_unary(self, f: JetFn) -> Self {
+        let [v, d1, d2, d3, d4] = f.jet(self.val());
+        self.lift4(v, d1, d2, d3, d4)
+    }
+    /// `f⁽ᵏ⁾(self)`, the `k`-th derivative of a jet function, as a function of `self`: the
+    /// jet shifted by `k` and lifted (`NaN` past the fourth derivative), on every type but a
+    /// recording one, which records one primitive. What a nested dual over a recording type
+    /// builds [`Self::jet_unary`]'s chain rule from.
+    #[inline]
+    fn jet_k(self, f: JetFn, k: u8) -> Self {
+        let j = f.jet(self.val());
+        let at = |i: usize| j.get(k as usize + i).copied().unwrap_or(f64::NAN);
+        self.lift4(at(0), at(1), at(2), at(3), at(4))
+    }
+    /// The next ODE segment's span is `[t0, t1]`, times that may depend on the inputs (a
+    /// lagged arrival, a zero-order window's end), value-only. A recording type (#2786) keeps
+    /// them so the segment it records takes its span as run-time inputs ([`Self::take_span`])
+    /// instead of the values it saw; every other type ignores it.
+    #[inline]
+    fn span_hint(_t0: Self, _t1: Self) {}
+    /// The span [`Self::span_hint`] left, taken (`None` once taken, and on every type but a
+    /// recording one).
+    #[inline]
+    fn take_span() -> Option<(Self, Self)> {
+        None
+    }
+    /// A segment time's value, for the solver's `f64` span: the value on every type; on a
+    /// recording type the value it saw, allowed only for a time [`Self::span_hint`] named (the
+    /// segment it is recording takes the time itself).
+    #[inline]
+    fn span_value(self) -> f64 {
+        self.val()
+    }
+    /// The value, for a decision the code takes on it — a discrete outcome of a
+    /// [`host`](Self::host) analysis. A recording type checks it comes out the same on every
+    /// evaluation.
+    #[inline]
+    fn br_value(self) -> f64 {
+        self.val()
+    }
+    /// `body` applied `count` times to `x0`, `count` a whole number the recording reads at run
+    /// time (#2786, `kernel_jit::record_repeat`): `None` for every type that is not a recording
+    /// type (the caller loops), `Some(None)` when the recording cannot take the call.
+    fn repeat(
+        _x0: &[Self],
+        _count: Self,
+        _body: &dyn Fn(&[Self]) -> Vec<Self>,
+    ) -> Option<Option<Vec<Self>>> {
+        None
+    }
+    /// A steady state recorded as one fixed-point call (#2786, `kernel_jit::record_fixed`):
+    /// `maps` the cycle maps the search runs (each recorded once, from `u0`), `solve` the
+    /// search itself on the values, `held` the coordinates every map leaves where they are
+    /// (the search holds them, so they take no derivative). `None` for every type that is not
+    /// a recording type — the caller solves — and `Some(None)` when the recording cannot take
+    /// the call (it fails).
+    #[allow(clippy::type_complexity)]
+    fn ss_fixed_point(
+        _n: usize,
+        _held: &[usize],
+        _u0: &[f64],
+        _maps: &[&dyn Fn(&[Self]) -> Option<Vec<Self>>],
+        _solve: Box<crate::parser::model_parser::rhs_regcode::kernel_jit::SolveFn>,
+    ) -> Option<Option<Vec<Self>>> {
+        None
+    }
+    /// The value, for a computation whose result is checked not to depend on it — a
+    /// parameter slot the tape shows constant in θ and η, evaluated with every other slot.
+    /// A recording type (#2786) reads the value it saw, with no guard.
+    #[inline]
+    fn seen_value(self) -> f64 {
+        self.val()
+    }
+    /// A magnitude to scale a computation by whose result does not depend on it — a probe
+    /// step, a column scaling: the value's size, and the jets' where the type carries them. A
+    /// recording type (#2786) keeps the one it saw; any scale gives the same exact result.
+    #[inline]
+    fn magnitude_hint(self) -> f64 {
+        self.val().abs().max(self.jet_max_abs())
+    }
+    /// Of two spellings of one quantity, `skip` and `take` — `take` the one with refinement
+    /// step `k` applied, a step that makes derivative order `k` exact (`linsolve`'s solve, a
+    /// spectral chord): `take` for every type but a recording type (#2786), whose compiled
+    /// variant takes it only when its derivative order (a reverse pass counting one more)
+    /// reaches `k`, so no variant runs a step it does not need.
+    #[inline]
+    fn order_gate(_k: u8, _skip: Self, take: Self) -> Self {
+        take
+    }
+    /// A segment of the exact linear path is integrated instead: a recording type (#2786)
+    /// counts it into its plan, which reports it on every run; every other type's caller
+    /// counts it itself.
+    #[inline]
+    fn note_linear_decline() {}
+    /// Whether `self` and `other` are the same recorded value (a recording type, #2786): an
+    /// `if`'s arm that left a variable as it was. `false` on every other type.
+    #[inline]
+    fn same_node(&self, _other: &Self) -> bool {
+        false
+    }
+    /// The value as a constant: no derivative.
+    #[inline]
+    fn value_only(self) -> Self {
+        Self::from_f64(self.val())
+    }
+    /// `exprel(z) = (e^z − 1)/z` at `self`, through the derivative orders the type carries
+    /// (`orders`, as `ode::linear` decides them): the spectral propagation's `φ(λ, Δ)/Δ`. A
+    /// recording type (#2786) records it as one primitive.
+    #[inline]
+    fn exprel(self, orders: usize) -> Self {
+        let [g0, g1, g2, g3, g4] = crate::ode::linear::exprel_derivs(self.val(), orders);
+        self.lift4(g0, g1, g2, g3, g4)
+    }
+    /// `A = ∂f/∂u` (row-major, `n = b.len()`) and `b = f(0)` of a right-hand side affine in the
+    /// state, read off the recording by a recording type (#2786); `false` — the caller probes
+    /// the RHS itself — for every number type.
+    #[inline]
+    fn affine_parts(
+        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
+        _params: &[Self],
+        _t: f64,
+        _a: &mut [Self],
+        _b: &mut [Self],
+    ) -> bool {
+        false
+    }
+    /// `f(u, t)`, `J = ∂f/∂u` (row-major) and `f_t = ∂f/∂t` of a right-hand side, exactly, read
+    /// off the recording by a recording type (#2786); `false` (nothing written) for every
+    /// number type, whose caller has the program's own evaluator or differences.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn rhs_jacobian(
+        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
+        _u: &[Self],
+        _params: &[Self],
+        _t: Self,
+        _f: &mut [Self],
+        _jac: &mut [Self],
+        _ft: &mut [Self],
+    ) -> bool {
+        false
+    }
+    /// The regularized incomplete gamma `P(self, x)`, or `Q = 1 − P` when `upper`
+    /// (`stats::special::regularized_gamma_p` / `_q`). A recording type (#2786) records it
+    /// as one primitive rather than its value-dependent iteration.
+    #[inline]
+    fn gamma_pq(self, x: Self, upper: bool) -> Self {
+        crate::stats::special::gamma_pq_g(self, x, upper)
+    }
     /// Whether every **derivative** component is finite — the gradient, and the Hessian
     /// block when the type carries one. Says nothing about [`val`](Self::val), which a
     /// caller checks separately.
@@ -150,6 +559,60 @@ pub trait PkNum:
     /// therefore inert on the prediction path and only ever fires on a dual instantiation
     /// (see `crate::ode::solver`'s escalation guard for why that asymmetry is deliberate).
     fn jets_finite(self) -> bool;
+    /// `self cc other` on the values, for a branch the code takes on them. The recording
+    /// type (#2786) turns it into a guard its compiled plan re-evaluates, so a branch that
+    /// would go the other way records another variant instead of being baked in.
+    #[inline]
+    fn br_cmp(self, cc: BranchCmp, other: Self) -> bool {
+        cc.holds(self.val(), other.val())
+    }
+    /// [`Self::br_cmp`] against a literal.
+    #[inline]
+    fn br_cmp_c(self, cc: BranchCmp, c: f64) -> bool {
+        cc.holds(self.val(), c)
+    }
+    /// `base + self cc c` on the values, for a branch (see [`Self::br_cmp`]): a time shifted
+    /// by a parameter, such as a dose's lagged arrival `t_dose + lag` against a time.
+    #[inline]
+    fn br_shift_cmp(self, base: f64, cc: BranchCmp, c: f64) -> bool {
+        cc.holds(base + self.val(), c)
+    }
+    /// Whether this type records its branches (a recording type, #2786), so code that
+    /// decides on an `f64` it derived from a parameter must decide through the branch API
+    /// instead. `false` for every number type: their decisions stay as they are.
+    const RECORDS_BRANCHES: bool = false;
+    /// `|self| < tol` on the value, for a branch (see [`Self::br_cmp`]).
+    #[inline]
+    fn br_abs_lt(self, tol: f64) -> bool {
+        self.val().abs() < tol
+    }
+    /// `|self − other| < tol` on the values, for a branch (see [`Self::br_cmp`]).
+    #[inline]
+    fn br_absdiff_lt(self, other: Self, tol: f64) -> bool {
+        (self.val() - other.val()).abs() < tol
+    }
+    /// An event boundary of the computation being evaluated: a recording type (#2786)
+    /// cuts its recording here into chunks it compiles once and shares across subjects.
+    /// Nothing for a number.
+    #[inline(always)]
+    fn chunk_mark() {}
+    /// `if x cc y { a } else { b }` on the values, as a selection rather than a branch: a
+    /// recording type (#2786) records it, so the choice is made again on every evaluation —
+    /// for a condition that changes inside the code it records (a time window inside an ODE
+    /// step), where a branch's guard would fail.
+    #[inline]
+    fn select_if(cc: BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self {
+        if cc.holds(x.val(), y.val()) {
+            a
+        } else {
+            b
+        }
+    }
+    /// Whether the value is `NaN`, for a branch (see [`Self::br_cmp`]).
+    #[inline]
+    fn br_is_nan(self) -> bool {
+        self.val().is_nan()
+    }
 
     /// The largest absolute **derivative** component — gradient, and the Hessian block when
     /// the type carries one; `0.0` for `f64`. Like [`jets_finite`](Self::jets_finite) it
@@ -183,7 +646,7 @@ pub trait PkNum:
     }
 
     /// [`Self::lift2`] with the third derivative `d3 = φ‴` too, for types that carry a
-    /// second-order jet over a differentiable base (`sens::rtape::DualH`): their
+    /// nested dual over a differentiable base (`sens::jet::DualT`): their
     /// `φ″` factor needs its own derivative. The default drops `d3`, which is exact for
     /// every type tracking fewer orders.
     #[inline]
@@ -192,7 +655,7 @@ pub trait PkNum:
     }
 
     /// [`Self::lift3`] with the fourth derivative `d4 = φ⁗` too, for the covariance step's
-    /// nested dual (`sens::rtape::DualH` over `DualT` over the reverse tape), which carries
+    /// nested jet (`sens::jet::DualT` over `DualT` over the recording type), which carries
     /// four orders: a Laplace exact-anchor R-matrix differentiates `∂²f/∂η²` twice more.
     /// The default drops `d4`, which is exact for every type tracking fewer orders.
     #[inline]
@@ -203,7 +666,7 @@ pub trait PkNum:
     /// `u + h·(c₀k₀ + c₁k₁ + …)` with exactly this association (left-to-right sum,
     /// then `h·`, then `u +`): an explicit RK stage combination. The default *is* that
     /// expression, so `f64` and the forward duals keep their trajectories bit for bit.
-    /// The adjoint tape type (`sens::vtape::DualV`) overrides it to record one
+    /// The recording type (`kernel_jit::Tr`) overrides it to record one
     /// node instead of `~3j` binary ones.
     #[inline]
     fn lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self {
@@ -215,8 +678,8 @@ pub trait PkNum:
     }
 
     /// `((acc + x₀·w₀) + x₁·w₁) + …`, each term `xⱼ · from_f64(wⱼ)`, left to right: a
-    /// Rosenbrock stage combination. The default *is* that expression; the adjoint tape type
-    /// (`sens::vtape::DualV`) computes the same values and records one linear node instead
+    /// Rosenbrock stage combination. The default *is* that expression; the recording type
+    /// (`kernel_jit::Tr`) computes the same values and records one linear node instead
     /// of two per term.
     #[inline]
     fn axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self {
@@ -244,7 +707,7 @@ pub trait PkNum:
     const FUSED_FOLDS: bool = false;
 
     /// `((acc + a₀·b₀) + a₁·b₁) + …`, left to right: one entry of a matrix product. The
-    /// default *is* that expression; `DualV` computes the same values and records one node
+    /// default *is* that expression; the recording type computes the same values and records one node
     /// whose rule is the product rule per pair, instead of two nodes per term.
     #[inline]
     fn dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self {
@@ -262,14 +725,14 @@ pub trait PkNum:
     }
 
     /// `(a − b) · from_f64(s)`: a forward-difference quotient. The default *is* that
-    /// expression; `DualV` computes the same values and records one linear node.
+    /// expression; the recording type computes the same values and records one linear node.
     #[inline]
     fn scaled_diff(a: Self, b: Self, s: f64) -> Self {
         (a - b) * Self::from_f64(s)
     }
 
     /// `base + Σ αₜ·xₜ·yₜ`, left to right: one entry of a weighted Gram sum such as the
-    /// FOCEI `H̃ = Ω⁻¹ + Σ_j α_j g_j g_jᵀ`. The reverse tape (`sens::rtape::R`)
+    /// FOCEI `H̃ = Ω⁻¹ + Σ_j α_j g_j g_jᵀ`. The recording type (`kernel_jit::Tr`)
     /// overrides it to record one node instead of three per term.
     #[inline]
     fn wsum3(base: f64, terms: impl Iterator<Item = (Self, Self, Self)>) -> Self {
@@ -280,8 +743,8 @@ pub trait PkNum:
         s
     }
 
-    /// `x₁·y₁ + x₂·y₂`: a product rule's tangent (`g·v′ + v·g′`). The reverse tape
-    /// (`sens::rtape::R`) overrides it to record **one** node with the four partials instead
+    /// `x₁·y₁ + x₂·y₂`: a product rule's tangent (`g·v′ + v·g′`). The recording type
+    /// (`kernel_jit::Tr`) overrides it to record **one** node with the four partials instead
     /// of three (two products and a sum, #2481 §2.2); every other type keeps exactly this
     /// arithmetic, so its values do not move.
     #[inline]
@@ -290,7 +753,7 @@ pub trait PkNum:
     }
 
     /// `((x₁·y₁ + x₂·y₂) + x₃·y₃) + x₄·y₄`, left to right: a second-order product rule's
-    /// Hessian entry. As [`Self::dot2`]: one node on the reverse tape, this arithmetic
+    /// Hessian entry. As [`Self::dot2`]: one recorded node on the recording type, this arithmetic
     /// everywhere else.
     #[allow(clippy::too_many_arguments)]
     #[inline]
@@ -313,19 +776,25 @@ pub trait PkNum:
     /// itself (it may leave `m` unfactored and keep its state behind `piv`), `None` to
     /// run the generic elimination (`sens::linsolve`).
     #[inline]
-    fn lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> Option<bool> {
+    fn lu_factor_hook(_m: &mut [Self], _piv: &mut [Self], _n: usize) -> Option<bool> {
         None
     }
 
     /// Solve hook paired with [`Self::lu_factor_hook`]; `true` when handled.
     #[inline]
-    fn lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool {
+    fn lu_solve_hook(_m: &[Self], _piv: &[Self], _n: usize, _b: &mut [Self]) -> bool {
         false
     }
 }
 
 impl PkNum for f64 {
     const SECOND_ORDER: bool = false;
+    /// Order 0 alone, one accumulator: the bits of `exprel_derivs`'s entry 0 whatever the
+    /// orders asked (`exprel_k_is_exprel_derivs_order_for_order`), and a value has no jet.
+    #[inline]
+    fn exprel(self, _orders: usize) -> Self {
+        crate::ode::linear::exprel_k(self, 0)
+    }
     #[inline]
     fn same_bits_untaped(&self, other: &Self) -> Option<bool> {
         Some(self.to_bits() == other.to_bits())
@@ -379,6 +848,10 @@ impl PkNum for f64 {
         f64::cos(self)
     }
     #[inline]
+    fn sin(self) -> Self {
+        f64::sin(self)
+    }
+    #[inline]
     fn acos(self) -> Self {
         f64::acos(self)
     }
@@ -403,12 +876,8 @@ impl PkNum for f64 {
 }
 
 /// Generate the `PkNum` impl for a dual type whose every method is a one-line
-/// delegation to the inherent method of the same name. `Dual1<N>` and
-/// `DualMixed<NA, N>` differ only in their const-generic list, the
-/// `SECOND_ORDER` flag, and (implicitly) which inherent method the delegator
-/// resolves to — everything else is identical, including the `guard_floor`
-/// NaN-flooring body. The scalar `f64` impl stays hand-written (its bodies are
-/// inline formulas, not delegation).
+/// delegation to the inherent method of the same name (`Dual2` is the one user). The
+/// scalar `f64` impl stays hand-written (its bodies are inline formulas, not delegation).
 macro_rules! impl_pknum_delegate {
     ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr) => {
         impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
@@ -505,37 +974,25 @@ macro_rules! impl_pknum_delegate {
     };
 }
 
-impl_pknum_delegate!(Dual1<const N: usize>, second_order = false);
-impl_pknum_delegate!(DualMixed<const NA: usize, const N: usize>, second_order = true);
+impl_pknum_delegate!(Dual2<const N: usize>, second_order = true);
 
-/// In-place arithmetic for the generic bytecode VM (`eval_bytecode_g`).
-///
-/// The VM keeps its operands on a `Vec<T>` stack. For the outer `DualMixed<NA, N>`
-/// type a value is several KB (`N + NA·N + 1` doubles), so the by-value
-/// `pop, pop, push(a ∘ b)` shape spent about a third of a busulfan ODE+IOV FOCEI fit
-/// in `memmove`/`memset` — moving operands and materialising all-zero jets for
-/// constants. These update the left operand where it sits on the stack and take the
-/// right one by reference, or as a bare `f64` when it is a constant, covariate or
-/// `TIME`.
-///
-/// **Every method is bit-identical to the by-value operator it replaces**, the scalar
-/// ones included: they evaluate the formula the operator would apply to a
-/// `from_f64(c)` operand term by term — `x·0.0`, `+ 0.0` and all — just without
-/// building that operand. So signed zeros and `inf · 0 = NaN` come out exactly as
-/// before. `f64` and `Dual1` (small enough that moves are cheap) use the operators
-/// themselves; `DualMixed` writes the same formulas as in-place loops.
+/// Arithmetic for the generic bytecode VM (`eval_bytecode_g`), which keeps its operands
+/// on a `Vec<T>` stack: update the left operand in place, take the right by reference, or
+/// as a bare `f64` when it is a constant, covariate or `TIME`. Every implementation is
+/// bit-identical to the by-value operator it stands for (signed zeros and
+/// `inf · 0 = NaN` included).
 ///
 /// In a crate-private module, so it is not public API and does not constrain
 /// `PkNum`: the VM and the generic code that drives it bound on [`vm::VmNum`]
 /// (`PkNum + VmArith`) instead.
 pub(crate) mod vm {
-    use super::{Dual1, DualMixed};
+    use super::Dual2;
 
     /// A number type's lanes as the RHS's native code sees them (`parser::rhs_ir`): `f64`
     /// (`n = m = 0`), or a dual of `n` tangents and an `m`-entry second-order payload,
     /// laid out `[value, g_0 … g_{n−1}, h_0 … h_{m−1}]`.
     ///
-    /// `th` is `DualV`'s directional mode (`m = n`, `h_k = ∂²/∂t_k²`); otherwise a
+    /// `th` is the directional mode (`m = n`, `h_k = ∂²/∂t_k²`); otherwise a
     /// non-empty payload is the packed lower triangle (`m = n(n+1)/2`). `wide` is
     /// [`super::outlined`]: such a dual applies a constant operand of `×`/`÷` as a full
     /// product with the constant dual, a different operation order.
@@ -545,6 +1002,10 @@ pub(crate) mod vm {
         pub(crate) m: u16,
         pub(crate) th: bool,
         pub(crate) wide: bool,
+        /// Forward-mode tangent directions (#2786): each slot holds the base layout's lanes,
+        /// then `tan` more blocks of them, block `j` the tangent along direction `j`
+        /// (`rhs_ir::tangent_packed`). `0` for every number type.
+        pub(crate) tan: u8,
     }
 
     impl Layout {
@@ -553,62 +1014,33 @@ pub(crate) mod vm {
             m: 0,
             th: false,
             wide: false,
+            tan: 0,
         };
         pub(crate) const fn lanes(&self) -> usize {
+            self.base_lanes() * (1 + self.tan as usize)
+        }
+        /// The lanes of one block: the value, the tangents, the payload.
+        pub(crate) const fn base_lanes(&self) -> usize {
             1 + self.n as usize + self.m as usize
+        }
+        /// The layout without its tangent blocks.
+        pub(crate) const fn base(&self) -> Layout {
+            Layout { tan: 0, ..*self }
+        }
+        /// The highest derivative order the lanes carry: 2 with a second-order payload, 1
+        /// with first-order tangents alone, 0 for `f64`; tangent blocks one more.
+        pub(crate) const fn order(&self) -> usize {
+            (if self.m > 0 {
+                2
+            } else if self.n > 0 {
+                1
+            } else {
+                0
+            }) + (self.tan > 0) as usize
         }
     }
 
-    /// A compiled RHS a tape can record whole and differentiate later (`parser::rhs_jit`):
-    /// its native forward and reverse pass over a [`Layout`]'s lanes, `fn(u, params, seeds,
-    /// du)` and `fn(u, params, seeds, du, ū, p̄, s̄, dū)`.
-    pub(crate) trait RhsKernel: Send + Sync {
-        /// How many elements of `u`, `params` and `du` the program touches.
-        fn extent(&self) -> (usize, usize, usize);
-        /// Whether every derivative below the extent is written, so an output never
-        /// depends on what `du` held before the call.
-        fn writes_every_du(&self) -> bool;
-        /// Whether a native forward exists (or can be built) for `layout`.
-        fn has_forward(&self, layout: Layout) -> bool;
-        /// Whether a reverse pass exists (or can be built) for `layout`.
-        fn has_reverse(&self, layout: Layout) -> bool;
-        /// The forward over `layout`.
-        ///
-        /// # Safety
-        /// Each pointer covers [`Self::extent`]'s elements (4 seeds) of `layout`'s lanes,
-        /// and `du` does not overlap the inputs; [`Self::has_forward`] holds.
-        unsafe fn forward(
-            &self,
-            layout: Layout,
-            u: *const f64,
-            params: *const f64,
-            seeds: *const f64,
-            du: *mut f64,
-        );
-        /// Add `dūᵀ·∂du/∂(u, params, seeds)` into `ū`, `p̄`, `s̄`.
-        ///
-        /// # Safety
-        /// As [`Self::forward`] for the primal inputs; each adjoint buffer is laid out like
-        /// its primal; [`Self::has_reverse`] holds.
-        #[allow(clippy::too_many_arguments)]
-        unsafe fn reverse(
-            &self,
-            layout: Layout,
-            u: *const f64,
-            params: *const f64,
-            seeds: *const f64,
-            u_bar: *mut f64,
-            p_bar: *mut f64,
-            s_bar: *mut f64,
-            du_bar: *const f64,
-        );
-    }
-
     pub trait VmArith: Sized {
-        /// Whether a value of this type can carry a tape node, so evaluating the same
-        /// expression twice records it twice. Code that reuses a value instead of
-        /// recomputing it (the ODE RHS's hoist) changes such a type's tape.
-        const RECORDS_TAPE: bool = false;
         /// This type's lanes for the RHS's native code, when it has them: `f64`, and the
         /// duals whose every part is an `f64` and whose arithmetic is the lane arithmetic
         /// `parser::rhs_ir` transcribes.
@@ -629,19 +1061,6 @@ pub(crate) mod vm {
         /// A value, off any tape, from its lanes (a non-contiguous type).
         fn from_lanes(_lanes: &[f64]) -> Self {
             unreachable!("only a non-contiguous type with LANES copies its lanes")
-        }
-        /// Record one whole RHS call on this type's tape: `du` from `kernel`'s native
-        /// forward, as tape nodes whose reverse rule is `kernel`'s reverse pass, instead of
-        /// one node per operation. `false`, with nothing written or recorded, when the type
-        /// has no such record or the kernel cannot serve it.
-        fn tape_rhs(
-            _kernel: &std::sync::Arc<dyn RhsKernel>,
-            _u: &[Self],
-            _params: &[Self],
-            _seeds: &[Self; 4],
-            _du: &mut [Self],
-        ) -> bool {
-            false
         }
         /// `self = self + rhs`.
         fn add_in(&mut self, rhs: &Self);
@@ -735,7 +1154,7 @@ pub(crate) mod vm {
         const LANES: Option<Layout> = Some(Layout::F64);
         const CONTIGUOUS: bool = true;
     );
-    impl_vm_by_value!(Dual1<N>, Dual1::<N>::constant, Dual1::<N>::same_bits, N);
+    impl_vm_by_value!(Dual2<N>, Dual2::<N>::constant, Dual2::<N>::same_bits, N);
     /// By-value `VmArith` for a type whose operators and `from_f64` are its own.
     macro_rules! vm_ops_body {
         ($same:expr) => {
@@ -786,172 +1205,19 @@ pub(crate) mod vm {
         };
     }
 
-    /// The scalar reverse tape: the same value *and* the same tape node.
-    impl VmArith for crate::sens::rtape::R {
-        const RECORDS_TAPE: bool = true;
-        vm_ops_body!(
-            |a: &crate::sens::rtape::R, b: &crate::sens::rtape::R| a.v.to_bits() == b.v.to_bits()
-                && a.i == b.i
-        );
-    }
-
-    impl<const N: usize, B: VmNum> VmArith for crate::sens::rtape::DualT<N, B> {
-        const RECORDS_TAPE: bool = B::RECORDS_TAPE;
+    impl<const N: usize, B: VmNum> VmArith for crate::sens::jet::DualT<N, B> {
         vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
             && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y)));
-    }
-
-    impl<const N: usize, const M: usize, B: VmNum, const D: bool> VmArith
-        for crate::sens::rtape::DualH<N, M, B, D>
-    {
-        const RECORDS_TAPE: bool = B::RECORDS_TAPE;
-        vm_ops_body!(|a: &Self, b: &Self| a.v.same_bits(&b.v)
-            && a.g.iter().zip(&b.g).all(|(x, y)| x.same_bits(y))
-            && a.h.iter().zip(&b.h).all(|(x, y)| x.same_bits(y)));
-    }
-
-    /// Both tape modes of [`crate::sens::vtape::DualV`] (the macro takes `usize` consts only).
-    impl<const N: usize, const M: usize, const TH: bool> VmArith
-        for crate::sens::vtape::DualV<N, M, TH>
-    {
-        const RECORDS_TAPE: bool = true;
-        const LANES: Option<Layout> = Some(Layout {
-            n: N as u16,
-            m: M as u16,
-            th: TH,
-            wide: crate::sens::vtape::DualV::<N, M, TH>::WIDE,
-        });
-        #[inline]
-        fn native_ok(&self) -> bool {
-            !<Self as super::PkNum>::is_taped(*self)
-        }
-        #[inline]
-        fn put_lanes(&self, out: &mut [f64]) {
-            out[0] = self.v;
-            out[1..1 + N].copy_from_slice(&self.g);
-            out[1 + N..1 + N + M].copy_from_slice(&self.h);
-        }
-        #[inline]
-        fn from_lanes(l: &[f64]) -> Self {
-            let mut g = [0.0; N];
-            let mut h = [0.0; M];
-            g.copy_from_slice(&l[1..1 + N]);
-            h.copy_from_slice(&l[1 + N..1 + N + M]);
-            crate::sens::vtape::DualV::free(l[0], g, h)
-        }
-        #[inline]
-        fn tape_rhs(
-            kernel: &std::sync::Arc<dyn RhsKernel>,
-            u: &[Self],
-            params: &[Self],
-            seeds: &[Self; 4],
-            du: &mut [Self],
-        ) -> bool {
-            crate::sens::vtape::record_rhs(kernel, u, params, seeds, du)
-        }
-        #[inline]
-        fn add_in(&mut self, rhs: &Self) {
-            *self = *self + *rhs;
-        }
-        #[inline]
-        fn sub_in(&mut self, rhs: &Self) {
-            *self = *self - *rhs;
-        }
-        #[inline]
-        fn rsub_in(&mut self, rhs: &Self) {
-            *self = *rhs - *self;
-        }
-        #[inline]
-        fn mul_in(&mut self, rhs: &Self) {
-            *self = *self * *rhs;
-        }
-        #[inline]
-        fn div_in(&mut self, rhs: &Self) {
-            *self = *self / *rhs;
-        }
-        #[inline]
-        fn add_scalar_in(&mut self, c: f64) {
-            *self = self.add_c(c);
-        }
-        #[inline]
-        fn sub_scalar_in(&mut self, c: f64) {
-            *self = self.sub_c(c);
-        }
-        #[inline]
-        fn rsub_scalar_in(&mut self, c: f64) {
-            *self = self.rsub_c(c);
-        }
-        #[inline]
-        fn mul_scalar_in(&mut self, c: f64) {
-            *self = self.mul_c(c);
-        }
-        #[inline]
-        fn div_scalar_in(&mut self, c: f64) {
-            *self = self.div_c(c);
-        }
-        #[inline]
-        fn same_bits(&self, other: &Self) -> bool {
-            crate::sens::vtape::DualV::same_bits(self, other)
-        }
-    }
-
-    impl<const NA: usize, const N: usize> VmArith for DualMixed<NA, N> {
-        #[inline]
-        fn add_in(&mut self, rhs: &Self) {
-            DualMixed::add_in(self, rhs)
-        }
-        #[inline]
-        fn sub_in(&mut self, rhs: &Self) {
-            DualMixed::sub_in(self, rhs)
-        }
-        #[inline]
-        fn rsub_in(&mut self, rhs: &Self) {
-            DualMixed::rsub_in(self, rhs)
-        }
-        #[inline]
-        fn mul_in(&mut self, rhs: &Self) {
-            DualMixed::mul_in(self, rhs)
-        }
-        #[inline]
-        fn div_in(&mut self, rhs: &Self) {
-            DualMixed::div_in(self, rhs)
-        }
-        #[inline]
-        fn add_scalar_in(&mut self, c: f64) {
-            DualMixed::add_scalar_in(self, c)
-        }
-        #[inline]
-        fn sub_scalar_in(&mut self, c: f64) {
-            DualMixed::sub_scalar_in(self, c)
-        }
-        #[inline]
-        fn rsub_scalar_in(&mut self, c: f64) {
-            DualMixed::rsub_scalar_in(self, c)
-        }
-        #[inline]
-        fn mul_scalar_in(&mut self, c: f64) {
-            DualMixed::mul_scalar_in(self, c)
-        }
-        #[inline]
-        fn div_scalar_in(&mut self, c: f64) {
-            DualMixed::div_scalar_in(self, c)
-        }
-        #[inline]
-        fn same_bits(&self, other: &Self) -> bool {
-            DualMixed::same_bits(self, other)
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sens::dual1::Dual1;
     use crate::sens::dual2::Dual2;
-    use crate::sens::dual_mixed::DualMixed;
 
     /// Exercise every `PkNum` method on a value once, so the per-impl delegators
-    /// (and the underlying `Dual1`/`Dual2` ops they call) are covered. `0.7` is a
+    /// (and the underlying `Dual2`/`Dual2` ops they call) are covered. `0.7` is a
     /// safe argument for all: positive (exp/ln/sqrt/pow), in `(0,1)` (logit/
     /// inv_logit) and in `[-1,1]` (acos).
     fn exercise<T: PkNum>(x: T) {
@@ -975,27 +1241,21 @@ mod tests {
     #[test]
     fn pknum_all_methods_covered_for_each_impl() {
         exercise::<f64>(0.7);
-        exercise::<Dual1<1>>(Dual1::var(0.7, 0));
         exercise::<Dual2<1>>(Dual2::var(0.7, 0));
-        exercise::<DualMixed<1, 2>>(DualMixed::var(0.7, 0));
     }
 
     /// `sqrt` at a zero argument — `0.0`, `-0.0`, a rounded-negative `-1e-18`, each raw and
     /// through the bytecode VM's `guard_floor(0.0)` — is flat on **every** `PkNum` type: a
-    /// constant with a finite, zero jet and no tape node (#2892). Before, `Dual1`/`Dual2`
-    /// returned a constant while `DualV`/`DualF`, `R`/`DualT`/`DualH` and `Taylor` put
-    /// `0.5 / 0 = inf` into the chain (`inf` with a live tangent, `NaN` with a floored one),
-    /// so which derivative engine served a subject depended on whether `sqrt`'s argument
-    /// touched zero. Each input is seeded *live* (a unit tangent, and a tape input where the
-    /// type has a θ tape), so the old rule shows up as a non-finite or taped result; the
-    /// `0.25` control straddles the gate, so an implementation that is flat everywhere
-    /// fails too.
+    /// constant with a finite, zero jet (#2892). A `0.5 / 0 = inf` in the chain would be `inf`
+    /// with a live tangent and `NaN` with a floored one, so which derivative engine served a
+    /// subject would depend on whether `sqrt`'s argument touched zero. Each input is seeded
+    /// *live* (a unit tangent), so the old rule shows up as a non-finite or non-constant
+    /// result; the `0.25` control straddles the gate, so an implementation that is flat
+    /// everywhere fails too. The compiled plan's recorder (`Tr`) is pinned the same way, at
+    /// the plan level, by `kernel_jit::sqrt_at_zero_is_flat_in_a_compiled_plan`.
     #[test]
     fn sqrt_at_zero_is_flat_on_every_pknum_type() {
-        use crate::sens::rtape::{rinput, rtape_reset, DualH, DualT, R};
         use crate::sens::taylor::Taylor;
-        use crate::sens::vfree::DualF;
-        use crate::sens::vtape::{vtape_reset, DualV};
 
         fn check<T: PkNum>(name: &str, mk: impl Fn(f64) -> T) {
             for x in [0.0, -0.0, -1e-18] {
@@ -1027,26 +1287,8 @@ mod tests {
             );
         }
 
-        rtape_reset();
-        vtape_reset(2);
-        check("Dual1", |x| Dual1::<1>::var(x, 0));
         check("Dual2", |x| Dual2::<1>::var(x, 0));
-        check("DualMixed", |x| DualMixed::<1, 2>::var(x, 0));
-        check("DualV", |x| DualV::<1, 1>::leaf(x, [1.0], [0.0]));
-        check("DualF", |x| DualF::<1, 1>::var(x, 0));
-        check("R", |x| -> R { rinput(x) });
-        check("DualT", |x| DualT::<1, R> {
-            v: rinput(x),
-            g: [R::c(1.0)],
-        });
-        check("DualH", |x| DualH::<1, 1, R> {
-            v: rinput(x),
-            g: [R::c(1.0)],
-            h: [R::c(0.0)],
-        });
         check("Taylor", |x| Taylor::<1, 2, 3>::seed(x, 0));
-        rtape_reset();
-        vtape_reset(2);
     }
 
     /// `guard_floor(NaN)` must floor (return `lo`) on the duals exactly as it does on
@@ -1058,17 +1300,12 @@ mod tests {
     fn guard_floor_floors_nan_consistently_across_impls() {
         let lo = 1e-6;
         assert_eq!(f64::NAN.guard_floor(lo), lo);
-        assert_eq!(Dual1::<1>::var(f64::NAN, 0).guard_floor(lo).value, lo);
         assert_eq!(Dual2::<1>::var(f64::NAN, 0).guard_floor(lo).value, lo);
-        assert_eq!(
-            DualMixed::<1, 2>::var(f64::NAN, 0).guard_floor(lo).value,
-            lo
-        );
         // The floored dual carries a zero jet (flat clamped region).
-        let g = Dual1::<1>::var(f64::NAN, 0).guard_floor(lo);
+        let g = Dual2::<1>::var(f64::NAN, 0).guard_floor(lo);
         assert_eq!(g.grad[0], 0.0);
         // A value already above the floor is untouched.
-        assert_eq!(Dual1::<1>::var(5.0, 0).guard_floor(lo).value, 5.0);
+        assert_eq!(Dual2::<1>::var(5.0, 0).guard_floor(lo).value, 5.0);
     }
 
     /// The `ln_gamma` `Dual2` rule: its analytic 1st (digamma) and 2nd (trigamma)

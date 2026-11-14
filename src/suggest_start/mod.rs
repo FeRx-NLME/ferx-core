@@ -17,6 +17,7 @@ mod nca;
 mod pooling;
 mod sweep;
 
+use crate::cold_sort::ColdSort;
 use rayon::prelude::*;
 
 use crate::diagnostics::first_error;
@@ -504,7 +505,7 @@ fn try_biexp_peel(
         return;
     }
 
-    all_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    all_pairs.cold_sort_by(&|a, b| a.0.partial_cmp(&b.0).unwrap());
 
     // Average concentrations at the same time point.
     let mut pooled: Vec<(f64, f64)> = Vec::new();

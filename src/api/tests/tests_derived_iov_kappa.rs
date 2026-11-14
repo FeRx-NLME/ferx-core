@@ -19,6 +19,7 @@ use std::collections::HashMap;
 /// for every observation, while the fix yields the per-occasion CL.
 fn minimal_iov_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,

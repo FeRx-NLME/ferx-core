@@ -109,6 +109,20 @@ pub(crate) struct StackedLayout {
     nested: Option<NestedLayout>,
 }
 
+impl StackedLayout {
+    /// The layout's structure, written to `h`: what a compiled plan recorded under it is keyed
+    /// by, compared exactly (#2786).
+    pub(crate) fn canon(&self, h: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        (self.n_eta, self.n_kappa).hash(h);
+        self.groups.hash(h);
+        self.nested.is_some().hash(h);
+        if let Some(n) = &self.nested {
+            format!("{n:?}").hash(h);
+        }
+    }
+}
+
 /// An occasion → group map as a label-sorted list (labels are unique keys).
 fn sorted_occasions(map: &HashMap<u32, usize>) -> Vec<(u32, usize)> {
     let mut v: Vec<(u32, usize)> = map.iter().map(|(&o, &g)| (o, g)).collect();

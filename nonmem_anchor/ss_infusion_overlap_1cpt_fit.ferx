@@ -1,0 +1,24 @@
+# SS=1 infusions with T_inf > II (overlapping pulses); twin of ss_infusion_overlap_1cpt.ctl.
+# Expected values: ss_infusion_overlap_ref_1cpt.csv.
+
+[parameters]
+  theta TVCL(2.0, 0.1, 100.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.0025
+[individual_parameters]
+  CL    = TVCL * (WT/70)^0.75 * exp(ETA_CL)
+  V     = TVV * exp(ETA_V)
+  LAG   = LG
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, lagtime=LAG)
+[covariates]
+  WT continuous
+  LG continuous
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  maxiter = 0
+  covariance = false

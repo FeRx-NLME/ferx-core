@@ -3,6 +3,7 @@ pub mod build_info;
 pub mod cancel;
 #[cfg(feature = "survival")]
 pub mod categorical;
+pub(crate) mod cold_sort;
 pub mod diagnostics;
 pub(crate) mod dosing;
 pub mod edit;
@@ -15,6 +16,7 @@ pub mod markov;
 pub mod model_selection;
 pub mod nn;
 pub mod ode;
+pub(crate) mod par;
 pub mod parser;
 pub mod pk;
 pub mod propensity_match;

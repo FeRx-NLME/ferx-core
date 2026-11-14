@@ -461,6 +461,7 @@ mod tests {
             hard_reject: false,
             screen_moved: false,
             twin_moved: false,
+            ipreds: None,
         };
         assert!(ebe_resolved(&ebe(true, false, false)));
         assert!(!ebe_resolved(&ebe(false, false, false)), "unconverged");

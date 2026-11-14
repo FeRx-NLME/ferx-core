@@ -4,7 +4,6 @@ use argmin::core::{
 };
 use argmin::solver::trustregion::{Steihaug, TrustRegion};
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 
 use crate::estimation::gauss_newton::{ebe_response_correction, subject_nll_pop_grad_with_cache};
 use crate::estimation::inner_optimizer::{
@@ -165,39 +164,36 @@ impl FoceiProblem<'_> {
         let (etas, h_mats) = maybe_warm.unwrap_or_else(|| self.run_inner(x));
         let n_subj = self.population.subjects.len();
 
-        let per_subj: Vec<(Vec<f64>, Vec<f64>)> = (0..n_subj)
-            .into_par_iter()
-            .map(|i| {
-                let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
-                    x,
-                    self.init_params,
-                    self.model,
-                    self.population,
-                    i,
-                    &etas[i],
-                    &h_mats[i],
-                    &[], // IOV not yet supported in trust_region path
-                    &self.bounds,
-                    self.options,
-                );
-                let ti = ebe_response_correction(
-                    x,
-                    self.init_params,
-                    self.model,
-                    self.population,
-                    i,
-                    &etas[i],
-                    &[],
-                    None,
-                    nll,
-                    &gi,
-                    cache.as_ref(),
-                    &self.bounds,
-                    self.options,
-                );
-                (gi, ti)
-            })
-            .collect();
+        let per_subj: Vec<(Vec<f64>, Vec<f64>)> = crate::par::map(n_subj, |i| {
+            let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
+                x,
+                self.init_params,
+                self.model,
+                self.population,
+                i,
+                &etas[i],
+                &h_mats[i],
+                &[], // IOV not yet supported in trust_region path
+                &self.bounds,
+                self.options,
+            );
+            let ti = ebe_response_correction(
+                x,
+                self.init_params,
+                self.model,
+                self.population,
+                i,
+                &etas[i],
+                &[],
+                None,
+                nll,
+                &gi,
+                cache.as_ref(),
+                &self.bounds,
+                self.options,
+            );
+            (gi, ti)
+        });
 
         let (grads, corrections): (Vec<Vec<f64>>, Vec<Vec<f64>>) = per_subj.into_iter().unzip();
 
@@ -1505,7 +1501,11 @@ mod tests {
             }
         }
         assert!(
-            g.iter().chain(&want).chain(&fd).chain(&raw).all(|v| v.is_finite()),
+            g.iter()
+                .chain(&want)
+                .chain(&fd)
+                .chain(&raw)
+                .all(|v| v.is_finite()),
             "every side must be finite: gradient {g:?}, exact {want:?}, reconverged {fd:?}, raw {raw:?}"
         );
         let vs_fd = want

@@ -10,24 +10,25 @@
 //! reported outer gradient method still says analytic, and that a fit which never
 //! evaluates an analytic outer gradient stays silent.
 //!
-//! Tier 2: `outer_maxiter = 1` runs one gradient evaluation and stops. It must not be `0`
+//! Lives in the lib since #2786: the decline is forced through `kernel_jit::fail_plans_of`, a
+//! `#[cfg(test)]` seam an integration test cannot reach.
+//!
+//! `outer_maxiter = 1` runs one gradient evaluation and stops. It must not be `0`
 //! — that is the evaluation-only path, which computes no outer gradient at all, so there
 //! would be nothing to report and the test would pass for the wrong reason.
 
-use ferx_core::types::{
+use crate::types::{
     CompiledModel, DoseEvent, EstimationMethod, FitOptions, Optimizer, Population, RateMode,
 };
 use std::path::Path;
 
 /// Warfarin with a bioavailability `F < 1` and a lag time.
 ///
-/// A **steady-state infusion** into the depot routes its subject to the closed-form event
-/// walk (an oral infusion), and the walk declines an SS infusion under a lag time
-/// (`ss_lagtime_walk_unsupported`), so the adjoint declines any subject carrying one. Every
-/// bolus-dosed subject is unaffected, and the model as a whole stays inside the analytic
-/// outer scope. That combination is exactly the shape this warning exists for: valid data,
-/// a model the report calls analytic, and one subject that quietly runs FD. (Until #486 the
-/// fixture was a rate-defined infusion under `F`, which the adjoint now serves.)
+/// One subject is made to decline (`make_subject_0_decline`: its dose becomes a steady-state
+/// infusion and every plan of it is forced to fail), while every bolus-dosed subject is
+/// unaffected and the model as a whole stays inside the analytic outer scope. That
+/// combination is exactly the shape this warning exists for: valid data, a model the report
+/// calls analytic, and one subject that quietly runs FD.
 /// The lag is 0.25, not the 0.5 it was: `data/warfarin.csv` samples at t = 0.5, where a
 /// 0.5 lag predicts exactly 0 and the proportional variance collapses to its guard, so
 /// the objective was 2.4e14 from the start (`W_NONFINITE_OBJECTIVE`). A line-search trial on
@@ -113,12 +114,15 @@ fn make_subject_0_decline(population: &mut Population) -> String {
     let mut dose = DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0);
     dose.rate_mode = RateMode::Fixed;
     declining.doses = vec![dose];
+    // After #2786 no regular-path shape declines the adjoint (an SS infusion under a lag is
+    // served by the plan's walk), so the decline is forced: every plan of this subject fails.
+    crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(declining);
     declining.id.clone()
 }
 
 fn fixture() -> (CompiledModel, Population) {
-    let model = ferx_core::parse_model_string(WARFARIN_F).expect("model parses");
-    let population = ferx_core::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+    let model = crate::parse_model_string(WARFARIN_F).expect("model parses");
+    let population = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data loads");
     (model, population)
 }
@@ -142,7 +146,7 @@ fn one_gradient_eval_options() -> FitOptions {
 #[test]
 fn in_scope_population_emits_no_outer_fd_warning() {
     let (model, population) = fixture();
-    let result = ferx_core::fit(
+    let result = crate::fit(
         &model,
         &population,
         &model.default_params,
@@ -171,7 +175,7 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
     assert!(n_total > 1, "fixture precondition: need a mixed population");
     let declining_id = make_subject_0_decline(&mut population);
 
-    let result = ferx_core::fit(
+    let result = crate::fit(
         &model,
         &population,
         &model.default_params,
@@ -227,8 +231,8 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
 /// comes from its runtime log, not from either report.
 #[test]
 fn a_derivative_free_mixture_auto_fit_does_not_warn() {
-    let model = ferx_core::parse_model_string(MIXTURE_F).expect("mixture model parses");
-    let mut population = ferx_core::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+    let model = crate::parse_model_string(MIXTURE_F).expect("mixture model parses");
+    let mut population = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data loads");
     make_subject_0_decline(&mut population);
 
@@ -241,7 +245,7 @@ fn a_derivative_free_mixture_auto_fit_does_not_warn() {
         run_covariance_step: false,
         ..Default::default()
     };
-    let result = ferx_core::fit(&model, &population, &model.default_params, &options)
+    let result = crate::fit(&model, &population, &model.default_params, &options)
         .expect("mixture fit succeeds");
 
     // Both reports describe the BOBYQA run (#1540), so the fixture is the derivative-free
@@ -273,7 +277,7 @@ fn an_evaluation_only_fit_does_not_warn() {
         ..one_gradient_eval_options()
     };
     let result =
-        ferx_core::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+        crate::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
     assert!(
         outer_fd_warning(&result.warnings).is_none(),
         "an evaluation-only fit runs no outer gradient; got {:?}",
@@ -296,7 +300,7 @@ fn forcing_the_reconverged_gradient_does_not_warn_about_scope() {
         ..one_gradient_eval_options()
     };
     let result =
-        ferx_core::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+        crate::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
     assert!(
         outer_fd_warning(&result.warnings).is_none(),
         "`reconverge_gradient_interval = 1` bypasses the analytic branch for every \
@@ -322,7 +326,7 @@ fn a_derivative_free_fit_does_not_warn_about_the_preflight_gradient() {
         ..one_gradient_eval_options()
     };
     let result =
-        ferx_core::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+        crate::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
     assert!(
         outer_fd_warning(&result.warnings).is_none(),
         "a BOBYQA fit's only outer gradient is the flat-theta pre-flight, which must not \
@@ -342,13 +346,13 @@ fn a_derivative_free_fit_does_not_warn_about_the_preflight_gradient() {
 fn a_gradient_driven_mixture_fit_warns_about_its_declined_subject() {
     let src = MIXTURE_F.replace("ALAG = 0.5", "ALAG = 0.25");
     assert!(src.contains("ALAG = 0.25"), "fixture: lag replaced");
-    let model = ferx_core::parse_model_string(&src).expect("mixture model parses");
-    let mut population = ferx_core::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+    let model = crate::parse_model_string(&src).expect("mixture model parses");
+    let mut population = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
         .expect("warfarin data loads");
     let n_total = population.subjects.len();
     let declining_id = make_subject_0_decline(&mut population);
 
-    let result = ferx_core::fit(
+    let result = crate::fit(
         &model,
         &population,
         &model.default_params,

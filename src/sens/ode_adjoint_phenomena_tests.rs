@@ -551,7 +551,7 @@ fn ss_absorption_cases() -> Vec<(CompiledModel, Subject, &'static [usize], &'sta
         let m = tight(parse_model_string(src).unwrap());
         assert!(!m.ode_spec.as_ref().unwrap().input_rate.is_empty());
         let s = subject(&m, doses.clone(), &times, &[0.1, -0.05]);
-        assert!(s.has_periodic_ss_dose() && !m.ss_absorption_out_of_scope(&s));
+        assert!(s.has_periodic_ss_dose());
         (m, s, live, label)
     })
     .collect()
@@ -1949,7 +1949,7 @@ pub(super) fn fd_oracle_agq_iov(m: &CompiledModel, s: &Subject, n_agq: usize, ex
 }
 
 /// The R-matrix of an IOV subject under Laplace's exact anchor and AGQ's Gauss–Newton one
-/// (two occasions, stacked width 4: the exact anchor's first bucket), against the
+/// (two occasions, stacked width 4), against the
 /// reconverged FD of the adjoint gradient — and that gradient against reconverged FD of
 /// production's AGQ objective, so the Hessian's reference is itself anchored.
 #[test]
@@ -1989,94 +1989,215 @@ fn cov_hessian_matches_profile_fd_iov_under_laplace_and_agq() {
 
 // ---- routing of the kept scope predicates ---------------------------------------------
 
-/// `has_infusion_into_input_rate` (#719 gap 2): an infusion into a built-in absorption
-/// compartment double-counts on the dual walk, so the subject declines (FD), on both ODE
-/// walks; the same subject dosed by bolus is served. Its predictions are live, so the
-/// decline is not a vacuous one.
+/// An infusion into a built-in absorption kernel (#719 gap 2) with a fixed window is served on
+/// both ODE walks: the generic walk delivers it through the convolved `R_in_inf` only (no plain
+/// `+rate`, as the f64 predictor), the segment saying which side of the window end it lies on.
+/// Multi-dose (a bolus lands on the infusion's residual drug). Two fixtures: a rate-defined
+/// infusion on a model without `F` and a duration-defined one under an estimated `F` (the
+/// window is fixed, the rate scales with `F`) are served and exact. The windows that move are
+/// `moving_window_infusions_into_an_absorption_kernel_match_reconverged_fd`.
 #[test]
-fn an_infusion_into_an_absorption_kernel_declines_to_fd() {
-    let m = parse_model_string(SS_FIRST_ORDER_F).unwrap();
-    let times = [1.0, 3.0, 6.0, 9.0, 12.0];
-    let bolus = subject(
-        &m,
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        &times,
-        &[0.0, 0.0],
-    );
-    let mut inf = bolus.clone();
-    inf.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0)];
-    assert!(!crate::sens::ode_provider::has_infusion_into_input_rate(
-        &m, &bolus
-    ));
-    assert!(crate::sens::ode_provider::has_infusion_into_input_rate(
-        &m, &inf
-    ));
-    assert!(
-        served(&m, &bolus),
-        "the bolus twin must be served (straddle)"
-    );
-    let preds =
-        crate::pk::compute_predictions_with_tv(&m, &inf, &m.default_params.theta, &[0.0, 0.0]);
-    assert!(preds.iter().all(|v| v.is_finite()) && preds.iter().any(|v| *v > 0.0));
-    let p = m.default_params.clone();
-    let x = pack_params(&p);
-    assert!(subject_adjoint_packed_gradient(&m, &inf, &p, &x, &[0.0, 0.0], true).is_none());
-    assert!(exact_eta_jacobian(&m, &inf, &p.theta, &[0.0, 0.0]).is_none());
+fn an_infusion_into_an_absorption_kernel_matches_reconverged_fd() {
+    let times = [1.0, 2.5, 4.0, 6.0, 8.0, 9.5, 11.0, 14.0, 18.0];
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 40.0, false, 0.0),
+        DoseEvent::new(6.0, 80.0, 1, 0.0, false, 0.0),
+    ];
+    // No `F` at all: one η.
+    let no_f = SS_FIRST_ORDER_F
+        .replace(
+            "  theta THETA_F(0.7, 0.001, 0.999)
+",
+            "",
+        )
+        .replace(
+            "  omega ETA_F ~ 0.04
+",
+            "",
+        )
+        .replace(
+            "  F  = inv_logit(logit(THETA_F) + ETA_F)
+",
+            "",
+        );
+    let m_no_f = tight(parse_model_string(&no_f).unwrap());
+    let m_f = tight(parse_model_string(SS_FIRST_ORDER_F).unwrap());
+    let rate_no_f = subject(&m_no_f, doses.clone(), &times, &[0.1]);
+    let rate_f = subject(&m_f, doses.clone(), &times, &[0.1, -0.05]);
+    let mut dur_f = rate_f.clone();
+    dur_f.doses[0].infusion_def = crate::types::InfusionDef::DurationDefined;
+    assert!(rate_f.doses[0].is_infusion() && !rate_f.doses[1].is_infusion());
+    for (m, s, live, label) in [
+        (&m_no_f, &rate_no_f, &[0usize, 2][..], "rate-defined, no F"),
+        (
+            &m_f,
+            &dur_f,
+            &[0, 2, 3][..],
+            "duration-defined, F estimated",
+        ),
+    ] {
+        assert!(served(m, s), "{label}: the infusion must be served");
+        let eta = probe_eta(m.n_eta);
+        for &k in live {
+            let e = theta_effect(m, s, &eta, k);
+            assert!(e > 1e-6, "{label}: θ[{k}] moves no prediction ({e:.1e})");
+        }
+        let jac = jacobian_gap(m, s, &eta, label);
+        let grad = parity(m, s);
+        eprintln!(
+            "infusion into kernel, {label}: ∂f/∂η vs FD {jac:.2e}, gradient vs FD {grad:.2e}"
+        );
+        // Measured on Linux: ∂f/∂η 1.1e-9 / 8.8e-10 and gradient 2.0e-7 / 2.5e-9 (rate-defined
+        // without F / duration-defined with F); ≥ 10× headroom.
+        assert!(jac < 2e-8, "{label} ∂f/∂η: {jac:.2e}");
+        assert!(grad < 2e-6, "{label} gradient: {grad:.2e}");
+    }
 }
 
-const SS_ZERO_ORDER: &str = r#"
-[parameters]
+/// A first-order absorption model with the given extra `[parameters]` / individual
+/// parameters and `first_order` arguments, for the moving-window infusions below.
+fn kernel_infusion_model(theta: &str, omega: &str, ind: &str, args: &str) -> CompiledModel {
+    tight(
+        parse_model_string(&format!(
+            "[parameters]
   theta TVCL(1.0, 0.01, 50.0)
   theta TVV(20.0, 0.5, 200.0)
-  theta TVDUR(2.0, 0.1, 20.0)
+  theta TVKA(0.15, 0.005, 20.0)
+{theta}
   omega ETA_CL ~ 0.09
+{omega}
   sigma PROP_ERR ~ 0.1 (sd)
 [individual_parameters]
-  CL  = TVCL * exp(ETA_CL)
-  V   = TVV
-  DUR = TVDUR
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+  KA = TVKA
+{ind}
 [structural_model]
   ode(obs_cmt=central, states=[central])
 [odes]
-  d/dt(central) = zero_order(dur=DUR) - CL/V*central
+  d/dt(central) = first_order(ka=KA{args}) - CL/V*central
 [scaling]
   y = central / V
 [error_model]
   DV ~ proportional(PROP_ERR)
-"#;
+"
+        ))
+        .unwrap(),
+    )
+}
 
-/// `ss_absorption_out_of_scope` (#835 / #913): an SS dose into a zero-order or lagged
-/// absorption compartment has no dual SS seed, so it declines — `CMT=0` scoped like
-/// `CMT=1` — while the same dose without `SS` is served (straddle).
+/// An infusion into an absorption kernel whose window END or START moves with the parameters
+/// — a rate-defined one under an estimated `F` (the window is `F·amt/rate`), modeled
+/// `RATE=-1` / `RATE=-2` doses, and any under a compartment or a per-route lag — is exact on
+/// the event walk: the end is a break of the integration and a kink of the convolved
+/// `R_in_inf` (`∂R/∂T` jumps by `(dose/T)·g(0)`), crossed as a moving boundary whose two
+/// sides differ in which segment membership the forcing reads. Each fixture has two
+/// infusions, the later one landing on the earlier one's residual drug, and observations on
+/// both sides of every window start and end; each η that moves a window moves a prediction
+/// (`measure`).
 #[test]
-fn steady_state_into_zero_order_or_route_lag_declines_to_fd() {
-    let times = [1.0, 3.0, 6.0, 9.0, 11.0];
-    for (src, label) in [(SS_ZERO_ORDER, "zero_order"), (ROUTE_LAG_ODE, "route lag")] {
-        let m = parse_model_string(src).unwrap();
-        let eta = vec![0.0; m.n_eta];
-        let plain = subject(
-            &m,
-            vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-            &times,
-            &eta,
-        );
-        assert!(!m.ss_absorption_out_of_scope(&plain));
-        assert!(
-            served(&m, &plain),
-            "{label}: the non-SS twin must be served"
-        );
-        for cmt in [1, 0] {
-            let mut ss = plain.clone();
-            ss.doses = vec![DoseEvent::new(0.0, 100.0, cmt, 0.0, true, 12.0)];
-            assert!(m.ss_absorption_out_of_scope(&ss), "{label}, CMT={cmt}");
-            let p = m.default_params.clone();
-            let x = pack_params(&p);
-            assert!(
-                subject_adjoint_packed_gradient(&m, &ss, &p, &x, &eta, true).is_none(),
-                "{label}, CMT={cmt}: an SS absorption dose without a dual seed must decline"
-            );
-        }
+fn moving_window_infusions_into_an_absorption_kernel_match_reconverged_fd() {
+    let times = [0.5, 1.5, 2.8, 3.5, 5.0, 6.7, 8.5, 10.5, 12.0, 16.0, 22.0];
+    let fixed = |t2: f64| {
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 40.0, false, 0.0),
+            DoseEvent::new(t2, 80.0, 1, 20.0, false, 0.0),
+        ]
+    };
+    let modeled = |mode: RateMode| {
+        vec![
+            DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, mode),
+            DoseEvent::modeled(6.0, 80.0, 1, false, 0.0, mode),
+        ]
+    };
+    let lag = ("  theta TVLAG(1.0, 0.01, 5.0)", "  omega ETA_LAG ~ 0.04");
+    let lagged = "  LAGTIME = TVLAG * exp(ETA_LAG)";
+    let route = "  RLAG = TVLAG * exp(ETA_LAG)";
+    let f_par = (
+        "  theta THETA_F(0.7, 0.001, 0.999)",
+        "  omega ETA_F ~ 0.04",
+        "  F  = inv_logit(logit(THETA_F) + ETA_F)",
+    );
+    let cases: Vec<(&str, CompiledModel, Vec<DoseEvent>, Vec<usize>)> = vec![
+        (
+            "rate-defined, F estimated",
+            kernel_infusion_model(f_par.0, f_par.1, f_par.2, ""),
+            fixed(6.0),
+            vec![0, 2, 3],
+        ),
+        (
+            "compartment lag",
+            kernel_infusion_model(lag.0, lag.1, lagged, ""),
+            fixed(6.0),
+            vec![0, 2, 3],
+        ),
+        (
+            "per-route lag",
+            kernel_infusion_model(lag.0, lag.1, route, ", lag=RLAG"),
+            fixed(6.0),
+            vec![0, 2, 3],
+        ),
+        (
+            "modeled RATE, R1",
+            kernel_infusion_model(
+                "  theta TVR1(20.0, 0.1, 200.0)",
+                "  omega ETA_R1 ~ 0.04",
+                "  R1 = TVR1 * exp(ETA_R1)",
+                "",
+            ),
+            modeled(RateMode::ModeledRate),
+            vec![0, 2, 3],
+        ),
+        (
+            "modeled duration, D1",
+            kernel_infusion_model(
+                "  theta TVD1(4.0, 0.1, 24.0)",
+                "  omega ETA_D1 ~ 0.04",
+                "  D1 = TVD1 * exp(ETA_D1)",
+                "",
+            ),
+            modeled(RateMode::ModeledDuration),
+            vec![0, 2, 3],
+        ),
+    ];
+    for (label, m, doses, live) in cases {
+        let eta = [0.1, -0.05];
+        let s = subject(&m, doses, &times, &eta[..m.n_eta.min(2)]);
+        let (jac, grad) = measure(&m, &s, &live, label);
+        eprintln!("moving-window infusion, {label}: ∂f/∂η {jac:.2e}, gradient {grad:.2e}");
+        // Measured on Linux x86_64: ∂f/∂η ≤ 3.8e-11 and gradient ≤ 4.0e-9 over the five
+        // fixtures; ≥ 12× headroom. Each saltation off (the window end, the compartment-lag
+        // onset, the route's end) or the CDF's onset continuation off moves the gradient to
+        // 1e-2 / 1e-2 / 2e-4 / 1.8e-2, so these bounds are decisive.
+        assert!(jac < 5e-10, "{label} ∂f/∂η: {jac:.2e}");
+        assert!(grad < 5e-8, "{label} gradient: {grad:.2e}");
     }
+}
+
+/// The covariance R-matrix (third and fourth order through the same boundaries) of a window
+/// whose start and end both move: a compartment lag together with an estimated `F` on a
+/// rate-defined infusion, so the end carries `lag + F·T` and the onset `lag`.
+#[test]
+fn a_moving_window_infusion_r_matrix_matches_fd_of_the_gradient() {
+    let m = kernel_infusion_model(
+        "  theta THETA_F(0.7, 0.001, 0.999)
+  theta TVLAG(1.0, 0.01, 5.0)",
+        "  omega ETA_F ~ 0.04
+  omega ETA_LAG ~ 0.04",
+        "  F  = inv_logit(logit(THETA_F) + ETA_F)
+  LAGTIME = TVLAG * exp(ETA_LAG)",
+        "",
+    );
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 40.0, false, 0.0),
+        DoseEvent::new(6.0, 80.0, 1, 20.0, false, 0.0),
+    ];
+    let times = [0.5, 1.5, 2.8, 3.5, 5.0, 6.7, 8.5, 10.5, 12.0, 16.0, 22.0];
+    let s = subject(&m, doses, &times, &[0.1, -0.05, 0.08]);
+    let (_, grad) = measure(&m, &s, &[0, 2, 3, 4], "F + lag");
+    let (hess, _) = hessian_gaps(&m, &s, true);
+    eprintln!("moving-window infusion, F + lag: gradient {grad:.2e}, R-matrix {hess:.2e}");
+    assert!(hess < 1e-4, "R-matrix: {hess:.2e}");
 }
 
 #[cfg(feature = "survival")]
@@ -2110,11 +2231,12 @@ const JOINT_PKTTE_ODE: &str = r"
 /// A joint PK-TTE model (#1210, #490, #905) under a steady-state dose: its Gaussian rows are
 /// served exactly — the event walk's dual SS run-in holds the injected accumulator still and
 /// restores its record value, as the f64 run-in does — against the reconverged Richardson
-/// oracle of production's objective. The same subject with an event record declines: the
-/// hazard's state solve is the static walk's, which has no run-in, and the term takes FD.
+/// oracle of production's objective. The same subject with an event record is served too: the
+/// hazard's state solve takes the event-driven walk (`ode_states_at_g`), whose run-in holds the
+/// accumulator, and its packed gradient matches the oracle as well.
 #[cfg(feature = "survival")]
 #[test]
-fn joint_pktte_serves_ss_gaussian_rows_and_declines_the_ss_hazard() {
+fn joint_pktte_serves_ss_gaussian_rows_and_the_ss_hazard() {
     let m = tight(parse_model_string(JOINT_PKTTE_ODE).unwrap());
     assert!(m.has_non_gaussian() && recorder_in_scope(&m) && !model_in_scope(&m));
     assert!(outer_model_in_scope(&m));
@@ -2153,19 +2275,21 @@ fn joint_pktte_serves_ss_gaussian_rows_and_declines_the_ss_hazard() {
         "the kernel alone does not score it"
     );
     assert!(
-        !crate::survival::tte_record_served(&m, &ss_tte, 3),
-        "the hazard under a steady-state dose declines"
+        crate::survival::tte_record_served(&m, &ss_tte, 3),
+        "the hazard under a steady-state dose is served"
     );
-    let x = pack_params(&p);
-    assert!(subject_adjoint_packed_gradient(&m, &ss_tte, &p, &x, &[0.0], true).is_none());
     let mut worst = 0.0f64;
-    for interaction in [true, false] {
-        let w = super::tests::fd_oracle(&m, &ss, interaction);
-        eprintln!("joint PK-TTE SS interaction={interaction}: worst {w:.2e}");
-        worst = worst.max(w);
+    for (label, s) in [("Gaussian rows", &ss), ("with the hazard", &ss_tte)] {
+        for interaction in [true, false] {
+            let w = super::tests::fd_oracle(&m, s, interaction);
+            eprintln!("joint PK-TTE SS {label} interaction={interaction}: worst {w:.2e}");
+            assert!(w.is_finite(), "{label} interaction={interaction}: {w}");
+            worst = worst.max(w);
+        }
     }
-    // Measured 5.3e-8 (FOCE), 9.3e-9 (FOCEI): the oracle's floor.
-    assert!(worst < 1e-5, "{worst:.2e}");
+    // Measured on Linux: Gaussian rows 5.3e-8 (FOCE), 5.1e-9 (FOCEI); with the hazard 8.9e-9
+    // (FOCE), 8.3e-10 (FOCEI) — the oracle's floor; about 10× headroom.
+    assert!(worst < 5e-7, "{worst:.2e}");
 }
 
 /// `analytic_terminal_work`: Laplace/AGQ reuse the terminal `(∂f/∂η, H)` only where the
@@ -2525,25 +2649,50 @@ fn ode_iiv_on_ruv_with_m3_and_closed_form_ss_with_lag_are_analytic() {
   DV ~ proportional(PROP_ERR)
 "#;
     let m = parse_model_string(cf).unwrap();
-    let s = subject(
-        &m,
-        vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
-            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        &[1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0],
-        &[0.1, -0.05],
-    );
-    let inner =
-        crate::sens::provider::subject_eta_grad(&m, &s, &m.default_params.theta, &[0.05, 0.02]);
-    assert!(
-        inner.is_some() && served(&m, &s),
-        "closed-form SS + lag must be served"
-    );
-    let g = parity(&m, &s);
-    eprintln!("closed-form SS + lag: gradient vs reconverged FD {g:.2e}");
-    // Measured 4.5e-6 on Linux; ~10× headroom.
-    assert!(g < 5e-5, "{g:.2e}");
+    // The SS dose as a bolus into the depot, and (#2786) as an infusion into the central
+    // compartment, whose seed at the record carries the previous cycle's window: one that
+    // closes before the record (2 h), and one still running across it (11.8 h against a phase
+    // of `12 − ALAG ≈ 11.5 h`), whose residual window then ends at a lag-moved break. A second
+    // dose lands on residual drug in each.
+    for (label, cmt, rate) in [
+        ("bolus", 1, 0.0),
+        ("infusion closing before the record", 2, 50.0),
+        ("infusion running across the record", 2, 100.0 / 11.8),
+    ] {
+        let s = subject(
+            &m,
+            vec![
+                DoseEvent::new(0.0, 100.0, cmt, rate, true, 12.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[0.1, 1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0],
+            &[0.1, -0.05],
+        );
+        let lag = m.default_params.theta[3];
+        assert_eq!(
+            crate::dosing::ss_residual_infusion_ends(
+                &s.doses[0],
+                lag,
+                1.0,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+            )
+            .next()
+            .is_some(),
+            label.ends_with("across the record"),
+            "{label}: the fixture's residual window"
+        );
+        let inner =
+            crate::sens::provider::subject_eta_grad(&m, &s, &m.default_params.theta, &[0.05, 0.02]);
+        assert!(
+            inner.is_some() && served(&m, &s),
+            "closed-form SS {label} + lag must be served"
+        );
+        let g = parity(&m, &s);
+        eprintln!("closed-form SS {label} + lag: gradient vs reconverged FD {g:.2e}");
+        // Measured 4.5e-6 (bolus) on Linux; ~10× headroom.
+        assert!(g < 5e-5, "{label}: {g:.2e}");
+    }
 }
 
 /// Modeled `D1`/`R1` on the **closed-form** event walk (#2093 review, Codex finding 2): the
@@ -2678,7 +2827,7 @@ fn eta_dependent_obs_scale_under_ltbs_on_an_ode_is_analytic() {
 }
 
 /// A 9-occasion IOV subject: 3 η + 3 κ × 9 occasions = 30 stacked random effects, past the
-/// 24-wide bucket that capped the adjoint before the 32 and 48 buckets.
+/// 24-wide bucket that once capped the adjoint.
 fn wide_iov_fixture() -> (CompiledModel, Subject) {
     let src = "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  theta TVKA(1.2, 0.05, 20.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n  omega ETA_KA ~ 0.1\n  kappa K_CL ~ 0.03\n  kappa K_V ~ 0.02\n  kappa K_KA ~ 0.04\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL + K_CL)\n  V = TVV * exp(ETA_V + K_V)\n  KA = TVKA * exp(ETA_KA + K_KA)\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  iov_column = OCC\n";
     let m = parse_model_string(src).unwrap();
@@ -2717,7 +2866,7 @@ fn wide_iov_fixture() -> (CompiledModel, Subject) {
     (m, s)
 }
 
-/// A subject wider than 24 stacked random effects is served (the 32 bucket) and its stacked
+/// A subject wider than 24 stacked random effects is served and its stacked
 /// η-Jacobian matches FD of production's IOV predictor. On a 20-subject population of these,
 /// the FOCEI fit took 2739 s on the reconverged-FD route it used to fall to and 41.5 s on the
 /// exact gradient, at the identical OFV (−1177.955802, Linux, 2 cores).
@@ -2745,9 +2894,8 @@ fn a_subject_past_24_stacked_random_effects_matches_reconverged_fd() {
     assert!(g < 3.4e-6, "{g:.2e}");
 }
 
-/// The same subject's analytic R-matrix, through the 48 Hessian bucket (#2093), against the
-/// reconverged-FD Hessian of its gradient. Measured 3.04e-11 on Linux; ~10× headroom. Without the
-/// 48 bucket the subject declines, and `hessian_gaps` fails on a subject out of scope.
+/// The same subject's analytic R-matrix against the reconverged-FD Hessian of its gradient.
+/// Measured 3.04e-11 on Linux; ~10× headroom.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -2834,5 +2982,341 @@ fn tad_reading_rhs_under_steady_state_is_analytic() {
                 .is_none(),
             "{label}: TIME under SS must decline"
         );
+    }
+}
+
+/// [`super::tests::templated_twin`] on a joint PK-TTE subject: its hazard term's plan, too, is
+/// served from another subject's template, bit for bit.
+#[cfg(feature = "survival")]
+#[test]
+fn a_tte_subject_served_from_anothers_template_matches_its_fresh_plan_bitwise() {
+    let m = tight(parse_model_string(JOINT_PKTTE_ODE).unwrap());
+    let times = [1.1, 4.2, 8.3, 12.4];
+    let mut a = subject_shell(vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)], &times);
+    a.obs_cmts = vec![2; times.len()];
+    a.observations = vec![3.1, 2.6, 1.6, 1.1];
+    a.obs_records = vec![crate::types::ObsRecord::Event {
+        time: 10.5,
+        event_type: crate::types::EventType::Exact,
+        entry_time: 0.0,
+        cmt: 3,
+    }];
+    let mut b = super::tests::other_data(&a);
+    b.obs_records = vec![crate::types::ObsRecord::Event {
+        time: 11.5,
+        event_type: crate::types::EventType::Exact,
+        entry_time: 0.0,
+        cmt: 3,
+    }];
+    let (n, k) = super::tests::templated_twin(&m, &a, &b);
+    assert!(k > 0 && k == n, "PK-TTE: {k} of {n} plans from a template");
+}
+
+// ---- steady state over a moving infusion window --------------------------------------
+
+/// [`MODELED_DUR_ODE`] / [`MODELED_RATE_ODE`], or a rate-defined infusion under an estimated
+/// `F1`, varied one input at a time: `mm` a saturable disposition (the steady state's pulse
+/// train instead of its affine fixed point), `tad` a `TAD`-reading right-hand side, `lag` an
+/// estimated `ALAG1`, `cf` the closed form (`one_cpt_iv`) in place of the ODE.
+fn ss_window_model(case: &str, mm: bool, tad: bool, lag: bool, cf: bool) -> CompiledModel {
+    let mut src = match case {
+        "D1" => MODELED_DUR_ODE.to_string(),
+        "R1" => MODELED_RATE_ODE.to_string(),
+        _ => MODELED_DUR_ODE
+            .replace("theta TVD1(5.0, 0.1, 24.0)", "theta TVF1(0.6, 0.05, 1.0)")
+            .replace("omega ETA_D1", "omega ETA_F1")
+            .replace("D1 = TVD1 * exp(ETA_D1)", "F1 = TVF1 * exp(ETA_F1)"),
+    };
+    let mut rhs = if mm {
+        "-CL * central / (V + 0.02 * central)"
+    } else {
+        "-CL/V * central"
+    }
+    .to_string();
+    if tad {
+        rhs = format!("({rhs}) * (1 + 0.05 * TAD)");
+    }
+    src = src.replace(
+        "d/dt(central) = -CL/V * central",
+        &format!("d/dt(central) = {rhs}"),
+    );
+    if lag {
+        src = src
+            .replace(
+                "  sigma PROP",
+                "  theta TVLAG(0.7, 0.01, 5.0)\n  omega ETA_LAG ~ 0.02\n  sigma PROP",
+            )
+            .replace(
+                "  V  = TVV\n",
+                "  V  = TVV\n  ALAG1 = TVLAG * exp(ETA_LAG)\n",
+            );
+    }
+    if !cf {
+        return tight(parse_model_string(&src).unwrap());
+    }
+    let args = match (lag, case) {
+        (true, "F1") => ", lagtime=ALAG1, f=F1",
+        (true, _) => ", lagtime=ALAG1",
+        (false, "F1") => ", f=F1",
+        _ => "",
+    };
+    let src = src.replace(
+        "[structural_model]\n  ode(states=[central])\n[odes]\n  d/dt(central) = -CL/V * central\n[scaling]\n  y = central / V\n",
+        &format!("[structural_model]\n  pk one_cpt_iv(cl=CL, v=V{args})\n"),
+    );
+    let m = parse_model_string(&src).unwrap();
+    assert!(m.ode_spec.is_none(), "closed form");
+    m
+}
+
+/// A dose of the case's kind at 0 (`SS=1` with interval `ii` when `ss`), a second at 12 on the
+/// first's residual, observations on both sides of both window ends.
+fn ss_window_subject(m: &CompiledModel, case: &str, ss: bool, ii: f64) -> Subject {
+    let ii = if ss { ii } else { 0.0 };
+    let dose = |t: f64, ss: bool| match case {
+        "D1" => DoseEvent::modeled(t, 100.0, 1, ss, ii, RateMode::ModeledDuration),
+        "R1" => DoseEvent::modeled(t, 100.0, 1, ss, ii, RateMode::ModeledRate),
+        _ => DoseEvent::new(t, 100.0, 1, 20.0, ss, ii),
+    };
+    let eta = [0.1, -0.08, 0.05];
+    subject(
+        m,
+        vec![dose(0.0, ss), dose(12.0, false)],
+        &[1.0, 3.0, 4.6, 6.0, 9.0, 11.9, 13.0, 15.0, 17.5, 20.0, 24.0],
+        &eta[..m.n_eta],
+    )
+}
+
+/// `(∂f/∂η gap, FOCEI gradient gap)` of one cell, every η live ([`jacobian_gap`]).
+fn ss_window_gaps(
+    case: &str,
+    mm: bool,
+    tad: bool,
+    lag: bool,
+    cf: bool,
+    ss: bool,
+    ii: f64,
+) -> (f64, f64) {
+    let m = ss_window_model(case, mm, tad, lag, cf);
+    // The overlapping saturable pulse train (`mm`, `II < T_inf`) is ~50 cycles of adaptive
+    // solves, and the reconverged-FD oracle differences them at `h = 1e-3`: at the models'
+    // `(1e-10, 1e-12)` the solver's step-selection noise is the floor — measured on `R1`
+    // `II = 4`, FOCEI gradient gap 1.285e-6 (`D1`: 6.9e-8), every coordinate 1e-7–1e-6 off
+    // while ∂f/∂η at fixed η is 4.5e-10 — and it falls with the solver tolerance, not the
+    // gradient: 2.4e-9 (`R1`) and 4.2e-9 (`D1`) at `(1e-12, 1e-14)`, 4.1e-9 at `(1e-13, 1e-15)`.
+    let m = if mm && ss && ii < 12.0 {
+        with_tol(m, 1e-12, 1e-14)
+    } else {
+        m
+    };
+    let s = ss_window_subject(&m, case, ss, ii);
+    let label = format!("{case} cf={cf} mm={mm} tad={tad} lag={lag} ss={ss} ii={ii}");
+    let jac = jacobian_gap(&m, &s, &probe_eta(m.n_eta), &label);
+    let grad = parity(&m, &s);
+    eprintln!("{label}: ∂f/∂η vs FD {jac:.2e}; FOCEI gradient vs reconverged FD {grad:.2e}");
+    (jac, grad)
+}
+
+/// An `SS=1` infusion whose window moves with the parameters — a modeled `D1` (`RATE=-2`), a
+/// modeled `R1` (`RATE=-1`), a rate-defined infusion under an estimated `F1` — on the ODE event
+/// walk, the second dose landing on the steady-state residual. One input varied at a time:
+/// the non-SS control; SS on a linear disposition (the affine fixed point), under a
+/// `TAD`-reading RHS, on a saturable one (the pulse train) and both; SS under an estimated lag
+/// (the pre-arrival seed at phase `II − lag`, linear and saturable); and `II = 4` and `2`,
+/// where the windows overlap the next pulses (`T_inf > II`: `D1`/`R1` at 4, all three at 2),
+/// linear, saturable (the pulse train) and lagged. The overlap used to equilibrate to a zero
+/// state, value and derivative alike — consistent, and not NONMEM's steady state.
+///
+/// Before the fix the run-in named the window's jet-carrying length as its segments' spans
+/// and anchored the quiet window's `TAD` on it, on top of the crossing that carries the same
+/// jet — the window's derivative twice on a linear disposition (whose exact segment takes a
+/// span's jet), a wrong `TAD` jet on any: ∂f/∂η 1.0 / 1.1 / 0.35 off FD (D1 / R1 / F1, linear),
+/// 0.10–0.13 under `TAD`. The lagged seed extended its quiet leg by the window's jet as well:
+/// 0.42–0.77. Measured now on Linux: ∂f/∂η ≤ 1.5e-10, gradient ≤ 7.4e-9 over the cells.
+/// (`R1`'s saturable lag cell is left out: its FOCEI EBE has two modes 0.07 apart in `η_R1`,
+/// between which the reconverged oracle jumps under a 1e-3 step; its ∂f/∂η at the moved
+/// parameters' EBE is 5.6e-11 and its values match production to 8e-13.)
+#[test]
+fn steady_state_over_a_moving_infusion_window_on_the_ode_walk_matches_reconverged_fd() {
+    for case in ["D1", "R1", "F1"] {
+        for (mm, tad, lag, ss, ii) in [
+            (false, false, false, false, 12.0),
+            (false, false, false, true, 12.0),
+            (false, true, false, true, 12.0),
+            (true, false, false, true, 12.0),
+            (true, true, false, true, 12.0),
+            (false, false, true, true, 12.0),
+            (true, false, true, true, 12.0),
+            (false, false, false, true, 4.0),
+            (false, false, false, true, 2.0),
+            (true, false, false, true, 4.0),
+            (false, false, true, true, 4.0),
+        ] {
+            if case == "R1" && mm && lag {
+                continue;
+            }
+            let (jac, grad) = ss_window_gaps(case, mm, tad, lag, false, ss, ii);
+            assert!(
+                jac < 2e-9,
+                "{case} mm={mm} tad={tad} lag={lag} ss={ss} ii={ii}: ∂f/∂η {jac:.2e}"
+            );
+            assert!(
+                grad < 1e-7,
+                "{case} mm={mm} tad={tad} lag={lag} ss={ss} ii={ii}: gradient {grad:.2e}"
+            );
+        }
+    }
+}
+
+/// The same windows on the closed-form event walk, with and without `SS=1`. A recording
+/// keeps the walk's break order, which the moving window ends decide as much as a lagged
+/// arrival does: before every adjacent pair of breaks was guarded, a plan recorded with the
+/// window end on one side of an observation was replayed with it on the other — the
+/// predictions of a different event order — so the FOCEI gradient was 0.29 off reconverged
+/// FD (`D1`, no SS), while ∂f/∂η at a probe point recorded fresh was exact. And the steady
+/// state's cycle dose under `F` dropped the `F`-scaled window the value walk keeps (#419):
+/// ∂f/∂η 0.35 off (`F1`, SS).
+///
+/// The same walk under an estimated lag — the record-seeded state at phase `II − ALAG` and the
+/// previous pulse's residual window after it, both moving with the lag — and with the pulses
+/// overlapping (`II = 4` and `2`: `D1 = 5`, `R1`'s `100/R1 = 5`, `F1`'s 3 h window), whose
+/// steady state replays the always-running pulses as one more window and carries them past the
+/// record. Before: the lag declined to FD (`ss_lagtime_walk_unsupported`), and the overlap
+/// equilibrated to a zero state, its gradient the derivative of a function the value path
+/// (superposition) does not score. Measured now on Linux (`D1`, `R1`): ∂f/∂η ≤ 1.6e-11,
+/// gradient ≤ 2.9e-9.
+#[test]
+fn steady_state_over_a_moving_infusion_window_on_the_closed_form_walk_matches_reconverged_fd() {
+    for case in ["D1", "R1", "F1"] {
+        for (lag, ss, ii) in [
+            (false, false, 12.0),
+            (false, true, 12.0),
+            (false, true, 4.0),
+            (false, true, 2.0),
+            (true, true, 12.0),
+            (true, true, 4.0),
+        ] {
+            // `R1` under a lag: its plan is re-recorded at every inner-search iterate (measured:
+            // the reconverged-FD oracle spends minutes per coordinate in a debug build, its first
+            // coordinate within 3.3e-9), which is too slow for Tier 1.
+            if case == "R1" && lag {
+                continue;
+            }
+            let (jac, grad) = ss_window_gaps(case, false, false, lag, true, ss, ii);
+            assert!(
+                jac < 5e-11,
+                "{case} lag={lag} ss={ss} ii={ii}: ∂f/∂η {jac:.2e}"
+            );
+            assert!(
+                grad < 3e-8,
+                "{case} lag={lag} ss={ss} ii={ii}: gradient {grad:.2e}"
+            );
+        }
+    }
+}
+
+/// The `nonmem_anchor` shapes whose steady state `periodic_ss_fixed_point_g` solves, anchored
+/// there on values only, here on derivatives, on the closed form and its ODE twin:
+/// `evid_reset_lag` ID 13 — an `SS=1` depot dose at 10 whose lag `≈ 11 < II` puts its pulse at
+/// 21, after an `EVID=3` reset at 15 that cancels it — and the same subject without the reset,
+/// so the steady state and the lagged arrival reach the observations, η on the lag; and
+/// `ss_infusion_stop` ID 2, a depot infusion still running when an `SS=1` record lands at 10,
+/// η on `CL` and `KA`. Observations off the model at a reference η.
+///
+/// The cancelled subject predicts exactly zero, so its exact Jacobian must be exactly zero (a
+/// dual leaking the cancelled pulse would not be). Measured on Linux, the others: ∂f/∂η ≤
+/// 3.5e-11, FOCEI gradient ≤ 2.5e-8 (ID 2 on the ODE twin; ≤ 6.9e-9 elsewhere).
+#[test]
+fn anchor_steady_state_shapes_match_reconverged_fd() {
+    let load = |file: &str, id: &str| {
+        crate::read_nonmem_csv(std::path::Path::new(file), None, None)
+            .expect("anchor dataset")
+            .subjects
+            .into_iter()
+            .find(|s| s.id == id)
+            .expect("anchor subject")
+    };
+    let model = |ode: bool, lag: bool| {
+        let (eta2, ka) = if lag {
+            ("ETA_LAG ~ 0.02", "TVKA")
+        } else {
+            ("ETA_KA ~ 0.09", "TVKA * exp(ETA_KA)")
+        };
+        let (ind2, structure) = match (ode, lag) {
+            (true, true) => ("ALAG1 = LAGC * exp(ETA_LAG)", ""),
+            (false, true) => ("LAG = LAGC * exp(ETA_LAG)", ", lagtime=LAG"),
+            _ => ("", ""),
+        };
+        let structure = if ode {
+            "ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot) = -KA*depot\n  \
+             d/dt(central) = KA*depot - CL/V*central\n[scaling]\n  y = central / V"
+                .to_string()
+        } else {
+            format!("pk one_cpt_oral(cl=CL, v=V, ka=KA{structure})")
+        };
+        let src = format!(
+            "[parameters]\n  theta TVCL(2.0, 0.01, 50.0)\n  theta TVV(20.0, 0.5, 200.0)\n  \
+             theta TVKA(0.15, 0.005, 20.0)\n  omega ETA_CL ~ 0.09\n  omega {eta2}\n  \
+             sigma ADD_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+             V = TVV\n  KA = {ka}\n  {ind2}\n[structural_model]\n  {structure}\n\
+             [error_model]\n  DV ~ additive(ADD_ERR)\n"
+        );
+        let m = parse_model_string(&src).unwrap();
+        assert_eq!(m.ode_spec.is_some(), ode);
+        if ode {
+            tight(m)
+        } else {
+            m
+        }
+    };
+    let observed = |m: &CompiledModel, s: &Subject| {
+        let mut s = s.clone();
+        let f =
+            crate::pk::compute_predictions_with_tv(m, &s, &m.default_params.theta, &[0.1, -0.05]);
+        s.observations = f
+            .iter()
+            .enumerate()
+            .map(|(j, v)| v * (1.0 + 0.1 * (1.3 * j as f64).sin()))
+            .collect();
+        s
+    };
+    let reset = load("nonmem_anchor/evid_reset_lag.csv", "13");
+    assert!(reset.has_resets() && reset.doses[0].ss);
+    let mut no_reset = reset.clone();
+    no_reset.reset_times.clear();
+    no_reset.reset_covariates.clear();
+    no_reset.reset_occasions.clear();
+    no_reset.reset_period_times.clear();
+    let stop = load("nonmem_anchor/ss_infusion_stop.csv", "2");
+    assert!(stop.doses[0].is_infusion() && stop.doses[1].ss);
+    for ode in [false, true] {
+        let e = if ode { "ODE" } else { "closed form" };
+        let (lagged, plain) = (model(ode, true), model(ode, false));
+        let eta = probe_eta(2);
+        let s = observed(&lagged, &reset);
+        let f =
+            crate::pk::compute_predictions_with_tv(&lagged, &s, &lagged.default_params.theta, &eta);
+        let jac =
+            exact_eta_jacobian(&lagged, &s, &lagged.default_params.theta, &eta).expect("served");
+        assert!(
+            f.iter().all(|v| *v == 0.0) && jac.iter().all(|v| *v == 0.0),
+            "ID 13, {e}: the cancelled pulse leaks: f {f:?}, ∂f/∂η {jac}"
+        );
+        for (label, m, s) in [
+            (
+                format!("ID 13 without the reset, {e}"),
+                &lagged,
+                observed(&lagged, &no_reset),
+            ),
+            (format!("ID 2, {e}"), &plain, observed(&plain, &stop)),
+        ] {
+            let jac = jacobian_gap(m, &s, &eta, &label);
+            let grad = parity(m, &s);
+            eprintln!(
+                "{label}: ∂f/∂η vs FD {jac:.2e}; FOCEI gradient vs reconverged FD {grad:.2e}"
+            );
+            assert!(jac < 4e-10, "{label}: ∂f/∂η {jac:.2e}");
+            assert!(grad < 3e-7, "{label}: gradient {grad:.2e}");
+        }
     }
 }

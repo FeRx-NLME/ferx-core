@@ -1,13 +1,13 @@
 //! Dense linear solve over the sensitivity numeric type ([`PkNum`]).
 //!
 //! A single partial-pivoted Gaussian elimination, generic over `f64` (value-only) and the
-//! dual types (`Dual1`/`Dual2`). Because every arithmetic step is a `PkNum` `+ − × ÷`, the
+//! dual types (`Dual2`/`Dual2`). Because every arithmetic step is a `PkNum` `+ − × ÷`, the
 //! derivative jets ride through the elimination automatically: solving `A·x = b` over a dual
 //! `A`, `b` yields the exact implicit-function derivative
 //! `∂x/∂p = A⁻¹·(∂b/∂p − ∂A/∂p·x)` — and its 2nd order for the FOCEI outer Hessian — with no
 //! hand-assembled `dA`/`db`. This is what carries `∂u_ss/∂(θ,η)` through the steady-state
 //! absorption fixed point `u_ss = (I − M)⁻¹·b`: production instantiates it at `T = f64`
-//! ([`crate::ode::predictions`]) and the analytic-sensitivity walk at `T = Dual1/Dual2`
+//! ([`crate::ode::predictions`]) and the analytic-sensitivity walk at `T = Dual2/Dual2`
 //! ([`crate::sens::ode_provider`]) — one body, one source of truth (#835).
 
 use crate::sens::num::PkNum;
@@ -28,7 +28,7 @@ pub(crate) fn solve_linear_system_g<T: PkNum>(a: &[T], b: &[T], n: usize) -> Opt
         return Some(Vec::new());
     }
     let mut m = a.to_vec();
-    let mut piv = vec![0usize; n];
+    let mut piv = vec![T::from_f64(0.0); lu_piv_len::<T>(n)];
     if !lu_factor_in_place_g(&mut m, &mut piv, n) {
         return None;
     }
@@ -45,7 +45,7 @@ pub(crate) fn solve_linear_system_g<T: PkNum>(a: &[T], b: &[T], n: usize) -> Opt
 /// nothing is skipped for it.
 #[inline]
 pub(crate) fn structural_zero<T: PkNum>(x: T) -> bool {
-    x.val() == 0.0 && x.is_constant()
+    x.is_constant() && x.val() == 0.0
 }
 
 /// Value and every derivative component finite. A structural zero is skipped only against a
@@ -53,8 +53,24 @@ pub(crate) fn structural_zero<T: PkNum>(x: T) -> bool {
 /// turn a diverged solve that used to propagate `NaN` (and be rejected) into a finite one.
 /// Against a finite factor the skipped product is exactly `±0`.
 #[inline]
+///
+/// A recording type (#2786) never skips: [`skips_zeros`] is `false`, so it multiplies the zero,
+/// which is exact, and needs no finiteness check (a guard) on the other factor.
 pub(crate) fn all_finite<T: PkNum>(x: T) -> bool {
+    // A recording type (#2786) decides on the value; its compiled jets are finite wherever the
+    // generic ones are, and a non-finite one fails the plan's checks.
+    if T::RECORDS_BRANCHES {
+        return x.br_abs_lt(f64::INFINITY);
+    }
     x.val().is_finite() && x.jets_finite()
+}
+
+/// Whether `T`'s kernels skip structural-zero products at all: not for a recording type
+/// (#2786), whose multiply by a literal zero is exact and whose skip would need a guard on the
+/// other factor's finiteness.
+#[inline(always)]
+pub(crate) fn skips_zeros<T: PkNum>() -> bool {
+    !T::RECORDS_BRANCHES
 }
 
 /// Partial-pivoted LU factorization of the row-major `n×n` matrix `m`, **in place**: the
@@ -75,8 +91,8 @@ pub(crate) fn all_finite<T: PkNum>(x: T) -> bool {
 // `col` indexes `m`, `piv` and the elimination bounds together; iterating `piv` would hide
 // that. The `!(best > tol)` guard is deliberately a negated comparison, so NaN is rejected.
 #[allow(clippy::needless_range_loop, clippy::neg_cmp_op_on_partial_ord)]
-pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
-    if let Some(m) = as_f64_mut(m) {
+pub(crate) fn lu_factor_in_place_g<T: PkNum>(m: &mut [T], piv: &mut [T], n: usize) -> bool {
+    if let (Some(m), Some(piv)) = (as_f64_mut(m), as_f64_mut(piv)) {
         return lu_factor_f64(m, piv, n);
     }
     lu_factor_body(m, piv, n)
@@ -164,23 +180,30 @@ macro_rules! at_literal_n {
 /// are unchanged. One copy for `f64` only; a dual's body is dominated by its jets (or runs
 /// in `lu_factor_hook`), so unrolling it would only multiply its code (#2454 review).
 #[inline]
-fn lu_factor_f64(m: &mut [f64], piv: &mut [usize], n: usize) -> bool {
+fn lu_factor_f64(m: &mut [f64], piv: &mut [f64], n: usize) -> bool {
     at_literal_n!(n, |k| lu_factor_body(m, piv, k))
 }
 
 #[inline(always)]
-fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
+fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [T], n: usize) -> bool {
     debug_assert_eq!(m.len(), n * n, "coefficient matrix must be n×n row-major");
-    debug_assert_eq!(piv.len(), n, "pivot vector must have length n");
+    debug_assert_eq!(
+        piv.len(),
+        lu_piv_len::<T>(n),
+        "pivot storage must be `lu_piv_len` long"
+    );
     if let Some(ok) = T::lu_factor_hook(m, piv, n) {
         return ok;
     }
+    if T::RECORDS_BRANCHES {
+        return lu_factor_recorded(m, piv, n);
+    }
     // Singular tolerance relative to the largest value-part magnitude, floored at 1.0 so a
     // uniformly small-entry system is not spuriously rejected.
-    let scale = m.iter().fold(0.0_f64, |s, x| s.max(x.val().abs())).max(1.0);
-    let tol = 1e-12 * scale;
+    let tol = 1e-12 * m.iter().fold(0.0_f64, |s, x| s.max(x.val().abs())).max(1.0);
     for col in 0..n {
-        // Partial pivot: largest value-part magnitude in this column, at or below the diagonal.
+        // Partial pivot: largest value-part magnitude in this column, at or below the
+        // diagonal.
         let mut p = col;
         let mut best = m[col * n + col].val().abs();
         for r in (col + 1)..n {
@@ -190,12 +213,12 @@ fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
                 p = r;
             }
         }
-        // `!(best > tol)` rather than `best <= tol` so a NaN pivot (a diverged Jacobian)
-        // is rejected instead of sliding through the comparison.
+        // `!(best > tol)` rather than `best <= tol` so a NaN pivot (a diverged
+        // Jacobian) is rejected instead of sliding through the comparison.
         if !(best > tol) {
             return false;
         }
-        piv[col] = p;
+        piv[col] = T::from_f64(p as f64);
         if p != col {
             for c in 0..n {
                 m.swap(col * n + c, p * n + c);
@@ -203,7 +226,8 @@ fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
         }
         let pivot = m[col * n + col];
         // The pivot row to the right of the pivot, which every update below multiplies.
-        let pivot_row_finite = ((col + 1)..n).all(|c| all_finite(m[col * n + c]));
+        let pivot_row_finite =
+            skips_zeros::<T>() && ((col + 1)..n).all(|c| all_finite(m[col * n + c]));
         for r in (col + 1)..n {
             // A structural zero below the pivot (value 0, no jet, no tape) has multiplier
             // exactly 0 in every component, so its row update adds `±0`: skipped, against a
@@ -224,6 +248,153 @@ fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
     true
 }
 
+/// The pivot storage [`lu_factor_in_place_g`] needs for `T`: the pivot rows, and for a
+/// recording type (#2786) also the values' LU and the matrix itself
+/// (`[pivots (n) | LU (n²) | A (n²)]`, [`lu_factor_recorded`]).
+pub(crate) fn lu_piv_len<T: PkNum>(n: usize) -> usize {
+    if T::RECORDS_BRANCHES {
+        n + 2 * n * n
+    } else {
+        n
+    }
+}
+
+/// The [`HostFn::LuFactor`](crate::sens::num::HostFn) analysis: `args = [A (n·n), n]` →
+/// `out = [ok, piv₀ … piv_{n−1}, LU (n·n)]`, [`lu_factor_in_place_g`] on these values.
+pub(crate) fn lu_factor_host(args: &[f64], out: &mut Vec<f64>) {
+    let n = args[args.len() - 1] as usize;
+    let mut m = args[..n * n].to_vec();
+    let mut piv = vec![0.0; n];
+    let ok = lu_factor_in_place_g(&mut m, &mut piv, n);
+    out.clear();
+    out.push(ok as u8 as f64);
+    out.extend_from_slice(&piv);
+    out.extend_from_slice(&m);
+}
+
+/// A recording type's factorization (#2786): the values factored at run time by a host call —
+/// pivoting and all, as [`lu_factor_body`] does, so the plan holds at every point but a
+/// singular one — kept in `piv` with the matrix itself for [`lu_solve_recorded`].
+fn lu_factor_recorded<T: PkNum>(m: &[T], piv: &mut [T], n: usize) -> bool {
+    let mut args = m[..n * n].to_vec();
+    args.push(T::from_f64(n as f64));
+    let out = T::host(crate::sens::num::HostFn::LuFactor, &args);
+    if !out[0].br_cmp_c(crate::sens::num::BranchCmp::Eq, 1.0) {
+        return false;
+    }
+    piv[..n].copy_from_slice(&out[1..=n]);
+    piv[n..n + n * n].copy_from_slice(&out[1 + n..1 + n + n * n]);
+    piv[n + n * n..n + 2 * n * n].copy_from_slice(&m[..n * n]);
+    true
+}
+
+/// [`lu_factor_in_place_g`] whose verdict is a value: `1` when `m` factors, `0` when it is
+/// singular. A recording type (#2786) takes the verdict as data rather than a guard — the
+/// caller decides on it at run time (a Rosenbrock attempt is then rejected, as the value path
+/// rejects it) — and factors a singular matrix as the identity, so a rejected attempt
+/// computes finite values whose reverse carries no `0 · ∞`.
+pub(crate) fn lu_factor_flag_g<T: PkNum>(m: &mut [T], piv: &mut [T], n: usize) -> T {
+    if !T::RECORDS_BRANCHES {
+        return T::from_f64(if lu_factor_in_place_g(m, piv, n) {
+            1.0
+        } else {
+            0.0
+        });
+    }
+    use crate::sens::num::BranchCmp::Eq;
+    let mut args = m[..n * n].to_vec();
+    args.push(T::from_f64(n as f64));
+    let out = T::host(crate::sens::num::HostFn::LuFactor, &args);
+    let ok = out[0];
+    let one = T::from_f64(1.0);
+    for i in 0..n {
+        piv[i] = T::select_if(Eq, ok, one, out[1 + i], T::from_f64(i as f64));
+    }
+    for i in 0..n * n {
+        let id = T::from_f64(if i / n == i % n { 1.0 } else { 0.0 });
+        piv[n + i] = T::select_if(Eq, ok, one, out[1 + n + i], id);
+    }
+    piv[n + n * n..n + 2 * n * n].copy_from_slice(&m[..n * n]);
+    ok
+}
+
+/// `x` solved against the values' LU (`lu`, pivots `pv`: constants of the computation), as
+/// [`lu_solve_body`] on `f64`: the swaps as selects on the pivot values.
+fn lu_substitute<T: PkNum>(lu: &[T], pv: &[T], n: usize, x: &mut [T]) {
+    use crate::sens::num::BranchCmp::Eq;
+    for col in 0..n {
+        for r in (col + 1)..n {
+            let rr = T::from_f64(r as f64);
+            let (a, b) = (x[col], x[r]);
+            x[col] = T::select_if(Eq, pv[col], rr, b, a);
+            x[r] = T::select_if(Eq, pv[col], rr, a, b);
+        }
+    }
+    for col in 0..n {
+        for r in (col + 1)..n {
+            let sub = lu[r * n + col] * x[col];
+            x[r] = x[r] - sub;
+        }
+    }
+    for i in (0..n).rev() {
+        let mut s = x[i];
+        for c in (i + 1)..n {
+            s = s - lu[i * n + c] * x[c];
+        }
+        x[i] = s / lu[i * n + i];
+    }
+}
+
+/// The most refinement steps a recorded solve can take: a second-order payload, a tangent
+/// block and a reverse pass (`kernel_jit`'s gate orders).
+const REFINE_STEPS: usize = 4;
+
+/// A recording type's solve (#2786): the value `x₀` from the values' LU — the value path's
+/// solve — and the derivatives from refinement steps `x ← x + LU⁻¹(b − A·x)`. With the
+/// values' LU the step's derivative in `x` is `I − LU⁻¹A`, which has no value part, so each
+/// step makes one more derivative order exact; the value stays `x₀`'s.
+fn lu_solve_recorded<T: PkNum>(piv: &[T], n: usize, b: &mut [T]) {
+    let (pv, lu, a) = (
+        &piv[..n],
+        &piv[n..n + n * n],
+        &piv[n + n * n..n + 2 * n * n],
+    );
+    let mut x0: Vec<T> = b.iter().map(|v| v.value_only()).collect();
+    lu_substitute(lu, pv, n, &mut x0);
+    // Refinement against the value factorization makes one more derivative order exact per
+    // step; the reverse holds that factorization fixed, so it needs one step past the
+    // forward's order. Step `k` is gated at order `k` (`PkNum::order_gate`): a compiled
+    // variant runs exactly the steps its order needs, a value forward none.
+    let mut x = x0.clone();
+    for k in 1..=REFINE_STEPS {
+        let mut r: Vec<T> = (0..n)
+            .map(|i| {
+                let mut s = b[i];
+                for j in 0..n {
+                    s = s - a[i * n + j] * x[j];
+                }
+                s
+            })
+            .collect();
+        lu_substitute(lu, pv, n, &mut r);
+        for (xi, ri) in x.iter_mut().zip(&r) {
+            *xi = T::order_gate(k as u8, *xi, *xi + *ri);
+        }
+    }
+    // `x₀`'s value with `x`'s derivatives; a non-finite `x₀` (`x − x` would be `NaN` there,
+    // where the value path returns `±∞`) is taken as it is.
+    for i in 0..n {
+        let carried = x0[i] + (x[i] - x[i].value_only());
+        b[i] = T::select_if(
+            crate::sens::num::BranchCmp::Lt,
+            x0[i].abs(),
+            T::from_f64(f64::INFINITY),
+            carried,
+            x0[i],
+        );
+    }
+}
+
 /// Solve `A·x = b` in place given the [`lu_factor_in_place_g`] factorization of `A`: `b` is
 /// overwritten with `x`. Applies the recorded row swaps, forward-substitutes through the
 /// unit-lower multipliers, then back-substitutes through `U`.
@@ -237,8 +408,8 @@ fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [usize], n: usize) -> bool {
 /// diagonally dominant at small `h` and rarely pivots at all).
 // `col` walks the permutation, the multiplier column and the right-hand side together.
 #[allow(clippy::needless_range_loop)]
-pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b: &mut [T]) {
-    if let (Some(m), Some(b)) = (as_f64(m), as_f64_mut(b)) {
+pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[T], n: usize, b: &mut [T]) {
+    if let (Some(m), Some(piv), Some(b)) = (as_f64(m), as_f64(piv), as_f64_mut(b)) {
         return lu_solve_f64(m, piv, n, b);
     }
     lu_solve_body(m, piv, n, b)
@@ -246,30 +417,36 @@ pub(crate) fn lu_solve_in_place_g<T: PkNum>(m: &[T], piv: &[usize], n: usize, b:
 
 /// As [`lu_factor_f64`]: the `f64` solve at a literal `n`, once per stage.
 #[inline]
-fn lu_solve_f64(m: &[f64], piv: &[usize], n: usize, b: &mut [f64]) {
+fn lu_solve_f64(m: &[f64], piv: &[f64], n: usize, b: &mut [f64]) {
     at_literal_n!(n, |k| lu_solve_body(m, piv, k, b))
 }
 
 #[inline(always)]
 #[allow(clippy::needless_range_loop)]
-fn lu_solve_body<T: PkNum>(m: &[T], piv: &[usize], n: usize, b: &mut [T]) {
+fn lu_solve_body<T: PkNum>(m: &[T], piv: &[T], n: usize, b: &mut [T]) {
     debug_assert_eq!(m.len(), n * n, "factorization must be n×n row-major");
     debug_assert_eq!(b.len(), n, "right-hand side must have length n");
     if T::lu_solve_hook(m, piv, n, b) {
         return;
     }
+    if T::RECORDS_BRANCHES {
+        return lu_solve_recorded(piv, n, b);
+    }
     for col in 0..n {
-        let p = piv[col];
+        let p = piv[col].val() as usize;
         if p != col {
             b.swap(col, p);
         }
     }
     for col in 0..n {
         // `b[col]` a structural zero multiplies the whole multiplier column below it.
-        if structural_zero(b[col]) && ((col + 1)..n).all(|r| all_finite(m[r * n + col])) {
+        if skips_zeros::<T>()
+            && structural_zero(b[col])
+            && ((col + 1)..n).all(|r| all_finite(m[r * n + col]))
+        {
             continue;
         }
-        let b_finite = all_finite(b[col]);
+        let b_finite = skips_zeros::<T>() && all_finite(b[col]);
         for r in (col + 1)..n {
             if b_finite && structural_zero(m[r * n + col]) {
                 continue;
@@ -281,7 +458,7 @@ fn lu_solve_body<T: PkNum>(m: &[T], piv: &[usize], n: usize, b: &mut [T]) {
     for i in (0..n).rev() {
         let mut s = b[i];
         for c in (i + 1)..n {
-            if structural_zero(m[i * n + c]) && all_finite(b[c]) {
+            if skips_zeros::<T>() && structural_zero(m[i * n + c]) && all_finite(b[c]) {
                 continue;
             }
             s = s - m[i * n + c] * b[c];
@@ -353,17 +530,16 @@ mod tests {
     /// carries a derivative is still used, in `L` and in `U`. The system forces a row swap
     /// (column 0's largest entry is below the diagonal) and has non-zero upper entries, so the
     /// back substitution sees both kinds of zero. Mutations: drop `is_constant` from
-    /// `structural_zero` → the jet-carrying zeros are skipped and the `DualF` solve differs;
+    /// `structural_zero` → the jet-carrying zeros are skipped and the solve differs;
     /// skip every back-substitution term → the non-zero `U` entries are lost.
     #[test]
     fn lu_skips_structural_zeros_exactly_and_keeps_a_jet_carrying_zero() {
-        use crate::sens::vfree::DualF;
+        use crate::sens::dual2::Dual2;
         let n = 4;
-        let c = |v: f64| DualF::<2, 0>::from_f64(v);
-        let d = |v: f64, g0: f64, g1: f64| DualF::<2, 0> {
-            v,
-            g: [g0, g1],
-            h: [],
+        let c = |v: f64| Dual2::<2>::constant(v);
+        let d = |v: f64, g0: f64, g1: f64| Dual2::<2> {
+            grad: [g0, g1],
+            ..Dual2::constant(v)
         };
         let mut m = vec![c(0.0); n * n];
         m[0] = d(1.0, 1.0, 0.2); // pivot-swap: row 1 has the larger column-0 entry
@@ -379,16 +555,16 @@ mod tests {
         let b = vec![d(1.0, 0.0, 0.0), c(0.0), d(0.0, 0.5, 0.0), c(2.0)];
         let mut got = b.clone();
         let mut mm = m.clone();
-        let mut piv = vec![0usize; n];
+        let mut piv = vec![c(0.0); n];
         assert!(lu_factor_in_place_g(&mut mm, &mut piv, n));
-        assert_eq!(piv[0], 1, "premise: column 0 pivots on row 1");
+        assert_eq!(piv[0].value, 1.0, "premise: column 0 pivots on row 1");
         lu_solve_in_place_g(&mm, &piv, n, &mut got);
         let want = lu_reference(&m, n, &b).unwrap();
         let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
         for (g, w) in got.iter().zip(&want) {
-            assert_eq!(norm(g.v), norm(w.v));
+            assert_eq!(norm(g.value), norm(w.value));
             for k in 0..2 {
-                assert_eq!(norm(g.g[k]), norm(w.g[k]));
+                assert_eq!(norm(g.grad[k]), norm(w.grad[k]));
             }
         }
     }
@@ -400,9 +576,9 @@ mod tests {
     fn a_skipped_lu_row_keeps_the_dense_multiplier_sign() {
         let n = 2;
         let mut m = vec![-2.0, 1.0, 0.0, 3.0];
-        let mut piv = vec![0usize; n];
+        let mut piv = vec![0.0; n];
         assert!(lu_factor_in_place_g(&mut m, &mut piv, n));
-        assert_eq!(piv[0], 0, "premise: no swap");
+        assert_eq!(piv[0], 0.0, "premise: no swap");
         let want = 0.0_f64 / -2.0;
         assert!(
             want.is_sign_negative(),
@@ -419,12 +595,12 @@ mod tests {
     fn lu_does_not_skip_a_zero_against_an_infinite_factor() {
         let n = 2;
         let m = vec![1.0, 0.0, f64::INFINITY, 1.0];
-        let mut piv = vec![0usize; n];
+        let mut piv = vec![0.0; n];
         let mut mm = m.clone();
         // Pivoting would move the inf row up; bypass the factor and solve the unit-lower
         // system directly, as a Rosenbrock stage solve with an overflowed entry does.
-        piv[0] = 0;
-        piv[1] = 1;
+        piv[0] = 0.0;
+        piv[1] = 1.0;
         mm[2] = f64::INFINITY;
         let mut b = vec![0.0, 1.0];
         lu_solve_in_place_g(&mm, &piv, n, &mut b);
@@ -450,10 +626,10 @@ mod tests {
             -1e300, 1e300, 1.5e308, //
             0.0, 0.0, 1e300,
         ];
-        let mut piv = vec![0usize; n];
+        let mut piv = vec![0.0; n];
         // Column 2's pivot is then NaN, so the factor rejects; what it wrote must match dense.
         let _ = lu_factor_in_place_g(&mut m, &mut piv, n);
-        assert_eq!(piv[..2], [0, 1], "premise: no swaps");
+        assert_eq!(piv[..2], [0.0, 1.0], "premise: no swaps");
         assert!(
             m[5].is_infinite(),
             "premise: row 1's U entry overflowed: {m:?}"
@@ -468,7 +644,7 @@ mod tests {
     fn lu_forward_substitution_does_not_skip_a_zero_against_an_infinite_entry() {
         let n = 2;
         let m = vec![1.0, 0.0, 0.0, 1.0];
-        let piv = vec![0usize, 1];
+        let piv = vec![0.0, 1.0];
         let mut b = vec![f64::INFINITY, 1.0];
         lu_solve_in_place_g(&m, &piv, n, &mut b);
         let want = lu_reference_solve_only(&m, &piv, n, &[f64::INFINITY, 1.0]);
@@ -483,7 +659,7 @@ mod tests {
     fn lu_back_substitution_does_not_skip_a_zero_against_an_infinite_entry() {
         let n = 2;
         let m = vec![1.0, 0.0, 0.0, 1e-300];
-        let piv = vec![0usize, 1];
+        let piv = vec![0.0, 1.0];
         let mut b = vec![1.0, 1e10];
         lu_solve_in_place_g(&m, &piv, n, &mut b);
         let want = lu_reference_solve_only(&m, &piv, n, &[1.0, 1e10]);
@@ -495,10 +671,10 @@ mod tests {
     }
 
     /// The pre-skip substitutions alone, on a given factorization.
-    fn lu_reference_solve_only(m: &[f64], piv: &[usize], n: usize, b: &[f64]) -> Vec<f64> {
+    fn lu_reference_solve_only(m: &[f64], piv: &[f64], n: usize, b: &[f64]) -> Vec<f64> {
         let mut x = b.to_vec();
         for col in 0..n {
-            x.swap(col, piv[col]);
+            x.swap(col, piv[col] as usize);
         }
         for col in 0..n {
             for r in (col + 1)..n {
@@ -635,7 +811,7 @@ mod tests {
         let rhs_set = [[1.0, 2.0, 3.0], [-4.0, 0.5, 7.0], [0.0, 0.0, 1.0]];
 
         let mut lu = a.to_vec();
-        let mut piv = vec![0usize; 3];
+        let mut piv = vec![0.0; 3];
         assert!(lu_factor_in_place_g::<f64>(&mut lu, &mut piv, 3));
 
         for b in rhs_set {
@@ -657,7 +833,7 @@ mod tests {
     fn non_finite_matrix_is_rejected() {
         let a = [f64::NAN, 1.0, 1.0, 1.0];
         let mut m = a.to_vec();
-        let mut piv = vec![0usize; 2];
+        let mut piv = vec![0.0; 2];
         assert!(!lu_factor_in_place_g::<f64>(&mut m, &mut piv, 2));
         assert!(solve_linear_system_g::<f64>(&a, &[1.0, 1.0], 2).is_none());
     }

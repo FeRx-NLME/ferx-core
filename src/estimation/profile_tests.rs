@@ -17,6 +17,7 @@
 use super::*;
 use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, PrevEtas};
 use crate::types::FitOptions;
+use rayon::prelude::*;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -72,11 +73,15 @@ fn prep(
             }
         };
     std::fs::write(&data_path, kept).unwrap();
-    crate::api::prepare_run(
+    let run = crate::api::prepare_run(
         model_path.to_str().unwrap(),
         Some(data_path.to_str().unwrap()),
-    )
-    .unwrap_or_else(|e| panic!("{e}"))
+    );
+    // The run holds what it read: the files go before any assertion can leave them behind.
+    for p in [&model_path, &data_path] {
+        let _ = std::fs::remove_file(p);
+    }
+    run.unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn options(p: &crate::api::PreparedRun) -> FitOptions {
@@ -6011,18 +6016,18 @@ fn under_nelder_mead_a_state_on_the_adjoint_is_a_mode() {
 /// `W_PROFILE_FD_GRADIENT`. Now none does. The fit's `converged` is not asserted: its
 /// stationary-start verdict is #2539's other half.
 ///
-/// The precondition is asserted too (#2554 review r1 §1): some evaluation ended a subject
-/// on a fallback, and none stopped short, so every fallback was certified. A change to the
-/// warm starts that stops the fallback firing would otherwise leave this test passing with
-/// or without the fix. It is read off the fit's own counters, not one solve at this start:
-/// a single solve there ends no subject on a fallback (measured, 0 of 12); the fallbacks
-/// come from the outer loop's ~1e-8 steps, each warm-started from the previous mode.
-///
-/// Since #2497 those warm searches stop `Stuck` at their mode and the same Newton certificate
-/// accepts them in place, without the restart (measured on Linux x86_64: 0 fallbacks, 6 stuck
-/// partials certified). The precondition therefore counts both: a point certified off the
-/// BFGS stop, by a fallback or as a stuck partial (`STUCK_CERTIFIED`, a process-wide counter,
-/// so a test running alongside can only add to it).
+/// Until #2786 its precondition was asserted too (#2554 review r1 §1): some evaluation ended
+/// a subject on a fallback, read off the fit's own counters — the outer loop's ~1e-8 steps,
+/// each warm-started from the previous mode. Since #2497 those warm searches stopped `Stuck` at their mode and the same Newton
+/// certificate accepted them in place (measured on Linux x86_64: 0 fallbacks, 6 stuck partials
+/// certified). Since #2786 the inner searches take the plans' exact gradients and converge
+/// at this start outright — measured on Linux x86_64: 0 fallbacks, 0 stuck partials, 0
+/// unconverged, under the BFGS and the Nelder–Mead inner optimizer alike — so the fit reaches
+/// no certified point here, and the certificate itself is pinned at the solve
+/// (`a_certified_fallback_takes_the_adjoint_level_gradient` and
+/// `under_nelder_mead_a_state_on_the_adjoint_is_a_mode` above). The counters are printed, not
+/// asserted; the property this test keeps is the fit-level one: no level gradient falls back
+/// to finite differences at the optimum.
 #[test]
 fn a_profiled_fit_at_its_optimum_keeps_the_adjoint_level_gradient() {
     let p = prep(F2, F2_DATA, None, |t| t);
@@ -6047,13 +6052,7 @@ fn a_profiled_fit_at_its_optimum_keeps_the_adjoint_level_gradient() {
         r.max_unconverged_subjects
     );
     assert!(r.ofv.is_finite());
-    assert!(
-        r.total_ebe_fallbacks as usize + stuck > 0 && r.max_unconverged_subjects == 0,
-        "the straddle is gone: {} fallbacks, {} stuck partials certified, max {} unconverged",
-        r.total_ebe_fallbacks,
-        stuck,
-        r.max_unconverged_subjects
-    );
+    assert_eq!(r.max_unconverged_subjects, 0, "every EBE converged");
     assert!(
         !r.warnings
             .iter()

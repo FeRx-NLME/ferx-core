@@ -4,7 +4,7 @@ use crate::estimation::inner_optimizer::{
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{
-    foce_subject_nll_cov, foce_subject_nll_iov_cov, SUBJECT_SENTINEL_NLL,
+    foce_subject_nll_cov_at, foce_subject_nll_iov_cov, SUBJECT_SENTINEL_NLL,
 };
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
@@ -12,7 +12,6 @@ use nalgebra::{DMatrix, DVector};
 // fallback tests); gate the import so a non-test build doesn't flag it unused.
 #[cfg(test)]
 use nalgebra::SymmetricEigen;
-use rayon::prelude::*;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1565,12 +1564,8 @@ fn subject_nlls(
         )
     };
     if crate::api::parallelize_cheap_subject_pass(population.subjects.len()) {
-        population
-            .subjects
-            .par_iter()
-            .enumerate()
-            .map(eval)
-            .collect()
+        let subjects = &population.subjects;
+        crate::par::map(subjects.len(), |i| eval((i, &subjects[i])))
     } else {
         population.subjects.iter().enumerate().map(eval).collect()
     }
@@ -1586,6 +1581,31 @@ pub(crate) fn subject_nll(
     h_matrix: &DMatrix<f64>,
     kappas: &[DVector<f64>],
     interaction: bool,
+) -> f64 {
+    subject_nll_at(
+        model,
+        subject,
+        params,
+        eta,
+        h_matrix,
+        kappas,
+        interaction,
+        None,
+    )
+}
+
+/// [`subject_nll`] given the predictions at `eta` when the caller holds them
+/// (`EbeResult::ipreds`); the IOV marginal predicts its own.
+#[allow(clippy::too_many_arguments)]
+fn subject_nll_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
+    interaction: bool,
+    ipreds: Option<&[f64]>,
 ) -> f64 {
     if model.n_kappa > 0 {
         if let Some(ref iov) = params.omega_iov {
@@ -1605,7 +1625,7 @@ pub(crate) fn subject_nll(
             );
         }
     }
-    foce_subject_nll_cov(
+    foce_subject_nll_cov_at(
         model,
         subject,
         &params.theta,
@@ -1618,6 +1638,7 @@ pub(crate) fn subject_nll(
         // optimizer is currently proposing.
         model.residual_cov_at(params),
         interaction,
+        ipreds,
     )
 }
 
@@ -1860,7 +1881,7 @@ fn run_inner_loop_and_nll_prepared(
     .with_prev_etas(prev);
     let finish_subject =
         |subject: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
-            subject_nll(
+            subject_nll_at(
                 model,
                 subject,
                 params,
@@ -1868,6 +1889,7 @@ fn run_inner_loop_and_nll_prepared(
                 &ebe.h_matrix,
                 &ebe.kappas,
                 options.interaction,
+                ebe.ipreds.as_deref(),
             )
         };
     let (etas, h_matrices, stats, kappas, contributions) =
@@ -4187,6 +4209,7 @@ fn recover_final_ebes(
 /// A final inner solve at `params` and what its Sobol screen (#2013) and flip-flop twin
 /// seed (#2095) did: the EBE triple `pop_nll_opts` consumes, and the IDs of the subjects
 /// whose EBE either moved off the mode the descent from η = 0 found.
+#[derive(Clone)]
 pub(crate) struct FinalInnerSolve {
     pub(crate) etas: Vec<DVector<f64>>,
     pub(crate) h_mats: Vec<DMatrix<f64>>,
@@ -4789,21 +4812,12 @@ fn cold_solve_is_consistent(best_seen_ofv: Option<f64>, final_ofv: f64) -> bool 
         .is_none_or(|best| final_ofv <= best + PLATEAU_CONSISTENCY_REL_TOL * (1.0 + best.abs()))
 }
 
-/// Can [`per_subject_outer_gradients`] be formed for this objective at all — not an AGQ or
-/// mixture objective, and the model inside the analytic outer scope? Asked on its own by
-/// [`predicted_remaining_gain`] before the tight re-solve it would otherwise pay for a
-/// certain `None` (#2143 review).
-fn per_subject_outer_gradients_in_scope(model: &CompiledModel, options: &FitOptions) -> bool {
-    options.agq_nodes().is_none()
-        && model.mixture.is_none()
-        && crate::sens::provider::analytic_outer_gradient_available(model)
-}
-
-/// Per-subject outer gradients `∂nllᵢ/∂x` (packed space) at `x`, from the same analytic
-/// entry points the optimizer's gradient is assembled from, for [`bhhh_newton_decrement`]
-/// (#1934). `None` whenever any subject has no analytic gradient — an AGQ or mixture
-/// objective, a model outside the analytic outer scope, or one subject the provider
-/// declines — so the decrement is never formed from a mix of exact and salvaged rows.
+/// Per-subject outer gradients `∂nllᵢ/∂x` (packed space) at `x` of the objective the fit
+/// minimises — FOCE, FOCEI, the quadrature (Laplace, AGQ) or a mixture's class log-sum-exp —
+/// from the same exact entry points the optimizer's gradient is assembled from, for
+/// [`bhhh_newton_decrement`] (#1934). `None` whenever any subject has no analytic gradient — a
+/// model outside the analytic outer scope, or one subject the adjoint declines — so the
+/// decrement is never formed from a mix of exact and salvaged rows.
 ///
 /// Production reads it through [`per_subject_outer_gradients_checked`], which also asks
 /// whether each subject's integration backs a decrement; this unchecked form is the tests'.
@@ -4860,57 +4874,69 @@ fn per_subject_outer_gradients_checked(
     options: &FitOptions,
     require_complete: bool,
 ) -> Option<Vec<Vec<f64>>> {
-    if !per_subject_outer_gradients_in_scope(model, options) {
+    if !crate::sens::provider::analytic_outer_gradient_available(model) {
         return None;
     }
-    let iov = model.n_kappa > 0;
+    // One subject's row, with its integrations counted on its own worker.
+    let checked = |row: &dyn Fn() -> Option<Vec<f64>>| {
+        let scope = require_complete.then(crate::ode::solver::SolverStatsScope::enter);
+        let gradient = row();
+        if scope.is_some_and(|s| !integration_backs_a_decrement(&s.collected())) {
+            return None;
+        }
+        gradient
+    };
+    if init_params.mixture.is_some() {
+        // A mixture's rows take every class's mode, which `ehs` (the MIXEST class's) does
+        // not carry: one evaluation at `x` solves them.
+        let params = unpack_params(x, init_params);
+        let (eval, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
+            model, population, &params, options, None,
+        );
+        if eval.ebe_stats.n_unconverged > 0 || eval.ebe_stats.n_start_rejected > 0 {
+            return None;
+        }
+        return crate::estimation::mixture::mixture_subject_gradients(
+            model,
+            population,
+            &params,
+            options,
+            &eval,
+            Some(&modes),
+            None,
+            checked,
+        );
+    }
+    let objective = crate::estimation::covariance::cov_objective(options);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
-    population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            let scope = require_complete.then(crate::ode::solver::SolverStatsScope::enter);
-            let gradient = if iov {
-                let mut stacked: Vec<f64> = ehs[i].iter().copied().collect();
+    {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
+            checked(&|| {
+                // No data contributes nothing.
+                if subject.observations.is_empty() && subject.obs_records.is_empty() {
+                    return Some(vec![0.0; x.len()]);
+                }
+                // The stacked `[η, κ₁ … κ_K]` (just `η` without IOV).
+                let mut mode: Vec<f64> = ehs[i].iter().copied().collect();
                 for kap in kappas.get(i).map(Vec::as_slice).unwrap_or(&[]) {
-                    stacked.extend(kap.iter().copied());
+                    mode.extend(kap.iter().copied());
                 }
-                match pt.as_ref() {
-                    Some(pt) => subject_analytic_outer_gradient(
-                        model,
-                        subject,
-                        pt,
-                        &stacked,
-                        options.interaction,
-                    ),
-                    // `x` is not the template's packed length: the adjoint declines, but a subject
-                    // with no observations keeps the zero gradient it gives one.
-                    None => (subject.observations.is_empty() && subject.obs_records.is_empty())
-                        .then(|| vec![0.0; x.len()]),
-                }
-            } else {
-                match pt.as_ref() {
-                    Some(pt) => subject_analytic_outer_gradient(
-                        model,
-                        subject,
-                        pt,
-                        ehs[i].as_slice(),
-                        options.interaction,
-                    ),
-                    // `x` is not the template's packed length: the adjoint declines, but a subject
-                    // with no observations keeps the zero gradient it gives one.
-                    None => (subject.observations.is_empty() && subject.obs_records.is_empty())
-                        .then(|| vec![0.0; x.len()]),
-                }
-            };
-            if scope.is_some_and(|s| !integration_backs_a_decrement(&s.collected())) {
-                return None;
-            }
-            gradient
+                let g = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
+                    model,
+                    subject,
+                    pt.as_ref()?,
+                    &mode,
+                    objective,
+                )?;
+                g.iter().all(|v| v.is_finite()).then_some(g)
+            })
         })
+        .into_iter()
         .collect()
+    }
 }
 
 /// The BHHH Newton decrement at a point (#1934, #1564 A3/B3): the OFV a Newton step would
@@ -5192,7 +5218,7 @@ fn predicted_newton_step(
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
 ) -> Option<(f64, Vec<f64>)> {
-    if !per_subject_outer_gradients_in_scope(model, options) {
+    if !crate::sens::provider::analytic_outer_gradient_available(model) {
         return None;
     }
     let per_subject = match decrement_ode_override(model, options) {
@@ -5265,7 +5291,6 @@ fn quadrature_predicted_remaining_gain(
     nn_reg: &crate::estimation::nn_reg::NnRegularizer,
     priors: &crate::estimation::priors::PriorSet,
 ) -> Option<f64> {
-    use rayon::prelude::*;
     let formed: Vec<Vec<f64>>;
     let per_subject: &[Vec<f64>] = match scores.filter(|s| s.len() == population.subjects.len()) {
         Some(s) => s,
@@ -5278,17 +5303,15 @@ fn quadrature_predicted_remaining_gain(
                 bounds,
                 false,
             );
-            formed = population
-                .subjects
-                .par_iter()
-                .enumerate()
-                .map(|(i, subject)| {
-                    let k = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-                    context
-                        .score_routed(subject, ehs.get(i)?.as_slice(), k, false)
-                        .map(|(g, _)| g)
-                })
-                .collect::<Option<_>>()?;
+            let subjects = &population.subjects;
+            formed = crate::par::map(subjects.len(), |i| {
+                let k = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                context
+                    .score_routed(&subjects[i], ehs.get(i)?.as_slice(), k, false)
+                    .map(|(g, _)| g)
+            })
+            .into_iter()
+            .collect::<Option<_>>()?;
             &formed
         }
     };
@@ -5326,6 +5349,19 @@ fn tight_per_subject_gradients(
     ode: crate::ode::solver::OdeSolverOverride,
 ) -> Option<Vec<Vec<f64>>> {
     crate::api::with_fit_scope_ode(options, ode, || {
+        if init_params.mixture.is_some() {
+            // A mixture solves its class modes itself, under this scope.
+            return per_subject_outer_gradients_checked(
+                model,
+                population,
+                init_params,
+                x,
+                ehs,
+                kappas,
+                options,
+                true,
+            );
+        }
         let params = unpack_params(x, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let warm = joint_warm_starts(ehs, kappas);
@@ -8237,6 +8273,10 @@ fn optimize_nlopt_attempt_probed(
     // L-BFGS's first step could gain there, and that leg ended `Failure` with no gain.
     let latched_at_stop = stagnation_latched.load(Ordering::Relaxed);
     let verified_needs_left_init = verified_stop_needs_left_init(&first_leg, latched_at_stop);
+    // The verified stop's cold solve and the point it was taken at, kept for the final cold
+    // re-solve at the restored point: a deterministic function of its inputs, so at the same
+    // point it is this one, not another descent from η = 0 per subject.
+    let cold_kept = std::cell::RefCell::new(None::<(Vec<f64>, FinalInnerSolve)>);
     // The best leg incumbent copied into `best_seen` so far (#2507), at the leg tolerance.
     let mut kept_leg_best: Option<f64> = None;
     // `kept_leg_best` as the code around the legs reads it, while they hold the original.
@@ -8481,6 +8521,7 @@ fn optimize_nlopt_attempt_probed(
                          restart, no further rounds."
                     );
                 }
+                *cold_kept.borrow_mut() = Some((x_inc, cold.clone()));
                 *cold_at_stop.borrow_mut() = Some(cold);
                 !owed
             },
@@ -8586,10 +8627,10 @@ fn optimize_nlopt_attempt_probed(
                 }
                 if options.verbose {
                     eprintln!(
-                    "{algo:?} stopped on its tolerance (best objective = {before:.6}); polishing \
+                        "{algo:?} stopped on its tolerance (best objective = {before:.6}); polishing \
                      from the best point with ftol_rel = {polish_ftol:e}, \
                      xtol_rel = {polish_xtol:e} ({left} evaluations left).",
-                );
+                    );
                 }
                 let r = leg.optimize(&mut x0);
                 opt_slot = Some(leg);
@@ -8894,8 +8935,16 @@ fn optimize_nlopt_attempt_probed(
             // The cold solve is kept for its own sake: `failure_is_converged_plateau`
             // reads it as the warm-start-artifact probe (#751), and that check is only
             // worth anything while the number it reads is genuinely cold.
-            let cold_solve =
-                final_inner_solve(model, population, &final_params, &final_mu_k, None, options);
+            let cold_solve = match cold_kept.take().filter(|(x, _)| {
+                x.iter()
+                    .map(|v| v.to_bits())
+                    .eq(x0.iter().map(|v| v.to_bits()))
+            }) {
+                Some((_, solved)) => solved,
+                None => {
+                    final_inner_solve(model, population, &final_params, &final_mu_k, None, options)
+                }
+            };
             // Only the cold solve can screen: the seeded re-solve below is warm.
             screen_moved_ids = cold_solve.screen_moved_ids;
             let (cold_ehs, cold_hms, cold_kappas, cold) = score_final_ebes(
@@ -10594,7 +10643,7 @@ fn central_diff_packed(
 
 /// Per-subject packed gradient `dᵢ = d(nllᵢ)/dx` at the **held** EBE `η̂ᵢ` and held
 /// prediction Jacobian — the per-subject term of [`ad_population_gradient`], and the fill
-/// for a subject [`subject_analytic_outer_gradient`] declines inside
+/// for a subject `subject_analytic_outer_gradient` declines inside
 /// [`population_gradient_sens_mixed_dx`] (#1529).
 ///
 /// It costs `2·n_free` objective evaluations of this one subject (or one closed-form
@@ -10766,7 +10815,7 @@ fn non_iov_declined_salvage(
     }
 }
 
-/// The non-IOV salvage for a subject declined by [`subject_analytic_outer_gradient`]
+/// The non-IOV salvage for a subject declined by `subject_analytic_outer_gradient`
 /// inside [`population_gradient_sens_mixed_dx`] (#1529), used whenever the #1520 guard
 /// ([`declined_subject_gradient`]) does not drop the subject. Three cases, by what the
 /// held-EBE gradient ([`subject_fixed_ebe_gradient`]) returns:
@@ -10990,6 +11039,7 @@ pub(crate) fn subject_reconverged_fd_gradient_iov(
 /// entry-point choice is the adjoint's (`sens_outer_gradient::subject_gradient_at`), and this
 /// adds the finiteness backstop. Note that [`outer_fd_fallback_warning`] deliberately does
 /// **not** ask this function — it probes the provider alone, for the reason recorded there.
+#[cfg(test)]
 fn subject_analytic_outer_gradient(
     model: &CompiledModel,
     subject: &Subject,
@@ -11007,7 +11057,7 @@ fn subject_analytic_outer_gradient(
     g.iter().all(|v| v.is_finite()).then_some(g)
 }
 
-/// [`subject_analytic_outer_gradient`], and with `want_eta_dx` the subject's mode response
+/// `subject_analytic_outer_gradient`, and with `want_eta_dx` the subject's mode response
 /// `dη̂/dx` formed from the same recording; the response is `None` wherever the gradient is.
 /// A declined gradient comes back as its [`DeclineCause`] (#2713).
 fn subject_analytic_outer_gradient_dx(
@@ -11394,7 +11444,7 @@ fn declined_subject_gradient(
 
 /// Which subjects actually took a per-subject salvage outer gradient during this fit —
 /// held-EBE for non-IOV ([`held_ebe_salvage`], #1529), reconverged FD under IOV —
-/// because [`subject_analytic_outer_gradient`] (or its IOV twin) declined them (#1154).
+/// because `subject_analytic_outer_gradient` (or its IOV twin) declined them (#1154).
 ///
 /// One `AtomicBool` per subject, set on the fallback arm of the mixed assemblies. Recorded
 /// at the point the gradient is evaluated, so it says what *ran* rather than what a probe
@@ -11608,7 +11658,7 @@ impl OuterFdDeclineLog {
 /// log with the wrong sentence.
 ///
 /// "Could not be given" rather than "fell outside the provider's scope": the log records
-/// every failure of [`subject_analytic_outer_gradient`], which includes a
+/// every failure of `subject_analytic_outer_gradient`, which includes a
 /// non-positive-definite inner Hessian at a trial point and a non-finite analytic
 /// component — not only a data shape the provider declines (#1529 review).
 pub(crate) fn outer_fd_fallback_warning(
@@ -11633,9 +11683,9 @@ pub(crate) fn outer_fd_fallback_warning(
          `reconverge_gradient_interval = N` restores the reconverged gradient every N-th \
          evaluation.";
     const STRUCTURAL: &str = "used reconverged finite-difference outer gradients because \
-         no analytic recorder serves them: their data shape is outside the recorders' scope \
-         at every parameter point (for example a steady-state infusion under a lag time on \
-         the event walk). Those gradients include the EBE-response term but are slower.";
+         no analytic recorder serves them: recording their exact derivatives failed, as it \
+         will at every parameter point. Those gradients include the EBE-response term but \
+         are slower.";
     // #1536: a non-IOV decline takes one of two salvages, so the sentence names each
     // group that is non-empty — never the held-EBE remedy for a subject that was
     // reconverged, nor "correct" for one that was not.
@@ -11786,11 +11836,10 @@ pub(crate) fn population_gradient_sens_mixed_dx(
     let n_obs_total = population_n_obs(population);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
-    let filled: Vec<(Vec<f64>, Option<Vec<DVector<f64>>>)> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let filled: Vec<(Vec<f64>, Option<Vec<DVector<f64>>>)> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             // Complete the fallback on this worker as soon as its analytic
             // result is known; do not wait for a second population-wide pass.
             let (analytic, dx) = match pt.as_ref() {
@@ -11846,7 +11895,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
             };
             (g, dx)
         })
-        .collect();
+    };
     let mut grad = vec![0.0f64; np];
     for (gi, _) in &filled {
         for k in 0..np {
@@ -11981,11 +12030,10 @@ pub(crate) fn population_gradient_sens_iov_mixed(
     let n_obs_total = population_n_obs(population);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
-    let filled: Vec<Vec<f64>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let filled: Vec<Vec<f64>> = {
+        let __r0 = &population.subjects;
+        crate::par::map(__r0.len(), |i| {
+            let subject = &__r0[i];
             let stacked = joint_warm_start(&ehs[i], &kappas[i]);
             match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
             {
@@ -12015,7 +12063,7 @@ pub(crate) fn population_gradient_sens_iov_mixed(
                 }
             }
         })
-        .collect();
+    };
     let mut grad = vec![0.0f64; np];
     for gi in &filled {
         for k in 0..np {
@@ -12055,24 +12103,21 @@ fn ad_population_gradient(
     // IOV routes through the reconverged-FD gradient, not here, so the `log|H̃|`
     // EBE-response term `subject_fixed_ebe_gradient` adds only affects non-IOV
     // FOCEI gradient steps.
-    let per_subj: Vec<Vec<f64>> = (0..n_subj)
-        .into_par_iter()
-        .map(|i| {
-            subject_fixed_ebe_gradient(
-                x,
-                init_params,
-                model,
-                population,
-                i,
-                &ehs[i],
-                &hms[i],
-                kappas[i].as_slice(),
-                bounds,
-                options,
-            )
-            .1
-        })
-        .collect();
+    let per_subj: Vec<Vec<f64>> = crate::par::map(n_subj, |i| {
+        subject_fixed_ebe_gradient(
+            x,
+            init_params,
+            model,
+            population,
+            i,
+            &ehs[i],
+            &hms[i],
+            kappas[i].as_slice(),
+            bounds,
+            options,
+        )
+        .1
+    });
     assemble_population_gradient(&per_subj, np)
 }
 
@@ -12261,7 +12306,7 @@ fn population_gradient_with_agq_evaluation(
     // needs the per-occasion κ̂ alongside the BSV EBEs, so it is dispatched
     // separately from the non-IOV path.
     // The adjoint serves both closed-form analytical and ODE (RHS-program) IOV models
-    // on the stacked `[η, κ]` width (`subject_width`); both feed the stacked-η /
+    // on the stacked `[η, κ]` width; both feed the stacked-η /
     // block-Ω assembly the IOV gradient entry points consume (#439 ODE IOV).
     let iov_analytic = model.n_kappa > 0;
     // `gradient = fd` forces the numeric path for the outer gradient too (the inner

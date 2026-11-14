@@ -119,13 +119,9 @@ nan-fold 2 src/estimation/vi/elbo_tests.rs::iov_mc_kl_neg_elbo_gradient_matches_
 nan-fold 1 src/estimation/vi/elbo_tests.rs::mc_kl_grad_x_matches_fd_but_phi_is_path_derivative
 nan-fold 4 src/estimation/vi/elbo_tests.rs::the_data_eta_gradient_is_exact_past_the_closed_forms
 nan-fold 1 src/io/datareader_tests.rs::test_missing_dv_advice_says_mdv1_keeps_the_row_as_a_record
-nan-fold 1 src/markov/dtmm_tests.rs::laplace_boundary_curvature_off_diagonal_matches_the_closed_form
-nan-fold 1 src/markov/dtmm_tests.rs::laplace_curvature_refuses_cancelling_sentinel_corners
 nan-fold 2 src/markov/endpoint.rs::exact_eta_hessian_tests::the_ctmm_eta_hessian_is_exact_on_a_homogeneous_generator
-nan-fold 3 src/markov/endpoint.rs::tests::a_drug_driven_ctmm_is_differentiated_exactly
 nan-fold 1 src/markov/mod.rs::tests::max_abs_diff
 nan-fold 1 src/nn/mlp.rs::regularizer_fit_tests::exact_penalty_hessian_matches_the_second_difference_of_the_penalty
-nan-fold 1 src/nn/mlp.rs::tests::vjp_is_the_seed_combination_of_the_jacobian_rows
 nan-fold 2 src/ode/ekf.rs::tests::ekf_covariance_matches_a_quadrature_oracle_on_a_time_varying_rate
 nan-fold 1 src/ode/ekf.rs::tests::ekf_infusion_under_f_matches_nonmem
 nan-fold 1 src/ode/ekf.rs::tests::ekf_reader_split_tie_is_one_instant
@@ -156,7 +152,6 @@ nan-fold 2 src/parser/model_parser_tests.rs::lean_rhs_dual2_vs_fd
 nan-fold 2 src/parser/model_parser_tests.rs::normalization_keeps_the_hidden_layer_responsive
 nan-fold 1 src/parser/model_parser_tests.rs::statement_if_partials_match_production_and_fd
 nan-fold 1 src/parser/model_parser_tests.rs::the_symbolic_partials_on_a_diamond_match_fd
-nan-fold 4 src/parser/rhs_regcode_tests.rs::a_taped_rhs_block_is_the_per_operation_tape_to_rounding
 nan-fold 1 src/parser/rhs_regcode_tests.rs::check_reverse
 nan-fold 1 src/parser/rhs_regcode_tests.rs::the_reverse_pass_is_the_forward_tangents_transposed_on_random_programs
 nan-fold 1 src/pk/absorption_walk_tests.rs::walk_1cpt_matches_quadrature_and_twin_across_a_live_boundary
@@ -170,10 +165,8 @@ nan-fold 1 src/sens/nested_levels_tests.rs::check_inner_hessian
 nan-fold 2 src/sens/nested_levels_tests.rs::check_jacobian
 nan-fold 2 src/sens/ode_adjoint_phenomena_tests.rs::fd_oracle_agq_iov
 nan-fold 1 src/sens/ode_adjoint_phenomena_tests.rs::jacobian_gap
-nan-fold 1 src/sens/ode_adjoint_phenomena_tests.rs::joint_pktte_serves_ss_gaussian_rows_and_declines_the_ss_hazard
 nan-fold 1 src/sens/ode_adjoint_phenomena_tests.rs::off_the_mode_the_identity_beats_the_held_ebe_gradient
 nan-fold 1 src/sens/ode_adjoint_tests.rs::a_certified_point_can_fail_the_indefinite_stationarity_gate
-nan-fold 1 src/sens/ode_adjoint_tests.rs::a_condition_on_a_network_output_takes_the_production_branch
 nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_block_on_a_covariate_nn_subject_is_the_full_hessians_block
 nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_block_on_axes_is_the_full_hessians_block
 nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_diag_on_a_covariate_nn_subject_runs_in_the_reduced_basis
@@ -188,15 +181,12 @@ nan-fold 1 src/sens/ode_adjoint_tests.rs::kernel_m3_censored_rows_match_reconver
 nan-fold 2 src/sens/ode_adjoint_tests.rs::mm_template_and_hand_written_gradients_agree_per_subject
 nan-fold 1 src/sens/ode_adjoint_tests.rs::multi_cpt_static_superposition_matches_production_and_fd
 nan-fold 1 src/sens/ode_adjoint_tests.rs::ode_iov_with_ltbs_matches_reconverged_fd
-nan-fold 2 src/sens/ode_adjoint_tests.rs::pk_space_twin_high_order
 nan-fold 1 src/sens/ode_adjoint_tests.rs::the_agq_gradient_is_exact_with_a_non_gaussian_term
 nan-fold 1 src/sens/ode_adjoint_tests.rs::the_cov_hessian_is_exact_with_a_non_gaussian_term
 nan-fold 1 src/sens/ode_adjoint_tests.rs::the_fixed_eta_theta_adjoint_is_the_forward_theta_tangents
 nan-fold 2 src/sens/ode_adjoint_tests.rs::the_iov_outer_gradient_is_exact_with_a_non_gaussian_term
 nan-fold 1 src/sens/ode_adjoint_tests.rs::the_outer_gradient_is_exact_on_binary_and_ctmm_endpoints
 nan-fold 1 src/sens/ode_adjoint_tests.rs::the_outer_gradient_is_exact_with_a_non_gaussian_term
-nan-fold 2 src/sens/ode_adjoint_tests.rs::the_pk_space_closed_form_is_the_generic_one
-nan-fold 2 src/sens/ode_adjoint_tests.rs::the_pk_space_ode_walk_is_the_generic_one
 nan-fold 1 src/sens/ode_adjoint_tests.rs::unread_theta_dependent_parameters_are_bit_inert
 nan-fold 1 src/stats/likelihood.rs::tests::ebe_survival_agrees_with_the_share_to_solver_tolerance
 nan-fold 2 src/stats/likelihood.rs::tests::nested_levels_linearize_with_exact_kappa_columns
@@ -208,8 +198,6 @@ nan-fold 2 src/stats/npde_block_sigma_tests.rs::npde_decorrelates_a_paired_block
 nan-fold 1 src/stats/residual_error.rs::tests::neg2ll_shift_under_a_change_of_units_is_2_n_ln_k
 nan-fold 1 src/stats/special.rs::tests::inv_mills_is_the_slope_of_log_normal_cdf
 nan-fold 1 src/suggest_start/nca.rs::tests::test_terminal_slope_monoexp
-nan-fold 1 src/survival/eta_hessian_step_tests.rs::inhomogeneous_ctmm_step_holds_across_omega_widths
-nan-fold 3 src/survival/eta_hessian_step_tests.rs::inhomogeneous_ctmm_step_sits_on_the_plateau
 nan-fold 3 src/survival/mod.rs::ode_hazard_exact_tests::a_time_dependent_ode_hazard_is_exact
 nan-fold 2 src/survival/mod.rs::ode_hazard_exact_tests::the_ode_hazard_eta_hessian_is_exact
 nan-fold 3 tests/absorption_fixed_at_dose_quadrature.rs::walk_and_twin_match_the_fixed_at_dose_quadrature_under_iov_and_a_tv_covariate

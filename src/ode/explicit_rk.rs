@@ -255,26 +255,25 @@ impl<T: PkNum> ErkStepper<T> {
     }
 }
 
-impl<T: PkNum> Stepper<T> for ErkStepper<T> {
-    // Indexed loops walk `u` alongside every stage vector; zipping would obscure the tableau.
+impl<T: PkNum> ErkStepper<T> {
+    /// The step's stages and its proposed state over `clock` — the arithmetic only, no
+    /// decision: what a recording type records as the step's code (#2786).
     #[allow(clippy::needless_range_loop)]
-    fn attempt(
+    pub(crate) fn stages(
         &mut self,
-        rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+        rhs: &crate::ode::solver::RhsG<'_, T>,
         u: &[T],
         params: &[T],
-        t: f64,
-        dt: f64,
-        opts: &OdeSolverOptions,
-    ) -> f64 {
+        clock: &super::solver::StepClock<T>,
+    ) {
         let n = self.n;
         let s = self.tab.stages;
-        let h = T::from_f64(dt);
+        let h = clock.h();
 
         // `ks[0] = f(u, t)`. Carried across a *rejected* step (which leaves `(u, t)` in place)
         // and, for an FSAL pair, across an accepted one too.
         if !self.have_k1 {
-            rhs(u, params, t, &mut self.ks[0]);
+            rhs(u, params, clock.start(), &mut self.ks[0]);
             self.have_k1 = true;
         }
 
@@ -292,8 +291,12 @@ impl<T: PkNum> Stepper<T> for ErkStepper<T> {
                 }
                 self.u_tmp[i] = u[i] + h * acc;
             }
-            let ti = t + self.tab.c[stage] * dt;
-            rhs(&self.u_tmp, params, ti, &mut self.ks[stage]);
+            rhs(
+                &self.u_tmp,
+                params,
+                clock.at(self.tab.c[stage]),
+                &mut self.ks[stage],
+            );
         }
 
         for i in 0..n {
@@ -307,31 +310,153 @@ impl<T: PkNum> Stepper<T> for ErkStepper<T> {
         }
 
         if self.tab.fsal {
-            rhs(&self.u_new, params, t + dt, &mut self.ks[s - 1]);
-        }
-
-        // Error estimate on **values only** — the step sequence must not depend on derivative
-        // components (see the `Stepper` contract).
-        let mut err_norm = 0.0;
-        for i in 0..n {
-            let mut e = 0.0;
-            for stage in 0..s {
-                if self.tab.b_tilde[stage] != 0.0 {
-                    e += self.tab.b_tilde[stage] * self.ks[stage][i].val();
-                }
-            }
-            let err_i = dt * e;
-            let scale = scale_tol(opts.abstol, opts.reltol, self.u_new[i].val(), u[i].val());
-            err_norm += (err_i / scale) * (err_i / scale);
+            rhs(&self.u_new, params, clock.end(), &mut self.ks[s - 1]);
         }
 
         // A non-FSAL pair has to buy the end derivative the Hermite interpolant needs — but
         // only when someone actually reads inside steps.
         if !self.tab.fsal && self.dense_required {
-            rhs(&self.u_new, params, t + dt, &mut self.f_end);
+            rhs(&self.u_new, params, clock.end(), &mut self.f_end);
         }
+    }
 
-        (err_norm / n as f64).sqrt()
+    /// The error estimate of the last [`Self::stages`].
+    pub(crate) fn err_norm(&self, u: &[T], dt: f64, opts: &OdeSolverOptions) -> f64 {
+        erk_err_norm(
+            self.n,
+            self.tab,
+            |stage, i| self.ks[stage][i].val(),
+            |i| self.u_new[i].val(),
+            |i| u[i].val(),
+            dt,
+            opts,
+        )
+    }
+}
+
+impl ErkTableau {
+    /// I-controller exponent `1/(p̂+1)`.
+    pub(crate) fn err_exp(&self) -> f64 {
+        self.err_exp
+    }
+    /// Whether `ks[0]` holds the next step's start after [`Stepper::on_accept`] (`dense` the
+    /// stepper's `dense_required`): an FSAL pair's last stage, or a dense non-FSAL pair's
+    /// `f_end`, is `f` at the accepted end point.
+    pub(crate) fn start_kept_on_accept(&self, dense: bool) -> bool {
+        self.fsal || dense
+    }
+}
+
+/// Where `u_new` sits in an [`ErkStepper`]'s carried state (`ks…, u_tmp, u_new, f_end`).
+pub(crate) fn erk_u_new_at(n: usize, tab: &ErkTableau) -> usize {
+    (tab.stages + 1) * n
+}
+
+/// An [`ErkStepper`]'s error norm over its stages `k(stage, i)` and `u_new` — on **values
+/// only**: the step sequence must not depend on derivative components (see the `Stepper`
+/// contract). The stepper's own, and a compiled run's off its value lane (#2786).
+#[allow(clippy::needless_range_loop)]
+#[inline(always)]
+pub(crate) fn erk_err_norm(
+    n: usize,
+    tab: &ErkTableau,
+    k: impl Fn(usize, usize) -> f64,
+    u_new: impl Fn(usize) -> f64,
+    u: impl Fn(usize) -> f64,
+    dt: f64,
+    opts: &OdeSolverOptions,
+) -> f64 {
+    let s = tab.stages;
+    let mut err_norm = 0.0;
+    for i in 0..n {
+        let mut e = 0.0;
+        for stage in 0..s {
+            if tab.b_tilde[stage] != 0.0 {
+                e += tab.b_tilde[stage] * k(stage, i);
+            }
+        }
+        let err_i = dt * e;
+        let scale = scale_tol(opts.abstol, opts.reltol, u_new(i), u(i));
+        err_norm += (err_i / scale) * (err_i / scale);
+    }
+
+    (err_norm / n as f64).sqrt()
+}
+
+/// An [`ErkStepper`]'s continuous extension (component `i`) over its carried state
+/// `k(block, i)` (`ks…, u_tmp, u_new, f_end`): the cubic Hermite over the step's ends.
+#[inline(always)]
+pub(crate) fn erk_interp<T: PkNum>(
+    tab: &ErkTableau,
+    k: impl Fn(usize, usize) -> T,
+    theta: f64,
+    u_old_i: T,
+    dt: f64,
+    i: usize,
+) -> T {
+    let s = tab.stages;
+    let d_end = if tab.fsal { k(s - 1, i) } else { k(s + 2, i) };
+    hermite_g(theta, dt, u_old_i, k(0, i), k(s + 1, i), d_end)
+}
+
+impl<T: PkNum> super::solver::StepBody<T> for ErkStepper<T> {
+    fn start(
+        &mut self,
+        rhs: &crate::ode::solver::RhsG<'_, T>,
+        u: &[T],
+        params: &[T],
+        clock: &super::solver::StepClock<T>,
+    ) {
+        rhs(&u[..self.n], params, clock.start(), &mut self.ks[0]);
+        self.have_k1 = true;
+    }
+    fn step(
+        &mut self,
+        rhs: &crate::ode::solver::RhsG<'_, T>,
+        u: &[T],
+        params: &[T],
+        clock: &super::solver::StepClock<T>,
+    ) {
+        self.have_k1 = true;
+        self.stages(rhs, u, params, clock);
+    }
+    fn carried_into(&self, out: &mut Vec<T>) {
+        out.clear();
+        for v in self
+            .ks
+            .iter()
+            .chain([&self.u_tmp, &self.u_new, &self.f_end])
+        {
+            out.extend_from_slice(v);
+        }
+    }
+    fn set_carried(&mut self, v: &[T]) {
+        let n = self.n;
+        let mut at = 0;
+        for dst in self
+            .ks
+            .iter_mut()
+            .chain([&mut self.u_tmp, &mut self.u_new, &mut self.f_end])
+        {
+            dst.copy_from_slice(&v[at..at + n]);
+            at += n;
+        }
+        self.have_k1 = true;
+    }
+}
+
+impl<T: PkNum> Stepper<T> for ErkStepper<T> {
+    fn attempt(
+        &mut self,
+        rhs: &crate::ode::solver::RhsG<'_, T>,
+        u: &[T],
+        params: &[T],
+        t: f64,
+        dt: f64,
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        self.stages(rhs, u, params, &super::solver::StepClock::new(t, dt));
+        self.err_norm(u, dt, opts)
     }
 
     fn u_new(&self) -> &[T] {
@@ -339,12 +464,14 @@ impl<T: PkNum> Stepper<T> for ErkStepper<T> {
     }
 
     fn interpolate_component(&self, theta: f64, u_old: &[T], dt: f64, i: usize) -> T {
-        let d_end = if self.tab.fsal {
-            self.ks[self.tab.stages - 1][i]
-        } else {
-            self.f_end[i]
+        let s = self.tab.stages;
+        let k = |b: usize, i: usize| match b {
+            b if b < s => self.ks[b][i],
+            b if b == s + 1 => self.u_new[i],
+            b if b == s + 2 => self.f_end[i],
+            _ => self.u_tmp[i],
         };
-        hermite_g(theta, dt, u_old[i], self.ks[0][i], self.u_new[i], d_end)
+        erk_interp(self.tab, k, theta, u_old[i], dt, i)
     }
 
     fn on_accept(&mut self) {
@@ -364,6 +491,10 @@ impl<T: PkNum> Stepper<T> for ErkStepper<T> {
             // `(u, t)` moved and nothing was evaluated there, so `ks[0]` is stale.
             self.have_k1 = false;
         }
+        debug_assert_eq!(
+            self.have_k1,
+            self.tab.start_kept_on_accept(self.dense_required)
+        );
     }
 
     fn err_exp(&self) -> f64 {

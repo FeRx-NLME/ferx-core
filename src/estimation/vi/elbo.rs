@@ -37,7 +37,6 @@ use nalgebra::{DMatrix, DVector};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
-use rayon::prelude::*;
 
 use crate::estimation::fixed_eta_gradient::{
     obs_nll_subject_grad, obs_nll_subject_grad_iov, obs_nll_subject_into_iov,
@@ -868,11 +867,10 @@ pub fn population_neg_elbo(
     let layout = PackedLayout::new(template);
     let (log_mask, lower, upper) = theta_sigma_masks(template);
 
-    let per_subj: Vec<Result<SubjectTerms, String>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+    let per_subj: Vec<Result<SubjectTerms, String>> = {
+        let __r0 = &population.subjects;
+        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
+            let subject = &__r0[i];
             subject_terms(
                 model,
                 subject,
@@ -888,7 +886,7 @@ pub fn population_neg_elbo(
                 scratch,
             )
         })
-        .collect();
+    };
 
     let mut eval = ElboEval {
         neg_elbo: 0.0,
@@ -1106,15 +1104,15 @@ pub fn closed_form_sigma_support(
                 "the combined error model couples two σ in one variance, which has no \
                  scalar stationary point"
                     .to_string(),
-            )
+            );
         }
         // Per-endpoint and covariate-selected error models each carry their own
         // σ set, so the single-scalar derivation does not describe them.
         ErrorSpec::PerCmt(_) => {
-            return Err("per-CMT error models declare a σ set per endpoint".to_string())
+            return Err("per-CMT error models declare a σ set per endpoint".to_string());
         }
         ErrorSpec::Selected { .. } => {
-            return Err("covariate-selected error models declare a σ set per branch".to_string())
+            return Err("covariate-selected error models declare a σ set per branch".to_string());
         }
     }
     // One scalar only. Two σ that both scale the same variance are not separately

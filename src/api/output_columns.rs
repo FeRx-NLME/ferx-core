@@ -2,6 +2,7 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
+use crate::cold_sort::ColdSort;
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
@@ -103,7 +104,7 @@ pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
         return f64::NAN;
     }
     let mut sorted = points.to_vec();
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.cold_sort_by(&|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut auc = 0.0;
     for w in sorted.windows(2) {
         let dt = w[1].0 - w[0].0;

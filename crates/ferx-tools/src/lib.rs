@@ -82,6 +82,7 @@ mod tests {
 pub mod allometry;
 pub mod amd;
 pub mod bootstrap;
+mod cold_sort;
 pub mod covsearch;
 pub mod gam;
 pub mod globalsearch;

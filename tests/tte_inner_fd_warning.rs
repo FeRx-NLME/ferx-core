@@ -5,9 +5,10 @@
 //! read `finite differences` while no hazard had an η-channel; it is the model-level
 //! best case, so since #2482 it reads analytic and the warning carries the decline.)
 //!
-//! Since #2482 the drug-driven hazard has an exact η-channel (the dual walk) except beside
-//! a steady-state dose, which the walk declines (its value path is not the walk's). So the
-//! warning arms dose to steady state, and a fourth arm pins the exact route without one.
+//! Since #2482 the drug-driven hazard has an exact η-channel, and since #2786 beside a
+//! steady-state dose too: the subject's compiled plan records the SS-equilibrated hazard walk
+//! like any other. So no arm warns any more — with or without SS, on every subject or on two of
+//! four — and none reports a failed plan (`W_PLAN_FD_FALLBACK`); this file pins that route.
 //!
 //! Before the fix the label read `analytic (Dual2)` (it is model-level and the recorder
 //! serves the PK rows), and the warning, when it fired, listed only causes that did not
@@ -106,42 +107,23 @@ fn run(model: &str, n_events: usize, ss: bool) -> FitResult {
     fit(&m, &pop, &m.default_params, &opts).expect("maxiter-0 fit runs")
 }
 
+/// A drug-driven hazard beside a steady-state dose (`SS = 1`), on every subject and on two of
+/// four: the exact route, no FD inner gradient and no failed plan (#2786). Until #2786 the
+/// walk declined SS and both arms warned "N of 4 subjects use finite-difference inner
+/// gradients".
 #[test]
-fn an_all_tte_population_warns_and_names_the_survival_cause() {
-    let r = run(MODEL, 4, true);
-    // The label is the best-case, model-level route (`build_info::gradient_method_inner`):
-    // this hazard has an exact channel, so it reads analytic, and the per-subject decline is
-    // the warning's to report — as for any out-of-scope subject of an in-scope model.
-    assert_eq!(r.gradient_method_inner, "analytic (Dual2)");
-    let w = r
-        .warnings
-        .iter()
-        .find(|w| w.contains(WARNING))
-        .unwrap_or_else(|| panic!("every TTE subject runs FD: {:?}", r.warnings));
-    assert!(
-        w.starts_with(
-            "4 of 4 subjects use finite-difference inner gradients (4 carry a time-to-event \
-             (or other non-Gaussian) record whose likelihood term has no analytic η-gradient)"
-        ),
-        "{w}"
-    );
-    assert!(!w.contains("shape no analytic recorder"), "{w}");
-}
-
-#[test]
-fn a_mixed_population_counts_only_its_tte_subjects() {
-    let r = run(MODEL, 2, true);
-    let w = r
-        .warnings
-        .iter()
-        .find(|w| w.contains(WARNING))
-        .unwrap_or_else(|| panic!("two TTE subjects run FD: {:?}", r.warnings));
-    assert!(
-        w.starts_with(
-            "2 of 4 subjects use finite-difference inner gradients (2 carry a time-to-event"
-        ),
-        "{w}"
-    );
+fn a_drug_driven_hazard_beside_a_steady_state_dose_runs_the_exact_inner_gradient() {
+    for n_events in [4, 2] {
+        let r = run(MODEL, n_events, true);
+        assert_eq!(r.gradient_method_inner, "analytic (Dual2)");
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.contains(WARNING) || w.contains("W_PLAN_FD_FALLBACK")),
+            "{n_events} TTE subjects: every hazard is served exactly: {:?}",
+            r.warnings
+        );
+    }
 }
 
 #[test]
@@ -163,16 +145,16 @@ fn the_same_pk_rows_without_an_event_model_emit_no_fd_warning() {
     );
 }
 
-/// The same TTE population without the steady-state dose: the dual walk serves every
-/// subject's hazard, so the inner gradient is exact and nothing warns. The pair with
-/// `an_all_tte_population_warns_and_names_the_survival_cause` straddles the walk's one
-/// remaining decline, so a scope that served SS (or declined everything) reddens one arm.
+/// The same TTE population without the steady-state dose: the plan serves every subject's
+/// hazard, so the inner gradient is exact and nothing warns.
 #[test]
 fn a_drug_driven_hazard_without_steady_state_runs_the_exact_inner_gradient() {
     let r = run(MODEL, 4, false);
     assert_eq!(r.gradient_method_inner, "analytic (Dual2)");
     assert!(
-        !r.warnings.iter().any(|w| w.contains(WARNING)),
+        !r.warnings
+            .iter()
+            .any(|w| w.contains(WARNING) || w.contains("W_PLAN_FD_FALLBACK")),
         "every subject's hazard is served: {:?}",
         r.warnings
     );

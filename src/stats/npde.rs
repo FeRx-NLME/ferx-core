@@ -72,7 +72,6 @@ use crate::types::{BloqMethod, CompiledModel, IovOccasionRule, ModelParameters, 
 use nalgebra::{DMatrix, DVector};
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
-use rayon::prelude::*;
 
 #[cfg(feature = "survival")]
 pub(crate) use super::npde_tte::fit_time_warnings;
@@ -271,11 +270,10 @@ pub fn compute_npde_npd_diag(
     // reference is the fitted mixture's predictive distribution rather than class 1's.
     let classes = crate::api::SimClasses::new(model, params, base_seed)?;
     let scores = crate::api::install_on_engine_pool(|| {
-        population
-            .subjects
-            .par_iter()
-            .enumerate()
-            .map(|(i, subject)| {
+        {
+            let __r0 = &population.subjects;
+            crate::par::map(__r0.len(), |i| {
+                let subject = &__r0[i];
                 let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed.wrapping_add(i as u64));
                 let n_obs = subject.observations.len();
 
@@ -439,7 +437,7 @@ pub fn compute_npde_npd_diag(
                     flip_flop,
                 )
             })
-            .collect::<Vec<_>>()
+        }
     });
     let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
     let scores: Vec<SubjectNpde> = scores

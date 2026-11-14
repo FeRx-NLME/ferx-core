@@ -335,6 +335,8 @@ fn the_gap_is_the_reconverged_difference() {
     // concurrently running `fit()` test that accounts for every warning (#1289). Measured:
     // the sink stays empty at 72 h.
     declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, true, 72.0)];
+    // The plans' failure is keyed by the subject's content, so re-key it after the edit.
+    crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&declining);
     let pop = mk_pop(vec![analytic, declining]);
     let params = &model.default_params;
     let opts = focei();

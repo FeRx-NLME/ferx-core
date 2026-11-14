@@ -633,28 +633,48 @@ pub(crate) fn log_abs_jacobian_natural_g<T: crate::sens::num::PkNum>(
     }
     for i in seg.rho_start()..seg.total() {
         if free(i) {
-            // ln(1 − tanh² z) with its derivatives −2·tanh z and −2·(1 − tanh² z).
-            let rho = x[i].val().tanh();
-            let sech2 = 1.0 - rho * rho;
-            out = out + x[i].lift2(sech2.ln(), -2.0 * rho, -2.0 * sech2);
+            // ln(1 − tanh² z) = ln 4 − 2|z| − 2·ln(1 + e^{−2|z|}): finite at any z.
+            let z = x[i];
+            let a = if z.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
+                z
+            } else {
+                -z
+            };
+            let ln4 = T::from_f64(4.0f64.ln());
+            out = out + (ln4 - two * a - two * (T::from_f64(1.0) + (-two * a).exp()).ln());
         }
     }
     out
 }
 
-/// The exact gradient of [`log_abs_jacobian_natural`] over the packed coordinates (one
-/// scalar-tape sweep of [`log_abs_jacobian_natural_g`]).
+/// The exact gradient of [`log_abs_jacobian_natural`] over the packed coordinates
+/// ([`log_abs_jacobian_natural_g`] recorded and reversed); where the recording fails, the
+/// central difference of [`log_abs_jacobian_natural`] itself (step `1e-6·max(|xᵢ|, 1)`), which
+/// `model`'s fit reports (`W_PLAN_FD_FALLBACK`).
 pub(crate) fn log_abs_jacobian_natural_grad(
+    model: &crate::types::CompiledModel,
     x: &[f64],
     template: &ModelParameters,
     fixed: &[bool],
 ) -> Vec<f64> {
-    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
-    rtape_reset();
-    let xr: Vec<R> = x.iter().map(|&v| rinput(v)).collect();
-    let out = log_abs_jacobian_natural_g::<R>(&xr, template, fixed);
-    let adj = rsweep::<1>(&[out]);
-    xr.iter().map(|r| r.idx().map_or(0.0, |i| adj[i])).collect()
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    if let Some((_, mut g, _)) = kj::derivs(model, x, 1, false, &|xr| {
+        Some(vec![log_abs_jacobian_natural_g(xr, template, fixed)])
+    }) {
+        return g.swap_remove(0);
+    }
+    let mut xp = x.to_vec();
+    (0..x.len())
+        .map(|i| {
+            let h = 1e-6 * x[i].abs().max(1.0);
+            xp[i] = x[i] + h;
+            let up = log_abs_jacobian_natural(&xp, template, fixed);
+            xp[i] = x[i] - h;
+            let down = log_abs_jacobian_natural(&xp, template, fixed);
+            xp[i] = x[i];
+            (up - down) / (2.0 * h)
+        })
+        .collect()
 }
 
 /// Clamp packed indices flagged as FIX to their pinned packed value (taken
@@ -2254,7 +2274,24 @@ mod tests {
                 }
             })
             .collect();
-        let g = log_abs_jacobian_natural_grad(&x0, &t, &fixed);
+        // The fit whose W_PLAN_FD_FALLBACK a failed recording is reported in (#2786).
+        let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
+            "examples/warfarin.ferx",
+        ))
+        .expect("model");
+        let pop = crate::io::datareader::read_nonmem_csv(
+            std::path::Path::new("data/warfarin.csv"),
+            None,
+            None,
+        )
+        .expect("data");
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::{plan_failures, FORCED_FAILURE};
+        let g = log_abs_jacobian_natural_grad(&model, &x0, &t, &fixed);
+        assert_eq!(
+            plan_failures(&model, &pop.subjects),
+            None,
+            "an exact gradient reports nothing"
+        );
         let seg = packed_segments(&t);
         let mut want = vec![0.0; x0.len()];
         for (i, w) in want.iter_mut().enumerate().take(seg.theta) {
@@ -2298,6 +2335,25 @@ mod tests {
         for (i, (a, b)) in g.iter().zip(&want).enumerate() {
             assert!((a - b).abs() < 1e-15, "[{i}] {a} vs {b}");
         }
+        // A failed recording takes the central difference, not NaNs (#2786).
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::FORCE_PLAN_FAIL;
+        FORCE_PLAN_FAIL.set(true);
+        let fd = log_abs_jacobian_natural_grad(&model, &x0, &t, &fixed);
+        FORCE_PLAN_FAIL.set(false);
+        // ... and is reported, for every subject: the log-Jacobian enters each one's draw.
+        let (k, why) = plan_failures(&model, &pop.subjects).expect("the fallback is reported");
+        assert_eq!(k, pop.subjects.len(), "{why}");
+        assert!(
+            why.contains("θ-only recording") && why.contains(FORCED_FAILURE),
+            "{why}"
+        );
+        let mut worst = 0.0f64;
+        for (a, b) in fd.iter().zip(&want) {
+            assert!(a.is_finite() && b.is_finite(), "{fd:?} vs {want:?}");
+            worst = worst.max((a - b).abs());
+        }
+        eprintln!("log-Jacobian gradient: worst FD error {worst:.3e}");
+        assert!(worst < 1e-6, "FD fallback off by {worst}");
         assert_eq!(
             log_abs_jacobian_natural(&x0, &t, &fixed).to_bits(),
             log_abs_jacobian_natural_g::<f64>(&x0, &t, &fixed).to_bits()

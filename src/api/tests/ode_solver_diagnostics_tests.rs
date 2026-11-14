@@ -652,7 +652,7 @@ fn the_post_fit_sweep_observes_the_sensitivity_solve_too() {
     );
     // …and it must be the *second-order* provider for a model with an analytic outer
     // gradient (#1207 review). The overflow this counter exists for reaches the Hessian
-    // first and the gradient only later, so a `Dual1` sweep would miss the very case #1204
+    // first and the gradient only later, so a `Dual2` sweep would miss the very case #1204
     // documents. This fixture has to take that branch, or the assertions above are only
     // testing the first-order path.
     assert!(

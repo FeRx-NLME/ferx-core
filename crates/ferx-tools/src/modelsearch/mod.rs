@@ -96,6 +96,7 @@
 //! * `TRANSITS(n)` is a `FIX`ed θ, not a literal, so the count keeps a name
 //!   the estimates file and the ODE twin can see.
 
+use crate::cold_sort::ColdSort;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
@@ -943,7 +944,7 @@ pub(crate) fn search(
     // Ties go to the earlier model, so a deterministic generation order
     // gives a deterministic winner (a stable sort keeps generation order).
     let mut order: Vec<usize> = (0..rows.len()).filter(|i| rows[*i].eligible()).collect();
-    order.sort_by(|a, b| rows[*a].criterion.total_cmp(&rows[*b].criterion));
+    order.cold_sort_by(&|a, b| rows[*a].criterion.total_cmp(&rows[*b].criterion));
     for (rank, i) in order.iter().enumerate() {
         rows[*i].rank = Some(rank + 1);
     }

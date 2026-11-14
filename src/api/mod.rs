@@ -6,7 +6,6 @@ use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 #[cfg(test)]
 use rand::RngExt;
-use rayon::prelude::*;
 use std::path::Path;
 
 // ── validation subsystem (extracted verbatim; see src/api/validation.rs) ──
@@ -321,6 +320,14 @@ mod thread_env_tests;
 #[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
 mod dose_compartment_tests;
+
+#[cfg(test)]
+#[path = "tests/outer_fd_fallback_warning_tests.rs"]
+mod outer_fd_fallback_warning_tests;
+
+#[cfg(test)]
+#[path = "tests/fd_salvage_guard_fires_in_a_fit_tests.rs"]
+mod fd_salvage_guard_fires_in_a_fit_tests;
 
 #[cfg(test)]
 #[path = "tests/reader_warning_suppression_tests.rs"]

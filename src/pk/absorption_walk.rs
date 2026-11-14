@@ -24,7 +24,7 @@
 //! ```
 //!
 //! with `cα = (α−k21)/(α−β)`, `cβ = (k21−β)/(α−β)`. Every term is exact; the walk is one
-//! function over [`PkNum`], so `T = f64` is the prediction and `T = Dual2`/`Dual1` its
+//! function over [`PkNum`], so `T = f64` is the prediction and `T = Dual2`/`Dual2` its
 //! sensitivities (`crate::sens::provider`), with no second copy of the formula.
 //!
 //! ## Domain — the one owner of "walk or twin"
@@ -41,6 +41,7 @@ use crate::pk::analytical_absorption::{
     windowed_tilted_term, IgAbsorption, TiltedAbsorption, TransitAbsorption,
 };
 use crate::pk::event_driven::{is_record, EventKind, EventSchedule};
+use crate::sens::num::BranchCmp::{Gt, Le, Lt};
 use crate::sens::num::PkNum;
 use crate::sens::propagate::{propagate_two_cpt_core_g, PkDual, TwoCptEigen};
 use crate::types::{CompiledModel, PkModel, PkParams, Subject};
@@ -107,42 +108,47 @@ pub(crate) enum WalkDomain {
 /// serves `NaN` from that interval on (#2134). A `NaN` `Q` is left to [`fastest_rate`],
 /// whose `NaN` macro-rates send the subject to the twin, which serves the same `NaN`.
 fn disposition_is_nan<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> bool {
-    p.cl.val().is_nan() || p.v.val().is_nan() || (two_cpt && p.v2.val().is_nan())
+    p.cl.br_is_nan() || p.v.br_is_nan() || (two_cpt && p.v2.br_is_nan())
 }
 
 /// A `NaN` in a dose's kernel parameters (`n`/`MTT`, `MAT`/`CV²`): the walk serves `NaN`
 /// from the first interval that evaluates the dose (#2134).
 fn kernel_is_nan<T: PkNum>(d: &AbsDose<T>) -> bool {
-    d.a.val().is_nan() || d.b.val().is_nan()
+    d.a.br_is_nan() || d.b.br_is_nan()
 }
 
 /// The MGF abscissa of one dose's kernel: `KTR = (n+1)/MTT` (transit) or
 /// `1/(2·MAT·CV²)` (IG). `None` for non-physical kernel parameters.
-fn abscissa(kernel: Kernel, a: f64, b: f64) -> Option<f64> {
+fn abscissa<T: PkNum>(kernel: Kernel, a: T, b: T) -> Option<T> {
+    use crate::sens::num::BranchCmp::{Ge, Gt};
+    let one = T::from_f64(1.0);
     match kernel {
-        Kernel::Transit => (a >= 0.0 && b > 0.0).then(|| (a + 1.0) / b),
-        Kernel::Ig => (a > 0.0 && b > 0.0).then(|| 1.0 / (2.0 * a * b)),
+        Kernel::Transit => (a.br_cmp_c(Ge, 0.0) && b.br_cmp_c(Gt, 0.0)).then(|| (a + one) / b),
+        Kernel::Ig => {
+            (a.br_cmp_c(Gt, 0.0) && b.br_cmp_c(Gt, 0.0)).then(|| one / (T::from_f64(2.0) * a * b))
+        }
     }
 }
 
 /// The largest disposition rate the tilting factorisation evaluates on an interval —
 /// `ke` (1-cpt) or `α` (2-cpt) — or the reason there is none.
-fn fastest_rate(two_cpt: bool, p: &PkDual<f64>) -> Result<f64, WalkDomain> {
-    if !(p.cl > 0.0 && p.v > 0.0) {
+fn fastest_rate<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> Result<T, WalkDomain> {
+    use crate::sens::num::BranchCmp::{Eq, Gt, Lt};
+    if !(p.cl.br_cmp_c(Gt, 0.0) && p.v.br_cmp_c(Gt, 0.0)) {
         return Err(WalkDomain::Invalid);
     }
     if !two_cpt {
         return Ok(p.cl / p.v);
     }
-    if !(p.v2 > 0.0) || p.q < 0.0 {
+    if !p.v2.br_cmp_c(Gt, 0.0) || p.q.br_cmp_c(Lt, 0.0) {
         return Err(WalkDomain::Invalid);
     }
-    if p.q == 0.0 {
+    if p.q.br_cmp_c(Eq, 0.0) {
         // A disconnected peripheral: valid, but outside the eigen-carry this walk uses.
         return Err(WalkDomain::Twin);
     }
-    let (alpha, beta, _) = crate::sens::two_cpt::macro_rates_g::<f64>(p.cl, p.v, p.q, p.v2);
-    if (alpha - beta).abs() < 1e-12 {
+    let (alpha, beta, _) = crate::sens::two_cpt::macro_rates_g::<T>(p.cl, p.v, p.q, p.v2);
+    if (alpha - beta).br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return Err(WalkDomain::Twin);
     }
     Ok(alpha)
@@ -191,7 +197,7 @@ fn nan_onset<T: PkNum>(
             let disp_nan = gov[i].is_some_and(|p| disposition_is_nan(two_cpt, p));
             let open_nan = doses
                 .iter()
-                .any(|d| d.arrival.val() <= cur_t && kernel_is_nan(d));
+                .any(|d| d.arrival.br_cmp_c(Le, cur_t) && kernel_is_nan(d));
             if disp_nan || open_nan {
                 return Some((i, cur_t));
             }
@@ -225,10 +231,10 @@ pub(crate) fn walk_domain<T: PkNum>(
     let onset = nan_onset(schedule, doses, &gov, two_cpt);
     let mut verdict = WalkDomain::Walk;
     for d in doses {
-        if onset.is_some_and(|(_, t)| !(d.arrival.val() < t)) {
+        if onset.is_some_and(|(_, t)| !d.arrival.br_cmp_c(Lt, t)) {
             continue;
         }
-        if !kernel_is_nan(d) && abscissa(kernel, d.a.val(), d.b.val()).is_none() {
+        if !kernel_is_nan(d) && abscissa(kernel, d.a, d.b).is_none() {
             verdict = WalkDomain::Invalid;
         }
     }
@@ -250,18 +256,8 @@ pub(crate) fn walk_domain<T: PkNum>(
             let Some(p) = gov[i] else {
                 return WalkDomain::Twin;
             };
-            let open = doses.iter().filter(|d| d.arrival.val() <= cur_t);
-            let vals = PkDual {
-                cl: p.cl.val(),
-                v: p.v.val(),
-                q: p.q.val(),
-                v2: p.v2.val(),
-                ka: 0.0,
-                q3: 0.0,
-                v3: 0.0,
-                f: 0.0,
-            };
-            let rate = match fastest_rate(two_cpt, &vals) {
+            let open = doses.iter().filter(|d| d.arrival.br_cmp_c(Le, cur_t));
+            let rate = match fastest_rate(two_cpt, p) {
                 Ok(r) => Some(r),
                 Err(WalkDomain::Twin) => return WalkDomain::Twin,
                 Err(_) => {
@@ -271,8 +267,8 @@ pub(crate) fn walk_domain<T: PkNum>(
             };
             if let Some(r) = rate {
                 for d in open {
-                    if let Some(abs) = abscissa(kernel, d.a.val(), d.b.val()) {
-                        if !(r < abs) {
+                    if let Some(abs) = abscissa(kernel, d.a, d.b) {
+                        if !r.br_cmp(Lt, abs) {
                             return WalkDomain::Twin;
                         }
                     }
@@ -453,7 +449,7 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
                 let p = pk_now.expect("an observation is a record");
                 // A `NaN` volume is kept, as in `central_concentration_g` (#2039, #2134).
                 let per_volume = |amount: T, vol: T| {
-                    if vol.val() > 0.0 || vol.val().is_nan() {
+                    if vol.br_cmp_c(Gt, 0.0) || vol.br_is_nan() {
                         amount / vol
                     } else {
                         zero
@@ -461,7 +457,7 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
                 };
                 let conc = per_volume(state[0], p.v);
                 // `conc < 0` is false for `NaN`, which is kept rather than floored to 0.
-                preds[ev.orig_idx] = if conc.val() < 0.0 { zero } else { conc };
+                preds[ev.orig_idx] = T::select_if(Lt, conc, zero, zero, conc);
                 if let Some(s) = states.as_deref_mut() {
                     // The analytical state convention (`single_dose_states`): the kernel
                     // `depot` as an amount, central and peripheral as concentrations.
@@ -482,7 +478,7 @@ pub(crate) fn absorption_walk_g<T: PkNum>(
                     // Floored like `analytical_state_at_times` (a `NaN` is kept).
                     s[ev.orig_idx] = row
                         .into_iter()
-                        .map(|x| if x.val() < 0.0 { zero } else { x })
+                        .map(|x| T::select_if(Lt, x, zero, zero, x))
                         .collect();
                 }
             }
@@ -581,7 +577,7 @@ pub(crate) fn closed_form_sens_walk_g<T: PkNum>(
 ///
 /// The last clause keeps the twin wherever the walk's **gradient** would not be analytic
 /// ([`crate::sens::provider::absorption_walk_sens_in_scope`]): the twin's ODE provider serves
-/// a wider scope (`MAX_WIDTH` stacked IOV axes, `sens/ode_adjoint.rs`, against the dual
+/// a wider scope (uncapped stacked IOV axes, `sens/ode_adjoint.rs`, against the dual
 /// walk's 24), and the walk must not
 /// trade a subject's analytic gradient for finite differences. Prediction and gradient read
 /// this one predicate, so they stay on the same engine.

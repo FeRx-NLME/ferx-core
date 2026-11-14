@@ -28,6 +28,7 @@
 //! "optimal" was best on average in simulation, but other methods can win on
 //! particular datasets, hence all three are exposed (#396).
 
+use crate::cold_sort::ColdSort;
 use nalgebra::{DMatrix, DVector};
 
 /// Squared Mahalanobis distance between two eta vectors under `Ω⁻¹`.
@@ -189,7 +190,7 @@ fn ranks_by_norm(etas: &[DVector<f64>], omega_inv: &DMatrix<f64>) -> Vec<f64> {
         .map(|e| mahalanobis_norm(e.as_slice(), omega_inv))
         .collect();
     let mut order: Vec<usize> = (0..scores.len()).collect();
-    order.sort_by(|&a, &b| {
+    order.cold_sort_by(&|&a, &b| {
         scores[a]
             .partial_cmp(&scores[b])
             .unwrap_or(std::cmp::Ordering::Equal)

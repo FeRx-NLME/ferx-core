@@ -29,6 +29,7 @@ pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
 
 fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> CompiledModel {
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -163,6 +164,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,

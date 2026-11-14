@@ -56,7 +56,7 @@ impl GradientMethodKind {
 ///
 /// Best-case, model-level mirror of the per-subject route
 /// `estimation::inner_optimizer::analytic_inner_grad_supported` runs. The reported method is
-/// the union of the three in-scope inner routes — closed-form / CTMM, the light `Dual1` ODE
+/// the union of the three in-scope inner routes — closed-form / CTMM, the compiled-plan ODE
 /// walk (#410), and the stacked-η IOV walk — computed by the shared
 /// `inner_reports_analytic_model` predicate that `fd_fallback_warning` reads too, so the
 /// reported label and the FD-fallback warning cannot drift (#378 task B / #926). Otherwise
@@ -126,12 +126,12 @@ pub fn gradient_method_outer(
         | EstimationMethod::Bayes => GradientMethodKind::NotApplicable,
         // VI's gradient route is per-subject and reported on `FitResult::vi`
         // (`n_fd_subjects`), not as a single population-wide classification: the
-        // analytic `Dual2` η-gradient serves most subjects while any it declines
+        // analytic plan η-gradient serves most subjects while any it declines
         // fall back to finite differences individually.
         EstimationMethod::Vi => GradientMethodKind::NotApplicable,
         // AGQ always differentiates the quadrature marginal itself — the posterior-weighted
         // score over the nodes plus the grid-response term, neither of which re-solves the
-        // inner loop. What varies is only the θ/σ score: analytic from the `Dual2` provider
+        // inner loop. What varies is only the θ/σ score: analytic from the plan provider
         // where it reaches, finite-differenced at fixed η otherwise (TTE, categorical, ODE,
         // M3, LTBS…). Report that distinction, not a scope gate — there isn't one.
         // Laplace is AGQ at one node — same objective, same gradient, so same report.

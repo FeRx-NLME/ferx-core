@@ -165,7 +165,7 @@ pub(crate) const fn stiff_method_for(opts: &OdeSolverOptions) -> OdeMethod {
 /// short-circuit is allowed to exist.
 #[cfg(test)]
 pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &crate::ode::solver::RhsG<'_, T>,
     u: &[T],
     params: &[T],
     t: f64,
@@ -178,7 +178,7 @@ pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
 /// `∂f_i/∂u_j`, the layout `DMatrix` expects). `None` on an empty system or a non-finite
 /// entry — a caller that cannot form the Jacobian must not guess.
 fn fd_jacobian<T: PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &crate::ode::solver::RhsG<'_, T>,
     u: &[T],
     params: &[T],
     t: f64,
@@ -189,7 +189,7 @@ fn fd_jacobian<T: PkNum>(
     }
 
     let mut f0 = vec![T::from_f64(0.0); n];
-    rhs(u, params, t, &mut f0);
+    rhs(u, params, T::from_f64(t), &mut f0);
     if f0.iter().any(|v| !v.val().is_finite()) {
         return None;
     }
@@ -200,7 +200,7 @@ fn fd_jacobian<T: PkNum>(
     for j in 0..n {
         let h = JAC_FD_REL_STEP * u[j].val().abs().max(1.0);
         u_pert[j] = u[j] + T::from_f64(h);
-        rhs(&u_pert, params, t, &mut f1);
+        rhs(&u_pert, params, T::from_f64(t), &mut f1);
         u_pert[j] = u[j];
         for (i, f1i) in f1.iter().enumerate() {
             let d = (f1i.val() - f0[i].val()) / h;
@@ -260,7 +260,7 @@ fn gershgorin_abs_bound(jac: &[f64], n: usize) -> f64 {
 /// stiff system is slow and loud (`min_step_clamped_steps`); a Rosenbrock method on a system
 /// with a singular `W` is fast and wrong.
 pub(crate) fn resolve_method<T: PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &crate::ode::solver::RhsG<'_, T>,
     u: &[T],
     params: &[T],
     t: f64,
