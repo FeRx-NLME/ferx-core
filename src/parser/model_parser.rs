@@ -30334,6 +30334,20 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
     match op {
         Op::Exp => v.exp(),
         Op::Ln => v.guard_floor(1e-30).ln(),
+        // A positive argument is the type's own `sqrt`. Anything else is a constant, so the
+        // derivative there is zero (`Dual1::sqrt`'s convention): `inf · 0` would otherwise put
+        // a `NaN` in the jets, whose bits optimised code does not reproduce from one route to
+        // the next (#2844). The value is the `f64` lane VM's (`eval_bytecode`): `±0` passes
+        // through as `sqrt(±0) = ±0`, and a negative or `NaN` argument floors to `+0`. The
+        // `v >= 0` test, not `f64::max`, whose signed-zero result is not specified.
+        Op::Sqrt => {
+            let x = v.val();
+            if x > 0.0 {
+                v.sqrt()
+            } else {
+                T::from_f64(if x >= 0.0 { x } else { 0.0 })
+            }
+        }
         Op::Abs => v.abs(),
         Op::Floor => T::from_f64(v.val().floor()),
         Op::Ceil => T::from_f64(v.val().ceil()),
@@ -30550,13 +30564,9 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                     }
                 });
             }
-            op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
+            op @ (Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
                 let v = pop!();
                 push!(apply_unary(op, v));
-            }
-            Op::Sqrt => {
-                let v = pop!();
-                push!(v.guard_floor(0.0).sqrt());
             }
             Op::InvLogit => {
                 let v = pop!();
