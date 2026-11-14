@@ -23004,9 +23004,11 @@ impl<'a> RuvIndivScope<'a> {
         if let Some(v) = self.verdicts.borrow().get(name) {
             return v.clone();
         }
-        let Some((&key, _)) = self.counts.get_key_value(name) else {
-            return Err("is not assigned in [individual_parameters]".to_string());
-        };
+        // Callers ask only about names `assigns` admitted.
+        let (&key, _) = self
+            .counts
+            .get_key_value(name)
+            .expect("a name the block assigns");
         let result = match self.defs.get(key) {
             None => Err(
                 "is assigned more than once or inside an `if/else` branch, so it has no \

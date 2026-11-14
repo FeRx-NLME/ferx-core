@@ -9873,6 +9873,11 @@ fn ruv_magnitude_diamond_is_judged_linearly() {
 /// index assigned in [individual_parameters] (#2915 review 2). `GRP` is a
 /// declared column. θ = [TVCL, TVV, RUV[1..3]].
 fn ruv_gather_model(indiv: &str) -> String {
+    ruv_gather_model_with(indiv, "PROP_ERR * RUV[IDX]")
+}
+
+/// [`ruv_gather_model`] with the magnitude `mag`.
+fn ruv_gather_model_with(indiv: &str, mag: &str) -> String {
     format!(
         r#"
 [parameters]
@@ -9888,7 +9893,7 @@ fn ruv_gather_model(indiv: &str) -> String {
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V)
 [error_model]
-  DV ~ proportional(PROP_ERR * RUV[IDX])
+  DV ~ proportional({mag})
 [covariates]
   GRP continuous
 "#
@@ -9945,11 +9950,122 @@ fn ruv_magnitude_assigned_column_gather_index_records_the_substituted_column() {
 /// A substituted literal index is range-checked like a written one.
 #[test]
 fn ruv_magnitude_assigned_literal_gather_index_out_of_range_is_refused() {
-    let err = expect_parse_err(&ruv_gather_model("  IDX = 5"));
+    // Read twice: the walk stops at the first refusal and skips the second.
+    let err = expect_parse_err(&ruv_gather_model_with(
+        "  IDX = 5",
+        "PROP_ERR * RUV[IDX] * RUV[IDX]",
+    ));
     assert!(
         err.contains("`RUV[5]`: level index must be an integer in 1..=3"),
         "{err}"
     );
+}
+
+/// A substituted index that is neither a column nor a literal (`GRP + 0`)
+/// has no single column for the pre-fit check to walk, so nothing is
+/// recorded — as for the same index written inline — and the rows still read
+/// their own level.
+#[test]
+fn ruv_magnitude_assigned_computed_gather_index_records_no_column() {
+    let model = parse_full_model(&ruv_gather_model("  IDX = GRP + 0"))
+        .unwrap()
+        .model;
+    assert!(ruv_gather_index_columns(&model).is_empty());
+    let s = magnitude_rows_subject(&[(1, 2.0)], "GRP");
+    let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
+    assert_eq!(rows[0][0], 2.2);
+}
+
+/// A data-driven block read bare beside a substituted name: its implicit index
+/// is not a recorded gather site, before or after substitution.
+#[test]
+fn ruv_magnitude_substitution_leaves_a_data_driven_block_unrecorded() {
+    let src = ruv_gather_model_with("  ISPK = 2", "PROP_ERR * ERRSCALE * ISPK").replace(
+        "  theta RUV[3](1.0, 0.0, 10.0)\n",
+        "  theta ERRSCALE[GRP](1.0, 0.1, 10.0)\n",
+    );
+    let model = parse_full_model(&src).unwrap().model;
+    assert!(
+        ruv_gather_index_columns(&model)
+            .iter()
+            .all(|(b, _)| b != "ERRSCALE"),
+        "{:?}",
+        ruv_gather_index_columns(&model)
+    );
+}
+
+/// A name read twice is substituted at both sites and reported once.
+#[test]
+fn ruv_magnitude_reads_the_same_assigned_name_twice() {
+    let m = ruv_indiv_mults(
+        &ruv_indiv_model("  ISPK = 3", "PROP_ERR * ISPK * ISPK"),
+        &[70.0],
+    );
+    assert_eq!(m, vec![9.0]);
+    let err = expect_parse_err(&ruv_indiv_model("  ISPK = AGE", "PROP_ERR * ISPK * ISPK"));
+    assert!(err.contains("definition of `ISPK`)"), "{err}");
+}
+
+/// Each name under the node cap, the expression over it: `X10` is 6139 nodes
+/// (`|X_n| = 6·2^n − 5`), read twice it is 12278, so the whole magnitude is
+/// refused on size even though each name alone is accepted.
+#[test]
+fn ruv_magnitude_total_size_is_capped_across_names() {
+    let src = ruv_indiv_model(&ruv_indiv_diamond(10), "PROP_ERR * X10 * X10");
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("expands to more than 10000 expression nodes once its [individual_parameters] names are substituted"),
+        "{err}"
+    );
+    // One read of the same name stays under the cap and is substituted.
+    parse_full_model(&ruv_indiv_model(&ruv_indiv_diamond(10), "PROP_ERR * X10")).unwrap();
+}
+
+/// Every node shape a definition can carry is rebuilt by the substitution —
+/// a function call, a power, and an inline `if` whose condition uses `&&`,
+/// `||`, `!` and `present(...)` — with the earlier name `A` substituted
+/// inside the condition too. Each `WT` row lands on a different arm, so a
+/// shape dropped or left unsubstituted changes a value.
+#[test]
+fn ruv_magnitude_substitutes_through_every_expression_shape() {
+    let src = ruv_indiv_model(
+        "  A = RUV_K\n  ISPK = if (((A > 1) && !(WT < 50)) || (present(WT) && WT > 200)) exp(A)^2 else sqrt(A)",
+        "PROP_ERR * ISPK",
+    );
+    let m = ruv_indiv_mults(&src, &[100.0, 10.0]);
+    approx::assert_relative_eq!(m[0], (3.0f64).exp(), max_relative = 1e-12);
+    approx::assert_relative_eq!(m[1], 1.5f64.sqrt(), max_relative = 1e-12);
+}
+
+/// The refusals no parsed fixture reaches without an optional feature or a
+/// mixture block, pinned on the scope: a definition reading the mixture class,
+/// a neural-network output, or a `Variable` the block does not assign (an
+/// engine built-in the RUV scope would reinterpret).
+#[test]
+fn ruv_indiv_scope_refuses_mixnum_nn_and_unknown_variables() {
+    let stmts = vec![
+        Statement::Assign("M".to_string(), Expression::MixNum),
+        Statement::Assign(
+            "N".to_string(),
+            Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 0,
+            },
+        ),
+        Statement::Assign("U".to_string(), Expression::Variable("ZZZ".to_string())),
+    ];
+    let scope = RuvIndivScope::new(&stmts);
+    for (name, want) in [
+        ("M", "depends on the mixture class (MIXNUM)"),
+        ("N", "depends on a neural-network output"),
+        (
+            "U",
+            "reads `ZZZ`, which is not a theta, a covariate or a name assigned in [individual_parameters]",
+        ),
+    ] {
+        let why = scope.verdict(name).unwrap_err();
+        assert_eq!(why, want, "{name}");
+    }
 }
 
 /// A name whose value depends on η is refused by name, with the reason — not
@@ -9958,7 +10074,7 @@ fn ruv_magnitude_assigned_literal_gather_index_out_of_range_is_refused() {
 #[test]
 fn ruv_magnitude_refuses_an_eta_dependent_individual_parameter() {
     for (indiv, mag, why) in [
-        ("", "PROP_ERR * CL", "`CL`, which [individual_parameters] assigns but which depends on a random effect"),
+        ("", "PROP_ERR * CL * 2", "`CL`, which [individual_parameters] assigns but which depends on a random effect"),
         (
             "  A = CL * 2",
             "PROP_ERR * A",
