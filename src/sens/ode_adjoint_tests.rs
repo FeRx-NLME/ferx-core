@@ -10065,3 +10065,123 @@ fn unit_weight_gradient_is_the_plain_kappas_bit_for_bit() {
         );
     }
 }
+
+const IV_LAG: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVLAG(0.4, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.1
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  ALAG = TVLAG * exp(ETA_LAG)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V, lagtime=ALAG)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// One plan of a lagged steady-state infusion, replayed at other lags (#2786 review #13). The
+/// seed freezes `phase_v = phase.seen_value()` into the plan, with only the `phase > r` branch
+/// (whether the newest window closes before the record) guarded and the `dur` break not moving
+/// with the lag, so the replay has to carry the lag's shift by the arrival alone. `II = 3`,
+/// a 2 h infusion (`r = 2`): `phase = 3 − lag` is above `r` for `lag < 1` and below it past.
+/// The plan recorded at the first lag serves the second lag on its side of the branch and a
+/// third lag across it (where its guard must decline and the walk re-record, never serve the
+/// other side's shape): values against the native predictor, and the adjoint gradient against a
+/// fresh recording on a re-parse (own plan identity) of the model at the same point. Dies when the
+/// replay's phase or window end stops following the lag.
+#[test]
+fn a_lagged_ss_infusion_plan_replays_at_other_lags_on_both_sides_of_the_window_end() {
+    let model = parse_model_string(IV_LAG).unwrap();
+    let params = moved_params(&model);
+    let lag_of = |eta: &[f64]| params.theta[2] * eta[1].exp();
+    // Same side (phase > r) twice, then across the branch.
+    let etas = vec![
+        vec![0.1, 0.1],
+        vec![-0.05, 0.4],
+        vec![0.1, 1.0],
+        vec![0.1, 0.1],
+    ];
+    let lags: Vec<f64> = etas.iter().map(|e| lag_of(e)).collect();
+    assert!(
+        lags[0] < 1.0 && lags[1] < 1.0 && lags[2] > 1.0 && lags[2] < 3.0,
+        "the straddle of phase > r, lag < II: {lags:?}"
+    );
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, true, 3.0)];
+    let s = subject(&model, doses, &[0.5, 1.0, 2.0, 3.5, 5.0], &etas[0]);
+    // Values: the one plan (recorded at the first point) against the native predictor.
+    let theta = params.theta.clone();
+    let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&model, &s, &theta, e);
+    let (served, worst) = plan_values_ulps(&model, &s, None, &etas, &native);
+    eprintln!("lagged SS infusion replay: served {served}, worst {worst} ulp");
+    assert!(served, "the plan serves every lag (or re-records)");
+    // Measured 0 ulp (Linux x86_64): the replay is the native predictor's bits at every lag.
+    assert_eq!(worst, 0, "values: {worst} ulp from the native predictor");
+    // Gradients: replay on the recording model, fresh on a re-parse.
+    let x = pack_params(&params);
+    let grad = |m: &CompiledModel, e: &[f64]| {
+        subject_adjoint_packed_gradient(m, &s, &params, &x, e, true).expect("in scope")
+    };
+    let _ = grad(&model, &etas[0]);
+    let mut gap = 0.0f64;
+    for e in &etas[1..] {
+        let replayed = grad(&model, e);
+        let fresh = grad(&parse_model_string(IV_LAG).unwrap(), e);
+        for (k, (a, b)) in replayed.iter().zip(&fresh).enumerate() {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "x[{k}] at {e:?}: {a} vs {b}"
+            );
+            gap = gap.max((a - b).abs() / (1.0 + b.abs()));
+        }
+    }
+    eprintln!("lagged SS infusion replay: worst gradient gap {gap:.3e}");
+    // Measured 0.0 (bit-identical to a fresh recording); 1e-12 leaves room for another libm.
+    assert!(
+        gap < 1e-12,
+        "replayed gradient off a fresh recording by {gap:e}"
+    );
+}
+
+/// A subject's plan is keyed by its design, `DoseEvent::implied` included (#2786 review #4).
+/// An `ADDL`-implied dose takes its lag from its parent record and its `TIME` from the record
+/// that governs it, so the same dose list with `implied` cleared is another subject whose
+/// parameters, lag and predictions differ. The key once hashed everything of a dose but that
+/// field, so the second of the pair was served the first's plan: a cache hit across subjects
+/// that predict differently. Reachable, as measured: the explicit twin's plan values were
+/// those of the implied dose's lag. Dies when `implied` leaves the key (the twin, served the
+/// implied subject's plan, is off the native predictor by far more than an ulp).
+#[test]
+fn an_addl_implied_dose_and_its_explicit_twin_do_not_share_a_plan() {
+    let model = parse_model_string(&addl_lag_src(false, false)).unwrap();
+    let implied = addl_implied_lag_subject(&model, true);
+    let mut explicit = implied.clone();
+    explicit.doses[1].implied = None;
+    let theta = moved_params(&model).theta;
+    let etas = vec![vec![0.1, -0.05]];
+    let mut worst = Vec::new();
+    // The implied subject records and serves first, then its twin.
+    for (label, s) in [("implied", &implied), ("explicit", &explicit)] {
+        let native = |e: &[f64]| crate::pk::compute_predictions_with_tv(&model, s, &theta, e);
+        let (served, ulps) = plan_values_ulps(&model, s, None, &etas, &native);
+        assert!(served, "{label}: the plan serves");
+        worst.push((label, ulps));
+    }
+    eprintln!("implied/explicit twins, plan vs native: {worst:?}");
+    for (label, ulps) in worst {
+        assert_eq!(ulps, 0, "{label}: served a plan that is not its own");
+    }
+    // The twins really do predict differently (else the pair cannot straddle the key).
+    let p = |s: &Subject| crate::pk::compute_predictions_with_tv(&model, s, &theta, &etas[0]);
+    let (a, b) = (p(&implied), p(&explicit));
+    assert!(
+        a.iter()
+            .zip(&b)
+            .any(|(x, y)| (x - y).abs() > 1e-3 * x.abs()),
+        "the twins predict apart: {a:?} vs {b:?}"
+    );
+}

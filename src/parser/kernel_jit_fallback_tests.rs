@@ -494,3 +494,69 @@ fn no_example_model_falls_back_with_plans_working() {
         "only {n} example models were simulated and fitted"
     );
 }
+
+/// The standalone post-fit steps report a failed plan too (#2786 review #11): `run_covariance`
+/// and `run_sir` register their own scope and fall back per subject exactly as `fit()` does, but
+/// used to drop the failures with the scope without saying so. Dies when either entry point stops
+/// calling `refresh_plan_fd_fallback`; the exact run, on a fit that already carries a stale
+/// report, shows the incoming fit's line is replaced rather than inherited or duplicated.
+#[test]
+fn standalone_covariance_and_sir_report_the_fallback() {
+    let (m, p) = example("examples/warfarin.ferx", "data/warfarin.csv");
+    let base = FitOptions {
+        sir_samples: 20,
+        sir_resamples: 5,
+        sir_seed: Some(1),
+        ..opts(EstimationMethod::FoceI)
+    };
+    let mut fit = crate::api::fit(&m, &p, &m.default_params, &base).expect("fit");
+    assert!(
+        fit.covariance_matrix.is_some(),
+        "the fit carries a covariance"
+    );
+    let n = p.subjects.len();
+    // A stale report from the fit's own run must not survive into a step that ran clean.
+    fit.warnings
+        .push(format!("{TOKEN}: 99 of {n} subjects fell back (stale)"));
+    let count = |r: &FitResult| r.warnings.iter().filter(|w| w.contains(TOKEN)).count();
+    let typed = |r: &FitResult| {
+        r.warnings_structured
+            .iter()
+            .filter(|e| e.message.contains(TOKEN))
+            .count()
+    };
+    type Step = fn(&FitResult, &CompiledModel, &Population, &FitOptions) -> FitResult;
+    let steps: [(&str, Step); 2] = [
+        ("run_covariance", |f, m, p, o| {
+            crate::run_covariance(f, Some(m), Some(p), o).expect("run_covariance")
+        }),
+        ("run_sir", |f, m, p, o| {
+            crate::run_sir(f, Some(m), Some(p), o).expect("run_sir")
+        }),
+    ];
+    for (label, step) in steps {
+        let exact = step(&fit, &m, &p, &base);
+        assert_eq!(
+            count(&exact),
+            0,
+            "{label}: plans held: {:?}",
+            exact.warnings
+        );
+        assert_eq!(typed(&exact), 0, "{label}: no typed entry either");
+        let forced = plans_failing(|| step(&fit, &m, &p, &base));
+        assert_eq!(count(&forced), 1, "{label}: {:?}", forced.warnings);
+        assert_eq!(typed(&forced), 1, "{label}: one typed entry");
+        let w = forced.warnings.iter().find(|w| w.contains(TOKEN)).unwrap();
+        assert!(
+            w.contains(super::FORCED_FAILURE),
+            "{label}: the reason: {w}"
+        );
+        assert!(!w.contains("(stale)"), "{label}: replaced, not inherited");
+        let e = forced
+            .warnings_structured
+            .iter()
+            .find(|e| e.message.contains(TOKEN))
+            .unwrap();
+        assert_eq!(e.category, WarningCode::GradientFallback, "{label}");
+    }
+}

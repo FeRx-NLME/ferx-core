@@ -80,7 +80,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-/// Compiled plans serve every derivative (#2786).
+/// Whether `FERX_KJIT_DEBUG` is set: the plan layer then prints its counters at the end of a
+/// fit and replays each recording on values to check it (#2786).
 pub(crate) fn debug() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("FERX_KJIT_DEBUG").is_ok())
@@ -2210,6 +2211,14 @@ fn subject_desc(s: &crate::types::Subject) -> Desc {
             (d.ss, d.cmt_idx()).hash(h);
             std::mem::discriminant(&d.rate_mode).hash(h);
             std::mem::discriminant(&d.infusion_def).hash(h);
+            // What the parameter and lag recordings read of a dose besides its own row: an
+            // `ADDL`-implied dose takes its `TIME` and lag from its parent record (`dose_param_time`,
+            // `implied_dose_parent`), a state walk's cut is `off_at`, and `evid4` marks the reset.
+            d.evid4.hash(h);
+            d.off_at.to_bits().hash(h);
+            d.implied
+                .map(|i| (i.parent, i.param_time.to_bits(), i.gov_time.to_bits()))
+                .hash(h);
         }
         maps(h, std::slice::from_ref(&s.covariates));
         maps(h, &s.dose_covariates);
@@ -3248,6 +3257,16 @@ pub(crate) struct Plan {
     /// The exact linear path's segments its recording integrated instead: reported to the
     /// solver statistics on every run, as the dual sweeps reported theirs.
     declined: usize,
+    /// Identifies this plan for as long as the process runs ([`next_serial`]), where its address
+    /// does not: a freed plan's address is reused, so a kept forward ([`Kept`]) keyed by it could
+    /// be adopted by an unrelated plan whose inputs happen to match (ABA, #2786 review #7).
+    serial: u64,
+}
+
+/// A fresh [`Plan::serial`].
+fn next_serial() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    N.fetch_add(1, Relaxed)
 }
 
 /// Distinct chunk programs, by structure (layout-independent): per hash, the programs with it.
@@ -3767,6 +3786,7 @@ impl Recording {
             resolved: Default::default(),
             ode_override: self.ode.then(crate::ode::solver::current_ode_override),
             declined: self.declined,
+            serial: next_serial(),
         }
     }
 
@@ -4044,6 +4064,7 @@ impl Recording {
             resolved: Default::default(),
             ode_override: None,
             declined: 0,
+            serial: next_serial(),
         };
         Some((plan, src))
     }
@@ -4119,7 +4140,7 @@ impl Drop for Buf {
 /// What the thread's last [`Plan::run`] left in `BUF`.
 #[derive(Clone, Copy)]
 struct LastRun {
-    plan: usize,
+    plan: u64,
     layout: Layout,
     need: usize,
     n_eta: usize,
@@ -4130,7 +4151,7 @@ struct LastRun {
 /// chunk-only plan at its inner layout, which [`Plan::adopt`] turns back into a [`Fwd`] for the
 /// outer gradient's reverse, so that does not run the same forward again at `η̂`.
 struct Kept {
-    plan: usize,
+    plan: u64,
     layout: Layout,
     buf: Vec<f64>,
 }
@@ -4329,6 +4350,13 @@ impl Plan {
                 ) => {
                     #[cfg(test)]
                     CALLS_RUN.with(|n| n.set(n.get() + 1));
+                    debug_assert!(
+                        buf.len() >= self.n_slots * l
+                            && idx.iter().all(|&s| (s as usize) < self.n_slots),
+                        "a chunk call needs every slot's lanes in `buf`: {} < {} slots × {l} lanes",
+                        buf.len(),
+                        self.n_slots
+                    );
                     // SAFETY: every slot in `idx` is below `n_slots`; the kernel reads its
                     // inputs' live lanes and its literals, and writes its outputs' lanes, at
                     // the layout it was built for, which is `buf`'s.
@@ -4465,7 +4493,7 @@ impl Plan {
             }
             LAST_RUN.with(|c| {
                 c.set(self.chunky.then_some(LastRun {
-                    plan: self as *const Plan as usize,
+                    plan: self.serial,
                     layout: self.layout,
                     need,
                     n_eta: self.n_eta,
@@ -4529,7 +4557,7 @@ impl Plan {
         let me = self as *const Plan as usize;
         let mut t = kept_table().lock().unwrap();
         let k = t.get(&owner)?;
-        if k.plan != me || k.layout != layout || k.buf.len() != self.n_slots * self.lanes {
+        if k.plan != self.serial || k.layout != layout || k.buf.len() != self.n_slots * self.lanes {
             return None;
         }
         if theta.len() != self.n_theta || !inputs_match(&k.buf, self.lanes, self.n_eta, theta, eta)
@@ -4659,6 +4687,15 @@ impl Plan {
             for (c, k) in self.calls.iter().zip(rev.iter()).rev() {
                 match (c, k) {
                     (Call::Chunk { idx, lits, .. }, Kern::Chunk(k)) => {
+                        debug_assert!(
+                            buf.len() >= need
+                                && adj.len() >= seeds * need
+                                && idx.iter().all(|&s| (s as usize) < self.n_slots),
+                            "a reverse chunk call needs `need` = {need} lanes in `buf` ({}) and \
+                             {seeds} such blocks in `adj` ({})",
+                            buf.len(),
+                            adj.len()
+                        );
                         // SAFETY: as `forward_into`; each seed's `adj` block is laid out like
                         // `buf`.
                         unsafe {

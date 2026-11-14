@@ -1385,10 +1385,18 @@ thread_local! {
 
 /// Run `f` with `hook` serving this thread's `f64` drivers.
 pub(crate) fn with_lane_hook<R>(hook: std::rc::Rc<dyn LaneHook>, f: impl FnOnce() -> R) -> R {
-    let prev = LANE_HOOK.with(|h| h.replace(Some(hook)));
-    let r = f();
-    LANE_HOOK.with(|h| *h.borrow_mut() = prev);
-    r
+    /// Restores the previous hook on drop, so a panic in `f` does not leave this thread (a
+    /// persistent rayon worker, or R's main thread under a caught panic) serving a dead
+    /// operation's stepper.
+    struct Restore(Option<std::rc::Rc<dyn LaneHook>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            LANE_HOOK.with(|h| *h.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(LANE_HOOK.with(|h| h.replace(Some(hook))));
+    f()
 }
 
 /// The hook serving this thread's drivers at `T = f64`, if any.
@@ -2502,7 +2510,7 @@ fn integrate_dense_g<T: PkNum>(
     // model's right-hand side says so at its first evaluation (`note_switches`), and a model
     // without any never does, so its integration takes no other branch.
     let watch = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>();
-    if watch && hook.is_none() {
+    if watch {
         take_switches();
     }
     let mut sw = Switches {
@@ -4050,6 +4058,86 @@ fn jets_finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+
+    /// A hook that serves nothing: only its identity matters to the restore tests.
+    struct NullHook;
+    impl LaneHook for NullHook {
+        fn stepper(&self, _: usize, _: OdeMethod) -> Box<dyn Stepper<f64>> {
+            unreachable!()
+        }
+        fn begin(&self) {}
+        fn point(&self, _: bool) {}
+        fn interp(&self, _: f64, _: f64, _: usize) {}
+        fn interp_done(&self) {}
+        fn tail(&self, _: bool, _: bool) {}
+        fn switches(&self) -> usize {
+            0
+        }
+        fn force(&self, _: Option<(usize, bool)>) {}
+        fn switch_g(&self, _: &[f64], _: f64, _: &mut [f64]) {}
+        fn jump(&self, _: usize, _: bool, _: f64) {}
+    }
+
+    /// `with_lane_hook` puts the previous hook back on a panic in `f` too (#2786 review #8): a
+    /// rayon worker outlives the operation, and a stale hook would serve a dead operation's
+    /// stepper to every later `f64` solve on that thread. Nested, so both levels are checked:
+    /// the inner panic leaves the outer hook in force, the outer one's end leaves none. Dies
+    /// when the restore goes back to running only on a normal return.
+    #[test]
+    fn a_lane_hook_is_restored_when_its_closure_panics() {
+        use std::rc::Rc;
+        assert!(lane_hook::<f64>().is_none(), "a clean thread");
+        let outer: Rc<dyn LaneHook> = Rc::new(NullHook);
+        let inner: Rc<dyn LaneHook> = Rc::new(NullHook);
+        let (o, i) = (outer.clone(), inner.clone());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_lane_hook(o.clone(), || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    with_lane_hook(i.clone(), || panic!("the inner operation fails"))
+                }));
+                assert!(r.is_err());
+                let now = lane_hook::<f64>().expect("the outer hook is back in force");
+                assert!(
+                    Rc::ptr_eq(&now, &o),
+                    "the outer hook, not the dead inner one"
+                );
+                panic!("the outer operation fails");
+            })
+        }));
+        assert!(r.is_err());
+        assert!(
+            lane_hook::<f64>().is_none(),
+            "no hook outlives the panicked operation"
+        );
+        // Normal return restores too, and the hook is not kept alive by the thread.
+        with_lane_hook(outer.clone(), || ());
+        assert!(lane_hook::<f64>().is_none());
+        assert_eq!(
+            Rc::strong_count(&outer),
+            2,
+            "only `outer` and its clone `o`"
+        );
+        assert_eq!(Rc::strong_count(&inner), 2);
+    }
+
+    /// A solve starts with no stale switch count: a right-hand side that said `k` switches in an
+    /// earlier evaluation on this thread must not make a switch-free solve watch any (#2786
+    /// review nit). Dies when the solve entry stops clearing it.
+    #[test]
+    fn a_solve_starts_with_no_stale_switch_count() {
+        note_switches(3);
+        let rhs = |u: &[f64], _: &[f64], _: f64, du: &mut [f64]| du[0] = -u[0];
+        let out = solve_ode(
+            &rhs,
+            &[1.0],
+            (0.0, 1.0),
+            &[],
+            &[1.0],
+            &OdeSolverOptions::default(),
+        );
+        assert!((out[0].u[0] - (-1.0f64).exp()).abs() < 1e-4);
+        assert_eq!(take_switches(), 0, "the stale count was cleared at entry");
+    }
 
     // -- Fit-scoped solver-option override (#1212) -------------------------------------
     //

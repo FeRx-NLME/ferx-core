@@ -17710,3 +17710,59 @@ fn public_ode_predictions_stops_an_infusion_at_an_off_row() {
         );
     }
 }
+
+/// The convolved infusion input trusts its segment to lie wholly on one side of the infusion's
+/// onset and of its window end (`rate_infused`'s `tail_age`, #2786 review #14), so a caller
+/// whose break list lacks either edge must fail loudly in debug, not deliver a wrong rate.
+/// A segment `[1, 3]` straddles the window end of a 4 h infusion at `F = 0.6` (2.4 h) and one
+/// `[-1, 0.5]` straddles an onset at 0; the segments on the correct side of each edge, the same
+/// calls one step away, are the controls that do not panic. Dies when either assertion goes.
+#[cfg(debug_assertions)]
+mod infusion_edge_contract {
+    use super::*;
+
+    fn run(doses: &[DoseEvent], t: f64, since: f64) {
+        let ode = first_order_one_cpt_spec();
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 2.0;
+        pk.values[crate::types::PK_IDX_V] = 20.0;
+        pk.values[4] = 0.6;
+        let prepared = prepare_input_rates(&ode, &pk.values);
+        let mut dy = [0.0_f64];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            doses,
+            &[0.0],
+            &[0.6],
+            &[],
+            ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+            t,
+            since,
+            &mut dy,
+        );
+    }
+
+    fn infusion(at: f64) -> DoseEvent {
+        DoseEvent::new(at, 100.0, 1, 25.0, false, 0.0)
+    }
+
+    #[test]
+    fn segments_on_one_side_of_each_edge_are_accepted() {
+        run(&[infusion(0.0)], 2.0, 1.0); // wholly inside the window (ends at 2.4)
+        run(&[infusion(0.0)], 3.0, 2.5); // wholly past it
+        run(&[infusion(2.0)], 1.5, 1.0); // wholly before the onset
+    }
+
+    #[test]
+    #[should_panic(expected = "window end")]
+    fn a_segment_straddling_the_window_end_is_refused() {
+        run(&[infusion(0.0)], 3.0, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "onset")]
+    fn a_segment_straddling_the_onset_is_refused() {
+        run(&[infusion(1.0)], 2.0, 0.0);
+    }
+}

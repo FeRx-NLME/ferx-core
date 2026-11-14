@@ -1173,6 +1173,7 @@ pub(crate) fn ss_residual_infusions_g<G: crate::sens::num::PkNum>(
 /// Saturates at `usize::MAX` for an `x` no finite count reaches.
 pub(crate) fn count_gt_multiples<G: crate::sens::num::PkNum>(x: G, ii: f64) -> usize {
     use crate::sens::num::BranchCmp::Gt;
+    debug_assert!(ii > 0.0, "count_gt_multiples needs an interval, got {ii}");
     if !x.br_cmp_c(Gt, 0.0) {
         return 0;
     }
@@ -1642,21 +1643,24 @@ impl DoseIndex {
     /// The infusion breaks `b` with `lo < b < hi`, ascending — the candidates
     /// `compute_propagation_bounds` pushes for an interval, as a slice.
     #[inline]
-    pub(crate) fn breaks_within(&self, lo: f64, hi: f64) -> Vec<f64> {
+    pub(crate) fn breaks_within(&self, lo: f64, hi: f64) -> std::borrow::Cow<'_, [f64]> {
         let from = self.breaks.partition_point(|&b| !(b > lo));
         let len = self.breaks[from..].partition_point(|&b| b < hi);
-        let mut out = self.breaks[from..from + len].to_vec();
-        if !self.residuals.is_empty() {
-            for (_, ends) in &self.residuals {
-                out.extend(
-                    ends.within(lo, hi)
-                        .map(|(_, e)| e)
-                        .filter(|&e| e > lo && e < hi),
-                );
-            }
-            out.sort_by(|a, b| a.total_cmp(b));
+        let own = &self.breaks[from..from + len];
+        if self.residuals.is_empty() {
+            // The per-interval hot path: no residual pulses, so no allocation.
+            return std::borrow::Cow::Borrowed(own);
         }
-        out
+        let mut out = own.to_vec();
+        for (_, ends) in &self.residuals {
+            out.extend(
+                ends.within(lo, hi)
+                    .map(|(_, e)| e)
+                    .filter(|&e| e > lo && e < hi),
+            );
+        }
+        out.sort_by(|a, b| a.total_cmp(b));
+        std::borrow::Cow::Owned(out)
     }
 
     /// Every dose with an arrival or window end within a margin of `[lo, hi]`, ascending
@@ -1835,6 +1839,26 @@ mod dose_index_tests {
         }
         out.sort_by(|a, b| a.total_cmp(b));
         out
+    }
+
+    /// With no residual pulses `breaks_within` hands back a slice of the index and allocates
+    /// nothing (the per-interval hot path); with one it owns the merged, sorted list. Dies when
+    /// the borrowed arm goes back to a `Vec`, or the residual arm stops merging.
+    #[test]
+    fn breaks_within_borrows_unless_a_residual_pulse_is_live() {
+        use std::borrow::Cow;
+        let plain = vec![DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0)];
+        let index = DoseIndex::new(&plain, &[]);
+        let got = index.breaks_within(0.5, 9.0);
+        assert!(matches!(got, Cow::Borrowed(_)), "no residuals: borrowed");
+        assert_eq!(&*got, &[5.0], "the window end only (onset 0 is outside)");
+        // An SS infusion longer than its interval: earlier pulses still run at the record.
+        let ss = vec![DoseEvent::new(0.0, 100.0, 1, 20.0, true, 4.0)];
+        let index = DoseIndex::new(&ss, &[]);
+        let got = index.breaks_within(-1.0, 9.0);
+        assert!(matches!(got, Cow::Owned(_)), "residuals: owned");
+        assert!(got.windows(2).all(|w| w[0] <= w[1]), "sorted: {got:?}");
+        assert!(got.len() > 2, "the residual ends are merged: {got:?}");
     }
 
     #[test]

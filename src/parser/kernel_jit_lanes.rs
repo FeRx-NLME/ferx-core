@@ -1,14 +1,11 @@
 //! The cold tier of a chunk kernel (#2786): its register program run one dual operation at a
-//! time over a [`Layout`]'s lanes, forward and reverse.
+//! time over a [`Layout`]'s lanes, forward only: there is no reverse sweep here.
 //!
 //! The lowered scalar code ([`ir::forward`]) is the compiled tiers' input; interpreting it
 //! costs a dispatch per lane of every operation. This runs the chunk's [`Flat`] code itself:
 //! one dispatch per operation, the lane arithmetic in loops over the layout's tangents and
 //! payload pairs ([`ir::pairs`]) — the same formulas, in the same order, as [`ir::Lower`]'s,
-//! so the forward lanes are the lowered code's. The reverse applies each operation's adjoint
-//! rule, derived from those formulas, in reverse order over the stored forward registers;
-//! like [`ir::reverse`], a select passes its adjoint to the operand it chose and a condition,
-//! a rounding, a stopped value or a host output carries none.
+//! so the forward lanes are the lowered code's.
 //!
 //! No input lane is assumed: the folding the compiled tiers apply ([`super::fold_chunk`]) is
 //! exact, so the lanes agree with theirs wherever no `NaN` or signed zero is involved.

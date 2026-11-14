@@ -18258,3 +18258,95 @@ fn internal_bfgs_reports_a_spent_iteration_budget() {
     assert_eq!(gtol.n_iterations, 1);
     assert!(!gtol.eval_budget_spent);
 }
+
+/// The Newton step from a verified incumbent (`predicted_newton_step`) is gated on
+/// `analytic_outer_gradient_available`, which since #2786 includes AGQ and `[mixture]` models
+/// as well as the FOCE-family scope the gate used to name. Both now form a step, with the
+/// objective's own per-subject scores: AGQ's at `n_agq = 3`, a mixture's K-class marginal rows.
+/// A model forced onto finite differences (`gradient = fd`) forms none, the control that shows
+/// the gate and not the fixture decides. Dies when the gate narrows back (AGQ or the mixture
+/// returns `None`, so those fits lose the Newton-start leg and report a different convergence
+/// path) or stops honouring `gradient = fd`.
+#[test]
+fn the_newton_step_is_formed_for_agq_and_mixture_models_and_withheld_under_fd() {
+    let base = r"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.05
+  sigma EPS ~ 0.01
+";
+    let tail = r"
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let mixture = format!(
+        "{base}  theta MIXL(0.0, -10.0, 10.0)\n[mixture]\n  nsub = 2\n  logit(1) = MIXL\n{tail}"
+    );
+    let plain = format!("{base}{tail}").replace("MIXNUM == 1", "TVCL1 > 0.0");
+    let pop = make_population(6);
+    let step_for = |model: &CompiledModel, opts: &FitOptions| {
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let warm: Vec<DVector<f64>> = (0..pop.subjects.len())
+            .map(|_| DVector::zeros(model.n_eta))
+            .collect();
+        let kappas = vec![Vec::new(); pop.subjects.len()];
+        let ehs = if params.mixture.is_some() {
+            warm
+        } else {
+            ebes_at(model, params, &pop, opts).1
+        };
+        predicted_newton_step(
+            model,
+            &pop,
+            params,
+            &x,
+            &ehs,
+            &kappas,
+            &compute_bounds(params),
+            opts,
+            &crate::estimation::nn_reg::NnRegularizer::build(model, &pop, opts),
+            &build_prior_set(model, params),
+        )
+    };
+    let finite = |label: &str, r: Option<(f64, Vec<f64>)>| {
+        let (gain, step) = r.unwrap_or_else(|| panic!("{label}: the Newton step forms"));
+        assert!(
+            gain.is_finite() && step.iter().all(|d| d.is_finite()),
+            "{label}: gain {gain}, step {step:?}"
+        );
+        eprintln!("{label}: predicted gain {gain:.4e}");
+    };
+    let agq = FitOptions {
+        method: EstimationMethod::Laplace,
+        n_agq: 3,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let m_plain = crate::parser::model_parser::parse_model_string(&plain).unwrap();
+    let m_mix = crate::parser::model_parser::parse_model_string(&mixture).unwrap();
+    assert!(
+        m_mix.default_params.mixture.is_some(),
+        "the mixture fixture is one"
+    );
+    finite("AGQ (n_agq = 3)", step_for(&m_plain, &agq));
+    finite("mixture", step_for(&m_mix, &focei_options()));
+    for (label, src, o) in [
+        ("AGQ", &plain, &agq),
+        ("mixture", &mixture, &focei_options()),
+    ] {
+        let mut fd = crate::parser::model_parser::parse_model_string(src).unwrap();
+        fd.gradient_method = crate::types::GradientMethod::Fd;
+        assert!(
+            step_for(&fd, o).is_none(),
+            "{label}: gradient = fd forms no Newton step"
+        );
+    }
+}

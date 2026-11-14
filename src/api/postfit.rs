@@ -1844,6 +1844,26 @@ pub(crate) fn plan_fd_fallback_warning(
     ))
 }
 
+/// [`plan_fd_fallback_warning`] for a standalone post-fit step (`run_covariance`, `run_sir`)
+/// over a clone of an earlier fit's result: the incoming fit's own report describes *its* run,
+/// so it is replaced by what this call's registered scope saw. Called while the call's
+/// [`register`](crate::parser::model_parser::rhs_regcode::kernel_jit::register) guard is alive,
+/// since the failures leave with the scope.
+pub(crate) fn refresh_plan_fd_fallback(
+    model: &CompiledModel,
+    population: &Population,
+    out: &mut FitResult,
+) {
+    const CODE: &str = "W_PLAN_FD_FALLBACK";
+    out.warnings.retain(|w| !w.contains(CODE));
+    out.warnings_structured
+        .retain(|e| !e.message.contains(CODE));
+    if let Some((msg, entry)) = plan_fd_fallback_warning(model, population) {
+        out.warnings.push(msg);
+        out.warnings_structured.push(entry);
+    }
+}
+
 /// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
 /// return `None` when empty, otherwise join a human `list` string (`line` per
 /// hit), format the message (`msg` over the joined list), build the structured

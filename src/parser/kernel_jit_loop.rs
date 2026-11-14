@@ -909,6 +909,12 @@ impl LoopRun {
                 log.entries.push(Entry::Body { m, kind, at });
             }
         }
+        debug_assert!(
+            buf.len() >= self.sl.total * l && table.iter().all(|&s| (s as usize) < self.sl.total),
+            "a body call needs every slot's lanes in `buf`: {} < {} slots × {l} lanes",
+            buf.len(),
+            self.sl.total
+        );
         // SAFETY: every slot in `table` is below `sl.total`, whose `l` lanes each `buf` holds,
         // laid out as the kernel's layout reads them.
         unsafe {

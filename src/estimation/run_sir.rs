@@ -308,6 +308,9 @@ fn run_sir_scoped(
     replace_sir_warnings(&mut out.warnings, &sir.warnings);
     crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
+    // Subjects whose compiled plan failed in this step and took finite differences (#2786);
+    // the scope's failures leave with `_prints`, so this reads them first.
+    crate::api::postfit::refresh_plan_fd_fallback(model_ref, pop_ref, &mut out);
     crate::api::rebuild_warnings_structured(&mut out);
     crate::api::apply_sir_result(&mut out, Some(&sir), None);
     Ok(out)

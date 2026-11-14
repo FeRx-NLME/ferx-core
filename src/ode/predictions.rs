@@ -2395,6 +2395,17 @@ fn push_route_lag_break_times(
     }
 }
 
+/// Whether stage time `t` of a segment lies on the side of the infusion edge `edge` that the
+/// segment's start put it on: before it (`edge` ahead of the segment, `t ≤ edge`). The convolved
+/// infusion rate trusts the segment to lie wholly on one side of its onset and of its window end
+/// (`rate_infused`'s `tail_age`), which holds only while every caller's break list holds both
+/// times, the route lag's included; this is the debug check of that contract (#2786 review #14).
+/// The tolerance is the integrators' own time slack.
+#[inline]
+fn infusion_edge_is_a_break(t: f64, edge: f64) -> bool {
+    !(t.is_finite() && edge.is_finite()) || t <= edge + 1e-9 * (1.0 + edge.abs())
+}
+
 /// How a segment's infusions are injected as a `+rate` derivative term in the
 /// wrapped RHS. The two shapes mirror how the two families of ODE paths break
 /// their timelines:
@@ -2404,9 +2415,12 @@ fn push_route_lag_break_times(
 ///   dose/infusion-end, so within a segment each active infusion spans the whole
 ///   interval — see [`active_infusions`].
 /// - [`InfusionInput::Gated`]: `(cmt_idx, rate, t_start, t_end)` tuples, each
-///   active only for `t ∈ [t_start − ε, t_end + ε)`. The dense/simulate paths do
-///   **not** split at infusion edges, so an infusion can start or end inside a
-///   segment and must be gated on the integration time.
+///   active only for `t ∈ [t_start − ε, t_end + ε)`. This channel is gated on the
+///   integration time, so it is right even for a segment an infusion edge falls
+///   inside. The dense paths do put every onset and window end into their break
+///   list (the route lag's included), which is what the *convolved* kernel input
+///   (`add_prepared_input_rate_forcing`) relies on and debug-asserts: it decides the
+///   side of its window from the segment, not from each stage's time.
 ///
 /// In both cases `rate` already folds in bioavailability (`F·RATE`).
 enum InfusionInput {
@@ -2956,12 +2970,32 @@ pub(crate) fn add_prepared_input_rate_forcing<
                 // it starts, and each time is a break of its timeline.
                 let reached = since + T::from_f64(INFUSION_EPS);
                 if t_eff.br_cmp(crate::sens::num::BranchCmp::Gt, reached) {
+                    // Not begun: every stage of the segment must precede the onset, i.e. the
+                    // caller's break list holds it (`rate_infused` no longer decides pointwise).
+                    debug_assert!(
+                        infusion_edge_is_a_break(t.seen_value(), t_eff.seen_value()),
+                        "infusion onset {} lies inside the segment [{}, {}]: a caller's break \
+                         list lacks it",
+                        t_eff.seen_value(),
+                        since.seen_value(),
+                        t.seen_value()
+                    );
                     continue;
                 }
                 let end = t_eff + window;
                 let tail_age = end
                     .br_cmp(crate::sens::num::BranchCmp::Le, reached)
                     .then(|| t - end);
+                // Still running: every stage of the segment must precede the window end.
+                debug_assert!(
+                    tail_age.is_some()
+                        || infusion_edge_is_a_break(t.seen_value(), end.seen_value()),
+                    "infusion window end {} lies inside the segment [{}, {}]: a caller's \
+                     break list lacks it (onset or route-lag end)",
+                    end.seen_value(),
+                    since.seen_value(),
+                    t.seen_value()
+                );
                 prep.rate_infused(tad, dose_mass, window, tail_age)
             } else if T::RECORDS_BRANCHES {
                 // A recording type (#2786) records this inside an ODE step, where the stage

@@ -216,9 +216,11 @@ fn propagate_covariance<T: VmNum, R: EkfRhs>(
     out
 }
 
-/// Longest sub-step of the Riccati propagation. 0.5 h per step keeps the relative
-/// error under ~3% for typical PK; the walk and the steady-state run-in both sub-step at
-/// this, so a steady state expanded into explicit records and one seeded from an `SS=1`
+/// Longest sub-step of the Riccati propagation. The Crank–Nicolson step
+/// ([`propagate_covariance`]) is second order and A-stable, so this bounds the quadrature error
+/// of the midpoint-linearised `F`, not stability (the "~3%" once quoted here was the retired
+/// explicit Euler step's figure, never measured for this one); the walk and the steady-state
+/// run-in both sub-step at this, so a steady state expanded into explicit records and one seeded from an `SS=1`
 /// record propagate `P` through the same quadrature (#1260).
 const RICCATI_DT_MAX: f64 = 0.5;
 

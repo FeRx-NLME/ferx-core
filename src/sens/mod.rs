@@ -5,7 +5,9 @@
 //! The adjoint (`ode_provider::adjoint`) records them into compiled per-subject plans
 //! (`parser::kernel_jit`) and gives FOCE, FOCEI, Laplace and AGQ their exact outer gradient,
 //! inner gradient, `H` and R-matrix from them. [`dual2::Dual2`] is the independent
-//! second-order forward dual the tests check those plans against.
+//! second-order forward dual the tests check those plans against; it also serves production
+//! where a closed second-order jet is the whole job (the residual-error derivatives in
+//! `stats::residual_error`).
 
 pub mod dual2;
 pub(crate) mod focei_kernel;

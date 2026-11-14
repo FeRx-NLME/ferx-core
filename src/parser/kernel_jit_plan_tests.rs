@@ -1583,3 +1583,86 @@ fn the_linear_kernels_plan_values_are_the_native_bits() {
     }
     assert!(bad.is_empty(), "{}", bad.join("\n"));
 }
+
+/// Every field of a dose a recording can read keys its subject's plan (#2786 review #4):
+/// `implied` (with each of its three fields), `evid4` and `off_at` each move the descriptor,
+/// and a dose list equal in all of them does not. Dies when any one leaves `subject_desc`.
+#[test]
+fn every_dose_field_a_recording_reads_keys_the_plan() {
+    use crate::types::{DoseEvent, ImpliedDose, Subject};
+    let base = || {
+        let mut s = Subject::default();
+        s.doses = vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+        ];
+        s
+    };
+    let imp = |parent: usize, param_time: f64, gov_time: f64| {
+        Some(ImpliedDose {
+            parent,
+            param_time,
+            gov_time,
+        })
+    };
+    let with = |f: &dyn Fn(&mut DoseEvent)| {
+        let mut s = base();
+        f(&mut s.doses[1]);
+        subject_desc(&s)
+    };
+    let plain = subject_desc(&base());
+    assert_eq!(plain, with(&|_| {}), "an unchanged list keys equal");
+    let implied = with(&|d| d.implied = imp(0, 24.0, 24.0));
+    let variants = [
+        ("implied", implied.clone()),
+        ("parent", with(&|d| d.implied = imp(1, 24.0, 24.0))),
+        ("param_time", with(&|d| d.implied = imp(0, 25.0, 24.0))),
+        ("gov_time", with(&|d| d.implied = imp(0, 24.0, 25.0))),
+        ("evid4", with(&|d| d.evid4 = true)),
+        ("off_at", with(&|d| d.off_at = 30.0)),
+    ];
+    for (i, (name, d)) in variants.iter().enumerate() {
+        assert_ne!(*d, plain, "{name} keys apart from the plain dose");
+        for (other, e) in &variants[i + 1..] {
+            assert_ne!(d, e, "{name} and {other} key apart");
+        }
+    }
+}
+
+/// A kept forward is adopted only by the plan that made it, identified by a process-unique
+/// serial and not by its address (#2786 review #7): a freed plan's address is reused, and an
+/// unrelated plan whose inputs match (eta = 0 at the initial theta) would adopt the stale forward.
+/// Two live plans of one shape stand for the ABA pair: equal layout, buffer length and inputs,
+/// differing in identity alone, so only the identity check can refuse. Dies when the check
+/// goes back to an address, or to none.
+#[test]
+fn a_kept_forward_is_adopted_only_by_the_plan_that_made_it() {
+    let (a, b) = (square_plan(), square_plan());
+    assert!(a.chunky && b.chunky && a.layout == b.layout);
+    assert_ne!(a.serial, b.serial, "serials are unique");
+    let owner = 0x5eed_0007usize;
+    let keep = |p: &Plan| {
+        kept_table().lock().unwrap().insert(
+            owner,
+            Kept {
+                plan: p.serial,
+                layout: p.layout,
+                buf: vec![0.0; p.n_slots * p.lanes],
+            },
+        );
+    };
+    let eta = [0.0, 0.0];
+    keep(&a);
+    assert!(
+        b.adopt(owner, b.layout, &[], &eta).is_none(),
+        "another plan's forward is refused"
+    );
+    assert!(
+        a.adopt(owner, a.layout, &[], &eta).is_some(),
+        "its own is adopted (the refusal above was the identity, not the inputs)"
+    );
+    assert!(
+        a.adopt(owner, a.layout, &[], &eta).is_none(),
+        "and taken once"
+    );
+}
