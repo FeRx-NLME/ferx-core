@@ -895,6 +895,10 @@ family, not interleaved by subject. Join them back to the data on `ID`, `CMT` an
 four residual columns exist only when the fit has a TTE record, and are blank on every other
 row.
 
+With `npde_nsim > 0` a single-event TTE row also carries its
+[simulation-based npde](#tte-npde) in `NPDE` and `NPD` (the same number in both).
+`EPRED`, `EWRES` and `PWRES` are blank on a TTE row.
+
 All four residual cells are blank:
 
 - for an **interval-censored** record (its `DV` too), which has no single `ΔH`;
@@ -913,7 +917,9 @@ so the residuals are those of the BSV η̂ alone.
 
 A `.fitrx` bundle carries the TTE rows (`predictions_tte.csv`,
 [#911](https://github.com/FeRx-NLME/ferx-core/issues/911)), so the sdtab of a restored
-fit equals the live one. Only a bundle written before #911 has none: writing its sdtab is
+fit equals the live one. The npde score travels in a trailing `NPDE` column of that
+entry, written only when some record has one; a build from before #1889 cannot read a
+bundle that carries it. Only a bundle written before #911 has none: writing its sdtab is
 refused with a message saying the bundle predates the TTE rows.
 
 ### Validation
@@ -931,6 +937,70 @@ Measured on Linux aarch64 at `inner_tol = 1e-10`, with ODE tolerances 1e-9 / 1e-
 joint model; macOS arm64 agrees to every digit shown. The inner η-gradient is exact, which
 is why the identities hold to ~1e-11. Test:
 `tests/tte_residuals_nonmem_anchor.rs`.
+
+### Simulation-based npde {#tte-npde}
+
+With `[fit_options] npde_nsim > 0` a single-event record also gets a simulation-based
+score ([#1889](https://github.com/FeRx-NLME/ferx-core/issues/1889)), written to the `NPDE`
+and `NPD` columns of its sdtab row. It differs from `PIT` in what it conditions on: `PIT`
+is the survival at the subject's EBE, the npde scores the record against the
+**population** predictive distribution, with η drawn from Ω, so it does not inherit the
+EBE's shrinkage.
+
+With `F̂(y)` the fraction of the `K` simulated replicates of the subject that have an event
+before `y`, an observed event at `t` has `pd = F̂(t)`, and a time right-censored at `c` has
+`pd` drawn uniformly between `F̂(c)` and 1. `NPDE = Φ⁻¹(pd)` after the
+`[1/(2K), 1 − 1/(2K)]` clamp. An event earlier than predicted is negative. No simulated
+time is ranked: only the count of events before `y` enters, so a replicate with no event
+(censored at the simulation horizon, a cure-fraction draw, a failed solve) is "not before
+`y`" and never a number in the empirical distribution.
+
+The censored rule is the one the R `npde` package applies to censored data
+(`cens.method = "cdf"`), mirrored to right censoring. The censored score is imputed on
+`pd`, not as a time: drawing η from Ω and then a time past `c` given that η would skip
+the weighting of η by `S(c | η)`.
+
+Under a correct model the scores are N(0, 1) when censoring is independent of the event
+time given the model, the assumption the likelihood makes. `NPDE = NPD` for a single
+event. The post-fit function is `stats::npde::compute_tte_npde`; with the fitted
+parameters (`fitted_params_from_result`) and the recorded `npde_seed` it reproduces the
+stored cells.
+
+Not scored: a repeated-events endpoint, competing risks, left truncation, an
+interval-censored record, more than one record per subject on the endpoint. At fit time
+the cells stay blank and the fit carries one `W_NPDE_TTE_SKIPPED` warning quoting the
+reason; `compute_tte_npde` returns `E_NPDE_TTE_INPUT`.
+
+#### Validation of the npde {#tte-npde-validation}
+
+NONMEM has no npde for event times, so there is no NONMEM run to compare with. The
+checks are a closed form, a distribution test and the R `npde` package (CRAN 3.5).
+
+| Check | Result |
+|---|---|
+| Event `pd` vs `1 − exp(−λt)`, no random effect, K = 20,000 | worst error 1.7e-3 (bound: 4 Monte-Carlo SD) |
+| Event `pd` vs quadrature `F(3) = 0.27751`, `F(8) = 0.55678` (λ = 0.1, ω² = 0.25) | errors 2.2e-3, 3.8e-3 (0.7 and 1.1 SD) |
+| 20 subjects all censored where `F(c) = 0.95` | every `pd ≥ 0.9495` |
+| KS distance of `pd` from U(0, 1), N = 1000, 71 % censored by independent dropout, K = 1000 | 0.0196 under the true model, 0.1265 under a hazard twice too large (0.1 % critical value 0.0616) |
+| Kernel vs R `npde` 3.5 on R's own simulated times (40 subjects, K = 200, one common censoring time) | event `pd`: 5.6e-17; event `npde`: 2.1e-9; censored `F̂(c)`: 5.6e-17 |
+| Constant hazard through the ODE engine, joint PK-TTE subjects, K = 2,000 | worst error 5.3e-3 (bound: 4 SD) |
+| `fit()` cells vs `compute_tte_npde` after the fit (25 scored records, correlated Ω block rebuilt by `fitted_params_from_result`) | bit-equal |
+
+A replicate with no event (a cure-fraction draw, a failed event-time solve) stays in the
+denominator. `compute_tte_npde` returns the simulator's warning for it once per warning
+code, with the number raised over the replicates. A fit keeps only the failed solves
+(`W_TTE_SOLVE_FAILED`, worded as reference replicates): a replicate that never has an
+event is what a cure-fraction hazard draws, and is not reported on the fit.
+
+The R package is a reference for less than it looks. It has no time-to-event mode; it
+is fed `−T`, with right censoring as left censoring. That is exact for event rows and
+for **one common censoring time**: with per-subject censoring times the package applies
+one limit, the smallest censored value, to every subject. So the committed R reference
+(`tests/fixtures/npde_tte_reference/`) censors administratively at a single time, and
+per-subject censoring rests on the closed-form row and the KS row above. R scores `−T`,
+so its sign is the opposite of the one here. The numbers are statistics of seeded
+simulations on macOS arm64, not fit results. Tests: `src/stats/npde_tte_tests.rs`,
+`tests/npde_tte_fit.rs`.
 
 ## Kaplan–Meier VPC {#km-vpc}
 
@@ -1100,6 +1170,43 @@ fit, exactly, and the absolute curves of orders 1 to 3 and the gap curves of ord
 within 1.1e-16. survfit cannot express two events at one time in one subject, so that case is
 pinned by its exact closed form instead.
 
+| Reference | Fixture | Agreement |
+|---|---|---|
+| `survival::survfit` 3.8.12 | `tests/fixtures/rtte_survfit` (80 subjects, 2 strata) | MCF exact; absolute orders 1–3 and gap orders 2–3 within 1.1e-16 (`tests/rtte_survfit_reference.rs`) |
+| `reda::mcf` 0.5.6 | the same fixture | MCF within 4.4e-16, with `numRisk` equal to ferx's at-risk count on all 40 rows |
+| `reda::mcf` 0.5.6 | `r2()` in `src/stats/km_tests.rs`, also used by `vpc_rtte_tests.rs` T7: two events at time 5 in one subject, the layout survfit refuses | `MCF(5) = 37/30` and `MCF(8) = 19/10` exactly, the closed form ferx is pinned to |
+
+reda refuses an event at a subject's follow-up end `cᵢ` (19 subjects in the survfit fixture, 2
+of the 6 in `r2()`), so for reda each such subject gets a censoring appended at `cᵢ + ε`. The
+two layouts give the same MCF: for `t ≤ cᵢ` the subject is at risk under both, and on
+`(cᵢ, cᵢ + ε]` it is at risk only under reda's, but every time in both fixtures is a whole
+number and `ε < 1`, so no event falls in that interval. The extra rows reda reports at the
+`cᵢ + ε` are dropped by matching on ferx's times; `ε = 0.5` and `ε = 1e-9` give identical
+results on both fixtures. reda also refuses a censoring
+that is not a subject's last record when an event follows it. ferx accepts that layout, so it
+is not compared. Neither reda comparison is a committed test.
+
+**`vpc::vpc_tte(rtte = TRUE)` is not a reference.** Its Kaplan–Meier step is survfit itself;
+what differs is which rows it builds for "order `k`", and in vpc 1.2.4 (and master 1.3.6 as
+of 2026-11-14) none of its modes is ferx's curve. In the default gap mode
+(`rtte_calc_diff = TRUE`) its gaps are the intervals between consecutive records, the closing
+censored interval included, and it sorts each subject's intervals by length before numbering
+them, so its "order `k`" is the `k`-th *shortest* interval, not the gap before the `k`-th
+event ([ronkeizer/vpc#127](https://github.com/ronkeizer/vpc/issues/127)). On the fixture
+above its orders 2 and 3 differ from ferx's gap curves by up to 0.22 in S, and its order 1
+from ferx's absolute order 1 by up to 0.25. The two other modes fail unless the data have a
+column named `t` ([ronkeizer/vpc#128](https://github.com/ronkeizer/vpc/issues/128)). With
+`rtte_calc_diff = FALSE` order `k` keeps only the subjects with at least `k` records: a
+subject with fewer events drops out instead of being censored at its follow-up end, and so
+does one with exactly `k − 1` events whose last record is an event (up to 0.34 at orders 2
+and 3). With `rtte_conditional = FALSE` one subject enters the risk set up to `k` times, so
+the curve is not a Kaplan–Meier estimate of the time to the `k`-th event. That construction
+reproduces vpc's curves exactly for stratum A of the fixture (7 orders), but not for stratum B
+(12 orders): stratified, B is off by 0.69 even at order 1, while B run alone matches at order 1
+exactly. That cause is not traced; labels with two-digit orders are suspected. A VPC drawn by
+vpc's own RTTE mode will therefore not overlay `vpc_rtte()`'s curves. Every difference that is
+traced is in vpc's row construction, not in either Kaplan–Meier step.
+
 The bands are checked for self-consistency in `tests/vpc_rtte_self_consistency.rs`. 200
 datasets are drawn outside the simulator from a Poisson process with between-subject
 variability, about 80 % of subjects leaving before `H`, and each gets a 200-replicate VPC. The
@@ -1254,7 +1361,10 @@ censoring overstates survival. Rather than let these look like ordinary censorin
 `simulate_with_options_diag` API returns a `SimulationOutput { results, warnings }` naming
 the affected subjects (`W_TTE_DEGENERATE_HAZARD` / `W_RTTE_DEGENERATE` /
 `W_TTE_SOLVE_FAILED`); `ferx … --simulate`
-echoes them alongside the fit warnings. The plain `simulate()` / `simulate_with_seed()` /
+echoes them alongside the fit warnings. `W_TTE_DEGENERATE_HAZARD` is one line per subject
+and CMT for the whole run, in population order: it gives the number of replicates in which
+the subject ended censored because of the degenerate draw and names them (`sim` indices, or
+the uncertainty draws under `simulate_with_uncertainty_diag`). The plain `simulate()` / `simulate_with_seed()` /
 `simulate_with_options()` entry points apply the same per-subject handling but return only
 the rows.
 :::

@@ -288,8 +288,9 @@ fn mcf_matches_closed_form_and_keeps_subjects_at_risk_after_an_event() {
 }
 
 /// PR2 T2. Two events at one time in one subject both count: `n_event(5) = 2`,
-/// `MCF(5) = 37/30` and `MCF(8) = 19/10` (exact closed form; survfit refuses
-/// `stop == start`). Deduplicating event times gives `n_event(5) = 1` and 31/30.
+/// `MCF(5) = 37/30` and `MCF(8) = 19/10` (exact closed form, and equals
+/// `reda::mcf` 0.5.6; survfit refuses `stop == start`). Deduplicating event times
+/// gives `n_event(5) = 1` and 31/30.
 #[test]
 fn mcf_counts_two_events_at_one_time_in_one_subject() {
     let (events, ends) = pooled(&r2());

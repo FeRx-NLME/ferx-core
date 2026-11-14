@@ -79,6 +79,8 @@ pub use adaptive::{
 pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UnmatchedSubjects};
 pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
+#[cfg(feature = "survival")]
+pub(crate) use entry_refusals::npde_tte_input;
 pub(crate) use entry_refusals::{
     adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
     fit_input_model, level_mixed_with_iov_rule, logit_theta_out_of_range, param_shape,
@@ -482,6 +484,9 @@ mod ctmm_time_dependent_pk_tests;
 #[path = "tests/entry_point_errors_tests.rs"]
 mod entry_point_errors_tests;
 // #1774: the codes of the predict / simulate / adaptive refusals `ferx check` cannot reach.
+#[cfg(all(test, feature = "survival"))]
+#[path = "tests/degenerate_hazard_once_tests.rs"]
+mod degenerate_hazard_once_tests;
 #[cfg(test)]
 #[path = "tests/entry_refusal_codes_tests.rs"]
 mod entry_refusal_codes_tests;
