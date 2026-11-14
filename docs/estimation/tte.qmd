@@ -1116,10 +1116,14 @@ that is not a subject's last record when an event follows it. ferx accepts that 
 is not compared. Neither reda comparison is a committed test.
 
 **`vpc::vpc_tte(rtte = TRUE)` is not a reference.** Its Kaplan–Meier step is survfit itself;
-what differs is which rows it builds for "order `k`", and in vpc 1.2.4 none of its modes is
-ferx's curve. In the default gap mode (`rtte_calc_diff = TRUE`) it sorts each subject's gaps
-by length after computing them, so its "order `k`" is the `k`-th *shortest* gap, not the gap
-before the `k`-th event (up to 0.14 in S on the fixture above). With
+what differs is which rows it builds for "order `k`", and in vpc 1.2.4 (and master 1.3.6 as
+of 2026-11-14) none of its modes is ferx's curve. In the default gap mode
+(`rtte_calc_diff = TRUE`) it sorts each subject's gaps by length after computing them, so its
+"order `k`" is the `k`-th *shortest* gap, not the gap before the `k`-th event (up to 0.14 in S
+on the fixture above; reported as
+[ronkeizer/vpc#127](https://github.com/ronkeizer/vpc/issues/127)). The two other modes fail
+unless the data have a column named `t`
+([ronkeizer/vpc#128](https://github.com/ronkeizer/vpc/issues/128)). With
 `rtte_calc_diff = FALSE` order `k` is conditional on reaching `k − 1` events: subjects with
 fewer drop out instead of being censored at their follow-up end (up to 0.34 at orders 2 and
 3). With `rtte_conditional = FALSE` one subject enters the risk set up to `k` times, so the
