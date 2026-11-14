@@ -35,6 +35,8 @@ $OMEGA
 $SIGMA
   0.0025
 
-$ESTIMATION METHOD=1 INTERACTION MAXEVAL=0 POSTHOC PRINT=1 NOABORT
+; FO evaluation without POSTHOC: PRED (eta = 0) is the anchored quantity, and the DV = 0
+; placeholder rows made the FOCEI posterior search stop (non-positive-definite Hessian).
+$ESTIMATION METHOD=0 MAXEVAL=0 PRINT=1 NOABORT
 $TABLE ID TIME WT LG DV PRED IPRED ONEHEADER NOPRINT FORMAT=s1PE23.16
        FILE=ss_first_order_lag.tab
