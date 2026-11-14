@@ -2417,6 +2417,20 @@ impl DegenerateHazardTally {
         }
     }
 
+    /// Fold in the tally of a later run of the same population and parameter set whose
+    /// replicates continue this one's, so `sim` 0 of `later` is replicate `sim_offset` of
+    /// the whole. `compute_tte_npde` simulates its reference replicates in batches and
+    /// reports each (subject, CMT) once over all of them, not once per batch.
+    pub(crate) fn absorb(&mut self, later: DegenerateHazardTally, sim_offset: usize) {
+        self.replicates += later.replicates;
+        self.draws = self.draws.max(later.draws);
+        for (position, cmt, id, at) in later.hits {
+            for (draw, sim) in at {
+                self.record(position, &id, cmt, draw, sim + sim_offset);
+            }
+        }
+    }
+
     /// One line per (subject, CMT) for a run of one parameter set, naming the affected
     /// replicates by their `sim` index.
     pub(crate) fn warnings_by_replicate(&self) -> Vec<String> {
