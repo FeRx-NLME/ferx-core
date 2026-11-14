@@ -398,6 +398,43 @@ than parsing prose. The exit code is `0` when no errors are found, `1` when
 there are errors. See the [check report reference](file-formats/check-report.qmd)
 for the JSON schema and the full code table.
 
+## How do I evaluate the OFV at given parameter values? {#evaluate-ofv}
+
+Put the values in `[parameters]` as the initial estimates and set
+`maxiter = 0` in `[fit_options]` (NONMEM's `MAXEVAL=0`; from R,
+`settings = list(maxiter = 0)`):
+
+```
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+```
+
+No outer optimizer is built. What you get back:
+
+- **The objective at those values**, with each subject's EBEs solved once at
+  them, so the sdtab's `IPRED` is at those EBEs.
+- **`converged: false`, by design.** Nothing was optimised, so the fit is never
+  marked converged. That does not mean the evaluation failed.
+- **The starts clamped into bounds.** A free parameter that starts outside its
+  bounds is evaluated at the bound: `theta TVE0(30, -20, 20)` is scored at `20`,
+  and a free `omega ~ 0.0` at `exp(-12)` ≈ `6.1e-6`. To evaluate exactly the
+  value you wrote, `FIX` it: `theta TVE0(30, -20, 20) FIX` is scored at `30`.
+  The `theta` case is reported: a `W_THETA_INIT_OUTSIDE_BOUNDS` warning names
+  the declared start and the value scored. The `omega` case is not.
+- **Standard errors only where they mean something.** `covariance = true` (the
+  default) still runs the covariance step, which is what you want at a known
+  optimum. At any other point the curvature is not that of an optimum, so set
+  `covariance = false` there.
+
+The reported OFV follows ferx's conventions (no `N·log 2π`, natural scale), so
+compare it with NONMEM's `OBJECTIVE FUNCTION VALUE WITHOUT CONSTANT`, or see
+[OFV conventions across tools](model-file/error-model.qmd#ofv-conventions).
+`maxiter` counts objective evaluations rather than outer iterations for some
+optimizers ([#1430](https://github.com/FeRx-NLME/ferx-core/issues/1430)), but `0`
+means evaluation-only for all of them.
+
 ## How do I exclude records or subjects, like NONMEM's `$DATA IGNORE=`?
 
 Use the `[data_selection]` block:

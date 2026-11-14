@@ -533,6 +533,11 @@ pub struct AdaptiveSubjectMetrics {
     /// on, not simulated: across replicates it varies by κ and a `Dv` monitor's assay
     /// only (adaptive trajectories carry no residual error).
     pub eta_supplied: bool,
+    /// Whether this run's dose expressions read the subject's **drawn** individual
+    /// parameters, random effects or mixture class (`dose_knowledge = oracle`, #944): a
+    /// perfect-information dose that no prescriber could compute. `false` for a supplied
+    /// subject, whose values are known input, and whenever no dose expression reads one.
+    pub dose_oracle: bool,
 }
 
 /// `true` if any logged decision is a `Stop` that *also* issued a dose — the
@@ -668,6 +673,7 @@ pub(crate) fn compute_subject_metrics(
         auc_target_attainment,
         // The caller knows where the η came from; the ledger does not.
         eta_supplied: false,
+        dose_oracle: false,
     }
 }
 
@@ -778,15 +784,41 @@ pub(crate) fn kappa_standard_normal(base_seed: u64, occasion: usize, component: 
 /// folded with the subject's `ruv_scale`) and the per-(subject, replicate) base
 /// seed that keys the controller-assay substream.
 ///
-/// `resid_var(cmt, ipred)` returns `Some(variance)` for a compartment that has a
-/// residual error model and `None` when none is defined — the driver turns the
-/// `None` into a typed error rather than fabricating a σ (S1.5 edge a).
+/// `resid_var(row)` returns `Ok(Some(variance))` for a compartment that has a
+/// residual error model and `Ok(None)` when none is defined — the driver turns the
+/// `None` into a typed error rather than fabricating a σ (S1.5 edge a). `Err` is a
+/// residual-error magnitude that is not positive and finite at the decision (#2741),
+/// worded for the user; the driver adds the decision and the monitor.
 pub(crate) struct AssayNoise<'a> {
-    /// `(cmt, ipred) -> Some(residual variance incl. ruv_scale)`, or `None` when
-    /// no residual error model covers `cmt`.
-    pub resid_var: &'a dyn Fn(usize, f64) -> Option<f64>,
+    /// `row -> Ok(Some(residual variance incl. ruv_scale and any magnitude))`,
+    /// `Ok(None)` when no residual error model covers `row.cmt`, `Err` on a
+    /// magnitude that is not positive and finite.
+    pub resid_var: &'a dyn Fn(&AssayRow) -> Result<Option<f64>, String>,
+    /// Whether the variance reads `TAD` (an `[error_model]` magnitude that names it).
+    /// The driver computes [`AssayRow::tad`] only then, as `tad_for` does for a data row.
+    pub needs_tad: bool,
     /// Per-(subject, replicate) base seed; see [`subject_assay_base_seed`].
     pub base_seed: u64,
+}
+
+/// One `Dv` reading as the assay's residual variance sees it (#2741): what
+/// `simulate()` reads from an observation row, read at a decision instead. A
+/// residual-error magnitude is a function of `(θ, covariates, TIME, TAD)`, so this
+/// is all it needs; θ is the resolver's own.
+pub(crate) struct AssayRow<'a> {
+    /// The monitored compartment: the endpoint key of a `CMT=N:` block.
+    pub cmt: usize,
+    /// The latent reading the noise is drawn around.
+    pub ipred: f64,
+    /// The `TIME` as written at the decision (`Subject::param_time_at`), the same
+    /// value the monitor's readout reads.
+    pub time: f64,
+    /// Time after dose at the decision on the causal record: the base regimen plus
+    /// the controller doses realized before the reading. `0.0` when
+    /// [`AssayNoise::needs_tad`] is false.
+    pub tad: f64,
+    /// The covariate row in force at the decision.
+    pub cov: &'a HashMap<String, f64>,
 }
 
 // ── Declarative `[adaptive_dosing]` block (#391 S2) ─────────────────────────
@@ -863,6 +895,18 @@ pub struct AdaptiveDosingSpec {
     /// one level; mutually exclusive with percentage steps. Each rung is a number
     /// or a per-subject expression, like `start_dose` (#944).
     pub levels: Option<Vec<DoseValue>>,
+    /// The dose grid step (`round_to`, #944): when set, every dose the controller
+    /// sets — the start dose and each percentage step — is rounded to the nearest
+    /// multiple of it (ties up), then clamped to the multiples inside `dose_bounds`,
+    /// and that rounded dose is carried to the next decision. A finite number `> 0`;
+    /// never combined with `levels`, which is already discrete.
+    pub round_to: Option<f64>,
+    /// What a dose expression may know about the subject (#944): with
+    /// [`DoseKnowledge::Known`] (the default) it may read a subject's individual
+    /// parameters and random effects only when that subject's η are supplied
+    /// (`AdaptiveInputs::with_etas`); with [`DoseKnowledge::Oracle`] it may also read
+    /// the values the simulation draws, and each subject dosed from them is flagged.
+    pub dose_knowledge: DoseKnowledge,
     /// Optional therapeutic target band `[low, high]` (inclusive) for the
     /// monitored signal. It feeds **only** the `pct_time_in_window` outcome metric
     /// (#391 S2.4) — it never influences dosing (the `when` rules do). `high` may
@@ -913,6 +957,30 @@ pub enum DoseValue {
     Literal(f64),
     /// An expression, evaluated per subject.
     Expr(String),
+}
+
+/// What an `[adaptive_dosing]` dose expression may know about a subject
+/// (`dose_knowledge`, #944).
+///
+/// A dose expression may always read θ and data covariates. A subject's individual
+/// parameters, random effects and mixture class are known at dosing time only when
+/// they come from input — η supplied from a previous fit — not when the simulation
+/// draws them.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DoseKnowledge {
+    /// `dose_knowledge = known` (the default): a dose expression reads a subject's
+    /// individual parameters only when its η are supplied; a run with a drawn subject
+    /// is refused (`E_ADAPTIVE_DOSE_KNOWLEDGE`).
+    #[default]
+    Known,
+    /// `dose_knowledge = oracle`: a drawn subject's dose expressions read its drawn η
+    /// and first-occasion κ — a perfect-information comparison arm. Each such subject
+    /// has [`AdaptiveSubjectMetrics::dose_oracle`] set, and the run warns
+    /// (`W_ADAPTIVE_DOSE_ORACLE`).
+    Oracle,
 }
 
 impl From<f64> for DoseValue {
@@ -986,10 +1054,185 @@ pub(crate) enum DosePlanViolation {
     StartNotALevel,
     /// The first rung outside the bounds: its index in `levels` and its value.
     LevelOutsideBounds(usize, f64),
+    /// `round_to` is set and no multiple of it lies within `dose_bounds` (V7).
+    NoGridPoint,
+    /// `round_to` is set, the rules take percentage steps, and the lower bound aligns
+    /// to 0 on the grid, so a dose can round to 0 and never rise again (V8).
+    StuckAtZero,
 }
 
-/// The first dose invariant `plan` breaks, if any.
-pub(crate) fn dose_plan_violation(plan: &SubjectDosePlan) -> Option<DosePlanViolation> {
+/// The relative tolerance of the dose grid (#944), the one `check_intervals_on_every_grid`
+/// and the driver's due test use: `x / s` is rarely exact (`0.3 / 0.1` is
+/// `2.9999999999999996`), so a quotient this close to an integer counts as that integer.
+const GRID_SNAP: f64 = 1e-9;
+
+/// `q` as an integer when it lies within [`GRID_SNAP`] (relative, at least absolute) of one.
+fn snapped_integer(q: f64) -> Option<f64> {
+    let r = q.round();
+    ((q - r).abs() <= GRID_SNAP * r.abs().max(1.0)).then_some(r)
+}
+
+/// The grid indices of the lowest and highest multiples of `s` inside `[lo, hi]`:
+/// `ceil(lo / s)` and `floor(hi / s)`, each after snapping a quotient within
+/// [`GRID_SNAP`] of an integer onto it, so `0.3 / 0.1` floors to 3, not 2 (#944 audit 1
+/// row 12). The interval holds no multiple when the first exceeds the second.
+///
+/// A positive low never snaps to index 0: 0 is not inside `[lo, hi]`, however small
+/// `lo / s` is, so the lowest multiple is at least one step (`lo = 1e-6` at `s = 1000`
+/// aligns to 1000; #2805 review r1 row 1). Only a low of exactly 0 has index 0.
+fn grid_index_bounds(lo: f64, hi: f64, s: f64) -> (f64, f64) {
+    let (ql, qh) = (lo / s, hi / s);
+    let kl = snapped_integer(ql).unwrap_or_else(|| ql.ceil());
+    (
+        if lo > 0.0 { kl.max(1.0) } else { kl },
+        snapped_integer(qh).unwrap_or_else(|| qh.floor()),
+    )
+}
+
+/// `x` rounded to the nearest multiple of `s`, ties up (#944). A tie sits at
+/// `k + 0.5`, which an integer snap never touches, and `x / s` misses it by an ulp
+/// either way (`0.35 / 0.1` is `3.4999999999999996`), so the half is nudged up by
+/// [`GRID_SNAP`] (relative) before the floor (#944 audit 1 row 12): plain
+/// `f64::round` sends such ties down.
+pub(crate) fn round_to_grid(x: f64, s: f64) -> f64 {
+    let q = x / s;
+    grid_point((q + 0.5 + GRID_SNAP * q.abs().max(1.0)).floor(), s)
+}
+
+/// The `k`-th multiple of `s`. For a step that divides 1 (`0.1`, `0.25`, `0.5`, … —
+/// `1 / s` within [`GRID_SNAP`] of an integer `n >= 2`) it is `k / n`, the correctly
+/// rounded decimal, where `k * s` carries the step's own representation error into
+/// the ledger (`7 * 0.1` is `0.7000000000000001`, `7 / 10` is `0.7`; #2805 review r1
+/// row 7). Any other step, every integer step included, is `k * s`, bit for bit as
+/// before; a step such as `0.3` keeps that ulp noise.
+fn grid_point(k: f64, s: f64) -> f64 {
+    match snapped_integer(1.0 / s) {
+        Some(n) if n >= 2.0 => k / n,
+        _ => k * s,
+    }
+}
+
+/// The dose grid of one subject (#944): the step and the grid-aligned bounds
+/// `[ceil(lo/s)·s, floor(hi/s)·s]`, each kept inside the written `[lo, hi]` — `k · s`
+/// can miss a bound on the grid by an ulp (`3 · 0.1` is `0.30000000000000004`, above a
+/// high of `0.3`), so the clamp is what keeps a dose inside `dose_bounds`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct DoseGrid {
+    pub step: f64,
+    pub low: f64,
+    pub high: f64,
+}
+
+impl DoseGrid {
+    /// `None` when no multiple of `step` lies within the bounds (V7, refused before any
+    /// subject runs).
+    pub(crate) fn new(step: f64, (lo, hi): (f64, f64)) -> Option<Self> {
+        let (kl, kh) = grid_index_bounds(lo, hi, step);
+        if kl > kh {
+            return None;
+        }
+        // Each multiple kept inside `[lo, hi]`: a snapped multiple can miss its bound by an
+        // ulp either way. The clamp is monotone and `kl <= kh`, so `low <= high`.
+        let low = grid_point(kl, step).clamp(lo, hi);
+        let high = grid_point(kh, step).clamp(lo, hi);
+        Some(Self { step, low, high })
+    }
+
+    /// `x` on the grid: rounded to the nearest multiple (ties up), **then** clamped to
+    /// the aligned bounds. The order matters: with `hi = 1150, s = 250`, clamping first
+    /// gives 1150, which rounds to 1250, above the bound; rounding first gives 1250,
+    /// which clamps to 1000.
+    pub(crate) fn place(&self, x: f64) -> f64 {
+        round_to_grid(x, self.step).clamp(self.low, self.high)
+    }
+
+    /// The dose one `p%` step from `d` lands on. The controller's step and the
+    /// absorbed-step check (#2810) both call this, so the check cannot disagree with
+    /// the engine on a tie.
+    pub(crate) fn step_percent(&self, d: f64, p: f64, up: bool) -> f64 {
+        self.place(percent_step(d, p, up))
+    }
+
+    /// The lowest multiple of the step that `increase p%` raises, on a grid with no
+    /// upper bound (#2810): every multiple below it is absorbed. `None` when the step
+    /// raises no finite multiple up to index 2^52.
+    ///
+    /// Found by bisection on [`Self::step_percent`] itself, not from `50 / p`: the tie
+    /// nudge in `round_to_grid` is relative, so for a small percentage the engine raises
+    /// a dose somewhat below `50 * step / p` (#2890 review r1 rows 1 and 2), and `50 / p`
+    /// is infinite for a percentage near the smallest `f64`.
+    pub(crate) fn lowest_raised_by(step: f64, p: f64) -> Option<f64> {
+        const MAX_INDEX: f64 = 4_503_599_627_370_496.0; // 2^52
+        let open = Self {
+            step,
+            low: 0.0,
+            high: f64::INFINITY,
+        };
+        let raised = |k: f64| {
+            let d = grid_point(k, step);
+            d.is_finite() && open.step_percent(d, p, true) > d
+        };
+        // The first power of two that is raised, then the first index between it and
+        // the power before it.
+        let mut hi = 1.0;
+        while !raised(hi) {
+            hi *= 2.0;
+            if hi > MAX_INDEX {
+                return None;
+            }
+        }
+        let mut lo = hi / 2.0;
+        while hi - lo > 1.0 {
+            let mid = ((lo + hi) / 2.0).floor();
+            if raised(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(grid_point(hi, step))
+    }
+}
+
+/// `d` after one `p%` step, before any rounding or clamp.
+pub(crate) fn percent_step(d: f64, p: f64, up: bool) -> f64 {
+    let factor = if up { 1.0 + p / 100.0 } else { 1.0 - p / 100.0 };
+    d * factor
+}
+
+/// A dose the smallest `increase N%` cannot raise on the dose grid (#2810): the step
+/// rounds back to the same dose at every decision where that rule fires.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum AbsorbedIncrease {
+    /// The start dose, as placed on the grid.
+    FromStart(f64),
+    /// The start dose can rise, but the lowest dose the decrease rules bring it to
+    /// cannot.
+    OnceSteppedDown(f64),
+}
+
+impl AbsorbedIncrease {
+    pub(crate) fn dose(self) -> f64 {
+        match self {
+            Self::FromStart(d) | Self::OnceSteppedDown(d) => d,
+        }
+    }
+}
+
+/// P4 (#944): `round_to` together with a `levels` ladder.
+pub(crate) const ROUND_TO_WITH_LEVELS: &str = "[adaptive_dosing]: round_to cannot be combined \
+     with levels: a levels ladder is already discrete, so write the rounded doses as the levels";
+
+/// P3 (#944): the text for a `round_to` that is not a finite number `> 0`, as written.
+pub(crate) fn round_to_message(val: &str) -> String {
+    format!("[adaptive_dosing]: round_to must be a finite number > 0: {val}")
+}
+
+/// The first dose invariant `plan` breaks, if any, under `spec`'s `round_to` and rules.
+pub(crate) fn dose_plan_violation(
+    spec: &AdaptiveDosingSpec,
+    plan: &SubjectDosePlan,
+) -> Option<DosePlanViolation> {
     let levels: Option<Vec<Option<f64>>> = plan
         .levels
         .as_ref()
@@ -999,6 +1242,7 @@ pub(crate) fn dose_plan_violation(plan: &SubjectDosePlan) -> Option<DosePlanViol
         Some(plan.dose_bounds.0),
         Some(plan.dose_bounds.1),
         levels.as_deref(),
+        spec.grid_rule(),
     )
 }
 
@@ -1014,6 +1258,7 @@ fn known_dose_violation(
     lo: Option<f64>,
     hi: Option<f64>,
     levels: Option<&[Option<f64>]>,
+    grid: Option<GridRule>,
 ) -> Option<DosePlanViolation> {
     // `low >= 0` and `low <= high` make a negative `high` invalid on its own.
     let bad = |x: Option<f64>| x.is_some_and(|x| !x.is_finite() || x < 0.0);
@@ -1063,7 +1308,33 @@ fn known_dose_violation(
             return Some(DosePlanViolation::LevelOutsideBounds(i, bad));
         }
     }
+    // The dose grid (`round_to`, #944), after every check above, so a block that breaks
+    // one of those names the same invariant it did before. No multiple within the
+    // bounds needs both of them (V7); a lower bound that aligns to 0 needs only the low
+    // one (V8), so a literal low is refused when the block is parsed even when the high
+    // is an expression.
+    if let Some(g) = grid {
+        if let (Some(l), Some(h)) = (lo, hi) {
+            if DoseGrid::new(g.step, (l, h)).is_none() {
+                return Some(DosePlanViolation::NoGridPoint);
+            }
+        }
+        if let Some(l) = lo {
+            if g.percent_steps && grid_index_bounds(l, l, g.step).0 == 0.0 {
+                return Some(DosePlanViolation::StuckAtZero);
+            }
+        }
+    }
     None
+}
+
+/// What the dose-grid checks (V7, V8) need from a spec with `round_to` (#944): the step,
+/// and whether a rule takes a percentage step — from a running dose of 0 only those
+/// can never climb again.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GridRule {
+    step: f64,
+    percent_steps: bool,
 }
 
 impl DosePlanViolation {
@@ -1127,21 +1398,40 @@ impl DosePlanViolation {
             DosePlanViolation::LevelOutsideBounds(_, bad) => {
                 format!("[adaptive_dosing]: level {bad} is outside dose_bounds [{lo}, {hi}]")
             }
+            DosePlanViolation::NoGridPoint => format!(
+                "[adaptive_dosing]: no multiple of round_to = {} lies within dose_bounds \
+                 [{lo}, {hi}]",
+                spec.round_to.unwrap_or(f64::NAN)
+            ),
+            DosePlanViolation::StuckAtZero => {
+                let s = spec.round_to.unwrap_or(f64::NAN);
+                format!(
+                    "[adaptive_dosing]: with round_to = {s}, dose_bounds low = {lo} lets a dose \
+                     round to 0, and a running dose of 0 cannot rise again under percentage \
+                     steps; set the lower bound above 0 (any value up to {s} raises it to {s})"
+                )
+            }
         }
     }
 
-    /// The per-subject text (#944): the subject, each value involved as written and as
-    /// evaluated, and — when the expressions read any — the covariate values they read.
+    /// The per-subject text (#944): the subject (and, for an oracle subject, the
+    /// replicate whose drawn values it read), each value involved as written and as
+    /// evaluated, and — when the expressions read any — the covariate and subject values
+    /// they read.
     pub(crate) fn subject_message(
         &self,
         spec: &AdaptiveDosingSpec,
         plan: &SubjectDosePlan,
         subject_id: &str,
+        replicate: Option<usize>,
         reads: &[(String, f64)],
     ) -> String {
         let (lo, hi) = plan.dose_bounds;
         let d = plan.start_dose;
-        let head = format!("[adaptive_dosing] subject {subject_id}:");
+        let head = match replicate {
+            None => format!("[adaptive_dosing] subject {subject_id}:"),
+            Some(k) => format!("[adaptive_dosing] subject {subject_id}, replicate {k}:"),
+        };
         let start = spec.start_dose.source();
         let bounds = format!(
             "[{}, {}]",
@@ -1185,6 +1475,20 @@ impl DosePlanViolation {
                     .get(*i)
                     .map_or_else(|| bad.to_string(), DoseValue::source)
             ),
+            DosePlanViolation::NoGridPoint => format!(
+                "no multiple of round_to = {} lies within dose_bounds = {bounds}, which \
+                 evaluate to [{lo}, {hi}].",
+                spec.round_to.unwrap_or(f64::NAN)
+            ),
+            DosePlanViolation::StuckAtZero => {
+                let s = spec.round_to.unwrap_or(f64::NAN);
+                format!(
+                    "with round_to = {s}, dose_bounds = {bounds} evaluate to [{lo}, {hi}]: a \
+                     low of {lo} lets a dose round to 0, and a running dose of 0 cannot rise \
+                     again under percentage steps; set the lower bound above 0 (any value up \
+                     to {s} raises it to {s})."
+                )
+            }
         };
         if reads.is_empty() {
             return format!("{head} {body}");
@@ -1241,6 +1545,91 @@ impl AdaptiveDosingSpec {
         })
     }
 
+    /// What the dose-grid checks need (#944): `None` without `round_to`, or with an
+    /// invalid one, which `validate` refuses first (P3).
+    pub(crate) fn grid_rule(&self) -> Option<GridRule> {
+        let step = self.round_to.filter(|s| s.is_finite() && *s > 0.0)?;
+        Some(GridRule {
+            step,
+            percent_steps: self.has_percent_steps(),
+        })
+    }
+
+    /// Whether a rule takes a percentage dose step (`increase N%` / `decrease N%`).
+    fn has_percent_steps(&self) -> bool {
+        self.rules.iter().any(|r| {
+            matches!(
+                r.action,
+                AdaptiveAction::Increase(DoseStep::Percent(_))
+                    | AdaptiveAction::Decrease(DoseStep::Percent(_))
+            )
+        })
+    }
+
+    /// The dose grid of a subject whose bounds evaluate to `bounds` (#944): `None`
+    /// without `round_to`. A plan that passed [`dose_plan_violation`] has one.
+    pub(crate) fn dose_grid(&self, bounds: (f64, f64)) -> Option<DoseGrid> {
+        DoseGrid::new(self.grid_rule()?.step, bounds)
+    }
+
+    /// The smallest `increase N%` among the rules, if any. `increase 0%` is not one:
+    /// it is written to keep the dose, so a dose it leaves unchanged is no surprise.
+    pub(crate) fn smallest_increase_percent(&self) -> Option<f64> {
+        self.rules
+            .iter()
+            .filter_map(|r| match r.action {
+                AdaptiveAction::Increase(DoseStep::Percent(p)) => Some(p),
+                _ => None,
+            })
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .reduce(f64::min)
+    }
+
+    /// The largest `decrease N%` among the rules, if any.
+    fn largest_decrease_percent(&self) -> Option<f64> {
+        self.rules
+            .iter()
+            .filter_map(|r| match r.action {
+                AdaptiveAction::Decrease(DoseStep::Percent(p)) => Some(p),
+                _ => None,
+            })
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .reduce(f64::max)
+    }
+
+    /// Whether the dose grid absorbs the smallest increase step at a dose this subject
+    /// can be at (#2810). `None` without `round_to`, without an `increase N%` rule, or
+    /// when the step moves every such dose.
+    ///
+    /// The doses a `p%` increase cannot raise are the lowest of the grid, since
+    /// `d * p / 100` grows with `d`. So the lowest dose the subject can reach decides:
+    /// the placed start dose when no decrease moves it, and otherwise the dose the
+    /// largest `decrease N%` brings it to when applied until it stops moving (a smaller
+    /// decrease never goes lower). The aligned low bound is not used: a decrease can be
+    /// absorbed above it, and then it is never reached. A dose at the aligned high bound
+    /// is not reported: an increase absorbed there is the bound, not the grid.
+    #[allow(clippy::float_cmp)] // grid doses: "unchanged" is the same multiple, bit for bit
+    pub(crate) fn absorbed_increase(&self, plan: &SubjectDosePlan) -> Option<AbsorbedIncrease> {
+        let grid = self.dose_grid(plan.dose_bounds)?;
+        let p = self.smallest_increase_percent()?;
+        let absorbed = |d: f64| d < grid.high && grid.step_percent(d, p, true) == d;
+        let start = grid.place(plan.start_dose);
+        if absorbed(start) {
+            return Some(AbsorbedIncrease::FromStart(start));
+        }
+        let q = self.largest_decrease_percent()?;
+        let mut floor = start;
+        loop {
+            let next = grid.step_percent(floor, q, false);
+            // Strictly lower each pass and never below the aligned low, so this ends.
+            if !(next < floor) {
+                break;
+            }
+            floor = next;
+        }
+        absorbed(floor).then_some(AbsorbedIncrease::OnceSteppedDown(floor))
+    }
+
     /// Every dose expression, with the key it is written under (#944).
     pub(crate) fn dose_expressions(&self) -> Vec<(&'static str, &str)> {
         let levels = self.levels.iter().flatten().map(|v| ("levels", v));
@@ -1288,6 +1677,7 @@ impl AdaptiveDosingSpec {
             self.dose_bounds.0.as_literal(),
             self.dose_bounds.1.as_literal(),
             levels.as_deref(),
+            self.grid_rule(),
         );
         let literal_err = |v: &DosePlanViolation| v.literal_message(self);
         if let Some(
@@ -1381,14 +1771,19 @@ impl AdaptiveDosingSpec {
             ),
         }
 
+        // The dose grid (`round_to`, #944): a finite step > 0 (P3), never with a `levels`
+        // ladder, which is already discrete (P4). Checked before the ladder, so a block
+        // with both is told this rather than a ladder or grid error.
+        if let Some(s) = self.round_to {
+            if !s.is_finite() || s <= 0.0 {
+                return Err(round_to_message(&s.to_string()));
+            }
+            if self.levels.is_some() {
+                return Err(ROUND_TO_WITH_LEVELS.to_string());
+            }
+        }
         // Percentage vs one-level dose steps are mutually exclusive and tied to `levels`.
-        let has_percent = self.rules.iter().any(|r| {
-            matches!(
-                r.action,
-                AdaptiveAction::Increase(DoseStep::Percent(_))
-                    | AdaptiveAction::Decrease(DoseStep::Percent(_))
-            )
-        });
+        let has_percent = self.has_percent_steps();
         let has_level = self.rules.iter().any(|r| {
             matches!(
                 r.action,
@@ -1425,6 +1820,13 @@ impl AdaptiveDosingSpec {
                                 a `levels = [...]` ladder; use `increase N%` for continuous titration"
                             .to_string(),
                     );
+                }
+                // V7 / V8 among the bounds written as numbers (#944); with an expression
+                // bound they run per subject (`resolve_dose_plans`).
+                if let Some(v @ (DosePlanViolation::NoGridPoint | DosePlanViolation::StuckAtZero)) =
+                    &violation
+                {
+                    return Err(literal_err(v));
                 }
             }
         }
@@ -1717,6 +2119,8 @@ mod tests {
             levels: None,
             target_window: None,
             auc_target: None,
+            round_to: None,
+            dose_knowledge: Default::default(),
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 10.0,
@@ -1726,6 +2130,455 @@ mod tests {
             intervals: None,
             start_interval: None,
         }
+    }
+
+    // ── round_to: the dose grid (#944 PR3) ─────────────────────────────────────────
+    //
+    // The closed forms are the ones audit 1 computed outside the engine (Python).
+
+    /// `0.35 / 0.1` is `3.4999999999999996`: a tie that plain `f64::round` sends down to
+    /// 0.3. The nudged half sends it up to 0.4 (#944 audit 1 row 12). `375` at `s = 250`
+    /// is an exact tie and also goes up, and a value just below a tie still goes down.
+    ///
+    /// Mutations: `(x / s).round() * s`; the nudge dropped. (A nudge made absolute differs
+    /// only at `|x / s| >~ 1e7`, which no dose grid here reaches; it is not pinned.)
+    #[test]
+    fn round_to_grid_sends_ties_up_on_a_decimal_grid() {
+        assert_eq!(
+            (0.35f64 / 0.1).round(),
+            3.0,
+            "premise: plain round sends it down"
+        );
+        assert!(
+            (round_to_grid(0.35, 0.1) - 0.4).abs() < 1e-12,
+            "{}",
+            round_to_grid(0.35, 0.1)
+        );
+        assert_eq!(round_to_grid(375.0, 250.0).to_bits(), 500.0f64.to_bits());
+        assert_eq!(round_to_grid(374.999, 250.0).to_bits(), 250.0f64.to_bits());
+        assert_eq!(round_to_grid(0.0, 250.0).to_bits(), 0.0f64.to_bits());
+    }
+
+    /// A step that divides 1 gives the decimal multiple, not `k * s`: `7 * 0.1` is
+    /// `0.7000000000000001`, but the grid dose for 0.7 at `s = 0.1` is `0.7` exactly, as
+    /// are `0.3` (`3 * 0.1 = 0.30000000000000004`) and the multiples of 0.25. An integer
+    /// step is `k * s` bit for bit, so integer grids (and D2) are unchanged (#2805 review
+    /// r1 row 7).
+    ///
+    /// Mutation: `grid_point` back to `k * s` (the decimal cases print ulp noise).
+    #[test]
+    fn a_step_dividing_one_gives_the_decimal_multiple() {
+        assert_eq!(7.0 * 0.1, 0.7000000000000001, "premise: k * s is noisy");
+        assert_eq!(round_to_grid(0.7, 0.1).to_bits(), 0.7f64.to_bits());
+        assert_eq!(round_to_grid(0.3, 0.1).to_bits(), 0.3f64.to_bits());
+        assert_eq!(round_to_grid(0.35, 0.1).to_bits(), 0.4f64.to_bits());
+        assert_eq!(round_to_grid(1.3, 0.25).to_bits(), 1.25f64.to_bits());
+        let g = DoseGrid::new(0.1, (0.05, 0.75)).expect("grid");
+        assert_eq!(
+            (g.low.to_bits(), g.high.to_bits()),
+            (0.1f64.to_bits(), 0.7f64.to_bits())
+        );
+        for (x, k) in [(1300.0, 5.0), (375.0, 2.0), (4000.0, 16.0)] {
+            assert_eq!(
+                round_to_grid(x, 250.0).to_bits(),
+                (k * 250.0f64).to_bits(),
+                "{x}"
+            );
+        }
+    }
+
+    /// `hi = 0.3, s = 0.1, x = 0.3 → 0.3`: `0.3 / 0.1` is `2.9999999999999996`, which a
+    /// bare `floor` takes to 2 (an aligned high of 0.2). The snap takes it to 3, and the
+    /// clamp keeps `3 · 0.1 = 0.30000000000000004` at the written 0.3. On the low side
+    /// `2.1 / 0.3` is `7.000000000000001`, which a bare `ceil` takes to 8; the snap
+    /// keeps it at 7. `[0.3, 0.3]` holds exactly one multiple, which a bare `floor`
+    /// would lose (V7 on a valid block).
+    ///
+    /// Mutations: a bare `floor` for the high bound; a bare `ceil` for the low bound; the
+    /// aligned bound not kept inside the written bounds.
+    #[test]
+    fn dose_grid_snaps_a_decimal_bound_onto_the_grid() {
+        let g = DoseGrid::new(0.1, (0.0, 0.3)).expect("0, 0.1, 0.2 and 0.3 lie inside");
+        assert_eq!(g.high.to_bits(), 0.3f64.to_bits(), "{g:?}");
+        assert_eq!(g.place(0.3).to_bits(), 0.3f64.to_bits(), "{g:?}");
+        assert!(
+            (2.1f64 / 0.3).ceil() == 8.0,
+            "premise: a bare ceil overshoots"
+        );
+        let g = DoseGrid::new(0.3, (2.1, 3.0)).expect("grid");
+        assert!((g.low - 2.1).abs() < 1e-12, "{g:?}");
+        let g = DoseGrid::new(0.1, (0.3, 0.3)).expect("0.3 is a multiple of 0.1");
+        assert_eq!(
+            (g.low.to_bits(), g.high.to_bits()),
+            (0.3f64.to_bits(), 0.3f64.to_bits())
+        );
+    }
+
+    /// `hi = 1150, s = 250`: round first (1150 → 1250), then clamp to the aligned 1000.
+    /// Clamp-then-round gives 1250, above the bound (#944 audit 1 row 13). Off the bounds
+    /// a non-aligned low is lifted to the next multiple: `lo = 1e-6` aligns to 250, so 100
+    /// (which rounds to 0) becomes 250 (row 14).
+    ///
+    /// Mutations: clamp then round; the aligned bounds replaced by the raw ones.
+    #[test]
+    fn dose_grid_rounds_then_clamps_to_the_aligned_bounds() {
+        let g = DoseGrid::new(250.0, (0.0, 1150.0)).expect("grid");
+        assert_eq!(g.high.to_bits(), 1000.0f64.to_bits(), "{g:?}");
+        assert_eq!(g.place(1150.0).to_bits(), 1000.0f64.to_bits());
+        let g = DoseGrid::new(250.0, (1e-6, 4000.0)).expect("grid");
+        assert_eq!(g.low.to_bits(), 250.0f64.to_bits(), "{g:?}");
+        assert_eq!(g.place(100.0).to_bits(), 250.0f64.to_bits());
+        assert!(
+            DoseGrid::new(250.0, (300.0, 400.0)).is_none(),
+            "no multiple in [300, 400]"
+        );
+        // A single grid point, with a low a hair above it (within the snap): the aligned
+        // bounds collapse onto the written low rather than crossing.
+        let lo = 250.0 * (1.0 + 1e-12);
+        let g = DoseGrid::new(250.0, (lo, 260.0)).expect("250 snaps in");
+        assert!(g.low <= g.high, "{g:?}");
+        assert_eq!(g.place(255.0).to_bits(), lo.to_bits(), "{g:?}");
+    }
+
+    fn gridded(round_to: f64, bounds: (f64, f64), start: f64) -> AdaptiveDosingSpec {
+        AdaptiveDosingSpec {
+            round_to: Some(round_to),
+            dose_bounds: (bounds.0.into(), bounds.1.into()),
+            start_dose: start.into(),
+            ..base_spec()
+        }
+    }
+
+    // ── #2810: the smallest increase step absorbed at a dose the subject can be at ──
+    //
+    // `s = 250` throughout, so every grid dose and every tie is an exact integer and the
+    // expected values are hand-computed.
+
+    /// `round_to = 250` with the rules `increase up%` (each of `ups`) and `decrease
+    /// down%` (each of `downs`).
+    fn stepped(bounds: (f64, f64), start: f64, ups: &[f64], downs: &[f64]) -> AdaptiveDosingSpec {
+        let rule = |op, action| AdaptiveRule {
+            op,
+            threshold: 10.0,
+            action,
+            interval: None,
+        };
+        let mut s = gridded(250.0, bounds, start);
+        s.rules = ups
+            .iter()
+            .map(|&p| {
+                rule(
+                    Comparison::Lt,
+                    AdaptiveAction::Increase(DoseStep::Percent(p)),
+                )
+            })
+            .chain(downs.iter().map(|&q| {
+                rule(
+                    Comparison::Gt,
+                    AdaptiveAction::Decrease(DoseStep::Percent(q)),
+                )
+            }))
+            .collect();
+        s
+    }
+
+    fn absorbed(spec: &AdaptiveDosingSpec) -> Option<AbsorbedIncrease> {
+        spec.absorbed_increase(&spec.literal_dose_plan().expect("a block of numbers"))
+    }
+
+    /// The threshold, both sides in one test: from 500, `increase 25%` changes the dose
+    /// by exactly half a step (625, a tie, which goes up to 750), so it is not absorbed;
+    /// `increase 24.99%` changes it by just under half (624.95, back to 500), so it is.
+    /// The straddle itself is asserted, so the pair cannot become two cases on one side.
+    ///
+    /// Mutations: ties sent down (`f64::round` on `x / s`, or `>` for `>=`) reddens the
+    /// 25% half; a check of `d * p / 100 < s` (a whole step) reddens it too; a check that
+    /// never fires reddens the 24.99% half.
+    #[test]
+    fn an_increase_just_below_half_a_step_is_absorbed_and_one_at_half_is_not() {
+        let half: f64 = 250.0 / 2.0;
+        let (at, below) = (25.0, 24.99);
+        assert_eq!(
+            (percent_step(500.0, at, true) - 500.0).to_bits(),
+            half.to_bits()
+        );
+        let short = percent_step(500.0, below, true) - 500.0;
+        assert!(short < half && short > half - 0.1, "{short}");
+
+        let bounds = (250.0, 4000.0);
+        assert_eq!(absorbed(&stepped(bounds, 500.0, &[at], &[])), None);
+        assert_eq!(
+            absorbed(&stepped(bounds, 500.0, &[below], &[])),
+            Some(AbsorbedIncrease::FromStart(500.0))
+        );
+    }
+
+    /// The two cases. Under `increase 10%` a dose rises only from 1250 up. A start dose
+    /// of 1000 is absorbed itself. A start dose of 1500 rises (1650 gives 1750), but
+    /// `decrease 25%` brings it down 1500, 1250, 1000, 750, 500 and stops there (375 is
+    /// a tie, back to 500), and 500 is absorbed. The floor is 500, not the aligned low
+    /// of 250, which no decrease reaches.
+    ///
+    /// Mutations: reporting the aligned low gives 250; checking only the start dose
+    /// gives `None` for 1500; skipping the start check reports 1000 as stepped down to
+    /// 500.
+    #[test]
+    fn the_start_dose_and_the_floor_of_the_decreases_are_told_apart() {
+        let bounds = (250.0, 4000.0);
+        assert_eq!(
+            absorbed(&stepped(bounds, 1000.0, &[10.0], &[25.0])),
+            Some(AbsorbedIncrease::FromStart(1000.0))
+        );
+        assert_eq!(
+            absorbed(&stepped(bounds, 1500.0, &[10.0], &[25.0])),
+            Some(AbsorbedIncrease::OnceSteppedDown(500.0))
+        );
+    }
+
+    /// A low bound the subject cannot reach does not warn, although `increase 25%` is
+    /// absorbed there (250 gives 312.5, back to 250; asserted, so the case is live).
+    /// Without a decrease rule the dose never leaves 500 downward; with `decrease 25%`
+    /// the decrease is absorbed at 500 first (375 is a tie). From 500 the increase moves.
+    ///
+    /// Mutations: the check on the aligned low reports 250 in both; the floor taken as
+    /// the low whenever a decrease rule exists reports it in the second.
+    #[test]
+    fn a_low_bound_no_decrease_reaches_is_not_reported() {
+        let bounds = (250.0, 4000.0);
+        let grid = DoseGrid::new(250.0, bounds).expect("grid");
+        assert_eq!(grid.low.to_bits(), 250.0f64.to_bits());
+        assert_eq!(
+            grid.step_percent(250.0, 25.0, true).to_bits(),
+            250.0f64.to_bits()
+        );
+        assert_eq!(absorbed(&stepped(bounds, 500.0, &[25.0], &[])), None);
+        assert_eq!(absorbed(&stepped(bounds, 500.0, &[25.0], &[25.0])), None);
+    }
+
+    /// A dose at the aligned high bound is not reported: 500 `increase 10%` stays 500
+    /// under bounds `[250, 500]` because of the bound. One grid point lower it is the
+    /// grid: with bounds `[250, 600]` (aligned high 500) a start dose of 300 is placed at
+    /// 250, where `increase 25%` is absorbed — the 20 kg subject of
+    /// `examples/adaptive_vanco_mgkg_rounded.ferx`.
+    ///
+    /// Mutations: dropping `d < high` reports the first; `d <= high - step` drops the
+    /// second.
+    #[test]
+    fn a_dose_at_the_high_bound_is_not_reported() {
+        assert_eq!(
+            absorbed(&stepped((250.0, 500.0), 500.0, &[10.0], &[])),
+            None
+        );
+        assert_eq!(
+            absorbed(&stepped((250.0, 600.0), 300.0, &[25.0], &[])),
+            Some(AbsorbedIncrease::FromStart(250.0))
+        );
+    }
+
+    /// Which rules are read. The smallest increase decides: with `increase 50%` and
+    /// `increase 10%`, 1000 is absorbed by the 10% rule; with 50% alone it is not. The
+    /// largest decrease sets the floor: with `decrease 5%` and `decrease 25%` the dose
+    /// comes down from 1500 to 500; with 5% alone it never leaves 1500 (1425 rounds back),
+    /// which the increase moves. `increase 0%` is not an increase step, and without
+    /// `round_to` there is no grid.
+    ///
+    /// Mutations: the largest increase, or the smallest decrease, each reddens its pair.
+    #[test]
+    fn the_smallest_increase_and_the_largest_decrease_are_the_ones_read() {
+        let bounds = (250.0, 4000.0);
+        assert_eq!(
+            absorbed(&stepped(bounds, 1000.0, &[50.0, 10.0], &[])),
+            Some(AbsorbedIncrease::FromStart(1000.0))
+        );
+        assert_eq!(absorbed(&stepped(bounds, 1000.0, &[50.0], &[])), None);
+        assert_eq!(
+            absorbed(&stepped(bounds, 1500.0, &[10.0], &[5.0, 25.0])),
+            Some(AbsorbedIncrease::OnceSteppedDown(500.0))
+        );
+        assert_eq!(absorbed(&stepped(bounds, 1500.0, &[10.0], &[5.0])), None);
+
+        assert_eq!(absorbed(&stepped(bounds, 500.0, &[0.0], &[])), None);
+        let mut no_grid = stepped(bounds, 1000.0, &[10.0], &[]);
+        no_grid.round_to = None;
+        assert_eq!(absorbed(&no_grid), None);
+    }
+
+    /// The lowest multiple an increase raises, by hand: at `s = 250`, 25% needs
+    /// `d >= 500`, 10% needs `d >= 1250`, 50% raises 250 itself (375 is a tie) and 49%
+    /// does not (372.5), so it starts at 500. On a decimal grid, `0.1` under 25%: 0.1
+    /// gives 0.125 (back to 0.1), 0.2 gives 0.25, a tie, up to 0.3.
+    ///
+    /// Small percentages (#2890 review r1 rows 1 and 2): the tie nudge is relative, so
+    /// the engine raises a dose below `50 * s / p`. At `s = 1` the reviewer's bisection
+    /// gave 16667 for 0.003%, 49996 for 0.001% (not 50000) and 45454546 for 1e-6% (not
+    /// 50000000). `1e-310%` must return: `50 / p` is infinite there.
+    ///
+    /// Each value is also checked against the engine: it is raised and the multiple
+    /// below it is not.
+    ///
+    /// Mutations: returning `50 * s / p` unrounded gives 510.2 for 49%; ties down gives
+    /// 750 for 25%; starting the search at `floor(50 / p)` gives 50000 for 0.001% and
+    /// does not return for 1e-310%.
+    #[test]
+    fn lowest_raised_by_is_the_first_multiple_the_step_moves() {
+        let open = |s: f64| DoseGrid {
+            step: s,
+            low: 0.0,
+            high: f64::INFINITY,
+        };
+        for (s, p, want) in [
+            (250.0, 25.0, Some(500.0)),
+            (250.0, 10.0, Some(1250.0)),
+            (250.0, 50.0, Some(250.0)),
+            (250.0, 49.0, Some(500.0)),
+            (0.1, 25.0, Some(0.2)),
+            (1.0, 0.003, Some(16667.0)),
+            (1.0, 0.001, Some(49996.0)),
+            (1.0, 1e-6, Some(45_454_546.0)),
+            (1.0, 1e-310, None),
+        ] {
+            let got = DoseGrid::lowest_raised_by(s, p).expect("a multiple is raised");
+            if let Some(want) = want {
+                assert_eq!(got.to_bits(), f64::to_bits(want), "s = {s}, p = {p}");
+            }
+            let below = got - s;
+            assert!(
+                open(s).step_percent(got, p, true) > got,
+                "s = {s}, p = {p}: {got}"
+            );
+            assert_eq!(
+                open(s).step_percent(below, p, true).to_bits(),
+                below.to_bits(),
+                "s = {s}, p = {p}: {below}"
+            );
+        }
+        // No finite multiple is raised: 1e308 is absorbed (1.25e308 rounds back) and
+        // the next multiple is infinite.
+        assert_eq!(DoseGrid::lowest_raised_by(1e308, 25.0), None);
+    }
+
+    /// P3: a `round_to` that is not a finite number `> 0`, on a spec built in code (the
+    /// parser's own check is in `model_parser_adaptive_dosing_tests.rs`). One sentence.
+    ///
+    /// Mutations: the check only in the parser; `s < 0` instead of `s <= 0`.
+    #[test]
+    fn validate_refuses_a_round_to_that_is_not_positive_and_finite() {
+        for (s, shown) in [
+            (0.0, "0"),
+            (-250.0, "-250"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "inf"),
+        ] {
+            assert_eq!(
+                gridded(s, (250.0, 400.0), 250.0).validate().unwrap_err(),
+                format!("[adaptive_dosing]: round_to must be a finite number > 0: {shown}")
+            );
+        }
+    }
+
+    /// P4: `round_to` with a `levels` ladder, asserted whole, so deleting either clause
+    /// (the refusal, or the advice to write the rounded doses as the levels) reddens it.
+    /// The ladder itself is valid, so the refusal is not a ladder error.
+    ///
+    /// Mutation: P4 checked after the ladder's own checks, or not at all.
+    #[test]
+    fn validate_refuses_round_to_with_levels() {
+        let mut s = gridded(250.0, (0.0, 400.0), 100.0);
+        s.levels = literal_levels(&[100.0, 200.0]);
+        s.rules[0].action = AdaptiveAction::Increase(DoseStep::Level);
+        assert_eq!(
+            s.validate().unwrap_err(),
+            "[adaptive_dosing]: round_to cannot be combined with levels: a levels ladder is \
+             already discrete, so write the rounded doses as the levels"
+        );
+    }
+
+    /// V7 on numeric bounds, at parse time: no multiple of 250 in [300, 400]. Whole text.
+    ///
+    /// Mutation: V7 only per subject.
+    #[test]
+    fn validate_refuses_bounds_holding_no_multiple_of_round_to() {
+        assert_eq!(
+            gridded(250.0, (300.0, 400.0), 350.0)
+                .validate()
+                .unwrap_err(),
+            "[adaptive_dosing]: no multiple of round_to = 250 lies within dose_bounds [300, 400]"
+        );
+    }
+
+    /// V8 straddle: `lo = 0` with percentage steps is refused; `lo = 1e-6` aligns to 250
+    /// and passes; `lo = 0` with no percentage step passes (no step can strand a 0). The
+    /// message is asserted whole, so each of its clauses — the cause (a dose can round to
+    /// 0), the consequence (it cannot rise again), and the advice (raise the bound,
+    /// naming the step it is lifted to) — is killed by deleting it.
+    ///
+    /// Mutations: V8 gated on the raw `lo` instead of the aligned bound (`lo = 1e-6`
+    /// refused); V8 not gated on percentage steps; V8 dropped.
+    #[test]
+    fn validate_refuses_a_lower_bound_that_aligns_to_zero_under_percentage_steps() {
+        assert_eq!(
+            gridded(250.0, (0.0, 4000.0), 1000.0)
+                .validate()
+                .unwrap_err(),
+            "[adaptive_dosing]: with round_to = 250, dose_bounds low = 0 lets a dose round \
+             to 0, and a running dose of 0 cannot rise again under percentage steps; set the \
+             lower bound above 0 (any value up to 250 raises it to 250)"
+        );
+        assert_eq!(gridded(250.0, (1e-6, 4000.0), 1000.0).validate(), Ok(()));
+        let mut hold_only = gridded(250.0, (0.0, 4000.0), 1000.0);
+        hold_only.rules[0].action = AdaptiveAction::Hold;
+        assert_eq!(hold_only.validate(), Ok(()));
+    }
+
+    /// V8 refuses a low of exactly 0, never a positive one, however small against the
+    /// step: `lo = 1e-6` at `s = 1000` (and `1e-7` at `s = 250`, both within the 1e-9
+    /// snap of 0) is lifted to one step, as the docs and the example promise, so a dose
+    /// cannot round to 0 (#2805 review r1 row 1). The straddle: `lo = 0` at the same step
+    /// is refused.
+    ///
+    /// Mutation: the low's quotient snapped to index 0 for a positive low (V8 refuses
+    /// `1e-6`, and the aligned low is `1e-6`, not 1000).
+    #[test]
+    fn a_tiny_positive_low_bound_is_lifted_to_one_step_not_refused() {
+        for (s, lo) in [(1000.0, 1e-6), (2000.0, 1e-6), (250.0, 1e-7)] {
+            assert_eq!(
+                gridded(s, (lo, 4000.0), 2000.0).validate(),
+                Ok(()),
+                "s = {s}, lo = {lo}"
+            );
+            let g = DoseGrid::new(s, (lo, 4000.0)).expect("grid");
+            assert_eq!(g.low.to_bits(), s.to_bits(), "s = {s}, lo = {lo}: {g:?}");
+            assert_eq!(g.place(1.0).to_bits(), s.to_bits(), "s = {s}, lo = {lo}");
+        }
+        let e = gridded(1000.0, (0.0, 4000.0), 2000.0)
+            .validate()
+            .unwrap_err();
+        assert!(
+            e.contains("dose_bounds low = 0 lets a dose round to 0"),
+            "{e}"
+        );
+        // A positive low with no positive multiple at or below the high is V7, not a
+        // grid that clamps every dose to the low.
+        let e = gridded(250.0, (1e-7, 100.0), 50.0).validate().unwrap_err();
+        assert!(e.contains("no multiple of round_to = 250"), "{e}");
+    }
+
+    /// V8 needs only the low bound: a numeric `0` low is refused when the block is parsed
+    /// even when the high bound is an expression (#944 PR3 delta row 1).
+    ///
+    /// Mutation: the grid checks gated on both bounds being numbers.
+    #[test]
+    fn validate_refuses_a_zero_low_bound_beside_an_expression_high() {
+        let mut s = gridded(250.0, (0.0, 4000.0), 1000.0);
+        s.start_dose = DoseValue::Expr("15 * WT".into());
+        s.dose_bounds.1 = DoseValue::Expr("min(30 * WT, 4000)".into());
+        let e = s.validate().unwrap_err();
+        assert!(
+            e.contains("dose_bounds low = 0 lets a dose round to 0"),
+            "{e}"
+        );
+        s.dose_bounds.0 = DoseValue::Literal(250.0);
+        assert_eq!(s.validate(), Ok(()));
     }
 
     #[test]

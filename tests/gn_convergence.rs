@@ -223,6 +223,14 @@ fn gn_warfarin_bloq_m3_matches_nonmem() {
         "[#2740] GN warfarin_bloq: OFV {:.6}, θ {:?}, σ {:?}, converged {}",
         result.ofv, result.theta, result.sigma, result.converged
     );
+    // #2738: before #2740 this fit stopped at −206.196 (+10.6 above FOCEI's −216.8187,
+    // max |grad| 34.7) on a micro-step at a collapsed radius and reported converged. A
+    // `converged: true` must now sit at the optimum; 0.1 OFV is far below that gap.
+    assert!(
+        !result.converged || (result.ofv - (-216.8187)).abs() < 0.1,
+        "GN reports converged at OFV {} away from FOCEI's -216.8187",
+        result.ofv
+    );
 
     let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
     for (name, got, want, tol) in [
@@ -240,4 +248,48 @@ fn gn_warfarin_bloq_m3_matches_nonmem() {
             rel(got, want)
         );
     }
+}
+
+/// #2777: on `examples/one_cpt_transit.ferx` GN drives `TVV` onto its upper bound (500)
+/// with the gradient still pushing outward. Before the fix, rho was measured against the
+/// unclamped step's predicted reduction, which counted the reduction from the coordinate
+/// the clamp holds still, so rho was a fixed 0.214 at every radius and the fit stopped on
+/// "trust radius collapsed" at 1513.94. With the bound-active coordinate held and rho on
+/// the clamped step it ends at 1492.1729 (Linux x86_64). The bound stays active, and the
+/// gap to FOCEI (1215.98, in a different basin with `TVMTT` on its upper bound) is not
+/// this test's object.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn gn_one_cpt_transit_does_not_collapse_on_the_volume_bound() {
+    let model = parse_model_file(Path::new("examples/one_cpt_transit.ferx"))
+        .expect("one_cpt_transit model must parse");
+    let population = read_nonmem_csv(Path::new("data/datsim_oral.csv"), None, None)
+        .expect("datsim_oral data must load");
+
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceGn;
+    opts.outer_maxiter = 500;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    let result = fit(&model, &population, &model.default_params, &opts)
+        .expect("GN fit must return a result");
+
+    assert!(
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("trust radius collapsed")),
+        "GN collapsed its trust region: {:?}",
+        result.warnings
+    );
+    assert!(result.ofv.is_finite(), "OFV must be finite: {}", result.ofv);
+    // Measured 1492.1729 after the fix against 1513.94 before; 5 OFV of headroom.
+    assert!(
+        result.ofv < 1497.0,
+        "GN OFV {} regressed toward the collapsed 1513.94",
+        result.ofv
+    );
 }

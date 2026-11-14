@@ -82,6 +82,15 @@ is taken if that increase is not significant at `p_backward`; the phase ends
 when every remaining effect is. Forced effects and relations the base model
 already declared are never candidates for removal.
 
+A removal that fails to fit, or fails the strictness gate, tests nothing, and a
+failed candidate is offered again at the next step. If the last backward step,
+whether nothing was removable or `max_steps` was reached, still has failed
+candidates, those effects stay in the final model without
+having met `p_backward`. The search says so: the summary reads `Final model
+(backward elimination incomplete)`, the notes name the effects and the first
+failure, and `final.ferx` opens with the same note as a comment. The exit code
+stays 0, so check for this in a scripted run.
+
 **Between steps** each child starts from its parent's final estimates
 (Pharmpy's `update_initial_estimates`); the new relation's θ takes the
 block's PsN default init and bounds for its form.

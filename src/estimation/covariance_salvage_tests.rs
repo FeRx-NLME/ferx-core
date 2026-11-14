@@ -462,7 +462,7 @@ fn the_population_cov_stencil_is_the_sum_of_the_per_subject_stencils() {
                 n,
                 &x_hat,
                 &free_idx,
-                &crate::estimation::parameterization::fd_step_floors(params, &model.default_params),
+                &crate::estimation::parameterization::fd_step_floors(params, model),
                 opts.fd_hessian_step,
                 f0,
                 None,
@@ -2086,6 +2086,8 @@ fn a_scope_failure_is_reported_on_every_step_outcome() {
         matrix: DMatrix::identity(1, 1),
         warnings: vec!["an existing note".to_string()],
         method: CovarianceMethod::default(),
+        newton_decrement: None,
+        non_stationary_optimum: false,
     });
     let CovarianceStepResult::Success(o) = note_scope_failure(ok, "no pool") else {
         panic!("a success stays a success");

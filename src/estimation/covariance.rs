@@ -8,11 +8,14 @@
 use crate::estimation::cov_diagnostics::{
     cov_objective_method, cov_objective_route, decrement_is_non_stationary,
     estimate_minimises_cov_objective, format_non_stationary_gradient_warning,
-    format_non_stationary_warning, format_offdiag_nan_warning, format_quadrature_declined_warning,
+    format_non_stationary_optimum_warning, format_non_stationary_warning,
+    format_offdiag_nan_warning, format_quadrature_declined_warning,
     format_quadrature_objective_note, format_regularized_warning, format_salvage_note,
-    newton_decrement, r_falls_back_to_s, tests_stationarity_by_gradient, CovHessianSource,
+    held_at_bound, largest_newton_steps, newton_decrement, r_falls_back_to_s, stationarity_reading,
+    tests_minimum_stationarity, tests_stationarity_by_gradient, CovHessianSource,
     CovObjectiveRoute, CovRegularizationFacts, CovScopeDecline, NonStationaryFacts,
-    NonStationaryGradientFacts, OdeToleranceFacts, S_RANK_DEFICIENT_REASON,
+    NonStationaryGradientFacts, OdeToleranceFacts, NON_STATIONARY_NAMED_COORDS,
+    S_RANK_DEFICIENT_REASON,
 };
 use crate::estimation::inner_optimizer::find_ebe_for_stage;
 use crate::estimation::outer_optimizer::pop_nll_opts;
@@ -43,6 +46,14 @@ pub(crate) struct CovarianceOutput {
     /// `R⁻¹` / `R⁻¹SR⁻¹` that would have inverted a floored `R` at an estimate the objective
     /// never optimised by `S⁻¹` ([`crate::estimation::cov_diagnostics::r_falls_back_to_s`]).
     pub method: CovarianceMethod,
+    /// The Newton decrement of the OFV at the estimate, in OFV units (#2541, #2785), when the
+    /// step tested stationarity; `None` when it did not (no `R`, a floored `R` at an estimate
+    /// its method minimised, cancellation).
+    pub newton_decrement: Option<f64>,
+    /// The estimate's method minimised this objective and the decrement exceeds one standard
+    /// error (#2785): the fit stopped short of a stationary point, and whoever publishes
+    /// `converged` demotes it. The warning saying so is already in `warnings`.
+    pub non_stationary_optimum: bool,
 }
 
 /// Return type of [`compute_covariance`].
@@ -354,7 +365,7 @@ fn fd_diag_specs(x_hat: &[f64], free_idx: &[usize], eps: f64, floor: &[f64]) -> 
 
 /// Evaluate `ofv` at one perturbed point. Each call clones `x_hat` once, so a `par_iter` over
 /// specs keeps only ~n_threads vectors live instead of all ~2·nf² perturbed points (#298).
-fn eval_fd_point<F: Fn(&[f64]) -> f64>(x_hat: &[f64], p: FdPert, ofv: &F) -> f64 {
+fn eval_fd_point<R, F: Fn(&[f64]) -> R>(x_hat: &[f64], p: FdPert, ofv: &F) -> R {
     let mut xv = x_hat.to_vec();
     match p {
         FdPert::Single { i, di } => xv[i] += di,
@@ -550,6 +561,55 @@ pub(crate) fn embed_free(m: &DMatrix<f64>, free_idx: &[usize], n: usize) -> DMat
         }
     }
     full
+}
+
+/// The positions in `free_idx` of the coordinates the covariance step holds at the internal
+/// guard (#2797): the free coordinates the post-fit guard warning calls a collapse, read off
+/// `x_hat` — the point the matrix is taken at — through
+/// [`crate::api::held_guard_coordinates`]. Never off `template`: the estimators hand the
+/// **start** as the template (`outer_optimizer.rs`), whose coordinates are not on the rail.
+pub(crate) fn held_free_positions(
+    x_hat: &[f64],
+    template: &ModelParameters,
+    free_idx: &[usize],
+) -> Vec<usize> {
+    let held = crate::api::held_guard_coordinates(&unpack_params(x_hat, template));
+    free_idx
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| held.contains(i))
+        .map(|(a, _)| a)
+        .collect()
+}
+
+/// The covariance **conditional on the held rows** (#2797): the inverse of `m_free`'s
+/// sub-block over the coordinates not in `held` (positions into the free block), embedded
+/// back into the free block with zero rows and columns at `held` — exactly the matrix the
+/// step returns when those coordinates are FIX.
+///
+/// `invert(sub, keep)` inverts the sub-block (`keep`: the kept positions, in order) the way
+/// the caller inverted the whole block, and returns `None` when that inverse is not clean.
+/// `None` — the caller keeps its unconditional matrix — when nothing is held, every
+/// coordinate is held, or `invert` declined. The caller decides *whether* to condition: only
+/// on a clean verdict for the whole block (no eigenvalue clipped, no `S` fallback), so a
+/// collapsed coordinate that is itself a negative-curvature direction at a poor point keeps
+/// its floor warning and its matrix (#2797 audit, probe G).
+pub(crate) fn condition_on_held(
+    m_free: &DMatrix<f64>,
+    held: &[usize],
+    invert: impl FnOnce(&DMatrix<f64>, &[usize]) -> Option<DMatrix<f64>>,
+) -> Option<DMatrix<f64>> {
+    let nf = m_free.nrows();
+    if held.is_empty() {
+        return None;
+    }
+    let keep: Vec<usize> = (0..nf).filter(|a| !held.contains(a)).collect();
+    if keep.is_empty() {
+        return None;
+    }
+    let sub = DMatrix::from_fn(keep.len(), keep.len(), |a, b| m_free[(keep[a], keep[b])]);
+    let inv = invert(&sub, &keep)?;
+    Some(embed_free(&inv, &keep, nf))
 }
 
 /// [`combine_covariance`] applied to the returned inverse **and** to the eigen-floor's
@@ -1320,7 +1380,7 @@ pub(crate) fn exact_candidate_derivatives(
         return None;
     }
     let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
-    let (_, ehs, _, kaps, all_converged) = reconverge_population_checked(
+    let (_, ehs, _, kaps, all_converged, _) = reconverge_population_checked(
         x,
         model,
         population,
@@ -1703,6 +1763,42 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     ofv: &F,
     options: &FitOptions,
 ) -> Option<FdStencil> {
+    fd_ofv_hessian_gated(
+        n,
+        x_hat,
+        free_idx,
+        floor,
+        initial_eps,
+        f0,
+        ofv,
+        None,
+        options,
+    )
+}
+
+/// The objective re-solved at τ/100 — the tight twin of [`fd_ofv_hessian_gated`]'s `ofv` —
+/// `None` where a solve fell to Nelder–Mead or did not converge.
+pub(super) type TightOfv<'a> = &'a (dyn Fn(&[f64]) -> Option<f64> + Sync);
+
+/// [`fd_ofv_hessian`], with the resolution gate of
+/// [`resolve_floored_step`](crate::estimation::fd_resolution::resolve_floored_step) on the
+/// diagonal of every free coordinate whose floor is below 1 (#2406); without `tight` no
+/// coordinate is gated. A gated coordinate's step grows until its second difference is
+/// resolved, the off-diagonal pairs it enters are taken at that grown step, and its diagonal
+/// entry is the τ/100 second difference. Where no step had a τ/100 one, the step stays at its
+/// floor and the entry is the τ second difference there.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fd_ofv_hessian_gated<F: Fn(&[f64]) -> f64 + Sync>(
+    n: usize,
+    x_hat: &[f64],
+    free_idx: &[usize],
+    floor: &[f64],
+    initial_eps: f64,
+    f0: f64,
+    ofv: &F,
+    tight: Option<TightOfv<'_>>,
+    options: &FitOptions,
+) -> Option<FdStencil> {
     #[cfg(test)]
     reconverge_log::record_fd_hessian(initial_eps);
     // Adaptively select the FD step: halve up to 8× until all free-parameter diagonal stencils
@@ -1721,17 +1817,115 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
             if step.n_halvings == 1 { "" } else { "s" }
         );
     }
-    fd_ofv_stencil(
+    let diag = step.diag;
+    let mut floor = floor.to_vec();
+    let mut resolved_diag: Vec<(usize, f64)> = Vec::new();
+    if let (Some(tight), Some(d)) = (tight, diag.as_deref()) {
+        // A gated coordinate's off-diagonal pairs are stepped at the floor it settled on. Its
+        // two axis points in `diag` stay the first step's: they feed only its own diagonal
+        // entry, which the resolved value replaces below.
+        for (i, r) in resolve_fd_diag(x_hat, free_idx, &floor, step.eps, f0, d, ofv, tight) {
+            floor[i] = r.floor;
+            resolved_diag.push((i, r.value));
+        }
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return None;
+        }
+    }
+    let mut stencil = fd_ofv_stencil(
         n,
         x_hat,
         free_idx,
-        floor,
+        &floor,
         step.eps,
         f0,
-        step.diag.as_deref(),
+        diag.as_deref(),
         ofv,
         options,
-    )
+    )?;
+    for (i, v) in resolved_diag {
+        if v.is_finite() {
+            stencil.hess[(i, i)] = v;
+            stencil.diag_nan.remove(&i);
+        }
+    }
+    Some(stencil)
+}
+
+/// The gated diagonal of [`fd_ofv_hessian_gated`]: for each free coordinate (packed `i`) whose
+/// floor is below 1, where its step settled, as `(i, resolved)`. `diag` is the accepted pass
+/// of [`select_fd_step`], reused as the τ side of the first step. The τ/100 side's centre is
+/// `tight(x̂)`, evaluated once and only when some coordinate is floored, so all three points
+/// of its second difference share a tolerance.
+#[allow(clippy::too_many_arguments)]
+fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
+    x_hat: &[f64],
+    free_idx: &[usize],
+    floor: &[f64],
+    eps: f64,
+    f0: f64,
+    diag: &[f64],
+    ofv: &F,
+    tight: TightOfv<'_>,
+) -> Vec<(usize, crate::estimation::fd_resolution::Resolved)> {
+    use crate::estimation::fd_resolution::{resolve_floored_step, Difference};
+    let gated: Vec<(usize, usize)> = free_idx
+        .iter()
+        .enumerate()
+        .filter(|&(_, &i)| floor[i] < 1.0)
+        .map(|(a, &i)| (a, i))
+        .collect();
+    if gated.is_empty() {
+        return Vec::new();
+    }
+    let f0_tight = tight(x_hat);
+    // A point on the `1e20` wall is missing, not a value, as on the gradient side: two walled
+    // diagonals agree to an ulp and clear the noise guard, so differenced they would accept
+    // a diagonal of ~2e20/h² and an SE of ~0. Growing ×10 toward the bounds is what reaches
+    // the wall; the ungated stencil only ever halves.
+    let usable = crate::stats::likelihood::is_usable_subject_nll;
+    let second = |fp: f64, f0: f64, fm: f64, h: f64| {
+        if !(usable(fp) && usable(f0) && usable(fm)) {
+            return None;
+        }
+        let numer = fp - 2.0 * f0 + fm;
+        let value = numer / (h * h);
+        value.is_finite().then_some(Difference {
+            value,
+            numer: numer.abs(),
+            scale: f0.abs(),
+            span: 2.0 * h,
+        })
+    };
+    gated
+        .par_iter()
+        .filter_map(|&(a, i)| {
+            let r = resolve_floored_step(floor[i], |fl, at_tight| {
+                let h = fd_step(eps, x_hat[i], fl);
+                let plus = FdPert::Single { i, di: h };
+                let minus = FdPert::Single { i, di: -h };
+                if at_tight {
+                    let f0t = f0_tight?;
+                    let (fp, fm) = rayon::join(
+                        || eval_fd_point(x_hat, plus, &tight),
+                        || eval_fd_point(x_hat, minus, &tight),
+                    );
+                    second(fp?, f0t, fm?, h)
+                } else {
+                    let (fp, fm) = if fl == floor[i] {
+                        (diag[2 * a], diag[2 * a + 1])
+                    } else {
+                        rayon::join(
+                            || eval_fd_point(x_hat, plus, ofv),
+                            || eval_fd_point(x_hat, minus, ofv),
+                        )
+                    };
+                    second(fp, f0, fm, h)
+                }
+            })?;
+            Some((i, r))
+        })
+        .collect()
 }
 
 /// Test-only record of every [`reconverge_population`] call (#1935), written by
@@ -1861,7 +2055,7 @@ pub(super) fn reconverge_population(
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
 ) {
-    let (params, ehs, hms, kaps, _) = reconverge_population_checked(
+    let (params, ehs, hms, kaps, _, _) = reconverge_population_checked(
         xv,
         model,
         pop,
@@ -1874,7 +2068,10 @@ pub(super) fn reconverge_population(
     (params, ehs, hms, kaps)
 }
 
-/// [`reconverge_population`], and whether every subject's inner solve converged.
+/// [`reconverge_population`], whether every subject's inner solve converged, and whether every
+/// one is resolved in the sense of
+/// [`ebe_resolved`](crate::estimation::fd_resolution::ebe_resolved) — converged without a
+/// Nelder–Mead fallback or polish, which the FD resolution gate's tight twin requires (#2406).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn reconverge_population_checked(
     xv: &[f64],
@@ -1890,6 +2087,7 @@ fn reconverge_population_checked(
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
+    bool,
     bool,
 ) {
     let params = unpack_params(xv, template);
@@ -1912,13 +2110,15 @@ fn reconverge_population_checked(
     let mut hms = Vec::with_capacity(n);
     let mut kaps = Vec::with_capacity(n);
     let mut all_converged = true;
+    let mut all_resolved = true;
     for ebe in ebes {
         all_converged &= ebe.converged;
+        all_resolved &= crate::estimation::fd_resolution::ebe_resolved(&ebe);
         ehs.push(ebe.eta);
         hms.push(ebe.h_matrix);
         kaps.push(ebe.kappas);
     }
-    (params, ehs, hms, kaps, all_converged)
+    (params, ehs, hms, kaps, all_converged, all_resolved)
 }
 
 /// [`compute_covariance_for`] for an estimate the step's own objective produced — the form
@@ -2360,6 +2560,8 @@ fn covariance_step(
             matrix: DMatrix::zeros(n, n),
             warnings: vec![],
             method: options.covariance_method,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }));
     }
 
@@ -2396,6 +2598,14 @@ fn covariance_step(
         let Some(cov_free) = invert_cross_product(&s_free, &unit_coords) else {
             return Some(CovarianceStepResult::Unusable(S_SINGULAR_MSG.to_string()));
         };
+        // #2797: `S⁻¹` conditional on the coordinates collapsed on the guard, once `S` itself
+        // inverted cleanly — the verdict this estimator has instead of `R`'s.
+        let held = held_free_positions(x_hat, template, &free_idx);
+        let cov_free = condition_on_held(&s_free, &held, |sub, keep| {
+            let units: Vec<CoordUnits> = keep.iter().map(|&a| unit_coords[a]).collect();
+            invert_cross_product(sub, &units)
+        })
+        .unwrap_or(cov_free);
         if options.verbose {
             eprintln!("  Covariance step successful");
         }
@@ -2407,6 +2617,8 @@ fn covariance_step(
                 .into_iter()
                 .collect(),
             method: CovarianceMethod::CrossProduct,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }));
     }
 
@@ -2599,8 +2811,48 @@ fn covariance_step(
             FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
         };
 
-        let fd_floor = fd_step_floors(template, &model.default_params);
-        let stencil = fd_ofv_hessian(
+        // The resolution gate's tight twin (#2406): `fd_ofv` re-solved at `cov_inner_tol`/100,
+        // `None` when any subject's solve is unresolved. Built on the same subject set and warm
+        // starts as `fd_ofv`, so it differs from it only in the tolerance.
+        let tight_inner_tol = crate::estimation::fd_resolution::tight_tol(cov_inner_tol);
+        let tight_mixture_options = FitOptions {
+            inner_tol: tight_inner_tol,
+            ..options.clone()
+        };
+        let subset_tight_ofv = |xv: &[f64], pop: &Population, warm: &[DVector<f64>]| {
+            let (params, ehs, hms, kaps, _, resolved) = reconverge_population_checked(
+                xv,
+                model,
+                pop,
+                template,
+                warm,
+                options,
+                tight_inner_tol,
+                false,
+            );
+            resolved.then(|| 2.0 * pop_nll_opts(model, pop, &params, &ehs, &hms, &kaps, options))
+        };
+        let tight_ofv = |xv: &[f64]| -> Option<f64> {
+            #[cfg(test)]
+            fd_evals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match scope {
+                FdScope::Whole if is_mixture => {
+                    let m = crate::estimation::mixture::mixture_ofv(
+                        model,
+                        population,
+                        &unpack_params(xv, template),
+                        &tight_mixture_options,
+                        None,
+                    );
+                    crate::estimation::fd_resolution::inner_resolved(&m.ebe_stats).then_some(m.ofv)
+                }
+                FdScope::Whole => subset_tight_ofv(xv, population, &warm),
+                FdScope::Subset { pop, warm } => subset_tight_ofv(xv, pop, warm),
+            }
+        };
+
+        let fd_floor = fd_step_floors(template, model);
+        let stencil = fd_ofv_hessian_gated(
             n,
             x_hat,
             &free_idx,
@@ -2608,6 +2860,7 @@ fn covariance_step(
             initial_eps,
             f0_fd,
             &fd_ofv,
+            Some(&tight_ofv),
             options,
         );
         // Read here, on the thread the stencil ran on: inside a tightened step it is the
@@ -2770,6 +3023,23 @@ fn covariance_step(
     // inverse observed Fisher information R = Hessian of −logL = ½·H_ofv, so
     // R⁻¹ = 2·H_ofv⁻¹. Without this factor every SE is 1/√2 too small.
     let r_inv = inv.inverse.clone() * 2.0;
+    // #2797: on a clean `R` (nothing clipped, so no #1781 fallback either), a coordinate
+    // collapsed on the internal guard is held — the covariance becomes conditional on it at
+    // its estimate, as for a FIX coordinate. After the verdict, never before: every
+    // diagnostic below (the floor, the fallback, the stationarity test on the full `R⁻¹`)
+    // reads the unconditional `R`, so holding cannot turn a floor into a clean matrix.
+    let r_inv = if inv.n_clipped == 0 {
+        let held = held_free_positions(x_hat, template, &free_idx);
+        condition_on_held(&hess_free_sym, &held, |sub, keep| {
+            let units: Vec<CoordUnits> = keep.iter().map(|&a| unit_coords[a]).collect();
+            invert_psd_with_floor_unit_free(sub, &units)
+                .filter(|i| i.n_clipped == 0)
+                .map(|i| i.inverse * 2.0)
+        })
+        .unwrap_or(r_inv)
+    } else {
+        r_inv
+    };
     // #1781: an `R` the floor had to clip, at an estimate its objective never optimised
     // (SAEM / IMP / IMPMAP / VI), is not inverted at all — the estimator becomes `S⁻¹`. The
     // floored direction is the objective's slope at a non-stationary point, not a precision,
@@ -2942,7 +3212,18 @@ fn covariance_step(
     // Off the fallback a sampler's `R` was not clipped, so `inv.inverse` is exactly `H⁻¹`.
     // The gradient is taken at the modes reconverged at `cov_inner_tol` (a mixture re-solves
     // its own), the ones the analytic R-matrix is assembled at.
-    if tests_stationarity_by_gradient(fit_method, fallback_to_s)
+    //
+    // #2785: the same test on an estimate its method *did* minimise — FOCE, FOCEI, Laplace /
+    // AGQ, Gauss–Newton — where a decrement above one standard error says the optimizer
+    // stopped short, whatever its own stop rule said, and the fit is demoted
+    // ([`CovarianceOutput::non_stationary_optimum`]). Only on an unclipped `R`: a floored
+    // `R⁻¹` reads `1/floor` along the clipped direction and would demote on the floor, which
+    // has its own warning. A coordinate on a bound whose slope points out of the box is
+    // held: that slope is the constraint's, not a stall's.
+    let minimum_test = tests_minimum_stationarity(fit_method, inv.n_clipped);
+    let mut newton_decrement_read = None;
+    let mut non_stationary_optimum = false;
+    if (tests_stationarity_by_gradient(fit_method, fallback_to_s) || minimum_test)
         && !crate::cancel::is_cancelled(&options.cancel)
     {
         let (ehs, hms, kaps) = if is_mixture {
@@ -2972,19 +3253,50 @@ fn covariance_step(
             nn_reg.as_ref(),
         );
         let g_free = DVector::from_iterator(n_free, free_idx.iter().map(|&i| g[i]));
-        let decrement = newton_decrement(&g_free, &inv.inverse);
-        if decrement_is_non_stationary(decrement) {
-            let msg = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
-                method: fit_method,
-                objective: cov_objective_method(options),
-                requested: estimator,
-                decrement,
-                quadrature_nodes,
-            });
-            if options.verbose {
-                eprintln!("  {}", msg);
+        if minimum_test {
+            let pick = |v: &[f64]| free_idx.iter().map(|&i| v[i]).collect::<Vec<_>>();
+            let held = held_at_bound(
+                &pick(x_hat),
+                g_free.as_slice(),
+                &pick(&bounds.lower),
+                &pick(&bounds.upper),
+            );
+            if let Some(reading) = stationarity_reading(&g_free, &inv.inverse, &held) {
+                newton_decrement_read = Some(reading.decrement);
+                if decrement_is_non_stationary(reading.decrement) {
+                    non_stationary_optimum = true;
+                    let largest: Vec<(String, f64)> =
+                        largest_newton_steps(&reading.step_se, NON_STATIONARY_NAMED_COORDS)
+                            .into_iter()
+                            .map(|(a, z)| (packed_param_label(free_idx[a], template), z))
+                            .collect();
+                    let msg = format_non_stationary_optimum_warning(
+                        fit_method,
+                        reading.decrement,
+                        &largest,
+                    );
+                    if options.verbose {
+                        eprintln!("  {}", msg);
+                    }
+                    cov_warnings.push(msg);
+                }
             }
-            cov_warnings.push(msg);
+        } else {
+            let decrement = newton_decrement(&g_free, &inv.inverse);
+            newton_decrement_read = Some(decrement);
+            if decrement_is_non_stationary(decrement) {
+                let msg = format_non_stationary_gradient_warning(&NonStationaryGradientFacts {
+                    method: fit_method,
+                    objective: cov_objective_method(options),
+                    requested: estimator,
+                    decrement,
+                    quadrature_nodes,
+                });
+                if options.verbose {
+                    eprintln!("  {}", msg);
+                }
+                cov_warnings.push(msg);
+            }
         }
     }
     if inv.n_clipped > 0 && estimator != CovarianceMethod::CrossProduct {
@@ -3053,6 +3365,8 @@ fn covariance_step(
         matrix: cov,
         warnings: cov_warnings,
         method: estimator,
+        newton_decrement: newton_decrement_read,
+        non_stationary_optimum,
     }))
 }
 
@@ -3187,15 +3501,17 @@ pub(crate) struct RegularizedInverse {
 /// The fold compares with `>` rather than folding through `f64::max`; both let a `NaN` fall
 /// through here, but the explicit comparison says so where a reader can see it.
 /// Every standard error the fit will **report**, flattened: θ on its natural scale, the Ω
-/// lower triangle through the multivariate Cholesky Jacobian, σ, Ω_IOV, and the `block_sigma`
-/// ρ's. Exactly the numbers `FitResult` carries, produced by the one function that produces
-/// them, so the diagnostic cannot measure a different transform than the user reads.
+/// lower triangle through the multivariate Cholesky Jacobian, σ, Ω_IOV, the `block_sigma`
+/// ρ's and the `[mixture]` per-class overrides (#2833). Exactly the numbers `FitResult`
+/// carries, produced by the one function that produces them, so the diagnostic cannot
+/// measure a different transform than the user reads.
 fn reported_standard_errors(cov: &DMatrix<f64>, template: &ModelParameters) -> Vec<f64> {
     let owned = Some(cov.clone());
     let (se_theta, se_omega, se_sigma, se_kappa) =
         crate::api::postfit::extract_standard_errors(&owned, template);
     let rho = crate::api::postfit::extract_residual_correlation_se(&owned, template);
-    [se_theta, se_omega, se_sigma, se_kappa, rho]
+    let overrides = crate::api::postfit::extract_mixture_override_se(&owned, template);
+    [se_theta, se_omega, se_sigma, se_kappa, rho, overrides]
         .into_iter()
         .flatten()
         .flatten()
@@ -3580,6 +3896,27 @@ pub(crate) struct CovStepOutcome {
     /// `None` exactly when `matrix` is `None`; see
     /// [`published_covariance_method`].
     pub method: Option<crate::types::CovarianceMethod>,
+    /// [`CovarianceOutput::newton_decrement`]; `None` when no matrix was produced.
+    pub newton_decrement: Option<f64>,
+    /// [`CovarianceOutput::non_stationary_optimum`] (#2785): the caller that publishes
+    /// `converged` demotes it ([`demote_non_stationary_optimum`]).
+    pub non_stationary_optimum: bool,
+}
+
+/// Demote `converged` for a covariance step that found the estimate is not a stationary
+/// point of the objective its method minimised (#2785), pushing the generic
+/// "did not converge" line a demoted fit carries beside the step's own
+/// `W_NON_STATIONARY_OPTIMUM` (already in the step's warnings) — once, so a run already
+/// reported unconverged does not get it twice.
+pub(crate) fn demote_non_stationary_optimum(
+    non_stationary_optimum: bool,
+    converged: &mut bool,
+    warnings: &mut Vec<String>,
+) {
+    if non_stationary_optimum && *converged {
+        *converged = false;
+        warnings.push("Outer optimization did not converge".to_string());
+    }
 }
 
 /// The estimator label to publish alongside a covariance matrix: `Some(routed)`
@@ -3864,6 +4201,8 @@ pub(crate) fn run_covariance_step_inner(
     // The estimator the returned matrix actually is: `routed`, unless `compute_covariance`
     // itself replaced it (#1781's `S⁻¹` fallback), which it reports on its output.
     let mut used = routed;
+    let mut newton_decrement = None;
+    let mut non_stationary_optimum = false;
     let cov_timer = std::time::Instant::now();
     let matrix = match compute_covariance_for(
         fit_method, x_hat, template, model, population, eta_hats, h_matrices, kappas, options,
@@ -3871,6 +4210,8 @@ pub(crate) fn run_covariance_step_inner(
         CovarianceStepResult::Success(out) => {
             warnings.extend(out.warnings);
             used = out.method;
+            newton_decrement = out.newton_decrement;
+            non_stationary_optimum = out.non_stationary_optimum;
             Some(out.matrix)
         }
         CovarianceStepResult::Unusable(msg) => {
@@ -3896,6 +4237,8 @@ pub(crate) fn run_covariance_step_inner(
         wall_time_secs: cov_timer.elapsed().as_secs_f64(),
         warnings,
         sir_fallback_proposal,
+        newton_decrement,
+        non_stationary_optimum,
     }
 }
 
@@ -3929,6 +4272,8 @@ impl CovStepOutcome {
             warnings: Vec::new(),
             sir_fallback_proposal: None,
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }
     }
 }
@@ -3972,6 +4317,8 @@ pub(crate) fn run_covariance_step(
             sir_fallback_proposal: None,
             // No step ran, so no estimator to name (#1382).
             method: None,
+            newton_decrement: None,
+            non_stationary_optimum: false,
         }
     }
 }
@@ -5048,6 +5395,57 @@ mod tests {
         assert_eq!(
             super::reported_variance_inflation(&cov, None, &free_idx, n, &template),
             1.0
+        );
+    }
+
+    /// #2833 review r1 row 2: a `[mixture]` override's SE is a reported standard error, so
+    /// the eigenvalue-floor inflation check sees it. The fixture inflates **only** the
+    /// override's packed row (variance 4 against 1), so every base SE has ratio 1 and the
+    /// answer is 4 exactly when the override is in the list. Mutation: leave
+    /// `extract_mixture_override_se` out of `reported_standard_errors` → 1.0.
+    #[test]
+    fn the_inflation_metric_sees_a_mixture_override() {
+        let omega = crate::types::OmegaMatrix::from_diagonal(&[0.09], vec!["ETA_CL".into()]);
+        let sigma = crate::types::SigmaVector {
+            values: vec![0.1],
+            names: vec!["EPS".into()],
+        };
+        let template = crate::types::ModelParameters {
+            residual_correlations: Vec::new(),
+            residual_correlation_fixed: Vec::new(),
+            theta: vec![5.0],
+            theta_names: vec!["TVCL".into()],
+            theta_lower: vec![0.1],
+            theta_upper: vec![50.0],
+            theta_fixed: vec![false],
+            omega: omega.clone(),
+            omega_fixed: vec![false],
+            sigma: sigma.clone(),
+            sigma_fixed: vec![false],
+            omega_iov: None,
+            kappa_fixed: vec![],
+            mixture: Some(crate::types::MixtureParams {
+                omega: vec![
+                    omega,
+                    crate::types::OmegaMatrix::from_diagonal(&[0.25], vec!["ETA_CL".into()]),
+                ],
+                sigma: vec![sigma.clone(), sigma],
+                omega_override_addr: vec![(1, 0)],
+                omega_override_fixed: vec![false],
+                sigma_override_addr: vec![],
+                sigma_override_fixed: vec![],
+            }),
+        };
+        // Packed layout: TVCL | ETA_CL | EPS | ETA_CL_MIX2.
+        let n = 4;
+        let free_idx: Vec<usize> = (0..n).collect();
+        let cov_ref = DMatrix::<f64>::identity(n, n);
+        let mut cov = cov_ref.clone();
+        cov[(3, 3)] = 4.0;
+        let got = super::reported_variance_inflation(&cov, Some(&cov_ref), &free_idx, n, &template);
+        assert!(
+            (got - 4.0).abs() < 1e-12,
+            "override inflation {got}, want 4"
         );
     }
 
@@ -6889,6 +7287,224 @@ mod tests {
         assert!(legacy.hess[(0, 0)] > 1e19, "H00 = {}", legacy.hess[(0, 0)]);
     }
 
+    /// The R-matrix fixtures of the #2406 gate: `f = 3x₀² + 0.2x₀x₁ + 0.5x₁² + x₀³x₁` at
+    /// `x̂ = (0.0077, 7.7)`, coordinate 0 floored at `|θ₀|`. The cubic makes the central
+    /// mixed difference read `0.2 + 3x₀² + h₀²`, so an off-diagonal pair shows which step it
+    /// was taken at.
+    fn gate_fixture(x: &[f64]) -> f64 {
+        3.0 * x[0] * x[0] + 0.2 * x[0] * x[1] + 0.5 * x[1] * x[1] + x[0].powi(3) * x[1]
+    }
+
+    fn hess_bits(s: &super::FdStencil) -> Vec<u64> {
+        s.hess.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// #2406: the gate is entered only for a coordinate whose floor is below 1. With every
+    /// floor 1 the gated stencil is the ungated one bit for bit and the twin is never called;
+    /// with coordinate 0 floored and a twin that agrees, it is accepted at the first step, from
+    /// three twin objectives (its centre and two probes): its diagonal is the twin's second
+    /// difference at the #2187 step and every other entry is the ungated stencil's bit for bit.
+    /// The twin's curvature in `x₀` is the objective's plus 1e-6, well inside `RESOLVED_REL`
+    /// but a different number, so the diagonal shows which side it came from. Coordinate 0 sits at 0.077 here, where its
+    /// second difference clears the noise guard at the first step.
+    #[test]
+    fn the_hessian_gate_leaves_floor_one_and_resolved_coordinates_alone() {
+        use super::{fd_ofv_hessian, fd_ofv_hessian_gated, fd_step};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.077f64, 7.7];
+        let f0 = gate_fixture(&x_hat);
+        let eps = 1e-2;
+        let panics = |_: &[f64]| -> Option<f64> { panic!("a floor-1 coordinate reached the gate") };
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &[1.0; 2],
+            eps,
+            f0,
+            &gate_fixture,
+            Some(&panics),
+            &opts,
+        )
+        .unwrap();
+        let ungated =
+            fd_ofv_hessian(2, &x_hat, &[0, 1], &[1.0; 2], eps, f0, &gate_fixture, &opts).unwrap();
+        assert_eq!(hess_bits(&gated), hess_bits(&ungated));
+
+        let floor = [0.077, 1.0];
+        let calls = AtomicUsize::new(0);
+        let shifted = |x: &[f64]| gate_fixture(x) + 0.25 + 5e-7 * x[0] * x[0];
+        let twin = |x: &[f64]| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some(shifted(x))
+        };
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &floor,
+            eps,
+            f0,
+            &gate_fixture,
+            Some(&twin),
+            &opts,
+        )
+        .unwrap();
+        let ungated =
+            fd_ofv_hessian(2, &x_hat, &[0, 1], &floor, eps, f0, &gate_fixture, &opts).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let h = fd_step(eps, x_hat[0], floor[0]);
+        let twin_diag = (shifted(&[x_hat[0] + h, x_hat[1]]) - 2.0 * shifted(&x_hat)
+            + shifted(&[x_hat[0] - h, x_hat[1]]))
+            / (h * h);
+        assert_eq!(gated.hess[(0, 0)].to_bits(), twin_diag.to_bits());
+        assert_ne!(
+            twin_diag.to_bits(),
+            ungated.hess[(0, 0)].to_bits(),
+            "fixture: the twin's diagonal is distinguishable from the stencil's"
+        );
+        assert!(
+            (gated.hess[(0, 0)] - ungated.hess[(0, 0)]).abs() < 1e-3,
+            "{} vs {}",
+            gated.hess[(0, 0)],
+            ungated.hess[(0, 0)]
+        );
+        for ij in [(0, 1), (1, 0), (1, 1)] {
+            assert_eq!(
+                gated.hess[ij].to_bits(),
+                ungated.hess[ij].to_bits(),
+                "H{ij:?}"
+            );
+        }
+    }
+
+    /// #2406 review r1, row 3: a floored coordinate whose grown step reaches the `1e20` wall.
+    /// The twin's curvature differs by 2e-4 relative, so the gate grows; past `|Δx₀| = 5e-3`
+    /// every point, τ and τ/100, is the wall, which floor 0.77 (`h ≈ 7.7e-3`) reaches. Two
+    /// walled second differences agree to an ulp and their numerator clears the noise guard,
+    /// so the gate accepted a diagonal of ~2e20/h²; read as missing, the walled floors give
+    /// nothing, and the diagonal is the twin's at floor 0. Both sides of the gate: the wall is
+    /// reached, and the diagonal is the fixture's curvature, not the wall's.
+    #[test]
+    fn the_hessian_gate_reads_a_walled_probe_as_missing() {
+        use super::fd_ofv_hessian_gated;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.077f64, 7.7];
+        let walls = AtomicUsize::new(0);
+        let walled = |f: f64, x: &[f64]| {
+            if (x[0] - x_hat[0]).abs() > 5e-3 {
+                walls.fetch_add(1, Ordering::Relaxed);
+                crate::stats::likelihood::SUBJECT_SENTINEL_NLL
+            } else {
+                f
+            }
+        };
+        let ofv = |x: &[f64]| walled(gate_fixture(x), x);
+        let twin = |x: &[f64]| Some(walled(gate_fixture(x) + 1e-3 * x[0] * x[0], x));
+        let f0 = gate_fixture(&x_hat);
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &[0.077, 1.0],
+            1e-2,
+            f0,
+            &ofv,
+            Some(&twin),
+            &opts,
+        )
+        .unwrap();
+        assert!(
+            walls.load(Ordering::Relaxed) > 0,
+            "fixture: the grown step reaches the wall"
+        );
+        // f₀₀ = 6 + 6·x₀·x₁, plus the twin's 2e-3.
+        let want = 6.0 + 6.0 * x_hat[0] * x_hat[1] + 2e-3;
+        let got = gated.hess[(0, 0)];
+        assert!(
+            got.is_finite() && (got - want).abs() < 1e-3,
+            "H00 {got:e} vs {want}"
+        );
+        // The off-diagonal pair is stepped at the floor the gate settled on, floor 0, where no
+        // point is the wall's: stepped at a walled floor it would be ~1e20. f₀₁ = 0.2 + 3·x₀².
+        let want01 = 0.2 + 3.0 * x_hat[0] * x_hat[0];
+        let got01 = gated.hess[(0, 1)];
+        assert!(
+            got01.is_finite() && (got01 - want01).abs() < 1e-2,
+            "H01 {got01:e} vs {want01}"
+        );
+    }
+
+    /// #2406: a floored coordinate whose τ objective *stalls* near `x̂` — modelled as
+    /// `−min(d₀², s²)` with `s = 1e-5`, which biases its second difference by `−2s²/h²` once
+    /// `h > s` — is grown until the exact τ/100 twin agrees: a bias of 1.4e-3 relative at the
+    /// #2187 step `h = 1.54e-4`, 4.6e-5 at floor 0.077, and 5.5e-7 at floor 0.77, the first
+    /// inside `RESOLVED_REL`. Its diagonal is the twin's there, and every other entry is the
+    /// ungated stencil's **at the grown floor**, bit for bit — so the pair it enters was taken
+    /// at the grown step, which the cubic's `h₀²` makes visible.
+    #[test]
+    fn the_hessian_gate_grows_a_stalled_diagonal_and_takes_its_pairs_there() {
+        use super::{fd_ofv_hessian, fd_ofv_hessian_gated, fd_step};
+        use crate::estimation::fd_resolution::{RESOLVED_REL, STEP_GROWTH};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.0077f64, 7.7];
+        let s = 1e-5;
+        let stalled = |x: &[f64]| gate_fixture(x) - (x[0] - x_hat[0]).powi(2).min(s * s);
+        let twin = |x: &[f64]| Some(gate_fixture(x));
+        let f0 = stalled(&x_hat);
+        let eps = 1e-2;
+        let floor = [0.0077, 1.0];
+        let want = 6.0 + 6.0 * x_hat[0] * x_hat[1];
+
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &floor,
+            eps,
+            f0,
+            &stalled,
+            Some(&twin),
+            &opts,
+        )
+        .unwrap();
+        let ungated = fd_ofv_hessian(2, &x_hat, &[0, 1], &floor, eps, f0, &stalled, &opts).unwrap();
+        let rel = |h: f64| (h - want).abs() / want;
+        let (rel_gated, rel_ungated) = (rel(gated.hess[(0, 0)]), rel(ungated.hess[(0, 0)]));
+        eprintln!("MEASURE #2406 stalled H00: gated {rel_gated:e}, ungated {rel_ungated:e}");
+        assert!(
+            rel_ungated > 1e-3,
+            "fixture: the τ objective stalls ({rel_ungated:e})"
+        );
+        assert!(rel_gated < RESOLVED_REL, "{rel_gated:e}");
+
+        let grown = [floor[0] * STEP_GROWTH * STEP_GROWTH, 1.0];
+        let h = fd_step(eps, x_hat[0], grown[0]);
+        let twin_diag = (gate_fixture(&[x_hat[0] + h, x_hat[1]]) - 2.0 * gate_fixture(&x_hat)
+            + gate_fixture(&[x_hat[0] - h, x_hat[1]]))
+            / (h * h);
+        assert_eq!(gated.hess[(0, 0)].to_bits(), twin_diag.to_bits());
+        let at_grown =
+            fd_ofv_hessian(2, &x_hat, &[0, 1], &grown, eps, f0, &stalled, &opts).unwrap();
+        for ij in [(0, 1), (1, 0), (1, 1)] {
+            assert_eq!(
+                gated.hess[ij].to_bits(),
+                at_grown.hess[ij].to_bits(),
+                "H{ij:?}"
+            );
+        }
+        assert_ne!(
+            at_grown.hess[(0, 1)],
+            ungated.hess[(0, 1)],
+            "fixture: the pair reads its step"
+        );
+    }
+
     /// #1935: `map_subjects` with `parallel = true` really re-solves subjects concurrently,
     /// and with `false` really does not — both sides of the flag in one test, so a branch
     /// stuck on either arm fails it. Combined with the production test that reads the log
@@ -7015,8 +7631,12 @@ mod tests {
         let (etas, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
             &model, &pop, p, 200, 1e-8, None, None, 0, 0,
         );
+        // `cov_inner_tol` is set so that neither it nor the #2406 gate's twin, at a hundredth
+        // of it, is the stencil tolerance: at an inner tolerance of 1e-5 the twin's 1e-7 *is*
+        // `STENCIL_INNER_TOL`, and a twin solve would read as the defect below.
         let opts = FitOptions {
             analytic_cov_hessian: false,
+            cov_inner_tol: Some(1e-6),
             ..opts
         };
         let x = crate::estimation::parameterization::pack_params(p);
@@ -7032,17 +7652,27 @@ mod tests {
         );
         assert_starts_at_modes(label, &rec, |_| true, &pop, &etas, &kappas);
         // The base reconvergence and every stencil point keep `cov_inner_tol`, not the FD
-        // gradients' stencil tolerance (#2261), so a user's `cov_inner_tol` is what runs.
+        // gradients' stencil tolerance (#2261), so a user's `cov_inner_tol` is what runs. A
+        // floored θ's twin re-solves at `tight_tol(cov_inner_tol)` (#2406).
         let cov_tol = opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+        let twin_tol = crate::estimation::fd_resolution::tight_tol(cov_tol);
+        let stencil = crate::estimation::inner_optimizer::STENCIL_INNER_TOL;
         assert!(
-            cov_tol > crate::estimation::inner_optimizer::STENCIL_INNER_TOL,
-            "{label}: fixture: cov_inner_tol must differ from the stencil tolerance"
+            cov_tol > stencil && twin_tol.to_bits() != stencil.to_bits(),
+            "{label}: fixture: cov_inner_tol and its twin must differ from the stencil tolerance"
         );
         assert!(
             rec.solve_tols
                 .iter()
-                .all(|(_, t)| t.to_bits() == cov_tol.to_bits()),
-            "{label}: the covariance step re-solved at {:?}, not cov_inner_tol {cov_tol:e}",
+                .any(|(_, t)| t.to_bits() == cov_tol.to_bits()),
+            "{label}: no solve of the covariance step ran at cov_inner_tol {cov_tol:e}"
+        );
+        assert!(
+            rec.solve_tols.iter().all(|(_, t)| [cov_tol, twin_tol]
+                .iter()
+                .any(|w| t.to_bits() == w.to_bits())),
+            "{label}: the covariance step re-solved at {:?}, not cov_inner_tol {cov_tol:e} \
+             (or its twin's {twin_tol:e})",
             rec.solve_tols
                 .iter()
                 .map(|(_, t)| format!("{t:e}"))

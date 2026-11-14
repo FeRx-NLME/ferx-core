@@ -13,7 +13,7 @@
 ///
 /// This approach mirrors NONMEM's modified Gauss-Newton algorithm and typically
 /// converges in 10-30 iterations vs 100+ for first-order methods.
-use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed, PrevEtas};
 use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
@@ -57,6 +57,53 @@ pub(crate) fn gn_scale(x: &[f64], options: &FitOptions) -> Vec<f64> {
     } else {
         vec![1.0; x.len()]
     }
+}
+
+/// Trust radius (scaled space) below which the region counts as collapsed for the
+/// small-change stop (#2738). The radius starts at 1 and is divided by 4 per rejection, so
+/// this is five net rejections in. A step capped by a radius this small says nothing
+/// about the gradient: its OFV change is small *because* the step is small, and on
+/// `warfarin_bloq` (+10.6 OFV above FOCEI, max |grad| 34.7) and `pkpd_nonmem` such a step
+/// at a radius of 1e-5…3e-8 ended the loop as converged.
+pub(crate) const GN_COLLAPSED_RADIUS: f64 = 1e-3;
+
+/// Warning for a loop that ended because the trust radius fell below `1e-10` after a
+/// rejected step. Worded "without convergence" so `classify_warning` files it
+/// `Critical`/`Convergence`: it is the run's one non-convergence message (#1049).
+pub(crate) const GN_COLLAPSE_WARNING: &str =
+    "Gauss-Newton: trust radius collapsed without convergence";
+
+/// [`GN_COLLAPSE_WARNING`]'s twin for a radius exhausted by degenerate-BHHH retries.
+pub(crate) const GN_DEGENERATE_COLLAPSE_WARNING: &str =
+    "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed without convergence";
+
+/// The run spent `maxiter` iterations without a stop rule ending it (#1049: only then).
+pub(crate) const GN_BUDGET_WARNING: &str =
+    "Gauss-Newton: max iterations reached without convergence";
+
+/// Whether an accepted step ends the GN loop as converged on the small-change rule:
+/// the OFV moved by less than `1e-6` relative, from iteration 4 on, **and** the radius the
+/// step was solved under had not collapsed (`radius ≥ GN_COLLAPSED_RADIUS`, #2738). Below
+/// that radius a small change says nothing about the gradient, so the loop goes on and
+/// ends on the collapse or the budget with `converged = false`.
+///
+/// There is deliberately no "interior step" exception: a Steihaug step strictly inside
+/// the region is not evidence of stationarity, because truncated CG also returns its
+/// partial iterate there when it exhausts its iteration budget with a large residual. A
+/// genuinely converging run is not held back by this either: near the optimum the model
+/// predicts well (`rho > 0.75`), so each accepted step doubles the radius and it is back
+/// above the floor within a few iterations.
+///
+/// `radius` is the radius the step was solved under, not the post-acceptance one (an
+/// accepted `rho > 0.75` step doubles it).
+pub(crate) fn gn_small_change_converged(rel_change: f64, iter: usize, radius: f64) -> bool {
+    rel_change < 1e-6 && iter > 3 && radius >= GN_COLLAPSED_RADIUS
+}
+
+/// Whether a pure Gauss–Newton loop spent its iteration budget (#2799): it ran (`maxiter >
+/// 0`) and no stop rule, collapse or cancel broke out of it before the range ended.
+pub(crate) fn gn_loop_budget_spent(maxiter: usize, exited_early: bool) -> bool {
+    maxiter > 0 && !exited_early
 }
 
 /// Run FOCE estimation using a Gauss-Newton optimizer.
@@ -143,6 +190,7 @@ pub fn run_foce_gn(
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
         options,
+        PrevEtas::Placeholder,
     );
 
     let mut ofv_clean = 2.0
@@ -164,19 +212,30 @@ pub fn run_foce_gn(
     let mut converged = false;
     // Best accepted iterate, so an interrupted run's checkpoint holds it (#1317).
     let mut best = crate::estimation::outer_optimizer::BestPoint::new();
+    // #2777: rejected steps in a row that no bound clamped, and the subjects whose
+    // EBE-response term `tᵢ` has been dropped from the gradient after such a run
+    // (`dominant_ebe_response_subject`). Sticky for the rest of the fit.
+    let mut unclamped_stalls: usize = 0;
+    let mut raw_score_subjects: Vec<usize> = Vec::new();
 
+    // #2799: the loop ran out of `maxiter` iterations — no stop rule, collapse or cancel
+    // ended it. Every `break` below sets `exited_early`, so a run that falls off the end of
+    // the range spent its budget. `maxiter = 0` runs no iteration and spends nothing (an
+    // evaluation).
+    let mut exited_early = false;
     for iter in 1..=maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
                 eprintln!("  GN iter {:>3}: cancelled by user", iter);
             }
             warnings.push("cancelled by user".to_string());
+            exited_early = true;
             break;
         }
 
         // ---- Build the BHHH system ----
         // Gradient + outer-product Hessian approximation
-        let (mut grad, mut h_bhhh) = build_gn_system(
+        let (mut grad, mut h_bhhh, mut per_subj_t) = build_gn_system_parts(
             &x,
             init_params,
             model,
@@ -204,19 +263,49 @@ pub fn run_foce_gn(
             priors.add_hessian(&mut |i, j, v| h_bhhh[(i, j)] += v);
         }
 
+        // #2777: one subject whose EBE mode sits near a fold can own the step
+        // direction through its `tᵢ`, which is exact at the point and wrong over any
+        // step GN can take. After a run of unclamped rejections, take such a subject
+        // back to its raw score `gᵢ`; the BHHH matrix already uses `gᵢ`. Only the
+        // coordinates the step can move count: a FIX one, or one held on its bound,
+        // played no part in the rejections.
+        for &s in &raw_score_subjects {
+            drop_ebe_response(&mut grad, &mut per_subj_t[s]);
+        }
+        if unclamped_stalls >= GN_DOMINANT_SUBJECT_STALLS {
+            let held = bound_active_outward(&x, &grad, &bounds);
+            let free: Vec<bool> = (0..n_packed).map(|i| !fixed_mask[i] && !held[i]).collect();
+            if let Some(s) = dominant_ebe_response_subject(&per_subj_t, &grad, &gn_scale, &free) {
+                drop_ebe_response(&mut grad, &mut per_subj_t[s]);
+                raw_score_subjects.push(s);
+                warnings.push(format!(
+                    "Gauss-Newton: subject {} dominated the gradient through its EBE \
+                     response (a mode that moves sharply with the parameters) and stalled \
+                     the trust region; its raw score is used for the rest of the fit",
+                    population.subjects[s].id
+                ));
+                if verbose {
+                    eprintln!(
+                        "  GN iter {:>3}: subject {} dominates the EBE-response term, \
+                         using its raw score",
+                        iter, population.subjects[s].id
+                    );
+                }
+            }
+            unclamped_stalls = 0;
+        }
+
         // Zero gradient rows / BHHH rows & cols for FIX parameters, and set
         // their diagonal to 1. The clamp at step-application keeps x[i] at its
         // pinned value; this form guarantees the Cholesky solve gives
         // `delta[i] = 0` exactly (rather than relying on the clamp to hide a
-        // large, meaningless step).
+        // large, meaningless step). A coordinate on a bound whose descent points
+        // out of the box is held the same way for this iteration (#2777); read
+        // after any raw-score switch above, which can change the gradient's sign.
+        let held = bound_active_outward(&x, &grad, &bounds);
         for i in 0..n_packed {
-            if fixed_mask[i] {
-                grad[i] = 0.0;
-                for j in 0..n_packed {
-                    h_bhhh[(i, j)] = 0.0;
-                    h_bhhh[(j, i)] = 0.0;
-                }
-                h_bhhh[(i, i)] = 1.0;
+            if fixed_mask[i] || held[i] {
+                hold_coordinate(&mut grad, &mut h_bhhh, i);
             }
         }
 
@@ -246,8 +335,7 @@ pub fn run_foce_gn(
         let delta_s = solve_trust_region_subproblem(&grad_s, &h_s, trust_radius, cg_budget);
 
         // Predicted decrease in the scaled quadratic model: -gᵀδ - ½ δᵀHδ
-        let h_s_delta_s = &h_s * &delta_s;
-        let pred_reduction = -grad_s.dot(&delta_s) - 0.5 * delta_s.dot(&h_s_delta_s);
+        let pred_reduction = model_reduction(&grad_s, &h_s, &delta_s);
 
         if pred_reduction < 1e-10 {
             if grad_s.norm() < 1e-8 {
@@ -259,6 +347,7 @@ pub fn run_foce_gn(
                         iter
                     );
                 }
+                exited_early = true;
                 break;
             } else {
                 // Degenerate BHHH: near-zero quadratic improvement despite a
@@ -271,9 +360,8 @@ pub fn run_foce_gn(
                             iter
                         );
                     }
-                    warnings.push(
-                        "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed".to_string(),
-                    );
+                    warnings.push(GN_DEGENERATE_COLLAPSE_WARNING.to_string());
+                    exited_early = true;
                     break;
                 }
                 if verbose {
@@ -290,13 +378,25 @@ pub fn run_foce_gn(
         let delta =
             DVector::from_iterator(n_packed, (0..n_packed).map(|i| delta_s[i] * gn_scale[i]));
         let mut x_try = x.clone();
+        let mut clamped = false;
         for i in 0..n_packed {
             x_try[i] = (x[i] + delta[i]).clamp(bounds.lower[i], bounds.upper[i]);
+            clamped |= x_try[i] != x[i] + delta[i];
         }
+        // rho is measured against the reduction the model predicts for the step
+        // actually taken. On the unclamped `delta_s` a clamped coordinate still
+        // claims its share, so rho is a fixed ratio below 0.25 at every radius and
+        // the region collapses (#2777, `one_cpt_transit`: 0.214 down to 1e-10).
+        let pred_taken = if clamped {
+            taken_step_reduction(&grad_s, &h_s, &x, &x_try, &gn_scale)
+        } else {
+            pred_reduction
+        };
 
         let params_try = unpack_params(&x_try, init_params);
         let try_mu_k = compute_mu_k(model, &params_try.theta, options.mu_referencing);
-        // Warm from the accepted point's whole mode, κ̂ with η̂ (#2261).
+        // Warm from the accepted point's whole mode, κ̂ with η̂ (#2261) — a solve's output,
+        // so an exactly-zero EBE among them is not re-solved as a cold start.
         let warm = crate::estimation::outer_optimizer::joint_warm_starts(&eta_hats, &kappas);
         let (eta_try, h_try, _, kap_try) = run_inner_loop_warm_seeded(
             model,
@@ -310,6 +410,7 @@ pub fn run_foce_gn(
             options.inner_restarts,
             InnerHessianSeed::for_options(options),
             options,
+            PrevEtas::Solved,
         );
         let ofv_try_clean = 2.0
             * pop_nll(
@@ -326,8 +427,9 @@ pub fn run_foce_gn(
 
         // TR ratio: actual OFV decrease vs quadratic model decrease.
         // rho < 0 or non-finite OFV → reject.
-        let rho = if ofv_try.is_finite() {
-            (ofv - ofv_try) / pred_reduction
+        // A clamped step the model no longer predicts to descend is rejected too.
+        let rho = if ofv_try.is_finite() && pred_taken > 0.0 {
+            (ofv - ofv_try) / pred_taken
         } else {
             -1.0
         };
@@ -335,6 +437,12 @@ pub fn run_foce_gn(
         let radius_before = trust_radius;
         let (new_radius, accepted) = update_trust_radius(rho, trust_radius, delta_max);
         trust_radius = new_radius;
+
+        if accepted || clamped {
+            unclamped_stalls = 0;
+        } else {
+            unclamped_stalls += 1;
+        }
 
         if !accepted {
             // Trace: rejected step — use radius_before so the column records
@@ -367,7 +475,8 @@ pub fn run_foce_gn(
                 if verbose {
                     eprintln!("  GN iter {:>3}: trust radius collapsed, stopping", iter);
                 }
-                warnings.push("Gauss-Newton: trust radius collapsed".to_string());
+                warnings.push(GN_COLLAPSE_WARNING.to_string());
+                exited_early = true;
                 break;
             }
             if verbose {
@@ -435,18 +544,32 @@ pub fn run_foce_gn(
             );
         }
 
-        // Check convergence
-        if rel_change < 1e-6 && iter > 3 {
+        // Check convergence. A small change on a boundary step at a collapsed radius is
+        // not convergence (#2738): the loop continues to the collapse or the budget.
+        if gn_small_change_converged(rel_change, iter, radius_before) {
             converged = true;
             if verbose {
                 eprintln!("  Converged: relative OFV change = {:.2e}", rel_change);
             }
+            exited_early = true;
             break;
+        }
+        if verbose && rel_change < 1e-6 && iter > 3 {
+            eprintln!(
+                "  GN iter {:>3}: small OFV change at a collapsed trust radius \
+                 ({:.2e}), not taken as convergence",
+                iter, radius_before
+            );
         }
     }
 
+    let gn_budget_spent = gn_loop_budget_spent(maxiter, exited_early);
+    // #1049: one non-convergence message per stop. A collapse or a cancel already pushed
+    // its own reason; "max iterations" is true only when the budget ran out.
+    if gn_budget_spent && !converged {
+        warnings.push(GN_BUDGET_WARNING.to_string());
+    }
     if !converged {
-        warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
         // #1006: at n_eta = 0 an unconverged pure-GN run is the state that
         // predicts a badly wrong answer — there is no inner EBE loop to absorb
         // a poor start, so the BHHH step can collapse orders of magnitude above
@@ -536,10 +659,18 @@ pub fn run_foce_gn(
             warnings: cov_warnings,
             sir_fallback_proposal,
             method: covariance_method,
+            newton_decrement,
+            non_stationary_optimum,
         } = out;
         warnings.extend(cov_warnings);
+        // #2785: the GN stop rule is a small step, which a stall satisfies too.
+        crate::estimation::covariance::demote_non_stationary_optimum(
+            non_stationary_optimum,
+            &mut converged,
+            &mut warnings,
+        );
 
-        // #1303: `converged` here is the LM loop's own stop rule (a small
+        // #1303: `converged` here is the GN loop's own stop rule (a small
         // parameter/objective step), which a run whose objective went `NaN`
         // partway can still satisfy. Gate it on the objective this result
         // publishes.
@@ -592,6 +723,9 @@ pub fn run_foce_gn(
             start_eval: None,
             mcem_lowest_objective: None,
             mcem_objective_trail: None,
+            newton_decrement,
+            optimizer_stop: None,
+            eval_budget_spent: gn_budget_spent,
         };
     }
 
@@ -720,8 +854,16 @@ pub fn run_foce_gn(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum,
     } = out;
     warnings.extend(cov_warnings);
+    // #2785: whichever half supplied the estimate, it is not a stationary point.
+    crate::estimation::covariance::demote_non_stationary_optimum(
+        non_stationary_optimum,
+        &mut converged,
+        &mut warnings,
+    );
 
     // #1303 — the hybrid's verdict is `polish_result.converged || converged`, an
     // OR that can keep a `true` from whichever half did *not* supply `final_ofv`.
@@ -772,6 +914,12 @@ pub fn run_foce_gn(
         start_eval: None,
         mcem_lowest_objective: None,
         mcem_objective_trail: None,
+        newton_decrement,
+        optimizer_stop: None,
+        // The hybrid's estimate is the FOCEI polish's or the GN phase's; the polish runs its
+        // own fixed 100-evaluation budget, not the user's `maxiter`, so neither half's budget
+        // is the fit's to report (#2799).
+        eval_budget_spent: false,
     }
 }
 
@@ -852,6 +1000,126 @@ fn update_trust_radius(rho: f64, current: f64, delta_max: f64) -> (f64, bool) {
         ((current * 2.0).min(delta_max), true)
     } else {
         (current, true)
+    }
+}
+
+/// Take coordinate `i` out of the trust-region subproblem: zero its gradient entry and
+/// its BHHH row and column, and set the diagonal to 1, so the solve returns
+/// `delta[i] = 0` exactly. Used for FIX coordinates and for bound-active ones
+/// ([`bound_active_outward`]).
+fn hold_coordinate(grad: &mut DVector<f64>, h: &mut DMatrix<f64>, i: usize) {
+    let n = grad.len();
+    grad[i] = 0.0;
+    for j in 0..n {
+        h[(i, j)] = 0.0;
+        h[(j, i)] = 0.0;
+    }
+    h[(i, i)] = 1.0;
+}
+
+/// Coordinates sitting on a packed bound whose descent direction `−grad` points out of
+/// the box (#2777). The step clamps them back to the bound, so the coordinate never
+/// moves; left in the subproblem it still bends the rest of the step toward it and
+/// claims part of the predicted reduction. Holding them like FIX coordinates for the
+/// iteration is the projected (active-set) trust region. A coordinate on a bound
+/// whose gradient points back inside stays free.
+fn bound_active_outward(x: &[f64], grad: &DVector<f64>, bounds: &PackedBounds) -> Vec<bool> {
+    (0..x.len())
+        .map(|i| {
+            (x[i] >= bounds.upper[i] && grad[i] < 0.0) || (x[i] <= bounds.lower[i] && grad[i] > 0.0)
+        })
+        .collect()
+}
+
+/// Reduction the quadratic model `m(s) = gᵀs + ½ sᵀHs` predicts for the step `s`:
+/// `−gᵀs − ½ sᵀHs`.
+fn model_reduction(g: &DVector<f64>, h: &DMatrix<f64>, s: &DVector<f64>) -> f64 {
+    -g.dot(s) - 0.5 * s.dot(&(h * s))
+}
+
+/// [`model_reduction`] for the step actually taken from `x` to the clamped `x_try`,
+/// in the scaled space the model was built in (#2777). A coordinate the clamp held still
+/// contributes nothing, where the unclamped step would credit it its full share.
+fn taken_step_reduction(
+    g_s: &DVector<f64>,
+    h_s: &DMatrix<f64>,
+    x: &[f64],
+    x_try: &[f64],
+    scale: &[f64],
+) -> f64 {
+    let taken_s =
+        DVector::from_iterator(x.len(), (0..x.len()).map(|i| (x_try[i] - x[i]) / scale[i]));
+    model_reduction(g_s, h_s, &taken_s)
+}
+
+/// Consecutive rejected, unclamped steps after which GN looks for one subject whose
+/// EBE-response term `tᵢ` sets the step direction ([`dominant_ebe_response_subject`]).
+/// Three rejections shrink the radius 64×: a step direction that is right at the point
+/// but wrong over every usable radius (#2777) already shows by then, while an ordinary
+/// overshoot is usually fixed by one or two shrinks.
+const GN_DOMINANT_SUBJECT_STALLS: usize = 3;
+
+/// How many times the next-largest subject's `‖tᵢ‖` the largest must be to count as
+/// dominant. #2777's private ODE IOV model measured 4919 against 1.0.
+const GN_DOMINANT_SUBJECT_RATIO: f64 = 10.0;
+
+/// The subject whose EBE-response term `tᵢ` alone sets GN's step direction, if any (#2777).
+///
+/// A subject whose EBE mode sits near a fold has a correct `tᵢ = dᵢ − gᵢ` at the point,
+/// but the slope changes over a distance far smaller than any step GN can take, so a
+/// direction it dominates is wrong at every radius and the trust region collapses. A
+/// subject qualifies when, in the scaled space the step is solved in (`scale`), its
+/// `‖tᵢ‖∞` is at least [`GN_DOMINANT_SUBJECT_RATIO`] times every other subject's, and on
+/// some coordinate its contribution `2·tᵢ[k]` outweighs the rest of the gradient
+/// `grad[k] − 2·tᵢ[k]`. With fewer than two subjects there is nothing to compare against.
+/// Both tests read only the coordinates `free` marks: a FIX coordinate, or one held on
+/// its bound, never entered the steps that were rejected.
+fn dominant_ebe_response_subject(
+    per_subj_t: &[Vec<f64>],
+    grad: &DVector<f64>,
+    scale: &[f64],
+    free: &[bool],
+) -> Option<usize> {
+    if per_subj_t.len() < 2 {
+        return None;
+    }
+    let norms: Vec<f64> = per_subj_t
+        .iter()
+        .map(|t| {
+            t.iter()
+                .zip(scale)
+                .zip(free)
+                .filter(|(_, &f)| f)
+                .map(|((tk, sk), _)| (tk * sk).abs())
+                .fold(0.0, f64::max)
+        })
+        .collect();
+    if norms.iter().any(|m| !m.is_finite()) {
+        return None;
+    }
+    let (s, &top) = norms.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+    let runner_up = norms
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| i != s)
+        .map(|(_, &m)| m)
+        .fold(0.0, f64::max);
+    if top <= 0.0 || top < GN_DOMINANT_SUBJECT_RATIO * runner_up {
+        return None;
+    }
+    let sets_direction = per_subj_t[s]
+        .iter()
+        .enumerate()
+        .any(|(k, &tk)| free[k] && (2.0 * tk).abs() > (grad[k] - 2.0 * tk).abs());
+    sets_direction.then_some(s)
+}
+
+/// Take one subject's EBE-response term `t` back out of the gradient (`grad −= 2·t`) and
+/// zero it, so the subject contributes its raw score and cannot be picked again.
+fn drop_ebe_response(grad: &mut DVector<f64>, t: &mut [f64]) {
+    for (g, tk) in grad.iter_mut().zip(t.iter_mut()) {
+        *g -= 2.0 * *tk;
+        *tk = 0.0;
     }
 }
 
@@ -1115,7 +1383,7 @@ fn subject_nll_pop_grad_analytical(
 
             // d(ipreds)/dx_k: FD perturb theta and re-evaluate predictions.
             let d_ipreds: Vec<f64> = {
-                let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
+                let h = fd_step(eps, x[k], fd_step_floor(template, model, k));
                 let xk_plus = (x[k] + h).min(bounds.upper[k]);
                 let actual_h = xk_plus - x[k];
                 if actual_h.abs() < 1e-16 {
@@ -1142,7 +1410,7 @@ fn subject_nll_pop_grad_analytical(
             // is always FD. Cheap (one extra prediction eval per free θ) and only on
             // the f-dependent path. For additive error `dr_j == 0`, so it is unused.
             let d_pop_preds: Vec<f64> = if use_pop_var {
-                let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
+                let h = fd_step(eps, x[k], fd_step_floor(template, model, k));
                 let xk_plus = (x[k] + h).min(bounds.upper[k]);
                 let actual_h = xk_plus - x[k];
                 if actual_h.abs() < 1e-16 {
@@ -1637,7 +1905,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
             // of a second prediction call. Both perturbations are clamped to bounds
             // and the actual span is used as the denominator (degrades gracefully to
             // one-sided at a boundary).
-            let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
+            let h = fd_step(eps, x[k], fd_step_floor(template, model, k));
             let xk_plus = (x[k] + h).min(bounds.upper[k]);
             let xk_minus = (x[k] - h).max(bounds.lower[k]);
             let actual_h = xk_plus - xk_minus;
@@ -2376,7 +2644,7 @@ pub(crate) fn subject_nll_pop_grad(
         if fixed_mask[j] {
             continue;
         }
-        let h = fd_step(eps, x[j], fd_step_floor(template, &model.default_params, j));
+        let h = fd_step(eps, x[j], fd_step_floor(template, model, j));
         let xj_plus = (x[j] + h).min(bounds.upper[j]);
         let xj_minus = (x[j] - h).max(bounds.lower[j]);
         let actual_2h = xj_plus - xj_minus;
@@ -2508,6 +2776,7 @@ pub(crate) fn subject_nll_pop_grad_with_cache(
 /// Each subject contributes its per-subject NLL gradient g_i; the totals are:
 ///   grad(OFV) = 2 * Σ_i g_i
 ///   H_bhhh(OFV) ≈ 4 * Σ_i g_i g_i^T   (BHHH approximation)
+#[allow(clippy::too_many_arguments)]
 fn build_gn_system(
     x: &[f64],
     template: &ModelParameters,
@@ -2519,6 +2788,27 @@ fn build_gn_system(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> (DVector<f64>, DMatrix<f64>) {
+    let (grad, h_bhhh, _) = build_gn_system_parts(
+        x, template, model, population, eta_hats, h_matrices, kappas, bounds, options,
+    );
+    (grad, h_bhhh)
+}
+
+/// [`build_gn_system`], also returning each subject's EBE-response term `tᵢ` (unscaled
+/// packed space, before the factor 2 the gradient applies), so the step loop can take a
+/// subject back to its raw score (#2777, [`dominant_ebe_response_subject`]).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn build_gn_system_parts(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> (DVector<f64>, DMatrix<f64>, Vec<Vec<f64>>) {
     let n = x.len();
     let n_subj = population.subjects.len();
     // One unpack for the population, read by every IOV subject's outer gradient (#2455).
@@ -2611,7 +2901,8 @@ fn build_gn_system(
         }
     }
 
-    (grad, h_bhhh)
+    let per_subj_t = per_subj.into_iter().map(|(_, _, ti)| ti).collect();
+    (grad, h_bhhh, per_subj_t)
 }
 
 /// Compute FOCE NLL for a single subject at given parameters with fixed EBEs.
@@ -3051,6 +3342,80 @@ mod tests {
         }
     }
 
+    /// #2738: the small-change stop counts only off a collapsed radius. Each pair differs
+    /// in one input and straddles one condition. The first row is the `warfarin_bloq` tail
+    /// (rel 5.02e-7 at iteration 31, step at radius 9.5e-6), which the old
+    /// `rel_change < 1e-6 && iter > 3` rule called converged. A small step strictly inside
+    /// a collapsed radius is not convergence either: truncated CG returns such a step when
+    /// it exhausts its budget with a large residual (review of #2738), so the rule takes no
+    /// step norm at all. Mutations: drop the radius conjunct (the old rule) → the first row
+    /// passes; `>=` → `>` at the floor → the floor row fails; drop either original
+    /// conjunct → its row fails.
+    #[test]
+    fn small_change_is_not_convergence_at_a_collapsed_radius() {
+        // Collapsed radius: not convergence, at any relative change.
+        assert!(!gn_small_change_converged(5.02e-7, 31, 9.5367e-6));
+        assert!(!gn_small_change_converged(4.57e-9, 16, 2.9802e-8));
+        // Same step under a radius that had not collapsed: the old verdict stands.
+        assert!(gn_small_change_converged(5.02e-7, 31, 0.5));
+        assert!(gn_small_change_converged(5.02e-7, 31, GN_COLLAPSED_RADIUS));
+        assert!(!gn_small_change_converged(
+            5.02e-7,
+            31,
+            GN_COLLAPSED_RADIUS * 0.999
+        ));
+        // The two original conditions still gate it.
+        assert!(!gn_small_change_converged(2e-6, 31, 0.5));
+        assert!(!gn_small_change_converged(5.02e-7, 3, 0.5));
+        assert!(gn_small_change_converged(5.02e-7, 4, 0.5));
+    }
+
+    /// #1049: a stop that is not a spent budget carries its own reason and not
+    /// "max iterations reached". A cancel set before the first iteration exits through the
+    /// cancel `break`; before #1049 it also carried the budget message. The collapse
+    /// messages are non-convergence, so they classify `Critical`/`Convergence`, the class
+    /// the budget message had — dropping it must not downgrade a collapsed run.
+    #[test]
+    fn an_early_stop_does_not_claim_the_iteration_budget() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/one_cpt_iv.ferx"))
+                .expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("data loads");
+        let flag = crate::cancel::CancelFlag::new();
+        flag.cancel();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            outer_maxiter: 5,
+            run_covariance_step: false,
+            cancel: Some(flag),
+            ..Default::default()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(!res.converged);
+        assert!(
+            res.warnings.iter().any(|w| w == "cancelled by user"),
+            "{:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings.iter().any(|w| w == GN_BUDGET_WARNING),
+            "a cancel is not a spent budget: {:?}",
+            res.warnings
+        );
+        for w in [
+            GN_COLLAPSE_WARNING,
+            GN_DEGENERATE_COLLAPSE_WARNING,
+            GN_BUDGET_WARNING,
+        ] {
+            let c = crate::types::classify_warning(w);
+            assert_eq!(c.severity, crate::types::WarningSeverity::Critical, "{w}");
+            assert_eq!(c.category.as_str(), "convergence", "{w}");
+            assert!(!w.contains("max iterations") || w == GN_BUDGET_WARNING);
+        }
+    }
+
     /// update_trust_radius: rho > 0.75 expands the radius (× 2) and accepts.
     #[test]
     fn test_update_trust_radius_expands_on_good_step() {
@@ -3117,6 +3482,182 @@ mod tests {
             (radius - 1.0).abs() < 1e-12,
             "radius must stay at 1.0 for rho=0.75: got {radius}"
         );
+    }
+
+    /// #2777: a coordinate on a bound is held only when `−grad` points out of the box.
+    /// Each bound is checked on both signs of the gradient, and an interior coordinate
+    /// with either sign stays free.
+    #[test]
+    fn bound_active_outward_holds_only_coordinates_pushed_out_of_the_box() {
+        let bounds = PackedBounds {
+            lower: vec![0.0; 6],
+            upper: vec![1.0; 6],
+        };
+        let x = [1.0, 1.0, 0.0, 0.0, 0.5, 0.5];
+        let grad = DVector::from_vec(vec![-1.0, 1.0, 1.0, -1.0, -1.0, 1.0]);
+        assert_eq!(
+            bound_active_outward(&x, &grad, &bounds),
+            vec![true, false, true, false, false, false]
+        );
+    }
+
+    /// #2777: the held coordinate gets `delta = 0` from the subproblem, and the rest of
+    /// the step is the one the reduced system gives.
+    #[test]
+    fn a_held_coordinate_does_not_move_in_the_trust_region_step() {
+        let mut g = DVector::from_vec(vec![-2.0, 1.0]);
+        let mut h = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
+        hold_coordinate(&mut g, &mut h, 0);
+        assert_eq!(g, DVector::from_vec(vec![0.0, 1.0]));
+        assert_eq!(h, DMatrix::from_row_slice(2, 2, &[1.0, 0.0, 0.0, 1.0]));
+        let step = solve_trust_region_subproblem(&g, &h, 10.0, 10);
+        assert_eq!(step[0], 0.0);
+        assert!((step[1] + 1.0).abs() < 1e-12, "got {step:?}");
+        // −gᵀs − ½sᵀHs at s = (0, −1): 1 − 0.5.
+        assert!((model_reduction(&g, &h, &step) - 0.5).abs() < 1e-12);
+    }
+
+    /// #2777: rho is measured against the step taken. With coordinate 0 already on its
+    /// upper bound, the clamp turns the proposed `(1, −1)` into `(0, −1)`; the reduction
+    /// must be the model's on `(0, −1)`, here 0.5, not on `(1, −1)` (1.5), which credits
+    /// the coordinate that never moved. The scale divides the taken step back into the
+    /// model's space.
+    #[test]
+    fn the_predicted_reduction_is_for_the_clamped_step() {
+        let g = DVector::from_vec(vec![-2.0, 1.0]);
+        let h = DMatrix::from_row_slice(2, 2, &[2.0, 0.0, 0.0, 1.0]);
+        let x = [1.0, 0.0];
+        let x_try = [1.0, -1.0];
+        assert!((taken_step_reduction(&g, &h, &x, &x_try, &[1.0, 1.0]) - 0.5).abs() < 1e-12);
+        assert!((model_reduction(&g, &h, &DVector::from_vec(vec![1.0, -1.0])) - 1.5).abs() < 1e-12);
+        // Scale 2 on coordinate 1: the taken −1 is −0.5 in the model's space,
+        // −gᵀs − ½sᵀHs = 0.5 − 0.125.
+        assert!((taken_step_reduction(&g, &h, &x, &x_try, &[1.0, 2.0]) - 0.375).abs() < 1e-12);
+    }
+
+    /// #2777: a step that crosses a bound before the coordinate is active is judged on
+    /// the step taken. Unbounded, this fixture's TVV ends at 49.868 from its start of 50;
+    /// a lower bound of 49.95 sits between the two, so the first step clamps TVV. On the
+    /// taken step the first iteration is accepted and the fit moves onto the bound; on
+    /// the unclamped prediction rho credits the clamped share and rejects it, and the
+    /// one-iteration fit stays at the start.
+    #[test]
+    fn a_step_clamped_by_a_bound_is_judged_on_the_step_taken() {
+        let mut model = make_model();
+        model.default_params.theta_lower[1] = 49.9999;
+        model.default_params.omega_fixed = vec![true];
+        model.default_params.sigma_fixed = vec![true];
+        let pop = make_population();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            outer_maxiter: 1,
+            run_covariance_step: false,
+            ..Default::default()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(
+            (res.params.theta[1] / 49.9999 - 1.0).abs() < 1e-12,
+            "the first step must be accepted onto the TVV bound: TVV = {}",
+            res.params.theta[1]
+        );
+    }
+
+    /// #2777: a subject is dominant only when its scaled `‖tᵢ‖∞` is at least 10× every
+    /// other subject's *and* it outweighs the rest of the gradient on some coordinate.
+    /// Each condition is broken alone, and the passing case is the issue's measured one
+    /// (4919 against 1.0 on TVQ, the rest of the gradient −184).
+    #[test]
+    fn dominant_ebe_response_subject_needs_both_dominance_and_direction() {
+        let scale = [1.0, 1.0];
+        let free = [true, true];
+        let others = vec![vec![1.0, 0.2]; 4];
+        let with = |t: Vec<f64>| {
+            let mut all = others.clone();
+            all.insert(2, t);
+            all
+        };
+        // grad = 2·Σtᵢ + rest, with rest = (−184 − 8, 30) so the rest of the gradient
+        // on k = 0 is −184 once the dominant 2·4919 is removed.
+        let grad_for = |ts: &[Vec<f64>], rest: [f64; 2]| {
+            DVector::from_iterator(
+                2,
+                (0..2).map(|k| rest[k] + 2.0 * ts.iter().map(|t| t[k]).sum::<f64>()),
+            )
+        };
+        let ts = with(vec![4919.0, 3.0]);
+        let g = grad_for(&ts, [-192.0, 30.0]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &free),
+            Some(2)
+        );
+
+        // Under 10× the runner-up: not dominant.
+        let ts = with(vec![9.0, 0.0]);
+        let g = grad_for(&ts, [-192.0, 30.0]);
+        assert_eq!(dominant_ebe_response_subject(&ts, &g, &scale, &free), None);
+
+        // Dominant over the subjects, but the rest of the gradient outweighs it on
+        // every coordinate.
+        let ts = with(vec![4919.0, 3.0]);
+        let g = grad_for(&ts, [1e5, 1e5]);
+        assert_eq!(dominant_ebe_response_subject(&ts, &g, &scale, &free), None);
+
+        // The comparison is made in the scaled space the step is solved in: the same
+        // `tᵢ` stops dominating when its coordinate is scaled down below the others'.
+        let ts = with(vec![4919.0, 0.0]);
+        let g = grad_for(&ts, [-192.0, 30.0]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &[1e-4, 1.0], &free),
+            None
+        );
+
+        // A held or FIX coordinate does not count (#2777 review). Each mask is broken
+        // alone. Norm: dominant only through coordinate 0; on coordinate 1 alone its 1.0
+        // is 5× the others' 0.2, under the ratio, while it does outweigh the rest of the
+        // gradient there (rest 0 once its 2·1.0 is removed), so only the norm's mask
+        // rejects it.
+        let ts = with(vec![4919.0, 1.0]);
+        let g = grad_for(&ts, [-192.0, -1.6]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &[false, true]),
+            None,
+            "the norm must read only free coordinates"
+        );
+        // Direction: dominant on both coordinates, but outweighs the rest only on 0.
+        let ts = with(vec![4919.0, 4919.0]);
+        let g = grad_for(&ts, [-192.0, 1e6]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &[true, true]),
+            Some(2)
+        );
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &g, &scale, &[false, true]),
+            None,
+            "the direction test must read only free coordinates"
+        );
+
+        // One subject has nothing to be dominant over; a non-finite `tᵢ` is not ranked.
+        let one = vec![vec![4919.0, 0.0]];
+        assert_eq!(
+            dominant_ebe_response_subject(&one, &grad_for(&one, [0.0, 0.0]), &scale, &free),
+            None
+        );
+        let ts = with(vec![f64::NAN, 0.0]);
+        assert_eq!(
+            dominant_ebe_response_subject(&ts, &DVector::zeros(2), &scale, &free),
+            None
+        );
+    }
+
+    /// #2777: dropping a subject's `tᵢ` leaves its raw score in the gradient and zeroes
+    /// the term, so a second detection cannot pick the same subject.
+    #[test]
+    fn drop_ebe_response_restores_the_raw_score_and_clears_the_term() {
+        let mut grad = DVector::from_vec(vec![10.0, -4.0]);
+        let mut t = vec![3.0, -1.0];
+        drop_ebe_response(&mut grad, &mut t);
+        assert_eq!(grad, DVector::from_vec(vec![4.0, -2.0]));
+        assert_eq!(t, vec![0.0, 0.0]);
     }
 
     /// Verify that build_gn_system returns a gradient and BHHH Hessian with
@@ -5905,6 +6446,54 @@ mod tests {
             "mixed-effects gn must not carry the #1006 warning: {:?}",
             res.warnings
         );
+    }
+
+    /// #2799 r1 #2: pure Gauss–Newton publishes `eval_budget_spent` when its loop runs off
+    /// the end of `maxiter`, and not when a stop rule ends it or no iteration runs. The
+    /// 2-iteration run cannot converge (the only normal convergence branch needs `iter > 3`);
+    /// the 200-iteration run on `one_cpt_iv` converges and breaks out (the pooled `n_eta = 0`
+    /// model never converges under pure GN, #1006, so it cannot be the twin). `maxiter = 0` is an
+    /// evaluation. Mutation: drop the `exited_early = true` on the relative-change stop (the
+    /// one this fixture converges through) → the converging run reads `true`; drop the
+    /// `maxiter > 0` conjunct → the evaluation reads `true`; fill `false` → the short run.
+    /// The cancel, collapse and zero-gradient breaks set the same flag and are not reached here.
+    #[test]
+    fn pure_gn_reports_a_spent_iteration_budget() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/one_cpt_iv.ferx"))
+                .expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("data loads");
+        let run = |maxiter: usize| {
+            let opts = FitOptions {
+                method: EstimationMethod::FoceGn,
+                outer_maxiter: maxiter,
+                run_covariance_step: false,
+                ..Default::default()
+            };
+            run_foce_gn(&model, &pop, &model.default_params, &opts)
+        };
+        let short = run(2);
+        assert!(!short.converged, "a 2-iteration GN budget cannot converge");
+        assert!(short.eval_budget_spent, "{:?}", short.warnings);
+        assert!(
+            short.warnings.iter().any(|w| w == GN_BUDGET_WARNING),
+            "{:?}",
+            short.warnings
+        );
+        let long = run(200);
+        assert!(
+            long.converged,
+            "the straddle needs a converging twin: {:?}",
+            long.warnings
+        );
+        assert!(!long.eval_budget_spent);
+        assert!(!long.warnings.iter().any(|w| w == GN_BUDGET_WARNING));
+        assert!(!run(0).eval_budget_spent, "an evaluation spends no budget");
+        assert!(!gn_loop_budget_spent(0, false));
+        assert!(gn_loop_budget_spent(3, false));
+        assert!(!gn_loop_budget_spent(3, true));
     }
 
     /// `gn_hybrid` options with the FOCEI polish reached through `run_foce_gn`.

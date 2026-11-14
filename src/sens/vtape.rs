@@ -1228,8 +1228,14 @@ impl<const N: usize, const M: usize, const TH: bool> PkNum for DualV<N, M, TH> {
         let x = self.v;
         self.unary(x.ln(), 1.0 / x, -1.0 / (x * x), || 2.0 / (x * x * x))
     }
+    // A non-positive argument is flat — a constant, zero derivative — on every
+    // `PkNum` type, as `Dual1::sqrt` has it and as `guard_floor` says of the floored
+    // region; `0.5 / 0` would put `inf·0 = NaN` in the jet (#2892).
     fn sqrt(self) -> Self {
         let s = self.v.sqrt();
+        if !(self.v > 0.0) {
+            return DualV::constant(s);
+        }
         self.unary(s, 0.5 / s, -0.25 / (s * s * s), || {
             0.375 / (s * s * s * s * s)
         })

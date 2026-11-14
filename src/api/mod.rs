@@ -63,7 +63,12 @@ mod pool;
 pub(crate) mod postfit;
 mod predict;
 mod run;
+mod scoring_horizon;
 mod simulate;
+#[cfg(feature = "survival")]
+mod vpc_rtte;
+#[cfg(feature = "survival")]
+mod vpc_tte;
 
 pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
@@ -104,22 +109,25 @@ pub(crate) use pool::{default_fit_pool, fit_scope_pool};
 // The fit path reaches these through `kappa_shrinkages` (#1911); the shrinkage tests
 // call them directly.
 pub(crate) use postfit::{
-    absorption_flip_flop_ebe_warning, apply_sir_result, boundary_estimate_warning,
-    compute_eps_shrinkage, compute_eta_shrinkage, compute_param_corr, compute_subject_results,
-    contribution_terms, cov_diagnostics, covariate_relation_estimates, degenerate_cl_v_warning,
-    eps_shrinkage_warning, eta_shrinkage_warning, extract_residual_correlation_se,
-    extract_standard_errors, high_correlation_warning, inflated_rse_warning, integrates_odes,
+    absorption_flip_flop_ebe_warning, apply_held_at_bound, apply_sir_result,
+    boundary_estimate_warning, compute_eps_shrinkage, compute_eta_shrinkage, compute_param_corr,
+    compute_subject_results, contribution_terms, cov_diagnostics, covariate_relation_estimates,
+    degenerate_cl_v_warning, eps_shrinkage_warning, eta_shrinkage_warning,
+    extract_mixture_override_se, extract_residual_correlation_se, extract_standard_errors,
+    held_guard_coordinates, high_correlation_warning, inflated_rse_warning, integrates_odes,
     is_last_estimating_stage, kappa_shrinkages, kappa_weight_typicals, keep_gn_zero_eta_warning,
     mcem_marginal_warning, mcem_settling_warning, name_nonfinite_subjects, non_fit_diagnostics,
     nonfinite_objective_warning, ode_solver_diagnostics_warning, probe_nlopt_algorithms,
-    profiled_bound_report, rebuild_warnings_structured, refresh_profiled_bound_report,
-    report_resolved_levels, resolve_covariance_status, resolve_sir_fallback, runaway_guard_warning,
-    sir_unavailable_warning, solver_stats_scope, stalled_at_init_warning,
-    sweep_sensitivity_solver_stats, with_solver_stats, ContributionSource, SolverStatsPhase,
+    profiled_bound_report, rebuild_warnings_structured, refresh_held_at_bound_report,
+    refresh_profiled_bound_report, report_resolved_levels, resolve_covariance_status,
+    resolve_sir_fallback, runaway_guard_warning_for, sir_unavailable_warning, solver_stats_scope,
+    stalled_at_init_warning, step_held, sweep_sensitivity_solver_stats, with_solver_stats,
+    ContributionSource, SolverStatsPhase,
 };
 #[cfg(test)]
 pub(crate) use postfit::{
-    compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ, profiled_bound_warning,
+    compute_kappa_shrinkage, compute_kappa_shrinkage_by_occ, held_at_bound_list,
+    profiled_bound_warning,
 };
 pub(crate) use predict::predict_diag_undrained;
 pub use predict::{predict, predict_diag, PredictionOutput, PredictionResult};
@@ -139,6 +147,13 @@ pub use run::{
     run_model_with_overrides, PreparedRun, ReaderSettings, RunOverrides,
 };
 pub(crate) use simulate::check_theta_length;
+#[cfg(feature = "survival")]
+pub use vpc_rtte::{vpc_rtte, RtteMcfBand, RtteOrderBand, RtteVpc, RtteVpcStratum, VpcRtteOptions};
+#[cfg(feature = "survival")]
+pub use vpc_tte::{
+    vpc_tte, TteVpc, TteVpcStratum, VpcCensoring, VpcGrid, VpcStratify, VpcTteOptions,
+    VPC_TTE_MAX_STRATA,
+};
 
 #[cfg(test)]
 thread_local! {
@@ -174,13 +189,15 @@ pub(crate) use adaptive::{
 pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
-    multistart_prefers, perturb_init, saem_active_covariate_group_etas,
+    dw_autocorrelation_warning, multistart_prefers, perturb_init, saem_active_covariate_group_etas,
     saem_active_mixture_switched_etas, saem_non_mu_referenced_individual_params_warning,
+    select_start, DwAdvice, SubjectLine,
 };
 #[cfg(test)]
 pub(crate) use pool::{
-    cap_default_threads, default_thread_count, effective_default_threads, reconfiguration_result,
-    resolve_default_threads,
+    cap_default_threads, default_thread_count, effective_default_threads, fit_thread_warnings_with,
+    reconfiguration_result, resolve_default_threads, resolve_fit_threads, thread_warnings,
+    ThreadSource,
 };
 #[cfg(test)]
 pub(crate) use postfit::{
@@ -191,6 +208,7 @@ pub(crate) use postfit::{
 pub(crate) use predict::grid_median_from_cumhaz;
 #[cfg(test)]
 pub(crate) use run::derive_output_occasions;
+pub(crate) use scoring_horizon::scored_population;
 #[cfg(test)]
 pub(crate) use simulate::emit_correlated_residual_rows;
 pub(crate) use simulate::{correlated_residual_draw, draw_correlations, SimClasses};
@@ -242,7 +260,7 @@ pub(crate) fn model_preds(
 /// [output] is allowed but produces a W_OUTPUT_DUPLICATE warning.
 const OUTPUT_MANDATORY: &[&str] = &[
     "ID", "TIME", "DV", "CENS", "OCC", "CMT", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD",
-    "EBE_OFV", "N_OBS", "TAFD", "TAD",
+    "EPRED", "PWRES", "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD",
 ];
 
 // ── Step 8: post-fit extra column computation ────────────────────────────────
@@ -293,6 +311,10 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/threads_override_tests.rs"]
 mod threads_override_tests;
+
+#[cfg(test)]
+#[path = "tests/thread_env_tests.rs"]
+mod thread_env_tests;
 
 #[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
@@ -428,6 +450,10 @@ mod no_feasible_eval_tests;
 mod ode_solver_options_tests;
 
 #[cfg(test)]
+#[path = "tests/held_at_bound_tests.rs"]
+mod held_at_bound_tests;
+
+#[cfg(test)]
 #[path = "tests/simulate_with_uncertainty_tests.rs"]
 mod simulate_with_uncertainty_tests;
 
@@ -548,6 +574,16 @@ mod adaptive_moved_reset_tests;
 #[path = "tests/adaptive_written_time_tests.rs"]
 mod adaptive_written_time_tests;
 
+// #2741: the controller assay applies the residual-error magnitude.
+#[cfg(test)]
+#[path = "tests/adaptive_assay_magnitude_tests.rs"]
+mod adaptive_assay_magnitude_tests;
+
+// #2753: compartment on/off records on the adaptive path.
+#[cfg(test)]
+#[path = "tests/adaptive_cmt_toggle_tests.rs"]
+mod adaptive_cmt_toggle_tests;
+
 // #2156: FREM covariate rows on the adaptive path.
 #[cfg(test)]
 #[path = "tests/adaptive_frem_tests.rs"]
@@ -562,6 +598,16 @@ mod frem_ode_sdtab_tests;
 #[cfg(test)]
 #[path = "tests/adaptive_dose_expr_tests.rs"]
 mod adaptive_dose_expr_tests;
+
+// #944 PR2: which subjects a dose expression may read individual values for.
+#[cfg(test)]
+#[path = "tests/adaptive_dose_knowledge_tests.rs"]
+mod adaptive_dose_knowledge_tests;
+
+// #944 PR3: `round_to`, the dose grid.
+#[cfg(test)]
+#[path = "tests/adaptive_round_to_tests.rs"]
+mod adaptive_round_to_tests;
 
 // #1594: supplied per-subject η on the adaptive path.
 #[cfg(test)]

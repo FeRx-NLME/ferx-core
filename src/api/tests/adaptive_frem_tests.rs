@@ -173,6 +173,8 @@ fn spec_hold() -> AdaptiveDosingSpec {
         levels: None,
         target_window: None,
         auc_target: None,
+        round_to: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: -1e9,
@@ -579,6 +581,7 @@ fn simulate_with_uncertainty_diag_reports_a_drawn_frem_eta() {
             n_sim_per_draw: 1,
             method: crate::estimation::uncertainty_samples::UncertaintyMethod::Asymptotic,
             seed: Some(7),
+            horizon: None,
         },
     )
     .expect("uncertainty");

@@ -1407,6 +1407,39 @@ fn addl_implied_lag_subject(model: &CompiledModel, tv: bool) -> Subject {
     s
 }
 
+/// The implied dose (`doses[1]`) of `s` carries its parent's lag in slot `lag`, **and** that
+/// differs from the governing record's (#1909, #2367). The governing value is computed, not
+/// assumed: on a twin whose dose 1 is an ordinary dose (no parent), the same snapshot
+/// builder reads dose 1's lag at its own inputs — the governing record's, which is what the
+/// implied dose read before the copy. So the pair straddles the copy under the old
+/// behaviour: dropping the copy fails the first assertion, and a fixture edit that made the
+/// two lags equal fails the second.
+fn assert_implied_lag_is_the_parents(
+    model: &CompiledModel,
+    s: &Subject,
+    theta: &[f64],
+    lag: usize,
+    label: &str,
+) {
+    let mut dose = Vec::new();
+    crate::pk::compute_dose_pk_params_into(model, s, theta, &[0.0, 0.0], &mut dose);
+    let parent = dose[0].values[lag];
+    assert_eq!(
+        dose[1].values[lag], parent,
+        "{label}: the implied dose takes the parent's lag"
+    );
+    let mut own = s.clone();
+    own.doses[1].implied = None;
+    let mut own_dose = Vec::new();
+    crate::pk::compute_dose_pk_params_into(model, &own, theta, &[0.0, 0.0], &mut own_dose);
+    let governing = own_dose[1].values[lag];
+    assert!(
+        governing.is_finite() && (governing - parent).abs() > 0.1 * parent.abs(),
+        "{label}: the governing record's lag {governing} must differ from the parent's \
+         {parent}, or the copy assertion cannot fail"
+    );
+}
+
 #[test]
 fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
     // (ODE, IOV, time-varying X, bound): one row per seeder that copies the lag — the
@@ -1434,10 +1467,60 @@ fn an_addl_implied_dose_lag_from_its_parent_matches_reconverged_fd() {
         if !iov {
             // The copy is live: the parent's lag is half the governing record's.
             let lag = model.active_dose_attr_map().lag_slot(1);
-            let mut dose = Vec::new();
             let theta = &model.default_params.theta;
-            crate::pk::compute_dose_pk_params_into(&model, &s, theta, &[0.0, 0.0], &mut dose);
-            assert_eq!(dose[1].values[lag], dose[0].values[lag], "{label}");
+            assert_implied_lag_is_the_parents(&model, &s, theta, lag, &label);
+            let params = moved_params(&model);
+            let (gf, gl) = objective_gaps::<2>(&model, &s, &params, &[0.1, -0.05]);
+            assert!(
+                gf < 1e-10 && gl < 1e-10,
+                "{label}: kernel vs production {gf:.2e}, {gl:.2e}"
+            );
+        }
+        let worst = parity(&model, &s);
+        eprintln!("addl implied lag ({label}) vs reconverged FD {worst:.2e}");
+        assert!(
+            worst < bound,
+            "{label}: worst relative difference {worst:.2e}"
+        );
+    }
+}
+
+/// [`addl_lag_src`]'s ODE model with the lag written as the route's own (#2367): the dose
+/// into central is absorbed by `first_order(ka=KA, lag=LAGR)`, with no compartment lag.
+fn addl_route_lag_src(iov: bool) -> String {
+    addl_lag_src(true, iov)
+        .replace("LAGTIME =", "LAGR =")
+        .replace(
+            "ode(states=[depot, central])\n[odes]\n  d/dt(depot) = -KA * depot\n  \
+             d/dt(central) = KA * depot - (CL/V) * central",
+            "ode(states=[central])\n[odes]\n  \
+             d/dt(central) = first_order(ka=KA, lag=LAGR) - (CL/V) * central",
+        )
+}
+
+#[test]
+fn an_addl_implied_dose_route_lag_from_its_parent_matches_reconverged_fd() {
+    // (IOV, time-varying X, bound): the ODE rows of the test above, with the lag on the
+    // route. Measured vs reconverged FD on macOS arm64: 2.6e-7, 2.7e-7 and 2.1e-7. Each
+    // bound is 5× that. If the walks' seed vectors do not copy the route lag while the
+    // predictor's snapshots do, the gaps are 52, 1.1 and 2.0.
+    let cases = [
+        (false, true, 1.3e-6),
+        (true, true, 1.4e-6),
+        (true, false, 1.1e-6),
+    ];
+    for (iov, tv, bound) in cases {
+        let label = format!("route lag, iov {iov}, tv {tv}");
+        let src = addl_route_lag_src(iov);
+        let model = with_tol(parse_model_string(&src).unwrap(), 1e-8, 1e-10);
+        let ode = model.ode_spec.as_ref().expect("ode model");
+        assert!(ode.n_states == 1 && !model.has_lagtime(), "{label}: {src}");
+        let lag = ode.input_rate[0].lag_slot.expect("a lagged route");
+        let s = addl_implied_lag_subject(&model, tv);
+        if !iov {
+            // The copy is live: the parent's route lag is half the governing record's.
+            let theta = &model.default_params.theta;
+            assert_implied_lag_is_the_parents(&model, &s, theta, lag, &label);
             let params = moved_params(&model);
             let (gf, gl) = objective_gaps::<2>(&model, &s, &params, &[0.1, -0.05]);
             assert!(
@@ -3733,6 +3816,72 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
     }
     let w = outer_fd_fallback_warning(&one, &population, &log).expect("the salvage is reported");
     assert!(w.contains("used fixed-EBE outer gradients"), "{w}");
+}
+
+/// #2713: a FOCEI gradient declined at its mode system says so. Off the mode, on a grid
+/// point where the exact `H` is indefinite (`laplace_serves_the_prior_precision_anchor_fallback`'s
+/// search), `mode_solve` declines and the pass sets `mode_system_declined`, with the mode
+/// response asked for too. The straddle: at the EBE the same subject is served, and the
+/// flag left on the reused `ModeOut` is cleared. Mutations that redden it: dropping the
+/// flag in `run`, or not resetting it at the start of a pass.
+#[test]
+fn a_mode_system_decline_is_named() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &one.default_params;
+    let x = pack_params(params);
+    let pt = PackedPoint::new(params, &x).expect("packed point");
+    let grid = [-2.5, -1.5, -0.75, 0.75, 1.5, 2.5];
+    let mut points = Vec::new();
+    for &a in &grid {
+        for &b in &grid {
+            for &c in &grid {
+                points.push([a, b, c]);
+            }
+        }
+    }
+    let eta = points
+        .into_iter()
+        .find(|e| {
+            exact_inner_hessian(&one, &s, params, e)
+                .expect("recorded")
+                .cholesky()
+                .is_none()
+        })
+        .expect("a point where the exact H is indefinite");
+    let ebe = find_ebe(&one, &s, params, 500, 1e-11, None, None, 0).eta;
+    for want_dx in [false, true] {
+        let mut out = ModeOut {
+            want_dx,
+            ..ModeOut::default()
+        };
+        let g =
+            subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
+        assert!(
+            g.is_none() && out.mode_system_declined,
+            "want_dx = {want_dx}: off the mode, H indefinite must decline at the mode system"
+        );
+        let g = subject_adjoint_gradient_and_mode_at(
+            &one,
+            &s,
+            &pt,
+            ebe.as_slice(),
+            Objective::Focei,
+            &mut out,
+        );
+        assert!(
+            g.is_some() && !out.mode_system_declined,
+            "want_dx = {want_dx}: the EBE is served, and the reused flag is cleared"
+        );
+    }
 }
 
 #[test]

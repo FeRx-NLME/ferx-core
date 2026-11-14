@@ -245,6 +245,16 @@ struct FitWire {
     // #2112. Absent on every fit with no profiled level on its bound.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     profiled_levels_at_bound: Vec<usize>,
+    // #2797. Absent on every fit with no held coordinate, and on every bundle written
+    // before the field existed; such a bundle's `profiled_levels_at_bound` is synthesised
+    // into `ProfiledBound` entries on load (`held_at_bound_on_load`). An entry of a
+    // parameter family this build does not know is dropped on read (#2817).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::types::held_at_bound_lenient"
+    )]
+    held_at_bound: Vec<crate::types::HeldAtBound>,
 
     sir: Option<SirWire>,
     iov: Option<IovWire>,
@@ -313,11 +323,27 @@ struct FitWire {
     final_gradient: Option<Vec<f64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     final_gradient_source: Option<String>,
+    // The covariance step's Newton decrement and the optimizer's stop state (#2785).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    newton_decrement: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    optimizer_stop: Option<String>,
+    // #2799: the facts `FitResult::status` reads beside `converged`. A bundle from before
+    // them reads `false`, which is what such a fit reported (no typed budget fact, and an
+    // evaluation-only run was told apart only by `outer_maxiter = 0`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    eval_budget_spent: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    evaluation_only: bool,
     // ── Run settings ─────────────────────────────────────────────────────────
     optimizer: String,
     n_starts: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     multi_start_seed: Option<u64>,
+    /// The per-start records of a multi-start fit (#2867). Absent for a single-start fit,
+    /// and in a bundle written before the field, which then loads with no rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    starts: Vec<crate::types::StartRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     saem_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -383,6 +409,19 @@ struct FitWire {
         with = "crate::io::serde_nan::opt_vec"
     )]
     mixture_overrides: Option<Vec<f64>>,
+    /// One descriptor per `mixture_overrides` entry (#2833): name, family, base index,
+    /// class, packed row, FIX state. Absent for a fit with no override and in a bundle
+    /// written before the field, which then loads empty (rows go unlabelled, nothing
+    /// else reads it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mixture_override_params: Vec<crate::types::MixtureOverrideParam>,
+    /// Standard errors parallel to `mixture_overrides` (#2833), on its scales.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::io::serde_nan::opt_vec"
+    )]
+    se_mixture_overrides: Option<Vec<f64>>,
     /// The variational-inference result (#2058), in the layout of the YAML
     /// writer's `vi:` section. Absent for every other method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1711,6 +1750,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         bic_inputs: r.bic_inputs,
         profiled_blocks: r.profiled_blocks.clone(),
         profiled_levels_at_bound: r.profiled_levels_at_bound.clone(),
+        held_at_bound: r.held_at_bound.clone(),
         sir: if r.sir_ci_theta.is_some() || r.sir_ess.is_some() || r.sir_resamples_packed.is_some()
         {
             Some(SirWire {
@@ -1787,9 +1827,14 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         obs_time_range: r.obs_time_range,
         final_gradient: r.final_gradient.clone(),
         final_gradient_source: r.final_gradient_source.clone(),
+        newton_decrement: r.newton_decrement,
+        optimizer_stop: r.optimizer_stop.clone(),
+        eval_budget_spent: r.eval_budget_spent,
+        evaluation_only: r.evaluation_only,
         optimizer: r.optimizer.clone(),
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
+        starts: r.starts.clone(),
         saem_seed: r.saem_seed,
         // `sir_settings.seed` is canonical when SIR ran (#1770): it is the seed the draws
         // used and the one `run_sir` repeats, and the field a caller edits to change a
@@ -1818,6 +1863,8 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         iov_occasion: r.iov_occasion.clone(),
         packed_estimate: r.packed_estimate.clone(),
         mixture_overrides: r.mixture_overrides.clone(),
+        mixture_override_params: r.mixture_override_params.clone(),
+        se_mixture_overrides: r.se_mixture_overrides.clone(),
         vi: r.vi.as_ref().map(|v| ViWire::from_result(v, r)),
     }
 }
@@ -2101,7 +2148,7 @@ fn write_predictions_csv<W: Write>(
 
     let mut header = String::from("ID,TIME,DV,PRED,IPRED,CWRES,IWRES");
     if any_npde {
-        header.push_str(",NPDE,NPD");
+        header.push_str(",NPDE,NPD,EPRED,PWRES");
     }
     header.push_str(",EBE_OFV,N_OBS");
     if any_cens {
@@ -2132,6 +2179,10 @@ fn write_predictions_csv<W: Write>(
                 row.push_str(&fmt_f64(sr.npde.get(j).copied().unwrap_or(f64::NAN)));
                 row.push(',');
                 row.push_str(&fmt_f64(sr.npd.get(j).copied().unwrap_or(f64::NAN)));
+                row.push(',');
+                row.push_str(&fmt_f64(sr.epred.get(j).copied().unwrap_or(f64::NAN)));
+                row.push(',');
+                row.push_str(&fmt_f64(sr.pwres.get(j).copied().unwrap_or(f64::NAN)));
             }
             row.push(',');
             row.push_str(&fmt_f64(sr.ofv_contribution));
@@ -2752,6 +2803,8 @@ fn parse_subjects(
             cwres: Vec::new(),
             npde: Vec::new(),
             npd: Vec::new(),
+            epred: Vec::new(),
+            pwres: Vec::new(),
             ofv_contribution: ofv,
             cens: Vec::new(),
             n_obs,
@@ -2794,6 +2847,9 @@ fn parse_subjects(
     // NPDE/NPD are optional — present only when the fit ran with npde_nsim > 0.
     let npde_i = col.get("NPDE").copied();
     let npd_i = col.get("NPD").copied();
+    // EPRED/PWRES (#2871) ride with NPDE; a file written before them carries none.
+    let epred_i = col.get("EPRED").copied();
+    let pwres_i = col.get("PWRES").copied();
     let cens_i = col.get("CENS").copied();
     // Validated per row against the subject we're filling: the ID order check alone
     // can't catch two same-ID blocks written in the wrong order.
@@ -2882,6 +2938,16 @@ fn parse_subjects(
         if let Some(j) = npd_i {
             subjects[idx]
                 .npd
+                .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
+        }
+        if let Some(j) = epred_i {
+            subjects[idx]
+                .epred
+                .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
+        }
+        if let Some(j) = pwres_i {
+            subjects[idx]
+                .pwres
                 .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
         }
         let c = match cens_i {
@@ -3576,6 +3642,24 @@ fn validate_parallel_lengths(w: &FitWire) -> Result<(), FitrxError> {
             ));
         }
     }
+    // #2833: the override descriptors and SEs are each absent or parallel to the values.
+    let n_overrides = w.mixture_overrides.as_ref().map_or(0, Vec::len);
+    if !w.mixture_override_params.is_empty() && w.mixture_override_params.len() != n_overrides {
+        return bail(format!(
+            "mixture_override_params ({}) does not match mixture_overrides ({})",
+            w.mixture_override_params.len(),
+            n_overrides
+        ));
+    }
+    if let Some(se) = &w.se_mixture_overrides {
+        if se.len() != n_overrides {
+            return bail(format!(
+                "se_mixture_overrides ({}) does not match mixture_overrides ({})",
+                se.len(),
+                n_overrides
+            ));
+        }
+    }
     // `cov_fixed` is empty or parallel to the covariance matrix.
     let cov_dim = w.covariance_matrix.as_ref().map(|m| m.rows);
     if !w.cov_fixed.is_empty() && cov_dim != Some(w.cov_fixed.len()) {
@@ -3779,6 +3863,11 @@ fn wire_to_fit_result(
         imp
     });
 
+    let held_at_bound = held_at_bound_on_load(
+        std::mem::take(&mut w.held_at_bound),
+        &w.profiled_levels_at_bound,
+        &w.theta.names,
+    );
     let mut fit = FitResult {
         restored_from_checkpoint: true,
         covariate_relations: Vec::new(),
@@ -3899,6 +3988,7 @@ fn wire_to_fit_result(
         bic_inputs: w.bic_inputs,
         profiled_blocks: w.profiled_blocks,
         profiled_levels_at_bound: w.profiled_levels_at_bound,
+        held_at_bound,
         eta_log_transformed: w.omega.log_transformed,
         omega_param_corr,
         omega_iov_param_corr,
@@ -3913,9 +4003,14 @@ fn wire_to_fit_result(
         obs_time_range: w.obs_time_range,
         final_gradient: w.final_gradient,
         final_gradient_source: w.final_gradient_source,
+        newton_decrement: w.newton_decrement,
+        optimizer_stop: w.optimizer_stop,
+        eval_budget_spent: w.eval_budget_spent,
+        evaluation_only: w.evaluation_only,
         optimizer: w.optimizer,
         n_starts: w.n_starts,
         multi_start_seed: w.multi_start_seed,
+        starts: w.starts,
         saem_seed: w.saem_seed,
         sir_seed: w.sir_seed,
         sir_settings,
@@ -3942,6 +4037,8 @@ fn wire_to_fit_result(
         // consumers validate it against the estimates above before reusing it.
         packed_estimate: w.packed_estimate,
         mixture_overrides: w.mixture_overrides,
+        mixture_override_params: w.mixture_override_params,
+        se_mixture_overrides: w.se_mixture_overrides,
         left_init: w.left_init,
         stationary_start: w.stationary_start,
         omega_is_diagonal: w.omega_is_diagonal,
@@ -3982,6 +4079,31 @@ fn parse_csv_row(line: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+/// A bundle's `held_at_bound` (#2797): its own, or — for a bundle written before the field
+/// existed, which carries only `profiled_levels_at_bound` — those levels as
+/// [`crate::types::HeldReason::ProfiledBound`] entries, so a reader has one rule for old
+/// and new bundles. A θ's packed index is its θ index.
+fn held_at_bound_on_load(
+    held: Vec<crate::types::HeldAtBound>,
+    profiled_levels_at_bound: &[usize],
+    theta_names: &[String],
+) -> Vec<crate::types::HeldAtBound> {
+    if !held.is_empty() {
+        return held;
+    }
+    profiled_levels_at_bound
+        .iter()
+        .map(|&k| crate::types::HeldAtBound {
+            name: theta_names.get(k).cloned().unwrap_or_default(),
+            kind: crate::types::ParameterKind::Theta,
+            index: k,
+            packed_index: k,
+            reason: crate::types::HeldReason::ProfiledBound,
+            class: None,
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {
@@ -4737,6 +4859,10 @@ mod tests {
         r.subjects[0].npd = vec![0.15, -0.25, 0.35];
         r.subjects[1].npde = vec![-1.0, 1.0];
         r.subjects[1].npd = vec![-0.9, 0.9];
+        r.subjects[0].epred = vec![4.0, 3.0, 2.0];
+        r.subjects[0].pwres = vec![0.5, -0.6, 0.7];
+        r.subjects[1].epred = vec![1.5, 1.25];
+        r.subjects[1].pwres = vec![f64::NAN, f64::NAN];
         let p = dummy_population(&["S1", "S2"], 3);
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
 
@@ -4748,6 +4874,19 @@ mod tests {
             }
             for (x, y) in a.npd.iter().zip(b.npd.iter()) {
                 assert!((x - y).abs() < 1e-6, "npd {x} vs {y}");
+            }
+            // #2871: EPRED / PWRES ride in the same file; a NaN PWRES (a masked
+            // subject) loads back as NaN.
+            assert_eq!(a.epred.len(), b.epred.len(), "subject {} epred len", a.id);
+            assert_eq!(a.pwres.len(), b.pwres.len(), "subject {} pwres len", a.id);
+            for (x, y) in a.epred.iter().zip(&b.epred) {
+                assert!((x - y).abs() < 1e-6, "epred {x} vs {y}");
+            }
+            for (x, y) in a.pwres.iter().zip(&b.pwres) {
+                assert!(
+                    (x.is_nan() && y.is_nan()) || (x - y).abs() < 1e-6,
+                    "pwres {x} vs {y}"
+                );
             }
         }
     }
@@ -4765,6 +4904,7 @@ mod tests {
         for s in &loaded.fit.subjects {
             assert!(s.npde.is_empty(), "npde must stay empty when not written");
             assert!(s.npd.is_empty(), "npd must stay empty when not written");
+            assert!(s.epred.is_empty() && s.pwres.is_empty());
         }
     }
 
@@ -4851,6 +4991,305 @@ mod tests {
         let loaded = load_fit(&path).unwrap().fit;
         assert!(loaded.profiled_blocks.is_empty());
         assert!(loaded.profiled_levels_at_bound.is_empty());
+    }
+
+    /// #2797 (D8): `held_at_bound` round-trips, as `snake_case` reasons, is omitted when
+    /// empty, and a bundle written before the field existed — `profiled_levels_at_bound`
+    /// only — loads with those levels as `ProfiledBound` entries, so a reader has one rule
+    /// for old and new bundles.
+    #[test]
+    fn held_at_bound_round_trips_and_an_old_bundle_synthesises_its_profiled_levels() {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+
+        let mut r = minimal_fit_result();
+        r.held_at_bound = vec![HeldAtBound {
+            name: "ETA_KA".into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index: r.theta.len(),
+            reason: HeldReason::CollapsedAtGuard,
+            class: None,
+        }];
+        let path = dir.path().join("held.fitrx");
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        assert_eq!(
+            fit_json(&path)["held_at_bound"][0]["reason"],
+            "collapsed_at_guard"
+        );
+        assert_eq!(load_fit(&path).unwrap().fit.held_at_bound, r.held_at_bound);
+
+        // Omitted when empty.
+        let wire = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        assert!(wire.get("held_at_bound").is_none(), "{wire}");
+
+        // An old bundle: only `profiled_levels_at_bound = [0, 2]`.
+        let mut old = minimal_fit_result();
+        old.theta_names = (0..old.theta.len()).map(|i| format!("L{i}")).collect();
+        old.profiled_levels_at_bound = vec![0, 2];
+        let path = dir.path().join("old.fitrx");
+        save_fit(&old, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        assert!(fit_json(&path).get("held_at_bound").is_none());
+        let loaded = load_fit(&path).unwrap().fit;
+        let got: Vec<(String, ParameterKind, usize, usize, HeldReason)> = loaded
+            .held_at_bound
+            .iter()
+            .map(|h| (h.name.clone(), h.kind, h.index, h.packed_index, h.reason))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    "L0".to_string(),
+                    ParameterKind::Theta,
+                    0,
+                    0,
+                    HeldReason::ProfiledBound
+                ),
+                (
+                    "L2".to_string(),
+                    ParameterKind::Theta,
+                    2,
+                    2,
+                    HeldReason::ProfiledBound
+                ),
+            ]
+        );
+        assert_eq!(loaded.profiled_levels_at_bound, [0, 2]);
+    }
+
+    /// T5 (#2809): a `[mixture]` override entry's `class` round-trips as a 1-based number;
+    /// a base entry writes no `class` key at all (so a bundle without an override entry is
+    /// byte-unchanged); and an entry written before the field existed loads as `None`.
+    #[test]
+    fn held_at_bound_class_round_trips_and_is_absent_for_a_base_entry() {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let entry = |name: &str, packed_index, class| HeldAtBound {
+            name: name.into(),
+            kind: ParameterKind::Omega,
+            index: 0,
+            packed_index,
+            reason: HeldReason::CollapsedAtGuard,
+            class,
+        };
+        let mut r = minimal_fit_result();
+        let n = r.theta.len();
+        r.held_at_bound = vec![
+            entry("eta_CL", n, None),
+            entry("eta_CL_MIX2", n + 3, Some(2)),
+        ];
+        let path = dir.path().join("class.fitrx");
+        save_fit(&r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+        let json = fit_json(&path);
+        let held = &json["held_at_bound"];
+        assert!(held[0].get("class").is_none(), "{held}");
+        assert_eq!(held[1]["class"], 2, "{held}");
+        assert_eq!(load_fit(&path).unwrap().fit.held_at_bound, r.held_at_bound);
+
+        // An entry from a bundle written before #2809.
+        let old: HeldAtBound = serde_json::from_value(serde_json::json!({
+            "name": "eta_CL", "kind": "Omega", "index": 0, "packed_index": n,
+            "reason": "collapsed_at_guard",
+        }))
+        .unwrap();
+        assert_eq!(old, entry("eta_CL", n, None));
+    }
+
+    /// The held-at-bound fixture for #2817: θ `V` (index 1) collapsed on the guard and θ
+    /// `KA` (index 2) a profiled level, so a reader that mishandles one entry cannot pass
+    /// on the strength of the other.
+    fn two_held_thetas() -> FitResult {
+        use crate::types::{HeldAtBound, HeldReason, ParameterKind};
+        let mut r = minimal_fit_result();
+        r.held_at_bound = vec![
+            HeldAtBound {
+                name: "V".into(),
+                kind: ParameterKind::Theta,
+                index: 1,
+                packed_index: 1,
+                reason: HeldReason::CollapsedAtGuard,
+                class: None,
+            },
+            HeldAtBound {
+                name: "KA".into(),
+                kind: ParameterKind::Theta,
+                index: 2,
+                packed_index: 2,
+                reason: HeldReason::ProfiledBound,
+                class: None,
+            },
+        ];
+        r
+    }
+
+    /// Rename the reason of `held_at_bound[0]` in a fit JSON value to one no build knows.
+    fn inject_future_reason(v: &mut serde_json::Value) {
+        assert_eq!(v["held_at_bound"][0]["reason"], "collapsed_at_guard", "{v}");
+        v["held_at_bound"][0]["reason"] = "some_future_reason".into();
+    }
+
+    /// #2817: a bundle whose `held_at_bound` names a reason this build does not know — as a
+    /// later ferx that added one would write — loads, rather than failing the whole
+    /// `load_fit`. The unknown entry reads as `HeldReason::Unknown` and still counts as
+    /// held (SE `N/A`, YAML `se: ~`); the neighbouring known entry and the not-held θ are
+    /// untouched. Under the strict derive (no `#[serde(other)]`) `load_fit` returns `Err`
+    /// and the first `unwrap` fails.
+    #[test]
+    fn a_bundle_with_an_unknown_held_reason_loads_and_the_entry_stays_held() {
+        use crate::io::output::{se_held, write_estimates_yaml};
+        use crate::types::{HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let r = two_held_thetas();
+        let src = dir.path().join("known.fitrx");
+        save_fit(&r, &p, "model source\n", &src, SaveFitOptions::default()).unwrap();
+        let dst = dir.path().join("future.fitrx");
+        rewrite_bundle(&src, &dst, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, inject_future_reason)
+            } else {
+                body
+            })
+        });
+        assert_eq!(
+            fit_json(&dst)["held_at_bound"][0]["reason"],
+            "some_future_reason"
+        );
+
+        let loaded = load_fit(&dst)
+            .expect("an unknown held reason must not fail the bundle")
+            .fit;
+        let reasons: Vec<HeldReason> = loaded.held_at_bound.iter().map(|h| h.reason).collect();
+        assert_eq!(reasons, [HeldReason::Unknown, HeldReason::ProfiledBound]);
+        assert_eq!(loaded.held_at_bound[0].name, "V");
+        assert_eq!(loaded.held_at_bound[0].packed_index, 1);
+
+        // Displays: held, so no SE — and the not-held θ keeps its number.
+        assert_eq!(
+            se_held(&loaded, ParameterKind::Theta, 1),
+            Some(HeldReason::Unknown)
+        );
+        assert_eq!(se_held(&loaded, ParameterKind::Theta, 0), None);
+        let yaml_path = dir.path().join("est.yaml");
+        write_estimates_yaml(&loaded, yaml_path.to_str().unwrap()).unwrap();
+        let yaml = std::fs::read_to_string(&yaml_path).unwrap();
+        assert!(
+            yaml.contains(
+                "  V:\n    estimate: 2.000000\n    se: ~\n    rse_pct: ~\n    held: unknown\n"
+            ),
+            "{yaml}"
+        );
+        assert!(yaml.contains("    se: 0.010000\n"), "{yaml}");
+    }
+
+    /// #2817: the same unknown reason through `FitResult::from_json_str` (the
+    /// `--output-format json` reader), and the plain serde read of that file — which the
+    /// strict derive would refuse.
+    #[test]
+    fn fit_result_json_with_an_unknown_held_reason_reads_back() {
+        use crate::types::HeldReason;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fit.json");
+        crate::io::output::write_result_json(&two_held_thetas(), path.to_str().unwrap()).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        inject_future_reason(&mut v);
+        let text = serde_json::to_string(&v).unwrap();
+
+        let back = FitResult::from_json_str(&text)
+            .expect("an unknown held reason must not fail the FitResult JSON");
+        let reasons: Vec<HeldReason> = back.held_at_bound.iter().map(|h| h.reason).collect();
+        assert_eq!(reasons, [HeldReason::Unknown, HeldReason::ProfiledBound]);
+
+        let reason: HeldReason = serde_json::from_str("\"some_future_reason\"").unwrap();
+        assert_eq!(reason, HeldReason::Unknown);
+        // Known tokens are unaffected, and `Unknown` writes the token it reads back from.
+        for r in [
+            HeldReason::ProfiledBound,
+            HeldReason::CollapsedAtGuard,
+            HeldReason::Unknown,
+        ] {
+            let tok = serde_json::to_string(&r).unwrap();
+            assert_eq!(tok, format!("\"{}\"", r.as_str()));
+            assert_eq!(serde_json::from_str::<HeldReason>(&tok).unwrap(), r);
+        }
+    }
+
+    /// Rename the `kind` of `held_at_bound[0]` in a fit JSON value to a family no build
+    /// knows.
+    fn inject_future_kind(v: &mut serde_json::Value) {
+        assert_eq!(v["held_at_bound"][0]["kind"], "Theta", "{v}");
+        v["held_at_bound"][0]["kind"] = "SomeFutureKind".into();
+    }
+
+    /// #2817 (review r1 row 2): a `held_at_bound` entry of a parameter family this build
+    /// does not know is dropped on load, and the rest of the bundle and the list load, both
+    /// through `load_fit` and through `FitResult::from_json_str`. Without the lenient read,
+    /// the strict `ParameterKind` derive fails both `expect`s.
+    #[test]
+    fn an_unknown_held_kind_is_dropped_and_the_rest_loads() {
+        use crate::types::{HeldReason, ParameterKind};
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let r = two_held_thetas();
+        let src = dir.path().join("known.fitrx");
+        save_fit(&r, &p, "model source\n", &src, SaveFitOptions::default()).unwrap();
+        let dst = dir.path().join("future-kind.fitrx");
+        rewrite_bundle(&src, &dst, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, inject_future_kind)
+            } else {
+                body
+            })
+        });
+        let survivors = |list: &[crate::types::HeldAtBound]| {
+            list.iter()
+                .map(|h| (h.name.clone(), h.kind, h.index, h.reason))
+                .collect::<Vec<_>>()
+        };
+        let want = [(
+            "KA".to_string(),
+            ParameterKind::Theta,
+            2,
+            HeldReason::ProfiledBound,
+        )];
+        let loaded = load_fit(&dst)
+            .expect("an unknown held kind must not fail the bundle")
+            .fit;
+        assert_eq!(survivors(&loaded.held_at_bound), want);
+
+        let json = dir.path().join("fit.json");
+        crate::io::output::write_result_json(&r, json.to_str().unwrap()).unwrap();
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+        inject_future_kind(&mut v);
+        let back = FitResult::from_json_str(&serde_json::to_string(&v).unwrap())
+            .expect("an unknown held kind must not fail the FitResult JSON");
+        assert_eq!(survivors(&back.held_at_bound), want);
+
+        // The negative: every known kind survives the lenient read.
+        let mut all = two_held_thetas();
+        for (k, kind) in [
+            ParameterKind::Omega,
+            ParameterKind::Sigma,
+            ParameterKind::Kappa,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut h = all.held_at_bound[0].clone();
+            h.kind = kind;
+            h.index = k;
+            all.held_at_bound.push(h);
+        }
+        let text = serde_json::to_string(&all).unwrap();
+        assert_eq!(
+            FitResult::from_json_str(&text).unwrap().held_at_bound,
+            all.held_at_bound
+        );
     }
 
     /// `final_gradient_source` has to survive the checkpoint alongside the vector
@@ -5856,6 +6295,91 @@ mod tests {
         );
         let old: FitWire = serde_json::from_value(value).unwrap();
         assert!(old.mixture_overrides.is_none());
+    }
+
+    /// #2833 T5: the override descriptors and SEs round-trip; a bundle without them (what
+    /// one written before #2833 is) loads empty / `None`; a descriptor list or SE vector
+    /// that is not parallel to `mixture_overrides` is refused.
+    ///
+    /// Mutations — drop either wire field (write or read): the round-trip `assert_eq!`
+    /// dies; drop `serde(default)`: the old bundle fails to load; drop either length check:
+    /// the mismatched bundle loads.
+    #[test]
+    fn roundtrip_mixture_override_params_and_se() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.mixture_overrides = Some(vec![0.3, 0.7]);
+        r.mixture_override_params = vec![
+            crate::types::MixtureOverrideParam {
+                name: "eta_CL_MIX2".into(),
+                kind: crate::types::ParameterKind::Omega,
+                index: 0,
+                class: 2,
+                packed_index: 6,
+                fixed: false,
+            },
+            crate::types::MixtureOverrideParam {
+                name: "prop_MIX3".into(),
+                kind: crate::types::ParameterKind::Sigma,
+                index: 0,
+                class: 3,
+                packed_index: 7,
+                fixed: true,
+            },
+        ];
+        r.se_mixture_overrides = Some(vec![0.064_975_8, 0.0]);
+        let path = saved(&dir, &r);
+        let back = load_fit(&path).unwrap().fit;
+        assert_eq!(back.mixture_override_params, r.mixture_override_params);
+        assert_eq!(back.se_mixture_overrides, r.se_mixture_overrides);
+
+        // Written only when set.
+        let plain = serde_json::to_value(build_fit_wire(&minimal_fit_result())).unwrap();
+        for key in ["mixture_override_params", "se_mixture_overrides"] {
+            assert!(plain.get(key).is_none(), "{key}: written when absent");
+        }
+
+        // A bundle from before #2833: both keys gone, loads with the values alone.
+        let old = dir.path().join("old.fitrx");
+        rewrite_bundle(&path, &old, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, |f| {
+                    let o = f.as_object_mut().unwrap();
+                    assert!(o.remove("mixture_override_params").is_some());
+                    assert!(o.remove("se_mixture_overrides").is_some());
+                })
+            } else {
+                body
+            })
+        });
+        let loaded = load_fit(&old).unwrap().fit;
+        assert!(loaded.mixture_override_params.is_empty());
+        assert!(loaded.se_mixture_overrides.is_none());
+        assert_eq!(loaded.mixture_overrides, r.mixture_overrides);
+
+        // Not parallel to the values: refused, each with its own message.
+        for (key, short, msg) in [
+            (
+                "mixture_override_params",
+                serde_json::json!([serde_json::to_value(&r.mixture_override_params[0]).unwrap()]),
+                "mixture_override_params (1) does not match mixture_overrides (2)",
+            ),
+            (
+                "se_mixture_overrides",
+                serde_json::json!([0.1, 0.2, 0.3]),
+                "se_mixture_overrides (3) does not match mixture_overrides (2)",
+            ),
+        ] {
+            let edited = dir.path().join(format!("{key}.fitrx"));
+            rewrite_bundle(&path, &edited, |name, body| {
+                Some(if name == "fit.json" {
+                    edit_json(body, |f| f[key] = short.clone())
+                } else {
+                    body
+                })
+            });
+            assert_eq!(load_corrupt(load_fit(&edited)), msg);
+        }
     }
 
     /// #1685 T4, probe D (re-measured at `045ca1b2`: `load_fit` returned 30 subjects
@@ -7169,6 +7693,89 @@ mod tests {
         );
     }
 
+    /// #2867: the per-start rows of a multi-start fit survive a save and load unchanged —
+    /// a row that ran, one with no OFV, one under a penalty and a failed one with its code —
+    /// and a single-start fit writes no `starts` key, so its `fit.json` is what it was. A
+    /// bundle without the key loads with no rows.
+    #[test]
+    fn the_per_start_rows_round_trip() {
+        use crate::types::StartRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let single = saved(&dir, &minimal_fit_result());
+        assert!(fit_json(&single).get("starts").is_none());
+        assert!(load_fit(&single).unwrap().fit.starts.is_empty());
+
+        // The status is a token and labels, not a typed enum: a reason this build has never
+        // heard of (written by a later one) is read back as it was written.
+        let ran = StartRecord {
+            start: 0,
+            ofv: Some(-221.877048),
+            penalized: false,
+            objective: None,
+            converged: true,
+            status: Some("converged_with_issues".into()),
+            status_reasons: vec!["budget_spent".into(), "a_future_reason".into()],
+            n_iterations: 84,
+            wall_time_secs: 1.25,
+            theta: vec![7.4577, 22.1467],
+            selected: true,
+            error: None,
+            error_code: None,
+        };
+        let mut r = minimal_fit_result();
+        r.n_starts = 4;
+        r.starts = vec![
+            ran.clone(),
+            StartRecord {
+                start: 1,
+                ofv: None,
+                status: Some("converged".into()),
+                status_reasons: Vec::new(),
+                selected: false,
+                ..ran.clone()
+            },
+            StartRecord {
+                start: 2,
+                penalized: true,
+                objective: Some(-200.5),
+                converged: false,
+                status: Some("not_converged".into()),
+                status_reasons: Vec::new(),
+                selected: false,
+                ..ran.clone()
+            },
+            StartRecord {
+                start: 3,
+                ofv: None,
+                penalized: false,
+                objective: None,
+                converged: false,
+                status: None,
+                status_reasons: Vec::new(),
+                n_iterations: 0,
+                wall_time_secs: 0.0,
+                theta: Vec::new(),
+                selected: false,
+                error: Some("n_agq must be at least 1".into()),
+                error_code: Some("E_AGQ_NODES_ZERO".into()),
+            },
+        ];
+        let path = saved(&dir, &r);
+        let json = fit_json(&path);
+        assert_eq!(json["starts"].as_array().map(Vec::len), Some(4));
+        assert_eq!(load_fit(&path).unwrap().fit.starts, r.starts);
+
+        // A start that ended on a non-finite θ must not make the bundle unloadable: the value
+        // is written as `null` and read back as `NaN`.
+        r.starts[2].theta = vec![f64::NAN, 22.1467];
+        let path = saved(&dir, &r);
+        assert!(fit_json(&path)["starts"][2]["theta"][0].is_null());
+        let loaded = load_fit(&path).unwrap().fit.starts;
+        assert!(loaded[2].theta[0].is_nan(), "{:?}", loaded[2].theta);
+        assert_eq!(loaded[2].theta[1], 22.1467);
+        assert_eq!(loaded[3], r.starts[3]);
+    }
+
     /// #2695: no key has a default for a file that predates it. A v2 `fit.json` missing
     /// one of these is damaged, and refusing it is what removing the defaults bought.
     /// Each mutation restoring a `#[serde(default)]` kills its row.
@@ -8161,6 +8768,34 @@ mod tests {
         });
         let loaded = load_fit(&edited).expect("core does not interpret the entry");
         assert_eq!(loaded.fit.interface_extras.as_deref(), Some("{not json"));
+    }
+
+    /// #2799: `eval_budget_spent` and `evaluation_only` round-trip, and a bundle written
+    /// before them (neither key present) loads both as `false`.
+    #[test]
+    fn roundtrip_status_facts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        r.eval_budget_spent = true;
+        r.evaluation_only = true;
+        let path = saved(&dir, &r);
+        let back = load_fit(&path).unwrap().fit;
+        assert!(back.eval_budget_spent && back.evaluation_only);
+
+        let edited = dir.path().join("old.fitrx");
+        rewrite_bundle(&path, &edited, |name, body| {
+            Some(if name == "fit.json" {
+                edit_json(body, |f| {
+                    let m = f.as_object_mut().unwrap();
+                    assert!(m.remove("eval_budget_spent").is_some());
+                    assert!(m.remove("evaluation_only").is_some());
+                })
+            } else {
+                body
+            })
+        });
+        let old = load_fit(&edited).unwrap().fit;
+        assert!(!old.eval_budget_spent && !old.evaluation_only);
     }
 
     /// #2695: `cov_fixed` round-trips, its pattern not all one value, and holds to the

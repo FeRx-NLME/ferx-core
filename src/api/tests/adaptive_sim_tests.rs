@@ -2242,16 +2242,13 @@ fn adaptive_base_multiple_doses_across_occasions_pass_verifiers() {
     // each base dose decays under its window's clearance. Base boluses at t=0 (occasion 0) and
     // t=24 (occasion 1); observations sit off the dose times.
     //
-    // Oracle note — why NOT `predict_iov` here: the adaptive driver assigns a segment's occasion
-    // from the last observation/EVID=2 record crossed (`segment_occ_at`, the #701 decision-window
-    // / end-of-interval convention — the clearance in effect *during* the segment, the physically
-    // faithful choice for real-time feedback). `predict_iov` follows the #104 OCC-column
-    // convention (the segment ending at a *dose* record uses that dose's occasion). The two agree
-    // when every segment ends at an observation (Test A, the mrgsolve anchor), but differ for a
-    // base dose at an occasion boundary with no coincident observation — as here — so `predict_iov`
-    // is not a valid oracle for this configuration. The driver's own verifiers are; the
-    // independent-engine multi-occasion check is the mrgsolve anchor. See
-    // `compute_event_pk_params_iov`'s docstring.
+    // Oracle note: this test asserts the driver's own verifiers only. `predict_iov` would be a
+    // valid oracle here too. A base dose row is a record in the driver (#1148), so the segment
+    // ending at the dose at 24 takes that dose's occasion under both conventions; measured on
+    // #2771, this fixture gives `predict_iov`'s predictions to 2e-16 relative. What does differ
+    // from `predict_iov` is a CONTROLLER dose whose first data record at or after it falls on or
+    // past the next decision. See `compute_event_pk_params_iov`'s docstring and
+    // `adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasion`.
     let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
     let doses = vec![
         DoseEvent::new(0.0, 1000.0, 1, 0.0, false, 0.0), // occasion 0
@@ -3388,6 +3385,8 @@ fn simple_titration_spec() -> AdaptiveDosingSpec {
         levels: None,
         target_window: None,
         auc_target: None,
+        round_to: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 50.0,
@@ -4139,6 +4138,8 @@ fn from_spec_three_witnesses_equals_handwritten_closure() {
         levels: None,
         target_window: None,
         auc_target: None,
+        round_to: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 50.0,
@@ -4724,6 +4725,8 @@ fn from_spec_dv_collapses_to_ipred_as_sigma_to_zero() {
         levels: None,
         target_window: None,
         auc_target: None,
+        round_to: None,
+        dose_knowledge: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: 50.0,
@@ -8149,19 +8152,13 @@ const ODE_1571_SELECTED: &str = r#"
   FREE continuous
 "#;
 
-/// The whole refusal text of `reject_ruv_magnitude_for_adaptive` (#2741). Asserted by
-/// equality, so deleting any one of its three sentences — or a form from the list —
-/// reddens [`both_entry_points_reject_every_ruv_magnitude_form`].
-const RUV_MAGNITUDE_REFUSAL: &str = "adaptive-dosing simulation does not support a \
-    residual-error magnitude (a sigma multiplied by an expression, a `weight =`, a \
-    `power(...)` exponent, or a magnitude on a `CMT=N:` line). The assay draws its residual \
-    error from the bare sigma, without the magnitude. Use bare sigma names in \
-    `[error_model]`.";
-
-/// The adaptive options and spec every #2741 refusal check runs under: `pop_1571`'s
-/// subject carries `FREE`, so every data check passes and only the model can refuse.
+/// The adaptive options and spec every #2741 form check runs under: `pop_1571`'s subject
+/// carries `FREE`, so every data check passes. `dv` adds a `Dv` monitor on CMT 1 (the
+/// programmatic path) and assay error on the spec, so the assay draws through the
+/// magnitude; without it the run reads no residual error at all.
 fn ruv_magnitude_run(
     src: &str,
+    dv: bool,
 ) -> (
     Result<AdaptiveSimulationResult, crate::diagnostics::EngineError>,
     Result<AdaptiveSimulationResult, crate::diagnostics::EngineError>,
@@ -8171,41 +8168,39 @@ fn ruv_magnitude_run(
     let opts = AdaptiveSimulateOptions {
         seed: Some(1),
         decision_times: vec![12.0, 36.0],
+        monitors: if dv {
+            vec![MonitorSpec::new("A", 1, ObserveMode::Dv)]
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     };
     let programmatic =
         simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts);
-    let spec = simulate_adaptive_from_spec(
-        &model,
-        &pop,
-        &model.default_params,
-        1,
-        &simple_titration_spec(),
-        &AdaptiveSimulateOptions::default(),
-    );
+    let mut spec = simple_titration_spec();
+    if dv {
+        spec.observe = None;
+        spec.with_assay_error = true;
+        spec.assay_cmt = Some(1);
+    }
+    let spec_opts = AdaptiveSimulateOptions {
+        seed: Some(1),
+        ..Default::default()
+    };
+    let spec =
+        simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &spec, &spec_opts);
     (programmatic, spec)
 }
 
-/// #2741 (single-endpoint forms) and #2731 (`CMT=N:` lines): the assay draws from
-/// `assay_resid_var`, which never evaluates a residual-error magnitude, so under a `Dv`
-/// monitor each form below was dropped from the draw with the run reporting success —
-/// measured on #2741: a tenfold multiplier and a cubed `power` loading left every
-/// reading bit-identical to the bare model's.
+/// #2741 T11: every residual-error magnitude form runs through both public entry points,
+/// with and without assay error. #2746 refused them all (`E_ADAPTIVE_UNSUPPORTED`) while
+/// the assay drew from the bare σ; the assay now applies the magnitude, so the refusal is
+/// gone. The forms: a σ multiplier, a `weight =`, a `power(σ, P)` exponent, and a
+/// magnitude on a `CMT=N:` line, each with its bare twin asserted different.
 ///
-/// The refusal is unconditional, and these fixtures carry no `Dv` monitor (`fixed_bolus`
-/// under default options, `simple_titration_spec` without assay error): a run that reads
-/// no residual error was correct and is refused anyway, until #2741's lift applies the
-/// magnitude in the assay. The test pins the gate, not the `Dv` path.
-///
-/// One test holds both sides of the gate: each bare twin (single-endpoint and `CMT=N:`)
-/// runs through both entry points, so each `Err` is this reject and nothing else; each
-/// magnitude form is refused through both with the full text.
-///
-/// Regressions: the gate narrowed back to `has_endpoint_magnitude` (the four
-/// single-endpoint forms run); the gate dropped from `check_adaptive_model_data` (all
-/// run); any sentence of the message deleted or changed.
+/// Regression: the refusal restored, on any form or either entry point.
 #[test]
-fn both_entry_points_reject_every_ruv_magnitude_form() {
+fn both_entry_points_run_every_ruv_magnitude_form() {
     const SELECTED_BLOCK: &str = "  if (FREE == 0) {\n    DV ~ proportional(PROP_TOTAL)\n  } \
                                   else {\n    DV ~ proportional(PROP_UNBOUND)\n  }";
     let single = ODE_1571_SELECTED.replace(SELECTED_BLOCK, "  DV ~ proportional(PROP_TOTAL)");
@@ -8215,13 +8210,6 @@ fn both_entry_points_reject_every_ruv_magnitude_form() {
     );
     assert_ne!(single, ODE_1571_SELECTED, "the bare twin must differ");
     assert_ne!(cmt_lines, ODE_1571_SELECTED, "the CMT twin must differ");
-
-    // The straddle's bare side: both twins run through both entry points.
-    for (name, bare) in [("single", &single), ("CMT lines", &cmt_lines)] {
-        let (p, s) = ruv_magnitude_run(bare);
-        assert!(p.is_ok(), "bare {name}, simulate_adaptive: {:?}", p.err());
-        assert!(s.is_ok(), "bare {name}, from_spec: {:?}", s.err());
-    }
 
     let forms = [
         (
@@ -8260,15 +8248,18 @@ fn both_entry_points_reject_every_ruv_magnitude_form() {
             src != &single && src != &cmt_lines,
             "{name}: the magnitude twin must differ from its bare twin"
         );
-        let (p, s) = ruv_magnitude_run(src);
-        for (entry, r) in [("simulate_adaptive", p), ("from_spec", s)] {
-            let err = r.expect_err(&format!("{name}: {entry} must refuse the magnitude"));
-            assert_eq!(
-                err.code(),
-                Some("E_ADAPTIVE_UNSUPPORTED"),
-                "{name}, {entry}: {err}"
+        assert!(
+            parse_model_string(src).unwrap().has_custom_ruv_magnitude(),
+            "{name}: a magnitude form"
+        );
+        for dv in [false, true] {
+            let (p, s) = ruv_magnitude_run(src, dv);
+            assert!(
+                p.is_ok(),
+                "{name}, dv {dv}, simulate_adaptive: {:?}",
+                p.err()
             );
-            assert_eq!(err.message(), RUV_MAGNITUDE_REFUSAL, "{name}, {entry}");
+            assert!(s.is_ok(), "{name}, dv {dv}, from_spec: {:?}", s.err());
         }
     }
 }
@@ -9229,17 +9220,29 @@ fn assay_residual_variance_reads_the_parameter_sets_correlation() {
         rho: -0.9,
         ..model.residual_correlations[0].clone()
     }];
-    let fitted = super::adaptive::assay_resid_var(&model, &params, 1, 10.0, 1.0)
-        .expect("cmt 1 has an error model");
+    let cov = HashMap::new();
+    let row = crate::sim::adaptive::AssayRow {
+        cmt: 1,
+        ipred: 10.0,
+        time: 0.0,
+        tad: 0.0,
+        cov: &cov,
+    };
+    let var = |params: &ModelParameters, ruv_scale: f64| {
+        super::adaptive::assay_resid_var(&model, params, &row, ruv_scale)
+            .expect("a bare model has no magnitude to refuse")
+            .expect("cmt 1 has an error model")
+    };
+    let fitted = var(&params, 1.0);
     assert!((fitted - 1.4).abs() < 1e-12, "fitted ρ: {fitted}, want 1.4");
     // ruv_scale multiplies the whole variance.
-    let scaled = super::adaptive::assay_resid_var(&model, &params, 1, 10.0, 2.0).unwrap();
+    let scaled = var(&params, 2.0);
     assert!(
         (scaled - 2.8).abs() < 1e-12,
         "ruv_scale 2: {scaled}, want 2.8"
     );
     params.residual_correlations.clear();
-    let declared = super::adaptive::assay_resid_var(&model, &params, 1, 10.0, 1.0).unwrap();
+    let declared = var(&params, 1.0);
     assert!(
         (declared - 7.0).abs() < 1e-12,
         "fallback: {declared}, want 7"
@@ -9967,4 +9970,134 @@ fn iov_decision_before_the_first_record_verifies_and_matches_predict_iov_2125() 
     // The hold at 0.5 read the seeded state, not a decayed one.
     let reads = seen.lock().unwrap().clone();
     assert_eq!(reads[0], (0.5, 100.0));
+}
+
+/// When the adaptive run equals `predict_iov` on the realized doses under IOV (#2771), and
+/// when it does not (#2895). A fixed bolus at decisions 0, 24, 48 and 72; occasions on the
+/// static side are set per decision, for observations and dose rows alike.
+///
+/// A controller dose is not a record in the driver, so the segment that ends at it runs
+/// under the next DATA record at or after the decision. In `predict_iov` the same dose is
+/// a dose row, a record of the decision's own occasion. The two pick the same κ when that
+/// next data record lies before the next decision. With no data record at or after the
+/// decision, no observation remains to show a difference.
+///
+/// | Observations at | First record at or after each decision | Result |
+/// |---|---|---|
+/// | 0, 24, 48, 72 | 0, 24, 48, 72 | equal |
+/// | 0, 23, 47, 71 | 0, 47, 71, none | equal |
+/// | 0, 30, 47, 71 | 0, 30, 71, none | equal |
+/// | 0, 23, 47 | 0, 47, none, none | equal |
+/// | 0, 12, 48, 72 | 0, **48**, 48, 72 | differs |
+/// | 0, 23, 50, 71 | 0, **50**, 50, none | differs |
+/// | 0, 72 | 0, **72**, **72**, 72 | differs |
+///
+/// The expected side of each layout is written by hand, not computed from the rule, so the
+/// test cannot agree with itself. Worst relative gap on the equal layouts, macOS arm64: 0
+/// (bound 1e-12). On the differing layouts the worst gap per layout is 5.3e-2, 4.5e-1 and
+/// 9.4e-2 (bound 1e-2). Both sides are asserted here, so a change that makes every layout
+/// equal (#2895) or every layout differ fails this test.
+///
+/// Mutation run: `governing_segment_pk_at` returning the carry instead of the next record
+/// ahead fails the equal side, at observations 0, 24, 48, 72.
+#[test]
+fn adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasion() {
+    let model = parse_model_string(ODE_IOV).expect("parse IOV ODE model");
+    let decisions = vec![0.0, 24.0, 48.0, 72.0];
+    let seed = 20260708u64;
+    let layouts: [(&[f64], bool); 7] = [
+        (&[0.0, 24.0, 48.0, 72.0], true),
+        (&[0.0, 23.0, 47.0, 71.0], true),
+        (&[0.0, 30.0, 47.0, 71.0], true),
+        (&[0.0, 23.0, 47.0], true),
+        (&[0.0, 12.0, 48.0, 72.0], false),
+        (&[0.0, 23.0, 50.0, 71.0], false),
+        (&[0.0, 72.0], false),
+    ];
+
+    // The η and κ the run draws, as in `adaptive_iov_matches_predict_iov_with_reconstructed_kappa`.
+    use rand::SeedableRng;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let normal = rand_distr::Normal::new(0.0, 1.0).unwrap();
+    let z_eta: Vec<f64> = (0..model.n_eta).map(|_| rng.sample(normal)).collect();
+    let eta_bsv: Vec<f64> = (&model.default_params.omega.chol
+        * nalgebra::DVector::from_column_slice(&z_eta))
+    .iter()
+    .copied()
+    .collect();
+    let omega_iov = model.default_params.omega_iov.as_ref().expect("omega_iov");
+    let base = crate::sim::adaptive::subject_kappa_base_seed(seed, "1", 1);
+    let kappas: Vec<Vec<f64>> = (0..decisions.len())
+        .map(|g| {
+            let z: Vec<f64> = (0..model.n_kappa)
+                .map(|k| crate::sim::adaptive::kappa_standard_normal(base, g, k))
+                .collect();
+            (&omega_iov.chol * nalgebra::DVector::from_column_slice(&z))
+                .iter()
+                .copied()
+                .collect()
+        })
+        .collect();
+    for pair in kappas.windows(2) {
+        assert!(
+            (pair[0][0] - pair[1][0]).abs() > 0.05,
+            "κ must differ across adjacent occasions for the fixture to see it: {kappas:?}"
+        );
+    }
+
+    for (obs, equal) in layouts {
+        let pop = population(vec![subj("1", obs.to_vec(), vec![])]);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(seed),
+            decision_times: decisions.clone(),
+            ..Default::default() // verify = true: the frozen replay passes on every layout
+        };
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect("adaptive IOV sim runs and passes the default verifier");
+        assert_eq!(res.ledger.len(), 4, "{obs:?}: a dose at every decision");
+
+        let static_doses: Vec<DoseEvent> = res
+            .ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+            .collect();
+        let occasion = |t: f64| crate::pk::occasion_of(&decisions, t).expect("in a window") as u32;
+        let mut static_subject = subj("1", obs.to_vec(), static_doses);
+        static_subject.occasions = obs.iter().map(|&t| occasion(t)).collect();
+        static_subject.dose_occasions = res.ledger.iter().map(|e| occasion(e.time)).collect();
+        let preds = crate::pk::predict_iov(
+            &model,
+            &static_subject,
+            &model.default_params.theta,
+            &eta_bsv,
+            &kappas,
+        );
+        assert_eq!(res.trajectories.len(), preds.len(), "{obs:?}");
+
+        // The worst relative gap over the observations, each asserted finite first.
+        let mut worst = 0.0_f64;
+        for (traj, &pred) in res.trajectories.iter().zip(preds.iter()) {
+            assert!(
+                traj.ipred.is_finite() && pred.is_finite() && pred > 0.0,
+                "{obs:?} t={}: adaptive {} predict_iov {pred}",
+                traj.time,
+                traj.ipred
+            );
+            let gap = ((traj.ipred - pred) / pred).abs();
+            assert!(gap.is_finite(), "{obs:?} t={}: gap {gap}", traj.time);
+            worst = worst.max(gap);
+        }
+        if equal {
+            assert!(
+                worst < 1e-12,
+                "observations {obs:?}: adaptive must equal predict_iov, worst gap {worst:e}"
+            );
+        } else {
+            assert!(
+                worst > 1e-2,
+                "observations {obs:?}: adaptive must differ from predict_iov (#2895), worst gap \
+                 {worst:e}"
+            );
+        }
+    }
 }

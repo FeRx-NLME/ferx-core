@@ -1532,33 +1532,56 @@ fn fill_per_record_pk_params(
 /// The dose attributes an `ADDL`-implied dose takes from its parent row's `$PK` rather
 /// than from the governing record's (#1909, [`crate::types::ImpliedDose`]). Measured
 /// against NONMEM 7.5.1: the lag is fixed when the parent row schedules the train, while
-/// `F` and the disposition follow the governing record (`nonmem_anchor/addl_*`).
+/// `F` and the disposition follow the governing record (`nonmem_anchor/addl_*`). A
+/// route's own lag (`first_order(ka=…, lag=L)`) is a lag too and follows the parent with
+/// it (#2367); it is a per-forcing slot rather than a `DoseAttr`, so
+/// [`parent_dose_attr_copies`] adds it.
 const PARENT_DOSE_ATTRS: [crate::types::DoseAttr; 1] = [crate::types::DoseAttr::Lag];
 
 /// `(k, parent, slot)` for every `ADDL`-implied dose `k` and every slot of
-/// [`PARENT_DOSE_ATTRS`] its compartment reads: the copies that turn per-dose snapshots
-/// built at each dose's own inputs into NONMEM's. The slot is the one the engine resolves
-/// for that dose (`ALAG{cmt}`, else the bare lag), so no other dose's attribute moves.
+/// [`PARENT_DOSE_ATTRS`] its compartment reads, then the route lag of every input-rate
+/// forcing its dose feeds: the copies that turn per-dose snapshots built at each dose's
+/// own inputs into NONMEM's. The slot is the one the engine resolves for that dose
+/// (`ALAG{cmt}`, else the bare lag; the forcing's `lag_slot`), so no other dose's
+/// attribute moves.
+///
+/// The route lag follows the parent because a first-order route with `lag = L` is a
+/// depot dosed with `ALAG = L`, and NONMEM fixes that `ALAG` at the parent row
+/// (`nonmem_anchor/addl_lag`, which `addl_lag_route_fit.ferx` spells as a route lag).
+/// Reading it at the governing record put the two lags of one dose on different
+/// records.
 pub(crate) fn parent_dose_attr_copies<'a>(
     model: &'a CompiledModel,
     subject: &'a Subject,
 ) -> impl Iterator<Item = (usize, usize, usize)> + 'a {
+    let map = model.active_dose_attr_map();
+    let forcings = model
+        .ode_spec
+        .as_ref()
+        .map_or(&[][..], |o| &o.input_rate[..]);
     (0..subject.doses.len()).flat_map(move |k| {
         let parent = subject.implied_dose_parent(k);
-        let cmt = subject.doses[k].cmt_1based();
-        PARENT_DOSE_ATTRS.iter().filter_map(move |&attr| {
-            let p = parent?;
-            let map = model.active_dose_attr_map();
-            let slot = match attr {
+        let dose = &subject.doses[k];
+        let cmt = dose.cmt_1based();
+        let attrs = PARENT_DOSE_ATTRS
+            .iter()
+            .filter_map(move |&attr| match attr {
                 crate::types::DoseAttr::Lag => Some(map.lag_slot(cmt)),
                 other => map.indexed_slot(other, cmt),
-            }?;
-            Some((k, p, slot))
-        })
+            });
+        let route_lags = forcings
+            .iter()
+            .filter(move |f| f.cmt == dose.cmt_idx())
+            .filter_map(|f| f.lag_slot);
+        parent
+            .map(move |p| attrs.chain(route_lags).map(move |s| (k, p, s)))
+            .into_iter()
+            .flatten()
     })
 }
 
-/// Give each `ADDL`-implied dose its parent's [`PARENT_DOSE_ATTRS`] (#1909): the one
+/// Give each `ADDL`-implied dose its parent's [`PARENT_DOSE_ATTRS`] (#1909) and route lags
+/// (#2367), the slots [`parent_dose_attr_copies`] lists: the one
 /// post-pass every per-dose builder runs after evaluating each dose at its own inputs,
 /// so the engines read the parent's lag at the implied dose without a second `$PK` call.
 pub(crate) fn inherit_parent_dose_attrs(
@@ -1793,24 +1816,30 @@ pub(crate) fn occasion_of(decision_times: &[f64], t: f64) -> Option<usize> {
 /// obs record), because in the reactive setting that observation genuinely occurs
 /// *during* that occasion. The static [`predict_iov`] instead reads the row's own `OCC`
 /// label ([`pk_only_row_occasion`], #1876). The two are consistent *within* their own
-/// path (the adaptive driver's `segment_occ_at` also uses [`occasion_of`], so
+/// path (the adaptive driver's `governing_segment_occ_at` also uses [`occasion_of`], so
 /// materialiser and driver agree); a future oracle that validates an adaptive IOV run
 /// *with EVID=2 rows* against `predict_iov` agrees only where the row's `OCC` names the
 /// decision window containing it.
 ///
-/// **Base dose at an occasion boundary — a second [`predict_iov`] divergence.** The
-/// driver assigns a *segment's* occasion from the last observation / EVID=2 record it
-/// crossed (`segment_occ_at`), i.e. the decision window active *during* the segment (the
-/// clearance in effect at that time — the physically faithful choice for real-time
-/// feedback, #701). `predict_iov` uses the #104 OCC end-of-interval rule: the segment
-/// ending at a *dose* record takes that dose's occasion. The two agree when every
-/// segment ends at an observation (the shipped anchor observes a trough at each decision),
-/// but differ for a base dose sitting at an occasion boundary with no coincident
-/// observation — the segment *before* that dose uses the prior window in the driver and
-/// the dose's window in `predict_iov`. An adaptive IOV oracle over such a configuration
-/// must validate against the driver's own frozen-replay verifier (bit-exact) or mrgsolve,
-/// not `predict_iov`. (This `dose` snapshot only fixes each dose's *F* at its
-/// administration occasion; the running disposition occasion is `segment_occ_at`'s job.)
+/// **Base dose at an occasion boundary — agreement with [`predict_iov`].** The driver
+/// assigns a *segment's* occasion from the record that ENDS it
+/// (`governing_segment_occ_at`, #1073), and a base dose row is a record (#1148). So the
+/// segment ending at a base dose takes that dose's occasion, as under `predict_iov`'s
+/// end-of-interval rule. Measured on #2771: base doses at 0 and 24, observations at 12,
+/// 36 and 60, decisions at 0, 24, 48 and 72 give `predict_iov`'s predictions to 2e-16
+/// relative. (This `dose` snapshot only fixes each dose's *F* at its administration
+/// occasion; the running disposition occasion is `governing_segment_occ_at`'s job.)
+///
+/// **A controller dose is the remaining [`predict_iov`] divergence.** A controller-issued
+/// dose is not a record in the driver, so it ends no segment. In `predict_iov` on the
+/// realized doses it is a dose row, which does. The two agree when, for each dosing
+/// decision, the first data record at or after it comes before the next decision (a
+/// decision with no data record at or after it does not matter: no observation is left to
+/// show a difference). Otherwise they can differ (#2895,
+/// `adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasion`): measured on #2771 with a bolus at each
+/// of the same four decisions, observations at 0, 12, 48, 72 differ by 5.3 % at t = 48
+/// and observations at 0, 72 by 9.4 % at t = 72. The frozen-replay verifier passes on
+/// both, because it shares the driver's convention.
 ///
 /// **An `ADDL`-implied dose takes its governing record's occasion — agreement with
 /// [`predict_iov`], not a third divergence** (#2371). Since #1909 an implied dose's

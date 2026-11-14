@@ -16,7 +16,9 @@
 //! a reference that profiles nothing.
 
 use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
-use ferx_core::types::{CovarianceMethod, EstimationMethod, FitOptions, FitResult, OmegaMatrix};
+use ferx_core::types::{
+    CovarianceMethod, EstimationMethod, FitOptions, FitResult, HeldReason, OmegaMatrix,
+};
 use nalgebra::DMatrix;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -417,6 +419,91 @@ fn f2b_evaluated(
     (p, f)
 }
 
+/// #2797 on a profiled fit, the "no matrix" cell: ETA_EM forced onto the internal guard
+/// (ω = e⁻¹²) where the data supports ω ≈ 0.1 is not a stationary point — the profile
+/// objective's Hessian is indefinite along ETA_EM itself (min eigenvalue −0.006, measured)
+/// — so the step publishes no matrix and holds nothing. ETA_EM is still listed in
+/// `held_at_bound` beside the profiled level, `cov_fixed` is empty, and the guard warning
+/// makes no claim about standard errors there are none of. The held side of the profiled
+/// step is pinned in `profile_tests::a_profiled_step_holds_a_structural_coordinate_on_the_guard`.
+#[test]
+fn a_profiled_fit_lists_a_collapse_even_when_its_step_fails() {
+    let (est, _) = ext("profile_mbma_bound.ext");
+    let path = unique_temp("ferx_profiled_levels_2797");
+    std::fs::write(&path, f2b_text(true)).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(root().join(F2_DATA).to_str().unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut params = p.init_params.clone();
+    for k in 0..3 {
+        params.theta[k] = est[&format!("THETA{}", k + 1)];
+    }
+    params.omega = OmegaMatrix::from_diagonal(&[(-12.0_f64).exp()], vec!["ETA_EM".into()]);
+    params.omega_iov = Some(OmegaMatrix::from_diagonal(
+        &[est["OMEGA(2,2)"]],
+        vec!["KAPPA_ARM".into()],
+    ));
+    let opts = r(FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..p.parsed.fit_options.clone()
+    });
+    let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(f.covariance_matrix.is_none(), "{:?}", f.warnings);
+    assert!(
+        f.warnings
+            .iter()
+            .any(|w| w.contains("Hessian of the profile objective is not positive definite")),
+        "{:?}",
+        f.warnings
+    );
+    let held: Vec<(&str, HeldReason)> = f
+        .held_at_bound
+        .iter()
+        .map(|h| (h.name.as_str(), h.reason))
+        .collect();
+    assert_eq!(
+        held,
+        [
+            ("PLACEBO[STUDY=7,TIME=4]", HeldReason::ProfiledBound),
+            ("ETA_EM", HeldReason::CollapsedAtGuard),
+        ]
+    );
+    assert!(f.cov_fixed.is_empty());
+    // #2799, the status's step-failed arm (plan cell F): a collapse beside a failed step is
+    // `collapsed_at_guard`, the failure is read once from `covariance_status` (its Critical
+    // warning is not counted again), and the profiled level on its box is not a reason.
+    assert_eq!(
+        f.covariance_status,
+        ferx_core::types::CovarianceStatus::Failed
+    );
+    assert_eq!(
+        f.status(),
+        ferx_core::types::FitStatus::NotConverged {
+            reasons: vec![
+                ferx_core::types::StatusReason::EvaluationOnly,
+                ferx_core::types::StatusReason::CovarianceFailed,
+                ferx_core::types::StatusReason::CollapsedAtGuard {
+                    parameters: vec!["ETA_EM".into()]
+                },
+            ]
+        },
+        "{:?}",
+        f.warnings
+    );
+    let guard = f
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("Internal optimizer parameter guard reached"))
+        .expect("the guard warning");
+    assert!(guard.contains("ETA_EM"), "{guard}");
+    assert!(!guard.contains("standard errors"), "{guard}");
+}
+
 /// The profiled [`f2b_evaluated`] under `r`, evaluated once for the tests that read it.
 fn bounded_at_nonmem_optimum() -> &'static (ferx_core::PreparedRun, FitResult) {
     static F: std::sync::OnceLock<(ferx_core::PreparedRun, FitResult)> = std::sync::OnceLock::new();
@@ -456,6 +543,31 @@ fn a_bounded_profiled_evaluation_reproduces_nonmem_with_the_level_fixed() {
         f.warnings
     );
     assert_eq!(f.profiled_levels_at_bound, [pinned]);
+    // #2797: the same level is the one `held_at_bound` entry, as a `ProfiledBound` — no
+    // collapse is listed beside it (none of this model's coordinates is on a rail), and the
+    // matrix below is unchanged by the field's arrival (the NONMEM comparison is the pin).
+    let held: Vec<(
+        &str,
+        ferx_core::types::ParameterKind,
+        usize,
+        usize,
+        HeldReason,
+    )> = f
+        .held_at_bound
+        .iter()
+        .map(|h| (h.name.as_str(), h.kind, h.index, h.packed_index, h.reason))
+        .collect();
+    assert_eq!(
+        held,
+        [(
+            "PLACEBO[STUDY=7,TIME=4]",
+            ferx_core::types::ParameterKind::Theta,
+            pinned,
+            pinned,
+            HeldReason::ProfiledBound
+        )]
+    );
+    assert!(f.cov_fixed[pinned], "{:?}", f.cov_fixed);
     let d_ofv = f.ofv - est["OBJ"];
     let mut worst_level = 0.0_f64;
     for k in (3..39).filter(|&k| k != pinned) {
@@ -1792,6 +1904,83 @@ fn a_bounded_profiled_cross_product_holds_the_level_as_fixed() {
         off_free > S_HELD_STRADDLE,
         "the held S⁻¹ is the all-free one: {off_free}"
     );
+}
+
+/// [`s1_visit_text`] profiled, at its inits, with ETA_EMAX (the second ETA) moved onto the
+/// internal guard ω = e⁻¹² — a collapse (#2797) — and ETA_EMAX `FIX` when `fix`, under
+/// `covariance_method = s`.
+fn s1_visit_collapsed_s(fix: bool) -> (ferx_core::PreparedRun, FitResult) {
+    let path = unique_temp("ferx_profiled_levels_s1_visit_collapsed");
+    std::fs::write(&path, s1_visit_text(true)).unwrap();
+    let p = ferx_core::prepare_run(
+        path.to_str().unwrap(),
+        Some(root().join(S1_DATA_100).to_str().unwrap()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    let mut params = p.init_params.clone();
+    let om = &params.omega;
+    assert_eq!(om.eta_names.len(), 2, "fixture moved");
+    let diag = [om.matrix[(0, 0)], (-12.0_f64).exp()];
+    params.omega = OmegaMatrix::from_diagonal(&diag, om.eta_names.clone());
+    params.omega_fixed[1] = fix;
+    let opts = s(FitOptions {
+        verbose: false,
+        outer_maxiter: 0,
+        run_covariance_step: true,
+        ..p.parsed.fit_options.clone()
+    });
+    let f = ferx_core::fit(&p.parsed.model, &p.population, &params, &opts)
+        .unwrap_or_else(|e| panic!("{e}"));
+    (p, f)
+}
+
+/// ETA_EMAX's packed row in [`s1_visit_collapsed_s`]: its Cholesky diagonal.
+const S1_ETA_EMAX_ROW: usize = 11;
+
+/// #2816 T4 + T5: a variance collapsed on the guard is held by the profiled
+/// `covariance_method = s` step as the unprofiled one holds it (#2797) — the matrix is the
+/// profiled FIX twin's bit for bit, its row is `cov_fixed`, its SE zero, and the guard
+/// warning says the other SEs are computed with it held. `run_covariance` replays the held
+/// matrix in memory and after a `.fitrx` reload.
+///
+/// Mutation: drop `condition_on_held` in `cross_product_covariance` → correlation-scale gap
+/// 1.9e2 to the FIX twin, `cov_fixed[11]` false, SE(ETA_E0) 8.6238e-3 against 7.4515e-3
+/// (macOS arm64).
+#[test]
+fn a_collapse_is_held_by_the_profiled_cross_product_as_fixed() {
+    let (p, held) = s1_visit_collapsed_s(false);
+    let (_, fix) = s1_visit_collapsed_s(true);
+    for (side, f) in [("held", &held), ("FIX", &fix)] {
+        assert_eq!(
+            f.covariance_method,
+            Some(CovarianceMethod::CrossProduct),
+            "{side}: {:?}",
+            f.warnings
+        );
+    }
+    let listed: Vec<_> = held.held_at_bound.iter().map(|h| h.packed_index).collect();
+    assert_eq!(listed, [S1_ETA_EMAX_ROW], "the collapse is listed");
+    assert!(
+        fix.held_at_bound.is_empty(),
+        "a FIX parameter is not listed"
+    );
+    assert_eq!(held.covariance_matrix, fix.covariance_matrix);
+    assert!(held.cov_fixed[S1_ETA_EMAX_ROW], "{:?}", held.cov_fixed);
+    let se = held.se_omega.as_ref().expect("SEs");
+    assert_eq!(se[1], 0.0, "{se:?}");
+    assert_eq!(held.se_omega, fix.se_omega);
+    assert_eq!(held.se_theta, fix.se_theta);
+    let guard = held
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("Internal optimizer parameter guard reached"))
+        .expect("the guard warning");
+    // Both arms open "Their standard errors are not reported"; only the held one goes on.
+    assert!(
+        guard.ends_with("the other standard errors are computed with them held at the floor."),
+        "{guard}"
+    );
+    assert_replays_bit_for_bit(&p, &held, &s1_visit_text(true), s);
 }
 
 /// The held `S⁻¹` against the all-free one, off the held row: realised 0.306 (Linux

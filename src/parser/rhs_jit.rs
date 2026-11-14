@@ -402,6 +402,7 @@ fn lower(module: &mut JITModule, name: &str, f: &Func) -> Option<cranelift_modul
                 Inst::Abs(x) => b.ins().fabs(r(x)),
                 Inst::Floor(x) => b.ins().floor(r(x)),
                 Inst::Ceil(x) => b.ins().ceil(r(x)),
+                Inst::Sqrt(x) => b.ins().sqrt(r(x)),
                 Inst::Call1(s, x) => {
                     let f: extern "C" fn(f64) -> f64 = match s {
                         Shim1::Exp => shim_exp,
