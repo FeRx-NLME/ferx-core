@@ -555,6 +555,13 @@ decision (`the_run_equals_predict_iov_on_the_realized_doses_plus_a_record_per_de
 `EVID=2` row's own `OCC` governing the interval it ends is anchored to NONMEM
 (`nonmem_anchor/iov_pk_only_*`, #1876).
 
+`predict_iov` takes its κ vectors in the order of the subject's occasion groups,
+not in decision order: first the occasions that own an observation, in the order
+they appear, then those only a dose, an `EVID=2` row or a reset carries
+(`iov_occasion_groups`). Hand it the run's κ in decision order and any layout
+where some occasion owns no observation gets the wrong κ. That mistake made the
+gaps first reported on #2895 look 25–50 times larger than they were.
+
 Before #2895 a decision was not a record, so a piece ran under the next *data*
 record, however many decisions later. Under IOV that was a later occasion's κ.
 With a `TIME`-reading PK it was a later `TIME`. With a time-varying covariate it

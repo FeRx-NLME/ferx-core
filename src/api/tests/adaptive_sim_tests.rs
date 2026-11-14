@@ -8910,7 +8910,7 @@ fn adaptive_state_past_cotimed_final_rows_carries_the_last() {
 }
 
 #[test]
-fn adaptive_state_before_a_reset_is_integrated_under_the_reset_row() {
+fn adaptive_state_before_a_reset_is_integrated_under_the_decisions_record() {
     // T6 (#1148, P9), revised by #2895. `ODE_TV_COV`: CL = 5·CRCL/100. A decision@18 sits
     // between obs@12 (90) and a reset@24 (30). The decision is itself a record (#2895), so it
     // terminates (12, 18] under the row it carries — LOCF, obs@12's 90 — and the state the
@@ -8919,15 +8919,17 @@ fn adaptive_state_before_a_reset_is_integrated_under_the_reset_row() {
     // (`auc_target_reads_a_reset_rows_own_kappa`). Before #2895 the reset row governed
     // (12, 18] and gave 28.365403, and skipping the reset to obs@42 gave 23.693414 (CRCL 60).
     //
-    // The arms differ only in obs@42's row, which no longer reaches the state at 18: both
-    // read the same value, and the old rules' values are asserted away from it.
+    // obs@42 carries CRCL 60, so skipping the reset (the pre-#1148 rule) is a distinct value
+    // too; both old rules are asserted away from the one checked. A second arm with obs@42 at
+    // 30 was dropped: since #2895 it asserts the same number (#2948 review row 6).
     let model = parse_model_string(ODE_TV_COV).expect("parse TV-cov ODE model");
     let a12 = 100.0 * (-0.09f64 * 12.0).exp();
     let want = 100.0 * (-0.09f64 * 18.0).exp();
     let reset_governed = a12 * (-0.03f64 * 6.0).exp();
     let skip_reset = |crcl42: f64| a12 * (-(0.1 * crcl42 / 100.0) * 6.0f64).exp();
     assert!((reset_governed - want).abs() > 1.0 && (skip_reset(60.0) - want).abs() > 1.0);
-    for crcl42 in [60.0, 30.0] {
+    {
+        let crcl42 = 60.0;
         let mut s = subj("1", vec![12.0, 42.0], vec![]);
         s.covariates = crcl_1148(90.0);
         s.obs_covariates = vec![crcl_1148(90.0), crcl_1148(crcl42)];
