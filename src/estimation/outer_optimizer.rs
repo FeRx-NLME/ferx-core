@@ -205,16 +205,21 @@ pub(crate) fn resolve_outer_optimizer(
     has_mixture: bool,
     analytic_outer_gradient: bool,
 ) -> (Optimizer, Option<String>) {
-    // Mixture models (#977). BOBYQA (derivative-free) is the default and safe
-    // choice — robust against the mixture's label-switching multimodality. Since
-    // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
-    // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
-    // honoured — those route through `optimize_nlopt`, whose objective closure
-    // branches to `mixture_gradient`. An explicit `bobyqa` is honoured too: it is
-    // the optimizer the mixture path runs, so nothing was replaced and no warning
-    // is owed (#2852). Every other choice (including `auto`, and the built-in
-    // BFGS / trust-region paths, which do not carry the mixture objective) falls
-    // back to BOBYQA.
+    // Mixture models (#977). The NLopt optimizers carry the mixture objective:
+    // `optimize_nlopt`'s objective closure branches to the analytic posterior-weighted
+    // `mixture_gradient` (Phase 4), so a user who picks SLSQP / L-BFGS / MMA is
+    // honoured, and `auto` follows the same rule as any other model: L-BFGS when the
+    // analytic outer gradient is in scope, BOBYQA otherwise. BOBYQA was `auto`'s mixture
+    // choice until #2739, as "robust against label switching". Measured on the public
+    // mixture fixtures (`tests/nonmem/mixture_iv*.csv`, 100 seeded random starts each),
+    // L-BFGS reached the best optimum in 100, 71 and 99 of 100 fits against BOBYQA's 100, 74
+    // and 99 (within 3 of 100) in 5–8× fewer evaluations. The one start it cannot leave is a
+    // permutation-symmetric one, which `optimize_population` detects and runs under BOBYQA
+    // (`mixture::indistinguishable_class_pairs`). The check is exact: a merely close start
+    // (clearances 1.70 and 1.71) is not caught and runs L-BFGS. An explicit `bobyqa` is
+    // honoured too: it is the optimizer the mixture path runs, so nothing was replaced and
+    // no warning is owed (#2852). The built-in BFGS / L-BFGS and trust-region paths do not
+    // carry the mixture objective and fall back to BOBYQA.
     if has_mixture {
         // Exhaustive, no wildcard: a new variant must say here whether it carries
         // the mixture objective.
@@ -222,11 +227,12 @@ pub(crate) fn resolve_outer_optimizer(
             Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
                 requested
             }
-            // `Auto` is the mixture default; the built-in BFGS / L-BFGS and
-            // trust-region paths do not carry the mixture objective.
-            Optimizer::Auto | Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => {
-                Optimizer::Bobyqa
+            Optimizer::Auto => {
+                requested.resolve_auto_given_analytic(model, analytic_outer_gradient)
             }
+            // The built-in BFGS / L-BFGS and trust-region paths do not carry the
+            // mixture objective.
+            Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => Optimizer::Bobyqa,
         };
         // The warning is owed exactly when an *explicit* choice did not run — keyed
         // on the outcome, not on a second list of variants, so "replaced" can never
@@ -246,6 +252,79 @@ pub(crate) fn resolve_outer_optimizer(
     (
         requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
         None,
+    )
+}
+
+/// The optimizer a fit started at `init_params` runs: [`resolve_outer_optimizer`], except that a
+/// mixture whose classes start indistinguishable runs BOBYQA where `auto` would pick a gradient
+/// optimizer, with [`mixture_symmetric_start_warning`]. Such a start is a saddle no gradient
+/// optimizer leaves (`mixture::indistinguishable_class_pairs`). Only `auto`'s own choice is
+/// overridden; an explicit gradient optimizer is the user's to keep.
+///
+/// The rule the outer loop dispatches on and the one `fit()` reports its optimizer from, so the
+/// two cannot disagree (#1540); `symmetric_pairs` is [`symmetric_mixture_start`] at the start the
+/// stage was run from, and the start is symmetric when it is non-empty. Returns the warnings owed
+/// with the choice.
+pub(crate) fn resolve_fit_optimizer(
+    requested: Optimizer,
+    model: &CompiledModel,
+    has_mixture: bool,
+    analytic_outer_gradient: bool,
+    symmetric_pairs: &[(usize, usize)],
+) -> (Optimizer, Vec<String>) {
+    let (resolved, downgrade) =
+        resolve_outer_optimizer(requested, model, has_mixture, analytic_outer_gradient);
+    let mut warnings: Vec<String> = downgrade.into_iter().collect();
+    // `requested == Auto` is the rule's own condition here. `symmetric_mixture_start` tests it
+    // too, and on the `optimize_population` path the two reject the same inputs; that one is
+    // only a cost gate, skipping the `O(n_subj · K)` scan where its answer cannot be used.
+    if requested == Optimizer::Auto
+        && has_mixture
+        && resolved != Optimizer::Bobyqa
+        && !symmetric_pairs.is_empty()
+    {
+        warnings.push(mixture_symmetric_start_warning(symmetric_pairs));
+        return (Optimizer::Bobyqa, warnings);
+    }
+    (resolved, warnings)
+}
+
+/// The class pairs of a mixture under `optimizer = auto` that start where they cannot be told
+/// apart ([`crate::estimation::mixture::indistinguishable_class_pairs`]); empty when there are
+/// none. Evaluated only where it can change the choice: a mixture left on `auto`.
+pub(crate) fn symmetric_mixture_start(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    requested: Optimizer,
+) -> Vec<(usize, usize)> {
+    if requested != Optimizer::Auto || init_params.mixture.is_none() {
+        return Vec::new();
+    }
+    crate::estimation::mixture::indistinguishable_class_pairs(model, population, init_params)
+}
+
+/// The code [`mixture_symmetric_start_warning`] opens with. The floor escape and rail completion
+/// read it to carry the warning onto a resumed run they adopt (`floor_escape::carry_start_warning`).
+pub(crate) const MIXTURE_SYMMETRIC_START: &str = "W_MIXTURE_SYMMETRIC_START";
+
+/// The warning for a mixture with classes that start indistinguishable, where `auto` runs
+/// BOBYQA instead of L-BFGS ([`crate::estimation::mixture::indistinguishable_class_pairs`]).
+/// Names each pair, as class numbers (`MIXNUM`): the check is pairwise, so a third class
+/// may differ.
+fn mixture_symmetric_start_warning(pairs: &[(usize, usize)]) -> String {
+    let named = pairs
+        .iter()
+        .map(|(a, b)| format!("classes {a} and {b}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{MIXTURE_SYMMETRIC_START}: mixture {named} start indistinguishable: every subject has \
+         the same mixing probability and the same objective under both classes of a pair. A \
+         gradient optimizer cannot separate such a pair, so `optimizer = auto` ran BOBYQA \
+         instead of L-BFGS. Give the two classes of each pair different initial values (for \
+         example of their class-specific parameters, or of their mixing probabilities) to fit \
+         with L-BFGS."
     )
 }
 
@@ -284,13 +363,13 @@ pub fn optimize_population(
     // The mixture arm and the `auto` resolution both live in
     // `resolve_outer_optimizer`, so the #1381 coupling check cannot describe a
     // different rule than the one that runs here.
-    let (resolved, downgrade) = resolve_outer_optimizer(
+    let (resolved, optimizer_downgrade_warning) = resolve_fit_optimizer(
         options.optimizer,
         model,
         init_params.mixture.is_some(),
         crate::sens::provider::analytic_outer_gradient_for_interaction(model, options.interaction),
+        &symmetric_mixture_start(model, population, init_params, options.optimizer),
     );
-    let optimizer_downgrade_warning: Vec<String> = downgrade.into_iter().collect();
     let owned_opts;
     let options = if resolved == options.optimizer {
         options
@@ -11420,8 +11499,8 @@ fn declined_subject_gradient(
 ///
 /// Recording instead of probing also removes every gate this diagnostic would otherwise
 /// need, because a decline can only be recorded on an evaluation that actually happened:
-/// a derivative-free BOBYQA fit (including the silent mixture `Auto` → BOBYQA downgrade in
-/// [`resolve_outer_optimizer`]),
+/// a derivative-free BOBYQA fit (including the mixture `Auto` → BOBYQA choice at an
+/// indistinguishable start, see [`resolve_fit_optimizer`]),
 /// a `reconverge_gradient_interval = 1` fit that bypasses the analytic branch on every
 /// eval, a GN / trust-region fit, and an `outer_maxiter = 0` evaluation-only run all reach
 /// the end with an empty log and say nothing.

@@ -6964,14 +6964,19 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // loop resolves with — differing *only* in the analytic-gradient predicate fed
     // to it: the live one, and the scope-only one that says what `auto` would have
     // picked under `gradient = auto`. Asking that question of `resolve_auto`
-    // directly was wrong twice over on review: it misses the mixture arm (where
-    // `auto` is BOBYQA whatever the gradient), and it knows nothing about the
-    // `outer_maxiter == 0` short-circuit that constructs no optimizer at all.
+    // directly was wrong twice over on review: it misses the mixture arm (which
+    // replaces an optimizer that cannot carry the mixture objective with BOBYQA), and
+    // it knows nothing about the `outer_maxiter == 0` short-circuit that constructs no
+    // optimizer at all.
     //
     // Quiet, therefore, on: a model out of the analytic scope anyway (ODE/PD, LTBS,
     // TTE) where `fd` changed nothing; a model above `BOBYQA_MAX_DIM`, where `auto`
-    // takes L-BFGS on an FD gradient either way; a mixture model; and an
-    // evaluation-only (`maxiter = 0`) fit.
+    // takes L-BFGS on an FD gradient either way; and an evaluation-only
+    // (`maxiter = 0`) fit. A mixture model *does* warn since #2739: its `auto` follows
+    // the analytic gradient like any other model's, so `gradient = fd` moves it too.
+    // This check takes no population, so it cannot see a mixture whose classes start
+    // indistinguishable, where `auto` runs BOBYQA under either gradient; it warns
+    // there too, naming the model-level pick (#2749 review row 3).
     //
     // The gradient is read through `GradientMethod::effective`, not off
     // `model.gradient_method`, because `validate_model_file` (`ferx check`) hands us

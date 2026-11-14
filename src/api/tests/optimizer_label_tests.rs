@@ -3,14 +3,17 @@
 //! `auto (<resolved>)` is a claim about which outer optimizer ran. Before #1540 the
 //! label was built from `Optimizer::resolve_auto`, which has no `[mixture]` branch,
 //! while the outer loop dispatches on
-//! `estimation::outer_optimizer::resolve_outer_optimizer`, which sends every mixture
-//! model left on `auto` to BOBYQA. A mixture model in analytic scope therefore ran
-//! BOBYQA and reported `auto (nlopt_lbfgs)`.
+//! `estimation::outer_optimizer::resolve_outer_optimizer`. The label now comes from
+//! `resolve_fit_optimizer`, the rule the outer loop runs, which knows the two things
+//! `resolve_auto` does not:
 //!
-//! Every test here is a pair straddling the mixture gate on one analytic-scope model,
-//! and asserts the analytic scope itself: without it the non-mixture arm also resolves
-//! to BOBYQA, both arms read `auto (bobyqa)`, and the mixture assertion passes against
-//! the pre-#1540 code.
+//! - under a mixture, an explicit optimizer that cannot carry the mixture objective runs
+//!   as BOBYQA;
+//! - a mixture whose classes start indistinguishable runs `auto` as BOBYQA, not L-BFGS.
+//!
+//! Every test here is a pair straddling one of those gates on an analytic-scope model,
+//! and asserts the analytic scope itself: without it `auto` resolves to BOBYQA on both
+//! sides and the pair cannot tell the rules apart.
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
@@ -80,13 +83,16 @@ fn assert_analytic_scope(model: &CompiledModel, interaction: bool) {
     );
 }
 
-/// The helper, both sides of the mixture gate, for both FOCE and FOCEI.
+/// The helper, both sides of the symmetric-start gate, for both FOCE and FOCEI: a mixture in
+/// analytic scope left on `auto` runs L-BFGS, and from a start whose classes are
+/// indistinguishable it runs BOBYQA. The flag means nothing without a mixture.
 ///
-/// Mutation that must redden this: building the label from
+/// Mutations that must redden this: building the label from
 /// `options.optimizer.resolve_auto(model, options.interaction)` again (the pre-#1540
-/// code) — the mixture arm then reads `auto (nlopt_lbfgs)`.
+/// code), or from `resolve_outer_optimizer` without the symmetric-start fallback — the
+/// symmetric arm then reads `auto (nlopt_lbfgs)` for a fit that ran BOBYQA.
 #[test]
-fn auto_label_follows_the_mixture_downgrade() {
+fn auto_label_follows_the_mixture_rule() {
     let model = parse(MIXTURE);
     assert!(model.mixture.is_some());
     for (method, interaction) in [
@@ -100,15 +106,22 @@ fn auto_label_follows_the_mixture_downgrade() {
             optimizer: Optimizer::Auto,
             ..Default::default()
         };
+        // The returned optimizer is what `gradient_method_outer` reports on (#2749 row 2), so it
+        // is asserted beside the label.
         assert_eq!(
-            reported_optimizer_label(method, &opts, &model, true),
-            "auto (bobyqa)",
-            "{method:?}: a mixture fit left on `auto` runs BOBYQA"
+            reported_optimizer_label(method, &opts, &model, true, Vec::new),
+            ("auto (nlopt_lbfgs)".to_string(), Optimizer::NloptLbfgs),
+            "{method:?}: a mixture in analytic scope left on `auto` runs L-BFGS"
         );
         assert_eq!(
-            reported_optimizer_label(method, &opts, &model, false),
-            "auto (nlopt_lbfgs)",
-            "{method:?}: the same model with the mixture gate off resolves to L-BFGS"
+            reported_optimizer_label(method, &opts, &model, true, || vec![(1, 2)]),
+            ("auto (bobyqa)".to_string(), Optimizer::Bobyqa),
+            "{method:?}: from a symmetric start it runs BOBYQA"
+        );
+        assert_eq!(
+            reported_optimizer_label(method, &opts, &model, false, || vec![(1, 2)]),
+            ("auto (nlopt_lbfgs)".to_string(), Optimizer::NloptLbfgs),
+            "{method:?}: without a mixture the symmetric-start pairs change nothing"
         );
     }
 }
@@ -124,12 +137,16 @@ fn auto_label_follows_the_mixture_downgrade() {
 #[test]
 fn explicit_optimizer_label_reports_the_mixture_replacement() {
     let model = parse(MIXTURE);
+    // A symmetric pair given: it overrides only `auto`, never an explicit choice.
     let label = |optimizer, has_mixture| {
         let opts = FitOptions {
             optimizer,
             ..Default::default()
         };
-        reported_optimizer_label(EstimationMethod::FoceI, &opts, &model, has_mixture)
+        reported_optimizer_label(EstimationMethod::FoceI, &opts, &model, has_mixture, || {
+            vec![(1, 2)]
+        })
+        .0
     };
     for (optimizer, own) in [
         (Optimizer::Bfgs, "bfgs"),
@@ -200,14 +217,8 @@ fn subject(id: &str, cl: f64) -> Subject {
     }
 }
 
-/// What `fit()` actually writes onto `FitResult::optimizer`, both sides of the gate.
-///
-/// The helper test above cannot see the call site: passing `false` (or
-/// `model.mixture.is_none()`) for `has_mixture` inside `fit_inner` leaves it green.
-/// One outer iteration — the label does not depend on convergence.
-#[test]
-fn fit_reports_auto_bobyqa_for_a_mixture_model() {
-    let pop = Population {
+fn population() -> Population {
+    Population {
         subjects: vec![
             subject("1", 1.0),
             subject("2", 1.2),
@@ -219,7 +230,31 @@ fn fit_reports_auto_bobyqa_for_a_mixture_model() {
         input_columns: Vec::new(),
         exclusions: None,
         warnings: Vec::new(),
-    };
+    }
+}
+
+/// `MIXTURE` with `TVCL2` set to `TVCL1`'s 1.0 and the mixing logit at 0: the classes are then
+/// the same model with probability ½ each.
+fn symmetric_mixture() -> String {
+    let symmetric = MIXTURE.replace(
+        "theta TVCL2(3.0, 0.001, 100.0)",
+        "theta TVCL2(1.0, 0.001, 100.0)",
+    );
+    assert_ne!(symmetric, MIXTURE, "the symmetric edit must apply");
+    symmetric
+}
+
+/// What `fit()` actually writes onto `FitResult::optimizer` and `gradient_method_outer`, both
+/// sides of the symmetric-start gate, and the warning that says why.
+///
+/// The helper test above cannot see the call site: passing no pairs for the symmetric start
+/// (or checking another start than the stage's) inside `fit_inner` leaves it green, and so does
+/// reporting the outer gradient for `options.optimizer` rather than the optimizer that ran,
+/// which at the symmetric start reads `analytic (Dual2)` beside `auto (bobyqa)` (#2749 row 2).
+/// One outer iteration: neither field depends on convergence.
+#[test]
+fn fit_reports_the_optimizer_a_mixture_fit_ran() {
+    let pop = population();
     let opts = FitOptions {
         method: EstimationMethod::FoceI,
         interaction: true,
@@ -228,18 +263,86 @@ fn fit_reports_auto_bobyqa_for_a_mixture_model() {
         run_covariance_step: false,
         ..Default::default()
     };
-    for (src, want) in [
-        (MIXTURE, "auto (bobyqa)"),
-        (NO_MIXTURE, "auto (nlopt_lbfgs)"),
+    let symmetric = symmetric_mixture();
+    for (label, src, want, gradient, warns) in [
+        (
+            "distinct classes",
+            MIXTURE,
+            "auto (nlopt_lbfgs)",
+            "analytic (Dual2)",
+            false,
+        ),
+        (
+            "symmetric start",
+            symmetric.as_str(),
+            "auto (bobyqa)",
+            "N/A",
+            true,
+        ),
+        (
+            "no mixture",
+            NO_MIXTURE,
+            "auto (nlopt_lbfgs)",
+            "analytic (Dual2)",
+            false,
+        ),
     ] {
         let model = parse(src);
         assert_analytic_scope(&model, true);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
-        assert_eq!(
-            result.optimizer,
-            want,
-            "mixture = {}",
-            model.mixture.is_some()
-        );
+        assert_eq!(result.optimizer, want, "{label}");
+        assert_eq!(result.gradient_method_outer, gradient, "{label}");
+        let warned = result
+            .warnings
+            .iter()
+            .any(|w| w.starts_with("W_MIXTURE_SYMMETRIC_START"));
+        assert_eq!(warned, warns, "{label}: {:#?}", result.warnings);
     }
+}
+
+/// The label is judged at the start of the **last** stage, not at `init_params` (#2749 review
+/// row 5). `methods = [foce, focei]` from the symmetric start: the FOCE stage runs BOBYQA and
+/// warns, its estimates separate the classes, and the FOCEI stage (the one `FitResult` reports)
+/// starts from them and runs L-BFGS.
+///
+/// Mutation that must redden this: `record_stage_start(init_params, &stage_opts)` in
+/// `fit_inner`, which judges every stage at the symmetric `init_params` and reports
+/// `auto (bobyqa)` / `N/A` for a final stage that ran L-BFGS. Every other fixture here starts its
+/// last stage at `init_params`, so none of them can see it.
+#[test]
+fn a_later_stage_is_judged_at_its_own_start() {
+    let pop = population();
+    let model = parse(&symmetric_mixture());
+    assert_analytic_scope(&model, true);
+    let opts = FitOptions {
+        method: EstimationMethod::FoceI,
+        methods: vec![EstimationMethod::Foce, EstimationMethod::FoceI],
+        interaction: true,
+        optimizer: Optimizer::Auto,
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+    // The premise: the FOCE stage moved the classes apart. If it ever ends with them still
+    // identical, the FOCEI stage starts symmetric too and the test no longer straddles the gate.
+    let theta = &result.theta;
+    assert_ne!(
+        theta[0], theta[1],
+        "the FOCE stage must separate TVCL1 and TVCL2: {theta:?}"
+    );
+    assert_eq!(result.optimizer, "auto (nlopt_lbfgs)");
+    assert_eq!(result.gradient_method_outer, "analytic (Dual2)");
+    // The first stage did start symmetric and says so under its own tag; the last did not.
+    let symmetric: Vec<&String> = result
+        .warnings
+        .iter()
+        .filter(|w| w.contains("W_MIXTURE_SYMMETRIC_START"))
+        .collect();
+    assert_eq!(symmetric.len(), 1, "{:#?}", result.warnings);
+    assert!(
+        symmetric[0].starts_with("[FOCE] W_MIXTURE_SYMMETRIC_START"),
+        "{:#?}",
+        result.warnings
+    );
 }
