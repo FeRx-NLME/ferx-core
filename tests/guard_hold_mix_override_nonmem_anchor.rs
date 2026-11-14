@@ -203,7 +203,9 @@ fn held_override_renders_held_and_its_base_keeps_its_se() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fit.yaml");
     ferx_core::io::output::write_estimates_yaml(&f, path.to_str().unwrap()).unwrap();
-    let yaml = std::fs::read_to_string(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    // The top-level sections; the `estimates:` block after them repeats them (#2911).
+    let yaml = &text[..text.find("\nestimates:\n").expect("estimates block")];
     let section = &yaml[yaml.find("\nmixture_overrides:\n").expect("section")..];
     assert!(
         section.starts_with(

@@ -9325,6 +9325,14 @@ impl FitResult {
                 "status".to_string(),
                 serde_json::to_value(self.status()).expect("FitStatus is serializable"),
             );
+            // #2911: the parameter estimates keyed by name, in the fit YAML's own layout —
+            // `estimates.theta.CL.estimate` is the YAML's `theta.CL.estimate` — so a reader
+            // of final estimates does not branch on which file it was handed. Derived, like
+            // `status`: `from_json_str` ignores it and reads the vectors above.
+            map.insert(
+                "estimates".to_string(),
+                crate::io::output::estimates_json(self),
+            );
         }
         v
     }
