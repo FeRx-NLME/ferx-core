@@ -1413,11 +1413,9 @@ fn read_nonmem_csv_impl(
         population_warnings.push(match routing.missing_dv {
             MissingDvPolicy::Skip => format!(
                 "W_MISSING_DV: {} observation row(s) (EVID=0) had a missing DV (`.`/`NA`/blank) \
-                 but were not marked MDV=1; they were skipped (not scored as DV=0). Setting \
-                 MDV=1 on intentionally-missing observations silences this, but is not the same \
-                 as the skip: an MDV=1 row is kept as a record, so it starts the integration \
-                 clock and its covariates and occasion govern the interval ending at it, as in \
-                 NONMEM. Otherwise, check for data errors.",
+                 but were not marked MDV=1; they were skipped (not scored as DV=0) and read as \
+                 MDV=1 rows, which are kept as records. Setting MDV=1 on intentionally-missing \
+                 observations silences this. Otherwise, check for data errors.",
                 total_missing_dv
             ),
             MissingDvPolicy::KeepAsDesign => format!(
@@ -3308,6 +3306,26 @@ fn parse_subject(
             ));
         }
 
+        // Keep the row as a pk-only record (see the `EVID=2` arm below).
+        macro_rules! push_pk_only {
+            () => {{
+                pk_only_times.push(time);
+                note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
+                pk_only_raw_times.push(raw_time);
+                pk_only_rec.push(row_seq);
+                if any_tv {
+                    pk_only_covariates.push(locf_state.clone());
+                }
+                // The row's own `OCC` (#1876): NONMEM runs `$PK` here under it, and the
+                // snapshot governs the interval ending at this row. Gated like
+                // `reset_occasions`. The #1810 pass below only moves a time in place, so the
+                // labels stay parallel to `pk_only_times`.
+                if occ_col.is_some() {
+                    pk_only_occasions.push(occ);
+                }
+            }};
+        }
+
         if evid == 3 {
             // Pure system reset: no dose, no observation. Nothing else to do.
         } else if is_dose_evid(evid) {
@@ -3497,13 +3515,29 @@ fn parse_subject(
                     "DV",
                 ));
             }
+            // NONMEM has no endpoint kinds: an endpoint row, or one skipped for its missing DV
+            // as MDV=1, is a record whose `$PK` runs and whose snapshot governs the interval
+            // ending at it, as an `EVID=2` row's does (#2368). An endpoint row ahead of every
+            // other record starts no clock: ferx integrates a subject with no other record
+            // from 0 (`subject_integration_start`), where a NONMEM dataset carries a TIME=0
+            // record for it. A TTE row is never skipped for its DV (see above).
+            let tte = routing.tte.contains(&cmt);
+            let has_record = !(dose_rec.is_empty()
+                && obs_rec.is_empty()
+                && pk_only_rec.is_empty()
+                && reset_rec.is_empty());
+            if (skip_missing_dv && !tte)
+                || ((tte || routing.integer_kind(cmt).is_some()) && has_record)
+            {
+                push_pk_only!();
+            }
 
             // Non-Gaussian row routing: when this CMT belongs to a declared TTE /
             // discrete-state / count endpoint, route the row to `obs_records`
             // instead of the Gaussian parallel Vecs. The routing `.contains`
             // checks are always compiled; only the TTE `Event` construction is
             // `survival`-gated. The routing sets are disjoint (validated up front).
-            if routing.tte.contains(&cmt) {
+            if tte {
                 #[cfg(feature = "survival")]
                 {
                     use crate::types::{EventType, ObsRecord};
@@ -3798,20 +3832,7 @@ fn parse_subject(
                     });
                 }
             }
-            pk_only_times.push(time);
-            note_filled_cells(&mut filled_cells, &filled_watch, row, raw_time);
-            pk_only_raw_times.push(raw_time);
-            pk_only_rec.push(row_seq);
-            if any_tv {
-                pk_only_covariates.push(locf_state.clone());
-            }
-            // The row's own `OCC` (#1876): NONMEM runs `$PK` here under it, and the
-            // snapshot governs the interval ending at this row. Gated like
-            // `reset_occasions`. The #1810 pass below only moves a time in place, so the
-            // labels stay parallel to `pk_only_times`.
-            if occ_col.is_some() {
-                pk_only_occasions.push(occ);
-            }
+            push_pk_only!();
         }
     }
 
