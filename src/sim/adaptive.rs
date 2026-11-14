@@ -1145,6 +1145,78 @@ impl DoseGrid {
     pub(crate) fn place(&self, x: f64) -> f64 {
         round_to_grid(x, self.step).clamp(self.low, self.high)
     }
+
+    /// The dose one `p%` step from `d` lands on. The controller's step and the
+    /// absorbed-step check (#2810) both call this, so the check cannot disagree with
+    /// the engine on a tie.
+    pub(crate) fn step_percent(&self, d: f64, p: f64, up: bool) -> f64 {
+        self.place(percent_step(d, p, up))
+    }
+
+    /// The lowest multiple of the step that `increase p%` raises, on a grid with no
+    /// upper bound (#2810): every multiple below it is absorbed. `None` when the step
+    /// raises no finite multiple up to index 2^52.
+    ///
+    /// Found by bisection on [`Self::step_percent`] itself, not from `50 / p`: the tie
+    /// nudge in `round_to_grid` is relative, so for a small percentage the engine raises
+    /// a dose somewhat below `50 * step / p` (#2890 review r1 rows 1 and 2), and `50 / p`
+    /// is infinite for a percentage near the smallest `f64`.
+    pub(crate) fn lowest_raised_by(step: f64, p: f64) -> Option<f64> {
+        const MAX_INDEX: f64 = 4_503_599_627_370_496.0; // 2^52
+        let open = Self {
+            step,
+            low: 0.0,
+            high: f64::INFINITY,
+        };
+        let raised = |k: f64| {
+            let d = grid_point(k, step);
+            d.is_finite() && open.step_percent(d, p, true) > d
+        };
+        // The first power of two that is raised, then the first index between it and
+        // the power before it.
+        let mut hi = 1.0;
+        while !raised(hi) {
+            hi *= 2.0;
+            if hi > MAX_INDEX {
+                return None;
+            }
+        }
+        let mut lo = hi / 2.0;
+        while hi - lo > 1.0 {
+            let mid = ((lo + hi) / 2.0).floor();
+            if raised(mid) {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        Some(grid_point(hi, step))
+    }
+}
+
+/// `d` after one `p%` step, before any rounding or clamp.
+pub(crate) fn percent_step(d: f64, p: f64, up: bool) -> f64 {
+    let factor = if up { 1.0 + p / 100.0 } else { 1.0 - p / 100.0 };
+    d * factor
+}
+
+/// A dose the smallest `increase N%` cannot raise on the dose grid (#2810): the step
+/// rounds back to the same dose at every decision where that rule fires.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum AbsorbedIncrease {
+    /// The start dose, as placed on the grid.
+    FromStart(f64),
+    /// The start dose can rise, but the lowest dose the decrease rules bring it to
+    /// cannot.
+    OnceSteppedDown(f64),
+}
+
+impl AbsorbedIncrease {
+    pub(crate) fn dose(self) -> f64 {
+        match self {
+            Self::FromStart(d) | Self::OnceSteppedDown(d) => d,
+        }
+    }
 }
 
 /// P4 (#944): `round_to` together with a `levels` ladder.
@@ -1498,6 +1570,64 @@ impl AdaptiveDosingSpec {
     /// without `round_to`. A plan that passed [`dose_plan_violation`] has one.
     pub(crate) fn dose_grid(&self, bounds: (f64, f64)) -> Option<DoseGrid> {
         DoseGrid::new(self.grid_rule()?.step, bounds)
+    }
+
+    /// The smallest `increase N%` among the rules, if any. `increase 0%` is not one:
+    /// it is written to keep the dose, so a dose it leaves unchanged is no surprise.
+    pub(crate) fn smallest_increase_percent(&self) -> Option<f64> {
+        self.rules
+            .iter()
+            .filter_map(|r| match r.action {
+                AdaptiveAction::Increase(DoseStep::Percent(p)) => Some(p),
+                _ => None,
+            })
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .reduce(f64::min)
+    }
+
+    /// The largest `decrease N%` among the rules, if any.
+    fn largest_decrease_percent(&self) -> Option<f64> {
+        self.rules
+            .iter()
+            .filter_map(|r| match r.action {
+                AdaptiveAction::Decrease(DoseStep::Percent(p)) => Some(p),
+                _ => None,
+            })
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .reduce(f64::max)
+    }
+
+    /// Whether the dose grid absorbs the smallest increase step at a dose this subject
+    /// can be at (#2810). `None` without `round_to`, without an `increase N%` rule, or
+    /// when the step moves every such dose.
+    ///
+    /// The doses a `p%` increase cannot raise are the lowest of the grid, since
+    /// `d * p / 100` grows with `d`. So the lowest dose the subject can reach decides:
+    /// the placed start dose when no decrease moves it, and otherwise the dose the
+    /// largest `decrease N%` brings it to when applied until it stops moving (a smaller
+    /// decrease never goes lower). The aligned low bound is not used: a decrease can be
+    /// absorbed above it, and then it is never reached. A dose at the aligned high bound
+    /// is not reported: an increase absorbed there is the bound, not the grid.
+    #[allow(clippy::float_cmp)] // grid doses: "unchanged" is the same multiple, bit for bit
+    pub(crate) fn absorbed_increase(&self, plan: &SubjectDosePlan) -> Option<AbsorbedIncrease> {
+        let grid = self.dose_grid(plan.dose_bounds)?;
+        let p = self.smallest_increase_percent()?;
+        let absorbed = |d: f64| d < grid.high && grid.step_percent(d, p, true) == d;
+        let start = grid.place(plan.start_dose);
+        if absorbed(start) {
+            return Some(AbsorbedIncrease::FromStart(start));
+        }
+        let q = self.largest_decrease_percent()?;
+        let mut floor = start;
+        loop {
+            let next = grid.step_percent(floor, q, false);
+            // Strictly lower each pass and never below the aligned low, so this ends.
+            if !(next < floor) {
+                break;
+            }
+            floor = next;
+        }
+        absorbed(floor).then_some(AbsorbedIncrease::OnceSteppedDown(floor))
     }
 
     /// Every dose expression, with the key it is written under (#944).
@@ -2117,6 +2247,214 @@ mod tests {
             start_dose: start.into(),
             ..base_spec()
         }
+    }
+
+    // ── #2810: the smallest increase step absorbed at a dose the subject can be at ──
+    //
+    // `s = 250` throughout, so every grid dose and every tie is an exact integer and the
+    // expected values are hand-computed.
+
+    /// `round_to = 250` with the rules `increase up%` (each of `ups`) and `decrease
+    /// down%` (each of `downs`).
+    fn stepped(bounds: (f64, f64), start: f64, ups: &[f64], downs: &[f64]) -> AdaptiveDosingSpec {
+        let rule = |op, action| AdaptiveRule {
+            op,
+            threshold: 10.0,
+            action,
+            interval: None,
+        };
+        let mut s = gridded(250.0, bounds, start);
+        s.rules = ups
+            .iter()
+            .map(|&p| {
+                rule(
+                    Comparison::Lt,
+                    AdaptiveAction::Increase(DoseStep::Percent(p)),
+                )
+            })
+            .chain(downs.iter().map(|&q| {
+                rule(
+                    Comparison::Gt,
+                    AdaptiveAction::Decrease(DoseStep::Percent(q)),
+                )
+            }))
+            .collect();
+        s
+    }
+
+    fn absorbed(spec: &AdaptiveDosingSpec) -> Option<AbsorbedIncrease> {
+        spec.absorbed_increase(&spec.literal_dose_plan().expect("a block of numbers"))
+    }
+
+    /// The threshold, both sides in one test: from 500, `increase 25%` changes the dose
+    /// by exactly half a step (625, a tie, which goes up to 750), so it is not absorbed;
+    /// `increase 24.99%` changes it by just under half (624.95, back to 500), so it is.
+    /// The straddle itself is asserted, so the pair cannot become two cases on one side.
+    ///
+    /// Mutations: ties sent down (`f64::round` on `x / s`, or `>` for `>=`) reddens the
+    /// 25% half; a check of `d * p / 100 < s` (a whole step) reddens it too; a check that
+    /// never fires reddens the 24.99% half.
+    #[test]
+    fn an_increase_just_below_half_a_step_is_absorbed_and_one_at_half_is_not() {
+        let half: f64 = 250.0 / 2.0;
+        let (at, below) = (25.0, 24.99);
+        assert_eq!(
+            (percent_step(500.0, at, true) - 500.0).to_bits(),
+            half.to_bits()
+        );
+        let short = percent_step(500.0, below, true) - 500.0;
+        assert!(short < half && short > half - 0.1, "{short}");
+
+        let bounds = (250.0, 4000.0);
+        assert_eq!(absorbed(&stepped(bounds, 500.0, &[at], &[])), None);
+        assert_eq!(
+            absorbed(&stepped(bounds, 500.0, &[below], &[])),
+            Some(AbsorbedIncrease::FromStart(500.0))
+        );
+    }
+
+    /// The two cases. Under `increase 10%` a dose rises only from 1250 up. A start dose
+    /// of 1000 is absorbed itself. A start dose of 1500 rises (1650 gives 1750), but
+    /// `decrease 25%` brings it down 1500, 1250, 1000, 750, 500 and stops there (375 is
+    /// a tie, back to 500), and 500 is absorbed. The floor is 500, not the aligned low
+    /// of 250, which no decrease reaches.
+    ///
+    /// Mutations: reporting the aligned low gives 250; checking only the start dose
+    /// gives `None` for 1500; skipping the start check reports 1000 as stepped down to
+    /// 500.
+    #[test]
+    fn the_start_dose_and_the_floor_of_the_decreases_are_told_apart() {
+        let bounds = (250.0, 4000.0);
+        assert_eq!(
+            absorbed(&stepped(bounds, 1000.0, &[10.0], &[25.0])),
+            Some(AbsorbedIncrease::FromStart(1000.0))
+        );
+        assert_eq!(
+            absorbed(&stepped(bounds, 1500.0, &[10.0], &[25.0])),
+            Some(AbsorbedIncrease::OnceSteppedDown(500.0))
+        );
+    }
+
+    /// A low bound the subject cannot reach does not warn, although `increase 25%` is
+    /// absorbed there (250 gives 312.5, back to 250; asserted, so the case is live).
+    /// Without a decrease rule the dose never leaves 500 downward; with `decrease 25%`
+    /// the decrease is absorbed at 500 first (375 is a tie). From 500 the increase moves.
+    ///
+    /// Mutations: the check on the aligned low reports 250 in both; the floor taken as
+    /// the low whenever a decrease rule exists reports it in the second.
+    #[test]
+    fn a_low_bound_no_decrease_reaches_is_not_reported() {
+        let bounds = (250.0, 4000.0);
+        let grid = DoseGrid::new(250.0, bounds).expect("grid");
+        assert_eq!(grid.low.to_bits(), 250.0f64.to_bits());
+        assert_eq!(
+            grid.step_percent(250.0, 25.0, true).to_bits(),
+            250.0f64.to_bits()
+        );
+        assert_eq!(absorbed(&stepped(bounds, 500.0, &[25.0], &[])), None);
+        assert_eq!(absorbed(&stepped(bounds, 500.0, &[25.0], &[25.0])), None);
+    }
+
+    /// A dose at the aligned high bound is not reported: 500 `increase 10%` stays 500
+    /// under bounds `[250, 500]` because of the bound. One grid point lower it is the
+    /// grid: with bounds `[250, 600]` (aligned high 500) a start dose of 300 is placed at
+    /// 250, where `increase 25%` is absorbed — the 20 kg subject of
+    /// `examples/adaptive_vanco_mgkg_rounded.ferx`.
+    ///
+    /// Mutations: dropping `d < high` reports the first; `d <= high - step` drops the
+    /// second.
+    #[test]
+    fn a_dose_at_the_high_bound_is_not_reported() {
+        assert_eq!(
+            absorbed(&stepped((250.0, 500.0), 500.0, &[10.0], &[])),
+            None
+        );
+        assert_eq!(
+            absorbed(&stepped((250.0, 600.0), 300.0, &[25.0], &[])),
+            Some(AbsorbedIncrease::FromStart(250.0))
+        );
+    }
+
+    /// Which rules are read. The smallest increase decides: with `increase 50%` and
+    /// `increase 10%`, 1000 is absorbed by the 10% rule; with 50% alone it is not. The
+    /// largest decrease sets the floor: with `decrease 5%` and `decrease 25%` the dose
+    /// comes down from 1500 to 500; with 5% alone it never leaves 1500 (1425 rounds back),
+    /// which the increase moves. `increase 0%` is not an increase step, and without
+    /// `round_to` there is no grid.
+    ///
+    /// Mutations: the largest increase, or the smallest decrease, each reddens its pair.
+    #[test]
+    fn the_smallest_increase_and_the_largest_decrease_are_the_ones_read() {
+        let bounds = (250.0, 4000.0);
+        assert_eq!(
+            absorbed(&stepped(bounds, 1000.0, &[50.0, 10.0], &[])),
+            Some(AbsorbedIncrease::FromStart(1000.0))
+        );
+        assert_eq!(absorbed(&stepped(bounds, 1000.0, &[50.0], &[])), None);
+        assert_eq!(
+            absorbed(&stepped(bounds, 1500.0, &[10.0], &[5.0, 25.0])),
+            Some(AbsorbedIncrease::OnceSteppedDown(500.0))
+        );
+        assert_eq!(absorbed(&stepped(bounds, 1500.0, &[10.0], &[5.0])), None);
+
+        assert_eq!(absorbed(&stepped(bounds, 500.0, &[0.0], &[])), None);
+        let mut no_grid = stepped(bounds, 1000.0, &[10.0], &[]);
+        no_grid.round_to = None;
+        assert_eq!(absorbed(&no_grid), None);
+    }
+
+    /// The lowest multiple an increase raises, by hand: at `s = 250`, 25% needs
+    /// `d >= 500`, 10% needs `d >= 1250`, 50% raises 250 itself (375 is a tie) and 49%
+    /// does not (372.5), so it starts at 500. On a decimal grid, `0.1` under 25%: 0.1
+    /// gives 0.125 (back to 0.1), 0.2 gives 0.25, a tie, up to 0.3.
+    ///
+    /// Small percentages (#2890 review r1 rows 1 and 2): the tie nudge is relative, so
+    /// the engine raises a dose below `50 * s / p`. At `s = 1` the reviewer's bisection
+    /// gave 16667 for 0.003%, 49996 for 0.001% (not 50000) and 45454546 for 1e-6% (not
+    /// 50000000). `1e-310%` must return: `50 / p` is infinite there.
+    ///
+    /// Each value is also checked against the engine: it is raised and the multiple
+    /// below it is not.
+    ///
+    /// Mutations: returning `50 * s / p` unrounded gives 510.2 for 49%; ties down gives
+    /// 750 for 25%; starting the search at `floor(50 / p)` gives 50000 for 0.001% and
+    /// does not return for 1e-310%.
+    #[test]
+    fn lowest_raised_by_is_the_first_multiple_the_step_moves() {
+        let open = |s: f64| DoseGrid {
+            step: s,
+            low: 0.0,
+            high: f64::INFINITY,
+        };
+        for (s, p, want) in [
+            (250.0, 25.0, Some(500.0)),
+            (250.0, 10.0, Some(1250.0)),
+            (250.0, 50.0, Some(250.0)),
+            (250.0, 49.0, Some(500.0)),
+            (0.1, 25.0, Some(0.2)),
+            (1.0, 0.003, Some(16667.0)),
+            (1.0, 0.001, Some(49996.0)),
+            (1.0, 1e-6, Some(45_454_546.0)),
+            (1.0, 1e-310, None),
+        ] {
+            let got = DoseGrid::lowest_raised_by(s, p).expect("a multiple is raised");
+            if let Some(want) = want {
+                assert_eq!(got.to_bits(), f64::to_bits(want), "s = {s}, p = {p}");
+            }
+            let below = got - s;
+            assert!(
+                open(s).step_percent(got, p, true) > got,
+                "s = {s}, p = {p}: {got}"
+            );
+            assert_eq!(
+                open(s).step_percent(below, p, true).to_bits(),
+                below.to_bits(),
+                "s = {s}, p = {p}: {below}"
+            );
+        }
+        // No finite multiple is raised: 1e308 is absorbed (1.25e308 rounds back) and
+        // the next multiple is infinite.
+        assert_eq!(DoseGrid::lowest_raised_by(1e308, 25.0), None);
     }
 
     /// P3: a `round_to` that is not a finite number `> 0`, on a spec built in code (the

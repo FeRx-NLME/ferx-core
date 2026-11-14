@@ -711,6 +711,111 @@ fn dose_oracle_warning(
     ))
 }
 
+/// One dose plan whose lowest reachable dose the smallest increase step cannot raise
+/// (#2810): the subject's index in the population, and the replicate for an oracle
+/// subject, whose plan is evaluated per replicate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct AbsorbedPlan {
+    pub(super) subject: usize,
+    pub(super) replicate: Option<usize>,
+    pub(super) found: crate::sim::adaptive::AbsorbedIncrease,
+}
+
+/// Subjects named per group in `W_ADAPTIVE_STEP_ABSORBED` before the rest are counted.
+const ABSORBED_STEP_SHOWN: usize = 10;
+
+/// `W_ADAPTIVE_STEP_ABSORBED` (#2810): with `round_to`, the smallest `increase N%`
+/// rounds back to the same dose at a dose some subjects can be at, so that rule fires
+/// there and the dose does not move. `None` when no plan in `plans` has such a dose. One
+/// line for the run: the subjects are counted, then named (the first
+/// [`ABSORBED_STEP_SHOWN`] of each group) with the dose, split by whether the start dose
+/// itself is absorbed.
+///
+/// An oracle subject's plan differs per replicate, so it is named per group with the
+/// number of replicates in that group, the first of them, and that replicate's dose. It
+/// is in both groups when its replicates differ in case (#2890 review r1 row 6).
+pub(super) fn absorbed_step_warning(
+    spec: &crate::sim::adaptive::AdaptiveDosingSpec,
+    population: &Population,
+    n_sim: usize,
+    mut plans: Vec<AbsorbedPlan>,
+) -> Option<String> {
+    use crate::sim::adaptive::{AbsorbedIncrease, DoseGrid};
+    let (s, p) = (spec.round_to?, spec.smallest_increase_percent()?);
+    plans.sort_by_key(|a| (a.subject, a.replicate));
+    let mut ids: Vec<usize> = plans.iter().map(|a| a.subject).collect();
+    ids.dedup();
+    if ids.is_empty() {
+        return None;
+    }
+    let group = |from_start: bool| {
+        // One entry per subject in this group: its first plan here, and how many.
+        let mut subjects: Vec<(AbsorbedPlan, usize)> = Vec::new();
+        for a in plans
+            .iter()
+            .filter(|a| matches!(a.found, AbsorbedIncrease::FromStart(_)) == from_start)
+        {
+            match subjects.last_mut() {
+                Some((first, n)) if first.subject == a.subject => *n += 1,
+                _ => subjects.push((*a, 1)),
+            }
+        }
+        let named: Vec<String> = subjects
+            .iter()
+            .map(|(a, n)| {
+                let id = &population.subjects[a.subject].id;
+                let dose = a.found.dose();
+                match a.replicate {
+                    None => format!("'{id}' at {dose}"),
+                    Some(k) => {
+                        format!("'{id}' in {n} of {n_sim} replicate(s), first in {k} at {dose}")
+                    }
+                }
+            })
+            .collect();
+        let shown = named
+            .iter()
+            .take(ABSORBED_STEP_SHOWN)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        match named.len() {
+            0 => None,
+            n if n > ABSORBED_STEP_SHOWN => {
+                Some(format!("{shown} and {} more", n - ABSORBED_STEP_SHOWN))
+            }
+            _ => Some(shown),
+        }
+    };
+    let from_start = group(true)
+        .map(|l| format!(" From the start dose on: {l}."))
+        .unwrap_or_default();
+    let stepped_down = group(false)
+        .map(|l| format!(" Once the decrease rules have brought the dose down: {l}."))
+        .unwrap_or_default();
+    // The third remedy holds only where a subject's upper bound leaves room for it, and
+    // needs the start dose raised with the low bound (#2890 review r1 row 3).
+    let (lowest, or_higher_doses) = match DoseGrid::lowest_raised_by(s, p) {
+        Some(d) => (
+            format!(" The lowest dose this step can raise is {d}."),
+            format!(
+                ", or, where a subject's upper bound allows, a start dose and a dose_bounds \
+                 low of at least {d}"
+            ),
+        ),
+        None => (String::new(), String::new()),
+    };
+    Some(format!(
+        "W_ADAPTIVE_STEP_ABSORBED: with round_to = {s}, `increase {p}%` (the smallest \
+         increase step) cannot raise a dose that {} of {} subject(s) can be at: the step \
+         rounds back to the same dose, so each time that rule fires there the dose stays \
+         where it is.{from_start}{stepped_down}{lowest} To let these doses rise, use a \
+         smaller round_to or a larger increase step{or_higher_doses}.",
+        ids.len(),
+        population.subjects.len(),
+    ))
+}
+
 /// A subject's drawn values in one replicate, handed to the controller factory so an
 /// oracle dose plan can read them (#944): the replicate, its θ, and `[η | κ₀]`.
 pub(crate) struct DrawnValues<'a> {
@@ -2240,6 +2345,25 @@ pub fn simulate_adaptive_from_spec_with_inputs(
     }];
 
     let exprs = &compiled.dose_exprs;
+    // The plans whose smallest increase step the dose grid absorbs (#2810). An oracle
+    // subject's plan is evaluated inside the run, once per replicate, hence the lock.
+    let absorbed_store = std::sync::Mutex::new(Vec::<AbsorbedPlan>::new());
+    let absorbed = &absorbed_store;
+    let note_absorbed =
+        move |subject: usize,
+              replicate: Option<usize>,
+              plan: &crate::sim::adaptive::SubjectDosePlan| {
+            if let Some(found) = spec.absorbed_increase(plan) {
+                absorbed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(AbsorbedPlan {
+                        subject,
+                        replicate,
+                        found,
+                    });
+            }
+        };
     let mut result = run_adaptive_population(
         model,
         ode,
@@ -2250,12 +2374,18 @@ pub fn simulate_adaptive_from_spec_with_inputs(
         &monitors,
         |supplied: &[Option<Vec<f64>>]| {
             let plans = resolve_dose_plans(model, population, params, spec, exprs, supplied)?;
+            for (i, plan) in plans.iter().enumerate() {
+                if let Some(plan) = plan {
+                    note_absorbed(i, None, plan);
+                }
+            }
             let make = compiled.make_controller.as_ref();
             Ok(move |i: usize, drawn: &DrawnValues<'_>| match &plans[i] {
                 Some(plan) => Ok((make(plan), false)),
                 None => {
                     let plan =
                         oracle_dose_plan(model, &population.subjects[i], spec, exprs, drawn)?;
+                    note_absorbed(i, Some(drawn.sim), &plan);
                     Ok((make(&plan), true))
                 }
             })
@@ -2292,6 +2422,12 @@ pub fn simulate_adaptive_from_spec_with_inputs(
     oracle_ids.sort_unstable();
     oracle_ids.dedup();
     if let Some(w) = dose_oracle_warning(exprs, oracle_ids.len(), population.subjects.len()) {
+        result.warnings.push(w);
+    }
+    let absorbed_plans = absorbed_store
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(w) = absorbed_step_warning(spec, population, n_sim, absorbed_plans) {
         result.warnings.push(w);
     }
     Ok(result)

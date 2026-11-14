@@ -547,9 +547,13 @@ const LINE: &str = "correlation cs(RHO) by ARM";
 /// was taken, that the line does not explain it, and the `ar1` advice.
 #[test]
 fn decorrelated_positive_message_under_cs_is_exact() {
-    let msg =
-        dw_autocorrelation_warning_decorrelated(1.43, LINE, crate::types::ResidualSerialKind::Cs)
-            .expect("below 1.5");
+    let msg = dw_autocorrelation_warning_decorrelated(
+        1.43,
+        LINE,
+        crate::types::ResidualSerialKind::Cs,
+        None,
+    )
+    .expect("below 1.5");
     assert_eq!(
         msg,
         "Positive autocorrelation remains in the residuals decorrelated by `correlation \
@@ -568,6 +572,7 @@ fn decorrelated_positive_message_under_ar1_is_exact() {
         1.2,
         "correlation ar1(RHO) by ARM",
         crate::types::ResidualSerialKind::Ar1,
+        None,
     )
     .expect("below 1.5");
     assert_eq!(
@@ -588,6 +593,7 @@ fn decorrelated_positive_message_under_car1_is_exact() {
         1.3,
         "correlation car1(RHO) by ARM",
         crate::types::ResidualSerialKind::Car1,
+        None,
     )
     .expect("below 1.5");
     assert_eq!(
@@ -603,15 +609,340 @@ fn decorrelated_positive_message_under_car1_is_exact() {
 
 #[test]
 fn decorrelated_negative_message_is_exact() {
-    let msg =
-        dw_autocorrelation_warning_decorrelated(2.7, LINE, crate::types::ResidualSerialKind::Cs)
-            .expect("above 2.5");
+    let msg = dw_autocorrelation_warning_decorrelated(
+        2.7,
+        LINE,
+        crate::types::ResidualSerialKind::Cs,
+        None,
+    )
+    .expect("above 2.5");
     assert_eq!(
         msg,
         "Negative autocorrelation in the residuals decorrelated by `correlation cs(RHO) by \
          ARM` (Durbin-Watson = 2.70). The residual correlation may be over-estimated, or the \
          error model misspecified."
     );
+}
+
+/// The sentence the positive text gains when the statistic paired rows across
+/// blocks (#2858), for a numeric `ID`.
+const ACROSS_BLOCKS: &str = " The blocks of this line follow one another in time, so the \
+     statistic also pairs rows of consecutive blocks, which the line leaves independent. A \
+     line `by ID` correlates all rows of one subject.";
+
+/// The same for a text `ID`.
+const ACROSS_BLOCKS_TEXT_ID: &str = " The blocks of this line follow one another in time, so \
+     the statistic also pairs rows of consecutive blocks, which the line leaves independent. \
+     A line `by COL` correlates all rows of one subject, with COL a numeric data column that \
+     has one value per subject (`ID` is not numeric in this data).";
+
+/// The subject-line sentence under `cs` (review of #2883, row 1): the structure
+/// changes with the `by`, since `cs` over a whole subject is what a subject-level
+/// random effect already gives.
+const SUBJECT_LINE_UNDER_CS: &str = " A `correlation ar1(RHO) by ID` line correlates all rows of \
+     one subject, decaying with the number of visits between them; `car1(RHO)` decays it with \
+     the time between rows instead. `cs` over a whole subject is the correlation a \
+     subject-level random effect already gives, so it would add nothing.";
+
+/// #2858: when the statistic paired across blocks, every structure's positive text
+/// is today's text (pinned exactly above) plus one sentence, and the sentence
+/// depends only on how a subject-wide line is written. The negative text and the
+/// band do not change.
+///
+/// The discriminator and its negative are asserted per cell. Mutations that must
+/// redden this: the sentence dropped; `by ID` on a text `ID`; the sentence added
+/// to the negative text.
+#[test]
+fn decorrelated_positive_message_across_blocks_names_the_subject_line() {
+    use crate::types::ResidualSerialKind::{Ar1, Car1, Cs};
+    const BLOCKS: &str = " The blocks of this line follow one another in time, so the statistic \
+         also pairs rows of consecutive blocks, which the line leaves independent.";
+    for (kind, line) in [
+        (Cs, "correlation cs(RHO) by OCC"),
+        (Ar1, "correlation ar1(RHO) by OCC"),
+        (Car1, "correlation car1(RHO) by OCC"),
+    ] {
+        let within =
+            dw_autocorrelation_warning_decorrelated(1.2, line, kind, None).expect("below 1.5");
+        assert!(
+            !within.contains("blocks of this line") && !within.contains("by ID"),
+            "{within}"
+        );
+        let by_id = dw_autocorrelation_warning_decorrelated(
+            1.2,
+            line,
+            kind,
+            Some(SubjectLine::ById("ID".into())),
+        )
+        .expect("below 1.5");
+        let by_col = dw_autocorrelation_warning_decorrelated(
+            1.2,
+            line,
+            kind,
+            Some(SubjectLine::ByNumericColumn),
+        )
+        .expect("below 1.5");
+        if kind == Cs {
+            // Review of #2883, row 1: `cs by ID` next to a subject-level random
+            // effect is the confounded line, so the sentence names `ar1` / `car1`
+            // and never a bare "a line `by ID`".
+            assert_eq!(by_id, format!("{within}{BLOCKS}{SUBJECT_LINE_UNDER_CS}"));
+            assert!(
+                by_id.contains("`correlation ar1(RHO) by ID` line")
+                    && by_id.contains("`car1(RHO)`")
+                    && by_id.contains("`cs` over a whole subject")
+                    && !by_id.contains("A line `by ID`"),
+                "{by_id}"
+            );
+            assert!(
+                by_col.contains("`correlation ar1(RHO) by COL` line")
+                    && by_col.contains("`ID` is not numeric")
+                    && by_col.contains("`cs` over a whole subject")
+                    && !by_col.contains("by ID"),
+                "{by_col}"
+            );
+        } else {
+            assert_eq!(by_id, format!("{within}{ACROSS_BLOCKS}"), "{kind:?}");
+            assert!(
+                by_id.contains("A line `by ID` correlates")
+                    && !by_id.contains("COL")
+                    && !by_id.contains("`cs` over a whole subject"),
+                "{by_id}"
+            );
+            assert_eq!(
+                by_col,
+                format!("{within}{ACROSS_BLOCKS_TEXT_ID}"),
+                "{kind:?}"
+            );
+            assert!(
+                by_col.contains("A line `by COL` correlates")
+                    && by_col.contains("`ID` is not numeric")
+                    && !by_col.contains("by ID`"),
+                "{by_col}"
+            );
+        }
+        for across in [
+            Some(SubjectLine::ById("ID".into())),
+            Some(SubjectLine::ByNumericColumn),
+        ] {
+            assert_eq!(
+                dw_autocorrelation_warning_decorrelated(2.7, line, kind, across.clone()),
+                dw_autocorrelation_warning_decorrelated(2.7, line, kind, None),
+                "{kind:?}: the negative text does not change"
+            );
+            assert_eq!(
+                dw_autocorrelation_warning_decorrelated(2.0, line, kind, across),
+                None
+            );
+        }
+    }
+}
+
+/// #2858: `dw_across_blocks` says the statistic paired across blocks exactly when
+/// `split_by_residual_group` joined some subject's blocks: more than one block, in
+/// time. Each row is one subject's blocks, clock and id.
+///
+/// Mutations that must redden this: the "more than one block" read dropped (one
+/// block, or none, would answer `Some`: a single label runs in time); the in-time
+/// read dropped (the restarting row answers `Some`); `any` → `all` over the
+/// subjects (the mixed population answers `None`).
+#[test]
+fn dw_across_blocks_is_some_only_when_blocks_in_time_were_joined() {
+    let subject = |id: &str, blocks: &[u32], times: &[f64]| Subject {
+        id: id.to_string(),
+        obs_times: times.to_vec(),
+        observations: vec![0.0; times.len()],
+        obs_cmts: vec![1; times.len()],
+        obs_rgroup: blocks.to_vec(),
+        ..Default::default()
+    };
+    let running = [0.0, 1.0, 2.0, 3.0];
+    let restarting = [0.0, 1.0, 0.0, 1.0];
+    let of = |subjects: Vec<Subject>| dw_across_blocks(&population(subjects));
+    assert_eq!(
+        of(vec![subject("1", &[1, 1, 2, 2], &running)]),
+        Some(SubjectLine::ById("ID".into()))
+    );
+    assert_eq!(of(vec![subject("1", &[1, 1, 2, 2], &restarting)]), None);
+    assert_eq!(of(vec![subject("1", &[1, 2, 1, 2], &running)]), None);
+    assert_eq!(of(vec![subject("1", &[1, 1, 1, 1], &running)]), None);
+    assert_eq!(of(vec![subject("1", &[], &running)]), None);
+    // One subject whose blocks were joined is enough, wherever it sits.
+    for flip in [false, true] {
+        let mut subjects = vec![
+            subject("1", &[1, 1, 2, 2], &running),
+            subject("2", &[1, 1, 2, 2], &restarting),
+        ];
+        if flip {
+            subjects.reverse();
+        }
+        assert_eq!(
+            of(subjects),
+            Some(SubjectLine::ById("ID".into())),
+            "flip {flip}"
+        );
+    }
+    // A text id anywhere: `by ID` cannot be read.
+    assert_eq!(
+        of(vec![
+            subject("1", &[1, 1, 2, 2], &running),
+            subject("S2", &[1, 1, 1, 1], &running),
+        ]),
+        Some(SubjectLine::ByNumericColumn)
+    );
+}
+
+/// #2858: the cross-block warning, character for character, and each of its four
+/// gates from both sides in one test. It names the statistic over the pairs that
+/// join two blocks, their count and the pooled value it disagrees with.
+///
+/// Mutations that must redden this: any gate dropped (too few pairs; a statistic
+/// at or above 1.5; a pooled statistic already below 1.5, where the pooled warning
+/// speaks; a non-finite statistic); either sentence of the text deleted.
+#[test]
+fn cross_block_warning_text_and_gates() {
+    use crate::types::ResidualSerialKind::{Ar1, Car1, Cs};
+    const LINE: &str = "correlation ar1(RHO) by OCC";
+    const LEAD: &str = "Positive autocorrelation between consecutive blocks of `correlation \
+         ar1(RHO) by OCC` (Durbin-Watson = 1.36 over the 72 pairs that join two blocks; 1.94 \
+         over all pairs). The blocks follow one another in time, and the line leaves rows of \
+         different blocks independent.";
+    let by_id = SubjectLine::ById("ID".into());
+    let n = DW_CROSS_BLOCK_MIN_PAIRS;
+    for kind in [Ar1, Car1] {
+        let msg = dw_cross_block_warning((72, 1.3579), 1.9388, LINE, kind, &by_id).expect("fires");
+        assert_eq!(
+            msg,
+            format!("{LEAD} A line `by ID` correlates all rows of one subject."),
+            "{kind:?}"
+        );
+        assert!(!msg.contains("COL") && !msg.contains("`cs` over"), "{msg}");
+        assert_eq!(
+            crate::types::classify_warning(&msg).category,
+            crate::types::WarningCode::DwAutocorrelation,
+            "{msg}"
+        );
+    }
+    // Under `cs` the sentence names the structure too (review of #2883, row 1).
+    let cs = dw_cross_block_warning((72, 1.3579), 1.9388, LINE, Cs, &by_id).expect("fires");
+    assert_eq!(cs, format!("{LEAD}{SUBJECT_LINE_UNDER_CS}"));
+    assert!(
+        cs.contains("`correlation ar1(RHO) by ID` line") && !cs.contains("A line `by ID`"),
+        "{cs}"
+    );
+    assert_eq!(
+        crate::types::classify_warning(&cs).category,
+        crate::types::WarningCode::DwAutocorrelation,
+        "{cs}"
+    );
+    let text_id = dw_cross_block_warning(
+        (72, 1.3579),
+        1.9388,
+        LINE,
+        Ar1,
+        &SubjectLine::ByNumericColumn,
+    )
+    .expect("fires");
+    assert!(
+        text_id.ends_with(
+            "A line `by COL` correlates all rows of one subject, with COL a numeric data \
+             column that has one value per subject (`ID` is not numeric in this data)."
+        ) && !text_id.contains("by ID`"),
+        "{text_id}"
+    );
+    // Each gate, the firing side then the silent one.
+    let fires = |cross, pooled| dw_cross_block_warning(cross, pooled, LINE, Ar1, &by_id);
+    assert!(fires((n, 1.3), 2.0).is_some());
+    assert_eq!(fires((n - 1, 1.3), 2.0), None);
+    assert!(fires((n, 1.4999), 2.0).is_some());
+    assert_eq!(fires((n, 1.5), 2.0), None);
+    assert!(fires((n, 1.3), 1.5).is_some());
+    assert_eq!(fires((n, 1.3), 1.4999), None);
+    assert_eq!(fires((n, f64::NAN), 2.0), None);
+    assert_eq!(fires((0, f64::NAN), 2.0), None);
+    // A non-finite pooled statistic is silent (review of #2883, row 5). No fit
+    // reaches this cell: every cross-block pair is also a pooled pair.
+    assert_eq!(fires((n, 1.3), f64::NAN), None);
+    assert_eq!(fires((n, 1.3), f64::INFINITY), None);
+}
+
+/// #2858: the floor on the pair count. On independent rows the statistic over
+/// `DW_CROSS_BLOCK_MIN_PAIRS` pairs falls below 1.5 in about 2% of data sets
+/// (`√n/4` = 1.97 standard deviations). Measured here on 20 000 draws of 62
+/// independent pairs: 2.25%; the bound leaves it room to 4%. With 20 pairs the
+/// same threshold fires in 13.3%, which is why there is a floor.
+///
+/// This grades the constant, not the fit's code path: the statistic is recomputed
+/// here from its definition.
+#[test]
+fn cross_block_dw_is_calibrated_on_white_noise() {
+    use rand::SeedableRng;
+    use rand_distr::Distribution;
+    let normal = rand_distr::Normal::new(0.0_f64, 1.0).expect("normal");
+    let rate = |pairs: usize, seed: u64| {
+        let mut rng = rand::rngs::SmallRng::seed_from_u64(seed);
+        let reps = 20_000;
+        let mut below = 0usize;
+        for _ in 0..reps {
+            let (mut num, mut den) = (0.0, 0.0);
+            for _ in 0..pairs {
+                let (a, b) = (normal.sample(&mut rng), normal.sample(&mut rng));
+                num += (b - a) * (b - a);
+                den += (a * a + b * b) / 2.0;
+            }
+            assert!((num / den).is_finite());
+            if num / den < 1.5 {
+                below += 1;
+            }
+        }
+        below as f64 / reps as f64
+    };
+    let at_floor = rate(DW_CROSS_BLOCK_MIN_PAIRS, 2858);
+    let at_twenty = rate(20, 2858);
+    eprintln!("false-positive rate: {at_floor:.4} at the floor, {at_twenty:.4} at 20 pairs");
+    assert!(at_floor < 0.04, "at the floor: {at_floor}");
+    assert!(
+        at_floor > 0.01,
+        "the floor is not far above what 2.5% needs: {at_floor}"
+    );
+    assert!(at_twenty > 0.08, "without a floor: {at_twenty}");
+}
+
+/// #2858: the subject line is written with the data's own spelling of the subject
+/// column. `by` is case-sensitive; on a header `id`, `by ID` is refused.
+///
+/// Mutation that must redden this: the header read dropped from `SubjectLine::of`.
+#[test]
+fn subject_line_names_the_datas_own_id_header() {
+    let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
+    let pop_with = |headers: &[&str]| {
+        let mut pop = prepared(&parsed, vec![cell_subject("1", &parsed, Rows::InTime)]);
+        pop.input_columns = headers.iter().map(|h| h.to_string()).collect();
+        pop
+    };
+    for (headers, want) in [
+        (&["ID", "TIME", "DV"][..], "ID"),
+        (&["TIME", "id", "DV"][..], "id"),
+        (&["Id", "TIME"][..], "Id"),
+        (&["TIME", "DV"][..], "ID"),
+        (&[][..], "ID"),
+    ] {
+        let pop = pop_with(headers);
+        assert_eq!(
+            SubjectLine::of(&pop),
+            SubjectLine::ById(want.into()),
+            "{headers:?}"
+        );
+        let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
+        let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
+        assert!(
+            msg.contains(&format!("`correlation ar1(RHO) by {want}` line")),
+            "{headers:?}: {msg}"
+        );
+        if want != "ID" {
+            assert!(!msg.contains("by ID"), "{headers:?}: {msg}");
+        }
+    }
 }
 
 /// The band and a non-finite statistic stay silent, as for the IWRES warning; and
@@ -623,16 +954,21 @@ fn decorrelated_warning_band_and_category() {
             dw_autocorrelation_warning_decorrelated(
                 dw,
                 LINE,
-                crate::types::ResidualSerialKind::Ar1
+                crate::types::ResidualSerialKind::Ar1,
+                None
             ),
             None,
             "dw = {dw}"
         );
     }
     for dw in [1.0, 3.0] {
-        let msg =
-            dw_autocorrelation_warning_decorrelated(dw, LINE, crate::types::ResidualSerialKind::Cs)
-                .unwrap();
+        let msg = dw_autocorrelation_warning_decorrelated(
+            dw,
+            LINE,
+            crate::types::ResidualSerialKind::Cs,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             crate::types::classify_warning(&msg).category,
             crate::types::WarningCode::DwAutocorrelation,
@@ -712,6 +1048,7 @@ fn fit_pushes_the_decorrelated_cs_advice() {
         result.dw_statistic,
         "correlation cs(RHO) by ARM",
         crate::types::ResidualSerialKind::Cs,
+        None,
     )
     .expect("a DW below 1.5 warns");
     let dw_entries: Vec<&String> = result
@@ -750,6 +1087,34 @@ const ALGEBRAIC_UNGROUPED: &str = "Positive IWRES autocorrelation detected (Durb
      level's name when levels are nested); `car1(RHO)` decays the correlation with the time \
      between rows instead. The line needs method = foce or focei. A `level` for that \
      grouping with a `kappa … at` it can absorb the shared part instead.";
+
+/// The compartment-free text when the statistic paired rows across occasions that
+/// run in time (#2858), for a numeric `ID`.
+const ALGEBRAIC_IN_TIME: &str = "Positive IWRES autocorrelation detected (Durbin-Watson = \
+     1.20). Consecutive rows of one subject may share what the structural model leaves out, \
+     across its occasions too: they follow one another in time, so the statistic pairs rows \
+     of different occasions. A `correlation ar1(RHO) by ID` line in [error_model] correlates \
+     all rows of one subject, decaying with the number of visits between them; `car1(RHO)` \
+     decays the correlation with the time between rows instead. The line needs method = foce \
+     or focei. A line `by` the occasions themselves cannot model this: a block never joins \
+     rows of two occasions.";
+
+/// The same for a text `ID`, which a `by` cannot read.
+const ALGEBRAIC_IN_TIME_TEXT_ID: &str = "Positive IWRES autocorrelation detected \
+     (Durbin-Watson = 1.20). Consecutive rows of one subject may share what the structural \
+     model leaves out, across its occasions too: they follow one another in time, so the \
+     statistic pairs rows of different occasions. A `correlation ar1(RHO) by COL` line in \
+     [error_model] correlates all rows of one subject, with COL a numeric data column that \
+     has one value per subject (`ID` is not numeric in this data), decaying with the number \
+     of visits between them; `car1(RHO)` decays the correlation with the time between rows \
+     instead. The line needs method = foce or focei. A line `by` the occasions themselves \
+     cannot model this: a block never joins rows of two occasions.";
+
+fn in_time_advice() -> DwAdvice {
+    DwAdvice::AlgebraicInTime {
+        by: SubjectLine::ById("ID".into()),
+    }
+}
 
 /// The compartment-free text for group `g`.
 fn algebraic_grouped(g: &str) -> String {
@@ -1040,15 +1405,16 @@ fn algebraic_with_a_parallel_iov_column_correlates_by_the_column() {
     }
 }
 
-/// A1 (#2829). Compartment-free with `iov_column = OCC` on occasions that **run in
-/// time**: the statistic was taken over the whole subject, so the advice names no
-/// column. The twin of the test above: the same model and labels, only the clock
-/// differs.
+/// A1 (#2829, #2858). Compartment-free with `iov_column = OCC` on occasions that
+/// **run in time**: the statistic was taken over the whole subject, so the advice
+/// correlates the subject, `by ID`, and says a line by the occasions cannot. The
+/// twin of the test above: the same model and labels, only the clock differs.
 ///
-/// Mutation that must redden this, and only this among the one-subject cells: the
-/// `occasions_run_in_time` read dropped from `dw_advice` (`by OCC` again).
+/// Mutations that must redden this: the `occasions_run_in_time` read dropped from
+/// `dw_advice` (`by OCC` again); the `AlgebraicInTime` arm dropped (the ungrouped
+/// text, which tells a model that has a grouping to declare one).
 #[test]
-fn algebraic_with_an_iov_column_in_time_gets_the_ungrouped_text() {
+fn algebraic_with_an_iov_column_in_time_correlates_the_subject() {
     let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
     assert_eq!(parsed.fit_options.iov_column.as_deref(), Some("OCC"));
     assert!(
@@ -1057,13 +1423,105 @@ fn algebraic_with_an_iov_column_in_time_gets_the_ungrouped_text() {
     );
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovColumn, Rows::InTime);
     assert!(in_time, "the fixture must run in time");
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert_eq!(msg, ALGEBRAIC_UNGROUPED);
+    assert_eq!(advice, in_time_advice());
+    assert_eq!(msg, ALGEBRAIC_IN_TIME);
+    for must in [
+        "by ID` line",
+        "all rows of one subject",
+        "across its occasions too",
+        "car1(RHO)",
+        "foce or focei",
+        "A line `by` the occasions themselves cannot",
+    ] {
+        assert!(msg.contains(must), "missing `{must}`: {msg}");
+    }
+    // Not the column the statistic was taken across, no placeholder, and none of
+    // the ungrouped text's "declare a grouping" advice: the model has one.
+    for banned in
+        NOT_FOR_ALGEBRAIC
+            .iter()
+            .chain(&["OCC", "COL", "kappa", "`level`", "labels the group"])
+    {
+        assert!(!msg.contains(banned), "`{banned}` in {msg}");
+    }
+}
+
+/// #2858. A `by` column is read as a number, so on a text `ID` the line `by ID`
+/// puts every row in no block (measured: OFV and ρ unmoved, `W_COVARIATE_MISSING`).
+/// The advice then asks for a numeric subject-level column instead of naming `ID`
+/// as the column to write. One text id among numeric ones is enough.
+///
+/// Both sides of the gate in one test. Mutations that must redden it: `by_id`
+/// always `true` (the text half names `by ID`); always `false` (the numeric half
+/// loses it); `all` → `any` over the subjects (the mixed population names `by ID`).
+#[test]
+fn algebraic_in_time_names_id_only_when_it_is_numeric() {
+    let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
+    let message = |ids: &[&str]| {
+        let subjects = ids
+            .iter()
+            .map(|id| cell_subject(id, &parsed, Rows::InTime))
+            .collect();
+        let pop = prepared(&parsed, subjects);
+        assert!(all_in_time(&pop));
+        let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
+        let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
+        (advice, msg)
+    };
+    let (advice, msg) = message(&["1", "2"]);
+    assert_eq!(
+        advice,
+        DwAdvice::AlgebraicInTime {
+            by: SubjectLine::ById("ID".into())
+        }
+    );
+    assert_eq!(msg, ALGEBRAIC_IN_TIME);
     assert!(
-        msg.contains("by COL` line") && msg.contains("COL any"),
+        msg.contains("by ID` line") && !msg.contains("COL") && !msg.contains("not numeric"),
         "{msg}"
     );
-    assert!(!msg.contains("OCC"), "{msg}");
+    for ids in [["S1", "S2"], ["1", "S2"], ["S1", "2"]] {
+        let (advice, msg) = message(&ids);
+        assert_eq!(
+            advice,
+            DwAdvice::AlgebraicInTime {
+                by: SubjectLine::ByNumericColumn
+            },
+            "{ids:?}"
+        );
+        assert_eq!(msg, ALGEBRAIC_IN_TIME_TEXT_ID, "{ids:?}");
+        assert!(
+            msg.contains("by COL` line")
+                && msg.contains("one value per subject")
+                && msg.contains("`ID` is not numeric")
+                && !msg.contains("by ID`"),
+            "{ids:?}: {msg}"
+        );
+    }
+}
+
+/// #2858. A declared grouping with **one** occasion per subject: no pair crosses
+/// occasions, so the in-time text's claim that the statistic pairs rows of
+/// different occasions would be false. The ungrouped text stands.
+///
+/// The twin of A1 on the labels alone (same model, same clock). Mutation that must
+/// redden this, and only this: the `across_occasions` read dropped from `dw_advice`.
+#[test]
+fn algebraic_with_one_occasion_per_subject_keeps_the_ungrouped_text() {
+    let parsed = grouped_model(Class::Algebraic, Grouping::IovColumn);
+    let mut s = cell_subject("1", &parsed, Rows::InTime);
+    s.occasions = vec![1; 4];
+    let pop = prepared(&parsed, vec![s]);
+    assert!(all_in_time(&pop));
+    assert_eq!(pop.subjects[0].occasions, vec![1; 4]);
+    let advice = dw_advice(&parsed.model, &parsed.fit_options, &pop);
+    assert_eq!(advice, DwAdvice::Algebraic { group: None });
+    let msg = dw_autocorrelation_warning(1.20, &advice).expect("below 1.5");
+    assert_eq!(msg, ALGEBRAIC_UNGROUPED);
+    assert!(
+        !msg.contains("across its occasions") && !msg.contains("by ID"),
+        "{msg}"
+    );
 }
 
 /// A4 (#2829, plan amendment 1). A population of one subject in time and one
@@ -1107,8 +1565,9 @@ fn algebraic_iov_column_split_in_some_subjects_correlates_by_the_column() {
 
 /// Compartment-free with one `level ARM by ARMID in ID`: the level's **column** —
 /// a one-level model has no named level a `by` can read — where its groups are
-/// parallel, and the ungrouped text where they run in time (a single level is
-/// `iov_column` by construction, so it reads the clock as the column does, #2829).
+/// parallel, and the in-time text where they run in time (a single level is
+/// `iov_column` by construction, so it reads the clock as the column does, #2829,
+/// #2858).
 ///
 /// Mutation that must redden this: the level's name in place of its column.
 #[test]
@@ -1129,14 +1588,14 @@ fn algebraic_single_level_correlates_by_its_column() {
     }
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::SingleLevel, Rows::InTime);
     assert!(in_time);
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert!(msg == ALGEBRAIC_UNGROUPED && !msg.contains("ARM"), "{msg}");
+    assert_eq!(advice, in_time_advice());
+    assert!(msg == ALGEBRAIC_IN_TIME && !msg.contains("ARM"), "{msg}");
 }
 
 /// Compartment-free with nested `STUDY > ARM`: the **innermost** level's **name**,
 /// which reads its groups nested by key, where the cells are parallel. Cells that
 /// run in time are one series like any other occasions (no exemption for a declared
-/// level, #2829), and get the ungrouped text.
+/// level, #2829), and get the in-time text (#2858).
 ///
 /// Mutations that must redden this: the column in place of the name (the opposite
 /// direction of the single-level row); the outermost level in place of the
@@ -1158,17 +1617,17 @@ fn algebraic_nested_levels_correlate_by_the_innermost_level_name() {
     }
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::Nested, Rows::InTime);
     assert!(in_time);
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert!(msg == ALGEBRAIC_UNGROUPED && !msg.contains("ARM"), "{msg}");
+    assert_eq!(advice, in_time_advice());
+    assert!(msg == ALGEBRAIC_IN_TIME && !msg.contains("ARM"), "{msg}");
 }
 
 /// Compartment-free with `iov_occasion = time(...)` or `dose` and a kappa, on one
 /// running clock: the occasions come from the timeline through
 /// `fitted_population`, they run in time (asserted), and the statistic is taken over
-/// the whole subject. The ungrouped text, although the fixture also sets
-/// `iov_column`.
+/// the whole subject. The in-time text (#2858), which names no occasion column,
+/// although the fixture also sets `iov_column`.
 #[test]
-fn algebraic_derived_occasions_get_the_ungrouped_text() {
+fn algebraic_derived_occasions_get_the_in_time_text() {
     for g in [Grouping::IovTime, Grouping::IovDose] {
         let parsed = grouped_model(Class::Algebraic, g);
         assert_eq!(
@@ -1188,8 +1647,8 @@ fn algebraic_derived_occasions_get_the_ungrouped_text() {
         );
         let (advice, msg, in_time) = cell(Class::Algebraic, g, Rows::InTime);
         assert!(in_time, "{g:?}: derived occasions on a running clock");
-        assert_eq!(advice, DwAdvice::Algebraic { group: None }, "{g:?}");
-        assert_eq!(msg, ALGEBRAIC_UNGROUPED, "{g:?}");
+        assert_eq!(advice, in_time_advice(), "{g:?}");
+        assert_eq!(msg, ALGEBRAIC_IN_TIME, "{g:?}");
         assert!(!msg.contains("OCC"), "{g:?}: {msg}");
     }
 }
@@ -1223,7 +1682,7 @@ fn algebraic_derived_windows_on_a_restarting_clock_name_no_column() {
 /// A3. Compartment-free with `iov_column = OCC` and `iov_occasion = time(...)` but
 /// no kappa: the fit derives no occasions, so the column's labels stand (#2815
 /// review round 1, row 1). Parallel, the advice correlates by the column; in time,
-/// it names none (#2829).
+/// it correlates the subject (#2829, #2858).
 ///
 /// Mutations that must redden this: dropping the `n_kappa > 0` term of
 /// `occasions_are_derived` (the parallel half loses its column); dropping the
@@ -1258,8 +1717,8 @@ fn algebraic_derived_rule_without_a_kappa_keeps_the_column() {
     assert!(msg.contains("by OCC`") && !msg.contains("COL"), "{msg}");
     let (advice, msg, in_time) = cell(Class::Algebraic, Grouping::IovTimeNoKappa, Rows::InTime);
     assert!(in_time);
-    assert_eq!(advice, DwAdvice::Algebraic { group: None });
-    assert!(msg.contains("COL any") && !msg.contains("OCC"), "{msg}");
+    assert_eq!(advice, in_time_advice());
+    assert!(msg == ALGEBRAIC_IN_TIME && !msg.contains("OCC"), "{msg}");
 }
 
 /// The negative branch is the same for every model: no model-class remedy.
@@ -1272,6 +1731,12 @@ fn negative_text_is_the_same_for_every_advice() {
         DwAdvice::Algebraic { group: None },
         DwAdvice::Algebraic {
             group: Some("ARM".into()),
+        },
+        DwAdvice::AlgebraicInTime {
+            by: SubjectLine::ById("ID".into()),
+        },
+        DwAdvice::AlgebraicInTime {
+            by: SubjectLine::ByNumericColumn,
         },
     ] {
         let msg = dw_autocorrelation_warning(2.80, &advice).expect("above 2.5");

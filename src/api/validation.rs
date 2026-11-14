@@ -8090,19 +8090,26 @@ fn residual_correlation_inert(model: &CompiledModel, population: &Population) ->
     )]
 }
 
+/// Whether any stage of the run searches, so a start clamped into its box is **held**
+/// there rather than scored once.
+///
+/// `maxiter > 0` always searches. At `maxiter = 0` a stage searches unless its estimator
+/// reads that as `MAXEVAL=0` (`EstimationMethod::evaluates_at_maxiter_zero`, the engine's
+/// own list). The list used to be spelled here, as saem / imp / impmap / bayes, and so
+/// missed `vi` and `gn_hybrid`: both search at `maxiter = 0`, and both were treated as
+/// evaluation-only by every start-side check (#2865 review).
+///
+/// Not `!FitOptions::evaluation_only_run()`: that also counts a standalone
+/// `imp_eval_only` / `agq_eval_only` run as evaluation-only at any `maxiter`, and the
+/// start-side checks have never exempted those.
 fn outer_search_runs(options: &FitOptions) -> bool {
     if options.outer_maxiter > 0 {
         return true;
     }
-    options.method_chain().iter().any(|m| {
-        matches!(
-            m,
-            EstimationMethod::Saem
-                | EstimationMethod::Imp
-                | EstimationMethod::Impmap
-                | EstimationMethod::Bayes
-        )
-    })
+    options
+        .method_chain()
+        .iter()
+        .any(|m| !m.evaluates_at_maxiter_zero())
 }
 
 /// Which declaration a flagged variance coordinate came from — the keyword the
@@ -8739,6 +8746,17 @@ const START_OUT_OF_BOX_TOKEN: &str = "W_INIT_OUTSIDE_BOUNDS";
 /// message below names the other one when it explains that silence.
 const NOT_REPRESENTABLE_TOKEN: &str = "W_INIT_NOT_REPRESENTABLE";
 
+/// The `W_` token of the evaluation-only half of `E_THETA_INIT_OUTSIDE_BOUNDS`
+/// (#2865): a `theta` start outside its own declared range on a run that does
+/// not search (`maxiter = 0`), which is clamped and scored at the bound.
+///
+/// Its own token, not [`START_OUT_OF_BOX_TOKEN`]: that one names an internal
+/// rail the user never wrote, this one a bound they declared, and the remedies
+/// differ. Both classify as `WarningCode::InitOutsideBounds` — a start the box
+/// moved — through separate arms of [`crate::types::classify_warning`], because
+/// neither token is a substring of the other.
+const THETA_START_EVAL_ONLY_TOKEN: &str = "W_THETA_INIT_OUTSIDE_BOUNDS";
+
 /// Report an initial estimate that packs **strictly outside** its own box, and
 /// is therefore silently moved by `clamp_to_bounds` before the first objective
 /// evaluation (#1251).
@@ -8753,7 +8771,7 @@ const NOT_REPRESENTABLE_TOKEN: &str = "W_INIT_NOT_REPRESENTABLE";
 /// |---|---|---|
 /// | any coordinate whose box is **empty** (`lower > upper`) | either | **error**, and not exempt at `maxiter = 0` |
 /// | any coordinate the **packer itself** altered (#1307) | ferx's | warning, and not exempt at `maxiter = 0` |
-/// | θ strictly outside its **declared** lower / upper | the user's | **error** |
+/// | θ strictly outside its **declared** lower / upper | the user's | **error** when a search runs; warning `W_THETA_INIT_OUTSIDE_BOUNDS` on an evaluation-only run (#2865) |
 /// | θ above the hidden `1e9` cap | ferx's | warning |
 /// | Ω / Ω_IOV / mixture-Ω **diagonal**, below `−6` | ferx's | *not reported here* — [`check_variance_init_rails`] owns it, as an error (#1229) |
 /// | Ω / Ω_IOV / mixture-Ω **diagonal**, above `+6` | ferx's | warning |
@@ -8940,10 +8958,14 @@ pub(crate) fn check_packed_start_in_box(
     // floors the value and the bound identically; and a free ρ, which lands
     // exactly *on* its rail rather than outside it. Those three are the #1309
     // doc's own list of what the box predicate is structurally blind to.
+    //
+    // The declared-range walk is claimed on **every** run since #2865: it emits
+    // at `maxiter = 0` too, as `W_THETA_INIT_OUTSIDE_BOUNDS`, and that message
+    // names the value the run scores. Only the rail walk is still silent there.
     let mut claimed: std::collections::BTreeSet<usize> = inverted.iter().copied().collect();
+    claimed.extend(theta_outside_declared_range(init_params).map(|h| h.index));
     if outer_search_runs(options) {
         claimed.extend(coordinates_outside_bounds(&start, &kinds).map(|h| h.index));
-        claimed.extend(theta_outside_declared_range(init_params).map(|h| h.index));
     }
 
     // What the fit will **actually** use, which is not `mv.represented` whenever
@@ -9094,16 +9116,20 @@ pub(crate) fn check_packed_start_in_box(
         );
     }
 
-    // Same exemption as the rail check: an eval-only run clamps too, it just
-    // does not hold. `tests/check_command.rs` pins that `fit()` succeeds at
-    // `outer_maxiter = 0` on a start that would otherwise be refused. The
-    // empty-box errors already collected are **not** exempt and ride out with
-    // it — an eval-only run clamps into the empty box too, and aborts.
-    if !outer_search_runs(options) {
-        return diags;
-    }
+    // An eval-only run clamps too, it just does not hold the clamped value
+    // through a search. So it is never *refused* for a start outside its box
+    // (`tests/check_command.rs` pins that `fit()` succeeds at
+    // `outer_maxiter = 0`), and `--dofv`, `ferx gam --no-fit` and the bootstrap
+    // Δofv sweep can hand in machine-produced parameters. What it does get is
+    // the declared-range finding below as a **warning** (#2865): the one OFV it
+    // reports is the OFV of the bound, not of the declared start.
+    let eval_only = !outer_search_runs(options);
 
     // ── θ against its own DECLARED range ────────────────────────────────────
+    //
+    // An error when a search runs, `W_THETA_INIT_OUTSIDE_BOUNDS` when none does.
+    // One walk and one predicate for both, so the two verdicts cannot disagree
+    // about which θ is outside its range.
     //
     // Judged on the natural scale, not the packed one, and that is the whole
     // reason this is a separate walk: `pack_params` floors the value at
@@ -9148,6 +9174,77 @@ pub(crate) fn check_packed_start_in_box(
         // this same interval, so there is nothing to drift from (#1309 review).
         let (lo_advice, hi_advice) = theta_representable_range(init_params, hit.index);
         let effective = init_params.theta[hit.index].clamp(lo_advice, hi_advice);
+        let suggestion = format!(
+            "move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e}), or widen \
+             the declared range"
+        );
+        if eval_only {
+            // The value scored is not always the declared bound: a declared
+            // lower at or below `LOG_PACK_FLOOR`, or a declared upper above
+            // `THETA_PACK_CEIL`, is replaced by that cap in the box. Say so, or
+            // the message quotes a bound and a scored value that do not match
+            // with no reason given.
+            let stand_in = if effective != hit.bound {
+                format!(
+                    " {effective:e} is the nearest value to that bound that ferx can represent."
+                )
+            } else {
+                String::new()
+            };
+            // "Widen the range" only scores the declared start if ferx can hold
+            // that number once the range admits it. A negative start can always be
+            // held: admitting it makes the lower bound negative, which selects
+            // identity packing. A start of 0, or one outside
+            // `[LOG_PACK_FLOOR, THETA_PACK_CEIL]`, cannot be held under log packing:
+            // `theta TVCL(1e13, 0.001, 1e14)` is in range, unreported at
+            // `maxiter = 0`, and scored at `1e9` (#2865 review). So the advice is
+            // gated, and the other branch says why there is nothing to widen to.
+            let lower = init_params.theta_lower[hit.index];
+            let widening_scores_it = !crate::estimation::parameterization::theta_packs_log(lower)
+                || hit.value < 0.0
+                || (LOG_PACK_FLOOR..=THETA_PACK_CEIL).contains(&hit.value);
+            let score_declared = if widening_scores_it {
+                format!(
+                    "To score {:e}, widen the declared range to include it;",
+                    hit.value
+                )
+            } else {
+                format!(
+                    "{:e} cannot be scored while the lower bound is 0 or more: such a theta is \
+                     held on the log scale, between {LOG_PACK_FLOOR:e} and {THETA_PACK_CEIL:e};",
+                    hit.value
+                )
+            };
+            // The help line follows the same gate: it must not offer the widening
+            // the message has just ruled out.
+            let suggestion = if widening_scores_it {
+                suggestion
+            } else {
+                format!("move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e})")
+            };
+            diags.push(
+                Diagnostic::warning(
+                    THETA_START_EVAL_ONLY_TOKEN,
+                    format!(
+                        "{THETA_START_EVAL_ONLY_TOKEN}: `theta {name}` starts at {value:e}, \
+                         {side} its own declared {bound_word} bound of {bound:e}. This run \
+                         evaluates the objective once and does not search (`maxiter = 0`), and \
+                         the start is clamped into its box first, so the OFV and every \
+                         prediction and estimate reported are those of {name} = {effective:e}, \
+                         not of the declared {value:e}.{stand_in} {score_declared} to score \
+                         {effective:e}, declare that as the start. A run that searches refuses \
+                         this declaration with E_THETA_INIT_OUTSIDE_BOUNDS.",
+                        value = hit.value,
+                        bound = hit.bound,
+                        side = hit.side.direction(),
+                        bound_word = hit.side.bound_name(),
+                    ),
+                )
+                .with_block("parameters")
+                .with_suggestion(suggestion),
+            );
+            continue;
+        }
         diags.push(
             Diagnostic::error(
                 "E_THETA_INIT_OUTSIDE_BOUNDS",
@@ -9166,11 +9263,15 @@ pub(crate) fn check_packed_start_in_box(
                 ),
             )
             .with_block("parameters")
-            .with_suggestion(format!(
-                "move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e}), or widen \
-                 the declared range"
-            )),
+            .with_suggestion(suggestion),
         );
+    }
+
+    // The rail walk below keeps the eval-only exemption whole: an internal-rail
+    // start is not reported at `maxiter = 0`. The empty-box errors and the
+    // declared-range warnings already collected ride out with it.
+    if eval_only {
+        return diags;
     }
 
     // No `inverted` consult here: `coordinates_outside_bounds` already declines
