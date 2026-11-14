@@ -66,6 +66,8 @@ mod run;
 mod scoring_horizon;
 mod simulate;
 #[cfg(feature = "survival")]
+mod vpc_rtte;
+#[cfg(feature = "survival")]
 mod vpc_tte;
 
 pub use adaptive::{
@@ -146,6 +148,8 @@ pub use run::{
 };
 pub(crate) use simulate::check_theta_length;
 #[cfg(feature = "survival")]
+pub use vpc_rtte::{vpc_rtte, RtteMcfBand, RtteOrderBand, RtteVpc, RtteVpcStratum, VpcRtteOptions};
+#[cfg(feature = "survival")]
 pub use vpc_tte::{
     vpc_tte, TteVpc, TteVpcStratum, VpcCensoring, VpcGrid, VpcStratify, VpcTteOptions,
     VPC_TTE_MAX_STRATA,
@@ -186,7 +190,8 @@ pub(crate) use fit::fitted_population;
 #[cfg(test)]
 pub(crate) use fit::{
     dw_autocorrelation_warning, multistart_prefers, perturb_init, saem_active_covariate_group_etas,
-    saem_active_mixture_switched_etas, saem_non_mu_referenced_individual_params_warning, DwAdvice,
+    saem_active_mixture_switched_etas, saem_non_mu_referenced_individual_params_warning,
+    select_start, DwAdvice,
 };
 #[cfg(test)]
 pub(crate) use pool::{

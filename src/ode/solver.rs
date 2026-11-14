@@ -91,19 +91,25 @@ pub(crate) const MAX_CONSECUTIVE_MIN_STEP_CLAMPS: usize = 64;
 ///   re-probed at all and pays nothing.
 /// * **Latency.** A segment that has turned stiff takes hundreds to thousands of steps before
 ///   it exhausts `max_steps`, so 25 steps of delay is noise against the detection it buys.
+///
+/// **The switch is one-way** (#2845): a segment may escalate from the explicit
+/// stepper to a stiff one part-way through, but is never demoted back. Once a segment is on a
+/// stiff stepper it stops being re-probed, so it changes stepper at most once.
+///
+/// Demotion on a single probe reading was what made `auto` carry `rk45`'s error and jitter on
+/// a TMDD model where the stiff steppers are right: the probe read the relaxing tail as
+/// non-stiff, swapped to `rk45`, and integrated the rest of the segment at explicit accuracy —
+/// at a step chosen by a probe counter that runs across segments, so *where* it landed moved
+/// with θ and the objective jittered by a third to a half of the outer optimizer's plateau
+/// window. On that fixture (`ode_reltol = 1e-6`, macOS arm64, as reported on #2845) blocking
+/// only the demotion took the OFV error against a `vern7` reference from -4.7e-3 to -1e-4, the
+/// same as a pinned `rodas4`.
+/// A stiff stepper integrates a non-stiff tail correctly, only at a higher per-step cost, and
+/// the *next* segment is probed afresh at its entry state, so the cost is bounded by one
+/// segment. The one-way rule also replaces the per-segment switch cap #1080 Part C carried
+/// against a trajectory hovering at the threshold: with no way down there is nothing to
+/// oscillate between.
 pub(crate) const AUTO_SWITCH_PROBE_INTERVAL: usize = 25;
-
-/// Stepper changes allowed inside one segment before the driver stops re-probing (#1080
-/// Part C).
-///
-/// A cap rather than a hysteresis band, because the probe is a threshold test on a continuous
-/// quantity: a trajectory that hovers at `|Re λ|max ≈` [`STIFF_RE_LAMBDA_THRESHOLD`] would
-/// otherwise be able to rebuild its stepper on every probe. Bounding the count keeps the worst
-/// case a fixed handful of rebuilds, and a segment that has already changed its mind this many
-/// times has no verdict worth acting on.
-///
-/// [`STIFF_RE_LAMBDA_THRESHOLD`]: crate::ode::stiffness::STIFF_RE_LAMBDA_THRESHOLD
-pub(crate) const MAX_AUTO_SWITCHES_PER_SEGMENT: usize = 8;
 
 /// Dormand-Prince 5(4)'s real-axis stability boundary, used by Hairer's free
 /// stage-based stiffness estimate. The estimate is dimensionless (`h * rho`),
@@ -643,8 +649,8 @@ pub struct OdeSolverStats {
     /// Integrations whose stepper was changed **in place** part-way through, because a
     /// mid-segment re-probe disagreed with the verdict the segment started on (#1080 Part C).
     ///
-    /// One per segment, not per switch — a segment that escalated and later came back down
-    /// counts once. A non-zero value says the segment's stiffness changed while it was being
+    /// The switch is one-way — explicit to stiff, never back (#2845) — so a segment switches at
+    /// most once and this counts escalations reached mid-segment. A non-zero value says the segment's stiffness changed while it was being
     /// integrated, which is the ordinary shape of a binding model after a dose (the fast mode
     /// `KON · C · R` does not exist until drug and target are both present) rather than a
     /// problem in itself. It matters for reading the other counters: the steps before a switch
@@ -1492,11 +1498,6 @@ fn integrate_dense_g<T: PkNum>(
     // guard runs pins its method for exactly this reason, so it cannot switch back.
     let switching = opts.method == OdeMethod::Auto && opts.auto_switch;
     let mut accepted_since_probe = auto_state.accepted_since_probe;
-    let mut switches = 0usize;
-    // A segment that starts on a stiff method was counted as an escalation by the caller (the
-    // guard needs that count before the segment runs), so a later switch must not count it
-    // twice — nor may a segment that switches down and back up.
-    let mut escalation_counted = method != OdeMethod::EXPLICIT_FALLBACK;
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
@@ -1598,18 +1599,21 @@ fn integrate_dense_g<T: PkNum>(
             // Reads `PkNum::val` only, like every other comparison a driver makes, so the
             // `T = f64` prediction and the `T = Dual2` sensitivity solve switch at the same
             // step and the analytic gradient keeps differentiating the reported trajectory.
-            if switching {
+            //
+            // One-way (#2845, see `AUTO_SWITCH_PROBE_INTERVAL`): only a segment
+            // still on the explicit stepper is re-probed or counted toward the next probe, so a
+            // stiff segment is never demoted back to `rk45` on a single probe reading.
+            let on_explicit = switching && method == OdeMethod::EXPLICIT_FALLBACK;
+            if on_explicit {
                 accepted_since_probe += 1;
             }
-            let stage_escalation = switching
-                && switches < MAX_AUTO_SWITCHES_PER_SEGMENT
-                && method == OdeMethod::EXPLICIT_FALLBACK
+            let stage_escalation = on_explicit
                 && stiffness_indicator.is_some_and(|indicator| auto_state.observe_rk45(indicator));
             // A verdict ratified by the step that reaches `tf` belongs to the next interval:
             // there is no remaining span for a replacement stepper to integrate here. Leave
             // it in `auto_state` so `integrate_resolved_g_inner` can consume it at the next
             // non-zero segment instead of reporting a switch that never took a step.
-            if switching && t < tf - 1e-15 && switches < MAX_AUTO_SWITCHES_PER_SEGMENT {
+            if on_explicit && t < tf - 1e-15 {
                 let periodic_probe = accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL;
                 let verdict = if stage_escalation {
                     Some(super::stiffness::stiff_method_for(opts))
@@ -1621,35 +1625,28 @@ fn integrate_dense_g<T: PkNum>(
                 if periodic_probe {
                     accepted_since_probe = 0;
                 }
+                // Only an escalation can pass this filter: the segment is on the explicit
+                // stepper here, and both verdicts are either it or a stiff method.
                 if let Some(verdict) = verdict.filter(|&verdict| verdict != method) {
                     method = verdict;
                     stepper = make_stepper::<T>(n, method);
                     stepper.set_dense_required(!interp_at.is_empty());
                     err_exp = stepper.err_exp();
-                    // Both counters are per *segment*, however many times it changes its mind.
                     // An escalation is an escalation whether the probe reached that verdict at
                     // the entry state or twenty-five steps in, so a switch onto a stiff method
                     // joins `auto_stiff_segments` too — which is what keeps the guard's "N of M
                     // escalations were discarded" count adding up. A segment that started stiff
-                    // was already counted by the caller.
-                    let newly_escalated =
-                        !escalation_counted && method != OdeMethod::EXPLICIT_FALLBACK;
+                    // was counted by the caller, and never reaches this switch.
                     if let Some(s) = stats.as_deref_mut() {
-                        if switches == 0 {
-                            s.auto_switched_segments += 1;
-                        }
-                        if newly_escalated {
-                            s.auto_stiff_segments += 1;
-                        }
+                        s.auto_switched_segments += 1;
+                        s.auto_stiff_segments += 1;
                     }
-                    escalation_counted |= newly_escalated;
-                    switches += 1;
                     auto_state.reset_rk45_verdict();
                     // The new stepper gets the whole abort budget. `stiff_abort_after` bounds
                     // how long *a method* is allowed to grind on a segment it cannot step, and
                     // the method just changed; the clamps behind this point measured the one
-                    // that was replaced. Bounded by `MAX_AUTO_SWITCHES_PER_SEGMENT`, so the
-                    // worst case is that many budgets rather than an unbounded reprieve.
+                    // that was replaced. The switch is one-way, so this is at most one extra
+                    // budget per segment.
                     min_step_clamps = 0;
                 }
             }
@@ -2090,7 +2087,6 @@ fn until_threshold_with(
     // and is integrated badly does not merely cost accuracy in a prediction.
     let switching = opts.method == OdeMethod::Auto && opts.auto_switch;
     let mut accepted_since_probe = 0usize;
-    let mut switches = 0usize;
     let mut ran_stiff = method != OdeMethod::EXPLICIT_FALLBACK;
 
     for _step in 0..opts.max_steps {
@@ -2179,10 +2175,11 @@ fn until_threshold_with(
             // driver's loop: read the same discriminator at the state just reached and swap the
             // stepper in place when it disagrees. Taken after the crossing test, so a step that
             // both advances and brackets the crossing still returns through the interpolant of
-            // the stepper that produced it.
+            // the stepper that produced it. One-way, as there (#2845): a span already on a
+            // stiff stepper is not re-probed, so it is never demoted back to `rk45`.
             accepted_since_probe += 1;
             if switching
-                && switches < MAX_AUTO_SWITCHES_PER_SEGMENT
+                && method == OdeMethod::EXPLICIT_FALLBACK
                 && accepted_since_probe >= AUTO_SWITCH_PROBE_INTERVAL
             {
                 accepted_since_probe = 0;
@@ -2193,7 +2190,6 @@ fn until_threshold_with(
                     stepper.set_dense_required(true);
                     err_exp = stepper.err_exp();
                     ran_stiff |= method != OdeMethod::EXPLICIT_FALLBACK;
-                    switches += 1;
                     // Fresh abort budget for the new stepper — see `integrate_dense_g`.
                     clamps = 0;
                 }

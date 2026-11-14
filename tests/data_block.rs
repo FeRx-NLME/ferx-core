@@ -253,3 +253,71 @@ fn check_explicit_data_flag_overrides_model_declared_path_with_warning() {
         report.diagnostics
     );
 }
+
+/// #2914: a `[data]` block carrying only column maps (no `path`) parses, and a
+/// caller-supplied dataset is read through those maps. The model and the CSV
+/// sit in **different** directories, the situation the issue hit when copying a
+/// model away from its data — nothing model-relative is resolved or opened.
+#[test]
+fn data_block_without_path_uses_caller_data_through_its_column_map() {
+    let model_dir = tempfile::tempdir().expect("tempdir");
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let csv = write_renamed_headers_csv(data_dir.path());
+
+    let data_block = "[data]\n  TIME = TAFD\n  DV = CONC\n";
+    let model_src = MODEL_TEMPLATE.replace("{data}", data_block);
+    let model_path = model_dir.path().join("m.ferx");
+    std::fs::write(&model_path, model_src).expect("write model file");
+
+    // The parse route `ferx_simulate(data = ...)` takes: no path, maps kept.
+    let parsed = ferx_core::parse_full_model_file(&model_path)
+        .expect("a [data] block without `path` must parse");
+    assert_eq!(parsed.data_path, None);
+    assert_eq!(
+        parsed.column_map,
+        vec![
+            ("TIME".to_string(), "TAFD".to_string()),
+            ("DV".to_string(), "CONC".to_string()),
+        ]
+    );
+
+    let (result, population) = run_model_with_data_inits(
+        model_path.to_str().unwrap(),
+        Some(csv.to_str().unwrap()),
+        None,
+    )
+    .expect("fit should read the caller's data through the [data] column map");
+    let n_obs: usize = population
+        .subjects
+        .iter()
+        .map(|s| s.observations.len())
+        .sum();
+    assert!(n_obs > 0, "mapped dataset should yield observations");
+    assert!(result.ofv.is_finite());
+    // Only one path was given, so there is nothing to override.
+    assert!(
+        result.warnings.iter().all(|w| !w.contains("overridden")),
+        "{:?}",
+        result.warnings
+    );
+    assert_eq!(result.data_path.as_deref(), Some(csv.to_str().unwrap()));
+}
+
+/// #2914: with no `path` in `[data]` and none passed by the caller there is
+/// still nothing to fit against — the refusal names the `[data]` block's
+/// missing `path`, not a missing block.
+#[test]
+fn data_block_without_path_and_no_caller_data_errors_clearly() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let model_src = MODEL_TEMPLATE.replace("{data}", "[data]\n  TIME = TAFD\n");
+    let model_path = dir.path().join("m.ferx");
+    std::fs::write(&model_path, model_src).expect("write model file");
+
+    let err = run_model_with_data_inits(model_path.to_str().unwrap(), None, None)
+        .expect_err("no path anywhere must error")
+        .to_string();
+    assert!(
+        err.contains("no dataset specified") && err.contains("`path = ...`"),
+        "unexpected error: {err}"
+    );
+}

@@ -15707,6 +15707,7 @@ fn a_verified_start_takes_every_point_field_from_the_lower_run() {
                 pmix: vec![vec![tag]],
                 mixest: vec![],
                 n_fd_h_redone: 0,
+                class_nll: vec![],
             }),
             converged: tag == 2.0,
             warnings: vec![format!("{tag}")],

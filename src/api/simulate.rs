@@ -134,14 +134,88 @@ pub struct SimulateOptions {
 }
 
 /// What a `simulate*` entry point lets its caller supply as the TTE administrative
-/// horizon, for [`validate_tte_simulatable`]'s refusal when one is required.
-#[cfg(feature = "survival")]
+/// horizon. It carries the value and is the one owner of the option's name, which both
+/// horizon refusals quote: `validate_tte_simulatable`'s (a required horizon is missing) and
+/// `check_horizon_value`'s (the supplied value is unusable).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TteHorizon {
-    /// The entry point takes a horizon; this is the one supplied (`None`: not set).
+    /// `[simulation] horizon` or `SimulateOptions.horizon`, as supplied (`None`: not set).
     Given(Option<f64>),
-    /// The entry point takes none (`simulate_with_uncertainty`).
-    NotAccepted,
+    /// `SimulateUncertaintyOptions.horizon`, as supplied (`None`: not set). The same
+    /// requirement as [`TteHorizon::Given`]; a separate variant only so the refusal names
+    /// the option this caller can set (#1774, #2003).
+    Uncertainty(Option<f64>),
+}
+
+impl TteHorizon {
+    /// The supplied horizon (`None`: not set).
+    fn value(self) -> Option<f64> {
+        match self {
+            TteHorizon::Given(h) | TteHorizon::Uncertainty(h) => h,
+        }
+    }
+
+    /// The API option this caller sets, as the value refusals name it.
+    fn option_name(self) -> &'static str {
+        match self {
+            TteHorizon::Given(_) => "SimulateOptions.horizon",
+            TteHorizon::Uncertainty(_) => "SimulateUncertaintyOptions.horizon",
+        }
+    }
+
+    /// Every way this caller can set the horizon, for the "set ..." half of the refusal
+    /// when a required one is missing. The options path is also reached from a
+    /// `[simulation]` block, so it names that key first.
+    #[cfg(feature = "survival")]
+    fn how_to_set(self) -> String {
+        let option = self.option_name();
+        match self {
+            TteHorizon::Given(_) => format!("`[simulation] horizon` (or `{option}`)"),
+            TteHorizon::Uncertainty(_) => format!("`{option}`"),
+        }
+    }
+}
+
+/// The value checks every horizon-taking `simulate*` entry point applies to a supplied
+/// horizon: finite and `> 0`, and not below any subject's TTE entry time. The refusal names
+/// the option the caller set (`TteHorizon::option_name`). `None` passes.
+///
+/// The `.ferx` parser already rejects a non-finite / non-positive horizon, but a direct
+/// caller of the API must get the same guard: a NaN window makes every `t_event < window`
+/// test false (silent NaN event times), and a `<= 0` horizon censors every subject at or
+/// before entry (#522 review).
+#[cfg_attr(not(feature = "survival"), allow(unused_variables))]
+fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(), EngineError> {
+    let option_name = horizon.option_name();
+    let Some(h) = horizon.value() else {
+        return Ok(());
+    };
+    if !h.is_finite() || h <= 0.0 {
+        return Err(super::entry_refusals::simulate_horizon(format!(
+            "{option_name} must be finite and > 0 (got {h})"
+        )));
+    }
+    // A horizon below a subject's TTE entry_time would censor it before it entered
+    // observation (a row with time = h < entry_time). The `[simulation]`-block path always
+    // enters at 0, but a left-truncated population passed to the API must be rejected
+    // (#522 review).
+    #[cfg(feature = "survival")]
+    for subject in &population.subjects {
+        for record in &subject.obs_records {
+            let crate::types::ObsRecord::Event { entry_time, .. } = record else {
+                continue;
+            };
+            if *entry_time > h {
+                return Err(super::entry_refusals::simulate_horizon(format!(
+                    "{option_name} ({h}) is below subject '{}' entry_time \
+                     ({entry_time}); the administrative horizon must be ≥ every \
+                     subject's entry time",
+                    subject.id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validate the preventable preconditions of TTE event-time simulation, returning a
@@ -181,10 +255,11 @@ pub(crate) enum TteHorizon {
 /// during integration, per subject: that subject is censored at the window and named in
 /// a `W_TTE_SOLVE_FAILED` warning (#2087), never silently.
 ///
-/// `horizon` says what the caller could have supplied. Where a horizon is required and
-/// missing, a caller that takes one is told to set it (`E_SIMULATE_HORIZON`); a caller
-/// that takes none (`simulate_with_uncertainty`) cannot act on that, so it is told the
-/// model cannot be simulated there and where it can (`E_TTE_NOT_SIMULATABLE`, #1774).
+/// `horizon` carries the supplied horizon and says which option the caller reads it from.
+/// Where a horizon is required and missing, the refusal (`E_SIMULATE_HORIZON`) names that
+/// option, never one the caller cannot set (#1774): `[simulation] horizon` /
+/// `SimulateOptions.horizon` for the options path, `SimulateUncertaintyOptions.horizon`
+/// for `simulate_with_uncertainty` (#2003).
 #[cfg(feature = "survival")]
 pub(crate) fn validate_tte_simulatable(
     model: &CompiledModel,
@@ -194,21 +269,13 @@ pub(crate) fn validate_tte_simulatable(
     use super::entry_refusals::{simulate_horizon, tte_not_simulatable};
     // The refusal for a required horizon that is missing or not finite and positive.
     // `what` names the endpoint kind, `why` the reason it needs one.
-    let missing_horizon = |what: &str, why: &str| match horizon {
-        TteHorizon::Given(_) => simulate_horizon(format!(
+    let set_it = horizon.how_to_set();
+    let horizon = horizon.value();
+    let missing_horizon = |what: &str, why: &str| {
+        simulate_horizon(format!(
             "{what} simulation requires a finite, positive administrative horizon: set \
-             `[simulation] horizon` (or `SimulateOptions.horizon`). {why}"
-        )),
-        TteHorizon::NotAccepted => tte_not_simulatable(format!(
-            "{what} simulation requires a finite, positive administrative horizon, and \
-             `simulate_with_uncertainty` takes none (`SimulateUncertaintyOptions` has no \
-             horizon). {why} Simulate this model with `simulate_with_options` and \
-             `SimulateOptions.horizon` instead."
-        )),
-    };
-    let horizon = match horizon {
-        TteHorizon::Given(h) => h,
-        TteHorizon::NotAccepted => None,
+             {set_it}. {why}"
+        ))
     };
     use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
 
@@ -776,38 +843,8 @@ pub(super) fn simulate_with_options_impl(
     // list.
     first_error(&check_simulation_data(model, population))?;
 
-    // Validate the TTE horizon on the library path too — the `.ferx` parser
-    // already rejects a non-finite / non-positive horizon, but a direct caller of
-    // this API must get the same guard: a NaN window makes every `t_event < window`
-    // test false (silent NaN event times), and a `<= 0` horizon censors every
-    // subject at or before entry (#522 review).
-    if let Some(h) = opts.horizon {
-        if !h.is_finite() || h <= 0.0 {
-            return Err(super::entry_refusals::simulate_horizon(format!(
-                "SimulateOptions.horizon must be finite and > 0 (got {h})"
-            )));
-        }
-        // A horizon below a subject's TTE entry_time would censor it before it
-        // entered observation (a row with time = h < entry_time). The
-        // `[simulation]`-block path always enters at 0, but a left-truncated
-        // population passed to this API must be rejected (#522 review).
-        #[cfg(feature = "survival")]
-        for subject in &population.subjects {
-            for record in &subject.obs_records {
-                let crate::types::ObsRecord::Event { entry_time, .. } = record else {
-                    continue;
-                };
-                if *entry_time > h {
-                    return Err(super::entry_refusals::simulate_horizon(format!(
-                        "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
-                         ({entry_time}); the administrative horizon must be ≥ every \
-                         subject's entry time",
-                        subject.id
-                    )));
-                }
-            }
-        }
-    }
+    // Validate the TTE horizon on the library path too (#522 review).
+    check_horizon_value(population, TteHorizon::Given(opts.horizon))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
@@ -2102,6 +2139,13 @@ pub struct SimulateUncertaintyOptions {
     pub method: crate::estimation::uncertainty_samples::UncertaintyMethod,
     /// Optional seed for reproducibility. `None` draws from entropy.
     pub seed: Option<u64>,
+    /// Administrative horizon for TTE endpoints, the same one for every draw: the
+    /// uncertainty twin of [`SimulateOptions::horizon`], validated by the same code. When
+    /// `Some(h)`, every TTE subject is administratively censored at `h` regardless of its
+    /// record's `time`. Required (finite and `> 0`) for a repeated-event (`type = rtte`) or
+    /// ODE-accumulated (joint PK-TTE) hazard, which have no implicit window; `None` keeps
+    /// the per-record window otherwise. No effect on Gaussian endpoints (#2003).
+    pub horizon: Option<f64>,
 }
 
 /// Simulate observations while propagating parameter uncertainty.
@@ -2118,6 +2162,11 @@ pub struct SimulateUncertaintyOptions {
 /// For an IOV model, a fit under a derived `iov_occasion = dose | time(...)` rule
 /// ([`FitResult::iov_occasion`]) has the population's occasion labels re-derived with that
 /// rule first, as `fit()` derived them, so κ is drawn per occasion (#1955).
+///
+/// For a TTE endpoint, `opts.horizon` is the administrative censoring horizon of every
+/// draw. A repeated-event or ODE-accumulated hazard requires one (`E_SIMULATE_HORIZON`
+/// otherwise), as on [`simulate_with_options`]. Each draw is simulated the way that
+/// function simulates the draw's parameters under the same horizon (#2003).
 ///
 /// Thin wrapper over [`simulate_with_uncertainty_diag`] that discards its
 /// [`SimulationOutput::warnings`]; the rows are the same, bit for bit.
@@ -2203,11 +2252,11 @@ fn simulate_with_uncertainty_impl(
     // Ω / σ / Ω_IOV (#1764, #1833) are refused by `fitted_params_from_result` below,
     // before any draw: a second gate here rejected exactly the same inputs.
 
-    // A repeated-event or ODE-accumulated TTE simulation needs a finite horizon, which this
-    // uncertainty path does not expose — validate once here rather than per draw, and say
-    // so rather than ask for an option the caller cannot set (#1774).
+    // A repeated-event or ODE-accumulated TTE simulation needs a finite horizon. Validated
+    // once here rather than per draw (and so before any draw); a missing one is refused
+    // naming this entry point's own option (#1774, #2003).
     #[cfg(feature = "survival")]
-    validate_tte_simulatable(model, population, TteHorizon::NotAccepted)?;
+    validate_tte_simulatable(model, population, TteHorizon::Uncertainty(opts.horizon))?;
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector
@@ -2215,6 +2264,9 @@ fn simulate_with_uncertainty_impl(
     // κ or a weighted residual, a non-positive weight before it collapses to zero
     // (#1031 / #1029 / #1083).
     first_error(&check_simulation_data(model, population))?;
+
+    // The same value checks, at the same position, as `simulate_with_options` (#2003).
+    check_horizon_value(population, TteHorizon::Uncertainty(opts.horizon))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
@@ -2293,8 +2345,12 @@ fn simulate_with_uncertainty_impl(
 }
 
 /// The per-draw loop of [`simulate_with_uncertainty_diag`], appending each draw's rows to
-/// `results`. Split out so the caller can run it inside one solver-stats scope.
-fn simulate_uncertainty_draws(
+/// `results`. Split out so the caller can run it inside one solver-stats scope, and
+/// `pub(super)` so a test can hand it parameter sets directly: the samplers consume the
+/// run's RNG before the first simulated subject, so only here can a draw equal to the
+/// point estimate be compared with `simulate_with_options` at the same RNG position (#2003).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn simulate_uncertainty_draws(
     model: &CompiledModel,
     population: &Population,
     draws: &[ModelParameters],
@@ -2346,7 +2402,7 @@ fn simulate_uncertainty_draws(
             opts.n_sim_per_draw,
             k + 1,
             None,
-            None,
+            opts.horizon,
             Some(proof),
             class_root,
             rng,
