@@ -1,0 +1,2639 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.11.9">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>Adaptive feedback dosing – ferx-core</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../assets/ferx-favicon.svg" rel="icon" type="image/svg+xml">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/scrollable-regions/scrollable-regions.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-62b633921dd11b6f4f90199e75d354ed.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-8e54f3b44ae85a4e33659ff2791ab8dc.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-62b633921dd11b6f4f90199e75d354ed.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-8e518522b9352d6c8936124a205dda04.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-355162dc54480269449fb35d57930480.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-8e518522b9352d6c8936124a205dda04.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "navbar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "end",
+  "type": "overlay",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+<link rel="stylesheet" href="../styles.css">
+<meta property="og:title" content="Adaptive feedback dosing">
+<meta property="og:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta property="og:site_name" content="ferx-core">
+<meta property="og:locale" content="en_US">
+<meta name="twitter:title" content="Adaptive feedback dosing">
+<meta name="twitter:description" content="Open-source nonlinear mixed-effects modeling for population PK/PD and pharmacometrics">
+<meta name="twitter:card" content="summary">
+<link rel="canonical" href="https://ferx-nlme.org/ferx-core/model-file/adaptive-dosing.html">
+</head>
+
+<body class="nav-sidebar floating nav-fixed quarto-light"><a id="quarto-skip-link" class="visually-hidden-focusable" href="#quarto-document-content">Skip to main content</a><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          toggle.setAttribute("aria-checked", alternate ? "true" : "false");
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+    }
+    // Hack to workaround the fact that safari doesn't
+    // properly recolor the scrollbar when toggling (#1455).
+    // Not run on load: stylesheets are set before first paint there, and
+    // scrolling would undo the scroll to a URL fragment (#14973).
+    // The one pixel nudge keeps the reader where they were.
+    const refreshSafariScrollbar = () => {
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        const scrollY = window.scrollY;
+        window.scrollTo(0, scrollY > 0 ? scrollY - 1 : 1);
+        setTimeout(() => {
+          window.scrollTo(0, scrollY);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      refreshSafariScrollbar();
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+    <nav class="navbar navbar-expand-lg " data-bs-theme="dark" aria-label="Site">
+      <div class="navbar-container container-fluid">
+      <div class="navbar-brand-container mx-auto">
+    <a href="https://ferx-nlme.org/" class="navbar-brand navbar-brand-logo">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo light-content">
+    <img src="../assets/ferx-dsl-brackets.svg" alt="ferx" class="navbar-logo dark-content">
+    </a>
+    <a class="navbar-brand" href="https://ferx-nlme.org/">
+    <span class="navbar-title">ferx-core</span>
+    </a>
+  </div>
+          <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarCollapse" aria-controls="navbarCollapse" aria-expanded="false" aria-label="Toggle navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+  <span class="navbar-toggler-icon"></span>
+</button>
+          <div class="collapse navbar-collapse" id="navbarCollapse">
+            <ul class="navbar-nav navbar-nav-scroll me-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.org/get-started.html"> 
+<span class="menu-text">Get started</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.org/design.html"> 
+<span class="menu-text">Design</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.org/features.html"> 
+<span class="menu-text">Features</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.org/changelog.html"> 
+<span class="menu-text">Changelog</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.org/roadmap.html"> 
+<span class="menu-text">Roadmap</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.org/blog/"> 
+<span class="menu-text">Blog</span></a>
+  </li>  
+</ul>
+            <ul class="navbar-nav navbar-nav-scroll ms-auto">
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.org/ferx-core/"> 
+<span class="menu-text">ferx-core</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.org/ferx-book/"> 
+<span class="menu-text">ferx-r</span></a>
+  </li>  
+  <li class="nav-item">
+    <a class="nav-link" href="https://ferx-nlme.org/reference/"> 
+<span class="menu-text">Reference</span></a>
+  </li>  
+  <li class="nav-item compact">
+    <a class="nav-link" href="https://github.com/FeRx-NLME"> <i class="bi bi-github" role="img" aria-label="GitHub">
+</i> 
+<span class="menu-text"></span></a>
+  </li>  
+</ul>
+          </div> <!-- /navcollapse -->
+            <div class="quarto-navbar-tools">
+  <button type="button" role="switch" aria-checked="false" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode" aria-label="Toggle dark mode"><i class="bi"></i></button>
+</div>
+            <div id="quarto-search" class="" title="Search"></div>
+      </div> <!-- /container-fluid -->
+    </nav>
+  <nav class="quarto-secondary-nav" aria-label="Toolbar">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="Breadcrumbs"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../model-file/index.html">Model File Reference</a></li><li class="breadcrumb-item"><a href="../model-file/adaptive-dosing.html">Adaptive (Feedback) Dosing</a></li></ol></nav>
+        <a class="flex-grow-1" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article page-navbar">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto" aria-label="Section">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+      <a href="../index.html" class="sidebar-logo-link">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo light-content py-0 d-lg-inline d-none">
+      <img src="../assets/ferx-favicon.svg" alt="" class="sidebar-logo dark-content py-0 d-lg-inline d-none">
+      </a>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Introduction</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../maturity.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Feature Maturity</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../getting-started.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Getting Started</span></a>
+            <button type="button" class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" aria-expanded="false" aria-label="Toggle section: Getting Started">
+              <i class="bi bi-chevron-right ms-2" aria-hidden="true"></i>
+            </button> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../installation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Installation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../quick-start.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Quick Start</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../model-file/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model File Reference</span></a>
+            <button type="button" class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#" aria-expanded="true" aria-label="Toggle section: Model File Reference">
+              <i class="bi bi-chevron-right ms-2" aria-hidden="true"></i>
+            </button> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/individual-parameters.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Individual Parameters</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariates</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/structural-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Lagtime</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Doses (SS=1)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/error-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Error Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/residual-correlation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Within-group residual correlation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/mbma.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model-based meta-analysis: start here</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">LOQ-Censored Observations</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/ode-models.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Built-in Absorption Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Scaling</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/initial-conditions.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Initial Conditions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/diffusion.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE / Diffusion)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/neural-networks.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Neural Networks</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/covariate-nn.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><code>[covariate_nn]</code> — Deep Compartment Models (DCM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/derived.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns (<code>[derived]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Columns (<code>[output]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/fit-options.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fit Options</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/adaptive-dosing.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text">Adaptive (Feedback) Dosing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/event-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event Endpoints (<code>[event_model]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints — <code>[binary_model]</code></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../model-file/markov-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Markov models ([markov_model])</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../estimation/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Estimation Methods</span></a>
+            <button type="button" class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" aria-expanded="false" aria-label="Toggle section: Estimation Methods">
+              <i class="bi bi-chevron-right ms-2" aria-hidden="true"></i>
+            </button> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/foce.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FOCE / FOCEI</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/agq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">AGQ — Adaptive Gaussian Quadrature</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/gauss-newton.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Gauss-Newton (BHHH)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/sir.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Sampling Importance Resampling (SIR)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/importance-sampling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Importance Sampling (IMP)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Full Random Effects Model)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/impmap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IMPMAP — Importance Sampling assisted by Mode A Posteriori</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/bayes.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bayesian estimation (MCMC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/vi.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variational Inference</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/parameterization.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Packed Parameter Space</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/optimizers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Outer Optimizers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/tte.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Time-to-Event (TTE) Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/categorical.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Categorical endpoints (binary / logistic)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/ctmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Continuous-time Markov models (CTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/dtmm.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Discrete-time Markov models (DTMM)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/mixture.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Mixture Models</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../estimation/priors.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parameter Priors (penalized ML / MAP)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../tools/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Tools</span></a>
+            <button type="button" class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" aria-expanded="false" aria-label="Toggle section: Tools">
+              <i class="bi bi-chevron-right ms-2" aria-hidden="true"></i>
+            </button> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/bootstrap.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Bootstrap</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/gam-screening.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">GAM covariate screening</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Search configuration</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/covsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/modelsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Structural model search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/ruvsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Residual-error search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/iivsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Variability-structure search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/iovsearch.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-occasion variability search</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/amd.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Automatic model development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../tools/global-search.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Global model search</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../data-format.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Format</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../cli.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">CLI Reference</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Output Files</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../warnings.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Warnings</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../file-formats/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">File Formats</span></a>
+            <button type="button" class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" aria-expanded="false" aria-label="Toggle section: File Formats">
+              <i class="bi bi-chevron-right ms-2" aria-hidden="true"></i>
+            </button> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/fitrx.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">The <code>.fitrx</code> Fit Bundle</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../file-formats/check-report.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Check Report (<code>ferx check --json</code>)</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../examples/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Examples</span></a>
+            <button type="button" class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" aria-expanded="false" aria-label="Toggle section: Examples">
+              <i class="bi bi-chevron-right ms-2" aria-hidden="true"></i>
+            </button> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/one-cpt-oral.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">One-Compartment Oral (Warfarin)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/two-cpt-iv.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Two-Compartment IV Bolus</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/covariates.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Covariate Model</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-model.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model (Michaelis-Menten)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/bloq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">BLOQ (M3 method)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Inter-Occasion Variability (IOV)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/iov-saem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">IOV with SAEM</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multiple-dosing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multiple Dosing (ADDL Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/steady-state.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Steady-State Dosing (SS Column)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/scaling.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Unit Scaling (<code>[scaling]</code>)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/derived-output.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Derived Columns and Output</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/data-selection.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Data Selection (IGNORE / ACCEPT)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/ode-lagtime.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">ODE Model with Absorption Lag Time</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/transit-absorption.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Transit Absorption (Two-Compartment)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/sde.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Stochastic Differential Equations (SDE)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/frem.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FREM (Covariate Analysis)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../examples/multistart.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Multi-Start: Michaelis-Menten Elimination</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../api/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Rust API</span></a>
+            <button type="button" class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" aria-expanded="false" aria-label="Toggle section: Rust API">
+              <i class="bi bi-chevron-right ms-2" aria-hidden="true"></i>
+            </button> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/types.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Core Types</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/fitting.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Fitting Functions</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/simulation.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Simulation</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/parsing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Parsing</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../api/model-editing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Model editing</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../faq.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">FAQ</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a href="../development/index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development</span></a>
+            <button type="button" class="sidebar-item-toggle text-start collapsed" data-bs-toggle="collapse" data-bs-target="#" aria-expanded="false" aria-label="Toggle section: Development">
+              <i class="bi bi-chevron-right ms-2" aria-hidden="true"></i>
+            </button> 
+      </div>
+      <ul id="" class="collapse list-unstyled sidebar-section depth1 ">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/contributing.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Contributing to FeRx development</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/sdlc.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Development Lifecycle (SDLC)</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/docs-lint.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Docs linter</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../development/golden-fits.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Golden fit set</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" aria-labelledby="toc-title" class="toc-active">
+    <h2 id="toc-title">On this page</h2>
+   
+  <ul>
+  <li><a href="#adaptive-feedback-dosing" id="toc-adaptive-feedback-dosing" class="nav-link active" data-scroll-target="#adaptive-feedback-dosing">Adaptive (Feedback) Dosing</a>
+  <ul>
+  <li><a href="#the-declarative-adaptive_dosing-block" id="toc-the-declarative-adaptive_dosing-block" class="nav-link" data-scroll-target="#the-declarative-adaptive_dosing-block">The declarative <code>[adaptive_dosing]</code> block</a>
+  <ul class="collapse">
+  <li><a href="#keys" id="toc-keys" class="nav-link" data-scroll-target="#keys">Keys</a>
+  <ul class="collapse">
+  <li><a href="#writing-an-observe-expression" id="toc-writing-an-observe-expression" class="nav-link" data-scroll-target="#writing-an-observe-expression">Writing an <code>observe</code> expression</a></li>
+  </ul></li>
+  <li><a href="#dose-expressions" id="toc-dose-expressions" class="nav-link" data-scroll-target="#dose-expressions">Dose expressions</a></li>
+  <li><a href="#what-a-dose-expression-may-read" id="toc-what-a-dose-expression-may-read" class="nav-link" data-scroll-target="#what-a-dose-expression-may-read">What a dose expression may read</a></li>
+  <li><a href="#which-subjects-values-are-known" id="toc-which-subjects-values-are-known" class="nav-link" data-scroll-target="#which-subjects-values-are-known">Which subjects’ values are known</a></li>
+  <li><a href="#rounding-doses-to-a-grid" id="toc-rounding-doses-to-a-grid" class="nav-link" data-scroll-target="#rounding-doses-to-a-grid">Rounding doses to a grid</a></li>
+  <li><a href="#when-a-grid-is-refused" id="toc-when-a-grid-is-refused" class="nav-link" data-scroll-target="#when-a-grid-is-refused">When a grid is refused</a></li>
+  <li><a href="#rules-when-signal-op-value-action" id="toc-rules-when-signal-op-value-action" class="nav-link" data-scroll-target="#rules-when-signal-op-value-action">Rules — <code>when signal &lt;op&gt; &lt;value&gt; : &lt;action&gt;</code></a></li>
+  <li><a href="#running-it" id="toc-running-it" class="nav-link" data-scroll-target="#running-it">Running it</a></li>
+  <li><a href="#supplied-individual-values" id="toc-supplied-individual-values" class="nav-link" data-scroll-target="#supplied-individual-values">Supplied individual values</a></li>
+  </ul></li>
+  <li><a href="#the-controller" id="toc-the-controller" class="nav-link" data-scroll-target="#the-controller">The controller</a>
+  <ul class="collapse">
+  <li><a href="#what-a-decision-reads" id="toc-what-a-decision-reads" class="nav-link" data-scroll-target="#what-a-decision-reads">What a decision reads</a></li>
+  <li><a href="#window-kappa" id="toc-window-kappa" class="nav-link" data-scroll-target="#window-kappa">Which κ a decision window runs under</a></li>
+  <li><a href="#window-kappa-records" id="toc-window-kappa-records" class="nav-link" data-scroll-target="#window-kappa-records">Placing records under IOV</a></li>
+  <li><a href="#one-controller-per-subject" id="toc-one-controller-per-subject" class="nav-link" data-scroll-target="#one-controller-per-subject">One controller per subject</a></li>
+  </ul></li>
+  <li><a href="#changing-the-dosing-interval" id="toc-changing-the-dosing-interval" class="nav-link" data-scroll-target="#changing-the-dosing-interval">Changing the dosing interval</a>
+  <ul class="collapse">
+  <li><a href="#in-the-adaptive_dosing-block" id="toc-in-the-adaptive_dosing-block" class="nav-link" data-scroll-target="#in-the-adaptive_dosing-block">In the <code>[adaptive_dosing]</code> block</a></li>
+  <li><a href="#not-due-points" id="toc-not-due-points" class="nav-link" data-scroll-target="#not-due-points">Not-due points</a></li>
+  <li><a href="#grid-alignment" id="toc-grid-alignment" class="nav-link" data-scroll-target="#grid-alignment">Grid alignment</a></li>
+  </ul></li>
+  <li><a href="#monitors" id="toc-monitors" class="nav-link" data-scroll-target="#monitors">Monitors</a>
+  <ul class="collapse">
+  <li><a href="#monitors-and-trajectories-are-on-the-models-scale" id="toc-monitors-and-trajectories-are-on-the-models-scale" class="nav-link" data-scroll-target="#monitors-and-trajectories-are-on-the-models-scale">Monitors and trajectories are on the model’s scale</a></li>
+  </ul></li>
+  <li><a href="#example" id="toc-example" class="nav-link" data-scroll-target="#example">Example</a></li>
+  <li><a href="#verification-on-by-default" id="toc-verification-on-by-default" class="nav-link" data-scroll-target="#verification-on-by-default">Verification (on by default)</a></li>
+  <li><a href="#validation" id="toc-validation" class="nav-link" data-scroll-target="#validation">Validation</a>
+  <ul class="collapse">
+  <li><a href="#the-platelet-ladder-anchor" id="toc-the-platelet-ladder-anchor" class="nav-link" data-scroll-target="#the-platelet-ladder-anchor">The platelet-ladder anchor</a></li>
+  <li><a href="#the-vancomycin-auc-tdm-anchor" id="toc-the-vancomycin-auc-tdm-anchor" class="nav-link" data-scroll-target="#the-vancomycin-auc-tdm-anchor">The vancomycin AUC-TDM anchor</a></li>
+  <li><a href="#the-vancomycin-interval-extension-anchor" id="toc-the-vancomycin-interval-extension-anchor" class="nav-link" data-scroll-target="#the-vancomycin-interval-extension-anchor">The vancomycin interval-extension anchor</a></li>
+  <li><a href="#the-weight-based-mgkg-vancomycin-anchor" id="toc-the-weight-based-mgkg-vancomycin-anchor" class="nav-link" data-scroll-target="#the-weight-based-mgkg-vancomycin-anchor">The weight-based (mg/kg) vancomycin anchor</a></li>
+  <li><a href="#the-rounded-dose-vancomycin-anchor" id="toc-the-rounded-dose-vancomycin-anchor" class="nav-link" data-scroll-target="#the-rounded-dose-vancomycin-anchor">The rounded-dose vancomycin anchor</a></li>
+  </ul></li>
+  <li><a href="#model-time-in-a-reactive-run" id="toc-model-time-in-a-reactive-run" class="nav-link" data-scroll-target="#model-time-in-a-reactive-run">Model time in a reactive run</a>
+  <ul class="collapse">
+  <li><a href="#decision-times-after-a-moved-reset" id="toc-decision-times-after-a-moved-reset" class="nav-link" data-scroll-target="#decision-times-after-a-moved-reset">Decision times after a moved reset</a></li>
+  <li><a href="#where-a-reactive-run-starts" id="toc-where-a-reactive-run-starts" class="nav-link" data-scroll-target="#where-a-reactive-run-starts">Where a reactive run starts</a></li>
+  <li><a href="#compartment-onoff-records" id="toc-compartment-onoff-records" class="nav-link" data-scroll-target="#compartment-onoff-records">Compartment on/off records</a></li>
+  <li><a href="#dose-clocks-before-the-first-dose" id="toc-dose-clocks-before-the-first-dose" class="nav-link" data-scroll-target="#dose-clocks-before-the-first-dose">Dose clocks before the first dose</a>
+  <ul class="collapse">
+  <li><a href="#how-the-check-decides" id="toc-how-the-check-decides" class="nav-link" data-scroll-target="#how-the-check-decides">How the check decides</a></li>
+  <li><a href="#what-the-check-cannot-see" id="toc-what-the-check-cannot-see" class="nav-link" data-scroll-target="#what-the-check-cannot-see">What the check cannot see</a></li>
+  </ul></li>
+  </ul></li>
+  <li><a href="#current-scope-and-limits" id="toc-current-scope-and-limits" class="nav-link" data-scroll-target="#current-scope-and-limits">Current scope and limits</a></li>
+  </ul></li>
+  </ul>
+<div class="toc-actions"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/model-file/adaptive-dosing.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content" tabindex="-1"><header id="title-block-header" class="quarto-title-block"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="Breadcrumbs"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../model-file/index.html">Model File Reference</a></li><li class="breadcrumb-item"><a href="../model-file/adaptive-dosing.html">Adaptive (Feedback) Dosing</a></li></ol></nav></header>
+
+
+
+
+
+<section id="adaptive-feedback-dosing" class="level1">
+<h1>Adaptive (Feedback) Dosing</h1>
+<blockquote class="blockquote">
+<p><strong>Maturity: beta</strong> — see <a href="../maturity.html">Feature Maturity</a> for what this means.</p>
+</blockquote>
+<p>Adaptive dosing simulates regimens where <strong>future doses depend on the simulated state</strong> — therapeutic-drug-monitoring (TDM) target attainment, oncology toxicity-driven dose reduction, biomarker titration, target-controlled infusion. A plain <a href="../model-file/simulation.html">simulation</a> is a pure forward pass: every dose is fixed before integration. Here a <em>controller</em> is consulted at a schedule of decision times, reads the current state, and chooses what to do next.</p>
+<p>There are two ways to drive a controller, and they compile to the <strong>same</strong> reactive engine — the same dose ledger, decision log, RNG substreams, and frozen-replay verifier (epic #391):</p>
+<ul>
+<li>the declarative <strong><code>[adaptive_dosing]</code> model-file block</strong>, run with <a href="https://docs.rs/ferx-core"><code>simulate_adaptive_from_spec()</code></a> — the file-driven path, documented next;</li>
+<li>the <strong>programmatic</strong> <a href="https://docs.rs/ferx-core"><code>simulate_adaptive()</code></a>, which takes a hand-written controller closure — the lower-level path, documented under <a href="#the-controller">The controller</a>.</li>
+</ul>
+<p>Multi-model composition (PK + PD + safety) and an imperative <code>[dose_control]</code> block remain on the roadmap.</p>
+<section id="the-declarative-adaptive_dosing-block" class="level2">
+<h2 class="anchored" data-anchor-id="the-declarative-adaptive_dosing-block">The declarative <code>[adaptive_dosing]</code> block</h2>
+<p>Put the policy in the model file and run it with <a href="https://docs.rs/ferx-core"><code>simulate_adaptive_from_spec()</code></a>. The block is <strong>declarative</strong> — a fixed dosing <em>policy</em> (trough &lt; target → increase, grade 4 → stop), not a script — that rides with the run, never with a fitted model’s parameters.</p>
+<pre><code>[adaptive_dosing]
+  observe     = central / V              # monitored signal: a derived expression
+  at          = every 24 from 0 to 168   # decision schedule (or an explicit list)
+  start_dose  = 100                      # dose issued at the first decision
+  route       = bolus(cmt=1)             # or: infuse(cmt=1, over=2)
+  dose_bounds = [0, 400]                 # every emitted dose is clamped here
+  confirm     = 2                        # act only after 2 consecutive breaches
+  when signal &lt; 10 : increase 25%        # first matching rule wins
+  when signal &gt; 20 : decrease 25%</code></pre>
+<section id="keys" class="level3">
+<h3 class="anchored" data-anchor-id="keys">Keys</h3>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Key</th>
+<th style="text-align: center;">Required</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>observe</code></td>
+<td style="text-align: center;">signal¹</td>
+<td>The <strong>latent</strong> monitored signal — a free-form expression over states + individual parameters (e.g.&nbsp;<code>central / V</code> for concentration), titrated on with <strong>no</strong> measurement noise. Provide this <em>or</em> <code>with_assay_error</code>, never both. The <code>when</code> rules compare the keyword <code>signal</code> to its value.</td>
+</tr>
+<tr class="even">
+<td><code>at</code></td>
+<td style="text-align: center;">✓</td>
+<td>Decision schedule on the subject clock: an explicit list <code>[0, 24, 48]</code> or an arithmetic sequence <code>every &lt;Δ&gt; from &lt;t0&gt; to &lt;t1&gt;</code> (inclusive).</td>
+</tr>
+<tr class="odd">
+<td><code>start_dose</code></td>
+<td style="text-align: center;">✓</td>
+<td>The dose issued at the first decision; seeds the running dose. A number, or an expression evaluated per subject (e.g.&nbsp;<code>15 * WT</code>, or <code>400 * CL</code> for a subject whose η are supplied); see <a href="#dose-expressions">Dose expressions</a>.</td>
+</tr>
+<tr class="even">
+<td><code>route</code></td>
+<td style="text-align: center;">✓</td>
+<td><code>bolus(cmt=N)</code> or <code>infuse(cmt=N, over=T)</code> (zero-order over duration <code>T</code>).</td>
+</tr>
+<tr class="odd">
+<td><code>dose_bounds</code></td>
+<td style="text-align: center;">✓</td>
+<td>Inclusive <code>[low, high]</code> clamp applied to every emitted dose. Each side is a number or a per-subject expression (e.g.&nbsp;<code>[0, min(30 * WT, 4000)]</code>).</td>
+</tr>
+<tr class="even">
+<td><code>confirm</code></td>
+<td style="text-align: center;"></td>
+<td>Debounce: act only after this many <em>consecutive</em> matches of the same rule (default <code>1</code> = act on the first breach).</td>
+</tr>
+<tr class="odd">
+<td><code>levels</code></td>
+<td style="text-align: center;"></td>
+<td>Discrete titration ladder <code>[d1, d2, …]</code> (oncology). With <code>levels</code>, bare <code>increase</code>/<code>decrease</code> step one rung; without it, use <code>increase N%</code> / <code>decrease N%</code>. Each rung is a number or a per-subject expression.</td>
+</tr>
+<tr class="even">
+<td><code>round_to</code></td>
+<td style="text-align: center;"></td>
+<td>Dose grid step, a number <code>&gt; 0</code> (e.g.&nbsp;<code>250</code> for 250 mg vials): every dose the controller sets is rounded to the nearest multiple, then clamped to the multiples inside <code>dose_bounds</code>. Not with <code>levels</code>. See <a href="#rounding-doses-to-a-grid">Rounding doses to a grid</a>.</td>
+</tr>
+<tr class="odd">
+<td><code>dose_knowledge</code></td>
+<td style="text-align: center;"></td>
+<td><code>known</code> (default) or <code>oracle</code>: whether a dose expression may read a drawn subject’s individual parameters. See <a href="#which-subjects-values-are-known">Which subjects’ values are known</a>.</td>
+</tr>
+<tr class="even">
+<td><code>intervals</code></td>
+<td style="text-align: center;"></td>
+<td>Dosing-interval ladder <code>[d1, d2, …]</code>, strictly increasing and positive. Rules step it with <code>lengthen</code> / <code>shorten</code>. Requires <code>start_interval</code>. See <a href="#changing-the-dosing-interval">Changing the dosing interval</a>.</td>
+</tr>
+<tr class="odd">
+<td><code>start_interval</code></td>
+<td style="text-align: center;"></td>
+<td>The dosing interval in force from the first decision; one of <code>intervals</code>, and required with it.</td>
+</tr>
+<tr class="even">
+<td><code>target_window</code></td>
+<td style="text-align: center;"></td>
+<td>Therapeutic band <code>[low, high]</code> for the monitored signal, used <strong>only</strong> to report the <code>pct_time_in_window</code> outcome metric — it does <strong>not</strong> influence dosing (the <code>when</code> rules do). <code>high</code> may be <code>inf</code> for a one-sided “at or above <code>low</code>” target. Omit it to leave <code>pct_time_in_window</code> unreported, rather than guessing a band from the rule thresholds.</td>
+</tr>
+<tr class="odd">
+<td><code>auc_target</code></td>
+<td style="text-align: center;"></td>
+<td>Exposure band <code>[low, high]</code> for the <strong>area under the monitored signal</strong> over each inter-decision window (e.g.&nbsp;vancomycin AUC₂₄ when decisions are daily), used <strong>only</strong> to report the <code>auc_target_attainment</code> outcome metric — like <code>target_window</code> it does <strong>not</strong> influence dosing. <code>low</code> must be <code>≥ 0</code>; <code>high</code> may be <code>inf</code>. Declaring it makes the reactive driver integrate the signal over each window as it simulates — any pre-scheduled base regimen (#702) together with the realized controller doses, on the run’s own trajectory; omit it to skip that integral and leave <code>auc_target_attainment</code> unreported.</td>
+</tr>
+<tr class="even">
+<td><code>with_assay_error</code></td>
+<td style="text-align: center;">signal¹</td>
+<td>Titrate on the <strong>noised measurement</strong> of a model output (named by <code>assay_cmt</code>) instead of a latent expression (default <code>false</code>). The signal’s value comes from that output’s <code>[scaling]</code> readout and its σ from that output’s <code>[error_model]</code>, so the two are always on the same scale — there is no re-typed <code>observe</code> expression to mis-scale. Mutually exclusive with <code>observe</code>.</td>
+</tr>
+<tr class="odd">
+<td><code>assay_cmt</code></td>
+<td style="text-align: center;"></td>
+<td>The 1-based compartment of the model output measured under <code>with_assay_error</code> — its <code>[scaling]</code> readout is the signal value and its <code>[error_model]</code> σ the noise. <strong>Required</strong> with <code>with_assay_error</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>¹ <strong>The signal source is exactly one of <code>observe</code> (a latent expression, un-noised) or <code>with_assay_error = true</code> + <code>assay_cmt</code> (a noised model output).</strong> Setting both, or neither, is a parse error. Titrating on a <em>measured</em> quantity uses the model’s own output (so its value and σ can never disagree on scale); titrating on a <em>derived latent</em> quantity (effect-site, a ratio — anything with no error model) uses <code>observe</code>.</p>
+<section id="writing-an-observe-expression" class="level4">
+<h4 class="anchored" data-anchor-id="writing-an-observe-expression">Writing an <code>observe</code> expression</h4>
+<div class="callout callout-style-default callout-important callout-titled">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Important</span><code>observe</code> must not read a dose attribute
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p><code>observe</code> is a prediction path, so the same rule applies as in <code>[odes]</code> and <code>[scaling]</code>: a parameter the engine already applies <strong>at the dose event</strong> — on an ODE model <code>F</code>, <code>LAGTIME</code>/<code>ALAG</code>, or an indexed <code>F{n}</code>/<code>ALAG{n}</code>/<code>LAGTIME{n}</code>; on an analytical model whatever the <code>pk(..., f=…)</code> / <code>lagtime=…</code> mapping binds — must not be read back here. Writing <code>observe = central / (V * F)</code> applies <code>F</code> once to the dose and once to the signal, so the value the <code>when</code> rules compare against is wrong by exactly <code>F</code> — and unlike a mis-scaled readout this biases the <strong>titration decision</strong>, and every dose the controller goes on to emit. Such a model is rejected at parse time with <code>E_DOSE_ATTR_DOUBLE_USE</code> (<a href="https://github.com/FeRx-NLME/ferx-core/issues/993">#993</a>, <a href="https://github.com/FeRx-NLME/ferx-core/issues/1004">#1004</a>); see <a href="../model-file/ode-models.html#reading-a-dose-attribute-is-an-error-not-a-warning">Reading a dose attribute is an error, not a warning</a>.</p>
+<p><code>D{n}</code>/<code>R{n}</code> are the exception, as everywhere: the engine only consults them for a dose that codes <code>RATE=-2</code>/<code>-1</code>, so an <code>R1</code> in <code>observe</code> is reported against the <strong>dataset</strong> rather than the model file, and only when such a dose lands on it.</p>
+</div>
+</div>
+<p><code>observe</code> compiles through the same expression compiler as a <code>[scaling]</code> Form C readout, so it shares that block’s name scope — including the <code>TIME</code> built-in (spelled <code>TIME</code> or <code>T</code>), which resolves to <strong>the decision’s own time</strong>. A protocol-time-dependent target such as <code>observe = central / V - TARGET * TIME / (TIME + T50)</code> therefore titrates against the intended ramp (<a href="https://github.com/FeRx-NLME/ferx-core/issues/1028">#1028</a>). It is the <code>TIME</code> as written at the decision, which is what an observation record there reads. After a reset that restarts <code>TIME</code>, that is the restarted value, not the engine clock the decision times are given on. The same holds for a monitor without <code>observe</code> whose <code>[scaling]</code> readout reads <code>TIME</code>, and for every point of an <code>auc_target</code> window (<a href="https://github.com/FeRx-NLME/ferx-core/issues/2756">#2756</a>).</p>
+<p>The shared name scope includes the <code>T</code> precedence rule: a <code>T</code> (or <code>t</code>) declared in <code>[covariates]</code> is the <strong>data column</strong>, in <code>observe</code> exactly as in <code>[scaling]</code>, so one model can never read the column in one block and the clock in the other. When <code>T</code> does fold into the built-in, the warning is reported at parse time — <code>observe</code> itself is compiled at simulate time, where there is no warnings channel. See <a href="../model-file/scaling.html#if-your-dataset-has-a-column-named-t">Scaling</a>.</p>
+</section>
+</section>
+<section id="dose-expressions" class="level3">
+<h3 class="anchored" data-anchor-id="dose-expressions">Dose expressions</h3>
+<p><code>start_dose</code>, each side of <code>dose_bounds</code> and each rung of <code>levels</code> can be an expression instead of a number, so one block can dose by weight, by renal function or by any other column in the data (<a href="https://github.com/FeRx-NLME/ferx-core/issues/944">#944</a>):</p>
+<pre><code>  start_dose  = 15 * WT                  # 15 mg/kg
+  dose_bounds = [0, min(30 * WT, 4000)]  # at most 30 mg/kg, never above 4000 mg</code></pre>
+<p>A value that reads as a number is a number, checked when the file is parsed, exactly as before — also against the other numbers of a block that mixes in expressions, so <code>start_dose = 5</code> with <code>dose_bounds = [10, 30 * WT]</code> is a parse error, not a refusal of the first subject. Anything else is an expression, compiled with the same expression language as <code>observe</code> (<code>min</code>, <code>max</code>, <code>exp</code>, <code>if (…) … else …</code>, …).</p>
+<p>Each expression is evaluated <strong>once per subject, at the first decision</strong> (<code>at[0]</code>), from θ, the covariates in force there and, for a subject whose values are known, its individual parameters there (see <a href="#which-subjects-values-are-known">Which subjects’ values are known</a>). The covariates are the row of the record in force at <code>at[0]</code>, the same row a programmatic controller reads in <code>ctx.covariates</code> at that decision. A covariate that changes before <code>at[0]</code> is read at its new value; one that changes after <code>at[0]</code> does not change the plan. When <code>at[0]</code> is before the subject’s first record, it is the subject’s first value of each covariate, as in the driver. The resulting start dose, bounds and ladder then work exactly as the numbers would: rules step from that start dose and clamp to those bounds.</p>
+<p>Every subject’s values are checked before any subject is simulated (except an oracle subject, checked in each replicate after its draw; see <a href="#which-subjects-values-are-known">Which subjects’ values are known</a>), with the same rules as the numbers: finite and <code>&gt;= 0</code>, <code>low &lt;= high</code>, the start dose inside the bounds (and on the ladder, with <code>levels</code>), every rung inside the bounds, and the ladder strictly increasing. The first subject that fails is refused with <code>E_ADAPTIVE_DOSE_VALUE</code>, naming the subject, the expression, the values it evaluated to and the covariate and individual-parameter values it read (and, for an oracle subject, checked in each replicate, the replicate):</p>
+<pre><code>[adaptive_dosing] subject 2: start_dose = 15 * WT - 1000 evaluates to -250; a dose
+must be finite and &gt;= 0. The dose expressions read WT = 50, at the first decision
+(t = 0).</code></pre>
+<p>A covariate the data lack is refused when the run starts, with <code>E_MISSING_COVARIATE</code>, as for <code>observe</code>. Example: <code>examples/adaptive_vanco_mgkg.ferx</code>.</p>
+</section>
+<section id="what-a-dose-expression-may-read" class="level3">
+<h3 class="anchored" data-anchor-id="what-a-dose-expression-may-read">What a dose expression may read</h3>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Name</th>
+<th>Allowed</th>
+<th>Why</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>A number, θ</td>
+<td>yes</td>
+<td>The same for every subject.</td>
+</tr>
+<tr class="even">
+<td>A data covariate</td>
+<td>yes</td>
+<td>Known when the dose is written. Read at <code>at[0]</code>.</td>
+</tr>
+<tr class="odd">
+<td>An individual parameter that no random effect reaches (<code>TVCLW = TVCL * (WT / 70)</code>)</td>
+<td>yes</td>
+<td>A function of θ, covariates and <code>TIME</code> alone, so known for every subject. Read at <code>at[0]</code>.</td>
+</tr>
+<tr class="even">
+<td>An individual parameter that a random effect reaches (<code>CL = TVCLW * exp(ETA_CL)</code>, or any parameter computed from one), or a random effect (<code>ETA_CL</code>)</td>
+<td>for a supplied subject; for a drawn one only under <code>dose_knowledge = oracle</code></td>
+<td>Known at dosing time only when the subject’s η come from input; see <a href="#which-subjects-values-are-known">Which subjects’ values are known</a>. A parameter counts as reached when an η, a κ or <code>MIXNUM</code> enters it through any intermediate or <code>if</code> condition.</td>
+</tr>
+<tr class="odd">
+<td>A state (<code>CENT</code>)</td>
+<td>no</td>
+<td>The expression runs once; to follow the drug level, write a <code>when signal …</code> rule.</td>
+</tr>
+<tr class="even">
+<td><code>TIME</code> (or <code>T</code>)</td>
+<td>no</td>
+<td>It would always be <code>at[0]</code>; write the value.</td>
+</tr>
+<tr class="odd">
+<td>A κ (IOV)</td>
+<td>no</td>
+<td>Drawn for each occasion, so never known at dosing time. Read the individual parameter instead: a supplied subject reads it at κ = 0.</td>
+</tr>
+<tr class="even">
+<td><code>MIXNUM</code></td>
+<td>only under <code>dose_knowledge = oracle</code></td>
+<td>The simulation draws the class, and supplied η refuse a <code>[mixture]</code> model, so no subject’s class is known.</td>
+</tr>
+</tbody>
+</table>
+<p>The refusals are raised when the model is parsed, so <code>ferx check</code> reports them, with a message that names the key and the name read. A spec built in code is checked again when the run starts. Whether a subject may read its individual parameters depends on whether its η are supplied, so that is decided when the run starts.</p>
+</section>
+<section id="which-subjects-values-are-known" class="level3">
+<h3 class="anchored" data-anchor-id="which-subjects-values-are-known">Which subjects’ values are known</h3>
+<p>A subject’s individual parameters are known at dosing time when they come from input: its η are supplied (<code>etas</code> in R, <code>AdaptiveInputs::with_etas</code> in Rust; see <a href="#supplied-individual-values">Supplied individual values</a>). When the simulation draws the η, the individual parameters are the simulated truth, which no prescriber knows. The rule is decided per subject, so a run under <code>UnmatchedSubjects::Draw</code> that mixes known and virtual patients treats each by its own source (<a href="https://github.com/FeRx-NLME/ferx-core/issues/944">#944</a>):</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Subject</th>
+<th><code>dose_knowledge = known</code> (default)</th>
+<th><code>dose_knowledge = oracle</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>η supplied</td>
+<td>reads its supplied η, with κ = 0</td>
+<td>the same; <code>dose_oracle</code> is <code>false</code></td>
+</tr>
+<tr class="even">
+<td>η drawn</td>
+<td>the run is refused (<code>E_ADAPTIVE_DOSE_KNOWLEDGE</code>), listing the drawn subjects</td>
+<td>reads its drawn η and the κ of the first decision’s occasion, in each replicate; <code>dose_oracle</code> is <code>true</code></td>
+</tr>
+</tbody>
+</table>
+<p>The refusal names the three routes to a dose computed from an individual value:</p>
+<pre><code>[adaptive_dosing] start_dose reads CL, an individual parameter, but the random effects
+of 1 of 2 subject(s) are drawn by the simulation ('2'), so CL is the simulated truth,
+which no prescriber knows at dosing time. To dose from it: carry the known value as a
+data column (e.g. CL_KNOWN) and read that; supply each subject's random effects (e.g. a
+previous fit's estimates, as `etas` in R, or through `AdaptiveInputs::with_etas` and
+`simulate_adaptive_from_spec_with_inputs` in Rust); or set dose_knowledge = oracle for a
+perfect-information comparison arm, which is flagged in the results.</code></pre>
+<p>The individual parameters are evaluated at the first decision: at the covariates in force there and at <code>TIME</code> as written there, the same point the driver evaluates the first decision’s PK at. κ is drawn per occasion, so a supplied subject reads κ = 0. An oracle subject reads the κ of the first decision’s occasion, the one the driver resolves the first dose’s attributes under. With a record at the next decision, the disposition over the first window follows that record’s occasion (<a href="https://github.com/FeRx-NLME/ferx-core/issues/943">#943</a>), so the oracle’s κ and the κ its first trough reflects can differ (see <a href="#window-kappa">Which κ a decision window runs under</a>).</p>
+<p><strong>The oracle is never silent.</strong> <code>dose_knowledge = oracle</code> is a perfect-information comparison arm, a standard benchmark in model-informed dosing studies. Each subject dosed from its drawn values has <code>dose_oracle = true</code> in its metrics (<code>AdaptiveSubjectMetrics::dose_oracle</code> in Rust), and the run warns:</p>
+<pre><code>W_ADAPTIVE_DOSE_ORACLE: 1 of 2 subject(s) were dosed from their simulated individual
+values (dose_knowledge = oracle; start_dose reads CL). This is a perfect-information
+arm: no prescriber has these values. Each such subject's metrics have dose_oracle =
+true.</code></pre>
+<p>A run in which every subject is supplied doses no subject from its drawn values, so it flags none and does not warn. A block whose dose expressions read no individual parameter that a random effect reaches, no random effect and no <code>MIXNUM</code> has nothing for the oracle to apply to, so <code>dose_knowledge = oracle</code> there is refused when the model is parsed.</p>
+<p><strong>Supplied values are taken as exact.</strong> A supplied subject’s η are both its simulated truth and its dosing input, so the run assumes the dose was computed from perfect estimates, which is optimistic. To represent estimation error, let the simulation draw the truth and pass the estimate as a data column (e.g.&nbsp;<code>CL_KNOWN</code>), which a dose expression reads as a covariate. The full treatment, where the controller estimates the individual values from the observations it sees, is the MAP-Bayes controller (#391, Part F).</p>
+<p>On a FREM model, a dose expression that reads a covariate doses from the value in the data, while a subject whose η is drawn has PK that follows its drawn covariate η — unless the model’s own expressions read that column directly. The <code>W_FREM_DRAWN_ETA</code> warning then names the covariates the dose expressions read and the model does not, each with the first key that reads it.</p>
+</section>
+<section id="rounding-doses-to-a-grid" class="level3">
+<h3 class="anchored" data-anchor-id="rounding-doses-to-a-grid">Rounding doses to a grid</h3>
+<p><code>round_to = &lt;step&gt;</code> puts every dose the controller sets on a grid of multiples of <code>&lt;step&gt;</code> — the vial or tablet size a real order is written in (<a href="https://github.com/FeRx-NLME/ferx-core/issues/944">#944</a>):</p>
+<pre><code>  start_dose  = 15 * WT
+  dose_bounds = [250, min(30 * WT, 4000)]
+  round_to    = 250</code></pre>
+<p>The step is one number for every subject, finite and <code>&gt; 0</code>. Each dose — the start dose, and the dose after each percentage step — goes through the same three steps:</p>
+<ol type="1">
+<li><strong>Round</strong> to the nearest multiple of the step. A value exactly halfway goes <strong>up</strong> (375 → 500 with a step of 250). The halfway test allows for decimal steps, whose quotients are rarely exact in binary (<code>0.35 / 0.1</code> is <code>3.4999999999999996</code>, and still rounds up to 0.4).</li>
+<li><strong>Clamp</strong> to the multiples inside <code>dose_bounds</code>: the lowest multiple at or above the low bound and the highest at or below the high bound. With <code>dose_bounds = [250, 1150]</code> and a step of 250, a step to 1300 rounds to 1250 and is clamped to 1000; a dose never leaves the bounds as written. Rounding comes first: clamping first would give 1150, which rounds to 1250, above the bound.</li>
+<li><strong>Carry</strong> the rounded dose. The next step starts from the dose actually given: 500 +30% is 650, given as 750; the next +30% starts from 750 and gives 1000 (from 650 it would be 845, given as 750).</li>
+</ol>
+<p>The rounded dose is what every later decision re-issues when no rule fires; it is rounded once, when it is set.</p>
+<p><strong>An absorbed step looks like a clamped step.</strong> A step the grid absorbs (500 +10% is 550, which rounds back to 500) leaves the dose unchanged. The dose ledger records the rule that fired (<code>rule_fired</code>) and the unchanged <code>amt</code> — exactly the record a step clamped at a bound produces — and the metrics count it as neither an increase nor a decrease, since they count realized changes. There is no separate field for it.</p>
+<p><strong>A small step can be absorbed every time.</strong> The rounded dose is carried, so a <code>p%</code> step moves a dose <code>d</code> only when it changes it by at least half a step (<code>d · p / 100 ≥ step / 2</code> on the way up; strictly more on the way down, since ties go up). Below that, the same rule fires at every decision and the dose never moves: with a step of 250, <code>increase 25%</code> from 250 gives 312.5, which rounds back to 250, so a subject held at 250 stays there. Likewise, because ties go up, 500 <code>decrease 25%</code> gives 375, which rounds back to 500. Choose the step and the percentages together so the lowest doses can still move, or check <code>rule_fired</code> against the realized <code>amt</code> in the ledger.</p>
+<p>The run warns (<code>W_ADAPTIVE_STEP_ABSORBED</code>) when the smallest <code>increase N%</code> is absorbed at a dose a subject can be at: its start dose, or the lowest dose the decrease rules bring it to. The warning names those subjects with the dose, and the lowest dose that step can raise. A dose at the upper bound, and a dose that only cannot go down, do not warn.</p>
+<p><code>round_to</code> does not combine with <code>levels</code>: a ladder is already discrete, so write the rounded doses as the rungs. Without <code>round_to</code>, nothing changes: doses are clamped to <code>dose_bounds</code> only, as before.</p>
+</section>
+<section id="when-a-grid-is-refused" class="level3">
+<h3 class="anchored" data-anchor-id="when-a-grid-is-refused">When a grid is refused</h3>
+<p>Bounds can be expressions, so the grid is checked for each subject before any subject runs (an oracle subject in each replicate, after its draw), and for numeric bounds when the file is parsed. Each refusal is <code>E_ADAPTIVE_DOSE_VALUE</code> and names the subject (and the replicate, for an oracle subject):</p>
+<ul>
+<li><strong>No multiple inside the bounds.</strong> With <code>dose_bounds = [10 * WT, 12 * WT]</code> and a step of 250, a 20 kg subject’s bounds are <code>[200, 240]</code>, which hold no multiple of 250.</li>
+<li><strong>A low bound of 0, with percentage steps.</strong> A dose could then round to 0, a dose of 0 is a hold, and a running dose of 0 cannot rise again under percentage steps. Set the low bound above 0: any positive value up to the step is lifted to the step, so <code>dose_bounds = [1e-6, …]</code> and <code>[250, …]</code> both give a lowest dose of 250. A block whose rules take no percentage step is not refused.</li>
+</ul>
+<pre><code>[adaptive_dosing] subject 1: with round_to = 250, dose_bounds = [WT - 20, 4000]
+evaluate to [0, 4000]: a low of 0 lets a dose round to 0, and a running dose of 0
+cannot rise again under percentage steps; set the lower bound above 0 (any value up
+to 250 raises it to 250). The dose expressions read WT = 20, at the first decision
+(t = 0).</code></pre>
+<p>A step that is not a finite number <code>&gt; 0</code>, and <code>round_to</code> together with <code>levels</code>, are parse errors. Example: <code>examples/adaptive_vanco_mgkg_rounded.ferx</code>.</p>
+</section>
+<section id="rules-when-signal-op-value-action" class="level3">
+<h3 class="anchored" data-anchor-id="rules-when-signal-op-value-action">Rules — <code>when signal &lt;op&gt; &lt;value&gt; : &lt;action&gt;</code></h3>
+<p>Rules are evaluated top to bottom and the <strong>first match wins</strong>, so order the most specific / most severe condition first. <code>&lt;op&gt;</code> is one of <code>&lt; &lt;= &gt; &gt;= ==</code>.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 47%">
+<col style="width: 52%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Action</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>increase N%</code> / <code>decrease N%</code></td>
+<td>Scale the running dose by ±N % (continuous titration).</td>
+</tr>
+<tr class="even">
+<td><code>increase</code> / <code>decrease</code></td>
+<td>Step one rung up / down a <code>levels</code> ladder.</td>
+</tr>
+<tr class="odd">
+<td><code>hold</code></td>
+<td>Skip this decision’s dose.</td>
+</tr>
+<tr class="even">
+<td><code>stop</code></td>
+<td>Discontinue all future dosing.</td>
+</tr>
+<tr class="odd">
+<td><code>lengthen</code> / <code>shorten</code></td>
+<td>Step one rung up / down the <code>intervals</code> ladder.</td>
+</tr>
+</tbody>
+</table>
+<p>A rule carries at most one <strong>dose effect</strong> (the first four rows) and at most one <strong>interval effect</strong> (<code>lengthen</code> / <code>shorten</code>), separated by a comma in either order: <code>when signal &gt; 20 : decrease 25%, lengthen</code>. A rule with only an interval effect re-issues the running dose. <code>stop</code> cannot be combined with an interval effect.</p>
+<p>A dose change is clamped to <code>dose_bounds</code> (with <code>round_to</code>, rounded first; see <a href="#rounding-doses-to-a-grid">Rounding doses to a grid</a>); a level step saturates at the ends of the ladder. When no rule matches (or a matched rule has not yet <code>confirm</code>-ed), the running dose is <strong>re-issued</strong> unchanged — the regimen continues, an explicit no-op rather than a silent skip.</p>
+</section>
+<section id="running-it" class="level3">
+<h3 class="anchored" data-anchor-id="running-it">Running it</h3>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb8"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_core::estimation::uncertainty_samples::</span>fitted_params_from_result<span class="op">;</span></span>
+<span id="cb8-2"><a href="#cb8-2" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_core::io::fitrx::</span>load_fit<span class="op">;</span></span>
+<span id="cb8-3"><a href="#cb8-3" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_core::</span><span class="op">{</span>parse_full_model_file<span class="op">,</span> simulate_adaptive_from_spec<span class="op">,</span> AdaptiveSimulateOptions<span class="op">};</span></span>
+<span id="cb8-4"><a href="#cb8-4" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">std::path::</span><span class="dt">Path</span><span class="op">;</span></span>
+<span id="cb8-5"><a href="#cb8-5" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-6"><a href="#cb8-6" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> parsed <span class="op">=</span> parse_full_model_file(<span class="dt">Path</span><span class="pp">::</span>new(<span class="st">"titration.ferx"</span>))<span class="op">?;</span></span>
+<span id="cb8-7"><a href="#cb8-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> spec <span class="op">=</span> parsed</span>
+<span id="cb8-8"><a href="#cb8-8" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>adaptive_dosing</span>
+<span id="cb8-9"><a href="#cb8-9" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>as_ref()</span>
+<span id="cb8-10"><a href="#cb8-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">.</span>ok_or(<span class="st">"model has no [adaptive_dosing] block"</span>)<span class="op">?;</span></span>
+<span id="cb8-11"><a href="#cb8-11" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-12"><a href="#cb8-12" aria-hidden="true" tabindex="-1"></a><span class="co">// The fitted estimates: θ, Ω, σ (and Ω_IOV) from a saved fit of this model.</span></span>
+<span id="cb8-13"><a href="#cb8-13" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> fit <span class="op">=</span> load_fit(<span class="dt">Path</span><span class="pp">::</span>new(<span class="st">"run1.fitrx"</span>))<span class="op">?.</span>fit<span class="op">;</span></span>
+<span id="cb8-14"><a href="#cb8-14" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> params <span class="op">=</span> fitted_params_from_result(<span class="op">&amp;</span>fit<span class="op">,</span> <span class="op">&amp;</span>parsed<span class="op">.</span>model)<span class="op">?;</span></span>
+<span id="cb8-15"><a href="#cb8-15" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-16"><a href="#cb8-16" aria-hidden="true" tabindex="-1"></a><span class="co">// The block owns the schedule and the monitor, so leave `decision_times` and</span></span>
+<span id="cb8-17"><a href="#cb8-17" aria-hidden="true" tabindex="-1"></a><span class="co">// `monitors` empty here (setting either is a typed error); `seed` / `verify` /</span></span>
+<span id="cb8-18"><a href="#cb8-18" aria-hidden="true" tabindex="-1"></a><span class="co">// `max_decisions` still apply. The struct is `#[non_exhaustive]`: start from</span></span>
+<span id="cb8-19"><a href="#cb8-19" aria-hidden="true" tabindex="-1"></a><span class="co">// `default()` and set fields.</span></span>
+<span id="cb8-20"><a href="#cb8-20" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> opts <span class="op">=</span> <span class="pp">AdaptiveSimulateOptions::</span><span class="kw">default</span>()<span class="op">;</span></span>
+<span id="cb8-21"><a href="#cb8-21" aria-hidden="true" tabindex="-1"></a>opts<span class="op">.</span>seed <span class="op">=</span> <span class="cn">Some</span>(<span class="dv">42</span>)<span class="op">;</span></span>
+<span id="cb8-22"><a href="#cb8-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb8-23"><a href="#cb8-23" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> result <span class="op">=</span> simulate_adaptive_from_spec(<span class="op">&amp;</span>parsed<span class="op">.</span>model<span class="op">,</span> <span class="op">&amp;</span>population<span class="op">,</span> <span class="op">&amp;</span>params<span class="op">,</span> <span class="dv">100</span><span class="op">,</span> spec<span class="op">,</span> <span class="op">&amp;</span>opts)<span class="op">?;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The simulation runs on whatever parameters you pass. <code>parsed.model.default_params</code> are the <strong>initial estimates</strong> from <code>[parameters]</code>, not a fit’s; passing them simulates the model as written before estimation. To simulate a fitted model, pass <code>fitted_params_from_result(&amp;fit, &amp;model)</code>. It takes a <code>FitResult</code> from <a href="../file-formats/fitrx.html#loading-a-bundle"><code>load_fit</code></a> or straight from <code>fit()</code>. It returns an error when the fit does not match the model: an Ω, σ or Ω_IOV of the wrong shape (<code>E_PARAM_SHAPE</code>), or, on a <code>[mixture]</code> model with class overrides, a fit that does not carry its packed estimate.</p>
+<p>On a model with a <code>theta NAME[...]</code> level block, or a <code>[covariate_model]</code> centre taken from the data (<code>center = median</code>), first bind the model and the simulated population to the fit with <code>bind_from_fit</code> and the fit’s <code>data_bindings</code>. Otherwise the fitted θ is read at the wrong level positions, or each covariate is centred on the simulated population’s statistic instead of the fit’s. See <a href="../api/fitting.html#simulate-with-fit-theta">Simulating with a fit’s θ</a>.</p>
+<p>Each subject’s η is still drawn from the fitted Ω. To simulate known patients at their own fitted η instead, see <a href="#supplied-individual-values">Supplied individual values</a>.</p>
+<p>On a FREM model that draw includes the covariate η, so a subject’s PK does not follow its own covariate values, while a controller reading <code>ControllerCtx::covariates</code> doses on them. The result reports this as <code>W_FREM_DRAWN_ETA</code>; supply the FREM fit’s EBEs instead. See <a href="../estimation/frem.html#limitations">FREM: Limitations</a>.</p>
+<p>The block compiles to exactly the controller, monitor, and engine described below, so every guarantee in <a href="#monitors">Monitors</a> and <a href="#verification-on-by-default">Verification</a> applies unchanged, and <code>result</code> is the same bundled <code>trajectories</code> / <code>ledger</code> / <code>decisions</code>. The lower-level programmatic API follows.</p>
+</section>
+<section id="supplied-individual-values" class="level3">
+<h3 class="anchored" data-anchor-id="supplied-individual-values">Supplied individual values</h3>
+<p>A run can simulate known patients at their own η rather than a draw from Ω, for example to try a dosing rule on the patients a model was fitted to. Build the η with <code>SuppliedEtas</code> and hand them to the run through <code>AdaptiveInputs</code>:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb9"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb9-1"><a href="#cb9-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_core::</span><span class="op">{</span>simulate_adaptive_from_spec_with_inputs<span class="op">,</span> AdaptiveInputs<span class="op">,</span> SuppliedEtas<span class="op">};</span></span>
+<span id="cb9-2"><a href="#cb9-2" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-3"><a href="#cb9-3" aria-hidden="true" tabindex="-1"></a><span class="co">// The fit's empirical Bayes estimates, one row per fitted subject.</span></span>
+<span id="cb9-4"><a href="#cb9-4" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> etas <span class="op">=</span> <span class="pp">SuppliedEtas::</span>from_fit(<span class="op">&amp;</span>fit<span class="op">,</span> <span class="op">&amp;</span>parsed<span class="op">.</span>model)<span class="op">?;</span></span>
+<span id="cb9-5"><a href="#cb9-5" aria-hidden="true" tabindex="-1"></a><span class="co">// Or your own: IDs, η names in the model's order, one row per subject.</span></span>
+<span id="cb9-6"><a href="#cb9-6" aria-hidden="true" tabindex="-1"></a><span class="co">// let etas = SuppliedEtas::from_table(ids, names, rows)?;</span></span>
+<span id="cb9-7"><a href="#cb9-7" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb9-8"><a href="#cb9-8" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> inputs <span class="op">=</span> <span class="pp">AdaptiveInputs::</span>new(<span class="op">&amp;</span>params)<span class="op">.</span>with_etas(<span class="op">&amp;</span>etas)<span class="op">;</span></span>
+<span id="cb9-9"><a href="#cb9-9" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> result <span class="op">=</span> simulate_adaptive_from_spec_with_inputs(</span>
+<span id="cb9-10"><a href="#cb9-10" aria-hidden="true" tabindex="-1"></a>    <span class="op">&amp;</span>parsed<span class="op">.</span>model<span class="op">,</span> <span class="op">&amp;</span>population<span class="op">,</span> <span class="op">&amp;</span>inputs<span class="op">,</span> <span class="dv">100</span><span class="op">,</span> spec<span class="op">,</span> <span class="op">&amp;</span>opts<span class="op">,</span></span>
+<span id="cb9-11"><a href="#cb9-11" aria-hidden="true" tabindex="-1"></a>)<span class="op">?;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p><code>simulate_adaptive_with_inputs</code> is the same for a programmatic controller. The two entry points without <code>_with_inputs</code> are <code>AdaptiveInputs::new(params)</code> with no η supplied.</p>
+<p>How supplied η are used:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Rule</th>
+<th>Behaviour</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Matching</td>
+<td>By subject ID. A supplied subject that is not in the simulated population is ignored.</td>
+</tr>
+<tr class="even">
+<td>A simulated subject with no supplied η</td>
+<td>Refused (<code>E_SUPPLIED_ETAS</code>), listing the IDs. With <code>.with_unmatched(UnmatchedSubjects::Draw)</code> its η is drawn from Ω instead, so known and virtual patients can share one run.</td>
+</tr>
+<tr class="odd">
+<td>A row</td>
+<td>Every η of the model, named and ordered as the model’s. There is no partial row: under a block Ω the missing η would need a draw conditional on the given ones.</td>
+</tr>
+<tr class="even">
+<td>Replicates</td>
+<td>A supplied η is the same in every replicate. κ and the controller’s assay (a <code>Dv</code> monitor) are still drawn. Adaptive trajectories carry no residual error, so without IOV or an assay the replicates of a supplied subject are identical.</td>
+</tr>
+<tr class="odd">
+<td>The η stream</td>
+<td>A supplied subject still uses up its draw, so every other subject gets the η the same seed gives without supplied η.</td>
+</tr>
+<tr class="even">
+<td>The metrics</td>
+<td><code>AdaptiveSubjectMetrics::eta_supplied</code> is <code>true</code> for a supplied subject.</td>
+</tr>
+<tr class="odd">
+<td>A <code>[mixture]</code> model</td>
+<td>Refused. A mixture fit estimates each subject’s η under its own class, and an adaptive run draws each subject’s class from the mixing probabilities (<a href="https://github.com/FeRx-NLME/ferx-core/issues/2163">#2163</a>), so the η could be simulated under another class.</td>
+</tr>
+</tbody>
+</table>
+<p>A refusal names its cause: IDs and rows that differ in count, a row with the wrong number of values or a non-finite one, a repeated ID, η names that are not the model’s, a fit of another model (<code>from_fit</code>), a <code>[mixture]</code> model, or an unmatched subject.</p>
+<p>A supplied η̂ is a point estimate, and the run treats it as exact. For a subject with few observations (high shrinkage) that understates how uncertain the patient’s parameters are, so the spread across replicates is optimistic. Drawing η from its posterior instead is <a href="https://github.com/FeRx-NLME/ferx-core/issues/2154">#2154</a>; re-estimating η from the simulated assays inside the run (a MAP-Bayesian controller) is <a href="https://github.com/FeRx-NLME/ferx-core/issues/2155">#2155</a>.</p>
+<p>The test that ties this to the fit: with a holding controller and the fit’s own doses, the run’s IPRED at the supplied η̂ equals the fit’s IPRED bit for bit, on a population ordered differently from the fit’s.</p>
+</section>
+</section>
+<section id="the-controller" class="level2">
+<h2 class="anchored" data-anchor-id="the-controller">The controller</h2>
+<p>A controller is a closure consulted at each decision time. It receives a read-only <a href="https://docs.rs/ferx-core"><code>ControllerCtx</code></a> — the decision time, the live ODE state, the subject’s covariates, the realized dose history, and the resolved value of every declared <em>monitor</em> — and returns a list of <a href="https://docs.rs/ferx-core"><code>DoseAction</code></a>s:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Action</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><code>Bolus { amt, cmt }</code></td>
+<td>Instantaneous dose into 1-based compartment <code>cmt</code>.</td>
+</tr>
+<tr class="even">
+<td><code>Infuse { amt, cmt, rate }</code></td>
+<td>Zero-order infusion; duration is <code>amt / rate</code>.</td>
+</tr>
+<tr class="odd">
+<td><code>Hold</code></td>
+<td>Skip this decision — no dose now, the regimen continues.</td>
+</tr>
+<tr class="even">
+<td><code>Stop</code></td>
+<td>Discontinue all <strong>future controller</strong> dosing. An infusion already in flight runs to its scheduled end, and a pre-scheduled base regimen (#702) keeps dosing — <code>Stop</code> ends the controller’s augmentation, not the patient’s standing prescription.</td>
+</tr>
+<tr class="odd">
+<td><code>SetInterval { interval }</code></td>
+<td>Change the dosing interval from this decision on (#945); see <a href="#changing-the-dosing-interval">Changing the dosing interval</a>. Composes with one dose or <code>Hold</code>.</td>
+</tr>
+</tbody>
+</table>
+<p>A <code>Stop</code> must be the final action in a decision’s list; issuing work after a <code>Stop</code> is a typed error, not a silently dropped dose.</p>
+<section id="what-a-decision-reads" class="level3">
+<h3 class="anchored" data-anchor-id="what-a-decision-reads">What a decision reads</h3>
+<p>At a decision at time <code>t</code>, one data record supplies everything the controller reads: <code>ctx.covariates</code>, the PK parameters behind every monitored signal, and the bioavailability <code>F</code> of any dose it issues there. That record is the <strong>latest data record at or before <code>t</code></strong>: an observation, an EVID=2 row, a pre-scheduled dose row or an EVID=3/4 reset row. When several records share that time, the observation wins over an EVID=2 row, which wins over a dose row, which wins over a reset row. Among several rows of the same kind at that time, the one listed last in the file wins.</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 50%">
+<col style="width: 50%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Decision at <code>t</code></th>
+<th>Reads</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>before the subject’s first record</td>
+<td>the baseline covariates and the t = 0 parameters</td>
+</tr>
+<tr class="even">
+<td>after an observation, EVID=2 or dose row</td>
+<td>that row’s covariates and parameters</td>
+</tr>
+<tr class="odd">
+<td>after an EVID=3/4 reset, with no record in between</td>
+<td>the reset row’s covariates and parameters</td>
+</tr>
+<tr class="even">
+<td>on an IOV model</td>
+<td>the same record, under the κ of the decision’s own occasion</td>
+</tr>
+</tbody>
+</table>
+<p>A subject whose covariates never change reads the same values at every decision. Under IOV the state a decision reads can have been integrated under a different κ than the one the decision reads its parameters under: see <a href="#window-kappa">Which κ a decision window runs under</a>.</p>
+<p>The state a decision reads (<code>ctx.state</code>) follows the rule <code>predict()</code> uses: an interval is integrated under the record that ends it. A reset row is a record, so a decision between the last record and a later reset reads a state integrated under the reset row’s parameters. The reset then restarts the state, so this changes what the controller sees before the reset, not any prediction.</p>
+<p>A reset row’s own <code>$PK</code> is anchored to NONMEM (<code>reset_init_snapshot_J</code>). NONMEM has no feedback dosing, so the decision rule itself has no NONMEM counterpart. It is tested against <code>predict()</code> on the realized doses and against closed forms.</p>
+</section>
+<section id="window-kappa" class="level3">
+<h3 class="anchored" data-anchor-id="window-kappa">Which κ a decision window runs under</h3>
+<p>On an IOV model the driver draws one κ per decision. Occasion <code>g</code> starts at decision <code>g</code>, and a data record belongs to the occasion of the latest decision at or before its time. A record on a decision (within 1e-9) belongs to that decision’s occasion. A record before the first decision belongs to none and runs under κ = 0.</p>
+<p>Between records the driver applies the rule every ferx engine uses, which is also NONMEM’s: <strong>an interval runs under the record that ends it</strong> (see <a href="../model-file/iov.html#occasions">Occasions</a>). A decision time is not a record, and neither is a dose the controller issues, so neither ends an interval. Each piece of a window runs under the next record at or after its end, however many decisions later that record is. After the subject’s last record nothing is ahead, and each window runs under its own decision’s κ.</p>
+<p>So with a record on decision <code>g+1</code> and none inside the window, the window after decision <code>g</code> runs under the next occasion’s κ, not the decision’s own.</p>
+<p>With a dose at every decision, the clearance in force is:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 33%">
+<col style="width: 33%">
+<col style="width: 33%">
+</colgroup>
+<thead>
+<tr class="header">
+<th>Decisions at</th>
+<th>Data records at</th>
+<th>Clearance</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0, 24</td>
+<td>0, 24, 48</td>
+<td>κ₁ over (0, 24]</td>
+</tr>
+<tr class="even">
+<td>0, 24</td>
+<td>0, 12, 24</td>
+<td>κ₀ over (0, 12], κ₁ over (12, 24]</td>
+</tr>
+<tr class="odd">
+<td>0, 24</td>
+<td>0, 23, 47</td>
+<td>κ₀ over (0, 23], κ₁ over (23, 24], from the record at 47</td>
+</tr>
+<tr class="even">
+<td>0, 24</td>
+<td>0, 23, 24, 48</td>
+<td>the same as the row above</td>
+</tr>
+<tr class="odd">
+<td>0, 24, 48</td>
+<td>0, 12, 48</td>
+<td>κ₀ over (0, 12], κ₂ over (12, 48]</td>
+</tr>
+<tr class="even">
+<td>0, 24, 48, 72</td>
+<td>0, 72</td>
+<td>κ₃ over (0, 72]: κ₀, κ₁ and κ₂ never reach the disposition</td>
+</tr>
+<tr class="odd">
+<td>0, 24, 48</td>
+<td>0, 23</td>
+<td>κ₀ over (0, 24], κ₁ over (24, 48]: no record follows 23</td>
+</tr>
+</tbody>
+</table>
+<p>Each row is tested against the clearance backed out of the simulated concentrations (<code>a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece</code>, #2771). The first row is the layout the mrgsolve anchors use: day <code>g</code> on occasion <code>g+1</code> (#943).</p>
+</section>
+<section id="window-kappa-records" class="level3">
+<h3 class="anchored" data-anchor-id="window-kappa-records">Placing records under IOV</h3>
+<p><strong>To run a window under its own decision’s κ, put a record just before the next decision</strong> (23 for a decision at 24). The piece from that record to the decision still runs under the next record’s κ, so keep it short. A record on the decision itself may stay: with one just before it, it governs only that short piece. Leaving the decision without a record is not enough. A window with no record in it runs under whichever later record comes next.</p>
+<ul>
+<li>A record carries the covariates for the interval it ends, so a moved or added record changes where a time-varying covariate takes effect.</li>
+<li>If you move the record off the decision instead of adding one, there is no trajectory row at the decision time. The pre-dose value is still in the decision log (<code>observed_signals</code>), which is what the controller read.</li>
+</ul>
+<p><code>predict()</code> on the realized doses, with the same occasions, gives the same trajectory when, for each dosing decision, the first data record at or after it comes before the next decision. A dosing decision with no data record at or after it does not matter: no observation is left to show a difference. Otherwise the two can differ (<a href="https://github.com/FeRx-NLME/ferx-core/issues/2895">#2895</a>). In <code>predict()</code> the realized dose is a dose row, which is a record and ends an interval. In the adaptive run a controller dose is not. The run’s own replay check passes either way, because it shares the adaptive convention.</p>
+<p>With a dose at decisions 0, 24, 48 and 72 (<code>adaptive_equals_predict_iov_when_a_record_follows_each_dose_within_its_occasion</code>):</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Data records at</th>
+<th>Adaptive against <code>predict()</code></th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>0, 24, 48, 72</td>
+<td>equal</td>
+</tr>
+<tr class="even">
+<td>0, 23, 47, 71</td>
+<td>equal</td>
+</tr>
+<tr class="odd">
+<td>0, 23, 47</td>
+<td>equal</td>
+</tr>
+<tr class="even">
+<td>0, 12, 48, 72</td>
+<td>differs: the first record at or after 24 is at 48</td>
+</tr>
+<tr class="odd">
+<td>0, 72</td>
+<td>differs: the first record at or after 24 is at 72</td>
+</tr>
+</tbody>
+</table>
+<p>Some quantities are read at the decision, under the decision’s own κ (κ of occasion <code>g</code> at decision <code>g</code>), whatever κ the window’s disposition follows:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th>Quantity</th>
+<th>κ it reads</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>The parameters behind the monitored signal (a <code>V</code> in <code>observe = central / V</code>)</td>
+<td>the decision’s own</td>
+</tr>
+<tr class="even">
+<td>The bioavailability <code>F</code> of a dose the controller issues, and the infusion window <code>F</code> scales</td>
+<td>the decision’s own</td>
+</tr>
+<tr class="odd">
+<td>The lag check on a controller dose (a non-zero lag is refused, see <a href="#current-scope-and-limits">Current scope and limits</a>)</td>
+<td>the decision’s own</td>
+</tr>
+<tr class="even">
+<td>A <code>dose_knowledge = oracle</code> dose</td>
+<td>the first decision’s, κ₀ (<a href="#which-subjects-values-are-known">Which subjects’ values are known</a>)</td>
+</tr>
+<tr class="odd">
+<td>The <code>F</code> of a pre-scheduled base dose</td>
+<td>the occasion at the dose’s own time: κ = 0 before the first decision, and for an <code>ADDL</code>-implied dose the occasion of the record that governs it</td>
+</tr>
+</tbody>
+</table>
+<p>A controller infusion carries its own rate, so no modeled <code>D{n}</code> or <code>R{n}</code> is read for it.</p>
+</section>
+<section id="one-controller-per-subject" class="level3">
+<h3 class="anchored" data-anchor-id="one-controller-per-subject">One controller per subject</h3>
+<p><code>simulate_adaptive()</code> takes a <strong>factory</strong> (<code>Fn() -&gt; FnMut(...)</code>), not a single shared closure. A fresh controller is built for each <code>(subject, replicate)</code>. Real controllers carry per-subject state — a debounce counter, a windowed AUC, the current rung of a titration ladder — and a single shared closure would leak that state from one subject to the next. The factory makes the isolation structural: a stateless rule is just a factory whose closure ignores its environment.</p>
+</section>
+</section>
+<section id="changing-the-dosing-interval" class="level2">
+<h2 class="anchored" data-anchor-id="changing-the-dosing-interval">Changing the dosing interval</h2>
+<p>The decision schedule (<code>decision_times</code>) is a fixed <strong>review grid</strong>: the times at which a decision <em>may</em> be taken. A controller can change how often it doses without changing that grid (#945). It holds a current <strong>dosing interval</strong>, and a grid point is <strong>due</strong> once that interval has passed since the last decision the controller was consulted at. The controller is consulted only at due points.</p>
+<ul>
+<li><strong>Starting interval.</strong> <code>AdaptiveSimulateOptions::start_interval</code> sets the interval in force at the first decision. Left at <code>None</code> (the default), every grid point is due, which is the behaviour without this feature.</li>
+<li><strong>Changing it.</strong> <code>DoseAction::SetInterval { interval }</code> takes effect from the decision that issues it. On a q12 grid, lengthening from 24 to 36 at t = 24 makes the next due point t = 60. It composes with one dose or a <code>Hold</code>; two in one decision, or one together with <code>Stop</code>, is refused.</li>
+<li><strong>What counts as consulted.</strong> A dose, a <code>Hold</code> (or an empty action list) and an interval change all start the next interval: a hold at a due point consumes that slot.</li>
+<li><strong>The controller can read it.</strong> <code>ctx.interval</code> is the interval in force before the decision.</li>
+</ul>
+<section id="in-the-adaptive_dosing-block" class="level3">
+<h3 class="anchored" data-anchor-id="in-the-adaptive_dosing-block">In the <code>[adaptive_dosing]</code> block</h3>
+<p>The block declares the interval as a ladder, like <code>levels</code> for the dose, and its rules move along it:</p>
+<pre><code>[adaptive_dosing]
+  at             = every 12 from 0 to 336   # the review grid
+  intervals      = [12, 24, 36, 48]         # the interval ladder
+  start_interval = 24                       # in force from the first decision
+  when signal &gt; 20 : decrease 25%, lengthen
+  when signal &gt; 15 : lengthen
+  when signal &lt; 10 : shorten</code></pre>
+<p><code>lengthen</code> and <code>shorten</code> step one rung and saturate at both ends; a step at an end changes nothing. A rule with only an interval effect re-issues the running dose, and <code>hold, lengthen</code> skips the dose and lengthens. The <code>confirm</code> debounce gates both effects of a rule together, and its streak counts consulted decisions only, since the controller is not called at a not-due point. <code>intervals</code> and <code>start_interval</code> come together, and <code>lengthen</code> / <code>shorten</code> need both.</p>
+<p>On an <code>at = every S …</code> grid, every interval must be a whole multiple of <code>S</code>, or its due times would fall between review times; the parse error names the interval and the step. With an explicit <code>at</code> list that check is the run’s: an off-grid due time is refused as described under <a href="#grid-alignment">Grid alignment</a>. The block is the only source of the interval on <a href="https://docs.rs/ferx-core"><code>simulate_adaptive_from_spec()</code></a>: setting <code>opts.start_interval</code> there is refused (<code>E_ADAPTIVE_OPTIONS</code>), as for <code>opts.decision_times</code>.</p>
+</section>
+<section id="not-due-points" class="level3">
+<h3 class="anchored" data-anchor-id="not-due-points">Not-due points</h3>
+<p>At a grid point that is not due, the controller is not called and no dose is given, but the monitors are still read. The decision log records the point with the outcome <code>NotDue</code>, distinct from <code>Hold</code>, and with what the monitors read, so the signal summaries (<code>signal_min</code> / <code>signal_max</code> / <code>signal_mean</code>, <code>pct_time_in_window</code>) still cover every grid point. The metrics count these points as <code>n_not_due</code>, never as holds. Every decision-log row also carries the interval in force after it. <code>auc_target</code> windows stay the review-grid windows: with a q24 grid each window is a daily AUC, whatever the dosing interval.</p>
+<p>Data records never move the due clock. A pre-scheduled base dose (EVID=1), a reset (EVID=3) and a reset with a dose (EVID=4) are applied when they fall on a not-due point, and the controller is still not consulted there. A controller that wants to restart its interval after a reset can read <code>ctx.history</code> and issue <code>SetInterval</code>.</p>
+</section>
+<section id="grid-alignment" class="level3">
+<h3 class="anchored" data-anchor-id="grid-alignment">Grid alignment</h3>
+<p>Every due time must land on a grid point, or past the last one: a dose cannot be scheduled between two review times. An interval is checked once, where it is set: every due time it produces from there to the end of the grid is walked, since until it changes each due point is consulted exactly when it falls due. A <code>start_interval</code> that would send one off the grid is refused before any subject runs (<code>E_ADAPTIVE_OPTIONS</code>). A <code>SetInterval</code> that does is refused at the decision that issued it (<code>E_ADAPTIVE_CONTROLLER_ACTION</code>), never at a later decision that took no interval action, naming the subject, the decision, the due time and the two grid points it falls between. An interval too short to move past its own decision within the grid’s matching tolerance is refused the same way. A decision that stops schedules nothing and is never refused for its interval.</p>
+<p><strong>Known limit.</strong> Not-due points do not consult the controller, so a safety rule is not evaluated between doses; a toxicity check that must act between doses is tracked as a follow-up under #391 (#1592).</p>
+</section>
+</section>
+<section id="monitors" class="level2">
+<h2 class="anchored" data-anchor-id="monitors">Monitors</h2>
+<p>A controller reads named signals declared as <a href="https://docs.rs/ferx-core"><code>MonitorSpec</code></a>s. Each monitor observes a 1-based compartment/endpoint under an <a href="https://docs.rs/ferx-core"><code>ObserveMode</code></a>:</p>
+<ul>
+<li><code>Ipred</code> — the latent individual prediction (no measurement noise).</li>
+<li><code>Dv</code> — the realized, assay-noised measurement: <code>IPRED + ε·√(residual variance)</code>, clamped at 0, with the residual variance taken from the endpoint’s own <code>[error_model]</code>. This is the realistic TDM / titration signal — a clinician titrates on a <em>measured</em> value, not the latent truth. A residual-error magnitude applies, evaluated at the decision (<a href="../model-file/error-model.html#magnitude-adaptive">magnitudes and adaptive dosing</a>).</li>
+</ul>
+<p>Mode is chosen <strong>per monitor</strong>, so a PK exposure target can run on <code>Ipred</code> while a safety marker (e.g.&nbsp;ANC → CTCAE grade) runs on <code>Dv</code> in the same simulation.</p>
+<p>The engine — not the controller — resolves every monitor and draws any assay noise, on a dedicated <strong>controller-assay RNG substream</strong> keyed by <code>(subject, replicate, decision, analyte)</code>. That identity keying makes the assay draws (under a fixed <code>seed</code>):</p>
+<ul>
+<li><strong>deterministic</strong> — re-running reproduces them exactly;</li>
+<li><strong>permutation-invariant</strong> — a subject’s draws do not depend on iteration order;</li>
+<li><strong>non-perturbing</strong> — adding a monitor never shifts another monitor’s (or η’s) draws, so the frozen-replay verifier stays exact.</li>
+</ul>
+<p>A <code>Dv</code> monitor on a compartment with no <code>[error_model]</code> is a typed error (never a fabricated σ), and a noised reading below zero is clamped to 0 — but <strong>only on the default bare-state readout</strong>, where non-negativity is a physical property of the quantity. Since #1039 a Form C <code>[scaling] y = &lt;expr&gt;</code> readout is exempt: the expression may be legitimately signed (a change from baseline, a z-score, a difference from comparator), so its negative samples reach the controller unchanged, exactly as they do under <code>Ipred</code>. See <a href="../model-file/scaling.html#signed-readouts-since-1020">Scaling</a>. With <code>sigma → 0</code> a <code>Dv</code> monitor therefore reproduces the <code>Ipred</code> monitor sample for sample on a Form C readout, negative samples included; on the bare-state readout the floor still applies, so the two agree only where the latent value is non-negative.</p>
+<section id="monitors-and-trajectories-are-on-the-models-scale" class="level3">
+<h3 class="anchored" data-anchor-id="monitors-and-trajectories-are-on-the-models-scale">Monitors and trajectories are on the model’s scale</h3>
+<p>A monitor with no <code>observe</code> expression — every programmatic <a href="https://docs.rs/ferx-core"><code>MonitorSpec</code></a>, and the declarative block under <code>with_assay_error</code> — reads the model’s readout for its compartment <strong>including</strong> a Form A / Form B <code>[scaling]</code> divisor (<code>obs_scale = V</code>, <code>obs_scale[CMT=n] = …</code>), the same value an observation on that compartment reports in <code>predict()</code> / <code>simulate()</code>. A <code>Dv</code> monitor draws its σ on that scaled value, and the <code>auc_target</code> exposure metric integrates it. The trajectory rows carry the same divisor, so a controller that holds reproduces <code>simulate()</code> row for row. An <code>observe</code> expression names its own signal and is never divided again: under <code>obs_scale = V</code>, <code>observe = central / V</code> is the concentration.</p>
+<p>The divisor is the one <code>predict()</code> uses: evaluated per subject at the baseline covariates, and — under IOV — with the κ of the decision window the reading falls in. Before #2129 the adaptive path skipped Forms A and B entirely: every trajectory row and every observe-less signal came back as the bare amount (×<code>V</code> for <code>obs_scale = V</code>), so a controller titrated against a value <code>V</code> times too high, with no warning. Form C (<code>y = central / V</code>) was always honoured.</p>
+<p>A log-transformed error model — <code>log(DV) ~ additive(…)</code> / <code>DV ~ log_additive(…)</code> (LTBS) — is refused (<code>E_ADAPTIVE_UNSUPPORTED</code>). <code>simulate()</code> reports such a model’s predictions as <code>ln(IPRED)</code>, but the reactive driver reads, noises and returns the linear readout, so its trajectories and a <code>Dv</code> signal would not be on the model’s scale.</p>
+</section>
+</section>
+<section id="example" class="level2">
+<h2 class="anchored" data-anchor-id="example">Example</h2>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb11"><pre class="sourceCode rust code-with-copy"><code class="sourceCode rust"><span id="cb11-1"><a href="#cb11-1" aria-hidden="true" tabindex="-1"></a><span class="kw">use</span> <span class="pp">ferx_core::</span><span class="op">{</span></span>
+<span id="cb11-2"><a href="#cb11-2" aria-hidden="true" tabindex="-1"></a>    simulate_adaptive<span class="op">,</span> AdaptiveSimulateOptions<span class="op">,</span> ControllerCtx<span class="op">,</span> DoseAction<span class="op">,</span> MonitorSpec<span class="op">,</span> ObserveMode<span class="op">,</span></span>
+<span id="cb11-3"><a href="#cb11-3" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb11-4"><a href="#cb11-4" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-5"><a href="#cb11-5" aria-hidden="true" tabindex="-1"></a><span class="co">// `#[non_exhaustive]`: start from `default()` (verify = true,</span></span>
+<span id="cb11-6"><a href="#cb11-6" aria-hidden="true" tabindex="-1"></a><span class="co">// max_decisions = 10_000) and set fields.</span></span>
+<span id="cb11-7"><a href="#cb11-7" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> <span class="kw">mut</span> opts <span class="op">=</span> <span class="pp">AdaptiveSimulateOptions::</span><span class="kw">default</span>()<span class="op">;</span></span>
+<span id="cb11-8"><a href="#cb11-8" aria-hidden="true" tabindex="-1"></a>opts<span class="op">.</span>seed <span class="op">=</span> <span class="cn">Some</span>(<span class="dv">42</span>)<span class="op">;</span></span>
+<span id="cb11-9"><a href="#cb11-9" aria-hidden="true" tabindex="-1"></a>opts<span class="op">.</span>decision_times <span class="op">=</span> <span class="pp">vec!</span>[<span class="dv">0.0</span><span class="op">,</span> <span class="dv">24.0</span><span class="op">,</span> <span class="dv">48.0</span><span class="op">,</span> <span class="dv">72.0</span><span class="op">,</span> <span class="dv">96.0</span>]<span class="op">;</span></span>
+<span id="cb11-10"><a href="#cb11-10" aria-hidden="true" tabindex="-1"></a><span class="co">// Titrate on the noisy assay (DV), as in real TDM. Use `ObserveMode::Ipred`</span></span>
+<span id="cb11-11"><a href="#cb11-11" aria-hidden="true" tabindex="-1"></a><span class="co">// to titrate on the latent prediction instead.</span></span>
+<span id="cb11-12"><a href="#cb11-12" aria-hidden="true" tabindex="-1"></a>opts<span class="op">.</span>monitors <span class="op">=</span> <span class="pp">vec!</span>[<span class="pp">MonitorSpec::</span>new(<span class="st">"CONC"</span><span class="op">,</span> <span class="dv">1</span><span class="op">,</span> <span class="pp">ObserveMode::</span>Dv)]<span class="op">;</span></span>
+<span id="cb11-13"><a href="#cb11-13" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-14"><a href="#cb11-14" aria-hidden="true" tabindex="-1"></a><span class="co">// A fresh controller per subject: titrate a trough toward the [10, 20] window.</span></span>
+<span id="cb11-15"><a href="#cb11-15" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> make_controller <span class="op">=</span> <span class="op">||</span> <span class="op">{</span></span>
+<span id="cb11-16"><a href="#cb11-16" aria-hidden="true" tabindex="-1"></a>    <span class="kw">move</span> <span class="op">|</span>ctx<span class="op">:</span> <span class="op">&amp;</span>ControllerCtx<span class="op">|</span> <span class="cf">match</span> ctx<span class="op">.</span>signal(<span class="st">"CONC"</span>) <span class="op">{</span></span>
+<span id="cb11-17"><a href="#cb11-17" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Some</span>(c) <span class="cf">if</span> c <span class="op">&lt;</span> <span class="dv">10.0</span> <span class="op">=&gt;</span> <span class="pp">vec!</span>[<span class="pp">DoseAction::</span>Bolus <span class="op">{</span> amt<span class="op">:</span> <span class="dv">150.0</span><span class="op">,</span> cmt<span class="op">:</span> <span class="dv">1</span> <span class="op">}</span>]<span class="op">,</span></span>
+<span id="cb11-18"><a href="#cb11-18" aria-hidden="true" tabindex="-1"></a>        <span class="cn">Some</span>(c) <span class="cf">if</span> c <span class="op">&gt;</span> <span class="dv">20.0</span> <span class="op">=&gt;</span> <span class="pp">vec!</span>[<span class="pp">DoseAction::</span>Hold]<span class="op">,</span></span>
+<span id="cb11-19"><a href="#cb11-19" aria-hidden="true" tabindex="-1"></a>        _ <span class="op">=&gt;</span> <span class="pp">vec!</span>[<span class="pp">DoseAction::</span>Bolus <span class="op">{</span> amt<span class="op">:</span> <span class="dv">100.0</span><span class="op">,</span> cmt<span class="op">:</span> <span class="dv">1</span> <span class="op">}</span>]<span class="op">,</span></span>
+<span id="cb11-20"><a href="#cb11-20" aria-hidden="true" tabindex="-1"></a>    <span class="op">}</span></span>
+<span id="cb11-21"><a href="#cb11-21" aria-hidden="true" tabindex="-1"></a><span class="op">};</span></span>
+<span id="cb11-22"><a href="#cb11-22" aria-hidden="true" tabindex="-1"></a></span>
+<span id="cb11-23"><a href="#cb11-23" aria-hidden="true" tabindex="-1"></a><span class="kw">let</span> result <span class="op">=</span> simulate_adaptive(<span class="op">&amp;</span>model<span class="op">,</span> <span class="op">&amp;</span>population<span class="op">,</span> <span class="op">&amp;</span>params<span class="op">,</span> <span class="dv">100</span><span class="op">,</span> make_controller<span class="op">,</span> <span class="op">&amp;</span>opts)<span class="op">?;</span></span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The result bundles four tidy, long-form artifacts — each tagged by <code>(draw, sim, id)</code> so they join cleanly:</p>
+<ul>
+<li><code>trajectories</code> — per-observation predictions (<code>Vec&lt;SimulationResult&gt;</code>).</li>
+<li><code>ledger</code> — every realized dose, with provenance (the decision that produced it, observed signals, applied bioavailability).</li>
+<li><code>decisions</code> — one row per decision <strong>including holds</strong>, so non-events are on the record rather than inferred from gaps in the ledger.</li>
+<li><code>metrics</code> — one per-subject <code>AdaptiveSubjectMetrics</code> row per realized run: cumulative dose, dose-increase / -decrease / hold / discontinuation counts, time-to-discontinuation, the observed-signal summary (min / max / mean), <code>pct_time_in_window</code> when the block declares a <code>target_window</code>, and <code>auc_target_attainment</code> when it declares an <code>auc_target</code>. The point fields are derived from <code>ledger</code> + <code>decisions</code> alone, so they are auditable against those rows (no re-integration). Increases / decreases are counted by realized dose change, not by which rule fired — a <code>decrease</code> clamped at the lower bound re-issues the same dose and is not counted. The signal summary is over the troughs/peaks the controller saw at the decision times (a decision-grid summary, not a dense-trajectory extremum). <code>auc_target_attainment</code> is the one integrated-exposure field: the fraction of inter-decision windows whose area under the monitored signal falls in the <code>auc_target</code> band. The driver integrates it on the run’s own trajectory: a 128-panel trapezoid per window read off the solver’s accepted steps, plus a node on each side of every dose, reset or infusion end inside the window — and, under a time-varying covariate, <code>TIME</code> in the PK or IOV, every data record, where the PK snapshot changes — so a discontinuity integrates exactly; each segment is read under the PK, κ and covariate row of the record that governs it (the <code>[scaling]</code> divisor keeps the baseline covariates, as <code>simulate()</code> does). Requesting it leaves the run bit-identical (#943). It is scored over the windows between <strong>realized</strong> decisions, so if a run discontinues (a <code>Stop</code>) the later, dose-free scheduled windows are not counted — discontinuation is already its own metric, and folding it in here too would double-count it; this keeps <code>auc_target_attainment</code> on the same realized basis as <code>pct_time_in_window</code>. Population summaries <strong>with uncertainty bands</strong> ride with the uncertainty slice, where bands carry meaning.</li>
+</ul>
+</section>
+<section id="verification-on-by-default" class="level2">
+<h2 class="anchored" data-anchor-id="verification-on-by-default">Verification (on by default)</h2>
+<p>Adaptive dosing is bookkeeping-heavy (event ordering, bioavailability/lag, segment carry-over). <code>simulate_adaptive()</code> runs a <strong>frozen-schedule replay verifier</strong> after every run (<code>verify = true</code>): it rebuilds a static subject from the realized dose ledger, re-integrates it through the trusted static engine, and checks the reactive trajectory against it. Because the reactive driver and the static engine are different code, agreement proves the driver applied every dose identically to the static engine. A divergence is a typed error that taints the result — never a silent wrong number.</p>
+<p>The replay reproduces the reactive driver’s <em>segment structure</em> — the driver restarts the integrator at every decision time (holds included), so the replay feeds those same decision times back in as no-op breaks. It builds the rest of that structure — a dose’s lag-shifted arrival, an infusion’s bioavailability-scaled end, a per-route absorption onset, and a <code>zero_order()</code> window’s <strong>two</strong> edges — through the <em>same</em> break-time builder the driver folds its pre-scheduled base regimen in with, rather than a second copy of the rule (#1188). That matters because a <code>zero_order()</code> window’s constant rate is only applied to a segment the window fully contains: a builder that failed to break at an edge would drop the rate for every segment straddling it, and the replay would then report a dose-bookkeeping mismatch that was its own artifact. One builder, so the two sides of the oracle cannot segment the timeline differently. Both engines then walk the same segments through the same integrator, so the comparison sits at the solver’s true round-off floor (a small multiple of its error control) rather than a wide held-decision slack. A real bookkeeping bug — a dropped dose, wrong compartment, double-applied bioavailability — moves a prediction by orders of magnitude more, so the tight check still catches it without ever false-positiving on a legitimate run.</p>
+<p>On the time-varying-covariate and IOV paths the driver and the replay share precomputed per-event / per-occasion PK snapshots, so replay agreement alone would only prove the two <em>consumed</em> them identically — not that the snapshots were built correctly. The verifier therefore also <strong>independently re-derives</strong> each snapshot (the per-occasion <code>kappa</code>, the per-decision PK at the decision’s covariate, the per-record PK) from the run’s primitives and bit-checks it against what the driver used, so a mis-resolved covariate or occasion fails loudly rather than being applied by both sides and slipping through unnoticed (#748). Which record a decision reads (<a href="#what-a-decision-reads">What a decision reads</a>) is checked the same way: the verifier works it out again from the subject’s data rows with code of its own, and fails the run if the driver read a different row (#1599).</p>
+</section>
+<section id="validation" class="level2">
+<h2 class="anchored" data-anchor-id="validation">Validation</h2>
+<p>NONMEM has <strong>no native feedback dosing</strong>, so there is no equivalent NONMEM run to anchor against — the standard NONMEM comparison does not apply to this feature family. It is validated instead by:</p>
+<ul>
+<li>a <strong>degenerate oracle</strong> — a controller that re-emits a fixed regimen reproduces a plain simulation of that regimen, bit-for-bit;</li>
+<li>the <strong>frozen-schedule replay</strong> verifier above (an exact internal bookkeeping anchor);</li>
+<li>the <strong>three-witnesses</strong> check — a declarative <code>[adaptive_dosing]</code> block and a hand-written controller closure with the identical ladder realize the identical ledger, decision log, and trajectory, byte-for-byte (so the block compiles to exactly the engine the programmatic API exercises);</li>
+<li>a <strong>closed-loop</strong> check — a titration that starts below its target band drives the trough into the band and holds it there;</li>
+<li>for genuinely reactive behaviour, reproduction of external <strong>mrgsolve</strong> dynamic-dosing runs (the apples-to-apples external comparator, since mrgsolve does do feedback dosing) — one for each titration mode: the discrete <code>levels</code> ladder, in <a href="#the-platelet-ladder-anchor">The platelet-ladder anchor</a>, and continuous (percentage) titration plus the AUC-exposure metric, in <a href="#the-vancomycin-auc-tdm-anchor">The vancomycin AUC-TDM anchor</a>; and schedule adaptation (#945), in <a href="#the-vancomycin-interval-extension-anchor">The vancomycin interval-extension anchor</a>.</li>
+</ul>
+<p>Schedule adaptation has one more internal oracle: a state-independent controller on a lengthened interval equals the static engine on the realized doses plus a zero-amount dose at every not-due grid point, bit for bit. The zero doses give the static engine the same segment breaks, and unlike the frozen replay this shares no code with the driver’s break builder.</p>
+<section id="the-platelet-ladder-anchor" class="level3">
+<h3 class="anchored" data-anchor-id="the-platelet-ladder-anchor">The platelet-ladder anchor</h3>
+<p>The <code>levels</code> ladder is cross-checked against <strong>mrgsolve 1.7.2</strong> on an oncology dose-modification scenario — a Friberg semi-mechanistic myelosuppression model (Friberg et al., <em>J Clin Oncol</em> 2002) driven by a 1-compartment IV drug. Circulating platelets are read at the start of each weekly cycle; the dose steps down a discrete ladder (100 → 75 → 50 → 25 mg) on thrombocytopenia, with a severe floor that stops treatment. ferx (RK45) and mrgsolve (LSODA) integrate the identical ODE system and an R loop mirrors the controller semantics exactly, so the two engines must reach the same decisions. Under the top dose the platelets fall, the controller de-escalates two levels (100 → 75 → 50 mg), and platelets recover and hold:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th style="text-align: right;">Cycle</th>
+<th style="text-align: right;">Platelet (×10⁹/L)</th>
+<th style="text-align: right;">Dose (mg)</th>
+<th style="text-align: left;">Action</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">250.0</td>
+<td style="text-align: right;">100</td>
+<td style="text-align: left;">start</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">169.6</td>
+<td style="text-align: right;">100</td>
+<td style="text-align: left;">continue</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">94.3</td>
+<td style="text-align: right;">75</td>
+<td style="text-align: left;"><strong>decrease</strong></td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">98.7</td>
+<td style="text-align: right;">50</td>
+<td style="text-align: left;"><strong>decrease</strong></td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">151.3</td>
+<td style="text-align: right;">50</td>
+<td style="text-align: left;">continue</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">5–9</td>
+<td style="text-align: right;">158–179</td>
+<td style="text-align: right;">50</td>
+<td style="text-align: left;">continue</td>
+</tr>
+</tbody>
+</table>
+<p>ferx reproduces every dose <strong>exactly</strong> and every platelet value to &lt; 0.01 ×10⁹/L — a cross-solver difference ~3 × 10⁻⁵ relative, far below the ~25-unit margin from each decision to its rule threshold, so every dose decision is robust. The model is <code>examples/adaptive_platelet_ladder.ferx</code>; the mrgsolve model, R driver, and frozen output live in <code>tests/reference/platelet_mrgsolve/</code>, exercised on every PR by <code>tests/adaptive_platelet_anchor.rs</code>.</p>
+</section>
+<section id="the-vancomycin-auc-tdm-anchor" class="level3">
+<h3 class="anchored" data-anchor-id="the-vancomycin-auc-tdm-anchor">The vancomycin AUC-TDM anchor</h3>
+<p>Continuous (percentage) titration <strong>and</strong> the <code>auc_target</code> exposure metric are cross-checked against <strong>mrgsolve 2.0.1</strong> on a vancomycin TDM scenario — a 1-compartment IV model dosed once daily by a 1-h infusion. At the start of each day the controller reads the pre-dose trough and titrates the dose ±25 % to hold the trough in <code>[10, 15]</code> mg/L (the control law), while the <em>reported</em> outcome is AUC₂₄ attainment against the guideline band <code>[400, 600]</code> mg·h/L — the real trough-vs-AUC vancomycin tension, where dosing follows a single timed level but efficacy is judged on the daily exposure. The empiric start is subtherapeutic, so the dose climbs (seven 25 % steps) and holds once the trough enters the band:</p>
+<table class="caption-top table">
+<thead>
+<tr class="header">
+<th style="text-align: right;">Day</th>
+<th style="text-align: right;">Trough (mg/L)</th>
+<th style="text-align: right;">Dose (mg)</th>
+<th style="text-align: right;">AUC₂₄ (mg·h/L)</th>
+<th style="text-align: center;">On AUC target</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0.0</td>
+<td style="text-align: right;">625</td>
+<td style="text-align: right;">108</td>
+<td style="text-align: center;">no</td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">6.2</td>
+<td style="text-align: right;">1526</td>
+<td style="text-align: right;">350</td>
+<td style="text-align: center;">no</td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">5</td>
+<td style="text-align: right;">7.8</td>
+<td style="text-align: right;">1907</td>
+<td style="text-align: right;">438</td>
+<td style="text-align: center;"><strong>yes</strong></td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">9.7</td>
+<td style="text-align: right;">2384</td>
+<td style="text-align: right;">548</td>
+<td style="text-align: center;"><strong>yes</strong></td>
+</tr>
+<tr class="odd">
+<td style="text-align: right;">7</td>
+<td style="text-align: right;">12.1</td>
+<td style="text-align: right;">2384</td>
+<td style="text-align: right;">581</td>
+<td style="text-align: center;"><strong>yes</strong></td>
+</tr>
+<tr class="even">
+<td style="text-align: right;">8–12</td>
+<td style="text-align: right;">12.9–13.2</td>
+<td style="text-align: right;">2384</td>
+<td style="text-align: right;">592–596</td>
+<td style="text-align: center;"><strong>yes</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The anchor runs at a supplied η = 0, the typical-value patient mrgsolve simulates; the model’s <code>omega ~ 1e-10</code> would otherwise draw an η of order 1e-5 on CL and offset every trough one-sidedly. ferx then reproduces every dose <strong>exactly</strong> (the titration is exact <code>f64</code> arithmetic shared with the R loop), every trough to within 5e-9 mg/L, and the AUC-target attainment fraction (<strong>8 of 13 daily windows</strong>) exactly. The worst trough gap, 1.0e-9 mg/L, is the mrgsolve table’s own error: against the exact one-compartment closed form, ferx’s troughs sit on it and the frozen LSODA values carry the whole gap. ferx integrates the daily exposure by a 128-panel trapezoid per window while mrgsolve uses an AUC compartment; the two agree to within 2.8e-6 relative on every one of the 13 daily AUC₂₄ values (all of it the trapezoid’s own error), which the anchor asserts window by window, far inside the margin from each AUC₂₄ to the band edges, so the in/out classification — hence attainment — is identical. (The exact AUC accuracy is pinned separately by analytic unit tests against closed forms, including a bolus and a reset inside a window.) The model is <code>examples/adaptive_vanco_auc.ferx</code>; the mrgsolve model, R driver, and frozen output live in <code>tests/reference/vanco_mrgsolve/</code>, exercised on every PR by <code>tests/adaptive_vanco_anchor.rs</code>.</p>
+</section>
+<section id="the-vancomycin-interval-extension-anchor" class="level3">
+<h3 class="anchored" data-anchor-id="the-vancomycin-interval-extension-anchor">The vancomycin interval-extension anchor</h3>
+<p>Schedule adaptation is cross-checked against <strong>mrgsolve</strong> on a 1-compartment IV vancomycin model with a fixed 1000 mg 1-h infusion and clearance scaled by a per-subject renal fraction. The review grid is every 12 h, and the controller moves the dosing interval on the ladder 12 / 24 / 36 / 48 h: at a due point it holds and lengthens above a trough of 25 mg/L, doses and lengthens above 14, doses and shortens below 9, and otherwise doses. The mrgsolve R loop applies the same due mask. Of the two subjects, one climbs to the top rung and holds there, and the other lengthens, shortens and lengthens again; both saturate at the bottom rung at the first decision. Every consulted trough is at least 0.13 mg/L from its nearest threshold, so the outcome (dosed / hold / not due) and the interval at every one of the 50 grid points match mrgsolve exactly, and the troughs agree within the cross-solver band. Each subject runs at a supplied η = 0, the typical-value patient mrgsolve simulates: the model’s <code>omega ~ 1e-10</code> would otherwise draw an η large enough to show as a one-sided trough drift. The kit lives in <code>tests/reference/vanco_interval_mrgsolve/</code>, exercised on every PR by <code>tests/adaptive_vanco_interval_anchor.rs</code>. The same controller written as an <code>[adaptive_dosing]</code> block (<code>intervals = [12, 24, 36, 48]</code>, <code>hold, lengthen</code>, <code>lengthen</code>, <code>shorten</code>) reproduces the programmatic run bit for bit: ledger, decision log and trajectories.</p>
+</section>
+<section id="the-weight-based-mgkg-vancomycin-anchor" class="level3">
+<h3 class="anchored" data-anchor-id="the-weight-based-mgkg-vancomycin-anchor">The weight-based (mg/kg) vancomycin anchor</h3>
+<p>Dose expressions are cross-checked against <strong>mrgsolve</strong> on a 1-compartment IV vancomycin model whose clearance and volume both scale with weight (<code>examples/adaptive_vanco_mgkg.ferx</code>). One block doses every patient by weight: <code>start_dose = 15 * WT</code> and <code>dose_bounds = [0, min(30 * WT, 4000)]</code>, with ±25% steps on the second consecutive breach of a 15–25 mg/L trough band. The R loop computes each subject’s start dose and bounds from its own weight. The 50 kg patient starts at 750 mg and is capped at 30 mg/kg (1500 mg); the 150 kg patient starts at 2250 mg and is capped at 4000 mg, below its 30 mg/kg, so the <code>min</code> binds for that patient only and the two ledgers part again at t = 60 h. At the cap an increase is absorbed: the rule fires and the dose stays. Every dose matches mrgsolve exactly, and the troughs agree within the cross-solver band at a supplied η = 0. The kit lives in <code>tests/reference/vanco_mgkg_mrgsolve/</code>, exercised on every PR by <code>tests/adaptive_vanco_mgkg_anchor.rs</code>. Beside it, a constant expression (<code>25 * WT</code> at <code>WT = 40</code>) reproduces the literal block (<code>1000</code>) bit for bit, and a block whose rules never fire matches <code>predict()</code> on each subject’s frozen weight-based regimen.</p>
+</section>
+<section id="the-rounded-dose-vancomycin-anchor" class="level3">
+<h3 class="anchored" data-anchor-id="the-rounded-dose-vancomycin-anchor">The rounded-dose vancomycin anchor</h3>
+<p><code>round_to</code> is cross-checked against the same mrgsolve kit, in a second arm (<code>examples/adaptive_vanco_mgkg_rounded.ferx</code>, <code>expected_round_to.md</code>): the same model and rules with <code>round_to = 250</code> and <code>dose_bounds = [250, min(30 * WT, 4000)]</code>, on a 40 kg and an 80 kg patient. The R loop rounds with the same rule (nearest multiple, ties up, then clamp to the multiples inside the bounds, then carry). Between them the two patients exercise each part of it: the 40 kg start dose of 600 mg is given as 500 mg; a tie goes up (625 → 750 at 40 kg, 1875 → 2000 at 80 kg); the 30 mg/kg cap needs aligning (1200 → 1000, 2400 → 2250), where clamping before rounding would give a dose above the cap; and the 40 kg patient’s second step starts from the carried 750 mg and gives 1000 mg, where the unrounded 625 mg would give 750 mg. Every dose matches mrgsolve exactly, and the troughs agree within the same cross-solver band. Beside it, every shipped adaptive example runs bit-identically with and without this feature in the engine when <code>round_to</code> is absent, and a <code>round_to</code> whose grid already holds every dose the controller would set reproduces the run without it.</p>
+</section>
+</section>
+<section id="model-time-in-a-reactive-run" class="level2">
+<h2 class="anchored" data-anchor-id="model-time-in-a-reactive-run">Model time in a reactive run</h2>
+<section id="decision-times-after-a-moved-reset" class="level3">
+<h3 class="anchored" data-anchor-id="decision-times-after-a-moved-reset">Decision times after a moved reset</h3>
+<p>Decision times are on the engine clock. The data reader moves a reset written at or before the end of a running infusion or <code>ADDL</code> train, or at the <code>TIME</code> of the record before it, to just past that point, and every later row moves with it (#1609). A decision time names the moved clock, so a decision written after such a reset can run before it, and the reset then removes the dose that decision issued.</p>
+<p>When that happens, the run’s <code>warnings</code> carry <code>W_ADAPTIVE_DECISION_BEFORE_MOVED_RESET</code> (#2559). It names the subject, the decision times, the reset’s written and engine times, and the shift to add to the decision times between that reset and the next one. An infusion of 600 at rate 20 from 0 with <code>EVID=3</code> at 18 runs to 30, so the reset runs at 31, and a decision written at 24 is flagged with a shift of 13.</p>
+<p>A reset whose <code>TIME</code> goes back (a restarting period) is not checked, and neither is any reset after it. A written decision time is ambiguous there, since that <code>TIME</code> exists in both periods, so write every decision from that period onward on the engine clock.</p>
+</section>
+<section id="where-a-reactive-run-starts" class="level3">
+<h3 class="anchored" data-anchor-id="where-a-reactive-run-starts">Where a reactive run starts</h3>
+<p>A reactive run starts where <code>predict()</code> starts on the same realized schedule: at the subject’s <strong>first record</strong> (observation, PK-only row, base dose or reset) or at the controller’s first realized dose, whichever is earlier — NONMEM’s first-record convention. Before that origin the state is its <code>init(...)</code> value and does not evolve, so a decision placed earlier reads the <code>init</code> state. A dataset whose first record is at t = 6 is not integrated over a phantom <code>[0, 6]</code> window.</p>
+<p>A dose the controller gives at such an earlier decision moves the origin to that decision. The <code>init(...)</code> value is still computed from the first <em>data</em> record’s covariates, because a controller dose has no row of its own. Running the same regimen through NONMEM, with the controller’s doses written as dose rows carrying the first record’s covariates, gives the same predictions (<code>nonmem_anchor/adaptive_prestart_decision</code>). The <a href="#verification-on-by-default">verifier</a> starts its replay at the same origin. Up to #2125 it refused a run whose first decision came before the first record without a dose there: it started integrating at that decision instead.</p>
+</section>
+<section id="compartment-onoff-records" class="level3">
+<h3 class="anchored" data-anchor-id="compartment-onoff-records">Compartment on/off records</h3>
+<p>A reactive run honours <code>EVID=2</code> rows that turn a compartment off (<code>CMT=-N</code>) and back on (<code>CMT=N</code>), with the rules of <a href="../data-format.html#compartment-onoff-evid2-cmt-n">Compartment on/off</a> on the static path (#2753). Four points are specific to a controller:</p>
+<ul>
+<li><strong>A decision at the same time as an on/off row comes after it.</strong> The monitors read the state the row leaves, and a dose decided there is a record after the row: it lands. This is the order of a reset and a decision, and the order the reader gives a dose row written after the off row. One exception follows file order: a row written <em>after</em> a dose row at the same <code>TIME</code> takes effect after that dose, and a decision reads before the doses at its time, so a decision there comes before the row. Its monitors read the amount, and a dose it gives into that compartment is wiped by the row. Write the row before the dose row, or give it its own <code>TIME</code>, to have the decision see it.</li>
+<li><strong>A controller dose into an off compartment turns it on</strong> when it arrives, as a recorded dose does. A controller infusion running when an off row on its compartment arrives stops there and does not resume when the compartment comes back.</li>
+<li><strong>A monitor on an off compartment reads 0</strong>, the amount held there. The static path refuses an observation row of an off compartment (<code>E_OBS_CMT_OFF</code>), but a monitor is not a data record. A <code>Dv</code> monitor there under a proportional error model reads a draw of σ = 1e-6 around 0, possibly negative. That σ is the floor the residual-error variance is held at to keep the likelihood finite, not a modelled assay error, so a controller should not treat the reading as an assay result.</li>
+<li><strong><code>E_OBS_CMT_OFF</code> is checked on the data alone.</strong> An observation row of a compartment that only a controller dose would turn back on is still refused. Write an <code>EVID=2</code> on row before it.</li>
+</ul>
+<p>The <a href="#verification-on-by-default">verifier</a> replays the rows on the realized schedule, and the window AUC of an <code>auc_target</code> integrates the held zero over an off interval.</p>
+</section>
+<section id="dose-clocks-before-the-first-dose" class="level3">
+<h3 class="anchored" data-anchor-id="dose-clocks-before-the-first-dose">Dose clocks before the first dose</h3>
+<p>A <code>[odes]</code> RHS may read the dose clocks <code>TAD</code> (time since the last dose) and <code>TAFD</code> (time after the first dose) — a natural shape for a PD controller, where time since the last dose drives an effect compartment. Both are supported reactively and match <code>predict()</code> on the realized schedule.</p>
+<p>They are anchored <strong>at a dose</strong>, which is the one thing a reactive run does not know in advance. Before the controller’s first dose — and with no pre-scheduled base regimen to anchor them — <code>TAD</code> and <code>TAFD</code> have no referent at all. Where the record <em>does</em> contain a dose, <code>predict()</code> fills that window by looking ahead to the first one, which is a peek a causal simulation has not earned: that dose has not been decided yet, and may never be. (On a record with no dose anywhere, <code>predict()</code> has no anchor either and returns <code>NaN</code> in that window too.)</p>
+<p>So <code>simulate_adaptive()</code> <strong>refuses the window with a typed error</strong> rather than hand you an unanchored trajectory. The message names the segment, the spelling that is unanchored (<code>TAD</code> or <code>TAFD</code>), and the two fixes:</p>
+<ul>
+<li>give the subject a <strong>pre-scheduled base regimen</strong> — base dose times <em>are</em> known up front, so they anchor the window exactly as <code>predict()</code> does; or</li>
+<li>have the controller <strong>dose at a decision at or before the subject’s first record</strong>, so no segment is integrated before the first dose.</li>
+</ul>
+<p>Neither fix helps a controller that <em>never</em> doses: such a run has no anchor at any point. A window whose clock read made the state non-finite is still refused, and the message says so. A window whose state stayed finite runs, since <code>predict()</code> on that record has no anchor either and takes the same branch.</p>
+<p>The refusal covers the whole pre-dose window, not only the observations inside it: what an unanchored clock does to the derivative is integrated into the <strong>state</strong> — as a <code>NaN</code>, or as the wrong branch — so a read taken later, even after the first dose has landed, would inherit it.</p>
+<section id="how-the-check-decides" class="level4">
+<h4 class="anchored" data-anchor-id="how-the-check-decides">How the check decides</h4>
+<p>It is gated on what the clock does, not on the text of your model. The check asks whether the right-hand side’s derivative over a pre-dose window depends on the missing anchor. It evaluates the <code>[odes]</code> right-hand side at 17 evenly spaced times across the window, once as the window ran and once with the clock anchored, and refuses only if some derivative differs. Nothing is re-solved. Which states it reads, and which anchor it uses, depend on how the window ended:</p>
+<ul>
+<li><strong>The state went non-finite.</strong> The window is judged at once, so when the clock’s missing value is what made the state diverge, the refusal names the clock rather than the diverged state the next decision would see. The check reads the state the window started from and the one it ended at (each only when every compartment in it is finite) at every sample time, and anchors the clock at the window’s end. That is the earliest anchor a schedule can give.</li>
+<li><strong>The state stayed finite.</strong> The window is held until the controller gives the run’s first dose, and is judged then, with the clock anchored at that dose. This is the anchor <code>predict()</code> gives the window on the realized schedule. The check reads the state the run actually had at each sample time, interpolated within the solver’s steps. The refusal arrives at that dose and names its time. If the controller never doses, nothing is judged.</li>
+</ul>
+<p>That covers both ways a clock gets in:</p>
+<ul>
+<li>through <strong>arithmetic</strong>, as in <code>(1 + KT * TAD)</code>: the <code>NaN</code> reaches the state and the message says the segment “integrated to a non-finite state”;</li>
+<li>through a <strong>comparison</strong> — <code>if (TAD &lt; 5)</code>, <code>min(TAD, 24)</code>, <code>min(TAD, 0)</code>: an ordering comparison against the unanchored clock is false, so the window silently takes one branch and the state stays finite, but the answer depends on which way the comparison fell. The message says the derivative changes when the clock is anchored.</li>
+</ul>
+<p>A comparison that only switches for a <em>positive</em> clock — <code>if (TAD &gt; 5)</code>, <code>max(TAD, 0)</code> — is not refused, and needs no refusal: the unanchored clock takes the same branch that every clock a schedule can give the window takes, so the run already matches <code>predict()</code>.</p>
+<p>A <code>TAD</code> that appears in a branch the pre-dose window does not take, or only in a condition on an empty compartment (where every branch gives the same zero derivative), is left alone. So is a compartment that diverges for its own reasons on a model that merely mentions <code>TAD</code> somewhere — it is not refused, and not blamed on the clock. A RHS that reads only <code>TIME</code> / <code>T</code> is unaffected in every case, since that clock is the integration axis and is anchored everywhere.</p>
+<p>Not being refused by this check is not the same as being accepted. A model whose <em>other</em> compartment has run away is caught elsewhere, and named for what it is:</p>
+<ul>
+<li>every prediction past the point where a state went non-finite is <code>NaN</code>, never a frozen last value;</li>
+<li>the solver warning says a state became non-finite, rather than blaming stiffness or the step budget;</li>
+<li>a decision taken on a non-finite state is refused, naming the compartments that diverged, before the controller sees it;</li>
+<li>the frozen-schedule replay verifier refuses to certify <code>NaN</code> predictions as agreement.</li>
+</ul>
+</section>
+<section id="what-the-check-cannot-see" class="level4">
+<h4 class="anchored" data-anchor-id="what-the-check-cannot-see">What the check cannot see</h4>
+<p>It samples, so a dependence confined between two of its 17 points can slip through. A comparison whose threshold lies within the solver’s tolerance of the interpolated state can come out either way.</p>
+<p>A window whose state went non-finite is still judged with the clock anchored at the window’s end. If the state would have stayed finite only under a later anchor, the check does not see it: <code>if (TAD &lt; -20 || TIME &gt; 12)</code> guarding an otherwise divergent compartment, with the first dose at 36, diverges under the window-end anchor too. The run is then refused at the next decision for its diverged state, and the clock is not named, although <code>predict()</code> on the realized schedule stays finite. No number is returned either way. Such a window is also judged on its start state at every sample time (its end state is non-finite, so it is not evidence), so it can in principle be blamed on a pairing of state and time the run never reached. No known model shows that.</p>
+<p>Two consequences of judging a finite window at the dose that came:</p>
+<ul>
+<li>the controller has already run on the decisions before that dose, which is harmless because the run then ends in an error;</li>
+<li>if the state diverges <em>between</em> such a window and the first dose, the decision on the diverged state is refused first, naming the state. Fix that, and the clock’s refusal follows.</li>
+</ul>
+<p>The <strong>frozen-schedule replay verifier</strong>, on by default, remains the net for what the check misses, with two limits of its own: it fires only when an effect exceeds its tolerance band — <code>8 × ode_reltol</code>, and at least <code>1e-9</code>, relative — and the two engines it compares share the ODE solver, so it cannot see a failure in the solver itself.</p>
+</section>
+</section>
+</section>
+<section id="current-scope-and-limits" class="level2">
+<h2 class="anchored" data-anchor-id="current-scope-and-limits">Current scope and limits</h2>
+<ul>
+<li><strong>ODE models only</strong> (the reactive driver runs on the ODE engine).</li>
+<li><strong>A non-empty decision schedule is required</strong> — an empty <code>decision_times</code> never consults the controller, so it is rejected rather than run as a silent dose-free simulation.</li>
+<li><strong>Pre-scheduled base regimens are supported</strong> (#702) — the base subject may carry a loading / maintenance regimen, including a steady-state (<code>SS=1</code>) dose and doses into lagged or built-in input-rate (transit / zero-order absorption) compartments, which the driver integrates and the controller augments at the decision schedule (the real TDM / MIPD workflow: start on a fixed regimen, then titrate on measured levels). Base doses flow through the same dose-resolution, break-timeline, and steady-state machinery as <code>predict()</code> / <code>simulate()</code>, and they appear in the controller’s dose <code>history</code>; the frozen-replay verifier rebuilds the base regimen alongside the realized ledger, so the pre-scheduled + reactive bookkeeping is checked bit-for-bit each run. The <code>auc_target</code> exposure metric likewise integrates the base doses, wherever they land, not just the controller’s, so <code>auc_target_attainment</code> is not biased low on a base-regimen run (constant-covariate; the <code>auc_target</code> caveat below still applies). A base dose that <strong>shares a time with a decision is observed pre-dose</strong> (the trough), symmetric with the controller’s own doses — the controller reads the level <em>before</em> the scheduled dose lands, then that dose is applied (#933); for a steady-state base dose the pre-dose readout is the steady-state trough. A base dose scheduled <strong>past a controller <code>Stop</code> still lands</strong> — the base regimen is the patient’s standing prescription, which the controller discontinues its <em>own</em> augmentation of but does not cancel. (Base doses into lagged / input-rate compartments are supported because they run the exact pre-resolved static machinery; <em>controller-issued</em> doses into those compartments are still rejected at injection, where the TAD-anchor bookkeeping for a dose discovered mid-run is a follow-up.) <em>Scope:</em> supported on constant-covariate models, on <strong>time-varying-covariate models</strong> (since #930), and on <strong>IOV models</strong> (since #931), for a plain bolus / infusion base dose, whose bioavailability <code>F</code> is resolved from its own snapshot — the covariate active at, and (under IOV) the occasion κ of, the dose’s administration time (symmetric with a controller dose, whose <code>F</code> is fixed at injection) — and which is then integrated under the per-segment PK, matching independent mrgsolve loading-dose runs (renal-decline #930, per-occasion κ #931). An <code>ADDL</code>-implied dose takes both from the record that governs it, and is no record for what a decision reads (#2371, #2528). A base regimen also <strong>composes with system resets</strong> (EVID=3/4), under constant covariates, time-varying covariates and IOV alike (#932): the reset zeros the state and turns off a base infusion opened before it, and an EVID=4 reset+dose row’s dose lands after its own reset — see <em>System resets</em> below. Still a typed error, never a silent mis-integration of a delivered dose: under a time-varying covariate or IOV, a steady-state, lagged, built-in input-rate, or modeled-<code>RATE</code> base dose (a #930 / #931 follow-up whose per-dose SS / lag / input-rate / rate-resolution bookkeeping the frozen-replay engine does not yet reproduce).</li>
+<li><strong>Time-varying covariates are supported</strong> — the driver recomputes PK per event/segment from the covariate active in that segment (the NONMEM end-of-interval convention that <code>predict()</code> / <code>simulate()</code> use), so a covariate that changes over the horizon (e.g.&nbsp;declining renal function driving clearance) correctly drives CL/V/KA, the monitored signal, and every dose decision; the frozen-replay verifier validates the per-event bookkeeping. A model whose PK reads the <code>TIME</code> built-in is covered the same way, <code>auc_target</code> included (#943).</li>
+<li><strong>System resets (EVID=3) are supported</strong> — the reactive driver zeros the compartments at each reset time (re-seeding any <code>init(state)=expr</code>) and turns off controller-issued infusions opened before the reset, exactly as <code>predict()</code> / <code>simulate()</code> do on the event-driven path; the frozen-replay verifier is reset-aware, so the reset is honored <em>and</em> checked each run. A reset also composes with a <strong>pre-scheduled base regimen</strong> (#932): it zeros the base regimen’s state and turns off a base infusion opened before it (the reset floor), and an <strong>EVID=4</strong> reset+dose row — which records both a reset and a dose — reaches the adaptive path as a base dose landing <em>after</em> its own reset (Reset &lt; Dose), matching <code>predict()</code>. Decision times are on the engine clock, which a moved reset shifts (see <a href="#decision-times-after-a-moved-reset">Decision times after a moved reset</a>). <code>auc_target</code> composes with resets (#943): the window that straddles a reset carries a node at the state the reset found and one at the state it left, so the drop integrates exactly.</li>
+<li><strong>Inter-occasion variability (IOV) is supported</strong> — a fresh occasion <code>kappa</code> is drawn per <strong>decision</strong> (occasion <code>g</code> starts at decision <code>g</code>) and threaded through the per-event PK. A window runs under the κ of the record that ends it, see <a href="#window-kappa">Which κ a decision window runs under</a>. The frozen-replay verifier validates the per-occasion bookkeeping. A <strong>pre-scheduled base regimen</strong> (a loading dose) composes with IOV (#931): each base dose’s <code>F</code> resolves under the κ of the occasion active at its administration time — see <em>Pre-scheduled base regimens</em> above. It also composes with time-varying covariates — the composition (<code>CL = TVCL·(CRCL/100)·exp(η + κ)</code> under a declining covariate <em>and</em> a per-occasion κ) is cross-validated dose-for-dose against an independent <strong>mrgsolve</strong> run (<code>tests/reference/vanco_renal_iov_mrgsolve/</code>). <code>kappa</code> is drawn on a dedicated per-(subject, replicate) substream (disjoint from the η and assay streams), so a non-IOV run is unchanged and enabling a <code>Dv</code> monitor never shifts the draws. <code>auc_target</code> reads each segment under the κ it was integrated with (#943). Between-subject η is still drawn per subject/replicate; parameter-uncertainty propagation is a later layer.</li>
+<li><strong>Deterministic ODE only</strong> — a stochastic (<code>[diffusion]</code> / SDE) model is rejected (the reactive integrator carries no process noise).</li>
+<li><strong>Diagonal assay noise</strong> — each <code>Dv</code> monitor draws independently; correlated cross-endpoint (<code>block_sigma</code>) assay noise is a follow-up.</li>
+<li><strong>One monitored signal per block</strong> — the declarative block titrates on a single <code>observe</code>; multiple named per-analyte monitors (already supported by the programmatic engine) are a declarative-surface follow-up.</li>
+<li><strong>Roadmap</strong> — population outcome summaries with uncertainty bands, the imperative <code>[dose_control]</code> block, and PK + PD + safety model composition.</li>
+</ul>
+
+
+</section>
+</section>
+
+</main> <!-- /main -->
+<script>
+(function () {
+  var HEAD = '<div class="panel-head"><span class="dots"><i></i><i></i><i></i></span><span class="file"><span class="br">[</span>warfarin_pk.ferx<span class="br">]</span></span></div>';
+
+  function apply() {
+    var dark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    document.querySelectorAll('div.sourceCode').forEach(function (el) {
+      if (el.parentElement && el.parentElement.closest('.code-panel')) return;
+      if (dark) {
+        if (!el.classList.contains('code-panel')) {
+          el.classList.add('code-panel');
+          el.insertAdjacentHTML('afterbegin', HEAD);
+        }
+      } else {
+        el.classList.remove('code-panel');
+        var h = el.querySelector(':scope > .panel-head');
+        if (h) h.remove();
+      }
+    });
+  }
+
+  if (document.body) apply();
+  document.addEventListener('DOMContentLoaded', apply);
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) { if (m.attributeName === 'data-bs-theme') apply(); });
+  }).observe(document.documentElement, { attributes: true });
+}());
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const toggle = window.document.createElement('button');
+      toggle.type = "button";
+      toggle.setAttribute("role", "switch");
+      toggle.setAttribute("aria-checked", "false");
+      toggle.classList.add('top-right');
+      toggle.classList.add('quarto-color-scheme-toggle');
+      toggle.setAttribute("aria-label", "Toggle dark mode");
+      toggle.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      toggle.appendChild(i);
+      // Put the toggle in a landmark of its own, so that landmark navigation
+      // can reach it.
+      //
+      // The container is always a fresh direct child of body, and the toggle is
+      // never moved into page furniture that the theme or the author controls.
+      // The toggle is positioned against the page, so any ancestor that
+      // establishes a containing block captures it: a positioned element or a
+      // grid for position: absolute, and transform, filter, will-change or
+      // contain for position: fixed. A direct child of body has none of these
+      // to inherit, and the shift when one appears is silent and visual.
+      //
+      // ARIA says a document should have at most one banner, and axe reports a
+      // duplicate whether or not the banners carry distinct labels. So use a
+      // header when the page has no banner yet, and a named region otherwise.
+      //
+      // A header is a banner wherever it sits, unless it is inside sectioning
+      // content, so this cannot just look at the children of body: a custom
+      // page layout wraps the title block header in a plain div. An explicit
+      // role="banner" always counts.
+      const sectioning = 'article, aside, main, nav, section, [role="article"], [role="complementary"], [role="main"], [role="navigation"], [role="region"]';
+      const hasBanner = Array.from(
+        window.document.querySelectorAll('header:not([role]), [role="banner"]')
+      ).some(function(el) {
+        return el.hasAttribute("role") || el.closest(sectioning) === null;
+      });
+      const container = window.document.createElement(hasBanner ? "div" : "header");
+      if (hasBanner) {
+        container.setAttribute("role", "region");
+        container.setAttribute("aria-label", "Toggle dark mode");
+      }
+      container.classList.add('quarto-color-scheme-toggle-container');
+      container.appendChild(toggle);
+      window.document.body.appendChild(container);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp("https:\/\/ferx-nlme\.org\/ferx-core\/");
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+      window.quartoDecorateExternalLinks = function (root) {
+     var links = (root || window.document).querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+          if (!link.classList.contains('no-external-icon')) {
+          }
+        }
+      }
+      };
+      window.quartoDecorateExternalLinks(window.document);
+    // Esc closes the popup (WCAG 1.4.13) and focus leaving both trigger and
+    // popup closes it (WCAG 2.4.11); tippy handles neither for interactive popups.
+    const hideOnEscAndFocusOut = {
+      name: 'hideOnEscAndFocusOut',
+      defaultValue: true,
+      fn(instance) {
+        const dismiss = () => {
+          // A show scheduled by the trigger delay would otherwise reopen it
+          instance.clearDelayTimeouts();
+          instance.hide();
+        };
+        const onKeyDown = (event) => {
+          if (event.key !== 'Escape') {
+            return;
+          }
+          // Keep Esc from also reaching page handlers (e.g. reveal.js overview),
+          // except an open reveal.js slide menu, which Esc should close too.
+          // The menu handles keys only when its keyboard option is on.
+          const menuHandlesEsc = window.Reveal?.getPlugin?.('menu')?.isOpen() &&
+            window.Reveal.getConfig().menu?.keyboard !== false;
+          if (!menuHandlesEsc) {
+            event.stopPropagation();
+          }
+          if (instance.popper.contains(window.document.activeElement)) {
+            // Disabled while refocusing so the focus trigger does not reopen it
+            instance.disable();
+            instance.reference.focus();
+            instance.enable();
+          }
+          dismiss();
+        };
+        const onFocusOut = (event) => {
+          const target = event.relatedTarget;
+          if (target && !instance.reference.contains(target) &&
+              !instance.popper.contains(target)) {
+            dismiss();
+          }
+        };
+        // On the trigger too: a click trigger (code-annotations: select) has no
+        // blur handling. Attached for the instance's lifetime so leaving the
+        // trigger also cancels a show still pending on the trigger delay.
+        instance.reference.addEventListener('focusout', onFocusOut);
+        return {
+          onShow() {
+            window.document.addEventListener('keydown', onKeyDown, true);
+            instance.popper.addEventListener('focusout', onFocusOut);
+          },
+          onHide() {
+            window.document.removeEventListener('keydown', onKeyDown, true);
+            instance.popper.removeEventListener('focusout', onFocusOut);
+          },
+          onDestroy() {
+            instance.reference.removeEventListener('focusout', onFocusOut);
+          },
+        };
+      },
+    };
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+        plugins: [hideOnEscAndFocusOut],
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          // Each band is positioned against its own containing block, which is
+          // not the offsetParent of the lines, so place it from client rects.
+          const placeBand = (band, firstEl, lastEl, codeBlock) => {
+            const container = band.offsetParent;
+            if (container === null) {
+              return;
+            }
+            const containerRect = container.getBoundingClientRect();
+            // Reveal.js scales slides with a transform, so convert client
+            // pixels back to the CSS pixels of the container.
+            const scale = containerRect.height / container.offsetHeight || 1;
+            const firstRect = firstEl.getBoundingClientRect();
+            const lastRect = lastEl.getBoundingClientRect();
+            const top = (firstRect.top - containerRect.top) / scale - container.clientTop + container.scrollTop;
+            const height = (lastRect.bottom - firstRect.top) / scale;
+            band.style.top = top - 2 + "px";
+            band.style.height = height + 4 + "px";
+            if (codeBlock) {
+              // Without the copy button wrapper, the containing block is wider
+              // than the code block, so span the code block explicitly.
+              const blockRect = codeBlock.getBoundingClientRect();
+              band.style.left = (blockRect.left - containerRect.left) / scale - container.clientLeft + container.scrollLeft + "px";
+              band.style.width = blockRect.width / scale + "px";
+            }
+          };
+          if (lineIds.length > 0) {
+            const el = window.document.getElementById(lineIds[0]);
+            const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+            const parent = el.parentElement.parentElement;
+            // cook up a div (if necessary) and position it
+            let div = window.document.getElementById("code-annotation-line-highlight");
+            if (div === null) {
+              div = window.document.createElement("div");
+              div.setAttribute("id", "code-annotation-line-highlight");
+              div.style.position = 'absolute';
+              parent.appendChild(div);
+            }
+            placeBand(div, el, lastEl, parent.closest("div.sourceCode") || parent);
+            let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+            if (gutterDiv === null) {
+              gutterDiv = window.document.createElement("div");
+              gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+              gutterDiv.style.position = 'absolute';
+              const codeCell = window.document.getElementById(targetCell);
+              const gutter = codeCell.querySelector('.code-annotation-gutter');
+              gutter.appendChild(gutterDiv);
+            }
+            placeBand(gutterDiv, el, lastEl);
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+  <script type="application/javascript">
+  window.quartoScrollableRegionsLabels = {"code":"Scrollable code","output":"Scrollable output"};
+  </script>
+</div> <!-- /content -->
+<footer class="footer">
+  <div class="nav-footer">
+    <div class="nav-footer-left">
+<p>© 2026 FeRx-NLME · MIT licensed</p>
+</div>   
+    <div class="nav-footer-center">
+      &nbsp;
+    <div class="toc-actions d-sm-block d-md-none"><ul><li><a href="https://github.com/FeRx-NLME/ferx-core/edit/main/model-file/adaptive-dosing.qmd" class="toc-action"><i class="bi bi-github"></i>Edit this page</a></li><li><a href="https://github.com/FeRx-NLME/ferx-core/issues/new" class="toc-action"><i class="bi empty"></i>Report an issue</a></li></ul></div></div>
+    <div class="nav-footer-right">
+<p>Fe · 26 · Rx · 2026</p>
+</div>
+  </div>
+</footer>
+
+
+
+
+</body></html>
