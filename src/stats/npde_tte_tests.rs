@@ -754,10 +754,12 @@ fn ode_hazard_and_joint_subjects() {
 /// D6. A replicate with no event is in the denominator, and its per-subject simulator
 /// warning comes back once, with a count, not once per replicate. A Gompertz hazard
 /// with `gamma < 0` has a cure fraction: a replicate that never has an event is a
-/// legitimate "never", which the simulator reports as `W_TTE_DEGENERATE_HAZARD`.
-/// Measured: 493 raw warnings over 3 subjects × 250 replicates.
+/// legitimate "never", which the simulator reports as `W_TTE_DEGENERATE_HAZARD` — once
+/// per subject and CMT per `simulate` call (#1648), so once per subject per batch here:
+/// 3 subjects × 3 batches (250 = 100 + 100 + 50). Every batch draws a no-event replicate for
+/// every subject (cure fraction ≈ 0.67, so a batch without one has probability ≈ 0.33^50).
 ///
-/// Dies on: the fold skipped (493 strings); a no-event replicate dropped from the
+/// Dies on: the fold skipped (9 strings); a no-event replicate dropped from the
 /// denominator (fewer than 250 drawn); the count in the folded text wrong.
 #[test]
 fn no_event_replicates_count_and_their_warnings_fold() {
@@ -770,7 +772,7 @@ fn no_event_replicates_count_and_their_warnings_fold() {
         reference_counts(&m, &p, &m.default_params, 250, 5, None, 2, &scored).unwrap();
     assert_eq!(drawn, vec![250; 3]);
     let raw = tte_warnings(raw);
-    assert!(raw.len() > 250, "{} raw warnings", raw.len());
+    assert_eq!(raw.len(), 3 * 250usize.div_ceil(super::BATCH), "{raw:?}");
     assert!(raw
         .iter()
         .all(|w| w.starts_with("W_TTE_DEGENERATE_HAZARD: ")));

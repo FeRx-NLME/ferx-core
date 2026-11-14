@@ -1169,6 +1169,43 @@ fit, exactly, and the absolute curves of orders 1 to 3 and the gap curves of ord
 within 1.1e-16. survfit cannot express two events at one time in one subject, so that case is
 pinned by its exact closed form instead.
 
+| Reference | Fixture | Agreement |
+|---|---|---|
+| `survival::survfit` 3.8.12 | `tests/fixtures/rtte_survfit` (80 subjects, 2 strata) | MCF exact; absolute orders 1–3 and gap orders 2–3 within 1.1e-16 (`tests/rtte_survfit_reference.rs`) |
+| `reda::mcf` 0.5.6 | the same fixture | MCF within 4.4e-16, with `numRisk` equal to ferx's at-risk count on all 40 rows |
+| `reda::mcf` 0.5.6 | `r2()` in `src/stats/km_tests.rs`, also used by `vpc_rtte_tests.rs` T7: two events at time 5 in one subject, the layout survfit refuses | `MCF(5) = 37/30` and `MCF(8) = 19/10` exactly, the closed form ferx is pinned to |
+
+reda refuses an event at a subject's follow-up end `cᵢ` (19 subjects in the survfit fixture, 2
+of the 6 in `r2()`), so for reda each such subject gets a censoring appended at `cᵢ + ε`. The
+two layouts give the same MCF: for `t ≤ cᵢ` the subject is at risk under both, and on
+`(cᵢ, cᵢ + ε]` it is at risk only under reda's, but every time in both fixtures is a whole
+number and `ε < 1`, so no event falls in that interval. The extra rows reda reports at the
+`cᵢ + ε` are dropped by matching on ferx's times; `ε = 0.5` and `ε = 1e-9` give identical
+results on both fixtures. reda also refuses a censoring
+that is not a subject's last record when an event follows it. ferx accepts that layout, so it
+is not compared. Neither reda comparison is a committed test.
+
+**`vpc::vpc_tte(rtte = TRUE)` is not a reference.** Its Kaplan–Meier step is survfit itself;
+what differs is which rows it builds for "order `k`", and in vpc 1.2.4 (and master 1.3.6 as
+of 2026-11-14) none of its modes is ferx's curve. In the default gap mode
+(`rtte_calc_diff = TRUE`) its gaps are the intervals between consecutive records, the closing
+censored interval included, and it sorts each subject's intervals by length before numbering
+them, so its "order `k`" is the `k`-th *shortest* interval, not the gap before the `k`-th
+event ([ronkeizer/vpc#127](https://github.com/ronkeizer/vpc/issues/127)). On the fixture
+above its orders 2 and 3 differ from ferx's gap curves by up to 0.22 in S, and its order 1
+from ferx's absolute order 1 by up to 0.25. The two other modes fail unless the data have a
+column named `t` ([ronkeizer/vpc#128](https://github.com/ronkeizer/vpc/issues/128)). With
+`rtte_calc_diff = FALSE` order `k` keeps only the subjects with at least `k` records: a
+subject with fewer events drops out instead of being censored at its follow-up end, and so
+does one with exactly `k − 1` events whose last record is an event (up to 0.34 at orders 2
+and 3). With `rtte_conditional = FALSE` one subject enters the risk set up to `k` times, so
+the curve is not a Kaplan–Meier estimate of the time to the `k`-th event. That construction
+reproduces vpc's curves exactly for stratum A of the fixture (7 orders), but not for stratum B
+(12 orders): stratified, B is off by 0.69 even at order 1, while B run alone matches at order 1
+exactly. That cause is not traced; labels with two-digit orders are suspected. A VPC drawn by
+vpc's own RTTE mode will therefore not overlay `vpc_rtte()`'s curves. Every difference that is
+traced is in vpc's row construction, not in either Kaplan–Meier step.
+
 The bands are checked for self-consistency in `tests/vpc_rtte_self_consistency.rs`. 200
 datasets are drawn outside the simulator from a Poisson process with between-subject
 variability, about 80 % of subjects leaving before `H`, and each gets a 200-replicate VPC. The
@@ -1223,7 +1260,10 @@ censoring overstates survival. Rather than let these look like ordinary censorin
 `simulate_with_options_diag` API returns a `SimulationOutput { results, warnings }` naming
 the affected subjects (`W_TTE_DEGENERATE_HAZARD` / `W_RTTE_DEGENERATE` /
 `W_TTE_SOLVE_FAILED`); `ferx … --simulate`
-echoes them alongside the fit warnings. The plain `simulate()` / `simulate_with_seed()` /
+echoes them alongside the fit warnings. `W_TTE_DEGENERATE_HAZARD` is one line per subject
+and CMT for the whole run, in population order: it gives the number of replicates in which
+the subject ended censored because of the degenerate draw and names them (`sim` indices, or
+the uncertainty draws under `simulate_with_uncertainty_diag`). The plain `simulate()` / `simulate_with_seed()` /
 `simulate_with_options()` entry points apply the same per-subject handling but return only
 the rows.
 :::

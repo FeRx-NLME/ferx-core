@@ -657,7 +657,7 @@ fn ctmm_drug_driven_tv_covariate_check_fails_closed_without_the_ode_program() {
     );
 }
 
-fn tiny_population() -> Population {
+pub(super) fn tiny_population() -> Population {
     let obs_times = vec![1.0, 2.0, 3.0];
     let subjects: Vec<Subject> = (0..2)
         .map(|i| Subject {
@@ -876,7 +876,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
 // `pk` block's built-in concentration output. (Using the volume `V` would divide by V a
 // second time and emit the #712 double-scale warning; the flip-flop detection keys off
 // `CL/V`, so the scale value is otherwise immaterial here.)
-const INDOMAIN_TWINLESS_TRANSIT_SRC: &str = "\
+pub(super) const INDOMAIN_TWINLESS_TRANSIT_SRC: &str = "\
 [parameters]
   theta TVCL(0.5, 0.001, 50.0)
   theta TVV(4.0, 0.1, 500.0)
@@ -952,7 +952,7 @@ const PLAIN_TWIN_TRANSIT_SRC: &str = "\
   DV ~ proportional(PROP)
 ";
 
-fn parse_fixture(src: &str) -> CompiledModel {
+pub(super) fn parse_fixture(src: &str) -> CompiledModel {
     crate::parser::model_parser::parse_full_model(src)
         .expect("fixture model parses")
         .model
