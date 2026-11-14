@@ -44,6 +44,7 @@ pktte_tdep_nonmem_anchor
 predict_survival_at_etas
 profiled_levels_correlation_fits
 profiled_levels_fits
+record_clock_nonmem_anchor
 reset_clock_nonmem_anchor
 rtte_survfit_reference
 sampler_covariance_non_gaussian

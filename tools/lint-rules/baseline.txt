@@ -118,7 +118,6 @@ nan-fold 1 src/estimation/vi/elbo_tests.rs::assert_tv_iov_gradient_matches_fd
 nan-fold 2 src/estimation/vi/elbo_tests.rs::iov_mc_kl_neg_elbo_gradient_matches_central_fd
 nan-fold 1 src/estimation/vi/elbo_tests.rs::mc_kl_grad_x_matches_fd_but_phi_is_path_derivative
 nan-fold 4 src/estimation/vi/elbo_tests.rs::the_data_eta_gradient_is_exact_past_the_closed_forms
-nan-fold 1 src/io/datareader_tests.rs::test_missing_dv_advice_says_mdv1_keeps_the_row_as_a_record
 nan-fold 1 src/markov/dtmm_tests.rs::laplace_boundary_curvature_off_diagonal_matches_the_closed_form
 nan-fold 1 src/markov/dtmm_tests.rs::laplace_curvature_refuses_cancelling_sentinel_corners
 nan-fold 2 src/markov/endpoint.rs::exact_eta_hessian_tests::the_ctmm_eta_hessian_is_exact_on_a_homogeneous_generator

@@ -372,8 +372,8 @@ fn a_record_row_does_not_make_a_pure_tte_subject_a_pk_subject() {
         );
         assert_eq!(
             s.pk_only_times,
-            vec![2.0, 3.0],
-            "subject {}: the EVID=2 and EVID=0/MDV=1 rows are records",
+            vec![2.0, 3.0, 5.0],
+            "subject {}: the EVID=2, EVID=0/MDV=1 and event rows are records (#2368)",
             s.id
         );
     }

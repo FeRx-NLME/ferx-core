@@ -430,8 +430,11 @@ observation, an `EVID = 2` row or an `EVID = 0, MDV = 1` row. So a baseline haza
 accumulates from a covariate-marker row ahead of the first dose. Before
 [#1809](https://github.com/FeRx-NLME/ferx-core/issues/1809) the reader dropped the last
 two kinds of row (an `EVID = 2` row was kept only with time-varying covariates), and the
-clock started at the first dose or scored observation. One row is still not a record: an
-observation row whose `DV` is missing, which the reader skips under `W_MISSING_DV`.
+clock started at the first dose or scored observation. Since
+[#2368](https://github.com/FeRx-NLME/ferx-core/issues/2368) an event row, and an
+observation row the reader skips for its missing `DV` (`W_MISSING_DV`), are records too,
+but an event row ahead of every other record starts no clock: a subject with only event
+rows integrates from 0, where a NONMEM dataset carries a `TIME = 0` record.
 
 ### A time-dependent hazard keeps the single shared solve {#time-dependent-hazard}
 
