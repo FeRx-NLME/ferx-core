@@ -445,3 +445,143 @@ fn the_spec_path_refuses_the_decision_covariates_option() {
     simulate_adaptive_from_spec(&model, &pop, &model.default_params, 1, &spec, &opts)
         .expect("runs without the option");
 }
+
+/// IOV with a time-varying `WT`: κ and the covariate act on one decision record.
+const ODE_IOV_WT: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 1e-10
+  kappa KAPPA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * WT / 70 * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// Under IOV with a time-varying covariate the two settings part on the same record: κ_g with
+/// the LOCF row, or κ_g with the NOCB row (#2948 review row 4). Each run equals `predict_iov` on
+/// the static equivalent filled by its own rule, to the bit, and misses the other fill by more
+/// than 1e-2 — so the `nocb` record (θ, `[η | κ_g]`, the next data record's row, `TIME` at the
+/// decision) has an oracle outside the driver and outside `verify_decision_records`, which
+/// share its formula. `WT` steps 70 → 50 at the record at 72, with nothing between 12 and 72.
+#[test]
+fn under_iov_each_decision_covariates_rule_equals_predict_iov_on_its_own_fill() {
+    const SEED: u64 = 31;
+    let model = parse_model_string(ODE_IOV_WT).expect("parse");
+    let rows = [(0.0, 70.0), (12.0, 70.0), (72.0, 50.0)];
+    let obs: Vec<f64> = rows.iter().map(|r| r.0).collect();
+    let base = |doses: Vec<DoseEvent>| {
+        let mut s = subj("1", obs.clone(), doses);
+        s.covariates = wt(rows[0].1);
+        s.obs_covariates = rows.iter().map(|r| wt(r.1)).collect();
+        s
+    };
+    let (eta, kappas) = drawn_eta_and_kappas(&model, SEED);
+    let locf = |t: f64| rows.iter().rfind(|r| r.0 <= t).map_or(rows[0].1, |r| r.1);
+    let nocb = |t: f64| rows.iter().find(|r| r.0 >= t).map_or(locf(t), |r| r.1);
+    let gap = |run_rule: DecisionCovariates, fill_rule: DecisionCovariates| -> f64 {
+        let mut pop = population(vec![base(vec![])]);
+        pop.covariate_names = vec!["WT".to_string()];
+        let mut opts = AdaptiveSimulateOptions {
+            seed: Some(SEED),
+            decision_times: DECISIONS.to_vec(),
+            ..Default::default() // verify = true
+        };
+        opts.decision_covariates = Some(run_rule);
+        let res = simulate_adaptive(&model, &pop, &model.default_params, 1, fixed_bolus, &opts)
+            .expect("runs and passes the default-on verifiers");
+        let fill = |t: f64| match fill_rule {
+            DecisionCovariates::Nocb => nocb(t),
+            _ => locf(t),
+        };
+        let doses: Vec<DoseEvent> = res
+            .ledger
+            .iter()
+            .map(|e| DoseEvent::new(e.time, e.amt, e.cmt, e.rate, false, 0.0))
+            .collect();
+        let mut s = base(doses);
+        let occ = |t: f64| crate::pk::occasion_of(&DECISIONS, t).expect("in a window") as u32;
+        s.occasions = obs.iter().map(|&t| occ(t)).collect();
+        s.dose_occasions = res.ledger.iter().map(|e| occ(e.time)).collect();
+        s.dose_covariates = res.ledger.iter().map(|e| wt(fill(e.time))).collect();
+        s.pk_only_times = DECISIONS.to_vec();
+        s.pk_only_raw_times = DECISIONS.to_vec();
+        s.pk_only_covariates = DECISIONS.iter().map(|&t| wt(fill(t))).collect();
+        s.pk_only_occasions = DECISIONS.iter().map(|&t| occ(t)).collect();
+        let ordered: Vec<Vec<f64>> = crate::stats::likelihood::iov_occasion_groups(&s)
+            .iter()
+            .map(|(o, _)| kappas[*o as usize].clone())
+            .collect();
+        let preds = crate::pk::predict_iov(&model, &s, &model.default_params.theta, &eta, &ordered);
+        assert_eq!(preds.len(), res.trajectories.len());
+        let mut worst = 0.0_f64;
+        for (r, &p) in res.trajectories.iter().zip(&preds) {
+            let g = ((r.ipred - p) / p).abs();
+            assert!(g.is_finite(), "gap {g} at t={}: {} / {p}", r.time, r.ipred);
+            worst = worst.max(g);
+        }
+        worst
+    };
+    for (rule, other) in [
+        (DecisionCovariates::Locf, DecisionCovariates::Nocb),
+        (DecisionCovariates::Nocb, DecisionCovariates::Locf),
+    ] {
+        assert_eq!(gap(rule, rule), 0.0, "{rule:?} against its own fill");
+        let crossed = gap(rule, other);
+        assert!(
+            crossed > 1e-2,
+            "{rule:?} against {other:?}'s fill: {crossed:e}"
+        );
+    }
+}
+
+/// An `ADDL`-implied dose re-governed by a decision takes the decision's `TIME` (#2948 review
+/// row 9): `CL` reads `TIME`, the dose at 10 implies doses at 34 and 58, the only later data
+/// record is the observation at 96, decisions at 0, 24, 48, 72, 96 hold. In the static
+/// equivalent (`EVID=2` rows at 24, 48, 72) the reader governs the implied dose at 34 by the
+/// row at 48 and evaluates it at `TIME` 48; the run must do the same, to the bit. Keeping the
+/// reader's `TIME` (96, the observation's) in the re-governed copy left all 547 adaptive lib
+/// tests green before this test.
+#[test]
+fn an_implied_dose_governed_by_a_decision_reads_the_decisions_time() {
+    let model = parse_model_string(ODE_TIME).expect("parse");
+    let decisions = [0.0, 24.0, 48.0, 72.0, 96.0];
+    let data = "ID,TIME,DV,AMT,EVID,CMT,MDV,ADDL,II
+1,0,0,0,0,1,0,0,0
+1,10,0,100,1,1,1,2,24
+1,96,0,0,0,1,0,0,0
+";
+    let pop = read_csv(data, None);
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: decisions.to_vec(),
+        ..Default::default() // verify = true
+    };
+    let hold = || |_ctx: &ControllerCtx| vec![DoseAction::Hold];
+    let res = simulate_adaptive(&model, &pop, &model.default_params, 1, hold, &opts)
+        .expect("runs and passes the default-on verifiers");
+    let mut csv = data.to_string();
+    for t in &decisions[1..4] {
+        csv.push_str(&format!("1,{t},0,0,2,1,1,0,0\n"));
+    }
+    let sp = read_csv(&csv, None);
+    let preds = predict(&model, &sp, &model.default_params).expect("predicts");
+    let want: Vec<f64> = preds.iter().map(|p| p.pred).collect();
+    let got: Vec<f64> = res.trajectories.iter().map(|r| r.ipred).collect();
+    assert!(
+        got.iter().all(|v| v.is_finite()) && got[1] > 1e-2,
+        "{got:?}"
+    );
+    assert_eq!(
+        bits(got.iter().copied()),
+        bits(want.iter().copied()),
+        "{got:?} vs {want:?}"
+    );
+}
