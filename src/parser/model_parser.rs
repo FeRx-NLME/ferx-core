@@ -6381,11 +6381,10 @@ pub fn parse_full_model_with(
     // value is resolved here; `parse_full_model_file` resolves it relative to
     // the model file's directory afterwards (this function only sees the
     // model's text, not its path on disk).
+    // `path` is optional (#2914): a block carrying only column maps leaves
+    // `data_path` `None`, and the caller has to supply the dataset.
     let (data_path, data_column_map) = match blocks.get("data") {
-        Some(lines) => {
-            let (p, m) = parse_data_block(lines)?;
-            (Some(p), m)
-        }
+        Some(lines) => parse_data_block(lines)?,
         None => (None, Vec::new()),
     };
 
@@ -12133,6 +12132,10 @@ pub fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     }
 }
 
+/// A parsed `[data]` block: the raw `path` (absent when the block only maps
+/// columns, #2914) and the `(target, actual)` column remappings.
+type DataBlock = (Option<String>, Vec<(String, String)>);
+
 /// Canonical column roles a `[data]` block may remap (#730, NONMEM
 /// `$INPUT TIME=TAFD` analogue). A target naming one of these is upper-cased to
 /// the standard header spelling; any other target is an arbitrary column rename
@@ -12146,6 +12149,12 @@ const DATA_BLOCK_ROLES: &[&str] = &[
 /// Parse a `[data]` block (#690, NONMEM `$DATA` analogue). Returns the raw
 /// `path` value as written (resolved relative to the model file's directory by
 /// `parse_full_model_file`) plus any `target = actual` column remappings.
+///
+/// `path` is optional (#2914): a block may carry only column maps, for a model
+/// whose dataset is always supplied by the caller (`ferx_simulate(data = ...)`,
+/// `--data`). The path is never resolved or opened here, so a model copied away
+/// from its dataset still parses; with no path on either side the file entry
+/// points refuse with `E_DATA_PATH_MISSING`.
 /// Each map entry is `(target_header, actual_header)`: the dataset's
 /// `actual_header` column is renamed to `target_header` when the CSV is read.
 ///
@@ -12167,7 +12176,7 @@ const DATA_BLOCK_ROLES: &[&str] = &[
 /// actually exists in the dataset — and whether a rename collides with a
 /// surviving column — can only be checked when the CSV is read, so that lives in
 /// the datareader.
-fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>), String> {
+fn parse_data_block(lines: &[String]) -> Result<DataBlock, String> {
     let mut path: Option<String> = None;
     let mut column_map: Vec<(String, String)> = Vec::new();
     for line in lines {
@@ -12217,7 +12226,6 @@ fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>),
             }
         }
     }
-    let path = path.ok_or_else(|| "[data]: missing required key `path`".to_string())?;
     Ok((path, column_map))
 }
 
