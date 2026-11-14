@@ -892,6 +892,15 @@ fn iov_salvage_probes_start_at_the_subject_mode() {
         vec![0],
         "fixture: subject 0 is salvaged"
     );
+    // #2713: the IOV assembly records the cause too: a recorder decline.
+    assert_eq!(
+        (
+            declines.n_cause(DeclineCause::ModeSystem),
+            declines.n_cause(DeclineCause::Recording)
+        ),
+        (0, 1),
+        "the IOV route must record why subject 0 declined"
+    );
     let n = assert_starts_at_modes("IOV salvage", &rec, |_| true, &pop, &etas, &kappas);
     crate::estimation::inner_optimizer::test_helpers::assert_solves_at_stencil_tol(
         "IOV salvage",

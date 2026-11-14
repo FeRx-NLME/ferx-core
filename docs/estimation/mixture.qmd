@@ -78,9 +78,11 @@ with class-$k$ parameters and a **separate empirical Bayes solve per
 per-class $\Omega$/$\Sigma$ are estimated jointly. Estimation defaults to the
 derivative-free BOBYQA outer optimizer; an analytic posterior-weighted outer
 gradient is available — exact also under IOV and with a block (correlated) $\Omega$ — so a
-user-selected NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured, with an automatic
-finite-difference fallback for subjects outside analytic scope. `MIXNUM`-branched typical
-values are in scope.
+user-selected NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured. A subject outside
+analytic scope is salvaged on its own: the other subjects keep their exact gradient, and only
+that subject's per-class terms are finite-differenced, re-solving its class modes at each
+probe. Such a subject is named in the "could not be given the exact analytic outer gradient"
+warning, as for a single population (#2906). `MIXNUM`-branched typical values are in scope.
 
 ## Output
 
@@ -95,7 +97,16 @@ NONMEM reserved variables:
 A `ferx model.ferx --simulate` run adds a third: **`MIXNUM`**, the class each subject
 was *simulated* under (1-based), written before `MIXEST`. It is the generating class,
 so on a simulated dataset it is the truth `MIXEST` can be checked against. Data read
-from a file has no `MIXNUM` column.
+from a file has no `MIXNUM` column unless `[output]` asks for one.
+
+Listing `MIXNUM` in `[output]` writes the class, as NONMEM's `$TABLE MIXNUM` does and
+as `MIXNUM` means in every expression: the simulated class where the data were drawn
+under one, the fitted `MIXEST` otherwise, on every row of the subject — binary and
+time-to-event rows included. It is never a data column that happens to be called
+`MIXNUM` (no expression can read such a column either); with one present, `fit()` and
+`ferx check` warn `W_OUTPUT_MIXNUM_IS_CLASS`, so rename the column to table it. On a
+simulated dataset the requested column replaces the generating-class column rather than
+sitting beside it under the same name (#2784).
 
 Every other per-subject diagnostic is evaluated **in that subject's `MIXEST`
 class**: the reported $\hat\eta$ are the winning class's EBEs, and `IPRED`,
@@ -103,6 +114,36 @@ class**: the reported $\hat\eta$ are the winning class's EBEs, and `IPRED`,
 that branches on `MIXNUM` are all computed with `MIXNUM` set to that class. So a
 subject the fit assigns to class 2 gets class-2 typical values throughout its
 sdtab row, not the class-1 default.
+
+### Merged or empty classes
+
+A mixture objective has local optima where fewer than `nsub` classes are in use.
+Two classes can end up describing the same subpopulation, or one class can end up
+holding nobody. After every mixture fit, ferx checks the final evaluation for both
+and warns `W_MIXTURE_MERGED_CLASSES`, naming each pair or class it finds (#2907):
+
+- **Merged pair.** Both classes carry posterior mass, and no subject's data favours
+  one over the other by more than 1 log-likelihood unit:
+  $\max_i |\text{nll}_{ia} - \text{nll}_{ib}| < 1$. That is how far each subject's
+  posterior class odds moved from its prior odds,
+  $\ln(\text{PMIX}_{ia}/\text{PMIX}_{ib}) - \ln(p_{ia}/p_{ib})$. It is computed from
+  the class objectives, not rebuilt from $\text{PMIX}$, so a subject that a third class
+  dominates so strongly that both posteriors underflow to 0 still counts. The test is
+  on the objective, not on the parameters, so it also catches classes that are equal
+  but written two different ways.
+- **Empty class.** No subject's posterior probability of the class reaches 0.01.
+
+The thresholds were measured on `tests/nonmem/mixture_iv.csv` with Ω and Σ
+estimated. Started from clearances 1.70 / 1.71, L-BFGS ends in a collapsed optimum
+(OFV 310.02, class clearances 1.71 / 1.76, ω_CL 0.35, which absorbs the
+bimodality). There the largest factor is 0.09. At the two-class optimum (OFV 299.86)
+it is 15.05, and at the NONMEM-matching optima of the Ω/Σ-fixed fixture and of
+`mixture_iv_iov.csv` (301.58, 470.81) it is 11.45 and 19.29. A mixing logit held at
+−9 leaves class 1 with a largest posterior of 3e-4, which is reported empty.
+
+The warning does not change the fit. When it fires, refit with the class starts
+further apart, or with `optimizer = bobyqa`, and compare the objectives: on the
+fixture above, BOBYQA from the same 1.70 / 1.71 start reaches 299.86.
 
 ## Validation against NONMEM
 
@@ -151,6 +192,40 @@ usual 10–25 % between the two estimators):
 All four agree to **< 1 %**. The `p(1)` row compares NONMEM's direct
 $P(1)=\theta_4$ SE to ferx's logit-scale SE mapped through
 $\operatorname{SE}(p) = p(1-p)\operatorname{SE}(\text{logit})$.
+
+#### Per-class overrides
+
+An `omega(k)` / `sigma(k)` override is an estimated coordinate like any other, and
+since #2833 it is reported with its estimate, SE and %RSE in the console, the fit
+YAML's `mixture_overrides:` section and `parameter_table`, named `<base>_MIX<k>`
+(see [Mixture per-class overrides](../output.qmd#mixture-overrides)). Each override
+packs the log of its class SD, so its SE is put on the reported scale by the delta
+method: $\operatorname{SE}(\omega^2_k) = 2\,\omega^2_k\,\operatorname{SE}(\ln \omega_k)$
+for an Ω override (exact because an Ω override is accepted on a diagonal base only)
+and $\operatorname{SE}(\sigma_k) = \sigma_k\,\operatorname{SE}(\ln \sigma_k)$ for a σ
+override.
+
+Cross-checked against NONMEM at ferx's FOCEI estimate on a 2-class, 80-subject
+population with both overrides interior (`nonmem_anchor/mix_override_se.ctl`: each
+override is a second `ETA` / `EPS` used only for `MIXNUM.EQ.2`, `$EST MAXEVAL=0`,
+`$COV MATRIX=R SIGL=8`). OFVs agree to 9e-8; NONMEM's σ SEs are converted from the
+variance by $\operatorname{SE}(\sigma^2)/2\sigma$:
+
+| SE | NONMEM (`SIGL=8`) | ferx (analytic R) | relative gap |
+|---|---|---|---|
+| `TVCL1` | 0.0536804 | 0.0536807 | 6.2e-6 |
+| `TVCL2` | 0.246881 | 0.246863 | 7.2e-5 |
+| `TVV` | 0.0772119 | 0.0772116 | 4.2e-6 |
+| `MIXL` | 0.263654 | 0.263651 | 9.8e-6 |
+| `ETA_CL` | 0.0168770 | 0.0168769 | 1.1e-6 |
+| `EPS` | 0.00583841 | 0.00583828 | 2.2e-5 |
+| **`ETA_CL_MIX2`** | 0.0649761 | 0.0649758 | 3.8e-6 |
+| **`EPS_MIX2`** | 0.0106680 | 0.0106675 | 4.1e-5 |
+
+`SIGL=8` matters here. At `SIGL=12` NONMEM's own finite-difference step moves
+`TVCL2` by 1 % and `EPS_MIX2` by 0.66 %, at `SIGL=14` `TVCL2` by 9 %, while ferx's
+analytic and finite-difference R agree with each other and with `SIGL=8`.
+`tests/mixture_override_se_nonmem_anchor.rs` pins each SE against its own bound.
 
 #### The `s` and `rsr` estimators
 
@@ -344,9 +419,10 @@ from the K-fold mixture marginal at the SAEM optimum, exactly as for FOCEI.
 Per-class **σ** overrides (`sigma(k)`) are the one piece not yet re-estimated
 under SAEM — they are held at their initial values (with a warning), and every
 class-`k` subject is *scored* under that held σ, so the free base σ is estimated
-only from the classes that actually share it. Being held, the overrides report a
-standard error of 0, as `FIX`ed parameters do; route the model to FOCEI if they
-must be fit. HMC and the conditional-distribution pass are disabled for a mixture
+only from the classes that actually share it. Being held, the overrides are reported
+as fixed, as `FIX`ed parameters are: `[FIX]` with SE `---` in the console and the
+parameter table, `fixed: true` in the YAML (#2833). Route the model to FOCEI if
+they must be fit. HMC and the conditional-distribution pass are disabled for a mixture
 (they are class-unaware); the MH E-step is used.
 
 Two further SAEM-specific rules follow from the separated M-step:

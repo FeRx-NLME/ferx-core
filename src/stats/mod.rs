@@ -1,4 +1,5 @@
 pub mod convergence;
+pub mod km;
 pub mod likelihood;
 pub(crate) mod nested_levels;
 pub mod npde;

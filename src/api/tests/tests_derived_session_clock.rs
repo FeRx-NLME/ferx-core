@@ -129,6 +129,7 @@ fn two_session_subject() -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: vec![5.0], // boundary at shifted t=5
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1, 1, 1, 2, 2, 2],
         obs_l2: Vec::new(),
@@ -154,6 +155,8 @@ fn sr_for(n_obs: usize) -> SubjectResult {
         cwres: vec![0.0; n_obs],
         npde: vec![],
         npd: vec![],
+        epred: vec![],
+        pwres: vec![],
         ofv_contribution: 0.0,
         cens: vec![0; n_obs],
         n_obs,
@@ -162,7 +165,6 @@ fn sr_for(n_obs: usize) -> SubjectResult {
         extra_columns: Vec::new(),
         per_obs_tad: Vec::new(),
         compartment_states: Vec::new(),
-        #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
         #[cfg(feature = "survival")]
         tte_rows: Vec::new(),
@@ -383,6 +385,7 @@ fn derived_integral_single_session_unchanged() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 3],
         occasions: vec![1, 1, 1],
         obs_l2: Vec::new(),

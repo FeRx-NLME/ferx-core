@@ -61,7 +61,25 @@ Expressions can reference:
   on the parameters in its equation. A `FIX` parameter counts too. `TAD` and
   `TAFD` move with an estimated lag. These stay analytic: a clock or a state that
   no parameter reaches against a literal (`if (TIME > 24)`), a threshold computed
-  from covariates alone, `min`, `max`, and `clamp` with literal bounds.
+  from covariates alone, `min`, `max`, `clamp` with literal bounds, and an inline
+  `if` whose arms meet at its switch, such as the Friberg feedback
+  `if (rb < CIRC0) (CIRC0 / rb)^0.16 else 1.0`, where both arms are 1 at
+  `rb = CIRC0`. A right-hand side that is continuous at the switch puts no jump in
+  the first-order sensitivities. Its gradient is still inexact to second order, by
+  about 1% on a measured feedback model. ferx checks the arms by evaluating them at
+  points on the switch, and keeps finite differences when it cannot: for a compound
+  condition, `==` or `!=`, a nested `if`, `mod`, any function other than `log` and
+  `sqrt`, a condition that is not linear in what it reads, or an arm so steep
+  that rounding hides the gap at the switch. The check samples values up to about
+  1000 and works in floating point, so it can't see a kink built by hand from
+  `sqrt(x * x)` beyond that, a power term like `(x / 1200)^1000` that rounds away
+  below it, or a jump near rounding error. An
+  intermediate is treated as a free value, so arms that meet only once it is
+  expanded also stay on finite differences; write the expression in the arm.
+
+  Finite differences of the FOCE Jacobian amplify ODE solver error, so on this route
+  a default `ode_reltol` can move the objective a long way. Check the OFV at a much
+  tighter tolerance before trusting it.
 
 ### `TAD` before the first dose arrives
 
@@ -422,8 +440,12 @@ in the last bits (measured: within `4e-15` relative on random programs). An opti
 reads it can then take a slightly different path: on the benchmarks below the objective
 values agree to five or more significant digits, some with one or two iterations more or
 fewer. A block keeps the interpreter if it uses a statement-level `if (cond) { ... }` block,
-`sqrt`, `inv_logit`, `logit` or `mod`, or reads anything other than the states, the individual
-parameters, its own intermediate variables, literals and the time variables.
+`inv_logit`, `logit`, `tanh`, `softplus`, `sin`, `cos`, `pnorm` or `mod`, or reads anything
+other than the states, the individual parameters, its own intermediate variables, literals and
+the time variables. `sqrt` compiles (as `sqrt(max(x, 0))`, the interpreter's guard, with a
+zero derivative where the argument is not positive), so a
+quasi-steady-state root such as `0.5 * (B + sqrt(B * B + 4 * KSS * CT))` no longer needs to be
+written with `^ 0.5` to get native code.
 
 Whole fits (FOCEI with the covariance step, one thread) with forward native code alone
 ("before") and with the direct stepper calls, the compiled reverse pass and the PK-space
@@ -483,15 +505,18 @@ informational entry in `warnings` / `warning_details` (category `ode_rhs_route`)
 ([#2681](https://github.com/FeRx-NLME/ferx-core/issues/2681)):
 
 - `W_ODE_RHS_INTERPRETED`: the block keeps the interpreter. The message names the
-  construct (an `if (…) { … }` statement, `sqrt`, a read of `L` before it is assigned, …)
-  and the statement it is in (`d/dt(sm)`, the assignment to `E`).
+  construct (an `if (…) { … }` statement, `tanh`, a read of `L` before it is assigned, …)
+  and the statement it is in (`d/dt(sm)`, the assignment to `E`). `sin` and `cos`
+  ([#2720](https://github.com/FeRx-NLME/ferx-core/issues/2720)) are among the functions
+  the compiler does not translate, as are `pnorm`, `tanh`, `softplus`, `logit` and `inv_logit`;
+  `sqrt` is translated ([#2844](https://github.com/FeRx-NLME/ferx-core/issues/2844)).
 - `W_ODE_RHS_NOT_NATIVE`: the block compiled, but runs as register code, because
   `FERX_NO_RHS_JIT=1` is set, Cranelift cannot target the host, or the native compiler did
   not build the program.
 
 A compiled block that runs as native code gets no entry. To keep a block compiled, rewrite
 the construct the message names: an `if (…) { … }` statement as inline `if`s (see
-[Inline conditionals](#inline-conditionals)); a `sqrt` of individual parameters only moves
+[Inline conditionals](#inline-conditionals)); a `tanh` of individual parameters only moves
 to `[individual_parameters]`.
 
 ### Sensitivities in PK space {#pk-space-sensitivities}
@@ -931,9 +956,17 @@ stability signal used by the original Dormand–Prince stiffness detector. Conse
 verdicts switch to the stiff method without another RHS evaluation. Those verdict counters
 belong to the subject solve and survive event boundaries, even though the stepper workspace is
 rebuilt because a dose or forcing change invalidates its stages. Every 25 accepted steps `auto`
-also re-runs the Jacobian probe as a backstop. If either detector changes the verdict, it
+also re-runs the Jacobian probe as a backstop. If either detector finds the segment stiff, it
 **swaps the stepper in place**: the segment keeps everything it has integrated so far and
-carries on with the other method, rather than restarting or re-solving.
+carries on with the stiff method, rather than restarting or re-solving.
+
+The switch is **one-way**: explicit to stiff, never back (#2845). Once a segment is on a stiff
+stepper it is not re-probed, so a fast mode that relaxes later in the segment does not demote it
+to RK45. Demotion on a single probe reading used to do exactly that on a full-TMDD model whose
+binding mode relaxes after the dose: the tail was integrated at explicit accuracy, at a point set
+by step counts, so `auto` carried RK45's OFV error and its jitter in θ instead of `rodas4`'s. A
+stiff stepper integrates a non-stiff tail correctly, only at a higher cost per step, and the
+next segment is probed afresh at its entry state, so that cost never outlives the segment.
 
 A switch onto a stiff method is guarded exactly like a start-of-segment escalation: if that half
 comes back non-finite or clamps at the minimum step, the segment is discarded and re-solved with
@@ -951,8 +984,8 @@ prediction.
 Being threshold tests, both detectors add a **discontinuity** in the objective as a function
 of θ: a segment whose stage estimate or `|Re λ|max` sits near its threshold can switch at θ
 and not at θ+h, and the two trajectories differ by far more than the solver tolerance. The
-start-of-segment probe and the escalation guard have the same property — re-probing adds up to
-eight more decision points per segment. Unlike `ode_stiff_abort_after` this is
+start-of-segment probe and the escalation guard have the same property — re-probing adds one
+more decision per segment, the step at which it escalates. Unlike `ode_stiff_abort_after` this is
 still on by default, because on a segment that actually turns stiff the alternative is not a
 slightly different trajectory but a 143 %-wrong one. If a covariance step returns implausible
 standard errors on a model whose `ode_solver` warning reports mid-segment switches, re-run it

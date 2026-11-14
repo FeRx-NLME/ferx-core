@@ -330,3 +330,45 @@ fn a_derivative_free_fit_does_not_warn_about_the_preflight_gradient() {
         result.warnings
     );
 }
+
+/// #2906. A mixture on an NLopt **gradient** optimizer with one subject the adjoint
+/// declines. That subject's (subject × class) terms used to send the whole mixture gradient
+/// to a central difference of the full objective, with no warning, while
+/// `gradient_method_outer` kept reading `analytic (Dual2)`. The terms are now salvaged on
+/// their own (reconverged, so the structural sentence), and the decline reaches the #1154
+/// warning like a single-population one. Lag 0.25, as in [`WARFARIN_F`], so the start
+/// objective is not the degenerate one a 0.5 lag gives on this data.
+#[test]
+fn a_gradient_driven_mixture_fit_warns_about_its_declined_subject() {
+    let src = MIXTURE_F.replace("ALAG = 0.5", "ALAG = 0.25");
+    assert!(src.contains("ALAG = 0.25"), "fixture: lag replaced");
+    let model = ferx_core::parse_model_string(&src).expect("mixture model parses");
+    let mut population = ferx_core::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let n_total = population.subjects.len();
+    let declining_id = make_subject_0_decline(&mut population);
+
+    let result = ferx_core::fit(
+        &model,
+        &population,
+        &model.default_params,
+        &one_gradient_eval_options(),
+    )
+    .expect("mixture fit succeeds");
+    assert_eq!(result.optimizer, "nlopt_lbfgs");
+    assert_eq!(result.gradient_method_outer, "analytic (Dual2)");
+    let w = outer_fd_warning(&result.warnings).unwrap_or_else(|| {
+        panic!(
+            "a declined mixture subject must warn; got {:?}",
+            result.warnings
+        )
+    });
+    assert!(
+        w.contains(&format!("1 of {n_total}")) && w.contains(&declining_id),
+        "warning must count and name exactly the declining subject; got: {w}"
+    );
+    assert!(
+        w.contains("no analytic recorder serves them") && !w.contains("fixed-EBE"),
+        "a mixture salvage is reconverged, never held-EBE; got: {w}"
+    );
+}

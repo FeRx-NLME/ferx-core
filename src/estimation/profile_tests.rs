@@ -1973,6 +1973,80 @@ fn profiled_trace(edit: fn(String) -> String, method: &str, file: &str) {
     }
 }
 
+/// #2797 on the profiled step: a structural coordinate on the internal guard at `x_hat` is
+/// held once `A_p` is positive definite — `A_p⁻¹` becomes the inverse of its sub-block over
+/// the rest, embedded with a zero row, and the level blocks built from it inherit the zero
+/// cross-covariance — while the same `A_p` at a point off the rail publishes the
+/// unconditional `2·A_p⁻¹`. Both sides of the gate in one test. Dies when the profiled
+/// step's `condition_on_held` is dropped, or reads the guard set off the template (the
+/// template here is the off-rail start).
+#[test]
+fn a_profiled_step_holds_a_structural_coordinate_on_the_guard() {
+    let p = prep(F2, F2_DATA, Some(2), |t| t);
+    let layout = layout_of(&p);
+    let o = options(&p);
+    let c = ctx(&p, &layout, &o);
+    let hold = hold_template(&layout, &p.init_params);
+    let PackedStart {
+        packed: x, fixed, ..
+    } = pack_with_bounds(&hold);
+    let free: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
+    let s = c
+        .solve(
+            &unpack_params(&x, &hold),
+            &ProfileWarm::from_template(&layout, &p.init_params),
+        )
+        .unwrap();
+    let x_hat = solved_point(&layout, &hold, &x, &s);
+    let nf = free.len();
+    // ETA_EM's log-Cholesky diagonal: the first packed coordinate after θ.
+    let eta = hold.theta.len();
+    let a = free.iter().position(|&i| i == eta).expect("ETA_EM is free");
+    let a_p = DMatrix::from_fn(
+        nf,
+        nf,
+        |i, j| if i == j { 10.0 * (i + 1) as f64 } else { 0.5 },
+    );
+
+    // Off the rail: the unconditional inverse, ETA_EM's row live.
+    let off = c
+        .covariance_from_profile_hessian(&hold, &x_hat, &free, &s, &a_p, Instant::now(), None)
+        .matrix
+        .expect("a PD A_p publishes a matrix");
+    assert!(off[(eta, eta)] > 0.0);
+
+    // On the rail: held.
+    let mut on_rail = x_hat.clone();
+    on_rail[eta] = -6.0;
+    assert_eq!(
+        crate::api::held_guard_coordinates(&unpack_params(&on_rail, &hold)),
+        [eta]
+    );
+    let held =
+        c.covariance_from_profile_hessian(&hold, &on_rail, &free, &s, &a_p, Instant::now(), None);
+    assert!(held.warnings.is_empty(), "{:?}", held.warnings);
+    let m = held.matrix.expect("a PD A_p publishes a matrix");
+    for k in 0..m.nrows() {
+        assert_eq!(m[(eta, k)], 0.0, "row {k}");
+        assert_eq!(m[(k, eta)], 0.0, "col {k}");
+    }
+    let keep: Vec<usize> = (0..nf).filter(|&b| b != a).collect();
+    let sub = DMatrix::from_fn(keep.len(), keep.len(), |i, j| a_p[(keep[i], keep[j])]);
+    let want = sub.cholesky().unwrap().inverse() * 2.0;
+    for (i, &ki) in keep.iter().enumerate() {
+        for (j, &kj) in keep.iter().enumerate() {
+            assert!(
+                (m[(free[ki], free[kj])] - want[(i, j)]).abs() < 1e-12,
+                "({ki}, {kj})"
+            );
+        }
+    }
+    // The held coordinate's correlation with the rest moved the others: not the off-rail
+    // matrix's structural block.
+    let other = free[keep[0]];
+    assert_ne!(m[(other, other)], off[(other, other)]);
+}
+
 /// Row 4, the non-PD SIR fallback: an `A_p` that is not positive definite publishes no
 /// matrix, warns with its eigenvalues, and hands SIR the unprofiled step's rectified
 /// proposal over the structural block — at the same 4× inflation — extended over the
@@ -2472,7 +2546,7 @@ fn level_blocks_over_levels_are_the_theta_hessian() {
     for sidx in 0..free.len() {
         // Well below the stencil's default: the blocks are exact now (#2109), so the
         // oracle's truncation is the whole gap.
-        let floor = fd_step_floor(&hold, &c.model.default_params, free[sidx]);
+        let floor = fd_step_floor(&hold, &c.model, free[sidx]);
         let hs = fd_step(LEVEL_BLOCKS_ORACLE_STEP, x[free[sidx]], floor);
         for a in 0..n {
             let h = hl[a];
@@ -4368,6 +4442,11 @@ fn a_fit_with_a_level_on_its_bound_holds_it_in_the_covariance_step() {
             .as_ref()
             .unwrap_or_else(|| panic!("no covariance: {:?}", f.warnings));
         assert_eq!(f.profiled_levels_at_bound, held);
+        // `cov_fixed` says so (#2695), though the level is not FIX in `theta_fixed`.
+        for &k in held {
+            assert!(f.cov_fixed[k] && !f.theta_fixed[k], "θ index {k}");
+        }
+        assert_eq!(f.cov_fixed.len(), c.nrows());
         for k in 0..f.theta.len() {
             if held.contains(&k) {
                 assert!(
@@ -4535,6 +4614,7 @@ fn run_covariance_reports_the_levels_its_step_held() {
             out.warnings
         );
         assert_eq!(out.profiled_levels_at_bound, [k], "{cell}");
+        assert!(out.cov_fixed[k], "{cell}: the replayed step held it");
         let n = |w: &str| out.warnings.iter().filter(|x| x.as_str() == w).count();
         assert_eq!(
             (n(&at(true)), n(&at(false))),
@@ -4890,7 +4970,7 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
         .free
         .iter()
         .map(|&i| {
-            let floor = fd_step_floor(&cp.hold, &c.model.default_params, i);
+            let floor = fd_step_floor(&cp.hold, &c.model, i);
             fd_step(LEVEL_BLOCKS_ORACLE_STEP, cp.x_hat[i], floor)
         })
         .collect();
@@ -4900,7 +4980,7 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
         .free
         .iter()
         .map(|&i| {
-            let floor = fd_step_floor(&cp.hold, &c.model.default_params, i);
+            let floor = fd_step_floor(&cp.hold, &c.model, i);
             fd_step(a_step, cp.x_hat[i], floor)
         })
         .collect();
@@ -5009,7 +5089,7 @@ fn the_schur_profile_hessian_is_the_profile_stencil() {
                 c.solve(&unpack_params(xv, &cp.hold), &warm)
                     .map_or(f64::NAN, |s| s.ofv)
             };
-            let floor = fd_step_floors(&cp.hold, &c.model.default_params);
+            let floor = fd_step_floors(&cp.hold, &c.model);
             let st = fd_ofv_hessian(
                 cp.x_hat.len(),
                 &cp.x_hat,
@@ -7365,4 +7445,60 @@ fn every_study_and_the_profiled_twin_get_one_verdict_above_the_floor() {
         "{:?}",
         profiled.warnings
     );
+}
+
+/// #2799: `profiled_budget_spent`, the one predicate behind the budget advice and
+/// `OuterResult::eval_budget_spent`: a budget spent before a leg, or a leg that ended
+/// `Settled` on `MaxEvalReached`, and nothing else — not a leg cap or an unneeded polish that
+/// happens to carry `MaxEvalReached`, not a tolerance stop. Mutation: drop either disjunct →
+/// its row.
+#[test]
+fn a_profiled_budget_is_spent_only_before_or_during_a_leg() {
+    use nlopt::{FailState as F, SuccessState as S};
+    let cases: [(&str, PolishEnd, NloptReturn, bool); 7] = [
+        (
+            "before a leg",
+            PolishEnd::BudgetSpent,
+            ok(S::XtolReached),
+            true,
+        ),
+        (
+            "during a leg",
+            PolishEnd::Settled,
+            ok(S::MaxEvalReached),
+            true,
+        ),
+        (
+            "settled on tolerance",
+            PolishEnd::Settled,
+            ok(S::FtolReached),
+            false,
+        ),
+        (
+            "settled on failure",
+            PolishEnd::Settled,
+            Err((F::Failure, 1.0)),
+            false,
+        ),
+        (
+            "leg cap on MaxEvalReached",
+            PolishEnd::LegCapReached { last_gain: 1.0 },
+            ok(S::MaxEvalReached),
+            false,
+        ),
+        (
+            "not needed",
+            PolishEnd::NotNeeded,
+            ok(S::MaxEvalReached),
+            false,
+        ),
+        ("skipped", PolishEnd::Skipped, ok(S::FtolReached), false),
+    ];
+    for (name, end, last, want) in cases {
+        assert_eq!(profiled_budget_spent(end, &last), want, "{name}");
+        // The warning's budget advice reads the same predicate.
+        let advises = profiled_verdict_warning(end, &last, false)
+            .is_some_and(|w| w.contains("spent its evaluation budget"));
+        assert_eq!(advises, want, "{name}: warning");
+    }
 }

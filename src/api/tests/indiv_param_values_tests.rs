@@ -95,6 +95,7 @@ fn one_obs_subject() -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![1],
         obs_l2: Vec::new(),
@@ -130,6 +131,8 @@ fn sr_for(n_eta: usize) -> SubjectResult {
         cwres: vec![0.0],
         npde: vec![],
         npd: vec![],
+        epred: vec![],
+        pwres: vec![],
         ofv_contribution: 0.0,
         cens: vec![0],
         n_obs: 1,
@@ -138,7 +141,6 @@ fn sr_for(n_eta: usize) -> SubjectResult {
         extra_columns: Vec::new(),
         per_obs_tad: Vec::new(),
         compartment_states: Vec::new(),
-        #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
         #[cfg(feature = "survival")]
         tte_rows: Vec::new(),

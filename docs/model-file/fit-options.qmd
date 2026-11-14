@@ -66,8 +66,8 @@ What runs, how long, and how it is resumed or traced.
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `method` | `foce`, `focei`, `laplace`, `saem`, `gn`, `gn_hybrid`, `impmap`, `imp` (only as final chain stage) | `focei` | Estimation method (or single-stage method in a chain). See [chained fits](../estimation/index.qmd#method-chaining). When neither this key nor a wrapper's `method` argument is set, the engine falls back to `focei` and emits a warning so the implicit choice is visible — set `method` here to silence it. `foce` is FOCE **without** η–ε interaction (NONMEM `METHOD=1`) and `focei` FOCE with it (`METHOD=1 INTER`); the choice also fixes the objective every post-fit step scores — the sdtab CWRES, SIR's importance weights, the standalone `run_sir` / `run_covariance`, and the reported `interaction` (#1710). |
-| `threads` | positive integer, `0`, `auto` | `auto` | Number of Rayon worker threads for per-subject parallelism. A positive integer pins the count. `0`/`auto` (or omitting the key) uses the engine's default: available cores − 1 (floored at 1), capped at 8 — most fits gain little from spreading across every core; see [choosing a thread count](#choosing-a-thread-count). A pinned count is an upper bound on the whole fit, `n_starts > 1` included: a multi-start fit runs its start fan-out and the per-subject loops underneath it on the same pinned pool. The CLI's `--threads` flag mirrors this key (see `ferx --help`) and **overrides it** when both are given: an explicit `ferx model.ferx --threads 1` wins over a file that says `threads = 8`, and a warning names both counts. `--threads 0` / `--threads auto` counts as explicit too — it asks for the engine default by name, so it also overrides a pinned count (#1416). |
-| `maxiter` | integer | `500` | Maximum outer loop iterations. `maxiter = 0` is *evaluation only* (NONMEM `MAXEVAL=0`): the engine runs one inner EBE solve at the initial parameters and reports the objective there with no outer optimisation — useful for scoring a fixed parameter set or computing standard errors at known estimates (with `covariance = true`). The reported fit is marked not-converged, and the parameters are returned unchanged — except that the start is still clamped into the optimizer's bounds, so a parameter that begins outside them is evaluated at the bound (e.g. a free `omega ~ 0.0` at `exp(-12)`, not `1e-8`); `FIX` pins a coordinate at its own start and avoids this. |
+| `threads` | positive integer, `0`, `auto` | `auto` | Number of Rayon worker threads for per-subject parallelism. A positive integer pins the count. `0`/`auto` (or omitting the key) uses the engine's default: a positive `RAYON_NUM_THREADS` if set, else available cores − 1 (at least 2 where two cores exist, at least 1), capped at 8 — see [containers](#threads-containers) and [choosing a thread count](#choosing-a-thread-count). A pinned count is an upper bound on the whole fit, `n_starts > 1` included: a multi-start fit runs its start fan-out and the per-subject loops underneath it on the same pinned pool. The CLI's `--threads` flag mirrors this key (see `ferx --help`) and **overrides it** when both are given: an explicit `ferx model.ferx --threads 1` wins over a file that says `threads = 8`, and a warning names both counts. `--threads 0` / `--threads auto` counts as explicit too — it asks for the engine default by name, so it also overrides a pinned count (#1416). |
+| `maxiter` | integer | `500` | Maximum outer loop iterations. `maxiter = 0` is *evaluation only* (NONMEM `MAXEVAL=0`): the engine runs one inner EBE solve at the initial parameters and reports the objective there with no outer optimisation — useful for scoring a fixed parameter set or computing standard errors at known estimates (with `covariance = true`). The reported fit is marked not-converged, and the parameters are returned unchanged — except that the start is still clamped into the optimizer's bounds, so a parameter that begins outside them is evaluated at the bound (e.g. a free `omega ~ 0.0` at `exp(-12)`, not `1e-8`); `FIX` pins a coordinate at its own start and avoids this. How-to: [evaluate the OFV at given parameter values](../faq.qmd#evaluate-ofv). |
 | `checkpoint` | `true`, `false` | `true` | Periodically save a resume point so a run that is interrupted (e.g. `Ctrl-C`, a crashed job) can be restarted from where it stopped instead of from scratch (#755). The CLI writes `{model}.tmp` next to the other outputs and, on the next run of the same model + data, resumes from it automatically; the file is deleted on successful completion. The write is throttled to `checkpoint_interval_secs`, so a run that finishes before the first interval leaves nothing behind. Restart is *coarse*: the population estimates (θ/Ω/Σ) at the last save are used as the new starting point and the fit continues — not a bit-exact optimizer-state resume — so the resumed run may take a few extra iterations to re-converge. What is saved depends on the stage's method. A **deterministic** stage (`foce`, `focei`, `laplace`, `gn`, `gn_hybrid`) saves the **best point it has reached**, not the last one evaluated (#1317): the objective is evaluated at every point the optimizer probes, including the trial steps a line search rejects, so saving the current evaluation could record a throwaway point far from the fit's actual position — the file's `iter` and `ofv` are then the evaluation index and the (unpenalized) objective at that best point. A **`saem`** stage instead saves its *latest* state, which is what a correct continuation of the stochastic-approximation chain resumes from; its `ofv` is that iteration's conditional NLL, not a best-so-far and not comparable to a deterministic stage's. `method_chain` and `stage_idx` in the file say which stage wrote it. A change to the model or data invalidates the checkpoint (a hash check), and the run silently starts fresh. Pass the CLI flag `--clean` to force a fresh start (it deletes any existing `{model}.tmp` first). Set `checkpoint = false` to disable saving entirely. |
 | `checkpoint_interval_secs` | integer | `300` | Minimum wall-clock seconds between checkpoint writes. Larger values reduce I/O overhead but lose more progress on an interrupt; smaller values save more often. Only used when `checkpoint = true`. |
 | `optimizer_trace` | `true`, `false` | `false` | Write a per-iteration CSV to `/tmp/ferx_trace_<pid>_<ts>.csv`. The path is stored in `FitResult::trace_path`. Useful for diagnosing convergence problems or comparing optimizers. See [Optimizer Trace](#optimizer-trace). |
@@ -93,7 +93,7 @@ to 16, onto the SMT siblings of the same cores, saved a further 7–11 % but cos
 about 70 % more CPU time. This is one CPU and two models; scaling depends on the
 host and the model, so treat these as a starting point and time your own fit:
 
-- **The default** (available cores − 1, capped at 8) is a sensible start.
+- **The default** (available cores − 1, at least 2 where two cores exist, capped at 8) is a sensible start.
 - **For a long fit**, try `threads` up to the number of *physical* cores. On the
   machine above, that is where most of the wall-time gain was.
 - **Threads beyond the physical cores** (SMT / hyper-threads) bought little wall
@@ -107,6 +107,55 @@ host and the model, so treat these as a starting point and time your own fit:
 
 The thread count changes speed only. With the same binary, data, model and seed,
 estimates do not depend on it (#703).
+
+#### Containers, CPU quotas and `RAYON_NUM_THREADS` {#threads-containers}
+
+"Available cores" is Rust's `std::thread::available_parallelism()`, which on Linux
+honours the container's cgroup CPU quota rather than the host's core count. Measured in Docker on an 18-core host (`nproc` reports 18 in every case,
+because it ignores the quota):
+
+| `docker run` flag | cores ferx sees | default `threads` |
+|---|---|---|
+| none | 18 | 8 (the cap) |
+| `--cpus 8` | 8 | 7 |
+| `--cpus 4` | 4 | 3 |
+| `--cpus 2` | 2 | 2 |
+
+So a job given 8 CPUs runs 7 workers by default. To use all of them, set
+`threads = 8`, pass `--threads 8`, or set `RAYON_NUM_THREADS=8` in the job's
+environment.
+
+A positive integer in `RAYON_NUM_THREADS` is a pin, used as given: no "minus one"
+and no cap at 8 (#2800). It sits **below** every explicit count. In order, a fit
+uses:
+
+1. `threads = N` from the R package's `ferx_fit()` argument, the CLI's
+   `--threads N`, or `[fit_options] threads = N`, in that precedence (#1416);
+2. `RAYON_NUM_THREADS`, when it is a positive integer;
+3. the default in the table above.
+
+`threads = 0`, `threads = auto` and `--threads auto` name the engine default, so
+the variable applies to them. A value that is not a non-negative integer (`x`,
+`-2`, ` 8` with a space) is ignored, and the fit warns and names it. `0` and an
+empty value mean "the default", as they do for Rayon, and are not warned about.
+A count above the available CPUs, whether from the variable or from `threads`, is
+honoured but warned about, because the workers then time-share the cores. When
+a fit has more workers than subjects, the note that says so also says where the
+count came from.
+
+The variable is read **once per process**, the first time ferx sizes a worker
+pool (any fit, prediction or simulation), because the shared worker pool is sized
+then and cannot be resized. Changing it later in the same R
+session or process has no effect; pass `threads` for a different count.
+
+**Bootstrap.** `ferx-tools`' bootstrap with no `threads` set runs as many
+replicates at once as Rayon's own default pool is wide (or, when called from
+inside a Rayon pool, as that pool has workers). Rayon parses `RAYON_NUM_THREADS`
+exactly as above, so a positive value sizes the replicate lanes too, and an
+unusable one is ignored there as well — silently, since Rayon does not warn. Without the variable the two
+defaults differ: a fit uses the capped default above, while a bootstrap uses one
+lane per logical CPU, since each replicate is pinned to one thread. A bootstrap
+with `threads = N` runs `N` replicates at once whatever the variable says.
 
 #### Worker reuse for repeated fits
 
@@ -179,7 +228,7 @@ The population-parameter search: which algorithm, when it stops, and whether a g
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `report_final_gradient` | `true`, `false` | `true` | Compute a gradient at the reported estimates when the optimizer supplied none of its own, and report it as `final_gradient` (#997): the exact one, with `final_gradient_source = "analytic"`, when every subject is in the analytic gradient's scope, else a central difference with `final_gradient_source = "finite_difference"`. Only `bobyqa` — the derivative-free `auto` pick for out-of-scope ODE/PD, SDE, `gradient = fd` and `[mixture]` models — has no gradient of its own; every other outer optimizer reports the one it used, labelled `"optimizer"`. Without this a derivative-free run reports `converged = true` with nothing in the result to check the claim against, which is how a BOBYQA fit that stopped 1.54 OFV short of the L-BFGS optimum on the same model looked identical to one that had not. It is a **reporting** quantity: computed once, after the fit, never fed to the optimizer, so the estimates are bit-identical either way. Costs one gradient — the exact one, or `2 × n_free` objective evaluations for the difference — the same as a single step of the optimizers that get it for free. Set `false` when that is not worth paying (a large ODE model whose every evaluation is seconds). It does not govern the covariance step's stationarity gradient after a `saem` / `imp` / `impmap` / `vi` fit, which always runs ([#2541](https://github.com/FeRx-NLME/ferx-core/issues/2541), [details](../estimation/saem.qmd#saem-stationarity)). |
+| `report_final_gradient` | `true`, `false` | `true` | Compute a gradient at the reported estimates when the optimizer supplied none of its own, and report it as `final_gradient` (#997): the exact one, with `final_gradient_source = "analytic"`, when every subject is in the analytic gradient's scope, else a central difference with `final_gradient_source = "finite_difference"`. Only `bobyqa` — the derivative-free `auto` pick for out-of-scope ODE/PD, SDE, `gradient = fd` and `[mixture]` models — has no gradient of its own; every other outer optimizer reports the one it used, labelled `"optimizer"`. Without this a derivative-free run reports `converged = true` with nothing in the result to check the claim against, which is how a BOBYQA fit that stopped 1.54 OFV short of the L-BFGS optimum on the same model looked identical to one that had not. It is a **reporting** quantity: computed once, after the fit, never fed to the optimizer, so the estimates are bit-identical either way. Costs one gradient — the exact one, or `2 × n_free` objective evaluations for the difference — the same as a single step of the optimizers that get it for free. Set `false` when that is not worth paying (a large ODE model whose every evaluation is seconds). It does not govern the covariance step's stationarity gradient, which always runs when the step builds an `R` — after a `saem` / `imp` / `impmap` / `vi` fit ([#2541](https://github.com/FeRx-NLME/ferx-core/issues/2541), [details](../estimation/saem.qmd#saem-stationarity)), and since [#2785](https://github.com/FeRx-NLME/ferx-core/issues/2785) after every other method too, where it can demote `converged` ([details](../estimation/optimizers.qmd#what-converged-guarantees)). |
 
 #### Global pre-search {#outer-optimizer-global-search}
 
@@ -200,7 +249,7 @@ The per-subject empirical-Bayes search that the outer objective is built from.
 | `inner_restarts` | integer | `1` | Guarded multi-start count for the inner (per-subject EBE) optimizer, to escape a **multimodal individual objective**. A subject that a single warm-started BFGS would leave in the wrong basin re-solves from `N` Ω-scaled cold-start seeds and keeps the lowest-objective mode; unimodal subjects are bit-identical to `0` and pay only a flatness probe. Set `0` to disable — see [Escaping a multimodal individual objective](#escaping-a-multimodal-individual-objective). |
 | `inner_screen` | integer ≥ 0 | `100` | Size `N` of the Sobol screen the cold multi-start runs before its per-coordinate seeds, to find an individual mode that lies off every axis (the flip-flop `ka ↔ CL/V` twin). The `3` lowest of `N` quasi-random points from `N(0, 4Ω)` are descended, and one replaces the EBE only when it reaches a different, lower mode; unimodal subjects are bit-identical to `0`. Runs only where `inner_restarts` does, so `inner_restarts = 0` disables it too. Set `0` to disable — see [The Sobol screen](#inner-screen). |
 | `inner_twin_seed` | `true`, `false` | `true` | Seed the cold multi-start with the subject's flip-flop twin before the screen: on a closed-form `one_cpt_oral` model whose `V` and `KA` are each log-normal on a random effect of their own, one descent from `η_V`, `η_KA` moved together by `ln(k/ka)`. Kept only when it reaches a different, lower mode; every other model takes no seed. Runs only where `inner_restarts` does. Set `false` to disable — see [The flip-flop twin seed](#inner-twin-seed). |
-| `reconverge_gradient_interval` | integer ≥ 0 | `0` | How often to re-solve each subject's inner EBE loop during the population gradient instead of holding the EBEs (η̂) and FOCE Hessian fixed. `0` (default) never reconverges — the cheap fixed-EBE gradient is used. `1` reconverges on every gradient evaluation, at roughly **5–6× the per-gradient cost**; `N` reconverges on evaluations `0, N, 2N, …` and uses the cheap gradient in between. Raise it when a gradient optimizer stalls above the derivative-free optimum. IOV models (`kappa`/`block_kappa`) always reconverge and ignore this setting. Models with an `[event_model]`, `[binary_model]` or `[markov_model]` endpoint and random effects take the exact marginal gradient, which carries the EBE response itself (see [TTE: the outer gradient](../estimation/tte.qmd#outer-gradient-reconverged)). The reconverged gradient steps packed coordinate `i` by `1e-4·(s_i + |x_i|)`, with the floor `s_i` of `fd_hessian_step` below, so a small identity-packed θ is stepped relative to its declared value rather than through zero; the mixture FD gradient (`1e-5·s_i`) and SAEM's and VI's θ differences (floor `|θ₀|` for any packing) do the same ([#2187](https://github.com/FeRx-NLME/ferx-core/issues/2187)). See [Gradient accuracy vs cost](../estimation/foce.qmd#gradient-accuracy-vs-cost-reconverged-ebes). |
+| `reconverge_gradient_interval` | integer ≥ 0 | `0` | How often to re-solve each subject's inner EBE loop during the population gradient instead of holding the EBEs (η̂) and FOCE Hessian fixed. `0` (default) never reconverges — the cheap fixed-EBE gradient is used. `1` reconverges on every gradient evaluation, at roughly **5–6× the per-gradient cost**; `N` reconverges on evaluations `0, N, 2N, …` and uses the cheap gradient in between. Raise it when a gradient optimizer stalls above the derivative-free optimum. IOV models (`kappa`/`block_kappa`) always reconverge and ignore this setting. Models with an `[event_model]`, `[binary_model]` or `[markov_model]` endpoint and random effects take the exact marginal gradient, which carries the EBE response itself (see [TTE: the outer gradient](../estimation/tte.qmd#outer-gradient-reconverged)). The reconverged gradient steps packed coordinate `i` by `1e-4·(s_i + |x_i|)`, with the floor `s_i` of `fd_hessian_step` below, so a small identity-packed θ is not stepped across 0; the mixture FD gradient (`1e-5·s_i`) and SAEM's and VI's θ differences (floor `|θ₀|` for any packing) do the same ([#2187](https://github.com/FeRx-NLME/ferx-core/issues/2187)). See [Gradient accuracy vs cost](../estimation/foce.qmd#gradient-accuracy-vs-cost-reconverged-ebes) and [when it grows](../estimation/foce.qmd#small-theta-fd-step). |
 | `mu_referencing` | `true`, `false` | `true` | Re-centre inner-loop ETA estimates on the current population mean (auto-detected from `[individual_parameters]`). See the [FAQ entry](../faq.qmd#do-i-need-to-use-mu-referencing-in-my-model-definitions-like-in-nonmem-nlmixr2) for details. Set `false` to reproduce pre-automatic-mu behaviour. Under a `[mixture]` model this also switches off the class-aware mu-referencing θ shift for SAEM and estimating IMP/IMPMAP (see [Mixture models](../estimation/mixture.qmd#mu-referencing-under-a-mixture)). |
 
 #### Choosing `inner_tol` {#choosing-inner-tol}
@@ -213,13 +262,38 @@ Guarded multi-start count for the inner (per-subject EBE) optimizer, to escape a
 
 The initial BFGS metric also decides which basin a cold start lands in. Under `focei`, `foce`, `gn`, `gn_hybrid` and `laplace` (any `n_agq`), warm-started inner solves seed BFGS from the subject's conditional η-Hessian, which speeds up re-convergence near the previous mode. A **cold** start (the first outer evaluation and the final cold EBE re-solve) runs twice, once with that seed and once with the historical metric, and keeps the lower objective; the two share one [Sobol screen](#inner-screen), whose descents read neither metric (#2549). Neither metric picks the right basin on every subject ([#1504](https://github.com/FeRx-NLME/ferx-core/pull/1504)). If both reach the same mode, the historical solve is kept, so unimodal subjects are unchanged. Models with a `[covariate_nn]` block never use the seed.
 
+#### Seeds under a correlated Ω {#inner-restarts-correlated}
+
+A per-coordinate seed is placed `±2·sd`, `±3·sd`, … along its random effect. Under a `block_omega`, the random effects correlated with it move too, by their conditional mean given that move: the seed follows Ω's own column for that coordinate, so it sits the intended 2 or 3 prior SDs out. With a diagonal Ω nothing else moves and the seeds are as before. On a subject with occasions the same holds for the random effects' block of the search vector; a `kappa` seed moves only its own `kappa`.
+
+Until [#2788](https://github.com/FeRx-NLME/ferx-core/issues/2788) the other random effects were held. On a strongly correlated Ω that crosses the prior's ridge. On a melphalan 2-compartment ODE model at a FOCEI plateau, with ρ(η_CL, η_V) = 0.9995, a 2-SD η_CL seed with η_V held was at a prior distance `ηᵀΩ⁻¹η` of about 6×10⁵. The descents from those seeds ran on to `V2` of 10⁻⁶⁰ to 10¹¹⁰, where every ODE solve is stiff. On the same optimizer path, the cold solve of 68 subjects at that plateau went from 78 s to 1.3 s, and the fit from 191 s to 13 s, ending at the same OFV, 2686.670708 (Linux x86_64, one thread).
+
+#### Inter-occasion variability {#inner-restarts-iov}
+
+On a subject with occasions in a `kappa` / `block_kappa` model, the per-coordinate seeds run on the whole search vector: every random effect and each occasion's `kappa` ([#2730](https://github.com/FeRx-NLME/ferx-core/issues/2730)). Before #2730 they did not run on these subjects at all, so `inner_restarts` had no effect there. Each `kappa` seed is placed by that `kappa`'s own variance, and under [nested levels](individual-parameters.qmd) there is one coordinate per group of each level.
+
+The same rule picks the coordinates. A subject with system resets or time-varying covariates scans every one. Any other subject scans a flat coordinate, and also one with a barrier on the way to its seed: the objective at the midpoint is at least as high as at the seed. An occasion with a few informative samples can have a second solution in `kappa` and be sharply curved at both, so flatness alone would miss it.
+
+A seed's descent replaces the EBE only when it ends lower and more than 0.5 from it in the prior's metric, the test the Sobol screen uses, so a unimodal subject is bit-identical to `inner_restarts = 0`.
+
+The cost is `2 * inner_restarts` descents per scanned coordinate, on cold solves only. It grows linearly with the occasions: a reset subject with 3 random effects and 3 `kappa`s on 3 occasions has 12 coordinates, so 24 descents per cold solve at the default. On `examples/warfarin_iov_ode_bloq.ferx` the fit's CPU time is unchanged, and with an `EVID=4` reset added at each later occasion it rises from 0.56 s to 1.02 s (macOS arm64). Set `inner_restarts = 0` if that is too much for a large ODE model.
+
+The move is chosen on the inner objective, not on the subject's FOCEI contribution, and the two can disagree: a lower individual mode can raise the OFV. NONMEM's `MCETA` makes the same choice. On the two-mode dataset in `nonmem_anchor/iov_kappa_two_mode*`, evaluated at fixed parameters:
+
+| Dataset | `inner_restarts = 0` | NONMEM, descent from zero | default | NONMEM, other starts |
+|---|---|---|---|---|
+| occasion 2 opens with `EVID=4` | 4.2797 | 4.2797 | -4.5724 | -4.5724 (started at the ferx EBEs) |
+| no reset | 4.8006 | 4.8006 | -5.2912 | -5.2912 (`MCETA=200`) |
+
+With the reset, `MCETA=200` reports -6.4973: it reaches the same mode for the two-mode subject, and misses a lower inner mode of another subject that the seeds find.
+
 #### The Sobol screen {#inner-screen}
 
 The per-coordinate seeds above move one random effect at a time, so they cannot reach a mode that only opens when two move together. The one-compartment oral flip-flop is the standard case: when absorption is slower than elimination, the data fit `(ka, k)` and the swapped pair almost equally well, and the twin sits where `η_ka` and `η_V` move together. On a synthetic subject with `ka = 0.02` and `k = CL/V = 0.1`, a cold descent from η = 0 and every axis seed stop at an individual objective of −42.34, while the twin is at −50.16 ([#2013](https://github.com/FeRx-NLME/ferx-core/issues/2013)).
 
 With `inner_screen = N > 0` (default `100`), each cold multi-start first scores `N` points of a scrambled Sobol sequence mapped to `N(0, 4Ω)`, twice the prior SD on every axis and correlated as Ω is, and runs a full inner descent from the `3` lowest. A descent replaces the current EBE only when its objective is lower by more than `1e-9` **and** it lies more than `0.5` from the current EBE in the Ω⁻¹ metric. A descent that comes back to the current mode, even a hair lower, is turned away, so a subject with one mode keeps exactly the EBE it gets with `inner_screen = 0`. The per-coordinate seeds then run as before, from whatever EBE the screen leaves.
 
-The screen runs on the same cold solves as `inner_restarts`, and `inner_restarts = 0` turns it off too. It applies to `focei`, `foce`, `laplace` (any `n_agq`), `gn`, `gn_hybrid` and `trust_region`, to the covariance step's re-solves and a mixture's per-class solves, and to SAEM's final EBE pass. Subjects of a model with inter-occasion variability (`kappa`/`block_kappa`) are not screened, nor are the EBEs of `imp`, `impmap` and `bayes`.
+The screen runs on the same cold solves as `inner_restarts`, and `inner_restarts = 0` turns it off too. It applies to `focei`, `foce`, `laplace` (any `n_agq`), `gn`, `gn_hybrid` and `trust_region`, to the covariance step's re-solves and a mixture's per-class solves, and to SAEM's final EBE pass. Subjects of a model with inter-occasion variability (`kappa`/`block_kappa`) are not screened, though the [per-coordinate seeds](#inner-restarts-iov) run on them, and neither are the EBEs of `imp`, `impmap` and `bayes`.
 
 The Sobol scramble is seeded from a fixed hash of the subject's ID, so the result does not depend on the number of threads or on where the subject sits in the data; renaming a subject changes its sequence. At `N = 100` the synthetic flip-flop subject reaches the twin on all 100 sequences tried, in both of the #2013 configurations. The cost is `N` objective evaluations and up to `3` descents per cold solve. Under the seeded BFGS metric a cold solve runs twice (see above), and so does its screen. On `examples/warfarin.ferx` and `examples/schnider.ferx` the default screen leaves the fit and the sdtab byte-identical to `inner_screen = 0`, and wall time goes from 0.08 s to 0.10 s and from 1.02 s to 1.21 s (macOS arm64, fastest of three runs).
 
@@ -265,7 +339,12 @@ The post-fit covariance step. See [Covariance Step](../estimation/foce.qmd#covar
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `analytic_cov_hessian` | `true`, `false` | `true` | Use the **exact analytic R-matrix** for the covariance step when the model is in scope, instead of the finite-difference-of-OFV Hessian (#436). The analytic route is the adjoint gradient's identity one order up (`Uᵀ∇²Ψ U`, #486; see [FOCE / FOCEI](../estimation/foce.qmd)), by reverse over forward through the same recorder and likelihood kernel, so it carries no `fd_hessian_step` to tune and no `ε/h²` differencing noise. It covers the subjects the exact outer gradient covers, for every objective — FOCE, FOCEI, `laplace` and AGQ under either anchor — on closed-form and `[odes]` models, IOV and M3 censoring included, for up to 48 random effects (stacked `[η, κ]` under IOV; 8 under Laplace's exact anchor). The full scope lives on the estimation pages rather than here: [the R-matrix's scope](../estimation/foce.qmd#sensitivity-assembly) and, for quadrature fits, [When it applies](../estimation/agq.qmd#when-it-applies), which also covers the anchor having to be positive-definite at the subject's mode. TTE, categorical and Markov endpoints are in scope, and so is a FOCE/FOCEI mixture. A model-level exclusion (a mixture under `laplace`/AGQ, an SDE model, `gradient = fd`, …) keeps the whole fit on the finite-difference stencil, which is correct for all of them. A subject-level one does not: since [#1514](https://github.com/FeRx-NLME/ferx-core/issues/1514) the covariance step assembles the exact term for every in-scope subject and finite-differences only the declining subjects' own terms, adding them into the same information sum $\sum_i R_i$. Each term is then an estimate of *itself* — the observed information is a per-subject sum, so this is not a blend of two approximations of one matrix — and the fit reports a `W_COV_ANALYTIC_SALVAGE` note naming the salvaged subjects. When at least half the population declines, the whole-population stencil is taken instead: there is no analytic majority left to carry the cost, and rebuilding it subject by subject measured +4% wall for a matrix identical to 7 significant figures. Set `analytic_cov_hessian = false` to force finite differences for an in-scope model (e.g. to reproduce standard errors from a pre-#436 run). |
-| `fd_hessian_step` | float | `1e-2` | Initial relative step size for the finite-difference Hessian used in the covariance step. Ignored when the analytic R-matrix (`analytic_cov_hessian`) serves the fit, which differences nothing at the population level. The actual perturbation for packed coordinate `i` is `fd_hessian_step * (s_i + |x_hat[i]|)`, with `s_i = 1` except on an identity-packed θ (one with a negative lower bound) whose declared initial value θ₀ satisfies `0 < |θ₀| < 1`, where `s_i = |θ₀|` ([#2147](https://github.com/FeRx-NLME/ferx-core/issues/2147)). Such a θ is stepped in its own units, so without the floor a θ of 0.0077 would be stepped by ~0.01 — through zero. The same floor applies to the per-subject score's finite differences behind `covariance_method = s` / `rsr`, and a mixture's mixing-probability derivative — taken in θ's own units, so for any packing — steps `1e-6·max(|θ|, |θ₀|)` when `0 < |θ₀| < 1`. A θ whose estimate lands far below its θ₀ in magnitude is still stepped relative to θ₀; declare θ₀ at the parameter's scale. ferx automatically halves this value up to 8 times if any diagonal stencil evaluates to a non-finite value, so in most cases the default requires no tuning. Choosing it by hand is [a trade between two errors](#fd-hessian-step-choice). A `profile`d fit's `A_p` stencil defaults to `3e-3` ([why](parameters.qmd#profiled-level-blocks)); an explicit value is used as written. Must be positive and finite. |
+| `fd_hessian_step` | float | `1e-2` | Initial relative step size for the finite-difference Hessian used in the covariance step. Ignored when the analytic R-matrix (`analytic_cov_hessian`) serves the fit, which differences nothing at the population level. The actual perturbation for packed coordinate `i` is `fd_hessian_step * (s_i + |x_hat[i]|)`, with `s_i = 1` except on an identity-packed θ (one with a negative lower bound) whose declared initial value θ₀ satisfies `0 < |θ₀| < 1`, where `s_i = |θ₀|` ([#2147](https://github.com/FeRx-NLME/ferx-core/issues/2147)), and on a `[covariate_nn]` weight, where `s_i = 1` always (the weight's packed value *is* its natural scale; see [Finite-difference steps on the weights](covariate-nn.qmd#finite-difference-steps-on-the-weights)). Without the floor a θ of 0.0077 would be stepped by ~0.01, through zero. The same floor applies to the per-subject score's finite differences behind `covariance_method = s` / `rsr`, and a mixture's mixing-probability derivative — taken in θ's own units, so for any packing — steps `1e-6·max(|θ|, |θ₀|)` when `0 < |θ₀| < 1`. A θ whose estimate lands far below its θ₀ in magnitude is still stepped relative to θ₀; declare θ₀ at the parameter's scale. [A tighter re-solve can grow it](../estimation/foce.qmd#small-theta-fd-step). ferx automatically halves this value up to 8 times if any diagonal stencil evaluates to a non-finite value, so in most cases the default requires no tuning. Choosing it by hand is [a trade between two errors](#fd-hessian-step-choice). A `profile`d fit's `A_p` stencil defaults to `3e-3` ([why](parameters.qmd#profiled-level-blocks)); an explicit value is used as written. Must be positive and finite. |
+
+#### Reconverging the EBEs for the covariance step {#cov-inner-tol}
+
+| Key | Values | Default | Description |
+|-----|--------|---------|-------------|
 | `cov_inner_tol` | float | `inner_tol` (LTBS: `min(inner_tol, 1e-8)`) | Inner EBE-reconvergence tolerance used **only by the covariance step**, decoupled from `inner_tol`. The covariance R-matrix is a second-difference of the reconverged OFV and is more sensitive to EBE precision than the fit itself, so on a flat or weakly-identified surface an EBE converged only to the fit's `inner_tol` can leave enough residual noise to perturb the standard errors (e.g. the heavily-censored M3 + IOV case in #654 — set `cov_inner_tol = 1e-11`). This lets the covariance step reconverge tighter without slowing every outer iteration. Unset (default) uses `inner_tol` for ordinary models (SEs unchanged) and `min(inner_tol, 1e-8)` for **closed-form LTBS** models, whose `g = ln(f)` covariance Hessian needs the tighter reconvergence — including LTBS combined with `[iov]` since #486, when that combination's inner loop moved onto the same analytic `ln(f)` gradient. The default is deliberately *not* tightened for every model — over-converging some ill-conditioned inner Hessians drives the covariance indefinite — so opt in per model with this key. Must be positive and finite. |
 
 #### Choosing `fd_hessian_step` {#fd-hessian-step-choice}
@@ -294,7 +373,7 @@ Set one of these on a model that never integrates — an analytical PK model wit
 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
-| `ode_reltol` | float | `1e-4` | RK45 ODE solver **relative** tolerance. Applies to ODE models, and to the auto-generated ODE **twin** that closed-form transit / inverse-Gaussian absorption models (`one_cpt_transit`, `two_cpt_transit`, `one_cpt_ig`, `two_cpt_ig`) use to serve IOV, time-varying-covariate, and `TIME`-switch subjects (#719/#814) — so a call-time override reaches those rerouted fits too; otherwise ignored for analytical PK. The default reproduces analytical closed forms in PRED to ~`1e-4`, but the FOCE objective amplifies solver error, so the OFV of an ODE-form model can differ from its analytical equivalent by several units. Set a tighter value (e.g. `1e-10`) when the ODE-form **OFV** must match an analytical reference; expect slower fits. **Standard errors have their own sensitivity**: when the covariance step falls back to the finite-difference Hessian (see [`covariance_regularized`](../warnings.qmd#codes-covariance)) it divides by `h²` and so amplifies integration noise, and SEs measured on the 3-cpt IV ODE fixture were 2-7x too large at the default, on the plateau from `ode_reltol = 1e-6` / `ode_abstol = 1e-8` (#520). So a covariance step running that stencil (or its per-subject salvage), or `covariance_method = s`, now runs whole — every matrix and its modes, also on an absorption ODE twin — at no looser than `1e-6` / `1e-8`; estimates and OFV are unchanged. A fully analytic R-matrix keeps the fit's tolerance, and so does `rsr`'s `S` beside it. A tighter fit is left as is (a matrix-exponential solve reads no tolerance, but a segment it declines is integrated at the tighter one); if the tight run cannot be set up, a warning says so. The exact analytic covariance R-matrix, which most Gaussian `[odes]` fits now take, avoids **that** mechanism: it never second-differences the objective, so there is no `1/h²` for integration error to be amplified through, and the #520 sweep measures it flat across eight orders of magnitude of `ode_reltol`. It is not step-free, though — `third_order_fd_step` finite-differences the `Dual2` sensitivity jet to assemble the third-order blocks, so the analytic route keeps a step sensitivity of its own, across a smooth sensitivity rather than across the objective. Where that step would cross an **event kink** — a lagged-dose arrival, an infusion end, a `zero_order` window edge — the sweep bounds it by the observation-to-event gap, so no sample changes sides of the event between the two points of a difference pair; a subject whose mode sits *on* a moving event (a corner minimum of the inner objective, which a lagged arrival at a dense early sample does produce) has no third derivative there and is declined to the per-subject salvage instead. Before that bound, `SE(TVLAG)` on a lagged-dose fixture moved 27 % with the step ([#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505)). |
+| `ode_reltol` | float | `1e-4` | RK45 ODE solver **relative** tolerance. Applies to ODE models, and to the auto-generated ODE **twin** that closed-form transit / inverse-Gaussian absorption models (`one_cpt_transit`, `two_cpt_transit`, `one_cpt_ig`, `two_cpt_ig`) use to serve IOV, time-varying-covariate, and `TIME`-switch subjects (#719/#814) — so a call-time override reaches those rerouted fits too; otherwise ignored for analytical PK. The default reproduces analytical closed forms in PRED to ~`1e-4`, but the FOCE objective amplifies solver error, so the OFV of an ODE-form model can differ from its analytical equivalent by several units. Set a tighter value (e.g. `1e-10`) when the ODE-form **OFV** must match an analytical reference; expect slower fits. FD `H` [runs tighter](../estimation/foce.qmd#fd-jacobian-tolerance). **Standard errors have their own sensitivity**: when the covariance step falls back to the finite-difference Hessian (see [`covariance_regularized`](../warnings.qmd#codes-covariance)) it divides by `h²` and so amplifies integration noise, and SEs measured on the 3-cpt IV ODE fixture were 2-7x too large at the default, on the plateau from `ode_reltol = 1e-6` / `ode_abstol = 1e-8` (#520). So a covariance step running that stencil (or its per-subject salvage), or `covariance_method = s`, now runs whole — every matrix and its modes, also on an absorption ODE twin — at no looser than `1e-6` / `1e-8`; estimates and OFV are unchanged. A fully analytic R-matrix keeps the fit's tolerance, and so does `rsr`'s `S` beside it. A tighter fit is left as is (a matrix-exponential solve reads no tolerance, but a segment it declines is integrated at the tighter one); if the tight run cannot be set up, a warning says so. The exact analytic covariance R-matrix, which most Gaussian `[odes]` fits now take, avoids **that** mechanism: it never second-differences the objective, so there is no `1/h²` for integration error to be amplified through, and the #520 sweep measures it flat across eight orders of magnitude of `ode_reltol`. It is not step-free, though — `third_order_fd_step` finite-differences the `Dual2` sensitivity jet to assemble the third-order blocks, so the analytic route keeps a step sensitivity of its own, across a smooth sensitivity rather than across the objective. Where that step would cross an **event kink** — a lagged-dose arrival, an infusion end, a `zero_order` window edge — the sweep bounds it by the observation-to-event gap, so no sample changes sides of the event between the two points of a difference pair; a subject whose mode sits *on* a moving event (a corner minimum of the inner objective, which a lagged arrival at a dense early sample does produce) has no third derivative there and is declined to the per-subject salvage instead. Before that bound, `SE(TVLAG)` on a lagged-dose fixture moved 27 % with the step ([#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505)). |
 | `ode_abstol` | float | `1e-6` | RK45 ODE solver **absolute** tolerance (companion to `ode_reltol`). ODE models and the closed-form absorption ODE twin (as for `ode_reltol`). |
 | `ode_max_steps` | integer | `10000` | Max solver steps per integration segment. ODE models and the absorption ODE twin. Raise (e.g. `1000000`) if a tight `ode_reltol` exhausts the step budget on stiff multi-compartment systems. |
 | `ode_stiff_abort_after` | integer ≥ 0, or `off` | `off` | Abandon an integration segment once this many of its steps have **clamped at the minimum step size**, instead of grinding on to `ode_max_steps`. A clamp means the step failed its local-error test and was accepted anyway because `dt` could not shrink further — the segment is *stability*-limited, not accuracy-limited, and the remaining thousands of steps buy wall time rather than accuracy. Off by default, and deliberately so: aborting freeze-pads the segment's remaining output times with the last state, so it trades a slow-but-eventually-integrated segment for a padded one — a change to the objective, not only to its cost. On the time-to-event path (which returns an event time rather than a trajectory) an abort is reported as a failed segment instead of being padded. **It applies to every likelihood evaluation, not just the final one**, so a budget that actually bites makes the objective *discontinuous* in θ — a segment that clamps `N-1` times at θ and `N` times at θ+h returns a differently-truncated trajectory — which stalls the outer optimizer and corrupts the finite-difference Hessian the covariance step builds. Treat estimates and standard errors from a fit whose `ode_solver` warning reports a non-zero abort count as diagnostic output, not as results. Reach for it when a fit is grinding and you want it to say so quickly; fix the grinding with `ode_method = auto` (the default) or a named stiff method, then turn the budget off. `0` / `off` / `none` / `false` disable it. |
@@ -306,7 +385,7 @@ Which integrator runs, and whether `auto` may change it mid-segment. See [Stiff 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `ode_method` | `auto`, `linear`, `rk45`, `vern7`, `rosenbrock23`, `rodas4`, `rodas5p` | `auto` | Which stepper integrates the `[odes]` block — or, for a block that is linear in the states, whether to skip integration: `auto` solves such a model **exactly** by the matrix exponential (NONMEM's `ADVAN5`), `linear` asserts that it must (a parse error naming the reason on a model that cannot), and naming any integrator opts out. See [Linear models are solved exactly](ode-models.qmd#linear-exact). For every other model there are two axes: `vern7` (Verner 7(6)) buys **order**, for fits that are *accuracy*-limited at tight tolerances — not a blanket upgrade, since it is slower than `rk45` at default tolerances. The three **linearly implicit Rosenbrock** methods buy **stability**, for **stiff** systems — fast reversible binding / TMDD, Michaelis-Menten with `KM` far below observed concentrations, long transit chains, QSP cascades — where an explicit method is stability-limited and grinds down to the minimum step (visible as a fit that crawls, or as `ode_max_steps` being exhausted). `rk45` is the explicit Dormand-Prince method and the fastest choice on a non-stiff model. Pick by tolerance: `rosenbrock23` (aliases `ros23`/`ode23s`) for crude tolerances or rough right-hand sides, `rodas4` at typical `1e-6`–`1e-9`, `rodas5p` at `ode_reltol ≤ 1e-9`. A stiff step is not free — `n + 1` extra right-hand-side evaluations for the finite-difference Jacobian, plus one `n × n` factorization — so switch only when stiffness, not accuracy, caps the step (see [below](#stiff-step-cost) for what `n` is). The default `auto` decides per integration segment; see [Stiff systems](ode-models.qmd#stiff-systems) for the full method table and [Letting ferx pick the stepper](ode-models.qmd#letting-ferx-pick-the-stepper-ode_method--auto) for how it decides. |
-| `ode_auto_switch` | `true`, `false` | `true` | Let `ode_method = auto` change stepper **inside** an integration segment, not only at its start. The start-of-segment probe is blind to a model that turns stiff only once drug and target have accumulated — a depot-absorption binding model reads `|Re λ|max = 10` when the dose lands and `7.6e3` an hour later. With this on, RK45 evaluates its dimensionless, stage-based stiffness estimate after every accepted step at no extra RHS cost; the verdict counters survive event boundaries. The Jacobian probe remains as a periodic backstop every 25 accepted steps. A switch keeps the accepted state and continues with the other stepper. Being a threshold test, it makes the objective **discontinuous in θ**: if a covariance step returns implausible standard errors on a model whose `ode_solver` warning reports mid-segment switches, re-run with `ode_auto_switch = false` (or a named stiff method, which is pinned and takes no such decisions) to see whether the switching is what moved them. Ignored under a named `ode_method`. See [When a segment turns stiff halfway through](ode-models.qmd#mid-segment-switching). |
+| `ode_auto_switch` | `true`, `false` | `true` | Let `ode_method = auto` change stepper **inside** an integration segment, not only at its start. The start-of-segment probe is blind to a model that turns stiff only once drug and target have accumulated — a depot-absorption binding model reads `|Re λ|max = 10` when the dose lands and `7.6e3` an hour later. With this on, RK45 evaluates its dimensionless, stage-based stiffness estimate after every accepted step at no extra RHS cost; the verdict counters survive event boundaries. The Jacobian probe remains as a periodic backstop every 25 accepted steps. A switch keeps the accepted state and continues with the stiff stepper; it is one-way, so a segment already on a stiff stepper is never demoted back to RK45 when its fast mode relaxes (#2845). Being a threshold test, it makes the objective **discontinuous in θ**: if a covariance step returns implausible standard errors on a model whose `ode_solver` warning reports mid-segment switches, re-run with `ode_auto_switch = false` (or a named stiff method, which is pinned and takes no such decisions) to see whether the switching is what moved them. Ignored under a named `ode_method`. See [When a segment turns stiff halfway through](ode-models.qmd#mid-segment-switching). |
 
 #### Stiff-step cost follows the integrated system, not the state count {#stiff-step-cost}
 
@@ -324,7 +403,7 @@ How the dataset is interpreted, and what diagnostics are produced alongside the 
 | Key | Values | Default | Description |
 |-----|--------|---------|-------------|
 | `bloq_method` | `drop`, `m3` | `drop` | How to handle rows with `CENS=1` (below LLOQ) or `CENS=-1` (above ULOQ). `m3` enables Beal's M3 likelihood (see [BLOQ example](../examples/bloq.qmd)). |
-| `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde-npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. A typical value is `1000`. Cost scales linearly with the count. |
+| `npde_nsim` | integer ≥ 0 | `0` | Number of Monte-Carlo replicates per subject used to compute the simulation-based [NPDE/NPD diagnostics](#simulation-based-diagnostics-npde-npd) after the fit. `0` (default) disables the computation — no `NPDE`/`NPD` columns are emitted. The same simulation also yields the [`EPRED` and `PWRES`/`EWRES`](#population-weighted-residuals-epred-pwres-ewres) columns. A typical value is `1000`. Cost scales linearly with the count. |
 | `npde_seed` | integer | — | RNG seed for the NPDE/NPD simulation, for reproducible diagnostics. Unset falls back to a fixed default. Only used when `npde_nsim > 0`. |
 | `iov_column` | string | — | Name of the occasion column in the dataset (e.g. `OCC`). Supplies occasions when the model uses `kappa` or `block_kappa` declarations. The column must contain integer occasion indices. Case-insensitive. Supported with `foce`, `focei`, `saem`, `imp` and `impmap`. See [IOV documentation](iov.qmd). |
 | `iov_occasion` | `column`, `dose`, `time(t₁, …)` | `column` | Derive the IOV occasion partition from the model instead of a data column. `dose`: each administration starts a new occasion. `time(24, 48)`: time-window breakpoints. When set to `dose`/`time(...)`, this overrides `iov_column` (with a warning). See [Declaring occasions in the model](iov.qmd#declaring-occasions-in-the-model). |
@@ -571,6 +650,82 @@ ferx's by default and 0.997 with `WRESCHOL` on. So compare NPDE against a
 `WRESCHOL` table; comparing against the default one is comparing two different
 statistics.
 
+## Population-weighted residuals (EPRED / PWRES / EWRES)
+
+The NPDE simulation also yields two columns at no extra cost, written whenever
+`npde_nsim > 0` (#2871):
+
+- **`EPRED`**: the per-observation mean of the `K` simulated replicates,
+  `E_sim[y]`. This is NONMEM's `$TABLE EPRED`. It is not `PRED`: `PRED` is the
+  prediction at η = 0, while `EPRED` averages over η ~ Ω and ε, and the two differ
+  whenever the model is nonlinear in η. Under `CL = TVCL·exp(η)` the expected
+  concentration is not the typical-value one.
+- **`PWRES`**, also written as **`EWRES`** (the same values under Monolix's and
+  NONMEM's names): the population-weighted residual
+  `PWRES_i = Σ_sim^(-1/2) (y_i − EPRED_i)`, with `Σ_sim` the empirical
+  within-subject covariance of the replicates. This is the simulation-based
+  analogue of CWRES, with no FOCE linearization.
+
+### PWRES, CWRES or NPDE?
+
+| | built from | linear in `y` | valid after |
+|---|---|---|---|
+| CWRES | FOCE linearization around η̂ | yes | FOCE / FOCEI fits; poor for models strongly nonlinear in η |
+| PWRES / EWRES | first two moments of the simulation | yes | any estimator (SAEM, IMP, Bayes) |
+| NPDE | full simulated distribution (rank) | no | any estimator |
+
+PWRES keeps the magnitude of an outlier, which NPDE does not. NPDE is a rank, so it
+saturates near `Φ⁻¹(1/(2K))` and a 6-SD outlier scores the same as a 3.5-SD one.
+PWRES is linear in `y`, so the 6-SD outlier stays at about 6.
+
+**PWRES uses only the first two moments.** It is N(0, 1) under the true model only
+when the marginal distribution of `y` is Gaussian. A skewed marginal, such as
+log-normal IIV or a proportional error, can show a non-zero mean or a skewed
+spread even when the model is correct. NPDE has no such caveat, so it stays the
+primary simulation-based diagnostic. This is also why Monolix hides PWRES by
+default. Use PWRES to see how large a misfit is, and NPDE to decide whether there
+is one.
+
+Rows follow NPDE's rules. `PWRES` is `NaN` wherever `NPDE` is: for a subject with
+an M3-censored row, or one with `npde_nsim ≤ n_obs`. `EPRED` needs no
+decorrelation, so it is written on every row, censored ones included, like `PRED`.
+
+### Decorrelation: PWRES follows NONMEM's default, NPDE does not
+
+The two columns decorrelate with different factors of the same simulated
+covariance. The choices are independent and fixed:
+
+| column | factor | matches |
+|---|---|---|
+| `PWRES` / `EWRES` | symmetric inverse square root `V Λ^(-1/2) Vᵀ` | NONMEM's default `EWRES` and ferx's `CWRES` |
+| `NPDE` | Cholesky factor | `npde::autonpde()`, NONMEM's `NPDE` under `WRESCHOL` |
+
+Both factors give the same per-subject norm, `√(rᵀ Σ⁻¹ r)`, but different
+per-observation values whenever the observations are correlated. Compare ferx's
+`PWRES` against a NONMEM `EWRES` table written **without** `WRESCHOL`, and ferx's
+`NPDE` against one written **with** it.
+
+### NONMEM cross-validation of PWRES {#pwres-nonmem-cross-validation}
+
+`tests/pwres_iov_nonmem_anchor.rs` reuses the IOV anchor above: 60 subjects with
+9 correlated observations each, all parameters fixed, and
+`$TABLE EPRED EWRES ESAMPLE=2000` against `npde_nsim = 2000`
+(`nonmem_anchor/pwres_iov_anchor.ctl`). The random streams differ, so agreement is
+up to Monte-Carlo error:
+
+| NONMEM table | worst relative \|ΔEPRED\| | worst \|ΔEWRES\| | rms ΔEWRES |
+|---|---|---|---|
+| default (symmetric) | 0.027 | 0.207 | 0.053 |
+| `WRESCHOL` (Cholesky) | 0.027 | 1.809 | 0.504 |
+
+`EPRED` is identical in the two NONMEM runs. Only the decorrelation changes, and
+ferx's `PWRES` matches the default table, not the `WRESCHOL` one.
+
+The engine-side check is a closed form. For a model whose first two moments are
+exact, `y_j = B·exp(η_B) + η_S·t_j + ε_j`, ferx's `EPRED` and `PWRES` converge to
+`E[y] = B·e^{ω_B/2}` and to `Σ^(-1/2)(y − E[y])` from the exact covariance. See
+`src/stats/npde_pwres_tests.rs`.
+
 ## Estimation Methods
 
 ### FOCEI (default)
@@ -795,13 +950,13 @@ sparsely-sampled PK).
 | `imp_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
 | `imp_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |
 | `imp_proposal_df` | `5.0` | Student-t proposal degrees of freedom (≥ 1), or `normal`/`mvn` for a multivariate-normal proposal. Lower = heavier tails. |
-| `imp_auto` | `true` | Adaptive sample count (NONMEM `AUTO`). When `true`, `imp_samples` is the *starting* count and the floor, and K follows a **per-subject** objective MC SE target of 0.05, up to 10000. Recommended for high-dimensional / FREM models. Set `false` to pin K. See [Adaptive sample count](../estimation/importance-sampling.qmd#adaptive-sample-count). |
+| `imp_auto` | `true` | Adaptive sample count (NONMEM `AUTO`). When `true`, `imp_samples` is the *starting* count and the floor, and K follows a **per-subject** objective MC SE target of 0.05, up to 10000. Recommended for high-dimensional / FREM models. Set `false` to pin K. Estimating path only: an `imp_eval_only` evaluation draws a fixed `imp_samples` and warns if this option is set. See [Adaptive sample count](../estimation/importance-sampling.qmd#adaptive-sample-count). |
 | `imp_max_time` | none | Wall-clock limit on the IMP iterations, in seconds. The fit stops with its current estimate and `converged: false`. See [Wall-clock limit](../estimation/importance-sampling.qmd#wall-clock-limit). |
 | `imp_seed` | `12345` | RNG seed. Same seed → identical result. |
 | `imp_sobol` | `false` | Estimator only: Sobol quasi-random IS draws for the MCEM E-step, the `imp` counterpart of `impmap_sobol` (#1965). `imp_eval_only` stays pseudo-random. The same limits apply as for `impmap_sobol`, checked when the fit starts: a Student-t proposal (`imp_proposal_df`) of at most 1000 degrees of freedom (use `normal` beyond that), and at most 1000 quasi-random coordinates per draw (the ETAs, plus one each for a t proposal and the defensive mixture). |
 | `imp_low_ess_threshold` | `0.1` | Subjects with normalized ESS below this fraction get flagged in the result. Set `0` to silence. |
 | `imp_adapt_passes` | `5` | Pilot passes that adapt each subject's proposal before a marginal `−2 log L` is reported, under `imp_eval_only` and after an estimating `imp` or `impmap` stage (NONMEM `EONLY=1 NITER=5`). The MCEM iterations are not affected. Each pass costs one more `imp_samples` draws per subject. `0` keeps the single Laplace proposal, which reads high on sparse subjects. While above `0`, a marginal's proposal keeps at least `0.1` of the prior. See [Adaptive evaluation](../estimation/importance-sampling.qmd#adaptive-evaluation). |
-| `imp_defensive_alpha` | `0.0` | Defensive-mixture weight (issue #528), **opt-in**. Each subject draws this fraction of its samples from the prior `N(0, Ω)` rather than the mode-centred proposal, and every sample is scored under the mixture density. This bounds the importance weights so a weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline whose `V` cancels in the amplitude — can't hijack the weighted M-step and walk θ to the bounds. Must be in `[0, 1)`; the default `0` is the legacy single-proposal sampler for the MCEM iterations (a reported marginal keeps at least `0.1` while `imp_adapt_passes` is above `0`), set a small positive value (e.g. `0.1`) to enable the rescue. Applies to `imp` and `impmap` (including the FREM Rao-Blackwell path); for an `impmap` stage you may also write `impmap_defensive_alpha`. It combines with Sobol QMC (`impmap_sobol` / `imp_sobol`), which then stratifies the broad fraction (#1965). It raises the per-subject ESS floor (so `imp_low_ess_threshold` flags fewer subjects). See [Importance Sampling → Defensive mixture](../estimation/importance-sampling.qmd#defensive-mixture). |
+| `imp_defensive_alpha` | `0.0` | Defensive-mixture weight (issue #528), **opt-in**. Each subject draws this fraction of its samples from the prior `N(0, Ω)` rather than the mode-centred proposal, and every sample is scored under the mixture density. This bounds the importance weights so a weakly-identified subject — e.g. an analytical `[initial_conditions]` baseline whose `V` cancels in the amplitude — can't hijack the weighted M-step and walk θ to the bounds. Must be in `[0, 1)`; the default `0` is the legacy single-proposal sampler for the MCEM iterations (a reported marginal keeps at least `0.1` while `imp_adapt_passes` is above `0`), set a small positive value (e.g. `0.1`) to enable the rescue. A value below `0.1`, including `0`, is raised to `0.1` for a reported marginal unless `imp_adapt_passes = 0` is also set, so a plain single proposal needs both. Applies to `imp` and `impmap` (including the FREM Rao-Blackwell path); for an `impmap` stage you may also write `impmap_defensive_alpha`. It combines with Sobol QMC (`impmap_sobol` / `imp_sobol`), which then stratifies the broad fraction (#1965). It raises the per-subject ESS floor (so `imp_low_ess_threshold` flags fewer subjects). See [Importance Sampling → Defensive mixture](../estimation/importance-sampling.qmd#defensive-mixture). |
 
 See [Importance Sampling documentation](../estimation/importance-sampling.qmd)
 for the algorithm, the NONMEM mapping, IOV caveats, and tuning guidance.
@@ -837,8 +992,8 @@ importance-weighted posterior moments. It runs standalone or as a chain stage:
 | `impmap_trace` | `false` | When `true`, collect per-iteration parameter values into `FitResult.impmap_trace` — analogous to NONMEM `.ext` output for traceplots. |
 | `impmap_mceta` | `0` | Number of additional random starting points for per-subject MAP optimization (analogous to NONMEM `MCETA`). Each start draws η from N(0, Ω). The start with the lowest individual NLL wins. `0` = single warm-start (default). `3` is a good choice for high-dimensional models (e.g. FREM with ≥ 5 ETAs). |
 | `impmap_sobol` | `false` | Build each IS draw from an Owen-scrambled Sobol quasi-random point instead of pseudo-random numbers — the normals, the Student-t scale and the defensive-mixture component alike, so it applies to every proposal form (#1965). Pays off on models with few ETAs: in the #1965 benchmark it cut the spread across seeds 2–44× at K = 100 on the normal proposal, and 1.2–60× at K = 100–300 on the default t₄ proposal. Under Sobol, a Student-t proposal is limited to 1000 degrees of freedom (use `normal` beyond that) and a draw to 1000 quasi-random coordinates (the ETAs, plus one each for a t proposal and the defensive mixture). See [IMPMAP → Quasi-random draws](../estimation/impmap.qmd#quasi-random-draws-impmap_sobol). |
-| `iscale_min` | `0.1` | Minimum proposal scaling factor for adaptive IS (NONMEM `ISCALE_MIN`). The IS proposal covariance is multiplied by `s²` where `s` is chosen from `[iscale_min, iscale_max]` to maximise per-subject ESS. Set both to `1.0` to disable. |
-| `iscale_max` | `10.0` | Maximum proposal scaling factor (NONMEM `ISCALE_MAX`). |
+| `iscale_min` | `0.1` | Minimum proposal scaling factor for adaptive IS (NONMEM `ISCALE_MIN`). The IS proposal covariance is multiplied by `s²` where `s` is chosen from `[iscale_min, iscale_max]` to maximise per-subject ESS. Set both to `1.0` to disable. Read by the estimating `imp` and `impmap` iterations only. A reported marginal draws at scale 1, and an `imp_eval_only` stage warns if this option is set, unless an `impmap` stage in the chain reads it; use `imp_adapt_passes` to adapt an evaluation's proposal. |
+| `iscale_max` | `10.0` | Maximum proposal scaling factor (NONMEM `ISCALE_MAX`). Same scope as `iscale_min`. |
 | `frem_rao_blackwell` | `true` | FREM only: Rao-Blackwellise the covariate ETAs (integrate them analytically, importance-sample only the PK ETAs). Strongly recommended — brute-force sampling of the near-singular covariate dimensions has very poor ESS. Set `false` only to diagnose the RB path against the full-dimensional sampler. |
 
 `impmap` reuses `inner_maxiter` / `inner_tol` for the per-iteration MAP step.
@@ -962,11 +1117,82 @@ warnings.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `n_starts` | `1` | Number of independent optimization runs. `1` disables multi-start (no behaviour change). When `> 1`, all starts run in parallel via rayon; the converged run with the lowest OFV is returned. Start 0 always uses the exact initial values from the model file. |
+| `n_starts` | `1` | Number of independent optimization runs. `1` disables multi-start (no behaviour change). When `> 1`, all starts run in parallel via rayon; the converged run with the lowest OFV is returned. Selection reads `converged`, not the [fit status](../output.qmd#fit-status): a start that is `CONVERGED WITH ISSUES` still ranks as converged. Start 0 always uses the exact initial values from the model file. |
 | `start_sigma` | `0.3` | Log-space perturbation applied to initial theta values for starts 1..n. Log-packed thetas are multiplied by `exp(N(0, start_sigma))`; thetas with negative lower bounds are shifted additively. |
 | `multi_start_seed` | `42` | RNG seed for the multi-start theta perturbations. Independent of `seed` (SAEM) so that changing the SAEM seed does not silently alter which perturbed starting points are used in FOCE multi-start runs. |
 
 Multi-start is most useful for models prone to local minima: nonlinear elimination (Michaelis-Menten), full-block omega, or many covariate parameters. On an 8-core machine `n_starts = 8` costs the same wall-clock time as a single run but has ~8× lower probability of a local minimum.
+
+### What the starts did {#multi-start-spread}
+
+Every multi-start fit reports how its starts compare, whichever start wins. The
+[`multi_start`](../warnings.qmd#codes-run) info line reads, for
+`examples/mm_multistart.ferx` as shipped:
+
+```
+Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 6); all 8 converged starts within 1.0 of best (range 0.0000)
+```
+
+and for the same model with `start_sigma = 1.5`:
+
+```
+Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 2); 7 of 8 converged starts within 1.0 of best; 1 converged above it: start 4 (+5.27)
+```
+
+The first says the optimum is stable: start 6 is lower than start 0 by 1e-7 OFV,
+which is not a better optimum. The second says one start stopped somewhere else
+and called itself converged. The returned estimates are the same in both.
+
+| Part of the line | Meaning |
+|---|---|
+| `8 starts, 5 converged, 2 not converged, 1 failed` | Each start is counted once. A failed start returned no result; its error is in the `k of n starts failed` line and in the table below. |
+| `best OFV … (start k)` | The returned start. `(start k, not converged)` when no start converged. Under [`nn_l2` / `nn_smooth`](#covariate-nn-regularization-nn_l2-nn_smooth) it reads `best penalized objective`, because that is the value the starts are ranked on. |
+| `7 of 8 converged starts within 1.0 of best` | The converged starts are compared with the returned one. `range` is the largest distance among them. When no start converged, every start with an OFV is compared instead. |
+| `1 converged above it: start 4 (+5.27)` | The converged starts more than 1.0 above the returned one, with their distance. The first three are named. |
+| `1 not converged at a lower OFV: start 3 (-3.21)` | A converged start is always preferred, so a start that did not converge can have stopped lower than the returned one. |
+| `2 without a usable OFV` | Starts whose OFV is `NaN` or a divergence sentinel. They are left out of the count and the range. |
+| `no OFV to compare (start 0 returned)` | The returned start has no OFV, as for `method = vi` under `vi_final_ofv = none`. Under a penalty it reads `no penalized objective to compare` when the returned start has no finite penalized objective; the starts are then not compared on their OFV, which did not rank them. |
+
+The cutoff is fixed at 1.0 OFV. It is not tied to a convergence tolerance: in 30
+multi-start fits of the example models (macOS arm64), starts that stopped on the
+same optimum or the same ridge were at most 2.3e-6 apart in OFV under the
+gradient optimizers and at most 0.33 under `bobyqa`, and the nearest different
+stop was 5.00 away
+([#2867](https://github.com/FeRx-NLME/ferx-core/issues/2867)). For any other
+cutoff, read the table.
+
+The line compares objective values, not estimates. On a flat objective, starts
+within 1.0 OFV of each other can still differ in θ: the `bobyqa` start 0.33 above
+the best had `TVVMAX` 5.76 and `TVKM` 17.0 against 7.47 and 22.2, further along
+the same Vmax/Km ridge. The `theta` column of the table shows whether the
+estimates agree.
+
+A converged start far above the best is reported at `Info` severity and does not
+change the [fit status](../output.qmd#fit-status). It describes the objective
+surface and the width of the perturbation, not the returned fit. It occurred in
+12 of those 30 fits (macOS arm64), none of them at `start_sigma` ≤ 0.5 on a
+model without a covariate network.
+
+The per-start table is `FitResult.starts`, one row per start in start order
+(empty when `n_starts = 1`):
+
+| Field | Meaning |
+|---|---|
+| `start` | Start index. `0` is the model file's initial values. |
+| `ofv` | The start's reported OFV. Absent for a failed start and for a non-finite OFV. |
+| `penalized` | `true` when the start was ranked on a penalized objective and not on `ofv`: a start that ran under an active `nn_l2` / `nn_smooth` penalty. |
+| `objective` | The penalized objective a `penalized` start was ranked on. Absent when the start is not `penalized`, and when that value is not finite. |
+| `converged` | The start's own `converged`. |
+| `status`, `status_reasons` | The start's own [fit status](../output.qmd#fit-status), as its token (`converged`, `converged_with_issues`, `not_converged`) and the labels of its reasons. It is what the fit's status would be had this start been returned, before the fit-level multi-start notes are added. Absent for a failed start. |
+| `n_iterations`, `wall_time_secs` | Of this start alone. The starts run in parallel, so the times do not add up to the fit's. |
+| `theta` | The start's final θ, so two optima can be told apart without a refit. A non-finite value is written as `null`. |
+| `selected` | `true` on the returned start. |
+| `error`, `error_code` | A failed start's message, and its [error code](../warnings.qmd#fit-error-codes) when it has one. |
+
+The same rows are written to the fit YAML's
+[`multi_start:` block](../output.qmd#multi-start-block), the fit JSON and the
+`.fitrx` bundle. Only these rows are kept; the other starts' full results are
+dropped.
 
 ## Global Search
 
@@ -1073,7 +1299,7 @@ Enable optimizer trace and EBE guard:
 
 ## Optimizer Trace
 
-When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.csv` and the path is stored in `FitResult::trace_path`. Each row is one outer iteration.
+When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.csv` and the path is stored in `FitResult::trace_path`, with the text in `FitResult::trace_csv`. Each row is one outer iteration.
 
 | Column | Populated by | Description |
 |--------|-------------|-------------|
@@ -1086,7 +1312,7 @@ When `optimizer_trace = true`, a CSV is written to `/tmp/ferx_trace_<pid>_<ts>.c
 | `step_norm` | BFGS | Step size |
 | `inner_iter_count` | (reserved) | Reserved for future per-iteration inner-loop count; currently `NA` |
 | `optimizer` | FOCE/FOCEI | Active NLopt algorithm |
-| `lm_lambda` | GN | Levenberg-Marquardt damping factor |
+| `lm_lambda` | GN | Trust radius in scaled parameter space ([details](../estimation/gauss-newton.qmd#convergence)). The name is kept from the Levenberg-Marquardt loop GN replaced in 0.1.0 |
 | `ofv_delta` | GN | Change in OFV from previous iteration |
 | `step_accepted` | GN | Whether the GN step was accepted |
 | `cond_nll` | SAEM | Conditional observation NLL |

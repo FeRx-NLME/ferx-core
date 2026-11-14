@@ -217,8 +217,8 @@ through an η-bearing parameter (`CL = TYPICAL_PK.CL * exp(ETA_CL)`) makes the
 shared hidden-layer weights and that head's row and bias random-class, while
 another head's own weights stay fixed-class. The tally is recorded on
 `FitResult::bic_inputs` at fit time, so a
-`.fitrx` bundle can be ranked without re-parsing the model; a bundle saved
-before the tally existed gets `NaN` rather than a wrong penalty.
+`.fitrx` bundle can be ranked without re-parsing the model; a hand-built result
+with no tally gets `NaN` rather than a wrong penalty.
 
 The four variants are pinned in unit tests to `calculate_bic()`'s own outputs
 on Pharmpy's `pheno` example (59 subjects, 155 observations, three θ that all
@@ -257,7 +257,7 @@ if !verdict.passed {
 | `require_converged` | `true` | `converged == false` — which also covers an internal runaway-guard hit, and a [non-finite objective](../warnings.qmd#non-finite-objective) (`NaN`, infinite, or past the `1e14` divergence cutoff), both of which demote `converged` |
 | `require_covariance` | `false` | the covariance step did not run or failed. A SIR fallback that delivered credible intervals is accepted — unless its importance weights collapsed onto a single draw (Kish ESS below 2, every interval of zero width), which fails like a failed step; an accepted fallback stores no matrix, so the threshold gates below then report `skipped` |
 | `max_condition_number` | `Some(1000)` | `cov_condition_number` exceeds it (∞ for a singular correlation matrix) |
-| `max_correlation` | `Some(0.95)` | any off-diagonal of the covariance's correlation form exceeds it in absolute value — the whole matrix, not just θ, read on the natural scale (a `block_omega` / block-κ segment is mapped off its Cholesky coordinates by the delta method first, so the number is the ω correlation NONMEM's `.cor` would show — the layout comes from `FitResult::omega_is_diagonal` / `kappa_is_diagonal`, and a bundle saved before those were recorded is read as stored); the offending pair is named by its packed coordinate (`CL ~ log_chol_ETA_CL`) |
+| `max_correlation` | `Some(0.95)` | any off-diagonal of the covariance's correlation form exceeds it in absolute value — the whole matrix, not just θ, read on the natural scale (a `block_omega` / block-κ segment is mapped off its Cholesky coordinates by the delta method first, so the number is the ω correlation NONMEM's `.cor` would show — the layout comes from `FitResult::omega_is_diagonal` / `kappa_is_diagonal`, and a result that does not record them is read as stored); the offending pair is named by its packed coordinate (`CL ~ log_chol_ETA_CL`) |
 | `reject_on_boundary` | `true` | a θ is pinned to a declared bound — the same predicate `bootstrap`'s `skip_estimate_near_boundary` applies |
 | `reject_init_stall` | `true` | the fit never left its initial estimates (the #751 signature): the outer optimizer's own escape verdict when the result carries it (`FitResult::left_init`, recorded by the NLopt outer loop), otherwise no free θ/Ω/σ moved more than 1 % of its initial value; a fit with `n_parameters == 0` cannot stall, and one whose only free coordinates are κ / mixture / `block_sigma` entries with no optimizer verdict is `skipped`. A fit that did not move but whose start the optimizer verified as an optimum (`FitResult::stationary_start`, #2506: a restart from a perturbation of it converged back) passes — that is a warm start at an optimum. Without that verification (another estimator, a restart with no budget left or an inconclusive one) the gate assumes a **cold start**, so turn it off for a warm-started search over those |
 
@@ -427,7 +427,7 @@ nothing, since the fitted θ was estimated against the fit's centres, not the
 design's. `bind_theta_levels` refuses it, since the design's own levels would
 read the fitted θ at other positions
 ([#1730](https://github.com/FeRx-NLME/ferx-core/issues/1730)). A fit that
-carries no bindings, such as a `.fitrx` saved before they were recorded, is
+carries no bindings, such as a hand-built result, is
 refused rather than re-bound on the design. Refit the model to record them.
 This holds for a model already bound to other data too, such as one
 `prepare_run` bound to a design. What the model needs is read from its text, so

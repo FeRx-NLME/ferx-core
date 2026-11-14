@@ -374,6 +374,7 @@ fn subject(id: &str, scale: f64) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -446,6 +447,121 @@ fn a_pinned_plan_also_caps_a_multi_start_fit() {
         "a multi-start fit must honor the pinned thread count too, or a plan's \
          budget is silently multiplied by `n_starts`"
     );
+}
+
+/// The fit-level verdict that sits beside the #2867 summary when no start converged.
+fn lines_contain_not_converged(warnings: &[String]) -> bool {
+    warnings
+        .iter()
+        .any(|w| w.starts_with("No multi-start run converged (3 starts)"))
+}
+
+/// #2867, through `fit()` itself: a multi-start fit returns one row per start, the selected
+/// row is the returned result, and the summary line is there once — whichever start wins.
+/// A single-start fit returns no rows and no line. Lives here for the fixture.
+#[test]
+fn a_multi_start_fit_reports_every_start_and_a_single_start_fit_none() {
+    let model = one_cpt_model();
+    let pop = population();
+    let summary_lines = |r: &FitResult| -> Vec<String> {
+        r.warnings
+            .iter()
+            .filter(|w| w.starts_with("Multi-start: 3 starts"))
+            .cloned()
+            .collect()
+    };
+
+    let mut opts = short_fit_opts();
+    opts.n_starts = 3;
+    let multi = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    assert_eq!(
+        multi.starts.iter().map(|s| s.start).collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+    let selected: Vec<_> = multi.starts.iter().filter(|s| s.selected).collect();
+    assert_eq!(selected.len(), 1);
+    assert!(multi.ofv.is_finite(), "premise: the fixture has an OFV");
+    assert_eq!(selected[0].ofv, Some(multi.ofv));
+    assert_eq!(selected[0].theta, multi.theta);
+    assert_eq!(selected[0].converged, multi.converged);
+    // The row's status is the start's own. The returned fit's can list more: the two-iteration
+    // budget converges no start, and the fit-level "No multi-start run converged" note is
+    // added after the rows are taken.
+    assert!(
+        !multi.converged,
+        "premise: outer_maxiter = 2 converges no start"
+    );
+    assert_eq!(selected[0].status.as_deref(), Some("not_converged"));
+    // `convergence` is the start's own "did not converge" warning, a plain string on its
+    // result: the row's status has it only because the start's warnings were classified
+    // before the status was taken.
+    assert_eq!(
+        selected[0].status_reasons,
+        vec!["budget_spent", "convergence"]
+    );
+    assert!(lines_contain_not_converged(&multi.warnings));
+    assert!(multi.starts.iter().all(|s| s.error.is_none()));
+    // Start 0 ran from the model file's values, the others from perturbed ones.
+    assert_ne!(multi.starts[0].theta, multi.starts[1].theta);
+    let lines = summary_lines(&multi);
+    assert_eq!(lines.len(), 1, "{:?}", multi.warnings);
+    assert!(
+        lines[0].contains(&format!("(start {}", selected[0].start)),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        !multi
+            .warnings
+            .iter()
+            .any(|w| w.contains("best result from start")),
+        "the line this replaces is gone: {:?}",
+        multi.warnings
+    );
+    let entry = multi
+        .warnings_structured
+        .iter()
+        .find(|w| w.message.starts_with("Multi-start: 3 starts"))
+        .expect("the summary is in the structured warnings");
+    assert_eq!(
+        (&entry.severity, &entry.category),
+        (&WarningSeverity::Info, &WarningCode::MultiStart)
+    );
+
+    // Reporting only: start 0 of the multi-start fit is the single-start fit, bit for bit.
+    let single = fit(&model, &pop, &model.default_params, &short_fit_opts()).expect("fit");
+    assert!(single.starts.is_empty());
+    assert!(
+        !single.warnings.iter().any(|w| w.starts_with("Multi-start")),
+        "{:?}",
+        single.warnings
+    );
+    assert_eq!(
+        multi.starts[0].ofv.map(f64::to_bits),
+        Some(single.ofv.to_bits())
+    );
+    assert_eq!(multi.starts[0].theta, single.theta);
+}
+
+#[test]
+fn a_fit_names_a_pinned_thread_count_as_the_source_of_its_width() {
+    // The `fit()` end of the #2800 wiring (#2813 review row 1): with one more worker than
+    // subjects the subjects note fires, and it must say the width came from `threads`.
+    // The environment cannot change this cell — a pin is never overridden by it — so the
+    // test needs no `set_var`.
+    let model = one_cpt_model();
+    let pop = population();
+    let mut opts = short_fit_opts();
+    opts.threads = Some(pop.subjects.len() + 1);
+
+    let result = fit(&model, &pop, &model.default_params, &opts).expect("fit");
+    assert_eq!(result.n_threads_used, pop.subjects.len() + 1);
+    let note = result
+        .warnings
+        .iter()
+        .find(|w| w.contains("threads configured"))
+        .unwrap_or_else(|| panic!("no subjects note in {:?}", result.warnings));
+    assert!(note.contains("(pinned by `threads`)"), "{note}");
 }
 
 #[test]
@@ -530,9 +646,11 @@ fn work_outside_a_fit_runs_on_a_ferx_pool_of_the_requested_width() {
     // pool was never built at all, which no core count can fake.
     // Both routes to a pool are exercised, and which one a given width takes is a
     // property of the host: the shared default pool when it is already that wide (no new
-    // threads at all), a lease from `fit()`'s own cache otherwise. `default_thread_count()`
-    // is the first by construction and `+ 5` cannot be, on any machine.
-    for n in [default_thread_count(), default_thread_count() + 5, 3] {
+    // threads at all), a lease from `fit()`'s own cache otherwise.
+    // `effective_default_threads()` is the first by construction and `+ 5` cannot be,
+    // on any machine.
+    let shared = crate::api::effective_default_threads();
+    for n in [shared, shared + 5, 3] {
         let (index, width) = install_on_pool_sized(n, || {
             (rayon::current_thread_index(), rayon::current_num_threads())
         });

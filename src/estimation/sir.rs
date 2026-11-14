@@ -1007,7 +1007,10 @@ fn screen_draw(
 ///   [`FitResult::ebe_kappas`](crate::FitResult::ebe_kappas)), which `fit()` and
 ///   [`run_sir`](crate::run_sir) hand, so a draw re-solves κ from κ̂ rather than from 0
 ///   (#2261). `η̂` alone remains valid.
-/// * `proposal_cov` - Covariance matrix in packed (log-transformed) parameter space
+/// * `proposal_cov` - Covariance matrix in packed (log-transformed) parameter space. A
+///   coordinate collapsed on the internal guard whose diagonal here is exactly zero (the
+///   covariance step held it, #2797) is held at its estimate like a `FIX` parameter and not
+///   sampled (#2816)
 /// * `ofv_hat` - the **data** OFV (−2 log L) at the estimates, i.e. what every
 ///   optimizer reports as `OuterResult::ofv`. Under parameter priors (#254) the
 ///   penalty is added internally, to this baseline and to every draw alike, so
@@ -1201,6 +1204,18 @@ fn run_sir_in_box(
             proposal_cov.ncols(),
             n_packed,
         )));
+    }
+
+    // A random-effect variance the covariance step held on its guard (#2797: a
+    // `CollapsedAtGuard` coordinate whose row of the matrix is zero) is a FIX parameter of
+    // that matrix, so it is one here too (#2816) and SIR equals the same fit with it `FIX`.
+    // The gate reads the *proposal*: a floored `R` or a non-PD fallback has no zero row
+    // there, so a collapse that step did not hold stays sampled. It reads the proposal's
+    // diagonal, so it runs after the shape check above (#2830 review r1 #1).
+    for p in crate::api::held_guard_coordinates(params) {
+        if crate::api::step_held(Some(proposal_cov), p) {
+            fixed_mask[p] = true;
+        }
     }
 
     // Restrict the proposal to the free subspace. `compute_covariance` zeroes

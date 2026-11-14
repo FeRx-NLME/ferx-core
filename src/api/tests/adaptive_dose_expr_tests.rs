@@ -552,3 +552,150 @@ fn a_hand_built_spec_reading_a_state_is_refused_at_compile() {
         "{e}"
     );
 }
+
+// ── #2671: a covariate a record's snapshot lacks ─────────────────────────────
+
+/// One subject whose dose-only covariate `DW` changes (50 → 80 at t = 6), so the reader
+/// builds per-record snapshots, and the t = 6 record is in force at the first decision
+/// (t = 12).
+const CSV_DW: &str = "ID,TIME,DV,AMT,EVID,CMT,MDV,WT,DW
+1,0,0,0,0,1,0,70,50
+1,6,0,0,0,1,0,70,80
+1,24,0,0,0,1,0,70,80
+1,48,0,0,0,1,0,70,80
+";
+
+/// [`CSV_DW`] as the reader returns it, and the same population with `DW` removed from
+/// the snapshot of the record in force at the first decision — a gap the CSV reader
+/// cannot produce (every snapshot starts from the static map), so only a population
+/// built in code reaches it. The static map still carries `DW`.
+fn dw_populations() -> (Population, Population) {
+    let full = pop(CSV_DW);
+    let s = &full.subjects[0];
+    assert_eq!(
+        s.obs_covariates.len(),
+        4,
+        "the reader built per-record snapshots"
+    );
+    assert!(
+        s.covariates.contains_key("DW") && s.obs_covariates.iter().all(|m| m.contains_key("DW")),
+        "the reader fills every map"
+    );
+    let mut gap = full.clone();
+    assert_eq!(gap.subjects[0].obs_covariates[1].remove("DW"), Some(80.0));
+    assert!(
+        gap.subjects[0].covariates.contains_key("DW"),
+        "static map untouched"
+    );
+    (full, gap)
+}
+
+/// #2671, dose-expression path: a dose expression is evaluated on the snapshot of the
+/// record in force at the first decision (`locf_decision_cov`), and the run-start check
+/// looked only at the static map, so a snapshot without `DW` read it as 0 — measured on
+/// #2671: `Ok`, an empty ledger (0 mg is a hold), nothing refused. Both sides here:
+/// the full population doses 15 · 80 mg; the gap is refused naming `DW`.
+///
+/// Regression: `population_carries` back to the static map alone.
+#[test]
+fn a_dose_expression_covariate_missing_from_a_record_snapshot_is_refused() {
+    let p = parsed(
+        "  observe = CENT / V
+  at = every 12 from 12 to 48
+  start_dose = 15 * DW
+  route = infuse(cmt=1, over=1)
+  dose_bounds = [0, 4000]
+  when signal > 1000000 : decrease 25%",
+    );
+    let (full, gap) = dw_populations();
+    let ok = run(&p, &full).expect("every map carries DW");
+    assert_eq!(first_dose(&ok, "1"), 15.0 * 80.0);
+    let e = run(&p, &gap).expect_err("the in-force snapshot lacks DW");
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
+    assert_eq!(
+        e.message(),
+        "[adaptive_dosing] `start_dose` references covariate(s) not found in data \
+         (case-sensitive): DW. Available covariate columns: WT."
+    );
+}
+
+/// #2671, `observe` path: the same snapshot feeds the `observe` expression at each
+/// decision. The dose is a literal, so the signal is live on the full side (a non-zero
+/// `DW * CENT / V` at t = 24), and the gap is refused naming `DW` under `observe`.
+///
+/// Regression: as above, for the `observe` check.
+#[test]
+fn an_observe_covariate_missing_from_a_record_snapshot_is_refused() {
+    let p = parsed(
+        "  observe = DW * CENT / V
+  at = every 12 from 12 to 48
+  start_dose = 500
+  route = infuse(cmt=1, over=1)
+  dose_bounds = [0, 4000]
+  when signal > 1000000000 : decrease 25%",
+    );
+    let (full, gap) = dw_populations();
+    let ok = run(&p, &full).expect("every map carries DW");
+    let at24 = ok
+        .decisions
+        .iter()
+        .find(|d| d.subject == "1" && d.time == 24.0)
+        .expect("a decision at t = 24");
+    assert!(
+        at24.observed_signals[0].value.is_finite() && at24.observed_signals[0].value > 0.0,
+        "the observe signal is live: {:?}",
+        at24.observed_signals
+    );
+    let e = run(&p, &gap).expect_err("the in-force snapshot lacks DW");
+    assert_eq!(e.code(), Some("E_MISSING_COVARIATE"), "{e}");
+    assert_eq!(
+        e.message(),
+        "[adaptive_dosing] `observe` references covariate(s) not found in data \
+         (case-sensitive): DW. Available covariate columns: WT."
+    );
+}
+
+/// #2671: a refusal's "The dose expressions read …" sentence reports the value the
+/// expression used. It reported `unwrap_or(NaN)` for a key absent from the map while
+/// the closure read 0.0, so a refusal said `DW = NaN` about a dose computed from 0. Both
+/// now go through `output_covariate_read`; held on both sides of the absent key: the
+/// reported value times 15 is the start dose, with `DW` present and absent.
+///
+/// Regression: `resolve`'s reads with their own default (`NaN`, or any value but the
+/// closure's).
+#[test]
+fn the_reported_dose_expression_read_is_the_value_used() {
+    let p = parsed(
+        "  observe = CENT / V
+  at = every 12 from 12 to 48
+  start_dose = 15 * DW
+  route = infuse(cmt=1, over=1)
+  dose_bounds = [0, 4000]
+  when signal > 1000000 : decrease 25%",
+    );
+    let spec = p.adaptive_dosing.as_ref().expect("block present");
+    let exprs = crate::sim::adaptive_control::compile_dose_exprs(&p.model, spec).expect("compiles");
+    let theta = &p.model.default_params.theta;
+    let present =
+        std::collections::HashMap::from([("DW".to_string(), 80.0), ("WT".to_string(), 70.0)]);
+    let absent = std::collections::HashMap::from([("WT".to_string(), 70.0)]);
+    for (label, covs) in [("present", &present), ("absent", &absent)] {
+        let r = exprs.resolve(spec, &p.model, theta, covs, None);
+        assert_eq!(r.reads.len(), 1, "{label}: {:?}", r.reads);
+        let (name, read) = &r.reads[0];
+        assert_eq!(name, "DW", "{label}");
+        assert_eq!(
+            (15.0 * read).to_bits(),
+            r.plan.start_dose.to_bits(),
+            "{label}: reported DW = {read}, dosed {}",
+            r.plan.start_dose
+        );
+    }
+    assert_eq!(
+        exprs
+            .resolve(spec, &p.model, theta, &present, None)
+            .plan
+            .start_dose,
+        1200.0
+    );
+}

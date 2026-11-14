@@ -90,9 +90,8 @@ impl BicInputs {
 /// time-to-event records). `Fixed` therefore reproduces `FitResult::bic`
 /// exactly.
 ///
-/// Returns `NaN` when the tally cannot support the penalty: a bundle saved
-/// before the tally existed (all-zero counts with `n_parameters > 0`), or a
-/// zero subject / record count under a convention that needs its log. A
+/// Returns `NaN` when the tally cannot support the penalty: a hand-built result
+/// (all-zero counts with `n_parameters > 0`), or a zero subject / record count under a convention that needs its log. A
 /// count of zero never needs a log — every variant is `ofv` for a fit with no
 /// free parameter, whatever `n_subjects` / `n_obs` say — so the four variants
 /// agree on such a fit and `Fixed` stays equal to `FitResult::bic` on it.
@@ -338,7 +337,7 @@ pub struct StrictnessVerdict {
     /// gate and the value that tripped it.
     pub failures: Vec<String>,
     /// Gates that were enabled but had no input to test on this fit (no
-    /// covariance matrix, no initial estimates on an old bundle). Not failures,
+    /// covariance matrix, no initial estimates on a hand-built result). Not failures,
     /// but a search report should show them.
     pub skipped: Vec<String>,
 }
@@ -577,8 +576,7 @@ pub const INIT_STALL_REL_TOL: f64 = 1e-2;
 /// [`Strictness::reject_init_stall`].
 ///
 /// `None` when the result carries nothing to judge by: no comparable initial
-/// estimates (a `.fitrx` bundle saved before they were recorded, or
-/// shape-mismatched vectors), or free coordinates only in segments it has no
+/// estimates (a hand-built result, or shape-mismatched vectors), or free coordinates only in segments it has no
 /// initials for.
 pub fn stalled_at_init(result: &FitResult) -> Option<bool> {
     // Nothing free cannot stall. `n_parameters` counts every packed segment,
@@ -676,8 +674,8 @@ pub fn max_abs_correlation(result: &FitResult) -> Option<f64> {
 /// `kappa_is_diagonal`, never inferred from the matrix size (the packed
 /// vector also carries mixture-override and `block_sigma` coordinates, and a
 /// guessed layout would embed the Jacobian over the wrong coordinates). A
-/// result that did not record the layout — a `.fitrx` bundle saved before
-/// #1177, a hand-built result — is returned as stored, packed scale and all.
+/// hand-built result, which does not record the layout, is returned as stored, packed
+/// scale and all.
 /// `None` without a covariance matrix.
 pub fn natural_scale_covariance(result: &FitResult) -> Option<DMatrix<f64>> {
     let cov = result.covariance_matrix.as_ref()?;

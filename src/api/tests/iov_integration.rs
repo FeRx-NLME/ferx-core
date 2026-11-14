@@ -138,6 +138,7 @@ fn make_iov_population() -> Population {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 6],
             occasions: occasions.clone(),
             obs_l2: Vec::new(),
@@ -173,7 +174,6 @@ fn fast_opts(method: EstimationMethod, optimizer: Optimizer, mu_referencing: boo
         interaction: method == EstimationMethod::FoceI,
         mu_referencing,
         optimizer,
-        lbfgs_memory: 5,
         verbose: false,
         ..FitOptions::default()
     }
@@ -1503,6 +1503,7 @@ fn test_saem_accepts_block_sigma_cross_endpoint_fit() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -1592,6 +1593,7 @@ fn test_vi_block_is_marked_when_a_later_stage_re_estimates() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 2],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -1744,6 +1746,7 @@ fn test_vi_accepts_block_sigma_cross_endpoint_fit() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -1851,6 +1854,7 @@ fn test_imp_accepts_block_sigma_cross_endpoint() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 4],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -1947,6 +1951,7 @@ fn test_saem_block_sigma_ofv_matches_foce() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -2051,6 +2056,7 @@ fn test_focei_block_sigma_ofv_finite_and_applies_interaction() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
             occasions: Vec::new(),
             obs_l2: Vec::new(),
@@ -2158,6 +2164,7 @@ fn block_sigma_selected_model_and_population() -> (CompiledModel, Population) {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![1, 1],
         obs_l2: Vec::new(),
@@ -2641,6 +2648,7 @@ fn analytical_oral_depot_infusion_with_compartments_derived_emits_warning() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 5],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -2892,6 +2900,7 @@ fn reset_crossover_population(reset_label: Option<u32>) -> Population {
                 pk_only_occasions: Vec::new(),
                 reset_times: vec![12.0],
                 reset_covariates: Vec::new(),
+                cmt_toggles: Vec::new(),
                 cens: vec![0; 8],
                 occasions: vec![1, 1, 1, 1, 2, 2, 2, 2],
                 obs_l2: Vec::new(),
@@ -3106,6 +3115,14 @@ fn test_npde_post_hoc_matches_the_fit_under_a_derived_rule() {
         .collect();
     assert!(at_fit.iter().all(|(npd, _)| !npd.is_empty()));
     assert_eq!(npde_bits(&post_hoc), at_fit);
+    // #2871: the fit's post-fit step carries EPRED / PWRES from the same pass onto
+    // `SubjectResult`, bit for bit.
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+    for (sr, sn) in res.subjects.iter().zip(&post_hoc) {
+        assert!(!sr.epred.is_empty() && !sr.pwres.is_empty());
+        assert_eq!(bits(&sr.epred), bits(&sn.epred), "subject {} EPRED", sr.id);
+        assert_eq!(bits(&sr.pwres), bits(&sn.pwres), "subject {} PWRES", sr.id);
+    }
 }
 
 // ── #1955: a derived `iov_occasion` rule reaches simulate ────────────────
@@ -3230,6 +3247,7 @@ fn simulate_with_uncertainty_derives_occasions_from_the_fits_rule() {
         n_sim_per_draw: 2,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(5),
+        horizon: None,
     };
     let rows = |pop: &Population, rule: Option<IovOccasionRule>| {
         let mut fit = fit.clone();
@@ -3367,6 +3385,7 @@ fn iov_simulate_warns_when_no_kappa_is_drawn() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(5),
+        horizon: None,
     };
     let uncertainty = |pop: &Population, rule: Option<IovOccasionRule>| {
         let mut fit = fit.clone();

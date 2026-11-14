@@ -928,6 +928,8 @@ pub(crate) fn compute_subject_results(
                 // Filled post-fit (only when npde_nsim > 0); see compute_npde_npd.
                 npde: vec![],
                 npd: vec![],
+                epred: vec![],
+                pwres: vec![],
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
@@ -948,6 +950,8 @@ pub(crate) fn compute_subject_results(
                     &params.theta,
                     eta.as_slice(),
                 ),
+                #[cfg(not(feature = "survival"))]
+                discrete_rows: Vec::new(),
                 // TTE per-record residuals at the same EBE, off the curves the OFV
                 // contribution above scored (#901). Empty without a TTE endpoint.
                 #[cfg(feature = "survival")]
@@ -1673,6 +1677,105 @@ pub(crate) fn collapsed_coordinates(params: &ModelParameters) -> Vec<(usize, Pac
         .collect()
 }
 
+/// The packed coordinates the covariance step holds at the internal guard (#2797): the
+/// [`collapsed_coordinates`] (a lower rail on a log-packed coordinate; a runaway is never
+/// held, D1), `[mixture]` per-class overrides included (#2809: listed with their class, so
+/// no consumer reads one as the base parameter). Ascending. One walk for the step and for
+/// `FitResult::held_at_bound`, so the list and the matrix cannot disagree on which
+/// coordinates are held.
+pub(crate) fn held_guard_coordinates(params: &ModelParameters) -> Vec<usize> {
+    collapsed_coordinates(params)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// `FitResult::held_at_bound` for the estimate `params` (#2797): the
+/// [`HeldReason::ProfiledBound`] levels (`profiled_levels_at_bound`, θ indices) and the
+/// [`HeldReason::CollapsedAtGuard`] coordinates ([`held_guard_coordinates`]), in packed
+/// order, each with the name and family the estimate table shows it under.
+pub(crate) fn held_at_bound_list(
+    params: &ModelParameters,
+    profiled_levels_at_bound: &[usize],
+) -> Vec<HeldAtBound> {
+    use crate::estimation::parameterization::{coordinate_names, packed_segments};
+    let segs = packed_segments(params);
+    let names = coordinate_names(params);
+    let mut out: Vec<HeldAtBound> = profiled_levels_at_bound
+        .iter()
+        .filter(|&&k| k < params.theta.len())
+        .map(|&k| HeldAtBound {
+            name: params.theta_names.get(k).cloned().unwrap_or_default(),
+            kind: ParameterKind::Theta,
+            index: k,
+            packed_index: k,
+            reason: HeldReason::ProfiledBound,
+            class: None,
+        })
+        .collect();
+    for p in held_guard_coordinates(params) {
+        if out.iter().any(|h| h.packed_index == p) {
+            continue;
+        }
+        let Some((kind, index, class)) = packed_diagonal_parameter(params, &segs, p) else {
+            continue;
+        };
+        out.push(HeldAtBound {
+            name: names.get(p).cloned().unwrap_or_default(),
+            kind,
+            index,
+            packed_index: p,
+            reason: HeldReason::CollapsedAtGuard,
+            class,
+        });
+    }
+    out.sort_by_key(|h| h.packed_index);
+    out
+}
+
+/// The `(family, index, class)` a packed coordinate reports under — θ index, Ω diagonal,
+/// σ, or κ (Ω_IOV) diagonal — for a θ or a diagonal Ω / Ω_IOV coordinate (a block's packed
+/// `L_ii` names `Omega(i)`, D4) or a σ, with `class: None`. A `[mixture]` per-class
+/// override (#2809) names the base η or σ it replaces and its 1-based class
+/// (`omega(2)` → `Some(2)`); an Ω override is always diagonal (the parser refuses a block
+/// one). `None` for an off-diagonal or a ρ, neither of which is ever held.
+fn packed_diagonal_parameter(
+    params: &ModelParameters,
+    segs: &crate::estimation::parameterization::PackedSegments,
+    p: usize,
+) -> Option<(ParameterKind, usize, Option<usize>)> {
+    use crate::estimation::parameterization::lower_tri_iter;
+    let diag_of = |om: &crate::types::OmegaMatrix, off: usize| {
+        lower_tri_iter(om.dim(), om.diagonal)
+            .nth(off)
+            .and_then(|(i, j)| (i == j).then_some(i))
+    };
+    if p < segs.omega_start() {
+        Some((ParameterKind::Theta, p, None))
+    } else if p < segs.sigma_start() {
+        diag_of(&params.omega, p - segs.omega_start()).map(|i| (ParameterKind::Omega, i, None))
+    } else if p < segs.iov_start() {
+        Some((ParameterKind::Sigma, p - segs.sigma_start(), None))
+    } else if p < segs.mixture_omega_start() {
+        let iov = params.omega_iov.as_ref()?;
+        diag_of(iov, p - segs.iov_start()).map(|i| (ParameterKind::Kappa, i, None))
+    } else if p < segs.mixture_sigma_start() {
+        let mix = params.mixture.as_ref()?;
+        let &(c, e) = mix
+            .omega_override_addr
+            .get(p - segs.mixture_omega_start())?;
+        Some((ParameterKind::Omega, e, Some(c + 1)))
+    } else if p < segs.rho_start() {
+        let mix = params.mixture.as_ref()?;
+        let &(c, s) = mix
+            .sigma_override_addr
+            .get(p - segs.mixture_sigma_start())?;
+        Some((ParameterKind::Sigma, s, Some(c + 1)))
+    } else {
+        None
+    }
+}
+
 /// Construct a fit-end [`WarningEntry`] with the invariant fields every native
 /// emitter shares (`severity: Warning`, `source_method: None`), varying only
 /// `category`, `message`, and `details`.
@@ -1938,6 +2041,65 @@ pub(crate) fn refresh_profiled_bound_report(
     result.profiled_levels_at_bound = held;
 }
 
+/// `FitResult::held_at_bound` and what follows from it (#2797), for the estimate `params`
+/// and the matrix already in `result`: the list (from `result.profiled_levels_at_bound`,
+/// final by now), and a `0.0` in `se_*` for each collapse the step held, as for a FIX
+/// parameter (a block's held `L_ii` would otherwise leave `Ω_ii` the SE of its free
+/// `L_ij` alone). One place for `fit()` and `run_covariance`, so both report the same.
+pub(crate) fn apply_held_at_bound(params: &ModelParameters, result: &mut FitResult) {
+    result.held_at_bound = held_at_bound_list(params, &result.profiled_levels_at_bound);
+    let cov = result.covariance_matrix.clone();
+    for h in &result.held_at_bound {
+        if h.reason != HeldReason::CollapsedAtGuard || !step_held(cov.as_ref(), h.packed_index) {
+            continue;
+        }
+        // A `[mixture]` override's slot is `se_mixture_overrides` (#2833), already `0.0`:
+        // the step left its covariance row zero. Its `(kind, index)` names the base
+        // parameter, whose SE it must not touch (#2809).
+        if h.class.is_some() {
+            continue;
+        }
+        // `se_omega` of a block Ω is its whole lower triangle, so the held variance's slot
+        // is read off the layout, not the ETA index (#2812 review r1 #1); `se_kappa` is one
+        // per κ whatever the block structure, as are `se_theta` and `se_sigma`.
+        let n_eta = result.omega.nrows();
+        let (se, slot) = match h.kind {
+            ParameterKind::Theta => (result.se_theta.as_mut(), Some(h.index)),
+            ParameterKind::Omega => {
+                let len = result.se_omega.as_ref().map_or(0, Vec::len);
+                (
+                    result.se_omega.as_mut(),
+                    crate::types::omega_se_slot(len, n_eta, h.index, h.index),
+                )
+            }
+            ParameterKind::Sigma => (result.se_sigma.as_mut(), Some(h.index)),
+            ParameterKind::Kappa => (result.se_kappa.as_mut(), Some(h.index)),
+        };
+        if let Some(v) = se.zip(slot).and_then(|(se, k)| se.get_mut(k)) {
+            *v = 0.0;
+        }
+    }
+}
+
+/// `run_covariance`'s refresh of the guard warning and `held_at_bound` (#2797): a re-run
+/// step can hold a collapse the incoming fit's did not, or fail where it succeeded, so the
+/// sentence about the standard errors is rebuilt from this step's matrix, and the old
+/// copy dropped. `converged` is not revisited: a runaway demoted it in `fit()` already,
+/// and this call never promotes.
+pub(crate) fn refresh_held_at_bound_report(params: &ModelParameters, result: &mut FitResult) {
+    result
+        .warnings
+        .retain(|w| !w.contains(RUNAWAY_GUARD_PREFIX));
+    let mut ignored = result.converged;
+    if let Some((msg, entry)) =
+        runaway_guard_warning_for(&mut ignored, params, result.covariance_matrix.as_ref())
+    {
+        result.warnings.push(msg);
+        result.warnings_structured.push(entry);
+    }
+    apply_held_at_bound(params, result);
+}
+
 /// `run_covariance`'s report of the profiled levels its step ran at (#2419). Handed level
 /// estimates that are not the profile solve's β̂ at the other estimates (edited after the
 /// fit), the step's re-solve moves them and computes its matrix there. The re-solved `levels` (`(θ index, value)`, from
@@ -2120,6 +2282,123 @@ pub(crate) fn mcem_marginal_warning(
     );
     Some((msg, entry))
 }
+
+/// Demote a fit whose IMP / IMPMAP objective had not settled when the iteration limit
+/// stopped it, and say which way (#2686). See `impmap::McemObjectiveTrail::settling`.
+///
+/// `trail` is `None` when no MCEM stage produced the estimates. `marginal` is `None`
+/// when no marginal was published, which leaves only the falling-floor test.
+///
+/// A run too short to test keeps its verdict, and hears that the verdict then only says
+/// the run did not diverge. A run long enough whose trace cannot be read is demoted:
+/// nothing in it shows the run settled.
+pub(crate) fn mcem_settling_warning(
+    converged: &mut bool,
+    trail: Option<&crate::estimation::impmap::McemObjectiveTrail>,
+    marginal: Option<crate::estimation::impmap::FinalMarginal>,
+) -> Option<(String, WarningEntry)> {
+    use crate::estimation::impmap::{McemSettling, MCEM_SETTLE_MIN_WINDOW};
+    let trail = trail?;
+    let label = &trail.label;
+    let n = trail.objectives.len();
+    let (severity, msg, details) = match trail.settling(marginal) {
+        McemSettling::Settled => return None,
+        McemSettling::TooShort => {
+            let needed = 3 * MCEM_SETTLE_MIN_WINDOW;
+            let msg = format!(
+                "{MCEM_SETTLING_UNTESTED_TOKEN}: {label}: {n} iteration(s) are too few to test \
+                 whether the objective settled, so `converged` only says the run did not \
+                 diverge. The test needs `{}` of at least {needed}.",
+                trail.iterations_option
+            );
+            let details = serde_json::json!({ "iterations": n, "needed": needed });
+            (WarningSeverity::Warning, msg, details)
+        }
+        McemSettling::Unusable { window, usable } => {
+            *converged = false;
+            let msg = format!(
+                "{MCEM_NOT_SETTLED_TOKEN}: {label}: the run's objective trace cannot be read, \
+                 so the fit is reported converged: false. One of its last two windows of \
+                 {window} iterations has only {usable} finite value(s) of objective or \
+                 Monte-Carlo SE, and reading a window takes {MCEM_SETTLE_MIN_WINDOW}. Those \
+                 iterations produced no usable likelihood, so find out why before relying on \
+                 the estimates."
+            );
+            let details = serde_json::json!({
+                "reason": "unusable_trace",
+                "window": window,
+                "usable": usable,
+                "needed": MCEM_SETTLE_MIN_WINDOW,
+            });
+            (WarningSeverity::Critical, msg, details)
+        }
+        McemSettling::Falling {
+            window,
+            previous_floor,
+            floor,
+            previous_mc_se,
+            mc_se,
+        } => {
+            *converged = false;
+            let msg = format!(
+                "{MCEM_NOT_SETTLED_TOKEN}: {label}: the objective was still falling when the \
+                 run reached its limit of {n} iterations, so the fit is reported converged: \
+                 false. Its floor fell from {previous_floor:.2} to {floor:.2} over the last \
+                 two windows of {window} iterations (Monte-Carlo SEs {previous_mc_se:.2} and \
+                 {mc_se:.2}), so the estimates are likely short of the optimum. Raise `{}`.",
+                trail.iterations_option
+            );
+            let details = serde_json::json!({
+                "reason": "falling",
+                "window": window,
+                "previous_floor": previous_floor,
+                "floor": floor,
+                "previous_mc_se": previous_mc_se,
+                "mc_se": mc_se,
+            });
+            (WarningSeverity::Critical, msg, details)
+        }
+        McemSettling::AboveMarginal {
+            window,
+            floor,
+            marginal,
+            mc_se,
+        } => {
+            *converged = false;
+            let msg = format!(
+                "{MCEM_NOT_SETTLED_TOKEN}: {label}: the iteration objective stayed well above \
+                 the final marginal, so the fit is reported converged: false. Over the last \
+                 {window} iterations its floor was {floor:.2} (Monte-Carlo SE {mc_se:.2}) \
+                 against a marginal of {:.2} (SE {:.2}), so the iterations were not sampling \
+                 the posterior well and the estimates may be short of the optimum. Raise `{}`, \
+                 use a heavy-tailed proposal (`{}`), or chain a FOCE/FOCEI stage first.",
+                marginal.value, marginal.mc_se, trail.samples_option, trail.proposal_option
+            );
+            let details = serde_json::json!({
+                "reason": "above_marginal",
+                "window": window,
+                "floor": floor,
+                "marginal": marginal.value,
+                "marginal_mc_se": marginal.mc_se,
+                "mc_se": mc_se,
+            });
+            (WarningSeverity::Critical, msg, details)
+        }
+    };
+    let entry = warning_entry_with_severity(
+        severity,
+        WarningCode::Convergence,
+        msg.clone(),
+        Some(details),
+    );
+    Some((msg, entry))
+}
+
+/// Stable token of [`mcem_settling_warning`]'s demoting arms.
+pub(crate) const MCEM_NOT_SETTLED_TOKEN: &str = "W_MCEM_NOT_SETTLED";
+
+/// Stable token of [`mcem_settling_warning`]'s note on a run too short to test.
+pub(crate) const MCEM_SETTLING_UNTESTED_TOKEN: &str = "W_MCEM_SETTLING_UNTESTED";
 
 /// Stable token of [`mcem_marginal_warning`]'s unusable-marginal arm.
 pub(crate) const NONFINITE_MARGINAL_TOKEN: &str = "W_NONFINITE_MARGINAL";
@@ -2793,9 +3072,27 @@ pub(crate) fn name_nonfinite_subjects(
 /// Which of the two a hit is comes from [`RunawayGuardHit::is_runaway`], not
 /// from the side: an Ω off-diagonal is rail-bounded symmetrically, so its lower
 /// rail is a runaway too.
-pub(crate) fn runaway_guard_warning(
+/// The opening of the guard warning's text, by which a refresh finds the copy it replaces.
+const RUNAWAY_GUARD_PREFIX: &str = "Internal optimizer parameter guard reached by estimate(s):";
+
+/// Whether the covariance step held packed coordinate `p` (#2797): it produced a matrix
+/// and `p`'s row is the zero row [`crate::estimation::covariance::condition_on_held`]
+/// embeds. Read only for a coordinate [`held_guard_coordinates`] lists: a free coordinate
+/// the step did not hold has the positive diagonal of a positive-definite inverse.
+pub(crate) fn step_held(cov: Option<&DMatrix<f64>>, p: usize) -> bool {
+    cov.is_some_and(|m| p < m.nrows() && m[(p, p)] == 0.0)
+}
+
+/// The guard warning, given the covariance matrix the step produced (`None`: no
+/// matrix). A collapse is a [`HeldReason::CollapsedAtGuard`] coordinate, whose SE is not
+/// reported (#2797); the sentence saying so depends on whether the step held it (a clean
+/// `R`: the other SEs are conditional on it) or not (a floored `R` or an `S` fallback: no
+/// claim about the others), and is absent without a matrix — there are no SEs to qualify.
+/// A runaway is never held (D1). `details.parameters[].held` mirrors `cov_fixed`.
+pub(crate) fn runaway_guard_warning_for(
     converged: &mut bool,
     params: &ModelParameters,
+    cov: Option<&DMatrix<f64>>,
 ) -> Option<(String, WarningEntry)> {
     let hits = runaway_guard_estimates(params);
     if hits.is_empty() {
@@ -2857,8 +3154,33 @@ pub(crate) fn runaway_guard_warning(
              log-transformed error model.",
         );
     }
-    let msg =
-        format!("Internal optimizer parameter guard reached by estimate(s): {list}. {guidance}");
+    // #2797: the collapses the step reports no SE for (`held_guard_coordinates`, `[mixture]`
+    // overrides included since #2809), and whether it held them.
+    let held_set = held_guard_coordinates(params);
+    let collapsed: Vec<&RunawayGuardHit> = hits
+        .iter()
+        .filter(|hit| held_set.contains(&hit.index))
+        .collect();
+    if cov.is_some() && !collapsed.is_empty() {
+        let held = collapsed.iter().all(|hit| step_held(cov, hit.index));
+        let subject = if has_runaway {
+            let names = collapsed
+                .iter()
+                .map(|hit| hit.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("The standard errors of the collapsed parameter(s) {names} are")
+        } else {
+            "Their standard errors are".to_string()
+        };
+        guidance.push_str(&format!(" {subject} not reported"));
+        guidance.push_str(if held {
+            "; the other standard errors are computed with them held at the floor."
+        } else {
+            "."
+        });
+    }
+    let msg = format!("{RUNAWAY_GUARD_PREFIX} {list}. {guidance}");
     let params_json: Vec<serde_json::Value> = hits
         .iter()
         .map(|hit| {
@@ -2869,6 +3191,7 @@ pub(crate) fn runaway_guard_warning(
                 "packed_guard": hit.packed_guard,
                 "side": hit.side,
                 "verdict": hit.verdict(),
+                "held": held_set.contains(&hit.index) && step_held(cov, hit.index),
             })
         })
         .collect();
@@ -3058,20 +3381,27 @@ pub(crate) fn high_correlation_warning(result: &FitResult) -> Option<(String, Wa
 /// is, whatever the start was worth.
 ///
 /// `converged` is deliberately left alone — unlike
-/// [`runaway_guard_warning`], which demotes it. A runaway hit is by construction
+/// [`runaway_guard_warning_for`], which demotes it. A runaway hit is by construction
 /// not an interior optimum; a stall at the start *can* be one (the initial
 /// estimates may simply be the optimum, the degenerate but real case of a fit
 /// restarted from its own output). What the warning asserts is that the OFV is
 /// the OFV of the initial values and so carries no information about the model —
 /// a judgement for the caller, and one `Strictness::reject_init_stall` already
 /// makes for search harnesses that want it fatal.
-pub(crate) fn stalled_at_init_warning(result: &FitResult) -> Option<(String, WarningEntry)> {
-    // An evaluation-only run (`outer_maxiter = 0`, NONMEM `MAXEVAL=0`) reports the
-    // objective at the initial estimates *by request*. The predicate is perfectly
-    // correct there and the warning tells the caller nothing they did not ask for,
-    // so it is suppressed — the one case where "the estimates are the initial
-    // values" is the answer rather than a symptom.
-    if result.outer_maxiter == 0 {
+pub(crate) fn stalled_at_init_warning(
+    result: &FitResult,
+    options: &FitOptions,
+) -> Option<(String, WarningEntry)> {
+    // An evaluation-only run reports the objective at the initial estimates *by
+    // request*: `outer_maxiter = 0` (NONMEM `MAXEVAL=0`), or a chain with no estimating
+    // stage (a standalone `imp_eval_only` or `agq_eval_only`, #2716). The predicate is
+    // perfectly correct there and the warning tells the caller nothing they did not ask
+    // for, so it is suppressed — the one case where "the estimates are the initial
+    // values" is the answer rather than a symptom. The second spelling is read from
+    // `options` because the result records no trace of it: its `outer_maxiter` is the
+    // untouched default, and an estimating IMP fit carries the same `method_chain` and
+    // `importance_sampling`.
+    if result.outer_maxiter == 0 || options.evaluation_only_chain() {
         return None;
     }
     if crate::model_selection::stalled_at_init(result) != Some(true) {
@@ -3632,6 +3962,37 @@ pub(crate) fn non_fit_diagnostics(
     out
 }
 
+/// The token of [`fd_h_not_tightened_warning`]; `classify_warning` matches it.
+const FD_H_NOT_TIGHTENED_TOKEN: &str = "W_FD_JACOBIAN_NOT_TIGHTENED";
+
+/// The warning for `redone` of `n_subjects` subjects whose finite-difference `H` at the final
+/// estimates fell back to the fit's own ODE settings (#2701), or `None` when none did. The
+/// wording holds for a fit tighter than the Jacobian's target too, whose tolerances are its own.
+pub(crate) fn fd_h_not_tightened_warning(
+    redone: usize,
+    n_subjects: usize,
+) -> Option<(String, WarningEntry)> {
+    use crate::estimation::inner_optimizer::{
+        ODE_FD_JACOBIAN_ABSTOL, ODE_FD_JACOBIAN_MAX_STEPS_FACTOR, ODE_FD_JACOBIAN_RELTOL,
+    };
+    if redone == 0 {
+        return None;
+    }
+    let msg = format!(
+        "{FD_H_NOT_TIGHTENED_TOKEN}: {redone} of {n_subjects} subjects' finite-difference \
+         Jacobian could not be integrated cleanly at the final estimates, at no looser than \
+         ode_reltol = {ODE_FD_JACOBIAN_RELTOL:.0e} / ode_abstol = \
+         {ODE_FD_JACOBIAN_ABSTOL:.0e} with {ODE_FD_JACOBIAN_MAX_STEPS_FACTOR} times \
+         ode_max_steps, and was taken at the fit's own ODE settings instead. Integration \
+         error enters the objective's determinant term through this Jacobian, so the OFV \
+         may be off. Raise ode_max_steps or ode_stiff_abort_after, or name a stiff \
+         ode_method, so the solve can finish (#2701)."
+    );
+    let details = serde_json::json!({ "subjects": redone, "n_subjects": n_subjects });
+    let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), Some(details));
+    Some((msg, entry))
+}
+
 /// The one place a non-`fit()` entry point decides whether to open a
 /// [`crate::ode::solver::SolverStatsScope`] (#1304).
 ///
@@ -3809,9 +4170,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // clause below. They are reported through `auto_stiff_rejected` instead. A stall *is* the
     // rejection trigger, so without this subtraction every rejected escalation would be told
     // its predictions were padded when the guard had just repaired them.
-    let clamped = stats
-        .min_step_clamped_steps
-        .saturating_sub(stats.discarded_clamped_steps);
+    let clamped = stats.kept_clamped_steps();
     let rejected = stats.auto_stiff_rejected;
     // The rejections only a dual solve could have taken (#1204), carried here from the
     // post-fit *sensitivity* sweep — `fit_inner` collects that sweep in its own scope and
@@ -3824,9 +4183,7 @@ pub(crate) fn ode_solver_diagnostics_warning(
     // Like clamps, an unfinished stiff attempt that the guard discarded did not reach the
     // caller. Only the explicit fallback (or a named/kept method) belongs in the returned-
     // trajectory clause.
-    let unfinished_kept = stats
-        .unfinished_segments
-        .saturating_sub(stats.discarded_unfinished_segments);
+    let unfinished_kept = stats.kept_unfinished_segments();
     let aborted = stats.stiff_aborted_segments;
     // `unfinished_kept` is a roll-up: a segment abandoned by `ode_stiff_abort_after` stops
     // while `t < tf`, so it is *also* an unfinished segment, and the abort clause below already
@@ -4281,6 +4638,53 @@ pub(crate) fn extract_standard_errors(
     });
 
     (Some(se_theta), Some(se_omega), Some(se_sigma), se_kappa)
+}
+
+/// Standard errors of a `[mixture]` fit's per-class overrides (#2833), parallel to
+/// [`FitResult::mixture_overrides`](crate::types::FitResult::mixture_overrides) and on its
+/// scales. Each override packs `ln` of its class's standard deviation — an Ω override the
+/// Cholesky diagonal `ln L_ee`, a σ override `ln σ` — so the delta method gives
+/// `SE(var) = 2·var·SE(packed)` for Ω and `SE(σ) = σ·SE(packed)` for Σ.
+///
+/// The Ω rule is exact only because an Ω override is accepted on a **diagonal** base
+/// alone (the parser refuses one on a block Ω, `mixture_block_omega_override_rejected`):
+/// there `L_ee = sd`. Lifting that refusal makes this formula wrong.
+///
+/// Rows come from [`mixture_override_params`](crate::estimation::parameterization::mixture_override_params),
+/// so the offsets are the packed-segment helpers', never re-spelled here. A fixed override
+/// reports `0.0`, as a pinned θ/Ω/σ does. `None` with no override or no matrix.
+pub(crate) fn extract_mixture_override_se(
+    cov: &Option<DMatrix<f64>>,
+    template: &ModelParameters,
+) -> Option<Vec<f64>> {
+    let mix = template.mixture.as_ref()?;
+    let params = crate::estimation::parameterization::mixture_override_params(template);
+    if params.is_empty() {
+        return None;
+    }
+    let cov = cov.as_ref()?;
+    let n = cov.nrows();
+    Some(
+        params
+            .iter()
+            .map(|p| {
+                let idx = p.packed_index;
+                // A truncated `cov` reports 0.0, as the other `se_*` extractions do.
+                if p.fixed || idx >= n {
+                    return 0.0;
+                }
+                let var = cov[(idx, idx)];
+                let se_packed = if var > 0.0 { var.sqrt() } else { 0.0 };
+                let c = p.class - 1;
+                match p.kind {
+                    crate::types::ParameterKind::Omega => {
+                        2.0 * mix.omega[c].matrix[(p.index, p.index)] * se_packed
+                    }
+                    _ => mix.sigma[c].values[p.index] * se_packed,
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Standard errors for the estimated `block_sigma` correlations (#847), on the

@@ -529,6 +529,9 @@ pub(crate) static GRADIENT_TIMINGS: GradientTimings = GradientTimings::new();
 pub struct EbeResult {
     pub eta: DVector<f64>,
     pub h_matrix: DMatrix<f64>,
+    /// This candidate's `h_matrix` is an FD Jacobian that fell back to the fit's own ODE
+    /// settings (#2701). On the candidate so a discarded one's fallback leaves with it.
+    pub(crate) fd_h_redone: bool,
     /// Exact conditional eta Hessian at the returned mode when the adjoint
     /// (`exact_inner_hessian`) can produce it.  Laplace/AGQ may reuse this instead
     /// of immediately repeating the same evaluation.
@@ -1864,6 +1867,131 @@ fn weakly_identified_coords(
     omega: &OmegaMatrix,
     n_eta: usize,
 ) -> Vec<bool> {
+    weakly_identified_axes(obj, eta, nll, &omega_prior_diag(omega, n_eta))
+}
+
+/// One coordinate of a search vector as its prior sees it: the variance and `(Ω⁻¹)ᵢᵢ`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AxisPrior {
+    var: f64,
+    inv: f64,
+}
+
+/// The first `n` coordinates' priors under `omega`.
+fn omega_prior_diag(omega: &OmegaMatrix, n: usize) -> Vec<AxisPrior> {
+    (0..n)
+        .map(|i| AxisPrior {
+            var: omega.matrix[(i, i)],
+            inv: omega.inv[(i, i)],
+        })
+        .collect()
+}
+
+/// The priors of the IOV inner loop's flat vector, in its order: `Ω` for the BSV block, then
+/// `Ω_iov` for each occasion's κ, or for each group of each level under nested levels
+/// (#1082). A model with no `omega_iov` has no κ prior, so its κ coordinates read as fixed.
+fn iov_prior_diag(
+    n_eta: usize,
+    n_kappa: usize,
+    k_occasions: usize,
+    nested: Option<&crate::stats::nested_levels::NestedLayout>,
+    params: &ModelParameters,
+) -> Vec<AxisPrior> {
+    let n_flat = nested.map_or(stacked_width(n_eta, n_kappa, k_occasions), |n| {
+        n.n_compact()
+    });
+    let mut out = omega_prior_diag(&params.omega, n_eta);
+    if let Some(oi) = params.omega_iov.as_ref() {
+        let of = |k: usize| AxisPrior {
+            var: oi.matrix[(k, k)],
+            inv: oi.inv[(k, k)],
+        };
+        match nested {
+            Some(n) => {
+                for (l, _) in n.blocks(&vec![0.0; n_flat]) {
+                    out.extend(n.kappas_at(l).into_iter().map(of));
+                }
+            }
+            None => (0..k_occasions).for_each(|_| out.extend((0..n_kappa).map(of))),
+        }
+    }
+    out.resize(
+        n_flat,
+        AxisPrior {
+            var: 0.0,
+            inv: f64::INFINITY,
+        },
+    );
+    out
+}
+
+/// Whether the objective rises and falls again on the way from the mode `x` to `seed`: the
+/// midpoint is at least as high as the seed. A function convex along that segment, with its
+/// minimum at `x`, has its midpoint below the seed, so this proves a barrier. It is
+/// deliberately not the chord test, which a saturating response fails with no second mode.
+/// Non-finite values prove nothing.
+fn section_has_barrier(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], seed: &[f64]) -> bool {
+    let mid: Vec<f64> = x.iter().zip(seed).map(|(a, b)| 0.5 * (a + b)).collect();
+    let (at_mid, at_seed) = (obj(&mid), obj(seed));
+    at_mid.is_finite() && at_seed.is_finite() && at_mid >= at_seed
+}
+
+/// The starts of the guarded multi-start's axis scan: `base` with one scanned coordinate
+/// replaced by `centre[i] ± (m + 1)·sd[i]` for `m` in `1..=restarts`, coordinate by
+/// coordinate, the negative seed of each pair first. A coordinate of zero prior SD has none.
+///
+/// With `omega` (the BSV Ω, over the leading coordinates it covers), a seed moves the
+/// coordinates correlated with `i` too, by their conditional mean `Ω_ji/Ω_ii · Δ` for the
+/// move `Δ` of coordinate `i` — along Ω's own column for `i`, so the seed's move is the
+/// `(m + 1)` prior SDs it is meant to be (#2788). Holding them, as without `omega`, crosses
+/// the prior's ridge: on the melphalan model at a FOCEI plateau (ρ(η_CL, η_V) = 0.9995) a
+/// two-SD η_CL seed with η_V held sat at `ηᵀΩ⁻¹η ≈ 6e5`, objective 3e5, and the descents from
+/// those seeds — into `V2 = 1e-60 … 1e110`, a hopelessly stiff ODE — made that plateau's cold
+/// solve of 68 subjects take 78 s; it takes 1.3 s on the same optimizer path now. A
+/// coordinate uncorrelated with `i` (every one, for a diagonal Ω) is not touched, so its seeds
+/// are bit-identical. The IOV scan passes the BSV Ω, which covers the leading η block of its
+/// flat vector: a κ coordinate (past `Ω`'s rows) is neither shifted nor shifts anything.
+fn axis_seed_starts(
+    base: &[f64],
+    centre: &[f64],
+    scan: &[bool],
+    sd: &[f64],
+    restarts: usize,
+    omega: Option<&DMatrix<f64>>,
+) -> Vec<Vec<f64>> {
+    let mut starts = Vec::new();
+    for i in 0..base.len() {
+        if !scan[i] || sd[i] == 0.0 {
+            continue;
+        }
+        for m in 1..=restarts {
+            let step = (m as f64 + 1.0) * sd[i];
+            for k in [-step, step] {
+                let mut start = base.to_vec();
+                start[i] = centre[i] + k;
+                if let Some(om) = omega.filter(|om| i < om.nrows() && om[(i, i)] > 0.0) {
+                    let delta = start[i] - base[i];
+                    for (j, sj) in start.iter_mut().enumerate().take(om.nrows()) {
+                        if j != i && om[(j, i)] != 0.0 {
+                            *sj += om[(j, i)] / om[(i, i)] * delta;
+                        }
+                    }
+                }
+                starts.push(start);
+            }
+        }
+    }
+    starts
+}
+
+/// [`weakly_identified_coords`] over any search vector, each coordinate against its own
+/// [`AxisPrior`].
+fn weakly_identified_axes(
+    obj: &dyn Fn(&[f64]) -> f64,
+    eta: &[f64],
+    nll: f64,
+    prior: &[AxisPrior],
+) -> Vec<bool> {
     // Prior variances below this are effectively fixed effects. `from_matrix`
     // floors a zero-variance diagonal to a 1e-8 eigenvalue (it must stay PD for
     // the cached Cholesky/inverse), so an exactly-zero test never survives; this
@@ -1871,19 +1999,19 @@ fn weakly_identified_coords(
     // random effect (a 1% CV is variance ~1e-4), so a pinned effect is skipped
     // without ever excluding a real one.
     const FIXED_VAR_FLOOR: f64 = 1e-7;
-    let mut flags = vec![false; n_eta];
+    let mut flags = vec![false; prior.len()];
     if !nll.is_finite() {
         return flags;
     }
-    for i in 0..n_eta {
-        let var_prior = omega.matrix[(i, i)].max(0.0);
+    for (i, axis) in prior.iter().enumerate() {
+        let var_prior = axis.var.max(0.0);
         let sd = var_prior.sqrt();
         // Fixed / effectively-zero-variance effect: it cannot move, so never
         // scan it (the prior pins it at 0 regardless of seed).
         if var_prior <= FIXED_VAR_FLOOR {
             continue;
         }
-        let prior_curv = omega.inv[(i, i)];
+        let prior_curv = axis.inv;
         if !prior_curv.is_finite() || prior_curv <= 0.0 {
             continue;
         }
@@ -2369,6 +2497,13 @@ fn with_recording(f: impl FnOnce(&mut InnerRecording)) {
 // so a test can observe which callers pay for it (#2014 review).
 #[cfg(test)]
 thread_local! {
+    /// Descents this thread has started from an IOV axis seed (#2730).
+    pub(crate) static IOV_AXIS_SEEDS_RUN: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// The largest `ΔᵀΩ⁻¹Δ` of an IOV axis seed's move `Δ` of the BSV block away from the
+    /// incumbent, on this thread; `NaN` once any was non-finite (#2788).
+    pub(crate) static IOV_SEED_MAX_BSV_MAHA: std::cell::Cell<f64> =
+        const { std::cell::Cell::new(0.0) };
     pub(crate) static EBE_MULTISTARTS_STARTED: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     /// This thread's [`MULTISTART_PROFILE`] moves — twin seed, screen, axis scan — so a test
@@ -2455,6 +2590,9 @@ fn find_ebe_impl_from(
     }
     #[cfg(test)]
     with_recording(|r| r.solve_tols.push((subject.id.clone(), tol)));
+    // Every evaluation below is this subject under this model, so the `$PK` sharing index
+    // is built once for the search instead of once per evaluation (#2558).
+    let _share = pk::sharing_scope::SharingScope::enter(model, subject);
 
     // A nested-level subject that was never given its cells (#1082): refused, never
     // estimated as one-level IOV or with κ dropped. `hard_reject` keeps the outer loop
@@ -2463,6 +2601,7 @@ fn find_ebe_impl_from(
         return EbeResult {
             eta: DVector::zeros(model.n_eta),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
@@ -2488,6 +2627,7 @@ fn find_ebe_impl_from(
             tol,
             eta_init,
             mu_k,
+            restarts,
             policy.ebe_variance,
             policy.init_is_mode,
             if policy.unseeded_iov_warm {
@@ -2789,6 +2929,7 @@ fn find_ebe_solve(
         return Some(EbeResult {
             eta: DVector::zeros(0),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), 0),
+            fd_h_redone: false,
             terminal_hessian: policy
                 .capture_terminal_hessian
                 .then(|| DMatrix::zeros(0, 0)),
@@ -3261,46 +3402,42 @@ fn find_ebe_solve(
         } else {
             weakly_identified_coords(&obj, &eta, nll, &params.omega, n_eta)
         };
-        let base = eta.clone();
+        let sds: Vec<f64> = omega_prior_diag(&params.omega, n_eta)
+            .iter()
+            .map(|p| p.var.max(0.0).sqrt())
+            .collect();
         let mut axis_moved = false;
-        for i in 0..n_eta {
-            if !scan_coord[i] {
-                continue;
-            }
-            let sd = params.omega.matrix[(i, i)].max(0.0).sqrt();
-            if sd == 0.0 {
-                continue;
-            }
-            for m in 1..=restarts {
-                let step = (m as f64 + 1.0) * sd;
-                for &k in &[-step, step] {
-                    let mut cand = base.clone();
-                    cand[i] = k;
-                    let ok = inner_minimize_with_grad(
-                        &obj,
-                        &agrad,
-                        &mut cand,
-                        n_eta,
-                        max_iter,
-                        tol,
-                        precond.as_deref(),
-                        None,
-                        stop_precond,
-                        &stall_at,
-                        false,
-                    );
-                    if cand.iter().all(|v| v.is_finite()) {
-                        let cand_nll = obj(&cand);
-                        if cand_nll + 1e-9 < nll {
-                            nll = cand_nll;
-                            eta = cand;
-                            ebe_exit = ok;
-                            used_fallback = false;
-                            axis_moved = true;
-                            #[cfg(test)]
-                            AXIS_SWAPS.with(|n| n.set(n.get() + 1));
-                        }
-                    }
+        for mut cand in axis_seed_starts(
+            &eta,
+            &vec![0.0; n_eta],
+            &scan_coord,
+            &sds,
+            restarts,
+            Some(&params.omega.matrix),
+        ) {
+            let ok = inner_minimize_with_grad(
+                &obj,
+                &agrad,
+                &mut cand,
+                n_eta,
+                max_iter,
+                tol,
+                precond.as_deref(),
+                None,
+                stop_precond,
+                &stall_at,
+                false,
+            );
+            if cand.iter().all(|v| v.is_finite()) {
+                let cand_nll = obj(&cand);
+                if cand_nll + 1e-9 < nll {
+                    nll = cand_nll;
+                    eta = cand;
+                    ebe_exit = ok;
+                    used_fallback = false;
+                    axis_moved = true;
+                    #[cfg(test)]
+                    AXIS_SWAPS.with(|n| n.set(n.get() + 1));
                 }
             }
         }
@@ -3394,6 +3531,7 @@ fn find_ebe_solve(
                 .then(|| DMatrix::from_fn(rows.len(), n_eta, |j, k| rows[j].df_deta[k]))
             })
     };
+    let redone_before = fd_h_redone_on_this_thread();
     let h_matrix = ebe_h_matrix(
         model,
         subject,
@@ -3403,10 +3541,12 @@ fn find_ebe_solve(
         &mut pk_scratch_cell.borrow_mut(),
         schedule,
     );
+    let fd_h_redone = fd_h_redone_on_this_thread() > redone_before;
 
     Some(EbeResult {
         eta: DVector::from_column_slice(&eta_true),
         h_matrix,
+        fd_h_redone,
         terminal_hessian,
         converged: ebe_exit.converged(),
         used_fallback,
@@ -3521,24 +3661,38 @@ pub(crate) fn ebe_h_matrices_at(
         .subjects
         .par_iter()
         .enumerate()
-        .map(|(i, subject)| {
-            // The same branch `find_ebe_impl` takes.
-            if model.n_kappa > 0 && !subject.occasions.is_empty() {
-                iov_ebe_h_matrix(model, subject, params, etas[i].as_slice(), &kappas[i])
-            } else {
-                let schedule = cacheable_schedule(model, subject);
-                ebe_h_matrix(
-                    model,
-                    subject,
-                    params,
-                    etas[i].as_slice(),
-                    None,
-                    &mut pk::EventPkParams::default(),
-                    schedule.as_ref(),
-                )
-            }
-        })
+        .map(|(i, subject)| ebe_h_matrix_of(model, subject, params, etas[i].as_slice(), &kappas[i]))
         .collect()
+}
+
+/// Whether `subject`'s `H` is the IOV one: the same branch `find_ebe_impl` takes.
+fn iov_h_route(model: &CompiledModel, subject: &Subject) -> bool {
+    model.n_kappa > 0 && !subject.occasions.is_empty()
+}
+
+/// One subject's `H` at its EBE, by the rule the inner loop finishes with and with no captured
+/// Jacobian. `kappas` is read on the IOV route only.
+fn ebe_h_matrix_of(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+    kappas: &[DVector<f64>],
+) -> DMatrix<f64> {
+    if iov_h_route(model, subject) {
+        iov_ebe_h_matrix(model, subject, params, eta, kappas)
+    } else {
+        let schedule = cacheable_schedule(model, subject);
+        ebe_h_matrix(
+            model,
+            subject,
+            params,
+            eta,
+            None,
+            &mut pk::EventPkParams::default(),
+            schedule.as_ref(),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -3587,6 +3741,7 @@ fn find_ebe_iov(
         tol,
         eta_init,
         mu_k,
+        0,
         ebe_variance,
         init_is_mode,
         InnerHessianSeed::GaussNewton,
@@ -3604,6 +3759,7 @@ fn find_ebe_iov_seeded(
     tol: f64,
     eta_init: Option<&[f64]>,
     mu_k: Option<&[f64]>,
+    restarts: usize,
     ebe_variance: EbeVariance,
     init_is_mode: bool,
     seed: InnerHessianSeed,
@@ -3941,6 +4097,7 @@ fn find_ebe_iov_seeded(
         return EbeResult {
             eta: DVector::from_column_slice(&bsv_eta),
             h_matrix: DMatrix::zeros(subject.obs_times.len(), n_eta),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: false,
@@ -4073,6 +4230,95 @@ fn find_ebe_iov_seeded(
     } else {
         InnerExit::certified(nm_converged)
     };
+    // ── Guarded multi-start, IOV twin (`[fit_options] inner_restarts`, #2730) ───
+    // The axis scan of `find_ebe_solve`, on the flat vector `[ψ, κ_1, …, κ_K]`: a mode that
+    // differs in one occasion's κ is as invisible to a single descent as one in η, and the
+    // reset / TV-covariate subjects whose individual objective is multimodal are the same
+    // ones here. The same gates apply: cold starts only, every coordinate on a family-1
+    // subject and the flat ones otherwise, seeds from each coordinate's own prior SD, an η
+    // seed moving the correlated η along Ω's column (#2788).
+    //
+    // Three differences. A seed is placed about the prior's centre, which for ψ is `μ`, not
+    // 0. A candidate must also lie more than `SCREEN_MIN_OMEGA_DIST` from the incumbent in
+    // the joint prior's metric, as a Sobol screen descent must: this solve's descents stop
+    // on a stall or at a loose gradient norm, so two of them on one mode can differ by more
+    // than `1e-9`, and the objective guard alone would move a unimodal subject's EBE. And
+    // a family-2 subject also scans a coordinate that is well curved at the incumbent but
+    // has a barrier on the way to a seed ([`section_has_barrier`]): an occasion's κ with a
+    // few informative samples and a second solution on the far side of a peak in the
+    // response is sharp at both modes, so the flatness probe alone never sees it.
+    //
+    // Cost: `2·restarts` descents per scanned coordinate, so linear in the occasions, and
+    // on cold solves only; the probes are objective evaluations, `2` per seed. The Sobol
+    // screen and the twin seed stay off this path.
+    if restarts > 0 && !is_warm_start(eta_init, init_is_mode) {
+        #[cfg(test)]
+        EBE_MULTISTARTS_STARTED.with(|n| n.set(n.get() + 1));
+        let mut nll = obj(&x);
+        let prior = iov_prior_diag(n_eta, n_kappa, k_occasions, nested, params);
+        let scan_all = subject.has_resets() || subject.has_tv_covariates();
+        let sds: Vec<f64> = prior.iter().map(|p| p.var.max(0.0).sqrt()).collect();
+        let mut centre = vec![0.0; n_flat];
+        centre[..n_eta].copy_from_slice(&mu);
+        // The BSV block's seeds follow Ω's column (#2788); `axis_seed_starts` shifts only the
+        // leading `n_eta` coordinates Ω covers, so a κ seed, and the κ block of an η seed, are
+        // left to their own priors.
+        let bsv_omega = Some(&params.omega.matrix);
+        let scan_coord: Vec<bool> = if scan_all {
+            vec![true; n_flat]
+        } else {
+            weakly_identified_axes(&obj, &x, nll, &prior)
+                .into_iter()
+                .enumerate()
+                .map(|(i, flat)| {
+                    let only_i: Vec<bool> = (0..n_flat).map(|j| j == i).collect();
+                    flat || axis_seed_starts(&x, &centre, &only_i, &sds, restarts, bsv_omega)
+                        .iter()
+                        .any(|seed| section_has_barrier(&obj, &x, seed))
+                })
+                .collect()
+        };
+        let mut axis_moved = false;
+        for mut cand in axis_seed_starts(&x, &centre, &scan_coord, &sds, restarts, bsv_omega) {
+            #[cfg(test)]
+            {
+                IOV_AXIS_SEEDS_RUN.with(|n| n.set(n.get() + 1));
+                let moved: Vec<f64> = (0..n_eta).map(|j| cand[j] - x[j]).collect();
+                let maha = ebe_prior_maha(&moved, &params.omega);
+                IOV_SEED_MAX_BSV_MAHA.with(|c| {
+                    if !(maha <= c.get()) {
+                        c.set(maha);
+                    }
+                });
+            }
+            let ok = inner_minimize_with_grad(
+                &obj, &agrad, &mut cand, n_flat, max_iter, tol, None, None, None, &stall_at, false,
+            );
+            if cand.iter().all(|v| v.is_finite()) {
+                let cand_nll = obj(&cand);
+                // The difference, re-centred on `μ` because the metric takes a point in ψ.
+                let gap: Vec<f64> = cand
+                    .iter()
+                    .zip(&x)
+                    .zip(&centre)
+                    .map(|((c, i), m)| c - i + m)
+                    .collect();
+                let dist =
+                    iov_prior_maha(&gap, &mu, n_eta, n_kappa, k_occasions, nested, params).sqrt();
+                if cand_nll + 1e-9 < nll && dist > SCREEN_MIN_OMEGA_DIST {
+                    nll = cand_nll;
+                    x = cand;
+                    ebe_exit = ok;
+                    used_fallback = false;
+                    axis_moved = true;
+                    #[cfg(test)]
+                    AXIS_SWAPS.with(|n| n.set(n.get() + 1));
+                }
+            }
+        }
+        MULTISTART_PROFILE.record(false, false, axis_moved);
+    }
+
     let runaway_limit = RUNAWAY_EBE_MAHA_PER_ETA * n_flat as f64;
     if !skip_ode_iov_nm_fallback(model)
         && iov_prior_maha(&x, &mu, n_eta, n_kappa, k_occasions, nested, params) > runaway_limit
@@ -4102,11 +4348,14 @@ fn find_ebe_iov_seeded(
         .map(|k| DVector::from_column_slice(k))
         .collect();
 
+    let redone_before = fd_h_redone_on_this_thread();
     let h_matrix = iov_ebe_h_matrix(model, subject, params, &bsv_eta, &kappas_vec);
+    let fd_h_redone = fd_h_redone_on_this_thread() > redone_before;
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),
         h_matrix,
+        fd_h_redone,
         terminal_hessian: None,
         converged: ebe_exit.converged() && nll.is_finite(),
         used_fallback,
@@ -4228,23 +4477,26 @@ fn compute_jacobian_fd_iov(
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
-    let eps = 1e-6;
-    let mut h = DMatrix::zeros(n_obs, n_eta);
-    let mut eta_pert = eta.to_vec();
 
-    for col in 0..n_eta {
-        let h_step = eps * (1.0 + eta[col].abs());
-        eta_pert[col] = eta[col] + h_step;
-        let preds_plus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
-        eta_pert[col] = eta[col] - h_step;
-        let preds_minus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
-        eta_pert[col] = eta[col];
+    let mut h = with_fd_jacobian_integration(model, |eps| {
+        let mut h = DMatrix::zeros(n_obs, n_eta);
+        let mut eta_pert = eta.to_vec();
 
-        let inv = 1.0 / (2.0 * h_step);
-        for j in 0..n_obs {
-            h[(j, col)] = (preds_plus[j] - preds_minus[j]) * inv;
+        for col in 0..n_eta {
+            let h_step = eps * (1.0 + eta[col].abs());
+            eta_pert[col] = eta[col] + h_step;
+            let preds_plus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
+            eta_pert[col] = eta[col] - h_step;
+            let preds_minus = pk::predict_iov(model, subject, theta, &eta_pert, kappas);
+            eta_pert[col] = eta[col];
+
+            let inv = 1.0 / (2.0 * h_step);
+            for j in 0..n_obs {
+                h[(j, col)] = (preds_plus[j] - preds_minus[j]) * inv;
+            }
         }
-    }
+        h
+    });
 
     // Overwrite FREM pseudo-observation rows with exact analytical Jacobian.
     overwrite_frem_pseudo_obs_rows(&mut h, model, subject, n_eta);
@@ -5008,7 +5260,13 @@ fn residual_inner_obs(
         // Signed kernel: right-censored (`cens < 0`) rows use the upper tail, so
         // `h·m` / `h·z` match `individual_nll_iov`'s `m3_logcdf` data term.
         let (h, z, m) = crate::stats::special::m3_censored_kernel(y, f, v, dv_df, cens);
-        (h * m, if ruv_active { h * z } else { 0.0 })
+        if h == 0.0 {
+            // A certain row past `h`'s underflow: both limits are `0`, and at `z = +∞` the
+            // products would be `0·∞` (#2772).
+            (0.0, 0.0)
+        } else {
+            (h * m, if ruv_active { h * z } else { 0.0 })
+        }
     } else {
         let ruv_term = if ruv_active {
             ruv_data_dterm(y - f, v)
@@ -7381,6 +7639,150 @@ fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
     g
 }
 
+/// Central-difference step of the FD Jacobian on a model that never integrates, where only
+/// roundoff limits the difference.
+const FD_JACOBIAN_STEP: f64 = 1e-6;
+
+/// Central-difference step of the FD Jacobian on a model with an integrator (#2701), per unit
+/// of `1 + |η|`. Integration error reaches `H` as `error / step`, so a step sized for roundoff
+/// lets the integrator set the determinant term. On the 8-state neutropenia model (6 worst
+/// subjects, OFV −3.6510 once `H` is resolved) the step alone, at the fit's `1e-4` / `1e-6`,
+/// measured 71.6 at `1e-6`, 44.3 at `1e-5`, 17.5 at `1e-4` and −2.2 at `1e-3`. Truncation is
+/// `O(step²)`: `1e-3` and `3e-3` agree to 1e-4 OFV at every tolerance from `1e-7` down.
+const ODE_FD_JACOBIAN_STEP: f64 = 1e-3;
+
+/// `ode_reltol` / `ode_abstol` the FD Jacobian integrates at, at most (#2701). Unlike the
+/// covariance plateau (`1e-6` / `1e-8`) this one is measured against a difference of step
+/// [`ODE_FD_JACOBIAN_STEP`]: at that step on the same model (256 subjects, `H` resolved at
+/// −289.8764), `1e-7` / `1e-9` left 1.2e-2 OFV, this 5.3e-3, `1e-9` / `1e-12` 2.4e-4.
+pub(crate) const ODE_FD_JACOBIAN_RELTOL: f64 = 1e-8;
+pub(crate) const ODE_FD_JACOBIAN_ABSTOL: f64 = 1e-10;
+
+/// How much the step budget grows under [`fd_jacobian_ode_override`]. Tightening the default
+/// `ode_reltol` 10⁴× costs an order-`p` stepper 10^(4/p) more steps: ~6× for rk45, ~22× for
+/// rosenbrock23. A cap, paid only by a solve that needs it.
+pub(crate) const ODE_FD_JACOBIAN_MAX_STEPS_FACTOR: usize = 32;
+
+/// The ODE solver override the FD Jacobian integrates under, or `None` when the model has no
+/// integrator. A fit already at least that tight keeps its tolerances and still gets the
+/// budget and [`with_fd_jacobian_integration`]'s health check: a perturbed solve can fail where
+/// the prediction pass at η̂ does not, and no other diagnostic sees it. Every field is pinned,
+/// so the fit's `ode_method` and budgets reach the Jacobian. Read on the thread that solves,
+/// where the fit's override is in force.
+fn fd_jacobian_ode_override(
+    model: &CompiledModel,
+) -> Option<crate::ode::solver::OdeSolverOverride> {
+    let eff = model.integrator_spec()?.effective_solver_opts();
+    Some(crate::ode::solver::OdeSolverOverride {
+        reltol: Some(eff.reltol.min(ODE_FD_JACOBIAN_RELTOL)),
+        abstol: Some(eff.abstol.min(ODE_FD_JACOBIAN_ABSTOL)),
+        max_steps: Some(
+            eff.max_steps
+                .saturating_mul(ODE_FD_JACOBIAN_MAX_STEPS_FACTOR),
+        ),
+        method: Some(eff.method),
+        stiff_abort_after: Some(eff.stiff_abort_after),
+        auto_switch: Some(eff.auto_switch),
+    })
+}
+
+/// The step `difference` takes per unit of `1 + |η|`, and the tolerance it runs at (#2701).
+///
+/// `H` enters FOCE/FOCEI through `log|Ω⁻¹ + HᵀR⁻¹H|`, so integration error in `H` raises the
+/// objective at an unchanged mode and residuals: on the neutropenia model, `H` differenced at
+/// the fit's tolerance cost 30 OFV on 256 subjects and about 1450 on 5111. The predictions
+/// and the EBE search keep the fit's tolerance, exactly as beside an exact analytic Jacobian.
+///
+/// The override reaches this thread alone, which is all the differences use: they run inside
+/// one subject's work, on one worker.
+///
+/// A tighter solve can fail where the fit's own does not, and a failed one need not look
+/// failed: a segment that runs out of `ode_max_steps` or `ode_stiff_abort_after` is padded with
+/// its last state, and a step force-accepted at `min_dt` finishes the segment over the error
+/// test, so either way the difference stays finite without meeting the tolerance. So the pass
+/// is accepted only if it is finite and the trajectories it **kept** have no unfinished segment
+/// and no clamped step. An `auto` attempt the guard discarded and re-solved cleanly does not
+/// count against it. Otherwise it is redone at the fit's own settings with the same step, and
+/// counted in [`FD_H_REDONE`], which is how the fit reports it to the user.
+fn with_fd_jacobian_integration(
+    model: &CompiledModel,
+    mut difference: impl FnMut(f64) -> DMatrix<f64>,
+) -> DMatrix<f64> {
+    let step = if model.integrator_spec().is_some() {
+        ODE_FD_JACOBIAN_STEP
+    } else {
+        FD_JACOBIAN_STEP
+    };
+    if let Some(tight) = fd_jacobian_ode_override(model) {
+        let stats = crate::ode::solver::SolverStatsScope::enter();
+        let h = {
+            let _tight = crate::ode::solver::arm_ode_solver_override(tight);
+            difference(step)
+        };
+        let solved = stats.collected();
+        let met_tolerance =
+            solved.kept_unfinished_segments() == 0 && solved.kept_clamped_steps() == 0;
+        if met_tolerance && h.iter().all(|v| v.is_finite()) {
+            return h;
+        }
+        FD_H_REDONE.with(|c| c.set(c.get() + 1));
+    }
+    difference(step)
+}
+
+thread_local! {
+    /// FD Jacobians on this thread that [`with_fd_jacobian_integration`] redid at the fit's
+    /// tolerance. Read as a difference around one subject's `H`, on the thread that built it.
+    static FD_H_REDONE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// FD Jacobians redone on this thread so far, read on either side of building one `H`.
+fn fd_h_redone_on_this_thread() -> usize {
+    FD_H_REDONE.with(|c| c.get())
+}
+
+/// How many subjects' `H` at the final estimates fell back to the fit's own settings because
+/// the Jacobian's pass could not meet its tolerance (#2701). Not for a `[mixture]` fit, whose
+/// objective reads every contributing class's `H`: `mixture_ofv` reads
+/// [`EbeResult::fd_h_redone`] for those.
+///
+/// A second pass over the subjects, because no objective evaluation carries a report out of
+/// the inner loop, and because the reported objective reads this `H` and no earlier one. It
+/// builds `H` through [`ebe_h_matrix_of`], the route the fit took, so a subject on an exact
+/// Jacobian counts nothing, at the cost of one first-order sweep per subject.
+///
+/// `0` without building anything on a model that never integrates. A subject the fit reported
+/// no EBE or no κ̂ for is skipped.
+pub(crate) fn fd_h_subjects_redone(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    etas: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+) -> usize {
+    use rayon::prelude::*;
+    if fd_jacobian_ode_override(model).is_none() {
+        return 0;
+    }
+    population
+        .subjects
+        .par_iter()
+        .enumerate()
+        .filter(|&(i, subject)| {
+            let Some(eta) = etas.get(i) else {
+                return false;
+            };
+            let subject_kappas = kappas.get(i).map_or(&[][..], Vec::as_slice);
+            if iov_h_route(model, subject) && subject_kappas.is_empty() {
+                return false;
+            }
+            let before = fd_h_redone_on_this_thread();
+            ebe_h_matrix_of(model, subject, params, eta.as_slice(), subject_kappas);
+            fd_h_redone_on_this_thread() > before
+        })
+        .count()
+}
+
 /// Compute Jacobian H = d(predictions)/d(eta) via finite differences.
 /// H is n_obs x n_eta.
 ///
@@ -7398,30 +7800,32 @@ fn compute_jacobian_fd(
 ) -> DMatrix<f64> {
     let n_obs = subject.obs_times.len();
     let n_eta = eta.len();
-    let eps = 1e-6;
 
-    let mut h = DMatrix::zeros(n_obs, n_eta);
-    let mut eta_pert = eta.to_vec();
+    let mut h = with_fd_jacobian_integration(model, |eps| {
+        let mut h = DMatrix::zeros(n_obs, n_eta);
+        let mut eta_pert = eta.to_vec();
 
-    for j in 0..n_eta {
-        let h_step = eps * (1.0 + eta[j].abs());
+        for j in 0..n_eta {
+            let h_step = eps * (1.0 + eta[j].abs());
 
-        eta_pert[j] = eta[j] + h_step;
-        let preds_plus = pk::compute_predictions_with_tv_into_with_schedule(
-            model, subject, theta, &eta_pert, scratch, schedule,
-        );
+            eta_pert[j] = eta[j] + h_step;
+            let preds_plus = pk::compute_predictions_with_tv_into_with_schedule(
+                model, subject, theta, &eta_pert, scratch, schedule,
+            );
 
-        eta_pert[j] = eta[j] - h_step;
-        let preds_minus = pk::compute_predictions_with_tv_into_with_schedule(
-            model, subject, theta, &eta_pert, scratch, schedule,
-        );
+            eta_pert[j] = eta[j] - h_step;
+            let preds_minus = pk::compute_predictions_with_tv_into_with_schedule(
+                model, subject, theta, &eta_pert, scratch, schedule,
+            );
 
-        for i in 0..n_obs {
-            h[(i, j)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
+            for i in 0..n_obs {
+                h[(i, j)] = (preds_plus[i] - preds_minus[i]) / (2.0 * h_step);
+            }
+
+            eta_pert[j] = eta[j];
         }
-
-        eta_pert[j] = eta[j];
-    }
+        h
+    });
 
     // Overwrite FREM pseudo-observation rows with exact analytical Jacobian.
     // For FREMTYPE > 0 observations, prediction = theta[k] + eta[m], so
@@ -7730,6 +8134,7 @@ fn cancelled_ebe_placeholder(
     EbeResult {
         eta,
         h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+        fd_h_redone: false,
         terminal_hessian: None,
         converged: false,
         used_fallback: false,
@@ -7887,6 +8292,10 @@ mod tests;
 #[cfg(test)]
 #[path = "inner_optimizer_iov_tests.rs"]
 mod iov_tests;
+
+#[cfg(test)]
+#[path = "inner_optimizer_fd_jacobian_tests.rs"]
+mod fd_jacobian_tests;
 
 #[cfg(test)]
 #[path = "inner_optimizer_screen_tests.rs"]

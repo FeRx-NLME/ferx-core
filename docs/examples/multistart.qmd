@@ -23,17 +23,43 @@ With `n_starts = 8` and `start_sigma = 0.5`:
 - **Start 0** uses the exact initial values from `[parameters]` (Vmax=12, Km=20).
 - **Starts 1–7** multiply each log-packed theta by `exp(N(0, 0.5))`, giving a spread of roughly ×0.6–×1.6 around the initial values. With `start_sigma = 0.5` this is wider than the default 0.3 — appropriate for a ridge-shaped surface.
 - All 8 runs execute in parallel. On an 8-core machine wall-clock time equals a single run.
-- The converged run with the lowest OFV is returned. If start 0 was already at the global optimum, nothing changes. If one of the perturbed starts found a better solution, a warning on `FitResult.warnings` reports which start won and its OFV.
+- The converged run with the lowest OFV is returned. If start 0 was already at the global optimum, the estimates are those of a single run to within the optimizer's stopping noise (the returned start can be another one that reached the same optimum).
+- One `Multi-start:` line on `FitResult.warnings` says how the starts compare, and `FitResult.starts` has a row per start.
 
 ## Running it
 
 ```bash
-# Simulate data first
+# Simulate from the [simulation] block and fit in the same run
 cargo run --release -p ferx-cli -- examples/mm_multistart.ferx --simulate
-
-# Fit with multi-start
-cargo run --release -p ferx-cli -- examples/mm_multistart.ferx --data mm_multistart-sim.csv
 ```
+
+## Reading the result
+
+The run prints (macOS arm64; the winning index can differ by platform, since
+the starts agree to 1e-7):
+
+```
+Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 6); all 8 converged starts within 1.0 of best (range 0.0000)
+```
+
+All eight starts reached the same optimum. Start 6 is lower than start 0 by
+1e-7 OFV; that is the optimizer's stopping noise, not a better optimum. This is
+the answer multi-start is run for: the reported optimum does not depend on the
+initial values.
+
+Widen the perturbation to `start_sigma = 1.5` and the line changes:
+
+```
+Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 2); 7 of 8 converged starts within 1.0 of best; 1 converged above it: start 4 (+5.27)
+```
+
+Start 4 stopped 5.27 OFV above the others and reports `converged`. Its row in
+`FitResult.starts` (and in the fit YAML's `multi_start:` block) shows where:
+`TVVMAX` at its upper bound of 50, with `TVV` 3.9 against 18.5. The returned
+estimates are the same as before. What the line adds is that this objective
+has a second point where a fit can stop, so a single run from a poor start
+could have reported it. [What the starts did](../model-file/fit-options.qmd#multi-start-spread)
+explains each part of the line.
 
 ## When to use multi-start
 
@@ -43,5 +69,30 @@ cargo run --release -p ferx-cli -- examples/mm_multistart.ferx --data mm_multist
 | Michaelis-Menten elimination | High | 4–8 |
 | Full-block omega (≥ 3 etas) | Moderate | 4 |
 | Many correlated covariates | Moderate | 4–8 |
+| Small dataset (e.g. an arm-level MBMA) | Model-dependent; cheap to check | 8 |
+
+### Small datasets {#small-datasets}
+
+On a dataset of a few hundred rows or fewer, such as an arm-level model-based
+meta-analysis, a single fit usually takes well under a second, so eight starts
+cost almost nothing. That makes multi-start a cheap check that the reported
+optimum is not a local one, even when the model is not one of the high-risk
+types above. The exception is a model whose nested levels stack many random
+effects into one subject: on 192 rows such a fit took 0.56 to 6.97 s as the
+stacked width grew from 9 to 33
+([Cost grows with the groups inside each subject](../model-file/iov.qmd#nested-levels-cost)).
+
+Whether it finds anything depends on the model. On the naproxen MBMA
+(`examples/mbma_naproxen.ferx`, 18 trials, 36 arms, 122 observations) it found nothing
+better: from the published estimates and from a naive start (all covariate
+effects at 0, the typical values off by 2–7×), `n_starts = 1` and `n_starts = 8`
+reached the same OFV, 261.8149, and eight starts took 0.04–0.06 s against
+0.03 s for one. A user fitting arm-level ulcerative-colitis models reported
+better optima from multi-start on several of them
+([ferx-r#721](https://github.com/FeRx-NLME/ferx-r/issues/721)). The
+`Multi-start:` line says which it is: `all 8 converged starts within 1.0 of best`
+means the single-start fit was already there, whichever start index the line
+names, and a clause such as `1 converged above it: start 4 (+5.27)` means the
+starts disagree ([Reading the result](#reading-the-result)).
 
 `start_sigma = 0.3` (the default, ≈ 30% CV) is appropriate for most models. For ridge-shaped surfaces like Vmax/Km, `start_sigma = 0.4–0.5` explores a wider neighbourhood.

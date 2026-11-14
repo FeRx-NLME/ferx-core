@@ -64,9 +64,9 @@ pub enum UncertaintyMethod {
 /// estimated, and its fitted value is read from [`FitResult::mixture_overrides`]
 /// (#1765), which every `fit()` of such a model records — SAEM included — and a `.fitrx`
 /// bundle [`save_fit`](crate::io::fitrx::save_fit) wrote from one carries on reload. A fit
-/// without it (built in R, or a bundle saved before #1765) falls back to the override
-/// segment of [`FitResult::packed_estimate`], which a packed-space fit (FOCE / FOCEI /
-/// Laplace / Gauss-Newton) carries in memory and in a bundle saved since #1815. That
+/// without it (built in R) falls back to the override segment of
+/// [`FitResult::packed_estimate`], which a packed-space fit (FOCE / FOCEI / Laplace /
+/// Gauss-Newton) carries in memory and in a bundle. That
 /// vector is read only when it unpacks bit-for-bit to the fit's reported θ / Ω / σ /
 /// Ω_IOV / ρ.
 ///
@@ -79,9 +79,7 @@ pub enum UncertaintyMethod {
 ///
 /// For a `[mixture]` model with at least one override: `E_FIT_INPUT_MODEL` when
 /// `mixture_overrides` does not hold one non-negative finite value per declared override.
-/// When it is `None`, `E_FIT_INPUT_MISSING` if `packed_estimate` is `None` too (a
-/// `.fitrx` bundle saved before #1765 / #1815, or written by ferx-r before
-/// FeRx-NLME/ferx-r#655), and
+/// When it is `None`, `E_FIT_INPUT_MISSING` if `packed_estimate` is `None` too, and
 /// `E_FIT_INPUT_MODEL` if it does not have this model's packed length (a different
 /// model) or no longer unpacks to the fit's reported estimates (they were edited after
 /// the fit, or the model's layout differs).
@@ -163,8 +161,7 @@ pub(crate) enum PackedEstimate<'a> {
     /// Ω_IOV, ρ and recorded `[mixture]` override values: the optimizer's own point,
     /// safe to reuse as the centre.
     Usable(&'a [f64]),
-    /// The fit carries none (SAEM / IMP / Bayes, a fit built in R, a `.fitrx`
-    /// bundle saved before #1815 or written by ferx-r).
+    /// The fit carries none (SAEM / IMP / Bayes, a fit built in R).
     Absent,
     /// Has this many coordinates, which is not this model's packed length.
     WrongLength(usize),
@@ -349,9 +346,7 @@ fn fitted_mixture_values(
                 "this [mixture] fit estimates the per-class override(s) {}, and the fit \
                  records neither their fitted values (mixture_overrides) nor a packed \
                  estimate holding them. A fit() result records them, and so does a .fitrx \
-                 bundle save_fit wrote from one; a .fitrx bundle saved before #1765 from an \
-                 SAEM fit or before #1815 from any other method, or written by ferx-r before \
-                 FeRx-NLME/ferx-r#655, lacks them.",
+                 bundle save_fit wrote from one.",
                 names.join(", ")
             )))
         }
@@ -784,6 +779,22 @@ fn draw_asymptotic(
             *f = true;
         }
     }
+    // A collapse on the internal guard the step held (#2797) has the same zero row and is
+    // held the same way: a draw off its rail would be a draw from the floor's 1/curvature.
+    // So is an entry whose reason this build does not know (#2817, a bundle from a later
+    // ferx): `step_held` reads only the matrix, so a zero row is held whatever the reason,
+    // and the draws agree with the displays, which already show its SE as N/A.
+    for h in &fit_result.held_at_bound {
+        if matches!(
+            h.reason,
+            crate::types::HeldReason::CollapsedAtGuard | crate::types::HeldReason::Unknown
+        ) && crate::api::step_held(Some(cov), h.packed_index)
+        {
+            if let Some(f) = fixed_mask.get_mut(h.packed_index) {
+                *f = true;
+            }
+        }
+    }
     let n_packed = x_hat.len();
     if cov.nrows() != n_packed || cov.ncols() != n_packed {
         return Err(crate::api::fit_input_model(format!(
@@ -1021,6 +1032,9 @@ mod tests {
             nlopt_missing_algorithms: vec![],
             covariance_n_evals_estimated: None,
             trace_path: None,
+            trace_csv: None,
+            cov_fixed: Vec::new(),
+            interface_extras: None,
             ebe_convergence_warnings: 0,
             max_unconverged_subjects: 0,
             total_ebe_fallbacks: 0,
@@ -1046,6 +1060,7 @@ mod tests {
             bic_inputs: Default::default(),
             profiled_blocks: Vec::new(),
             profiled_levels_at_bound: Vec::new(),
+            held_at_bound: Vec::new(),
             eta_log_transformed: vec![],
             omega_param_corr: None,
             omega_iov_param_corr: None,
@@ -1066,6 +1081,7 @@ mod tests {
             optimizer: "bobyqa".to_string(),
             n_starts: 1,
             multi_start_seed: None,
+            starts: Vec::new(),
             saem_seed: None,
             sir_seed: None,
             sir_settings: None,
@@ -1084,10 +1100,16 @@ mod tests {
             exclusions: None,
             packed_estimate: None,
             mixture_overrides: None,
+            mixture_override_params: Vec::new(),
+            se_mixture_overrides: None,
             left_init: None,
             stationary_start: false,
             omega_is_diagonal: None,
             kappa_is_diagonal: None,
+            newton_decrement: None,
+            optimizer_stop: None,
+            eval_budget_spent: false,
+            evaluation_only: false,
         }
     }
 
@@ -1460,6 +1482,66 @@ mod tests {
         assert!(
             any_v_varies,
             "free parameter V was inadvertently pinned by the clamp"
+        );
+    }
+
+    /// #2797: a collapse the covariance step held (its row of the matrix zero) is held in
+    /// the asymptotic draws too, as a FIX parameter and a #2418 profiled level are. Without
+    /// the hold the regularised Cholesky scatters the zero-variance coordinate (the
+    /// control half: same matrix, empty `held_at_bound`), so the pin is the mask's work.
+    #[test]
+    fn asymptotic_draws_hold_a_collapse_the_step_held() {
+        assert_asymptotic_draws_hold(crate::types::HeldReason::CollapsedAtGuard);
+    }
+
+    /// #2817: an entry whose reason this build does not know (read from a later ferx's
+    /// bundle) is held the same way when the step held its row, so the draws agree with
+    /// the displays (SE `N/A`). Without the hold the σ scatters, as the control half shows.
+    #[test]
+    fn asymptotic_draws_hold_an_unknown_reason_the_step_held() {
+        assert_asymptotic_draws_hold(crate::types::HeldReason::Unknown);
+    }
+
+    fn assert_asymptotic_draws_hold(reason: crate::types::HeldReason) {
+        use crate::types::{HeldAtBound, ParameterKind};
+        let template = tiny_template();
+        let n_packed = crate::estimation::parameterization::packed_len(&template);
+        let p = crate::estimation::parameterization::packed_segments(&template).sigma_start();
+        let mut cov = DMatrix::identity(n_packed, n_packed) * 0.01;
+        for k in 0..n_packed {
+            cov[(p, k)] = 0.0;
+            cov[(k, p)] = 0.0;
+        }
+        let sigma_draws = |fit: &FitResult| {
+            let mut rng = StdRng::seed_from_u64(11);
+            draw_parameter_samples(fit, &template, 50, UncertaintyMethod::Asymptotic, &mut rng)
+                .expect("draws")
+                .iter()
+                .map(|d| d.sigma.values[0])
+                .collect::<Vec<_>>()
+        };
+        let free = fit_with_cov(&template, cov.clone());
+        let mut held = free.clone();
+        held.held_at_bound = vec![HeldAtBound {
+            name: template.sigma.names[0].clone(),
+            kind: ParameterKind::Sigma,
+            index: 0,
+            packed_index: p,
+            reason,
+            class: None,
+        }];
+        let s_hat = template.sigma.values[0];
+        let pinned = sigma_draws(&held);
+        for s in &pinned {
+            assert!(
+                s.is_finite() && (s - s_hat).abs() < 1e-12,
+                "held σ ({reason:?}) drifted: {s}"
+            );
+        }
+        let scattered = sigma_draws(&free);
+        assert!(
+            scattered.iter().any(|s| (s - s_hat).abs() > 1e-12),
+            "the control must scatter, or the test cannot see the hold: {scattered:?}"
         );
     }
 

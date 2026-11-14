@@ -231,7 +231,7 @@ fn median_of(buf: &mut [f64]) -> f64 {
 /// deviation scaled to a standard-deviation equivalent.
 ///
 /// Returns `None` if the window holds a non-finite value, which is never "settled".
-fn median_and_mad(window: &[f64]) -> Option<(f64, f64)> {
+pub(crate) fn median_and_mad(window: &[f64]) -> Option<(f64, f64)> {
     if window.iter().any(|v| !v.is_finite()) {
         return None;
     }
@@ -1192,6 +1192,8 @@ pub fn run_vi(
         warnings: cov_warnings,
         sir_fallback_proposal,
         method: covariance_method,
+        newton_decrement,
+        non_stationary_optimum: _,
     } = cov_out;
     warnings.extend(cov_warnings);
 
@@ -1285,7 +1287,11 @@ pub fn run_vi(
         vi: Some(vi_result),
         start_eval: None,
         mcem_lowest_objective: None,
+        mcem_objective_trail: None,
         mixture_posteriors: None,
+        newton_decrement,
+        optimizer_stop: None,
+        eval_budget_spent: false,
     })
 }
 

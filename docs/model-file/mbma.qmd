@@ -88,7 +88,16 @@ subject, counting the stacked η and kappas over its occasions; past that, the f
 uses finite differences ([Gradients](structural-model.qmd#gradients)).
 
 In R, `ferx_mbma_data()` builds and checks such a dataset
-([Counted form](parameters.qmd#counted-form-theta-namen)).
+([Counted form](parameters.qmd#counted-form-theta-namen)). For a model already
+written in nlmixr2, `ferxtranslate::nlmixr2_to_ferx()` translates a
+compartment-free model (`pred <- ...; pred ~ add(sd)`) into this form
+([translator#75](https://github.com/FeRx-NLME/translator/pull/75)). When the
+source is weighted by hand, `pred <- f * sqrt(W)` with `DV` already multiplied by
+`sqrt(W)`, the default translation keeps that and is fitted to the same data.
+`weighting = "weight"` instead emits `y = f` with `weight = 1/sqrt(W)` on the
+error line; a model without that shape is refused. Fit that translation to the
+data returned by `ferxtranslate::ferx_weighted_data()`, which divides `DV` back
+by `sqrt(W)`, not to the data the nlmixr2 model read.
 
 ## 2. Inverse-variance weighting
 
@@ -99,8 +108,11 @@ and the VPC stay on the natural scale
 sigma is fixed stays your choice: fix it for a continuous endpoint with a known
 SE, estimate it for a weighted logit of a proportion
 ([Is sigma fixed?](error-model.qmd#is-sigma-fixed)). The reported OFV differs
-from a hand-built `DV/SE` fit by a constant that cancels from every ΔOFV
-([Objective-function value](error-model.qmd#objective-function-value)).
+from a hand-built `DV/SE` fit by $\sum_j 2\ln SE_j$, a constant that cancels from
+every ΔOFV ([Objective-function value](error-model.qmd#objective-function-value)).
+[OFV conventions across tools](error-model.qmd#ofv-conventions) gives the term to
+add for each of NONMEM (with and without `N·log 2π`) and nlmixr2's
+precision-weighted `DV·√w` form.
 
 ## 3. Between-arm variability
 
@@ -155,6 +167,13 @@ ones with `level NAME by COLUMN in PARENT`, then attach each kappa with
 `foce` or `focei` at `n_agq = 1` only
 ([What this release supports](iov.qmd#nested-levels-scope)).
 
+Each subject's inner problem is over its η plus one kappa per group of every
+level it contains, so a coarse `ID` such as a sponsor stacks every arm of every
+study into one problem and the fit slows much faster than the row count grows.
+Make `ID` the coarsest grouping that needs its own random effect, and declare a
+level only where its kappa is needed
+([Cost grows with the groups inside each subject](iov.qmd#nested-levels-cost)).
+
 ## 7. Within-arm residual correlation
 
 `correlation cs|ar1|car1(RHO) by ARM` lets the residuals of one arm's visits
@@ -166,6 +185,21 @@ kappa-carrying level is refused; with a kappa at the arm, use `ar1` or `car1`
 [Choosing a structure](residual-correlation.qmd#choosing-a-structure)). The line
 fits next to a profiled level block, and its refusals come first
 ([With a profiled level block](residual-correlation.qmd#with-a-profiled-level-block)).
+
+A positive Durbin–Watson warning ([`dw_autocorrelation`](../warnings.qmd#codes-residuals))
+on a compartment-free model suggests this line, `by` the grouping the model
+declares: its `iov_column` (which a single `level` also sets), or the innermost
+level's name when levels are nested. With no grouping declared, it suggests the
+line `by` any data column that labels the group, and a `kappa` at that grouping
+as the alternative. A model with compartments keeps the structural advice. The
+statistic pairs only rows of one arm or level cell when they restart the clock,
+so declaring the arms also stops it pairing one arm's last visit with the next
+arm's first. A grouping whose groups follow one another in time, such as visits, is one
+series, and the advice then names no column
+([IWRES Autocorrelation](../output.qmd#iwres-autocorrelation)). The bundled
+`mbma_naproxen` model, whose arms are not declared, gets the no-grouping advice
+(Durbin–Watson 1.22); a `kappa` on `E0` at the arm (`iov_column = ARM`) absorbs
+the shared part (1.87, silent) before any `correlation` line is added.
 
 With few studies, do not read the OFV drop for `ρ` against a χ² distribution.
 On the 6-study `mbma_placebo` data, which the generator draws with no serial
@@ -192,6 +226,24 @@ study leaves `S` rank-deficient and `s` reports no SEs. On a block whose levels
 are each read by one subject, the `rsr` level SEs are not usable; read them from
 `r`, and ferx warns with `W_COV_RSR_ONE_SUBJECT_LEVELS`
 ([Standard errors](parameters.qmd#standard-errors)).
+
+An omega or kappa variance the optimizer leaves on ferx's internal lower guard
+($e^{-12} = 6.144 \times 10^{-6}$) has collapsed. ferx lists it in
+`held_at_bound` and prints its SE as `N/A`; when the covariance step's `R` is
+clean, every other SE is conditional on that variance at its estimate, as with a
+`FIX` ([Held parameters](../estimation/parameterization.qmd#held-parameters)).
+Read the fit's `Status:` line, not `converged` alone. `converged` means only
+that the optimizer's stop was verified. The status is `CONVERGED WITH ISSUES` or
+`NOT CONVERGED`, with its reasons, when for example the covariance step failed
+or a collapsed variance could not be held
+([Fit status](../output.qmd#fit-status)).
+
+On an arm-level dataset of a few hundred rows a fit usually takes well under a
+second, so `n_starts = 8` is a cheap check that the reported optimum is not a
+local one ([Small datasets](../examples/multistart.qmd#small-datasets)). Nested
+levels that stack many random effects into one subject are the exception: such
+a fit can take several seconds
+([Cost grows with the groups inside each subject](iov.qmd#nested-levels-cost)).
 
 [SIR](../estimation/sir.qmd) (`sir = true`, beta) samples from the covariance
 step's proposal. It never samples a `FIX`ed sigma, so the fixed residual of the

@@ -29,10 +29,11 @@
 //! values lane for lane; see `rhs_ir`'s docs for why a dead arm cannot leak into a derivative.
 //!
 //! A program with any operation whose `f64` meaning the generic primitives do not reproduce
-//! exactly (`sqrt`'s guard, `inv_logit`, `logit`, `mod`), that reads anything but its states,
-//! parameters, seeds, its own locals and literals (θ, η, covariates, gathers, network
-//! outputs, the mixture class; `TIME` is the time seed by the time a program is compiled), or
-//! that reads a local before assigning it, is not compiled and keeps the interpreter.
+//! exactly (`inv_logit`, `logit`, `tanh`, `softplus`, `sin`, `cos`, `pnorm`, `mod`), that
+//! reads anything but its states, parameters, seeds, its own locals and literals (θ, η,
+//! covariates, gathers, network outputs, the mixture class; `TIME` is the time seed by the
+//! time a program is compiled), or that reads a local before assigning it, is not compiled
+//! and keeps the interpreter. `sqrt` is translated (#2844): its guard is `apply_unary`'s.
 use super::{apply_binary_in, apply_scalar_in, apply_unary, Bytecode, Op, Statement};
 use crate::sens::num::vm::VmNum;
 use ir::Cc;
@@ -77,6 +78,7 @@ impl Arith {
 enum Unary {
     Exp,
     Ln,
+    Sqrt,
     Abs,
     Floor,
     Ceil,
@@ -88,6 +90,7 @@ impl Unary {
         match self {
             Unary::Exp => Op::Exp,
             Unary::Ln => Op::Ln,
+            Unary::Sqrt => Op::Sqrt,
             Unary::Abs => Op::Abs,
             Unary::Floor => Op::Floor,
             Unary::Ceil => Op::Ceil,
@@ -499,11 +502,13 @@ pub(crate) fn rhs_route_note(
 /// [`Builder::expr`] translates.
 fn refused_construct(op: Op) -> Option<RhsConstruct> {
     Some(match op {
-        Op::Sqrt => RhsConstruct::Function("sqrt"),
         Op::InvLogit => RhsConstruct::Function("inv_logit"),
         Op::Logit => RhsConstruct::Function("logit"),
         Op::Tanh => RhsConstruct::Function("tanh"),
         Op::Softplus => RhsConstruct::Function("softplus"),
+        Op::Sin => RhsConstruct::Function("sin"),
+        Op::Cos => RhsConstruct::Function("cos"),
+        Op::Pnorm => RhsConstruct::Function("pnorm"),
         Op::Mod => RhsConstruct::Function("mod"),
         Op::PushTheta(_) => RhsConstruct::Read("a θ"),
         Op::PushThetaGather(_) => RhsConstruct::Read("a θ level"),
@@ -535,6 +540,7 @@ fn refused_construct(op: Op) -> Option<RhsConstruct> {
         | Op::Pow
         | Op::Exp
         | Op::Ln
+        | Op::Sqrt
         | Op::Abs
         | Op::Floor
         | Op::Ceil
@@ -1368,12 +1374,16 @@ impl Builder {
                 self.ins.push(Ins::Pow { dst, a, e });
                 stack.push(Src::Tmp(dst));
             }
-            (op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round), _) => {
+            (
+                op @ (Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::Floor | Op::Ceil | Op::Round),
+                _,
+            ) => {
                 let a = stack.pop().ok_or(SHAPE)?;
                 let dst = self.tmp().ok_or(SHAPE)?;
                 let op = match op {
                     Op::Exp => Unary::Exp,
                     Op::Ln => Unary::Ln,
+                    Op::Sqrt => Unary::Sqrt,
                     Op::Abs => Unary::Abs,
                     Op::Floor => Unary::Floor,
                     Op::Ceil => Unary::Ceil,
@@ -1424,8 +1434,8 @@ impl Builder {
             // `compile_expr_into` gives an `if` (`conditional` consumes the one it emits), the
             // reads the RHS is not handed (θ, η, covariates, gathers, network outputs, the
             // mixture class), an out-of-range variable, and the ops whose `f64` meaning the
-            // generic primitives do not reproduce bit for bit (`Sqrt`'s `-0.0` guard,
-            // `InvLogit`, `Logit`, `Tanh`, `Softplus`, `Mod`). Listed one by one: a new `Op`
+            // generic primitives do not reproduce bit for bit (`InvLogit`, `Logit`, `Tanh`,
+            // `Softplus`, `Sin`, `Cos`, `Pnorm`, `Mod`). Listed one by one: a new `Op`
             // must be decided here, not swallowed by a wildcard.
             (
                 Op::PushVar(_)
@@ -1436,11 +1446,13 @@ impl Builder {
                 | Op::PushMixNum
                 | Op::PushNnOutput(_, _)
                 | Op::PushThetaGather(_)
-                | Op::Sqrt
                 | Op::InvLogit
                 | Op::Logit
                 | Op::Tanh
                 | Op::Softplus
+                | Op::Sin
+                | Op::Cos
+                | Op::Pnorm
                 | Op::Mod
                 | Op::Jump(_),
                 _,
@@ -1460,8 +1472,8 @@ impl Builder {
     /// ends one op later, the then arm runs that op too, as its path does, and both continue
     /// after it.
     ///
-    /// A construct an arm cannot translate is reported as itself (a `sqrt` in an arm is
-    /// `sqrt`); an `if` whose bytecode is not in this shape is [`RhsConstruct::InlineIf`].
+    /// A construct an arm cannot translate is reported as itself (a `tanh` in an arm is
+    /// `tanh`); an `if` whose bytecode is not in this shape is [`RhsConstruct::InlineIf`].
     fn conditional(
         &mut self,
         ops: &[Op],

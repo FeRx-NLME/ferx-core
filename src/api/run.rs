@@ -107,8 +107,8 @@ pub fn resolve_data_path(
         (Some(ext), _) => Ok((ext.to_string(), None)),
         (None, Some(model_p)) => Ok((model_p.to_string(), None)),
         (None, None) => Err(
-            "no dataset specified — pass a data path, or add a `[data]` block \
-             (`path = ...`) to the model file"
+            "no dataset specified — pass a data path, or set `path = ...` in the \
+             model file's `[data]` block"
                 .to_string(),
         ),
     }
@@ -705,6 +705,7 @@ pub fn run_model_simulate_with_overrides(
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n_gauss],
             occasions: Vec::new(),
             obs_l2: Vec::new(),

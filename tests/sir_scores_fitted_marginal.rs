@@ -789,10 +789,7 @@ fn mixture_without_packed_estimate() {
              estimate holding them"
                 .to_string(),
             "A fit() result records them".to_string(),
-            "and so does a .fitrx bundle save_fit wrote from one".to_string(),
-            "a .fitrx bundle saved before #1765 from an SAEM fit or before #1815 from any \
-             other method, or written by ferx-r before FeRx-NLME/ferx-r#655, lacks them"
-                .to_string(),
+            "and so does a .fitrx bundle save_fit wrote from one.".to_string(),
         ] {
             assert!(
                 e.to_string().contains(&must),
@@ -1241,7 +1238,8 @@ const MIX_SIGMA_OVERRIDE: &str = r"
 ///
 /// Mutations — the SAEM gate on `sigma_override_fixed` removed: the free Σ override becomes
 /// a covariance coordinate standalone, and the matrices differ; zero refused by the
-/// recorded-values check: every call errors.
+/// recorded-values check: every call errors; `fit()`'s `cov_fixed` built from `init_params`,
+/// where SAEM has not held the Σ override yet: the in-fit mask assertion dies.
 #[test]
 fn saem_mixture_sigma_override_run_sir_and_covariance_are_identical_to_in_fit() {
     use ferx_core::io::fitrx::{load_fit, save_fit, SaveFitOptions};
@@ -1280,6 +1278,15 @@ fn saem_mixture_sigma_override_run_sir_and_covariance_are_identical_to_in_fit() 
         "Σ overrides held at their inits (sd 0.25 and 0)"
     );
     assert!(r.covariance_matrix.is_some(), "in-fit covariance must run");
+    // θ ×4, Ω, σ ×2, then the overrides: omega(2), sigma(2) PROP, sigma(2) ADD. `cov_fixed`
+    // is the mask the step ran under: SAEM held `sigma(2) PROP`, which the model leaves free
+    // (#2695). The ω override it estimated stays free, so this is not "all overrides held".
+    let (free, held) = (false, true);
+    assert_eq!(
+        r.cov_fixed,
+        [free, free, free, free, free, free, free, free, held, held],
+        "the in-fit mask must be the one the step held"
+    );
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("saem_sigma_mixture.fitrx");
@@ -1296,6 +1303,7 @@ fn saem_mixture_sigma_override_run_sir_and_covariance_are_identical_to_in_fit() 
         let c = run_covariance(f, Some(&model), Some(&pop), &sir_defaults())
             .unwrap_or_else(|e| panic!("{side}: run_covariance on an SAEM Σ-override fit: {e}"));
         assert_cov_identical(&c, &r, &format!("SAEM Σ run_covariance {side} vs in-fit"));
+        assert_eq!(c.cov_fixed, r.cov_fixed, "{side}: run_covariance's mask");
         let s = run_sir(&cleared(f), Some(&model), Some(&pop), &sir_defaults())
             .unwrap_or_else(|e| panic!("{side}: run_sir on an SAEM Σ-override fit: {e}"));
         assert_sir_identical(&s, &r, &format!("SAEM Σ run_sir {side} vs in-fit"));

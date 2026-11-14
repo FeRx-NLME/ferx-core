@@ -260,6 +260,39 @@ fn m3_censored_dterm_df_matches_fd() {
     }
 }
 
+/// #2772 on the inner gradient's censored row (`residual_inner_obs`): `coef = h·m` and the
+/// `iiv_on_ruv` column `h·z`. Past `h = φ/Φ`'s underflow both limits are `0`, but at a limit
+/// far enough out that `z = +∞` the factors are infinite, and `0·∞` was `NaN`. Both tails,
+/// plus the `±1e300` row, where `z` is still finite. Both rows are past `h`'s underflow, so
+/// the oracle is the exact limit `0`, not the `±1e300` row.
+#[test]
+fn residual_inner_obs_is_zero_where_inv_mills_underflows() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(0.2,0.001,10.0)\n  theta TVV(10.0,0.1,500.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_RUV ~ 0.05\n  sigma PROP_ERR ~ 0.2 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n  iiv_on_ruv = ETA_RUV\n",
+    )
+    .expect("parse");
+    let sigma = &model.default_params.sigma.values;
+    let (f, ruv_scale) = (1.0, 1.1);
+    let v = ruv_scale * model.residual_variance_at(1, f, sigma);
+    let d = ruv_scale * model.error_spec.dvar_df(1, f, sigma);
+    for (near, far, cens) in [(1e300, 1e308, 1), (-1e300, -1e308, -1)] {
+        let (_, z, _) = crate::stats::special::m3_censored_kernel(near, f, v, d, cens);
+        assert!(z.is_finite(), "control {near:e}: z={z}");
+        let (h, z, m) = crate::stats::special::m3_censored_kernel(far, f, v, d, cens);
+        assert!(
+            h == 0.0 && z == f64::INFINITY && m.is_infinite(),
+            "{far:e}: z={z}, m={m}"
+        );
+        for y in [near, far] {
+            let (coef, ruv_term) =
+                residual_inner_obs(&model, 1, y, f, sigma, None, ruv_scale, true, cens, None)
+                    .expect("positive variance");
+            assert!(coef == 0.0, "h·m at y={y:e}, cens={cens}: {coef}");
+            assert!(ruv_term == 0.0, "h·z at y={y:e}, cens={cens}: {ruv_term}");
+        }
+    }
+}
+
 #[test]
 fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
     use crate::parser::model_parser::parse_model_string;
@@ -319,6 +352,7 @@ fn find_ebe_uses_fd_h_matrix_when_inner_gradient_forced_fd() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -464,6 +498,7 @@ fn analytic_inner_gradient_ode_init_theta_sqrt_matches_fd() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
@@ -551,6 +586,7 @@ fn analytic_inner_gradient_iiv_on_ruv_m3_matches_fd() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0, 0, 1, 1],
         occasions: vec![1; 6],
         obs_l2: Vec::new(),
@@ -700,6 +736,7 @@ fn analytic_inner_gradient_m3_iiv_on_ruv_matches_fd_on_ode() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0, 0, 1, 1],
         occasions: vec![1; 6],
         obs_l2: Vec::new(),
@@ -1399,6 +1436,7 @@ fn test_ebe_result_converged_flag() {
     let r = EbeResult {
         eta: nalgebra::DVector::zeros(2),
         h_matrix: nalgebra::DMatrix::identity(2, 2),
+        fd_h_redone: false,
         terminal_hessian: None,
         converged: true,
         used_fallback: false,
@@ -1945,6 +1983,7 @@ fn test_inner_loop_stats_min_obs_filter() {
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
             h_matrix: nalgebra::DMatrix::identity(1, 1),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false, // unconverged
             used_fallback: false,
@@ -1959,6 +1998,7 @@ fn test_inner_loop_stats_min_obs_filter() {
         EbeResult {
             eta: nalgebra::DVector::zeros(1),
             h_matrix: nalgebra::DMatrix::identity(1, 1),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false, // also unconverged
             used_fallback: true,
@@ -1994,6 +2034,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
     let make = |hard_reject: bool| EbeResult {
         eta: nalgebra::DVector::zeros(1),
         h_matrix: nalgebra::DMatrix::zeros(1, 1),
+        fd_h_redone: false,
         terminal_hessian: None,
         converged: false,
         used_fallback: false,
@@ -2160,6 +2201,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0, 0],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -2376,6 +2418,7 @@ fn wellidentified_oral_fixture() -> (CompiledModel, Subject) {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -2518,6 +2561,7 @@ fn fd_inner_ebe_runaway_on_floored_row_is_recovered() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
@@ -2611,6 +2655,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
@@ -2643,6 +2688,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         pk_only_covariates: Vec::new(),
         reset_times: vec![12.0],
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 6],
         occasions: vec![1; 6],
         obs_l2: Vec::new(),
@@ -2779,6 +2825,7 @@ fn flip_flop_transit_subject() -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: vec![1; n],
         obs_l2: Vec::new(),
@@ -3469,6 +3516,7 @@ mod frozen_ebe_variance {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 5],
             occasions: vec![1; 5],
             obs_l2: Vec::new(),
@@ -4489,6 +4537,7 @@ fn flipflop_fixture(reset: bool) -> (CompiledModel, Subject) {
         pk_only_covariates: Vec::new(),
         reset_times: if reset { vec![0.0] } else { Vec::new() },
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -4991,6 +5040,7 @@ fn flip_flop_oral_fixture(v: f64, omega: [f64; 3]) -> (CompiledModel, Subject) {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; n],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -7289,6 +7339,7 @@ fn an_unusable_predicted_start_or_end_takes_the_mode() {
         let end = EbeResult {
             eta: DVector::from_vec(vec![0.0; 2]),
             h_matrix: DMatrix::zeros(0, 2),
+            fd_h_redone: false,
             terminal_hessian: None,
             converged: false,
             used_fallback: true,

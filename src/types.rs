@@ -136,12 +136,105 @@ pub struct DoseEvent {
     /// NONMEM gives no `$PK` call of its own; see [`ImpliedDose`]. Set only by the reader,
     /// so a dose built in memory is a record, as before. Crate-private, like `evid4`.
     pub(crate) implied: Option<ImpliedDose>,
+    /// The time this dose's input stops because its compartment was turned off (#2732),
+    /// `+∞` when it never does: the first `EVID=2`, `CMT=-N` row on its compartment after
+    /// its record, or after its parent's for an `ADDL`-implied dose. NONMEM cancels the
+    /// input whatever stage it has reached, measured in `nonmem_anchor/cmt_toggle.ctl`: an
+    /// infusion stops and does not resume when the compartment comes back, a lagged dose
+    /// still in flight never lands, and the rest of an `ADDL` train never arrives. Read
+    /// through `ode::predictions::ResetGate`. `+∞` on every stored subject: only the copy a
+    /// state walk takes from `Subject::with_cmt_cutoffs` carries a finite one, derived from
+    /// `Subject::cmt_toggles`, so no edit to those rows can leave it stale. Crate-private,
+    /// like `evid4`.
+    pub(crate) off_at: f64,
+}
+
+/// One compartment on/off record (#2732): an `EVID=2` row with `CMT=N` (on) or `CMT=-N`
+/// (off) on a subject that turns a compartment off somewhere.
+///
+/// Off zeroes the amount and holds it at zero: the state's own `d/dt` is discarded, so
+/// mass flowing in is lost, and any term reading the state sees zero. On restarts it from
+/// zero, without re-applying `init(...)`. A dose arrival also turns its compartment on,
+/// and a reset turns every compartment on.
+///
+/// A subject built in memory fills this and `Subject::pk_only_times` and nothing else: what
+/// the row does to dose input is derived from them. It has no file order, so records at the
+/// row's exact time take the engines' order, `Reset < Dose < PkOnly < Obs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CmtToggle {
+    /// Index into `Subject::pk_only_times` of the row. The row is an ordinary record,
+    /// so it takes its time, and its place among co-timed records, from there.
+    pub pk_only: usize,
+    /// 0-based state index.
+    pub state: usize,
+    /// `true` for on, `false` for off.
+    pub on: bool,
+}
+
+/// The time each dose's input stops: the first off row on its compartment at or after its
+/// record, or after its parent's for an `ADDL`-implied dose, since the train was scheduled
+/// there. `+∞` when no off row follows. The one rule for `DoseEvent::off_at` (#2732).
+///
+/// "At" is the engines' order: a dose sorts ahead of a co-timed row, so the row stops it. The
+/// reader leaves no such tie, having put the two a ULP apart in file order.
+pub(crate) fn cmt_off_times(
+    doses: &[DoseEvent],
+    toggles: &[CmtToggle],
+    pk_only_times: &[f64],
+) -> Vec<f64> {
+    doses
+        .iter()
+        .map(|d| {
+            let record = d.implied.map_or(d.time, |i| doses[i.parent].time);
+            cmt_off_time(
+                record,
+                d.cmt_idx(),
+                toggles,
+                pk_only_times,
+                CoTimedOff::Stops,
+            )
+        })
+        .collect()
+}
+
+/// How an off row at exactly a dose's record time counts in [`cmt_off_time`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CoTimedOff {
+    /// The engines' order for a data record: the dose sorts ahead of the row, so the row
+    /// stops it ([`cmt_off_times`]).
+    Stops,
+    /// A dose an adaptive controller decided (#2753). The decision sees the state after
+    /// every on/off row at its time, so its dose is a record after the row, as the reader
+    /// orders a dose row listed after it: the row does not stop it.
+    After,
+}
+
+/// The time the input of a dose recorded at `record` into state `cmt_idx` stops: the first
+/// off row on that compartment at or after the record (strictly after, under
+/// [`CoTimedOff::After`]), `+∞` when none follows. The one rule for `DoseEvent::off_at`,
+/// shared by [`cmt_off_times`] and the adaptive driver's controller doses.
+pub(crate) fn cmt_off_time(
+    record: f64,
+    cmt_idx: usize,
+    toggles: &[CmtToggle],
+    pk_only_times: &[f64],
+    cotimed: CoTimedOff,
+) -> f64 {
+    toggles
+        .iter()
+        .filter(|c| !c.on && c.state == cmt_idx)
+        .filter_map(|c| pk_only_times.get(c.pk_only).copied())
+        .filter(|&t| match cotimed {
+            CoTimedOff::Stops => t >= record,
+            CoTimedOff::After => t > record,
+        })
+        .fold(f64::INFINITY, f64::min)
 }
 
 /// Which records parameterise an `ADDL`-implied dose (#1909). NONMEM evaluates `$PK` only
 /// at event records, and an implied dose is not one. Measured against NONMEM 7.5.1
-/// (`nonmem_anchor/addl_*`), it takes its lag from the dose row whose `ADDL` implies it
-/// and everything else — `F`, the disposition the interval ending at it runs under, and
+/// (`nonmem_anchor/addl_*`), it takes its lag (the compartment's and, since #2367, a
+/// route's own) from the dose row whose `ADDL` implies it, and everything else — `F`, the disposition the interval ending at it runs under, and
 /// the `TIME` and `OCC` `$PK` sees — from the **governing** record, the first record at
 /// or after the dose in (`TIME`, file order). The reader stores the governing record's
 /// covariates and `OCC` in the dose's own `Subject::dose_covariates` /
@@ -197,6 +290,7 @@ impl DoseEvent {
             infusion_def: InfusionDef::RateDefined,
             evid4: false,
             implied: None,
+            off_at: f64::INFINITY,
         }
     }
 
@@ -225,6 +319,7 @@ impl DoseEvent {
             infusion_def,
             evid4: false,
             implied: None,
+            off_at: f64::INFINITY,
         }
     }
 
@@ -687,6 +782,30 @@ impl DoseAttr {
         }
     }
 
+    /// Whether `name` is a compartment-indexed dose attribute the engine reads
+    /// **by name**, so that no textual reference is needed to keep it alive.
+    ///
+    /// `is_ode` picks the route; a compartment-free model has no doses, so it
+    /// takes neither and must not ask.
+    ///
+    /// * ODE: every indexed form — `F{n}`, `ALAG{n}`/`LAGTIME{n}`, `D{n}`, `R{n}`.
+    /// * Analytical: only `D{n}` and `R{n}`, which the parser routes to spare
+    ///   `PkParams` slots and which are consulted solely through coded-`RATE`
+    ///   data. An `F{n}`/`ALAG{n}` reaches the single analytical dose route only
+    ///   through a `pk(...)` mapping, which is a textual reference, and an unmapped
+    ///   one is a parse error.
+    ///
+    /// Single source of truth for the "computed but never used" census and the
+    /// `edit` layer's declaration pruner, which must agree: a name the census
+    /// calls load-bearing and the pruner deletes is how #2789 lost `D1`.
+    pub(crate) fn is_read_by_name(name: &str, is_ode: bool) -> bool {
+        match Self::from_indexed_name(name) {
+            Some((DoseAttr::Duration | DoseAttr::Rate, _)) => true,
+            Some((DoseAttr::F | DoseAttr::Lag, _)) => is_ode,
+            None => false,
+        }
+    }
+
     /// Recognise a compartment-indexed dose-attribute parameter name, returning
     /// `(attr, 1-based compartment)`. Case-insensitive; the numeric suffix must
     /// be a positive integer (so `F0` is *not* an attribute, and bare `F` /
@@ -1040,8 +1159,10 @@ pub struct Subject {
     /// `(engine time, TIME as written)` of every dose and reset row the reader shifted
     /// onto the monotonic timeline because a reset restarted `TIME` (#1969), ascending
     /// in engine time. Empty for a subject with no such period. Read through
-    /// `Subject::param_time_at`: a dose or reset row is never moved one ULP, so its
-    /// engine time finds its row here exactly. The written time is stored rather than
+    /// `Subject::param_time_at`: a dose row is never moved one ULP, so its engine time
+    /// finds its row here exactly. A reset is moved one ULP only with a trough listed
+    /// after it at a dose tie (#2728); the reader then adds a row for both its moved time
+    /// and the tie, so it and the doses there each find their own. The written time is stored rather than
     /// recomputed as `engine − offset`, which is inexact for most decimal times
     /// (`(0.1 + 73.1) − 73.1` is `0.09999999999999432`).
     pub reset_period_times: Vec<(f64, f64)>,
@@ -1068,6 +1189,10 @@ pub struct Subject {
     /// constant covariates `reset_cov` falls back to the subject-static map and
     /// every convention agrees.
     pub reset_covariates: Vec<HashMap<String, f64>>,
+    /// Compartment on/off records (#2732), in file order. Empty for a subject that never
+    /// turns a compartment off: an `EVID=2`, `CMT=N` row with nothing to turn back on
+    /// changes nothing and is not kept. See [`CmtToggle`].
+    pub cmt_toggles: Vec<CmtToggle>,
     /// Censoring flag per observation (0 = quantified, 1 = below LLOQ, -1 = above ULOQ).
     /// On censored rows, `observations[j]` holds the corresponding LOQ limit.
     pub cens: Vec<i8>,
@@ -1220,6 +1345,48 @@ impl Subject {
         !self.reset_times.is_empty()
     }
 
+    /// True when this subject turns a compartment off (`EVID=2`, `CMT=-N`, #2732).
+    pub fn has_cmt_toggles(&self) -> bool {
+        !self.cmt_toggles.is_empty()
+    }
+
+    /// True when this subject's state can jump at a record: a reset or a compartment
+    /// on/off row. Neither has a place in the dense ODE walk, so such a subject takes the
+    /// event-driven one.
+    pub fn has_state_events(&self) -> bool {
+        self.has_resets() || self.has_cmt_toggles()
+    }
+
+    /// This subject with each `DoseEvent::off_at` set from `cmt_toggles`, for a state walk to
+    /// read. Borrowed for a subject with no on/off row. The copy is the cost of keeping the
+    /// cutoffs off the stored subject, paid only by subjects with such a row, and small
+    /// against the solve it precedes.
+    pub(crate) fn with_cmt_cutoffs(&self) -> std::borrow::Cow<'_, Subject> {
+        use std::borrow::Cow;
+        if self.cmt_toggles.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        let off_times = cmt_off_times(&self.doses, &self.cmt_toggles, &self.pk_only_times);
+        let mut owned = self.clone();
+        for (d, off_at) in owned.doses.iter_mut().zip(off_times) {
+            d.off_at = off_at;
+        }
+        Cow::Owned(owned)
+    }
+
+    /// `DoseEvent::off_at` for a dose an adaptive controller decided at `t` into state
+    /// `cmt_idx` (#2753): see [`CoTimedOff::After`]. The driver sets it at injection and the
+    /// frozen replay on each ledger dose, so the two cut the same input at the same row.
+    pub(crate) fn controller_dose_off_at(&self, t: f64, cmt_idx: usize) -> f64 {
+        cmt_off_time(
+            t,
+            cmt_idx,
+            &self.cmt_toggles,
+            &self.pk_only_times,
+            CoTimedOff::After,
+        )
+    }
+
     /// True when any dose record on this subject is flagged steady-state
     /// (SS=1). Used to gate paths that don't yet honour SS (event-driven,
     /// AD propagators, ODE) — see `estimation/inner_optimizer.rs` and the
@@ -1289,6 +1456,20 @@ impl Subject {
             .map(|d| d.time)
             .filter(|&t| t >= seg_start - 1e-9)
             .fold(f64::INFINITY, f64::min)
+    }
+
+    /// Every per-record covariate snapshot of the subject — observation, dose, PK-only,
+    /// reset and non-Gaussian endpoint rows — each a map some predictor reads at its
+    /// record. Not the subject-static `covariates` map. The one list of record kinds for
+    /// the covariate presence check (`population_carries`, #2671), so a kind cannot be
+    /// left out of one caller and kept in another.
+    pub(crate) fn record_maps(&self) -> impl Iterator<Item = &HashMap<String, f64>> {
+        self.obs_covariates
+            .iter()
+            .chain(&self.dose_covariates)
+            .chain(&self.pk_only_covariates)
+            .chain(&self.reset_covariates)
+            .chain(&self.endpoint_covariates)
     }
 
     /// Covariate snapshot at observation index `j`. Falls back to the
@@ -1489,26 +1670,42 @@ impl Subject {
     /// shared time, so the same trough reads `0` — which is also how ferx's
     /// predictor breaks the tie; see `time_after_dose_at_or_before`.
     pub fn time_after_dose(&self, j: usize) -> f64 {
-        let strict = self.data_tad(j, false);
+        match self.obs_times.get(j) {
+            Some(&obs_t) => self.time_after_dose_at(obs_t),
+            None => f64::NAN,
+        }
+    }
+
+    /// [`Self::time_after_dose`] at engine time `obs_t`, which need not be an
+    /// observation of this subject: the adaptive controller's assay reads it at a
+    /// decision time (#2741), on the record of doses realized so far. At an
+    /// observation's time it is that observation's value, bit for bit. Never `NaN`
+    /// for a finite `obs_t`: with no dose at or before it, the time since the
+    /// earliest record ahead of the first dose, `obs_t` itself counted.
+    pub(crate) fn time_after_dose_at(&self, obs_t: f64) -> f64 {
+        let strict = self.data_tad_at(obs_t, false);
         if strict.is_finite() {
             return strict;
         }
         // Pharmpy's first-dose exception: nothing precedes the dose, so an
         // observation at its time keeps it (`TAD = 0`).
-        let at_or_before = self.data_tad(j, true);
+        let at_or_before = self.data_tad_at(obs_t, true);
         if at_or_before.is_finite() {
             return at_or_before;
         }
-        self.pre_dose_tad(j)
+        self.pre_dose_tad_at(obs_t)
     }
 
-    /// Pharmpy's dose group `0` for observation `j`: the time since the
+    /// Pharmpy's dose group `0` at engine time `obs_t`: the time since the
     /// subject's first record ahead of the first dose. See
     /// [`Self::time_after_dose`].
-    fn pre_dose_tad(&self, j: usize) -> f64 {
-        let Some(&obs_t) = self.obs_times.get(j) else {
-            return f64::NAN;
-        };
+    ///
+    /// `obs_t` is folded into the minimum. Through [`Self::time_after_dose`] that
+    /// changes nothing, since `obs_t` is then an observation ahead of the first dose
+    /// and already in the set. At a decision time with no record there it is what
+    /// keeps the value at `0` rather than negative: a decision at `0` on records from
+    /// `1` would otherwise read `−1` (#2741).
+    fn pre_dose_tad_at(&self, obs_t: f64) -> f64 {
         let first_dose = self
             .doses
             .iter()
@@ -1521,12 +1718,8 @@ impl Subject {
             .chain(self.reset_times.iter())
             .copied()
             .filter(|&t| t < first_dose - 1e-12)
-            .fold(f64::INFINITY, f64::min);
-        if first_record.is_finite() {
-            obs_t - first_record
-        } else {
-            f64::NAN
-        }
+            .fold(obs_t, f64::min);
+        obs_t - first_record
     }
 
     /// The sdtab `TAD` fallback: time after the last dose **at or before**
@@ -1537,7 +1730,10 @@ impl Subject {
     /// the first dose. See [`Self::time_after_dose`] for why the `TAD`
     /// built-in reads the same-time trough differently.
     pub(crate) fn time_after_dose_at_or_before(&self, j: usize) -> f64 {
-        self.data_tad(j, true)
+        match self.obs_times.get(j) {
+            Some(&obs_t) => self.data_tad_at(obs_t, true),
+            None => f64::NAN,
+        }
     }
 
     /// The one data-TAD kernel behind both conventions. `same_time_counts`
@@ -1546,10 +1742,7 @@ impl Subject {
     /// observation reads from the dose before it (`false`, Pharmpy's
     /// `get_doseid`). An `SS` dose at the observation's time counts under both
     /// (Pharmpy: "no swap for SS dosing").
-    fn data_tad(&self, j: usize, same_time_counts: bool) -> f64 {
-        let Some(&obs_t) = self.obs_times.get(j) else {
-            return f64::NAN;
-        };
+    fn data_tad_at(&self, obs_t: f64, same_time_counts: bool) -> f64 {
         let last_eff = self
             .doses
             .iter()
@@ -3199,6 +3392,15 @@ pub enum ErrorModel {
     Additive,
     Proportional,
     Combined,
+    /// Combined proportional + additive error under log-transform-both-sides
+    /// (`log(DV) ~ combined(PROP, ADD)` / `DV ~ log_combined(PROP, ADD)`, #2729):
+    /// `Var(log y) = PROP² + ADD²/F²`, NONMEM's `W = SQRT(PROP**2 + ADD**2/IPR**2)`.
+    /// `PROP` is on the log scale (unitless); `ADD` is in natural `DV` units, and `F`
+    /// is the natural-scale prediction floored at the LTBS floor
+    /// (`IF (IPR.LT.1E-12) IPR=1E-12`). The residual is scored on the log scale, so
+    /// the variance is written in the log prediction `g = log(max(F, floor))` as
+    /// `PROP² + ADD²·exp(−2g)`. Only meaningful with `log_transform = true`.
+    LogCombined,
 }
 
 /// How a sigma parameter enters the residual error model.
@@ -3214,7 +3416,9 @@ impl ErrorModel {
         match self {
             ErrorModel::Proportional => vec![SigmaType::Proportional],
             ErrorModel::Additive => vec![SigmaType::Additive],
-            ErrorModel::Combined => vec![SigmaType::Proportional, SigmaType::Additive],
+            ErrorModel::Combined | ErrorModel::LogCombined => {
+                vec![SigmaType::Proportional, SigmaType::Additive]
+            }
         }
     }
 
@@ -3222,7 +3426,7 @@ impl ErrorModel {
     pub fn n_sigma(self) -> usize {
         match self {
             ErrorModel::Additive | ErrorModel::Proportional => 1,
-            ErrorModel::Combined => 2,
+            ErrorModel::Combined | ErrorModel::LogCombined => 2,
         }
     }
 }
@@ -3388,11 +3592,24 @@ impl std::fmt::Debug for KappaWeight {
     }
 }
 
+/// One endpoint's magnitude programs (#2731), for a `CMT=N:` line or an `if/else`
+/// branch: the same two parallel tables as [`RuvMagnitude::per_sigma`] and
+/// [`RuvMagnitude::per_sigma_deriv`], indexed on the flat sigma vector, with `None`
+/// for a slot this endpoint leaves bare or does not load.
+pub(crate) struct EndpointMagnitude {
+    pub(crate) per_sigma: Vec<Option<RuvMagFn>>,
+    pub(crate) per_sigma_deriv: Vec<Option<crate::parser::model_parser::RuvMagDerivProgram>>,
+}
+
 /// Custom residual-error magnitude (#484): one optional multiplier per flat
 /// sigma slot, indexed positionally to match `ErrorSpec::Single`'s sigma
 /// consumption order. `per_sigma[k] == None` means slot `k` is a bare sigma
 /// (multiplier ≡ 1, the legacy path); `Some(f)` makes the slot's magnitude
 /// vary with TIME / covariates / theta.
+///
+/// A multi-endpoint block carries its expressions in `per_endpoint` instead and
+/// leaves `per_sigma` all `None`: two endpoints may share a sigma under different
+/// factors, so a slot's multiplier depends on which endpoint the row resolves to.
 ///
 /// `#[non_exhaustive]`: `per_sigma_deriv` (#576/#486) is the first field added
 /// since this type shipped; marking the struct non-exhaustive now means a
@@ -3449,6 +3666,12 @@ pub struct RuvMagnitude {
     /// so the scan runs only when an expression can see the result. Set by
     /// the parser; `false` for every model built before this field existed.
     pub(crate) uses_tad: bool,
+    /// Per-endpoint magnitudes of a `CMT=N:` or `if/else` block (#2731), keyed as
+    /// [`ErrorSpec::obs_key`] keys the row: the data `CMT` for `PerCmt`, the branch
+    /// index for `Selected`. An endpoint with only bare sigmas has no entry, and its
+    /// rows read `per_sigma`, which such a block leaves all `None`. Empty for a
+    /// single-endpoint block.
+    pub(crate) per_endpoint: HashMap<usize, EndpointMagnitude>,
 }
 
 impl std::fmt::Debug for RuvMagnitude {
@@ -3465,6 +3688,10 @@ impl std::fmt::Debug for RuvMagnitude {
                 .map(|s| if s.is_some() { "power" } else { "-" })
                 .collect();
             write!(f, "RuvMagnitude({:?}, exponent {:?})", slots, exps)
+        } else if !self.per_endpoint.is_empty() {
+            let mut keys: Vec<usize> = self.per_endpoint.keys().copied().collect();
+            keys.sort_unstable();
+            write!(f, "RuvMagnitude(endpoints {:?})", keys)
         } else {
             write!(f, "RuvMagnitude({:?})", slots)
         }
@@ -3476,7 +3703,56 @@ impl RuvMagnitude {
     /// `RuvMagnitude` whose slots are all `None` behaves identically to no
     /// custom magnitude.
     pub fn is_active(&self) -> bool {
-        self.per_sigma.iter().any(|s| s.is_some()) || self.has_exponent()
+        self.per_sigma.iter().any(|s| s.is_some())
+            || self.has_exponent()
+            || self.has_endpoint_magnitude()
+    }
+
+    /// Whether the magnitude is keyed by endpoint, a `CMT=N:` or `if/else` block
+    /// (#2731). [`eval_obs`](Self::eval_obs) cannot see such a magnitude: it has no
+    /// endpoint to look up.
+    pub(crate) fn has_endpoint_magnitude(&self) -> bool {
+        !self.per_endpoint.is_empty()
+    }
+
+    /// The magnitude programs of the endpoint observation `j` of `subject` resolves
+    /// to, or `None` to read the single-endpoint tables. The key is resolved only for
+    /// a block that has endpoint magnitudes, since a `Selected` key evaluates the
+    /// selector and this runs on the inner objective's per-call path.
+    fn endpoint_for(
+        &self,
+        spec: &ErrorSpec,
+        subject: &Subject,
+        j: usize,
+    ) -> Option<&EndpointMagnitude> {
+        if self.per_endpoint.is_empty() {
+            return None;
+        }
+        self.per_endpoint.get(&spec.obs_key(subject, j))
+    }
+
+    /// The per-sigma programs endpoint `key` reads: its own when the block has an
+    /// entry for it, else the single-endpoint tables.
+    fn fns_for_key(&self, key: usize) -> &[Option<RuvMagFn>] {
+        self.per_endpoint
+            .get(&key)
+            .map_or(&self.per_sigma, |ep| &ep.per_sigma)
+    }
+
+    /// [`eval_obs`](Self::eval_obs) on the programs of endpoint `key` (keyed as
+    /// [`ErrorSpec::obs_key`] keys a row), at the given covariate row, `TIME` and
+    /// `TAD`. A magnitude reads `(θ, covariates, TIME, TAD)` and nothing else, so it
+    /// needs no observation row: the adaptive controller's assay evaluates it at a
+    /// decision (#2741), and [`eval_subject_obs`](Self::eval_subject_obs) at a data row.
+    pub(crate) fn eval_key(
+        &self,
+        key: usize,
+        theta: &[f64],
+        covariates: &HashMap<String, f64>,
+        time: f64,
+        tad: f64,
+    ) -> Vec<f64> {
+        self.eval_row(self.fns_for_key(key), theta, covariates, time, tad)
     }
 
     /// Whether any slot carries a `power(...)` exponent (#1182). When true,
@@ -3502,6 +3778,9 @@ impl RuvMagnitude {
     /// active, the exponents (`1.0` for a slot without one) following the
     /// multipliers. `tad` is the record's time after dose
     /// ([`Subject::time_after_dose`]).
+    ///
+    /// This reads the single-endpoint tables, so for a `CMT=N:` or `if/else` block it
+    /// returns all ones; [`CompiledModel::ruv_obs_mult`] resolves each row's endpoint.
     pub fn eval_obs(
         &self,
         theta: &[f64],
@@ -3509,8 +3788,43 @@ impl RuvMagnitude {
         time: f64,
         tad: f64,
     ) -> Vec<f64> {
-        let mut out: Vec<f64> = self
-            .per_sigma
+        self.eval_row(&self.per_sigma, theta, obs_covariates, time, tad)
+    }
+
+    /// [`eval_obs`](Self::eval_obs) of observation `j` of `subject`, on the magnitude
+    /// programs of the endpoint it resolves to under `spec`.
+    pub(crate) fn eval_subject_obs(
+        &self,
+        spec: &ErrorSpec,
+        subject: &Subject,
+        j: usize,
+        theta: &[f64],
+    ) -> Vec<f64> {
+        // The key is resolved only for a block with endpoint magnitudes: a `Selected`
+        // key evaluates the selector, and this runs on the inner objective's path.
+        let key = if self.per_endpoint.is_empty() {
+            0
+        } else {
+            spec.obs_key(subject, j)
+        };
+        self.eval_key(
+            key,
+            theta,
+            subject.obs_cov(j),
+            subject.readout_time(j),
+            self.tad_for(subject, j),
+        )
+    }
+
+    fn eval_row(
+        &self,
+        fns: &[Option<RuvMagFn>],
+        theta: &[f64],
+        obs_covariates: &HashMap<String, f64>,
+        time: f64,
+        tad: f64,
+    ) -> Vec<f64> {
+        let mut out: Vec<f64> = fns
             .iter()
             .map(|slot| match slot {
                 Some(f) => f(theta, obs_covariates, time, tad),
@@ -3527,17 +3841,20 @@ impl RuvMagnitude {
         out
     }
 
-    /// [`eval_obs`](Self::eval_obs) over any VM number type, from the compiled slot
-    /// programs (`per_sigma_deriv` / `per_sigma_exponent_deriv`): the same two-half row
-    /// (multipliers, then exponents when a power form is active), each a function of the
-    /// caller's θ. `None` when an active slot has no compiled program.
-    pub(crate) fn eval_obs_g<T: crate::sens::num::vm::VmNum>(
+    /// [`eval_subject_obs`](Self::eval_subject_obs) over any VM number type, from the
+    /// compiled slot programs (`per_sigma_deriv` / `per_sigma_exponent_deriv`): the same
+    /// two-half row (multipliers, then exponents when a power form is active), each a
+    /// function of the caller's θ. `None` when an active slot has no compiled program.
+    pub(crate) fn eval_subject_obs_g<T: crate::sens::num::vm::VmNum>(
         &self,
+        spec: &ErrorSpec,
+        subject: &Subject,
+        j: usize,
         theta: &[T],
-        obs_covariates: &HashMap<String, f64>,
-        time: f64,
-        tad: f64,
     ) -> Option<Vec<T>> {
+        let obs_covariates = subject.obs_cov(j);
+        let time = subject.readout_time(j);
+        let tad = self.tad_for(subject, j);
         let half = |fns: &[Option<RuvMagFn>],
                     progs: &[Option<crate::parser::model_parser::RuvMagDerivProgram>]|
          -> Option<Vec<T>> {
@@ -3553,7 +3870,10 @@ impl RuvMagnitude {
                 })
                 .collect()
         };
-        let mut out = half(&self.per_sigma, &self.per_sigma_deriv)?;
+        let mut out = match self.endpoint_for(spec, subject, j) {
+            Some(ep) => half(&ep.per_sigma, &ep.per_sigma_deriv)?,
+            None => half(&self.per_sigma, &self.per_sigma_deriv)?,
+        };
         if self.has_exponent() {
             out.extend(half(
                 &self.per_sigma_exponent,
@@ -4244,13 +4564,14 @@ pub enum TteRecurrence {
 }
 
 #[cfg(feature = "survival")]
-/// Link function for a categorical endpoint's linear predictor. Only `Logit`
-/// (log-odds) is implemented in Phase 4 slice 1; probit/cloglog are rejected at
-/// parse with a "not yet supported" error so the surface stays forward-compatible.
+/// Link function for a categorical endpoint's linear predictor: logit (the default) or
+/// probit (#2603). `cloglog` is rejected at parse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkFn {
     /// Logistic (log-odds) link: `p = 1 / (1 + exp(-lp))`.
     Logit,
+    /// Probit link: `p = Φ(lp)`, the standard-normal CDF (#2603).
+    Probit,
 }
 
 #[cfg(feature = "survival")]
@@ -5339,6 +5660,18 @@ impl CompiledModel {
         self.ode_spec.is_some() || self.absorption_ode_equivalent.is_some()
     }
 
+    /// The spec this model integrates on: its own, or for a closed form its absorption twin's
+    /// (a model has one or the other). `None` for a model that never integrates. The twin
+    /// counts even when no current subject reaches it, since the flip-flop reroute is decided
+    /// per `(θ, η)` and can reach it at a perturbed point only (#520 review).
+    pub(crate) fn integrator_spec(&self) -> Option<&crate::ode::predictions::OdeSpec> {
+        self.ode_spec.as_ref().or_else(|| {
+            self.absorption_ode_equivalent
+                .as_ref()
+                .and_then(|eq| eq.built().ode_spec.as_ref())
+        })
+    }
+
     /// Returns true for a **compartment-free** (`$PRED`-equivalent) model — one
     /// whose `[structural_model]` declares its prediction as an equation with no
     /// compartments underneath (issue #811).
@@ -6166,12 +6499,7 @@ impl CompiledModel {
         let n = subject.observations.len();
         let mut out = Vec::with_capacity(n);
         for j in 0..n {
-            out.push(rm.eval_obs(
-                theta,
-                subject.obs_cov(j),
-                subject.readout_time(j),
-                rm.tad_for(subject, j),
-            ));
+            out.push(rm.eval_subject_obs(&self.error_spec, subject, j, theta));
         }
         Some(out)
     }
@@ -6258,6 +6586,17 @@ impl CompiledModel {
     #[inline]
     pub(crate) fn nested_levels(&self) -> Option<&NestedLevels> {
         self.indiv_param_partials.nested_levels.as_ref()
+    }
+
+    /// Whether individual parameter `name` depends on a draw — an η or κ, or `MIXNUM`,
+    /// through any intermediate or `if` condition (#944). `true` for every name on a
+    /// hand-built model that never went through the parser (no record of its
+    /// dependencies), so a caller never treats a drawn value as known.
+    pub(crate) fn indiv_param_is_random(&self, name: &str) -> bool {
+        self.indiv_param_partials
+            .random_indiv_params
+            .as_ref()
+            .is_none_or(|r| r.binary_search_by(|n| n.as_str().cmp(name)).is_ok())
     }
 
     /// The names a `[derived]` expression looks up at evaluation time, other than
@@ -6362,14 +6701,39 @@ impl CompiledModel {
                 return (s * s).max(1e-12);
             }
         }
-        let cmt = self.error_spec.obs_key(subject, j);
+        self.residual_variance_for_key(
+            self.error_spec.obs_key(subject, j),
+            f_pred,
+            sigma,
+            correlations,
+            ruv_scale,
+            mult,
+        )
+    }
+
+    /// The PK residual variance of one row on endpoint `key` (as
+    /// [`ErrorSpec::obs_key`] keys it): the tail of
+    /// [`sim_residual_variance`](Self::sim_residual_variance) after its FREM branch,
+    /// shared with the adaptive controller's assay (#2741), which has a key and no
+    /// row. `mult = None` is the legacy unscaled form, bit for bit: the `_scaled`
+    /// form at a row of ones is *not* (it associates the product differently), so a
+    /// model without a magnitude must pass `None`.
+    pub(crate) fn residual_variance_for_key(
+        &self,
+        key: usize,
+        f_pred: f64,
+        sigma: &[f64],
+        correlations: &[ResidualCorrelation],
+        ruv_scale: f64,
+        mult: Option<&[f64]>,
+    ) -> f64 {
         let v = match mult {
             Some(m) => self
                 .error_spec
-                .variance_at_scaled(cmt, f_pred, sigma, correlations, m),
+                .variance_at_scaled(key, f_pred, sigma, correlations, m),
             None => self
                 .error_spec
-                .variance_at_with_correlations(cmt, f_pred, sigma, correlations),
+                .variance_at_with_correlations(key, f_pred, sigma, correlations),
         };
         v * ruv_scale
     }
@@ -6449,7 +6813,9 @@ impl std::fmt::Debug for CompiledModel {
 /// CWRES, and its `ipred` is a probability rather than a concentration. Every column
 /// the Gaussian rows carry but a discrete row cannot define is emitted as an empty
 /// sdtab cell.
-#[cfg(feature = "survival")]
+///
+/// Not behind `survival`, unlike the code that computes it: a `.fitrx` bundle read by a
+/// build without that feature keeps these rows, and writes them back when it is re-saved.
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq)]
 pub struct DiscreteObsDiagnostic {
     /// CMT of the endpoint that produced this record.
@@ -6523,6 +6889,17 @@ pub struct SubjectResult {
     /// Normalized prediction discrepancies (simulation-based, no decorrelation).
     /// Empty unless `[fit_options] npde_nsim > 0`. Emitted as the `NPD` column.
     pub npd: Vec<f64>,
+    /// Monte-Carlo expected prediction `E_sim[y]` from the NPDE simulation (NONMEM's
+    /// `$TABLE EPRED`). Empty unless `[fit_options] npde_nsim > 0`. Emitted as the
+    /// `EPRED` column.
+    #[serde(default)]
+    pub epred: Vec<f64>,
+    /// Monte-Carlo population-weighted residual `Σ_sim^(-1/2) (y − E_sim[y])`
+    /// (Monolix `PWRES`, NONMEM `EWRES`), symmetric-root decorrelated. Empty unless
+    /// `[fit_options] npde_nsim > 0`. Emitted as the `PWRES` and `EWRES` columns.
+    /// See [`crate::stats::npde::SubjectNpde::pwres`].
+    #[serde(default)]
+    pub pwres: Vec<f64>,
     pub ofv_contribution: f64,
     pub cens: Vec<i8>,
     /// Number of observations for this subject (MDV=0 rows).
@@ -6560,7 +6937,6 @@ pub struct SubjectResult {
     /// Post-fit diagnostics for this subject's **discrete** (binary) endpoint records,
     /// one entry per record (§8.8.5). Empty for models with no discrete endpoint, which
     /// keeps every existing `FitResult` serialization byte-identical.
-    #[cfg(feature = "survival")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub discrete_rows: Vec<DiscreteObsDiagnostic>,
     /// Post-fit residuals for this subject's **time-to-event** records, one entry per
@@ -7379,11 +7755,25 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     // rewrite instead of a one-line edit. Scoped to this statement rather than
     // the whole fn so a future duplicated arm in another chain still lints.
     #[allow(clippy::if_same_then_else)]
-    let (severity, category) = if lower.contains("w_vi_bad_basin") {
+    let (severity, category) = if lower.starts_with("multi-start:") {
+        // #2799: the multi-start notes `fit()` appends to the returned run — "k of n starts
+        // failed: <errors>" and the #2867 summary of the starts. A prefix-token arm ahead of
+        // *every* other arm, because the failure note interpolates the sibling starts' own
+        // error text: a "did not converge" or covariance-failure phrase in it would land on a
+        // Critical arm and mark a healthy returned fit as failing. The note is about runs that
+        // were not returned, so it is informational.
+        (WarningSeverity::Info, WarningCode::MultiStart)
+    } else if lower.contains("w_vi_bad_basin") {
         // #1098: VI's final bound-quality check demotes `converged`; keep this
         // distinct from a budget-limited convergence failure so programmatic
         // consumers can choose new starts or a chained initializer.
         (WarningSeverity::Critical, WarningCode::ViBadBasin)
+    } else if lower.starts_with("w_mcem_mstep_") {
+        // #2718: the IMP / IMPMAP weighted M-step left a parameter at its start, or NLopt
+        // failed it, and `converged` is demoted. A token arm ahead of the prose ones: the
+        // first message advises "mu-reference", which the `MuReferencing` arm below would
+        // claim as `Info`.
+        (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("w_absorption_twin_declined") {
         // #1008: the analytic absorption model kept no ODE twin. Not an estimation problem —
         // the fit that follows is a pure closed form — but the model has silently lost the
@@ -7575,6 +7965,11 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // methods and quotes counters, and "did not converge" style prose could plausibly be
         // added to it later without anyone remembering this chain exists.
         (WarningSeverity::Warning, WarningCode::OdeSolver)
+    } else if lower.contains("w_fd_jacobian_not_tightened") {
+        // #2701: a finite-difference `H` at the final estimates ran at the fit's tolerance
+        // because the Jacobian's tighter solve could not finish. Its own token, ahead of the
+        // prose arms: the message says "finite-difference" and "objective".
+        (WarningSeverity::Warning, WarningCode::OdeSolver)
     } else if lower.contains("w_nonfinite_objective") {
         // #1303: the convergence verdict was demoted because the objective at
         // the final estimates is `NaN`, infinite, or the clamped divergence
@@ -7601,6 +7996,14 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // `W_NONFINITE_OBJECTIVE` does ("infusion duration", "residual variance", …),
         // which is prose a later edit could grow into a phrase one of the arms below
         // claims.
+        (WarningSeverity::Critical, WarningCode::Convergence)
+    } else if lower.contains("w_non_stationary_optimum") {
+        // #2785: the covariance step's Newton decrement says an estimate its method minimised
+        // is not a stationary point, and the verdict was demoted. `(Critical, Convergence)`
+        // like the generic line it accompanies, so `require_converged` and a consumer keyed
+        // on `convergence` read the same thing. A token arm ahead of the prose ones: the
+        // message names "standard errors" and quotes coordinate labels, which spell
+        // whatever the model's θ are called.
         (WarningSeverity::Critical, WarningCode::Convergence)
     } else if lower.contains("w_per_cmt_unmatched") {
         // #1405: a declared per-CMT `[scaling]` / `[error_model]` / `y[CMT=N]` entry
@@ -7697,6 +8100,9 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("trust radius")
         || lower.contains("degenerate")
         || lower.contains("resumed from the best point seen")
+        // #2832's adopted rail completion; its not-converged twin says "not reported as
+        // converged" and is filed by the convergence arm above first.
+        || lower.contains("resumed from just above the guard")
     {
         (WarningSeverity::Warning, WarningCode::OptimizerHealth)
     } else if lower.contains("autocorrelation") || lower.contains("durbin") {
@@ -7817,6 +8223,13 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     } else if lower.contains("_max_time`") {
         // #2687: the fit stopped on its wall-clock limit, so `converged` is false.
         (WarningSeverity::Warning, WarningCode::Convergence)
+    } else if lower.contains("logical cpu(s) available")
+        || (lower.contains("rayon_num_threads") && lower.contains("was ignored"))
+    {
+        // #1811 / #2800: an explicit count oversubscribes the cores, or a set
+        // `RAYON_NUM_THREADS` could not be used — the user asked for something the
+        // fit did not (or could not usefully) do.
+        (WarningSeverity::Warning, WarningCode::Threads)
     } else if lower.contains("thread count overridden") {
         // #1416: a front end's explicit `--threads` beat the model file's
         // `[fit_options] threads`. A Warning, not Info, for the same reason the
@@ -7875,6 +8288,155 @@ pub struct LevelGroupEbe {
     pub labels: Vec<f64>,
     /// κ̂ of each of [`LevelKappaEbes::kappa_names`].
     pub kappa: Vec<f64>,
+}
+
+/// One estimated `[mixture]` per-class override (`omega(k)` / `sigma(k)`, #977), as listed in
+/// [`FitResult::mixture_override_params`] (#2833): what a renderer needs to name its row and
+/// read its state. Parallel to [`FitResult::mixture_overrides`] (its value) and
+/// [`FitResult::se_mixture_overrides`] (its standard error).
+///
+/// Not to be confused with [`MixtureClassOverride`], the parsed declaration.
+/// `#[non_exhaustive]` so a later field is not a breaking change; ferx builds it, a caller
+/// reads it.
+#[non_exhaustive]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MixtureOverrideParam {
+    /// The override's name, as
+    /// [`crate::estimation::parameterization::coordinate_names`] spells it: the base name with a
+    /// `_MIX{class}` suffix, e.g. `"ETA_CL_MIX2"`, `"EPS_MIX2"`.
+    pub name: String,
+    /// [`ParameterKind::Omega`] or [`ParameterKind::Sigma`].
+    pub kind: ParameterKind,
+    /// The index of the **base** η (Ω diagonal) or σ the override replaces in its class —
+    /// the same convention as [`HeldAtBound::index`] for an override entry.
+    pub index: usize,
+    /// The class, 1-based like the model file, the `_MIX{c}` name and
+    /// [`HeldAtBound::class`].
+    pub class: usize,
+    /// Its row in [`FitResult::covariance_matrix`].
+    pub packed_index: usize,
+    /// Held by the model: a user `FIX`, or an override an estimator held at its initial
+    /// value (SAEM's σ override, #985). Read from the model's packed FIX mask, **not** from
+    /// [`FitResult::cov_fixed`], which also marks a coordinate the covariance step held on
+    /// the internal guard — that one is listed in [`FitResult::held_at_bound`] instead.
+    pub fixed: bool,
+}
+
+/// One coordinate the covariance step reports no standard error for (#2797), as listed in
+/// [`FitResult::held_at_bound`]: its SE displays as not available, and — when the step held
+/// it (it is marked in [`FitResult::cov_fixed`]) — every other SE is conditional on it at
+/// its estimate.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct HeldAtBound {
+    /// The parameter's name as in the estimate table: `"ETA_KA"`, `"K_ARM"`, `"TVE0"`.
+    pub name: String,
+    /// The family the parameter is reported under.
+    pub kind: ParameterKind,
+    /// Its index within that family: into `theta`, the Ω diagonal, `sigma`, or the κ
+    /// (Ω_IOV) diagonal. For a `[mixture]` per-class override (`class` is `Some`), the
+    /// index of the **base** η or σ the override replaces in that class.
+    pub index: usize,
+    /// Its row in [`FitResult::covariance_matrix`] and [`FitResult::cov_fixed`].
+    pub packed_index: usize,
+    /// Why it is held.
+    pub reason: HeldReason,
+    /// `Some(c)` when the entry is a `[mixture]` per-class override — `omega(c)` or
+    /// `sigma(c)`, 1-based like the model file, the `_MIX{c}` name and NONMEM's `MIXNUM`
+    /// (#2809). The entry is then the override, **not** the base parameter that `kind` and
+    /// `index` name: a consumer matching entries to the base estimate table by
+    /// `(kind, index)` must skip it. `None` for a base parameter, and absent from the
+    /// serialised form, so a bundle with no override entry is byte-unchanged; a reader
+    /// that predates the field drops it and would read the override as the base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<usize>,
+}
+
+/// Why a coordinate is in [`FitResult::held_at_bound`].
+#[non_exhaustive]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldReason {
+    /// A profiled level the bounded profile solve ended on its block's declared box
+    /// (#2112); [`FitResult::profiled_levels_at_bound`] lists the same levels.
+    ProfiledBound,
+    /// A free coordinate collapsed onto ferx's internal lower guard (#2797): an Ω or κ
+    /// diagonal or a σ at the floor of its log packing, or a θ on the internal 1e-10 floor
+    /// that replaces an undeclared lower bound. The same coordinates the
+    /// `parameter_at_runaway_guard` warning calls a collapse.
+    CollapsedAtGuard,
+    /// A reason this build does not know (#2817): read from a `.fitrx` bundle or
+    /// `FitResult` JSON written by a later ferx that added one. ferx never produces it.
+    /// The entry still counts as held, so its SE displays as not available; it is
+    /// neither a profiled bound nor a guard collapse, so nothing that acts on either
+    /// treats it as one. Written back as `"unknown"` — the original token is not kept.
+    #[serde(other)]
+    Unknown,
+}
+
+/// Reads a `held_at_bound` list leniently (#2817): an entry whose `kind` this build does
+/// not know (a parameter family a later ferx added) is dropped instead of failing the
+/// whole `.fitrx` bundle or `FitResult` JSON. Nothing could use such an entry: there is
+/// no family to display its SE under, and a build that cannot pack the family cannot
+/// draw from or hold it. An unknown `reason` is not dropped. It reads as
+/// [`HeldReason::Unknown`] and stays held. `ParameterKind` itself is left strict, since
+/// priors and every per-family `match` read it.
+pub(crate) fn held_at_bound_lenient<'de, D>(d: D) -> Result<Vec<HeldAtBound>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    enum KindRead {
+        Theta,
+        Omega,
+        Sigma,
+        Kappa,
+        #[serde(other)]
+        Unknown,
+    }
+    #[derive(serde::Deserialize)]
+    struct HeldRead {
+        name: String,
+        kind: KindRead,
+        index: usize,
+        packed_index: usize,
+        reason: HeldReason,
+        // #2809: the `[mixture]` class must survive this read, or an override entry
+        // loads as its base parameter.
+        #[serde(default)]
+        class: Option<usize>,
+    }
+    let rows: Vec<HeldRead> = serde::Deserialize::deserialize(d)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|h| {
+            let kind = match h.kind {
+                KindRead::Theta => ParameterKind::Theta,
+                KindRead::Omega => ParameterKind::Omega,
+                KindRead::Sigma => ParameterKind::Sigma,
+                KindRead::Kappa => ParameterKind::Kappa,
+                KindRead::Unknown => return None,
+            };
+            Some(HeldAtBound {
+                name: h.name,
+                kind,
+                index: h.index,
+                packed_index: h.packed_index,
+                reason: h.reason,
+                class: h.class,
+            })
+        })
+        .collect())
+}
+
+impl HeldReason {
+    /// The snake_case token the YAML and `.fitrx` outputs write.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HeldReason::ProfiledBound => "profiled_bound",
+            HeldReason::CollapsedAtGuard => "collapsed_at_guard",
+            HeldReason::Unknown => "unknown",
+        }
+    }
 }
 
 /// Full fit result
@@ -8138,6 +8700,11 @@ pub struct FitResult {
     /// Path to the per-iteration optimizer trace CSV, present when
     /// `FitOptions::optimizer_trace = true`.
     pub trace_path: Option<String>,
+    /// The text of that trace file, read when the fit finished. The file is a
+    /// temporary one, so this is what `.fitrx` carries (as `trace.csv`) and what
+    /// outlives it; `None` when no trace was asked for or the file could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_csv: Option<String>,
     /// Number of outer iterations in which at least one subject had an
     /// unconverged EBE.  Always `0` for SAEM (which uses MH sampling).
     pub ebe_convergence_warnings: u32,
@@ -8194,11 +8761,12 @@ pub struct FitResult {
     /// EPS shrinkage: `1 - SD(IWRES)`.  `NaN` when fewer than 2 valid residuals.
     pub shrinkage_eps: f64,
     /// Pooled lag-1 Pearson correlation of IWRES across subjects.
-    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    /// `NaN` when no series has ≥ 2 valid IWRES values (a series is a subject's
+    /// rows, split at its `correlation … by` blocks and its parallel occasions).
     pub iwres_lag1_r: f64,
     /// Pooled Durbin-Watson statistic for IWRES within subjects.
     /// 2.0 = no autocorrelation; < 1.5 = positive; > 2.5 = negative.
-    /// `NaN` when no subject has ≥ 2 valid IWRES values.
+    /// `NaN` when no series has ≥ 2 valid IWRES values, as for `iwres_lag1_r`.
     pub dw_statistic: f64,
     /// Wall-clock time for the complete fit in seconds.
     pub wall_time_secs: f64,
@@ -8222,17 +8790,15 @@ pub struct FitResult {
     pub eta_param_info: Vec<EtaParamInfo>,
     /// Scale of each IOV kappa, parallel to `kappa_names` (see
     /// `CompiledModel::kappa_param_types`, #1643). Picks CV% (log-normal) vs
-    /// SD (additive, logit) for the KAPPA rows. Empty on a `.fitrx` bundle
-    /// saved before #1643, and on a hand-built result; consumers then fall
-    /// back to the log-normal CV%.
+    /// SD (additive, logit) for the KAPPA rows. Empty on a hand-built result;
+    /// consumers then fall back to the log-normal CV%.
     pub kappa_param_types: Vec<EtaParamType>,
     /// The data-derived bindings the fitted model was compiled from (#1621):
     /// each θ level block's observed levels and contrast, and the covariate
     /// statistics behind symbolic `[covariate_model]` centres. Rebuilding the
     /// fitted model on other data — a design for `simulate`, a reloaded
     /// `.fitrx` — needs exactly these, not ones re-resolved from that data.
-    /// Empty for a model with no data-derived binding, and on a `.fitrx`
-    /// bundle saved before #1621; omitted from JSON when empty.
+    /// Empty for a model with no data-derived binding; omitted from JSON when empty.
     #[serde(
         default,
         skip_serializing_if = "crate::parser::model_parser::DataBindings::is_empty"
@@ -8252,6 +8818,12 @@ pub struct FitResult {
     /// non-positive (signals a near-singular parameter space). `None` when
     /// `cov_eigenvalues` is `None`.
     pub cov_condition_number: Option<f64>,
+    /// Which coordinates of [`Self::covariance_matrix`] the step held, parallel to its
+    /// rows (#424), so a held row is told from a degenerate one without reading it off a
+    /// zero diagonal. Empty when there is no matrix, or when the packed layout does not
+    /// have the matrix's dimension.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cov_fixed: Vec<bool>,
     /// Whether each BSV eta is lognormally parameterised (`true`) or
     /// additive/unknown (`false`). Parallel to `eta_names` / omega diagonal.
     pub eta_log_transformed: Vec<bool>,
@@ -8290,23 +8862,21 @@ pub struct FitResult {
     /// `[covariates]`, `iov_column`, and the `[data_selection]` clauses with any a
     /// caller added. `run_sir`, `run_covariance` and `load_fit` re-read
     /// `data_path` with these. `Some` when the fit was launched from a data file
-    /// (`fit_from_files`, `prepare_run`, the CLI); `None` for an in-memory `fit()`
-    /// and on a `.fitrx` bundle saved before #1685.
+    /// (`fit_from_files`, `prepare_run`, the CLI); `None` for an in-memory `fit()`.
     #[serde(default)]
     pub reader_settings: Option<crate::api::ReaderSettings>,
     /// A fingerprint of the population `fit()` was given (#1685). Every post-hoc
-    /// step refuses a population that does not match it. `None` on a `.fitrx`
-    /// bundle saved before #1685; a fingerprint from another encoding scheme is
-    /// treated as absent, with a warning.
+    /// step refuses a population that does not match it. `None` on a hand-built
+    /// result; a fingerprint from another encoding scheme is treated as absent, with a
+    /// warning.
     #[serde(default)]
     pub population_fingerprint: Option<PopulationFingerprint>,
     /// The IOV occasion rule the fit derived its occasions under (#1783): the
     /// `iov_occasion` of the options `fit()` ran with, which a file entry point
     /// takes from the caller, not from the model file's `[fit_options]`.
     /// `run_sir` and `run_covariance` derive the population's occasions with it,
-    /// as `fit()` did. `Some` for every fit; `None` on a `.fitrx` bundle saved
-    /// before #1783, for which the post-hoc steps fall back to the model file's
-    /// rule when they read the file.
+    /// as `fit()` did. `Some` for every fit; `None` on a hand-built result, for which
+    /// the post-hoc steps fall back to the model file's rule when they read the file.
     #[serde(default)]
     pub iov_occasion: Option<IovOccasionRule>,
     /// Initial theta values as supplied to the optimizer, parallel to `theta`
@@ -8371,6 +8941,51 @@ pub struct FitResult {
     /// a worse optimum and reporting `converged = true`) #997 was filed about.
     #[serde(default)]
     pub final_gradient_source: Option<String>,
+    /// The Newton decrement `½·gᵀH⁻¹g` of the OFV at the reported estimates, in OFV units
+    /// (#2541, #2785): the OFV a Newton step from them is predicted to remove. Because the
+    /// covariance is `R⁻¹ = 2·H⁻¹`, its square root is the distance to the quadratic model's
+    /// minimum in standard errors, so it is scale-aware where
+    /// [`Self::final_gradient`]'s raw magnitude is not.
+    ///
+    /// Computed by the covariance step at the modes it reconverges, so `None` whenever that
+    /// step did not test it: no step (`run_covariance_step = false`), `covariance_method = s`
+    /// (no `R`), an `R` that needed an eigenvalue floor at a FOCE-family estimate, a
+    /// profiled fit, or a cancelled run. For FOCE, FOCEI, Laplace / AGQ and Gauss–Newton a
+    /// value above 1 demotes [`Self::converged`] with `W_NON_STATIONARY_OPTIMUM`; for SAEM,
+    /// IMP, IMPMAP and VI it raises `W_COV_NON_STATIONARY_ESTIMATE` and leaves the verdict.
+    #[serde(default)]
+    pub newton_decrement: Option<f64>,
+    /// The outer optimizer's own stop state (#2785): on the NLopt path the
+    /// `SuccessState` / `FailState` name (`"FtolReached"`, `"XtolReached"`,
+    /// `"MaxEvalReached"`, `"Failure"`, `"RoundoffLimited"`, …) of the leg that produced
+    /// the reported estimates. `None` for every other optimizer.
+    ///
+    /// [`Self::converged`] is a verdict *built on* this, not a copy of it: a bare
+    /// `"Failure"` the plateau check accepts is converged (#751), and an `"FtolReached"` at
+    /// a non-stationary point is not (#2785). Kept so a reader can see which.
+    #[serde(default)]
+    pub optimizer_stop: Option<String>,
+    /// Whether the outer optimizer spent its evaluation budget (`maxiter`) on the leg that
+    /// produced the reported estimates (#2799) — the typed form of the "increase maxiter"
+    /// warnings. Read from the optimizer's final state, after a stagnation latch that
+    /// landed on the last permitted evaluation has been attributed to the guard rather than
+    /// the budget, and after a polish that spent it (which [`Self::optimizer_stop`], taken
+    /// from the primary leg, does not see). Set by every outer optimizer with a `maxiter`
+    /// budget: NLopt (profiled or not), the trust region (`MaxItersReached`), pure
+    /// Gauss–Newton and `optimizer = bfgs` (a loop that ran out of iterations). `false` for
+    /// SAEM, IMP, IMPMAP, Bayes and VI, which report their own iteration caps in warnings,
+    /// and for the Gauss–Newton hybrid, whose polish runs a fixed budget rather than the
+    /// user's. Read by [`Self::status`].
+    #[serde(default)]
+    pub eval_budget_spent: bool,
+    /// Whether no stage of the run estimated: it scored the given values by request
+    /// (#2799). That is `maxiter = 0` on an estimator that reads it as NONMEM's
+    /// `MAXEVAL=0` (FOCE, FOCEI, Laplace/AGQ, pure Gauss–Newton, profiled and mixture fits),
+    /// or a standalone `imp_eval_only` / `agq_eval_only` chain. Not `maxiter = 0` alone:
+    /// SAEM, IMP, IMPMAP, Bayes, VI and the Gauss–Newton hybrid's polish search
+    /// regardless of it. Read by [`Self::status`].
+    #[serde(default)]
+    pub evaluation_only: bool,
     // ── Run settings (for runlog / reproducibility) ──────────────────────────
     /// Outer optimizer used for this fit, as a lowercase label ("bobyqa",
     /// "slsqp", "nlopt_lbfgs", "mma", "bfgs", "lbfgs", "trust_region"). When the
@@ -8391,6 +9006,11 @@ pub struct FitResult {
     /// `n_starts == 1` (no perturbation applied) or when no seed was set and
     /// the run used a random seed derived from the system clock.
     pub multi_start_seed: Option<u64>,
+    /// What each start of a multi-start fit did (#2867): one [`StartRecord`] per start, in
+    /// start order, exactly one of them `selected`. Empty when `n_starts == 1`. The other
+    /// starts' full results are not kept; these rows are what remains of them.
+    #[serde(default)]
+    pub starts: Vec<StartRecord>,
     /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
     /// when no explicit seed was set in `[fit_options]`.
     pub saem_seed: Option<u64>,
@@ -8409,8 +9029,7 @@ pub struct FitResult {
     pub sir_seed: Option<u64>,
     /// Every setting the reported SIR draws were scored under (#1758): the
     /// scale, degrees of freedom, draw counts, seed, inner-loop and ODE
-    /// settings. `None` exactly when SIR did not run, and on a fit fitted or
-    /// loaded from a `.fitrx` written before #1758.
+    /// settings. `None` exactly when SIR did not run.
     ///
     /// [`run_sir`](crate::run_sir) reads it: a setting its caller leaves at the
     /// default is taken from here, so `run_sir` on this fit with default options
@@ -8422,7 +9041,7 @@ pub struct FitResult {
     /// estimates, with its own `inner_tol` (a quadrature stage runs at 1e-8 or tighter)
     /// rather than the top-level one. A trailing evaluator (`agq_eval_only`,
     /// `imp_eval_only`) does not write it, though the reported OFV may be that evaluator's. Set by every `fit()`; `None`
-    /// only on a fit loaded from a `.fitrx` written before #426.
+    /// only on a hand-built result.
     ///
     /// [`run_covariance`](crate::run_covariance) reads it: a setting its caller leaves
     /// at the default is taken from here, so `run_covariance` on this fit with
@@ -8474,6 +9093,12 @@ pub struct FitResult {
     /// (which has no raw rows) or when no `[covariates]` block is declared.
     /// Missing values are `f64::NAN`. See [`CovariateTable`].
     pub covariate_table: Option<CovariateTable>,
+    /// A JSON document holding an interface's own data: the R package's call settings,
+    /// objects a user added beside the fit, and so on. Core stores and returns the text
+    /// byte for byte and never reads it. [`crate::io::fitrx::save_fit`] requires only that
+    /// it is well-formed JSON. `None` until an interface sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interface_extras: Option<String>,
     /// Echo of the `[covariate_model]` relations with the estimate and SE of
     /// each θ they generated (#1111). Empty when the model declares no
     /// `[covariate_model]` block.
@@ -8505,8 +9130,7 @@ pub struct FitResult {
     /// writes it as `fit.json`'s `packed_estimate` key and
     /// [`load_fit`](crate::io::fitrx::load_fit) reads it back bit-for-bit, so a
     /// `run_covariance` on a reloaded fit repeats the inline step. `FitResult`'s own
-    /// serde still skips it (`#[serde(skip)]`): that is not the bundle format. A
-    /// bundle saved before #1815, or written by ferx-r, loads `None`. Every consumer
+    /// serde still skips it (`#[serde(skip)]`): that is not the bundle format. Every consumer
     /// reads it only when it unpacks bit-for-bit to this result's `theta` / `omega` /
     /// `sigma` / `omega_iov` / `residual_correlations` under the supplied model, so
     /// estimates edited after the fit are evaluated where they now say, never at this
@@ -8526,10 +9150,25 @@ pub struct FitResult {
     /// [`crate::simulate_with_uncertainty`] read it (ahead of `packed_estimate`) to
     /// rebuild the per-class matrices the fit had. `Some` for every estimator that
     /// produces a `[mixture]` fit with at least one override — SAEM included, which
-    /// carries no `packed_estimate`; `None` otherwise, for hand-built results, and
-    /// for a `.fitrx` bundle saved before it was recorded.
+    /// carries no `packed_estimate`; `None` otherwise and for hand-built results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mixture_overrides: Option<Vec<f64>>,
+    /// One descriptor per entry of [`FitResult::mixture_overrides`], in the same order
+    /// (#2833): the override's name, family, base index, class, packed row and FIX state, so
+    /// a renderer can label its row. Empty for a fit with no override and for a result that
+    /// predates the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mixture_override_params: Vec<MixtureOverrideParam>,
+    /// Standard errors of [`FitResult::mixture_overrides`] (#2833), parallel to it and on its
+    /// scales: an Ω override's class **variance**, a σ override's σ (the scale the base
+    /// `se_sigma` reports). `0.0` for a fixed override
+    /// ([`MixtureOverrideParam::fixed`]), as the other `se_*` vectors report a pinned
+    /// coordinate, **and** for an override the covariance step held on the internal guard,
+    /// which is not `fixed` but has an entry with its `class` in
+    /// [`FitResult::held_at_bound`]: read that list before printing a `0.0` as an SE.
+    /// `None` with no override or no covariance matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub se_mixture_overrides: Option<Vec<f64>>,
     /// The outer optimizer's own verdict on whether the fit left its initial
     /// estimates — its `INIT_ESCAPE_STEP_S` test (#751) in scaled packed space,
     /// on the point the reported estimates are built from. `Some(false)` is the
@@ -8538,8 +9177,7 @@ pub struct FitResult {
     /// loop (BOBYQA, SLSQP, L-BFGS, MMA), and for the built-in BFGS, the trust
     /// region and Gauss-Newton when they report a #2506 start-probe result;
     /// otherwise `None` for those three, and for SAEM / IMP / Bayes / VI, an
-    /// `outer_maxiter = 0` evaluation, hand-built results, and a `.fitrx`
-    /// bundle saved before it was recorded.
+    /// `outer_maxiter = 0` evaluation and hand-built results.
     #[serde(default)]
     pub left_init: Option<bool>,
     /// The fit did not leave its initial estimates (`left_init == Some(false)`),
@@ -8551,16 +9189,14 @@ pub struct FitResult {
     /// previous fit's estimates), which `crate::stalled_at_init` does not call a
     /// stall. `false` whenever that was not shown: the fit left its start, the
     /// restart was inconclusive or had no budget left, the estimator does not run
-    /// the restart (SAEM, IMP, Bayes, VI), or the `.fitrx` bundle predates the
-    /// field. A stall the restart *improved on* is reported
+    /// the restart (SAEM, IMP, Bayes, VI). A stall the restart *improved on* is reported
     /// as the restart's own estimates, which left the start.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stationary_start: bool,
     /// Whether the BSV Ω was estimated as a diagonal (`omega NAME ~ v`, one
     /// packed coordinate per η) or a full Cholesky block (`block_omega`, a
     /// lower triangle) — the packed layout of `covariance_matrix`, which the
-    /// result otherwise does not record. `None` on a `.fitrx` bundle saved
-    /// before it was recorded and on hand-built results; consumers that need
+    /// result otherwise does not record. `None` on hand-built results; consumers that need
     /// the layout (`crate::natural_scale_covariance`) then leave the matrix as
     /// stored rather than guess it from the matrix size.
     #[serde(default)]
@@ -8572,41 +9208,60 @@ pub struct FitResult {
     /// True when this result was reconstructed from a `.fitrx` checkpoint by
     /// [`crate::io::fitrx::load_fit`] rather than produced by a live fit.
     ///
-    /// The checkpoint format does not round-trip per-record discrete-endpoint or
-    /// time-to-event diagnostics (`SubjectResult::discrete_rows`, `SubjectResult::tte_rows`),
-    /// so a restored fit of a binary / categorical or TTE model has none. This flag lets
-    /// [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose model declares a
-    /// binary or a time-to-event endpoint (rows genuinely dropped) while still writing a
-    /// live fit. It must be paired with the model's
-    /// declared endpoints — parsed from [`Self::model_text`] — because the *reconstructed
-    /// population* is not a usable signal: `load_fit` re-reads the data with default
-    /// (Gaussian) routing, so binary DVs come back as continuous observations and no
-    /// [`ObsRecord::DiscreteState`] survives. Runtime-only: `#[serde(skip)]`, so no
-    /// `.fitrx` / JSON / ferx-r format change, and a live fit always carries `false`.
-    /// Removed once diagnostics round-trip (#911).
+    /// The checkpoint carries per-record time-to-event diagnostics
+    /// (`SubjectResult::tte_rows`) since #911, but a bundle written before that has none.
+    /// This flag lets [`crate::io::output::write_sdtab_csv`] refuse a restored fit whose
+    /// model declares a time-to-event endpoint and whose subjects carry no TTE row (rows
+    /// genuinely dropped) while still writing a live fit. It is paired with the model's
+    /// declared endpoints, parsed from [`Self::model_text`]. Runtime-only: `#[serde(skip)]`,
+    /// so no `.fitrx` / JSON / ferx-r format change, and a live fit always carries `false`.
     #[serde(skip)]
     pub restored_from_checkpoint: bool,
     /// Free-parameter tally by Delattre class, the inputs to the BIC variants
-    /// (`crate::bic`, #1177). Absent on `.fitrx` bundles saved before this field
-    /// existed; such bundles load with an all-zero tally, for which `bic()`
+    /// (`crate::bic`, #1177). All zero on a hand-built result, for which `bic()`
     /// returns `NaN`.
     #[serde(default)]
     pub bic_inputs: BicInputs,
     /// The θ level blocks declared `profile` (#1065), in declaration order. Their
     /// levels are solved for at every outer evaluation rather than searched by the
     /// optimizer; they still sit in `theta` / `theta_names` and still count in
-    /// `n_parameters` and `bic_inputs`. Empty for a model without one, and on
-    /// `.fitrx` bundles saved before the field existed.
+    /// `n_parameters` and `bic_inputs`. Empty for a model without one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiled_blocks: Vec<String>,
     /// The θ indices of the profiled levels the bounded profile solve ended exactly on
     /// their block's declared box (#2112), ascending. The covariance step holds each at
     /// its bound: its row and column of `covariance_matrix` are zero, its `se_theta` is
     /// `0.0` and printed as not available, as a FIX θ's is, and every other standard error
-    /// is conditional on it. Empty when no level sits on a bound, and on `.fitrx` bundles
-    /// saved before the field existed.
+    /// is conditional on it. Empty when no level sits on a bound.
+    ///
+    /// **Deprecated** in favour of [`Self::held_at_bound`], which lists these levels as
+    /// [`HeldReason::ProfiledBound`] entries alongside every other held coordinate. Still
+    /// filled, from the same source, for one release.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profiled_levels_at_bound: Vec<usize>,
+    /// Every coordinate whose standard error is not available because it sits on a bound
+    /// (#2797), in packed order: the profiled levels on their declared box
+    /// ([`HeldReason::ProfiledBound`]) and the free coordinates collapsed on ferx's internal
+    /// guard ([`HeldReason::CollapsedAtGuard`]). Filled from the reported estimate, whether
+    /// or not the covariance step ran or succeeded.
+    ///
+    /// The list says "this SE is not available"; [`Self::cov_fixed`] says whether the step
+    /// held the coordinate, and so whether every other SE is conditional on it. A collapse
+    /// is held only when the step's `R` was clean (no eigenvalue floor, no `S` fallback):
+    /// otherwise the matrix and the SEs are the unconditional ones, the coordinate is not
+    /// marked in `cov_fixed`, and its stored `se_*` keeps the unconditional value. A held
+    /// coordinate's stored `se_*` is `0.0`, as a FIX parameter's is (never `NaN`, which
+    /// would break every consumer that sums or folds SEs). Display reads this list, not the
+    /// number.
+    ///
+    /// Read leniently: an entry of a parameter family this build does not know is
+    /// dropped on load rather than failing the whole read (#2817).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "held_at_bound_lenient"
+    )]
+    pub held_at_bound: Vec<HeldAtBound>,
 }
 
 /// Free-parameter counts by Delattre et al. (2014) class, plus the record count
@@ -8664,6 +9319,20 @@ impl FitResult {
                 "schema_version".to_string(),
                 serde_json::json!(Self::JSON_SCHEMA_VERSION),
             );
+            // #2799: the derived usability verdict, as `schema_version` is derived: there is no
+            // stored field, so a reader gets it from the same facts the result carries.
+            map.insert(
+                "status".to_string(),
+                serde_json::to_value(self.status()).expect("FitStatus is serializable"),
+            );
+            // #2911: the parameter estimates keyed by name, in the fit YAML's own layout —
+            // `estimates.theta.CL.estimate` is the YAML's `theta.CL.estimate` — so a reader
+            // of final estimates does not branch on which file it was handed. Derived, like
+            // `status`: `from_json_str` ignores it and reads the vectors above.
+            map.insert(
+                "estimates".to_string(),
+                crate::io::output::estimates_json(self),
+            );
         }
         v
     }
@@ -8676,7 +9345,8 @@ impl FitResult {
     /// `NaN` (an `Option<f64>` reads it as `None`). A plain
     /// `serde_json::from_str::<FitResult>` refuses such a file — any fit whose
     /// diagnostics came out undefined, e.g. `dw_statistic` when no subject has
-    /// two IWRES values. The `schema_version` key is ignored.
+    /// two IWRES values. The `schema_version` and `status` keys are ignored (the status is
+    /// recomputed from the fields by [`Self::status`]).
     pub fn from_json_str(text: &str) -> Result<FitResult, serde_json::Error> {
         let value: serde_json::Value = serde_json::from_str(text)?;
         serde::Deserialize::deserialize(crate::io::serde_nan::NullAsNan(value))
@@ -8696,9 +9366,17 @@ pub fn omega_se_at(se_omega: &Option<Vec<f64>>, n_eta: usize, i: usize, j: usize
 /// [`omega_se_at`] over a borrowed SE slice, for a caller holding the packed
 /// vector without its `Option<Vec<_>>` (`OmegaRowsInput`, #1859).
 pub(crate) fn omega_se_at_in(se: &[f64], n_eta: usize, i: usize, j: usize) -> Option<f64> {
+    se.get(omega_se_slot(se.len(), n_eta, i, j)?).copied()
+}
+
+/// The position of Ω element `(i, j)` in an `se_omega` vector of length `len`, or `None`
+/// when that layout has no slot for it. The one reading of the layout, shared by the
+/// lookup ([`omega_se_at_in`]) and the writer that zeroes a held variance's SE
+/// (`apply_held_at_bound`, #2797), so the two cannot disagree on a block Ω.
+pub(crate) fn omega_se_slot(len: usize, n_eta: usize, i: usize, j: usize) -> Option<usize> {
     let (r, c) = if i >= j { (i, j) } else { (j, i) }; // ensure r >= c
     let n_lt = crate::estimation::parameterization::omega_packed_len(n_eta, false);
-    if se.len() == n_lt && n_lt != n_eta {
+    if len == n_lt && n_lt != n_eta {
         // Full lower-triangle format (block omega). The packed index is the
         // shared column-major `chol_lt_idx` (same convention as `pack_params`).
         //
@@ -8710,21 +9388,10 @@ pub(crate) fn omega_se_at_in(se: &[f64], n_eta: usize, i: usize, j: usize) -> Op
         // answer. This is only reachable by an external caller: every in-repo
         // caller loops `i,j < n_eta`, so the guard is inert internally. The
         // guard also keeps `chol_lt_idx`'s `debug_assert!(i < n)` from firing.
-        if r < n_eta {
-            se.get(crate::estimation::parameterization::chol_lt_idx(
-                r, c, n_eta,
-            ))
-            .copied()
-        } else {
-            None
-        }
+        (r < n_eta).then(|| crate::estimation::parameterization::chol_lt_idx(r, c, n_eta))
     } else {
         // Diagonal-only format: only (i, i) is available.
-        if r == c {
-            se.get(r).copied()
-        } else {
-            None
-        }
+        (r == c).then_some(r)
     }
 }
 
@@ -8761,15 +9428,9 @@ pub struct NeuralNetworkInfo {
     /// vectors. `init` is deliberately **not** recorded — it is a starting value
     /// for the optimizer, superseded by the fitted weights, and says nothing
     /// about what the converged network computes.
-    ///
-    /// `serde(default)` so a `.fitrx` bundle written before this field existed still
-    /// deserialises; such a bundle predates `center`/`scale` entirely, so the empty
-    /// vector it yields means "no transform" and should be read as the identity.
-    #[serde(default)]
     pub input_center: Vec<f64>,
     /// Per-input `scale`, in `input_names` order (all-one when the model declares
     /// no normalisation). See [`NeuralNetworkInfo::input_center`].
-    #[serde(default)]
     pub input_scale: Vec<f64>,
 }
 
@@ -9032,6 +9693,13 @@ pub struct FitOptions {
     /// model whose every objective evaluation is seconds). The fit is otherwise
     /// bit-identical either way — nothing downstream reads `final_gradient`.
     pub report_final_gradient: bool,
+    /// Read by nothing. It was never a `[fit_options]` key, and no optimizer takes its
+    /// L-BFGS history length from it. The field goes at the next minor release, with
+    /// `gn_lambda` (#1841).
+    #[deprecated(
+        since = "0.4.1",
+        note = "never read; removed at the next minor release (#1841)"
+    )]
     pub lbfgs_memory: usize,
     /// Run a gradient-free global pre-search (NLopt GN_CRS2_LM) before local optimization.
     pub global_search: bool,
@@ -9263,7 +9931,15 @@ pub struct FitOptions {
     /// Base RNG seed for the Bayes sampler. Chain `c` uses a seed derived from
     /// this. `None` draws a nondeterministic seed.
     pub bayes_seed: Option<u64>,
-    /// Levenberg-Marquardt damping factor for Gauss-Newton (0 = pure GN).
+    /// Read by nothing. Gauss-Newton has used a trust region, not Levenberg-Marquardt
+    /// damping, since 0.1.0 (#68), so there is no damping factor for this to set. The
+    /// `[fit_options]` key is still parsed and draws a warning (#1841); the key and this
+    /// field go at the next minor release.
+    #[deprecated(
+        since = "0.4.1",
+        note = "has no effect: Gauss-Newton has used a trust region since 0.1.0; \
+                the field is removed at the next minor release (#1841)"
+    )]
     pub gn_lambda: f64,
     /// L2 (weight-decay) regularization strength for `[covariate_nn]` weights
     /// (NN-only). Adds `nn_l2_lambda · Σ wᵢ²` over the network **weight** blocks
@@ -9546,7 +10222,8 @@ pub struct FitOptions {
     /// then reach a low-noise objective instead of carrying a sample-count-dependent
     /// M-step bias, but a fit that stays above the target while its SE does scale runs
     /// at the cap, at about ten times the per-iteration cost of K = 1000. Set `false`
-    /// to pin the sample count.
+    /// to pin the sample count. Estimating path only: an `imp_eval_only` evaluation
+    /// draws a fixed `imp_samples` and warns if this is set (#2717).
     pub imp_auto: bool,
     /// Adaptive importance-sample count for IMPMAP (NONMEM `AUTO`/`STDOBJ`). As
     /// [`FitOptions::imp_auto`] but moves `impmap_samples`. Default `true`.
@@ -9562,10 +10239,13 @@ pub struct FitOptions {
     pub impmap_max_time: Option<f64>,
     /// Minimum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MIN).
     /// The proposal covariance is multiplied by iscale² to improve IS efficiency.
-    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1.
+    /// Set `iscale_min == iscale_max == 1.0` to disable. Default 0.1. Read by the
+    /// estimating `imp` / `impmap` iterations only: a reported marginal, including an
+    /// `imp_eval_only` evaluation, draws at scale 1, and `imp_eval_only` warns if this
+    /// is set (#2717).
     pub iscale_min: f64,
     /// Maximum ISCALE factor for adaptive IS proposal scaling (NONMEM ISCALE_MAX).
-    /// Default 10.0.
+    /// Default 10.0. Same scope as [`Self::iscale_min`].
     pub iscale_max: f64,
     /// Defensive-mixture weight for the IMP/IMPMAP importance-sampling proposal
     /// (issue #528). Each subject draws an `imp_defensive_alpha` fraction of its
@@ -9623,8 +10303,10 @@ pub struct FitOptions {
     pub mu_referencing: bool,
     /// Number of rayon worker threads used for the per-subject parallel loops
     /// (inner EBE search, SAEM MH steps, SIR weighting, likelihood reductions).
-    /// `None` or `Some(0)` uses available cores minus one, clamped to 1..8,
-    /// unless explicitly configured through `configure_global_thread_pool`.
+    /// `None` or `Some(0)` uses the engine default: the width declared through
+    /// `configure_global_thread_pool` if any, else a positive `RAYON_NUM_THREADS`
+    /// (used as given, read once per process — #2800), else available cores minus
+    /// one, at least two where two exist, capped at 8.
     /// `Some(n)` for positive `n` exclusively leases a pool of that width for
     /// this call. Idle pools are reused within a bounded cache; concurrent fits
     /// keep independent budgets even when their ODE overrides are identical.
@@ -9893,6 +10575,7 @@ impl Default for FitOptions {
             optimizer: Optimizer::Auto,
             inner_optimizer: InnerOptimizer::Auto,
             report_final_gradient: true,
+            #[allow(deprecated)] // removed with the field at the next minor (#1841)
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
@@ -9924,6 +10607,7 @@ impl Default for FitOptions {
             bayes_chains: 4,
             bayes_thin: 1,
             bayes_seed: None,
+            #[allow(deprecated)] // removed with the field at the next minor (#1841)
             gn_lambda: 0.01,
             sir: false,
             sir_samples: 1000,
@@ -10902,6 +11586,39 @@ impl FitOptions {
         v
     }
 
+    /// Whether no stage of the chain estimates: each one runs as a pure evaluator, so the
+    /// fit reports the initial estimates by request (#2716). That is a standalone
+    /// `imp_eval_only` or `agq_eval_only` run. A readout after an estimator is not one, and
+    /// neither is a run whose flag names a method outside its chain, where the flag is inert.
+    pub(crate) fn evaluation_only_chain(&self) -> bool {
+        let eval_only = self.eval_only_methods();
+        self.method_chain().iter().all(|m| eval_only.contains(m))
+    }
+
+    /// Whether no stage of the run estimates (#2799), the source of
+    /// [`FitResult::evaluation_only`]: every stage is either a standalone evaluator
+    /// ([`Self::evaluation_only_chain`]'s `imp_eval_only` / `agq_eval_only`) or one that reads
+    /// `outer_maxiter = 0` as NONMEM `MAXEVAL=0`. Those are the stages `fit()` routes through
+    /// `optimize_population` (FOCE, FOCEI, Laplace — profiled and mixture fits included, and
+    /// the trust region beneath them), which short-circuits to `evaluate_at_initial_params`,
+    /// and pure Gauss–Newton, whose loop runs `1..=maxiter`. Not SAEM, IMP, IMPMAP, Bayes or
+    /// VI, which carry their own iteration counts, nor the Gauss–Newton hybrid, whose FOCEI
+    /// polish runs a fixed 100-evaluation budget whatever `maxiter` says.
+    pub(crate) fn evaluation_only_run(&self) -> bool {
+        let eval_only = self.eval_only_methods();
+        self.method_chain().iter().all(|m| {
+            eval_only.contains(m)
+                || (self.outer_maxiter == 0
+                    && matches!(
+                        m,
+                        EstimationMethod::Foce
+                            | EstimationMethod::FoceI
+                            | EstimationMethod::FoceGn
+                            | EstimationMethod::Laplace
+                    ))
+        })
+    }
+
     /// The chain stage that would run the post-fit covariance step: the last stage that
     /// estimates, ignoring a trailing run of evaluation-only stages (#615).
     ///
@@ -11082,6 +11799,15 @@ impl FitOptions {
             if key == "method" || key == "methods" {
                 continue;
             }
+            // A deprecated key is read by no method, so it gets its own notice on every
+            // chain instead of the "not used by method" text, which would suggest that
+            // some other method reads it.
+            if let Some(notice) = deprecated_key_notice(key) {
+                if seen.insert(key.clone()) {
+                    warnings.push(notice.to_string());
+                }
+                continue;
+            }
             if applicable.contains(key.as_str()) {
                 continue;
             }
@@ -11098,7 +11824,55 @@ impl FitOptions {
             ));
         }
         warnings.extend(self.inert_covariance_key_notices());
+        warnings.extend(self.inert_imp_eval_only_key_notices());
         warnings
+    }
+
+    /// Notices for the MCEM-only `imp` keys set on a chain whose `imp` stage only evaluates.
+    ///
+    /// `iscale_min`, `iscale_max` and `imp_auto` belong to `imp`'s key list because the
+    /// estimating path reads them, so [`Self::unsupported_keys_warnings`] accepts them. The
+    /// evaluator reads none: it draws at a fixed scale of 1 and a fixed `imp_samples`, and
+    /// its proposal is shaped by `imp_adapt_passes` alone (#2717).
+    ///
+    /// This keys on `user_set_keys`, not on the values, because `imp_auto` defaults to
+    /// `true`. A key another stage of the chain reads stays quiet: `iscale_*` still drive
+    /// the IMPMAP stage of `[impmap, imp]`. A chain with no `imp` stage is left to the
+    /// "not used by method" warning, which already covers these keys there.
+    fn inert_imp_eval_only_key_notices(&self) -> Vec<String> {
+        let chain = self.method_chain();
+        if !self.imp_eval_only || !chain.contains(&EstimationMethod::Imp) {
+            return Vec::new();
+        }
+        let read_by_another_stage = |key: &str| {
+            chain
+                .iter()
+                .filter(|&&m| m != EstimationMethod::Imp)
+                .any(|&m| method_specific_keys(m).contains(&key))
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut notices = Vec::new();
+        for key in &self.user_set_keys {
+            let notice = match key.as_str() {
+                "iscale_min" | "iscale_max" => format!(
+                    "fit option `{key}` bounds the proposal-scale search of the estimating \
+                     IMP iterations, but `imp_eval_only` runs an evaluation, which does not \
+                     search a scale, so it has no effect. An evaluation's proposal is adapted \
+                     only by `imp_adapt_passes`."
+                ),
+                "imp_auto" => "fit option `imp_auto` adapts the sample count of the estimating \
+                     IMP iterations, but `imp_eval_only` runs an evaluation, which draws a \
+                     fixed `imp_samples` per subject in each pass, so it has no effect. Raise \
+                     `imp_samples` to lower the evaluation's Monte-Carlo error."
+                    .to_string(),
+                _ => continue,
+            };
+            if read_by_another_stage(key) || !seen.insert(key.clone()) {
+                continue;
+            }
+            notices.push(notice);
+        }
+        notices
     }
 
     /// Notices for [`covariance_keys`] set on a chain whose covariance step never runs.
@@ -11193,6 +11967,29 @@ impl FitOptions {
             self.method.label()
         ))
     }
+}
+
+/// `[fit_options]` keys the parser still accepts but nothing reads, each with the
+/// warning [`FitOptions::unsupported_keys_warnings`] emits when it is set, on any method.
+///
+/// A key here is in no `method_specific_keys` list and not in [`framework_keys`]: the
+/// notice is its only diagnostic. Each entry is removed, key and field together, at the
+/// next minor release after it was added.
+pub(crate) fn deprecated_keys() -> &'static [(&'static str, &'static str)] {
+    &[(
+        "gn_lambda",
+        "fit option `gn_lambda` has no effect: Gauss-Newton has used a trust region, not \
+         Levenberg-Marquardt damping, since ferx 0.1.0. Remove the key from your settings; \
+         it will be rejected from the next minor release.",
+    )]
+}
+
+/// The [`deprecated_keys`] notice for `key`, if it is deprecated.
+fn deprecated_key_notice(key: &str) -> Option<&'static str> {
+    deprecated_keys()
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|(_, notice)| *notice)
 }
 
 /// The `ode_*` subset of [`framework_keys`]: knobs that only ever reach the ODE
@@ -11380,7 +12177,6 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_screen",
             "inner_twin_seed",
             "inner_optimizer",
-            "gn_lambda",
             "nn_l2",
             "nn_smooth",
         ],
@@ -11399,7 +12195,6 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "global_search",
             "global_maxeval",
             "stagnation_guard",
-            "gn_lambda",
             "reconverge_gradient_interval",
             "nn_l2",
             "nn_smooth",
@@ -11578,6 +12373,17 @@ pub struct ParsedModel {
     /// bindings still in hand instead of silently dropping them.
     pub bindings: crate::parser::model_parser::ParseBindings,
 }
+
+// #2799: the usability verdict beside `converged`, in its own file.
+#[path = "types_fit_status.rs"]
+mod fit_status;
+pub use fit_status::{FitStatus, StatusReason};
+
+// #2867: what each start of a multi-start fit did, and the summary of their spread.
+#[path = "types_multi_start.rs"]
+mod multi_start;
+pub use multi_start::StartRecord;
+pub(crate) use multi_start::{StartSpread, START_AGREE_OFV};
 
 /// Factories that build minimal `CompiledModel` instances for unit tests.
 /// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests

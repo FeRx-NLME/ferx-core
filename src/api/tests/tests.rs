@@ -4,8 +4,10 @@ use nalgebra::{DMatrix, DVector};
 // ── default thread count cap (#707) ─────────────────────────────────────
 
 #[test]
-fn cap_default_threads_leaves_one_core_free() {
-    assert_eq!(cap_default_threads(2), 1);
+fn cap_default_threads_leaves_one_core_free_but_keeps_two_workers() {
+    // Except on two cores, where one free core would leave a single, serial worker.
+    assert_eq!(cap_default_threads(2), 2);
+    assert_eq!(cap_default_threads(3), 2);
     assert_eq!(cap_default_threads(4), 3);
     assert_eq!(cap_default_threads(8), 7);
 }
@@ -40,17 +42,20 @@ fn an_explicit_thread_count_beats_the_default_cap() {
     // read — the statics are shared with every other test in this binary, so the
     // resolution is tested here and the end-to-end path in `ferx-cli`'s
     // `a_threads_flag_sizes_one_pool_and_no_idle_set_beside_it` (#1460).
-    assert_eq!(resolve_default_threads(3), 3);
+    assert_eq!(resolve_default_threads(3, None, 16).n, 3);
     // An explicit count is a user's choice, not a suggestion: it is not re-capped at
     // DEFAULT_THREADS_CAP the way the automatic count is.
-    assert_eq!(resolve_default_threads(64), 64);
+    assert_eq!(resolve_default_threads(64, None, 16).n, 64);
 }
 
 #[test]
 fn no_explicit_thread_count_falls_back_to_the_capped_default() {
     // `0` is "nothing was declared", which is why `configure_global_thread_pool`
     // refuses to store it.
-    assert_eq!(resolve_default_threads(0), default_thread_count());
+    assert_eq!(
+        resolve_default_threads(0, None, 16).n,
+        cap_default_threads(16)
+    );
 }
 
 #[test]
@@ -250,6 +255,7 @@ fn adaptive_base_subject() -> crate::types::Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -461,6 +467,8 @@ fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         cwres: vec![0.0; n],
         npde: vec![],
         npd: vec![],
+        epred: vec![],
+        pwres: vec![],
         ofv_contribution: 0.0,
         cens: vec![0; n],
         n_obs: n,
@@ -469,7 +477,6 @@ fn make_subject(eta: Vec<f64>, iwres: Vec<f64>) -> SubjectResult {
         extra_columns: vec![],
         per_obs_tad: vec![],
         compartment_states: vec![],
-        #[cfg(feature = "survival")]
         discrete_rows: Vec::new(),
         #[cfg(feature = "survival")]
         tte_rows: Vec::new(),

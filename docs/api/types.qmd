@@ -62,10 +62,16 @@ covariate varies within the subject — the no-TV-cov fast paths use
 `covariates` directly. Helpers `subject.has_tv_covariates()`,
 `subject.dose_cov(k)`, and `subject.obs_cov(j)` abstract over this.
 
-A covariate the model reads (including an `[adaptive_dosing]` `observe`
-covariate) is present only when **every** subject's `covariates` map carries
-it. Per-record snapshots alone do not count: a dose or reset row without one,
-and an adaptive decision before the first record, read the `covariates` map.
+A covariate the model reads (including an `[adaptive_dosing]` `observe` or
+dose-expression covariate) is present only when **every** subject carries it in
+its `covariates` map **and** in every per-record snapshot it has
+(`obs_covariates`, `dose_covariates`, `pk_only_covariates`, `reset_covariates`,
+`endpoint_covariates`). Each map is read somewhere: a dose or reset row without
+a snapshot of its own, and an adaptive decision before the first record, read
+the `covariates` map; a record with a snapshot reads that snapshot, and an
+adaptive decision reads the snapshot of the record in force. A key one map
+lacks would be read as 0 there, so it is refused with `E_MISSING_COVARIATE`
+([#2671](https://github.com/FeRx-NLME/ferx-core/issues/2671)).
 `covariate_names` does not decide presence either: a population built in
 memory that lists a name some subject lacks is refused with
 `E_MISSING_COVARIATE`, since the predictor would read the missing value as 0
@@ -117,7 +123,7 @@ pub struct FitOptions {
     pub interaction: bool,             // FOCEI flag
     pub verbose: bool,                 // Default: true
     pub optimizer: Optimizer,          // Default: Auto
-    pub lbfgs_memory: usize,           // Default: 5
+    pub lbfgs_memory: usize,           // Deprecated since 0.4.1: never read; removed at the next minor
     pub global_search: bool,           // Default: false
     pub global_maxeval: usize,         // Default: 0 (auto)
     // SAEM-specific
@@ -156,8 +162,12 @@ pub struct FitResult {
     pub n_parameters: usize,      // free packed coordinates (FIX and structural zeros excluded)
     pub bic_inputs: BicInputs,    // free-parameter tally by Delattre class, for `bic()`
     pub left_init: Option<bool>,  // the outer optimizer's own init-escape verdict (#751); NLopt loop only
-    pub omega_is_diagonal: Option<bool>, // packed layout of Ω (diagonal vs `block_omega`); None on older bundles
+    pub omega_is_diagonal: Option<bool>, // packed layout of Ω (diagonal vs `block_omega`); None on hand-built results
     pub kappa_is_diagonal: Option<bool>, // same for the IOV κ block
+    pub cov_fixed: Vec<bool>,     // rows of `covariance_matrix` the step held; empty without a matrix
+    pub held_at_bound: Vec<HeldAtBound>, // parameters with no SE: on a profiled bound, or collapsed on the internal guard (#2797)
+    pub trace_csv: Option<String>, // the optimizer trace's text, when `optimizer_trace = true`
+    pub interface_extras: Option<String>, // an interface's own JSON, stored and returned byte for byte
     pub n_iterations: usize,
     pub interaction: bool,
     pub warnings: Vec<String>,

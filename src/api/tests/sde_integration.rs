@@ -105,6 +105,7 @@ fn make_sde_population() -> Population {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; 3],
             occasions: vec![1u32; 3],
             obs_l2: Vec::new(),
@@ -140,7 +141,6 @@ fn fast_foce_opts() -> FitOptions {
         interaction: false,
         mu_referencing: false,
         optimizer: Optimizer::Slsqp,
-        lbfgs_memory: 5,
         verbose: false,
         ..FitOptions::default()
     }
@@ -245,6 +245,7 @@ fn sde_gn_returns_error() {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0],
             occasions: Vec::new(),
             obs_l2: Vec::new(),

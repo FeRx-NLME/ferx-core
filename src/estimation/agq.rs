@@ -1397,11 +1397,8 @@ impl<'a> SubjectScoreContext<'a> {
             if self.fixed[k] {
                 continue;
             }
-            let floor = crate::estimation::parameterization::fd_step_floor(
-                self.template,
-                &self.model.default_params,
-                k,
-            );
+            let floor =
+                crate::estimation::parameterization::fd_step_floor(self.template, self.model, k);
             let h = crate::estimation::parameterization::fd_step(1e-4, self.x[k], floor);
             let mut xp = self.x.to_vec();
             let mut xm = self.x.to_vec();
@@ -1710,6 +1707,7 @@ mod tests {
             pk_only_covariates: Vec::new(),
             reset_times: Vec::new(),
             reset_covariates: Vec::new(),
+            cmt_toggles: Vec::new(),
             cens: vec![0; n],
             occasions: vec![1; n],
             obs_l2: Vec::new(),

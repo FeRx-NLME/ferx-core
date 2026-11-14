@@ -122,9 +122,15 @@ pub(crate) fn check_covariates(model: &CompiledModel, population: &Population) -
     // `read_nonmem_csv*` population handed to `fit()`. It gets its own message;
     // the historical text below keeps every other name byte-for-byte. An in-memory
     // population (`input_columns` empty) and a case-differing spelling stay there.
-    let (unread, plain): (Vec<&str>, Vec<&str>) = plain
-        .iter()
-        .partition(|n| population.input_columns.iter().any(|h| h == *n));
+    // So does a header some map of the population holds (#2671): the reader *did*
+    // take that column, and a population later edited in code to drop it from one
+    // map is missing it there, not unread.
+    let (unread, plain): (Vec<&str>, Vec<&str>) = plain.iter().partition(|n| {
+        population.input_columns.iter().any(|h| h == *n)
+            && !population.subjects.iter().any(|s| {
+                s.covariates.contains_key(**n) || s.record_maps().any(|m| m.contains_key(**n))
+            })
+    });
 
     if !plain.is_empty() {
         diags.push(missing_covariate_diagnostic(population, &plain));
@@ -213,21 +219,30 @@ fn missing_covariate_diagnostic(population: &Population, plain: &[&str]) -> Diag
 /// per-subject maps, so a name that is listed but missing from some subject is read
 /// as 0 for that subject. An empty population carries nothing.
 ///
-/// The subject-static map decides, not the per-record snapshots: every lookup
-/// without a snapshot of its own — a dose, reset or PK-only row of a subject with no
-/// such snapshots, an adaptive decision before the first record — falls back to it,
-/// so a name the static map lacks is read as 0 there even when every observation
-/// snapshot has it. The CSV reader fills the static map with each subject's first
-/// value.
+/// A subject carries `name` when its subject-static map **and** every per-record
+/// snapshot (`Subject::record_maps`: observation, dose, PK-only,
+/// reset, non-Gaussian endpoint) holds it, since each is a map some predictor reads:
+/// - the static map is the fallback of every lookup without a snapshot of its own — a
+///   dose, reset or PK-only row of a subject with no such snapshots, an adaptive
+///   decision before the first record — so a name it lacks is read as 0 there even
+///   when every observation snapshot has it;
+/// - a record's snapshot is what that record reads, the PK at that row and, through
+///   `locf_decision_cov`, an adaptive `observe` or dose expression at a decision in
+///   force there (#2671), and a binary / categorical / DTMM endpoint row through
+///   `record_cov`, so a name one snapshot lacks is read as 0 at that record even when
+///   the static map has it.
 ///
-/// Shared with the `[adaptive_dosing]` `observe` check in
-/// `simulate_adaptive_from_spec`, so the two cannot disagree on one population.
+/// The CSV reader cannot produce either gap: it fills the static map with each
+/// subject's first value (`NaN` when it has none) and starts every snapshot from a
+/// copy of it, only ever adding keys. Only a population built in code can.
+///
+/// Shared with the `[adaptive_dosing]` `observe` and dose-expression checks in
+/// `simulate_adaptive_from_spec`, so they cannot disagree on one population.
 pub(crate) fn population_carries(population: &Population, name: &str) -> bool {
     !population.subjects.is_empty()
-        && population
-            .subjects
-            .iter()
-            .all(|s| s.covariates.contains_key(name))
+        && population.subjects.iter().all(|s| {
+            s.covariates.contains_key(name) && s.record_maps().all(|m| m.contains_key(name))
+        })
 }
 
 /// The "Available covariate columns" list of an `E_MISSING_COVARIATE`: the listed
@@ -3223,6 +3238,230 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
         .any(|s| crate::pk::subject_feeds_analytical_pk(model, s))
 }
 
+/// Refuse what compartment on/off rows (`EVID=2`, `CMT=-N`, #2732) cannot do here.
+///
+/// Only the event-driven ODE walk has the record, so anything that integrates elsewhere is
+/// refused rather than run with the row ignored: an analytical or compartment-free model, an
+/// SDE, and an endpoint model, whose hazard or transition solve is the dense walk. A compartment
+/// fed by a built-in absorption input has no amount of its own to switch.
+///
+/// The rest mirrors NONMEM 7.5.1, which stops the run on an observation of an off compartment
+/// ("COMPARTMENT ASSOCIATED WITH THE PREDICTION IS OFF"). The record replays the status the
+/// way the engines reach it: a reset turns every compartment on, and a dose turns its own on
+/// at the record for this purpose, since NONMEM accepts an observation between a lagged dose's
+/// record and its arrival and reads zero there. An `SS=1` dose is refused while the walk may
+/// still hold anything off, that gap included, because its periodic solve would integrate the
+/// compartment as if it were on.
+pub(crate) fn check_cmt_toggles(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
+    let Some(subject) = population.subjects.iter().find(|s| s.has_cmt_toggles()) else {
+        return Vec::new();
+    };
+    let refused = |why: &str, block: &str| {
+        vec![Diagnostic::error(
+            "E_CMT_TOGGLE_UNSUPPORTED",
+            format!(
+                "subject {} turns a compartment off (`EVID=2` with a negative `CMT`), which {why}.",
+                subject.id
+            ),
+        )
+        .with_block(block)]
+    };
+    let Some(spec) = model.ode_spec.as_ref() else {
+        return refused(
+            "needs an `[odes]` model: write the system as `ode(states=[...])`",
+            "structural_model",
+        );
+    };
+    if model.is_sde() {
+        return refused("an SDE model cannot honour", "diffusion");
+    }
+    if crate::api::run::model_routes_rows_by_cmt(model) {
+        return refused(
+            "a model with a declared endpoint cannot honour",
+            "structural_model",
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum Event {
+        Reset,
+        Dose(usize),
+        Toggle(crate::types::CmtToggle),
+        Obs(usize),
+    }
+    let rank = |e: &Event| match e {
+        Event::Reset => 0,
+        Event::Dose(_) => 1,
+        Event::Toggle(_) => 2,
+        Event::Obs(_) => 3,
+    };
+    // The `TIME` as written. A subject built in memory carries no written times.
+    let written_at = |s: &crate::types::Subject, c: &crate::types::CmtToggle| {
+        let engine = s.pk_only_times[c.pk_only];
+        s.pk_only_raw_times
+            .get(c.pk_only)
+            .copied()
+            .unwrap_or(engine)
+    };
+    let mut diags = Vec::new();
+    for s in population.subjects.iter().filter(|s| s.has_cmt_toggles()) {
+        // Reachable only from a subject built in memory: the reader's indices are its own.
+        if let Some(c) = s
+            .cmt_toggles
+            .iter()
+            .find(|c| c.pk_only >= s.pk_only_times.len())
+        {
+            return vec![Diagnostic::error(
+                "E_CMT_TOGGLE_OUT_OF_RANGE",
+                format!(
+                    "subject {}: a compartment on/off record names pk-only row {}, but the \
+                     subject has {}.",
+                    s.id,
+                    c.pk_only,
+                    s.pk_only_times.len(),
+                ),
+            )
+            .with_block("odes")];
+        }
+        for c in s.cmt_toggles.iter().filter(|c| !c.on) {
+            let cmt = c.state + 1;
+            if c.state >= spec.n_states {
+                diags.push(
+                    Diagnostic::error(
+                        "E_CMT_TOGGLE_OUT_OF_RANGE",
+                        format!(
+                            "subject {}, time {}: `CMT=-{cmt}` turns off compartment {cmt}, but \
+                             the `[odes]` block declares only {} state(s) (CMT is 1-based: {:?}).",
+                            s.id,
+                            written_at(s, c),
+                            spec.n_states,
+                            spec.state_names,
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+            } else if spec.input_rate.iter().any(|f| f.cmt == c.state) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_CMT_TOGGLE_UNSUPPORTED",
+                        format!(
+                            "subject {}, time {}: `CMT=-{cmt}` turns off `{}`, which a built-in \
+                             absorption input feeds. Only a compartment dosed directly or fed by \
+                             its `d/dt` terms can be switched.",
+                            s.id,
+                            written_at(s, c),
+                            spec.state_names[c.state],
+                        ),
+                    )
+                    .with_block("odes"),
+                );
+            }
+        }
+        if !diags.is_empty() {
+            return diags;
+        }
+
+        let mut events: Vec<(f64, Event)> =
+            s.reset_times.iter().map(|&t| (t, Event::Reset)).collect();
+        events.extend(
+            s.doses
+                .iter()
+                .enumerate()
+                .map(|(k, d)| (d.time, Event::Dose(k))),
+        );
+        events.extend(
+            s.cmt_toggles
+                .iter()
+                .map(|&c| (s.pk_only_times[c.pk_only], Event::Toggle(c))),
+        );
+        events.extend(
+            s.obs_times
+                .iter()
+                .enumerate()
+                .map(|(j, &t)| (t, Event::Obs(j))),
+        );
+        events.sort_by(|a, b| a.0.total_cmp(&b.0).then(rank(&a.1).cmp(&rank(&b.1))));
+        // Two statuses, because a lagged dose separates them. `off` is what an observation is
+        // checked against, which a dose clears at its record. `held` is what the walk holds at
+        // zero, which it clears at the arrival. The arrival's time is a model parameter this
+        // check cannot read, so a lagged dose leaves `held` set until an on row or a reset.
+        let mut off: Vec<usize> = Vec::new();
+        let mut held: Vec<usize> = Vec::new();
+        let cutoffs = s.with_cmt_cutoffs();
+        for (t, event) in events {
+            match event {
+                Event::Reset => {
+                    off.clear();
+                    held.clear();
+                }
+                Event::Toggle(c) => {
+                    off.retain(|&x| x != c.state);
+                    held.retain(|&x| x != c.state);
+                    if !c.on {
+                        off.push(c.state);
+                        held.push(c.state);
+                    }
+                }
+                Event::Dose(k) => {
+                    let d = &s.doses[k];
+                    // Before the dose turns its own compartment on: an `SS=1` dose into an
+                    // off compartment is the same refusal.
+                    if d.ss && !held.is_empty() {
+                        diags.push(
+                            Diagnostic::error(
+                                "E_CMT_TOGGLE_SS",
+                                format!(
+                                    "subject {}, time {t}: an `SS=1` dose while `{}` is off, or \
+                                     may be: a lagged dose only turns a compartment on when it \
+                                     arrives. Turn the compartment on with an `EVID=2` row before \
+                                     the steady-state record, or off after it.",
+                                    s.id, spec.state_names[held[0]],
+                                ),
+                            )
+                            .with_block("odes"),
+                        );
+                        break;
+                    }
+                    // A dose an off row cancelled never arrives, so it turns nothing on. The
+                    // rest of an `ADDL` train stays in `doses` past that row.
+                    if d.time >= cutoffs.doses[k].off_at {
+                        continue;
+                    }
+                    off.retain(|&x| x != d.cmt_idx());
+                    if !model.has_lagtime_on_cmt(d.cmt_1based()) {
+                        held.retain(|&x| x != d.cmt_idx());
+                    }
+                }
+                Event::Obs(j) => {
+                    let cmt = s
+                        .obs_cmts
+                        .get(j)
+                        .copied()
+                        .unwrap_or(crate::io::datareader::DEFAULT_CMT);
+                    if cmt >= 1 && off.contains(&(cmt - 1)) {
+                        diags.push(
+                            Diagnostic::error(
+                                "E_OBS_CMT_OFF",
+                                format!(
+                                    "subject {}, time {}: an observation of compartment {cmt} \
+                                     (`{}`) while it is off. Turn it on before this record, or \
+                                     observe it before the off row.",
+                                    s.id,
+                                    s.obs_raw_times.get(j).copied().unwrap_or(t),
+                                    spec.state_names[cmt - 1],
+                                ),
+                            )
+                            .with_block("odes"),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    diags
+}
+
 /// Every dose must name a compartment the **analytical** engine can actually
 /// deliver it into (#375). The datareader cannot make this call — it has no
 /// model — and the parse-time infusable check
@@ -3286,10 +3525,19 @@ fn population_uses_analytical_pk(model: &CompiledModel, population: &Population)
 /// Reported once per `(kind, compartment)` so a dataset with many offending
 /// rows yields one actionable error per cause, matching
 /// [`check_modeled_dose_rates`].
+///
+/// Compartment on/off rows are checked first ([`check_cmt_toggles`]), so every entry point
+/// that validates its doses refuses what it cannot honour.
 pub(crate) fn check_dose_compartments(
     model: &CompiledModel,
     population: &Population,
 ) -> Vec<Diagnostic> {
+    // Ahead of everything else here, the compartment-free return below included: a model
+    // that cannot honour an off row must not run with the row ignored (#2732).
+    let toggle_diags = check_cmt_toggles(model, population);
+    if !toggle_diags.is_empty() {
+        return toggle_diags;
+    }
     // A compartment-free model (#811) applies no dose on any engine, and its
     // `pk_model` is the `one_cpt_iv` **placeholder** the parser installs for the
     // class — so a `CMT=2` dose would be rejected as out of that placeholder's
@@ -4514,28 +4762,54 @@ pub(crate) fn check_ctmm_records(
 }
 
 /// `E_LTBS_UNSUPPORTED` on block `error_model`: LTBS (`log_transform = true`) with an
-/// error model the log-scale likelihood cannot represent — a proportional or combined
-/// error, a per-CMT error spec, or an SDE (#1788). The parser refuses all three for a
-/// `.ferx` model, so only a hand-built `CompiledModel` reaches this; predictions would be
-/// log-wrapped while the variance still expects natural-scale `f`.
+/// error model the log-scale likelihood cannot represent — a proportional or (natural-scale)
+/// combined error on any endpoint, a covariate-selected error spec, or an SDE (#1788) —
+/// and the converse, a
+/// `LogCombined` error without LTBS (#2729), whose `exp(−f)` loading reads `f` as a log
+/// prediction. The parser refuses all of these for a `.ferx` model, so only a hand-built
+/// `CompiledModel` reaches this; predictions would be log-wrapped while the variance still
+/// expects natural-scale `f`, or the reverse.
 pub(crate) fn check_ltbs_model(model: &CompiledModel) -> Vec<Diagnostic> {
-    if !model.log_transform {
-        return Vec::new();
-    }
+    use crate::types::{ErrorModel, ErrorSpec};
     let mut diags = Vec::new();
     let mut refuse = |m: &str| {
         diags.push(Diagnostic::error("E_LTBS_UNSUPPORTED", m).with_block("error_model"));
     };
-    if !matches!(model.error_model, crate::types::ErrorModel::Additive) {
+    if !model.log_transform {
+        let log_combined = match &model.error_spec {
+            ErrorSpec::Single(em) => *em == ErrorModel::LogCombined,
+            ErrorSpec::PerCmt(m) | ErrorSpec::Selected { endpoints: m, .. } => {
+                m.values().any(|e| e.error_model == ErrorModel::LogCombined)
+            }
+        };
+        if log_combined || model.error_model == ErrorModel::LogCombined {
+            refuse(
+                "`error_model = LogCombined` requires LTBS (`log_transform = true`): its \
+                 additive part loads `exp(−f)`, which reads the prediction on the log scale",
+            );
+        }
+        return diags;
+    }
+    // Every endpoint is scored on the log scale (the log-wrap is model-wide), so each
+    // one's error model must be a log-scale one; per-CMT is fine on those terms (#2729).
+    let log_scale = |em: ErrorModel| matches!(em, ErrorModel::Additive | ErrorModel::LogCombined);
+    let all_log_scale = match &model.error_spec {
+        ErrorSpec::Single(em) => log_scale(*em) && log_scale(model.error_model),
+        ErrorSpec::PerCmt(m) | ErrorSpec::Selected { endpoints: m, .. } => {
+            m.values().all(|e| log_scale(e.error_model))
+        }
+    };
+    if !all_log_scale {
         refuse(
-            "LTBS (`log_transform = true`) requires `error_model = Additive`; \
-             proportional/combined error on the log scale is not supported",
+            "LTBS (`log_transform = true`) requires `error_model = Additive` or \
+             `LogCombined` on every endpoint; proportional/combined error on the log \
+             scale is not supported",
         );
     }
-    if !matches!(model.error_spec, crate::types::ErrorSpec::Single(_)) {
+    if matches!(model.error_spec, ErrorSpec::Selected { .. }) {
         refuse(
-            "LTBS (`log_transform = true`) is not supported with per-CMT \
-             (`ErrorSpec::PerCmt`) error models",
+            "LTBS (`log_transform = true`) is not supported with covariate-selected \
+             (`ErrorSpec::Selected`) error models",
         );
     }
     if model.diffusion_theta_start.is_some() {
@@ -4826,7 +5100,7 @@ pub(crate) fn check_survival_tv_covariates(
                         return refuse(
                             "binary_model",
                             format!(
-                                "[binary_model] on CMT={cmt}: the logit predictor references \
+                                "[binary_model] on CMT={cmt}: the linear predictor references \
                                  {}, which is time-varying for subject `{}`, but that subject \
                                  carries no per-record covariate snapshot aligned with its \
                                  binary records (it also has time-to-event records, or was \
@@ -6006,6 +6280,7 @@ pub(crate) fn check_profiled_levels(
     if let Some(em) = models.iter().find(|e| !matches!(e, ErrorModel::Additive)) {
         let name = match em {
             ErrorModel::Proportional => "proportional (or power)",
+            ErrorModel::LogCombined => "log_combined",
             _ => "combined",
         };
         out.push(refuse(
@@ -9096,6 +9371,7 @@ pub(crate) fn check_model_data_warnings_rule(
     // Warning half of the kappa-weight check (#1031) — a sample-size weight that
     // moves within an occasion. The error half rides the fatal list.
     diags.extend(check_kappa_weight_variation(model, population));
+    diags.extend(output_mixnum_is_class(model, population));
     diags.extend(residual_correlation_inert(model, population));
     diags.extend(residual_correlation_partly_confounded(
         model, population, iov_rule,
@@ -10199,6 +10475,20 @@ pub(crate) fn check_nn_input_scale(
 /// carries verbatim (the `W_…` token, or a pinned phrase), so a reworded warning
 /// falls through to the generic `W_PARSE` rather than silently mislabelling —
 /// which is why the codes are asserted at both ends.
+/// One parse warning as a check-report [`Diagnostic`]. A deprecated block
+/// (#2913) carries its block and line, read back out of the message the way
+/// [`parse_error_to_diagnostic`] reads the block-header errors; every other
+/// warning keeps its full text under the code [`parse_warning_to_code`] picks.
+fn parse_warning_to_diagnostic(w: &str) -> Diagnostic {
+    let code = parse_warning_to_code(w);
+    match w.strip_prefix(crate::parser::model_parser::DEPRECATED_BLOCK_PREFIX) {
+        Some(rest) if code == crate::parser::model_parser::DEPRECATED_BLOCK_CODE => {
+            locate(Diagnostic::warning(code, String::new()), w, rest)
+        }
+        _ => Diagnostic::warning(code, w.to_string()),
+    }
+}
+
 fn parse_warning_to_code(w: &str) -> &'static str {
     if w.contains("declared in [parameters] but not referenced") {
         "W_UNUSED_PARAM"
@@ -10208,6 +10498,8 @@ fn parse_warning_to_code(w: &str) -> &'static str {
         "W_DERIVED_STEP_IGNORED"
     } else if w.contains("W_ABSORPTION_TWIN_DECLINED") {
         "W_ABSORPTION_TWIN_DECLINED"
+    } else if w.contains(crate::parser::model_parser::DEPRECATED_BLOCK_CODE) {
+        crate::parser::model_parser::DEPRECATED_BLOCK_CODE
     } else {
         "W_PARSE"
     }
@@ -10219,7 +10511,7 @@ fn parse_warning_to_code(w: &str) -> &'static str {
 /// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993), the
 /// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001), the
 /// scale tag on a `block_*` declaration (→ `E_BLOCK_VARIANCE_ONLY`, #1377), and
-/// the block-header shapes (→ `E_UNKNOWN_BLOCK` / `E_DEPRECATED_BLOCK` /
+/// the block-header shapes (→ `E_UNKNOWN_BLOCK` /
 /// `E_BLOCK_INSTANCE_NAME` / `E_BLOCK_FEATURE_DISABLED`, #1040); everything else is
 /// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
 /// pinned to by a test, so a reworded message cannot silently fall through to the
@@ -10353,13 +10645,6 @@ pub(crate) fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
             d = d.with_suggestion(format!("did you mean `[{near}]`?"));
         }
         return locate(d, err, rest);
-    }
-    if let Some(rest) = err.strip_prefix("Deprecated block `[") {
-        return locate(
-            Diagnostic::error("E_DEPRECATED_BLOCK", String::new()),
-            err,
-            rest,
-        );
     }
     if let Some(rest) = err.strip_prefix("Block `[") {
         // Match each shape on its own sentinel rather than letting one be the
@@ -10553,7 +10838,7 @@ pub fn validate_model_file_with(
     //     context in the message text; we use W_PARSE as the generic code here
     //     rather than a narrower code that would mislabel unrelated warnings.
     for w in &parsed.model.parse_warnings {
-        diags.push(Diagnostic::warning(parse_warning_to_code(w), w.clone()));
+        diags.push(parse_warning_to_diagnostic(w));
     }
 
     // 2b. Model / estimation-option compatibility (data-independent): catches
@@ -10882,6 +11167,34 @@ pub(crate) fn bind_for_check(
     crate::api::covariate_stats::bind_covariate_stats_diag(parsed, model_text, population)
 }
 
+/// `W_OUTPUT_MIXNUM_IS_CLASS` (#2784): `[output] MIXNUM` on a `[mixture]` model whose
+/// data also carry a `MIXNUM` column. The sdtab column is the class, so a user who listed
+/// it expecting their covariate is told. A data column of that name is unreachable from
+/// the model already (an expression reads the built-in). In the warning bundle
+/// ([`check_model_data_warnings`]) so `fit()` reports it as `ferx check` does.
+pub(crate) fn output_mixnum_is_class(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<Diagnostic> {
+    let col = model
+        .output_columns
+        .iter()
+        .find(|c| super::output_columns::is_mixture_class_column(model, c))?;
+    let data_col = population
+        .covariate_names
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case(col))?;
+    Some(Diagnostic::warning(
+        "W_OUTPUT_MIXNUM_IS_CLASS",
+        format!(
+            "W_OUTPUT_MIXNUM_IS_CLASS: [output] column `{col}` on a [mixture] model is the \
+             mixture class (the simulated class where the data were drawn under one, else \
+             the fitted MIXEST), as NONMEM's `$TABLE MIXNUM` is; it is not the data column \
+             `{data_col}`. Rename that column to write it to sdtab"
+        ),
+    ))
+}
+
 /// Validate `model.output_columns` against known quantities, emitting
 /// `W_OUTPUT_DUPLICATE` and `E_OUTPUT_UNKNOWN_COLUMN` diagnostics.
 pub fn validate_output_columns(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
@@ -10913,6 +11226,12 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
             continue;
         }
+        // `MIXNUM` on a `[mixture]` model is the class (#2784), whatever the data carry;
+        // a data column of that name is reported by `output_mixnum_is_class`, from the
+        // warning bundle `fit()` reports, not from this list `fit()` reads error-first.
+        if super::output_columns::is_mixture_class_column(model, col) {
+            continue;
+        }
         // Valid if it's a covariate, indiv param, or derived name. Synthetic
         // readout parameters (`__ferx_ro_*`, #486) are internal — not user-requestable.
         let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
@@ -10932,6 +11251,9 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             );
             candidates.extend(derived_names.iter().copied());
             candidates.extend(OUTPUT_MANDATORY.iter().copied());
+            if model.mixture.is_some() {
+                candidates.push(super::output_columns::MIXNUM_COLUMN);
+            }
             diags.push(Diagnostic::error(
                 "E_OUTPUT_UNKNOWN_COLUMN",
                 format!(

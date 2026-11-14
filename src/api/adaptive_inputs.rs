@@ -290,7 +290,7 @@ impl SuppliedEtas {
 }
 
 /// At most 10 IDs, then a count of the rest.
-fn list_ids(ids: &[&str]) -> String {
+pub(crate) fn list_ids(ids: &[&str]) -> String {
     const SHOWN: usize = 10;
     let head = ids
         .iter()

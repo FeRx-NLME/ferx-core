@@ -51,8 +51,9 @@ likewise the set *this* build accepts, so a default build does not advertise
 `[initial_values]` is **not** a block. Initial estimates are declared inline in
 `[parameters]` (`theta NAME(init, lower, upper)`, `omega NAME ~ variance`); the
 separate block predates that and has not been read for several releases. A file
-still carrying one is now rejected with `E_DEPRECATED_BLOCK` naming the
-replacement — delete the block.
+still carrying one parses, with a `W_DEPRECATED_BLOCK` warning naming the
+replacement: the block's contents are ignored, exactly as they have been for
+several releases, so deleting it cannot change the fit — delete the block.
 
 ## Model name
 

@@ -139,14 +139,9 @@ fn wrapper_calls(src: &str) -> Vec<(usize, String)> {
 const ALLOWED: &[(&str, &str, &str)] = &[
     // Reporting: the `block_sigma` ρ is reported as its own block (a serial ρ is a θ).
     (
-        "src/io/output.rs",
-        "if !result.residual_correlations.is_empty() {",
-        "reports the block_sigma rows",
-    ),
-    (
-        "src/io/fitrx.rs",
-        "let residual_correlation_fixed_resolved = if w.sigma.residual_correlations.is_empty() {",
-        "round-trips the block_sigma FIX flags",
+        "src/io/output_estimates.rs",
+        "if result.residual_correlations.is_empty() {",
+        "block_sigma_section: reports the block_sigma rows (moved from output.rs, #2911)",
     ),
     (
         "src/estimation/uncertainty_samples.rs",

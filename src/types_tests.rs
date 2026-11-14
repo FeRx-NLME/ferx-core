@@ -225,6 +225,7 @@ fn sim_residual_variance_splits_frem_rows_from_pk_error() {
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0, 0],
         occasions: vec![],
         obs_l2: Vec::new(),
@@ -285,6 +286,7 @@ fn sim_residual_variance_applies_custom_magnitude() {
         pk_only_covariates: vec![],
         reset_times: vec![],
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0],
         occasions: vec![],
         obs_l2: Vec::new(),
@@ -764,7 +766,10 @@ fn classify_warning_covariance_prefix_does_not_claim_convergence() {
         "Outer optimization did not converge".to_string(),
         "[FOCEI] Outer optimization did not converge".to_string(),
         crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string(),
-        "Gauss-Newton: max iterations reached without convergence".to_string(),
+        crate::estimation::gauss_newton::GN_BUDGET_WARNING.to_string(),
+        // #1049: the collapse stops are non-convergence too, so they file with it.
+        crate::estimation::gauss_newton::GN_COLLAPSE_WARNING.to_string(),
+        crate::estimation::gauss_newton::GN_DEGENERATE_COLLAPSE_WARNING.to_string(),
         // trust_region.rs, the four forms.
         "Trust-region did not converge: reached the iteration budget (maxiter = 50). The \
          estimates and any standard errors are reported at a non-stationary point; raise \
@@ -932,6 +937,30 @@ fn classify_warning_dw_is_warning() {
     let w = classify_warning("Positive IWRES autocorrelation detected (Durbin-Watson = 1.20).");
     assert_eq!(w.severity, WarningSeverity::Warning);
     assert_eq!(w.category.as_str(), "dw_autocorrelation");
+}
+
+/// #2798: every positive-DW message, whatever the model class, lands in
+/// `dw_autocorrelation`. The compartment-free text reaches that arm only after
+/// ~60 earlier ones, so a wording that hits one of their keys (`degenerate`,
+/// `did not converge`, `covariance step`, …) would silently re-file it; ferx-r
+/// classifies through this same function. The full messages, not a prefix.
+#[test]
+fn classify_warning_dw_advice_messages_are_dw() {
+    use crate::api::{dw_autocorrelation_warning, DwAdvice};
+    for advice in [
+        DwAdvice::Compartmental,
+        DwAdvice::Algebraic { group: None },
+        DwAdvice::Algebraic {
+            group: Some("ARM".into()),
+        },
+    ] {
+        for dw in [1.2, 2.8] {
+            let msg = dw_autocorrelation_warning(dw, &advice).expect("outside the band");
+            let w = classify_warning(&msg);
+            assert_eq!(w.severity, WarningSeverity::Warning, "{msg}");
+            assert_eq!(w.category.as_str(), "dw_autocorrelation", "{msg}");
+        }
+    }
 }
 
 /// #2041: the reader's missing-covariate warning is `data_quality` on its token,
@@ -1419,14 +1448,14 @@ fn classify_warning_roundtrips_every_engine_message() {
         ("cancelled by user", Info, "cancelled"),
         // -- gauss_newton.rs -------------------------------------------
         (
-            "Gauss-Newton: trust radius collapsed",
-            Warning,
-            "optimizer_health",
+            "Gauss-Newton: trust radius collapsed without convergence",
+            Critical,
+            "convergence",
         ),
         (
-            "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed",
-            Warning,
-            "optimizer_health",
+            "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed without convergence",
+            Critical,
+            "convergence",
         ),
         (
             "Gauss-Newton: max iterations reached without convergence",
@@ -1594,12 +1623,13 @@ fn classify_warning_roundtrips_every_engine_message() {
             "mu_referencing",
         ),
         (
-            "Multi-start: best result from start 3/8",
+            "Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 3); \
+             all 8 converged starts within 1.0 of best (range 0.0000)",
             Info,
             "multi_start",
         ),
         (
-            "12 threads configured but only 10 subject(s)",
+            "12 threads configured (engine default) but only 10 subject(s)",
             Info,
             "threads",
         ),
@@ -2562,6 +2592,7 @@ fn bare_subject(id: &str) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: Vec::new(),
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -3980,6 +4011,119 @@ fn eval_only_trailing_stage_leaves_the_covariance_step_on_bayes() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  #2717 — MCEM-only `imp` keys under `imp_eval_only`
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `imp_eval_only` on `chain`, with `(key, value)` applied the way a model file or
+/// ferx-r applies them, so `user_set_keys` is the parser's rather than hand-written.
+fn eval_only_opts(chain: &[EstimationMethod], keys: &[(&str, &str)]) -> FitOptions {
+    let mut opts = FitOptions {
+        methods: chain.to_vec(),
+        imp_eval_only: true,
+        ..FitOptions::default()
+    };
+    for (key, value) in keys {
+        crate::parser::model_parser::apply_fit_option(&mut opts, key, value)
+            .expect("the option parses");
+    }
+    opts
+}
+
+const EVAL_CHAIN: [EstimationMethod; 2] = [EstimationMethod::FoceI, EstimationMethod::Imp];
+
+/// Every sentence of each message, and the set and unset cases of each option. `imp_auto`
+/// defaults to `true`, so `unset` is what catches a rule keyed on the value.
+#[test]
+fn eval_only_iscale_keys_warn_when_set_and_only_then() {
+    assert!(eval_only_opts(&EVAL_CHAIN, &[])
+        .unsupported_keys_warnings()
+        .is_empty());
+    for (key, other) in [("iscale_min", "iscale_max"), ("iscale_max", "iscale_min")] {
+        let w = eval_only_opts(&EVAL_CHAIN, &[(key, "5")]).unsupported_keys_warnings();
+        assert_eq!(
+            w,
+            vec![format!(
+                "fit option `{key}` bounds the proposal-scale search of the estimating IMP \
+                 iterations, but `imp_eval_only` runs an evaluation, which does not search \
+                 a scale, so it has no effect. An evaluation's proposal is adapted only by \
+                 `imp_adapt_passes`."
+            )]
+        );
+        assert!(!w[0].contains(other), "{}", w[0]);
+    }
+}
+
+#[test]
+fn eval_only_imp_auto_warns_when_set_to_either_value_and_only_then() {
+    let unset = eval_only_opts(&EVAL_CHAIN, &[]);
+    assert!(
+        unset.imp_auto,
+        "the unset case must hold the default `true`"
+    );
+    assert!(unset.unsupported_keys_warnings().is_empty());
+    for value in ["true", "false"] {
+        let w = eval_only_opts(&EVAL_CHAIN, &[("imp_auto", value)]).unsupported_keys_warnings();
+        assert_eq!(
+            w,
+            vec![
+                "fit option `imp_auto` adapts the sample count of the estimating IMP \
+                 iterations, but `imp_eval_only` runs an evaluation, which draws a fixed \
+                 `imp_samples` per subject in each pass, so it has no effect. Raise \
+                 `imp_samples` to lower the evaluation's Monte-Carlo error."
+                    .to_string()
+            ],
+            "imp_auto = {value}"
+        );
+    }
+}
+
+/// The estimating path reads all three, so the pair straddles `imp_eval_only`.
+#[test]
+fn estimating_imp_keeps_the_mcem_keys_quiet() {
+    let keys = [
+        ("iscale_min", "5"),
+        ("iscale_max", "5"),
+        ("imp_auto", "false"),
+    ];
+    let evaluating = eval_only_opts(&[EstimationMethod::Imp], &keys);
+    assert_eq!(evaluating.unsupported_keys_warnings().len(), 3);
+    let estimating = FitOptions {
+        imp_eval_only: false,
+        ..evaluating
+    };
+    assert!(estimating.unsupported_keys_warnings().is_empty());
+}
+
+/// `[impmap, imp]`: IMPMAP reads `iscale_*`, so calling them inert would be false, while
+/// it reads `impmap_auto` rather than `imp_auto`, so that one stays inert.
+#[test]
+fn eval_only_notice_skips_a_key_an_impmap_stage_reads() {
+    let w = eval_only_opts(
+        &[EstimationMethod::Impmap, EstimationMethod::Imp],
+        &[("iscale_min", "5"), ("imp_auto", "false")],
+    )
+    .unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].starts_with("fit option `imp_auto`"), "{}", w[0]);
+}
+
+/// With no `imp` stage the key is unknown to the chain: one warning, the general one.
+#[test]
+fn eval_only_notice_leaves_a_chain_without_imp_to_the_general_warning() {
+    let w = eval_only_opts(&[EstimationMethod::FoceI], &[("iscale_min", "5")])
+        .unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+    assert!(w[0].contains("is not used by method"), "{}", w[0]);
+}
+
+#[test]
+fn eval_only_notice_is_issued_once_per_key() {
+    let w = eval_only_opts(&EVAL_CHAIN, &[("imp_auto", "true"), ("imp_auto", "false")])
+        .unsupported_keys_warnings();
+    assert_eq!(w.len(), 1, "{w:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  #1382 — one spelling for the covariance estimator
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4461,4 +4605,201 @@ fn retain_records_keeps_the_record_snapshots_aligned() {
     };
     bare.retain_records(|_| false);
     assert!(bare.obs_records.is_empty() && bare.endpoint_covariates.is_empty());
+}
+
+/// #2741 T12: `time_after_dose(j)` is a thin wrapper over the time-keyed
+/// `time_after_dose_at`, bit for bit, on every fixture of
+/// `subject_time_after_dose_is_the_data_tad` (Pharmpy same-time grouping, group 0,
+/// SS with and without a preceding dose). Regression: a `j` wrapper that diverges
+/// from `*_at` (the assay reads `*_at`, every estimator reads the wrapper).
+#[test]
+fn time_after_dose_is_its_time_keyed_twin_bit_for_bit() {
+    let d = |t: f64, ss: bool, ii: f64| DoseEvent::new(t, 100.0, 1, 0.0, ss, ii);
+    let fixtures = [
+        Subject {
+            id: "1".into(),
+            doses: vec![d(0.0, false, 0.0), d(24.0, false, 0.0)],
+            obs_times: vec![-1.0, 0.0, 2.0, 23.9, 24.0, 30.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "4".into(),
+            doses: vec![d(10.0, false, 0.0)],
+            pk_only_times: vec![-3.0],
+            obs_times: vec![-2.0, 0.0, 10.0, 12.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "5".into(),
+            obs_times: vec![0.0, 4.0, 9.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "2".into(),
+            doses: vec![d(0.0, true, 12.0)],
+            obs_times: vec![0.0, 26.0],
+            ..Default::default()
+        },
+        Subject {
+            id: "3".into(),
+            doses: vec![d(0.0, false, 0.0), d(48.0, true, 12.0)],
+            obs_times: vec![48.0],
+            ..Default::default()
+        },
+    ];
+    let mut n = 0;
+    for s in &fixtures {
+        for (j, &t) in s.obs_times.iter().enumerate() {
+            let (by_row, by_time) = (s.time_after_dose(j), s.time_after_dose_at(t));
+            assert!(by_row.is_finite(), "subject {} obs {j}: {by_row}", s.id);
+            assert_eq!(
+                by_row.to_bits(),
+                by_time.to_bits(),
+                "subject {} obs {j}",
+                s.id
+            );
+            n += 1;
+        }
+        assert!(
+            s.time_after_dose(s.obs_times.len()).is_nan(),
+            "out of range stays NaN"
+        );
+    }
+    assert_eq!(n, 16, "every fixture row was compared");
+}
+
+/// #2741 T6: at a decision time with no record there, `time_after_dose_at` folds the
+/// time itself into group 0's earliest record, so a decision at `0` on records from
+/// `1` reads `0` (by hand: no dose, no earlier record, the decision is its own group-0
+/// start), and one at `5` reads `5 − 1 = 4`. Regression: `obs_t` left out of the minimum,
+/// which reads `0 − 1 = −1` at the first decision.
+#[test]
+fn time_after_dose_at_a_decision_before_every_record_is_zero() {
+    let s = Subject {
+        id: "1".into(),
+        doses: vec![DoseEvent::new(8.0, 100.0, 1, 0.0, false, 0.0)],
+        obs_times: vec![1.0, 6.0],
+        ..Default::default()
+    };
+    assert_eq!(
+        s.time_after_dose_at(0.0),
+        0.0,
+        "decision before every record"
+    );
+    assert_eq!(
+        s.time_after_dose_at(5.0),
+        4.0,
+        "decision after the first record"
+    );
+    assert_eq!(
+        s.time_after_dose_at(8.0),
+        0.0,
+        "at the first dose: that dose's"
+    );
+}
+
+/// #2799: the multi-start notes `fit()` appends to the returned run classify `(Info,
+/// MultiStart)` whatever sibling-start error text they interpolate. Each phrase below is one a
+/// Critical prose arm claims on its own (convergence, covariance failure, condition number), and
+/// the control row shows that phrase *without* the prefix still lands Critical, so the pair
+/// straddles the arm. Mutation: delete the `multi-start:` prefix arm → every prefixed row
+/// classifies Critical and this test names it.
+#[test]
+fn multi_start_notes_classify_info_whatever_error_text_they_carry() {
+    let embedded = [
+        "Outer optimizer did not converge after 3 iterations",
+        "Covariance step failed: Hessian is not positive definite",
+        "Covariance step: Hessian is not positive definite",
+        "condition number 3.2e9 exceeds 1e6",
+        "optimizer stopped without converging (Failure)",
+    ];
+    for phrase in embedded {
+        let bare = classify_warning(phrase);
+        assert_eq!(
+            bare.severity,
+            WarningSeverity::Critical,
+            "control: `{phrase}` must be Critical on its own, or this row tests nothing"
+        );
+        for msg in [
+            format!("Multi-start: 1 of 4 starts failed: start 2: {phrase}"),
+            format!("[FOCEI] Multi-start: 2 of 3 starts failed: x; {phrase}"),
+        ] {
+            let w = classify_warning(&msg);
+            assert_eq!(
+                (w.severity, w.category),
+                (WarningSeverity::Info, WarningCode::MultiStart),
+                "{msg}"
+            );
+        }
+    }
+    // #2867: the summary line says "not converged" of the starts that were not returned, and
+    // stays informational for the same reason.
+    for msg in [
+        "Multi-start: 4 starts, 4 converged; best OFV 123.4560 (start 2); \
+         all 4 converged starts within 1.0 of best (range 0.0000)",
+        "Multi-start: 4 starts, 2 converged, 2 not converged; best OFV 123.4560 (start 2); \
+         all 2 converged starts within 1.0 of best (range 0.0000); \
+         1 not converged at a lower OFV: start 3 (-3.21)",
+    ] {
+        let best = classify_warning(msg);
+        assert_eq!(
+            (best.severity, best.category),
+            (WarningSeverity::Info, WarningCode::MultiStart),
+            "{msg}"
+        );
+    }
+    // The no-run-converged note is a real verdict on the returned run and keeps its class.
+    let none = classify_warning(
+        "No multi-start run converged (4 starts); returning best OFV from start 2",
+    );
+    assert_eq!(
+        (none.severity, none.category),
+        (WarningSeverity::Critical, WarningCode::Convergence)
+    );
+}
+
+/// #2799: `FitOptions::evaluation_only_run`, the source of `FitResult::evaluation_only`. Every
+/// stage must be an evaluator: `maxiter = 0` on a method that reads it as `MAXEVAL=0` (FOCE,
+/// FOCEI, Laplace, pure GN), or a standalone `imp_eval_only` / `agq_eval_only`. SAEM, IMP,
+/// IMPMAP, Bayes, VI and the GN hybrid (fixed 100-eval polish) search regardless, so
+/// `maxiter = 0` on them is not evaluation-only; one estimating stage in a chain makes the run
+/// estimate. Mutation: widen the method list to any method → the SAEM/VI/hybrid rows; drop the
+/// `eval_only_methods` arm → the IMP/AGQ rows.
+#[test]
+fn evaluation_only_run_reads_each_estimators_own_meaning_of_maxiter_zero() {
+    use EstimationMethod::*;
+    let opts = |methods: &[EstimationMethod], maxiter: usize, imp: bool, agq: bool| FitOptions {
+        method: methods[methods.len() - 1],
+        methods: if methods.len() > 1 {
+            methods.to_vec()
+        } else {
+            Vec::new()
+        },
+        outer_maxiter: maxiter,
+        imp_eval_only: imp,
+        agq_eval_only: agq,
+        ..FitOptions::default()
+    };
+    #[rustfmt::skip]
+    let rows: Vec<(&str, FitOptions, bool)> = vec![
+        ("foce maxiter 0", opts(&[Foce], 0, false, false), true),
+        ("focei maxiter 0", opts(&[FoceI], 0, false, false), true),
+        ("laplace maxiter 0", opts(&[Laplace], 0, false, false), true),
+        ("pure gn maxiter 0", opts(&[FoceGn], 0, false, false), true),
+        ("focei maxiter 500", opts(&[FoceI], 500, false, false), false),
+        ("gn hybrid maxiter 0", opts(&[FoceGnHybrid], 0, false, false), false),
+        ("saem maxiter 0", opts(&[Saem], 0, false, false), false),
+        ("imp maxiter 0", opts(&[Imp], 0, false, false), false),
+        ("impmap maxiter 0", opts(&[Impmap], 0, false, false), false),
+        ("bayes maxiter 0", opts(&[Bayes], 0, false, false), false),
+        ("vi maxiter 0", opts(&[Vi], 0, false, false), false),
+        ("standalone imp_eval_only", opts(&[Imp], 500, true, false), true),
+        ("standalone agq_eval_only", opts(&[Laplace], 500, false, true), true),
+        ("focei then imp_eval_only", opts(&[FoceI, Imp], 500, true, false), false),
+        ("focei maxiter 0 then imp_eval_only", opts(&[FoceI, Imp], 0, true, false), true),
+        ("saem then focei, maxiter 0", opts(&[Saem, FoceI], 0, false, false), false),
+    ];
+    for (name, o, want) in rows {
+        assert_eq!(o.evaluation_only_run(), want, "{name}");
+    }
 }

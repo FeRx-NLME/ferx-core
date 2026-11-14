@@ -126,6 +126,19 @@ assumption has failed and following the SE would only walk K to the cap. On
 product falls back, rises resume. A fit that ends noisy after this stop says so in
 its warnings, and a larger `imp_samples` is unlikely to help it.
 
+A subject whose importance weights are degenerate, with ESS below 2 because one draw
+carries all the weight or because its sampler failed, adds about 1 to the variance
+sum whatever K is. One such subject keeps the per-subject SE above 0.05 for any N
+below 1600, so it could ramp every subject to the cap without improving itself. A
+degenerate subject still counts at first, since a proposal that only undersamples
+the posterior recovers as K grows. It is left out of the decision once, over consecutive
+degenerate iterations, K has risen above the lowest K of that run and the subject is
+still degenerate; a lowering of K does not count. A failed subject is left out at
+once. When the set left out changes, the five-iteration SE window is recomputed
+without them, so they stop driving rises straight away. The fit's warning names the subjects left out at the
+final iteration: they need a better proposal (check their EBE and Hessian), not more
+samples. The reported MC SE still includes them.
+
 The per-subject form keeps the rule from ramping a large
 dataset purely because it has more subjects, since the total SE grows as √N. NONMEM's
 `AUTO` targets the total: `STDOBJ = 1.0` corresponds to 0.05 only near N = 400. With
@@ -149,7 +162,9 @@ the limit stops there and keeps its result:
 
 - The estimate is the mean of the averaging iterations reached, or the last iteration's
   parameters if the averaging window had not started.
-- `converged` is `false`, and a warning gives the iteration reached.
+- `converged` is `false`, and a warning gives the iteration reached. The
+  [settling check](#not-settled) does not run, since the run did not reach its iteration
+  limit.
 - The post-fit work still runs: final EBEs, the covariance step if enabled, and the
   marginal evaluation. It is not counted against the limit, so set `covariance = false`
   if the budget is tight.
@@ -275,6 +290,15 @@ on 6 threads). `imp_adapt_passes = 0` restores the single Laplace proposal with
 `imp_defensive_alpha` as set. On a FREM Rao-Blackwellised subject the prior
 component applies but the pilots do not run; its low-dimensional conditional
 proposal is already well matched.
+
+An evaluation does not use the options that adapt the MCEM iterations. It draws
+at a proposal scale of 1, so `iscale_min` and `iscale_max` have no effect, and it
+draws a fixed `imp_samples` in each pass, so `imp_auto` has no effect either.
+Setting any of the three under `imp_eval_only` draws a warning. An evaluation's
+proposal follows `imp_adapt_passes`, `imp_proposal_df` and `imp_defensive_alpha`,
+and its Monte-Carlo error falls as `imp_samples` rises. In
+`method = [impmap, imp]` the IMPMAP stage still reads `iscale_*`, so those two
+draw no warning there.
 
 ### Why a proposal built at the mode reads high
 
@@ -423,7 +447,8 @@ $$
 ## When the marginal shows a collapse {#marginal-collapse}
 
 IMP and IMPMAP run a fixed iteration schedule, so `converged` has no stopping
-test to report. It rests on the objectives instead. `ofv` is a Laplace pass, which
+test to report. It rests on the objectives instead, and on the check in
+[When the objective has not settled](#not-settled). `ofv` is a Laplace pass, which
 can look sane on a run that has collapsed, so `fit()` also checks the marginal
 in `importance_sampling.minus2_log_likelihood` and reports `converged: false` in
 two cases (#2652):
@@ -444,6 +469,72 @@ The rise check needs an estimating IMP / IMPMAP stage and a published marginal. 
 the marginal pass was skipped, a warning says so and this check does not run. The
 marginal is computed after the last estimating stage, so a trailing `agq_eval_only`
 readout replaces `ofv` and leaves both checks in force.
+
+## When the objective has not settled {#not-settled}
+
+Every IMP and IMPMAP run stops at its iteration limit, finished or not. So `fit()`, and
+a direct `run_imp` or `run_impmap` call, check the end of the iteration trace, and report
+`converged: false` with `W_MCEM_NOT_SETTLED` when it shows the run had not finished
+(#2686).
+
+The check reads the objective's *floor*: the lower 10% point of the last 50 iterations.
+A shorter run uses windows of a third of its length, so it never reads the first third,
+where a cold start descends. A gap counts when it exceeds both 3.84, one likelihood-ratio
+step, and 4 Monte-Carlo SEs. Each side brings its own SE, taken as a window's median, and
+they combine as independent estimates. That matters under `imp_auto`: an earlier window
+can have sampled less than the last one, and the final pass does not inherit a ramped-up
+sample count. Fewer samples also raise the objective, by about SE²/4, so that excess comes
+off a fall before it is tested.
+
+| What the floor shows | What it means | What to do |
+|---|---|---|
+| It fell from the window before | The run needed more iterations | Raise `imp_iterations` (`impmap_iterations`) |
+| It stayed above the final marginal | The iterations were not sampling the posterior well | Raise `imp_samples` (`impmap_samples`), use a heavy-tailed proposal (`imp_proposal_df`, `impmap_proposal_df`), or chain a FOCE/FOCEI stage first |
+
+The second test needs the marginal, so it does not run if the marginal pass was skipped.
+
+The check reads the floor and not the spread because a failed proposal misses posterior
+mass, which only ever raises an iteration's objective. A `normal` proposal makes large
+upward excursions on runs whose estimates are fine, so a wide trace alone proves nothing.
+
+The bounds were measured on Linux, on the six models of a comparison with NONMEM, at
+K = 1000 and 200 iterations. On healthy runs the floor fell by at most 1.78, and sat at
+most 3.86 above the marginal, which is 1.5 Monte-Carlo SEs. The two cold runs that
+NONMEM's own evaluator scored short of the optimum read 30.5 (vancomycin, falling) and
+42.4 (cefepime, above the marginal). With `imp_auto` on, the same cold runs mostly reach
+the optimum: eleven of the twelve finished, including three whose K moved inside
+the windows, and none was demoted. The widest fall was 2.16. The twelfth, cefepime with a
+`normal` proposal, did not finish in the time allowed.
+
+A run of fewer than 30 iterations is too short to test. It keeps its verdict and gets
+`W_MCEM_SETTLING_UNTESTED`, which says `converged` then only means the run did not
+diverge.
+
+A longer run whose trace cannot be read is another matter. If either window has fewer
+than 10 finite objectives or SEs, those iterations produced no usable likelihood, so the
+fit is reported `converged: false` with `W_MCEM_NOT_SETTLED`, `reason: unusable_trace`.
+
+## When the M-step leaves a parameter behind {#mstep-frozen}
+
+σ, and any θ the closed-form shift does not own, are updated by a BOBYQA solve of the
+importance-weighted observation likelihood. Two checks read what that solve did (#2718).
+
+`W_MCEM_MSTEP_FROZEN` names a parameter the solve never moved although it should have. The
+parameter ended the run within 1e-6 of where the solve first took it up, in packed units,
+and after the last solve a step along it alone, of 0.1 or a quarter of a narrower interval,
+still lowered −2 log L by more than 3.84, one likelihood-ratio step. The value reported is
+then a starting value, so the fit is `converged: false`. A parameter that starts near its
+optimum, sits on a bound with its optimum outside, or barely affects the objective does not
+trigger this, and nor does one the closed-form shift owns or that is `FIX`. A run stopped by `imp_max_time` is not judged.
+
+The objective cannot show this, because Ω keeps absorbing the misfit and the objective
+keeps falling, so the settling check above does not see it. To clear the warning, start
+closer, mu-reference the parameters so the closed-form shift owns them, or chain a
+FOCE/FOCEI stage first.
+
+`W_MCEM_MSTEP_FAILED` says NLopt failed at least one solve, for a reason other than
+roundoff, and also reports `converged: false`, whether or not the parameters moved. It
+points at a solver fault rather than the data, so please report it.
 
 ## Defensive mixture {#defensive-mixture}
 
@@ -479,8 +570,9 @@ Practical notes:
   [adaptive evaluation](#adaptive-evaluation) always keeps at least $\alpha = 0.1$.
 - **It bounds the weights, not the raw ESS.** A sharp interior likelihood spike
   can still keep ESS low; the mixture only guarantees no single sample runs away.
-- **Complementary to the ISCALE pilot search, not redundant with it.** The
-  per-subject ISCALE search (`iscale_min`/`iscale_max`) already rescues *many*
+- **Complementary to the ISCALE pilot search, not redundant with it.** During the
+  MCEM iterations, the per-subject ISCALE search (`iscale_min`/`iscale_max`) already
+  rescues *many*
   collapses by isotropically rebroadening a too-narrow proposal, and with it on the
   mixture is often unnecessary. But ISCALE applies a single scalar to the whole
   proposal covariance: it cannot cover a proposal that is badly *centred* or wrong
@@ -540,6 +632,10 @@ whose minimum can sit far from the `imp` estimate on such a model (#1781). See
 when it applies, the measured effect, and the warnings it carries.
 
 ## Cost
+
+An estimating iteration adds a weighted M-step to the sampling below. That solve runs on
+the θ and σ the closed-form shift does not own, and its evaluation budget grows with their
+number.
 
 K × n_subjects predict calls per pass, and an evaluation runs
 `imp_adapt_passes + 1` passes. For warfarin (32 subjects) with K=2000 and the

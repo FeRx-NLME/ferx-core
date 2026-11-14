@@ -356,7 +356,8 @@ See [Output Files](output.qmd) for detailed format descriptions.
 Pass `--output run.fitrx` to additionally write a portable `.fitrx` bundle —
 a zip of JSON and CSV designed to be read from Rust, R, Python, or Julia. Use
 `--include-data` to embed the input NONMEM CSV inside the bundle (off by
-default).
+default). A data file edited since the fit started is refused: the fit still
+completes, with a warning that no bundle was written.
 
 ```bash
 ferx model.ferx --data data.csv --output run1.fitrx --include-data

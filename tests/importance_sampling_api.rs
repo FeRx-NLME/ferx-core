@@ -54,6 +54,62 @@ fn imp_only_chain_runs_standalone() {
     assert_eq!(result.method_chain, vec![EstimationMethod::Imp]);
 }
 
+/// The notices say these options have no effect on an evaluation (#2717), so the claim
+/// itself is pinned: wiring ISCALE or the K ramp into the evaluator reddens this and the
+/// warning text has to change with it. `imp_adapt_passes` is the control that shows the
+/// fixture can see a change of proposal, so bit-equality is not a fixture that moves nothing.
+#[test]
+fn iscale_and_imp_auto_do_not_reach_an_evaluation_and_warn_through_fit() {
+    use ferx_core::parser::model_parser::apply_fit_option;
+
+    let (model, population, mut base) = warfarin_setup();
+    base.methods = vec![EstimationMethod::Imp];
+    let run = |keys: &[(&str, &str)]| {
+        let mut opts = base.clone();
+        for (key, value) in keys {
+            apply_fit_option(&mut opts, key, value).expect("the option parses");
+        }
+        let result =
+            fit(&model, &population, &model.default_params, &opts).expect("the evaluation runs");
+        let imp = result
+            .importance_sampling
+            .clone()
+            .expect("an evaluation reports its marginal");
+        (imp, result.warnings)
+    };
+    let notes = |warnings: &[String]| {
+        warnings
+            .iter()
+            .filter(|w| w.contains("`imp_eval_only` runs an evaluation"))
+            .count()
+    };
+
+    let (plain, plain_warnings) = run(&[]);
+    assert!(plain.minus2_log_likelihood.is_finite());
+    assert_eq!(notes(&plain_warnings), 0, "{plain_warnings:?}");
+
+    let (scaled, scaled_warnings) = run(&[("iscale_min", "5"), ("iscale_max", "5")]);
+    assert_eq!(
+        scaled.minus2_log_likelihood.to_bits(),
+        plain.minus2_log_likelihood.to_bits()
+    );
+    assert_eq!(notes(&scaled_warnings), 2, "{scaled_warnings:?}");
+
+    let (pinned, pinned_warnings) = run(&[("imp_auto", "false")]);
+    assert_eq!(
+        pinned.minus2_log_likelihood.to_bits(),
+        plain.minus2_log_likelihood.to_bits()
+    );
+    assert_eq!(notes(&pinned_warnings), 1, "{pinned_warnings:?}");
+
+    let (unadapted, _) = run(&[("imp_adapt_passes", "0")]);
+    assert_ne!(
+        unadapted.minus2_log_likelihood.to_bits(),
+        plain.minus2_log_likelihood.to_bits(),
+        "the control must move, or equality above proves nothing"
+    );
+}
+
 #[test]
 fn imp_before_estimator_is_rejected() {
     // `imp` first but not terminal — caught by the "must be the final stage" rule.

@@ -34,8 +34,11 @@ fn model(rhs: &str) -> CompiledModel {
 }
 
 const COMPILED: &str = "-(CL / V) * central";
-// `sqrt` keeps the interpreter (an inline `if` no longer does, #2680).
-const INTERPRETED: &str = "-(CL / V) * sqrt(central)";
+// `sqrt` compiles too (#2844), with the same structure as `INTERPRETED`.
+const COMPILED_SQRT: &str = "-(CL / V) * sqrt(central)";
+// `tanh` keeps the interpreter (an inline `if` no longer does, #2680; `sqrt` no longer
+// does, #2844).
+const INTERPRETED: &str = "-(CL / V) * tanh(central)";
 
 fn subject(id: &str) -> Subject {
     let obs_times = vec![0.5, 2.0, 8.0, 24.0];
@@ -57,6 +60,7 @@ fn subject(id: &str) -> Subject {
         pk_only_covariates: Vec::new(),
         reset_times: Vec::new(),
         reset_covariates: Vec::new(),
+        cmt_toggles: Vec::new(),
         cens: vec![0; 4],
         occasions: Vec::new(),
         obs_l2: Vec::new(),
@@ -113,7 +117,7 @@ fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
         "{}",
         e.message
     );
-    assert!(e.message.contains("`sqrt`"), "{}", e.message);
+    assert!(e.message.contains("`tanh`"), "{}", e.message);
     assert!(e.message.contains("`d/dt(central)`"), "{}", e.message);
     assert_eq!(
         r.warnings.iter().filter(|w| **w == e.message).count(),
@@ -125,14 +129,16 @@ fn a_fit_reports_an_interpreted_rhs_once_and_a_compiled_one_not_at_all() {
     assert_eq!(d["route"], "interpreter");
     assert_eq!(d["site"], "`d/dt(central)`");
 
-    let m = model(COMPILED);
-    let r = fit(&m, &pop, &m.default_params, &opts).expect("fit");
-    assert!(route_entries(&r).is_empty(), "{:?}", r.warnings);
-    assert!(
-        !r.warnings.iter().any(|w| w.starts_with("W_ODE_RHS_")),
-        "{:?}",
-        r.warnings
-    );
+    for rhs in [COMPILED, COMPILED_SQRT] {
+        let m = model(rhs);
+        let r = fit(&m, &pop, &m.default_params, &opts).expect("fit");
+        assert!(route_entries(&r).is_empty(), "{rhs}: {:?}", r.warnings);
+        assert!(
+            !r.warnings.iter().any(|w| w.starts_with("W_ODE_RHS_")),
+            "{rhs}: {:?}",
+            r.warnings
+        );
+    }
 }
 
 /// `ferx check`'s row is the fit's message, `Info` (so it is not counted as a warning),
@@ -147,6 +153,7 @@ fn check_reports_the_same_note_as_an_info_row() {
     assert_eq!(d.block.as_deref(), Some("odes"));
     assert_eq!(d.message, msg);
     assert!(check_ode_rhs_route(&model(COMPILED)).is_none());
+    assert!(check_ode_rhs_route(&model(COMPILED_SQRT)).is_none());
     // A closed-form model has no RHS to report.
     let closed = parse_model_string(
         "
@@ -190,7 +197,7 @@ fn validate_model_file_lists_the_row() {
 [structural_model]
   ode(obs_cmt=central, states=[central])
 [odes]
-  d/dt(central) = -(CL / V) * sqrt(central)
+  d/dt(central) = -(CL / V) * tanh(central)
 [scaling]
   y = central / V
 [error_model]
@@ -205,5 +212,5 @@ fn validate_model_file_lists_the_row() {
         .iter()
         .find(|d| d.code == "W_ODE_RHS_INTERPRETED")
         .unwrap_or_else(|| panic!("{:?}", report.diagnostics));
-    assert!(row.message.contains("`sqrt`"), "{}", row.message);
+    assert!(row.message.contains("`tanh`"), "{}", row.message);
 }

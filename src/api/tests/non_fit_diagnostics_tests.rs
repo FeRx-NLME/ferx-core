@@ -483,6 +483,7 @@ fn uncertainty_opts() -> SimulateUncertaintyOptions {
         n_sim_per_draw: 2,
         method: crate::estimation::uncertainty_samples::UncertaintyMethod::Asymptotic,
         seed: Some(17),
+        horizon: None,
     }
 }
 
