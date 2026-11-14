@@ -2,7 +2,7 @@
 //! exponential tilting** — the #386 / absorption-Phase-3 acceleration that moves
 //! `transit()` (#386) and `igd()` (inverse-Gaussian, #790) off the numerical ODE
 //! forcing path onto the analytic `pk` path, where sensitivities come from
-//! `sens/`'s `Dual2` jets rather than finite differences.
+//! `sens/`'s generic `PkNum` kernels (compiled plans) rather than finite differences.
 //!
 //! ## The tilting identity
 //!

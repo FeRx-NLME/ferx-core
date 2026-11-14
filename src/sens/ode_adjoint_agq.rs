@@ -57,9 +57,9 @@ pub(super) fn agq_planned(
     let n_rows = p1.rows();
     let n_th = theta.len();
     let n_cols = n_th + if sde { sigma.len() } else { 0 };
-    // The node predictions, values only, each forward kept for its one reverse: the tape takes
-    // a node as a block of `b` ([`node_block`]), whose reverse returns `Gᵀ·adjoint` — all `b`
-    // needs — and the node's θ adjoint with it, so `G` itself is never formed.
+    // The node predictions, values only, each forward kept for its one reverse: a node's
+    // reverse returns `Gᵀ·adjoint` — all `b` needs — and the node's θ adjoint with it, so
+    // `G` itself is never formed.
     type Fwd = (PlanArc, std::sync::Arc<kj_fwd::Fwd>);
     // Per node: its rows (the predictions, then an SDE's variances) and the plan forwards that
     // produced them (the predictions', the variances').

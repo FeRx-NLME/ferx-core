@@ -683,15 +683,15 @@ correct, but an *objective* missing part of the likelihood cannot be salvaged.
 
 ## Performance note
 
-VI needs `∂/∂η` of the data term for every subject at every iteration. The analytic `Dual2`
-provider covers this for most models — including ODE models, `iiv_on_ruv`, steady-state doses
+VI needs `∂/∂η` of the data term for every subject at every iteration. The analytic
+plan provider covers this for most models — including ODE models, `iiv_on_ruv`, steady-state doses
 and reset events — and anything it declines falls back to central finite differences, roughly
 10–40× slower for that subject. `FitResult$vi$n_fd_subjects` reports how many subjects took
 the slow path, and a non-zero count raises a warning. It means the fit was slower than it
 needed to be, not that it was wrong.
 
 The data term's `∂/∂θ` at the drawn `η` is exact for every model the adjoint recorder serves:
-one recording of the subject's predictions with θ on the adjoint's tape and one reverse sweep,
+one recording of the subject's predictions with θ as the plan's inputs and one reverse pass,
 whatever the number of θ, where a forward difference cost one extra solve per θ. A model whose
 residual magnitude reads a θ directly keeps the forward difference.
 

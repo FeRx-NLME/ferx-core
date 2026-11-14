@@ -3899,7 +3899,7 @@ fn a_packed_vector_of_the_wrong_length_declines() {
 fn a_population_sweep_unpacks_the_packed_point_once() {
     use crate::estimation::agq::{ScoreRoute, SubjectScoreContext};
     use crate::estimation::sens_outer_gradient::{
-        per_subject_packed_gradients, population_eta_dx, subject_packed_gradient,
+        per_subject_packed_gradients, subject_packed_gradient,
     };
     let model = crate::parser::model_parser::parse_model_file(std::path::Path::new(
         "examples/warfarin.ferx",
@@ -3929,10 +3929,6 @@ fn a_population_sweep_unpacks_the_packed_point_once() {
             "subject {i}"
         );
     }
-    let n = count(&|| {
-        population_eta_dx(&model, &pop, &params, &x, &etas, true).expect("served");
-    });
-    assert_eq!(n, 1, "mode responses");
     let n = count(&|| {
         crate::estimation::agq::agq_population_gradient(
             &model,
@@ -6753,7 +6749,7 @@ fn eta_dx_serves_a_five_effect_subject_and_matches_the_re_solved_ebe() {
     let params = moved_params(&model);
     let x = pack_params(&params);
     // FOCEI's conditional mode and FOCE's frozen-variance one each respond on their own
-    // inner problem (`population_eta_dx` passes the fit's `interaction`).
+    // inner problem (`subject_adjoint_eta_dx` takes the fit's `interaction`).
     for interaction in [true, false] {
         let eta = ebe_for(&model, &s, &params, 1e-12, interaction);
         let dx = std::thread::scope(|sc| {
@@ -6785,7 +6781,7 @@ fn eta_dx_serves_a_five_effect_subject_and_matches_the_re_solved_ebe() {
         eprintln!("eta_dx (5 η, interaction = {interaction}) vs re-solved EBE {worst:.2e}");
         // Measured on Linux: 1.8e-7 (FOCEI), 1.6e-5 (FOCE); ~10× headroom each. FOCE's
         // response taken on FOCEI's conditional mode (the old hard-coded `interaction = true`
-        // in `population_eta_dx`) misses it by 6.1e-2, so the FOCE bound straddles that defect.
+        // in the removed `population_eta_dx`) misses it by 6.1e-2, so the FOCE bound straddles that defect.
         let bound = if interaction { 2e-6 } else { 2e-4 };
         assert!(
             worst < bound,

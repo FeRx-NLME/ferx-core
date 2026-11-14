@@ -174,35 +174,6 @@ pub(crate) fn theta_dx_chain(template: &ModelParameters, theta: &[f64], m: usize
     }
 }
 
-/// Per-subject `dη̂/dx` Jacobians (one `n_eta`-vector per packed coordinate) for the whole
-/// population, or `None` if any subject is unsupported: the exact mode response
-/// (`adjoint::subject_adjoint_eta_dx`) of the fit's own inner problem — FOCEI's conditional
-/// mode when `interaction`, FOCE's frozen-variance mode otherwise (#2093 review).
-pub fn population_eta_dx(
-    model: &CompiledModel,
-    population: &Population,
-    template: &ModelParameters,
-    x: &[f64],
-    eta_hats: &[DVector<f64>],
-    interaction: bool,
-) -> Option<Vec<Vec<DVector<f64>>>> {
-    let pt = PackedPoint::new(template, x)?;
-    population
-        .subjects
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            crate::sens::ode_provider::adjoint::subject_adjoint_eta_dx_at(
-                model,
-                s,
-                &pt,
-                eta_hats[i].as_slice(),
-                interaction,
-            )
-        })
-        .collect()
-}
-
 /// What an outer gradient evaluation hands the EBE warm start about each subject's mode
 /// (#2549): the exact mode responses `dη̂ᵢ/dx`, one `n_eta`-vector per packed coordinate (a
 /// subject the response does not reach is predicted not to move), and, under the

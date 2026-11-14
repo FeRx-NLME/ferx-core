@@ -325,7 +325,7 @@ Two consequences worth knowing:
 ### FOCE / FOCEI / Laplace: the adjoint gradient
 
 `method = focei` (and `foce`, `laplace`, AGQ) differentiates through the network with the
-adjoint (#486). The weights are θ leaves on its tape, so one reverse sweep returns every
+adjoint (#486). The weights are θ inputs of its plan, so one reverse pass returns every
 weight's derivative, at a cost that does not grow with the number of weights. Static and
 time-varying network inputs, IOV (`kappa`), an `[initial_conditions]` baseline, an `obs_scale`
 expression and a Form C readout are all served, on both loops. A model that reads a generated

@@ -9,10 +9,10 @@
 //! ODE disposition (see `plans/absorption-models.md`). They use only
 //! `+ − * /`, `.ln()`, `.exp()`, and `ln_gamma` — all on the `PkNum`
 //! trait. The input-rate forcing is **generic over `T: PkNum`** (the `sens/`
-//! `*_g<T>` convention), so `transit()` and `igd()` models are evaluated over
-//! `Dual2` by `sens/ode_provider.rs` and get **exact analytic** FOCE/FOCEI/Bayes
+//! `*_g<T>` convention), so `transit()` and `igd()` models are recorded into
+//! compiled plans by `sens/ode_provider.rs` and get **exact analytic** FOCE/FOCEI/Bayes
 //! sensitivities, not finite differences (#430). (The Enzyme `autodiff` path
-//! these once targeted was retired in #367/#381; `Dual2` handles `max`/`min` by
+//! these once targeted was retired in #367/#381; the recording type handles `max`/`min` by
 //! comparison, so the old `f64::max`/`min` restriction no longer applies.)
 
 use crate::sens::num::PkNum;

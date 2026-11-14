@@ -1427,7 +1427,7 @@ pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
 }
 
 /// Per observation the prediction and its exact `∂f/∂η` at `(θ, η)` (the stacked `[η, κ]`
-/// under IOV), from one tape-free recording of the unified recorder
+/// under IOV), from one recording of the unified recorder
 /// (`sens::ode_provider::adjoint`) — closed form, event walks, user ODEs, compartment-free
 /// models alike — or `None` for a subject no recorder serves. FREM pseudo-observation rows
 /// carry their exact `θ_i + η_e`.

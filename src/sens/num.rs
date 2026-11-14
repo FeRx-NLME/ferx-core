@@ -1,7 +1,7 @@
 //! `PkNum` — the small numeric interface a closed-form PK solution needs, so a
 //! single generic implementation serves both the scalar prediction (`T = f64`)
-//! and its exact sensitivities (`T = Dual2<N>`). No Enzyme, no codegen: the same
-//! source is monomorphised for each numeric type.
+//! and its exact sensitivities (`T = Dual2<N>`, or the plan-recording type
+//! `parser::kernel_jit::Tr`). The same source is monomorphised for each numeric type.
 
 use super::dual2::Dual2;
 use std::ops::{Add, Div, Mul, Neg, Sub};
@@ -655,7 +655,7 @@ pub trait PkNum:
     }
 
     /// [`Self::lift3`] with the fourth derivative `d4 = φ⁗` too, for the covariance step's
-    /// nested dual (`sens::jet::DualT` over `DualT` over the reverse tape), which carries
+    /// nested jet (`sens::jet::DualT` over `DualT` over the recording type), which carries
     /// four orders: a Laplace exact-anchor R-matrix differentiates `∂²f/∂η²` twice more.
     /// The default drops `d4`, which is exact for every type tracking fewer orders.
     #[inline]
@@ -732,7 +732,7 @@ pub trait PkNum:
     }
 
     /// `base + Σ αₜ·xₜ·yₜ`, left to right: one entry of a weighted Gram sum such as the
-    /// FOCEI `H̃ = Ω⁻¹ + Σ_j α_j g_j g_jᵀ`. The reverse tape (`sens::jet::R`)
+    /// FOCEI `H̃ = Ω⁻¹ + Σ_j α_j g_j g_jᵀ`. The recording type (`kernel_jit::Tr`)
     /// overrides it to record one node instead of three per term.
     #[inline]
     fn wsum3(base: f64, terms: impl Iterator<Item = (Self, Self, Self)>) -> Self {
@@ -743,8 +743,8 @@ pub trait PkNum:
         s
     }
 
-    /// `x₁·y₁ + x₂·y₂`: a product rule's tangent (`g·v′ + v·g′`). The reverse tape
-    /// (`sens::jet::R`) overrides it to record **one** node with the four partials instead
+    /// `x₁·y₁ + x₂·y₂`: a product rule's tangent (`g·v′ + v·g′`). The recording type
+    /// (`kernel_jit::Tr`) overrides it to record **one** node with the four partials instead
     /// of three (two products and a sum, #2481 §2.2); every other type keeps exactly this
     /// arithmetic, so its values do not move.
     #[inline]
@@ -753,7 +753,7 @@ pub trait PkNum:
     }
 
     /// `((x₁·y₁ + x₂·y₂) + x₃·y₃) + x₄·y₄`, left to right: a second-order product rule's
-    /// Hessian entry. As [`Self::dot2`]: one node on the reverse tape, this arithmetic
+    /// Hessian entry. As [`Self::dot2`]: one recorded node on the recording type, this arithmetic
     /// everywhere else.
     #[allow(clippy::too_many_arguments)]
     #[inline]

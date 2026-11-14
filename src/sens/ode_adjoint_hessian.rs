@@ -230,7 +230,8 @@ pub(crate) fn subject_adjoint_eta_dx(
 }
 
 /// `subject_adjoint_eta_dx` (the per-subject entry point, which unpacks its own `x`) at a [`PackedPoint`].
-pub(crate) fn subject_adjoint_eta_dx_at(
+#[cfg(test)]
+fn subject_adjoint_eta_dx_at(
     model: &CompiledModel,
     subject: &Subject,
     pt: &PackedPoint<'_>,
@@ -269,6 +270,7 @@ pub(crate) fn cov_non_gaussian_served(model: &CompiledModel, objective: Objectiv
 }
 
 /// The packed axes as pass directions, without an η tangent.
+#[cfg(test)]
 fn x_dirs(n: usize) -> Vec<Dir> {
     (0..n).map(|i| Dir::x(i, Vec::new())).collect()
 }

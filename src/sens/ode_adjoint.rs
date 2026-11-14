@@ -17,17 +17,21 @@
 //! the structural parameters only through the predictions `f` and `G = ∂f/∂η`, so no
 //! second-order sensitivity in θ is ever formed. The steps:
 //!
-//! 1. **Record** the predictions into the subject's compiled plan (`parser::kernel_jit`): value and η-tangents
-//!    on the vector tape, an η-Hessian payload alongside. θ are tape leaves, η free inputs, and the individual-parameter program itself runs on the tape
-//!    (`eval_params_g`), so `∂p/∂θ` tables are never built. The solve is the production
-//!    integrator's, so this is a discrete adjoint of exactly the predicted trajectory.
-//! 2. **`w`**, from `(F, ∇_η l)` evaluated over a plain forward η-dual (`f` carrying `G`,
-//!    `G` carrying the payload `∂²f/∂η²`): its dual parts are `∇_η F` and `H`. No tape.
-//! 3. **`Ψ`** on the scalar reverse tape ([`R`]), with `f`, `G`, `η`, Ω's packed Cholesky
-//!    entries, σ, ρ, the serial ρ and (FREM) θ as leaves; one single-lane sweep gives
-//!    `∂Ψ` for all of them. The kernel (`focei_kernel`) is the likelihood written once,
-//!    generic over the number type, and pinned to the f64 production objective.
-//! 4. `∂Ψ/∂f`, `∂Ψ/∂G` seed one single-lane sweep of the vector tape back to the θ leaves.
+//! 1. **Record** the subject's predictions once into a compiled plan (`parser::kernel_jit`,
+//!    on the recording type `Tr`): θ and η are the plan's input slots and the
+//!    individual-parameter program runs inside the recording (`taped_params`), so `∂p/∂θ`
+//!    tables are never built. The solve is the production integrator's, so this is a discrete
+//!    adjoint of exactly the predicted trajectory. One forward at the first-order layout gives
+//!    `f` and `G = ∂f/∂η`.
+//! 2. **The kernel.** The likelihood (`focei_kernel`, written once, generic over the number
+//!    type and pinned to the f64 production objective) is itself a compiled plan
+//!    (`ode_adjoint_kernel.rs`) whose leaves are `f`, `G`, η, Ω's packed Cholesky entries, σ,
+//!    ρ, the serial ρ and (FREM) θ, and whose outputs are `F` and `∇_η l`. One multi-seed
+//!    reverse gives every output's adjoint at every leaf: `∇_η F`, `H`, and from them `w` and
+//!    `Ψ = F − wᵀ∇_η l` as fixed linear combinations.
+//! 3. **Back through the predictions.** The adjoints of `f` and `G` seed one reverse of the
+//!    prediction plan, carrying `∂Ψ` to the θ (and η) input lanes; the η-Hessian of `f` is
+//!    only ever contracted with an adjoint of `G`, never formed.
 //!
 //! Its cost does not grow with the number of θ or individual parameters. IOV runs the same steps over the stacked
 //! `[η, κ_0, …, κ_{K−1}]` with the block prior `Ω ⊕ (I_K ⊗ Ω_IOV)`.
@@ -35,7 +39,7 @@
 //! The same machinery serves FOCE, FOCEI and AGQ (both anchors; one exact-anchor node is
 //! Laplace) — see [`run_agq`].
 //!
-//! The same recorder runs tape-free for the inner loop's η-Jacobians,
+//! The same recordings are replayed by value for the inner loop's η-Jacobians,
 //! inner gradients and Hessians ([`exact_obs_grads`], [`exact_inner_hessian`], …).
 //!
 //! Out of scope (`None`, and the caller salvages the subject by finite differences): SDE,
@@ -349,7 +353,7 @@ pub(crate) fn subject_adjoint_gradient_with_eta_dx_at(
 
 /// [`subject_adjoint_gradient_with_eta_dx_at`] for any objective the adjoint serves: under
 /// Laplace/AGQ (`Objective::Agq`) the response of the conditional mode the quadrature is
-/// centred on, from the exact inner Hessian, out of the quadrature gradient's own tape.
+/// centred on, from the exact inner Hessian, out of the quadrature gradient's own plans.
 #[cfg(test)]
 pub(crate) fn subject_adjoint_gradient_and_eta_dx_at(
     model: &CompiledModel,
@@ -431,7 +435,7 @@ pub(crate) fn subject_adjoint_held_ebe_score_at(
 /// false`, `R⁰` at `f(η = 0)` where the variance is f-dependent) or FOCEI objective, with
 /// `H` and `η̂` constants. This is the score the outer optimizer's fixed-EBE paths
 /// difference (GN, trust region, the S-matrix, the held-EBE salvage), taken exactly: one
-/// scalar-tape sweep of the objective gives its adjoints in the predictions, `Ω` and `σ`,
+/// reverse of the objective's kernel plan gives its adjoints in the predictions, `Ω` and `σ`,
 /// and the predictions' θ-derivatives are contracted with them by one recording and one
 /// reverse sweep each ([`fixed_eta_theta_contractions`]). Every feature the kernel scores —
 /// M3 censoring, a dense residual, FREM rows, a residual-error η, a residual magnitude —
@@ -508,7 +512,7 @@ fn fixed_ebe_score(
     let mut pv = ParT::of(model, subject, params);
     pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
 
-    // The objective on the scalar tape (`H` and `η̂` constants), scored inside the η̂
+    // The objective's kernel plan (`H` and `η̂` constants), scored inside the η̂
     // recording's weights callback on that recording's own prediction values — one
     // recording serves both the value and its θ-derivatives. Everything but the θ block
     // is assembled there; the θ block is linear in `theta_adj` and added afterwards.
@@ -668,8 +672,8 @@ fn add_theta_sigma_adjoint(
 
 /// [`fixed_ebe_score`] under IOV: production's held objective (`foce_subject_nll_iov`) holds
 /// the BSV columns of `H` and `b̂ = [η̂, κ̂]`, and rebuilds the κ columns `∂f/∂κ` at `b̂` from
-/// θ. So the predictions are recorded with their κ-tangents on the vector tape (θ leaves,
-/// `b` free), the kernel's objective over the stacked system is scored on the scalar tape
+/// θ. So the predictions are recorded with their κ-tangents in the prediction plan (θ leaves,
+/// `b` free), the kernel's objective over the stacked system is scored on its kernel plan
 /// with the BSV columns constant and the κ columns as inputs, and one sweep seeded with both
 /// adjoints carries `∂f/∂θ` and `∂²f/∂κ∂θ` to the θ leaves together.
 fn fixed_ebe_score_iov(
@@ -4334,7 +4338,7 @@ fn run(
         None
     };
 
-    // ---- 2. F and ∇_η l on the scalar tape, one (1 + N)-lane sweep ---------------------
+    // ---- 2. F and ∇_η l from the kernel plan, one (1 + N)-lane reverse ---------------------
     // Every derivative below is a combination of this sweep's input adjoints: `∇_η F` and
     // `H = ∂(∇_η l)/∂η` through the predictions (one multi-seed reverse of their plans,
     // seeded with each output's adjoints of `f` and `G`; f_pop does not depend on η), and
@@ -4705,15 +4709,15 @@ fn factor_anchor<T: crate::sens::num::PkNum>(
 ///
 /// with `H_reg = H_a + jitter` the regularised anchor and `L = chol(H_reg)`; one node is
 /// `l(η̂) + ½log|H_reg|`. The node predictions enter as `f_j + G_j·(b − b_j)`, so the grid's
-/// movement with `x` and `η̂` (through `H_a`) is differentiated on the scalar tape, the
+/// movement with `x` and `η̂` (through `H_a`) is differentiated through the kernel plan, the
 /// hand-written grid response is not needed. `Ψ = A − wᵀ∇_η l(η̂)`, `w = H⁻¹∇_η̂A` with
 /// `H` the exact inner Hessian, and `dA/dx = ∂ₓΨ`.
 ///
 /// Under the exact anchor the second-order sensitivities `Q = ∂²f/∂η²` at `η̂` enter only
-/// through `H_a = Σ_j (∂l/∂f_j)·Q_j + …`, so each row's adjoint is `c_j·S` for one
-/// symmetric `S`; the taped recording at `η̂` runs along `S`'s eigenvectors `u_m`, to
-/// second order along each (`1 + 2N` components), and is seeded `u_mᵀ adj(Q_j) u_m`. The
-/// Gauss–Newton anchor reads no `Q`, so its recording is first order.
+/// through `H_a = Σ_j (∂l/∂f_j)·Q_j + …`; the plan's forward is kept at the second-order
+/// layout there and its reverse is seeded with the adjoints of `Q` (see `ode_adjoint_agq.rs`),
+/// so `Q` itself is never formed. The Gauss–Newton anchor reads no `Q`, so its forward is
+/// first order.
 #[allow(clippy::too_many_arguments)]
 fn run_agq(
     model: &CompiledModel,
@@ -4929,7 +4933,7 @@ fn ng_value_grad(
 mod hessian;
 pub(crate) use hessian::{
     cov_non_gaussian_served, subject_adjoint_cov_block_at, subject_adjoint_cov_diag_at,
-    subject_adjoint_cov_hessian_at, subject_adjoint_eta_dx_at,
+    subject_adjoint_cov_hessian_at,
 };
 #[cfg(test)]
 pub(crate) use hessian::{subject_adjoint_cov_hessian, subject_adjoint_eta_dx};
