@@ -1619,7 +1619,8 @@ fn fit_inner(
     // An initial estimate that packs strictly outside its own box and is
     // silently clamped there (#1251). Computed **once**, into a local: it
     // returns a mix of errors (a θ outside the user's own declared range) and
-    // warnings (the internal Ω / Σ / hidden-θ-cap rails), and `first_error`
+    // warnings (the internal Ω / Σ / hidden-θ-cap rails, and that same θ on an
+    // evaluation-only run, #2865), and `first_error`
     // consumes only the errors. The non-errors are pushed into
     // `accumulated_warnings` at the `option_diags` block below — which is not
     // declared until ~50 lines from here, so this cannot simply be inlined.
@@ -1779,7 +1780,8 @@ fn fit_inner(
         accumulated_warnings.push(d.message.clone());
     }
     // The warning half of the packed-start-in-box check (#1251) — the internal
-    // Ω / Σ / hidden-θ-cap rails. Its error half was consumed by `first_error`
+    // Ω / Σ / hidden-θ-cap rails, a value the packer moved, and a θ outside its
+    // declared range on an evaluation-only run (#2865). Its error half was consumed by `first_error`
     // above, on the same `Vec`, for exactly the reason the comment above gives.
     for d in start_box_diags.iter().filter(|d| !d.is_error()) {
         accumulated_warnings.push(d.message.clone());
