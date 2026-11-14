@@ -8771,7 +8771,8 @@ pub struct FitResult {
     pub shrinkage_eps: f64,
     /// Pooled lag-1 Pearson correlation of IWRES across subjects.
     /// `NaN` when no series has ≥ 2 valid IWRES values (a series is a subject's
-    /// rows, split at its `correlation … by` blocks and its parallel occasions).
+    /// rows, split at its `correlation … by` blocks and its occasions where these
+    /// are parallel; blocks and occasions that run in time stay one series).
     pub iwres_lag1_r: f64,
     /// Pooled Durbin-Watson statistic for IWRES within subjects.
     /// 2.0 = no autocorrelation; < 1.5 = positive; > 2.5 = negative.
