@@ -406,3 +406,180 @@ fn mcf_band_uses_only_defined_curves_and_keeps_the_floor() {
         })
     );
 }
+
+/// PR3 (#1886 KMMC): the covariate on PR1's tie fixture, `z = 3,1,4,1,5,9,2,6,5,3`.
+const Z: [f64; 10] = [3.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0, 6.0, 5.0, 3.0];
+
+fn m3_kmmc() -> KmmcCurve {
+    let ev: Vec<bool> = E.iter().map(|&e| e == 1).collect();
+    kaplan_meier_mean_covariate(&T, &ev, &Z).unwrap()
+}
+
+/// PR3 K1. The mean over the Kaplan–Meier risk set `{Tᵢ ≥ tⱼ}`, computed with exact
+/// fractions outside the engine (`~/ferx-probes/1886/pr3/kmmc_fixture.py`, plan M3):
+/// 39/10, 4, 35/8, 5, 4, 14/3, 3 at t = 1, 2, 3, 5, 7, 8, 10, with the risk set
+/// equal to `kaplan_meier`'s row for row. Mutations it reddens: censor-first in
+/// `count_pass` (t = 5 becomes 21/5 and t = 8 becomes 4; PR1's T1 dies too); the
+/// right-limit set `T > t`, which shifts every row up by one (row 1 becomes 4); a
+/// sum over the input order instead of the sorted order (the shuffled copy).
+/// Realised error 0 (integer
+/// sums are exact and one correctly rounded division gives the nearest double of
+/// each fraction); the 4e-15 bound is four ULPs at 8 and only covers a change of
+/// summation order, while the smallest mutation above moves a value by 0.2.
+#[test]
+fn kmmc_matches_exact_risk_set_means_and_km_risk_sets() {
+    let c = m3_kmmc();
+    let km = m2();
+    let want: [f64; 7] = [39.0 / 10.0, 4.0, 35.0 / 8.0, 5.0, 4.0, 14.0 / 3.0, 3.0];
+    assert_eq!(c.time, km.time);
+    assert_eq!(c.n_risk, km.n_risk, "one counting pass: KM risk sets");
+    assert_eq!(c.n_event, km.n_event);
+    assert_eq!(c.n_censor, km.n_censor);
+    assert_eq!(c.mean.len(), want.len());
+    let mut worst = 0.0_f64;
+    for (j, (&got, &w)) in c.mean.iter().zip(&want).enumerate() {
+        assert!(got.is_finite(), "mean at t = {} is {got}", c.time[j]);
+        assert!(w.is_finite());
+        worst = worst.max((got - w).abs());
+        assert!(
+            (got - w).abs() < 4e-15,
+            "KMMC({}) = {got} != {w}",
+            c.time[j]
+        );
+    }
+    eprintln!("K1 worst |mean - exact| = {worst:.3e}");
+    // The fixture is already in time order, so the sorted order is the identity and a
+    // sum over `values[k]` instead of `values[order[k]]` would pass above. The same
+    // subjects in a shuffled input order must give the same curve.
+    let perm = [7, 2, 9, 0, 5, 3, 8, 1, 6, 4];
+    let ev: Vec<bool> = perm.iter().map(|&i| E[i] == 1).collect();
+    let t: Vec<f64> = perm.iter().map(|&i| T[i]).collect();
+    let z: Vec<f64> = perm.iter().map(|&i| Z[i]).collect();
+    let shuffled = kaplan_meier_mean_covariate(&t, &ev, &z).unwrap();
+    assert_eq!(shuffled.n_risk, c.n_risk);
+    for (j, (&got, &w)) in shuffled.mean.iter().zip(&want).enumerate() {
+        assert!(
+            (got - w).abs() < 4e-15,
+            "shuffled input: KMMC({}) = {got} != {w}",
+            c.time[j]
+        );
+    }
+}
+
+/// PR3 K2. `KmmcCurve::at` is left-continuous: the set at risk *at* `t` is the first
+/// row with time `≥ t`. Before the first row it is the mean over everyone; past the
+/// last time it is `None`; where that row's `n_risk` is below the floor it is `None`.
+/// Mutations: `partition_point(x <= t)` (right-continuous: `at(5)` becomes 4 and
+/// `at(10)` becomes `None`); drop the floor (`at(8, 4)` becomes 14/3); carry the
+/// last value past the end (`at(10.5)` becomes 3).
+#[test]
+fn kmmc_at_is_left_continuous_with_floor_and_end() {
+    let c = m3_kmmc();
+    assert_eq!(c.at(0.5, 1), Some(39.0 / 10.0), "before the first row");
+    assert_eq!(c.at(0.0, 1), Some(39.0 / 10.0));
+    assert_eq!(c.at(5.0, 1), Some(5.0), "at a row: that row's set");
+    assert_eq!(c.at(5.5, 1), Some(4.0), "just after: the next row's");
+    assert_eq!(c.at(10.0, 1), Some(3.0), "the last row");
+    assert_eq!(c.at(10.5, 1), None, "past the last time");
+    assert_eq!(c.at(8.0, 4), None, "n_risk 3 < 4");
+    assert_eq!(c.at(7.0, 4), Some(4.0), "n_risk 4 >= 4");
+    assert_eq!(c.at(f64::NAN, 1), None);
+    assert_eq!(KmmcCurve::default().at(0.0, 0), None, "empty curve");
+}
+
+/// A KMMC curve at `v` on `[0, 10]` whose risk set at 10 is `n_end`.
+fn flat_kmmc(v: f64, n_end: usize) -> KmmcCurve {
+    KmmcCurve {
+        time: vec![0.0, 10.0],
+        n_risk: vec![20, n_end],
+        n_event: vec![1, 0],
+        n_censor: vec![0, n_end],
+        mean: vec![v, v],
+    }
+}
+
+/// PR3 K3. `vpc_band_kmmc` applies the at-risk floor to each curve: at t = 5 the 3
+/// curves with 3 subjects at risk are left out (`n_used` 22) and the band is the
+/// type-7 quantiles of the other 22. Counting a floored curve (as its value, 0.9, or
+/// as 0) makes `n_used` 25 and moves the quantiles; at t = 0 all 25 count.
+#[test]
+fn kmmc_band_floors_each_curve_on_its_own() {
+    let probs = [0.05, 0.5, 0.95];
+    let mut curves: Vec<KmmcCurve> = (0..22)
+        .map(|i| flat_kmmc(1.0 + i as f64 / 4.0, 15))
+        .collect();
+    curves.extend((0..3).map(|_| flat_kmmc(0.9, 3)));
+    let band = vpc_band_kmmc(&curves, &[0.0, 5.0], probs, 10).unwrap();
+    assert_eq!(band.n_used, [25, 22]);
+    let v: Vec<f64> = (0..22).map(|i| 1.0 + i as f64 / 4.0).collect();
+    assert_eq!(band.lo[1], Some(quantile_sorted(&v, 0.05)));
+    assert_eq!(band.med[1], Some(quantile_sorted(&v, 0.5)));
+    assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
+    assert_eq!(
+        vpc_band_kmmc(&curves, &[1.0], [0.5, 0.5, 0.95], 10),
+        Err(KmInputError::BadProbs {
+            probs: [0.5, 0.5, 0.95]
+        })
+    );
+}
+
+/// PR3 K4. A non-finite value (a missing covariate is `NaN`) is refused with its
+/// index, and a value slice of the wrong length is refused; without the checks the
+/// `NaN` reaches every mean whose risk set holds it, and a short slice panics.
+#[test]
+fn kmmc_refuses_bad_values_and_lengths() {
+    let t = [1.0, 2.0, 3.0];
+    let e = [true, false, true];
+    let r = kaplan_meier_mean_covariate(&t, &e, &[1.0, f64::NAN, 2.0]);
+    assert!(
+        matches!(r, Err(KmInputError::BadValue { index: 1, value }) if value.is_nan()),
+        "{r:?}"
+    );
+    assert_eq!(
+        kaplan_meier_mean_covariate(&t, &e, &[1.0, f64::INFINITY, 2.0]),
+        Err(KmInputError::BadValue {
+            index: 1,
+            value: f64::INFINITY
+        })
+    );
+    assert_eq!(
+        kaplan_meier_mean_covariate(&t, &e, &[1.0, 2.0]),
+        Err(KmInputError::ValueLengthMismatch {
+            times: 3,
+            values: 2
+        })
+    );
+    assert_eq!(
+        kaplan_meier_mean_covariate(&t, &e[..2], &[1.0, 2.0, 3.0]),
+        Err(KmInputError::LengthMismatch {
+            times: 3,
+            events: 2
+        })
+    );
+    assert_eq!(
+        kaplan_meier_mean_covariate(&[1.0, -1.0], &[true, true], &[1.0, 2.0]),
+        Err(KmInputError::BadTime {
+            index: 1,
+            value: -1.0
+        })
+    );
+    let msg = KmInputError::BadValue {
+        index: 1,
+        value: f64::NAN,
+    }
+    .to_string();
+    assert!(
+        msg.contains("kaplan_meier_mean_covariate") && msg.contains("index 1"),
+        "{msg}"
+    );
+    let msg = KmInputError::ValueLengthMismatch {
+        times: 3,
+        values: 2,
+    }
+    .to_string();
+    assert!(msg.contains("3 times but 2 covariate values"), "{msg}");
+    assert!(kaplan_meier_mean_covariate(&[], &[], &[])
+        .unwrap()
+        .time
+        .is_empty());
+}

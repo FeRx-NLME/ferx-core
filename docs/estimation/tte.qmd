@@ -1110,6 +1110,101 @@ and these are inside the 99 % binomial interval around that (83 %–94.5 %). Fol
 replicate subject to `H` instead takes the order-2 curve to 79 % and 82 % at H/2 and 3H/4,
 out of it.
 
+### Kaplan–Meier mean covariate {#km-vpc-kmmc}
+
+`vpc_kmmc()` checks whether a model captures how a covariate drives the hazard. At every step of
+the Kaplan–Meier curve it takes the mean of one baseline covariate over the subjects still at
+risk, in the data and in each replicate, and returns the observed curve beside the band of the
+replicate curves, per stratum (Hooker & Karlsson, PAGE 21 (2012) Abstr 2564; Xpose 4's
+`kaplan.plot(cov = )` and PsN `vpc -tte` draw the same plot). It is for a single-event endpoint.
+
+```rust
+let mut opts = VpcKmmcOptions::new("WT");
+opts.vpc.n_sim = 500;
+opts.vpc.sim = SimulateOptions { seed: Some(1), ..Default::default() };
+let vpc = vpc_kmmc(&model, &population, &fit_params, &opts)?;
+for s in &vpc.strata {
+    // s.grid, s.obs_on_grid, s.lo / s.med / s.hi, s.n_used, s.observed (KmmcCurve)
+}
+```
+
+`opts.vpc` holds every `vpc_tte()` option: replicates, band, grid, censoring, strata, `cmt`
+and the simulator options. `level: Some(v)` turns the mean into the share of at-risk subjects
+whose value equals `v`, for a multi-level code such as an arm, where a mean of codes means
+nothing. For a 0/1 covariate the mean already is the share coded 1. `min_at_risk` (default 10)
+leaves a curve undefined where fewer subjects are at risk.
+
+#### The curve {#km-vpc-kmmc-curve}
+
+The covariate is each subject's baseline value, its first non-missing value, the one strata
+read. At time `t` the curve is the mean of that value over the subjects whose time is `t` or
+later: the Kaplan–Meier risk set, with the same tie convention, so a subject censored at a tied
+time is still in it. `ferx_core::stats::km::kaplan_meier_mean_covariate` computes it, one row
+per row of the Kaplan–Meier curve. Read at a time, the curve takes the set at risk *at* that
+time: the value of the first row at or after it. Before the first row it is the mean over
+everyone, and past the last time it is undefined. A step plot of the rows therefore steps just
+after each row's time; Xpose 4 plots the value just after the step, the same function seen
+from the right.
+
+The floor applies to the observed curve and to each replicate on its own: a replicate with too
+few subjects at risk at a grid time is left out of the band there, and `n_used` shows how many
+remain. Applying it only where the observed curve is defined would select datasets and break
+the comparison.
+
+A covariate that changes within a subject is not refused. The curve uses each subject's first
+value, and the result's `warnings` carry `W_VPC_KMMC_TIME_VARYING_COVARIATE` with the number of
+subjects it changes in. The mean of a time-varying value at the risk time is a planned
+follow-up.
+
+#### Censoring of the replicates {#km-vpc-kmmc-censoring}
+
+The replicates reuse the observed population, so every replicate subject keeps its covariate.
+Under the default `VpcCensoring::Observed`, **every** replicate subject draws its censoring time
+from its own stratum's reverse Kaplan–Meier censoring distribution, whether it was observed
+censored or with an event. This differs from `vpc_tte()`, where a subject observed censored
+keeps its own time. Censored subjects are the ones that outlasted their censoring time, so they
+lean towards a low hazard. Keeping their exact times removes the same covariate values from the
+risk set at the same times in every replicate as in the data, and the band hugs the observed
+curve. In a prototype outside ferx (200 datasets, 200 replicates, a band that should cover
+89.1 %), the kept times covered 95 % and 95.5 % at H/2 and 3H/4, and up to 98.5 % for a binary
+covariate, while the Kaplan–Meier band on the same data covered 88.5 %–90.5 %. Drawing every
+subject's time gave 89 % and 92.5 %. The draw assumes what the censoring distribution already
+assumes: within a stratum, censoring does not depend on the covariate. Stratify on what drives
+dropout. `VpcCensoring::Horizon` follows every replicate subject to `H`.
+
+#### Reading it {#km-vpc-kmmc-reading}
+
+At `t = 0` every subject is at risk in the data and in every replicate, so the observed value,
+`lo`, `med` and `hi` are all the population mean and the band has width 0. A gap there is
+impossible, and agreement there says nothing. The signal is **who stays at risk**: as subjects
+have their events or drop out, the mean drifts. If a higher value raises the hazard, those
+subjects leave first and the mean falls; a model without that effect has replicates whose mean
+stays near the start, and the observed curve leaves the band. The check can see what the
+Kaplan–Meier VPC cannot: for a binary covariate with its effect left out and the overall rate
+matched, the Kaplan–Meier band still covered 88.5 % of datasets in the prototype, while the
+mean-covariate band covered only 49.5 %.
+
+Stratifying on the covariate itself is refused, since the mean is then constant in each
+stratum.
+
+#### Validation of the mean-covariate curve {#km-vpc-kmmc-validation}
+
+NONMEM has no Kaplan–Meier estimator, so there is no NONMEM spelling of this curve either. The
+reference is the risk sets of R's `survfit` 3.8.12 with the mean taken in R:
+`tests/kmmc_survfit_reference.rs` runs the kernel and `vpc_kmmc()`, stratified, on 120
+subjects in two strata with a weight and a 0/1 sex (15 rows with tied events, 12 with an event
+and a censoring at one time) and matches every row: the counts exactly, the means within
+2.2e-14 (about one unit in the last place of a weight mean near 71). The R means agree with
+exact fractions to 1.25e-16 relative.
+
+`tests/vpc_kmmc_self_consistency.rs` draws 200 datasets outside the simulator (100 subjects, a
+normal covariate with log hazard ratio 0.7, uniform dropout, `H = 30`) and runs a
+200-replicate VPC of each. Under the data's own model the observed curve lies inside the band
+in 90.5 %, 92 % and 91.5 % of datasets at H/4, 3H/8 and H/2, inside the 99 % binomial interval
+(83 %–94.5 %) around the 89.1 % a band from 200 replicates covers. Under a model without the
+covariate effect, with the overall rate matched, it lies outside in 82 % of datasets at H/4
+(81.5 % and 79 % later), while the Kaplan–Meier band of that model still covers 84 % at H/4.
+
 ### What it refuses
 
 `vpc_tte()` returns `E_VPC_TTE_INPUT` rather than a wrong curve for: several TTE endpoints and
@@ -1124,6 +1219,11 @@ endpoint, which `vpc_tte()` draws; left truncation (the simulator supports it fo
 events, but these risk sets have no delayed entry yet); interval-censored records; a
 subject's records out of time order; `max_order = 0`; and the same replicate, probability and
 stratification checks.
+
+`vpc_kmmc()` returns the same code for everything `vpc_tte()` refuses, and also for: no
+covariate named (`VpcKmmcOptions::default()` leaves it empty); a repeated-events endpoint (a mean covariate by event order is not supported yet); a subject on
+the endpoint that lacks the covariate, or whose baseline value is missing; a `level` no subject
+has; and stratifying on the covariate itself.
 
 Cumulative-incidence VPCs, binned strata and left truncation are planned follow-ups.
 
