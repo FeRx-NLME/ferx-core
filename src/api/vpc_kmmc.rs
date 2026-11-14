@@ -26,10 +26,22 @@
 //! 3H/4 with kept times, 0.89 / 0.925 with the unconditional draw (#1886 PR3 plan M5).
 //! The draw assumes what `G` already assumes: censoring is independent of the
 //! covariate within a stratum, so stratify on what drives dropout.
+//!
+//! **The data on `[0, H]` only.** The observed records are cut at `H` by the same helper
+//! as [`vpc_tte`](super::vpc_tte)'s, and as [`vpc_rtte`](super::vpc_rtte) cuts its
+//! streams (#2955): a record after `H` becomes a censoring at `H`, and an event exactly
+//! at `H` is kept, so
+//! the result is the one for the data cut at `H` first. The censoring distribution `G`
+//! below `H` reads only risk sets before `H`, which the cut leaves alone, so every draw
+//! under `H` is unchanged and a draw at or past `H` censors no replicate time: the band
+//! and the observed curve on `[0, H]` are the same either way. What changes is the raw
+//! `observed` curve, which now ends at `H`, and `obs_on_grid` at a
+//! [`VpcGrid::Times`](crate::VpcGrid::Times) point past `H`, now `None`. With
+//! `sim.horizon` unset `H` is the latest record and nothing is cut.
 
 use super::vpc_tte::{
-    check_band_options, observed_rows, refuse, resolve_cmt, simulate_replicates, stratum_grid,
-    Entry, TteCensorRule, VpcCensoring, VpcStratify, VpcTteOptions,
+    check_band_options, horizon_and_cut, observed_rows, refuse, resolve_cmt, simulate_replicates,
+    stratum_grid, Entry, TteCensorRule, VpcCensoring, VpcStratify, VpcTteOptions,
 };
 use crate::diagnostics::EngineError;
 use crate::stats::km::{kaplan_meier_mean_covariate, vpc_band_kmmc, KmmcCurve};
@@ -231,7 +243,7 @@ pub fn vpc_kmmc(
         )));
     }
     let cmt = resolve_cmt(WHO, model, vpc.cmt)?;
-    let (rows, values, labels) = observed_rows(WHO, population, cmt, &vpc.stratify)?;
+    let (mut rows, values, labels) = observed_rows(WHO, population, cmt, &vpc.stratify)?;
 
     let by_id: HashMap<&str, &Subject> = population
         .subjects
@@ -245,11 +257,7 @@ pub fn vpc_kmmc(
         .into_iter()
         .collect();
 
-    let horizon = vpc.sim.horizon.unwrap_or_else(|| {
-        rows.iter()
-            .map(|r| r.time)
-            .fold(f64::NEG_INFINITY, f64::max)
-    });
+    let horizon = horizon_and_cut(&mut rows, vpc.sim.horizon);
     let n_strata = values.len();
     let (reps, sim_warnings) = simulate_replicates(
         model,
