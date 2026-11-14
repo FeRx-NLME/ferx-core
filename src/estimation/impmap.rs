@@ -4063,6 +4063,7 @@ fn run_mcem_mixture(
         pmix: meval.pmix,
         mixest: meval.mixest,
         n_fd_h_redone: meval.n_fd_h_redone,
+        class_nll: meval.class_nll,
     });
 
     // ---- Covariance step (mixture-aware) ----

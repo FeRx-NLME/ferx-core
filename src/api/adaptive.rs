@@ -86,8 +86,10 @@ pub(crate) fn check_adaptive_model_data(
 /// Time-varying covariates (and a `TIME`-in-PK model) are **no longer** rejected:
 /// the driver recomputes PK per event/segment from the covariate active in that
 /// segment (#700). Inter-occasion variability (IOV / `kappa`) is **no longer**
-/// rejected either: a fresh κ is drawn per decision window and threaded through the
-/// per-segment eta (#701), with occasion = decision index. System-reset events
+/// rejected either: a fresh κ is drawn per decision (occasion g starts at decision g)
+/// and threaded through the per-segment eta (#701). A segment runs under the κ of the
+/// record that ends it, so a window whose last record sits on decision g+1 runs under
+/// κ_{g+1}, not κ_g (#2771). System-reset events
 /// (EVID=3) are **no longer** rejected: the reactive driver now zeros the
 /// compartments at each reset and turns off infusions opened before it, and the
 /// frozen-replay verifier is reset-aware, so the reset is honored and checked (#716).
@@ -1214,10 +1216,12 @@ where
             };
             eta_slice.resize(n_eta + model.n_kappa, 0.0);
 
-            // Inter-occasion variability (#701): draw a fresh κ per decision window
-            // and build the per-window eta `[η_bsv | κ_g]` the driver threads through
-            // each segment, plus `decision_pk[g]` = the PK at decision g under
-            // occasion g's κ. Occasion = decision index (per-decision-window). κ is
+            // Inter-occasion variability (#701): draw a fresh κ per decision and build
+            // the per-occasion eta `[η_bsv | κ_g]`, plus `decision_pk[g]` = the PK at
+            // decision g under occasion g's κ. Occasion g starts at decision g. The
+            // driver threads into each segment the eta of the record that ENDS it, so
+            // the window after decision g runs under κ_{g+1} when a record sits on
+            // decision g+1 (#2771); `decision_pk[g]` is what the decision reads. κ is
             // drawn on a dedicated substream keyed by (subject, replicate), disjoint
             // from the η and assay streams, so a non-IOV model (`n_kappa == 0`) draws
             // nothing and this whole block is skipped — the path stays byte-identical.

@@ -7757,7 +7757,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     #[allow(clippy::if_same_then_else)]
     let (severity, category) = if lower.starts_with("multi-start:") {
         // #2799: the multi-start notes `fit()` appends to the returned run — "k of n starts
-        // failed: <errors>" and "best result from start k/n". A prefix-token arm ahead of
+        // failed: <errors>" and the #2867 summary of the starts. A prefix-token arm ahead of
         // *every* other arm, because the failure note interpolates the sibling starts' own
         // error text: a "did not converge" or covariance-failure phrase in it would land on a
         // Critical arm and mark a healthy returned fit as failing. The note is about runs that
@@ -9006,6 +9006,11 @@ pub struct FitResult {
     /// `n_starts == 1` (no perturbation applied) or when no seed was set and
     /// the run used a random seed derived from the system clock.
     pub multi_start_seed: Option<u64>,
+    /// What each start of a multi-start fit did (#2867): one [`StartRecord`] per start, in
+    /// start order, exactly one of them `selected`. Empty when `n_starts == 1`. The other
+    /// starts' full results are not kept; these rows are what remains of them.
+    #[serde(default)]
+    pub starts: Vec<StartRecord>,
     /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
     /// when no explicit seed was set in `[fit_options]`.
     pub saem_seed: Option<u64>,
@@ -9319,6 +9324,14 @@ impl FitResult {
             map.insert(
                 "status".to_string(),
                 serde_json::to_value(self.status()).expect("FitStatus is serializable"),
+            );
+            // #2911: the parameter estimates keyed by name, in the fit YAML's own layout —
+            // `estimates.theta.CL.estimate` is the YAML's `theta.CL.estimate` — so a reader
+            // of final estimates does not branch on which file it was handed. Derived, like
+            // `status`: `from_json_str` ignores it and reads the vectors above.
+            map.insert(
+                "estimates".to_string(),
+                crate::io::output::estimates_json(self),
             );
         }
         v
@@ -12365,6 +12378,12 @@ pub struct ParsedModel {
 #[path = "types_fit_status.rs"]
 mod fit_status;
 pub use fit_status::{FitStatus, StatusReason};
+
+// #2867: what each start of a multi-start fit did, and the summary of their spread.
+#[path = "types_multi_start.rs"]
+mod multi_start;
+pub use multi_start::StartRecord;
+pub(crate) use multi_start::{StartSpread, START_AGREE_OFV};
 
 /// Factories that build minimal `CompiledModel` instances for unit tests.
 /// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests

@@ -980,6 +980,75 @@ mod tests {
         exercise::<DualMixed<1, 2>>(DualMixed::var(0.7, 0));
     }
 
+    /// `sqrt` at a zero argument — `0.0`, `-0.0`, a rounded-negative `-1e-18`, each raw and
+    /// through the bytecode VM's `guard_floor(0.0)` — is flat on **every** `PkNum` type: a
+    /// constant with a finite, zero jet and no tape node (#2892). Before, `Dual1`/`Dual2`
+    /// returned a constant while `DualV`/`DualF`, `R`/`DualT`/`DualH` and `Taylor` put
+    /// `0.5 / 0 = inf` into the chain (`inf` with a live tangent, `NaN` with a floored one),
+    /// so which derivative engine served a subject depended on whether `sqrt`'s argument
+    /// touched zero. Each input is seeded *live* (a unit tangent, and a tape input where the
+    /// type has a θ tape), so the old rule shows up as a non-finite or taped result; the
+    /// `0.25` control straddles the gate, so an implementation that is flat everywhere
+    /// fails too.
+    #[test]
+    fn sqrt_at_zero_is_flat_on_every_pknum_type() {
+        use crate::sens::rtape::{rinput, rtape_reset, DualH, DualT, R};
+        use crate::sens::taylor::Taylor;
+        use crate::sens::vfree::DualF;
+        use crate::sens::vtape::{vtape_reset, DualV};
+
+        fn check<T: PkNum>(name: &str, mk: impl Fn(f64) -> T) {
+            for x in [0.0, -0.0, -1e-18] {
+                for floored in [false, true] {
+                    let a = if floored {
+                        mk(x).guard_floor(0.0)
+                    } else {
+                        mk(x)
+                    };
+                    let y = a.sqrt();
+                    assert!(
+                        y.jets_finite() && y.is_constant(),
+                        "{name}: sqrt({x:e}, floored = {floored}) is not flat \
+                         (val = {}, jets_finite = {}, constant = {})",
+                        y.val(),
+                        y.jets_finite(),
+                        y.is_constant()
+                    );
+                    if floored || x == 0.0 {
+                        assert_eq!(y.val(), 0.0, "{name}: sqrt({x:e}) value");
+                    }
+                }
+            }
+            let y = mk(0.25).sqrt();
+            assert_eq!(y.val(), 0.5, "{name}: sqrt(0.25) value");
+            assert!(
+                y.jets_finite() && !y.is_constant(),
+                "{name}: sqrt(0.25) must carry a live derivative"
+            );
+        }
+
+        rtape_reset();
+        vtape_reset(2);
+        check("Dual1", |x| Dual1::<1>::var(x, 0));
+        check("Dual2", |x| Dual2::<1>::var(x, 0));
+        check("DualMixed", |x| DualMixed::<1, 2>::var(x, 0));
+        check("DualV", |x| DualV::<1, 1>::leaf(x, [1.0], [0.0]));
+        check("DualF", |x| DualF::<1, 1>::var(x, 0));
+        check("R", |x| -> R { rinput(x) });
+        check("DualT", |x| DualT::<1, R> {
+            v: rinput(x),
+            g: [R::c(1.0)],
+        });
+        check("DualH", |x| DualH::<1, 1, R> {
+            v: rinput(x),
+            g: [R::c(1.0)],
+            h: [R::c(0.0)],
+        });
+        check("Taylor", |x| Taylor::<1, 2, 3>::seed(x, 0));
+        rtape_reset();
+        vtape_reset(2);
+    }
+
     /// `guard_floor(NaN)` must floor (return `lo`) on the duals exactly as it does on
     /// `f64` (`NaN.max(lo) == lo`) — a sub-floor / `NaN` value lands in the flat
     /// clamped region, so the dual's value is `lo` and its jet is zero. Without this,

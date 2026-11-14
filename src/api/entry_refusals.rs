@@ -125,7 +125,8 @@ pub(crate) fn simulate_horizon(message: impl Into<String>) -> EngineError {
 
 /// `E_DATA_PATH_MISSING`: a file entry point (`fit_from_files`, `prepare_run` and the
 /// `run_model_with_data*` family) was given no data path and the model file has no
-/// `[data]` block, so there is nothing to fit against (#1788). `ferx check` skips its
+/// `[data] path` — no `[data]` block, or one that only maps columns (#2914) — so
+/// there is nothing to fit against (#1788). `ferx check` skips its
 /// data checks in that case instead of refusing, so only the entry points raise it.
 /// `resolve_data_path` keeps returning the same text as a `String`.
 pub(crate) fn data_path_missing(message: String) -> EngineError {

@@ -11,7 +11,12 @@
 //!   (as the reset oracles in `adaptive_sim_tests.rs`); [`ORACLE_TOL`] is measured;
 //! - the **frozen-schedule replay**, on by default in every run here, whose `Ok` is part of
 //!   each assertion: on the time-varying / IOV cells it is the replay
-//!   `adaptive_frozen_replay_tv`, so those cells are its side of the mutation check;
+//!   `adaptive_frozen_replay_tv`, so those cells are its side of the mutation check for what
+//!   the replay does itself (the on/off rows, the reset clear, the timeline). Not for a dose
+//!   arrival: since #2811 the driver and both replays apply an arrival through one function
+//!   (`apply_prescheduled_boluses_at`), so a defect there moves them together and the replay
+//!   stays `Ok`. Those cells catch it through `predict()`, and
+//!   `frozen_replay_tv_applies_cmt_toggles_like_the_closed_form` through a closed form;
 //! - **closed forms** for the window AUC and for what a monitor reads.
 //!
 //! The driver-level closed-form tests (and the per-side mutation split) live in
@@ -508,11 +513,9 @@ fn adaptive_auc_window_spanning_an_off_interval() {
     );
 }
 
-/// IOV × on/off rows: per-decision κ on the driver and on `adaptive_frozen_replay_tv`; the
-/// replay's `Ok` is the assertion (#2753).
-#[test]
-fn adaptive_cmt_toggle_under_iov_passes_the_replay() {
-    let model = r#"
+/// Oral 1-cpt `[odes]` model with a per-occasion κ on CL, so a run takes the per-event path
+/// under IOV and its verifier is `adaptive_frozen_replay_tv`.
+const GUT_IOV: &str = r#"
 [parameters]
   theta TVKA(0.3, 0.01, 10.0)
   theta TVCL(5.0, 0.1, 50.0)
@@ -535,7 +538,12 @@ fn adaptive_cmt_toggle_under_iov_passes_the_replay() {
 [error_model]
   DV ~ proportional(PROP)
 "#;
-    let m = parse_model_string(model).expect("parse");
+
+/// IOV × on/off rows: per-decision κ on the driver and on `adaptive_frozen_replay_tv`; the
+/// replay's `Ok` is the assertion (#2753).
+#[test]
+fn adaptive_cmt_toggle_under_iov_passes_the_replay() {
+    let m = parse_model_string(GUT_IOV).expect("parse");
     assert_eq!(m.n_kappa, 1);
     let res = run(&m, &oracle_rows(), &[0.0, 6.0, 12.0], vec![], depot_bolus)
         .expect("runs and passes adaptive_frozen_replay_tv");
@@ -673,4 +681,224 @@ fn adaptive_dead_lagged_dose_does_not_turn_its_compartment_on() {
     let got = ipreds(&res);
     let worst = worst_rel(&got, &want);
     assert!(worst < 1e-4, "worst rel {worst:e}: {got:?} vs {want:?}");
+}
+
+/// Oral 1-cpt `[odes]` model with CL on a time-varying `CRCL`, so a run takes the per-event
+/// path and its verifier is `adaptive_frozen_replay_tv`.
+const GUT_CRCL: &str = r#"
+[parameters]
+  theta TVKA(0.3, 0.01, 10.0)
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP ~ 0.04
+[individual_parameters]
+  KA = TVKA
+  CL = TVCL * CRCL / 100.0
+  V  = TVV
+[structural_model]
+  ode(states=[depot, central])
+[odes]
+  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (CL / V) * central / (1 + central / 200)
+[scaling]
+  y[CMT=1] = depot
+  y[CMT=2] = central
+[error_model]
+  DV ~ proportional(PROP)
+"#;
+
+/// A held run on `pop` (one decision at 7, no dose), with the verifier on, and `predict()` on
+/// the same subject. The decision sits on an observation's time, so the driver breaks where
+/// `predict()` does and the two walk the same segments.
+fn held_run_and_predict(
+    m: &CompiledModel,
+    pop: &Population,
+) -> (Result<AdaptiveSimulationResult, EngineError>, Vec<f64>) {
+    let opts = AdaptiveSimulateOptions {
+        seed: Some(7),
+        decision_times: vec![7.0],
+        ..Default::default() // verify = true
+    };
+    let hold = |_: &ControllerCtx| vec![DoseAction::Hold];
+    let res = simulate_adaptive(m, pop, &m.default_params, 1, || hold, &opts);
+    let want = predict(m, pop, &m.default_params)
+        .expect("predict the static twin")
+        .iter()
+        .map(|p| p.pred)
+        .collect();
+    (res, want)
+}
+
+/// An off row inside an `ADDL` train stops the rest of the train (#2732: an implied dose
+/// takes its cutoff from its parent's record), in the driver **and** in
+/// `adaptive_frozen_replay_tv` (#2811). The train is 100 into `depot` at 0, 4, 8 and 12;
+/// `depot` goes off at 6, so the doses at 8 and 12 never land and nothing turns `depot` back
+/// on. Before #2811 the replay's own bolus loop had no `ResetGate::live` test: it applied
+/// both doses (129.0 at t = 9 against the driver's 103.3), and the verifier refused the run.
+///
+/// The replay's `Ok` is its side of the assertion; `predict()` (`event_driven_walk`, which
+/// #2737 anchored against NONMEM) is the driver's. The twin without the off row is far away,
+/// so the cut is live.
+#[test]
+fn adaptive_off_row_inside_an_addl_train_passes_the_replay() {
+    let m = parse_model_string(GUT_CRCL).expect("parse");
+    let data = |off_row: bool| {
+        let mut s = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,CRCL,ADDL,II\n");
+        s.push_str("1,0,0,1,100,1,1,100,3,4\n1,1,0,0,0,2,0,100,0,0\n");
+        if off_row {
+            s.push_str("1,6,0,2,0,-1,1,60,0,0\n");
+        }
+        s.push_str("1,7,0,0,0,2,0,60,0,0\n1,9,0,0,0,2,0,40,0,0\n");
+        s.push_str("1,13,0,0,0,2,0,120,0,0\n1,16,0,0,0,2,0,120,0,0\n");
+        read_pop(&s, &["CRCL"])
+    };
+    let pop = data(true);
+    assert!(pop.subjects[0].has_tv_covariates());
+    assert_eq!(pop.subjects[0].doses.len(), 4, "the train is expanded");
+
+    let (res, want) = held_run_and_predict(&m, &pop);
+    let got = ipreds(&res.expect("runs and passes adaptive_frozen_replay_tv"));
+    let worst = worst_rel(&got, &want);
+    eprintln!("tv covariate × ADDL train cut by an off row: worst rel {worst:e}");
+    assert!(
+        worst < ORACLE_TOL,
+        "worst rel {worst:e}: {got:?} vs {want:?}"
+    );
+
+    let (uncut, _) = held_run_and_predict(&m, &data(false));
+    let uncut = ipreds(&uncut.expect("the uncut train runs"));
+    // Observations at 9, 13 and 16 follow the doses the off row cancels.
+    for j in 2..5 {
+        assert!(
+            uncut[j] > 1.2 * got[j],
+            "obs {j}: the cancelled doses are missing ({} vs uncut {})",
+            got[j],
+            uncut[j]
+        );
+    }
+}
+
+/// The IOV side of `adaptive_off_row_inside_an_addl_train_passes_the_replay` (#2811, review
+/// r1 #1): the same `ADDL` train into `depot`, cut by an off row at 6, with a per-occasion κ
+/// on CL and three decision windows. The replay's `Ok` is the assertion: with its arrival
+/// pass on the old hand-rolled loop it applied the doses at 8 and 12 and the verifier
+/// refused the run (measured in review: 60.77 against 84.64).
+///
+/// There is no `predict()` twin here, as in `adaptive_cmt_toggle_under_iov_passes_the_replay`:
+/// the κ of each window is drawn inside the run. The uncut twin runs on the same seed, so
+/// the same κ, and is far away at the observations after the cancelled doses. The twin with
+/// only the first two doses written out, on the same seed, is the reference for the value.
+///
+/// Mutations measured: the replay alone ignoring `off_at` at an arrival fails the verifier
+/// here; `ResetGate::live` removed from `apply_prescheduled_boluses_at` (driver and replay
+/// together) leaves the verifier `Ok` and fails the written-out twin.
+#[test]
+fn adaptive_off_row_inside_an_addl_train_passes_the_replay_under_iov() {
+    let m = parse_model_string(GUT_IOV).expect("parse");
+    assert_eq!(m.n_kappa, 1);
+    // `doses`: the dose rows, before the observation at 1.
+    let run = |doses: &str, n_doses: usize, off_row: bool| {
+        let mut s = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,ADDL,II\n");
+        s.push_str(doses);
+        s.push_str("1,1,0,0,0,2,0,0,0\n");
+        if off_row {
+            s.push_str("1,6,0,2,0,-1,1,0,0\n");
+        }
+        s.push_str("1,7,0,0,0,2,0,0,0\n1,9,0,0,0,2,0,0,0\n");
+        s.push_str("1,13,0,0,0,2,0,0,0\n1,16,0,0,0,2,0,0,0\n");
+        let pop = read_pop(&s, &[]);
+        assert_eq!(pop.subjects[0].doses.len(), n_doses);
+        let opts = AdaptiveSimulateOptions {
+            seed: Some(7),
+            decision_times: vec![0.0, 7.0, 13.0],
+            ..Default::default() // verify = true
+        };
+        let hold = |_: &ControllerCtx| vec![DoseAction::Hold];
+        simulate_adaptive(&m, &pop, &m.default_params, 1, || hold, &opts)
+    };
+    let train = "1,0,0,1,100,1,1,3,4\n";
+    let got =
+        ipreds(&run(train, 4, true).expect("runs and passes adaptive_frozen_replay_tv under IOV"));
+    let uncut = ipreds(&run(train, 4, false).expect("the uncut train runs"));
+    assert!(
+        got.iter().chain(&uncut).all(|x| x.is_finite() && *x > 0.0),
+        "{got:?} / {uncut:?}"
+    );
+    // The cut train is the regimen with only its first two doses written out: same seed,
+    // same decisions, so the same κ per window. This is what pins the driver's side under
+    // IOV: the replay's `Ok` cannot, since both apply an arrival through one function.
+    let written = ipreds(
+        &run("1,0,0,1,100,1,1,0,0\n1,4,0,1,100,1,1,0,0\n", 2, true)
+            .expect("the written-out twin runs"),
+    );
+    let worst = worst_rel(&got, &written);
+    eprintln!("IOV × ADDL train cut by an off row vs its written-out twin: worst rel {worst:e}");
+    // Measured on macOS arm64: 4.8e-16 (this model is linear, and the two runs differ only
+    // in the breaks at the cancelled arrivals). 1e-12 is 2,000× that; a cancelled dose that
+    // lands moves these by tens of percent.
+    assert!(worst < 1e-12, "worst rel {worst:e}: {got:?} vs {written:?}");
+    // Observations at 9, 13 and 16 follow the doses the off row cancels.
+    for j in 2..5 {
+        assert!(
+            uncut[j] > 1.2 * got[j],
+            "obs {j}: the cancelled doses are missing ({} vs uncut {})",
+            got[j],
+            uncut[j]
+        );
+    }
+}
+
+/// An off row at exactly a base dose's time stops that dose (the engines' order,
+/// `Dose < PkOnly`; `CoTimedOff::Stops`), in the driver and in `adaptive_frozen_replay_tv`
+/// (#2811). Only a subject built in memory holds such a tie: the reader puts the row a ULP
+/// after the dose, where the dose lands and the row then zeroes it, which gives the same
+/// trajectory by another route and is asserted first. Before #2811 the replay applied the
+/// tied dose and left `depot` on (77.0 at t = 4 against the driver's 51.5), and the verifier
+/// refused the run. The twin without the off row is far away, so the row is live.
+#[test]
+fn adaptive_off_row_tied_with_a_base_dose_passes_the_replay() {
+    let m = parse_model_string(GUT_CRCL).expect("parse");
+    let data = |off_row: bool| {
+        let mut s = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,CRCL\n");
+        s.push_str("1,0,0,1,100,1,1,100\n1,1,0,0,0,2,0,100\n1,3,0,1,100,1,1,60\n");
+        if off_row {
+            s.push_str("1,3,0,2,0,-1,1,60\n");
+        }
+        s.push_str("1,4,0,0,0,2,0,60\n1,7,0,0,0,2,0,40\n");
+        read_pop(&s, &["CRCL"])
+    };
+    let mut pop = data(true);
+
+    // As read: the row sits one ULP after the dose.
+    let (res, want) = held_run_and_predict(&m, &pop);
+    let as_read = ipreds(&res.expect("as read: runs and passes the replay"));
+    let worst = worst_rel(&as_read, &want);
+    assert!(worst < ORACLE_TOL, "as read: worst rel {worst:e}");
+
+    // Tied: the row stops the dose at its arrival.
+    let s = &mut pop.subjects[0];
+    let row = s.cmt_toggles[0].pk_only;
+    assert_eq!(s.pk_only_times[row], s.doses[1].time.next_up());
+    s.pk_only_times[row] = s.doses[1].time;
+    let (res, want) = held_run_and_predict(&m, &pop);
+    let tied = ipreds(&res.expect("tied: runs and passes adaptive_frozen_replay_tv"));
+    let worst = worst_rel(&tied, &want);
+    eprintln!("tv covariate × off row tied with a base dose: worst rel {worst:e}");
+    assert!(
+        worst < ORACLE_TOL,
+        "tied: worst rel {worst:e}: {tied:?} vs {want:?}"
+    );
+
+    let (kept, _) = held_run_and_predict(&m, &data(false));
+    let kept = ipreds(&kept.expect("the twin without the off row runs"));
+    // The dose at 3 has 1 h of absorption behind it at t = 4, and 4 h at t = 7.
+    for j in 1..3 {
+        assert!(
+            kept[j] > 1.2 * tied[j],
+            "obs {j}: the stopped dose is missing ({} vs kept {})",
+            tied[j],
+            kept[j]
+        );
+    }
 }
