@@ -831,6 +831,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         optimizer: "bobyqa".to_string(),
         n_starts: 1,
         multi_start_seed: None,
+        starts: Vec::new(),
         saem_seed: None,
         sir_seed: None,
         sir_settings: None,
@@ -1115,6 +1116,7 @@ fn uncertainty_skips_flip_flop_draws_without_panicking() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(7),
+        horizon: None,
     };
     // Must return Ok rather than panicking (the #786 regression).
     let rows = simulate_with_uncertainty(&model, &pop, &fit, &opts)
@@ -1196,6 +1198,7 @@ fn skip_run(model: &CompiledModel, var: f64, n: usize, seed: u64) -> (String, Ve
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(seed),
+        horizon: None,
     };
     let out = simulate_with_uncertainty_diag(model, &pop, &fit, &opts).expect("some draws run");
     let skipped: Vec<usize> = (1..=n)
@@ -1418,6 +1421,7 @@ fn uncertainty_refuses_when_every_draw_is_skipped() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(ALL_SKIP_SEED),
+        horizon: None,
     };
     let err = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
         .expect_err("every draw skipped must be refused");
@@ -1473,6 +1477,7 @@ fn uncertainty_without_skips_carries_no_skip_warning() {
                 n_sim_per_draw: 1,
                 method: UncertaintyMethod::Asymptotic,
                 seed: Some(7),
+                horizon: None,
             };
             let out = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
                 .unwrap_or_else(|e| panic!("{name} n={n}: {e}"));
@@ -1515,6 +1520,7 @@ fn uncertainty_refuses_a_flip_flop_point_estimate() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(7),
+        horizon: None,
     };
     let err = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
         .expect_err("a flip-flop point estimate must be refused");
@@ -2671,6 +2677,7 @@ fn uncertainty_reports_the_tally_alongside_the_skipped_draws() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(42),
+        horizon: None,
     };
     let out = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts).expect("some draws run");
     let ran: std::collections::BTreeSet<usize> = out.results.iter().map(|r| r.draw).collect();
@@ -2734,6 +2741,7 @@ fn asymptotic_row_count_and_draw_range() {
         n_sim_per_draw: 2,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(7),
+        horizon: None,
     };
     let rows = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap();
     // 3 draws * 2 sims * 2 subjects * 3 obs = 36 rows
@@ -3566,6 +3574,7 @@ fn sir_path_reuses_pool() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Sir,
         seed: Some(11),
+        horizon: None,
     };
     let rows = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap();
     // 5 draws * 1 sim * 2 subjects * 3 obs = 30 rows
@@ -3583,6 +3592,7 @@ fn asymptotic_errors_without_covariance_step() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(0),
+        horizon: None,
     };
     let err = simulate_with_uncertainty(&model, &pop, &fit, &opts).unwrap_err();
     assert!(err.to_string().contains("covariance"));
@@ -3614,6 +3624,7 @@ fn asymptotic_refuses_a_logit_theta_outside_the_unit_interval_with_its_code() {
         n_sim_per_draw: 1,
         method,
         seed: Some(0),
+        horizon: None,
     };
     let e = simulate_with_uncertainty(&model, &pop, &fit, &opts(2, UncertaintyMethod::Asymptotic))
         .unwrap_err();
@@ -3679,6 +3690,7 @@ fn spread_default_matches_exhaustive_literal() {
         n_sim_per_draw: 2,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(42),
+        horizon: None,
     };
     let spread = SimulateUncertaintyOptions {
         n_uncertainty_draws: 3,
@@ -3895,6 +3907,7 @@ fn draw_independent_preconditions_run_once_per_call() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(7),
+        horizon: None,
     };
     let (out, runs) =
         draw_independent_runs(|| simulate_with_uncertainty_diag(&model, &pop, &fit, &opts));
@@ -3957,8 +3970,280 @@ fn draw_independent_preconditions_run_when_draw_one_is_skipped() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(seed),
+        horizon: None,
     };
     let err = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
         .expect_err("a modeled-duration dose with no `D1` is refused even with draw 1 skipped");
     assert_eq!(err.code(), Some("E_MODELED_DURATION_NO_PARAM"), "{err}");
+}
+
+// ---- #2003: `SimulateUncertaintyOptions::horizon` ----
+
+/// A row as a string that is equal exactly when the rows are bit-identical (the two `f64`
+/// fields by their bits; the outcome's `Debug` prints a float round-trip exactly).
+fn row_bits(r: &SimulationResult) -> String {
+    format!(
+        "draw {} sim {} id {} time {:016x} cmt {} ipred {:016x} {:?} {:?}",
+        r.draw,
+        r.sim,
+        r.id,
+        r.time.to_bits(),
+        r.cmt,
+        r.ipred.to_bits(),
+        r.outcome,
+        r.mixnum
+    )
+}
+
+fn uncertainty_horizon_opts(n: usize, per: usize, h: Option<f64>) -> SimulateUncertaintyOptions {
+    SimulateUncertaintyOptions {
+        n_uncertainty_draws: n,
+        n_sim_per_draw: per,
+        method: UncertaintyMethod::Asymptotic,
+        seed: Some(2003),
+        horizon: h,
+    }
+}
+
+/// `n` TTE subjects with one right-censored record at `window` on `cmt`, each dosed
+/// `amt(i)` into compartment 1 at time 0 (the dose is inert on a model with no drug effect).
+#[cfg(feature = "survival")]
+fn horizon_tte_population(n: usize, cmt: usize, window: f64, amt: fn(usize) -> f64) -> Population {
+    let subjects = (0..n)
+        .map(|i| Subject {
+            id: format!("T{}", i + 1),
+            doses: vec![DoseEvent::new(0.0, amt(i), 1, 0.0, false, 0.0)],
+            obs_records: vec![ObsRecord::Event {
+                time: window,
+                event_type: crate::types::EventType::RightCensored,
+                entry_time: 0.0,
+                cmt,
+            }],
+            ..Default::default()
+        })
+        .collect();
+    Population {
+        subjects,
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+    }
+}
+
+/// The two models that *require* a horizon, each with a population and a horizon under
+/// which some replicates fire before it and some are censored at it.
+#[cfg(feature = "survival")]
+fn horizon_required_fixtures() -> Vec<(&'static str, CompiledModel, Population, f64)> {
+    use crate::parser::model_parser::parse_model_string;
+    let read = |path: &str| {
+        parse_model_string(&std::fs::read_to_string(path).expect("example")).expect("parse")
+    };
+    vec![
+        (
+            "RTTE",
+            read("examples/rtte_exponential.ferx"),
+            horizon_tte_population(4, 2, 20.0, |_| 100.0),
+            8.0,
+        ),
+        (
+            "ODE hazard",
+            read("examples/pktte_joint.ferx"),
+            horizon_tte_population(4, 3, 20.0, |i| 5.0 * (i + 1) as f64),
+            12.0,
+        ),
+    ]
+}
+
+/// Asserts the rows hold an event strictly before `h` and a censor row at exactly `h`, so
+/// a test on them reads both sides of the horizon.
+#[cfg(feature = "survival")]
+fn assert_straddles_horizon(name: &str, rows: &[SimulationResult], h: f64) {
+    let event_before = rows.iter().any(|r| {
+        matches!(r.outcome, crate::types::SimOutcome::Event { observed: true, time } if time < h)
+    });
+    let censored_at = rows.iter().any(|r| {
+        matches!(r.outcome, crate::types::SimOutcome::Event { observed: false, time } if time == h)
+    });
+    assert!(
+        event_before && censored_at,
+        "{name}: the fixture must hold an event before {h} ({event_before}) and a censor row \
+         at exactly {h} ({censored_at})"
+    );
+}
+
+/// The degenerate oracle (#2003): a draw equal to the point estimate reproduces
+/// `simulate_with_options` under the same horizon, bit for bit. Two draws of θ̂ with 3
+/// replicates each equal one 6-replicate run from the same seed, `(draw d, sim j)` being
+/// `sim 3(d − 1) + j`.
+///
+/// At `simulate_uncertainty_draws`, not the public entry: both samplers consume the run's RNG
+/// before the first simulated subject, so `simulate_with_uncertainty(seed)` is at another
+/// RNG position than `simulate_with_options(seed)` whatever the covariance. The public half
+/// (`opts` → validation → draws) is `uncertainty_horizon_censors_every_draw_at_the_horizon`.
+///
+/// Mutations: pass `None` to the per-draw call (the chokepoint refuses: dies on `expect`),
+/// pass any other horizon (row times differ), drop it for draw 2 only (second half differs).
+#[cfg(feature = "survival")]
+#[test]
+fn uncertainty_draw_at_the_point_estimate_reproduces_simulate_with_options() {
+    use rand::SeedableRng;
+    const SEED: u64 = 2003;
+    for (name, model, pop, h) in horizon_required_fixtures() {
+        let p = &model.default_params;
+        let want = simulate_with_options(
+            &model,
+            &pop,
+            p,
+            6,
+            &SimulateOptions {
+                seed: Some(SEED),
+                horizon: Some(h),
+                ..Default::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("{name}: options path: {e}"));
+        assert_straddles_horizon(name, &want, h);
+
+        let draws = vec![p.clone(), p.clone()];
+        let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+        let mut got = Vec::new();
+        let mut warnings = Vec::new();
+        super::simulate::simulate_uncertainty_draws(
+            &model,
+            &pop,
+            &draws,
+            &uncertainty_horizon_opts(2, 3, Some(h)),
+            SEED,
+            &mut rng,
+            &mut got,
+            &mut warnings,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{name}: uncertainty draws: {e}"));
+
+        // Both draws are present before they are folded onto the options path's indices.
+        let draw_ids: std::collections::BTreeSet<usize> = got.iter().map(|r| r.draw).collect();
+        assert_eq!(draw_ids, [1, 2].into(), "{name}");
+        for r in &mut got {
+            r.sim += 3 * (r.draw - 1);
+            r.draw = 1;
+        }
+        assert_eq!(got.len(), want.len(), "{name}: row count");
+        for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(row_bits(g), row_bits(w), "{name}: row {k}");
+        }
+    }
+}
+
+/// The public entry with a horizon, on the two models that require one (#2003): accepted,
+/// no row is past the horizon, and **in every draw** each censor row sits at exactly the
+/// horizon and at least one does; every draw is present, and the row-only wrapper returns
+/// the `_diag` form's rows.
+///
+/// Mutations: hand the entry validation `None` in place of `opts.horizon` and both models
+/// are refused (`E_SIMULATE_HORIZON`); halve the horizon for every draw but the first and
+/// the later draws censor at `h / 2`.
+#[cfg(feature = "survival")]
+#[test]
+fn uncertainty_horizon_censors_every_draw_at_the_horizon() {
+    for (name, model, pop, h) in horizon_required_fixtures() {
+        let fit = synthetic_fit(&model.default_params);
+        let opts = uncertainty_horizon_opts(4, 3, Some(h));
+        let rows = simulate_with_uncertainty(&model, &pop, &fit, &opts)
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_straddles_horizon(name, &rows, h);
+        for r in &rows {
+            assert!(
+                r.time.is_finite() && r.time <= h,
+                "{name}: row past the horizon: {}",
+                row_bits(r)
+            );
+        }
+        let draw_ids: std::collections::BTreeSet<usize> = rows.iter().map(|r| r.draw).collect();
+        assert_eq!(draw_ids, (1..=4).collect(), "{name}");
+        for draw in 1..=4 {
+            let censor_times: Vec<f64> = rows
+                .iter()
+                .filter(|r| r.draw == draw)
+                .filter_map(|r| match r.outcome {
+                    crate::types::SimOutcome::Event {
+                        observed: false,
+                        time,
+                    } => Some(time),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                !censor_times.is_empty() && censor_times.iter().all(|t| *t == h),
+                "{name}: draw {draw} must censor at exactly {h}, got {censor_times:?}"
+            );
+        }
+
+        let diag = simulate_with_uncertainty_diag(&model, &pop, &fit, &opts)
+            .unwrap_or_else(|e| panic!("{name}: diag: {e}"));
+        let bits = |rows: &[SimulationResult]| rows.iter().map(row_bits).collect::<Vec<_>>();
+        assert_eq!(bits(&diag.results), bits(&rows), "{name}: wrapper vs diag");
+    }
+}
+
+/// A single-event analytic hazard does not *require* a horizon, so nothing refuses a
+/// horizon that is silently dropped: this is the one test that sees it (#2003). With record
+/// windows at 30, `horizon = Some(5)` censors at 5 and `None` at 30.
+///
+/// Mutation: pass `None` to the per-draw call and the `Some(5)` run censors at 30, with no
+/// error anywhere.
+#[cfg(feature = "survival")]
+#[test]
+fn uncertainty_horizon_overrides_the_record_window_of_a_single_event_hazard() {
+    use crate::parser::model_parser::parse_model_string;
+    let src = std::fs::read_to_string("examples/tte_exponential.ferx").expect("example");
+    let model = parse_model_string(&src).expect("parse");
+    let pop = horizon_tte_population(6, 2, 30.0, |_| 100.0);
+    let fit = synthetic_fit(&model.default_params);
+    let censor_times = |h: Option<f64>| -> Vec<f64> {
+        simulate_with_uncertainty(&model, &pop, &fit, &uncertainty_horizon_opts(2, 3, h))
+            .expect("simulate")
+            .iter()
+            .filter_map(|r| match r.outcome {
+                crate::types::SimOutcome::Event {
+                    observed: false,
+                    time,
+                } => Some(time),
+                _ => None,
+            })
+            .collect()
+    };
+    for (h, window) in [(Some(5.0), 5.0), (None, 30.0)] {
+        let times = censor_times(h);
+        assert!(!times.is_empty(), "horizon {h:?}: no censored replicate");
+        assert!(
+            times.iter().all(|&t| t == window),
+            "horizon {h:?}: censored rows must sit at {window}: {times:?}"
+        );
+    }
+}
+
+/// Control (#2003): on a model with no TTE endpoint a horizon changes nothing, bit for
+/// bit, even one below the last observation time.
+#[test]
+fn uncertainty_horizon_leaves_gaussian_rows_bit_identical() {
+    let model = tiny_model();
+    let pop = tiny_population();
+    let fit = synthetic_fit(&model.default_params);
+    let run = |h: Option<f64>| -> Vec<String> {
+        simulate_with_uncertainty(&model, &pop, &fit, &uncertainty_horizon_opts(3, 2, h))
+            .expect("simulate")
+            .iter()
+            .map(row_bits)
+            .collect()
+    };
+    let without = run(None);
+    assert_eq!(
+        without.len(),
+        3 * 2 * 2 * 3,
+        "3 draws x 2 sims x 2 subjects x 3 obs"
+    );
+    assert_eq!(run(Some(2.0)), without);
 }

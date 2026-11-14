@@ -4421,6 +4421,9 @@ pub fn parse_full_model_with(
 ) -> Result<ParsedModel, String> {
     let level_bindings = &bindings.levels;
     let mut extracted = extract_blocks(content)?;
+    // A deprecated block (`[initial_values]`) is a warning, not an error (#2913):
+    // taken out here so it seeds `parse_warnings` when the model is built.
+    let deprecated_block_warnings = std::mem::take(&mut extracted.warnings);
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
     // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
     // hand-written `ode(...)` form *before* anything else looks at the blocks, so
@@ -6322,7 +6325,7 @@ pub fn parse_full_model_with(
         covariate_mu_refs,
         referenced_covariates,
         gradient_method: GradientMethod::default(),
-        parse_warnings: Vec::new(), // populated below
+        parse_warnings: deprecated_block_warnings, // more pushed below
         has_conditional_eta_params: false,
         eta_param_info,
         kappa_param_types,
@@ -6381,11 +6384,10 @@ pub fn parse_full_model_with(
     // value is resolved here; `parse_full_model_file` resolves it relative to
     // the model file's directory afterwards (this function only sees the
     // model's text, not its path on disk).
+    // `path` is optional (#2914): a block carrying only column maps leaves
+    // `data_path` `None`, and the caller has to supply the dataset.
     let (data_path, data_column_map) = match blocks.get("data") {
-        Some(lines) => {
-            let (p, m) = parse_data_block(lines)?;
-            (Some(p), m)
-        }
+        Some(lines) => parse_data_block(lines)?,
         None => (None, Vec::new()),
     };
 
@@ -7911,6 +7913,9 @@ pub(crate) const MAX_CMT_INDEX: usize = 255;
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
     "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EPRED", "PWRES",
     "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD", "CENS", "OCC", "CMT",
+    // The mixture sdtab columns (#2784): a `[derived] MIXNUM` beside `[output] MIXNUM`
+    // would write two `MIXNUM` headers, the derived values hidden behind the class.
+    "MIXNUM", "MIXEST",
 ];
 
 /// Split a token slice at top-level commas (depth 0 inside parentheses).
@@ -12130,6 +12135,10 @@ pub fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     }
 }
 
+/// A parsed `[data]` block: the raw `path` (absent when the block only maps
+/// columns, #2914) and the `(target, actual)` column remappings.
+type DataBlock = (Option<String>, Vec<(String, String)>);
+
 /// Canonical column roles a `[data]` block may remap (#730, NONMEM
 /// `$INPUT TIME=TAFD` analogue). A target naming one of these is upper-cased to
 /// the standard header spelling; any other target is an arbitrary column rename
@@ -12143,6 +12152,12 @@ const DATA_BLOCK_ROLES: &[&str] = &[
 /// Parse a `[data]` block (#690, NONMEM `$DATA` analogue). Returns the raw
 /// `path` value as written (resolved relative to the model file's directory by
 /// `parse_full_model_file`) plus any `target = actual` column remappings.
+///
+/// `path` is optional (#2914): a block may carry only column maps, for a model
+/// whose dataset is always supplied by the caller (`ferx_simulate(data = ...)`,
+/// `--data`). The path is never resolved or opened here, so a model copied away
+/// from its dataset still parses; with no path on either side the file entry
+/// points refuse with `E_DATA_PATH_MISSING`.
 /// Each map entry is `(target_header, actual_header)`: the dataset's
 /// `actual_header` column is renamed to `target_header` when the CSV is read.
 ///
@@ -12164,7 +12179,7 @@ const DATA_BLOCK_ROLES: &[&str] = &[
 /// actually exists in the dataset — and whether a rename collides with a
 /// surviving column — can only be checked when the CSV is read, so that lives in
 /// the datareader.
-fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>), String> {
+fn parse_data_block(lines: &[String]) -> Result<DataBlock, String> {
     let mut path: Option<String> = None;
     let mut column_map: Vec<(String, String)> = Vec::new();
     for line in lines {
@@ -12214,7 +12229,6 @@ fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>),
             }
         }
     }
-    let path = path.ok_or_else(|| "[data]: missing required key `path`".to_string())?;
     Ok((path, column_map))
 }
 
@@ -18199,12 +18213,26 @@ const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
 /// names were silently dropped — nothing ever said so. `ferx-r` still lists it
 /// in its section docs and three of its checked-in example models still carry
 /// one, so this fires for real files (#1040).
+///
+/// A deprecated block is a **warning** (`W_DEPRECATED_BLOCK`), not an error
+/// (#2913): it was already inert, so a stored model or archived run carrying one
+/// has been fitting correctly all along, and a version bump must not turn it
+/// unparseable. Every entry here must be one whose contents were *already
+/// ignored* — a block whose removal changes the fit belongs in the error path.
 const DEPRECATED_BLOCKS: &[(&str, &str)] = &[(
     "initial_values",
     "initial estimates are declared inline in `[parameters]` \
      (`theta NAME(init, lower, upper)`, `omega NAME ~ variance`); \
-     the block has not been read for several releases — delete it",
+     the block has not been read for several releases, so it never affected \
+     the fit and deleting it cannot change one — delete it",
 )];
+
+/// The code a deprecated-block warning ends with. `ferx check` keys
+/// `W_DEPRECATED_BLOCK` on it, and the message opens with
+/// [`DEPRECATED_BLOCK_PREFIX`] so the block and line can be read back out.
+pub(crate) const DEPRECATED_BLOCK_CODE: &str = "W_DEPRECATED_BLOCK";
+/// How every deprecated-block warning begins.
+pub(crate) const DEPRECATED_BLOCK_PREFIX: &str = "Deprecated block `[";
 
 /// The name of every `[block]` **this build** of the parser will accept, in the
 /// order they appear in the error message (alphabetical).
@@ -18286,7 +18314,7 @@ pub(crate) fn nearest_block_name(name: &str) -> Option<&'static str> {
 /// the order a user is most likely to hit them:
 ///
 /// 1. a block that was ferx syntax and is no longer read
-///    (`E_DEPRECATED_BLOCK`),
+///    (`W_DEPRECATED_BLOCK` — a warning, see below),
 /// 2. an unrecognised block name (`E_UNKNOWN_BLOCK`),
 /// 3. a known block written in the wrong header form — an instance name on a
 ///    block that takes none, or a missing one on `[covariate_nn NAME]`
@@ -18294,9 +18322,13 @@ pub(crate) fn nearest_block_name(name: &str) -> Option<&'static str> {
 /// 4. a known block whose cargo feature this binary was not built with
 ///    (`E_BLOCK_FEATURE_DISABLED`).
 ///
-/// All findings of the first non-empty class are reported together, so an
+/// All findings of the first non-empty error class are reported together, so an
 /// author fixing a batch of typos sees them in one pass.
-fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), String> {
+///
+/// Class 1 is not an error (#2913): the block was already inert, so it is
+/// returned as one warning per header for `parse_warnings`, and the caller drops
+/// its lines. The other three classes still fail the parse.
+fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<Vec<String>, String> {
     let mut deprecated: Vec<String> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
     let mut wrong_form: Vec<String> = Vec::new();
@@ -18320,7 +18352,8 @@ fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), 
         };
         if let Some((name, remedy)) = DEPRECATED_BLOCKS.iter().find(|(n, _)| *n == ty) {
             deprecated.push(format!(
-                "`[{name}]` (line {line}) is no longer read: {remedy}"
+                "{DEPRECATED_BLOCK_PREFIX}{name}]` (line {line}) is ignored: {remedy}. \
+                 ({DEPRECATED_BLOCK_CODE})"
             ));
             continue;
         }
@@ -18350,9 +18383,6 @@ fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), 
         }
     }
 
-    if !deprecated.is_empty() {
-        return Err(format!("Deprecated block {}.", deprecated.join("; ")));
-    }
     if !unknown.is_empty() {
         return Err(format!(
             "Unknown block {}. Valid blocks: {}.",
@@ -18366,7 +18396,7 @@ fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), 
     if !disabled.is_empty() {
         return Err(format!("Block {}.", disabled.join("; ")));
     }
-    Ok(())
+    Ok(deprecated)
 }
 
 /// The name a model carries when its file declares none. `api::run::set_model_name`
@@ -18524,6 +18554,10 @@ struct ExtractedBlocks {
     /// type. First occurrence wins. Used to give `ferx check` diagnostics a
     /// block-level location.
     block_lines: HashMap<String, usize>,
+    /// One `parse_warnings` entry per deprecated block header (#2913). The block's
+    /// lines are dropped from `unnamed` / `block_lines`, so nothing downstream —
+    /// including the absorption twin, which re-emits `unnamed` — ever sees it.
+    warnings: Vec<String>,
 }
 
 /// A block header line, read the one way [`extract_blocks`] reads it: `(type
@@ -18624,7 +18658,12 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
         }
     }
 
-    check_block_names(&headers)?;
+    out.warnings = check_block_names(&headers)?;
+    for (name, _) in DEPRECATED_BLOCKS {
+        out.unnamed.remove(*name);
+        out.named.remove(*name);
+        out.block_lines.remove(*name);
+    }
 
     // Fold operator continuation lines into single logical lines before anyone
     // reads the block (#1030). Done here rather than in each block's parser so the
@@ -30331,6 +30370,20 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
     match op {
         Op::Exp => v.exp(),
         Op::Ln => v.guard_floor(1e-30).ln(),
+        // A positive argument is the type's own `sqrt`. Anything else is a constant, so the
+        // derivative there is zero (`Dual1::sqrt`'s convention): `inf · 0` would otherwise put
+        // a `NaN` in the jets, whose bits optimised code does not reproduce from one route to
+        // the next (#2844). The value is the `f64` lane VM's (`eval_bytecode`): `±0` passes
+        // through as `sqrt(±0) = ±0`, and a negative or `NaN` argument floors to `+0`. The
+        // `v >= 0` test, not `f64::max`, whose signed-zero result is not specified.
+        Op::Sqrt => {
+            let x = v.val();
+            if x > 0.0 {
+                v.sqrt()
+            } else {
+                T::from_f64(if x >= 0.0 { x } else { 0.0 })
+            }
+        }
         Op::Abs => v.abs(),
         Op::Floor => T::from_f64(v.val().floor()),
         Op::Ceil => T::from_f64(v.val().ceil()),
@@ -30547,13 +30600,9 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                     }
                 });
             }
-            op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
+            op @ (Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
                 let v = pop!();
                 push!(apply_unary(op, v));
-            }
-            Op::Sqrt => {
-                let v = pop!();
-                push!(v.guard_floor(0.0).sqrt());
             }
             Op::InvLogit => {
                 let v = pop!();

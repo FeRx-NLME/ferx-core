@@ -242,7 +242,11 @@ impl PkNum for R {
         R::n1(self.v.ln(), self, 1.0 / self.v)
     }
     fn sqrt(self) -> Self {
+        // Flat at a non-positive argument, as on every `PkNum` type (#2892).
         let s = self.v.sqrt();
+        if !(self.v > 0.0) {
+            return R::c(s);
+        }
         R::n1(s, self, 0.5 / s)
     }
     fn pow(self, e: Self) -> Self {
@@ -558,6 +562,10 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         self.chain(self.v.ln(), d)
     }
     fn sqrt(self) -> Self {
+        // Flat at a non-positive argument, as on every `PkNum` type (#2892).
+        if !(self.v.val() > 0.0) {
+            return DualT::constant(self.v.val().sqrt());
+        }
         let s = self.v.sqrt();
         let d = B::from_f64(0.5) / s;
         self.chain(s, d)
@@ -893,6 +901,10 @@ impl<const N: usize, const M: usize, B: PkNum, const D: bool> PkNum for DualH<N,
         self.chain2(self.v.ln(), d1, -(d1 * d1))
     }
     fn sqrt(self) -> Self {
+        // Flat at a non-positive argument, as on every `PkNum` type (#2892).
+        if !(self.v.val() > 0.0) {
+            return DualH::constant(self.v.val().sqrt());
+        }
         let s = self.v.sqrt();
         let d1 = B::from_f64(0.5) / s;
         self.chain2(s, d1, -(d1 / (B::from_f64(2.0) * self.v)))
