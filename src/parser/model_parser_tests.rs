@@ -9780,31 +9780,93 @@ fn ruv_magnitude_inlines_a_theta_covariate_chain_from_individual_parameters() {
     assert_eq!(grad[0], 0.0);
 }
 
-/// A substituted body is not walked again. [individual_parameters] refuses a
-/// self-reference (`WT = f(WT)`) as a forward reference, so the parser never
-/// builds this map; the guard is pinned on the helper, since a re-walk would
-/// recurse without bound on any body containing its own name.
+/// A definition that reaches itself is refused, not recursed into without
+/// bound. [individual_parameters] refuses a self-reference as a forward
+/// reference before this scope runs, so it is pinned on the scope directly.
 #[test]
-fn ruv_indiv_substitution_does_not_rewalk_its_output() {
-    let body = Expression::BinOp(
-        Box::new(Expression::Covariate("WT".to_string())),
-        BinOp::Mul,
-        Box::new(Expression::Literal(2.0)),
+fn ruv_indiv_scope_refuses_a_self_reference_instead_of_recursing() {
+    let stmts = vec![Statement::Assign(
+        "WT".to_string(),
+        Expression::BinOp(
+            Box::new(Expression::Covariate("WT".to_string())),
+            BinOp::Mul,
+            Box::new(Expression::Literal(2.0)),
+        ),
+    )];
+    let scope = RuvIndivScope::new(&stmts);
+    let why = scope.verdict("WT").unwrap_err();
+    assert!(
+        why.contains("reads `WT`, which is defined in terms of itself"),
+        "{why}"
     );
-    let defs = HashMap::from([("WT".to_string(), RuvIndivDef::Inline(body))]);
-    let mut expr = Expression::Covariate("WT".to_string());
-    let mut hit = Vec::new();
-    substitute_ruv_indiv_defs(&mut expr, &defs, false, &mut hit);
-    assert_eq!(hit, vec!["WT".to_string()]);
-    let v = eval_expression(
-        &expr,
-        &[],
-        &[],
-        &HashMap::from([("WT".to_string(), 35.0)]),
-        &HashMap::new(),
-        &[],
+}
+
+/// Review round 1 (#2915): a refused name must refuse every name that reads
+/// it, even when the refused name collides with an RUV built-in. With `TAD`
+/// assigned twice, `ISPK = TAD` used to be stored as the bare leaf `TAD`,
+/// which the error model then read as the engine's time after dose — `3` in
+/// every other block, `TAD` here, with no message.
+#[test]
+fn ruv_magnitude_refusal_propagates_through_a_wrapper_of_a_reassigned_name() {
+    let err = expect_parse_err(&ruv_indiv_model(
+        "  TAD = 2\n  ISPK = TAD\n  TAD = 3",
+        "PROP_ERR * ISPK",
+    ));
+    assert!(
+        err.contains("`ISPK`, which [individual_parameters] assigns but which reads `TAD`, which is assigned more than once"),
+        "{err}"
     );
-    assert_eq!(v, 70.0);
+}
+
+/// A name the block assigns that the error model reads as its own built-in
+/// (`TAD`) or as the scaled sigma: two blocks would read two values, so it is
+/// refused by name.
+#[test]
+fn ruv_magnitude_refuses_a_builtin_name_the_block_assigns() {
+    let err = expect_parse_err(&ruv_indiv_model("  TAD = 2", "PROP_ERR * (1 + TAD)"));
+    assert!(
+        err.contains("references `TAD`, which [individual_parameters] assigns, but which in [error_model] names"),
+        "{err}"
+    );
+}
+
+/// `n` levels of a diamond (`B_i = X_i + 2`, `C_i = X_i + 3`,
+/// `X_{i+1} = B_i + C_i`): the substituted tree doubles per level.
+fn ruv_indiv_diamond(n: usize) -> String {
+    let mut s = String::from("  X0 = RUV_K\n");
+    for i in 0..n {
+        s += &format!(
+            "  B{i} = X{i} + 2\n  C{i} = X{i} + 3\n  X{} = B{i} + C{i}\n",
+            i + 1
+        );
+    }
+    s
+}
+
+/// Review round 1 (#2915): substitution is judged lazily and by size, never
+/// materialised up front. A 60-level diamond is ~2^60 nodes expanded; a model
+/// whose magnitude does not read it parses (the scope only indexes the block),
+/// and one whose magnitude does is refused on size — both in linear time, so
+/// an exponential regression hangs this test rather than passing it.
+#[test]
+fn ruv_magnitude_diamond_is_judged_linearly() {
+    let deep = ruv_indiv_diamond(60);
+    // Read by nothing in the error model: parses as before.
+    parse_full_model(&ruv_indiv_model(&deep, "PROP_ERR * RUV_K")).unwrap();
+    // Read by the magnitude: refused on size, naming the top name.
+    let err = expect_parse_err(&ruv_indiv_model(&deep, "PROP_ERR * X60"));
+    assert!(
+        err.contains("`X60`, which [individual_parameters] assigns but which")
+            && err.contains("expands to more than 10000 expression nodes"),
+        "{err}"
+    );
+    // A shallow diamond is substituted, with the value of the expanded tree:
+    // X1 = 2·X0 + 5 = 8, X2 = 2·X1 + 5 = 21 at RUV_K = 1.5.
+    let m = ruv_indiv_mults(
+        &ruv_indiv_model(&ruv_indiv_diamond(2), "PROP_ERR * X2"),
+        &[70.0],
+    );
+    assert_eq!(m, vec![21.0]);
 }
 
 /// A name whose value depends on η is refused by name, with the reason — not

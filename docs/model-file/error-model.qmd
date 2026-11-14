@@ -412,6 +412,13 @@ that reason. A covariate the substituted definition reads must be declared in
 `[covariates]`, like one written in the expression itself. A name that is
 neither declared nor assigned is rejected too, since it would silently read `0`.
 
+Two more refusals keep the error model from reading a different value than the
+rest of the model: a name the block assigns that `[error_model]` would read as
+its own built-in (`TAD`, `MACHEPS`) or as the scaled sigma — rename the
+variable — and a definition that would grow past 10,000 expression nodes once
+every name in it is substituted (a deep chain of intermediates that each read
+the previous one twice).
+
 ### With adaptive dosing {#magnitude-adaptive}
 
 Adaptive dosing (`simulate_adaptive*`) applies the residual-error magnitude to a `Dv`
