@@ -152,4 +152,7 @@ start gradient differs by 1.2e-14 on Linux (7 of 7 coordinates; 1.1e-14 on
 macOS) and by 0 on Padé. Kept reads `A` as cyclic in 1380 of 1400 taped calls,
 this branch in none. The fits take 67 iterations in every variant, and the
 final traced max |gradient| moves from 5.921093e-6 (`main` and kept) to
-5.918084e-6. That is the moved `final_gradient_max_abs` in the table above.
+5.918084e-6. Those are the debug test build's trace values. The release CLI's
+`final_gradient_max_abs` in the table above (1.76759e-6 vs 1.76808e-6) is the
+same quantity from a different build, so its values, and the direction it moves,
+differ. Both move for the reason above.
