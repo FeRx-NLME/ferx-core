@@ -2527,8 +2527,15 @@ pub ferx_core::stats::npde::SubjectNpde::epred: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::npd: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::npde: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::pwres: alloc::vec::Vec<f64>
+pub struct ferx_core::stats::npde::TteNpde
+pub ferx_core::stats::npde::TteNpde::cmt: usize
+pub ferx_core::stats::npde::TteNpde::imputed: bool
+pub ferx_core::stats::npde::TteNpde::npde: f64
+pub ferx_core::stats::npde::TteNpde::pd: f64
+pub ferx_core::stats::npde::TteNpde::time: f64
 pub fn ferx_core::stats::npde::compute_npde_npd(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::compute_npde_npd_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<(alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, alloc::vec::Vec<alloc::string::String>), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::stats::npde::compute_tte_npde(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<(alloc::vec::Vec<alloc::vec::Vec<ferx_core::stats::npde::TteNpde>>, alloc::vec::Vec<alloc::string::String>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::effective_seed(seed: core::option::Option<u64>) -> u64
 pub mod ferx_core::stats::residual_error
 pub fn ferx_core::stats::residual_error::compute_d2r_df2_matrices(error_spec: &ferx_core::ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64], obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], sigma_values: &[f64], correlations: &[ferx_core::ResidualCorrelation], mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>>
@@ -3986,6 +3993,7 @@ pub ferx_core::types::TteObsDiagnostic::coxsnell: f64
 pub ferx_core::types::TteObsDiagnostic::deviance: f64
 pub ferx_core::types::TteObsDiagnostic::dv: f64
 pub ferx_core::types::TteObsDiagnostic::martingale: f64
+pub ferx_core::types::TteObsDiagnostic::npde: f64
 pub ferx_core::types::TteObsDiagnostic::pit: f64
 pub ferx_core::types::TteObsDiagnostic::time: f64
 #[non_exhaustive] pub struct ferx_core::types::ViResult
@@ -5890,6 +5898,7 @@ pub ferx_core::TteObsDiagnostic::coxsnell: f64
 pub ferx_core::TteObsDiagnostic::deviance: f64
 pub ferx_core::TteObsDiagnostic::dv: f64
 pub ferx_core::TteObsDiagnostic::martingale: f64
+pub ferx_core::TteObsDiagnostic::npde: f64
 pub ferx_core::TteObsDiagnostic::pit: f64
 pub ferx_core::TteObsDiagnostic::time: f64
 pub struct ferx_core::TteVpc
