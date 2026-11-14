@@ -77,19 +77,21 @@ with class-$k$ parameters and a **separate empirical Bayes solve per
 (subject × class)**. The mixing-logit coefficients are ordinary thetas and any
 per-class $\Omega$/$\Sigma$ are estimated jointly. The outer gradient is analytic and
 posterior-weighted, exact also under IOV and with a block (correlated) $\Omega$;
-`MIXNUM`-branched typical values are in scope. If any subject or class is outside that
-scope, the **whole** gradient falls back to finite differences, re-solving every subject,
-with no warning. So `optimizer = auto` runs L-BFGS on a mixture as on any other model in
-that scope, and an explicit NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured.
-The exception is a start where two classes are indistinguishable (every subject has the
-same mixing probability and the same objective under both), where no gradient optimizer
-can separate them. `auto` runs BOBYQA there and warns `W_MIXTURE_SYMMETRIC_START`, naming
-the pair; see [mixture models](optimizers.qmd#auto-mixture) on the optimizers page, which
-has the measurements and the cost of the finite-difference fallback. Give the two classes
-different initial values. The check is exact, so classes
-that start only close to each other are fitted with L-BFGS without a warning; if a fit
-ends with two nearly merged classes, refit from different class starts or set
-`optimizer = bobyqa`.
+`MIXNUM`-branched typical values are in scope. A subject outside that scope is salvaged
+on its own: the other subjects keep their exact gradient, and only that subject's
+per-class terms are finite-differenced, re-solving its class modes at each probe. Such a
+subject is named in the "could not be given the exact analytic outer gradient" warning,
+as for a single population (#2906). So `optimizer = auto` runs L-BFGS on a mixture as on
+any other model in that scope, and an explicit NLopt gradient optimizer (SLSQP / L-BFGS /
+MMA) is honoured. The exception is a start where two classes are indistinguishable (every
+subject has the same mixing probability and the same objective under both), where no
+gradient optimizer can separate them. `auto` runs BOBYQA there and warns
+`W_MIXTURE_SYMMETRIC_START`, naming the pair; see
+[mixture models](optimizers.qmd#auto-mixture) on the optimizers page, which has the
+measurements. Give the two classes different initial values. The check is exact, so
+classes that start only close to each other are fitted with L-BFGS without a warning. A
+fit that ends with two classes merged, or one empty, warns `W_MIXTURE_MERGED_CLASSES`;
+see [merged or empty classes](#merged-or-empty-classes).
 
 ## Output
 
@@ -104,7 +106,16 @@ NONMEM reserved variables:
 A `ferx model.ferx --simulate` run adds a third: **`MIXNUM`**, the class each subject
 was *simulated* under (1-based), written before `MIXEST`. It is the generating class,
 so on a simulated dataset it is the truth `MIXEST` can be checked against. Data read
-from a file has no `MIXNUM` column.
+from a file has no `MIXNUM` column unless `[output]` asks for one.
+
+Listing `MIXNUM` in `[output]` writes the class, as NONMEM's `$TABLE MIXNUM` does and
+as `MIXNUM` means in every expression: the simulated class where the data were drawn
+under one, the fitted `MIXEST` otherwise, on every row of the subject — binary and
+time-to-event rows included. It is never a data column that happens to be called
+`MIXNUM` (no expression can read such a column either); with one present, `fit()` and
+`ferx check` warn `W_OUTPUT_MIXNUM_IS_CLASS`, so rename the column to table it. On a
+simulated dataset the requested column replaces the generating-class column rather than
+sitting beside it under the same name (#2784).
 
 Every other per-subject diagnostic is evaluated **in that subject's `MIXEST`
 class**: the reported $\hat\eta$ are the winning class's EBEs, and `IPRED`,
@@ -112,6 +123,36 @@ class**: the reported $\hat\eta$ are the winning class's EBEs, and `IPRED`,
 that branches on `MIXNUM` are all computed with `MIXNUM` set to that class. So a
 subject the fit assigns to class 2 gets class-2 typical values throughout its
 sdtab row, not the class-1 default.
+
+### Merged or empty classes
+
+A mixture objective has local optima where fewer than `nsub` classes are in use.
+Two classes can end up describing the same subpopulation, or one class can end up
+holding nobody. After every mixture fit, ferx checks the final evaluation for both
+and warns `W_MIXTURE_MERGED_CLASSES`, naming each pair or class it finds (#2907):
+
+- **Merged pair.** Both classes carry posterior mass, and no subject's data favours
+  one over the other by more than 1 log-likelihood unit:
+  $\max_i |\text{nll}_{ia} - \text{nll}_{ib}| < 1$. That is how far each subject's
+  posterior class odds moved from its prior odds,
+  $\ln(\text{PMIX}_{ia}/\text{PMIX}_{ib}) - \ln(p_{ia}/p_{ib})$. It is computed from
+  the class objectives, not rebuilt from $\text{PMIX}$, so a subject that a third class
+  dominates so strongly that both posteriors underflow to 0 still counts. The test is
+  on the objective, not on the parameters, so it also catches classes that are equal
+  but written two different ways.
+- **Empty class.** No subject's posterior probability of the class reaches 0.01.
+
+The thresholds were measured on `tests/nonmem/mixture_iv.csv` with Ω and Σ
+estimated. Started from clearances 1.70 / 1.71, L-BFGS ends in a collapsed optimum
+(OFV 310.02, class clearances 1.71 / 1.76, ω_CL 0.35, which absorbs the
+bimodality). There the largest factor is 0.09. At the two-class optimum (OFV 299.86)
+it is 15.05, and at the NONMEM-matching optima of the Ω/Σ-fixed fixture and of
+`mixture_iv_iov.csv` (301.58, 470.81) it is 11.45 and 19.29. A mixing logit held at
+−9 leaves class 1 with a largest posterior of 3e-4, which is reported empty.
+
+The warning does not change the fit. When it fires, refit with the class starts
+further apart, or with `optimizer = bobyqa`, and compare the objectives: on the
+fixture above, BOBYQA from the same 1.70 / 1.71 start reaches 299.86.
 
 ## Validation against NONMEM
 

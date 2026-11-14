@@ -38,6 +38,8 @@ pub struct MixturePosteriors {
     /// [`MixtureEval::n_fd_h_redone`](crate::estimation::mixture::MixtureEval) of the
     /// evaluation that scored the reported objective.
     pub(crate) n_fd_h_redone: usize,
+    /// `MixtureEval::class_nll` of that evaluation, `[subject][class]`, for the merged-class check (#2907).
+    pub(crate) class_nll: Vec<Vec<f64>>,
 }
 
 pub struct OuterResult {
@@ -386,7 +388,14 @@ pub fn optimize_population(
     // there would make those fits warn about — and give advice for — a gradient their
     // optimizer never used (#1529 review). A gradient-driven optimizer re-evaluates the
     // same start point on its first iteration, so nothing it would report is lost.
-    let declines = OuterFdDeclineLog::new(population.subjects.len());
+    // A mixture salvages every declined (subject × class) term by reconverged FD
+    // (`mixture::mixture_gradient_salvaged`, #2906), never the held-EBE gradient, so its
+    // log is a reconverging one and the warning cannot give it the held-EBE remedy.
+    let declines = if init_params.mixture.is_some() {
+        OuterFdDeclineLog::reconverging(population.subjects.len())
+    } else {
+        OuterFdDeclineLog::new(population.subjects.len())
+    };
     let preflight_declines = OuterFdDeclineLog::new(population.subjects.len());
 
     // Pre-flight flat-theta guard (#826): a non-fixed theta whose outer gradient is
@@ -1241,6 +1250,7 @@ fn evaluate_at_initial_params(
             pmix: m.pmix,
             mixest: m.mixest,
             n_fd_h_redone: m.n_fd_h_redone,
+            class_nll: m.class_nll,
         };
         (
             m.mixest_etas,
@@ -7495,19 +7505,22 @@ fn optimize_nlopt_attempt_probed(
                 }
             } else {
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-                // Mixture (#977 Phase 4): analytic posterior-weighted gradient,
-                // FD fallback when out of analytic scope.
+                // Mixture (#977 Phase 4): analytic posterior-weighted gradient, a
+                // declined (subject × class) term salvaged on its own and recorded for
+                // the #1154 warning (#2906); whole-objective FD only when the mixing map
+                // itself is out of analytic scope.
                 // #1520: per the optimizer's own acceptance test (`SalvageGuardPolicy`),
                 // the incumbent the salvage guard may measure this gradient point against.
                 let guard_reference = state.salvage_guard.reference(xs);
                 let mut grad_raw = if let Some(mev) = &mixeval {
-                    crate::estimation::mixture::mixture_gradient_with_modes(
+                    crate::estimation::mixture::mixture_gradient_salvaged(
                         model,
                         population,
                         &params,
                         options,
                         mev,
                         mixmodes.as_ref(),
+                        declines,
                     )
                     .unwrap_or_else(|| {
                         crate::estimation::mixture::mixture_gradient_fd(
@@ -8799,6 +8812,7 @@ fn optimize_nlopt_attempt_probed(
                     pmix: m.pmix,
                     mixest: m.mixest,
                     n_fd_h_redone: m.n_fd_h_redone,
+                    class_nll: m.class_nll,
                 }),
             )
         } else {
@@ -10577,7 +10591,7 @@ fn subject_fixed_ebe_gradient(
 /// The adjoint's kernel scores dense residual covariances itself, so the one structural
 /// cause left is a subject no recorder serves: its decline is scope, not numerics, and
 /// recurs at every evaluation exactly as a model-level exclusion does.
-fn is_structural_decline(
+pub(crate) fn is_structural_decline(
     model: &CompiledModel,
     subject: &Subject,
     init_params: &ModelParameters,
@@ -10838,7 +10852,7 @@ fn subject_central_diff(
 /// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums). `warm` is the
 /// subject's joint mode (`η̂` then each cell's κ̂, [`joint_warm_start`]), so every probe
 /// starts at κ̂ rather than κ = 0 (#2261).
-fn subject_reconverged_fd_gradient_iov(
+pub(crate) fn subject_reconverged_fd_gradient_iov(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,

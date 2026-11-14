@@ -422,6 +422,8 @@ No outer optimizer is built. What you get back:
   bounds is evaluated at the bound: `theta TVE0(30, -20, 20)` is scored at `20`,
   and a free `omega ~ 0.0` at `exp(-12)` ≈ `6.1e-6`. To evaluate exactly the
   value you wrote, `FIX` it: `theta TVE0(30, -20, 20) FIX` is scored at `30`.
+  The `theta` case is reported: a `W_THETA_INIT_OUTSIDE_BOUNDS` warning names
+  the declared start and the value scored. The `omega` case is not.
 - **Standard errors only where they mean something.** `covariance = true` (the
   default) still runs the covariance step, which is what you want at a known
   optimum. At any other point the curvature is not that of an optimum, so set

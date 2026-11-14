@@ -209,3 +209,200 @@ fn band_refuses_bad_probs() {
     }
     assert!(!probs_valid([f64::NAN, 0.5, 0.95]));
 }
+
+// ── Mean cumulative function (#1886 PR2) ─────────────────────────────────────
+
+/// Fixture R1 (#1886 PR2 plan §0): follow-up end and event times per subject. A tie
+/// across subjects at 2, an event at the subject's own follow-up end (B at 8, E at 4)
+/// and a subject with no event (C).
+const R1: [(f64, &[f64]); 6] = [
+    (10.0, &[2.0, 5.0, 9.0]), // A
+    (8.0, &[3.0, 8.0]),       // B
+    (6.0, &[]),               // C
+    (10.0, &[2.0, 7.0]),      // D
+    (4.0, &[4.0]),            // E
+    (5.0, &[1.0]),            // F
+];
+
+/// The pooled event times and the follow-up ends of a fixture.
+fn pooled(subjects: &[(f64, &[f64])]) -> (Vec<f64>, Vec<f64>) {
+    let events = subjects.iter().flat_map(|s| s.1.iter().copied()).collect();
+    let ends = subjects.iter().map(|s| s.0).collect();
+    (events, ends)
+}
+
+/// R1 with a second event of A at 5: two events at one time within one subject.
+fn r2() -> Vec<(f64, &'static [f64])> {
+    let mut s = R1.to_vec();
+    s[0] = (10.0, &[2.0, 5.0, 5.0]);
+    s
+}
+
+/// An MCF that sits at `v` from time 0 to `end`, so [`McfCurve::at`] is `Some(v)` on
+/// `[0, end]` and `None` after it.
+fn flat_mcf(v: f64, end: f64) -> McfCurve {
+    McfCurve {
+        time: vec![0.0, end],
+        n_risk: vec![1, 1],
+        n_event: vec![1, 0],
+        mcf: vec![v, v],
+    }
+}
+
+/// PR2 T1. R1's rows against exact fractions computed outside the engine (Python
+/// `fractions`) and equal to `survfit(Surv(start, stop, status) ~ 1, id = id)$cumhaz`
+/// (survival 3.8.12), re-measured at the commit adding this test. A subject stays in
+/// the risk set after its event: letting it leave gives 17/30 at t = 2 against 1/2, a
+/// gap of 0.067 against a bound of 1e-15. An event at a subject's own follow-up end is
+/// counted with that subject still at risk: `n_risk(4) = 6` and `n_risk(8) = 3`, where
+/// counting the follow-up end first gives 5 and 2.
+#[test]
+fn mcf_matches_closed_form_and_keeps_subjects_at_risk_after_an_event() {
+    let (events, ends) = pooled(&R1);
+    let c = mean_cumulative(&events, &ends).unwrap();
+    assert_eq!(c.time, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
+    assert_eq!(c.n_risk, [6, 6, 6, 6, 5, 4, 3, 3, 2, 2]);
+    assert_eq!(c.n_event, [1, 2, 1, 1, 1, 0, 1, 1, 1, 0]);
+    let want = [
+        1.0 / 6.0,
+        1.0 / 2.0,
+        2.0 / 3.0,
+        5.0 / 6.0,
+        31.0 / 30.0,
+        31.0 / 30.0,
+        41.0 / 30.0,
+        17.0 / 10.0,
+        11.0 / 5.0,
+        11.0 / 5.0,
+    ];
+    for j in 0..want.len() {
+        assert!(c.mcf[j].is_finite());
+        assert!(
+            (c.mcf[j] - want[j]).abs() < 1e-15,
+            "MCF({}) = {} != {}",
+            c.time[j],
+            c.mcf[j],
+            want[j]
+        );
+    }
+}
+
+/// PR2 T2. Two events at one time in one subject both count: `n_event(5) = 2`,
+/// `MCF(5) = 37/30` and `MCF(8) = 19/10` (exact closed form; survfit refuses
+/// `stop == start`). Deduplicating event times gives `n_event(5) = 1` and 31/30.
+#[test]
+fn mcf_counts_two_events_at_one_time_in_one_subject() {
+    let (events, ends) = pooled(&r2());
+    let c = mean_cumulative(&events, &ends).unwrap();
+    let row = |t: f64| c.time.iter().position(|&x| x == t).expect("row");
+    assert_eq!(c.n_event[row(5.0)], 2);
+    assert_eq!(c.n_risk[row(5.0)], 5);
+    assert!((c.mcf[row(5.0)] - 37.0 / 30.0).abs() < 1e-15, "{c:?}");
+    assert!((c.mcf[row(8.0)] - 19.0 / 10.0).abs() < 1e-15, "{c:?}");
+}
+
+/// PR2 T3. `at`: 0 before the first row, the step value from it on, and `None` past the
+/// last follow-up end (carrying 11/5 forward would give `Some`). The subject with no
+/// event is in the risk set from the first row: without its follow-up end
+/// `n_risk(1)` is 5.
+#[test]
+fn mcf_at_is_zero_before_the_first_row_and_none_past_the_last_follow_up_end() {
+    let (events, ends) = pooled(&R1);
+    let c = mean_cumulative(&events, &ends).unwrap();
+    assert_eq!(c.n_risk[0], 6, "the subject with no event is at risk");
+    assert_eq!(c.at(0.5), Some(0.0));
+    assert_eq!(c.at(1.0), Some(c.mcf[0]));
+    assert_eq!(c.at(2.5), Some(0.5));
+    assert!((c.at(10.0).unwrap() - 11.0 / 5.0).abs() < 1e-15);
+    assert_eq!(c.at(10.5), None);
+    assert_eq!(c.at(f64::NAN), None);
+    assert_eq!(McfCurve::default().at(1.0), None);
+    // No subject and no event: an empty curve.
+    assert_eq!(mean_cumulative(&[], &[]), Ok(McfCurve::default()));
+    // Subjects with no event at all: a flat zero until the last follow-up end.
+    let none = mean_cumulative(&[], &[3.0, 7.0]).unwrap();
+    assert_eq!(none.mcf, [0.0, 0.0]);
+    assert_eq!((none.at(7.0), none.at(7.5)), (Some(0.0), None));
+}
+
+/// PR2 T4. Bad input is refused with a message naming the value; an event later than
+/// every follow-up end would divide by an empty risk set. An event exactly at the last
+/// follow-up end is fine.
+#[test]
+fn mcf_refuses_bad_input() {
+    let err = mean_cumulative(&[1.0, -2.0], &[5.0]).unwrap_err();
+    assert_eq!(
+        err,
+        McfInputError::BadEventTime {
+            index: 1,
+            value: -2.0
+        }
+    );
+    assert_eq!(
+        err.to_string(),
+        "mean_cumulative: event time -2 at index 1 is not a finite, non-negative number"
+    );
+    let err = mean_cumulative(&[1.0], &[5.0, f64::INFINITY]).unwrap_err();
+    assert!(matches!(
+        err,
+        McfInputError::BadFollowUpEnd { index: 1, .. }
+    ));
+    assert_eq!(
+        err.to_string(),
+        "mean_cumulative: follow-up end inf at index 1 is not a finite, non-negative number"
+    );
+    assert!(matches!(
+        mean_cumulative(&[f64::NAN], &[5.0]),
+        Err(McfInputError::BadEventTime { index: 0, .. })
+    ));
+    assert!(matches!(
+        mean_cumulative(&[1.0], &[-5.0]),
+        Err(McfInputError::BadFollowUpEnd { index: 0, .. })
+    ));
+    let err = mean_cumulative(&[2.0, 5.0], &[4.0, 3.0]).unwrap_err();
+    assert_eq!(err, McfInputError::EventAfterFollowUp { time: 5.0 });
+    assert_eq!(
+        err.to_string(),
+        "mean_cumulative: the event at time 5 is later than every follow-up end, so no \
+         subject is at risk for it"
+    );
+    let at_end = mean_cumulative(&[2.0, 4.0], &[4.0, 3.0]).unwrap();
+    assert_eq!(at_end.n_risk, [2, 2, 1]);
+    assert!(at_end.mcf.iter().all(|v| v.is_finite()));
+    assert_eq!(at_end.mcf, [0.5, 0.5, 1.5]);
+}
+
+/// PR2 T5. `vpc_band_mcf` uses only the curves defined at a grid time (folding the 3
+/// that ended in as 0 raises `n_used` to 25 and moves every quantile), and a point
+/// reached by fewer than 19 curves has no band (removing the floor makes it `Some`).
+#[test]
+fn mcf_band_uses_only_defined_curves_and_keeps_the_floor() {
+    let probs = [0.05, 0.5, 0.95];
+    let mut curves: Vec<McfCurve> = (0..22)
+        .map(|i| flat_mcf((i + 1) as f64 / 4.0, 10.0))
+        .collect();
+    curves.extend((0..3).map(|_| flat_mcf(0.9, 2.0)));
+    let band = vpc_band_mcf(&curves, &[1.0, 5.0], probs).unwrap();
+    assert_eq!(band.n_used, [25, 22]);
+    let v: Vec<f64> = (0..22).map(|i| (i + 1) as f64 / 4.0).collect();
+    assert_eq!(band.lo[1], Some(quantile_sorted(&v, 0.05)));
+    assert_eq!(band.med[1], Some(quantile_sorted(&v, 0.5)));
+    assert_eq!(band.hi[1], Some(quantile_sorted(&v, 0.95)));
+
+    let mut curves: Vec<McfCurve> = (0..18)
+        .map(|i| flat_mcf((i + 1) as f64 / 4.0, 10.0))
+        .collect();
+    curves.extend((0..7).map(|_| flat_mcf(0.5, 2.0)));
+    let band = vpc_band_mcf(&curves, &[1.0, 5.0], probs).unwrap();
+    assert_eq!(band.n_used, [25, 18]);
+    assert_eq!((band.lo[1], band.med[1], band.hi[1]), (None, None, None));
+    for v in [band.lo[0], band.med[0], band.hi[0]] {
+        assert!(v.expect("25 curves resolve the band").is_finite());
+    }
+    assert_eq!(
+        vpc_band_mcf(&curves, &[1.0], [0.5, 0.5, 0.95]),
+        Err(KmInputError::BadProbs {
+            probs: [0.5, 0.5, 0.95]
+        })
+    );
+}

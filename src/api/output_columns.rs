@@ -118,13 +118,31 @@ pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
 /// ETA (both ignored with `W_OUTPUT_DUPLICATE`). The single rule both
 /// [`compute_extra_output_columns`] and the reader's `W_COVARIATE_MISSING` gate
 /// (#2599) read, so the warning covers exactly the columns the echo reads.
+///
+/// `MIXNUM` on a `[mixture]` model is not echoed: it is the class, as everywhere else
+/// in the model file (#2784) — see [`is_mixture_class_column`].
 pub(crate) fn output_echo_columns(model: &CompiledModel) -> impl Iterator<Item = &String> {
     model.output_columns.iter().filter(move |col| {
         let is = |n: &str| n.eq_ignore_ascii_case(col);
         !model.derived_exprs.iter().any(|d| is(&d.name))
             && !OUTPUT_MANDATORY.iter().any(|m| is(m))
             && !model.eta_names.iter().any(|e| is(e))
+            && !is_mixture_class_column(model, col)
     })
+}
+
+/// The sdtab name of the mixture-class column, NONMEM's `$TABLE MIXNUM`.
+pub(crate) const MIXNUM_COLUMN: &str = "MIXNUM";
+
+/// Whether the `[output]` entry `col` names the mixture class rather than a data
+/// column (#2784): `MIXNUM` (any case) on a `[mixture]` model. In an expression that
+/// name is the class built-in and assigning to it is refused, so `[output] MIXNUM`
+/// means the class too — the subject's simulated class where its data were drawn under
+/// one (`Subject::simulated_mixnum`), its fitted `MIXEST` otherwise — and never a data
+/// column that happens to share the name. On a model without `[mixture]` there is no
+/// class and `MIXNUM` is an ordinary name.
+pub(crate) fn is_mixture_class_column(model: &CompiledModel, col: &str) -> bool {
+    model.mixture.is_some() && col.eq_ignore_ascii_case(MIXNUM_COLUMN)
 }
 
 /// Compute all [derived] and [output] columns post-fit, storing results in
@@ -345,6 +363,25 @@ pub(crate) fn compute_extra_output_columns(
                 col_vals.push(v);
             }
             sr.extra_columns.push((col_name.clone(), col_vals));
+        }
+
+        // `[output] MIXNUM` on a `[mixture]` model (#2784): the subject's class, a
+        // subject-level scalar repeated across its rows — the class its data were
+        // simulated under where there is one, else the class this pass runs under (the
+        // fitted MIXEST of a fit, the drawn class of a simulation). Written under the
+        // canonical name so the sdtab writer recognises it and does not emit its own
+        // simulated-class `MIXNUM` column beside it.
+        if model
+            .output_columns
+            .iter()
+            .any(|c| is_mixture_class_column(model, c))
+        {
+            let class = subject
+                .simulated_mixnum
+                .or(mix_class)
+                .map_or(f64::NAN, |k| k as f64);
+            sr.extra_columns
+                .push((MIXNUM_COLUMN.to_string(), vec![class; n_obs]));
         }
 
         // [derived] columns, evaluated in declaration order.

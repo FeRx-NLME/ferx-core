@@ -1212,8 +1212,9 @@ Two things are deliberately outside the check. **Sigma**: a free
 optimum, so it is not rejected. **Runs where nothing searches**: with
 `maxiter = 0` (NONMEM `MAXEVAL=0`) a zero variance is accepted — which is what
 lets `ferx gam --no-fit`, and any evaluation at fixed parameters, keep working.
-`saem`, `imp`, `impmap` and `bayes` carry their own iteration counts and are
-checked regardless of `maxiter`.
+`saem`, `imp`, `impmap`, `bayes` and `vi` carry their own iteration counts, and
+`gn_hybrid` runs a fixed polish budget, so all six are checked regardless of
+`maxiter`.
 
 ::: {.callout-warning}
 ## `maxiter = 0` still clamps the start
@@ -1227,8 +1228,11 @@ says so. Write `omega ETA_CL ~ 0.0 FIX` if you want the objective evaluated at
 the variance you declared — a fixed coordinate is pinned at its own packed
 start, so the clamp cannot move it.
 
-This is not specific to variances: a `theta TVCL(0.05, 0.1, 10.0)` starts at
-`0.1`, a factor of two. That is now reported too — see
+This is not specific to variances: a `theta TVCL(0.05, 0.1, 10.0)` is scored at
+`0.1`, a factor of two. The `theta` case is reported at `maxiter = 0`: the run
+carries a `W_THETA_INIT_OUTSIDE_BOUNDS` warning naming the declared start and
+the value scored, and `ferx check` shows the same warning. With `maxiter > 0`
+the declaration is refused — see
 [Bounds](../estimation/parameterization.qmd#the-same-box-on-the-way-in).
 :::
 
