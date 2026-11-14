@@ -45,6 +45,17 @@
 //! `min(cᵢ, H)`. Unlike a single event, a recurrent subject's follow-up end is always
 //! observed, so no censoring time is drawn. [`VpcCensoring::Horizon`] follows every
 //! replicate subject to `H`.
+//!
+//! **The data on `[0, H]` only.** The observed streams are cut at `H` the same way,
+//! once, before anything is computed from them: a subject's events after `H` are
+//! dropped, an event exactly at `H` is kept, and its follow-up ends at `min(cᵢ, H)`. The
+//! result is the one for the data cut at `H` first, every curve, the default
+//! `max_order` and `W_VPC_RTTE_ENDS_ON_EVENT` included (#2908). Without the cut, a
+//! gap-time risk set and the gap a subject is censored at would read follow-up the
+//! replicates do not have. With `sim.horizon` unset `H` is the latest follow-up end and
+//! the cut does nothing. [`vpc_tte`](super::vpc_tte) does not cut its observed records:
+//! an event after `H` cut to a censoring at `H` would enter its reverse Kaplan–Meier
+//! censoring distribution and move the band on `[0, H]`.
 
 use super::simulate::simulate_with_options_impl;
 use super::vpc_tte::{
@@ -85,7 +96,8 @@ pub struct VpcRtteOptions {
     /// least 1. One `K` applies to every stratum. `Some(0)` is refused.
     pub max_order: Option<usize>,
     /// Passed to the simulator. `sim.seed` seeds the replicates; `sim.horizon` is `H`,
-    /// and when `None` `H` is the latest time recorded on `cmt`.
+    /// and when `None` `H` is the latest time recorded on `cmt`. The observed data are
+    /// read on `[0, H]` only (see the module doc).
     pub sim: SimulateOptions,
 }
 
@@ -169,9 +181,9 @@ pub struct RtteVpc {
     /// The highest event order returned, as given or as chosen from the data.
     pub max_order: usize,
     pub strata: Vec<RtteVpcStratum>,
-    /// The warnings of this check about the data's follow-up
-    /// (`W_VPC_RTTE_ENDS_ON_EVENT`, `W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP`), then the
-    /// simulator's (a degenerate recurrent hazard, …).
+    /// The warning of this check about the data's follow-up on `[0, H]`
+    /// (`W_VPC_RTTE_ENDS_ON_EVENT`), then the simulator's (a degenerate recurrent
+    /// hazard, …).
     pub warnings: Vec<String>,
 }
 
@@ -239,6 +251,15 @@ fn mcf_curve<'a>(streams: impl Iterator<Item = (&'a [f64], f64)>) -> McfCurve {
         .expect("event times are finite, non-negative and not after their follow-up end")
 }
 
+/// A stream (event times in time order) followed to `end`, cut at `horizon`: the events
+/// up to `min(end, horizon)`, an event exactly there kept, and that time as the new
+/// follow-up end. The observed streams and the replicates under
+/// [`VpcCensoring::Observed`] both go through it.
+fn cut_at(events: &[f64], end: f64, horizon: f64) -> (&[f64], f64) {
+    let end = end.min(horizon);
+    (&events[..events.partition_point(|&t| t <= end)], end)
+}
+
 /// The part of a replicate subject's simulated events (in time order, all before
 /// `horizon`) that the VPC keeps, and where its follow-up ends, given its observed
 /// follow-up end.
@@ -249,10 +270,7 @@ fn replicate_follow_up(
     censoring: VpcCensoring,
 ) -> (&[f64], f64) {
     match censoring {
-        VpcCensoring::Observed => {
-            let kept = events.partition_point(|&t| t <= observed_end);
-            (&events[..kept], observed_end.min(horizon))
-        }
+        VpcCensoring::Observed => cut_at(events, observed_end, horizon),
         VpcCensoring::Horizon => (events, horizon),
     }
 }
@@ -370,24 +388,15 @@ fn default_max_order(streams: &[Stream]) -> usize {
     k
 }
 
-/// What the data's follow-up does to the comparison, for [`RtteVpc::warnings`].
-/// `horizon` is `H`. Left unset by the caller it is the latest follow-up end, which is
-/// below nobody's, so only a horizon the caller set can raise the second warning.
+/// What the data's follow-up does to the comparison, for [`RtteVpc::warnings`], read
+/// on the streams already cut at `H`.
 ///
-/// - `W_VPC_RTTE_ENDS_ON_EVENT`: subjects whose last record is an event. Their
-///   follow-up ends at that event, so the observed subject has an event exactly at its
-///   follow-up end, where a simulated subject has one with probability 0.
-/// - `W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP`: a horizon below some subject's follow-up end
-///   when gap-time curves are returned. The observed streams are not cut at the horizon
-///   and the replicates are, which changes who is in a gap-time risk set and where a gap
-///   is censored. The mean cumulative function and the absolute-time curves are the
-///   same up to the horizon either way, so with `max_order = 1` nothing is said.
-fn follow_up_warnings(
-    streams: &[Stream],
-    cmt: usize,
-    horizon: f64,
-    max_order: usize,
-) -> Vec<String> {
+/// `W_VPC_RTTE_ENDS_ON_EVENT`: subjects whose last record is an event. Their follow-up
+/// ends at that event, so the observed subject has an event exactly at its follow-up
+/// end, where a simulated subject has one with probability 0. A subject followed past
+/// `H` is cut to a follow-up ending at `H` with no event there, so it is not counted,
+/// whatever its last record was.
+fn follow_up_warnings(streams: &[Stream], cmt: usize) -> Vec<String> {
     let total = streams.len();
     let mut warnings = Vec::new();
     let on_event = streams.iter().filter(|s| s.ends_on_event).count();
@@ -397,17 +406,6 @@ fn follow_up_warnings(
              event as their last record, so their follow-up ends at that event. Such a subject \
              has an event exactly at its follow-up end, which a simulated subject almost never \
              has. If follow-up went on after the last event, add a censoring record at its end."
-        ));
-    }
-    let beyond = streams.iter().filter(|s| s.end > horizon).count();
-    if max_order >= 2 && beyond > 0 {
-        warnings.push(format!(
-            "W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP: `sim.horizon = {horizon}` is below the \
-             follow-up end of {beyond} of {total} subjects on cmt {cmt}. The observed curves \
-             are not cut at the horizon and the replicates are, so each gap-time comparison is \
-             approximate. The mean cumulative function and the absolute-time curves are \
-             unaffected up to the horizon. Leave `sim.horizon` unset, or cut the data at the \
-             horizon first."
         ));
     }
     warnings
@@ -449,18 +447,28 @@ pub fn vpc_rtte(
         ));
     }
     let cmt = resolve_cmt(WHO, model, opts.cmt)?;
-    let (streams, values, labels) = observed_streams(population, cmt, &opts.stratify)?;
-    let max_order = opts
-        .max_order
-        .unwrap_or_else(|| default_max_order(&streams));
+    let (mut streams, values, labels) = observed_streams(population, cmt, &opts.stratify)?;
     let horizon = opts.sim.horizon.unwrap_or_else(|| {
         streams
             .iter()
             .map(|s| s.end)
             .fold(f64::NEG_INFINITY, f64::max)
     });
+    // The data on [0, H] only (module doc), before anything is read from them: the
+    // result is the one for the data cut at H first. A subject followed past H ends at
+    // H on no event.
+    for s in &mut streams {
+        let (kept, end) = cut_at(&s.events, s.end, horizon);
+        let kept = kept.len();
+        s.events.truncate(kept);
+        s.ends_on_event &= s.end <= horizon;
+        s.end = end;
+    }
+    let max_order = opts
+        .max_order
+        .unwrap_or_else(|| default_max_order(&streams));
 
-    let mut warnings = follow_up_warnings(&streams, cmt, horizon, max_order);
+    let mut warnings = follow_up_warnings(&streams, cmt);
 
     let mut sim_opts = opts.sim.clone();
     sim_opts.horizon = Some(horizon);

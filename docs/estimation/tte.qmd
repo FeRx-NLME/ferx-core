@@ -1076,19 +1076,23 @@ or at `H` when `H` is earlier. A recurrent subject's follow-up end is always obs
 unlike the single-event VPC, no censoring time has to be drawn. `VpcCensoring::Horizon`
 follows every replicate subject to `H`.
 
-The observed curves are never cut at `H`. With `sim.horizon` below the data's own follow-up,
-the MCF and the absolute-time curves are unaffected up to `H`. A gap-time curve is not: the
-data's risk set counts events up to each subject's follow-up end and the replicates' only up
-to `H`, so that comparison is approximate. Leave `sim.horizon` unset, or cut the data at `H`
-first, when the gap-time curves matter. The result's `warnings` carry
-`W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP` with the number of subjects followed past `H` whenever
-gap-time curves are returned.
+The observed curves are cut at `H` the same way, before anything is computed from them: a
+subject's events after `H` are dropped, an event exactly at `H` is kept, and its follow-up
+ends at `H` when it went on longer. So `sim.horizon = H` below the data's own follow-up gives
+exactly the result of calling `vpc_rtte()` on the data cut at `H` first: every curve, the
+default `max_order` and the warnings. Without the cut, a gap-time risk set would count events
+the replicates cannot have, and the misses of an observed gap-time curve would fall almost all
+above its band ([#2908](https://github.com/FeRx-NLME/ferx-core/issues/2908)). With
+`sim.horizon` unset, `H` is the latest follow-up end and nothing is cut. `vpc_tte()` does not
+cut its observed records: there an event after `H` turned into a censoring at `H` would enter
+the censoring distribution the replicates draw from, and move the band before `H`.
 
 When a subject's last record is an event, its follow-up ends at that event: the data say
 nothing later about it. The observed subject then has an event exactly at its follow-up end,
 which a replicate almost never has. The usual layout, one censoring row closing each subject,
 does not have this. The result's `warnings` carry `W_VPC_RTTE_ENDS_ON_EVENT` with the number
-of such subjects.
+of such subjects, counted on the data cut at `H`: a subject followed past `H` ends at `H` on
+no event, whatever its last record was.
 
 #### Validation of the repeated-events curves {#km-vpc-rtte-validation}
 
