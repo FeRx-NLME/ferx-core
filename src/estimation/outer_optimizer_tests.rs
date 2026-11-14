@@ -7046,7 +7046,7 @@ pub(crate) mod outer_fd_fallback {
     }
 
     /// A log nobody wrote to is silent. This is the property that makes every route gate
-    /// unnecessary: BOBYQA (including the mixture `Auto` downgrade), GN, trust-region,
+    /// unnecessary: BOBYQA (including the mixture `Auto` choice at an indistinguishable start), GN, trust-region,
     /// `reconverge_gradient_interval = 1` and `outer_maxiter = 0` all reach the end
     /// without touching the analytic branch, so there is nothing to report.
     #[test]
@@ -14751,12 +14751,11 @@ fn unprofiled_stop_needs_verify_takes_every_stop_that_could_be_reported_converge
 #[test]
 fn unprofiled_verify_applies_to_foce_gradient_fits_only() {
     use nlopt::Algorithm as A;
-    assert!(unprofiled_verify_applies(A::Lbfgs, false, false));
-    assert!(unprofiled_verify_applies(A::Slsqp, false, false));
-    assert!(!unprofiled_verify_applies(A::Bobyqa, false, false));
-    assert!(!unprofiled_verify_applies(A::Mma, false, false));
-    assert!(!unprofiled_verify_applies(A::Lbfgs, true, false), "AGQ");
-    assert!(!unprofiled_verify_applies(A::Lbfgs, false, true), "mixture");
+    assert!(unprofiled_verify_applies(A::Lbfgs, false));
+    assert!(unprofiled_verify_applies(A::Slsqp, false));
+    assert!(!unprofiled_verify_applies(A::Bobyqa, false));
+    assert!(!unprofiled_verify_applies(A::Mma, false));
+    assert!(!unprofiled_verify_applies(A::Lbfgs, true), "AGQ");
 }
 
 /// Every exit of the #2462 loop, with the legs scripted.
@@ -16858,6 +16857,7 @@ fn a_discarded_round_leaves_its_probe_and_latch_behind() {
                 basin_probe_fired: &probe,
                 stagnation_latched: &latched,
                 kept_best: &kept,
+                mixture: false,
             },
             || true,
             |start, _| fake.run(start, start == LegStart::ColdModes && cold_wins),
@@ -16893,6 +16893,7 @@ fn a_stop_that_owes_a_restart_takes_no_round() {
                 basin_probe_fired: &probe,
                 stagnation_latched: &latched,
                 kept_best: &kept,
+                mixture: false,
             },
             || {
                 asked.set(asked.get() + 1);
@@ -16957,6 +16958,7 @@ fn a_cancel_starts_no_further_round() {
             basin_probe_fired: &probe,
             stagnation_latched: &latched,
             kept_best: &kept,
+            mixture: false,
         },
         || true,
         |start, v| {
@@ -17709,6 +17711,320 @@ mod start_warm_rescore {
         assert!(start.guard_rejected, "{start:?}");
         assert_eq!(start.warm_rescored_from, None, "{start:?}");
         assert_eq!(start.n_unconverged, 27, "{start:?}");
+    }
+}
+
+// #2745: the #2462 verification leg on a mixture fit.
+
+const MIXTURE_IV_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+const MIXTURE_IV_IOV_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta P1(0.5, 0.001, 0.999)
+  omega ETA_CL ~ 0.05 FIX
+  kappa KAPPA_CL ~ 0.02 FIX
+  sigma EPS ~ 0.04 FIX
+
+[mixture]
+  nsub = 2
+  p(1) = P1
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL + KAPPA_CL) else TVCL2 * exp(ETA_CL + KAPPA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+/// A public mixture fixture under `optimizer = auto` (L-BFGS since #2739), FOCEI, with the
+/// verification leg switched `on` or off.
+fn mixture_fit(
+    model: &str,
+    csv: &str,
+    occ: Option<&str>,
+    on: bool,
+) -> (OuterResult, Vec<UnprofiledLeg>) {
+    let model = crate::parser::model_parser::parse_model_string(model).unwrap();
+    let pop = crate::read_nonmem_csv(std::path::Path::new(csv), Some(&["WT"]), occ).unwrap();
+    let opts = FitOptions {
+        verbose: false,
+        run_covariance_step: false,
+        interaction: true,
+        ..FitOptions::default()
+    };
+    with_verify_leg(on, || {
+        optimize_population(&model, &pop, &model.default_params, &opts)
+    })
+}
+
+const MIXTURE_FIXTURES: [(&str, &str, Option<&str>); 2] = [
+    (MIXTURE_IV_MODEL, "tests/nonmem/mixture_iv.csv", None),
+    (
+        MIXTURE_IV_IOV_MODEL,
+        "tests/nonmem/mixture_iv_iov.csv",
+        Some("OCC"),
+    ),
+];
+
+/// #2745: a mixture's L-BFGS stop gets the verification leg. Measured on `mixture_iv` /
+/// `mixture_iv_iov` (Linux aarch64, with the leg at its own tolerance): one leg each, gaining
+/// 9.1e-13 and 1.1e-13, its first evaluation 1.9e-7 and 3.3e-8 from the loose fit's OFV, and
+/// the leg-on fit 1.4e-12 and 0 from the leg-off one (301.582018391 / 470.814251781, both
+/// converged); 25 against 21 evaluations and 36 against 30. macOS arm64 reads the same first
+/// evaluations, gains of 5.7e-13 and 1.1e-13, and 5.7e-14 between the fits. The bounds below
+/// are 10× the worst first evaluation and 700× the worst fit difference. The leg finds
+/// nothing on either, so this pins that it ran, started at the incumbent and did not disturb
+/// the fit; the straddle is two tests down. It does not pin the per-class seed: clearing
+/// `cached_etas_by_class` at the leg's start leaves it green, because a cold class solve
+/// reaches the same modes here.
+#[test]
+fn a_mixture_stop_gets_one_verification_leg() {
+    for (model, csv, occ) in MIXTURE_FIXTURES {
+        LEG_PASSES_APPLIED.with(|c| c.set(0));
+        let (on, legs) = mixture_fit(model, csv, occ, true);
+        let passes = LEG_PASSES_APPLIED.with(|c| c.get());
+        let (off, none) = mixture_fit(model, csv, occ, false);
+        assert!(none.is_empty(), "the switch turns the leg off: {none:?}");
+        assert_eq!(legs.len(), 1, "{csv}: one leg, no pass: {legs:?}");
+        assert_eq!(passes, 0, "{csv}: a mixture fit reaches no LegStart pass");
+        let first = legs[0]
+            .first
+            .expect("the leg's first evaluation is feasible");
+        assert!(
+            (first - off.ofv).abs() < 2e-6,
+            "{csv}: the leg starts at the incumbent, first {first} vs {}",
+            off.ofv
+        );
+        assert!(
+            legs[0].gain.is_finite() && legs[0].gain < UNPROFILED_VERIFY_GAIN,
+            "{legs:?}"
+        );
+        assert!(on.converged && off.converged, "{csv}");
+        assert!(on.ofv.is_finite() && off.ofv.is_finite());
+        eprintln!(
+            "#2745 {csv}: leg gain {:.3e}, first-vs-off {:.3e}, on-vs-off {:.3e}, ofv {:.9} evals {} vs {}",
+            legs[0].gain,
+            first - off.ofv,
+            on.ofv - off.ofv,
+            on.ofv,
+            on.n_iterations,
+            off.n_iterations
+        );
+        assert!(
+            (on.ofv - off.ofv).abs() < 1e-9,
+            "{csv}: {} vs {}",
+            on.ofv,
+            off.ofv
+        );
+    }
+}
+
+/// #2745 review round 1 #1/#2: a mixture's leg solves every class at the leg tolerance. The
+/// mixture branch of the objective was handed the fit's options, not the leg's, so the leg was
+/// a restart at the fit's own `inner_tol` — the configuration that gains exactly 0 from a stuck
+/// stop (#2462) — and every other `a_mixture_*` test stayed green. Read where the tolerance is
+/// consumed (`mixture_ofv_with_modes`), not where it is chosen. With the leg off, or with the
+/// mixture calls handed `options` again, no evaluation runs at `UNPROFILED_VERIFY_INNER_TOL`.
+#[test]
+fn a_mixture_leg_solves_its_classes_at_the_leg_tolerance() {
+    use crate::estimation::mixture::MIXTURE_OFV_INNER_TOLS;
+    let fit_tol = FitOptions::default().inner_tol;
+    assert!(
+        fit_tol > UNPROFILED_VERIFY_INNER_TOL,
+        "the two tolerances must differ for this test to tell them apart"
+    );
+    for (model, csv, occ) in MIXTURE_FIXTURES {
+        let tols_of = |on: bool| {
+            MIXTURE_OFV_INNER_TOLS.with(|t| t.borrow_mut().clear());
+            let (_, legs) = mixture_fit(model, csv, occ, on);
+            (
+                MIXTURE_OFV_INNER_TOLS.with(|t| t.borrow_mut().split_off(0)),
+                legs.len(),
+            )
+        };
+        let (on, n_legs) = tols_of(true);
+        let (off, _) = tols_of(false);
+        let at = |tols: &[f64], tol: f64| tols.iter().filter(|t| **t == tol).count();
+        assert_eq!(n_legs, 1, "{csv}");
+        assert!(
+            at(&on, UNPROFILED_VERIFY_INNER_TOL) > 0,
+            "{csv}: the leg's evaluations run at the leg tolerance: {on:?}"
+        );
+        assert!(
+            at(&on, fit_tol) > 0,
+            "{csv}: the fit before the leg runs at its own: {on:?}"
+        );
+        assert_eq!(
+            at(&on, UNPROFILED_VERIFY_INNER_TOL) + at(&on, fit_tol),
+            on.len(),
+            "{csv}: no third tolerance: {on:?}"
+        );
+        assert!(
+            !off.is_empty() && at(&off, fit_tol) == off.len(),
+            "{csv}: with the leg off every evaluation is at the fit's tolerance: {off:?}"
+        );
+    }
+}
+
+/// #2745: the other side of the pass gate at fit level. The same data fitted as one population
+/// (no `[mixture]`) reaches the `LegStart` passes, so the zero counted for the mixture fits above
+/// is the `mixture` flag's doing and not a stop that never settles. Without this, replacing
+/// `init_params.mixture.is_some()` at the `PassState` call site by `false` left every test green.
+#[test]
+fn the_single_population_twin_of_a_mixture_fixture_reaches_the_leg_passes() {
+    const TWIN: &str = r"
+[parameters]
+  theta TVCL(1.8, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.09 FIX
+  sigma EPS ~ 0.04 FIX
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    LEG_PASSES_APPLIED.with(|c| c.set(0));
+    let (fit, legs) = mixture_fit(TWIN, "tests/nonmem/mixture_iv.csv", None, true);
+    let passes = LEG_PASSES_APPLIED.with(|c| c.get());
+    assert!(fit.ofv.is_finite(), "ofv {}", fit.ofv);
+    assert!(passes > 0, "a single population takes passes: {legs:?}");
+}
+
+/// #2745, the straddle: a mixture stop the leg does not settle is not reported converged,
+/// while the same fit with the leg off, or with a leg that settles, is. `NEVER_SETTLE` makes
+/// the leg's verdict the only difference.
+#[test]
+fn a_mixture_stop_its_leg_does_not_settle_is_not_converged() {
+    let (model, csv, occ) = MIXTURE_FIXTURES[0];
+    let (settled, _) = mixture_fit(model, csv, occ, true);
+    let (off, _) = mixture_fit(model, csv, occ, false);
+    UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(true));
+    let (stuck, legs) = mixture_fit(model, csv, occ, true);
+    UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(false));
+    assert!(settled.converged && off.converged);
+    assert!(legs.len() > 1, "legs run to the cap: {}", legs.len());
+    assert!(
+        !stuck.converged,
+        "an unsettled leg must not report converged"
+    );
+}
+
+/// #2837 review round 1 #5: [`carry_kept_class_modes`] records after a kept leg and restores
+/// after one that was not.
+#[test]
+fn a_leg_that_was_not_kept_hands_back_the_kept_class_modes() {
+    let (mut kept, mut live) = (0, 7);
+    carry_kept_class_modes(&mut kept, true, &mut live);
+    assert_eq!((kept, live), (7, 7), "a kept leg's modes are recorded");
+    live = 9;
+    carry_kept_class_modes(&mut kept, false, &mut live);
+    assert_eq!((kept, live), (7, 7), "a dropped leg's modes are replaced");
+    live = 11;
+    carry_kept_class_modes(&mut kept, true, &mut live);
+    assert_eq!((kept, live), (11, 11));
+}
+
+/// #2837 review round 1 #5, at fit level: a mixture leg that follows one the fit did not keep
+/// starts from the kept incumbent's per-class modes, not the dropped leg's. The legs are
+/// forced to the cap and every leg after the first is dropped
+/// (`UNPROFILED_VERIFY_DROP_LATER_LEGS`), because whether a leg is kept otherwise turns on
+/// the last digit of the objective: unforced, `mixture_iv` drops legs 1 to 3 on macOS arm64
+/// and only leg 3 on Linux aarch64. Leg 1 starts from the kept leg's modes, so every later
+/// leg must too.
+#[test]
+fn a_mixture_leg_after_a_dropped_one_starts_from_the_kept_class_modes() {
+    for (model, csv, occ) in MIXTURE_FIXTURES {
+        MIXTURE_LEG_START_MODES.with(|m| m.borrow_mut().clear());
+        UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(true));
+        UNPROFILED_VERIFY_DROP_LATER_LEGS.with(|c| c.set(true));
+        let (_, legs) = mixture_fit(model, csv, occ, true);
+        UNPROFILED_VERIFY_DROP_LATER_LEGS.with(|c| c.set(false));
+        UNPROFILED_VERIFY_NEVER_SETTLE.with(|c| c.set(false));
+        let starts = MIXTURE_LEG_START_MODES.with(|m| m.borrow_mut().split_off(0));
+        assert_eq!(starts.len(), legs.len(), "{csv}: one start per leg");
+        assert!(
+            starts.len() > 2,
+            "{csv}: a dropped leg is followed: {legs:?}"
+        );
+        assert!(
+            starts.iter().all(|s| !s.is_empty()),
+            "{csv}: per-class modes"
+        );
+        for i in 2..starts.len() {
+            assert!(
+                starts[i] == starts[1],
+                "{csv}: leg {i} follows a dropped leg and must start from the kept modes"
+            );
+        }
+    }
+}
+
+/// #2745: a mixture takes its legs but neither leg pass (the cold-modes restart, the Newton
+/// step); a single population takes both passes.
+#[test]
+fn a_mixture_takes_no_leg_pass() {
+    for (mixture, want) in [
+        (false, vec![LegStart::ColdModes, LegStart::NewtonStep]),
+        (true, vec![]),
+    ] {
+        let (probe, latched) = (
+            std::cell::Cell::new(false),
+            std::sync::atomic::AtomicBool::new(false),
+        );
+        let kept = std::cell::Cell::new(None);
+        let ran = std::cell::RefCell::new(Vec::new());
+        drive_leg_passes(
+            PolishEnd::Settled,
+            |v| *v,
+            || false,
+            PassState {
+                basin_probe_fired: &probe,
+                stagnation_latched: &latched,
+                kept_best: &kept,
+                mixture,
+            },
+            || true,
+            |start, v| {
+                ran.borrow_mut().push(start);
+                *v
+            },
+        );
+        assert_eq!(*ran.borrow(), want, "mixture = {mixture}");
     }
 }
 

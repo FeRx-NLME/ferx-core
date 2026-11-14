@@ -27,6 +27,7 @@
 
 use crate::estimation::outer_optimizer::{
     above_start_warning, ofv_is_valid, runs_outer_optimizer, OuterResult, StartEval, StartRescore,
+    MIXTURE_SYMMETRIC_START,
 };
 use crate::estimation::parameterization::{pack_params, unpack_params, PackedCoordKind};
 use crate::types::{FitOptions, ModelParameters};
@@ -631,6 +632,7 @@ pub(crate) fn resolve_rail_completion<T: StoppedFit>(
             .push(rail_not_converged_warning(&downhill, stop_ofv, at));
         return first;
     }
+    carry_start_warning(&mut first, &mut second);
     *second.evals_mut() += *first.evals_mut() + n_probes;
     *second.covariance_secs_mut() += *first.covariance_secs_mut();
     // The resumed run measures "left its start" against the point it was resumed from,
@@ -959,6 +961,32 @@ fn escape_floor_from<T: StoppedFit>(
     (out, warning)
 }
 
+/// Carry `first`'s `W_MIXTURE_SYMMETRIC_START` onto `second`, the resumed run a rescue adopts in
+/// its place, at the front where `optimize_population` puts it (#2749). The warning says why the
+/// stage ran BOBYQA, and `fit()` reports the optimizer judged at the stage's start, which is
+/// `first`'s start. `second` judges its own start, which `first` has moved: once the classes are
+/// apart it does not warn, and the fit would report `auto (bobyqa)` with nothing to say why.
+/// Measured on Linux x86_64, where rail completion rescues the FOCE stage of
+/// `a_later_stage_is_judged_at_its_own_start` and macOS does not. A warning `second` gives itself
+/// is replaced, so the one kept names the pairs of the start the label was judged at. When
+/// `first` has none, `second` keeps its own. The other warnings of `first` describe a run that is
+/// no longer reported, and are dropped as before.
+fn carry_start_warning<T: StoppedFit>(first: &mut T, second: &mut T) {
+    let is_start = |w: &String| w.starts_with(MIXTURE_SYMMETRIC_START);
+    let carried: Vec<String> = first
+        .warnings_mut()
+        .iter()
+        .filter(|w| is_start(w))
+        .cloned()
+        .collect();
+    if carried.is_empty() {
+        return;
+    }
+    let warnings = second.warnings_mut();
+    warnings.retain(|w| !is_start(w));
+    warnings.splice(0..0, carried);
+}
+
 /// What [`escape_floor`] and [`resolve_floor_escape`] read and write of a fit:
 /// [`OuterResult`]'s fields, behind a trait so both are unit-tested on a stand-in.
 pub(crate) trait StoppedFit {
@@ -1071,6 +1099,7 @@ pub(crate) fn resolve_floor_escape<T: StoppedFit>(
             .push(floor_not_converged_warning(names, floor_ofv, probe_ofv));
         return first;
     }
+    carry_start_warning(&mut first, &mut second);
     *second.evals_mut() += *first.evals_mut() + 1;
     *second.covariance_secs_mut() += *first.covariance_secs_mut();
     let again = floored_in(&second);

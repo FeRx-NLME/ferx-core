@@ -75,14 +75,23 @@ $$
 `nll_ik` is the ordinary per-subject FOCE/FOCEI negative log-likelihood evaluated
 with class-$k$ parameters and a **separate empirical Bayes solve per
 (subject × class)**. The mixing-logit coefficients are ordinary thetas and any
-per-class $\Omega$/$\Sigma$ are estimated jointly. Estimation defaults to the
-derivative-free BOBYQA outer optimizer; an analytic posterior-weighted outer
-gradient is available — exact also under IOV and with a block (correlated) $\Omega$ — so a
-user-selected NLopt gradient optimizer (SLSQP / L-BFGS / MMA) is honoured. A subject outside
-analytic scope is salvaged on its own: the other subjects keep their exact gradient, and only
-that subject's per-class terms are finite-differenced, re-solving its class modes at each
-probe. Such a subject is named in the "could not be given the exact analytic outer gradient"
-warning, as for a single population (#2906). `MIXNUM`-branched typical values are in scope.
+per-class $\Omega$/$\Sigma$ are estimated jointly. The outer gradient is analytic and
+posterior-weighted, exact also under IOV and with a block (correlated) $\Omega$;
+`MIXNUM`-branched typical values are in scope. A subject outside that scope is salvaged
+on its own: the other subjects keep their exact gradient, and only that subject's
+per-class terms are finite-differenced, re-solving its class modes at each probe. Such a
+subject is named in the "could not be given the exact analytic outer gradient" warning,
+as for a single population (#2906). So `optimizer = auto` runs L-BFGS on a mixture as on
+any other model in that scope, and an explicit NLopt gradient optimizer (SLSQP / L-BFGS /
+MMA) is honoured. The exception is a start where two classes are indistinguishable (every
+subject has the same mixing probability and the same objective under both), where no
+gradient optimizer can separate them. `auto` runs BOBYQA there and warns
+`W_MIXTURE_SYMMETRIC_START`, naming the pair; see
+[mixture models](optimizers.qmd#auto-mixture) on the optimizers page, which has the
+measurements. Give the two classes different initial values. The check is exact, so
+classes that start only close to each other are fitted with L-BFGS without a warning. A
+fit that ends with two classes merged, or one empty, warns `W_MIXTURE_MERGED_CLASSES`;
+see [merged or empty classes](#merged-or-empty-classes).
 
 ## Output
 

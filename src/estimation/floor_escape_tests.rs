@@ -1933,6 +1933,85 @@ fn an_adopted_rail_restart_carries_the_floor_escapes_warning_and_verdict() {
     assert_eq!(r.warnings.len(), 1, "{:?}", r.warnings);
 }
 
+/// A `W_MIXTURE_SYMMETRIC_START` in `first`'s warnings, naming `pairs`.
+fn symmetric_start(pairs: &str) -> String {
+    format!("{MIXTURE_SYMMETRIC_START}: mixture {pairs} start indistinguishable.")
+}
+
+/// Both rescues carry the stage's `W_MIXTURE_SYMMETRIC_START` onto the resumed run they adopt,
+/// at the front, and drop the first run's other warnings as before (#2749). Without it, a stage
+/// rescued from a symmetric start reports `auto (bobyqa)` with no warning: the resumed run starts
+/// where the classes are already apart and does not warn itself (on Linux rail completion
+/// rescues the FOCE stage of `a_later_stage_is_judged_at_its_own_start`, and that test lost
+/// it).
+///
+/// Mutations, each killed here: either call deleted (the floor or the rail half), the `retain`
+/// dropped (the re-warning restart keeps two), the empty-`first` return dropped (the restart's
+/// own warning is removed), the warning appended after the restart's own instead of at the
+/// front, and every warning of `first` carried instead of that one.
+#[test]
+fn an_adopted_restart_carries_the_symmetric_start_warning() {
+    let stage = symmetric_start("classes 1 and 2, classes 1 and 3");
+    let first = || Stub {
+        warnings: vec![stage.clone(), "the stop's own".into()],
+        ..floor_stop()
+    };
+    let starts = |r: &Stub| {
+        r.warnings
+            .iter()
+            .filter(|w| w.starts_with(MIXTURE_SYMMETRIC_START))
+            .count()
+    };
+
+    // The θ floor escape: carried to the front, ahead of the restart's own and the escape's.
+    let r = resolve(first(), 273.790, |_| Stub {
+        warnings: vec!["the restart's own".into()],
+        ..landed()
+    });
+    assert_eq!(r.ofv, 101.911514, "the restart is adopted");
+    assert_eq!(r.warnings.len(), 3, "{:?}", r.warnings);
+    assert_eq!(r.warnings[0], stage);
+    assert_eq!(r.warnings[1], "the restart's own");
+    assert!(
+        r.warnings[2].contains("was resumed from the best point seen"),
+        "the escape's warning stays last: {:?}",
+        r.warnings
+    );
+    assert!(!r.warnings.iter().any(|w| w == "the stop's own"));
+
+    // A restart that warns itself (its start still has a merged pair) keeps the stage's.
+    let r = resolve(first(), 273.790, |_| Stub {
+        warnings: vec![symmetric_start("classes 1 and 2")],
+        ..landed()
+    });
+    assert_eq!(starts(&r), 1, "{:?}", r.warnings);
+    assert_eq!(r.warnings[0], stage);
+
+    // A stage that did not warn leaves a restart's own warning in place.
+    let own = symmetric_start("classes 2 and 3");
+    let r = resolve(floor_stop(), 273.790, |_| Stub {
+        warnings: vec![own.clone()],
+        ..landed()
+    });
+    assert_eq!(r.warnings[0], own);
+    assert_eq!(starts(&r), 1, "{:?}", r.warnings);
+
+    // Rail completion: carried ahead of the rail warning.
+    let cands = &rail_candidates()[..1];
+    let world = RailWorld::new(cands, &[(7, -37.381570)], -37.396982);
+    let (r, (_, restarted)) = world.resolve(
+        Stub {
+            warnings: vec![stage.clone(), "the stop's own".into()],
+            ..short_stop()
+        },
+        None,
+    );
+    assert_eq!(restarted, Some(vec![7]), "the resumed run is adopted");
+    assert_eq!(r.warnings.len(), 2, "{:?}", r.warnings);
+    assert_eq!(r.warnings[0], stage);
+    assert!(r.warnings[1].contains("resumed from just above the guard"));
+}
+
 /// The text's input space (plan §3), one assertion per sentence and per class.
 #[test]
 fn the_rail_messages_name_each_coordinate_by_family_and_say_what_happened() {

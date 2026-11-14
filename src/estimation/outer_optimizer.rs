@@ -205,16 +205,21 @@ pub(crate) fn resolve_outer_optimizer(
     has_mixture: bool,
     analytic_outer_gradient: bool,
 ) -> (Optimizer, Option<String>) {
-    // Mixture models (#977). BOBYQA (derivative-free) is the default and safe
-    // choice — robust against the mixture's label-switching multimodality. Since
-    // Phase 4 an analytic posterior-weighted outer gradient exists, so a user who
-    // explicitly picks an NLopt *gradient* optimizer (SLSQP / L-BFGS / MMA) is
-    // honoured — those route through `optimize_nlopt`, whose objective closure
-    // branches to `mixture_gradient`. An explicit `bobyqa` is honoured too: it is
-    // the optimizer the mixture path runs, so nothing was replaced and no warning
-    // is owed (#2852). Every other choice (including `auto`, and the built-in
-    // BFGS / trust-region paths, which do not carry the mixture objective) falls
-    // back to BOBYQA.
+    // Mixture models (#977). The NLopt optimizers carry the mixture objective:
+    // `optimize_nlopt`'s objective closure branches to the analytic posterior-weighted
+    // `mixture_gradient` (Phase 4), so a user who picks SLSQP / L-BFGS / MMA is
+    // honoured, and `auto` follows the same rule as any other model: L-BFGS when the
+    // analytic outer gradient is in scope, BOBYQA otherwise. BOBYQA was `auto`'s mixture
+    // choice until #2739, as "robust against label switching". Measured on the public
+    // mixture fixtures (`tests/nonmem/mixture_iv*.csv`, 100 seeded random starts each),
+    // L-BFGS reached the best optimum in 100, 71 and 99 of 100 fits against BOBYQA's 100, 74
+    // and 99 (within 3 of 100) in 5–8× fewer evaluations. The one start it cannot leave is a
+    // permutation-symmetric one, which `optimize_population` detects and runs under BOBYQA
+    // (`mixture::indistinguishable_class_pairs`). The check is exact: a merely close start
+    // (clearances 1.70 and 1.71) is not caught and runs L-BFGS. An explicit `bobyqa` is
+    // honoured too: it is the optimizer the mixture path runs, so nothing was replaced and
+    // no warning is owed (#2852). The built-in BFGS / L-BFGS and trust-region paths do not
+    // carry the mixture objective and fall back to BOBYQA.
     if has_mixture {
         // Exhaustive, no wildcard: a new variant must say here whether it carries
         // the mixture objective.
@@ -222,11 +227,12 @@ pub(crate) fn resolve_outer_optimizer(
             Optimizer::Bobyqa | Optimizer::Slsqp | Optimizer::NloptLbfgs | Optimizer::Mma => {
                 requested
             }
-            // `Auto` is the mixture default; the built-in BFGS / L-BFGS and
-            // trust-region paths do not carry the mixture objective.
-            Optimizer::Auto | Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => {
-                Optimizer::Bobyqa
+            Optimizer::Auto => {
+                requested.resolve_auto_given_analytic(model, analytic_outer_gradient)
             }
+            // The built-in BFGS / L-BFGS and trust-region paths do not carry the
+            // mixture objective.
+            Optimizer::Bfgs | Optimizer::Lbfgs | Optimizer::TrustRegion => Optimizer::Bobyqa,
         };
         // The warning is owed exactly when an *explicit* choice did not run — keyed
         // on the outcome, not on a second list of variants, so "replaced" can never
@@ -246,6 +252,79 @@ pub(crate) fn resolve_outer_optimizer(
     (
         requested.resolve_auto_given_analytic(model, analytic_outer_gradient),
         None,
+    )
+}
+
+/// The optimizer a fit started at `init_params` runs: [`resolve_outer_optimizer`], except that a
+/// mixture whose classes start indistinguishable runs BOBYQA where `auto` would pick a gradient
+/// optimizer, with [`mixture_symmetric_start_warning`]. Such a start is a saddle no gradient
+/// optimizer leaves (`mixture::indistinguishable_class_pairs`). Only `auto`'s own choice is
+/// overridden; an explicit gradient optimizer is the user's to keep.
+///
+/// The rule the outer loop dispatches on and the one `fit()` reports its optimizer from, so the
+/// two cannot disagree (#1540); `symmetric_pairs` is [`symmetric_mixture_start`] at the start the
+/// stage was run from, and the start is symmetric when it is non-empty. Returns the warnings owed
+/// with the choice.
+pub(crate) fn resolve_fit_optimizer(
+    requested: Optimizer,
+    model: &CompiledModel,
+    has_mixture: bool,
+    analytic_outer_gradient: bool,
+    symmetric_pairs: &[(usize, usize)],
+) -> (Optimizer, Vec<String>) {
+    let (resolved, downgrade) =
+        resolve_outer_optimizer(requested, model, has_mixture, analytic_outer_gradient);
+    let mut warnings: Vec<String> = downgrade.into_iter().collect();
+    // `requested == Auto` is the rule's own condition here. `symmetric_mixture_start` tests it
+    // too, and on the `optimize_population` path the two reject the same inputs; that one is
+    // only a cost gate, skipping the `O(n_subj · K)` scan where its answer cannot be used.
+    if requested == Optimizer::Auto
+        && has_mixture
+        && resolved != Optimizer::Bobyqa
+        && !symmetric_pairs.is_empty()
+    {
+        warnings.push(mixture_symmetric_start_warning(symmetric_pairs));
+        return (Optimizer::Bobyqa, warnings);
+    }
+    (resolved, warnings)
+}
+
+/// The class pairs of a mixture under `optimizer = auto` that start where they cannot be told
+/// apart ([`crate::estimation::mixture::indistinguishable_class_pairs`]); empty when there are
+/// none. Evaluated only where it can change the choice: a mixture left on `auto`.
+pub(crate) fn symmetric_mixture_start(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    requested: Optimizer,
+) -> Vec<(usize, usize)> {
+    if requested != Optimizer::Auto || init_params.mixture.is_none() {
+        return Vec::new();
+    }
+    crate::estimation::mixture::indistinguishable_class_pairs(model, population, init_params)
+}
+
+/// The code [`mixture_symmetric_start_warning`] opens with. The floor escape and rail completion
+/// read it to carry the warning onto a resumed run they adopt (`floor_escape::carry_start_warning`).
+pub(crate) const MIXTURE_SYMMETRIC_START: &str = "W_MIXTURE_SYMMETRIC_START";
+
+/// The warning for a mixture with classes that start indistinguishable, where `auto` runs
+/// BOBYQA instead of L-BFGS ([`crate::estimation::mixture::indistinguishable_class_pairs`]).
+/// Names each pair, as class numbers (`MIXNUM`): the check is pairwise, so a third class
+/// may differ.
+fn mixture_symmetric_start_warning(pairs: &[(usize, usize)]) -> String {
+    let named = pairs
+        .iter()
+        .map(|(a, b)| format!("classes {a} and {b}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{MIXTURE_SYMMETRIC_START}: mixture {named} start indistinguishable: every subject has \
+         the same mixing probability and the same objective under both classes of a pair. A \
+         gradient optimizer cannot separate such a pair, so `optimizer = auto` ran BOBYQA \
+         instead of L-BFGS. Give the two classes of each pair different initial values (for \
+         example of their class-specific parameters, or of their mixing probabilities) to fit \
+         with L-BFGS."
     )
 }
 
@@ -284,13 +363,13 @@ pub fn optimize_population(
     // The mixture arm and the `auto` resolution both live in
     // `resolve_outer_optimizer`, so the #1381 coupling check cannot describe a
     // different rule than the one that runs here.
-    let (resolved, downgrade) = resolve_outer_optimizer(
+    let (resolved, optimizer_downgrade_warning) = resolve_fit_optimizer(
         options.optimizer,
         model,
         init_params.mixture.is_some(),
         crate::sens::provider::analytic_outer_gradient_for_interaction(model, options.interaction),
+        &symmetric_mixture_start(model, population, init_params, options.optimizer),
     );
-    let optimizer_downgrade_warning: Vec<String> = downgrade.into_iter().collect();
     let owned_opts;
     let options = if resolved == options.optimizer {
         options
@@ -6274,16 +6353,11 @@ pub(crate) const UNPROFILED_VERIFY_GAIN: f64 = 3e-5;
 /// gradient optimizer (L-BFGS, SLSQP), whose `1e-12` stops are unreachable, so that its
 /// stops are bare `Failure`s the plateau rule accepts or tolerance stops met mid-descent.
 /// Not a quadrature objective, which has reachable stops
-/// (`gradient_run_has_reachable_stops`) and its own noise floor, and not a mixture, whose
-/// objective is a different solve.
-pub(crate) fn unprofiled_verify_applies(
-    algo: nlopt::Algorithm,
-    reachable_stops: bool,
-    is_mixture: bool,
-) -> bool {
-    matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp)
-        && !reachable_stops
-        && !is_mixture
+/// (`gradient_run_has_reachable_stops`) and its own noise floor. A mixture takes the
+/// incumbent-seeded legs (#2745), each class's inner solve at the leg tolerance, but not
+/// the [`LegStart`] passes, which score the single-population objective.
+pub(crate) fn unprofiled_verify_applies(algo: nlopt::Algorithm, reachable_stops: bool) -> bool {
+    matches!(algo, nlopt::Algorithm::Lbfgs | nlopt::Algorithm::Slsqp) && !reachable_stops
 }
 
 /// Does a stop need a verification leg before it may be called converged (#2462)? Every
@@ -6495,6 +6569,20 @@ pub(crate) fn keep_verify_leg<G: Clone>(
     }
 }
 
+/// The per-class modes a mixture's next #2462 leg starts from (#2837 review round 1 #5). A
+/// mixture's warm start is `cached_etas_by_class`, which lives in the optimizer state and so
+/// is out of [`keep_verify_leg`]'s reach when a leg ends: it is settled here, when the next
+/// leg takes the state back. After a kept leg (or the fit before the first leg) `live` holds
+/// the incumbent's modes and is recorded; after a leg that was not kept it holds that leg's
+/// incumbent's, a point the fit dropped, and the kept ones go back in.
+pub(crate) fn carry_kept_class_modes<M: Clone>(kept: &mut M, last_leg_kept: bool, live: &mut M) {
+    if last_leg_kept {
+        kept.clone_from(live);
+    } else {
+        live.clone_from(kept);
+    }
+}
+
 /// Where a leg starts. Every leg starts at the incumbent's own modes (#2549) unless it opens
 /// one of the further passes a verified stop gets (#2645): a round of
 /// [`unprofiled_verify_legs`] from somewhere the warm legs cannot reach, which replaces the
@@ -6558,12 +6646,16 @@ pub(crate) fn verified_stop_owes_a_restart(best: f64, cold: f64) -> bool {
         || cold_solve_beats_best_seen(Some(cold), Some(best)).is_some()
 }
 
-/// The fit's own state a pass can leave behind, restored when the pass is discarded.
+/// The fit's own state a pass can leave behind, restored when the pass is discarded, and
+/// whether the fit takes passes at all (`mixture`).
 pub(crate) struct PassState<'a> {
     pub(crate) basin_probe_fired: &'a std::cell::Cell<bool>,
     pub(crate) stagnation_latched: &'a std::sync::atomic::AtomicBool,
     /// The incumbent's objective at the leg tolerance: what a kept pass changes.
     pub(crate) kept_best: &'a std::cell::Cell<Option<f64>>,
+    /// A mixture fit takes no pass (#2745): a pass's cold solve, Newton step and comparison of
+    /// modes are the single-population objective's and do not score a mixture's classes.
+    pub(crate) mixture: bool,
 }
 
 /// Runs each [`LegStart`] pass that applies after the verdict `warm`, and returns the verdict
@@ -6582,6 +6674,9 @@ pub(crate) fn drive_leg_passes<V>(
     stop_is_free: impl FnOnce() -> bool,
     mut pass: impl FnMut(LegStart, &V) -> V,
 ) -> V {
+    if state.mixture {
+        return warm;
+    }
     let mut verdict = warm;
     let mut stop_is_free = Some(stop_is_free);
     for start in [LegStart::ColdModes, LegStart::NewtonStep] {
@@ -6589,6 +6684,8 @@ pub(crate) fn drive_leg_passes<V>(
         if !leg_pass_applies(start, end_of(&verdict), probe_fired, cancelled()) {
             continue;
         }
+        #[cfg(test)]
+        LEG_PASSES_APPLIED.with(|c| c.set(c.get() + 1));
         if stop_is_free.take().is_some_and(|free| !free()) {
             break;
         }
@@ -6661,6 +6758,17 @@ thread_local! {
     /// The #2645 passes turned off on this thread, for the tests' straddles.
     pub(crate) static LEG_PASSES_OFF: std::cell::Cell<&'static [LegStart]> =
         const { std::cell::Cell::new(&[]) };
+    /// [`LegStart`] passes `drive_leg_passes` reached on this thread, for the tests (#2745).
+    pub(crate) static LEG_PASSES_APPLIED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    /// The per-class modes each #2462 leg of a mixture started from on this thread, for the
+    /// tests ([`carry_kept_class_modes`]).
+    pub(crate) static MIXTURE_LEG_START_MODES: std::cell::RefCell<Vec<Vec<Vec<DVector<f64>>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Test switch: every #2462 leg after the first kept one is treated as not kept, so a
+    /// dropped leg is followed by another whatever the last digits of the objective do.
+    pub(crate) static UNPROFILED_VERIFY_DROP_LATER_LEGS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
     /// The #2462 legs `optimize_nlopt_attempt` ran on this thread, for the tests.
     pub(crate) static UNPROFILED_VERIFY_LEGS: std::cell::RefCell<Vec<UnprofiledLeg>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -7084,11 +7192,7 @@ fn optimize_nlopt_attempt_probed(
     // objectives at the user's tolerance; `leg_first` is the leg's first feasible
     // objective, for its gain.
     let verify_on = unprofiled_verify_enabled()
-        && unprofiled_verify_applies(
-            algo,
-            gradient_run_has_reachable_stops(options),
-            init_params.mixture.is_some(),
-        );
+        && unprofiled_verify_applies(algo, gradient_run_has_reachable_stops(options));
     let leg_options = FitOptions {
         inner_tol: options.inner_tol.min(UNPROFILED_VERIFY_INNER_TOL),
         ..options.clone()
@@ -7183,13 +7287,21 @@ fn optimize_nlopt_attempt_probed(
                     .then_some(state.cached_etas_by_class.as_slice());
                 let mut m = if grad.is_some() && model.n_kappa > 0 {
                     let (m, modes) = crate::estimation::mixture::mixture_ofv_with_modes(
-                        model, population, &params, options, warm,
+                        model,
+                        population,
+                        &params,
+                        eval_options,
+                        warm,
                     );
                     mixmodes = Some(modes);
                     m
                 } else {
                     crate::estimation::mixture::mixture_ofv(
-                        model, population, &params, options, warm,
+                        model,
+                        population,
+                        &params,
+                        eval_options,
+                        warm,
                     )
                 };
                 let stats = InnerLoopStats {
@@ -7479,7 +7591,7 @@ fn optimize_nlopt_attempt_probed(
                         model,
                         population,
                         &params,
-                        options,
+                        eval_options,
                         mev,
                         mixmodes.as_ref(),
                         declines,
@@ -7490,7 +7602,7 @@ fn optimize_nlopt_attempt_probed(
                             population,
                             &x,
                             init_params,
-                            options,
+                            eval_options,
                         )
                     })
                 } else {
@@ -8165,6 +8277,10 @@ fn optimize_nlopt_attempt_probed(
         let cold_at_stop = std::cell::RefCell::new(None::<FinalInnerSolve>);
         // Set for the first leg of a pass ([`leg_pass_applies`]).
         let next_start = std::cell::Cell::new(LegStart::Incumbent);
+        // A mixture's per-class modes at the kept incumbent, and whether the leg before this
+        // one was kept ([`carry_kept_class_modes`]). Empty for a single population.
+        let mut kept_class_modes: Vec<Vec<DVector<f64>>> = Vec::new();
+        let mut last_leg_kept = true;
         let mut run_leg = |left: u32| {
             if plateau_tracker.lock().unwrap().2 == 0 {
                 return None;
@@ -8275,6 +8391,16 @@ fn optimize_nlopt_attempt_probed(
             // re-solve of them and a subject the cold solve left unconverged is not what
             // the guard judges (#2645).
             state.restart_from_modes(held);
+            carry_kept_class_modes(
+                &mut kept_class_modes,
+                last_leg_kept,
+                &mut state.cached_etas_by_class,
+            );
+            #[cfg(test)]
+            if init_params.mixture.is_some() {
+                MIXTURE_LEG_START_MODES
+                    .with(|m| m.borrow_mut().push(state.cached_etas_by_class.clone()));
+            }
             *leg_best.borrow_mut() = BestPoint::new();
             leg_first.set(None);
             let mut leg = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
@@ -8299,7 +8425,15 @@ fn optimize_nlopt_attempt_probed(
                 last_gradient.lock().unwrap().take(),
                 best_solve.lock().unwrap().take(),
             );
-            if keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, best, &mut live) {
+            #[cfg(test)]
+            let judged = best.filter(|_| {
+                kept_leg_best.is_none() || !UNPROFILED_VERIFY_DROP_LATER_LEGS.with(|c| c.get())
+            });
+            #[cfg(not(test))]
+            let judged = best;
+            last_leg_kept =
+                keep_verify_leg(&mut kept_leg_best, &mut kept_leg_state, judged, &mut live);
+            if last_leg_kept {
                 *best_seen.lock().unwrap() = leg_best.borrow().clone();
             }
             kept_best_seen.set(kept_leg_best);
@@ -8337,6 +8471,7 @@ fn optimize_nlopt_attempt_probed(
                 basin_probe_fired: &basin_probe_fired,
                 stagnation_latched: &stagnation_latched,
                 kept_best: &kept_best_seen,
+                mixture: init_params.mixture.is_some(),
             },
             || {
                 // Clean, as the final check reads it: the cold objective carries no penalty.
@@ -11309,8 +11444,8 @@ fn declined_subject_gradient(
 ///
 /// Recording instead of probing also removes every gate this diagnostic would otherwise
 /// need, because a decline can only be recorded on an evaluation that actually happened:
-/// a derivative-free BOBYQA fit (including the silent mixture `Auto` → BOBYQA downgrade in
-/// [`resolve_outer_optimizer`]),
+/// a derivative-free BOBYQA fit (including the mixture `Auto` → BOBYQA choice at an
+/// indistinguishable start, see [`resolve_fit_optimizer`]),
 /// a `reconverge_gradient_interval = 1` fit that bypasses the analytic branch on every
 /// eval, a GN / trust-region fit, and an `outer_maxiter = 0` evaluation-only run all reach
 /// the end with an empty log and say nothing.
