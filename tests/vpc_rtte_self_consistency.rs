@@ -205,6 +205,10 @@ mod self_consistency {
     /// | gap 2, observed streams not cut | 0.895 / 0.880 / 0.870 | 11 / 60 | **0.15** |
     /// | gap 3, observed streams not cut | 0.890 / 0.890 / 0.940 | 1 / 55 | **0.02** |
     ///
+    /// Linux x86_64 (CI slow-tests run 43616779609, at `b28f22101`) printed the cut rows
+    /// and the MCF / absolute-2 control with every digit, undefined count and miss count
+    /// identical to the macOS arm64 numbers above.
+    ///
     /// Coverage is over the datasets where the observed value and the band are both
     /// defined: at most 10 of 200 are not (gap 3 at 6, where a dataset's observed gap
     /// curve can end first); the bound `MAX_UNDEFINED` is twice that.
