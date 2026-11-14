@@ -600,7 +600,8 @@ With `npde_nsim > 0` a **single-event** time-to-event record gets a score in the
 ([#1889](https://github.com/FeRx-NLME/ferx-core/issues/1889)). The two columns hold
 the same number there: one event per subject leaves nothing to decorrelate. `EPRED`,
 `EWRES` and `PWRES` stay blank on a TTE row, since a single event has no replicate
-mean to subtract.
+mean to subtract. The five columns come together, so a fit with only TTE records has
+`EPRED`, `EWRES` and `PWRES` columns too, blank on every row.
 
 The record is scored against the model's population predictive distribution of the
 event time. With `F̂(y)` the fraction of the `K = npde_nsim` simulated replicates of
@@ -625,9 +626,11 @@ no score yet. The fit still succeeds: the TTE cells stay blank and the fit carri
 `W_NPDE_TTE_SKIPPED` warning that says which of these it met. The other rows are
 scored as usual.
 
-`stats::npde::compute_tte_npde` computes the same scores after the fit; with the
-fitted parameters and the recorded `npde_seed` it reproduces the stored cells bit for
-bit. Called directly it returns `E_NPDE_TTE_INPUT` for an input it cannot score. The
+`stats::npde::compute_tte_npde` computes the same scores after the fit. Given the
+fitted parameters (`fitted_params_from_result`) and the recorded `npde_seed` it
+reproduces the stored cells: a score is a count of replicates, so it does not move
+with the last bits of a recomputed Ω factor unless a simulated time lies within
+rounding of the record's own time. Called directly it returns `E_NPDE_TTE_INPUT` for an input it cannot score. The
 rule, the validation and what the R `npde` package can and cannot check are in
 [Simulation-based npde](../estimation/tte.qmd#tte-npde).
 

@@ -75,6 +75,8 @@ use rand_distr::{Distribution, Normal};
 use rayon::prelude::*;
 
 #[cfg(feature = "survival")]
+pub(crate) use super::npde_tte::fit_time_warnings;
+#[cfg(feature = "survival")]
 pub use super::npde_tte::{compute_tte_npde, TteNpde};
 
 /// Seed used when the caller leaves `npde_seed` unset, so the diagnostic is

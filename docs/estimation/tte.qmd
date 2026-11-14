@@ -963,7 +963,8 @@ the weighting of η by `S(c | η)`.
 Under a correct model the scores are N(0, 1) when censoring is independent of the event
 time given the model, the assumption the likelihood makes. `NPDE = NPD` for a single
 event. The post-fit function is `stats::npde::compute_tte_npde`; with the fitted
-parameters and the recorded `npde_seed` it reproduces the stored cells bit for bit.
+parameters (`fitted_params_from_result`) and the recorded `npde_seed` it reproduces the
+stored cells.
 
 Not scored: a repeated-events endpoint, competing risks, left truncation, an
 interval-censored record, more than one record per subject on the endpoint. At fit time
@@ -983,11 +984,13 @@ checks are a closed form, a distribution test and the R `npde` package (CRAN 3.5
 | KS distance of `pd` from U(0, 1), N = 1000, 71 % censored by independent dropout, K = 1000 | 0.0196 under the true model, 0.1265 under a hazard twice too large (0.1 % critical value 0.0616) |
 | Kernel vs R `npde` 3.5 on R's own simulated times (40 subjects, K = 200, one common censoring time) | event `pd`: 5.6e-17; event `npde`: 2.1e-9; censored `F̂(c)`: 5.6e-17 |
 | Constant hazard through the ODE engine, joint PK-TTE subjects, K = 2,000 | worst error 5.3e-3 (bound: 4 SD) |
-| `fit()` cells vs `compute_tte_npde` after the fit (25 scored records) | bit-equal |
+| `fit()` cells vs `compute_tte_npde` after the fit (25 scored records, correlated Ω block rebuilt by `fitted_params_from_result`) | bit-equal |
 
 A replicate with no event (a cure-fraction draw, a failed event-time solve) stays in the
-denominator. The simulator's warning for it reaches the fit once per warning code, with
-the number raised over the replicates.
+denominator. `compute_tte_npde` returns the simulator's warning for it once per warning
+code, with the number raised over the replicates. A fit keeps only the failed solves
+(`W_TTE_SOLVE_FAILED`, worded as reference replicates): a replicate that never has an
+event is what a cure-fraction hazard draws, and is not reported on the fit.
 
 The R package is a reference for less than it looks. It has no time-to-event mode; it
 is fed `−T`, with right censoring as left censoring. That is exact for event rows and

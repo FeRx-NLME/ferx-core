@@ -318,6 +318,26 @@ pub(crate) fn reference_counts(
     Ok((n_before, n_drawn, warnings))
 }
 
+/// What a fit keeps of [`compute_tte_npde`]'s warnings (#1889): the failed event-time
+/// solves of the reference replicates, said as such. A `W_TTE_DEGENERATE_HAZARD` is
+/// dropped: the simulator raises it for every replicate that never has an event, which
+/// is what a cure-fraction hazard (Gompertz `gamma < 0`) legitimately draws, and its
+/// text ("check the hazard parameters") would be a false alarm on a correct fit.
+pub(crate) fn fit_time_warnings(folded: Vec<String>) -> Vec<String> {
+    const CODE: &str = "W_TTE_SOLVE_FAILED: ";
+    folded
+        .into_iter()
+        .filter_map(|w| {
+            w.strip_prefix(CODE).map(|rest| {
+                format!(
+                    "{CODE}in the npde reference replicates of the time-to-event records, \
+                     where a failed solve counts as \"no event\": {rest}"
+                )
+            })
+        })
+        .collect()
+}
+
 /// npde of every single-event TTE record of `population` under `params` (#1889).
 ///
 /// Returns one inner `Vec` per subject in population order, holding one [`TteNpde`]
@@ -330,7 +350,9 @@ pub(crate) fn reference_counts(
 /// `iov_occasion` is passed to the simulator (see
 /// [`SimulateOptions::iov_occasion`]). A fit with `[fit_options] npde_nsim > 0` stores
 /// these scores on [`crate::types::TteObsDiagnostic::npde`]; calling this with the
-/// fitted parameters and the fit's recorded `npde_seed` reproduces them bit for bit.
+/// fitted parameters
+/// ([`fitted_params_from_result`](crate::estimation::uncertainty_samples::fitted_params_from_result))
+/// and the fit's recorded `npde_seed` reproduces them.
 ///
 /// A replicate whose hazard draw is degenerate or whose event-time solve failed is in
 /// the denominator and counts as "no event", as the simulator reports it.
@@ -358,7 +380,7 @@ pub fn compute_tte_npde(
     let cmt = scored_cmt(model)?;
     let records = scored_records(population, cmt)?;
     let seed = effective_seed(seed);
-    let (n_before, _, warnings) = reference_counts(
+    let (n_before, n_drawn, warnings) = reference_counts(
         model,
         population,
         params,
@@ -368,6 +390,16 @@ pub fn compute_tte_npde(
         cmt,
         &records,
     )?;
+
+    // The simulator returns one row per replicate for every scored subject, whatever
+    // the replicate's outcome, so `nsim` is the denominator.
+    debug_assert!(
+        records
+            .iter()
+            .zip(&n_drawn)
+            .all(|(r, &d)| d == if r.is_some() { nsim } else { 0 }),
+        "replicates drawn per subject: {n_drawn:?}, nsim {nsim}"
+    );
 
     let scores = records
         .iter()

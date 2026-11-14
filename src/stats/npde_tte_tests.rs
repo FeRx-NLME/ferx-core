@@ -654,8 +654,9 @@ fn ode_hazard_model(file: &str) -> CompiledModel {
 ///
 /// Constant arm (`hazard = H0`, integrated by the ODE engine): `pd` against
 /// `1 − exp(−H0·t)`, four Monte-Carlo SDs. Drug-driven arm: one finite score per event
-/// record, none for a subject with no TTE record, and the Gaussian npde of the
-/// concentration rows is what it is without the TTE scoring.
+/// record, none for a subject with no TTE record, and `compute_npde_npd` on the same
+/// population gives one Gaussian score per concentration row and none for the TTE
+/// record.
 ///
 /// Dies on: no horizon passed to the simulator (refused for an ODE hazard); a score
 /// emitted per observation record; the concentration rows scored here.
@@ -695,7 +696,7 @@ fn ode_hazard_and_joint_subjects() {
             .map(|s| (s.npd, s.npde))
             .collect::<Vec<_>>()
     };
-    let before = gaussian(&p);
+    let gaussian_scores = gaussian(&p);
     let (out, _) = compute_tte_npde(&m, &p, &m.default_params, 200, Some(4), None).unwrap();
     assert_eq!(out.len(), 12);
     for (i, (s, row)) in out.iter().zip(&rows).enumerate() {
@@ -710,10 +711,10 @@ fn ode_hazard_and_joint_subjects() {
         }
     }
     // The concentration rows: one Gaussian score each, the TTE record none.
-    assert!(before
+    assert!(gaussian_scores
         .iter()
         .all(|(npd, npde)| npd.len() == 1 && npde.len() == 1));
-    assert!(before.iter().all(|(npd, _)| npd[0].is_finite()));
+    assert!(gaussian_scores.iter().all(|(npd, _)| npd[0].is_finite()));
 }
 
 /// D6. A replicate with no event is in the denominator, and its per-subject simulator
@@ -783,4 +784,72 @@ fn tte_row_without_npde_deserialises_to_nan() {
     let old: TteObsDiagnostic = serde_json::from_value(json).unwrap();
     assert!(old.npde.is_nan(), "{}", old.npde);
     assert_eq!((old.cmt, old.time, old.pit), (2, 5.0, 0.6));
+}
+
+/// `TteNpde::time` is the data TIME as written, not the engine clock (review r1 #3).
+/// The second subject's record lies in a reset period that restarts `TIME`: engine
+/// time 14, written 4. No other fixture has a reset period, so everywhere else the two
+/// clocks are equal and a score reporting the engine time passes.
+///
+/// Dies on: `param_time_at` dropped (14, not 4).
+#[test]
+fn reported_time_is_the_written_time() {
+    let m = model(EXP_FIXED);
+    let mut p = pop(vec![event(3.0), event(14.0)]);
+    p.subjects[1].reset_period_times = vec![(10.0, 0.0)];
+    let out = scores(&m, &p, 100, 1);
+    assert_eq!(out[0][0].time, 3.0);
+    assert_eq!(out[1][0].time, 4.0);
+    // The score itself is on the engine clock: F(14), not F(4).
+    assert!(out[1][0].pd > 0.6, "{}", out[1][0].pd);
+}
+
+/// Records that are not on the scored endpoint are skipped, not scored and not
+/// refused (review r1 #11): a discrete-endpoint record, and an event record on
+/// another compartment.
+///
+/// Dies on: either skip removed (two records on the endpoint are refused, or the
+/// other compartment's time is scored).
+#[test]
+fn records_off_the_endpoint_are_skipped() {
+    let p = pop(vec![
+        vec![
+            ObsRecord::DiscreteState {
+                time: 1.0,
+                raw_time: 1.0,
+                state: 1,
+                cmt: 5,
+            },
+            rec(9.0, EventType::Exact, 0.0, 3),
+            rec(4.0, EventType::RightCensored, 0.0, 2),
+        ],
+        vec![rec(9.0, EventType::Exact, 0.0, 3)],
+    ]);
+    let scored = scored_records(&p, 2).unwrap();
+    assert_eq!(scored, vec![Some((4.0, 4.0, true)), None]);
+}
+
+/// What a fit keeps of the reference draws' warnings (review r1 #1): a failed solve,
+/// reworded for where it happened; never the degenerate-hazard text, which every
+/// cure-fraction replicate raises.
+///
+/// Dies on: the degenerate-hazard warning forwarded; the solve warning forwarded
+/// unchanged, or dropped; the count clause lost.
+#[test]
+fn a_fit_keeps_only_failed_solves_of_the_reference_draws() {
+    let kept = fit_time_warnings(vec![
+        "W_TTE_DEGENERATE_HAZARD: subject '2' (CMT=2) drew a non-positive rate [493 more]".into(),
+        "W_TTE_SOLVE_FAILED: subject '7' (CMT=3): the solve failed [12 such]".into(),
+        "W_IOV_NO_OCCASIONS: something".into(),
+    ]);
+    assert_eq!(
+        kept,
+        vec![
+            "W_TTE_SOLVE_FAILED: in the npde reference replicates of the time-to-event \
+             records, where a failed solve counts as \"no event\": subject '7' (CMT=3): the \
+             solve failed [12 such]"
+                .to_string()
+        ]
+    );
+    assert!(fit_time_warnings(vec![]).is_empty());
 }

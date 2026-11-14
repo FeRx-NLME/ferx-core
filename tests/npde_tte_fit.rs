@@ -8,11 +8,12 @@ mod common;
 #[cfg(feature = "survival")]
 mod npde_tte_fit {
     use crate::common;
+    use ferx_core::estimation::uncertainty_samples::fitted_params_from_result;
     use ferx_core::io::output::write_sdtab_csv;
     use ferx_core::parser::model_parser::parse_model_string;
     use ferx_core::stats::npde::compute_tte_npde;
     use ferx_core::types::{
-        CompiledModel, DoseEvent, EventType, ModelParameters, ObsRecord, OmegaMatrix, Population,
+        CompiledModel, DoseEvent, EventType, ModelParameters, ObsRecord, Population,
     };
     use ferx_core::{fit, FitOptions, FitResult};
 
@@ -23,8 +24,7 @@ mod npde_tte_fit {
   theta TVCL(1.0, 0.01, 100.0)
   theta TVV(10.0, 0.1, 500.0)
   theta TVLAMBDA(0.05, 0.001, 10.0)
-  omega ETA_CL ~ 0.09
-  omega ETA_LAMBDA ~ 0.25
+  block_omega (ETA_CL, ETA_LAMBDA) = [0.09, 0.03, 0.25]
   sigma PROP_ERR ~ 0.04
 
 [individual_parameters]
@@ -123,19 +123,12 @@ mod npde_tte_fit {
         }
     }
 
-    /// The fitted parameters as a post-fit caller rebuilds them from the `FitResult`:
-    /// the model's parameter set with the estimates written in. Ω's Cholesky factor is
-    /// recomputed from the reported matrix here, where the fit held the factor itself.
+    /// The fitted parameters as a post-fit caller gets them: the public accessor on
+    /// the `FitResult`. Ω is a correlated block here, so its Cholesky factor is
+    /// recomputed from the reported matrix and need not equal the factor the fit held
+    /// to the last bit. The scores are integer counts, so they agree all the same.
     fn fitted_params(model: &CompiledModel, result: &FitResult) -> ModelParameters {
-        let mut params = model.default_params.clone();
-        params.theta = result.theta.clone();
-        params.omega = OmegaMatrix::from_matrix(
-            result.omega.clone(),
-            params.omega.eta_names.clone(),
-            params.omega.diagonal,
-        );
-        params.sigma.values = result.sigma.clone();
-        params
+        fitted_params_from_result(result, model).expect("fitted parameters")
     }
 
     fn skipped(result: &FitResult) -> Vec<&String> {
@@ -365,27 +358,66 @@ mod npde_tte_fit {
         }
     }
 
-    /// The reference draws' own warnings reach the fit once, folded: a Gompertz hazard
-    /// with a cure fraction has replicates that never have an event.
+    /// A reference simulation the simulator refuses is the same single warning, quoting
+    /// the simulator's own message, with no claim that the model kind is unsupported
+    /// (review r1 #5). Every record here is at time 0, so the latest scored time, the
+    /// simulation horizon, is 0, which the simulator refuses.
     ///
-    /// Dies on: the simulator's warnings dropped at fit time; one string per replicate.
+    /// Dies on: a simulator `Err` propagated out of the fit; its message replaced by a
+    /// refusal's.
     #[test]
-    fn reference_draw_warnings_reach_the_fit_once() {
+    fn a_refused_reference_simulation_is_the_same_warning() {
+        let model = parse_model_string(EXP).expect("model parses");
+        let pop = common::tte_pop_from_pairs(&[(0.0, 0), (0.0, 0), (0.0, 0)]);
+        let result = fit(&model, &pop, &model.default_params, &options(200)).expect("fit");
+        assert!(tte_scores(&result).iter().flatten().all(|v| v.is_nan()));
+        let warnings = skipped(&result);
+        assert_eq!(warnings.len(), 1, "{:?}", result.warnings);
+        assert_eq!(
+            *warnings[0],
+            format!("{SKIPPED}SimulateOptions.horizon must be finite and > 0 (got 0)")
+        );
+        assert!(!warnings[0].contains("not supported"));
+    }
+
+    /// A correct fit of a cure-fraction model carries no hazard warning (review r1 #1).
+    /// A Gompertz hazard with `gamma < 0` has replicates that never have an event; the
+    /// simulator reports each as `W_TTE_DEGENERATE_HAZARD`, which `compute_tte_npde`
+    /// returns once with a count, and which the fit does not repeat as its own warning.
+    ///
+    /// Dies on: the degenerate-hazard warning forwarded to the fit; the fold dropped
+    /// from the direct call.
+    #[test]
+    fn a_cure_fraction_fit_is_not_warned_about_its_reference_draws() {
         let model = parse_model_string(GOMPERTZ_CURE).expect("model parses");
         let pop = common::tte_pop_from_pairs(&[(1.0, 1), (30.0, 0), (4.0, 1), (2.0, 1)]);
         let result = fit(&model, &pop, &model.default_params, &options(200)).expect("fit");
         assert!(skipped(&result).is_empty(), "{:?}", result.warnings);
         assert!(tte_scores(&result).iter().flatten().all(|v| v.is_finite()));
-        let degenerate: Vec<&String> = result
-            .warnings
-            .iter()
-            .filter(|w| w.starts_with("W_TTE_DEGENERATE_HAZARD"))
-            .collect();
-        assert_eq!(degenerate.len(), 1, "{:?}", result.warnings);
         assert!(
-            degenerate[0].contains("warnings were raised over the 200 npde reference replicates"),
+            !result.warnings.iter().any(|w| w.contains("W_TTE_")),
+            "{:?}",
+            result.warnings
+        );
+        let (_, direct) = compute_tte_npde(
+            &model,
+            &pop,
+            &fitted_params(&model, &result),
+            200,
+            result.npde_seed,
+            None,
+        )
+        .expect("post-fit scores");
+        assert_eq!(direct.len(), 1, "{direct:?}");
+        assert!(
+            direct[0].starts_with("W_TTE_DEGENERATE_HAZARD: "),
             "{}",
-            degenerate[0]
+            direct[0]
+        );
+        assert!(
+            direct[0].contains("warnings were raised over the 200 npde reference replicates"),
+            "{}",
+            direct[0]
         );
     }
 }

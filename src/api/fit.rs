@@ -2713,13 +2713,11 @@ fn fit_inner(
                         row.npde = score.npde;
                     }
                 }
-                // What happened to the reference draws themselves: a replicate with a
-                // degenerate hazard or a failed event-time solve counted as "no event".
-                result.warnings.extend(
-                    npde_warnings
-                        .into_iter()
-                        .filter(|w| w.starts_with("W_TTE_")),
-                );
+                // A failed event-time solve among the reference draws is worth a line;
+                // a replicate that simply never has an event is not.
+                result
+                    .warnings
+                    .extend(crate::stats::npde::fit_time_warnings(npde_warnings));
             }
             Err(why) => result.warnings.push(tte_npde_skipped_warning(&why)),
         }
