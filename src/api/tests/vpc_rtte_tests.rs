@@ -628,9 +628,9 @@ fn warns_when_subjects_end_on_an_event_record() {
 /// and every horizon, below all, half or none of its follow-up ends, it is silent.
 #[test]
 fn ends_on_event_counts_the_data_cut_at_the_horizon() {
-    let ends_on_event = |n: usize| {
+    let ends_on_event = |n: usize, total: usize| {
         format!(
-            "W_VPC_RTTE_ENDS_ON_EVENT: {n} of 28 subjects on cmt 2 have an event as their last \
+            "W_VPC_RTTE_ENDS_ON_EVENT: {n} of {total} subjects on cmt 2 have an event as their last \
              record, so their follow-up ends at that event. Such a subject has an event exactly \
              at its follow-up end, which a simulated subject almost never has. If follow-up \
              went on after the last event, add a censoring record at its end."
@@ -649,9 +649,25 @@ fn ends_on_event_counts_the_data_cut_at_the_horizon() {
     let f = pop(fixture_f());
     let mut o = opts(20);
     o.sim.horizon = Some(F_HORIZON);
-    assert_eq!(own(&o, &f), [ends_on_event(1)]);
+    assert_eq!(own(&o, &f), [ends_on_event(1, 28)]);
     o.sim.horizon = None;
-    assert_eq!(own(&o, &f), [ends_on_event(2)]);
+    assert_eq!(own(&o, &f), [ends_on_event(2, 28)]);
+
+    // An event exactly at `H` that is the subject's last record (`cᵢ = H`) still ends
+    // follow-up on an event, both with `H` set to it and with `H` unset, where `H` is the
+    // latest follow-up end and is that subject's (review r1 row 1).
+    let at_h = pop(vec![
+        stream("A", 10.0, &[3.0, 10.0]),
+        stream("B", 6.0, &[2.0]),
+    ]);
+    for horizon in [Some(10.0), None] {
+        o.sim.horizon = horizon;
+        assert_eq!(
+            own(&o, &at_h),
+            [ends_on_event(1, 2)],
+            "horizon {horizon:?}: A's last record is its event at H"
+        );
+    }
 
     let p = short_and_long();
     for max_order in [1, 2] {
@@ -661,7 +677,7 @@ fn ends_on_event_counts_the_data_cut_at_the_horizon() {
             o.sim.horizon = horizon;
             let w = own(&o, &p);
             assert!(
-                w.is_empty() && !w.iter().any(|w| w.contains("HORIZON_BELOW")),
+                w.is_empty(),
                 "max_order {max_order}, horizon {horizon:?}: {w:?}"
             );
         }
