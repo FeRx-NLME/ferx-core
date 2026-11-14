@@ -4421,6 +4421,9 @@ pub fn parse_full_model_with(
 ) -> Result<ParsedModel, String> {
     let level_bindings = &bindings.levels;
     let mut extracted = extract_blocks(content)?;
+    // A deprecated block (`[initial_values]`) is a warning, not an error (#2913):
+    // taken out here so it seeds `parse_warnings` when the model is built.
+    let deprecated_block_warnings = std::mem::take(&mut extracted.warnings);
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
     // uses `ode_template`, rewrite it (and the [odes]/[scaling] blocks) into the
     // hand-written `ode(...)` form *before* anything else looks at the blocks, so
@@ -6322,7 +6325,7 @@ pub fn parse_full_model_with(
         covariate_mu_refs,
         referenced_covariates,
         gradient_method: GradientMethod::default(),
-        parse_warnings: Vec::new(), // populated below
+        parse_warnings: deprecated_block_warnings, // more pushed below
         has_conditional_eta_params: false,
         eta_param_info,
         kappa_param_types,
@@ -6381,11 +6384,10 @@ pub fn parse_full_model_with(
     // value is resolved here; `parse_full_model_file` resolves it relative to
     // the model file's directory afterwards (this function only sees the
     // model's text, not its path on disk).
+    // `path` is optional (#2914): a block carrying only column maps leaves
+    // `data_path` `None`, and the caller has to supply the dataset.
     let (data_path, data_column_map) = match blocks.get("data") {
-        Some(lines) => {
-            let (p, m) = parse_data_block(lines)?;
-            (Some(p), m)
-        }
+        Some(lines) => parse_data_block(lines)?,
         None => (None, Vec::new()),
     };
 
@@ -7320,6 +7322,7 @@ pub fn parse_full_model_with(
             &ruv_theta_names,
             &ruv_eta_names,
             &covariate_decls,
+            &indiv_stmts,
         )?;
         model.ruv_magnitude = rm;
         // A covariate that appears *only* in a magnitude / `weight =` expression
@@ -7911,6 +7914,9 @@ pub(crate) const MAX_CMT_INDEX: usize = 255;
 const DERIVED_BUILTIN_NAMES: &[&str] = &[
     "ID", "TIME", "DV", "PRED", "IPRED", "CWRES", "IWRES", "NPDE", "NPD", "EPRED", "PWRES",
     "EWRES", "EBE_OFV", "N_OBS", "TAFD", "TAD", "CENS", "OCC", "CMT",
+    // The mixture sdtab columns (#2784): a `[derived] MIXNUM` beside `[output] MIXNUM`
+    // would write two `MIXNUM` headers, the derived values hidden behind the class.
+    "MIXNUM", "MIXEST",
 ];
 
 /// Split a token slice at top-level commas (depth 0 inside parentheses).
@@ -12130,6 +12136,10 @@ pub fn parse_method_token(token: &str) -> Result<EstimationMethod, String> {
     }
 }
 
+/// A parsed `[data]` block: the raw `path` (absent when the block only maps
+/// columns, #2914) and the `(target, actual)` column remappings.
+type DataBlock = (Option<String>, Vec<(String, String)>);
+
 /// Canonical column roles a `[data]` block may remap (#730, NONMEM
 /// `$INPUT TIME=TAFD` analogue). A target naming one of these is upper-cased to
 /// the standard header spelling; any other target is an arbitrary column rename
@@ -12143,6 +12153,12 @@ const DATA_BLOCK_ROLES: &[&str] = &[
 /// Parse a `[data]` block (#690, NONMEM `$DATA` analogue). Returns the raw
 /// `path` value as written (resolved relative to the model file's directory by
 /// `parse_full_model_file`) plus any `target = actual` column remappings.
+///
+/// `path` is optional (#2914): a block may carry only column maps, for a model
+/// whose dataset is always supplied by the caller (`ferx_simulate(data = ...)`,
+/// `--data`). The path is never resolved or opened here, so a model copied away
+/// from its dataset still parses; with no path on either side the file entry
+/// points refuse with `E_DATA_PATH_MISSING`.
 /// Each map entry is `(target_header, actual_header)`: the dataset's
 /// `actual_header` column is renamed to `target_header` when the CSV is read.
 ///
@@ -12164,7 +12180,7 @@ const DATA_BLOCK_ROLES: &[&str] = &[
 /// actually exists in the dataset — and whether a rename collides with a
 /// surviving column — can only be checked when the CSV is read, so that lives in
 /// the datareader.
-fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>), String> {
+fn parse_data_block(lines: &[String]) -> Result<DataBlock, String> {
     let mut path: Option<String> = None;
     let mut column_map: Vec<(String, String)> = Vec::new();
     for line in lines {
@@ -12214,7 +12230,6 @@ fn parse_data_block(lines: &[String]) -> Result<(String, Vec<(String, String)>),
             }
         }
     }
-    let path = path.ok_or_else(|| "[data]: missing required key `path`".to_string())?;
     Ok((path, column_map))
 }
 
@@ -18199,12 +18214,26 @@ const BLOCK_REGISTRY: &[(&str, BlockForm, Option<&str>)] = &[
 /// names were silently dropped — nothing ever said so. `ferx-r` still lists it
 /// in its section docs and three of its checked-in example models still carry
 /// one, so this fires for real files (#1040).
+///
+/// A deprecated block is a **warning** (`W_DEPRECATED_BLOCK`), not an error
+/// (#2913): it was already inert, so a stored model or archived run carrying one
+/// has been fitting correctly all along, and a version bump must not turn it
+/// unparseable. Every entry here must be one whose contents were *already
+/// ignored* — a block whose removal changes the fit belongs in the error path.
 const DEPRECATED_BLOCKS: &[(&str, &str)] = &[(
     "initial_values",
     "initial estimates are declared inline in `[parameters]` \
      (`theta NAME(init, lower, upper)`, `omega NAME ~ variance`); \
-     the block has not been read for several releases — delete it",
+     the block has not been read for several releases, so it never affected \
+     the fit and deleting it cannot change one — delete it",
 )];
+
+/// The code a deprecated-block warning ends with. `ferx check` keys
+/// `W_DEPRECATED_BLOCK` on it, and the message opens with
+/// [`DEPRECATED_BLOCK_PREFIX`] so the block and line can be read back out.
+pub(crate) const DEPRECATED_BLOCK_CODE: &str = "W_DEPRECATED_BLOCK";
+/// How every deprecated-block warning begins.
+pub(crate) const DEPRECATED_BLOCK_PREFIX: &str = "Deprecated block `[";
 
 /// The name of every `[block]` **this build** of the parser will accept, in the
 /// order they appear in the error message (alphabetical).
@@ -18286,7 +18315,7 @@ pub(crate) fn nearest_block_name(name: &str) -> Option<&'static str> {
 /// the order a user is most likely to hit them:
 ///
 /// 1. a block that was ferx syntax and is no longer read
-///    (`E_DEPRECATED_BLOCK`),
+///    (`W_DEPRECATED_BLOCK` — a warning, see below),
 /// 2. an unrecognised block name (`E_UNKNOWN_BLOCK`),
 /// 3. a known block written in the wrong header form — an instance name on a
 ///    block that takes none, or a missing one on `[covariate_nn NAME]`
@@ -18294,9 +18323,13 @@ pub(crate) fn nearest_block_name(name: &str) -> Option<&'static str> {
 /// 4. a known block whose cargo feature this binary was not built with
 ///    (`E_BLOCK_FEATURE_DISABLED`).
 ///
-/// All findings of the first non-empty class are reported together, so an
+/// All findings of the first non-empty error class are reported together, so an
 /// author fixing a batch of typos sees them in one pass.
-fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), String> {
+///
+/// Class 1 is not an error (#2913): the block was already inert, so it is
+/// returned as one warning per header for `parse_warnings`, and the caller drops
+/// its lines. The other three classes still fail the parse.
+fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<Vec<String>, String> {
     let mut deprecated: Vec<String> = Vec::new();
     let mut unknown: Vec<String> = Vec::new();
     let mut wrong_form: Vec<String> = Vec::new();
@@ -18320,7 +18353,8 @@ fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), 
         };
         if let Some((name, remedy)) = DEPRECATED_BLOCKS.iter().find(|(n, _)| *n == ty) {
             deprecated.push(format!(
-                "`[{name}]` (line {line}) is no longer read: {remedy}"
+                "{DEPRECATED_BLOCK_PREFIX}{name}]` (line {line}) is ignored: {remedy}. \
+                 ({DEPRECATED_BLOCK_CODE})"
             ));
             continue;
         }
@@ -18350,9 +18384,6 @@ fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), 
         }
     }
 
-    if !deprecated.is_empty() {
-        return Err(format!("Deprecated block {}.", deprecated.join("; ")));
-    }
     if !unknown.is_empty() {
         return Err(format!(
             "Unknown block {}. Valid blocks: {}.",
@@ -18366,7 +18397,7 @@ fn check_block_names(headers: &[(String, Option<String>, usize)]) -> Result<(), 
     if !disabled.is_empty() {
         return Err(format!("Block {}.", disabled.join("; ")));
     }
-    Ok(())
+    Ok(deprecated)
 }
 
 /// The name a model carries when its file declares none. `api::run::set_model_name`
@@ -18524,6 +18555,10 @@ struct ExtractedBlocks {
     /// type. First occurrence wins. Used to give `ferx check` diagnostics a
     /// block-level location.
     block_lines: HashMap<String, usize>,
+    /// One `parse_warnings` entry per deprecated block header (#2913). The block's
+    /// lines are dropped from `unnamed` / `block_lines`, so nothing downstream —
+    /// including the absorption twin, which re-emits `unnamed` — ever sees it.
+    warnings: Vec<String>,
 }
 
 /// A block header line, read the one way [`extract_blocks`] reads it: `(type
@@ -18624,7 +18659,12 @@ fn extract_blocks(content: &str) -> Result<ExtractedBlocks, String> {
         }
     }
 
-    check_block_names(&headers)?;
+    out.warnings = check_block_names(&headers)?;
+    for (name, _) in DEPRECATED_BLOCKS {
+        out.unnamed.remove(*name);
+        out.named.remove(*name);
+        out.block_lines.remove(*name);
+    }
 
     // Fold operator continuation lines into single logical lines before anyone
     // reads the block (#1030). Done here rather than in each block's parser so the
@@ -22935,6 +22975,281 @@ const RUV_FORBIDDEN_NAMES: &[&str] = &["IPRED", "PRED", "DV", "TAFD", "IRES", "I
 /// (`compile_ruv_mag_deriv_program`): sigma `0`, `MACHEPS` `1`, `TAD` `2`.
 const RUV_RESERVED_VARS: [&str; 4] = ["MACHEPS", "macheps", "TAD", "tad"];
 
+/// The most expression nodes a residual-magnitude expression may grow to once
+/// its `[individual_parameters]` names are substituted (#2915). Substitution
+/// copies a definition into every place it is read, so a diamond of
+/// intermediates (`B = X + 2`, `C = X + 3`, `X' = B + C`) doubles per level;
+/// the cap turns that into a refusal instead of an exponential parse. Real
+/// magnitudes are a few dozen nodes.
+const RUV_INDIV_MAX_NODES: usize = 10_000;
+
+/// How a residual-magnitude / exponent expression reads names assigned in
+/// `[individual_parameters]` (#2915).
+///
+/// Every other block reads such a name as the value it was assigned, so the
+/// error model does too — but the magnitude is evaluated per observation from
+/// θ, covariates, `TIME` and `TAD` alone (`RuvMagFn` has no η and no
+/// individual-parameter vector), so a name can only be honoured by
+/// substituting its definition. That is exact when the name is assigned once,
+/// at top level, from a right-hand side that reads only θ, covariates,
+/// built-ins and other names with the same property; for anything else the
+/// scope keeps the reason, so the error names it instead of calling the name
+/// an undeclared covariate.
+///
+/// Lazy and linear: building the scope only indexes the statements; a name is
+/// judged ([`Self::verdict`]) the first time a magnitude reads it, memoised
+/// with its substituted size, and only a name a magnitude actually reads is
+/// ever expanded — after the size is known to be under
+/// [`RUV_INDIV_MAX_NODES`].
+struct RuvIndivScope<'a> {
+    /// Every name the block assigns, with how many times (any depth).
+    counts: HashMap<&'a str, usize>,
+    /// Top-level right-hand side of each name assigned exactly once.
+    defs: HashMap<&'a str, &'a Expression>,
+    /// Name → substituted node count, or why it cannot be substituted.
+    verdicts: std::cell::RefCell<HashMap<&'a str, Result<usize, String>>>,
+}
+
+impl<'a> RuvIndivScope<'a> {
+    fn new(stmts: &'a [Statement]) -> Self {
+        let mut counts = HashMap::new();
+        count_all_assignments(stmts, &mut counts);
+        let defs = stmts
+            .iter()
+            .filter_map(|s| match s {
+                Statement::Assign(name, rhs) if counts.get(name.as_str()) == Some(&1) => {
+                    Some((name.as_str(), rhs))
+                }
+                _ => None,
+            })
+            .collect();
+        Self {
+            counts,
+            defs,
+            verdicts: Default::default(),
+        }
+    }
+
+    fn assigns(&self, name: &str) -> bool {
+        self.counts.contains_key(name)
+    }
+
+    /// Whether `name` can be substituted, and its size once it is: `Ok(nodes)`
+    /// or `Err(reason)`, the reason phrased to follow "which".
+    fn verdict(&self, name: &str) -> Result<usize, String> {
+        if let Some(v) = self.verdicts.borrow().get(name) {
+            return v.clone();
+        }
+        // Callers ask only about names `assigns` admitted.
+        let (&key, _) = self
+            .counts
+            .get_key_value(name)
+            .expect("a name the block assigns");
+        let result = match self.defs.get(key) {
+            None => Err(
+                "is assigned more than once or inside an `if/else` branch, so it has no \
+                         single definition to substitute"
+                    .to_string(),
+            ),
+            Some(body) => {
+                // Guard against a definition reaching itself: the block's
+                // forward-reference check refuses one before this runs, but a
+                // recursion here must not depend on that.
+                self.verdicts
+                    .borrow_mut()
+                    .insert(key, Err("is defined in terms of itself".to_string()));
+                self.body_size(body).and_then(|n| {
+                    if n > RUV_INDIV_MAX_NODES {
+                        Err(format!(
+                            "expands to more than {RUV_INDIV_MAX_NODES} expression nodes when \
+                             its definitions are substituted"
+                        ))
+                    } else {
+                        Ok(n)
+                    }
+                })
+            }
+        };
+        self.verdicts.borrow_mut().insert(key, result.clone());
+        result
+    }
+
+    /// Node count of a definition's right-hand side with every block name it
+    /// reads substituted, or the first reason one cannot be.
+    ///
+    /// Inside the block an earlier-assigned name parses as `Variable`, so a
+    /// `Variable` the block does not assign is something this scope cannot
+    /// see through (an engine built-in); it is refused rather than left as a
+    /// leaf the RUV scope would resolve to its *own* meaning of that name.
+    fn body_size(&self, body: &Expression) -> Result<usize, String> {
+        let mut size = 0_usize;
+        let mut err: Option<String> = None;
+        visit_expr_nodes(body, &mut |e: &Expression| {
+            if err.is_some() {
+                return;
+            }
+            size = size.saturating_add(1);
+            let r = match e {
+                Expression::Eta(_) => Err("depends on a random effect (eta)".to_string()),
+                Expression::MixNum => Err("depends on the mixture class (MIXNUM)".to_string()),
+                Expression::NnOutput { .. } => {
+                    Err("depends on a neural-network output".to_string())
+                }
+                Expression::Variable(m) | Expression::Covariate(m) if self.assigns(m) => self
+                    .verdict(m)
+                    .map(|n| n - 1)
+                    .map_err(|why| format!("reads `{m}`, which {why}")),
+                Expression::Variable(m) => Err(format!(
+                    "reads `{m}`, which is not a theta, a covariate or a name assigned in \
+                     [individual_parameters]"
+                )),
+                _ => Ok(0),
+            };
+            match r {
+                Ok(extra) => size = size.saturating_add(extra),
+                Err(why) => err = Some(why),
+            }
+        });
+        match err {
+            Some(why) => Err(why),
+            None => Ok(size),
+        }
+    }
+
+    /// `expr` with every block name substituted. `variables` is whether a
+    /// `Variable` leaf is a block name (true inside a definition) or the RUV
+    /// scope's own sigma / built-in (false at the magnitude's top level).
+    /// Callers have checked [`Self::verdict`] for every name reached, so the
+    /// result is bounded by [`RUV_INDIV_MAX_NODES`].
+    fn expand(&self, expr: &Expression, variables: bool) -> Expression {
+        let sub = |e: &Expression| self.expand(e, variables);
+        let cond = |c: &Condition| self.expand_cond(c, variables);
+        match expr {
+            Expression::Covariate(n) | Expression::Variable(n)
+                if self.assigns(n) && (variables || matches!(expr, Expression::Covariate(_))) =>
+            {
+                let body = self.defs.get(n.as_str()).expect("verdict checked");
+                self.expand(body, true)
+            }
+            Expression::BinOp(l, op, r) => {
+                Expression::BinOp(Box::new(sub(l)), *op, Box::new(sub(r)))
+            }
+            Expression::UnaryFn(f, a) => Expression::UnaryFn(f.clone(), Box::new(sub(a))),
+            Expression::Power(b, x) => Expression::Power(Box::new(sub(b)), Box::new(sub(x))),
+            Expression::Conditional(c, t, e) => {
+                Expression::Conditional(Box::new(cond(c)), Box::new(sub(t)), Box::new(sub(e)))
+            }
+            Expression::ThetaGather { spec, idx } => Expression::ThetaGather {
+                spec: spec.clone(),
+                idx: Box::new(sub(idx)),
+            },
+            other => other.clone(),
+        }
+    }
+
+    fn expand_cond(&self, c: &Condition, variables: bool) -> Condition {
+        match c {
+            Condition::Compare(l, op, r) => {
+                Condition::Compare(self.expand(l, variables), *op, self.expand(r, variables))
+            }
+            Condition::And(l, r) => Condition::And(
+                Box::new(self.expand_cond(l, variables)),
+                Box::new(self.expand_cond(r, variables)),
+            ),
+            Condition::Or(l, r) => Condition::Or(
+                Box::new(self.expand_cond(l, variables)),
+                Box::new(self.expand_cond(r, variables)),
+            ),
+            Condition::Not(x) => Condition::Not(Box::new(self.expand_cond(x, variables))),
+            Condition::Present(e) => Condition::Present(self.expand(e, variables)),
+        }
+    }
+}
+
+/// Resolve the `[individual_parameters]` names a parsed residual-magnitude /
+/// exponent expression reads (#2915): substitute each one that can be, refuse
+/// one that cannot by name. In the RUV scope an unknown identifier parses as
+/// `Covariate`, so those are the candidates; a `Variable` there is the scaled
+/// sigma or a reserved built-in (`TAD`, `MACHEPS`), and if the block also
+/// assigns that name the error model would read a different value than every
+/// other block, so it is refused. Returns the names substituted, so a later
+/// validation error can say the offending reference came in through one.
+///
+/// A name that is both a θ and assigned in the block (`theta CL` with
+/// `CL = CL * exp(ETA_CL)`, the usual typical-value spelling) parses here as
+/// `Theta`, because θ names resolve first; every other block reads it as the
+/// assigned value, so it is turned back into a block name and judged like one
+/// (review 4) — substituted, or refused for the reason it cannot be. Only the
+/// magnitude's own leaves are rewritten: inside a definition a `Theta` is the
+/// θ the right-hand side read before the name was assigned.
+fn resolve_ruv_indiv_names(
+    expr: &mut Expression,
+    scope: &RuvIndivScope<'_>,
+    theta_names: &[String],
+    what: &str,
+) -> Result<Vec<String>, String> {
+    visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
+        if let Expression::Theta(i) = e {
+            if let Some(name) = theta_names.get(*i).filter(|n| scope.assigns(n)) {
+                *e = Expression::Covariate(name.clone());
+            }
+        }
+    });
+    let mut err: Option<String> = None;
+    let mut hit: Vec<String> = Vec::new();
+    let mut total = 0_usize;
+    visit_expr_nodes(expr, &mut |e: &Expression| {
+        if err.is_some() {
+            return;
+        }
+        total = total.saturating_add(1);
+        match e {
+            Expression::Variable(n) if scope.assigns(n) => {
+                err = Some(format!(
+                    "[error_model] {what} references `{n}`, which [individual_parameters] \
+                     assigns, but which in [error_model] names the scaled sigma or the \
+                     engine built-in of that name — so the error model would read a different \
+                     value than every other block. Rename the [individual_parameters] variable"
+                ));
+            }
+            Expression::Covariate(n) if scope.assigns(n) => match scope.verdict(n) {
+                Ok(size) => {
+                    total = total.saturating_add(size - 1);
+                    if !hit.contains(n) {
+                        hit.push(n.clone());
+                    }
+                }
+                Err(why) => {
+                    err = Some(format!(
+                        "[error_model] {what} references `{n}`, which [individual_parameters] \
+                         assigns but which {why}. A residual magnitude is evaluated per \
+                         observation from thetas, covariates, TIME and TAD only, so it can read \
+                         a value computed in [individual_parameters] only when that value is \
+                         assigned once, at top level, without a random effect — write the \
+                         expression here instead"
+                    ));
+                }
+            },
+            _ => {}
+        }
+    });
+    if let Some(e) = err {
+        return Err(e);
+    }
+    if hit.is_empty() {
+        return Ok(hit);
+    }
+    if total > RUV_INDIV_MAX_NODES {
+        return Err(format!(
+            "[error_model] {what} expands to more than {RUV_INDIV_MAX_NODES} expression nodes \
+             once its [individual_parameters] names are substituted — write it in terms of \
+             thetas and covariates directly"
+        ));
+    }
+    *expr = scope.expand(expr, false);
+    Ok(hit)
+}
+
 /// Validate a parsed residual-magnitude expression (#484). The magnitude may
 /// depend only on θ, the scaled sigma itself, `TIME`, `TAD`, and declared
 /// covariates — never on η/EBE or the prediction. Unlike the rest of the
@@ -23046,8 +23361,9 @@ fn validate_ruv_expr(
                     if !declared {
                         err = Some(format!(
                             "{what} references undeclared covariate `{}` (declare it in \
-                             [covariates]; an undeclared name silently evaluates to 0 and would \
-                             make the magnitude a constant)",
+                             [covariates], or assign it in [individual_parameters]; an \
+                             undeclared name silently evaluates to 0 and would make the \
+                             magnitude a constant)",
                             name
                         ));
                     }
@@ -23182,6 +23498,7 @@ fn build_ruv_magnitude(
     theta_names: &[String],
     eta_names: &[String],
     covariate_decls: &Option<Vec<CovariateDecl>>,
+    indiv_stmts: &[Statement],
 ) -> Result<
     (
         Option<RuvMagnitude>,
@@ -23206,6 +23523,8 @@ fn build_ruv_magnitude(
     // Parse one magnitude / exponent expression against the RUV scope: θ, the
     // scaled sigma (magnitude only), declared covariates, `TIME`, `TAD`,
     // `MACHEPS`. Returns the AST, its `Dual1` θ-program and the runtime closure.
+    // Indexes the block only; a name is judged and expanded when a magnitude reads it.
+    let indiv_scope = RuvIndivScope::new(indiv_stmts);
     let mut compile = |src: &str,
                        sigma_name: Option<&str>,
                        what: &str|
@@ -23232,9 +23551,36 @@ fn build_ruv_magnitude(
             // A residual magnitude reads θ by name (#484), so it reads a block too.
             level_blocks: LevelBlockScope::Readable,
         };
-        let expr = parse_scalar_expression(src, ctx)
+        let gather_mark = gather_uses_len();
+        let mut expr = parse_scalar_expression(src, ctx)
             .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
-        validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref())?;
+        // A name assigned in [individual_parameters] reads its value, as in every
+        // other block (#2915). Substituted before validation, so the definition
+        // is held to the same θ / covariate / TIME / TAD rule as inline text.
+        let what_long = if sigma_name.is_some() {
+            "residual-magnitude expression"
+        } else {
+            "power exponent"
+        };
+        let inlined = resolve_ruv_indiv_names(&mut expr, &indiv_scope, theta_names, what_long)?;
+        if !inlined.is_empty() {
+            // The parse recorded gather sites against the names as written; the
+            // substituted tree may read other columns, or a literal (review 2).
+            truncate_gather_uses(gather_mark);
+            renormalize_rewritten_gathers(&mut expr)
+                .map_err(|e| format!("[error_model] {what} `{}`: {}", src, e))?;
+        }
+        validate_ruv_expr(&expr, sigma_name, allowed_covs.as_deref()).map_err(|e| {
+            if inlined.is_empty() {
+                e
+            } else {
+                let names: Vec<String> = inlined.iter().map(|n| format!("`{n}`")).collect();
+                format!(
+                    "{e} (after substituting the [individual_parameters] definition of {})",
+                    names.join(", ")
+                )
+            }
+        })?;
         // `note_theta_eta` counts a gather as every θ of its block (#1638): a
         // magnitude reading `ERRSCALE[STUDY]` is θ-dependent, so GN must take its
         // magnitude-aware fallback, and the levels are not "unreferenced". η is
@@ -24547,6 +24893,63 @@ fn record_gather_use(block: &str, index_covariate: &str, n_levels: usize) {
             v.push(use_);
         }
     });
+}
+
+/// How many gather sites the active parse has recorded — a mark for
+/// [`truncate_gather_uses`].
+fn gather_uses_len() -> usize {
+    GATHER_USES.with(|c| c.borrow().len())
+}
+
+/// Forget the gather sites recorded after `mark`. Only sites that one parse
+/// *added* are dropped: a site it re-recorded was deduplicated against an
+/// earlier reader and stays.
+fn truncate_gather_uses(mark: usize) {
+    GATHER_USES.with(|c| c.borrow_mut().truncate(mark));
+}
+
+/// Re-derive what the parser derives from a counted block's index, on a tree
+/// that was rewritten after parsing (#2915 review 2): substituting an
+/// `[individual_parameters]` name into an index changes which column it reads,
+/// or makes it a literal. A column index is recorded for the pre-fit level
+/// check ([`record_gather_use`]); a literal one is range-checked and, on a
+/// free level, folded to the plain θ read — both exactly as written text
+/// would be. A data-driven block's bare read carries its index column
+/// implicitly and is never recorded, so it is left alone here too.
+fn renormalize_rewritten_gathers(expr: &mut Expression) -> Result<(), String> {
+    let mut err: Option<String> = None;
+    visit_expr_nodes_mut(expr, &mut |e: &mut Expression| {
+        if err.is_some() {
+            return;
+        }
+        let Expression::ThetaGather { spec, idx } = e else {
+            return;
+        };
+        let counted = lookup_vector_theta(&spec.name).is_some_and(|d| d.index_covariate.is_none());
+        if !counted {
+            return;
+        }
+        let n_levels = spec.levels.len();
+        match idx.as_ref() {
+            Expression::Covariate(col) => record_gather_use(&spec.name, col, n_levels),
+            Expression::Literal(v) => {
+                let v = *v;
+                if v.fract() != 0.0 || v < 1.0 || v as usize > n_levels {
+                    err = Some(format!(
+                        "`{}[{v}]`: level index must be an integer in 1..={n_levels}",
+                        spec.name
+                    ));
+                } else if let LevelRule::Free(t) = spec.levels[v as usize - 1] {
+                    *e = Expression::Theta(t as usize);
+                }
+            }
+            _ => {}
+        }
+    });
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Identifiability convention applied to a a level block θ block (#1064).
@@ -30331,6 +30734,20 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
     match op {
         Op::Exp => v.exp(),
         Op::Ln => v.guard_floor(1e-30).ln(),
+        // A positive argument is the type's own `sqrt`. Anything else is a constant, so the
+        // derivative there is zero (`Dual1::sqrt`'s convention): `inf · 0` would otherwise put
+        // a `NaN` in the jets, whose bits optimised code does not reproduce from one route to
+        // the next (#2844). The value is the `f64` lane VM's (`eval_bytecode`): `±0` passes
+        // through as `sqrt(±0) = ±0`, and a negative or `NaN` argument floors to `+0`. The
+        // `v >= 0` test, not `f64::max`, whose signed-zero result is not specified.
+        Op::Sqrt => {
+            let x = v.val();
+            if x > 0.0 {
+                v.sqrt()
+            } else {
+                T::from_f64(if x >= 0.0 { x } else { 0.0 })
+            }
+        }
         Op::Abs => v.abs(),
         Op::Floor => T::from_f64(v.val().floor()),
         Op::Ceil => T::from_f64(v.val().ceil()),
@@ -30547,13 +30964,9 @@ fn eval_bytecode_g<T: crate::sens::num::vm::VmNum>(
                     }
                 });
             }
-            op @ (Op::Exp | Op::Ln | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
+            op @ (Op::Exp | Op::Ln | Op::Sqrt | Op::Abs | Op::Floor | Op::Ceil | Op::Round) => {
                 let v = pop!();
                 push!(apply_unary(op, v));
-            }
-            Op::Sqrt => {
-                let v = pop!();
-                push!(v.guard_floor(0.0).sqrt());
             }
             Op::InvLogit => {
                 let v = pop!();

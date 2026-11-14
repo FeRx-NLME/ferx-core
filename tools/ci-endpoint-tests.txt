@@ -45,6 +45,7 @@ predict_survival_at_etas
 profiled_levels_correlation_fits
 profiled_levels_fits
 reset_clock_nonmem_anchor
+rtte_survfit_reference
 sampler_covariance_non_gaussian
 ss_chz_nonmem_anchor
 survival_time_dependent_pk
@@ -55,5 +56,6 @@ tte_ode_solve_failed
 tte_residuals_nonmem_anchor
 tte_smoke
 vi_dcm_omega_recovery
+vpc_rtte_self_consistency
 vpc_tte_self_consistency
 zero_omega_fit

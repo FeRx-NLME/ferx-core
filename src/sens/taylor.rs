@@ -333,6 +333,11 @@ impl<const P: usize, const ORD: usize, const L: usize> PkNum for Taylor<P, ORD, 
     fn sqrt(self) -> Self {
         // `d_k = (1/2)(1/2 − 1)…(1/2 − k + 1) x^{1/2 − k}`.
         let x = self.c[0];
+        // Flat at a non-positive argument, as on every `PkNum` type: `x^{1/2 − k}` is
+        // `inf` at `x = 0`, and `compose` would turn `inf·0` into `NaN` (#2892).
+        if !(x > 0.0) {
+            return Self::constant(x.sqrt());
+        }
         let mut d = [0.0; MAX_ORD + 1];
         let mut a = 1.0;
         for k in 0..=ORD {

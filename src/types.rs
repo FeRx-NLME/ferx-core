@@ -7784,7 +7784,7 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
     #[allow(clippy::if_same_then_else)]
     let (severity, category) = if lower.starts_with("multi-start:") {
         // #2799: the multi-start notes `fit()` appends to the returned run — "k of n starts
-        // failed: <errors>" and "best result from start k/n". A prefix-token arm ahead of
+        // failed: <errors>" and the #2867 summary of the starts. A prefix-token arm ahead of
         // *every* other arm, because the failure note interpolates the sibling starts' own
         // error text: a "did not converge" or covariance-failure phrase in it would land on a
         // Critical arm and mark a healthy returned fit as failing. The note is about runs that
@@ -7878,6 +7878,15 @@ pub fn classify_warning(raw: &str) -> WarningEntry {
         // estimate whose category drives `skip_estimate_near_boundary` and
         // `reject_on_boundary`. A near-miss phrasing there would silently drop
         // bootstrap replicates.
+        (WarningSeverity::Warning, WarningCode::InitOutsideBounds)
+    } else if lower.contains("w_theta_init_outside_bounds") {
+        // #2865: the evaluation-only half of `E_THETA_INIT_OUTSIDE_BOUNDS` — a
+        // `theta` start outside its own declared range at `maxiter = 0`, clamped
+        // and scored at the bound. The same category as the arm above (a start
+        // the box moved), through its own arm because neither token contains the
+        // other. A token arm for the same reason too: the message quotes a
+        // "bound", and the "optimizer bound" prose arm is `BoundaryEstimate`,
+        // which would drop bootstrap replicates.
         (WarningSeverity::Warning, WarningCode::InitOutsideBounds)
     } else if lower.contains("w_stalled_at_init") {
         // #997 §2: the fit never left its initial estimates. Matched on its `W_`
@@ -9033,6 +9042,11 @@ pub struct FitResult {
     /// `n_starts == 1` (no perturbation applied) or when no seed was set and
     /// the run used a random seed derived from the system clock.
     pub multi_start_seed: Option<u64>,
+    /// What each start of a multi-start fit did (#2867): one [`StartRecord`] per start, in
+    /// start order, exactly one of them `selected`. Empty when `n_starts == 1`. The other
+    /// starts' full results are not kept; these rows are what remains of them.
+    #[serde(default)]
+    pub starts: Vec<StartRecord>,
     /// Seed used for the SAEM MCMC E-step.  `None` for non-SAEM methods or
     /// when no explicit seed was set in `[fit_options]`.
     pub saem_seed: Option<u64>,
@@ -9346,6 +9360,14 @@ impl FitResult {
             map.insert(
                 "status".to_string(),
                 serde_json::to_value(self.status()).expect("FitStatus is serializable"),
+            );
+            // #2911: the parameter estimates keyed by name, in the fit YAML's own layout —
+            // `estimates.theta.CL.estimate` is the YAML's `theta.CL.estimate` — so a reader
+            // of final estimates does not branch on which file it was handed. Derived, like
+            // `status`: `from_json_str` ignores it and reads the vectors above.
+            map.insert(
+                "estimates".to_string(),
+                crate::io::output::estimates_json(self),
             );
         }
         v
@@ -11309,6 +11331,29 @@ pub enum HessianAnchor {
 }
 
 impl EstimationMethod {
+    /// Whether this estimator reads `outer_maxiter = 0` as NONMEM `MAXEVAL=0`: one
+    /// objective evaluation at the initial estimates and no search.
+    ///
+    /// Those are the stages `fit()` routes through `optimize_population` (FOCE, FOCEI,
+    /// Laplace, which short-circuits to `evaluate_at_initial_params`) and pure
+    /// Gauss–Newton, whose loop runs `1..=maxiter`. Not SAEM, IMP, IMPMAP, Bayes or VI,
+    /// which carry their own iteration counts, nor the Gauss–Newton hybrid, whose FOCEI
+    /// polish runs a fixed budget whatever `maxiter` says.
+    ///
+    /// The one membership list behind [`FitOptions::evaluation_only_run`] and the
+    /// start-side checks' "does a search run" gate (`api::validation::outer_search_runs`).
+    /// They were two lists, and the second one missed VI and the hybrid (#2865 review).
+    /// An allow-list, so a new estimator counts as searching until it is added here.
+    pub(crate) fn evaluates_at_maxiter_zero(self) -> bool {
+        matches!(
+            self,
+            EstimationMethod::Foce
+                | EstimationMethod::FoceI
+                | EstimationMethod::FoceGn
+                | EstimationMethod::Laplace
+        )
+    }
+
     /// Whether this method's objective is an integral over the random effects, so
     /// `n_eta = 0` leaves it nothing to integrate (#1050). The single membership
     /// rule for the "requires at least one random effect" family:
@@ -11621,15 +11666,7 @@ impl FitOptions {
     pub(crate) fn evaluation_only_run(&self) -> bool {
         let eval_only = self.eval_only_methods();
         self.method_chain().iter().all(|m| {
-            eval_only.contains(m)
-                || (self.outer_maxiter == 0
-                    && matches!(
-                        m,
-                        EstimationMethod::Foce
-                            | EstimationMethod::FoceI
-                            | EstimationMethod::FoceGn
-                            | EstimationMethod::Laplace
-                    ))
+            eval_only.contains(m) || (self.outer_maxiter == 0 && m.evaluates_at_maxiter_zero())
         })
     }
 
@@ -12392,6 +12429,12 @@ pub struct ParsedModel {
 #[path = "types_fit_status.rs"]
 mod fit_status;
 pub use fit_status::{FitStatus, StatusReason};
+
+// #2867: what each start of a multi-start fit did, and the summary of their spread.
+#[path = "types_multi_start.rs"]
+mod multi_start;
+pub use multi_start::StartRecord;
+pub(crate) use multi_start::{StartSpread, START_AGREE_OFV};
 
 /// Factories that build minimal `CompiledModel` instances for unit tests.
 /// Exposed `pub(crate)` (gated on `#[cfg(test)]`) so other modules' tests

@@ -7122,6 +7122,7 @@ pub fn run_saem(
                 pmix: meval.pmix.clone(),
                 mixest: meval.mixest.clone(),
                 n_fd_h_redone: meval.n_fd_h_redone,
+                class_nll: meval.class_nll.clone(),
             };
             (
                 meval.mixest_etas,
