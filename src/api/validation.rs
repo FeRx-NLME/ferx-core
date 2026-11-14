@@ -10475,6 +10475,20 @@ pub(crate) fn check_nn_input_scale(
 /// carries verbatim (the `W_…` token, or a pinned phrase), so a reworded warning
 /// falls through to the generic `W_PARSE` rather than silently mislabelling —
 /// which is why the codes are asserted at both ends.
+/// One parse warning as a check-report [`Diagnostic`]. A deprecated block
+/// (#2913) carries its block and line, read back out of the message the way
+/// [`parse_error_to_diagnostic`] reads the block-header errors; every other
+/// warning keeps its full text under the code [`parse_warning_to_code`] picks.
+fn parse_warning_to_diagnostic(w: &str) -> Diagnostic {
+    let code = parse_warning_to_code(w);
+    match w.strip_prefix(crate::parser::model_parser::DEPRECATED_BLOCK_PREFIX) {
+        Some(rest) if code == crate::parser::model_parser::DEPRECATED_BLOCK_CODE => {
+            locate(Diagnostic::warning(code, String::new()), w, rest)
+        }
+        _ => Diagnostic::warning(code, w.to_string()),
+    }
+}
+
 fn parse_warning_to_code(w: &str) -> &'static str {
     if w.contains("declared in [parameters] but not referenced") {
         "W_UNUSED_PARAM"
@@ -10484,6 +10498,8 @@ fn parse_warning_to_code(w: &str) -> &'static str {
         "W_DERIVED_STEP_IGNORED"
     } else if w.contains("W_ABSORPTION_TWIN_DECLINED") {
         "W_ABSORPTION_TWIN_DECLINED"
+    } else if w.contains(crate::parser::model_parser::DEPRECATED_BLOCK_CODE) {
+        crate::parser::model_parser::DEPRECATED_BLOCK_CODE
     } else {
         "W_PARSE"
     }
@@ -10495,7 +10511,7 @@ fn parse_warning_to_code(w: &str) -> &'static str {
 /// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993), the
 /// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001), the
 /// scale tag on a `block_*` declaration (→ `E_BLOCK_VARIANCE_ONLY`, #1377), and
-/// the block-header shapes (→ `E_UNKNOWN_BLOCK` / `E_DEPRECATED_BLOCK` /
+/// the block-header shapes (→ `E_UNKNOWN_BLOCK` /
 /// `E_BLOCK_INSTANCE_NAME` / `E_BLOCK_FEATURE_DISABLED`, #1040); everything else is
 /// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
 /// pinned to by a test, so a reworded message cannot silently fall through to the
@@ -10629,13 +10645,6 @@ pub(crate) fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
             d = d.with_suggestion(format!("did you mean `[{near}]`?"));
         }
         return locate(d, err, rest);
-    }
-    if let Some(rest) = err.strip_prefix("Deprecated block `[") {
-        return locate(
-            Diagnostic::error("E_DEPRECATED_BLOCK", String::new()),
-            err,
-            rest,
-        );
     }
     if let Some(rest) = err.strip_prefix("Block `[") {
         // Match each shape on its own sentinel rather than letting one be the
@@ -10829,7 +10838,7 @@ pub fn validate_model_file_with(
     //     context in the message text; we use W_PARSE as the generic code here
     //     rather than a narrower code that would mislabel unrelated warnings.
     for w in &parsed.model.parse_warnings {
-        diags.push(Diagnostic::warning(parse_warning_to_code(w), w.clone()));
+        diags.push(parse_warning_to_diagnostic(w));
     }
 
     // 2b. Model / estimation-option compatibility (data-independent): catches

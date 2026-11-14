@@ -5,6 +5,7 @@
 //! refactor kept `fit()`'s error string byte-identical to the diagnostic.
 //! All return immediately (no fit convergence), so they belong in Tier 2.
 
+use ferx_core::diagnostics::Severity;
 use ferx_core::{fit, parse_full_model_file, read_nonmem_csv, validate_model_file, FitOptions};
 use std::path::Path;
 
@@ -112,19 +113,29 @@ fn unknown_block_is_reported_as_e_unknown_block() {
 /// unknown names were dropped in silence — never said so. It gets its own code
 /// and a remediation rather than a bare "unknown block", since no valid name is
 /// close enough for a did-you-mean.
+///
+/// A warning, not an error (#2913): the block was already inert, so an archived
+/// model carrying one has been fitting correctly all along and must still parse.
 #[test]
-fn deprecated_block_is_reported_as_e_deprecated_block() {
+fn deprecated_block_is_reported_as_w_deprecated_block() {
     let model = temp_model(
         "deprecated_block",
         &format!("{COV_MODEL}\n[initial_values]\n  theta = [0.2, 10.0]\n"),
     );
     let report = validate_model_file(model.to_str().unwrap(), None);
     assert!(
-        !report.valid,
-        "a deprecated block must invalidate the report"
+        report.diagnostics.iter().all(|d| d.code != "E_PARSE"),
+        "a deprecated block must not fail the parse: {:?}",
+        report.diagnostics
     );
-    let d = &report.diagnostics[0];
-    assert_eq!(d.code, "E_DEPRECATED_BLOCK");
+    let found: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "W_DEPRECATED_BLOCK")
+        .collect();
+    assert_eq!(found.len(), 1, "{:?}", report.diagnostics);
+    let d = found[0];
+    assert_eq!(d.severity, Severity::Warning);
     assert_eq!(d.block.as_deref(), Some("initial_values"));
     assert_eq!(d.line, Some(17));
     assert!(
@@ -132,11 +143,49 @@ fn deprecated_block_is_reported_as_e_deprecated_block() {
         "message must name the replacement: {}",
         d.message
     );
-    assert!(d.suggestion.is_none());
+    assert!(
+        d.message.contains("never affected the fit"),
+        "message must say deleting it is safe: {}",
+        d.message
+    );
+    // The located line is lifted into `line`, not left in the prose twice.
+    assert!(!d.message.contains("(line 17)"), "{}", d.message);
     let _ = std::fs::remove_file(&model);
 }
 
-/// The same rejection reaches `fit()` through `first_error`, byte-identical —
+/// The deprecated block is dropped, not read: a model with one fits exactly as
+/// the same model without it (#2913). Parsed through the file path `fit()` uses,
+/// the two compile to the same initial estimates and the only difference is the
+/// warning — whose contents (here deliberately different inits) were ignored.
+#[test]
+fn deprecated_block_parses_identically_to_its_absence() {
+    let with = temp_model(
+        "deprecated_block_with",
+        &format!("{COV_MODEL}\n[initial_values]\n  theta = [5.0, 99.0]\n"),
+    );
+    let without = temp_model("deprecated_block_without", COV_MODEL);
+    let a = parse_full_model_file(Path::new(with.to_str().unwrap()))
+        .expect("a deprecated block must not fail the parse");
+    let b = parse_full_model_file(Path::new(without.to_str().unwrap())).unwrap();
+    assert_eq!(a.model.default_params.theta, b.model.default_params.theta);
+    let extra: Vec<_> = a
+        .model
+        .parse_warnings
+        .iter()
+        .filter(|w| !b.model.parse_warnings.contains(w))
+        .collect();
+    assert_eq!(extra.len(), 1, "{extra:?}");
+    assert!(
+        extra[0].starts_with("Deprecated block `[initial_values]` (line 17) is ignored:")
+            && extra[0].ends_with("(W_DEPRECATED_BLOCK)"),
+        "{}",
+        extra[0]
+    );
+    let _ = std::fs::remove_file(&with);
+    let _ = std::fs::remove_file(&without);
+}
+
+/// An unknown-block rejection reaches `fit()` through `first_error`, byte-identical —
 /// there is no separate path for the batch and the fail-fast callers.
 #[test]
 fn unknown_block_also_fails_the_parser_directly() {
