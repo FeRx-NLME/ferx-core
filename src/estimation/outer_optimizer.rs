@@ -1,6 +1,6 @@
 use crate::estimation::inner_optimizer::{
     find_ebe_for_stage, run_inner_loop_warm_map, run_inner_loop_warm_seeded, stencil_inner_tol,
-    GuardStop, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
+    GuardStop, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy, PrevEtas,
 };
 use crate::estimation::parameterization::{compute_mu_k, *};
 use crate::stats::likelihood::{
@@ -38,6 +38,8 @@ pub struct MixturePosteriors {
     /// [`MixtureEval::n_fd_h_redone`](crate::estimation::mixture::MixtureEval) of the
     /// evaluation that scored the reported objective.
     pub(crate) n_fd_h_redone: usize,
+    /// `MixtureEval::class_nll` of that evaluation, `[subject][class]`, for the merged-class check (#2907).
+    pub(crate) class_nll: Vec<Vec<f64>>,
 }
 
 pub struct OuterResult {
@@ -307,7 +309,14 @@ pub fn optimize_population(
     // there would make those fits warn about — and give advice for — a gradient their
     // optimizer never used (#1529 review). A gradient-driven optimizer re-evaluates the
     // same start point on its first iteration, so nothing it would report is lost.
-    let declines = OuterFdDeclineLog::new(population.subjects.len());
+    // A mixture salvages every declined (subject × class) term by reconverged FD
+    // (`mixture::mixture_gradient_salvaged`, #2906), never the held-EBE gradient, so its
+    // log is a reconverging one and the warning cannot give it the held-EBE remedy.
+    let declines = if init_params.mixture.is_some() {
+        OuterFdDeclineLog::reconverging(population.subjects.len())
+    } else {
+        OuterFdDeclineLog::new(population.subjects.len())
+    };
     let preflight_declines = OuterFdDeclineLog::new(population.subjects.len());
 
     // Pre-flight flat-theta guard (#826): a non-fixed theta whose outer gradient is
@@ -580,6 +589,7 @@ fn freeze_flat_thetas(
             options.inner_restarts,
             InnerHessianSeed::for_options(options),
             options,
+            PrevEtas::Placeholder,
         );
         (
             2.0 * pop_nll_opts(model, population, &p, &e, &h, &k, options),
@@ -1162,6 +1172,7 @@ fn evaluate_at_initial_params(
             pmix: m.pmix,
             mixest: m.mixest,
             n_fd_h_redone: m.n_fd_h_redone,
+            class_nll: m.class_nll,
         };
         (
             m.mixest_etas,
@@ -1620,6 +1631,8 @@ fn run_inner_loop_and_nll(
     params: &ModelParameters,
     options: &FitOptions,
     prev_etas: Option<&[DVector<f64>]>,
+    // What `prev_etas` are ([`PrevEtas`]).
+    prev: PrevEtas,
     mu_k: Option<&[f64]>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
     cancel: Option<&crate::cancel::CancelFlag>,
@@ -1631,7 +1644,7 @@ fn run_inner_loop_and_nll(
     f64,
 ) {
     let (etas, h_matrices, stats, kappas, nll, _, _) = run_inner_loop_and_nll_prepared(
-        model, population, params, options, prev_etas, None, mu_k, None, schedules, false, cancel,
+        model, population, params, options, prev_etas, None, mu_k, None, schedules, prev, cancel,
         None,
     );
     (etas, h_matrices, stats, kappas, nll)
@@ -1684,9 +1697,10 @@ fn run_inner_loop_and_nll_prepared(
     // The fused AGQ gradient's inputs, and whether it forms the mode response (#2549).
     agq_gradient_inputs: Option<(&ModelParameters, &[f64], &PackedBounds, bool)>,
     schedules: Option<&[Option<crate::pk::event_driven::EventSchedule>]>,
-    // `prev_etas` are converged modes at `params` ([`InnerSolvePolicy::init_is_mode`]):
-    // only the first evaluation seeded from the flat-theta pre-flight passes `true` (#2076).
-    init_is_mode: bool,
+    // What `prev_etas` are ([`PrevEtas`]): converged modes at `params` only on the first
+    // evaluation seeded from the flat-theta pre-flight (#2076), an earlier pass's modes on
+    // the evaluations after it.
+    prev: PrevEtas,
     // Polled per subject (#574). Only a caller whose guard keeps a hard-rejected pass
     // out of every accepted state passes `Some`: the NLopt objective and the global
     // pre-search. The built-in BFGS loop passes `None` and polls between iterations.
@@ -1711,10 +1725,8 @@ fn run_inner_loop_and_nll_prepared(
         // The Gauss-Newton anchor never reuses it, and the gradient path recomputes the
         // whole second-order jet for its Laplace derivative sweep anyway, so capturing there
         // would be a full provider pass per subject thrown away.
-        let policy = InnerSolvePolicy {
-            init_is_mode,
-            ..agq_inner_solve_policy(model, options, agq_gradient_inputs.is_some())
-        };
+        let policy = agq_inner_solve_policy(model, options, agq_gradient_inputs.is_some())
+            .with_prev_etas(prev);
         let take_terminal_work =
             |_: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
                 (ebe.terminal_hessian.clone(), ebe.nll)
@@ -1843,9 +1855,9 @@ fn run_inner_loop_and_nll_prepared(
     }
     let policy = InnerSolvePolicy {
         accelerate_exact_outer: true,
-        init_is_mode,
         ..InnerSolvePolicy::for_stage(options, model)
-    };
+    }
+    .with_prev_etas(prev);
     let finish_subject =
         |subject: &Subject, ebe: &crate::estimation::inner_optimizer::EbeResult| {
             subject_nll(
@@ -1924,10 +1936,13 @@ fn run_inner_loop_and_nll_prepared(
 /// State passed through NLopt's user-data mechanism
 struct NloptState {
     cached_etas: Vec<DVector<f64>>,
-    /// `cached_etas` are the flat-theta pre-flight's converged modes at this leg's start,
-    /// still unconsumed: the next inner pass takes them as warm starts whatever their
-    /// values ([`InnerSolvePolicy::init_is_mode`], #2076). Cleared by that pass.
-    cached_etas_are_modes: bool,
+    /// What `cached_etas` are. `ModesHere` while the flat-theta pre-flight's converged
+    /// modes at this leg's start are still unconsumed: the next inner pass takes them as
+    /// warm starts whatever their values ([`InnerSolvePolicy::init_is_mode`], #2076).
+    /// `Solved` once an adopted pass wrote them, so an EBE that is exactly zero is not
+    /// mistaken for the cold placeholder and multi-started again at every evaluation.
+    /// `Placeholder` for the zero fill of a cold start.
+    cached_etas_kind: PrevEtas,
     /// The incumbent's mode response `dη̂/dx` and the point it was taken at, for the
     /// Almquist Eq. 48 warm start `η̂ + (dη̂/dx)(x − x₀)`, taken whole (#2549,
     /// [`crate::estimation::sens_outer_gradient::predict_warm_etas`]).
@@ -1979,10 +1994,23 @@ impl NloptState {
         for e in self.cached_etas.iter_mut() {
             e.fill(0.0);
         }
-        self.cached_etas_are_modes = false;
+        self.cached_etas_kind = PrevEtas::Placeholder;
         self.pred_jac = None;
         self.pred_anchor.clear();
         self.seed_hessians = None;
+    }
+
+    /// [`Self::reset_to_cold_start`], then `modes` as the next evaluation's warm starts when
+    /// there is one per subject: a cold incumbent's or a verification leg's held modes. They
+    /// are a solve's output, so the cache is [`PrevEtas::Solved`] and an exactly-zero mode
+    /// among them is warm like the rest (#2688). With `None`, or a count that does not match,
+    /// the start stays cold.
+    fn restart_from_modes(&mut self, modes: Option<Vec<DVector<f64>>>) {
+        self.reset_to_cold_start();
+        if let Some(modes) = modes.filter(|m| m.len() == self.cached_etas.len()) {
+            self.cached_etas = modes;
+            self.cached_etas_kind = PrevEtas::Solved;
+        }
     }
 }
 
@@ -2188,6 +2216,9 @@ fn stopped_eval_line(
 struct ColdStart {
     solved: StartSolve,
     cached_etas: Vec<DVector<f64>>,
+    /// What `cached_etas` was read as, restored with it. The re-solve reads its warm start
+    /// as [`PrevEtas::Solved`]: the cold solve's modes, an exactly-zero η̂ among them (#2688).
+    cached_etas_kind: PrevEtas,
     contribs: Vec<f64>,
     mixeval: Option<crate::estimation::mixture::MixtureEval>,
     mixmodes: Option<crate::estimation::mixture::MixtureClassModes>,
@@ -2469,7 +2500,7 @@ fn new_nlopt_state(
 ) -> NloptState {
     NloptState {
         cached_etas: vec![DVector::zeros(n_eta); n_subj],
-        cached_etas_are_modes: false,
+        cached_etas_kind: PrevEtas::Placeholder,
         pred_jac: None,
         pred_anchor: Vec::new(),
         seed_hessians: None,
@@ -2593,6 +2624,7 @@ fn run_global_presearch(
             &params,
             options,
             Some(&cached_zero),
+            PrevEtas::Placeholder,
             Some(&mu_k),
             Some(&schedule_cache),
             options.cancel.as_ref(),
@@ -2633,6 +2665,8 @@ fn run_global_presearch(
             &params,
             options,
             Some(&state.cached_etas),
+            // Always the zero fill below: the pre-search keeps no modes between evals.
+            PrevEtas::Placeholder,
             Some(&mu_k),
             Some(&schedule_cache),
             options.cancel.as_ref(),
@@ -3739,11 +3773,11 @@ fn absorb_cold_incumbent(
     model: &CompiledModel,
     solve: IncumbentSolve,
 ) {
-    state.reset_to_cold_start();
-    let modes = outer_cache_warm_starts(model, &solve.etas, &solve.kappas);
-    if modes.len() == state.cached_etas.len() {
-        state.cached_etas = modes;
-    }
+    state.restart_from_modes(Some(outer_cache_warm_starts(
+        model,
+        &solve.etas,
+        &solve.kappas,
+    )));
     if ofv < state.best_ofv {
         state.best_ofv = ofv;
     }
@@ -4221,7 +4255,13 @@ fn inner_solve_polled(
         Some(mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
-        InnerSolvePolicy::for_stage(options, model),
+        // A seed is a set of modes an earlier pass returned, so an exactly-zero one among
+        // them is warm like the rest (#2688); without one the solve is cold.
+        InnerSolvePolicy::for_stage(options, model).with_prev_etas(if seed.is_some() {
+            PrevEtas::Solved
+        } else {
+            PrevEtas::Placeholder
+        }),
         cancel,
         |_, ebe| ebe.screen_moved || ebe.twin_moved,
     );
@@ -5301,6 +5341,7 @@ fn tight_per_subject_gradients(
             0,
             InnerHessianSeed::for_options(options),
             options,
+            PrevEtas::Solved,
         );
         // The decrement assumes every η̂ is a mode; one that did not converge (or a
         // start the inner loop refused) still yields a finite gradient, formed as if
@@ -7015,7 +7056,7 @@ fn optimize_nlopt_attempt_probed(
         .filter(|e| restart.is_none() && optimizer_start_s == x0_start_s && e.len() == n_subj)
     {
         state.cached_etas = etas.to_vec();
-        state.cached_etas_are_modes = true;
+        state.cached_etas_kind = PrevEtas::ModesHere;
     }
 
     // External counter mirrors state.n_evals — nlopt doesn't hand `state`
@@ -7280,7 +7321,7 @@ fn optimize_nlopt_attempt_probed(
             } else {
                 let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
                 let predicted: Option<Vec<DVector<f64>>> = match &state.pred_jac {
-                    Some(jac) if !state.cached_etas_are_modes => {
+                    Some(jac) if state.cached_etas_kind != PrevEtas::ModesHere => {
                         #[cfg(test)]
                         crate::estimation::inner_optimizer::record_prediction(
                             &state.cached_etas,
@@ -7297,6 +7338,11 @@ fn optimize_nlopt_attempt_probed(
                     }
                     _ => None,
                 };
+                // Read once: pre-flight modes are at this leg's start, the next evaluation is
+                // elsewhere. They stay a solve's output whether or not this pass is adopted;
+                // the zero placeholder stays one unless it is (the adoption below).
+                let prev = state.cached_etas_kind;
+                state.cached_etas_kind = prev.after_pass(false);
                 let (ehs, hms, ebe_stats, kappas, nll, prepared, nll_i) =
                     run_inner_loop_and_nll_prepared(
                         model,
@@ -7318,7 +7364,7 @@ fn optimize_nlopt_attempt_probed(
                             warm_predictor,
                         )),
                         Some(&schedule_cache),
-                        std::mem::take(&mut state.cached_etas_are_modes),
+                        prev,
                         options.cancel.as_ref(),
                         guard_stop.as_ref(),
                     );
@@ -7330,6 +7376,7 @@ fn optimize_nlopt_attempt_probed(
                 // evaluation is the cold one, as it was before #2682, and so is the warm-start
                 // cache — no incumbent exists yet to have earned a non-zero one (#1290).
                 state.cached_etas = cold.cached_etas;
+                state.cached_etas_kind = cold.cached_etas_kind;
                 let accepted = warm_rescore_accepted(
                     &solved.2,
                     n_subj,
@@ -7379,6 +7426,10 @@ fn optimize_nlopt_attempt_probed(
                 };
                 cold_start = Some(ColdStart {
                     cached_etas: std::mem::replace(&mut state.cached_etas, warm),
+                    cached_etas_kind: std::mem::replace(
+                        &mut state.cached_etas_kind,
+                        PrevEtas::Solved,
+                    ),
                     solved,
                     contribs: std::mem::take(&mut contribs),
                     mixeval: mixeval.take(),
@@ -7521,19 +7572,22 @@ fn optimize_nlopt_attempt_probed(
                 }
             } else {
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
-                // Mixture (#977 Phase 4): analytic posterior-weighted gradient,
-                // FD fallback when out of analytic scope.
+                // Mixture (#977 Phase 4): analytic posterior-weighted gradient, a
+                // declined (subject × class) term salvaged on its own and recorded for
+                // the #1154 warning (#2906); whole-objective FD only when the mixing map
+                // itself is out of analytic scope.
                 // #1520: per the optimizer's own acceptance test (`SalvageGuardPolicy`),
                 // the incumbent the salvage guard may measure this gradient point against.
                 let guard_reference = state.salvage_guard.reference(xs);
                 let mut grad_raw = if let Some(mev) = &mixeval {
-                    crate::estimation::mixture::mixture_gradient_with_modes(
+                    crate::estimation::mixture::mixture_gradient_salvaged(
                         model,
                         population,
                         &params,
                         options,
                         mev,
                         mixmodes.as_ref(),
+                        declines,
                     )
                     .unwrap_or_else(|| {
                         crate::estimation::mixture::mixture_gradient_fd(
@@ -7645,6 +7699,7 @@ fn optimize_nlopt_attempt_probed(
             // η̂, rather than restarting an IOV subject's κ at 0 (#2261) — except on an
             // ODE + IOV model, see `outer_cache_warm_starts` (#2508).
             state.cached_etas = outer_cache_warm_starts(model, &ehs, &kappas);
+            state.cached_etas_kind = state.cached_etas_kind.after_pass(true);
             // The next evaluation predicts its warm start from this incumbent's mode
             // response; a gradient-free evaluation keeps the last response, re-anchored here.
             if warm_predictor {
@@ -7878,6 +7933,7 @@ fn optimize_nlopt_attempt_probed(
                         probe_options.inner_restarts,
                         InnerHessianSeed::for_options(probe_options),
                         probe_options,
+                        PrevEtas::Placeholder,
                     );
                     let cold = 2.0
                         * pop_nll_opts(model, population, &p, &ehs, &hms, &kappas, probe_options);
@@ -8328,10 +8384,7 @@ fn optimize_nlopt_attempt_probed(
             // cold solve's modes the same way, so that leg's first evaluation is a warm
             // re-solve of them and a subject the cold solve left unconverged is not what
             // the guard judges (#2645).
-            state.reset_to_cold_start();
-            if let Some(modes) = held.filter(|m| m.len() == state.cached_etas.len()) {
-                state.cached_etas = modes;
-            }
+            state.restart_from_modes(held);
             *leg_best.borrow_mut() = BestPoint::new();
             leg_first.set(None);
             let mut leg = nlopt::Nlopt::new(algo, n, &objective, nlopt::Target::Minimize, state);
@@ -8830,6 +8883,7 @@ fn optimize_nlopt_attempt_probed(
                     pmix: m.pmix,
                     mixest: m.mixest,
                     n_fd_h_redone: m.n_fd_h_redone,
+                    class_nll: m.class_nll,
                 }),
             )
         } else {
@@ -9470,11 +9524,16 @@ fn optimize_bfgs(
         Some(etas) if etas.len() == n_subj => etas.to_vec(),
         _ => vec![DVector::zeros(n_eta); n_subj],
     };
-    // Whether `cached_etas` still holds those converged modes, unconsumed: the first
-    // `fdfg` call takes them as warm starts whatever their values
-    // ([`InnerSolvePolicy::init_is_mode`]) and clears the flag.
-    let cached_etas_are_modes =
-        std::cell::Cell::new(first_eval_etas.is_some_and(|e| e.len() == n_subj));
+    // What `cached_etas` are. `ModesHere` while they still hold those converged modes,
+    // unconsumed: the first `fdfg` call takes them as warm starts whatever their values
+    // ([`InnerSolvePolicy::init_is_mode`]). Every `fdfg` result becomes the cache, so
+    // from then on they are `Solved` — an exactly-zero EBE among them included.
+    let cached_etas_kind =
+        std::cell::Cell::new(if first_eval_etas.is_some_and(|e| e.len() == n_subj) {
+            PrevEtas::ModesHere
+        } else {
+            PrevEtas::Placeholder
+        });
 
     // Covariate-NN (DCM) regularizer. No-op when both λ are 0. Penalty is added
     // to the optimizer-facing `f_only`/`fdfg` values (and `fdfg`'s gradient) but
@@ -9516,6 +9575,8 @@ fn optimize_bfgs(
             &params,
             options,
             Some(prev_etas),
+            // A line-search probe is never at the point the cache's modes were solved at.
+            cached_etas_kind.get().after_pass(false),
             Some(&mu_k),
             None,
             None, // the built-in BFGS loop polls between iterations (#574)
@@ -9562,7 +9623,7 @@ fn optimize_bfgs(
                 Some(&mu_k),
                 None,
                 None,
-                cached_etas_are_modes.take(),
+                cached_etas_kind.replace(PrevEtas::Solved),
                 None, // the built-in BFGS loop polls between iterations (#574)
                 None,
             );
@@ -9924,6 +9985,7 @@ fn optimize_bfgs(
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
         options,
+        cached_etas_kind.get(),
     );
     let final_ofv = ofv_at_fixed(&x_final, &final_ehs, &final_hms, &final_kappas);
 
@@ -10044,19 +10106,27 @@ pub(crate) fn reconverged_fd_gradient(
 ) -> Vec<f64> {
     let fixed = packed_fixed_mask(init_params);
     let warm = joint_warm_starts(warm_etas, warm_kappas);
-    let eval =
-        |xv: &[f64]| reconverged_probe_ofv(xv, init_params, model, population, &warm, options);
+    let probe = |xv: &[f64], tol: f64| {
+        reconverged_probe_ofv(xv, init_params, model, population, &warm, options, tol)
+    };
+    let tol = stencil_inner_tol(options.inner_tol);
+    let eval = |xv: &[f64]| probe(xv, tol).0;
+    let tight = |xv: &[f64]| {
+        let (v, stats) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+        crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
+    };
     // Same bounded central-difference policy as the per-subject reconverged-FD gradients —
     // shared so the `eps`/clamp/missing-probe convention can't drift (#466 review round 4 #8).
-    let floor = fd_step_floors(init_params, &model.default_params);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    let floor = fd_step_floors(init_params, model);
+    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
 }
 
 /// One probe of [`reconverged_fd_gradient`]: the OFV at packed `xv`, re-solving the inner
 /// loop warm from `warm` at the stencil tolerance. Matches the objective closure's
 /// definition, 2·pop_nll, and its guard: a probe the objective would reject (non-finite,
-/// or excess EBE non-convergence) is the same `1e20` wall, which [`central_diff_packed`]
-/// treats as missing rather than as a value (#2378).
+/// or excess EBE non-convergence) is the same `1e20` wall, which [`central_diff_packed_gated`]
+/// treats as missing rather than as a value (#2378). `tol` is the inner tolerance — the
+/// stencil's, or its tight twin's — and the inner loop's stats come back with the value.
 fn reconverged_probe_ofv(
     xv: &[f64],
     init_params: &ModelParameters,
@@ -10064,7 +10134,8 @@ fn reconverged_probe_ofv(
     population: &Population,
     warm: &[DVector<f64>],
     options: &FitOptions,
-) -> f64 {
+    tol: f64,
+) -> (f64, InnerLoopStats) {
     let params = unpack_params(xv, init_params);
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
     let (ehs, hms, ebe_stats, kappas) = run_inner_loop_warm_seeded(
@@ -10072,22 +10143,26 @@ fn reconverged_probe_ofv(
         population,
         &params,
         options.inner_maxiter,
-        stencil_inner_tol(options.inner_tol),
+        tol,
         Some(warm),
         Some(&mu_k),
         options.min_obs_for_convergence_check as usize,
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
         options,
+        // The modes the gradient is taken at.
+        PrevEtas::Solved,
     );
     let raw = 2.0 * pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
     let n_subj = population.subjects.len();
-    if !raw.is_finite() || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
+    let v = if !raw.is_finite()
+        || ebe_guard_rejects(&ebe_stats, n_subj, raw, options.max_unconverged_frac)
     {
         1e20
     } else {
         raw
-    }
+    };
+    (v, ebe_stats)
 }
 
 /// The gradient of the objective the covariance step's `R` is the Hessian of, at `x` (#2541):
@@ -10312,14 +10387,27 @@ fn reporting_fd_gradient(
     let n_subj = population.subjects.len();
     let fixed = packed_fixed_mask(init_params);
     let warm = joint_warm_starts(warm_etas, warm_kappas);
-    let eval = |xv: &[f64]| -> f64 {
+    // `tight` re-solves at the gate's τ/100 (#2406): the mixture branch reads its inner
+    // tolerance from the options it is handed, so it takes an override clone.
+    let tight_options = FitOptions {
+        inner_tol: crate::estimation::fd_resolution::tight_tol(options.inner_tol),
+        ..options.clone()
+    };
+    let stencil_tol = stencil_inner_tol(options.inner_tol);
+    let probe = |xv: &[f64], tight: bool| -> (f64, InnerLoopStats) {
         let params = unpack_params(xv, init_params);
         // Mirror the objective closure's own two branches, so the mixture path
         // differentiates the K-fold log-sum-exp it minimised rather than a
         // single-class stand-in for it.
         let (raw, stats) = if params.mixture.is_some() {
-            let m =
-                crate::estimation::mixture::mixture_ofv(model, population, &params, options, None);
+            let mixture_options = if tight { &tight_options } else { options };
+            let m = crate::estimation::mixture::mixture_ofv(
+                model,
+                population,
+                &params,
+                mixture_options,
+                None,
+            );
             let stats = InnerLoopStats {
                 n_unconverged: m.ebe_stats.n_unconverged,
                 n_fallback: m.ebe_stats.n_fallback,
@@ -10334,27 +10422,40 @@ fn reporting_fd_gradient(
                 population,
                 &params,
                 options.inner_maxiter,
-                stencil_inner_tol(options.inner_tol),
+                if tight {
+                    crate::estimation::fd_resolution::tight_tol(stencil_tol)
+                } else {
+                    stencil_tol
+                },
                 Some(&warm),
                 Some(&mu_k),
                 options.min_obs_for_convergence_check as usize,
                 options.inner_restarts,
                 InnerHessianSeed::for_options(options),
                 options,
+                // The final modes.
+                PrevEtas::Solved,
             );
             let nll = pop_nll_opts(model, population, &params, &ehs, &hms, &kappas, options);
             (2.0 * nll, ebe_stats)
         };
         let raw = raw + nn_reg.penalty_value(&params.theta) + priors.penalty(xv);
-        if !raw.is_finite() || ebe_guard_rejects(&stats, n_subj, raw, options.max_unconverged_frac)
+        let v = if !raw.is_finite()
+            || ebe_guard_rejects(&stats, n_subj, raw, options.max_unconverged_frac)
         {
             1e20
         } else {
             raw
-        }
+        };
+        (v, stats)
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    let eval = |xv: &[f64]| probe(xv, false).0;
+    let tight = |xv: &[f64]| {
+        let (v, stats) = probe(xv, true);
+        crate::estimation::fd_resolution::inner_resolved(&stats).then_some(v)
+    };
+    let floor = fd_step_floors(init_params, model);
+    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
 }
 
 /// Bounded central-difference of a packed-space scalar `eval`, skipping fixed
@@ -10372,13 +10473,28 @@ fn reporting_fd_gradient(
 /// Coordinate `k` is stepped by [`fd_step`]`(1e-4, xₖ, floor[k])`, `floor` from
 /// [`fd_step_floors`]: `1e-4·(1 + |xₖ|)` on every coordinate but a small identity-packed θ,
 /// which is stepped relative to its declared magnitude rather than by an absolute `1e-4` in
-/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187).
-fn central_diff_packed(
+/// its own units — 12 % of a θ of 8e-4, and straight through zero below 1e-4 (#2187). A
+/// `[covariate_nn]` weight is identity-packed too but keeps the unit floor, since its θ₀ is
+/// a draw rather than a declared magnitude (#2406).
+///
+/// That relative step is only as good as the probes resolve it, so a coordinate whose floor is
+/// below 1 goes through the resolution gate of
+/// [`resolve_floored_step`](crate::estimation::fd_resolution::resolve_floored_step) (#2406):
+/// `tight` is `eval` re-solved at τ/100, `None` where a solve fell to Nelder–Mead or did not
+/// converge, and the step grows ×10 until the two agree or growth runs into truncation error.
+/// A coordinate whose `tight` was `None` at every floor keeps its first step's difference.
+/// Without `tight` no coordinate is gated, and a floor-1 coordinate takes the ungated difference
+/// either way. A floored one for which no floor gave a difference takes the ungated difference
+/// at its own floor, with its one-sided fallback — the covariance gate's fallback too. Floor 1
+/// was the worst step there: on a `V = TVV/k` volume it is the step through `V ≤ 0` that made
+/// the probe go missing (#2406 review r1).
+fn central_diff_packed_gated(
     x: &[f64],
     fixed: &[bool],
     floor: &[f64],
     bounds: &PackedBounds,
     eval: impl Fn(&[f64]) -> f64,
+    tight: Option<&dyn Fn(&[f64]) -> Option<f64>>,
 ) -> Vec<f64> {
     let n = x.len();
     let eps = 1e-4;
@@ -10390,7 +10506,43 @@ fn central_diff_packed(
         if fixed[k] {
             continue;
         }
-        let h = fd_step(eps, x[k], floor[k]);
+        let floor_k = floor[k];
+        if let Some(tight) = tight.filter(|_| floor_k < 1.0) {
+            let resolved =
+                crate::estimation::fd_resolution::resolve_floored_step(floor_k, |fl, at_tight| {
+                    let h = fd_step(eps, x[k], fl);
+                    let xp = (x[k] + h).min(bounds.upper[k]);
+                    let xm = (x[k] - h).max(bounds.lower[k]);
+                    if xp <= xm {
+                        return None;
+                    }
+                    let mut probe = |xk: f64| {
+                        xw[k] = xk;
+                        let v = if at_tight {
+                            tight(&xw)
+                        } else {
+                            Some(eval(&xw))
+                        };
+                        xw[k] = x[k];
+                        v.filter(|&v| usable(v))
+                    };
+                    let fp = probe(xp)?;
+                    let fm = probe(xm)?;
+                    Some(crate::estimation::fd_resolution::Difference {
+                        value: (fp - fm) / (xp - xm),
+                        numer: (fp - fm).abs(),
+                        scale: fp.abs().max(fm.abs()),
+                        span: xp - xm,
+                    })
+                });
+            if let Some(r) = resolved {
+                if r.value.is_finite() {
+                    grad[k] = r.value;
+                }
+                continue;
+            }
+        }
+        let h = fd_step(eps, x[k], floor_k);
         let xp = (x[k] + h).min(bounds.upper[k]);
         let xm = (x[k] - h).max(bounds.lower[k]);
         // Skip only probes that collapsed onto one point (a box pinned to `x`). The span is
@@ -10425,6 +10577,19 @@ fn central_diff_packed(
         }
     }
     grad
+}
+
+/// [`central_diff_packed_gated`] without the gate: the difference every coordinate took before
+/// #2406, which the tests pin the shared policy on.
+#[cfg(test)]
+fn central_diff_packed(
+    x: &[f64],
+    fixed: &[bool],
+    floor: &[f64],
+    bounds: &PackedBounds,
+    eval: impl Fn(&[f64]) -> f64,
+) -> Vec<f64> {
+    central_diff_packed_gated(x, fixed, floor, bounds, eval, None)
 }
 
 /// Per-subject packed gradient `dᵢ = d(nllᵢ)/dx` at the **held** EBE `η̂ᵢ` and held
@@ -10510,7 +10675,7 @@ fn subject_fixed_ebe_gradient(
 /// The adjoint's kernel scores dense residual covariances itself, so the one structural
 /// cause left is a subject no recorder serves: its decline is scope, not numerics, and
 /// recurs at every evaluation exactly as a model-level exclusion does.
-fn is_structural_decline(
+pub(crate) fn is_structural_decline(
     model: &CompiledModel,
     subject: &Subject,
     init_params: &ModelParameters,
@@ -10705,12 +10870,11 @@ pub(crate) fn subject_reconverged_fd_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let fixed = packed_fixed_mask(init_params);
     // Subject marginal NLL at a packed point, re-solving this subject's EBE
     // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
     // (`foce_subject_nll`, summed by `pop_nll`); a non-finite or sentinel side is missing
-    // to `central_diff_packed`, which takes the one-sided difference (#2378).
-    let eval = |xv: &[f64]| -> f64 {
+    // to `central_diff_packed_gated`, which takes the one-sided difference (#2378).
+    let probe = |xv: &[f64], tol: f64| -> (f64, bool) {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let ebe = find_ebe_for_stage(
@@ -10718,13 +10882,13 @@ pub(crate) fn subject_reconverged_fd_gradient(
             subject,
             &params,
             options.inner_maxiter,
-            stencil_inner_tol(options.inner_tol),
+            tol,
             Some(warm_eta.as_slice()),
             Some(&mu_k),
             0,
             options,
         );
-        crate::stats::likelihood::foce_subject_nll_cov(
+        let nll = crate::stats::likelihood::foce_subject_nll_cov(
             model,
             subject,
             &params.theta,
@@ -10734,10 +10898,32 @@ pub(crate) fn subject_reconverged_fd_gradient(
             &params.sigma.values,
             model.residual_cov_at(&params),
             options.interaction,
-        )
+        );
+        (nll, crate::estimation::fd_resolution::ebe_resolved(&ebe))
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    subject_central_diff(x, init_params, model, bounds, options, probe)
+}
+
+/// The per-subject reconverged-FD gradients' shared difference: `probe(x, tol)` is the
+/// subject's objective re-solved at `tol` and whether that solve counts as resolved, taken at
+/// the stencil tolerance and, on a floored coordinate, at its tight twin (#2406).
+fn subject_central_diff(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    probe: impl Fn(&[f64], f64) -> (f64, bool),
+) -> Vec<f64> {
+    let fixed = packed_fixed_mask(init_params);
+    let tol = stencil_inner_tol(options.inner_tol);
+    let eval = |xv: &[f64]| probe(xv, tol).0;
+    let tight = |xv: &[f64]| {
+        let (v, resolved) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+        resolved.then_some(v)
+    };
+    let floor = fd_step_floors(init_params, model);
+    central_diff_packed_gated(x, &fixed, &floor, bounds, eval, Some(&tight))
 }
 
 /// Per-subject reconverged-FD packed gradient for an **IOV** subject: **re-converges that
@@ -10750,7 +10936,7 @@ pub(crate) fn subject_reconverged_fd_gradient(
 /// IOV objective `foce_subject_nll_iov` (the same one `pop_nll` sums). `warm` is the
 /// subject's joint mode (`η̂` then each cell's κ̂, [`joint_warm_start`]), so every probe
 /// starts at κ̂ rather than κ = 0 (#2261).
-fn subject_reconverged_fd_gradient_iov(
+pub(crate) fn subject_reconverged_fd_gradient_iov(
     x: &[f64],
     init_params: &ModelParameters,
     model: &CompiledModel,
@@ -10759,8 +10945,7 @@ fn subject_reconverged_fd_gradient_iov(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let fixed = packed_fixed_mask(init_params);
-    let eval = |xv: &[f64]| -> f64 {
+    let probe = |xv: &[f64], tol: f64| -> (f64, bool) {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let ebe = find_ebe_for_stage(
@@ -10768,13 +10953,13 @@ fn subject_reconverged_fd_gradient_iov(
             subject,
             &params,
             options.inner_maxiter,
-            stencil_inner_tol(options.inner_tol),
+            tol,
             Some(warm.as_slice()),
             Some(&mu_k),
             0,
             options,
         );
-        crate::stats::likelihood::foce_subject_nll_iov_cov(
+        let nll = crate::stats::likelihood::foce_subject_nll_iov_cov(
             model,
             subject,
             &params.theta,
@@ -10789,10 +10974,10 @@ fn subject_reconverged_fd_gradient_iov(
                 .omega_iov
                 .as_ref()
                 .expect("IOV model (n_kappa > 0) has omega_iov"),
-        )
+        );
+        (nll, crate::estimation::fd_resolution::ebe_resolved(&ebe))
     };
-    let floor = fd_step_floors(init_params, &model.default_params);
-    central_diff_packed(x, &fixed, &floor, bounds, eval)
+    subject_central_diff(x, init_params, model, bounds, options, probe)
 }
 
 /// The exact analytic per-subject packed **outer** gradient at the packed point `pt` the

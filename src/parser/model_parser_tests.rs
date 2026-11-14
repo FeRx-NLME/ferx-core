@@ -3765,8 +3765,8 @@ fn test_parse_threads_auto() {
 #[test]
 fn test_parse_threads_zero_means_auto() {
     // `threads = 0` is treated as "use the engine's default thread count"
-    // (available cores - 1, floored at 1, capped at 8 — #707), matching the
-    // R binding's `threads <= 0` sentinel.
+    // (available cores minus one, at least two where two cores exist, capped
+    // at 8 — #707), matching the R binding's `threads <= 0` sentinel.
     let opts = parse_fit_options(&["threads = 0".to_string()]).unwrap();
     assert_eq!(opts.threads, None);
 }
@@ -5900,17 +5900,30 @@ fn test_parse_fit_options_applies_known_keys() {
 #[test]
 fn test_parse_data_block_path() {
     let (path, map) = parse_data_block(&["path = warfarin.csv".to_string()]).unwrap();
-    assert_eq!(path, "warfarin.csv");
+    assert_eq!(path.as_deref(), Some("warfarin.csv"));
     assert!(map.is_empty());
     // Quoted paths (e.g. containing spaces) are accepted, quotes stripped.
     let (path, _) = parse_data_block(&["path = \"my data.csv\"".to_string()]).unwrap();
-    assert_eq!(path, "my data.csv");
+    assert_eq!(path.as_deref(), Some("my data.csv"));
 }
 
+/// #2914: `path` is optional — a block carrying only column maps parses, with
+/// no path and the maps intact, so a caller-supplied dataset can use them.
 #[test]
-fn test_parse_data_block_missing_path_is_error() {
-    let err = parse_data_block(&[]).unwrap_err();
-    assert!(err.contains("missing required key `path`"), "{err}");
+fn test_parse_data_block_without_path_keeps_column_map() {
+    let (path, map) =
+        parse_data_block(&["TIME = TAFD".to_string(), "DV = CONC".to_string()]).unwrap();
+    assert_eq!(path, None);
+    assert_eq!(
+        map,
+        vec![
+            ("TIME".to_string(), "TAFD".to_string()),
+            ("DV".to_string(), "CONC".to_string())
+        ]
+    );
+    let (path, map) = parse_data_block(&[]).unwrap();
+    assert_eq!(path, None);
+    assert!(map.is_empty());
 }
 
 #[test]
@@ -5938,7 +5951,7 @@ fn test_parse_data_block_column_mapping() {
         "DV = CONC".to_string(),
     ])
     .unwrap();
-    assert_eq!(path, "mydata.csv");
+    assert_eq!(path.as_deref(), Some("mydata.csv"));
     assert_eq!(
         map,
         vec![
@@ -9709,6 +9722,469 @@ fn test_ruv_magnitude_rejects_covariate_without_covariates_block() {
     assert!(err.contains("undeclared covariate"), "got: {err}");
 }
 
+// ── #2915: [error_model] magnitudes read [individual_parameters] names ──────
+
+/// A one-compartment model whose magnitude is `mag` and whose
+/// [individual_parameters] block carries the extra lines `indiv` (#2915).
+/// Declares `WT` so an inlined body may read it.
+fn ruv_indiv_model(indiv: &str, mag: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_K(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+{indiv}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional({mag})
+[covariates]
+  WT continuous
+"#
+    )
+}
+
+/// The value the magnitude multiplies its sigma by at each `WT` row.
+fn ruv_indiv_mults(model_str: &str, wts: &[f64]) -> Vec<f64> {
+    let model = parse_full_model(model_str).unwrap().model;
+    let rows: Vec<(usize, f64)> = wts.iter().map(|w| (1, *w)).collect();
+    let s = magnitude_rows_subject(&rows, "WT");
+    let theta = model.default_params.theta.clone();
+    model
+        .ruv_obs_mult(&s, &theta)
+        .unwrap()
+        .into_iter()
+        .map(|r| r[0])
+        .collect()
+}
+
+/// The issue's case: a name assigned in [individual_parameters] is read as its
+/// value, not refused as an undeclared covariate. The literal is not 1, so a
+/// regression that read the name as 0 (undeclared) or dropped the factor (1)
+/// both fail.
+#[test]
+fn ruv_magnitude_reads_a_constant_assigned_in_individual_parameters() {
+    let m = ruv_indiv_mults(&ruv_indiv_model("  ISPK = 3", "PROP_ERR * ISPK"), &[70.0]);
+    assert_eq!(m, vec![3.0]);
+}
+
+/// A θ- and covariate-dependent definition, through a chain of two names: the
+/// runtime value follows the per-observation covariate, and the θ-derivative
+/// program (the adjoint's) sees the inlined θ, so the magnitude counts as
+/// θ-dependent and `∂mult/∂RUV_K = WT/70`.
+#[test]
+fn ruv_magnitude_inlines_a_theta_covariate_chain_from_individual_parameters() {
+    let src = ruv_indiv_model("  WTN = WT / 70\n  ISPK = RUV_K * WTN", "PROP_ERR * ISPK");
+    assert_eq!(ruv_indiv_mults(&src, &[70.0, 35.0]), vec![1.5, 0.75]);
+    let model = parse_full_model(&src).unwrap().model;
+    assert!(model.has_theta_dependent_ruv_magnitude());
+    assert!(model.referenced_covariates.iter().any(|c| c == "WT"));
+    let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+    let deriv = rm.per_sigma_deriv[0].as_ref().expect("deriv program");
+    let cov = HashMap::from([("WT".to_string(), 35.0)]);
+    let grad = deriv_theta_grad(deriv, &[0.2, 10.0, 1.5], &cov, 1.0, 1.0);
+    approx::assert_relative_eq!(grad[2], 0.5, max_relative = 1e-12);
+    assert_eq!(grad[0], 0.0);
+}
+
+/// A definition that reaches itself is refused, not recursed into without
+/// bound. [individual_parameters] refuses a self-reference as a forward
+/// reference before this scope runs, so it is pinned on the scope directly.
+#[test]
+fn ruv_indiv_scope_refuses_a_self_reference_instead_of_recursing() {
+    let stmts = vec![Statement::Assign(
+        "WT".to_string(),
+        Expression::BinOp(
+            Box::new(Expression::Covariate("WT".to_string())),
+            BinOp::Mul,
+            Box::new(Expression::Literal(2.0)),
+        ),
+    )];
+    let scope = RuvIndivScope::new(&stmts);
+    let why = scope.verdict("WT").unwrap_err();
+    assert!(
+        why.contains("reads `WT`, which is defined in terms of itself"),
+        "{why}"
+    );
+}
+
+/// Review round 1 (#2915): a refused name must refuse every name that reads
+/// it, even when the refused name collides with an RUV built-in. With `TAD`
+/// assigned twice, `ISPK = TAD` used to be stored as the bare leaf `TAD`,
+/// which the error model then read as the engine's time after dose — `3` in
+/// every other block, `TAD` here, with no message.
+#[test]
+fn ruv_magnitude_refusal_propagates_through_a_wrapper_of_a_reassigned_name() {
+    let err = expect_parse_err(&ruv_indiv_model(
+        "  TAD = 2\n  ISPK = TAD\n  TAD = 3",
+        "PROP_ERR * ISPK",
+    ));
+    assert!(
+        err.contains("`ISPK`, which [individual_parameters] assigns but which reads `TAD`, which is assigned more than once"),
+        "{err}"
+    );
+}
+
+/// A name the block assigns that the error model reads as its own built-in
+/// (`TAD`) or as the scaled sigma: two blocks would read two values, so it is
+/// refused by name.
+#[test]
+fn ruv_magnitude_refuses_a_builtin_name_the_block_assigns() {
+    let err = expect_parse_err(&ruv_indiv_model("  TAD = 2", "PROP_ERR * (1 + TAD)"));
+    assert!(
+        err.contains("references `TAD`, which [individual_parameters] assigns, but which in [error_model] names"),
+        "{err}"
+    );
+}
+
+/// `n` levels of a diamond (`B_i = X_i + 2`, `C_i = X_i + 3`,
+/// `X_{i+1} = B_i + C_i`): the substituted tree doubles per level.
+fn ruv_indiv_diamond(n: usize) -> String {
+    let mut s = String::from("  X0 = RUV_K\n");
+    for i in 0..n {
+        s += &format!(
+            "  B{i} = X{i} + 2\n  C{i} = X{i} + 3\n  X{} = B{i} + C{i}\n",
+            i + 1
+        );
+    }
+    s
+}
+
+/// Review round 1 (#2915): substitution is judged lazily and by size, never
+/// materialised up front. A 60-level diamond is ~2^60 nodes expanded; a model
+/// whose magnitude does not read it parses (the scope only indexes the block),
+/// and one whose magnitude does is refused on size — both in linear time, so
+/// an exponential regression hangs this test rather than passing it.
+#[test]
+fn ruv_magnitude_diamond_is_judged_linearly() {
+    let deep = ruv_indiv_diamond(60);
+    // Read by nothing in the error model: parses as before.
+    parse_full_model(&ruv_indiv_model(&deep, "PROP_ERR * RUV_K")).unwrap();
+    // Read by the magnitude: refused on size, naming the top name.
+    let err = expect_parse_err(&ruv_indiv_model(&deep, "PROP_ERR * X60"));
+    assert!(
+        err.contains("`X60`, which [individual_parameters] assigns but which")
+            && err.contains("expands to more than 10000 expression nodes"),
+        "{err}"
+    );
+    // A shallow diamond is substituted, with the value of the expanded tree:
+    // X1 = 2·X0 + 5 = 8, X2 = 2·X1 + 5 = 21 at RUV_K = 1.5.
+    let m = ruv_indiv_mults(
+        &ruv_indiv_model(&ruv_indiv_diamond(2), "PROP_ERR * X2"),
+        &[70.0],
+    );
+    assert_eq!(m, vec![21.0]);
+}
+
+/// A model whose magnitude reads a counted θ block `RUV[3]` through an
+/// index assigned in [individual_parameters] (#2915 review 2). `GRP` is a
+/// declared column. θ = [TVCL, TVV, RUV[1..3]].
+fn ruv_gather_model(indiv: &str) -> String {
+    ruv_gather_model_with(indiv, "PROP_ERR * RUV[IDX]")
+}
+
+/// [`ruv_gather_model`] with the magnitude `mag`.
+fn ruv_gather_model_with(indiv: &str, mag: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV[3](1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+{indiv}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional({mag})
+[covariates]
+  GRP continuous
+"#
+    )
+}
+
+/// The gather index columns the pre-fit check will walk.
+fn ruv_gather_index_columns(model: &CompiledModel) -> Vec<(String, String)> {
+    model
+        .theta_blocks()
+        .index_columns()
+        .map(|(b, c, _)| (b.to_string(), c.to_string()))
+        .collect()
+}
+
+/// Review 2 (#2915): the parse records `RUV[IDX]` as a gather over a data
+/// column `IDX` before substitution makes the index the literal `2`. That
+/// stale record made fit/predict demand an `IDX` column the expression never
+/// reads (`E_THETA_GATHER_INDEX_MISSING`). After substitution the literal is
+/// folded to level 2's θ, as `RUV[2]` written inline is, and no column is
+/// recorded.
+#[test]
+fn ruv_magnitude_assigned_literal_gather_index_folds_and_records_no_column() {
+    let model = parse_full_model(&ruv_gather_model("  IDX = 2"))
+        .unwrap()
+        .model;
+    assert!(
+        ruv_gather_index_columns(&model).is_empty(),
+        "{:?}",
+        ruv_gather_index_columns(&model)
+    );
+    let s = magnitude_rows_subject(&[(1, 1.0)], "GRP");
+    let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
+    assert_eq!(rows[0][0], 2.2);
+}
+
+/// The column the substituted index reads is the one recorded — `GRP`, never
+/// the name as written — so the pre-fit level check walks the right column,
+/// and each row reads its own level.
+#[test]
+fn ruv_magnitude_assigned_column_gather_index_records_the_substituted_column() {
+    let model = parse_full_model(&ruv_gather_model("  IDX = GRP"))
+        .unwrap()
+        .model;
+    assert_eq!(
+        ruv_gather_index_columns(&model),
+        vec![("RUV".to_string(), "GRP".to_string())]
+    );
+    let s = magnitude_rows_subject(&[(1, 1.0), (1, 3.0)], "GRP");
+    let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
+    assert_eq!((rows[0][0], rows[1][0]), (1.1, 3.3));
+}
+
+/// A substituted literal index is range-checked like a written one.
+#[test]
+fn ruv_magnitude_assigned_literal_gather_index_out_of_range_is_refused() {
+    // Read twice: the walk stops at the first refusal and skips the second.
+    let err = expect_parse_err(&ruv_gather_model_with(
+        "  IDX = 5",
+        "PROP_ERR * RUV[IDX] * RUV[IDX]",
+    ));
+    assert!(
+        err.contains("`RUV[5]`: level index must be an integer in 1..=3"),
+        "{err}"
+    );
+}
+
+/// A substituted index that is neither a column nor a literal (`GRP + 0`)
+/// has no single column for the pre-fit check to walk, so nothing is
+/// recorded — as for the same index written inline — and the rows still read
+/// their own level.
+#[test]
+fn ruv_magnitude_assigned_computed_gather_index_records_no_column() {
+    let model = parse_full_model(&ruv_gather_model("  IDX = GRP + 0"))
+        .unwrap()
+        .model;
+    assert!(ruv_gather_index_columns(&model).is_empty());
+    let s = magnitude_rows_subject(&[(1, 2.0)], "GRP");
+    let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
+    assert_eq!(rows[0][0], 2.2);
+}
+
+/// A data-driven block read bare beside a substituted name: its implicit index
+/// is not a recorded gather site, before or after substitution.
+#[test]
+fn ruv_magnitude_substitution_leaves_a_data_driven_block_unrecorded() {
+    let src = ruv_gather_model_with("  ISPK = 2", "PROP_ERR * ERRSCALE * ISPK").replace(
+        "  theta RUV[3](1.0, 0.0, 10.0)\n",
+        "  theta ERRSCALE[GRP](1.0, 0.1, 10.0)\n",
+    );
+    let model = parse_full_model(&src).unwrap().model;
+    assert!(
+        ruv_gather_index_columns(&model)
+            .iter()
+            .all(|(b, _)| b != "ERRSCALE"),
+        "{:?}",
+        ruv_gather_index_columns(&model)
+    );
+}
+
+/// A name read twice is substituted at both sites and reported once.
+#[test]
+fn ruv_magnitude_reads_the_same_assigned_name_twice() {
+    let m = ruv_indiv_mults(
+        &ruv_indiv_model("  ISPK = 3", "PROP_ERR * ISPK * ISPK"),
+        &[70.0],
+    );
+    assert_eq!(m, vec![9.0]);
+    let err = expect_parse_err(&ruv_indiv_model("  ISPK = AGE", "PROP_ERR * ISPK * ISPK"));
+    assert!(err.contains("definition of `ISPK`)"), "{err}");
+}
+
+/// Each name under the node cap, the expression over it: `X10` is 6139 nodes
+/// (`|X_n| = 6·2^n − 5`), read twice it is 12278, so the whole magnitude is
+/// refused on size even though each name alone is accepted.
+#[test]
+fn ruv_magnitude_total_size_is_capped_across_names() {
+    let src = ruv_indiv_model(&ruv_indiv_diamond(10), "PROP_ERR * X10 * X10");
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("expands to more than 10000 expression nodes once its [individual_parameters] names are substituted"),
+        "{err}"
+    );
+    // One read of the same name stays under the cap and is substituted.
+    parse_full_model(&ruv_indiv_model(&ruv_indiv_diamond(10), "PROP_ERR * X10")).unwrap();
+}
+
+/// Every node shape a definition can carry is rebuilt by the substitution —
+/// a function call, a power, and an inline `if` whose condition uses `&&`,
+/// `||`, `!` and `present(...)` — with the earlier name `A` substituted
+/// inside the condition too. Each `WT` row lands on a different arm, so a
+/// shape dropped or left unsubstituted changes a value.
+#[test]
+fn ruv_magnitude_substitutes_through_every_expression_shape() {
+    let src = ruv_indiv_model(
+        "  A = RUV_K\n  ISPK = if (((A > 1) && !(WT < 50)) || (present(WT) && WT > 200)) exp(A)^2 else sqrt(A)",
+        "PROP_ERR * ISPK",
+    );
+    let m = ruv_indiv_mults(&src, &[100.0, 10.0]);
+    approx::assert_relative_eq!(m[0], (3.0f64).exp(), max_relative = 1e-12);
+    approx::assert_relative_eq!(m[1], 1.5f64.sqrt(), max_relative = 1e-12);
+}
+
+/// The refusals no parsed fixture reaches without an optional feature or a
+/// mixture block, pinned on the scope: a definition reading the mixture class,
+/// a neural-network output, or a `Variable` the block does not assign (an
+/// engine built-in the RUV scope would reinterpret).
+#[test]
+fn ruv_indiv_scope_refuses_mixnum_nn_and_unknown_variables() {
+    let stmts = vec![
+        Statement::Assign("M".to_string(), Expression::MixNum),
+        Statement::Assign(
+            "N".to_string(),
+            Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 0,
+            },
+        ),
+        Statement::Assign("U".to_string(), Expression::Variable("ZZZ".to_string())),
+    ];
+    let scope = RuvIndivScope::new(&stmts);
+    for (name, want) in [
+        ("M", "depends on the mixture class (MIXNUM)"),
+        ("N", "depends on a neural-network output"),
+        (
+            "U",
+            "reads `ZZZ`, which is not a theta, a covariate or a name assigned in [individual_parameters]",
+        ),
+    ] {
+        let why = scope.verdict(name).unwrap_err();
+        assert_eq!(why, want, "{name}");
+    }
+}
+
+/// A name whose value depends on η is refused by name, with the reason — not
+/// sent to [covariates], which is the wrong fix for a derived quantity. Also
+/// pins the transitive case: the η reaches `A` only through `CL`.
+#[test]
+fn ruv_magnitude_refuses_an_eta_dependent_individual_parameter() {
+    for (indiv, mag, why) in [
+        ("", "PROP_ERR * CL * 2", "`CL`, which [individual_parameters] assigns but which depends on a random effect"),
+        (
+            "  A = CL * 2",
+            "PROP_ERR * A",
+            "`A`, which [individual_parameters] assigns but which reads `CL`, which depends on a random effect",
+        ),
+    ] {
+        let err = expect_parse_err(&ruv_indiv_model(indiv, mag));
+        assert!(err.contains(why), "{mag}: {err}");
+        assert!(!err.contains("undeclared covariate"), "{mag}: {err}");
+        assert!(!err.contains("declare it in"), "{mag}: {err}");
+    }
+}
+
+/// A θ that [individual_parameters] reassigns under its own name (`theta CL`,
+/// `CL = CL * exp(ETA_CL)`) is read in the error model as the assigned value,
+/// like every other block — not as the raw θ, which θ-first name resolution
+/// would otherwise hand the magnitude silently (#2915 review 4). The η-bearing
+/// spelling is refused by name; the η-free one is substituted, and its value
+/// (θ × WT/70) differs from the raw θ at WT ≠ 70, so a regression back to the
+/// θ leaf fails on the 140 row.
+#[test]
+fn ruv_magnitude_reads_a_theta_reassigned_in_individual_parameters_as_its_value() {
+    let eta_model = r#"
+[parameters]
+  theta CL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * CL)
+"#;
+    let err = expect_parse_err(eta_model);
+    assert!(
+        err.contains(
+            "`CL`, which [individual_parameters] assigns but which depends on a random effect"
+        ),
+        "{err}"
+    );
+
+    // RUV_K defaults to 1.5; the assigned value is RUV_K * WT / 70.
+    let model = ruv_indiv_model("  RUV_K = RUV_K * WT / 70", "PROP_ERR * RUV_K");
+    let got = ruv_indiv_mults(&model, &[70.0, 140.0]);
+    assert_eq!(got, vec![1.5, 3.0]);
+}
+
+/// A name assigned inside an `if/else`, or twice, has no single definition:
+/// refused with that reason. `if` with no `else` and a later override are the
+/// two shapes — both would read a different value than the statement order
+/// produces if the first top-level line were substituted.
+#[test]
+fn ruv_magnitude_refuses_a_conditional_or_reassigned_individual_parameter() {
+    for indiv in [
+        "  if (WT > 70) {\n    ISPK = 2\n  } else {\n    ISPK = 1\n  }",
+        "  ISPK = 1\n  if (WT > 70) {\n    ISPK = 2\n  }",
+    ] {
+        let err = expect_parse_err(&ruv_indiv_model(indiv, "PROP_ERR * ISPK"));
+        assert!(
+            err.contains("`ISPK`, which [individual_parameters] assigns")
+                && err.contains("assigned more than once or inside an `if/else` branch"),
+            "{indiv}: {err}"
+        );
+        assert!(!err.contains("undeclared covariate"), "{indiv}: {err}");
+    }
+}
+
+/// An inlined body is held to the magnitude's own rules: a covariate it reads
+/// must be declared, and the message says the reference came in through the
+/// substituted name (else the user hunts for `AGE` in an error model that
+/// never wrote it).
+#[test]
+fn ruv_magnitude_inlined_body_keeps_the_declared_covariate_rule() {
+    let err = expect_parse_err(&ruv_indiv_model("  ISPK = AGE / 40", "PROP_ERR * ISPK"));
+    assert!(err.contains("undeclared covariate `AGE`"), "{err}");
+    assert!(
+        err.contains("after substituting the [individual_parameters] definition of `ISPK`"),
+        "{err}"
+    );
+}
+
+/// A genuinely undefined name keeps the original error, and the advice now
+/// names both places a name can be defined.
+#[test]
+fn ruv_magnitude_undefined_name_still_rejected() {
+    let err = expect_parse_err(&ruv_indiv_model("", "PROP_ERR * NOPE"));
+    assert!(err.contains("undeclared covariate `NOPE`"), "{err}");
+    assert!(
+        err.contains("declare it in [covariates], or assign it in [individual_parameters]"),
+        "{err}"
+    );
+    assert!(!err.contains("after substituting"), "{err}");
+}
+
 #[test]
 fn test_parse_full_model_block_sigma_single_endpoint_order_mismatch_errs() {
     // Single-endpoint error models use the leading sigma slots positionally, so
@@ -12580,7 +13056,11 @@ fn endpoint_magnitude_keeps_the_plain_line_rules() {
         ("TPF * 2.0", "references no declared sigma"),
         ("PROP_ERR_PK * ADD_ERR_PD", "references multiple sigmas"),
         ("ADD_ERR_PD * ETA_CL", "random effect"),
-        ("ADD_ERR_PD * CL", "undeclared covariate `CL`"),
+        // `CL` is η-bearing in [individual_parameters] (#2915), not undeclared.
+        (
+            "ADD_ERR_PD * CL",
+            "`CL`, which [individual_parameters] assigns",
+        ),
         ("ADD_ERR_PD * IPRED", "may not reference `IPRED`"),
         ("ADD_ERR_PD * NOPE", "undeclared covariate `NOPE`"),
     ] {
@@ -15141,19 +15621,53 @@ fn test_known_block_names_track_the_build_features() {
 /// parser stopped reading it silently, and `nearest_block_name` finds nothing
 /// close enough to suggest (`initial_conditions` is far past edit distance 2),
 /// so the generic path would leave the user with no explanation at all.
+///
+/// It is a warning, not an error (#2913): the block was already inert, so a
+/// stored model carrying one must keep parsing across an upgrade.
 #[test]
-fn test_deprecated_block_is_rejected_with_its_remediation() {
+fn test_deprecated_block_is_a_warning_with_its_remediation() {
     assert_eq!(nearest_block_name("initial_values"), None);
     let src = model_with_extra_block("[initial_values]\n  theta = [0.2, 10.0]\n  sigma = [0.02]\n");
-    let err = parse_model_string(&src).expect_err("deprecated block must be an error");
+    let model = parse_model_string(&src).expect("a deprecated block must not fail the parse");
+    let hits: Vec<&String> = model
+        .parse_warnings
+        .iter()
+        .filter(|w| w.contains("W_DEPRECATED_BLOCK"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", model.parse_warnings);
+    let w = hits[0];
     assert!(
-        err.starts_with("Deprecated block `[initial_values]` (line 16) is no longer read:"),
-        "{err}"
+        w.starts_with("Deprecated block `[initial_values]` (line 16) is ignored:"),
+        "{w}"
     );
-    assert!(err.contains("declared inline in `[parameters]`"), "{err}");
-    assert!(err.contains("delete it"), "{err}");
+    assert!(w.contains("declared inline in `[parameters]`"), "{w}");
+    assert!(w.contains("delete it"), "{w}");
+    assert!(w.contains("never affected the fit"), "{w}");
     // Not the generic bucket: no "valid blocks" dump, no did-you-mean.
-    assert!(!err.contains("Valid blocks"), "{err}");
+    assert!(!w.contains("Valid blocks"), "{w}");
+}
+
+/// The deprecated block's lines are dropped at extraction, so nothing
+/// downstream — the absorption twin re-emits `unnamed` — can read them, and a
+/// repeated header warns once.
+#[test]
+fn test_deprecated_block_lines_are_dropped_at_extraction() {
+    let src = model_with_extra_block(
+        "[initial_values]\n  theta = [0.2, 10.0]\n\n[initial_values]\n  sigma = [0.02]\n",
+    );
+    let extracted = extract_blocks(&src).expect("extracts");
+    assert!(!extracted.unnamed.contains_key("initial_values"));
+    assert!(!extracted.block_lines.contains_key("initial_values"));
+    assert_eq!(extracted.warnings.len(), 1, "{:?}", extracted.warnings);
+}
+
+/// A deprecated block never masks a real header error: an unknown block in the
+/// same file still fails the parse.
+#[test]
+fn test_deprecated_block_does_not_mask_an_unknown_block() {
+    let src = model_with_extra_block("[initial_values]\n  theta = [0.2]\n\n[foo]\n  k = 1\n");
+    let err = parse_model_string(&src).expect_err("unknown block must still be an error");
+    assert!(err.starts_with("Unknown block `[foo]`"), "{err}");
 }
 
 /// An unknown header written with an instance name is echoed as written, so
@@ -32695,13 +33209,20 @@ fn conditional_name_read_by_each_downstream_block_is_refused() {
         let err = refused_with_valid_twin(&src, name);
         assert_conditional_read(&err, name, &format!("named in `{block}`"));
     }
-    // `[error_model]` reads no individual parameter even when it is assigned on
-    // every path (its twin is refused as an undeclared covariate), so only the
-    // message changes: the conditional name is named as such, not as a column.
+    // `[error_model]` reads an individual parameter only through a single
+    // top-level η-free definition (#2915), so a name assigned on every path of
+    // an `if/else` is refused there too — by name, as a branch-assigned value,
+    // not as a column. Only the message differs: the conditional name is named
+    // as such.
     let src =
         cond_ode_model(&s, rhs, "").replace("proportional(PROP_ERR)", "proportional(PROP_ERR * S)");
     let twin_err = parse_err(&else_twin(&src, "S"));
-    assert!(twin_err.contains("undeclared covariate `S`"), "{twin_err}");
+    assert!(
+        twin_err.contains("`S`, which [individual_parameters] assigns")
+            && twin_err.contains("inside an `if/else` branch")
+            && !twin_err.contains("undeclared covariate"),
+        "{twin_err}"
+    );
     assert_conditional_read(&parse_err(&src), "S", "named in `[error_model]`");
 }
 
@@ -39105,4 +39626,185 @@ fn an_ode_scope_remedy_reads_a_data_driven_block_bare() {
             "hazard, index_covariate {index_covariate:?}: {why}"
         );
     }
+}
+
+/// #2766: a θ used only in a `[mixture]` mixing expression is not unused.
+#[test]
+fn a_theta_used_only_in_the_mixing_expression_is_not_flagged_unused() {
+    // Logit form: MIXL appears only in `logit(1) = MIXL`.
+    let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta UNUSED(42.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parsed = parse_full_model(src).expect("parse ok");
+    let unused: Vec<&str> = parsed
+        .model
+        .parse_warnings
+        .iter()
+        .filter(|w| w.contains("not referenced in any model expression"))
+        .map(|w| w.as_str())
+        .collect();
+    assert!(
+        !unused.iter().any(|w| w.contains("'MIXL'")),
+        "MIXL is used in `logit(1) = MIXL` and must not be flagged; got: {unused:?}"
+    );
+    // The straddle: UNUSED really is unused and must still be flagged.
+    assert!(
+        unused.iter().any(|w| w.contains("'UNUSED'")),
+        "UNUSED is declared and used nowhere; got: {unused:?}"
+    );
+}
+
+/// Same as the logit test above, but for the `p(1) = P1` mixing form (#2766).
+#[test]
+fn the_p_form_mixing_theta_is_not_flagged_unused_either() {
+    let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta P1(0.5, 0.001, 0.999)
+  theta UNUSED(42.0)
+  omega ETA_CL ~ 0.05
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  p(1) = P1
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parsed = parse_full_model(src).expect("parse ok");
+    let unused = unused_theta_warnings(&parsed.model.parse_warnings);
+    assert!(
+        !unused.iter().any(|w| w.contains("'P1'")),
+        "P1 is used in `p(1) = P1`; got: {unused:?}"
+    );
+    // The straddle: the check still runs, and still flags a θ nothing reads.
+    assert!(
+        unused.iter().any(|w| w.contains("'UNUSED'")),
+        "UNUSED is declared and used nowhere; got: {unused:?}"
+    );
+}
+
+/// The unused-parameter warnings among `warnings`.
+fn unused_theta_warnings(warnings: &[String]) -> Vec<&str> {
+    warnings
+        .iter()
+        .filter(|w| w.contains("not referenced in any model expression"))
+        .map(|w| w.as_str())
+        .collect()
+}
+
+/// Three mixture classes: a compound mixing expression in the first, a bare θ in the
+/// second, and one θ (`UNUSED`) that nothing reads (#2766).
+const THREE_CLASS_MIXING_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVCL3(9.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXA(0.0, -10.0, 10.0)
+  theta MIXB(0.5, -10.0, 10.0)
+  theta MIXC(0.0, -10.0, 10.0)
+  theta UNUSED(42.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 3
+  logit(1) = MIXA + MIXB
+  logit(2) = MIXC
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else if (MIXNUM == 2) TVCL2 * exp(ETA_CL) else TVCL3 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+/// Every mixing expression is scanned, and every node of each (#2766). A fix that read
+/// only `mixing[0]`, or only an expression's top node, leaves `MIXB` or `MIXC` flagged.
+#[test]
+fn every_theta_of_every_mixing_expression_is_used() {
+    let parsed = parse_full_model(THREE_CLASS_MIXING_MODEL).expect("parse ok");
+    let unused = unused_theta_warnings(&parsed.model.parse_warnings);
+    for name in ["MIXA", "MIXB", "MIXC"] {
+        assert!(
+            !unused.iter().any(|w| w.contains(&format!("'{name}'"))),
+            "{name} is read by a mixing expression and must not be flagged; got: {unused:?}"
+        );
+    }
+    assert!(
+        unused.iter().any(|w| w.contains("'UNUSED'")),
+        "UNUSED is declared and used nowhere; got: {unused:?}"
+    );
+}
+
+/// The user-visible path the changelog names (#2766): `ferx check`'s report
+/// (`validate_model_file`) carries `W_UNUSED_PARAM` for `UNUSED` and for no mixing θ.
+/// The parser test above reads `parse_warnings`; this one reads what a user sees after
+/// `classify_warning` codes them, so a second emitter of the warning would show here.
+#[test]
+fn ferx_check_reports_only_the_truly_unused_theta_of_a_mixture() {
+    use std::io::Write;
+    let mut f = tempfile::Builder::new()
+        .suffix(".ferx")
+        .tempfile()
+        .expect("create temp model");
+    f.write_all(THREE_CLASS_MIXING_MODEL.as_bytes())
+        .expect("write temp model");
+    f.flush().expect("flush temp model");
+    let report = crate::api::validate_model_file(f.path().to_str().expect("utf-8 path"), None);
+    let mut flagged: Vec<String> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "W_UNUSED_PARAM")
+        .map(|d| {
+            d.message
+                .split('\'')
+                .nth(1)
+                .unwrap_or(&d.message)
+                .to_string()
+        })
+        .collect();
+    flagged.sort();
+    assert_eq!(
+        flagged,
+        vec!["UNUSED".to_string()],
+        "{:?}",
+        report.diagnostics
+    );
 }

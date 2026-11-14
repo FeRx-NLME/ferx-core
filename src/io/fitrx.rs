@@ -340,6 +340,10 @@ struct FitWire {
     n_starts: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     multi_start_seed: Option<u64>,
+    /// The per-start records of a multi-start fit (#2867). Absent for a single-start fit,
+    /// and in a bundle written before the field, which then loads with no rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    starts: Vec<crate::types::StartRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     saem_seed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1830,6 +1834,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         optimizer: r.optimizer.clone(),
         n_starts: r.n_starts,
         multi_start_seed: r.multi_start_seed,
+        starts: r.starts.clone(),
         saem_seed: r.saem_seed,
         // `sir_settings.seed` is canonical when SIR ran (#1770): it is the seed the draws
         // used and the one `run_sir` repeats, and the field a caller edits to change a
@@ -2143,7 +2148,7 @@ fn write_predictions_csv<W: Write>(
 
     let mut header = String::from("ID,TIME,DV,PRED,IPRED,CWRES,IWRES");
     if any_npde {
-        header.push_str(",NPDE,NPD");
+        header.push_str(",NPDE,NPD,EPRED,PWRES");
     }
     header.push_str(",EBE_OFV,N_OBS");
     if any_cens {
@@ -2174,6 +2179,10 @@ fn write_predictions_csv<W: Write>(
                 row.push_str(&fmt_f64(sr.npde.get(j).copied().unwrap_or(f64::NAN)));
                 row.push(',');
                 row.push_str(&fmt_f64(sr.npd.get(j).copied().unwrap_or(f64::NAN)));
+                row.push(',');
+                row.push_str(&fmt_f64(sr.epred.get(j).copied().unwrap_or(f64::NAN)));
+                row.push(',');
+                row.push_str(&fmt_f64(sr.pwres.get(j).copied().unwrap_or(f64::NAN)));
             }
             row.push(',');
             row.push_str(&fmt_f64(sr.ofv_contribution));
@@ -2794,6 +2803,8 @@ fn parse_subjects(
             cwres: Vec::new(),
             npde: Vec::new(),
             npd: Vec::new(),
+            epred: Vec::new(),
+            pwres: Vec::new(),
             ofv_contribution: ofv,
             cens: Vec::new(),
             n_obs,
@@ -2836,6 +2847,9 @@ fn parse_subjects(
     // NPDE/NPD are optional — present only when the fit ran with npde_nsim > 0.
     let npde_i = col.get("NPDE").copied();
     let npd_i = col.get("NPD").copied();
+    // EPRED/PWRES (#2871) ride with NPDE; a file written before them carries none.
+    let epred_i = col.get("EPRED").copied();
+    let pwres_i = col.get("PWRES").copied();
     let cens_i = col.get("CENS").copied();
     // Validated per row against the subject we're filling: the ID order check alone
     // can't catch two same-ID blocks written in the wrong order.
@@ -2924,6 +2938,16 @@ fn parse_subjects(
         if let Some(j) = npd_i {
             subjects[idx]
                 .npd
+                .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
+        }
+        if let Some(j) = epred_i {
+            subjects[idx]
+                .epred
+                .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
+        }
+        if let Some(j) = pwres_i {
+            subjects[idx]
+                .pwres
                 .push(fields.get(j).map(|s| parse_opt(s)).unwrap_or(f64::NAN));
         }
         let c = match cens_i {
@@ -3986,6 +4010,7 @@ fn wire_to_fit_result(
         optimizer: w.optimizer,
         n_starts: w.n_starts,
         multi_start_seed: w.multi_start_seed,
+        starts: w.starts,
         saem_seed: w.saem_seed,
         sir_seed: w.sir_seed,
         sir_settings,
@@ -4834,6 +4859,10 @@ mod tests {
         r.subjects[0].npd = vec![0.15, -0.25, 0.35];
         r.subjects[1].npde = vec![-1.0, 1.0];
         r.subjects[1].npd = vec![-0.9, 0.9];
+        r.subjects[0].epred = vec![4.0, 3.0, 2.0];
+        r.subjects[0].pwres = vec![0.5, -0.6, 0.7];
+        r.subjects[1].epred = vec![1.5, 1.25];
+        r.subjects[1].pwres = vec![f64::NAN, f64::NAN];
         let p = dummy_population(&["S1", "S2"], 3);
         save_fit(&r, &p, "src\n", &path, SaveFitOptions::default()).unwrap();
 
@@ -4845,6 +4874,19 @@ mod tests {
             }
             for (x, y) in a.npd.iter().zip(b.npd.iter()) {
                 assert!((x - y).abs() < 1e-6, "npd {x} vs {y}");
+            }
+            // #2871: EPRED / PWRES ride in the same file; a NaN PWRES (a masked
+            // subject) loads back as NaN.
+            assert_eq!(a.epred.len(), b.epred.len(), "subject {} epred len", a.id);
+            assert_eq!(a.pwres.len(), b.pwres.len(), "subject {} pwres len", a.id);
+            for (x, y) in a.epred.iter().zip(&b.epred) {
+                assert!((x - y).abs() < 1e-6, "epred {x} vs {y}");
+            }
+            for (x, y) in a.pwres.iter().zip(&b.pwres) {
+                assert!(
+                    (x.is_nan() && y.is_nan()) || (x - y).abs() < 1e-6,
+                    "pwres {x} vs {y}"
+                );
             }
         }
     }
@@ -4862,6 +4904,7 @@ mod tests {
         for s in &loaded.fit.subjects {
             assert!(s.npde.is_empty(), "npde must stay empty when not written");
             assert!(s.npd.is_empty(), "npd must stay empty when not written");
+            assert!(s.epred.is_empty() && s.pwres.is_empty());
         }
     }
 
@@ -7648,6 +7691,89 @@ mod tests {
             err.to_string(),
             "unsupported .fitrx format_version \"1\"; expected \"2\""
         );
+    }
+
+    /// #2867: the per-start rows of a multi-start fit survive a save and load unchanged —
+    /// a row that ran, one with no OFV, one under a penalty and a failed one with its code —
+    /// and a single-start fit writes no `starts` key, so its `fit.json` is what it was. A
+    /// bundle without the key loads with no rows.
+    #[test]
+    fn the_per_start_rows_round_trip() {
+        use crate::types::StartRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let single = saved(&dir, &minimal_fit_result());
+        assert!(fit_json(&single).get("starts").is_none());
+        assert!(load_fit(&single).unwrap().fit.starts.is_empty());
+
+        // The status is a token and labels, not a typed enum: a reason this build has never
+        // heard of (written by a later one) is read back as it was written.
+        let ran = StartRecord {
+            start: 0,
+            ofv: Some(-221.877048),
+            penalized: false,
+            objective: None,
+            converged: true,
+            status: Some("converged_with_issues".into()),
+            status_reasons: vec!["budget_spent".into(), "a_future_reason".into()],
+            n_iterations: 84,
+            wall_time_secs: 1.25,
+            theta: vec![7.4577, 22.1467],
+            selected: true,
+            error: None,
+            error_code: None,
+        };
+        let mut r = minimal_fit_result();
+        r.n_starts = 4;
+        r.starts = vec![
+            ran.clone(),
+            StartRecord {
+                start: 1,
+                ofv: None,
+                status: Some("converged".into()),
+                status_reasons: Vec::new(),
+                selected: false,
+                ..ran.clone()
+            },
+            StartRecord {
+                start: 2,
+                penalized: true,
+                objective: Some(-200.5),
+                converged: false,
+                status: Some("not_converged".into()),
+                status_reasons: Vec::new(),
+                selected: false,
+                ..ran.clone()
+            },
+            StartRecord {
+                start: 3,
+                ofv: None,
+                penalized: false,
+                objective: None,
+                converged: false,
+                status: None,
+                status_reasons: Vec::new(),
+                n_iterations: 0,
+                wall_time_secs: 0.0,
+                theta: Vec::new(),
+                selected: false,
+                error: Some("n_agq must be at least 1".into()),
+                error_code: Some("E_AGQ_NODES_ZERO".into()),
+            },
+        ];
+        let path = saved(&dir, &r);
+        let json = fit_json(&path);
+        assert_eq!(json["starts"].as_array().map(Vec::len), Some(4));
+        assert_eq!(load_fit(&path).unwrap().fit.starts, r.starts);
+
+        // A start that ended on a non-finite θ must not make the bundle unloadable: the value
+        // is written as `null` and read back as `NaN`.
+        r.starts[2].theta = vec![f64::NAN, 22.1467];
+        let path = saved(&dir, &r);
+        assert!(fit_json(&path)["starts"][2]["theta"][0].is_null());
+        let loaded = load_fit(&path).unwrap().fit.starts;
+        assert!(loaded[2].theta[0].is_nan(), "{:?}", loaded[2].theta);
+        assert_eq!(loaded[2].theta[1], 22.1467);
+        assert_eq!(loaded[3], r.starts[3]);
     }
 
     /// #2695: no key has a default for a file that predates it. A v2 `fit.json` missing

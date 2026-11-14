@@ -15,7 +15,7 @@
 //! nothing with the solve but the objective.
 
 use super::*;
-use crate::estimation::inner_optimizer::run_inner_loop_warm_seeded;
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, PrevEtas};
 use crate::types::FitOptions;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -451,6 +451,7 @@ fn the_profiled_objective_is_the_unprofiled_objective_at_its_own_point() {
             o.inner_restarts,
             InnerHessianSeed::for_options(&o),
             &o,
+            PrevEtas::Placeholder,
         );
         let plain = 2.0
             * crate::estimation::outer_optimizer::pop_nll_opts(
@@ -2545,7 +2546,7 @@ fn level_blocks_over_levels_are_the_theta_hessian() {
     for sidx in 0..free.len() {
         // Well below the stencil's default: the blocks are exact now (#2109), so the
         // oracle's truncation is the whole gap.
-        let floor = fd_step_floor(&hold, &c.model.default_params, free[sidx]);
+        let floor = fd_step_floor(&hold, &c.model, free[sidx]);
         let hs = fd_step(LEVEL_BLOCKS_ORACLE_STEP, x[free[sidx]], floor);
         for a in 0..n {
             let h = hl[a];
@@ -2922,6 +2923,7 @@ fn unprofiled_ofv(p: &crate::api::PreparedRun, params: &ModelParameters) -> f64 
         o.inner_restarts,
         InnerHessianSeed::for_options(&o),
         &o,
+        PrevEtas::Placeholder,
     );
     2.0 * crate::estimation::outer_optimizer::pop_nll_opts(
         model,
@@ -4071,6 +4073,7 @@ fn the_bounded_objective_is_the_frozen_unbounded_objective() {
             o.inner_restarts,
             InnerHessianSeed::for_options(&o),
             &o,
+            PrevEtas::Placeholder,
         );
         let plain = 2.0
             * crate::estimation::outer_optimizer::pop_nll_opts(
@@ -4967,7 +4970,7 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
         .free
         .iter()
         .map(|&i| {
-            let floor = fd_step_floor(&cp.hold, &c.model.default_params, i);
+            let floor = fd_step_floor(&cp.hold, &c.model, i);
             fd_step(LEVEL_BLOCKS_ORACLE_STEP, cp.x_hat[i], floor)
         })
         .collect();
@@ -4977,7 +4980,7 @@ fn level_block_gaps(p: &crate::api::PreparedRun) -> (f64, f64, f64, f64) {
         .free
         .iter()
         .map(|&i| {
-            let floor = fd_step_floor(&cp.hold, &c.model.default_params, i);
+            let floor = fd_step_floor(&cp.hold, &c.model, i);
             fd_step(a_step, cp.x_hat[i], floor)
         })
         .collect();
@@ -5086,7 +5089,7 @@ fn the_schur_profile_hessian_is_the_profile_stencil() {
                 c.solve(&unpack_params(xv, &cp.hold), &warm)
                     .map_or(f64::NAN, |s| s.ofv)
             };
-            let floor = fd_step_floors(&cp.hold, &c.model.default_params);
+            let floor = fd_step_floors(&cp.hold, &c.model);
             let st = fd_ofv_hessian(
                 cp.x_hat.len(),
                 &cp.x_hat,
@@ -6098,6 +6101,7 @@ fn laplace_ofv(p: &crate::api::PreparedRun, params: &ModelParameters, beta: &[f6
         o.inner_restarts,
         InnerHessianSeed::for_options(&o),
         &o,
+        PrevEtas::Placeholder,
     );
     2.0 * crate::estimation::agq::agq_population_nll(
         &p.parsed.model,

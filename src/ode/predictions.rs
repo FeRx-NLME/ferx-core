@@ -2532,8 +2532,9 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
 /// infusion ending at `0.1 + 0.7 = 0.7999999999999999` merges with an `SS=1` record at
 /// `0.8`). The walker still equilibrates the record's state there, and an exact
 /// comparison read the record as not reached for the whole segment — train off, earlier
-/// doses live (PR #1589 review finding 1: −51 % at t = 6). [`Self::at_segment`] is the
-/// only constructor, so no caller can apply the gate without the tolerance.
+/// doses live (PR #1589 review finding 1: −51 % at t = 6). [`Self::at_segment`] and its
+/// indexed twin [`Self::at_segment_indexed`] are the only constructors, and both add the
+/// tolerance in one place (`with_cutoff`), so no caller can apply the gate without it.
 ///
 /// It also carries the **EVID=3/4 reset** (#1587), keyed the same way: on the dose
 /// *record*, never its lagged arrival. NONMEM cancels a dose whose record precedes a reset
@@ -2560,9 +2561,37 @@ impl ResetGate {
     /// `reset_floor` it means no EVID=3/4 reset.
     #[inline]
     pub(crate) fn at_segment(doses: &[DoseEvent], reset_floor: f64, t_seg: f64) -> Self {
+        Self::with_cutoff(reset_floor, t_seg, |reached| {
+            crate::dosing::ss_reset_cutoff(doses, reached)
+        })
+    }
+
+    /// [`Self::at_segment`], with the `SS=1` cutoff found by binary search in `index`
+    /// (built from these `doses`) instead of a scan of every dose (#2754). The same
+    /// tolerance, the same cutoff, so the same gate.
+    #[inline]
+    pub(crate) fn at_segment_indexed(
+        index: &crate::dosing::DoseIndex,
+        doses: &[DoseEvent],
+        reset_floor: f64,
+        t_seg: f64,
+    ) -> Self {
+        Self::with_cutoff(reset_floor, t_seg, |reached| {
+            index.ss_cutoff(doses, reached)
+        })
+    }
+
+    /// The one place the `EVENT_MATCH_TOL` reach is added: `cutoff` maps the reached time
+    /// to the `SS=1` record in force there.
+    #[inline]
+    fn with_cutoff(
+        reset_floor: f64,
+        t_seg: f64,
+        cutoff: impl FnOnce(f64) -> Option<usize>,
+    ) -> Self {
         let reached = t_seg + EVENT_MATCH_TOL;
         Self {
-            cutoff: crate::dosing::ss_reset_cutoff(doses, reached),
+            cutoff: cutoff(reached),
             reached,
             reset_floor,
             t_seg,
@@ -4687,24 +4716,58 @@ fn apply_prescheduled_boluses_at(
         // the arrival event, so marking it here closes the whole arrival (#1186).
         applied[i] = true;
         first_event = first_event.min(dose.time + dose_lagtimes[i]);
-        let live = gate.live(doses, i);
-        if live {
-            off.retain(|&c| c != dose.cmt_idx());
-        }
-        if !is_real_infusion(dose) && !input_rate_consumes_cmt(ode, dose.cmt_raw()) && live {
-            // dose.cmt is 1-based; state indices are 0-based. A dose into a built-in
-            // input-rate compartment (transit/etc.) is delivered as R_in over time by
-            // the wrapped RHS — not as a bolus — so it's skipped to avoid double-count.
-            // `cmt_idx` maps CMT=0 → compartment 1 (NONMEM default, #899).
-            let cmt_idx = dose.cmt_idx();
-            // Unreachable from a validated call (`check_dose_compartments` rejects
-            // `cmt > n_states` since #899); kept as a bound for hand-built `OdeSpec`s.
-            if cmt_idx < ode.n_states {
-                u[cmt_idx] += dose_f_bio[i] * dose.amt;
-            }
+        if gate.live(doses, i) {
+            land_live_arrival(u, ode, dose, dose_f_bio[i], off);
         }
     }
     first_event
+}
+
+/// A **live** dose arrival turns its compartment back on (#2732): `dose`'s compartment
+/// leaves the off list `off`. The one spelling of the rule in the crate (#2811), for the
+/// `f64` walks through [`land_live_arrival`] and for the dual walk
+/// (`sens::ode_provider`), so the value and its gradient cannot switch a compartment on at
+/// different arrivals. The caller has already asked [`ResetGate::live`].
+#[inline]
+pub(crate) fn turn_on_at_live_arrival(off: &mut Vec<usize>, dose: &DoseEvent) {
+    let cmt_idx = dose.cmt_idx();
+    off.retain(|&c| c != cmt_idx);
+}
+
+/// What a **live** dose arrival does to the state: it turns its compartment back on, and a
+/// bolus adds `F·AMT` (#2732, #2811). The caller has already asked [`ResetGate::live`]; a
+/// dead dose must not reach this.
+///
+/// The turn-on is for every kind of dose (bolus, infusion, a dose into an input-rate
+/// compartment): `nonmem_anchor/cmt_toggle.ctl` holds the amount at zero across a lag and
+/// restarts it at the arrival, not at the record. The jump is for a bolus alone. A real
+/// infusion is injected as a `+rate` term by `active_infusions`, and a dose into a built-in
+/// input-rate compartment (transit etc.) is delivered as `R_in` by the wrapped RHS, so
+/// adding it here would count it twice.
+///
+/// The one spelling for every `f64` state walk: [`apply_prescheduled_boluses_at`] (the
+/// static dense engine, the adaptive driver and, since #2811, its time-varying replay) and
+/// [`event_driven_walk`]'s dose arm. The dual walk (`sens::ode_provider`, the `K_DOSE` arm)
+/// shares the turn-on through [`turn_on_at_live_arrival`] and keeps its own jump, which is
+/// over dual numbers and carries the lag saltation.
+fn land_live_arrival(
+    u: &mut [f64],
+    ode: &OdeSpec,
+    dose: &DoseEvent,
+    f_bio: f64,
+    off: &mut Vec<usize>,
+) {
+    turn_on_at_live_arrival(off, dose);
+    // dose.cmt is 1-based; state indices are 0-based. `cmt_idx` maps CMT=0 → compartment 1
+    // (NONMEM default, #899).
+    let cmt_idx = dose.cmt_idx();
+    if !is_real_infusion(dose) && !input_rate_consumes_cmt(ode, dose.cmt_raw()) {
+        // Unreachable from a validated call (`check_dose_compartments` rejects
+        // `cmt > n_states` since #899); kept as a bound for hand-built `OdeSpec`s.
+        if cmt_idx < ode.n_states {
+            u[cmt_idx] += f_bio * dose.amt;
+        }
+    }
 }
 
 /// Apply every pre-scheduled dose landing at `t_start` to the state `u`, in the order the
@@ -5847,9 +5910,11 @@ pub(crate) fn ode_predictions_adaptive_impl(
     // Per-decision occasion PK + per-window eta for the IOV path (#701). `Some` ⇒
     // draw-time κ varies by decision window: `decision_pk[g]` is the PK at decision g
     // under occasion g's κ (drives the pre-dose readout, the injected dose's F, and
-    // the LOCF carry into the following segment), and `eta_occ[g]` is the full
+    // the LOCF carry past the subject's last record), and `eta_occ[g]` is the full
     // `[η_bsv | κ_g]` threaded into `read_observable` / `integrate_segment` for every
-    // event in window g. `None` on both ⇒ no IOV, byte-identical to the pre-#701 path
+    // segment a record of occasion g ends — so the window after decision g runs under
+    // κ_{g+1} when a record sits on decision g+1 (#2771). `None` on both ⇒ no IOV,
+    // byte-identical to the pre-#701 path
     // (the fixed `eta` is used throughout). IOV implies `event_pk = Some` (κ makes PK
     // per-occasion, so obs / pk-only records carry their occasion snapshot).
     decision_pk: Option<&[PkParams]>,
@@ -6320,8 +6385,9 @@ pub(crate) fn ode_predictions_adaptive_impl(
 
         // #701 (IOV): a decision break opens its occasion window `g`. Set the LOCF PK
         // + occasion to occasion g's snapshot so the pre-dose readout, the injected
-        // dose's F, and any following non-record segment all use occasion g's
-        // parameters — not the previous occasion carried in `last_pk`/`last_occ`.
+        // dose's F, and any following segment PAST THE LAST RECORD all use occasion g's
+        // parameters — not the previous occasion carried in `last_pk`/`last_occ`. A
+        // segment with a record ahead takes that record's instead (#1073, #2771).
         // Unconditional (every decision break, including holds and post-`Stop`, so
         // every event reads its window's κ). The readout below then reads this snapshot.
         if let (Some(dp), Some(&g)) = (decision_pk, decision_index_of.get(&t_start.to_bits())) {
@@ -7425,7 +7491,6 @@ fn adaptive_frozen_replay_tv(
     dose_f: &[f64],
     extra_breaks: &[f64],
 ) -> Vec<f64> {
-    let n = ode.n_states;
     let n_obs = subject.obs_times.len();
     let iov = eta_occ.is_some();
 
@@ -7599,7 +7664,7 @@ fn adaptive_frozen_replay_tv(
 
         // #701: open a decision window here, mirroring the driver — set the LOCF PK +
         // occasion to this decision's occasion snapshot so the coincident observation,
-        // and any following non-record segment, read occasion g's κ.
+        // and any following segment past the last record, read occasion g's κ.
         if let (Some(dp), Some(&g)) = (decision_pk, decision_index_of.get(&t_start.to_bits())) {
             last_pk = dp[g];
             last_occ = Some(g);
@@ -7662,31 +7727,31 @@ fn adaptive_frozen_replay_tv(
         // the last time is silently dropped here (the frozen-replay verifier caught
         // exactly this). Infusions add nothing here — `integrate_segment`'s
         // `active_infusions` delivers them over every segment they span.
-        for (i, d) in subject.doses.iter().enumerate() {
-            if applied[i] {
-                continue;
-            }
-            if !event_on_break(d.time, t_start, t_next) {
-                continue;
-            }
-            applied[i] = true;
-            first_event = first_event.min(d.time);
-            // The arrival turns its compartment back on (#2753), as in the driver's
-            // `apply_prescheduled_boluses_at`. Without its `ResetGate::live` test: every dose
-            // here is lag-free and fires at its own record, which no EVID=3/4 reset reached
-            // there can postdate, and no off row stops at its record (the reader keeps data
-            // rows off a dose's TIME; a controller dose takes `CoTimedOff::After`). Measured:
-            // the gate could not change the answer for any input that reaches it (review r1
-            // #3). If a lagged base dose is ever admitted on this path, the driver keeps its
-            // gate, and the verifier refuses the run rather than return a wrong value.
-            off_states.retain(|&c| c != d.cmt_idx());
-            if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
-                let cmt_idx = d.cmt_idx();
-                if cmt_idx < n {
-                    u[cmt_idx] += dose_f[i] * d.amt;
-                }
-            }
-        }
+        //
+        // The driver's own pass (#2811), so the two cannot apply an arrival differently. It
+        // brings the `ResetGate::live` test the hand-rolled loop here lacked, and that test
+        // is reachable: an `ADDL`-implied dose takes its `off_at` from its parent's record,
+        // so an off row inside the train kills the rest of it, and an in-memory subject can
+        // hold an off row at exactly a base dose's time. The driver skipped those doses and
+        // the loop applied them, so the verifier refused a correct run. The gate's other two
+        // tests cannot fire here. No `SS=1` dose reaches this path. And no reset floor can
+        // postdate a dose's record: the floor is a break this walk has visited, so it is at
+        // or before the break the dose fires at, and that break is at or before the dose's
+        // time (a lag-free dose's time is pushed as a break, and the dedup keeps the lower
+        // of a merged pair), while `evid_reset_live` is `record >= floor`.
+        // `dose_lagtimes` is all zeros, so the helper's lagged arrival is `d.time`.
+        first_event = first_event.min(apply_prescheduled_boluses_at(
+            &mut u,
+            ode,
+            &subject.doses,
+            &dose_lagtimes,
+            dose_f,
+            t_start,
+            t_next,
+            reset_floor,
+            &mut applied,
+            &mut off_states,
+        ));
 
         // Record obs read *at* the left boundary (post-dose) with each observation's own
         // per-event PK (consistent with the state propagated into this boundary). Same
@@ -8517,23 +8582,16 @@ fn event_driven_walk(
                     let chz_before = chz_snapshot(ode, &u);
                     u = equilibrate_ss_state(ode, &dose_pk.values, d, &opts, &chz_before);
                 }
-                // A dose turns its compartment on when it arrives, not at its record:
-                // `nonmem_anchor/cmt_toggle.ctl` holds the amount at zero, with no inflow,
-                // across the lag.
-                off_states.retain(|&c| c != d.cmt_idx());
-                // Boluses: add amt to state. Infusions: no instantaneous
-                // change — handled via the wrapped RHS for segments inside
-                // [d.time, d.time + d.duration]. A dose into a built-in
-                // input-rate compartment (transit/etc.) is delivered as R_in
-                // over time by the wrapped RHS, so it's skipped here too.
-                if !is_real_infusion(d) && !input_rate_consumes_cmt(ode, d.cmt_raw()) {
-                    let cmt_idx = d.cmt_idx();
-                    if cmt_idx < n {
-                        // Bioavailability resolved per dose compartment (`Fn`),
-                        // precomputed from `pk_at_dose` alongside the lagtimes.
-                        u[cmt_idx] += dose_f_bio[idx] * d.amt;
-                    }
-                }
+                // A dose turns its compartment on when it arrives, not at its record
+                // (`nonmem_anchor/cmt_toggle.ctl` holds the amount at zero, with no inflow,
+                // across the lag), and a bolus adds `F·AMT`: the same kernel the dense
+                // walks call (#2811). Only the kernel is shared, not
+                // `apply_prescheduled_boluses_at`: this walk handles one arrival per
+                // event, and equilibrates an `SS=1` dose between the gate above and the
+                // jump, where the dense walks run that in a separate pass before theirs.
+                // Bioavailability is resolved per dose compartment (`Fn`), precomputed
+                // from `pk_at_dose` alongside the lagtimes.
+                land_live_arrival(&mut u, ode, d, dose_f_bio[idx], &mut off_states);
                 // The arrival is not a record: it must NOT become `last_pk`.
             }
             Kind::Obs => {

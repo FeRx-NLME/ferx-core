@@ -75,6 +75,40 @@ pub ferx_core::api::ReaderSettings::ignore_subjects: alloc::vec::Vec<alloc::stri
 pub ferx_core::api::ReaderSettings::iov_column: core::option::Option<alloc::string::String>
 impl ferx_core::ReaderSettings
 pub fn ferx_core::ReaderSettings::from_parsed(parsed: &ferx_core::ParsedModel) -> Self
+pub struct ferx_core::api::RtteMcfBand
+pub ferx_core::api::RtteMcfBand::grid: alloc::vec::Vec<f64>
+pub ferx_core::api::RtteMcfBand::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::RtteMcfBand::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::RtteMcfBand::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::RtteMcfBand::n_used: alloc::vec::Vec<usize>
+pub ferx_core::api::RtteMcfBand::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::RtteMcfBand::observed: ferx_core::stats::km::McfCurve
+pub struct ferx_core::api::RtteOrderBand
+pub ferx_core::api::RtteOrderBand::grid: alloc::vec::Vec<f64>
+pub ferx_core::api::RtteOrderBand::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::RtteOrderBand::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::RtteOrderBand::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::RtteOrderBand::n_subjects: usize
+pub ferx_core::api::RtteOrderBand::n_used: alloc::vec::Vec<usize>
+pub ferx_core::api::RtteOrderBand::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::RtteOrderBand::observed: ferx_core::stats::km::KmCurve
+pub ferx_core::api::RtteOrderBand::order: usize
+pub struct ferx_core::api::RtteVpc
+pub ferx_core::api::RtteVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::api::RtteVpc::cmt: usize
+pub ferx_core::api::RtteVpc::horizon: f64
+pub ferx_core::api::RtteVpc::max_order: usize
+pub ferx_core::api::RtteVpc::n_sim: usize
+pub ferx_core::api::RtteVpc::probs: [f64; 3]
+pub ferx_core::api::RtteVpc::strata: alloc::vec::Vec<ferx_core::RtteVpcStratum>
+pub ferx_core::api::RtteVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::api::RtteVpcStratum
+pub ferx_core::api::RtteVpcStratum::absolute: alloc::vec::Vec<ferx_core::RtteOrderBand>
+pub ferx_core::api::RtteVpcStratum::gap: alloc::vec::Vec<ferx_core::RtteOrderBand>
+pub ferx_core::api::RtteVpcStratum::label: alloc::string::String
+pub ferx_core::api::RtteVpcStratum::mcf: ferx_core::RtteMcfBand
+pub ferx_core::api::RtteVpcStratum::n_subjects: usize
+pub ferx_core::api::RtteVpcStratum::value: core::option::Option<f64>
 pub struct ferx_core::api::RunOverrides
 pub ferx_core::api::RunOverrides::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
 pub ferx_core::api::RunOverrides::threads: core::option::Option<usize>
@@ -84,6 +118,7 @@ pub ferx_core::api::SimulateOptions::iov_occasion: core::option::Option<ferx_cor
 pub ferx_core::api::SimulateOptions::match_method: core::option::Option<ferx_core::propensity_match::MatchMethod>
 pub ferx_core::api::SimulateOptions::seed: core::option::Option<u64>
 pub struct ferx_core::api::SimulateUncertaintyOptions
+pub ferx_core::api::SimulateUncertaintyOptions::horizon: core::option::Option<f64>
 pub ferx_core::api::SimulateUncertaintyOptions::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
 pub ferx_core::api::SimulateUncertaintyOptions::n_sim_per_draw: usize
 pub ferx_core::api::SimulateUncertaintyOptions::n_uncertainty_draws: usize
@@ -162,6 +197,17 @@ pub ferx_core::api::TteVpcStratum::n_used: alloc::vec::Vec<usize>
 pub ferx_core::api::TteVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::api::TteVpcStratum::observed: ferx_core::stats::km::KmCurve
 pub ferx_core::api::TteVpcStratum::value: core::option::Option<f64>
+pub struct ferx_core::api::VpcRtteOptions
+pub ferx_core::api::VpcRtteOptions::censoring: ferx_core::VpcCensoring
+pub ferx_core::api::VpcRtteOptions::cmt: core::option::Option<usize>
+pub ferx_core::api::VpcRtteOptions::grid: ferx_core::VpcGrid
+pub ferx_core::api::VpcRtteOptions::max_order: core::option::Option<usize>
+pub ferx_core::api::VpcRtteOptions::n_sim: usize
+pub ferx_core::api::VpcRtteOptions::probs: [f64; 3]
+pub ferx_core::api::VpcRtteOptions::sim: ferx_core::SimulateOptions
+pub ferx_core::api::VpcRtteOptions::stratify: ferx_core::VpcStratify
+impl core::default::Default for ferx_core::VpcRtteOptions
+pub fn ferx_core::VpcRtteOptions::default() -> Self
 pub struct ferx_core::api::VpcTteOptions
 pub ferx_core::api::VpcTteOptions::censoring: ferx_core::VpcCensoring
 pub ferx_core::api::VpcTteOptions::cmt: core::option::Option<usize>
@@ -223,6 +269,7 @@ pub fn ferx_core::api::theta_level_values(model: &ferx_core::CompiledModel, thet
 pub fn ferx_core::api::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_output_columns(model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
+pub fn ferx_core::api::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
 pub mod ferx_core::build_info
 pub enum ferx_core::build_info::GradientMethodKind
@@ -2409,6 +2456,18 @@ pub ferx_core::stats::km::KmInputError::LengthMismatch::times: usize
 impl core::error::Error for ferx_core::stats::km::KmInputError
 impl core::fmt::Display for ferx_core::stats::km::KmInputError
 pub fn ferx_core::stats::km::KmInputError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub enum ferx_core::stats::km::McfInputError
+pub ferx_core::stats::km::McfInputError::BadEventTime
+pub ferx_core::stats::km::McfInputError::BadEventTime::index: usize
+pub ferx_core::stats::km::McfInputError::BadEventTime::value: f64
+pub ferx_core::stats::km::McfInputError::BadFollowUpEnd
+pub ferx_core::stats::km::McfInputError::BadFollowUpEnd::index: usize
+pub ferx_core::stats::km::McfInputError::BadFollowUpEnd::value: f64
+pub ferx_core::stats::km::McfInputError::EventAfterFollowUp
+pub ferx_core::stats::km::McfInputError::EventAfterFollowUp::time: f64
+impl core::error::Error for ferx_core::stats::km::McfInputError
+impl core::fmt::Display for ferx_core::stats::km::McfInputError
+pub fn ferx_core::stats::km::McfInputError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct ferx_core::stats::km::KmCurve
 pub ferx_core::stats::km::KmCurve::cumhaz: alloc::vec::Vec<f64>
 pub ferx_core::stats::km::KmCurve::n_censor: alloc::vec::Vec<usize>
@@ -2418,15 +2477,24 @@ pub ferx_core::stats::km::KmCurve::surv: alloc::vec::Vec<f64>
 pub ferx_core::stats::km::KmCurve::time: alloc::vec::Vec<f64>
 impl ferx_core::stats::km::KmCurve
 pub fn ferx_core::stats::km::KmCurve::at(&self, t: f64) -> core::option::Option<f64>
+pub struct ferx_core::stats::km::McfCurve
+pub ferx_core::stats::km::McfCurve::mcf: alloc::vec::Vec<f64>
+pub ferx_core::stats::km::McfCurve::n_event: alloc::vec::Vec<usize>
+pub ferx_core::stats::km::McfCurve::n_risk: alloc::vec::Vec<usize>
+pub ferx_core::stats::km::McfCurve::time: alloc::vec::Vec<f64>
+impl ferx_core::stats::km::McfCurve
+pub fn ferx_core::stats::km::McfCurve::at(&self, t: f64) -> core::option::Option<f64>
 pub struct ferx_core::stats::km::VpcBand
 pub ferx_core::stats::km::VpcBand::hi: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::stats::km::VpcBand::lo: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::stats::km::VpcBand::med: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::stats::km::VpcBand::n_used: alloc::vec::Vec<usize>
 pub fn ferx_core::stats::km::kaplan_meier(times: &[f64], events: &[bool]) -> core::result::Result<ferx_core::stats::km::KmCurve, ferx_core::stats::km::KmInputError>
+pub fn ferx_core::stats::km::mean_cumulative(event_times: &[f64], follow_up_ends: &[f64]) -> core::result::Result<ferx_core::stats::km::McfCurve, ferx_core::stats::km::McfInputError>
 pub fn ferx_core::stats::km::min_curves_for(probs: [f64; 3]) -> usize
 pub fn ferx_core::stats::km::probs_valid(probs: [f64; 3]) -> bool
 pub fn ferx_core::stats::km::vpc_band(curves: &[ferx_core::stats::km::KmCurve], grid: &[f64], probs: [f64; 3]) -> core::result::Result<ferx_core::stats::km::VpcBand, ferx_core::stats::km::KmInputError>
+pub fn ferx_core::stats::km::vpc_band_mcf(curves: &[ferx_core::stats::km::McfCurve], grid: &[f64], probs: [f64; 3]) -> core::result::Result<ferx_core::stats::km::VpcBand, ferx_core::stats::km::KmInputError>
 pub mod ferx_core::stats::likelihood
 pub fn ferx_core::stats::likelihood::apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[core::option::Option<f64>])
 pub fn ferx_core::stats::likelihood::build_block_diag_omega(omega_bsv: &nalgebra::base::alias::DMatrix<f64>, omega_iov: &nalgebra::base::alias::DMatrix<f64>, n_occasions: usize) -> nalgebra::base::alias::DMatrix<f64>
@@ -2450,8 +2518,10 @@ pub fn ferx_core::stats::likelihood::iov_occasion_groups(subject: &ferx_core::Su
 pub fn ferx_core::stats::likelihood::split_obs_by_occasion(subject: &ferx_core::Subject) -> alloc::vec::Vec<(u32, alloc::vec::Vec<usize>)>
 pub mod ferx_core::stats::npde
 pub struct ferx_core::stats::npde::SubjectNpde
+pub ferx_core::stats::npde::SubjectNpde::epred: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::npd: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::npde: alloc::vec::Vec<f64>
+pub ferx_core::stats::npde::SubjectNpde::pwres: alloc::vec::Vec<f64>
 pub fn ferx_core::stats::npde::compute_npde_npd(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::compute_npde_npd_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<(alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, alloc::vec::Vec<alloc::string::String>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::effective_seed(seed: core::option::Option<u64>) -> u64
@@ -3564,6 +3634,7 @@ pub ferx_core::types::FitResult::sir_ess: core::option::Option<f64>
 pub ferx_core::types::FitResult::sir_resamples_packed: core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
 pub ferx_core::types::FitResult::sir_seed: core::option::Option<u64>
 pub ferx_core::types::FitResult::sir_settings: core::option::Option<ferx_core::estimation::sir::SirSettings>
+pub ferx_core::types::FitResult::starts: alloc::vec::Vec<ferx_core::StartRecord>
 pub ferx_core::types::FitResult::stationary_start: bool
 pub ferx_core::types::FitResult::subjects: alloc::vec::Vec<ferx_core::SubjectResult>
 pub ferx_core::types::FitResult::theta: alloc::vec::Vec<f64>
@@ -3814,6 +3885,20 @@ pub ferx_core::types::SimulationSpec::horizon: core::option::Option<f64>
 pub ferx_core::types::SimulationSpec::n_subjects: usize
 pub ferx_core::types::SimulationSpec::obs_times: alloc::vec::Vec<f64>
 pub ferx_core::types::SimulationSpec::seed: u64
+pub struct ferx_core::types::StartRecord
+pub ferx_core::types::StartRecord::converged: bool
+pub ferx_core::types::StartRecord::error: core::option::Option<alloc::string::String>
+pub ferx_core::types::StartRecord::error_code: core::option::Option<alloc::string::String>
+pub ferx_core::types::StartRecord::n_iterations: usize
+pub ferx_core::types::StartRecord::objective: core::option::Option<f64>
+pub ferx_core::types::StartRecord::ofv: core::option::Option<f64>
+pub ferx_core::types::StartRecord::penalized: bool
+pub ferx_core::types::StartRecord::selected: bool
+pub ferx_core::types::StartRecord::start: usize
+pub ferx_core::types::StartRecord::status: core::option::Option<alloc::string::String>
+pub ferx_core::types::StartRecord::status_reasons: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::types::StartRecord::theta: alloc::vec::Vec<f64>
+pub ferx_core::types::StartRecord::wall_time_secs: f64
 pub struct ferx_core::types::Subject
 pub ferx_core::types::Subject::cens: alloc::vec::Vec<i8>
 pub ferx_core::types::Subject::cmt_toggles: alloc::vec::Vec<ferx_core::CmtToggle>
@@ -3866,6 +3951,7 @@ pub ferx_core::types::SubjectResult::cens: alloc::vec::Vec<i8>
 pub ferx_core::types::SubjectResult::compartment_states: alloc::vec::Vec<alloc::vec::Vec<f64>>
 pub ferx_core::types::SubjectResult::cwres: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::discrete_rows: alloc::vec::Vec<ferx_core::DiscreteObsDiagnostic>
+pub ferx_core::types::SubjectResult::epred: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::eta: nalgebra::base::alias::DVector<f64>
 pub ferx_core::types::SubjectResult::extra_columns: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<f64>)>
 pub ferx_core::types::SubjectResult::id: alloc::string::String
@@ -3879,6 +3965,7 @@ pub ferx_core::types::SubjectResult::ofv_contribution: f64
 pub ferx_core::types::SubjectResult::per_obs_tad: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::pmix: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::types::SubjectResult::pred: alloc::vec::Vec<f64>
+pub ferx_core::types::SubjectResult::pwres: alloc::vec::Vec<f64>
 pub ferx_core::types::SubjectResult::tte_rows: alloc::vec::Vec<ferx_core::TteObsDiagnostic>
 pub struct ferx_core::types::ThetaBlocks
 impl ferx_core::parser::model_parser::ThetaBlocks
@@ -5237,6 +5324,7 @@ pub ferx_core::FitResult::sir_ess: core::option::Option<f64>
 pub ferx_core::FitResult::sir_resamples_packed: core::option::Option<alloc::vec::Vec<alloc::vec::Vec<f64>>>
 pub ferx_core::FitResult::sir_seed: core::option::Option<u64>
 pub ferx_core::FitResult::sir_settings: core::option::Option<ferx_core::estimation::sir::SirSettings>
+pub ferx_core::FitResult::starts: alloc::vec::Vec<ferx_core::StartRecord>
 pub ferx_core::FitResult::stationary_start: bool
 pub ferx_core::FitResult::subjects: alloc::vec::Vec<ferx_core::SubjectResult>
 pub ferx_core::FitResult::theta: alloc::vec::Vec<f64>
@@ -5538,6 +5626,40 @@ pub struct ferx_core::ResidualSerial
 pub ferx_core::ResidualSerial::by: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::ResidualSerial::kind: ferx_core::ResidualSerialKind
 pub ferx_core::ResidualSerial::rho_theta: usize
+pub struct ferx_core::RtteMcfBand
+pub ferx_core::RtteMcfBand::grid: alloc::vec::Vec<f64>
+pub ferx_core::RtteMcfBand::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::RtteMcfBand::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::RtteMcfBand::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::RtteMcfBand::n_used: alloc::vec::Vec<usize>
+pub ferx_core::RtteMcfBand::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::RtteMcfBand::observed: ferx_core::stats::km::McfCurve
+pub struct ferx_core::RtteOrderBand
+pub ferx_core::RtteOrderBand::grid: alloc::vec::Vec<f64>
+pub ferx_core::RtteOrderBand::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::RtteOrderBand::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::RtteOrderBand::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::RtteOrderBand::n_subjects: usize
+pub ferx_core::RtteOrderBand::n_used: alloc::vec::Vec<usize>
+pub ferx_core::RtteOrderBand::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::RtteOrderBand::observed: ferx_core::stats::km::KmCurve
+pub ferx_core::RtteOrderBand::order: usize
+pub struct ferx_core::RtteVpc
+pub ferx_core::RtteVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::RtteVpc::cmt: usize
+pub ferx_core::RtteVpc::horizon: f64
+pub ferx_core::RtteVpc::max_order: usize
+pub ferx_core::RtteVpc::n_sim: usize
+pub ferx_core::RtteVpc::probs: [f64; 3]
+pub ferx_core::RtteVpc::strata: alloc::vec::Vec<ferx_core::RtteVpcStratum>
+pub ferx_core::RtteVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::RtteVpcStratum
+pub ferx_core::RtteVpcStratum::absolute: alloc::vec::Vec<ferx_core::RtteOrderBand>
+pub ferx_core::RtteVpcStratum::gap: alloc::vec::Vec<ferx_core::RtteOrderBand>
+pub ferx_core::RtteVpcStratum::label: alloc::string::String
+pub ferx_core::RtteVpcStratum::mcf: ferx_core::RtteMcfBand
+pub ferx_core::RtteVpcStratum::n_subjects: usize
+pub ferx_core::RtteVpcStratum::value: core::option::Option<f64>
 pub struct ferx_core::RunOverrides
 pub ferx_core::RunOverrides::inits_from_nca: core::option::Option<ferx_core::suggest_start::NcaInit>
 pub ferx_core::RunOverrides::threads: core::option::Option<usize>
@@ -5585,6 +5707,7 @@ pub ferx_core::SimulateOptions::iov_occasion: core::option::Option<ferx_core::Io
 pub ferx_core::SimulateOptions::match_method: core::option::Option<ferx_core::propensity_match::MatchMethod>
 pub ferx_core::SimulateOptions::seed: core::option::Option<u64>
 pub struct ferx_core::SimulateUncertaintyOptions
+pub ferx_core::SimulateUncertaintyOptions::horizon: core::option::Option<f64>
 pub ferx_core::SimulateUncertaintyOptions::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
 pub ferx_core::SimulateUncertaintyOptions::n_sim_per_draw: usize
 pub ferx_core::SimulateUncertaintyOptions::n_uncertainty_draws: usize
@@ -5625,6 +5748,20 @@ pub ferx_core::SimulationSpec::horizon: core::option::Option<f64>
 pub ferx_core::SimulationSpec::n_subjects: usize
 pub ferx_core::SimulationSpec::obs_times: alloc::vec::Vec<f64>
 pub ferx_core::SimulationSpec::seed: u64
+pub struct ferx_core::StartRecord
+pub ferx_core::StartRecord::converged: bool
+pub ferx_core::StartRecord::error: core::option::Option<alloc::string::String>
+pub ferx_core::StartRecord::error_code: core::option::Option<alloc::string::String>
+pub ferx_core::StartRecord::n_iterations: usize
+pub ferx_core::StartRecord::objective: core::option::Option<f64>
+pub ferx_core::StartRecord::ofv: core::option::Option<f64>
+pub ferx_core::StartRecord::penalized: bool
+pub ferx_core::StartRecord::selected: bool
+pub ferx_core::StartRecord::start: usize
+pub ferx_core::StartRecord::status: core::option::Option<alloc::string::String>
+pub ferx_core::StartRecord::status_reasons: alloc::vec::Vec<alloc::string::String>
+pub ferx_core::StartRecord::theta: alloc::vec::Vec<f64>
+pub ferx_core::StartRecord::wall_time_secs: f64
 pub struct ferx_core::Strictness
 pub ferx_core::Strictness::max_condition_number: core::option::Option<f64>
 pub ferx_core::Strictness::max_correlation: core::option::Option<f64>
@@ -5692,6 +5829,7 @@ pub ferx_core::SubjectResult::cens: alloc::vec::Vec<i8>
 pub ferx_core::SubjectResult::compartment_states: alloc::vec::Vec<alloc::vec::Vec<f64>>
 pub ferx_core::SubjectResult::cwres: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::discrete_rows: alloc::vec::Vec<ferx_core::DiscreteObsDiagnostic>
+pub ferx_core::SubjectResult::epred: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::eta: nalgebra::base::alias::DVector<f64>
 pub ferx_core::SubjectResult::extra_columns: alloc::vec::Vec<(alloc::string::String, alloc::vec::Vec<f64>)>
 pub ferx_core::SubjectResult::id: alloc::string::String
@@ -5705,6 +5843,7 @@ pub ferx_core::SubjectResult::ofv_contribution: f64
 pub ferx_core::SubjectResult::per_obs_tad: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::pmix: core::option::Option<alloc::vec::Vec<f64>>
 pub ferx_core::SubjectResult::pred: alloc::vec::Vec<f64>
+pub ferx_core::SubjectResult::pwres: alloc::vec::Vec<f64>
 pub ferx_core::SubjectResult::tte_rows: alloc::vec::Vec<ferx_core::TteObsDiagnostic>
 pub struct ferx_core::SuggestedStart
 pub ferx_core::SuggestedStart::params: ferx_core::ModelParameters
@@ -5783,6 +5922,17 @@ pub ferx_core::ViResult::n_mc_samples: usize
 pub ferx_core::ViResult::neg_two_elbo: f64
 pub ferx_core::ViResult::objective_trace: alloc::vec::Vec<f64>
 pub ferx_core::ViResult::superseded_by: core::option::Option<alloc::string::String>
+pub struct ferx_core::VpcRtteOptions
+pub ferx_core::VpcRtteOptions::censoring: ferx_core::VpcCensoring
+pub ferx_core::VpcRtteOptions::cmt: core::option::Option<usize>
+pub ferx_core::VpcRtteOptions::grid: ferx_core::VpcGrid
+pub ferx_core::VpcRtteOptions::max_order: core::option::Option<usize>
+pub ferx_core::VpcRtteOptions::n_sim: usize
+pub ferx_core::VpcRtteOptions::probs: [f64; 3]
+pub ferx_core::VpcRtteOptions::sim: ferx_core::SimulateOptions
+pub ferx_core::VpcRtteOptions::stratify: ferx_core::VpcStratify
+impl core::default::Default for ferx_core::VpcRtteOptions
+pub fn ferx_core::VpcRtteOptions::default() -> Self
 pub struct ferx_core::VpcTteOptions
 pub ferx_core::VpcTteOptions::censoring: ferx_core::VpcCensoring
 pub ferx_core::VpcTteOptions::cmt: core::option::Option<usize>
@@ -5882,6 +6032,7 @@ pub fn ferx_core::theta_level_map(model: &ferx_core::CompiledModel) -> std::coll
 pub fn ferx_core::theta_level_values(model: &ferx_core::CompiledModel, theta: &[f64], covariance: core::option::Option<&nalgebra::base::alias::DMatrix<f64>>, sir_resamples_packed: core::option::Option<&[alloc::vec::Vec<f64>]>) -> core::result::Result<std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<ferx_core::api::ThetaLevelValue>>, alloc::string::String>
 pub fn ferx_core::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
+pub fn ferx_core::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
 pub type ferx_core::DerivedEvalFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> f64 + core::marker::Send + core::marker::Sync)>
 pub type ferx_core::DerivedFilterFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> bool + core::marker::Send + core::marker::Sync)>

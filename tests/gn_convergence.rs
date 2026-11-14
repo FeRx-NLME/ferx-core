@@ -223,6 +223,14 @@ fn gn_warfarin_bloq_m3_matches_nonmem() {
         "[#2740] GN warfarin_bloq: OFV {:.6}, θ {:?}, σ {:?}, converged {}",
         result.ofv, result.theta, result.sigma, result.converged
     );
+    // #2738: before #2740 this fit stopped at −206.196 (+10.6 above FOCEI's −216.8187,
+    // max |grad| 34.7) on a micro-step at a collapsed radius and reported converged. A
+    // `converged: true` must now sit at the optimum; 0.1 OFV is far below that gap.
+    assert!(
+        !result.converged || (result.ofv - (-216.8187)).abs() < 0.1,
+        "GN reports converged at OFV {} away from FOCEI's -216.8187",
+        result.ofv
+    );
 
     let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
     for (name, got, want, tol) in [

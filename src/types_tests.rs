@@ -766,7 +766,10 @@ fn classify_warning_covariance_prefix_does_not_claim_convergence() {
         "Outer optimization did not converge".to_string(),
         "[FOCEI] Outer optimization did not converge".to_string(),
         crate::estimation::gauss_newton::GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string(),
-        "Gauss-Newton: max iterations reached without convergence".to_string(),
+        crate::estimation::gauss_newton::GN_BUDGET_WARNING.to_string(),
+        // #1049: the collapse stops are non-convergence too, so they file with it.
+        crate::estimation::gauss_newton::GN_COLLAPSE_WARNING.to_string(),
+        crate::estimation::gauss_newton::GN_DEGENERATE_COLLAPSE_WARNING.to_string(),
         // trust_region.rs, the four forms.
         "Trust-region did not converge: reached the iteration budget (maxiter = 50). The \
          estimates and any standard errors are reported at a non-stationary point; raise \
@@ -949,6 +952,12 @@ fn classify_warning_dw_advice_messages_are_dw() {
         DwAdvice::Algebraic { group: None },
         DwAdvice::Algebraic {
             group: Some("ARM".into()),
+        },
+        DwAdvice::AlgebraicInTime {
+            by: crate::api::SubjectLine::ById("ID".into()),
+        },
+        DwAdvice::AlgebraicInTime {
+            by: crate::api::SubjectLine::ByNumericColumn,
         },
     ] {
         for dw in [1.2, 2.8] {
@@ -1445,14 +1454,14 @@ fn classify_warning_roundtrips_every_engine_message() {
         ("cancelled by user", Info, "cancelled"),
         // -- gauss_newton.rs -------------------------------------------
         (
-            "Gauss-Newton: trust radius collapsed",
-            Warning,
-            "optimizer_health",
+            "Gauss-Newton: trust radius collapsed without convergence",
+            Critical,
+            "convergence",
         ),
         (
-            "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed",
-            Warning,
-            "optimizer_health",
+            "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed without convergence",
+            Critical,
+            "convergence",
         ),
         (
             "Gauss-Newton: max iterations reached without convergence",
@@ -1620,7 +1629,8 @@ fn classify_warning_roundtrips_every_engine_message() {
             "mu_referencing",
         ),
         (
-            "Multi-start: best result from start 3/8",
+            "Multi-start: 8 starts, 8 converged; best OFV -221.8770 (start 3); \
+             all 8 converged starts within 1.0 of best (range 0.0000)",
             Info,
             "multi_start",
         ),
@@ -4728,11 +4738,22 @@ fn multi_start_notes_classify_info_whatever_error_text_they_carry() {
             );
         }
     }
-    let best = classify_warning("Multi-start: best result from start 2/4 (OFV = 123.4560)");
-    assert_eq!(
-        (best.severity, best.category),
-        (WarningSeverity::Info, WarningCode::MultiStart)
-    );
+    // #2867: the summary line says "not converged" of the starts that were not returned, and
+    // stays informational for the same reason.
+    for msg in [
+        "Multi-start: 4 starts, 4 converged; best OFV 123.4560 (start 2); \
+         all 4 converged starts within 1.0 of best (range 0.0000)",
+        "Multi-start: 4 starts, 2 converged, 2 not converged; best OFV 123.4560 (start 2); \
+         all 2 converged starts within 1.0 of best (range 0.0000); \
+         1 not converged at a lower OFV: start 3 (-3.21)",
+    ] {
+        let best = classify_warning(msg);
+        assert_eq!(
+            (best.severity, best.category),
+            (WarningSeverity::Info, WarningCode::MultiStart),
+            "{msg}"
+        );
+    }
     // The no-run-converged note is a real verdict on the returned run and keeps its class.
     let none = classify_warning(
         "No multi-start run converged (4 starts); returning best OFV from start 2",

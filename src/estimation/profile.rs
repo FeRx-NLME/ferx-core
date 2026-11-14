@@ -3854,7 +3854,7 @@ impl ProfileCtx<'_> {
         if !f0.is_finite() {
             return fail(PROFILE_NOT_FINITE_AT_ESTIMATE.to_string());
         }
-        let floor = fd_step_floors(hold, &self.model.default_params);
+        let floor = fd_step_floors(hold, self.model);
         let Some(stencil) = fd_ofv_hessian(
             n,
             x_hat,
@@ -4121,7 +4121,7 @@ impl ProfileCtx<'_> {
         let a_steps: Vec<f64> = free
             .iter()
             .map(|&i| {
-                let floor = fd_step_floor(hold, &self.model.default_params, i);
+                let floor = fd_step_floor(hold, self.model, i);
                 fd_step(profile_fd_hessian_step(self.options), x_hat[i], floor)
             })
             .collect();
@@ -4242,7 +4242,7 @@ impl ProfileCtx<'_> {
         let theta_steps: Vec<f64> = free
             .iter()
             .map(|&i| {
-                let floor = fd_step_floor(hold, &self.model.default_params, i);
+                let floor = fd_step_floor(hold, self.model, i);
                 fd_step(self.options.fd_hessian_step, x_hat[i], floor)
             })
             .collect();

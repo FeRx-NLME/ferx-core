@@ -7122,6 +7122,7 @@ pub fn run_saem(
                 pmix: meval.pmix.clone(),
                 mixest: meval.mixest.clone(),
                 n_fd_h_redone: meval.n_fd_h_redone,
+                class_nll: meval.class_nll.clone(),
             };
             (
                 meval.mixest_etas,
@@ -7166,6 +7167,8 @@ pub fn run_saem(
                     0, // SAEM final EBE is warm-started; no inner multi-start
                     crate::estimation::inner_optimizer::InnerHessianSeed::None,
                     options,
+                    // The chain's state, no solve's; inert anyway without restarts or a seed.
+                    crate::estimation::inner_optimizer::PrevEtas::Placeholder,
                 );
             let ofv = 2.0
                 * pop_nll(

@@ -8090,19 +8090,26 @@ fn residual_correlation_inert(model: &CompiledModel, population: &Population) ->
     )]
 }
 
+/// Whether any stage of the run searches, so a start clamped into its box is **held**
+/// there rather than scored once.
+///
+/// `maxiter > 0` always searches. At `maxiter = 0` a stage searches unless its estimator
+/// reads that as `MAXEVAL=0` (`EstimationMethod::evaluates_at_maxiter_zero`, the engine's
+/// own list). The list used to be spelled here, as saem / imp / impmap / bayes, and so
+/// missed `vi` and `gn_hybrid`: both search at `maxiter = 0`, and both were treated as
+/// evaluation-only by every start-side check (#2865 review).
+///
+/// Not `!FitOptions::evaluation_only_run()`: that also counts a standalone
+/// `imp_eval_only` / `agq_eval_only` run as evaluation-only at any `maxiter`, and the
+/// start-side checks have never exempted those.
 fn outer_search_runs(options: &FitOptions) -> bool {
     if options.outer_maxiter > 0 {
         return true;
     }
-    options.method_chain().iter().any(|m| {
-        matches!(
-            m,
-            EstimationMethod::Saem
-                | EstimationMethod::Imp
-                | EstimationMethod::Impmap
-                | EstimationMethod::Bayes
-        )
-    })
+    options
+        .method_chain()
+        .iter()
+        .any(|m| !m.evaluates_at_maxiter_zero())
 }
 
 /// Which declaration a flagged variance coordinate came from — the keyword the
@@ -8739,6 +8746,17 @@ const START_OUT_OF_BOX_TOKEN: &str = "W_INIT_OUTSIDE_BOUNDS";
 /// message below names the other one when it explains that silence.
 const NOT_REPRESENTABLE_TOKEN: &str = "W_INIT_NOT_REPRESENTABLE";
 
+/// The `W_` token of the evaluation-only half of `E_THETA_INIT_OUTSIDE_BOUNDS`
+/// (#2865): a `theta` start outside its own declared range on a run that does
+/// not search (`maxiter = 0`), which is clamped and scored at the bound.
+///
+/// Its own token, not [`START_OUT_OF_BOX_TOKEN`]: that one names an internal
+/// rail the user never wrote, this one a bound they declared, and the remedies
+/// differ. Both classify as `WarningCode::InitOutsideBounds` — a start the box
+/// moved — through separate arms of [`crate::types::classify_warning`], because
+/// neither token is a substring of the other.
+const THETA_START_EVAL_ONLY_TOKEN: &str = "W_THETA_INIT_OUTSIDE_BOUNDS";
+
 /// Report an initial estimate that packs **strictly outside** its own box, and
 /// is therefore silently moved by `clamp_to_bounds` before the first objective
 /// evaluation (#1251).
@@ -8753,7 +8771,7 @@ const NOT_REPRESENTABLE_TOKEN: &str = "W_INIT_NOT_REPRESENTABLE";
 /// |---|---|---|
 /// | any coordinate whose box is **empty** (`lower > upper`) | either | **error**, and not exempt at `maxiter = 0` |
 /// | any coordinate the **packer itself** altered (#1307) | ferx's | warning, and not exempt at `maxiter = 0` |
-/// | θ strictly outside its **declared** lower / upper | the user's | **error** |
+/// | θ strictly outside its **declared** lower / upper | the user's | **error** when a search runs; warning `W_THETA_INIT_OUTSIDE_BOUNDS` on an evaluation-only run (#2865) |
 /// | θ above the hidden `1e9` cap | ferx's | warning |
 /// | Ω / Ω_IOV / mixture-Ω **diagonal**, below `−6` | ferx's | *not reported here* — [`check_variance_init_rails`] owns it, as an error (#1229) |
 /// | Ω / Ω_IOV / mixture-Ω **diagonal**, above `+6` | ferx's | warning |
@@ -8940,10 +8958,14 @@ pub(crate) fn check_packed_start_in_box(
     // floors the value and the bound identically; and a free ρ, which lands
     // exactly *on* its rail rather than outside it. Those three are the #1309
     // doc's own list of what the box predicate is structurally blind to.
+    //
+    // The declared-range walk is claimed on **every** run since #2865: it emits
+    // at `maxiter = 0` too, as `W_THETA_INIT_OUTSIDE_BOUNDS`, and that message
+    // names the value the run scores. Only the rail walk is still silent there.
     let mut claimed: std::collections::BTreeSet<usize> = inverted.iter().copied().collect();
+    claimed.extend(theta_outside_declared_range(init_params).map(|h| h.index));
     if outer_search_runs(options) {
         claimed.extend(coordinates_outside_bounds(&start, &kinds).map(|h| h.index));
-        claimed.extend(theta_outside_declared_range(init_params).map(|h| h.index));
     }
 
     // What the fit will **actually** use, which is not `mv.represented` whenever
@@ -9094,16 +9116,20 @@ pub(crate) fn check_packed_start_in_box(
         );
     }
 
-    // Same exemption as the rail check: an eval-only run clamps too, it just
-    // does not hold. `tests/check_command.rs` pins that `fit()` succeeds at
-    // `outer_maxiter = 0` on a start that would otherwise be refused. The
-    // empty-box errors already collected are **not** exempt and ride out with
-    // it — an eval-only run clamps into the empty box too, and aborts.
-    if !outer_search_runs(options) {
-        return diags;
-    }
+    // An eval-only run clamps too, it just does not hold the clamped value
+    // through a search. So it is never *refused* for a start outside its box
+    // (`tests/check_command.rs` pins that `fit()` succeeds at
+    // `outer_maxiter = 0`), and `--dofv`, `ferx gam --no-fit` and the bootstrap
+    // Δofv sweep can hand in machine-produced parameters. What it does get is
+    // the declared-range finding below as a **warning** (#2865): the one OFV it
+    // reports is the OFV of the bound, not of the declared start.
+    let eval_only = !outer_search_runs(options);
 
     // ── θ against its own DECLARED range ────────────────────────────────────
+    //
+    // An error when a search runs, `W_THETA_INIT_OUTSIDE_BOUNDS` when none does.
+    // One walk and one predicate for both, so the two verdicts cannot disagree
+    // about which θ is outside its range.
     //
     // Judged on the natural scale, not the packed one, and that is the whole
     // reason this is a separate walk: `pack_params` floors the value at
@@ -9148,6 +9174,77 @@ pub(crate) fn check_packed_start_in_box(
         // this same interval, so there is nothing to drift from (#1309 review).
         let (lo_advice, hi_advice) = theta_representable_range(init_params, hit.index);
         let effective = init_params.theta[hit.index].clamp(lo_advice, hi_advice);
+        let suggestion = format!(
+            "move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e}), or widen \
+             the declared range"
+        );
+        if eval_only {
+            // The value scored is not always the declared bound: a declared
+            // lower at or below `LOG_PACK_FLOOR`, or a declared upper above
+            // `THETA_PACK_CEIL`, is replaced by that cap in the box. Say so, or
+            // the message quotes a bound and a scored value that do not match
+            // with no reason given.
+            let stand_in = if effective != hit.bound {
+                format!(
+                    " {effective:e} is the nearest value to that bound that ferx can represent."
+                )
+            } else {
+                String::new()
+            };
+            // "Widen the range" only scores the declared start if ferx can hold
+            // that number once the range admits it. A negative start can always be
+            // held: admitting it makes the lower bound negative, which selects
+            // identity packing. A start of 0, or one outside
+            // `[LOG_PACK_FLOOR, THETA_PACK_CEIL]`, cannot be held under log packing:
+            // `theta TVCL(1e13, 0.001, 1e14)` is in range, unreported at
+            // `maxiter = 0`, and scored at `1e9` (#2865 review). So the advice is
+            // gated, and the other branch says why there is nothing to widen to.
+            let lower = init_params.theta_lower[hit.index];
+            let widening_scores_it = !crate::estimation::parameterization::theta_packs_log(lower)
+                || hit.value < 0.0
+                || (LOG_PACK_FLOOR..=THETA_PACK_CEIL).contains(&hit.value);
+            let score_declared = if widening_scores_it {
+                format!(
+                    "To score {:e}, widen the declared range to include it;",
+                    hit.value
+                )
+            } else {
+                format!(
+                    "{:e} cannot be scored while the lower bound is 0 or more: such a theta is \
+                     held on the log scale, between {LOG_PACK_FLOOR:e} and {THETA_PACK_CEIL:e};",
+                    hit.value
+                )
+            };
+            // The help line follows the same gate: it must not offer the widening
+            // the message has just ruled out.
+            let suggestion = if widening_scores_it {
+                suggestion
+            } else {
+                format!("move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e})")
+            };
+            diags.push(
+                Diagnostic::warning(
+                    THETA_START_EVAL_ONLY_TOKEN,
+                    format!(
+                        "{THETA_START_EVAL_ONLY_TOKEN}: `theta {name}` starts at {value:e}, \
+                         {side} its own declared {bound_word} bound of {bound:e}. This run \
+                         evaluates the objective once and does not search (`maxiter = 0`), and \
+                         the start is clamped into its box first, so the OFV and every \
+                         prediction and estimate reported are those of {name} = {effective:e}, \
+                         not of the declared {value:e}.{stand_in} {score_declared} to score \
+                         {effective:e}, declare that as the start. A run that searches refuses \
+                         this declaration with E_THETA_INIT_OUTSIDE_BOUNDS.",
+                        value = hit.value,
+                        bound = hit.bound,
+                        side = hit.side.direction(),
+                        bound_word = hit.side.bound_name(),
+                    ),
+                )
+                .with_block("parameters")
+                .with_suggestion(suggestion),
+            );
+            continue;
+        }
         diags.push(
             Diagnostic::error(
                 "E_THETA_INIT_OUTSIDE_BOUNDS",
@@ -9166,11 +9263,15 @@ pub(crate) fn check_packed_start_in_box(
                 ),
             )
             .with_block("parameters")
-            .with_suggestion(format!(
-                "move {name}'s initial estimate inside ({lo_advice:e}, {hi_advice:e}), or widen \
-                 the declared range"
-            )),
+            .with_suggestion(suggestion),
         );
+    }
+
+    // The rail walk below keeps the eval-only exemption whole: an internal-rail
+    // start is not reported at `maxiter = 0`. The empty-box errors and the
+    // declared-range warnings already collected ride out with it.
+    if eval_only {
+        return diags;
     }
 
     // No `inverted` consult here: `coordinates_outside_bounds` already declines
@@ -9371,6 +9472,7 @@ pub(crate) fn check_model_data_warnings_rule(
     // Warning half of the kappa-weight check (#1031) — a sample-size weight that
     // moves within an occasion. The error half rides the fatal list.
     diags.extend(check_kappa_weight_variation(model, population));
+    diags.extend(output_mixnum_is_class(model, population));
     diags.extend(residual_correlation_inert(model, population));
     diags.extend(residual_correlation_partly_confounded(
         model, population, iov_rule,
@@ -10474,6 +10576,20 @@ pub(crate) fn check_nn_input_scale(
 /// carries verbatim (the `W_…` token, or a pinned phrase), so a reworded warning
 /// falls through to the generic `W_PARSE` rather than silently mislabelling —
 /// which is why the codes are asserted at both ends.
+/// One parse warning as a check-report [`Diagnostic`]. A deprecated block
+/// (#2913) carries its block and line, read back out of the message the way
+/// [`parse_error_to_diagnostic`] reads the block-header errors; every other
+/// warning keeps its full text under the code [`parse_warning_to_code`] picks.
+fn parse_warning_to_diagnostic(w: &str) -> Diagnostic {
+    let code = parse_warning_to_code(w);
+    match w.strip_prefix(crate::parser::model_parser::DEPRECATED_BLOCK_PREFIX) {
+        Some(rest) if code == crate::parser::model_parser::DEPRECATED_BLOCK_CODE => {
+            locate(Diagnostic::warning(code, String::new()), w, rest)
+        }
+        _ => Diagnostic::warning(code, w.to_string()),
+    }
+}
+
 fn parse_warning_to_code(w: &str) -> &'static str {
     if w.contains("declared in [parameters] but not referenced") {
         "W_UNUSED_PARAM"
@@ -10483,6 +10599,8 @@ fn parse_warning_to_code(w: &str) -> &'static str {
         "W_DERIVED_STEP_IGNORED"
     } else if w.contains("W_ABSORPTION_TWIN_DECLINED") {
         "W_ABSORPTION_TWIN_DECLINED"
+    } else if w.contains(crate::parser::model_parser::DEPRECATED_BLOCK_CODE) {
+        crate::parser::model_parser::DEPRECATED_BLOCK_CODE
     } else {
         "W_PARSE"
     }
@@ -10494,7 +10612,7 @@ fn parse_warning_to_code(w: &str) -> &'static str {
 /// dose-attribute double use (→ `E_DOSE_ATTR_DOUBLE_USE`, #993), the
 /// single-endpoint sigma order mismatch (→ `E_SIGMA_ORDER_MISMATCH`, #1001), the
 /// scale tag on a `block_*` declaration (→ `E_BLOCK_VARIANCE_ONLY`, #1377), and
-/// the block-header shapes (→ `E_UNKNOWN_BLOCK` / `E_DEPRECATED_BLOCK` /
+/// the block-header shapes (→ `E_UNKNOWN_BLOCK` /
 /// `E_BLOCK_INSTANCE_NAME` / `E_BLOCK_FEATURE_DISABLED`, #1040); everything else is
 /// a generic `E_PARSE`. Each shape is matched on a sentinel the emitting site is
 /// pinned to by a test, so a reworded message cannot silently fall through to the
@@ -10628,13 +10746,6 @@ pub(crate) fn parse_error_to_diagnostic(err: &str) -> Diagnostic {
             d = d.with_suggestion(format!("did you mean `[{near}]`?"));
         }
         return locate(d, err, rest);
-    }
-    if let Some(rest) = err.strip_prefix("Deprecated block `[") {
-        return locate(
-            Diagnostic::error("E_DEPRECATED_BLOCK", String::new()),
-            err,
-            rest,
-        );
     }
     if let Some(rest) = err.strip_prefix("Block `[") {
         // Match each shape on its own sentinel rather than letting one be the
@@ -10828,7 +10939,7 @@ pub fn validate_model_file_with(
     //     context in the message text; we use W_PARSE as the generic code here
     //     rather than a narrower code that would mislabel unrelated warnings.
     for w in &parsed.model.parse_warnings {
-        diags.push(Diagnostic::warning(parse_warning_to_code(w), w.clone()));
+        diags.push(parse_warning_to_diagnostic(w));
     }
 
     // 2b. Model / estimation-option compatibility (data-independent): catches
@@ -11157,6 +11268,34 @@ pub(crate) fn bind_for_check(
     crate::api::covariate_stats::bind_covariate_stats_diag(parsed, model_text, population)
 }
 
+/// `W_OUTPUT_MIXNUM_IS_CLASS` (#2784): `[output] MIXNUM` on a `[mixture]` model whose
+/// data also carry a `MIXNUM` column. The sdtab column is the class, so a user who listed
+/// it expecting their covariate is told. A data column of that name is unreachable from
+/// the model already (an expression reads the built-in). In the warning bundle
+/// ([`check_model_data_warnings`]) so `fit()` reports it as `ferx check` does.
+pub(crate) fn output_mixnum_is_class(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<Diagnostic> {
+    let col = model
+        .output_columns
+        .iter()
+        .find(|c| super::output_columns::is_mixture_class_column(model, c))?;
+    let data_col = population
+        .covariate_names
+        .iter()
+        .find(|c| c.eq_ignore_ascii_case(col))?;
+    Some(Diagnostic::warning(
+        "W_OUTPUT_MIXNUM_IS_CLASS",
+        format!(
+            "W_OUTPUT_MIXNUM_IS_CLASS: [output] column `{col}` on a [mixture] model is the \
+             mixture class (the simulated class where the data were drawn under one, else \
+             the fitted MIXEST), as NONMEM's `$TABLE MIXNUM` is; it is not the data column \
+             `{data_col}`. Rename that column to write it to sdtab"
+        ),
+    ))
+}
+
 /// Validate `model.output_columns` against known quantities, emitting
 /// `W_OUTPUT_DUPLICATE` and `E_OUTPUT_UNKNOWN_COLUMN` diagnostics.
 pub fn validate_output_columns(model: &CompiledModel, population: &Population) -> Vec<Diagnostic> {
@@ -11188,6 +11327,12 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             diags.push(Diagnostic::warning("W_OUTPUT_DUPLICATE", msg));
             continue;
         }
+        // `MIXNUM` on a `[mixture]` model is the class (#2784), whatever the data carry;
+        // a data column of that name is reported by `output_mixnum_is_class`, from the
+        // warning bundle `fit()` reports, not from this list `fit()` reads error-first.
+        if super::output_columns::is_mixture_class_column(model, col) {
+            continue;
+        }
         // Valid if it's a covariate, indiv param, or derived name. Synthetic
         // readout parameters (`__ferx_ro_*`, #486) are internal — not user-requestable.
         let known = cov_names.iter().any(|c| c.eq_ignore_ascii_case(col))
@@ -11207,6 +11352,9 @@ pub fn validate_output_columns(model: &CompiledModel, population: &Population) -
             );
             candidates.extend(derived_names.iter().copied());
             candidates.extend(OUTPUT_MANDATORY.iter().copied());
+            if model.mixture.is_some() {
+                candidates.push(super::output_columns::MIXNUM_COLUMN);
+            }
             diags.push(Diagnostic::error(
                 "E_OUTPUT_UNKNOWN_COLUMN",
                 format!(

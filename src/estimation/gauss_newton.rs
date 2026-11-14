@@ -13,7 +13,7 @@
 ///
 /// This approach mirrors NONMEM's modified Gauss-Newton algorithm and typically
 /// converges in 10-30 iterations vs 100+ for first-order methods.
-use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed};
+use crate::estimation::inner_optimizer::{run_inner_loop_warm_seeded, InnerHessianSeed, PrevEtas};
 use crate::estimation::outer_optimizer::pop_nll;
 use crate::estimation::outer_optimizer::OuterResult;
 use crate::estimation::parameterization::{compute_mu_k, *};
@@ -57,6 +57,47 @@ pub(crate) fn gn_scale(x: &[f64], options: &FitOptions) -> Vec<f64> {
     } else {
         vec![1.0; x.len()]
     }
+}
+
+/// Trust radius (scaled space) below which the region counts as collapsed for the
+/// small-change stop (#2738). The radius starts at 1 and is divided by 4 per rejection, so
+/// this is five net rejections in. A step capped by a radius this small says nothing
+/// about the gradient: its OFV change is small *because* the step is small, and on
+/// `warfarin_bloq` (+10.6 OFV above FOCEI, max |grad| 34.7) and `pkpd_nonmem` such a step
+/// at a radius of 1e-5…3e-8 ended the loop as converged.
+pub(crate) const GN_COLLAPSED_RADIUS: f64 = 1e-3;
+
+/// Warning for a loop that ended because the trust radius fell below `1e-10` after a
+/// rejected step. Worded "without convergence" so `classify_warning` files it
+/// `Critical`/`Convergence`: it is the run's one non-convergence message (#1049).
+pub(crate) const GN_COLLAPSE_WARNING: &str =
+    "Gauss-Newton: trust radius collapsed without convergence";
+
+/// [`GN_COLLAPSE_WARNING`]'s twin for a radius exhausted by degenerate-BHHH retries.
+pub(crate) const GN_DEGENERATE_COLLAPSE_WARNING: &str =
+    "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed without convergence";
+
+/// The run spent `maxiter` iterations without a stop rule ending it (#1049: only then).
+pub(crate) const GN_BUDGET_WARNING: &str =
+    "Gauss-Newton: max iterations reached without convergence";
+
+/// Whether an accepted step ends the GN loop as converged on the small-change rule:
+/// the OFV moved by less than `1e-6` relative, from iteration 4 on, **and** the radius the
+/// step was solved under had not collapsed (`radius ≥ GN_COLLAPSED_RADIUS`, #2738). Below
+/// that radius a small change says nothing about the gradient, so the loop goes on and
+/// ends on the collapse or the budget with `converged = false`.
+///
+/// There is deliberately no "interior step" exception: a Steihaug step strictly inside
+/// the region is not evidence of stationarity, because truncated CG also returns its
+/// partial iterate there when it exhausts its iteration budget with a large residual. A
+/// genuinely converging run is not held back by this either: near the optimum the model
+/// predicts well (`rho > 0.75`), so each accepted step doubles the radius and it is back
+/// above the floor within a few iterations.
+///
+/// `radius` is the radius the step was solved under, not the post-acceptance one (an
+/// accepted `rho > 0.75` step doubles it).
+pub(crate) fn gn_small_change_converged(rel_change: f64, iter: usize, radius: f64) -> bool {
+    rel_change < 1e-6 && iter > 3 && radius >= GN_COLLAPSED_RADIUS
 }
 
 /// Whether a pure Gauss–Newton loop spent its iteration budget (#2799): it ran (`maxiter >
@@ -149,6 +190,7 @@ pub fn run_foce_gn(
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
         options,
+        PrevEtas::Placeholder,
     );
 
     let mut ofv_clean = 2.0
@@ -318,9 +360,7 @@ pub fn run_foce_gn(
                             iter
                         );
                     }
-                    warnings.push(
-                        "Gauss-Newton: degenerate BHHH Hessian, trust radius collapsed".to_string(),
-                    );
+                    warnings.push(GN_DEGENERATE_COLLAPSE_WARNING.to_string());
                     exited_early = true;
                     break;
                 }
@@ -355,7 +395,8 @@ pub fn run_foce_gn(
 
         let params_try = unpack_params(&x_try, init_params);
         let try_mu_k = compute_mu_k(model, &params_try.theta, options.mu_referencing);
-        // Warm from the accepted point's whole mode, κ̂ with η̂ (#2261).
+        // Warm from the accepted point's whole mode, κ̂ with η̂ (#2261) — a solve's output,
+        // so an exactly-zero EBE among them is not re-solved as a cold start.
         let warm = crate::estimation::outer_optimizer::joint_warm_starts(&eta_hats, &kappas);
         let (eta_try, h_try, _, kap_try) = run_inner_loop_warm_seeded(
             model,
@@ -369,6 +410,7 @@ pub fn run_foce_gn(
             options.inner_restarts,
             InnerHessianSeed::for_options(options),
             options,
+            PrevEtas::Solved,
         );
         let ofv_try_clean = 2.0
             * pop_nll(
@@ -433,7 +475,7 @@ pub fn run_foce_gn(
                 if verbose {
                     eprintln!("  GN iter {:>3}: trust radius collapsed, stopping", iter);
                 }
-                warnings.push("Gauss-Newton: trust radius collapsed".to_string());
+                warnings.push(GN_COLLAPSE_WARNING.to_string());
                 exited_early = true;
                 break;
             }
@@ -502,8 +544,9 @@ pub fn run_foce_gn(
             );
         }
 
-        // Check convergence
-        if rel_change < 1e-6 && iter > 3 {
+        // Check convergence. A small change on a boundary step at a collapsed radius is
+        // not convergence (#2738): the loop continues to the collapse or the budget.
+        if gn_small_change_converged(rel_change, iter, radius_before) {
             converged = true;
             if verbose {
                 eprintln!("  Converged: relative OFV change = {:.2e}", rel_change);
@@ -511,11 +554,22 @@ pub fn run_foce_gn(
             exited_early = true;
             break;
         }
+        if verbose && rel_change < 1e-6 && iter > 3 {
+            eprintln!(
+                "  GN iter {:>3}: small OFV change at a collapsed trust radius \
+                 ({:.2e}), not taken as convergence",
+                iter, radius_before
+            );
+        }
     }
 
     let gn_budget_spent = gn_loop_budget_spent(maxiter, exited_early);
+    // #1049: one non-convergence message per stop. A collapse or a cancel already pushed
+    // its own reason; "max iterations" is true only when the budget ran out.
+    if gn_budget_spent && !converged {
+        warnings.push(GN_BUDGET_WARNING.to_string());
+    }
     if !converged {
-        warnings.push("Gauss-Newton: max iterations reached without convergence".to_string());
         // #1006: at n_eta = 0 an unconverged pure-GN run is the state that
         // predicts a badly wrong answer — there is no inner EBE loop to absorb
         // a poor start, so the BHHH step can collapse orders of magnitude above
@@ -1329,7 +1383,7 @@ fn subject_nll_pop_grad_analytical(
 
             // d(ipreds)/dx_k: FD perturb theta and re-evaluate predictions.
             let d_ipreds: Vec<f64> = {
-                let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
+                let h = fd_step(eps, x[k], fd_step_floor(template, model, k));
                 let xk_plus = (x[k] + h).min(bounds.upper[k]);
                 let actual_h = xk_plus - x[k];
                 if actual_h.abs() < 1e-16 {
@@ -1356,7 +1410,7 @@ fn subject_nll_pop_grad_analytical(
             // is always FD. Cheap (one extra prediction eval per free θ) and only on
             // the f-dependent path. For additive error `dr_j == 0`, so it is unused.
             let d_pop_preds: Vec<f64> = if use_pop_var {
-                let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
+                let h = fd_step(eps, x[k], fd_step_floor(template, model, k));
                 let xk_plus = (x[k] + h).min(bounds.upper[k]);
                 let actual_h = xk_plus - x[k];
                 if actual_h.abs() < 1e-16 {
@@ -1851,7 +1905,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
             // of a second prediction call. Both perturbations are clamped to bounds
             // and the actual span is used as the denominator (degrades gracefully to
             // one-sided at a boundary).
-            let h = fd_step(eps, x[k], fd_step_floor(template, &model.default_params, k));
+            let h = fd_step(eps, x[k], fd_step_floor(template, model, k));
             let xk_plus = (x[k] + h).min(bounds.upper[k]);
             let xk_minus = (x[k] - h).max(bounds.lower[k]);
             let actual_h = xk_plus - xk_minus;
@@ -2590,7 +2644,7 @@ pub(crate) fn subject_nll_pop_grad(
         if fixed_mask[j] {
             continue;
         }
-        let h = fd_step(eps, x[j], fd_step_floor(template, &model.default_params, j));
+        let h = fd_step(eps, x[j], fd_step_floor(template, model, j));
         let xj_plus = (x[j] + h).min(bounds.upper[j]);
         let xj_minus = (x[j] - h).max(bounds.lower[j]);
         let actual_2h = xj_plus - xj_minus;
@@ -3285,6 +3339,80 @@ mod tests {
                 gate_open,
                 "{label}: the correction must follow closed_form_fixed_ebe_grad_ok, got {t:?}"
             );
+        }
+    }
+
+    /// #2738: the small-change stop counts only off a collapsed radius. Each pair differs
+    /// in one input and straddles one condition. The first row is the `warfarin_bloq` tail
+    /// (rel 5.02e-7 at iteration 31, step at radius 9.5e-6), which the old
+    /// `rel_change < 1e-6 && iter > 3` rule called converged. A small step strictly inside
+    /// a collapsed radius is not convergence either: truncated CG returns such a step when
+    /// it exhausts its budget with a large residual (review of #2738), so the rule takes no
+    /// step norm at all. Mutations: drop the radius conjunct (the old rule) → the first row
+    /// passes; `>=` → `>` at the floor → the floor row fails; drop either original
+    /// conjunct → its row fails.
+    #[test]
+    fn small_change_is_not_convergence_at_a_collapsed_radius() {
+        // Collapsed radius: not convergence, at any relative change.
+        assert!(!gn_small_change_converged(5.02e-7, 31, 9.5367e-6));
+        assert!(!gn_small_change_converged(4.57e-9, 16, 2.9802e-8));
+        // Same step under a radius that had not collapsed: the old verdict stands.
+        assert!(gn_small_change_converged(5.02e-7, 31, 0.5));
+        assert!(gn_small_change_converged(5.02e-7, 31, GN_COLLAPSED_RADIUS));
+        assert!(!gn_small_change_converged(
+            5.02e-7,
+            31,
+            GN_COLLAPSED_RADIUS * 0.999
+        ));
+        // The two original conditions still gate it.
+        assert!(!gn_small_change_converged(2e-6, 31, 0.5));
+        assert!(!gn_small_change_converged(5.02e-7, 3, 0.5));
+        assert!(gn_small_change_converged(5.02e-7, 4, 0.5));
+    }
+
+    /// #1049: a stop that is not a spent budget carries its own reason and not
+    /// "max iterations reached". A cancel set before the first iteration exits through the
+    /// cancel `break`; before #1049 it also carried the budget message. The collapse
+    /// messages are non-convergence, so they classify `Critical`/`Convergence`, the class
+    /// the budget message had — dropping it must not downgrade a collapsed run.
+    #[test]
+    fn an_early_stop_does_not_claim_the_iteration_budget() {
+        use std::path::Path;
+        let model =
+            crate::parser::model_parser::parse_model_file(Path::new("examples/one_cpt_iv.ferx"))
+                .expect("model parses");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_iv.csv"), None, None)
+            .expect("data loads");
+        let flag = crate::cancel::CancelFlag::new();
+        flag.cancel();
+        let opts = FitOptions {
+            method: EstimationMethod::FoceGn,
+            outer_maxiter: 5,
+            run_covariance_step: false,
+            cancel: Some(flag),
+            ..Default::default()
+        };
+        let res = run_foce_gn(&model, &pop, &model.default_params, &opts);
+        assert!(!res.converged);
+        assert!(
+            res.warnings.iter().any(|w| w == "cancelled by user"),
+            "{:?}",
+            res.warnings
+        );
+        assert!(
+            !res.warnings.iter().any(|w| w == GN_BUDGET_WARNING),
+            "a cancel is not a spent budget: {:?}",
+            res.warnings
+        );
+        for w in [
+            GN_COLLAPSE_WARNING,
+            GN_DEGENERATE_COLLAPSE_WARNING,
+            GN_BUDGET_WARNING,
+        ] {
+            let c = crate::types::classify_warning(w);
+            assert_eq!(c.severity, crate::types::WarningSeverity::Critical, "{w}");
+            assert_eq!(c.category.as_str(), "convergence", "{w}");
+            assert!(!w.contains("max iterations") || w == GN_BUDGET_WARNING);
         }
     }
 
@@ -6349,6 +6477,11 @@ mod tests {
         let short = run(2);
         assert!(!short.converged, "a 2-iteration GN budget cannot converge");
         assert!(short.eval_budget_spent, "{:?}", short.warnings);
+        assert!(
+            short.warnings.iter().any(|w| w == GN_BUDGET_WARNING),
+            "{:?}",
+            short.warnings
+        );
         let long = run(200);
         assert!(
             long.converged,
@@ -6356,6 +6489,7 @@ mod tests {
             long.warnings
         );
         assert!(!long.eval_budget_spent);
+        assert!(!long.warnings.iter().any(|w| w == GN_BUDGET_WARNING));
         assert!(!run(0).eval_budget_spent, "an evaluation spends no budget");
         assert!(!gn_loop_budget_spent(0, false));
         assert!(gn_loop_budget_spent(3, false));
