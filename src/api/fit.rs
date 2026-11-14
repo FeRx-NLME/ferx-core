@@ -2700,6 +2700,14 @@ fn fit_inner(
             sr.pmix = Some(pmix.clone());
             sr.mixest = Some(mixest + 1);
         }
+        // #2907: a fit that ends with two classes merged, or one class empty, has fewer
+        // distinct classes than `nsub` — often a local optimum the user should know about.
+        let collapse = crate::estimation::mixture::merged_classes_from(&mp.class_nll, &mp.pmix);
+        result
+            .warnings
+            .extend(crate::estimation::mixture::merged_classes_warning(
+                &collapse,
+            ));
     }
 
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad

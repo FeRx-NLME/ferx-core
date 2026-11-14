@@ -38,6 +38,8 @@ pub struct MixturePosteriors {
     /// [`MixtureEval::n_fd_h_redone`](crate::estimation::mixture::MixtureEval) of the
     /// evaluation that scored the reported objective.
     pub(crate) n_fd_h_redone: usize,
+    /// `MixtureEval::class_nll` of that evaluation, `[subject][class]`, for the merged-class check (#2907).
+    pub(crate) class_nll: Vec<Vec<f64>>,
 }
 
 pub struct OuterResult {
@@ -1169,6 +1171,7 @@ fn evaluate_at_initial_params(
             pmix: m.pmix,
             mixest: m.mixest,
             n_fd_h_redone: m.n_fd_h_redone,
+            class_nll: m.class_nll,
         };
         (
             m.mixest_etas,
@@ -8730,6 +8733,7 @@ fn optimize_nlopt_attempt_probed(
                     pmix: m.pmix,
                     mixest: m.mixest,
                     n_fd_h_redone: m.n_fd_h_redone,
+                    class_nll: m.class_nll,
                 }),
             )
         } else {

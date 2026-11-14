@@ -149,6 +149,18 @@ fn iov_mixture_fit_matches_nonmem() {
         agree,
         NM_MIXEST.len()
     );
+
+    // Two distinct classes at the NONMEM optimum: the merged-class check stays silent
+    // (#2907; the largest per-subject class log Bayes factor here is 19.29, against the
+    // threshold of 1, and 0 at the identical-class saddle this fixture's L-BFGS reaches from
+    // a symmetric start, OFV 549.20).
+    assert!(
+        !res.warnings
+            .iter()
+            .any(|w| w.contains("W_MIXTURE_MERGED_CLASSES")),
+        "{:?}",
+        res.warnings
+    );
 }
 
 // ── #1932: evaluation-only (`maxiter = 0`) postfit at NONMEM's own finals ─────
