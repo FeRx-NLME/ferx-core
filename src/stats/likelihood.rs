@@ -4056,29 +4056,26 @@ pub fn foce_population_nll_iov(
     // (e.g. 4 vs 15 threads). Collecting into an ordered `Vec` and summing
     // serially makes the objective bit-reproducible regardless of thread count
     // while keeping the expensive per-subject work parallel (#703).
-    let per_subj: Vec<f64> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            let kappas = if i < kappas_per_subject.len() {
-                kappas_per_subject[i].as_slice()
-            } else {
-                &[]
-            };
-            foce_subject_nll_iov(
-                model,
-                subject,
-                theta,
-                &eta_hats[i],
-                &h_matrices[i],
-                omega_bsv,
-                sigma_values,
-                interaction,
-                kappas,
-                omega_iov,
-            )
-        })
-    };
+    let per_subj: Vec<f64> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let kappas = if i < kappas_per_subject.len() {
+            kappas_per_subject[i].as_slice()
+        } else {
+            &[]
+        };
+        foce_subject_nll_iov(
+            model,
+            subject,
+            theta,
+            &eta_hats[i],
+            &h_matrices[i],
+            omega_bsv,
+            sigma_values,
+            interaction,
+            kappas,
+            omega_iov,
+        )
+    });
     per_subj.iter().sum()
 }
 
@@ -4131,23 +4128,20 @@ pub(crate) fn foce_population_nll_cov(
     // sum serially. A parallel `.sum()` would make the OFV depend on the
     // thread count (f64 addition is non-associative; rayon splits by worker
     // count). See `foce_population_nll_iov` and #703.
-    let per_subj: Vec<f64> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            foce_subject_nll_cov(
-                model,
-                subject,
-                theta,
-                &eta_hats[i],
-                &h_matrices[i],
-                omega,
-                sigma_values,
-                residual_cov,
-                interaction,
-            )
-        })
-    };
+    let per_subj: Vec<f64> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        foce_subject_nll_cov(
+            model,
+            subject,
+            theta,
+            &eta_hats[i],
+            &h_matrices[i],
+            omega,
+            sigma_values,
+            residual_cov,
+            interaction,
+        )
+    });
     per_subj.iter().sum()
 }
 

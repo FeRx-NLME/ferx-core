@@ -590,27 +590,6 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
     crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
 }
 
-/// `analytic_outer_gradient_available`, kept as the shared entry point that
-/// `crate::types::Optimizer::resolve_auto` and `build_info::gradient_method_outer`
-/// consult so `auto`'s pick and the reported gradient method can never disagree
-/// with the outer loop's actual dispatch.
-///
-/// As of the FOCE σ-magnitude work (#486), a custom / time-varying residual-error
-/// magnitude (`σ = expr(TIME, cov, θ)`) is analytic on **both** loops — the
-/// Sheiner–Beal FOCE (non-interaction) assembly (`subject_packed_gradient_foce` /
-/// `subject_packed_gradient_foce_iov`) now threads `mult(θ)` through its marginal
-/// `R⁰` (value + direct-θ derivative), matching the FOCEI direct-θ channel. So the
-/// predicate no longer narrows by `interaction`: every exclusion in
-/// `analytic_outer_gradient_available` is interaction-independent (a magnitude
-/// combined with an M3-censored row is a *per-subject* FD fallback, as under
-/// FOCEI, not a model-level decline). The `interaction` parameter is retained for
-/// call-site stability and in case a future interaction-only channel must
-/// re-narrow here.
-pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interaction: bool) -> bool {
-    let _ = interaction;
-    analytic_outer_gradient_available(model)
-}
-
 // ─── IOV (inter-occasion variability) analytic sensitivities ──────────
 //
 // IOV makes the PK parameters switch mid-decay at occasion boundaries (NONMEM

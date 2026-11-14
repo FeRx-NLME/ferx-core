@@ -175,7 +175,7 @@ fn an_engine_forced_fd_is_silent_because_the_user_set_nothing() {
     // The counterfactual alone *would* fire here — that is what makes the options
     // gate load-bearing rather than belt-and-braces.
     assert_ne!(
-        Optimizer::Auto.resolve_auto(&model, true),
+        Optimizer::Auto.resolve_auto(&model),
         Optimizer::Auto.resolve_auto_given_analytic(
             &model,
             crate::sens::provider::analytic_outer_gradient_in_scope(&model)
@@ -244,7 +244,7 @@ fn above_the_bobyqa_dimension_threshold_nothing_is_coupled() {
         "fixture must clear the threshold, else this tests the ordinary arm"
     );
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&model, true),
+        Optimizer::Auto.resolve_auto(&model),
         Optimizer::NloptLbfgs,
         "above the threshold `auto` takes L-BFGS even on an FD gradient"
     );
@@ -292,12 +292,9 @@ fn resolve_auto_is_unchanged_by_the_split() {
         (ode_model(GradientMethod::Auto), Optimizer::Bobyqa),
         (ode_model(GradientMethod::Fd), Optimizer::Bobyqa),
     ] {
-        assert_eq!(Optimizer::Auto.resolve_auto(&model, true), expected);
+        assert_eq!(Optimizer::Auto.resolve_auto(&model), expected);
         // Idempotent for every non-`Auto` variant, as before.
-        assert_eq!(
-            Optimizer::Slsqp.resolve_auto(&model, true),
-            Optimizer::Slsqp
-        );
+        assert_eq!(Optimizer::Slsqp.resolve_auto(&model), Optimizer::Slsqp);
     }
 }
 

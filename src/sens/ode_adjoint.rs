@@ -2187,8 +2187,6 @@ fn canonical_jets1(
     sigma: Option<&[f64]>,
     eta: &[f64],
 ) -> Option<PredLanes<Vec<f64>>> {
-    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
-    use std::sync::atomic::Ordering::Relaxed;
     let n_obs = subject.observations.len();
     let mut p = with_plan(model, subject, lay, theta, eta, &mut |plan| {
         kjit_run(plan, theta, eta, n_obs)
@@ -2200,7 +2198,6 @@ fn canonical_jets1(
         })?;
         p.du.extend(pp.du);
     }
-    kj::STATS.runs.fetch_add(1, Relaxed);
     Some(p)
 }
 

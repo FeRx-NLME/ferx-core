@@ -924,29 +924,26 @@ fn agq_population_nll_impl(
         uncached_log_weights = weights.iter().map(|w| w.ln()).collect::<Vec<_>>();
         &uncached_log_weights
     };
-    let per_subject: Vec<f64> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            let stack = Stack::new(model, params, subj_kappas.len());
-            let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
-            let schedule = schedules.and_then(|s| s[i].as_ref());
-            agq_subject_evaluate(
-                model,
-                subject,
-                params,
-                &stack,
-                &b_hat,
-                nodes,
-                log_weights,
-                anchor,
-                schedule,
-                terminal_work.and_then(|all| all[i].0.as_ref()),
-                terminal_work.map(|all| all[i].1),
-            )
-        })
-    };
+    let per_subject: Vec<f64> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        let stack = Stack::new(model, params, subj_kappas.len());
+        let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
+        let schedule = schedules.and_then(|s| s[i].as_ref());
+        agq_subject_evaluate(
+            model,
+            subject,
+            params,
+            &stack,
+            &b_hat,
+            nodes,
+            log_weights,
+            anchor,
+            schedule,
+            terminal_work.and_then(|all| all[i].0.as_ref()),
+            terminal_work.map(|all| all[i].1),
+        )
+    });
     per_subject.iter().sum()
 }
 
@@ -1047,10 +1044,9 @@ fn agq_population_evaluate_impl(
     let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
 
     let exact_anchor = matches!(anchor, HessianAnchor::Exact);
-    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
+    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> =
+        crate::par::map(population.subjects.len(), |i| {
+            let subject = &population.subjects[i];
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
@@ -1090,8 +1086,7 @@ fn agq_population_evaluate_impl(
                 terminal_work.map(|all| all[i].1),
             );
             (nll, score, mode)
-        })
-    };
+        });
     let nll = per_subject.iter().map(|(nll, _, _)| nll).sum();
     let gradient = per_subject.iter().try_fold(
         vec![0.0; x.len()],
@@ -1451,25 +1446,22 @@ pub(crate) fn population_gradient_mixed(
     let want_eta_dx = eta_dx.as_ref().is_some_and(|s| s.want_dx);
     let want_hessian = want_eta_dx && matches!(options.hessian_anchor(), HessianAnchor::Exact);
     let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
-    let scores: Vec<_> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            let mut mode = ModeOut {
-                want_dx: want_eta_dx,
-                want_hessian,
-                ..ModeOut::default()
-            };
-            let score = context.score_routed_with_mode(
-                subject,
-                eta_hats[i].as_slice(),
-                kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                true,
-                &mut mode,
-            );
-            (score, mode)
-        })
-    };
+    let scores: Vec<_> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let mut mode = ModeOut {
+            want_dx: want_eta_dx,
+            want_hessian,
+            ..ModeOut::default()
+        };
+        let score = context.score_routed_with_mode(
+            subject,
+            eta_hats[i].as_slice(),
+            kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
+            true,
+            &mut mode,
+        );
+        (score, mode)
+    });
     let mut result = vec![0.0; x.len()];
     let mut per = Vec::with_capacity(scores.len());
     let mut hessians = Vec::with_capacity(scores.len());
@@ -1535,17 +1527,14 @@ pub fn agq_population_gradient(
     let _ = params;
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
-    let per_subject: Vec<Option<Vec<f64>>> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
-            let mut g = vec![0.0f64; n_packed];
-            agq_subject_packed_gradient(model, subject, &pt, &b_hat, n_nodes, anchor, &mut g)
-                .map(|()| g)
-        })
-    };
+    let per_subject: Vec<Option<Vec<f64>>> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
+        let mut g = vec![0.0f64; n_packed];
+        agq_subject_packed_gradient(model, subject, &pt, &b_hat, n_nodes, anchor, &mut g)
+            .map(|()| g)
+    });
 
     let mut out = vec![0.0f64; n_packed];
     for g in per_subject {

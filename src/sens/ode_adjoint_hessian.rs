@@ -37,7 +37,7 @@ use crate::estimation::parameterization::{packed_segments, rho_packed_start, the
 use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
 use crate::sens::focei_kernel::{chol_logdet, focei_htilde, OmegaT};
 use crate::sens::num::vm::Layout;
-use crate::sens::num::PkNum;
+use crate::sens::num::{log_sum_exp, PkNum};
 
 /// Directions per pass: the plan's tangent lanes, and the seeds of each reverse.
 ///
@@ -1501,16 +1501,7 @@ impl<'a> CovPlan<'a> {
                         };
                         terms.push(c(*cw) - (inner_l(ctx, &fb, &b, &p, None)? + qb));
                     }
-                    let mx = terms[1..]
-                        .iter()
-                        .fold(terms[0], |m, &t| {
-                            T::select_if(crate::sens::num::BranchCmp::Gt, t, m, t, m)
-                        })
-                        .value_only();
-                    let one = c(1.0);
-                    let sum =
-                        <T as PkNum>::wsum3(0.0, terms.iter().map(|&t| (one, (t - mx).exp(), one)));
-                    half_logdet - (mx + sum.ln())
+                    half_logdet - log_sum_exp(&terms)
                 };
                 let mut lg = inner_grad(ctx, &f, &g, &eo, &p, None)?;
                 if let Some(ng) = ng.as_ref() {

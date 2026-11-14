@@ -17,6 +17,7 @@
 //! - An endpoint-only subject (no prediction rows) has no plan: its term alone.
 use super::*;
 use crate::sens::num::vm::Layout;
+use crate::sens::num::{log_sum_exp, wsum3};
 
 /// The quadrature (AGQ, Laplace) gradient of a subject through its plans; `None` where a
 /// plan cannot be recorded.
@@ -214,25 +215,13 @@ pub(super) fn agq_planned(
                         Some(_) => {
                             let gq = &node_gq[j];
                             t(node_qr[j])
-                                + T::wsum3(
-                                    0.0,
-                                    (0..n_bsv).map(|k| (t(gq[k]), b[k] - t(b0[k]), one)),
-                                )
+                                + wsum3(0.0, (0..n_bsv).map(|k| (t(gq[k]), b[k] - t(b0[k]), one)))
                         }
                         None => c(0.0),
                     };
                     terms.push(t(*cw) - (inner_l(ctx, &fb, &b, &pr, None)? + qb));
                 }
-                // The log-sum-exp's shift: the terms' largest, recorded, with no derivative (the
-                // sum is invariant to it).
-                let mx = terms[1..]
-                    .iter()
-                    .fold(terms[0], |m, &x| {
-                        T::select_if(crate::sens::num::BranchCmp::Gt, x, m, x, m)
-                    })
-                    .value_only();
-                let sum = T::wsum3(0.0, terms.iter().map(|&x| (one, (x - mx).exp(), one)));
-                c(0.5 * n as f64 * std::f64::consts::PI.ln()) + half_logdet - (mx + sum.ln())
+                c(0.5 * n as f64 * std::f64::consts::PI.ln()) + half_logdet - log_sum_exp(&terms)
             };
             let mut lg = inner_grad(ctx, &fr, &gr, &er, &pr, None)?;
             if let Some(ngr) = ngr.as_ref() {

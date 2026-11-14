@@ -463,7 +463,7 @@ impl<'a> Lower<'a> {
                     .find(|(x, _)| x == d)
                     .expect("both arms write an `if`'s value")
                     .1;
-                let l = Alg::select(self, arm.is_else, e, t);
+                let l = self.select(arm.is_else, e, t);
                 self.set(*d, l);
             }
         }
@@ -567,9 +567,23 @@ impl<'a> Lower<'a> {
             .map(|(&x, &y)| self.ins(Inst::Select(c, x, y)))
             .collect()
     }
+    /// Lane by lane — every type's `+`.
+    fn add(&mut self, a: &[V], b: &[V]) -> Lanes {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| self.ins(Inst::Add(x, y)))
+            .collect()
+    }
+    /// Lane by lane — every type's `−`.
+    fn sub(&mut self, a: &[V], b: &[V]) -> Lanes {
+        a.iter()
+            .zip(b)
+            .map(|(&x, &y)| self.ins(Inst::Sub(x, y)))
+            .collect()
+    }
 
     // ── The primitives, as `f64` and the forward dual's untaped bodies compute them (`+` and `−`
-    // are lane by lane, [`Alg`]'s). ──
+    // are lane by lane). ──
 
     /// `mul_body`: `g_k = a.g_k·b.v + a.v·b.g_k`,
     /// `h_t = a.h_t·b.v + a.v·b.h_t + a.g_k·b.g_l + a.g_l·b.g_k`, left to right.
@@ -961,168 +975,9 @@ impl<'a> Lower<'a> {
     }
 }
 
-/// A number type's arithmetic over its lanes, as scalar instructions: what [`emit`] needs to
-/// write any [`Flat`] instruction. An algebra transcribes its type's own operator bodies;
-/// the instruction dispatch — the guards, the `ln` floor, the constant operands — is
-/// written once, here.
-pub(super) trait Alg {
-    fn func(&mut self) -> &mut Func;
-    /// Lanes per value.
-    fn width(&self) -> usize;
-    fn regs(&mut self) -> &mut Vec<Lanes>;
-    fn regs_ref(&self) -> &[Lanes];
-    fn mul(&mut self, a: &[V], b: &[V]) -> Lanes;
-    /// `a / b`, or the constant zero when `|b| < 1e-30` (`apply_binary_in`'s guard).
-    fn guarded_div(&mut self, a: &[V], b: &[V]) -> Lanes;
-    /// `a / b` unguarded (the forward dual's `div_body`).
-    fn raw_div(&mut self, a: &[V], b: &[V]) -> Lanes;
-    /// A constant right operand, as the type's `*_scalar_in`.
-    fn scalar(&mut self, op: Arith, a: &[V], c: f64) -> Lanes;
-    fn exp(&mut self, a: &[V]) -> Lanes;
-    /// The type's own `ln`, unguarded.
-    fn ln(&mut self, a: &[V]) -> Lanes;
-    /// The type's own `sqrt`, unguarded.
-    fn sqrt(&mut self, a: &[V]) -> Lanes;
-    fn inv_logit(&mut self, a: &[V]) -> Lanes;
-    fn logit(&mut self, a: &[V]) -> Lanes;
-    fn cos(&mut self, a: &[V]) -> Lanes;
-    fn acos(&mut self, a: &[V]) -> Lanes;
-    fn ln_gamma(&mut self, a: &[V]) -> Lanes;
-    fn abs(&mut self, a: &[V]) -> Lanes;
-    fn pow(&mut self, a: &[V], e: &[V]) -> Lanes;
-    fn gamma_pq(&mut self, a: &[V], x: &[V], upper: bool, i: u8, j: u8) -> Lanes;
-    fn unary_chain(&mut self, a: &[V], shim: &dyn Fn(u8) -> Shim1) -> Lanes;
-
-    fn ins(&mut self, i: Inst) -> V {
-        self.func().push(i)
-    }
-    fn k(&mut self, c: f64) -> V {
-        self.func().k(c)
-    }
-    /// The constant whose value is `v` (every other lane zero): `T::from_f64`.
-    fn constant(&mut self, v: V) -> Lanes {
-        let mut l = vec![v];
-        for _ in 1..self.width() {
-            let z = self.k(0.0);
-            l.push(z);
-        }
-        l
-    }
-    fn select(&mut self, c: V, a: &[V], b: &[V]) -> Lanes {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| self.ins(Inst::Select(c, x, y)))
-            .collect()
-    }
-    /// Lane by lane — every type's `+`.
-    fn add(&mut self, a: &[V], b: &[V]) -> Lanes {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| self.ins(Inst::Add(x, y)))
-            .collect()
-    }
-    /// Lane by lane — every type's `−`.
-    fn sub(&mut self, a: &[V], b: &[V]) -> Lanes {
-        a.iter()
-            .zip(b)
-            .map(|(&x, &y)| self.ins(Inst::Sub(x, y)))
-            .collect()
-    }
-    fn load(&mut self, arg: u8, index: usize) -> Lanes {
-        let lanes = self.width();
-        (0..lanes)
-            .map(|j| {
-                self.ins(Inst::Load {
-                    arg,
-                    off: (index * lanes + j) as u32,
-                })
-            })
-            .collect()
-    }
-    fn store(&mut self, arg: u8, index: usize, l: &[V]) {
-        let lanes = self.width();
-        for (j, &v) in l.iter().enumerate() {
-            self.ins(Inst::Store {
-                arg,
-                off: (index * lanes + j) as u32,
-                v,
-            });
-        }
-    }
-    fn reg(&self, r: u32) -> Lanes {
-        self.regs_ref()[r as usize].clone()
-    }
-    fn set(&mut self, d: u32, l: Lanes) {
-        self.regs()[d as usize] = l;
-    }
-}
-
-impl Alg for Lower<'_> {
-    fn func(&mut self) -> &mut Func {
-        self.f
-    }
-    fn width(&self) -> usize {
-        self.layout.lanes()
-    }
-    fn regs(&mut self) -> &mut Vec<Lanes> {
-        &mut self.regs
-    }
-    fn regs_ref(&self) -> &[Lanes] {
-        &self.regs
-    }
-    fn mul(&mut self, a: &[V], b: &[V]) -> Lanes {
-        Lower::mul(self, a, b)
-    }
-    fn guarded_div(&mut self, a: &[V], b: &[V]) -> Lanes {
-        Lower::guarded_div(self, a, b)
-    }
-    fn raw_div(&mut self, a: &[V], b: &[V]) -> Lanes {
-        Lower::div(self, a, b)
-    }
-    fn scalar(&mut self, op: Arith, a: &[V], c: f64) -> Lanes {
-        Lower::scalar(self, op, a, c)
-    }
-    fn exp(&mut self, a: &[V]) -> Lanes {
-        Lower::exp(self, a)
-    }
-    fn ln(&mut self, a: &[V]) -> Lanes {
-        Lower::ln(self, a)
-    }
-    fn sqrt(&mut self, a: &[V]) -> Lanes {
-        Lower::sqrt(self, a)
-    }
-    fn inv_logit(&mut self, a: &[V]) -> Lanes {
-        Lower::inv_logit(self, a)
-    }
-    fn logit(&mut self, a: &[V]) -> Lanes {
-        Lower::logit(self, a)
-    }
-    fn cos(&mut self, a: &[V]) -> Lanes {
-        Lower::cos(self, a)
-    }
-    fn acos(&mut self, a: &[V]) -> Lanes {
-        Lower::acos(self, a)
-    }
-    fn ln_gamma(&mut self, a: &[V]) -> Lanes {
-        Lower::ln_gamma(self, a)
-    }
-    fn abs(&mut self, a: &[V]) -> Lanes {
-        Lower::abs(self, a)
-    }
-    fn pow(&mut self, a: &[V], e: &[V]) -> Lanes {
-        Lower::pow(self, a, e)
-    }
-    fn gamma_pq(&mut self, a: &[V], x: &[V], upper: bool, i: u8, j: u8) -> Lanes {
-        Lower::gamma_pq(self, a, x, upper, i, j)
-    }
-    fn unary_chain(&mut self, a: &[V], shim: &dyn Fn(u8) -> Shim1) -> Lanes {
-        Lower::unary_chain(self, a, shim)
-    }
-}
-
-/// Emit one register instruction over any [`Alg`]; `args` are the argument indices of `u`,
+/// Emit one register instruction; `args` are the argument indices of `u`,
 /// `params`, `seeds` and `du`.
-pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
+pub(super) fn emit(al: &mut Lower<'_>, f: &Flat, args: [u8; 4]) {
     let [u, params, seeds, du] = args;
     match *f {
         Flat::LoadState { d, i } => {
@@ -1164,7 +1019,7 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
             al.set(d, l);
         }
         Flat::DivRaw { d, a, b } => {
-            let l = al.raw_div(&al.reg(a), &al.reg(b));
+            let l = al.div(&al.reg(a), &al.reg(b));
             al.set(d, l);
         }
         Flat::AddK { d, a, c }
@@ -1358,7 +1213,7 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
 }
 
 /// `T::from_f64(if c { 1 } else { 0 })`.
-fn bool01<A: Alg>(al: &mut A, c: V) -> Lanes {
+fn bool01(al: &mut Lower<'_>, c: V) -> Lanes {
     let one = al.k(1.0);
     let z = al.k(0.0);
     let v = al.ins(Inst::Select(c, one, z));

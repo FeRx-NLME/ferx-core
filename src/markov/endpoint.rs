@@ -698,7 +698,7 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
                 }
             }
         };
-        // A stiff step's exact `J` and `f_t` come off the recording (`PkNum::rhs_jacobian`), the
+        // A stiff step's exact `J` and `f_t` come off the recording (`RecHooks::rhs_jacobian`), the
         // only type this walk runs on in a fit; the f64 value path registers its own
         // (`ctmm_endpoint_nll_inhomogeneous`).
         let mut u0 = vec![T::from_f64(0.0); s * s];

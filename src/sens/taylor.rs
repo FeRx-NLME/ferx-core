@@ -28,23 +28,6 @@ pub(crate) const fn binom(n: usize, k: usize) -> usize {
     r
 }
 
-/// How many `(i, j)` monomial products of total degree ≤ `ord` a `(p, ord)` [`Table`]
-/// lists: the terms one product sums.
-pub(crate) const fn mul_len(p: usize, ord: usize) -> usize {
-    // Monomials of exact degree `d` in `p` variables: `C(d + p − 1, d)`.
-    let mut n = 0usize;
-    let mut a = 0usize;
-    while a <= ord {
-        let mut b = 0usize;
-        while a + b <= ord {
-            n += binom(a + p - 1, a) * binom(b + p - 1, b);
-            b += 1;
-        }
-        a += 1;
-    }
-    n
-}
-
 /// The monomial structure of one `(P, ORD)`.
 pub(crate) struct Table {
     /// Exponent vector of each monomial (`P` entries each), graded order; index 0 is `1`.
@@ -249,11 +232,14 @@ impl<const P: usize, const ORD: usize, const L: usize> Div for Taylor<P, ORD, L>
     }
 }
 
+impl<const P: usize, const ORD: usize, const L: usize> crate::sens::num::RecHooks
+    for Taylor<P, ORD, L>
+{
+}
+
 impl<const P: usize, const ORD: usize, const L: usize> PkNum for Taylor<P, ORD, L> {
     const SECOND_ORDER: bool = ORD >= 2;
     const JET_ORDER: usize = ORD;
-    /// A product sums one term per pair of monomials of total degree ≤ `ORD`.
-    const WORK: usize = mul_len(P, ORD);
     #[inline]
     fn is_constant(self) -> bool {
         self.zero_jet()
@@ -482,19 +468,6 @@ mod tests {
     /// Every coefficient of a composite against its closed form: `f(x, y) = exp(x·y) /
     /// (1 + x²) + ln(y)·x³` at `(0.3, 1.7)`, whose normalised Taylor coefficients to third
     /// order are computed here by hand-expanded derivatives.
-    #[test]
-    fn the_work_counts_every_product_the_table_lists() {
-        for p in 1..=8 {
-            for ord in 1..=4 {
-                assert_eq!(
-                    mul_len(p, ord),
-                    table(p, ord).mul.len(),
-                    "p = {p}, ord = {ord}"
-                );
-            }
-        }
-    }
-
     #[test]
     fn third_order_coefficients_are_exact() {
         let (x0, y0) = (0.3f64, 1.7f64);

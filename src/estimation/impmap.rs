@@ -1266,31 +1266,28 @@ fn run_map_multistart(
         None
     };
 
-    let results: Vec<EbeResult> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            let warm = prev_etas.map(|pe| pe[i].as_slice());
-            // Deterministic per-subject, per-iteration seed, separated from IS draws.
-            let subj_seed = seed
-                .wrapping_add(i as u64)
-                .wrapping_add((iteration as u64) << 32)
-                .wrapping_add(0x4D43_4554_4100u64);
-            find_ebe_multistart(
-                model,
-                subject,
-                params,
-                inner_maxiter,
-                inner_tol,
-                warm,
-                Some(mu_k),
-                0,
-                mceta,
-                omega_chol.as_ref(),
-                subj_seed,
-            )
-        })
-    };
+    let results: Vec<EbeResult> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let warm = prev_etas.map(|pe| pe[i].as_slice());
+        // Deterministic per-subject, per-iteration seed, separated from IS draws.
+        let subj_seed = seed
+            .wrapping_add(i as u64)
+            .wrapping_add((iteration as u64) << 32)
+            .wrapping_add(0x4D43_4554_4100u64);
+        find_ebe_multistart(
+            model,
+            subject,
+            params,
+            inner_maxiter,
+            inner_tol,
+            warm,
+            Some(mu_k),
+            0,
+            mceta,
+            omega_chol.as_ref(),
+            subj_seed,
+        )
+    });
 
     let stats = InnerLoopStats {
         n_unconverged: results.iter().filter(|r| !r.converged).count(),
@@ -2123,10 +2120,11 @@ fn run_mcem(
             .omega_iov
             .as_ref()
             .map(|iov| JointPriors::build(&params_k.omega, iov, &n_occ_of, defensive_alpha));
-        let mut draws: Vec<_> = {
-            let __r0 = &population.subjects;
-            crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-                let subject = &__r0[i];
+        let mut draws: Vec<_> = crate::par::map_init(
+            population.subjects.len(),
+            EventPkParams::default,
+            |scratch, i| {
+                let subject = &population.subjects[i];
                 // Poll per subject: the inner-loop MAP + IS draws below are the
                 // dominant per-iteration cost, so without this a cancel set
                 // mid-iteration is not seen until the next iteration's top-of-loop
@@ -2344,8 +2342,8 @@ fn run_mcem(
                     defensive_mixture.as_ref(),
                     schedules[i].as_ref(),
                 )
-            })
-        };
+            },
+        );
 
         // If a cancel was observed inside the E-step, the `draws` are placeholders;
         // break before the M-steps consume them. The post-loop check returns Err.
@@ -2649,35 +2647,31 @@ fn run_mcem(
                 };
                 let solved = if group.needs_data_term {
                     let data = |th: &[f64], shifts: &[Vec<f64>]| -> f64 {
-                        let per_subj: Vec<f64> = {
-                            let __r0 = &population.subjects;
-                            let __r1 = &draws;
-                            crate::par::map_init(
-                                __r0.len().min(__r1.len()),
-                                EventPkParams::default,
-                                |scratch, i| {
-                                    let (subject, d) = (&__r0[i], &__r1[i]);
-                                    let mut s = 0.0f64;
-                                    for (w, eta) in d.weights.iter().zip(d.etas.iter()) {
-                                        if *w == 0.0 {
-                                            continue;
-                                        }
-                                        let mut e2 = eta.clone();
-                                        group.shift_eta(&mut e2, shifts, i);
-                                        s += w * draw_obs_nll(
-                                            model,
-                                            subject,
-                                            th,
-                                            &sigma_now,
-                                            &e2,
-                                            schedules[i].as_ref(),
-                                            scratch,
-                                        );
+                        let per_subj: Vec<f64> = crate::par::map_init(
+                            population.subjects.len().min(draws.len()),
+                            EventPkParams::default,
+                            |scratch, i| {
+                                let (subject, d) = (&population.subjects[i], &draws[i]);
+                                let mut s = 0.0f64;
+                                for (w, eta) in d.weights.iter().zip(d.etas.iter()) {
+                                    if *w == 0.0 {
+                                        continue;
                                     }
-                                    s
-                                },
-                            )
-                        };
+                                    let mut e2 = eta.clone();
+                                    group.shift_eta(&mut e2, shifts, i);
+                                    s += w * draw_obs_nll(
+                                        model,
+                                        subject,
+                                        th,
+                                        &sigma_now,
+                                        &e2,
+                                        schedules[i].as_ref(),
+                                        scratch,
+                                    );
+                                }
+                                s
+                            },
+                        );
                         per_subj.iter().sum()
                     };
                     group.solve_numerical(population, &input, mstep_maxiter, &data)
@@ -3615,10 +3609,11 @@ fn run_mcem_mixture(
         // Parallel over subjects; the class loop runs inside each worker so the
         // `MIXNUM` guard is entered on the same thread as the solve/draws.
         #[allow(clippy::type_complexity)]
-        let per_subject: Vec<(Vec<SubjectDraws>, Vec<f64>, f64)> = {
-            let __r0 = &population.subjects;
-            crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-                let subject = &__r0[i];
+        let per_subject: Vec<(Vec<SubjectDraws>, Vec<f64>, f64)> = crate::par::map_init(
+            population.subjects.len(),
+            EventPkParams::default,
+            |scratch, i| {
+                let subject = &population.subjects[i];
                 // Poll per subject: one subject's E-step is `n_classes` inner
                 // solves plus `n_classes · K` importance draws — the dominant
                 // per-iteration cost — so without this a cancel set mid-sweep is
@@ -3731,8 +3726,8 @@ fn run_mcem_mixture(
                 }
                 let (contribution, pmix_i, _mixest) = combine_subject(&logp, &nll);
                 (class_draws, pmix_i, contribution)
-            })
-        };
+            },
+        );
 
         if crate::cancel::is_cancelled(cancel) {
             break;
@@ -4438,36 +4433,36 @@ fn weighted_mstep_objective(
     // reproducible regardless of rayon worker count — a parallel `.sum()`
     // folds along thread-count-dependent split points and f64 addition is
     // non-associative (#703).
-    let per_subj: Vec<f64> = {
-        let __r0 = &population.subjects;
-        let __r1 = &draws;
-        let __r2 = &schedules;
-        crate::par::map_init(
-            __r0.len().min(__r1.len()).min(__r2.len()),
-            EventPkParams::default,
-            |scratch, __i| {
-                let ((subject, d), schedule) = ((&__r0[__i], &__r1[__i]), &__r2[__i]);
-                {
-                    let mut s = 0.0f64;
-                    for (w, b) in d.weights.iter().zip(d.etas.iter()) {
-                        if *w == 0.0 {
-                            continue;
-                        }
-                        s += w * draw_obs_nll(
-                            model,
-                            subject,
-                            theta,
-                            sigma,
-                            b,
-                            schedule.as_ref(),
-                            scratch,
-                        );
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population
+            .subjects
+            .len()
+            .min(draws.len())
+            .min(schedules.len()),
+        EventPkParams::default,
+        |scratch, idx| {
+            let ((subject, d), schedule) =
+                ((&population.subjects[idx], &draws[idx]), &schedules[idx]);
+            {
+                let mut s = 0.0f64;
+                for (w, b) in d.weights.iter().zip(d.etas.iter()) {
+                    if *w == 0.0 {
+                        continue;
                     }
-                    s
+                    s += w * draw_obs_nll(
+                        model,
+                        subject,
+                        theta,
+                        sigma,
+                        b,
+                        schedule.as_ref(),
+                        scratch,
+                    );
                 }
-            },
-        )
-    };
+                s
+            }
+        },
+    );
     let val: f64 = per_subj.iter().sum();
     if val.is_finite() {
         val
@@ -4889,10 +4884,11 @@ fn theta_sigma_weighted_mstep_mixture(
     let obj = |xv: &[f64], _: Option<&mut [f64]>, _: &mut ()| -> f64 {
         let th: Vec<f64> = unpack_thetas(&xv[..n_theta]);
         let sg: Vec<f64> = xv[n_theta..].iter().map(|&v| v.exp()).collect();
-        let per_subj: Vec<f64> = {
-            let __r0 = &population.subjects;
-            crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-                let subject = &__r0[i];
+        let per_subj: Vec<f64> = crate::par::map_init(
+            population.subjects.len(),
+            EventPkParams::default,
+            |scratch, i| {
+                let subject = &population.subjects[i];
                 let mut s = 0.0f64;
                 for c in 0..n_classes {
                     let p = pmix[i][c];
@@ -4920,8 +4916,8 @@ fn theta_sigma_weighted_mstep_mixture(
                     s += p * sc;
                 }
                 s
-            })
-        };
+            },
+        );
         let val: f64 = per_subj.iter().sum();
         if val.is_finite() {
             val

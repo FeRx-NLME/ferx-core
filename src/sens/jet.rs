@@ -118,7 +118,7 @@ impl<const N: usize, B: PkNum> DualT<N, B> {
     fn mul_body(self, o: Self) -> Self {
         let mut g = self.g;
         for k in 0..N {
-            g[k] = B::dot2(self.g[k], o.v, self.v, o.g[k]);
+            g[k] = self.g[k] * o.v + self.v * o.g[k];
         }
         DualT { v: self.v * o.v, g }
     }
@@ -185,10 +185,11 @@ impl<const N: usize, B: PkNum> DualT<N, B> {
     }
 }
 
+impl<const N: usize, B: PkNum> crate::sens::num::RecHooks for DualT<N, B> {}
+
 impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     const SECOND_ORDER: bool = false;
     const JET_ORDER: usize = B::JET_ORDER + 1;
-    const WORK: usize = (1 + N) * B::WORK;
     /// `f` on the base with its tangent factor `f′` on the base: exact to the base's order,
     /// with no value read (a recording base records both, #2786).
     #[inline]

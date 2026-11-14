@@ -222,8 +222,54 @@ enum Ins {
 /// A register of a [`Flat`] program: a recording's (#2786) can number past 65k.
 pub(super) type Reg = u32;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Flat {
+/// A field of a [`Flat`] instruction as its [`FlatKey`] holds it: itself, or a literal's bits.
+trait KeyBits: Copy {
+    type Bits: Copy + Eq + std::hash::Hash;
+    fn key_bits(self) -> Self::Bits;
+}
+macro_rules! key_bits_self {
+    ($($t:ty),*) => {$(impl KeyBits for $t {
+        type Bits = $t;
+        #[inline]
+        fn key_bits(self) -> $t {
+            self
+        }
+    })*};
+}
+key_bits_self!(u8, u32, bool, Cc, Unary, crate::sens::num::HostFn);
+impl KeyBits for f64 {
+    type Bits = u64;
+    #[inline]
+    fn key_bits(self) -> u64 {
+        self.to_bits()
+    }
+}
+
+/// Defines [`Flat`] and, from the same variant list, [`FlatKey`]: the instruction with its
+/// literals as bits, which derives the exact content equality and hash the compiled path's
+/// caches key programs on (#2786), with no text rendering.
+macro_rules! flat_enum {
+    ($($(#[$m:meta])* $v:ident { $($f:ident : $t:ty),* $(,)? }),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Flat {
+            $($(#[$m])* $v { $($f: $t),* }),*
+        }
+        /// [`Flat`] with literals by their bits (`-0.0` is not `0.0`, a `NaN` is itself).
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum FlatKey {
+            $($v { $($f: <$t as KeyBits>::Bits),* }),*
+        }
+        impl Flat {
+            fn key(&self) -> FlatKey {
+                match *self {
+                    $(Flat::$v { $($f),* } => FlatKey::$v { $($f: $f.key_bits()),* }),*
+                }
+            }
+        }
+    };
+}
+
+flat_enum! {
     /// `r[d] = u[i]` (`0` past `u.len()`, as the binding fills a short `u`).
     LoadState {
         d: Reg,
@@ -301,7 +347,7 @@ enum Flat {
         a: Reg,
         b: Reg,
     },
-    /// Kernel recordings only (#2786, `PkNum::order_gate`): `r[d] = r[b]` in a compiled
+    /// Kernel recordings only (#2786, `RecHooks::order_gate`): `r[d] = r[b]` in a compiled
     /// variant whose derivative order reaches `k`, `r[a]` below it. Resolved per variant
     /// before lowering (`kernel_jit::resolve_gates`).
     Gate {
@@ -417,180 +463,9 @@ enum Flat {
     },
 }
 
-/// Structural hashing of an instruction, literals by their bits ([`Flat::same`]'s notion of
-/// equality): what the compiled path's caches key programs on (#2786), with no text rendering.
 impl std::hash::Hash for Flat {
     fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
-        std::mem::discriminant(self).hash(h);
-        match *self {
-            Flat::LoadState { d, i } => {
-                d.hash(h);
-                i.hash(h);
-            }
-            Flat::LoadParam { d, slot } => {
-                d.hash(h);
-                slot.hash(h);
-            }
-            Flat::LoadSeed { d, k } => {
-                d.hash(h);
-                k.hash(h);
-            }
-            Flat::LoadK { d, c } => {
-                d.hash(h);
-                c.to_bits().hash(h);
-            }
-            Flat::Add { d, a, b } => {
-                d.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::Sub { d, a, b } => {
-                d.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::RSub { d, a, b } => {
-                d.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::Mul { d, a, b } => {
-                d.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::Div { d, a, b } => {
-                d.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::DivRaw { d, a, b } => {
-                d.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::HostArg { a } => {
-                a.hash(h);
-            }
-            Flat::Host { f } => {
-                f.hash(h);
-            }
-            Flat::HostOut { d, k } => {
-                d.hash(h);
-                k.hash(h);
-            }
-            Flat::Select { d, c, a, b } => {
-                d.hash(h);
-                c.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::Gate { d, a, b, k } => {
-                d.hash(h);
-                a.hash(h);
-                b.hash(h);
-                k.hash(h);
-            }
-            Flat::LoopArg { a } => {
-                a.hash(h);
-            }
-            Flat::Loop { id } => {
-                id.hash(h);
-            }
-            Flat::LoopOut { d, k } => {
-                d.hash(h);
-                k.hash(h);
-            }
-            Flat::GammaPq {
-                d,
-                a,
-                x,
-                upper,
-                i,
-                j,
-            } => {
-                d.hash(h);
-                a.hash(h);
-                x.hash(h);
-                upper.hash(h);
-                i.hash(h);
-                j.hash(h);
-            }
-            Flat::AddK { d, a, c } => {
-                d.hash(h);
-                a.hash(h);
-                c.to_bits().hash(h);
-            }
-            Flat::SubK { d, a, c } => {
-                d.hash(h);
-                a.hash(h);
-                c.to_bits().hash(h);
-            }
-            Flat::RSubK { d, a, c } => {
-                d.hash(h);
-                a.hash(h);
-                c.to_bits().hash(h);
-            }
-            Flat::MulK { d, a, c } => {
-                d.hash(h);
-                a.hash(h);
-                c.to_bits().hash(h);
-            }
-            Flat::DivK { d, a, c } => {
-                d.hash(h);
-                a.hash(h);
-                c.to_bits().hash(h);
-            }
-            Flat::Pow { d, a, e } => {
-                d.hash(h);
-                a.hash(h);
-                e.hash(h);
-            }
-            Flat::Unary { d, op, a } => {
-                d.hash(h);
-                op.hash(h);
-                a.hash(h);
-            }
-            Flat::Deriv { state, a } => {
-                state.hash(h);
-                a.hash(h);
-            }
-            Flat::Cmp { d, cc, a, b } => {
-                d.hash(h);
-                cc.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::And { d, a, b } => {
-                d.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::Or { d, a, b } => {
-                d.hash(h);
-                a.hash(h);
-                b.hash(h);
-            }
-            Flat::Not { d, a } => {
-                d.hash(h);
-                a.hash(h);
-            }
-            Flat::Present { d, a } => {
-                d.hash(h);
-                a.hash(h);
-            }
-            Flat::Branch { c, to } => {
-                c.hash(h);
-                to.hash(h);
-            }
-            Flat::Jump { to } => {
-                to.hash(h);
-            }
-            Flat::Move { d, a } => {
-                d.hash(h);
-                a.hash(h);
-            }
-        }
+        self.key().hash(h)
     }
 }
 
@@ -598,290 +473,7 @@ impl Flat {
     /// Equal instruction for instruction, literals bit for bit (`-0.0` is not `0.0`, a `NaN`
     /// is itself): two programs that are `same` compute the same values.
     pub(super) fn same(&self, other: &Flat) -> bool {
-        match (*self, *other) {
-            (Flat::LoadState { d: d0, i: i0 }, Flat::LoadState { d: d1, i: i1 }) => {
-                d0 == d1 && i0 == i1
-            }
-            (Flat::LoadParam { d: d0, slot: slot0 }, Flat::LoadParam { d: d1, slot: slot1 }) => {
-                d0 == d1 && slot0 == slot1
-            }
-            (Flat::LoadSeed { d: d0, k: k0 }, Flat::LoadSeed { d: d1, k: k1 }) => {
-                d0 == d1 && k0 == k1
-            }
-            (Flat::LoadK { d: d0, c: c0 }, Flat::LoadK { d: d1, c: c1 }) => {
-                d0 == d1 && c0.to_bits() == c1.to_bits()
-            }
-            (
-                Flat::Add {
-                    d: d0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::Add {
-                    d: d1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && a0 == a1 && b0 == b1,
-            (
-                Flat::Sub {
-                    d: d0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::Sub {
-                    d: d1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && a0 == a1 && b0 == b1,
-            (
-                Flat::RSub {
-                    d: d0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::RSub {
-                    d: d1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && a0 == a1 && b0 == b1,
-            (
-                Flat::Mul {
-                    d: d0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::Mul {
-                    d: d1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && a0 == a1 && b0 == b1,
-            (
-                Flat::Div {
-                    d: d0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::Div {
-                    d: d1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && a0 == a1 && b0 == b1,
-            (
-                Flat::DivRaw {
-                    d: d0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::DivRaw {
-                    d: d1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && a0 == a1 && b0 == b1,
-            (Flat::HostArg { a: a0 }, Flat::HostArg { a: a1 }) => a0 == a1,
-            (Flat::Host { f: f0 }, Flat::Host { f: f1 }) => f0 == f1,
-            (Flat::HostOut { d: d0, k: k0 }, Flat::HostOut { d: d1, k: k1 }) => {
-                d0 == d1 && k0 == k1
-            }
-            (
-                Flat::Select {
-                    d: d0,
-                    c: c0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::Select {
-                    d: d1,
-                    c: c1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && c0 == c1 && a0 == a1 && b0 == b1,
-            (
-                Flat::Gate {
-                    d: d0,
-                    a: a0,
-                    b: b0,
-                    k: k0,
-                },
-                Flat::Gate {
-                    d: d1,
-                    a: a1,
-                    b: b1,
-                    k: k1,
-                },
-            ) => d0 == d1 && a0 == a1 && b0 == b1 && k0 == k1,
-            (Flat::LoopArg { a: a0 }, Flat::LoopArg { a: a1 }) => a0 == a1,
-            (Flat::Loop { id: id0 }, Flat::Loop { id: id1 }) => id0 == id1,
-            (Flat::LoopOut { d: d0, k: k0 }, Flat::LoopOut { d: d1, k: k1 }) => {
-                d0 == d1 && k0 == k1
-            }
-            (
-                Flat::GammaPq {
-                    d: d0,
-                    a: a0,
-                    x: x0,
-                    upper: upper0,
-                    i: i0,
-                    j: j0,
-                },
-                Flat::GammaPq {
-                    d: d1,
-                    a: a1,
-                    x: x1,
-                    upper: upper1,
-                    i: i1,
-                    j: j1,
-                },
-            ) => d0 == d1 && a0 == a1 && x0 == x1 && upper0 == upper1 && i0 == i1 && j0 == j1,
-            (
-                Flat::AddK {
-                    d: d0,
-                    a: a0,
-                    c: c0,
-                },
-                Flat::AddK {
-                    d: d1,
-                    a: a1,
-                    c: c1,
-                },
-            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
-            (
-                Flat::SubK {
-                    d: d0,
-                    a: a0,
-                    c: c0,
-                },
-                Flat::SubK {
-                    d: d1,
-                    a: a1,
-                    c: c1,
-                },
-            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
-            (
-                Flat::RSubK {
-                    d: d0,
-                    a: a0,
-                    c: c0,
-                },
-                Flat::RSubK {
-                    d: d1,
-                    a: a1,
-                    c: c1,
-                },
-            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
-            (
-                Flat::MulK {
-                    d: d0,
-                    a: a0,
-                    c: c0,
-                },
-                Flat::MulK {
-                    d: d1,
-                    a: a1,
-                    c: c1,
-                },
-            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
-            (
-                Flat::DivK {
-                    d: d0,
-                    a: a0,
-                    c: c0,
-                },
-                Flat::DivK {
-                    d: d1,
-                    a: a1,
-                    c: c1,
-                },
-            ) => d0 == d1 && a0 == a1 && c0.to_bits() == c1.to_bits(),
-            (
-                Flat::Pow {
-                    d: d0,
-                    a: a0,
-                    e: e0,
-                },
-                Flat::Pow {
-                    d: d1,
-                    a: a1,
-                    e: e1,
-                },
-            ) => d0 == d1 && a0 == a1 && e0 == e1,
-            (
-                Flat::Unary {
-                    d: d0,
-                    op: op0,
-                    a: a0,
-                },
-                Flat::Unary {
-                    d: d1,
-                    op: op1,
-                    a: a1,
-                },
-            ) => d0 == d1 && op0 == op1 && a0 == a1,
-            (
-                Flat::Deriv {
-                    state: state0,
-                    a: a0,
-                },
-                Flat::Deriv {
-                    state: state1,
-                    a: a1,
-                },
-            ) => state0 == state1 && a0 == a1,
-            (
-                Flat::Cmp {
-                    d: d0,
-                    cc: cc0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::Cmp {
-                    d: d1,
-                    cc: cc1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && cc0 == cc1 && a0 == a1 && b0 == b1,
-            (
-                Flat::And {
-                    d: d0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::And {
-                    d: d1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && a0 == a1 && b0 == b1,
-            (
-                Flat::Or {
-                    d: d0,
-                    a: a0,
-                    b: b0,
-                },
-                Flat::Or {
-                    d: d1,
-                    a: a1,
-                    b: b1,
-                },
-            ) => d0 == d1 && a0 == a1 && b0 == b1,
-            (Flat::Not { d: d0, a: a0 }, Flat::Not { d: d1, a: a1 }) => d0 == d1 && a0 == a1,
-            (Flat::Present { d: d0, a: a0 }, Flat::Present { d: d1, a: a1 }) => {
-                d0 == d1 && a0 == a1
-            }
-            (Flat::Branch { c: c0, to: to0 }, Flat::Branch { c: c1, to: to1 }) => {
-                c0 == c1 && to0 == to1
-            }
-            (Flat::Jump { to: to0 }, Flat::Jump { to: to1 }) => to0 == to1,
-            (Flat::Move { d: d0, a: a0 }, Flat::Move { d: d1, a: a1 }) => d0 == d1 && a0 == a1,
-            _ => false,
-        }
+        self.key() == other.key()
     }
 }
 

@@ -61,7 +61,6 @@
 //! those are the individual search tools. The runner takes a list and returns
 //! the same list scored.
 
-use crate::cold_sort::ColdSort;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -605,7 +604,7 @@ fn cost_groups(candidates: &[Candidate], todo: &[usize]) -> Vec<Vec<usize>> {
             costs.push(cost);
         }
     }
-    costs.cold_sort_by(&|a, b| b.total_cmp(a));
+    costs.sort_by(|a, b| b.total_cmp(a));
     costs
         .into_iter()
         .map(|cost| {

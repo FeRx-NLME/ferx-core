@@ -317,10 +317,7 @@ pub(crate) fn reported_optimizer_label(
                 options.optimizer,
                 model,
                 has_mixture,
-                crate::sens::provider::analytic_outer_gradient_for_interaction(
-                    model,
-                    options.interaction,
-                ),
+                crate::sens::provider::analytic_outer_gradient_available(model),
             );
             if options.optimizer == Optimizer::Auto {
                 format!("auto ({})", resolved.label())

@@ -177,8 +177,7 @@ macro_rules! at_literal_n {
 
 /// The `f64` factorization at a literal `n` for the systems an ODE stepper factors every
 /// attempt ([`UNROLLED_N`]), so the compiler unrolls it: the operations, and their order,
-/// are unchanged. One copy for `f64` only; a dual's body is dominated by its jets (or runs
-/// in `lu_factor_hook`), so unrolling it would only multiply its code (#2454 review).
+/// are unchanged. One copy for `f64` only; a dual's body is dominated by its jets, so unrolling it would only multiply its code (#2454 review).
 #[inline]
 fn lu_factor_f64(m: &mut [f64], piv: &mut [f64], n: usize) -> bool {
     at_literal_n!(n, |k| lu_factor_body(m, piv, k))
@@ -192,9 +191,6 @@ fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [T], n: usize) -> bool {
         lu_piv_len::<T>(n),
         "pivot storage must be `lu_piv_len` long"
     );
-    if let Some(ok) = T::lu_factor_hook(m, piv, n) {
-        return ok;
-    }
     if T::RECORDS_BRANCHES {
         return lu_factor_recorded(m, piv, n);
     }
@@ -363,7 +359,7 @@ fn lu_solve_recorded<T: PkNum>(piv: &[T], n: usize, b: &mut [T]) {
     lu_substitute(lu, pv, n, &mut x0);
     // Refinement against the value factorization makes one more derivative order exact per
     // step; the reverse holds that factorization fixed, so it needs one step past the
-    // forward's order. Step `k` is gated at order `k` (`PkNum::order_gate`): a compiled
+    // forward's order. Step `k` is gated at order `k` (`RecHooks::order_gate`): a compiled
     // variant runs exactly the steps its order needs, a value forward none.
     let mut x = x0.clone();
     for k in 1..=REFINE_STEPS {
@@ -426,9 +422,6 @@ fn lu_solve_f64(m: &[f64], piv: &[f64], n: usize, b: &mut [f64]) {
 fn lu_solve_body<T: PkNum>(m: &[T], piv: &[T], n: usize, b: &mut [T]) {
     debug_assert_eq!(m.len(), n * n, "factorization must be n×n row-major");
     debug_assert_eq!(b.len(), n, "right-hand side must have length n");
-    if T::lu_solve_hook(m, piv, n, b) {
-        return;
-    }
     if T::RECORDS_BRANCHES {
         return lu_solve_recorded(piv, n, b);
     }

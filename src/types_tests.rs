@@ -321,7 +321,7 @@ fn resolve_auto_picks_nlopt_lbfgs_when_analytic() {
     // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
     let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&m, true),
+        Optimizer::Auto.resolve_auto(&m),
         Optimizer::NloptLbfgs,
         "analytic-gradient model should resolve auto → nlopt_lbfgs"
     );
@@ -335,7 +335,7 @@ fn resolve_auto_picks_bobyqa_when_fd_only() {
     let forced_fd = test_helpers::analytical_model(GradientMethod::Fd);
     for m in [&ode, &forced_fd] {
         assert_eq!(
-            Optimizer::Auto.resolve_auto(m, true),
+            Optimizer::Auto.resolve_auto(m),
             Optimizer::Bobyqa,
             "FD-only model should resolve auto → bobyqa"
         );
@@ -353,12 +353,12 @@ fn resolve_auto_analytic_for_custom_magnitude_both_loops() {
     assert!(m.has_custom_ruv_magnitude());
     assert!(crate::sens::provider::analytic_outer_gradient_available(&m));
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&m, false),
+        Optimizer::Auto.resolve_auto(&m),
         Optimizer::NloptLbfgs,
         "FOCE + custom magnitude now has the analytic gradient"
     );
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&m, true),
+        Optimizer::Auto.resolve_auto(&m),
         Optimizer::NloptLbfgs,
         "FOCEI + custom magnitude has the analytic gradient"
     );
@@ -377,7 +377,7 @@ fn resolve_auto_is_identity_for_concrete_optimizers() {
         Optimizer::Bobyqa,
         Optimizer::TrustRegion,
     ] {
-        assert_eq!(opt.resolve_auto(&m, true), opt);
+        assert_eq!(opt.resolve_auto(&m), opt);
     }
 }
 
@@ -3573,7 +3573,7 @@ mod theta_block_scale_guards {
         model.gradient_method = crate::types::GradientMethod::Fd;
         assert!(model.free_packed_dim() <= BOBYQA_MAX_DIM);
         assert_eq!(
-            Optimizer::Auto.resolve_auto(&model, true),
+            Optimizer::Auto.resolve_auto(&model),
             Optimizer::Bobyqa,
             "small models must be unaffected by the scale guard"
         );
@@ -3585,10 +3585,7 @@ mod theta_block_scale_guards {
         // resolves to the gradient-based optimizer exactly as it would without
         // the block.
         let model = wide_model(4);
-        assert_eq!(
-            Optimizer::Auto.resolve_auto(&model, true),
-            Optimizer::NloptLbfgs
-        );
+        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::NloptLbfgs);
     }
 
     #[test]
@@ -3597,10 +3594,7 @@ mod theta_block_scale_guards {
         // hundred θ the interpolation set alone is the whole budget.
         let model = wide_model(BOBYQA_MAX_DIM + 10);
         assert!(model.free_packed_dim() > BOBYQA_MAX_DIM);
-        assert_eq!(
-            Optimizer::Auto.resolve_auto(&model, true),
-            Optimizer::NloptLbfgs
-        );
+        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::NloptLbfgs);
     }
 
     #[test]
@@ -3612,7 +3606,7 @@ mod theta_block_scale_guards {
             Optimizer::Mma,
             Optimizer::TrustRegion,
         ] {
-            assert_eq!(opt.resolve_auto(&model, true), opt);
+            assert_eq!(opt.resolve_auto(&model), opt);
         }
     }
 
@@ -4503,12 +4497,7 @@ mod kappa_correlation_auto_route {
         for m in [&on, &kappa_only, &corr_only] {
             assert!(m.free_packed_dim() <= BOBYQA_MAX_DIM);
             assert!(analytic_outer_gradient_in_scope(m));
-            for interaction in [true, false] {
-                assert_eq!(
-                    Optimizer::Auto.resolve_auto(m, interaction),
-                    Optimizer::NloptLbfgs
-                );
-            }
+            assert_eq!(Optimizer::Auto.resolve_auto(m), Optimizer::NloptLbfgs);
             assert_eq!(
                 Optimizer::Auto.resolve_auto_given_analytic(m, false),
                 Optimizer::Bobyqa

@@ -1060,18 +1060,14 @@ impl<T: PkNum> StepClock<T> {
             T::from_f64(1.0 / (c * self.dt))
         }
     }
-    /// [`PkNum::lincomb`] at this step's `dt`: `u + dt·(Σ cⱼ·kⱼ)`.
+    /// `u + dt·(Σ cⱼ·kⱼ)`, summed left to right: an explicit RK stage combination.
     #[inline]
     pub(crate) fn lincomb(&self, u: T, cs: &[f64], ks: &[T]) -> T {
-        if T::RECORDS_BRANCHES {
-            let mut acc = T::from_f64(cs[0]) * ks[0];
-            for j in 1..cs.len() {
-                acc = acc + T::from_f64(cs[j]) * ks[j];
-            }
-            u + self.dts * acc
-        } else {
-            T::lincomb(u, self.dt, cs, ks)
+        let mut acc = T::from_f64(cs[0]) * ks[0];
+        for j in 1..cs.len() {
+            acc = acc + T::from_f64(cs[j]) * ks[j];
         }
+        u + self.h() * acc
     }
 }
 
@@ -1116,8 +1112,7 @@ pub(crate) trait Stepper<T: PkNum> {
     /// Hook fired once the driver commits a step (RK45 carries `k7` into the next `k1`).
     fn on_accept(&mut self);
 
-    /// Hook fired when the driver rejects the last attempt. A taping numeric type uses it to
-    /// drop the rejected attempt's records ([`PkNum::tape_rollback`]); no-op otherwise.
+    /// Hook fired when the driver rejects the last attempt; no-op by default.
     fn on_reject(&mut self) {}
 
     /// I-controller exponent `1/(p̂+1)` for this method's embedded pair.
@@ -1716,8 +1711,6 @@ pub(crate) struct Rk45Stepper<T> {
     u_tmp: Vec<T>,
     u5: Vec<T>,
     have_k1: bool,
-    /// Tape mark taken after `k1` (see [`Stepper::on_reject`]).
-    mark: usize,
 }
 
 /// A [`Rk45Stepper`] taken from this thread's pool and returned to it on drop (#1564). Every
@@ -1853,7 +1846,6 @@ impl<T: PkNum> Rk45Stepper<T> {
             v.fill(z);
         }
         self.have_k1 = false;
-        self.mark = 0;
     }
 
     pub(crate) fn new(n: usize) -> Self {
@@ -1870,7 +1862,6 @@ impl<T: PkNum> Rk45Stepper<T> {
             u_tmp: vec![z; n],
             u5: vec![z; n],
             have_k1: false,
-            mark: 0,
         }
     }
 }
@@ -2009,7 +2000,6 @@ impl<T: PkNum> Rk45Stepper<T> {
             u_tmp,
             u5,
             have_k1,
-            mark,
             ..
         } = self;
         let (k1, k2, k3, k4, k5, k6, k7) = (
@@ -2026,8 +2016,6 @@ impl<T: PkNum> Rk45Stepper<T> {
             rhs.call(u, params, clock.start(), k1);
             *have_k1 = true;
         }
-        *mark = T::tape_mark();
-
         let b21 = clock.dt_times(B21);
         for i in 0..n {
             u_tmp[i] = u[i] + b21 * k1[i];
@@ -2216,11 +2204,6 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     fn on_accept(&mut self) {
         // `k7` (at the accepted end point) becomes the next step's `k1`; it is dead otherwise.
         std::mem::swap(&mut self.k1, &mut self.k7);
-    }
-
-    fn on_reject(&mut self) {
-        // `k1` predates the mark, so it survives; every other stage is recomputed.
-        T::tape_rollback(self.mark);
     }
 
     fn err_exp(&self) -> f64 {

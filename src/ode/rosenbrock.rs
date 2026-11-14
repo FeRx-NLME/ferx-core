@@ -72,9 +72,6 @@ const MAX_ROS_STAGES: usize = 8;
 /// before its dose, or any compartment that has not been reached yet.
 const FD_FLOOR: f64 = 1e-5;
 
-/// The most stages any tableau here has (Rodas5P), sizing the stage folds' term buffers.
-const MAX_STAGES: usize = 8;
-
 /// A Rosenbrock tableau in the `RODAS` convention (see the module docs). Rows `i` use only
 /// entries `j < i`; the unused tail is zero-padded to [`MAX_ROS_STAGES`].
 struct RosTableau {
@@ -845,7 +842,7 @@ impl<T: PkNum> RosWorkspace<T> {
             self.u_tmp[j] = u[j] + T::from_f64(delt);
             rhs.call(&self.u_tmp, params, clock.start(), &mut self.f_tmp);
             for i in 0..n {
-                self.jac[i * n + j] = T::scaled_diff(self.f_tmp[i], self.f0[i], 1.0 / delt);
+                self.jac[i * n + j] = (self.f_tmp[i] - self.f0[i]) * T::from_f64(1.0 / delt);
             }
         }
         let delt = (f64::EPSILON * clock.t.abs().max(FD_FLOOR)).sqrt();
@@ -856,7 +853,7 @@ impl<T: PkNum> RosWorkspace<T> {
             &mut self.f_tmp,
         );
         for i in 0..n {
-            self.ft[i] = T::scaled_diff(self.f_tmp[i], self.f0[i], 1.0 / delt);
+            self.ft[i] = (self.f_tmp[i] - self.f0[i]) * T::from_f64(1.0 / delt);
         }
     }
 
@@ -905,7 +902,6 @@ impl<T: PkNum> RosWorkspace<T> {
         clock: &StepClock<T>,
         tab: &RosTableau,
     ) {
-        let dt = clock.dt;
         let n = self.n;
         let s = tab.stages;
         // Every buffer cut to `n` up front, so the loops index without bounds checks; the
@@ -926,24 +922,13 @@ impl<T: PkNum> RosWorkspace<T> {
         let (u_tmp, f_tmp, f0, ft) = (&mut u_tmp[..n], &mut f_tmp[..n], &f0[..n], &ft[..n]);
         let (rhs_tmp, u) = (&mut rhs_tmp[..n], &u[..n]);
         for i in 0..s {
-            // u_i = u + Σ_{j<i} a_ij k_j, left to right. A taped type folds each entry into
-            // one tape node (`PkNum::axpy_fold`, the same values); the rest keep the loop.
-            let mut terms = [(T::from_f64(0.0), 0.0); MAX_STAGES];
-            if T::FUSED_FOLDS {
+            // u_i = u + Σ_{j<i} a_ij k_j, left to right.
+            u_tmp.copy_from_slice(u);
+            for (j, kj) in ks[..i].iter().enumerate() {
+                let wt = T::from_f64(tab.a[i][j]);
+                let kj = &kj[..n];
                 for idx in 0..n {
-                    for (j, kj) in ks[..i].iter().enumerate() {
-                        terms[j] = (kj[idx], tab.a[i][j]);
-                    }
-                    u_tmp[idx] = T::axpy_fold(u[idx], &terms[..i]);
-                }
-            } else {
-                u_tmp.copy_from_slice(u);
-                for (j, kj) in ks[..i].iter().enumerate() {
-                    let wt = T::from_f64(tab.a[i][j]);
-                    let kj = &kj[..n];
-                    for idx in 0..n {
-                        u_tmp[idx] = u_tmp[idx] + kj[idx] * wt;
-                    }
+                    u_tmp[idx] = u_tmp[idx] + kj[idx] * wt;
                 }
             }
             if i == 0 {
@@ -952,27 +937,16 @@ impl<T: PkNum> RosWorkspace<T> {
             } else {
                 rhs.call(u_tmp, params, clock.at(tab.alpha[i]), f_tmp);
             }
-            // rhs_i = f_i + h·γ_i·f_t + (1/h)·Σ_{j<i} c_ij k_j, left to right (folded per
-            // entry on a taped type, as above).
-            if T::FUSED_FOLDS {
+            // rhs_i = f_i + h·γ_i·f_t + (1/h)·Σ_{j<i} c_ij k_j, left to right.
+            let hd = clock.dt_times(tab.d[i]);
+            for idx in 0..n {
+                rhs_tmp[idx] = f_tmp[idx] + ft[idx] * hd;
+            }
+            for (j, kj) in ks[..i].iter().enumerate() {
+                let wt = clock.over_dt(tab.c[i][j]);
+                let kj = &kj[..n];
                 for idx in 0..n {
-                    terms[0] = (ft[idx], dt * tab.d[i]);
-                    for (j, kj) in ks[..i].iter().enumerate() {
-                        terms[1 + j] = (kj[idx], tab.c[i][j] / dt);
-                    }
-                    rhs_tmp[idx] = T::axpy_fold(f_tmp[idx], &terms[..1 + i]);
-                }
-            } else {
-                let hd = clock.dt_times(tab.d[i]);
-                for idx in 0..n {
-                    rhs_tmp[idx] = f_tmp[idx] + ft[idx] * hd;
-                }
-                for (j, kj) in ks[..i].iter().enumerate() {
-                    let wt = clock.over_dt(tab.c[i][j]);
-                    let kj = &kj[..n];
-                    for idx in 0..n {
-                        rhs_tmp[idx] = rhs_tmp[idx] + kj[idx] * wt;
-                    }
+                    rhs_tmp[idx] = rhs_tmp[idx] + kj[idx] * wt;
                 }
             }
             ks[i][..n].copy_from_slice(rhs_tmp);
@@ -1168,8 +1142,6 @@ pub(crate) struct RosStepper<T> {
     /// which is the only event that moves `(u, t)`. A *rejected* attempt changes `dt` alone,
     /// so the retry reuses them and pays for the factorization only.
     jac_valid: bool,
-    /// Tape mark taken after the (retry-reused) Jacobian.
-    mark: usize,
 }
 
 impl<T: PkNum> RosStepper<T> {
@@ -1181,7 +1153,6 @@ impl<T: PkNum> RosStepper<T> {
             usable: false,
             usable_t: T::from_f64(0.0),
             jac_valid: false,
-            mark: 0,
         }
     }
 }
@@ -1210,7 +1181,6 @@ impl<T: PkNum> RosStepper<T> {
             self.jac_valid = true;
         }
 
-        self.mark = T::tape_mark();
         if self.ws.factor_w(&clock, gamma).is_err() {
             // Singular `W`: no stage could be solved, so there is no `u_new` to score or to
             // force-accept. The driver shrinks `dt`, or gives up at `min_dt`.
@@ -1343,11 +1313,6 @@ impl<T: PkNum> super::solver::Stepper<T> for RosStepper<T> {
     fn on_accept(&mut self) {
         // `(u, t)` has moved, so the cached `f0` / `J` / `f_t` describe the previous step.
         self.jac_valid = START_KEPT_ON_ACCEPT;
-    }
-
-    fn on_reject(&mut self) {
-        // `f0`, `J`, `f_t` predate the mark and are reused by the retry.
-        T::tape_rollback(self.mark);
     }
 
     fn err_exp(&self) -> f64 {

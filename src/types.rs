@@ -11166,17 +11166,10 @@ impl Optimizer {
     /// reliable. (A residual `correlation` line with kappa, which #2122 sent to L-BFGS
     /// on its finite-difference gradient, is analytic since #2093 and takes the
     /// general rule.)
-    ///
-    /// `interaction` is `options.interaction` (`true` for `method = focei`,
-    /// `false` for plain `method = foce`) — a custom residual-magnitude model's
-    /// direct-θ channel is FOCEI-only (#486 review), so a magnitude-active model
-    /// under plain FOCE must still resolve to `Bobyqa` even though
-    /// `analytic_outer_gradient_available` (interaction-agnostic) says the model
-    /// is in scope.
-    pub fn resolve_auto(self, model: &CompiledModel, interaction: bool) -> Optimizer {
+    pub fn resolve_auto(self, model: &CompiledModel) -> Optimizer {
         self.resolve_auto_given_analytic(
             model,
-            crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction),
+            crate::sens::provider::analytic_outer_gradient_available(model),
         )
     }
 

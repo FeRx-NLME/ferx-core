@@ -30501,6 +30501,23 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
         };
     }
 
+    // A comparison as data on a recording type, as a branch on the values otherwise.
+    macro_rules! cmp {
+        ($cc:ident) => {{
+            let r = pop!();
+            let l = pop!();
+            push!(if rec {
+                T::select_if(BranchCmp::$cc, l, r, k(1.0), k(0.0))
+            } else {
+                k(if l.br_cmp(BranchCmp::$cc, r) {
+                    1.0
+                } else {
+                    0.0
+                })
+            });
+        }};
+    }
+
     while pc < end {
         match ops[pc] {
             // Operand fusion: a push consumed directly by a binary arithmetic op is
@@ -30641,132 +30658,78 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                 let v = pop!();
                 push!(pnorm_g(v));
             }
-            Op::Logit if rec => {
-                // The clamp as selections, `logit` read at a safe point outside `(0, 1)`.
-                let v = pop!();
-                let (lo, hi) = (1e-15_f64, 1.0 - 1e-15);
-                let inside = T::select_if(BranchCmp::Gt, v, k(lo), k(1.0), k(0.0));
-                let inside = T::select_if(BranchCmp::Lt, v, k(hi), inside, k(0.0));
-                let safe = T::select_if(BranchCmp::Ne, inside, k(0.0), v, k(0.5));
-                let r = T::select_if(BranchCmp::Ge, v, k(hi), k((hi / lo).ln()), safe.logit());
-                push!(T::select_if(BranchCmp::Le, v, k(lo), k((lo / hi).ln()), r));
-            }
             Op::Logit => {
                 let v = pop!();
-                // Match the scalar path's clamp to (0,1); the clamped region is
-                // flat (zero jet for duals).
-                let r = if v.br_cmp_c(crate::sens::num::BranchCmp::Le, 1e-15) {
-                    k((1e-15_f64 / (1.0 - 1e-15)).ln())
-                } else if v.br_cmp_c(crate::sens::num::BranchCmp::Ge, 1.0 - 1e-15) {
-                    k(((1.0 - 1e-15_f64) / 1e-15).ln())
+                if rec {
+                    // The clamp as selections, `logit` read at a safe point outside `(0, 1)`.
+                    let (lo, hi) = (1e-15_f64, 1.0 - 1e-15);
+                    let inside = T::select_if(BranchCmp::Gt, v, k(lo), k(1.0), k(0.0));
+                    let inside = T::select_if(BranchCmp::Lt, v, k(hi), inside, k(0.0));
+                    let safe = T::select_if(BranchCmp::Ne, inside, k(0.0), v, k(0.5));
+                    let r = T::select_if(BranchCmp::Ge, v, k(hi), k((hi / lo).ln()), safe.logit());
+                    push!(T::select_if(BranchCmp::Le, v, k(lo), k((lo / hi).ln()), r));
                 } else {
-                    v.logit()
-                };
-                push!(r);
+                    // Match the scalar path's clamp to (0,1); the clamped region is
+                    // flat (zero jet for duals).
+                    let r = if v.br_cmp_c(BranchCmp::Le, 1e-15) {
+                        k((1e-15_f64 / (1.0 - 1e-15)).ln())
+                    } else if v.br_cmp_c(BranchCmp::Ge, 1.0 - 1e-15) {
+                        k(((1.0 - 1e-15_f64) / 1e-15).ln())
+                    } else {
+                        v.logit()
+                    };
+                    push!(r);
+                }
             }
-            Op::CmpLt if rec => {
-                let r = pop!();
-                let l = pop!();
-                push!(T::select_if(BranchCmp::Lt, l, r, k(1.0), k(0.0)));
-            }
-            Op::CmpLt => {
-                let r = pop!();
-                let l = pop!();
-                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Lt, r) {
-                    1.0
-                } else {
-                    0.0
-                }));
-            }
-            Op::CmpLe if rec => {
-                let r = pop!();
-                let l = pop!();
-                push!(T::select_if(BranchCmp::Le, l, r, k(1.0), k(0.0)));
-            }
-            Op::CmpLe => {
-                let r = pop!();
-                let l = pop!();
-                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Le, r) {
-                    1.0
-                } else {
-                    0.0
-                }));
-            }
-            Op::CmpGt if rec => {
-                let r = pop!();
-                let l = pop!();
-                push!(T::select_if(BranchCmp::Gt, l, r, k(1.0), k(0.0)));
-            }
-            Op::CmpGt => {
-                let r = pop!();
-                let l = pop!();
-                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Gt, r) {
-                    1.0
-                } else {
-                    0.0
-                }));
-            }
-            Op::CmpGe if rec => {
-                let r = pop!();
-                let l = pop!();
-                push!(T::select_if(BranchCmp::Ge, l, r, k(1.0), k(0.0)));
-            }
-            Op::CmpGe => {
-                let r = pop!();
-                let l = pop!();
-                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Ge, r) {
-                    1.0
-                } else {
-                    0.0
-                }));
-            }
-            Op::CmpEq if rec => {
-                let r = pop!();
-                let l = pop!();
-                push!(T::select_if(BranchCmp::Eq, l, r, k(1.0), k(0.0)));
-            }
-            Op::CmpEq => {
-                let r = pop!();
-                let l = pop!();
-                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Eq, r) {
-                    1.0
-                } else {
-                    0.0
-                }));
-            }
-            Op::CmpNe if rec => {
-                let r = pop!();
-                let l = pop!();
-                push!(T::select_if(BranchCmp::Ne, l, r, k(1.0), k(0.0)));
-            }
-            Op::CmpNe => {
-                let r = pop!();
-                let l = pop!();
-                push!(k(if l.br_cmp(crate::sens::num::BranchCmp::Ne, r) {
-                    1.0
-                } else {
-                    0.0
-                }));
-            }
-            Op::LogicAnd if rec => {
+            Op::CmpLt => cmp!(Lt),
+            Op::CmpLe => cmp!(Le),
+            Op::CmpGt => cmp!(Gt),
+            Op::CmpGe => cmp!(Ge),
+            Op::CmpEq => cmp!(Eq),
+            Op::CmpNe => cmp!(Ne),
+            Op::LogicAnd => {
                 let b = pop!();
                 let a = pop!();
-                let bb = T::select_if(BranchCmp::Ne, b, k(0.0), k(1.0), k(0.0));
-                push!(T::select_if(BranchCmp::Ne, a, k(0.0), bb, k(0.0)));
+                push!(if rec {
+                    let bb = T::select_if(BranchCmp::Ne, b, k(0.0), k(1.0), k(0.0));
+                    T::select_if(BranchCmp::Ne, a, k(0.0), bb, k(0.0))
+                } else {
+                    k(if a.val() != 0.0 && b.val() != 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    })
+                });
             }
-            Op::LogicOr if rec => {
+            Op::LogicOr => {
                 let b = pop!();
                 let a = pop!();
-                let bb = T::select_if(BranchCmp::Ne, b, k(0.0), k(1.0), k(0.0));
-                push!(T::select_if(BranchCmp::Ne, a, k(0.0), k(1.0), bb));
+                push!(if rec {
+                    let bb = T::select_if(BranchCmp::Ne, b, k(0.0), k(1.0), k(0.0));
+                    T::select_if(BranchCmp::Ne, a, k(0.0), k(1.0), bb)
+                } else {
+                    k(if a.val() != 0.0 || b.val() != 0.0 {
+                        1.0
+                    } else {
+                        0.0
+                    })
+                });
             }
-            Op::LogicNot if rec => {
+            Op::LogicNot => {
                 let v = pop!();
-                push!(T::select_if(BranchCmp::Eq, v, k(0.0), k(1.0), k(0.0)));
+                push!(if rec {
+                    T::select_if(BranchCmp::Eq, v, k(0.0), k(1.0), k(0.0))
+                } else {
+                    k(if v.val() == 0.0 { 1.0 } else { 0.0 })
+                });
             }
-            Op::IsPresent if rec => {
+            Op::IsPresent => {
                 let v = pop!();
-                push!(T::select_if(BranchCmp::Eq, v, v, k(1.0), k(0.0)));
+                push!(if rec {
+                    T::select_if(BranchCmp::Eq, v, v, k(1.0), k(0.0))
+                } else {
+                    k(if v.br_is_nan() { 0.0 } else { 1.0 })
+                });
             }
             Op::JumpIfFalse(target) if rec && !stack.last().is_some_and(|v| v.is_constant()) => {
                 // Both arms, each reading its inputs through `select(arm live, x,
@@ -30797,32 +30760,6 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                 push!(T::select_if(BranchCmp::Ne, cond, k(0.0), t, e));
                 pc = arm_end;
                 continue;
-            }
-            Op::LogicAnd => {
-                let b = pop!();
-                let a = pop!();
-                push!(k(if a.val() != 0.0 && b.val() != 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }));
-            }
-            Op::LogicOr => {
-                let b = pop!();
-                let a = pop!();
-                push!(k(if a.val() != 0.0 || b.val() != 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }));
-            }
-            Op::LogicNot => {
-                let v = pop!();
-                push!(k(if v.val() == 0.0 { 1.0 } else { 0.0 }));
-            }
-            Op::IsPresent => {
-                let v = pop!();
-                push!(k(if v.br_is_nan() { 0.0 } else { 1.0 }));
             }
             Op::JumpIfFalse(target) => {
                 let v = pop!();

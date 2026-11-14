@@ -72,7 +72,7 @@ pub(crate) enum CallLog {
 }
 use super::ir::{self, Func, Inst, Layout};
 use super::{Flat, Unary};
-use crate::sens::num::PkNum;
+use crate::sens::num::{PkNum, RecHooks};
 pub(crate) use ode_loop::LoopSpec;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -174,14 +174,14 @@ struct Rec {
     ode: bool,
     /// Each register's recorded value (`affine_parts` differentiates with them).
     vals: Vec<f64>,
-    /// Code positions where a chunk starts (`PkNum::chunk_mark`).
+    /// Code positions where a chunk starts (`RecHooks::chunk_mark`).
     marks: Vec<usize>,
     /// The η and θ input registers: `(register, index)`.
     eta_regs: Vec<(u32, usize)>,
     theta_regs: Vec<(u32, usize)>,
     guard: Option<u32>,
     /// The exact linear path's segments this recording integrated instead
-    /// ([`PkNum::note_linear_decline`]): the plan reports them on every run.
+    /// ([`RecHooks::note_linear_decline`]): the plan reports them on every run.
     declined: usize,
     /// How many sub-plan regions ([`fixed::record_sub`]) enclose the code being recorded: a
     /// sub-plan's inputs are dense (any lane may be live), so a loop call recorded inside
@@ -267,7 +267,7 @@ impl Rec {
 
 thread_local! {
     static REC: RefCell<Option<Rec>> = const { RefCell::new(None) };
-    /// The next ODE segment's span (`PkNum::span_hint`): each end's register, value, and
+    /// The next ODE segment's span (`RecHooks::span_hint`): each end's register, value, and
     /// whether it depends on the inputs.
     static SPAN: std::cell::Cell<Option<(u32, f64, bool, u32, f64, bool)>> =
         const { std::cell::Cell::new(None) };
@@ -414,6 +414,7 @@ const T_EXPREL: u8 = 27;
 const T_STOPGRAD: u8 = 28;
 const T_SELECT: u8 = 29;
 const T_JET: u8 = 30;
+#[cfg(feature = "markov")]
 const T_FLOOR: u8 = 31;
 const T_GATE: u8 = 32;
 /// A comparison: this plus its `ir::Cc`.
@@ -722,15 +723,6 @@ impl PkNum for Tr {
     fn is_constant(self) -> bool {
         !self.dep
     }
-    /// A chunk boundary: sharing (hash-consing) restarts, so a chunk's text depends only
-    /// on its own event, never on which values an earlier event happened to compute.
-    fn chunk_mark() {
-        REC.with(|r| {
-            if let Some(r) = r.borrow_mut().as_mut() {
-                r.marks.push(r.code.len());
-            }
-        });
-    }
     fn br_cmp(self, cc: crate::sens::num::BranchCmp, other: Self) -> bool {
         Self::guard_cmp(self, cc_of(cc), other)
     }
@@ -835,6 +827,93 @@ impl PkNum for Tr {
         });
         Self::select_reg(Tr::mk(holds as u8 as f64, c, true), a, b)
     }
+    fn jet_unary(self, f: crate::sens::num::JetFn) -> Self {
+        self.jet_k_node(f, 0)
+    }
+    fn jet_k(self, f: crate::sens::num::JetFn, k: u8) -> Self {
+        self.jet_k_node(f, k)
+    }
+    fn value_only(self) -> Self {
+        self.unary(T_STOPGRAD, Unary::StopGrad, self.v)
+    }
+    fn sin(self) -> Self {
+        Tr::sin(self)
+    }
+    /// One primitive with its derivatives (`linear::exprel_derivs`), not the lift.
+    fn exprel(self, _orders: usize) -> Self {
+        self.exprel_k(0)
+    }
+    fn inv_logit(self) -> Self {
+        self.unary(T_INVLOGIT, Unary::InvLogit, 1.0 / (1.0 + (-self.v).exp()))
+    }
+    fn logit(self) -> Self {
+        self.unary(T_LOGIT, Unary::Logit, (self.v / (1.0 - self.v)).ln())
+    }
+    fn cos(self) -> Self {
+        self.unary(T_COS, Unary::Cos, self.v.cos())
+    }
+    fn acos(self) -> Self {
+        self.unary(T_ACOS, Unary::Acos, self.v.acos())
+    }
+    fn ln_gamma(self) -> Self {
+        self.unary(
+            T_LNGAMMA,
+            Unary::LnGamma,
+            crate::stats::special::ln_gamma(self.v),
+        )
+    }
+    /// the forward dual's `guard_floor`: `!(v ≥ lo)` (a `NaN` included) is the constant `lo`. The test
+    /// is a value branch, so it is recorded as a guard and the taken arm is kept.
+    fn guard_floor(self, lo: f64) -> Self {
+        let keep = Self::guard_cmp(self, ir::Cc::Ge, Self::k(lo));
+        if keep {
+            self
+        } else {
+            Self::k(lo)
+        }
+    }
+    fn jets_finite(self) -> bool {
+        if self.dep {
+            fail("jets_finite".into());
+        }
+        true
+    }
+    fn jet_max_abs(self) -> f64 {
+        if self.dep {
+            fail("jet_max_abs".into());
+        }
+        0.0
+    }
+    fn lift2(self, v: f64, _d1: f64, _d2: f64) -> Self {
+        if self.dep {
+            fail("lift2".into());
+        }
+        Self::k(v)
+    }
+    fn lift3(self, v: f64, _d1: f64, _d2: f64, _d3: f64) -> Self {
+        if self.dep {
+            fail("lift3".into());
+        }
+        Self::k(v)
+    }
+    fn lift4(self, v: f64, _d1: f64, _d2: f64, _d3: f64, _d4: f64) -> Self {
+        if self.dep {
+            fail("lift4".into());
+        }
+        Self::k(v)
+    }
+}
+
+impl RecHooks for Tr {
+    /// A chunk boundary: sharing (hash-consing) restarts, so a chunk's text depends only
+    /// on its own event, never on which values an earlier event happened to compute.
+    fn chunk_mark() {
+        REC.with(|r| {
+            if let Some(r) = r.borrow_mut().as_mut() {
+                r.marks.push(r.code.len());
+            }
+        });
+    }
     fn ode_segment(
         rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
         u0: &[Self],
@@ -909,12 +988,7 @@ impl PkNum for Tr {
     ) -> Option<Option<Vec<Self>>> {
         Some(record_repeat(x0, count, body))
     }
-    fn jet_unary(self, f: crate::sens::num::JetFn) -> Self {
-        self.jet_k_node(f, 0)
-    }
-    fn jet_k(self, f: crate::sens::num::JetFn, k: u8) -> Self {
-        self.jet_k_node(f, k)
-    }
+    #[cfg(feature = "markov")]
     fn floor_c(self) -> Self {
         self.unary(T_FLOOR, Unary::Floor, self.v.floor())
     }
@@ -922,24 +996,14 @@ impl PkNum for Tr {
     fn magnitude_hint(self) -> f64 {
         self.v.abs()
     }
-    fn value_only(self) -> Self {
-        self.unary(T_STOPGRAD, Unary::StopGrad, self.v)
-    }
     fn order_gate(k: u8, skip: Self, take: Self) -> Self {
         Tr::gate_node(k, skip, take)
     }
     fn same_node(&self, other: &Self) -> bool {
         self.r == other.r && self.dep == other.dep && self.v.to_bits() == other.v.to_bits()
     }
-    fn sin(self) -> Self {
-        Tr::sin(self)
-    }
     fn note_linear_decline() {
         rec(|r| r.declined += 1);
-    }
-    /// One primitive with its derivatives (`linear::exprel_derivs`), not the lift.
-    fn exprel(self, _orders: usize) -> Self {
-        self.exprel_k(0)
     }
     fn affine_parts(
         rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
@@ -962,65 +1026,6 @@ impl PkNum for Tr {
     ) -> bool {
         jacobian(rhs, u, params, t, f, jac, ft);
         true
-    }
-    fn inv_logit(self) -> Self {
-        self.unary(T_INVLOGIT, Unary::InvLogit, 1.0 / (1.0 + (-self.v).exp()))
-    }
-    fn logit(self) -> Self {
-        self.unary(T_LOGIT, Unary::Logit, (self.v / (1.0 - self.v)).ln())
-    }
-    fn cos(self) -> Self {
-        self.unary(T_COS, Unary::Cos, self.v.cos())
-    }
-    fn acos(self) -> Self {
-        self.unary(T_ACOS, Unary::Acos, self.v.acos())
-    }
-    fn ln_gamma(self) -> Self {
-        self.unary(
-            T_LNGAMMA,
-            Unary::LnGamma,
-            crate::stats::special::ln_gamma(self.v),
-        )
-    }
-    /// the forward dual's `guard_floor`: `!(v ≥ lo)` (a `NaN` included) is the constant `lo`. The test
-    /// is a value branch, so it is recorded as a guard and the taken arm is kept.
-    fn guard_floor(self, lo: f64) -> Self {
-        let keep = Self::guard_cmp(self, ir::Cc::Ge, Self::k(lo));
-        if keep {
-            self
-        } else {
-            Self::k(lo)
-        }
-    }
-    fn jets_finite(self) -> bool {
-        if self.dep {
-            fail("jets_finite".into());
-        }
-        true
-    }
-    fn jet_max_abs(self) -> f64 {
-        if self.dep {
-            fail("jet_max_abs".into());
-        }
-        0.0
-    }
-    fn lift2(self, v: f64, _d1: f64, _d2: f64) -> Self {
-        if self.dep {
-            fail("lift2".into());
-        }
-        Self::k(v)
-    }
-    fn lift3(self, v: f64, _d1: f64, _d2: f64, _d3: f64) -> Self {
-        if self.dep {
-            fail("lift3".into());
-        }
-        Self::k(v)
-    }
-    fn lift4(self, v: f64, _d1: f64, _d2: f64, _d3: f64, _d4: f64) -> Self {
-        if self.dep {
-            fail("lift4".into());
-        }
-        Self::k(v)
     }
 }
 
@@ -2626,11 +2631,6 @@ pub(crate) struct Stats {
     pub(crate) compiled: AtomicUsize,
     pub(crate) shared: AtomicUsize,
     pub(crate) bad: AtomicUsize,
-    pub(crate) runs: AtomicUsize,
-    pub(crate) taped: AtomicUsize,
-    pub(crate) cov: AtomicUsize,
-    pub(crate) jets2: AtomicUsize,
-    pub(crate) spot_fail: AtomicUsize,
     pub(crate) guard_fail: AtomicUsize,
     pub(crate) compile_us: AtomicUsize,
     pub(crate) record_us: AtomicUsize,
@@ -2645,11 +2645,6 @@ pub(crate) static STATS: Stats = Stats {
     compiled: AtomicUsize::new(0),
     shared: AtomicUsize::new(0),
     bad: AtomicUsize::new(0),
-    runs: AtomicUsize::new(0),
-    taped: AtomicUsize::new(0),
-    cov: AtomicUsize::new(0),
-    jets2: AtomicUsize::new(0),
-    spot_fail: AtomicUsize::new(0),
     guard_fail: AtomicUsize::new(0),
     compile_us: AtomicUsize::new(0),
     record_us: AtomicUsize::new(0),
@@ -2663,19 +2658,14 @@ pub(crate) fn report() {
     if debug() {
         let s = &STATS;
         eprintln!(
-            "kjit: records {} templated {} replayed {} compiled {} shared {} bad {} runs {} taped {} cov {} jets2 {} guard-fails {} spot-fails {} record {:.1} ms compile {:.1} ms",
+            "kjit: records {} templated {} replayed {} compiled {} shared {} bad {} guard-fails {} record {:.1} ms compile {:.1} ms",
             s.records.load(Relaxed),
             s.templated.load(Relaxed),
             s.replayed.load(Relaxed),
             s.compiled.load(Relaxed),
             s.shared.load(Relaxed),
             s.bad.load(Relaxed),
-            s.runs.load(Relaxed),
-            s.taped.load(Relaxed),
-            s.cov.load(Relaxed),
-            s.jets2.load(Relaxed),
             s.guard_fail.load(Relaxed),
-            s.spot_fail.load(Relaxed),
             s.record_us.load(Relaxed) as f64 / 1e3,
             s.compile_us.load(Relaxed) as f64 / 1e3,
         );

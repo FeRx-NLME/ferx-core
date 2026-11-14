@@ -867,10 +867,11 @@ pub fn population_neg_elbo(
     let layout = PackedLayout::new(template);
     let (log_mask, lower, upper) = theta_sigma_masks(template);
 
-    let per_subj: Vec<Result<SubjectTerms, String>> = {
-        let __r0 = &population.subjects;
-        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-            let subject = &__r0[i];
+    let per_subj: Vec<Result<SubjectTerms, String>> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             subject_terms(
                 model,
                 subject,
@@ -885,8 +886,8 @@ pub fn population_neg_elbo(
                 &upper,
                 scratch,
             )
-        })
-    };
+        },
+    );
 
     let mut eval = ElboEval {
         neg_elbo: 0.0,

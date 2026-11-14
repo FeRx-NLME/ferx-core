@@ -146,15 +146,9 @@ pub fn gradient_method_outer(
             GradientMethodKind::FiniteDifferences
         }
         EstimationMethod::Foce | EstimationMethod::FoceI => {
-            // A FOCE / FOCEI stage scores under the flag its method implies
-            // (`crate::types::interaction_for`: FOCEI on, FOCE off, whatever the
-            // caller's `FitOptions::interaction` says), so `method` alone fixes it
-            // here; this function does not receive the options.
-            let interaction = crate::types::interaction_for(method, false);
             // Resolved by the outer loop's own dispatch rule (#1540), so a mixture
             // model's `auto` → BOBYQA downgrade reports "no outer gradient" here too.
-            let analytic =
-                crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction);
+            let analytic = crate::sens::provider::analytic_outer_gradient_available(model);
             let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
                 optimizer,
                 model,

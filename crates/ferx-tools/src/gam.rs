@@ -27,7 +27,6 @@
 //! emits a warning for each ETA whose shrinkage exceeds
 //! [`GamOptions::shrinkage_warn_threshold`].
 
-use crate::cold_sort::ColdSort;
 use ferx_core::{CovariateKind, CovariateTable, FitResult, Population};
 use nalgebra::{DMatrix, DVector};
 use rayon::prelude::*;
@@ -497,7 +496,7 @@ fn determine_cov_kind(
     let near_int = values.iter().all(|&v| (v - v.round()).abs() < 1e-6);
     if near_int {
         let mut sorted = values.clone();
-        sorted.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap());
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         sorted.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
         if sorted.len() <= 10 {
             return CovariateKind::Categorical;
@@ -856,7 +855,7 @@ pub(crate) fn ns_basis(x: &[f64], df: usize) -> DMatrix<f64> {
     }
 
     let mut sorted = x.to_vec();
-    sorted.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap());
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let xi_min = sorted[0];
     let xi_max = *sorted.last().unwrap();
@@ -973,7 +972,7 @@ pub(crate) fn ols_aic(x: &DMatrix<f64>, y: &DVector<f64>) -> Option<(f64, f64)> 
 /// `pub(crate)` for unit tests.
 pub(crate) fn categorical_levels(x: &[f64]) -> Vec<f64> {
     let mut levels: Vec<f64> = x.to_vec();
-    levels.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap());
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
     levels.dedup_by(|a, b| (*a - *b).abs() < 1e-10);
     levels
 }

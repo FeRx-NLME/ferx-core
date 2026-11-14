@@ -677,10 +677,9 @@ pub(crate) fn compute_subject_results(
     mixest: Option<&[usize]>,
     collect_solver_stats: bool,
 ) -> (Vec<SubjectResult>, crate::ode::solver::OdeSolverStats) {
-    let per_subject: Vec<(SubjectResult, crate::ode::solver::OdeSolverStats)> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
+    let per_subject: Vec<(SubjectResult, crate::ode::solver::OdeSolverStats)> =
+        crate::par::map(population.subjects.len(), |i| {
+            let subject = &population.subjects[i];
             // Declared before the mixture guard so it is dropped *after* it: the
             // scope must still be open while this subject's integrations run.
             let stats_scope =
@@ -966,8 +965,7 @@ pub(crate) fn compute_subject_results(
             // scope (usually none) this worker had before.
             let stats = stats_scope.map(|s| s.collected()).unwrap_or_default();
             (subject_result, stats)
-        })
-    };
+        });
 
     let mut solver_stats = crate::ode::solver::OdeSolverStats::default();
     let mut subjects = Vec::with_capacity(per_subject.len());
@@ -4143,10 +4141,9 @@ pub(crate) fn sweep_sensitivity_solver_stats(
         return merged;
     }
     let second_order = crate::sens::provider::analytic_outer_gradient_available(model);
-    let per_subject: Vec<crate::ode::solver::OdeSolverStats> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
+    let per_subject: Vec<crate::ode::solver::OdeSolverStats> =
+        crate::par::map(population.subjects.len(), |i| {
+            let subject = &population.subjects[i];
             let Some(eta) = eta_hats.get(i) else {
                 return crate::ode::solver::OdeSolverStats::default();
             };
@@ -4167,8 +4164,7 @@ pub(crate) fn sweep_sensitivity_solver_stats(
                     crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta);
             }
             stats_scope.collected()
-        })
-    };
+        });
     // In subject order, so a future non-additive counter cannot become
     // worker-count dependent.
     for stats in &per_subject {

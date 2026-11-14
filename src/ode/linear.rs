@@ -69,31 +69,12 @@ const MAX_SQUARINGS: u32 = 64;
 /// a dual type every skipped product is a full jet multiply. A zero that is only *numerically*
 /// zero — `θ − θ₀` at `θ = θ₀`, a taped or jet-carrying value — is not constant and is kept.
 fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: &mut [bool]) {
-    use crate::sens::linsolve::{all_finite, structural_zero};
+    use crate::sens::linsolve::all_finite;
     // A skipped `x[i][k]` multiplies row `k` of `y`, which must be finite for the skipped
     // products to be exactly `±0` (`all_finite`).
     for (k, f) in row_finite.iter_mut().enumerate().take(n) {
         *f = crate::sens::linsolve::skips_zeros::<T>()
             && y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v));
-    }
-    if T::FUSED_FOLDS {
-        // A taped type folds each entry as one tape node (`PkNum::dot_fold`): the same
-        // products, in the same ascending-`k` order, as the loop below.
-        let mut pairs: Vec<(T, T)> = Vec::with_capacity(n);
-        for i in 0..n {
-            for j in 0..n {
-                pairs.clear();
-                for k in 0..n {
-                    let xik = x[i * n + k];
-                    if row_finite[k] && structural_zero(xik) {
-                        continue;
-                    }
-                    pairs.push((xik, y[k * n + j]));
-                }
-                out[i * n + j] = T::dot_fold(T::from_f64(0.0), &pairs);
-            }
-        }
-        return;
     }
     // The common compartment counts as literals into the one inlined loop, so it unrolls at
     // each size; the same products in the same order, skips included (#1564).
@@ -136,21 +117,11 @@ fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
 /// `Σ_k c_k·M_k`, each `M_k` an `n×n` row-major matrix, plus `c_I·I` when `c_i` is nonzero,
 /// into `out`.
 fn lincomb_into<T: PkNum>(terms: &[(f64, &[T])], c_i: f64, n: usize, out: &mut [T]) {
-    if T::FUSED_FOLDS {
-        // One linear tape node per entry (`PkNum::caxpy_fold`), the loop below's values.
-        let mut ts: Vec<(f64, T)> = Vec::with_capacity(terms.len());
-        for (e, o) in out[..n * n].iter_mut().enumerate() {
-            ts.clear();
-            ts.extend(terms.iter().map(|&(c, m)| (c, m[e])));
-            *o = T::caxpy_fold(T::from_f64(0.0), &ts);
-        }
-    } else {
-        out[..n * n].fill(T::from_f64(0.0));
-        for &(c, m) in terms {
-            let c = T::from_f64(c);
-            for (o, &v) in out.iter_mut().zip(&m[..n * n]) {
-                *o = *o + c * v;
-            }
+    out[..n * n].fill(T::from_f64(0.0));
+    for &(c, m) in terms {
+        let c = T::from_f64(c);
+        for (o, &v) in out.iter_mut().zip(&m[..n * n]) {
+            *o = *o + c * v;
         }
     }
     if c_i != 0.0 {
@@ -276,7 +247,7 @@ impl<T: PkNum> Expm<T> {
         let need = host[0];
         let out1 = host.get(1).copied().unwrap_or_else(|| T::from_f64(1.0));
         // A recording type (#2786) takes the count as data: the scale `2⁻ˢ` the analysis returns
-        // with it, the squarings a run-time repeat call (`PkNum::repeat`) — the value path's
+        // with it, the squarings a run-time repeat call (`RecHooks::repeat`) — the value path's
         // arithmetic at every count, checked only that the count exists.
         let (s, counted, scale) = if T::RECORDS_BRANCHES {
             if !need.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
@@ -1079,7 +1050,7 @@ fn spectral_of<T: PkNum>(a: &[T], n: usize, out: &[T]) -> Option<Spectral<T>> {
             *vi = out[lay.v0(k, r)];
         }
         let mut l = out[lay.lam(k)];
-        // Step `s` is gated at order `s` (`PkNum::order_gate`): a recording's compiled
+        // Step `s` is gated at order `s` (`RecHooks::order_gate`): a recording's compiled
         // variant runs the steps its order needs (a reverse one more), a value forward none.
         for step in 1..=SPECTRAL_JET_STEPS {
             for r in 0..n {
@@ -1217,7 +1188,7 @@ fn segment_in<T: PkNum>(
     saveat: &[f64],
     interp_at: &[f64],
 ) -> Option<(Vec<SolPointG<T>>, Vec<SolPointG<T>>)> {
-    // The walk's moving span (`PkNum::span_hint`), or the values; handed back on a decline,
+    // The walk's moving span (`RecHooks::span_hint`), or the values; handed back on a decline,
     // so the integration the walk falls back to takes it.
     let span = T::take_span();
     let r = segment_span(ws, rhs, u0, t_span, span, params, saveat, interp_at);
@@ -1263,11 +1234,6 @@ fn segment_span<T: PkNum>(
         scaled,
         next,
         x,
-        pairs,
-        params_d,
-        a_d,
-        b_d,
-        x_d,
         times,
         props,
         n_props,
@@ -1293,7 +1259,7 @@ fn segment_span<T: PkNum>(
     // segment rather than returning a wrong gradient.
     //
     // A recording type (#2786) reads them off its recording instead, exactly
-    // ([`PkNum::affine_parts`]).
+    // ([`RecHooks::affine_parts`]).
     if !T::affine_parts(rhs, params, t_mid, a, b) {
         rhs(probe, params, T::from_f64(t_mid), b);
         let magnitude = b
@@ -1312,7 +1278,7 @@ fn segment_span<T: PkNum>(
             rhs(probe, params, T::from_f64(t_mid), col);
             probe[j] = zero;
             for i in 0..n {
-                a[i * n + j] = T::scaled_diff(col[i], b[i], 1.0 / scale);
+                a[i * n + j] = (col[i] - b[i]) * T::from_f64(1.0 / scale);
             }
         }
     }
@@ -1326,23 +1292,10 @@ fn segment_span<T: PkNum>(
 
     // `f(x, t) == A·x + b` to rounding — the affine claim at one state and time.
     // In the value and in the derivative components alike: a column whose jets were lost to
-    // cancellation reproduces the RHS's value exactly and its gradient not at all. It reads
-    // values only, so it runs on detached copies (`PkNum::detach`): a taped type records
-    // nothing for it.
-    params_d.clear();
-    params_d.extend(params.iter().map(|p| p.detach()));
-    for (d, s) in a_d.iter_mut().zip(a.iter()) {
-        *d = s.detach();
-    }
-    for (d, s) in b_d.iter_mut().zip(b.iter()) {
-        *d = s.detach();
-    }
-    let mut reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
-        for (d, s) in x_d.iter_mut().zip(x) {
-            *d = s.detach();
-        }
-        let (a, b, x) = (&*a_d, &*b_d, &*x_d);
-        rhs(x, params_d, T::from_f64(t), direct);
+    // cancellation reproduces the RHS's value exactly and its gradient not at all.
+    let reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
+        let (a, b) = (&*a, &*b);
+        rhs(x, params, T::from_f64(t), direct);
         (0..n).all(|i| {
             // A recording type (#2786) checks the values through its branch API, as the same
             // sums: its `A` is exact, so there is no jet cancellation to catch.
@@ -1465,14 +1418,8 @@ fn segment_span<T: PkNum>(
                 let pk = &sp.proj[k * n * n..(k + 1) * n * n];
                 for r in 0..n {
                     let mut acc = zero;
-                    if T::FUSED_FOLDS {
-                        pairs.clear();
-                        pairs.extend((0..n).map(|col| (pk[r * n + col], b[col])));
-                        acc = T::dot_fold(acc, pairs);
-                    } else {
-                        for col in 0..n {
-                            acc = acc + pk[r * n + col] * b[col];
-                        }
+                    for col in 0..n {
+                        acc = acc + pk[r * n + col] * b[col];
                     }
                     pb[k * n + r] = acc;
                 }
@@ -1499,26 +1446,17 @@ fn segment_span<T: PkNum>(
                         let phi = dt_t * z.exprel(jet_orders);
                         let pk = &sp.proj[k * n * n..(k + 1) * n * n];
                         for r in 0..n {
-                            // One tape node per entry on a taped type (`PkNum::dot_fold`), as
-                            // the Padé path's products.
-                            let px = if T::FUSED_FOLDS {
-                                pairs.clear();
-                                pairs.extend((0..n).map(|col| (pk[r * n + col], x[col])));
-                                T::dot_fold(zero, pairs)
-                            } else {
-                                let mut px = zero;
-                                for col in 0..n {
-                                    px = px + pk[r * n + col] * x[col];
-                                }
-                                px
-                            };
+                            let mut px = zero;
+                            for col in 0..n {
+                                px = px + pk[r * n + col] * x[col];
+                            }
                             next[r] = next[r] + e * px + phi * pb[k * n + r];
                         }
                     }
                     std::mem::swap(x, next);
                     t_prev = t;
                     // A recording type's generator is exact and its RHS proven affine
-                    // ([`PkNum::affine_parts`]): there is nothing for a propagated state to
+                    // ([`RecHooks::affine_parts`]): there is nothing for a propagated state to
                     // catch.
                     if !T::RECORDS_BRANCHES && !reproduces(x, t_mid, direct) {
                         ok = false;
@@ -1630,17 +1568,6 @@ fn segment_span<T: PkNum>(
             // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
             for i in 0..n {
                 let acc = e[i * m + n] * c;
-                if T::FUSED_FOLDS {
-                    // One tape node per state (`PkNum::dot_fold`), the loop's values.
-                    pairs.clear();
-                    for j in 0..n {
-                        if !crate::sens::linsolve::structural_zero(e[i * m + j]) {
-                            pairs.push((e[i * m + j], x[j]));
-                        }
-                    }
-                    next[i] = T::dot_fold(acc, &pairs);
-                    continue;
-                }
                 let mut acc = acc;
                 for j in 0..n {
                     if crate::sens::linsolve::structural_zero(e[i * m + j]) {
@@ -1701,11 +1628,6 @@ struct LinWs<T> {
     scaled: Vec<T>,
     next: Vec<T>,
     x: Vec<T>,
-    pairs: Vec<(T, T)>,
-    params_d: Vec<T>,
-    a_d: Vec<T>,
-    b_d: Vec<T>,
-    x_d: Vec<T>,
     times: Vec<T>,
     /// Propagators by the bits of their gap; the first `n_props` are this segment's.
     props: Vec<(u64, Vec<T>)>,
@@ -1728,11 +1650,6 @@ impl<T: PkNum> LinWs<T> {
             scaled: Vec::new(),
             next: Vec::new(),
             x: Vec::new(),
-            pairs: Vec::new(),
-            params_d: Vec::new(),
-            a_d: Vec::new(),
-            b_d: Vec::new(),
-            x_d: Vec::new(),
             times: Vec::new(),
             props: Vec::new(),
             n_props: 0,
@@ -1753,14 +1670,10 @@ impl<T: PkNum> LinWs<T> {
             (&mut self.gen, m * m),
             (&mut self.scaled, m * m),
             (&mut self.next, n),
-            (&mut self.a_d, n * n),
-            (&mut self.b_d, n),
-            (&mut self.x_d, n),
         ] {
             v.clear();
             v.resize(len, zero);
         }
-        self.pairs.clear();
     }
 }
 

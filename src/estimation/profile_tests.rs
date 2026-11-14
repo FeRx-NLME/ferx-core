@@ -522,10 +522,7 @@ fn envelope_matches_fd(edit: impl Fn(String) -> String, analytic: bool) -> usize
         p
     };
     assert_eq!(
-        crate::sens::provider::analytic_outer_gradient_for_interaction(
-            &p.parsed.model,
-            p.parsed.fit_options.interaction
-        ),
+        crate::sens::provider::analytic_outer_gradient_available(&p.parsed.model),
         analytic,
         "the arm runs on the engine it names"
     );
@@ -2178,10 +2175,7 @@ fn a_subject_that_declines_at_runtime_gets_the_reconverged_envelope_gradient() {
             .replace("  iov_column = OCC\n", "")
     });
     assert!(
-        crate::sens::provider::analytic_outer_gradient_for_interaction(
-            &p.parsed.model,
-            p.parsed.fit_options.interaction
-        ),
+        crate::sens::provider::analytic_outer_gradient_available(&p.parsed.model),
         "fixture: analytic at model level"
     );
     let layout = layout_of(&p);
@@ -2249,10 +2243,7 @@ fn a_profiled_fit_reports_its_runtime_outer_fd_fallbacks() {
             .replace("  iov_column = OCC\n", "")
     });
     assert!(
-        crate::sens::provider::analytic_outer_gradient_for_interaction(
-            &p.parsed.model,
-            p.parsed.fit_options.interaction
-        ),
+        crate::sens::provider::analytic_outer_gradient_available(&p.parsed.model),
         "fixture: analytic at model level"
     );
     let n = p.population.subjects.len();
@@ -2630,10 +2621,7 @@ fn gradient_and_line_search_start_at_the_pass_mode(fd: bool) {
         assert_these_start_at_modes, on_one_thread,
     };
     let p = prep(F1, F1_DATA, Some(2), |t| if fd { forced_fd(t) } else { t });
-    assert_eq!(
-        profile_gradient_is_analytic(&p.parsed.model, &options(&p)),
-        !fd
-    );
+    assert_eq!(profile_gradient_is_analytic(&p.parsed.model), !fd);
     let layout = layout_of(&p);
     let o = options(&p);
     let c = ctx(&p, &layout, &o);
@@ -3134,7 +3122,7 @@ fn g2_fixtures() -> Vec<(&'static str, crate::api::PreparedRun)> {
 fn the_adjoint_level_gradient_is_the_reconverged_fd_one() {
     for (name, p) in g2_fixtures() {
         assert!(
-            profile_gradient_is_analytic(&p.parsed.model, &options(&p)),
+            profile_gradient_is_analytic(&p.parsed.model),
             "{name}: the fixture runs on the adjoint"
         );
         if name == "nested" {
@@ -3195,10 +3183,7 @@ fn the_profile_gradient_runs_on_the_outer_gradients_engine() {
         (false, prep(F2, F2_DATA, Some(3), |t| t)),
         (true, prep(F2, F2_DATA, Some(3), forced_fd)),
     ] {
-        assert_eq!(
-            profile_gradient_is_analytic(&p.parsed.model, &options(&p)),
-            !fd
-        );
+        assert_eq!(profile_gradient_is_analytic(&p.parsed.model), !fd);
         let (_, s) = solve_at(&p);
         assert!(
             s.fd_gradient_subjects.is_empty(),
@@ -4201,10 +4186,7 @@ fn bounded_profile_is_the_box_constrained_minimum(adjoint: bool) {
         }
     };
     let (p, layout, s) = solve_boxed(F2, F2_DATA, Some(3), edit);
-    assert_eq!(
-        profile_gradient_is_analytic(&p.parsed.model, &options(&p)),
-        adjoint
-    );
+    assert_eq!(profile_gradient_is_analytic(&p.parsed.model), adjoint);
     assert!(
         s.fd_gradient_subjects.is_empty(),
         "{:?}",
@@ -6261,7 +6243,7 @@ fn the_adjoint_level_gradient_is_the_reconverged_fd_one_under_laplace() {
             })),
         ),
     ] {
-        assert!(profile_gradient_is_analytic(&p.parsed.model, &options(&p)));
+        assert!(profile_gradient_is_analytic(&p.parsed.model));
         let (gap, size) = level_gradient_gaps(&p);
         eprintln!("G2-L {name}: worst gap {gap:.3e} SE, largest gradient {size:.3e} SE");
         assert!(
@@ -6290,11 +6272,11 @@ fn the_envelope_gradient_is_the_profile_gradient_under_laplace() {
         let o = options(&p);
         assert_eq!(o.agq_nodes(), Some(1));
         assert_eq!(
-            profile_gradient_is_analytic(&p.parsed.model, &o),
+            profile_gradient_is_analytic(&p.parsed.model),
             crate::estimation::agq::analytic_score_supported(&p.parsed.model),
             "fd={fd}: one predicate"
         );
-        assert_eq!(profile_gradient_is_analytic(&p.parsed.model, &o), !fd);
+        assert_eq!(profile_gradient_is_analytic(&p.parsed.model), !fd);
         envelope_matches_fd(edit, !fd);
     }
 }
@@ -6568,7 +6550,7 @@ fn the_adjoint_level_gradient_is_the_reconverged_fd_one_under_quadrature() {
             ),
         ] {
             assert_agq3(name, &p, anchor);
-            assert!(profile_gradient_is_analytic(&p.parsed.model, &options(&p)));
+            assert!(profile_gradient_is_analytic(&p.parsed.model));
             let (gap, size) = level_gradient_gaps(&p);
             eprintln!(
                 "G2-A {name} {fixture}: worst gap {gap:.3e} SE, largest gradient {size:.3e} SE"
@@ -6592,9 +6574,8 @@ fn the_envelope_gradient_is_the_profile_gradient_under_quadrature() {
             let arm = move |t: String| if fd { forced_fd_agq(edit(t)) } else { edit(t) };
             let p = prep(F2, F2_DATA, Some(3), arm);
             assert_agq3(name, &p, anchor);
-            let o = options(&p);
             assert_eq!(
-                profile_gradient_is_analytic(&p.parsed.model, &o),
+                profile_gradient_is_analytic(&p.parsed.model),
                 crate::estimation::agq::analytic_score_supported(&p.parsed.model) && !fd,
                 "{name} fd={fd}: one predicate"
             );

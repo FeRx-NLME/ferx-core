@@ -16146,7 +16146,7 @@ fn the_recorded_rhs_jacobian_matches_the_f64_one() {
         };
         let zero = kj::Tr::from_f64(0.0);
         let (mut f, mut j, mut ft) = (vec![zero; n], vec![zero; n * n], vec![zero; n]);
-        assert!(<kj::Tr as PkNum>::rhs_jacobian(
+        assert!(<kj::Tr as crate::sens::num::RecHooks>::rhs_jacobian(
             &rhs,
             &ut,
             &pt,

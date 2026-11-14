@@ -270,174 +270,171 @@ pub fn compute_npde_npd_diag(
     // reference is the fitted mixture's predictive distribution rather than class 1's.
     let classes = crate::api::SimClasses::new(model, params, base_seed)?;
     let scores = crate::api::install_on_engine_pool(|| {
-        {
-            let __r0 = &population.subjects;
-            crate::par::map(__r0.len(), |i| {
-                let subject = &__r0[i];
-                let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed.wrapping_add(i as u64));
-                let n_obs = subject.observations.len();
+        crate::par::map(population.subjects.len(), |i| {
+            let subject = &population.subjects[i];
+            let mut rng = rand::rngs::StdRng::seed_from_u64(base_seed.wrapping_add(i as u64));
+            let n_obs = subject.observations.len();
 
-                // sims[(j, k)] — observation j, replicate k. Column-per-replicate
-                // layout so the covariance is one D·Dᵀ gemm and decorrelation is one
-                // batched triangular solve.
-                let mut sims = DMatrix::<f64>::zeros(n_obs, nsim);
-                // Custom residual magnitude (#484): η-independent (θ/covariate/TIME
-                // only), so build the per-observation multiplier matrix once per class
-                // and reuse it across replicates. It can read `MIXNUM`, so each class's
-                // is built under that class's guard, on its first replicate (#2163).
-                let mut ruv_mult_by_class: Vec<Option<Option<Vec<Vec<f64>>>>> =
-                    vec![None; classes.n_classes()];
-                let draw_correlations = crate::api::draw_correlations(model, params);
-                let correlated_draw = draw_correlations.is_dense()
-                    && n_obs > 0
-                    && !subject.fremtype.iter().any(|&ft| ft > 0);
-                // IOV (#734): the per-occasion κ draw needs the subject's occasion
-                // groups in the exact order `predict_iov` indexes its `kappas`
-                // argument by. A function of the subject alone, so this side builds
-                // it once instead of once per replicate. `predict_iov` still builds
-                // its own copy (plus the `occ_to_k` map) on every call — the group
-                // walk is not part of its signature — so the reference costs two
-                // builds per replicate, not one; only the second is hoistable from
-                // here. Worth plumbing through only if the walk ever shows up in a
-                // profile, since the estimation hot path pays the same duplicate.
-                // Empty when the subject carries no occasion labels, in which case
-                // `predict_iov` falls back to κ = 0 (matching the fit-time
-                // no-occasion diagnostic).
-                //
-                // Under nested levels (#1082 PR4) a κ is drawn once per group of its own
-                // level, as `simulate()` draws it: both go through `KappaDraw`, built
-                // per subject before the parallel walk so a nested subject without its
-                // cells is an `Err` (review r1 #1 on #1082 PR4).
-                let iov: Option<(
-                    &crate::types::OmegaMatrix,
-                    &crate::stats::nested_levels::KappaDraw,
-                )> = params
-                    .omega_iov
-                    .as_ref()
-                    .filter(|_| model.n_kappa > 0)
-                    .map(|om| (om, &kappa_draws[i]));
-                let kappa_factor =
-                    iov.map(|(om, _)| crate::stats::nested_levels::KappaDraw::factor(model, om));
-                // #1928: this loop draws its own η rather than going through
-                // `simulate_inner_with_draw`, so it counts its own flip-flop crossers — on a
-                // twin-less transit / IG closed form a replicate whose η leaves the domain
-                // enters the reference as an undosed profile, silently. One tally per
-                // subject (the walk is parallel), folded below.
-                let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
-                for k in 0..nsim {
-                    // The replicate's class: its `MIXNUM`, Ω and Σ (θ and the residual
-                    // correlations are every class's, so `draw_correlations` above
-                    // stands), and its residual magnitude, built under its guard.
-                    let class = classes.enter(subject, 1, k + 1);
-                    let params = class.params;
-                    let ruv_mult = ruv_mult_by_class[class.index]
-                        .get_or_insert_with(|| model.ruv_obs_mult(subject, &params.theta));
-                    // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
-                    let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
-                    let eta = class.eta_factor * DVector::from_column_slice(&z);
-                    let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
-                    eta_slice.resize(n_eta + model.n_kappa, 0.0);
-                    flip_flop.observe(model, subject, &params.theta, &eta_slice);
+            // sims[(j, k)] — observation j, replicate k. Column-per-replicate
+            // layout so the covariance is one D·Dᵀ gemm and decorrelation is one
+            // batched triangular solve.
+            let mut sims = DMatrix::<f64>::zeros(n_obs, nsim);
+            // Custom residual magnitude (#484): η-independent (θ/covariate/TIME
+            // only), so build the per-observation multiplier matrix once per class
+            // and reuse it across replicates. It can read `MIXNUM`, so each class's
+            // is built under that class's guard, on its first replicate (#2163).
+            let mut ruv_mult_by_class: Vec<Option<Option<Vec<Vec<f64>>>>> =
+                vec![None; classes.n_classes()];
+            let draw_correlations = crate::api::draw_correlations(model, params);
+            let correlated_draw = draw_correlations.is_dense()
+                && n_obs > 0
+                && !subject.fremtype.iter().any(|&ft| ft > 0);
+            // IOV (#734): the per-occasion κ draw needs the subject's occasion
+            // groups in the exact order `predict_iov` indexes its `kappas`
+            // argument by. A function of the subject alone, so this side builds
+            // it once instead of once per replicate. `predict_iov` still builds
+            // its own copy (plus the `occ_to_k` map) on every call — the group
+            // walk is not part of its signature — so the reference costs two
+            // builds per replicate, not one; only the second is hoistable from
+            // here. Worth plumbing through only if the walk ever shows up in a
+            // profile, since the estimation hot path pays the same duplicate.
+            // Empty when the subject carries no occasion labels, in which case
+            // `predict_iov` falls back to κ = 0 (matching the fit-time
+            // no-occasion diagnostic).
+            //
+            // Under nested levels (#1082 PR4) a κ is drawn once per group of its own
+            // level, as `simulate()` draws it: both go through `KappaDraw`, built
+            // per subject before the parallel walk so a nested subject without its
+            // cells is an `Err` (review r1 #1 on #1082 PR4).
+            let iov: Option<(
+                &crate::types::OmegaMatrix,
+                &crate::stats::nested_levels::KappaDraw,
+            )> = params
+                .omega_iov
+                .as_ref()
+                .filter(|_| model.n_kappa > 0)
+                .map(|om| (om, &kappa_draws[i]));
+            let kappa_factor =
+                iov.map(|(om, _)| crate::stats::nested_levels::KappaDraw::factor(model, om));
+            // #1928: this loop draws its own η rather than going through
+            // `simulate_inner_with_draw`, so it counts its own flip-flop crossers — on a
+            // twin-less transit / IG closed form a replicate whose η leaves the domain
+            // enters the reference as an undosed profile, silently. One tally per
+            // subject (the walk is parallel), folded below.
+            let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
+            for k in 0..nsim {
+                // The replicate's class: its `MIXNUM`, Ω and Σ (θ and the residual
+                // correlations are every class's, so `draw_correlations` above
+                // stands), and its residual magnitude, built under its guard.
+                let class = classes.enter(subject, 1, k + 1);
+                let params = class.params;
+                let ruv_mult = ruv_mult_by_class[class.index]
+                    .get_or_insert_with(|| model.ruv_obs_mult(subject, &params.theta));
+                // η ~ N(0, Ω) via the Cholesky factor; pad zero kappas for IOV.
+                let z: Vec<f64> = (0..n_eta).map(|_| normal.sample(&mut rng)).collect();
+                let eta = class.eta_factor * DVector::from_column_slice(&z);
+                let mut eta_slice: Vec<f64> = eta.iter().copied().collect();
+                eta_slice.resize(n_eta + model.n_kappa, 0.0);
+                flip_flop.observe(model, subject, &params.theta, &eta_slice);
 
-                    // IOV models (#734): one independent κ ~ N(0, Ω_IOV) per
-                    // occasion through the occasion-aware `predict_iov`, mirroring
-                    // `simulate()`'s `emit_subject_rows` (#723). Holding κ at zero
-                    // would leave the reference distribution without its
-                    // inter-occasion component and over-disperse every score.
-                    // Non-IOV models take the TV-covariate-aware dispatcher
-                    // unchanged — matching simulate()/predict() (#506): a per-event
-                    // covariate snapshot must drive NPDE IPREDs, not the
-                    // baseline-only `pk_param_fn(subject.covariates)` — and draw no
-                    // extra randoms, so their sims are byte-identical.
-                    let ipreds = match &iov {
-                        Some((_, kappa_draw)) => {
-                            let kappa_factor = kappa_factor
-                                .as_ref()
-                                .expect("kappa_factor is Some whenever iov is");
-                            let kappas = kappa_draw.draw(kappa_factor, normal, &mut rng);
-                            crate::pk::predict_iov(
-                                model,
-                                subject,
-                                &params.theta,
-                                &eta_slice[..n_eta],
-                                &kappas,
-                            )
-                        }
-                        None => crate::pk::compute_predictions_with_tv(
+                // IOV models (#734): one independent κ ~ N(0, Ω_IOV) per
+                // occasion through the occasion-aware `predict_iov`, mirroring
+                // `simulate()`'s `emit_subject_rows` (#723). Holding κ at zero
+                // would leave the reference distribution without its
+                // inter-occasion component and over-disperse every score.
+                // Non-IOV models take the TV-covariate-aware dispatcher
+                // unchanged — matching simulate()/predict() (#506): a per-event
+                // covariate snapshot must drive NPDE IPREDs, not the
+                // baseline-only `pk_param_fn(subject.covariates)` — and draw no
+                // extra randoms, so their sims are byte-identical.
+                let ipreds = match &iov {
+                    Some((_, kappa_draw)) => {
+                        let kappa_factor = kappa_factor
+                            .as_ref()
+                            .expect("kappa_factor is Some whenever iov is");
+                        let kappas = kappa_draw.draw(kappa_factor, normal, &mut rng);
+                        crate::pk::predict_iov(
                             model,
                             subject,
                             &params.theta,
-                            &eta_slice,
-                        ),
-                    };
+                            &eta_slice[..n_eta],
+                            &kappas,
+                        )
+                    }
+                    None => crate::pk::compute_predictions_with_tv(
+                        model,
+                        subject,
+                        &params.theta,
+                        &eta_slice,
+                    ),
+                };
 
-                    // IIV on residual error (#409): the simulated eta draw includes
-                    // the residual-error eta, so scale the residual variance by
-                    // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
-                    let ruv_scale = model.residual_var_scale(&eta_slice);
-                    // `block_sigma` (#1733): draw through `simulate()`'s own
-                    // correlated draw, at the parameter set's ρ. Paired rows
-                    // (cross-endpoint `L2` / same time) need the dense `R`; a
-                    // per-row draw would score them as independent, and reading
-                    // the model's ρ would score a fitted model at its declaration.
-                    // Same gate as `simulate()`: FREM covariate rows sit outside
-                    // `R`, so such a subject keeps the per-row draw.
-                    if correlated_draw {
-                        let eps = crate::api::correlated_residual_draw(
-                            model,
+                // IIV on residual error (#409): the simulated eta draw includes
+                // the residual-error eta, so scale the residual variance by
+                // exp(2·η_ruv) — i.e. simulate `Y = IPRED + EPS·EXP(η_ruv)`.
+                let ruv_scale = model.residual_var_scale(&eta_slice);
+                // `block_sigma` (#1733): draw through `simulate()`'s own
+                // correlated draw, at the parameter set's ρ. Paired rows
+                // (cross-endpoint `L2` / same time) need the dense `R`; a
+                // per-row draw would score them as independent, and reading
+                // the model's ρ would score a fitted model at its declaration.
+                // Same gate as `simulate()`: FREM covariate rows sit outside
+                // `R`, so such a subject keeps the per-row draw.
+                if correlated_draw {
+                    let eps = crate::api::correlated_residual_draw(
+                        model,
+                        subject,
+                        &params.sigma.values,
+                        draw_correlations,
+                        &ipreds,
+                        ruv_scale,
+                        ruv_mult.as_deref(),
+                        normal,
+                        &mut rng,
+                    );
+                    for (j, &ip) in ipreds.iter().enumerate() {
+                        sims[(j, k)] = ip + eps[j];
+                    }
+                } else {
+                    for (j, &ip) in ipreds.iter().enumerate() {
+                        let var = model.sim_residual_variance(
                             subject,
+                            j,
+                            ip,
                             &params.sigma.values,
-                            draw_correlations,
-                            &ipreds,
+                            draw_correlations.pairs,
                             ruv_scale,
-                            ruv_mult.as_deref(),
-                            normal,
-                            &mut rng,
+                            ruv_mult.as_ref().map(|m| m[j].as_slice()),
                         );
-                        for (j, &ip) in ipreds.iter().enumerate() {
-                            sims[(j, k)] = ip + eps[j];
-                        }
-                    } else {
-                        for (j, &ip) in ipreds.iter().enumerate() {
-                            let var = model.sim_residual_variance(
-                                subject,
-                                j,
-                                ip,
-                                &params.sigma.values,
-                                draw_correlations.pairs,
-                                ruv_scale,
-                                ruv_mult.as_ref().map(|m| m[j].as_slice()),
-                            );
-                            let eps: f64 = normal.sample(&mut rng);
-                            sims[(j, k)] = ip + var.sqrt() * eps;
-                        }
+                        let eps: f64 = normal.sample(&mut rng);
+                        sims[(j, k)] = ip + var.sqrt() * eps;
                     }
                 }
+            }
 
-                let npd = npd_scores(
-                    &subject.observations,
-                    &subject.cens,
-                    &sims,
-                    model.bloq_in_force(),
-                );
-                let Decorrelated { npde, pwres } = npde_scores(
-                    &subject.observations,
-                    &subject.cens,
-                    &sims,
-                    model.bloq_in_force(),
-                );
-                let epred = epred(&sims);
-                (
-                    SubjectNpde {
-                        npd,
-                        npde,
-                        epred,
-                        pwres,
-                    },
-                    flip_flop,
-                )
-            })
-        }
+            let npd = npd_scores(
+                &subject.observations,
+                &subject.cens,
+                &sims,
+                model.bloq_in_force(),
+            );
+            let Decorrelated { npde, pwres } = npde_scores(
+                &subject.observations,
+                &subject.cens,
+                &sims,
+                model.bloq_in_force(),
+            );
+            let epred = epred(&sims);
+            (
+                SubjectNpde {
+                    npd,
+                    npde,
+                    epred,
+                    pwres,
+                },
+                flip_flop,
+            )
+        })
     });
     let mut flip_flop = crate::api::SimulatedFlipFlopTally::default();
     let scores: Vec<SubjectNpde> = scores

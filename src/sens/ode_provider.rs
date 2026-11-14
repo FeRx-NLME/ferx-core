@@ -331,19 +331,30 @@ fn infusion_spans_segment_g<G: crate::sens::num::PkNum>(
         && (start + duration).br_cmp(Ge, seg_end - eps)
 }
 
-/// `f64::total_cmp` on two times' values; through the branch API on a recording type
-/// (#2786), whose times can move with the inputs.
+/// `f64::total_cmp` on two times' values; on a recording type (#2786), whose times can move
+/// with the inputs, the strict orders go through the branch API. A tie, or a `NaN` (which
+/// neither strict order holds for), is settled by the values it saw — a `NaN` after every
+/// number, as `total_cmp` has it, so the order stays total — with no guard: such a time makes
+/// the subject non-finite whatever its place (#1189).
 fn cmp_times<T: crate::sens::num::PkNum>(a: T, b: T) -> std::cmp::Ordering {
     use crate::sens::num::BranchCmp::Lt;
+    use std::cmp::Ordering;
     if !T::RECORDS_BRANCHES {
         return a.val().total_cmp(&b.val());
     }
     if a.br_cmp(Lt, b) {
-        std::cmp::Ordering::Less
+        Ordering::Less
     } else if b.br_cmp(Lt, a) {
-        std::cmp::Ordering::Greater
+        Ordering::Greater
     } else {
-        std::cmp::Ordering::Equal
+        match (
+            crate::sens::num::RecHooks::seen_value(a).is_nan(),
+            crate::sens::num::RecHooks::seen_value(b).is_nan(),
+        ) {
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            _ => Ordering::Equal,
+        }
     }
 }
 
@@ -4783,23 +4794,9 @@ fn records_at_break_g<T: crate::sens::num::PkNum>(
     }
 }
 
-/// Times in ascending order: `f64::total_cmp` on the values, through the branch API on a
-/// recording type (#2786), whose times can move with the inputs.
+/// Times in ascending order ([`cmp_times`]).
 pub(crate) fn sort_times<T: crate::sens::num::PkNum>(times: &mut [T]) {
-    use crate::sens::num::BranchCmp::Lt;
-    if T::RECORDS_BRANCHES {
-        times.sort_by(|a, b| {
-            if a.br_cmp(Lt, *b) {
-                std::cmp::Ordering::Less
-            } else if b.br_cmp(Lt, *a) {
-                std::cmp::Ordering::Greater
-            } else {
-                std::cmp::Ordering::Equal
-            }
-        });
-    } else {
-        times.sort_by(|a, b| a.val().total_cmp(&b.val()));
-    }
+    times.sort_by(|a, b| cmp_times(*a, *b));
 }
 
 /// Integrate the dual state through the subject's bolus + infusion events,

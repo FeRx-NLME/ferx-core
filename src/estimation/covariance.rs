@@ -428,19 +428,16 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
     for halvings in 0..MAX_HALVINGS {
         let specs = fd_diag_specs(x_hat, free_idx, eps, floor);
         let report = cov_progress("step probe", specs.len(), options.verbose);
-        let vals: Vec<f64> = {
-            let __r0 = &specs;
-            crate::par::map(__r0.len(), |__i| {
-                let &p = &__r0[__i];
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    report();
-                    return f64::NAN;
-                }
-                let v = eval_fd_point(x_hat, p, ofv);
+        let vals: Vec<f64> = crate::par::map(specs.len(), |idx| {
+            let &p = &specs[idx];
+            if crate::cancel::is_cancelled(&options.cancel) {
                 report();
-                v
-            })
-        };
+                return f64::NAN;
+            }
+            let v = eval_fd_point(x_hat, p, ofv);
+            report();
+            v
+        });
         if crate::cancel::is_cancelled(&options.cancel) {
             return FdStep {
                 eps,
@@ -1265,11 +1262,10 @@ fn per_subject_adjoint<R: Send>(
     let objective = cov_objective(options);
     // One unpack for the population: every subject is at `x`.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
-    Some({
-        let __r0 = &population.subjects;
-        let __r1 = &eta_hats;
-        crate::par::map(__r0.len().min(__r1.len()), |i| {
-            let (subject, eta_hat) = (&__r0[i], &__r1[i]);
+    Some(crate::par::map(
+        population.subjects.len().min(eta_hats.len()),
+        |i| {
+            let (subject, eta_hat) = (&population.subjects[i], &eta_hats[i]);
             let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
             // Cooperative cancel. The FD stencil checks on every perturbed point; this loop
             // is `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs)
@@ -1294,8 +1290,8 @@ fn per_subject_adjoint<R: Send>(
                 }
             }
             f(subject, &pt, &b, objective)
-        })
-    })
+        },
+    ))
 }
 
 /// The slope and the curvature of the OFV along each packed axis in `axes`, exact: `∂OFV/∂x_a`

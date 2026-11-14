@@ -935,10 +935,11 @@ fn sigma_log_se(
     }
     // Collected in subject order and folded serially, as everywhere else in
     // this file: a parallel reduction would depend on the worker count (#703).
-    let per_subj: Vec<Vec<f64>> = {
-        let __r0 = &population.subjects;
-        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-            let subject = &__r0[i];
+    let per_subj: Vec<Vec<f64>> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             let preds = crate::pk::compute_predictions_with_tv_into_with_schedule(
                 model,
                 subject,
@@ -967,8 +968,8 @@ fn sigma_log_se(
                 }
             }
             info
-        })
-    };
+        },
+    );
     let mut info = DMatrix::<f64>::zeros(m, m);
     for s in &per_subj {
         for a in 0..m {
@@ -1511,30 +1512,26 @@ impl MstepScoreSa {
         // Collected in subject order and folded serially: a parallel `reduce`
         // would combine partials along thread-count-dependent boundaries and
         // f64 addition is not associative (#703).
-        let per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)> = {
-            let __r0 = &population.subjects;
-            let __r1 = &etas;
-            crate::par::map_init(
-                __r0.len().min(__r1.len()),
-                EventPkParams::default,
-                |scratch, __i| {
-                    let (subject, eta) = (&__r0[__i], &__r1[__i]);
-                    crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher(
-                        model,
-                        subject,
-                        &theta_nat,
-                        &sigma_nat,
-                        eta,
-                        theta_packs_log_mask,
-                        &lower,
-                        &upper,
-                        n_theta,
-                        n_sigma,
-                        scratch,
-                    )
-                },
-            )
-        };
+        let per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)> = crate::par::map_init(
+            population.subjects.len().min(etas.len()),
+            EventPkParams::default,
+            |scratch, idx| {
+                let (subject, eta) = (&population.subjects[idx], &etas[idx]);
+                crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher(
+                    model,
+                    subject,
+                    &theta_nat,
+                    &sigma_nat,
+                    eta,
+                    theta_packs_log_mask,
+                    &lower,
+                    &upper,
+                    n_theta,
+                    n_sigma,
+                    scratch,
+                )
+            },
+        );
 
         let mut grad = vec![0.0f64; n];
         let mut fisher = vec![0.0f64; n * n];
@@ -1815,44 +1812,39 @@ fn scalar_residual_sse(
     etas: &[Vec<f64>],
     residual_model: ScalarResidualModel,
 ) -> Option<(f64, usize)> {
-    let per_subject: Vec<Option<(f64, usize)>> = {
-        let __r0 = &population.subjects;
-        let __r1 = &etas;
-        crate::par::map_init(
-            __r0.len().min(__r1.len()),
-            EventPkParams::default,
-            |scratch, __i| {
-                let (subject, eta) = (&__r0[__i], &__r1[__i]);
-                let predictions = crate::pk::compute_predictions_with_tv_into(
-                    model, subject, theta, eta, scratch,
-                );
-                if predictions.len() != subject.observations.len() {
+    let per_subject: Vec<Option<(f64, usize)>> = crate::par::map_init(
+        population.subjects.len().min(etas.len()),
+        EventPkParams::default,
+        |scratch, idx| {
+            let (subject, eta) = (&population.subjects[idx], &etas[idx]);
+            let predictions =
+                crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, scratch);
+            if predictions.len() != subject.observations.len() {
+                return None;
+            }
+            let mut sse = 0.0;
+            for (&y, &f) in subject.observations.iter().zip(predictions.iter()) {
+                if !(y.is_finite() && f.is_finite()) {
                     return None;
                 }
-                let mut sse = 0.0;
-                for (&y, &f) in subject.observations.iter().zip(predictions.iter()) {
-                    if !(y.is_finite() && f.is_finite()) {
-                        return None;
-                    }
-                    let residual = y - f;
-                    let term = match residual_model {
-                        ScalarResidualModel::Additive => residual * residual,
-                        ScalarResidualModel::Proportional => {
-                            if f.abs() <= f64::MIN_POSITIVE {
-                                return None;
-                            }
-                            residual * residual / (f * f)
+                let residual = y - f;
+                let term = match residual_model {
+                    ScalarResidualModel::Additive => residual * residual,
+                    ScalarResidualModel::Proportional => {
+                        if f.abs() <= f64::MIN_POSITIVE {
+                            return None;
                         }
-                    };
-                    if !term.is_finite() {
-                        return None;
+                        residual * residual / (f * f)
                     }
-                    sse += term;
+                };
+                if !term.is_finite() {
+                    return None;
                 }
-                Some((sse, subject.observations.len()))
-            },
-        )
-    };
+                sse += term;
+            }
+            Some((sse, subject.observations.len()))
+        },
+    );
 
     // Preserve thread-count reproducibility: Rayon may schedule subjects in a
     // different partition, but the collected vector remains input ordered.
@@ -2535,62 +2527,12 @@ fn theta_sigma_mstep_light(
     // exactly one call and the arithmetic is unchanged.
     let one_draw_grad = |th: &[f64], sg: &[f64], etas: &[Vec<f64>]| -> (f64, Vec<f64>) {
         if let Some(kappas) = kappas_opt {
-            let per_subj: Vec<(f64, Vec<f64>)> = {
-                let __r0 = &population.subjects;
-                let __r1 = &etas;
-                let __r2 = &kappas;
-                crate::par::map_init(
-                    __r0.len().min(__r1.len()).min(__r2.len()),
-                    EventPkParams::default,
-                    |scratch, i| {
-                        let ((subject, eta), kaps) = ((&__r0[i], &__r1[i]), &__r2[i]);
-                        {
-                            let cls = mix_mstep.map(|m| m.classes[i]);
-                            let _g = cls.map(|c| {
-                                crate::parser::model_parser::MixtureClassGuard::enter(c + 1)
-                            });
-                            let over: &[(usize, f64)] = match (mix_mstep, cls) {
-                                (Some(m), Some(c)) => &m.class_sigma_over[c],
-                                _ => &[],
-                            };
-                            let sub_sg = class_sigma_subst(sg, over);
-                            let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
-                            let (nll, mut grad) = obs_nll_subject_grad_iov(
-                                model,
-                                subject,
-                                th,
-                                sg_i,
-                                eta,
-                                kaps,
-                                &theta_packs_log_mask,
-                                &lower,
-                                &upper,
-                                n_theta,
-                                n_sigma,
-                                scratch,
-                            );
-                            // A held σ override carries no information about the
-                            // free base σ — zero that subject's contribution.
-                            for &(sidx, _) in over {
-                                if n_theta + sidx < grad.len() {
-                                    grad[n_theta + sidx] = 0.0;
-                                }
-                            }
-                            (nll, grad)
-                        }
-                    },
-                )
-            };
-            fold_nll_grad(per_subj, n)
-        } else {
-            let per_subj: Vec<(f64, Vec<f64>)> = {
-                let __r0 = &population.subjects;
-                let __r1 = &etas;
-                crate::par::map_init(
-                    __r0.len().min(__r1.len()),
-                    EventPkParams::default,
-                    |scratch, i| {
-                        let (subject, eta) = (&__r0[i], &__r1[i]);
+            let per_subj: Vec<(f64, Vec<f64>)> = crate::par::map_init(
+                population.subjects.len().min(etas.len()).min(kappas.len()),
+                EventPkParams::default,
+                |scratch, i| {
+                    let ((subject, eta), kaps) = ((&population.subjects[i], &etas[i]), &kappas[i]);
+                    {
                         let cls = mix_mstep.map(|m| m.classes[i]);
                         let _g = cls
                             .map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
@@ -2600,12 +2542,13 @@ fn theta_sigma_mstep_light(
                         };
                         let sub_sg = class_sigma_subst(sg, over);
                         let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
-                        let (nll, mut grad) = obs_nll_subject_grad(
+                        let (nll, mut grad) = obs_nll_subject_grad_iov(
                             model,
                             subject,
                             th,
                             sg_i,
                             eta,
+                            kaps,
                             &theta_packs_log_mask,
                             &lower,
                             &upper,
@@ -2613,15 +2556,54 @@ fn theta_sigma_mstep_light(
                             n_sigma,
                             scratch,
                         );
+                        // A held σ override carries no information about the
+                        // free base σ — zero that subject's contribution.
                         for &(sidx, _) in over {
                             if n_theta + sidx < grad.len() {
                                 grad[n_theta + sidx] = 0.0;
                             }
                         }
                         (nll, grad)
-                    },
-                )
-            };
+                    }
+                },
+            );
+            fold_nll_grad(per_subj, n)
+        } else {
+            let per_subj: Vec<(f64, Vec<f64>)> = crate::par::map_init(
+                population.subjects.len().min(etas.len()),
+                EventPkParams::default,
+                |scratch, i| {
+                    let (subject, eta) = (&population.subjects[i], &etas[i]);
+                    let cls = mix_mstep.map(|m| m.classes[i]);
+                    let _g =
+                        cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
+                    let over: &[(usize, f64)] = match (mix_mstep, cls) {
+                        (Some(m), Some(c)) => &m.class_sigma_over[c],
+                        _ => &[],
+                    };
+                    let sub_sg = class_sigma_subst(sg, over);
+                    let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(&sg);
+                    let (nll, mut grad) = obs_nll_subject_grad(
+                        model,
+                        subject,
+                        th,
+                        sg_i,
+                        eta,
+                        &theta_packs_log_mask,
+                        &lower,
+                        &upper,
+                        n_theta,
+                        n_sigma,
+                        scratch,
+                    );
+                    for &(sidx, _) in over {
+                        if n_theta + sidx < grad.len() {
+                            grad[n_theta + sidx] = 0.0;
+                        }
+                    }
+                    (nll, grad)
+                },
+            );
             fold_nll_grad(per_subj, n)
         }
     };
@@ -2794,10 +2776,11 @@ pub(crate) fn obs_nll_sum(
     // Collect in subject order and sum serially so the objective does not
     // depend on the rayon worker count (f64 addition is non-associative and a
     // parallel `.sum()` splits by thread count) — #703.
-    let per_subj: Vec<f64> = {
-        let __r0 = &population.subjects;
-        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-            let subject = &__r0[i];
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             crate::stats::likelihood::obs_nll_subject_into_with_schedule(
                 model,
                 subject,
@@ -2808,8 +2791,8 @@ pub(crate) fn obs_nll_sum(
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
             )
-        })
-    };
+        },
+    );
     per_subj.iter().sum()
 }
 
@@ -2828,10 +2811,11 @@ fn obs_nll_sum_iov(
     // Deterministic reduction (collect in subject order, fold serially): a
     // parallel `.sum()` would make the objective depend on the rayon worker
     // count — #703.
-    let per_subj: Vec<f64> = {
-        let __r0 = &population.subjects;
-        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-            let subject = &__r0[i];
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov_with_schedule(
                 model,
                 subject,
@@ -2842,8 +2826,8 @@ fn obs_nll_sum_iov(
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
             )
-        })
-    };
+        },
+    );
     per_subj.iter().sum()
 }
 
@@ -2860,10 +2844,11 @@ fn obs_nll_sum_mix(
     mix: MixMstep<'_>,
     schedules: &[Option<crate::pk::event_driven::EventSchedule>],
 ) -> f64 {
-    let per_subj: Vec<f64> = {
-        let __r0 = &population.subjects;
-        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-            let subject = &__r0[i];
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             let c = mix.classes[i];
             let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
             let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
@@ -2878,8 +2863,8 @@ fn obs_nll_sum_mix(
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
             )
-        })
-    };
+        },
+    );
     per_subj.iter().sum()
 }
 
@@ -2893,17 +2878,18 @@ fn obs_nll_sum_iov_mix(
     kappas: &[Vec<Vec<f64>>],
     mix: MixMstep<'_>,
 ) -> f64 {
-    let per_subj: Vec<f64> = {
-        let __r0 = &population.subjects;
-        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-            let subject = &__r0[i];
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             let c = mix.classes[i];
             let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
             let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
             let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(sigma_values);
             obs_nll_subject_into_iov(model, subject, theta, sg_i, &etas[i], &kappas[i], scratch)
-        })
-    };
+        },
+    );
     per_subj.iter().sum()
 }
 
@@ -6745,10 +6731,9 @@ pub fn run_saem(
             let mix_omegas_ref = &mix_omegas;
             let mix_sigmas_ref = &mix_sigmas;
             let mix_classes_ref = mix_classes.as_ref();
-            let new_nlls: Vec<f64> = {
-                let __r0 = &state.etas;
-                crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-                    let eta = &__r0[i];
+            let new_nlls: Vec<f64> =
+                crate::par::map_init(state.etas.len(), EventPkParams::default, |scratch, i| {
+                    let eta = &state.etas[i];
                     let cls = mix_classes_ref.map(|c| c[i]);
                     let _g =
                         cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
@@ -6769,8 +6754,7 @@ pub fn run_saem(
                         scratch,
                         schedules.get(i).and_then(|s| s.as_ref()),
                     )
-                })
-            };
+                });
             state.nll_cache = new_nlls;
         }
 

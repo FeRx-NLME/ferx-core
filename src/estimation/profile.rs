@@ -1450,7 +1450,7 @@ impl ProfileCtx<'_> {
         // Each group is independent: its subjects read only its coordinates.
         let theta0 = p.theta.clone();
         let route = GradientRoute {
-            adjoint: profile_gradient_is_analytic(self.model, self.options),
+            adjoint: profile_gradient_is_analytic(self.model),
             #[cfg(test)]
             force_decline: FORCE_PROFILE_GRADIENT_DECLINE.with(std::cell::Cell::get),
             #[cfg(test)]
@@ -1458,17 +1458,15 @@ impl ProfileCtx<'_> {
             #[cfg(test)]
             fail_after: FORCE_PROFILE_GROUP_FAILURE.with(std::cell::Cell::get),
         };
-        let outcomes: Vec<(Result<GroupOutcome, ProfileFailure>, ProfileCounts)> = {
-            let __r0 = &layout.groups;
-            crate::par::map(__r0.len(), |__i| {
-                let g = &__r0[__i];
+        let outcomes: Vec<(Result<GroupOutcome, ProfileFailure>, ProfileCounts)> =
+            crate::par::map(layout.groups.len(), |idx| {
+                let g = &layout.groups[idx];
                 let sub: Vec<SubjectState> =
                     g.subjects.iter().map(|&i| states[i].clone()).collect();
                 let mut counts = ProfileCounts::default();
                 let out = self.solve_group(g, &p, &theta0, sub, &route, &mut counts);
                 (out, counts)
-            })
-        };
+            });
         let mut this = ProfileCounts::default();
         for (_, c) in &outcomes {
             this.add(c);
@@ -1608,38 +1606,35 @@ impl ProfileCtx<'_> {
             // mode only, as the level gradient below; otherwise the second differences of
             // its re-solved term ([`Self::resolved_hessian`]), never the held matrix, which
             // through a link can contract at 0.96 per step.
-            let exact: Vec<Option<DMatrix<f64>>> = {
-                let __r0 = &g.subjects;
-                let __r1 = &states;
-                crate::par::map(__r0.len().min(__r1.len()), |__i| {
-                    let (&i, s) = (&__r0[__i], &__r1[__i]);
+            let exact: Vec<Option<DMatrix<f64>>> =
+                crate::par::map(g.subjects.len().min(states.len()), |idx| {
+                    let (&i, s) = (&g.subjects[idx], &states[idx]);
                     let pt = pt
                         .as_ref()
                         .filter(|_| g.linked && !s.off_mode && !route.declines_matrix(i))?;
                     self.exact_hessian(i, pt, s)
-                })
-            };
+                });
             let held_parts = |m_steps: &[f64]| -> Vec<DMatrix<f64>> {
-                {
-                    let __r0 = &g.subjects;
-                    let __r1 = &states;
-                    let __r2 = &subj_loc;
-                    let __r3 = &exact;
-                    crate::par::map(
-                        __r0.len().min(__r1.len()).min(__r2.len()).min(__r3.len()),
-                        |__i| {
-                            let (((&i, s), loc), e) =
-                                (((&__r0[__i], &__r1[__i]), &__r2[__i]), &__r3[__i]);
-                            match e {
-                                Some(e) => e.clone(),
-                                None => {
-                                    let st: Vec<f64> = loc.iter().map(|&l| m_steps[l]).collect();
-                                    self.held_hessian(i, &p, s, &st)
-                                }
+                crate::par::map(
+                    g.subjects
+                        .len()
+                        .min(states.len())
+                        .min(subj_loc.len())
+                        .min(exact.len()),
+                    |idx| {
+                        let (((&i, s), loc), e) = (
+                            ((&g.subjects[idx], &states[idx]), &subj_loc[idx]),
+                            &exact[idx],
+                        );
+                        match e {
+                            Some(e) => e.clone(),
+                            None => {
+                                let st: Vec<f64> = loc.iter().map(|&l| m_steps[l]).collect();
+                                self.held_hessian(i, &p, s, &st)
                             }
-                        },
-                    )
-                }
+                        }
+                    },
+                )
             };
             let n_exact = exact.iter().filter(|e| e.is_some()).count();
             let m = if !g.linked {
@@ -1657,29 +1652,29 @@ impl ProfileCtx<'_> {
                 } else {
                     m_steps.clone()
                 };
-                let parts: Vec<DMatrix<f64>> = {
-                    let __r0 = &g.subjects;
-                    let __r1 = &states;
-                    let __r2 = &subj_loc;
-                    let __r3 = &exact;
-                    crate::par::map(
-                        __r0.len().min(__r1.len()).min(__r2.len()).min(__r3.len()),
-                        |__i| {
-                            let (((&i, s), loc), e) =
-                                (((&__r0[__i], &__r1[__i]), &__r2[__i]), &__r3[__i]);
-                            match e {
-                                Some(e) => e.clone(),
-                                None => {
-                                    let st: Vec<f64> = loc
-                                        .iter()
-                                        .map(|&l| LINKED_HESSIAN_STEP_SE * scale[l])
-                                        .collect();
-                                    self.resolved_hessian(i, &p, s, &st)
-                                }
+                let parts: Vec<DMatrix<f64>> = crate::par::map(
+                    g.subjects
+                        .len()
+                        .min(states.len())
+                        .min(subj_loc.len())
+                        .min(exact.len()),
+                    |idx| {
+                        let (((&i, s), loc), e) = (
+                            ((&g.subjects[idx], &states[idx]), &subj_loc[idx]),
+                            &exact[idx],
+                        );
+                        match e {
+                            Some(e) => e.clone(),
+                            None => {
+                                let st: Vec<f64> = loc
+                                    .iter()
+                                    .map(|&l| LINKED_HESSIAN_STEP_SE * scale[l])
+                                    .collect();
+                                self.resolved_hessian(i, &p, s, &st)
                             }
-                        },
-                    )
-                };
+                        }
+                    },
+                );
                 for (e, loc) in exact.iter().zip(&subj_loc) {
                     if e.is_none() {
                         counts.resolves += 2 * loc.len() * loc.len();
@@ -1713,12 +1708,10 @@ impl ProfileCtx<'_> {
             };
             let steps: Vec<f64> = level_se.iter().map(|s| fd_step * s).collect();
             // Per subject: the gradient, and whether the adjoint served it.
-            let parts: Vec<(Vec<f64>, bool)> = {
-                let __r0 = &g.subjects;
-                let __r1 = &states;
-                let __r2 = &subj_loc;
-                crate::par::map(__r0.len().min(__r1.len()).min(__r2.len()), |__i| {
-                    let ((&i, s), loc) = ((&__r0[__i], &__r1[__i]), &__r2[__i]);
+            let parts: Vec<(Vec<f64>, bool)> = crate::par::map(
+                g.subjects.len().min(states.len()).min(subj_loc.len()),
+                |idx| {
+                    let ((&i, s), loc) = ((&g.subjects[idx], &states[idx]), &subj_loc[idx]);
                     if let Some(pt) = pt.as_ref().filter(|_| !s.off_mode && !route.declines(i)) {
                         if let Some(gr) = self.total_gradient_adjoint(i, pt, s) {
                             return (gr, true);
@@ -1726,8 +1719,8 @@ impl ProfileCtx<'_> {
                     }
                     let st: Vec<f64> = loc.iter().map(|&l| steps[l]).collect();
                     (self.total_gradient_fd(i, &p, s, &st), false)
-                })
-            };
+                },
+            );
             for (a, (((_, served), s), loc)) in parts.iter().zip(&states).zip(&subj_loc).enumerate()
             {
                 if *served {
@@ -1806,14 +1799,11 @@ impl ProfileCtx<'_> {
                 for (&c, &b) in g.coords.iter().zip(&trial) {
                     q.theta[layout.coords[c]] = b;
                 }
-                let next: Vec<SubjectState> = {
-                    let __r0 = &g.subjects;
-                    let __r1 = &states;
-                    crate::par::map(__r0.len().min(__r1.len()), |__i| {
-                        let (&i, s) = (&__r0[__i], &__r1[__i]);
+                let next: Vec<SubjectState> =
+                    crate::par::map(g.subjects.len().min(states.len()), |idx| {
+                        let (&i, s) = (&g.subjects[idx], &states[idx]);
                         self.resolve(i, &q, &s.warm())
-                    })
-                };
+                    });
                 counts.resolves += next.len();
                 let o: f64 = next.iter().map(|s| s.nll).sum();
                 // Armijo, with a floor at the objective's own noise: within it, the step
@@ -1949,8 +1939,8 @@ impl GradientRoute {
 /// Under `laplace` the outer gradient routes on `agq::analytic_score_supported`, which
 /// is this same predicate by construction (#251), so there is one gate, not two; a test
 /// pins that the two agree on both `gradient` settings (#2107).
-pub(crate) fn profile_gradient_is_analytic(model: &CompiledModel, options: &FitOptions) -> bool {
-    crate::sens::provider::analytic_outer_gradient_for_interaction(model, options.interaction)
+pub(crate) fn profile_gradient_is_analytic(model: &CompiledModel) -> bool {
+    crate::sens::provider::analytic_outer_gradient_available(model)
 }
 
 /// The warning for subjects whose profile-solve level gradient fell back to finite
@@ -2051,7 +2041,7 @@ pub(crate) fn envelope_gradient(
     // reconverges already. On the analytic route a subject can still decline at runtime
     // and take the per-subject salvage; that one is keyed on the subject's own route, by
     // the reconverging `declines` log, not on this model-level predicate (#2136).
-    let analytic = profile_gradient_is_analytic(ctx.model, ctx.options);
+    let analytic = profile_gradient_is_analytic(ctx.model);
     let opts = FitOptions {
         reconverge_gradient_interval: if analytic {
             ctx.options.reconverge_gradient_interval
@@ -3747,7 +3737,7 @@ impl ProfileCtx<'_> {
     /// `gradient = fd` keeps the step on finite differences too), and the switch the
     /// unprofiled step's exact R-matrix reads (`analytic_cov_hessian`).
     fn cov_is_analytic(&self) -> bool {
-        self.options.analytic_cov_hessian && profile_gradient_is_analytic(self.model, self.options)
+        self.options.analytic_cov_hessian && profile_gradient_is_analytic(self.model)
     }
 
     /// The covariance step's context: [`Self`] at the step's inner tolerance

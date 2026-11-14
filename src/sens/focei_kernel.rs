@@ -24,7 +24,7 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::sens::jet::DualT;
-use crate::sens::num::{BranchCmp, PkNum};
+use crate::sens::num::{wsum3, BranchCmp, PkNum};
 use crate::stats::residual_error::{LoadingForm, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
 
@@ -66,14 +66,14 @@ impl<T: PkNum> OmegaT<T> {
             }
             li[i][i] = c(1.0) / chol[i][i];
             for j in 0..i {
-                let s = T::wsum3(0.0, (j..i).map(|k| (c(1.0), chol[i][k], li[k][j])));
+                let s = wsum3(0.0, (j..i).map(|k| (c(1.0), chol[i][k], li[k][j])));
                 li[i][j] = -s / chol[i][i];
             }
         }
         let mut inv = vec![vec![c(0.0); n]; n];
         for a in 0..n {
             for b in 0..=a {
-                let e = T::wsum3(0.0, (a..n).map(|k| (c(1.0), li[k][a], li[k][b])));
+                let e = wsum3(0.0, (a..n).map(|k| (c(1.0), li[k][a], li[k][b])));
                 inv[a][b] = e;
                 inv[b][a] = e;
             }
@@ -340,7 +340,7 @@ impl<'a> LikCtx<'a> {
     fn prior<T: PkNum>(&self, eta: &[T], p: &ParT<T>) -> T {
         let n = eta.len();
         let oi = &p.omega.inv;
-        T::wsum3(
+        wsum3(
             0.0,
             (0..n)
                 .flat_map(|k| (0..n).map(move |l| (k, l)))
@@ -677,7 +677,7 @@ fn focei_rows<T: PkNum, const K: usize>(
     let mut ht: Vec<Vec<T>> = vec![vec![c(0.0); nn]; nn];
     for a in 0..nn {
         for b in 0..=a {
-            let e = T::wsum3(
+            let e = wsum3(
                 0.0,
                 std::iter::once((oi[a][b], one, one))
                     .chain(terms.iter().map(|(al, u, v)| (*al, u[a], v[b]))),
@@ -720,7 +720,7 @@ fn assemble_grad<T: PkNum>(
         .map(|k| {
             let prior = (0..eta.len()).map(|l| (oi[k][l], eta[l], one));
             let rows = (0..dl.len()).map(|j| (half, dl[j], g[j][k]));
-            T::wsum3(0.0, prior.chain(rows)) + half * explicit[k]
+            wsum3(0.0, prior.chain(rows)) + half * explicit[k]
         })
         .collect()
 }
@@ -760,10 +760,10 @@ pub(crate) fn foce_f<T: PkNum>(
             Some(row) => (ctx.frem_pred_var(row, eta, p).0, unit(row.1)),
             None => (f[j], g[j].clone()),
         };
-        f0.push(fj - T::wsum3(0.0, (0..nn).map(|k| (one, gj[k], eta[k]))));
+        f0.push(fj - wsum3(0.0, (0..nn).map(|k| (one, gj[k], eta[k]))));
         lg.push(
             (0..nn)
-                .map(|cc| T::wsum3(0.0, (cc..nn).map(|r| (one, lch[r][cc], gj[r]))))
+                .map(|cc| wsum3(0.0, (cc..nn).map(|r| (one, lch[r][cc], gj[r]))))
                 .collect(),
         );
     }
@@ -798,7 +798,7 @@ pub(crate) fn foce_f<T: PkNum>(
         rdiag.push(rd);
         match ctx.censored(j) {
             Some(cens) if ctx.frem_row(j).is_none() => {
-                let rt = T::wsum3(0.0, (0..nn).map(|k| (one, lg[j][k], lg[j][k]))) + rd;
+                let rt = wsum3(0.0, (0..nn).map(|k| (one, lg[j][k], lg[j][k]))) + rd;
                 let sgn = if cens < 0 { -1.0 } else { 1.0 };
                 bloq = bloq
                     + c(-2.0)
@@ -838,14 +838,14 @@ pub(crate) fn foce_f<T: PkNum>(
                         } else {
                             rm.as_ref().map_or(c(0.0), |m| m[ja][jb])
                         };
-                        T::wsum3(0.0, (0..nn).map(|k| (one, lg[ja][k], lg[jb][k]))) + r0
+                        wsum3(0.0, (0..nn).map(|k| (one, lg[ja][k], lg[jb][k]))) + r0
                     })
                     .collect()
             })
             .collect();
         let l = chol(&rt)?;
         let z = chol_solve(&l, &res);
-        let quad = T::wsum3(0.0, (0..nq).map(|i| (one, res[i], z[i])));
+        let quad = wsum3(0.0, (0..nq).map(|i| (one, res[i], z[i])));
         return Some(c(0.5) * (quad + chol_logdet(&l) + bloq));
     }
     // Woodbury / determinant lemma on the diagonal R⁰, Ω-normalised: with `B = D⁻¹GL`,
@@ -856,7 +856,7 @@ pub(crate) fn foce_f<T: PkNum>(
     let mut a: Vec<Vec<T>> = vec![vec![c(0.0); nn]; nn];
     for k in 0..nn {
         for l in 0..=k {
-            let e = T::wsum3(
+            let e = wsum3(
                 if k == l { 1.0 } else { 0.0 },
                 (0..nq).map(|i| (iv[i], lg[quant[i]][k], lg[quant[i]][l])),
             );
@@ -865,12 +865,12 @@ pub(crate) fn foce_f<T: PkNum>(
         }
     }
     let b: Vec<T> = (0..nn)
-        .map(|k| T::wsum3(0.0, (0..nq).map(|i| (iv[i], lg[quant[i]][k], res[i]))))
+        .map(|k| wsum3(0.0, (0..nq).map(|i| (iv[i], lg[quant[i]][k], res[i]))))
         .collect();
     let la = chol(&a)?;
     let ab = chol_solve(&la, &b);
-    let quad = T::wsum3(0.0, (0..nq).map(|i| (iv[i], res[i], res[i])))
-        - T::wsum3(0.0, (0..nn).map(|k| (one, b[k], ab[k])));
+    let quad = wsum3(0.0, (0..nq).map(|i| (iv[i], res[i], res[i])))
+        - wsum3(0.0, (0..nn).map(|k| (one, b[k], ab[k])));
     let mut log_r = c(0.0);
     for &j in &quant {
         log_r = log_r + rdiag[j].ln();

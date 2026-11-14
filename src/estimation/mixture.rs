@@ -623,65 +623,62 @@ pub(crate) fn mixture_subject_gradients(
         .map(|(cp, x_k)| PackedPoint::new(cp, x_k))
         .collect();
     let n = packed_segments(params).total();
-    {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            each(&|| {
-                let dlnp = mixing_logp_grad_fd(
-                    model,
-                    spec,
-                    &params.theta,
-                    &subject.covariates,
-                    &theta_floor,
-                );
-                let mut g = vec![0.0f64; n];
-                for (cls, (cp, _x_k)) in classes.iter().enumerate() {
-                    let w = eval.pmix[i][cls];
-                    if w == 0.0 {
-                        continue;
-                    }
-                    // `MIXNUM` resolves to the class on this (worker) thread.
-                    let _class = MixtureClassGuard::enter(cls + 1);
-                    let eta = match modes.filter(|_| iov) {
-                        Some(m) => DVector::from_column_slice(
-                            &crate::estimation::covariance::stacked_mode(
-                                model,
-                                subject,
-                                &eval.etas_by_class[cls][i],
-                                m.kappas[cls].get(i),
-                            )?,
-                        ),
-                        None => eval.etas_by_class[cls][i].clone(),
-                    };
-                    let exact = points[cls].as_ref().and_then(|pt| {
-                        crate::estimation::sens_outer_gradient::subject_gradient_at(
+    crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        each(&|| {
+            let dlnp = mixing_logp_grad_fd(
+                model,
+                spec,
+                &params.theta,
+                &subject.covariates,
+                &theta_floor,
+            );
+            let mut g = vec![0.0f64; n];
+            for (cls, (cp, _x_k)) in classes.iter().enumerate() {
+                let w = eval.pmix[i][cls];
+                if w == 0.0 {
+                    continue;
+                }
+                // `MIXNUM` resolves to the class on this (worker) thread.
+                let _class = MixtureClassGuard::enter(cls + 1);
+                let eta = match modes.filter(|_| iov) {
+                    Some(m) => {
+                        DVector::from_column_slice(&crate::estimation::covariance::stacked_mode(
                             model,
                             subject,
-                            pt,
-                            eta.as_slice(),
-                            options.interaction,
-                        )
-                    });
-                    let g_c = match exact {
-                        Some(g_c) => g_c,
-                        None if salvage.is_some() => salvage?(DeclinedTerm {
-                            subject: i,
-                            cls,
-                            cp,
-                            eta: &eta,
-                        })?,
-                        None => return None,
-                    };
-                    route_class_gradient(&mut g, &g_c, w, cls, params, mp);
-                    subtract_mixing_gradient(&mut g, &dlnp[cls], w, &dtheta_dx);
-                }
-                Some(g)
-            })
+                            &eval.etas_by_class[cls][i],
+                            m.kappas[cls].get(i),
+                        )?)
+                    }
+                    None => eval.etas_by_class[cls][i].clone(),
+                };
+                let exact = points[cls].as_ref().and_then(|pt| {
+                    crate::estimation::sens_outer_gradient::subject_gradient_at(
+                        model,
+                        subject,
+                        pt,
+                        eta.as_slice(),
+                        options.interaction,
+                    )
+                });
+                let g_c = match exact {
+                    Some(g_c) => g_c,
+                    None if salvage.is_some() => salvage?(DeclinedTerm {
+                        subject: i,
+                        cls,
+                        cp,
+                        eta: &eta,
+                    })?,
+                    None => return None,
+                };
+                route_class_gradient(&mut g, &g_c, w, cls, params, mp);
+                subtract_mixing_gradient(&mut g, &dlnp[cls], w, &dtheta_dx);
+            }
+            Some(g)
         })
-        .into_iter()
-        .collect()
-    }
+    })
+    .into_iter()
+    .collect()
 }
 
 /// `d(nll_ik)/dx_k` over the class-`cls` layout `pack_params(&class_params(params, cls))`
@@ -870,62 +867,59 @@ pub(crate) fn mixture_cov_hessian(
         .map(|&l| theta_packs_log(l))
         .collect();
     let n_theta = params.theta.len();
-    let per_subject: Vec<Option<DMatrix<f64>>> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            let (dlnp, d2lnp) =
-                mixing_logp_derivs(model, spec, &params.theta, &subject.covariates, true)?;
-            let mut h = DMatrix::<f64>::zeros(n, n);
-            let mut gbar = DVector::<f64>::zeros(n);
-            for (cls, (cp, xc, route)) in classes.iter().enumerate() {
-                let w = eval.pmix[i][cls];
-                if w == 0.0 {
-                    continue;
-                }
-                let _guard = MixtureClassGuard::enter(cls + 1);
-                let pt = PackedPoint::new(cp, xc)?;
-                let b = crate::estimation::covariance::stacked_mode(
-                    model,
-                    subject,
-                    &eval.etas_by_class[cls][i],
-                    modes.kappas[cls].get(i),
-                )?;
-                let g_c = subject_adjoint_gradient_at(model, subject, &pt, &b, objective)?;
-                let h_c = subject_adjoint_cov_hessian_at(model, subject, &pt, &b, objective)?;
-                if g_c.len() != route.len() || h_c.nrows() != route.len() {
-                    return None;
-                }
-                // ∇u_k = ∇ln p_k − ∇F_k on the mixture layout.
-                let mut du = DVector::<f64>::zeros(n);
-                for (a, da) in route.iter().enumerate() {
-                    if let Some(da) = *da {
-                        du[da] -= g_c[a];
-                        for (c, dc) in route.iter().enumerate() {
-                            if let Some(dc) = *dc {
-                                h[(da, dc)] += w * h_c[(a, c)];
-                            }
-                        }
-                    }
-                }
-                for j in 0..n_theta {
-                    du[j] += dlnp[cls][j] * chain[j];
-                    for l in 0..n_theta {
-                        let mut d = d2lnp[cls][j * n_theta + l] * chain[j] * chain[l];
-                        if j == l && log_packed[j] {
-                            // d(θ_j)/dx_j = θ_j on a log-packed coordinate.
-                            d += dlnp[cls][j] * chain[j];
-                        }
-                        h[(j, l)] -= w * d;
-                    }
-                }
-                h -= w * &du * du.transpose();
-                gbar += w * &du;
+    let per_subject: Vec<Option<DMatrix<f64>>> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let (dlnp, d2lnp) =
+            mixing_logp_derivs(model, spec, &params.theta, &subject.covariates, true)?;
+        let mut h = DMatrix::<f64>::zeros(n, n);
+        let mut gbar = DVector::<f64>::zeros(n);
+        for (cls, (cp, xc, route)) in classes.iter().enumerate() {
+            let w = eval.pmix[i][cls];
+            if w == 0.0 {
+                continue;
             }
-            h += &gbar * gbar.transpose();
-            h.iter().all(|v| v.is_finite()).then_some(h)
-        })
-    };
+            let _guard = MixtureClassGuard::enter(cls + 1);
+            let pt = PackedPoint::new(cp, xc)?;
+            let b = crate::estimation::covariance::stacked_mode(
+                model,
+                subject,
+                &eval.etas_by_class[cls][i],
+                modes.kappas[cls].get(i),
+            )?;
+            let g_c = subject_adjoint_gradient_at(model, subject, &pt, &b, objective)?;
+            let h_c = subject_adjoint_cov_hessian_at(model, subject, &pt, &b, objective)?;
+            if g_c.len() != route.len() || h_c.nrows() != route.len() {
+                return None;
+            }
+            // ∇u_k = ∇ln p_k − ∇F_k on the mixture layout.
+            let mut du = DVector::<f64>::zeros(n);
+            for (a, da) in route.iter().enumerate() {
+                if let Some(da) = *da {
+                    du[da] -= g_c[a];
+                    for (c, dc) in route.iter().enumerate() {
+                        if let Some(dc) = *dc {
+                            h[(da, dc)] += w * h_c[(a, c)];
+                        }
+                    }
+                }
+            }
+            for j in 0..n_theta {
+                du[j] += dlnp[cls][j] * chain[j];
+                for l in 0..n_theta {
+                    let mut d = d2lnp[cls][j * n_theta + l] * chain[j] * chain[l];
+                    if j == l && log_packed[j] {
+                        // d(θ_j)/dx_j = θ_j on a log-packed coordinate.
+                        d += dlnp[cls][j] * chain[j];
+                    }
+                    h[(j, l)] -= w * d;
+                }
+            }
+            h -= w * &du * du.transpose();
+            gbar += w * &du;
+        }
+        h += &gbar * gbar.transpose();
+        h.iter().all(|v| v.is_finite()).then_some(h)
+    });
     let mut acc = DMatrix::<f64>::zeros(n, n);
     for h in per_subject {
         acc += h?;

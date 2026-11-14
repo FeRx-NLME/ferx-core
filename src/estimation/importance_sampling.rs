@@ -690,10 +690,11 @@ pub fn run_importance_sampling(
             .filter(|(pk, cov)| !pk.is_empty() && !cov.is_empty())
     };
 
-    let per_subject: Vec<SubjectIsOutput> = {
-        let __r0 = &population.subjects;
-        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-            let subject = &__r0[i];
+    let per_subject: Vec<SubjectIsOutput> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             if crate::cancel::is_cancelled(cancel) {
                 return SubjectIsOutput::cancelled(subject.id.clone());
             }
@@ -878,8 +879,8 @@ pub fn run_importance_sampling(
                     defensive_mixture.as_ref(),
                 )
             }
-        })
-    };
+        },
+    );
 
     if crate::cancel::is_cancelled(&options.cancel) {
         return Err("cancelled by user".to_string());
@@ -1052,10 +1053,11 @@ pub fn run_importance_sampling_mixture(
         );
     }
 
-    let per_subject: Vec<SubjectIsOutput> = {
-        let __r0 = &population.subjects;
-        crate::par::map_init(__r0.len(), EventPkParams::default, |scratch, i| {
-            let subject = &__r0[i];
+    let per_subject: Vec<SubjectIsOutput> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             if crate::cancel::is_cancelled(cancel) {
                 return SubjectIsOutput::cancelled(subject.id.clone());
             }
@@ -1162,8 +1164,8 @@ pub fn run_importance_sampling_mixture(
                 var_log_marginal,
                 ess_fraction,
             }
-        })
-    };
+        },
+    );
 
     if crate::cancel::is_cancelled(&options.cancel) {
         return Err("cancelled by user".to_string());

@@ -107,10 +107,11 @@ pub fn run_conditional_distribution(
         samples: Vec<Vec<f64>>,
     }
 
-    let results: Vec<SubjResult> = {
-        let __r0 = &population.subjects;
-        crate::par::map_init(__r0.len(), MhScratch::default, |mh_scratch, i| {
-            let subject = &__r0[i];
+    let results: Vec<SubjResult> = crate::par::map_init(
+        population.subjects.len(),
+        MhScratch::default,
+        |mh_scratch, i| {
+            let subject = &population.subjects[i];
             let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(i as u64));
             // Same per-subject hoist as the SAEM E-step: the η-independent NLL
             // inputs and the proposal buffers are rebuilt here, not per proposal.
@@ -307,8 +308,8 @@ pub fn run_conditional_distribution(
                 .collect();
 
             SubjResult { mean, sd, samples }
-        })
-    };
+        },
+    );
 
     let cond_mean: Vec<Vec<f64>> = results.iter().map(|r| r.mean.clone()).collect();
     let cond_sd: Vec<Vec<f64>> = results.iter().map(|r| r.sd.clone()).collect();

@@ -86,12 +86,7 @@ pub(crate) fn subject_gradient_at(
     eta_hat: &[f64],
     interaction: bool,
 ) -> Option<Vec<f64>> {
-    // No data at all contributes nothing; a subject with only non-Gaussian records still
-    // carries its term (the adjoint folds it in).
-    if subject.observations.is_empty() && subject.obs_records.is_empty() {
-        return Some(vec![0.0; pt.x.len()]);
-    }
-    crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
+    subject_objective_gradient_at(
         model,
         subject,
         pt,
@@ -101,6 +96,24 @@ pub(crate) fn subject_gradient_at(
         } else {
             Objective::Foce
         },
+    )
+}
+
+/// [`subject_gradient_at`] for any [`Objective`] (the covariance step's may be a quadrature).
+pub(crate) fn subject_objective_gradient_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    pt: &PackedPoint<'_>,
+    eta_hat: &[f64],
+    objective: Objective,
+) -> Option<Vec<f64>> {
+    // No data at all contributes nothing; a subject with only non-Gaussian records still
+    // carries its term (the adjoint folds it in).
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        return Some(vec![0.0; pt.x.len()]);
+    }
+    crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
+        model, subject, pt, eta_hat, objective,
     )
 }
 
@@ -123,20 +136,17 @@ pub fn per_subject_packed_gradients(
 ) -> Vec<Option<Vec<f64>>> {
     // One unpack for the population (every subject is at the same packed point).
     let pt = PackedPoint::new(template, x);
-    {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            let _guard = mixture_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
-            subject_gradient_at(
-                model,
-                subject,
-                pt.as_ref()?,
-                eta_hats[i].as_slice(),
-                interaction,
-            )
-        })
-    }
+    crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let _guard = mixture_class.map(crate::parser::model_parser::MixtureClassGuard::enter);
+        subject_gradient_at(
+            model,
+            subject,
+            pt.as_ref()?,
+            eta_hats[i].as_slice(),
+            interaction,
+        )
+    })
 }
 
 /// [`per_subject_packed_gradients`] for an **IOV** model: `eta_hats[i]` the BSV EBEs and
@@ -151,17 +161,14 @@ pub fn per_subject_packed_gradients_iov(
     interaction: bool,
 ) -> Vec<Option<Vec<f64>>> {
     let pt = PackedPoint::new(template, x);
-    {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
-            for kap in &kappas[i] {
-                stacked.extend(kap.iter().copied());
-            }
-            subject_gradient_at(model, subject, pt.as_ref()?, &stacked, interaction)
-        })
-    }
+    crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let mut stacked: Vec<f64> = eta_hats[i].iter().copied().collect();
+        for kap in &kappas[i] {
+            stacked.extend(kap.iter().copied());
+        }
+        subject_gradient_at(model, subject, pt.as_ref()?, &stacked, interaction)
+    })
 }
 
 /// θ→packed chain rule `∂θ/∂x`: `θ` when the parameter packs in log-space, else `1.0`.

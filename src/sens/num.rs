@@ -237,6 +237,28 @@ pub(crate) fn one_minus_exp_rel<T: PkNum>(x: T) -> T {
     (-x).exprel(orders)
 }
 
+/// `base + Σ αₜ·xₜ·yₜ`, left to right: one entry of a weighted Gram sum such as the FOCEI
+/// `H̃ = Ω⁻¹ + Σ_j α_j g_j g_jᵀ`.
+#[inline]
+pub(crate) fn wsum3<T: PkNum>(base: f64, terms: impl Iterator<Item = (T, T, T)>) -> T {
+    let mut s = T::from_f64(base);
+    for (a, x, y) in terms {
+        s = s + a * x * y;
+    }
+    s
+}
+
+/// `ln Σₜ e^{xₜ}` (`terms` non-empty), shifted by the terms' largest — recorded, with no
+/// derivative: the sum is invariant to it.
+pub(crate) fn log_sum_exp<T: PkNum>(terms: &[T]) -> T {
+    let mx = terms[1..]
+        .iter()
+        .fold(terms[0], |m, &x| T::select_if(BranchCmp::Gt, x, m, x, m))
+        .value_only();
+    let one = T::from_f64(1.0);
+    mx + wsum3(0.0, terms.iter().map(|&x| (one, (x - mx).exp(), one))).ln()
+}
+
 /// The Bateman function `(e^{−a·t} − e^{−b·t})/(b − a)`, and `t·e^{−a·t}` at `a = b`:
 /// `t·e^{−lo·t}·(1 − e^{−(hi−lo)·t})/((hi−lo)·t)` over the ordered rates. Symmetric in `a, b`;
 /// the order is a selection a recording re-makes on every evaluation (not a branch), and keeps
@@ -266,6 +288,7 @@ pub(crate) fn bateman_ss<T: PkNum>(a: T, b: T, t: T, ii: f64) -> T {
     ss_factor(b, ii) * (bateman(a, b, t) + tail)
 }
 
+#[allow(private_bounds)]
 pub trait PkNum:
     Copy
     // Every implementor is a plain numeric value type (`f64`, `Dual2`, the recorders' types)
@@ -278,6 +301,7 @@ pub trait PkNum:
     + Mul<Output = Self>
     + Div<Output = Self>
     + Neg<Output = Self>
+    + RecHooks
 {
     /// Whether this type carries a second-order (Hessian) jet. `false` for `f64` and the
     /// first-order types, `true` for `Dual2`. Lets a caller
@@ -295,15 +319,6 @@ pub trait PkNum:
     /// of this order in them without changing anything the type carries (the adjoint's
     /// PK-space lift, `sens::ode_adjoint`). `0` for a plain number.
     const JET_ORDER: usize = 0;
-    /// The `f64` work one arithmetic operation on this type costs, in lanes: the lanes it
-    /// carries, plus two for each lane a tape records (the node, and its sweep). A cost proxy
-    /// for choosing between two recordings of one function (the adjoint's PK-space lift), not
-    /// a timing; `1` for a plain number.
-    const WORK: usize = 1;
-    /// Whether the forward jet carries second derivatives in its own directions (the
-    /// adjoint's η-Hessian payload): what a [`Self::TAYLOR2_EXACT`] stand-in has to reproduce
-    /// besides the tape's first θ-derivatives. Defaults to [`Self::SECOND_ORDER`].
-    const ETA_HESSIAN: bool = Self::SECOND_ORDER;
     /// Whether this value carries no derivative at all (no jet, no tape), so a function of
     /// it may be evaluated on `f64` and lifted with [`Self::from_f64`]. Conservative:
     /// `false` unless an implementor can tell cheaply.
@@ -369,28 +384,6 @@ pub trait PkNum:
         f.run(&vals, &mut out);
         out.into_iter().map(Self::from_f64).collect()
     }
-    /// One adaptive ODE segment, for a recording type (#2786) that records it as a call the
-    /// solver's driver runs at run time; `None` — the generic integration — for every number
-    /// type. `auto` is the driver's auto-switch state.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn ode_segment(
-        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
-        _u0: &[Self],
-        _t_span: (f64, f64),
-        _params: &[Self],
-        _saveat: &[f64],
-        _interp_at: &[f64],
-        _opts: &crate::ode::OdeSolverOptions,
-        _auto: &mut dyn std::any::Any,
-    ) -> Option<(Vec<crate::ode::SolPointG<Self>>, Vec<crate::ode::SolPointG<Self>>)> {
-        None
-    }
-    /// `⌊self⌋` as a constant (no derivative): a recording type (#2786) records it, so it
-    /// follows the value on every evaluation.
-    #[inline]
-    fn floor_c(self) -> Self {
-        Self::from_f64(self.val().floor())
-    }
     /// `f(self)` for a function given by its jet ([`JetFn`]): the jet lifted, on every type
     /// but a recording one (#2786), which records one primitive.
     #[inline]
@@ -408,92 +401,6 @@ pub trait PkNum:
         let at = |i: usize| j.get(k as usize + i).copied().unwrap_or(f64::NAN);
         self.lift4(at(0), at(1), at(2), at(3), at(4))
     }
-    /// The next ODE segment's span is `[t0, t1]`, times that may depend on the inputs (a
-    /// lagged arrival, a zero-order window's end), value-only. A recording type (#2786) keeps
-    /// them so the segment it records takes its span as run-time inputs ([`Self::take_span`])
-    /// instead of the values it saw; every other type ignores it.
-    #[inline]
-    fn span_hint(_t0: Self, _t1: Self) {}
-    /// The span [`Self::span_hint`] left, taken (`None` once taken, and on every type but a
-    /// recording one).
-    #[inline]
-    fn take_span() -> Option<(Self, Self)> {
-        None
-    }
-    /// A segment time's value, for the solver's `f64` span: the value on every type; on a
-    /// recording type the value it saw, allowed only for a time [`Self::span_hint`] named (the
-    /// segment it is recording takes the time itself).
-    #[inline]
-    fn span_value(self) -> f64 {
-        self.val()
-    }
-    /// The value, for a decision the code takes on it — a discrete outcome of a
-    /// [`host`](Self::host) analysis. A recording type checks it comes out the same on every
-    /// evaluation.
-    #[inline]
-    fn br_value(self) -> f64 {
-        self.val()
-    }
-    /// `body` applied `count` times to `x0`, `count` a whole number the recording reads at run
-    /// time (#2786, `kernel_jit::record_repeat`): `None` for every type that is not a recording
-    /// type (the caller loops), `Some(None)` when the recording cannot take the call.
-    fn repeat(
-        _x0: &[Self],
-        _count: Self,
-        _body: &dyn Fn(&[Self]) -> Vec<Self>,
-    ) -> Option<Option<Vec<Self>>> {
-        None
-    }
-    /// A steady state recorded as one fixed-point call (#2786, `kernel_jit::record_fixed`):
-    /// `maps` the cycle maps the search runs (each recorded once, from `u0`), `solve` the
-    /// search itself on the values, `held` the coordinates every map leaves where they are
-    /// (the search holds them, so they take no derivative). `None` for every type that is not
-    /// a recording type — the caller solves — and `Some(None)` when the recording cannot take
-    /// the call (it fails).
-    #[allow(clippy::type_complexity)]
-    fn ss_fixed_point(
-        _n: usize,
-        _held: &[usize],
-        _u0: &[f64],
-        _maps: &[&dyn Fn(&[Self]) -> Option<Vec<Self>>],
-        _solve: Box<crate::parser::model_parser::rhs_regcode::kernel_jit::SolveFn>,
-    ) -> Option<Option<Vec<Self>>> {
-        None
-    }
-    /// The value, for a computation whose result is checked not to depend on it — a
-    /// parameter slot the tape shows constant in θ and η, evaluated with every other slot.
-    /// A recording type (#2786) reads the value it saw, with no guard.
-    #[inline]
-    fn seen_value(self) -> f64 {
-        self.val()
-    }
-    /// A magnitude to scale a computation by whose result does not depend on it — a probe
-    /// step, a column scaling: the value's size, and the jets' where the type carries them. A
-    /// recording type (#2786) keeps the one it saw; any scale gives the same exact result.
-    #[inline]
-    fn magnitude_hint(self) -> f64 {
-        self.val().abs().max(self.jet_max_abs())
-    }
-    /// Of two spellings of one quantity, `skip` and `take` — `take` the one with refinement
-    /// step `k` applied, a step that makes derivative order `k` exact (`linsolve`'s solve, a
-    /// spectral chord): `take` for every type but a recording type (#2786), whose compiled
-    /// variant takes it only when its derivative order (a reverse pass counting one more)
-    /// reaches `k`, so no variant runs a step it does not need.
-    #[inline]
-    fn order_gate(_k: u8, _skip: Self, take: Self) -> Self {
-        take
-    }
-    /// A segment of the exact linear path is integrated instead: a recording type (#2786)
-    /// counts it into its plan, which reports it on every run; every other type's caller
-    /// counts it itself.
-    #[inline]
-    fn note_linear_decline() {}
-    /// Whether `self` and `other` are the same recorded value (a recording type, #2786): an
-    /// `if`'s arm that left a variable as it was. `false` on every other type.
-    #[inline]
-    fn same_node(&self, _other: &Self) -> bool {
-        false
-    }
     /// The value as a constant: no derivative.
     #[inline]
     fn value_only(self) -> Self {
@@ -506,35 +413,6 @@ pub trait PkNum:
     fn exprel(self, orders: usize) -> Self {
         let [g0, g1, g2, g3, g4] = crate::ode::linear::exprel_derivs(self.val(), orders);
         self.lift4(g0, g1, g2, g3, g4)
-    }
-    /// `A = ∂f/∂u` (row-major, `n = b.len()`) and `b = f(0)` of a right-hand side affine in the
-    /// state, read off the recording by a recording type (#2786); `false` — the caller probes
-    /// the RHS itself — for every number type.
-    #[inline]
-    fn affine_parts(
-        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
-        _params: &[Self],
-        _t: f64,
-        _a: &mut [Self],
-        _b: &mut [Self],
-    ) -> bool {
-        false
-    }
-    /// `f(u, t)`, `J = ∂f/∂u` (row-major) and `f_t = ∂f/∂t` of a right-hand side, exactly, read
-    /// off the recording by a recording type (#2786); `false` (nothing written) for every
-    /// number type, whose caller has the program's own evaluator or differences.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn rhs_jacobian(
-        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
-        _u: &[Self],
-        _params: &[Self],
-        _t: Self,
-        _f: &mut [Self],
-        _jac: &mut [Self],
-        _ft: &mut [Self],
-    ) -> bool {
-        false
     }
     /// The regularized incomplete gamma `P(self, x)`, or `Q = 1 − P` when `upper`
     /// (`stats::special::regularized_gamma_p` / `_q`). A recording type (#2786) records it
@@ -591,11 +469,6 @@ pub trait PkNum:
     fn br_absdiff_lt(self, other: Self, tol: f64) -> bool {
         (self.val() - other.val()).abs() < tol
     }
-    /// An event boundary of the computation being evaluated: a recording type (#2786)
-    /// cuts its recording here into chunks it compiles once and shares across subjects.
-    /// Nothing for a number.
-    #[inline(always)]
-    fn chunk_mark() {}
     /// `if x cc y { a } else { b }` on the values, as a selection rather than a branch: a
     /// recording type (#2786) records it, so the choice is made again on every evaluation —
     /// for a condition that changes inside the code it records (a time window inside an ODE
@@ -613,7 +486,6 @@ pub trait PkNum:
     fn br_is_nan(self) -> bool {
         self.val().is_nan()
     }
-
     /// The largest absolute **derivative** component — gradient, and the Hessian block when
     /// the type carries one; `0.0` for `f64`. Like [`jets_finite`](Self::jets_finite) it
     /// ignores [`val`](Self::val).
@@ -630,7 +502,6 @@ pub trait PkNum:
     fn jet_max_abs(self) -> f64 {
         0.0
     }
-
     /// `φ(self)` for a scalar function known through its value and first two derivatives
     /// at `self.val()` (`v = φ(x)`, `d1 = φ′(x)`, `d2 = φ″(x)`): the special functions the
     /// likelihood needs (e.g. `log Φ` for M3 rows) and a residual variance as a function of
@@ -644,7 +515,6 @@ pub trait PkNum:
         let dx = self - Self::from_f64(self.val());
         Self::from_f64(v) + dx * Self::from_f64(d1) + dx * dx * Self::from_f64(0.5 * d2)
     }
-
     /// [`Self::lift2`] with the third derivative `d3 = φ‴` too, for types that carry a
     /// nested dual over a differentiable base (`sens::jet::DualT`): their
     /// `φ″` factor needs its own derivative. The default drops `d3`, which is exact for
@@ -653,7 +523,6 @@ pub trait PkNum:
     fn lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self {
         self.lift2(v, d1, d2)
     }
-
     /// [`Self::lift3`] with the fourth derivative `d4 = φ⁗` too, for the covariance step's
     /// nested jet (`sens::jet::DualT` over `DualT` over the recording type), which carries
     /// four orders: a Laplace exact-anchor R-matrix differentiates `∂²f/∂η²` twice more.
@@ -662,130 +531,176 @@ pub trait PkNum:
     fn lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self {
         self.lift3(v, d1, d2, d3)
     }
+}
 
-    /// `u + h·(c₀k₀ + c₁k₁ + …)` with exactly this association (left-to-right sum,
-    /// then `h·`, then `u +`): an explicit RK stage combination. The default *is* that
-    /// expression, so `f64` and the forward duals keep their trajectories bit for bit.
-    /// The recording type (`kernel_jit::Tr`) overrides it to record one
-    /// node instead of `~3j` binary ones.
-    #[inline]
-    fn lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self {
-        let mut s = Self::from_f64(cs[0]) * ks[0];
-        for j in 1..cs.len() {
-            s = s + Self::from_f64(cs[j]) * ks[j];
-        }
-        u + Self::from_f64(h) * s
-    }
-
-    /// `((acc + x₀·w₀) + x₁·w₁) + …`, each term `xⱼ · from_f64(wⱼ)`, left to right: a
-    /// Rosenbrock stage combination. The default *is* that expression; the recording type
-    /// (`kernel_jit::Tr`) computes the same values and records one linear node instead
-    /// of two per term.
-    #[inline]
-    fn axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self {
-        let mut a = acc;
-        for &(x, w) in terms {
-            a = a + x * Self::from_f64(w);
-        }
-        a
-    }
-
-    /// `((acc + from_f64(w₀)·x₀) + from_f64(w₁)·x₁) + …`: [`Self::axpy_fold`] with the
-    /// constant on the left, as a matrix combination `Σ cₖ·Mₖ` writes it.
-    #[inline]
-    fn caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self {
-        let mut a = acc;
-        for &(w, x) in terms {
-            a = a + Self::from_f64(w) * x;
-        }
-        a
-    }
-
-    /// Whether this type's folds ([`Self::dot_fold`], [`Self::caxpy_fold`],
-    /// [`Self::axpy_fold`]) record fewer tape nodes than the per-operation expressions, so a
-    /// kernel should call them per entry; otherwise it keeps its own loop (same values).
-    const FUSED_FOLDS: bool = false;
-
-    /// `((acc + a₀·b₀) + a₁·b₁) + …`, left to right: one entry of a matrix product. The
-    /// default *is* that expression; the recording type computes the same values and records one node
-    /// whose rule is the product rule per pair, instead of two nodes per term.
-    #[inline]
-    fn dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self {
-        let mut r = acc;
-        for &(a, b) in pairs {
-            r = r + a * b;
-        }
-        r
-    }
-
-    /// The same number off any tape: a value-only check computed on it records nothing.
-    #[inline]
-    fn detach(self) -> Self {
-        self
-    }
-
-    /// `(a − b) · from_f64(s)`: a forward-difference quotient. The default *is* that
-    /// expression; the recording type computes the same values and records one linear node.
-    #[inline]
-    fn scaled_diff(a: Self, b: Self, s: f64) -> Self {
-        (a - b) * Self::from_f64(s)
-    }
-
-    /// `base + Σ αₜ·xₜ·yₜ`, left to right: one entry of a weighted Gram sum such as the
-    /// FOCEI `H̃ = Ω⁻¹ + Σ_j α_j g_j g_jᵀ`. The recording type (`kernel_jit::Tr`)
-    /// overrides it to record one node instead of three per term.
-    #[inline]
-    fn wsum3(base: f64, terms: impl Iterator<Item = (Self, Self, Self)>) -> Self {
-        let mut s = Self::from_f64(base);
-        for (a, x, y) in terms {
-            s = s + a * x * y;
-        }
-        s
-    }
-
-    /// `x₁·y₁ + x₂·y₂`: a product rule's tangent (`g·v′ + v·g′`). The recording type
-    /// (`kernel_jit::Tr`) overrides it to record **one** node with the four partials instead
-    /// of three (two products and a sum, #2481 §2.2); every other type keeps exactly this
-    /// arithmetic, so its values do not move.
-    #[inline]
-    fn dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self {
-        x1 * y1 + x2 * y2
-    }
-
-    /// `((x₁·y₁ + x₂·y₂) + x₃·y₃) + x₄·y₄`, left to right: a second-order product rule's
-    /// Hessian entry. As [`Self::dot2`]: one recorded node on the recording type, this arithmetic
-    /// everywhere else.
-    #[allow(clippy::too_many_arguments)]
-    #[inline]
-    fn dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self {
-        x1 * y1 + x2 * y2 + x3 * y3 + x4 * y4
-    }
-
-    /// Tape position for [`Self::tape_rollback`]; `0` for types that record nothing.
-    #[inline]
-    fn tape_mark() -> usize {
-        0
-    }
-
-    /// Discard every record made after `mark` (a rejected ODE step attempt). No-op for
-    /// types that record nothing.
-    #[inline]
-    fn tape_rollback(_mark: usize) {}
-
-    /// LU factorisation hook for a taping type: `Some(ok)` when the type factored `m`
-    /// itself (it may leave `m` unfactored and keep its state behind `piv`), `None` to
-    /// run the generic elimination (`sens::linsolve`).
-    #[inline]
-    fn lu_factor_hook(_m: &mut [Self], _piv: &mut [Self], _n: usize) -> Option<bool> {
+/// The hooks only the recording type (`kernel_jit::Tr`, #2786) overrides, with the no-op or
+/// plain-value default every other number type keeps. A supertrait of [`PkNum`] kept
+/// crate-private, so the public trait is arithmetic, branches and selections only.
+pub(crate) trait RecHooks: Sized {
+    /// One adaptive ODE segment, for a recording type (#2786) that records it as a call the
+    /// solver's driver runs at run time; `None` — the generic integration — for every number
+    /// type. `auto` is the driver's auto-switch state.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn ode_segment(
+        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
+        _u0: &[Self],
+        _t_span: (f64, f64),
+        _params: &[Self],
+        _saveat: &[f64],
+        _interp_at: &[f64],
+        _opts: &crate::ode::OdeSolverOptions,
+        _auto: &mut dyn std::any::Any,
+    ) -> Option<(
+        Vec<crate::ode::SolPointG<Self>>,
+        Vec<crate::ode::SolPointG<Self>>,
+    )> {
         None
     }
-
-    /// Solve hook paired with [`Self::lu_factor_hook`]; `true` when handled.
+    /// `⌊self⌋` as a constant (no derivative): a recording type (#2786) records it, so it
+    /// follows the value on every evaluation.
+    #[cfg(feature = "markov")]
     #[inline]
-    fn lu_solve_hook(_m: &[Self], _piv: &[Self], _n: usize, _b: &mut [Self]) -> bool {
+    fn floor_c(self) -> Self
+    where
+        Self: PkNum,
+    {
+        Self::from_f64(self.val().floor())
+    }
+    /// The next ODE segment's span is `[t0, t1]`, times that may depend on the inputs (a
+    /// lagged arrival, a zero-order window's end), value-only. A recording type (#2786) keeps
+    /// them so the segment it records takes its span as run-time inputs ([`Self::take_span`])
+    /// instead of the values it saw; every other type ignores it.
+    #[inline]
+    fn span_hint(_t0: Self, _t1: Self) {}
+    /// The span [`Self::span_hint`] left, taken (`None` once taken, and on every type but a
+    /// recording one).
+    #[inline]
+    fn take_span() -> Option<(Self, Self)> {
+        None
+    }
+    /// A segment time's value, for the solver's `f64` span: the value on every type; on a
+    /// recording type the value it saw, allowed only for a time [`Self::span_hint`] named (the
+    /// segment it is recording takes the time itself).
+    #[inline]
+    fn span_value(self) -> f64
+    where
+        Self: PkNum,
+    {
+        self.val()
+    }
+    /// The value, for a decision the code takes on it — a discrete outcome of a
+    /// [`host`](Self::host) analysis. A recording type checks it comes out the same on every
+    /// evaluation.
+    #[inline]
+    fn br_value(self) -> f64
+    where
+        Self: PkNum,
+    {
+        self.val()
+    }
+    /// `body` applied `count` times to `x0`, `count` a whole number the recording reads at run
+    /// time (#2786, `kernel_jit::record_repeat`): `None` for every type that is not a recording
+    /// type (the caller loops), `Some(None)` when the recording cannot take the call.
+    fn repeat(
+        _x0: &[Self],
+        _count: Self,
+        _body: &dyn Fn(&[Self]) -> Vec<Self>,
+    ) -> Option<Option<Vec<Self>>> {
+        None
+    }
+    /// A steady state recorded as one fixed-point call (#2786, `kernel_jit::record_fixed`):
+    /// `maps` the cycle maps the search runs (each recorded once, from `u0`), `solve` the
+    /// search itself on the values, `held` the coordinates every map leaves where they are
+    /// (the search holds them, so they take no derivative). `None` for every type that is not
+    /// a recording type — the caller solves — and `Some(None)` when the recording cannot take
+    /// the call (it fails).
+    #[allow(clippy::type_complexity)]
+    fn ss_fixed_point(
+        _n: usize,
+        _held: &[usize],
+        _u0: &[f64],
+        _maps: &[&dyn Fn(&[Self]) -> Option<Vec<Self>>],
+        _solve: Box<crate::parser::model_parser::rhs_regcode::kernel_jit::SolveFn>,
+    ) -> Option<Option<Vec<Self>>> {
+        None
+    }
+    /// The value, for a computation whose result is checked not to depend on it — a
+    /// parameter slot the tape shows constant in θ and η, evaluated with every other slot.
+    /// A recording type (#2786) reads the value it saw, with no guard.
+    #[inline]
+    fn seen_value(self) -> f64
+    where
+        Self: PkNum,
+    {
+        self.val()
+    }
+    /// A magnitude to scale a computation by whose result does not depend on it — a probe
+    /// step, a column scaling: the value's size, and the jets' where the type carries them. A
+    /// recording type (#2786) keeps the one it saw; any scale gives the same exact result.
+    #[inline]
+    fn magnitude_hint(self) -> f64
+    where
+        Self: PkNum,
+    {
+        self.val().abs().max(self.jet_max_abs())
+    }
+    /// Of two spellings of one quantity, `skip` and `take` — `take` the one with refinement
+    /// step `k` applied, a step that makes derivative order `k` exact (`linsolve`'s solve, a
+    /// spectral chord): `take` for every type but a recording type (#2786), whose compiled
+    /// variant takes it only when its derivative order (a reverse pass counting one more)
+    /// reaches `k`, so no variant runs a step it does not need.
+    #[inline]
+    fn order_gate(_k: u8, _skip: Self, take: Self) -> Self {
+        take
+    }
+    /// A segment of the exact linear path is integrated instead: a recording type (#2786)
+    /// counts it into its plan, which reports it on every run; every other type's caller
+    /// counts it itself.
+    #[inline]
+    fn note_linear_decline() {}
+    /// Whether `self` and `other` are the same recorded value (a recording type, #2786): an
+    /// `if`'s arm that left a variable as it was. `false` on every other type.
+    #[inline]
+    fn same_node(&self, _other: &Self) -> bool {
         false
     }
+    /// `A = ∂f/∂u` (row-major, `n = b.len()`) and `b = f(0)` of a right-hand side affine in the
+    /// state, read off the recording by a recording type (#2786); `false` — the caller probes
+    /// the RHS itself — for every number type.
+    #[inline]
+    fn affine_parts(
+        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
+        _params: &[Self],
+        _t: f64,
+        _a: &mut [Self],
+        _b: &mut [Self],
+    ) -> bool {
+        false
+    }
+    /// `f(u, t)`, `J = ∂f/∂u` (row-major) and `f_t = ∂f/∂t` of a right-hand side, exactly, read
+    /// off the recording by a recording type (#2786); `false` (nothing written) for every
+    /// number type, whose caller has the program's own evaluator or differences.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn rhs_jacobian(
+        _rhs: &dyn Fn(&[Self], &[Self], Self, &mut [Self]),
+        _u: &[Self],
+        _params: &[Self],
+        _t: Self,
+        _f: &mut [Self],
+        _jac: &mut [Self],
+        _ft: &mut [Self],
+    ) -> bool {
+        false
+    }
+    /// An event boundary of the computation being evaluated: a recording type (#2786)
+    /// cuts its recording here into chunks it compiles once and shares across subjects.
+    /// Nothing for a number.
+    #[inline(always)]
+    fn chunk_mark() {}
 }
+
+impl RecHooks for f64 {}
 
 impl PkNum for f64 {
     const SECOND_ORDER: bool = false;
@@ -880,6 +795,7 @@ impl PkNum for f64 {
 /// scalar `f64` impl stays hand-written (its bodies are inline formulas, not delegation).
 macro_rules! impl_pknum_delegate {
     ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr) => {
+        impl<$(const $c: usize),+> RecHooks for $ty<$($c),+> {}
         impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
             const SECOND_ORDER: bool = $so;
             const JET_ORDER: usize = if $so { 2 } else { 1 };
@@ -1400,6 +1316,7 @@ mod tests {
         macro_rules! un {
             ($($f:ident),*) => { $(fn $f(self) -> Self { Ext(PkNum::$f(self.0)) })* };
         }
+        impl RecHooks for Ext {}
         impl PkNum for Ext {
             const SECOND_ORDER: bool = true;
             fn from_f64(x: f64) -> Self {

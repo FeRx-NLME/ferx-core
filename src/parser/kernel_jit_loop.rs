@@ -323,7 +323,7 @@ pub(super) fn record_segment(
 ) -> Option<(Vec<SolPointG<Tr>>, Vec<SolPointG<Tr>>)> {
     let n = u0.len();
     // The span the walk named, when its ends depend on the inputs.
-    let span = <Tr as crate::sens::num::PkNum>::take_span()
+    let span = <Tr as crate::sens::num::RecHooks>::take_span()
         .filter(|(a, b)| (a.v, b.v) == t_span && (a.dep || b.dep));
     // A recording that has already failed is discarded whatever it records next (`end` keeps
     // the first reason): the entry state at every time, rather than bodies nothing will run.

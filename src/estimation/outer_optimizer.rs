@@ -287,7 +287,7 @@ pub fn optimize_population(
         options.optimizer,
         model,
         init_params.mixture.is_some(),
-        crate::sens::provider::analytic_outer_gradient_for_interaction(model, options.interaction),
+        crate::sens::provider::analytic_outer_gradient_available(model),
     );
     let optimizer_downgrade_warning: Vec<String> = downgrade.into_iter().collect();
     let owned_opts;
@@ -4910,33 +4910,26 @@ fn per_subject_outer_gradients_checked(
     let objective = crate::estimation::covariance::cov_objective(options);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
-    {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            checked(&|| {
-                // No data contributes nothing.
-                if subject.observations.is_empty() && subject.obs_records.is_empty() {
-                    return Some(vec![0.0; x.len()]);
-                }
-                // The stacked `[η, κ₁ … κ_K]` (just `η` without IOV).
-                let mut mode: Vec<f64> = ehs[i].iter().copied().collect();
-                for kap in kappas.get(i).map(Vec::as_slice).unwrap_or(&[]) {
-                    mode.extend(kap.iter().copied());
-                }
-                let g = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
-                    model,
-                    subject,
-                    pt.as_ref()?,
-                    &mode,
-                    objective,
-                )?;
-                g.iter().all(|v| v.is_finite()).then_some(g)
-            })
+    crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        checked(&|| {
+            // The stacked `[η, κ₁ … κ_K]` (just `η` without IOV).
+            let mut mode: Vec<f64> = ehs[i].iter().copied().collect();
+            for kap in kappas.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+                mode.extend(kap.iter().copied());
+            }
+            let g = crate::estimation::sens_outer_gradient::subject_objective_gradient_at(
+                model,
+                subject,
+                pt.as_ref()?,
+                &mode,
+                objective,
+            )?;
+            g.iter().all(|v| v.is_finite()).then_some(g)
         })
-        .into_iter()
-        .collect()
-    }
+    })
+    .into_iter()
+    .collect()
 }
 
 /// The BHHH Newton decrement at a point (#1934, #1564 A3/B3): the OFV a Newton step would
@@ -11836,10 +11829,9 @@ pub(crate) fn population_gradient_sens_mixed_dx(
     let n_obs_total = population_n_obs(population);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
-    let filled: Vec<(Vec<f64>, Option<Vec<DVector<f64>>>)> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
+    let filled: Vec<(Vec<f64>, Option<Vec<DVector<f64>>>)> =
+        crate::par::map(population.subjects.len(), |i| {
+            let subject = &population.subjects[i];
             // Complete the fallback on this worker as soon as its analytic
             // result is known; do not wait for a second population-wide pass.
             let (analytic, dx) = match pt.as_ref() {
@@ -11894,8 +11886,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                 }
             };
             (g, dx)
-        })
-    };
+        });
     let mut grad = vec![0.0f64; np];
     for (gi, _) in &filled {
         for k in 0..np {
@@ -12030,40 +12021,28 @@ pub(crate) fn population_gradient_sens_iov_mixed(
     let n_obs_total = population_n_obs(population);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
-    let filled: Vec<Vec<f64>> = {
-        let __r0 = &population.subjects;
-        crate::par::map(__r0.len(), |i| {
-            let subject = &__r0[i];
-            let stacked = joint_warm_start(&ehs[i], &kappas[i]);
-            match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options)
-            {
-                Ok(g) => g,
-                Err(cause) => {
-                    declines.record(i);
-                    declines.record_cause(i, cause);
-                    declined_subject_gradient(
-                        np,
-                        population,
-                        i,
-                        &trial,
-                        n_obs_total,
-                        declines,
-                        || {
-                            subject_reconverged_fd_gradient_iov(
-                                x,
-                                init_params,
-                                model,
-                                subject,
-                                &stacked,
-                                bounds,
-                                options,
-                            )
-                        },
+    let filled: Vec<Vec<f64>> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let stacked = joint_warm_start(&ehs[i], &kappas[i]);
+        match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options) {
+            Ok(g) => g,
+            Err(cause) => {
+                declines.record(i);
+                declines.record_cause(i, cause);
+                declined_subject_gradient(np, population, i, &trial, n_obs_total, declines, || {
+                    subject_reconverged_fd_gradient_iov(
+                        x,
+                        init_params,
+                        model,
+                        subject,
+                        &stacked,
+                        bounds,
+                        options,
                     )
-                }
+                })
             }
-        })
-    };
+        }
+    });
     let mut grad = vec![0.0f64; np];
     for gi in &filled {
         for k in 0..np {

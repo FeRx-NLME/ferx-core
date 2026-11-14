@@ -1129,7 +1129,7 @@ fn padded_ode_model(n_fix: usize) -> crate::types::CompiledModel {
 fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
     use crate::estimation::cov_diagnostics::CovScopeDecline;
     use crate::sens::provider::{
-        analytic_outer_gradient_for_interaction, analytic_outer_gradient_in_scope,
+        analytic_outer_gradient_available, analytic_outer_gradient_in_scope,
     };
     use crate::types::{FitOptions, GradientMethod, Optimizer};
     let model = padded_ode_model;
@@ -1145,7 +1145,7 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
         );
         for interaction in [true, false] {
             assert_eq!(
-                Optimizer::Auto.resolve_auto(&m, interaction),
+                Optimizer::Auto.resolve_auto(&m),
                 Optimizer::NloptLbfgs,
                 "{axes} axes, interaction = {interaction}: `auto` must take L-BFGS"
             );
@@ -1159,12 +1159,9 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
 
         let mut fd = model(n_fix);
         fd.gradient_method = GradientMethod::Fd;
-        assert!(
-            !analytic_outer_gradient_for_interaction(&fd, true),
-            "{axes} axes, FD"
-        );
+        assert!(!analytic_outer_gradient_available(&fd), "{axes} axes, FD");
         assert_eq!(
-            Optimizer::Auto.resolve_auto(&fd, true),
+            Optimizer::Auto.resolve_auto(&fd),
             Optimizer::Bobyqa,
             "{axes} axes, FD"
         );
