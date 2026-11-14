@@ -772,7 +772,8 @@ When they do not, the optimizer is **restarted once from the best point it reach
 ([#1277](https://github.com/FeRx-NLME/ferx-core/issues/1277)), on whatever is left of the
 fit's `maxiter` budget. It usually costs nothing in the sense that matters: the restart is
 adopted only if it ends at a **strictly lower** objective, so it can never make a reported
-fit worse. On the two-compartment deep-compartment model in
+fit worse. The one tie it wins is a restart that
+[the check below](#restart-at-its-own-start) verified as an optimum. On the two-compartment deep-compartment model in
 `tests/fixtures/two_cpt_dcm_regularized.ferx`, started without an `init` line, L-BFGS quit
 at evaluation 12 with the trace
 still falling ~2600 OFV per evaluation; the restart ran to convergence 3886 OFV units lower
@@ -1191,6 +1192,41 @@ mode. The restart reaches 775.39 with different estimates (TVVMAX 1.261 → 1.19
 search gets enough starts (`MCETA=200`), a gap of 8.935 against ferx's 8.938. Without
 `MCETA`, NONMEM's cold η search puts one subject in the higher mode at the optimum. Its own
 estimation from these starting values stops with rounding errors at 814.84.
+
+#### A restart that does not leave its own start {#restart-at-its-own-start}
+
+A restart, for a basin shift or a [mid-descent stall](#stopping-without-converging), starts at
+the previous leg's estimates. A basin-shift restart's gain is mostly the EBE modes the cold
+solve found, not a step in θ, so it often ends closer to its own start than the escape step of
+0.01 in the optimizer's scaled space. The plateau rule and the
+verified-stop rule both require that step of a stop NLopt reported as a bare `Failure`, to
+tell a fit that descended from one that twitched and died at its start (#751). Before
+[#2707](https://github.com/FeRx-NLME/ferx-core/issues/2707), that alone made such a restart
+`converged: false`, however sound its stop: flat tail, a cold solve that reproduces the best
+objective seen, no subject off its modes.
+
+Now a restart rejected on that one ground is asked the question a
+[warm start at an optimum](optimizers.qmd#warm-start-at-an-optimum) is asked: the optimizer is
+restarted from a perturbation of the restart's point, and if it comes back to within 0.01 OFV,
+the point is reported converged. On a multimodal inner problem that perturbed run can trap in
+a higher mode as the fit did, so it runs the same restart chain before its answer is read.
+Only the fit's own restarts are announced in `FitResult.warnings`, not the perturbed run's.
+
+The check costs nothing on a restart that converged on its own terms, or that was rejected
+for any other reason. When the perturbed run instead ends more than 0.01 below the restart,
+the restart was not finished, and the perturbed run's result is reported, with its own
+`converged` verdict. That is not done on the first attempt, whose stall at the user's
+initial estimates stays flagged; a restart's start is not the user's. When it reaches no
+verdict, the restart is reported `converged: false` as before. The perturbed run spends what
+is left of the fit's `maxiter` budget; when it runs out, the fit reports the budget spent
+(`eval_budget_spent`) and the advice to increase `maxiter`. Either way the restart's
+notice in `FitResult.warnings` says which run the reported estimates come from.
+
+On a simulated population of 80 subjects, 24 of them flip-flop
+(`tests/fixtures/flip_flop_pop/`, fitted in closed form and as an ODE), both fits end at the
+optimum, OFV −3051.439163, and are now reported converged. The closed form stops through the
+verified-stop rule and the ODE twin through the plateau rule. The check costs about 110 more
+objective evaluations (87 → 197 and 85 → 202), about twice each fit's run time (Linux).
 
 ## Configuration Example
 
