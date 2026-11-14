@@ -26,6 +26,7 @@ dcm_export_predict
 dose_compartment_routing
 dtmm_nonmem_anchor
 kappa_correlation_auto_lbfgs_fits
+kmmc_survfit_reference
 lagged_zero_order_break_times
 level_no_gaussian_nonmem_anchor
 markov_nonmem
@@ -56,6 +57,7 @@ tte_ode_solve_failed
 tte_residuals_nonmem_anchor
 tte_smoke
 vi_dcm_omega_recovery
+vpc_kmmc_self_consistency
 vpc_rtte_self_consistency
 vpc_tte_self_consistency
 zero_omega_fit

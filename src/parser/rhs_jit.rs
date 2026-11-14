@@ -31,7 +31,7 @@
 //! binding does).
 use super::ir::{self, Cc, Func, Inst, Layout, Shim1};
 use super::Flat;
-use crate::sens::num::vm::RhsKernel;
+use crate::sens::num::vm::{LoadedInputs, RhsKernel};
 use cranelift_codegen::ir::condcodes::FloatCC;
 use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
 use cranelift_codegen::settings::{self, Configurable};
@@ -464,6 +464,10 @@ pub(super) struct JitCode {
 struct JitInner {
     code: Vec<Flat>,
     n_regs: usize,
+    /// `super::makes_structural_zeros(&code)`, computed once.
+    zero_sources: bool,
+    /// `super::loaded_inputs(&code)`: the states, `params` slots and seeds it loads.
+    loads: (Vec<u32>, Vec<u32>, [bool; 4]),
     extent: Extent,
     plan: HoistPlan,
     full: Box<[OnceLock<Option<Compiled<RhsFn>>>]>,
@@ -494,6 +498,8 @@ impl JitCode {
         let inner = Arc::new(JitInner {
             code: code.to_vec(),
             n_regs,
+            zero_sources: super::makes_structural_zeros(code),
+            loads: super::loaded_inputs(code),
             extent: extent(code),
             plan: hoist_plan(code),
             full: slots(),
@@ -618,6 +624,27 @@ impl RhsKernel for JitInner {
     }
     fn has_reverse(&self, layout: Layout) -> bool {
         self.resolve_vjp(layout).is_some()
+    }
+    fn structural_zero_inputs(&self) -> Option<LoadedInputs<'_>> {
+        let (states, params, seeds) = &self.loads;
+        (!self.zero_sources).then_some(LoadedInputs {
+            states,
+            params,
+            seeds: *seeds,
+        })
+    }
+    fn structural_zeros(
+        &self,
+        u: &[f64],
+        params: &[f64],
+        seeds: &[f64; 4],
+        zu: &[bool],
+        zp: &[bool],
+        zs: &[bool; 4],
+        out: &mut [bool],
+    ) -> bool {
+        super::structural_zeros(&self.code, self.n_regs, u, params, seeds, zu, zp, zs, out);
+        true
     }
     unsafe fn forward(
         &self,
