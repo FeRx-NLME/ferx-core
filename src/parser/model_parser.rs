@@ -1,7 +1,8 @@
 use crate::parser::covariate_model::CovariateStatBindings;
 use crate::sim::adaptive::{
     round_to_message, validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec,
-    AdaptiveRoute, AdaptiveRule, Comparison, DoseKnowledge, DoseStep, DoseValue, IntervalStep,
+    AdaptiveRoute, AdaptiveRule, Comparison, DecisionCovariates, DoseKnowledge, DoseStep,
+    DoseValue, IntervalStep,
 };
 use crate::types::*;
 use regex::Regex;
@@ -11500,6 +11501,7 @@ fn parse_adaptive_dosing_block(
     let mut levels: Option<Vec<DoseValue>> = None;
     let mut round_to: Option<f64> = None;
     let mut dose_knowledge = DoseKnowledge::Known;
+    let mut decision_covariates = DecisionCovariates::Locf;
     let mut intervals: Option<Vec<f64>> = None;
     let mut start_interval: Option<f64> = None;
     // The `every` step of `at`, kept for the intervals-on-the-grid check (#945).
@@ -11631,6 +11633,17 @@ fn parse_adaptive_dosing_block(
                     }
                 };
             }
+            "decision_covariates" => {
+                decision_covariates = match val {
+                    "locf" => DecisionCovariates::Locf,
+                    "nocb" => DecisionCovariates::Nocb,
+                    other => {
+                        return Err(format!(
+                            "[adaptive_dosing]: decision_covariates must be `locf` or `nocb`, got `{other}`"
+                        ))
+                    }
+                };
+            }
             "intervals" => {
                 let l = parse_float_array(val)
                     .map_err(|e| format!("[adaptive_dosing]: bad intervals: {e}"))?;
@@ -11715,6 +11728,7 @@ fn parse_adaptive_dosing_block(
         levels,
         round_to,
         dose_knowledge,
+        decision_covariates,
         intervals,
         start_interval,
         target_window,

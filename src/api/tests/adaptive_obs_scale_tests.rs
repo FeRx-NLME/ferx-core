@@ -331,6 +331,7 @@ fn from_spec_hold(observe: Option<&str>, with_assay_error: bool) -> AdaptiveDosi
         // Required by the block; it never fires (no reading is below −1e9).
         round_to: None,
         dose_knowledge: Default::default(),
+        decision_covariates: Default::default(),
         rules: vec![AdaptiveRule {
             op: Comparison::Lt,
             threshold: -1e9,

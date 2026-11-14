@@ -23,6 +23,7 @@ pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters
 pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveSimulateOptions
+pub ferx_core::api::AdaptiveSimulateOptions::decision_covariates: core::option::Option<ferx_core::sim::adaptive::DecisionCovariates>
 pub ferx_core::api::AdaptiveSimulateOptions::decision_times: alloc::vec::Vec<f64>
 pub ferx_core::api::AdaptiveSimulateOptions::max_decisions: usize
 pub ferx_core::api::AdaptiveSimulateOptions::monitors: alloc::vec::Vec<ferx_core::sim::adaptive::MonitorSpec>
@@ -2295,6 +2296,9 @@ pub ferx_core::sim::adaptive::Comparison::Ge
 pub ferx_core::sim::adaptive::Comparison::Gt
 pub ferx_core::sim::adaptive::Comparison::Le
 pub ferx_core::sim::adaptive::Comparison::Lt
+#[non_exhaustive] pub enum ferx_core::sim::adaptive::DecisionCovariates
+pub ferx_core::sim::adaptive::DecisionCovariates::Locf
+pub ferx_core::sim::adaptive::DecisionCovariates::Nocb
 #[non_exhaustive] pub enum ferx_core::sim::adaptive::DecisionOutcome
 pub ferx_core::sim::adaptive::DecisionOutcome::Dosed
 pub ferx_core::sim::adaptive::DecisionOutcome::Dosed::n: usize
@@ -2348,6 +2352,7 @@ pub ferx_core::sim::adaptive::AdaptiveDosingSpec::assay_cmt: core::option::Optio
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::confirm: u32
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::decision_covariates: ferx_core::sim::adaptive::DecisionCovariates
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_knowledge: ferx_core::sim::adaptive::DoseKnowledge
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
@@ -4597,6 +4602,7 @@ pub ferx_core::AdaptiveDosingSpec::assay_cmt: core::option::Option<usize>
 pub ferx_core::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::confirm: u32
+pub ferx_core::AdaptiveDosingSpec::decision_covariates: ferx_core::sim::adaptive::DecisionCovariates
 pub ferx_core::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
 pub ferx_core::AdaptiveDosingSpec::dose_knowledge: ferx_core::sim::adaptive::DoseKnowledge
 pub ferx_core::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
@@ -4626,6 +4632,7 @@ pub ferx_core::AdaptiveRule::interval: core::option::Option<ferx_core::sim::adap
 pub ferx_core::AdaptiveRule::op: ferx_core::sim::adaptive::Comparison
 pub ferx_core::AdaptiveRule::threshold: f64
 #[non_exhaustive] pub struct ferx_core::AdaptiveSimulateOptions
+pub ferx_core::AdaptiveSimulateOptions::decision_covariates: core::option::Option<ferx_core::sim::adaptive::DecisionCovariates>
 pub ferx_core::AdaptiveSimulateOptions::decision_times: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveSimulateOptions::max_decisions: usize
 pub ferx_core::AdaptiveSimulateOptions::monitors: alloc::vec::Vec<ferx_core::sim::adaptive::MonitorSpec>

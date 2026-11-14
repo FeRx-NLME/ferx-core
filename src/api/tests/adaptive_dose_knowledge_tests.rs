@@ -407,28 +407,34 @@ fn under_iov_a_supplied_subject_reads_kappa_zero_and_an_oracle_one_the_first_occ
 }
 
 /// The table in `docs/model-file/adaptive-dosing.qmd`, "Which κ a decision window runs
-/// under" (#2771): a bolus at every decision, κ on CL. Each piece between two neighbouring
-/// records or decisions runs under the κ of the next record at or after its end, however
-/// many decisions later that record is. Past the subject's last record it runs under the κ
-/// of the latest decision at or before its start.
+/// under" (#2771, #2895): a bolus at every decision, κ on CL. Every decision is a record, so
+/// each piece between two neighbouring records or decisions runs under the κ of the first
+/// data record or decision at or after its end — a decision `g` brings κ_g. Before #2895 a
+/// decision was no record, and a piece ran under the next *data* record however many
+/// decisions later (rows 5–8 below moved).
 ///
 /// | Decisions | Records | Pieces |
 /// |---|---|---|
 /// | 0, 24 | 0, 24, 48 | `(0, 24]` κ₁ |
 /// | 0, 24 | 0, 12, 24 | `(0, 12]` κ₀, `(12, 24]` κ₁ |
-/// | 0, 24 | 0, 23, 47 | `(0, 23]` κ₀, `(23, 24]` κ₁ (the record at 47) |
+/// | 0, 24 | 0, 23, 47 | `(0, 23]` κ₀, `(23, 24]` κ₁ (the decision at 24; the record at 47 before #2895) |
 /// | 0, 24 | 0, 23, 24, 48 | `(0, 23]` κ₀, `(23, 24]` κ₁: a record on the decision is harmless with one just before it |
-/// | 0, 24, 48 | 0, 12, 48 | `(0, 12]` κ₀, `(12, 24]` and `(24, 48]` κ₂: no record on a decision is not enough |
-/// | 0, 24, 48, 72 | 0, 72 | all three windows κ₃ |
-/// | 0, 24 | 0, 23 | `(0, 24]` κ₀ (nothing after 23) |
-/// | 0, 24, 48 | 0, 23 | `(0, 24]` κ₀, `(24, 48]` κ₁: past the last record, the window's own decision |
+/// | 0, 24, 48 | 0, 12, 48 | `(0, 12]` κ₀, `(12, 24]` κ₁, `(24, 48]` κ₂ |
+/// | 0, 24, 48, 72 | 0, 72 | `(0, 24]` κ₁, `(24, 48]` κ₂, `(48, 72]` κ₃ |
+/// | 0, 24 | 0, 23 | `(0, 23]` κ₀, `(23, 24]` κ₁ (the decision at 24) |
+/// | 0, 24, 48 | 0, 23 | `(0, 23]` κ₀, `(23, 24]` κ₁, `(24, 48]` κ₂: past the last record, each decision |
+/// | 0, 24, 48, 72 | 0, 24, 48, 72 | `(0, 24]` κ₁, `(24, 48]` κ₂, `(48, 72]` κ₃ |
+/// | 0, 24, 48, 72 | 0, 23, 47, 71 | κ₀, κ₁, κ₁, κ₂, κ₂, κ₃ over the six pieces |
+/// | 0, 24, 48, 72 | 0, 12, 48, 72 | `(0, 12]` κ₀, `(12, 24]` κ₁, `(24, 48]` κ₂, `(48, 72]` κ₃ |
+///
+/// The last three rows and records 0, 72 are the layouts of the #2895 table.
 ///
 /// The oracle is outside the engine: the CL in force over a piece is backed out of the
 /// concentrations at its ends, `CL = −V/Δt · ln(C_b/C_a)`. At a decision the end value is
 /// the trough the decision read and the start value is that trough plus `dose/V`; between
 /// decisions it is the trajectory row. It is compared with `TVCL·exp(κ_g)` from the run's
-/// own κ substream. Worst relative gap over the 54 pieces of three replicates, macOS arm64:
-/// 2.8e-15, on a one-hour `(23, 24]` piece (bound 1e-12). Every other occasion's CL is
+/// own κ substream. Worst relative gap over the 93 pieces of three replicates, macOS arm64:
+/// 2.5e-15 (bound 1e-12). Every other occasion's CL is
 /// asserted at least 1e-2 away, so no κ can pass for another.
 ///
 /// Already pinned elsewhere: the first row by `auc_target_reads_each_window_under_its_segments_kappa`
@@ -440,9 +446,10 @@ fn under_iov_a_supplied_subject_reads_kappa_zero_and_an_oracle_one_the_first_occ
 /// Mutations run, each failing this test:
 /// - `governing_segment_pk_at` returning the carry (the last record behind the segment)
 ///   instead of the next record ahead: row 1, `(0, 24]` under κ₀.
-/// - the decision break no longer setting `last_pk = dp[g]` and `last_occ = Some(g)`, in
-///   the driver and its replay: the last row, `(24, 48]` under κ₀. The `0, 23` row with
-///   decisions at 0 and 24 cannot see this one: its κ₀ comes from the record at 23 alike.
+/// - the decision no longer a record in the driver alone, or in the frozen replay alone
+///   (`governing_segment_*_at` handed `None` for the decision records, #2895): rows 5–8.
+///   The decision break's own carry (`last_pk = dp[g]`) now reaches only the walk past the
+///   last decision, which no row here integrates.
 #[test]
 fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
     const SEED: u64 = 17;
@@ -450,7 +457,7 @@ fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
     let rel = |a: f64, b: f64| ((a - b) / b).abs();
     // (decisions, record times, pieces as (start, end, occasion in force)).
     type Piece = (f64, f64, usize);
-    let layouts: [(&[f64], &[f64], &[Piece]); 8] = [
+    let layouts: [(&[f64], &[f64], &[Piece]); 11] = [
         (&[0.0, 24.0], &[0.0, 24.0, 48.0], &[(0.0, 24.0, 1)]),
         (
             &[0.0, 24.0],
@@ -470,24 +477,54 @@ fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
         (
             &[0.0, 24.0, 48.0],
             &[0.0, 12.0, 48.0],
-            &[(0.0, 12.0, 0), (12.0, 24.0, 2), (24.0, 48.0, 2)],
+            &[(0.0, 12.0, 0), (12.0, 24.0, 1), (24.0, 48.0, 2)],
         ),
         (
             &[0.0, 24.0, 48.0, 72.0],
             &[0.0, 72.0],
-            &[(0.0, 24.0, 3), (24.0, 48.0, 3), (48.0, 72.0, 3)],
+            &[(0.0, 24.0, 1), (24.0, 48.0, 2), (48.0, 72.0, 3)],
         ),
         (
             &[0.0, 24.0],
             &[0.0, 23.0],
-            &[(0.0, 23.0, 0), (23.0, 24.0, 0)],
+            &[(0.0, 23.0, 0), (23.0, 24.0, 1)],
         ),
         (
             &[0.0, 24.0, 48.0],
             &[0.0, 23.0],
-            &[(0.0, 23.0, 0), (23.0, 24.0, 0), (24.0, 48.0, 1)],
+            &[(0.0, 23.0, 0), (23.0, 24.0, 1), (24.0, 48.0, 2)],
+        ),
+        // The other three layouts of the #2895 table (records 0, 72 is the row above it).
+        (
+            &[0.0, 24.0, 48.0, 72.0],
+            &[0.0, 24.0, 48.0, 72.0],
+            &[(0.0, 24.0, 1), (24.0, 48.0, 2), (48.0, 72.0, 3)],
+        ),
+        (
+            &[0.0, 24.0, 48.0, 72.0],
+            &[0.0, 23.0, 47.0, 71.0],
+            &[
+                (0.0, 23.0, 0),
+                (23.0, 24.0, 1),
+                (24.0, 47.0, 1),
+                (47.0, 48.0, 2),
+                (48.0, 71.0, 2),
+                (71.0, 72.0, 3),
+            ],
+        ),
+        (
+            &[0.0, 24.0, 48.0, 72.0],
+            &[0.0, 12.0, 48.0, 72.0],
+            &[
+                (0.0, 12.0, 0),
+                (12.0, 24.0, 1),
+                (24.0, 48.0, 2),
+                (48.0, 72.0, 3),
+            ],
         ),
     ];
+    let mut worst = 0.0_f64;
+    let mut n_pieces = 0;
     for (at, times, pieces) in layouts {
         let at_list: Vec<String> = at.iter().map(|t| t.to_string()).collect();
         let b = format!(
@@ -544,6 +581,11 @@ fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
                 .collect();
             for &(a, b, g) in pieces {
                 let backed_out = -v / (b - a) * (conc(b, false) / conc(a, true)).ln();
+                assert!(backed_out.is_finite(), "{tag}: ({a}, {b}] CL {backed_out}");
+                let gap = rel(backed_out, cl[g]);
+                assert!(gap.is_finite(), "{tag}: ({a}, {b}] gap {gap}");
+                worst = worst.max(gap);
+                n_pieces += 1;
                 assert!(
                     rel(backed_out, cl[g]) < 1e-12,
                     "{tag}: ({a}, {b}] runs under CL {backed_out}, want κ_{g}'s {} (all: {cl:?})",
@@ -558,6 +600,7 @@ fn a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece() {
             }
         }
     }
+    eprintln!("worst relative CL gap over {n_pieces} pieces: {worst:e}");
 }
 
 // ── The first decision: covariates and TIME ───────────────────────────────────────

@@ -19,7 +19,7 @@ An **occasion** is a distinct time window during which the same kappa value appl
 
 **Every record runs under its own occasion**, including the rows that are neither a dose nor a scored observation: an `EVID=2` row, an `EVID=0` row with `MDV=1`, and a reset (`EVID=3`/`4`). Under the end-of-interval rule such a row governs the interval that ends at it, so its occasion's κ is the one in force over that interval. NONMEM runs `$PK` on these rows the same way (#1133, #1876). An occasion that only `EVID=2`, `MDV=1` or reset rows carry gets a κ of its own, like one that only doses carry: it is informed through the interval the row governs, or the `init(...)` baseline a reset re-seeds, and a row after the subject's last observation leaves the objective unchanged. NONMEM gives such an occasion an `ETA` too (`nonmem_anchor/reset_init_snapshot_K.ctl`, #1153). A subject built in memory without per-row labels for them runs those rows under κ = 0; ferx does not guess an occasion from a neighbouring record.
 
-In an adaptive-dosing run the occasions are the decisions, and the same rule applies. A dosing window whose last record sits on the next decision therefore runs under the next occasion's κ: see [Which κ a decision window runs under](adaptive-dosing.qmd#window-kappa).
+In an adaptive-dosing run the occasions are the decisions, and the same rule applies. Every decision is a record, so the piece of a dosing window that ends at the next decision runs under the next occasion's κ: see [Which κ a decision window runs under](adaptive-dosing.qmd#window-kappa).
 
 ### Kappa parameters
 

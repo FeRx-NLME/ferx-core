@@ -2381,6 +2381,20 @@ fn adaptive_tv_pk_only_records_drive_per_event_pk() {
     );
 }
 
+/// The decision records (#2895) of a covariate-free IOV driver test: each decision's PK is
+/// the occasion PK it reads (`decision_covariates = locf` with no covariate, so the record
+/// and the readout are one `pk_param_fn` call in production).
+fn iov_decision_records<'a>(times: &'a [f64], pk: &[PkParams]) -> super::DecisionRecords<'a> {
+    static NO_COVARIATES: std::sync::LazyLock<HashMap<String, f64>> =
+        std::sync::LazyLock::new(HashMap::new);
+    super::DecisionRecords {
+        times,
+        pk: pk.to_vec(),
+        cov: vec![&*NO_COVARIATES; times.len()],
+        readout: Some(pk.to_vec()),
+    }
+}
+
 #[test]
 fn adaptive_iov_controller_matches_static_event_driven() {
     // Degenerate oracle for IOV (#701): a fixed-regimen controller under a
@@ -2417,7 +2431,7 @@ fn adaptive_iov_controller_matches_static_event_driven() {
         &ode,
         &occ_pk[0].values,
         Some(&event_pk),
-        Some(&decision_pk),
+        Some(&iov_decision_records(&times, &decision_pk)),
         Some(&eta_occ),
         &[],
         &[],
@@ -2474,7 +2488,7 @@ fn adaptive_iov_controller_matches_static_event_driven() {
         &ode,
         &frozen_pk[0].values,
         Some(&frozen_event),
-        Some(&frozen_pk),
+        Some(&iov_decision_records(&times, &frozen_pk)),
         Some(&frozen_eta),
         &[],
         &[],
@@ -2541,7 +2555,7 @@ fn adaptive_iov_frozen_replay_is_bit_exact() {
         &ode,
         &occ_pk[0].values,
         Some(&event_pk),
-        Some(&decision_pk),
+        Some(&iov_decision_records(&decisions, &decision_pk)),
         Some(&eta_occ),
         &[],
         &[],
@@ -2562,7 +2576,7 @@ fn adaptive_iov_frozen_replay_is_bit_exact() {
         &ode,
         &occ_pk[0].values,
         Some(&event_pk),
-        Some(&decision_pk),
+        Some(&iov_decision_records(&decisions, &decision_pk)),
         Some(&eta_occ),
         &[],
         &[],
@@ -2584,7 +2598,7 @@ fn adaptive_iov_frozen_replay_is_bit_exact() {
         &ode,
         &occ_pk[0].values,
         &event_pk,
-        Some(&decision_pk),
+        Some(&iov_decision_records(&decisions, &decision_pk)),
         Some(&eta_occ),
         &[],
         &[],
@@ -2655,7 +2669,7 @@ fn adaptive_iov_threads_occasion_eta_into_readout() {
         &ode,
         &occ_pk[0].values,
         Some(&event_pk),
-        Some(&decision_pk),
+        Some(&iov_decision_records(&times, &decision_pk)),
         Some(&eta_occ),
         &[],
         &baseline_eta,
@@ -9331,8 +9345,8 @@ fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
     let (last_pk, last_occ) = (pk_one(99.0, 100.0), Some(0_usize));
 
     for &t_end in &[24.0_f64, 30.0] {
-        let pk = governing_segment_pk_at(t_end, &records, &event_pk, last_pk);
-        let occ = governing_segment_occ_at(t_end, &records, &occ_of, last_occ);
+        let pk = governing_segment_pk_at(t_end, &records, None, &event_pk, last_pk);
+        let occ = governing_segment_occ_at(t_end, &records, None, &occ_of, last_occ);
         // Both must resolve to the t=30 record: for `t_end = 30` it is the record
         // itself, and for the non-record break at 24 it is the record that terminates
         // the interval containing it.
@@ -9351,8 +9365,8 @@ fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
     }
 
     // Past the final record both fall back, and they must fall back together.
-    let pk = governing_segment_pk_at(31.0, &records, &event_pk, last_pk);
-    let occ = governing_segment_occ_at(31.0, &records, &occ_of, last_occ);
+    let pk = governing_segment_pk_at(31.0, &records, None, &event_pk, last_pk);
+    let occ = governing_segment_occ_at(31.0, &records, None, &occ_of, last_occ);
     assert_eq!(pk.values[crate::types::PK_IDX_CL], 99.0);
     assert_eq!(occ, last_occ);
 
@@ -9374,8 +9388,8 @@ fn the_adaptive_segment_pk_and_occasion_resolve_to_the_same_record() {
         obs: vec![Some(0_usize), Some(2_usize)],
         ..Default::default()
     };
-    let pk = governing_segment_pk_at(24.0, &records, &event_pk, last_pk);
-    let occ = governing_segment_occ_at(24.0, &records, &occ_of, last_occ);
+    let pk = governing_segment_pk_at(24.0, &records, None, &event_pk, last_pk);
+    let occ = governing_segment_occ_at(24.0, &records, None, &occ_of, last_occ);
     assert_eq!(
         pk.values[crate::types::PK_IDX_CL],
         33.0,

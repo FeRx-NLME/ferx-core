@@ -16,7 +16,6 @@ nan-fold 1 crates/ferx-tools/tests/gam_two_cpt_oral_cov.rs::gam_ranks_wt_and_crc
 nan-fold 1 src/api/tests/adaptive_auc_tv_tests.rs::assert_distinct
 nan-fold 1 src/api/tests/adaptive_sim_tests.rs::adaptive_driver_wipes_a_dose_an_ss_record_reset
 nan-fold 1 src/api/tests/adaptive_sim_tests.rs::worst_rel
-nan-fold 1 src/api/tests/adaptive_sim_tests.rs::worst_rel_2371
 nan-fold 1 src/api/tests/cotimed_record_order_tests.rs::assert_close
 nan-fold 1 src/api/tests/cotimed_record_order_tests.rs::review_ties_follow_file_order
 nan-fold 1 src/api/tests/derived_cmt_tv_warning_tests.rs::worst_state_vs_ipred
