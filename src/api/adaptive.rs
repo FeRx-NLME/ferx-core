@@ -1198,19 +1198,16 @@ where
     // (#2163), keyed off the same root as the assay and κ substreams.
     let classes = super::simulate::SimClasses::new(model, params, assay_root)?;
 
-    for sim_idx in 0..n_sim {
-        let sim = sim_idx + 1;
-        for (subject_idx, (subject, supplied)) in
-            population.subjects.iter().zip(&supplied_etas).enumerate()
-        {
-            // Every decision is a record (#2895), so an `ADDL`-implied dose between a
-            // decision and the next data record is governed by that decision. The driver, its
-            // replay and the #748 check all read this one copy; the per-event condition is
-            // the one that gives the run its decision records below.
-            let regoverned;
-            let subject: &Subject = if model.n_kappa > 0
-                || crate::pk::subject_needs_per_event_pk(model, subject)
-            {
+    // Every decision is a record (#2895), so an `ADDL`-implied dose between a decision and
+    // the next data record is governed by that decision. The driver, its replay and the #748
+    // check read this one copy per subject; the per-event condition is the one that gives the
+    // run its decision records below. It depends on the subject, the schedule and the rule
+    // alone, so it is built once, not per replicate (#2948 review row 5).
+    let governed_subjects: Vec<std::borrow::Cow<'_, Subject>> = population
+        .subjects
+        .iter()
+        .map(|subject| {
+            if model.n_kappa > 0 || crate::pk::subject_needs_per_event_pk(model, subject) {
                 let index =
                     crate::ode::predictions::AdaptiveRecordIndex::new(subject, subject.doses.len());
                 let covs = crate::ode::predictions::decision_record_covs(
@@ -1219,15 +1216,27 @@ where
                     decision_times,
                     subject,
                 );
-                regoverned = crate::ode::predictions::with_implied_doses_governed_by_decisions(
+                crate::ode::predictions::with_implied_doses_governed_by_decisions(
                     subject,
                     decision_times,
                     &covs,
-                );
-                &regoverned
+                )
             } else {
-                subject
-            };
+                std::borrow::Cow::Borrowed(subject)
+            }
+        })
+        .collect();
+
+    for sim_idx in 0..n_sim {
+        let sim = sim_idx + 1;
+        for (subject_idx, ((as_read, supplied), governed)) in population
+            .subjects
+            .iter()
+            .zip(&supplied_etas)
+            .zip(&governed_subjects)
+            .enumerate()
+        {
+            let subject: &Subject = governed;
             // Held for the whole subject: the driver (and its window AUC) and the verifiers all
             // read `MIXNUM`, and every use of `params` below is this class's.
             let class = classes.enter(subject, 1, sim);
@@ -1510,10 +1519,12 @@ where
                             .as_ref()
                             .map_or_else(|| eta_slice.clone(), |eo| eo[g].clone())
                     };
+                    // The subject as read, not the re-governed copy: a re-governed implied
+                    // dose carries a row the code under check wrote (#2948 review row 2).
                     verify_decision_records(
                         model,
                         &params.theta,
-                        subject,
+                        as_read,
                         decision_times,
                         decision_covariates,
                         &eta_of,
@@ -2162,10 +2173,12 @@ pub(crate) fn verify_decision_records(
     }
     let locf = decision_covs_by_scan(subject, decision_times);
     let nocb = match rule {
+        // Exhaustive on purpose (#2948 review row 1), like the engine's match: a new rule must
+        // get its own re-derivation, not fall into the LOCF one the engine might share.
         crate::sim::adaptive::DecisionCovariates::Nocb => {
             Some(decision_nocb_covs_by_scan(subject, decision_times))
         }
-        _ => None,
+        crate::sim::adaptive::DecisionCovariates::Locf => None,
     };
     for (g, &t) in decision_times.iter().enumerate() {
         let row = nocb.as_ref().and_then(|v| v[g]).unwrap_or(locf[g]);

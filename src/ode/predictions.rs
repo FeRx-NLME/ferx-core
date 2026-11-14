@@ -5678,6 +5678,10 @@ pub(crate) fn with_implied_doses_governed_by_decisions<'a>(
         return std::borrow::Cow::Borrowed(subject);
     }
     let mut s = subject.clone();
+    // Filling every dose's row makes `has_tv_covariates()` true on the copy of an IOV-only or
+    // `TIME`-only subject. No adaptive consumer branches on it: the IOV path takes
+    // `event_pk_iov`, and the copy exists only where per-event PK already holds (#2948 review
+    // row 7). A new reader of that predicate on this copy must account for it.
     if s.dose_covariates.len() != s.doses.len() {
         s.dose_covariates = (0..subject.doses.len())
             .map(|k| subject.dose_cov(k).clone())
@@ -5713,10 +5717,12 @@ pub(crate) fn decision_record_covs<'a>(
         .map(|&t| {
             let locf = locf_decision_cov(records, t, subject, &subject.covariates);
             match rule {
+                // Exhaustive on purpose (#2948 review row 1): a new rule must be written
+                // here, not fall into LOCF.
                 DecisionCovariates::Nocb => {
                     governing_record_at(t, records).map_or(locf, |rec| rec.cov(subject))
                 }
-                _ => locf,
+                DecisionCovariates::Locf => locf,
             }
         })
         .collect()
