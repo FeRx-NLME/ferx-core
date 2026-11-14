@@ -3,6 +3,7 @@
 //! every payload form a plan uses.
 use super::super::super::{Flat, Unary};
 use super::super::ir::{self, Cc, Layout};
+use super::super::DirMask;
 use super::{AtLayout, LaneProg};
 
 fn layouts() -> Vec<(&'static str, Layout)> {
@@ -83,8 +84,8 @@ fn check_mode(name: &str, op: Flat, vals: &[f64], zero_tan: &[usize], dead: bool
             ir::interpret(&f, &mut [&mut uu, &mut p, &mut s, &mut du_ir]);
         }
         let prog = LaneProg::of(&code, n_regs, n_in).expect("no `if`");
-        let spec: Vec<(u64, u8)> = (0..n_in)
-            .map(|_| (if dead { 0 } else { !0 }, u8::MAX))
+        let spec: Vec<(DirMask, u16)> = (0..n_in)
+            .map(|_| (if dead { DirMask::NONE } else { DirMask::ALL }, u16::MAX))
             .collect();
         let at = AtLayout::of(&prog, layout, &spec);
         let mut base = u.clone();

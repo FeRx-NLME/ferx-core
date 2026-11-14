@@ -56,7 +56,7 @@ impl GradientMethodKind {
 ///
 /// Best-case, model-level mirror of the per-subject route
 /// `estimation::inner_optimizer::analytic_inner_grad_supported` runs. The reported method is
-/// the union of the three in-scope inner routes — closed-form / CTMM, the light `Dual1` ODE
+/// the union of the three in-scope inner routes — closed-form / CTMM, the light `Dual2` ODE
 /// walk (#410), and the stacked-η IOV walk — computed by the shared
 /// `inner_reports_analytic_model` predicate that `fd_fallback_warning` reads too, so the
 /// reported label and the FD-fallback warning cannot drift (#378 task B / #926). Otherwise

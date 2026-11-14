@@ -1721,6 +1721,28 @@ pub(crate) fn ode_rhs_route_warning(model: &CompiledModel) -> Option<(String, Wa
     Some((msg, entry))
 }
 
+/// The fit's subjects whose compiled plan failed at runtime and so took finite-difference
+/// derivatives (`W_PLAN_FD_FALLBACK`, #2786), counted from what ran: in theory never, so the
+/// message asks for a report. `None` when every plan held.
+pub(crate) fn plan_fd_fallback_warning(
+    model: &CompiledModel,
+    population: &Population,
+) -> Option<(String, WarningEntry)> {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let (k, why) = kj::plan_failures(model, &population.subjects)?;
+    let n = population.subjects.len();
+    let msg = format!(
+        "W_PLAN_FD_FALLBACK: {k} of {n} subjects fell back to finite-difference derivatives \
+         because their compiled plan failed ({why}); results are correct but slower — please \
+         report this as a bug."
+    );
+    let details = serde_json::json!({ "n_subjects": k, "n_total": n, "reason": why });
+    Some((
+        msg.clone(),
+        warning_entry(WarningCode::GradientFallback, msg, Some(details)),
+    ))
+}
+
 /// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
 /// return `None` when empty, otherwise join a human `list` string (`line` per
 /// hit), format the message (`msg` over the joined list), build the structured
@@ -3834,7 +3856,7 @@ pub(crate) fn with_solver_stats<T>(
 ///
 /// The post-fit prediction sweep is an `f64` sweep, and one whole class of solver decision is
 /// invisible to it: the `auto` escalation guard's jet-finiteness clause can only fire on a
-/// `Dual1`/`Dual2` instantiation, because `f64` carries no jets to check. A counter that no
+/// `Dual2`/`Dual2` instantiation, because `f64` carries no jets to check. A counter that no
 /// production path could ever set would be exactly the dead diagnostic #1080 item 3 existed to
 /// remove, so the diagnostic scope has to see a dual solve as well as a scalar one.
 ///
@@ -3853,7 +3875,7 @@ pub(crate) fn with_solver_stats<T>(
 ///
 /// And the *order* matters. The overflow this exists to observe reaches the Hessian first and
 /// the gradient only later — value `7.2e303`, gradient `1.4e306`, Hessian `NaN` on the #1204
-/// repro — so a first-order `Dual1` sweep would miss exactly the case the counter is named
+/// repro — so a first-order `Dual2` sweep would miss exactly the case the counter is named
 /// for. When the model has an analytic **outer** gradient the sweep runs the unified
 /// recorder's second-order η-jets (`adjoint::exact_inner_hessian`), which is what FOCEI
 /// differentiates; when only the inner loop is analytic it runs the first-order

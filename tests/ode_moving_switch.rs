@@ -1,7 +1,8 @@
 //! A θ that reaches `[odes]` only through an `if` condition must move (#2649).
 //!
 //! The objective depends on `TLAG`, but its analytic gradient was exactly zero, so the
-//! default route never moved it. Tier-2: a handful of outer iterations on a small dataset
+//! default route never moved it; the model was then routed to finite differences, and is now
+//! served by the exact gradient, the switch located and its sensitivity jump applied. Tier-2: a handful of outer iterations on a small dataset
 //! generated with the switch at 2, started at 1.13. Asserting that `TLAG` left its start is
 //! the whole claim: before the fix it came back bit-identical.
 
@@ -60,8 +61,11 @@ fn a_theta_only_in_an_odes_condition_is_estimated() {
         "TLAG never left its start: {tlag}"
     );
     assert!(
-        result.warnings.iter().any(|w| w.contains("`LAGT`")),
-        "the route change is reported: {:?}",
+        !result
+            .warnings
+            .iter()
+            .any(|w| w.contains("finite-difference")),
+        "the exact gradient serves it: {:?}",
         result.warnings
     );
 }

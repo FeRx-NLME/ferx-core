@@ -442,9 +442,8 @@ subject.
 
 The analytic route is taken for every subject a recorder serves, including IOV
 (correlated blocks shared across occasions), LTBS, observation scaling and the TTE, binary
-and CTMM endpoints (whose term falls back to finite differences past 8 BSV random
-effects). The exact anchor is served up to eight random effects (stacked under
-IOV) and the Gauss–Newton anchor up to 48. A subject outside the scope is
+and CTMM endpoints, at any number of random effects (stacked under IOV) and under either
+anchor. A subject outside the scope is
 finite-differenced on its own, and a mixture or `gradient = fd` keeps the whole-population
 stencil. The anchor must be positive-definite at the subject's **mode**. At a quadrature
 node it may be indefinite (common in the tails of a wide-Ω grid), since the assembly

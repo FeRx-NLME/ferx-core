@@ -14,13 +14,13 @@
 //! the #570 one-solve share (`model_uses_time_anywhere`) and lands on the dedicated engine
 //! this file exercises.
 //!
-//! **Engine.** Every fixture here is the dense f64 walk (`ode_dense_solve_states_reading`)
-//! or the threshold walk (`ode_solve_until_chz_threshold`). The dual twin of the hazard
-//! curves (`ode_cumhaz_hazard_g`) serves only subjects on the static walk with an autonomous
-//! RHS; these fixtures read `TIME` in `$PK`, which that walk declines, so their inner
-//! η-gradient resolves to finite differences and there is no dual path here to keep in
-//! parity. The routing boundary is pinned at Tier 1
-//! (`inner_optimizer::tests::an_ode_hazard_subject_resolves_its_inner_gradient_by_the_walks_scope`).
+//! **Engine.** `predict_survival` and `simulate()` run the dense f64 walk
+//! (`ode_dense_solve_states_reading`) or the threshold walk (`ode_solve_until_chz_threshold`).
+//! The objective scores the subject off the event-driven dual walk (`ode_states_at_g`: every
+//! segment on the `TIME = 0` disposition, every dose quantity at its record) — the function its
+//! exact derivatives differentiate, so the fit reports no finite-difference fallback. Its value
+//! against the dense walk and its gradients against Richardson differences are pinned at
+//! Tier 1 (`survival::ode_hazard_exact_tests::a_time_reading_pk_with_an_ode_hazard_is_exact`).
 //!
 //! **The fixture.** `DROP` is a literal spliced into `$PK` that only ever acts at
 //! `TIME < 0.5` (a literal, not a theta: a `0 FIX` theta is packed on the log scale and
@@ -256,6 +256,14 @@ fn the_objective_reads_dose_quantities_at_the_dose_record() {
         b.ofv,
         c.ofv
     );
+    // The exact route serves both arms: no subject falls back to finite differences.
+    for (arm, r) in [("bad", &b), ("control", &c)] {
+        assert!(
+            !r.warnings.iter().any(|w| w.contains("finite-difference")),
+            "{arm}: {:?}",
+            r.warnings
+        );
+    }
 }
 
 /// H2, `simulate()`: event times off a fixed seed, finite horizon, bit-identical to the

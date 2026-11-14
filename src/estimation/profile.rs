@@ -4120,10 +4120,6 @@ impl ProfileCtx<'_> {
             }
             acc
         });
-        if adjoint {
-            // The recordings' tape buffers, released on every worker (`analytic_cov_assembly`).
-            rayon::broadcast(|_| crate::sens::rtape::rtape_trim(0));
-        }
         let mut d_levels: Vec<DMatrix<f64>> = layout
             .groups
             .iter()

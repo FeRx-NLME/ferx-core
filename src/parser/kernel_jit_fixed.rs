@@ -33,8 +33,6 @@ pub enum Found {
     /// pulse train). The value is that iterate and not a fixed point, so its derivatives are
     /// the iteration's own — the implicit ones would belong to a state it never computed.
     Iterated { map: usize, count: usize },
-    /// A state that depends on nothing (overlapping infusion pulses): no derivatives.
-    Constant,
 }
 
 /// The value search: the value path's own steady-state solve over the given maps, returning
@@ -109,20 +107,6 @@ impl FixedSpec {
         let (u_star, found) = (self.solve)(&refs)?;
         let k = match found {
             Found::Fixed(k) => k,
-            Found::Constant => {
-                out[..n * l].fill(0.0);
-                for i in 0..n {
-                    out[i * l] = u_star[i];
-                }
-                if let Some(lg) = log {
-                    *lg = Some(FixedLog {
-                        steps: Vec::new(),
-                        map: usize::MAX,
-                        m: Vec::new(),
-                    });
-                }
-                return Some(());
-            }
             Found::Iterated { map, count } => {
                 // The iteration itself over the layout, from the zero state.
                 let mut u = vec![0.0; n * l];
@@ -345,7 +329,7 @@ pub(crate) fn record_fixed(
     let cap_vals: Vec<f64> = rec(|r| caps.iter().map(|&c| r.vals[c as usize]).collect());
     let mut out = vec![0.0; n];
     if !spec.run(Layout::F64, &cap_vals, &mut out, None) {
-        fail("a steady-state call's record-time search failed".into());
+        fail_here("a steady-state call's record-time search failed");
         return None;
     }
     let id = rec(|r| {
@@ -427,21 +411,6 @@ fn record_sub(
             seen.insert(d as u32);
         }
     }
-    if super::debug() {
-        // TEMP #2786: which of the fresh variables the map reads.
-        let used: Vec<bool> = var_regs
-            .iter()
-            .map(|&v| {
-                body.iter()
-                    .any(|g| uses(g).into_iter().flatten().any(|u| u as u32 == v))
-                    || y.iter().any(|o| o.r == v)
-            })
-            .collect();
-        eprintln!(
-            "kjit: record_sub n {n} vars used {used:?} body {}",
-            body.len()
-        );
-    }
     let mut outs: Vec<u32> = y.iter().map(|o| o.r).collect();
     // An output (or a guard condition, shared by hash-consing) recorded before the map is an
     // input too.
@@ -474,6 +443,7 @@ fn record_sub(
         ode: true,
         dense: true,
         declined: 0,
+        tie: Default::default(),
     })
 }
 
@@ -618,7 +588,7 @@ pub(crate) fn record_repeat(
     }));
     let mut out = vec![0.0; n];
     if !spec.run(Layout::F64, &inputs, &mut out, None) {
-        fail("a repeat call's record-time run failed".into());
+        fail_here("a repeat call's record-time run failed");
         return None;
     }
     let id = rec(|r| {

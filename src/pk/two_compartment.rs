@@ -279,19 +279,6 @@ pub fn two_cpt_predict(
 // A·exp(-λ·τ) / (1 - exp(-λ·II)). The 2-cpt formulas just apply this
 // substitution per eigenvalue (α, β, and ka for oral).
 
-/// Helper: SS coefficient `1 / (1 - exp(-λ·ii))`. Returns 0 when the
-/// denominator collapses (λ·ii ≤ 0 — should already be guarded out by
-/// callers' `ii > 0` and `λ > 0` checks).
-#[inline]
-fn ss_coeff(lambda: f64, ii: f64) -> f64 {
-    let denom = 1.0 - (-lambda * ii).exp();
-    if denom > 0.0 {
-        1.0 / denom
-    } else {
-        0.0
-    }
-}
-
 /// Two-compartment IV bolus at steady state.
 #[inline]
 pub fn two_cpt_iv_bolus_ss(dose: &DoseEvent, t: f64, cl: f64, v1: f64, q: f64, v2: f64) -> f64 {
@@ -370,73 +357,23 @@ pub(crate) fn two_cpt_iv_peripheral(
     if v2 <= 0.0 || q < 0.0 {
         return 0.0;
     }
+    let Some(modes) = peripheral_modes(cl, v1, q, v2) else {
+        return 0.0;
+    };
+    let mode = |lam| crate::sens::one_cpt::mode_dose(dose, lam, tau);
+    q / (v1 * v2) * crate::sens::one_cpt::modal_sum(&modes, mode)
+}
+
+/// The modes of the peripheral's response to a unit central impulse, `k12·(e^{−βt} −
+/// e^{−αt})/(α − β)` (the factor `k12` left to the caller); `None` at `α = β`, which needs
+/// `CL = Q = 0`.
+fn peripheral_modes(cl: f64, v1: f64, q: f64, v2: f64) -> Option<[(f64, f64); 2]> {
     let (alpha, beta, _k21) = macro_rates(cl, v1, q, v2);
     let diff = alpha - beta;
-    if diff.abs() < 1e-12 || alpha.abs() < 1e-12 || beta.abs() < 1e-12 {
-        return 0.0;
+    if diff <= 0.0 {
+        return None;
     }
-    // Shared coefficient: (q/v1)/v2/diff = k12/(v2*diff)
-    let k12_over_v2_diff = q / (v1 * v2 * diff);
-
-    if dose.ss && dose.ii > 0.0 {
-        let ii = dose.ii;
-        if dose.is_infusion() {
-            let dur = dose.duration;
-            if dur <= 0.0 {
-                // Degenerate infusion → treat as bolus SS
-                return k12_over_v2_diff
-                    * dose.amt
-                    * ((-beta * tau).exp() * ss_coeff(beta, ii)
-                        - (-alpha * tau).exp() * ss_coeff(alpha, ii));
-            }
-            if dur > ii {
-                return 0.0;
-            }
-            // c2_coeff for infusion: rate * k12/(v2*diff)
-            let c2 = dose.rate / diff * q / (v1 * v2);
-            if tau <= dur {
-                // Current pulse (during infusion) + past pulses (always "after").
-                let current = c2
-                    * ((1.0 - (-beta * tau).exp()) / beta - (1.0 - (-alpha * tau).exp()) / alpha);
-                let past_b = c2 * (1.0 - (-beta * dur).exp()) / beta
-                    * (-beta * (tau - dur)).exp()
-                    * (-beta * ii).exp()
-                    * ss_coeff(beta, ii);
-                let past_a = c2 * (1.0 - (-alpha * dur).exp()) / alpha
-                    * (-alpha * (tau - dur)).exp()
-                    * (-alpha * ii).exp()
-                    * ss_coeff(alpha, ii);
-                current + past_b - past_a
-            } else {
-                let dt = tau - dur;
-                c2 * ((1.0 - (-beta * dur).exp()) * (-beta * dt).exp() * ss_coeff(beta, ii) / beta
-                    - (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() * ss_coeff(alpha, ii)
-                        / alpha)
-            }
-        } else {
-            // Bolus SS
-            k12_over_v2_diff
-                * dose.amt
-                * ((-beta * tau).exp() * ss_coeff(beta, ii)
-                    - (-alpha * tau).exp() * ss_coeff(alpha, ii))
-        }
-    } else if dose.is_infusion() {
-        let dur = dose.duration;
-        if dur <= 0.0 {
-            return k12_over_v2_diff * dose.amt * ((-beta * tau).exp() - (-alpha * tau).exp());
-        }
-        let c2 = dose.rate / diff * q / (v1 * v2);
-        if tau <= dur {
-            c2 * ((1.0 - (-beta * tau).exp()) / beta - (1.0 - (-alpha * tau).exp()) / alpha)
-        } else {
-            let dt = tau - dur;
-            c2 * ((1.0 - (-beta * dur).exp()) * (-beta * dt).exp() / beta
-                - (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() / alpha)
-        }
-    } else {
-        // Single-dose bolus
-        k12_over_v2_diff * dose.amt * ((-beta * tau).exp() - (-alpha * tau).exp())
-    }
+    Some([(1.0 / diff, beta), (-1.0 / diff, alpha)])
 }
 
 /// Peripheral concentration for a 2-cpt oral single dose at elapsed time tau.
@@ -456,11 +393,9 @@ pub(crate) fn two_cpt_iv_peripheral(
 /// time 0), the residues must sum to zero, so the `exp(-ka·τ)` coefficient
 /// equals minus the sum of the eigenvalue residues.
 ///
-/// Formula (non-L'Hôpital):
-///   D = f_bio·dose.amt·ka/v1
-///   C2(τ) = (q/v2)·D · [ exp(-α·τ)/((ka-α)(β-α)) + exp(-β·τ)/((ka-β)(α-β)) + exp(-ka·τ)/((α-ka)(β-ka)) ]
-///
-/// L'Hôpital case (ka≈α or ka≈β): returns 0 (peripheral formula undefined at singularity).
+/// Formula, with `D = f_bio·dose.amt·ka/v1` and `B` the Bateman function
+/// ([`crate::sens::num::bateman`], smooth through `ka = α, β`):
+///   C2(τ) = (q/v2)·D · (B(β, ka, τ) − B(α, ka, τ))/(α − β)
 pub(crate) fn two_cpt_oral_peripheral(
     dose: &DoseEvent,
     tau: f64,
@@ -482,34 +417,21 @@ pub(crate) fn two_cpt_oral_peripheral(
     if v2 <= 0.0 || q < 0.0 || ka <= 0.0 {
         return 0.0;
     }
-    let (alpha, beta, _k21) = macro_rates(cl, v1, q, v2);
-    let diff = alpha - beta; // alpha - beta
-    if diff.abs() < 1e-12 {
+    let Some(modes) = peripheral_modes(cl, v1, q, v2) else {
         return 0.0;
-    }
-    if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 {
-        return 0.0; // L'Hôpital case; peripheral formula reduces to 0 at this singularity
-    }
-
-    let d = f_bio * dose.amt * ka / v1;
-    // Peripheral formula coefficients (exp terms mirror the central formula, but with k21 cancelled):
-    // C2(τ) = (q/v2)·D·[exp(-α·τ)/((ka-α)(β-α)) + exp(-β·τ)/((ka-β)(α-β)) + exp(-ka·τ)/((α-ka)(β-ka))]
-    let q_over_v2 = q / v2;
-
-    if dose.ss && dose.ii > 0.0 {
-        let ii = dose.ii;
-        q_over_v2
-            * d
-            * ((-alpha * tau).exp() * ss_coeff(alpha, ii) / ((ka - alpha) * (beta - alpha))
-                + (-beta * tau).exp() * ss_coeff(beta, ii) / ((ka - beta) * (alpha - beta))
-                + (-ka * tau).exp() * ss_coeff(ka, ii) / ((alpha - ka) * (beta - ka)))
-    } else {
-        q_over_v2
-            * d
-            * ((-alpha * tau).exp() / ((ka - alpha) * (beta - alpha))
-                + (-beta * tau).exp() / ((ka - beta) * (alpha - beta))
-                + (-ka * tau).exp() / ((alpha - ka) * (beta - ka)))
-    }
+    };
+    // The central impulse response's peripheral modes, each convolved with the depot's drain:
+    // Bateman functions, smooth through `ka = α, β` (at steady state, their geometric sums).
+    let (d, ii) = (f_bio * dose.amt * ka / v1, dose.ii);
+    let ss = dose.ss && ii > 0.0;
+    let bateman = |lam| {
+        if ss {
+            crate::sens::num::bateman_ss(lam, ka, tau, ii)
+        } else {
+            crate::sens::num::bateman(lam, ka, tau)
+        }
+    };
+    q / v2 * d * crate::sens::one_cpt::modal_sum(&modes, bateman)
 }
 
 #[cfg(test)]

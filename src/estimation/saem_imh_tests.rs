@@ -360,10 +360,19 @@ fn conditional_precision_matches_the_fd_hessian_at_zero_residual() {
     subject.observations = predictions(&model, &subject, &theta, &eta_star);
 
     // The production pair: `J` and the `f` it rides with, from one dual sweep.
-    let (jac, f) = super::eta_jacobian_and_preds(&model, &subject, &theta, &eta_star)
+    let (jac, f, _) = super::eta_jacobian_and_preds(&model, &subject, &theta, None, &eta_star)
         .expect("analytic Jacobian in scope");
     let h_tilde = crate::stats::likelihood::conditional_eta_precision(
-        &model, &subject, &theta, &eta_star, &f, &jac, &omega, &sigma, true,
+        &model,
+        &subject,
+        &theta,
+        &eta_star,
+        &f,
+        &[],
+        &jac,
+        &omega,
+        &sigma,
+        true,
     )
     .expect("curvature in scope");
 
@@ -413,7 +422,7 @@ fn conditional_precision_halves_match_their_closed_forms_under_proportional_erro
     let subject = well_conditioned_subject();
     let eta = [0.2, -0.1];
     let n_obs = subject.obs_times.len();
-    let (jac_dual, f_dual) = super::eta_jacobian_and_preds(&model, &subject, &theta, &eta)
+    let (jac_dual, f_dual, _) = super::eta_jacobian_and_preds(&model, &subject, &theta, None, &eta)
         .expect("analytic Jacobian in scope");
     let jac_fd = fd_jacobian(&model, &subject, &theta, &eta);
     // The closed forms below use the value path's `f`; the curvature gets the
@@ -423,11 +432,29 @@ fn conditional_precision_halves_match_their_closed_forms_under_proportional_erro
     let sigma2 = sigma[0] * sigma[0];
 
     let with = crate::stats::likelihood::conditional_eta_precision(
-        &model, &subject, &theta, &eta, &f_dual, &jac_dual, &omega, &sigma, true,
+        &model,
+        &subject,
+        &theta,
+        &eta,
+        &f_dual,
+        &[],
+        &jac_dual,
+        &omega,
+        &sigma,
+        true,
     )
     .unwrap();
     let without = crate::stats::likelihood::conditional_eta_precision(
-        &model, &subject, &theta, &eta, &f_dual, &jac_dual, &omega, &sigma, false,
+        &model,
+        &subject,
+        &theta,
+        &eta,
+        &f_dual,
+        &[],
+        &jac_dual,
+        &omega,
+        &sigma,
+        false,
     )
     .unwrap();
 
@@ -872,9 +899,19 @@ fn one_gn_step_is_capped_by_the_trust_region() {
     // Far on the other side of the prior from the stress fixture's mode
     // (η_CL ≈ 1.5), where the first Newton step is long.
     const START: [f64; 2] = [-1.0, 0.0];
-    let (jac, f) = super::eta_jacobian_and_preds(&model, &subject, &theta, &START).unwrap();
+    let (jac, f, _) =
+        super::eta_jacobian_and_preds(&model, &subject, &theta, None, &START).unwrap();
     let h0 = crate::stats::likelihood::conditional_eta_precision(
-        &model, &subject, &theta, &START, &f, &jac, &omega, &sigma, true,
+        &model,
+        &subject,
+        &theta,
+        &START,
+        &f,
+        &[],
+        &jac,
+        &omega,
+        &sigma,
+        true,
     )
     .unwrap();
     let g0 = analytic_eta_nll_gradient(&model, &subject, &theta, &START, &omega, &sigma).unwrap();
@@ -1647,15 +1684,13 @@ fn every_scope_condition_declines_on_its_own() {
     assert!(ode.ode_spec.is_some() && ode.tv_fn.is_none());
     assert!(imh_supported_model(&ode), "an ODE model must be in scope");
 
-    // The same ODE with a `[diffusion]` block — an SDE, whose EKF likelihood the
-    // dual ODE walk does not record — differs in that one block.
+    // The same ODE with a `[diffusion]` block — an SDE — is in scope too: the refresh
+    // reads the EKF variance rows off the subject's recording
+    // (`sde_imh_proposal_is_the_exact_objective_s`).
     let sde = parse_model_string(&format!("{ode_src}[diffusion]\n  central ~ 0.05 FIX\n"))
         .expect("SDE twin parses");
     assert!(sde.is_sde());
-    assert!(
-        !imh_supported_model(&sde),
-        "an SDE model must be out of scope"
-    );
+    assert!(imh_supported_model(&sde), "an SDE model must be in scope");
 
     // An ODE the recorder declines (no compiled RHS program to walk over duals),
     // differing from the in-scope ODE in that one field.
@@ -2148,7 +2183,7 @@ fn ode_eta_jacobian_matches_fd_across_a_second_dose() {
     let theta = model.default_params.theta.clone();
     let subject = mm_well_conditioned_subject();
     let eta = [0.2, -0.1];
-    let (jac, f) = super::eta_jacobian_and_preds(&model, &subject, &theta, &eta)
+    let (jac, f, _) = super::eta_jacobian_and_preds(&model, &subject, &theta, None, &eta)
         .expect("ODE η-Jacobian in scope");
     let jac_fd = fd_jacobian(&model, &subject, &theta, &eta);
     let f_val = predictions(&model, &subject, &theta, &eta);
@@ -2192,10 +2227,19 @@ fn ode_conditional_precision_matches_the_fd_hessian_at_zero_residual() {
     let mut subject = mm_subject(vec![0.0; MM_OBS_TIMES.len()]);
     subject.observations = predictions(&model, &subject, &theta, &eta_star);
 
-    let (jac, f) = super::eta_jacobian_and_preds(&model, &subject, &theta, &eta_star)
+    let (jac, f, _) = super::eta_jacobian_and_preds(&model, &subject, &theta, None, &eta_star)
         .expect("ODE η-Jacobian in scope");
     let h_tilde = crate::stats::likelihood::conditional_eta_precision(
-        &model, &subject, &theta, &eta_star, &f, &jac, &omega, &sigma, true,
+        &model,
+        &subject,
+        &theta,
+        &eta_star,
+        &f,
+        &[],
+        &jac,
+        &omega,
+        &sigma,
+        true,
     )
     .expect("curvature in scope");
 
@@ -2392,4 +2436,130 @@ fn an_ode_fit_runs_the_kernel_without_declines() {
         0,
         "the random walk ran under IMH"
     );
+}
+
+/// `IV_MODEL` as an SDE: the same one-compartment IV system as an ODE over amounts, with
+/// process noise on `central` large enough that the EKF variance is a live share of each
+/// row's `V` (`p_obs` 30–170 against a residual 90–400 on the fixture).
+const SDE_IV_MODEL: &str = "\
+[parameters]
+  theta TVCL(1.0, 0.01, 50.0)
+  theta TVV(20.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -CL / V * central
+[diffusion]
+  central ~ 20
+[error_model]
+  DV ~ proportional(PROP_ERR)
+";
+
+/// The SDE twin's subject: its own predictions at `η = (0.25, −0.15)` with the ±4 % ripple.
+fn sde_subject(model: &CompiledModel) -> Subject {
+    let theta = model.default_params.theta.clone();
+    let mut subject = iv_subject(vec![0.0; 6]);
+    let preds = predictions(model, &subject, &theta, &[0.25, -0.15]);
+    let ripple = [1.04, 0.97, 1.02, 0.96, 1.03, 0.98];
+    subject.observations = preds.iter().zip(ripple).map(|(p, r)| p * r).collect();
+    subject
+}
+
+/// IMH on an SDE subject: the refresh's gradient and curvature read the EKF variance rows off
+/// the subject's plan. The proposal's centre is the mode of the exact objective
+/// (`individual_nll`, which runs `ekf_p_obs`) to the search's own stop: the Newton step its
+/// central differences give there is shorter than `GN_CONVERGED_MAHA` in the precision's
+/// metric. Its precision is `conditional_eta_precision` over production's own `ekf_p_obs`
+/// (the plan's variance rows are the filter's, bit for bit) up to the curvature's staleness
+/// (`GN_RECURVE_MAHA`), and without the rows (the pre-fix refresh) it is a different matrix.
+/// Dies when the refresh's gradient or curvature drops the variance rows.
+#[test]
+fn sde_imh_proposal_is_the_exact_objective_s() {
+    let model = parse_model_string(SDE_IV_MODEL).expect("parse");
+    assert!(model.is_sde() && imh_supported_model(&model));
+    let subject = sde_subject(&model);
+    let theta = model.default_params.theta.clone();
+    let sigma = model.default_params.sigma.values.clone();
+    let omega = omega2(0.09, 0.09);
+    let counters = ImhCounters::default();
+    let prop = build(&model, &subject, &[0.0, 0.0], 30, 0.05, &counters);
+    let eta = prop.eta_hat.clone();
+    let nll = |e: &[f64]| individual_nll(&model, &subject, &theta, e, &omega, &sigma);
+    let mut g = DVector::zeros(2);
+    for a in 0..2 {
+        let h = 1e-5;
+        let (mut up, mut dn) = (eta.clone(), eta.clone());
+        up[a] += h;
+        dn[a] -= h;
+        g[a] = (nll(&up) - nll(&dn)) / (2.0 * h);
+        assert!(g[a].is_finite());
+    }
+    let p_obs = crate::stats::likelihood::ekf_p_obs(&model, &subject, &theta, &eta, &sigma);
+    let (jac, f, p_plan) =
+        super::eta_jacobian_and_preds(&model, &subject, &theta, Some(&sigma), &eta)
+            .expect("in scope");
+    let prec = |p: &[f64]| {
+        crate::stats::likelihood::conditional_eta_precision(
+            &model, &subject, &theta, &eta, &f, p, &jac, &omega, &sigma, true,
+        )
+        .expect("curvature in scope")
+    };
+    let (want, without) = (prec(&p_obs), prec(&[]));
+    let got = &prop.chol_l * prop.chol_l.transpose();
+    let rel = |a: &DMatrix<f64>, b: &DMatrix<f64>| (a - b).norm() / b.norm();
+    let worst_p = p_plan
+        .iter()
+        .zip(&p_obs)
+        .fold(0.0f64, |w, (a, b)| w.max((a - b).abs() / b.abs()));
+    let step = g
+        .dot(&want.clone().cholesky().expect("SPD").solve(&g))
+        .sqrt();
+    eprintln!(
+        "sde IMH: Newton step at the centre {step:.2e}, plan vs ekf_p_obs {worst_p:.2e}, \
+         precision vs production's {:.2e}, without the rows {:.2e}",
+        rel(&got, &want),
+        rel(&without, &want)
+    );
+    assert!(
+        p_obs.iter().all(|&p| p > 1.0),
+        "the variance rows are live: {p_obs:?}"
+    );
+    assert!(
+        step < super::GN_CONVERGED_MAHA,
+        "the centre is not the mode: {step:.2e}"
+    );
+    // Measured 0: the same filter on the same values.
+    assert!(
+        worst_p == 0.0,
+        "the plan's rows are not the filter's: {worst_p:.2e}"
+    );
+    // Measured 1.25e-2 (a curvature built within `GN_RECURVE_MAHA` of the centre) against
+    // 7.3e-1 without the variance rows.
+    assert!(rel(&got, &want) < 5e-2, "{:.2e}", rel(&got, &want));
+    assert!(
+        rel(&without, &want) > 0.3,
+        "the variance rows do not move H̃"
+    );
+}
+
+/// End to end on an SDE population: SAEM's IMH kernel runs (no refresh declines, no subject
+/// on the random walk) and accepts at an independence sampler's rate.
+#[test]
+fn imh_runs_an_sde_fit() {
+    let model = parse_model_string(SDE_IV_MODEL).expect("parse");
+    let pop = population_of(&sde_subject(&model), 6);
+    let r = run_saem(&model, &pop, &model.default_params, &imh_opts(7)).expect("SAEM runs");
+    let used = last_imh();
+    assert_eq!(used.proposals, 12 * 6 * 2, "{used:?}");
+    assert_eq!(used.declines, 0, "{used:?}");
+    let rate = used.accepts as f64 / used.proposals as f64;
+    eprintln!("sde IMH acceptance {rate:.3}");
+    assert!(rate > 0.5, "IMH acceptance {rate:.3}");
+    assert!(r.ofv.is_finite());
 }

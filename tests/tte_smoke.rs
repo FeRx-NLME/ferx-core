@@ -612,17 +612,13 @@ mod survival_smoke {
         );
     }
 
-    /// A hand-built `Repeated { clock = Reset }` model fits end-to-end through the
-    /// gap-time renewal likelihood (finite OFV). A `.ferx` file reaches this via
-    /// `clock = reset`; a Rust caller can also construct the endpoint directly. This is
-    /// the fit-boundary counterpart to the clock-forward `rtte_fit_completes_*` test and
-    /// exercises the `check_rtte_records` fall-through for reset endpoints. Tier-2:
-    /// capped at 3 outer iterations, no convergence.
+    /// A hand-built analytic hazard carries no compiled program, so its non-Gaussian curvature
+    /// has no exact channel and the subject is repelled by the `1e20` sentinel rather than
+    /// scored without it (the deliberate counterpart of the parsed `clock = reset` fit below).
     #[test]
-    fn rtte_clock_reset_hand_built_fits() {
+    fn rtte_hand_built_endpoint_without_a_program_is_repelled() {
         use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
         let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
-        // Swap the parsed Repeated{Forward} endpoint on CMT 2 for a Repeated{Reset} one.
         let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
         model.endpoints.insert(
             2,
@@ -638,6 +634,36 @@ mod survival_smoke {
                 hazard_program: None,
             },
         );
+        let result = fit(
+            &model,
+            &rtte_pop(),
+            &model.default_params,
+            &FitOptions::default(),
+        )
+        .expect("a repelled fit still returns");
+        assert!(
+            result.ofv >= 1e19,
+            "no program: every subject must sit on the repel sentinel, got {}",
+            result.ofv
+        );
+    }
+
+    /// A hand-built `Repeated { clock = Reset }` model fits end-to-end through the
+    /// gap-time renewal likelihood (finite OFV). A `.ferx` file reaches this via
+    /// `clock = reset`; a Rust caller can also construct the endpoint directly. This is
+    /// the fit-boundary counterpart to the clock-forward `rtte_fit_completes_*` test and
+    /// exercises the `check_rtte_records` fall-through for reset endpoints. Tier-2:
+    /// capped at 3 outer iterations, no convergence.
+    #[test]
+    fn rtte_clock_reset_hand_built_fits() {
+        // A `clock = reset` endpoint is parsed, so it carries the compiled hazard program the
+        // exact η-channel needs. A hand-built `param_fn` closure has none, and its non-Gaussian
+        // curvature cannot be recorded: such a subject is repelled (see
+        // `rtte_hand_built_endpoint_without_a_program_is_repelled`).
+        let model = parse_model_string(
+            &RTTE_EXP_FIT_MODEL.replace("type   = rtte", "type   = rtte\n  clock  = reset"),
+        )
+        .expect("clock = reset RTTE model must parse");
         let pop = rtte_pop();
         let opts = FitOptions::default();
         let result = fit(&model, &pop, &model.default_params, &opts)
@@ -929,23 +955,14 @@ mod survival_smoke {
     /// Tier-1 `rtte_reset_left_truncation_*` unit tests; this is the end-to-end boundary.)
     #[test]
     fn rtte_reset_left_truncation_fits() {
-        use ferx_core::types::{HazardFamily, HazardParamFn, HazardSpec, RtteClock, TteRecurrence};
-        let mut model = parse_model_string(RTTE_EXP_FIT_MODEL).expect("RTTE model must parse");
-        let param_fn: HazardParamFn = Box::new(|theta: &[f64], _eta, _cov| vec![theta[0]]);
-        model.endpoints.insert(
-            2,
-            EndpointLikelihood::Tte {
-                hazard: HazardSpec::Analytic {
-                    family: HazardFamily::Exponential,
-                    param_fn,
-                },
-                recurrence: TteRecurrence::Repeated {
-                    clock: RtteClock::Reset,
-                },
-                hazard_covariates: Vec::new(),
-                hazard_program: None,
-            },
-        );
+        // A `clock = reset` endpoint is parsed, so it carries the compiled hazard program the
+        // exact η-channel needs. A hand-built `param_fn` closure has none, and its non-Gaussian
+        // curvature cannot be recorded: such a subject is repelled (see
+        // `rtte_hand_built_endpoint_without_a_program_is_repelled`).
+        let model = parse_model_string(
+            &RTTE_EXP_FIT_MODEL.replace("type   = rtte", "type   = rtte\n  clock  = reset"),
+        )
+        .expect("clock = reset RTTE model must parse");
         let mut pop = rtte_pop();
         // Subject enters the risk set at t=4 (delayed entry, entry_time > 0) on both rows.
         pop.subjects[0].obs_records = vec![

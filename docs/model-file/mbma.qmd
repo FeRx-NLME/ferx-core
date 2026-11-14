@@ -83,9 +83,9 @@ a `[structural_model]` with no `pk` or `ode` line, whose `y = ...` equation read
 the dose as a data column. The dataset needs no `AMT` column, and dose records it
 carries anyway are not applied
 ([What a compartment-free model does not have](structural-model.qmd#what-a-compartment-free-model-does-not-have)).
-A kappa on such a model keeps the analytic gradient up to 48 random effects per
-subject, counting the stacked η and kappas over its occasions; past that, the fit
-uses finite differences ([Gradients](structural-model.qmd#gradients)).
+A kappa on such a model keeps the analytic gradient at any number of random effects per
+subject, counting the stacked η and kappas over its occasions
+([Gradients](structural-model.qmd#gradients)).
 
 In R, `ferx_mbma_data()` builds and checks such a dataset
 ([Counted form](parameters.qmd#counted-form-theta-namen)).

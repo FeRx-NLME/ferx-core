@@ -1346,6 +1346,7 @@ mod tests {
 
     fn make_test_model() -> CompiledModel {
         CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,

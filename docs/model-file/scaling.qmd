@@ -640,24 +640,24 @@ because the walk applies LTBS before the η/θ chain.
 
 **Numerical validation.** The per-CMT analytic gradient inherits the NONMEM
 validation of the user-ODE sensitivity engine (#410): the gradient machinery —
-the augmented `Dual2`/`Dual1` RK45 and the η/θ chain — is unchanged, and per-CMT
+the augmented RK45 recording and the η/θ chain — is unchanged, and per-CMT
 only selects, per observation, which CMT's compiled Form-C output program to
 evaluate. Each such program is the same readout already validated for the uniform
 `y = <expr>` case. The per-observation routing itself is verified by the
 `ode_provider_percmt_matches_production` test (analytic `f`, `∂f/∂η`, `∂f/∂θ` vs
 the production predictor + finite differences on a two-endpoint model) and the
-`ode_provider_percmt_light_matches_full` test (the `Dual1` inner η-gradient
-equals the `Dual2` outer to 1e-9). A dedicated NONMEM cross-check on a
+`ode_provider_percmt_light_matches_full` test (the inner η-gradient
+equals the outer one to 1e-9). A dedicated NONMEM cross-check on a
 multi-endpoint model is therefore not re-run here; it is covered transitively by
 #410's validation plus these routing tests.
 
 The **time-varying-covariate** analytic gradient (#439) inherits #410's NONMEM
 validation on the same basis: it switches the per-event PK parameters at each
-covariate breakpoint (the event-driven `Dual2`/`Dual1` walk) but the underlying
+covariate breakpoint (the event-driven walk) but the underlying
 integrator and η/θ chain are unchanged, exactly mirroring how production's
 `compute_predictions_with_tv` switches parameters over `f64`. The walk is verified
 against that production predictor + finite differences — first order by
 `ode_provider_tvcov_matches_production` and the second-order Hessian blocks
 (`d2f_deta2`, `d2f_deta_dtheta`) by central-differencing the validated first-order
-gradient — and the `Dual1` inner equals the `Dual2` outer
+gradient — and the inner equals the outer
 (`ode_provider_tvcov_light_matches_full`).

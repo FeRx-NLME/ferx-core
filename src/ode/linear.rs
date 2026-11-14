@@ -24,7 +24,7 @@
 //! ill-conditioned there. Padé never diagonalizes, so a repeated eigenvalue is a non-event.
 //!
 //! **One implementation for the value and the gradient.** Both functions are generic over
-//! [`PkNum`]: at `T = f64` they are the prediction, at `T = Dual1`/`Dual2` the exact `∂/∂(θ,η)`
+//! [`PkNum`]: at `T = f64` they are the prediction, at `T = Dual2`/`Dual2` the exact `∂/∂(θ,η)`
 //! and its second order, by the same `*_g<T: PkNum>` rule the closed forms follow. Every
 //! branch — the squaring count, LU pivoting, the self-checks below — reads [`PkNum::val`]
 //! only, so the dual run differentiates the very computation the `f64` run reports.
@@ -714,6 +714,24 @@ struct SpectralF64 {
     jinv: Vec<f64>,
 }
 
+/// The eigenvalues of `[[a, b], [c, d]]`, when real, in a fixed order (the larger first when the
+/// trace is positive, else the smaller): the larger-magnitude root from the stable sum
+/// `m ± √disc`, the other from the determinant over it, so neither cancels. `None` for a
+/// complex pair or a non-finite result.
+fn eigenvalues_2x2(a: f64, b: f64, c: f64, d: f64) -> Option<(f64, f64)> {
+    let m = 0.5 * (a + d);
+    let h = 0.5 * (a - d);
+    let disc = h * h + b * c;
+    if !(disc > 0.0) {
+        return None;
+    }
+    let s = disc.sqrt();
+    let q = if m >= 0.0 { m + s } else { m - s };
+    let det = a * d - b * c;
+    let r = if q != 0.0 { det / q } else { return None };
+    (q.is_finite() && r.is_finite()).then_some((q, r))
+}
+
 /// Whether two compartments that sit on no cycle of `A`'s coupling graph have (nearly) the same
 /// diagonal. Such a compartment is a 1×1 diagonal block of `A`'s block-triangular form, so its
 /// diagonal *is* an eigenvalue, exactly: a transit chain at one rate shows its repeated
@@ -840,40 +858,29 @@ fn spectral_f64(vals: &[f64], n: usize, present: u64) -> Option<SpectralF64> {
     if repeated_singleton_eigenvalue(vals, present, n) {
         return None;
     }
-    let ev = nalgebra::DMatrix::<f64>::from_row_slice(n, n, vals).complex_eigenvalues();
     let scale = vals.iter().fold(0.0_f64, |s, x| s.max(x.abs())).max(1e-300);
-    let mut lam_f: Vec<f64> = Vec::with_capacity(n);
-    for z in ev.iter() {
-        if !(z.re.is_finite() && z.im.is_finite()) || z.im.abs() > 1e-12 * scale {
-            return None;
-        }
-        lam_f.push(z.re);
-    }
-    lam_f.sort_by(|x, y| x.total_cmp(y));
-    let lmax = lam_f
-        .iter()
-        .fold(0.0_f64, |s, x| s.max(x.abs()))
-        .max(scale * 1e-12);
-    for w in lam_f.windows(2) {
-        if (w[1] - w[0]).abs() < SPECTRAL_MIN_REL_GAP * lmax {
-            return None;
-        }
-    }
     // Each eigenvalue belongs to one diagonal block of `A`'s block-triangular form: a strongly
-    // connected set of compartments. An acyclic compartment is a 1×1 block, its diagonal an
-    // eigenvalue exactly, which the eigensolver returns to within an ulp or so: snapping to
-    // the exact bits makes `A − λI` zero that compartment's row (measured: a depot decayed to
-    // 1e-6 of its dose otherwise read 5.5e-10 off, the other modes leaking `ε·‖x‖` into it).
-    // A cyclic block's eigenvalues are found by solving that block alone. The block fixes the
-    // projector's support — rows downstream of it, columns upstream — which the products then
-    // keep as exact zeros rather than rounding residue. (Entries a projector's support does
-    // include can still carry the modes' algebraic cancellation: a stiff chain's
-    // `∂²u₁/∂k₂²`, exactly 0, reads ~1e-12 through mode 0's `(A − λ₂I)/(λ₀ − λ₂)`.) `exact[k]`: the compartment eigenvalue `k` is the diagonal of.
+    // connected set of compartments, and `A`'s spectrum is the union of the blocks' — so the
+    // blocks are solved alone, never `A` whole. An acyclic compartment is a 1×1 block, its
+    // diagonal an eigenvalue exactly: using the exact bits makes `A − λI` zero that
+    // compartment's row (measured: a depot decayed to 1e-6 of its dose otherwise read 5.5e-10
+    // off, the other modes leaking `ε·‖x‖` into it). A 2×2 block has a closed form
+    // ([`eigenvalues_2x2`]); a larger one goes to the eigensolver, which sees a block and not
+    // the whole matrix. The block fixes the projector's support — rows downstream of it,
+    // columns upstream — which the products then keep as exact zeros rather than rounding
+    // residue. (Entries a projector's support does include can still carry the modes'
+    // algebraic cancellation: a stiff chain's `∂²u₁/∂k₂²`, exactly 0, reads ~1e-12 through
+    // mode 0's `(A − λ₂I)/(λ₀ − λ₂)`.) `exact[k]`: the compartment eigenvalue `k` is the
+    // diagonal of.
+    //
+    // The eigenvalues come in block order — the coupling graph's, fixed by the model — rather
+    // than by value: two that cross as the parameters move keep their indices, so every
+    // per-mode decision (`exact`, the masks) is the same at both points and a compiled plan's
+    // checks on them hold (#2786).
     let down = downstream(present, n);
-    let mut exact: [Option<usize>; 6] = [None; 6];
-    let mut block: [u8; 6] = [0; 6];
-    // Each eigenvalue's index into `lam_f`, in the order the blocks claim them.
-    let mut seq: Vec<usize> = Vec::with_capacity(n);
+    let mut lam_f: Vec<f64> = Vec::with_capacity(n);
+    let mut exact: Vec<Option<usize>> = Vec::with_capacity(n);
+    let mut block: Vec<u8> = Vec::with_capacity(n);
     let mut done = 0u8;
     for i in 0..n {
         if done & (1 << i) != 0 {
@@ -888,39 +895,56 @@ fn spectral_f64(vals: &[f64], n: usize, present: u64) -> Option<SpectralF64> {
         });
         done |= scc;
         let members: Vec<usize> = (0..n).filter(|&j| scc & (1 << j) != 0).collect();
-        let targets: Vec<f64> = if members.len() == 1 {
-            vec![vals[i * n + i]]
-        } else {
-            let sub = nalgebra::DMatrix::<f64>::from_fn(members.len(), members.len(), |r, c| {
-                vals[members[r] * n + members[c]]
-            });
-            sub.complex_eigenvalues().iter().map(|z| z.re).collect()
-        };
-        for d in targets {
-            let k = (0..n)
-                .filter(|&k| block[k] == 0)
-                .min_by(|&x, &y| (lam_f[x] - d).abs().total_cmp(&(lam_f[y] - d).abs()))?;
-            if !((lam_f[k] - d).abs() <= SPECTRAL_CHECK_RTOL * lmax) {
-                return None;
+        match members.len() {
+            1 => {
+                lam_f.push(vals[i * n + i]);
+                exact.push(Some(i));
+                block.push(scc);
             }
-            block[k] = scc;
-            seq.push(k);
-            if members.len() == 1 {
-                lam_f[k] = d;
-                exact[k] = Some(i);
+            2 => {
+                let (p, q) = (members[0], members[1]);
+                let (l0, l1) = eigenvalues_2x2(
+                    vals[p * n + p],
+                    vals[p * n + q],
+                    vals[q * n + p],
+                    vals[q * n + q],
+                )?;
+                for l in [l0, l1] {
+                    lam_f.push(l);
+                    exact.push(None);
+                    block.push(scc);
+                }
+            }
+            _ => {
+                let sub =
+                    nalgebra::DMatrix::<f64>::from_fn(members.len(), members.len(), |r, c| {
+                        vals[members[r] * n + members[c]]
+                    });
+                for z in sub.complex_eigenvalues().iter() {
+                    if !(z.re.is_finite() && z.im.is_finite()) || z.im.abs() > 1e-12 * scale {
+                        return None;
+                    }
+                    lam_f.push(z.re);
+                    exact.push(None);
+                    block.push(scc);
+                }
             }
         }
     }
-    // The eigenvalues in block order — the coupling graph's, fixed by the model — rather than
-    // by value: two that cross as the parameters move keep their indices, so every per-mode
-    // decision (`exact`, the masks) is the same at both points and a compiled plan's checks
-    // on them hold (#2786).
-    if seq.len() != n {
+    if lam_f.len() != n || !lam_f.iter().all(|l| l.is_finite()) {
         return None;
     }
-    let lam_f: Vec<f64> = seq.iter().map(|&k| lam_f[k]).collect();
-    let exact: [Option<usize>; 6] = std::array::from_fn(|j| seq.get(j).and_then(|&k| exact[k]));
-    let block: [u8; 6] = std::array::from_fn(|j| seq.get(j).map_or(0, |&k| block[k]));
+    let lmax = lam_f
+        .iter()
+        .fold(0.0_f64, |s, x| s.max(x.abs()))
+        .max(scale * 1e-12);
+    let mut sorted = lam_f.clone();
+    sorted.sort_by(|x, y| x.total_cmp(y));
+    for w in sorted.windows(2) {
+        if (w[1] - w[0]).abs() < SPECTRAL_MIN_REL_GAP * lmax {
+            return None;
+        }
+    }
     let masks: Vec<(u8, u8)> = (0..n)
         .map(|k| {
             let b = block[k];
@@ -1001,7 +1025,7 @@ fn spectral_f64(vals: &[f64], n: usize, present: u64) -> Option<SpectralF64> {
     }
     Some(SpectralF64 {
         lam: lam_f,
-        exact: exact[..n].to_vec(),
+        exact,
         masks,
         pf,
         v0: v0s,
@@ -1101,29 +1125,41 @@ const RECIP: [f64; 48] = {
     r
 };
 
+/// The order-`m` derivative of `g(z) = (e^z − 1)/z` alone (`m ≤ 4`): what a compiled plan's or a
+/// recording's `ExpRel(m)` reads — one accumulator, where [`exprel_derivs`] carries five — and
+/// the same bits as [`exprel_derivs`]`(z, 4)[m]`.
+pub(crate) fn exprel_k(z: f64, m: usize) -> f64 {
+    debug_assert!(m <= 4);
+    // Order 0's closed form `expm1(z)/z` cancels nowhere (`expm1` is accurate at small `z`):
+    // it is the whole function but its removable point `z = 0`, where the series' one term is
+    // the limit `1`.
+    if m == 0 && z != 0.0 {
+        return z.exp_m1() / z;
+    }
+    if z.abs() <= 2.0 {
+        // `exprel_derivs`'s series for one order: the same terms, in the same order, with the
+        // same stop (its `top = 4` bound), so the bits equal its entry `m`. Over a fixed range
+        // with `m ≤ 4` known, so the loop carries no bounds check.
+        let m = m.min(4);
+        let (mut p, mut o) = (1.0, 0.0);
+        for k in 0..43 {
+            o += p * RECIP[k + m + 1];
+            p *= z * RECIP[k + 1];
+            if p.abs() < 1e-19 {
+                break;
+            }
+        }
+        return o;
+    }
+    exprel_closed(z, z.exp(), m)
+}
+
 /// `g(z) = (e^z − 1)/z` and its derivatives up to `orders` (≤ 4), the rest left 0, so
 /// `φ(λ, Δ) = Δ·g(λΔ)` is lifted exactly through the jet orders a number type carries
 /// ([`PkNum::lift4`]). Near `z = 0` the closed forms cancel (`g⁗` loses ~7 digits at `z = 0.1`),
 /// so `|z| ≤ 2` sums `g⁽ᵐ⁾(z) = Σ_k (zᵏ/k!)/(k + m + 1)` in one pass over `k`; past it the
 /// closed forms lose at most ~2. Each order accumulates on its own, so `g` is the same bits
 /// whatever `orders` asks for: the `f64` run and a dual run read one value.
-/// [`exprel_derivs`] through every order, for the last point asked on this thread (each order
-/// accumulates on its own, so any `orders` reads the same bits): a recording's primitive asks
-/// for `g`, `g′`, `g″` at one point in a row.
-pub(crate) fn exprel_all(z: f64) -> [f64; 5] {
-    use std::cell::Cell;
-    thread_local! {
-        static LAST: Cell<(u64, [f64; 5])> = const { Cell::new((u64::MAX, [0.0; 5])) };
-    }
-    let (k, v) = LAST.get();
-    if k == z.to_bits() {
-        return v;
-    }
-    let v = exprel_derivs(z, 4);
-    LAST.set((z.to_bits(), v));
-    v
-}
-
 pub(crate) fn exprel_derivs(z: f64, orders: usize) -> [f64; 5] {
     let mut out = [0.0; 5];
     let top = orders.min(4);
@@ -1142,27 +1178,32 @@ pub(crate) fn exprel_derivs(z: f64, orders: usize) -> [f64; 5] {
                 break;
             }
         }
+        if z != 0.0 {
+            out[0] = z.exp_m1() / z;
+        }
         return out;
     }
-    let e = z.exp();
-    let (z2, z3, z4) = (z * z, z * z * z, z * z * z * z);
-    // Past `z ≈ −745` the exponential is 0 and the polynomials it multiplies may overflow
-    // (`0·inf = NaN`): drop the term, leaving each closed form's constant over `zᵐ⁺¹`.
-    let e_term = |poly: f64| if e == 0.0 { 0.0 } else { e * poly };
     out[0] = z.exp_m1() / z;
-    if top >= 1 {
-        out[1] = (e_term(z - 1.0) + 1.0) / z2;
-    }
-    if top >= 2 {
-        out[2] = (e_term(z2 - 2.0 * z + 2.0) - 2.0) / z3;
-    }
-    if top >= 3 {
-        out[3] = (e_term(z3 - 3.0 * z2 + 6.0 * z - 6.0) + 6.0) / z4;
-    }
-    if top >= 4 {
-        out[4] = (e_term(z4 - 4.0 * z3 + 12.0 * z2 - 24.0 * z + 24.0) - 24.0) / (z4 * z);
+    let e = if top > 0 { z.exp() } else { 0.0 };
+    for (m, o) in out.iter_mut().enumerate().take(top + 1).skip(1) {
+        *o = exprel_closed(z, e, m);
     }
     out
+}
+
+/// `exprel`'s order-`m` closed form at `|z| > 2` (`1 ≤ m ≤ 4`; order 0 is `expm1(z)/z`, which
+/// needs no `e`), `e = eᶻ`. Past `z ≈ −745` the exponential is 0 and the polynomials it
+/// multiplies may overflow (`0·inf = NaN`): the term is dropped, leaving each closed form's
+/// constant over `zᵐ⁺¹`.
+fn exprel_closed(z: f64, e: f64, m: usize) -> f64 {
+    let (z2, z3, z4) = (z * z, z * z * z, z * z * z * z);
+    let e_term = |poly: f64| if e == 0.0 { 0.0 } else { e * poly };
+    match m {
+        1 => (e_term(z - 1.0) + 1.0) / z2,
+        2 => (e_term(z2 - 2.0 * z + 2.0) - 2.0) / z3,
+        3 => (e_term(z3 - 3.0 * z2 + 6.0 * z - 6.0) + 6.0) / z4,
+        _ => (e_term(z4 - 4.0 * z3 + 12.0 * z2 - 24.0 * z + 24.0) - 24.0) / (z4 * z),
+    }
 }
 
 /// [`linear_segment_g`] on a reused workspace: every buffer a segment needs, so a fit's

@@ -458,6 +458,7 @@ pub(crate) fn natural_centre(
 /// gradient in the packed coordinates (`log_abs_jacobian_natural_grad`), chained through a
 /// logit θ's `y → x` map.
 fn natural_log_jac_gradient(
+    model: &CompiledModel,
     y_hat: &[f64],
     free_idx: &[usize],
     logit_coords: &[LogitThetaCoord],
@@ -466,8 +467,9 @@ fn natural_log_jac_gradient(
 ) -> DVector<f64> {
     let mut x = y_hat.to_vec();
     from_draw_scale(&mut x, logit_coords);
-    let mut g =
-        crate::estimation::uncertainty_samples::log_abs_jacobian_natural_grad(&x, params, fixed);
+    let mut g = crate::estimation::uncertainty_samples::log_abs_jacobian_natural_grad(
+        model, &x, params, fixed,
+    );
     for c in logit_coords {
         g[c.index] *= c.dx_dy(x[c.index]);
     }
@@ -1283,7 +1285,8 @@ fn run_sir_in_box(
     // centre is `ŷ` itself and nothing below differs from before #1723.
     let natural = options.sir_scale == SirScale::Natural;
     let centre = if natural {
-        let grad = natural_log_jac_gradient(&y_hat, &free_idx, &logit_coords, params, &fixed_mask);
+        let grad =
+            natural_log_jac_gradient(model, &y_hat, &free_idx, &logit_coords, params, &fixed_mask);
         let cov_free = &proposal_chol * proposal_chol.transpose();
         natural_centre(&y_hat, &cov_free, &grad, &free_idx, &draw_bounds)
     } else {

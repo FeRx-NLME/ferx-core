@@ -719,13 +719,8 @@ pub(crate) fn tte_nll_from_curves_g<T: PkNum>(
 /// band `abstol + reltol·|H|` (see [`MonoTol`], #633). Shared by
 /// [`tte_nll_from_curves`] and [`rtte_forward_nll_from_curves`] so the floor lives in
 /// one place (see #618 re: decoupling it from a fixed `|H|` term).
-#[inline]
-fn cumhaz_monotone_violation(hi: f64, lo: f64, tol: MonoTol) -> bool {
-    hi - lo < -crate::ode::scale_tol(tol.abstol, tol.reltol, hi, lo)
-}
-
-/// [`cumhaz_monotone_violation`] on any number type's values, through the branch API (a
-/// recording type, #2786, records the decision): the same arithmetic.
+/// On any number type's values, through the branch API (a recording type, #2786, records
+/// the decision).
 fn cumhaz_monotone_violation_g<T: PkNum>(hi: T, lo: T, tol: MonoTol) -> bool {
     use crate::sens::num::BranchCmp::{Ge, Lt};
     let (a, b) = (hi.abs(), lo.abs());
@@ -1135,7 +1130,8 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
 
 /// 4-point central-stencil finite-difference Hessian of `eval` at `eta_hat`, `eps[j]` the
 /// step of axis `j`: the reference the parity tests extrapolate against the plans' exact
-/// Hessians (#2786).
+/// Hessians (#2786), and the safety net for a subject whose term no plan records
+/// (`stats::likelihood`'s non-Gaussian curvature).
 ///
 /// The (j,k) entry is:
 ///   (f(η+sj·ej+sk·ek) − f(η+sj·ej−sk·ek) − f(η−sj·ej+sk·ek) + f(η−sj·ej−sk·ek))
@@ -1143,7 +1139,6 @@ pub(crate) fn rtte_reset_nll_from_curves_g<T: PkNum>(
 ///                              4 · sj · sk
 ///
 /// For j==k this reduces to the standard central-difference second derivative with step 2·sj.
-#[cfg(test)]
 pub(crate) fn data_term_hessian_fd(
     eval: impl Fn(&[f64]) -> f64,
     eta_hat: &[f64],
@@ -4524,5 +4519,183 @@ mod ode_hazard_exact_tests {
         eprintln!("TIME-reading ODE hazard: value {worst_v:.2e}, gradients {worst_g:.2e}");
         assert!(worst_v < 1e-8, "value {worst_v:.2e}");
         assert!(worst_g < 1e-6, "gradient {worst_g:.2e}");
+    }
+
+    /// #1575's fixture (`tests/one_snapshot_dose_reads_survival.rs`) on the exact route: a
+    /// `TIME`-reading `$PK` whose `TIME = 0` disposition snapshot differs from every dose
+    /// record (`MTT = −9`, `ALAG1 = 10.5` there, `1` and `0.5` at the records), a transit
+    /// kernel and a compartment lag read per dose, a `TAD`-reading hazard, doses at 1 and 13
+    /// (the second on residual drug), η on `CL`, the lag and the kernel, and a `CL` the
+    /// disposition reads at `TIME = 0` (1.5×) but no dose record does; and a steady-state
+    /// twin (`SS=1`, the plain drug-driven hazard). Both take the event-driven dual walk with
+    /// every segment on the disposition (`ode_states_at_g`), which the static walk declined.
+    ///
+    /// Value: the walk's `(H, h)` against production's dense single-pass solve
+    /// (`ode_cumhaz_hazard`, a different engine) — dies if a dose quantity is read at the
+    /// disposition (the kernel then delivers nothing, the lag moves every arrival), if a
+    /// segment is integrated on a dose record's snapshot instead of the disposition (its `CL`),
+    /// or if the `TAD` anchor drops the lag. Gradients: the exact η-gradient and θ-score
+    /// against Richardson differences of the production objective.
+    #[test]
+    fn a_time_reading_pk_with_an_ode_hazard_is_exact() {
+        const MODEL: &str = r"
+[parameters]
+  theta TVCL(1.0, FIX)
+  theta TVV(10.0, FIX)
+  theta TVKA(1.0, FIX)
+  theta TVMTT(1.0, FIX)
+  theta TVN(3.0, FIX)
+  theta TVLAG(0.5, FIX)
+  theta TVH0(0.02, FIX)
+  theta TVBETA(0.1, FIX)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.09
+  omega ETA_MTT ~ 0.09
+  sigma PROP_ERR ~ 0.01
+[individual_parameters]
+  CL    = TVCL * exp(ETA_CL) * (if (TIME < 0.5) 1.5 else 1.0)
+  V     = TVV
+  KA    = TVKA
+  MTT   = TVMTT * exp(ETA_MTT) - 10.0 * (if (TIME < 0.5) 1.0 else 0.0)
+  NTR   = TVN
+  ALAG1 = TVLAG * exp(ETA_LAG) + 10.0 * (if (TIME < 0.5) 1.0 else 0.0)
+  H0    = TVH0
+  BETA  = TVBETA
+[structural_model]
+  ode(obs_cmt=central, states=[depot, central])
+[odes]
+  d/dt(depot)   = transit(n=NTR, mtt=MTT) - KA * depot
+  d/dt(central) = KA * depot - (CL/V) * central
+[scaling]
+  obs_scale = V
+[event_model]
+  cmt    = 3
+  hazard = H0 * exp(BETA * (central / V)) + 0.002 * TAD
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  ode_reltol = 1e-11
+  ode_abstol = 1e-13
+";
+        use std::io::Write;
+        // The steady-state twin: #1575's lag and transit kernel are rejected under `SS=1`
+        // (`E_ABSORPTION_SS_LAG`), so it is the plain drug-driven hazard.
+        let ss_model = MODEL
+            .replace("  omega ETA_LAG ~ 0.09\n  omega ETA_MTT ~ 0.09\n", "")
+            .replace("transit(n=NTR, mtt=MTT) - KA * depot", "-KA * depot")
+            .replace(
+                "  MTT   = TVMTT * exp(ETA_MTT) - 10.0 * (if (TIME < 0.5) 1.0 else 0.0)\n",
+                "",
+            )
+            .replace(
+                "  ALAG1 = TVLAG * exp(ETA_LAG) + 10.0 * (if (TIME < 0.5) 1.0 else 0.0)\n",
+                "",
+            )
+            .replace(" + 0.002 * TAD", "")
+            .replace(" * (if (TIME < 0.5) 1.5 else 1.0)", "");
+        let (mut worst_v, mut worst_g) = (0.0f64, 0.0f64);
+        for (src, ss) in [(MODEL, "0,0"), (ss_model.as_str(), "1,12")] {
+            let model = crate::parser::model_parser::parse_model_string(src).unwrap();
+            let (cmt, chz) = model
+                .endpoints
+                .iter()
+                .find_map(|(c, ep)| match ep {
+                    EndpointLikelihood::Tte {
+                        hazard: HazardSpec::OdeAccumulated { chz_state },
+                        ..
+                    } => Some((*c, *chz_state)),
+                    _ => None,
+                })
+                .unwrap();
+            let theta = model.default_params.theta.clone();
+            let eta = [0.1, -0.2, 0.15][..model.n_eta].to_vec();
+            let rich = |f: &dyn Fn(f64) -> f64, x: f64| {
+                let d = |h: f64| (f(x + h) - f(x - h)) / (2.0 * h);
+                let h = 1e-3 * x.abs().max(1e-1);
+                (4.0 * d(h / 2.0) - d(h)) / 3.0
+            };
+            let nll = |s: &Subject, th: &[f64], e: &[f64]| {
+                let mut acc = 0.0;
+                crate::stats::likelihood::accumulate_non_gaussian_nll(
+                    &model, s, th, e, None, 1.0, &mut acc,
+                );
+                acc
+            };
+            {
+                let data = format!(
+                    "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,SS,II\n\
+                 1,1,.,1,100,1,0,1,{ss}\n\
+                 1,8,5,0,.,2,0,0,0,0\n\
+                 1,13,.,1,100,1,0,1,0,0\n\
+                 1,20,1,0,0,3,0,0,0,0\n"
+                );
+                let mut f = tempfile::NamedTempFile::new().unwrap();
+                f.write_all(data.as_bytes()).unwrap();
+                let (pop, _) = crate::api::read_population_for(
+                    &model,
+                    &None,
+                    f.path().to_str().unwrap(),
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .unwrap();
+                let s = &pop.subjects[0];
+                assert!(tte_record_served(&model, s, cmt), "SS={ss}: served exactly");
+                let times = [20.0];
+                let walk = crate::sens::ode_provider::adjoint::ode_states_at_g::<f64>(
+                    &model, s, &theta, &eta, &times,
+                )
+                .expect("the event walk serves it");
+                let (cum, haz) = crate::sens::ode_provider::adjoint::cumhaz_hazard_from_states(
+                    &model, s, chz, &times, &walk,
+                )
+                .unwrap();
+                let (cum_d, haz_d) = ode_cumhaz_hazard(&model, s, chz, &theta, &eta, &times);
+                assert!(cum[0].is_finite() && haz[0].is_finite() && cum_d[0].is_finite());
+                worst_v = worst_v
+                    .max((cum[0] - cum_d[0]).abs() / cum_d[0].abs())
+                    .max((haz[0] - haz_d[0]).abs() / haz_d[0].abs());
+                let (_, g) = tte_subject_eta_grad(&model, s, &theta, &eta).expect("exact");
+                for k in 0..eta.len() {
+                    let fd = rich(
+                        &|x| {
+                            let mut e = eta.clone();
+                            e[k] = x;
+                            nll(s, &theta, &e)
+                        },
+                        eta[k],
+                    );
+                    assert!(fd.is_finite() && g[k].is_finite());
+                    // Every η is live: the lag and the kernel move the hazard at 20.
+                    assert!(fd.abs() > 1e-4, "SS={ss}: η[{k}] is not live ({fd:.2e})");
+                    worst_g = worst_g.max((g[k] - fd).abs() / (1.0 + fd.abs()));
+                }
+                let (_, gt) = crate::sens::ode_provider::adjoint::non_gaussian_theta_score(
+                    &model, s, &theta, &eta,
+                )
+                .expect("exact");
+                for i in 0..theta.len() {
+                    let fd = rich(
+                        &|x| {
+                            let mut th = theta.clone();
+                            th[i] = x;
+                            nll(s, &th, &eta)
+                        },
+                        theta[i],
+                    );
+                    assert!(fd.is_finite() && gt[i].is_finite());
+                    worst_g = worst_g.max((gt[i] - fd).abs() / (1.0 + fd.abs()));
+                }
+            }
+        }
+        eprintln!(
+            "TIME-reading $PK ODE hazard: value vs dense {worst_v:.2e}, gradients {worst_g:.2e}"
+        );
+        // Measured on Linux: value 2.0e-15 against the dense engine (the same arithmetic on
+        // another walk), gradients 2.2e-10 (Richardson's own error at these tolerances).
+        assert!(worst_v < 1e-12, "value {worst_v:.2e}");
+        assert!(worst_g < 5e-9, "gradient {worst_g:.2e}");
     }
 }

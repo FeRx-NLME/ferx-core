@@ -209,37 +209,28 @@ fn a_steady_state_dose_with_no_interval_does_not_warn() {
 /// **A dose that never reaches the run-in must not be reported**, because the message names
 /// what the run-in does and would be false about it.
 ///
-/// `equilibrate_ss_pk_state` returns before integrating anything in two cases, and in both
-/// the ordinary finite `TAFD` anchor stays in place: an infusion whose `T_inf` exceeds its own
-/// `II` (the record is served as a single non-SS infusion), and a dose whose compartment index
-/// is outside the state vector (#899).
+/// `equilibrate_ss_pk_state` returns before integrating anything for a dose whose compartment
+/// index is outside the state vector (#899); the ordinary finite `TAFD` anchor stays in place.
 ///
-/// The fixtures here carry no `F`, so `T_inf` is the record's own `AMT/RATE`. That is *not*
-/// the general condition — the run-in compares the bioavailable length, which
-/// [`the_run_in_bail_out_follows_bioavailability`] pins separately.
+/// An infusion whose `T_inf` exceeds its own `II` used to be the second such case (served as a
+/// single non-SS infusion). Since #2786 an overlapping train equilibrates like any other SS
+/// infusion (⌊T_inf/II⌋ always-running pulses plus one ordinary train), so its run-in reads the
+/// clock and it MUST warn — that row is now the straddle's other half.
 ///
-/// Measured end-to-end at the time this was written: the same `0.003*TAFD` model with
-/// `AMT = 100, RATE = 5, II = 12` (so `T_inf = 20 > II`) fits to **OFV 367.2851** — finite —
-/// while the bolus form of the same record returns `NaN`. Without the filter the warning fired
-/// on the finite one saying "it reads NaN and the objective is non-finite".
-///
-/// Both rows are straddles: the same dose with `RATE = 20` (`T_inf = 5 ≤ II`) and the same
-/// dose on the model's one real compartment **do** warn, so neither row can pass against a
-/// gate that has simply stopped firing on infusions or on this fixture.
+/// Both rows are straddles: the same dose on the model's one real compartment does warn, so the
+/// out-of-state row cannot pass against a gate that has simply stopped firing on this fixture.
 #[test]
 fn a_dose_that_never_reaches_the_run_in_is_not_reported() {
     let m = ode_model(" + 0.003*TAFD");
 
-    assert_eq!(
-        warning_for(&m, &population_with(5.0, 1)),
-        None,
-        "T_inf = 20 > II = 12: the record is served as a single non-SS infusion, so no run-in \
-         runs and nothing about it is NaN"
+    assert!(
+        warning_for(&m, &population_with(5.0, 1)).is_some(),
+        "T_inf = 20 > II = 12: an overlapping SS infusion equilibrates through the run-in (#2786), \
+         so it reads the clock and must warn"
     );
     assert!(
         warning_for(&m, &population_with(20.0, 1)).is_some(),
-        "T_inf = 5 <= II = 12 equilibrates normally and must still warn — otherwise the row \
-         above is a statement about infusions, not about the bail-out"
+        "T_inf = 5 <= II = 12 equilibrates normally and must warn"
     );
 
     // `ode_model` declares a single state, so `CMT = 2` is outside the state vector.
@@ -437,81 +428,23 @@ fn ode_model_with_d1(term: &str, f: &str, d1: &str) -> crate::types::CompiledMod
     .expect("parse")
 }
 
-/// **Which infusions reach the run-in is decided on the bioavailable length, not on the
-/// record's own `AMT/RATE`** — and both steady-state warnings have to ask it the same way.
-///
-/// `equilibrate_ss_pk_state` bails on `is_real_infusion(dose) && t_inf > dose.ii`, with `t_inf`
-/// from [`crate::types::DoseEvent::bioavailable_infusion`]. That is mode-aware (#419): on a
-/// **rate-defined** infusion the data fixes the rate, so `F` scales the *length*; on a
-/// **duration-defined** one (`RATE = -2` → `D{n}`) it scales the rate and the length is
-/// untouched. Comparing the unscaled duration instead made the two warnings below false in
-/// opposite directions (#1139 / #1281), so they now share one predicate.
-///
-/// Measured by reading what the same model predicts, not by reading the gate:
-///
-/// | dose | bioavailable `T_inf` vs `II = 12` | predictions | `…INFUSION` | `…ABSOLUTE_TIME` |
-/// |---|---|---|---|---|
-/// | `RATE = 5`, `F1 = 1.0` | `20 > 12`, run-in skipped | `9.514379031181768`, `22.093161802029634` | fires | silent |
-/// | `RATE = 5`, `F1 = 0.5` | `10 ≤ 12`, run-in **runs** | `NaN`, `NaN` | silent | fires |
-/// | `RATE = -2`, `D1 = 20`, `F1 = 0.5` | `20 > 12`, run-in skipped | finite | fires | silent |
-///
-/// Every row is load-bearing. Row 1 is the straddle for row 2 — same record, same `RATE`, same
-/// compartment — so a gate that had merely stopped firing on infusions fails it. Row 3 is the
-/// arm a hand-written `F * duration` breaks: it would read `0.5 · 20 = 10 ≤ 12` and flip both
-/// verdicts, which is why the predicate has to go through `bioavailable_infusion` rather than
-/// multiply. `tests/modeled_duration.rs` covers `RATE = -2` at `F = 1`, where a wrong scaling
-/// is invisible.
+/// **Every `SS=1` infusion reaches the run-in, overlapping pulses (`T_inf > II`) included**,
+/// so the absolute-clock warning counts it. The run-in used to bail on
+/// `bioavailable_infusion(F).1 > II`, serving the record as a single non-SS infusion under a
+/// `W_STEADY_STATE_INFUSION` warning, and this gate had to follow that bail through `F` (#1281):
+/// on a 20-hour infusion into `II = 12` the `TAFD`-reading predictions were finite at `F1 = 1`
+/// (`9.514379031181768`, `22.093161802029634`) and `NaN` at `F1 = 0.5`. Now the overlap is
+/// equilibrated like any other steady state (`dosing::ss_overlap_split_g`), so both are `NaN` —
+/// the run-in's cycle-local clock has no first dose — and the warning fires on both, on a
+/// rate-defined window and on a duration-defined (`RATE = -2`) one alike.
 ///
 /// Tier 1 in cost — two observations on one subject — but it does call
 /// [`crate::api::predict`], because the property under test is *agreement with the
-/// integrator*, and a check-pass-only assertion would pin the gates against themselves.
+/// integrator*, and a check-pass-only assertion would pin the gate against itself.
 #[test]
-fn the_run_in_bail_out_follows_bioavailability() {
-    const INF: &str = "W_STEADY_STATE_INFUSION";
+fn an_overlapping_steady_state_infusion_reaches_the_run_in() {
     // `AMT = 100, RATE = 5` is a 20-hour infusion into an `II = 12` interval.
     let pop = population_with(5.0, 1);
-
-    let full = ode_model_with_f(" + 0.003*TAFD", "1.0");
-    let preds = crate::api::predict(&full, &pop, &full.default_params.clone()).unwrap();
-    assert!(
-        preds.iter().all(|p| p.pred.is_finite()),
-        "F = 1 leaves T_inf = 20 > II = 12, so the run-in is skipped and TAFD keeps its \
-         ordinary anchor: {:?}",
-        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        warning_for(&full, &pop),
-        None,
-        "nothing about that fit is NaN, so the message would be false"
-    );
-    assert!(
-        raised(&full, &pop, INF),
-        "the record really is served as a single non-SS infusion here, which is what \
-         {INF} says"
-    );
-
-    let half = ode_model_with_f(" + 0.003*TAFD", "0.5");
-    let preds = crate::api::predict(&half, &pop, &half.default_params.clone()).unwrap();
-    assert!(
-        preds.iter().all(|p| p.pred.is_nan()),
-        "F = 0.5 makes T_inf = 10 <= II = 12, so the run-in does run and TAFD has no \
-         referent in it: {:?}",
-        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
-    );
-    assert!(
-        warning_for(&half, &pop).is_some(),
-        "the same record with a bioavailability that shortens it below II must warn — \
-         comparing the unscaled duration silently drops exactly this case"
-    );
-    assert!(
-        !raised(&half, &pop, INF),
-        "and {INF} must stop claiming this record is served as a single non-SS infusion, \
-         because the NaN predictions above can only come from the run-in it says did not \
-         happen (#1281)"
-    );
-
-    // `RATE = -2`: `D1 = 20 > II = 12` regardless of `F`, because `F` reshapes the rate here.
-    let modeled = ode_model_with_d1(" + 0.003*TAFD", "0.5", "20.0");
     let mut pop_d1 = population(1, true, 12.0);
     pop_d1.subjects[0].doses = vec![DoseEvent::modeled(
         480.0,
@@ -521,23 +454,27 @@ fn the_run_in_bail_out_follows_bioavailability() {
         12.0,
         RateMode::ModeledDuration,
     )];
-    let preds = crate::api::predict(&modeled, &pop_d1, &modeled.default_params.clone()).unwrap();
-    assert!(
-        preds.iter().all(|p| p.pred.is_finite()),
-        "a duration-defined infusion keeps its 20-hour length under F = 0.5, so the run-in \
-         is skipped exactly as at F = 1: {:?}",
-        preds.iter().map(|p| p.pred).collect::<Vec<_>>()
-    );
-    assert!(
-        raised(&modeled, &pop_d1, INF),
-        "{INF} must still fire on it"
-    );
-    assert_eq!(
-        warning_for(&modeled, &pop_d1),
-        None,
-        "and the absolute-clock gate must stay silent — an `F * duration` shortcut would \
-         read 10 <= 12 here and flip both"
-    );
+    for (label, model, pop) in [
+        ("F1 = 1", ode_model_with_f(" + 0.003*TAFD", "1.0"), &pop),
+        ("F1 = 0.5", ode_model_with_f(" + 0.003*TAFD", "0.5"), &pop),
+        (
+            "RATE = -2, D1 = 20",
+            ode_model_with_d1(" + 0.003*TAFD", "0.5", "20.0"),
+            &pop_d1,
+        ),
+    ] {
+        let preds = crate::api::predict(&model, pop, &model.default_params.clone()).unwrap();
+        assert!(
+            preds.iter().all(|p| p.pred.is_nan()),
+            "{label}: the run-in runs, and TAFD has no referent in it: {:?}",
+            preds.iter().map(|p| p.pred).collect::<Vec<_>>()
+        );
+        assert!(warning_for(&model, pop).is_some(), "{label}: must warn");
+        assert!(
+            !raised(&model, pop, "W_STEADY_STATE_INFUSION"),
+            "{label}: the overlap warning is retired"
+        );
+    }
 }
 
 #[cfg(feature = "survival")]

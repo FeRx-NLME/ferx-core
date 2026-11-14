@@ -501,15 +501,17 @@ fn tte_endpoint_nll_visit(
             crate::survival::analytic_tte_nll_visit_g(records, *family, recurrence, &params, visit)
         }
         HazardSpec::OdeAccumulated { chz_state } => {
-            let walk = crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(model, subject);
-            if walk {
-                if let Some(nll) = crate::survival::ode_tte_nll_visit_g::<f64>(
+            // A subject in the walk's scope is scored off the walk, whose exact derivatives
+            // the gradient takes. It declines only a non-finite trajectory (#2786: pre-start
+            // times and the pre-dose `TAD` anchor are served), which any other engine would
+            // integrate to the same divergence: repelled.
+            if crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(model, subject) {
+                return crate::survival::ode_tte_nll_visit_g::<f64>(
                     model, subject, *chz_state, records, theta, eta, visit,
-                ) {
-                    return nll;
-                }
+                )
+                .unwrap_or(SUBJECT_SENTINEL_NLL);
             }
-            match joint_share.filter(|_| !walk) {
+            match joint_share {
                 Some(s) => {
                     let ode = model.ode_spec.as_ref().expect("joint share ⟹ ode_spec");
                     let (cum, haz, tol) = shared_tte_curves(ode, s, *chz_state);
@@ -1658,11 +1660,8 @@ pub(crate) fn ekf_p_obs(
     );
     let error_model = model.error_model;
 
-    // Temporarily shadow ode_spec with updated diffusion_var for this call.
-    // We cannot mutate model.ode_spec, so we pass diffusion_var separately
-    // via a local OdeSpec-like struct. Since solve_ekf takes rhs + n_states
-    // + obs_cmt_idx + diffusion_var as separate args, we call it directly.
-    // TODO: unify EKF ipred with likelihood ipred to avoid double ODE evaluation
+    // `diffusion_var` is passed beside the spec (it moves with θ; the spec cannot). One filter
+    // solve: its Kalman `R` reads the filter's own mean, so no second ODE pass is made for it.
     let (_, p_obs) = crate::ode::ode_predictions_ekf_with_diffusion(
         ode,
         &pk.values,
@@ -1745,6 +1744,35 @@ pub(crate) fn foce_subject_nll_cov(
     residual_cov: ResidualCov<'_>,
     interaction: bool,
 ) -> f64 {
+    foce_subject_nll_cov_at(
+        model,
+        subject,
+        theta,
+        eta_hat,
+        h_matrix,
+        omega,
+        sigma_values,
+        residual_cov,
+        interaction,
+        None,
+    )
+}
+
+/// [`foce_subject_nll_cov`] given the predictions at `eta_hat` when the caller holds them
+/// (the inner objective's last evaluation at the mode), so the point is not predicted again.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn foce_subject_nll_cov_at(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta_hat: &DVector<f64>,
+    h_matrix: &DMatrix<f64>,
+    omega: &OmegaMatrix,
+    sigma_values: &[f64],
+    residual_cov: ResidualCov<'_>,
+    interaction: bool,
+    ipreds: Option<&[f64]>,
+) -> f64 {
     foce_subject_nll_cov_split(
         model,
         subject,
@@ -1755,6 +1783,7 @@ pub(crate) fn foce_subject_nll_cov(
         sigma_values,
         residual_cov,
         interaction,
+        ipreds,
         None,
     )
 }
@@ -1817,6 +1846,7 @@ pub(crate) fn foce_subject_contribution_parts(
         sigma_values,
         residual_cov,
         interaction,
+        None,
         Some(&mut parts),
     );
     parts
@@ -1917,14 +1947,41 @@ fn non_gaussian_mode_terms(
         tte_nll_at_mode += mode;
     }
     // The curvature, exact: the whole term's η-Hessian from its plan (#2786). A subject a
-    // part already repels by its value takes none; one whose term cannot be recorded is
-    // repelled, not scored without it.
+    // part already repels by its value takes none. One whose term cannot be recorded (never
+    // expected) takes the central-difference Hessian of the same NLL — the safety net — and is
+    // repelled only when that is not finite either.
     if n_eta > 0 && tte_nll_at_mode < crate::survival::REPEL_SENTINEL_FLOOR {
         match crate::survival::non_gaussian_eta_jets2(model, subject, theta, eta_hat.as_slice()) {
             Some((_, _, h)) => tte_h += h,
             None => {
-                note(parts, "non-Gaussian curvature not recorded", f64::NAN);
-                tte_nll_at_mode += SUBJECT_SENTINEL_NLL;
+                // A stencil point the term repels (or cannot score) has no curvature to
+                // difference — at a mode on a feasibility boundary both sides are repelled —
+                // so the curvature is unmeasurable and the subject is repelled.
+                let poisoned = std::cell::Cell::new(false);
+                let nll = |e: &[f64]| {
+                    let mut acc = 0.0;
+                    accumulate_non_gaussian_nll(
+                        model,
+                        subject,
+                        theta,
+                        e,
+                        joint_share,
+                        1.0,
+                        &mut acc,
+                    );
+                    if !acc.is_finite() || acc >= crate::survival::REPEL_SENTINEL_FLOOR {
+                        poisoned.set(true);
+                    }
+                    acc
+                };
+                let eps: Vec<f64> = eta_hat.iter().map(|x| 1e-4 * x.abs().max(1.0)).collect();
+                let h = crate::survival::data_term_hessian_fd(nll, eta_hat.as_slice(), &eps);
+                if !poisoned.get() && h.iter().all(|v| v.is_finite()) {
+                    tte_h += h;
+                } else {
+                    note(parts, "non-Gaussian curvature unmeasurable", f64::NAN);
+                    tte_nll_at_mode += SUBJECT_SENTINEL_NLL;
+                }
             }
         }
     }
@@ -1943,6 +2000,7 @@ fn foce_subject_nll_cov_split(
     sigma_values: &[f64],
     residual_cov: ResidualCov<'_>,
     interaction: bool,
+    held_preds: Option<&[f64]>,
     #[cfg_attr(not(feature = "survival"), allow(unused_mut))] mut parts: PartSink<'_>,
 ) -> f64 {
     // Individual predictions at eta_hat (per-event PK when subject has TV covariates).
@@ -1951,13 +2009,17 @@ fn foce_subject_nll_cov_split(
     // (the FD-Hessian's perturbed-η TTE solves below are at different η and stay separate).
     #[cfg(feature = "survival")]
     let joint_share = try_joint_pktte_shared_solve(model, subject, theta, eta_hat.as_slice());
+    let predict = || match held_preds {
+        Some(p) => p.to_vec(),
+        None => model_predictions(model, subject, theta, eta_hat.as_slice()),
+    };
     #[cfg(feature = "survival")]
     let ipreds = match &joint_share {
         Some(s) => s.preds.clone(),
-        None => model_predictions(model, subject, theta, eta_hat.as_slice()),
+        None => predict(),
     };
     #[cfg(not(feature = "survival"))]
-    let ipreds = model_predictions(model, subject, theta, eta_hat.as_slice());
+    let ipreds = predict();
 
     // Per-observation custom residual magnitude (#484). η-independent, so one
     // evaluation here feeds both the data term and the Laplace curvature term.
@@ -3270,8 +3332,9 @@ fn gaussian_foce_accum(
 /// FOCEI objective cannot drift apart. Consumed by the SAEM f-SAEM kernel
 /// (`estimation::saem_imh`, #1449).
 ///
-/// Scope: the Gaussian observation rows of an analytical-PK subject with a
-/// diagonal residual R. SDE process noise, the FREM R-override, `block_sigma`
+/// Scope: the Gaussian observation rows of a subject with a diagonal residual R; an
+/// SDE subject's EKF variances `p_obs` (empty otherwise) add to each row's `V`, held
+/// η-independent as FOCEI's `H̃` holds them. The FREM R-override, `block_sigma`
 /// correlations and IIV on the residual are deliberately **not** threaded
 /// through; the caller gates those model shapes out rather than score them with
 /// an approximation this function would silently supply. Returns `None` when
@@ -3283,6 +3346,7 @@ pub(crate) fn conditional_eta_precision(
     theta: &[f64],
     eta_hat: &[f64],
     ipreds: &[f64],
+    p_obs: &[f64],
     h_matrix: &DMatrix<f64>,
     omega: &OmegaMatrix,
     sigma_values: &[f64],
@@ -3297,7 +3361,7 @@ pub(crate) fn conditional_eta_precision(
         &model.error_spec,
         sigma_values,
         model.bloq_in_force(),
-        &[],
+        p_obs,
         n_eta,
         None,
         model.residual_error_eta,
@@ -4694,6 +4758,14 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
     let ruv_mult = model.ruv_obs_mult(subject, theta);
     // #658: per-observation residual endpoint keys (covariate selector or CMT).
     let err_keys = model.error_spec.obs_keys(subject);
+    // An SDE's EKF process-noise variance, on the BSV η (the filter reads one parameter set,
+    // κ = 0): the same `V = V_resid + p_obs` the IOV marginal (`foce_subject_nll_iov`) scores,
+    // so the EBE minimises the objective the outer loop differentiates.
+    let p_obs = if model.is_sde() {
+        ekf_p_obs(model, subject, theta, eta, sigma_values)
+    } else {
+        Vec::new()
+    };
     let mut data_ll = 0.0;
     // A dense `R` (a `correlation … by` line, #1082 PR5, or a `block_sigma`
     // off-diagonal, #979) scores the whole subject with the non-IOV objective's data
@@ -4710,7 +4782,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
             sigma_values,
             residual_cov,
             ruv_scale,
-            &[],
+            &p_obs,
             ruv_mult.as_deref(),
         ) {
             Some(term) => data_ll += term,
@@ -4729,6 +4801,7 @@ pub(crate) fn individual_nll_iov_frozen_in<K: AsRef<[f64]>>(
                     ) * ruv_scale
                 }
             };
+            let v = v + p_obs.get(j).copied().unwrap_or(0.0);
             let cens = subject.cens.get(j).copied().unwrap_or(0);
             if model.bloq_in_force().is_censored_row(cens) {
                 data_ll += -2.0 * m3_logcdf(y, f_pred, v.sqrt(), cens);
@@ -5002,6 +5075,7 @@ mod tests {
 
     fn make_model() -> CompiledModel {
         CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
@@ -7178,6 +7252,30 @@ mod tests {
         .expect("joint PK-TTE model must parse")
     }
 
+    /// [`joint_pktte_ode_model`] without its compiled `[odes]` program: a spec the walks
+    /// cannot record (`ode_hazard_walk_in_scope` requires `rhs_program`), while the share and
+    /// the dedicated solve integrate the same `ode.rhs` closure. The fixture for the TTE
+    /// router's non-walk arms — the one difference from the walk arm's model is the program,
+    /// so the curves are the plain model's.
+    #[cfg(feature = "survival")]
+    fn walk_declined_joint_pktte_model() -> CompiledModel {
+        let mut model = joint_pktte_ode_model();
+        model.ode_spec.as_mut().expect("ODE model").rhs_program = None;
+        model
+    }
+
+    /// The router's walk-arm predicate for `s` on the program-bearing model and on
+    /// [`walk_declined_joint_pktte_model`]: `(true, false)` is the straddle the non-walk arms'
+    /// tests stand on — the same subject, the walk taken exactly when the program is there.
+    #[cfg(feature = "survival")]
+    fn walk_scope_straddle(s: &Subject) -> (bool, bool) {
+        let in_scope = crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope;
+        (
+            in_scope(&joint_pktte_ode_model(), s),
+            in_scope(&walk_declined_joint_pktte_model(), s),
+        )
+    }
+
     /// #1885's ODE fixture (the plan's M4): [`joint_pktte_ode_model`]'s subject on oral
     /// 100 at 0/12/24, so the later doses land on residual drug, with PK observations at
     /// 2/6/14/26 and one exact event at `t_event` on CMT 2. With `reset`, one EVID=3
@@ -8946,11 +9044,10 @@ DV ~ proportional(PROP_ERR)
     /// tolerance, below every NONMEM anchor's bound (#901 plan, M5). Dies on: the share read
     /// for an in-scope subject, or the walk's terms not visited.
     ///
-    /// Skipping the walk arm outright is an **equivalent** mutation, not a hole: on its
-    /// scope the walk at `f64` reproduces the dedicated solve bit for bit (measured: rel 0 at
-    /// η ∈ {0.2, −0.4, 0, 0.7} on this fixture), and a skipped walk falls to the dedicated
-    /// solve, never the share. The walk's precedence is observable only against the share,
-    /// which this test and the declined-walk fallback below pin.
+    /// Skipping the walk arm falls to the share, which this test's `assert_ne` tells apart
+    /// from the walk. (On its scope the walk at `f64` reproduces the dedicated solve bit for
+    /// bit — measured rel 0 at η ∈ {0.2, −0.4, 0, 0.7} on this fixture — so the share is the
+    /// only engine the walk's precedence is observable against.)
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_walk_nll() {
@@ -8989,49 +9086,8 @@ DV ~ proportional(PROP_ERR)
         );
     }
 
-    /// T6c (#901), walk fallback: a subject in the walk's scope whose walk returns `None`
-    /// (a TTE time before the first dose, which the walk cannot serve) is scored off the
-    /// **dedicated** solve, never the #570 share — the share is only for subjects outside
-    /// the walk's scope (#2482's routing), even when one exists.
-    ///
-    /// Dies on: the fallback reading the share, or the walk's `None` treated as the sentinel.
-    #[cfg(feature = "survival")]
-    #[test]
-    fn tte_record_terms_fall_back_from_a_declined_walk_to_the_dedicated_solve() {
-        let model = joint_pktte_ode_model();
-        let p = &model.default_params;
-        let (chz_state, _, _) = ode_tte_endpoint(&model);
-        let eta = [0.2];
-        let s = record_terms_subject(false, false, 5.0);
-        assert!(crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(&model, &s));
-        assert!(
-            crate::survival::ode_tte_nll_g::<f64>(
-                &model,
-                &s,
-                chz_state,
-                &s.obs_records,
-                &p.theta,
-                &eta
-            )
-            .is_none(),
-            "a pre-dose entry must be one the walk declines (straddle)"
-        );
-        let share = try_joint_pktte_shared_solve(&model, &s, &p.theta, &eta)
-            .expect("a share exists, so declining it is what is tested");
-        let terms = router_terms(&model, &s, Some(&share), &eta);
-        let dedicated = tte_ode_nll(&model, &s, chz_state, &s.obs_records, &p.theta, &eta);
-        assert_eq!(fold_terms(&terms).to_bits(), dedicated.to_bits());
-        let shared = tte_ode_nll_from_shared(
-            model.ode_spec.as_ref().unwrap(),
-            &share,
-            chz_state,
-            &s.obs_records,
-        );
-        assert_ne!(shared.to_bits(), dedicated.to_bits(), "engines must differ");
-    }
-
-    /// T6b (#901), shared arm: a steady-state dose takes the subject out of the walk's
-    /// scope while the #570 share still admits it, and the terms fold bit-identically to
+    /// T6b (#901), shared arm: a spec without a compiled `[odes]` program takes the subject
+    /// out of the walks' scope while the #570 share still admits it, and the terms fold bit-identically to
     /// the NLL the objective scores off that share (`tte_ode_nll_from_shared`), not to the
     /// dedicated solve's.
     ///
@@ -9039,14 +9095,15 @@ DV ~ proportional(PROP_ERR)
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_shared_solve_nll() {
-        let model = joint_pktte_ode_model();
+        let model = walk_declined_joint_pktte_model();
         let p = &model.default_params;
         let (chz_state, _, _) = ode_tte_endpoint(&model);
         let eta = [0.2];
         let s = record_terms_subject(false, true, 5.0);
-        assert!(
-            !crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(&model, &s),
-            "an SS dose must take the subject out of the walk's scope (straddle)"
+        assert_eq!(
+            walk_scope_straddle(&s),
+            (true, false),
+            "only the missing program may take the subject out of the walks' scope (straddle)"
         );
         let share = try_joint_pktte_shared_solve(&model, &s, &p.theta, &eta)
             .expect("the reset-free subject must take the #570 share (straddle)");
@@ -9224,8 +9281,8 @@ DV ~ proportional(PROP_ERR)
         assert!((rows[0].coxsnell - 0.10 * 104.0).abs() < 1e-12);
     }
 
-    /// T7 (#901), dedicated arm: an SS dose takes the subject out of the walk's scope and
-    /// an EVID-3 reset declines the share, and the terms fold bit-identically to the
+    /// T7 (#901), dedicated arm: a spec without a compiled `[odes]` program takes the subject
+    /// out of the walks' scope and an EVID-3 reset declines the share, and the terms fold bit-identically to the
     /// dedicated `tte_ode_nll`. Both declines are asserted first, so the test is about the
     /// dedicated arm and not about a scope that happened to be empty.
     ///
@@ -9233,14 +9290,15 @@ DV ~ proportional(PROP_ERR)
     #[cfg(feature = "survival")]
     #[test]
     fn tte_record_terms_fold_to_the_dedicated_solve_nll() {
-        let model = joint_pktte_ode_model();
+        let model = walk_declined_joint_pktte_model();
         let p = &model.default_params;
         let (chz_state, _, _) = ode_tte_endpoint(&model);
         let eta = [0.2];
         let r = record_terms_subject(true, true, 5.0);
-        assert!(
-            !crate::sens::ode_provider::adjoint::ode_hazard_walk_in_scope(&model, &r),
-            "the SS subject must be out of the walk's scope (straddle)"
+        assert_eq!(
+            walk_scope_straddle(&r),
+            (true, false),
+            "only the missing program may take the subject out of the walks' scope (straddle)"
         );
         assert!(
             try_joint_pktte_shared_solve(&model, &r, &p.theta, &eta).is_none(),

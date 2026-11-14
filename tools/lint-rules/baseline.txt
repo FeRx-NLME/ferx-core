@@ -122,7 +122,6 @@ nan-fold 1 src/io/datareader_tests.rs::test_missing_dv_advice_says_mdv1_keeps_th
 nan-fold 1 src/markov/dtmm_tests.rs::laplace_boundary_curvature_off_diagonal_matches_the_closed_form
 nan-fold 1 src/markov/dtmm_tests.rs::laplace_curvature_refuses_cancelling_sentinel_corners
 nan-fold 2 src/markov/endpoint.rs::exact_eta_hessian_tests::the_ctmm_eta_hessian_is_exact_on_a_homogeneous_generator
-nan-fold 3 src/markov/endpoint.rs::tests::a_drug_driven_ctmm_is_differentiated_exactly
 nan-fold 1 src/markov/mod.rs::tests::max_abs_diff
 nan-fold 1 src/nn/mlp.rs::regularizer_fit_tests::exact_penalty_hessian_matches_the_second_difference_of_the_penalty
 nan-fold 1 src/nn/mlp.rs::tests::vjp_is_the_seed_combination_of_the_jacobian_rows

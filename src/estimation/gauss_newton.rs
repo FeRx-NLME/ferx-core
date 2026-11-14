@@ -2892,6 +2892,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
@@ -5015,6 +5016,7 @@ mod tests {
             mixture: None,
         };
         let model = CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
@@ -5314,6 +5316,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
@@ -5602,6 +5605,87 @@ mod tests {
             }
         }
         assert!(worst < 1e-6, "{worst:.2e}");
+    }
+
+    /// An SDE subject's fixed-EBE score (the covariance step's S-matrix and the held salvage
+    /// read it) is exact: the EKF variance rows' θ and σ adjoints are in it. Exact branch
+    /// against the forced difference quotient of production's held objective.
+    #[test]
+    fn the_fixed_ebe_score_is_exact_for_an_sde_subject() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_sde.ferx"),
+            Some(&format!("{root}/data/warfarin.csv")),
+        )
+        .unwrap();
+        // The example's model at a tight integrator tolerance, so the quotient differences the
+        // filter's discretisation and not its error control.
+        let src = std::fs::read_to_string(format!("{root}/examples/warfarin_sde.ferx")).unwrap();
+        let mut model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        let ode = model.ode_spec.as_mut().unwrap();
+        ode.solver_opts.reltol = 1e-11;
+        ode.solver_opts.abstol = 1e-13;
+        let model = &model;
+        assert!(model.is_sde());
+        let mut template = prep.init_params.clone();
+        template.theta_fixed.fill(false);
+        template.omega_fixed.fill(false);
+        template.sigma_fixed.fill(false);
+        let template = &template;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let mut worst = 0.0f64;
+        for interaction in [false, true] {
+            let options = FitOptions {
+                interaction,
+                ..FitOptions::default()
+            };
+            for i in 0..3 {
+                let s = &prep.population.subjects[i];
+                let ebe = crate::estimation::inner_optimizer::find_ebe(
+                    model, s, template, 200, 1e-8, None, None, 0,
+                );
+                let run = |force: bool| {
+                    THETA_FD_FORCE.with(|c| c.set(force));
+                    let r = subject_nll_pop_grad(
+                        &x,
+                        template,
+                        model,
+                        &prep.population,
+                        i,
+                        &ebe.eta,
+                        &ebe.h_matrix,
+                        &[],
+                        &bounds,
+                        &options,
+                    );
+                    THETA_FD_FORCE.with(|c| c.set(false));
+                    r
+                };
+                let (nll_e, g_e) = run(false);
+                let (nll_f, g_f) = run(true);
+                let tag = format!("interaction={interaction} subject {i}");
+                assert!(
+                    (nll_e - nll_f).abs() <= 1e-9 * (1.0 + nll_f.abs()),
+                    "{tag}: {nll_e} vs {nll_f}"
+                );
+                assert!(
+                    g_e.iter()
+                        .zip(&g_f)
+                        .any(|(a, b)| a.to_bits() != b.to_bits()),
+                    "{tag}: exact branch did not run"
+                );
+                let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+                for (a, b) in g_e.iter().zip(&g_f) {
+                    assert!(a.is_finite() && b.is_finite(), "{tag}");
+                    worst = worst.max((a - b).abs() / scale);
+                }
+            }
+        }
+        eprintln!("sde fixed-EBE score vs the central difference: worst {worst:.2e} of the row");
+        // Measured 7.0e-7 at tolerance 1e-11 (1.6e-2 at the default tolerance: the quotient
+        // then differences the integrator's error control); 14× headroom.
+        assert!(worst < 1e-5, "{worst:.2e}");
     }
 
     /// #338 Part A quantification: with the mu-ref H-column gradient shortcut

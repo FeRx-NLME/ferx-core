@@ -21,7 +21,7 @@ use crate::sens::num::vm::Layout;
 /// The quadrature (AGQ, Laplace) gradient of a subject through its plans; `None` where a
 /// plan cannot be recorded.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn agq_planned<const N: usize, const M: usize>(
+pub(super) fn agq_planned(
     model: &CompiledModel,
     subject: &Subject,
     lay: Option<&crate::stats::stacked_layout::StackedLayout>,
@@ -32,39 +32,53 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
     ctx: &LikCtx,
     so: &StackedOmega,
     pv: &ParT<f64>,
-    grid: &[([f64; N], f64, [f64; N])],
+    grid: &[(Vec<f64>, f64, Vec<f64>)],
     h_inner: &DMatrix<f64>,
     exact: bool,
-    active: usize,
     held: bool,
     ng: Option<&AgqNg>,
     eta_dx: Option<&mut ModeOut>,
+    mode_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
+    var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
+    p1: &PredLanes<&[f64]>,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
     let n_obs = subject.observations.len();
     let n_bsv = model.n_eta;
-    let full = terms::layout2(N);
-    let lf = full.lanes();
-    let mode_fwd = if n_obs == 0 {
-        None
-    } else {
-        Some(plan_forward(model, subject, lay, theta, eta, full)?)
-    };
-    let p1 = PredLanes::<N> {
-        du: mode_fwd.as_ref().map_or(&[][..], |p| p.1.as_slice()),
-    };
+    let n = eta.len();
+    let full = terms::layout2(n);
+    // A reverse that seeds no `Q` lane runs at the first-order layout, the kept forward's
+    // leading lanes.
+    let first = terms::layout1(n);
+    // An SDE subject's EKF variance rows (the kernel's rows `n..2n`): a plan of their own over
+    // θ then σ, at η̂ and at every node.
+    let sde = var_fwd.is_some();
+    let sigma = params.sigma.values.as_slice();
+    let n_rows = p1.rows();
     let n_th = theta.len();
+    let n_cols = n_th + if sde { sigma.len() } else { 0 };
     // The node predictions, values only, each forward kept for its one reverse: the tape takes
     // a node as a block of `b` ([`node_block`]), whose reverse returns `Gᵀ·adjoint` — all `b`
     // needs — and the node's θ adjoint with it, so `G` itself is never formed.
-    type Node = (Vec<f64>, PlanArc, std::sync::Arc<kj_fwd::Fwd>);
+    type Fwd = (PlanArc, std::sync::Arc<kj_fwd::Fwd>);
+    // Per node: its rows (the predictions, then an SDE's variances) and the plan forwards that
+    // produced them (the predictions', the variances').
+    type Node = (Vec<f64>, Fwd, Option<Fwd>);
     let mut nodes: Vec<Node> = Vec::with_capacity(grid.len());
     for (_, _, b) in grid {
         if n_obs == 0 {
             continue;
         }
-        let (plan, du, f) = plan_forward(model, subject, lay, theta, &b[..], Layout::F64)?;
-        nodes.push((du, plan, std::sync::Arc::new(f)));
+        let (plan, mut du, f) = plan_forward(model, subject, lay, theta, &b[..], Layout::F64)?;
+        let var = if sde {
+            let (pp, dp, pf) =
+                plan_forward_in(model, subject, lay, theta, Some(sigma), &b[..], Layout::F64)?;
+            du.extend(dp);
+            Some((pp, std::sync::Arc::new(pf)))
+        } else {
+            None
+        };
+        nodes.push((du, (plan, std::sync::Arc::new(f)), var));
     }
 
     // ---- the objective and ∇_η l from the kernel plan --------------------------------
@@ -74,24 +88,26 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
     // predictions.
     use kernel::Leaf;
     let mut inp = kernel::Inputs::default();
-    let fr: Vec<Leaf> = (0..n_obs).map(|j| inp.leaf(p1.v(j))).collect();
-    let gr: Vec<[Leaf; N]> = (0..n_obs)
-        .map(|j| std::array::from_fn(|k| inp.leaf(p1.g(j, k))))
+    let fr: Vec<Leaf> = (0..n_rows).map(|j| inp.leaf(p1.v(j))).collect();
+    let gr: Vec<Vec<Leaf>> = (0..n_rows)
+        .map(|j| (0..n).map(|k| inp.leaf(p1.g(j, k))).collect())
         .collect();
-    let qr: Vec<[Leaf; M]> = (0..n_obs)
+    let qr: Vec<Vec<Leaf>> = (0..n_rows)
         .map(|j| {
-            std::array::from_fn(|t| {
-                if exact {
-                    inp.leaf(p1.q(j, t))
-                } else {
-                    Leaf::c(0.0)
-                }
-            })
+            (0..n * (n + 1) / 2)
+                .map(|t| {
+                    if exact {
+                        inp.leaf(p1.q(j, t))
+                    } else {
+                        Leaf::c(0.0)
+                    }
+                })
+                .collect()
         })
         .collect();
-    let er: [Leaf; N] = std::array::from_fn(|k| inp.leaf(eta[k]));
+    let er: Vec<Leaf> = eta.iter().map(|&v| inp.leaf(v)).collect();
     let (pr, om) = param_leaves(pv, so, &mut inp);
-    let ng_r = ng.map(|ng| ng_leaves::<N>(&ng.jets, &mut inp));
+    let ng_r = ng.map(|ng| ng_leaves(n, &ng.jets, &mut inp));
     let node_qr: Vec<Leaf> = ng
         .map(|ng| ng.nodes.iter().map(|(q, _)| inp.leaf(*q)).collect())
         .unwrap_or_default();
@@ -104,13 +120,13 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
         })
         .unwrap_or_default();
     #[allow(clippy::type_complexity)]
-    let grid_l: Vec<([Leaf; N], Leaf, [Leaf; N])> = grid
+    let grid_l: Vec<(Vec<Leaf>, Leaf, Vec<Leaf>)> = grid
         .iter()
         .map(|(z, c, b0)| {
             (
-                z.map(|v| inp.leaf(v)),
+                z.iter().map(|&v| inp.leaf(v)).collect(),
                 inp.leaf(*c),
-                b0.map(|v| inp.leaf(v)),
+                b0.iter().map(|&v| inp.leaf(v)).collect(),
             )
         })
         .collect();
@@ -119,12 +135,10 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
         .map(|(fv, _, _)| fv.iter().map(|&v| inp.leaf(v)).collect())
         .collect();
     let n_nodes_b = nodes.len();
-    let n_out = 1 + N + n_nodes_b * N;
+    let n_out = 1 + n + n_nodes_b * n;
     let variant = kernel::variant_of(&(
         4u8,
-        (N, M),
         exact,
-        active,
         grid.len(),
         n_nodes_b,
         ng.map(|n| (n.jets.g.len(), n.nodes.len())),
@@ -144,15 +158,19 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
             let c = T::from_f64;
             let one = c(1.0);
             let fr: Vec<T> = fr.iter().map(|&l| t(l)).collect();
-            let gr: Vec<[T; N]> = gr.iter().map(|r| r.map(t)).collect();
-            let qr: Vec<[T; M]> = qr.iter().map(|r| r.map(t)).collect();
-            let er: [T; N] = er.map(t);
+            let gr: Vec<Vec<T>> = gr
+                .iter()
+                .map(|r| r.iter().map(|&l| t(l)).collect())
+                .collect();
+            let qr: Vec<Vec<T>> = qr
+                .iter()
+                .map(|r| r.iter().map(|&l| t(l)).collect())
+                .collect();
+            let er: Vec<T> = er.iter().map(|&l| t(l)).collect();
             let pr = param_tr(model, subject, &pr, lv)?;
             let ngr = ng_r.as_ref().map(|n| ng_tr(n, lv));
             let mut h_a: Vec<Vec<T>> = if exact {
-                crate::sens::focei_kernel::exact_inner_hessian_kernel(
-                    ctx, &fr, &gr, &qr, &er, &pr, active,
-                )?
+                crate::sens::focei_kernel::exact_inner_hessian_kernel(ctx, &fr, &gr, &qr, &er, &pr)?
             } else {
                 crate::sens::focei_kernel::focei_htilde(ctx, &fr, &gr, &er, &pr)?
             };
@@ -166,26 +184,27 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
             let lh = factor_anchor(&mut h_a, &pr.omega.inv)?;
             let half_logdet = c(0.5) * crate::sens::focei_kernel::chol_logdet(&lh);
             let ng_q = ngr.as_ref().map_or(c(0.0), |n| n.q);
-            let mut bs: Vec<T> = Vec::with_capacity(n_nodes_b * N);
+            let mut bs: Vec<T> = Vec::with_capacity(n_nodes_b * n);
             let a = if grid_l.is_empty() {
                 inner_l(ctx, &fr, &er, &pr, None)? + ng_q + half_logdet
             } else {
                 let mut terms: Vec<T> = Vec::with_capacity(grid_l.len());
                 for (j, (z, cw, b0)) in grid_l.iter().enumerate() {
                     // b = η̂ + √2·L⁻ᵀz.
-                    let mut step = [c(0.0); N];
-                    for i in (0..N).rev() {
+                    let mut step = vec![c(0.0); n];
+                    for i in (0..n).rev() {
                         let mut acc = t(z[i]);
-                        for jj in (i + 1)..N {
+                        for jj in (i + 1)..n {
                             acc = acc - lh[jj][i] * step[jj];
                         }
                         step[i] = acc / lh[i][i];
                     }
-                    let b: [T; N] =
-                        std::array::from_fn(|k| er[k] + c(std::f64::consts::SQRT_2) * step[k]);
+                    let b: Vec<T> = (0..n)
+                        .map(|k| er[k] + c(std::f64::consts::SQRT_2) * step[k])
+                        .collect();
                     let fb: Vec<T> = match node_f.get(j) {
                         Some(f) => {
-                            bs.extend(b);
+                            bs.extend(b.iter().copied());
                             f.iter().map(|&l| t(l)).collect()
                         }
                         None => Vec::new(),
@@ -212,11 +231,11 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
                     })
                     .value_only();
                 let sum = T::wsum3(0.0, terms.iter().map(|&x| (one, (x - mx).exp(), one)));
-                c(0.5 * active as f64 * std::f64::consts::PI.ln()) + half_logdet - (mx + sum.ln())
+                c(0.5 * n as f64 * std::f64::consts::PI.ln()) + half_logdet - (mx + sum.ln())
             };
             let mut lg = inner_grad(ctx, &fr, &gr, &er, &pr, None)?;
             if let Some(ngr) = ngr.as_ref() {
-                for k in 0..N {
+                for k in 0..n {
                     lg[k] = lg[k] + ngr.g[k];
                 }
             }
@@ -229,29 +248,42 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
     // The adjoint rows of `A` and of each `∇_η l` component.
     let unit =
         |o: usize| -> Vec<f64> { (0..n_out).map(|c| if c == o { 1.0 } else { 0.0 }).collect() };
-    let mut base = kr.reverse_values(&(0..=N).map(unit).collect::<Vec<_>>())?;
+    let mut base = kr.reverse_values(&(0..=n).map(unit).collect::<Vec<_>>())?;
     // `A` through every node's predictions: `ā` of them, back through the node's plan to its
     // location (`Gᵀā`) and θ, and the locations' adjoints through the kernel to the leaves.
-    let mut theta_nodes = vec![0.0; n_th];
+    let mut theta_nodes = vec![0.0; n_cols];
     if n_nodes_b > 0 {
         let mut seed = vec![0.0; n_out];
-        for (j, (_, plan, ff)) in nodes.iter().enumerate() {
+        for (j, (_, (plan, ff), var)) in nodes.iter().enumerate() {
             let du: Vec<f64> = node_f[j].iter().map(|&l| l.adj(&base[0])).collect();
             if du.iter().all(|&x| x == 0.0) {
                 continue;
             }
-            let (mut ub, mut pb) = (vec![0.0; N], vec![0.0; n_th]);
-            if !plan.reverse_from(ff, Layout::F64, 1, &mut ub, &mut pb, &du) {
+            let (mut ub, mut pb) = (vec![0.0; n], vec![0.0; n_th]);
+            if !plan.reverse_from(ff, Layout::F64, 1, &mut ub, &mut pb, &du[..n_obs]) {
                 return None;
             }
-            seed[1 + N + j * N..1 + N + (j + 1) * N].copy_from_slice(&ub[..N]);
+            if let Some((pp, pf)) = var {
+                let mut pbv = vec![0.0; n_cols];
+                let mut ubv = vec![0.0; n];
+                if !pp.reverse_from(pf, Layout::F64, 1, &mut ubv, &mut pbv, &du[n_obs..]) {
+                    return None;
+                }
+                for (a, b) in ub.iter_mut().zip(&ubv) {
+                    *a += b;
+                }
+                for (a, b) in theta_nodes.iter_mut().zip(&pbv) {
+                    *a += b;
+                }
+            }
+            seed[1 + n + j * n..1 + n + (j + 1) * n].copy_from_slice(&ub[..n]);
             for (t, d) in theta_nodes.iter_mut().zip(&pb) {
                 *t += d;
             }
         }
         if seed.iter().any(|&x| x != 0.0) {
-            let corr = kr.reverse_values(&[seed])?.pop()?;
-            for (a, c) in base[0].iter_mut().zip(&corr) {
+            let corr = kr.reverse_one(&seed)?;
+            for (a, c) in base[0].iter_mut().zip(corr.iter()) {
                 *a += c;
             }
         }
@@ -259,8 +291,9 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
     let ba = |o: usize, v: Leaf| v.adj(&base[o]);
 
     // ---- reverse 1: A through the predictions at η̂ ------------------------------------
-    // Seeds of output combination `c` (over the lanes `[A, ∇_η l]`) on (f, G, Q).
-    let seed_preds = |c: &[f64], du: &mut [f64]| {
+    // Seeds of output combination `c` (over the lanes `[A, ∇_η l]`) on (f, G, and at the
+    // second-order layout `Q`), `lf` lanes per row.
+    let seed_preds = |c: &[f64], du: &mut [f64], lf: usize| {
         let comb = |v: Leaf| -> f64 {
             c.iter()
                 .enumerate()
@@ -268,30 +301,56 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
                 .map(|(o, &k)| k * ba(o, v))
                 .sum()
         };
-        for j in 0..n_obs {
+        for j in 0..n_rows {
             du[j * lf] = comb(fr[j]);
-            for k in 0..N {
+            for k in 0..n {
                 du[j * lf + 1 + k] = comb(gr[j][k]);
             }
-            if exact {
-                for t in 0..M {
-                    du[j * lf + 1 + N + t] = comb(qr[j][t]);
+            if lf > 1 + n {
+                for t in 0..qr[j].len() {
+                    du[j * lf + 1 + n + t] = comb(qr[j][t]);
                 }
             }
         }
     };
-    let (nu, np, w_out) = (N * lf, n_th * lf, n_obs * lf);
-    let mut a_seed = vec![0.0; 1 + N];
-    a_seed[0] = 1.0;
-    let mut du_bar = vec![0.0; w_out];
-    seed_preds(&a_seed, &mut du_bar);
-    let (mut ub, mut pb) = (vec![0.0; nu], vec![0.0; np]);
-    if let Some((plan, _, fwd)) = mode_fwd.as_ref() {
-        if !plan.reverse_from(fwd, full, 1, &mut ub, &mut pb, &du_bar) {
-            return None;
+    // The plans' reverses at η̂ over `rl`: `seeds` rows of seeds over all `n_rows` rows (the
+    // predictions', then the variances'), each plan taking its own rows. Returns the η lanes
+    // (both plans' summed) and, per seed, the θ (then σ) adjoints.
+    let reverse_at_mode = |seeds: usize, du_bar: &[f64], rl: Layout| {
+        let lf = rl.lanes();
+        let (nu, w_out, w_p) = (n * lf, n_rows * lf, n_obs * lf);
+        let (mut ub, mut pb) = (vec![0.0; seeds * nu], vec![0.0; seeds * n_cols]);
+        for (fwd, off, cols) in [(mode_fwd, 0, n_th), (var_fwd, 1, n_cols)] {
+            let Some((plan, _, fwd)) = fwd else { continue };
+            let mut dub = vec![0.0; seeds * w_p];
+            for s in 0..seeds {
+                dub[s * w_p..(s + 1) * w_p]
+                    .copy_from_slice(&du_bar[s * w_out + off * w_p..s * w_out + (off + 1) * w_p]);
+            }
+            let (mut u, mut p) = (vec![0.0; seeds * nu], vec![0.0; seeds * cols * lf]);
+            if !plan.reverse_from(fwd, rl, seeds, &mut u, &mut p, &dub) {
+                return None;
+            }
+            for (a, b) in ub.iter_mut().zip(&u) {
+                *a += b;
+            }
+            for s in 0..seeds {
+                for j in 0..cols {
+                    pb[s * n_cols + j] += p[(s * cols + j) * lf];
+                }
+            }
         }
-    }
-    let mut grad_eta: [f64; N] = std::array::from_fn(|k| ba(0, er[k]) + ub[k * lf]);
+        Some((ub, pb))
+    };
+    let mut a_seed = vec![0.0; 1 + n];
+    a_seed[0] = 1.0;
+    // Only the exact anchor reads `Q`, so only its reverse 1 seeds it.
+    let r1 = if exact { full } else { first };
+    let lf = r1.lanes();
+    let mut du_bar = vec![0.0; n_rows * lf];
+    seed_preds(&a_seed, &mut du_bar, lf);
+    let (ub, pb) = reverse_at_mode(1, &du_bar, r1)?;
+    let mut grad_eta: Vec<f64> = (0..n).map(|k| ba(0, er[k]) + ub[k * lf]).collect();
     if let (Some(ngr), Some(ng)) = (ng_r.as_ref(), ng) {
         let d = ng_eta_contraction(&ng.jets, ngr, |v| ba(0, v))?;
         for k in 0..n_bsv {
@@ -299,17 +358,17 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
         }
     }
     // A's θ adjoint: at η̂, then through every node's predictions (their blocks' reverses).
-    let mut theta_a: Vec<f64> = (0..n_th).map(|j| pb[j * lf]).collect();
+    let mut theta_a: Vec<f64> = pb[..n_cols].to_vec();
     for (t, d) in theta_a.iter_mut().zip(&theta_nodes) {
         *t += d;
     }
 
     // ---- the mode solve ----------------------------------------------------------------
-    let grad_l: Vec<f64> = (0..N).map(|k| kr.value(1 + k)).collect();
+    let grad_l: Vec<f64> = (0..n).map(|k| kr.value(1 + k)).collect();
     let bvec = DVector::from_column_slice(&grad_eta);
     let mut at_mode = true;
     let w = match mode_solve(h_inner, &bvec, &grad_l, || {
-        let mut g = inner_search_gradient::<N>(model, subject, lay, theta, eta, ctx, pv, None)?;
+        let mut g = inner_search_gradient(model, subject, lay, theta, eta, ctx, pv, None)?;
         if let Some(ng) = ng {
             for (gk, qk) in g.iter_mut().zip(&ng.jets.g) {
                 *gk += qk;
@@ -320,7 +379,7 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
         Some(w) => w,
         None if held => {
             at_mode = false;
-            DVector::zeros(N)
+            DVector::zeros(n)
         }
         None => return None,
     };
@@ -329,24 +388,17 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
     let mut coefs: Vec<Vec<f64>> = vec![std::iter::once(0.0).chain(w.iter().map(|v| -v)).collect()];
     let want_rows = matches!(&eta_dx, Some(o) if o.want_dx) && at_mode;
     if want_rows {
-        coefs.extend(eta_dx_coefs::<N>(
-            h_inner,
-            active.min(N),
-            n_bsv.min(active).min(N),
-        ));
+        coefs.extend(eta_dx_coefs(h_inner, n_bsv));
     }
+    // `∇_η l` reads `f` and `G` only: no `Q` seed, the first-order layout.
     let seeds = coefs.len();
+    let (l1, w_out) = (first.lanes(), n_rows * first.lanes());
     let mut du_bar = vec![0.0; seeds * w_out];
     for (s, c) in coefs.iter().enumerate() {
-        seed_preds(c, &mut du_bar[s * w_out..(s + 1) * w_out]);
+        seed_preds(c, &mut du_bar[s * w_out..(s + 1) * w_out], l1);
     }
-    let (mut ub2, mut pb2) = (vec![0.0; seeds * nu], vec![0.0; seeds * np]);
-    if let Some((plan, _, fwd)) = mode_fwd.as_ref() {
-        if !plan.reverse_from(fwd, full, seeds, &mut ub2, &mut pb2, &du_bar) {
-            return None;
-        }
-    }
-    let theta_of = |s: usize| -> Vec<f64> { (0..n_th).map(|j| pb2[s * np + j * lf]).collect() };
+    let (_, pb2) = reverse_at_mode(seeds, &du_bar, first)?;
+    let theta_of = |s: usize| -> Vec<f64> { pb2[s * n_cols..(s + 1) * n_cols].to_vec() };
     let comb_adj = |c: &[f64], v: Leaf| -> f64 {
         c.iter()
             .enumerate()
@@ -398,7 +450,7 @@ pub(super) fn agq_planned<const N: usize, const M: usize>(
     if let Some(o) = eta_dx {
         o.eta_dx = None;
         o.hessian = (o.want_hessian && at_mode && !iov_frem_mismatch(model, subject))
-            .then(|| h_inner.view((0, 0), (active, active)).into_owned())
+            .then(|| h_inner.clone())
             .filter(|h| h.iter().all(|v| v.is_finite()));
         let n_rows = seeds - 1;
         if want_rows && n_rows > 0 {

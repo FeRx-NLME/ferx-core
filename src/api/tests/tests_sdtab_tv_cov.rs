@@ -49,6 +49,7 @@ fn test_sdtab_ipred_honours_tv_covariates() {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -421,6 +422,7 @@ fn test_simulate_honours_tv_covariates() {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,

@@ -24,7 +24,7 @@ pub(super) struct KernelRun {
     n_in: usize,
     n_out: usize,
     /// Per output, its lanes (`layout.lanes()` each).
-    pub(super) out: Vec<f64>,
+    pub(super) out: kj::Buf,
 }
 
 impl KernelRun {
@@ -33,33 +33,45 @@ impl KernelRun {
         self.out[o * self.layout.lanes()]
     }
 
-    /// One reverse seeded with each row of `seeds` (`n_out · lanes` entries per row, laid out
-    /// like the outputs): per row, the adjoint of every leaf's every lane, `n_in · lanes`
-    /// entries. `None` where the plan's reverse fails.
+    /// One reverse seeded with `seeds` (`rows · n_out · lanes` entries, laid out like the
+    /// outputs): per row, the adjoint of every leaf's every lane, `n_in · lanes` entries,
+    /// row after row. `None` where the plan's reverse fails.
+    pub(super) fn reverse_flat(&self, seeds: &[f64], rows: usize) -> Option<kj::Buf> {
+        let nt = self.n_in * self.layout.lanes();
+        let mut p_bar = kj::Buf::new(rows * nt);
+        if seeds.len() != rows * self.n_out * self.layout.lanes()
+            || !self
+                .plan
+                .reverse_from(&self.fwd, self.layout, rows, &mut [], &mut p_bar, seeds)
+        {
+            return None;
+        }
+        p_bar.iter().all(|v| v.is_finite()).then_some(p_bar)
+    }
+
+    /// [`Self::reverse_flat`] for one seed.
+    pub(super) fn reverse_one(&self, seed: &[f64]) -> Option<kj::Buf> {
+        self.reverse_flat(seed, 1)
+    }
+
+    /// One reverse per row of `seeds`, each an owned row ([`Self::reverse_flat`]).
     pub(super) fn reverse(&self, seeds: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
-        let l = self.layout.lanes();
-        let (rows, w) = (seeds.len(), self.n_out * l);
-        let mut du_bar = vec![0.0; rows * w];
+        let w = self.n_out * self.layout.lanes();
+        let mut flat = kj::Buf::new(seeds.len() * w);
         for (r, s) in seeds.iter().enumerate() {
             if s.len() != w {
                 return None;
             }
-            du_bar[r * w..(r + 1) * w].copy_from_slice(s);
+            flat[r * w..(r + 1) * w].copy_from_slice(s);
         }
-        let nt = self.n_in * l;
-        let mut p_bar = vec![0.0; rows * nt];
-        if !self
-            .plan
-            .reverse_from(&self.fwd, self.layout, rows, &mut [], &mut p_bar, &du_bar)
-        {
-            return None;
-        }
-        let out: Vec<Vec<f64>> = p_bar
-            .chunks_exact(nt.max(1))
-            .take(rows)
-            .map(<[f64]>::to_vec)
-            .collect();
-        out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+        let p = self.reverse_flat(&flat, seeds.len())?;
+        let nt = (self.n_in * self.layout.lanes()).max(1);
+        Some(
+            p.chunks_exact(nt)
+                .take(seeds.len())
+                .map(<[f64]>::to_vec)
+                .collect(),
+        )
     }
 
     /// [`Self::reverse`] at the value layout with one seed per output combination: per row
@@ -79,7 +91,7 @@ impl KernelRun {
 pub(super) fn kernel_run(
     model: &CompiledModel,
     subject: &Subject,
-    variant: u64,
+    variant: kj::Desc,
     layout: Layout,
     inputs: &[f64],
     n_out: usize,
@@ -91,16 +103,17 @@ pub(super) fn kernel_run(
         return None;
     }
     let n_in = inputs.len() / l;
+    // A kernel also bakes in the observed values: subjects of one design key apart by them.
     let key = kj::SubjectKey::new(model, subject, 0, n_in)
         .with_kind(KERNEL_KIND)
-        .with_variant(variant);
+        .with_variant(variant)
+        .with_observed(subject);
     let run = |plan: &Arc<kj::Plan>| -> Option<KernelRun> {
-        let mut out = vec![0.0; (n_out + 1) * l];
+        let mut out = kj::Buf::new((n_out + 1) * l);
         let fwd = plan.forward_layout(layout, &[], inputs, &mut out)?;
         if out[n_out * l] != 1.0 {
             return None;
         }
-        out.truncate(n_out * l);
         Some(KernelRun {
             plan: plan.clone(),
             fwd,
@@ -113,74 +126,48 @@ pub(super) fn kernel_run(
     match kj::lookup(&key) {
         kj::Lookup::Bad => return None,
         kj::Lookup::Found(ks) => {
-            if let Some(r) = ks.iter().find_map(run) {
-                // TEMP #2786 diagnosis: a fresh recording at these leaves must agree.
-                if std::env::var("FERX_TMP_KVERIFY").is_ok() {
-                    kj::begin();
-                    let lv: Vec<kj::Tr> =
-                        (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
-                    let y = f(&lv);
-                    let fresh: Option<Vec<f64>> = y.map(|y| y.iter().map(|x| x.v_dbg()).collect());
-                    let _ = kj::end(None);
-                    if let Some(fr) = fresh {
-                        for (o, (a, b)) in fr.iter().zip(r.out.iter().step_by(l)).enumerate() {
-                            if a.to_bits() != b.to_bits() {
-                                eprintln!("TMPKV variant {variant:x} out {o}: fresh {a} plan {b}");
-                                break;
-                            }
-                        }
-                    }
-                }
+            if let Some((i, r)) = ks.order().find_map(|(i, p)| Some((i, run(p)?))) {
+                ks.hit(i);
                 return Some(r);
             }
             kj::STATS.guard_fail.fetch_add(1, Relaxed);
         }
         kj::Lookup::Missing => {}
     }
-    // Record at the leaves' values.
-    kj::begin();
-    let leaves: Vec<kj::Tr> = (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
-    let y = f(&leaves);
-    let Some(y) = y else {
-        // Outside the kernel's domain here: nothing to keep, nothing to condemn.
-        let _ = kj::end(None);
-        return None;
-    };
-    if y.len() != n_out {
-        let _ = kj::end(None);
-        kj::mark_bad(&key);
-        return None;
-    }
-    let rec = match kj::end(Some(y.iter().map(|x| x.reg()).collect())) {
-        Ok(r) => r,
-        Err(why) => {
-            if kj::debug() {
-                eprintln!("kjit: kernel not recorded: {why}");
-            }
-            kj::mark_bad(&key);
+    // Record at the leaves' values: how many outputs `f` gave (none: outside the kernel's
+    // domain here, nothing to keep and nothing to condemn).
+    let given = std::cell::Cell::new(None);
+    let rec = kj::recorded(&key.family(), || {
+        let leaves: Vec<kj::Tr> = (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
+        let y = f(&leaves);
+        given.set(y.as_ref().map(Vec::len));
+        y.filter(|y| y.len() == n_out)
+            .map(|y| y.iter().map(|x| x.reg()).collect())
+    });
+    let rec = match (given.get(), rec) {
+        (None, _) => return None,
+        (Some(n), _) if n != n_out => {
+            kj::mark_bad(&key, "the kernel recorded the wrong number of outputs");
+            return None;
+        }
+        (_, Ok(r)) => r,
+        (_, Err((why, _))) => {
+            kj::mark_bad(&key, &why);
             return None;
         }
     };
     let Some(plan) = rec.plan(Layout::F64, 0, n_in).map(Arc::new) else {
-        kj::mark_bad(&key);
+        kj::mark_bad(&key, "the recording could not be planned");
         return None;
     };
     kj::add(&key, plan.clone());
-    let r = run(&plan);
-    if r.is_none() {
-        // A fresh recording that does not serve at its own point never will.
-        kj::mark_bad(&key);
-    }
-    r
+    run(&plan)
 }
 
 /// A kernel configuration's [`kj::SubjectKey`] variant: everything that shapes the kernel's
-/// code and is not one of its leaves, hashed.
-pub(super) fn variant_of(parts: &impl std::hash::Hash) -> u64 {
-    use std::hash::Hasher;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    parts.hash(&mut h);
-    h.finish()
+/// code and is not one of its leaves, as its canonical bytes (compared exactly).
+pub(super) fn variant_of(parts: &impl std::hash::Hash) -> kj::Desc {
+    kj::Desc::of_value(parts)
 }
 
 /// A kernel input: a leaf of the plan (`i`, its input slot) or a constant, with its value.
@@ -221,6 +208,40 @@ impl Inputs {
         Leaf {
             v,
             i: Some((self.vals.len() - 1) as u32),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A kernel plan replays at new leaves: `x₀·x₁ + exp(x₂)` recorded at one point, then run
+    /// at others, against its closed-form value and gradient. Dies when a replay returns the
+    /// recording point's output (a leaf baked as a constant) or a stale adjoint.
+    #[test]
+    fn a_kernel_plan_replays_at_new_leaves() {
+        use crate::sens::num::PkNum;
+        let model = crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TCL(1.0, 0.01, 10.0)\n  theta TV(10.0, 1.0, 100.0)\n  \
+             omega ETA_CL ~ 0.1\n  sigma PROP ~ 0.01\n[individual_parameters]\n  \
+             CL = TCL * exp(ETA_CL)\n  V = TV\n[structural_model]\n  \
+             pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n",
+        )
+        .expect("parses");
+        let subject = Subject::default();
+        let f = |lv: &[kj::Tr]| Some(vec![lv[0] * lv[1] + lv[2].exp()]);
+        for x in [[1.0, 2.0, 0.5], [3.0, -1.5, 0.25], [0.5, 4.0, -2.0]] {
+            let r = kernel_run(&model, &subject, variant_of(&7u8), Layout::F64, &x, 1, &f)
+                .expect("runs");
+            let want = x[0] * x[1] + x[2].exp();
+            assert_eq!(r.value(0), want, "value at {x:?}");
+            let g = r
+                .reverse_values(&[vec![1.0]])
+                .expect("reverses")
+                .pop()
+                .unwrap();
+            assert_eq!(g, vec![x[1], x[0], x[2].exp()], "gradient at {x:?}");
         }
     }
 }

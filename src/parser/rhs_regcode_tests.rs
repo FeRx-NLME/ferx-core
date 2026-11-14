@@ -6,9 +6,9 @@ use super::super::{
     OdeRhsProgram,
 };
 use super::{RhsLayout, RhsRegProgram};
+use crate::sens::dual2::Dual2;
 use crate::sens::num::vm::VmNum;
 use crate::sens::num::PkNum;
-use crate::sens::vfree::DualF;
 
 /// xorshift64*, so the generated programs are the same on every run.
 struct Rng(u64);
@@ -122,18 +122,6 @@ fn program_states(n: usize, odes: &str) -> OdeRhsProgram {
         )
     });
     model.ode_spec.unwrap().rhs_program.unwrap()
-}
-
-/// A chain of `n` states: `x1' = −A·x1`, `xk' = A·x(k−1) − B·xk`.
-fn chain_odes(n: usize) -> String {
-    let mut lines = vec!["  d/dt(x1) = -A * x1".to_string()];
-    for k in 2..=n {
-        lines.push(format!("  d/dt(x{k}) = A * x{} - B * x{k}", k - 1));
-    }
-    lines.join(
-        "
-",
-    )
 }
 
 fn random_odes(rng: &mut Rng) -> String {
@@ -275,48 +263,22 @@ fn compiled_rhs_is_the_interpreter_bit_for_bit_on_random_programs() {
                 "{label}\nf64: du {du_ref:?} vs {du_reg:?}"
             );
         }
-        // The duals: the inner gradient's tape-free first-order type, and the untaped
-        // second-order one (value, tangents and the packed Hessian lanes all compared).
-        let lift_f = |x: &[f64]| -> Vec<DualF<2, 0>> {
+        // The forward dual `Dual2` (value, tangents and the full Hessian all compared).
+        let lift_1 = |x: &[f64]| -> Vec<Dual2<2>> {
             x.iter()
                 .enumerate()
-                .map(|(i, &v)| DualF::<2, 0>::var(v, i % 2) * DualF::constant(0.5 + i as f64 / 7.0))
-                .collect()
-        };
-        let (uf, pf, sf) = (lift_f(&raw_u), lift_f(&raw_p), lift_f(&raw_s));
-        let sf: [DualF<2, 0>; 4] = [sf[0], sf[1], sf[2], sf[3]];
-        compiled += usize::from(check_on(
-            &prog,
-            &uf,
-            &pf,
-            &sf,
-            &format!("{label}\nDualF<2,0>"),
-        ));
-        let lift_v = |x: &[f64]| -> Vec<DualF<2, 3>> {
-            x.iter()
-                .enumerate()
-                .map(|(i, &v)| {
-                    let a = DualF::<2, 3>::var(v, i % 2);
-                    a * a * DualF::constant(0.25) + DualF::var(0.3, (i + 1) % 2)
-                })
-                .collect()
-        };
-        let (uv, pv, sv) = (lift_v(&raw_u), lift_v(&raw_p), lift_v(&raw_s));
-        let sv: [DualF<2, 3>; 4] = [sv[0], sv[1], sv[2], sv[3]];
-        check_on(&prog, &uv, &pv, &sv, &format!("{label}\nDualV<2,3>"));
-        // The first- and second-order forward duals (`Dual1`, `Dual2`), which the
-        // sensitivity solves run.
-        use crate::sens::dual1::Dual1;
-        use crate::sens::dual2::Dual2;
-        let lift_1 = |x: &[f64]| -> Vec<Dual1<2>> {
-            x.iter()
-                .enumerate()
-                .map(|(i, &v)| Dual1::<2>::var(v, i % 2) * Dual1::constant(0.5 + i as f64 / 7.0))
+                .map(|(i, &v)| Dual2::<2>::var(v, i % 2) * Dual2::constant(0.5 + i as f64 / 7.0))
                 .collect()
         };
         let (u1, p1, s1) = (lift_1(&raw_u), lift_1(&raw_p), lift_1(&raw_s));
-        let s1: [Dual1<2>; 4] = [s1[0], s1[1], s1[2], s1[3]];
-        check_on(&prog, &u1, &p1, &s1, &format!("{label}\nDual1<2>"));
+        let s1: [Dual2<2>; 4] = [s1[0], s1[1], s1[2], s1[3]];
+        compiled += usize::from(check_on(
+            &prog,
+            &u1,
+            &p1,
+            &s1,
+            &format!("{label}\nfirst-order seeds"),
+        ));
         let lift_2 = |x: &[f64]| -> Vec<Dual2<2>> {
             x.iter()
                 .enumerate()
@@ -328,7 +290,13 @@ fn compiled_rhs_is_the_interpreter_bit_for_bit_on_random_programs() {
         };
         let (u2, p2, s2) = (lift_2(&raw_u), lift_2(&raw_p), lift_2(&raw_s));
         let s2: [Dual2<2>; 4] = [s2[0], s2[1], s2[2], s2[3]];
-        check_on(&prog, &u2, &p2, &s2, &format!("{label}\nDual2<2>"));
+        check_on(
+            &prog,
+            &u2,
+            &p2,
+            &s2,
+            &format!("{label}\nsecond-order seeds"),
+        );
     }
     // The generator only emits translatable programs, so they all compile; a collapse
     // here means the compiler started declining and the test checks nothing.
@@ -368,39 +336,6 @@ fn run_without_jit<T: VmNum>(reg: &RhsRegProgram, u: &[T], p: &[T], s: &[T; 4]) 
     du
 }
 
-/// A value of `T` from its lanes, contiguous or not.
-fn from_lanes_any<T: VmNum>(l: &[f64]) -> T {
-    if T::CONTIGUOUS {
-        assert_eq!(std::mem::size_of::<T>(), l.len() * 8);
-        // SAFETY: a contiguous `T` is exactly its lanes (`#[repr(C)]` `f64`s).
-        unsafe { std::ptr::read(l.as_ptr().cast::<T>()) }
-    } else {
-        T::from_lanes(l)
-    }
-}
-
-/// `x` lifted to `T`: tangents and payload of mixed sign, zeros and `−0.0`, so `0 − g` vs
-/// `−g` and the `x·0` products are exercised.
-fn lift_lanes<T: VmNum>(x: &[f64]) -> Vec<T> {
-    let w = T::LANES.expect("a native layout").lanes();
-    x.iter()
-        .enumerate()
-        .map(|(i, &v)| {
-            let mut l = vec![v];
-            for k in 1..w {
-                l.push(match (i + k) % 5 {
-                    0 => 0.0,
-                    1 => 0.5 + i as f64 / 7.0,
-                    2 => -1.25,
-                    3 => -0.0,
-                    _ => 0.375,
-                });
-            }
-            from_lanes_any(&l)
-        })
-        .collect()
-}
-
 /// Native vs register code on one `T`.
 fn check_native<T: VmNum>(reg: &RhsRegProgram, x: (&[T], &[T], &[T; 4]), label: &str) {
     assert!(
@@ -419,20 +354,6 @@ fn check_native<T: VmNum>(reg: &RhsRegProgram, x: (&[T], &[T], &[T; 4]), label: 
     );
 }
 
-fn check_native_lifted<T: VmNum>(
-    reg: &RhsRegProgram,
-    raw: (&[f64], &[f64], &[f64; 4]),
-    label: &str,
-) {
-    let (u, p, s) = (
-        lift_lanes::<T>(raw.0),
-        lift_lanes::<T>(raw.1),
-        lift_lanes::<T>(raw.2),
-    );
-    let s: [T; 4] = [s[0], s[1], s[2], s[3]];
-    check_native(reg, (&u[..], &p[..], &s), label);
-}
-
 #[test]
 fn native_rhs_is_the_register_code_bit_for_bit_on_random_programs() {
     let mut rng = Rng(0xD1B5_4A32_D192_ED03);
@@ -449,149 +370,7 @@ fn native_rhs_is_the_register_code_bit_for_bit_on_random_programs() {
         let _time = ModelTimeGuard::enter(1.75);
         let raw = (&raw_u[..], &raw_p[..], &raw_s);
         check_native(&reg, raw, &label);
-        // First order: the inner gradient's widths, inlined and out of line (`N ≥ 8`).
-        check_native_lifted::<DualF<1, 0>>(&reg, raw, &label);
-        check_native_lifted::<DualF<2, 0>>(&reg, raw, &label);
-        check_native_lifted::<DualF<3, 0>>(&reg, raw, &label);
-        check_native_lifted::<DualF<7, 0>>(&reg, raw, &label);
-        check_native_lifted::<DualF<8, 0>>(&reg, raw, &label);
-        check_native_lifted::<DualF<12, 0>>(&reg, raw, &label);
-        // Second order: the packed η-Hessian payload, contiguous through `DualF`'s lanes.
-        check_native_lifted::<DualF<2, 3>>(&reg, raw, &label);
-        check_native_lifted::<DualF<4, 10>>(&reg, raw, &label);
-        check_native_lifted::<DualF<3, 6>>(&reg, raw, &label);
-        check_native_lifted::<DualF<8, 36>>(&reg, raw, &label);
     }
-}
-
-#[test]
-fn a_too_wide_dual_keeps_the_register_code() {
-    let prog = program("  d/dt(x1) = -A * x1 + 2\n  d/dt(x2) = A * x1 - B * x2\n  d/dt(x3) = C");
-    let reg = prog.reg.as_ref().expect("translatable");
-    // A payload past the lane cap has no native function.
-    assert!(!reg.has_native::<DualF<24, 300>>());
-    assert!(reg.has_native::<DualF<4, 10>>());
-}
-
-#[test]
-fn native_fd_columns_are_the_lane_evaluator_bit_for_bit() {
-    // The Rosenbrock Jacobian's batched columns: one native call per column against the
-    // lane evaluator, on the production closures, over programs with and without `TIME`.
-    let mut rng = Rng(0x94D0_49BB_1331_11EB);
-    let n_params = crate::types::MAX_PK_PARAMS + 2;
-    let (mut checked, mut split) = (0, 0);
-    for case in 0..120 {
-        let odes = random_odes(&mut rng);
-        let prog = program(&odes);
-        let Some(columns) = prog.columns.as_ref() else {
-            continue;
-        };
-        assert!(
-            prog.reg.as_ref().is_some_and(|r| r.has_native_f64()),
-            "case {case}"
-        );
-        let u = seed_values(&mut rng, 3);
-        let p = seed_values(&mut rng, n_params);
-        let t = rng.unit() * 5.0;
-        // Every state perturbed once, one twice with a negative step, past one lane pass.
-        let cols: Vec<(usize, f64)> =
-            [(0, 1e-7), (1, 2.5e-8), (2, 1e-6), (1, -3e-7), (0, 0.0)].repeat(2);
-        let mut want = vec![7.0; cols.len() * 3];
-        let mut got = vec![7.0; cols.len() * 3];
-        super::RHS_JIT_DISABLED.with(|c| c.set(true));
-        let ok_want = columns(&u, &p, t, &cols, &mut want);
-        super::RHS_JIT_DISABLED.with(|c| c.set(false));
-        let ok_got = columns(&u, &p, t, &cols, &mut got);
-        if !ok_want && ok_got {
-            // The lanes decline a batch whose columns take different arms of an `if`; the
-            // native arm runs each column alone, as the caller's per-column fallback would.
-            // Each is the RHS at its own point (the register code, bit for bit the
-            // interpreter).
-            let reg = prog.reg.as_ref().expect("native");
-            let seeds = prog.binding.f64_seeds(&p, t);
-            for (c, &(j, d)) in cols.iter().enumerate() {
-                let mut x = u.clone();
-                x[j] = u[j] + d;
-                let mut du = vec![0.0; 3];
-                let mut regs = vec![0.0; reg.n_regs()];
-                super::RHS_JIT_DISABLED.with(|c| c.set(true));
-                reg.run(&x, &p, &seeds, &mut du, &mut regs);
-                super::RHS_JIT_DISABLED.with(|c| c.set(false));
-                assert!(
-                    bits_eq(&du, &got[c * 3..(c + 1) * 3]),
-                    "case {case}, column {c}:\n{odes}\nscalar {du:?}\nnative {got:?}"
-                );
-            }
-            split += 1;
-            continue;
-        }
-        assert_eq!(ok_want, ok_got, "case {case}:\n{odes}");
-        assert!(
-            bits_eq(&want, &got),
-            "case {case}:\n{odes}\nlanes {want:?}\nnative {got:?}"
-        );
-        checked += usize::from(ok_want);
-    }
-    assert!(
-        checked > 100,
-        "only {checked} programs ran the lane evaluator"
-    );
-    assert!(split > 0, "no batch split on an `if`");
-}
-
-/// A first-order type that records a reverse tape keeps the hoisted interpreter: with the
-/// hoist, a lifted parameter-only value (`K = A / B` here) is recorded once per recording
-/// and reused by every later call; compiled, it would be recorded again per call — a longer
-/// tape whose sweep sums the same adjoints in another order. Three RHS calls on one
-/// recording, production program vs the same model parsed with the compiler off: the same
-/// tape length, the same output nodes and the same adjoints, bit for bit.
-#[test]
-fn a_taped_first_order_rhs_records_the_hoisted_tape() {
-    use crate::sens::rtape::{rinput, rsweep, rtape_len, rtape_reset, R};
-    let odes = "  K = A / B\n  d/dt(x1) = -K * x1\n  d/dt(x2) = K * x1 - C * x2\n  d/dt(x3) = x2";
-    let production = program(odes);
-    let interpreted = {
-        let _off = super::super::RhsRegcodeOff::enter();
-        program(odes)
-    };
-    assert!(production.reg.is_some() && interpreted.reg.is_none());
-    assert!(production.hoist.is_some(), "the fixture must lift `A / B`");
-    let record = |prog: &OdeRhsProgram| -> (usize, Vec<(u64, u32)>, Vec<u64>) {
-        rtape_reset();
-        let n_params = crate::types::MAX_PK_PARAMS + 2;
-        let params: Vec<R> = (0..n_params).map(|i| rinput(0.5 + i as f64)).collect();
-        let mut outs = Vec::new();
-        let (mut vars, mut stack) = (Vec::new(), Vec::new());
-        for (k, t) in [0.5, 1.0, 2.0].into_iter().enumerate() {
-            let u: Vec<R> = (0..3).map(|i| rinput(1.0 + (i + k) as f64)).collect();
-            let mut du = vec![R::c(0.0); 3];
-            prog.eval_rhs_g::<R>(
-                &u,
-                &params,
-                t,
-                t,
-                R::c(t),
-                R::c(0.0),
-                &mut du,
-                &mut vars,
-                &mut stack,
-            );
-            outs.extend(du);
-        }
-        let len = rtape_len();
-        let sum = outs.iter().fold(R::c(0.0), |a, &b| a + b);
-        let adj = rsweep::<1>(&[sum]);
-        (
-            len,
-            outs.iter().map(|o| (o.v.to_bits(), o.i)).collect(),
-            adj.iter().map(|a| a.to_bits()).collect(),
-        )
-    };
-    let want = record(&interpreted);
-    let got = record(&production);
-    assert_eq!(want.0, got.0, "tape length");
-    assert_eq!(want.1, got.1, "output values and nodes");
-    assert_eq!(want.2, got.2, "adjoints");
 }
 
 /// The reverse pass of one program over one layout, two ways: interpreted, and as
@@ -843,87 +622,6 @@ fn forward_over_reverse_is_the_hessian_on_random_programs() {
     eprintln!("forward-over-reverse vs forward-over-forward: worst relative difference {worst:e}");
 }
 
-/// `columns` over native and lane evaluator: the same acceptance, the same bits.
-fn columns_agree(
-    prog: &OdeRhsProgram,
-    u: &[f64],
-    p: &[f64],
-    cols: &[(usize, f64)],
-    out_len: usize,
-) -> (bool, Vec<f64>) {
-    let columns = prog.columns.as_ref().expect("lane-evaluable");
-    let mut want = vec![7.0; out_len];
-    let mut got = vec![7.0; out_len];
-    super::RHS_JIT_DISABLED.with(|c| c.set(true));
-    let ok_want = columns(u, p, 0.5, cols, &mut want);
-    super::RHS_JIT_DISABLED.with(|c| c.set(false));
-    let ok_got = columns(u, p, 0.5, cols, &mut got);
-    assert_eq!(ok_want, ok_got, "cols {cols:?}, out {out_len}");
-    assert!(
-        bits_eq(&want, &got),
-        "lanes {want:?}
-native {got:?}"
-    );
-    (ok_got, got)
-}
-
-#[test]
-fn native_columns_decline_where_the_lane_evaluator_declines() {
-    let prog = program(&chain_odes(3));
-    assert!(prog.reg.as_ref().is_some_and(|r| r.has_native_f64()));
-    let p = vec![0.7; crate::types::MAX_PK_PARAMS + 2];
-    let u = [1.0, 2.0, 3.0];
-    let cols = [(0, 1e-7), (2, 1e-6)];
-    // The accepted case, as the control: both run, and agree.
-    assert!(columns_agree(&prog, &u, &p, &cols, 6).0);
-    // `out` shorter than the columns need.
-    assert!(!columns_agree(&prog, &u, &p, &cols, 5).0);
-    // A column past the states, though inside a longer `u`: the lane evaluator reads only
-    // the first `state_count` states, and so does the native arm.
-    let long = [1.0, 2.0, 3.0, 4.0, 5.0];
-    assert!(!columns_agree(&prog, &long, &p, &[(3, 1e-7)], 3).0);
-    // And a longer `u` with in-range columns is fine.
-    assert!(columns_agree(&prog, &long, &p, &cols, 6).0);
-}
-
-#[test]
-fn native_columns_handle_more_states_than_the_stack_buffer() {
-    // 40 states: `u` outgrows the 32-element stack copy and takes the heap one.
-    let n = 40;
-    let prog = program_states(n, &chain_odes(n));
-    assert!(prog.reg.as_ref().is_some_and(|r| r.has_native_f64()));
-    let p = vec![0.7; crate::types::MAX_PK_PARAMS + 2];
-    let u: Vec<f64> = (0..n).map(|i| 1.0 + i as f64 / 7.0).collect();
-    let cols = [(0, 1e-7), (31, 2e-7), (32, -1e-7), (n - 1, 3e-7)];
-    let (ok, out) = columns_agree(&prog, &u, &p, &cols, cols.len() * n);
-    assert!(ok);
-    assert!(out.iter().all(|x| x.is_finite() && *x != 7.0));
-}
-
-#[test]
-fn a_large_native_frame_runs_and_matches_the_register_code() {
-    // 120 states at 8 lanes keep ~7.7 KB of prologue loads live: a frame past one page, which
-    // needs stack probes on Windows (`enable_probestack`). Run it, and compare bits.
-    let n = 120;
-    let prog = program_states(n, &chain_odes(n));
-    let reg = prog.reg.as_ref().expect("translatable");
-    let lift = |v: f64| DualF::<7, 0>::free(v, [0.25, -0.5, 0.0, 1.5, -0.0, 2.0, 0.125], []);
-    let u: Vec<_> = (0..n).map(|i| lift(1.0 + i as f64 / 9.0)).collect();
-    let p: Vec<_> = (0..crate::types::MAX_PK_PARAMS + 2)
-        .map(|i| lift(0.5 + i as f64))
-        .collect();
-    let s = [lift(0.0), lift(0.0), lift(0.0), lift(f64::EPSILON)];
-    assert!(reg.has_native::<DualF<7, 0>>());
-    let mut want = vec![DualF::<7, 0>::constant(9.0); n];
-    let mut got = want.clone();
-    let mut regs = vec![DualF::<7, 0>::constant(0.0); reg.n_regs()];
-    super::RHS_JIT_DISABLED.with(|c| c.set(true));
-    reg.run(&u, &p, &s, &mut want, &mut regs);
-    super::RHS_JIT_DISABLED.with(|c| c.set(false));
-    reg.run(&u, &p, &s, &mut got, &mut regs);
-    assert!(bits_eq(&want, &got));
-}
-
 #[test]
 fn the_jit_switch_reads_the_environment_value() {
     use super::jit::enabled_by;
@@ -953,80 +651,12 @@ fn rhs_at<T: VmNum>(
     du
 }
 
-/// A taped type records an `if`'s live arm and nothing of the other, exactly as the
-/// interpreter does: the production program (compiled) against the same model parsed with
-/// the compiler off, on calls that take each arm of both `if`s — the same tape length, output
-/// nodes and adjoints, bit for bit. Recording both arms would lengthen the tape. The second
-/// `if` is a right operand whose else arm ends in a literal, so on that path the literal fuses
-/// with the `*` after the `if` and on the other the `*` runs unfused (`conditional`).
-#[test]
-fn an_if_records_only_its_live_arm_on_a_tape() {
-    use crate::sens::rtape::{rinput, rsweep, rtape_len, rtape_reset, R};
-    let odes = "  d/dt(x1) = if (x1 < A) x1 * B else exp(x1) * C
-  d/dt(x2) = x1 * (if (x2 > 1) B else 2)
-  d/dt(x3) = x2";
-    let production = program(odes);
-    let interpreted = {
-        let _off = super::super::RhsRegcodeOff::enter();
-        program(odes)
-    };
-    assert!(production.reg.is_some() && interpreted.reg.is_none());
-    // `eval_rhs_g` would keep the hoisted interpreter for `R` otherwise.
-    assert!(production.hoist.is_none(), "the fixture must lift nothing");
-    // `A` is params slot `indiv_to_params_slot[0]`, between 0.5 and 11.5: `x1` = 0.1 and 50
-    // straddle it, `x2` = 0.5 and 2 straddle 1.
-    let points = [[0.1, 0.5], [50.0, 2.0], [0.1, 2.0], [50.0, 0.5]];
-    let record = |prog: &OdeRhsProgram, at: [f64; 2]| -> (usize, Vec<(u64, u32)>, Vec<u64>) {
-        rtape_reset();
-        let n_params = crate::types::MAX_PK_PARAMS + 2;
-        let params: Vec<R> = (0..n_params).map(|i| rinput(0.5 + i as f64)).collect();
-        let u = [rinput(at[0]), rinput(at[1]), rinput(3.0)];
-        let mut du = vec![R::c(0.0); 3];
-        let (mut vars, mut stack) = (Vec::new(), Vec::new());
-        prog.eval_rhs_g::<R>(
-            &u,
-            &params,
-            1.0,
-            1.0,
-            R::c(1.0),
-            R::c(0.0),
-            &mut du,
-            &mut vars,
-            &mut stack,
-        );
-        let len = rtape_len();
-        let sum = du.iter().fold(R::c(0.0), |a, &b| a + b);
-        let adj = rsweep::<1>(&[sum]);
-        (
-            len,
-            du.iter().map(|o| (o.v.to_bits(), o.i)).collect(),
-            adj.iter().map(|a| a.to_bits()).collect(),
-        )
-    };
-    let mut lens = Vec::new();
-    for at in points {
-        let want = record(&interpreted, at);
-        let got = record(&production, at);
-        assert_eq!(want.0, got.0, "{at:?}: tape length");
-        assert_eq!(want.1, got.1, "{at:?}: output values and nodes");
-        assert_eq!(want.2, got.2, "{at:?}: adjoints");
-        lens.push(got.0);
-    }
-    // The arms differ in what they record, so the points do reach both arms.
-    lens.sort_unstable();
-    lens.dedup();
-    assert!(
-        lens.len() > 1,
-        "every point recorded the same tape: {lens:?}"
-    );
-}
-
 /// The native code computes both arms of an `if`, so a dead arm's `NaN` is in the forward
 /// values; its derivatives must still reach no input. `(x1 − 2)^B` at `x1 = 1.5` is a negative
 /// base under a differentiated exponent — `NaN` — and the condition kills it. Over `f64`, a
 /// first-order and a second-order layout: every input adjoint of the compiled reverse pass is
 /// finite, `B`'s (read only in the dead arm) is exactly zero, and the native reverse pass is
-/// the interpreted one bit for bit. The same through a taped block (`DualF`'s whole-call
+/// the interpreted one bit for bit. The same through a taped block (the whole-call
 /// recording), whose reverse rule is this reverse pass.
 #[test]
 fn a_dead_arm_leaks_no_nan_into_the_reverse_pass() {
@@ -1044,9 +674,9 @@ fn a_dead_arm_leaks_no_nan_into_the_reverse_pass() {
     let s0 = [1.75, 0.0, 0.0, f64::EPSILON];
     let mut du = vec![0.0; 3];
     let mut regs = vec![0.0; dead.reg.as_ref().unwrap().n_regs()];
-    let lifted = |v: f64| <DualF<1, 0> as PkNum>::var(v, 0);
-    let mut du_d = vec![DualF::<1, 0>::constant(0.0); 3];
-    let mut regs_d = vec![DualF::<1, 0>::constant(0.0); regs.len()];
+    let lifted = |v: f64| <Dual2<1> as PkNum>::var(v, 0);
+    let mut du_d = vec![Dual2::<1>::constant(0.0); 3];
+    let mut regs_d = vec![Dual2::<1>::constant(0.0); regs.len()];
     let p_d: Vec<_> = p0.iter().map(|&v| lifted(v)).collect();
     dead.reg.as_ref().unwrap().run(
         &[lifted(1.5), lifted(1.0), lifted(1.0)],
@@ -1060,7 +690,7 @@ fn a_dead_arm_leaks_no_nan_into_the_reverse_pass() {
         .unwrap()
         .run(&[1.5, 1.0, 1.0], &p0, &s0, &mut du, &mut regs);
     assert!(
-        du[0].is_nan() && du_d[0].v.is_nan(),
+        du[0].is_nan() && du_d[0].value.is_nan(),
         "the dead arm must be NaN"
     );
 
@@ -1131,13 +761,11 @@ fn a_dead_arm_leaks_no_nan_into_the_reverse_pass() {
 }
 
 /// Exact derivatives across an `if` against central finite differences of the `f64` program,
-/// on both sides of every condition, through the register code (`Dual2`, the full Hessian)
-/// and the native code (`DualF`, the packed one). `C` is read only by the conditions: its
+/// on both sides of every condition, through the register code over `Dual2` (the full Hessian). `C` is read only by the conditions: its
 /// derivatives are exactly zero, as the branch-wise RHS has none (#2649 is the integration's
 /// concern, not the RHS's), and the differences agree since no step crosses a switch.
 #[test]
 fn derivatives_across_an_if_match_finite_differences() {
-    use crate::sens::dual2::Dual2;
     let odes = "  d/dt(x1) = if (x1 * C < A) B * x1 * x1 else exp(B) * x2
   d/dt(x2) = -x2 * (if (x1 > C && x2 <= 1.5) A else B * B)
   d/dt(x3) = min(x1, x2) * A + max(x3, 1) * B";
@@ -1167,7 +795,6 @@ fn derivatives_across_an_if_match_finite_differences() {
     for x in &points {
         let y = f(x);
         let x2 = rhs_at(&prog, reg, x, &|v, i| <Dual2<6> as PkNum>::var(v, i));
-        let xf = rhs_at(&prog, reg, x, &|v, i| <DualF<6, 21> as PkNum>::var(v, i));
         let step = |d: &[(usize, f64)]| {
             let mut z = *x;
             for &(i, e) in d {
@@ -1177,15 +804,13 @@ fn derivatives_across_an_if_match_finite_differences() {
         };
         for o in 0..3 {
             assert_eq!(x2[o].value.to_bits(), y[o].to_bits(), "value, Dual2");
-            assert_eq!(xf[o].v.to_bits(), y[o].to_bits(), "value, DualF");
             for i in 0..6 {
                 let fd = (step(&[(i, h)])[o] - step(&[(i, -h)])[o]) / (2.0 * h);
-                for (got, which) in [(x2[o].grad[i], "Dual2"), (xf[o].g[i], "DualF")] {
-                    assert!(got.is_finite() && fd.is_finite());
-                    worst_g = worst_g.max((got - fd).abs() / (1.0 + fd.abs()));
-                    if i == 5 {
-                        assert_eq!(got, 0.0, "{which}: ∂/∂C at {x:?}");
-                    }
+                let got = x2[o].grad[i];
+                assert!(got.is_finite() && fd.is_finite());
+                worst_g = worst_g.max((got - fd).abs() / (1.0 + fd.abs()));
+                if i == 5 {
+                    assert_eq!(got, 0.0, "∂/∂C at {x:?}");
                 }
                 for j in 0..=i {
                     let fd = (step(&[(i, h2), (j, h2)])[o]
@@ -1193,13 +818,11 @@ fn derivatives_across_an_if_match_finite_differences() {
                         - step(&[(i, -h2), (j, h2)])[o]
                         + step(&[(i, -h2), (j, -h2)])[o])
                         / (4.0 * h2 * h2);
-                    let packed = xf[o].h[i * (i + 1) / 2 + j];
-                    for got in [x2[o].hess[i][j], packed] {
-                        assert!(got.is_finite() && fd.is_finite());
-                        worst_h = worst_h.max((got - fd).abs() / (1.0 + fd.abs()));
-                        if i == 5 {
-                            assert_eq!(got, 0.0, "∂²/∂C∂· at {x:?}");
-                        }
+                    let got = x2[o].hess[i][j];
+                    assert!(got.is_finite() && fd.is_finite());
+                    worst_h = worst_h.max((got - fd).abs() / (1.0 + fd.abs()));
+                    if i == 5 {
+                        assert_eq!(got, 0.0, "∂²/∂C∂· at {x:?}");
                     }
                 }
             }
@@ -1488,4 +1111,48 @@ fn a_compiled_rhs_without_native_code_reports_the_register_code() {
         RhsConstruct::Function("sqrt"),
         RhsConstruct::Function(_)
     ));
+}
+
+/// The native tangent layout (`OdeRhsProgram::native_jacobian`, one call) against the jet
+/// fallback (`jet_jacobian`, one `DualT<1>` pass per direction), on random programs with and
+/// without `TIME`, with the clock direction and without. Measured worst relative difference:
+/// see the `eprintln`; the two evaluate the same operations in the same order, so the bound
+/// is tight.
+#[test]
+fn the_native_tangent_jacobian_matches_the_jet_fallback() {
+    let mut rng = Rng(0x2F0A_6C1D_83B7_55E1);
+    let n_params = crate::types::MAX_PK_PARAMS + 2;
+    let (mut checked, mut worst) = (0, 0.0_f64);
+    for case in 0..120 {
+        let odes = random_odes(&mut rng);
+        let prog = program(&odes);
+        let u = seed_values(&mut rng, 3);
+        let p = seed_values(&mut rng, n_params);
+        let t = rng.unit() * 5.0;
+        for clock in [false, true] {
+            let Some(native) = prog.program_jacobian(clock) else {
+                continue;
+            };
+            let (mut a, mut at) = (vec![0.0; 9], vec![0.0; 3]);
+            let (mut b, mut bt) = (vec![0.0; 9], vec![0.0; 3]);
+            assert!(native.eval(&u, &p, t, &mut a, &mut at), "case {case}");
+            crate::ode::predictions::jet_jacobian(&prog, &u, &p, t, clock, &mut b, &mut bt);
+            for (x, y) in a.iter().chain(&at).zip(b.iter().chain(&bt)) {
+                if x.is_nan() && y.is_nan() {
+                    continue;
+                }
+                assert!(
+                    x.is_finite() == y.is_finite(),
+                    "case {case}:\n{odes}\n{x} vs {y}"
+                );
+                if x.is_finite() {
+                    worst = worst.max((x - y).abs() / y.abs().max(1.0));
+                }
+            }
+            checked += 1;
+        }
+    }
+    eprintln!("native vs jet tangent Jacobian: worst relative difference {worst:e}");
+    assert!(checked > 100, "only {checked} native cases");
+    assert!(worst < 1e-12, "{worst:e}");
 }

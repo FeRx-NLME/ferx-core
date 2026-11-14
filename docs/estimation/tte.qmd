@@ -272,7 +272,7 @@ in θ, and it does not depend on η's units: `logit = TH + 1000 * ETA` with
 `ω = 0.25e-6` and `logit = TH + ETA` with `ω = 0.25` give the same FOCEI objective to
 9e-16. Against a Richardson-extrapolated stencil of the objective's own value, the exact
 η-Hessians agree to 2e-9 relative on every endpoint, record kind, recurrence and
-boundary value tested (`src/stats/non_gaussian_eta_hessian_tests.rs`), up to 48 η.
+boundary value tested (`src/stats/non_gaussian_eta_hessian_tests.rs`), at any η count.
 
 ### Finite-difference fallback
 
@@ -280,8 +280,7 @@ The duals do not reach every endpoint. These keep a 4-point central-difference
 stencil:
 
 - an expression ferx cannot compile to a dual program;
-- a drug-driven hazard on a subject the dual walk declines (a steady-state dose);
-- a model with more than 48 η.
+- a drug-driven hazard on a subject the dual walk declines (a steady-state dose).
 
 The step on each η axis is `2.4e-3` conditional posterior standard deviations,
 `1/√((Ω⁻¹)_jj + Ĥ_jj)`. The stencil moves one η with the others held, so the prior

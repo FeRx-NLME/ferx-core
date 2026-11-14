@@ -40,7 +40,7 @@ use cranelift_module::{default_libcall_names, Linkage, Module};
 use std::sync::{Arc, OnceLock};
 
 /// `fn(u, params, seeds, du)`; every pointer is to elements of one layout's lanes.
-type RhsFn = unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64);
+pub(super) type RhsFn = unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64);
 /// The hoisted pair ([`HoistPlan`]): `prep(params, seeds, cache)` writes the
 /// parameter-only values, `main(u, params, seeds, du, cache)` is the RHS reading them.
 pub(super) type PrepFn = unsafe extern "C" fn(*const f64, *const f64, *mut f64);
@@ -194,6 +194,16 @@ enum Part<'a> {
 /// The program over `layout` as scalar code, whole or one half of the hoisted pair.
 fn emit(code: &[Flat], n_regs: usize, layout: Layout, part: Part<'_>) -> Func {
     match part {
+        Part::Full if layout.tan > 0 => {
+            // Forward tangents along the inputs, the seeds' included (the clock).
+            let base = layout.base();
+            ir::tangent_packed(
+                &ir::forward(code, n_regs, base),
+                layout.tan as usize,
+                base.lanes(),
+                true,
+            )
+        }
         Part::Full => ir::forward(code, n_regs, layout),
         // `prep(params, seeds, cache)`: no instruction it runs reads `u` or writes `du`.
         Part::Prep(plan) => {
@@ -317,7 +327,7 @@ fn compile(funcs: &[(&str, &Func)]) -> Option<(JITModule, Vec<*const u8>)> {
     compile_with(funcs, MAX_INSTS, FAST_ALLOC_INSTS)
 }
 
-/// [`compile`] with its own size limits (#2786 prototype: a whole subject's recording).
+/// [`compile`] with its own size limits (a whole subject's plan, #2786).
 pub(super) fn compile_with(
     funcs: &[(&str, &Func)],
     max_insts: usize,

@@ -1969,6 +1969,7 @@ fn make_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -2310,6 +2311,7 @@ fn test_outer_ad_gradient_block_omega() {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -2807,6 +2809,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -6579,9 +6582,9 @@ mod outer_fd_fallback {
     }
 
     /// The analytic subject, and a twin whose bolus is replaced by a steady-state
-    /// infusion into the depot. An oral infusion routes the subject to the event walk,
-    /// and the walk declines an SS infusion under a lag time
-    /// (`ss_lagtime_walk_unsupported`), so the twin falls back while its sibling stays exact.
+    /// infusion into the depot, every plan of which fails (`kernel_jit::fail_plans_of`; no
+    /// regular-path shape declines since #2786), so the twin falls back while its sibling
+    /// stays exact.
     fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
         let model =
             crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
@@ -6592,6 +6595,7 @@ mod outer_fd_fallback {
         let mut declining = pop.subjects[0].clone();
         declining.id = "OUT_OF_SCOPE".into();
         declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0)];
+        crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&declining);
         (model, analytic, declining)
     }
 
@@ -6788,9 +6792,9 @@ mod outer_fd_fallback {
         let pop = mk_pop(vec![analytic, declining]);
         // Whole sentences, so deleting any clause of either one reddens a cell.
         const STRUCT: &str = "used reconverged finite-difference outer gradients because \
-             no analytic recorder serves them: their data shape is outside the recorders' scope \
-             at every parameter point (for example a steady-state infusion under a lag time on \
-             the event walk). Those gradients include the EBE-response term but are slower.";
+             no analytic recorder serves them: recording their exact derivatives failed, as it \
+             will at every parameter point. Those gradients include the EBE-response term but \
+             are slower.";
         const CORRECT: &str = "include the EBE-response term but are slower";
         const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
              term the analytic gradient carries. If the fit stalls, \
@@ -8938,10 +8942,11 @@ fn predicted_remaining_gain_is_withheld_when_the_exact_path_declines_a_segment()
     );
 }
 
-/// #2143 review: an objective the decrement cannot be formed for skips the tight re-solve
+/// #2143 review: a model the decrement cannot be formed for skips the tight re-solve
 /// instead of paying for it (up to a 100× step budget) and then returning `None`. Both
-/// sides on one integrated fixture, the #1934 model's ODE twin under rk45: FOCEI starts one
-/// re-solve and forms a decrement, AGQ starts none and forms none.
+/// sides on one integrated fixture, the #1934 model's ODE twin under rk45: FOCEI and AGQ
+/// each start one re-solve and form a decrement; the same model under `gradient = fd`
+/// starts none and forms none.
 #[test]
 fn predicted_remaining_gain_skips_the_tight_re_solve_out_of_scope() {
     use crate::parser::model_parser::parse_model_string;
@@ -8949,26 +8954,35 @@ fn predicted_remaining_gain_skips_the_tight_re_solve_out_of_scope() {
     use std::path::Path;
 
     let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
-    let m = parse_model_string(&issue_1934_ode_model(
-        6.735588,
-        16.155540,
-        0.011638,
-        23.488333,
-        [0.061883, -0.018713, 0.101651],
-        0.043717,
-        "rk45",
-    ))
-    .expect("fixture parses");
+    let parse = || {
+        parse_model_string(&issue_1934_ode_model(
+            6.735588,
+            16.155540,
+            0.011638,
+            23.488333,
+            [0.061883, -0.018713, 0.101651],
+            0.043717,
+            "rk45",
+        ))
+        .expect("fixture parses")
+    };
+    let m = parse();
     let opts = focei_options();
     let (x, ehs, _, kappas) = ebes_at(&m, &m.default_params, &pop, &opts);
     let agq = FitOptions {
         n_agq: 3,
         ..focei_options()
     };
+    let mut fd = parse();
+    fd.gradient_method = crate::types::GradientMethod::Fd;
     let resolves = || super::TIGHT_RESOLVES.with(|n| n.get());
-    for (label, o, in_scope) in [("FOCEI", &opts, true), ("AGQ", &agq, false)] {
+    for (label, model, o, in_scope) in [
+        ("FOCEI", &m, &opts, true),
+        ("AGQ", &m, &agq, true),
+        ("gradient = fd", &fd, &opts, false),
+    ] {
         let before = resolves();
-        let got = gain_with(&m, &pop, &m.default_params, &x, &ehs, &kappas, o);
+        let got = gain_with(model, &pop, &m.default_params, &x, &ehs, &kappas, o);
         assert_eq!(got.is_some(), in_scope, "{label}: {got:?}");
         assert_eq!(
             resolves() - before,
@@ -9233,79 +9247,115 @@ fn predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms() {
     );
 }
 
-/// Where no decrement is formed, both sides of each exclusion: AGQ, whose objective is not
-/// the one `subject_analytic_outer_gradient` differentiates, and a mixture. An ODE model
-/// is no longer one (#2001): see `predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms`
-/// and `predicted_remaining_gain_on_an_integrated_ode_model_is_the_exact_one`.
+/// The decrement serves the quadrature and mixture objectives too, each from its own exact
+/// per-subject gradients: twice their sum is the optimizer's gradient of that objective — the
+/// AGQ gradient (`agq_population_gradient`) and the mixture's (`mixture_gradient_with_modes`)
+/// — on every free coordinate, and the decrement formed from them is finite. A regression to
+/// FOCEI rows on an AGQ fit, or to one class's marginal on a mixture, misses the sum; one that
+/// withholds the rows again leaves the decrement `None`.
 #[test]
-fn predicted_remaining_gain_is_withheld_from_inexact_objectives() {
+fn per_subject_outer_gradients_serve_agq_and_mixtures() {
     use crate::parser::model_parser::parse_model_file;
     use crate::read_nonmem_csv;
     use std::path::Path;
 
-    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
-    let opts = focei_options();
-    let closed = parse_model_file(Path::new("examples/two_cpt_iv.ferx")).expect("parses");
-    assert!(gain_at(&closed, &pop, &opts).is_some(), "closed form");
+    let sums_to = |label: &str, rows: &[Vec<f64>], want: &[f64], params: &ModelParameters| {
+        let fixed = packed_fixed_mask(params);
+        let mut free = 0;
+        for k in (0..want.len()).filter(|&k| !fixed[k]) {
+            let ours = 2.0 * rows.iter().map(|g| g[k]).sum::<f64>();
+            assert!(ours.is_finite() && want[k].is_finite(), "{label} [{k}]");
+            assert!(
+                (ours - want[k]).abs() <= 1e-9 * (1.0 + want[k].abs()),
+                "{label} coordinate {k}: {ours} vs {}",
+                want[k]
+            );
+            free += usize::from(want[k] != 0.0);
+        }
+        assert!(
+            free > 1,
+            "{label}: the gradient must be live on several coordinates"
+        );
+    };
 
+    // AGQ (3 nodes, FOCEI anchor) on the closed-form two-compartment model.
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let model = parse_model_file(Path::new("examples/two_cpt_iv.ferx")).expect("parses");
+    let params = &model.default_params;
     let agq = FitOptions {
         n_agq: 3,
         ..focei_options()
     };
-    let (x, ehs, _, kappas) = ebes_at(&closed, &closed.default_params, &pop, &opts);
-    let per_subject = |o: &FitOptions| {
-        per_subject_outer_gradients(&closed, &pop, &closed.default_params, &x, &ehs, &kappas, o)
-    };
-    assert!(per_subject(&opts).is_some(), "FOCEI");
-    assert_eq!(per_subject(&agq), None, "AGQ");
+    let (x, ehs, _, kappas) = ebes_at(&model, params, &pop, &agq);
+    let rows = per_subject_outer_gradients(&model, &pop, params, &x, &ehs, &kappas, &agq)
+        .expect("AGQ rows");
+    let want = crate::estimation::agq::agq_population_gradient(
+        &model,
+        &pop,
+        params,
+        params,
+        &x,
+        &ehs,
+        &kappas,
+        3,
+        agq.hessian_anchor(),
+    )
+    .expect("AGQ gradient");
+    sums_to("AGQ", &rows, &want, params);
+    let gain = gain_at(&model, &pop, &agq).expect("AGQ decrement");
+    assert!(gain.is_finite() && gain >= 0.0, "AGQ decrement {gain}");
 
-    // A mixture's objective is the class log-sum-exp, not one class's marginal: its
-    // twin with the `[mixture]` block removed is in scope, the mixture is not.
-    let mixture_src = |mixture: bool| {
-        format!(
-            "[parameters]
+    // A two-class mixture: the class log-sum-exp, every class at its own mode.
+    let mix = crate::parser::model_parser::parse_model_string(
+        "[parameters]
   theta TVCL1(1.2, 0.01, 100.0)
   theta TVCL2(2.5, 0.01, 100.0)
   theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_CL ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-{}
+  theta MIXL(0.3, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
 [individual_parameters]
-  CL = {}
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
   V  = TVV
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V)
 [error_model]
   DV ~ proportional(EPS)
 ",
-            if mixture {
-                "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n"
-            } else {
-                ""
-            },
-            if mixture {
-                "if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)"
-            } else {
-                "TVCL1 * exp(ETA_CL) * (TVCL2 / TVCL2) * exp(MIXL - MIXL)"
-            }
-        )
-    };
+    )
+    .expect("parses");
     let mix_pop = read_nonmem_csv(
         Path::new("tests/nonmem/mixture_iv.csv"),
         Some(&["WT"]),
         None,
     )
     .expect("mixture data loads");
-    for (mixture, want_some) in [(false, true), (true, false)] {
-        let m =
-            crate::parser::model_parser::parse_model_string(&mixture_src(mixture)).expect("parses");
-        assert_eq!(m.mixture.is_some(), mixture, "fixture's mixture status");
-        let (x, ehs, _, kappas) = ebes_at(&m, &m.default_params, &mix_pop, &opts);
-        let got =
-            per_subject_outer_gradients(&m, &mix_pop, &m.default_params, &x, &ehs, &kappas, &opts);
-        assert_eq!(got.is_some(), want_some, "mixture = {mixture}");
-    }
+    let opts = focei_options();
+    let params = &mix.default_params;
+    let (x, ehs, _, kappas) = ebes_at(&mix, params, &mix_pop, &opts);
+    let rows = per_subject_outer_gradients(&mix, &mix_pop, params, &x, &ehs, &kappas, &opts)
+        .expect("mixture rows");
+    let (eval, modes) =
+        crate::estimation::mixture::mixture_ofv_with_modes(&mix, &mix_pop, params, &opts, None);
+    assert!(
+        eval.pmix.iter().any(|p| p.iter().all(|&w| w > 1e-3)),
+        "a subject must carry both classes, or the log-sum-exp is one class's marginal"
+    );
+    let want = crate::estimation::mixture::mixture_gradient_with_modes(
+        &mix,
+        &mix_pop,
+        params,
+        &opts,
+        &eval,
+        Some(&modes),
+    )
+    .expect("mixture gradient");
+    sums_to("mixture", &rows, &want, params);
+    let gain = gain_at(&mix, &mix_pop, &opts).expect("mixture decrement");
+    assert!(gain.is_finite() && gain >= 0.0, "mixture decrement {gain}");
 }
 
 /// `per_subject_outer_gradients` is the optimizer's own gradient taken apart: twice its

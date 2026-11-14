@@ -2,7 +2,7 @@
 //!
 //! A [`super::RhsRegProgram`] runs over `f64` or a dual whose value and derivative parts
 //! are all `f64`s ("lanes"). Every arithmetic operation of such a dual is itself a short
-//! sequence of `f64` operations — `DualV`'s `mul_body` is `g = a.g·b.v + a.v·b.g` per
+//! sequence of `f64` operations — the forward dual's `mul_body` is `g = a.g·b.v + a.v·b.g` per
 //! tangent, and so on — so the whole program, over a given [`Layout`], is a straight-line
 //! program over `f64`s: loads of the inputs' lanes, IEEE arithmetic, selects for the
 //! guards, calls for `exp`/`ln`/`powf`/`round`, and stores of the derivatives' lanes.
@@ -116,7 +116,7 @@ impl Shim1 {
             if K as usize > 4 {
                 f64::NAN
             } else {
-                crate::ode::linear::exprel_all(x)[K as usize]
+                crate::ode::linear::exprel_k(x, K as usize)
             }
         }
         extern "C" fn neg_sin(x: f64) -> f64 {
@@ -356,8 +356,7 @@ impl Func {
 
 pub(crate) use crate::sens::num::vm::Layout;
 
-/// The payload entries of row `k`: `(l, t)` with `h_t = ∂²/∂η_k∂η_l` (`vtape::hrange`/
-/// `hidx`).
+/// The payload entries of row `k`: `(l, t)` with `h_t = ∂²/∂η_k∂η_l`.
 pub(super) fn pairs(layout: &Layout, k: usize) -> Vec<(usize, usize)> {
     if layout.m == 0 {
         Vec::new()
@@ -377,18 +376,27 @@ const MAX_N: usize = 48;
 /// Every layout a native function can be built for has a fixed slot, so a call finds its
 /// function with one index instead of a lookup: `f64`, then the first-order duals, the
 /// packed second-order ones and the directional ones, each by direction count and by
-/// whether its constant operands run as full products (`wide`).
-pub(super) const N_SLOTS: usize = 2 * (1 + 3 * MAX_N);
+/// whether its constant operands run as full products (`wide`); the tangent layouts of `f64`
+/// (`Layout::tan`, the exact Jacobian) by direction count.
+pub(super) const N_SLOTS: usize = 2 * (1 + 4 * MAX_N);
 
 pub(super) const fn slot(l: Layout) -> Option<usize> {
     let n = l.n as usize;
     let base = if n == 0 {
-        if l.m == 0 {
-            0
-        } else {
+        let tan = l.tan as usize;
+        if l.m != 0 || tan > MAX_N {
             return None;
         }
+        // `f64` and its forward tangents (`tangent_packed`), after the dual slots.
+        if tan == 0 {
+            0
+        } else {
+            3 * MAX_N + tan
+        }
     } else {
+        if l.tan != 0 {
+            return None;
+        }
         if n > MAX_N || l.lanes() > MAX_LANES {
             return None;
         }
@@ -559,7 +567,7 @@ impl<'a> Lower<'a> {
             .collect()
     }
 
-    // ── The primitives, as `f64` and `DualV`'s untaped bodies compute them (`+` and `−`
+    // ── The primitives, as `f64` and the forward dual's untaped bodies compute them (`+` and `−`
     // are lane by lane, [`Alg`]'s). ──
 
     /// `mul_body`: `g_k = a.g_k·b.v + a.v·b.g_k`,
@@ -697,7 +705,7 @@ impl<'a> Lower<'a> {
         let e = self.ins(Inst::Call1(Shim1::Exp, a[0]));
         self.unary(a, e, e, Some(e))
     }
-    /// `DualV::ln`, unguarded: `h1 = 1/x`, `h2 = −1/(x·x)`.
+    /// the forward dual's `ln`, unguarded: `h1 = 1/x`, `h2 = −1/(x·x)`.
     fn ln(&mut self, a: &[V]) -> Lanes {
         let l = self.ins(Inst::Call1(Shim1::Ln, a[0]));
         if self.lanes() == 1 {
@@ -712,7 +720,7 @@ impl<'a> Lower<'a> {
         });
         self.unary(a, l, h1, h2)
     }
-    /// `DualV::sqrt`, unguarded: `h1 = 0.5/s`, `h2 = −0.25/(s·s·s)`.
+    /// the forward dual's `sqrt`, unguarded: `h1 = 0.5/s`, `h2 = −0.25/(s·s·s)`.
     fn sqrt(&mut self, a: &[V]) -> Lanes {
         let s = self.ins(Inst::Call1(Shim1::Sqrt, a[0]));
         if self.lanes() == 1 {
@@ -728,7 +736,7 @@ impl<'a> Lower<'a> {
         });
         self.unary(a, s, h1, h2)
     }
-    /// `DualV::inv_logit`: `u = 1/(1+e^{−x})`, `h1 = u(1−u)`, `h2 = h1(1−2u)`.
+    /// the forward dual's `inv_logit`: `u = 1/(1+e^{−x})`, `h1 = u(1−u)`, `h2 = h1(1−2u)`.
     fn inv_logit(&mut self, a: &[V]) -> Lanes {
         let one = self.k(1.0);
         let nx = self.ins(Inst::Neg(a[0]));
@@ -748,7 +756,7 @@ impl<'a> Lower<'a> {
         });
         self.unary(a, u, d1, h2)
     }
-    /// `DualV::logit`: `ln(x/(1−x))`, `h1 = 1/(x(1−x))`, `h2 = −(1−2x)·h1·h1`.
+    /// the forward dual's `logit`: `ln(x/(1−x))`, `h1 = 1/(x(1−x))`, `h2 = −(1−2x)·h1·h1`.
     fn logit(&mut self, a: &[V]) -> Lanes {
         let one = self.k(1.0);
         let x = a[0];
@@ -770,7 +778,7 @@ impl<'a> Lower<'a> {
         });
         self.unary(a, v, d1, h2)
     }
-    /// `DualV::cos`: `h1 = −sin x`, `h2 = −cos x`.
+    /// the forward dual's `cos`: `h1 = −sin x`, `h2 = −cos x`.
     fn cos(&mut self, a: &[V]) -> Lanes {
         let c = self.ins(Inst::Call1(Shim1::Cos, a[0]));
         if self.lanes() == 1 {
@@ -781,7 +789,7 @@ impl<'a> Lower<'a> {
         let h2 = (self.layout.m > 0).then(|| self.ins(Inst::Neg(c)));
         self.unary(a, c, h1, h2)
     }
-    /// `DualV::acos`: `s = 1 − x·x`, `h1 = −1/√s`, `h2 = −x/(s·√s)`.
+    /// the forward dual's `acos`: `s = 1 − x·x`, `h1 = −1/√s`, `h2 = −x/(s·√s)`.
     fn acos(&mut self, a: &[V]) -> Lanes {
         let v = self.ins(Inst::Call1(Shim1::Acos, a[0]));
         if self.lanes() == 1 {
@@ -800,7 +808,7 @@ impl<'a> Lower<'a> {
         });
         self.unary(a, v, h1, h2)
     }
-    /// `DualV::ln_gamma`: `h1 = ψ(x)`, `h2 = ψ'(x)`.
+    /// the forward dual's `ln_gamma`: `h1 = ψ(x)`, `h2 = ψ'(x)`.
     fn ln_gamma(&mut self, a: &[V]) -> Lanes {
         let v = self.ins(Inst::Call1(Shim1::LnGamma, a[0]));
         if self.lanes() == 1 {
@@ -873,7 +881,7 @@ impl<'a> Lower<'a> {
     fn neg(&mut self, a: &[V]) -> Lanes {
         a.iter().map(|&x| self.ins(Inst::Neg(x))).collect()
     }
-    /// `DualV::pow`: a constant exponent (no tangent) is `powf` lifted with
+    /// the forward dual's `pow`: a constant exponent (no tangent) is `powf` lifted with
     /// `h1 = n·powf(a, n − 1)` and `h2 = n·(n − 1)·powf(a, n − 2)` (the constant `powf(a,
     /// n)` at `a = 0`); otherwise `exp(e · ln a)`.
     ///
@@ -941,7 +949,7 @@ impl<'a> Lower<'a> {
         }
     }
     fn abs(&mut self, a: &[V]) -> Lanes {
-        // `f64::abs` on one lane; `DualV::abs`'s `v ≥ 0` select on a dual.
+        // `f64::abs` on one lane; the forward dual's `abs`'s `v ≥ 0` select on a dual.
         if self.lanes() == 1 {
             return vec![self.ins(Inst::Abs(a[0]))];
         }
@@ -965,7 +973,7 @@ pub(super) trait Alg {
     fn mul(&mut self, a: &[V], b: &[V]) -> Lanes;
     /// `a / b`, or the constant zero when `|b| < 1e-30` (`apply_binary_in`'s guard).
     fn guarded_div(&mut self, a: &[V], b: &[V]) -> Lanes;
-    /// `a / b` unguarded (`DualV::div_body`).
+    /// `a / b` unguarded (the forward dual's `div_body`).
     fn raw_div(&mut self, a: &[V], b: &[V]) -> Lanes;
     /// A constant right operand, as the type's `*_scalar_in`.
     fn scalar(&mut self, op: Arith, a: &[V], c: f64) -> Lanes;
@@ -1220,7 +1228,7 @@ pub(super) fn emit<A: Alg>(al: &mut A, f: &Flat, args: [u8; 4]) {
                 Unary::LnGamma => al.ln_gamma(&x),
                 Unary::Ln => {
                     // `guard_floor(1e-30)`: `f64::max` (a NaN floors) on one lane,
-                    // `DualV`'s `!(v ≥ lo)` → `constant(lo)` on a dual — the same test.
+                    // the forward dual's `!(v ≥ lo)` → `constant(lo)` on a dual — the same test.
                     let lo = al.k(1e-30);
                     let keep = al.ins(Inst::Cmp(Cc::Ge, x[0], lo));
                     let floor = al.constant(lo);
@@ -1326,6 +1334,65 @@ pub(super) fn forward(code: &[Flat], n_regs: usize, layout: Layout) -> Func {
     }
     l.reach(code.len());
     f
+}
+
+/// `f` with each repeated host call `Call1(s, x)` replaced by its first occurrence: a shim is a
+/// pure function, so the repeat is the same bits, and the derivative passes emit one each time
+/// they reach a primitive's next order (`exprel`'s `h₁` from the value's chain, again from its
+/// tangent). Only on a function with no `if` arms (every `live` is `None`, as [`tangent`] and
+/// [`reverse`] leave a folded chunk), so the first occurrence dominates the repeat; the
+/// returned `prefix` counts what stays of the first `prefix` instructions.
+pub(super) fn dedup_calls(f: &Func, prefix: usize) -> (Func, usize) {
+    if f.live.iter().any(Option::is_some) {
+        return (f.clone(), prefix);
+    }
+    let mut out = Func::new(f.n_args);
+    let mut map: Vec<V> = Vec::with_capacity(f.insts.len());
+    let mut seen: std::collections::HashMap<V, Vec<(Shim1, V)>> = Default::default();
+    let mut kept_prefix = 0;
+    for (i, &inst) in f.insts.iter().enumerate() {
+        let m = |x: V| map[x as usize];
+        let inst = match inst {
+            Inst::Load { .. } | Inst::Const(_) | Inst::Host(_) | Inst::HostOut(_) => inst,
+            Inst::Add(x, y) => Inst::Add(m(x), m(y)),
+            Inst::Sub(x, y) => Inst::Sub(m(x), m(y)),
+            Inst::Mul(x, y) => Inst::Mul(m(x), m(y)),
+            Inst::Div(x, y) => Inst::Div(m(x), m(y)),
+            Inst::Neg(x) => Inst::Neg(m(x)),
+            Inst::Abs(x) => Inst::Abs(m(x)),
+            Inst::Floor(x) => Inst::Floor(m(x)),
+            Inst::Ceil(x) => Inst::Ceil(m(x)),
+            Inst::Call1(s, x) => Inst::Call1(s, m(x)),
+            Inst::Powf(x, y) => Inst::Powf(m(x), m(y)),
+            Inst::Gamma { upper, i, j, a, x } => Inst::Gamma {
+                upper,
+                i,
+                j,
+                a: m(a),
+                x: m(x),
+            },
+            Inst::Cmp(c, x, y) => Inst::Cmp(c, m(x), m(y)),
+            Inst::And(x, y) => Inst::And(m(x), m(y)),
+            Inst::Or(x, y) => Inst::Or(m(x), m(y)),
+            Inst::Select(c, x, y) => Inst::Select(m(c), m(x), m(y)),
+            Inst::StopGrad(x) => Inst::StopGrad(m(x)),
+            Inst::HostArg(x) => Inst::HostArg(m(x)),
+            Inst::Store { arg, off, v } => Inst::Store { arg, off, v: m(v) },
+        };
+        if let Inst::Call1(s, x) = inst {
+            let at = seen.entry(x).or_default();
+            if let Some(&(_, v)) = at.iter().find(|(t, _)| *t == s) {
+                map.push(v);
+                continue;
+            }
+            at.push((s, out.insts.len() as V));
+        }
+        map.push(out.push(inst));
+        if i < prefix {
+            kept_prefix += 1;
+        }
+    }
+    (out, kept_prefix)
 }
 
 /// The reverse pass of a forward [`Func`] of `n` arguments: a function of `2n` arguments
@@ -1825,7 +1892,7 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
 /// the base function at `i·l(1+k) + lane` and its tangent along `j` at
 /// `i·l(1+k) + l + lane·k + j` (`Layout::tan`). Argument 2 (the literals, indexed by slot
 /// alone) has no tangents: their loads are zeros.
-pub(super) fn tangent_packed(f: &Func, k: usize, l: usize) -> Func {
+pub(super) fn tangent_packed(f: &Func, k: usize, l: usize, seed_tangents: bool) -> Func {
     let t = tangent(f, k);
     let n = f.n_args;
     let wl = (l * (1 + k)) as u32;
@@ -1845,7 +1912,7 @@ pub(super) fn tangent_packed(f: &Func, k: usize, l: usize) -> Func {
         .insts
         .iter()
         .map(|inst| match *inst {
-            Inst::Load { arg, off } if arg == n + 2 => {
+            Inst::Load { arg, off } if arg == n + 2 && !seed_tangents => {
                 let _ = off;
                 Inst::Const(0f64.to_bits())
             }

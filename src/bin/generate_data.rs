@@ -200,6 +200,7 @@ fn build_warfarin_model() -> CompiledModel {
         },
     );
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -345,6 +346,7 @@ fn generate_two_cpt_iv() {
         },
     );
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -485,6 +487,7 @@ fn generate_two_cpt_oral_cov() {
         },
     );
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -709,6 +712,7 @@ fn generate_mm_oral() {
         dose_attr_map: Default::default(),
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,

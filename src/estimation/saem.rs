@@ -1012,8 +1012,9 @@ fn sigma_log_se(
 ///   class draw as well as on η, and neither the stored-draw bookkeeping nor the
 ///   information block has been derived for them.
 /// * **M3**, a **TTE endpoint**, and a **`block_sigma` residual correlation** —
-///   the per-subject gradient takes the whole-NLL finite-difference path there
-///   and never forms a per-observation prediction derivative.
+///   the per-subject gradient is exact there (the kernel's data score), but the
+///   information block is built from per-observation `∂f/∂θ` rows and variance
+///   derivatives that are not derived for censored, hazard or dense-`R` rows.
 /// * **`[covariate_nn]`** — its θ derivatives are assembled in output space.
 /// * a **residual magnitude** (#484/#1029) — θ reaches the residual variance
 ///   through a channel the closed form does not carry.
@@ -3824,9 +3825,14 @@ pub(crate) fn mixture_mu_ref_means(
 /// recorder, so its scope (`recorder_in_scope`, read through the inner-gradient
 /// predicate) is the single structural gate: it admits analytical PK models and
 /// ODE models whose dual ODE walk serves the RHS and readout (#2639), and keeps
-/// out SDE (`[diffusion]`) and any ODE shape the recorder declines. There is no
-/// separate analytical-PK conjunct — a second gate rejecting the same inputs
-/// would leave one of them untestable.
+/// out any ODE shape the recorder declines. There is no separate analytical-PK
+/// conjunct — a second gate rejecting the same inputs would leave one of them
+/// untestable.
+///
+/// SDE (`[diffusion]`) is served: the refresh's gradient and curvature read the EKF
+/// variance rows off the subject's recording beside the predictions
+/// (`analytic_eta_nll_gradient`, `saem_imh::eta_jacobian_and_preds`), so they describe the
+/// likelihood SAEM samples.
 ///
 /// The remaining conditions are no IOV, no `iiv_on_ruv`, no mixture, and the
 /// shapes

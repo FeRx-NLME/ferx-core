@@ -1027,8 +1027,12 @@ mod fitted_population_1783 {
     }
 
     fn iov(rule: &str) -> FileFit {
+        iov_at(rule, MAXITER)
+    }
+
+    fn iov_at(rule: &str, maxiter: usize) -> FileFit {
         let to =
-            format!("{rule}\n  covariance = true\n  maxiter = {MAXITER}\n  checkpoint = false");
+            format!("{rule}\n  covariance = true\n  maxiter = {maxiter}\n  checkpoint = false");
         run_fit(
             "examples/warfarin_iov.ferx",
             "data/warfarin_iov.csv",
@@ -1041,6 +1045,16 @@ mod fitted_population_1783 {
     fn dose() -> &'static FileFit {
         static F: OnceLock<FileFit> = OnceLock::new();
         F.get_or_init(|| iov("iov_occasion = dose"))
+    }
+
+    /// `dose` run to convergence (T2). The `MAXITER` fit stops mid-descent, where the SIR
+    /// proposal is only as good as that one point: the seed-1 ESS there swings 19-39 with
+    /// the arithmetic of the gradient (measured on #2786), so it cannot carry an ESS floor.
+    /// Converged at 6 iterations (OFV 205.0903, the same to 9 places at 10 and 40), the ESS
+    /// is 54-140 over seeds 1-4.
+    fn dose_converged() -> &'static FileFit {
+        static F: OnceLock<FileFit> = OnceLock::new();
+        F.get_or_init(|| iov_at("iov_occasion = dose", 10))
     }
 
     /// The control: the same occasions from the data's `OCC` column.
@@ -1207,7 +1221,7 @@ mod fitted_population_1783 {
     /// occasion and the ESS collapses (measured on #1783: 1.0, CI width 0).
     #[test]
     fn derived_rule_run_sir_matches_across_cells() {
-        let f = dose();
+        let f = dose_converged();
         let opts = sir_opts(&f.opts);
         let runs: Vec<(FitResult, &str)> = cells(f)
             .into_iter()

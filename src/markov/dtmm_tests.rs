@@ -677,7 +677,8 @@ fn laplace_fold_takes_the_exact_curvature_at_a_boundary_mode() {
     let repelled = fold(&unrecorded);
     assert!(
         repelled >= 1e20,
-        "without a program the term does not record and repels: {repelled}"
+        "without a program the FD fallback's stencil straddles the boundary, so the \
+         curvature is unmeasurable and the subject repels: {repelled}"
     );
 }
 

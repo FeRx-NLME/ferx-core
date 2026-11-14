@@ -89,6 +89,13 @@ fn prog_covers_required_pk_slots(
 /// by wrapping the negative elapsed time up into `[0, II)`. Returns `None` when
 /// the dose does not contribute at `t_obs`. `lag_d` is the seeded lagtime dual;
 /// `lag_val` its value (kept separate to branch on `.val()` without a borrow).
+///
+/// Known divergence, confined to `ALAG > II`: this *wraps* the pre-arrival phase where
+/// production `crate::dosing::ss_seed_phase` clamps (wrapping was measured wrong against
+/// NONMEM 7.6.0 — `nonmem_anchor/results/ss_lag_ge_ii`), and always takes the collapsed
+/// `C_ss(t − t_eff)` where production splits into tail + arrival once
+/// `!crate::dosing::ss_arrival_is_trough`; predictions measured up to ~19 % from production's
+/// there. It needs its own fix and its own anchor.
 #[inline]
 fn lagged_elapsed<T: PkNum>(dose: &DoseEvent, t_obs: f64, lag_val: f64, lag_d: T) -> Option<T> {
     use crate::sens::num::BranchCmp as B;
@@ -145,7 +152,7 @@ struct PkClassFlags {
 /// The 14 PK-parameter duals a dose superposition reads, seeded once from `seed_dim`
 /// (which slot maps to which compact dual axis; `None` = constant). Generic over the
 /// seeded number type so the outer walker instantiates it at `Dual2<N>` (full `(θ,η)`
-/// jet + Hessian) and the inner at `Dual1<N>` (η-gradient only) from identical code.
+/// jet + Hessian) and the inner at `Dual2<N>` (η-gradient only) from identical code.
 /// `lag_val` is kept alongside `lag_d` so the lagged-arrival reset test can branch on the
 /// plain value without a borrow.
 struct SeededPkDuals<T: PkNum> {
@@ -618,7 +625,7 @@ pub fn analytic_outer_gradient_for_interaction(model: &CompiledModel, interactio
 // The inner/outer "η" for an IOV subject is the **stacked** random-effects vector
 //   `[η_bsv (n_eta) , κ_group0 (n_kappa) , κ_group1 , … , κ_group(K−1)]`
 // with `K = iov_occasion_groups(subject).len()`. The adjoint differentiates over that
-// stacked vector (`subject_width`, capped at `MAX_WIDTH = 24`), so the caller's block-Ω
+// stacked vector (the subject's own `[η, κ]` width, uncapped), so the caller's block-Ω
 // (BSV ⊕ K·IOV) assembly consumes it directly. (Much of the clause-by-clause history
 // below describes the pre-#2093 forward provider; the predicate now only gates the
 // absorption-walk routing, `absorption_walk_sens_in_scope`.)
@@ -726,9 +733,8 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     }
     // Lagtime is now carried on the IOV walk (#486): the dose arrival `t + ALAG` is threaded
     // as a moving dual boundary, exactly like a modeled infusion end, so the saltation falls
-    // out of the closed-form flow. A subject that *also* carries an SS dose still declines
-    // (per-subject, `ss_lagtime_walk_unsupported`) — production's pre-arrival SS overlay has
-    // no dual twin yet.
+    // out of the closed-form flow — an SS dose's seed at its record and an SS infusion's
+    // previous-cycle residual window included (#2786).
     // Initial-compartment amounts (#521) are now differentiable on the IOV event-driven walk
     // too (#486): the adjoint's `record_analytic_events` layers the `A₀·kernel(t, pk)` impulse
     // per occasion — the amount `A₀` from the BSV-only snapshot (`bsv_amount`, κ = 0) and the decay
@@ -770,8 +776,8 @@ fn iov_analytical_supported_core(model: &CompiledModel, require_theta_axis: bool
     // output-channel factorization the chain relies on (a direct read of a generated weight θ
     // breaks it — same predicate `tvcov_analytical_supported` / `nn_theta_gradient` use), and the
     // builder's own dual width (declared θ + `[η, κ]` + outputs) fitting its `1..=24` dispatch. The
-    // adjoint has no θ-count limit (its width is the per-subject random-effect width,
-    // `subject_width`), so `model.n_theta` itself is unbounded here.
+    // adjoint has no θ-count limit (its width is the per-subject random-effect width),
+    // so `model.n_theta` itself is unbounded here.
     if require_theta_axis && nn_weight_theta_count(model) > 0 {
         if !nn_output_chain_supported(model) || iov_program_axes(model) > ABSORPTION_WALK_AXES {
             return false;
@@ -844,8 +850,7 @@ pub(crate) fn tvcov_analytical_supported(model: &CompiledModel) -> bool {
     // back here for the `uses_time_builtin` case) so a `TIME` model did not recurse
     // (#637 review #1).
     // Lagtime is carried on the TV-cov / `TIME` event walk since #486 (moving dual arrival
-    // boundary); an SS dose alongside it still declines per-subject via
-    // `ss_lagtime_walk_unsupported`.
+    // boundary), an SS dose alongside it since #2786.
     if !analytical_supported_core(model) {
         return false;
     }
@@ -1062,29 +1067,6 @@ pub(crate) fn modeled_dose_analytic_gate(model: &CompiledModel, subject: &Subjec
     modeled_doses_resolvable(model, subject)
 }
 
-/// True when this subject combines a **steady-state infusion with a lagtime** on the event walk.
-///
-/// Production loads a lagged SS dose's periodic state at the dose **record** and lets the walk
-/// carry it to the lagged arrival (#1121, `EventKind::DoseRecord` in
-/// `pk::event_driven`). The dual walk now mirrors that seed for boluses. An infusion also has
-/// a previous-cycle residual rate window after the record; until that forcing is dualized, it
-/// remains a hard decline to FD rather than an approximation.
-///
-/// This gate is consulted from the four **walk** entry points only, so widening it leaves the
-/// CF *static* superposition path alone — that path reaches SS × lagtime without passing here.
-/// Do not read that as the static path being correct. `lagged_elapsed` still implements the
-/// pre-#1121 semantics on both sides of the arrival: it *wraps* the pre-arrival phase where
-/// production `crate::dosing::ss_seed_phase` clamps (wrapping was measured wrong against
-/// NONMEM 7.6.0 — `nonmem_anchor/results/ss_lag_ge_ii`), and it always takes the collapsed
-/// `C_ss(t − t_eff)` where production splits into tail + arrival once
-/// `!crate::dosing::ss_arrival_is_trough`. Both divergences are confined to `ALAG > II`, where
-/// the static path (`analytic_static_predictions`) returns `Some` on predictions measured up to ~19 % from
-/// production's. Pre-existing, and untouched by #1311, which changes the walk alone; it needs
-/// its own fix and its own anchor.
-pub(crate) fn ss_lagtime_walk_unsupported(model: &CompiledModel, subject: &Subject) -> bool {
-    model.has_lagtime() && subject.doses.iter().any(|d| d.ss && d.is_infusion())
-}
-
 /// Per-dose lagtime **values** for the event schedule (`τ_k = t_k + ALAG`), read from each
 /// dose's own PK snapshot so a TV-covariate or `TIME`-dependent lag is honoured per dose —
 /// production parity (`pk::compute_predictions_event_driven` builds `dose_lagtimes` the same
@@ -1157,6 +1139,14 @@ fn moving_bounds_separable(
     let attr_map = model.active_dose_attr_map();
     let has_lag = model.has_lagtime();
     let mut moving: Vec<f64> = Vec::new();
+    // The last time the walk reaches: a residual pulse ending after it is no break at all.
+    let horizon = subject
+        .obs_times
+        .iter()
+        .chain(subject.pk_only_times.iter())
+        .chain(subject.reset_times.iter())
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
     for (k, d) in subject.doses.iter().enumerate() {
         // The walk's break times are the *lagged* arrivals, so compare on those.
         let t_start = eff[k].time + dose_lagtimes.get(k).copied().unwrap_or(0.0);
@@ -1171,6 +1161,16 @@ fn moving_bounds_separable(
                 moving.push(t_start + eff[k].duration);
             }
         }
+        // An SS infusion's earlier pulses still running after its record end where the lag
+        // (through a seeded phase) and a modeled window move them.
+        let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+        moving.extend(crate::dosing::ss_residual_infusion_ends(
+            &eff[k],
+            lag,
+            1.0,
+            f64::NEG_INFINITY,
+            horizon,
+        ));
     }
     if moving.is_empty() {
         return true;
@@ -1209,7 +1209,7 @@ fn moving_bounds_separable(
 /// bioavailability the dose-time `F` is applied exactly as `resolve_eff_doses` applies
 /// it to the f64 window (#419): a rate-defined window stretches to `F·dur`, a
 /// duration-defined rate scales by `F`; the walk injects the rate as-is. `slot_dual(dose_k, pk_slot)` supplies the seeded dual of the `D`/`R` PK
-/// slot at dose `k`'s snapshot (`Dual2<M>` outer, `Dual1<N>` inner). A transient
+/// slot at dose `k`'s snapshot (`Dual2<M>` outer, `Dual2<N>` inner). A transient
 /// non-positive `D`/`R` is clamped to its floor, mirroring the f64
 /// `DoseEvent::resolve_rate`.
 fn modeled_dose_inf_duals<T: crate::sens::num::PkNum>(
@@ -1292,7 +1292,7 @@ fn cached_event_schedule(
         scratch.push(doses.len() as u64);
         for d in doses {
             // Exactly the dose fields the schedule reads (its event times, and the
-            // infusion rates of `active_rates_at` / `ss_residual_infusion_end`); the
+            // infusion rates of `active_rates_at` / `ss_residual_infusion_ends`); the
             // amount is not one of them — the walk reads it from `doses` directly. `rate`
             // is kept although no edit isolates it: a real rate change moves `duration`
             // too, and the walk revalidates the cached rates itself (`rates_valid_for`).
@@ -1334,7 +1334,7 @@ fn cached_event_schedule(
 /// doses resolved to their windows, lag-shifted arrivals as moving boundaries, the walk
 /// itself (`closed_form_sens_walk_g`), the production clamp of the concentration at zero,
 /// then the analytic Form C readout (#650) at each observation. Shared by the forward
-/// TV-cov provider (`Dual2`) and the adjoint gradient (`DualV`), so neither carries its
+/// TV-cov provider (`Dual2`) and the adjoint gradient, so neither carries its
 /// own copy of the event semantics.
 ///
 /// `dose_pk` are the per-dose f64 PK params (window resolution and lag values),
@@ -1549,7 +1549,7 @@ pub(crate) fn closed_form_model_scope(model: &CompiledModel) -> bool {
 /// caller-seeded numeric type: `slot_dual(slot)` gives each PK slot's dual (or `None` for
 /// a constant). The same kernels, clamp and readout as the f64 predictor, with no
 /// `dp_deta` chain (scaling and LTBS follow in the adjoint's `closed_form_finish`). The adjoint
-/// gradient (`sens::ode_provider::adjoint`) seeds the slots with `DualV` η-tangents.
+/// gradient (`sens::ode_provider::adjoint`) seeds the slots with η-tangents.
 ///
 /// `None` outside that path's scope (event-driven walk, algebraic or ODE models,
 /// resets with SS, unresolved modeled doses, rate-defined infusions under F, analytic

@@ -170,8 +170,9 @@ pub type OdeRhsFn = Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>;
 /// [`OdeSolverStats::min_step_clamped_steps`]) instead of being accuracy-limited.
 ///
 /// Cost per step differs sharply, so this is not a free upgrade: RK45 takes 6 `f` evaluations
-/// (FSAL), while a Rosenbrock step takes `n + 1` extra evaluations for the finite-difference
-/// Jacobian and `∂f/∂t` plus an `O(n³)` factorization. On a non-stiff 1–3 compartment model
+/// (FSAL), while a Rosenbrock step adds the exact `n × n` Jacobian and `∂f/∂t` (differenced,
+/// `n + 1` extra evaluations, only for a caller's own closure through [`solve_ode`]) plus an
+/// `O(n³)` factorization. On a non-stiff 1–3 compartment model
 /// RK45 stays the faster choice; the Rosenbrock methods win only where stiffness, not
 /// accuracy, is what caps the step.
 ///
@@ -539,8 +540,13 @@ pub(crate) fn effective_solver_options(baked: OdeSolverOptions) -> OdeSolverOpti
 
 /// The override in force on this thread (see `LOCAL_OVERRIDE`): what a compiled recording's
 /// ODE segment was recorded under, and must run under (#2786).
-pub(crate) fn current_ode_override() -> Option<Option<OdeSolverOverride>> {
-    LOCAL_OVERRIDE.get()
+///
+/// Canonical: "outside a fit" (`None`), "a fit with no opinion" (`Some(None)`) and an override
+/// with no field moved all integrate at the baked options, so all three read `None` here. A
+/// plan recorded on one and run on another (a shared-pool worker against the thread that
+/// armed an empty override) is the same plan, and must not be refused for it.
+pub(crate) fn current_ode_override() -> Option<OdeSolverOverride> {
+    LOCAL_OVERRIDE.get().flatten().filter(|ov| !ov.is_empty())
 }
 
 pub(crate) fn install_worker_ode_override(ov: OdeSolverOverride) {
@@ -674,7 +680,7 @@ pub struct OdeSolverStats {
     /// it can only ever be non-zero on a **dual** instantiation, because `f64` carries no
     /// jets to check ([`crate::sens::num::PkNum::jets_finite`] is `true` for it). So a
     /// segment counted here was kept by the `f64` prediction solve and discarded by the
-    /// `Dual1`/`Dual2` sensitivity solve — the one place the two deliberately part company.
+    /// `Dual2`/`Dual2` sensitivity solve — the one place the two deliberately part company.
     /// See the escalation guard for why that asymmetry is the right trade.
     ///
     /// Non-zero means the fit's *gradient* would otherwise have been `NaN`/`inf` on those
@@ -1150,6 +1156,197 @@ pub(crate) trait LaneHook {
     fn interp_done(&self);
     /// A point the solve did not reach, padded with the last state (`NaN` lanes when diverged).
     fn tail(&self, soft: bool, diverged: bool);
+    /// How many moving switches the segment watches (#2649).
+    fn switches(&self) -> usize;
+    /// Steps from here on integrate with switch `k` forced to the arm of its side `pos`
+    /// (`Some((k, pos))`), or as the model is written (`None`).
+    fn force(&self, arm: Option<(usize, bool)>);
+    /// The switch functions at `(u, t)`, on values.
+    fn switch_g(&self, u: &[f64], t: f64, out: &mut [f64]);
+    /// The state crossed switch `k` at the current time `t`, from the side where its function
+    /// is positive when `pos`: apply the sensitivity jump to every lane of the state.
+    fn jump(&self, k: usize, pos: bool, t: f64);
+}
+
+thread_local! {
+    /// How many moving switches the last right-hand side evaluated on this thread has
+    /// (`note_switches`); never written by a model without any.
+    static SWITCHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A model's right-hand side with `k` moving switches (#2649) says so at each evaluation, so an
+/// integration of it, whatever wraps the model's closure, knows to watch them.
+pub(crate) fn note_switches(k: usize) {
+    SWITCHES.with(|c| c.set(k));
+}
+
+/// What [`note_switches`] said since the last call, which clears it.
+pub(crate) fn take_switches() -> usize {
+    SWITCHES.with(|c| c.replace(0))
+}
+
+/// Whether switch function value `g` is on the side where it is positive. The driver's
+/// verdict, shared by the jump: `l ? r` and `l − r > 0` agree on every finite pair but where
+/// `l = r` exactly, a measure-zero set the forced arms in the jump do not depend on.
+#[inline]
+fn switch_side(g: f64) -> bool {
+    g > 0.0
+}
+
+/// The moving switches of one segment at `T = f64` (#2649): their functions, by the lane hook
+/// of a recorded segment or the model's own switch program through `rhs`.
+struct Switches<'a, 'r, T: PkNum> {
+    k: usize,
+    n: usize,
+    hook: Option<std::rc::Rc<dyn LaneHook>>,
+    rhs: &'a RhsG<'r, T>,
+    params: &'a [T],
+    ue: Vec<T>,
+    du: Vec<T>,
+}
+
+impl<T: PkNum> Switches<'_, '_, T> {
+    /// The functions at `(u, t)`.
+    fn g(&mut self, u: &[T], t: f64) -> Vec<f64> {
+        let (n, k) = (self.n, self.k);
+        let mut out = vec![0.0; k];
+        if let Some(h) = &self.hook {
+            let uv: Vec<f64> = u.iter().map(|x| x.val()).collect();
+            h.switch_g(&uv, t, &mut out);
+            return out;
+        }
+        self.ue.clear();
+        self.ue.extend_from_slice(&u[..n]);
+        self.ue.resize(n + k, T::from_f64(0.0));
+        self.du.clear();
+        self.du.resize(n + k, T::from_f64(0.0));
+        (self.rhs)(&self.ue, self.params, T::from_f64(t), &mut self.du);
+        for (o, d) in out.iter_mut().zip(&self.du[n..]) {
+            *o = d.val();
+        }
+        out
+    }
+}
+
+/// How close, in units of `EPSILON·(|t| + h)`, [`locate_switch`] brackets a crossing.
+const SWITCH_LOCATE_ULPS: f64 = 64.0;
+/// Most attempts [`locate_switch`] makes per switch; Illinois needs about ten.
+const SWITCH_LOCATE_MAX: usize = 100;
+
+/// Where the step from `(u, t)` over `h` first crosses a moving switch, given that switch `k`
+/// changed side over it (`g_old` at its start, `g_hi` at its end): Illinois on
+/// `φ(θ) = g_k(step(u, t, θ·h))`, each value a real attempt of `stepper`, so the step it ends
+/// with lands on the far side of the crossing, where the right-hand side takes the other arm.
+/// A second switch that crossed before the bracket's far end is located instead, in what is
+/// left. Every attempt forces the located switch's arm before the crossing in all its stages
+/// ([`Switches::forced_attempt`]), so the step that ends there is a flow of that arm alone.
+/// Returns `θ`, the switch, its functions at the end, and the error of the attempt the stepper
+/// now holds, which is the forced attempt to `θ·h`.
+#[allow(clippy::too_many_arguments)]
+fn locate_switch<T: PkNum>(
+    stepper: &mut dyn Stepper<T>,
+    sw: &mut Switches<'_, '_, T>,
+    (u, t, h): (&[T], f64, f64),
+    g_old: &[f64],
+    mut g_hi: Vec<f64>,
+    mut k: usize,
+    opts: &OdeSolverOptions,
+) -> (f64, usize, Vec<f64>, Option<f64>) {
+    let tol = SWITCH_LOCATE_ULPS * f64::EPSILON * (t.abs() + h);
+    let mut hi = 1.0_f64;
+    let mut err = None;
+    let mut at_hi = true;
+    for _ in 0..=g_old.len() {
+        let (mut lo, mut flo, mut fhi, mut side) = (0.0_f64, g_old[k], g_hi[k], 0i8);
+        for _ in 0..SWITCH_LOCATE_MAX {
+            if (hi - lo) * h <= tol {
+                break;
+            }
+            let mut th = lo + (hi - lo) * (flo / (flo - fhi));
+            if !(th > lo && th < hi) {
+                th = 0.5 * (lo + hi);
+            }
+            if !(th > lo && th < hi) {
+                break;
+            }
+            let e = sw.forced_attempt(stepper, u, t, th * h, (k, switch_side(g_old[k])), opts);
+            let g = sw.g(stepper.u_new(), t + th * h);
+            if switch_side(g[k]) == switch_side(g_old[k]) {
+                (lo, flo) = (th, g[k]);
+                if side < 0 {
+                    fhi *= 0.5;
+                }
+                side = -1;
+                at_hi = false;
+            } else {
+                (hi, fhi) = (th, g[k]);
+                if side > 0 {
+                    flo *= 0.5;
+                }
+                side = 1;
+                at_hi = true;
+                err = Some(e);
+                g_hi = g;
+            }
+        }
+        match crossed(g_old, &g_hi, Some(k)) {
+            Some(j) => k = j,
+            None => break,
+        }
+    }
+    if !at_hi || err.is_none() {
+        err = Some(sw.forced_attempt(stepper, u, t, hi * h, (k, switch_side(g_old[k])), opts));
+    }
+    (hi, k, g_hi, err)
+}
+
+/// The bias that forces a switch's arm in the switch program (`ode_switch::instrument`): past
+/// any switch function's value, so `g + B` and `g − B` have the sign of `B`.
+pub(crate) const SWITCH_FORCE: f64 = 1e300;
+
+impl<T: PkNum> Switches<'_, '_, T> {
+    /// `stepper`'s attempt from `(u, t)` over `dt` with switch `k` forced to the arm of its
+    /// side `pos` in every stage, so a step that ends on a crossing integrates the field
+    /// before it throughout, whichever side its last stages land on.
+    #[allow(clippy::too_many_arguments)]
+    fn forced_attempt(
+        &self,
+        stepper: &mut dyn Stepper<T>,
+        u: &[T],
+        t: f64,
+        dt: f64,
+        (k, pos): (usize, bool),
+        opts: &OdeSolverOptions,
+    ) -> f64 {
+        if let Some(h) = &self.hook {
+            h.force(Some((k, pos)));
+            let e = stepper.attempt(self.rhs, u, self.params, t, dt, opts);
+            h.force(None);
+            return e;
+        }
+        let (n, kk, rhs) = (self.n, self.k, self.rhs);
+        let bias = T::from_f64(if pos { SWITCH_FORCE } else { -SWITCH_FORCE });
+        let forced = move |x: &[T], p: &[T], tt: T, du: &mut [T]| {
+            let zero = T::from_f64(0.0);
+            let mut ue = x[..n].to_vec();
+            ue.resize(n + kk, zero);
+            ue[n + k] = bias;
+            let mut d = vec![zero; n + kk];
+            rhs(&ue, p, tt, &mut d);
+            du[..n].copy_from_slice(&d[..n]);
+        };
+        stepper.attempt(&forced, u, self.params, t, dt, opts)
+    }
+}
+
+/// The first switch other than `skip` whose side differs between `a` and `b`, both finite.
+fn crossed(a: &[f64], b: &[f64], skip: Option<usize>) -> Option<usize> {
+    (0..a.len()).find(|&j| {
+        Some(j) != skip
+            && a[j].is_finite()
+            && b[j].is_finite()
+            && switch_side(a[j]) != switch_side(b[j])
+    })
 }
 
 thread_local! {
@@ -1180,8 +1377,6 @@ fn lane_hook<T: PkNum>() -> Option<std::rc::Rc<dyn LaneHook>> {
 /// carried state, and writes the carried state, with no decision of its own — every decision
 /// stays in the driver, on values.
 pub(crate) trait StepBody<T: PkNum>: Stepper<T> {
-    /// Whether the step start is not yet computed for the current `(u, t)`.
-    fn needs_start(&self) -> bool;
     /// Compute the step start.
     fn start(&mut self, rhs: &RhsG<'_, T>, u: &[T], params: &[T], clock: &StepClock<T>);
     /// The step's stages over `clock` (the start computed): no error norm.
@@ -1190,12 +1385,176 @@ pub(crate) trait StepBody<T: PkNum>: Stepper<T> {
     fn carried_into(&self, out: &mut Vec<T>);
     /// Set the carried state, the start included.
     fn set_carried(&mut self, v: &[T]);
-    /// The error norm of the last step, on values (`∞` for an unusable one).
-    fn err(&mut self, u: &[T], dt: f64, opts: &OdeSolverOptions) -> f64;
-    /// Back to a fresh stepper's state for what a step reads: the start not computed (a
-    /// reused stepper, #2786; the carried state is set before it is read).
-    fn reset_start(&mut self);
 }
+
+/// A carried state ([`StepBody::carried_into`]'s order) read in place at a stride: component
+/// `j` at `v[j * s]` — one lane of a compiled run's slot buffer, whose lanes are contiguous per
+/// slot (#2786).
+#[derive(Clone, Copy)]
+pub(crate) struct Carried<'a> {
+    v: &'a [f64],
+    s: usize,
+}
+
+impl<'a> Carried<'a> {
+    pub(crate) fn new(v: &'a [f64], s: usize) -> Self {
+        Carried { v, s }
+    }
+    #[inline(always)]
+    fn at(&self, j: usize) -> f64 {
+        self.v[j * self.s]
+    }
+}
+
+/// What the driver reads off a [`StepBody`]'s carried state — the error norm, `u_new`, the
+/// continuous extension, the stiffness indicator, usability — computed straight from a
+/// [`Carried`] view by the same definitions the steppers' own reads call. A compiled run
+/// (#2786) decides on its value lane with these: no value stepper shadows its lanes.
+#[derive(Clone, Copy)]
+pub(crate) enum CarriedLayout {
+    Rk45 {
+        n: usize,
+    },
+    Erk {
+        n: usize,
+        tab: &'static super::explicit_rk::ErkTableau,
+        dense: bool,
+    },
+    Ros {
+        n: usize,
+        method: OdeMethod,
+    },
+}
+
+impl CarriedLayout {
+    /// The layout [`make_step_body`]`(n, method)` carries, `dense` its
+    /// [`Stepper::set_dense_required`].
+    pub(crate) fn of(n: usize, method: OdeMethod, dense: bool) -> Self {
+        match method {
+            OdeMethod::Vern7 => CarriedLayout::Erk {
+                n,
+                tab: &super::explicit_rk::VERN7,
+                dense,
+            },
+            OdeMethod::Rosenbrock23 | OdeMethod::Rodas4 | OdeMethod::Rodas5P => {
+                CarriedLayout::Ros { n, method }
+            }
+            OdeMethod::Rk45 | OdeMethod::Auto | OdeMethod::Linear => CarriedLayout::Rk45 { n },
+        }
+    }
+    /// Where [`Stepper::u_new`] starts (its `n` components are contiguous).
+    pub(crate) fn u_new_at(&self) -> usize {
+        match *self {
+            CarriedLayout::Rk45 { n } => 8 * n,
+            CarriedLayout::Erk { n, tab, .. } => super::explicit_rk::erk_u_new_at(n, tab),
+            CarriedLayout::Ros { n, .. } => super::rosenbrock::ros_u_new_at(n),
+        }
+    }
+    /// The error norm of the last attempt, on values (`∞` for an unusable one).
+    pub(crate) fn err(&self, c: Carried<'_>, u: &[f64], dt: f64, opts: &OdeSolverOptions) -> f64 {
+        match *self {
+            CarriedLayout::Rk45 { n } => {
+                rk45_err_norm(n, |b, i| c.at(b * n + i), |i| u[i], dt, opts)
+            }
+            CarriedLayout::Erk { n, tab, .. } => {
+                let un = self.u_new_at();
+                super::explicit_rk::erk_err_norm(
+                    n,
+                    tab,
+                    |b, i| c.at(b * n + i),
+                    |i| c.at(un + i),
+                    |i| u[i],
+                    dt,
+                    opts,
+                )
+            }
+            CarriedLayout::Ros { n, .. } => {
+                if !self.usable(c) {
+                    return f64::INFINITY;
+                }
+                let un = self.u_new_at();
+                super::rosenbrock::ros_err_norm(
+                    n,
+                    |i| c.at(un + i),
+                    |i| c.at(un + n + i),
+                    |i| u[i],
+                    opts,
+                )
+            }
+        }
+    }
+    /// [`Stepper::attempt_usable`].
+    pub(crate) fn usable(&self, c: Carried<'_>) -> bool {
+        match *self {
+            CarriedLayout::Ros { n, method } => {
+                c.at(super::rosenbrock::ros_usable_at(n, method)) == 1.0
+            }
+            _ => true,
+        }
+    }
+    /// [`Stepper::interpolate_component`], `u_old_i` the component's start value.
+    pub(crate) fn interp(
+        &self,
+        c: Carried<'_>,
+        theta: f64,
+        u_old_i: f64,
+        dt: f64,
+        i: usize,
+    ) -> f64 {
+        match *self {
+            CarriedLayout::Rk45 { n } => hermite_g(
+                theta,
+                dt,
+                u_old_i,
+                c.at(i),
+                c.at(8 * n + i),
+                c.at(6 * n + i),
+            ),
+            CarriedLayout::Erk { n, tab, .. } => {
+                super::explicit_rk::erk_interp(tab, |b, i| c.at(b * n + i), theta, u_old_i, dt, i)
+            }
+            CarriedLayout::Ros { n, method } => {
+                // The stages follow `u_new` and `err`.
+                let un = self.u_new_at();
+                super::rosenbrock::ros_interp(
+                    method,
+                    |j| c.at(un + 2 * n + j * n + i),
+                    theta,
+                    u_old_i,
+                    c.at(un + i),
+                    dt,
+                )
+            }
+        }
+    }
+    /// [`Stepper::stiffness_indicator`].
+    pub(crate) fn stiffness(&self, c: Carried<'_>, dt: f64) -> Option<f64> {
+        match *self {
+            CarriedLayout::Rk45 { n } => rk45_stiffness(n, |b, i| c.at(b * n + i), dt),
+            CarriedLayout::Erk { .. } | CarriedLayout::Ros { .. } => None,
+        }
+    }
+    /// [`Stepper::err_exp`].
+    pub(crate) fn err_exp(&self) -> f64 {
+        match *self {
+            CarriedLayout::Rk45 { .. } => RK45_ERR_EXP,
+            CarriedLayout::Erk { tab, .. } => tab.err_exp(),
+            CarriedLayout::Ros { method, .. } => super::rosenbrock::method_err_exp(method),
+        }
+    }
+    /// Whether the step start survives [`Stepper::on_accept`] (computed at the new `(u, t)`:
+    /// RK45's FSAL `k7`), so the next attempt does not run [`StepBody::start`].
+    pub(crate) fn start_kept_on_accept(&self) -> bool {
+        match *self {
+            CarriedLayout::Rk45 { .. } => true,
+            CarriedLayout::Erk { tab, dense, .. } => tab.start_kept_on_accept(dense),
+            CarriedLayout::Ros { .. } => super::rosenbrock::START_KEPT_ON_ACCEPT,
+        }
+    }
+}
+
+/// I-controller exponent for RK45's 5(4) pair.
+const RK45_ERR_EXP: f64 = 1.0 / 5.0;
 
 /// [`make_stepper`] as a [`StepBody`].
 pub(crate) fn make_step_body<T: PkNum>(n: usize, method: OdeMethod) -> Box<dyn StepBody<T>> {
@@ -1467,8 +1826,6 @@ impl<T: PkNum> Rk45Stepper<T> {
 /// reaches the model: through the closure, or straight into its machine code
 /// ([`DirectCall`]), inlined.
 pub(crate) trait StageRhs<T> {
-    /// Calls reach the model's machine code directly ([`DirectCall`]).
-    const DIRECT: bool = false;
     fn call(&self, u: &[T], params: &[T], t: T, du: &mut [T]);
 }
 
@@ -1488,7 +1845,6 @@ pub(crate) struct DirectCall<'a, T> {
 }
 
 impl<T: PkNum> StageRhs<T> for DirectCall<'_, T> {
-    const DIRECT: bool = true;
     #[inline(always)]
     fn call(&self, u: &[T], params: &[T], t: T, du: &mut [T]) {
         super::rosenbrock::call_direct(self.direct, self.rhs, u, params, t, du)
@@ -1616,30 +1972,76 @@ impl<T: PkNum> Rk45Stepper<T> {
     /// step sequence must not depend on derivative components.
     #[allow(clippy::needless_range_loop)]
     pub(crate) fn err_norm(&self, u: &[T], dt_eff: f64, opts: &OdeSolverOptions) -> f64 {
-        let n = self.n;
-        let (k1, k3, k4, k5, k6, k7, u5) = (
-            &self.k1, &self.k3, &self.k4, &self.k5, &self.k6, &self.k7, &self.u5,
-        );
-        let mut err_norm = 0.0;
-        for i in 0..n {
-            let err_i = dt_eff
-                * (E1 * k1[i].val()
-                    + E3 * k3[i].val()
-                    + E4 * k4[i].val()
-                    + E5 * k5[i].val()
-                    + E6 * k6[i].val()
-                    + E7 * k7[i].val());
-            let scale = scale_tol(opts.abstol, opts.reltol, u5[i].val(), u[i].val());
-            err_norm += (err_i / scale) * (err_i / scale);
+        rk45_err_norm(
+            self.n,
+            |b, i| self.block(b)[i].val(),
+            |i| u[i].val(),
+            dt_eff,
+            opts,
+        )
+    }
+
+    /// Carried block `b` (the [`StepBody::carried_into`] order: `k1..k7`, `u_tmp`, `u5`).
+    #[inline(always)]
+    fn block(&self, b: usize) -> &[T] {
+        match b {
+            0 => &self.k1,
+            1 => &self.k2,
+            2 => &self.k3,
+            3 => &self.k4,
+            4 => &self.k5,
+            5 => &self.k6,
+            6 => &self.k7,
+            7 => &self.u_tmp,
+            _ => &self.u5,
         }
-        (err_norm / n as f64).sqrt()
     }
 }
 
-impl<T: PkNum> StepBody<T> for Rk45Stepper<T> {
-    fn needs_start(&self) -> bool {
-        !self.have_k1
+/// RK45's error norm over its carried blocks, `k(b, i)` component `i` of block `b` (the
+/// [`StepBody::carried_into`] order) on values: the stepper's own, and a compiled run's off its
+/// value lane ([`CarriedLayout`]) — one definition, so both decide alike bit for bit.
+#[inline(always)]
+fn rk45_err_norm(
+    n: usize,
+    k: impl Fn(usize, usize) -> f64,
+    u: impl Fn(usize) -> f64,
+    dt_eff: f64,
+    opts: &OdeSolverOptions,
+) -> f64 {
+    let mut err_norm = 0.0;
+    for i in 0..n {
+        let err_i = dt_eff
+            * (E1 * k(0, i)
+                + E3 * k(2, i)
+                + E4 * k(3, i)
+                + E5 * k(4, i)
+                + E6 * k(5, i)
+                + E7 * k(6, i));
+        let scale = scale_tol(opts.abstol, opts.reltol, k(8, i), u(i));
+        err_norm += (err_i / scale) * (err_i / scale);
     }
+    (err_norm / n as f64).sqrt()
+}
+
+/// Hairer & Wanner's DOPRI5 stiffness estimate over RK45's carried blocks (as
+/// [`rk45_err_norm`]). `u_tmp` is the stage-6 state and remains intact after `k6` is
+/// evaluated; `u5`/`k7` are the accepted endpoint. Values only keep prediction and
+/// sensitivity solves on the same path.
+#[inline(always)]
+fn rk45_stiffness(n: usize, k: impl Fn(usize, usize) -> f64, dt: f64) -> Option<f64> {
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for i in 0..n {
+        let dk = k(6, i) - k(5, i);
+        let du = k(8, i) - k(7, i);
+        num += dk * dk;
+        den += du * du;
+    }
+    (den > 0.0).then(|| dt.abs() * (num / den).sqrt())
+}
+
+impl<T: PkNum> StepBody<T> for Rk45Stepper<T> {
     fn start(&mut self, rhs: &RhsG<'_, T>, u: &[T], params: &[T], clock: &StepClock<T>) {
         rhs(&u[..self.n], params, clock.start(), &mut self.k1[..self.n]);
         self.have_k1 = true;
@@ -1684,12 +2086,6 @@ impl<T: PkNum> StepBody<T> for Rk45Stepper<T> {
         }
         self.have_k1 = true;
     }
-    fn err(&mut self, u: &[T], dt: f64, opts: &OdeSolverOptions) -> f64 {
-        self.err_norm(u, dt, opts)
-    }
-    fn reset_start(&mut self) {
-        self.have_k1 = false;
-    }
 }
 
 impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
@@ -1729,8 +2125,7 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     }
 
     fn err_exp(&self) -> f64 {
-        // 0.20 — I-controller exponent for the 5(4) pair.
-        1.0 / 5.0
+        RK45_ERR_EXP
     }
 
     fn attempt_usable(&self) -> bool {
@@ -1738,18 +2133,7 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
     }
 
     fn stiffness_indicator(&self, dt: f64) -> Option<f64> {
-        // Hairer & Wanner's DOPRI5 estimate. `u_tmp` is the stage-6 state and
-        // remains intact after k6 is evaluated; u5/k7 are the accepted endpoint.
-        // Values only keep prediction and sensitivity solves on the same path.
-        let mut num = 0.0;
-        let mut den = 0.0;
-        for i in 0..self.n {
-            let dk = self.k7[i].val() - self.k6[i].val();
-            let du = self.u5[i].val() - self.u_tmp[i].val();
-            num += dk * dk;
-            den += du * du;
-        }
-        (den > 0.0).then(|| dt.abs() * (num / den).sqrt())
+        rk45_stiffness(self.n, |b, i| self.block(b)[i].val(), dt)
     }
 }
 
@@ -1849,6 +2233,26 @@ fn integrate_dense_g<T: PkNum>(
     // guard needs that count before the segment runs), so a later switch must not count it
     // twice — nor may a segment that switches down and back up.
     let mut escalation_counted = method != OdeMethod::EXPLICIT_FALLBACK;
+    // The moving switches (#2649), watched on values (`T = f64`: the prediction, and a
+    // recording's run over its lanes). A recorded segment's hook knows how many; otherwise the
+    // model's right-hand side says so at its first evaluation (`note_switches`), and a model
+    // without any never does, so its integration takes no other branch.
+    let watch = std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>();
+    if watch && hook.is_none() {
+        take_switches();
+    }
+    let mut sw = Switches {
+        k: hook.as_ref().map_or(0, |h| h.switches()),
+        n,
+        hook: hook.clone(),
+        rhs,
+        params,
+        ue: Vec::new(),
+        du: Vec::new(),
+    };
+    let mut probe = watch && hook.is_none();
+    // The switch functions at `(u, t)`, once a step has needed them.
+    let mut g_old: Vec<f64> = Vec::new();
 
     for _step in 0..opts.max_steps {
         if t >= tf - 1e-15 {
@@ -1861,7 +2265,7 @@ fn integrate_dense_g<T: PkNum>(
             dt_eff = (saveat[save_idx] - t).max(opts.min_dt);
         }
 
-        let err_norm = stepper.attempt(rhs, &u, params, t, dt_eff, opts);
+        let mut err_norm = stepper.attempt(rhs, &u, params, t, dt_eff, opts);
         let usable = stepper.attempt_usable();
 
         // An unusable attempt at `min_dt` is unrecoverable: the step cannot be shrunk further
@@ -1885,6 +2289,41 @@ fn integrate_dense_g<T: PkNum>(
         let accepted = usable && (err_norm <= 1.0 || dt_eff <= opts.min_dt);
         if !accepted {
             stepper.on_reject();
+        }
+        // A moving switch the step crossed: end the step at the crossing instead, on the far
+        // side of it, so the field changes arms there and the jump is applied there.
+        let mut event: Option<(usize, bool)> = None;
+        let mut g_end: Option<Vec<f64>> = None;
+        if accepted && watch {
+            if probe {
+                sw.k = take_switches();
+                probe = false;
+            }
+            if sw.k > 0 {
+                if g_old.is_empty() {
+                    g_old = sw.g(&u, t);
+                }
+                let g_new = sw.g(stepper.u_new(), t + dt_eff);
+                if let Some(k) = crossed(&g_old, &g_new, None) {
+                    let (theta, k, g, e) = locate_switch(
+                        &mut *stepper,
+                        &mut sw,
+                        (&u, t, dt_eff),
+                        &g_old,
+                        g_new,
+                        k,
+                        opts,
+                    );
+                    dt_eff *= theta;
+                    if let Some(e) = e {
+                        err_norm = e;
+                    }
+                    event = Some((k, switch_side(g_old[k])));
+                    g_end = Some(g);
+                } else {
+                    g_end = Some(g_new);
+                }
+            }
         }
         // Mirrors `OdeSolverStats::record`'s clamp test, so the abort budget below counts
         // exactly the steps `min_step_clamped_steps` reports.
@@ -1929,6 +2368,18 @@ fn integrate_dense_g<T: PkNum>(
             t += dt_eff;
             u.copy_from_slice(stepper.u_new());
             stepper.on_accept();
+            if let Some(g) = g_end {
+                g_old = g;
+            }
+            if let Some((k, pos)) = event {
+                // The jump of every derivative lane (the values do not move), then a fresh
+                // stepper: its start reads the field on its new arm, and the jumped lanes.
+                if let Some(h) = &hook {
+                    h.jump(k, pos, t);
+                }
+                stepper = make_stepper::<T>(n, method);
+                stepper.set_dense_required(!interp_at.is_empty());
+            }
 
             while save_idx < saveat.len() && (t - saveat[save_idx]).abs() < 1e-12 {
                 if let Some(h) = &hook {
@@ -2992,7 +3443,7 @@ fn integrate_resolved_g_inner<T: PkNum>(
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
     // A certified-linear model's segment is propagated exactly (#852). Every integration entry
     // point funnels through here, so the dense segments, the steady-state run-in cycles and the
-    // `Dual1`/`Dual2` sensitivity solves all take the same exact path without being threaded
+    // `Dual2`/`Dual2` sensitivity solves all take the same exact path without being threaded
     // individually. A segment it declines is integrated as `Auto` would integrate it.
     if opts.method == OdeMethod::Linear {
         if (t_span.1 - t_span.0).abs() >= 1e-15 {
@@ -3228,7 +3679,7 @@ fn finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
 ///
 /// The deliberate counterpart to [`finite_g`]: at `T = f64` this is a compile-time `true`
 /// (there are no jets), so the prediction path decides exactly as it did before #1204 and
-/// only a `Dual1`/`Dual2` solve can fail it. See the escalation guard for why that
+/// only a `Dual2`/`Dual2` solve can fail it. See the escalation guard for why that
 /// asymmetry is wanted rather than tolerated.
 fn jets_finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
     points.iter().all(|p| p.u.iter().all(|v| v.jets_finite()))
@@ -3350,8 +3801,12 @@ mod tests {
             // mean the spec's baked value, not the enclosing fit's tolerance.
             let _quiet = arm_ode_solver_override(OdeSolverOverride::default());
             assert_eq!(effective_solver_options(baked).reltol, baked.reltol);
+            // ...and a compiled plan sees it as the same as no fit at all (a plan recorded on
+            // a shared-pool worker serves the thread that armed an empty override).
+            assert_eq!(current_ode_override(), None);
         }
         assert_eq!(effective_solver_options(baked).reltol, 1e-9);
+        assert!(current_ode_override().is_some());
         drop(outer);
         assert_eq!(effective_solver_options(baked).reltol, baked.reltol);
     }

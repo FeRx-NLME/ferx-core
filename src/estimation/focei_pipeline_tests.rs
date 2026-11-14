@@ -32,13 +32,14 @@ fn fixture(iov: bool, mixed_fallback: bool) -> (CompiledModel, Population) {
     if mixed_fallback {
         // One subject the adjoint declines while the others stay exact: per-record
         // covariate snapshots (constant, so predictions are unchanged) route it to the
-        // event walk, which declines an SS infusion under a lag time
-        // (`ss_lagtime_walk_unsupported`).
+        // event walk, and every plan of it fails (`kernel_jit::fail_plans_of`; no
+        // regular-path shape declines since #2786).
         let s0 = &mut pop.subjects[0];
         s0.doses[0] = DoseEvent::new(0.0, 100.0, 1, 25.0, true, 24.0);
         let snap: std::collections::HashMap<String, f64> = [("WT".to_string(), 70.0)].into();
         s0.dose_covariates = vec![snap.clone(); s0.doses.len()];
         s0.obs_covariates = vec![snap; s0.obs_times.len()];
+        crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(s0);
     }
     (model, pop)
 }

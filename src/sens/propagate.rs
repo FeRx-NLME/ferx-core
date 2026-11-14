@@ -17,7 +17,7 @@
 //! the foundation; the dual event walk + readout + the per-occasion block-Ω outer
 //! assembly build on top (issue #367).
 
-use super::num::PkNum;
+use super::num::{bateman, one_minus_exp_rel, PkNum};
 use crate::pk::event_driven::{Event, EventKind, EventSchedule};
 use crate::pk::topology::Channel;
 use crate::types::{DoseEvent, PkModel, Subject};
@@ -153,9 +153,9 @@ pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: T, cl: T, v: T, rate: 
     if skip_step_on_cl_v(state, cl, v, &[rate]) {
         return;
     }
+    // `(rate/ke)·(1 − e^{−ke·dt})`, exact at small `ke·dt`.
     let ke = cl / v;
-    let exp_term = (-(ke * dt)).exp();
-    state[0] = exp_term * state[0] + (rate / ke) * (T::from_f64(1.0) - exp_term);
+    state[0] = (-(ke * dt)).exp() * state[0] + rate * dt * one_minus_exp_rel(ke * dt);
 }
 
 /// 1-cpt oral propagator. `state = [A_depot, A_central]`; the depot drains into
@@ -163,8 +163,8 @@ pub fn propagate_one_cpt_g<T: PkNum>(state: &mut [T], dt: T, cl: T, v: T, rate: 
 /// zero-order input into central (depot-bypass infusion, RATE>0 into cmt 2);
 /// `rate_depot` is a constant zero-order input into the depot (RATE>0 into cmt 1,
 /// #400). Both are added by linear superposition and are `0` for bolus dosing.
-/// Mirror of `crate::pk::event_driven::propagate_one_cpt_oral`, including the
-/// `ka ≈ ke` L'Hôpital limit.
+/// Mirror of `crate::pk::event_driven::propagate_one_cpt_oral`; the depot-driven terms are
+/// the Bateman function, one smooth function through `ka = ke` ([`bateman`]).
 pub fn propagate_one_cpt_oral_g<T: PkNum>(
     state: &mut [T],
     dt: T,
@@ -180,40 +180,18 @@ pub fn propagate_one_cpt_oral_g<T: PkNum>(
         return;
     }
     let ke = cl / v;
-    let dtt = dt;
-    let one = T::from_f64(1.0);
-    let e_ka = (-(ka * dtt)).exp();
-    let e_ke = (-(ke * dtt)).exp();
-    let a_d_0 = state[0];
-    let a_c_0 = state[1];
-    let near = ka.br_absdiff_lt(ke, 1e-9);
-
-    // Depot decays exponentially (decoupled).
-    state[0] = a_d_0 * e_ka;
-
-    // Central: homogeneous decay of A_c(0) plus the depot-driven Bateman term,
-    // with the `ka ≈ ke` L'Hôpital fallback (branch on `.val()`).
-    if near {
-        state[1] = a_c_0 * e_ke + ka * a_d_0 * dtt * e_ke;
-    } else {
-        state[1] = a_c_0 * e_ke + (ka * a_d_0 / (ke - ka)) * (e_ka - e_ke);
-    }
-
-    // Constant infusion into central (depot bypass): forced response of the 1-cpt
-    // IV propagator from a zero initial state, `(R/ke)·(1 − e_ke)`. Zero when
-    // `rate_central` is zero, so applied unconditionally (derivative-safe).
-    state[1] = state[1] + (rate_central / ke) * (one - e_ke);
-
-    // Constant zero-order input into the depot (#400), added by linearity:
-    //   depot:   (R/ka)·(1 − e_ka)
-    //   central: (R/ke)·(1 − e_ke) − R·(e_ka − e_ke)/(ke − ka), L'Hôpital → R·dt·e_ke.
-    state[0] = state[0] + (rate_depot / ka) * (one - e_ka);
-    let central_forced = if near {
-        rate_depot / ke * (one - e_ke) - rate_depot * dtt * e_ke
-    } else {
-        rate_depot / ke * (one - e_ke) - rate_depot * (e_ka - e_ke) / (ke - ka)
-    };
-    state[1] = state[1] + central_forced;
+    // `B = (e^{−ka·dt} − e^{−ke·dt})/(ke − ka)`, and `(1 − e^{−λ·dt})/λ = dt·exprel(−λ·dt)`.
+    let b = bateman(ke, ka, dt);
+    let (a_d_0, a_c_0) = (state[0], state[1]);
+    // Depot: exponential decay plus the forced response `(R/ka)·(1 − e^{−ka·dt})` of a
+    // zero-order input into it (#400). Central: decay of `A_c(0)`, the depot-driven Bateman
+    // term, a depot-bypass infusion `(R/ke)·(1 − e^{−ke·dt})`, and the depot input's
+    // `R·((1 − e^{−ke·dt})/ke − B)` (each zero when its rate is, so applied unconditionally).
+    state[0] = a_d_0 * (-(ka * dt)).exp() + rate_depot * dt * one_minus_exp_rel(ka * dt);
+    state[1] = a_c_0 * (-(ke * dt)).exp()
+        + ka * a_d_0 * b
+        + (rate_central + rate_depot) * dt * one_minus_exp_rel(ke * dt)
+        - rate_depot * b;
 }
 
 // ─── 1-cpt event-driven sensitivity walk ─────────────────────────────
@@ -364,23 +342,19 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     let a_c_0 = state[1];
     let a_p_0 = state[2];
 
-    let e_ka = (-(ka * dtt)).exp();
     let e_alpha = (-(alpha * dtt)).exp();
     let e_beta = (-(beta * dtt)).exp();
 
-    state[0] = a_d_0 * e_ka;
+    state[0] = a_d_0 * (-(ka * dtt)).exp();
 
-    let denom_depot = (ka - alpha) * (ka - beta);
-    let (cap_a, cap_b) = if denom_depot.br_abs_lt(1e-12) {
-        (T::from_f64(0.0), T::from_f64(0.0))
-    } else {
-        let a = ka * a_d_0 * (k21 - ka) / denom_depot;
-        let b = ka * a_d_0 * k12 / denom_depot;
-        (a, b)
-    };
-
-    let h_c_0 = a_c_0 - cap_a;
-    let h_p_0 = a_p_0 - cap_b;
+    // The depot's drain into central, `ka·A_d(0)·e^{−ka·s}`, convolved with the central and
+    // peripheral impulse responses `((α−k21)e^{−αt} + (k21−β)e^{−βt})/(α−β)` and
+    // `k12(e^{−βt} − e^{−αt})/(α−β)`: Bateman functions, smooth through `ka = α, β`
+    // ([`bateman`]). `α > β` here (`two_cpt_eigen_g` requires `CL, Q > 0`).
+    let (b_alpha, b_beta) = (bateman(alpha, ka, dtt), bateman(beta, ka, dtt));
+    let dep = ka * a_d_0 / (alpha - beta);
+    let dep_c = dep * ((alpha - k21) * b_alpha + (k21 - beta) * b_beta);
+    let dep_p = dep * k12 * (b_beta - b_alpha);
 
     let denom = beta - alpha;
     let (c1, c2) = if k12.br_abs_lt(1e-30) || denom.br_abs_lt(1e-30) {
@@ -389,11 +363,11 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
         } else {
             k12
         };
-        let s_homog = h_p_0 / kk;
+        let s_homog = a_p_0 / kk;
         (s_homog * T::from_f64(0.5), s_homog * T::from_f64(0.5))
     } else {
-        let s_homog = h_p_0 / k12;
-        let c1 = (h_c_0 - s_homog * (k21 - beta)) / denom;
+        let s_homog = a_p_0 / k12;
+        let c1 = (a_c_0 - s_homog * (k21 - beta)) / denom;
         let c2 = s_homog - c1;
         (c1, c2)
     };
@@ -401,8 +375,8 @@ pub fn propagate_two_cpt_oral_core_g<T: PkNum>(
     let h_c_dt = c1 * (k21 - alpha) * e_alpha + c2 * (k21 - beta) * e_beta;
     let h_p_dt = (c1 * e_alpha + c2 * e_beta) * k12;
 
-    state[1] = h_c_dt + cap_a * e_ka;
-    state[2] = h_p_dt + cap_b * e_ka;
+    state[1] = h_c_dt + dep_c;
+    state[2] = h_p_dt + dep_p;
 
     // Constant infusion into central (depot bypass) and/or into the **peripheral**
     // (#375): forced response of the 2-cpt IV propagator from a zero initial state.
@@ -570,18 +544,25 @@ fn build_three_cpt_mode_g<T: PkNum>(mu: T, k12: T, k13: T, k21: T, k31: T) -> Th
     ThreeCptModeG { mu, v, w, norm }
 }
 
+/// One eigenmode's share of the state `(c, p1, p2)`, scaled by `decay` — `e^{−μ·dt}` for a
+/// state's free evolution, the Bateman function `B(μ, ka, dt)` for a depot's drain.
 #[inline]
-fn apply_three_cpt_mode_g<T: PkNum>(m: &ThreeCptModeG<T>, c: T, p1: T, p2: T, dt: T) -> (T, T, T) {
+fn apply_three_cpt_mode_g<T: PkNum>(
+    m: &ThreeCptModeG<T>,
+    c: T,
+    p1: T,
+    p2: T,
+    decay: T,
+) -> (T, T, T) {
     if m.norm.br_abs_lt(1e-30) {
         return (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0));
     }
     let proj = m.w[0] * c + m.w[1] * p1 + m.w[2] * p2;
     let coef = proj / m.norm;
-    let exp_term = (-(m.mu * dt)).exp();
     (
-        coef * m.v[0] * exp_term,
-        coef * m.v[1] * exp_term,
-        coef * m.v[2] * exp_term,
+        coef * m.v[0] * decay,
+        coef * m.v[1] * decay,
+        coef * m.v[2] * decay,
     )
 }
 
@@ -609,9 +590,10 @@ pub fn propagate_three_cpt_core_g<T: PkNum>(
     let h_p1 = state[1] - a_ss_p1;
     let h_p2 = state[2] - a_ss_p2;
 
-    let (ca, p1a, p2a) = apply_three_cpt_mode_g(&e.modes[0], h_c, h_p1, h_p2, dt);
-    let (cb, p1b, p2b) = apply_three_cpt_mode_g(&e.modes[1], h_c, h_p1, h_p2, dt);
-    let (cg, p1g, p2g) = apply_three_cpt_mode_g(&e.modes[2], h_c, h_p1, h_p2, dt);
+    let decay = |m: &ThreeCptModeG<T>| (-(m.mu * dt)).exp();
+    let (ca, p1a, p2a) = apply_three_cpt_mode_g(&e.modes[0], h_c, h_p1, h_p2, decay(&e.modes[0]));
+    let (cb, p1b, p2b) = apply_three_cpt_mode_g(&e.modes[1], h_c, h_p1, h_p2, decay(&e.modes[1]));
+    let (cg, p1g, p2g) = apply_three_cpt_mode_g(&e.modes[2], h_c, h_p1, h_p2, decay(&e.modes[2]));
 
     state[0] = ca + cb + cg + a_ss_c;
     state[1] = p1a + p1b + p1g + a_ss_p1;
@@ -660,38 +642,29 @@ pub fn propagate_three_cpt_oral_core_g<T: PkNum>(
     rate_periph2: T,
     rate_depot: T,
 ) {
-    let (alpha, beta, gamma, k10, k12, k13, k21, k31) =
-        (e.alpha, e.beta, e.gamma, e.k10, e.k12, e.k13, e.k21, e.k31);
+    let (k10, k12, k13, k21, k31) = (e.k10, e.k12, e.k13, e.k21, e.k31);
 
     let a_d_0 = state[0];
     let a_c_0 = state[1];
     let a_p1_0 = state[2];
     let a_p2_0 = state[3];
 
-    let e_ka = (-(ka * dt)).exp();
-    state[0] = a_d_0 * e_ka;
+    state[0] = a_d_0 * (-(ka * dt)).exp();
 
-    let denom_depot = (ka - alpha) * (ka - beta) * (ka - gamma);
-    let d21 = k21 - ka;
-    let d31 = k31 - ka;
-    let (cap_a, cap_b, cap_c) = if denom_depot.br_abs_lt(1e-12) {
-        (T::from_f64(0.0), T::from_f64(0.0), T::from_f64(0.0))
-    } else {
-        let scale = -(ka * a_d_0) / denom_depot;
-        (scale * d21 * d31, scale * k12 * d31, scale * k13 * d21)
-    };
-
-    let h_c = a_c_0 - cap_a;
-    let h_p1 = a_p1_0 - cap_b;
-    let h_p2 = a_p2_0 - cap_c;
-
-    let (ca, p1a, p2a) = apply_three_cpt_mode_g(&e.modes[0], h_c, h_p1, h_p2, dt);
-    let (cb, p1b, p2b) = apply_three_cpt_mode_g(&e.modes[1], h_c, h_p1, h_p2, dt);
-    let (cg, p1g, p2g) = apply_three_cpt_mode_g(&e.modes[2], h_c, h_p1, h_p2, dt);
-
-    state[1] = ca + cb + cg + cap_a * e_ka;
-    state[2] = p1a + p1b + p1g + cap_b * e_ka;
-    state[3] = p2a + p2b + p2g + cap_c * e_ka;
+    // Each mode carries the state's free evolution `e^{−μ·dt}` plus its share of the depot's
+    // drain `ka·A_d(0)·e^{−ka·s}` into central, convolved: `B(μ, ka, dt)`, smooth through
+    // `ka = μ` ([`bateman`]).
+    let drain = ka * a_d_0;
+    let zero = T::from_f64(0.0);
+    let mut out = [zero; 3];
+    for m in &e.modes {
+        let free = apply_three_cpt_mode_g(m, a_c_0, a_p1_0, a_p2_0, (-(m.mu * dt)).exp());
+        let fed = apply_three_cpt_mode_g(m, drain, zero, zero, bateman(m.mu, ka, dt));
+        out[0] = out[0] + free.0 + fed.0;
+        out[1] = out[1] + free.1 + fed.1;
+        out[2] = out[2] + free.2 + fed.2;
+    }
+    state[1..4].copy_from_slice(&out);
 
     // Constant infusion into central (depot bypass) and/or into either
     // **peripheral** (#375): forced response of the 3-cpt IV propagator from a
@@ -1032,6 +1005,18 @@ fn propagate_bounds_g<T: PkNum>(
                 moving_bounds.push((t_start + d.duration, dual_end));
             }
         }
+        // The earlier pulses of an SS infusion still running after its record (#1121 when
+        // seeded; every overlapping pulse when `T_inf > II`) stop at `t + T_inf − ψ − j·II`:
+        // they move with the lag (through a seeded phase) and with a modeled duration.
+        moving_bounds.extend(residual_ends_g(
+            k,
+            d,
+            dose_lagtimes,
+            dose_lag_dual,
+            dose_inf_dual,
+            bounds.first().copied().unwrap_or(f64::NEG_INFINITY),
+            bounds.last().copied().unwrap_or(f64::INFINITY),
+        ));
     }
     let dual_pos = |w: f64| -> T {
         for &(val, dual) in &moving_bounds {
@@ -1059,6 +1044,40 @@ fn propagate_bounds_g<T: PkNum>(
         );
         apply_step_g(state, dt, pk, pk_model, rates);
     }
+}
+
+/// Dose `k`'s earlier steady-state pulses still infusing after its record
+/// (`dosing::ss_residual_infusions_g`) as `(position, dual end)`: the position is the value
+/// walk's own (`dosing::ss_residual_infusion_ends` on the `F`-reshaped dose; a recording reads
+/// no value), the dual the same end moving with an estimated lag (through a seeded record's
+/// phase) and with a modeled or `F`-reshaped window.
+fn residual_ends_g<T: PkNum>(
+    k: usize,
+    d: &DoseEvent,
+    dose_lagtimes: &[f64],
+    dose_lag_dual: &[T],
+    dose_inf_dual: &[Option<(T, T)>],
+    lo: f64,
+    hi: f64,
+) -> Vec<(f64, T)> {
+    let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
+    // Only the ends in `[lo, hi]`, the span the caller looks at (`j` keeps each one's index).
+    let ends: Vec<(usize, f64)> = crate::dosing::ss_residual_ends(d, lag, 1.0)
+        .within(lo, hi)
+        .collect();
+    if ends.is_empty() {
+        return Vec::new();
+    }
+    let lag_d = dose_lag_dual.get(k).copied().unwrap_or(T::from_f64(lag));
+    let t_inf = dose_inf_dual
+        .get(k)
+        .copied()
+        .flatten()
+        .map_or(T::from_f64(d.duration), |(_, w)| w);
+    let e0 = T::from_f64(d.time) + crate::dosing::ss_residual_infusions_g(d, lag_d, t_inf).0;
+    ends.into_iter()
+        .map(|(j, e)| (e, e0 - T::from_f64(j as f64 * d.ii)))
+        .collect()
 }
 
 /// The infusion rates (`F·rate`, already summed per compartment) active at clock time `mid`,
@@ -1108,18 +1127,23 @@ fn active_rates_g<T: PkNum>(
         if !gate.live(doses, k) {
             continue;
         }
-        let started = if strict_start {
-            t_start < mid
+        let started = |t: f64| if strict_start { t < mid } else { t <= mid };
+        // The earlier pulses of an SS infusion still infusing after its record (#1121; every
+        // overlapping pulse when `T_inf > II`), each on `[t, residual_end]` — production's
+        // `active_rates_at`.
+        let residual = if started(d.time) {
+            crate::dosing::ss_residual_ends(d, lag, 1.0).count_ending_at_or_after(mid)
         } else {
-            t_start <= mid
+            0
         };
-        if d.rate > 0.0 && d.duration > 0.0 && started && t_end >= mid {
-            // A dual window already carries its dose-time `F` (`modeled_dose_inf_duals`,
-            // #419) and is injected as-is, as production injects its `F`-applied rate. A
-            // fixed window has one only without bioavailability, where `pk.f` is 1.
-            let r = match dose_inf_dual.get(k).copied().flatten() {
-                Some((rate, _)) => rate,
-                None => pk.f * T::from_f64(d.rate),
+        let own = d.rate > 0.0 && d.duration > 0.0 && started(t_start) && t_end >= mid;
+        let pulses = residual + usize::from(own);
+        if pulses > 0 {
+            let (one, _) = infusion_window_g(d, dose_inf_dual.get(k).copied().flatten(), pk);
+            let r = if pulses == 1 {
+                one
+            } else {
+                one * T::from_f64(pulses as f64)
             };
             match pk_model.topology().dose_channel(d.cmt_raw()) {
                 Some(Channel::Central) => rate_central = rate_central + r,
@@ -1143,6 +1167,14 @@ fn active_rates_g<T: PkNum>(
         }
     }
     (rate_central, rate_periph1, rate_periph2, rate_depot)
+}
+
+/// An infusing dose's `(rate, duration)` as the walk injects them: a dual window already
+/// carries its dose-time `F` (`modeled_dose_inf_duals`, #419) and is used as-is, as production
+/// injects its `F`-applied rate; a fixed window has one only without bioavailability, where
+/// `pk.f` is 1.
+fn infusion_window_g<T: PkNum>(d: &DoseEvent, inf: Option<(T, T)>, pk: &PkDual<T>) -> (T, T) {
+    inf.unwrap_or((pk.f * T::from_f64(d.rate), T::from_f64(d.duration)))
 }
 
 /// Advance the dual state by one (possibly dual-length) step under a constant rate vector.
@@ -1280,7 +1312,23 @@ fn obs_boundary_correction<T: PkNum>(
             return Some((dual_start - T::from_f64(t), false));
         }
 
-        // (b) The sample sits on this dose's infusion *end*.
+        // (b) The sample sits on the end of an earlier SS pulse still running after the record.
+        if has_lag || dose_inf_dual.get(k).copied().flatten().is_some() {
+            for (e_val, e) in residual_ends_g(
+                k,
+                d,
+                dose_lagtimes,
+                dose_lag_dual,
+                dose_inf_dual,
+                t - 2e-9,
+                t + 2e-9,
+            ) {
+                if d.time < t && (e_val - t).abs() < 1e-9 {
+                    return Some((e - T::from_f64(t), true));
+                }
+            }
+        }
+        // (c) The sample sits on this dose's infusion *end*.
         if d.rate > 0.0 && d.duration > 0.0 && ((t_start + d.duration) - t).abs() < 1e-9 {
             let dual_end = match dose_inf_dual.get(k).copied().flatten() {
                 Some((_, dur_bare)) => dual_start + dur_bare,
@@ -1337,6 +1385,26 @@ pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
     false
 }
 
+/// The window duals of `DoseEvent::ss_cycle_doses` for a modeled or `F`-reshaped infusion
+/// `(rate, D)`: the newest pulse over `r = D − m·II` (`dosing::ss_overlap_split_g`, deciding `m`
+/// on the dual `D` so a recording guards it), and the `m` earlier ones over the whole cycle at
+/// `m·rate`, a fixed window. All `None` (`len` of them) for a fixed window.
+fn cycle_window_duals<T: PkNum>(
+    dose: &DoseEvent,
+    inf: Option<(T, T)>,
+    len: usize,
+) -> Vec<Option<(T, T)>> {
+    let Some((rate, dur)) = inf else {
+        return vec![None; len];
+    };
+    let (m, r) = crate::dosing::ss_overlap_split_g(dur, dose.ii);
+    let mut v = vec![Some((rate, r))];
+    if m > 0 {
+        v.push(Some((rate * T::from_f64(m as f64), T::from_f64(dose.ii))));
+    }
+    v
+}
+
 /// Equilibrate the dual state to its SS value for an SS=1 dose, per-event (uses
 /// `pk`, the dose-event's params). Generic mirror of
 /// `event_driven::equilibrate_ss_state_event_driven` for the 1-/2-cpt models;
@@ -1377,30 +1445,22 @@ fn equilibrate_ss_g<T: PkNum>(
         return state;
     }
     let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
-    if is_inf && dose.duration > dose.ii {
-        return state;
-    }
+    // The value walk's cycle doses, which keep the `F`-reshaped window (#419) and replay the
+    // always-running pulses of an overlapping infusion as one more window.
     let synthetic_dose = if is_inf {
-        vec![DoseEvent::new(
-            0.0,
-            dose.amt,
-            dose.cmt_raw(),
-            dose.rate,
-            false,
-            0.0,
-        )]
+        dose.ss_cycle_doses()
     } else {
         Vec::new()
     };
-    let synthetic_lag: Vec<f64> = if is_inf { vec![0.0] } else { Vec::new() };
+    let synthetic_lag = vec![0.0; synthetic_dose.len()];
     // #486: for a **modeled** SS infusion (`RATE=-1/-2`), thread the window dual
     // `(rate_bare, dur_bare)` so each equilibration cycle's active/quiet split carries the
     // moving infusion-end jet (`∂D`/`∂R`) through `propagate_bounds_g`'s `dual_pos`, exactly
     // as the main walk does for the current pulse — closing the closed-form SS × modeled-dose
     // gap. `None` (a fixed-window infusion) recovers the pre-#486 f64 window behaviour.
-    let synthetic_inf: Vec<Option<(T, T)>> = if is_inf { vec![inf] } else { Vec::new() };
+    let synthetic_inf = cycle_window_duals(dose, inf, synthetic_dose.len());
     let bounds: Vec<f64> = if is_inf {
-        vec![0.0, dose.duration, dose.ii]
+        vec![0.0, synthetic_dose[0].duration, dose.ii]
     } else {
         vec![0.0, dose.ii]
     };
@@ -1410,7 +1470,7 @@ fn equilibrate_ss_g<T: PkNum>(
     //
     // The SS equilibration runs in the dose's own periodic frame (the synthetic pulse sits at
     // t = 0), so its arrival is not a moving boundary: no lag duals. That still holds for the
-    // lagged SS bolus which now reaches here via `ss_bolus_state_at_phase_g`: the trough is
+    // lagged SS dose which now reaches here via `ss_state_at_phase_g`: the trough is
     // lag-independent by construction, and the lag enters only through the seed phase applied
     // at that call site.
     let advance = |u0: &[T], forced: bool| -> Option<Vec<T>> {
@@ -1482,56 +1542,79 @@ fn equilibrate_ss_g<T: PkNum>(
     state
 }
 
-/// Seed the dual walk at a lagged steady-state bolus record.
+/// Seed the dual walk at a lagged steady-state dose record — production's
+/// `ss_state_at_phase_event_driven`.
 ///
-/// At a dose record, the previous periodic pulse is `ss_seed_phase(II, ALAG)`
-/// old. The dual-valued phase carries lagtime derivatives through the pre-arrival
-/// steady-state tail when it is positive; the production clamp at `ALAG ≥ II`
-/// pins it to the post-pulse peak with a zero jet. SS infusions need their
-/// residual previous-cycle forcing too and therefore remain outside this helper's
-/// scope.
-fn ss_bolus_state_at_phase_g<T: PkNum>(
+/// At a dose record, the previous periodic pulse is `ss_seed_phase(II, ALAG)` old: the trough,
+/// then the pulse (a bolus's jump, or an infusion's window) carried `phase = II − ALAG` forward,
+/// a dual length carrying the lag's jet. An infusion's flow runs through `propagate_bounds_g` on
+/// the cycle's own clock (pulse at 0, record at `phase`), its arrival a moving break whose value
+/// is 0 and whose jet is the lag's, so the window (a modeled duration's jet included) and the
+/// rest of the phase take the same lengths production steps; an infusion still running at the
+/// record is carried past it by the walk's residual windows (`dosing::ss_residual_infusion_ends`);
+/// an overlapping one (`T_inf > II`) also replays its always-running pulses
+/// (`DoseEvent::ss_cycle_doses`).
+/// The production clamp at `ALAG ≥ II` pins the seed at the post-pulse instant with no lag jet:
+/// the trough plus a bolus, or the bare trough for an infusion (its residual window delivers
+/// the cycle).
+fn ss_state_at_phase_g<T: PkNum>(
     pk_model: PkModel,
     pk: &PkDual<T>,
     dose: &DoseEvent,
     lag: T,
+    inf: Option<(T, T)>,
 ) -> Vec<T> {
-    let mut state = equilibrate_ss_g(pk_model, pk, dose, None);
+    use crate::sens::num::BranchCmp as B;
+    let mut state = equilibrate_ss_g(pk_model, pk, dose, inf);
     let (n_states, _) = state_layout_g(pk_model);
     let cmt_idx = dose.cmt_idx();
     if cmt_idx >= n_states {
         return state;
     }
-    // Production's phase is `dosing::ss_seed_phase` = `(II − lag).max(0)`, and this dual's
-    // `phase.val()` *is* `II − lag`. The clamp therefore needs exactly **one** gate, and the
-    // `phase.val() > 0.0` below is it: skipping the step leaves the seed at the post-pulse
-    // peak — production's clamped value — and drops the `−d(lag)` jet with it, since the jet
-    // reaches the state only through `apply_step_g`. Writing the clamp a second time into
-    // `phase` itself would reject exactly these inputs, so neither copy could fail on its own
-    // (#1229, "two redundant gates cover for each other"). Measured before #2093: with the
-    // single gate below removed, the retired `ss_bolus_lag_at_least_interval_matches_production`
-    // failed; with the clamp *also* written into `phase`, it passed. Its adjoint successor is
-    // `ode_steady_state_under_a_lag_past_the_interval_matches_reconverged_fd`.
-    //
-    // Past `lag >= II` the clamped phase is locally constant, so keeping `−d(lag)` would
-    // differentiate a function production does not predict, and the negative step would
-    // propagate the PK system backward.
-    let phase = T::from_f64(dose.ii) - lag;
-    state[cmt_idx] = state[cmt_idx] + pk.f * T::from_f64(dose.amt);
-    if phase.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
-        apply_step_g(
-            &mut state,
-            phase,
-            pk,
-            pk_model,
-            (
-                T::from_f64(0.0),
-                T::from_f64(0.0),
-                T::from_f64(0.0),
-                T::from_f64(0.0),
-            ),
-        );
+    let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
+    if !is_inf {
+        state[cmt_idx] = state[cmt_idx] + pk.f * T::from_f64(dose.amt);
     }
+    // Production's phase is `dosing::ss_seed_phase` = `(II − lag).max(0)`, and this dual's value
+    // is `II − lag`. One gate, here: skipping the flow leaves the seed at production's clamped
+    // value and drops the `−d(lag)` jet with it (#1229, "two redundant gates cover for each
+    // other"); past `lag ≥ II` the clamped phase is locally constant, and a negative step would
+    // propagate the system backward. Measured before #2093: with this gate removed, the retired
+    // `ss_bolus_lag_at_least_interval_matches_production` failed; its adjoint successor is
+    // `ode_steady_state_under_a_lag_past_the_interval_matches_reconverged_fd`.
+    let phase = T::from_f64(dose.ii) - lag;
+    if !phase.br_cmp_c(B::Gt, 0.0) {
+        return state;
+    }
+    let zero = T::from_f64(0.0);
+    if !is_inf {
+        apply_step_g(&mut state, phase, pk, pk_model, (zero, zero, zero, zero));
+        return state;
+    }
+    let phase_v = phase.seen_value();
+    let cycle = dose.ss_cycle_doses();
+    let cycle_inf = cycle_window_duals(dose, inf, cycle.len());
+    let (_, r) = infusion_window_g(&cycle[0], cycle_inf[0], pk);
+    // The flow's shape — whether the newest window closes before the record — is a guard on
+    // the phase.
+    let bounds = if phase.br_cmp(B::Gt, r) {
+        vec![0.0, cycle[0].duration, phase_v]
+    } else {
+        vec![0.0, phase_v]
+    };
+    // The arrival: value 0 where recorded, the lag's jet (and its shift, on a replay at another lag).
+    let arrival = lag - T::from_f64(lag.seen_value());
+    propagate_bounds_g(
+        &mut state,
+        &bounds,
+        pk,
+        pk_model,
+        &cycle,
+        &vec![0.0; cycle.len()],
+        &vec![arrival; cycle.len()],
+        &cycle_inf,
+        f64::NEG_INFINITY,
+    );
     state
 }
 
@@ -1663,21 +1746,57 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     }
     let (n_states, central_slot) = state_layout_g(pk_model);
 
-    // A recording keeps the schedule's order, which the lagged arrival times decide: each
-    // adjacent pair's relation (earlier, or tied) is a guard on the recorded times (#2786).
-    if T::RECORDS_BRANCHES && !dose_lag_dual.is_empty() {
+    // A recording keeps the order of the walk's breaks, which the lagged arrivals and the
+    // infusion window ends (moving with a lag, a modeled `D`/`R` or `F`) decide: each adjacent
+    // pair's relation (earlier, or tied) is a guard on the recorded times (#2786).
+    if T::RECORDS_BRANCHES
+        && (!dose_lag_dual.is_empty() || dose_inf_dual.iter().any(Option::is_some))
+    {
         use crate::sens::num::BranchCmp as B;
-        let at = |ev: &crate::pk::event_driven::Event| -> (T, f64) {
-            match ev.kind {
-                EventKind::Dose => {
-                    let lag = dose_lag_dual[ev.orig_idx];
-                    (T::from_f64(eff_doses[ev.orig_idx].time) + lag, ev.time)
-                }
-                _ => (T::from_f64(ev.time), ev.time),
-            }
+        let arrival = |k: usize| -> T {
+            let t = eff_doses[k].time;
+            dose_lag_dual.get(k).map_or_else(
+                || T::from_f64(t + schedule.dose_lagtimes[k]),
+                |&lag| T::from_f64(t) + lag,
+            )
         };
-        for w in schedule.events.windows(2) {
-            let ((a, av), (b, bv)) = (at(&w[0]), at(&w[1]));
+        let mut breaks: Vec<(T, f64)> = schedule
+            .events
+            .iter()
+            .map(|ev| match ev.kind {
+                EventKind::Dose => (arrival(ev.orig_idx), ev.time),
+                _ => (T::from_f64(ev.time), ev.time),
+            })
+            .collect();
+        for (k, d) in eff_doses.iter().enumerate() {
+            if d.rate > 0.0 && d.duration > 0.0 {
+                let dur = dose_inf_dual
+                    .get(k)
+                    .copied()
+                    .flatten()
+                    .map_or(T::from_f64(d.duration), |(_, w)| w);
+                let end_v = d.time + schedule.dose_lagtimes[k] + d.duration;
+                breaks.push((arrival(k) + dur, end_v));
+            }
+            for (e_val, e) in residual_ends_g(
+                k,
+                d,
+                &schedule.dose_lagtimes,
+                dose_lag_dual,
+                dose_inf_dual,
+                f64::NEG_INFINITY,
+                schedule
+                    .events
+                    .iter()
+                    .map(|ev| ev.time)
+                    .fold(f64::NEG_INFINITY, f64::max),
+            ) {
+                breaks.push((e, e_val));
+            }
+        }
+        breaks.sort_by(|a, b| a.1.total_cmp(&b.1));
+        for w in breaks.windows(2) {
+            let ((a, av), (b, bv)) = (w[0], w[1]);
             let cc = if av < bv { B::Lt } else { B::Eq };
             if !a.br_cmp(cc, b) {
                 return preds;
@@ -1740,13 +1859,14 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 // snapshot above. State jumps at the arrival, not here (#1073).
                 let d = &eff_doses[ev.orig_idx];
                 let lag = schedule.dose_lagtimes[ev.orig_idx];
-                if crate::dosing::ss_bolus_seeded_at_record(d, lag) {
+                if crate::dosing::ss_seeded_at_record(d, lag) {
                     let lag_dual = dose_lag_dual
                         .get(ev.orig_idx)
                         .copied()
                         .unwrap_or_else(|| T::from_f64(lag));
+                    let inf = dose_inf_dual.get(ev.orig_idx).copied().flatten();
                     state =
-                        ss_bolus_state_at_phase_g(pk_model, &pk_at_dose[ev.orig_idx], d, lag_dual);
+                        ss_state_at_phase_g(pk_model, &pk_at_dose[ev.orig_idx], d, lag_dual, inf);
                 }
             }
             EventKind::Dose => {
@@ -1770,7 +1890,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 // The exact complement of the `DoseRecord` seed above, read from the same
                 // predicate: the walk must not both seed and re-equilibrate (which would
                 // discard the propagation), nor do neither.
-                if d.ss && d.ii > 0.0 && !crate::dosing::ss_bolus_seeded_at_record(d, lag) {
+                if crate::dosing::ss_equilibrates_at_arrival(d, lag) {
                     // #486: forward this dose's modeled-window dual (if any) so the SS
                     // equilibration threads `∂D`/`∂R` into the trough, matching the current
                     // pulse handled by the main walk. `None` for a fixed infusion / bolus.

@@ -259,6 +259,7 @@ pub fn ctmm_subject_nll(
             n_states,
             state_codes,
             generator_fn,
+            generator_program,
             generator_states,
             ..
         } = endpoint
@@ -285,6 +286,7 @@ pub fn ctmm_subject_nll(
                     *n_states,
                     state_codes,
                     generator_fn,
+                    generator_program.as_ref(),
                     theta,
                     eta,
                 )
@@ -325,6 +327,7 @@ fn ctmm_endpoint_nll_inhomogeneous(
     n_states: usize,
     state_codes: &[usize],
     generator_fn: &GeneratorFn,
+    prog: Option<&crate::parser::model_parser::CtmmGeneratorProgram>,
     theta: &[f64],
     eta: &[f64],
 ) -> f64 {
@@ -375,6 +378,9 @@ fn ctmm_endpoint_nll_inhomogeneous(
     debug_assert_eq!(states.len(), grid.len());
 
     let cov = &subject.covariates;
+    // The generator program on a jet along τ, for a stiff step's exact `f_t`
+    // (`generator_tau_jet`); without a program the step differences.
+    let tau_jet = prog.and_then(|prog| Some((prog, prog.vars_g(theta, eta, cov)?)));
     let mut nll = 0.0;
     for (m, w) in obs.windows(2).enumerate() {
         let (t0, t1) = (w[0].time, w[1].time);
@@ -399,14 +405,7 @@ fn ctmm_endpoint_nll_inhomogeneous(
         let n_ode = states[base].len();
         let interp_scratch = std::cell::RefCell::new(vec![0.0_f64; n_ode]);
         let interp_into = |tau: f64, out: &mut [f64]| {
-            if dt <= 0.0 {
-                out.copy_from_slice(&states[base]);
-                return;
-            }
-            let frac = (tau / dt).clamp(0.0, 1.0) * (n_sub as f64);
-            let lo = (frac.floor() as usize).min(n_sub);
-            let hi = (lo + 1).min(n_sub);
-            let w_hi = frac - lo as f64;
+            let (lo, hi, w_hi) = sub_bracket(tau, dt);
             let (a, b) = (&states[base + lo], &states[base + hi]);
             for (o, (x, y)) in out.iter_mut().zip(a.iter().zip(b.iter())) {
                 *o = x + (y - x) * w_hi;
@@ -449,6 +448,14 @@ fn ctmm_endpoint_nll_inhomogeneous(
                 interp_into(tau, &mut st);
                 generator_fn(theta, eta, cov, &st)
             },
+            |tau| {
+                let (prog, (vars, cov_vec)) = tau_jet.as_ref()?;
+                let (lo, hi, w) = sub_bracket(tau, dt);
+                let (x, y) = (&states[base + lo], &states[base + hi]);
+                let q = generator_tau_jet(prog, theta, eta, cov_vec, vars, x, y, w, dt);
+                let dq = |a: usize, b: usize| q[a * n_states + b].g[0];
+                Some(nalgebra::DMatrix::from_fn(n_states, n_states, dq))
+            },
             dt,
             n_states,
             &ode.effective_solver_opts(),
@@ -479,6 +486,58 @@ fn gap_grid(obs: &[StateObs]) -> Option<Vec<f64>> {
         }
     }
     Some(grid)
+}
+
+/// The sub-nodes bracketing elapsed time `tau` in a gap of length `dt` (`gap_grid`'s
+/// `n_sub + 1` uniform nodes) and the weight of the upper one: the state there is
+/// `x_lo + (x_hi − x_lo)·w`. `(0, 0, 0)` — the gap's start — for `dt ≤ 0`.
+fn sub_bracket(tau: f64, dt: f64) -> (usize, usize, f64) {
+    if dt <= 0.0 {
+        return (0, 0, 0.0);
+    }
+    let n_sub = INHOMOGENEOUS_SUBNODES_PER_GAP;
+    let frac = (tau / dt).clamp(0.0, 1.0) * (n_sub as f64);
+    let lo = (frac.floor() as usize).min(n_sub);
+    (lo, (lo + 1).min(n_sub), frac - lo as f64)
+}
+
+/// A one-direction jet over `T`: the value and one tangent.
+type Jet<T> = crate::sens::jet::DualT<1, T>;
+
+/// `Q` (row-major) at elapsed time `τ` in a gap of length `dt`, as the values, and `∂Q/∂τ`, as
+/// the tangents: the generator program at the interpolated state `x + (y − x)·w` between the
+/// bracketing sub-nodes ([`sub_bracket`]), on a jet along the state's motion
+/// `(y − x)·n_sub/dt` — θ, η and the `[individual_parameters]` slots `vars`
+/// (`CtmmGeneratorProgram::vars_g`) constant. The right derivative at a sub-node, the bracket the value path takes.
+#[allow(clippy::too_many_arguments)]
+fn generator_tau_jet<T: crate::sens::num::vm::VmNum>(
+    prog: &crate::parser::model_parser::CtmmGeneratorProgram,
+    theta: &[T],
+    eta: &[T],
+    cov_vec: &[f64],
+    vars: &[T],
+    x: &[T],
+    y: &[T],
+    w: f64,
+    dt: f64,
+) -> Vec<Jet<T>> {
+    let lift = |xs: &[T]| -> Vec<Jet<T>> {
+        let zero = T::from_f64(0.0);
+        xs.iter().map(|&v| Jet { v, g: [zero] }).collect()
+    };
+    let (w, rate) = (
+        T::from_f64(w),
+        T::from_f64(INHOMOGENEOUS_SUBNODES_PER_GAP as f64 / dt),
+    );
+    let st: Vec<Jet<T>> = x
+        .iter()
+        .zip(y)
+        .map(|(&x, &y)| Jet {
+            v: x + (y - x) * w,
+            g: [(y - x) * rate],
+        })
+        .collect();
+    prog.generator_at_g(&lift(theta), &lift(eta), cov_vec, &mut lift(vars), &st)
 }
 
 /// Every time a drug-driven CTMM endpoint reads the ODE state at, for the subject — what a
@@ -621,11 +680,8 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
                     *o = acc;
                 }
             } else {
-                let tau = tau.val();
-                let frac = (tau / dt).clamp(0.0, 1.0) * (n_sub as f64);
-                let lo = (frac.floor() as usize).min(n_sub);
-                let hi = (lo + 1).min(n_sub);
-                let w_hi = T::from_f64(frac - lo as f64);
+                let (lo, hi, w_hi) = sub_bracket(tau.val(), dt);
+                let w_hi = T::from_f64(w_hi);
                 for (o, (x, y)) in st.iter_mut().zip(nodes[lo].iter().zip(nodes[hi].iter())) {
                     *o = *x + (*y - *x) * w_hi;
                 }
@@ -642,6 +698,9 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
                 }
             }
         };
+        // A stiff step's exact `J` and `f_t` come off the recording (`PkNum::rhs_jacobian`), the
+        // only type this walk runs on in a fit; the f64 value path registers its own
+        // (`ctmm_endpoint_nll_inhomogeneous`).
         let mut u0 = vec![T::from_f64(0.0); s * s];
         for i in 0..s {
             u0[i * s + i] = T::from_f64(1.0);
@@ -830,7 +889,7 @@ mod tests {
     }
 
     /// The load-bearing end-to-end check: the exact η-gradient — `∂Q/∂η` from replaying the
-    /// parsed intensities over `Dual1`, chained through the adjoint Van Loan derivative of
+    /// parsed intensities over `Dual2`, chained through the adjoint Van Loan derivative of
     /// `expm` — must equal a central finite difference of the *same* subject NLL the fit
     /// minimizes. This is what pins the whole chain (parser → program → generator jets →
     /// Fréchet) to the function it claims to differentiate.
@@ -873,6 +932,155 @@ mod tests {
     /// and fails the first two.
     #[test]
     fn a_drug_driven_ctmm_is_differentiated_exactly() {
+        let (model, subject) = drug_driven_ctmm(1e-12, 1e-14, None);
+        let (worst_v, worst_g, worst_h) = drug_driven_gaps(&model, &subject);
+        // Measured: the value bit-identical to the f64 path's (the same solves on the same
+        // steps), the gradients 5.8e-7 and the Hessian 1.9e-7 off the Richardson differences —
+        // the differences' own floor on an adaptively stepped likelihood. An unfilled state
+        // slot or a dropped gap misses by O(1).
+        assert!(worst_v < 1e-12, "value {worst_v:.2e}");
+        assert!(worst_g < 3e-6, "gradient {worst_g:.2e}");
+        assert!(worst_h < 1e-6, "Hessian {worst_h:.2e}");
+    }
+
+    /// [`a_drug_driven_ctmm_is_differentiated_exactly`] on a stiff method: the f64 value path's
+    /// occupancy step takes the exact `J` and `f_t` (`generator_tau_jet`,
+    /// `kolmogorov_jacobian`), as the recording reads them off itself.
+    #[test]
+    fn a_stiff_drug_driven_ctmm_takes_the_exact_jacobian() {
+        let (model, subject) = drug_driven_ctmm(1e-10, 1e-12, Some(crate::ode::OdeMethod::Rodas4));
+        let (worst_v, worst_g, worst_h) = drug_driven_gaps(&model, &subject);
+        // Measured (Linux x86_64): the value 1.3e-11 off the recording's (not bit-identical, as
+        // the RK45 fixture is), the gradient 9.2e-8 and the Hessian 6.8e-7 off the Richardson
+        // differences — inside the RK45 fixture's bounds.
+        assert!(worst_v < 1e-10, "value {worst_v:.2e}");
+        assert!(worst_g < 3e-6, "gradient {worst_g:.2e}");
+        assert!(worst_h < 1e-6, "Hessian {worst_h:.2e}");
+        // The occupancy step's own shift, FD-J → exact-J (the PK solve exact either way): the
+        // value path with and without the program `∂Q/∂τ` comes from — and so, without one,
+        // differences. At this tolerance and at a production one; a moved value is also what
+        // says the value path reaches the registration. Measured: −3.4e-11 at 1e-10, 5.9e-8 at
+        // 1e-6, on an NLL of 4.347.
+        let theta = model.default_params.theta.clone();
+        for tol in [1e-10, 1e-6] {
+            let (model, subject) =
+                drug_driven_ctmm(tol, tol * 1e-2, Some(crate::ode::OdeMethod::Rodas4));
+            let Some(EndpointLikelihood::Ctmm {
+                n_states,
+                state_codes,
+                generator_fn,
+                generator_program,
+                ..
+            }) = model.endpoints.get(&5)
+            else {
+                panic!("a Ctmm endpoint on CMT 5");
+            };
+            let nll = |prog| {
+                ctmm_endpoint_nll_inhomogeneous(
+                    &model,
+                    &subject,
+                    5,
+                    *n_states,
+                    state_codes,
+                    generator_fn,
+                    prog,
+                    &theta,
+                    &[0.25],
+                )
+            };
+            let (exact, fd) = (nll(generator_program.as_ref()), nll(None));
+            eprintln!(
+                "stiff drug-driven CTMM at reltol {tol:e}: NLL {exact} (exact-J) vs {fd} (FD-J), \
+                 shift {:.2e}",
+                exact - fd
+            );
+            assert!(exact.is_finite() && fd.is_finite() && exact != fd);
+        }
+    }
+
+    /// `generator_tau_jet`'s `∂Q/∂τ` against a central difference of the f64 generator the
+    /// value path integrates — the tree walk, a second implementation of `Q` — at the
+    /// interpolated state, inside a sub-interval of every gap; and its value against `Q`.
+    #[test]
+    fn generator_tau_jet_matches_the_value_paths_generator() {
+        let (model, subject) = drug_driven_ctmm(1e-10, 1e-12, None);
+        let Some(EndpointLikelihood::Ctmm {
+            generator_fn,
+            generator_program: Some(prog),
+            state_codes,
+            ..
+        }) = model.endpoints.get(&5)
+        else {
+            panic!("a drug-driven Ctmm endpoint with a program");
+        };
+        let theta = model.default_params.theta.clone();
+        let eta = [0.25];
+        let obs = collect_state_obs(5, state_codes, &subject.obs_records).unwrap();
+        let grid = gap_grid(&obs).unwrap();
+        let ode = model.ode_spec.as_ref().unwrap();
+        let pk = (model.pk_param_fn)(&theta, &eta, &subject.covariates, 0.0);
+        let mut pk_at_dose = Vec::new();
+        crate::pk::compute_dose_pk_params_into(&model, &subject, &theta, &eta, &mut pk_at_dose);
+        let states = crate::ode::predictions::ode_dense_solve_states_reading(
+            ode,
+            &pk.values,
+            crate::ode::predictions::DoseReads::PerDose(&pk_at_dose),
+            &subject,
+            &grid,
+        );
+        let (vars, cov_vec) = prog.vars_g(&theta, &eta, &subject.covariates).unwrap();
+        let n_sub = INHOMOGENEOUS_SUBNODES_PER_GAP;
+        let q_tree = |base: usize, tau: f64, dt: f64| {
+            let (lo, hi, w) = sub_bracket(tau, dt);
+            let st: Vec<f64> = states[base + lo]
+                .iter()
+                .zip(&states[base + hi])
+                .map(|(x, y)| x + (y - x) * w)
+                .collect();
+            generator_fn(&theta, &eta, &subject.covariates, &st)
+        };
+        let (mut worst_q, mut worst_dq, mut live) = (0.0f64, 0.0f64, 0.0f64);
+        for (m, w) in obs.windows(2).enumerate() {
+            let dt = w[1].time - w[0].time;
+            let base = m * (n_sub + 1);
+            for frac in [0.37, 5.5, 11.8] {
+                let tau = frac / n_sub as f64 * dt;
+                let (lo, hi, wt) = sub_bracket(tau, dt);
+                let (x, y) = (&states[base + lo], &states[base + hi]);
+                let q = generator_tau_jet(prog, &theta, &eta, &cov_vec, &vars, x, y, wt, dt);
+                let h = 1e-4 * dt / n_sub as f64;
+                let fd = (q_tree(base, tau + h, dt) - q_tree(base, tau - h, dt)) / (2.0 * h);
+                let qv = q_tree(base, tau, dt);
+                for a in 0..2 {
+                    for b in 0..2 {
+                        let (v, d) = (q[a * 2 + b].v, q[a * 2 + b].g[0]);
+                        assert!(v.is_finite() && d.is_finite() && fd[(a, b)].is_finite());
+                        assert!(qv[(a, b)].is_finite());
+                        worst_q = worst_q.max((v - qv[(a, b)]).abs());
+                        worst_dq = worst_dq.max((d - fd[(a, b)]).abs() / (1.0 + fd[(a, b)].abs()));
+                        live = live.max(d.abs());
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "generator_tau_jet: Q {worst_q:.2e}, ∂Q/∂τ {worst_dq:.2e}, max |∂Q/∂τ| {live:.2e}"
+        );
+        assert!(
+            live > 1e-3,
+            "∂Q/∂τ is flat: the fixture does not move the state"
+        );
+        assert!(worst_q < 1e-12, "Q {worst_q:.2e}");
+        assert!(worst_dq < 1e-8, "∂Q/∂τ {worst_dq:.2e}");
+    }
+
+    /// The drug-driven CTMM fixture of [`a_drug_driven_ctmm_is_differentiated_exactly`] at the
+    /// given ODE tolerances and method: two doses, the second on residual drug.
+    fn drug_driven_ctmm(
+        reltol: f64,
+        abstol: f64,
+        method: Option<crate::ode::OdeMethod>,
+    ) -> (CompiledModel, Subject) {
         use crate::types::DoseEvent;
         let src = r"
 [parameters]
@@ -906,8 +1114,11 @@ mod tests {
 ";
         let mut model = crate::parser::model_parser::parse_model_string(src).expect("parse");
         if let Some(ode) = model.ode_spec.as_mut() {
-            ode.solver_opts.reltol = 1e-12;
-            ode.solver_opts.abstol = 1e-14;
+            ode.solver_opts.reltol = reltol;
+            ode.solver_opts.abstol = abstol;
+            if let Some(m) = method {
+                ode.solver_opts.method = m;
+            }
         }
         let mut subject =
             ctmm_subject(&[(0.5, 0), (1.5, 1), (3.0, 1), (7.0, 0), (9.0, 1), (12.0, 0)]);
@@ -915,6 +1126,13 @@ mod tests {
             DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
         ];
+        (model, subject)
+    }
+
+    /// The worst relative gaps of the drug-driven fixture: the exact path's value against the
+    /// f64 value path's, its η-gradient and θ-score against Richardson differences of the value
+    /// path, and its η-Hessian against those of the exact gradient.
+    fn drug_driven_gaps(model: &CompiledModel, subject: &Subject) -> (f64, f64, f64) {
         let theta = model.default_params.theta.clone();
         let rich = |f: &dyn Fn(f64) -> f64, x: f64| {
             let d = |h: f64| (f(x + h) - f(x - h)) / (2.0 * h);
@@ -930,6 +1148,7 @@ mod tests {
             worst_v = worst_v.max((v - v_ref).abs() / (1.0 + v_ref.abs()));
             let fd = rich(&|e| ctmm_subject_nll(&model, &subject, &theta, &[e]), eta0);
             assert!(g[0].abs() > 1e-3, "η = {eta0}: ∂/∂ETA_CL is flat: {}", g[0]);
+            assert!(g[0].is_finite() && fd.is_finite());
             worst_g = worst_g.max((g[0] - fd).abs() / (1.0 + fd.abs()));
             let (_, h) = ctmm_subject_eta_hessian(&model, &subject, &theta, &[eta0]).unwrap();
             let hd = rich(
@@ -940,6 +1159,7 @@ mod tests {
                 },
                 eta0,
             );
+            assert!(h[(0, 0)].is_finite() && hd.is_finite());
             worst_h = worst_h.max((h[(0, 0)] - hd).abs() / (1.0 + hd.abs()));
             let (_, gt) = crate::sens::ode_provider::adjoint::non_gaussian_theta_score(
                 &model,
@@ -957,6 +1177,7 @@ mod tests {
                     },
                     theta[i],
                 );
+                assert!(gt[i].is_finite() && fd.is_finite());
                 worst_g = worst_g.max((gt[i] - fd).abs() / (1.0 + fd.abs()));
             }
             assert!(gt[0].abs() > 1e-3, "∂/∂TVCL is flat: {}", gt[0]);
@@ -964,13 +1185,7 @@ mod tests {
         eprintln!(
             "drug-driven CTMM: value {worst_v:.2e}, gradient {worst_g:.2e}, Hessian {worst_h:.2e}"
         );
-        // Measured: the value bit-identical to the f64 path's (the same solves on the same
-        // steps), the gradients 5.8e-7 and the Hessian 1.9e-7 off the Richardson differences —
-        // the differences' own floor on an adaptively stepped likelihood. An unfilled state
-        // slot or a dropped gap misses by O(1).
-        assert!(worst_v < 1e-12, "value {worst_v:.2e}");
-        assert!(worst_g < 3e-6, "gradient {worst_g:.2e}");
-        assert!(worst_h < 1e-6, "Hessian {worst_h:.2e}");
+        (worst_v, worst_g, worst_h)
     }
 
     /// #1187 at this objective. The inhomogeneous CTMM path reads its drug concentration
@@ -1285,7 +1500,7 @@ mod tests {
         HashMap::from([("X".to_string(), x)])
     }
 
-    /// `Q` and `∂Q/∂(θ, η)` from the dual-evaluable program over `Dual1<N>`, θ_m on axis
+    /// `Q` and `∂Q/∂(θ, η)` from the dual-evaluable program over `Dual2<N>`, θ_m on axis
     /// `m` and η_k on axis `n_θ + k` (`N = n_θ + n_η`): `dq[a]` is `∂Q/∂(axis a)`.
     fn generator_duals<const N: usize>(
         prog: &crate::parser::model_parser::CtmmGeneratorProgram,
@@ -1293,11 +1508,11 @@ mod tests {
         eta: &[f64],
         covariates: &HashMap<String, f64>,
     ) -> (DMatrix<f64>, Vec<DMatrix<f64>>) {
-        use crate::sens::dual1::Dual1;
+        use crate::sens::dual2::Dual2;
         assert_eq!(N, theta.len() + eta.len(), "one dual axis per θ and η");
-        let th: Vec<Dual1<N>> = (0..theta.len()).map(|m| Dual1::var(theta[m], m)).collect();
-        let et: Vec<Dual1<N>> = (0..eta.len())
-            .map(|k| Dual1::var(eta[k], theta.len() + k))
+        let th: Vec<Dual2<N>> = (0..theta.len()).map(|m| Dual2::var(theta[m], m)).collect();
+        let et: Vec<Dual2<N>> = (0..eta.len())
+            .map(|k| Dual2::var(eta[k], theta.len() + k))
             .collect();
         let q = prog
             .eval_generator_g(&th, &et, covariates)

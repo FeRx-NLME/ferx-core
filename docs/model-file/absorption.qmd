@@ -207,10 +207,13 @@ matches NONMEM's native `ADVAN2` zero-order-into-depot behaviour exactly (see
 closed-form `pk *_transit` / `*_ig` model with an infusion reroutes to its ODE
 twin automatically. Because every kernel's CDF is a closed form
 (`regularized_gamma_p` for transit, the two-`Φ` IG CDF, elementary for
-Weibull/first-order), `R_in_inf` is exact and cheap; fit-time sensitivities use a
-finite-difference fallback (the dual walk's `+rate` suppression is a follow-up),
-which runs at normal FOCEI speed since an infusion prediction needs no
-equilibration.
+Weibull/first-order), `R_in_inf` is exact and cheap, and fit-time sensitivities are
+exact: the adjoint walks deliver the infusion through the same convolved `R_in_inf`
+(no plain `+rate`), and when the window's start or end moves with an estimated
+parameter — `F` on a rate-defined infusion, a modeled `RATE=-1`/`-2` dose, or a
+compartment or per-route lag — the kink of `R_in_inf` there is crossed as a moving
+boundary. The window end is a break of every integration timeline, including under a
+per-route lag (where it sits one window after the route's onset).
 
 Two infusion combinations remain **rejected with a clear error**: into a
 `zero_order()` window (`E_ABSORPTION_RATE_ZERO_ORDER` — a window-with-window

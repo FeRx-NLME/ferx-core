@@ -572,15 +572,17 @@ mod sde_steady_state_scores_like_the_explicit_train {
         let (got, warnings) = ofv(&ss);
         let (want, _) = ofv(&train);
         let (was, _) = ofv(&single);
-        // Measured: bit-identical (10.125356 both). The straddle is measured against the
+        // Measured: 10.125362 vs 10.125364 (2e-6: the EBE now converges on the exact kernel
+        // gradient, so the two subjects stop at slightly different points; they were
+        // bit-identical on the FD gradient). The straddle is measured against the
         // OLD behaviour itself, not inferred from the control below: with the `SS=1` hook
         // in `solve_ekf` disabled, this arm scores **9.290403** — 0.835 *below* the train,
         // `p_obs` 55 % low at the first sample and 2–3 % low after the first update on an
-        // `IPRED` that is the ODE path's and so already equilibrated. The bound sits six
+        // `IPRED` that is the ODE path's and so already equilibrated. The bound sits four
         // orders inside that gap. (The issue's 120.53 was on DVs with more residual
         // leverage.)
         assert!(
-            (got - want).abs() < 1e-6,
+            (got - want).abs() < 1e-4,
             "SS=1 record scores {got:.6} against the explicit train's {want:.6}"
         );
         // Non-degeneracy of the flag: the `SS=0` control scores 15.2427, a 5.12 gap. That is
@@ -598,4 +600,77 @@ mod sde_steady_state_scores_like_the_explicit_train {
             "the retired SS warning must not reach the fit: {warnings:?}"
         );
     }
+}
+
+/// `examples/warfarin_sde.ferx` fits on the exact gradient: no `gradient = fd` line, and a
+/// FOCE fit on a small population reports no finite-difference fallback. Dies when an SDE
+/// subject declines the adjoint (the variance rows fail to record) and falls back per subject.
+#[test]
+fn the_warfarin_sde_example_fits_without_a_finite_difference_fallback() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/warfarin_sde.ferx"
+    ))
+    .expect("example readable");
+    assert!(
+        !src.contains("gradient_method"),
+        "the example must not pin FD"
+    );
+    let parsed = parse_full_model(&src).expect("example parses");
+    assert!(parsed.model.is_sde());
+    let opts = FitOptions {
+        outer_maxiter: 3,
+        optimizer: Optimizer::Auto,
+        ..fast_foce_opts()
+    };
+    let fit = fit(
+        &parsed.model,
+        &make_sde_population(),
+        &parsed.model.default_params,
+        &opts,
+    )
+    .expect("fit runs");
+    assert!(fit.ofv.is_finite());
+    let fd: Vec<_> = fit
+        .warnings
+        .iter()
+        .filter(|w| w.contains("finite-difference"))
+        .collect();
+    assert!(fd.is_empty(), "FD fallback reported: {fd:?}");
+}
+
+/// The same example with the covariance step on: the R-matrix through the variance rows and
+/// the held-EBE score run, and no warning anywhere reports a finite-difference route.
+#[test]
+fn the_warfarin_sde_example_reports_no_fd_fallback_with_a_covariance_step() {
+    let src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/warfarin_sde.ferx"
+    ))
+    .expect("example readable");
+    let parsed = parse_full_model(&src).expect("example parses");
+    let opts = FitOptions {
+        outer_maxiter: 3,
+        optimizer: Optimizer::Auto,
+        run_covariance_step: true,
+        ..fast_foce_opts()
+    };
+    let fit = fit(
+        &parsed.model,
+        &make_sde_population(),
+        &parsed.model.default_params,
+        &opts,
+    )
+    .expect("fit runs");
+    assert!(fit.ofv.is_finite());
+    assert!(
+        fit.covariance_matrix.is_some(),
+        "the covariance step must run"
+    );
+    let fd: Vec<_> = fit
+        .warnings
+        .iter()
+        .filter(|w| w.contains("finite-difference") || w.contains("finite difference"))
+        .collect();
+    assert!(fd.is_empty(), "FD fallback reported: {fd:?}");
 }

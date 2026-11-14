@@ -39,4 +39,3 @@
   method     = foce
   maxiter    = 300
   covariance = true
-  gradient   = ad

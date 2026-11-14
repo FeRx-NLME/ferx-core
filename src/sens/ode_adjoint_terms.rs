@@ -10,6 +10,7 @@
 use super::*;
 use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
 use crate::sens::num::vm::Layout;
+#[cfg(feature = "survival")]
 use std::sync::Arc;
 
 /// The second-order layout over `n` random effects (`n = 0`: the value alone).
@@ -37,6 +38,7 @@ pub(super) fn layout1(n: usize) -> Layout {
     }
 }
 
+#[cfg(feature = "survival")]
 /// `layout`'s inputs at `(theta, eta)`: η seeded one-hot, θ constants.
 fn inputs(layout: Layout, theta: &[f64], eta: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let l = layout.lanes();
@@ -60,10 +62,11 @@ pub(super) fn h_lane(n: usize, k: usize, l: usize) -> usize {
     1 + n + k * (k + 1) / 2 + l
 }
 
+#[cfg(feature = "survival")]
 /// The plan (the first of the subject's variants whose guard holds) and its forward at
 /// `layout`: the output's lanes, and the forward kept for the plan's reverse passes.
 fn forward(
-    plans: &[Arc<kj::Plan>],
+    plans: &kj::Variants,
     layout: Layout,
     theta: &[f64],
     eta: &[f64],
@@ -71,12 +74,16 @@ fn forward(
     let (u, p) = inputs(layout, theta, eta);
     let l = layout.lanes();
     let mut du = vec![0.0; 2 * l];
-    plans.iter().find_map(|pl| {
+    plans.order().find_map(|(i, pl)| {
         let f = pl.forward_layout(layout, &u, &p, &mut du)?;
-        (du[l] == 1.0).then(|| (pl.clone(), du[..l].to_vec(), f))
+        (du[l] == 1.0).then(|| {
+            plans.hit(i);
+            (pl.clone(), du[..l].to_vec(), f)
+        })
     })
 }
 
+#[cfg(feature = "survival")]
 /// `(q, ∇q, ∇²q)` from a second-order forward's lanes.
 fn jets2(n: usize, lanes: &[f64]) -> (f64, Vec<f64>, Vec<Vec<f64>>) {
     let g = (0..n).map(|k| lanes[1 + k]).collect();
@@ -97,9 +104,9 @@ pub(crate) fn term_plans<S: crate::survival::SubjectTerm>(
     term: &S,
     theta: &[f64],
     eta: &[f64],
-) -> Option<Vec<Arc<kj::Plan>>> {
+) -> Option<kj::Kernels> {
     use std::sync::atomic::Ordering::Relaxed;
-    if !kj::enabled() || subject.obs_records.is_empty() {
+    if subject.obs_records.is_empty() {
         return None;
     }
     let n = eta.len();
@@ -109,7 +116,7 @@ pub(crate) fn term_plans<S: crate::survival::SubjectTerm>(
         kj::Lookup::Found(ks) => {
             // A variant whose guard holds here: the guards read values only.
             if forward(&ks, Layout::F64, theta, eta).is_some() {
-                return Some(ks.as_ref().clone());
+                return Some(ks);
             }
             kj::STATS.guard_fail.fetch_add(1, Relaxed);
         }
@@ -127,38 +134,22 @@ pub(crate) fn term_plans<S: crate::survival::SubjectTerm>(
         .map(|(k, &v)| kj::Tr::eta(k, v))
         .collect();
     let y = term.eval(&th, &et);
-    kj::guard_log_diff(format!("{key:?}"));
     let rec = match kj::end(y.map(|v| vec![v.reg()])) {
         Ok(r) => r,
-        Err(why) => {
-            if kj::debug() {
-                eprintln!("kjit: term not recorded: {why}");
-            }
-            kj::mark_bad(&key);
+        Err((why, _)) => {
+            kj::mark_bad(&key, &why);
             return None;
         }
     };
     let base = if n == 0 { Layout::F64 } else { layout1(n) };
-    let plan = Arc::new(rec.plan(base, n, theta.len())?);
-    kj::add(&key, plan.clone());
-    let kj::Lookup::Found(ks) = kj::lookup(&key) else {
+    let Some(plan) = rec.plan(base, n, theta.len()).map(Arc::new) else {
+        kj::mark_bad(&key, "the recording could not be planned");
         return None;
     };
-    Some(ks.as_ref().clone())
+    Some(kj::add(&key, plan))
 }
 
-#[cfg(not(feature = "survival"))]
-pub(crate) fn term_plans<S>(
-    _: &CompiledModel,
-    _: &Subject,
-    _: TermKind,
-    _: &S,
-    _: &[f64],
-    _: &[f64],
-) -> Option<Vec<Arc<kj::Plan>>> {
-    None
-}
-
+#[cfg(feature = "survival")]
 /// Which subject term a plan computes: its key kind.
 #[derive(Clone, Copy)]
 pub(crate) enum TermKind {
@@ -171,6 +162,7 @@ pub(crate) enum TermKind {
     Dtmm,
 }
 
+#[cfg(feature = "survival")]
 impl TermKind {
     fn key(self) -> u8 {
         match self {
@@ -191,7 +183,7 @@ pub(super) fn non_gaussian_plans(
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
-) -> Option<Vec<Arc<kj::Plan>>> {
+) -> Option<kj::Kernels> {
     let term = crate::survival::NonGaussianTerm::new(model, subject);
     term_plans(model, subject, TermKind::NonGaussian, &term, theta, eta)
 }
@@ -202,12 +194,12 @@ pub(super) fn non_gaussian_plans(
     _: &Subject,
     _: &[f64],
     _: &[f64],
-) -> Option<Vec<Arc<kj::Plan>>> {
+) -> Option<kj::Kernels> {
     None
 }
 
 /// `(q, ∇q, ∇²q)` of a subject term from its plan's second-order forward.
-#[cfg(test)]
+#[cfg(all(test, feature = "survival"))]
 pub(crate) fn term_jets2_planned<S>(
     model: &CompiledModel,
     subject: &Subject,
@@ -225,6 +217,7 @@ where
     Some(jets2(n, &lanes))
 }
 
+#[cfg(feature = "survival")]
 /// `(q, ∇q)` of a subject term from its plan's first-order forward.
 pub(crate) fn term_gradient_planned<S>(
     model: &CompiledModel,
@@ -244,6 +237,7 @@ where
     Some((lanes[0], (0..n).map(|k| lanes[1 + k]).collect()))
 }
 
+#[cfg(feature = "survival")]
 /// A term the plans can serve: every `SubjectTerm` with `survival`, none without.
 pub(crate) trait TermEval {
     fn plans(
@@ -253,7 +247,7 @@ pub(crate) trait TermEval {
         kind: TermKind,
         theta: &[f64],
         eta: &[f64],
-    ) -> Option<Vec<Arc<kj::Plan>>>;
+    ) -> Option<kj::Kernels>;
 }
 
 #[cfg(feature = "survival")]
@@ -265,11 +259,12 @@ impl<S: crate::survival::SubjectTerm> TermEval for S {
         kind: TermKind,
         theta: &[f64],
         eta: &[f64],
-    ) -> Option<Vec<Arc<kj::Plan>>> {
+    ) -> Option<kj::Kernels> {
         term_plans(model, subject, kind, self, theta, eta)
     }
 }
 
+#[cfg(feature = "survival")]
 /// `(q, ∇q, ∇²q)` of the subject's non-Gaussian term at `(theta, eta)` from its plan.
 pub(crate) fn non_gaussian_jets2_planned(
     model: &CompiledModel,
@@ -283,6 +278,7 @@ pub(crate) fn non_gaussian_jets2_planned(
     Some(jets2(n, &lanes))
 }
 
+#[cfg(feature = "survival")]
 /// `(q, ∇q)` of the subject's non-Gaussian term from its plan's first-order forward.
 pub(crate) fn non_gaussian_gradient_planned(
     model: &CompiledModel,
@@ -297,6 +293,7 @@ pub(crate) fn non_gaussian_gradient_planned(
     Some((lanes[0], (0..n).map(|k| lanes[1 + k]).collect()))
 }
 
+#[cfg(feature = "survival")]
 /// `(q, ∇q, ∇²q)` from the plan's second-order forward, kept with the plan: the third order
 /// is only contracted ([`super::NgJets::contract_t`], [`contract_hessian_lanes`]).
 pub(super) fn non_gaussian_jets3_planned(
@@ -315,6 +312,7 @@ pub(super) fn non_gaussian_jets3_planned(
     (jets.q.is_finite() && jets.q < 1e19).then_some(jets)
 }
 
+#[cfg(feature = "survival")]
 /// `Σ_{k≥l} a_h[k][l]·∂³q/∂η_k∂η_l∂η_m` for every `m`: one reverse of the kept second-order
 /// forward, seeded with `a_h` on the `∇²q` lanes (its η value lanes).
 pub(super) fn contract_hessian_lanes(
@@ -340,6 +338,7 @@ pub(super) fn contract_hessian_lanes(
     out.iter().all(|v| v.is_finite()).then_some(out)
 }
 
+#[cfg(feature = "survival")]
 /// `Σ_parts ∂/∂θ [a_q·q + Σ_k a_g,k·∂_k q + Σ_{k≥l} a_h,kl·∂²_kl q]` at each part's η, from
 /// the plan's reverse (one per part, θ's value lanes): [`ng_theta_adjoint`]'s quantity.
 pub(super) fn non_gaussian_theta_adjoint_planned(
@@ -364,6 +363,7 @@ pub(super) fn non_gaussian_theta_adjoint_planned(
     Some(out)
 }
 
+#[cfg(feature = "survival")]
 /// Per seed `(a_q, a_g, a_h)` at one `eta`, `∂/∂θ [a_q·q + Σ a_g,k·∂_k q + Σ_{k≥l} a_h,kl·∂²_kl q]`:
 /// one forward and one reverse for every seed, at the value layout when every seed weights
 /// the value alone (an AGQ node's) and the second-order one otherwise.
@@ -419,6 +419,7 @@ pub(super) fn non_gaussian_theta_seeds_planned(
     out.iter().flatten().all(|v| v.is_finite()).then_some(out)
 }
 
+#[cfg(feature = "survival")]
 /// The term's value and θ-gradient at fixed `eta`, from the plan: the value-layout forward and
 /// its reverse seeded on the value ([`non_gaussian_theta_score`]'s quantity).
 pub(super) fn non_gaussian_theta_score_planned(

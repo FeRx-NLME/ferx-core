@@ -3,18 +3,18 @@
 //! (prediction) and [`Dual2`](super::dual2::Dual2) (exact PK-parameter
 //! sensitivities). Mirrors [`crate::pk::three_compartment`]; only the central-
 //! compartment concentration is needed for the likelihood. The macro-rate cubic
-//! is solved by the same trigonometric (Vieta) method, which is why the dual
-//! number needs `cos`/`acos` (see [`super::num::PkNum`]).
+//! starts from the trigonometric solution on the values and is polished in the
+//! number type ([`macro_rates_three_cpt_g`]).
 // PK closed forms carry many positional params (dose descriptors + 6 PK params);
 // the wide signatures are inherent, not a smell.
 #![allow(clippy::too_many_arguments)]
 
-use super::num::PkNum;
+use super::num::{bateman, bateman_ss, ss_factor, PkNum};
+use super::one_cpt::{modal_sum, mode_infusion, mode_infusion_ss};
 use crate::types::DoseEvent;
 
-/// Macro-rate constants `(α, β, γ, k21, k31)` with `α > β > γ > 0`, via the
-/// trigonometric solution of the disposition cubic. Branches on `.val()` only,
-/// so the dual derivatives flow through the selected roots unchanged.
+/// Macro-rate constants `(α, β, γ, k21, k31)` with `α ≥ β ≥ γ ≥ 0`: the roots of the
+/// disposition cubic, ordered by construction (no sort), with exact jets of every order.
 #[allow(clippy::many_single_char_names)]
 pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
     cl: T,
@@ -35,20 +35,31 @@ pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
     let s1 = k10 * k21 + k10 * k31 + k21 * k31 + k12 * k31 + k13 * k21;
     let s0 = k10 * k21 * k31;
 
-    // Depress the cubic: lambda = x + s2/3.
+    // Each root is polished in `T` by three Newton steps on the cubic from a start computed on
+    // the values (`value_only`): from a jet-free start each step doubles the orders its jets are
+    // exact to (1, 3, 7 — past every type's 4), and the value converges with them. So no jet
+    // flows through `acos` (unbounded as two roots meet) or a discriminant's square root (which
+    // cancels as they do); each root's jets are the implicit function's, `−∂P/∂θ / P'(λ)`.
+    let newton = |x0: T| {
+        (0..3).fold(x0, |x, _| {
+            let f = ((x - s2) * x + s1) * x - s0;
+            let df = (T::from_f64(3.0) * x - T::from_f64(2.0) * s2) * x + s1;
+            x - f / df
+        })
+    };
+    let (c2, c1, c0) = (s2.value_only(), s1.value_only(), s0.value_only());
     let third = T::from_f64(1.0 / 3.0);
-    let h = s2 * third;
-    let p = s1 - s2 * s2 * third;
-    let q = s1 * s2 * third - s2 * s2 * s2 * T::from_f64(2.0 / 27.0) - s0;
-
-    // Guard p = 0 (matches production `p.min(-1e-30)`); inactive for valid PK.
+    let h = c2 * third;
+    let p = c1 - c2 * c2 * third;
+    let q = c1 * c2 * third - c2 * c2 * c2 * T::from_f64(2.0 / 27.0) - c0;
+    // Guard p = 0 (a triple root; inactive for valid PK) and the rounding of `arg` past ±1:
+    // the start only, which the Newton steps then converge from.
     let p_safe = if p.br_cmp_c(crate::sens::num::BranchCmp::Lt, -1e-30) {
         p
     } else {
         T::from_f64(-1e-30)
     };
     let m = (-(p_safe * third)).sqrt() * T::from_f64(2.0);
-    // arg = 3q / (p_safe·m), clamped to [-1, 1] (identity in the interior).
     let arg_raw = (q * T::from_f64(3.0)) / (p_safe * m);
     let arg = if arg_raw.br_cmp_c(crate::sens::num::BranchCmp::Gt, 1.0) {
         T::from_f64(1.0)
@@ -57,33 +68,15 @@ pub(crate) fn macro_rates_three_cpt_g<T: PkNum>(
     } else {
         arg_raw
     };
-    let phi = arg.acos() * third;
-
-    let pi_2_3 = 2.0 * std::f64::consts::FRAC_PI_3;
-    let lambda0 = m * phi.cos() + h;
-    let lambda1 = m * (phi - T::from_f64(pi_2_3)).cos() + h;
-    let lambda2 = m * (phi - T::from_f64(2.0 * pi_2_3)).cos() + h;
-
-    // Sort by value: alpha > beta > gamma. The concentration is symmetric under
-    // root permutation, so selecting the dual by `.val()` is exact at distinct
-    // roots (the sort is locally constant there).
-    // Through the branch API (#2786): the comparisons a recording type checks.
-    use crate::sens::num::BranchCmp as B;
-    let alpha = if lambda0.br_cmp(B::Ge, lambda1) && lambda0.br_cmp(B::Ge, lambda2) {
-        lambda0
-    } else if lambda1.br_cmp(B::Ge, lambda2) {
-        lambda1
-    } else {
-        lambda2
-    };
-    let gamma = if lambda0.br_cmp(B::Le, lambda1) && lambda0.br_cmp(B::Le, lambda2) {
-        lambda0
-    } else if lambda1.br_cmp(B::Le, lambda2) {
-        lambda1
-    } else {
-        lambda2
-    };
-    let beta = s2 - alpha - gamma;
+    // `α`: φ ∈ [0, π/3] makes `m·cos φ + h` the largest of the three roots.
+    let alpha = newton(m * (arg.acos() * third).cos() + h);
+    // `β`: the larger root of the deflated quadratic `λ² − (β+γ)·λ + βγ` (`βγ = s0/α`,
+    // `β + γ = (s1 − βγ)/α`), a sum of positives; `γ = s0/(αβ)` by Vieta, so the slow
+    // terminal root does not cancel.
+    let a0 = alpha.value_only();
+    let bg0 = c0 / a0;
+    let beta = newton(crate::sens::two_cpt::quadratic_roots((c1 - bg0) / a0, bg0).0);
+    let gamma = s0 / (alpha * beta);
 
     (alpha, beta, gamma, k21, k31)
 }
@@ -119,6 +112,28 @@ impl<T: PkNum> ThreeCpt<T> {
             k21,
             k31,
         }
+    }
+
+    /// The disposition modes `(c, λ)` of the central impulse response `(1/V1)·Σ c·e^{−λt}`,
+    /// `c_λ = (λ − k21)(λ − k31)/Π_{μ≠λ}(λ − μ)` — all `≥ 0` (the roots interlace `k21`,
+    /// `k31`), so no closed form built on them cancels. `None` at a repeated root, which needs
+    /// a zero inter-compartmental clearance (a positive one keeps the roots of the
+    /// irreducible arrowhead generator distinct).
+    pub(crate) fn modes(&self) -> Option<[(T, T); 3]> {
+        let ThreeCpt {
+            alpha: a,
+            beta: b,
+            gamma: g,
+            k21,
+            k31,
+            ..
+        } = *self;
+        use crate::sens::num::BranchCmp::Le;
+        if (a - b).br_cmp_c(Le, 0.0) || (b - g).br_cmp_c(Le, 0.0) {
+            return None;
+        }
+        let c = |l: T, m: T, n: T| (l - k21) * (l - k31) / ((l - m) * (l - n));
+        Some([(c(a, b, g), a), (c(b, a, g), b), (c(g, a, b), g)])
     }
 }
 
@@ -165,18 +180,7 @@ pub fn three_cpt_iv_bolus_amt_g<T: PkNum>(
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>) -> T {
-    let ThreeCpt {
-        cl,
-        v1,
-        v2,
-        v3,
-        alpha,
-        beta,
-        gamma,
-        k21,
-        k31,
-        ..
-    } = *d;
+    let ThreeCpt { cl, v1, v2, v3, .. } = *d;
 
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -192,22 +196,10 @@ pub(crate) fn three_cpt_iv_bolus_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>) 
         return T::from_f64(0.0);
     }
 
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    // Confluent eigenvalues (any of α≈β, α≈γ, β≈γ): the spectral form carries
-    // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
-    // for physical PK params (distinct real eigenvalues); return 0 rather than the
-    // confluent limit form — a deliberate edge (PR #381, review #1).
-    if ab.br_abs_lt(1e-12) || ag.br_abs_lt(1e-12) || bg.br_abs_lt(1e-12) {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let d = amt / v1;
-    let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
-    let b = d * (beta - k21) * (beta - k31) / (-(ab) * bg);
-    let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-    let tt = t;
-    a * (-(alpha * tt)).exp() + b * (-(beta * tt)).exp() + g * (-(gamma * tt)).exp()
+    };
+    (amt / v1) * modal_sum(&m, |lam| (-(lam * t)).exp())
 }
 
 /// 3-cpt constant-rate IV infusion (duration `dur`, rate `rate`).
@@ -237,18 +229,7 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
     t: T,
     d: &ThreeCpt<T>,
 ) -> T {
-    let ThreeCpt {
-        cl,
-        v1,
-        v2,
-        v3,
-        alpha,
-        beta,
-        gamma,
-        k21,
-        k31,
-        ..
-    } = *d;
+    let ThreeCpt { cl, v1, v2, v3, .. } = *d;
 
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -267,39 +248,15 @@ pub(crate) fn three_cpt_infusion_d<T: PkNum>(
         return three_cpt_iv_bolus_d(amt, t, d);
     }
 
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.br_abs_lt(1e-12)
-        || ag.br_abs_lt(1e-12)
-        || bg.br_abs_lt(1e-12)
-        || alpha.br_abs_lt(1e-12)
-        || beta.br_abs_lt(1e-12)
-        || gamma.br_abs_lt(1e-12)
-    {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let rv = T::from_f64(rate) / v1;
-    let a_coeff = rv * (alpha - k21) * (alpha - k31) / (ab * ag * alpha);
-    let b_coeff = rv * (beta - k21) * (beta - k31) / (-(ab) * bg * beta);
-    let g_coeff = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
-    let one = T::from_f64(1.0);
-    let dd = T::from_f64(dur);
-    if t.br_cmp_c(crate::sens::num::BranchCmp::Le, dur) {
-        let tt = t;
-        a_coeff * (one - (-(alpha * tt)).exp())
-            + b_coeff * (one - (-(beta * tt)).exp())
-            + g_coeff * (one - (-(gamma * tt)).exp())
-    } else {
-        let dt = t - dd;
-        a_coeff * (one - (-(alpha * dd)).exp()) * (-(alpha * dt)).exp()
-            + b_coeff * (one - (-(beta * dd)).exp()) * (-(beta * dt)).exp()
-            + g_coeff * (one - (-(gamma * dd)).exp()) * (-(gamma * dt)).exp()
-    }
+    };
+    let (rv, dd) = (T::from_f64(rate) / v1, T::from_f64(dur));
+    modal_sum(&m, |lam| mode_infusion(lam, rv, dd, t))
 }
 
-/// 3-cpt oral (first-order absorption), with per-eigenvalue `ka ≈ λ` L'Hôpital
-/// limits in the Bateman function.
+/// 3-cpt oral (first-order absorption): `(F·D·KA/V1)·Σ c·B(λ, KA, t)` over the disposition
+/// modes, the Bateman function one smooth function through `KA = λ` ([`bateman`]).
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_oral_g<T: PkNum>(
     amt: f64,
@@ -345,18 +302,7 @@ pub fn three_cpt_oral_amt_g<T: PkNum>(
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: T, f_bio: T) -> T {
-    let ThreeCpt {
-        cl,
-        v1,
-        v2,
-        v3,
-        alpha,
-        beta,
-        gamma,
-        k21,
-        k31,
-        ..
-    } = *d;
+    let ThreeCpt { cl, v1, v2, v3, .. } = *d;
 
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -373,42 +319,10 @@ pub(crate) fn three_cpt_oral_amt_d<T: PkNum>(amt: T, t: T, d: &ThreeCpt<T>, ka: 
         return T::from_f64(0.0);
     }
 
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    // Confluent eigenvalues (any of α≈β, α≈γ, β≈γ): the spectral form carries
-    // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
-    // for physical PK params (distinct real eigenvalues); return 0 rather than the
-    // confluent limit form — a deliberate edge (PR #381, review #1).
-    if ab.br_abs_lt(1e-12) || ag.br_abs_lt(1e-12) || bg.br_abs_lt(1e-12) {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let coeff = f_bio * amt * ka / v1;
-    let a = (alpha - k21) * (alpha - k31) / (ab * ag);
-    let b = (beta - k21) * (beta - k31) / (-(ab) * bg);
-    let c = (gamma - k21) * (gamma - k31) / (ag * bg);
-    let tt = t;
-
-    // Bateman per eigenvalue λ with L'Hôpital limit when ka ≈ λ.
-    let bateman = |lambda: T| -> T {
-        if ka.br_absdiff_lt(lambda, 1e-6) {
-            tt * (-(lambda * tt)).exp()
-        } else {
-            ((-(lambda * tt)).exp() - (-(ka * tt)).exp()) / (ka - lambda)
-        }
     };
-
-    coeff * (a * bateman(alpha) + b * bateman(beta) + c * bateman(gamma))
-}
-
-/// SS geometric-series factor `1/(1 − e^{−λ·ii})`.
-fn ss_coeff_g<T: PkNum>(lambda: T, ii: f64) -> T {
-    let denom = T::from_f64(1.0) - (-(lambda * T::from_f64(ii))).exp();
-    if denom.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
-        T::from_f64(1.0) / denom
-    } else {
-        T::from_f64(0.0)
-    }
+    (f_bio * amt * ka / v1) * modal_sum(&m, |lam| bateman(lam, ka, t))
 }
 
 /// 3-cpt IV bolus at steady state.
@@ -431,18 +345,7 @@ pub fn three_cpt_iv_bolus_ss_g<T: PkNum>(
 /// parameter set, not once per dose and observation).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &ThreeCpt<T>) -> T {
-    let ThreeCpt {
-        cl,
-        v1,
-        v2,
-        v3,
-        alpha,
-        beta,
-        gamma,
-        k21,
-        k31,
-        ..
-    } = *d;
+    let ThreeCpt { cl, v1, v2, v3, .. } = *d;
 
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -459,27 +362,14 @@ pub(crate) fn three_cpt_iv_bolus_ss_d<T: PkNum>(amt: f64, t: T, ii: f64, d: &Thr
         return T::from_f64(0.0);
     }
 
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    // Confluent eigenvalues (any of α≈β, α≈γ, β≈γ): the spectral form carries
-    // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
-    // for physical PK params (distinct real eigenvalues); return 0 rather than the
-    // confluent limit form — a deliberate edge (PR #381, review #1).
-    if ab.br_abs_lt(1e-12) || ag.br_abs_lt(1e-12) || bg.br_abs_lt(1e-12) {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let d = T::from_f64(amt) / v1;
-    let a = d * (alpha - k21) * (alpha - k31) / (ab * ag);
-    let b = d * (beta - k21) * (beta - k31) / (-(ab) * bg);
-    let g = d * (gamma - k21) * (gamma - k31) / (ag * bg);
-    let tt = t;
-    a * (-(alpha * tt)).exp() * ss_coeff_g(alpha, ii)
-        + b * (-(beta * tt)).exp() * ss_coeff_g(beta, ii)
-        + g * (-(gamma * tt)).exp() * ss_coeff_g(gamma, ii)
+    };
+    (T::from_f64(amt) / v1) * modal_sum(&m, |lam| (-(lam * t)).exp() * ss_factor(lam, ii))
 }
 
-/// 3-cpt oral at steady state, with per-eigenvalue `ka ≈ λ` L'Hôpital limits.
+/// 3-cpt oral at steady state: `(F·D·KA/V1)·Σ c·B_ss(λ, KA, t)`, smooth through `KA = λ`
+/// ([`bateman_ss`]).
 #[allow(clippy::too_many_arguments)]
 pub fn three_cpt_oral_ss_g<T: PkNum>(
     amt: f64,
@@ -515,18 +405,7 @@ pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
     ka: T,
     f_bio: T,
 ) -> T {
-    let ThreeCpt {
-        cl,
-        v1,
-        v2,
-        v3,
-        alpha,
-        beta,
-        gamma,
-        k21,
-        k31,
-        ..
-    } = *d;
+    let ThreeCpt { cl, v1, v2, v3, .. } = *d;
 
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -544,40 +423,10 @@ pub(crate) fn three_cpt_oral_ss_d<T: PkNum>(
         return T::from_f64(0.0);
     }
 
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    // Confluent eigenvalues (any of α≈β, α≈γ, β≈γ): the spectral form carries
-    // 1/(λ_i−λ_j) residue poles, undefined at exact root coalescence. Measure-zero
-    // for physical PK params (distinct real eigenvalues); return 0 rather than the
-    // confluent limit form — a deliberate edge (PR #381, review #1).
-    if ab.br_abs_lt(1e-12) || ag.br_abs_lt(1e-12) || bg.br_abs_lt(1e-12) {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let coeff = f_bio * T::from_f64(amt) * ka / v1;
-    let a = (alpha - k21) * (alpha - k31) / (ab * ag);
-    let b = (beta - k21) * (beta - k31) / (-(ab) * bg);
-    let c = (gamma - k21) * (gamma - k31) / (ag * bg);
-    let tt = t;
-
-    // SS Bateman per eigenvalue λ, with L'Hôpital limit when ka ≈ λ:
-    //   Σ_n (τ + n·II)·e^{−λ(τ+nII)} = e^{−λτ}·[τ/(1−x) + II·x/(1−x)²], x=e^{−λII}.
-    let bateman_ss = |lambda: T| -> T {
-        if ka.br_absdiff_lt(lambda, 1e-6) {
-            let x = (-(lambda * T::from_f64(ii))).exp();
-            let omx = T::from_f64(1.0) - x;
-            if omx.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
-                return T::from_f64(0.0);
-            }
-            (-(lambda * tt)).exp() * (tt / omx + (x * T::from_f64(ii)) / (omx * omx))
-        } else {
-            ((-(lambda * tt)).exp() * ss_coeff_g(lambda, ii)
-                - (-(ka * tt)).exp() * ss_coeff_g(ka, ii))
-                / (ka - lambda)
-        }
     };
-
-    coeff * (a * bateman_ss(alpha) + b * bateman_ss(beta) + c * bateman_ss(gamma))
+    (f_bio * T::from_f64(amt) * ka / v1) * modal_sum(&m, |lam| bateman_ss(lam, ka, t, ii))
 }
 
 /// 3-cpt infusion at steady state (interval `ii`), for any `dur` — including
@@ -617,18 +466,7 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
     ii: f64,
     d: &ThreeCpt<T>,
 ) -> T {
-    let ThreeCpt {
-        cl,
-        v1,
-        v2,
-        v3,
-        alpha,
-        beta,
-        gamma,
-        k21,
-        k31,
-        ..
-    } = *d;
+    let ThreeCpt { cl, v1, v2, v3, .. } = *d;
 
     if t.br_cmp_c(crate::sens::num::BranchCmp::Lt, 0.0) {
         return T::from_f64(0.0);
@@ -648,67 +486,11 @@ pub(crate) fn three_cpt_infusion_ss_d<T: PkNum>(
         return three_cpt_iv_bolus_ss_d(amt, t, ii, d);
     }
 
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.br_abs_lt(1e-12)
-        || ag.br_abs_lt(1e-12)
-        || bg.br_abs_lt(1e-12)
-        || alpha.br_abs_lt(1e-12)
-        || beta.br_abs_lt(1e-12)
-        || gamma.br_abs_lt(1e-12)
-    {
+    let Some(m) = d.modes() else {
         return T::from_f64(0.0);
-    }
-    let rv = T::from_f64(rate) / v1;
-    let a_coeff = rv * (alpha - k21) * (alpha - k31) / (ab * ag * alpha);
-    let b_coeff = rv * (beta - k21) * (beta - k31) / (-(ab) * bg * beta);
-    let g_coeff = rv * (gamma - k21) * (gamma - k31) / (ag * bg * gamma);
-    let one = T::from_f64(1.0);
-    let dd = T::from_f64(dur);
-
-    if dur > ii {
-        // Overlapping infusions: superpose the past pulse train per eigenvalue
-        // (mirror of `crate::pk::three_cpt_infusion_ss`). `N` = count of pulses
-        // still infusing at phase `t`, a locally-constant integer seeded by value.
-        let n_active = (((dur - t.val()) / ii).floor() + 1.0).max(0.0);
-        let nii = T::from_f64(n_active * ii);
-        let overlap = |c: T, lambda: T| -> T {
-            let sc = ss_coeff_g(lambda, ii);
-            let a = T::from_f64(n_active)
-                - (-(lambda * t)).exp() * (one - (-(lambda * nii)).exp()) * sc;
-            let d = (one - (-(lambda * dd)).exp()) * (-(lambda * (t - dd + nii))).exp() * sc;
-            c * (a + d)
-        };
-        return overlap(a_coeff, alpha) + overlap(b_coeff, beta) + overlap(g_coeff, gamma);
-    }
-
-    let dt = t - dd;
-    // Past pulses (n ≥ 1): always "after-infusion" since τ + n·II ≥ II ≥ dur.
-    let past = |coeff: T, lambda: T| -> T {
-        coeff
-            * (one - (-(lambda * dd)).exp())
-            * (-(lambda * dt)).exp()
-            * (-(lambda * T::from_f64(ii))).exp()
-            * ss_coeff_g(lambda, ii)
     };
-
-    if t.br_cmp_c(crate::sens::num::BranchCmp::Le, dur) {
-        let tt = t;
-        a_coeff * (one - (-(alpha * tt)).exp())
-            + b_coeff * (one - (-(beta * tt)).exp())
-            + g_coeff * (one - (-(gamma * tt)).exp())
-            + past(a_coeff, alpha)
-            + past(b_coeff, beta)
-            + past(g_coeff, gamma)
-    } else {
-        a_coeff * (one - (-(alpha * dd)).exp()) * (-(alpha * dt)).exp() * ss_coeff_g(alpha, ii)
-            + b_coeff * (one - (-(beta * dd)).exp()) * (-(beta * dt)).exp() * ss_coeff_g(beta, ii)
-            + g_coeff
-                * (one - (-(gamma * dd)).exp())
-                * (-(gamma * dt)).exp()
-                * ss_coeff_g(gamma, ii)
-    }
+    let rv = T::from_f64(rate) / v1;
+    modal_sum(&m, |lam| mode_infusion_ss(lam, rv, dur, ii, t))
 }
 
 /// Central-compartment concentration contribution of a single dose at elapsed

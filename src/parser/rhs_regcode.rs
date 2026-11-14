@@ -265,7 +265,7 @@ enum Flat {
         a: Reg,
         b: Reg,
     },
-    /// `a / b` unguarded — `PkNum`'s division (`DualV::div_body`), which a kernel recording
+    /// `a / b` unguarded — `PkNum`'s division (the forward dual's `div`), which a kernel recording
     /// (`kernel_jit`, #2786) emits; `Div` is the interpreter's guarded one.
     DivRaw {
         d: Reg,
@@ -1181,6 +1181,36 @@ impl NativeF64<'_> {
     }
 }
 
+/// The `f64` RHS with its forward tangents along `k` directions, one native call
+/// ([`RhsRegProgram::native_tangent`]): every input and output element is `1 + k` lanes, the
+/// value then its `k` tangents.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeTan<'a>(jit::Resolved<'a, jit::RhsFn>, usize);
+
+impl NativeTan<'_> {
+    /// Lanes of one element.
+    pub(crate) fn lanes(&self) -> usize {
+        1 + self.1
+    }
+
+    /// `du` (value and tangents) from `u`, `params` and the four `seeds`, each element
+    /// [`Self::lanes`] long; `false`, nothing written, when a slice is shorter than the
+    /// program reads.
+    pub(crate) fn run(&self, u: &[f64], params: &[f64], seeds: &[f64], du: &mut [f64]) -> bool {
+        let l = self.lanes();
+        if seeds.len() < 4 * l || !self.0.fits(u.len() / l, params.len() / l, du.len() / l) {
+            return false;
+        }
+        // SAFETY: `fits` covers every element the program loads or stores, at `l` lanes each,
+        // and `seeds` holds four elements; `du` is a separate slice.
+        unsafe {
+            self.0
+                .call(u.as_ptr(), params.as_ptr(), seeds.as_ptr(), du.as_mut_ptr())
+        };
+        true
+    }
+}
+
 /// A compiled straight-line RHS; see the module docs.
 #[derive(Clone, Debug)]
 pub(super) struct RhsRegProgram {
@@ -1313,15 +1343,6 @@ impl RhsRegProgram {
         self.jit.as_ref().is_some_and(|j| j.has(ir::Layout::F64))
     }
 
-    /// Whether the `f64` native function can read slices of these lengths (`u`, `params`) and
-    /// write `ndu` derivatives.
-    pub(super) fn native_f64_fits(&self, nu: usize, np: usize, ndu: usize) -> bool {
-        self.jit
-            .as_ref()
-            .and_then(|j| j.resolve(ir::Layout::F64))
-            .is_some_and(|f| f.fits(nu, np, ndu))
-    }
-
     /// The `f64` native function, resolved once for a caller that runs it many times
     /// (`DirectRhsF64`). `None` where [`Self::has_native_f64`] is `false`.
     pub(super) fn native_f64(&self) -> Option<NativeF64<'_>> {
@@ -1333,6 +1354,20 @@ impl RhsRegProgram {
             .as_ref()?
             .resolve_hoisted(ir::Layout::F64)
             .map(NativeF64)
+    }
+
+    /// The `f64` RHS over `k` forward tangent directions as one native function (built on
+    /// first use); `None` where there is no native code for it.
+    pub(super) fn native_tangent(&self, k: usize) -> Option<NativeTan<'_>> {
+        #[cfg(test)]
+        if RHS_JIT_DISABLED.with(|c| c.get()) {
+            return None;
+        }
+        let layout = ir::Layout {
+            tan: u8::try_from(k).ok()?,
+            ..ir::Layout::F64
+        };
+        self.jit.as_ref()?.resolve(layout).map(|f| NativeTan(f, k))
     }
 
     /// [`Self::run`] when `T` has a native function, without the register file: `true` when
@@ -1349,8 +1384,8 @@ impl RhsRegProgram {
     }
 
     /// [`Self::run`] through the native function when `T` has one (`VmArith::LANES`):
-    /// `f64` and the forward duals, the contiguous ones in place and `DualV` through its
-    /// lanes when no input is on a tape. `false`, with nothing written, otherwise.
+    /// `f64` and the duals with lanes, the contiguous ones in place and the rest through
+    /// their lanes when no input is on a tape. `false`, with nothing written, otherwise.
     #[inline(always)]
     fn run_native<T: VmNum>(&self, u: &[T], params: &[T], seeds: &[T; 4], du: &mut [T]) -> bool {
         let Some(layout) = T::LANES else {

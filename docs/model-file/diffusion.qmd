@@ -36,7 +36,9 @@ is:
 V_total = P_ekf[obs_cmt, obs_cmt]  +  V_residual
 ```
 
-where `V_residual` is the variance from the `[error_model]` (sigma-based).
+where `V_residual` is the variance from the `[error_model]` (sigma-based). The
+Kalman update's measurement variance is that residual variance at the filter's own
+mean, so one solve gives both the mean and `P`.
 
 So the residual actually scored is the ordinary ODE residual `DV - IPRED`, and
 the inflation `P` depends on the parameters, the sampling times and the residual
@@ -71,6 +73,10 @@ interpreting a `[diffusion]` fit.
 A large estimated `DIFF_CENTRAL` relative to sigma suggests that the ODE
 structure is missing an important mechanism (e.g., a compartment, a feedback
 loop, or a covariate effect).
+
+## Derivatives
+
+Every estimation route on an SDE model is exact (the EKF's process-noise variance is differentiated through the adjoint): FOCE/FOCEI, AGQ/Laplace, IOV, `[scaling]` and LTBS, time-varying covariates, and the covariance step. A steady-state dose, a modeled `RATE`/`D` dose and a rate-defined infusion under an estimated `F` are exact too: a moving infusion window end carries its derivatives through the filter.
 
 ## When to use SDE models
 
@@ -188,8 +194,8 @@ the ODE alone explains the data; a large value suggests model misspecification.
 | Situation | Behaviour |
 |---|---|
 | `[diffusion]` on an analytical PK model (`pk ...`) | Parse-time error |
-| `method = saem` with `[diffusion]` | Hard error at fit time |
-| Analytic gradients with `[diffusion]` | Not supported; use `gradient_method = fd` |
+| `method = saem` with `[diffusion]` and `block_sigma` | Hard error at fit time |
+| Analytic gradients with `[diffusion]` | Exact on every route: FOCE/FOCEI, AGQ/Laplace, the covariance step, fixed-EBE scores (GN, trust region), SAEM's IMH proposal, IOV, steady state, a modeled `RATE`/`D`, `[scaling]` and LTBS |
 | State name not in `states = [...]` | Parse-time error |
 | Negative initial value | Parse-time error |
 
@@ -262,8 +268,8 @@ dose): one `SS=1, II=12` record scored **610.41** where the 41 explicit records 
 **489.88**, while the ODE path gave the identical objective both ways. The two spellings
 now agree to `1e-9` relative in `IPRED` and in the filter covariance at every sample, and
 so does an `SS=1` infusion against its explicit infusion train on a right-hand side reading
-`TAD`. An `SS=1` infusion longer than `II` (overlapping pulses) is the one steady-state
-shape neither engine equilibrates; `W_STEADY_STATE_INFUSION` names it at check time.
+`TAD`, and an `SS=1` infusion longer than `II` (overlapping pulses) against its explicit
+overlapping train.
 
 The run-in reads model time the way the ODE run-in does: each cycle is integrated on a
 clock whose origin is its own pulse, so `TAD` is anchored per window, `T` / `TIME` take

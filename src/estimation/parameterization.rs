@@ -91,7 +91,7 @@ pub(crate) fn fd_step_floors(template: &ModelParameters, declared: &ModelParamet
 }
 
 /// The per-θ floor of a finite difference taken in **θ's own units** rather than the packed
-/// coordinate — the mixing-probability derivatives (`mixing_logp_grad{,_fd}`), which step
+/// coordinate — the mixing-probability derivatives (`mixing_logp_grad_fd`'s fallback), which step
 /// `1e-6·max(|θⱼ|, floorⱼ)` (#2147). `floorⱼ = |θ₀ⱼ|` when `0 < |θ₀ⱼ| < 1`, else 1 (the
 /// pre-#2147 step). Unlike [`fd_step_floor`] this does not depend on the packing: in θ units a
 /// log-packed θ is as exposed as an identity-packed one, since neither step is relative there.
@@ -3949,6 +3949,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,

@@ -349,16 +349,14 @@ fn an_unstamped_model_still_warns_because_the_options_carry_the_fd() {
     assert!(diags[0].message.contains("bobyqa"));
 }
 
-/// The same finding's negative half: an **SDE** model reaches the loop on FD because
-/// `GradientMethod::effective` forces it, not because the user asked — so `ferx check`
-/// must stay silent there even though the effective gradient is `Fd`.
+/// The same finding's negative half: an **SDE** model has an exact gradient (the adjoint
+/// carries the EKF's process-noise variance as kernel rows), so `GradientMethod::effective`
+/// no longer forces it to FD and `ferx check` stays silent — nothing moved the optimizer.
 ///
-/// Also pins `effective` itself, since it is now the one rule the two production
-/// stamps and this check all read: a mutation making it ignore `is_sde` would leave
-/// an SDE fit reading `Auto` in `resolve_gradient_method` and silently claiming an
-/// analytic gradient it has no path for.
+/// Also pins `effective` itself, the one rule the two production stamps and this check
+/// read: a mutation restoring the `is_sde` clause makes it answer `Fd` here.
 #[test]
-fn an_sde_model_is_forced_to_fd_by_the_engine_and_stays_silent() {
+fn an_sde_model_keeps_the_requested_gradient_and_stays_silent() {
     let mut model = analytical_model(GradientMethod::Auto);
     // `is_sde()` is `diffusion_theta_start.is_some()` — the θ index at which the
     // `[diffusion]` block's parameters begin.
@@ -374,8 +372,8 @@ fn an_sde_model_is_forced_to_fd_by_the_engine_and_stays_silent() {
     };
     assert_eq!(
         GradientMethod::effective(&model, &user_asked_auto),
-        GradientMethod::Fd,
-        "an SDE model has no analytic-sensitivity path; the engine forces FD"
+        GradientMethod::Auto,
+        "an SDE model has an analytic-sensitivity path; the engine forces nothing"
     );
     assert!(
         !check_model_options(&model, &user_asked_auto)

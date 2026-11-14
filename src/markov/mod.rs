@@ -582,7 +582,10 @@ pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
 /// returns `P(Δt)`. `q_at(τ)` supplies the `n_states × n_states` generator at
 /// **elapsed time `τ` within the interval** (`0` at the left endpoint); the
 /// caller maps `τ` to an absolute model time and hence to the PK state / drug
-/// concentration that drives `Q`. Unlike the time-homogeneous
+/// concentration that drives `Q`. `dq_at(τ)` is its derivative `∂Q/∂τ` (the right
+/// derivative at a kink of `Q`), which a stiff method's exact `f_t = P·∂Q/∂τ` reads
+/// (`kolmogorov_jacobian`); `None` leaves the step's `J` and `f_t` to differences.
+/// Unlike the time-homogeneous
 /// [`ctmm_data_term`], there is no closed form here (the matrix exponential
 /// `expm(Q·Δt)` is exact only when `Q` is constant), so the interval transition
 /// is obtained by integration.
@@ -615,6 +618,7 @@ pub(crate) fn ctmm_data_term_g<T: crate::sens::num::PkNum>(
 #[must_use]
 pub fn ctmm_inhomogeneous_transition(
     q_at: impl Fn(f64) -> DMatrix<f64>,
+    dq_at: impl Fn(f64) -> Option<DMatrix<f64>>,
     delta_t: f64,
     n_states: usize,
 ) -> DMatrix<f64> {
@@ -623,7 +627,7 @@ pub fn ctmm_inhomogeneous_transition(
         reltol: 1e-10,
         ..Default::default()
     };
-    ctmm_inhomogeneous_transition_with_opts(q_at, delta_t, n_states, &opts)
+    ctmm_inhomogeneous_transition_with_opts(q_at, dq_at, delta_t, n_states, &opts)
 }
 
 /// [`ctmm_inhomogeneous_transition`] with explicit solver options — the fit path
@@ -633,6 +637,7 @@ pub fn ctmm_inhomogeneous_transition(
 #[must_use]
 pub fn ctmm_inhomogeneous_transition_with_opts(
     q_at: impl Fn(f64) -> DMatrix<f64>,
+    dq_at: impl Fn(f64) -> Option<DMatrix<f64>>,
     delta_t: f64,
     n_states: usize,
     opts: &crate::ode::OdeSolverOptions,
@@ -681,6 +686,21 @@ pub fn ctmm_inhomogeneous_transition_with_opts(
         u0[i * s + i] = 1.0;
     }
 
+    // A stiff step takes the exact `J` and `f_t` (`kolmogorov_jacobian`); only a `dq_at` that
+    // declines leaves them to the stepper's differences.
+    let jac = |u: &[f64], _: &[f64], t: f64, j: &mut [f64], ft: &mut [f64]| {
+        let Some(dq) = dq_at(t) else {
+            return false;
+        };
+        let q = q_at(t);
+        kolmogorov_jacobian(u, |a, b| q[(a, b)], |a, b| dq[(a, b)], s, j, ft);
+        true
+    };
+    let _guard = crate::ode::rosenbrock::RhsGuard::register(
+        &rhs,
+        Some(&jac as &crate::ode::rosenbrock::JacFn<'_>),
+        None,
+    );
     let sol = crate::ode::solve_ode(&rhs, &u0, (0.0, delta_t), &[], &[delta_t], opts);
 
     match sol.last() {
@@ -688,6 +708,34 @@ pub fn ctmm_inhomogeneous_transition_with_opts(
         // The solver always returns at least the final save; identity is the
         // conservative fallback (never observed) rather than a panic in a hot loop.
         None => DMatrix::identity(s, s),
+    }
+}
+
+/// The exact `J = ∂f/∂u` (row-major, `S²×S²`) and `f_t = ∂f/∂τ` of the forward Kolmogorov
+/// right-hand side `f(vec P) = vec(P·Q(τ))`, `P` row-major in `u` (`u[i·S + j] = P[i, j]`).
+/// `f` is linear in `P` — `∂(P·Q)[i, j]/∂P[i', k] = δ_{ii'}·Q[k, j]`, i.e. `J = I ⊗ Qᵀ` — and
+/// `f_t = P·∂Q/∂τ`. `q` and `dq` read `Q` and `∂Q/∂τ` at `(row, col)`.
+pub(crate) fn kolmogorov_jacobian<T: crate::sens::num::PkNum>(
+    u: &[T],
+    q: impl Fn(usize, usize) -> T,
+    dq: impl Fn(usize, usize) -> T,
+    s: usize,
+    jac: &mut [T],
+    ft: &mut [T],
+) {
+    let n = s * s;
+    let zero = T::from_f64(0.0);
+    jac.fill(zero);
+    for i in 0..s {
+        for j in 0..s {
+            let row = (i * s + j) * n;
+            let mut acc = zero;
+            for k in 0..s {
+                jac[row + i * s + k] = q(k, j);
+                acc = acc + u[i * s + k] * dq(k, j);
+            }
+            ft[i * s + j] = acc;
+        }
     }
 }
 
@@ -1520,7 +1568,8 @@ mod tests {
         // 2-state, closed form.
         let (a, b, dt) = (0.7, 0.3, 2.0);
         let q2 = DMatrix::from_row_slice(2, 2, &[-a, a, b, -b]);
-        let p2 = ctmm_inhomogeneous_transition(|_t| q2.clone(), dt, 2);
+        let zero = |s: usize| move |_t: f64| Some(DMatrix::<f64>::zeros(s, s));
+        let p2 = ctmm_inhomogeneous_transition(|_t| q2.clone(), zero(2), dt, 2);
         assert!(
             max_abs_diff(&p2, &exact_2state(a, b, dt)) < 1e-8,
             "constant-Q 2-state must match the closed form; got {p2}"
@@ -1528,7 +1577,7 @@ mod tests {
 
         // 3-state dense generator vs. the exact matrix exponential.
         let q3 = generator_3();
-        let p3 = ctmm_inhomogeneous_transition(|_t| q3.clone(), 1.5, 3);
+        let p3 = ctmm_inhomogeneous_transition(|_t| q3.clone(), zero(3), 1.5, 3);
         assert!(
             max_abs_diff(&p3, &matrix_exp(&(&q3 * 1.5))) < 1e-8,
             "constant-Q 3-state must match expm(Q·Δt)"
@@ -1553,7 +1602,8 @@ mod tests {
         let integral = dt + 0.5 * dt * dt; // 2 + 2 = 4
         let expected = exact_2state(a, b, integral); // expm(Q₀·∫g)
 
-        let p = ctmm_inhomogeneous_transition(|t| (1.0 + t) * q0.clone(), dt, 2);
+        let p =
+            ctmm_inhomogeneous_transition(|t| (1.0 + t) * q0.clone(), |_t| Some(q0.clone()), dt, 2);
         assert!(
             max_abs_diff(&p, &expected) < 1e-7,
             "scalar-time-varying Q must match expm(Q₀·∫g); got {p}, want {expected}"
@@ -1599,6 +1649,7 @@ mod tests {
 
         let p = ctmm_inhomogeneous_transition(
             |t| if t < h { q1.clone() } else { q2.clone() },
+            |_t| Some(DMatrix::zeros(3, 3)),
             2.0 * h,
             3,
         );
@@ -1623,9 +1674,114 @@ mod tests {
         // evaluating the generator at all.
         let p = ctmm_inhomogeneous_transition(
             |_t| panic!("q_at must not be called for Δt = 0"),
+            |_t| panic!("dq_at must not be called for Δt = 0"),
             0.0,
             3,
         );
         assert_eq!(p, DMatrix::identity(3, 3));
+    }
+
+    /// `kolmogorov_jacobian` against central differences of the right-hand side it claims to
+    /// differentiate, `f(u, τ) = vec(P·Q(τ))`, on a non-stochastic `P` and a `Q(τ)` with a
+    /// non-commuting, nonlinear time dependence, so a transposed `J` (`Q ⊗ I`) or an `f_t`
+    /// of `∂Q/∂τ·P` cannot agree.
+    #[test]
+    fn kolmogorov_jacobian_matches_central_differences() {
+        let s = 3;
+        let q1 = generator_3();
+        let q2 = DMatrix::from_row_slice(3, 3, &[-0.8, 0.1, 0.7, 0.6, -0.8, 0.2, 0.4, 0.3, -0.7]);
+        let q_at = |t: f64| &q1 * (1.0 + t * t) + &q2 * t.sin();
+        let dq_at = |t: f64| &q1 * (2.0 * t) + &q2 * t.cos();
+        let f = |u: &[f64], t: f64| -> Vec<f64> {
+            let p = DMatrix::from_row_slice(s, s, u);
+            let pq = p * q_at(t);
+            (0..s * s).map(|r| pq[(r / s, r % s)]).collect()
+        };
+        let u: Vec<f64> = (0..s * s)
+            .map(|r| 0.3 + 0.17 * r as f64 - 0.05 * (r * r) as f64)
+            .collect();
+        let t = 0.8;
+        let (q, dq) = (q_at(t), dq_at(t));
+        let (mut jac, mut ft) = (vec![f64::NAN; s.pow(4)], vec![f64::NAN; s * s]);
+        kolmogorov_jacobian(
+            &u,
+            |a, b| q[(a, b)],
+            |a, b| dq[(a, b)],
+            s,
+            &mut jac,
+            &mut ft,
+        );
+        let h = 1e-5;
+        let (mut worst_j, mut worst_t) = (0.0f64, 0.0f64);
+        for c in 0..s * s {
+            let (mut up, mut dn) = (u.clone(), u.clone());
+            up[c] += h;
+            dn[c] -= h;
+            let (fp, fm) = (f(&up, t), f(&dn, t));
+            for r in 0..s * s {
+                let err = (jac[r * s * s + c] - (fp[r] - fm[r]) / (2.0 * h)).abs();
+                assert!(err.is_finite(), "J[{r},{c}]");
+                worst_j = worst_j.max(err);
+            }
+        }
+        let (fp, fm) = (f(&u, t + h), f(&u, t - h));
+        for r in 0..s * s {
+            let err = (ft[r] - (fp[r] - fm[r]) / (2.0 * h)).abs();
+            assert!(err.is_finite(), "f_t[{r}]");
+            worst_t = worst_t.max(err);
+        }
+        eprintln!("kolmogorov J {worst_j:.2e}, f_t {worst_t:.2e}");
+        assert!(worst_j < 1e-9, "J {worst_j:.2e}");
+        assert!(worst_t < 1e-8, "f_t {worst_t:.2e}");
+    }
+
+    /// A stiff method integrates the occupancy ODE on the exact `J` and `f_t`: on a stiff,
+    /// scalar-commuting `Q(τ) = g(τ)·Q₀` (closed form `expm(Q₀·∫g)`), Rodas4 and Rosenbrock23
+    /// on the registered Jacobian match the closed form to the measured error.
+    #[test]
+    fn ctmm_inhomogeneous_stiff_step_takes_the_exact_jacobian() {
+        let (a, b, dt) = (40.0_f64, 25.0_f64, 1.5_f64);
+        let q0 = DMatrix::from_row_slice(2, 2, &[-a, a, b, -b]);
+        // g(τ) = 1 + τ·sin(3τ) > 0 on [0, 1.5]; ∫₀^Δt g = Δt + (sin 3Δt − 3Δt·cos 3Δt)/9.
+        let g = |t: f64| 1.0 + t * (3.0 * t).sin();
+        let dg = |t: f64| (3.0 * t).sin() + 3.0 * t * (3.0 * t).cos();
+        let integral = dt + ((3.0 * dt).sin() - 3.0 * dt * (3.0 * dt).cos()) / 9.0;
+        let want = exact_2state(a, b, integral);
+        // Measured (Linux x86_64) at reltol 1e-4: the exact-J error 6.7e-8 (Rodas4) and 2.1e-8
+        // (Rosenbrock23), the differenced 7.4e-8 / 2.2e-8; an `f_t` of `P·Q` in place of
+        // `P·∂Q/∂τ` misses by 3.2e-6 / 1.3e-7, so the step reads the `f_t` it is handed. (At
+        // 1e-6 and 1e-8 every variant sits at the stepper's noise, 1e-12–1e-9.)
+        for (method, bound) in [
+            (crate::ode::OdeMethod::Rodas4, 3e-7),
+            (crate::ode::OdeMethod::Rosenbrock23, 6e-8),
+        ] {
+            let opts = crate::ode::OdeSolverOptions {
+                method,
+                reltol: 1e-4,
+                abstol: 1e-6,
+                ..Default::default()
+            };
+            let run = |dq: &dyn Fn(f64) -> Option<DMatrix<f64>>| {
+                ctmm_inhomogeneous_transition_with_opts(|t| g(t) * q0.clone(), dq, dt, 2, &opts)
+            };
+            let exact = run(&|t| Some(dg(t) * q0.clone()));
+            crate::ode::rosenbrock::EXACT_JAC_OFF.with(|c| c.set(true));
+            let fd = run(&|t| Some(dg(t) * q0.clone()));
+            crate::ode::rosenbrock::EXACT_JAC_OFF.with(|c| c.set(false));
+            let err = max_abs_diff(&exact, &want);
+            eprintln!(
+                "stiff occupancy {method:?}: exact-J {err:.2e}, FD-J {:.2e}",
+                max_abs_diff(&fd, &want)
+            );
+            assert!(
+                err.is_finite() && err < bound,
+                "{method:?}: exact-J {err:.2e}"
+            );
+            // The registration is what the step read: differenced, the bits move.
+            assert_ne!(
+                exact, fd,
+                "{method:?}: the stiff step never took the exact J"
+            );
+        }
     }
 }

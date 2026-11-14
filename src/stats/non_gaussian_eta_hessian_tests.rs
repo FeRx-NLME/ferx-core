@@ -81,7 +81,7 @@ struct Cell<'a> {
     value: Box<dyn Fn(&[f64]) -> f64 + 'a>,
 }
 
-/// The η-Hessian of a one-η subject term on the tests' forward dual (`vfree::DualF`): an
+/// The η-Hessian of a one-η subject term on the tests' forward dual (`Dual2`): an
 /// oracle that shares no code with the plans and, unlike a stencil of an adaptively
 /// integrated objective, has no `tol/h²` roundoff — the solver's steps are differentiated
 /// as taken, exactly as the recording does.
@@ -90,11 +90,11 @@ fn dual_hessian1<S: crate::survival::SubjectTerm>(
     theta: &[f64],
     eta: f64,
 ) -> DMatrix<f64> {
-    use crate::sens::vfree::DualF;
-    let th: Vec<DualF<1, 1>> = theta.iter().map(|&v| DualF::constant(v)).collect();
-    let e = [DualF::free(eta, [1.0], [0.0])];
+    use crate::sens::dual2::Dual2;
+    let th: Vec<Dual2<1>> = theta.iter().map(|&v| Dual2::constant(v)).collect();
+    let e = [Dual2::var(eta, 0)];
     let y = term.eval(&th, &e).expect("the dual evaluates the term");
-    DMatrix::from_element(1, 1, y.h[0])
+    DMatrix::from_element(1, 1, y.hess[0][0])
 }
 
 /// The marginal's curvature of `s`'s whole non-Gaussian term at `eta`.

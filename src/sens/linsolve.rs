@@ -1,13 +1,13 @@
 //! Dense linear solve over the sensitivity numeric type ([`PkNum`]).
 //!
 //! A single partial-pivoted Gaussian elimination, generic over `f64` (value-only) and the
-//! dual types (`Dual1`/`Dual2`). Because every arithmetic step is a `PkNum` `+ − × ÷`, the
+//! dual types (`Dual2`/`Dual2`). Because every arithmetic step is a `PkNum` `+ − × ÷`, the
 //! derivative jets ride through the elimination automatically: solving `A·x = b` over a dual
 //! `A`, `b` yields the exact implicit-function derivative
 //! `∂x/∂p = A⁻¹·(∂b/∂p − ∂A/∂p·x)` — and its 2nd order for the FOCEI outer Hessian — with no
 //! hand-assembled `dA`/`db`. This is what carries `∂u_ss/∂(θ,η)` through the steady-state
 //! absorption fixed point `u_ss = (I − M)⁻¹·b`: production instantiates it at `T = f64`
-//! ([`crate::ode::predictions`]) and the analytic-sensitivity walk at `T = Dual1/Dual2`
+//! ([`crate::ode::predictions`]) and the analytic-sensitivity walk at `T = Dual2/Dual2`
 //! ([`crate::sens::ode_provider`]) — one body, one source of truth (#835).
 
 use crate::sens::num::PkNum;
@@ -530,17 +530,16 @@ mod tests {
     /// carries a derivative is still used, in `L` and in `U`. The system forces a row swap
     /// (column 0's largest entry is below the diagonal) and has non-zero upper entries, so the
     /// back substitution sees both kinds of zero. Mutations: drop `is_constant` from
-    /// `structural_zero` → the jet-carrying zeros are skipped and the `DualF` solve differs;
+    /// `structural_zero` → the jet-carrying zeros are skipped and the solve differs;
     /// skip every back-substitution term → the non-zero `U` entries are lost.
     #[test]
     fn lu_skips_structural_zeros_exactly_and_keeps_a_jet_carrying_zero() {
-        use crate::sens::vfree::DualF;
+        use crate::sens::dual2::Dual2;
         let n = 4;
-        let c = |v: f64| DualF::<2, 0>::from_f64(v);
-        let d = |v: f64, g0: f64, g1: f64| DualF::<2, 0> {
-            v,
-            g: [g0, g1],
-            h: [],
+        let c = |v: f64| Dual2::<2>::constant(v);
+        let d = |v: f64, g0: f64, g1: f64| Dual2::<2> {
+            grad: [g0, g1],
+            ..Dual2::constant(v)
         };
         let mut m = vec![c(0.0); n * n];
         m[0] = d(1.0, 1.0, 0.2); // pivot-swap: row 1 has the larger column-0 entry
@@ -558,14 +557,14 @@ mod tests {
         let mut mm = m.clone();
         let mut piv = vec![c(0.0); n];
         assert!(lu_factor_in_place_g(&mut mm, &mut piv, n));
-        assert_eq!(piv[0].v, 1.0, "premise: column 0 pivots on row 1");
+        assert_eq!(piv[0].value, 1.0, "premise: column 0 pivots on row 1");
         lu_solve_in_place_g(&mm, &piv, n, &mut got);
         let want = lu_reference(&m, n, &b).unwrap();
         let norm = |x: f64| if x == 0.0 { 0 } else { x.to_bits() };
         for (g, w) in got.iter().zip(&want) {
-            assert_eq!(norm(g.v), norm(w.v));
+            assert_eq!(norm(g.value), norm(w.value));
             for k in 0..2 {
-                assert_eq!(norm(g.g[k]), norm(w.g[k]));
+                assert_eq!(norm(g.grad[k]), norm(w.grad[k]));
             }
         }
     }

@@ -58,7 +58,6 @@
 //! | `E_INIT_BOUNDS_INVERTED` | a coordinate whose packed box is **empty** — for a `theta`, bounds swapped or a declared range lying entirely outside ferx's `1e-10` / `1e9` packing caps. No start can be placed in it, and the clamp has no interval to clamp into. Only θ reaches it through the parser, but the code is kind-neutral. The only start-side check with no `maxiter = 0` exemption (#1251) |
 //! | `W_INIT_OUTSIDE_BOUNDS`   | an initial estimate strictly outside one of ferx's **internal** rails (the hidden `1e9` θ cap, the Ω `±6` / off-diagonal `±10` guards, the Σ `[-8, 5]` guard) — clamped there before the first objective evaluation (#1251) |
 //! | `W_STEADY_STATE_II`       | SS=1 dose with missing / non-positive II |
-//! | `W_STEADY_STATE_INFUSION` | SS=1 infusion with `T_inf > II` (overlapping pulses) |
 //! | `W_STEADY_STATE_ABSOLUTE_TIME` | SS=1 dose on an `[odes]` PK block reading an absolute clock (`TAFD`, or `T` / `TIME`) — the run-in expands the train on a cycle-local clock, so there is no periodic limit to converge to: `TAFD` reads `NaN`, `T` / `TIME` return NONMEM's value (#1139) |
 //! | `W_SDE_RESET`             | EVID=3/4 resets under an SDE model are not honoured |
 //! | `W_SDE_LAGTIME`           | an absorption lag time under an SDE model is not honoured |
@@ -242,6 +241,7 @@
 //! | `W_FD_JACOBIAN_NOT_TIGHTENED` | some subjects' finite-difference Jacobian at the final estimates could not be integrated cleanly at no looser than `ode_reltol = 1e-8` / `ode_abstol = 1e-10` with 32 times `ode_max_steps`, and was taken at the fit's own ODE settings, so the OFV may carry integration error through the determinant term (#2701) |
 //! | `W_ODE_SOLVER_ESCALATION_NOTE` | informational: `ode_method = auto` escalated some segments to a stiff stepper and the integration was otherwise clean (no rejected escalation, no min-step clamp) |
 //! | `W_ODE_RHS_INTERPRETED` | informational: the `[odes]` right-hand side runs on the bytecode interpreter; the message names the construct that kept it there and its statement. `ferx check` (severity `Info`) and once per `fit()` (#2681) |
+//! | `W_PLAN_FD_FALLBACK` | some subjects' compiled per-subject plan failed at run time, so they took finite-difference derivatives instead; the message counts them and quotes the first failure's reason. Results are correct but slower, and it should never appear: please report it (#2786) |
 //! | `W_ODE_RHS_NOT_NATIVE` | informational: the `[odes]` right-hand side compiled but runs as register code, because native code is switched off, the host is not a Cranelift target, or the program was not built (#2681) |
 //! | `W_DERIVED_CMT_IOV_UNSUPPORTED` | a `[derived]` expression reads `compartments[i]` on a fit where some subject has IOV (κ); those subjects have no compartment states, so it evaluates to NaN |
 //! | `W_DERIVED_CMT_TV_ANALYTICAL` | analytical model with a `[derived]` expression reading `compartments[i]` and subject(s) with time-varying covariates, or individual parameters that read `TIME` (#1855); compartment states are not built for those subjects, so the expression is NaN |

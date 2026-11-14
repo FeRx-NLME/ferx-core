@@ -3,12 +3,19 @@ use super::super::{
 };
 use super::*;
 use crate::sens::ode_provider::adjoint::{outer_model_in_scope, recorder_in_scope};
+use crate::types::CompiledModel;
 
 const STATES: &[&str] = &["a", "tau"];
 const PARAMS: &[&str] = &["KE", "LAGT"];
 
 /// Parse an `[odes]` body the way `build_ode_spec` does, then report its conditions.
 fn reads(body: &str) -> Vec<ConditionReads> {
+    let mut got = analyse(body);
+    got.iter_mut().for_each(|c| c.leaves.clear());
+    got
+}
+
+fn analyse(body: &str) -> Vec<ConditionReads> {
     let states: Vec<String> = STATES.iter().map(|s| s.to_string()).collect();
     let params: Vec<String> = PARAMS.iter().map(|s| s.to_string()).collect();
     let mut defined: Vec<String> = states.iter().chain(&params).cloned().collect();
@@ -38,6 +45,7 @@ fn lagt(moves: bool) -> Vec<ConditionReads> {
     vec![ConditionReads {
         params: vec!["LAGT".to_string()],
         moves,
+        leaves: Vec::new(),
     }]
 }
 
@@ -289,77 +297,70 @@ fn model(thetas: &str, indiv: &str, rhs: &str) -> crate::types::CompiledModel {
 const TLAG: &str = "theta TLAG(1.13, 0.1, 6.0)";
 const SWITCH: &str = "if (tau > LAGT) -KE * a else 0.0";
 
-fn switch_warning(m: &crate::types::CompiledModel) -> Option<&String> {
-    m.parse_warnings
-        .iter()
-        .find(|w| w.contains("`if` condition"))
+/// How many moving switches the model's integration locates.
+fn switches(m: &CompiledModel) -> usize {
+    let ode = m.ode_spec.as_ref().expect("an ODE model");
+    ode.rhs_program.as_ref().expect("compiled").switch_count()
 }
 
-fn assert_declined(m: &crate::types::CompiledModel, param: &str, why: &str) {
-    assert!(!recorder_in_scope(m), "{why}: the recorder must decline");
-    assert!(!outer_model_in_scope(m), "{why}: the outer must decline");
-    let w = switch_warning(m).unwrap_or_else(|| panic!("{why}: no warning"));
-    assert!(w.contains(&format!("`{param}`")), "{why}: {w}");
-    assert!(w.contains("finite-difference gradients"), "{why}: {w}");
-}
-
-fn assert_analytic(m: &crate::types::CompiledModel, why: &str) {
+/// Served by the exact derivatives with `n` switches located (#2649): every model is, the
+/// switches decide only whether its integration watches for crossings and jumps there.
+fn assert_served(m: &CompiledModel, n: usize, why: &str) {
     assert!(recorder_in_scope(m), "{why}: the recorder must serve it");
     assert!(outer_model_in_scope(m), "{why}: the outer must serve it");
-    assert_eq!(switch_warning(m), None, "{why}");
+    assert_eq!(switches(m), n, "{why}");
+    assert!(
+        !m.parse_warnings
+            .iter()
+            .any(|w| w.contains("`if` condition")),
+        "{why}: {:?}",
+        m.parse_warnings
+    );
+}
+
+/// A located switch: the integration watches it.
+fn assert_located(m: &CompiledModel, why: &str) {
+    assert_served(m, 1, why);
+}
+
+/// No switch to locate: the integration is the plain one.
+fn assert_analytic(m: &CompiledModel, why: &str) {
+    assert_served(m, 0, why);
 }
 
 #[test]
-fn a_switch_moved_by_an_estimated_parameter_routes_to_fd() {
+fn a_switch_moved_by_an_estimated_parameter_is_located() {
     // The issue's model: a θ reaching the equations only through the condition.
-    assert_declined(&model(TLAG, "LAGT = TLAG", SWITCH), "LAGT", "θ only");
+    assert_located(&model(TLAG, "LAGT = TLAG", SWITCH), "θ only");
     // Through an intermediate of `[individual_parameters]`.
-    assert_declined(
+    assert_located(
         &model(TLAG, "TV = 2 * TLAG\n  LAGT = TV", SWITCH),
-        "LAGT",
         "θ via an intermediate",
     );
-    // A condition in the arms as well: its θ has a non-zero gradient that is still wrong.
-    assert_declined(
+    // A condition in the arms as well.
+    assert_located(
         &model(
             TLAG,
             "LAGT = TLAG",
             "if (tau > LAGT) -KE * a * LAGT else 0.0",
         ),
-        "LAGT",
         "θ in the condition and an arm",
     );
     // An η on the switch, with no θ behind it.
-    assert_declined(
+    assert_located(
         &model("omega ETA_L ~ 0.1", "LAGT = 2 * exp(ETA_L)", SWITCH),
-        "LAGT",
         "η only",
     );
-    // FIX is the caller's to lift at `fit()`, which the scope cannot see.
-    assert_declined(
+    // FIX is the caller's to lift at `fit()`: the switch is located whatever is estimated.
+    assert_located(
         &model("theta TLAG(1.13, FIX)", "LAGT = TLAG", SWITCH),
-        "LAGT",
         "a FIX θ",
     );
-    // A FIX θ does not rescue a parameter another θ also moves.
-    assert_declined(
-        &model(
-            "theta TFIX(1.0, FIX)\n  theta TLAG(1.13, 0.1, 6.0)",
-            "LAGT = TFIX * TLAG",
-            SWITCH,
-        ),
-        "LAGT",
-        "a free θ beside a FIX one",
-    );
-    // No state or clock in the condition: `SW` itself varies with time.
-    assert_declined(
-        &model(TLAG, "SW = TLAG * TIME", "if (SW > 0.5) -KE * a else 0.0"),
-        "SW",
-        "a parameter reading TIME",
-    );
+    // Covariates alone place the switch per subject; locating it is exact, with no jump.
+    assert_located(&model("", "LAGT = WT / 10", SWITCH), "covariates alone");
 }
 
-/// An `if` whose arms meet at its switch stays on the exact route, however it is moved.
+/// An `if` whose arms meet at its switch has no jump, so nothing is located.
 #[test]
 fn a_moving_switch_with_meeting_arms_stays_analytic() {
     assert_analytic(
@@ -382,10 +383,9 @@ fn a_moving_switch_with_meeting_arms_stays_analytic() {
 
 /// A switch moved through a state: the condition itself names no parameter.
 #[test]
-fn a_switch_moved_through_a_state_routes_to_fd() {
-    assert_declined(
+fn a_switch_moved_through_a_state_is_located() {
+    assert_located(
         &model("", "", "if (a > 2.0) -KE * a else 0.0"),
-        "KE",
         "the state's own equation",
     );
     let clocked = |rhs_tau: &str, extra: &str, indiv: &str| {
@@ -409,15 +409,14 @@ fn a_switch_moved_through_a_state_routes_to_fd() {
         );
         parse_model_string(&src).unwrap_or_else(|e| panic!("{src}\n{e}"))
     };
-    assert_declined(&clocked("R", "", ""), "R", "the review's d/dt(tau) = RATE");
-    assert_declined(&clocked("1.0", "init(tau) = R", ""), "R", "init(...)");
-    assert_declined(
+    assert_located(&clocked("R", "", ""), "the review's d/dt(tau) = RATE");
+    assert_located(&clocked("1.0", "init(tau) = R", ""), "init(...)");
+    assert_located(
         &clocked("1.0 + first_order(ka=R)", "", ""),
-        "R",
         "an input-rate term",
     );
-    assert_declined(&clocked("1.0", "", "F = R"), "F", "a dose attribute");
-    assert_declined(&clocked("1.0", "", "ALAG1 = R"), "ALAG1", "a lag");
+    assert_located(&clocked("1.0", "", "F = R"), "a dose attribute");
+    assert_located(&clocked("1.0", "", "ALAG1 = R"), "a lag");
     // The control for all five: the clock is free of `R`.
     assert_analytic(&clocked("1.0", "", ""), "a clock no parameter reaches");
 }
@@ -442,25 +441,86 @@ fn a_lag_moves_the_dose_clocks_only() {
         );
         parse_model_string(&src).unwrap_or_else(|e| panic!("{src}\n{e}"))
     };
-    assert_declined(&lagged("TAD"), "ALAG1", "TAD");
-    assert_declined(&lagged("TAFD"), "ALAG1", "TAFD");
+    assert_located(&lagged("TAD"), "TAD");
+    assert_located(&lagged("TAFD"), "TAFD");
     assert_analytic(&lagged("TIME"), "TIME");
 }
 
-/// The controls, each differing from the declined model in the one thing that decides it.
+/// The controls, each differing from a located model in the one thing that decides it.
 #[test]
-fn a_switch_nothing_estimated_can_move_stays_analytic() {
+fn a_switch_nothing_can_move_is_not_located() {
     assert_analytic(
         &model("", "", "if (tau > 2.0) -KE * a else 0.0"),
         "a literal threshold on a clock",
     );
-    assert_analytic(&model("", "LAGT = WT / 10", SWITCH), "covariates alone");
     assert_analytic(
         &model(TLAG, "LAGT = TLAG", "if (LAGT > 2.0) -KE * a else 0.0"),
         "a condition that cannot change during the integration",
+    );
+    // `SW` changes only where the walk re-evaluates `[individual_parameters]`, at records,
+    // never inside a segment: its switch is at a data time no parameter moves.
+    assert_analytic(
+        &model(TLAG, "SW = TLAG * TIME", "if (SW > 0.5) -KE * a else 0.0"),
+        "a parameter reading TIME",
     );
     assert_analytic(
         &model(TLAG, "LAGT = TLAG", "-KE * a * max(tau - LAGT, 0.0)"),
         "a continuous select",
     );
+}
+
+/// Each moving comparison is one switch, however often it is written, and only the moving
+/// comparisons of a compound condition are: `TAD < 24` reads no parameter (no lag here).
+///
+/// Regression caught: a repeated comparison counted twice (two jumps at one crossing), or a
+/// comparison no parameter reaches located at every dose.
+#[test]
+fn switches_are_counted_per_moving_comparison() {
+    let rhs = "if (tau > LAGT && TAD < 24) -KE * a else 0.0 + 0.0 * (if (tau > LAGT) 1.0 else 2.0)";
+    assert_located(&model(TLAG, "LAGT = TLAG", rhs), "one comparison, twice");
+    let two = "if (tau > LAGT) -KE * a else (if (a < LAGT) 0.0 else -1.0)";
+    assert_served(&model(TLAG, "LAGT = TLAG", two), 2, "two comparisons");
+}
+
+/// A model without a moving switch takes no new path (#2649): no switch program, its closure
+/// is the one built before (served by the direct native call where it has one), and evaluating
+/// it tells the integrator of no switch, so the driver never evaluates a switch function and
+/// integrates bit for bit as before. The same model with a moving switch differs in each.
+///
+/// Regression caught: a switch-free model wrapped or noted (paying the closure route, or the
+/// driver's switch evaluations), or a switch model that does not note its switches (its
+/// crossings go unlocated on the prediction path while the recording locates them).
+#[test]
+fn a_switch_free_model_takes_no_new_path() {
+    let eval_notes = |m: &CompiledModel| {
+        let ode = m.ode_spec.as_ref().expect("an ODE model");
+        let prog = ode.rhs_program.as_ref().expect("compiled");
+        let p = vec![0.3; crate::types::MAX_PK_PARAMS + 2];
+        let mut du = vec![0.0; ode.n_states];
+        crate::ode::solver::take_switches();
+        (ode.rhs)(&[1.0, 0.5], &p, 0.0, &mut du);
+        let direct = prog.direct_f64(&*ode.rhs).is_some();
+        (
+            crate::ode::solver::take_switches(),
+            direct,
+            prog.direct_f64_native(),
+        )
+    };
+    let free = model(TLAG, "LAGT = TLAG", "-KE * a");
+    assert_eq!(switches(&free), 0);
+    let (noted, direct, native) = eval_notes(&free);
+    assert_eq!(noted, 0, "a switch-free model notes no switch");
+    assert_eq!(
+        direct, native,
+        "a switch-free model keeps its direct native call"
+    );
+    assert!(
+        native,
+        "the fixture has a native function, so the direct path is live"
+    );
+    let moving = model(TLAG, "LAGT = TLAG", SWITCH);
+    assert_eq!(switches(&moving), 1);
+    let (noted, direct, _) = eval_notes(&moving);
+    assert_eq!(noted, 1, "a switch model notes its switch");
+    assert!(!direct, "a switch model runs its closure, which notes it");
 }

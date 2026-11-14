@@ -5781,7 +5781,7 @@ fn absorption_flip_flop_wording(model: &CompiledModel) -> (&'static str, &'stati
     }
 }
 
-/// The clause naming the 2-cpt confluent-eigenvalue edge (`|α − β| < 1e-12`), empty for a
+/// The clause naming the 2-cpt confluent-eigenvalue edge (`α = β`), empty for a
 /// 1-cpt model, which has a single disposition exponential and so no such edge.
 fn absorption_confluent_clause(model: &CompiledModel) -> &'static str {
     if matches!(model.pk_model, PkModel::TwoCptTransit | PkModel::TwoCptIg) {
@@ -5794,7 +5794,7 @@ fn absorption_confluent_clause(model: &CompiledModel) -> &'static str {
 /// Reject a transit closed form with **no ODE twin** whose η = 0 typical parameters
 /// fall **outside the closed form's convergence domain** — the flip-flop regime
 /// (`ke ≥ KTR` 1-cpt / `α ≥ KTR` 2-cpt), or the 2-cpt confluent-eigenvalue edge
-/// (`|α − β| < 1e-12`) — where it returns an identically-zero profile that silently
+/// (`α = β`) — where it returns an identically-zero profile that silently
 /// degenerates the objective (a proportional error model collapses `(σ·pred)²` to 0).
 /// Unlike a twin-carrying model — which [`crate::pk::effective_model_for_eval`]
 /// auto-reroutes to its exact ODE `transit()` twin — a twin-less form (one carrying a
@@ -6928,18 +6928,16 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
         );
     }
 
-    // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired in
-    // favour of the hand-rolled `Dual2` analytic sensitivities. Reject it rather
-    // than silently running a different method. `auto` (analytic where in scope,
-    // else FD) and `fd` are unaffected.
+    // Explicit `gradient_method = ad`: the Enzyme autodiff path was retired; the exact
+    // derivatives are the default. Reject it rather than silently running a different
+    // method. `auto` and `fd` are unaffected.
     if options.gradient_method == crate::types::GradientMethod::Ad {
         diags.push(
             Diagnostic::error(
                 "E_AD_RETIRED",
                 "gradient_method = ad is no longer supported: the Enzyme automatic-differentiation \
-                 path was retired in favour of the analytic `Dual2` sensitivities. Set \
-                 gradient_method = auto (uses the exact analytic gradient where it is in scope and \
-                 falls back to finite differences otherwise) or fd.",
+                 path was retired, and exact derivatives are the default. Set \
+                 gradient_method = auto (exact derivatives) or fd (finite differences).",
             )
             .with_block("fit_options"),
         );
@@ -9434,107 +9432,6 @@ pub(crate) fn check_model_data_warnings_rule(
         ));
     }
 
-    // SS=1 infusion with T_inf > II (overlapping pulses). The analytical 1-/2-/3-
-    // cpt closed forms now superpose the overlapping past pulse train (#379), so
-    // these are handled exactly. Only ODE models — and subjects that route to the
-    // event-driven walker (EVID 3/4 resets) — still skip SS pre-equilibration.
-    let analytic_handles_overlap = model.ode_spec.is_none();
-    // For a modeled dose (RATE=-2 → `D{cmt}` duration, or RATE=-1 → `R{cmt}` rate;
-    // #324) the `(rate, duration)` pair is unresolved here — both are 0 until
-    // `resolve_rate` — so resolve it at the typical-value point through the
-    // engine-correct `active_dose_attr_map()`.
-    //
-    // Resolution goes through the single-source-of-truth `DoseEvent::resolve_rate`
-    // (the same rule + floor clamps the integrator applies at runtime), not a
-    // hand-rolled slot read, so the warning's notion of "duration" can't drift
-    // from the integrator's. It is a *typical-value* heuristic: it uses init
-    // theta, eta = 0, and this subject's covariates, whereas runtime uses
-    // per-occasion eta/IOV — a modeled SS infusion whose duration crosses `II`
-    // only on some occasions may not be flagged here (and conversely a typical
-    // overlap may not occur on every occasion). The runtime SS-skip is the
-    // backstop; this catches the common typical-value / covariate-driven overlap.
-    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
-    // This dose as the integrator will construct it, plus the `F` that reshapes it: the
-    // resolved `(rate, duration)` pair and `f_bio` for its compartment, both at the
-    // typical-value point. `None` when a modeled dose has no matching parameter — an
-    // upstream *error* (`E_MODELED_DURATION_NO_PARAM` / `E_MODELED_RATE_NO_PARAM`), but this
-    // warnings pass must stay panic-free if run on such a model rather than hit
-    // `resolve_rate`'s slot `.expect`.
-    //
-    // One resolution, two consumers: this warning and the `W_STEADY_STATE_ABSOLUTE_TIME` gate
-    // further down read the *same* resolved dose through the *same* predicate, so the two
-    // cannot drift about which doses the run-in actually serves.
-    let resolved_dose = |s: &Subject, d: &DoseEvent| -> Option<(DoseEvent, f64)> {
-        use crate::types::{DoseAttr, RateMode};
-        let attr_map = model.active_dose_attr_map();
-        // The dose attribute whose slot holds this modeled dose's value, if any.
-        let attr = match d.rate_mode {
-            RateMode::Fixed => None,
-            RateMode::ModeledDuration => Some(DoseAttr::Duration),
-            RateMode::ModeledRate => Some(DoseAttr::Rate),
-        };
-        if attr.is_some_and(|a| attr_map.indexed_slot(a, d.cmt_raw()).is_none()) {
-            return None;
-        }
-        // Initial-estimate warning pass: typical values at t=0.
-        let pk = (model.pk_param_fn)(&init_params.theta, &zero_eta, &s.covariates, 0.0);
-        Some((
-            d.resolve_rate(attr_map, &pk.values),
-            attr_map.f_bio(d.cmt_raw(), &pk.values),
-        ))
-    };
-    // Whether the steady-state run-in **skips** this dose because its infusion outlasts its own
-    // interval. This is the integrator's own test rather than a paraphrase of it:
-    // `equilibrate_ss_pk_state` (`ode/predictions.rs`) compares
-    // `dose.bioavailable_infusion(f_bio).1` against `dose.ii`, and the event-driven
-    // equilibration reshapes its synthetic cycle dose the same way
-    // (`with_bioavailable_infusion`, #419). So `F` is part of the comparison on both engines —
-    // on a rate-defined infusion it scales the *length* (the data fixes the rate), on a
-    // duration-defined one (`RATE=-2`) it scales the rate and the length is untouched.
-    //
-    // Comparing the unscaled duration instead made both warnings below say things that were
-    // not true, in opposite directions (#1281). Measured on a 1-cpt `[odes]` model with
-    // `AMT = 100, RATE = 5, II = 12` (duration 20) and observations at 482 / 485: at
-    // `F1 = 1.0` the predictions are `9.514379031181768` / `22.093161802029634` — finite,
-    // the run-in skipped, and "applied as a single (non-SS) infusion" is true of it. At
-    // `F1 = 0.5` (`T_inf = 10 ≤ II`) the same record on a `TAFD`-reading RHS returns
-    // `NaN` / `NaN`, which nothing but the run-in can produce — so that sentence was false
-    // there, while `W_STEADY_STATE_ABSOLUTE_TIME` was suppressed on the one row that needed
-    // it. `tests/modeled_duration.rs` holds the arm that must not move: `RATE=-2` answers the
-    // same before and after, which a hand-written `F * duration` would break.
-    let run_in_skips_overlapping_infusion = |s: &Subject, d: &DoseEvent| -> bool {
-        resolved_dose(s, d).is_some_and(|(resolved, f_bio)| {
-            crate::dosing::is_real_infusion(&resolved)
-                && resolved.bioavailable_infusion(f_bio).1 > d.ii
-        })
-    };
-    let n_ss_overlapping_inf = population
-        .subjects
-        .iter()
-        .filter(|s| {
-            let overlapping = s
-                .doses
-                .iter()
-                .any(|d| d.ss && d.ii > 0.0 && run_in_skips_overlapping_infusion(s, d));
-            overlapping && (!analytic_handles_overlap || s.has_resets())
-        })
-        .count();
-    if n_ss_overlapping_inf > 0 {
-        diags.push(Diagnostic::warning(
-            "W_STEADY_STATE_INFUSION",
-            format!(
-                "{} subject(s) have SS=1 infusions with T_inf > II (overlapping \
-                 pulses) on a model path that does not pre-equilibrate steady \
-                 state (ODE model, or EVID=3/4 resets routing to the event-driven \
-                 walker) — the dose is applied as a single (non-SS) infusion, so \
-                 the system is not at steady state at the dose time. The analytical \
-                 1-/2-/3-cpt closed forms do handle this case; use a shorter \
-                 infusion (T_inf ≤ II) or remove the SS flag otherwise.",
-                n_ss_overlapping_inf
-            ),
-        ));
-    }
-
     // SS=1 dose on an `[odes]` right-hand side that reads an **absolute** clock (#1139).
     //
     // The run-in that stands in for the infinite past does not integrate on the subject's
@@ -9552,20 +9449,9 @@ pub(crate) fn check_model_data_warnings_rule(
     // `check_model_data_rule`, and serve the same numbers unwarned.
     //
     // **Counted per dose that actually reaches the run-in**, because the consequence sentences
-    // below name what the run-in does and are false wherever it is skipped.
-    // `equilibrate_ss_pk_state` bails before integrating anything for an overlapping SS
-    // infusion (`is_inf && t_inf > dose.ii`) and for a dose whose compartment is outside the
-    // state vector (`cmt_idx >= n_states`), leaving the ordinary finite TAFD anchor in place.
-    // Measured on `0.003*TAFD` with `AMT=100, RATE=5, II=12, SS=1` (T_inf = 20 > II): the fit
-    // returns **OFV 367.2851**, finite — so an unfiltered count would have printed "it reads
-    // NaN and the objective is non-finite" next to a `W_STEADY_STATE_INFUSION` correctly
-    // saying the record was served as a single non-SS infusion. Filtering on the *same*
-    // predicate that warning uses makes the two partition rather than contradict.
-    //
-    // Deliberately *not* suppressed when a neighbouring steady-state warning fires on a dose
-    // this one still counts: `W_STEADY_STATE_INFUSION` is a typical-value heuristic by its
-    // own comment above (a modeled SS infusion may overlap on some occasions only), so
-    // blanket suppression would drop a true finding.
+    // below name what the run-in does and are false wherever it is skipped:
+    // `equilibrate_ss_pk_state` bails for a dose whose compartment is outside the state vector
+    // (`cmt_idx >= n_states`), leaving the ordinary finite TAFD anchor in place.
     //
     // `[diffusion]` is **not** excluded, twice over. Since #1260 `solve_ekf` runs its own
     // run-in (`ode::ekf::equilibrate_ss_ekf`) on the same cycle-local clock with the same
@@ -9590,34 +9476,18 @@ pub(crate) fn check_model_data_warnings_rule(
         // through `Subject::has_periodic_ss_dose` because the two further conjuncts below are
         // per dose too: a subject may carry one equilibrating SS dose and one that bails.
         let n_states = model.ode_spec.as_ref().map_or(0, |o| o.n_states);
-        let equilibrates = |s: &Subject, d: &DoseEvent| -> bool {
+        let equilibrates = |d: &DoseEvent| -> bool {
             if !(d.ss && d.ii > 0.0) {
                 return false;
             }
             // The out-of-range compartment bail-out (#899): `CMT` beyond the state vector
             // returns the unequilibrated zero state without touching the RHS.
-            if d.cmt_idx() >= n_states {
-                return false;
-            }
-            // The overlapping-infusion bail-out — the same predicate
-            // `W_STEADY_STATE_INFUSION` reports on, so the two findings partition the
-            // population rather than contradicting each other about which doses the run-in
-            // serves. `F` is why that had to be one function and not two spellings (#1281):
-            // it enters through `bioavailable_infusion`, and a paraphrase that compared the
-            // unscaled duration suppressed this warning on exactly the `F < 1` row whose
-            // predictions are `NaN`.
-            //
-            // Typical-value like the resolution it sits on: `F` may itself carry an η, so a
-            // dose that crosses `II` on some subjects only is judged on the typical one. The
-            // runtime bail-out is the backstop. An unresolvable modeled dose (no slot — an
-            // upstream error) counts as reaching the run-in, since the integrator will not
-            // treat it as a real infusion either.
-            !run_in_skips_overlapping_infusion(s, d)
+            d.cmt_idx() < n_states
         };
         let n_ss = population
             .subjects
             .iter()
-            .filter(|s| s.doses.iter().any(|d| equilibrates(s, d)))
+            .filter(|s| s.doses.iter().any(equilibrates))
             .count();
         if n_ss > 0 {
             let (reads_tafd, reads_solver_time) =
@@ -9858,6 +9728,7 @@ pub(crate) fn check_model_data_warnings_rule(
     // flip-flop model (lagtime / `f` / user `[odes]`) has nothing to reroute to and is a hard
     // error instead (`check_absorption_flip_flop_no_twin`), rejected at
     // fit / predict / simulate / `ferx check`.
+    let zero_eta = vec![0.0_f64; model.n_eta + model.n_kappa];
     if matches!(
         model.pk_model,
         PkModel::OneCptTransit | PkModel::TwoCptTransit | PkModel::OneCptIg | PkModel::TwoCptIg

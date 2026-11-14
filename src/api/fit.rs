@@ -557,17 +557,7 @@ pub fn fit(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
-    if std::env::var_os("FERX_TMP_NORESET").is_none() {
-        crate::parser::model_parser::rhs_regcode::kernel_jit::reset(); // TEMP switch #2786
-    }
     let mut result = fit_unstamped(model, population, init_params, options)?;
-    if std::env::var_os("FERX_TMP_TIER").is_some() {
-        eprintln!(
-            "TIERBITS ofv {:x} theta {:?}",
-            result.ofv.to_bits(),
-            result.theta.iter().map(|t| t.to_bits()).collect::<Vec<_>>()
-        ); // TEMP #2786
-    }
     crate::parser::model_parser::rhs_regcode::kernel_jit::report();
     // Under a derived `iov_occasion` rule the fit overwrites the occasion labels, so
     // the ones the population carries are not part of what it was given (#1685
@@ -1176,6 +1166,9 @@ fn fit_inner(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
+    // The plans' keys read this fit's fingerprints instead of hashing per lookup.
+    let _prints =
+        crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
     // LTBS needs the inner EBE loop converged tighter than the default for
     // reproducible standard errors (see `FitOptions::effective_inner_tol` /
     // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
@@ -1466,10 +1459,9 @@ fn fit_inner(
     // but suppress the numeric estimate. No note at all when the step will run
     // an estimator that builds no `R` (#1803).
     // The route is predicted from the covariance step's own scope walk (#2054): no note on
-    // the analytic R-matrix, and on the #1514 salvage the note names the declined subset.
+    // the analytic R-matrix.
     let covariance_route = crate::estimation::covariance::predicted_r_route(
         model,
-        population,
         options,
         init_params.mixture.is_some(),
     );
@@ -1605,11 +1597,9 @@ fn fit_inner(
     for d in crate::api::validation::check_nn_input_scale(model, population) {
         accumulated_warnings.push(d.message);
     }
-    if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
-        n_params_pre,
-        covariance_cost,
-        covariance_route,
-    ) {
+    if let Some(note) =
+        crate::estimation::covariance::pre_fit_covariance_cost_note(n_params_pre, covariance_cost)
+    {
         accumulated_warnings.push(note);
     }
 
@@ -3457,6 +3447,11 @@ fn fit_inner(
     // Which engine ran the `[odes]` RHS, when it was not native code (#2681): a property
     // of the model, reported once per fit rather than per stage of a chain.
     if let Some((msg, entry)) = crate::api::postfit::ode_rhs_route_warning(model) {
+        fit_result.warnings.push(msg);
+        fit_result.warnings_structured.push(entry);
+    }
+    // Subjects whose compiled plan failed and took finite differences instead (#2786).
+    if let Some((msg, entry)) = crate::api::postfit::plan_fd_fallback_warning(model, population) {
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }

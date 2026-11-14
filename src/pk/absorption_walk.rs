@@ -24,7 +24,7 @@
 //! ```
 //!
 //! with `cα = (α−k21)/(α−β)`, `cβ = (k21−β)/(α−β)`. Every term is exact; the walk is one
-//! function over [`PkNum`], so `T = f64` is the prediction and `T = Dual2`/`Dual1` its
+//! function over [`PkNum`], so `T = f64` is the prediction and `T = Dual2`/`Dual2` its
 //! sensitivities (`crate::sens::provider`), with no second copy of the formula.
 //!
 //! ## Domain — the one owner of "walk or twin"
@@ -148,7 +148,7 @@ fn fastest_rate<T: PkNum>(two_cpt: bool, p: &PkDual<T>) -> Result<T, WalkDomain>
         return Err(WalkDomain::Twin);
     }
     let (alpha, beta, _) = crate::sens::two_cpt::macro_rates_g::<T>(p.cl, p.v, p.q, p.v2);
-    if (alpha - beta).br_abs_lt(1e-12) {
+    if (alpha - beta).br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
         return Err(WalkDomain::Twin);
     }
     Ok(alpha)

@@ -1131,16 +1131,8 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
     use crate::sens::provider::{
         analytic_outer_gradient_for_interaction, analytic_outer_gradient_in_scope,
     };
-    use crate::types::{FitOptions, GradientMethod, Optimizer, Population, Subject};
+    use crate::types::{FitOptions, GradientMethod, Optimizer};
     let model = padded_ode_model;
-    let population = Population {
-        subjects: vec![Subject::default()],
-        covariate_names: Vec::new(),
-        dv_column: "DV".into(),
-        input_columns: Vec::new(),
-        exclusions: None,
-        warnings: Vec::new(),
-    };
     let options = FitOptions::default();
     for n_fix in [20, 21, 40] {
         let m = model(n_fix);
@@ -1159,11 +1151,11 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
             );
         }
         assert_eq!(
-            super::analytic_cov_declines(&m, &population, &options, false),
+            super::analytic_cov_declines(&m, &options, false),
             vec![CovScopeDecline::PerSubjectBail],
             "{axes} axes: no model-level clause may decline the analytic R-matrix"
         );
-        assert!(super::analytic_r_expected(&m, &population, &options, false));
+        assert!(super::analytic_r_expected(&m, &options, false));
 
         let mut fd = model(n_fix);
         fd.gradient_method = GradientMethod::Fd;
@@ -1176,12 +1168,7 @@ fn an_ode_model_past_the_old_axis_cap_keeps_the_analytic_outer_and_r_routes() {
             Optimizer::Bobyqa,
             "{axes} axes, FD"
         );
-        assert!(!super::analytic_r_expected(
-            &fd,
-            &population,
-            &options,
-            false
-        ));
+        assert!(!super::analytic_r_expected(&fd, &options, false));
     }
 }
 
@@ -1269,23 +1256,20 @@ fn an_ode_model_past_the_old_axis_cap_assembles_r_analytically_for_every_subject
     }
 }
 
-/// #2054: the pre-fit cost prediction (`predicted_r_route`) follows the covariance step's own
-/// route, salvage included, and the assembly agrees with it on the same population. Laplace on
-/// the exact anchor serves at most 8 stacked `[η, κ]` axes, so on the 3-η / 1-κ IOV fixture a
-/// subject with 6 occasions (9 axes) declines and one with 1 occasion (4 axes) does not —
-/// the population's mix of the two is the only input that changes between cells:
+/// #2054: the pre-fit cost prediction (`predicted_r_route`) agrees with the assembly on the
+/// same population. Laplace's exact anchor once served at most 8 stacked `[η, κ]` axes, so on
+/// the 3-η / 1-κ IOV fixture a subject with 6 occasions (9 axes) declined and the prediction was
+/// `Salvage`; now every width is served:
 ///
-/// - none wide → `Analytic`, no cost note, no count;
-/// - 1 of 3 wide → `Salvage { 1, 3 }`, the `2·n²` count over that one subject — and
-///   `analytic_cov_assembly` returns `Partial` declining exactly that subject;
-/// - 1 of 2 wide → `Stencil`, the salvage cut is `>=` one half;
-/// - the 1-of-3 population with `analytic_cov_hessian = false` → `Stencil`, the model-level
-///   gate overrides the per-subject walk.
+/// - the mixed population → `Analytic`, no cost count, and `analytic_cov_assembly` returns
+///   `Full` (the wide subject included — its term is not declined);
+/// - the same population with `analytic_cov_hessian = false` → `Stencil`, the model-level gate
+///   still overrides the prediction.
 #[test]
-fn the_pre_fit_cost_prediction_follows_the_salvage_route() {
+fn the_pre_fit_cost_prediction_agrees_with_a_full_assembly_at_any_width() {
     use super::{
-        analytic_cov_assembly, pre_fit_covariance_cost, pre_fit_covariance_cost_note,
-        predicted_r_route, AnalyticCovAssembly, PredictedRRoute,
+        analytic_cov_assembly, pre_fit_covariance_cost, predicted_r_route, AnalyticCovAssembly,
+        PredictedRRoute,
     };
     use crate::types::{EstimationMethod, FitOptions, Population};
     let (model, narrow) = iov_cov_fixture(1, false);
@@ -1294,8 +1278,12 @@ fn the_pre_fit_cost_prediction_follows_the_salvage_route() {
         id: id.into(),
         ..s.clone()
     };
-    let pop = |subjects: Vec<Subject>| Population {
-        subjects,
+    let mixed = Population {
+        subjects: vec![
+            subject(&narrow, "n1"),
+            subject(&narrow, "n2"),
+            subject(&wide, "w1"),
+        ],
         covariate_names: Vec::new(),
         dv_column: "DV".to_string(),
         input_columns: Vec::new(),
@@ -1307,64 +1295,33 @@ fn the_pre_fit_cost_prediction_follows_the_salvage_route() {
         run_covariance_step: true,
         ..FitOptions::default()
     };
-    let none_wide = pop(vec![subject(&narrow, "n1"), subject(&narrow, "n2")]);
-    let one_of_three = pop(vec![
-        subject(&narrow, "n1"),
-        subject(&narrow, "n2"),
-        subject(&wide, "w1"),
-    ]);
-    let one_of_two = pop(vec![subject(&narrow, "n1"), subject(&wide, "w1")]);
-
-    let route = |p: &Population, o: &FitOptions| predicted_r_route(&model, p, o, false);
-    assert_eq!(route(&none_wide, &options), PredictedRRoute::Analytic);
-    let salvage = PredictedRRoute::Salvage {
-        declined: 1,
-        n_subjects: 3,
-    };
-    assert_eq!(route(&one_of_three, &options), salvage);
-    assert_eq!(route(&one_of_two, &options), PredictedRRoute::Stencil);
+    assert_eq!(
+        predicted_r_route(&model, &options, false),
+        PredictedRRoute::Analytic
+    );
     let disabled = FitOptions {
         analytic_cov_hessian: false,
         ..options.clone()
     };
-    assert_eq!(route(&one_of_three, &disabled), PredictedRRoute::Stencil);
-    assert!(
-        route(
-            &one_of_three,
-            &FitOptions {
-                method: EstimationMethod::FoceI,
-                interaction: true,
-                ..options.clone()
-            }
-        ) == PredictedRRoute::Analytic,
-        "control: under FOCEI's wider ladder the 9-axis subject is in scope"
+    assert_eq!(
+        predicted_r_route(&model, &disabled, false),
+        PredictedRRoute::Stencil
     );
-
-    // The cost and the note, at n = 31, on each route.
     assert_eq!(
         pre_fit_covariance_cost(31, &options, false, PredictedRRoute::Analytic),
-        None
+        None,
+        "no count on the analytic route"
     );
-    assert_eq!(
-        pre_fit_covariance_cost(31, &options, false, salvage),
-        Some(Some(1922))
-    );
-    assert_eq!(
-        pre_fit_covariance_cost(31, &options, false, PredictedRRoute::Stencil),
-        Some(Some(1922))
-    );
-    let note = pre_fit_covariance_cost_note(31, Some(Some(1922)), salvage).expect("a note");
-    assert!(note.contains("over 1 of 3 subjects"), "{note}");
 
-    // The assembly declines exactly the subject the prediction named.
+    // The assembly serves every subject, the wide one included.
     let params = model.default_params.clone();
     let x_hat = pack_params(&params);
-    let eta_hats: Vec<DVector<f64>> = one_of_three
+    let eta_hats: Vec<DVector<f64>> = mixed
         .subjects
         .iter()
         .map(|_| DVector::from_element(model.n_eta, 0.1))
         .collect();
-    let kappas: Vec<Vec<DVector<f64>>> = one_of_three
+    let kappas: Vec<Vec<DVector<f64>>> = mixed
         .subjects
         .iter()
         .map(|s| {
@@ -1376,17 +1333,13 @@ fn the_pre_fit_cost_prediction_follows_the_salvage_route() {
         })
         .collect();
     match analytic_cov_assembly(
-        &model,
-        &one_of_three,
-        &params,
-        &x_hat,
-        &eta_hats,
-        &kappas,
-        &options,
+        &model, &mixed, &params, &x_hat, &eta_hats, &kappas, &options,
     ) {
-        AnalyticCovAssembly::Partial { declined, .. } => assert_eq!(declined, vec![2]),
-        AnalyticCovAssembly::Full(_) => panic!("expected Partial, got Full"),
-        AnalyticCovAssembly::Unavailable => panic!("expected Partial, got Unavailable"),
+        AnalyticCovAssembly::Full(_) => {}
+        AnalyticCovAssembly::Partial { declined, .. } => {
+            panic!("expected Full, declined {declined:?}")
+        }
+        AnalyticCovAssembly::Unavailable => panic!("expected Full, got Unavailable"),
     }
 }
 
@@ -1400,15 +1353,7 @@ fn the_pre_fit_cost_prediction_follows_the_salvage_route() {
 /// unscaled control.
 #[test]
 fn no_scaling_form_declines_the_r_matrix_on_either_engine() {
-    use crate::types::{FitOptions, Population, ScalingSpec, Subject};
-    let population = Population {
-        subjects: vec![Subject::default()],
-        covariate_names: Vec::new(),
-        dv_column: "DV".into(),
-        input_columns: Vec::new(),
-        exclusions: None,
-        warnings: Vec::new(),
-    };
+    use crate::types::{FitOptions, ScalingSpec};
     let options = FitOptions::default();
     // `examples/warfarin_iov.ferx`, the issue's closed-form fixture (κ on CL).
     let closed = |scaling: &str| {
@@ -1473,12 +1418,12 @@ fn no_scaling_form_declines_the_r_matrix_on_either_engine() {
 
     for (label, model) in &cases {
         assert_eq!(
-            super::analytic_cov_scope_declines(model, &population, &options, false),
+            super::analytic_cov_model_declines(model, &options, false),
             Vec::new(),
             "{label}"
         );
         assert!(
-            super::analytic_r_expected(model, &population, &options, false),
+            super::analytic_r_expected(model, &options, false),
             "{label}"
         );
     }
@@ -1493,15 +1438,7 @@ fn no_scaling_form_declines_the_r_matrix_on_either_engine() {
 #[test]
 fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
     use crate::estimation::cov_diagnostics::CovScopeDecline;
-    use crate::types::{FitOptions, GradientMethod, Population, Subject};
-    let population = Population {
-        subjects: vec![Subject::default()],
-        covariate_names: Vec::new(),
-        dv_column: "DV".into(),
-        input_columns: Vec::new(),
-        exclusions: None,
-        warnings: Vec::new(),
-    };
+    use crate::types::{FitOptions, GradientMethod};
     let base = || {
         crate::parser::model_parser::parse_model_string(
             "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
@@ -1525,7 +1462,7 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
             other => unreachable!("{other:?} has a remedy but no fixture applying it"),
         }
         assert_eq!(
-            super::analytic_cov_scope_declines(&model, &population, &options, false),
+            super::analytic_cov_model_declines(&model, &options, false),
             vec![decline],
             "{decline:?}: the fixture hits only its own clause"
         );
@@ -1535,7 +1472,7 @@ fn applying_each_remedy_to_a_model_that_hits_only_its_clause_clears_the_walk() {
             _ => unreachable!(),
         }
         assert_eq!(
-            super::analytic_cov_scope_declines(&model, &population, &options, false),
+            super::analytic_cov_model_declines(&model, &options, false),
             Vec::new(),
             "{decline:?}: {} must clear the walk",
             decline.remedy().unwrap()
@@ -1774,7 +1711,7 @@ fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
     assert!(options.analytic_cov_hessian);
     assert!(super::cov_ode_override(&default, &options).is_some());
     assert_eq!(
-        super::predicted_r_route(&default, &population, &options, false),
+        super::predicted_r_route(&default, &options, false),
         super::PredictedRRoute::Analytic,
         "fixture: every subject is on the analytic R-matrix"
     );
@@ -1851,7 +1788,7 @@ fn the_hybrid_covariance_step_runs_whole_at_the_plateau_tolerance() {
     let tight = ode_model_at(Some((1e-9, 1e-11)));
     let options = FitOptions::default();
     assert_eq!(
-        super::predicted_r_route(&default, &population, &options, false),
+        super::predicted_r_route(&default, &options, false),
         super::PredictedRRoute::Analytic,
         "fixture: the decline is invisible to the route walk"
     );

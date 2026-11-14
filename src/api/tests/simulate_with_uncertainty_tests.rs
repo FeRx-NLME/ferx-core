@@ -30,6 +30,7 @@ fn tiny_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,

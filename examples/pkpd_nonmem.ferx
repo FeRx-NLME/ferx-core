@@ -37,5 +37,4 @@
 
 [fit_options]
   method     = focei
-  gradient   = fd
   covariance = false

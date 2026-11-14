@@ -1454,6 +1454,8 @@ pub fn run_imp(
     warm_etas: Option<&[DVector<f64>]>,
     options: &FitOptions,
 ) -> Result<OuterResult, String> {
+    let _prints =
+        crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
     let result = run_imp_stage(model, population, init_params, warm_etas, options)?;
     Ok(apply_settling_verdict(
         result,

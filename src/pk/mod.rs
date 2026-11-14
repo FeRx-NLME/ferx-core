@@ -176,7 +176,7 @@ fn pk_params_at_time(
 ///
 /// Mirrors those exact guards — the 1-cpt arm inline, the 2-cpt arm by deferring to
 /// the closed form's own `*_2cpt_domain_ok` (so both the flip-flop and the confluent
-/// `|α − β| < 1e-12` clamp are honoured) — so the prediction and every sensitivity
+/// `α = β` clamp are honoured) — so the prediction and every sensitivity
 /// path make the *same* routing decision. Returns `false` for a non-absorption-closed-form
 /// model, and for invalid parameters — there the closed form's `0` is a deliberate
 /// optimiser penalty, not a flip-flop to reroute to the ODE twin — or a `NaN` one, which
@@ -211,7 +211,7 @@ pub(crate) fn absorption_flip_flop_at(
             // Defer to the closed form's own domain guard rather than re-deriving it:
             // `transit_2cpt_domain_ok` returns `None` (⇒ the closed form clamps to `0`)
             // for *both* the flip-flop `!(α < KTR)` case and the confluent-eigenvalue
-            // `|α − β| < 1e-12` case. Rerouting exactly when it clamps keeps this a
+            // `α = β` case. Rerouting exactly when it clamps keeps this a
             // faithful negation of the guard. Params are valid here, so `None` always
             // means "would clamp", never "invalid input".
             crate::sens::two_cpt::transit_2cpt_domain_ok::<f64>(cl, v1, pk.q(), pk.v2(), n, mtt)
@@ -546,33 +546,37 @@ fn fill_iov_record_table(
     pk_only_ix: &mut Vec<u32>,
 ) {
     let mut memo = RecordParamMemo::new(model);
-    let mut last: Option<u32> = None;
+    // The table entry holding the memo's evaluation: never one the parent-dose edits below
+    // write (they edit copies), so every record the memo matches reads it.
+    let mut held: Option<u32> = None;
     let mut push = |table: &mut Vec<PkParams>,
-                    last: &mut Option<u32>,
+                    held: &mut Option<u32>,
                     out: &mut Vec<u32>,
                     occ: u32,
                     cov: &std::collections::HashMap<String, f64>,
                     time: f64| {
-        let mut fresh = false;
-        let p = memo.get_ref(occ, cov, time, || {
-            fresh = true;
-            pk_params_at_time(model, theta, &combined_for(occ), cov, time)
-        });
-        let i = match *last {
-            Some(i) if !fresh => i,
+        let hit = memo.same(occ, cov, time);
+        let i = match *held {
+            Some(i) if hit => i,
             _ => {
-                table.extend_from_slice(std::slice::from_ref(p));
+                table.push(pk_params_at_time(
+                    model,
+                    theta,
+                    &combined_for(occ),
+                    cov,
+                    time,
+                ));
                 (table.len() - 1) as u32
             }
         };
-        *last = Some(i);
+        *held = Some(i);
         out.push(i);
     };
     for d in 0..subject.doses.len() {
         let occ = dose_row_occasion(subject, d).unwrap_or(u32::MAX);
         push(
             table,
-            &mut last,
+            &mut held,
             dose_ix,
             occ,
             subject.dose_cov(d),
@@ -590,13 +594,11 @@ fn fill_iov_record_table(
         let v = table[dose_ix[p] as usize].values[slot];
         table[dose_ix[k] as usize].values[slot] = v;
     }
-    // A record after an edited dose must not share the edited entry: restart sharing.
-    last = None;
     for j in 0..subject.obs_times.len() {
         let occ = subject.occasions.get(j).copied().unwrap_or(0);
         push(
             table,
-            &mut last,
+            &mut held,
             obs_ix,
             occ,
             subject.obs_cov(j),
@@ -607,7 +609,7 @@ fn fill_iov_record_table(
         let occ = pk_only_row_occasion(subject, m).unwrap_or(u32::MAX);
         push(
             table,
-            &mut last,
+            &mut held,
             pk_only_ix,
             occ,
             subject.pk_only_cov(m),
@@ -621,12 +623,8 @@ fn fill_iov_record_table(
 /// time unless the parameter program provably does not read `TIME`.
 struct RecordParamMemo {
     time_free: bool,
-    last: Option<(
-        u32,
-        *const std::collections::HashMap<String, f64>,
-        u64,
-        PkParams,
-    )>,
+    last: Option<(u32, *const std::collections::HashMap<String, f64>, u64)>,
+    value: PkParams,
 }
 
 impl RecordParamMemo {
@@ -641,6 +639,7 @@ impl RecordParamMemo {
             time_free: model.indiv_param_partials.indiv_param_program.is_some()
                 && !model_uses_time_builtin(model),
             last: None,
+            value: PkParams::default(),
         }
     }
 
@@ -653,14 +652,20 @@ impl RecordParamMemo {
         time: f64,
         eval: impl FnOnce() -> PkParams,
     ) -> &PkParams {
-        let t = if self.time_free { 0 } else { time.to_bits() };
-        let cov_ptr = cov as *const _;
-        let hit = matches!(&self.last, Some((o, c, tt, _))
-            if *o == occ && std::ptr::eq(*c, cov_ptr) && *tt == t);
-        if !hit {
-            self.last = Some((occ, cov_ptr, t, eval()));
+        if !self.same(occ, cov, time) {
+            self.value = eval();
         }
-        &self.last.as_ref().expect("set above").3
+        &self.value
+    }
+
+    /// Whether these inputs are the last call's, which they become.
+    fn same(&mut self, occ: u32, cov: &std::collections::HashMap<String, f64>, time: f64) -> bool {
+        let key = (
+            occ,
+            cov as *const _,
+            if self.time_free { 0 } else { time.to_bits() },
+        );
+        self.last.replace(key) == Some(key)
     }
 }
 
@@ -961,7 +966,7 @@ fn analytical_init_concentration(
     p: &PkParams,
 ) -> f64 {
     // Delegate to the generic form at `T = f64`; the single formula dispatch
-    // lives there so the Dual2/Dual1 sensitivity path (#524) cannot drift from
+    // lives there so the Dual2/Dual2 sensitivity path (#524) cannot drift from
     // the f64 prediction.
     analytical_init_concentration_g::<f64>(
         pk_model,
@@ -979,7 +984,7 @@ fn analytical_init_concentration(
 }
 
 /// Generic form of [`analytical_init_concentration`] over [`PkNum`]: evaluating
-/// in `f64` gives the prediction; evaluating in `Dual2<N>`/`Dual1<N>` (with the
+/// in `f64` gives the prediction; evaluating in `Dual2<N>`/`Dual2<N>` (with the
 /// amount `a0` and the PK params seeded as duals) gives the exact `∂C/∂A₀`,
 /// `∂C/∂(CL,V,…)` the analytic FOCE/FOCEI provider needs (#524). The amount is a
 /// pre-loaded compartment quantity, so `F = 1` everywhere — an initial condition
@@ -3888,6 +3893,7 @@ mod tests {
         let mut memo = RecordParamMemo {
             time_free: true,
             last: None,
+            value: PkParams::default(),
         };
         assert_eq!(memo.get_ref(0, &a, 1.0, || eval(1.0)).values[0], 1.0);
         // Same occasion and map, another time, on a time-free program: reused.
@@ -3901,6 +3907,7 @@ mod tests {
         let mut timed = RecordParamMemo {
             time_free: false,
             last: None,
+            value: PkParams::default(),
         };
         timed.get_ref(0, &a, 1.0, || eval(4.0));
         assert_eq!(timed.get_ref(0, &a, 2.0, || eval(5.0)).values[0], 5.0);
@@ -5237,6 +5244,7 @@ mod tests {
             PkModel, ScalingSpec, SigmaVector,
         };
         CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,

@@ -14,6 +14,7 @@
 //! exact, so the lanes agree with theirs wherever no `NaN` or signed zero is involved.
 use super::super::{Flat, Unary};
 use super::ir::{self, Cc, Layout, Shim1};
+use super::DirMask;
 use crate::stats::special::gamma_pq_partial;
 
 /// A layout's lane structure: `n` tangents, then the payload pairs `(k, l, lane)`.
@@ -61,35 +62,32 @@ pub(super) struct AtLayout {
 }
 
 impl AtLayout {
-    pub(super) fn of(prog: &LaneProg, layout: Layout, spec: &[(u64, u8)]) -> Self {
-        let n = layout.n as u32;
-        let bits = if n >= 63 {
-            !super::FREE
-        } else {
-            (1u64 << n) - 1
-        };
-        let mut m = vec![0u64; prog.n_regs];
-        let get = |m: &[u64], r: u32| m[r as usize];
+    pub(super) fn of(prog: &LaneProg, layout: Layout, spec: &[(DirMask, u16)]) -> Self {
+        let n = layout.n as usize;
+        let mut m = vec![DirMask::NONE; prog.n_regs];
+        let get = |m: &[DirMask], r: u32| m[r as usize].clone();
         for f in &prog.code {
             let (d, v) = match *f {
-                Flat::LoadState { d, i } => (d, spec[i as usize].0),
+                Flat::LoadState { d, i } => (d, spec[i as usize].0.clone()),
                 Flat::Add { d, a, b }
                 | Flat::Sub { d, a, b }
                 | Flat::RSub { d, a, b }
                 | Flat::Mul { d, a, b }
                 | Flat::Div { d, a, b }
-                | Flat::DivRaw { d, a, b } => (d, get(&m, a) | get(&m, b)),
+                | Flat::DivRaw { d, a, b } => (d, get(&m, a) | &m[b as usize]),
                 Flat::Pow { d, a, e: b } | Flat::GammaPq { d, a, x: b, .. } => {
-                    (d, get(&m, a) | get(&m, b))
+                    (d, get(&m, a) | &m[b as usize])
                 }
-                Flat::Select { d, a, b, .. } => (d, get(&m, a) | get(&m, b)),
+                Flat::Select { d, a, b, .. } => (d, get(&m, a) | &m[b as usize]),
                 Flat::AddK { d, a, .. }
                 | Flat::SubK { d, a, .. }
                 | Flat::RSubK { d, a, .. }
                 | Flat::MulK { d, a, .. }
                 | Flat::DivK { d, a, .. } => (d, get(&m, a)),
                 Flat::Unary { d, op, a } => match op {
-                    Unary::StopGrad | Unary::Floor | Unary::Ceil | Unary::Round => (d, 0),
+                    Unary::StopGrad | Unary::Floor | Unary::Ceil | Unary::Round => {
+                        (d, DirMask::NONE)
+                    }
                     _ => (d, get(&m, a)),
                 },
                 Flat::LoadSeed { d, .. }
@@ -99,12 +97,12 @@ impl AtLayout {
                 | Flat::Or { d, .. }
                 | Flat::Not { d, .. }
                 | Flat::Present { d, .. }
-                | Flat::HostOut { d, .. } => (d, 0),
+                | Flat::HostOut { d, .. } => (d, DirMask::NONE),
                 _ => continue,
             };
             m[d as usize] = v;
         }
-        let live: Vec<bool> = m.iter().map(|&v| v & bits != 0).collect();
+        let live: Vec<bool> = m.iter().map(|v| v.any_below(n)).collect();
         AtLayout {
             sh: Shape::of(layout),
             dead: prog
@@ -124,16 +122,6 @@ pub(super) struct LaneProg {
 }
 
 impl LaneProg {
-    /// TEMP #2786 tier check: the chunk's outputs and its code.
-    pub(super) fn n_out(&self) -> usize {
-        self.code
-            .iter()
-            .filter(|f| matches!(f, Flat::Deriv { .. }))
-            .count()
-    }
-    pub(super) fn code(&self) -> &[Flat] {
-        &self.code
-    }
     pub(super) fn of(code: &[Flat], n_regs: usize, n_in: usize) -> Option<Self> {
         if code.iter().any(|f| {
             matches!(
@@ -271,7 +259,9 @@ impl LaneProg {
                     if store {
                         let dst =
                             std::slice::from_raw_parts_mut(slot(self.n_in + state as usize), l);
-                        dst.copy_from_slice(rd(a));
+                        for (o, &x) in dst.iter_mut().zip(rd(a)) {
+                            *o = super::canonical_zero(x);
+                        }
                     }
                 }
                 Flat::Cmp { d, cc, a, b } => {
@@ -520,7 +510,7 @@ fn prim(sh: &Shape, a: &[f64], x: &[f64], p: &[f64; 6], out: &mut [f64]) {
     }
 }
 
-/// `DualV::pow` (see `ir::Lower::pow`): a constant exponent lifts `powf` (the constant
+/// the forward dual's `pow` (see `ir::Lower::pow`): a constant exponent lifts `powf` (the constant
 /// `powf(a, n)` at `a = 0`); one with a tangent is `exp(e · ln a)`.
 fn pow_fwd(sh: &Shape, a: &[f64], e: &[f64], out: &mut [f64], t1: &mut [f64], t2: &mut [f64]) {
     let (av, n) = (a[0], e[0]);

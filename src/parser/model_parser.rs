@@ -4228,9 +4228,6 @@ pub fn parse_full_model_with(
     content: &str,
     bindings: &ParseBindings,
 ) -> Result<ParsedModel, String> {
-    // A new model may be built where a dropped one lived: no compiled plan of the old one
-    // may serve it (#2786).
-    crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
     let level_bindings = &bindings.levels;
     let mut extracted = extract_blocks(content)?;
     // `ode_template NAME(...)` desugaring (#322 Phase 0b): if [structural_model]
@@ -5957,11 +5954,6 @@ pub fn parse_full_model_with(
         .collect();
     random_indiv.sort();
     indiv_param_partials.random_indiv_params = Some(random_indiv);
-    // Which `[odes]` conditions move with an estimated parameter (#2649). Needs the same
-    // desugared statements, so the dependencies a condition's parameters carry are complete.
-    if let Some(program) = ode_spec.as_mut().and_then(|o| o.rhs_program.as_mut()) {
-        program.resolve_moving_switches(&indiv_var_deps(&indiv_stmts, &nn_theta_deps));
-    }
     debug_assert_eq!(
         theta_transform.len(),
         theta_names.len(),
@@ -6057,6 +6049,7 @@ pub fn parse_full_model_with(
     indiv_param_partials.nested_levels = nested_levels;
 
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: residual_serial.clone(),
         priors: declared_priors,
         // `[priors] from_fit` is read further down, once `extract_blocks` output
@@ -7389,20 +7382,6 @@ pub fn parse_full_model_with(
     // desugared because the PK-slot layout was full (see the headroom check above).
     if let Some(note) = readout_fd_fallback_note.take() {
         model.parse_warnings.push(note);
-    }
-
-    // The route change below the scope gate is otherwise invisible (#2649).
-    if let Some(switch) = model
-        .ode_spec
-        .as_ref()
-        .and_then(|o| o.rhs_program.as_ref())
-        .and_then(|p| p.moving_switch())
-    {
-        model.parse_warnings.push(format!(
-            "[odes]: `{switch}` depends on a model parameter and reaches an `if` condition \
-             that switches during the integration, so the switching time moves with it. Exact \
-             derivatives cannot see that, so this model uses finite-difference gradients."
-        ));
     }
 
     model.parse_warnings.extend(check_unused_parameters(
@@ -16275,6 +16254,28 @@ fn build_ode_spec(
     indiv_param_slots: &[usize],
     chz_state_slots: &[usize],
 ) -> Result<crate::ode::OdeSpec, String> {
+    build_ode_spec_with(
+        lines,
+        state_names,
+        obs_cmt_name,
+        indiv_param_names,
+        indiv_param_slots,
+        chz_state_slots,
+        None,
+    )
+}
+
+/// [`build_ode_spec`]; with `switches`, the switch program of a model whose moving switches
+/// they are (`ode_switch::instrument`), `state_names` already extended by their hidden states.
+fn build_ode_spec_with(
+    lines: &[String],
+    state_names: &[String],
+    obs_cmt_name: Option<&str>,
+    indiv_param_names: &[String],
+    indiv_param_slots: &[usize],
+    chz_state_slots: &[usize],
+    switches: Option<&[String]>,
+) -> Result<crate::ode::OdeSpec, String> {
     let n_states = state_names.len();
     // When the user omitted `obs_cmt=` in `ode(states=[...])` they must
     // supply a `[scaling] y = <expr>` (Form C). At this point the
@@ -16551,7 +16552,10 @@ fn build_ode_spec(
         }
     }
     let ode_ctx = ParseCtx::ode(&ode_defined);
-    let stmts = parse_block_statements(&block_text, ode_ctx, StatementMode::Ode)?;
+    let mut stmts = parse_block_statements(&block_text, ode_ctx, StatementMode::Ode)?;
+    if let Some(leaves) = switches {
+        ode_switch::instrument(&mut stmts, leaves);
+    }
 
     // Validate that every declared state has a d/dt assignment somewhere in
     // the block (top level OR inside an if-body). Whether the if-body actually
@@ -16904,6 +16908,31 @@ fn build_ode_spec(
             inits: &init_specs,
         },
     );
+    // The moving switches (#2649): the integrator locates them and applies the sensitivity
+    // jump there, through a second program that returns each one's function and can force
+    // either arm (`ode_switch::instrument`). A model without one builds nothing more.
+    let leaves = ode_switch::switch_leaves(&condition_reads);
+    let switch = if switches.is_some() || leaves.is_empty() {
+        None
+    } else {
+        let mut ext = state_names.to_vec();
+        ext.extend((0..leaves.len()).map(ode_switch::switch_state));
+        let inner = build_ode_spec_with(
+            lines,
+            &ext,
+            obs_cmt_name,
+            indiv_param_names,
+            indiv_param_slots,
+            chz_state_slots,
+            Some(&leaves),
+        )?;
+        Some(std::sync::Arc::new(SwitchRhs {
+            prog: inner
+                .rhs_program
+                .ok_or("[odes]: the switch program did not compile")?,
+            rhs: inner.rhs,
+        }))
+    };
 
     // Rewrite the AST so the hot path walks `VariableIdx`/`AssignIdx`/`DiffEqIdx`
     // — pre-resolving names to slot indices. `cov_idx` stays empty (any
@@ -17195,8 +17224,7 @@ fn build_ode_spec(
         pk_reads_tad,
         pk_reads_solver_time,
         affine_in_states,
-        condition_reads,
-        moving_switches: Vec::new(),
+        switch: switch.clone(),
         #[cfg(feature = "survival")]
         init_indiv_reads,
         init_program,
@@ -17204,20 +17232,13 @@ fn build_ode_spec(
         reg_refusal: rhs_reg.err(),
         hoist: rhs_hoist,
         binding,
-        columns: None,
         f64_rhs: 0,
     };
 
-    // One binding (states, parameters, time slots, the lifted parameter-only values) feeds
-    // both the scalar RHS and the batched finite-difference columns (`RhsSink::Columns`).
-    // The compiled RHS (see `OdeRhsProgram::reg`), for the scalar `Value` sink.
+    // The compiled RHS (see `OdeRhsProgram::reg`).
     let rhs_reg_f64 = rhs_program.reg.clone();
-    let rhs_lanes_ok = stmts_lane_evaluable(match &rhs_hoist_f64 {
-        Some(h) => &h.stmts,
-        None => &stmts_owned,
-    });
-    let rhs_eval = std::sync::Arc::new(
-        move |u: &[f64], params: &[f64], t: f64, sink: RhsSink<'_>| -> bool {
+    let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> =
+        Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
             // The RHS always reserves two trailing slots for dose-time anchors:
             // TAFD at MAX_PK_PARAMS and TAD at MAX_PK_PARAMS + 1. Passing a bare
             // PkParams::values array (which ends at MAX_PK_PARAMS) turns either
@@ -17244,80 +17265,34 @@ fn build_ode_spec(
             // Compiled: no thread-local scratch, no `vars` binding, no hoist cache. This is the
             // closure path, called through `dyn Fn` where nothing outlives one call to hold a
             // cache in; the steppers' direct calls keep one per solve (`HoistCache`), with the
-            // values bit for bit this kernel's
-            // (`batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop`).
-            let sink = match rhs_reg_f64.as_ref() {
-                Some(reg) => {
-                    // No `ModelTimeGuard`: the program reads `TIME` through the time
-                    // seed (`rewrite_push_time_to_slot` ran before it was compiled).
-                    let seeds = binding.f64_seeds(params, t);
-                    match sink {
-                        RhsSink::Value(du) => {
-                            if binding.zero || du.len() != state_count {
-                                du.fill(0.0);
-                            }
-                            if reg.try_native(u, params, &seeds, du) {
-                                return true;
-                            }
-                            // Registers are reused by lifetime, so a typical program fits
-                            // the stack; a larger one borrows the thread's scratch rather
-                            // than allocating per call.
-                            let mut stack_regs = [0.0_f64; 24];
-                            if reg.n_regs() <= stack_regs.len() {
-                                reg.run(u, params, &seeds, du, &mut stack_regs);
-                            } else {
-                                RHS_REG_SCRATCH.with(|cell| {
-                                    let mut regs = cell.borrow_mut();
-                                    if regs.len() < reg.n_regs() {
-                                        regs.resize(reg.n_regs(), 0.0);
-                                    }
-                                    reg.run(u, params, &seeds, du, &mut regs);
-                                });
-                            }
-                            return true;
-                        }
-                        // The finite-difference columns as one native call each: column
-                        // `c` is the RHS at `u` with `u[j] + d` in place of `u[j]`, the
-                        // value the lane evaluator seeds, and states the program never
-                        // writes stay zero as the lanes leave them. The guard is
-                        // `eval_rhs_columns`' own acceptance (every column a state, `out`
-                        // and `u` long enough) plus the slices the native code reads; a
-                        // call that fails it falls through to the lane evaluator, which
-                        // reads a missing state or parameter as 0.
-                        RhsSink::Columns { cols, out }
-                            if reg.has_native_f64()
-                                && u.len() >= state_count
-                                && out.len() >= cols.len() * state_count
-                                && cols.iter().all(|&(j, _)| j < state_count)
-                                && reg.native_f64_fits(u.len(), params.len(), state_count) =>
-                        {
-                            let n = state_count;
-                            let mut x = [0.0_f64; 32];
-                            let mut heap = Vec::new();
-                            let x: &mut [f64] = if u.len() <= x.len() {
-                                &mut x[..u.len()]
-                            } else {
-                                heap.resize(u.len(), 0.0);
-                                &mut heap
-                            };
-                            x.copy_from_slice(u);
-                            for (c, &(j, d)) in cols.iter().enumerate() {
-                                x[j] = u[j] + d;
-                                let col = &mut out[c * n..(c + 1) * n];
-                                col.fill(0.0);
-                                // Cannot decline: `has_native_f64` and `native_f64_fits`
-                                // hold for these very slices.
-                                let ran = reg.try_native(x, params, &seeds, col);
-                                debug_assert!(ran);
-                                x[j] = u[j];
-                            }
-                            return true;
-                        }
-                        sink => sink,
-                    }
+            // values bit for bit this kernel's.
+            if let Some(reg) = rhs_reg_f64.as_ref() {
+                // No `ModelTimeGuard`: the program reads `TIME` through the time
+                // seed (`rewrite_push_time_to_slot` ran before it was compiled).
+                let seeds = binding.f64_seeds(params, t);
+                if binding.zero || du.len() != state_count {
+                    du.fill(0.0);
                 }
-                None => sink,
-            };
+                if reg.try_native(u, params, &seeds, du) {
+                    return;
+                }
+                // Registers are reused by lifetime, so a typical program fits
+                // the stack; a larger one borrows the thread's scratch rather
+                // than allocating per call.
+                let mut stack_regs = [0.0_f64; 24];
+                if reg.n_regs() <= stack_regs.len() {
+                    reg.run(u, params, &seeds, du, &mut stack_regs);
+                } else {
+                    RHS_REG_SCRATCH.with(|cell| {
+                        let mut regs = cell.borrow_mut();
+                        if regs.len() < reg.n_regs() {
+                            regs.resize(reg.n_regs(), 0.0);
+                        }
+                        reg.run(u, params, &seeds, du, &mut regs);
+                    });
+                }
+                return;
+            }
             let copy_n = state_count.min(u.len());
 
             FERX_SCRATCH.with(|cell| {
@@ -17412,58 +17387,44 @@ fn build_ode_spec(
                     }
                     None => &stmts_owned,
                 };
-                match sink {
-                    RhsSink::Value(du) => {
-                        // Reset du so a state without a firing d/dt this iteration
-                        // (e.g. inside an untaken if-branch) gets 0.0 rather than
-                        // stale memory. The lean binding proved every path writes all
-                        // `state_count` of them; a `du` of another length keeps the reset.
-                        if binding.zero || du.len() != state_count {
-                            for slot in du.iter_mut() {
-                                *slot = 0.0;
-                            }
-                        }
-                        eval_statements_indexed_with_stack(
-                            run_stmts,
-                            &empty_theta,
-                            &empty_eta,
-                            &empty_cov,
-                            &mut scratch.rhs_vars,
-                            Some(du),
-                            &empty_nn_outputs,
-                            &mut scratch.bc_stack,
-                        );
-                        true
-                    }
-                    RhsSink::Columns { cols, out } => {
-                        rhs_lanes_ok
-                            && eval_rhs_columns(
-                                run_stmts,
-                                &scratch.rhs_vars,
-                                &u[..copy_n],
-                                state_count,
-                                cols,
-                                out,
-                            )
+                // Reset du so a state without a firing d/dt this iteration
+                // (e.g. inside an untaken if-branch) gets 0.0 rather than
+                // stale memory. The lean binding proved every path writes all
+                // `state_count` of them; a `du` of another length keeps the reset.
+                if binding.zero || du.len() != state_count {
+                    for slot in du.iter_mut() {
+                        *slot = 0.0;
                     }
                 }
+                eval_statements_indexed_with_stack(
+                    run_stmts,
+                    &empty_theta,
+                    &empty_eta,
+                    &empty_cov,
+                    &mut scratch.rhs_vars,
+                    Some(du),
+                    &empty_nn_outputs,
+                    &mut scratch.bc_stack,
+                );
             })
-        },
-    );
-    let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> = {
-        let e = rhs_eval.clone();
-        Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
-            e(u, params, t, RhsSink::Value(du));
-        })
+        });
+    // A model with moving switches: a `u` past the states asks for its switch program, and
+    // every other call says how many switches the integration has to watch
+    // (`ode::solver::note_switches`).
+    let rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync> = match switch {
+        None => rhs,
+        Some(sw) => {
+            let k = sw.prog.state_count - state_count;
+            Box::new(move |u: &[f64], params: &[f64], t: f64, du: &mut [f64]| {
+                if u.len() > state_count {
+                    (sw.rhs)(u, params, t, du);
+                } else {
+                    crate::ode::solver::note_switches(k);
+                    rhs(u, params, t, du);
+                }
+            })
+        }
     };
-    let rhs_columns: Option<RhsColumnsFn> = rhs_lanes_ok.then(|| -> RhsColumnsFn {
-        Box::new(
-            move |u: &[f64], params: &[f64], t: f64, cols: &[(usize, f64)], out: &mut [f64]| {
-                rhs_eval(u, params, t, RhsSink::Columns { cols, out })
-            },
-        )
-    });
-    rhs_program.columns = rhs_columns;
     // The box's heap address is stable when the box moves into the spec.
     rhs_program.f64_rhs = &*rhs as *const _ as *const () as usize;
 
@@ -19166,28 +19127,23 @@ pub(crate) fn eval_mixing_log_probs(
 }
 
 /// The exact `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) of [`eval_mixing_log_probs`], for either
-/// mixing form: each mixing expression's θ-only program (compiled once, at parse) evaluated
-/// on the scalar reverse tape with θ as inputs, through the
-/// objective's own log-softmax (logit form) or clamp-and-renormalise (`p` form), and one
-/// sweep per class. A clamped probability has the zero derivative its clamp gives the
-/// objective. `None` on a program that declines (a θ-count mismatch) or a non-finite
-/// result; the callers keep their difference quotients for that.
-pub(crate) fn mixing_logp_grad_exact(
+/// mixing form, and — `second` — each class's row-major θ-Hessian: [`mixing_logp_g`] recorded
+/// and differentiated (`kernel_jit::derivs`). A clamped probability has the zero derivative its
+/// clamp gives the objective. `None` on a program that declines (a θ-count mismatch) or a
+/// non-finite result.
+#[allow(clippy::type_complexity)]
+pub(crate) fn mixing_logp_derivs(
+    model: &CompiledModel,
     spec: &crate::types::MixtureSpec,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
-) -> Option<Vec<Vec<f64>>> {
-    use crate::sens::rtape::{rinput, rsweep, rtape_reset, R};
-    rtape_reset();
-    let th: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
-    let lp = mixing_logp_g::<R>(spec, &th, covariates)?;
-    let mut out = Vec::with_capacity(lp.len());
-    for &l in &lp {
-        let adj = rsweep::<1>(&[l]);
-        let row: Vec<f64> = th.iter().map(|t| t.idx().map_or(0.0, |i| adj[i])).collect();
-        out.push(row);
-    }
-    out.iter().flatten().all(|v| v.is_finite()).then_some(out)
+    second: bool,
+) -> Option<(Vec<Vec<f64>>, Vec<Vec<f64>>)> {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let (_, grad, hess) = kj::derivs(model, theta, spec.n_classes, second, &|th| {
+        mixing_logp_g(spec, th, covariates)
+    })?;
+    Some((grad, hess))
 }
 
 /// `ln p_ik` over any number type: each mixing expression's θ-only program through the
@@ -19205,10 +19161,11 @@ fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
     let eval = |m: &crate::types::MixingExpr| -> Option<T> {
         m.program.eval_g::<T>(th, covariates, time, 0.0)
     };
+    use crate::sens::num::BranchCmp;
     let clamp = |x: T, lo: f64, hi: f64| -> T {
-        if x.val() < lo {
+        if x.br_cmp_c(BranchCmp::Lt, lo) {
             T::from_f64(lo)
-        } else if x.val() > hi {
+        } else if x.br_cmp_c(BranchCmp::Gt, hi) {
             T::from_f64(hi)
         } else {
             x
@@ -19219,9 +19176,10 @@ fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
         for m in &spec.mixing {
             logits[m.class - 1] = eval(m)?;
         }
+        // The shift is exact at any value: the one seen.
         let max = logits
             .iter()
-            .map(|l| l.val())
+            .map(|l| l.seen_value())
             .fold(f64::NEG_INFINITY, f64::max);
         let mut sum = T::from_f64(0.0);
         for &l in &logits {
@@ -19246,142 +19204,19 @@ fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
     })
 }
 
-/// The exact θ-Hessian `∂² ln p_ik / ∂θ_j ∂θ_l` of every class (`K` matrices,
-/// `n_theta × n_theta`), with the gradient rows of [`mixing_logp_grad_exact`]: forward over
-/// reverse, eight θ directions per recording on `DualT<8, R>`, one eight-lane sweep per
-/// class and chunk. `None` where the gradient declines.
-pub(crate) fn mixing_logp_hess_exact(
-    spec: &crate::types::MixtureSpec,
-    theta: &[f64],
-    covariates: &HashMap<String, f64>,
-) -> Option<(Vec<Vec<f64>>, Vec<nalgebra::DMatrix<f64>>)> {
-    use crate::sens::rtape::{rinput, rsweep, rtape_reset, DualT, R};
-    const C: usize = 8;
-    let n = theta.len();
-    let k = spec.n_classes;
-    let mut grad = vec![vec![0.0; n]; k];
-    let mut hess = vec![nalgebra::DMatrix::<f64>::zeros(n, n); k];
-    for start in (0..n.max(1)).step_by(C) {
-        rtape_reset();
-        let leaves: Vec<R> = theta.iter().map(|&t| rinput(t)).collect();
-        let th: Vec<DualT<C, R>> = leaves
-            .iter()
-            .enumerate()
-            .map(|(m, &v)| {
-                let mut g = [R::c(0.0); C];
-                if (start..start + C).contains(&m) {
-                    g[m - start] = R::c(1.0);
-                }
-                DualT { v, g }
-            })
-            .collect();
-        let lp = mixing_logp_g::<DualT<C, R>>(spec, &th, covariates)?;
-        for (cls, y) in lp.iter().enumerate() {
-            if start == 0 {
-                let adj = rsweep::<1>(&[y.v]);
-                for (j, t) in leaves.iter().enumerate() {
-                    grad[cls][j] = t.idx().map_or(0.0, |i| adj[i]);
-                }
-            }
-            let adj = rsweep::<C>(&y.g);
-            for (lane, l) in (start..(start + C).min(n)).enumerate() {
-                for (j, t) in leaves.iter().enumerate() {
-                    hess[cls][(j, l)] = t.idx().map_or(0.0, |i| adj[i * C + lane]);
-                }
-            }
-        }
-    }
-    let finite = grad.iter().flatten().all(|v| v.is_finite())
-        && hess.iter().all(|h| h.iter().all(|v| v.is_finite()));
-    finite.then_some((grad, hess))
-}
-
-/// `∂ ln p_ik / ∂ θ_j` for the mixing probabilities (#977 Phase 4), returned as
-/// `K × n_theta`: exact for either form ([`mixing_logp_grad_exact`]). Where that declines,
-/// the **logit** form (`p = softmax(g)`) falls back to the central difference below and
-/// the `p` (direct-probability) form returns `None` so the caller routes to FD.
-///
-/// For the softmax: `∂ ln p_k/∂θ_j = ∂g_k/∂θ_j − Σ_m p_m ∂g_m/∂θ_j`, where the
-/// per-class scores `g_k` are the mixing expressions (reference class `K` has
-/// `g ≡ 0 ⇒ ∂ = 0`) and `∂g/∂θ_j` comes from the symbolic differentiator.
-///
-/// `floor` is the per-θ step floor of [`crate::estimation::parameterization::fd_theta_step_floors`]
-/// (#2147): θⱼ is stepped by `1e-6·max(|θⱼ|, floorⱼ)`, so a θ declared below 1 in magnitude is
-/// stepped relative to its θ₀ rather than by `1e-6` in its own units, which crosses zero on a
-/// θ near `1e-6`.
-pub(crate) fn mixing_logp_grad(
-    spec: &crate::types::MixtureSpec,
-    theta: &[f64],
-    covariates: &HashMap<String, f64>,
-    floor: &[f64],
-) -> Option<Vec<Vec<f64>>> {
-    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
-        return Some(exact);
-    }
-    if !spec.mixing.iter().all(|m| m.is_logit) {
-        return None; // p-form → FD fallback
-    }
-    let k = spec.n_classes;
-    let nt = theta.len();
-    let empty_vars: HashMap<String, f64> = HashMap::new();
-    let env = MapEnv {
-        covariates,
-        vars: &empty_vars,
-    };
-    let no_eta: [f64; 0] = [];
-
-    // Per-class logit value and its θ-gradient (reference class K stays 0). The
-    // mixing expression is a cheap closed form over θ + covariates (no inner
-    // solve, no random effects), so a central difference over θ is machine-exact
-    // — and it avoids the symbolic differentiator, which expects resolved
-    // covariate-index nodes the mixing AST never carries.
-    let mut logit = vec![0.0f64; k];
-    let mut dlogit = vec![vec![0.0f64; nt]; k];
-    let mut tperturb = theta.to_vec();
-    for m in &spec.mixing {
-        let c = m.class - 1;
-        logit[c] = eval_expr(&m.expr, theta, &no_eta, &env, &[]);
-        for j in 0..nt {
-            let h = 1e-6 * theta[j].abs().max(floor[j]);
-            tperturb[j] = theta[j] + h;
-            let fp = eval_expr(&m.expr, &tperturb, &no_eta, &env, &[]);
-            tperturb[j] = theta[j] - h;
-            let fm = eval_expr(&m.expr, &tperturb, &no_eta, &env, &[]);
-            tperturb[j] = theta[j];
-            dlogit[c][j] = (fp - fm) / (2.0 * h);
-        }
-    }
-    // p = softmax(logit)
-    let max = logit.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let ex: Vec<f64> = logit.iter().map(|l| (l - max).exp()).collect();
-    let s: f64 = ex.iter().sum();
-    let p: Vec<f64> = ex.iter().map(|e| e / s).collect();
-
-    // ∂ ln p_c/∂θ_j = dlogit[c][j] − Σ_m p_m dlogit[m][j]
-    let mut out = vec![vec![0.0f64; nt]; k];
-    for j in 0..nt {
-        let wsum: f64 = (0..k).map(|m| p[m] * dlogit[m][j]).sum();
-        for c in 0..k {
-            out[c][j] = dlogit[c][j] - wsum;
-        }
-    }
-    Some(out)
-}
-
-/// Central-difference `∂ ln p_ik / ∂ θ_j` (`K × n_theta`) for **either** mixing form
-/// (#1956) — the covariance step's per-subject mixture score takes it for the `p`
-/// form, which `mixing_logp_grad` declines. The outer gradient can fall back to an FD
-/// of the whole mixture objective there; a per-subject score has no such fallback.
-/// Differences `eval_mixing_log_probs` itself, so the clamp and renormalisation the
-/// objective applies are exactly what is differentiated; same step as the logit form's
-/// expression FD, `floor` included.
+/// `∂ ln p_ik / ∂ θ_j` (`K × n_theta`): exact ([`mixing_logp_derivs`]), or — where the
+/// recording declines, which the fit reports (`W_PLAN_FD_FALLBACK`) — the central difference
+/// of `eval_mixing_log_probs` itself, so the clamp and renormalisation the objective applies are
+/// exactly what is differentiated (#1956),
+/// stepping θⱼ by `1e-6·max(|θⱼ|, floorⱼ)` (#2147).
 pub(crate) fn mixing_logp_grad_fd(
+    model: &CompiledModel,
     spec: &crate::types::MixtureSpec,
     theta: &[f64],
     covariates: &HashMap<String, f64>,
     floor: &[f64],
 ) -> Vec<Vec<f64>> {
-    if let Some(exact) = mixing_logp_grad_exact(spec, theta, covariates) {
+    if let Some((exact, _)) = mixing_logp_derivs(model, spec, theta, covariates, false) {
         return exact;
     }
     let nt = theta.len();
@@ -22805,7 +22640,7 @@ fn validate_ruv_expr(
     }
 }
 
-/// Lower a parsed magnitude expression to a `Dual1`-differentiable
+/// Lower a parsed magnitude expression to a `Dual2`-differentiable
 /// [`RuvMagDerivProgram`] over `θ` only (#576/#486): the magnitude is validated
 /// ([`validate_ruv_expr`]) to never reference `η`, an individual parameter, or an
 /// NN output, so — unlike [`compile_scale_deriv_program`] — there is no `η` axis
@@ -22910,7 +22745,7 @@ fn at_error_endpoint(label: &str, err: String) -> String {
 /// statement, `endpoint_args` for a `CMT=N:` or `if/else` block (#2731). Returns
 /// `(None, {})` when every argument is a bare sigma (the legacy variance path is then
 /// taken verbatim). Each non-bare argument compiles to a per-observation multiplier
-/// closure over `(theta, observation covariates, TIME)`, plus a `Dual1`
+/// closure over `(theta, observation covariates, TIME)`, plus a `Dual2`
 /// θ-derivative program (#576/#486) so the analytic outer θ/σ gradient can
 /// differentiate the magnitude exactly instead of falling back to FD.
 ///
@@ -22948,7 +22783,7 @@ fn build_ruv_magnitude(
         .map(|d| d.iter().map(|c| c.name.clone()).collect());
     // Parse one magnitude / exponent expression against the RUV scope: θ, the
     // scaled sigma (magnitude only), declared covariates, `TIME`, `TAD`,
-    // `MACHEPS`. Returns the AST, its `Dual1` θ-program and the runtime closure.
+    // `MACHEPS`. Returns the AST, its `Dual2` θ-program and the runtime closure.
     let mut compile = |src: &str,
                        sigma_name: Option<&str>,
                        what: &str|
@@ -30290,7 +30125,7 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                 // value stays `rem_euclid` bit for bit: `a`'s jet is lifted onto
                 // it, and the `q·b` term enters with its value cancelled exactly.
                 // The lift is `lift4`, not `lift2`: the map is affine, so every
-                // higher derivative is a known `0`, and the taped-Hessian `DualV`
+                // higher derivative is a known `0`, and the recorded Hessian
                 // of the Laplace/AGQ exact anchor poisons a `lift2` with a `NaN` `φ‴`.
                 let (av, bv) = (a.val(), b.val());
                 push!(if bv.abs() < 1e-30 {
@@ -31166,7 +31001,7 @@ fn stmts_read_time_builtin(stmts: &[Statement]) -> bool {
 // fixed, so a subexpression that reads only individual parameters — `Q/V1`
 // in `−(Q/V1)·central + (Q/V2)·peripheral`, or `CL/V` in a hand-written
 // one-compartment model — is recomputed with identical inputs every time.
-// For the outer-gradient `DualMixed` each such division is two passes over a
+// For a second-order dual each such division is two passes over a
 // several-KB jet.
 //
 // `build_rhs_hoist` lifts every maximal such subtree (reusing E6's
@@ -31761,103 +31596,17 @@ fn rhs_lift_eval_g<T: crate::sens::num::vm::VmNum>(
     eval_bytecode_g::<T>(bc, &[], &[], &[], vars, &[], stack)
 }
 
-/// `f(u + δ_c·e_{j_c})` for each `(j_c, δ_c)` in `cols`, written to `out[c·n .. (c+1)·n]`:
-/// the columns of a forward-difference Jacobian, bit-identical to `n` scalar RHS calls.
-/// `false` when the lanes could not be evaluated together (they disagree at a branch).
-pub(crate) type RhsColumnsFn =
-    Box<dyn Fn(&[f64], &[f64], f64, &[(usize, f64)], &mut [f64]) -> bool + Send + Sync>;
-
-/// What the shared ODE RHS binding feeds: the scalar `du`, or batched FD columns.
-enum RhsSink<'a> {
-    Value(&'a mut [f64]),
-    Columns {
-        cols: &'a [(usize, f64)],
-        out: &'a mut [f64],
-    },
-}
-
-/// Lanes per pass of [`eval_rhs_columns`].
-const RHS_LANES: usize = 8;
-
 thread_local! {
     /// The register file of a compiled `f64` RHS too large for the closure's stack array.
     static RHS_REG_SCRATCH: std::cell::RefCell<Vec<f64>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-thread_local! {
-    /// `(vars, du, stack)` lane buffers for [`eval_rhs_columns`], reused across calls.
-    static RHS_LANE_SCRATCH: std::cell::RefCell<(
-        Vec<[f64; RHS_LANES]>,
-        Vec<[f64; RHS_LANES]>,
-        Vec<[f64; RHS_LANES]>,
-    )> = const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
-}
-
-/// Whether every statement is a straight-line bytecode assignment, the shape
-/// [`eval_rhs_columns`] runs on lanes (an `If` statement's branch is per lane).
-fn stmts_lane_evaluable(stmts: &[Statement]) -> bool {
-    stmts
-        .iter()
-        .all(|s| matches!(s, Statement::AssignBc(..) | Statement::DiffEqBc(..)))
-}
-
-/// [`RhsColumnsFn`] over a bound RHS: `vars` is the scalar binding at the base state `u`
-/// (parameters, time slots and lifted values included), and each lane replaces one state
-/// slot by `u_j + δ` — the value a scalar call on the perturbed state binds there — and
-/// runs `stmts`, so every lane performs the scalar evaluation's operations exactly.
-fn eval_rhs_columns(
-    stmts: &[Statement],
-    vars: &[f64],
-    u: &[f64],
-    n: usize,
-    cols: &[(usize, f64)],
-    out: &mut [f64],
-) -> bool {
-    if out.len() < cols.len() * n || cols.iter().any(|&(j, _)| j >= u.len()) {
-        return false;
-    }
-    RHS_LANE_SCRATCH.with(|cell| {
-        let (lv, ldu, stack) = &mut *cell.borrow_mut();
-        for (chunk_i, chunk) in cols.chunks(RHS_LANES).enumerate() {
-            lv.clear();
-            lv.extend(vars.iter().map(|&v| [v; RHS_LANES]));
-            // Unused lanes repeat the chunk's first column.
-            for l in 0..RHS_LANES {
-                let (j, d) = chunk[l.min(chunk.len() - 1)];
-                lv[j][l] = u[j] + d;
-            }
-            ldu.clear();
-            ldu.resize(n, [0.0; RHS_LANES]);
-            for st in stmts {
-                match st {
-                    Statement::AssignBc(idx, bc) => {
-                        let Some(v) = eval_bytecode_lanes(bc, &[], &[], &[], lv, &[], stack) else {
-                            return false;
-                        };
-                        if let Some(slot) = lv.get_mut(*idx) {
-                            *slot = v;
-                        }
-                    }
-                    Statement::DiffEqBc(i, bc) => {
-                        let Some(v) = eval_bytecode_lanes(bc, &[], &[], &[], lv, &[], stack) else {
-                            return false;
-                        };
-                        if let Some(slot) = ldu.get_mut(*i) {
-                            *slot = v;
-                        }
-                    }
-                    _ => return false,
-                }
-            }
-            for (l, _) in chunk.iter().enumerate() {
-                let c = chunk_i * RHS_LANES + l;
-                for i in 0..n {
-                    out[c * n + i] = ldu[i][l];
-                }
-            }
-        }
-        true
-    })
+/// A model's switch program (#2649): its `[odes]` with the moving switches instrumented
+/// (`ode_switch::instrument`), over the states then one hidden state per switch, which carries
+/// the switch's function out (its `du`) and the arm it is forced to in (its `u`).
+pub(crate) struct SwitchRhs {
+    prog: OdeRhsProgram,
+    rhs: Box<dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync>,
 }
 
 pub struct OdeRhsProgram {
@@ -31905,12 +31654,9 @@ pub struct OdeRhsProgram {
     /// read through [`Self::is_affine_in_states`] (#852). Decided on the unresolved program by
     /// `ode_linearity::stmts_affine_in_states`.
     affine_in_states: bool,
-    /// The `if` conditions an individual parameter reaches (#2649). Decided on the unresolved
-    /// program; [`Self::moving_switch`] is what a gate should ask.
-    condition_reads: Vec<ode_switch::ConditionReads>,
-    /// The parameters that move an `if` switch (#2649). Filled once `[individual_parameters]`
-    /// is known; see [`Self::resolve_moving_switches`].
-    moving_switches: Vec<String>,
+    /// The switch program of a model with moving switches (#2649), `None` without one: an
+    /// evaluation whose `u` is longer than [`Self::state_count`] runs it instead.
+    switch: Option<std::sync::Arc<SwitchRhs>>,
     /// The parameter-only subexpressions lifted out of the RK stages, and the
     /// statements evaluation runs instead of [`Self::stmts`]; `None` when the RHS
     /// has none worth lifting. See [`RhsHoist`].
@@ -31923,9 +31669,6 @@ pub struct OdeRhsProgram {
     /// Why [`Self::reg`] is `None`: the construct that kept the interpreter, and where
     /// (#2681). `Some` exactly when `reg` is `None`.
     reg_refusal: Option<rhs_regcode::RhsInterpreted>,
-    /// The f64 RHS at many single-state perturbations in one lane pass
-    /// ([`OdeRhsProgram::rhs_columns`]); `None` when a statement cannot run on lanes.
-    columns: Option<RhsColumnsFn>,
     /// Does the **PK block** read the raw solver time axis — `T`/`t`/`time` through
     /// `time_slot`, or the bare `TIME` built-in through `Op::PushTime`? Both disjuncts are
     /// load-bearing: `TIME` compiles to the built-in and is structurally invisible to
@@ -31989,6 +31732,72 @@ impl DirectRhsF64<'_> {
     }
 }
 
+/// The exact Jacobian of the `f64` RHS in one native call ([`OdeRhsProgram::native_jacobian`]):
+/// the program's forward tangents along every state, and along the clock when `clock`.
+pub(crate) struct NativeJacobian<'a> {
+    tan: rhs_regcode::NativeTan<'a>,
+    binding: RhsBindingPlan,
+    n: usize,
+    clock: bool,
+    /// The lane buffers of `u`, `params`, the seeds and `du`, reused across calls.
+    bufs: std::cell::RefCell<[Vec<f64>; 4]>,
+}
+
+impl NativeJacobian<'_> {
+    /// `J` (row-major) and `f_t` (zero without the clock direction) at `(u, params, t)`;
+    /// `false`, nothing written, when the native code cannot read the slices.
+    pub(crate) fn eval(
+        &self,
+        u: &[f64],
+        params: &[f64],
+        t: f64,
+        jac: &mut [f64],
+        ft: &mut [f64],
+    ) -> bool {
+        let (n, l) = (self.n, self.tan.lanes());
+        if u.len() < n {
+            return false;
+        }
+        let [ub, pb, sb, db] = &mut *self.bufs.borrow_mut();
+        // Every input element is its value, then its one-hot tangents: state `j` along
+        // direction `j`, the clock's seeds (`T`, `TAFD`, `TAD`) along direction `n`.
+        for (b, len) in [
+            (&mut *ub, u.len()),
+            (&mut *pb, params.len()),
+            (&mut *sb, 4),
+            (&mut *db, n),
+        ] {
+            b.clear();
+            b.resize(len * l, 0.0);
+        }
+        for (j, &x) in u.iter().enumerate() {
+            ub[j * l] = x;
+            if j < n {
+                ub[j * l + 1 + j] = 1.0;
+            }
+        }
+        for (j, &x) in params.iter().enumerate() {
+            pb[j * l] = x;
+        }
+        for (i, x) in self.binding.f64_seeds(params, t).into_iter().enumerate() {
+            sb[i * l] = x;
+            if self.clock && i < 3 {
+                sb[i * l + 1 + n] = 1.0;
+            }
+        }
+        if !self.tan.run(ub, pb, sb, db) {
+            return false;
+        }
+        for i in 0..n {
+            for j in 0..n {
+                jac[i * n + j] = db[i * l + 1 + j];
+            }
+            ft[i] = if self.clock { db[i * l + 1 + n] } else { 0.0 };
+        }
+        true
+    }
+}
+
 /// Streams `Debug` output straight into a hasher, so a compiled program can be
 /// fingerprinted without allocating its rendering (#1150).
 #[cfg(debug_assertions)]
@@ -32003,11 +31812,6 @@ impl<H: std::hash::Hasher> std::fmt::Write for HashWriter<'_, H> {
 }
 
 impl OdeRhsProgram {
-    /// Fill [`Self::moving_switches`] from `deps`, the `[individual_parameters]` dependencies.
-    /// A condition counts when something in it varies during the integration (a state, a
-    /// clock, or a parameter that reads `TIME`). A parameter counts when a θ or η reaches it,
-    /// FIX or not: `ModelParameters::theta_fixed` is the caller's to change at `fit()`, which
-    /// the model-level scope cannot see. A covariate-only `LAGT = WT / 10` is left alone.
     /// Which engine runs this RHS (#2681): the interpreter, with the construct that kept
     /// it; the register code, with why no native code; or native code.
     pub(crate) fn rhs_route(&self) -> rhs_regcode::RhsRoute<'_> {
@@ -32025,29 +31829,50 @@ impl OdeRhsProgram {
         rhs_regcode::rhs_route_note(self.rhs_route())
     }
 
-    fn resolve_moving_switches(&mut self, deps: &std::collections::HashMap<String, IndivVarDeps>) {
-        let mut out: Vec<String> = Vec::new();
-        for c in &self.condition_reads {
-            let moves = c.moves
-                || c.params
-                    .iter()
-                    .any(|p| deps.get(p).is_some_and(|d| d.reads_time));
-            if !moves {
-                continue;
-            }
-            for p in &c.params {
-                let Some(d) = deps.get(p) else { continue };
-                if (d.has_eta || !d.thetas.is_empty()) && !out.contains(p) {
-                    out.push(p.clone());
-                }
-            }
-        }
-        self.moving_switches = out;
+    /// Whether the program has an `f64` native function ([`Self::direct_f64`]'s other half).
+    #[cfg(test)]
+    pub(crate) fn direct_f64_native(&self) -> bool {
+        self.reg.as_ref().and_then(|r| r.native_f64()).is_some()
     }
 
-    /// The first parameter whose `if` switch moves with it (#2649), if any.
-    pub(crate) fn moving_switch(&self) -> Option<&str> {
-        self.moving_switches.first().map(String::as_str)
+    /// How many moving switches the integration of this program watches (#2649).
+    #[cfg(test)]
+    pub(crate) fn switch_count(&self) -> usize {
+        self.switch
+            .as_ref()
+            .map_or(0, |sw| sw.prog.state_count - self.state_count)
+    }
+
+    /// [`Self::program_jacobian`] of `rhs`, when it is this program's closure.
+    pub(crate) fn native_jacobian(
+        &self,
+        rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
+        clock: bool,
+    ) -> Option<NativeJacobian<'_>> {
+        self.serves(rhs)
+            .then(|| self.program_jacobian(clock))
+            .flatten()
+    }
+
+    /// The program's exact Jacobian as one native call, when it has native code for the
+    /// tangents.
+    pub(crate) fn program_jacobian(&self, clock: bool) -> Option<NativeJacobian<'_>> {
+        let n = self.state_count;
+        Some(NativeJacobian {
+            tan: self.reg.as_ref()?.native_tangent(n + usize::from(clock))?,
+            binding: self.binding,
+            n,
+            clock,
+            bufs: Default::default(),
+        })
+    }
+
+    /// Whether `rhs` is the very closure this program was built with (same address).
+    pub(crate) fn serves(
+        &self,
+        rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
+    ) -> bool {
+        self.f64_rhs != 0 && self.f64_rhs == rhs as *const _ as *const () as usize
     }
 
     /// `rhs` as direct native calls ([`DirectRhsF64`]): `Some` only when `rhs` is the very
@@ -32057,8 +31882,8 @@ impl OdeRhsProgram {
         &self,
         rhs: &(dyn Fn(&[f64], &[f64], f64, &mut [f64]) + Send + Sync),
     ) -> Option<DirectRhsF64<'_>> {
-        let addr = rhs as *const _ as *const () as usize;
-        if self.f64_rhs == 0 || self.f64_rhs != addr {
+        // A model with moving switches runs its closure, which tells the integrator so.
+        if !self.serves(rhs) || self.switch.is_some() {
             return None;
         }
         Some(DirectRhsF64 {
@@ -32089,11 +31914,6 @@ impl OdeRhsProgram {
             self.tad_slot,
             self.macheps_slot,
         );
-    }
-
-    /// The batched FD-column evaluator of the f64 RHS, when the program runs on lanes.
-    pub(crate) fn rhs_columns(&self) -> Option<&RhsColumnsFn> {
-        self.columns.as_ref()
     }
 
     /// The initial state `init(...)` sets, evaluated over `T` from the PK-parameter
@@ -32479,7 +32299,7 @@ impl OdeRhsProgram {
     }
 
     /// Evaluate `du = f(u, p, t)` over a dual type, generic over [`PkNum`]
-    /// (`Dual1<N>` for the light inner η-gradient, `Dual2<N>` for the full outer
+    /// (`Dual2<N>` for the light inner η-gradient, `Dual2<N>` for the full outer
     /// gradient). `u` is the current state; `params` is the flat PK-parameter vector
     /// with the differentiated slots already seeded as dual variables (so individual
     /// parameter `i`, read from `params[indiv_to_params_slot[i]]`, carries its
@@ -32503,18 +32323,16 @@ impl OdeRhsProgram {
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
     ) {
-        // A first-order type that records a tape (`R`, `DualT<_, R>`: the adjoint covariance
-        // Hessian) keeps the hoisted interpreter. The hoist records each lifted
-        // parameter-only value once per recording and every later call reuses that node;
-        // the compiled program would record it again on every call, so the tape would grow
-        // per RHS call and the reverse sweep would sum the same adjoints in another order.
-        // (A second-order type never used the hoist, and a tape-free one gets the same bits
-        // either way.)
-        let compiled = self
-            .reg
-            .as_ref()
-            .filter(|_| !(T::RECORDS_TAPE && !T::SECOND_ORDER && self.hoist.is_some()));
-        if let Some(reg) = compiled {
+        // A model with moving switches: as its `f64` closure (`build_ode_spec`).
+        if let Some(sw) = &self.switch {
+            if u.len() > self.state_count {
+                return sw
+                    .prog
+                    .eval_rhs_g(u, params, t, tafd, tad, dt, du, vars, stack);
+            }
+            crate::ode::solver::note_switches(sw.prog.state_count - self.state_count);
+        }
+        if let Some(reg) = self.reg.as_ref() {
             // Compiled: the binding's values without the binding. Each seed is built under
             // the flag that would have written its slot, so a taped `T` records exactly the
             // nodes the binding records, and no more.
@@ -32551,8 +32369,8 @@ impl OdeRhsProgram {
         // Second-order duals evaluate the original statements. Their cache key would
         // be a bit-for-bit comparison of every key slot's Hessian block on every call —
         // as much memory traffic as the couple of divisions a lift saves (measured on
-        // busulfan: the `DualMixed` RHS gained ~5% self time with the lift on). For
-        // `f64` and `Dual1` the key is a handful of words and the lift pays.
+        // busulfan: the second-order RHS gained ~5% self time with the lift on). For
+        // `f64` and `Dual2` the key is a handful of words and the lift pays.
         let hoist = self.hoist.as_ref().filter(|_| !T::SECOND_ORDER);
         let b = self.binding;
         let zero = T::from_f64(0.0);
@@ -32728,7 +32546,7 @@ fn cond_is_dynamic(c: &Condition, dyn_vars: &[bool]) -> bool {
 
 /// Classify each individual-parameter var slot as **cov-static** (`true`): its
 /// value is constant across every (θ, η) axis the analytic gradient
-/// differentiates, so the `Dual2`/`Dual1` walks can pre-seed it as a constant
+/// differentiates, so the `Dual2`/`Dual2` walks can pre-seed it as a constant
 /// computed once in plain `f64` instead of carrying it through dual arithmetic
 /// (#485). A slot is cov-static iff every assignment to it reads only covariates,
 /// literals, and other cov-static slots, AND it is never assigned under an `if`
@@ -33632,7 +33450,7 @@ impl IndivParamProgram {
         // dual `powd`, both of which differ from `f64::/` / `f64::powf` by up to
         // 1 ULP. A division-bearing covariate kernel (CKD-EPI, Schwartz
         // `0.413·HEIGHT/CREAT`, FFM) would otherwise make a folded slot drift ~1
-        // ULP from the unfolded walk. Both `Dual1<M>` and `Dual2<M>` share the
+        // ULP from the unfolded walk. Both `Dual2<M>` and `Dual2<M>` share the
         // `× recip` division and the same `powd`/`exp`/`ln` value arithmetic, and
         // the `.value` field is computed independently of the axis count, so a
         // `Dual2<0>` `.value` is bit-for-bit equal to what either unfolded path
@@ -33807,7 +33625,7 @@ impl OdeOutputProgram {
     }
 
     /// Evaluate the output expression over a dual type, generic over [`PkNum`]
-    /// (`Dual1` light inner / `Dual2` full outer; #410) — the Form-C readout.
+    /// (`Dual2` light inner / `Dual2` full outer; #410) — the Form-C readout.
     /// `state` is the integrated dual state; `params` is the flat PK-parameter
     /// vector with the differentiated slots seeded as dual variables (so `V1`'s
     /// derivative flows into `central / V1`); `cov` is the per-observation
@@ -33895,7 +33713,7 @@ impl ScaleDerivProgram {
 }
 
 /// Differentiable form of a custom residual-error magnitude slot (#484/#576/#486):
-/// the magnitude expression compiled to bytecode, evaluable over `Dual1<M>` seeded
+/// the magnitude expression compiled to bytecode, evaluable over `Dual2<M>` seeded
 /// on `θ` only. Unlike [`ScaleDerivProgram`] the magnitude never depends on `η` or
 /// an individual parameter (`validate_ruv_expr` rejects both), so there is a single
 /// var slot — the scaled sigma, pinned to the constant `1.0` — and no

@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::ode::solver::{solve_ode_with_stats, OdeSolverStats};
-use crate::sens::dual1::Dual1;
+use crate::sens::dual2::Dual2;
 
 /// `du/dt = A u` for a diagonal `A` — eigenvalues are the diagonal, exactly.
 fn diagonal_rhs<T: PkNum>(rates: &'static [f64]) -> impl Fn(&[T], &[T], T, &mut [T]) {
@@ -204,20 +204,20 @@ fn auto_picks_the_stiff_method_the_tolerance_calls_for() {
 
 #[test]
 fn the_probe_decides_identically_at_f64_and_at_a_dual() {
-    // The consistency the analytic gradient depends on: the `Dual2`/`Dual1` sensitivity solve
+    // The consistency the analytic gradient depends on: the `Dual2`/`Dual2` sensitivity solve
     // must land on the same stepper as the `f64` prediction for the same segment, which holds
     // because the probe reads values only. Seeding a *derivative* on the state is exactly the
     // perturbation that would break it if the probe ever read a jet.
     const N: usize = 2;
     let scalar_rhs = binding_rhs::<f64>(1000.0, 20.0);
-    let dual_rhs = binding_rhs::<Dual1<N>>(1000.0, 20.0);
+    let dual_rhs = binding_rhs::<Dual2<N>>(1000.0, 20.0);
 
     for u_central in [0.0, 0.05, 5.0, 50.0] {
         let u_f64 = [u_central, 10.0, 0.0];
         let u_dual = [
-            Dual1::<N>::var(u_central, 0),
-            Dual1::<N>::var(10.0, 1),
-            Dual1::<N>::constant(0.0),
+            Dual2::<N>::var(u_central, 0),
+            Dual2::<N>::var(10.0, 1),
+            Dual2::<N>::constant(0.0),
         ];
         let l_f64 = max_abs_re_eigenvalue(&scalar_rhs, &u_f64, &[], 0.0).unwrap();
         let l_dual = max_abs_re_eigenvalue(&dual_rhs, &u_dual, &[], 0.0).unwrap();
@@ -1180,7 +1180,7 @@ fn an_unswitched_explicit_segment_is_not_re_solved() {
     );
 }
 
-/// The property the analytic gradient depends on, extended to the switch: the `Dual1`/`Dual2`
+/// The property the analytic gradient depends on, extended to the switch: the `Dual2`/`Dual2`
 /// sensitivity solve must change stepper at the *same* accepted step as the `f64` prediction,
 /// or the gradient would differentiate a trajectory the predictor never produced. It holds
 /// because the re-probe reads `PkNum::val` only — seeding derivatives on the state is exactly
@@ -1190,12 +1190,12 @@ fn the_switch_happens_at_the_same_step_at_f64_and_at_a_dual() {
     const N: usize = 2;
     let (saveat, u0) = latent_grid();
     let scalar_rhs = latent_binding_rhs::<f64>(100.0, 10.0);
-    let dual_rhs = latent_binding_rhs::<Dual1<N>>(100.0, 10.0);
-    let u_dual: Vec<Dual1<N>> = vec![
-        Dual1::<N>::var(u0[0], 0),
-        Dual1::<N>::var(u0[1], 1),
-        Dual1::<N>::constant(u0[2]),
-        Dual1::<N>::constant(u0[3]),
+    let dual_rhs = latent_binding_rhs::<Dual2<N>>(100.0, 10.0);
+    let u_dual: Vec<Dual2<N>> = vec![
+        Dual2::<N>::var(u0[0], 0),
+        Dual2::<N>::var(u0[1], 1),
+        Dual2::<N>::constant(u0[2]),
+        Dual2::<N>::constant(u0[3]),
     ];
 
     let mut scalar_stats = OdeSolverStats::default();
@@ -1628,13 +1628,13 @@ fn a_named_stiff_method_is_not_jet_guarded() {
 /// models `auto` exists to serve, or it would turn every stiff fit into a warning.
 #[test]
 fn a_healthy_escalation_records_no_jet_rejection() {
-    use crate::sens::dual1::Dual1;
+    use crate::sens::dual2::Dual2;
     const N: usize = 2;
-    let rhs = binding_rhs::<Dual1<N>>(1000.0, 20.0);
+    let rhs = binding_rhs::<Dual2<N>>(1000.0, 20.0);
     let u0 = [
-        Dual1::<N>::var(100.0, 0),
-        Dual1::<N>::var(10.0, 1),
-        Dual1::<N>::constant(0.0),
+        Dual2::<N>::var(100.0, 0),
+        Dual2::<N>::var(10.0, 1),
+        Dual2::<N>::constant(0.0),
     ];
     let mut stats = OdeSolverStats::default();
     let out = crate::ode::solver::solve_ode_g_with_stats(
