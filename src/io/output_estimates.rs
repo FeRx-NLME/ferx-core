@@ -1,12 +1,15 @@
 //! The parameter-estimate sections of a fit's output, built once and rendered twice
 //! (#2911): as the `theta:` / `omega:` / `sigma:` / `block_sigma:` / `omega_iov:` /
 //! `mixture_overrides:` sections of `{model}-fit.yaml`, and as the `estimates` object of
-//! `{model}-fit.json` ([`FitResult::to_json_value`]).
+//! `{model}-fit.json` ([`FitResult::to_json_value`]). The YAML also writes them a second
+//! time, nested under its own `estimates:` key, so the one path
+//! `estimates.<section>.<name>.<field>` reads both files.
 //!
 //! Before #2911 the JSON carried only `FitResult`'s own fields — bare `theta` vectors
 //! beside parallel `theta_names` lists, Ω as a flat `{rows, cols, data}` matrix — so
 //! anything reading final estimates back had to branch on which file it was handed. Now
-//! `json["estimates"]["theta"]["CL"]["estimate"]` is `yaml["theta"]["CL"]["estimate"]`:
+//! `x["estimates"]["theta"]["CL"]["estimate"]` reads either file (the YAML keeps its
+//! top-level `theta:` … sections too, as aliases of its `estimates:` block):
 //! the same sections, entry names and field names, because both are rendered from the one
 //! [`Section`] list built here. They differ only in precision — the YAML rounds as it
 //! always has (`{:.6}`, `{:.2}` for a percentage) and writes `~` for "none", the JSON
@@ -143,18 +146,29 @@ impl Section {
         }
     }
 
-    /// The section as YAML, from the blank line before its header to its last field.
+    /// The section as a top-level YAML key, from the blank line before its header to its
+    /// last field.
     pub(crate) fn yaml(&self) -> String {
+        format!("\n{}", self.yaml_at(""))
+    }
+
+    /// The section's header and entries, every line prefixed by `indent`.
+    fn yaml_at(&self, indent: &str) -> String {
         use std::fmt::Write;
-        let mut out = format!("\n{}:", self.key);
+        let mut out = format!("{indent}{}:", self.key);
+        // An empty section nested under `estimates:` is `{}`, so a YAML parser reads the
+        // empty map the JSON has rather than `null`. The top-level copy keeps its old bytes.
+        if self.entries.is_empty() && !indent.is_empty() {
+            out.push_str(" {}");
+        }
         if let Some(c) = &self.comment {
             let _ = write!(out, "  # {c}");
         }
         out.push('\n');
         for e in &self.entries {
-            let _ = writeln!(out, "  {}:", e.name);
+            let _ = writeln!(out, "{indent}  {}:", e.name);
             for (k, v) in &e.fields {
-                let _ = writeln!(out, "    {k}: {}", v.yaml());
+                let _ = writeln!(out, "{indent}    {k}: {}", v.yaml());
             }
         }
         out
@@ -552,6 +566,18 @@ pub(crate) fn estimate_sections(result: &FitResult) -> Result<Vec<Section>, Stri
     out.extend(block_sigma_section(result)?);
     out.extend(omega_iov_section(result));
     out.extend(mixture_overrides_section(result));
+    Ok(out)
+}
+
+/// The `estimates:` block of the fit YAML (#2911): every section of [`estimate_sections`]
+/// again, nested one level under `estimates`, so `estimates.theta.CL.estimate` reads the
+/// same in `{model}-fit.yaml` and `{model}-fit.json`. The top-level `theta:` / `omega:` /
+/// … sections stay where they were, for the readers that already use them.
+pub(crate) fn estimates_yaml(result: &FitResult) -> Result<String, String> {
+    let mut out = String::from("\nestimates:\n");
+    for s in estimate_sections(result)? {
+        out.push_str(&s.yaml_at("  "));
+    }
     Ok(out)
 }
 

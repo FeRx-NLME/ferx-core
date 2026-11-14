@@ -1,5 +1,5 @@
-//! #2911: the fit YAML's estimate sections and `fit.json`'s `estimates` object are
-//! one table rendered twice.
+//! #2911: the fit YAML's estimate sections — top-level and under `estimates:` — and
+//! `fit.json`'s `estimates` object are one table rendered three times.
 
 use super::*;
 use crate::types::{
@@ -95,10 +95,12 @@ pub(super) fn rich_result() -> FitResult {
     r
 }
 
-/// The YAML's estimate sections, read back as `(section, entry, field) → scalar text`.
+/// The YAML's estimate sections, read back as `(section, entry, field) → scalar text`:
+/// the top-level copies (`nested = false`) or the `estimates:` block (`nested = true`).
 /// Only the sections [`estimate_sections`] owns, at the writer's exact indentation.
 fn yaml_estimate_fields(
     yaml: &str,
+    nested: bool,
 ) -> std::collections::BTreeMap<(String, String, String), String> {
     const OWNED: &[&str] = &[
         "theta",
@@ -108,7 +110,9 @@ fn yaml_estimate_fields(
         "omega_iov",
         "mixture_overrides",
     ];
+    let base = if nested { 2 } else { 0 };
     let mut out = std::collections::BTreeMap::new();
+    let mut in_estimates = false;
     let (mut section, mut entry): (Option<String>, Option<String>) = (None, None);
     for line in yaml.lines() {
         let indent = line.len() - line.trim_start().len();
@@ -116,20 +120,28 @@ fn yaml_estimate_fields(
         if t.is_empty() {
             continue;
         }
-        match indent {
-            0 => {
-                let key = t.split(':').next().unwrap();
-                section = OWNED.contains(&key).then(|| key.to_string());
-                entry = None;
+        if indent == 0 {
+            in_estimates = t == "estimates:";
+            section = None;
+            entry = None;
+            if nested {
+                continue;
             }
-            2 if section.is_some() => entry = Some(t.trim_end_matches(':').to_string()),
-            4 => {
-                if let (Some(s), Some(e)) = (&section, &entry) {
-                    let (k, v) = t.split_once(": ").unwrap_or_else(|| panic!("{line}"));
-                    out.insert((s.clone(), e.clone(), k.to_string()), v.to_string());
-                }
+        }
+        if nested && !in_estimates {
+            continue;
+        }
+        if indent == base {
+            let key = t.split(':').next().unwrap();
+            section = OWNED.contains(&key).then(|| key.to_string());
+            entry = None;
+        } else if indent == base + 2 && section.is_some() {
+            entry = Some(t.trim_end_matches(':').to_string());
+        } else if indent == base + 4 {
+            if let (Some(s), Some(e)) = (&section, &entry) {
+                let (k, v) = t.split_once(": ").unwrap_or_else(|| panic!("{line}"));
+                out.insert((s.clone(), e.clone(), k.to_string()), v.to_string());
             }
-            _ => {}
         }
     }
     out
@@ -157,7 +169,16 @@ fn assert_yaml_and_json_agree(r: &FitResult) -> usize {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m-fit.yaml");
     write_estimates_yaml(r, path.to_str().unwrap()).unwrap();
-    let yaml = yaml_estimate_fields(&std::fs::read_to_string(&path).unwrap());
+    let text = std::fs::read_to_string(&path).unwrap();
+    let yaml = yaml_estimate_fields(&text, false);
+    // The `estimates:` block is the top-level sections again, field for field: one path
+    // reads both files, and the old top-level one keeps working.
+    assert_eq!(
+        yaml_estimate_fields(&text, true),
+        yaml,
+        "the YAML's `estimates:` block differs from its top-level sections:\n{text}"
+    );
+    assert_eq!(text.matches("\nestimates:\n").count(), 1, "{text}");
     // Through the writer and `serde_json`'s text, as a reader of `{model}-fit.json` sees it.
     let json_path = dir.path().join("m-fit.json");
     write_result_json(r, json_path.to_str().unwrap()).unwrap();
@@ -234,7 +255,7 @@ fn json_estimates_keep_the_precision_the_yaml_rounds_away() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m-fit.yaml");
     write_estimates_yaml(&r, path.to_str().unwrap()).unwrap();
-    let yaml = yaml_estimate_fields(&std::fs::read_to_string(&path).unwrap());
+    let yaml = yaml_estimate_fields(&std::fs::read_to_string(&path).unwrap(), true);
     let key = |f: &str| ("theta".to_string(), "TINY".to_string(), f.to_string());
     assert_eq!(yaml[&key("estimate")], "0.000000");
     // A non-finite estimate, and the NaN %RSE it gives, are `null` in the JSON — where the
@@ -257,6 +278,16 @@ fn json_estimates_agree_with_the_yaml_on_the_minimal_and_empty_fits() {
     let est = r.to_json_value()["estimates"].clone();
     let keys: Vec<_> = est.as_object().unwrap().keys().cloned().collect();
     assert_eq!(keys, ["omega", "sigma", "theta"]);
+    // In the YAML too, as empty maps (`{}`) — not `null` — under `estimates:`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("m-fit.yaml");
+    write_estimates_yaml(&r, path.to_str().unwrap()).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    let block = &text[text.find("\nestimates:\n").unwrap()..];
+    for s in ["theta", "omega"] {
+        assert!(block.contains(&format!("\n  {s}: {{}}\n")), "{block}");
+    }
+    assert!(block.contains("\n  sigma: {}  # error model:"), "{block}");
 }
 
 #[test]

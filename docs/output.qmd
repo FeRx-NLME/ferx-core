@@ -225,12 +225,20 @@ filesystem, via `FitResult::to_json_value() -> serde_json::Value`.
 
 The vectors above (`theta` beside `theta_names`, `omega` as a flat matrix) are
 `FitResult`'s own fields. For reading final estimates back — substituting them
-into a model, a report, a comparison across runs — the JSON also carries a
-top-level `estimates` object in **the fit YAML's own layout**: the same
-sections, entry names and field names as the YAML's
-[parameter estimates](#parameter-estimates). So
-`json$estimates$theta$TVCL$estimate` is `yaml$theta$TVCL$estimate`, and a reader
-that handles one file handles the other by first stepping into `estimates`:
+into a model, a report, a comparison across runs — **both** fit files carry a
+top-level `estimates` block with the same layout: the sections, entry names and
+field names of the YAML's [parameter estimates](#parameter-estimates). One path
+reads either file, with no branch on the format:
+
+```r
+fit <- if (grepl("\\.json$", path)) jsonlite::read_json(path) else yaml::read_yaml(path)
+fit$estimates$theta$TVCL$estimate
+```
+
+In the YAML, `estimates:` repeats the top-level `theta:` / `omega:` / `sigma:` /
+… sections nested one level down; the top-level copies stay, so a reader that
+already uses `yaml$theta$TVCL$estimate` keeps working. The `estimates:` block
+is the supported path for code that has to read both formats. In the JSON:
 
 ```json
 "estimates": {
@@ -248,19 +256,21 @@ that handles one file handles the other by first stepping into `estimates`:
 }
 ```
 
-- The sections are `theta`, `omega` and `sigma` (always present, possibly empty)
-  and `block_sigma`, `omega_iov` and `mixture_overrides` (present exactly when
-  the YAML writes them). The fit YAML and `estimates` are rendered from one
-  table, so they cannot list different parameters or fields.
-- Values are full `f64` precision, where the YAML rounds to six decimals (two
-  for `rse_pct` / `cv_pct`). An estimate below ~1e-4 keeps its significant
-  figures here.
-- `null` replaces the YAML's `~`, and also a non-finite value the YAML prints as
+- The sections are `theta`, `omega` and `sigma` (always present, possibly an
+  empty map — `{}` in both files) and `block_sigma`, `omega_iov` and
+  `mixture_overrides` (present when the fit has them). All three renderings —
+  the YAML's top-level sections, its `estimates:` block and the JSON's
+  `estimates` — come from one table, so they cannot list different parameters
+  or fields.
+- The JSON values are full `f64` precision, where the YAML rounds to six
+  decimals (two for `rse_pct` / `cv_pct`). An estimate below ~1e-4 keeps its
+  significant figures only in the JSON.
+- JSON `null` is the YAML's `~`, and also a non-finite value the YAML prints as
   `NaN` / `inf` / `.inf`.
 - Keys within a section are sorted, not in declaration order; read them by
   name. Declaration order is `theta_names` / `eta_names` / `sigma_names`.
-- `estimates` is derived output, like `status`: reading the file back as a
-  `FitResult` ignores it. It is `null` only for a result the YAML writer also
+- `estimates` is derived output, like `status`: reading the JSON back as a
+  `FitResult` ignores it. It is `null` only for a result the YAML writer
   refuses (a `block_sigma` correlation naming a σ index the fit does not have).
 
 ## Fit YAML (`{model}-fit.yaml`)
@@ -310,6 +320,11 @@ sigma:
   sigma_1:
     estimate: 0.010638
     se: 0.000788
+estimates:              # theta/omega/sigma/... again, one level down (#2911)
+  theta:
+    TVCL:
+      estimate: 0.132735
+      # … every section and field exactly as above
 covariance_matrix:
   # optimizer parameterization: theta log-transformed when lower bound >= 0
   # (identity otherwise), sigma log-transformed, omega/kappa Cholesky-factored
@@ -339,6 +354,10 @@ environment:
   username: "ron"
   ferx_version: 0.2.0
 ```
+
+`estimates:` repeats the parameter sections under one key so that
+`estimates.theta.TVCL.estimate` reads this file and `{model}-fit.json` alike —
+see [Parameter estimates keyed by name](#fit-json-estimates).
 
 The `covariance_matrix:` block is only present when the covariance step ran
 successfully or was regularised. The values are in **optimizer space** — thetas

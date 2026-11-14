@@ -3597,6 +3597,8 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if let Some(s) = estimates::mixture_overrides_section(result) {
         write!(f, "{}", s.yaml()).map_err(|e| e.to_string())?;
     }
+    // The same sections under `estimates:`, the path `fit.json` uses too (#2911).
+    write!(f, "{}", estimates::estimates_yaml(result)?).map_err(|e| e.to_string())?;
 
     // Importance-sampling marginal log-likelihood section
     if let Some(ref imp) = result.importance_sampling {
@@ -4827,7 +4829,7 @@ mod tests {
 
             let file = tempfile::NamedTempFile::new().unwrap();
             write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
-            let yaml = std::fs::read_to_string(file.path()).unwrap();
+            let yaml = top_level_yaml(&std::fs::read_to_string(file.path()).unwrap());
             if compact {
                 assert!(
                     yaml.contains(
@@ -5043,7 +5045,7 @@ mod tests {
         // YAML.
         let file = tempfile::NamedTempFile::new().unwrap();
         write_estimates_yaml(&r, file.path().to_str().unwrap()).unwrap();
-        let yaml = std::fs::read_to_string(file.path()).unwrap();
+        let yaml = top_level_yaml(&std::fs::read_to_string(file.path()).unwrap());
         assert!(
             yaml.contains("  TVV:\n    estimate: 2.000000\n    at_bound: true\n    se: ~\n    rse_pct: ~\n    held: profiled_bound\n"),
             "{yaml}"
@@ -5508,7 +5510,7 @@ mod tests {
 
     #[test]
     fn sigma_yaml_combined_distinguishes_components() {
-        let yaml = yaml_for(ErrorModel::Combined, vec![0.2, 0.5]);
+        let yaml = top_level_yaml(&yaml_for(ErrorModel::Combined, vec![0.2, 0.5]));
         // First sigma is proportional (CV%), second is additive (no CV).
         assert!(yaml.contains("type: proportional"), "yaml=\n{}", yaml);
         assert!(yaml.contains("type: additive"), "yaml=\n{}", yaml);
@@ -8558,7 +8560,7 @@ mod tests {
         // entry, followed by the #1660 weight keys and (#1858) the typical
         // arm's exact CV%, which only a CV% type gets: one such key in a file
         // with a log-normal, an additive, a logit and a custom weighted kappa.
-        let yaml = yaml_of(&mk(true, true));
+        let yaml = top_level_yaml(&yaml_of(&mk(true, true)));
         let entry = "  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n    \
                      weight: \"NARM\"\n    weight_typical: 4.000000\n    \
                      sd_at_typical_weight: 0.111952\n    \
@@ -8581,7 +8583,7 @@ mod tests {
         );
         // Unweighted: byte-identical to the weighted file less its weight keys,
         // and the log-normal entry is the pre-#1666 one.
-        let plain = yaml_of(&mk(false, true));
+        let plain = top_level_yaml(&yaml_of(&mk(false, true)));
         assert!(
             plain.contains("  K_LN:\n    variance: 0.050133\n    cv_pct: 22.67\n    se: ~\n"),
             "{plain}"
@@ -8965,7 +8967,7 @@ mod tests {
     #[test]
     fn yaml_reports_a_weighted_kappa() {
         let w = weighted_result();
-        let yaml = yaml_of(&w);
+        let yaml = top_level_yaml(&yaml_of(&w));
         let entry = "  K_ADD:\n    variance: 156.036966\n    sd: 12.491476\n    \
                      weight: \"NARM\"\n    weight_typical: 4.000000\n    \
                      sd_at_typical_weight: 6.245738\n    se: ~\n";
@@ -8984,7 +8986,7 @@ mod tests {
 
         // Unweighted kappas (and every ETA): byte-identical to the same fit
         // with no weights at all.
-        let plain = yaml_of(&classified_result());
+        let plain = top_level_yaml(&yaml_of(&classified_result()));
         assert!(!plain.contains("weight"), "{plain}");
         let stripped: String = yaml
             .lines()
@@ -9844,6 +9846,25 @@ mod tests {
 #[cfg(test)]
 #[path = "output_mixture_override_tests.rs"]
 mod mixture_override_tests;
+
+/// `yaml` without its `estimates:` block (#2911): the header and every indented line
+/// under it. For tests pinning the top-level estimate sections by counting a key across
+/// the whole file — the block repeats those sections, and `output_estimates_tests` pins
+/// it field for field against them.
+#[cfg(test)]
+pub(crate) fn top_level_yaml(yaml: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in yaml.split_inclusive('\n') {
+        if !line.starts_with(' ') && !line.trim().is_empty() {
+            skipping = line == "estimates:\n";
+        }
+        if !skipping {
+            out.push_str(line);
+        }
+    }
+    out
+}
 
 #[path = "output_estimates.rs"]
 mod estimates;
