@@ -2737,6 +2737,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         &schedules,
         InnerSolvePolicy::default(),
         None,
+        None,
         |_, _| (),
     );
 
@@ -7423,6 +7424,7 @@ fn an_extrapolated_predicted_start_still_reaches_the_mode() {
             None,
             policy,
             None,
+            None,
             outcome,
         );
         assert!(!got[2].0, "η = {far}: no Nelder–Mead recovery needed");
@@ -7539,4 +7541,127 @@ fn a_carried_exact_seed_replaces_the_fresh_one_and_reaches_the_same_mode() {
         worst < 1e-10,
         "carried vs fresh seed reach different modes ({worst:.3e})"
     );
+}
+
+/// #2709: [`GuardStop`] counts exactly what the end-of-pass [`InnerLoopStats`] counts, and
+/// stops at exactly the count `outer_optimizer::ebe_guard_rejects` rejects on. Each case is
+/// one input that flips the answer from its neighbour.
+mod guard_stop {
+    use super::*;
+
+    /// A subject with `n_obs` scored rows.
+    fn subject(n_obs: usize) -> Subject {
+        Subject {
+            id: format!("S{n_obs}"),
+            observations: vec![1.0; n_obs],
+            ..Default::default()
+        }
+    }
+
+    /// An EBE result with the given verdict.
+    fn result(converged: bool, hard_reject: bool) -> EbeResult {
+        EbeResult {
+            eta: DVector::zeros(1),
+            h_matrix: DMatrix::zeros(1, 1),
+            fd_h_redone: false,
+            terminal_hessian: None,
+            converged,
+            used_fallback: false,
+            nm_polished: false,
+            grad_norm: 0.0,
+            nll: 0.0,
+            kappas: Vec::new(),
+            hard_reject,
+            screen_moved: false,
+            twin_moved: false,
+        }
+    }
+
+    #[test]
+    fn the_fraction_arm_stops_one_past_the_threshold() {
+        // 10 subjects at `max_unconverged_frac = 0.1`: the guard rejects 2 unconverged
+        // (0.2 > 0.1), not 1 (0.1 is not > 0.1).
+        let stop = GuardStop::new(10, 1, 0.1);
+        stop.record(&subject(5), &result(false, false));
+        assert!(!stop.stopped(), "1 of 10 is not past 0.1");
+        stop.record(&subject(5), &result(true, false));
+        assert!(!stop.stopped(), "a converged subject adds nothing");
+        stop.record(&subject(5), &result(false, false));
+        assert!(stop.stopped(), "2 of 10 is past 0.1");
+        assert_eq!(stop.solved(), 3);
+        let s = stop.observed_stats();
+        assert_eq!((s.n_unconverged, s.n_start_rejected), (2, 0));
+    }
+
+    #[test]
+    fn a_hard_rejection_stops_at_once_and_counts_without_the_min_obs_filter() {
+        // A subject below `min_obs`, hard-rejected: the guard's hard-reject arm takes it,
+        // whatever its row count; its unconverged flag does not count.
+        let stop = GuardStop::new(10, 3, 0.5);
+        stop.record(&subject(1), &result(false, true));
+        assert!(stop.stopped());
+        let s = stop.observed_stats();
+        assert_eq!((s.n_unconverged, s.n_start_rejected), (0, 1));
+    }
+
+    #[test]
+    fn an_unconverged_subject_below_min_obs_is_not_counted() {
+        // `min_obs = 3`: the 2-row subjects are left out of the fraction, the 3-row one counts.
+        let stop = GuardStop::new(4, 3, 0.0);
+        stop.record(&subject(2), &result(false, false));
+        stop.record(&subject(2), &result(false, false));
+        assert!(!stop.stopped(), "below min_obs: not counted");
+        assert_eq!(stop.observed_stats().n_unconverged, 0);
+        stop.record(&subject(3), &result(false, false));
+        assert!(stop.stopped(), "at min_obs: counted, 1 of 4 > 0.0");
+    }
+
+    #[test]
+    fn a_negative_fraction_disables_the_fraction_arm_but_not_a_hard_rejection() {
+        let stop = GuardStop::new(2, 1, -1.0);
+        stop.record(&subject(5), &result(false, false));
+        stop.record(&subject(5), &result(false, false));
+        assert!(
+            !stop.stopped(),
+            "every subject unconverged, fraction arm off"
+        );
+        stop.record(&subject(5), &result(false, true));
+        assert!(stop.stopped(), "a hard rejection still rejects");
+    }
+
+    /// The token reproduces the end-of-pass guard verdict on any record sequence: once it
+    /// has stopped, `ebe_guard_rejects` on the counts of *all* subjects rejects too
+    /// (counts only grow), and a sequence that never stops it is one the guard accepts.
+    #[test]
+    fn its_verdict_matches_the_guard_on_the_whole_pass() {
+        use crate::estimation::outer_optimizer::ebe_guard_rejects;
+        let verdicts = [(true, false), (false, false), (false, true)];
+        // Every 4-subject sequence of the three verdicts, at three thresholds.
+        for frac in [0.0, 0.25, 0.5] {
+            for code in 0..81usize {
+                let seq: Vec<(bool, bool)> = (0..4)
+                    .map(|k| verdicts[(code / 3usize.pow(k)) % 3])
+                    .collect();
+                let stop = GuardStop::new(4, 1, frac);
+                let mut stopped_at = None;
+                for (i, &(c, h)) in seq.iter().enumerate() {
+                    stop.record(&subject(5), &result(c, h));
+                    if stop.stopped() && stopped_at.is_none() {
+                        stopped_at = Some(i);
+                    }
+                }
+                let whole = InnerLoopStats {
+                    n_unconverged: seq.iter().filter(|(c, _)| !c).count(),
+                    n_start_rejected: seq.iter().filter(|(_, h)| *h).count(),
+                    ..Default::default()
+                };
+                let rejects = ebe_guard_rejects(&whole, 4, -100.0, frac);
+                assert_eq!(
+                    stopped_at.is_some(),
+                    rejects,
+                    "frac {frac}, sequence {seq:?}: stopped at {stopped_at:?}, guard {rejects}"
+                );
+            }
+        }
+    }
 }

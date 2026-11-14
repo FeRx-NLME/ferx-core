@@ -5,7 +5,8 @@
 //! in two strata with whole-unit times: 13 have no event, 19 have an event at their own
 //! follow-up end, and 32 of the mean-cumulative-function rows carry more than one event.
 //! No subject has two events at one time, because survfit refuses `stop == start`; that
-//! case is pinned by the exact closed form in `src/stats/km_tests.rs`.
+//! case is pinned by the exact closed form in `src/stats/km_tests.rs`, and equals
+//! `reda::mcf` 0.5.6.
 //!
 //! The entry point itself is run on the data, with its own stratification, and its
 //! `observed` curves are compared: the mean cumulative function against

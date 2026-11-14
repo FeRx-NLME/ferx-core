@@ -11510,8 +11510,15 @@ fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
             ..FitOptions::default()
         };
         let declines = OuterFdDeclineLog::new(n_subj);
+        // The #2709 stop would leave a rejected pass's later subjects unsolved: switched off
+        // inside the pool, where the objective runs.
         let (r, rec) = pool.install(|| {
-            record_inner_solves(|| optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[]))
+            GUARD_STOP_DISABLED.with(|c| c.set(true));
+            let out = record_inner_solves(|| {
+                optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[])
+            });
+            GUARD_STOP_DISABLED.with(|c| c.set(false));
+            out
         });
         let start = r.start_eval.expect("the unprofiled loop records its start");
         let ms = |id: &str| rec.multistarts.iter().filter(|s| *s == id).count();
@@ -11942,6 +11949,7 @@ fn assert_first_eval_starts_at_preflight_mode(
                     None,
                     None,
                     PrevEtas::ModesHere,
+                    None,
                     None,
                 )
                 .4;
@@ -13560,7 +13568,16 @@ fn assert_next_pass_restarts_kappa(
 ) {
     use crate::estimation::inner_optimizer::record_inner_solves;
     let (model, pop, opts) = warfarin_iov_ode_fixture();
-    let rec = on_one_thread(|| record_inner_solves(|| run(&model, &pop, &opts)).1);
+    // Every subject's start in pass `b` is the object under test, so the pass must be solved
+    // in full. On this fixture NLopt's second evaluation is a trial the EBE guard rejects,
+    // and the #2709 stop would leave its later subjects unsolved: switched off here (inside
+    // the pool, where the objective runs).
+    let rec = on_one_thread(|| {
+        GUARD_STOP_DISABLED.with(|c| c.set(true));
+        let rec = record_inner_solves(|| run(&model, &pop, &opts)).1;
+        GUARD_STOP_DISABLED.with(|c| c.set(false));
+        rec
+    });
     let a = rec
         .passes
         .iter()
@@ -17709,6 +17726,360 @@ mod start_warm_rescore {
         assert!(start.guard_rejected, "{start:?}");
         assert_eq!(start.warm_rescored_from, None, "{start:?}");
         assert_eq!(start.n_unconverged, 27, "{start:?}");
+    }
+}
+
+/// #2709: an outer evaluation whose inner pass the EBE guard is certain to reject stops
+/// solving subjects ([`GuardStop`]).
+mod guard_stop {
+    use super::*;
+    use crate::estimation::inner_optimizer::record_inner_solves;
+
+    /// `examples/mm_iv.ferx` with every θ bound widened to (0, 1e5) and `inner_maxiter = 5`.
+    /// The wide box lets the L-BFGS line search probe points far from the data, where 5 to
+    /// 10 of the 10 subjects' inner loops do not converge in 5 iterations, so the guard
+    /// rejects them. Measured on Linux x86_64 at `b9867c13`: 29 guard-rejected evaluations
+    /// after the first feasible one at the default `max_unconverged_frac = 0.1`, and the
+    /// fit still ends at OFV −336.6017.
+    fn fixture() -> (CompiledModel, Population, ModelParameters, FitOptions) {
+        let src = std::fs::read_to_string("examples/mm_iv.ferx").expect("example exists");
+        let src = src
+            .replace(
+                "theta TVVMAX(5.0,  0.1, 100.0)",
+                "theta TVVMAX(5.0, 0, 100000)",
+            )
+            .replace(
+                "theta TVKM(2.0,   0.01, 50.0)",
+                "theta TVKM(2.0, 0, 100000)",
+            )
+            .replace(
+                "theta TVV(10.0,   0.5, 200.0)",
+                "theta TVV(10.0, 0, 100000)",
+            );
+        assert_eq!(
+            src.matches("100000").count(),
+            3,
+            "the bound edit must apply"
+        );
+        let parsed = crate::parser::model_parser::parse_full_model(&src).expect("parses");
+        let population = crate::read_nonmem_csv(std::path::Path::new("data/mm_iv.csv"), None, None)
+            .expect("data loads");
+        let opts = FitOptions {
+            inner_maxiter: 5,
+            outer_maxiter: 12,
+            run_covariance_step: false,
+            verbose: false,
+            ..parsed.fit_options.clone()
+        };
+        let init = parsed.model.default_params.clone();
+        (parsed.model, population, init, opts)
+    }
+
+    /// One fit on one thread, so the solve count is deterministic: its result, the solves
+    /// it ran and how many evaluations the stop cut short.
+    fn fit(
+        method: crate::types::EstimationMethod,
+        stop_disabled: bool,
+    ) -> (OuterResult, usize, usize) {
+        let (model, population, init, opts) = fixture();
+        let opts = FitOptions { method, ..opts };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .build()
+            .unwrap();
+        // The objective runs on the pool's worker, so the thread-locals are set and read
+        // there, inside `install`.
+        let ((result, rec), stops) = pool.install(|| {
+            GUARD_STOP_DISABLED.with(|c| c.set(stop_disabled));
+            GUARD_STOPS.with(|c| c.set(0));
+            let out = record_inner_solves(|| {
+                optimize_nlopt(
+                    &model,
+                    &population,
+                    &init,
+                    &opts,
+                    &OuterFdDeclineLog::new(population.subjects.len()),
+                    None,
+                    &[],
+                )
+            });
+            let stops = GUARD_STOPS.with(std::cell::Cell::get);
+            GUARD_STOP_DISABLED.with(|c| c.set(false));
+            (out, stops)
+        });
+        (result, rec.solve_tols.len(), stops)
+    }
+
+    /// The stop changes nothing the optimizer sees: the same objective at every point, so
+    /// the same path, bit for bit. Only the solve count drops. Under FOCEI and under
+    /// Laplace, which are the two arms of `run_inner_loop_and_nll_prepared`; Laplace's
+    /// stopped pass skips its quadrature and reports an infinite objective.
+    ///
+    /// Mutations:
+    /// - stopping below the threshold (`>=` for `>` in the fraction test) stops passes the
+    ///   guard would accept: the path changes and the equalities fail;
+    /// - never stopping fails `stops > 0` and the solve count;
+    /// - dropping the forced guard verdict on a stopped pass files Laplace's stopped
+    ///   evaluations, with their infinite objective, as non-finite rejections: the
+    ///   `ebe_convergence_warnings` equality fails.
+    #[test]
+    fn a_fit_is_bit_identical_with_the_stop_and_solves_fewer_subjects() {
+        use crate::types::EstimationMethod;
+        for method in [EstimationMethod::FoceI, EstimationMethod::Laplace] {
+            let (off, solves_off, stops_off) = fit(method, true);
+            let (on, solves_on, stops_on) = fit(method, false);
+            assert_eq!(stops_off, 0, "{method:?}: the switch must disable the stop");
+            assert!(
+                stops_on > 0,
+                "{method:?}: fixture: the stop must fire on a guard-rejected evaluation"
+            );
+            assert!(off.ofv.is_finite() && on.ofv.is_finite());
+            assert_eq!(
+                on.ofv.to_bits(),
+                off.ofv.to_bits(),
+                "{method:?}: {} vs {}",
+                on.ofv,
+                off.ofv
+            );
+            assert_eq!(on.n_iterations, off.n_iterations, "{method:?}");
+            assert_eq!(on.converged, off.converged, "{method:?}");
+            // A stopped evaluation is still a guard rejection, not a non-finite one: the
+            // count of guard-rejected evaluations is the same either way.
+            assert_eq!(
+                on.ebe_convergence_warnings, off.ebe_convergence_warnings,
+                "{method:?}: a stopped evaluation must be counted as a guard rejection"
+            );
+            let bits = |p: &ModelParameters| -> Vec<u64> {
+                p.theta
+                    .iter()
+                    .chain(p.omega.matrix.iter())
+                    .chain(p.sigma.values.iter())
+                    .map(|v| v.to_bits())
+                    .collect()
+            };
+            assert_eq!(
+                bits(&on.params),
+                bits(&off.params),
+                "{method:?}: the estimates differ"
+            );
+            assert!(
+                solves_on < solves_off,
+                "{method:?}: the stopped passes must solve fewer subjects \
+                 ({solves_on} vs {solves_off})"
+            );
+            eprintln!(
+                "guard stop {method:?}: {stops_on} stopped evaluations, {solves_on} solves vs \
+                 {solves_off}"
+            );
+        }
+    }
+
+    /// A stopped Laplace/AGQ pass does not run its quadrature over the placeholders: its
+    /// objective is infinite. Without the skip every fit result is the same (the caller
+    /// rejects the evaluation either way), so this pins the work it saves where it is done:
+    /// removing the skip returns the quadrature's finite sum instead.
+    #[test]
+    fn a_stopped_quadrature_pass_skips_the_quadrature() {
+        use crate::estimation::inner_optimizer::{build_schedule_cache, EbeResult, GuardStop};
+        let (model, population, init, opts) = fixture();
+        let opts = FitOptions {
+            method: crate::types::EstimationMethod::Laplace,
+            ..opts
+        };
+        let schedules = build_schedule_cache(&model, &population);
+        let run = |stop: Option<&GuardStop>| {
+            run_inner_loop_and_nll_prepared(
+                &model,
+                &population,
+                &init,
+                &opts,
+                None,
+                None,
+                None,
+                None,
+                Some(&schedules),
+                PrevEtas::Placeholder,
+                None,
+                stop,
+            )
+            .4
+        };
+        let full = run(None);
+        assert!(
+            full.is_finite(),
+            "premise: the unstopped quadrature is finite ({full})"
+        );
+        // A token already stopped by a hard rejection: every subject gets a placeholder.
+        let stop = GuardStop::new(population.subjects.len(), 1, 0.1);
+        let rejected = EbeResult {
+            eta: DVector::zeros(model.n_eta),
+            h_matrix: DMatrix::zeros(1, model.n_eta),
+            fd_h_redone: false,
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: false,
+            nm_polished: false,
+            grad_norm: 0.0,
+            nll: f64::INFINITY,
+            kappas: Vec::new(),
+            hard_reject: true,
+            screen_moved: false,
+            twin_moved: false,
+        };
+        stop.record(&population.subjects[0], &rejected);
+        assert!(stop.stopped(), "premise: the token is stopped");
+        let stopped = run(Some(&stop));
+        assert!(
+            stopped == f64::INFINITY,
+            "a stopped quadrature pass must not be summed ({stopped})"
+        );
+    }
+
+    /// A run with no feasible evaluation never stops a pass, so its `W_NO_FEASIBLE_EVAL`
+    /// reports the worst unconverged count over full passes, as before #2709. The same gate
+    /// keeps the stop off the first evaluation, which #2682 re-solves from its own EBEs
+    /// (killed there by `start_warm_rescore::a_start_rejected_cold_is_accepted_when_its_warm_resolve_converges`).
+    ///
+    /// `two_cpt_oral_cov` at `inner_maxiter = 1` is never feasible: every evaluation leaves
+    /// most of the 30 subjects unconverged. Mutation: arming the stop on an infeasible run
+    /// (`>= 0` for `> 0` on the feasible count) stops every pass after 4 subjects, and the
+    /// warning's "at worst" count drops.
+    #[test]
+    fn a_run_with_no_feasible_evaluation_never_stops_a_pass() {
+        let prep = crate::api::prepare_run(
+            "examples/two_cpt_oral_cov.ferx",
+            Some("data/two_cpt_oral_cov.csv"),
+        )
+        .expect("prepare two_cpt_oral_cov");
+        let opts = FitOptions {
+            inner_maxiter: 1,
+            outer_maxiter: 5,
+            run_covariance_step: false,
+            verbose: false,
+            ..prep.parsed.fit_options.clone()
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .build()
+            .unwrap();
+        let run = |disabled: bool| {
+            pool.install(|| {
+                GUARD_STOP_DISABLED.with(|c| c.set(disabled));
+                GUARD_STOPS.with(|c| c.set(0));
+                let r = optimize_nlopt(
+                    &prep.parsed.model,
+                    &prep.population,
+                    &prep.init_params,
+                    &opts,
+                    &OuterFdDeclineLog::new(prep.population.subjects.len()),
+                    None,
+                    &[],
+                );
+                let stops = GUARD_STOPS.with(std::cell::Cell::get);
+                GUARD_STOP_DISABLED.with(|c| c.set(false));
+                (r, stops)
+            })
+        };
+        let (off, _) = run(true);
+        let (on, stops) = run(false);
+        let no_feasible =
+            |r: &OuterResult| r.warnings.iter().any(|w| w.contains("W_NO_FEASIBLE_EVAL"));
+        assert!(
+            no_feasible(&off),
+            "fixture: the run must have no feasible evaluation: {:?}",
+            off.warnings
+        );
+        assert_eq!(
+            stops, 0,
+            "a run with no feasible evaluation must not stop a pass"
+        );
+        assert_eq!(on.max_unconverged_subjects, off.max_unconverged_subjects);
+        assert_eq!(on.warnings, off.warnings);
+    }
+
+    /// A stopped pass is reported on the subjects it solved, not on its end-of-pass
+    /// statistics, which also count every unsolved placeholder as a hard rejection and as
+    /// unconverged; an unstopped pass, or none, keeps its own.
+    #[test]
+    fn a_stopped_pass_reports_the_counts_of_the_subjects_it_solved() {
+        use crate::estimation::inner_optimizer::{EbeResult, GuardStop};
+        let unconverged = EbeResult {
+            eta: DVector::zeros(1),
+            h_matrix: DMatrix::zeros(1, 1),
+            fd_h_redone: false,
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: true,
+            nm_polished: false,
+            grad_norm: 0.0,
+            nll: 0.0,
+            kappas: Vec::new(),
+            hard_reject: false,
+            screen_moved: false,
+            twin_moved: false,
+        };
+        let subject = Subject {
+            id: "1".into(),
+            observations: vec![1.0; 4],
+            ..Default::default()
+        };
+        // The placeholders' end-of-pass picture: 8 more unconverged and hard-rejected.
+        let pass = InnerLoopStats {
+            n_unconverged: 10,
+            n_fallback: 2,
+            n_nm_polished: 0,
+            n_start_rejected: 8,
+        };
+        let stop = GuardStop::new(10, 1, 0.1);
+        stop.record(&subject, &unconverged);
+        let (stats, solved) = stopped_pass_stats(Some(&stop), pass.clone());
+        assert_eq!(solved, None, "1 of 10 does not stop");
+        assert_eq!(stats.n_start_rejected, 8, "an unstopped pass keeps its own");
+        stop.record(&subject, &unconverged);
+        let (stats, solved) = stopped_pass_stats(Some(&stop), pass.clone());
+        assert_eq!(solved, Some(2));
+        assert_eq!(
+            (
+                stats.n_unconverged,
+                stats.n_fallback,
+                stats.n_start_rejected
+            ),
+            (2, 2, 0),
+            "{stats:?}"
+        );
+        let (stats, solved) = stopped_pass_stats(None, pass);
+        assert_eq!((stats.n_start_rejected, solved), (8, None));
+    }
+
+    /// The verbose line of a stopped evaluation names its trigger, the counts it stopped on
+    /// and the subjects it left unsolved. Each arm is asserted with the other's text absent.
+    #[test]
+    fn the_stopped_line_names_its_trigger_and_the_unsolved_subjects() {
+        let stats = |n_unconverged, n_start_rejected| InnerLoopStats {
+            n_unconverged,
+            n_start_rejected,
+            ..Default::default()
+        };
+        let frac = stopped_eval_line(&stats(2, 0), 3, 10, 0.1);
+        assert!(
+            frac.contains("after 3 of 10 subjects")
+                && frac.contains("2 subjects' inner loops did not converge")
+                && frac.contains("`max_unconverged_frac` = 0.1")
+                && frac.contains("the other 7 were not solved")
+                && !frac.contains("rejected at their inner start")
+                && !frac.contains("not finite"),
+            "{frac}"
+        );
+        let hard = stopped_eval_line(&stats(1, 1), 1, 10, 0.1);
+        assert!(
+            hard.contains("after 1 of 10 subjects")
+                && hard.contains("1 subjects rejected at their inner start")
+                && hard.contains("the other 9 were not solved")
+                && !hard.contains("did not converge"),
+            "{hard}"
+        );
     }
 }
 
