@@ -1083,9 +1083,9 @@ exactly the result of calling `vpc_rtte()` on the data cut at `H` first: every c
 default `max_order` and the warnings. Without the cut, a gap-time risk set would count events
 the replicates cannot have, and the misses of an observed gap-time curve would fall almost all
 above its band ([#2908](https://github.com/FeRx-NLME/ferx-core/issues/2908)). With
-`sim.horizon` unset, `H` is the latest follow-up end and nothing is cut. `vpc_tte()` does not
-cut its observed records: there an event after `H` turned into a censoring at `H` would enter
-the censoring distribution the replicates draw from, and move the band before `H`.
+`sim.horizon` unset, `H` is the latest follow-up end and nothing is cut. `vpc_tte()` needs no
+such cut: a single-event curve and its band are the same on `[0, H]` with the records cut at
+`H` or not, and only its raw `observed` curve past `H` differs.
 
 When a subject's last record is an event, its follow-up ends at that event: the data say
 nothing later about it. The observed subject then has an event exactly at its follow-up end,

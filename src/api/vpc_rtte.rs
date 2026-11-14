@@ -53,9 +53,9 @@
 //! `max_order` and `W_VPC_RTTE_ENDS_ON_EVENT` included (#2908). Without the cut, a
 //! gap-time risk set and the gap a subject is censored at would read follow-up the
 //! replicates do not have. With `sim.horizon` unset `H` is the latest follow-up end and
-//! the cut does nothing. [`vpc_tte`](super::vpc_tte) does not cut its observed records:
-//! an event after `H` cut to a censoring at `H` would enter its reverse Kaplan–Meier
-//! censoring distribution and move the band on `[0, H]`.
+//! the cut does nothing. [`vpc_tte`](super::vpc_tte) needs no such cut: a single-event
+//! curve and its band are the same on `[0, H]` with the records cut at `H` or not, and
+//! only its raw `observed` curve past `H` differs.
 
 use super::simulate::simulate_with_options_impl;
 use super::vpc_tte::{
