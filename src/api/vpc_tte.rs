@@ -222,10 +222,35 @@ pub(super) struct ObsRow {
     pub(super) stratum: usize,
 }
 
+/// The horizon `H` of a VPC, with the observed records read on `[0, H]` only. `H` is
+/// `sim_horizon`, or when `None` the latest record time (and then nothing is cut). A
+/// record after `H` becomes a censoring at `H`, and an event exactly at `H` is kept, so
+/// the result is the one for the data cut at `H` first. `censor_at` is left as it was: a
+/// censoring time past `H` can only censor a replicate draw later than `H`, and no draw
+/// is. The censoring curve `G` does change at `H` (a row censored past `H` now counts
+/// there), but not before `H`, and a draw landing at `H` instead of past it gives
+/// `c = H`, which censors no draw `≤ H` either. So on `[0, H]` a curve and its band do
+/// not move (#2950 for [`vpc_tte`], #2955 measures it for
+/// [`vpc_kmmc`](super::vpc_kmmc)); the raw observed curve stops running past the band.
+/// [`vpc_tte`] and [`vpc_kmmc`](super::vpc_kmmc) take `H` from here, and resolving `H`
+/// and cutting are one call, so neither can skip the cut.
+pub(super) fn horizon_and_cut(rows: &mut [ObsRow], sim_horizon: Option<f64>) -> f64 {
+    let horizon = sim_horizon.unwrap_or_else(|| {
+        rows.iter()
+            .map(|r| r.time)
+            .fold(f64::NEG_INFINITY, f64::max)
+    });
+    for r in rows.iter_mut().filter(|r| r.time > horizon) {
+        r.time = horizon;
+        r.event = false;
+    }
+    horizon
+}
+
 /// The entry point a shared helper refuses for, so each message carries the name of
 /// the function the caller called. [`vpc_rtte`](super::vpc_rtte) shares the endpoint,
 /// record, strata and grid helpers below, and [`vpc_kmmc`](super::vpc_kmmc) also the
-/// observed rows and the replicate loop.
+/// observed rows, the horizon and its cut ([`horizon_and_cut`]) and the replicate loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Entry {
     Tte,
@@ -700,22 +725,8 @@ pub fn vpc_tte(
     check_band_options(Entry::Tte, probs, opts.n_sim, &opts.grid)?;
     let cmt = resolve_cmt(Entry::Tte, model, opts.cmt)?;
     let (mut rows, values, labels) = observed_rows(Entry::Tte, population, cmt, &opts.stratify)?;
-    let horizon = opts.sim.horizon.unwrap_or_else(|| {
-        rows.iter()
-            .map(|r| r.time)
-            .fold(f64::NEG_INFINITY, f64::max)
-    });
-    // The data on [0, H] only (module doc): a record after H is a censoring at H, an
-    // event at H is kept. `censor_at` is left as it was: past H it could only censor a
-    // replicate draw later than H, and no draw is. The censoring curve G does change at
-    // H (a row censored past H now counts there), but not before H, and a draw landing
-    // at H instead of past it gives c = H, which censors no draw ≤ H either.
-    for r in &mut rows {
-        if r.time > horizon {
-            r.time = horizon;
-            r.event = false;
-        }
-    }
+    // The data on [0, H] only (module doc).
+    let horizon = horizon_and_cut(&mut rows, opts.sim.horizon);
 
     let n_strata = values.len();
     let (reps, warnings) = simulate_replicates(

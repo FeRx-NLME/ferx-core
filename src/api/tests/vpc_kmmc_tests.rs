@@ -562,3 +562,258 @@ fn warns_on_a_time_varying_covariate() {
         "no warning for a constant covariate"
     );
 }
+
+// ── #2955: the observed data are read on [0, H] ──────────────────────────────
+
+const H_CUT: f64 = 10.0;
+
+/// Fixture C on cmt 2 with `H = 10`: events at 1, 2, …, 8 (three subjects each), a
+/// censoring at 5, `X10` an event exactly at `H`, `E12` and `E15` events past `H`, and
+/// `C18`, `C20` censorings past `H` (so the censoring curve `G` has mass past `H`).
+/// `Z` is distinct per subject and not sorted by time; `W` alternates, for two strata.
+fn fixture_c() -> Population {
+    let mut s: Vec<Subject> = Vec::new();
+    let mut add = |id: String, t: f64, e: bool| {
+        let i = s.len();
+        let mut x = subj(&id, t, e, ((7 * i) % 13) as f64 + 0.1 * i as f64);
+        x.covariates.insert("W".into(), (i % 2) as f64);
+        s.push(x);
+    };
+    for t in 1..=8 {
+        for j in 0..3 {
+            add(format!("S{t}{j}"), t as f64, true);
+        }
+    }
+    add("C5".into(), 5.0, false);
+    add("X10".into(), 10.0, true);
+    add("E12".into(), 12.0, true);
+    add("E15".into(), 15.0, true);
+    add("C18".into(), 18.0, false);
+    add("C20".into(), 20.0, false);
+    let mut p = pop(s);
+    p.covariate_names.push("W".into());
+    p
+}
+
+/// The data cut at `h` by hand, independently of the engine: a record after `h`
+/// becomes a right-censored record at `h`; one at or before `h` is unchanged.
+fn cut_by_hand(p: &Population, h: f64) -> Population {
+    let mut q = p.clone();
+    for r in q.subjects.iter_mut().flat_map(|s| s.obs_records.iter_mut()) {
+        if let ObsRecord::Event {
+            time, event_type, ..
+        } = r
+        {
+            if *time > h {
+                *time = h;
+                *event_type = EventType::RightCensored;
+            }
+        }
+    }
+    q
+}
+
+fn record_times(p: &Population) -> Vec<f64> {
+    p.subjects
+        .iter()
+        .flat_map(|s| s.obs_records.iter())
+        .map(|r| match r {
+            ObsRecord::Event { time, .. } => *time,
+            _ => unreachable!("fixture C holds event records only"),
+        })
+        .collect()
+}
+
+/// #2955. `sim.horizon = H` below the data's follow-up equals calling on the data cut
+/// at `H` first: the whole `KmmcVpc`, under both censorings, unstratified and in two
+/// strata, on the automatic grid and on a `Times` grid with points past `H` where the
+/// uncut observed curve is still defined. The straddle is asserted first: C has records
+/// past `H`, the hand cut has none. The hand cut also differs from the engine's in `G`
+/// at `H`: it makes `E12` and `E15` censorings there, the engine leaves their
+/// `censor_at` empty, so equality also pins that `G` at `H` moves no draw.
+///
+/// Mutations that redden it (measured): no cut (`observed` runs to 20, `obs_on_grid`
+/// at 15 is defined); removing the call from `vpc_kmmc`; a cut that keeps the event flag
+/// (`E12`, `E15` become events at `H`); a cut to `H − 1`. Not `>=` for `>`: it also
+/// makes `X10` a censoring in the hand cut, so both sides agree;
+/// `kmmc_observed_curve_reads_the_data_cut_at_the_horizon` kills it.
+#[test]
+fn kmmc_horizon_below_follow_up_equals_the_data_cut_at_the_horizon() {
+    let p = fixture_c();
+    let cut = cut_by_hand(&p, H_CUT);
+    assert!(
+        record_times(&p).iter().any(|&t| t > H_CUT),
+        "C has records past H"
+    );
+    assert!(
+        record_times(&cut).iter().all(|&t| t <= H_CUT),
+        "the cut has none"
+    );
+
+    let m = exp_model(0.08);
+    for stratify in [VpcStratify::None, VpcStratify::Covariate("W".into())] {
+        for censoring in [VpcCensoring::Observed, VpcCensoring::Horizon] {
+            for grid in [VpcGrid::Auto, VpcGrid::Times(vec![3.0, 9.0, 10.0, 15.0])] {
+                let mut o = opts(20);
+                o.min_at_risk = 2;
+                o.vpc.stratify = stratify.clone();
+                o.vpc.censoring = censoring;
+                o.vpc.grid = grid.clone();
+                o.vpc.sim.horizon = Some(H_CUT);
+                let got = run(&m, &p, &o).unwrap();
+                let want = run(&m, &cut, &o).unwrap();
+                assert_eq!(got, want, "{stratify:?}, {censoring:?}, {grid:?}");
+            }
+        }
+    }
+}
+
+/// #2955, the readable twin. The observed curve of C at `H = 10` ends at `H`: there
+/// `X10`, `E12`, `E15`, `C18` and `C20` are at risk, `X10`'s event is an event and the
+/// other four are censorings, and the mean is theirs. At the grid point 15 the observed
+/// value is empty; uncut, the curve ran to 20 and was defined there.
+///
+/// Mutations that redden it (measured): no cut (last row 20), in the helper or by
+/// removing the call; `>=` for `>` (`X10`'s event at `H` becomes a censoring,
+/// `n_event` 0); keeping the event flag (`n_event` 3); a cut to `H − 1`.
+#[test]
+fn kmmc_observed_curve_reads_the_data_cut_at_the_horizon() {
+    let p = fixture_c();
+    let mut o = opts(20);
+    o.min_at_risk = 2;
+    o.vpc.sim.horizon = Some(H_CUT);
+    o.vpc.grid = VpcGrid::Times(vec![9.0, 15.0]);
+    let v = run(&exp_model(0.08), &p, &o).unwrap();
+    let s = &v.strata[0];
+    assert_eq!(s.n_subjects, 30);
+    let c = &s.observed;
+    assert_eq!(c.time.last(), Some(&H_CUT), "the curve ends at H");
+    let k = c.time.len() - 1;
+    assert_eq!(
+        (c.n_risk[k], c.n_event[k], c.n_censor[k]),
+        (5, 1, 4),
+        "at H: X10's event, and E12, E15, C18, C20 censored there"
+    );
+    let at_risk = ["X10", "E12", "E15", "C18", "C20"];
+    let want: f64 = p
+        .subjects
+        .iter()
+        .filter(|x| at_risk.contains(&x.id.as_str()))
+        .map(|x| x.covariates["Z"])
+        .sum::<f64>()
+        / 5.0;
+    assert!(
+        (c.mean[k] - want).abs() <= 4.0 * f64::EPSILON * want,
+        "mean at H {} vs {want}",
+        c.mean[k]
+    );
+    assert!(s.obs_on_grid[0].is_some(), "9 is before H");
+    assert_eq!(s.obs_on_grid[1], None, "15 is past H");
+}
+
+/// #2955, the reason the cut leaves the band alone, at the replicate level: under
+/// `DrawAll` the replicates of C are the same, time for time, with the rows cut at `H`
+/// or not. `G` below `H` reads only risk sets before `H`, which the cut does not touch,
+/// so every draw under `H` is unchanged, and a draw at or past `H` censors no replicate
+/// time (all `≤ H`). The straddle: uncut, two rows are censorings past `H`, so `G` has
+/// mass there that the cut moves onto `H`.
+///
+/// Mutation that reddens its equality (measured): a cut to a time below `H`
+/// (`r.time = horizon - 1.0`), which moves `G`'s mass under `H`. No cut at all reddens
+/// only its straddle assertion, since both sides are then the uncut rows.
+#[test]
+fn kmmc_replicates_are_the_same_with_the_rows_cut_at_the_horizon_or_not() {
+    let p = fixture_c();
+    let m = exp_model(0.08);
+    let (rows, _, _) = observed_rows(Entry::Kmmc, &p, 2, &VpcStratify::None).unwrap();
+    let (mut cut, _, _) = observed_rows(Entry::Kmmc, &p, 2, &VpcStratify::None).unwrap();
+    assert_eq!(horizon_and_cut(&mut cut, Some(H_CUT)), H_CUT);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.time > H_CUT && r.censor_at.is_some())
+            .count(),
+        2,
+        "C18, C20 put G's mass past H"
+    );
+    assert!(cut.iter().all(|r| r.time <= H_CUT));
+
+    let mut v = opts(40).vpc;
+    v.censoring = VpcCensoring::Observed;
+    let sim = |rows: &[ObsRow]| {
+        simulate_replicates(
+            &m,
+            &p,
+            &m.default_params,
+            &v,
+            2,
+            rows,
+            1,
+            H_CUT,
+            TteCensorRule::DrawAll,
+        )
+        .unwrap()
+        .0
+    };
+    let (a, b) = (sim(&rows), sim(&cut));
+    let mut censored_below_h = 0;
+    for (ra, rb) in a.iter().zip(&b) {
+        let (sa, sb) = (&ra[0], &rb[0]);
+        assert_eq!(sa.rows, sb.rows);
+        assert_eq!(sa.events, sb.events);
+        let bits = |t: &[f64]| t.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&sa.times), bits(&sb.times));
+        censored_below_h += sa
+            .times
+            .iter()
+            .zip(&sa.events)
+            .filter(|(t, e)| !**e && **t < H_CUT)
+            .count();
+    }
+    // Not a fixture where nobody is censored before H: the draws under H are live.
+    assert!(censored_below_h > 0, "no replicate censored before H");
+}
+
+/// #2955, the helper: a record after `H` becomes a censoring at `H`, an event exactly
+/// at `H` stays an event, a record before `H` is untouched, and `censor_at` is left as
+/// it was. `>=` for `>` reddens the `X10` assertion; keeping the event flag reddens
+/// `E12`'s; no cut reddens every row past `H`.
+#[test]
+fn horizon_and_cut_censors_past_h_and_keeps_an_event_at_h() {
+    let p = fixture_c();
+    let (mut rows, _, _) = observed_rows(Entry::Kmmc, &p, 2, &VpcStratify::None).unwrap();
+    assert_eq!(horizon_and_cut(&mut rows, Some(H_CUT)), H_CUT);
+    let row = |id: &str| {
+        let r = rows.iter().find(|r| r.id == id).unwrap();
+        (r.time, r.event, r.censor_at)
+    };
+    assert_eq!(row("S80"), (8.0, true, None));
+    assert_eq!(row("C5"), (5.0, false, Some(5.0)));
+    assert_eq!(row("X10"), (10.0, true, None));
+    assert_eq!(row("E12"), (10.0, false, None));
+    assert_eq!(row("E15"), (10.0, false, None));
+    assert_eq!(row("C18"), (10.0, false, Some(18.0)));
+}
+
+/// #2955, the helper with `sim.horizon` unset: `H` is the latest record time (20) and no
+/// row changes, the event `X20` at that time included. A fold that takes the earliest
+/// time instead (`f64::min`) gives `H = 1` and cuts every later row; ignoring
+/// `sim_horizon` reddens the `Some` assertion in the test above.
+#[test]
+fn horizon_and_cut_without_a_horizon_is_the_latest_record_and_cuts_nothing() {
+    let mut p = fixture_c();
+    let mut x = subj("X20", 20.0, true, 1.5);
+    x.covariates.insert("W".into(), 0.0);
+    p.subjects.push(x);
+    let (rows, _, _) = observed_rows(Entry::Kmmc, &p, 2, &VpcStratify::None).unwrap();
+    let (mut got, _, _) = observed_rows(Entry::Kmmc, &p, 2, &VpcStratify::None).unwrap();
+    assert_eq!(horizon_and_cut(&mut got, None), 20.0);
+    let key = |r: &ObsRow| (r.id.clone(), r.time.to_bits(), r.event, r.censor_at);
+    assert_eq!(
+        got.iter().map(key).collect::<Vec<_>>(),
+        rows.iter().map(key).collect::<Vec<_>>()
+    );
+    assert!(
+        got.iter().any(|r| r.id == "X20" && r.event),
+        "the event at H is kept"
+    );
+}

@@ -1305,6 +1305,20 @@ subject's time gave 89 % and 92.5 %. The draw assumes what the censoring distrib
 assumes: within a stratum, censoring does not depend on the covariate. Stratify on what drives
 dropout. `VpcCensoring::Horizon` follows every replicate subject to `H`.
 
+The observed data are read on `[0, H]` only, by the same rule as `vpc_tte()`'s
+([Censoring in the replicates](#censoring-in-the-replicates)): a record after `H` becomes a
+censoring at `H`, and an event exactly at `H` is kept. So a
+`sim.horizon` below the data's follow-up gives exactly the result of calling `vpc_kmmc()` on the
+data cut at `H` first. Although every replicate subject draws from the censoring distribution
+from time 0, the band does not move: the distribution below `H` depends only on who is still
+followed before `H`, which the cut leaves alone, and a draw at or past `H` censors nothing.
+Measured on 24 configurations (two horizons, with and without strata, both censorings, all three
+grids), every band cell and every observed value up to `H` was bit-identical with the records
+cut or not. What changes is the raw `observed` curve, which now ends at `H` instead of running
+past the band, and the observed value at a `VpcGrid::Times` point past `H`, which is now empty
+([#2955](https://github.com/FeRx-NLME/ferx-core/issues/2955)). With `sim.horizon` unset nothing
+is cut.
+
 #### Reading it {#km-vpc-kmmc-reading}
 
 At `t = 0` every subject is at risk in the data and in every replicate, so the observed value,
