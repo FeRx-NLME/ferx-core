@@ -322,6 +322,7 @@ fn outer_gradient_gap(m: &CompiledModel, pop: &Population, o: &FitOptions) -> f6
 }
 
 #[test]
+#[cfg(feature = "survival")]
 fn non_gaussian_curvature_falls_back_to_fd() {
     // The CTMM example needs `markov`; the base `ci,survival` set does not compile it in.
     #[allow(unused_mut)]
@@ -485,5 +486,11 @@ fn no_example_model_falls_back_with_plans_working() {
         eprintln!("{}: no fallback", path.display());
         n += 1;
     }
-    assert!(n >= 20, "only {n} example models were simulated and fitted");
+    // Measured: 20 example models simulate and fit with `survival`, 19 without it (an
+    // `[event_model]` example does not parse in a build without the feature).
+    let want = if cfg!(feature = "survival") { 20 } else { 19 };
+    assert!(
+        n >= want,
+        "only {n} example models were simulated and fitted"
+    );
 }
