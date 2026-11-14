@@ -1864,6 +1864,20 @@ pub(crate) fn refresh_plan_fd_fallback(
     }
 }
 
+/// The route label of a fit with `k` of `n` subjects on finite differences because their
+/// plans failed (#2949): `label` unchanged for `k = 0` or for a label that names no gradient
+/// (`N/A`); every subject on FD reads `finite differences (compiled plan failed)`; a split
+/// reads like the banner's, `analytic ×a, FD ×k`.
+pub(crate) fn plan_fallback_label(label: &str, k: usize, n: usize) -> String {
+    if k == 0 || label == crate::build_info::GradientMethodKind::NotApplicable.as_str() {
+        label.to_string()
+    } else if k >= n {
+        "finite differences (compiled plan failed)".to_string()
+    } else {
+        format!("analytic ×{}, FD ×{k}", n - k)
+    }
+}
+
 /// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
 /// return `None` when empty, otherwise join a human `list` string (`line` per
 /// hit), format the message (`msg` over the joined list), build the structured

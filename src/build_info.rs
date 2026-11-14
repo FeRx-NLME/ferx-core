@@ -45,7 +45,7 @@ pub enum GradientMethodKind {
 impl GradientMethodKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Analytic => "analytic (Dual2)",
+            Self::Analytic => "analytic",
             Self::FiniteDifferences => "finite differences",
             Self::NotApplicable => "N/A",
         }

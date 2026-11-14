@@ -313,8 +313,12 @@ fn outer_gradient_gap(m: &CompiledModel, pop: &Population, o: &FitOptions) -> f6
         });
         assert!(exact.iter().all(|v| v.is_finite()), "{exact:?}");
         let scale = exact.iter().fold(1.0f64, |a, v| a.max(v.abs()));
-        for (a, b) in exact.iter().zip(&fd) {
+        for (k, (a, b)) in exact.iter().zip(&fd).enumerate() {
             assert!(a.is_finite() && b.is_finite(), "{exact:?} vs {fd:?}");
+            // A FIX coordinate is pinned (`lower == upper`): the optimizer's FD never moves it.
+            if bounds.lower[k] == bounds.upper[k] {
+                continue;
+            }
             worst = worst.max((a - b).abs() / scale); // nan-ok: a, b, scale finite asserted above; scale >= 1
         }
     }
@@ -558,5 +562,264 @@ fn standalone_covariance_and_sir_report_the_fallback() {
             .find(|e| e.message.contains(TOKEN))
             .unwrap();
         assert_eq!(e.category, WarningCode::GradientFallback, "{label}");
+    }
+}
+
+// ---- #2949: the plan's value reads ----------------------------------------------------------
+
+/// Parse `model` (its `[data]` path rewritten to a file holding `data`) and read the population.
+fn from_text(model: &str, data: &str) -> (CompiledModel, Population) {
+    let dir = tempfile::tempdir().expect("tmp");
+    let csv = dir.path().join("data.csv");
+    std::fs::write(&csv, data).expect("write csv");
+    let text = model.replace("path=data.csv", &format!("path={}", csv.display()));
+    let ferx = dir.path().join("run.ferx");
+    std::fs::write(&ferx, text).expect("write model");
+    example(ferx.to_str().expect("utf8"), csv.to_str().expect("utf8"))
+}
+
+/// A FOCEI fit (3 outer iterations, one thread) reports no fallback and its plan outer
+/// gradient matches the reconverged central difference; returns the gradient gap.
+fn exact_and_matches_fd(label: &str, model: &str, data: &str) -> f64 {
+    let (m, p) = from_text(model, data);
+    let o = opts(EstimationMethod::FoceI);
+    let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
+    assert!(
+        !fit.warnings.iter().any(|w| w.contains(TOKEN)),
+        "{label}: {:?}",
+        fit.warnings
+    );
+    let gap = outer_gradient_gap(&m, &p, &o);
+    eprintln!("{label}: worst outer-gradient gap {gap:.3e}");
+    gap
+}
+
+/// Bound on the plan-vs-reconverged-FD gap (relative to the gradient's largest entry).
+const GAP_TOL: f64 = 1e-3;
+
+const TWO_CPT_TV: &str = r#"[data]
+  path=data.csv
+[parameters]
+  theta TVCL(3.0, 0.1, 150.0)
+  theta TVV(50.0, 1.0, 2000.0)
+  theta TVQ(2.0, 0.1, 50.0)
+  theta TVV2(100.0, 1.0, 2500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta TH_WT(0.75, 0.01, 3.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.2
+  sigma PROP_ERR ~ 0.2
+[covariates]
+  WT continuous
+[individual_parameters]
+  CL = TVCL * (WT / 70.0)^TH_WT * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+  KA = TVKA
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+"#;
+const TWO_CPT_TV_DATA: &str = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,WT
+1,0,1,1,0,1000,0,1,70
+1,12,0,0,5.0,0,0,1,90
+";
+const SS_RESET_F_LOGADD: &str = r#"[data]
+  path=data.csv
+[parameters]
+  theta TVKA(8.0, FIX)
+  theta TVV(1000.0, 1e-6, 10000.0)
+  theta TVCL(100.0, 1e-6, 1000.0)
+  omega ETA_KA ~ 1.0 FIX
+  block_omega (ETA_V, ETA_CL) = [0.3, 0.1, 0.3]
+  omega ETA_RUV ~ 0.1
+  sigma PROP_ERR ~ 0.2 (sd)
+[individual_parameters]
+  F = 1e6 / 167.19
+  KA = TVKA * exp(ETA_KA)
+  V = TVV * 5.0 * exp(ETA_V)
+  CL = TVCL * exp(ETA_CL)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F)
+[error_model]
+  DV ~ log_additive(PROP_ERR)
+  iiv_on_ruv = ETA_RUV
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+"#;
+const SS_RESET_F_LOGADD_DATA: &str = "ID,TIME,EVID,MDV,DV,AMT,CMT,II,SS
+1,0,4,1,0,20,1,1,1
+1,0.17,0,0,5.8,0,2,0,0
+1,0.17,0,0,5.83,0,2,0,0
+1,0.5,0,0,5.81,0,2,0,0
+1,0.5,0,0,5.83,0,2,0,0
+1,1,0,0,5.81,0,2,0,0
+1,1,0,0,5.82,0,2,0,0
+";
+
+/// A two-compartment closed form whose covariate changes between records: the event walk reads
+/// `CL`/`V` through the branch API (`cl_or_v_degenerate_g`), not `.val()`. The twin with a
+/// constant covariate takes the superposition path (the straddle: only the time-varying
+/// subjects reach the walk). Mutation: restore `cl_or_v_degenerate(cl.val(), v1.val())` in
+/// `two_cpt_eigen_g` -> the time-varying cases fail on the token.
+#[test]
+fn a_two_compartment_time_varying_covariate_plans_without_fallback() {
+    let constant = TWO_CPT_TV_DATA.replace("12,0,0,5.0,0,0,1,90", "12,0,0,5.0,0,0,1,70");
+    assert_ne!(constant, TWO_CPT_TV_DATA);
+    let infusion = TWO_CPT_TV_DATA.replace("1000,0,1,70", "1000,1000,1,70");
+    assert_ne!(infusion, TWO_CPT_TV_DATA);
+    let oral = TWO_CPT_TV.replace(
+        "two_cpt_iv(cl=CL, v1=V, q=Q, v2=V2)",
+        "two_cpt_oral(cl=CL, v1=V, q=Q, v2=V2, ka=KA)",
+    );
+    assert_ne!(oral, TWO_CPT_TV);
+    let gaps = [
+        exact_and_matches_fd("two_cpt const", TWO_CPT_TV, &constant),
+        exact_and_matches_fd("two_cpt tv", TWO_CPT_TV, TWO_CPT_TV_DATA),
+        exact_and_matches_fd("two_cpt tv infusion", TWO_CPT_TV, &infusion),
+        exact_and_matches_fd("two_cpt oral tv", &oral, TWO_CPT_TV_DATA),
+    ];
+    for g in gaps {
+        assert!(g.is_finite() && g < GAP_TOL, "{g:e}");
+    }
+}
+
+/// `EVID=4` + `SS=1` + `F` + `log_additive` + `iiv_on_ruv`, and its `EVID=1` twin (which
+/// planned before the fix: the straddle).
+#[test]
+fn a_reset_steady_state_dose_with_f_and_ruv_eta_plans_without_fallback() {
+    let evid1 = SS_RESET_F_LOGADD_DATA.replace("1,0,4,1,0,20", "1,0,1,1,0,20");
+    assert_ne!(evid1, SS_RESET_F_LOGADD_DATA);
+    let gaps = [
+        exact_and_matches_fd(
+            "ss_reset_f_logadd",
+            SS_RESET_F_LOGADD,
+            SS_RESET_F_LOGADD_DATA,
+        ),
+        exact_and_matches_fd("ss_evid1_f_logadd", SS_RESET_F_LOGADD, &evid1),
+    ];
+    for g in gaps {
+        assert!(g.is_finite() && g < GAP_TOL, "{g:e}");
+    }
+}
+
+const TWO_CPT_TIME: &str = r#"[data]
+  path=data.csv
+[parameters]
+  theta TVCL(3.0, 0.1, 150.0)
+  theta TVV(50.0, 1.0, 2000.0)
+  theta TVQ(2.0, 0.1, 50.0)
+  theta TVV2(100.0, 1.0, 2500.0)
+  theta IMAX(0.4, 0.01, 3.0)
+  theta TI50(20.0, 1.0, 500.0)
+  theta HILL(1.5, 0.5, 5.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.2
+  sigma PROP_ERR ~ 0.2
+[individual_parameters]
+  CL = TVCL * exp(IMAX*TIME^HILL/(TI50^HILL+TIME^HILL)) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V, q=Q, v2=V2)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+"#;
+const TWO_CPT_TIME_DATA: &str = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT
+1,0,1,1,0,1000,0,1
+1,6,0,0,9.0,0,0,1
+1,24,0,0,5.0,0,0,1
+1,48,0,0,3.5,0,0,1
+";
+
+/// The pembrolizumab shape: `TIME` inside an individual parameter of a two-compartment closed
+/// form (no covariate column at all). Control: the same model with the `TIME` term removed
+/// takes the superposition path.
+#[test]
+fn a_two_compartment_time_in_parameter_plans_without_fallback() {
+    let g = exact_and_matches_fd("two_cpt TIME in CL", TWO_CPT_TIME, TWO_CPT_TIME_DATA);
+    let no_time = TWO_CPT_TIME.replace("exp(IMAX*TIME^HILL/(TI50^HILL+TIME^HILL)) * ", "");
+    assert_ne!(no_time, TWO_CPT_TIME);
+    let g0 = exact_and_matches_fd("two_cpt no TIME", &no_time, TWO_CPT_TIME_DATA);
+    for g in [g, g0] {
+        assert!(g.is_finite() && g < GAP_TOL, "{g:e}");
+    }
+}
+
+/// The realised-route labels name the plan fallback: with every plan failing the fit's inner
+/// and outer labels say finite differences, never `analytic`; with the plans working they
+/// say `analytic`. The split form is pinned on `plan_fallback_label` directly.
+#[test]
+fn the_route_labels_name_a_plan_fallback() {
+    let (m, p) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
+    let (exact, forced) = pair(&m, &p, &opts(EstimationMethod::FoceI));
+    assert_eq!(exact.gradient_method_inner, "analytic");
+    assert_eq!(exact.gradient_method_outer, "analytic");
+    for l in [&forced.gradient_method_inner, &forced.gradient_method_outer] {
+        assert_eq!(l, "finite differences (compiled plan failed)");
+    }
+    use crate::api::postfit::plan_fallback_label as lab;
+    assert_eq!(lab("analytic", 0, 4), "analytic");
+    assert_eq!(lab("analytic", 1, 4), "analytic ×3, FD ×1");
+    assert_eq!(
+        lab("analytic", 4, 4),
+        "finite differences (compiled plan failed)"
+    );
+    assert_eq!(lab("N/A", 4, 4), "N/A");
+}
+
+const ONE_CPT_SS_INFUSION: &str = r#"[data]
+  path=data.csv
+[parameters]
+  theta TVCL(3.0, 0.1, 150.0)
+  theta TVV(50.0, 1.0, 2000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V ~ 0.2
+  sigma PROP_ERR ~ 0.2
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+"#;
+
+/// An overlapping steady-state infusion (`dur = AMT/RATE = 10 > II = 6`) sums its still-running
+/// pulses by the phase's value; a recording guards that count instead of reading the value
+/// (`mode_infusion_ss`). Control: the non-overlapping twin (`II = 12`).
+#[test]
+fn an_overlapping_steady_state_infusion_plans_without_fallback() {
+    let data = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,II,SS
+1,0,1,1,0,1000,100,1,6,1
+1,2,0,0,9.0,0,0,1,0,0
+1,5,0,0,12.0,0,0,1,0,0
+1,8,0,0,8.0,0,0,1,0,0
+";
+    let plain = data.replace("100,1,6,1", "100,1,12,1");
+    assert_ne!(plain, data);
+    let gaps = [
+        exact_and_matches_fd("ss overlap", ONE_CPT_SS_INFUSION, data),
+        exact_and_matches_fd("ss no overlap", ONE_CPT_SS_INFUSION, &plain),
+    ];
+    for g in gaps {
+        assert!(g.is_finite() && g < GAP_TOL, "{g:e}");
     }
 }

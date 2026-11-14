@@ -11645,7 +11645,7 @@ impl OuterFdDeclineLog {
 /// The outer twin of `inner_optimizer::fd_fallback_warning` (#1154). Since #466 the
 /// salvage is per subject, and was indistinguishable from a fit that is simply slow: no
 /// `W_*` code, no count, and a `gradient_method_outer` that keeps reporting
-/// `analytic (Dual2)` because it reads a **model**-level predicate. Any non-empty log is
+/// `analytic` because it reads a **model**-level predicate. Any non-empty log is
 /// therefore already a mismatch with that label: the analytic branch had to have been
 /// selected for a decline to be recordable at all.
 ///

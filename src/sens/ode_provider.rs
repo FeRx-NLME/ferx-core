@@ -2258,13 +2258,20 @@ pub(crate) fn ss_solve_g<T: crate::sens::num::PkNum>(
     }
     let mut u = vec![T::from_f64(0.0); n];
     let mut prev = vec![0.0_f64; n];
+    let mut prev_t: Vec<T> = Vec::new();
     let mut cur = vec![0.0_f64; n];
     let mut cycles_run = 0usize;
     let mut converged = false;
     for c in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
         u = cycle(&u)?;
         cycles_run = c + 1;
-        if crate::sens::propagate::ss_dual_cycle_should_stop(c, &u, &mut cur, &mut prev) {
+        if crate::sens::propagate::ss_dual_cycle_should_stop(
+            c,
+            &u,
+            &mut cur,
+            &mut prev,
+            &mut prev_t,
+        ) {
             converged = true;
             break;
         }
@@ -2451,6 +2458,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
     );
     let mut u = vec![T::from_f64(0.0); n];
     let mut prev = vec![0.0_f64; n];
+    let mut prev_t: Vec<T> = Vec::new();
     let mut cur = vec![0.0_f64; n];
     let mut cycles_run = 0usize;
     for m in 0..n_pulses {
@@ -2462,7 +2470,13 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
             u.copy_from_slice(&last.u);
         }
         cycles_run = m + 1;
-        if crate::sens::propagate::ss_dual_cycle_should_stop(m, &u, &mut cur, &mut prev) {
+        if crate::sens::propagate::ss_dual_cycle_should_stop(
+            m,
+            &u,
+            &mut cur,
+            &mut prev,
+            &mut prev_t,
+        ) {
             break;
         }
     }

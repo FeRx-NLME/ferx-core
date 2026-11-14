@@ -3905,6 +3905,17 @@ fn fit_inner(
     }
     // Subjects whose compiled plan failed and took finite differences instead (#2786).
     if let Some((msg, entry)) = crate::api::postfit::plan_fd_fallback_warning(model, population) {
+        // The realised route, not the model's: those subjects ran finite differences.
+        if let Some((k, _)) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failures(
+            model,
+            &population.subjects,
+        ) {
+            let n = population.subjects.len();
+            fit_result.gradient_method_inner =
+                crate::api::postfit::plan_fallback_label(&fit_result.gradient_method_inner, k, n);
+            fit_result.gradient_method_outer =
+                crate::api::postfit::plan_fallback_label(&fit_result.gradient_method_outer, k, n);
+        }
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }

@@ -6067,7 +6067,7 @@ mod weighted_dense_residual_inner {
             } else {
                 assert_eq!(label, GradientMethodKind::Analytic, "{cell}");
                 assert!(
-                    banner.starts_with("analytic (Dual2)  [requested: auto]"),
+                    banner.starts_with("analytic  [requested: auto]"),
                     "{cell}: {banner}"
                 );
                 assert!(

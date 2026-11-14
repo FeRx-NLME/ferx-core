@@ -514,7 +514,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
-        gradient_method_inner: "analytic (Dual2)".into(),
+        gradient_method_inner: "analytic".into(),
         gradient_method_outer: "finite differences".into(),
         uses_ode_solver: false,
         ode_linear_exact: false,

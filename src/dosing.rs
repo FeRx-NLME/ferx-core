@@ -366,6 +366,12 @@ pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
         .all(|(&a, &b)| (a - b).abs() <= tol * a.abs() + atol)
 }
 
+/// The test-only full-budget switch, for the recording type's convergence test.
+#[cfg(test)]
+pub(crate) fn force_full_ss_equilibration() -> bool {
+    FORCE_FULL_SS_EQUILIBRATION.with(|c| c.get())
+}
+
 /// Rolling prev-state tracker for the f64 SS-equilibration early stop. Owns the previous
 /// cycle's state so the f64 predictor and the event-driven f64 loop share one scaffold instead
 /// of each re-implementing the `cycle > 0` + `copy_from_slice` dance — a later tweak missed in

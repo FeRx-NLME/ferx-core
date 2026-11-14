@@ -118,10 +118,10 @@ What follows is the detail behind that one-line answer:
 The startup banner reports the route **actually resolved** across the population — not just the requested setting — so a silent analytic→FD fallback is visible:
 
 ```
-  gradient: analytic (Dual2)  [requested: auto]
+  gradient: analytic  [requested: auto]
 ```
 
-When the population splits across routes, the banner shows per-route subject counts, e.g. `analytic (Dual2) ×118, FD ×3`.
+When the population splits across routes, the banner shows per-route subject counts, e.g. `analytic ×118, FD ×3`.
 
 This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and for `imp`, which reuses the EBE Hessian built via the same route. SAEM is sampling-based and reports its E-step kernel on a `sampler:` line instead — see [SAEM](saem.qmd).
 
@@ -129,7 +129,7 @@ This `gradient:` line appears for gradient-driven estimators (FOCE/FOCEI/GN) and
 
 The `gradient:` banner and the `gradient_method_inner` field describe the **inner** (per-subject EBE) loop. The **outer** (population parameter) loop has its own scope, and its reported method — `gradient_method_outer` in the fit output — is deliberately a **model-level** statement: it answers "may this model use the exact analytic outer gradient", not "did every subject get one".
 
-The two can disagree. A subject no recorder serves — an out-of-scope ODE dose event, or any subject whose inner Hessian is not positive-definite at the trial point — is salvaged individually, while the model as a whole stays in scope and keeps reporting `analytic (Dual2)`. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
+The two can disagree. A subject no recorder serves — an out-of-scope ODE dose event, or any subject whose inner Hessian is not positive-definite at the trial point — is salvaged individually, while the model as a whole stays in scope and keeps reporting `analytic`. Since #1154 that mismatch is stated rather than left to be inferred from the run time:
 
 ```
 1 of 32 subjects could not be given the exact analytic outer gradient during this fit
@@ -191,7 +191,7 @@ That gate looks one degree too strict, because $-H^{-1}M$ needs $H$ only **nonsi
 
 This was measured rather than assumed ([#1513](https://github.com/FeRx-NLME/ferx-core/issues/1513)). Substituting a full-pivot LU makes a 100-subject transit-absorption fit 12% faster and eliminates all 16 of its declines, but over those 16 events the resulting gradient disagrees with the reconverged finite-difference one by a median relative $0.378$ — against a $1.4 \times 10^{-3}$ noise floor measured on the *same fit's* positive-definite subjects — and points in a near-orthogonal direction (cosine $0.032$) at the worst of them. The $H$ matrices are well conditioned throughout, so that is the broken precondition, not a numerical artifact. The fit still lands at the same optimum, which is exactly why an OFV comparison cannot settle a question like this one.
 
-The practical reading for a user: a `gradient:` banner of `analytic (Dual2)` together with a per-subject fallback warning means some subjects' inner loops are finishing away from their optimum, not that ferx is being needlessly cautious. Those subjects get the held-EBE gradient (the reconverged one under IOV) at those points.
+The practical reading for a user: a `gradient:` banner of `analytic` together with a per-subject fallback warning means some subjects' inner loops are finishing away from their optimum, not that ferx is being needlessly cautious. Those subjects get the held-EBE gradient (the reconverged one under IOV) at those points.
 
 #### Why an inner loop finishes away from its optimum {#inner-loop-noise-floor}
 

@@ -6525,7 +6525,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
 ///
 /// A per-subject decline of the analytic outer gradient is salvaged onto
 /// `subject_reconverged_fd_gradient`: correct, several times slower on that subject, and
-/// invisible — no count, and `gradient_method_outer` keeps reporting `analytic (Dual2)`
+/// invisible — no count, and `gradient_method_outer` keeps reporting `analytic`
 /// because it reads a **model**-level predicate.
 ///
 /// These pin the *recording*, which is what makes the report honest. An earlier revision

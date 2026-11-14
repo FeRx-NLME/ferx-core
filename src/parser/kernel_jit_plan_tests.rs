@@ -905,7 +905,8 @@ fn an_interpolated_sample_reverses_like_the_forward_tangent() {
 
 /// `exp(−(a0/a2)·a3)` over four inputs at the first-order layout over 3 η, `a3` carrying no
 /// tangent and `a0`, `a2` none along η₂: output lane 3 is `exp(v)·(−1·t)` with `t` a structural
-/// zero — the folded tiers write the constant `+0` where the dual operations give `−0`.
+/// zero — the folded tiers write the constant `+0` where the unfolded program gives `−0` (or, past `exp`'s
+/// overflow, `NaN`).
 fn zero_tangent_chunk(live: bool) -> (ChunkProgram, Layout) {
     let code = vec![
         Flat::LoadState { d: 0, i: 0 },
@@ -947,7 +948,6 @@ fn zero_tangent_chunk(live: bool) -> (ChunkProgram, Layout) {
         spec,
         n_in: 4,
         compiled: Mutex::new(HashMap::new()),
-        lane: Default::default(),
     };
     (cp, layout)
 }
@@ -968,15 +968,21 @@ fn zero_tangent_inputs(v: [f64; 4], l: usize) -> Vec<f64> {
     base
 }
 
-/// Every tier of the forward gives the same bits, signed zeros included, across the signs the
-/// zero lane can take. Kills: the folded tier writing `+0` where the dual operations carry `-0`
-/// (`canonical_zero` removed from either side).
+/// Every tier of the forward gives the same bits, `NaN` and signed zeros included, across the
+/// signs the zero lane can take and where `exp` overflows: `v = [-800, …, 1, 1]` makes the
+/// output `exp(800)·(−1·t)` with `t` a structural zero — `inf · 0`, a `NaN`, wherever the
+/// zero is computed, and a constant `0` where the folding knows it. All tiers (the interpreter,
+/// the quick and the optimizing native) run the one folded function, so none can differ from
+/// another. Kills: a tier that runs the program unfolded (the cold tier used to), or one that
+/// patches its outputs (a `+0` canonicalisation on one side only).
 #[test]
 fn the_forward_tiers_agree_bit_for_bit_on_a_structurally_zero_tangent() {
     for v in [
         [1.3, 0.4, 2.0, 0.9],
         [-1.3, 0.4, -2.0, -0.9],
         [0.0, 1.0, 3.0, 2.0],
+        // exp(800) = inf.
+        [-800.0, 0.4, 1.0, 1.0],
     ]
     .into_iter()
     .flat_map(|v| [(v, false), (v, true)])
@@ -998,32 +1004,37 @@ fn the_forward_tiers_agree_bit_for_bit_on_a_structurally_zero_tangent() {
                 0,
             )
         };
-        t.promote(true, "none");
-        assert_ne!(
-            t.native.load(std::sync::atomic::Ordering::Acquire),
-            0,
-            "compiled"
-        );
-        let mut native = zero_tangent_inputs(v, l);
-        unsafe {
-            t.call(
-                native.as_mut_ptr(),
-                std::ptr::null_mut(),
-                idx.as_ptr(),
-                lits.as_ptr(),
-            )
-        };
-        for c in 0..l {
+        for (quick, opt) in [(true, "none"), (true, "speed"), (false, "speed")] {
+            t.promote(quick, opt);
+            let mut native = zero_tangent_inputs(v, l);
+            unsafe {
+                t.call(
+                    native.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                    idx.as_ptr(),
+                    lits.as_ptr(),
+                )
+            };
+            for c in 0..l {
+                assert_eq!(
+                    interp[4 * l + c].to_bits(),
+                    native[4 * l + c].to_bits(),
+                    "{v:?} live={live} quick={quick} {opt} lane {c}: interpreter {:e}, native {:e}",
+                    interp[4 * l + c],
+                    native[4 * l + c]
+                );
+            }
+        }
+        // The overflowing value is really there (so the case reaches the `inf · 0` it is for):
+        // the live zero lane is a `NaN`, the folded one the constant `0`.
+        if v[0] == -800.0 {
+            assert!(interp[4 * l].is_infinite(), "exp(800) is inf");
             assert_eq!(
-                interp[4 * l + c].to_bits(),
-                native[4 * l + c].to_bits(),
-                "{v:?} live={live} lane {c}: interpreter {:e}, native {:e}",
-                interp[4 * l + c],
-                native[4 * l + c]
+                interp[4 * l + 3].is_nan(),
+                live,
+                "live={live}: the lane the folding knows to be zero is a constant, not inf·0"
             );
         }
-        // The lane the fold knows is zero is the one the two used to disagree on.
-        assert_eq!(native[4 * l + 3].to_bits(), 0.0f64.to_bits(), "{v:?}: a +0");
     }
 }
 
@@ -1121,7 +1132,6 @@ fn simd_chunk() -> (ChunkProgram, Layout) {
         spec: vec![(DirMask::ALL, u16::MAX); 3],
         n_in: 3,
         compiled: Mutex::new(HashMap::new()),
-        lane: Default::default(),
     };
     (cp, layout)
 }
@@ -1139,8 +1149,7 @@ fn simd_inputs(l: usize) -> Vec<f64> {
 
 /// The two-lane vector code gives the scalar code's bits, forward and multi-seed reverse,
 /// and it is the vector code that ran: the chunk packs. Kills: a pack whose lanes are swapped
-/// or read from the wrong operand, a vector store missing the forward's `+0` canonicalisation,
-/// a reverse pack scheduled across the adjoint store it reads back.
+/// or read from the wrong operand, a reverse pack scheduled across the adjoint store it reads back.
 #[test]
 fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     let (cp, layout) = simd_chunk();
@@ -1664,5 +1673,66 @@ fn a_kept_forward_is_adopted_only_by_the_plan_that_made_it() {
     assert!(
         a.adopt(owner, a.layout, &[], &eta).is_none(),
         "and taken once"
+    );
+}
+
+/// A dropped model leaves nothing behind in the process-wide caches (#2786 review): the
+/// templates it planned go, the chunk programs only its plans ran are freed (the chunk cache
+/// holds them weakly), and a program's native code is freed with its last user. Dies when
+/// `drop_model` leaves its templates in `templates()`, when the chunk cache owns its programs,
+/// or when a compiled kernel's module is never freed.
+#[test]
+fn the_caches_shrink_when_a_model_drops() {
+    let subject = crate::types::Subject::default();
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let id = m.plan_id.get();
+    // A structure no other test records, so the counts below are this model's alone.
+    let family = SubjectKey::new(&m, &subject, 1, 2)
+        .with_variant(Desc::of_value(&0xcac4_e5u64))
+        .family();
+    let rec = recorded(&family, || {
+        let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
+        let mut x = et[0];
+        for _ in 0..23 {
+            x = x * et[1] + et[0];
+        }
+        Some(vec![x.reg()])
+    })
+    .expect("records");
+    let plan = rec.plan(l2(), 2, 0).expect("plans");
+    assert_eq!(templates_of(id), 1, "the model's template is cached");
+    let prog = plan
+        .calls
+        .iter()
+        .find_map(|c| match c {
+            Call::Chunk { prog, .. } => Some(prog.clone()),
+            _ => None,
+        })
+        .expect("a chunk call");
+    let mine = Arc::downgrade(&prog);
+    let held_by_cache = |w: &std::sync::Weak<ChunkProgram>| {
+        chunk_cache()
+            .lock()
+            .unwrap()
+            .values()
+            .flatten()
+            .any(|o| o.ptr_eq(w))
+    };
+    assert!(held_by_cache(&mine), "the program is shared by structure");
+    // Compile it, so there is native code to free.
+    let k = prog.get(l2(), false).expect("a kernel");
+    k.promote(true, "none");
+    assert_ne!(k.native.load(std::sync::atomic::Ordering::Acquire), 0);
+    drop((k, prog, plan));
+    let freed0 = KERNELS_FREED.with(std::cell::Cell::get);
+    // The template still holds the plan, so the program lives until the model goes.
+    assert!(mine.upgrade().is_some(), "the template's plan runs it");
+    drop(m);
+    assert_eq!(templates_of(id), 0, "the dropped model's templates go");
+    assert!(mine.upgrade().is_none(), "the program is freed");
+    assert!(!held_by_cache(&mine), "no dead entry stays in the cache");
+    assert!(
+        KERNELS_FREED.with(std::cell::Cell::get) > freed0,
+        "its native code is freed with it"
     );
 }

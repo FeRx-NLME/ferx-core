@@ -3,7 +3,7 @@
 //! A subject whose data shape falls out of the analytic outer gradient's scope is
 //! salvaged onto a per-subject gradient (held-EBE since #1529; reconverged FD under IOV).
 //! Before #1154 that was invisible: no warning code, no count, and
-//! `FitResult::gradient_method_outer` keeps reporting `analytic (Dual2)` because it reads a
+//! `FitResult::gradient_method_outer` keeps reporting `analytic` because it reads a
 //! **model**-level predicate. The Tier-1 tests in
 //! `estimation::outer_optimizer::tests::outer_fd_fallback` pin the recording; this pins the
 //! wiring — that the warning reaches `FitResult::warnings`, that it does so while the
@@ -154,7 +154,7 @@ fn in_scope_population_emits_no_outer_fd_warning() {
     )
     .expect("fit succeeds");
     assert_eq!(
-        result.gradient_method_outer, "analytic (Dual2)",
+        result.gradient_method_outer, "analytic",
         "fixture precondition: the model must report the analytic outer route"
     );
     assert!(
@@ -165,7 +165,7 @@ fn in_scope_population_emits_no_outer_fd_warning() {
 }
 
 /// One subject whose dose is a steady-state infusion falls out of the adjoint's scope
-/// under the model's lag time. The fit still reports the model-level `analytic (Dual2)`
+/// under the model's lag time. The fit still reports the model-level `analytic`
 /// route — correctly, for the model — and the warning is what reconciles that with what
 /// the subject actually ran.
 #[test]
@@ -211,7 +211,7 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
     );
     // The whole point: the report and the run disagree, and only the warning says so.
     assert_eq!(
-        result.gradient_method_outer, "analytic (Dual2)",
+        result.gradient_method_outer, "analytic",
         "the reported outer method is model-level and must still read analytic — if it \
          ever reports the per-subject route instead, this warning's framing needs updating"
     );
@@ -224,7 +224,7 @@ fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
 /// would decline.
 ///
 /// When this test was written `build_info::gradient_method_outer` did not model that
-/// downgrade and still reported `analytic (Dual2)` here, so a gate written against it
+/// downgrade and still reported `analytic` here, so a gate written against it
 /// would have emitted "1 of 2 ... could not be given the exact analytic outer gradient".
 /// Since #1540 the report resolves through `resolve_outer_optimizer` too and reads `N/A`,
 /// which is asserted below alongside `FitResult::optimizer`. The warning's silence still
@@ -338,7 +338,7 @@ fn a_derivative_free_fit_does_not_warn_about_the_preflight_gradient() {
 /// #2906. A mixture on an NLopt **gradient** optimizer with one subject the adjoint
 /// declines. That subject's (subject × class) terms used to send the whole mixture gradient
 /// to a central difference of the full objective, with no warning, while
-/// `gradient_method_outer` kept reading `analytic (Dual2)`. The terms are now salvaged on
+/// `gradient_method_outer` kept reading `analytic`. The terms are now salvaged on
 /// their own (reconverged, so the structural sentence), and the decline reaches the #1154
 /// warning like a single-population one. Lag 0.25, as in [`WARFARIN_F`], so the start
 /// objective is not the degenerate one a 0.5 lag gives on this data.
@@ -360,7 +360,7 @@ fn a_gradient_driven_mixture_fit_warns_about_its_declined_subject() {
     )
     .expect("mixture fit succeeds");
     assert_eq!(result.optimizer, "nlopt_lbfgs");
-    assert_eq!(result.gradient_method_outer, "analytic (Dual2)");
+    assert_eq!(result.gradient_method_outer, "analytic");
     let w = outer_fd_warning(&result.warnings).unwrap_or_else(|| {
         panic!(
             "a declined mixture subject must warn; got {:?}",

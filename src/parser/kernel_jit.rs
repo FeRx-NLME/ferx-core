@@ -31,8 +31,6 @@
 mod fallback_tests;
 #[path = "kernel_jit_fixed.rs"]
 mod fixed;
-#[path = "kernel_jit_lanes.rs"]
-mod lanes;
 #[path = "kernel_jit_loop.rs"]
 mod ode_loop;
 #[cfg(test)]
@@ -2405,6 +2403,46 @@ pub(crate) fn plan_failures(
     Some((k, why.clone()))
 }
 
+/// Forget the cached programs and templates a dropped scope or model owned: the templates it
+/// planned, and the chunk programs nothing runs any more (their native code is freed with
+/// them).
+fn prune_caches(gone: impl Fn(u64, u64) -> bool) {
+    {
+        let mut t = templates()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        t.retain(|_, v| {
+            v.retain(|t| t.owner.is_none_or(|(sc, m)| !gone(sc, m)));
+            !v.is_empty()
+        });
+    }
+    chunk_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|_, v| {
+            v.retain(|w| w.strong_count() > 0);
+            !v.is_empty()
+        });
+}
+
+/// How many templates the model `id` owns (test seam).
+#[cfg(test)]
+pub(crate) fn templates_of(id: u64) -> usize {
+    templates()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .values()
+        .flatten()
+        .filter(|t| t.owner.is_some_and(|(_, m)| m == id))
+        .count()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Native kernels this thread has freed ([`ChunkKernel`]'s drop).
+    pub(crate) static KERNELS_FREED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Forget the plans of every subject and model in scope `scope`: under the subjects' lock, with
 /// the generation bumped there, so a thread that read the new generation sees them gone.
 fn drop_scope(scope: u64) {
@@ -2422,6 +2460,12 @@ fn drop_scope(scope: u64) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|&(sc, _), _| sc != scope);
+    // Scope `0` holds the unregistered plans, which leave with their model ([`drop_model`]):
+    // what a template planned there serves the next subject across a reset.
+    if scope != 0 {
+        lock_families().retain(|k, _| k.scope != scope);
+        prune_caches(|sc, _| sc == scope);
+    }
 }
 
 /// Forget the plans and bad marks of the model `id`, as its [`crate::types::PlanId`] drops.
@@ -2442,6 +2486,7 @@ pub(crate) fn drop_model(id: u64) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .retain(|&(_, m), _| m != id);
+    prune_caches(|_, m| m == id);
 }
 
 /// Forget every unregistered plan (a test's empty cache); a registered fit's are its own.
@@ -2660,18 +2705,31 @@ pub(crate) type ChunkRevFn =
 pub(crate) struct ChunkKernel {
     /// The entry point: a [`ChunkFn`] or a [`ChunkRevFn`].
     f: *const u8,
-    _module: cranelift_jit::JITModule,
+    module: Option<cranelift_jit::JITModule>,
+}
+
+impl Drop for ChunkKernel {
+    fn drop(&mut self) {
+        if let Some(m) = self.module.take() {
+            // SAFETY: `f` points into this module's memory. A kernel is owned by its
+            // [`Tiered`], which every caller of `f` holds an `Arc` of while it runs, so
+            // nothing can call it once this drops.
+            unsafe { m.free_memory() };
+            #[cfg(test)]
+            KERNELS_FREED.with(|c| c.set(c.get() + 1));
+        }
+    }
 }
 
 // SAFETY: immutable once finalized.
 unsafe impl Send for ChunkKernel {}
 unsafe impl Sync for ChunkKernel {}
 
-/// A chunk's kernel over one (layout, direction): its program run a dual operation at a time
-/// ([`lanes`]), then native code compiled from the lowered IR — the quick tier (single-pass
-/// register allocation), then the optimizing one. The tiers' lanes agree up to the sign of a
-/// zero (the folding's exactness); only the cost moves. A kernel the fit calls a few dozen
-/// times is never compiled, one it calls millions of times is optimized.
+/// A chunk's kernel over one (layout, direction): its folded scalar function interpreted
+/// ([`interpret_func`]), then native code compiled from it — the quick tier (single-pass
+/// register allocation), then the optimizing one. Every tier runs the same function, so the
+/// tiers agree bit for bit (`NaN` and the sign of a zero included); only the cost moves. A
+/// kernel the fit calls a few dozen times is never compiled, one it calls millions of times is optimized.
 pub(crate) struct Tiered {
     f: Func,
     layout: Layout,
@@ -2686,10 +2744,6 @@ pub(crate) struct Tiered {
     /// A reverse kernel's leading forward instructions ([`ir::reverse`]): the part every
     /// seed of a multi-seed call shares.
     prefix: usize,
-    /// The chunk's register program and the layout's lane structure: until it is compiled,
-    /// the kernel runs one dual operation at a time over them ([`lanes`]). `None` for a
-    /// tangent layout ([`Layout::tan`]), which is compiled on construction.
-    lane: Option<(Arc<lanes::LaneProg>, lanes::AtLayout)>,
     /// The modules every native entry point lives in (an older one may still be running).
     modules: Mutex<Vec<ChunkKernel>>,
     /// Itself, for the compile queue ([`compile_queue`]).
@@ -2733,7 +2787,7 @@ fn compile_guarded(queued: &std::sync::atomic::AtomicBool, compile: impl FnOnce(
 ///
 /// | tier | compile | run |
 /// |---|---|---|
-/// | dual operations ([`lanes`]) | 0 | ~2× the fixed-width duals |
+/// | interpreter ([`interpret_func`]) | 0 | one scalar instruction at a time |
 /// | single-pass regalloc, no optimizer | 1.1 µs | 0.5–0.8 ns (large), 0.15 (small) |
 /// | single-pass regalloc, optimizer | 2.2 µs | 0.3–0.4 ns (large), 0.15 (small) |
 /// | backtracking regalloc, optimizer | 3 µs at ≤ 2k instructions, 80 µs at 40k | 0.3 (large), 0.09 (small) |
@@ -2750,26 +2804,13 @@ const TIER3_CALLS: usize = 1 << 16;
 /// instruction up to 2k, 25 µs at 11k, 80 µs at 40k).
 const TIER3_MAX_INSTS: usize = 4096;
 
-thread_local! {
-    /// The dual-granularity tier's registers and their adjoints.
-    static LANE_REGS: RefCell<(Vec<f64>, Vec<f64>, Vec<f64>)> = const { RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
-}
-
 impl Tiered {
-    fn new(
-        f: Func,
-        layout: Layout,
-        n_in: usize,
-        rev: bool,
-        prefix: usize,
-        lane: Option<(Arc<lanes::LaneProg>, lanes::AtLayout)>,
-    ) -> Arc<Self> {
+    fn new(f: Func, layout: Layout, n_in: usize, rev: bool, prefix: usize) -> Arc<Self> {
         Arc::new_cyclic(|me| Tiered {
             me: me.clone(),
             want: std::sync::atomic::AtomicU8::new(0),
             queued: std::sync::atomic::AtomicBool::new(false),
             prefix,
-            lane,
             f,
             layout,
             n_in,
@@ -2912,8 +2953,9 @@ impl Tiered {
             .fetch_add(t.elapsed().as_micros() as usize, Relaxed);
     }
 
-    /// The chunk's program run a dual operation at a time ([`lanes`]): the cold tier. A
-    /// reverse's seeds share its forward.
+    /// The chunk's scalar function run in Rust ([`interpret_func`]): the cold tier. A reverse's
+    /// seeds share its forward. It is the function the compiled tiers lower, so every tier of
+    /// a kernel gives the same bits.
     unsafe fn interpret(
         &self,
         base: *mut f64,
@@ -2923,37 +2965,19 @@ impl Tiered {
         seeds: usize,
         stride: usize,
     ) {
-        let Some((prog, at)) = self.lane.as_ref() else {
-            return interpret_func(
-                &self.f,
-                self.layout.lanes(),
-                self.n_in,
-                self.rev,
-                self.prefix,
-                base,
-                adj,
-                idx,
-                lits,
-                seeds,
-                stride,
-            );
-        };
-        let l = at.sh.lanes;
-        let need = prog.n_regs() * l;
-        LANE_REGS.with(|v| {
-            let mut v = v.borrow_mut();
-            let (regs, ar, scratch) = &mut *v;
-            if regs.len() < need {
-                regs.resize(need, 0.0);
-                ar.resize(need, 0.0);
-            }
-            if scratch.len() < 10 * l {
-                scratch.resize(10 * l, 0.0);
-            }
-            // Only a forward has a lane program.
-            debug_assert!(!self.rev);
-            prog.forward(at, self.layout.wide, regs, base, idx, lits, true, scratch);
-        })
+        interpret_func(
+            &self.f,
+            self.layout.lanes(),
+            self.n_in,
+            self.rev,
+            self.prefix,
+            base,
+            adj,
+            idx,
+            lits,
+            seeds,
+            stride,
+        );
     }
 }
 
@@ -2964,9 +2988,6 @@ pub(crate) struct ChunkProgram {
     spec: Vec<(DirMask, u16)>,
     n_in: usize,
     compiled: Mutex<HashMap<(Layout, bool), Option<Arc<Tiered>>>>,
-    /// The program for the dual-granularity tier ([`lanes`]), built on first use: per gate
-    /// order ([`resolve_gates`]) when the code has a gate, else one at index 0.
-    lane: [OnceLock<Option<Arc<lanes::LaneProg>>>; GATE_ORDERS],
 }
 
 /// The gate orders a variant can have: a second-order payload, a tangent block and a reverse.
@@ -3023,9 +3044,9 @@ impl ChunkProgram {
         // The steps a gate leaves to a higher order are not this variant's.
         let gate = (layout.order() + rev as usize).min(GATE_ORDERS - 1);
         let gated = resolve_gates(&self.code, self.n_regs, gate);
-        let (code, slot) = match &gated {
-            Some(c) => (c.as_slice(), gate),
-            None => (self.code.as_slice(), 0),
+        let code = match &gated {
+            Some(c) => c.as_slice(),
+            None => self.code.as_slice(),
         };
         // A tangent layout's kernel is the base layout's, differentiated forward along its
         // directions (`ir::tangent_packed`).
@@ -3048,21 +3069,7 @@ impl ChunkProgram {
         };
         let f = if rev { ir::reverse(&f) } else { f };
         let (f, prefix) = ir::dedup_calls(&f, prefix);
-        // A forward starts on the lane program (a recording has no `if` arms, so every chunk
-        // has one); a tangent layout and a reverse pass on the scalar function
-        // ([`interpret_func`]), the one definition the compiled tiers lower — so every tier
-        // of a kernel gives the same bits.
-        let k = if layout.tan > 0 || rev {
-            Some(Tiered::new(f, layout, self.n_in, rev, prefix, None))
-        } else {
-            self.lane[slot]
-                .get_or_init(|| lanes::LaneProg::of(code, self.n_regs, self.n_in).map(Arc::new))
-                .clone()
-                .map(|p| {
-                    let at = lanes::AtLayout::of(&p, layout, &self.spec);
-                    Tiered::new(f, layout, self.n_in, rev, prefix, Some((p, at)))
-                })
-        };
+        let k = Some(Tiered::new(f, layout, self.n_in, rev, prefix));
         c.insert((layout, rev), k.clone());
         k
     }
@@ -3152,7 +3159,7 @@ unsafe fn interpret_func(
                         let (j, lane) = (off as usize / lanes, off as usize % lanes);
                         let y = r(v);
                         match arg {
-                            3 if !rev => *base.add(slot(n_in + j) + lane) = canonical_zero(y),
+                            3 if !rev => *base.add(slot(n_in + j) + lane) = y,
                             4 if rev => *adjp.add(slot(j) + lane) = y,
                             _ => {}
                         }
@@ -3171,16 +3178,6 @@ unsafe fn interpret_func(
             run(&mut x, 0, f.insts.len(), adj);
         }
     });
-}
-
-/// `x` with a `-0` made `+0` (`NaN` and every other value unchanged): what every tier stores as
-/// a forward's output. The tiers compute a lane the folding knows to be zero differently: the
-/// folded code writes the constant, the dual operations of the interpreter carry the sign
-/// IEEE gives `exp(v)*(-1*0)`. A zero's sign carries no meaning, so the output is where
-/// they are made to agree bit for bit.
-#[inline(always)]
-pub(super) fn canonical_zero(x: f64) -> f64 {
-    x + 0.0
 }
 
 /// Distinct `(layout, direction)` keys a plan resolves lock-free.
@@ -3270,7 +3267,9 @@ fn next_serial() -> u64 {
 }
 
 /// Distinct chunk programs, by structure (layout-independent): per hash, the programs with it.
-type ChunkCache = HashMap<u64, Vec<Arc<ChunkProgram>>, FxBuild>;
+/// The cache does not own them — a program lives as long as a plan (or a template's plan) runs
+/// it, and its native code ([`Tiered`]) is freed with it.
+type ChunkCache = HashMap<u64, Vec<std::sync::Weak<ChunkProgram>>, FxBuild>;
 
 /// Distinct chunk programs, by structure (layout-independent).
 fn chunk_cache() -> &'static Mutex<ChunkCache> {
@@ -3334,13 +3333,11 @@ fn build_chunk(
         h.finish()
     };
     let hit = cache.get(&key).and_then(|v| {
-        v.iter()
-            .find(|p| {
-                p.spec == spec
-                    && p.code.len() == code.len()
-                    && p.code.iter().zip(&code).all(|(a, b)| a.same(b))
-            })
-            .cloned()
+        v.iter().filter_map(std::sync::Weak::upgrade).find(|p| {
+            p.spec == spec
+                && p.code.len() == code.len()
+                && p.code.iter().zip(&code).all(|(a, b)| a.same(b))
+        })
     });
     let prog = match hit {
         Some(p) => {
@@ -3354,9 +3351,10 @@ fn build_chunk(
                 spec,
                 n_in: ins.len(),
                 compiled: Mutex::new(HashMap::new()),
-                lane: Default::default(),
             });
-            cache.entry(key).or_default().push(p.clone());
+            let bucket = cache.entry(key).or_default();
+            bucket.retain(|w| w.strong_count() > 0);
+            bucket.push(Arc::downgrade(&p));
             p
         }
     };
@@ -3561,6 +3559,7 @@ impl DirMask {
     }
 
     /// Whether any of the first `n` directions is live.
+    #[cfg(test)]
     pub(super) fn any_below(&self, n: usize) -> bool {
         let low = if n >= 63 {
             !Self::FREE_BIT
@@ -3691,6 +3690,9 @@ fn direction_masks(
 /// confirmed instruction by instruction ([`Recording::fits`]), so no hash collision serves a
 /// wrong plan.
 pub(crate) struct Template {
+    /// The `(scope, model)` whose recording planned it ([`drop_scope`], [`drop_model`] forget
+    /// it with them); `None` for a recording no family keeps.
+    owner: Option<(u64, u64)>,
     rec: Recording,
     layout: Layout,
     n_eta: usize,
@@ -3807,6 +3809,7 @@ impl Recording {
             return Some(self.serve(&t.plan, &t.src));
         }
         let family = self.tie.family.take();
+        let owner = family.as_ref().map(|f| (f.scope, f.model));
         let key = self.shape(layout, n_eta, n_theta);
         let lock = || {
             templates()
@@ -3855,6 +3858,7 @@ impl Recording {
         self.vals = Vec::new();
         let tie = std::mem::take(&mut self.tie);
         let t = Template {
+            owner,
             rec: self,
             layout,
             n_eta,
@@ -5063,15 +5067,7 @@ fn lower_chunk_opt(
                                 4 => slot_addr(&mut b, &mut offs, &mut addr, adjp, j, true),
                                 _ => return None,
                             };
-                            // A forward's output is canonical: a zero is `+0`.
-                            let stored = if arg == 3 {
-                                let z = b.ins().f64const(0.0);
-                                let z = b.ins().splat(types::F64X2, z);
-                                b.ins().fadd(x, z)
-                            } else {
-                                x
-                            };
-                            b.ins().store(fl, stored, a, (lane * 8) as i32);
+                            b.ins().store(fl, x, a, (lane * 8) as i32);
                             None
                         }
                         Inst::Add(..) => {
@@ -5227,14 +5223,7 @@ fn lower_chunk_opt(
                         }
                         _ => return None,
                     };
-                    // A forward's output is canonical: a zero is `+0` ([`canonical_zero`]).
-                    let stored = if arg == 3 && !rev {
-                        let z = b.ins().f64const(0.0);
-                        b.ins().fadd(r(x), z)
-                    } else {
-                        r(x)
-                    };
-                    b.ins().store(fl, stored, a, (lane * 8) as i32);
+                    b.ins().store(fl, r(x), a, (lane * 8) as i32);
                     r(x)
                 }
             };
@@ -5272,7 +5261,7 @@ fn lower_chunk_opt(
     // SAFETY: defined with `ChunkFn`'s signature.
     Some(ChunkKernel {
         f: p,
-        _module: module,
+        module: Some(module),
     })
 }
 

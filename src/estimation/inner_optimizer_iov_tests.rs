@@ -105,7 +105,7 @@ fn gradient_route_summary_reports_ode_iov_analytic_route() {
 
     let summary = gradient_route_summary(&model, &population, GradientMethod::Auto);
     assert!(
-        summary.starts_with("analytic (Dual2)"),
+        summary.starts_with("analytic"),
         "ODE IOV provider should be reported as analytic, got: {summary}"
     );
 }
@@ -1780,7 +1780,7 @@ fn dense_residual_ode_inner_grad_matches_fd() {
     };
     assert!(
         analytic_inner_grad_supported(&model, &subject),
-        "ODE block_sigma subject should take the analytic (Dual2) inner gradient (#627)"
+        "ODE block_sigma subject should take the analytic inner gradient (#627)"
     );
     let preds = crate::pk::compute_predictions_with_tv(
         &model,

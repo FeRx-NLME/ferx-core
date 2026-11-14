@@ -10,7 +10,7 @@
 //! like any other. So no arm warns any more — with or without SS, on every subject or on two of
 //! four — and none reports a failed plan (`W_PLAN_FD_FALLBACK`); this file pins that route.
 //!
-//! Before the fix the label read `analytic (Dual2)` (it is model-level and the recorder
+//! Before the fix the label read `analytic` (it is model-level and the recorder
 //! serves the PK rows), and the warning, when it fired, listed only causes that did not
 //! apply ("an SDE, a per-CMT `obs_scale`, …").
 //!
@@ -115,7 +115,7 @@ fn run(model: &str, n_events: usize, ss: bool) -> FitResult {
 fn a_drug_driven_hazard_beside_a_steady_state_dose_runs_the_exact_inner_gradient() {
     for n_events in [4, 2] {
         let r = run(MODEL, n_events, true);
-        assert_eq!(r.gradient_method_inner, "analytic (Dual2)");
+        assert_eq!(r.gradient_method_inner, "analytic");
         assert!(
             !r.warnings
                 .iter()
@@ -137,7 +137,7 @@ fn the_same_pk_rows_without_an_event_model_emit_no_fd_warning() {
         "fixture: the endpoint is removed"
     );
     let r = run(&pk_only, 0, true);
-    assert_eq!(r.gradient_method_inner, "analytic (Dual2)");
+    assert_eq!(r.gradient_method_inner, "analytic");
     assert!(
         !r.warnings.iter().any(|w| w.contains(WARNING)),
         "PK-only subjects run the analytic recorder: {:?}",
@@ -150,7 +150,7 @@ fn the_same_pk_rows_without_an_event_model_emit_no_fd_warning() {
 #[test]
 fn a_drug_driven_hazard_without_steady_state_runs_the_exact_inner_gradient() {
     let r = run(MODEL, 4, false);
-    assert_eq!(r.gradient_method_inner, "analytic (Dual2)");
+    assert_eq!(r.gradient_method_inner, "analytic");
     assert!(
         !r.warnings
             .iter()

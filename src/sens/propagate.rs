@@ -231,7 +231,7 @@ pub struct TwoCptEigen<T: PkNum> {
 /// + eigenvalue solve). `None` ⇒ callers skip propagation, matching the old f64
 /// propagators' early return.
 pub fn two_cpt_eigen_g<T: PkNum>(cl: T, v1: T, q: T, v2: T) -> Option<TwoCptEigen<T>> {
-    if cl_or_v_degenerate(cl.val(), v1.val())
+    if cl_or_v_degenerate_g(cl, v1)
         || v2.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
         || q.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
     {
@@ -1398,7 +1398,11 @@ pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
     u: &[T],
     cur: &mut Vec<f64>,
     prev: &mut Vec<f64>,
+    prev_t: &mut Vec<T>,
 ) -> bool {
+    if T::RECORDS_BRANCHES {
+        return ss_cycle_converged_recorded(cycle, u, prev_t);
+    }
     for (c, x) in cur.iter_mut().zip(u) {
         *c = x.val();
     }
@@ -1409,6 +1413,40 @@ pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
     }
     std::mem::swap(cur, prev);
     false
+}
+
+/// [`crate::dosing::ss_cycle_converged`] for a recording type (#2949): the same mixed
+/// `atol`/`rtol` test on the increment, spelled in `T` so each comparison is a guard the plan
+/// checks, not a value read that fails the recording. `prev` is the previous cycle's state as
+/// `T` (it moves with the point, so it cannot be a constant). A non-finite state never
+/// converges, as in the `f64` test.
+fn ss_cycle_converged_recorded<T: PkNum>(cycle: usize, u: &[T], prev: &mut Vec<T>) -> bool {
+    use crate::sens::num::BranchCmp as B;
+    #[cfg(test)]
+    if crate::dosing::force_full_ss_equilibration() {
+        prev.clear();
+        prev.extend_from_slice(u);
+        return false;
+    }
+    let converged = cycle > 0 && prev.len() == u.len() && {
+        let tol = T::from_f64(crate::dosing::SS_EQUILIBRATION_TOL);
+        u.iter().all(|x| x.br_abs_lt(f64::INFINITY)) && {
+            let mut max_mag = T::from_f64(0.0);
+            for x in u {
+                let a = x.abs();
+                max_mag = T::select_if(B::Gt, a, max_mag, a, max_mag);
+            }
+            let atol = tol * max_mag;
+            u.iter()
+                .zip(prev.iter())
+                .all(|(&a, &b)| (a - b).abs().br_cmp(B::Le, tol * a.abs() + atol))
+        }
+    };
+    if !converged {
+        prev.clear();
+        prev.extend_from_slice(u);
+    }
+    converged
 }
 
 /// The window duals of `DoseEvent::ss_cycle_doses` for a modeled or `F`-reshaped infusion
@@ -1551,6 +1589,7 @@ fn equilibrate_ss_g<T: PkNum>(
     // No `note_ss_nonconvergence_if_capped` here: the value walk (`event_driven`) owns the #867
     // cap warning, and the two walks co-run per subject, so warning here too would double-emit.
     let mut prev = vec![0.0_f64; n_states];
+    let mut prev_t: Vec<T> = Vec::new();
     let mut cur = vec![0.0_f64; n_states];
     let mut cycles_run = 0usize;
     for cycle in 0..crate::dosing::SS_EQUILIBRATION_CYCLES {
@@ -1570,7 +1609,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &synthetic_index,
         );
         cycles_run = cycle + 1;
-        if ss_dual_cycle_should_stop(cycle, &state, &mut cur, &mut prev) {
+        if ss_dual_cycle_should_stop(cycle, &state, &mut cur, &mut prev, &mut prev_t) {
             break;
         }
     }

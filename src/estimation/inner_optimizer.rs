@@ -148,7 +148,7 @@ pub(crate) fn gradient_route_summary(
     // a single uniform route reads cleanly as just its label.
     let mixed = [analytic, fd].iter().filter(|&&c| c > 0).count() > 1;
     let mut parts: Vec<String> = Vec::new();
-    for (count, label) in [(analytic, "analytic (Dual2)"), (fd, "FD")] {
+    for (count, label) in [(analytic, "analytic"), (fd, "FD")] {
         if count > 0 {
             parts.push(if mixed {
                 format!("{label} ×{count}")
