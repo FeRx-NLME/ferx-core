@@ -2326,6 +2326,10 @@ pub fn sdtab(result: &FitResult, population: &Population) -> Vec<(String, Vec<f6
         .subjects
         .iter()
         .any(|s| !s.npde.is_empty() || !s.npd.is_empty());
+    // A scored time-to-event record (#1889) needs the columns too: on a TTE-only fit
+    // no subject has a Gaussian vector to switch them on.
+    #[cfg(feature = "survival")]
+    let any_npde = any_npde || crate::types::any_tte_npde(&result.subjects);
 
     // Mixture (#977): emit MIXEST + PMIX_1..PMIX_K only for a mixture fit. `K` is
     // the posterior-vector length (identical across subjects for a given model).
@@ -2680,6 +2684,9 @@ fn append_tte_rows(
                     "MARTINGALE" => row.martingale,
                     "DEVIANCE" => row.deviance,
                     "PIT" => row.pit,
+                    // One score, both columns: NPDE = NPD for a single event (#1889).
+                    // `EPRED` / `EWRES` / `PWRES` stay blank.
+                    "NPDE" | "NPD" => row.npde,
                     // N_OBS counts Gaussian observations only (see append_discrete_rows).
                     _ => f64::NAN,
                 });
@@ -6182,6 +6189,120 @@ mod tests {
     }
 
     #[cfg(feature = "survival")]
+    fn scored_tte_row(time: f64, npde: f64) -> crate::types::TteObsDiagnostic {
+        crate::types::TteObsDiagnostic {
+            npde,
+            ..tte_row(time, 1.0, 0.5)
+        }
+    }
+
+    #[cfg(feature = "survival")]
+    fn sdtab_population(subjects: Vec<Subject>) -> Population {
+        Population {
+            subjects,
+            covariate_names: vec![],
+            dv_column: "DV".into(),
+            input_columns: vec![],
+            exclusions: None,
+            warnings: vec![],
+        }
+    }
+
+    /// T9 (#1889). A TTE-only fit whose records carry an npde has `NPDE` and `NPD`
+    /// columns, each TTE row holding the score in **both**; `EPRED`, `EWRES` and
+    /// `PWRES` are blank there. With no finite score the columns do not exist.
+    ///
+    /// Dies on: `any_npde` left Gaussian-only (no columns); the score written to
+    /// `NPDE` alone; `any_npde` forced on (the second half); an unscored record
+    /// (NaN) switching the columns on.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn sdtab_tte_npde_fills_npde_and_npd() {
+        let population = sdtab_population(vec![
+            sdtab_subject("1", 0, vec![]),
+            sdtab_subject("2", 0, vec![]),
+        ]);
+        let result_with = |scores: [f64; 2]| {
+            let mut s0 = sdtab_subject_result("1", 0);
+            s0.tte_rows.push(scored_tte_row(5.0, scores[0]));
+            let mut s1 = sdtab_subject_result("2", 0);
+            s1.tte_rows.push(scored_tte_row(7.0, scores[1]));
+            minimal_sdtab_result(vec![s0, s1])
+        };
+        let col = |cols: &[(String, Vec<f64>)], name: &str| {
+            cols.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        };
+
+        // One record scored, one not (NaN): the columns exist, the unscored cell is blank.
+        let cols = sdtab(&result_with([-1.1, f64::NAN]), &population);
+        for name in ["NPDE", "NPD"] {
+            let v = col(&cols, name).unwrap_or_else(|| panic!("{name} column"));
+            assert_eq!(v.len(), 2);
+            assert_eq!(v[0], -1.1, "{name}");
+            assert!(v[1].is_nan(), "{name} of the unscored record");
+        }
+        for name in ["EPRED", "EWRES", "PWRES"] {
+            let v = col(&cols, name).unwrap_or_else(|| panic!("{name} column"));
+            assert!(v.iter().all(|x| x.is_nan()), "{name} on TTE rows");
+        }
+        assert_eq!(col(&cols, "COXSNELL").unwrap(), [0.5, 0.5]);
+
+        // No finite score anywhere: the table a fit without npde writes.
+        let cols = sdtab(&result_with([f64::NAN, f64::NAN]), &population);
+        for name in ["NPDE", "NPD", "EPRED", "EWRES", "PWRES"] {
+            assert!(col(&cols, name).is_none(), "{name} with no score");
+        }
+        assert!(col(&cols, "COXSNELL").is_some());
+    }
+
+    /// T10 (#1889). A joint fit: Gaussian rows carry the Gaussian vectors, TTE rows
+    /// the record's own score, each for its own subject. The third subject has no TTE
+    /// record at all.
+    ///
+    /// Dies on: a TTE row reading the Gaussian vector; the score of another subject;
+    /// `NPD` on a Gaussian row reading `NPDE`.
+    #[cfg(feature = "survival")]
+    #[test]
+    fn sdtab_joint_npde_keeps_each_row_its_own_score() {
+        let population = sdtab_population(vec![
+            sdtab_subject("1", 1, vec![1]),
+            sdtab_subject("2", 1, vec![1]),
+            sdtab_subject("3", 1, vec![1]),
+        ]);
+        let subject = |id: &str, gaussian: [f64; 2], tte: Option<f64>| {
+            let mut s = sdtab_subject_result(id, 1);
+            s.npde = vec![gaussian[0]];
+            s.npd = vec![gaussian[1]];
+            s.epred = vec![4.0];
+            s.pwres = vec![0.5];
+            if let Some(score) = tte {
+                s.tte_rows.push(scored_tte_row(9.0, score));
+            }
+            s
+        };
+        let result = minimal_sdtab_result(vec![
+            subject("1", [0.3, 0.35], Some(-1.1)),
+            subject("2", [-0.3, -0.35], Some(1.1)),
+            subject("3", [0.7, 0.75], None),
+        ]);
+        let cols = sdtab(&result, &population);
+        let col = |name: &str| {
+            cols.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{name} column"))
+        };
+        // Three Gaussian rows, then the two TTE rows (subjects 1 and 2).
+        assert_eq!(col("ID"), [1.0, 2.0, 3.0, 1.0, 2.0]);
+        assert_eq!(col("NPDE"), [0.3, -0.3, 0.7, -1.1, 1.1]);
+        assert_eq!(col("NPD"), [0.35, -0.35, 0.75, -1.1, 1.1]);
+        let epred = col("EPRED");
+        assert_eq!(epred[..3], [4.0, 4.0, 4.0]);
+        assert!(epred[3..].iter().all(|x| x.is_nan()));
+        assert!(col("PWRES")[3..].iter().all(|x| x.is_nan()));
+    }
+
+    #[cfg(feature = "survival")]
     fn tte_row(time: f64, dv: f64, dh: f64) -> crate::types::TteObsDiagnostic {
         crate::types::TteObsDiagnostic {
             cmt: 4,
@@ -6191,6 +6312,7 @@ mod tests {
             martingale: dv - dh,
             deviance: -0.5,
             pit: (-dh).exp(),
+            npde: f64::NAN,
         }
     }
 

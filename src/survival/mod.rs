@@ -856,6 +856,7 @@ pub(crate) fn tte_record_diagnostics(
             martingale,
             deviance,
             pit,
+            npde: f64::NAN,
         });
     }
     rows

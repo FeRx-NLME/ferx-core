@@ -6871,6 +6871,33 @@ pub struct TteObsDiagnostic {
     /// leans high. Under censoring, check `coxsnell` against Exp(1) with a censored
     /// estimate instead.
     pub pit: f64,
+    /// Simulation-based npde of a single-event record (#1889), from
+    /// [`crate::stats::npde::compute_tte_npde`]: `Φ⁻¹` of the fraction of population
+    /// replicates with an earlier event, imputed above that fraction for a
+    /// right-censored time. NaN unless the fit ran with `[fit_options] npde_nsim > 0`
+    /// and the record could be scored. NPDE and NPD are the same number for a single
+    /// event, so the sdtab writes this field to both columns. Absent from a value
+    /// serialised before #1889, which reads back as NaN.
+    #[serde(default = "nan_f64")]
+    pub npde: f64,
+}
+
+/// Serde default of an optional score: NaN, "not computed". The derive default of an
+/// `f64` is `0.0`, a valid-looking score.
+#[cfg(feature = "survival")]
+fn nan_f64() -> f64 {
+    f64::NAN
+}
+
+/// Whether any time-to-event row of `subjects` carries a finite npde (#1889). The one
+/// answer both the sdtab (whether `NPDE` / `NPD` columns exist for a fit whose only
+/// scores are on TTE rows) and the `.fitrx` writer (whether `predictions_tte.csv` gets
+/// its `NPDE` column) read.
+#[cfg(feature = "survival")]
+pub(crate) fn any_tte_npde(subjects: &[SubjectResult]) -> bool {
+    subjects
+        .iter()
+        .any(|s| s.tte_rows.iter().any(|r| r.npde.is_finite()))
 }
 
 /// Per-subject estimation results
