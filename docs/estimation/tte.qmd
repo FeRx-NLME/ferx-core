@@ -1190,16 +1190,24 @@ results on both fixtures. reda also refuses a censoring
 that is not a subject's last record when an event follows it. ferx accepts that layout, so it
 is not compared. Neither reda comparison is a committed test.
 
-**`vpc::vpc_tte(rtte = TRUE)` is not a reference.** Its Kaplan–Meier step is survfit itself;
-what differs is which rows it builds for "order `k`", and in vpc 1.2.4 (and master 1.3.6 as
-of 2026-11-14) none of its modes is ferx's curve. In the default gap mode
-(`rtte_calc_diff = TRUE`) its gaps are the intervals between consecutive records, the closing
-censored interval included, and it sorts each subject's intervals by length before numbering
-them, so its "order `k`" is the `k`-th *shortest* interval, not the gap before the `k`-th
-event ([ronkeizer/vpc#127](https://github.com/ronkeizer/vpc/issues/127)). On the fixture
-above its orders 2 and 3 differ from ferx's gap curves by up to 0.22 in S, and its order 1
-from ferx's absolute order 1 by up to 0.25. The two other modes fail unless the data have a
-column named `t` ([ronkeizer/vpc#128](https://github.com/ronkeizer/vpc/issues/128)). With
+##### Against `vpc::vpc_tte` {#km-vpc-rtte-vs-vpc-package}
+
+**`vpc::vpc_tte(rtte = TRUE)` is a reference only in its default gap mode, from vpc 1.3.8.**
+Its Kaplan–Meier step is survfit itself; what differs is which rows it builds for "order
+`k`". Up to 1.3.7 its default gap mode (`rtte_calc_diff = TRUE`) sorted each subject's
+intervals by length before numbering them, so "order `k`" was the `k`-th *shortest* interval
+([ronkeizer/vpc#127](https://github.com/ronkeizer/vpc/issues/127)), and its other two modes
+failed unless the data had a column named `t`
+([ronkeizer/vpc#128](https://github.com/ronkeizer/vpc/issues/128)). Both are fixed in vpc
+1.3.8 (master `aeba2e1`, 2026-11-14). On the fixture above, 1.3.8's gap mode now equals
+ferx's gap curves of orders 2 and 3 within 5.6e-17 at every time, and its order 1 equals
+ferx's absolute order 1 within 5.6e-17 (1.2.4 was off by 0.22 and 0.25). Its gaps are the
+intervals between consecutive records, so one difference remains by definition: a subject
+whose last record is an event has no record `k + 1` and is left out of gap order `k + 1`,
+where ferx keeps it, censored at gap 0. On the survfit fixture that changes no value of S. On
+`r2()`, where one subject has two events at time 5, it does: gap order 3 has S(0) = 1/2 in
+vpc 1.3.8 and 2/3 in ferx. The two other modes are unchanged in 1.3.8 and are **not** ferx's
+curve. With
 `rtte_calc_diff = FALSE` order `k` keeps only the subjects with at least `k` records: a
 subject with fewer events drops out instead of being censored at its follow-up end, and so
 does one with exactly `k − 1` events whose last record is an event (up to 0.34 at orders 2
@@ -1207,9 +1215,12 @@ and 3). With `rtte_conditional = FALSE` one subject enters the risk set up to `k
 the curve is not a Kaplan–Meier estimate of the time to the `k`-th event. That construction
 reproduces vpc's curves exactly for stratum A of the fixture (7 orders), but not for stratum B
 (12 orders): stratified, B is off by 0.69 even at order 1, while B run alone matches at order 1
-exactly. That cause is not traced; labels with two-digit orders are suspected. A VPC drawn by
-vpc's own RTTE mode will therefore not overlay `vpc_rtte()`'s curves. Every difference that is
-traced is in vpc's row construction, not in either Kaplan–Meier step.
+exactly; 1.3.8 gives the same numbers. That cause is not traced; labels with two-digit orders
+are suspected. A VPC drawn by vpc's own RTTE mode therefore overlays `vpc_rtte()`'s curves
+only in gap mode with vpc ≥ 1.3.8, and only up to the gap-0 difference above. Every
+difference that is traced is in vpc's row construction, not in either Kaplan–Meier step.
+
+##### Band self-consistency {#km-vpc-rtte-band-self-consistency}
 
 The bands are checked for self-consistency in `tests/vpc_rtte_self_consistency.rs`. 200
 datasets are drawn outside the simulator from a Poisson process with between-subject
