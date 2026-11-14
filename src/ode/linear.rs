@@ -548,6 +548,14 @@ thread_local! {
     pub(crate) static SPECTRAL_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Segments the spectral path propagated on this thread.
     pub(super) static SPECTRAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The coupling graph each `spectral` call on this thread built, as its reachability
+    /// `downstream(present, n)`, tagged `true` for `sens::vtape::DualV` (any mode) and
+    /// `false` for `f64`; other number types are not recorded. Reachability is what
+    /// `spectral_of` reads `A`'s structural zeros through (its blocks, its acyclic
+    /// compartments and its projectors' support), so equal entries mean the taped
+    /// recording and the `f64` objective built the same construction (#2761 row 5).
+    pub(crate) static SPECTRAL_GRAPHS: std::cell::RefCell<Vec<(bool, [u8; 6])>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[inline]
@@ -582,6 +590,15 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
             m | (1 << i)
         }
     });
+    #[cfg(test)]
+    {
+        let ty = std::any::type_name::<T>();
+        let taped = ty.contains("vtape::DualV");
+        if taped || ty == "f64" {
+            let down = downstream(present, n);
+            SPECTRAL_GRAPHS.with(|g| g.borrow_mut().push((taped, down)));
+        }
+    }
     if repeated_singleton_eigenvalue(vals, present, n) {
         return None;
     }

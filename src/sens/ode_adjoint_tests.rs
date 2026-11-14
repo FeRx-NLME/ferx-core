@@ -2141,6 +2141,147 @@ fn dormant_accumulators_match_reconverged_fd(
     assert!(hess < hessian_tol, "Hessian vs reconverged FD {hess:.2e}");
 }
 
+/// A chain `depot → central → effect` with η-free rate constants: `A` is lower-triangular,
+/// so every compartment is acyclic, and its rates are distinct, so the spectral path takes it.
+const TRIANGULAR_CHAIN_ODE: &str = r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVKA(1.0, 0.05, 20.0)
+  theta TVKE0(0.3, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.09
+  sigma PROP_ERR ~ 0.02
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV * exp(ETA_V)
+  KA  = TVKA
+  KE0 = TVKE0
+[structural_model]
+  ode(states=[depot, central, effect])
+[odes]
+  d/dt(depot)   = -KA * depot
+  d/dt(central) =  KA * depot - CL / V * central
+  d/dt(effect)  =  KE0 * (central / V - effect)
+[scaling]
+  y = central / V + effect
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// #2761 review row 5: the outer gradient's taped recording builds `A`'s coupling graph
+/// exactly as the `f64` objective does. Before #2760 the recorded block kept `A`'s
+/// structural zeros as tape nodes, so on the tape a triangular `A` was one cyclic block
+/// (eigensolver eigenvalues, no masks) while the objective took the acyclic form. That
+/// moved `emax_pkpd`'s start gradient by 7.9e-13 relative and its optimizer path by 8
+/// iterations, a gap far inside every FD-parity bound, so the construction itself is
+/// what is asserted.
+///
+/// Dies on: structural-zero outputs kept on the tape in `vtape::record_rhs` (the
+/// `RHS_DEAD_KEPT` gate forced on); `DualV` reading a taped zero as an edge.
+#[test]
+fn taped_gradient_builds_a_triangular_generators_graph_like_the_objective() {
+    taped_graphs_match_the_objective(TRIANGULAR_CHAIN_ODE);
+}
+
+/// The same on a generator that is genuinely cyclic (`central ⇄ peripheral`, fed by an
+/// acyclic `depot`), where "some compartment on a cycle" reads `true` with the zeros
+/// dropped or kept: only the reachability tells the two recordings apart (#2953 review
+/// row 2).
+#[test]
+fn taped_gradient_builds_a_cyclic_generators_graph_like_the_objective() {
+    taped_graphs_match_the_objective(TWOCPT_DEPOT_LINEAR_ODE);
+}
+
+/// The body of the two tests above: `src` is a linear model dosed into state 1. Records
+/// every `spectral` call's reachability (`SPECTRAL_GRAPHS`) for the `f64` predictions and
+/// for one adjoint gradient at the same θ and η, and asserts that every taped graph is one
+/// the objective built. Straddle: with the block keeping its zeros (`RHS_DEAD_KEPT`, the
+/// recording before #2760) some taped graph is not, so a fixture whose graph the kept
+/// zeros cannot change, or that never reaches the taped spectral call, cannot pass.
+fn taped_graphs_match_the_objective(src: &str) {
+    use crate::ode::linear::SPECTRAL_GRAPHS;
+    use crate::sens::vtape::RHS_DEAD_KEPT;
+    let model = parse_model_string(src).unwrap();
+    assert_eq!(
+        model
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .effective_solver_opts()
+            .method,
+        crate::ode::OdeMethod::Linear,
+        "the fixture must take the exact path"
+    );
+    // Two doses: two segments, so two `spectral` calls per recording (the graph comes from
+    // `A` alone, not from the state).
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [1.0, 3.0, 8.0, 23.0, 25.0, 30.0, 47.0];
+    let mut s = subject_shell(doses, &times);
+    let preds = crate::pk::compute_predictions_with_tv(
+        &model,
+        &s,
+        &model.default_params.theta,
+        &vec![0.05; model.n_eta],
+    );
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    assert!(in_scope(&model, &s), "the subject must be in adjoint scope");
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let eta = ebe_for(&model, &s, &params, 1e-10, true);
+    // The graphs one closure call built, split into (taped, `f64`).
+    let take = || {
+        let all = SPECTRAL_GRAPHS.with(|g| std::mem::take(&mut *g.borrow_mut()));
+        let (t, f): (Vec<_>, Vec<_>) = all.into_iter().partition(|(taped, _)| *taped);
+        let strip = |v: Vec<(bool, [u8; 6])>| v.into_iter().map(|(_, d)| d).collect::<Vec<_>>();
+        (strip(t), strip(f))
+    };
+    SPECTRAL_GRAPHS.with(|g| g.borrow_mut().clear());
+    crate::pk::compute_predictions_with_tv(&model, &s, &params.theta, eta.as_slice());
+    let (_, objective) = take();
+    let taped = |keep: bool| {
+        RHS_DEAD_KEPT.with(|c| c.set(keep));
+        let g = subject_adjoint_packed_gradient(&model, &s, &params, &x, eta.as_slice(), true);
+        RHS_DEAD_KEPT.with(|c| c.set(false));
+        let g = g.expect("in scope");
+        assert!(g.iter().all(|v| v.is_finite()), "{g:?}");
+        take().0
+    };
+    let dropped = taped(false);
+    let kept = taped(true);
+    let foreign = |v: &[[u8; 6]]| v.iter().filter(|d| !objective.contains(d)).count();
+    eprintln!(
+        "objective graphs {objective:?}; taped {dropped:?} ({} foreign); kept {kept:?} ({} foreign)",
+        foreign(&dropped),
+        foreign(&kept)
+    );
+    assert!(
+        !objective.is_empty(),
+        "the f64 objective never reached the spectral path"
+    );
+    assert!(
+        !dropped.is_empty(),
+        "the taped type never reached the spectral path"
+    );
+    assert_eq!(
+        foreign(&dropped),
+        0,
+        "the taped recording built a graph the objective did not: {dropped:?} vs {objective:?}"
+    );
+    assert!(
+        foreign(&kept) > 0,
+        "the straddle: keeping the zeros on the tape must change the graph: {kept:?} vs \
+         {objective:?}"
+    );
+}
+
 /// The adjoint on the exact linear path (#852, Teun on #2093): its recordings run the
 /// matrix exponential over the tape types, whose derivative self-check reads
 /// `jet_max_abs`. Each subject's gradient must match reconverged FD, and the recording
