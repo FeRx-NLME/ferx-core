@@ -274,13 +274,26 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
 /// Uses the actual light provider at the prior mode (`η = 0`) so it catches the
 /// *per-point* fallbacks (modeled-duration, SS+reset, oral infusion) that the
 /// coarse model-level [`resolve_gradient_method`] does not.
+#[cfg(test)]
 pub(crate) fn fd_fallback_warning(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
 ) -> Option<String> {
+    fd_fallback_warning_skipping(model, population, theta, false)
+}
+
+/// [`fd_fallback_warning`] for a fit whose every stage skips a refused IOV subject's EBE search
+/// (`refused_skipped`, [`InnerSolvePolicy::skip_refused`]): that subject runs no gradient, so it
+/// is not counted as finite-difference.
+pub(crate) fn fd_fallback_warning_skipping(
+    model: &CompiledModel,
+    population: &Population,
+    theta: &[f64],
+    refused_skipped: bool,
+) -> Option<String> {
     if model.n_kappa != 0 {
-        return iov_fd_fallback_warning(model, population, theta);
+        return iov_fd_fallback_warning(model, population, theta, refused_skipped);
     }
     // No random effects: there is no inner EBE problem, so no inner gradient of either
     // kind to report. Probing `subject_eta_grad` anyway counts every subject of an
@@ -405,11 +418,16 @@ fn iov_fd_fallback_warning(
     model: &CompiledModel,
     population: &Population,
     theta: &[f64],
+    refused_skipped: bool,
 ) -> Option<String> {
     let n_total = population.subjects.len();
     let mut n_fd = 0usize;
     let mut reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
     for subject in &population.subjects {
+        // A refused subject's search is skipped, so it runs no gradient of either kind.
+        if refused_skipped && crate::stats::likelihood::iov_refuses_frem(model, subject) {
+            continue;
+        }
         if iov_inner_subject_route(model, subject, theta).is_none() {
             n_fd += 1;
             *reasons.entry(iov_fd_reason(model, subject)).or_insert(0) += 1;
@@ -965,6 +983,20 @@ impl EbeVariance {
     }
 }
 
+/// Whether a stage running `options` scores an IOV subject with FREM rows as the constant
+/// `IOV_FREM_REFUSAL_NLL` (the FOCE-family marginal, quadrature excluded: its integrand scores
+/// the subject itself), so that subject's EBE search changes nothing ([`InnerSolvePolicy::skip_refused`]).
+pub(crate) fn skips_refused_subjects(options: &crate::types::FitOptions) -> bool {
+    use crate::types::EstimationMethod;
+    matches!(
+        options.method,
+        EstimationMethod::Foce
+            | EstimationMethod::FoceI
+            | EstimationMethod::FoceGn
+            | EstimationMethod::FoceGnHybrid
+    ) && options.agq_nodes().is_none()
+}
+
 /// Per-call inner-solve policy: the BFGS seed and whether to retain the terminal exact
 /// Hessian (see `find_ebe_impl`). `Default` is the historical solve.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1026,6 +1058,15 @@ pub(crate) struct InnerSolvePolicy {
     /// tolerance, left it 1.7e-6 above NONMEM and unconverged after four verification legs
     /// (+8.6e-8 converged unseeded). `false`, the `Default`, seeds as `seed` says.
     pub(crate) unseeded_iov_warm: bool,
+    /// Do not search an IOV subject the marginal refuses (FREM rows under κ,
+    /// [`crate::stats::likelihood::iov_refuses_frem`]): the stage's objective is the constant
+    /// `IOV_FREM_REFUSAL_NLL` whatever its EBE is, so the search is wasted work — and its
+    /// inner objective scores the FREM rows differently from the marginal, so it was the one
+    /// finite-difference route left under κ. The subject reports η̂ = κ̂ = 0 and no
+    /// finite-difference gradient. Set by [`Self::for_stage`] for the FOCE family without
+    /// quadrature, whose objective is that constant; quadrature, IMP and the rest keep the
+    /// solve. `false`, the `Default`, solves.
+    pub(crate) skip_refused: bool,
 }
 
 impl InnerSolvePolicy {
@@ -1046,6 +1087,7 @@ impl InnerSolvePolicy {
             init_is_warm: false,
             keep_certified_start: false,
             unseeded_iov_warm: false,
+            skip_refused: skips_refused_subjects(options),
         }
     }
 
@@ -2264,6 +2306,7 @@ pub(crate) fn find_ebe_for_stage_with_prev(
             ebe_variance: EbeVariance::for_options(stage, model),
             screen: stage.inner_screen,
             twin_seed: stage.inner_twin_seed,
+            skip_refused: skips_refused_subjects(stage),
             ..InnerSolvePolicy::default()
         }
         .with_prev_etas(prev),
@@ -2728,6 +2771,9 @@ fn find_ebe_impl_from(
     // When the model has kappa declarations AND this subject has occasion labels,
     // optimize over the flat vector [bsv_eta (n_eta), kappa_1 (n_kappa), ..., kappa_K (n_kappa)].
     if model.n_kappa > 0 && !subject.occasions.is_empty() {
+        if policy.skip_refused && crate::stats::likelihood::iov_refuses_frem(model, subject) {
+            return refused_iov_ebe(model, subject);
+        }
         let ebe = find_ebe_iov_seeded(
             model,
             subject,
@@ -4638,6 +4684,31 @@ fn find_ebe_iov_seeded(
         grad_norm: 0.0,
         nll,
         kappas: kappas_vec,
+        hard_reject: false,
+        screen_moved: false,
+        twin_moved: false,
+    }
+}
+
+/// The EBE reported for a subject the IOV marginal refuses when its search is skipped
+/// ([`InnerSolvePolicy::skip_refused`]): the prior mode, η̂ = κ̂ = 0, with a zero `H` and the
+/// refusal objective. Nothing was searched, so no gradient of either kind ran.
+fn refused_iov_ebe(model: &CompiledModel, subject: &Subject) -> EbeResult {
+    let k_occasions = crate::stats::stacked_layout::group_count(subject);
+    EbeResult {
+        eta: DVector::zeros(model.n_eta),
+        h_matrix: DMatrix::zeros(subject.obs_times.len(), model.n_eta),
+        fd_h_redone: false,
+        terminal_hessian: None,
+        ipreds: None,
+        converged: true,
+        used_fallback: false,
+        nm_polished: false,
+        grad_norm: 0.0,
+        nll: crate::stats::likelihood::IOV_FREM_REFUSAL_NLL,
+        kappas: (0..k_occasions)
+            .map(|_| DVector::zeros(model.n_kappa))
+            .collect(),
         hard_reject: false,
         screen_moved: false,
         twin_moved: false,

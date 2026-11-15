@@ -1108,6 +1108,7 @@ fn fit_unstamped(
     ))?;
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
@@ -1907,10 +1908,17 @@ fn fit_inner(
                 | EstimationMethod::Laplace
         )
     }) {
-        if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
+        if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning_skipping(
             model,
             population,
             &init_params.theta,
+            // Every stage skips a refused subject's EBE search (`InnerSolvePolicy::skip_refused`).
+            chain.iter().all(|&m| {
+                crate::estimation::inner_optimizer::skips_refused_subjects(&FitOptions {
+                    method: m,
+                    ..options.clone()
+                })
+            }),
         ) {
             accumulated_warnings.push(w);
         }

@@ -767,7 +767,7 @@ pub(crate) fn record_ss_nonconvergence_warning(_warning: Option<&str>) {}
 /// path (`(I − M)⁻¹·b`, #835) and never reaches this iteration.
 pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 
-/// Process-global collector for steady-state equilibration non-convergence warnings (#867).
+/// Per-run collector for steady-state equilibration non-convergence warnings (#867, #2067).
 ///
 /// The capped pulse-train equilibration runs deep inside the per-subject prediction walk
 /// (`ode::predictions::equilibrate_ss_state`), which rayon parallelises across subjects and whose
@@ -775,7 +775,7 @@ pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 /// `ode_predictions_*` variant and its callers would be a wide, invasive change for a rare
 /// diagnostic, and a thread-local would be lost on the rayon worker threads. So the message —
 /// written only on the rare non-converged nonlinear branch — is deduplicated into this cross-thread
-/// set and drained by every `api` boundary that returns a `warnings` channel — `fit`,
+/// map, one set per *run* (the id the pool tasks carry as their fit, [`run_scope`]), and drained by every `api` boundary that returns a `warnings` channel — `fit`,
 /// `simulate_with_options_diag`, `simulate_with_uncertainty_diag`, `predict_diag` and the adaptive
 /// driver behind `simulate_adaptive` / `simulate_adaptive_from_spec` (#1652) — via
 /// [`take_ss_nonconvergence_warnings`]. Bare `predict()` / `simulate()` are wrappers over their
@@ -783,21 +783,57 @@ pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 ///
 /// The message is model-structural (independent of subject and of objective-eval count), so the
 /// `BTreeSet` collapses the thousands of identical writes a fit produces down to one entry, and its
-/// deterministic ordering keeps the surfaced list stable. This assumes one top-level `api`
-/// operation per process at a time (the CLI / ferx-r usage): each draining entrypoint
-/// [`clear_ss_nonconvergence_warnings`] on entry and [`take_ss_nonconvergence_warnings`] on exit to
-/// bracket its own run; genuinely concurrent in-process operations would share the sink. A
-/// draining call *nested* inside another's window clears the outer run's notes, so code that runs
-/// inside an entry point must not call one. `suggest_start::sweep`, which predicts inside `fit()`
-/// (via `inits_from_nca`) — once per start of a multi-start fit, concurrently with the other
-/// starts' objective passes — therefore uses the non-draining `api::predict_diag_undrained`
+/// deterministic ordering keeps the surfaced list stable. Each draining entrypoint opens a
+/// [`run_scope`] (joining the fit it runs inside, if any), so concurrent in-process operations —
+/// the candidate fits of a model search — keep their notes apart (#2067); a write from a thread
+/// that runs no scope lands in the shared bucket `0`. [`clear_ss_nonconvergence_warnings`] on entry
+/// and [`take_ss_nonconvergence_warnings`] on exit bracket the run's own set. A draining call
+/// *nested* inside another's window of the same run clears the outer run's notes, so code that
+/// runs inside an entry point must not call one. `suggest_start::sweep`, which predicts inside
+/// `fit()` (via `inits_from_nca`), therefore uses the non-draining `api::predict_diag_undrained`
 /// rather than `predict()` (#1652 review r1 #1). Writers that do not drain (e.g. the public
-/// `pk::compute_predictions_with_states`) leave their note for the next draining entrypoint,
-/// whose clear discards it.
-fn ss_nonconvergence_sink() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
-    static SINK: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
-        std::sync::OnceLock::new();
+/// `pk::compute_predictions_with_states`) leave their note for the next draining entrypoint of
+/// the same run, whose clear discards it.
+type SsSink = std::sync::Mutex<std::collections::HashMap<u64, std::collections::BTreeSet<String>>>;
+
+fn ss_nonconvergence_sink() -> &'static SsSink {
+    static SINK: std::sync::OnceLock<SsSink> = std::sync::OnceLock::new();
     SINK.get_or_init(std::sync::Mutex::default)
+}
+
+/// The sink bucket of the run the calling thread belongs to.
+fn ss_run_key() -> u64 {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    kj::run_of(kj::current_fit())
+}
+
+/// Hold the run scope of a top-level draining operation: a thread outside any fit takes a fresh
+/// run id for the operation's duration (carried by its pool tasks), a thread inside one joins it.
+/// Dropping it discards what the run left in the sink.
+pub(crate) struct SsRunScope(
+    Option<(
+        u64,
+        crate::parser::model_parser::rhs_regcode::kernel_jit::FitGuard,
+    )>,
+);
+
+pub(crate) fn run_scope() -> SsRunScope {
+    SsRunScope(crate::parser::model_parser::rhs_regcode::kernel_jit::open_run())
+}
+
+impl Drop for SsRunScope {
+    fn drop(&mut self) {
+        if let Some((id, _)) = &self.0 {
+            drop_ss_run(*id);
+        }
+    }
+}
+
+/// Forget run `run`'s bucket (its scope ended).
+pub(crate) fn drop_ss_run(run: u64) {
+    if let Ok(mut m) = ss_nonconvergence_sink().lock() {
+        m.remove(&run);
+    }
 }
 
 /// Estimate the un-taken geometric tail of a cycle-capped SS equilibration and, if it is
@@ -818,8 +854,8 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
     // records — see `record_ss_nonconvergence_warning`.
     record_ss_nonconvergence_warning(warning.as_deref());
     if let Some(msg) = warning {
-        if let Ok(mut set) = ss_nonconvergence_sink().lock() {
-            set.insert(msg);
+        if let Ok(mut m) = ss_nonconvergence_sink().lock() {
+            m.entry(ss_run_key()).or_default().insert(msg);
         }
     }
 }
@@ -922,7 +958,9 @@ pub(crate) fn take_ss_nonconvergence_warnings() -> Vec<String> {
     SS_SINK_DRAINS.with(|c| c.set(c.get() + 1));
     ss_nonconvergence_sink()
         .lock()
-        .map(|mut set| std::mem::take(&mut *set).into_iter().collect())
+        .ok()
+        .and_then(|mut m| m.remove(&ss_run_key()))
+        .map(|set| set.into_iter().collect())
         .unwrap_or_default()
 }
 
@@ -931,9 +969,7 @@ pub(crate) fn take_ss_nonconvergence_warnings() -> Vec<String> {
 pub(crate) fn clear_ss_nonconvergence_warnings() {
     #[cfg(test)]
     SS_SINK_DRAINS.with(|c| c.set(c.get() + 1));
-    if let Ok(mut set) = ss_nonconvergence_sink().lock() {
-        set.clear();
-    }
+    drop_ss_run(ss_run_key());
 }
 
 #[cfg(test)]
@@ -958,6 +994,54 @@ mod ss_warn_tests {
         note_ss_nonconvergence_if_capped(true, 1.0, 2.0, 10.0);
         assert_eq!(last_ss_equilibration_warning(), None);
         assert!(!last_ss_equilibration_warned());
+    }
+
+    /// #2067: two runs open at once keep their notes apart, including a note written by a pool
+    /// task that carries the run's id. Each run clears on entry and takes on exit, and sees only
+    /// its own. Mutation: key every write and read by one constant -> both runs read both notes.
+    #[test]
+    fn concurrent_runs_keep_their_ss_notes_apart() {
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::{current_fit, in_fit};
+        let gate = std::sync::Barrier::new(2);
+        let run = |mag: f64| {
+            let _run = run_scope();
+            clear_ss_nonconvergence_warnings();
+            let fit = current_fit();
+            assert_ne!(fit, 0, "a top-level run opens a scope");
+            // The write comes from another thread running the run's id, as a pool task does.
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    in_fit(fit, || {
+                        note_ss_nonconvergence_if_capped(false, 1.0, 2.0, mag)
+                    })
+                })
+                .join()
+                .unwrap();
+            });
+            gate.wait(); // both runs have written before either reads
+            (fit, take_ss_nonconvergence_warnings())
+        };
+        let ((fa, a), (fb, b)) = std::thread::scope(|s| {
+            let ha = s.spawn(|| run(10.0));
+            let hb = s.spawn(|| run(40.0));
+            (ha.join().unwrap(), hb.join().unwrap())
+        });
+        let want = |mag: f64| {
+            vec![ss_equilibration_tail_warning(false, 1.0, 2.0, mag).expect("fixture warns")]
+        };
+        assert_eq!(a, want(10.0));
+        assert_eq!(b, want(40.0));
+        // A run that ends leaves nothing behind: its bucket is gone.
+        let left = {
+            let run = run_scope();
+            let fit = current_fit();
+            note_ss_nonconvergence_if_capped(false, 1.0, 2.0, 10.0);
+            assert!(ss_nonconvergence_sink().lock().unwrap().contains_key(&fit));
+            drop(run);
+            fit
+        };
+        let m = ss_nonconvergence_sink().lock().unwrap();
+        assert!(![fa, fb, left].iter().any(|k| m.contains_key(k)));
     }
 
     /// Every clear and every take counts as a drain on the calling thread (#2071).

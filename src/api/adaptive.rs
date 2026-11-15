@@ -1032,6 +1032,7 @@ where
     // must stay the FIRST statement: the base-snapshot precompute below runs its own SS
     // equilibrations, and a clear placed after it would drop the note they wrote. The frozen-
     // replay verifier writes into the same window — same run, deduped.
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
     let params = inputs.params;
 

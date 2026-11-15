@@ -5870,6 +5870,7 @@ fn the_profile_solve_counts_its_own_moved_states() {
                 InnerSolvePolicy {
                     seed: InnerHessianSeed::for_options(&o),
                     unseeded_iov_warm: true,
+                    skip_refused: false,
                     ..InnerSolvePolicy::for_stage(&o, cf.model)
                 },
                 None,

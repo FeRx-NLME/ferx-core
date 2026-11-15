@@ -2414,6 +2414,30 @@ impl Drop for FitGuard {
     }
 }
 
+/// Fits opened inside a run scope ([`open_run`]) -> that run: a worker deposits a per-run note
+/// under the run its fit belongs to, whichever fit id it reads.
+static RUN_OF: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// The run `fit` belongs to (`fit` itself when it was opened outside any run scope).
+pub(crate) fn run_of(fit: u64) -> u64 {
+    RUN_OF
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(f, _)| *f == fit)
+        .map_or(fit, |(_, r)| *r)
+}
+
+/// Open a run scope for a top-level operation that is not already inside a fit: a fresh id
+/// this thread (and every pool task it hands work to) runs under, so per-run collectors key by
+/// it. `None` when the thread already runs a fit or run, which this operation then joins.
+pub(crate) fn open_run() -> Option<(u64, FitGuard)> {
+    (current_fit() == 0).then(|| {
+        let id = NEXT_SCOPE.fetch_add(1, Relaxed);
+        (id, enter_fit(id))
+    })
+}
+
 /// Run this thread as fit `fit` until the guard drops.
 pub(crate) fn enter_fit(fit: u64) -> FitGuard {
     FitGuard(CUR_FIT.replace(fit))
@@ -2476,6 +2500,13 @@ pub(crate) fn register<'a>(
             }
         }
     });
+    if open != 0 && open != fit {
+        let run = run_of(open);
+        RUN_OF
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((fit, run));
+    }
     let prev = CUR_FIT.replace(fit);
     Prints {
         addrs: add.into_iter().map(|(a, _)| a).collect(),
@@ -2509,6 +2540,11 @@ impl Drop for Prints<'_> {
             ended = !m.values().flatten().any(|e| e.fit == self.fit);
         });
         if ended {
+            RUN_OF
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|(f, _)| *f != self.fit);
+            crate::dosing::drop_ss_run(self.fit);
             drop_scope(self.fit);
         }
     }

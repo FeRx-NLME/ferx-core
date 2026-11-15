@@ -2893,6 +2893,147 @@ fn frem_with_kappa_on_an_ode_is_served_exactly() {
     }
 }
 
+/// The `frem_iov_ode` subject pair: an ordinary IOV subject and the same one with its last
+/// observation a FREM weight row (the one the IOV marginal refuses).
+fn frem_iov_pair(model: &CompiledModel) -> (Subject, Subject) {
+    let mut plain = iov_subject(model);
+    plain.fremtype = vec![0; plain.observations.len()];
+    let mut refused = plain.clone();
+    let last = refused.observations.len() - 1;
+    refused.fremtype[last] = 100;
+    refused.observations[last] = 80.0;
+    (plain, refused)
+}
+
+/// A FOCE / FOCEI stage does not search a refused subject (`InnerSolvePolicy::skip_refused`):
+/// no gradient of either kind runs (`IOV_AGRAD_ROUTE` stays `(0, 0)`), it reports η̂ = κ̂ = 0
+/// and the refusal objective. Controls on the same subject and thread: the default policy
+/// still solves it (the counter moves, η̂ ≠ 0), a stage that scores the subject itself
+/// (AGQ, SAEM) does too, and an unrefused subject under the stage policy is searched.
+/// Mutations: drop the skip in `find_ebe_impl` -> the counter moves; make
+/// `skips_refused_subjects` true for AGQ -> the AGQ control reads zero.
+#[test]
+fn a_refused_subjects_inner_search_is_skipped_for_the_foce_family_only() {
+    use crate::estimation::inner_optimizer::{find_ebe_for_stage, IOV_AGRAD_ROUTE};
+    use crate::types::{EstimationMethod, FitOptions};
+    let model = frem_iov_ode();
+    let (plain, refused) = frem_iov_pair(&model);
+    let params = moved_params(&model);
+    let stage = |method: EstimationMethod, interaction: bool| FitOptions {
+        method,
+        interaction,
+        ..FitOptions::default()
+    };
+    let run = |s: &Subject, o: &FitOptions| {
+        IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+        let r = find_ebe_for_stage(&model, s, &params, 200, 1e-8, None, None, 0, o);
+        (r, IOV_AGRAD_ROUTE.with(|c| c.get()))
+    };
+    for (method, interaction) in [
+        (EstimationMethod::Foce, false),
+        (EstimationMethod::FoceI, true),
+        (EstimationMethod::FoceGn, true),
+    ] {
+        let (r, route) = run(&refused, &stage(method, interaction));
+        assert_eq!(route, (0, 0), "{method:?}: no gradient of either kind");
+        assert!(r.eta.iter().all(|v| *v == 0.0), "{method:?}");
+        assert_eq!(
+            r.kappas.len(),
+            crate::stats::stacked_layout::group_count(&refused)
+        );
+        assert!(r
+            .kappas
+            .iter()
+            .all(|k| k.len() == model.n_kappa && k.iter().all(|v| *v == 0.0)));
+        assert_eq!(r.nll, crate::stats::likelihood::IOV_FREM_REFUSAL_NLL);
+        assert!(r.converged && !r.hard_reject);
+        assert_eq!(r.h_matrix.nrows(), refused.obs_times.len());
+        assert_eq!(r.h_matrix.ncols(), model.n_eta);
+        // Control: an unrefused subject under the same stage is searched.
+        let (rp, route) = run(&plain, &stage(method, interaction));
+        assert!(
+            route.0 + route.1 > 0,
+            "{method:?}: the plain subject is searched"
+        );
+        assert!(rp.eta.iter().any(|v| *v != 0.0));
+    }
+    // Controls: every other policy solves the refused subject.
+    let mut quad = stage(EstimationMethod::FoceI, true);
+    quad.n_agq = 3;
+    for (name, o) in [("agq", quad), ("saem", stage(EstimationMethod::Saem, true))] {
+        let (r, route) = run(&refused, &o);
+        assert!(route.0 + route.1 > 0, "{name}: solved");
+        assert!(
+            r.eta
+                .iter()
+                .chain(r.kappas.iter().flatten())
+                .any(|v| *v != 0.0),
+            "{name}"
+        );
+    }
+    IOV_AGRAD_ROUTE.with(|c| c.set((0, 0)));
+    let r = crate::estimation::inner_optimizer::find_ebe(
+        &model, &refused, &params, 200, 1e-8, None, None, 0,
+    );
+    let route = IOV_AGRAD_ROUTE.with(|c| c.get());
+    assert!(route.0 + route.1 > 0);
+    assert!(r
+        .eta
+        .iter()
+        .chain(r.kappas.iter().flatten())
+        .any(|v| *v != 0.0));
+}
+
+/// A FOCE fit of a FREM + κ ODE population with one refused subject reports no
+/// finite-difference inner subjects and no `W_PLAN_FD_FALLBACK`: the refused subject was the
+/// only FD route under κ. Its objective is the constant, the others' are live.
+/// Mutation: the warning's `refused_skipped` flag forced `false` -> "1 of 3 subjects use
+/// finite-difference inner gradients".
+#[test]
+fn a_foce_fit_with_a_refused_frem_subject_reports_no_fd_inner_subjects() {
+    use crate::types::{EstimationMethod, FitOptions, Population};
+    let model = frem_iov_ode();
+    let (plain, refused) = frem_iov_pair(&model);
+    let mut other = plain.clone();
+    other.id = "2".to_string();
+    other.observations.iter_mut().for_each(|v| *v *= 1.07);
+    let mut refused = refused;
+    refused.id = "3".to_string();
+    let pop = Population {
+        subjects: vec![plain, other, refused],
+        covariate_names: Vec::new(),
+        dv_column: "DV".to_string(),
+        input_columns: Vec::new(),
+        exclusions: None,
+        warnings: Vec::new(),
+    };
+    for (method, interaction) in [
+        (EstimationMethod::Foce, false),
+        (EstimationMethod::FoceI, true),
+    ] {
+        let opts = FitOptions {
+            method,
+            interaction,
+            outer_maxiter: 3,
+            run_covariance_step: false,
+            ..FitOptions::default()
+        };
+        let r = crate::api::fit(&model, &pop, &model.default_params, &opts).expect("fit");
+        let bad: Vec<_> = r
+            .warnings
+            .iter()
+            .filter(|w| w.contains("W_PLAN_FD_FALLBACK") || w.contains("finite-difference inner"))
+            .collect();
+        assert!(bad.is_empty(), "{method:?}: {bad:?}");
+        assert!(
+            r.ofv >= crate::stats::likelihood::IOV_FREM_REFUSAL_NLL,
+            "{method:?}: the constant is in the objective"
+        );
+        let sr = r.subjects.iter().find(|s| s.id == "3").expect("subject 3");
+        assert!(sr.eta.iter().all(|v| *v == 0.0));
+    }
+}
+
 // ---- the f64 kernel IS the production objective ------------------------------------------
 
 /// Kernel `F` and `l` at `(params, η)` against production's `foce_subject_nll` / inner

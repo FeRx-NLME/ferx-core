@@ -817,6 +817,7 @@ pub(crate) fn simulate_with_options_tallied(
     // Start the SS-equilibration non-convergence sink clean, then drain it into this run's
     // `warnings` at each return (#867): a capped nonlinear pulse-train can silently under-report
     // the SS trough, biasing simulated concentrations low.
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
 
     // A derived rule on a nested model would regroup its level cells (#1082 PR4), the
@@ -2318,6 +2319,7 @@ fn simulate_with_uncertainty_impl(
 
     // Start the SS-equilibration non-convergence sink clean, as `simulate_with_options_diag`
     // does, so this run's `warnings` carry only its own capped equilibrations (#867).
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
 
     // The occasions the fit derived (#1955): `FitResult::iov_occasion` is the rule it ran
