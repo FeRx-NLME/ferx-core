@@ -1889,31 +1889,6 @@ fn a_poisoned_kept_table_does_not_panic_a_scope_drop() {
     kept_table().clear_poison();
 }
 
-/// A recording that is not affine in the state (a right-hand side the exact linear path cannot
-/// take) is the subject's failure, a model property: condemned and counted by
-/// [`settle_failure`], not declined as a point's (#2786 round 2, finding 1). Mutation: make the
-/// check fail with `fail_here` (`FailScope::Point`) -> the scope is `Point` and the key stays
-/// `Missing`.
-#[test]
-fn a_right_hand_side_not_affine_in_the_state_is_condemned_and_counted() {
-    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
-    let subs = vec![crate::types::Subject::default()];
-    let _g = register(&m, &subs);
-    begin();
-    let rhs = |u: &[Tr], _p: &[Tr], _t: Tr, f: &mut [Tr]| f[0] = u[0] * u[0];
-    let (mut a, mut b) = (vec![Tr::k(0.0)], vec![Tr::k(0.0)]);
-    assert!(!affine_parts(&rhs, &[], 0.0, &mut a, &mut b));
-    let Err((why, scope)) = end(Some(vec![])) else {
-        panic!("a non-affine right-hand side recorded");
-    };
-    assert_eq!(scope, FailScope::Subject, "{why}");
-    let key = SubjectKey::new(&m, &subs[0], 0, 0).with_variant(Desc::of_value(&0x5e_0001u64));
-    settle_failure(&key, &why, scope);
-    assert!(matches!(lookup(&key), Lookup::Bad), "condemned");
-    let c = plan_failure_counts(&m, &subs).expect("counted");
-    assert_eq!((c.any, c.inner, c.outer), (1, 1, 1));
-}
-
 /// Each scope settles its own way: a point's failure is counted (the call took finite
 /// differences) and not condemned, so a later call is re-served; a repelled point is neither
 /// counted nor condemned; the model's failure marks the model (#2786 round 2, finding 1).
@@ -2003,4 +1978,324 @@ fn a_failure_at_an_overflowed_point_is_repelled_and_a_finite_one_keeps_its_scope
     let one = fine();
     let rec = end(Some(vec![one.reg()])).expect("records");
     assert!(rec.finite());
+}
+
+/// A subject whose structure is not its family's template's is recorded afresh, never failed: the
+/// replay that meets another structure ("another structure than its template") is discarded by
+/// [`recorded`], which records again without the template. The control side asserts the replay
+/// engages for the template's own structure (`REPLAYS`), so the mismatch below is a replay that
+/// ended, not one that never started. Mutation: return the replay's `Err` from `recorded`
+/// instead of recording afresh -> `expect("records afresh")` fails.
+#[test]
+fn a_structure_other_than_the_template_is_recorded_afresh() {
+    let subject = crate::types::Subject::default();
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let family = SubjectKey::new(&m, &subject, 1, 2)
+        .with_variant(Desc::of_value(&0x7e_4411u64))
+        .family();
+    let chain = |n: usize| {
+        move || {
+            let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
+            let mut x = et[0];
+            for _ in 0..n {
+                x = x * et[1] + et[0];
+            }
+            Some(vec![x.reg()])
+        }
+    };
+    let replays = || REPLAYS.with(std::cell::Cell::get);
+    let first = recorded(&family, chain(23)).expect("records");
+    first.plan(l2(), 2, 0).expect("plans");
+    // The template's own structure replays.
+    let before = replays();
+    let same = recorded(&family, chain(23)).expect("records");
+    same.plan(l2(), 2, 0).expect("plans");
+    assert_eq!(replays(), before + 1, "the same structure replays");
+    // Another structure: the replay ends at its first unmet decision, and the subject records
+    // afresh.
+    let before = replays();
+    let other = recorded(&family, chain(5)).expect("records afresh");
+    assert_eq!(replays(), before, "the other structure is not a replay");
+    assert_eq!(other.outs.len(), 1);
+    let plan = other.plan(l2(), 2, 0).expect("plans");
+    // And it computes its own structure: `x ← x·η₁ + η₀`, five times from `η₀`, at (0.3, 0.2).
+    let (e0, e1) = (0.3, 0.2);
+    let mut want = e0;
+    for _ in 0..5 {
+        want = want * e1 + e0;
+    }
+    let l = l2().lanes();
+    let mut u = vec![0.0; 2 * l];
+    for (k, e) in [e0, e1].into_iter().enumerate() {
+        u[k * l] = e;
+        u[k * l + 1 + k] = 1.0;
+    }
+    let mut du = vec![0.0; 2 * l];
+    plan.forward_layout(l2(), &u, &[], &mut du).expect("runs");
+    close(du[0], want, "the afresh recording's value");
+}
+
+/// What a recording that declines the exact linear path leaves behind: nothing. The state of
+/// the recording after `restore` is what it was at `snapshot` — instructions, registers, the
+/// literal pool, hash-consing, loop calls, chunk marks, the guard and the template trace — and
+/// recording the same expression again takes the same registers as the first time. Mutations:
+/// leave the guard (`self.guard = s.guard`) -> the guard differs; leave the pool or the literals
+/// in `cse` -> the re-recorded literal has no pool entry or reads a dead register; truncate
+/// `code` but not `n_regs` -> the registers differ.
+#[test]
+fn restoring_a_recording_undoes_everything_recorded_since() {
+    begin();
+    let x = Tr::eta(0, 0.7);
+    let y = x * Tr::k(2.5);
+    let snap = rec(|r| r.snapshot());
+    let shape = |r: &Rec| {
+        (
+            r.code.len(),
+            r.n_regs,
+            r.pool.clone(),
+            r.loops.len(),
+            r.marks.clone(),
+            r.guard,
+            r.guarded.len(),
+            r.cse.len(),
+            r.lits.len(),
+        )
+    };
+    let at_snapshot = rec(|r| shape(r));
+    // Something of everything: a literal, a dependent node, a guard, a chunk mark.
+    let speculate = || {
+        let z = (y + Tr::k(7.25)).exp();
+        Tr::guard_cmp(z, ir::Cc::Gt, Tr::k(0.5));
+        <Tr as crate::sens::num::RecHooks>::chunk_mark();
+        z
+    };
+    let first = speculate();
+    let after = rec(|r| shape(r));
+    assert_ne!(after, at_snapshot, "the speculation recorded something");
+    assert!(rec(|r| r.guard).is_some(), "and a guard");
+    rec(|r| r.restore(snap));
+    assert_eq!(rec(|r| shape(r)), at_snapshot, "restored");
+    // The same recording again takes the same registers and the same shape.
+    let second = speculate();
+    assert_eq!(second.reg(), first.reg(), "the same registers");
+    assert_eq!(rec(|r| shape(r)), after, "the same shape");
+    end(Some(vec![second.reg()])).expect("records");
+}
+
+/// A right-hand side that is not affine in the state is a decline of the exact linear path, not a
+/// failure of the recording: `affine_parts` says so (`false`), leaves no guard behind (its call on
+/// the state's placeholder would have required `u > 0.5` of the variable), and the recording
+/// ends `Ok`. Mutation: fail the recording there instead (`fail_subject`) -> `end` is `Err`;
+/// skip the restore -> the guard on the placeholder state stays and `guard` is `Some`.
+#[test]
+fn a_right_hand_side_not_affine_in_the_state_declines_without_a_trace() {
+    begin();
+    // `f = −u²` with a branch on the state: not affine, and the branch would guard the variable.
+    let rhs = |u: &[Tr], _p: &[Tr], _t: Tr, f: &mut [Tr]| {
+        Tr::guard_cmp(u[0], ir::Cc::Gt, Tr::k(0.5));
+        f[0] = -(u[0] * u[0]);
+    };
+    let (mut a, mut b) = (vec![Tr::k(0.0)], vec![Tr::k(0.0)]);
+    assert!(!affine_parts(&rhs, &[], 0.0, &mut a, &mut b));
+    assert!(rec(|r| r.guard).is_none(), "no guard on the variable stays");
+    assert!(rec(|r| r.failed.is_none()), "the recording has not failed");
+    let ok = end(Some(vec![])).expect("the recording ends Ok");
+    assert!(ok.guard.is_none());
+    // The control side: an affine right-hand side is served.
+    begin();
+    let aff = |u: &[Tr], _p: &[Tr], _t: Tr, f: &mut [Tr]| f[0] = -(Tr::k(0.3) * u[0]);
+    let (mut a, mut b) = (vec![Tr::k(0.0)], vec![Tr::k(0.0)]);
+    assert!(affine_parts(&aff, &[], 0.0, &mut a, &mut b));
+    end(Some(vec![])).expect("records");
+}
+
+/// `y' = −p·y²` under `OdeMethod::Linear`, the exact linear path's request on a right-hand side it
+/// cannot take: the recording declines the path (counted: `declined`) and records the stepper
+/// instead, and the plan carries the value and the η-derivatives of the integration — against the
+/// `f64` solve and its central difference. Mutation: fail the recording on the non-affine
+/// right-hand side -> `recorded` is `Err`.
+#[test]
+fn a_non_affine_system_on_the_linear_method_is_integrated_by_the_plan() {
+    fn solve<T: crate::sens::num::PkNum>(e0: T, e1: T) -> T {
+        let k = |c: f64| T::from_f64(c);
+        let p = [k(0.8) * e0.exp()];
+        let u0 = [k(1.0) + k(0.2) * e1];
+        let rhs = |u: &[T], p: &[T], _t: T, du: &mut [T]| du[0] = -(p[0] * u[0] * u[0]);
+        let opts = crate::ode::solver::OdeSolverOptions {
+            reltol: 1e-10,
+            abstol: 1e-12,
+            method: crate::ode::solver::OdeMethod::Linear,
+            auto_switch: false,
+            ..Default::default()
+        };
+        let mut auto = crate::ode::solver::OdeAutoSwitchState::default();
+        crate::ode::solver::solve_ode_g_with_auto_state(
+            &rhs,
+            &u0,
+            (0.0, 2.0),
+            &p,
+            &[2.0],
+            &opts,
+            &mut auto,
+        )[0]
+        .u[0]
+    }
+    let at = [0.3, 0.2];
+    begin();
+    let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, at[k])).collect();
+    let y = solve(et[0], et[1]);
+    let rec = end(Some(vec![y.reg()])).expect("records: the path is declined, not failed");
+    assert_eq!(rec.declined, 1, "the exact linear path declined once");
+    let plan = rec.plan(l2(), 2, 0).expect("plans");
+    let l = l2().lanes();
+    let mut u = vec![0.0; 2 * l];
+    for k in 0..2 {
+        u[k * l] = at[k];
+        u[k * l + 1 + k] = 1.0;
+    }
+    let mut du = vec![0.0; 2 * l];
+    plan.forward_layout(l2(), &u, &[], &mut du).expect("runs");
+    let f = |a: f64, b: f64| solve::<f64>(a, b);
+    assert!(
+        (du[0] - f(at[0], at[1])).abs() < 1e-9 * (1.0 + du[0].abs()),
+        "value {} vs {}",
+        du[0],
+        f(at[0], at[1])
+    );
+    let h = 1e-3;
+    for k in 0..2 {
+        let (mut p, mut q) = (at, at);
+        p[k] += h;
+        q[k] -= h;
+        let fd = (f(p[0], p[1]) - f(q[0], q[1])) / (2.0 * h);
+        assert!(
+            (du[1 + k] - fd).abs() < 2e-5 * (1.0 + fd.abs()),
+            "∂{k}: {} vs FD {fd}",
+            du[1 + k]
+        );
+    }
+}
+
+/// The derivative of the fourth derivative of `ln Γ` — the tangent of `Unary::Tetragamma`, which
+/// the recorder had no rule for (it failed the model) — is the next of `ln Γ`'s jet, `pentagamma`.
+/// Recorded through `jacobian` (the right-hand side `f = ψ″(u)`, whose `∂f/∂u` is the tangent) and
+/// run at another point. Mutation: the rule back to `fail(..)` -> `end` is `Err`; the jet at the
+/// wrong order (`3` for `4`) -> the value is `tetragamma`, not `pentagamma`.
+#[test]
+fn the_tangent_of_tetragamma_is_pentagamma() {
+    use crate::stats::special::{pentagamma, tetragamma};
+    let record_at = 1.7;
+    begin();
+    let u0 = Tr::eta(0, record_at);
+    let rhs = |u: &[Tr], _p: &[Tr], _t: Tr, f: &mut [Tr]| f[0] = u[0].tetragamma();
+    let (mut f, mut jac, mut ft) = (vec![Tr::k(0.0)], vec![Tr::k(0.0)], vec![Tr::k(0.0)]);
+    jacobian(&rhs, &[u0], &[], Tr::k(0.0), &mut f, &mut jac, &mut ft);
+    close(
+        f[0].recorded(),
+        tetragamma(record_at),
+        "ψ″ at the recording point",
+    );
+    close(
+        jac[0].recorded(),
+        pentagamma(record_at),
+        "its tangent at the recording point",
+    );
+    let rec = end(Some(vec![f[0].reg(), jac[0].reg()])).expect("records: the rule exists");
+    let plan = rec.plan(l2(), 2, 0).expect("plans");
+    let l = l2().lanes();
+    for x in [0.9, 2.4] {
+        let mut u = vec![0.0; 2 * l];
+        u[0] = x;
+        u[1] = 1.0;
+        let mut du = vec![0.0; 3 * l];
+        plan.forward_layout(l2(), &u, &[], &mut du).expect("runs");
+        close(du[0], tetragamma(x), &format!("ψ″({x}) from the plan"));
+        close(
+            du[l],
+            pentagamma(x),
+            &format!("its tangent at {x} from the plan"),
+        );
+    }
+}
+
+/// The ODE driver reads values, and a recording reaches it only through `ode_segment`; a nested
+/// dual over a recording has none, so nothing may integrate one. The instantiation is a compile
+/// error (`integrate_resolved_g_inner`'s `const` assertion on `RecHooks::ODE_DRIVER_OK`); this
+/// pins the flag itself: the recording type and every plain type integrate, a dual of a recording
+/// — at any depth — does not. Mutation: `ODE_DRIVER_OK = true` on `DualT` -> the last two
+/// assertions fail.
+#[test]
+fn only_a_recording_with_a_segment_rule_or_a_plain_type_reaches_the_ode_driver() {
+    use crate::sens::jet::DualT;
+    use crate::sens::num::RecHooks;
+    assert!(<Tr as RecHooks>::ODE_DRIVER_OK);
+    assert!(<f64 as RecHooks>::ODE_DRIVER_OK);
+    assert!(<DualT<1, f64> as RecHooks>::ODE_DRIVER_OK);
+    assert!(<DualT<2, DualT<1, f64>> as RecHooks>::ODE_DRIVER_OK);
+    assert!(!<DualT<1, Tr> as RecHooks>::ODE_DRIVER_OK);
+    assert!(!<DualT<1, DualT<1, Tr>> as RecHooks>::ODE_DRIVER_OK);
+}
+
+/// A steady-state call whose map the recording cannot take (the map declines at the record
+/// point) fails the recording as the point's: callers substitute a state for a `None` and keep
+/// recording, which gave a plan with no steady state. Mutation: drop the `fail_here` in
+/// `Tr::ss_fixed_point` -> `end` is `Ok`.
+#[test]
+fn a_steady_state_call_the_recording_cannot_take_fails_the_recording() {
+    use crate::sens::num::RecHooks;
+    begin();
+    let declines: &dyn Fn(&[Tr]) -> Option<Vec<Tr>> = &|_| None;
+    let out = <Tr as RecHooks>::ss_fixed_point(1, &[], &[0.0], &[declines], Box::new(|_| None));
+    assert!(matches!(out, Some(None)), "the call is not taken");
+    match end(Some(vec![])) {
+        Err((_, scope)) => assert_eq!(scope, FailScope::Point),
+        Ok(_) => panic!("the recording went on without the steady state"),
+    }
+}
+
+/// Every `JetFn`'s native shim reaches its own jet at every order a plan reads: the shim table
+/// listed indices 0..7 only, so `Exprel` (8) and `LnGamma` (9) read `NaN` in a compiled plan
+/// (their recorded values were right). Each function's `k`-th derivative from a plan against
+/// `JetFn::jet`. Mutation: shrink the shim table's index list back to `0..7` -> the last two
+/// functions fail.
+#[test]
+fn every_jet_function_is_the_same_in_a_plan_as_in_its_table() {
+    use crate::sens::num::JetFn;
+    for f in JetFn::ALL {
+        for k in 0..=4u8 {
+            let at = 0.7;
+            let want = f.jet(at)[k as usize];
+            let got = run2(|e| vec![e[0].jet_k(f, k)], [at, at], [at, at])[0][0];
+            if want.is_nan() {
+                continue;
+            }
+            close(got, want, &format!("{f:?} order {k}"));
+        }
+    }
+}
+
+/// `periodic_ss_fixed_point_g`'s affinity self-check is a branch on a difference against a
+/// tolerance: a plan recorded at one point serves another (the check holds at both), where an
+/// exact-value guard on the solution and on each cycle's result held at the recording point
+/// alone (`run2` asserts the plan's checks hold at the second point). The fixed point itself is
+/// the closed form `b / (1 − e^{−k·II})`. Mutation: `br_value` reads back on `u_ss` / `within`
+/// -> the checks fail at the other point (or the function returned `None` under a recording).
+#[test]
+fn the_ss_affinity_self_check_holds_at_another_point() {
+    let ii = 12.0;
+    let f = |e: &[Tr]| {
+        let k = (e[0] * Tr::k(0.2) - Tr::k(1.5)).exp();
+        let decay = (-(k * Tr::k(ii))).exp();
+        let dose = Tr::k(5.0) * e[1].exp();
+        let unforced = |u: &[Tr]| Some(vec![u[0] * decay]);
+        let forced = |u: &[Tr]| Some(vec![u[0] * decay + dose]);
+        let u =
+            crate::dosing::periodic_ss_fixed_point_g::<Tr, _, _>(1, ii, 0.0, 0.0, unforced, forced)
+                .expect("the affine map's fixed point");
+        vec![u[0]]
+    };
+    let got = run2(f, [0.3, 0.2], [1.2, 0.9]);
+    let k = (1.2f64 * 0.2 - 1.5).exp();
+    let want = 5.0 * 0.9f64.exp() / (1.0 - (-k * ii).exp());
+    close(got[0][0], want, "the fixed point at the second point");
 }

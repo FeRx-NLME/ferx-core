@@ -370,20 +370,22 @@ where
         }
     }
     let u_ss = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_m, &b, n)?;
-    if u_ss.iter().any(|x| !x.br_value().is_finite()) {
+    // `|x| < ∞`, as a branch (a `NaN` fails it too): a guard on the verdict, not on the value.
+    if u_ss.iter().any(|x| !x.br_abs_lt(f64::INFINITY)) {
         return None;
     }
-    // The checks below read the values a recording type saw (`seen_value`): they verify the map
-    // is affine — a property of the model, not of the point — and the solution above does not
-    // depend on their verdict.
+    // The checks below verify the map is affine — a property of the model, not of the point —
+    // and the solution above does not depend on their verdict. Each is a branch on the
+    // difference against a tolerance, so a recording holds while the verdict does and not at the
+    // one value it saw: an exact-value guard on `u_ss` or on a cycle's result would fail at
+    // every other point and record again on every evaluation.
     // Confirm linearity on the value part: one and two forced cycles from u_ss must both return
     // u_ss (only an affine one-cycle map does). The tolerance is scaled to the caller's own
     // accuracy so the fast path is not falsely abandoned at a loose `ode_reltol`; a genuinely
     // nonlinear map diverges by O(scale) and is rejected. Two cycles (not one) rejects a weakly-
     // nonlinear map whose true fixed point merely happens to sit within `vtol` after the first.
-    let scale = u_ss
-        .iter()
-        .fold(1e-12_f64, |a, x| a.max(x.br_value().abs()));
+    // The scale is a magnitude (`abs_hint`, no guard): it only sets how loose the bound is.
+    let scale = u_ss.iter().fold(1e-12_f64, |a, x| a.max(x.abs_hint()));
     // Verification tolerance, scaled to the caller's own accuracy. For the ODE caller the
     // one-cycle residual of a genuinely *linear* map is not zero but a solver-noise floor: `b`
     // (forced from a zero state) and the check below (forced from `u_ss`) integrate the same
@@ -398,10 +400,12 @@ where
     // propagators need — seven orders above their measured ~1e-16 residual and still eight orders
     // below a nonlinear map's O(scale).
     let vtol = (256.0 * reltol + 1e-9) * scale + 256.0 * abstol;
+    // `|c − u| ≤ vtol` is `< next_up(vtol)`, exactly, for a finite `vtol`.
+    let vtol_open = vtol.next_up();
     let within = |a: &[T], b: &[T]| {
         a.iter()
             .zip(b)
-            .all(|(c, u)| (c.br_value() - u.br_value()).abs() <= vtol)
+            .all(|(&c, &u)| c.br_absdiff_lt(u, vtol_open))
     };
     let u_check = advance_forced(&u_ss)?;
     if !within(&u_check, &u_ss) {
@@ -1274,7 +1278,8 @@ pub(crate) fn count_gt_multiples<G: crate::sens::num::PkNum>(x: G, ii: f64) -> u
     if !x.br_cmp_c(Gt, 0.0) {
         return 0;
     }
-    let v = x.br_value();
+    // value-read-ok: an estimate; the two comparisons recorded below pin `n`, the value is not a decision
+    let v = x.probe_value();
     let mut n = if v.is_finite() {
         (v / ii).ceil() as usize
     } else {
@@ -1359,7 +1364,8 @@ pub(crate) fn residual_end_indices_g<G: crate::sens::num::PkNum>(
     horizon: f64,
 ) -> std::ops::Range<usize> {
     use crate::sens::num::BranchCmp::{Gt, Le};
-    let j0 = ResidualEnds::new(t, first.br_value(), ii, n).count_ending_after(horizon);
+    // value-read-ok: an estimate of the split; the two comparisons recorded below pin it
+    let j0 = ResidualEnds::new(t, first.probe_value(), ii, n).count_ending_after(horizon);
     let end = |j: usize| G::from_f64(t) + first - G::from_f64(j as f64 * ii);
     if j0 > 0 {
         end(j0 - 1).br_cmp_c(Gt, horizon);

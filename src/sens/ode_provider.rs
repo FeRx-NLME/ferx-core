@@ -859,7 +859,10 @@ pub(crate) fn apply_output_transform<T: crate::sens::num::vm::VmNum>(
     // LTBS log — deferred under an expression scale, which production applies *before* the
     // log (`apply_scaling` then `apply_log_transform`) and the adjoint applies after the walk
     // (`apply_expression_scale`, which then takes this same log).
-    let deferred = matches!(model.scaling, ScalingSpec::ExpressionScale { .. });
+    let deferred = matches!(
+        model.scaling,
+        ScalingSpec::ExpressionScale { .. } | ScalingSpec::PerCmt(_)
+    );
     if model.log_transform && !deferred {
         ltbs_readout(p)
     } else {

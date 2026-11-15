@@ -3623,3 +3623,316 @@ fn ss_modeled_duration_lag_ge_ii_ebe_on_window_edge_kink_is_not_differentiable()
         );
     }
 }
+
+// ---- per-CMT `obs_scale` on the ODE walks (#2786, universal-engine item 5) ----------------
+
+/// A two-observed-compartment ODE with a per-CMT `obs_scale` — a constant on CMT 1 (the depot)
+/// and the η-dependent individual parameter `V` on CMT 2 — and, optionally, LTBS and κ.
+fn per_cmt_scale_src(ltbs: bool, iov: bool) -> String {
+    format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+         theta TVKA(1.2, 0.05, 20.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n{}  \
+         sigma S ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+         V = TVV * exp(ETA_V{})\n  KA = TVKA\n[structural_model]\n  \
+         ode(obs_cmt=central, states=[depot, central])\n[odes]\n  d/dt(depot) = -KA * depot\n  \
+         d/dt(central) = KA * depot - (CL/V) * central\n[scaling]\n  obs_scale[CMT=1] = 5\n  \
+         obs_scale[CMT=2] = V\n[error_model]\n  {}\n{}",
+        if iov { "  kappa KAPPA_V ~ 0.03\n" } else { "" },
+        if iov { " + KAPPA_V" } else { "" },
+        if ltbs {
+            "log(DV) ~ additive(S)"
+        } else {
+            "DV ~ proportional(S)"
+        },
+        if iov {
+            "[fit_options]\n  iov_column = OCC\n"
+        } else {
+            ""
+        },
+    )
+}
+
+/// A per-CMT `obs_scale` on an ODE model (static and event-driven walk) used to decline the
+/// whole subject to finite differences (`apply_expression_scale`'s `PerCmt` arm was `None`).
+/// Served now: each observation divides by its own CMT's scale — a constant on one, an
+/// η-dependent expression on the other — then the LTBS log, against the reconverged-FD objective
+/// gradient and the Richardson `∂f/∂η` of the production predictor. The observations alternate
+/// CMTs and CMT 2's scale moves with `η_V` (`measure` asserts every η column live), so a scale
+/// applied to the wrong CMT fails the Jacobian.
+/// Mutations: return `None` for `PerCmt` -> `served` fails; look the scale up by observation
+/// index instead of its CMT -> the Jacobian gap is O(1); drop `PerCmt` from
+/// `apply_output_transform`'s deferral -> LTBS logs before the divisor and the gap is O(1).
+#[test]
+fn a_per_cmt_obs_scale_on_an_ode_is_analytic() {
+    for ltbs in [false, true] {
+        let m = tight(parse_model_string(&per_cmt_scale_src(ltbs, false)).unwrap());
+        assert!(matches!(m.scaling, crate::types::ScalingSpec::PerCmt(_)));
+        let mut s = two_dose_subject(&m);
+        s.obs_cmts = (0..s.obs_times.len()).map(|j| 1 + j % 2).collect();
+        // With a covariate that varies by row the same subject takes the event walk.
+        for tv in [false, true] {
+            let mut s = s.clone();
+            if tv {
+                s.covariates.insert("WT".into(), 70.0);
+                s.obs_covariates = vec![s.covariates.clone(); s.obs_times.len()];
+                s.dose_covariates = vec![s.covariates.clone(); s.doses.len()];
+            }
+            let label = format!("per-CMT obs_scale, ltbs {ltbs}, tv {tv}");
+            let (jac, grad) = measure(&m, &s, &[0, 1, 2], &label);
+            assert!(jac < 1e-6 && grad < 3e-5, "{label}: {jac:.2e} {grad:.2e}");
+        }
+    }
+}
+
+/// The IOV event walk's per-(occasion group, CMT) scale: κ on `V`, so CMT 2's scale differs per
+/// occasion. Mutation: key the cache by CMT only (drop the group) -> the second occasion reads
+/// the first's scale and the Jacobian gap is O(1).
+#[test]
+fn a_per_cmt_obs_scale_under_iov_is_analytic() {
+    let m = tight(parse_model_string(&per_cmt_scale_src(false, true)).unwrap());
+    let times = [1.0, 4.0, 10.0, 13.0, 16.0, 22.0];
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let mut s = subject_shell(doses, &times);
+    s.occasions = vec![1, 1, 1, 2, 2, 2];
+    s.dose_occasions = vec![1, 2];
+    s.obs_cmts = vec![1, 2, 1, 2, 1, 2];
+    let kappas = vec![vec![0.1], vec![-0.08]];
+    let preds = crate::pk::predict_iov(&m, &s, &m.default_params.theta, &[0.1, -0.05], &kappas);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    assert!(
+        served(&m, &s),
+        "the adjoint must serve a per-CMT scale under IOV"
+    );
+    let jac = iov_jacobian_gap(&m, &s, &[0.06, -0.04, 0.05, -0.03], "per-CMT IOV");
+    let grad = fd_oracle(&m, &s, true);
+    eprintln!("per-CMT obs_scale × IOV: ∂f/∂[η, κ] {jac:.2e}; gradient {grad:.2e}");
+    assert!(jac < 8e-11, "∂f/∂[η, κ]: {jac:.2e}");
+    assert!(grad < 4.5e-5, "gradient: {grad:.2e}");
+}
+
+// ---- variant churn of the exact-value guards (#2786, universal-engine item 6) -------------
+
+/// How many variants a subject's plan holds after it is served at `points` `(θ scale, η)` —
+/// 1 when one recording serves them all, one per point when a guard on a continuous value
+/// fails at every other point and the subject is recorded again each time.
+fn variants_over(m: &CompiledModel, s: &Subject, points: &[(f64, Vec<f64>)]) -> usize {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let n = m.n_eta;
+    for (scale, eta) in points {
+        let theta: Vec<f64> = m.default_params.theta.iter().map(|t| t * scale).collect();
+        let layout = terms::layout1(n);
+        assert!(
+            plan_forward(m, s, None, &theta, eta, layout).is_some(),
+            "the subject records and serves at θ×{scale}, η {eta:?}"
+        );
+    }
+    let key = kj::SubjectKey::new(m, s, n, m.default_params.theta.len()).with_layout(None);
+    match kj::lookup(&key) {
+        kj::Lookup::Found(ks) => ks.len(),
+        _ => panic!("the subject has no plan"),
+    }
+}
+
+fn churn_points() -> Vec<(f64, Vec<f64>)> {
+    (0..6)
+        .map(|k| {
+            let x = k as f64;
+            (1.0 + 0.04 * x, vec![0.05 * x - 0.1, 0.03 - 0.02 * x])
+        })
+        .collect()
+}
+
+const CF_SS_LAG: &str = r#"
+[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV(30.0, 1.0, 500.0)
+  theta TVKA(1.2, 0.05, 20.0)
+  theta TVLAG(0.5, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_LAG ~ 0.1
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V = TVV
+  KA = TVKA
+  ALAG = TVLAG * exp(ETA_LAG)
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// A closed-form SS dose under an estimated lag, a later dose on residual drug: `cmt` 1 a bolus,
+/// 2 an infusion at `rate`. The variants a plan holds after `churn_points`.
+fn cf_ss_lag_variants(cmt: usize, rate: f64) -> usize {
+    let m = parse_model_string(CF_SS_LAG).unwrap();
+    let s = subject(
+        &m,
+        vec![
+            DoseEvent::new(0.0, 100.0, cmt, rate, true, 12.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.1, 1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0],
+        &[0.1, -0.05],
+    );
+    variants_over(&m, &s, &churn_points())
+}
+
+/// Over six distinct (theta, eta) points a subject keeps at most `MAX_CHURN` plans: a guard on
+/// the exact value of a continuous quantity fails at every other point and records the subject
+/// again on each evaluation (six variants here). A plan holds while its *decisions* do.
+const MAX_CHURN: usize = 2;
+
+/// A closed-form SS bolus under an estimated lag stays one plan across a fit. A control for the
+/// bolus side of the seed (no exact-value guard on the lag or on `u_ss`); measured, it does NOT
+/// die when `periodic_ss_fixed_point_g`'s self-check is mutated back to `br_value` reads (this
+/// fixture's seed does not take that call) -- that site is pinned by
+/// `the_ss_affinity_self_check_holds_at_another_point` (`kernel_jit_plan_tests.rs`).
+#[test]
+fn a_closed_form_ss_bolus_under_a_lag_is_one_plan_across_a_fit() {
+    assert!(cf_ss_lag_variants(1, 0.0) <= MAX_CHURN);
+}
+
+/// `ss_state_at_phase_g` guarded `phase` and the lag by exact value: a lagged SS infusion seed
+/// never replayed at another lag. Mutation: `phase.br_value()` / `lag.br_value()` back in the
+/// non-overlapping arm -> 6 variants.
+#[test]
+fn a_lagged_ss_infusion_seed_is_one_plan_across_a_fit() {
+    assert!(
+        cf_ss_lag_variants(2, 50.0) <= MAX_CHURN,
+        "closing before the record"
+    );
+}
+
+/// An SS dose into `zero_order` (lowered to a modeled duration, an estimated window): the
+/// window's count (`count_gt_multiples`, `residual_end_indices_g`) read the exact value of the
+/// moving duration although recorded comparisons pin it. Mutation: `probe_value()` back to
+/// `br_value()` in either -> one variant per point.
+#[test]
+fn an_ss_infusion_with_an_estimated_window_is_one_plan_across_a_fit() {
+    for (kernel, v) in [("zero_order", 3.0), ("first_order", 0.4)] {
+        let m = tight(parse_model_string(&ss_lag_model(kernel, "alag", 2.0, v)).unwrap());
+        let s = subject(
+            &m,
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &[0.4, 4.0, 6.5, 7.5, 10.5, 16.0, 19.0, 22.5, 28.0, 31.0],
+            &[0.1, -0.05],
+        );
+        let n = variants_over(&m, &s, &churn_points());
+        assert!(n <= MAX_CHURN, "{kernel}: {n} variants over six points");
+    }
+}
+
+/// The overlapping infusion keeps its exact-value guard, and the one running at the record has
+/// residual windows that move with the lag: printed (measured), not asserted.
+#[test]
+fn a_running_ss_infusion_under_a_lag_is_measured() {
+    let n = cf_ss_lag_variants(2, 100.0 / 11.8);
+    eprintln!("running-at-the-record SS infusion + lag: {n} variants over 6 points");
+}
+
+// ---- which parser-accepted shapes the structural scope predicates still send to FD ---------
+
+/// `(label, source)` of shapes the scope predicates were audited against (#2786, universal-engine
+/// item 5), each parsed and asked of [`recorder_in_scope`] and, on a two-dose subject, of the
+/// recorder itself. The table is printed (`--nocapture`) and the shapes that are served are
+/// asserted; the shapes still declined are asserted too, so a change that serves one turns this
+/// red and the report's "still open" row goes with it.
+fn scope_probe_sources() -> Vec<(&'static str, String, Option<bool>)> {
+    let ode = |odes: &str, ind: &str, cov: &str, scaling: &str, extra_theta: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n{extra_theta}  \
+             omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  \
+             CL = TVCL * exp(ETA_CL)\n  V = TVV\n{ind}[structural_model]\n  \
+             ode(obs_cmt=central, states=[central])\n[odes]\n{odes}{cov}[scaling]\n{scaling}\
+             [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+        )
+    };
+    vec![
+        (
+            "init(central) = 2 * WT (a covariate in the init)",
+            ode(
+                "  init(central) = 2 * WT\n  d/dt(central) = -(CL/V) * central\n",
+                "",
+                "[covariates]\n  WT continuous\n",
+                "  y = central / V\n",
+                "",
+            ),
+            None,
+        ),
+        (
+            "weibull + compartment lag",
+            ode(
+                "  d/dt(central) = weibull(td=TD, beta=BETA) - CL/V*central\n",
+                "  TD = TVTD\n  BETA = TVBETA\n  ALAG1 = TVLAG\n",
+                "",
+                "  y = central / V\n",
+                "  theta TVTD(2.0, 0.05, 24.0)\n  theta TVBETA(1.5, 0.1, 10.0)\n  theta TVLAG(0.5, 0.01, 5.0)\n",
+            ),
+            Some(false),
+        ),
+    ]
+}
+
+#[test]
+fn scope_declines_are_enumerated() {
+    for (label, src, expect_served) in scope_probe_sources() {
+        let parsed = parse_model_string(&src);
+        let Ok(m) = parsed else {
+            eprintln!(
+                "SCOPE-PROBE {label}: REJECTED BY THE PARSER ({:?})",
+                parsed.err()
+            );
+            continue;
+        };
+        let m = tight(m);
+        let s = two_dose_subject(&m);
+        let in_scope = recorder_in_scope(&m);
+        let ok = in_scope && served(&m, &s);
+        eprintln!("SCOPE-PROBE {label}: recorder_in_scope {in_scope}, served {ok}");
+        if let Some(want) = expect_served {
+            assert_eq!(ok, want, "{label}");
+        }
+    }
+}
+
+/// Two lagged infusions whose window ends coincide (`0 + 2` and `1 + 1`, both shifted by the lag)
+/// are not representable by the single-`dt` walk, and that is read off this point's values: the
+/// recording fails as the point's (declined, counted), and the subject is not condemned for the
+/// fit. Mutation: drop `T::fail_point` in `closed_form_event_predictions` -> the recorder
+/// returns `None` with finite values, which `end` maps to the subject's scope, and the key reads
+/// `Bad`.
+#[test]
+fn coincident_moving_breaks_decline_the_point_not_the_subject() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let m = parse_model_string(CF_SS_LAG).unwrap();
+    let s = subject(
+        &m,
+        vec![
+            DoseEvent::new(0.0, 100.0, 2, 50.0, false, 0.0),
+            DoseEvent::new(1.0, 50.0, 2, 50.0, false, 0.0),
+        ],
+        &[0.5, 3.0, 5.0, 8.0],
+        &[0.1, -0.05],
+    );
+    let theta = m.default_params.theta.clone();
+    assert!(
+        plan_forward(&m, &s, None, &theta, &[0.1, -0.05], terms::layout1(2)).is_none(),
+        "premise: the coincident breaks decline the walk"
+    );
+    let key = kj::SubjectKey::new(&m, &s, 2, theta.len()).with_layout(None);
+    assert!(
+        !matches!(kj::lookup(&key), kj::Lookup::Bad),
+        "the subject is not condemned for a point's coincidence"
+    );
+}

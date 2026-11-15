@@ -213,6 +213,21 @@ struct Rec {
     alts: Arc<Vec<Arc<Template>>>,
 }
 
+/// A recording's extent at one point ([`Rec::snapshot`]).
+struct Snapshot {
+    code: usize,
+    n_regs: u32,
+    pool: usize,
+    loops: usize,
+    marks: usize,
+    guard: Option<u32>,
+    guarded: std::collections::HashSet<(u32, bool), FxBuild>,
+    declined: usize,
+    nonfinite: bool,
+    trace: usize,
+    at: usize,
+}
+
 /// A hash-consing key: tag, operands, immediate.
 type Key = (u8, u32, u32, u64);
 /// One hash-consing decision of a recording: the key, its register, and whether it was made
@@ -286,6 +301,42 @@ impl Rec {
             }
         }
         self.cse.insert(k, d);
+    }
+    /// What [`Self::restore`] needs to undo everything recorded after this point.
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            code: self.code.len(),
+            n_regs: self.n_regs,
+            pool: self.pool.len(),
+            loops: self.loops.len(),
+            marks: self.marks.len(),
+            guard: self.guard,
+            guarded: self.guarded.clone(),
+            declined: self.declined,
+            nonfinite: self.nonfinite,
+            trace: self.trace.len(),
+            at: self.at,
+        }
+    }
+    /// Undo what was recorded since `s`: the instructions, registers (and what hash-consing,
+    /// the literal pool and the values know of them), loop calls, chunk marks, guards and the
+    /// template trace — a replay takes its next decision from where it stood.
+    fn restore(&mut self, s: Snapshot) {
+        let n = s.n_regs;
+        self.code.truncate(s.code);
+        self.n_regs = n;
+        self.pool.truncate(s.pool);
+        self.loops.truncate(s.loops);
+        self.marks.truncate(s.marks);
+        self.guard = s.guard;
+        self.guarded = s.guarded;
+        self.declined = s.declined;
+        self.nonfinite = s.nonfinite;
+        self.trace.truncate(s.trace);
+        self.at = s.at;
+        self.cse.retain(|_, d| *d < n);
+        self.lits.retain(|d| *d < n);
+        self.vals.truncate(n as usize);
     }
     /// Register `r`'s recorded value.
     #[inline]
@@ -1099,7 +1150,14 @@ impl RecHooks for Tr {
         maps: &[&dyn Fn(&[Self]) -> Option<Vec<Self>>],
         solve: Box<SolveFn>,
     ) -> Option<Option<Vec<Self>>> {
-        Some(record_fixed(n, held, u0, maps, solve))
+        let out = record_fixed(n, held, u0, maps, solve);
+        if out.is_none() {
+            // A caller substitutes a state for a call the recording could not take and goes on
+            // recording: the plan would have no steady state. The recording fails instead (the
+            // point's, as a map or search that declines does so at these values).
+            fail_here("a steady-state call could not be recorded");
+        }
+        Some(out)
     }
     fn repeat(
         x0: &[Self],
@@ -1132,6 +1190,9 @@ impl RecHooks for Tr {
     }
     fn same_node(&self, other: &Self) -> bool {
         self.r == other.r && self.dep == other.dep && self.v.to_bits() == other.v.to_bits()
+    }
+    fn fail_point(why: &str) {
+        fail_here(why);
     }
     fn note_linear_decline() {
         rec(|r| r.declined += 1);
@@ -1560,7 +1621,8 @@ fn live_code(
 /// differentiating, one state direction at a time, the recording of a call on fresh variables
 /// (which the recording then drops). Exact — no probe, so no cancellation against the forcing
 /// — and checked: a column or a guard that still depends on the variables means the RHS is not
-/// affine in them, and the recording fails.
+/// affine in them: the call's recording is undone and `false` returned, a decline of the exact
+/// linear path (the caller integrates the segment), not a failure of the recording.
 pub(crate) fn affine_parts(
     rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]),
     params: &[Tr],
@@ -1586,6 +1648,7 @@ fn affine_parts_folding(
     let zeros = vec![Tr::k(0.0); n];
     rhs(&zeros, params, Tr::k(t), b);
     let start = rec(|r| r.code.len());
+    let before = rec(|r| r.snapshot());
     let u: Vec<Tr> = (0..n)
         .map(|_| Tr::mk(0.0, node(None, |d| Flat::LoadK { d, c: 0.0 }), true))
         .collect();
@@ -1620,7 +1683,11 @@ fn affine_parts_folding(
         }
     }
     if a.iter().any(|x| x.dep && on_u[x.r as usize]) || guard.is_some_and(|g| on_u[g as usize]) {
-        fail_subject("the right-hand side is not affine in the state");
+        // Not affine in the state: the exact linear path does not apply, which is a decision
+        // about the path, not a failure of the recording. Everything the speculative call on
+        // the variables recorded goes (its guards read the variables' placeholder values), and
+        // the caller integrates the segment instead, as it does for any decline.
+        rec(|r| r.restore(before));
         return false;
     }
     true
@@ -1802,10 +1869,11 @@ fn tangent(g: &Flat, h: &impl Fn(u32) -> Tr, tan: &HashMap<u32, Tr, FxBuild>) ->
                 Unary::Abs => Tr::select_if(BranchCmp::Ge, v, Tr::k(0.0), x, -x),
                 Unary::ExpRel(k) => v.exprel_k(k + 1) * x,
                 Unary::Jet(f, k) => v.jet_k(f, k + 1) * x,
-                Unary::Tetragamma => {
-                    fail(format!("no tangent rule for {op:?}"));
-                    return None;
-                }
+                // `ψ″' = ψ‴` is the fourth derivative of `ln Γ`: the last of `JetFn::LnGamma`'s
+                // jet (`pentagamma`), recorded as the `k = 4` jet of `ln Γ`. Its own tangent is
+                // the fifth, which no jet carries (`jet_k_node`: `NaN` past the fourth, as
+                // every layout's order is bounded by it).
+                Unary::Tetragamma => v.jet_k(crate::sens::num::JetFn::LnGamma, 4) * x,
                 Unary::Floor | Unary::Ceil | Unary::Round | Unary::StopGrad => return None,
             })
         }

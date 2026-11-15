@@ -30629,7 +30629,10 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
             // is what makes `∂f/∂θ_k` exact through a gather.
             Op::PushThetaGather(g) => {
                 // Integer-valued data (a level index): a recording holds it as a constant.
-                let raw = pop!().nonrec_val().unwrap_or(f64::NAN);
+                // A θ/η-dependent index is no level index: the recording fails (never a `NaN`
+                // substituted and recorded on).
+                let idx = pop!();
+                let raw = idx.nonrec_val().unwrap_or_else(|| idx.value_read_refused());
                 let v = match bc.gathers.get(g as usize) {
                     Some(spec) => gather_g::<T>(spec, theta, raw),
                     None => {

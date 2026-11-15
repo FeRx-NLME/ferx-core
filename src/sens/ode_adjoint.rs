@@ -1227,8 +1227,9 @@ fn divide_by_scale<T: VmNum>(y: T, s: T) -> T {
 
 /// An expression `obs_scale` divisor `s(θ, η, p)`, applied after the walk as the
 /// providers do: the scale program evaluated on the tape over the (subject-static)
-/// taped parameters, and every prediction becomes `pred / s`. `None` for a scale this
-/// cannot serve (a per-CMT scale, or LTBS on top of it).
+/// taped parameters, and every prediction becomes `pred / s` — each on its CMT's entry for a
+/// per-CMT scale — then the LTBS log. `None` only for an expression with no compiled program,
+/// which the parser never builds.
 fn apply_expression_scale<T: VmNum>(
     model: &CompiledModel,
     subject: &Subject,
@@ -1263,9 +1264,68 @@ fn apply_expression_scale<T: VmNum>(
             }
             Some(preds)
         }
-        ScalingSpec::ExpressionScale { .. } | ScalingSpec::PerCmt(_) => None,
+        // One entry per observed compartment, as production's `build_obs_scale_array`: each
+        // observation divided by its CMT's scale (an entry's expression evaluated once, at the
+        // subject-static parameters), a CMT with no entry a `NaN` prediction, then the LTBS log.
+        ScalingSpec::PerCmt(map) => {
+            let slot = |sl: usize| {
+                by_slot
+                    .get(sl)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(T::from_f64(0.0))
+            };
+            let mut scales: std::collections::HashMap<usize, Option<T>> = Default::default();
+            for (j, y) in preds.iter_mut().enumerate() {
+                let cmt = *subject.obs_cmts.get(j)?;
+                let s = match scales.get(&cmt) {
+                    Some(&s) => s,
+                    None => {
+                        let s = match map.get(&cmt) {
+                            Some(spec) => {
+                                scale_of_spec(spec, theta, eta, &subject.covariates, &slot)?
+                            }
+                            None => Some(T::from_f64(f64::NAN)),
+                        };
+                        scales.insert(cmt, s);
+                        s
+                    }
+                };
+                if let Some(s) = s {
+                    *y = divide_by_scale(*y, s);
+                }
+                if model.log_transform {
+                    *y = crate::sens::ode_provider::ltbs_readout(*y);
+                }
+            }
+            Some(preds)
+        }
+        ScalingSpec::ExpressionScale { .. } => None,
         _ => Some(preds),
     }
+}
+
+/// One `[scaling]` entry's divisor over the tape (`None`: no division): a constant, or the
+/// expression on `theta`/`eta` with the individual parameters `slot` reads. `None` for an
+/// entry with no compiled program or a nested per-CMT map, which the parser never builds.
+fn scale_of_spec<T: VmNum>(
+    spec: &ScalingSpec,
+    theta: &[T],
+    eta: &[T],
+    covariates: &std::collections::HashMap<String, f64>,
+    slot: &dyn Fn(usize) -> T,
+) -> Option<Option<T>> {
+    Some(match spec {
+        ScalingSpec::None => None,
+        ScalingSpec::ScalarScale(k) => Some(T::from_f64(*k)),
+        ScalingSpec::ExpressionScale {
+            deriv: Some(prog), ..
+        } => {
+            let vars: Vec<T> = prog.var_to_pk_slot().iter().map(|&sl| slot(sl)).collect();
+            Some(prog.eval_scale_g(theta, eta, covariates, &vars))
+        }
+        ScalingSpec::ExpressionScale { .. } | ScalingSpec::PerCmt(_) => return None,
+    })
 }
 
 /// ODE engine: the static superposition walk, or (time-varying covariates, lag times,
@@ -1562,7 +1622,40 @@ fn record_ode_iov<T: VmNum>(
                 }
             }
         }
-        ScalingSpec::ExpressionScale { .. } | ScalingSpec::PerCmt(_) => return None,
+        // One scale per (occasion group, CMT) (`predict_iov`'s `apply_scaling` over
+        // `build_obs_scale_array`), applied to that group's observation on that CMT.
+        ScalingSpec::PerCmt(map) => {
+            let groups = match shared {
+                Some(g) => g,
+                None => static_groups()?,
+            };
+            let mut scales: std::collections::HashMap<(usize, usize), Option<T>> =
+                Default::default();
+            for (j, y) in preds.iter_mut().enumerate() {
+                let g = layout.group_of(*subject.occasions.get(j)?)?;
+                let cmt = *subject.obs_cmts.get(j)?;
+                let s = match scales.get(&(g, cmt)) {
+                    Some(&s) => s,
+                    None => {
+                        let params = &groups[g];
+                        let slot = |sl: usize| params.get(sl).copied().unwrap_or(T::from_f64(0.0));
+                        let s = match map.get(&cmt) {
+                            Some(spec) => scale_of_spec(spec, th, &et[..n_eta], cov, &slot)?,
+                            None => Some(T::from_f64(f64::NAN)),
+                        };
+                        scales.insert((g, cmt), s);
+                        s
+                    }
+                };
+                if let Some(s) = s {
+                    *y = divide_by_scale(*y, s);
+                }
+                if model.log_transform {
+                    *y = crate::sens::ode_provider::ltbs_readout(*y);
+                }
+            }
+        }
+        ScalingSpec::ExpressionScale { .. } => return None,
         _ => {}
     }
     Some(preds)

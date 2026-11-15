@@ -1350,6 +1350,9 @@ pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
     // break landing on a fixed obs/reset/cov-change time — aren't representable by the
     // single-`dt` walk; decline to FD (#486 review #2).
     if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
+        // Read off this point's resolved values: another point need not coincide, so a recording
+        // fails as the point's (declined and counted), not the subject's (condemned).
+        T::fail_point("moving breaks coincide at this point");
         return None;
     }
     let schedule = cached_event_schedule(subject, model.pk_model, &eff_doses, &dose_lagtimes);

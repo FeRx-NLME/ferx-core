@@ -39761,3 +39761,35 @@ fn ferx_check_reports_only_the_truly_unused_theta_of_a_mixture() {
         report.diagnostics
     );
 }
+
+/// A gather index that follows θ or η is no level index: recording it fails the recording (the
+/// value was read as `NaN` and recorded on before). The control: an index read from a covariate
+/// (data) gathers its level and records. Mutation: `unwrap_or(f64::NAN)` back in
+/// `Op::PushThetaGather` -> the recording of the θ-dependent index succeeds.
+#[test]
+fn a_theta_dependent_gather_index_fails_the_recording() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let program = |index: Op| Bytecode {
+        ops: vec![index, Op::PushThetaGather(0)],
+        constants: vec![0.0],
+        max_stack: 2,
+        gathers: vec![std::sync::Arc::new(GatherSpec {
+            name: "G".into(),
+            levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
+        })],
+    };
+    let run = |bc: &Bytecode| {
+        kj::begin();
+        let th = [kj::Tr::theta(0, 5.0), kj::Tr::theta(1, 2.0)];
+        let y = eval_bytecode_g(bc, &th, &[], &[2.0], &[], &[], &mut Vec::new());
+        (y.recorded(), kj::end(Some(vec![y.reg()])))
+    };
+    let (v, rec) = run(&program(Op::PushCov(0)));
+    assert!(rec.is_ok(), "a covariate index records");
+    assert_eq!(v, 2.0, "level 2 is θ[1]");
+    let (_, rec) = run(&program(Op::PushTheta(1)));
+    match rec {
+        Err((_, scope)) => assert_eq!(scope, kj::FailScope::Model),
+        Ok(_) => panic!("a θ-dependent index was recorded"),
+    }
+}

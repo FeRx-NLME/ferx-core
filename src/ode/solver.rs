@@ -3783,6 +3783,15 @@ fn integrate_resolved_g_inner<T: PkNum>(
     mut stats: Option<&mut OdeSolverStats>,
     auto_state: &mut OdeAutoSwitchState,
 ) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
+    // The driver below reads values; a recording reaches it only through `T::ode_segment`.
+    // A type that records without one (a nested dual over a recording) cannot be integrated:
+    // a compile error at the instantiation, not a failed recording at run time.
+    const {
+        assert!(
+            T::ODE_DRIVER_OK,
+            "the ODE driver cannot be instantiated over a nested dual of a recording"
+        )
+    };
     // A segment handed a non-finite state has nothing to integrate (#2788). Every stepper
     // couples the components through `u`, so its error norm is `NaN` from the first attempt:
     // the step shrinks to `min_dt`, force-accepts `MAX_CONSECUTIVE_MIN_STEP_CLAMPS` times and

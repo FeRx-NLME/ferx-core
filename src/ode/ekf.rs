@@ -251,7 +251,8 @@ fn propagate_covariance_between<T: VmNum, R: EkfRhs>(
     if dt.br_cmp_c(BranchCmp::Le, 1e-15) {
         return p_mat;
     }
-    let n_steps = ((dt.br_value() / RICCATI_DT_MAX).ceil() as usize).max(1);
+    // value-read-ok: an estimate; the two verdicts recorded below pin `n_steps`
+    let n_steps = ((dt.probe_value() / RICCATI_DT_MAX).ceil() as usize).max(1);
     if !dt.is_constant() {
         // The verdicts that give `n_steps`: `(n − 1)·Δ < dt ≤ n·Δ` (`dt / Δ` is exact, Δ a
         // power of two).
@@ -750,8 +751,15 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
     // `ode::predictions::times_have_non_finite`. `results` is prefilled with the
     // caller's default point, so overwrite it with NaN ipreds rather than returning a
     // finite-looking filter pass built on a timeline that could not be ordered.
+    // Finite, as a branch per break (a guard on the verdict, not on each break's value).
     if crate::ode::predictions::abandon_non_finite_timeline(
-        break_times.iter().map(|t| t.br_value()),
+        break_times.iter().map(|t| {
+            if t.br_abs_lt(f64::INFINITY) {
+                0.0
+            } else {
+                f64::NAN
+            }
+        }),
         None,
     ) {
         // `fill`, not a per-field loop: one spelling of the struct, so a field added to

@@ -1279,8 +1279,9 @@ fn segment_span<T: PkNum>(
     // A recording type (#2786) reads them off its recording instead, exactly
     // ([`RecHooks::affine_parts`]).
     if !T::affine_parts(rhs, params, t_mid, a, b) {
-        // A recording declined here has already failed (`not affine in the state`): there are
-        // no values to probe.
+        // A recording that found the right-hand side not affine in the state declines the
+        // segment (the recorder has undone what it tried): the caller integrates it. There
+        // are no values to probe.
         if T::RECORDS_BRANCHES {
             return None;
         }

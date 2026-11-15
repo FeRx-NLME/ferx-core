@@ -948,6 +948,9 @@ fn propagate_bounds_g<T: PkNum>(
     // cutoff, the doses that can carry a rate, and the doses with a boundary near this
     // interval come from it instead of a scan of every dose.
     index: &crate::dosing::DoseIndex,
+    // Break positions whose dual the caller supplies (`value`, dual): matched like the moving
+    // breaks below, so a recording can hold a break as a number that follows its inputs.
+    extra_moving: &[(f64, T)],
 ) {
     // Dual clock position of dose `k`'s arrival, `τ_k = t_k + ALAG`. With an estimated
     // lagtime this boundary **moves**: `dose_lag_dual[k]` carries `∂ALAG/∂(θ,η)`, so the
@@ -1035,6 +1038,7 @@ fn propagate_bounds_g<T: PkNum>(
             bounds.last().copied().unwrap_or(f64::INFINITY),
         ));
     }
+    moving_bounds.extend_from_slice(extra_moving);
     let dual_pos = |w: f64| -> T {
         for &(val, dual) in &moving_bounds {
             if (w - val).abs() < 1e-9 {
@@ -1567,6 +1571,7 @@ fn equilibrate_ss_g<T: PkNum>(
             inf_dual,
             f64::NEG_INFINITY,
             index,
+            &[],
         );
         Some(s)
     };
@@ -1608,6 +1613,7 @@ fn equilibrate_ss_g<T: PkNum>(
             &synthetic_inf,
             f64::NEG_INFINITY,
             &synthetic_index,
+            &[],
         );
         cycles_run = cycle + 1;
         if ss_dual_cycle_should_stop(cycle, &state, &mut cur, &mut prev, &mut prev_t) {
@@ -1667,10 +1673,26 @@ fn ss_state_at_phase_g<T: PkNum>(
         apply_step_g(&mut state, phase, pk, pk_model, (zero, zero, zero, zero));
         return state;
     }
-    let phase_v = phase.br_value();
     let cycle = dose.ss_cycle_doses();
     let cycle_inf = cycle_window_duals(dose, inf, cycle.len());
     let (_, r) = infusion_window_g(&cycle[0], cycle_inf[0], pk);
+    // Overlapping pulses (`T_inf > II`) replay inside this flow: there the phase is guarded on
+    // its exact value. Without them the record is a number that follows the inputs (`phase` with its jets dropped: the lag's jet
+    // rides the arrival), so one recording serves every lag whose flow has this shape.
+    let t_inf = inf.map_or(T::from_f64(dose.duration), |(_, w)| w);
+    // (The cycle's own clock carries no lag: its pulses overlap when `T_inf > II`, a count
+    // `count_gt_multiples` pins by recorded comparisons. The running window of the *real* lag
+    // is the walk's residual windows', after this seed.)
+    let overlapping = cycle.len() > 1
+        || crate::dosing::ss_residual_infusions_g(dose, T::from_f64(0.0), t_inf).1 > 0;
+    let (phase_v, record_end, arrival) = if overlapping {
+        let v = phase.br_value();
+        (v, T::from_f64(v), lag - T::from_f64(lag.br_value()))
+    } else {
+        // value-read-ok: the bound's key in the walk's break list; its value is `record_end`, a recorded number
+        let v = phase.probe_value();
+        (v, phase.value_only(), lag - lag.value_only())
+    };
     // The flow's shape — whether the newest window closes before the record — is a guard on
     // the phase.
     let bounds = if phase.br_cmp(B::Gt, r) {
@@ -1678,8 +1700,7 @@ fn ss_state_at_phase_g<T: PkNum>(
     } else {
         vec![0.0, phase_v]
     };
-    // The arrival: value 0 where recorded, the lag's jet (and its shift, on a replay at another lag).
-    let arrival = lag - T::from_f64(lag.br_value());
+    // The arrival: value 0, the lag's jet.
     propagate_bounds_g(
         &mut state,
         &bounds,
@@ -1691,6 +1712,7 @@ fn ss_state_at_phase_g<T: PkNum>(
         &cycle_inf,
         f64::NEG_INFINITY,
         &crate::dosing::DoseIndex::new(&cycle, &vec![0.0; cycle.len()]),
+        &[(phase_v, record_end)],
     );
     state
 }
@@ -1930,6 +1952,7 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 dose_inf_dual,
                 reset_floor,
                 &dose_index,
+                &[],
             );
             cur_t = ev.time;
         }

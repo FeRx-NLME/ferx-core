@@ -186,6 +186,10 @@ impl<const N: usize, B: PkNum> DualT<N, B> {
 }
 
 impl<const N: usize, B: PkNum> crate::sens::num::RecHooks for DualT<N, B> {
+    // A nested dual over a recording has no `ode_segment` (the segment's sensitivities would
+    // be the recorder's to record, not a dual's to carry): nothing integrates one, and the
+    // driver's entry points assert it.
+    const ODE_DRIVER_OK: bool = !B::RECORDS_BRANCHES;
     fn floor_c(self) -> Self {
         DualT {
             v: self.v.floor_c(),

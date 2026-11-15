@@ -178,7 +178,7 @@ fn jet_shim(f: crate::sens::num::JetFn, k: u8) -> NativeUnary {
             }
         };
     }
-    entries!(f.index(), k, 0, 1, 2, 3, 4, 5, 6, 7)
+    entries!(f.index(), k, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
 }
 
 /// The host calls' runtime: the queued arguments and the last call's outputs, per thread. The
