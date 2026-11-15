@@ -3550,7 +3550,7 @@ fn ss_d1_dense_subject(m: &CompiledModel, eta_ref: [f64; 2]) -> (Subject, Vec<f6
             assert!(l.is_finite() && r.is_finite());
             (l - r).abs()
         })
-        .fold(0.0, f64::max);
+        .fold(0.0, f64::max); // nan-ok: both slopes asserted finite in the map above
     (s, eta, jump)
 }
 
