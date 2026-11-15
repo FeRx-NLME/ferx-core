@@ -3915,26 +3915,20 @@ fn fit_inner(
         fit_result.warnings_structured.push(entry);
     }
     // Subjects whose compiled plan failed and took finite differences instead (#2786).
-    if let Some((msg, entry)) = crate::api::postfit::plan_fd_fallback_warning(model, population) {
+    // Counted once: the warning and both route labels read the same counts.
+    if let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
+        model,
+        &population.subjects,
+    ) {
+        let n = population.subjects.len();
+        let (msg, entry) = crate::api::postfit::plan_fd_fallback_warning(&c, n);
         // The realised route, not the model's: those subjects ran finite differences.
         // Each route from its own count: a θ-only failure is the outer gradient's alone, a
         // covariance-step one neither's.
-        if let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
-            model,
-            &population.subjects,
-        ) {
-            let n = population.subjects.len();
-            fit_result.gradient_method_inner = crate::api::postfit::plan_fallback_label(
-                &fit_result.gradient_method_inner,
-                c.inner,
-                n,
-            );
-            fit_result.gradient_method_outer = crate::api::postfit::plan_fallback_label(
-                &fit_result.gradient_method_outer,
-                c.outer,
-                n,
-            );
-        }
+        fit_result.gradient_method_inner =
+            crate::api::postfit::plan_fallback_label(&fit_result.gradient_method_inner, c.inner, n);
+        fit_result.gradient_method_outer =
+            crate::api::postfit::plan_fallback_label(&fit_result.gradient_method_outer, c.outer, n);
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }

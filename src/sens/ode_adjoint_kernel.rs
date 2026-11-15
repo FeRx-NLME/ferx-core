@@ -160,8 +160,13 @@ pub(super) fn kernel_run(
         kj::mark_bad(&key, "the recording could not be planned");
         return None;
     };
-    kj::add(&key, plan.clone());
-    run(&plan)
+    // The variant joins the cache once it runs: one that cannot (a point outside its guard)
+    // must not evict one that does.
+    let r = run(&plan);
+    if r.is_some() {
+        kj::add(&key, plan);
+    }
+    r
 }
 
 /// A kernel configuration's [`kj::SubjectKey`] variant: everything that shapes the kernel's

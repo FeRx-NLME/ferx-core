@@ -1657,6 +1657,7 @@ fn a_kept_forward_is_adopted_only_by_the_plan_that_made_it() {
                 plan: p.serial,
                 layout: p.layout,
                 buf: vec![0.0; p.n_slots * p.lanes],
+                scope: 0,
             },
         );
     };
@@ -1735,4 +1736,103 @@ fn the_caches_shrink_when_a_model_drops() {
         KERNELS_FREED.with(std::cell::Cell::get) > freed0,
         "its native code is freed with it"
     );
+}
+
+/// A bad mark is the subject's for every thread and every later caller, not for whichever
+/// thread looked it up last (#2786 review): a thread's last-subject entry is dropped when the
+/// mark is written, and a recording that finishes afterwards does not replace the mark.
+/// Mutation: drop the `GENERATION` bump and the `LAST` reset from `mark_bad` -> the lookup
+/// right after it still finds the plan; let `add` replace a `None` -> the lookup after the
+/// second `add` finds a plan again, on this thread and on another.
+#[test]
+fn a_bad_mark_outlives_the_cached_plan_and_a_late_add() {
+    let subject = crate::types::Subject::default();
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let key = SubjectKey::new(&m, &subject, 1, 2).with_variant(Desc::of_value(&0xbad_0001u64));
+    add(&key, square_plan());
+    assert!(matches!(lookup(&key), Lookup::Found(_)), "fixture: cached");
+    mark_bad(&key, "forced");
+    assert!(
+        matches!(lookup(&key), Lookup::Bad),
+        "the thread that cached the plan sees the mark"
+    );
+    // A recording that was in flight when the mark landed serves its caller, and stores nothing.
+    let served = add(&key, square_plan());
+    assert_eq!(served.len(), 1, "the caller still has a plan to serve from");
+    assert!(
+        matches!(lookup(&key), Lookup::Bad),
+        "a late add leaves the mark"
+    );
+    std::thread::scope(|s| {
+        s.spawn(|| assert!(matches!(lookup(&key), Lookup::Bad), "another thread"))
+            .join()
+            .expect("lookup");
+    });
+}
+
+/// A finished fit's templates, families and kept forwards leave with its scope; the model's
+/// scope-`0` state is not what they are keyed under (#2786 review): many fits of one model leave
+/// the caches as they found them, and another fit's kept forward stays.
+/// Mutation: key a family under scope `0` again (`SubjectKey::family`) -> the template's owner is
+/// `(0, id)` and `templates_of` stays 1 after every fit; stop `drop_scope` clearing the fit's
+/// kept forwards, or let `drop_model` clear them all -> the `kept_in` counts below.
+#[test]
+fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let id = m.plan_id.get();
+    let (a, b) = (
+        vec![crate::types::Subject::default()],
+        vec![crate::types::Subject::default()],
+    );
+    let guard_b = register(&m, &b);
+    let scope_of =
+        |s: &[crate::types::Subject]| registered(s.as_ptr() as usize).expect("registered").1;
+    let scope_b = scope_of(&b);
+    let keep = |owner: usize, scope: u64| {
+        kept_table().lock().unwrap().insert(
+            owner,
+            Kept {
+                plan: 0,
+                layout: l2(),
+                buf: vec![0.0; 4],
+                scope,
+            },
+        );
+    };
+    keep(b.as_ptr() as usize, scope_b);
+    for round in 0..4 {
+        let guard = register(&m, &a);
+        let scope_a = scope_of(&a);
+        assert_ne!(scope_a, scope_b, "each fit has a scope of its own");
+        // A structure no other test records, so the counts are this model's alone.
+        let family = SubjectKey::new(&m, &a[0], 1, 2)
+            .with_variant(Desc::of_value(&0xf17_0001u64))
+            .family();
+        assert_eq!(family.scope, scope_a, "the family belongs to the fit");
+        let rec = recorded(&family, || {
+            let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, 1.0)).collect();
+            let mut x = et[0];
+            for _ in 0..(11 + round) {
+                x = x * et[1] + et[0];
+            }
+            Some(vec![x.reg()])
+        })
+        .expect("records");
+        rec.plan(l2(), 2, 0).expect("plans");
+        keep(a.as_ptr() as usize, scope_a);
+        assert_eq!(templates_of(id), 1, "round {round}: the fit's template");
+        assert_eq!(kept_in(scope_a), 1);
+        drop(guard);
+        assert_eq!(templates_of(id), 0, "round {round}: it left with the fit");
+        assert_eq!(kept_in(scope_a), 0, "round {round}: so did its forward");
+        assert!(
+            lock_families().keys().all(|k| k.model != id),
+            "round {round}: and its family"
+        );
+        // Another model dropping is not this fit's business.
+        drop_model(u64::MAX);
+        assert_eq!(kept_in(scope_b), 1, "round {round}: B keeps its own");
+    }
+    drop(guard_b);
+    assert_eq!(kept_in(scope_b), 0, "B's leaves with B");
 }

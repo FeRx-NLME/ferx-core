@@ -160,9 +160,8 @@ struct Rec {
     code: Vec<Flat>,
     n_regs: u32,
     cse: HashMap<Key, u32, FxBuild>,
-    /// Why the recording failed, and whether every subject of the model would (a code path
-    /// the recorder cannot take) rather than this one at this point.
-    failed: Option<(String, bool)>,
+    /// Why the recording failed, and whose failure it is ([`FailScope`]).
+    failed: Option<(String, FailScope)>,
     /// The literals, in first-use order (argument 2 of the compiled function).
     pool: Vec<f64>,
     /// The conditions already required (`guard_reg`).
@@ -250,8 +249,10 @@ impl Rec {
                         .find(|o| meets(o) && o.trace.get(..at) == t.trace.get(..at))
                         .cloned();
                     if next.is_none() {
-                        self.failed
-                            .get_or_insert(("another structure than its template".into(), false));
+                        self.failed.get_or_insert((
+                            "another structure than its template".into(),
+                            FailScope::Subject,
+                        ));
                     }
                     self.replay = next;
                 }
@@ -314,17 +315,28 @@ fn rec<R>(f: impl FnOnce(&mut Rec) -> R) -> R {
     })
 }
 
+/// Whose failure a failed recording is: the point's alone (a record-time run that failed at
+/// these inputs: no steady state, an overflow), the subject's (its structure cannot be
+/// recorded), or the model's (a code path the recorder cannot take: every subject would fail).
+/// Only the last two condemn: a point's failure is declined, and the subject's plan route stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FailScope {
+    Point,
+    Subject,
+    Model,
+}
+
 /// Fail the recording on a code path the recorder cannot take: every subject would.
 fn fail(why: String) {
     rec(|r| {
-        r.failed.get_or_insert((why, true));
+        r.failed.get_or_insert((why, FailScope::Model));
     })
 }
 
 /// Fail the recording at this subject's point only (a record-time run that failed).
 fn fail_here(why: &str) {
     rec(|r| {
-        r.failed.get_or_insert((why.into(), false));
+        r.failed.get_or_insert((why.into(), FailScope::Point));
     })
 }
 
@@ -339,7 +351,8 @@ fn node(key: Option<Key>, mk: impl FnOnce(u32) -> Flat) -> u32 {
         }
         let d = r.n_regs;
         if d >= u32::MAX - 2 {
-            r.failed.get_or_insert(("register file full".into(), false));
+            r.failed
+                .get_or_insert(("register file full".into(), FailScope::Subject));
             return 0;
         }
         r.n_regs += 1;
@@ -361,7 +374,8 @@ fn node_v(key: Key, v: f64, mk: impl FnOnce(u32) -> Flat) -> Tr {
             None => {
                 let d = r.n_regs;
                 if d >= u32::MAX - 2 {
-                    r.failed.get_or_insert(("register file full".into(), false));
+                    r.failed
+                        .get_or_insert(("register file full".into(), FailScope::Subject));
                     return 0;
                 }
                 r.n_regs += 1;
@@ -475,7 +489,8 @@ impl Tr {
                 None => {
                     let d = r.n_regs;
                     if d >= u32::MAX - 2 {
-                        r.failed.get_or_insert(("register file full".into(), false));
+                        r.failed
+                            .get_or_insert(("register file full".into(), FailScope::Subject));
                         0
                     } else {
                         r.n_regs += 1;
@@ -1283,7 +1298,7 @@ pub(crate) struct Tie {
 /// Close the recording with `outs` as the outputs, or the reason it cannot be compiled.
 /// The recording, or why it failed and whether that is the model's code path (every
 /// subject would fail the same way).
-pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, bool)> {
+pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScope)> {
     STATS.records.fetch_add(1, Relaxed);
     let mut r = REC
         .with(|r| r.borrow_mut().take())
@@ -1294,12 +1309,13 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, bool)> {
     SPARE.set((std::mem::take(&mut r.cse), std::mem::take(&mut r.guarded)));
     #[cfg(test)]
     if FORCE_PLAN_FAIL.get() {
-        return Err((FORCED_FAILURE.to_string(), false));
+        return Err((FORCED_FAILURE.to_string(), FailScope::Subject));
     }
     if let Some(f) = r.failed {
         return Err(f);
     }
-    let outs = outs.ok_or_else(|| ("the recorder returned None".to_string(), false))?;
+    let outs =
+        outs.ok_or_else(|| ("the recorder returned None".to_string(), FailScope::Subject))?;
     if let Some(t) = r.replay.take() {
         // Every decision the template's, and every instruction, output, guard and mark as its:
         // the recording a fresh run would make, its literals and loop calls aside.
@@ -1313,7 +1329,10 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, bool)> {
             && r.code.len() == t.raw.len()
             && r.code.iter().zip(&t.raw).all(|(a, b)| a.same(b));
         if !same {
-            return Err(("another structure than its template".into(), false));
+            return Err((
+                "another structure than its template".into(),
+                FailScope::Subject,
+            ));
         }
         return Ok(Recording {
             code: Vec::new(),
@@ -1375,7 +1394,7 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, bool)> {
 pub(crate) fn recorded(
     family: &SubjectKey,
     f: impl Fn() -> Option<Vec<u32>>,
-) -> Result<Recording, (String, bool)> {
+) -> Result<Recording, (String, FailScope)> {
     #[cfg(test)]
     let off = TEMPLATE_PROBE.with(|p| p.get().0);
     #[cfg(not(test))]
@@ -2101,10 +2120,10 @@ impl SubjectKey {
         self
     }
     /// The plans of every subject of this computation ([`recorded`]): the key without the
-    /// subject's data or the fit's scope.
+    /// subject's data. It keeps the fit's scope, so the templates a fit planned leave with it
+    /// ([`drop_scope`]).
     pub(crate) fn family(&self) -> Self {
         SubjectKey {
-            scope: 0,
             subject: Desc::of(|_| {}),
             observed: None,
             ..self.clone()
@@ -2562,6 +2581,9 @@ pub(crate) fn plan_failure_counts(
         let observed = reg
             .as_ref()
             .map_or_else(|| observed_desc(s), |e| e.0[1].clone());
+        // A plan fails under its design alone or under its design and observed values, so two
+        // `get`s find every failure of this subject.
+        let own = [(design.clone(), None), (design, Some(observed))];
         let mut mask = 0u8;
         for &id in &ids {
             if let Some((failed, why)) = f.get(&(model_scope, id)) {
@@ -2576,10 +2598,10 @@ pub(crate) fn plan_failure_counts(
                 let Some((failed, why)) = f.get(&(sc, id)) else {
                     continue;
                 };
-                let hit = failed
+                let hit = own
                     .iter()
-                    .filter(|((d, o), _)| *d == design && o.as_ref().is_none_or(|o| *o == observed))
-                    .fold(0u8, |m, (_, q)| m | q);
+                    .filter_map(|k| failed.get(k))
+                    .fold(0u8, |m, q| m | q);
                 if hit != 0 && counts.why.is_empty() {
                     counts.why = why.clone();
                 }
@@ -2594,6 +2616,7 @@ pub(crate) fn plan_failure_counts(
 }
 
 /// [`plan_failure_counts`]'s total and first reason.
+#[cfg(test)]
 pub(crate) fn plan_failures(
     model: &crate::types::CompiledModel,
     subjects: &[crate::types::Subject],
@@ -2670,6 +2693,7 @@ thread_local! {
 /// Forget the plans of every subject and model in scope `scope`: under the subjects' lock, with
 /// the generation bumped there, so a thread that read the new generation sees them gone.
 fn drop_scope(scope: u64) {
+    clear_kept(scope);
     let mut s = subjects()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2694,7 +2718,8 @@ fn drop_scope(scope: u64) {
 
 /// Forget the plans and bad marks of the model `id`, as its [`crate::types::PlanId`] drops.
 pub(crate) fn drop_model(id: u64) {
-    clear_kept();
+    // A live fit borrows its model, so what a dropped model's plans leave kept is unregistered.
+    clear_kept(0);
     let mut s = subjects()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2716,7 +2741,6 @@ pub(crate) fn drop_model(id: u64) {
 /// Forget every unregistered plan (a test's empty cache); a registered fit's are its own.
 #[cfg(test)]
 pub(crate) fn reset() {
-    clear_kept();
     drop_scope(0);
 }
 
@@ -2819,16 +2843,20 @@ pub(crate) fn mark_bad(k: &SubjectKey, why: &str) {
         FORCED_BAD.with(|b| b.borrow_mut().insert(k.clone()));
         return;
     }
-    subjects()
+    let mut s = subjects()
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(k.clone(), None);
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    s.insert(k.clone(), None);
+    // Under the lock, like [`drop_scope`]: every thread's last-subject entry (this one's too)
+    // may hold the plans of `k` that were good a moment ago, and must look the mark up.
+    GENERATION.fetch_add(1, Relaxed);
+    LAST.with(|l| *l.borrow_mut() = None);
 }
 
 /// The variants a subject's cache entry keeps ([`add`]).
-const MAX_VARIANTS: usize = 8;
+pub(crate) const MAX_VARIANTS: usize = 8;
 
-/// The variants of `k` with `kernel` added, as stored. A caller serves from them and never looks
+/// The variants of `k` with `kernel` added, as stored (a bad mark is never replaced). A caller serves from them and never looks
 /// `k` up again: a model dropped on another thread may have emptied the table.
 pub(crate) fn add(k: &SubjectKey, kernel: Entry) -> Kernels {
     let mut s = subjects()
@@ -2836,7 +2864,10 @@ pub(crate) fn add(k: &SubjectKey, kernel: Entry) -> Kernels {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let ks = match s.get(k) {
         Some(Some(ks)) => ks.with(kernel),
-        _ => Variants::default().with(kernel),
+        // A bad mark stands: this caller serves from its own plan and nothing is stored, so the
+        // subject is bad for every thread alike, not for whichever looked it up last.
+        Some(None) => return Arc::new(Variants::default().with(kernel)),
+        None => Variants::default().with(kernel),
     };
     let ks = Arc::new(ks);
     s.insert(k.clone(), Some(ks.clone()));
@@ -4492,6 +4523,8 @@ struct Kept {
     plan: u64,
     layout: Layout,
     buf: Vec<f64>,
+    /// The fit scope that kept it ([`drop_scope`] frees it with the fit); `0`: no fit's.
+    scope: u64,
 }
 
 fn kept_table() -> &'static Mutex<HashMap<usize, Kept, FxBuild>> {
@@ -4537,6 +4570,7 @@ pub(crate) fn keep_last_run(owner: usize, theta: &[f64], eta: &[f64]) {
                 plan: last.plan,
                 layout: last.layout,
                 buf,
+                scope: registered(owner).map_or(0, |e| e.1),
             },
         );
         if let Some(o) = old {
@@ -4557,11 +4591,31 @@ pub(crate) fn adopts() -> usize {
     ADOPTS.with(|c| c.get())
 }
 
-/// Drop every kept forward (a new fit or a dropped model: the plans they belong to may go).
-pub(crate) fn clear_kept() {
-    for (_, k) in kept_table().lock().unwrap().drain() {
-        give(k.buf);
+/// Drop the forwards kept in `scope` (a finished fit's, or `0`'s on a dropped model: the plans
+/// they belong to may go). Another fit's stay.
+fn clear_kept(scope: u64) {
+    let mut t = kept_table().lock().unwrap();
+    let gone: Vec<usize> = t
+        .iter()
+        .filter(|(_, k)| k.scope == scope)
+        .map(|(&o, _)| o)
+        .collect();
+    for o in gone {
+        if let Some(k) = t.remove(&o) {
+            give(k.buf);
+        }
     }
+}
+
+/// How many forwards `scope` keeps (test seam).
+#[cfg(test)]
+pub(crate) fn kept_in(scope: u64) -> usize {
+    kept_table()
+        .lock()
+        .unwrap()
+        .values()
+        .filter(|k| k.scope == scope)
+        .count()
 }
 
 /// A plan's forward at one layout, kept for its reverse passes ([`Plan::forward_kept`]):

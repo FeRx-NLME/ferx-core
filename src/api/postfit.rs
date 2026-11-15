@@ -1824,22 +1824,20 @@ pub(crate) fn ode_rhs_route_warning(model: &CompiledModel) -> Option<(String, Wa
 /// derivatives (`W_PLAN_FD_FALLBACK`, #2786), counted from what ran: in theory never, so the
 /// message asks for a report. `None` when every plan held.
 pub(crate) fn plan_fd_fallback_warning(
-    model: &CompiledModel,
-    population: &Population,
-) -> Option<(String, WarningEntry)> {
-    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
-    let (k, why) = kj::plan_failures(model, &population.subjects)?;
-    let n = population.subjects.len();
+    counts: &crate::parser::model_parser::rhs_regcode::kernel_jit::PlanFailureCounts,
+    n: usize,
+) -> (String, WarningEntry) {
+    let (k, why) = (counts.any, &counts.why);
     let msg = format!(
         "W_PLAN_FD_FALLBACK: {k} of {n} subjects fell back to finite-difference derivatives \
          because their compiled plan failed ({why}); results are correct but slower — please \
          report this as a bug."
     );
     let details = serde_json::json!({ "n_subjects": k, "n_total": n, "reason": why });
-    Some((
+    (
         msg.clone(),
         warning_entry(WarningCode::GradientFallback, msg, Some(details)),
-    ))
+    )
 }
 
 /// [`plan_fd_fallback_warning`] for a standalone post-fit step (`run_covariance`, `run_sir`)
@@ -1856,7 +1854,11 @@ pub(crate) fn refresh_plan_fd_fallback(
     out.warnings.retain(|w| !w.contains(CODE));
     out.warnings_structured
         .retain(|e| !e.message.contains(CODE));
-    if let Some((msg, entry)) = plan_fd_fallback_warning(model, population) {
+    if let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
+        model,
+        &population.subjects,
+    ) {
+        let (msg, entry) = plan_fd_fallback_warning(&c, population.subjects.len());
         out.warnings.push(msg);
         out.warnings_structured.push(entry);
     }

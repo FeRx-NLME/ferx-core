@@ -10654,7 +10654,7 @@ fn a_scale_that_underflows_at_an_extreme_eta_does_not_condemn_the_subject() {
 /// An `SS=1` dose recorded first at an extreme η — `CL = TVCL·exp(800) = ∞`, no finite trough, the
 /// steady-state search fails at record time — is that point's failure, not the subject's: the
 /// call is declined, no plan failure is noted, and the same subject is served at ordinary points
-/// matching the reconverged FD. Mutation: drop the `individual_parameters_are_finite` test from
+/// matching the reconverged FD. Mutation: make `fail_here` fail with `FailScope::Subject` in
 /// `kjit_record` -> the extreme call marks the subject bad ("a steady-state call's record-time
 /// search failed") and the parity panics with "subject must be in adjoint scope". The control
 /// (`+800` on `CL` and `-800` on `V`) is a finite value path with a failing recording, which
@@ -10746,3 +10746,156 @@ fn a_variant_that_overflows_at_a_trial_point_does_not_condemn_the_subject() {
 
 /// The trial point of the test above, set by what the exploration found to overflow.
 const EXTREME: (f64, f64) = (700.0, -30.0);
+
+// ---- Plan failures at a trial point, and the variant cache (#2786 review) ----------------
+
+/// The key `with_plan` files a subject's plan under, at `n` stacked random effects.
+fn plan_key(
+    model: &CompiledModel,
+    s: &Subject,
+    n: usize,
+    n_theta: usize,
+) -> crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey {
+    crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey::new(model, s, n, n_theta)
+        .with_layout(None)
+}
+
+/// A recording that fails at one finite trial point — here an `SS=1` dose with
+/// `KA = TVKA·e^700 ≈ 1e304`, whose steady-state search finds no state — is that
+/// point's failure, not the subject's: `fail_here` carries its scope, so the call is declined
+/// with nothing cached and nothing marked, and the next sane point is served by a plan.
+/// Mutation: make `fail_here` fail with `FailScope::Subject` -> the trial point marks the
+/// subject bad (the key is `Bad`, not `Missing`) and the sane call after it is declined.
+#[test]
+fn a_finite_trial_eta_with_no_steady_state_declines_the_point_not_the_subject() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let model = tight(parse_model_string(MM_ODE).unwrap());
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 11.0];
+    let s = subject(&model, doses, &times, &[0.1, -0.05, 0.02]);
+    let params = moved_params(&model);
+    let trial = [0.0, 0.0, 700.0];
+    assert!(
+        (model.pk_param_fn)(&params.theta, &trial, &s.covariates, 0.0)
+            .values
+            .iter()
+            .all(|v| v.is_finite()),
+        "fixture: the individual parameters are finite at the trial point"
+    );
+    let key = plan_key(&model, &s, 3, params.theta.len());
+    let served = &mut |_: &PlanArc| Some(());
+    assert!(super::with_plan(&model, &s, None, &params.theta, &trial, served).is_none());
+    assert!(
+        matches!(kj::lookup(&key), kj::Lookup::Missing),
+        "the trial point recorded nothing and marked nothing"
+    );
+    assert!(kj::plan_failures(&model, std::slice::from_ref(&s)).is_none());
+    // The next, sane point is recorded and served by a plan.
+    let sane = [0.1, -0.05, 0.02];
+    assert!(super::with_plan(&model, &s, None, &params.theta, &sane, served).is_some());
+    assert!(matches!(kj::lookup(&key), kj::Lookup::Found(_)));
+    assert!(kj::plan_failures(&model, std::slice::from_ref(&s)).is_none());
+}
+
+/// The same for an overflowing κ: a trial point whose κ of one occasion is 800 (`exp(κ) = ∞`)
+/// failed the recording while a check on η and the baseline covariates alone read the
+/// parameters as finite, and condemned the subject. The scope the failure carries decides, not
+/// a re-evaluation of the parameters over part of the stacked vector.
+/// Mutation: make `fail_here` fail with `FailScope::Subject` -> the stacked trial point marks
+/// the subject bad.
+#[test]
+fn an_overflowing_kappa_declines_the_point_not_the_subject() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let model = tight(parse_model_string(ODE_IOV).unwrap());
+    let mut s = iov_subject(&model);
+    s.doses[0] = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+    let params = moved_params(&model);
+    // [η (2), κ of occasions 1..3 (2 each)].
+    let trial = [0.1, -0.05, 800.0, 800.0, 0.0, 0.0, 0.0, 0.0];
+    let key = plan_key(&model, &s, trial.len(), params.theta.len());
+    let served = &mut |_: &PlanArc| Some(());
+    assert!(super::with_plan(&model, &s, None, &params.theta, &trial, served).is_none());
+    assert!(
+        matches!(kj::lookup(&key), kj::Lookup::Missing),
+        "the trial point recorded nothing and marked nothing"
+    );
+    assert!(kj::plan_failures(&model, std::slice::from_ref(&s)).is_none());
+    let sane = [0.1, -0.05, 0.1, -0.05, -0.08, 0.04, 0.05, 0.06];
+    assert!(super::with_plan(&model, &s, None, &params.theta, &sane, served).is_some());
+    assert!(kj::plan_failures(&model, std::slice::from_ref(&s)).is_none());
+}
+
+/// Trial points whose predictions overflow record variants that cannot serve, and such a
+/// variant is not cached: the serving variant stays the subject's, however many insane probes
+/// come (more than `MAX_VARIANTS`, which would have evicted it).
+/// Mutation: add the variant before `serves` has run (as `kjit_record` did) -> the cache holds
+/// `MAX_VARIANTS` non-serving variants and the serving one is gone.
+#[test]
+fn insane_probes_do_not_evict_the_serving_variant() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let model = tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap());
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05],
+    );
+    let params = moved_params(&model);
+    let key = plan_key(&model, &s, 2, params.theta.len());
+    let sane = [0.1, -0.05];
+    assert!(super::with_plan(&model, &s, None, &params.theta, &sane, &mut |_| Some(())).is_some());
+    let serving = match kj::lookup(&key) {
+        kj::Lookup::Found(ks) => ks[0].clone(),
+        _ => panic!("fixture: the sane point cached a variant"),
+    };
+    let extreme = [EXTREME.0, EXTREME.1];
+    for _ in 0..(kj::MAX_VARIANTS + 3) {
+        // A serve that declines wherever the predictions are not finite, as every consumer does.
+        let r = super::with_plan(
+            &model,
+            &s,
+            None,
+            &params.theta,
+            &extreme,
+            &mut |_| None::<()>,
+        );
+        assert!(r.is_none());
+    }
+    match kj::lookup(&key) {
+        kj::Lookup::Found(ks) => {
+            assert_eq!(ks.len(), 1, "no insane variant was cached");
+            assert!(std::sync::Arc::ptr_eq(&ks[0], &serving));
+        }
+        _ => panic!("the subject was condemned"),
+    }
+}
+
+/// The reduced basis's plan takes the same lookup as every other: a model-level bad mark
+/// declines it (and marks the subject) instead of recording again.
+/// Mutation: drop the `model_bad` arm from `plan_or_record` -> the plan is recorded and served.
+#[test]
+fn the_reduced_basis_plan_honours_a_model_level_bad_mark() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let model = tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap());
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05],
+    );
+    let params = moved_params(&model);
+    let eta = [0.1, -0.05];
+    let _g = kj::register(&model, std::slice::from_ref(&s));
+    let shape = kernel::variant_of(&(Vec::<usize>::new(), None::<usize>));
+    let key = kj::SubjectKey::new(&model, &s, 2, params.theta.len())
+        .with_kind(9)
+        .with_variant(shape);
+    kj::mark_model_bad(&key, "a code path the recorder cannot take");
+    let mut called = false;
+    let r = super::with_plan_nn(&model, &s, &params.theta, &eta, &[], None, &mut |_| {
+        called = true;
+        Some(())
+    });
+    assert!(r.is_none() && !called, "declined without recording");
+    assert!(matches!(kj::lookup(&key), kj::Lookup::Bad));
+}

@@ -2259,31 +2259,6 @@ pub(crate) fn plan_values(
 /// step's reduced basis 9).
 const SDE_P_KIND: u8 = 10;
 
-/// Whether the individual parameters are finite at `(theta, eta)`. A point where one is not (an
-/// inner search overshooting to `exp(η) = ∞`) has no derivative to serve and no steady state to
-/// find, so a recording that fails there says nothing about the subject: the caller declines
-/// that one call and keeps the subject's plan route, instead of condemning it to finite
-/// differences for the rest of the fit ([`kjit_record`], [`with_plan_in`]). The parameters, not
-/// the predictions: this runs on a failure path, where a subject outside the predictor's
-/// contract (an unresolved modeled `RATE`) must not panic it.
-fn individual_parameters_are_finite(
-    model: &CompiledModel,
-    subject: &Subject,
-    theta: &[f64],
-    eta: &[f64],
-) -> bool {
-    theta.iter().chain(eta).all(|v| v.is_finite())
-        && (model.pk_param_fn)(
-            theta,
-            &eta[..model.n_eta.min(eta.len())],
-            &subject.covariates,
-            0.0,
-        )
-        .values
-        .iter()
-        .all(|v| v.is_finite())
-}
-
 /// A subject's compiled plan (#2786).
 pub(super) type PlanArc =
     std::sync::Arc<crate::parser::model_parser::rhs_regcode::kernel_jit::Plan>;
@@ -2316,7 +2291,6 @@ fn with_plan_in<R>(
     serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
 ) -> Option<R> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
-    use std::sync::atomic::Ordering::Relaxed;
     // An endpoint-only subject has no prediction rows to record (its terms have their own
     // plans, `terms::term_plans`).
     if subject.observations.is_empty() {
@@ -2329,7 +2303,31 @@ fn with_plan_in<R>(
         key = key.with_kind(SDE_P_KIND);
     }
     let fits = |p: &PlanArc| p.n_out() == n_obs && p.n_eta() == n && p.n_theta() == n_in;
-    match kj::lookup(&key) {
+    plan_or_record(
+        model, subject, lay, theta, None, eta, sigma, &key, &fits, serves,
+    )
+}
+
+/// The subject's plan under `key` that `serves`, else a variant recorded at `(theta, eta)` (the
+/// one lookup and record path of every plan kind): `None` where the subject is bad or the plan
+/// declines. A variant joins the cache once it serves, so a trial point where it cannot (a
+/// recording whose predictions overflow) never evicts a good one.
+#[allow(clippy::too_many_arguments)]
+fn plan_or_record<R>(
+    model: &CompiledModel,
+    subject: &Subject,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    theta: &[f64],
+    nn_z: Option<&[Vec<f64>]>,
+    eta: &[f64],
+    sigma: Option<&[f64]>,
+    key: &crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey,
+    fits: &dyn Fn(&PlanArc) -> bool,
+    serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
+) -> Option<R> {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use std::sync::atomic::Ordering::Relaxed;
+    match kj::lookup(key) {
         kj::Lookup::Bad => return None,
         kj::Lookup::Found(ks) => {
             for (i, plan) in ks.order().filter(|(_, p)| fits(p)) {
@@ -2341,20 +2339,21 @@ fn with_plan_in<R>(
             kj::STATS.guard_fail.fetch_add(1, Relaxed);
         }
         kj::Lookup::Missing => {
-            if let Some(why) = kj::model_bad(&key) {
-                kj::mark_bad(&key, &why);
+            if let Some(why) = kj::model_bad(key) {
+                kj::mark_bad(key, &why);
                 return None;
             }
         }
     }
-    let (plan, sane) = kjit_record(model, subject, lay, theta, eta, None, sigma, &key)?;
+    let (plan, sane) = kjit_record(model, subject, lay, theta, eta, nn_z, sigma, key)?;
     let r = serves(&plan);
-    if r.is_none() && sane && individual_parameters_are_finite(model, subject, theta, eta) {
+    if r.is_some() {
+        kj::add(key, plan);
+    } else if sane {
         // A recording that does not serve at its own point never will: recording again on
-        // every call would only repeat it. (At a point the value path cannot predict — a
-        // non-finite parameter, or predictions that overflow there — the guard has no finite
-        // values to hold at: that call is declined, not the subject.)
-        kj::mark_bad(&key, "the plan does not serve at its own recording point");
+        // every call would only repeat it. (At a point whose predictions are not finite the
+        // guard has no finite values to hold at: that call is declined, not the subject.)
+        kj::mark_bad(key, "the plan does not serve at its own recording point");
     }
     r
 }
@@ -2386,23 +2385,18 @@ pub(super) fn with_plan_nn<R>(
         .with_kind(9)
         .with_variant(shape);
     let fits = |p: &PlanArc| p.n_eta() == eta.len() && p.n_theta() == n_in;
-    match kj::lookup(&key) {
-        kj::Lookup::Bad => return None,
-        kj::Lookup::Found(ks) => {
-            for plan in ks.iter().filter(|p| fits(p)) {
-                if let Some(r) = serves(plan) {
-                    return Some(r);
-                }
-            }
-        }
-        kj::Lookup::Missing => {}
-    }
-    let (plan, sane) = kjit_record(model, subject, None, theta, eta, Some(nn_z), sigma, &key)?;
-    let r = serves(&plan);
-    if r.is_none() && sane && individual_parameters_are_finite(model, subject, theta, eta) {
-        kj::mark_bad(&key, "the plan does not serve at its own recording point");
-    }
-    r
+    plan_or_record(
+        model,
+        subject,
+        None,
+        theta,
+        Some(nn_z),
+        eta,
+        sigma,
+        &key,
+        &fits,
+        serves,
+    )
 }
 
 /// [`with_plan`] with `serves` also told the plan's width, `eta.len()`.
@@ -2419,7 +2413,7 @@ pub(super) fn with_plan_width<R>(
 }
 
 /// Record the subject on the recording type at `(theta, eta)` and plan it (#2786): the
-/// variant joins `key`'s. `None` — and the subject (or, for a reason of the model's, the
+/// variant is the caller's to add to `key`'s once it serves. `None` — and the subject (or, for a reason of the model's, the
 /// model) marked so no caller tries again — where the recording fails.
 #[allow(clippy::too_many_arguments)]
 fn kjit_record(
@@ -2497,17 +2491,17 @@ fn kjit_record(
         .fetch_add(t.elapsed().as_micros() as usize, Relaxed);
     let rec = match rec {
         Ok(r) => r,
-        Err((why, model_wide)) => {
+        Err((why, scope)) => {
             if kj::debug() {
                 eprintln!("kjit: subject not recorded: {why}");
             }
             // A failure at a point the value path cannot predict (non-finite parameters, no
             // finite steady state) is that point's, not the subject's: declined, not condemned.
-            if !model_wide && !individual_parameters_are_finite(model, subject, theta, eta) {
+            if scope == kj::FailScope::Point {
                 return None;
             }
             kj::mark_bad(key, &why);
-            if model_wide {
+            if scope == kj::FailScope::Model {
                 kj::mark_model_bad(key, &why);
             }
             return None;
@@ -2524,7 +2518,6 @@ fn kjit_record(
         kj::mark_bad(key, "the recording could not be planned");
         return None;
     };
-    kj::add(key, plan.clone());
     Some((plan, sane))
 }
 
