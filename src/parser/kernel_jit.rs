@@ -2836,29 +2836,24 @@ pub(crate) struct Tiered {
     queued: std::sync::atomic::AtomicBool,
 }
 
-/// Queue `k` for compilation off the caller's path. A call comes from a worker of the fit's
-/// pool, so the compile is spawned on that pool: no thread of its own, and no pool beside the
-/// one `FitOptions.threads` sized. The callers keep running the current tier (every tier
-/// computes the same values, bit for bit) until the native entry point is swapped in. A caller
-/// that is not a pool worker has no pool to spawn on (`rayon::spawn` would start the global
-/// one) and compiles in place: a compile is microseconds per kernel, see the table below.
+/// Compile the tier `k` has earned, on the calling thread. The call that crosses a promotion
+/// point is a worker of the fit's pool (or the fit's own thread): compiling there adds no
+/// thread beyond the ones `FitOptions.threads` sized, and does not wait for a pool worker to
+/// come free. A spawned job would: a worker runs it only once its batch of subjects is done,
+/// and meanwhile every call of the kernel stays on the interpreter (`--threads 1`: half the
+/// calls of a fit; `--threads 2`: ~10%). The other callers of the kernel run the tier it has
+/// until the native entry point is swapped in (every tier computes the same values, bit for
+/// bit); `queued` keeps a second caller from compiling the same tier beside this one. A compile
+/// is microseconds per kernel, see the table below.
 fn compile_queue(k: std::sync::Weak<Tiered>) {
-    let run = move || {
-        if let Some(t) = k.upgrade() {
-            compile_guarded(&t.queued, || t.compile_wanted());
-        }
-    };
-    if rayon::current_thread_index().is_some() {
-        rayon::spawn(run);
-    } else {
-        run();
+    if let Some(t) = k.upgrade() {
+        compile_guarded(&t.queued, || t.compile_wanted());
     }
 }
 
 /// Run a compile; if it panics, release the kernel's `queued` flag and stay on the tier already
-/// reached (every tier computes the same values), instead of unwinding into a pool worker
-/// (rayon aborts the process on an unhandled panic in a spawned job) or leaving `queued` set
-/// forever, which would keep the kernel off every later promotion.
+/// reached (every tier computes the same values), instead of unwinding into the caller's fit or
+/// leaving `queued` set forever, which would keep the kernel off every later promotion.
 fn compile_guarded(queued: &std::sync::atomic::AtomicBool, compile: impl FnOnce()) {
     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(compile)).is_err() {
         queued.store(false, Relaxed);
@@ -2879,7 +2874,11 @@ fn compile_guarded(queued: &std::sync::atomic::AtomicBool, compile: impl FnOnce(
 /// faster calls. Both scale with the kernel's size, so the counts hold for any kernel — except
 /// the last tier's compile, superlinear in size (register allocation), taken only up to
 /// [`TIER3_MAX_INSTS`].
-const TIER1_CALLS: usize = 512;
+///
+/// The first point is 128, not the 512 the lane interpreter's cheaper cold tier earned: the cold
+/// tier is now [`interpret_func`], and `pk2_ode` (pk2_n300, `--threads 2`) measured 24.32G
+/// instructions at 512, 23.9G at 128 and 16 alike, against 23.4G before the cold tier changed.
+const TIER1_CALLS: usize = 128;
 const TIER2_CALLS: usize = 4096;
 
 const TIER3_CALLS: usize = 1 << 16;
@@ -3164,8 +3163,7 @@ thread_local! {
 }
 
 /// Run a chunk kernel's scalar function in Rust over the plan's buffers, as its native
-/// lowering ([`lower_chunk_opt`]) does: the first tier of a kernel with no lane program (a
-/// tangent layout's, [`Layout::tan`]). A reverse kernel runs its forward `prefix` once and
+/// lowering ([`lower_chunk_opt`]) does: the first tier of every kernel. A reverse kernel runs its forward `prefix` once and
 /// the rest once per seed, each seed's adjoint block `stride` apart. Conditions are `1.0` /
 /// `0.0`.
 ///
@@ -3188,8 +3186,11 @@ unsafe fn interpret_func(
     let slot = |e: usize| *idx.add(e) as usize * lanes;
     FUNC_VALS.with(|vals| {
         let mut x = vals.borrow_mut();
-        x.clear();
-        x.resize(f.insts.len(), 0.0);
+        // Every value is stored before an instruction reads it (a function is in SSA order),
+        // so a stale buffer needs no clearing, only to be long enough.
+        if x.len() < f.insts.len() {
+            x.resize(f.insts.len(), 0.0);
+        }
         let run = |x: &mut Vec<f64>, from: usize, to: usize, adjp: *mut f64| {
             for at in from..to {
                 let r = |v: ir::V| x[v as usize];
