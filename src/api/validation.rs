@@ -2818,12 +2818,19 @@ pub(crate) fn check_absorption_dosing(
     // equilibrated *through* the absorption kernel (a pulse-train trough) and its infinite
     // periodic pulse train is superposed as `R_in` on the forward walk, so predictions match
     // an explicit run-in exactly (`ode::predictions::equilibrate_ss_state` +
-    // `add_prepared_input_rate_forcing`). Two combinations stay out of scope and are rejected
-    // here rather than silently mis-served:
-    //   * zero_order() absorption — its input is a spanning window, not a pointwise density,
-    //     so SS needs a periodic-window equilibration (separate follow-up under #719).
-    //   * a lagtime on the SS-dosed compartment — the SS+lagtime pre-arrival seed
-    //     (`ss_state_at_phase`) is still bolus-only for input-rate compartments.
+    // `add_prepared_input_rate_forcing`), with or without a lag (compartment `lagtime`/`ALAG`
+    // or a per-route `lag=`, #2786): the periodic forcing is anchored on the record and the
+    // record's state is the fixed point of the cycle the dose's own pulse arrives `lag` into.
+    //
+    // An SS dose into a compartment fed by a single `zero_order()` window is supported too
+    // (#2786): the dose is lowered to a duration-modeled SS infusion (`dosing::lower_zero_order_ss`)
+    // and rides the steady-state infusion machinery, lag included. What stays out of scope is a
+    // zero-order window the lowering cannot represent, rejected here rather than mis-served:
+    //   * `zero_order()` mixed with another absorption function on the same compartment —
+    //     the window and the density share one dose, so the periodic window train and the
+    //     periodic density sum would both have to be seeded.
+    //   * `zero_order()` with a per-route `lag=` on a compartment that also declares its own
+    //     `ALAG{c}`/`lagtime` — the two lags add, and the infusion carries one.
     use std::collections::BTreeSet;
     let cmts: BTreeSet<usize> = ode.input_rate.iter().map(|f| f.cmt + 1).collect();
     let zero_order_cmts: BTreeSet<usize> = ode
@@ -2833,62 +2840,50 @@ pub(crate) fn check_absorption_dosing(
         .map(|f| f.cmt + 1)
         .collect();
     // `cmt_1based()` throughout so a `CMT=0` dose (the default dose compartment == compartment 1)
-    // is scoped like `CMT=1` against these 1-based `f.cmt + 1` sets (#899, #913 review). The raw
-    // `d.cmt` this replaced left `CMT=0` bypassing the SS-unsupported gates, so an SS `CMT=0` dose
-    // into a zero-order / lagged absorption compartment skipped its clean rejection and fell
-    // through to the silent zero-order drop the same review fixed in `zero_order_dur_and_frac`.
-    let has_ss_zero_order = population.subjects.iter().any(|s| {
-        s.doses
-            .iter()
-            .any(|d| d.ss && d.ii > 0.0 && zero_order_cmts.contains(&d.cmt_1based()))
-    });
-    // A per-route lag (`fn(..., lag=L)`, #856) lives on the forcing's `lag_slot`, NOT the
-    // compartment-lag machinery, so `has_lagtime_on_cmt` does not see it — but the SS
-    // equilibration seed is just as unable to route the dose through a per-route-lagged
-    // onset over the previous interval as through a compartment `lagtime`/`ALAG`. Reject
-    // the combination the same way, compartment-scoped so a per-route lag on a *different*
-    // pathway does not block an SS dose into an un-lagged compartment.
-    let route_lag_cmts: BTreeSet<usize> = ode
-        .input_rate
-        .iter()
-        .filter(|f| f.lag_slot.is_some())
-        .map(|f| f.cmt + 1)
-        .collect();
-    // Compartment-scoped, not model-wide (`model.has_lagtime()`): a lag declared on a
-    // *different* absorption pathway (e.g. `ALAG2`) must not block an SS dose into an
-    // un-lagged compartment (e.g. `CMT=1`). Covers both a compartment `lagtime`/`ALAG`
-    // and a per-route `lag=` on a forcing feeding the SS-dosed compartment.
-    let has_ss_lag = population.subjects.iter().any(|s| {
+    // is scoped like `CMT=1` against these 1-based `f.cmt + 1` sets (#899, #913 review).
+    let lowerable = |c: usize| ode.dose_attr_map.zero_order_slot(c).is_some();
+    let route_lagged_zero_order = |c: usize| {
+        ode.input_rate.iter().any(|f| {
+            f.cmt + 1 == c
+                && f.kind == crate::pk::absorption::InputRateKind::ZeroOrder
+                && f.lag_slot.is_some()
+        })
+    };
+    let ss_zero_order_mixed = population.subjects.iter().any(|s| {
         s.doses.iter().any(|d| {
             d.ss && d.ii > 0.0
-                && cmts.contains(&d.cmt_1based())
-                && (model.has_lagtime_on_cmt(d.cmt_1based())
-                    || route_lag_cmts.contains(&d.cmt_1based()))
+                && zero_order_cmts.contains(&d.cmt_1based())
+                && !lowerable(d.cmt_1based())
         })
     });
-    if has_ss_zero_order {
+    let ss_zero_order_two_lags = population.subjects.iter().any(|s| {
+        s.doses.iter().any(|d| {
+            d.ss && d.ii > 0.0
+                && lowerable(d.cmt_1based())
+                && route_lagged_zero_order(d.cmt_1based())
+        })
+    });
+    if ss_zero_order_mixed {
         diags.push(
             Diagnostic::error(
-                "E_ABSORPTION_SS_ZERO_ORDER",
-                "Steady-state dosing (SS=1) into a zero_order() absorption compartment is not \
-                 yet supported: unlike the pointwise density kernels (transit/igd/weibull/\
-                 first_order), the zero-order input is a spanning window and its periodic \
-                 steady state needs a window-based equilibration (a follow-up under #719). \
-                 Expand the run-in with explicit dosing records, or use a density absorption \
-                 kernel.",
+                "E_ABSORPTION_SS_ZERO_ORDER_MIXED",
+                "Steady-state dosing (SS=1) into a compartment fed by a zero_order() window \
+                 together with another absorption function (a `mixed` model) is not supported: \
+                 the zero-order window train and the density's periodic tail would both have to \
+                 be seeded from one dose. A compartment fed by zero_order() alone is supported, \
+                 with or without a lag. Use a single absorption function on that compartment, \
+                 or expand the run-in with explicit dosing records.",
             )
             .with_block("odes"),
         );
-    } else if has_ss_lag {
+    } else if ss_zero_order_two_lags {
         diags.push(
             Diagnostic::error(
-                "E_ABSORPTION_SS_LAG",
-                "Steady-state dosing (SS=1) into a built-in absorption compartment combined \
-                 with an absorption lagtime (a compartment `lagtime`/`ALAG` or a per-route \
-                 `lag=`) is not yet supported: the SS+lagtime pre-arrival seed does not yet \
-                 route the dose through the absorption kernel over the previous interval. \
-                 Remove the lagtime, expand the run-in with explicit dosing records, or dose \
-                 without SS.",
+                "E_ABSORPTION_SS_ZERO_ORDER_LAG",
+                "Steady-state dosing (SS=1) into a zero_order() compartment that carries both a \
+                 per-route `lag=` and a compartment `lagtime`/`ALAG` is not supported: the two \
+                 lags add and the steady-state infusion it is served as carries one. Declare the \
+                 delay once, either as `zero_order(dur=..., lag=...)` or as `ALAG{c}`.",
             )
             .with_block("odes"),
         );
@@ -2906,7 +2901,7 @@ pub(crate) fn check_absorption_dosing(
     //     equilibration (bolus-record only) nor the infusion convolution handles the periodic
     //     zero-order-into-kernel steady state yet.
     //
-    // Unlike the SS-*bolus* gates above (`has_ss` / `has_ss_zero_order`), this reject is
+    // Unlike the SS-*bolus* gates above (the steady-state bolus gates above), this reject is
     // **`II`-independent** — it fires on `d.ss && d.is_infusion()` with no `d.ii > 0.0` condition.
     // An SS bolus with `II ≤ 0` legitimately degrades to a single non-SS bolus (a valid prediction,
     // flagged by the `W_STEADY_STATE_II` warning), so those gates let it through. But an SS infusion

@@ -474,7 +474,7 @@ fn parallel_steady_state_dosing_is_supported() {
     // SS=1 into a **parallel** (dual first-order) compartment is now supported (#719): both
     // pathways are smooth density kernels, so each superposes its own periodic-sum R_in and
     // the compartment equilibrates through the kernels — no E_ABSORPTION_SS. (A **mixed**
-    // model that includes a zero_order pathway is still rejected, with E_ABSORPTION_SS_ZERO_ORDER.)
+    // model that includes a zero_order pathway is still rejected, with E_ABSORPTION_SS_ZERO_ORDER_MIXED.)
     use ferx_core::check_model_data;
     let model = parse_full_model(PARALLEL_MODEL)
         .expect("parallel parses")

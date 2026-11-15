@@ -483,6 +483,13 @@ impl DoseEvent {
         self.cmt.max(1)
     }
 
+    /// Write `CMT=0` as the compartment 1 it means. For a dose rewritten into an infusion
+    /// ([`crate::dosing::lower_zero_order_ss`]): a `CMT=0` infusion has no rate channel, so the
+    /// lowered dose names its compartment.
+    pub(crate) fn resolve_default_cmt(&mut self) {
+        self.cmt = self.cmt.max(1);
+    }
+
     /// The literal authored `CMT`, `0` included — the escape hatch for the few
     /// sites that need the raw value rather than a resolved index: detecting a
     /// `CMT=0` dose (`d.cmt_raw() == 0`), echoing it in a diagnostic, or passing
@@ -764,6 +771,13 @@ pub struct DoseAttrMap {
     /// makes the collision data-dependent, so it is judged in
     /// `api::validation::check_modeled_dose_rates` rather than by the parser (#993).
     prediction_path_reads: HashMap<(DoseAttr, usize), String>,
+    /// `1-based compartment -> PkParams slot` of the `dur` of the **sole** `zero_order()`
+    /// forcing feeding it (#2786): a compartment fed by nothing but one zero-order window. An
+    /// `SS=1` dose into such a compartment is lowered to a duration-modeled infusion that reads
+    /// its window from this slot ([`crate::dosing::lower_zero_order_ss`]), so the steady-state
+    /// seed, the residual windows and the exact derivatives are the infusion's own. Kept apart
+    /// from `indexed` so a model's `D{n}` bookkeeping (and [`Self::is_empty`]) is unchanged.
+    zero_order: HashMap<usize, usize>,
 }
 
 impl DoseAttr {
@@ -924,7 +938,32 @@ impl DoseAttrMap {
     /// a `CMT=0` modeled-`RATE` dose is an infusion by `DoseEvent::is_infusion`,
     /// which `check_dose_compartments` rejects on both engines.
     pub fn indexed_slot(&self, attr: DoseAttr, cmt: usize) -> Option<usize> {
-        self.indexed.get(&(attr, cmt.max(1))).copied()
+        self.indexed.get(&(attr, cmt.max(1))).copied().or_else(|| {
+            // A dose lowered from a pure zero-order compartment reads its duration from the
+            // forcing's `dur` slot (#2786).
+            if attr == DoseAttr::Duration {
+                self.zero_order.get(&cmt.max(1)).copied()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Record that 1-based compartment `cmt` is fed by one `zero_order()` forcing and nothing
+    /// else, its `dur` read from PkParams `slot` (#2786).
+    pub(crate) fn set_zero_order(&mut self, cmt: usize, slot: usize) {
+        self.zero_order.insert(cmt, slot);
+    }
+
+    /// The `dur` slot of the sole zero-order forcing feeding 1-based `cmt`, if it has exactly
+    /// that ([`Self::set_zero_order`]).
+    pub(crate) fn zero_order_slot(&self, cmt: usize) -> Option<usize> {
+        self.zero_order.get(&cmt.max(1)).copied()
+    }
+
+    /// Whether any compartment is a pure zero-order one.
+    pub(crate) fn has_zero_order(&self) -> bool {
+        !self.zero_order.is_empty()
     }
 
     /// Whether any compartment-indexed entry for `attr` is declared (e.g. `F1`/`F2`
@@ -6349,12 +6388,17 @@ impl CompiledModel {
     /// the entry indexed for 1-based `c` counts ([`Self::has_lagtime_on_cmt`]).
     fn has_indexed_dose_attr(&self, attr: DoseAttr, cmt: Option<usize>) -> bool {
         self.ode_spec.is_some()
-            && self.indiv_param_names.iter().any(|n| {
+            && (self.indiv_param_names.iter().any(|n| {
                 matches!(
                     DoseAttr::from_indexed_name(n),
                     Some((a, indexed_cmt)) if a == attr && cmt.is_none_or(|c| c == indexed_cmt)
                 )
-            })
+            }) || self.ode_spec.as_ref().is_some_and(|o| match cmt {
+                // An entry the parser registered without the name (a per-route `lag=` on a
+                // lone zero-order compartment is its `ALAG{c}`, #2786).
+                None => o.dose_attr_map.has_indexed_attr(attr),
+                Some(c) => o.dose_attr_map.indexed_slot(attr, c).is_some(),
+            }))
     }
 
     /// True when any built-in absorption input-rate forcing carries a per-route

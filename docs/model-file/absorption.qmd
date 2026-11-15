@@ -183,10 +183,36 @@ the nonlinear Anderson solve carries them through the same fixed-point recursion
 derivative correction (#867) — not the FD-of-prediction fallback the earlier nonlinear case used.
 (The Newton correction's state-Jacobian `J_P` is itself a finite difference, so the nonlinear-SS
 gradient carries an `O(reltol/eps)` term amplified by `1/(1−ρ)`; it is accurate across the clinical
-range but loosens as `ρ → 1`.) Two `SS` combinations remain **rejected with a clear error**: a
-`zero_order()` window (`E_ABSORPTION_SS_ZERO_ORDER` — a spanning window needs a
-distinct periodic-window equilibration) and an absorption **lagtime**
-(`E_ABSORPTION_SS_LAG` — the SS + lagtime pre-arrival seed is still bolus-only).
+range but loosens as `ρ → 1`.)
+
+### Steady state with a lag, and into a `zero_order()` window {#ss-absorption-lag}
+
+Both combinations that used to be rejected (`E_ABSORPTION_SS_LAG`,
+`E_ABSORPTION_SS_ZERO_ORDER`, #719) are supported (#2786), with exact analytic gradients
+and no finite-difference fallback.
+
+**A lag** — a compartment `lagtime`/`ALAG{c}` or a per-route `lag=`, the two add — moves the
+dose's own pulse `L` after its record; the earlier pulses of the periodic train are anchored on
+the record. The state the record installs is the fixed point of the cycle that starts there with
+the own pulse arriving `L` into it, the forcing after the record is the same periodic sum, and
+for `L ≥ II` the train **clamps** onto the record (the pulse before the dose lands on it), as
+for every other lagged steady-state dose ([lagtime](lagtime.qmd)).
+
+**A `zero_order()` window** is an infusion — rate `F·AMT/dur` over `[t + lag, t + lag + dur]` —
+so an `SS=1` dose into a compartment fed by a lone `zero_order()` is carried as the
+duration-modeled steady-state infusion it is: the periodic window seed, the windows of earlier
+pulses still running at the record (`dur > II`, or lag + `dur` past `II`) and the exact
+derivatives through `dur` and the lag are the steady-state infusion's own. A per-route `lag=` on
+such a compartment is its `ALAG{c}`; the two spellings are the same model.
+
+Anchored against an independent pulse-train reference to 1e-9 and against NONMEM 7.6.0
+(`nonmem_anchor/ss_zero_order_lag.ctl`, `ss_first_order_lag.ctl`, `tests/ss_absorption_lag_anchor.rs`).
+For `lag > II` NONMEM's analytic `ADVAN1`/`ADVAN2` follow the unclamped periodic train from
+`t = lag − II` on (and are not a concentration before it); ferx follows the documented clamp,
+verified against `ADVAN13`. Two cases stay **rejected with a clear error**: a `zero_order()` window mixed
+with another absorption function on the same compartment (`E_ABSORPTION_SS_ZERO_ORDER_MIXED`),
+and a zero-order compartment carrying both a per-route `lag=` and its own `ALAG{c}`
+(`E_ABSORPTION_SS_ZERO_ORDER_LAG`).
 
 ### Infusion (`RATE>0`) into an absorption compartment
 
@@ -967,10 +993,8 @@ rather than aborting the run.
 
 A plain **infusion** (`RATE>0`) into a per-route-lagged compartment composes as expected
 (the whole infused-kernel appearance is delayed by `lag`). **Steady-state** dosing
-(`SS=1`) into a per-route-lagged compartment is *rejected* (`E_ABSORPTION_SS_LAG`) — the
-same limitation as a compartment `lagtime`/`ALAG` under `SS` ([#719](https://github.com/FeRx-NLME/ferx-core/issues/719)):
-the steady-state pre-arrival seed does not yet route the dose through the absorption
-kernel over a lagged onset.
+(`SS=1`) into a per-route-lagged compartment is supported
+([above](#ss-absorption-lag), #2786).
 
 ### Closed-form evaluation {#mr-closed-form}
 

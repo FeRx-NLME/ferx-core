@@ -673,7 +673,7 @@ pub(crate) fn ss_equilibration_opts(opts: &OdeSolverOptions) -> OdeSolverOptions
 /// sub-problem: drop the `d/dt(__chz_<cmt>)` rows, solve, put them back at zero.
 ///
 /// Two call sites need exactly this — [`periodic_ss_fixed_point_pk`] (delegating to
-/// [`crate::dosing::periodic_ss_fixed_point_g`]) and [`equilibrate_ss_input_rate`]'s joint
+/// [`crate::dosing::periodic_ss_fixed_point_g`]) and `equilibrate_ss_input_rate`'s joint
 /// branch (delegating to [`equilibrate_ss_input_rate_g`]) — and they cannot share a delegate.
 /// They share this instead, because the invariant is the subtle half of #1210: an accumulator
 /// row embeds as `0.0` and projects out, so the reduced one-cycle map is the PK propagator and
@@ -965,10 +965,28 @@ pub(crate) fn ss_run_in_params(
 /// Returns `None` — so the caller falls back to the capped pulse train + #867 warning — only when
 /// *neither* converges: a singular `I − M`, a non-finite intermediate, or `ρ ≥ 1` (mean input ≥
 /// maximum elimination, so no periodic steady state exists).
+#[cfg(test)]
 fn equilibrate_ss_input_rate(
     ode: &crate::ode::OdeSpec,
     pk_params_flat: &[f64],
     dose: &DoseEvent,
+    f_bio: f64,
+    opts: &OdeSolverOptions,
+    prepared: &PreparedForcings,
+) -> Option<Vec<f64>> {
+    equilibrate_ss_input_rate_lagged(ode, pk_params_flat, dose, 0.0, f_bio, opts, prepared)
+}
+
+/// `equilibrate_ss_input_rate` for a dose with a **compartment lag** `lag` (#2786): the state
+/// at the dose *record*, `lag` before its own pulse arrives (the route lag rides in `prepared`).
+/// The local cycle's pulse arrives at `lag + route_lag` and the earlier pulses are read through
+/// the clamped periodic sum ([`ss_periodic_forcing_shifted`]), so a lag of a full interval or
+/// more leaves the train on the record, like every other lagged SS seed.
+fn equilibrate_ss_input_rate_lagged(
+    ode: &crate::ode::OdeSpec,
+    pk_params_flat: &[f64],
+    dose: &DoseEvent,
+    lag: f64,
     f_bio: f64,
     opts: &OdeSolverOptions,
     prepared: &PreparedForcings,
@@ -978,6 +996,7 @@ fn equilibrate_ss_input_rate(
     if !(ii > 0.0) || n == 0 {
         return None;
     }
+    let local_lag = [lag];
 
     // Forced one-cycle RHS: the disposition plus the periodic absorption `R_in` of a single
     // local SS pulse at t = 0 (its SS branch superposes the prior-pulse tails). Reused for `b`,
@@ -986,12 +1005,11 @@ fn equilibrate_ss_input_rate(
     // doesn't redo the same prep on a `None` return.
     let local_ss = [DoseEvent::new(0.0, dose.amt, dose.cmt_raw(), 0.0, true, ii)];
     let local_f_bio = [f_bio];
-    let no_lag: [f64; 0] = [];
     let no_zero: [(usize, f64); 0] = [];
     let forced_rhs = wrap_rhs_with_forcings(
         ode,
         &local_ss,
-        &no_lag,
+        &local_lag,
         &local_f_bio,
         f64::NEG_INFINITY,
         // The one cycle `[0, II]` is a single segment starting at the local pulse's own
@@ -1008,14 +1026,37 @@ fn equilibrate_ss_input_rate(
     let eq_opts = ss_equilibration_opts(opts);
     // The cycle's pulse sits at local `0`, so `TAD = t` across the whole window (#1139).
     let ext = ss_run_in_params(pk_params_flat, 0.0);
+    // A pulse arriving inside the cycle (`0 < lag + route lag < II`, #2786) is a kink of the forced
+    // field: the cycle is integrated in stretches that end on it, so the step sequence never
+    // straddles it (an unresolved kink costs the one-cycle map ~1e-9, which a difference quotient
+    // of the objective amplifies — and the dual twin's derivative through it is only exact when
+    // the stretches match). No cut, one stretch, for an unlagged dose.
+    let mut cuts: Vec<f64> = ode
+        .input_rate
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| {
+            f.cmt == dose.cmt_idx() && f.kind != crate::pk::absorption::InputRateKind::ZeroOrder
+        })
+        .map(|(fi, _)| lag + prepared.get(fi, 0).route_lag)
+        .filter(|&l| l > 0.0 && l < ii)
+        .collect();
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
     let advance = |rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
                    jac: Option<&crate::ode::rosenbrock::JacFn<'_>>,
                    u0: &[f64]|
      -> Option<Vec<f64>> {
         let _guard = jac.map(|j| crate::ode::rosenbrock::RhsGuard::register_jac_of::<f64>(rhs, j));
-        solve_ode_certified(rhs, u0, (0.0, ii), &ext, &[ii], &eq_opts)
-            .last()
-            .map(|p| p.u.clone())
+        let mut y = u0.to_vec();
+        let mut a = 0.0;
+        for &b in cuts.iter().chain(std::iter::once(&ii)) {
+            y = solve_ode_certified(rhs, &y, (a, b), &ext, &[b], &eq_opts)
+                .last()
+                .map(|p| p.u.clone())?;
+            a = b;
+        }
+        Some(y)
     };
     let chz = &ode.chz_state_slots[..];
 
@@ -1039,7 +1080,7 @@ fn equilibrate_ss_input_rate(
     let held = forcing_adder(
         ode,
         &local_ss,
-        &no_lag,
+        &local_lag,
         &local_f_bio,
         f64::NEG_INFINITY,
         0.0,
@@ -1461,7 +1502,21 @@ fn equilibrate_ss_state(
     opts: &OdeSolverOptions,
     chz_before: &[f64],
 ) -> Vec<f64> {
-    let mut u = equilibrate_ss_pk_state(ode, pk_params_flat, dose, opts);
+    equilibrate_ss_state_lagged(ode, pk_params_flat, dose, 0.0, opts, chz_before)
+}
+
+/// [`equilibrate_ss_state`] for a dose whose compartment lag is `lag` (#2786). Only a dose into
+/// a built-in absorption compartment reads it: its steady state is a statement about the record
+/// (`lag` before the dose's own pulse arrives), not about the arrival.
+fn equilibrate_ss_state_lagged(
+    ode: &crate::ode::OdeSpec,
+    pk_params_flat: &[f64],
+    dose: &DoseEvent,
+    lag: f64,
+    opts: &OdeSolverOptions,
+    chz_before: &[f64],
+) -> Vec<f64> {
+    let mut u = equilibrate_ss_pk_state(ode, pk_params_flat, dose, lag, opts);
     restore_chz(ode, &mut u, chz_before);
     u
 }
@@ -1474,6 +1529,7 @@ fn equilibrate_ss_pk_state(
     ode: &crate::ode::OdeSpec,
     pk_params_flat: &[f64],
     dose: &DoseEvent,
+    lag: f64,
     opts: &OdeSolverOptions,
 ) -> Vec<f64> {
     // Clear the branch tag up front so the early returns below leave `None` rather than
@@ -1547,7 +1603,7 @@ fn equilibrate_ss_pk_state(
         // the solve and the fallback.
         let prepared = prepare_input_rates(ode, pk_params_flat);
         if let Some(u_ss) =
-            equilibrate_ss_input_rate(ode, pk_params_flat, dose, f_bio, opts, &prepared)
+            equilibrate_ss_input_rate_lagged(ode, pk_params_flat, dose, lag, f_bio, opts, &prepared)
         {
             return u_ss;
         }
@@ -1572,7 +1628,20 @@ fn equilibrate_ss_pk_state(
         // purely to satisfy an index that would otherwise panic; `ss_monotone_run_in_anchor_is_the_same_with_an_empty_lag_slice`
         // pins that the two spellings agree, so the allocation cannot creep back in on the
         // strength of a misremembered contract.
-        let no_lag: [f64; 0] = [];
+        //
+        // A lagged dose (#2786) staggers each synthetic pulse's arrival by the same lag, clamped
+        // so lag + route lag stays within one interval (the periodic sum's own clamp): the
+        // state after the last cycle is then the state at the record, `lag` before the arrival.
+        let route0 = ode
+            .input_rate
+            .iter()
+            .find(|f| f.cmt == dose.cmt_idx())
+            .map_or(0.0, |f| f.route_lag(pk_params_flat));
+        let no_lag: Vec<f64> = if lag > 0.0 {
+            vec![lag.min((dose.ii - route0).max(0.0)); n_pulses]
+        } else {
+            Vec::new()
+        };
         let no_zero_order: [(usize, f64); 0] = [];
         let wrapped_raw = wrap_rhs_with_forcings(
             ode,
@@ -1868,6 +1937,34 @@ fn ss_state_at_phase(
     u
 }
 
+/// The state a lagged SS dose installs **at its record** (#1121), the one spelling every f64
+/// walk reads. An ordinary compartment: [`ss_state_at_phase`] at the clamped phase `II − lag`.
+/// A bolus into a built-in absorption compartment (#2786) has no bolus to place and no phase to
+/// advance: its periodic forcing is the whole input, so the record's state is the fixed point
+/// of the cycle that starts at the record, the dose's own pulse arriving `lag` into it
+/// ([`equilibrate_ss_input_rate_lagged`], whose clamped sum keeps `lag ≥ II` on the record).
+fn ss_seed_at_record(
+    ode: &crate::ode::OdeSpec,
+    pk_params_flat: &[f64],
+    dose: &DoseEvent,
+    lag: f64,
+    opts: &OdeSolverOptions,
+    chz_before: &[f64],
+) -> Vec<f64> {
+    if !is_real_infusion(dose) && input_rate_consumes_cmt(ode, dose.cmt_raw()) {
+        equilibrate_ss_state_lagged(ode, pk_params_flat, dose, lag, opts, chz_before)
+    } else {
+        ss_state_at_phase(
+            ode,
+            pk_params_flat,
+            dose,
+            ss_seed_phase(dose, lag),
+            opts,
+            chz_before,
+        )
+    }
+}
+
 /// The PK-only body of [`ss_state_at_phase`] — see that function. Every integration runs under
 /// [`mask_chz`]; the accumulator rows come back at zero for the wrapper to fill.
 fn ss_state_at_phase_pk(
@@ -1907,7 +2004,7 @@ fn ss_state_at_phase_pk(
         mask_chz(chz, dy);
     };
     let run_in = run_in_jac(ode, chz);
-    let mut u = equilibrate_ss_pk_state(ode, pk_params_flat, dose, opts);
+    let mut u = equilibrate_ss_pk_state(ode, pk_params_flat, dose, 0.0, opts);
     let cmt_idx = dose.cmt_idx();
     if cmt_idx >= u.len() {
         return u;
@@ -2212,6 +2309,10 @@ fn zero_order_dur_and_frac_for_dose(
     if dose.amt <= 0.0 {
         return None;
     }
+    // An `SS=1` dose is lowered to an infusion (#2786): its window is the infusion's own.
+    if crate::dosing::is_lowered_zero_order_ss(&ode.dose_attr_map, dose) {
+        return None;
+    }
     ode.input_rate.iter().find_map(|f| {
         // `f.cmt` is 0-based; match it against the dose's 0-based target index so a `CMT=0` dose
         // (the default dose compartment == compartment 1) resolves its zero-order window instead of
@@ -2308,7 +2409,14 @@ pub(crate) fn infusion_contributes(
     // One binding, so the range test and the forcing test provably ask about the same
     // compartment — the property this shared predicate exists to guarantee.
     let cmt = d.cmt_idx();
-    cmt < n_states && !forcing_consumes_cmt(input_rate, cmt)
+    // A `zero_order()` forcing does not consume an infusion: its window *is* an infusion, so a
+    // real infusion record into a pure zero-order compartment (what an `SS=1` zero-order dose
+    // is lowered to, [`crate::dosing::lower_zero_order_ss`], #2786) delivers as the ordinary
+    // `+rate`. Every other kernel convolves it through `R_in_inf` instead.
+    cmt < n_states
+        && !input_rate
+            .iter()
+            .any(|f| f.cmt == cmt && f.kind != crate::pk::absorption::InputRateKind::ZeroOrder)
 }
 
 /// True if a built-in absorption input-rate forcing (transit/etc.) feeds the
@@ -2685,12 +2793,41 @@ fn prepare_input_rates(ode: &OdeSpec, params: &[f64]) -> PreparedForcings {
 /// structurally impossible — the function has no access to the outer accumulator.
 /// Generic over `T: PkNum` so the one implementation serves the `f64` predictor
 /// and the `Dual*` sensitivity walk identically.
+#[cfg(test)]
 #[inline]
 fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
     prep: &PreparedInputRate<T>,
     tad: T,
     ii: T,
     dose_mass: T,
+) -> T {
+    ss_periodic_forcing_shifted(prep, tad, ii, dose_mass, T::from_f64(0.0))
+}
+
+/// Pulse `j`'s age in [`ss_periodic_forcing_shifted`]: `tad` for the dose's own pulse
+/// (`j = 0`), `tad + j·II + shift` for the earlier ones.
+#[inline]
+fn tad_cycle<T: crate::sens::num::PkNum>(tad: T, ii: T, shift: T, j: usize) -> T {
+    if j == 0 {
+        tad
+    } else {
+        tad + ii * T::from_f64(j as f64) + shift
+    }
+}
+
+/// `ss_periodic_forcing` (the sum above) for a lagged SS dose (#2786). `tad` is measured from the dose's own
+/// arrival `t0 + L` (`L` = compartment lag + route lag); the earlier pulses of the train
+/// (`j ≥ 1`) arrived `j·II` before it, **but a lag of a full interval or more clamps** — the
+/// train is anchored on the record, as [`crate::dosing::ss_seed_phase`] does for every other
+/// SS dose — so they sit `shift = max(L − II, 0)` later: pulse `j` is read at
+/// `tad + j·II + shift`. `shift = 0` for `L ≤ II`, which is the unlagged and ordinary-lag sum.
+#[inline]
+fn ss_periodic_forcing_shifted<T: crate::sens::num::PkNum>(
+    prep: &PreparedInputRate<T>,
+    tad: T,
+    ii: T,
+    dose_mass: T,
+    shift: T,
 ) -> T {
     let mut local = T::from_f64(0.0);
     if T::RECORDS_BRANCHES {
@@ -2701,7 +2838,7 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
         use crate::sens::num::BranchCmp::Gt;
         let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
         for j in 0..SS_EQUILIBRATION_CYCLES {
-            let tad_j = tad + ii * T::from_f64(j as f64);
+            let tad_j = tad_cycle(tad, ii, shift, j);
             let safe = T::select_if(Gt, tad_j, zero, tad_j, one);
             local = local + T::select_if(Gt, tad_j, zero, prep.rate(safe, dose_mass), zero);
         }
@@ -2709,7 +2846,7 @@ fn ss_periodic_forcing<T: crate::sens::num::PkNum>(
     }
     let mut j = 0usize;
     while j < SS_EQUILIBRATION_CYCLES {
-        let tad_j = tad + ii * T::from_f64(j as f64);
+        let tad_j = tad_cycle(tad, ii, shift, j);
         if tad_j.val() > 0.0 {
             let term = prep.rate(tad_j, dose_mass);
             local = local + term;
@@ -2946,7 +3083,19 @@ pub(crate) fn add_prepared_input_rate_forcing<
                 if !gate.record_reached(d) {
                     continue;
                 }
-                ss_periodic_forcing(prep, tad, T::from_f64(d.ii), dose_mass)
+                // The lag past a full interval clamps (the train sits on the record): the
+                // earlier pulses read `max(L − II, 0)` later. A selection, not a branch — a
+                // recording type evaluates this inside an ODE step.
+                let ii = T::from_f64(d.ii);
+                let total_lag = lag + dose_rate.route_lag;
+                let shift = T::select_if(
+                    crate::sens::num::BranchCmp::Gt,
+                    total_lag,
+                    ii,
+                    total_lag - ii,
+                    T::from_f64(0.0),
+                );
+                ss_periodic_forcing_shifted(prep, tad, ii, dose_mass, shift)
             } else if d.is_infusion() {
                 // Infusion (RATE>0) into a built-in absorption compartment (#719 gap 2): the
                 // dose is a *zero-order source* feeding the kernel — its mass is delivered at a
@@ -5044,11 +5193,11 @@ fn reseed_prescheduled_states_at(
             seed_applied[i] = true;
             first_event = first_event.min(dose.time);
             let chz_before = chz_snapshot(ode, u);
-            u.copy_from_slice(&ss_state_at_phase(
+            u.copy_from_slice(&ss_seed_at_record(
                 ode,
                 pk_params_flat,
                 dose,
-                ss_seed_phase(dose, lag),
+                lag,
                 opts,
                 &chz_before,
             ));
@@ -9168,11 +9317,11 @@ fn event_driven_walk(
                 let d = &subject.doses[idx];
                 if ss_seeded_at_record(d, dose_lagtimes[idx]) {
                     let chz_before = chz_snapshot(ode, &u);
-                    u = ss_state_at_phase(
+                    u = ss_seed_at_record(
                         ode,
                         &pk_at_dose[idx].values,
                         d,
-                        ss_seed_phase(d, dose_lagtimes[idx]),
+                        dose_lagtimes[idx],
                         &opts,
                         &chz_before,
                     );
@@ -9516,14 +9665,7 @@ pub fn ode_predictions_with_states(
                 seed_applied[i] = true;
                 first_event = first_event.min(dose.time);
                 let chz_before = chz_snapshot(ode, &u);
-                u = ss_state_at_phase(
-                    ode,
-                    pk_params_flat,
-                    dose,
-                    ss_seed_phase(dose, lag),
-                    &opts,
-                    &chz_before,
-                );
+                u = ss_seed_at_record(ode, pk_params_flat, dose, lag, &opts, &chz_before);
                 // The earlier pulses still running at the record (#1121; every overlapping pulse
                 // when `T_inf > II`) stop inside the window after it. Registered like any other
                 // window so `gated_infusions` injects `+rate` over exactly `[dose.time, end]`.
@@ -10089,14 +10231,7 @@ fn apply_segment_boundary(
             seed_applied[i] = true;
             first_event = first_event.min(dose.time);
             let chz_before = chz_snapshot(ode, u);
-            *u = ss_state_at_phase(
-                ode,
-                dose_reads.at(i),
-                dose,
-                ss_seed_phase(dose, lag),
-                opts,
-                &chz_before,
-            );
+            *u = ss_seed_at_record(ode, dose_reads.at(i), dose, lag, opts, &chz_before);
             // The earlier pulses still running at the record (#1121; every overlapping pulse
             // when `T_inf > II`) stop inside the window after it. Registered like any other
             // window so `gated_infusions` injects `+rate` over exactly `[dose.time, end]`.

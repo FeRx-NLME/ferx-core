@@ -3299,6 +3299,9 @@ pub(crate) fn ode_states_at_g<T: VmNum>(
                 Some(snapshot(cov, time))
             })?;
         let attr_map = model.active_dose_attr_map();
+        // An `SS=1` zero-order dose is walked as the infusion it is lowered to (#2786).
+        let lowered = crate::dosing::lower_zero_order_ss(subject, attr_map);
+        let subject: &Subject = &lowered;
         let lag_slot: Vec<usize> = if model.has_lagtime() {
             subject
                 .doses

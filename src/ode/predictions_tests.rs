@@ -6690,6 +6690,34 @@ fn ss_periodic_forcing_break_is_dose_local_not_cross_dose() {
     );
 }
 
+/// **The clamp of a lagged SS train (#2786).** Past `lag = II` the earlier pulses stay on the
+/// record: the dose's own pulse is read at `tad`, pulse `j ≥ 1` at `tad + j·II + shift`, with
+/// `shift = max(L − II, 0)` the lag's excess over one interval. Pins `shift = 0` as the
+/// unlagged sum bit for bit, and a positive shift as moving every earlier pulse — and only
+/// those — by exactly that much (the own pulse term is unchanged).
+#[test]
+fn ss_periodic_forcing_shift_moves_the_earlier_pulses_only() {
+    let prep = transit_accumulator_spec().input_rate[0].prepare(&pk_transit_vec(3.0, 4.0, 1.0));
+    let (tad, ii, mass) = (2.5_f64, 6.0_f64, 1.0_f64);
+    let unshifted = ss_periodic_forcing_shifted(&prep, tad, ii, mass, 0.0);
+    assert_eq!(unshifted, ss_periodic_forcing(&prep, tad, ii, mass));
+    let shift = 1.75_f64;
+    let own = prep.rate(tad, mass);
+    // Brute force: the own pulse at `tad`, each earlier one `j·II + shift` older.
+    let mut want = own;
+    for j in 1..SS_EQUILIBRATION_CYCLES {
+        want += prep.rate(tad + ii * j as f64 + shift, mass);
+    }
+    let got = ss_periodic_forcing_shifted(&prep, tad, ii, mass, shift);
+    assert_relative_eq!(got, want, max_relative = 1e-9);
+    // Both halves are live: the earlier pulses carry mass at this age, and the shift moves it.
+    assert!(want - own > 1e-6 * own, "the earlier pulses are negligible");
+    assert!(
+        (got - unshifted).abs() > 1e-4 * unshifted,
+        "the shift moved nothing: {got} vs {unshifted}"
+    );
+}
+
 #[test]
 fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
     // Biphasic IG (#388): two igd forcings on one compartment, split FR1/FR2.

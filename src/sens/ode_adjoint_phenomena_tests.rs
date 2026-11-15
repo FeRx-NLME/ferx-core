@@ -3320,3 +3320,173 @@ fn anchor_steady_state_shapes_match_reconverged_fd() {
         }
     }
 }
+
+// ---- SS into an absorption input with a lag, and into a zero-order window (#2786) --------
+//
+// A zero-order SS dose is walked as the duration-modeled SS infusion it is lowered to (the
+// moving window end rides `dur`'s jet; the lag is `ALAG{c}`), a density SS dose through the
+// periodic forcing whose record state is the fixed point of the cycle its own pulse arrives
+// `lag` into. Every fixture dose is followed by an ordinary dose on residual drug; the lags
+// sit below `II` and at / above it (the clamp), the windows below, past and above `II`. Each
+// is checked against the reconverged-FD objective gradient and the Richardson `∂f/∂η`, served
+// by the adjoint (no FD route) and with no plan failure.
+
+/// A one-compartment model with `kernel` (`zero_order` | `first_order`) absorption and its lag:
+/// `lag` is `"alag"` (compartment `ALAG1`), `"route"` (`lag=LAG` on the kernel) or `"none"`.
+fn ss_lag_model(kernel: &str, lag: &str, lag_value: f64, dur_or_ka: f64) -> String {
+    let (arg, extra) = if kernel == "zero_order" {
+        (
+            "dur=DUR",
+            format!("  theta TVDUR({dur_or_ka}, 0.1, 40.0)\n"),
+        )
+    } else {
+        ("ka=KA", format!("  theta TVKA({dur_or_ka}, 0.01, 20.0)\n"))
+    };
+    let (indiv, call) = match lag {
+        "alag" => ("  ALAG1 = TVLAG\n", format!("{kernel}({arg})")),
+        "route" => ("  LAG = TVLAG\n", format!("{kernel}({arg}, lag=LAG)")),
+        _ => ("", format!("{kernel}({arg})")),
+    };
+    let var = if kernel == "zero_order" {
+        "  DUR = TVDUR * exp(ETA_P)\n"
+    } else {
+        "  KA = TVKA * exp(ETA_P)\n"
+    };
+    format!(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 50.0)\n  theta TVV(20.0, 0.5, 200.0)\n{extra}  \
+         theta TVLAG({lag_value}, 0.0, 30.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_P ~ 0.04\n  \
+         sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+         V  = TVV\n{var}{indiv}[structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+         [odes]\n  d/dt(central) = {call} - CL/V*central\n[scaling]\n  y = central / V\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+/// `(label, model source, live θ)`: θ order is CL, V, DUR|KA, LAG.
+fn ss_lag_cases() -> Vec<(String, String, Vec<usize>)> {
+    let mut v = Vec::new();
+    for (label, kernel, lag, lag_value, p) in [
+        ("ZO ALAG1 2 (dur 3)", "zero_order", "alag", 2.0, 3.0),
+        ("ZO route lag 2 (dur 3)", "zero_order", "route", 2.0, 3.0),
+        (
+            "ZO ALAG1 2 + dur 11 past II",
+            "zero_order",
+            "alag",
+            2.0,
+            11.0,
+        ),
+        ("ZO ALAG1 14 >= II", "zero_order", "alag", 14.0, 3.0),
+        ("ZO ALAG1 12 = II, dur 5", "zero_order", "alag", 12.0, 5.0),
+        ("ZO no lag, dur 15 > II", "zero_order", "none", 0.0, 15.0),
+        ("FO ALAG1 2", "first_order", "alag", 2.0, 0.4),
+        ("FO route lag 2", "first_order", "route", 2.0, 0.4),
+        ("FO ALAG1 14 >= II", "first_order", "alag", 14.0, 0.4),
+        ("FO route lag 14 >= II", "first_order", "route", 14.0, 0.4),
+    ] {
+        let live = if lag == "none" {
+            vec![0, 2]
+        } else {
+            vec![0, 2, 3]
+        };
+        v.push((
+            label.to_string(),
+            ss_lag_model(kernel, lag, lag_value, p),
+            live,
+        ));
+    }
+    v
+}
+
+#[test]
+fn ss_into_absorption_with_a_lag_matches_reconverged_fd() {
+    // >= 1 h from every window edge and arrival: an observation on an edge sits on a kink of
+    // the prediction, where central FD and the one-sided analytic derivative differ.
+    let times = [0.4, 4.0, 6.5, 7.5, 10.5, 16.0, 19.0, 22.5, 28.0, 31.0];
+    // The `lag >= II` rows keep the observations out of the whole range the estimated window
+    // end can sweep (`dur = 3 e^eta`, eta in +-0.5): a recorded plan whose window end crossed an
+    // observation across the inner search is the pre-existing hole noted on the control test.
+    let clamp_times = [
+        0.4, 6.0, 7.5, 10.5, 13.0, 14.6, 21.0, 23.0, 25.0, 33.0, 36.0,
+    ];
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let mut worst = (0.0f64, 0.0f64);
+    let mut bad = Vec::new();
+    for (label, src, live) in ss_lag_cases() {
+        let times: &[f64] = if label.contains(">= II") {
+            &clamp_times
+        } else {
+            &times
+        };
+        let m = tight(parse_model_string(&src).unwrap());
+        let s = subject(&m, doses.clone(), times, &[0.1, -0.05]);
+        assert!(s.has_periodic_ss_dose());
+        let (jac, grad) = measure(&m, &s, &live, &label);
+        assert!(
+            crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failures(
+                &m,
+                std::slice::from_ref(&s)
+            )
+            .is_none(),
+            "{label}: a plan failed"
+        );
+        worst = (worst.0.max(jac), worst.1.max(grad));
+        // Measured on Linux (reltol 1e-10): worst ∂f/∂η 8.6e-8 (first_order at lag >= II, whose
+        // periodic sum the value path truncates at 1e-10 relative), worst gradient 2.8e-6 (a
+        // 15 h zero-order window, no lag); the zero-order rows with a lag 1.4e-10 / 4.6e-7.
+        // Bounds ~10x the worst.
+        if jac >= 1e-6 || grad >= 3e-5 {
+            bad.push(format!("{label}: ∂f/∂η {jac:.2e}, gradient {grad:.2e}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+    eprintln!(
+        "SS absorption lag: worst ∂f/∂η {:.2e}, gradient {:.2e}",
+        worst.0, worst.1
+    );
+}
+
+/// Control for the zero-order SS case: the same configurations written as a user-coded
+/// `RATE=-2` modeled-duration SS infusion (`D1`), the path the zero-order dose is lowered to.
+/// Not covered here: `lag >= II` with an estimated duration on a dense observation grid, where
+/// (before and independent of #2786, reproduced on this user-coded `D1` path) the θ gradient
+/// came back 0.3 off reconverged FD for a ten-observation grid whose observations sit inside the
+/// range the estimated window end sweeps, while each half of the grid alone matched to 1e-9 and
+/// the same subject with a fixed rate matched to 1e-8.
+#[test]
+fn ss_modeled_duration_infusion_with_a_lag_matches_reconverged_fd() {
+    let times = [0.4, 4.0, 6.5, 7.5, 10.5, 16.0, 19.0, 22.5, 28.0, 31.0];
+    let mut bad = Vec::new();
+    for (dur, lag) in [
+        (3.0, 2.0),
+        (11.0, 0.0),
+        (5.0, 9.0),
+        (11.0, 2.0),
+        (15.0, 0.0),
+    ] {
+        let src = format!(
+            "[parameters]\n  theta TVCL(1.0, 0.01, 50.0)\n  theta TVV(20.0, 0.5, 200.0)\n  \
+            theta TVDUR({dur}, 0.1, 40.0)\n  theta TVLAG({lag}, 0.0, 30.0)\n  omega ETA_CL ~ 0.09\n  \
+            omega ETA_P ~ 0.04\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  \
+            CL = TVCL * exp(ETA_CL)\n  V  = TVV\n  D1 = TVDUR * exp(ETA_P)\n  ALAG1 = TVLAG\n\
+            [structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  \
+            d/dt(central) = -CL/V*central\n[scaling]\n  y = central / V\n[error_model]\n  \
+            DV ~ proportional(PROP_ERR)\n"
+        );
+        let m = tight(parse_model_string(&src).unwrap());
+        let doses = vec![
+            DoseEvent::modeled(0.0, 100.0, 1, true, 12.0, RateMode::ModeledDuration),
+            DoseEvent::modeled(12.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration),
+        ];
+        let s = subject(&m, doses, &times, &[0.1, -0.05]);
+        let label = format!("modeled D1 SS dur {dur} lag {lag}");
+        let (jac, grad) = measure(&m, &s, &[0, 2, 3], &label);
+        // Measured on Linux: worst ∂f/∂η 1.6e-11, worst gradient 3.8e-9; ~10x.
+        if jac > 2e-10 || grad > 4e-8 {
+            bad.push(format!("{label}: {jac:.2e} {grad:.2e}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:?}");
+}

@@ -198,8 +198,12 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
 /// the mass through the convolved `R_in_inf` instead (#719 gap 2). One predicate for every site
 /// of both generic walks, mirroring the f64 predictor's `infusion_contributes`.
 fn plain_rate_channel(ode: &OdeSpec, d: &crate::types::DoseEvent) -> bool {
+    // A zero-order forcing does not consume an infusion (its window is one): the lowered `SS=1`
+    // zero-order dose (#2786) is a plain infusion. See `predictions::infusion_contributes`.
     crate::dosing::infusion_has_rate_channel(d)
-        && !crate::ode::predictions::forcing_consumes_cmt(&ode.input_rate, d.cmt_idx())
+        && !ode.input_rate.iter().any(|f| {
+            f.cmt == d.cmt_idx() && f.kind != crate::pk::absorption::InputRateKind::ZeroOrder
+        })
 }
 
 /// The static (superposition) walk's subject scope **without** the retired forward
@@ -390,6 +394,11 @@ fn zero_order_forcing_for_dose<'f, T: crate::sens::num::PkNum>(
     d: &crate::types::DoseEvent,
     params: &[T],
 ) -> Option<(&'f crate::pk::absorption::InputRateForcing, T)> {
+    // An `SS=1` zero-order dose is walked as the infusion it is lowered to (#2786): its window
+    // is the infusion's own, so no zero-order window is built for it.
+    if crate::dosing::is_lowered_zero_order_ss(&ode.dose_attr_map, d) {
+        return None;
+    }
     let f = ode.input_rate.iter().find(|f| {
         // 0-based match so a `CMT=0` dose resolves compartment 1's zero-order window (#899, #913
         // review) — the gradient twin of the value-path fix in `zero_order_dur_and_frac_for_dose`.
@@ -1100,6 +1109,11 @@ pub(crate) fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
         .as_ref()
         .expect("ode_analytical_supported (via ode_tvcov_supported) guarantees rhs_program");
     let opts = ode.effective_solver_opts();
+    // An `SS=1` zero-order dose is walked as the duration-modeled infusion it is lowered to
+    // (#2786), as production's `resolve_subject_doses` does: its window end rides the `dur`
+    // slot's jet through the modeled-dose machinery below.
+    let lowered = crate::dosing::lower_zero_order_ss(subject, &ode.dose_attr_map);
+    let subject: &Subject = &lowered;
 
     // Per dose compartment, mirroring production's `DoseAttrMap::f_bio`: `F{cmt}` if
     // declared else the bare `PK_IDX_F` slot (#369 / #486), read from that dose's own
@@ -2327,6 +2341,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
     ode: &OdeSpec,
     n_states: usize,
     dose: &crate::types::DoseEvent,
+    lag: T,
     f_bio: T,
     params: &[T],
     opts: &crate::ode::solver::OdeSolverOptions,
@@ -2380,7 +2395,9 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
         true,
         ii,
     )];
-    let lag0 = [T::from_f64(0.0)];
+    // The dose's compartment lag (#2786), a jet: the cycle's pulse arrives `lag` (+ route lag)
+    // into it, so the record's state depends on the lag through the forced cycle itself.
+    let lag0 = [lag];
     let fbio1 = [f_bio];
     // One cycle from the local pulse's own record: the gate is a no-op (the f64 twin
     // `equilibrate_ss_input_rate` builds the same gate at `0.0`, with no EVID=3/4 floor).
@@ -2416,6 +2433,55 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
                 .last()
                 .map(|p| p.u.clone())
         };
+    // A pulse that arrives *inside* the cycle (`0 < lag + route lag < II`, #2786) is a kink of the
+    // forced field: the one-cycle map integrated across it with a step sequence fixed at the
+    // recording carries a derivative error `O(h·jump)` in the kink's position (the values stay
+    // accurate, which hides it — the lag's gradient came back 1.2 off FD). So the cycle is split
+    // there, and the moving onset crossed as the walk crosses a lagged arrival
+    // (`cross_rate_switch`, exact to every order). Sorted by position; none for an unlagged dose
+    // (the onset is the cycle's start) or one at or past `II` (the clamp: it is not in the cycle).
+    let cmt_idx = dose.cmt_idx();
+    let mut kinks: Vec<(T, usize)> = Vec::new();
+    for (fi, f) in ode.input_rate.iter().enumerate() {
+        if f.cmt != cmt_idx || f.kind == crate::pk::absorption::InputRateKind::ZeroOrder {
+            continue;
+        }
+        let total = lag + prepared.get(fi, 0).route_lag;
+        use crate::sens::num::BranchCmp::{Gt, Lt};
+        if total.br_cmp_c(Gt, 0.0) && total.br_cmp_c(Lt, ii) {
+            kinks.push((total, fi));
+        }
+    }
+    kinks.sort_by(|a, b| a.0.seen_value().total_cmp(&b.0.seen_value()));
+    let dose_mass = f_bio * T::from_f64(dose.amt);
+    // One stretch of the forced cycle, from nominal `a` to nominal `b` (times that move with the
+    // lag on a recording type, like the phase seed's).
+    let stretch = |u0: &[T], a: T, b: T| -> Option<Vec<T>> {
+        T::span_hint(a, b);
+        let (av, bv) = (a.span_value(), b.span_value());
+        register_prog_jac!(&forced, pj_forced);
+        let sol = solve_ode_g_certified(&forced, u0, (av, bv), params, &[bv], &eq_opts);
+        let _ = T::take_span();
+        sol.last().map(|p| p.u.clone())
+    };
+    let advance_forced = |u0: &[T]| -> Option<Vec<T>> {
+        if kinks.is_empty() {
+            return advance(&forced, &pj_forced, u0);
+        }
+        let mut y = u0.to_vec();
+        let mut at = T::from_f64(0.0);
+        for &(total, fi) in &kinks {
+            let pos = total.value_only();
+            y = stretch(&y, at, pos)?;
+            let dr = prepared.get(fi, 0);
+            let onset = |tau: T| dr.frac * dr.prep.rate_onset_continued(tau, dose_mass);
+            // The field at the kink without this pulse (the others' own onsets are their kinks).
+            let mut base = |x: &[T], _s: T, out: &mut [T]| forced(x, params, pos, out);
+            cross_rate_switch(&mut y, jet_only(total), cmt_idx, &onset, true, &mut base);
+            at = pos;
+        }
+        stretch(&y, at, T::from_f64(ii))
+    };
     if let Some(u_ss) = crate::ode::predictions::equilibrate_ss_input_rate_pk::<T, _, _>(
         chz,
         n,
@@ -2423,7 +2489,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
         eq_opts.reltol,
         eq_opts.abstol,
         |u0| advance(&disposition, &pj_disposition, u0),
-        |u0| advance(&forced, &pj_forced, u0),
+        advance_forced,
     ) {
         return u_ss;
     }
@@ -2441,7 +2507,18 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
             crate::types::DoseEvent::new(m as f64 * ii, dose.amt, dose.cmt_raw(), 0.0, false, 0.0)
         })
         .collect();
-    let lags = vec![T::from_f64(0.0); n_pulses];
+    // A lagged dose staggers each synthetic pulse by the (clamped) lag, as the f64 twin does.
+    let route0 = ode
+        .input_rate
+        .iter()
+        .find(|f| f.cmt == dose.cmt_idx())
+        .map_or(0.0, |f| f.route_lag(params).seen_value());
+    let train_lag = if lag.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
+        lag.seen_value().min((ii - route0).max(0.0))
+    } else {
+        0.0
+    };
+    let lags = vec![T::from_f64(train_lag); n_pulses];
     let fbios = vec![f_bio; n_pulses];
     // Non-SS synthetic pulses: no `SS=1` record and no EVID=3/4 reset, so nothing to reach.
     let gate = crate::ode::predictions::ResetGate::at_segment(
@@ -3840,6 +3917,9 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         ode,
                         n_states,
                         d,
+                        // Unseeded (`lag ≤ 0`): the record is the arrival, so the lag is the
+                        // `0⁺` branch's (a route lag rides in the prepared forcing).
+                        lag_dual(idx),
                         f_bio_at_dose[idx],
                         &pk_at_dose[idx],
                         opts,
@@ -3866,7 +3946,10 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             {
                 let cmt_idx = d.cmt_idx();
                 if cmt_idx < n_states {
-                    if has_input_rate && input_rate_consumes_cmt(ode, d.cmt_raw()) {
+                    if has_input_rate
+                        && input_rate_consumes_cmt(ode, d.cmt_raw())
+                        && !crate::dosing::is_lowered_zero_order_ss(&ode.dose_attr_map, d)
+                    {
                         // The dose feeds a built-in absorption forcing (`R_in`), not a
                         // bolus (#430) — its mass flows in continuously via
                         // `add_prepared_input_rate_forcing` in the RHS above, not as an
@@ -4481,6 +4564,27 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // through the walk's ordinary integration.
             let d = &subject.doses[idx];
             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
+            // A bolus into a built-in absorption compartment (#2786) has no bolus to place and no
+            // phase to advance: its periodic forcing is the whole input, so the record's state is
+            // the fixed point of the cycle that starts at the record (the dose's own pulse
+            // arriving `lag` into it), carrying `∂/∂lag` through that cycle — production's
+            // `ss_seed_at_record`.
+            if has_input_rate && !is_inf(d) && input_rate_consumes_cmt(ode, d.cmt_raw()) {
+                let chz_before = chz_rows(ode, &u);
+                u = equilibrate_ss_input_rate_state_g::<T>(
+                    program,
+                    ode,
+                    n_states,
+                    d,
+                    lag,
+                    f_bio_at_dose[idx],
+                    &pk_at_dose[idx],
+                    opts,
+                );
+                restore_chz_rows(ode, &mut u, &chz_before);
+                last_params = &pk_at_dose[idx];
+                continue;
+            }
             // `crate::dosing::ss_seed_phase` in dual form. The clamp is on the VALUE, and
             // it kills the jet with it: past `lag = II` the phase is pinned at 0 for every
             // nearby lag, so `∂phase/∂lag = 0` there. Taking `T::from_f64(d.ii) - lag`

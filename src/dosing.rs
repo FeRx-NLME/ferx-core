@@ -54,12 +54,71 @@ pub(crate) fn resolve_subject_doses_with<'a>(
     // dose to resolve, so skip the per-dose `all_doses_fixed()` scan entirely —
     // the overwhelmingly common case (no `D{cmt}`). A modeled dose cannot reach
     // here with an empty map: it would have been rejected by the data gate first.
-    if attr_map.is_empty() || subject.all_doses_fixed() {
+    let base = lower_zero_order_ss(subject, attr_map);
+    if (attr_map.is_empty() && !attr_map.has_zero_order()) || base.all_doses_fixed() {
+        return base;
+    }
+    let mut owned = base.into_owned();
+    for (k, d) in owned.doses.iter_mut().enumerate() {
+        *d = d.resolve_rate(attr_map, pk_for_dose(k));
+    }
+    Cow::Owned(owned)
+}
+
+/// Whether `d` is a plain `SS=1` bolus record into a compartment fed by one `zero_order()`
+/// window and nothing else (#2786) — the doses [`lower_zero_order_ss`] rewrites.
+fn is_zero_order_ss_record(attr_map: &crate::types::DoseAttrMap, d: &DoseEvent) -> bool {
+    d.ss && d.ii > 0.0
+        && d.amt > 0.0
+        && matches!(d.rate_mode, crate::types::RateMode::Fixed)
+        && !d.is_infusion()
+        && attr_map.zero_order_slot(d.cmt_1based()).is_some()
+}
+
+/// Whether `d` is such a dose **after** lowering: a duration-modeled `SS=1` infusion whose
+/// compartment is a pure zero-order one. A user-coded infusion into a zero-order compartment is
+/// refused by validation, so this names the lowered doses and only them. Every walk asks it to
+/// keep such a dose on the plain-infusion paths (no forcing onset, no `R_in_inf`).
+pub(crate) fn is_lowered_zero_order_ss(
+    attr_map: &crate::types::DoseAttrMap,
+    d: &DoseEvent,
+) -> bool {
+    d.ss && d.ii > 0.0 && d.is_infusion() && attr_map.zero_order_slot(d.cmt_1based()).is_some()
+}
+
+/// Rewrite every `SS=1` bolus into a pure zero-order compartment as a duration-modeled
+/// infusion (`RATE=-2` with the forcing's `dur` as its `D{cmt}`), #2786.
+///
+/// A zero-order window *is* an infusion: rate `F·amt/dur` over `[t + lag, t + lag + dur]`. The
+/// engines already carry a steady-state infusion exactly — the periodic seed with its active and
+/// quiet windows, the pulses of an overlapping train still running after the record, the lag
+/// phase and its clamp, resets — in value and in every derivative order, including the moving
+/// window end through the modeled duration's jet. Lowering the dose reuses all of it instead of
+/// growing a second implementation of the same train for `zero_order()`; non-SS doses keep the
+/// window machinery. Borrowed (no allocation) unless a dose is rewritten.
+pub(crate) fn lower_zero_order_ss<'a>(
+    subject: &'a Subject,
+    attr_map: &crate::types::DoseAttrMap,
+) -> Cow<'a, Subject> {
+    if !attr_map.has_zero_order()
+        || !subject
+            .doses
+            .iter()
+            .any(|d| is_zero_order_ss_record(attr_map, d))
+    {
         return Cow::Borrowed(subject);
     }
     let mut owned = subject.clone();
-    for (k, d) in owned.doses.iter_mut().enumerate() {
-        *d = d.resolve_rate(attr_map, pk_for_dose(k));
+    for d in owned
+        .doses
+        .iter_mut()
+        .filter(|d| is_zero_order_ss_record(attr_map, d))
+    {
+        d.rate_mode = crate::types::RateMode::ModeledDuration;
+        d.infusion_def = crate::types::InfusionDef::DurationDefined;
+        d.rate = 0.0;
+        d.duration = 0.0;
+        d.resolve_default_cmt();
     }
     Cow::Owned(owned)
 }

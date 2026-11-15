@@ -173,7 +173,7 @@ found:
 | dose compartment | `E_DOSE_CMT_OUT_OF_RANGE`, `E_DOSE_CMT_NOT_INFUSABLE` |
 | absorption closed-form support | `E_TRANSIT_UNSUPPORTED` (`E_IG_UNSUPPORTED` for an inverse-Gaussian model) |
 | flip-flop without an ODE twin | `E_TRANSIT_FLIP_FLOP` (`E_IG_FLIP_FLOP`) |
-| absorption input rate | `E_ABSORPTION_FRACTION`, `E_ABSORPTION_DOMAIN`, `E_ABSORPTION_DIFFUSION`, `E_ABSORPTION_RATE_ZERO_ORDER`, `E_ABSORPTION_SS_INFUSION`, `E_ABSORPTION_SS_LAG`, `E_ABSORPTION_SS_ZERO_ORDER` |
+| absorption input rate | `E_ABSORPTION_FRACTION`, `E_ABSORPTION_DOMAIN`, `E_ABSORPTION_DIFFUSION`, `E_ABSORPTION_RATE_ZERO_ORDER`, `E_ABSORPTION_SS_INFUSION`, `E_ABSORPTION_SS_ZERO_ORDER_MIXED`, `E_ABSORPTION_SS_ZERO_ORDER_LAG` |
 | κ weights, residual weights | `E_KAPPA_WEIGHT_NONPOSITIVE`, `E_RUV_MAGNITUDE_NONPOSITIVE` |
 | endpoint routing | `E_ENDPOINT_UNROUTED`; on `run_sir()` / `run_covariance()` also `E_ENDPOINT_NO_RECORDS` |
 | θ level binding, covariate statistics binding | `E_THETA_LEVEL_BINDING`, `E_COVARIATE_STATS_BINDING` |
