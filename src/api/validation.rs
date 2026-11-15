@@ -2861,6 +2861,10 @@ pub(crate) fn check_absorption_dosing(
             d.ss && d.ii > 0.0
                 && lowerable(d.cmt_1based())
                 && route_lagged_zero_order(d.cmt_1based())
+                && ode
+                    .dose_attr_map
+                    .lowered_route_lag_slot(d.cmt_1based())
+                    .is_none()
         })
     });
     if ss_zero_order_mixed {

@@ -1132,12 +1132,12 @@ pub(crate) fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
     // Per-dose lagtime slot: the bare `PK_IDX_LAGTIME`, or a compartment-indexed
     // `ALAG{cmt}` slot when declared (#369). Empty when the model has no lagtime (the
     // walk then skips the dose-time shift / saltation entirely).
-    let dose_lag_slot: Vec<usize> = if model.has_lagtime() {
+    let dose_lag_slot: Vec<usize> = if model.has_dose_lag() {
         let attr_map = model.active_dose_attr_map();
         subject
             .doses
             .iter()
-            .map(|d| attr_map.lag_slot(d.cmt_raw()))
+            .map(|d| attr_map.lag_slot_for_dose(d))
             .collect()
     } else {
         Vec::new()

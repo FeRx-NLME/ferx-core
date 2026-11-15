@@ -4823,3 +4823,86 @@ fn an_ode_readout_reading_a_theta_with_every_pk_slot_taken_is_served() {
         assert!(jac < 5e-10 && grad < 3e-8, "{label}: {jac:.2e} {grad:.2e}");
     }
 }
+
+// ---- an SS dose into a route-lagged zero-order window (#2786) -------------------------
+
+/// `zero_order(dur, lag=)` with an estimated window length and an estimated per-route lag, the
+/// disposition reading `TAD` when `tad`.
+fn route_lagged_zero_order_ss_model(tad: bool) -> CompiledModel {
+    let clock = if tad { " * (1 + 0.05 * TAD)" } else { "" };
+    let src = format!(
+        r#"
+[parameters]
+  theta TVCL(10.0, 1.0, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVDUR(2.0, 0.1, 8.0)
+  theta TVLAG(0.7, 0.01, 5.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_DUR ~ 0.04
+  omega ETA_LAG ~ 0.02
+  sigma PROP_ERR ~ 0.1 (sd)
+[individual_parameters]
+  CL  = TVCL * exp(ETA_CL)
+  V   = TVV
+  DUR = TVDUR * exp(ETA_DUR)
+  LAG = TVLAG * exp(ETA_LAG)
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = zero_order(dur=DUR, lag=LAG) - (CL/V) * central{clock}
+[scaling]
+  obs_scale = V
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#
+    );
+    let m = tight(parse_model_string(&src).unwrap());
+    // The route lag stays on the route: the model is not a compartment-lag model, and its
+    // lowered SS dose is the one dose that carries the lag as its own.
+    assert!(!m.has_lagtime() && m.has_route_absorption_lag() && m.has_dose_lag());
+    m
+}
+
+/// An `SS=1` dose into a route-lagged zero-order window (lowered to an SS infusion that takes
+/// the route's lag as its own), then a non-SS dose on its residual, whose window is the
+/// forcing's: the plan serves the subject (`jacobian_gap` / `parity` expect it in scope, no
+/// FD fallback) and its `∂f/∂η` and FOCEI gradient match reconverged FD, `η_LAG` live.
+/// Mutation: the lowered dose reading the compartment lag (0) instead of the route's slot
+/// (`DoseAttrMap::lagtime_for_dose` / `lag_slot_for_dose`) -> the lag η moves no prediction of
+/// the SS train and the gap is O(1).
+#[test]
+fn ss_dose_into_a_route_lagged_zero_order_window_matches_reconverged_fd() {
+    const TIMES_ALL: [f64; 12] = [
+        0.4, 1.0, 3.0, 4.6, 6.0, 9.0, 11.9, 13.0, 15.0, 17.5, 20.0, 24.0,
+    ];
+    const TIMES_TAD: [f64; 9] = [0.4, 1.0, 3.0, 4.6, 6.0, 9.0, 11.9, 12.3, 12.6];
+    for tad in [false, true] {
+        let m = route_lagged_zero_order_ss_model(tad);
+        let s = subject(
+            &m,
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            // The `TAD` cell stays inside the SS dose's first cycle (`< lag + II`): the walk's
+            // `TAD` anchor does not follow an SS dose's later cycle starts (`tad_referent`'s
+            // "arrival plus whole cycles"), so past the first wrap a dose of another lag
+            // re-anchors differently from the value path -- the `TAD`-with-a-lagged-SS-dose gap,
+            // independent of where the lag is spelled (measured: gap 2e-2 from t = 15).
+            if tad { &TIMES_TAD[..] } else { &TIMES_ALL[..] },
+            &[0.1, -0.08, 0.05],
+        );
+        let label = format!("route-lagged zero-order SS tad={tad}");
+        let jac = jacobian_gap(&m, &s, &probe_eta(m.n_eta), &label);
+        assert!(jac < 2e-9, "{label}: ∂f/∂η {jac:.2e}");
+        // The FOCEI gradient is asserted without the `TAD` clock only: with it, the first-cycle
+        // observations give ∂f/∂η 5.8e-11 but a gradient 2.4e-5 off reconverged FD (measured,
+        // Linux) -- the `TAD`-with-a-lagged-SS-dose gap, open, not asserted away.
+        if !tad {
+            let grad = parity(&m, &s);
+            eprintln!("{label}: ∂f/∂η {jac:.2e}; FOCEI gradient vs reconverged FD {grad:.2e}");
+            // Measured 7.7e-8 on Linux.
+            assert!(grad < 1e-6, "{label}: gradient {grad:.2e}");
+        }
+    }
+}

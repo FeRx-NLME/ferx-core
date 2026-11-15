@@ -17528,19 +17528,16 @@ fn build_ode_spec_with(
 
     // Compartments fed by a single `zero_order()` window and nothing else (#2786): an `SS=1`
     // dose into one is lowered to a duration-modeled infusion that reads the window's `dur`
-    // from this slot (`dosing::lower_zero_order_ss`). Its lag must then be the dose's own
-    // compartment lag, which is all the infusion machinery knows — so a per-route `lag=` on
-    // such a compartment is the compartment's `ALAG{c}`: the same physical delay (the window
-    // opens `lag` after the dose either way, `tests/per_route_lag.rs`), moved onto the dose
-    // attribute when nothing else already is the compartment's lag. A compartment that also
-    // carries its own `ALAG{c}`/`lagtime` keeps the two apart (their sum is not one slot), and
-    // an `SS=1` dose into it is refused by validation.
-    let mut input_rate = input_rate;
+    // from this slot (`dosing::lower_zero_order_ss`). The forcing's per-route `lag=` stays on
+    // the route for every other dose; the lowered infusion reads it as its own lag through
+    // `DoseAttrMap::lagtime_for_dose` — the same physical delay (the window opens `lag` after
+    // the dose either way, `tests/per_route_lag.rs`) — when nothing else is the compartment's
+    // lag. A compartment that also carries its own `ALAG{c}`/`lagtime` keeps the two apart
+    // (their sum is not one slot), and an `SS=1` dose into it is refused by validation.
     let has_bare_lag = indiv_param_names
         .iter()
         .any(|n| reserved_flag_slot(n) == Some(crate::types::PK_IDX_LAGTIME));
-    for i in 0..input_rate.len() {
-        let f = &input_rate[i];
+    for f in input_rate.iter() {
         let sole = input_rate.iter().filter(|g| g.cmt == f.cmt).count() == 1;
         if f.kind != crate::pk::absorption::InputRateKind::ZeroOrder
             || f.frac_slot.is_some()
@@ -17548,21 +17545,17 @@ fn build_ode_spec_with(
         {
             continue;
         }
-        let (cmt, lag_slot) = (f.cmt + 1, f.lag_slot);
+        let cmt = f.cmt + 1;
         let Some(&dur_slot) = f.arg_slots.first() else {
             continue;
         };
-        dose_attr_map.set_zero_order(cmt, dur_slot);
-        if let Some(ls) = lag_slot {
-            if !has_bare_lag
+        let route_lag_slot = f.lag_slot.filter(|_| {
+            !has_bare_lag
                 && dose_attr_map
                     .indexed_slot(crate::types::DoseAttr::Lag, cmt)
                     .is_none()
-            {
-                dose_attr_map.insert(crate::types::DoseAttr::Lag, cmt, ls);
-                input_rate[i].lag_slot = None;
-            }
-        }
+        });
+        dose_attr_map.set_zero_order(cmt, dur_slot, route_lag_slot);
     }
 
     Ok(crate::ode::OdeSpec {

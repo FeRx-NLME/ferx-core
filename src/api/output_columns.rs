@@ -210,7 +210,7 @@ pub(crate) fn compute_extra_output_columns(
         // subject (dose-indexed). Skipped entirely when the model declares no lag:
         // `dose_lagtimes` stays empty and `tad_at_time` falls back to zero lag,
         // so the common no-lag case pays nothing for this per-dose pass.
-        let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
+        let dose_lagtimes: Vec<f64> = if model.has_dose_lag() {
             let mut pk_dose: Vec<_> = (0..subject.doses.len())
                 .map(|d| {
                     let occ = crate::pk::dose_row_occasion(subject, d).unwrap_or(u32::MAX);
@@ -243,7 +243,7 @@ pub(crate) fn compute_extra_output_columns(
                     match &model.ode_spec {
                         Some(ode) => ode
                             .dose_attr_map
-                            .lagtime(subject.doses[d].cmt_raw(), &pk_d.values),
+                            .lagtime_for_dose(&subject.doses[d], &pk_d.values),
                         None => pk_d.lagtime(),
                     }
                 })

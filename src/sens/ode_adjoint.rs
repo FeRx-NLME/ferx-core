@@ -3524,11 +3524,11 @@ pub(crate) fn ode_states_at_g<T: VmNum>(
         // An `SS=1` zero-order dose is walked as the infusion it is lowered to (#2786).
         let lowered = crate::dosing::lower_zero_order_ss(subject, attr_map);
         let subject: &Subject = &lowered;
-        let lag_slot: Vec<usize> = if model.has_lagtime() {
+        let lag_slot: Vec<usize> = if model.has_dose_lag() {
             subject
                 .doses
                 .iter()
-                .map(|d| attr_map.lag_slot(d.cmt_raw()))
+                .map(|d| attr_map.lag_slot_for_dose(d))
                 .collect()
         } else {
             Vec::new()

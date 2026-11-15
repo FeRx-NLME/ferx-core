@@ -2896,7 +2896,7 @@ fn fit_inner(
 
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
     // (with individual lagtime) for the mandatory TAD column in output.rs.
-    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
+    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_dose_lag() {
         compute_extra_output_columns(
             model,
             all_records,

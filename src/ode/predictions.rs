@@ -3998,7 +3998,7 @@ fn subject_dose_attrs_with<'a>(
         .doses
         .iter()
         .enumerate()
-        .map(|(k, d)| ode.dose_attr_map.lagtime(d.cmt_raw(), pk_for_dose(k)))
+        .map(|(k, d)| ode.dose_attr_map.lagtime_for_dose(d, pk_for_dose(k)))
         .collect();
     let dose_f_bio: Vec<f64> = subject
         .doses
@@ -4038,7 +4038,7 @@ pub(crate) fn dose_lagtimes_reading(
         .doses
         .iter()
         .enumerate()
-        .map(|(k, d)| ode.dose_attr_map.lagtime(d.cmt_raw(), dose_reads.at(k)))
+        .map(|(k, d)| ode.dose_attr_map.lagtime_for_dose(d, dose_reads.at(k)))
         .collect()
 }
 
@@ -9074,7 +9074,7 @@ fn event_driven_walk(
         .doses
         .iter()
         .zip(pk_at_dose.iter())
-        .map(|(d, p)| ode.dose_attr_map.lagtime(d.cmt_raw(), &p.values))
+        .map(|(d, p)| ode.dose_attr_map.lagtime_for_dose(d, &p.values))
         .collect();
     let dose_f_bio: Vec<f64> = subject
         .doses

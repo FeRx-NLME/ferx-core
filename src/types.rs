@@ -777,7 +777,7 @@ pub struct DoseAttrMap {
     /// its window from this slot ([`crate::dosing::lower_zero_order_ss`]), so the steady-state
     /// seed, the residual windows and the exact derivatives are the infusion's own. Kept apart
     /// from `indexed` so a model's `D{n}` bookkeeping (and [`Self::is_empty`]) is unchanged.
-    zero_order: HashMap<usize, usize>,
+    zero_order: HashMap<usize, (usize, Option<usize>)>,
 }
 
 impl DoseAttr {
@@ -942,7 +942,7 @@ impl DoseAttrMap {
             // A dose lowered from a pure zero-order compartment reads its duration from the
             // forcing's `dur` slot (#2786).
             if attr == DoseAttr::Duration {
-                self.zero_order.get(&cmt.max(1)).copied()
+                self.zero_order.get(&cmt.max(1)).map(|z| z.0)
             } else {
                 None
             }
@@ -950,15 +950,62 @@ impl DoseAttrMap {
     }
 
     /// Record that 1-based compartment `cmt` is fed by one `zero_order()` forcing and nothing
-    /// else, its `dur` read from PkParams `slot` (#2786).
-    pub(crate) fn set_zero_order(&mut self, cmt: usize, slot: usize) {
-        self.zero_order.insert(cmt, slot);
+    /// else, its `dur` read from PkParams `slot` (#2786). `route_lag_slot` is the forcing's own
+    /// `lag=` slot when it is the **only** lag the compartment's doses carry (no `ALAG{c}`, no
+    /// bare `lagtime`): a dose lowered to an infusion reads it as the dose's lag
+    /// ([`Self::lagtime_for_dose`]); the forcing keeps it for every other dose.
+    pub(crate) fn set_zero_order(
+        &mut self,
+        cmt: usize,
+        slot: usize,
+        route_lag_slot: Option<usize>,
+    ) {
+        self.zero_order.insert(cmt, (slot, route_lag_slot));
     }
 
     /// The `dur` slot of the sole zero-order forcing feeding 1-based `cmt`, if it has exactly
     /// that ([`Self::set_zero_order`]).
     pub(crate) fn zero_order_slot(&self, cmt: usize) -> Option<usize> {
-        self.zero_order.get(&cmt.max(1)).copied()
+        self.zero_order.get(&cmt.max(1)).map(|z| z.0)
+    }
+
+    /// The per-route lag slot a dose lowered from 1-based pure zero-order `cmt` carries as its
+    /// own lag ([`Self::set_zero_order`]), if there is one.
+    pub(crate) fn lowered_route_lag_slot(&self, cmt: usize) -> Option<usize> {
+        self.zero_order.get(&cmt.max(1)).and_then(|z| z.1)
+    }
+
+    /// Whether some pure zero-order compartment hands its route lag to its lowered doses.
+    pub(crate) fn has_lowered_route_lag(&self) -> bool {
+        self.zero_order.values().any(|z| z.1.is_some())
+    }
+
+    /// The route-lag slot of `d` when `d` is an `SS=1` dose into a pure zero-order compartment
+    /// whose lag lives on the route: the dose the engines walk lowered to an infusion
+    /// ([`crate::dosing::lower_zero_order_ss`]), read here lowered or not (a user-coded SS
+    /// infusion into such a compartment is refused by validation, so the two are one set).
+    fn lowered_dose_lag_slot(&self, d: &DoseEvent) -> Option<usize> {
+        if d.ss && d.ii > 0.0 {
+            self.lowered_route_lag_slot(d.cmt_1based())
+        } else {
+            None
+        }
+    }
+
+    /// [`Self::lag_slot`] for the dose `d`: a dose lowered from a route-lagged zero-order
+    /// compartment lags by the route's `lag=` slot (its lag now lives on the dose); every other
+    /// dose by its compartment's lag. The one reader every dose-lag consumer goes through.
+    pub(crate) fn lag_slot_for_dose(&self, d: &DoseEvent) -> usize {
+        self.lowered_dose_lag_slot(d)
+            .unwrap_or_else(|| self.lag_slot(d.cmt_raw()))
+    }
+
+    /// [`Self::lagtime`] for the dose `d` ([`Self::lag_slot_for_dose`]).
+    pub(crate) fn lagtime_for_dose(&self, d: &DoseEvent, params: &[f64]) -> f64 {
+        match self.lowered_dose_lag_slot(d) {
+            Some(slot) => params.get(slot).copied().unwrap_or(0.0),
+            None => self.lagtime(d.cmt_raw(), params),
+        }
     }
 
     /// Whether any compartment is a pure zero-order one.
@@ -6368,6 +6415,18 @@ impl CompiledModel {
     /// `a_conditional_lag_separates_records_like_a_plain_one`).
     pub fn has_lagtime(&self) -> bool {
         self.routes_lag_slot() || self.has_indexed_dose_attr(DoseAttr::Lag, None)
+    }
+
+    /// [`Self::has_lagtime`], or a per-route `lag=` that `SS=1` doses into a pure zero-order
+    /// compartment carry as their own lag once lowered to infusions (#2786). Only the sites
+    /// that read a *lowered* dose's lag ask this; everywhere else a route lag stays on the
+    /// route and the model stays on the lag-free paths.
+    pub(crate) fn has_dose_lag(&self) -> bool {
+        self.has_lagtime()
+            || self
+                .ode_spec
+                .as_ref()
+                .is_some_and(|o| o.dose_attr_map.has_lowered_route_lag())
     }
 
     /// Routes 1 and 3 of [`Self::has_lagtime`]: the bare lag slot is written,
