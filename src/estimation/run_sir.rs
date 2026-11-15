@@ -310,7 +310,7 @@ fn run_sir_scoped(
     inputs.note_warnings(&mut out.warnings);
     // Subjects whose compiled plan failed in this step and took finite differences (#2786);
     // the scope's failures leave with `_prints`, so this reads them first.
-    crate::api::postfit::refresh_plan_fd_fallback(model_ref, pop_ref, &mut out);
+    crate::api::postfit::refresh_plan_fd_fallback(model_ref, pop_ref, "the SIR step", &mut out);
     crate::api::rebuild_warnings_structured(&mut out);
     crate::api::apply_sir_result(&mut out, Some(&sir), None);
     Ok(out)

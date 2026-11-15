@@ -339,7 +339,7 @@ pub(crate) enum FailScope {
 pub(crate) fn settle_failure(k: &SubjectKey, why: &str, scope: FailScope) {
     match scope {
         FailScope::Repelled => {}
-        FailScope::Point => note_failure(k, why),
+        FailScope::Point => note_point_failure(k, why),
         FailScope::Subject => mark_bad(k, why),
         FailScope::Model => {
             mark_bad(k, why);
@@ -2183,6 +2183,24 @@ pub(crate) struct SubjectKey {
     /// The computation's own configuration ([`Self::with_variant`]): a likelihood kernel's
     /// objective, width and parts.
     variant: Option<Desc>,
+    /// The registered subject this key was made for ([`Who`]); not part of the plan's identity.
+    who: Who,
+}
+
+/// The address of the registered subject a [`SubjectKey`] was made for (`None`: not a registered
+/// subject). It names whose failure a point failure is; it is **not** part of the key, which
+/// stays the plan's identity — every subject of one design shares one plan — so it compares equal
+/// and hashes to nothing.
+#[derive(Clone, Copy, Debug)]
+struct Who(Option<usize>);
+impl PartialEq for Who {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+impl Eq for Who {}
+impl std::hash::Hash for Who {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
 impl SubjectKey {
@@ -2229,6 +2247,7 @@ impl SubjectKey {
     ) -> Self {
         let m = registered(model as *const _ as usize);
         let s = registered(subject as *const _ as usize);
+        let who = Who(s.as_ref().map(|_| subject as *const _ as usize));
         SubjectKey {
             // A registered subject keys under its own fit's scope; anything else under the
             // model's (a cut copy no fit registered).
@@ -2247,6 +2266,7 @@ impl SubjectKey {
             n_theta,
             kind: 0,
             variant: None,
+            who,
         }
     }
 }
@@ -2703,7 +2723,14 @@ const Q_COV: u8 = 4;
 /// A failed plan's identity, the way plans are keyed: the subject's design and, for a
 /// likelihood kernel (which bakes the observed values in), its observed values — so two subjects
 /// of one design with other data are not one failure.
-type FailedPlan = (Desc, Option<Desc>);
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FailedPlan {
+    /// A plan condemned for its design (and observed values): every subject sharing it fell back.
+    Design(Desc, Option<Desc>),
+    /// One registered subject's failure at a point: only it fell back, whatever its design twins
+    /// did.
+    Subject(usize),
+}
 
 /// Per `(scope, model)`: the plans that failed, each with the quantities (`Q_*`) it fed, and
 /// the first reason. In theory no plan fails; one that does sends its subject to finite
@@ -2714,8 +2741,28 @@ fn failures() -> &'static Mutex<Failures> {
     F.get_or_init(Default::default)
 }
 
-/// Note that `k`'s subject fell back to finite differences because its plan failed (`why`).
+/// Note that `k`'s subject fell back to finite differences because its plan failed (`why`): the
+/// plan is condemned for its design, so every subject sharing it fell back.
 pub(crate) fn note_failure(k: &SubjectKey, why: &str) {
+    note_plan_failure(
+        k,
+        why,
+        FailedPlan::Design(k.subject.clone(), k.observed.clone()),
+    );
+}
+
+/// Note that the registered subject `k` was made for fell back for this call alone (a point
+/// failure): its design twins did not. An unregistered subject has no identity and is keyed by
+/// design, as [`note_failure`].
+pub(crate) fn note_point_failure(k: &SubjectKey, why: &str) {
+    let who = k.who.0.map_or_else(
+        || FailedPlan::Design(k.subject.clone(), k.observed.clone()),
+        FailedPlan::Subject,
+    );
+    note_plan_failure(k, why, who);
+}
+
+fn note_plan_failure(k: &SubjectKey, why: &str, who: FailedPlan) {
     // The covariance step's reduced basis (kind 9) feeds no fit gradient; every other plan
     // is read by the inner and the outer gradient alike.
     let q = if k.kind == 9 {
@@ -2729,7 +2776,7 @@ pub(crate) fn note_failure(k: &SubjectKey, why: &str) {
         .entry((k.scope, k.model))
         .or_insert_with(|| (Default::default(), why.to_string()))
         .0
-        .entry((k.subject.clone(), k.observed.clone()))
+        .entry(who)
         .or_default() |= q;
 }
 
@@ -2741,7 +2788,7 @@ fn failure_key(model: &crate::types::CompiledModel) -> (u64, u64) {
 
 /// The failed "subject" a model-level recording notes: one every subject's derivative reads.
 fn model_wide() -> FailedPlan {
-    (Desc::of_value(&"model-wide θ-only recording"), None)
+    FailedPlan::Design(Desc::of_value(&"model-wide θ-only recording"), None)
 }
 
 /// Note that a derivative of the model's alone (a θ-only recording, [`derivs`]) fell back to
@@ -2811,7 +2858,11 @@ pub(crate) fn plan_failure_counts(
             .map_or_else(|| observed_desc(s), |e| e.0[1].clone());
         // A plan fails under its design alone or under its design and observed values, so two
         // `get`s find every failure of this subject.
-        let own = [(design.clone(), None), (design, Some(observed))];
+        let own = [
+            FailedPlan::Design(design.clone(), None),
+            FailedPlan::Design(design, Some(observed)),
+            FailedPlan::Subject(s as *const _ as usize),
+        ];
         let mut mask = 0u8;
         for &id in &ids {
             if let Some((failed, why)) = f.get(&(model_scope, id)) {

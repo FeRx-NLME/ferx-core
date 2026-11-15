@@ -42,6 +42,17 @@ pub enum GradientMethodKind {
     NotApplicable,
 }
 
+/// The label an earlier engine wrote for the analytic route (`.fitrx` bundles and fit YAMLs
+/// saved by it still carry it).
+pub(crate) const LEGACY_ANALYTIC_LABEL: &str = "analytic (Dual2)";
+
+/// Whether a stored route label names the analytic route: today's [`GradientMethodKind::Analytic`]
+/// or the legacy [`LEGACY_ANALYTIC_LABEL`]. The one place labels are compared against it, so a
+/// result an earlier engine wrote reads the same as one this engine writes.
+pub(crate) fn is_analytic_label(label: &str) -> bool {
+    label == GradientMethodKind::Analytic.as_str() || label == LEGACY_ANALYTIC_LABEL
+}
+
 impl GradientMethodKind {
     pub fn as_str(&self) -> &'static str {
         match self {

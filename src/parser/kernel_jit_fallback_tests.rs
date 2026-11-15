@@ -501,9 +501,11 @@ fn no_example_model_falls_back_with_plans_working() {
 
 /// The standalone post-fit steps report a failed plan too (#2786 review #11): `run_covariance`
 /// and `run_sir` register their own scope and fall back per subject exactly as `fit()` does, but
-/// used to drop the failures with the scope without saying so. Dies when either entry point stops
-/// calling `refresh_plan_fd_fallback`; the exact run, on a fit that already carries a stale
-/// report, shows the incoming fit's line is replaced rather than inherited or duplicated.
+/// used to drop the failures with the scope without saying so. The step's line names the step
+/// (`W_PLAN_FD_FALLBACK (the covariance step):`) and is *added*: the incoming fit's own report
+/// of its estimation is kept, never rewritten from the step's counts.
+/// Mutation: drop the `refresh_plan_fd_fallback` call of either step -> its forced run has no step
+/// line; strip the incoming `W_PLAN_FD_FALLBACK` again -> the "(from the fit)" line is gone.
 #[test]
 fn standalone_covariance_and_sir_report_the_fallback() {
     let (m, p) = example("examples/warfarin.ferx", "data/warfarin.csv");
@@ -519,49 +521,57 @@ fn standalone_covariance_and_sir_report_the_fallback() {
         "the fit carries a covariance"
     );
     let n = p.subjects.len();
-    // A stale report from the fit's own run must not survive into a step that ran clean.
-    fit.warnings
-        .push(format!("{TOKEN}: 99 of {n} subjects fell back (stale)"));
-    let count = |r: &FitResult| r.warnings.iter().filter(|w| w.contains(TOKEN)).count();
-    let typed = |r: &FitResult| {
-        r.warnings_structured
-            .iter()
-            .filter(|e| e.message.contains(TOKEN))
-            .count()
-    };
+    // The estimation's own report, which a step did not rerun.
+    let own = format!("{TOKEN}: 99 of {n} subjects fell back (from the fit)");
+    fit.warnings.push(own.clone());
     type Step = fn(&FitResult, &CompiledModel, &Population, &FitOptions) -> FitResult;
-    let steps: [(&str, Step); 2] = [
-        ("run_covariance", |f, m, p, o| {
+    let steps: [(&str, &str, Step); 2] = [
+        ("run_covariance", "the covariance step", |f, m, p, o| {
             crate::run_covariance(f, Some(m), Some(p), o).expect("run_covariance")
         }),
-        ("run_sir", |f, m, p, o| {
+        ("run_sir", "the SIR step", |f, m, p, o| {
             crate::run_sir(f, Some(m), Some(p), o).expect("run_sir")
         }),
     ];
-    for (label, step) in steps {
+    for (label, name, step) in steps {
+        let tag = format!("{TOKEN} ({name}):");
+        let of_step = |r: &FitResult| r.warnings.iter().filter(|w| w.starts_with(&tag)).count();
         let exact = step(&fit, &m, &p, &base);
         assert_eq!(
-            count(&exact),
+            of_step(&exact),
             0,
             "{label}: plans held: {:?}",
             exact.warnings
         );
-        assert_eq!(typed(&exact), 0, "{label}: no typed entry either");
+        assert!(
+            exact.warnings.contains(&own),
+            "{label}: the fit's report is kept"
+        );
         let forced = plans_failing(|| step(&fit, &m, &p, &base));
-        assert_eq!(count(&forced), 1, "{label}: {:?}", forced.warnings);
-        assert_eq!(typed(&forced), 1, "{label}: one typed entry");
-        let w = forced.warnings.iter().find(|w| w.contains(TOKEN)).unwrap();
+        assert_eq!(of_step(&forced), 1, "{label}: {:?}", forced.warnings);
+        assert!(
+            forced.warnings.contains(&own),
+            "{label}: the fit's report is kept"
+        );
+        let w = forced
+            .warnings
+            .iter()
+            .find(|w| w.starts_with(&tag))
+            .unwrap();
         assert!(
             w.contains(super::FORCED_FAILURE),
             "{label}: the reason: {w}"
         );
-        assert!(!w.contains("(stale)"), "{label}: replaced, not inherited");
+        assert!(w.contains(name), "{label}: names the step: {w}");
         let e = forced
             .warnings_structured
             .iter()
-            .find(|e| e.message.contains(TOKEN))
-            .unwrap();
+            .find(|e| e.message.starts_with(&tag))
+            .expect("typed entry");
         assert_eq!(e.category, WarningCode::GradientFallback, "{label}");
+        // A step run over its own result replaces its line rather than doubling it.
+        let again = plans_failing(|| step(&forced, &m, &p, &base));
+        assert_eq!(of_step(&again), 1, "{label}: not doubled");
     }
 }
 
@@ -1183,6 +1193,36 @@ fn a_kernel_failure_counts_the_subject_whose_data_it_is() {
     assert_eq!(c.any, 2);
 }
 
+/// A point failure is the subject's that failed, not every subject of its design (#2786 review
+/// round 4): two registered subjects with identical dosing, times and covariates share one plan,
+/// but only the one whose recording failed at its point fell back. A plan condemned for its
+/// design (`note_failure`, the structural and model scopes) is every sharer's.
+/// Mutation: key a point failure by design ([`note_failure`]) -> both subjects count.
+#[test]
+fn a_point_failure_counts_the_subject_that_failed_not_its_design_twins() {
+    let data = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,WT
+1,0,1,1,0,1000,0,1,70
+1,12,0,0,5.0,0,0,1,90
+2,0,1,1,0,1000,0,1,70
+2,12,0,0,5.0,0,0,1,90
+";
+    let (m, p) = from_text(TWO_CPT_TV, data);
+    let _g = register(&m, &p.subjects);
+    let key = |s: &crate::types::Subject| SubjectKey::new(&m, s, 2, 6);
+    assert_eq!(
+        key(&p.subjects[0]),
+        key(&p.subjects[1]),
+        "fixture: one design, one shared plan"
+    );
+    super::note_point_failure(&key(&p.subjects[1]), "point");
+    let c = plan_failure_counts(&m, &p.subjects).expect("counted");
+    assert_eq!((c.any, c.inner, c.outer), (1, 1, 1));
+    // A condemned design is both subjects'.
+    note_failure(&key(&p.subjects[0]), "design");
+    let c = plan_failure_counts(&m, &p.subjects).expect("counted");
+    assert_eq!(c.any, 2);
+}
+
 /// A fit whose outer route is already finite differences (Gauss-Newton: its outer step reads no
 /// analytic gradient) keeps that label when plans fail: no plan fed it, so none failed it, and
 /// "(compiled plan failed)" there would blame the plans for a route they never took (#2786
@@ -1204,26 +1244,50 @@ fn a_finite_difference_outer_route_keeps_its_label_when_plans_fail() {
     assert_eq!(lab("finite differences", 4, 4), "finite differences");
 }
 
-/// A standalone post-fit step makes the labels from the same counts as the warning (#2786 round
-/// 2, finding 6): over a fit that carries FD labels and the warning, a clean `run_covariance`
-/// reports neither — not a warning-less result whose labels still say `FD`. Mutation: make
-/// `refresh_plan_fd_fallback` strip the warning only -> the labels stay rewritten.
+/// A standalone post-fit step does not rewrite the incoming fit's record of its estimation
+/// (#2786 review round 4): over a fit that carries FD labels and the warning, a clean
+/// `run_covariance` keeps both — the estimation's gradients were computed that way whatever the
+/// step did — and a step whose own plans fail adds its own named line beside them.
+/// Mutation: let `refresh_plan_fd_fallback` call `apply_plan_failures` with the step's counts ->
+/// the labels are restored to `exact`'s and the warning is stripped.
 #[test]
-fn a_clean_standalone_step_restores_the_route_labels_with_the_warning() {
+fn a_standalone_step_keeps_the_fits_route_labels_and_warning() {
     let (m, p) = example("examples/warfarin.ferx", "data/warfarin.csv");
     let o = opts(EstimationMethod::FoceI);
     let (exact, forced) = pair(&m, &p, &o);
-    assert!(forced.warnings.iter().any(|w| w.contains(TOKEN)));
+    assert!(forced.warnings.iter().any(|w| w.starts_with(TOKEN)));
     assert_ne!(forced.gradient_method_inner, exact.gradient_method_inner);
     let out = crate::run_covariance(&forced, Some(&m), Some(&p), &o).expect("run_covariance");
+    assert_eq!(out.gradient_method_inner, forced.gradient_method_inner);
+    assert_eq!(out.gradient_method_outer, forced.gradient_method_outer);
+    let kept = |r: &FitResult| {
+        r.warnings
+            .iter()
+            .filter(|w| w.starts_with(&format!("{TOKEN}:")))
+            .count()
+    };
+    assert_eq!(kept(&out), kept(&forced), "the fit's warning is kept");
     assert!(
-        !out.warnings.iter().any(|w| w.contains(TOKEN)),
-        "{:?}",
+        !out.warnings
+            .iter()
+            .any(|w| w.contains("(the covariance step)")),
+        "a clean step adds none: {:?}",
         out.warnings
     );
-    assert_eq!(out.gradient_method_inner, exact.gradient_method_inner);
-    assert_eq!(out.gradient_method_outer, exact.gradient_method_outer);
-    // And a split label is undone the same way: `analytic ×a, FD ×k` restarts from `analytic`.
+    // Its own failure is a separate line naming the step; the labels are still the fit's.
+    let failed = plans_failing(|| {
+        crate::run_covariance(&exact, Some(&m), Some(&p), &o).expect("run_covariance")
+    });
+    let lines = failed
+        .warnings
+        .iter()
+        .filter(|w| w.contains("(the covariance step)"))
+        .count();
+    assert_eq!(lines, 1, "{:?}", failed.warnings);
+    assert_eq!(failed.gradient_method_inner, exact.gradient_method_inner);
+    assert_eq!(failed.gradient_method_outer, exact.gradient_method_outer);
+    // And a split label is undone by the fit's own `apply_plan_failures`: `analytic ×a, FD ×k`
+    // restarts from `analytic`.
     let mut split = exact.clone();
     split.gradient_method_inner = "analytic ×3, FD ×1".into();
     crate::api::postfit::apply_plan_failures(&mut split, None, 4);

@@ -2543,6 +2543,21 @@ fn unrecorded_fd_route_note_clauses() {
         "carried over and still applies: once"
     );
     assert!(!note(fd, analytic, &auto, false), "(FD, analytic)");
+    // A `.fitrx` an earlier engine wrote labels its analytic route `analytic (Dual2)`: the
+    // same route, so a result loaded from it does not warn (and `is_analytic_label` is the one
+    // comparison, so the plan-failure labels read it the same way).
+    // Mutation: compare the outer label with `K::Analytic.as_str()` alone -> this row warns.
+    assert!(
+        !note(fd, "analytic (Dual2)", &auto, false),
+        "(FD, legacy analytic)"
+    );
+    assert!(crate::build_info::is_analytic_label("analytic (Dual2)"));
+    assert!(!crate::build_info::is_analytic_label("finite differences"));
+    assert_eq!(
+        crate::api::postfit::plan_fallback_label("analytic (Dual2)", 4, 4),
+        "finite differences (compiled plan failed)",
+        "a legacy analytic label is rewritten like today's"
+    );
     assert!(!note(analytic, na, &auto, false), "(analytic, N/A)");
     assert!(
         !note(analytic, analytic, &auto, true),

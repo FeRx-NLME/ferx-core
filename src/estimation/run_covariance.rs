@@ -397,7 +397,12 @@ fn run_covariance_scoped(
     inputs.note_warnings(&mut out.warnings);
     // Subjects whose compiled plan failed in this step and took finite differences (#2786);
     // the scope's failures leave with `_prints`, so this reads them first.
-    crate::api::postfit::refresh_plan_fd_fallback(model_ref, pop_ref, &mut out);
+    crate::api::postfit::refresh_plan_fd_fallback(
+        model_ref,
+        pop_ref,
+        "the covariance step",
+        &mut out,
+    );
     // Rebuild so the machine-readable payloads agree with the fields above: the
     // entries are keyed by message, so the surviving native ones are preserved and
     // the new covariance warnings get `details` sourced from the *refreshed*

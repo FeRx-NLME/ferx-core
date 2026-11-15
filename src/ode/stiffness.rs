@@ -79,7 +79,7 @@
 //!
 //! # Consistency across `T`
 //!
-//! The probe reads [`PkNum::val`] only, exactly like every other comparison a driver makes.
+//! The probe reads values only through the branch API, exactly like every other comparison a driver makes.
 //! The `T = f64` prediction and the `T = Dual2` sensitivity solve therefore resolve `auto` to
 //! the *same* method for the same segment, so the analytic gradient differentiates the
 //! trajectory the predictor reports rather than one produced by a different stepper.

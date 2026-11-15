@@ -113,7 +113,7 @@ pub(crate) fn note_unrecorded_fd_route(
     use crate::build_info::GradientMethodKind;
     warnings.retain(|w| w != UNRECORDED_FD_ROUTE_WARNING);
     if fit.gradient_method_inner == GradientMethodKind::FiniteDifferences.as_str()
-        && fit.gradient_method_outer != GradientMethodKind::Analytic.as_str()
+        && !crate::build_info::is_analytic_label(&fit.gradient_method_outer)
         && crate::estimation::inner_optimizer::inner_reports_analytic_model(model)
     {
         warnings.push(UNRECORDED_FD_ROUTE_WARNING.to_string());

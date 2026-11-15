@@ -394,7 +394,7 @@ pub trait PkNum:
     /// as depending on an input. A recording must never read such a value, and this is the one
     /// place the trait says so: there is no `val()` on `PkNum`. Code that cannot decide
     /// without it decides through the branch API instead (`br_cmp`, `br_cmp_c`, `br_abs_lt`,
-    /// `br_is_nan`, `select_if`), or reads it with [`NonRecRead::plain`] inside an
+    /// `br_is_nan`, `select_if`), or reads it with `NonRecRead::plain` inside an
     /// `!T::RECORDS_BRANCHES` arm.
     fn nonrec_val(self) -> Option<f64>;
     /// `exp`.
@@ -457,7 +457,7 @@ pub trait PkNum:
         crate::stats::special::gamma_pq_g(self, x, upper)
     }
     /// Whether every **derivative** component is finite — the gradient, and the Hessian
-    /// block when the type carries one. Says nothing about [`val`](Self::val), which a
+    /// block when the type carries one. Says nothing about `val`, which a
     /// caller checks separately.
     ///
     /// Exists because value-finiteness and jet-finiteness genuinely come apart (#1204). A
@@ -498,7 +498,7 @@ pub trait PkNum:
     fn br_is_nan(self) -> bool;
     /// The largest absolute **derivative** component — gradient, and the Hessian block when
     /// the type carries one; `0.0` for `f64`. Like [`jets_finite`](Self::jets_finite) it
-    /// ignores [`val`](Self::val).
+    /// ignores `val`.
     ///
     /// For a check that has to hold in every component, not just the value: the exact linear
     /// propagator (#852) reads `A` off differences of the RHS, and a cancellation can wipe a

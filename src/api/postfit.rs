@@ -1840,29 +1840,45 @@ pub(crate) fn plan_fd_fallback_warning(
     )
 }
 
-/// [`plan_fd_fallback_warning`] for a standalone post-fit step (`run_covariance`, `run_sir`)
-/// over a clone of an earlier fit's result: the incoming fit's own report describes *its* run,
-/// so it is replaced by what this call's registered scope saw. Called while the call's
-/// [`register`](crate::parser::model_parser::rhs_regcode::kernel_jit::register) guard is alive,
-/// since the failures leave with the scope.
+/// A standalone post-fit step's (`run_covariance`, `run_sir`) own plan failures, over a clone of
+/// an earlier fit's result. The incoming fit's route labels and its `W_PLAN_FD_FALLBACK` describe
+/// how *its estimation* computed gradients, which this step did not rerun: they are kept as they
+/// are. A step whose own plans failed adds one more warning naming the step (`step`: "the
+/// covariance step"), replacing the one an earlier call of the same step left. Called while the
+/// call's [`register`](crate::parser::model_parser::rhs_regcode::kernel_jit::register) guard is
+/// alive, since the failures leave with the scope.
 pub(crate) fn refresh_plan_fd_fallback(
     model: &CompiledModel,
     population: &Population,
+    step: &str,
     out: &mut FitResult,
 ) {
-    const CODE: &str = "W_PLAN_FD_FALLBACK";
-    out.warnings.retain(|w| !w.contains(CODE));
+    let tag = format!("W_PLAN_FD_FALLBACK ({step}):");
+    out.warnings.retain(|w| !w.starts_with(&tag));
     out.warnings_structured
-        .retain(|e| !e.message.contains(CODE));
-    apply_plan_failures(
-        out,
-        crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
-            model,
-            &population.subjects,
-        )
-        .as_ref(),
-        population.subjects.len(),
+        .retain(|e| !e.message.starts_with(&tag));
+    let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
+        model,
+        &population.subjects,
+    ) else {
+        return;
+    };
+    let (n, why) = (population.subjects.len(), &c.why);
+    let msg = format!(
+        "{tag} {} of {n} subjects fell back to finite-difference derivatives in {step} because \
+         their compiled plan failed ({why}); the estimation's gradient routes above are \
+         unchanged; results are correct but slower — please report this as a bug.",
+        c.any
     );
+    let details = serde_json::json!({
+        "step": step, "n_subjects": c.any, "n_total": n, "reason": why
+    });
+    out.warnings.push(msg.clone());
+    out.warnings_structured.push(warning_entry(
+        WarningCode::GradientFallback,
+        msg,
+        Some(details),
+    ));
 }
 
 /// Report `counts` (`None`: no plan failed) on `out`: the warning, and each route's label from
@@ -1890,9 +1906,10 @@ pub(crate) fn apply_plan_failures(
 /// The route label [`plan_fallback_label`] rewrote `label` from: `analytic` for either of its
 /// forms (it rewrites only an analytic route), `label` itself otherwise.
 fn plan_fallback_base(label: &str) -> String {
-    let analytic = crate::build_info::GradientMethodKind::Analytic.as_str();
     if label == PLAN_FAILED_ALL_FD || label.starts_with("analytic ×") {
-        analytic.to_string()
+        crate::build_info::GradientMethodKind::Analytic
+            .as_str()
+            .to_string()
     } else {
         label.to_string()
     }
@@ -1906,7 +1923,7 @@ const PLAN_FAILED_ALL_FD: &str = "finite differences (compiled plan failed)";
 /// it); every subject on FD reads `finite differences (compiled plan failed)`; a split reads
 /// like the banner's, `analytic ×a, FD ×k`.
 pub(crate) fn plan_fallback_label(label: &str, k: usize, n: usize) -> String {
-    if k == 0 || label != crate::build_info::GradientMethodKind::Analytic.as_str() {
+    if k == 0 || !crate::build_info::is_analytic_label(label) {
         label.to_string()
     } else if k >= n {
         PLAN_FAILED_ALL_FD.to_string()
