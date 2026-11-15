@@ -2784,10 +2784,18 @@ pub(crate) type ChunkFn = unsafe extern "C" fn(*mut f64, *const u32, *const f64)
 /// recomputes run once for all.
 pub(crate) type ChunkRevFn =
     unsafe extern "C" fn(*mut f64, *mut f64, *const u32, *const f64, usize, usize);
+/// One segment of a kernel too large to be one function ([`SegPlan`]):
+/// `fn(base, adj, idx, lits, scratch)`, one seed's worth of a reverse kernel (`adj` null in a
+/// forward one). Values that cross a segment boundary go through `scratch`.
+type SegFn = unsafe extern "C" fn(*mut f64, *mut f64, *const u32, *const f64, *mut f64);
 
 pub(crate) struct ChunkKernel {
-    /// The entry point: a [`ChunkFn`] or a [`ChunkRevFn`].
+    /// The entry point: a [`ChunkFn`] or a [`ChunkRevFn`] — or, of a segmented kernel, the
+    /// address of `segs`.
     f: *const u8,
+    /// The [`SegFn`]s of a segmented kernel ([`SegPlan`]), in order.
+    #[allow(dead_code)]
+    segs: Option<Box<[*const u8]>>,
     module: Option<cranelift_jit::JITModule>,
 }
 
@@ -2831,6 +2839,9 @@ pub(crate) struct Tiered {
     modules: Mutex<Vec<ChunkKernel>>,
     /// Itself, for the compile queue ([`compile_queue`]).
     me: std::sync::Weak<Tiered>,
+    /// How a kernel too large for one native frame is cut into segments ([`SegPlan`]), made at
+    /// its first compile: most large kernels never get one.
+    spill: OnceLock<Option<SegPlan>>,
     /// The highest tier the calls so far have earned, and whether a compile is queued.
     want: std::sync::atomic::AtomicU8,
     queued: std::sync::atomic::AtomicBool,
@@ -2890,6 +2901,7 @@ impl Tiered {
     fn new(f: Func, layout: Layout, n_in: usize, rev: bool, prefix: usize) -> Arc<Self> {
         Arc::new_cyclic(|me| Tiered {
             me: me.clone(),
+            spill: OnceLock::new(),
             want: std::sync::atomic::AtomicU8::new(0),
             queued: std::sync::atomic::AtomicBool::new(false),
             prefix,
@@ -2915,6 +2927,8 @@ impl Tiered {
         let p = self.native.load(std::sync::atomic::Ordering::Acquire);
         if p == 0 {
             self.interpret(base, adj, idx, lits, 1, 0);
+        } else if p & SEGMENTED != 0 {
+            self.run_segments(p, base, adj, idx, lits, 1, 0);
         } else if self.rev {
             let f: ChunkRevFn = std::mem::transmute(p);
             f(base, adj, idx, lits, 1, 0);
@@ -2988,6 +3002,61 @@ impl Tiered {
         }
     }
 
+    /// Run a segmented kernel ([`SegPlan`]): `segs` is the native entry point, the address of
+    /// its [`SegFn`]s. The forward segments run once, the rest once per seed (the seed's adjoint
+    /// block `stride` doubles on). The scratch buffer is a thread's, taken out for the call so
+    /// that a kernel entered from inside this one (a host callback) gets one of its own.
+    ///
+    /// # Safety
+    /// As [`Self::call_seeds`]; `native` is a segmented kernel's [`ChunkKernel::f`], tagged.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run_segments(
+        &self,
+        native: usize,
+        base: *mut f64,
+        adj: *mut f64,
+        idx: *const u32,
+        lits: *const f64,
+        seeds: usize,
+        stride: usize,
+    ) {
+        thread_local! {
+            static SCRATCH: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+        }
+        let plan = self
+            .spill
+            .get()
+            .and_then(Option::as_ref)
+            .expect("a segmented kernel has its plan");
+        let segs = native & !SEGMENTED;
+        let mut buf = SCRATCH.with(|c| std::mem::take(&mut *c.borrow_mut()));
+        if buf.len() < plan.slots {
+            buf.resize(plan.slots, 0.0);
+        }
+        let sc = buf.as_mut_ptr();
+        let fns = std::slice::from_raw_parts(segs as *const *const u8, plan.segs.len());
+        let run = |k: usize, adj: *mut f64| {
+            let f: SegFn = std::mem::transmute(fns[k]);
+            f(base, adj, idx, lits, sc);
+        };
+        for k in 0..plan.nfwd {
+            run(k, adj);
+        }
+        if self.rev {
+            for sd in 0..seeds {
+                for k in plan.nfwd..fns.len() {
+                    run(k, adj.add(sd * stride));
+                }
+            }
+        }
+        SCRATCH.with(|c| {
+            let mut held = c.borrow_mut();
+            if held.len() < buf.len() {
+                *held = buf;
+            }
+        });
+    }
+
     /// A reverse kernel over `seeds` adjoint buffers, `stride` apart: native code runs once
     /// per seed, the interpreter runs the shared forward prefix once.
     ///
@@ -3007,6 +3076,9 @@ impl Tiered {
         if p == 0 {
             self.interpret(base, adj, idx, lits, seeds, stride);
         } else {
+            if p & SEGMENTED != 0 {
+                return self.run_segments(p, base, adj, idx, lits, seeds, stride);
+            }
             let f: ChunkRevFn = std::mem::transmute(p);
             f(base, adj, idx, lits, seeds, stride);
         }
@@ -3015,6 +3087,10 @@ impl Tiered {
     /// Compile the next tier and switch to it; a failed compile keeps the current one.
     fn promote(&self, quick: bool, opt: &str) {
         let t = std::time::Instant::now();
+        let plan = self
+            .spill
+            .get_or_init(|| SegPlan::new(&self.f, self.rev, self.prefix))
+            .as_ref();
         let Some(k) = lower_chunk_opt(
             &self.f,
             self.layout,
@@ -3023,10 +3099,12 @@ impl Tiered {
             self.prefix,
             quick,
             opt,
+            plan,
         ) else {
             return;
         };
-        let p = k.f as usize;
+        // A segmented kernel's entry point is tagged (a function's address is aligned).
+        let p = k.f as usize | if k.segs.is_some() { SEGMENTED } else { 0 };
         self.modules.lock().unwrap().push(k);
         self.native.store(p, std::sync::atomic::Ordering::Release);
         STATS.compiled.fetch_add(1, Relaxed);
@@ -4928,6 +5006,122 @@ fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
     fold_with(src, known)
 }
 
+/// Kernels above this many instructions are lowered as a chain of segments ([`SegPlan`]). Below
+/// it one function's frame is bounded by the kernel itself — the single-pass allocator gives each
+/// value it ever spills a 16-byte slot of its own, a few tens of KiB at 4k instructions — and
+/// is left alone, which is also every kernel the backtracking tier ([`TIER3_MAX_INSTS`])
+/// compiles. Above it the frame grows with the instruction count: a 150k-instruction kernel (an
+/// SDE steady-state walk's second-order chunk) took a frame over 1 MiB, more than a default
+/// 2 MiB thread stack has left under a deep caller.
+const SEG_MIN_INSTS: usize = 4096;
+/// The low bit of [`Tiered::native`] of a segmented kernel.
+const SEGMENTED: usize = 1;
+/// A segment's instructions: its frame is bounded by this, not by the kernel.
+const SEG_INSTS: usize = 1024;
+
+/// A large kernel cut into segments of [`SEG_INSTS`] instructions, one native function each, run
+/// in order ([`Tiered::run_segments`]). A value used in a later segment than its definition
+/// goes through a heap scratch buffer — stored where it is defined, read back (once per
+/// segment) where it is used — so no function holds more than a segment's values and the
+/// frames stay small whatever the kernel's size. Every segment runs the instructions the one
+/// function would, in its order, so the tiers still agree bit for bit.
+struct SegPlan {
+    /// Each segment's instruction range. A reverse kernel's forward (`prefix`) and its seed-loop
+    /// body are cut apart: the first `nfwd` segments run once, the rest once per seed.
+    segs: Vec<(usize, usize)>,
+    nfwd: usize,
+    /// Per instruction: its scratch slot, or [`Self::NONE`] (every use is in its own segment, or
+    /// it is a constant, re-emitted where a later segment needs it).
+    slot: Vec<u32>,
+    /// Per instruction: it is a condition (stored and read as `i8`), not a double.
+    cond: Vec<bool>,
+    /// The scratch buffer's length in doubles.
+    slots: usize,
+}
+
+impl SegPlan {
+    const NONE: u32 = u32::MAX;
+
+    /// `None` for a kernel small enough to be one function.
+    fn new(f: &Func, rev: bool, prefix: usize) -> Option<Self> {
+        let n = f.insts.len();
+        if n <= SEG_MIN_INSTS {
+            return None;
+        }
+        // A reverse kernel's forward and its body are cut apart; a forward-only kernel has no
+        // second range.
+        let split = if rev { prefix.min(n) } else { n };
+        let mut segs = Vec::new();
+        for (lo, hi) in [(0, split), (split, n)] {
+            segs.extend(
+                (lo..hi)
+                    .step_by(SEG_INSTS)
+                    .map(|a| (a, (a + SEG_INSTS).min(hi))),
+            );
+        }
+        let nfwd = segs.iter().take_while(|&&(_, hi)| hi <= split).count();
+        let mut seg_of = vec![0usize; n];
+        for (k, &(lo, hi)) in segs.iter().enumerate() {
+            seg_of[lo..hi].fill(k);
+        }
+        let mut cond = vec![false; n];
+        let mut last = vec![0usize; n];
+        let mut crosses = vec![false; n];
+        for (at, i) in f.insts.iter().enumerate() {
+            cond[at] = match *i {
+                Inst::Cmp(..) | Inst::And(..) | Inst::Or(..) => true,
+                Inst::Select(_, a, _) | Inst::StopGrad(a) => cond[a as usize],
+                _ => false,
+            };
+            let (ops, k) = simd::operands(i);
+            for &o in &ops[..k] {
+                let o = o as usize;
+                last[o] = last[o].max(at);
+                crosses[o] |= seg_of[at] != seg_of[o];
+            }
+        }
+        let mut slot = vec![Self::NONE; n];
+        // The slots in use, by the last instruction that reads each (a min-heap), and the free
+        // ones.
+        let mut busy: std::collections::BinaryHeap<std::cmp::Reverse<(usize, u32)>> =
+            Default::default();
+        let mut free: Vec<u32> = Vec::new();
+        let mut slots = 0u32;
+        for at in 0..n {
+            while let Some(&std::cmp::Reverse((until, s))) = busy.peek() {
+                if until >= at {
+                    break;
+                }
+                busy.pop();
+                free.push(s);
+            }
+            if !crosses[at] || matches!(f.insts[at], Inst::Const(_)) {
+                continue;
+            }
+            let s = free.pop().unwrap_or_else(|| {
+                slots += 1;
+                slots - 1
+            });
+            slot[at] = s;
+            // A forward value the seed loop's body reads is read again on every seed: its slot
+            // is never handed to a value the body defines.
+            let until = if rev && at < prefix && last[at] >= prefix {
+                usize::MAX
+            } else {
+                last[at]
+            };
+            busy.push(std::cmp::Reverse((until, s)));
+        }
+        Some(SegPlan {
+            segs,
+            nfwd,
+            slot,
+            cond,
+            slots: slots as usize,
+        })
+    }
+}
+
 /// With `rev`, the first `prefix` instructions are the recomputed forward ([`ir::reverse`]):
 /// they run once, the rest in a loop over the seeds.
 #[allow(clippy::too_many_arguments)]
@@ -4939,6 +5133,7 @@ fn lower_chunk_opt(
     prefix: usize,
     quick: bool,
     opt: &str,
+    spill: Option<&SegPlan>,
 ) -> Option<ChunkKernel> {
     use super::ir::{Cc, Shim1};
     use cranelift_codegen::ir::condcodes::FloatCC;
@@ -4980,371 +5175,466 @@ fn lower_chunk_opt(
     let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
     let target = module.target_config();
     let ptr = target.pointer_type();
-    let mut sig = module.make_signature();
-    for _ in 0..if rev { 6 } else { 3 } {
-        sig.params.push(AbiParam::new(ptr));
-    }
-    let id = module
-        .declare_function("chunk", Linkage::Local, &sig)
-        .ok()?;
+    // A segmented kernel ([`SegPlan`]): one function per segment, `SegFn`'s signature.
+    let seg = spill.is_some();
+    let ranges: Vec<(usize, usize)> = match spill {
+        Some(plan) => plan.segs.clone(),
+        None => vec![(0, f.insts.len())],
+    };
+    let mut ids = Vec::with_capacity(ranges.len());
+    // Each instruction's value in the function being built: one vector for every segment, its
+    // touched entries cleared after each (a vector per segment would cost the kernel's size
+    // each).
+    let mut v: Vec<Option<Value>> = vec![None; f.insts.len()];
+    let mut reloaded: Vec<usize> = Vec::new();
     let mut ctx = module.make_context();
-    ctx.func.signature = sig;
     let mut fctx = FunctionBuilderContext::new();
-    {
-        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
-        let block = b.create_block();
-        b.append_block_params_for_function_params(block);
-        b.switch_to_block(block);
-        let args = b.block_params(block).to_vec();
-        let (base, mut adjp, idxp, litp) = if rev {
-            (args[0], Some(args[1]), args[2], args[3])
+    for (si, &(lo, hi)) in ranges.iter().enumerate() {
+        let mut sig = module.make_signature();
+        for _ in 0..if seg {
+            5
+        } else if rev {
+            6
         } else {
-            (args[0], None, args[1], args[2])
-        };
-        // The seed loop: `head(adj, n)` tests `n`, `body` runs the adjoint part on `adj`.
-        let seed_loop = rev.then(|| {
-            let head = b.create_block();
-            b.append_block_param(head, ptr);
-            b.append_block_param(head, ptr);
-            let body = b.create_block();
-            let exit = b.create_block();
-            (head, body, exit)
-        });
-        let mut usig = Signature::new(target.default_call_conv);
-        usig.params.push(AbiParam::new(types::F64));
-        usig.returns.push(AbiParam::new(types::F64));
-        let mut bsig = usig.clone();
-        bsig.params.push(AbiParam::new(types::F64));
-        let uref = b.import_signature(usig);
-        let bref = b.import_signature(bsig);
-        let fl = MemFlagsData::trusted();
-        // Slot table entry `e`'s byte offset, then its lane block in `base` (or `adj`),
-        // each computed once.
-        let mut offs: HashMap<usize, Value, FxBuild> = HashMap::default();
-        let mut addr: HashMap<(usize, bool), Value, FxBuild> = HashMap::default();
-        let slot_addr = |b: &mut FunctionBuilder,
-                         offs: &mut HashMap<usize, Value, FxBuild>,
-                         addr: &mut HashMap<(usize, bool), Value, FxBuild>,
-                         adjp: Option<Value>,
-                         e: usize,
-                         in_adj: bool|
-         -> Value {
-            if let Some(&a) = addr.get(&(e, in_adj)) {
-                return a;
-            }
-            let off = *offs.entry(e).or_insert_with(|| {
-                let s = b.ins().load(types::I32, fl, idxp, (4 * e) as i32);
-                let s = b.ins().uextend(types::I64, s);
-                b.ins().imul_imm_u(s, (lanes * 8) as i64)
-            });
-            let buf = if in_adj {
-                adjp.expect("an adjoint buffer")
-            } else {
-                base
-            };
-            let a = b.ins().iadd(buf, off);
-            addr.insert((e, in_adj), a);
-            a
-        };
-        // The lane-parallel operations as `f64x2` ones ([`simd`]), every other instruction as
-        // it is, in the packs' order.
-        let packs = simd::packs(f, lanes, rev, prefix);
-        let order: Vec<simd::Node> = match &packs {
-            Some(p) => p.order.clone(),
-            None => (0..f.insts.len() as ir::V)
-                .map(simd::Node::Scalar)
-                .collect(),
-        };
-        let pk = packs.as_ref();
-        let mut v: Vec<Option<Value>> = vec![None; f.insts.len()];
-        let mut pv: Vec<Option<Value>> = vec![None; pk.map_or(0, |p| p.members.len())];
-        let mut splats: HashMap<ir::V, Value, FxBuild> = HashMap::default();
-        // An instruction's scalar value: a packed one's lane (a store's, its stored value's).
-        fn scalar(
-            b: &mut FunctionBuilder,
-            f: &Func,
-            pk: Option<&simd::Packs>,
-            v: &mut [Option<Value>],
-            pv: &[Option<Value>],
-            x: ir::V,
-        ) -> Value {
-            if let Some(y) = v[x as usize] {
-                return y;
-            }
-            let y = match (f.insts[x as usize], pk.and_then(|p| p.of[x as usize])) {
-                (Inst::Store { v: s, .. }, _) => scalar(b, f, pk, v, pv, s),
-                (_, Some((q, lane))) => {
-                    let vec = pv[q as usize].expect("a pack before its lanes' readers");
-                    b.ins().extractlane(vec, lane)
-                }
-                _ => unreachable!("an operand before its reader"),
-            };
-            v[x as usize] = Some(y);
-            y
+            3
+        } {
+            sig.params.push(AbiParam::new(ptr));
         }
-        let mut in_body = false;
-        for node in order {
-            let anchor = match node {
-                simd::Node::Scalar(i) => i as usize,
-                simd::Node::Pack(p) => {
-                    let m = pk.expect("packs").members[p as usize];
-                    m[0].max(m[1]) as usize
-                }
+        let id = module
+            .declare_function(&format!("chunk{si}"), Linkage::Local, &sig)
+            .ok()?;
+        ctx.func.signature = sig;
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fctx);
+            let block = b.create_block();
+            b.append_block_params_for_function_params(block);
+            b.switch_to_block(block);
+            let args = b.block_params(block).to_vec();
+            // A segment's last argument: the scratch buffer.
+            let scratch = args[args.len() - 1];
+            let (base, mut adjp, idxp, litp) = if rev {
+                (args[0], Some(args[1]), args[2], args[3])
+            } else if seg {
+                (args[0], None, args[2], args[3])
+            } else {
+                (args[0], None, args[1], args[2])
             };
-            if let (false, true, Some((head, body, _))) = (in_body, anchor >= prefix, seed_loop) {
-                in_body = true;
-                // Into the seed loop: the forward's values dominate it.
-                b.ins().jump(head, &[args[1].into(), args[4].into()]);
-                b.switch_to_block(head);
-                let hp = b.block_params(head).to_vec();
-                let exit = seed_loop.expect("rev").2;
-                b.ins().brif(hp[1], body, &[], exit, &[]);
-                b.switch_to_block(body);
-                adjp = Some(hp[0]);
-                // An adjoint block's address is the seed's: computed afresh in the body.
-                addr.retain(|&(_, in_adj), _| !in_adj);
-            }
-            let at = match node {
-                simd::Node::Scalar(i) => i as usize,
-                simd::Node::Pack(p) => {
-                    let pks = pk.expect("packs");
-                    let [m0, m1] = pks.members[p as usize];
-                    // Operand `j` as a vector: its pack's, or one shared value splatted.
-                    let vop = |b: &mut FunctionBuilder,
-                               v: &mut Vec<Option<Value>>,
-                               splats: &mut HashMap<ir::V, Value, FxBuild>,
-                               j: usize|
-                     -> Value {
-                        let (x0, x1) = (
-                            simd::operand(&f.insts[m0 as usize], j),
-                            simd::operand(&f.insts[m1 as usize], j),
-                        );
-                        if x0 == x1 {
-                            if let Some(&s) = splats.get(&x0) {
-                                return s;
-                            }
-                            let x = scalar(b, f, pk, v, &pv, x0);
-                            let s = b.ins().splat(types::F64X2, x);
-                            splats.insert(x0, s);
-                            s
-                        } else {
-                            let (q, _) = pks.of[x0 as usize].expect("a paired operand");
-                            pv[q as usize].expect("a pack before its readers")
-                        }
-                    };
-                    let out = match f.insts[m0 as usize] {
-                        Inst::Load { arg, off } => {
-                            let (i, lane) = (off as usize / lanes, off as usize % lanes);
-                            let a = match arg {
-                                0 => slot_addr(&mut b, &mut offs, &mut addr, adjp, i, false),
-                                4 => slot_addr(&mut b, &mut offs, &mut addr, adjp, i, true),
-                                7 => slot_addr(&mut b, &mut offs, &mut addr, adjp, n_in + i, true),
-                                _ => return None,
-                            };
-                            Some(b.ins().load(types::F64X2, fl, a, (lane * 8) as i32))
-                        }
-                        Inst::Store { arg, off, .. } => {
-                            let (j, lane) = (off as usize / lanes, off as usize % lanes);
-                            let x = vop(&mut b, &mut v, &mut splats, 0);
-                            let a = match arg {
-                                3 => slot_addr(&mut b, &mut offs, &mut addr, adjp, n_in + j, false),
-                                4 => slot_addr(&mut b, &mut offs, &mut addr, adjp, j, true),
-                                _ => return None,
-                            };
-                            b.ins().store(fl, x, a, (lane * 8) as i32);
-                            None
-                        }
-                        Inst::Add(..) => {
-                            let (x, y) = (
-                                vop(&mut b, &mut v, &mut splats, 0),
-                                vop(&mut b, &mut v, &mut splats, 1),
-                            );
-                            Some(b.ins().fadd(x, y))
-                        }
-                        Inst::Sub(..) => {
-                            let (x, y) = (
-                                vop(&mut b, &mut v, &mut splats, 0),
-                                vop(&mut b, &mut v, &mut splats, 1),
-                            );
-                            Some(b.ins().fsub(x, y))
-                        }
-                        Inst::Mul(..) => {
-                            let (x, y) = (
-                                vop(&mut b, &mut v, &mut splats, 0),
-                                vop(&mut b, &mut v, &mut splats, 1),
-                            );
-                            Some(b.ins().fmul(x, y))
-                        }
-                        Inst::Div(..) => {
-                            let (x, y) = (
-                                vop(&mut b, &mut v, &mut splats, 0),
-                                vop(&mut b, &mut v, &mut splats, 1),
-                            );
-                            Some(b.ins().fdiv(x, y))
-                        }
-                        Inst::Neg(_) => {
-                            let x = vop(&mut b, &mut v, &mut splats, 0);
-                            Some(b.ins().fneg(x))
-                        }
-                        Inst::Abs(_) => {
-                            let x = vop(&mut b, &mut v, &mut splats, 0);
-                            Some(b.ins().fabs(x))
-                        }
-                        Inst::Call1(Shim1::Sqrt, _) => {
-                            let x = vop(&mut b, &mut v, &mut splats, 0);
-                            Some(b.ins().sqrt(x))
-                        }
-                        _ => return None,
-                    };
-                    pv[p as usize] = out;
-                    continue;
+            // The seed loop: `head(adj, n)` tests `n`, `body` runs the adjoint part on `adj`.
+            let seed_loop = (rev && !seg).then(|| {
+                let head = b.create_block();
+                b.append_block_param(head, ptr);
+                b.append_block_param(head, ptr);
+                let body = b.create_block();
+                let exit = b.create_block();
+                (head, body, exit)
+            });
+            let mut usig = Signature::new(target.default_call_conv);
+            usig.params.push(AbiParam::new(types::F64));
+            usig.returns.push(AbiParam::new(types::F64));
+            let mut bsig = usig.clone();
+            bsig.params.push(AbiParam::new(types::F64));
+            let uref = b.import_signature(usig);
+            let bref = b.import_signature(bsig);
+            let fl = MemFlagsData::trusted();
+            // Slot table entry `e`'s byte offset, then its lane block in `base` (or `adj`),
+            // each computed once.
+            let mut offs: HashMap<usize, Value, FxBuild> = HashMap::default();
+            let mut addr: HashMap<(usize, bool), Value, FxBuild> = HashMap::default();
+            let slot_addr = |b: &mut FunctionBuilder,
+                             offs: &mut HashMap<usize, Value, FxBuild>,
+                             addr: &mut HashMap<(usize, bool), Value, FxBuild>,
+                             adjp: Option<Value>,
+                             e: usize,
+                             in_adj: bool|
+             -> Value {
+                if let Some(&a) = addr.get(&(e, in_adj)) {
+                    return a;
                 }
+                let off = *offs.entry(e).or_insert_with(|| {
+                    let s = b.ins().load(types::I32, fl, idxp, (4 * e) as i32);
+                    let s = b.ins().uextend(types::I64, s);
+                    b.ins().imul_imm_u(s, (lanes * 8) as i64)
+                });
+                let buf = if in_adj {
+                    adjp.expect("an adjoint buffer")
+                } else {
+                    base
+                };
+                let a = b.ins().iadd(buf, off);
+                addr.insert((e, in_adj), a);
+                a
             };
-            let inst = &f.insts[at];
-            // Every operand's scalar, a packed one's lane read out.
-            {
-                let (ops, k) = simd::operands(inst);
-                for &o in &ops[..k] {
-                    scalar(&mut b, f, pk, &mut v, &pv, o);
+            // The lane-parallel operations as `f64x2` ones ([`simd`]), every other instruction as
+            // it is, in the packs' order.
+            // A segment is lowered scalar, over its own instructions.
+            let packs = if seg {
+                None
+            } else {
+                simd::packs(f, lanes, rev, prefix)
+            };
+            let order: Vec<simd::Node> = match &packs {
+                Some(p) => p.order.clone(),
+                None => (lo as ir::V..hi as ir::V).map(simd::Node::Scalar).collect(),
+            };
+            let pk = packs.as_ref();
+            let mut pv: Vec<Option<Value>> = vec![None; pk.map_or(0, |p| p.members.len())];
+            let mut splats: HashMap<ir::V, Value, FxBuild> = HashMap::default();
+            // An instruction's scalar value: a packed one's lane (a store's, its stored value's).
+            fn scalar(
+                b: &mut FunctionBuilder,
+                f: &Func,
+                pk: Option<&simd::Packs>,
+                v: &mut [Option<Value>],
+                pv: &[Option<Value>],
+                x: ir::V,
+            ) -> Value {
+                if let Some(y) = v[x as usize] {
+                    return y;
                 }
-            }
-            let r = |x: ir::V| v[x as usize].expect("an operand before its reader");
-            let out = match *inst {
-                Inst::Load { arg, off } => {
-                    let (i, lane) = (off as usize / lanes, off as usize % lanes);
-                    match arg {
-                        0 => {
-                            let a = slot_addr(&mut b, &mut offs, &mut addr, adjp, i, false);
-                            b.ins().load(types::F64, fl, a, (lane * 8) as i32)
-                        }
-                        // A literal: the pool holds values only; its derivative lanes are zeros
-                        // (folded away unless strict, which must still read them as zero).
-                        2 if lane == 0 => b.ins().load(types::F64, fl, litp, (i * 8) as i32),
-                        2 => b.ins().f64const(0.0),
-                        4 if rev => {
-                            let a = slot_addr(&mut b, &mut offs, &mut addr, adjp, i, true);
-                            b.ins().load(types::F64, fl, a, (lane * 8) as i32)
-                        }
-                        7 if rev => {
-                            let a = slot_addr(&mut b, &mut offs, &mut addr, adjp, n_in + i, true);
-                            b.ins().load(types::F64, fl, a, (lane * 8) as i32)
-                        }
-                        // The literals' adjoints: discarded (read as zero, never stored).
-                        6 if rev => b.ins().f64const(0.0),
-                        _ => return None,
+                let y = match (f.insts[x as usize], pk.and_then(|p| p.of[x as usize])) {
+                    (Inst::Store { v: s, .. }, _) => scalar(b, f, pk, v, pv, s),
+                    (_, Some((q, lane))) => {
+                        let vec = pv[q as usize].expect("a pack before its lanes' readers");
+                        b.ins().extractlane(vec, lane)
                     }
+                    _ => unreachable!("an operand before its reader"),
+                };
+                v[x as usize] = Some(y);
+                y
+            }
+            let mut in_body = false;
+            for node in order {
+                let anchor = match node {
+                    simd::Node::Scalar(i) => i as usize,
+                    simd::Node::Pack(p) => {
+                        let m = pk.expect("packs").members[p as usize];
+                        m[0].max(m[1]) as usize
+                    }
+                };
+                if let (false, true, Some((head, body, _))) = (in_body, anchor >= prefix, seed_loop)
+                {
+                    in_body = true;
+                    // Into the seed loop: the forward's values dominate it.
+                    b.ins().jump(head, &[args[1].into(), args[4].into()]);
+                    b.switch_to_block(head);
+                    let hp = b.block_params(head).to_vec();
+                    let exit = seed_loop.expect("rev").2;
+                    b.ins().brif(hp[1], body, &[], exit, &[]);
+                    b.switch_to_block(body);
+                    adjp = Some(hp[0]);
+                    // An adjoint block's address is the seed's: computed afresh in the body.
+                    addr.retain(|&(_, in_adj), _| !in_adj);
                 }
-                Inst::Const(bits) => b.ins().f64const(f64::from_bits(bits)),
-                Inst::Add(x, y) => b.ins().fadd(r(x), r(y)),
-                Inst::Sub(x, y) => b.ins().fsub(r(x), r(y)),
-                Inst::Mul(x, y) => b.ins().fmul(r(x), r(y)),
-                Inst::Div(x, y) => b.ins().fdiv(r(x), r(y)),
-                Inst::Neg(x) => b.ins().fneg(r(x)),
-                Inst::Abs(x) => b.ins().fabs(r(x)),
-                Inst::Floor(x) => b.ins().floor(r(x)),
-                Inst::Ceil(x) => b.ins().ceil(r(x)),
-                Inst::Call1(Shim1::Sqrt, x) => b.ins().sqrt(r(x)),
-                Inst::Call1(s, x) => {
-                    let fp = s.f();
-                    let callee = b.ins().iconst(ptr, fp as usize as i64);
-                    let call = b.ins().call_indirect(uref, callee, &[r(x)]);
-                    b.inst_results(call)[0]
-                }
-                Inst::Powf(x, y) => {
-                    let fp: extern "C" fn(f64, f64) -> f64 = sh_powf;
-                    let callee = b.ins().iconst(ptr, fp as usize as i64);
-                    let call = b.ins().call_indirect(bref, callee, &[r(x), r(y)]);
-                    b.inst_results(call)[0]
-                }
-                Inst::Gamma {
-                    upper,
-                    i,
-                    j,
-                    a: x,
-                    x: y,
-                } => {
-                    let fp = ir::gamma_shim(upper, i, j);
-                    let callee = b.ins().iconst(ptr, fp as usize as i64);
-                    let call = b.ins().call_indirect(bref, callee, &[r(x), r(y)]);
-                    b.inst_results(call)[0]
-                }
-                Inst::Cmp(cc, x, y) => {
-                    let cc = match cc {
-                        Cc::Lt => FloatCC::LessThan,
-                        Cc::Le => FloatCC::LessThanOrEqual,
-                        Cc::Gt => FloatCC::GreaterThan,
-                        Cc::Ge => FloatCC::GreaterThanOrEqual,
-                        Cc::Eq => FloatCC::Equal,
-                        Cc::Ne => FloatCC::NotEqual,
-                    };
-                    b.ins().fcmp(cc, r(x), r(y))
-                }
-                Inst::And(x, y) => b.ins().band(r(x), r(y)),
-                Inst::Or(x, y) => b.ins().bor(r(x), r(y)),
-                Inst::Select(c, x, y) => b.ins().select(r(c), r(x), r(y)),
-                Inst::StopGrad(x) => r(x),
-                Inst::HostArg(_) | Inst::Host(_) | Inst::HostOut(_) => {
-                    let (fp, arg): (extern "C" fn(f64) -> f64, Value) = match *inst {
-                        Inst::HostArg(x) => (ir::host::arg_native, r(x)),
-                        Inst::Host(f) => {
-                            (ir::host::call_native, b.ins().f64const(f.index() as f64))
-                        }
-                        Inst::HostOut(k) => (ir::host::out_native, b.ins().f64const(k as f64)),
-                        _ => unreachable!(),
-                    };
-                    let callee = b.ins().iconst(ptr, fp as usize as i64);
-                    let call = b.ins().call_indirect(uref, callee, &[arg]);
-                    b.inst_results(call)[0]
-                }
-                Inst::Store { arg, off, v: x } => {
-                    let (j, lane) = (off as usize / lanes, off as usize % lanes);
-                    let a = match arg {
-                        3 if !rev => slot_addr(&mut b, &mut offs, &mut addr, adjp, n_in + j, false),
-                        4 if rev => slot_addr(&mut b, &mut offs, &mut addr, adjp, j, true),
-                        6 if rev => {
-                            v[at] = Some(r(x));
+                let at = match node {
+                    simd::Node::Scalar(i) => i as usize,
+                    simd::Node::Pack(p) => {
+                        let pks = pk.expect("packs");
+                        let [m0, m1] = pks.members[p as usize];
+                        // Operand `j` as a vector: its pack's, or one shared value splatted.
+                        let vop = |b: &mut FunctionBuilder,
+                                   v: &mut Vec<Option<Value>>,
+                                   splats: &mut HashMap<ir::V, Value, FxBuild>,
+                                   j: usize|
+                         -> Value {
+                            let (x0, x1) = (
+                                simd::operand(&f.insts[m0 as usize], j),
+                                simd::operand(&f.insts[m1 as usize], j),
+                            );
+                            if x0 == x1 {
+                                if let Some(&s) = splats.get(&x0) {
+                                    return s;
+                                }
+                                let x = scalar(b, f, pk, v, &pv, x0);
+                                let s = b.ins().splat(types::F64X2, x);
+                                splats.insert(x0, s);
+                                s
+                            } else {
+                                let (q, _) = pks.of[x0 as usize].expect("a paired operand");
+                                pv[q as usize].expect("a pack before its readers")
+                            }
+                        };
+                        let out = match f.insts[m0 as usize] {
+                            Inst::Load { arg, off } => {
+                                let (i, lane) = (off as usize / lanes, off as usize % lanes);
+                                let a = match arg {
+                                    0 => slot_addr(&mut b, &mut offs, &mut addr, adjp, i, false),
+                                    4 => slot_addr(&mut b, &mut offs, &mut addr, adjp, i, true),
+                                    7 => slot_addr(
+                                        &mut b,
+                                        &mut offs,
+                                        &mut addr,
+                                        adjp,
+                                        n_in + i,
+                                        true,
+                                    ),
+                                    _ => return None,
+                                };
+                                Some(b.ins().load(types::F64X2, fl, a, (lane * 8) as i32))
+                            }
+                            Inst::Store { arg, off, .. } => {
+                                let (j, lane) = (off as usize / lanes, off as usize % lanes);
+                                let x = vop(&mut b, &mut v, &mut splats, 0);
+                                let a = match arg {
+                                    3 => slot_addr(
+                                        &mut b,
+                                        &mut offs,
+                                        &mut addr,
+                                        adjp,
+                                        n_in + j,
+                                        false,
+                                    ),
+                                    4 => slot_addr(&mut b, &mut offs, &mut addr, adjp, j, true),
+                                    _ => return None,
+                                };
+                                b.ins().store(fl, x, a, (lane * 8) as i32);
+                                None
+                            }
+                            Inst::Add(..) => {
+                                let (x, y) = (
+                                    vop(&mut b, &mut v, &mut splats, 0),
+                                    vop(&mut b, &mut v, &mut splats, 1),
+                                );
+                                Some(b.ins().fadd(x, y))
+                            }
+                            Inst::Sub(..) => {
+                                let (x, y) = (
+                                    vop(&mut b, &mut v, &mut splats, 0),
+                                    vop(&mut b, &mut v, &mut splats, 1),
+                                );
+                                Some(b.ins().fsub(x, y))
+                            }
+                            Inst::Mul(..) => {
+                                let (x, y) = (
+                                    vop(&mut b, &mut v, &mut splats, 0),
+                                    vop(&mut b, &mut v, &mut splats, 1),
+                                );
+                                Some(b.ins().fmul(x, y))
+                            }
+                            Inst::Div(..) => {
+                                let (x, y) = (
+                                    vop(&mut b, &mut v, &mut splats, 0),
+                                    vop(&mut b, &mut v, &mut splats, 1),
+                                );
+                                Some(b.ins().fdiv(x, y))
+                            }
+                            Inst::Neg(_) => {
+                                let x = vop(&mut b, &mut v, &mut splats, 0);
+                                Some(b.ins().fneg(x))
+                            }
+                            Inst::Abs(_) => {
+                                let x = vop(&mut b, &mut v, &mut splats, 0);
+                                Some(b.ins().fabs(x))
+                            }
+                            Inst::Call1(Shim1::Sqrt, _) => {
+                                let x = vop(&mut b, &mut v, &mut splats, 0);
+                                Some(b.ins().sqrt(x))
+                            }
+                            _ => return None,
+                        };
+                        pv[p as usize] = out;
+                        continue;
+                    }
+                };
+                let inst = &f.insts[at];
+                // A segment reads an operand defined in an earlier one back from the scratch buffer
+                // (a constant is made again), once.
+                if let Some(plan) = spill {
+                    let (ops, k) = simd::operands(inst);
+                    for &o in &ops[..k] {
+                        if v[o as usize].is_some() {
                             continue;
                         }
-                        _ => return None,
-                    };
-                    b.ins().store(fl, r(x), a, (lane * 8) as i32);
-                    r(x)
+                        let val = if let Inst::Const(bits) = f.insts[o as usize] {
+                            b.ins().f64const(f64::from_bits(bits))
+                        } else {
+                            let s = plan.slot[o as usize];
+                            debug_assert_ne!(s, SegPlan::NONE, "a crossing operand has a slot");
+                            let ty = if plan.cond[o as usize] {
+                                types::I8
+                            } else {
+                                types::F64
+                            };
+                            b.ins().load(ty, fl, scratch, (s as i32) * 8)
+                        };
+                        v[o as usize] = Some(val);
+                        reloaded.push(o as usize);
+                    }
                 }
-            };
-            v[at] = Some(out);
-        }
-        if let Some((head, _, exit)) = seed_loop {
-            if f.insts.len() <= prefix {
-                // No adjoint part: the loop's blocks still need their terminators.
-                b.ins().jump(head, &[args[1].into(), args[4].into()]);
-                b.switch_to_block(head);
-                let body = seed_loop.expect("rev").1;
-                let n = b.block_params(head)[1];
-                b.ins().brif(n, body, &[], exit, &[]);
-                b.switch_to_block(body);
-                b.ins().jump(exit, &[]);
-            } else {
-                let hp_adj = adjp.expect("in the loop");
-                let step = b.ins().imul_imm_s(args[5], 8);
-                let next = b.ins().iadd(hp_adj, step);
-                // `n − 1` from the head's count.
-                let n = b.block_params(head)[1];
-                let n1 = b.ins().iadd_imm_s(n, -1);
-                b.ins().jump(head, &[next.into(), n1.into()]);
+                // Every operand's scalar, a packed one's lane read out.
+                {
+                    let (ops, k) = simd::operands(inst);
+                    for &o in &ops[..k] {
+                        scalar(&mut b, f, pk, &mut v, &pv, o);
+                    }
+                }
+                let r = |x: ir::V| v[x as usize].expect("an operand before its reader");
+                let out = match *inst {
+                    Inst::Load { arg, off } => {
+                        let (i, lane) = (off as usize / lanes, off as usize % lanes);
+                        match arg {
+                            0 => {
+                                let a = slot_addr(&mut b, &mut offs, &mut addr, adjp, i, false);
+                                b.ins().load(types::F64, fl, a, (lane * 8) as i32)
+                            }
+                            // A literal: the pool holds values only; its derivative lanes are zeros
+                            // (folded away unless strict, which must still read them as zero).
+                            2 if lane == 0 => b.ins().load(types::F64, fl, litp, (i * 8) as i32),
+                            2 => b.ins().f64const(0.0),
+                            4 if rev => {
+                                let a = slot_addr(&mut b, &mut offs, &mut addr, adjp, i, true);
+                                b.ins().load(types::F64, fl, a, (lane * 8) as i32)
+                            }
+                            7 if rev => {
+                                let a =
+                                    slot_addr(&mut b, &mut offs, &mut addr, adjp, n_in + i, true);
+                                b.ins().load(types::F64, fl, a, (lane * 8) as i32)
+                            }
+                            // The literals' adjoints: discarded (read as zero, never stored).
+                            6 if rev => b.ins().f64const(0.0),
+                            _ => return None,
+                        }
+                    }
+                    Inst::Const(bits) => b.ins().f64const(f64::from_bits(bits)),
+                    Inst::Add(x, y) => b.ins().fadd(r(x), r(y)),
+                    Inst::Sub(x, y) => b.ins().fsub(r(x), r(y)),
+                    Inst::Mul(x, y) => b.ins().fmul(r(x), r(y)),
+                    Inst::Div(x, y) => b.ins().fdiv(r(x), r(y)),
+                    Inst::Neg(x) => b.ins().fneg(r(x)),
+                    Inst::Abs(x) => b.ins().fabs(r(x)),
+                    Inst::Floor(x) => b.ins().floor(r(x)),
+                    Inst::Ceil(x) => b.ins().ceil(r(x)),
+                    Inst::Call1(Shim1::Sqrt, x) => b.ins().sqrt(r(x)),
+                    Inst::Call1(s, x) => {
+                        let fp = s.f();
+                        let callee = b.ins().iconst(ptr, fp as usize as i64);
+                        let call = b.ins().call_indirect(uref, callee, &[r(x)]);
+                        b.inst_results(call)[0]
+                    }
+                    Inst::Powf(x, y) => {
+                        let fp: extern "C" fn(f64, f64) -> f64 = sh_powf;
+                        let callee = b.ins().iconst(ptr, fp as usize as i64);
+                        let call = b.ins().call_indirect(bref, callee, &[r(x), r(y)]);
+                        b.inst_results(call)[0]
+                    }
+                    Inst::Gamma {
+                        upper,
+                        i,
+                        j,
+                        a: x,
+                        x: y,
+                    } => {
+                        let fp = ir::gamma_shim(upper, i, j);
+                        let callee = b.ins().iconst(ptr, fp as usize as i64);
+                        let call = b.ins().call_indirect(bref, callee, &[r(x), r(y)]);
+                        b.inst_results(call)[0]
+                    }
+                    Inst::Cmp(cc, x, y) => {
+                        let cc = match cc {
+                            Cc::Lt => FloatCC::LessThan,
+                            Cc::Le => FloatCC::LessThanOrEqual,
+                            Cc::Gt => FloatCC::GreaterThan,
+                            Cc::Ge => FloatCC::GreaterThanOrEqual,
+                            Cc::Eq => FloatCC::Equal,
+                            Cc::Ne => FloatCC::NotEqual,
+                        };
+                        b.ins().fcmp(cc, r(x), r(y))
+                    }
+                    Inst::And(x, y) => b.ins().band(r(x), r(y)),
+                    Inst::Or(x, y) => b.ins().bor(r(x), r(y)),
+                    Inst::Select(c, x, y) => b.ins().select(r(c), r(x), r(y)),
+                    Inst::StopGrad(x) => r(x),
+                    Inst::HostArg(_) | Inst::Host(_) | Inst::HostOut(_) => {
+                        let (fp, arg): (extern "C" fn(f64) -> f64, Value) = match *inst {
+                            Inst::HostArg(x) => (ir::host::arg_native, r(x)),
+                            Inst::Host(f) => {
+                                (ir::host::call_native, b.ins().f64const(f.index() as f64))
+                            }
+                            Inst::HostOut(k) => (ir::host::out_native, b.ins().f64const(k as f64)),
+                            _ => unreachable!(),
+                        };
+                        let callee = b.ins().iconst(ptr, fp as usize as i64);
+                        let call = b.ins().call_indirect(uref, callee, &[arg]);
+                        b.inst_results(call)[0]
+                    }
+                    Inst::Store { arg, off, v: x } => {
+                        let (j, lane) = (off as usize / lanes, off as usize % lanes);
+                        let a = match arg {
+                            3 if !rev => Some(slot_addr(
+                                &mut b,
+                                &mut offs,
+                                &mut addr,
+                                adjp,
+                                n_in + j,
+                                false,
+                            )),
+                            4 if rev => {
+                                Some(slot_addr(&mut b, &mut offs, &mut addr, adjp, j, true))
+                            }
+                            // The literals' adjoints: discarded.
+                            6 if rev => None,
+                            _ => return None,
+                        };
+                        if let Some(a) = a {
+                            b.ins().store(fl, r(x), a, (lane * 8) as i32);
+                        }
+                        r(x)
+                    }
+                };
+                v[at] = Some(out);
+                if let Some(plan) = spill {
+                    let s = plan.slot[at];
+                    if s != SegPlan::NONE {
+                        b.ins().store(fl, out, scratch, (s as i32) * 8);
+                    }
+                }
             }
-            b.switch_to_block(exit);
+            if let Some((head, _, exit)) = seed_loop {
+                if f.insts.len() <= prefix {
+                    // No adjoint part: the loop's blocks still need their terminators.
+                    b.ins().jump(head, &[args[1].into(), args[4].into()]);
+                    b.switch_to_block(head);
+                    let body = seed_loop.expect("rev").1;
+                    let n = b.block_params(head)[1];
+                    b.ins().brif(n, body, &[], exit, &[]);
+                    b.switch_to_block(body);
+                    b.ins().jump(exit, &[]);
+                } else {
+                    let hp_adj = adjp.expect("in the loop");
+                    let step = b.ins().imul_imm_s(args[5], 8);
+                    let next = b.ins().iadd(hp_adj, step);
+                    // `n − 1` from the head's count.
+                    let n = b.block_params(head)[1];
+                    let n1 = b.ins().iadd_imm_s(n, -1);
+                    b.ins().jump(head, &[next.into(), n1.into()]);
+                }
+                b.switch_to_block(exit);
+            }
+            b.ins().return_(&[]);
+            b.seal_all_blocks();
+            b.finalize(target);
         }
-        b.ins().return_(&[]);
-        b.seal_all_blocks();
-        b.finalize(target);
+        v[lo..hi].fill(None);
+        for o in reloaded.drain(..) {
+            v[o] = None;
+        }
+        module.define_function(id, &mut ctx).ok()?;
+        module.clear_context(&mut ctx);
+        ids.push(id);
     }
-    module.define_function(id, &mut ctx).ok()?;
-    module.clear_context(&mut ctx);
     module.finalize_definitions().ok()?;
-    let p = module.get_finalized_function(id);
-    // SAFETY: defined with `ChunkFn`'s signature.
+    // SAFETY: defined with `ChunkFn`'s (`ChunkRevFn`'s) signature, or each with `SegFn`'s.
+    let (p, segs) = if seg {
+        let fns: Box<[*const u8]> = ids
+            .iter()
+            .map(|&id| module.get_finalized_function(id))
+            .collect();
+        (fns.as_ptr() as *const u8, Some(fns))
+    } else {
+        (module.get_finalized_function(ids[0]), None)
+    };
     Some(ChunkKernel {
         f: p,
+        segs,
         module: Some(module),
     })
 }
@@ -5366,5 +5656,232 @@ mod compile_guard_tests {
             !queued.load(Relaxed),
             "a panicked compile must release `queued`"
         );
+    }
+}
+
+/// A kernel too large for one native frame runs from a small stack: it is cut into segments
+/// ([`SegPlan`]), each with a frame of its own size.
+#[cfg(test)]
+mod seg_tests {
+    use super::*;
+
+    const M: usize = 40_000;
+
+    fn layout() -> Layout {
+        Layout {
+            n: 2,
+            m: 3,
+            th: false,
+            wide: false,
+            tan: 0,
+        }
+    }
+
+    /// `M` inputs loaded first and summed last (every value live across the kernel), the sum
+    /// stored to the output slot `M`.
+    fn sum_func(l: usize) -> Func {
+        let mut f = Func::new(4);
+        for i in 0..M {
+            f.insts.push(Inst::Load {
+                arg: 0,
+                off: (i * l) as u32,
+            });
+        }
+        // Input `i` times input `M − 1 − i`: at the middle every input is still live.
+        let mut acc = 0 as ir::V;
+        for i in 0..M {
+            f.insts.push(Inst::Mul(i as ir::V, (M - 1 - i) as ir::V));
+            let m = (f.insts.len() - 1) as ir::V;
+            if i == 0 {
+                acc = m;
+            } else {
+                f.insts.push(Inst::Add(acc, m));
+                acc = (f.insts.len() - 1) as ir::V;
+            }
+        }
+        f.insts.push(Inst::Store {
+            arg: 3,
+            off: 0,
+            v: acc,
+        });
+        f.live = vec![None; f.insts.len()];
+        f
+    }
+
+    /// A reverse kernel, by hand: the forward loads (`prefix`), then per seed every input's
+    /// adjoint = the output's adjoint times the input (read across the seed loop).
+    fn rev_func(l: usize) -> (Func, usize) {
+        let mut f = Func::new(8);
+        for i in 0..M {
+            f.insts.push(Inst::Load {
+                arg: 0,
+                off: (i * l) as u32,
+            });
+        }
+        let prefix = f.insts.len();
+        f.insts.push(Inst::Load { arg: 7, off: 0 });
+        let a = prefix as ir::V;
+        for i in 0..M {
+            f.insts.push(Inst::Mul(a, i as ir::V));
+            let m = (f.insts.len() - 1) as ir::V;
+            f.insts.push(Inst::Store {
+                arg: 4,
+                off: (i * l) as u32,
+                v: m,
+            });
+        }
+        f.live = vec![None; f.insts.len()];
+        (f, prefix)
+    }
+
+    /// `body` on a thread with `stack` bytes, `kib` KiB of it already used by its callers.
+    fn on_small_stack(stack: usize, kib: usize, body: impl FnOnce() + Send) {
+        fn deep(kib: usize, body: &mut Option<Box<dyn FnOnce() + '_>>) {
+            if kib == 0 {
+                body.take().expect("once")();
+                return;
+            }
+            let pad = [kib as u8; 1024];
+            deep(kib - 1, body);
+            std::hint::black_box(&pad);
+        }
+        std::thread::scope(|s| {
+            std::thread::Builder::new()
+                .stack_size(stack)
+                .spawn_scoped(s, move || deep(kib, &mut Some(Box::new(body))))
+                .unwrap()
+                .join()
+                .expect("the kernel ran within the small stack");
+        });
+    }
+
+    fn inputs(l: usize) -> Vec<f64> {
+        (0..(M + 1) * l)
+            .map(|k| 0.5 + (k as f64 * 0.37).sin())
+            .collect()
+    }
+
+    #[test]
+    fn a_large_kernel_plans_a_scratch_buffer_and_a_small_one_does_not() {
+        let l = layout().lanes();
+        let plan = SegPlan::new(&sum_func(l), false, 0).expect("a large kernel");
+        // Every input is read ~M instructions after its definition, in a later segment; a
+        // running sum only where a segment boundary cuts the chain.
+        assert!(plan.slot[..M].iter().all(|&s| s != SegPlan::NONE));
+        let cut = plan.slot[M..]
+            .iter()
+            .filter(|&&s| s != SegPlan::NONE)
+            .count();
+        // Only the boundaries inside the chain.
+        assert!((1..=2 * plan.segs.len()).contains(&cut), "{cut}");
+        assert!(plan.slots >= M && plan.slots <= M + cut);
+        assert!(plan.segs.iter().all(|&(lo, hi)| hi - lo <= SEG_INSTS));
+        let mut small = sum_func(l);
+        small.insts.truncate(SEG_MIN_INSTS);
+        assert!(SegPlan::new(&small, false, 0).is_none());
+    }
+
+    #[test]
+    fn a_promoted_large_kernel_runs_on_a_small_stack_at_every_tier() {
+        let l = layout().lanes();
+        let t = Tiered::new(sum_func(l), layout(), M, false, 0);
+        assert!(t
+            .spill
+            .get_or_init(|| SegPlan::new(&t.f, t.rev, t.prefix))
+            .is_some());
+        let idx: Vec<u32> = (0..=M as u32).collect();
+        let inp = inputs(l);
+        let mut want = inp.clone();
+        // SAFETY: `idx` names `M + 1` lane blocks of `want`.
+        unsafe {
+            t.interpret(
+                want.as_mut_ptr(),
+                std::ptr::null_mut(),
+                idx.as_ptr(),
+                [].as_ptr(),
+                1,
+                0,
+            )
+        };
+        let want = want[M * l];
+        assert!(want.is_finite() && want != inp[M * l]);
+        for (quick, opt) in [(true, "none"), (true, "speed")] {
+            let mut buf = inp.clone();
+            let (bp, ip, tr) = (buf.as_mut_ptr() as usize, idx.as_ptr() as usize, &t);
+            // 256 KiB stack, 64 KiB used by the callers: the kernel's own frame would be
+            // 8 B x 40k = 320 KiB if its values lived on the stack.
+            // The compile runs on the small stack too: each segment is a small function.
+            on_small_stack(256 << 10, 64, move || unsafe {
+                tr.promote(quick, opt);
+                assert_ne!(tr.native.load(Relaxed), 0, "{opt} compiled");
+                tr.call(
+                    bp as *mut f64,
+                    std::ptr::null_mut(),
+                    ip as *const u32,
+                    [].as_ptr(),
+                );
+            });
+            assert_eq!(buf[M * l].to_bits(), want.to_bits(), "{opt}");
+        }
+    }
+
+    #[test]
+    fn a_promoted_large_reverse_kernel_runs_on_a_small_stack_and_matches_the_interpreter() {
+        let l = layout().lanes();
+        let (f, prefix) = rev_func(l);
+        let t = Tiered::new(f, layout(), M, true, prefix);
+        assert!(t
+            .spill
+            .get_or_init(|| SegPlan::new(&t.f, t.rev, t.prefix))
+            .is_some());
+        let idx: Vec<u32> = (0..=M as u32).collect();
+        let inp = inputs(l);
+        let stride = (M + 1) * l;
+        let seeds = 3;
+        let adj0: Vec<f64> = (0..stride * seeds)
+            .map(|k| 1.0 + (k as f64 * 0.11).cos())
+            .collect();
+        let mut want = adj0.clone();
+        let mut base = inp.clone();
+        // SAFETY: `seeds` adjoint buffers `stride` apart.
+        unsafe {
+            t.interpret(
+                base.as_mut_ptr(),
+                want.as_mut_ptr(),
+                idx.as_ptr(),
+                [].as_ptr(),
+                seeds,
+                stride,
+            )
+        };
+        assert_ne!(want, adj0);
+        for (quick, opt) in [(true, "none"), (true, "speed")] {
+            let mut got = adj0.clone();
+            let mut base = inp.clone();
+            let (bp, gp, ip, tr) = (
+                base.as_mut_ptr() as usize,
+                got.as_mut_ptr() as usize,
+                idx.as_ptr() as usize,
+                &t,
+            );
+            on_small_stack(256 << 10, 64, move || unsafe {
+                tr.promote(quick, opt);
+                assert_ne!(tr.native.load(Relaxed), 0, "{opt} compiled");
+                tr.call_seeds(
+                    bp as *mut f64,
+                    gp as *mut f64,
+                    stride,
+                    seeds,
+                    ip as *const u32,
+                    [].as_ptr(),
+                );
+            });
+            assert!(
+                got.iter()
+                    .zip(&want)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{opt}"
+            );
+        }
     }
 }

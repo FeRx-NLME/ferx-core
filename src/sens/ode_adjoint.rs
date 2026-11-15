@@ -1200,6 +1200,26 @@ fn taped_params<T: VmNum>(
     by_slot
 }
 
+/// `y / s` where the `[scaling]` divisor is a finite positive number, else `NaN`: production's
+/// `divide_by_obs_scale`, a prediction the model cannot make at this `(θ, η)`.
+///
+/// The recording serves such a point as the plan it is — a branch guard on `s` and constant `NaN`
+/// predictions — instead of declining. A decline here (`None`) condemned the whole subject to
+/// finite differences for the rest of the fit, and the point is an ordinary one: an inner search
+/// that overshoots to an extreme η (`V = TVV·exp(η)` underflowing to 0) records its first plan
+/// there. A diverged subject is a `NaN` value, as on the non-finite timeline (#1189), which the
+/// objective already turns into a rejected trial point.
+fn divide_by_scale<T: VmNum>(y: T, s: T) -> T {
+    // `0 < s < ∞`: a `NaN` fails both.
+    if s.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
+        && s.br_cmp_c(crate::sens::num::BranchCmp::Lt, f64::INFINITY)
+    {
+        y / s
+    } else {
+        T::from_f64(f64::NAN)
+    }
+}
+
 /// An expression `obs_scale` divisor `s(θ, η, p)`, applied after the walk as the
 /// providers do: the scale program evaluated on the tape over the (subject-static)
 /// taped parameters, and every prediction becomes `pred / s`. `None` for a scale this
@@ -1228,14 +1248,8 @@ fn apply_expression_scale<T: VmNum>(
                 })
                 .collect();
             let s = prog.eval_scale_g(theta, eta, &subject.covariates, &vars);
-            // `0 < s < ∞`: a `NaN` fails both.
-            if !(s.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
-                && s.br_cmp_c(crate::sens::num::BranchCmp::Lt, f64::INFINITY))
-            {
-                return None;
-            }
             for y in preds.iter_mut() {
-                *y = *y / s;
+                *y = divide_by_scale(*y, s);
                 // Production's order: the scale, then the LTBS log (`apply_output_transform`
                 // left it for here).
                 if model.log_transform {
@@ -1537,13 +1551,7 @@ fn record_ode_iov<T: VmNum>(
                 .collect();
             for (j, y) in preds.iter_mut().enumerate() {
                 let s = scales[layout.group_of(*subject.occasions.get(j)?)?];
-                // `0 < s < ∞`: a `NaN` fails both.
-                if !(s.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
-                    && s.br_cmp_c(crate::sens::num::BranchCmp::Lt, f64::INFINITY))
-                {
-                    return None;
-                }
-                *y = *y / s;
+                *y = divide_by_scale(*y, s);
                 if model.log_transform {
                     *y = crate::sens::ode_provider::ltbs_readout(*y);
                 }
@@ -1613,13 +1621,7 @@ fn closed_form_finish<T: VmNum>(
     };
     let apply = |y: &mut T, s: Option<T>| -> Option<()> {
         if let Some(s) = s {
-            // `0 < s < ∞`: a `NaN` fails both.
-            if !(s.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
-                && s.br_cmp_c(crate::sens::num::BranchCmp::Lt, f64::INFINITY))
-            {
-                return None;
-            }
-            *y = *y / s;
+            *y = divide_by_scale(*y, s);
         }
         Some(())
     };
@@ -1886,13 +1888,7 @@ fn record_analytic_events<T: VmNum>(
             let s = *cache
                 .entry(l.group_of(occ))
                 .or_insert_with(|| group_scale(occ));
-            // `0 < s < ∞`: a `NaN` fails both.
-            if !(s.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
-                && s.br_cmp_c(crate::sens::num::BranchCmp::Lt, f64::INFINITY))
-            {
-                return None;
-            }
-            *y = *y / s;
+            *y = divide_by_scale(*y, s);
         }
         if model.log_transform {
             preds
@@ -2263,6 +2259,31 @@ pub(crate) fn plan_values(
 /// step's reduced basis 9).
 const SDE_P_KIND: u8 = 10;
 
+/// Whether the individual parameters are finite at `(theta, eta)`. A point where one is not (an
+/// inner search overshooting to `exp(η) = ∞`) has no derivative to serve and no steady state to
+/// find, so a recording that fails there says nothing about the subject: the caller declines
+/// that one call and keeps the subject's plan route, instead of condemning it to finite
+/// differences for the rest of the fit ([`kjit_record`], [`with_plan_in`]). The parameters, not
+/// the predictions: this runs on a failure path, where a subject outside the predictor's
+/// contract (an unresolved modeled `RATE`) must not panic it.
+fn individual_parameters_are_finite(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+) -> bool {
+    theta.iter().chain(eta).all(|v| v.is_finite())
+        && (model.pk_param_fn)(
+            theta,
+            &eta[..model.n_eta.min(eta.len())],
+            &subject.covariates,
+            0.0,
+        )
+        .values
+        .iter()
+        .all(|v| v.is_finite())
+}
+
 /// A subject's compiled plan (#2786).
 pub(super) type PlanArc =
     std::sync::Arc<crate::parser::model_parser::rhs_regcode::kernel_jit::Plan>;
@@ -2328,9 +2349,10 @@ fn with_plan_in<R>(
     }
     let plan = kjit_record(model, subject, lay, theta, eta, None, sigma, &key)?;
     let r = serves(&plan);
-    if r.is_none() {
+    if r.is_none() && individual_parameters_are_finite(model, subject, theta, eta) {
         // A recording that does not serve at its own point never will: recording again on
-        // every call would only repeat it.
+        // every call would only repeat it. (At a point the value path cannot predict, the
+        // guard has no finite values to hold at: that call is declined, not the subject.)
         kj::mark_bad(&key, "the plan does not serve at its own recording point");
     }
     r
@@ -2376,7 +2398,7 @@ pub(super) fn with_plan_nn<R>(
     }
     let plan = kjit_record(model, subject, None, theta, eta, Some(nn_z), sigma, &key)?;
     let r = serves(&plan);
-    if r.is_none() {
+    if r.is_none() && individual_parameters_are_finite(model, subject, theta, eta) {
         kj::mark_bad(&key, "the plan does not serve at its own recording point");
     }
     r
@@ -2471,6 +2493,11 @@ fn kjit_record(
         Err((why, model_wide)) => {
             if kj::debug() {
                 eprintln!("kjit: subject not recorded: {why}");
+            }
+            // A failure at a point the value path cannot predict (non-finite parameters, no
+            // finite steady state) is that point's, not the subject's: declined, not condemned.
+            if !model_wide && !individual_parameters_are_finite(model, subject, theta, eta) {
+                return None;
             }
             kj::mark_bad(key, &why);
             if model_wide {

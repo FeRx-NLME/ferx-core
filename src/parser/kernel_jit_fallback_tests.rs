@@ -823,3 +823,60 @@ fn an_overlapping_steady_state_infusion_plans_without_fallback() {
         assert!(g.is_finite() && g < GAP_TOL, "{g:e}");
     }
 }
+
+/// An amount-state ODE whose `[scaling]` divisor reads an individual parameter (`obs_scale = V1`),
+/// the idiom of every amount model. Its first fit overshoots: the inner search steps to an extreme
+/// η, where `V1 = TVV1·exp(η)` underflows to 0 and the recording's scale check failed — the
+/// whole subject went to finite differences for the rest of the fit ("the recorder returned
+/// None", all 6 subjects, and a converged fit that is not converged under it). The fit reports
+/// no fallback and its plan outer gradient matches the reconverged central difference.
+/// Mutation: restore `return None` at the divisor check in `record_ode` -> the token appears.
+#[test]
+fn an_ode_expression_scale_on_an_individual_parameter_plans_without_fallback() {
+    let model = TWO_CPT_AMOUNTS;
+    let data = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT\n1,0,1,1,.,100,100,1\n1,0.5,0,0,4.2931,0,0,1\n1,1.0,0,0,4.2024,0,0,1\n1,2.0,0,0,3.2577,0,0,1\n1,4.0,0,0,2.9236,0,0,1\n1,8.0,0,0,1.9541,0,0,1\n1,24.0,0,0,0.5111,0,0,1\n2,0,1,1,.,100,100,1\n2,0.5,0,0,3.9917,0,0,1\n2,1.0,0,0,3.9186,0,0,1\n2,2.0,0,0,3.6982,0,0,1\n2,4.0,0,0,2.7256,0,0,1\n2,8.0,0,0,1.8316,0,0,1\n2,24.0,0,0,0.5425,0,0,1\n3,0,1,1,.,100,100,1\n3,0.5,0,0,3.6904,0,0,1\n3,1.0,0,0,3.6348,0,0,1\n3,2.0,0,0,3.4465,0,0,1\n3,4.0,0,0,2.5276,0,0,1\n3,8.0,0,0,1.7090,0,0,1\n3,24.0,0,0,0.5245,0,0,1\n4,0,1,1,.,100,100,1\n4,0.5,0,0,4.2177,0,0,1\n4,1.0,0,0,4.1315,0,0,1\n4,2.0,0,0,3.1948,0,0,1\n4,4.0,0,0,2.8741,0,0,1\n4,8.0,0,0,1.9235,0,0,1\n4,24.0,0,0,0.5066,0,0,1\n5,0,1,1,.,100,100,1\n5,0.5,0,0,3.9164,0,0,1\n5,1.0,0,0,3.8477,0,0,1\n5,2.0,0,0,3.6353,0,0,1\n5,4.0,0,0,2.6761,0,0,1\n5,8.0,0,0,1.8009,0,0,1\n5,24.0,0,0,0.5380,0,0,1\n6,0,1,1,.,100,100,1\n6,0.5,0,0,4.4438,0,0,1\n6,1.0,0,0,3.5639,0,0,1\n6,2.0,0,0,3.3836,0,0,1\n6,4.0,0,0,3.0226,0,0,1\n6,8.0,0,0,1.6784,0,0,1\n6,24.0,0,0,0.5200,0,0,1";
+    let (m, p) = from_text(model, data);
+    let o = FitOptions {
+        outer_maxiter: 25,
+        ..opts(EstimationMethod::FoceI)
+    };
+    let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
+    assert!(
+        !fit.warnings.iter().any(|w| w.contains(TOKEN)),
+        "{:?}",
+        fit.warnings
+    );
+    assert!(fit.converged, "converged");
+    let gap = exact_and_matches_fd("ode obs_scale = V1", model, data);
+    assert!(gap.is_finite() && gap < GAP_TOL, "{gap:e}");
+}
+
+const TWO_CPT_AMOUNTS: &str = r#"[data]
+  path=data.csv
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(10.0, 0.5, 500.0)
+  theta TVQ(2.0, 0.05, 50.0)
+  theta TVV2(20.0, 0.5, 1000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V1 ~ 0.2
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  obs_scale = V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+"#;

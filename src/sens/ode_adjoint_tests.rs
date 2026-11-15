@@ -10574,3 +10574,118 @@ fn an_addl_implied_dose_and_its_explicit_twin_do_not_share_a_plan() {
         "the twins predict apart: {a:?} vs {b:?}"
     );
 }
+
+// ---- a recording at an extreme η is served, never a reason to give the subject up -----------
+
+/// One-compartment oral models whose `[scaling]` divisor reads an individual parameter
+/// (`obs_scale = V`, Form B): the ODE form, the closed form, and each with a κ on `CL`. At an
+/// extreme η the divisor underflows (`V = TVV·exp(η) = 0`), which production reads as a `NaN`
+/// prediction (`divide_by_obs_scale`).
+fn scaled_src(ode: bool, iov: bool) -> String {
+    let (cl, kappa) = if iov {
+        ("exp(ETA_CL + KAPPA_CL)", "  kappa KAPPA_CL ~ 0.05\n")
+    } else {
+        ("exp(ETA_CL)", "")
+    };
+    let (structural, odes, scale) = if ode {
+        (
+            "ode(obs_cmt=central, states=[depot, central])",
+            "[odes]\n  d/dt(depot) = -KA * depot\n  d/dt(central) = KA * depot - (CL/V) * central\n",
+            "V",
+        )
+    } else {
+        ("pk one_cpt_oral(cl=CL, v=V, ka=KA)", "", "V * 1.5")
+    };
+    format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+         theta TVKA(1.2, 0.05, 20.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n{kappa}  \
+         sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * {cl}\n  \
+         V = TVV * exp(ETA_V)\n  KA = TVKA\n[structural_model]\n  {structural}\n{odes}\
+         [scaling]\n  obs_scale = {scale}\n[error_model]\n  DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+/// A subject whose first plan is recorded at an extreme η (the divisor `V` is 0 there) is not
+/// condemned to finite differences: the plan records the `NaN` predictions as the branch it is,
+/// and the same subject is then served at an ordinary η, matching the reconverged FD of the
+/// objective. Mutation: restore `return None` where the divisor fails `0 < s < ∞` -> the
+/// extreme call marks the subject bad (`W_PLAN_FD_FALLBACK`, "the recorder returned None") and
+/// the parity below panics with "subject must be in adjoint scope". Four sites, one per engine
+/// that applies an expression scale (ODE, ODE with κ, closed form, closed form with κ).
+#[test]
+fn a_scale_that_underflows_at_an_extreme_eta_does_not_condemn_the_subject() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    for (ode, iov) in [(true, false), (true, true), (false, false), (false, true)] {
+        let label = format!("ode={ode} iov={iov}");
+        let model = tight(parse_model_string(&scaled_src(ode, iov)).unwrap());
+        let n_stacked = model.n_eta + model.n_kappa;
+        let eta_ref: Vec<f64> = (0..n_stacked).map(|k| 0.1 - 0.07 * k as f64).collect();
+        let s = subject(
+            &model,
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &TIMES,
+            &eta_ref,
+        );
+        let params = moved_params(&model);
+        let x = pack_params(&params);
+        // `V = TVV·exp(-800)` is 0 and `CL` is denormal: the divisor is not a positive number.
+        let extreme = vec![-800.0; n_stacked];
+        let _ = subject_adjoint_packed_gradient(&model, &s, &params, &x, &extreme, true);
+        let failed = kj::plan_failures(&model, std::slice::from_ref(&s));
+        assert!(
+            failed.is_none(),
+            "{label}: the extreme η condemned the subject: {failed:?}"
+        );
+        // The same subject, at ordinary points, is served exactly. Measured below.
+        let worst = parity(&model, &s);
+        eprintln!("{label}: scaled-divisor parity {worst:.3e}");
+        assert!(
+            worst < 1e-8,
+            "{label}: worst relative difference {worst:.2e}"
+        );
+        let failed = kj::plan_failures(&model, std::slice::from_ref(&s));
+        assert!(failed.is_none(), "{label}: a plan failed later: {failed:?}");
+    }
+}
+
+/// An `SS=1` dose recorded first at an extreme η — `CL = TVCL·exp(800) = ∞`, no finite trough, the
+/// steady-state search fails at record time — is that point's failure, not the subject's: the
+/// call is declined, no plan failure is noted, and the same subject is served at ordinary points
+/// matching the reconverged FD. Mutation: drop the `individual_parameters_are_finite` test from
+/// `kjit_record` -> the extreme call marks the subject bad ("a steady-state call's record-time
+/// search failed") and the parity panics with "subject must be in adjoint scope". The control
+/// (`+800` on `CL` and `-800` on `V`) is a finite value path with a failing recording, which
+/// stays a plan failure and is not asserted here.
+#[test]
+fn a_steady_state_with_no_finite_trough_at_an_extreme_eta_does_not_condemn_the_subject() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let model = tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap());
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    let times = [0.5, 1.0, 2.0, 4.0, 8.0, 11.0];
+    let s = subject(&model, doses, &times, &[0.1, -0.05]);
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    let extreme = [800.0, 800.0];
+    assert!(
+        (model.pk_param_fn)(&params.theta, &extreme, &s.covariates, 0.0)
+            .values
+            .iter()
+            .any(|v| !v.is_finite()),
+        "the extreme point must be one with a non-finite individual parameter"
+    );
+    let _ = subject_adjoint_packed_gradient(&model, &s, &params, &x, &extreme, true);
+    let failed = kj::plan_failures(&model, std::slice::from_ref(&s));
+    assert!(
+        failed.is_none(),
+        "the extreme η condemned the subject: {failed:?}"
+    );
+    let worst = parity(&model, &s);
+    eprintln!("ss after an extreme η: parity {worst:.3e}");
+    // Measured 1.6e-9; 6x headroom.
+    assert!(worst < 1e-8, "worst relative difference {worst:.2e}");
+    let failed = kj::plan_failures(&model, std::slice::from_ref(&s));
+    assert!(failed.is_none(), "a plan failed later: {failed:?}");
+}

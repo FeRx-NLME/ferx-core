@@ -26370,7 +26370,7 @@ fn is_link(f: &str) -> bool {
 /// ([`coupling_defs`], [`CouplingCtx`]), so a name resolves to the same reaching
 /// definitions here as there. `others` names the other profiled blocks, for the
 /// disjointness rule.
-pub(crate) fn profile_route_check(
+fn profile_route_check(
     stmts: &[Statement],
     readouts: &[(String, Expression)],
     error_lines: &[String],
