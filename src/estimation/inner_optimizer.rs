@@ -4548,6 +4548,15 @@ fn find_ebe_iov_seeded(
     let redone_before = fd_h_redone_on_this_thread();
     let h_matrix = iov_ebe_h_matrix(model, subject, params, &bsv_eta, &kappas_vec);
     let fd_h_redone = fd_h_redone_on_this_thread() > redone_before;
+    // The forward the Jacobian just took at the mode, for the outer gradient's reverse at the
+    // same stacked point (as the non-IOV solve keeps its own).
+    if analytic_iov_inner {
+        let mut stacked = bsv_eta.clone();
+        for k in &kappas_vec {
+            stacked.extend(k.iter().copied());
+        }
+        crate::sens::ode_provider::adjoint::keep_forward(subject, &params.theta, &stacked);
+    }
 
     EbeResult {
         eta: DVector::from_column_slice(&bsv_eta),

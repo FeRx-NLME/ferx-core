@@ -85,6 +85,7 @@ pub(crate) fn debug() -> bool {
     *F.get_or_init(|| std::env::var("FERX_KJIT_DEBUG").is_ok())
 }
 
+
 /// A recorded value: its value (for the recorder's own decisions), its register, and
 /// whether it depends on an input.
 #[derive(Clone, Copy, Debug)]
@@ -2833,6 +2834,144 @@ pub(crate) fn lookup(k: &SubjectKey) -> Lookup {
     Lookup::Found(found)
 }
 
+/// One thread's hot plan lookup: the subject's variants as the thread's last call found them,
+/// keyed by what the call hands over — the addresses of a model and a subject the fit
+/// registered ([`register`]), the widths, the plan's kind and the mixture class — instead of the
+/// [`SubjectKey`] those build, whose fingerprints, registry reads and reference counts cost
+/// more than a closed form's whole value pass (#2786). Valid while the registry and the plan
+/// table are as they were when it was filled: [`PRINTS_VERSION`] moves with every registration
+/// and [`GENERATION`] with every plan, bad mark or dropped scope that changes what a lookup
+/// returns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HotKey {
+    model: usize,
+    subject: usize,
+    n: usize,
+    n_in: usize,
+    kind: u8,
+    class: usize,
+}
+
+impl HotKey {
+    pub(crate) fn new(
+        model: &crate::types::CompiledModel,
+        subject: &crate::types::Subject,
+        n: usize,
+        n_in: usize,
+        kind: u8,
+    ) -> Self {
+        HotKey {
+            model: model as *const _ as usize,
+            subject: subject as *const _ as usize,
+            n,
+            n_in,
+            kind,
+            class: crate::parser::model_parser::current_mixture_class(),
+        }
+    }
+}
+
+/// What a hot entry was filled under.
+#[derive(Clone, Copy)]
+pub(crate) struct HotStamp {
+    prints: usize,
+    gen: usize,
+}
+
+thread_local! {
+    static HOT: RefCell<Option<(HotKey, HotStamp, Option<Desc>, Kernels)>> =
+        const { RefCell::new(None) };
+}
+
+/// A `Hasher` that checks what is written against canonical bytes already kept ([`Desc`]),
+/// writing nothing: a layout's structure compared exactly without building its bytes again.
+struct SameBytes<'a> {
+    rest: &'a [u8],
+    same: bool,
+}
+
+impl std::hash::Hasher for SameBytes<'_> {
+    fn write(&mut self, bytes: &[u8]) {
+        match self.rest.strip_prefix(bytes) {
+            Some(rest) if self.same => self.rest = rest,
+            _ => self.same = false,
+        }
+    }
+    fn finish(&self) -> u64 {
+        unreachable!("canonical bytes are compared, not hashed")
+    }
+}
+
+/// The registry's state now, read before the lookup a [`hot_put`] follows.
+pub(crate) fn hot_stamp() -> HotStamp {
+    HotStamp {
+        prints: PRINTS_VERSION.load(Relaxed),
+        gen: GENERATION.load(Relaxed),
+    }
+}
+
+/// The variants this thread last found for `k`, when nothing they depend on has changed.
+pub(crate) fn hot_get(
+    k: &HotKey,
+    now: HotStamp,
+    lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+) -> Option<Kernels> {
+    #[cfg(test)]
+    if !hot_allowed_in_test() {
+        return None;
+    }
+    HOT.with(|h| match &*h.borrow() {
+        Some((hk, st, want, ks)) if hk == k && st.prints == now.prints && st.gen == now.gen => {
+            // The layout is rebuilt per call: its structure is compared, not its address.
+            let same = match (want, lay) {
+                (None, None) => true,
+                (Some(w), Some(l)) => {
+                    let mut c = SameBytes {
+                        rest: w.bytes(),
+                        same: true,
+                    };
+                    l.canon(&mut c);
+                    c.same && c.rest.is_empty()
+                }
+                _ => false,
+            };
+            same.then(|| ks.clone())
+        }
+        _ => None,
+    })
+}
+
+/// Keep `ks`, found for `k` under `stamp`, for [`hot_get`] — only for a model and a subject
+/// the registry holds, whose addresses then name them for as long as it is unchanged.
+pub(crate) fn hot_put(
+    k: HotKey,
+    stamp: HotStamp,
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    key: &SubjectKey,
+    ks: &Kernels,
+) {
+    #[cfg(test)]
+    if !hot_allowed_in_test() {
+        return;
+    }
+    if registered(model as *const _ as usize).is_some()
+        && registered(subject as *const _ as usize).is_some()
+    {
+        HOT.with(|h| *h.borrow_mut() = Some((k, stamp, key.layout.clone(), ks.clone())));
+    }
+}
+
+/// The test seams that make [`lookup`] answer by a rule of their own are not bypassed.
+#[cfg(test)]
+fn hot_allowed_in_test() -> bool {
+    !FORCE_PLAN_FAIL.get()
+        && FAILING_SUBJECTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty()
+}
+
 /// Mark `k` as failing to plan (`why`): its callers take the finite-difference path, and the
 /// fit reports the subject ([`note_failure`]).
 pub(crate) fn mark_bad(k: &SubjectKey, why: &str) {
@@ -2871,6 +3010,7 @@ pub(crate) fn add(k: &SubjectKey, kernel: Entry) -> Kernels {
     };
     let ks = Arc::new(ks);
     s.insert(k.clone(), Some(ks.clone()));
+    GENERATION.fetch_add(1, Relaxed);
     // This thread's last-subject entry lists the new variant too.
     let gen = GENERATION.load(Relaxed);
     LAST.with(|l| *l.borrow_mut() = Some((gen, k.clone(), ks.clone())));

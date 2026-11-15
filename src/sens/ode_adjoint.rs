@@ -2298,20 +2298,38 @@ fn with_plan_in<R>(
     }
     let (n, n_obs) = (eta.len(), subject.observations.len());
     let n_in = theta.len() + sigma.map_or(0, <[f64]>::len);
-    let mut key = kj::SubjectKey::new(model, subject, n, n_in).with_layout(lay);
-    if sigma.is_some() {
-        key = key.with_kind(SDE_P_KIND);
-    }
     let fits = |p: &PlanArc| p.n_out() == n_obs && p.n_eta() == n && p.n_theta() == n_in;
+    let hot_key = kj::HotKey::new(model, subject, n, n_in, u8::from(sigma.is_some()));
+    let build = || {
+        let key = kj::SubjectKey::new(model, subject, n, n_in).with_layout(lay);
+        if sigma.is_some() {
+            key.with_kind(SDE_P_KIND)
+        } else {
+            key
+        }
+    };
     plan_or_record(
-        model, subject, lay, theta, None, eta, sigma, &key, &fits, serves,
+        model,
+        subject,
+        lay,
+        theta,
+        None,
+        eta,
+        sigma,
+        Some(hot_key),
+        &build,
+        &fits,
+        serves,
     )
 }
 
-/// The subject's plan under `key` that `serves`, else a variant recorded at `(theta, eta)` (the
-/// one lookup and record path of every plan kind): `None` where the subject is bad or the plan
-/// declines. A variant joins the cache once it serves, so a trial point where it cannot (a
-/// recording whose predictions overflow) never evicts a good one.
+/// The subject's plan under the key `build` makes that `serves`, else a variant recorded at
+/// `(theta, eta)` (the one lookup and record path of every plan kind): `None` where the subject
+/// is bad or the plan declines. A variant joins the cache once it serves, so a trial point where
+/// it cannot (a recording whose predictions overflow) never evicts a good one. With a `hot` key
+/// the variants this thread last found for the subject are tried before the key's fingerprints
+/// and registry reads are paid for (`build` runs only on a hot miss, or to record); when they do
+/// not serve, the plans are not tried a second time through the lookup.
 #[allow(clippy::too_many_arguments)]
 fn plan_or_record<R>(
     model: &CompiledModel,
@@ -2321,39 +2339,57 @@ fn plan_or_record<R>(
     nn_z: Option<&[Vec<f64>]>,
     eta: &[f64],
     sigma: Option<&[f64]>,
-    key: &crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey,
+    hot: Option<crate::parser::model_parser::rhs_regcode::kernel_jit::HotKey>,
+    build: &dyn Fn() -> crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey,
     fits: &dyn Fn(&PlanArc) -> bool,
     serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
 ) -> Option<R> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
     use std::sync::atomic::Ordering::Relaxed;
-    match kj::lookup(key) {
-        kj::Lookup::Bad => return None,
-        kj::Lookup::Found(ks) => {
-            for (i, plan) in ks.order().filter(|(_, p)| fits(p)) {
-                if let Some(r) = serves(plan) {
-                    ks.hit(i);
-                    return Some(r);
+    let stamp = kj::hot_stamp();
+    let hot_found = hot.as_ref().and_then(|k| kj::hot_get(k, stamp, lay));
+    let mut key_cell: Option<kj::SubjectKey> = None;
+    let found = match hot_found {
+        Some(ks) => Some(ks),
+        None => {
+            let key = key_cell.insert(build());
+            match kj::lookup(key) {
+                kj::Lookup::Bad => return None,
+                kj::Lookup::Found(ks) => {
+                    if let Some(hk) = hot {
+                        kj::hot_put(hk, stamp, model, subject, key, &ks);
+                    }
+                    Some(ks)
+                }
+                kj::Lookup::Missing => {
+                    if let Some(why) = kj::model_bad(key) {
+                        kj::mark_bad(key, &why);
+                        return None;
+                    }
+                    None
                 }
             }
-            kj::STATS.guard_fail.fetch_add(1, Relaxed);
         }
-        kj::Lookup::Missing => {
-            if let Some(why) = kj::model_bad(key) {
-                kj::mark_bad(key, &why);
-                return None;
+    };
+    if let Some(ks) = found {
+        for (i, plan) in ks.order().filter(|(_, p)| fits(p)) {
+            if let Some(r) = serves(plan) {
+                ks.hit(i);
+                return Some(r);
             }
         }
+        kj::STATS.guard_fail.fetch_add(1, Relaxed);
     }
-    let (plan, sane) = kjit_record(model, subject, lay, theta, eta, nn_z, sigma, key)?;
+    let key = key_cell.unwrap_or_else(build);
+    let (plan, sane) = kjit_record(model, subject, lay, theta, eta, nn_z, sigma, &key)?;
     let r = serves(&plan);
     if r.is_some() {
-        kj::add(key, plan);
+        kj::add(&key, plan);
     } else if sane {
         // A recording that does not serve at its own point never will: recording again on
         // every call would only repeat it. (At a point whose predictions are not finite the
         // guard has no finite values to hold at: that call is declined, not the subject.)
-        kj::mark_bad(key, "the plan does not serve at its own recording point");
+        kj::mark_bad(&key, "the plan does not serve at its own recording point");
     }
     r
 }
@@ -2381,10 +2417,13 @@ pub(super) fn with_plan_nn<R>(
         nn_z.iter().map(Vec::len).collect::<Vec<_>>(),
         sigma.map(<[f64]>::len),
     ));
-    let key = kj::SubjectKey::new(model, subject, eta.len(), n_in)
-        .with_kind(9)
-        .with_variant(shape);
+    let build = || {
+        kj::SubjectKey::new(model, subject, eta.len(), n_in)
+            .with_kind(9)
+            .with_variant(shape.clone())
+    };
     let fits = |p: &PlanArc| p.n_eta() == eta.len() && p.n_theta() == n_in;
+    // No hot entry: its key does not carry the networks' shape variant.
     plan_or_record(
         model,
         subject,
@@ -2393,7 +2432,8 @@ pub(super) fn with_plan_nn<R>(
         Some(nn_z),
         eta,
         sigma,
-        &key,
+        None,
+        &build,
         &fits,
         serves,
     )
