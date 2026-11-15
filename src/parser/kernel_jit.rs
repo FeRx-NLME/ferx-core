@@ -3361,6 +3361,105 @@ impl ChunkProgram {
     }
 }
 
+/// The buffers one interpreted run reads and writes (see [`interpret_func`]).
+#[derive(Clone, Copy)]
+struct Interp {
+    base: *mut f64,
+    idx: *const u32,
+    lits: *const f64,
+    /// Every instruction's value, in SSA order.
+    x: *mut f64,
+    insts: *const Inst,
+    lanes: usize,
+    n_in: usize,
+    rev: bool,
+}
+
+impl Interp {
+    /// Run instructions `from..to`; `adjp` is the adjoint block of the seed being run.
+    ///
+    /// # Safety
+    /// `x` holds a value per instruction, every operand is an earlier instruction, and the
+    /// buffers are as [`Tiered::call_seeds`] requires.
+    #[inline(never)]
+    unsafe fn run(self, from: usize, to: usize, adjp: *mut f64) {
+        let Interp {
+            base,
+            idx,
+            lits,
+            x,
+            insts,
+            lanes,
+            n_in,
+            rev,
+        } = self;
+        let slot = |e: usize| *idx.add(e) as usize * lanes;
+        for at in from..to {
+            let r = |v: ir::V| {
+                debug_assert!((v as usize) < at);
+                *x.add(v as usize)
+            };
+            let val = match *insts.add(at) {
+                Inst::Load { arg, off } => {
+                    let (i, lane) = (off as usize / lanes, off as usize % lanes);
+                    match arg {
+                        0 => *base.add(slot(i) + lane),
+                        2 if lane == 0 => *lits.add(i),
+                        2 | 6 => 0.0,
+                        4 => *adjp.add(slot(i) + lane),
+                        7 => *adjp.add(slot(n_in + i) + lane),
+                        _ => f64::NAN,
+                    }
+                }
+                Inst::Const(bits) => f64::from_bits(bits),
+                Inst::Add(a, b) => r(a) + r(b),
+                Inst::Sub(a, b) => r(a) - r(b),
+                Inst::Mul(a, b) => r(a) * r(b),
+                Inst::Div(a, b) => r(a) / r(b),
+                Inst::Neg(a) => -r(a),
+                Inst::Abs(a) => r(a).abs(),
+                Inst::Floor(a) => r(a).floor(),
+                Inst::Ceil(a) => r(a).ceil(),
+                Inst::Call1(ir::Shim1::Sqrt, a) => r(a).sqrt(),
+                Inst::Call1(s, a) => (s.f())(r(a)),
+                Inst::Powf(a, b) => r(a).powf(r(b)),
+                Inst::Gamma {
+                    upper,
+                    i,
+                    j,
+                    a,
+                    x: y,
+                } => (ir::gamma_shim(upper, i, j))(r(a), r(y)),
+                Inst::Cmp(cc, a, b) => f64::from(u8::from(cc.holds(r(a), r(b)))),
+                Inst::And(a, b) => f64::from(u8::from(r(a) != 0.0 && r(b) != 0.0)),
+                Inst::Or(a, b) => f64::from(u8::from(r(a) != 0.0 || r(b) != 0.0)),
+                Inst::Select(c, a, b) => {
+                    if r(c) != 0.0 {
+                        r(a)
+                    } else {
+                        r(b)
+                    }
+                }
+                Inst::StopGrad(a) => r(a),
+                Inst::HostArg(a) => ir::host::arg_native(r(a)),
+                Inst::Host(h) => ir::host::call_native(h.index() as f64),
+                Inst::HostOut(k) => ir::host::out_native(k as f64),
+                Inst::Store { arg, off, v } => {
+                    let (j, lane) = (off as usize / lanes, off as usize % lanes);
+                    let y = r(v);
+                    match arg {
+                        3 if !rev => *base.add(slot(n_in + j) + lane) = y,
+                        4 if rev => *adjp.add(slot(j) + lane) = y,
+                        _ => {}
+                    }
+                    y
+                }
+            };
+            *x.add(at) = val;
+        }
+    }
+}
+
 thread_local! {
     /// [`interpret_func`]'s values, one per instruction.
     static FUNC_VALS: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
@@ -3387,7 +3486,6 @@ unsafe fn interpret_func(
     seeds: usize,
     stride: usize,
 ) {
-    let slot = |e: usize| *idx.add(e) as usize * lanes;
     FUNC_VALS.with(|vals| {
         let mut x = vals.borrow_mut();
         // Every value is stored before an instruction reads it (a function is in SSA order),
@@ -3395,75 +3493,23 @@ unsafe fn interpret_func(
         if x.len() < f.insts.len() {
             x.resize(f.insts.len(), 0.0);
         }
-        let run = |x: &mut Vec<f64>, from: usize, to: usize, adjp: *mut f64| {
-            for at in from..to {
-                let r = |v: ir::V| x[v as usize];
-                let val = match f.insts[at] {
-                    Inst::Load { arg, off } => {
-                        let (i, lane) = (off as usize / lanes, off as usize % lanes);
-                        match arg {
-                            0 => *base.add(slot(i) + lane),
-                            2 if lane == 0 => *lits.add(i),
-                            2 | 6 => 0.0,
-                            4 => *adjp.add(slot(i) + lane),
-                            7 => *adjp.add(slot(n_in + i) + lane),
-                            _ => f64::NAN,
-                        }
-                    }
-                    Inst::Const(bits) => f64::from_bits(bits),
-                    Inst::Add(a, b) => r(a) + r(b),
-                    Inst::Sub(a, b) => r(a) - r(b),
-                    Inst::Mul(a, b) => r(a) * r(b),
-                    Inst::Div(a, b) => r(a) / r(b),
-                    Inst::Neg(a) => -r(a),
-                    Inst::Abs(a) => r(a).abs(),
-                    Inst::Floor(a) => r(a).floor(),
-                    Inst::Ceil(a) => r(a).ceil(),
-                    Inst::Call1(ir::Shim1::Sqrt, a) => r(a).sqrt(),
-                    Inst::Call1(s, a) => (s.f())(r(a)),
-                    Inst::Powf(a, b) => r(a).powf(r(b)),
-                    Inst::Gamma {
-                        upper,
-                        i,
-                        j,
-                        a,
-                        x: y,
-                    } => (ir::gamma_shim(upper, i, j))(r(a), r(y)),
-                    Inst::Cmp(cc, a, b) => f64::from(u8::from(cc.holds(r(a), r(b)))),
-                    Inst::And(a, b) => f64::from(u8::from(r(a) != 0.0 && r(b) != 0.0)),
-                    Inst::Or(a, b) => f64::from(u8::from(r(a) != 0.0 || r(b) != 0.0)),
-                    Inst::Select(c, a, b) => {
-                        if r(c) != 0.0 {
-                            r(a)
-                        } else {
-                            r(b)
-                        }
-                    }
-                    Inst::StopGrad(a) => r(a),
-                    Inst::HostArg(a) => ir::host::arg_native(r(a)),
-                    Inst::Host(h) => ir::host::call_native(h.index() as f64),
-                    Inst::HostOut(k) => ir::host::out_native(k as f64),
-                    Inst::Store { arg, off, v } => {
-                        let (j, lane) = (off as usize / lanes, off as usize % lanes);
-                        let y = r(v);
-                        match arg {
-                            3 if !rev => *base.add(slot(n_in + j) + lane) = y,
-                            4 if rev => *adjp.add(slot(j) + lane) = y,
-                            _ => {}
-                        }
-                        y
-                    }
-                };
-                x[at] = val;
-            }
+        let it = Interp {
+            base,
+            idx,
+            lits,
+            x: x.as_mut_ptr(),
+            insts: f.insts.as_ptr(),
+            lanes,
+            n_in,
+            rev,
         };
         if rev {
-            run(&mut x, 0, prefix, adj);
+            it.run(0, prefix, adj);
             for sd in 0..seeds {
-                run(&mut x, prefix, f.insts.len(), adj.add(sd * stride));
+                it.run(prefix, f.insts.len(), adj.add(sd * stride));
             }
         } else {
-            run(&mut x, 0, f.insts.len(), adj);
+            it.run(0, f.insts.len(), adj);
         }
     });
 }
@@ -5134,12 +5180,18 @@ fn fold_chunk(src: &Func, layout: Layout, spec: &[(DirMask, u16)]) -> Func {
 
 /// Kernels above this many instructions are lowered as a chain of segments ([`SegPlan`]). Below
 /// it one function's frame is bounded by the kernel itself — the single-pass allocator gives each
-/// value it ever spills a 16-byte slot of its own, a few tens of KiB at 4k instructions — and
-/// is left alone, which is also every kernel the backtracking tier ([`TIER3_MAX_INSTS`])
-/// compiles. Above it the frame grows with the instruction count: a 150k-instruction kernel (an
+/// value it ever spills a 16-byte slot of its own, at most 384 KiB at this size (the test pins a
+/// kernel with every value live at 512 KiB of stack under 64 KiB of callers) — and is left
+/// alone. Above it the frame grows with the instruction count: a 150k-instruction kernel (an
 /// SDE steady-state walk's second-order chunk) took a frame over 1 MiB, more than a default
 /// 2 MiB thread stack has left under a deep caller.
-const SEG_MIN_INSTS: usize = 4096;
+///
+/// A segment is lowered scalar, without the packed `f64x2` lanes (`simd::packs`) a whole kernel
+/// gets, and every value that crosses a boundary goes through memory, so the cut costs run time:
+/// at 4096 the 7.9k–18k-instruction kernels of `pk2_ode` and `pk1_agq3` (`--threads 2`) ran
+/// 3–6 % more instructions than whole, and `iov_ode` 7 %. The point is the size above which a
+/// frame is a hazard, not the size at which cutting is cheap.
+const SEG_MIN_INSTS: usize = 24576;
 /// The low bit of [`Tiered::native`] of a segmented kernel.
 const SEGMENTED: usize = 1;
 /// A segment's instructions: its frame is bounded by this, not by the kernel.
@@ -5806,17 +5858,22 @@ mod seg_tests {
     /// `M` inputs loaded first and summed last (every value live across the kernel), the sum
     /// stored to the output slot `M`.
     fn sum_func(l: usize) -> Func {
+        sum_func_n(M, l)
+    }
+
+    /// [`sum_func`] over `m` inputs: `3m` instructions.
+    fn sum_func_n(m: usize, l: usize) -> Func {
         let mut f = Func::new(4);
-        for i in 0..M {
+        for i in 0..m {
             f.insts.push(Inst::Load {
                 arg: 0,
                 off: (i * l) as u32,
             });
         }
-        // Input `i` times input `M − 1 − i`: at the middle every input is still live.
+        // Input `i` times input `m − 1 − i`: at the middle every input is still live.
         let mut acc = 0 as ir::V;
-        for i in 0..M {
-            f.insts.push(Inst::Mul(i as ir::V, (M - 1 - i) as ir::V));
+        for i in 0..m {
+            f.insts.push(Inst::Mul(i as ir::V, (m - 1 - i) as ir::V));
             let m = (f.insts.len() - 1) as ir::V;
             if i == 0 {
                 acc = m;
@@ -5935,11 +5992,13 @@ mod seg_tests {
             let mut buf = inp.clone();
             let (bp, ip, tr) = (buf.as_mut_ptr() as usize, idx.as_ptr() as usize, &t);
             // 256 KiB stack, 64 KiB used by the callers: the kernel's own frame would be
-            // 8 B x 40k = 320 KiB if its values lived on the stack.
-            // The compile runs on the small stack too: each segment is a small function.
+            // 8 B x 40k = 320 KiB if its values lived on the stack. The compile runs on the
+            // test thread: what is bounded here is the native frame, and an unoptimized build's
+            // compiler frames alone exceed this stack (production compiles optimized, on the
+            // caller's or a fit-pool thread).
+            t.promote(quick, opt);
+            assert_ne!(t.native.load(Relaxed), 0, "{opt} compiled");
             on_small_stack(256 << 10, 64, move || unsafe {
-                tr.promote(quick, opt);
-                assert_ne!(tr.native.load(Relaxed), 0, "{opt} compiled");
                 tr.call(
                     bp as *mut f64,
                     std::ptr::null_mut(),
@@ -5948,6 +6007,55 @@ mod seg_tests {
                 );
             });
             assert_eq!(buf[M * l].to_bits(), want.to_bits(), "{opt}");
+        }
+    }
+
+    /// The largest kernel left whole ([`SEG_MIN_INSTS`]) has every value live across it, the worst
+    /// case for the single-pass allocator's spill slots: its frame still fits the stack a deep
+    /// caller leaves (512 KiB stack, 64 KiB used), at both quick tiers. Past it the kernel is cut
+    /// ([`SegPlan`]); below it, left whole, it keeps the packed `f64x2` lowering a segment does not.
+    #[test]
+    fn a_kernel_at_the_segmentation_threshold_is_whole_and_runs_on_a_small_stack() {
+        let m = SEG_MIN_INSTS / 3;
+        let l = layout().lanes();
+        let t = Tiered::new(sum_func_n(m, l), layout(), m, false, 0);
+        assert!(t.f.insts.len() <= SEG_MIN_INSTS && t.f.insts.len() + 3 > SEG_MIN_INSTS);
+        assert!(t
+            .spill
+            .get_or_init(|| SegPlan::new(&t.f, t.rev, t.prefix))
+            .is_none());
+        let idx: Vec<u32> = (0..=m as u32).collect();
+        let inp: Vec<f64> = (0..(m + 1) * l)
+            .map(|k| 0.5 + (k as f64 * 0.37).sin())
+            .collect();
+        let mut want = inp.clone();
+        // SAFETY: `idx` names `m + 1` lane blocks of `want`.
+        unsafe {
+            t.interpret(
+                want.as_mut_ptr(),
+                std::ptr::null_mut(),
+                idx.as_ptr(),
+                [].as_ptr(),
+                1,
+                0,
+            )
+        };
+        let want = want[m * l];
+        assert!(want.is_finite() && want != inp[m * l]);
+        for (quick, opt) in [(true, "none"), (true, "speed")] {
+            t.promote(quick, opt);
+            assert_ne!(t.native.load(Relaxed), 0, "{opt} compiled");
+            let mut buf = inp.clone();
+            let (bp, ip, tr) = (buf.as_mut_ptr() as usize, idx.as_ptr() as usize, &t);
+            on_small_stack(512 << 10, 64, move || unsafe {
+                tr.call(
+                    bp as *mut f64,
+                    std::ptr::null_mut(),
+                    ip as *const u32,
+                    [].as_ptr(),
+                );
+            });
+            assert_eq!(buf[m * l].to_bits(), want.to_bits(), "{opt}");
         }
     }
 
@@ -5990,8 +6098,8 @@ mod seg_tests {
                 idx.as_ptr() as usize,
                 &t,
             );
+            t.promote(quick, opt);
             on_small_stack(256 << 10, 64, move || unsafe {
-                tr.promote(quick, opt);
                 assert_ne!(tr.native.load(Relaxed), 0, "{opt} compiled");
                 tr.call_seeds(
                     bp as *mut f64,
