@@ -3075,6 +3075,73 @@ pub(crate) fn add_prepared_input_rate_forcing<
     since: T,
     dy: &mut [T],
 ) {
+    add_input_rate_forcing_core(
+        ode,
+        prepared,
+        doses,
+        dose_lagtimes,
+        dose_f_bio,
+        infusion_windows,
+        gate,
+        t,
+        since,
+        &[],
+        dy,
+    );
+}
+
+/// [`add_prepared_input_rate_forcing`] for a segment integrated in the cumulative frame
+/// ([`CumulativeInputs`]): the `(forcing, dose)` pairs that frame delivers (`framed`,
+/// [`CumulativeInputs::framed`]) are left out, since the frame's state shift already carries
+/// their whole input.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_input_rate_forcing_except_cumulative<
+    T: crate::sens::num::PkNum,
+    G: crate::sens::num::PkNum,
+>(
+    ode: &OdeSpec,
+    prepared: &PreparedForcings<T>,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[T],
+    dose_f_bio: &[T],
+    infusion_windows: &[Option<T>],
+    gate: ResetGate<G>,
+    t: T,
+    since: T,
+    framed: &[(usize, usize)],
+    dy: &mut [T],
+) {
+    add_input_rate_forcing_core(
+        ode,
+        prepared,
+        doses,
+        dose_lagtimes,
+        dose_f_bio,
+        infusion_windows,
+        gate,
+        t,
+        since,
+        framed,
+        dy,
+    );
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::num::PkNum>(
+    ode: &OdeSpec,
+    prepared: &PreparedForcings<T>,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[T],
+    dose_f_bio: &[T],
+    infusion_windows: &[Option<T>],
+    gate: ResetGate<G>,
+    t: T,
+    since: T,
+    framed: &[(usize, usize)],
+    dy: &mut [T],
+) {
     debug_assert!(
         prepared.per_dose.is_none_or(|n| n == doses.len()),
         "per-dose forcings built for {:?} doses, applied to {}",
@@ -3101,6 +3168,9 @@ pub(crate) fn add_prepared_input_rate_forcing<
         let mut acc = T::from_f64(0.0);
         for (k, d) in doses.iter().enumerate() {
             if d.cmt_idx() != forcing.cmt || !gate.live(doses, k) {
+                continue;
+            }
+            if framed.contains(&(fi, k)) {
                 continue;
             }
             let dose_rate = prepared.get(fi, k);
@@ -3238,6 +3308,187 @@ pub(crate) fn add_prepared_input_rate_forcing<
     }
 }
 
+/// Whether dose `d` into a forcing of `kind` can be delivered in the **cumulative frame**
+/// ([`CumulativeInputs`]) rather than as a pointwise rate: a plain bolus into a Weibull kernel
+/// (a steady-state train and an infusion keep the pointwise path: their kernel enters through the
+/// periodic sum / the convolved `R_in_inf`). It is delivered there when its onset is lagged
+/// (`lag + route lag > 0`) and the density is infinite at it
+/// ([`PreparedInputRate::frame_kernel`], `β < 1`): the one place the pointwise path's derivative
+/// is not the integral's. The frame integrates `v = u − shift`, so its tolerance is relative to
+/// `|v|`, and it is used where nothing cheaper is exact.
+#[inline]
+pub(crate) fn cumulative_dose(kind: crate::pk::absorption::InputRateKind, d: &DoseEvent) -> bool {
+    kind == crate::pk::absorption::InputRateKind::Weibull
+        && !(d.ss && d.ii > 0.0)
+        && !d.is_infusion()
+}
+
+/// Whether the segment after the lagged onset of dose `d` into a forcing of `kind` can be
+/// anchored at the true onset (`ode_provider`'s `onset_shift`): a plain bolus into a Weibull or
+/// transit kernel, whose density is zero or infinite there and whose slope is singular for
+/// `β < 2` / `n < 1`. The segment then reads the kernel at an age with no jet.
+#[inline]
+pub(crate) fn anchorable_dose(kind: crate::pk::absorption::InputRateKind, d: &DoseEvent) -> bool {
+    use crate::pk::absorption::InputRateKind::{Transit, Weibull};
+    matches!(kind, Weibull | Transit) && !(d.ss && d.ii > 0.0) && !d.is_infusion()
+}
+
+/// The absorbed mass of a lagged Weibull (`β < 1`) bolus as a **state shift**, for one
+/// integration segment.
+///
+/// The pointwise forcing integrates `R_in(τ) = D·g(τ)` at the stage times, and for `β < 1` the
+/// density `g ~ τ^(β−1)` is infinite (and its slope non-integrable) at the onset: the derivative
+/// of that computation with respect to the onset (an estimated lag) is the derivative of a
+/// quadrature of a singular integrand, not of the integral. Here the segment is
+/// integrated in `v = u − Σ D·(S_a − S(τ))·e`, with `S = 1 − G` the not-yet-absorbed fraction
+/// and `S_a` its value at the segment start: since `d/dt (D·(S_a − S)) = D·g`, the density
+/// cancels exactly and `v' = f(v + shift(t))` reads only `S` — continuous at the onset, with
+/// slope `−g` — for any right-hand side `f`, linear or not. `u = v + shift(t)` is recovered at
+/// every saved point and at the segment end; the shift is zero at the start, so the state
+/// carried between segments is the physical one.
+///
+/// One implementation for every number type: the production `f64` segment
+/// ([`SegmentForcing`]) and the analytic walks build it from the same prepared forcings, so the
+/// value and the plan's derivatives are those of one computation.
+pub(crate) struct CumulativeInputs<T> {
+    items: Vec<CumulativeItem<T>>,
+    /// The `(forcing, dose)` pairs of `items`, for the pointwise loop to leave out.
+    framed: Vec<(usize, usize)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: the cumulative frame off, every dose on the pointwise forcing it replaced
+    /// (the A side of the value comparison, and the mutation the parity tests must see).
+    pub(crate) static CUMULATIVE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct CumulativeItem<T> {
+    cmt: usize,
+    /// `frac · F · amt`.
+    mass: T,
+    /// The dose's effective onset `t_dose + lag + route lag`.
+    t_eff: T,
+    prep: PreparedInputRate<T>,
+    /// `S` at the segment start (`1` before the onset).
+    s_start: T,
+}
+
+impl<T: crate::sens::num::PkNum> CumulativeInputs<T> {
+    /// No dose in the cumulative frame.
+    pub(crate) fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            framed: Vec::new(),
+        }
+    }
+
+    /// The cumulative-frame doses live in a segment starting at `since`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn for_segment<G: crate::sens::num::PkNum>(
+        ode: &OdeSpec,
+        prepared: &PreparedForcings<T>,
+        doses: &[DoseEvent],
+        dose_lagtimes: &[T],
+        dose_f_bio: &[T],
+        gate: ResetGate<G>,
+        since: T,
+    ) -> Self {
+        let mut items = Vec::new();
+        let mut framed = Vec::new();
+        if prepared.is_empty() {
+            return Self { items, framed };
+        }
+        #[cfg(test)]
+        if CUMULATIVE_OFF.with(|c| c.get()) {
+            return Self { items, framed };
+        }
+        for (fi, forcing) in ode.input_rate.iter().enumerate() {
+            if forcing.kind != crate::pk::absorption::InputRateKind::Weibull {
+                continue;
+            }
+            for (k, d) in doses.iter().enumerate() {
+                if d.cmt_idx() != forcing.cmt
+                    || forcing.cmt >= ode.n_states
+                    || !gate.live(doses, k)
+                    || !cumulative_dose(forcing.kind, d)
+                {
+                    continue;
+                }
+                let dr = prepared.get(fi, k);
+                let lag = dose_lagtimes.get(k).copied().unwrap_or(T::from_f64(0.0));
+                // Only a lagged onset with an infinite density is framed (see [`cumulative_dose`]).
+                if (lag + dr.route_lag).br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
+                    || !dr.prep.frame_kernel()
+                {
+                    continue;
+                }
+                let t_eff = T::from_f64(d.time) + lag + dr.route_lag;
+                let mass = dr.frac
+                    * (dose_f_bio.get(k).copied().unwrap_or(T::from_f64(1.0)) * T::from_f64(d.amt));
+                framed.push((fi, k));
+                items.push(CumulativeItem {
+                    cmt: forcing.cmt,
+                    mass,
+                    t_eff,
+                    prep: dr.prep,
+                    s_start: Self::survival_at(&dr.prep, since - t_eff),
+                });
+            }
+        }
+        Self { items, framed }
+    }
+
+    /// The `(forcing, dose)` pairs this segment delivers in the frame.
+    pub(crate) fn framed(&self) -> &[(usize, usize)] {
+        &self.framed
+    }
+
+    /// No dose of this segment is delivered in the cumulative frame.
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// `S(τ)`, `1` for `τ ≤ 0` (not yet begun). A recording type decides that by selection: the
+    /// stage time moves inside an ODE step, and the kernel is read at a safe age where it is not
+    /// taken. A zero-age stage — the first of a segment that opens at the onset — takes the
+    /// constant branch: `S` has no jet there, the limit of a stage `c·h → 0` of a step whose
+    /// onset moves with it.
+    #[inline]
+    fn survival_at(prep: &PreparedInputRate<T>, tau: T) -> T {
+        use crate::sens::num::BranchCmp::Gt;
+        let (zero, one) = (T::from_f64(0.0), T::from_f64(1.0));
+        if T::RECORDS_BRANCHES {
+            let safe = T::select_if(Gt, tau, zero, tau, one);
+            T::select_if(Gt, tau, zero, prep.survival(safe), one)
+        } else if tau.plain() <= 0.0 {
+            one
+        } else {
+            prep.survival(tau)
+        }
+    }
+
+    /// Add the physical input rate `Σ D·g(t − t_eff)` of these doses — the time derivative of
+    /// [`Self::add_shift`] — to `out`.
+    #[inline]
+    pub(crate) fn add_rate(&self, t: T, out: &mut [T]) {
+        for it in &self.items {
+            out[it.cmt] = out[it.cmt] + it.prep.rate(t - it.t_eff, it.mass);
+        }
+    }
+
+    /// Add the shift `Σ D·(S_a − S(t − t_eff))` to `u`: `u = v + shift`, or, with `u` zeroed,
+    /// the shift itself.
+    #[inline]
+    pub(crate) fn add_shift(&self, t: T, u: &mut [T]) {
+        for it in &self.items {
+            let s = Self::survival_at(&it.prep, t - it.t_eff);
+            u[it.cmt] = u[it.cmt] + it.mass * (it.s_start - s);
+        }
+    }
+}
+
 /// The single seam that wraps a model's user RHS with the two dose-driven
 /// forcing terms shared by **all** ODE integration paths: the infusion `+rate`
 /// injection and the built-in absorption input-rate forcing (`R_in`,
@@ -3291,8 +3542,18 @@ fn forced<'a>(
     ode: &'a OdeSpec,
     force: &'a SegmentForcing<'a>,
 ) -> impl Fn(&[f64], &[f64], f64, &mut [f64]) + 'a {
+    // The state the model reads, in the cumulative frame: `v + shift(t)`.
+    let scratch = std::cell::RefCell::new(Vec::<f64>::new());
     move |y: &[f64], p: &[f64], t: f64, dy: &mut [f64]| {
-        (ode.rhs)(y, p, t, dy);
+        if force.cum.is_empty() {
+            (ode.rhs)(y, p, t, dy);
+        } else {
+            let mut u = scratch.borrow_mut();
+            u.clear();
+            u.extend_from_slice(y);
+            force.cum.add_shift(t, &mut u);
+            (ode.rhs)(&u, p, t, dy);
+        }
         force.apply(t, dy);
     }
 }
@@ -3352,12 +3613,34 @@ fn forced_jac<'a>(
             if u.len() < n {
                 return false;
             }
+            // A cumulative-frame segment steps on `v = u − shift(t)`: the model's tangents are
+            // those at the physical `u = v + shift(t)`, and `f_t` gains `J·shift'(t)` (below).
+            let shifted: Vec<f64>;
+            let u: &[f64] = if force.is_cumulative() {
+                let mut v = u.to_vec();
+                force.cum.add_shift(t, &mut v);
+                shifted = v;
+                &shifted
+            } else {
+                u
+            };
             if !native.as_ref().is_some_and(|nj| nj.eval(u, p, t, jac, ft)) {
                 jet_jacobian(prog, u, p, t, !autonomous, jac, ft);
             }
+            if force.is_cumulative() {
+                let mut r = vec![0.0; n];
+                force.cum.add_rate(t, &mut r);
+                for (c, &rc) in r.iter().enumerate() {
+                    if rc != 0.0 {
+                        for i in 0..n {
+                            ft[i] += jac[i * n + c] * rc;
+                        }
+                    }
+                }
+            }
             if let Some((prepared, lagged, f_bio)) = &rates {
                 let mut dy = vec![lift1(0.0); n];
-                add_prepared_input_rate_forcing(
+                add_input_rate_forcing_except_cumulative::<D1, f64>(
                     ode,
                     prepared,
                     force.doses,
@@ -3367,6 +3650,7 @@ fn forced_jac<'a>(
                     force.gate,
                     D1 { v: t, g: [1.0] },
                     lift1(force.gate.t_seg),
+                    force.cum.framed(),
                     &mut dy,
                 );
                 for i in 0..n {
@@ -3469,6 +3753,10 @@ impl<'a> DirectStep<'a> {
 /// The [`DirectStep`] of `forced(ode, force)`, when the spec's RHS is its program's own
 /// closure and that program has an `f64` native function.
 fn direct_step<'a>(ode: &'a OdeSpec, force: &'a SegmentForcing<'a>) -> Option<DirectStep<'a>> {
+    // The native code reads the state as given: a cumulative-frame segment shifts it first.
+    if force.is_cumulative() {
+        return None;
+    }
     let rhs = ode.rhs_program.as_ref()?.direct_f64(&*ode.rhs)?;
     Some(DirectStep { rhs, force })
 }
@@ -3536,6 +3824,7 @@ fn forcing_adder<'a>(
         infusions,
         zero_order,
         off: &[],
+        cum: CumulativeInputs::empty(),
     }
 }
 
@@ -3639,9 +3928,43 @@ pub(crate) struct SegmentForcing<'a> {
     zero_order: &'a [(usize, f64)],
     /// Compartments off for this segment (#2732), held at zero whatever flows at them.
     off: &'a [usize],
+    /// The doses this segment integrates in the cumulative frame ([`CumulativeInputs`]); empty
+    /// unless [`Self::cumulative`] built it, and then [`Self::apply`] leaves those doses out.
+    cum: CumulativeInputs<f64>,
 }
 
 impl<'a> SegmentForcing<'a> {
+    /// This forcing with the segment's Weibull / transit boluses delivered in the cumulative
+    /// frame ([`CumulativeInputs`]): the caller integrates `v = u − shift` through
+    /// [`forced`] and reads the physical state back with [`Self::physical`].
+    fn cumulative(self) -> Self {
+        let lags: Vec<f64> = self.dose_lagtimes.to_vec();
+        let cum = CumulativeInputs::for_segment(
+            self.ode,
+            self.prepared,
+            self.doses,
+            &lags,
+            self.dose_f_bio,
+            self.gate,
+            self.gate.t_seg,
+        );
+        Self { cum, ..self }
+    }
+
+    /// The physical state at a saved point of this segment's integration: `v + shift(t)` in
+    /// the cumulative frame, the point's own state otherwise.
+    pub(crate) fn physical(&self, pt: &crate::ode::solver::SolPoint) -> Vec<f64> {
+        let mut u = pt.u.clone();
+        self.cum.add_shift(pt.t, &mut u);
+        u
+    }
+
+    /// `u` (the cumulative-frame state at `t`) as the physical state, in place.
+    #[cfg(feature = "survival")]
+    pub(crate) fn to_physical(&self, t: f64, u: &mut [f64]) {
+        self.cum.add_shift(t, u);
+    }
+
     /// Whether [`Self::apply`] adds nothing at any time.
     pub(crate) fn is_noop(&self) -> bool {
         self.zero_order.is_empty()
@@ -3658,6 +3981,11 @@ impl<'a> SegmentForcing<'a> {
     /// step) discards the row, and the linear path reads a zero row of `A` from it.
     fn holding(self, off: &'a [usize]) -> Self {
         Self { off, ..self }
+    }
+
+    /// Whether this segment integrates in the cumulative frame.
+    pub(crate) fn is_cumulative(&self) -> bool {
+        !self.cum.is_empty()
     }
 
     /// Add the forcing at time `t` to `dy`.
@@ -3695,7 +4023,7 @@ impl<'a> SegmentForcing<'a> {
             }
         }
         if !self.prepared.is_empty() {
-            add_prepared_input_rate_forcing(
+            add_input_rate_forcing_except_cumulative::<f64, f64>(
                 self.ode,
                 self.prepared,
                 self.doses,
@@ -3705,6 +4033,7 @@ impl<'a> SegmentForcing<'a> {
                 self.gate,
                 t,
                 self.gate.t_seg,
+                self.cum.framed(),
                 dy,
             );
         }
@@ -4963,7 +5292,8 @@ fn integrate_segment(
         InfusionInput::Spanning(active),
         &zero_order,
     )
-    .holding(off);
+    .holding(off)
+    .cumulative();
     let wrapped_rhs = forced(ode, &force);
     let jac = forced_jac(ode, &force, autonomous);
     let direct = direct_step(ode, &force);
@@ -4980,13 +5310,16 @@ fn integrate_segment(
         auto_state,
     );
 
+    // The cumulative frame's `v` is read back as the physical state at each saved point.
+    let physical = |pt: &crate::ode::solver::SolPoint| force.physical(pt);
+
     // Extract predictions and update state
     for pt in &sol {
         if let Some(obs_idxs) = obs_map.get(&pt.t.to_bits()) {
             record_observations(
                 ode,
                 obs_idxs,
-                &pt.u,
+                &physical(pt),
                 pk_params_flat,
                 theta,
                 eta,
@@ -4999,13 +5332,13 @@ fn integrate_segment(
 
     // State at end of segment
     if let Some(last) = sol.last() {
-        u.copy_from_slice(&last.u);
+        u.copy_from_slice(&physical(last));
     }
 
     // #570: full interpolated state at each requested soft time, in `chz_times`
     // order. Empty (just an empty Vec, no heap alloc) on the `chz_times = &[]` hot
     // path, so existing callers ignore a no-op return.
-    soft.into_iter().map(|p| p.u).collect()
+    soft.iter().map(physical).collect()
 }
 
 /// Dose events are handled as state discontinuities between integration segments.
@@ -9334,7 +9667,8 @@ fn event_driven_walk(
                 InfusionInput::Spanning(active),
                 &zero_order,
             )
-            .holding(&off_states);
+            .holding(&off_states)
+            .cumulative();
             let wrapped_rhs = forced(ode, &force);
             let jac = forced_jac(ode, &force, autonomous);
             let direct = direct_step(ode, &force);
@@ -9352,7 +9686,7 @@ fn event_driven_walk(
                 &mut auto_state,
             );
             if let Some(last) = sol.last() {
-                u.copy_from_slice(&last.u);
+                u.copy_from_slice(&force.physical(last));
             }
             cur_t = t_event;
         }
@@ -9878,7 +10212,8 @@ pub fn ode_predictions_with_states(
             &prepared,
             InfusionInput::Gated(gated),
             &zero_order,
-        );
+        )
+        .cumulative();
         let wrapped_rhs = forced(ode, &force);
         let jac = forced_jac(ode, &force, autonomous);
         let direct = direct_step(ode, &force);
@@ -9898,7 +10233,7 @@ pub fn ode_predictions_with_states(
                 record_observations(
                     ode,
                     obs_idxs,
-                    &pt.u,
+                    &force.physical(pt),
                     pk_params_flat,
                     theta,
                     eta,
@@ -9910,7 +10245,7 @@ pub fn ode_predictions_with_states(
         }
 
         if let Some(last) = sol.last() {
-            u.copy_from_slice(&last.u);
+            u.copy_from_slice(&force.physical(last));
         }
     }
 
@@ -10639,7 +10974,8 @@ fn ode_dense_solve_states_seeded(
             &prepared,
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,
-        );
+        )
+        .cumulative();
         let wrapped_rhs = forced(ode, &force);
         let jac = forced_jac(ode, &force, autonomous);
         let direct = direct_step(ode, &force);
@@ -10657,13 +10993,13 @@ fn ode_dense_solve_states_seeded(
         for pt in &sol {
             if let Some(idxs) = saveat_map.get(&pt.t.to_bits()) {
                 for &i in idxs {
-                    result[i] = pt.u.clone();
+                    result[i] = force.physical(pt);
                 }
             }
         }
 
         if let Some(last) = sol.last() {
-            u.copy_from_slice(&last.u);
+            u.copy_from_slice(&force.physical(last));
         }
     }
 
@@ -10853,7 +11189,8 @@ pub(crate) fn ode_solve_until_chz_threshold(
             &prepared,
             InfusionInput::Gated(forcings.gated),
             &forcings.zero_order,
-        );
+        )
+        .cumulative();
         let wrapped_rhs = forced(ode, &force);
         let jac = forced_jac(ode, &force, autonomous);
         let direct = direct_step(ode, &force);
@@ -10872,7 +11209,8 @@ pub(crate) fn ode_solve_until_chz_threshold(
             Some(&labels),
         ) {
             ThresholdCrossing::Crossed(t) => return ThresholdOutcome::Crossed(t),
-            ThresholdCrossing::ReachedEnd => {} // u advanced; carry into next segment
+            // `u` advanced (in the cumulative frame, if any): carry it into the next segment.
+            ThresholdCrossing::ReachedEnd => force.to_physical(t_end, &mut u),
             ThresholdCrossing::Failed(why) => return ThresholdOutcome::SolveFailed(why),
         }
     }

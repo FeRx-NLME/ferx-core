@@ -4223,7 +4223,29 @@ fn scope_probe_sources() -> Vec<(&'static str, String, Option<bool>)> {
                 "  y = central / V\n",
                 "  theta TVTD(2.0, 0.05, 24.0)\n  theta TVBETA(1.5, 0.1, 10.0)\n  theta TVLAG(0.5, 0.01, 5.0)\n",
             ),
-            Some(false),
+            Some(true),
+        ),
+        (
+            "weibull (beta < 1) + route lag",
+            ode(
+                "  d/dt(central) = weibull(td=TD, beta=BETA, lag=LAG) - CL/V*central\n",
+                "  TD = TVTD\n  BETA = TVBETA\n  LAG = TVLAG\n",
+                "",
+                "  y = central / V\n",
+                "  theta TVTD(2.0, 0.05, 24.0)\n  theta TVBETA(0.5, 0.1, 10.0)\n  theta TVLAG(0.5, 0.01, 5.0)\n",
+            ),
+            Some(true),
+        ),
+        (
+            "transit (n < 1) + compartment lag",
+            ode(
+                "  d/dt(central) = transit(n=N, mtt=MTT) - CL/V*central\n",
+                "  MTT = TVMTT\n  N = TVN\n  ALAG1 = TVLAG\n",
+                "",
+                "  y = central / V\n",
+                "  theta TVMTT(2.0, 0.05, 24.0)\n  theta TVN(0.5, 0.1, 10.0)\n  theta TVLAG(0.5, 0.01, 5.0)\n",
+            ),
+            Some(true),
         ),
     ]
 }
@@ -4903,6 +4925,247 @@ fn ss_dose_into_a_route_lagged_zero_order_window_matches_reconverged_fd() {
             eprintln!("{label}: ∂f/∂η {jac:.2e}; FOCEI gradient vs reconverged FD {grad:.2e}");
             // Measured 7.7e-8 on Linux.
             assert!(grad < 1e-6, "{label}: gradient {grad:.2e}");
+        }
+    }
+}
+
+// ---- Weibull / transit absorption under a compartment or route lag (AD everywhere, G5) -------
+
+/// One-compartment ODE model absorbed through `weibull(td, beta)` or `transit(n, mtt)` with an
+/// estimated `lag` of `"alag"` (compartment `ALAG1`) or `"route"` (`lag=LAG`); η on CL and on
+/// the lag, so both the lag's θ and its η are live.
+fn lagged_kernel_model(kernel: &str, shape: f64, lag: &str) -> String {
+    let (call, extra, ind) = if kernel == "weibull" {
+        (
+            "weibull(td=TD, beta=BETA".to_string(),
+            format!("  theta TVTD(2.0, 0.05, 24.0)\n  theta TVBETA({shape}, 0.1, 10.0)\n"),
+            "  TD = TVTD\n  BETA = TVBETA\n",
+        )
+    } else {
+        (
+            "transit(n=N, mtt=MTT".to_string(),
+            format!("  theta TVMTT(2.0, 0.05, 24.0)\n  theta TVN({shape}, 0.1, 10.0)\n"),
+            "  MTT = TVMTT\n  N = TVN\n",
+        )
+    };
+    let (lag_ind, call) = if lag == "alag" {
+        ("  ALAG1 = TVLAG * exp(ETA_LAG)\n", format!("{call})"))
+    } else {
+        (
+            "  LAG = TVLAG * exp(ETA_LAG)\n",
+            format!("{call}, lag=LAG)"),
+        )
+    };
+    format!(
+        "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n{extra}  \
+         theta TVLAG(1.0, 0.01, 5.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_LAG ~ 0.04\n  \
+         sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  \
+         V = TVV\n{ind}{lag_ind}[structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+         [odes]\n  d/dt(central) = {call} - CL/V*central\n[scaling]\n  y = central / V\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+/// The subject every lagged-kernel fixture is measured on: two doses, the second landing on
+/// residual drug (so the incoming side of its onset is live), observations before, across and
+/// after both estimated onsets, none within 0.4 h of one.
+fn lagged_kernel_subject(m: &CompiledModel) -> Subject {
+    subject(
+        m,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(6.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.4, 1.3, 2.0, 3.0, 4.5, 6.5, 7.5, 9.0, 12.0, 18.0],
+        &[0.1, -0.05],
+    )
+}
+
+/// θ order of [`lagged_kernel_model`]: CL, V, TD|MTT, BETA|N, LAG.
+const LAGGED_KERNEL_LIVE: &[usize] = &[0, 2, 3, 4];
+
+/// `(kernel, shape, ∂f/∂η bound, FOCEI-gradient bound)`. Measured worst over the compartment and
+/// route lag on Linux, at `tight` tolerances (jac / grad): Weibull β = 0.5 2.9e-9 / 6.6e-6 and
+/// 0.9 2.1e-9 / 2.8e-8 (both in the cumulative frame), 1.5 4.4e-9 / 8.9e-8 and 3 6.0e-8 / 1.7e-7
+/// (pointwise, on the anchored onset); transit n = 0.5 6.9e-10 / 9.6e-8 and 2.5 1.1e-10 / 2.1e-8
+/// (pointwise, anchored). Bounds are ~10× the measured worst. Without the onset anchoring the
+/// gaps are 4.9e-4 / 3.6 (β = 0.5), 7.1e-5 / 0.22 (β = 0.9), 1.7e-6 / 4.0e-4 (β = 1.5) and
+/// 2.1e-6 / 2.1e-4 (n = 0.5) -- `an_unanchored_onset_loses_the_second_derivative` below.
+const LAGGED_KERNEL_CASES: &[(&str, f64, f64, f64)] = &[
+    ("weibull", 0.5, 3e-8, 7e-5),
+    ("weibull", 0.9, 3e-8, 3e-7),
+    ("weibull", 1.5, 5e-8, 1e-6),
+    ("weibull", 3.0, 6e-7, 2e-6),
+    ("transit", 0.5, 1e-8, 1e-6),
+    ("transit", 2.5, 2e-9, 3e-7),
+];
+
+/// A Weibull (`β ∈ {0.5, 0.9, 1.5, 3}`) or transit (`n ∈ {0.5, 2.5}`) absorption under an
+/// estimated compartment `ALAG1` or per-route `lag=`, each with an η on the lag, is served by
+/// the plan (no fallback to finite differences) and matches the reconverged-FD objective
+/// gradient and a Richardson `∂f/∂η`. The onset of these kernels is singular for `β < 2` /
+/// `n < 1` (the density is infinite below 1, and its slope not integrable), so a pointwise
+/// forcing's derivative with respect to the onset is the derivative of a quadrature of a singular
+/// integrand. The segment after a moving onset is anchored at the true onset (`onset_shift`), so
+/// the kernel is read at an age with no jet; a Weibull with `β < 1`, whose density is infinite
+/// there, is delivered as absorbed mass besides (`CumulativeInputs`). The mutations that remove
+/// either are the next two tests.
+#[test]
+fn lagged_weibull_and_transit_forcing_is_served_and_matches_reconverged_fd() {
+    for &(kernel, shape, jac_bound, grad_bound) in LAGGED_KERNEL_CASES {
+        for lag in ["alag", "route"] {
+            let label = format!("{kernel} {shape} {lag}");
+            let m = tight(parse_model_string(&lagged_kernel_model(kernel, shape, lag)).unwrap());
+            let s = lagged_kernel_subject(&m);
+            let theta = m.default_params.theta.clone();
+            assert!(
+                plan_forward(&m, &s, None, &theta, &[0.1, -0.05], terms::layout1(2)).is_some(),
+                "{label}: the recorder must serve this subject (no finite-difference fallback)"
+            );
+            let (jac, grad) = measure(&m, &s, LAGGED_KERNEL_LIVE, &label);
+            assert!(jac < jac_bound, "{label} ∂f/∂η: {jac:.2e}");
+            assert!(grad < grad_bound, "{label} gradient: {grad:.2e}");
+        }
+    }
+}
+
+/// Runs `f` with the cumulative frame off (every dose on the pointwise forcing), restoring it.
+fn with_cumulative_off<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::ode::predictions::CUMULATIVE_OFF.with(|c| c.set(false));
+        }
+    }
+    crate::ode::predictions::CUMULATIVE_OFF.with(|c| c.set(true));
+    let _restore = Restore;
+    f()
+}
+
+/// Runs `f` with the onset anchoring off (the segment after a Weibull / transit onset on the
+/// fixed grid), restoring it.
+fn with_onset_shift_off<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::sens::ode_provider::ONSET_SHIFT_OFF.with(|c| c.set(false));
+        }
+    }
+    crate::sens::ode_provider::ONSET_SHIFT_OFF.with(|c| c.set(true));
+    let _restore = Restore;
+    f()
+}
+
+/// `(∂f/∂η gap, gradient gap)` of the Weibull β = 0.5 route-lag fixture, on a fresh model.
+fn singular_onset_gaps() -> (f64, f64) {
+    let m = tight(parse_model_string(&lagged_kernel_model("weibull", 0.5, "route")).unwrap());
+    let s = lagged_kernel_subject(&m);
+    let eta = probe_eta(m.n_eta);
+    (jacobian_gap(&m, &s, &eta, "mutated"), parity(&m, &s))
+}
+
+/// The mutation the parity above must see: with the cumulative frame off (the onset still
+/// anchored), the stages near the onset of a `β = 0.5` Weibull read the infinite density again,
+/// and the `∂f/∂η` gap is the measured 3.9e-7 against the frame's 2.9e-9 and the parity's bound of
+/// 3e-8 (gradient 7.9e-4 against 6.6e-6 and 7e-5).
+#[test]
+fn a_cumulative_frame_off_loses_the_singular_onset() {
+    let (jac, grad) = with_cumulative_off(singular_onset_gaps);
+    eprintln!("G5 frame off: jac {jac:.2e} grad {grad:.2e}");
+    assert!(jac > 1e-7, "∂f/∂η gap with the frame off: {jac:.2e}");
+}
+
+/// The second mutation: with the onset segment on the fixed grid (no `onset_shift`), the kernel's
+/// age carries the lag's jet at stages a hair from the onset, where its slope is not integrable:
+/// the second-order terms the FOCEI gradient needs are garbage -- for the Weibull `β = 0.5` (gap
+/// 3.6 / 4.9e-4, measured); and the transit `n = 0.5`, which the frame does not serve, has no
+/// Taylor series at its onset, so it leaves the adjoint altogether.
+#[test]
+fn an_unanchored_onset_loses_the_second_derivative() {
+    let (jac, grad) = with_onset_shift_off(singular_onset_gaps);
+    eprintln!("G5 unanchored weibull: jac {jac:.2e} grad {grad:.2e}");
+    assert!(
+        grad > 1e-3,
+        "gradient gap with the onset unanchored: {grad:.2e}"
+    );
+    // The transit `n = 0.5` kernel has no Taylor series at its onset: unanchored, the recorder
+    // meets the `NaN` of `rate_onset_continued` and the subject leaves the adjoint (the pre-fix
+    // scope decline), instead of being served with the wrong second derivative.
+    let m = tight(parse_model_string(&lagged_kernel_model("transit", 0.5, "route")).unwrap());
+    let s = lagged_kernel_subject(&m);
+    assert!(
+        !with_onset_shift_off(|| served(&m, &s)),
+        "transit n = 0.5, unanchored, must not be served"
+    );
+    // A fresh model: the unanchored run's failure marks `m`'s plan bad for good.
+    let m = tight(parse_model_string(&lagged_kernel_model("transit", 0.5, "route")).unwrap());
+    let s = lagged_kernel_subject(&m);
+    assert!(served(&m, &s), "transit n = 0.5, anchored, is served");
+}
+
+/// The cumulative frame is a reformulation of the same ODE, so the predictions move only at the
+/// integrator's tolerance: the worst relative change over every fixture (only the Weibull
+/// `β < 1` ones are framed, the rest are unchanged), at the `tight` tolerances (1e-10 / 1e-12)
+/// the parity tests run at.
+#[test]
+fn the_cumulative_frame_moves_the_predictions_at_integrator_tolerance() {
+    let mut worst = (0.0f64, String::new());
+    for &(kernel, shape, _, _) in LAGGED_KERNEL_CASES {
+        for lag in ["alag", "route"] {
+            let m = tight(parse_model_string(&lagged_kernel_model(kernel, shape, lag)).unwrap());
+            let s = lagged_kernel_subject(&m);
+            let (theta, eta) = (m.default_params.theta.clone(), probe_eta(m.n_eta));
+            let new = crate::pk::compute_predictions_with_tv(&m, &s, &theta, &eta);
+            let old = with_cumulative_off(|| {
+                crate::pk::compute_predictions_with_tv(&m, &s, &theta, &eta)
+            });
+            assert_eq!(new.len(), old.len());
+            for (a, b) in new.iter().zip(&old) {
+                assert!(a.is_finite() && b.is_finite(), "{kernel} {shape} {lag}");
+                let rel = (a - b).abs() / b.abs().max(1e-12);
+                if rel > worst.0 {
+                    worst = (rel, format!("{kernel} {shape} {lag}"));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "G5 value change: worst relative {:.2e} ({})",
+        worst.0, worst.1
+    );
+    // Measured worst 6.8e-7 (Weibull β = 0.5, compartment lag); ~15x headroom.
+    assert!(
+        worst.0 < 1e-5,
+        "worst relative change {:.2e} ({})",
+        worst.0,
+        worst.1
+    );
+}
+
+/// The one Weibull shape the cumulative frame does not serve: an infusion into the kernel under
+/// an estimated lag (the convolved `R_in_inf`). Its lag derivative off the pointwise path is
+/// wrong (2.4e-2 at `β = 1.5`, measured), so the scope sends it to finite differences rather than
+/// serve it. Mutation: delete the infusion clause of `event_walk_scope` -> `β = 1.5` is served
+/// with that gap.
+#[test]
+fn an_infusion_into_a_lagged_weibull_stays_on_finite_differences() {
+    for shape in [0.5, 1.5] {
+        for lag in ["alag", "route"] {
+            let m = tight(parse_model_string(&lagged_kernel_model("weibull", shape, lag)).unwrap());
+            let s = subject(
+                &m,
+                vec![
+                    DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+                    DoseEvent::new(6.0, 100.0, 1, 50.0, false, 0.0),
+                ],
+                &[0.4, 1.3, 2.0, 3.0, 4.5, 6.5, 7.5, 9.0, 12.0, 18.0],
+                &[0.1, -0.05],
+            );
+            assert!(!served(&m, &s), "weibull {shape} {lag}: declined by scope");
+            // The bolus twin of the same model is served (the scope is the infusion's, not the
+            // model's).
+            let b = lagged_kernel_subject(&m);
+            assert!(served(&m, &b), "weibull {shape} {lag}: bolus");
         }
     }
 }

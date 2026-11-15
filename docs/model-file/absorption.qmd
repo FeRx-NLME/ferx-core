@@ -866,9 +866,9 @@ Jacobian jumps across the boundary too, not just the forcing). Because the IOV w
 the same event-driven walk, **every** absorption forcing is analytic under **IOV** too
 (#486 — the smooth densities `igd`/`transit`/`weibull`/`first_order`, the moving-window
 `zero_order`, and any composition `mixed`/`parallel`; each forcing's rate/window is rebuilt
-from its dose's own occasion-seeded PK jet); the only IOV holdouts are `weibull` + lagtime
-(β<1 onset divergence) and any forcing combined with a **steady-state** dose (the dual SS
-equilibration does not spread the forcing over the cycle).
+from its dose's own occasion-seeded PK jet); the only IOV holdout is any forcing combined
+with a **steady-state** dose (the dual SS equilibration does not spread the forcing over the
+cycle).
 See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
 
 The **smooth-density forcings** (`igd`, `transit`, `weibull`, `first_order`) have a
@@ -881,9 +881,18 @@ lagtime**, `igd`/`transit`/`first_order` are *also* analytic (#486): the continu
 `∂R_in/∂lag` rides the walk's dual time-after-dose, and the forcing's onset at the
 dose's lagged arrival is injected as an exact rate-on saltation — the sign-mirror of
 the `zero_order` rate-off saltation above, generalised from a constant rate to
-`R_in(0⁺)`. `weibull` + lagtime still falls back to finite differences: its onset can
-diverge for shape `β < 1` (an integrable spike, not a finite jump), so no closed-form
-saltation exists there.
+`R_in(0⁺)`. `weibull` and `transit` boluses are *also* analytic under a lagtime, for every
+shape — including `β < 1` and `0 < n < 1`, where the density is infinite (or its slope not
+integrable) at the onset and no rate-on saltation exists. The segment after a moving onset is
+integrated from the state at the true onset, on the walk's clock shifted by the onset's jet, so
+the kernel is read at an age with no derivative and the state is flowed back to the fixed time
+afterwards, where the field is smooth. A Weibull with `β < 1` — whose density is infinite at the
+onset — is integrated as the absorbed mass besides: its lagged dose shifts the state by
+`D·(S(τ₀) − S(τ))`, with `S = 1 − G` the not-yet-absorbed fraction (a closed form), so the
+right-hand side reads `S`, which is continuous there, instead of the density. Predictions are
+unchanged for every other kernel and shape; the framed Weibull's move only at the integrator's
+tolerance (≤ 7e-7 relative at `reltol = 1e-10`), a tolerance that is relative to the shifted
+state, so on a long segment with fast elimination tighten `reltol` for the late amounts.
 :::
 
 ### Worked examples — zero-order sensitivity
@@ -1039,12 +1048,11 @@ carries the same jet on its rate-off at the window end; for the smooth kernels
 continuous `∂R_in/∂lag_route` alone, with a timeline break at the onset. The predicted
 values are unchanged — only the gradient moves off finite differences.
 
-Two cases remain on the **finite-difference** fallback: a per-route lag on a **`weibull`**
-forcing (its onset diverges for shape `β < 1`, so no finite rate-on saltation exists — the
-exact analogue of the `weibull()` + compartment-lagtime fallback), and a per-route lag
-combined with **IOV** (`κ`). Both stay exact in predictions and simulation; only their
-FOCEI gradient is FD. Analytic IOV per-route lag is a planned follow-up
-([#856](https://github.com/FeRx-NLME/ferx-core/issues/856)).
+A per-route lag on a **`weibull`** forcing is analytic too (see the lagtime note above: its
+bolus is delivered as absorbed mass, with no onset to cross). One case remains on the
+**finite-difference** fallback: a per-route lag combined with **IOV** (`κ`). It stays exact
+in predictions and simulation; only its FOCEI gradient is FD. Analytic IOV per-route lag is
+a planned follow-up ([#856](https://github.com/FeRx-NLME/ferx-core/issues/856)).
 :::
 
 ### Sensitivities

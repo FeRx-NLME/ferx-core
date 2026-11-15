@@ -16274,7 +16274,7 @@ fn the_recorded_rhs_jacobian_matches_the_f64_one() {
 /// ones (`EXACT_JAC_OFF`, the host-closure fallback): the textbook method with `J` moves the
 /// solution by the solver's own tolerance, and the two are not the same bits (non-vacuity:
 /// the registered evaluator is what the first run takes). Measured worst relative shift of the
-/// predictions (Linux x86_64): 1.0e-8 (`STIFF_MM`) and 3.6e-9 (`STIFF_TRANSIT`); the bound is
+/// predictions (Linux x86_64): 1.0e-8 (`STIFF_MM`) and 3.4e-8 (`STIFF_TRANSIT`, which a cumulative-frame segment steps on `v + shift(t)`: 3.6e-9 before it); the bound is
 /// `1e-7`.
 #[test]
 fn an_exact_jacobian_moves_a_stiff_solve_by_the_solver_tolerance() {

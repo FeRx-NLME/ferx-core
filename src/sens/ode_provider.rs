@@ -11,12 +11,14 @@
 //! Form C (`y = <expr>`, `y[CMT=N] = <expr>`), with covariate references; bolus and
 //! infusion doses, bioavailability `F` (incl. `F{cmt}`), EVID 3/4 resets, `init(...)`
 //! initial conditions, scalar and expression `obs_scale`, LTBS, all five built-in
-//! input-rate forcings and estimated lag times (incl. `ALAG{cmt}`) for every forcing except
-//! `weibull()`.
+//! input-rate forcings and estimated lag times (incl. `ALAG{cmt}`). A Weibull / transit bolus
+//! is delivered in the cumulative frame (`CumulativeInputs`) and its onset, which moves with an
+//! estimated lag, anchors the segment after it (`onset_shift`): the kernel's density is singular
+//! there for `β < 1` / `n < 1`, and neither a rate-on saltation nor a quadrature of it has a
+//! derivative.
 //!
 //! **Not supported** (the subject's gradient falls back to finite differences):
-//! `weibull()` combined with an estimated lagtime (its `β < 1` onset has no
-//! closed-form rate-on saltation), an expression `obs_scale` combined with LTBS, steady state
+//! an expression `obs_scale` combined with LTBS, steady state
 //! combined with a time-dependent (`TIME`/`TAD`) RHS, and IOV combined with FREM. Steady state
 //! into a `zero_order` window, or steady state with an absorption lagtime, are rejected
 //! upstream rather than routed here.
@@ -89,33 +91,15 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
         return false;
     }
     // Per-route absorption lag (`fn(..., lag=L)`, #857): the analytic event-driven walk
-    // (`integrate_tvcov_g`) now emits a per-route onset saltation — each route-lagged
-    // forcing switches on at its own `t_dose + lag_cmt + lag_route`, injected as a rate-on
-    // saltation at that (moving) boundary with the combined `∂/∂(lag_cmt + lag_route)` jet
-    // (#859). The continuous `∂R_in/∂lag_route` already flows through
-    // `add_prepared_input_rate_forcing` (which adds `route_lag` to `t_eff` over any `T`);
-    // the walk adds only the missing onset-discontinuity term. Admitted per kernel, mirroring
-    // the `has_lagtime` classifier below:
-    //   • `first_order` — onset is the finite `ka·dose` jump the rate-on saltation handles.
-    //   • `zero_order` — the route-lagged window shifts BOTH boundaries: its rate-on saltation
-    //     at `t_dose + lag_cmt + lag_route` (`K_ROUTE_ONSET`) and its rate-off at `+ dur`
-    //     (`K_ZO_END`) both carry the `lag_route` jet.
-    //   • `transit` / `igd` — continuous onset (`R_in → 0` at the boundary), so no saltation:
-    //     the continuous `∂R_in/∂lag_route` plus the timeline break at the onset suffice.
-    //   • `weibull` — onset **diverges** for shape `β < 1` (an integrable spike, no finite
-    //     rate-on saltation), so a route-lagged `weibull` stays on the FD fallback, exactly as
-    //     `weibull` + a compartment lagtime does below.
+    // (`integrate_tvcov_g`) emits a per-route onset saltation — each route-lagged forcing
+    // switches on at its own `t_dose + lag_cmt + lag_route`, injected as a rate-on saltation at
+    // that (moving) boundary with the combined `∂/∂(lag_cmt + lag_route)` jet (#859). Every kind
+    // is admitted: `first_order` (the finite `ka·dose` jump), `zero_order` (both window
+    // boundaries), `transit` / `igd` (a continuous onset), and `weibull` / `transit` boluses,
+    // which the cumulative frame delivers with no onset discontinuity at all.
     // IOV (`n_kappa != 0`) route lag is declined *here* by the `n_kappa != 0` clause below (an IOV
     // model is off the non-IOV analytic gate outright), but IS analytic on the IOV path since #877
-    // — the IOV scope (`ode_iov_walk_scope`) admits it via this same per-kernel
-    // `route_lag_analytic()` classifier.
-    if ode
-        .input_rate
-        .iter()
-        .any(|f| f.lag_slot.is_some() && !f.kind.route_lag_analytic())
-    {
-        return false;
-    }
+    // — the IOV scope (`ode_iov_model_scope`) admits it via the same classifier.
     // Output transforms applied over the dual prediction in the adjoint's `record_ode`: `None`, a
     // constant `ScalarScale` divisor (`f/k`), and the LTBS log (`ln f`). An η-dependent
     // `ExpressionScale` divisor (`obs_scale = expr(θ,η)`) is ALSO analytic now (#486):
@@ -143,38 +127,14 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     // production's `DoseAttrMap::f_bio`, so the analytic gradient carries `∂/∂F{cmt}`
     // exactly. Both indexed slots are ordinary individual parameters seeded in
     // `params_dual` like any other — so lagtime and indexed-`F` compose.
-    // Lagtime + a built-in absorption **input rate** now composes on the event-driven
-    // walk (`integrate_tvcov_g`, #486): an estimated lagtime forces that walk, which
-    // now carries `R_in` — the continuous `∂R_in/∂lag` flows through the shared
-    // `add_prepared_input_rate_forcing` helper (its `tad` carries the lag jet), and
-    // the *onset* term (the forcing switching on at the dose's lagged arrival, a
-    // discontinuity in `du/dt` at that moving boundary) is injected as an exact
-    // rate-on saltation, mirroring the existing lagged-infusion rate-on injection.
-    // `InverseGaussian`'s onset vanishes for every valid `(mat, cv2)` (an essential
-    // singularity dominates); `Transit`'s vanishes for `n > 0` and is a finite
-    // `ktr·dose` jump at the degenerate `n = 0`; `FirstOrder`'s onset is always the
-    // finite `ka·dose`. `Weibull`'s onset **diverges** for shape `β < 1` (an
-    // integrable spike, not a finite jump) — no closed-form saltation exists there,
-    // so a model combining lagtime with `Weibull` stays on the FD fallback.
-    // `ZeroOrder`'s moving-boundary window is now carried on the event-driven walk too
-    // (#486): its two boundaries — the rate-on at the lagged arrival `t_dose + lag` and
-    // the rate-off at `t_dose + lag + dur` — both shift with `lag`, injected as the
-    // rate-on / rate-off saltations `integrate_tvcov_g` already uses for infusions (the
-    // rate-off additionally carries `∂/∂dur`). So `zero_order` + lagtime is admitted,
-    // leaving only `Weibull` (whose onset diverges for shape `β < 1`) on the FD fallback.
-    if model.has_lagtime()
-        && ode.input_rate.iter().any(|f| {
-            !matches!(
-                f.kind,
-                crate::pk::absorption::InputRateKind::Transit
-                    | crate::pk::absorption::InputRateKind::InverseGaussian
-                    | crate::pk::absorption::InputRateKind::FirstOrder
-                    | crate::pk::absorption::InputRateKind::ZeroOrder
-            )
-        })
-    {
-        return false;
-    }
+    // Lagtime + a built-in absorption **input rate** composes on the event-driven walk
+    // (`integrate_tvcov_g`, #486): the continuous `∂R_in/∂lag` flows through the shared forcing
+    // helper (its `tad` carries the lag jet), and the *onset* — the forcing switching on at the
+    // dose's lagged arrival, a discontinuity in `du/dt` at that moving boundary — is injected as
+    // an exact rate-on saltation (`first_order`; zero for `transit n > 0` and `igd`). A Weibull /
+    // transit bolus has no onset to cross: its cumulative frame is continuous there, and the
+    // segment that follows is anchored at the true onset. `zero_order`'s window is carried too
+    // (its two boundaries shift with the lag). No kernel is left on the FD fallback.
     // The η/θ chain evaluates the individual-parameter program over `Dual2`
     // seeded on (θ, η); require it present, with matching axis counts (no NN-θ /
     // IOV), and within the analytic-chain dual-width cap.
@@ -568,7 +528,22 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
     // `integrate_tvcov_g` shifts each dose to `t_dose + lag` and injects the event-time
     // (saltation) sensitivity, propagated exactly through the per-event params (#439).
-    if model.ode_spec.is_none() {
+    let Some(ode) = model.ode_spec.as_ref() else {
+        return false;
+    };
+    // An infusion into a Weibull kernel under an estimated lag: the input is the convolved
+    // `R_in_inf = (D/T)·[G(τ) − G(τ − T)]`, and the cumulative frame (`CumulativeInputs`)
+    // delivers boluses only. Its onset and window end sit on the same singular `G` for
+    // `β < 2`, so the pointwise path's lag derivative is off (2.4e-2 measured at `β = 1.5`, NaN
+    // jets at `β < 1`): the subject stays on finite differences.
+    if (model.has_lagtime() || has_route_lag)
+        && subject.doses.iter().any(|d| {
+            d.is_infusion()
+                && ode.input_rate.iter().any(|f| {
+                    f.cmt == d.cmt_idx() && f.kind == crate::pk::absorption::InputRateKind::Weibull
+                })
+        })
+    {
         return false;
     }
     // Built-in absorption input-rate forcing (transit/igd/weibull/first_order, #486):
@@ -1695,6 +1670,9 @@ pub(crate) struct ProgJac<'a, T: crate::sens::num::vm::VmNum> {
     last_dose_eff: T,
     zero_rows: Vec<usize>,
     forcing_ft: Option<Box<dyn Fn(T, &mut [T]) + 'a>>,
+    /// A segment integrated in the cumulative frame (`CumulativeInputs`) steps on a shifted
+    /// state these tangents are not of: it declines, and the stepper takes its own differences.
+    declined: bool,
 }
 
 impl<'a, T: crate::sens::num::vm::VmNum> ProgJac<'a, T> {
@@ -1710,7 +1688,14 @@ impl<'a, T: crate::sens::num::vm::VmNum> ProgJac<'a, T> {
             last_dose_eff,
             zero_rows: zero_rows.to_vec(),
             forcing_ft: None,
+            declined: false,
         }
+    }
+
+    /// This Jacobian declining (`eval` writes nothing and returns `false`) when `declined`.
+    pub(crate) fn declining(mut self, declined: bool) -> Self {
+        self.declined = declined;
+        self
     }
 
     pub(crate) fn with_forcing_ft(mut self, f: Option<Box<dyn Fn(T, &mut [T]) + 'a>>) -> Self {
@@ -1720,7 +1705,7 @@ impl<'a, T: crate::sens::num::vm::VmNum> ProgJac<'a, T> {
 
     pub(crate) fn eval(&self, u: &[T], p: &[T], t: T, jac: &mut [T], ft: &mut [T]) -> bool {
         let n = u.len();
-        if jac.len() != n * n {
+        if self.declined || jac.len() != n * n {
             return false;
         }
         anchored_jacobian(
@@ -1861,6 +1846,30 @@ pub(crate) fn rk4_dual<T: crate::sens::num::PkNum>(
     (0..n)
         .map(|i| u[i] + sixth * (k1[i] + T::from_f64(2.0) * (k2[i] + k3[i]) + k4[i]))
         .collect()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: a Weibull / transit onset is never anchored (`onset_shift`), so its segment
+    /// integrates on the fixed grid with the kernel's age carrying the lag's jet — the
+    /// mutation the anchoring's parity tests must see.
+    pub(crate) static ONSET_SHIFT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the segment after the event at `t_event` (timeline slot `p`) starts strictly later,
+/// so a Weibull / transit onset at `t_event` can anchor it (`onset_shift`).
+fn next_event_is_later<T: crate::sens::num::PkNum>(
+    tl: &[(T, u8, usize)],
+    p: usize,
+    t_event: T,
+) -> bool {
+    #[cfg(test)]
+    if ONSET_SHIFT_OFF.with(|c| c.get()) {
+        return false;
+    }
+    tl.get(p + 1).is_some_and(|e| {
+        e.0.br_cmp(crate::sens::num::BranchCmp::Gt, t_event + T::from_f64(1e-9))
+    })
 }
 
 /// The state just after a switch whose true time is `t_b + δ` (`δ` jet-only, the walk
@@ -3355,6 +3364,11 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     // folded into a cohort so its own later `K_ZO_END` event is a no-op (`false` for the
     // common single-window-per-time case).
     let mut zo_end_done: Vec<bool> = vec![false; zero_windows.len()];
+    // The jet-only shift `δ` of a Weibull / transit onset that moves with the inputs, left by
+    // its arrival or route-onset event for the segment that follows: that segment integrates
+    // the shifted copy `[t + δ, t_end + δ]` from the state at the true onset, so the
+    // kernel's age is `τ = t − t_eff` with no jet, and flows back to the fixed `t_end` after.
+    let mut onset_shift: Option<T> = None;
 
     // Full RHS velocity at the current boundary time for one side of a moving boundary: the
     // program RHS at `side_params` plus every forcing this side sees — other infusions, other
@@ -3761,7 +3775,36 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                     .map(|&(cmt, rate, _, _, _, _)| (cmt, rate))
                     .collect()
             };
+            // The lagged Weibull (`β < 1`) boluses of this segment, delivered as a state shift
+            // (`CumulativeInputs`): the segment integrates `v = u − shift`, the model reads
+            // `v + shift`, and the forcing below leaves those doses out.
+            // A Weibull / transit onset that moves with the inputs opened this segment: it
+            // integrates the copy of itself shifted by the onset's jet `δ` (`onset_shift`), on
+            // every clock — the model's, the forcings' and the kernels' ages — so the kernel,
+            // singular at its onset for `β < 1` / `n < 1`, is read at an age with no jet, and
+            // the state flows back by `−δ` at the end (below), where the field is smooth.
+            let sj = onset_shift.take();
+            let seg_since = sj.map_or(cur_t, |j| cur_t + j);
+            let cum = crate::ode::predictions::CumulativeInputs::for_segment(
+                ode,
+                &dose_forcings,
+                &subject.doses,
+                &dose_lagtimes_dual,
+                f_bio_at_dose,
+                gate,
+                seg_since,
+            );
             let rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
+                let t = sj.map_or(t, |j| t + j);
+                let shifted: Vec<T>;
+                let us: &[T] = if cum.is_empty() {
+                    us
+                } else {
+                    let mut v = us.to_vec();
+                    cum.add_shift(t, &mut v);
+                    shifted = v;
+                    &shifted
+                };
                 eval_rhs_anchored::<T>(
                     program,
                     us,
@@ -3792,7 +3835,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 // model has an estimated lagtime; the onset saltation at the dose's
                 // own arrival is injected separately at the `K_DOSE` event below.
                 if !dose_forcings.is_empty() {
-                    crate::ode::predictions::add_prepared_input_rate_forcing::<T, _>(
+                    crate::ode::predictions::add_input_rate_forcing_except_cumulative::<T, _>(
                         ode,
                         &dose_forcings,
                         &subject.doses,
@@ -3801,7 +3844,8 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         &modeled_windows,
                         gate,
                         t,
-                        cur_t,
+                        seg_since,
+                        cum.framed(),
                         du,
                     );
                 }
@@ -3822,6 +3866,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 last_dose_eff,
                 &off_states.borrow(),
             )
+            .declining(!cum.is_empty() || sj.is_some())
             .with_forcing_ft(input_rate_ft(
                 ode,
                 &dose_forcings,
@@ -3845,6 +3890,30 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             let _ = T::take_span();
             if let Some(last) = sol.last() {
                 u.copy_from_slice(&last.u);
+                // Back to the physical state (the shift is zero where the segment began).
+                cum.add_shift(sj.map_or(t_event, |j| t_event + j), &mut u);
+                if let Some(j) = sj {
+                    // The state at `t_end + δ` flows back to the fixed `t_end`: the pre side's
+                    // field at offset `s`, smooth here (the kernel's age is far from its onset).
+                    let anchor = if last_dose_eff.br_abs_lt(f64::INFINITY) {
+                        last_dose_eff
+                    } else {
+                        t_event
+                    };
+                    let mut end_field = |x: &[T], s: T, out: &mut [T]| {
+                        out.copy_from_slice(&boundary_velocity(
+                            x,
+                            params,
+                            t_event,
+                            s,
+                            anchor,
+                            reset_floor,
+                            true,
+                        ));
+                    };
+                    let y = rk4_dual(&u, j, -j, &mut end_field);
+                    u.copy_from_slice(&y);
+                }
             }
             cur_t = t_event;
         }
@@ -4051,8 +4120,16 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                             let onset_at = |tau: T| -> T {
                                 let mut onset = T::from_f64(0.0);
                                 for (fi, f) in ode.input_rate.iter().enumerate() {
-                                    if f.cmt == cmt_idx && f.lag_slot.is_none() {
-                                        let dr = dose_forcings.get(fi, idx);
+                                    // A Weibull bolus with an infinite onset density is delivered
+                                    // in the cumulative frame, which has no onset discontinuity
+                                    // to cross.
+                                    let dr = dose_forcings.get(fi, idx);
+                                    if f.cmt == cmt_idx
+                                        && f.lag_slot.is_none()
+                                        && !(crate::ode::predictions::cumulative_dose(f.kind, d)
+                                            && dr.prep.frame_kernel()
+                                            && lag.br_cmp_c(Gt, 0.0))
+                                    {
                                         onset = onset
                                             + dr.frac
                                                 * dr.prep.rate_onset_continued(tau, dose_mass);
@@ -4124,7 +4201,27 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                                     out[cmt_idx] = out[cmt_idx] + onset_at(s - dlag);
                                 }
                             };
-                            cross_moving_boundary(&mut u, dlag, &mut pre, &mut post, &|_| {});
+                            // Weibull / transit boluses alone feed this compartment: the segment
+                            // that follows is anchored at the true onset (`onset_shift`) rather
+                            // than crossing a rate-on whose density is singular there.
+                            let cumulative_only = ode
+                                .input_rate
+                                .iter()
+                                .filter(|f| f.cmt == cmt_idx && f.lag_slot.is_none())
+                                .all(|f| crate::ode::predictions::anchorable_dose(f.kind, d))
+                                && lag.br_cmp_c(Gt, 0.0)
+                                && ode
+                                    .input_rate
+                                    .iter()
+                                    .any(|f| f.cmt == cmt_idx && f.lag_slot.is_none())
+                                && !zero_windows.iter().any(|w| w.5 == idx && w.0 == cmt_idx);
+                            let next_later = next_event_is_later(&tl, p, t_event);
+                            if cumulative_only && next_later && !dlag.is_constant() {
+                                u = rk4_dual(&u, T::from_f64(0.0), dlag, &mut pre);
+                                onset_shift = Some(dlag);
+                            } else {
+                                cross_moving_boundary(&mut u, dlag, &mut pre, &mut post, &|_| {});
+                            }
                         }
                     } else if is_inf(d) {
                         // Infusion: no bolus — the rate `F·rate` enters via the segment
@@ -4504,6 +4601,8 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // onset jet here would be the derivative of a boundary the trajectory never had
             // (#1587: a dose recorded before an EVID=3/4 reset, whose route onset lands after
             // it).
+            // A Weibull / transit bolus is delivered in the cumulative frame, whose state is
+            // continuous at the onset: there is no rate-on to cross.
             let onset_live = event_gate().live(&subject.doses, dose_idx);
             if cmt_idx < n_states && onset_live {
                 let f = &ode.input_rate[fi];
@@ -4569,7 +4668,24 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         true,
                     ));
                 };
-                if is_inf(d) {
+                let lagged = (lag_cmt + dr.route_lag).br_cmp_c(Gt, 0.0);
+                if crate::ode::predictions::anchorable_dose(f.kind, d)
+                    && lagged
+                    && next_event_is_later(&tl, p, t_event)
+                    && !dlag.is_constant()
+                {
+                    // A Weibull / transit bolus: the segment that follows starts at the true onset
+                    // (`onset_shift`), the kernel read there at an age with no jet and its input
+                    // inside the segment from `τ = 0⁺`, so there is no rate-on to cross.
+                    u = rk4_dual(&u, T::from_f64(0.0), dlag, &mut base);
+                    onset_shift = Some(dlag);
+                } else if crate::ode::predictions::cumulative_dose(f.kind, d)
+                    && lagged
+                    && dr.prep.frame_kernel()
+                {
+                    // Delivered in the cumulative frame, whose state is continuous at the onset
+                    // (a following segment that cannot anchor reads the kernel on the fixed grid).
+                } else if is_inf(d) {
                     // An infusion into this route's kernel switches on continuously (a kink): the
                     // forcing itself carries it, from the segment start `since`.
                     let mut post = |x: &[T], s: T, out: &mut [T]| {
@@ -5571,7 +5687,26 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
 
         // (`last_dose_eff`, the TAD anchor, was computed once above the crossing block; the
         // segment's `gate` at the top of the break.)
+        // The Weibull / transit boluses of this segment as a state shift (`CumulativeInputs`).
+        let cum = crate::ode::predictions::CumulativeInputs::for_segment(
+            ode,
+            prepared_forcings,
+            &subject.doses,
+            &[],
+            dose_f_bio,
+            gate,
+            t_start,
+        );
         let rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
+            let shifted: Vec<T>;
+            let us: &[T] = if cum.is_empty() {
+                us
+            } else {
+                let mut v = us.to_vec();
+                cum.add_shift(t, &mut v);
+                shifted = v;
+                &shifted
+            };
             eval_rhs_anchored::<T>(
                 program,
                 us,
@@ -5614,7 +5749,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
             // EVID 3/4 reset is correctly turned off here too, matching production's
             // `active_infusions` rule for infusions (#430 review #4 / #451 / #486).
             if !prepared_forcings.is_empty() {
-                crate::ode::predictions::add_prepared_input_rate_forcing::<T, _>(
+                crate::ode::predictions::add_input_rate_forcing_except_cumulative::<T, _>(
                     ode,
                     prepared_forcings,
                     &subject.doses,
@@ -5624,6 +5759,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
                     gate,
                     t,
                     t_start,
+                    cum.framed(),
                     du,
                 );
             }
@@ -5632,6 +5768,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         // The exact `J` at `T = f64`: the program over this segment's clocks and the input-rate
         // forcing's `f_t` (the infusion and zero-order rates are constants).
         let pj = ProgJac::new(program, first_dose_time, T::from_f64(last_dose_eff), &[])
+            .declining(!cum.is_empty())
             .with_forcing_ft(input_rate_ft(
                 ode,
                 prepared_forcings,
@@ -5663,9 +5800,12 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
         for (i, pt) in sol.iter().enumerate() {
             let at_end = end_saved && n_pts == saveat.len() && i + 1 == n_pts;
             let q = if at_end { t_end } else { tf(pt.t) };
-            record_at(q, &pt.u, &mut states, &mut recorded);
+            // The physical state: the cumulative frame's `v` plus its shift at this time.
+            let mut physical = pt.u.clone();
+            cum.add_shift(q, &mut physical);
+            record_at(q, &physical, &mut states, &mut recorded);
             if at_end || (q - t_end).br_abs_lt(1e-12) {
-                u.copy_from_slice(&pt.u);
+                u.copy_from_slice(&physical);
             }
         }
     }

@@ -302,8 +302,9 @@ impl InputRateKind {
     /// and a zero-magnitude no-op for the smooth `Transit`/`InverseGaussian` onsets
     /// (which need only the timeline break plus the continuous `∂R_in/∂lag_route`).
     /// `Weibull`'s onset **diverges** for shape `β < 1` (an integrable spike, no finite
-    /// rate-on saltation), so it stays FD — exactly as `weibull` + a compartment
-    /// lagtime does. Exhaustive (no `_` arm), the sibling of [`Self::supported_over_dual`]:
+    /// rate-on saltation), so a plain bolus into it (like one into a `Transit`) has no rate-on
+    /// to cross: the walk anchors the segment after its onset at the true onset, and a lagged
+    /// `β < 1` bolus is delivered in the cumulative frame (`CumulativeInputs`). Exhaustive (no `_` arm), the sibling of [`Self::supported_over_dual`]:
     /// adding a kind forces a decision here, and this must stay consistent with the
     /// `K_ROUTE_ONSET` handler's per-kind onset magnitude.
     pub fn route_lag_analytic(self) -> bool {
@@ -311,8 +312,8 @@ impl InputRateKind {
             InputRateKind::FirstOrder
             | InputRateKind::ZeroOrder
             | InputRateKind::Transit
-            | InputRateKind::InverseGaussian => true,
-            InputRateKind::Weibull => false,
+            | InputRateKind::InverseGaussian
+            | InputRateKind::Weibull => true,
         }
     }
 }
@@ -354,13 +355,11 @@ pub struct InputRateForcing {
     /// by `DoseAttrMap`), this is a per-*forcing* offset: it is read only in the
     /// pointwise forcing loop and the zero-order window construction, leaving the
     /// `dose_lagtimes` machinery (`tad_anchor`, `subject_dose_attrs`) untouched.
-    /// Since #859/#875 a per-route lag is served with **analytic** FOCE/FOCEI
-    /// gradients on the event-driven walk for every kernel except `weibull` — its
-    /// onset saltation is injected at `K_ROUTE_ONSET` (`sens/ode_provider.rs`), under
-    /// both the non-IOV and IOV (#877) paths. A `weibull` route lag stays on finite
-    /// differences (its `β < 1` onset diverges, an integrable spike with no finite
-    /// rate-on saltation), mirroring the `weibull()` + compartment-lagtime FD fallback.
-    /// See [`InputRateKind::route_lag_analytic`].
+    /// A per-route lag is served with **analytic** FOCE/FOCEI gradients on the
+    /// event-driven walk for every kernel: the onset saltation is injected at
+    /// `K_ROUTE_ONSET` (`sens/ode_provider.rs`), under both the non-IOV and IOV (#877)
+    /// paths, and a `weibull` / `transit` bolus is delivered in the cumulative frame
+    /// instead, whose onset needs none. See [`InputRateKind::route_lag_analytic`].
     pub lag_slot: Option<usize>,
 }
 
@@ -400,11 +399,9 @@ impl InputRateForcing {
     /// **added** to the dose's compartment lagtime to form the route's effective
     /// onset `t_dose + lag_cmt + lag_route`. Generic over `T: PkNum` so the same
     /// reader serves the `f64` prediction / FD-fit path and the `Dual2` analytic
-    /// provider: since #859/#875 a per-route lag is served analytically on the
-    /// event-driven walk for every kernel except `weibull` (its onset saltation
-    /// injected at `K_ROUTE_ONSET`), so `T = Dual2` reaches here too — under both the
-    /// non-IOV and IOV (#877) paths. A `weibull` route lag stays FD (divergent `β < 1`
-    /// onset). See [`InputRateKind::route_lag_analytic`].
+    /// provider: a per-route lag is served analytically on the event-driven walk for
+    /// every kernel, so `T = Dual2` reaches here too — under both the non-IOV and IOV
+    /// (#877) paths. See [`InputRateKind::route_lag_analytic`].
     #[inline]
     pub fn route_lag<T: PkNum>(&self, params: &[T]) -> T {
         self.lag_slot
@@ -855,6 +852,40 @@ impl<T: PkNum> PreparedInputRate<T> {
         }
     }
 
+    /// Whether this kernel's density is infinite at its onset — a Weibull with `β < 1` — so that
+    /// a lagged dose into it is delivered in the cumulative frame
+    /// (`CumulativeInputs`). A transit kernel is zero there for every
+    /// `n > 0` (its slope infinite for `n < 1`, which the anchored onset segment resolves), and a
+    /// Weibull with `β ≥ 1` is finite.
+    #[inline]
+    pub(crate) fn frame_kernel(&self) -> bool {
+        match *self {
+            PreparedInputRate::Weibull { beta, .. } => {
+                beta.br_cmp_c(crate::sens::num::BranchCmp::Lt, 1.0)
+            }
+            _ => false,
+        }
+    }
+
+    /// The not-yet-absorbed fraction `S(s) = 1 − G(s)` of this kernel at an age `s > 0`, without
+    /// the cancellation of `1 − G` where the dose is nearly all absorbed: transit's upper
+    /// regularized incomplete gamma `Q(n + 1, KTR·s)`, Weibull's `exp(−(s/Td)^β)`. The cumulative
+    /// frame (`CumulativeInputs`) reads this in place of the density,
+    /// which is infinite at the onset for `β < 1`. Any kind but those two is `1 − cdf`.
+    #[inline]
+    pub(crate) fn survival(&self, s: T) -> T {
+        match *self {
+            PreparedInputRate::Transit { ktr, n, .. } => {
+                crate::stats::special::regularized_gamma_q(n + T::from_f64(1.0), ktr * s)
+            }
+            PreparedInputRate::Weibull { beta, ln_td, .. } => {
+                let p = (beta * (s.ln() - ln_td)).exp();
+                (-p).exp()
+            }
+            _ => T::from_f64(1.0) - self.cdf(s),
+        }
+    }
+
     /// `G(s)` for an age `s` that is `≥ 0` by construction (a stage time minus an onset the
     /// segment lies after): [`Self::cdf`] away from zero, and at the tie `s = 0` — the first
     /// stage of a segment that opens at the onset — the right-hand Taylor continuation of `G`
@@ -989,9 +1020,9 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// `InverseGaussian` vanishes at onset for *every* valid `(mat, cv2)` (the
     /// essential singularity `−mat/(2·cv2·tad) → −∞` always dominates); `FirstOrder`
     /// is finite (`dose·ka`) with no boundary case. `Weibull`'s onset **diverges**
-    /// for shape `β < 1` (an integrable spike, not a finite jump) — callers must
-    /// exclude that combination rather than call this (see
-    /// `ode_walk_model_scope`'s lagtime gate). `ZeroOrder`'s own onset/cutoff is
+    /// for shape `β < 1` (an integrable spike, not a finite jump) — a plain bolus
+    /// is delivered in the cumulative frame and never asks; only a steady-state or infused
+    /// dose could, and an estimated lag on those is rejected upstream. `ZeroOrder`'s own onset/cutoff is
     /// handled entirely by its separate moving-window mechanism (#530), not this
     /// path.
     #[inline]
@@ -1016,7 +1047,7 @@ impl<T: PkNum> PreparedInputRate<T> {
                     dose * c0.exp()
                 } else {
                     // β < 1: the true onset is +∞ (an integrable spike). Callers
-                    // must not reach this arm (excluded upstream) — a NaN/∞ here
+                    // must not reach this arm (a bolus rides the cumulative frame) — a NaN/∞ here
                     // would poison the whole subject's prediction, not just its
                     // gradient.
                     T::from_f64(f64::NAN)
@@ -1053,8 +1084,8 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// `InverseGaussian` and `ZeroOrder`. It deliberately returns `0` — a documented
     /// limitation, leaving those Hessians on FD — for the **singular** `Transit`
     /// `0 < n < 1` (slope →`+∞`, no finite companion). `Weibull` `β < 1` diverges
-    /// (mirrors `rate_at_zero`, `NaN`) and is unreachable — the lagtime gate
-    /// (`ode_walk_model_scope`) keeps `Weibull` on the FD fallback. The `Transit`
+    /// (mirrors `rate_at_zero`, `NaN`) and is unreachable (a plain bolus rides
+    /// the cumulative frame). The `Transit`
     /// `n = 0`/`n = 1` and `Weibull` `β = 1` arms branch on **exact** `f64` equality
     /// (as `rate_at_zero` does), since the slope is discontinuous across each.
     #[inline]
@@ -1089,7 +1120,7 @@ impl<T: PkNum> PreparedInputRate<T> {
                     let ka = c0.exp();
                     -dose * ka * ka
                 } else {
-                    // β < 1: divergent onset, unreachable (excluded by the lagtime gate).
+                    // β < 1: divergent onset, unreachable (a bolus rides the cumulative frame).
                     T::from_f64(f64::NAN)
                 }
             }
