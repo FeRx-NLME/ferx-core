@@ -16,6 +16,9 @@ use rayon::iter::ParallelIterator;
 /// Calls `f(lo, hi)` on disjoint ranges covering `0..n`, in parallel on the current pool.
 #[inline(never)]
 fn run_ranges(n: usize, f: &(dyn Fn(usize, usize) + Sync)) {
+    // A leaf may run on a worker another fit shares: it reads the plans of the fit that spawned
+    // it (#2786).
+    let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
     rayon::iter::split((0usize, n), |(lo, hi)| {
         if hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
@@ -24,7 +27,9 @@ fn run_ranges(n: usize, f: &(dyn Fn(usize, usize) + Sync)) {
             ((lo, hi), None)
         }
     })
-    .for_each(|(lo, hi)| f(lo, hi));
+    .for_each(|(lo, hi)| {
+        crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(fit, || f(lo, hi))
+    });
 }
 
 /// Output buffer shared across workers; each index is written by exactly one leaf.

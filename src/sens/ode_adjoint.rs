@@ -170,7 +170,7 @@ pub(super) struct Scoped<'m> {
     pub width: usize,
     pub eta: Vec<f64>,
     /// The subject's layout under IOV, built once for every recording of the subject.
-    pub layout: Option<crate::stats::stacked_layout::StackedLayout>,
+    pub layout: Option<crate::stats::stacked_layout::LayRef<'m>>,
 }
 
 /// A packed point unpacked once: `template`, the packed `x` and `unpack_params(x, template)`.
@@ -299,7 +299,7 @@ pub(super) fn scope<'m>(
         params,
         width,
         eta,
-        layout: lay.map(std::borrow::Cow::into_owned),
+        layout: lay,
     })
 }
 
@@ -685,7 +685,7 @@ fn fixed_ebe_score_iov(
 ) -> Option<(f64, Vec<f64>)> {
     let (model, params, template) = (sc.model, sc.params, pt.template);
     let theta = &params.theta;
-    let lay = sc.layout.as_ref();
+    let lay = sc.layout.as_deref();
     let eta = &sc.eta[..];
     let n_bsv = model.n_eta;
     // The plan's first-order forward: the predictions and their `[η, κ]` columns, kept for
@@ -946,7 +946,7 @@ fn adjoint_gradient(
             Objective::Agq { n_agq, exact } => run_agq(
                 sc.model,
                 subject,
-                sc.layout.as_ref(),
+                sc.layout.as_deref(),
                 template,
                 sc.params,
                 x,
@@ -960,7 +960,7 @@ fn adjoint_gradient(
                 sc.model,
                 sc.pop_model,
                 subject,
-                sc.layout.as_ref(),
+                sc.layout.as_deref(),
                 template,
                 sc.params,
                 x,
@@ -2005,8 +2005,8 @@ fn record<T: VmNum>(
     let built;
     let lay = match lay {
         None if model.n_kappa > 0 => {
-            built = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
-            Some(&built)
+            built = crate::stats::stacked_layout::StackedLayout::sens_of_cached(model, subject)?;
+            Some(&*built)
         }
         lay => lay,
     };
@@ -2769,7 +2769,7 @@ fn resolve<'m, 'l>(
     &'m CompiledModel,
     usize,
     Vec<f64>,
-    Option<std::borrow::Cow<'l, crate::stats::stacked_layout::StackedLayout>>,
+    Option<crate::stats::stacked_layout::LayRef<'l>>,
 )> {
     let (eff, w, e, lay) = if model.n_kappa > 0 {
         if nested_levels_outside_scope(model) {
@@ -2779,10 +2779,10 @@ fn resolve<'m, 'l>(
         // The caller's layout is the subject's under any route: an ODE twin has the
         // model's `n_eta` / `n_kappa`, and one without the model's levels is declined above.
         let lay = match layout {
-            Some(l) => std::borrow::Cow::Borrowed(l),
-            None => std::borrow::Cow::Owned(crate::stats::stacked_layout::StackedLayout::sens_of(
-                eff, subject,
-            )?),
+            Some(l) => crate::stats::stacked_layout::LayRef::Borrowed(l),
+            None => crate::stats::stacked_layout::LayRef::Shared(
+                crate::stats::stacked_layout::StackedLayout::sens_of_cached(eff, subject)?,
+            ),
         };
         if model.has_nested_levels() && lay.nested().is_none() {
             return None;

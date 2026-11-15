@@ -1094,12 +1094,24 @@ pub(crate) fn population_variance_preds_iov(
     }
     let zeros_eta = vec![0.0_f64; n_eta];
     let zero_kappas: Vec<Vec<f64>> = vec![vec![0.0_f64; n_kappa]; k_occasions];
-    Some(pk::predict_iov(
+    // The subject's layout and schedule are the fit's, built once (the schedule is the one the
+    // EBE search reads; `None` where the gate declines, which `predict_iov` then builds itself).
+    let layout = crate::stats::stacked_layout::StackedLayout::new_cached(
+        zeros_eta.len(),
+        model.n_kappa,
+        subject,
+    );
+    let schedule =
+        crate::estimation::inner_optimizer::cacheable_schedule_iov_cached(model, subject);
+    Some(pk::predict_iov_in(
         model,
         subject,
+        &layout,
         theta,
         &zeros_eta,
         &zero_kappas,
+        &mut pk::EventPkParams::default(),
+        schedule.as_ref().as_ref(),
     ))
 }
 
@@ -3659,7 +3671,7 @@ pub(crate) fn iov_linearization(
     let n_obs = subject.obs_times.len();
     let n_eta = eta_hat.len();
     let n_iov = omega_iov.matrix.nrows();
-    let layout = crate::stats::stacked_layout::StackedLayout::new(n_eta, n_iov, subject);
+    let layout = crate::stats::stacked_layout::StackedLayout::new_cached(n_eta, n_iov, subject);
     if kappas.len() != layout.n_groups() || kappas.iter().any(|k| k.len() != n_iov) {
         return None;
     }
@@ -3684,10 +3696,12 @@ pub(crate) fn iov_linearization(
         &layout
     } else {
         model_width =
-            crate::stats::stacked_layout::StackedLayout::new(n_eta, model.n_kappa, subject);
+            crate::stats::stacked_layout::StackedLayout::new_cached(n_eta, model.n_kappa, subject);
         &model_width
     };
     let mut scratch = pk::EventPkParams::default();
+    let schedule =
+        crate::estimation::inner_optimizer::cacheable_schedule_iov_cached(model, subject);
     let mut predict = |k: &[Vec<f64>]| {
         pk::predict_iov_in(
             model,
@@ -3697,7 +3711,7 @@ pub(crate) fn iov_linearization(
             eta_hat.as_slice(),
             k,
             &mut scratch,
-            None,
+            schedule.as_ref().as_ref(),
         )
     };
     let ipreds = predict(&kappa_slices);
@@ -4674,7 +4688,8 @@ pub(crate) fn individual_nll_iov_frozen<K: AsRef<[f64]>>(
 ) -> f64 {
     // #1082: a nested-level subject never given its cells has no layout, and is refused
     // rather than scored as one-level IOV or with κ dropped.
-    let Some(layout) = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject) else {
+    let Some(layout) = crate::stats::stacked_layout::StackedLayout::sens_of_cached(model, subject)
+    else {
         return SUBJECT_SENTINEL_NLL;
     };
     individual_nll_iov_frozen_in(

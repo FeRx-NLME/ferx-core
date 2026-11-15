@@ -3923,6 +3923,130 @@ fn an_ebe_search_builds_the_subject_layout_a_fixed_number_of_times() {
     }
 }
 
+/// A registered subject's layout and schedule are the fit's: built once, whatever the number of
+/// evaluations, and equal to the ones a fresh build makes — so every objective, prediction and
+/// recording that reads them is bit-for-bit what it was. An unregistered subject (a temporary, a
+/// cut copy) is built each time, as before.
+/// Mutation: key the cache by the subject's address alone, or let a registered ask build again
+/// -> the build counts below; build the cached layout with other widths than the key says -> the
+/// fresh-equality assertions.
+#[test]
+fn a_registered_subjects_layout_and_schedule_are_built_once_and_equal_the_fresh_ones() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::register;
+    use crate::stats::stacked_layout::{StackedLayout, LAYOUT_BUILDS};
+    use std::sync::Arc;
+    let m = make_iov_model();
+    let subjects = vec![make_iov_subject()];
+    let s = &subjects[0];
+    let mut p = m.default_params.clone();
+    p.omega_iov = Some(OmegaMatrix::from_diagonal(&[0.04], vec!["KAPPA_CL".into()]));
+    let (eta, kappas) = ([0.1], vec![vec![0.05], vec![-0.1]]);
+    // A layout's content, without the `HashMap`'s iteration order: widths, the canonical bytes
+    // (groups and nesting) and every label's group.
+    let shape = |l: &StackedLayout| {
+        use std::hash::Hasher;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        l.canon(&mut h);
+        (
+            l.n_eta(),
+            l.n_kappa(),
+            l.n_groups(),
+            h.finish(),
+            (0..5).map(|o| l.group_of(o)).collect::<Vec<_>>(),
+        )
+    };
+    let nll = |s: &Subject| {
+        crate::stats::likelihood::individual_nll_iov(
+            &m,
+            s,
+            &p.theta,
+            &eta,
+            &kappas,
+            &p.omega,
+            p.omega_iov.as_ref(),
+            &p.sigma.values,
+        )
+    };
+    // Unregistered: every ask builds, and nothing is shared.
+    LAYOUT_BUILDS.set(0);
+    let (a, b) = (
+        StackedLayout::sens_of_cached(&m, s).expect("layout"),
+        StackedLayout::sens_of_cached(&m, s).expect("layout"),
+    );
+    assert_eq!(LAYOUT_BUILDS.get(), 2);
+    assert!(!Arc::ptr_eq(&a, &b));
+    LAYOUT_BUILDS.set(0);
+    let unregistered: Vec<f64> = (0..5).map(|_| nll(s)).collect();
+    let unregistered_builds = LAYOUT_BUILDS.get();
+    assert!(
+        unregistered_builds >= 5,
+        "an unregistered subject builds per evaluation: {unregistered_builds}"
+    );
+
+    let _fit = register(&m, &subjects);
+    LAYOUT_BUILDS.set(0);
+    let a = StackedLayout::sens_of_cached(&m, s).expect("layout");
+    let b = StackedLayout::sens_of_cached(&m, s).expect("layout");
+    let c = StackedLayout::new_cached(m.n_eta, m.n_kappa, s);
+    let d = StackedLayout::new_cached(m.n_eta, m.n_kappa, s);
+    let e = StackedLayout::new_cached(m.n_eta + 1, m.n_kappa, s);
+    assert_eq!(
+        LAYOUT_BUILDS.get(),
+        3,
+        "the sens layout once, each width pair of `new` once"
+    );
+    assert!(Arc::ptr_eq(&a, &b) && Arc::ptr_eq(&c, &d) && !Arc::ptr_eq(&c, &e));
+    assert_eq!(
+        shape(&a),
+        shape(&StackedLayout::sens_of(&m, s).expect("fresh")),
+        "the cached layout is the fresh one"
+    );
+    assert_eq!(shape(&c), shape(&StackedLayout::new(m.n_eta, m.n_kappa, s)));
+    assert_eq!(
+        shape(&e),
+        shape(&StackedLayout::new(m.n_eta + 1, m.n_kappa, s)),
+        "a layout of other widths is not the first one's"
+    );
+    assert_ne!(shape(&c), shape(&e));
+
+    // The schedule: one build, equal to the fresh one.
+    crate::pk::event_driven::reset_schedule_build_count();
+    let x = cacheable_schedule_iov_cached(&m, s);
+    let y = cacheable_schedule_iov_cached(&m, s);
+    assert!(Arc::ptr_eq(&x, &y));
+    assert!(x.is_some(), "fixture: this model's schedule is cacheable");
+    let built = crate::pk::event_driven::schedule_build_count();
+    assert_eq!(built, 1, "one schedule build for two asks");
+    assert_eq!(
+        format!("{:?}", *x),
+        format!("{:?}", cacheable_schedule_iov(&m, s)),
+        "the cached schedule is the fresh one"
+    );
+
+    // Evaluations of the registered subject build the sens layout (already held) no more times,
+    // and score what the unregistered ones do, to the bit.
+    LAYOUT_BUILDS.set(0);
+    let registered: Vec<f64> = (0..5).map(|_| nll(s)).collect();
+    assert_eq!(
+        LAYOUT_BUILDS.get(),
+        0,
+        "five objective evaluations of a registered subject build no layout"
+    );
+    for (r, u) in registered.iter().zip(&unregistered) {
+        assert_eq!(r.to_bits(), u.to_bits(), "{r} vs {u}");
+    }
+    // The FOCE reference predictions at η = κ = 0 (`population_variance_preds_iov`) are the
+    // predictor's own, through the cached layout and schedule.
+    let zero = vec![vec![0.0]; 2];
+    let direct = crate::pk::predict_iov(&m, s, &p.theta, &[0.0], &zero);
+    let cached = crate::stats::likelihood::population_variance_preds_iov(&m, s, &p.theta, 1, 1, 2)
+        .expect("a proportional error reads f");
+    assert_eq!(direct.len(), cached.len());
+    for (d, c) in direct.iter().zip(&cached) {
+        assert_eq!(d.to_bits(), c.to_bits());
+    }
+}
+
 /// #1082 PR5 / #2101: an IOV subject whose residuals a `correlation … by` line couples
 /// across rows runs its EBE search on the adjoint kernel's exact gradient of its (dense)
 /// objective; a subject of the same model whose blocks are all singletons keeps the per-row

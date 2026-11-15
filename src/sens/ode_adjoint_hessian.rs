@@ -1029,7 +1029,7 @@ impl<'a> CovPlan<'a> {
             None => super::with_plan(
                 model,
                 self.subject,
-                self.sc.layout.as_ref(),
+                self.sc.layout.as_deref(),
                 &self.th,
                 eta,
                 &mut serve,
@@ -1091,7 +1091,7 @@ impl<'a> CovPlan<'a> {
             None => super::with_plan_in(
                 self.sc.model,
                 self.subject,
-                self.sc.layout.as_ref(),
+                self.sc.layout.as_deref(),
                 &self.th,
                 Some(sigma),
                 eta,

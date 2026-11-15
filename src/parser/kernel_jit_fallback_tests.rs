@@ -884,7 +884,8 @@ const TWO_CPT_AMOUNTS: &str = r#"[data]
 // ---- Code-review findings on the failure report (#2786) -------------------------------------
 
 use super::{
-    note_failure, note_model_failure, plan_failure_counts, register, state_of, SubjectKey,
+    current_fit, in_fit, note_failure, note_model_failure, plan_failure_counts, register, state_of,
+    SubjectKey,
 };
 
 /// A closed-form transit model whose subjects reroute to its ODE twin (a time-varying `WT`).
@@ -992,21 +993,29 @@ fn a_twin_plan_failure_is_reported_and_leaves_with_the_fit() {
 fn overlapping_fits_of_one_model_keep_their_failures_apart() {
     let (m, p) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
     let (pa, pb) = (p.clone(), p.clone());
-    let (_a, _b) = (register(&m, &pa.subjects), register(&m, &pb.subjects));
+    // Each fit's registration on a thread that runs no fit (a registration inside a fit of the
+    // model joins it), and each fit's calls under its own id, as its pool's tasks run them.
+    fn reg<'a>(m: &'a CompiledModel, pop: &'a Population) -> (super::Prints<'a>, u64) {
+        in_fit(0, || {
+            let g = register(m, &pop.subjects);
+            (g, current_fit())
+        })
+    }
+    let ((_a, id_a), (_b, id_b)) = (reg(&m, &pa), reg(&m, &pb));
     let key = |s: &crate::types::Subject| SubjectKey::new(&m, s, 2, 6);
-    note_failure(&key(&pa.subjects[0]), "forced");
-    let a = plan_failure_counts(&m, &pa.subjects).expect("A's failure");
+    in_fit(id_a, || note_failure(&key(&pa.subjects[0]), "forced"));
+    let a = in_fit(id_a, || plan_failure_counts(&m, &pa.subjects)).expect("A's failure");
     assert_eq!((a.any, a.inner, a.outer), (1, 1, 1));
     assert_eq!(
-        plan_failure_counts(&m, &pb.subjects),
+        in_fit(id_b, || plan_failure_counts(&m, &pb.subjects)),
         None,
         "B's subjects share A's designs and nothing else"
     );
     // A failure of a subject the population does not hold counts for none of its subjects.
     let mut other = pa.subjects[0].clone();
     other.doses[0].amt += 1.0;
-    note_failure(&key(&other), "a cut copy");
-    let a = plan_failure_counts(&m, &pa.subjects).expect("A's failure");
+    in_fit(id_a, || note_failure(&key(&other), "a cut copy"));
+    let a = in_fit(id_a, || plan_failure_counts(&m, &pa.subjects)).expect("A's failure");
     assert_eq!(a.any, 1, "a stranger's failure is not a guess at A's");
     // The same through whole fits, concurrently: only the one whose plans fail reports.
     let (m2, p2) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
@@ -1032,6 +1041,82 @@ fn overlapping_fits_of_one_model_keep_their_failures_apart() {
     assert_eq!(fb.gradient_method_inner, "analytic");
 }
 
+/// Fits over the very same model and population objects (a multi-start) keep their plan
+/// failures apart: a registration is a fit of its own, and every lookup reads the fit its thread
+/// runs, across the pool's tasks too. One fit's plans are forced to fail while another's, at the
+/// same time over the same objects and with two workers, are not: only the first reports.
+/// Mutation: key a registered address by address alone (`registered` ignoring `CUR_FIT`) -> the
+/// second fit reports the first's failures.
+#[test]
+fn fits_over_the_same_objects_keep_their_plan_failures_apart() {
+    let (m, p) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
+    let o = FitOptions {
+        threads: Some(2),
+        ..opts(EstimationMethod::FoceI)
+    };
+    let fit = || crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
+    let barrier = std::sync::Barrier::new(2);
+    let (fa, fb) = std::thread::scope(|sc| {
+        let a = sc.spawn(|| {
+            barrier.wait();
+            plans_failing(fit)
+        });
+        let b = sc.spawn(|| {
+            barrier.wait();
+            fit()
+        });
+        (a.join().expect("A"), b.join().expect("B"))
+    });
+    let n = p.subjects.len();
+    assert!(
+        fa.warnings
+            .iter()
+            .any(|w| w.contains(TOKEN) && w.contains(&format!("{n} of {n} subjects"))),
+        "{:?}",
+        fa.warnings
+    );
+    assert!(
+        !fb.warnings.iter().any(|w| w.contains(TOKEN)),
+        "{:?}",
+        fb.warnings
+    );
+    assert_eq!(fb.gradient_method_inner, "analytic");
+}
+
+/// Registrations of one object are fits of their own: distinct scopes, each read under the
+/// thread's fit; a registration made inside a fit of the model joins it (one scope, so its plans
+/// are not recorded again), and the thread's fit is restored as they leave.
+/// Mutation: let a nested registration open a scope -> the joined assertion; let a guard leave
+/// its id set -> the restored assertions.
+#[test]
+fn registration_scopes_are_per_fit_and_nested_ones_join() {
+    use super::registered;
+    let (m, p) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
+    let addr = p.subjects.as_ptr() as usize;
+    assert_eq!(current_fit(), 0);
+    let a = register(&m, &p.subjects);
+    let fit_a = current_fit();
+    assert_ne!(fit_a, 0);
+    let nested = register(&m, &p.subjects);
+    assert_eq!(current_fit(), fit_a, "joined");
+    drop(nested);
+    assert_eq!(current_fit(), fit_a);
+    let b = in_fit(0, || {
+        let b = register(&m, &p.subjects);
+        let fit_b = current_fit();
+        assert_ne!(fit_b, fit_a);
+        assert_eq!(registered(addr).expect("b").1, fit_b);
+        in_fit(fit_a, || assert_eq!(registered(addr).expect("a").1, fit_a));
+        b
+    });
+    drop(b);
+    assert_eq!(current_fit(), fit_a, "the other fit's registration left it");
+    assert_eq!(registered(addr).expect("still a").1, fit_a);
+    drop(a);
+    assert_eq!(current_fit(), 0);
+    assert!(registered(addr).is_none());
+}
+
 /// A θ-only recording that fell back (`note_model_failure`) is the outer gradient's, so the
 /// inner route keeps its label: the warning is there, `gradient_method_outer` says finite
 /// differences, `gradient_method_inner` still says analytic. A covariance-step plan failure
@@ -1041,8 +1126,9 @@ fn overlapping_fits_of_one_model_keep_their_failures_apart() {
 fn an_outer_only_failure_keeps_the_inner_label() {
     let (m, p) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
     let o = opts(EstimationMethod::FoceI);
-    // Registered over the model first, so the fit's own registration shares its scope.
-    let guard = register(&m, &[]);
+    // Registered over the model first, so the fit's own registration (over the scored copy of the
+    // population, which is no registered object) joins it.
+    let guard = register(&m, &p.subjects);
     note_model_failure(&m, "a θ-only recording: test");
     let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
     assert!(

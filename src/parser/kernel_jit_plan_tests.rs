@@ -1801,7 +1801,8 @@ fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
     };
     keep(b.as_ptr() as usize, scope_b);
     for round in 0..4 {
-        let guard = register(&m, &a);
+        // On a thread that runs no fit: a registration inside a fit of the model joins it.
+        let guard = super::in_fit(0, || register(&m, &a));
         let scope_a = scope_of(&a);
         assert_ne!(scope_a, scope_b, "each fit has a scope of its own");
         // A structure no other test records, so the counts are this model's alone.

@@ -1859,6 +1859,25 @@ pub(crate) fn cacheable_schedule_iov(
     schedule_stays_fresh(model, subject).then(|| subject_schedule(model, subject))
 }
 
+/// [`cacheable_schedule_iov`], built once per fit for a registered subject
+/// ([`kernel_jit::prepared`](crate::parser::model_parser::rhs_regcode::kernel_jit::prepared)): it
+/// is a function of the subject and the model's identity alone.
+pub(crate) fn cacheable_schedule_iov_cached(
+    model: &CompiledModel,
+    subject: &Subject,
+) -> std::sync::Arc<Option<pk::event_driven::EventSchedule>> {
+    crate::parser::model_parser::rhs_regcode::kernel_jit::prepared(
+        subject,
+        (
+            "iov-schedule",
+            model.n_eta,
+            model.n_kappa,
+            model.plan_id.get(),
+        ),
+        || cacheable_schedule_iov(model, subject),
+    )
+}
+
 /// The staleness rules of [`cacheable_schedule`], the one place they live, so the IOV
 /// gate ([`cacheable_schedule_iov`]) and the routed one cannot drift: an analytical,
 /// event-driven, non-algebraic model, with no lagtime and no `F` reshaping a rate-defined
@@ -3973,7 +3992,7 @@ fn find_ebe_iov_seeded(
     // The subject's layout is built once here and shared by every objective and gradient
     // evaluation of the search (#2037); `None` only for a nested-level subject never given
     // its cells, whose objective is the refusal sentinel at every point.
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject);
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of_cached(model, subject);
     let nested = layout.as_ref().and_then(|l| l.nested());
     let n_flat = match &nested {
         Some(n) => n.n_compact(),
@@ -4062,7 +4081,8 @@ fn find_ebe_iov_seeded(
         EbeVariance::Conditional => None,
     };
     let frozen = frozen_var_preds.as_deref();
-    let schedule = cacheable_schedule_iov(model, subject);
+    let schedule_cached = cacheable_schedule_iov_cached(model, subject);
+    let schedule = schedule_cached.as_ref().as_ref();
 
     let obj = |p: &[f64]| -> f64 {
         // Recover bsv_eta = psi - mu; kappas pass through unchanged.
@@ -4089,7 +4109,7 @@ fn find_ebe_iov_seeded(
             // objective: the outer loop moves ρ, so the EBE search must see it.
             model.residual_cov_at(params),
             &mut pk_scratch.borrow_mut(),
-            schedule.as_ref(),
+            schedule,
             frozen,
         )
     };
@@ -4167,7 +4187,7 @@ fn find_ebe_iov_seeded(
         crate::sens::ode_provider::adjoint::exact_inner_gradient_in(
             model,
             subject,
-            layout.as_ref(),
+            layout.as_deref(),
             params,
             &stacked_true,
             frozen,
@@ -6103,7 +6123,7 @@ pub(crate) fn analytic_eta_nll_gradient_iov(
     sigma: &[f64],
     mult: Option<&[Vec<f64>]>,
 ) -> Option<Vec<f64>> {
-    let layout = crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?;
+    let layout = crate::stats::stacked_layout::StackedLayout::sens_of_cached(model, subject)?;
     analytic_eta_nll_gradient_iov_frozen(
         model,
         subject,
@@ -8183,6 +8203,7 @@ pub(crate) fn fd_h_subjects_redone(
     if fd_jacobian_ode_override(model).is_none() {
         return 0;
     }
+    let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
     population
         .subjects
         .par_iter()
@@ -8196,7 +8217,9 @@ pub(crate) fn fd_h_subjects_redone(
                 return false;
             }
             let before = fd_h_redone_on_this_thread();
-            ebe_h_matrix_of(model, subject, params, eta.as_slice(), subject_kappas);
+            crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(fit, || {
+                ebe_h_matrix_of(model, subject, params, eta.as_slice(), subject_kappas)
+            });
             fd_h_redone_on_this_thread() > before
         })
         .count()

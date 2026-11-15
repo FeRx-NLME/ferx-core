@@ -5467,6 +5467,7 @@ pub fn run_saem(
                 ))
             };
             let imh_counters_ref = &imh_counters;
+            let e_step_fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
             #[cfg(test)]
             let rw_block_calls_ref = &rw_block_calls;
 
@@ -5502,6 +5503,10 @@ pub fn run_saem(
                 .map_init(
                     MhScratch::default,
                     |mh_scratch, (i, (((((eta, &nll), &scale), cw_sc_i), kappas_i), imh_slot))| {
+                        // This task's plans key under the fit that spawned it (#2786).
+                        let _fit = crate::parser::model_parser::rhs_regcode::kernel_jit::enter_fit(
+                            e_step_fit,
+                        );
                         let subject = &population.subjects[i];
                         let mut rng = StdRng::seed_from_u64(
                             master_seed

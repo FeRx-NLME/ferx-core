@@ -267,6 +267,9 @@ impl FitScope {
                 f()
             }
         };
+        // The fit the caller runs (#2786): its plans, bad marks and failures key under it on
+        // whichever worker runs `f`.
+        let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
         move || {
             #[cfg(test)]
             let _declined = ForcedDeclineGuard::set(declined);
@@ -274,7 +277,7 @@ impl FitScope {
             let _inner = crate::estimation::inner_optimizer::arm_inner_settings(self.inner);
             let _fd = crate::types::arm_forced_fd(self.fd);
             let _bloq = crate::types::arm_bloq_override(self.bloq);
-            f()
+            crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(fit, f)
         }
     }
 

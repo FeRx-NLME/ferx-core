@@ -93,6 +93,23 @@ pub(crate) fn count_build() {
     LAYOUT_BUILDS.with(|c| c.set(c.get() + 1));
 }
 
+/// A subject's layout, the caller's or the fit's shared one
+/// ([`StackedLayout::sens_of_cached`]): both read through `Deref`.
+pub(crate) enum LayRef<'a> {
+    Borrowed(&'a StackedLayout),
+    Shared(std::sync::Arc<StackedLayout>),
+}
+
+impl std::ops::Deref for LayRef<'_> {
+    type Target = StackedLayout;
+    fn deref(&self) -> &StackedLayout {
+        match self {
+            LayRef::Borrowed(l) => l,
+            LayRef::Shared(l) => l,
+        }
+    }
+}
+
 /// One subject's stacked `[η_bsv, κ…]` layout. See the module docs.
 #[derive(Debug, Clone)]
 pub(crate) struct StackedLayout {
@@ -145,6 +162,35 @@ impl StackedLayout {
             occ_sorted,
             nested: None,
         }
+    }
+
+    /// [`Self::new`], built once per fit for a registered subject
+    /// ([`kernel_jit::prepared`](crate::parser::model_parser::rhs_regcode::kernel_jit::prepared)):
+    /// the layout is a function of the subject and the two widths alone.
+    pub(crate) fn new_cached(
+        n_eta: usize,
+        n_kappa: usize,
+        subject: &Subject,
+    ) -> std::sync::Arc<Self> {
+        crate::parser::model_parser::rhs_regcode::kernel_jit::prepared(
+            subject,
+            ("layout", n_eta, n_kappa, 0),
+            || Self::new(n_eta, n_kappa, subject),
+        )
+    }
+
+    /// [`Self::sens_of`], built once per fit for a registered subject: a function of the subject
+    /// and the model's widths and nested levels, which the model's identity fixes.
+    pub(crate) fn sens_of_cached(
+        model: &CompiledModel,
+        subject: &Subject,
+    ) -> Option<std::sync::Arc<Self>> {
+        let built = crate::parser::model_parser::rhs_regcode::kernel_jit::prepared(
+            subject,
+            ("sens", model.n_eta, model.n_kappa, model.plan_id.get()),
+            || Self::sens_of(model, subject).map(std::sync::Arc::new),
+        );
+        (*built).clone()
     }
 
     /// The layout of `subject` under `model`'s `n_eta` / `n_kappa`.

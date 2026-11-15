@@ -2172,30 +2172,94 @@ impl SubjectKey {
 /// A fit's registration: its model and subjects, fingerprinted once — [`SubjectKey::new`]
 /// reads them by address instead of hashing on every lookup — and a scope its plans are keyed
 /// by. The scope borrows what it registered, so nothing it covers can move or change
-/// meanwhile; when the last user of a model's scope leaves, that scope's plans are dropped.
-/// Anything unregistered (a temporary subject, a test's direct call) is hashed per call and
-/// keyed under scope `0`, whose plans leave with the model's id ([`drop_model`]).
+/// meanwhile; when the last user of a scope leaves, that scope's plans are dropped. Anything
+/// unregistered (a temporary subject, a test's direct call) is hashed per call and keyed under
+/// scope `0`, whose plans leave with the model's id ([`drop_model`]).
+///
+/// A registration is a *fit identity* ([`current_fit`]): the scope is the fit's id, and each
+/// address is registered per fit, so two fits over the very same model and population objects
+/// (a multi-start) plan, mark bad and report failures apart. A lookup reads the identity of the
+/// fit its thread is running ([`in_fit`]; every parallel task a fit spawns carries it).
 pub(crate) struct Prints<'a> {
     addrs: Vec<usize>,
+    fit: u64,
+    /// The fit the thread was running before this registration.
+    prev: u64,
     _borrow: std::marker::PhantomData<&'a ()>,
 }
 
-/// Per address: (descriptors — a model's solver options; a subject's design and observed
-/// values —, live registrations, scope).
-type PrintMap = HashMap<usize, (Arc<[Desc; 2]>, usize, u64), FxBuild>;
+/// One fit's registration of an address: (descriptors — a model's solver options; a subject's
+/// design and observed values —, live registrations).
+struct PrintEntry {
+    fit: u64,
+    descs: Arc<[Desc; 2]>,
+    refs: usize,
+    /// What is derived from the registered object alone ([`prepared`]).
+    prep: Arc<Prep>,
+}
+
+/// What a fit derives from one registered subject and reuses: structures that depend on the
+/// subject (and the model's identity) alone, built once per fit instead of once per evaluation.
+/// Keyed by what the structure is a function of ([`PrepKey`]); the entries leave with the
+/// registration.
+#[derive(Default)]
+struct Prep(Mutex<Vec<(PrepKey, Arc<dyn std::any::Any + Send + Sync>)>>);
+
+/// What a prepared structure is: its kind, the widths and the model ([`crate::types::PlanId`]) it
+/// is a function of, with the subject.
+pub(crate) type PrepKey = (&'static str, usize, usize, u64);
+type PrintMap = HashMap<usize, Vec<PrintEntry>, FxBuild>;
+impl Clone for PrintEntry {
+    fn clone(&self) -> Self {
+        Self {
+            fit: self.fit,
+            descs: self.descs.clone(),
+            refs: self.refs,
+            prep: self.prep.clone(),
+        }
+    }
+}
 static NEXT_SCOPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 static PRINTS: RwLock<Option<Arc<PrintMap>>> = RwLock::new(None);
 static PRINTS_VERSION: AtomicUsize = AtomicUsize::new(0);
 thread_local! {
     static PRINTS_SEEN: RefCell<(usize, Option<Arc<PrintMap>>)> = const { RefCell::new((0, None)) };
+    /// The fit this thread is running (`0`: none): a registered address is read under it.
+    static CUR_FIT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// Register `model` and `subjects` for the scope's lifetime (reference-counted). Each call
-/// gives the subjects it newly registers a scope of their own — their plans, bad marks and
-/// failures key apart from every other fit's of the same model, and leave with it — while the
-/// model's entry (and its closed-form absorption model's ODE twin, which subjects rerouted to
-/// it plan under) is shared by concurrent fits and keeps one scope for what has no subject
-/// ([`note_model_failure`], a cut copy).
+/// The id of the fit this thread is running (`0` when none).
+pub(crate) fn current_fit() -> u64 {
+    CUR_FIT.get()
+}
+
+/// This thread running fit `fit` until dropped, then the fit it ran before. Every task a fit
+/// hands to a pool opens one with the id captured on the spawning thread, so a worker shared by
+/// two fits reads each task under its own.
+pub(crate) struct FitGuard(u64);
+
+impl Drop for FitGuard {
+    fn drop(&mut self) {
+        CUR_FIT.set(self.0);
+    }
+}
+
+/// Run this thread as fit `fit` until the guard drops.
+pub(crate) fn enter_fit(fit: u64) -> FitGuard {
+    FitGuard(CUR_FIT.replace(fit))
+}
+
+/// `f` with this thread running fit `fit`.
+pub(crate) fn in_fit<R>(fit: u64, f: impl FnOnce() -> R) -> R {
+    let _guard = enter_fit(fit);
+    f()
+}
+
+/// Register `model` and `subjects` for the scope's lifetime (reference-counted). A call made
+/// outside any fit opens one: a scope of its own, which the plans, bad marks and failures of
+/// these objects key under apart from every other fit's — also of the same objects — and leave
+/// with. A call made inside a fit of the model (the covariance step, SIR) joins it. The model's closed-form
+/// absorption model's ODE twin, which subjects rerouted to it plan under, is registered too.
 pub(crate) fn register<'a>(
     model: &'a crate::types::CompiledModel,
     subjects: &'a [crate::types::Subject],
@@ -2208,48 +2272,74 @@ pub(crate) fn register<'a>(
     if let Some(twin) = model.absorption_ode_equivalent.as_ref().map(|t| t.built()) {
         add.push((twin as *const _ as usize, [solver_desc(twin), none]));
     }
-    let n_model = add.len();
     add.extend(
         subjects
             .iter()
             .map(|s| (s as *const _ as usize, [subject_desc(s), observed_desc(s)])),
     );
+    // A call inside a fit of this model joins it (the covariance step over a cut copy of the
+    // fit's population: one scope, one set of plans); anything else is a fit of its own. A
+    // concurrent fit of the same model runs on threads outside this one's, which carry no fit
+    // or their own.
+    let open = current_fit();
+    let probe = add[0].0;
+    let mut fit = 0;
     edit_prints(|m| {
-        let model_scope = m
-            .get(&add[0].0)
-            .map_or_else(|| NEXT_SCOPE.fetch_add(1, Relaxed), |e| e.2);
-        let fit_scope = NEXT_SCOPE.fetch_add(1, Relaxed);
-        for (i, (a, d)) in add.iter().enumerate() {
-            let scope = if i < n_model { model_scope } else { fit_scope };
-            m.entry(*a).or_insert((Arc::new(d.clone()), 0, scope)).1 += 1;
+        let joins = open != 0
+            && m.get(&probe)
+                .is_some_and(|v| v.iter().any(|e| e.fit == open));
+        fit = if joins {
+            open
+        } else {
+            NEXT_SCOPE.fetch_add(1, Relaxed)
+        };
+        for (a, d) in &add {
+            let v = m.entry(*a).or_default();
+            match v.iter_mut().find(|e| e.fit == fit) {
+                Some(e) => e.refs += 1,
+                None => v.push(PrintEntry {
+                    fit,
+                    descs: Arc::new(d.clone()),
+                    refs: 1,
+                    prep: Arc::default(),
+                }),
+            }
         }
     });
+    let prev = CUR_FIT.replace(fit);
     Prints {
         addrs: add.into_iter().map(|(a, _)| a).collect(),
+        fit,
+        prev,
         _borrow: std::marker::PhantomData,
     }
 }
 
 impl Drop for Prints<'_> {
     fn drop(&mut self) {
-        let mut touched = Vec::new();
+        if CUR_FIT.get() == self.fit {
+            CUR_FIT.set(self.prev);
+        }
+        let mut ended = false;
         edit_prints(|m| {
             for a in &self.addrs {
-                if let Some(e) = m.get_mut(a) {
-                    e.1 -= 1;
-                    if !touched.contains(&e.2) {
-                        touched.push(e.2);
+                if let Some(v) = m.get_mut(a) {
+                    if let Some(i) = v.iter().position(|e| e.fit == self.fit) {
+                        v[i].refs -= 1;
+                        if v[i].refs == 0 {
+                            v.swap_remove(i);
+                        }
                     }
-                    if e.1 == 0 {
+                    if v.is_empty() {
                         m.remove(a);
                     }
                 }
             }
             // A scope ends with its last entry.
-            touched.retain(|sc| !m.values().any(|e| e.2 == *sc));
+            ended = !m.values().flatten().any(|e| e.fit == self.fit);
         });
-        for scope in touched {
-            drop_scope(scope);
+        if ended {
+            drop_scope(self.fit);
         }
     }
 }
@@ -2264,10 +2354,12 @@ fn edit_prints(f: impl FnOnce(&mut PrintMap)) {
     PRINTS_VERSION.fetch_add(1, Relaxed);
 }
 
-/// The registry's entry at `addr`: the thread re-reads the registry only when its version
-/// moved, so a lookup takes no lock.
+/// The registry's entry at `addr` under the thread's fit (the first registration when the
+/// thread runs none that registered it): the thread re-reads the registry only when its
+/// version moved, so a lookup takes no lock.
 fn registered(addr: usize) -> Option<(Arc<[Desc; 2]>, u64)> {
     let v = PRINTS_VERSION.load(Relaxed);
+    let fit = CUR_FIT.get();
     PRINTS_SEEN.with(|c| {
         let mut c = c.borrow_mut();
         if c.0 != v {
@@ -2276,9 +2368,63 @@ fn registered(addr: usize) -> Option<(Arc<[Desc; 2]>, u64)> {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *c = (v, g.clone());
         }
-        c.1.as_ref()
-            .and_then(|m| m.get(&addr))
-            .map(|e| (e.0.clone(), e.2))
+        c.1.as_ref().and_then(|m| m.get(&addr)).and_then(|v| {
+            v.iter()
+                .find(|e| e.fit == fit)
+                .or_else(|| v.first())
+                .map(|e| (e.descs.clone(), e.fit))
+        })
+    })
+}
+
+/// The structure `key` of `subject`, built by `build` the first time a fit asks and reused
+/// after (an `Arc` of the one value). A subject no fit registered (a temporary, a cut copy, a
+/// test's direct call) has nothing to keep it under: `build` runs every time, as before.
+///
+/// Registered subjects are borrowed by their registration, so what is derived from one cannot go
+/// stale meanwhile; `key` names the rest of what the structure is a function of.
+pub(crate) fn prepared<T: Send + Sync + 'static>(
+    subject: &crate::types::Subject,
+    key: PrepKey,
+    build: impl FnOnce() -> T,
+) -> Arc<T> {
+    let Some(prep) = prep_of(subject as *const _ as usize) else {
+        return Arc::new(build());
+    };
+    let mut kept = prep
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(v) = kept
+        .iter()
+        .find(|(k, _)| *k == key)
+        .and_then(|(_, v)| v.clone().downcast::<T>().ok())
+    {
+        return v;
+    }
+    let v = Arc::new(build());
+    kept.push((key, v.clone()));
+    v
+}
+
+/// The prepared-structure store of the registered `addr` under the thread's fit.
+fn prep_of(addr: usize) -> Option<Arc<Prep>> {
+    let v = PRINTS_VERSION.load(Relaxed);
+    let fit = CUR_FIT.get();
+    PRINTS_SEEN.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.0 != v {
+            let g = PRINTS
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *c = (v, g.clone());
+        }
+        c.1.as_ref().and_then(|m| m.get(&addr)).and_then(|v| {
+            v.iter()
+                .find(|e| e.fit == fit)
+                .or_else(|| v.first())
+                .map(|e| e.prep.clone())
+        })
     })
 }
 

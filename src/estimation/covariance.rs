@@ -1627,6 +1627,7 @@ pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
     if let Some(d) = diag {
         vals.extend_from_slice(d);
     }
+    let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
     vals.par_extend(specs[skip..].par_iter().map(|&p| {
         // Cooperative cancel: skip this point's EBE reconvergence and
         // return NaN so the queue drains; bailed on below.
@@ -1634,7 +1635,9 @@ pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
             report();
             return f64::NAN;
         }
-        let v = eval_fd_point(x_hat, p, ofv);
+        let v = crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(fit, || {
+            eval_fd_point(x_hat, p, ofv)
+        });
         report();
         v
     }));
@@ -1831,6 +1834,7 @@ fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
             span: 2.0 * h,
         })
     };
+    let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
     gated
         .par_iter()
         .filter_map(|&(a, i)| {
@@ -1841,8 +1845,18 @@ fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
                 if at_tight {
                     let f0t = f0_tight?;
                     let (fp, fm) = rayon::join(
-                        || eval_fd_point(x_hat, plus, &tight),
-                        || eval_fd_point(x_hat, minus, &tight),
+                        || {
+                            crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(
+                                fit,
+                                || eval_fd_point(x_hat, plus, &tight),
+                            )
+                        },
+                        || {
+                            crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(
+                                fit,
+                                || eval_fd_point(x_hat, minus, &tight),
+                            )
+                        },
                     );
                     second(fp?, f0t, fm?, h)
                 } else {
@@ -1850,8 +1864,18 @@ fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
                         (diag[2 * a], diag[2 * a + 1])
                     } else {
                         rayon::join(
-                            || eval_fd_point(x_hat, plus, ofv),
-                            || eval_fd_point(x_hat, minus, ofv),
+                            || {
+                                crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(
+                                    fit,
+                                    || eval_fd_point(x_hat, plus, ofv),
+                                )
+                            },
+                            || {
+                                crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(
+                                    fit,
+                                    || eval_fd_point(x_hat, minus, ofv),
+                                )
+                            },
                         )
                     };
                     second(fp, f0, fm, h)
@@ -1928,7 +1952,11 @@ fn map_subjects<T: Send, F: Fn(usize) -> T + Sync>(
     if parallel {
         #[cfg(test)]
         reconverge_log::record(pop, true);
-        (0..n).into_par_iter().map(&f).collect()
+        let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
+        (0..n)
+            .into_par_iter()
+            .map(|i| crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(fit, || f(i)))
+            .collect()
     } else {
         #[cfg(test)]
         reconverge_log::record(pop, false);

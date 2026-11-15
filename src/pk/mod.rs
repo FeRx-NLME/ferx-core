@@ -2076,8 +2076,11 @@ pub(crate) fn predict_iov_with_scratch_and_schedule<K: AsRef<[f64]>>(
     scratch: &mut EventPkParams,
     schedule: Option<&event_driven::EventSchedule>,
 ) -> Vec<f64> {
-    let layout =
-        crate::stats::stacked_layout::StackedLayout::new(eta_bsv.len(), model.n_kappa, subject);
+    let layout = crate::stats::stacked_layout::StackedLayout::new_cached(
+        eta_bsv.len(),
+        model.n_kappa,
+        subject,
+    );
     predict_iov_in(
         model, subject, &layout, theta, eta_bsv, kappas, scratch, schedule,
     )
