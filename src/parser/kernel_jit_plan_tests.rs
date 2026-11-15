@@ -1651,13 +1651,14 @@ fn a_kept_forward_is_adopted_only_by_the_plan_that_made_it() {
     assert_ne!(a.serial, b.serial, "serials are unique");
     let owner = 0x5eed_0007usize;
     let keep = |p: &Plan| {
-        kept_table().lock().unwrap().insert(
+        kept_lock().insert(
             owner,
             Kept {
                 plan: p.serial,
                 layout: p.layout,
                 buf: vec![0.0; p.n_slots * p.lanes],
                 scope: 0,
+                model: 0,
             },
         );
     };
@@ -1789,13 +1790,14 @@ fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
         |s: &[crate::types::Subject]| registered(s.as_ptr() as usize).expect("registered").1;
     let scope_b = scope_of(&b);
     let keep = |owner: usize, scope: u64| {
-        kept_table().lock().unwrap().insert(
+        kept_lock().insert(
             owner,
             Kept {
                 plan: 0,
                 layout: l2(),
                 buf: vec![0.0; 4],
                 scope,
+                model: m.plan_id.get(),
             },
         );
     };
@@ -1836,4 +1838,169 @@ fn a_finished_fits_templates_and_kept_forwards_leave_with_its_scope() {
     }
     drop(guard_b);
     assert_eq!(kept_in(scope_b), 0, "B's leaves with B");
+}
+
+/// `drop_model` frees the dropped model's unregistered kept forwards and no other model's
+/// (#2786 round 2, finding 10). Mutation: `clear_kept(|k| k.scope == 0)` in `drop_model` (the
+/// old `clear_kept(0)`) -> the second model's forward is gone.
+#[test]
+fn drop_model_clears_only_its_own_kept_forwards() {
+    let (ma, mb) = (0x7a_0001u64, 0x7a_0002u64);
+    let (oa, ob) = (0x7a_1001usize, 0x7a_1002usize);
+    let put = |o: usize, model: u64| {
+        kept_lock().insert(
+            o,
+            Kept {
+                plan: 0,
+                layout: l2(),
+                buf: vec![0.0; 4],
+                scope: 0,
+                model,
+            },
+        );
+    };
+    put(oa, ma);
+    put(ob, mb);
+    drop_model(ma);
+    let t = kept_lock();
+    assert!(!t.contains_key(&oa), "the dropped model's forward is gone");
+    assert!(t.contains_key(&ob), "another model's forward stays");
+    drop(t);
+    drop_model(mb);
+    assert!(!kept_lock().contains_key(&ob));
+}
+
+/// The kept table's lock is taken from `Drop` (`drop_scope`, `Prints::drop`): one poisoned by a
+/// panic elsewhere must not turn a drop into a second panic (#2786 round 2, finding 9).
+/// Mutation: `.lock().unwrap()` in `kept_lock` -> the drop panics.
+#[test]
+fn a_poisoned_kept_table_does_not_panic_a_scope_drop() {
+    let h = std::thread::spawn(|| {
+        let _g = kept_table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        panic!("poison the kept table");
+    });
+    assert!(h.join().is_err());
+    assert!(kept_table().is_poisoned());
+    drop_scope(0x7a_ffff);
+    drop_model(0x7a_fffe);
+    assert_eq!(kept_in(0x7a_ffff), 0);
+    kept_table().clear_poison();
+}
+
+/// A recording that is not affine in the state (a right-hand side the exact linear path cannot
+/// take) is the subject's failure, a model property: condemned and counted by
+/// [`settle_failure`], not declined as a point's (#2786 round 2, finding 1). Mutation: make the
+/// check fail with `fail_here` (`FailScope::Point`) -> the scope is `Point` and the key stays
+/// `Missing`.
+#[test]
+fn a_right_hand_side_not_affine_in_the_state_is_condemned_and_counted() {
+    let m = crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let subs = vec![crate::types::Subject::default()];
+    let _g = register(&m, &subs);
+    begin();
+    let rhs = |u: &[Tr], _p: &[Tr], _t: Tr, f: &mut [Tr]| f[0] = u[0] * u[0];
+    let (mut a, mut b) = (vec![Tr::k(0.0)], vec![Tr::k(0.0)]);
+    assert!(!affine_parts(&rhs, &[], 0.0, &mut a, &mut b));
+    let Err((why, scope)) = end(Some(vec![])) else {
+        panic!("a non-affine right-hand side recorded");
+    };
+    assert_eq!(scope, FailScope::Subject, "{why}");
+    let key = SubjectKey::new(&m, &subs[0], 0, 0).with_variant(Desc::of_value(&0x5e_0001u64));
+    settle_failure(&key, &why, scope);
+    assert!(matches!(lookup(&key), Lookup::Bad), "condemned");
+    let c = plan_failure_counts(&m, &subs).expect("counted");
+    assert_eq!((c.any, c.inner, c.outer), (1, 1, 1));
+}
+
+/// Each scope settles its own way: a point's failure is counted (the call took finite
+/// differences) and not condemned, so a later call is re-served; a repelled point is neither
+/// counted nor condemned; the model's failure marks the model (#2786 round 2, finding 1).
+/// Mutations: drop `note_failure` from the `Point` arm -> not counted; make `Point` mark bad ->
+/// not re-served; count `Repelled` -> the count is 1 after it.
+#[test]
+fn settling_a_failure_counts_a_point_declines_a_repelled_point_and_marks_a_model() {
+    let new_model =
+        || crate::types::test_helpers::analytical_model(crate::types::GradientMethod::default());
+    let subs = vec![crate::types::Subject::default()];
+    let key = |m: &crate::types::CompiledModel, tag: u64| {
+        SubjectKey::new(m, &subs[0], 0, 0).with_variant(Desc::of_value(&tag))
+    };
+    // A repelled point: nothing noted, nothing marked.
+    let m = new_model();
+    let _g = register(&m, &subs);
+    let k = key(&m, 0x5e_0010);
+    settle_failure(&k, "overflowed", FailScope::Repelled);
+    assert!(matches!(lookup(&k), Lookup::Missing));
+    assert!(plan_failure_counts(&m, &subs).is_none());
+    // A point's failure: counted, not condemned, and the next call is served.
+    settle_failure(&k, "no steady state", FailScope::Point);
+    assert!(matches!(lookup(&k), Lookup::Missing), "not condemned");
+    let c = plan_failure_counts(&m, &subs).expect("counted");
+    assert_eq!((c.any, c.inner, c.outer), (1, 1, 1));
+    assert_eq!(c.why, "no steady state");
+    add(&k, square_plan());
+    assert!(matches!(lookup(&k), Lookup::Found(_)), "re-served");
+    // The model's failure marks the model, and every subject's key with it.
+    let m2 = new_model();
+    let _g2 = register(&m2, &subs);
+    let k2 = key(&m2, 0x5e_0011);
+    settle_failure(&k2, "unsupported", FailScope::Model);
+    assert!(matches!(lookup(&k2), Lookup::Bad));
+    assert!(
+        model_bad(&key(&m2, 0x5e_0012)).is_some(),
+        "the model is bad"
+    );
+    assert!(model_bad(&k).is_none(), "another model is not");
+}
+
+/// A failure at a point whose recorded values overflowed — the individual parameters, an
+/// intermediate, a `NaN` guard — is the point's alone and is repelled, whatever it names: a
+/// predictor that bailed ("the recorder returned None", the subject's scope on a sane point) and
+/// a record-time run that failed (`Point`) alike; and a recording whose values were not all
+/// finite says so (`finite()`), so a plan is not condemned for failing to serve at its own
+/// point there (#2786 round 2, finding 2). The control side of each gate is asserted: on finite
+/// values the scopes stay. Mutation: drop the `nonfinite` flag from `Rec::store` -> every
+/// overflow row reads its finite-side scope.
+#[test]
+fn a_failure_at_an_overflowed_point_is_repelled_and_a_finite_one_keeps_its_scope() {
+    let overflow = || Tr::eta(0, 800.0).exp();
+    let fine = || Tr::eta(0, 1.0).exp();
+    // A bailing predictor.
+    begin();
+    let x = overflow();
+    assert!(!x.recorded().is_finite());
+    assert_eq!(end(None).err().expect("fails").1, FailScope::Repelled);
+    begin();
+    let _ = fine();
+    assert_eq!(end(None).err().expect("fails").1, FailScope::Subject);
+    // A record-time run that failed.
+    begin();
+    let _ = overflow();
+    fail_here("run");
+    assert_eq!(
+        end(Some(vec![])).err().expect("fails").1,
+        FailScope::Repelled
+    );
+    begin();
+    let _ = fine();
+    fail_here("run");
+    assert_eq!(end(Some(vec![])).err().expect("fails").1, FailScope::Point);
+    // The model's own failure is not the point's, overflowed or not.
+    begin();
+    let _ = overflow();
+    fail("unsupported".into());
+    assert_eq!(end(Some(vec![])).err().expect("fails").1, FailScope::Model);
+    // A recording that succeeds says whether its values were all finite: the guard NaN of
+    // `inf - inf` is one even where every output is finite.
+    begin();
+    let (big, one) = (overflow(), fine());
+    let nan = big - big;
+    let rec = end(Some(vec![one.reg(), nan.reg()])).expect("records");
+    assert!(!rec.finite());
+    begin();
+    let one = fine();
+    let rec = end(Some(vec![one.reg()])).expect("records");
+    assert!(rec.finite());
 }

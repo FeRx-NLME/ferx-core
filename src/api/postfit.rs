@@ -1854,25 +1854,62 @@ pub(crate) fn refresh_plan_fd_fallback(
     out.warnings.retain(|w| !w.contains(CODE));
     out.warnings_structured
         .retain(|e| !e.message.contains(CODE));
-    if let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
-        model,
-        &population.subjects,
-    ) {
-        let (msg, entry) = plan_fd_fallback_warning(&c, population.subjects.len());
+    apply_plan_failures(
+        out,
+        crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
+            model,
+            &population.subjects,
+        )
+        .as_ref(),
+        population.subjects.len(),
+    );
+}
+
+/// Report `counts` (`None`: no plan failed) on `out`: the warning, and each route's label from
+/// its own count — a θ-only failure is the outer gradient's alone, a covariance-step one
+/// neither's. The labels restart from the base route they were rewritten from, so a result that
+/// already carries a rewritten label (an earlier fit's) reads what these counts say and
+/// nothing else. The one place the warning and the labels are made from the same counts.
+pub(crate) fn apply_plan_failures(
+    out: &mut FitResult,
+    counts: Option<&crate::parser::model_parser::rhs_regcode::kernel_jit::PlanFailureCounts>,
+    n: usize,
+) {
+    let (inner, outer) = counts.map_or((0, 0), |c| (c.inner, c.outer));
+    out.gradient_method_inner =
+        plan_fallback_label(&plan_fallback_base(&out.gradient_method_inner), inner, n);
+    out.gradient_method_outer =
+        plan_fallback_label(&plan_fallback_base(&out.gradient_method_outer), outer, n);
+    if let Some(c) = counts {
+        let (msg, entry) = plan_fd_fallback_warning(c, n);
         out.warnings.push(msg);
         out.warnings_structured.push(entry);
     }
 }
 
+/// The route label [`plan_fallback_label`] rewrote `label` from: `analytic` for either of its
+/// forms (it rewrites only an analytic route), `label` itself otherwise.
+fn plan_fallback_base(label: &str) -> String {
+    let analytic = crate::build_info::GradientMethodKind::Analytic.as_str();
+    if label == PLAN_FAILED_ALL_FD || label.starts_with("analytic ×") {
+        analytic.to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+const PLAN_FAILED_ALL_FD: &str = "finite differences (compiled plan failed)";
+
 /// The route label of a fit with `k` of `n` subjects on finite differences because their
-/// plans failed (#2949): `label` unchanged for `k = 0` or for a label that names no gradient
-/// (`N/A`); every subject on FD reads `finite differences (compiled plan failed)`; a split
-/// reads like the banner's, `analytic ×a, FD ×k`.
+/// plans failed (#2949): `label` unchanged for `k = 0` or for a label that is not the analytic
+/// route (`N/A`, or `finite differences` already: no plan fed that gradient, so none failed
+/// it); every subject on FD reads `finite differences (compiled plan failed)`; a split reads
+/// like the banner's, `analytic ×a, FD ×k`.
 pub(crate) fn plan_fallback_label(label: &str, k: usize, n: usize) -> String {
-    if k == 0 || label == crate::build_info::GradientMethodKind::NotApplicable.as_str() {
+    if k == 0 || label != crate::build_info::GradientMethodKind::Analytic.as_str() {
         label.to_string()
     } else if k >= n {
-        "finite differences (compiled plan failed)".to_string()
+        PLAN_FAILED_ALL_FD.to_string()
     } else {
         format!("analytic ×{}, FD ×{k}", n - k)
     }

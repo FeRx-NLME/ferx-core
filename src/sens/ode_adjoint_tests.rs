@@ -10899,3 +10899,63 @@ fn the_reduced_basis_plan_honours_a_model_level_bad_mark() {
     assert!(r.is_none() && !called, "declined without recording");
     assert!(matches!(kj::lookup(&key), kj::Lookup::Bad));
 }
+
+/// An overflowing η (`exp(800) = ∞` on both parameters) never condemns the subject, on a plain
+/// model or a steady-state one, and whether the predictions there happen to be finite or not
+/// (#2786 round 2, finding 2): with `CL = ∞` the predictions at `t > 0` are exactly `0`, so a
+/// check on the final predictions alone calls the point sane, and the guard's own `inf − inf`
+/// (or a predictor that bails on the overflowed parameter) then condemned the subject. The
+/// sanity is read off the recording's own values (`Recording::finite`, `FailScope::Repelled`).
+/// Afterwards a sane point is served by a plan and nothing is noted. Mutation: take `sane` from
+/// the predictions alone in `kjit_record` (drop `&& finite`) and the `nonfinite` -> `Repelled`
+/// mapping in `end` -> the plain row marks the subject bad.
+#[test]
+fn an_overflowing_eta_does_not_condemn_a_plain_or_a_steady_state_subject() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let mut n = 0.0;
+    // Overflow on CL, on V, on both, and the opposite signs: predictions are `NaN`, `0` or
+    // finite, depending on which.
+    for extreme in [
+        [800.0, 800.0],
+        [800.0, 0.0],
+        [0.0, 800.0],
+        [800.0, -800.0],
+        [-800.0, 800.0],
+    ] {
+        for (label, ss) in [("plain", false), ("steady state", true)] {
+            n += 1.0;
+            let model = tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap());
+            // Each subject its own (the dose differs), so a condemnation names its point.
+            let amt = 100.0 + n;
+            let dose = if ss {
+                DoseEvent::new(0.0, amt, 1, 0.0, true, 12.0)
+            } else {
+                DoseEvent::new(0.0, amt, 1, 0.0, false, 0.0)
+            };
+            let times = [0.5, 1.0, 2.0, 4.0, 8.0, 11.0];
+            let s = subject(&model, vec![dose], &times, &[0.1, -0.05]);
+            let params = moved_params(&model);
+            let label = format!("{label} at {extreme:?}");
+            // Declined whichever way the consumer scores it there.
+            for serves in [
+                &mut (|_: &PlanArc| None::<()>) as &mut dyn FnMut(&PlanArc) -> Option<()>,
+                &mut |_: &PlanArc| Some(()),
+            ] {
+                let _ = super::with_plan(&model, &s, None, &params.theta, &extreme, serves);
+            }
+            let key = plan_key(&model, &s, 2, params.theta.len());
+            assert!(
+                !matches!(kj::lookup(&key), kj::Lookup::Bad),
+                "{label}: the overflow condemned the subject"
+            );
+            // The next, sane point is served by a plan and nothing is condemned.
+            let worst = parity(&model, &s);
+            assert!(
+                worst < 1e-6,
+                "{label}: worst relative difference {worst:.2e}"
+            );
+            let failed = kj::plan_failures(&model, std::slice::from_ref(&s));
+            assert!(failed.is_none(), "{label}: a plan failed later: {failed:?}");
+        }
+    }
+}

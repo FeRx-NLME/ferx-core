@@ -2504,7 +2504,9 @@ fn push_route_lag_break_times(
 }
 
 /// Whether stage time `t` of a segment lies on the side of the infusion edge `edge` that the
-/// segment's start put it on: before it (`edge` ahead of the segment, `t ≤ edge`). The convolved
+/// segment's start put it on: before it (`edge` ahead of the segment, `t ≤ edge`). Used by the
+/// debug check on the onset and, for the number types that record nothing, the window end's
+/// side; a recording type makes the end's side a selection on the stage's time. The convolved
 /// infusion rate trusts the segment to lie wholly before its onset or past it, which holds only
 /// while every caller's break list holds the onset, the route lag's included; that is debug-checked
 /// (#2786 review #14). The window end is not trusted: a stage past it of a segment that starts
@@ -3137,18 +3139,34 @@ pub(crate) fn add_prepared_input_rate_forcing<
                 // break list holds the end, so a segment is wholly on one side). A stage past
                 // the end of a segment that *starts* before it — a break list that lacks the
                 // end, which in release would run `R_in` on past the infusion as extra mass —
-                // is read on the tail side by its own time instead: one plain `f64` compare per
-                // stage, outside the recorded branches (so no recording or bit changes when
-                // the break is there), with the integrators' own time slack so a stage at the
-                // end itself never flips.
-                let tail_age = if end.br_cmp(crate::sens::num::BranchCmp::Le, reached)
-                    || !infusion_edge_is_a_break(t.seen_value(), end.seen_value())
-                {
-                    Some(t - end)
+                // is read on the tail side by its own time instead, with the integrators' own
+                // time slack so a stage at the end itself never flips.
+                let ended = end.br_cmp(crate::sens::num::BranchCmp::Le, reached);
+                if T::RECORDS_BRANCHES && !ended {
+                    // A recording type decides that by the stage's own time as a *selection*
+                    // (#2786): the stage time moves inside an ODE step, so a branch would be a
+                    // guard that a segment straddling the end fails at its later stages, and a
+                    // plain read would bake the side the recording's stage was on. Both sides
+                    // are computed and the stage's time picks one, at any θ: the tail's age is
+                    // a safe `1` where it is not taken (its kernel is then at an ordinary age).
+                    use crate::sens::num::BranchCmp::Gt;
+                    let slack = T::from_f64(1e-9) * (T::from_f64(1.0) + end.abs());
+                    let (limit, one) = (end + slack, T::from_f64(1.0));
+                    let age = T::select_if(Gt, t, limit, t - end, one);
+                    let tail = prep.rate_infused(tad, dose_mass, window, Some(age));
+                    let running = prep.rate_infused(tad, dose_mass, window, None);
+                    T::select_if(Gt, t, limit, tail, running)
                 } else {
-                    None
-                };
-                prep.rate_infused(tad, dose_mass, window, tail_age)
+                    // The same predicate, [`infusion_edge_is_a_break`] negated: one plain `f64`
+                    // compare per stage for the number types that record nothing.
+                    let tail_age =
+                        if ended || !infusion_edge_is_a_break(t.seen_value(), end.seen_value()) {
+                            Some(t - end)
+                        } else {
+                            None
+                        };
+                    prep.rate_infused(tad, dose_mass, window, tail_age)
+                }
             } else if T::RECORDS_BRANCHES {
                 // A recording type (#2786) records this inside an ODE step, where the stage
                 // time crosses the dose: the window is a selection, the kernel evaluated at a

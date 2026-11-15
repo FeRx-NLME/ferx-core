@@ -443,6 +443,7 @@ fn record_sub(
         ode: true,
         dense: true,
         declined: 0,
+        finite: true,
         tie: Default::default(),
     })
 }

@@ -524,8 +524,13 @@ pub(super) fn record_segment(
             .map(|&c| vals.get(c as usize).copied().unwrap_or(f64::NAN)),
     );
     let mut out = vec![0.0; spec.n_out()];
-    let ran = LoopKernels::resolve(&spec, Layout::F64, false)
-        .is_some_and(|k| run_loop(&spec, &k, 1, &inputs, &mut out, auto, None));
+    // No kernel for this segment is structural (the subject's); a run that fails on its values
+    // is this point's.
+    let Some(kernels) = LoopKernels::resolve(&spec, Layout::F64, false) else {
+        fail_subject("an ODE segment has no kernels");
+        return None;
+    };
+    let ran = run_loop(&spec, &kernels, 1, &inputs, &mut out, auto, None);
     if !ran {
         if super::debug() {
             eprintln!(

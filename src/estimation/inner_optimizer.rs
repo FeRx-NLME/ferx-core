@@ -1213,7 +1213,7 @@ pub(crate) struct FallbackCertifier<'a> {
     pub(crate) precond: Option<&'a [f64]>,
     /// Stopping-metric preconditioner, as in the BFGS `gnorm < tol` test (FREM only).
     pub(crate) stop_precond: Option<&'a [f64]>,
-    /// Per-iterate objective-stall predicate (see [`inner_stall_enabled_at`]).
+    /// Per-iterate objective-stall predicate (see `inner_stall_enabled_at`).
     pub(crate) stall_at: &'a dyn Fn(&[f64]) -> bool,
     pub(crate) n: usize,
     pub(crate) max_iter: usize,
@@ -1712,7 +1712,7 @@ fn reject_ode_iov_inner_start(model: &CompiledModel, n_obs: usize, nll: f64) -> 
 /// building the twin for those, so this adds no cost on the common path.
 ///
 /// **This is the subject-static half only**, and no solve calls it any more: the non-IOV inner
-/// solve calls [`inner_stall_enabled_at`] and the IOV solve [`inner_stall_enabled_at_iov`],
+/// solve reads `EvalRoute::at` (the test seam `inner_stall_enabled_at`) and the IOV solve [`inner_stall_enabled_at_iov`],
 /// because since #1560 an IOV transit/IG subject is no longer on its twin subject-statically —
 /// the absorption walk serves it exactly unless its per-occasion parameters put a (dose,
 /// interval) pair in flip-flop. Kept for the tests that assert this half is blind to that.
@@ -1765,18 +1765,58 @@ fn inner_stall_enabled(model: &CompiledModel, subject: &Subject) -> bool {
 /// non-transit/IG model), when the subject is already on an ODE twin, and when the parameters
 /// are in domain — so only a subject that *is* being integrated numerically changes behaviour,
 /// which is the whole point.
+#[cfg(test)]
 fn inner_stall_enabled_at(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
     eta: &[f64],
 ) -> bool {
-    crate::pk::effective_model_for_eval(model, subject, theta, eta)
-        .ode_spec
-        .is_some()
+    EvalRoute::at(model, subject, theta, eta).ode
 }
 
-/// [`inner_stall_enabled_at`] for the IOV inner solve, at one stacked iterate
+/// What the model *actually evaluated* at one `(θ, η)` is, decided once per point from one
+/// [`crate::pk::effective_model_for_eval`] (a transit/IG closed form leaves its domain and is
+/// rerouted to its ODE twin): the inner solve's stall stop and the fused value's memo both read
+/// it, and each used to ask again at every iterate.
+#[derive(Clone, Copy)]
+struct EvalRoute {
+    /// The objective is numerical (an ODE, or a twin the search has crossed into).
+    ode: bool,
+    /// The fused gradient pass's value is bit-equal to the native objective there: closed form
+    /// and one the plan scores bit-equal (`plan_value_bit_equal`, which excludes a lagged model).
+    fused_native: bool,
+    /// The model carries a lag time (a test counts the memo puts that are not native).
+    #[cfg(test)]
+    lagged: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The points [`EvalRoute::at`] decided on this thread, in order (a test asserts the solve
+    /// asks once per point, not once per consumer).
+    pub(crate) static EVAL_ROUTE_LOG: RefCell<Vec<Vec<u64>>> = const { RefCell::new(Vec::new()) };
+}
+
+impl EvalRoute {
+    fn at(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) -> Self {
+        #[cfg(test)]
+        EVAL_ROUTE_LOG.with(|l| {
+            l.borrow_mut()
+                .push(eta.iter().map(|v| v.to_bits()).collect())
+        });
+        let eff = crate::pk::effective_model_for_eval(model, subject, theta, eta);
+        let ode = eff.ode_spec.is_some();
+        EvalRoute {
+            ode,
+            fused_native: !ode && crate::stats::likelihood::plan_value_bit_equal(eff),
+            #[cfg(test)]
+            lagged: eff.has_lagtime(),
+        }
+    }
+}
+
+/// `inner_stall_enabled_at` for the IOV inner solve, at one stacked iterate
 /// `[η_bsv, κ_g0.., κ_g1..]` (η in true space, not ψ).
 ///
 /// Before #1560 this was constant for the whole solve, because `n_kappa > 0` sent every
@@ -1784,7 +1824,7 @@ fn inner_stall_enabled_at(
 /// those subjects exactly, so their objective is exact and must keep the `gnorm < tol` stop —
 /// and whether the walk serves them is decided per (dose, interval) pair at the *current* κ, so
 /// a solve can cross into the twin partway through, exactly as in the non-IOV case. The IOV
-/// solve therefore latches this per iterate, like [`inner_stall_enabled_at`].
+/// solve therefore latches this per iterate, like `inner_stall_enabled_at`.
 ///
 /// Identical to `effective_for` for every subject the walk cannot take
 /// (`effective_model_for_eval_iov` returns `effective_for` for them), so only a walk-eligible
@@ -3074,16 +3114,28 @@ fn find_ebe_solve(
     // [`dense_bfgs_core`] / [`lbfgs_core`]. The value at the *start* point still drives the
     // two pre-solve policies below (`short_line_search`, `certify_partial`), which have to
     // be decided before the search runs.
-    let stall_at = |e: &[f64]| inner_stall_enabled_at(model, subject, &params.theta, e);
+    // One decision per evaluated point, shared by the stall stop below and the fused-value
+    // checks: the search asks about the same iterate several times (the driver's per-iterate
+    // stall test, then the gradient and the fused trial there), keyed by the point's bits.
+    let route_cache: RefCell<Option<(Vec<u64>, EvalRoute)>> = RefCell::new(None);
+    let route_at = |e: &[f64]| -> EvalRoute {
+        let mut c = route_cache.borrow_mut();
+        if let Some((k, r)) = c.as_ref() {
+            if k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits()) {
+                return *r;
+            }
+        }
+        let r = EvalRoute::at(model, subject, &params.theta, e);
+        *c = Some((e.iter().map(|v| v.to_bits()).collect(), r));
+        r
+    };
+    let stall_at = |e: &[f64]| route_at(e).ode;
     let enable_stall = stall_at(&eta);
     // Whether the gradient pass's fused value at `e` is bit-equal to the native objective there:
     // the model *actually evaluated* at `e` is closed form (not a transit/IG twin the search has
     // crossed into) and one the plan scores bit-equal (`plan_value_bit_equal`, which excludes a
     // lagged model). The memo must hold one engine's values for the line search to compare.
-    let fused_value_native_at = |e: &[f64]| -> bool {
-        let eff = crate::pk::effective_model_for_eval(model, subject, &params.theta, e);
-        eff.ode_spec.is_none() && crate::stats::likelihood::plan_value_bit_equal(eff)
-    };
+    let fused_value_native_at = |e: &[f64]| -> bool { route_at(e).fused_native };
     // Single gradient closure used by *both* the optimizer and the fallback's stationarity
     // check, so the two agree on convergence: the exact analytic η-gradient (Almquist 2015,
     // one provider eval per step) when in scope with a per-point FD fallback, else FD
@@ -3168,9 +3220,8 @@ fn find_ebe_solve(
                     #[cfg(test)]
                     {
                         MEMO_PLAN_PUTS.with(|c| c.set(c.get() + 1));
-                        let eff =
-                            crate::pk::effective_model_for_eval(model, subject, &params.theta, e);
-                        if eff.ode_spec.is_some() || eff.has_lagtime() {
+                        let r = route_at(e);
+                        if r.ode || r.lagged {
                             MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.set(c.get() + 1));
                         }
                     }
@@ -3743,7 +3794,7 @@ fn find_ebe_solve(
     // The forward the solve's last gradient (or this Jacobian) took at `η̂`, for the outer
     // gradient's reverse at the same point.
     if use_analytic {
-        crate::sens::ode_provider::adjoint::keep_forward(subject, &params.theta, &eta_true);
+        crate::sens::ode_provider::adjoint::keep_forward(model, subject, &params.theta, &eta_true);
     }
     let at_mode = |k: &[u64]| k.iter().copied().eq(eta_true.iter().map(|v| v.to_bits()));
     let n_obs = subject.obs_times.len();
@@ -4575,7 +4626,7 @@ fn find_ebe_iov_seeded(
         for k in &kappas_vec {
             stacked.extend(k.iter().copied());
         }
-        crate::sens::ode_provider::adjoint::keep_forward(subject, &params.theta, &stacked);
+        crate::sens::ode_provider::adjoint::keep_forward(model, subject, &params.theta, &stacked);
     }
 
     EbeResult {

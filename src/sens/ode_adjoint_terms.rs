@@ -136,8 +136,8 @@ pub(crate) fn term_plans<S: crate::survival::SubjectTerm>(
     let y = term.eval(&th, &et);
     let rec = match kj::end(y.map(|v| vec![v.reg()])) {
         Ok(r) => r,
-        Err((why, _)) => {
-            kj::mark_bad(&key, &why);
+        Err((why, scope)) => {
+            kj::settle_failure(&key, &why, scope);
             return None;
         }
     };

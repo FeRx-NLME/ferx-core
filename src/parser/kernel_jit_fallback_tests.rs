@@ -1182,3 +1182,91 @@ fn a_kernel_failure_counts_the_subject_whose_data_it_is() {
     let c = plan_failure_counts(&m, &p.subjects).expect("counted");
     assert_eq!(c.any, 2);
 }
+
+/// A fit whose outer route is already finite differences (Gauss-Newton: its outer step reads no
+/// analytic gradient) keeps that label when plans fail: no plan fed it, so none failed it, and
+/// "(compiled plan failed)" there would blame the plans for a route they never took (#2786
+/// round 2, finding 3). The inner route is the plans', and is rewritten. Mutation: let
+/// `plan_fallback_label` rewrite any label but `N/A` -> the outer label changes.
+#[test]
+fn a_finite_difference_outer_route_keeps_its_label_when_plans_fail() {
+    let (m, p) = example("examples/warfarin.ferx", "data/warfarin.csv");
+    let (exact, forced) = pair(&m, &p, &opts(EstimationMethod::FoceGn));
+    assert_eq!(exact.gradient_method_outer, "finite differences");
+    assert_eq!(forced.gradient_method_outer, "finite differences");
+    assert_eq!(exact.gradient_method_inner, "analytic");
+    assert_eq!(
+        forced.gradient_method_inner,
+        "finite differences (compiled plan failed)"
+    );
+    use crate::api::postfit::plan_fallback_label as lab;
+    assert_eq!(lab("finite differences", 1, 4), "finite differences");
+    assert_eq!(lab("finite differences", 4, 4), "finite differences");
+}
+
+/// A standalone post-fit step makes the labels from the same counts as the warning (#2786 round
+/// 2, finding 6): over a fit that carries FD labels and the warning, a clean `run_covariance`
+/// reports neither — not a warning-less result whose labels still say `FD`. Mutation: make
+/// `refresh_plan_fd_fallback` strip the warning only -> the labels stay rewritten.
+#[test]
+fn a_clean_standalone_step_restores_the_route_labels_with_the_warning() {
+    let (m, p) = example("examples/warfarin.ferx", "data/warfarin.csv");
+    let o = opts(EstimationMethod::FoceI);
+    let (exact, forced) = pair(&m, &p, &o);
+    assert!(forced.warnings.iter().any(|w| w.contains(TOKEN)));
+    assert_ne!(forced.gradient_method_inner, exact.gradient_method_inner);
+    let out = crate::run_covariance(&forced, Some(&m), Some(&p), &o).expect("run_covariance");
+    assert!(
+        !out.warnings.iter().any(|w| w.contains(TOKEN)),
+        "{:?}",
+        out.warnings
+    );
+    assert_eq!(out.gradient_method_inner, exact.gradient_method_inner);
+    assert_eq!(out.gradient_method_outer, exact.gradient_method_outer);
+    // And a split label is undone the same way: `analytic ×a, FD ×k` restarts from `analytic`.
+    let mut split = exact.clone();
+    split.gradient_method_inner = "analytic ×3, FD ×1".into();
+    crate::api::postfit::apply_plan_failures(&mut split, None, 4);
+    assert_eq!(split.gradient_method_inner, "analytic");
+}
+
+/// The inner solve decides which model it actually evaluated once per point, not once per
+/// consumer (#2786 round 2, finding 8): the stall stop (per iterate) and the fused-value checks
+/// (per gradient and per fused trial) used to each call `effective_model_for_eval` at the same
+/// point. Both routes are exercised — a transit model with a time-varying covariate (its ODE
+/// twin: stall on) and a closed form (fused values memoised) — and no two consecutive decisions
+/// are for the same η. Mutation: make `route_at` recompute without its cache -> consecutive
+/// repeats appear.
+#[test]
+fn the_inner_solve_decides_the_evaluated_model_once_per_point() {
+    use crate::estimation::inner_optimizer::{find_ebe, EVAL_ROUTE_LOG};
+    let fixtures = [
+        (
+            "transit with a time-varying covariate",
+            from_text(TRANSIT_TV, TRANSIT_TV_DATA),
+        ),
+        (
+            "closed form",
+            example("examples/warfarin.ferx", "data/warfarin.csv"),
+        ),
+    ];
+    for (label, (m, p)) in fixtures {
+        EVAL_ROUTE_LOG.with(|l| l.borrow_mut().clear());
+        for s in p.subjects.iter().take(3) {
+            let _ = find_ebe(&m, s, &m.default_params, 200, 1e-6, None, None, 0);
+        }
+        let log = EVAL_ROUTE_LOG.with(|l| l.borrow().clone());
+        assert!(
+            log.len() >= 3,
+            "{label}: the solve decided {} points",
+            log.len()
+        );
+        let repeats = log.windows(2).filter(|w| w[0] == w[1]).count();
+        assert_eq!(
+            repeats,
+            0,
+            "{label}: {repeats} of {} decisions repeat",
+            log.len()
+        );
+    }
+}

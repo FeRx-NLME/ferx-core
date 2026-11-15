@@ -97,7 +97,6 @@ pub(super) fn kernel_run(
     n_out: usize,
     f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>,
 ) -> Option<KernelRun> {
-    use std::sync::atomic::Ordering::Relaxed;
     let l = layout.lanes();
     if inputs.len() % l != 0 {
         return None;
@@ -123,50 +122,55 @@ pub(super) fn kernel_run(
             out,
         })
     };
-    match kj::lookup(&key) {
-        kj::Lookup::Bad => return None,
-        kj::Lookup::Found(ks) => {
-            if let Some((i, r)) = ks.order().find_map(|(i, p)| Some((i, run(p)?))) {
-                ks.hit(i);
-                return Some(r);
+    // The one lookup-and-record path of every plan kind ([`plan_or_record`]): a failed recording
+    // settles by its scope, and a variant that does not run at its own point is marked.
+    let record = |key: &kj::SubjectKey| -> Option<(Arc<kj::Plan>, bool)> {
+        // Record at the leaves' values: how many outputs `f` gave (none: outside the kernel's
+        // domain here, nothing to keep and nothing to condemn).
+        let given = std::cell::Cell::new(None);
+        let sane = std::cell::Cell::new(true);
+        let rec = kj::recorded(&key.family(), || {
+            let leaves: Vec<kj::Tr> = (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
+            let y = f(&leaves);
+            given.set(y.as_ref().map(Vec::len));
+            y.filter(|y| y.len() == n_out).map(|y| {
+                sane.set(y.iter().all(|x| x.recorded().is_finite()));
+                y.iter().map(|x| x.reg()).collect()
+            })
+        });
+        let rec = match (given.get(), rec) {
+            (None, _) => return None,
+            (Some(n), _) if n != n_out => {
+                kj::settle_failure(
+                    key,
+                    "the kernel recorded the wrong number of outputs",
+                    kj::FailScope::Subject,
+                );
+                return None;
             }
-            kj::STATS.guard_fail.fetch_add(1, Relaxed);
-        }
-        kj::Lookup::Missing => {}
-    }
-    // Record at the leaves' values: how many outputs `f` gave (none: outside the kernel's
-    // domain here, nothing to keep and nothing to condemn).
-    let given = std::cell::Cell::new(None);
-    let rec = kj::recorded(&key.family(), || {
-        let leaves: Vec<kj::Tr> = (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
-        let y = f(&leaves);
-        given.set(y.as_ref().map(Vec::len));
-        y.filter(|y| y.len() == n_out)
-            .map(|y| y.iter().map(|x| x.reg()).collect())
-    });
-    let rec = match (given.get(), rec) {
-        (None, _) => return None,
-        (Some(n), _) if n != n_out => {
-            kj::mark_bad(&key, "the kernel recorded the wrong number of outputs");
+            (_, Ok(r)) => r,
+            (_, Err((why, scope))) => {
+                kj::settle_failure(key, &why, scope);
+                return None;
+            }
+        };
+        let finite = rec.finite();
+        let Some(plan) = rec.plan(Layout::F64, 0, n_in).map(Arc::new) else {
+            kj::mark_bad(key, "the recording could not be planned");
             return None;
-        }
-        (_, Ok(r)) => r,
-        (_, Err((why, _))) => {
-            kj::mark_bad(&key, &why);
-            return None;
-        }
+        };
+        Some((plan, sane.get() && finite))
     };
-    let Some(plan) = rec.plan(Layout::F64, 0, n_in).map(Arc::new) else {
-        kj::mark_bad(&key, "the recording could not be planned");
-        return None;
-    };
-    // The variant joins the cache once it runs: one that cannot (a point outside its guard)
-    // must not evict one that does.
-    let r = run(&plan);
-    if r.is_some() {
-        kj::add(&key, plan);
-    }
-    r
+    plan_or_record(
+        model,
+        subject,
+        None,
+        None,
+        &|| key.clone(),
+        &|_| true,
+        &record,
+        &mut |plan| run(plan),
+    )
 }
 
 /// A kernel configuration's [`kj::SubjectKey`] variant: everything that shapes the kernel's
@@ -252,5 +256,76 @@ mod tests {
                 .unwrap();
             assert_eq!(g, vec![x[1], x[0], x[2].exp()], "gradient at {x:?}");
         }
+    }
+    fn test_model() -> CompiledModel {
+        crate::parser::model_parser::parse_model_string(
+            "[parameters]\n  theta TCL(1.0, 0.01, 10.0)\n  theta TV(10.0, 1.0, 100.0)\n  \
+             omega ETA_CL ~ 0.1\n  sigma PROP ~ 0.01\n[individual_parameters]\n  \
+             CL = TCL * exp(ETA_CL)\n  V = TV\n[structural_model]\n  \
+             pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP)\n",
+        )
+        .expect("parses")
+    }
+
+    /// The key `kernel_run` files a kernel under, for one input and `variant`.
+    fn key_of(model: &CompiledModel, subject: &Subject, variant: &kj::Desc) -> kj::SubjectKey {
+        kj::SubjectKey::new(model, subject, 0, 1)
+            .with_kind(KERNEL_KIND)
+            .with_variant(variant.clone())
+            .with_observed(subject)
+    }
+
+    /// A kernel recording that fails at this point's values is the point's failure: declined and
+    /// counted, never condemned, so the next call records and runs (#2786 round 2, finding 4:
+    /// `kernel_run` had a lookup of its own that marked every scope bad). Mutation: settle with
+    /// `mark_bad` for every scope in `kernel_run` -> the key is `Bad` after the first call.
+    #[test]
+    fn a_point_failure_in_a_kernel_declines_without_condemning() {
+        let (model, subject) = (test_model(), Subject::default());
+        let variant = variant_of(&0x4e_0001u32);
+        let key = key_of(&model, &subject, &variant);
+        let at = |x: f64, f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>| {
+            kernel_run(&model, &subject, variant.clone(), Layout::F64, &[x], 1, f)
+        };
+        let fails = |lv: &[kj::Tr]| {
+            kj::fail_here("a record-time run failed at this point");
+            Some(vec![lv[0] * lv[0]])
+        };
+        assert!(at(2.0, &fails).is_none());
+        assert!(
+            matches!(kj::lookup(&key), kj::Lookup::Missing),
+            "not condemned"
+        );
+        let ok = |lv: &[kj::Tr]| Some(vec![lv[0] * lv[0]]);
+        let r = at(3.0, &ok).expect("re-served");
+        assert_eq!(r.value(0), 9.0);
+        assert!(matches!(kj::lookup(&key), kj::Lookup::Found(_)));
+    }
+
+    /// A kernel recording that fails for a reason of the model's marks the model, so another
+    /// variant of the same model is declined from the model's mark without recording (the
+    /// `model_bad` check on a missing key). Mutation: skip `mark_model_bad` in the `Model` arm
+    /// or the `model_bad` check in `plan_or_record` -> the second variant records and runs.
+    #[test]
+    fn a_model_failure_in_a_kernel_marks_the_model() {
+        let (model, subject) = (test_model(), Subject::default());
+        let (va, vb) = (variant_of(&0x4e_0002u32), variant_of(&0x4e_0003u32));
+        let run = |v: &kj::Desc, f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>| {
+            kernel_run(&model, &subject, v.clone(), Layout::F64, &[2.0], 1, f)
+        };
+        let fails = |lv: &[kj::Tr]| {
+            kj::fail("an operation the recorder cannot take".into());
+            Some(vec![lv[0]])
+        };
+        assert!(run(&va, &fails).is_none());
+        assert!(matches!(
+            kj::lookup(&key_of(&model, &subject, &va)),
+            kj::Lookup::Bad
+        ));
+        let key_b = key_of(&model, &subject, &vb);
+        assert!(kj::model_bad(&key_b).is_some(), "the model is marked");
+        let ok = |lv: &[kj::Tr]| Some(vec![lv[0] * lv[0]]);
+        assert!(run(&vb, &ok).is_none(), "declined from the model's mark");
+        assert!(matches!(kj::lookup(&key_b), kj::Lookup::Bad));
     }
 }

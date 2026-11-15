@@ -2312,13 +2312,10 @@ fn with_plan_in<R>(
         model,
         subject,
         lay,
-        theta,
-        None,
-        eta,
-        sigma,
         Some(hot_key),
         &build,
         &fits,
+        &|key| kjit_record(model, subject, lay, theta, eta, None, sigma, key),
         serves,
     )
 }
@@ -2331,17 +2328,16 @@ fn with_plan_in<R>(
 /// and registry reads are paid for (`build` runs only on a hot miss, or to record); when they do
 /// not serve, the plans are not tried a second time through the lookup.
 #[allow(clippy::too_many_arguments)]
-fn plan_or_record<R>(
+pub(super) fn plan_or_record<R>(
     model: &CompiledModel,
     subject: &Subject,
     lay: Option<&crate::stats::stacked_layout::StackedLayout>,
-    theta: &[f64],
-    nn_z: Option<&[Vec<f64>]>,
-    eta: &[f64],
-    sigma: Option<&[f64]>,
     hot: Option<crate::parser::model_parser::rhs_regcode::kernel_jit::HotKey>,
     build: &dyn Fn() -> crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey,
     fits: &dyn Fn(&PlanArc) -> bool,
+    record: &dyn Fn(
+        &crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey,
+    ) -> Option<(PlanArc, bool)>,
     serves: &mut dyn FnMut(&PlanArc) -> Option<R>,
 ) -> Option<R> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
@@ -2381,7 +2377,7 @@ fn plan_or_record<R>(
         kj::STATS.guard_fail.fetch_add(1, Relaxed);
     }
     let key = key_cell.unwrap_or_else(build);
-    let (plan, sane) = kjit_record(model, subject, lay, theta, eta, nn_z, sigma, &key)?;
+    let (plan, sane) = record(&key)?;
     let r = serves(&plan);
     if r.is_some() {
         kj::add(&key, plan);
@@ -2428,13 +2424,10 @@ pub(super) fn with_plan_nn<R>(
         model,
         subject,
         None,
-        theta,
-        Some(nn_z),
-        eta,
-        sigma,
         None,
         &build,
         &fits,
+        &|key| kjit_record(model, subject, None, theta, eta, Some(nn_z), sigma, key),
         serves,
     )
 }
@@ -2535,21 +2528,16 @@ fn kjit_record(
             if kj::debug() {
                 eprintln!("kjit: subject not recorded: {why}");
             }
-            // A failure at a point the value path cannot predict (non-finite parameters, no
-            // finite steady state) is that point's, not the subject's: declined, not condemned.
-            if scope == kj::FailScope::Point {
-                return None;
-            }
-            kj::mark_bad(key, &why);
-            if scope == kj::FailScope::Model {
-                kj::mark_model_bad(key, &why);
-            }
+            // A failure at a point the value path cannot predict (non-finite values) or whose
+            // record-time run failed on this point's values is that point's, not the subject's:
+            // declined, not condemned ([`kj::settle_failure`]).
+            kj::settle_failure(key, &why, scope);
             return None;
         }
     };
     // A trial point the value path cannot score (an overflowed or `NaN` output: the repel
     // sentinel) says nothing about the plan, whichever way it serves there.
-    let sane = sane.get();
+    let sane = sane.get() && rec.finite();
     if kj::debug() {
         rec.replay_check();
     }
@@ -2670,8 +2658,13 @@ pub(super) fn plan_forward_f64(
 /// Keep, for the outer gradient, the forward the subject's inner solve last took at `eta`
 /// ([`kj_fwd::keep_last_run`]): [`plan_forward`] adopts it at the same `(θ, η̂)` instead of
 /// running the plan again.
-pub(crate) fn keep_forward(subject: &Subject, theta: &[f64], eta: &[f64]) {
-    kj_fwd::keep_last_run(subject as *const Subject as usize, theta, eta);
+pub(crate) fn keep_forward(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) {
+    kj_fwd::keep_last_run(
+        subject as *const Subject as usize,
+        model.plan_id.get(),
+        theta,
+        eta,
+    );
 }
 
 /// The observations' lanes of a plan's forward over `n` random effects: per observation the

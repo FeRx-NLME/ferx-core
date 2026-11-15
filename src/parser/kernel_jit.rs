@@ -162,6 +162,11 @@ struct Rec {
     cse: HashMap<Key, u32, FxBuild>,
     /// Why the recording failed, and whose failure it is ([`FailScope`]).
     failed: Option<(String, FailScope)>,
+    /// Whether any register that depends on an input recorded a value that was not finite: the
+    /// point itself (an overflowing individual parameter, a `NaN` guard) is one the value path
+    /// cannot score ([`FailScope::Repelled`]). Literals are not counted (an ODE recording holds
+    /// `inf` ones: an open window end).
+    nonfinite: bool,
     /// The literals, in first-use order (argument 2 of the compiled function).
     pool: Vec<f64>,
     /// The conditions already required (`guard_reg`).
@@ -316,25 +321,50 @@ fn rec<R>(f: impl FnOnce(&mut Rec) -> R) -> R {
 }
 
 /// Whose failure a failed recording is: the point's alone (a record-time run that failed at
-/// these inputs: no steady state, an overflow), the subject's (its structure cannot be
-/// recorded), or the model's (a code path the recorder cannot take: every subject would fail).
-/// Only the last two condemn: a point's failure is declined, and the subject's plan route stays.
+/// these inputs: no steady state, a count out of range), a point the value path cannot score at
+/// all (a recorded value was not finite: an overflowed trial point), the subject's (its
+/// structure cannot be recorded), or the model's (a code path the recorder cannot take: every
+/// subject would fail). [`settle_failure`] is the one place each is handled: only the last two
+/// condemn; a point's failure takes finite differences for this call and is counted; a repelled
+/// point is declined and not counted, since nothing needs a derivative there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum FailScope {
     Point,
+    Repelled,
     Subject,
     Model,
 }
 
+/// Handle a failed recording of `k` by its `scope` (see [`FailScope`]).
+pub(crate) fn settle_failure(k: &SubjectKey, why: &str, scope: FailScope) {
+    match scope {
+        FailScope::Repelled => {}
+        FailScope::Point => note_failure(k, why),
+        FailScope::Subject => mark_bad(k, why),
+        FailScope::Model => {
+            mark_bad(k, why);
+            mark_model_bad(k, why);
+        }
+    }
+}
+
 /// Fail the recording on a code path the recorder cannot take: every subject would.
-fn fail(why: String) {
+pub(crate) fn fail(why: String) {
     rec(|r| {
         r.failed.get_or_insert((why, FailScope::Model));
     })
 }
 
-/// Fail the recording at this subject's point only (a record-time run that failed).
-fn fail_here(why: &str) {
+/// Fail the recording on this subject's structure (not the model's code path, not this point).
+fn fail_subject(why: &str) {
+    rec(|r| {
+        r.failed.get_or_insert((why.into(), FailScope::Subject));
+    })
+}
+
+/// Fail the recording at this subject's point only (a record-time run whose outcome depends on
+/// this point's values: a search that did not converge, a count out of range).
+pub(crate) fn fail_here(why: &str) {
     rec(|r| {
         r.failed.get_or_insert((why.into(), FailScope::Point));
     })
@@ -386,6 +416,7 @@ fn node_v(key: Key, v: f64, mk: impl FnOnce(u32) -> Flat) -> Tr {
             }
         };
         r.store(d, v);
+        r.nonfinite |= !v.is_finite();
         d
     });
     Tr { v, r, dep: true }
@@ -469,6 +500,7 @@ impl Tr {
         REC.with(|x| {
             if let Some(x) = x.borrow_mut().as_mut() {
                 x.store(r, v);
+                x.nonfinite |= dep && !v.is_finite();
             }
         });
         Tr { v, r, dep }
@@ -1280,6 +1312,8 @@ pub(crate) struct Recording {
     dense: bool,
     /// The linear segments it integrated instead (`Rec::declined`).
     declined: usize,
+    /// Every register's recorded value was finite ([`Rec::nonfinite`]).
+    finite: bool,
     tie: Tie,
 }
 
@@ -1311,11 +1345,24 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScop
     if FORCE_PLAN_FAIL.get() {
         return Err((FORCED_FAILURE.to_string(), FailScope::Subject));
     }
-    if let Some(f) = r.failed {
-        return Err(f);
+    // A point whose recorded values overflowed is one nothing can differentiate or score: its
+    // failure (a record-time run, a predictor bailing) is the point's, whatever it names.
+    if let Some((why, scope)) = r.failed.take() {
+        let scope = if scope == FailScope::Point && r.nonfinite {
+            FailScope::Repelled
+        } else {
+            scope
+        };
+        return Err((why, scope));
     }
-    let outs =
-        outs.ok_or_else(|| ("the recorder returned None".to_string(), FailScope::Subject))?;
+    let outs = outs.ok_or_else(|| {
+        let scope = if r.nonfinite {
+            FailScope::Repelled
+        } else {
+            FailScope::Subject
+        };
+        ("the recorder returned None".to_string(), scope)
+    })?;
     if let Some(t) = r.replay.take() {
         // Every decision the template's, and every instruction, output, guard and mark as its:
         // the recording a fresh run would make, its literals and loop calls aside.
@@ -1348,6 +1395,7 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScop
             ode: r.ode,
             dense: false,
             declined: r.declined,
+            finite: !r.nonfinite,
             tie: Tie {
                 family: r.family,
                 replayed: Some(t),
@@ -1381,6 +1429,7 @@ pub(crate) fn end(outs: Option<Vec<u32>>) -> Result<Recording, (String, FailScop
         ode: r.ode,
         dense: false,
         declined: r.declined,
+        finite: !r.nonfinite,
         tie,
     })
 }
@@ -1545,7 +1594,7 @@ fn affine_parts_folding(
         }
     }
     if a.iter().any(|x| x.dep && on_u[x.r as usize]) || guard.is_some_and(|g| on_u[g as usize]) {
-        fail_here("the right-hand side is not affine in the state");
+        fail_subject("the right-hand side is not affine in the state");
         return false;
     }
     true
@@ -1760,6 +1809,13 @@ fn tangent(g: &Flat, h: &impl Fn(u32) -> Tr, tan: &HashMap<u32, Tr, FxBuild>) ->
 }
 
 impl Recording {
+    /// Whether every register's recorded value was finite: the point is one the value path can
+    /// score (a plan that does not serve at its own point says something about the plan only
+    /// then).
+    pub(crate) fn finite(&self) -> bool {
+        self.finite
+    }
+
     /// `FERX_KJIT_DEBUG`: replay the program on values, with the lowering's semantics (the
     /// guarded division, the `ln` floor, the scalar forms), from the recorded inputs; report
     /// the first register whose replayed value differs from the one the recording computed.
@@ -2839,7 +2895,7 @@ thread_local! {
 /// Forget the plans of every subject and model in scope `scope`: under the subjects' lock, with
 /// the generation bumped there, so a thread that read the new generation sees them gone.
 fn drop_scope(scope: u64) {
-    clear_kept(scope);
+    clear_kept(|k| k.scope == scope);
     let mut s = subjects()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2865,7 +2921,7 @@ fn drop_scope(scope: u64) {
 /// Forget the plans and bad marks of the model `id`, as its [`crate::types::PlanId`] drops.
 pub(crate) fn drop_model(id: u64) {
     // A live fit borrows its model, so what a dropped model's plans leave kept is unregistered.
-    clear_kept(0);
+    clear_kept(|k| k.model == id);
     let mut s = subjects()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -4810,6 +4866,17 @@ struct Kept {
     buf: Vec<f64>,
     /// The fit scope that kept it ([`drop_scope`] frees it with the fit); `0`: no fit's.
     scope: u64,
+    /// The model the subject was solved under ([`crate::types::PlanId`]): [`drop_model`] frees
+    /// only its own.
+    model: u64,
+}
+
+/// The kept forwards' table; a panic while it was held leaves it usable (it is also locked
+/// from `Drop`).
+fn kept_lock() -> std::sync::MutexGuard<'static, HashMap<usize, Kept, FxBuild>> {
+    kept_table()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn kept_table() -> &'static Mutex<HashMap<usize, Kept, FxBuild>> {
@@ -4833,7 +4900,7 @@ fn inputs_match(buf: &[f64], l: usize, n_eta: usize, theta: &[f64], eta: &[f64])
 /// Keep, for `owner` (the subject), the forward this thread's last [`Plan::run`] left in
 /// `BUF`, when that was a chunk-only plan's run at exactly `(theta, eta)`. Replaces what the
 /// owner had kept.
-pub(crate) fn keep_last_run(owner: usize, theta: &[f64], eta: &[f64]) {
+pub(crate) fn keep_last_run(owner: usize, model: u64, theta: &[f64], eta: &[f64]) {
     let Some(last) = LAST_RUN.with(|c| c.get()) else {
         return;
     };
@@ -4849,13 +4916,14 @@ pub(crate) fn keep_last_run(owner: usize, theta: &[f64], eta: &[f64]) {
         Some(v)
     });
     if let Some(buf) = kept {
-        let old = kept_table().lock().unwrap().insert(
+        let old = kept_lock().insert(
             owner,
             Kept {
                 plan: last.plan,
                 layout: last.layout,
                 buf,
                 scope: registered(owner).map_or(0, |e| e.1),
+                model,
             },
         );
         if let Some(o) = old {
@@ -4876,13 +4944,13 @@ pub(crate) fn adopts() -> usize {
     ADOPTS.with(|c| c.get())
 }
 
-/// Drop the forwards kept in `scope` (a finished fit's, or `0`'s on a dropped model: the plans
-/// they belong to may go). Another fit's stay.
-fn clear_kept(scope: u64) {
-    let mut t = kept_table().lock().unwrap();
+/// Drop the kept forwards `gone_if` names: a finished fit's (`scope`), or a dropped model's (the
+/// plans they belong to may go). Another fit's and another model's stay.
+fn clear_kept(gone_if: impl Fn(&Kept) -> bool) {
+    let mut t = kept_lock();
     let gone: Vec<usize> = t
         .iter()
-        .filter(|(_, k)| k.scope == scope)
+        .filter(|(_, k)| gone_if(k))
         .map(|(&o, _)| o)
         .collect();
     for o in gone {
@@ -4895,12 +4963,7 @@ fn clear_kept(scope: u64) {
 /// How many forwards `scope` keeps (test seam).
 #[cfg(test)]
 pub(crate) fn kept_in(scope: u64) -> usize {
-    kept_table()
-        .lock()
-        .unwrap()
-        .values()
-        .filter(|k| k.scope == scope)
-        .count()
+    kept_lock().values().filter(|k| k.scope == scope).count()
 }
 
 /// A plan's forward at one layout, kept for its reverse passes ([`Plan::forward_kept`]):
@@ -5232,7 +5295,7 @@ impl Plan {
             return None;
         }
         let me = self as *const Plan as usize;
-        let mut t = kept_table().lock().unwrap();
+        let mut t = kept_lock();
         let k = t.get(&owner)?;
         if k.plan != self.serial || k.layout != layout || k.buf.len() != self.n_slots * self.lanes {
             return None;

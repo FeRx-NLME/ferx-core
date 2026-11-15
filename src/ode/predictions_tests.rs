@@ -17868,3 +17868,96 @@ mod infusion_edge_contract {
         run(&[infusion(1.0)], 2.0, 0.0);
     }
 }
+
+/// The side of the infusion window's end a stage lies on is a recorded decision, not a plain
+/// read (#2786 round 2, finding 5): a plan recorded with the stage before the end (the running
+/// side) must not serve the running side at a θ that moves the end before the stage. Window `5`
+/// (end 5, stage 4) records; window `3.5` (end before the stage) must give the tail side's value
+/// (or decline); `4.5` (same side) still serves, matching the `f64` engine. Mutation: decide
+/// the side from `t.seen_value()` (the old plain read) -> the plan serves the running-side
+/// value at window 3.5.
+#[test]
+fn the_window_end_side_of_a_stage_is_a_guard_of_the_plan() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use crate::sens::num::vm::Layout;
+    use crate::sens::num::PkNum;
+    let ode = first_order_one_cpt_spec();
+    let (amt, since, t) = (100.0_f64, 3.0_f64, 4.0_f64);
+    let dose = DoseEvent::new(0.0, amt, 1, 25.0, false, 0.0);
+    let ka = 0.6;
+    let f64_at = |window: f64| -> f64 {
+        let mut pk = vec![0.0; crate::types::MAX_PK_PARAMS];
+        pk[4] = ka;
+        let prepared = prepare_input_rates(&ode, &pk);
+        let mut dy = [0.0_f64];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            std::slice::from_ref(&dose),
+            &[0.0],
+            &[1.0],
+            &[Some(window)],
+            ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+            t,
+            since,
+            &mut dy,
+        );
+        dy[0]
+    };
+    // The plan recorded at `window` (θ slot 0): the forcing's value at stage `t`.
+    let record = |window: f64| {
+        kj::begin();
+        let w = kj::Tr::theta(0, window);
+        let c = |v: f64| <kj::Tr as PkNum>::from_f64(v);
+        let params: Vec<kj::Tr> = (0..crate::types::MAX_PK_PARAMS)
+            .map(|i| c(if i == 4 { ka } else { 0.0 }))
+            .collect();
+        let prepared = PreparedForcings::shared(&ode, &params, |f, p| {
+            f.prepare_dual(p).expect("first-order is supported")
+        });
+        let mut dy = [c(0.0)];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            std::slice::from_ref(&dose),
+            &[c(0.0)],
+            &[c(1.0)],
+            &[Some(w)],
+            ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+            c(t),
+            c(since),
+            &mut dy,
+        );
+        let rec = kj::end(Some(vec![dy[0].reg()])).expect("records");
+        rec.plan(Layout::F64, 0, 1).expect("plans")
+    };
+    // `Some(value)` where the plan's guard holds at `window`.
+    let run = |plan: &kj::Plan, window: f64| -> Option<f64> {
+        let mut out = kj::Buf::new(2);
+        plan.forward_layout(Layout::F64, &[], &[window], &mut out)?;
+        (out[1] == 1.0).then(|| out[0])
+    };
+    let (running, tail) = (f64_at(5.0), f64_at(3.5));
+    assert!(
+        (running - tail).abs() > 1e-6 * running.abs(),
+        "fixture drift: the two sides must differ ({running} vs {tail})"
+    );
+    let plan = record(5.0);
+    let own = run(&plan, 5.0).expect("serves at its own point");
+    assert_relative_eq!(own, running, max_relative = 1e-12);
+    // The same side: still served, exactly.
+    let near = run(&plan, 4.5).expect("serves on the same side");
+    assert_relative_eq!(near, f64_at(4.5), max_relative = 1e-12);
+    // The other side: the plan serves the tail side's value (the side is a selection on the
+    // stage's time, not a baked choice) or, were it a guard, declines — never the running side's.
+    if let Some(v) = run(&plan, 3.5) {
+        assert_relative_eq!(v, tail, max_relative = 1e-12);
+    }
+    // Recorded there, the plan reads the tail side.
+    let fresh = record(3.5);
+    assert_relative_eq!(
+        run(&fresh, 3.5).expect("serves"),
+        tail,
+        max_relative = 1e-12
+    );
+}

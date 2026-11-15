@@ -3920,17 +3920,12 @@ fn fit_inner(
         model,
         &population.subjects,
     ) {
-        let n = population.subjects.len();
-        let (msg, entry) = crate::api::postfit::plan_fd_fallback_warning(&c, n);
         // The realised route, not the model's: those subjects ran finite differences.
-        // Each route from its own count: a θ-only failure is the outer gradient's alone, a
-        // covariance-step one neither's.
-        fit_result.gradient_method_inner =
-            crate::api::postfit::plan_fallback_label(&fit_result.gradient_method_inner, c.inner, n);
-        fit_result.gradient_method_outer =
-            crate::api::postfit::plan_fallback_label(&fit_result.gradient_method_outer, c.outer, n);
-        fit_result.warnings.push(msg);
-        fit_result.warnings_structured.push(entry);
+        crate::api::postfit::apply_plan_failures(
+            &mut fit_result,
+            Some(&c),
+            population.subjects.len(),
+        );
     }
 
     // The `[covariate_model]` echo (#1111): the relations as declared, joined to
