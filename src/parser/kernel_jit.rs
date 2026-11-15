@@ -85,7 +85,6 @@ pub(crate) fn debug() -> bool {
     *F.get_or_init(|| std::env::var("FERX_KJIT_DEBUG").is_ok())
 }
 
-
 /// A recorded value: its value (for the recorder's own decisions), its register, and
 /// whether it depends on an input.
 #[derive(Clone, Copy, Debug)]
