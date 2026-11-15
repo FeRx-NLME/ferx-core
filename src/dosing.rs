@@ -109,7 +109,21 @@ pub(crate) fn lower_zero_order_ss<'a>(
         return Cow::Borrowed(subject);
     }
     let mut owned = subject.clone();
-    for d in owned
+    lower_zero_order_ss_in_place(&mut owned, attr_map);
+    Cow::Owned(owned)
+}
+
+/// Test seam: subjects lowered whose first dose carries the marker amount of this module's fit
+/// fixture, so a test counts its own fit's lowerings among the parallel suite's.
+#[cfg(test)]
+static MARKER_LOWERINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn lower_zero_order_ss_in_place(subject: &mut Subject, attr_map: &crate::types::DoseAttrMap) {
+    #[cfg(test)]
+    if subject.doses.first().is_some_and(|d| d.amt == 4321.5) {
+        MARKER_LOWERINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    for d in subject
         .doses
         .iter_mut()
         .filter(|d| is_zero_order_ss_record(attr_map, d))
@@ -119,6 +133,24 @@ pub(crate) fn lower_zero_order_ss<'a>(
         d.rate = 0.0;
         d.duration = 0.0;
         d.resolve_default_cmt();
+    }
+}
+
+/// [`lower_zero_order_ss`] for a whole population, once where a fit binds it to its model:
+/// the lowered doses are infusions no walk rewrites again, so the engines' own
+/// [`lower_zero_order_ss`] on a bound subject is a scan that borrows instead of cloning the
+/// subject on every walk of every inner solve. Borrowed unless a dose is rewritten.
+pub(crate) fn lower_population_zero_order_ss<'a>(
+    population: &'a crate::types::Population,
+    attr_map: &crate::types::DoseAttrMap,
+) -> Cow<'a, crate::types::Population> {
+    let has = |s: &Subject| s.doses.iter().any(|d| is_zero_order_ss_record(attr_map, d));
+    if !attr_map.has_zero_order() || !population.subjects.iter().any(has) {
+        return Cow::Borrowed(population);
+    }
+    let mut owned = population.clone();
+    for s in owned.subjects.iter_mut().filter(|s| has(s)) {
+        lower_zero_order_ss_in_place(s, attr_map);
     }
     Cow::Owned(owned)
 }
@@ -2764,5 +2796,79 @@ mod residual_pulse_count_tests {
         assert_eq!(re.count_ending_after(100.0), n - 9);
         assert_eq!(re.count_ending_at_or_after(0.0), n);
         assert_eq!(re.count_ending_at_or_after(100.0), n - 8);
+    }
+}
+
+#[cfg(test)]
+mod zero_order_binding_tests {
+    //! A fit lowers an `SS=1` dose into a `zero_order()` window once, where it binds the data,
+    //! not by a clone of the subject in every walk (#2786 review).
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    const DATA: &str = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,II,SS
+1,0,1,1,0,4321.5,0,1,12,1
+1,2,0,0,80.0,0,0,1,0,0
+1,6,0,0,55.0,0,0,1,0,0
+1,10,0,0,40.0,0,0,1,0,0
+2,0,1,1,0,4321.5,0,1,12,1
+2,2,0,0,90.0,0,0,1,0,0
+2,6,0,0,60.0,0,0,1,0,0
+2,10,0,0,45.0,0,0,1,0,0
+";
+
+    fn fixture(amt: &str) -> (crate::types::CompiledModel, crate::types::Population) {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(
+            "examples/zero_order_absorption.ferx",
+        ))
+        .expect("model");
+        let dir = tempfile::tempdir().expect("tmp");
+        let csv = dir.path().join("d.csv");
+        std::fs::write(&csv, DATA.replace("4321.5", amt)).expect("write");
+        let pop = crate::read_nonmem_csv(&csv, None, None).expect("data");
+        (model, pop)
+    }
+
+    /// Mutation: return `Cow::Borrowed` from `lower_population_zero_order_ss` -> the bound
+    /// population is not lowered and every walk clones its subject.
+    #[test]
+    fn a_bound_population_is_lowered_once_and_its_walks_borrow() {
+        let (model, pop) = fixture("4321.25");
+        let map = model.active_dose_attr_map();
+        assert!(
+            matches!(lower_zero_order_ss(&pop.subjects[0], map), Cow::Owned(_)),
+            "fixture: the data as read is rewritten by every walk"
+        );
+        let bound = lower_population_zero_order_ss(&pop, map);
+        assert!(matches!(bound, Cow::Owned(_)));
+        for s in &bound.subjects {
+            assert!(matches!(lower_zero_order_ss(s, map), Cow::Borrowed(_)));
+            assert!(is_lowered_zero_order_ss(map, &s.doses[0]));
+        }
+        assert!(matches!(
+            lower_population_zero_order_ss(&bound, map),
+            Cow::Borrowed(_)
+        ));
+        // The data as read is untouched: the lowering is the fit's own.
+        assert!(!pop.subjects[0].doses[0].is_infusion());
+    }
+
+    /// A whole fit lowers each affected subject exactly once. Mutation: drop the binding in
+    /// `fit_inner` -> every walk lowers (thousands of lowerings, not 2).
+    #[test]
+    fn a_fit_lowers_each_subject_once() {
+        let (model, pop) = fixture("4321.5");
+        let o = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::FoceI,
+            outer_maxiter: 2,
+            threads: Some(1),
+            verbose: false,
+            ..crate::types::FitOptions::default()
+        };
+        let before = MARKER_LOWERINGS.load(Relaxed);
+        crate::api::fit(&model, &pop, &model.default_params, &o).expect("fit");
+        let n = MARKER_LOWERINGS.load(Relaxed) - before;
+        assert_eq!(n, pop.subjects.len(), "lowerings per fit");
     }
 }

@@ -880,3 +880,219 @@ const TWO_CPT_AMOUNTS: &str = r#"[data]
   maxiter    = 0
   covariance = false
 "#;
+
+// ---- Code-review findings on the failure report (#2786) -------------------------------------
+
+use super::{
+    note_failure, note_model_failure, plan_failure_counts, register, state_of, SubjectKey,
+};
+
+/// A closed-form transit model whose subjects reroute to its ODE twin (a time-varying `WT`).
+const TRANSIT_TV: &str = r#"[data]
+  path=data.csv
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV(50.0, 5.0, 500.0)
+  theta TVMTT(1.0, 0.05, 24.0)
+  theta TVN(3.0, 0.0, 30.0)
+  theta TH_WT(0.75, 0.01, 3.0)
+  omega ETA_CL ~ 0.09
+  omega ETA_V ~ 0.09
+  sigma PROP_ERR ~ 0.15 (sd)
+[covariates]
+  WT continuous
+[individual_parameters]
+  CL  = TVCL * (WT / 70.0)^TH_WT * exp(ETA_CL)
+  V   = TVV * exp(ETA_V)
+  MTT = TVMTT
+  NTR = TVN
+[structural_model]
+  pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+"#;
+const TRANSIT_TV_DATA: &str = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,WT
+1,0,1,1,0,100,0,1,70
+1,1,0,0,1.1,0,0,2,70
+1,4,0,0,1.4,0,0,2,90
+1,12,0,0,0.9,0,0,2,90
+2,0,1,1,0,100,0,1,60
+2,1,0,0,1.3,0,0,2,60
+2,4,0,0,1.6,0,0,2,80
+2,12,0,0,1.0,0,0,2,80
+3,0,1,1,0,100,0,1,80
+3,1,0,0,0.9,0,0,2,80
+3,4,0,0,1.2,0,0,2,100
+3,12,0,0,0.8,0,0,2,100
+";
+
+fn one_fit(m: &CompiledModel, p: &Population) -> FitResult {
+    crate::api::fit(m, p, &m.default_params, &opts(EstimationMethod::FoceI)).expect("fit")
+}
+
+/// Subjects rerouted to a closed-form model's ODE twin plan under the twin's own id: a failure
+/// there is the fit's — warning, label — and leaves with the fit, so a later fit records fresh
+/// instead of skipping to finite differences silently.
+/// Mutation: drop the twin's id from `plan_failure_counts` -> no warning in the forced fit;
+/// stop `drop_scope` clearing `failures`/`bad_models` -> the twin's state outlives the fit.
+#[test]
+fn a_twin_plan_failure_is_reported_and_leaves_with_the_fit() {
+    let (m, p) = from_text(TRANSIT_TV, TRANSIT_TV_DATA);
+    let twin = m
+        .absorption_ode_equivalent
+        .as_ref()
+        .expect("a transit model carries its ODE twin")
+        .built();
+    let (twin_id, id) = (twin.plan_id.get(), m.plan_id.get());
+    let forced = plans_failing(|| one_fit(&m, &p));
+    let n = p.subjects.len();
+    assert!(
+        forced
+            .warnings
+            .iter()
+            .any(|w| w.contains(TOKEN) && w.contains(&format!("{n} of {n} subjects"))),
+        "{:?}",
+        forced.warnings
+    );
+    assert_eq!(
+        forced.gradient_method_inner,
+        "finite differences (compiled plan failed)"
+    );
+    // Nothing of the failed fit is left: not the twin's marks, not the model's.
+    assert_eq!(state_of(twin_id), 0, "the twin's state outlived the fit");
+    assert_eq!(state_of(id), 0, "the model's state outlived the fit");
+    // A later fit, plans unforced, records fresh and reports nothing.
+    let later = one_fit(&m, &p);
+    assert!(
+        !later.warnings.iter().any(|w| w.contains(TOKEN)),
+        "{:?}",
+        later.warnings
+    );
+    assert_eq!(later.gradient_method_inner, "analytic");
+    // A failure filed under the twin's own id alone is the fit's too (the fit above may also
+    // have failed plans of the model itself, which would hide a twin that is not counted).
+    let _g = register(&m, &p.subjects);
+    assert_eq!(plan_failure_counts(&m, &p.subjects), None);
+    note_failure(&SubjectKey::new(twin, &p.subjects[1], 2, 6), "the twin's");
+    let c = plan_failure_counts(&m, &p.subjects).expect("the twin's failure is the fit's");
+    assert_eq!((c.any, c.inner), (1, 1));
+}
+
+/// Fits of one model do not share failures: one whose plans fail reports them while another,
+/// registered over the same model at the same time, reports nothing — and a failure is counted
+/// for the subjects it was noted for, not guessed from the failure set's size.
+/// Mutation: key a registered subject's plans under the model's scope -> the second fit's
+/// subjects (clones: the same designs) are counted; restore the `min(n)` guess -> the stranger's
+/// failure below counts one subject.
+#[test]
+fn overlapping_fits_of_one_model_keep_their_failures_apart() {
+    let (m, p) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
+    let (pa, pb) = (p.clone(), p.clone());
+    let (_a, _b) = (register(&m, &pa.subjects), register(&m, &pb.subjects));
+    let key = |s: &crate::types::Subject| SubjectKey::new(&m, s, 2, 6);
+    note_failure(&key(&pa.subjects[0]), "forced");
+    let a = plan_failure_counts(&m, &pa.subjects).expect("A's failure");
+    assert_eq!((a.any, a.inner, a.outer), (1, 1, 1));
+    assert_eq!(
+        plan_failure_counts(&m, &pb.subjects),
+        None,
+        "B's subjects share A's designs and nothing else"
+    );
+    // A failure of a subject the population does not hold counts for none of its subjects.
+    let mut other = pa.subjects[0].clone();
+    other.doses[0].amt += 1.0;
+    note_failure(&key(&other), "a cut copy");
+    let a = plan_failure_counts(&m, &pa.subjects).expect("A's failure");
+    assert_eq!(a.any, 1, "a stranger's failure is not a guess at A's");
+    // The same through whole fits, concurrently: only the one whose plans fail reports.
+    let (m2, p2) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
+    let (q2, q3) = (p2.clone(), p2.clone());
+    let barrier = std::sync::Barrier::new(2);
+    let (fa, fb) = std::thread::scope(|sc| {
+        let a = sc.spawn(|| {
+            barrier.wait();
+            plans_failing(|| one_fit(&m2, &q2))
+        });
+        let b = sc.spawn(|| {
+            barrier.wait();
+            one_fit(&m2, &q3)
+        });
+        (a.join().expect("A"), b.join().expect("B"))
+    });
+    assert!(fa.warnings.iter().any(|w| w.contains(TOKEN)));
+    assert!(
+        !fb.warnings.iter().any(|w| w.contains(TOKEN)),
+        "{:?}",
+        fb.warnings
+    );
+    assert_eq!(fb.gradient_method_inner, "analytic");
+}
+
+/// A θ-only recording that fell back (`note_model_failure`) is the outer gradient's, so the
+/// inner route keeps its label: the warning is there, `gradient_method_outer` says finite
+/// differences, `gradient_method_inner` still says analytic. A covariance-step plan failure
+/// (kind 9) is neither's: reported, no label moves.
+/// Mutation: label both routes from the total count -> the inner label reads FD.
+#[test]
+fn an_outer_only_failure_keeps_the_inner_label() {
+    let (m, p) = from_text(TWO_CPT_TV, TWO_CPT_TV_DATA);
+    let o = opts(EstimationMethod::FoceI);
+    // Registered over the model first, so the fit's own registration shares its scope.
+    let guard = register(&m, &[]);
+    note_model_failure(&m, "a θ-only recording: test");
+    let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
+    assert!(
+        fit.warnings.iter().any(|w| w.contains(TOKEN)),
+        "{:?}",
+        fit.warnings
+    );
+    assert_eq!(fit.gradient_method_inner, "analytic");
+    assert_eq!(
+        fit.gradient_method_outer,
+        "finite differences (compiled plan failed)"
+    );
+    drop(guard);
+    // The counts, per route.
+    let _g = register(&m, &p.subjects);
+    let key = SubjectKey::new(&m, &p.subjects[0], 2, 6);
+    note_failure(&key.with_kind(9), "covariance");
+    let c = plan_failure_counts(&m, &p.subjects).expect("counted");
+    assert_eq!((c.any, c.inner, c.outer), (1, 0, 0));
+    note_model_failure(&m, "θ");
+    let c = plan_failure_counts(&m, &p.subjects).expect("counted");
+    let n = p.subjects.len();
+    assert_eq!((c.any, c.inner, c.outer), (n, 0, n));
+}
+
+/// Failures are keyed as their plans are: a likelihood kernel bakes the observed values in, so
+/// two subjects of one design with other data are not one failure.
+/// Mutation: key a failure by design alone -> both subjects count.
+#[test]
+fn a_kernel_failure_counts_the_subject_whose_data_it_is() {
+    let data = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,WT
+1,0,1,1,0,1000,0,1,70
+1,12,0,0,5.0,0,0,1,90
+2,0,1,1,0,1000,0,1,70
+2,12,0,0,6.5,0,0,1,90
+";
+    let (m, p) = from_text(TWO_CPT_TV, data);
+    let _g = register(&m, &p.subjects);
+    let key =
+        |s: &crate::types::Subject| SubjectKey::new(&m, s, 0, 3).with_kind(8).with_observed(s);
+    assert_ne!(
+        key(&p.subjects[0]),
+        key(&p.subjects[1]),
+        "fixture: data differ"
+    );
+    note_failure(&key(&p.subjects[1]), "kernel");
+    let c = plan_failure_counts(&m, &p.subjects).expect("counted");
+    assert_eq!(c.any, 1);
+    // A design-keyed plan (the predictions) is shared by both, and both fell back.
+    note_failure(&SubjectKey::new(&m, &p.subjects[0], 2, 6), "predictions");
+    let c = plan_failure_counts(&m, &p.subjects).expect("counted");
+    assert_eq!(c.any, 2);
+}

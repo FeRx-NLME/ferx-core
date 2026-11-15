@@ -459,24 +459,31 @@ pub(crate) struct GradientTimings {
     pub jac_analytic_nanos: AtomicU64,
     pub jac_fd_calls: AtomicU64,
     pub jac_fd_nanos: AtomicU64,
+    /// Whether spans are timed: set once per fit from `FERX_TIME_GRADIENTS` ([`Self::arm`]),
+    /// so a hot path reads a flag, never the environment.
+    on: std::sync::atomic::AtomicBool,
 }
 
 impl GradientTimings {
-    /// The start of a timed span, taken only under `FERX_TIME_GRADIENTS` (read once): two clock
-    /// reads and two shared-line atomics per gradient call are not free on a fit that never
-    /// prints them.
+    /// Set whether this fit times its gradient calls, from the value of `FERX_TIME_GRADIENTS`
+    /// the fit read (`1` or `true`), and say which. Per fit, not per process: a second fit in
+    /// one session reads the variable again.
+    pub(crate) fn arm(&self, var: Option<&str>) -> bool {
+        let on = var.is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        self.on.store(on, Ordering::Relaxed);
+        on
+    }
+    /// The start of a timed span, taken only while armed: two clock reads and two shared-line
+    /// atomics per gradient call are not free on a fit that never prints them.
     #[inline]
-    pub(crate) fn start() -> Option<std::time::Instant> {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        ON.get_or_init(|| {
-            std::env::var("FERX_TIME_GRADIENTS")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false)
-        })
-        .then(std::time::Instant::now)
+    pub(crate) fn start(&self) -> Option<std::time::Instant> {
+        self.on
+            .load(Ordering::Relaxed)
+            .then(std::time::Instant::now)
     }
     const fn new() -> Self {
         Self {
+            on: std::sync::atomic::AtomicBool::new(false),
             analytic_calls: AtomicU64::new(0),
             analytic_nanos: AtomicU64::new(0),
             fd_calls: AtomicU64::new(0),
@@ -540,6 +547,13 @@ impl GradientTimings {
 }
 
 pub(crate) static GRADIENT_TIMINGS: GradientTimings = GradientTimings::new();
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: solves whose mode's predictions came from the best walk kept, the last walk
+    /// having been another point.
+    pub(crate) static BEST_WALK_RESTORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Result of inner optimization for a single subject
 pub struct EbeResult {
@@ -2950,13 +2964,15 @@ fn find_ebe_solve(
         key.extend(e.iter().map(|x| x.to_bits()));
         m.push((key, v));
     };
-    // Every value the walk has scored this solve, with the predictions it left: the 4-slot
+    // The best point the walk has scored this solve, with the predictions it left: the 4-slot
     // memo above decides which value a lookup returns (a fused gradient pass's value can sit
     // beside the walk's), and only on its miss is the walk's own, a pure function of η, read
-    // back from here instead of walked again. An ODE walk is what a repeat is worth skipping;
-    // a closed form re-walks for less than the lookup costs.
-    let walked: RefCell<std::collections::HashMap<Vec<u64>, (f64, Vec<f64>)>> =
-        RefCell::new(std::collections::HashMap::new());
+    // back from here instead of walked again. The solve reads back one point's predictions —
+    // the mode's, which is the lowest value it scored — so one entry is all that is kept
+    // (not a vector per η the search and its finite-difference probes visited), written only
+    // on an improvement and read without a copy. An ODE walk is what a repeat is worth
+    // skipping; a closed form re-walks for less than the lookup costs.
+    let best_walk: RefCell<Option<(Vec<u64>, f64, Vec<f64>)>> = RefCell::new(None);
     let track_walks = model.ode_spec.is_some();
     let obj = |e: &[f64]| -> f64 {
         if let Some(v) = memo_get(e) {
@@ -2967,17 +2983,21 @@ fn find_ebe_solve(
             memo_put(e, v);
             return v;
         }
-        let key: Vec<u64> = e.iter().map(|x| x.to_bits()).collect();
-        let held = walked.borrow().get(&key).cloned();
-        let v = if let Some((v, preds)) = held {
-            *pred_recycle.borrow_mut() = preds;
-            *preds_at.borrow_mut() = key;
+        let held = best_walk.borrow().as_ref().and_then(|(k, v, _)| {
+            (k.len() == e.len() && k.iter().zip(e).all(|(&b, &x)| b == x.to_bits())).then_some(*v)
+        });
+        let v = if let Some(v) = held {
             v
         } else {
             let v = obj_uncached(e);
-            walked
-                .borrow_mut()
-                .insert(key, (v, pred_recycle.borrow().clone()));
+            let mut best = best_walk.borrow_mut();
+            if v.is_finite() && best.as_ref().is_none_or(|b| v < b.1) {
+                let (k, bv, p) = best.get_or_insert_with(Default::default);
+                k.clear();
+                k.extend(e.iter().map(|x| x.to_bits()));
+                *bv = v;
+                p.clone_from(&pred_recycle.borrow());
+            }
             v
         };
         memo_put(e, v);
@@ -3077,7 +3097,7 @@ fn find_ebe_solve(
                 gradient_fd(&obj, e, n_eta)
             });
         }
-        let t0 = GradientTimings::start();
+        let t0 = GRADIENT_TIMINGS.start();
         // Invalidated by emptying, so the key buffer survives for the refill below.
         if let Some(k) = rows_at.borrow_mut().as_mut() {
             k.clear();
@@ -3681,13 +3701,20 @@ fn find_ebe_solve(
     if use_analytic {
         crate::sens::ode_provider::adjoint::keep_forward(subject, &params.theta, &eta_true);
     }
-    let ipreds = (preds_at
-        .borrow()
-        .iter()
-        .copied()
-        .eq(eta_true.iter().map(|v| v.to_bits()))
-        && pred_recycle.borrow().len() == subject.obs_times.len())
-    .then(|| pred_recycle.take());
+    let at_mode = |k: &[u64]| k.iter().copied().eq(eta_true.iter().map(|v| v.to_bits()));
+    let n_obs = subject.obs_times.len();
+    let ipreds = if at_mode(&preds_at.borrow()) && pred_recycle.borrow().len() == n_obs {
+        Some(pred_recycle.take())
+    } else {
+        // The last walk was another point (a finite-difference probe beside the mode).
+        let kept = best_walk
+            .take()
+            .filter(|(k, _, p)| at_mode(k) && p.len() == n_obs)
+            .map(|(_, _, p)| p);
+        #[cfg(test)]
+        BEST_WALK_RESTORES.with(|c| c.set(c.get() + usize::from(kept.is_some())));
+        kept
+    };
 
     Some(EbeResult {
         eta: DVector::from_column_slice(&eta_true),
@@ -3731,7 +3758,7 @@ fn ebe_h_matrix(
     schedule: Option<&pk::event_driven::EventSchedule>,
 ) -> DMatrix<f64> {
     let n_eta = model.n_eta;
-    let t_jac = GradientTimings::start();
+    let t_jac = GRADIENT_TIMINGS.start();
     let analytic_jac: Option<DMatrix<f64>> = if analytic_inner_grad_supported(model, subject) {
         match captured_jac {
             Some(jac) => Some(jac),
@@ -3776,7 +3803,7 @@ fn ebe_h_matrix(
             }
             None => {
                 // FD Jacobian fallback for models no exact provider covers.
-                let t0 = GradientTimings::start();
+                let t0 = GRADIENT_TIMINGS.start();
                 let j =
                     compute_jacobian_fd(model, subject, &params.theta, eta, pk_scratch, schedule);
                 GRADIENT_TIMINGS.record_jac_fd(t0);
@@ -7981,7 +8008,7 @@ fn backtracking_line_search(
 
 /// Central finite difference gradient (optimized step size)
 fn gradient_fd(obj: &dyn Fn(&[f64]) -> f64, x: &[f64], n: usize) -> Vec<f64> {
-    let t0 = GradientTimings::start();
+    let t0 = GRADIENT_TIMINGS.start();
     let mut g = vec![0.0; n];
     let mut x_work = x.to_vec();
     for i in 0..n {

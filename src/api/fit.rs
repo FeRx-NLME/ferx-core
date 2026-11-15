@@ -1528,6 +1528,18 @@ fn fit_inner(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
+    // `SS=1` doses into a `zero_order()` compartment are lowered to the infusions they are
+    // once, here, not by a clone of the subject in every walk (#2786). Validation has seen
+    // the data as read.
+    let attr_map = model.active_dose_attr_map();
+    let lowered = crate::dosing::lower_population_zero_order_ss(population, attr_map);
+    let all_lowered = (!std::ptr::eq(population, all_records))
+        .then(|| crate::dosing::lower_population_zero_order_ss(all_records, attr_map));
+    let all_records: &Population = match (&all_lowered, &lowered) {
+        (Some(a), _) => &**a,
+        (None, l) => &**l,
+    };
+    let population: &Population = &lowered;
     // The plans' keys read this fit's fingerprints instead of hashing per lookup.
     let _prints =
         crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
@@ -1677,9 +1689,8 @@ fn fit_inner(
 
     // Reset gradient timing counters for this fit so FERX_TIME_GRADIENTS
     // readouts are per-call rather than cumulative across a long R session.
-    let time_gradients = std::env::var("FERX_TIME_GRADIENTS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let time_gradients = crate::estimation::inner_optimizer::GRADIENT_TIMINGS
+        .arm(std::env::var("FERX_TIME_GRADIENTS").ok().as_deref());
     if time_gradients {
         crate::estimation::inner_optimizer::GRADIENT_TIMINGS.reset();
     }
@@ -3903,15 +3914,23 @@ fn fit_inner(
     // Subjects whose compiled plan failed and took finite differences instead (#2786).
     if let Some((msg, entry)) = crate::api::postfit::plan_fd_fallback_warning(model, population) {
         // The realised route, not the model's: those subjects ran finite differences.
-        if let Some((k, _)) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failures(
+        // Each route from its own count: a θ-only failure is the outer gradient's alone, a
+        // covariance-step one neither's.
+        if let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
             model,
             &population.subjects,
         ) {
             let n = population.subjects.len();
-            fit_result.gradient_method_inner =
-                crate::api::postfit::plan_fallback_label(&fit_result.gradient_method_inner, k, n);
-            fit_result.gradient_method_outer =
-                crate::api::postfit::plan_fallback_label(&fit_result.gradient_method_outer, k, n);
+            fit_result.gradient_method_inner = crate::api::postfit::plan_fallback_label(
+                &fit_result.gradient_method_inner,
+                c.inner,
+                n,
+            );
+            fit_result.gradient_method_outer = crate::api::postfit::plan_fallback_label(
+                &fit_result.gradient_method_outer,
+                c.outer,
+                n,
+            );
         }
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);

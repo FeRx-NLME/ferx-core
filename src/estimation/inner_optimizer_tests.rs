@@ -7971,3 +7971,79 @@ mod guard_stop {
         }
     }
 }
+
+/// `FERX_TIME_GRADIENTS` is read per fit, not once per process: a second fit in one session
+/// follows the variable's value then (the first printed timings, the second's counters stayed
+/// zero because the span flag was cached). Mutation: cache the flag in a `OnceLock` again ->
+/// the second `arm` does not turn timing off / on.
+#[test]
+fn gradient_timing_follows_each_fits_reading_of_the_variable() {
+    let t = GradientTimings::new();
+    assert!(t.start().is_none(), "off until a fit arms it");
+    assert!(t.arm(Some("1")));
+    assert!(t.start().is_some());
+    // The next fit reads the variable unset: no spans.
+    assert!(!t.arm(None));
+    assert!(t.start().is_none());
+    // And set again, in either spelling.
+    assert!(t.arm(Some("TRUE")));
+    assert!(t.start().is_some());
+    assert!(!t.arm(Some("0")));
+    assert!(t.start().is_none());
+}
+
+/// The mode's predictions are handed back bit for bit from the one walk kept per solve, also
+/// where the search's last walk was another point (a probe beside the mode), and a solve of an
+/// ODE model holds one entry however many points it visited. Mutation: drop the kept walk's
+/// read-back at the end of the solve -> `ipreds` is `None` for the solves counted below.
+#[test]
+fn the_kept_walk_returns_the_modes_predictions_bit_for_bit() {
+    use std::path::Path;
+    let model = crate::parser::model_parser::parse_model_file(Path::new("examples/mm_oral.ferx"))
+        .expect("model");
+    let pop = crate::read_nonmem_csv(Path::new("data/mm_oral.csv"), None, None).expect("data");
+    let params = model.default_params.clone();
+    let before = BEST_WALK_RESTORES.with(|c| c.get());
+    let mut n_some = 0;
+    for subj in pop.subjects.iter().take(8) {
+        let r = find_ebe(&model, subj, &params, 500, 1e-8, None, None, 0);
+        let Some(ip) = r.ipreds.as_ref() else {
+            continue;
+        };
+        n_some += 1;
+        let eta: Vec<f64> = r.eta.iter().copied().collect();
+        let keys = model.error_spec.obs_keys(subj);
+        let mult = model.ruv_obs_mult(subj, &params.theta);
+        let mut want = Vec::new();
+        let _ = individual_nll_into_prepared_with_schedule_frozen(
+            &model,
+            subj,
+            &params.theta,
+            &eta,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_at(&params),
+            &mut pk::EventPkParams::default(),
+            None,
+            keys.as_ref(),
+            mult.as_deref(),
+            &mut want,
+            &mut DVector::zeros(eta.len()),
+            &mut DVector::zeros(eta.len()),
+            None,
+        );
+        assert_eq!(
+            ip.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "subject {}: the mode's predictions",
+            subj.id
+        );
+    }
+    let restored = BEST_WALK_RESTORES.with(|c| c.get()) - before;
+    eprintln!("{n_some} solves returned ipreds, {restored} from the kept walk");
+    assert_eq!(n_some, 8, "every ODE solve hands its predictions back");
+    assert!(
+        restored > 0,
+        "fixture: a solve whose last walk was another point"
+    );
+}

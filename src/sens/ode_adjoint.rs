@@ -2347,12 +2347,13 @@ fn with_plan_in<R>(
             }
         }
     }
-    let plan = kjit_record(model, subject, lay, theta, eta, None, sigma, &key)?;
+    let (plan, sane) = kjit_record(model, subject, lay, theta, eta, None, sigma, &key)?;
     let r = serves(&plan);
-    if r.is_none() && individual_parameters_are_finite(model, subject, theta, eta) {
+    if r.is_none() && sane && individual_parameters_are_finite(model, subject, theta, eta) {
         // A recording that does not serve at its own point never will: recording again on
-        // every call would only repeat it. (At a point the value path cannot predict, the
-        // guard has no finite values to hold at: that call is declined, not the subject.)
+        // every call would only repeat it. (At a point the value path cannot predict — a
+        // non-finite parameter, or predictions that overflow there — the guard has no finite
+        // values to hold at: that call is declined, not the subject.)
         kj::mark_bad(&key, "the plan does not serve at its own recording point");
     }
     r
@@ -2396,9 +2397,9 @@ pub(super) fn with_plan_nn<R>(
         }
         kj::Lookup::Missing => {}
     }
-    let plan = kjit_record(model, subject, None, theta, eta, Some(nn_z), sigma, &key)?;
+    let (plan, sane) = kjit_record(model, subject, None, theta, eta, Some(nn_z), sigma, &key)?;
     let r = serves(&plan);
-    if r.is_none() && individual_parameters_are_finite(model, subject, theta, eta) {
+    if r.is_none() && sane && individual_parameters_are_finite(model, subject, theta, eta) {
         kj::mark_bad(&key, "the plan does not serve at its own recording point");
     }
     r
@@ -2430,7 +2431,7 @@ fn kjit_record(
     nn_z: Option<&[Vec<f64>]>,
     sigma: Option<&[f64]>,
     key: &crate::parser::model_parser::rhs_regcode::kernel_jit::SubjectKey,
-) -> Option<PlanArc> {
+) -> Option<(PlanArc, bool)> {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
     use std::sync::atomic::Ordering::Relaxed;
     let n_obs = subject.observations.len();
@@ -2439,6 +2440,9 @@ fn kjit_record(
     let slot = theta.len()
         + nn_z.map_or(0, |z| z.iter().map(Vec::len).sum())
         + sigma.map_or(0, <[f64]>::len);
+    // Whether the predictions the recording computed are all finite: they are what the value
+    // path scores at this point, and a non-finite one is the repel sentinel's.
+    let sane = std::cell::Cell::new(true);
     let rec = kj::recorded(&key.family(), || {
         let mut slot = theta.len();
         let th: Vec<kj::Tr> = theta
@@ -2483,7 +2487,10 @@ fn kjit_record(
             &et,
         )
         .filter(|p| p.len() == n_obs)
-        .map(|p| p.iter().map(|x| x.reg()).collect())
+        .map(|p| {
+            sane.set(p.iter().all(|x| x.recorded().is_finite()));
+            p.iter().map(|x| x.reg()).collect()
+        })
     });
     kj::STATS
         .record_us
@@ -2506,6 +2513,9 @@ fn kjit_record(
             return None;
         }
     };
+    // A trial point the value path cannot score (an overflowed or `NaN` output: the repel
+    // sentinel) says nothing about the plan, whichever way it serves there.
+    let sane = sane.get();
     if kj::debug() {
         rec.replay_check();
     }
@@ -2515,7 +2525,7 @@ fn kjit_record(
         return None;
     };
     kj::add(key, plan.clone());
-    Some(plan)
+    Some((plan, sane))
 }
 
 /// The subject's plan whose guard holds at `(theta, eta)` ([`with_plan`]) and its forward at

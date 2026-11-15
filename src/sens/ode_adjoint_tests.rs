@@ -10689,3 +10689,60 @@ fn a_steady_state_with_no_finite_trough_at_an_extreme_eta_does_not_condemn_the_s
     let failed = kj::plan_failures(&model, std::slice::from_ref(&s));
     assert!(failed.is_none(), "a plan failed later: {failed:?}");
 }
+
+/// A line search overshoots to a point whose individual parameters are finite but whose
+/// predictions overflow (`CL = TVCL·e^700`, `V = TVV·e^-30`: `CL` is `~1e304`, the
+/// recording's predictions are `NaN`, the objective there the repel sentinel): the plan recorded
+/// there does not serve at its own point, and that is the point's failure, not the subject's.
+/// The call is declined, no plan failure is noted, and the next sane point is recorded afresh
+/// and served by the plan (matching the reconverged FD) instead of the finite differences the
+/// subject would be condemned to for the rest of the fit. Control: a plan that fails to serve at
+/// a sane point is still condemned (`mark_bad` stays for the structural case).
+/// Mutation: drop `sane &&` from the `mark_bad` condition in `with_plan_in` -> the extreme call
+/// marks the subject bad and the sane point after it is declined.
+#[test]
+fn a_variant_that_overflows_at_a_trial_point_does_not_condemn_the_subject() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let model = tight(parse_model_string(ONE_CPT_ORAL_ODE).unwrap());
+    let doses = || vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let s = subject(&model, doses(), &TIMES, &[0.1, -0.05]);
+    let params = moved_params(&model);
+    let extreme = [EXTREME.0, EXTREME.1];
+    assert!(
+        (model.pk_param_fn)(&params.theta, &extreme, &s.covariates, 0.0)
+            .values
+            .iter()
+            .all(|v| v.is_finite()),
+        "fixture: the individual parameters are finite at the trial point"
+    );
+    // A serve that declines wherever the predictions are not finite, as every consumer does.
+    let declines = &mut |_: &PlanArc| None::<()>;
+    assert!(super::with_plan(&model, &s, None, &params.theta, &extreme, declines).is_none());
+    let failed = kj::plan_failures(&model, std::slice::from_ref(&s));
+    assert!(
+        failed.is_none(),
+        "the overflowing trial point condemned the subject: {failed:?}"
+    );
+    // The next point of the line search, sane: served by a plan.
+    let worst = parity(&model, &s);
+    eprintln!("after an overflowing trial point: parity {worst:.3e}");
+    assert!(worst < 1e-6, "worst relative difference {worst:.2e}");
+    let failed = kj::plan_failures(&model, std::slice::from_ref(&s));
+    assert!(failed.is_none(), "a plan failed later: {failed:?}");
+    // Control: the same declining serve at a sane point is a plan that never serves.
+    let t = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 101.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05],
+    );
+    let sane = [0.1, -0.05];
+    assert!(super::with_plan(&model, &t, None, &params.theta, &sane, declines).is_none());
+    assert!(
+        kj::plan_failures(&model, std::slice::from_ref(&t)).is_some(),
+        "a plan that fails to serve at a sane point is condemned"
+    );
+}
+
+/// The trial point of the test above, set by what the exploration found to overflow.
+const EXTREME: (f64, f64) = (700.0, -30.0);

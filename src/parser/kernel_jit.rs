@@ -2126,12 +2126,18 @@ impl SubjectKey {
         n_theta: usize,
     ) -> Self {
         let m = registered(model as *const _ as usize);
+        let s = registered(subject as *const _ as usize);
         SubjectKey {
-            scope: m.as_ref().map_or(0, |e| e.1),
+            // A registered subject keys under its own fit's scope; anything else under the
+            // model's (a cut copy no fit registered).
+            scope: s
+                .as_ref()
+                .map(|e| e.1)
+                .or_else(|| m.as_ref().map(|e| e.1))
+                .unwrap_or(0),
             model: model.plan_id.get(),
             solver: m.map_or_else(|| solver_desc(model), |e| e.0[0].clone()),
-            subject: registered(subject as *const _ as usize)
-                .map_or_else(|| subject_desc(subject), |e| e.0[0].clone()),
+            subject: s.map_or_else(|| subject_desc(subject), |e| e.0[0].clone()),
             observed: None,
             class: crate::parser::model_parser::current_mixture_class(),
             layout: None,
@@ -2164,24 +2170,37 @@ thread_local! {
     static PRINTS_SEEN: RefCell<(usize, Option<Arc<PrintMap>>)> = const { RefCell::new((0, None)) };
 }
 
-/// Register `model` and `subjects` for the scope's lifetime (reference-counted: concurrent
-/// fits of one model share its entry and its scope).
+/// Register `model` and `subjects` for the scope's lifetime (reference-counted). Each call
+/// gives the subjects it newly registers a scope of their own — their plans, bad marks and
+/// failures key apart from every other fit's of the same model, and leave with it — while the
+/// model's entry (and its closed-form absorption model's ODE twin, which subjects rerouted to
+/// it plan under) is shared by concurrent fits and keeps one scope for what has no subject
+/// ([`note_model_failure`], a cut copy).
 pub(crate) fn register<'a>(
     model: &'a crate::types::CompiledModel,
     subjects: &'a [crate::types::Subject],
 ) -> Prints<'a> {
     let none = Desc::of(|_| {});
-    let mut add = vec![(model as *const _ as usize, [solver_desc(model), none])];
+    let mut add = vec![(
+        model as *const _ as usize,
+        [solver_desc(model), none.clone()],
+    )];
+    if let Some(twin) = model.absorption_ode_equivalent.as_ref().map(|t| t.built()) {
+        add.push((twin as *const _ as usize, [solver_desc(twin), none]));
+    }
+    let n_model = add.len();
     add.extend(
         subjects
             .iter()
             .map(|s| (s as *const _ as usize, [subject_desc(s), observed_desc(s)])),
     );
     edit_prints(|m| {
-        let scope = m
+        let model_scope = m
             .get(&add[0].0)
             .map_or_else(|| NEXT_SCOPE.fetch_add(1, Relaxed), |e| e.2);
-        for (a, d) in &add {
+        let fit_scope = NEXT_SCOPE.fetch_add(1, Relaxed);
+        for (i, (a, d)) in add.iter().enumerate() {
+            let scope = if i < n_model { model_scope } else { fit_scope };
             m.entry(*a).or_insert((Arc::new(d.clone()), 0, scope)).1 += 1;
         }
     });
@@ -2193,22 +2212,23 @@ pub(crate) fn register<'a>(
 
 impl Drop for Prints<'_> {
     fn drop(&mut self) {
-        let mut ended = None;
+        let mut touched = Vec::new();
         edit_prints(|m| {
-            for (i, a) in self.addrs.iter().enumerate() {
+            for a in &self.addrs {
                 if let Some(e) = m.get_mut(a) {
                     e.1 -= 1;
+                    if !touched.contains(&e.2) {
+                        touched.push(e.2);
+                    }
                     if e.1 == 0 {
-                        // The model's entry is first: its scope ends with its last user.
-                        if i == 0 {
-                            ended = Some(e.2);
-                        }
                         m.remove(a);
                     }
                 }
             }
+            // A scope ends with its last entry.
+            touched.retain(|sc| !m.values().any(|e| e.2 == *sc));
         });
-        if let Some(scope) = ended {
+        for scope in touched {
             drop_scope(scope);
         }
     }
@@ -2426,10 +2446,21 @@ pub(crate) fn mark_model_bad(k: &SubjectKey, why: &str) {
         .or_insert_with(|| why.to_string());
 }
 
-/// Per `(scope, model)`: the subjects (fingerprints) whose plan failed, and the first reason.
-/// In theory no plan fails; one that does sends its subject to finite differences for the
-/// quantity at hand, and the fit reports it once ([`plan_failures`]).
-type Failures = HashMap<(u64, u64), (std::collections::HashSet<Desc>, String)>;
+/// What a failed plan's derivatives feed: the inner η-gradient, the outer (θ) gradient, and
+/// the covariance step. A fit labels each route from its own count ([`plan_failure_counts`]).
+const Q_INNER: u8 = 1;
+const Q_OUTER: u8 = 2;
+const Q_COV: u8 = 4;
+
+/// A failed plan's identity, the way plans are keyed: the subject's design and, for a
+/// likelihood kernel (which bakes the observed values in), its observed values — so two subjects
+/// of one design with other data are not one failure.
+type FailedPlan = (Desc, Option<Desc>);
+
+/// Per `(scope, model)`: the plans that failed, each with the quantities (`Q_*`) it fed, and
+/// the first reason. In theory no plan fails; one that does sends its subject to finite
+/// differences for the quantity at hand, and the fit reports it once ([`plan_failures`]).
+type Failures = HashMap<(u64, u64), (HashMap<FailedPlan, u8>, String)>;
 fn failures() -> &'static Mutex<Failures> {
     static F: OnceLock<Mutex<Failures>> = OnceLock::new();
     F.get_or_init(Default::default)
@@ -2437,68 +2468,136 @@ fn failures() -> &'static Mutex<Failures> {
 
 /// Note that `k`'s subject fell back to finite differences because its plan failed (`why`).
 pub(crate) fn note_failure(k: &SubjectKey, why: &str) {
-    failures()
+    // The covariance step's reduced basis (kind 9) feeds no fit gradient; every other plan
+    // is read by the inner and the outer gradient alike.
+    let q = if k.kind == 9 {
+        Q_COV
+    } else {
+        Q_INNER | Q_OUTER
+    };
+    *failures()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry((k.scope, k.model))
         .or_insert_with(|| (Default::default(), why.to_string()))
         .0
-        .insert(k.subject.clone());
+        .entry((k.subject.clone(), k.observed.clone()))
+        .or_default() |= q;
 }
 
-/// The failures' entry for `model`'s fit (its [`register`]ed scope).
+/// The failures' entry for `model`'s model-level notes (its [`register`]ed scope).
 fn failure_key(model: &crate::types::CompiledModel) -> (u64, u64) {
     let scope = registered(model as *const _ as usize).map_or(0, |e| e.1);
     (scope, model.plan_id.get())
 }
 
 /// The failed "subject" a model-level recording notes: one every subject's derivative reads.
-fn model_wide() -> Desc {
-    Desc::of_value(&"model-wide θ-only recording")
+fn model_wide() -> FailedPlan {
+    (Desc::of_value(&"model-wide θ-only recording"), None)
 }
 
 /// Note that a derivative of the model's alone (a θ-only recording, [`derivs`]) fell back to
-/// finite differences because its recording failed (`why`): it enters every subject's, so
-/// the fit counts every subject ([`plan_failures`]).
+/// finite differences because its recording failed (`why`): it enters every subject's outer
+/// gradient only, so the fit counts every subject there ([`plan_failures`]).
 pub(crate) fn note_model_failure(model: &crate::types::CompiledModel, why: &str) {
     STATS.bad.fetch_add(1, Relaxed);
-    failures()
+    *failures()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .entry(failure_key(model))
         .or_insert_with(|| (Default::default(), why.to_string()))
         .0
-        .insert(model_wide());
+        .entry(model_wide())
+        .or_default() |= Q_OUTER;
 }
 
-/// How many of `subjects` a plan failed for during the fit registered for `model`
-/// ([`register`]), and the first failure's reason; `None` when none did. A model-level failure
-/// ([`note_model_failure`]) counts them all.
+/// How many of a fit's subjects fell back to finite differences, per route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlanFailureCounts {
+    /// Subjects with any failed plan.
+    pub(crate) any: usize,
+    /// Subjects whose inner η-gradient fell back.
+    pub(crate) inner: usize,
+    /// Subjects whose outer gradient fell back.
+    pub(crate) outer: usize,
+    /// The first failure's reason.
+    pub(crate) why: String,
+}
+
+/// The per-route counts of `subjects` a plan failed for during the fit registered for `model`
+/// ([`register`]); `None` when none did. A subject counts when a plan of its own — keyed as the
+/// plan is, design and (for a kernel) observed values — failed, under the fit's scope, the
+/// model's or its ODE twin's; a model-level failure ([`note_model_failure`]) counts them all, on
+/// the outer route.
+pub(crate) fn plan_failure_counts(
+    model: &crate::types::CompiledModel,
+    subjects: &[crate::types::Subject],
+) -> Option<PlanFailureCounts> {
+    let f = failures()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let model_scope = registered(model as *const _ as usize).map_or(0, |e| e.1);
+    let ids: Vec<u64> = std::iter::once(model.plan_id.get())
+        .chain(
+            model
+                .absorption_ode_equivalent
+                .as_ref()
+                .map(|t| t.built().plan_id.get()),
+        )
+        .collect();
+    let wide = model_wide();
+    let mut counts = PlanFailureCounts {
+        any: 0,
+        inner: 0,
+        outer: 0,
+        why: String::new(),
+    };
+    for s in subjects {
+        let reg = registered(s as *const _ as usize);
+        let scope = reg.as_ref().map_or(model_scope, |e| e.1);
+        let design = reg
+            .as_ref()
+            .map_or_else(|| subject_desc(s), |e| e.0[0].clone());
+        let observed = reg
+            .as_ref()
+            .map_or_else(|| observed_desc(s), |e| e.0[1].clone());
+        let mut mask = 0u8;
+        for &id in &ids {
+            if let Some((failed, why)) = f.get(&(model_scope, id)) {
+                if let Some(q) = failed.get(&wide) {
+                    mask |= q;
+                    if counts.why.is_empty() {
+                        counts.why = why.clone();
+                    }
+                }
+            }
+            for sc in [scope, model_scope] {
+                let Some((failed, why)) = f.get(&(sc, id)) else {
+                    continue;
+                };
+                let hit = failed
+                    .iter()
+                    .filter(|((d, o), _)| *d == design && o.as_ref().is_none_or(|o| *o == observed))
+                    .fold(0u8, |m, (_, q)| m | q);
+                if hit != 0 && counts.why.is_empty() {
+                    counts.why = why.clone();
+                }
+                mask |= hit;
+            }
+        }
+        counts.any += usize::from(mask != 0);
+        counts.inner += usize::from(mask & Q_INNER != 0);
+        counts.outer += usize::from(mask & Q_OUTER != 0);
+    }
+    (counts.any > 0).then_some(counts)
+}
+
+/// [`plan_failure_counts`]'s total and first reason.
 pub(crate) fn plan_failures(
     model: &crate::types::CompiledModel,
     subjects: &[crate::types::Subject],
 ) -> Option<(usize, String)> {
-    let f = failures()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (failed, why) = f.get(&failure_key(model))?;
-    if failed.contains(&model_wide()) {
-        return Some((subjects.len(), why.clone()));
-    }
-    let print = |s: &crate::types::Subject| {
-        registered(s as *const _ as usize).map_or_else(|| subject_desc(s), |e| e.0[0].clone())
-    };
-    let k = subjects
-        .iter()
-        .filter(|s| failed.contains(&print(s)))
-        .count();
-    // A per-occasion or cut copy is a subject the population does not hold: count it anyway.
-    let k = if k == 0 {
-        failed.len().min(subjects.len())
-    } else {
-        k
-    };
-    Some((k, why.clone()))
+    plan_failure_counts(model, subjects).map(|c| (c.any, c.why))
 }
 
 /// Forget the cached programs and templates a dropped scope or model owned: the templates it
@@ -2521,6 +2620,32 @@ fn prune_caches(gone: impl Fn(u64, u64) -> bool) {
             v.retain(|w| w.strong_count() > 0);
             !v.is_empty()
         });
+}
+
+/// How many plans, bad marks and failure sets the model `id` holds, whatever their scope (test
+/// seam).
+#[cfg(test)]
+pub(crate) fn state_of(id: u64) -> usize {
+    use std::sync::PoisonError;
+    let plans = subjects()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .keys()
+        .filter(|k| k.model == id)
+        .count();
+    let bad = bad_models()
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .keys()
+        .filter(|k| k.1 == id)
+        .count();
+    let failed = failures()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .keys()
+        .filter(|k| k.1 == id)
+        .count();
+    plans + bad + failed
 }
 
 /// How many templates the model `id` owns (test seam).
