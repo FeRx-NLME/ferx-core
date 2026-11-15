@@ -209,6 +209,17 @@ fn cov_hessian(
     objective: Objective,
     sel: HessianSel<'_>,
 ) -> Option<HessianOut> {
+    if super::marginal_refused(model, subject, objective) {
+        // The refusal sentinel is constant: its Hessian is the zero matrix.
+        let n = pt.x.len();
+        return match sel {
+            HessianSel::Full => Some(HessianOut::Full(DMatrix::zeros(n, n))),
+            HessianSel::Diag(axes) => Some(HessianOut::Diag(vec![0.0; axes.len()])),
+            HessianSel::Block(axes) => {
+                Some(HessianOut::Full(DMatrix::zeros(axes.len(), axes.len())))
+            }
+        };
+    }
     let sc = super::scope(model, subject, pt, eta_hat)?;
     hessian_with(&sc, subject, pt.template, pt.x, objective, sel)
 }

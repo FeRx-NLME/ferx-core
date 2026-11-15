@@ -188,7 +188,7 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
     // path exists anyway).
     spec.rhs_program.as_ref()?;
     let ro = spec.readout_program.as_ref()?;
-    if !ro.is_dual_evaluable() {
+    if ro.reads_leaves() {
         return None;
     }
     let n = spec.n_states;
@@ -412,9 +412,9 @@ pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
     e_c[disp.central] = T::from_f64(1.0);
     let mut e_c2 = vec![T::from_f64(0.0); n];
     e_c2[disp.central] = T::from_f64(2.0);
-    let y0 = ro.eval_output_g::<T>(&zero_state, p, cov, &mut vars, &mut stack);
-    let y1 = ro.eval_output_g::<T>(&e_c, p, cov, &mut vars, &mut stack);
-    let y2 = ro.eval_output_g::<T>(&e_c2, p, cov, &mut vars, &mut stack);
+    let y0 = ro.eval_output_g::<T>(&zero_state, p, &[], &[], cov, &mut vars, &mut stack);
+    let y1 = ro.eval_output_g::<T>(&e_c, p, &[], &[], cov, &mut vars, &mut stack);
+    let y2 = ro.eval_output_g::<T>(&e_c2, p, &[], &[], cov, &mut vars, &mut stack);
     // The observable must be **linear through the origin** in the central amount:
     // `mr_observable_g` sums `mass·kernel_conc = m·amount`, so a readout with a
     // non-zero intercept (a baseline `y = central/V + BASE`) or any curvature in

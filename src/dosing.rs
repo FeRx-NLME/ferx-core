@@ -1376,6 +1376,39 @@ pub(crate) fn residual_end_indices_g<G: crate::sens::num::PkNum>(
     j0..n
 }
 
+/// The number of [`ss_residual_ends`]'s pulses of `dose` still running at `lo` (end `≥ lo`), the
+/// window `dur_eff` and `lo` numbers of the caller's type. The count is estimated from the
+/// values and pinned by the two comparisons either side of it, recorded as branches by a
+/// recording type (as [`residual_end_indices_g`]), so a replay at other parameters keeps the
+/// pulses it kept.
+pub(crate) fn ss_residual_count_ending_at_or_after_g<G: crate::sens::num::PkNum>(
+    dose: &DoseEvent,
+    lag: f64,
+    dur_eff: G,
+    lo: G,
+) -> usize {
+    use crate::sens::num::BranchCmp::{Ge, Lt};
+    if !is_real_infusion(dose) {
+        return 0;
+    }
+    let (first, n) = ss_residual_infusions_g(dose, G::from_f64(lag), dur_eff);
+    if n == 0 {
+        return 0;
+    }
+    // An estimate of the count; the two comparisons recorded below pin it.
+    // value-read-ok: estimate only, pinned by the recorded comparisons below
+    let (first_v, lo_v) = (first.probe_value(), lo.probe_value());
+    let j0 = ResidualEnds::new(dose.time, first_v, dose.ii, n).count_ending_at_or_after(lo_v);
+    let end = |j: usize| G::from_f64(dose.time) + first - G::from_f64(j as f64 * dose.ii);
+    if j0 > 0 {
+        end(j0 - 1).br_cmp(Ge, lo);
+    }
+    if j0 < n {
+        end(j0).br_cmp(Lt, lo);
+    }
+    j0
+}
+
 /// [`ss_residual_infusions_g`]'s stop times, for an `F`-reshaped real infusion (else none).
 pub(crate) fn ss_residual_ends(dose: &DoseEvent, lag: f64, f_bio: f64) -> ResidualEnds {
     let (first, n) = if is_real_infusion(dose) {

@@ -43,8 +43,7 @@
 //! inner gradients and Hessians ([`exact_obs_grads`], [`exact_inner_hessian`], …).
 //!
 //! Out of scope (`None`, and the caller salvages the subject by finite differences): SDE,
-//! subjects with non-Gaussian records, IOV with FREM rows, engine shapes no recorder
-//! serves.
+//! subjects with non-Gaussian records, engine shapes no recorder serves.
 #![allow(clippy::needless_range_loop)]
 
 use super::*;
@@ -98,23 +97,30 @@ fn endpoint_only(model: &CompiledModel) -> bool {
 /// readout) with a parameter program over `[η, κ]`. The inner loop's scope: a subject
 /// without non-Gaussian records is served even on a joint model.
 pub(crate) fn recorder_in_scope(model: &CompiledModel) -> bool {
-    !nested_levels_outside_scope(model)
-        && match model.ode_spec.as_ref() {
-            _ if model.is_algebraic() => model
-                .indiv_param_partials
-                .indiv_param_program
-                .as_ref()
-                .is_some_and(|p| p.n_eta_axis() == model.n_eta + model.n_kappa),
-            Some(_) => {
-                crate::sens::ode_provider::ode_walk_model_scope(model)
-                    && (model.n_kappa == 0 || model.frem_config.is_none())
-            }
-            None => {
-                crate::sens::provider::closed_form_model_scope(model)
-                    && crate::sens::provider::analytic_param_program(model)
-                        .is_some_and(|p| p.n_eta_axis() == model.n_eta + model.n_kappa)
-            }
+    match model.ode_spec.as_ref() {
+        _ if model.is_algebraic() => model
+            .indiv_param_partials
+            .indiv_param_program
+            .as_ref()
+            .is_some_and(|p| p.n_eta_axis() == model.n_eta + model.n_kappa),
+        Some(_) => crate::sens::ode_provider::ode_walk_model_scope(model),
+        None => {
+            crate::sens::provider::closed_form_model_scope(model)
+                && crate::sens::provider::analytic_param_program(model)
+                    .is_some_and(|p| p.n_eta_axis() == model.n_eta + model.n_kappa)
         }
+    }
+}
+
+/// A subject the IOV FOCE/FOCEI marginal refuses (FREM covariate rows under κ,
+/// `stats::likelihood::iov_refuses_frem`): its objective is the constant
+/// `IOV_FREM_REFUSAL_NLL`, whose derivatives of every order in every packed coordinate are
+/// exactly zero. The quadrature objectives score such a subject through their own
+/// integrand, so they are not refused here.
+fn marginal_refused(model: &CompiledModel, subject: &Subject, objective: Objective) -> bool {
+    model.n_kappa > 0
+        && !matches!(objective, Objective::Agq { .. })
+        && crate::stats::likelihood::iov_refuses_frem(model, subject)
 }
 
 /// The subject objective whose gradient is wanted.
@@ -267,7 +273,9 @@ pub(super) fn scope<'m>(
     }
     let seg = crate::estimation::parameterization::packed_segments(template);
     let n_iov_packed = if model.n_kappa > 0 {
-        // IOV + FREM is scored by a sentinel, not the kernel's objective. A dense residual
+        // IOV + FREM is scored by a sentinel, not the kernel's objective (the FOCE/FOCEI
+        // callers answer it with the sentinel's exact zero derivatives before here,
+        // `marginal_refused`; what reaches this is a quadrature objective). A dense residual
         // (a `correlation … by` line, #1082 PR5) is: the IOV marginal is the non-IOV dense
         // one over the stacked `[η, κ]` system, on the same row-wise predicate.
         if subject.fremtype.iter().any(|&ft| ft > 0) {
@@ -450,6 +458,17 @@ pub(crate) fn subject_fixed_ebe_score_at(
     interaction: bool,
 ) -> Option<(f64, Vec<f64>)> {
     if model.n_kappa > 0 {
+        let objective = if interaction {
+            Objective::Focei
+        } else {
+            Objective::Foce
+        };
+        if marginal_refused(model, subject, objective) {
+            return Some((
+                crate::stats::likelihood::IOV_FREM_REFUSAL_NLL,
+                vec![0.0; pt.x.len()],
+            ));
+        }
         // `eta_hat` is the stacked `[η̂, κ̂]`; `h` holds the BSV columns only.
         let sc = scope(model, subject, pt, eta_hat)?;
         if h.nrows() != subject.observations.len() || h.ncols() != model.n_eta {
@@ -924,6 +943,9 @@ fn adjoint_gradient(
     if let Some(o) = eta_dx.as_deref_mut() {
         o.mode_system_declined = false;
     }
+    if marginal_refused(model, subject, objective) {
+        return Some(vec![0.0; pt.x.len()]);
+    }
     let sc = scope(model, subject, pt, eta_hat)?;
     let objective = match objective {
         // No random effects: both anchors are the empty `H`, and `Ψ = F`.
@@ -1328,6 +1350,19 @@ fn scale_of_spec<T: VmNum>(
     })
 }
 
+/// What a readout reads directly beside the individual parameters, as the recording's own
+/// values: the θ leaves and the BSV η (a readout cannot name a κ).
+fn readout_leaves<'a, T>(
+    model: &CompiledModel,
+    th: &'a ThetaLeaves<'_, T>,
+    et: &'a [T],
+) -> crate::sens::ode_provider::ReadoutLeaves<'a, T> {
+    crate::sens::ode_provider::ReadoutLeaves {
+        theta: th.theta,
+        eta: &et[..model.n_eta],
+    }
+}
+
 /// ODE engine: the static superposition walk, or (time-varying covariates, lag times,
 /// steady state, modeled doses, `TIME`, resets) the event-driven walk, with `init(...)`
 /// on either through the compiled init program (`init_seed`).
@@ -1351,7 +1386,14 @@ fn record_ode<T: VmNum>(
             .collect();
         let init_state = init_seed::<T>(ode, &params_dual)
             .unwrap_or_else(|| vec![T::from_f64(0.0); ode.n_states]);
-        let preds = integrate_seeded_duals(model, subject, &pk.values, &params_dual, &init_state)?;
+        let preds = integrate_seeded_duals(
+            model,
+            subject,
+            &pk.values,
+            &params_dual,
+            &init_state,
+            readout_leaves(model, th, et),
+        )?;
         return apply_expression_scale(model, subject, th, et, &by_slot, preds);
     }
     if !event_walk_subject_supported(model, subject) {
@@ -1380,6 +1422,7 @@ fn record_ode<T: VmNum>(
         &pk_at_obs,
         &pk_at_pk_only,
         &pk_at_reset,
+        readout_leaves(model, th, et),
         true,
     );
     if !matches!(
@@ -1591,6 +1634,7 @@ fn record_ode_iov<T: VmNum>(
         &pk_at_obs,
         &pk_at_pk_only,
         &pk_at_reset,
+        readout_leaves(model, th, et),
         true,
     );
     match &model.scaling {
@@ -1913,10 +1957,6 @@ fn record_analytic_events<T: VmNum>(
         let p = &snaps[obs[j]].1;
         std::array::from_fn(|s| p.get(s).copied().unwrap_or(T::from_f64(0.0)))
     };
-    let readout = model
-        .analytic_readout
-        .as_ref()
-        .and_then(|ar| ar.program.as_ref());
     let mut preds = pv::closed_form_event_predictions(
         model,
         subject,
@@ -1925,8 +1965,6 @@ fn record_analytic_events<T: VmNum>(
         &at_obs,
         &at_pk_only,
         &slot_dual,
-        &obs_params,
-        readout,
     )?;
     // Analytic `init(...)` impulses before scaling: the amount at the subject-static `t = 0`
     // parameters (BSV η only under IOV, as `predict_iov`); the decay at those parameters,
@@ -1956,6 +1994,37 @@ fn record_analytic_events<T: VmNum>(
             &amount,
             decay.as_deref(),
             &mut preds,
+        )?;
+    }
+    // The Form C readout, after the init impulses (production's order): at each observation's
+    // own parameters, beside the depot amount at the occasion's subject-static `t = 0` snapshot
+    // where it reads one.
+    if let Some(ar) = model.analytic_readout.as_ref() {
+        let depot: Option<Vec<T>> = if ar.references_depot() {
+            let mut by_group: std::collections::HashMap<Option<usize>, Vec<T>> =
+                std::collections::HashMap::new();
+            let mut v = Vec::with_capacity(n_obs);
+            for j in 0..n_obs {
+                let occ = subject.occasions.get(j).copied().unwrap_or(u32::MAX);
+                let all = by_group.entry(group(occ)).or_insert_with(|| {
+                    let (pk0, full) = at(occ, &subject.covariates, 0.0);
+                    pv::closed_form_depot_amounts_g(subject, &pk0, &|slot, value| {
+                        full.get(slot).copied().unwrap_or(T::from_f64(value))
+                    })
+                });
+                v.push(all[j]);
+            }
+            Some(v)
+        } else {
+            None
+        };
+        preds = pv::apply_closed_form_readout_g(
+            model,
+            subject,
+            preds,
+            depot.as_deref(),
+            &|j| std::borrow::Cow::Owned(obs_params(j)),
+            readout_leaves(model, th, et),
         )?;
     }
     // Scaling then LTBS: per occasion group for an IOV expression scale, else the shared
@@ -2013,12 +2082,6 @@ fn record_algebraic<T: VmNum>(
     et: &[T],
 ) -> Option<Vec<T>> {
     let readout = model.analytic_readout.as_ref()?;
-    let prog_out = match &readout.readout {
-        crate::ode::OdeReadout::Single(_) => {
-            readout.program.as_ref().filter(|p| p.is_dual_evaluable())?
-        }
-        _ => return None,
-    };
     let prog = model
         .indiv_param_partials
         .indiv_param_program
@@ -2078,8 +2141,19 @@ fn record_algebraic<T: VmNum>(
             };
             let _guard =
                 crate::parser::model_parser::ModelTimeGuard::enter(subject.readout_time(j));
-            let y =
-                prog_out.eval_output_g::<T>(&[], params, subject.obs_cov(j), &mut vars, &mut stack);
+            // The uniform program, or the observation's CMT's (none: a `NaN` prediction).
+            let y = match crate::sens::provider::readout_program_at(readout, subject, j)? {
+                Some(prog_out) => prog_out.eval_output_g::<T>(
+                    &[],
+                    params,
+                    th.theta,
+                    &et[..n_eta],
+                    subject.obs_cov(j),
+                    &mut vars,
+                    &mut stack,
+                ),
+                None => T::from_f64(f64::NAN),
+            };
             Some(crate::sens::ode_provider::apply_output_transform(model, y))
         })
         .collect()
@@ -2847,8 +2921,7 @@ fn kjit_run(
 /// count: `eta` arrives per cell and is recorded over the axes it expands from
 /// ([`StackedLayout::sens_of`](crate::stats::stacked_layout::StackedLayout::sens_of)), so each
 /// derivative is over the vector the EBE search moves. `None` when `eta` is not the subject's
-/// width, and for a nested-level subject no recording lays out (see
-/// [`nested_levels_outside_scope`]).
+/// width, and for a nested-level subject no recording lays out (one never given its cells).
 #[allow(clippy::type_complexity)]
 fn resolve<'m, 'l>(
     model: &'m CompiledModel,
@@ -2863,12 +2936,9 @@ fn resolve<'m, 'l>(
     Option<crate::stats::stacked_layout::LayRef<'l>>,
 )> {
     let (eff, w, e, lay) = if model.n_kappa > 0 {
-        if nested_levels_outside_scope(model) {
-            return None;
-        }
         let eff = crate::pk::effective_model_for_eval_iov(model, subject, theta, eta);
         // The caller's layout is the subject's under any route: an ODE twin has the
-        // model's `n_eta` / `n_kappa`, and one without the model's levels is declined above.
+        // model's `n_eta` / `n_kappa` and, being parsed from the emitted source, its levels.
         let lay = match layout {
             Some(l) => crate::stats::stacked_layout::LayRef::Borrowed(l),
             None => crate::stats::stacked_layout::LayRef::Shared(
@@ -2903,15 +2973,6 @@ pub(crate) fn subject_width(model: &CompiledModel, subject: &Subject) -> Option<
         return Some(model.n_eta);
     }
     Some(crate::stats::stacked_layout::StackedLayout::sens_of(model, subject)?.n_axes())
-}
-
-/// Whether a model with nested levels (#1082) lies outside the recordings: one whose IOV
-/// subjects may run on a closed-form transit/IG model's ODE twin
-/// (`absorption_ode_equivalent`), a separate `CompiledModel` parsed from emitted source
-/// that is not known to carry the levels — a recording on it would lay κ out per cell,
-/// one κ per arm where the model draws one per study. `false` without nested levels.
-pub(crate) fn nested_levels_outside_scope(model: &CompiledModel) -> bool {
-    model.has_nested_levels() && model.absorption_ode_equivalent.is_some()
 }
 
 /// A nested-level recording's inputs per cell (#1082): `eta` and `et` over the compact

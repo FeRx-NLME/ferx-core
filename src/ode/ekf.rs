@@ -26,7 +26,7 @@
 use crate::dosing::{
     is_real_infusion, note_ss_nonconvergence_if_capped, SsStopTracker, SS_EQUILIBRATION_CYCLES,
 };
-use crate::ode::predictions::active_infusion_doses;
+use crate::ode::predictions::active_infusion_doses_g;
 use crate::ode::solver::{solve_ode_g_with_auto_state, OdeAutoSwitchState, OdeSolverOptions};
 use crate::sens::jet::DualT;
 use crate::sens::num::vm::VmNum;
@@ -378,7 +378,10 @@ fn jet_part<T: VmNum>(t: T) -> Option<T> {
 /// A solve's saved point's time as a number of the filter's type: the span's (possibly
 /// moving) `end` when it is that end, the constant otherwise.
 fn point_time<T: VmNum>(t: f64, end: T) -> T {
-    if t.to_bits() == end.br_value().to_bits() {
+    // The solver places the solve's last point at the span's end by construction (a recording
+    // keeps it as the moving end, `end_save`); no decision is taken on the value.
+    // value-read-ok: names the last point, as above
+    if t.to_bits() == end.probe_value().to_bits() {
         end
     } else {
         T::from_f64(t)
@@ -450,7 +453,8 @@ fn equilibrate_ss_ekf<T: VmNum, R: EkfRhs>(
             (zero, t1),
             params,
             anchors,
-            &[t1.br_value()],
+            // value-read-ok: the span's own end as the solve's last save point (`end_save`)
+            &[t1.probe_value()],
             opts,
         );
         let mut p_out = p_mat;
@@ -793,7 +797,14 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
         // The breaks as numbers of the filter's type (a window end moves), and their values
         // for the record reads and the infusions' membership, which the guarded order fixes.
         let (t_start_g, t_end_g) = (break_times[k], break_times[k + 1]);
-        let (t_start, t_end) = (t_start_g.br_value(), t_end_g.br_value());
+        // The break values the f64 record reads and `segment_saveat` are built from; every
+        // decision they make is recorded below as a verdict on the break itself (a moving
+        // break's record band, the doses it names, the records a segment reads, the infusions
+        // running across it), so a plan holds across the values that leave those verdicts alone.
+        // value-read-ok: each decision is a recorded verdict on the break, as above
+        let (t_start, t_end) = (t_start_g.probe_value(), t_end_g.probe_value());
+        let near_start =
+            |x: f64| t_start_g.br_absdiff_lt(tf(x), crate::ode::predictions::EVENT_MATCH_TOL);
 
         // Records read *at* t_start — the whole `EVENT_MATCH_TOL` band, through the same
         // helper as the ODE engines (#1226). A dose matches a break symmetrically within
@@ -804,13 +815,23 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
         // post-event pair (#2510). At the subject's first instant the two always share a break,
         // and before this the record read post-dose there (and, before an `SS=1` dose, the
         // stationary covariance).
-        obs_index.records_at_break(t_start, &mut boundary_obs);
+        if T::RECORDS_BRANCHES && !t_start_g.is_constant() {
+            // A moving break: each record's membership of its band is a recorded verdict
+            // (`reads_at_break`, in time order as `records_at_break` returns them).
+            boundary_obs.clear();
+            boundary_obs.extend(obs_index.sorted().iter().filter_map(|&(t, j)| {
+                let d = tf(t) - t_start_g;
+                (d.br_cmp_c(BranchCmp::Ge, 0.0)
+                    && d.br_cmp_c(BranchCmp::Lt, crate::ode::predictions::EVENT_MATCH_TOL))
+                .then_some(j)
+            }));
+        } else {
+            obs_index.records_at_break(t_start, &mut boundary_obs);
+        }
         let first_event = doses
             .iter()
             .enumerate()
-            .filter(|&(di, d)| {
-                !applied[di] && (d.time - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL
-            })
+            .filter(|&(di, d)| !applied[di] && near_start(d.time))
             .map(|(_, d)| d.time)
             .fold(f64::INFINITY, f64::min);
         // Set when an `SS=1` record at this break replaces the covariance (below).
@@ -822,7 +843,7 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
                     if applied[di] {
                         continue;
                     }
-                    if (dose.time - t_start).abs() < crate::ode::predictions::EVENT_MATCH_TOL {
+                    if near_start(dose.time) {
                         applied[di] = true;
                         // An `SS=1` record replaces the pair with the periodic trough (#1260); the
                         // record's own dose then lands on it below (bolus) or through
@@ -912,6 +933,9 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
             }
             if !t_end_g.is_constant() {
                 let _ = tf(t).br_cmp(BranchCmp::Le, t_end_g);
+                // `segment_saveat` merges a record within `1e-12` of the end into the end's own
+                // save point.
+                let _ = tf(t).br_absdiff_lt(t_end_g, 1e-12);
             }
         }
 
@@ -929,22 +953,22 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
 
         // Active infusion rates for this segment (shared with the FOCEI ODE
         // path so the F·RATE / span / lag / reset semantics stay in lockstep).
-        // The EKF path has no per-dose lagtimes and no system resets. Membership is read on
-        // the values (the guarded order fixes it); the rate and window carry `F` and a
-        // modeled `D`/`R` ([`infusion_of`]).
-        let f_vals: Vec<f64> = dose_f_bio.iter().map(|f| f.br_value()).collect();
-        let active: Vec<(usize, T)> = active_infusion_doses(
+        // The EKF path has no per-dose lagtimes and no system resets. Membership is decided
+        // through the branch API on the window `inf[k].1` (carrying `F` and a modeled `D`/`R`,
+        // [`infusion_of`]) and the segment's ends, so a window that moves with the parameters
+        // is a guarded comparison, not an exact value.
+        let active: Vec<(usize, T)> = active_infusion_doses_g(
             &[],
             doses,
-            t_start,
-            t_end,
+            t_start_g,
+            t_end_g,
             &[],
-            &f_vals,
+            &|k, _| inf[k].1,
             f64::NEG_INFINITY,
             n,
         )
         .into_iter()
-        .map(|(k, cmt, _, pulses)| {
+        .map(|(k, cmt, pulses)| {
             (
                 cmt,
                 if pulses == 1 {

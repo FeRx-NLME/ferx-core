@@ -2781,6 +2781,118 @@ fn kernel_frem_pseudo_observations_match_reconverged_fd() {
     assert!(worst < 4e-5, "worst relative difference {worst:.2e}");
 }
 
+// ---- FREM with κ on an ODE (#2786) ------------------------------------------------------
+
+/// `ODE_IOV` with a FREM weight pseudo-covariate beside the two BSV η.
+fn frem_iov_ode() -> CompiledModel {
+    let src = ODE_IOV
+        .replace(
+            "  omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n",
+            "  theta TV_WT(72.0, 1.0, 500.0)\n  block_omega (ETA_CL, ETA_V, ETA_WT_FREM) = [\n    0.09,\n    0.0, 0.06,\n    0.0, 0.0, 111.56\n  ]\n",
+        )
+        .replace(
+            "  sigma PROP_ERR ~ 0.1 (sd)\n",
+            "  sigma PROP_ERR ~ 0.1 (sd)\n  sigma EPSCOV ~ 0.30\n",
+        )
+        .replace(
+            "[fit_options]\n  iov_column = OCC\n",
+            "[fit_options]\n  iov_column = OCC\n  frem_predictions = TV_WT/ETA_WT_FREM:100\n  frem_sigma = EPSCOV\n",
+        );
+    let m = tight(parse_model_string(&src).unwrap());
+    assert!(m.ode_spec.is_some() && m.n_kappa == 2 && m.frem_config.is_some());
+    m
+}
+
+/// A model with FREM and κ on an ODE is inside the recorders' scope, and each subject is
+/// served exactly. A subject without FREM rows is an ordinary IOV subject (reconverged-FD
+/// parity, FOCEI and FOCE). A subject with FREM rows is the one the IOV marginal refuses:
+/// its objective is the constant `IOV_FREM_REFUSAL_NLL`, so the exact gradient and Hessian
+/// are zero — checked against the production objective at the reconverged points, which
+/// is that constant at every one of them (the premise of the zero).
+#[test]
+fn frem_with_kappa_on_an_ode_is_served_exactly() {
+    use crate::stats::likelihood::IOV_FREM_REFUSAL_NLL;
+    let model = frem_iov_ode();
+    assert!(recorder_in_scope(&model) && outer_model_in_scope(&model));
+    // `iov_subject` draws its data at a two-η point; this model has the FREM η as a third.
+    let mut plain = iov_subject(&model);
+    plain.fremtype = vec![0; plain.observations.len()];
+    let kappas = vec![vec![0.1, -0.05], vec![-0.08, 0.04], vec![0.05, 0.06]];
+    let preds = crate::pk::predict_iov(
+        &model,
+        &plain,
+        &model.default_params.theta,
+        &[0.1, -0.05, 0.0],
+        &kappas,
+    );
+    plain.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    for interaction in [true, false] {
+        let worst = iov_parity(&model, &plain, interaction);
+        eprintln!("FREM + κ, no FREM rows, interaction={interaction}: {worst:.2e}");
+        // Measured 4.8e-9 (FOCEI) / 3.4e-7 (FOCE); ~30x headroom on the worse.
+        assert!(worst < 1e-5, "interaction={interaction}: {worst:.2e}");
+    }
+    // The same subject with its last observation a FREM weight row.
+    let mut refused = plain.clone();
+    let last = refused.observations.len() - 1;
+    refused.fremtype[last] = 100;
+    refused.observations[last] = 80.0;
+    assert!(crate::stats::likelihood::iov_refuses_frem(&model, &refused));
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    for interaction in [true, false] {
+        let eta = ebe_for(&model, &refused, &params, 1e-10, interaction);
+        let g = subject_adjoint_packed_gradient(
+            &model,
+            &refused,
+            &params,
+            &x,
+            eta.as_slice(),
+            interaction,
+        )
+        .expect("served, not declined to finite differences");
+        assert_eq!(g, vec![0.0; x.len()]);
+        // The oracle: the production objective at reconverged points is the constant.
+        for k in 0..x.len() {
+            let mut xp = x.clone();
+            xp[k] += 1e-3;
+            assert_eq!(
+                reconverged_f_for(&model, &refused, &params, &xp, interaction),
+                IOV_FREM_REFUSAL_NLL,
+                "x[{k}]"
+            );
+        }
+        let h = crate::sens::ode_provider::adjoint::subject_adjoint_cov_hessian(
+            &model,
+            &refused,
+            &params,
+            &x,
+            eta.as_slice(),
+            if interaction {
+                Objective::Focei
+            } else {
+                Objective::Foce
+            },
+        )
+        .expect("served");
+        assert!(h.nrows() == x.len() && h.iter().all(|v| *v == 0.0));
+        // Control: the unrefused subject's gradient is live.
+        let g0 = subject_adjoint_packed_gradient(
+            &model,
+            &plain,
+            &params,
+            &x,
+            eta.as_slice(),
+            interaction,
+        );
+        assert!(g0.is_some_and(|g| g.iter().any(|v| v.abs() > 1e-2)));
+    }
+}
+
 // ---- the f64 kernel IS the production objective ------------------------------------------
 
 /// Kernel `F` and `l` at `(params, η)` against production's `foce_subject_nll` / inner
@@ -3705,7 +3817,7 @@ fn closed_form_time_varying_covariate_matches_reconverged_fd() {
     assert!(worst < 2.6e-6, "FOCE: {worst:.2e}");
 }
 
-const CF_IOV: &str = r#"
+pub(super) const CF_IOV: &str = r#"
 [parameters]
   theta TVCL(4.0, 0.1, 100.0)
   theta TVV(30.0, 1.0, 500.0)
@@ -3744,7 +3856,7 @@ fn closed_form_iov_matches_reconverged_fd() {
 #[test]
 fn ode_iov_with_ltbs_matches_reconverged_fd() {
     // LTBS under ODE IOV (outside the retired forward provider's scope, inside the shared
-    // walk's `ode_iov_model_scope`): against the reconverged objective.
+    // walk's `ode_iov_walk_scope`): against the reconverged objective.
     let src = ODE_IOV
         .replace("  sigma PROP_ERR ~ 0.1 (sd)", "  sigma ADD_ERR ~ 0.1 (sd)")
         .replace(
@@ -4865,7 +4977,7 @@ fn endpoint_magnitude_cov_hessian_matches_fd() {
 
 // ---- closed-form analytic `init(...)` impulses -----------------------------------------
 
-const CF_INIT: &str = r#"
+pub(super) const CF_INIT: &str = r#"
 [parameters]
   theta TVCL(4.0, 0.1, 100.0)
   theta TVV(30.0, 1.0, 500.0)
@@ -8034,6 +8146,65 @@ fn the_outer_gradient_is_exact_on_binary_and_ctmm_endpoints() {
     eprintln!("binary / CTMM outer gradient vs the reconverged oracle: worst {worst:.2e}");
     // Measured 1.5e-12: the oracle's floor on these closed-form terms.
     assert!(worst < 5e-7, "{worst:.2e}");
+}
+
+/// A closed-form joint model (PK + a binary endpoint sharing `ETA_CL`) and a subject whose
+/// every observation is on the endpoint's CMT, so `subject_feeds_analytical_pk` is false:
+/// the data reader routes such rows to `obs_records` and leaves `observations` empty, so the
+/// recorders have no Gaussian row to record and the subject is served by the term alone.
+/// Against the reconverged oracle, with the mixed subject of the same model as the control.
+#[cfg(all(feature = "survival", feature = "markov"))]
+#[test]
+fn a_subject_with_only_endpoint_observations_on_a_closed_form_joint_model_is_served() {
+    use crate::types::ObsRecord;
+    let model = parse_model_string(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+         theta TVKA(1.2, 0.05, 20.0)\n  theta TH0(-0.3, -10.0, 10.0)\n  \
+         omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.06\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV * exp(ETA_V)\n  \
+         KA = TVKA\n[structural_model]\n  pk one_cpt_oral(cl=CL, v=V, ka=KA)\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n\
+         [binary_model]\n  cmt   = 3\n  logit = TH0 + 2.0 * ETA_CL\n",
+    )
+    .unwrap();
+    assert!(model.ode_spec.is_none() && !model.is_algebraic() && model.has_non_gaussian());
+    let records = [(0.0, 0), (1.0, 1), (2.0, 1), (4.0, 0), (6.0, 1)]
+        .iter()
+        .map(|&(time, state)| ObsRecord::DiscreteState {
+            time,
+            raw_time: time,
+            state,
+            cmt: 3,
+        })
+        .collect::<Vec<_>>();
+    let mut only = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[],
+        &[0.0, 0.0],
+    );
+    only.obs_records = records.clone();
+    assert!(only.observations.is_empty() && only.obs_cmts.is_empty());
+    assert!(
+        !crate::pk::subject_feeds_analytical_pk(&model, &only),
+        "the premise: the predictor feeds nothing for this subject"
+    );
+    let mut mixed = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &[1.0, 4.0, 12.0],
+        &[0.1, -0.05],
+    );
+    mixed.obs_records = records;
+    assert!(crate::pk::subject_feeds_analytical_pk(&model, &mixed));
+    assert!(outer_model_in_scope(&model));
+    for (tag, s) in [("endpoint observations only", &only), ("mixed", &mixed)] {
+        for interaction in [true, false] {
+            let w = fd_oracle(&model, s, interaction);
+            eprintln!("{tag} interaction={interaction}: worst {w:.2e}");
+            assert!(w < 5e-7, "{tag} interaction={interaction}: {w:.2e}");
+        }
+    }
 }
 
 /// The exact Laplace / AGQ gradient of a subject carrying non-Gaussian records: the term in

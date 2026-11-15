@@ -241,9 +241,6 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if GradientMethod::forced_fd(model) {
         return "gradient = fd";
     }
-    if crate::sens::ode_provider::adjoint::nested_levels_outside_scope(model) {
-        return "nested variability levels on a closed-form transit/IG model";
-    }
     if analytic_inner_common_bail(model) {
         return "model-level analytic inner fallback";
     }
@@ -4659,6 +4656,10 @@ fn analytic_iov_inner_supported(
     // a TTE + IOV model would then report an analytic label and run FD. A subject with no
     // Gaussian rows needs no recorder at all.
     (crate::sens::ode_provider::adjoint::recorder_in_scope(model) || subject.obs_times.is_empty())
+        // The IOV marginal refuses a subject's FREM rows (its inner objective scores them
+        // by the covariate variance over the *PK* prediction, which is not the kernel's
+        // `θ_i + η_e` row), so no exact inner gradient is the gradient of what is solved.
+        && !crate::stats::likelihood::iov_refuses_frem(model, subject)
         && params.omega_iov.is_some()
         && !analytic_inner_common_bail(model)
         && non_gaussian_eta_grad_served(model, subject)

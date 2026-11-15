@@ -328,4 +328,42 @@ mod tests {
         assert!(run(&vb, &ok).is_none(), "declined from the model's mark");
         assert!(matches!(kj::lookup(&key_b), kj::Lookup::Bad));
     }
+
+    /// Every `None` of a kernel's `f` is a point outside the objective's domain (a non-positive
+    /// or non-finite variance, a non-PD Ω or `H`, a custom residual magnitude out of range: the
+    /// value path scores a sentinel there, which has no derivative): `kernel_run` declines the
+    /// call, records nothing and condemns nothing, so the next valid point records and serves.
+    /// Mutation: settle a `None` from `f` as a subject's failure (`mark_bad`) -> the key reads
+    /// `Bad` and the valid call is declined.
+    #[test]
+    fn a_domain_decline_in_a_kernel_condemns_nothing() {
+        let (model, subject) = (test_model(), Subject::default());
+        let variant = variant_of(&0x4e_0004u32);
+        let key = key_of(&model, &subject, &variant);
+        let at = |x: f64, f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>| {
+            kernel_run(&model, &subject, variant.clone(), Layout::F64, &[x], 1, f)
+        };
+        // `1/x` outside its domain at `x = 0`: the objective's own decline (`None`).
+        let f = |lv: &[kj::Tr]| {
+            if lv[0].recorded() == 0.0 {
+                None
+            } else {
+                Some(vec![
+                    <kj::Tr as crate::sens::num::PkNum>::from_f64(1.0) / lv[0],
+                ])
+            }
+        };
+        assert!(at(0.0, &f).is_none());
+        assert!(
+            matches!(kj::lookup(&key), kj::Lookup::Missing),
+            "nothing kept, nothing condemned"
+        );
+        let r = at(4.0, &f).expect("served at a valid point");
+        assert_eq!(r.value(0), 0.25);
+        assert!(
+            matches!(kj::lookup(&key), kj::Lookup::Found(_)),
+            "the plan recorded at the valid point is kept"
+        );
+        assert_eq!(at(2.0, &f).expect("and serves again").value(0), 0.5);
+    }
 }

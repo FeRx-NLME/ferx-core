@@ -3127,9 +3127,6 @@ fn the_adjoint_level_gradient_is_the_reconverged_fd_one() {
         );
         if name == "nested" {
             assert!(p.parsed.model.has_nested_levels());
-            assert!(
-                !crate::sens::ode_provider::adjoint::nested_levels_outside_scope(&p.parsed.model)
-            );
         }
         if name == "global" {
             assert!(

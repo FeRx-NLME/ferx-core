@@ -2912,8 +2912,8 @@ fn a_subject_past_24_stacked_random_effects_has_an_exact_r_matrix() {
 /// replays production's per-window clocks (`ss_run_in_params`: local time from 0, `TAD` from
 /// the pulse, an infusion's quiet window at `TAD = τ + T_inf`, `TAFD` `NaN`). Pinned on the
 /// values against production's predictor, the gradient against reconverged FD, for an SS bolus
-/// and an SS infusion (whose quiet window is where the anchors differ); the straddle is the
-/// same RHS reading `TIME`, which has no periodic steady state and still declines.
+/// and an SS infusion (whose quiet window is where the anchors differ); the same
+/// RHS reading `TIME` is served too.
 #[test]
 fn tad_reading_rhs_under_steady_state_is_analytic() {
     let src = |clock: &str| {
@@ -2969,7 +2969,7 @@ fn tad_reading_rhs_under_steady_state_is_analytic() {
         eprintln!("{label}: FOCEI gradient vs reconverged FD {g:.2e}");
         // Measured 1.2e-6 (bolus) / 1.6e-7 (infusion) on Linux; ~10× headroom on the worse.
         assert!(g < 1.2e-5, "{label}: gradient {g:.2e}");
-        // The straddle: `TIME` under SS stays on FD.
+        // `TIME` under SS is served too (`ss_into_a_clock_reading_rhs_is_served_and_matches_fd`).
         let mt = tight(parse_model_string(&src("TIME")).unwrap());
         let st = subject(
             &mt,
@@ -2979,8 +2979,8 @@ fn tad_reading_rhs_under_steady_state_is_analytic() {
         );
         assert!(
             crate::sens::provider::subject_eta_grad(&mt, &st, &mt.default_params.theta, &eta)
-                .is_none(),
-            "{label}: TIME under SS must decline"
+                .is_some(),
+            "{label}: TIME under SS must be served"
         );
     }
 }
@@ -3833,12 +3833,356 @@ fn an_ss_infusion_with_an_estimated_window_is_one_plan_across_a_fit() {
     }
 }
 
-/// The overlapping infusion keeps its exact-value guard, and the one running at the record has
-/// residual windows that move with the lag: printed (measured), not asserted.
+/// An overlapping SS infusion (`T_inf = 15 > II = 12`: one earlier pulse runs through the whole
+/// cycle, the newest for `r = 3`) under an estimated lag is one plan across a fit, and its
+/// outer gradient matches the reconverged central difference. Mutation: `phase.br_value()` /
+/// `lag.br_value()` back in `ss_state_at_phase_g` for the overlapping case -> 6 variants.
 #[test]
-fn a_running_ss_infusion_under_a_lag_is_measured() {
+fn an_overlapping_ss_infusion_under_a_lag_is_one_plan_across_a_fit() {
+    let n = cf_ss_lag_variants(2, 100.0 / 15.0);
+    assert!(
+        n <= MAX_CHURN,
+        "overlapping SS infusion + lag: {n} variants over 6 points"
+    );
+    let m = parse_model_string(CF_SS_LAG).unwrap();
+    let s = subject(
+        &m,
+        vec![
+            DoseEvent::new(0.0, 100.0, 2, 100.0 / 15.0, true, 12.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.1, 1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0],
+        &[0.1, -0.05],
+    );
+    assert!(
+        served(&m, &s),
+        "the adjoint serves the overlapping SS infusion + lag"
+    );
+    let gap = fd_oracle(&m, &s, true);
+    eprintln!("overlapping SS infusion + lag: gradient gap {gap:.2e}");
+    assert!(gap < 1e-4, "gradient vs reconverged FD: {gap:.2e}");
+}
+
+/// The infusion running at the record (closing at `11.8 < II`) under a lag: one plan.
+#[test]
+fn a_running_ss_infusion_under_a_lag_is_one_plan_across_a_fit() {
     let n = cf_ss_lag_variants(2, 100.0 / 11.8);
-    eprintln!("running-at-the-record SS infusion + lag: {n} variants over 6 points");
+    assert!(
+        n <= MAX_CHURN,
+        "running-at-the-record SS infusion + lag: {n} variants"
+    );
+}
+
+// ---- SDE (EKF) churn: an estimated F / modeled window on an infusion ----------------------
+
+/// An SDE model on one amount, with a bioavailability `F1` (`"f"`) or a modeled duration `D1`
+/// (`"d"`) the infusion's window carries: the window's end is a moving break of the filter.
+fn sde_window_src(which: &str) -> String {
+    let (theta, indiv, omega) = match which {
+        "d" => (
+            "  theta TVD1(0.3, 0.1, 24.0)\n",
+            "  D1 = TVD1 * exp(ETA_D1)\n",
+            "  omega ETA_D1 ~ 0.04\n",
+        ),
+        _ => (
+            "  theta TVF1(0.8, 0.1, 5.0)\n",
+            "  F1 = TVF1 * exp(ETA_F1)\n",
+            "  omega ETA_F1 ~ 0.04\n",
+        ),
+    };
+    format!(
+        "[parameters]\n  theta TVCL(0.5, 0.01, 10.0)\n  theta TVV(8.0, 0.1, 500.0)\n{theta}  \
+         omega ETA_CL ~ 0.07\n{omega}  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL)\n  V = TVV\n{indiv}[structural_model]\n  \
+         ode(obs_cmt=central, states=[central])\n[odes]\n  d/dt(central) = -(CL / V) * central\n\
+         [diffusion]\n  central ~ 0.02\n[error_model]\n  DV ~ proportional(PROP_ERR)\n"
+    )
+}
+
+fn sde_window_fixture(which: &str) -> (CompiledModel, Subject) {
+    let m = tight(parse_model_string(&sde_window_src(which)).unwrap());
+    assert!(m.is_sde());
+    // The windows end in `[0.28, 0.57]` after each dose and no record sits where the six churn
+    // points could move one across it; every segment's Riccati sub-step count
+    // (`ceil(dt / 0.5)`) is the same at all six, since a count that changes is a real change of
+    // structure, a variant of its own, not churn.
+    let times: &[f64] = &[1.0, 3.5, 9.2, 11.5, 14.0, 20.0];
+    let doses = if which == "d" {
+        vec![
+            DoseEvent::modeled(0.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration),
+            DoseEvent::modeled(8.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration),
+        ]
+    } else {
+        vec![
+            DoseEvent::new(0.0, 80.0, 1, 200.0, false, 0.0),
+            DoseEvent::new(8.0, 80.0, 1, 200.0, false, 0.0),
+        ]
+    };
+    let eta = [0.1, -0.05];
+    let mut s = subject(&m, doses, times, &eta[..m.n_eta]);
+    let preds =
+        crate::pk::compute_predictions_with_tv(&m, &s, &m.default_params.theta, &eta[..m.n_eta]);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.1 * (1.3 * j as f64).sin()))
+        .collect();
+    (m, s)
+}
+
+/// The variants an SDE subject's variance plan holds after it is served at six points.
+fn sde_variants_over(m: &CompiledModel, s: &Subject) -> usize {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let n = m.n_eta;
+    let sigma = m.default_params.sigma.values.clone();
+    for k in 0..6 {
+        let x = k as f64;
+        let theta: Vec<f64> = m
+            .default_params
+            .theta
+            .iter()
+            .map(|t| t * (1.0 + 0.04 * x))
+            .collect();
+        let eta: Vec<f64> = (0..n).map(|j| 0.05 * x - 0.1 + 0.02 * j as f64).collect();
+        assert!(
+            plan_forward_in(m, s, None, &theta, Some(&sigma), &eta, terms::layout1(n)).is_some(),
+            "the variance plan serves point {k}"
+        );
+        let key = kj::SubjectKey::new(m, s, n, m.default_params.theta.len() + sigma.len())
+            .with_layout(None)
+            .with_kind(SDE_P_KIND);
+        if let kj::Lookup::Found(ks) = kj::lookup(&key) {
+            eprintln!(
+                "sde churn point {k}: {} variants, theta {theta:?} eta {eta:?}",
+                ks.len()
+            );
+        }
+    }
+    let key = kj::SubjectKey::new(m, s, n, m.default_params.theta.len() + sigma.len())
+        .with_layout(None)
+        .with_kind(SDE_P_KIND);
+    match kj::lookup(&key) {
+        kj::Lookup::Found(ks) => ks.len(),
+        _ => panic!("the subject has no variance plan"),
+    }
+}
+
+/// An SDE subject whose infusion window moves with an estimated `F` (rate-defined) or a modeled
+/// `D` is one variance plan across a fit, served exactly: the filter's break times, record
+/// reads, dose matches and running infusions are verdicts on the moving break, not exact
+/// values (`ekf.rs`: `point_time`, `advance`'s save point, `t_start`/`t_end`, the active set).
+/// Mutation: `probe_value()` back to `br_value()` at any of those sites -> one variant per point.
+#[test]
+fn an_sde_infusion_with_an_estimated_window_is_one_plan_across_a_fit() {
+    for which in ["f", "d"] {
+        let (m, s) = sde_window_fixture(which);
+        let n = sde_variants_over(&m, &s);
+        assert!(n <= MAX_CHURN, "{which}: {n} variants over six points");
+        assert!(served(&m, &s), "{which}: the adjoint serves the subject");
+        let gap = fd_oracle(&m, &s, true);
+        eprintln!("sde window {which}: gradient gap {gap:.2e}");
+        assert!(gap < 1e-7, "{which}: gradient vs reconverged FD {gap:.2e}");
+    }
+}
+
+// ---- the term evaluators' `None` declines, enumerated (#2786, AD everywhere G4) -----------
+
+/// `(label, source, undefined identifier read)` of the non-Gaussian endpoint kinds whose term
+/// evaluators return `None` without a compiled program: a binary linear predictor
+/// (`DiscreteTerm::eval`, `lp_program?`), an analytic hazard (`TteTerm::eval_shared`,
+/// `ep.program?`) and a CTMM intensity (`CtmmTerm`, `generator_program`). Each program is `None`
+/// only for an identifier it cannot bind, or a zero `(θ, η)` width.
+#[cfg(feature = "survival")]
+fn unbound_identifier_sources() -> Vec<(&'static str, String)> {
+    let head = "[parameters]\n  theta TVL(-0.3, -5.0, 5.0)\n  omega ETA_S ~ 0.25\n";
+    let mut out = vec![
+        (
+            "binary predictor",
+            format!("{head}[binary_model]\n  cmt = 1\n  logit = TVL + ETA_S + ZZ\n"),
+        ),
+        (
+            "analytic hazard",
+            format!(
+                "{head}[event_model]\n  cmt = 3\n  family = exponential\n  \
+                 scale = exp(TVL + ETA_S) * ZZ\n"
+            ),
+        ),
+    ];
+    #[cfg(feature = "markov")]
+    out.push((
+        "CTMM intensity",
+        format!(
+            "{head}[markov_model]\n  type = ctmm\n  cmt = 5\n  states = [off=0, on=1]\n  \
+             transition off -> on = exp(TVL + ETA_S) * ZZ\n  transition on -> off = exp(TVL)\n"
+        ),
+    ));
+    out
+}
+
+/// A binary / hazard / CTMM endpoint reading a name nothing defines is refused by the parser, so
+/// the term evaluators' `lp_program?` / `ep.program?` / generator-program `None` is unreachable
+/// for an accepted model; declaring the name as a covariate (the control) parses and carries the
+/// program. Mutation: let the parser accept the unbound name (build the program as `None`
+/// instead of refusing) -> the first assertion fails for that kind.
+#[cfg(feature = "survival")]
+#[test]
+fn an_endpoint_program_is_missing_only_for_a_model_the_parser_refuses() {
+    use crate::types::EndpointLikelihood as E;
+    let programs = |m: &CompiledModel| {
+        m.endpoints.values().all(|ep| match ep {
+            E::Binary { lp_program, .. } => lp_program.is_some(),
+            E::Tte { hazard_program, .. } => hazard_program.is_some(),
+            _ => true,
+        })
+    };
+    for (label, src) in unbound_identifier_sources() {
+        if let Ok(m) = parse_model_string(&src) {
+            assert!(
+                programs(&m),
+                "{label}: accepted with an unbound identifier, no program"
+            );
+        }
+        let bound = src.replace(
+            "[parameters]",
+            "[covariates]\n  ZZ continuous\n[parameters]",
+        );
+        let m = parse_model_string(&bound).unwrap_or_else(|e| panic!("{label}: control: {e:?}"));
+        assert!(
+            !m.endpoints.is_empty() && programs(&m),
+            "{label}: the bound control has its program"
+        );
+    }
+}
+
+// ---- the inner-gradient FD route (`InnerFdReason::Shape`) of typical clinical ODE models ---
+
+/// `(label, source, time-varying CRCL, doses)` of ODE shapes the benchmark's FD-inner subjects
+/// had (vancomycin / cefepime: IV infusions on a 1-2 cpt model with a time-varying `CRCL`;
+/// rifapentin: oral with a lag and transit compartments; thiotepa: 2 cpt with a metabolite
+/// state). `subject_inner_fd_reason`'s `Shape` is exactly `exact_obs_grads(..).is_none()`
+/// (`subject_inner_runs_fd`), so a subject the recorder serves at the prior mode is never counted.
+fn clinical_inner_fixtures() -> Vec<(&'static str, String, bool, Vec<DoseEvent>)> {
+    let head = |extra_theta: &str, extra_omega: &str| {
+        format!(
+            "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n{extra_theta}  \
+             omega ETA_CL ~ 0.09\n{extra_omega}  sigma PROP_ERR ~ 0.1 (sd)\n"
+        )
+    };
+    let tail = "[error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    let infusions = vec![
+        DoseEvent::new(0.0, 1000.0, 1, 500.0, false, 0.0),
+        DoseEvent::new(12.0, 1000.0, 1, 500.0, false, 0.0),
+        DoseEvent::new(24.0, 1000.0, 1, 500.0, false, 0.0),
+    ];
+    let boluses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    vec![
+        (
+            "vancomycin-like: 2 cpt IV infusions, time-varying CRCL",
+            format!(
+                "[covariates]\n  CRCL continuous\n{}[individual_parameters]\n  \
+                 CL = TVCL * exp(ETA_CL) * CRCL / 100\n  V = TVV\n  Q = TVQ\n  V2 = TVV2\n\
+                 [structural_model]\n  ode(obs_cmt=central, states=[central, periph])\n[odes]\n  \
+                 d/dt(central) = -(CL / V) * central - (Q / V) * central + (Q / V2) * periph\n  \
+                 d/dt(periph) = (Q / V) * central - (Q / V2) * periph\n[scaling]\n  y = central / V\n{tail}",
+                head("  theta TVQ(8.0, 0.1, 100.0)\n  theta TVV2(40.0, 1.0, 500.0)\n", "")
+            ),
+            true,
+            infusions.clone(),
+        ),
+        (
+            "cefepime-like: 1 cpt IV infusions, time-varying CRCL",
+            format!(
+                "[covariates]\n  CRCL continuous\n{}[individual_parameters]\n  \
+                 CL = TVCL * exp(ETA_CL) * (CRCL / 100)^0.75\n  V = TVV\n[structural_model]\n  \
+                 ode(obs_cmt=central, states=[central])\n[odes]\n  \
+                 d/dt(central) = -(CL / V) * central\n[scaling]\n  y = central / V\n{tail}",
+                head("", "")
+            ),
+            true,
+            infusions.clone(),
+        ),
+        (
+            "rifapentin-like: oral, lag, two transit compartments",
+            format!(
+                "{}[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  \
+                 KTR = TVKTR\n  ALAG1 = TVLAG * exp(ETA_LAG)\n[structural_model]\n  \
+                 ode(obs_cmt=central, states=[tr1, tr2, central])\n[odes]\n  \
+                 d/dt(tr1) = -KTR * tr1\n  d/dt(tr2) = KTR * tr1 - KTR * tr2\n  \
+                 d/dt(central) = KTR * tr2 - (CL / V) * central\n[scaling]\n  y = central / V\n{tail}",
+                head(
+                    "  theta TVKTR(1.5, 0.05, 20.0)\n  theta TVLAG(0.5, 0.01, 5.0)\n",
+                    "  omega ETA_LAG ~ 0.1\n"
+                )
+            ),
+            false,
+            boluses.clone(),
+        ),
+        (
+            "thiotepa-like: 2 cpt with a metabolite state",
+            format!(
+                "{}[individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  Q = TVQ\n  \
+                 V2 = TVV2\n  KM = TVKM\n[structural_model]\n  \
+                 ode(obs_cmt=central, states=[central, periph, met])\n[odes]\n  \
+                 d/dt(central) = -(CL / V) * central - (Q / V) * central + (Q / V2) * periph\n  \
+                 d/dt(periph) = (Q / V) * central - (Q / V2) * periph\n  \
+                 d/dt(met) = 0.6 * (CL / V) * central - KM * met\n[scaling]\n  y = central / V\n{tail}",
+                head(
+                    "  theta TVQ(8.0, 0.1, 100.0)\n  theta TVV2(40.0, 1.0, 500.0)\n  theta TVKM(0.3, 0.01, 10.0)\n",
+                    ""
+                )
+            ),
+            false,
+            infusions,
+        ),
+    ]
+}
+
+/// Each clinical ODE fixture's subject is served by the exact inner gradient at the prior mode
+/// (so `fd_fallback_warning` counts it as neither `Survival` nor `Shape`), with the shape the
+/// benchmark's FD subjects had live (the time-varying covariate really varies). Mutation: route
+/// any of these shapes to a scope decline (e.g. make `recorder_in_scope` false for a
+/// time-varying covariate on an infusion) -> that fixture is `None`.
+#[test]
+fn clinical_ode_shapes_run_the_exact_inner_gradient() {
+    for (label, src, tv, doses) in clinical_inner_fixtures() {
+        let m = tight(parse_model_string(&src).unwrap_or_else(|e| panic!("{label}: {e:?}")));
+        let times = [0.5, 1.0, 2.0, 4.0, 8.0, 11.5, 13.0, 16.0, 24.5, 30.0];
+        let eta = vec![0.1, -0.05, 0.08][..m.n_eta].to_vec();
+        let mut s = subject(&m, doses, &times, &eta);
+        if tv {
+            let w = |v: f64| HashMap::from([("CRCL".to_string(), v)]);
+            s.covariates.insert("CRCL".into(), 90.0);
+            s.dose_covariates = vec![w(90.0), w(70.0), w(50.0)];
+            s.obs_covariates = times
+                .iter()
+                .map(|&t| {
+                    w(if t < 12.0 {
+                        90.0
+                    } else if t < 24.0 {
+                        70.0
+                    } else {
+                        50.0
+                    })
+                })
+                .collect();
+            assert!(s.has_tv_covariates(), "{label}: the covariate varies");
+        }
+        let zeros = vec![0.0; m.n_eta];
+        let got = crate::sens::ode_provider::adjoint::exact_obs_grads(
+            &m,
+            &s,
+            &m.default_params.theta,
+            &zeros,
+        );
+        assert!(
+            got.is_some(),
+            "{label}: the inner gradient runs on FD (shape decline)"
+        );
+        assert!(served(&m, &s), "{label}: the outer gradient is served");
+    }
 }
 
 // ---- which parser-accepted shapes the structural scope predicates still send to FD ---------
@@ -3935,4 +4279,547 @@ fn coincident_moving_breaks_decline_the_point_not_the_subject() {
         !matches!(kj::lookup(&key), kj::Lookup::Bad),
         "the subject is not condemned for a point's coincidence"
     );
+}
+
+// ---- steady state under a clock-reading right-hand side (AD everywhere, G1) ---------------
+
+/// [`ODE_LAG`] (depot + central, an estimated `LAGTIME`) with the central's elimination scaled by
+/// `factor` -- an expression in `TIME`/`T`/`TAD` -- and the lag kept or traded for an `eta_V`.
+fn clock_model(factor: &str, lag: bool) -> CompiledModel {
+    let mut src = ODE_LAG.replace(
+        "d/dt(central) = KA * depot - (CL/V) * central",
+        &format!("d/dt(central) = KA * depot - (CL/V) * central * ({factor})"),
+    );
+    if !lag {
+        src = src
+            .replace("omega ETA_LAG ~ 0.1", "omega ETA_V ~ 0.1")
+            .replace("V = TVV", "V = TVV * exp(ETA_V)")
+            .replace("  LAGTIME = TVLAG * exp(ETA_LAG)\n", "");
+    }
+    tight(parse_model_string(&src).unwrap())
+}
+
+/// An `SS=1` dose at 0 (`II = 12`, a bolus, or an infusion of 5 h when `inf`) into the depot, a
+/// second on its residual at 12; observations before and after the lagged arrival and across
+/// the infusion's end.
+fn clock_subject(m: &CompiledModel, inf: bool) -> Subject {
+    let first = if inf {
+        DoseEvent::new(0.0, 100.0, 1, 20.0, true, 12.0)
+    } else {
+        DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)
+    };
+    subject(
+        m,
+        vec![first, DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0)],
+        &[
+            0.2, 0.3, 0.5, 1.0, 2.0, 4.0, 6.0, 8.0, 11.0, 13.0, 14.0, 18.0, 24.0,
+        ],
+        &[0.1, -0.05],
+    )
+}
+
+/// `SS=1` into a right-hand side that reads `TIME`/`T`, `TAD`, or both -- with and without an
+/// estimated lag, bolus and infusion -- is served by the plan and matches reconverged FD of the
+/// production objective. It used to route to FD (`ss_clock_out_of_scope`): the dual run-in did
+/// not replay production's clocks (the quiet window's local `TIME`, the lagged seed's
+/// pre-arrival `TAD` anchored at the previous cycle's pulse).
+#[test]
+fn ss_into_a_clock_reading_rhs_is_served_and_matches_fd() {
+    for (factor, lag, inf) in [
+        ("1 + 0.05 * TIME", false, false),
+        ("1 + 0.05 * T", true, false),
+        ("1 + 0.05 * TIME", true, false),
+        ("1 + 0.3 * exp(-0.5 * TAD)", true, false),
+        ("1 + 0.05 * TIME + 0.3 * exp(-0.5 * TAD)", true, false),
+        ("1 + 0.05 * TIME", false, true),
+        ("1 + 0.05 * TIME", true, true),
+        ("1 + 0.3 * exp(-0.5 * TAD)", true, true),
+        ("1 + 0.05 * TIME + 0.3 * exp(-0.5 * TAD)", true, true),
+    ] {
+        let label = format!("SS clock `{factor}` lag={lag} inf={inf}");
+        let m = clock_model(factor, lag);
+        let s = clock_subject(&m, inf);
+        assert!(served(&m, &s), "{label}: served by the plan");
+        let eta = probe_eta(m.n_eta);
+        let jac = jacobian_gap(&m, &s, &eta, &label);
+        let grad = parity(&m, &s);
+        eprintln!("{label}: dF/dEta vs FD {jac:.2e}; FOCEI gradient vs reconverged FD {grad:.2e}");
+        assert!(jac.is_finite() && grad.is_finite(), "{label}");
+        // Measured on Linux (dev profile): dF/dEta <= 5.9e-11, FOCEI gradient <= 4.3e-5 (the lagged
+        // infusion cells; the oracle's own noise level there, as in the lagged TAD test above).
+        assert!(jac < 1e-8 && grad < 2e-4, "{label}: {jac:.2e} / {grad:.2e}");
+    }
+}
+
+// ---- readouts (#2786, AD-everywhere G2): none routes to finite differences by scope --------
+
+/// `ONE_CPT_ORAL` (three η) with a `[scaling]` readout block.
+fn cf_readout(lines: &str) -> CompiledModel {
+    let src = ONE_CPT_ORAL.replace("[error_model]", &format!("[scaling]\n{lines}[error_model]"));
+    tight(parse_model_string(&src).unwrap())
+}
+
+/// The model with a time-varying weight on `CL`, so a subject whose rows carry their own `WT`
+/// takes the closed-form event walk.
+fn tv_variant(src: &str) -> String {
+    src.replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CL = TVCL * (WT / 70.0)^0.75 * exp(ETA_CL)",
+    )
+}
+
+/// `s` with its observations redrawn from the production predictor at `eta`, off the
+/// predictions by a deterministic multiplicative pattern of both signs.
+fn redraw(m: &CompiledModel, s: &mut Subject, eta: &[f64]) {
+    let preds = crate::pk::compute_predictions_with_tv(m, s, &m.default_params.theta, eta);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
+        .collect();
+}
+
+/// Two doses (the second on residual drug), eight observations; `tv` gives every record its
+/// own `WT`, so the walk switches parameters with drug on board.
+fn cf_readout_subject(m: &CompiledModel, tv: bool, cmts: Option<&[usize]>) -> Subject {
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+    ];
+    let times = [1.0, 2.0, 4.0, 8.0, 13.0, 14.0, 18.0, 24.0];
+    let mut s = subject_shell(doses.clone(), &times);
+    if tv {
+        let wt_at = |t: f64| HashMap::from([("WT".to_string(), 60.0 + 1.5 * t)]);
+        s.covariates.insert("WT".into(), 70.0);
+        s.obs_covariates = times.iter().map(|&t| wt_at(t)).collect();
+        s.dose_covariates = doses.iter().map(|d| wt_at(d.time)).collect();
+        assert!(s.has_tv_covariates());
+    }
+    if let Some(c) = cmts {
+        s.obs_cmts = c.to_vec();
+    }
+    redraw(m, &mut s, &probe_eta(m.n_eta));
+    s
+}
+
+/// What a readout case asserts: the recorder is in scope, serves the subject, and the η-Jacobian
+/// and FOCEI gradient agree with the production predictor's Richardson differences and the
+/// reconverged-FD objective. Returns the two gaps.
+fn readout_gaps(m: &CompiledModel, s: &Subject, label: &str) -> (f64, f64) {
+    assert!(recorder_in_scope(m), "{label}: the recorder scope declines");
+    measure(m, s, &[0, 1, 2], label)
+}
+
+/// Per-CMT `y[CMT=N]` readouts on a closed form used to decline every subject (the scope took
+/// `Single` programs only). Each observation now evaluates its own CMT's program: two
+/// different expressions, observations alternating between them, on the static superposition
+/// and the event walk. Non-degenerate: the two programs give different predictions at one time
+/// (asserted), so a program picked for the wrong CMT fails the Jacobian.
+/// Mutations: take the `Single` arm for a `PerCmt` readout (`ar.program` is `None`) -> the
+/// recorder declines and `measure` fails on `served`; index `readout_program_at` by the
+/// observation index instead of its CMT -> the Jacobian gap is O(1).
+#[test]
+fn a_per_cmt_closed_form_readout_is_served_and_matches_reconverged_fd() {
+    let ro = "  y[CMT=1] = central / V\n  y[CMT=2] = 2.0 * central / V + 0.1 * KA\n";
+    let cmts: Vec<usize> = (0..8).map(|j| 1 + j % 2).collect();
+    for tv in [false, true] {
+        let m = if tv {
+            tight(parse_model_string(&tv_variant(&cf_readout_src(ro))).unwrap())
+        } else {
+            cf_readout(ro)
+        };
+        assert!(matches!(
+            m.analytic_readout.as_ref().unwrap().readout,
+            crate::ode::OdeReadout::PerCmt(_)
+        ));
+        let s = cf_readout_subject(&m, tv, Some(&cmts));
+        let mut s1 = s.clone();
+        s1.obs_cmts = vec![1; 8];
+        let (p, p1) = (
+            crate::pk::compute_predictions_with_tv(&m, &s, &m.default_params.theta, &probe_eta(3)),
+            crate::pk::compute_predictions_with_tv(&m, &s1, &m.default_params.theta, &probe_eta(3)),
+        );
+        assert!(
+            (p[1] - p1[1]).abs() > 1e-3 * p1[1].abs(),
+            "premise: the two programs differ at one time"
+        );
+        let label = format!("per-CMT closed-form readout, tv {tv}");
+        let (jac, grad) = readout_gaps(&m, &s, &label);
+        // Measured worst on Linux: Jacobian 4.9e-11, gradient 1.8e-9.
+        assert!(jac < 5e-10 && grad < 3e-8, "{label}: {jac:.2e} {grad:.2e}");
+    }
+}
+
+fn cf_readout_src(lines: &str) -> String {
+    ONE_CPT_ORAL.replace("[error_model]", &format!("[scaling]\n{lines}[error_model]"))
+}
+
+/// A readout over the central amount of a closed form with `[initial_conditions]` used to
+/// decline the model (`analytic_readout_dual_supported`: no readout beside an init), and the
+/// event walk layered the init impulse AFTER the readout. Production adds it to the
+/// concentration first, so a readout that is not the identity in the central amount (here
+/// `central/V + 0.2·central/V²`, curved in V) reads `conc + init`. Static superposition and
+/// the event walk (time-varying weight), both against the reconverged-FD gradient and the
+/// production Jacobian; `TVC0` is live (asserted by `measure`).
+/// Mutations: add the init impulse after the readout in `record_analytic_events` -> the event
+/// walk's Jacobian gap is O(1); restore the `analytical_init` decline -> `recorder_in_scope`
+/// fails.
+#[test]
+fn a_closed_form_readout_over_an_init_baseline_is_served_and_matches_reconverged_fd() {
+    let src = super::tests::CF_INIT.replace(
+        "[error_model]",
+        "[scaling]\n  y = central / V + 0.2 * central / (V * V)\n[error_model]",
+    );
+    for tv in [false, true] {
+        let src = if tv { tv_variant(&src) } else { src.clone() };
+        let m = tight(parse_model_string(&src).unwrap());
+        assert!(!m.analytical_init.is_empty() && m.analytic_readout.is_some());
+        let s = cf_readout_subject(&m, tv, None);
+        let label = format!("init baseline + readout, tv {tv}");
+        assert!(recorder_in_scope(&m), "{label}: scope");
+        let (jac, grad) = measure(&m, &s, &[0, 1, 2, 3], &label);
+        // Measured worst on Linux: Jacobian 3.1e-12, gradient 1.0e-9.
+        assert!(jac < 3e-11 && grad < 1e-8, "{label}: {jac:.2e} {grad:.2e}");
+    }
+}
+
+/// One arm of the depot-readout check (see the tests below): the closed-form oral model with
+/// `y = (central + 0.3·depot)/V` on the subject the flags describe, in scope, served, and
+/// against the reconverged-FD gradient and the production Jacobian. The arm is live on the
+/// depot: the prediction with `0.3·depot` differs from the one without it (asserted), and
+/// `TVLAG` moves the lagged arms. Measured worst on Linux: Jacobian 1.1e-10, gradient 2.8e-9.
+fn depot_readout_arm(name: &str, tv: bool, lag: bool, ss: bool, inf: bool) {
+    let with_depot = "  y = (central + 0.3 * depot) / V\n";
+    let without = "  y = central / V\n";
+    let build = |ro: &str| {
+        let mut src = cf_readout_src(ro);
+        if tv {
+            // The weight moves `KA` too: the depot reads it, so the snapshot it is built at
+            // (the static one, not each observation's) decides the prediction.
+            src = tv_variant(&src).replace(
+                "KA = TVKA * exp(ETA_KA)",
+                "KA = TVKA * (WT / 70.0)^0.5 * exp(ETA_KA)",
+            );
+        }
+        if lag {
+            src = src
+                .replace(
+                    "  theta TVKA(1.5, 0.01, 50.0)\n",
+                    "  theta TVKA(1.5, 0.01, 50.0)\n  theta TVLAG(0.4, 0.01, 5.0)\n",
+                )
+                .replace(
+                    "  KA = TVKA * exp(ETA_KA)\n",
+                    "  KA = TVKA * exp(ETA_KA)\n  ALAG = TVLAG\n",
+                )
+                .replace(
+                    "pk one_cpt_oral(cl=CL, v=V, ka=KA)",
+                    "pk one_cpt_oral(cl=CL, v=V, ka=KA, lagtime=ALAG)",
+                );
+        }
+        tight(parse_model_string(&src).unwrap())
+    };
+    let m = build(with_depot);
+    assert!(m.analytic_readout.as_ref().unwrap().references_depot());
+    let mut s = cf_readout_subject(&m, tv, None);
+    if ss {
+        s.doses[0] = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+    }
+    if inf {
+        // A zero-order input into central: it bypasses the depot, which holds only the first
+        // (bolus) dose's amount.
+        s.doses[1] = DoseEvent::new(12.0, 100.0, 2, 50.0, false, 0.0);
+    }
+    redraw(&m, &mut s, &probe_eta(3));
+    let m0 = build(without);
+    let theta = &m.default_params.theta;
+    let eta = probe_eta(3);
+    let (a, b) = (
+        crate::pk::compute_predictions_with_tv(&m, &s, theta, &eta),
+        crate::pk::compute_predictions_with_tv(&m0, &s, theta, &eta),
+    );
+    assert!(
+        (a[0] - b[0]).abs() > 1e-3 * b[0].abs(),
+        "{name}: premise: the depot term moves the first prediction"
+    );
+    let live: Vec<usize> = if lag { vec![0, 1, 2, 3] } else { vec![0, 1, 2] };
+    assert!(recorder_in_scope(&m), "{name}: scope");
+    let (jac, grad) = measure(&m, &s, &live, &format!("depot readout, {name}"));
+    assert!(jac < 1e-9 && grad < 3e-8, "{name}: {jac:.2e} {grad:.2e}");
+}
+
+/// A readout reading the oral depot amount used to decline the model, whatever the subject.
+/// Production reconstructs the depot by superposition at the subject's `t = 0` parameters
+/// (`analytical_state_at_times`); the recorders now do the same on the tape. Static
+/// superposition. Mutation: leave the depot at zero in the readout state -> the Jacobian gap is
+/// O(1) (on every arm below too).
+#[test]
+fn a_depot_reading_closed_form_readout_matches_reconverged_fd() {
+    depot_readout_arm("static", false, false, false, false);
+}
+
+/// The depot on a time-varying-covariate subject (the event walk) is the static `t = 0`
+/// snapshot's, not the per-observation one the readout's own parameters read. Mutation: build
+/// the depot from the observation's own snapshot -> this arm only.
+#[test]
+fn a_depot_reading_readout_on_a_time_varying_subject_uses_the_static_snapshot() {
+    depot_readout_arm("tv (event walk)", true, false, false, false);
+}
+
+/// The depot of a lagged dose arrives at `t + ALAG`; `TVLAG` is live. Mutation: take the
+/// unlagged elapsed time -> this arm and the SS one.
+#[test]
+fn a_depot_reading_readout_under_a_lag_matches_reconverged_fd() {
+    depot_readout_arm("lagged", false, true, false, false);
+}
+
+/// An `SS=1` bolus carries the steady-state factor in the depot. Mutation: drop `ss_factor` in
+/// `closed_form_depot_amounts_g` -> this arm only.
+#[test]
+fn a_depot_reading_readout_over_a_steady_state_dose_matches_reconverged_fd() {
+    depot_readout_arm("steady state + lag", false, true, true, false);
+}
+
+/// An infusion into central bypasses the depot (production: `single_dose_states`), and takes
+/// the event walk. Mutation: let an infusion contribute to the depot -> this arm only.
+#[test]
+fn a_depot_reading_readout_beside_an_infusion_into_central_matches_reconverged_fd() {
+    depot_readout_arm(
+        "infusion into central (event walk)",
+        false,
+        false,
+        false,
+        true,
+    );
+}
+
+/// The depot readout under IOV: each occasion's depot is the superposition at that occasion's
+/// own `[η, κ_g]` snapshot (`predict_iov` runs `apply_analytic_readout` once per occasion
+/// group), so κ on `V`/`CL` reaches the depot term of its own occasion only.
+/// Mutation: build one depot from the first occasion's snapshot -> the stacked Jacobian gap is
+/// O(1) from the second occasion on.
+#[test]
+fn a_depot_reading_closed_form_readout_under_iov_matches_reconverged_fd() {
+    // κ_V also moves `KA`, so each occasion's depot differs from the others'.
+    let src = super::tests::CF_IOV
+        .replace("  KA = TVKA\n", "  KA = TVKA * exp(KAPPA_V)\n")
+        .replace(
+            "[error_model]",
+            "[scaling]\n  y = (central + 0.3 * depot) / V\n[error_model]",
+        );
+    let m = tight(parse_model_string(&src).unwrap());
+    assert!(m.analytic_readout.as_ref().unwrap().references_depot());
+    let s = super::tests::iov_subject(&m);
+    assert!(recorder_in_scope(&m) && served(&m, &s), "scope");
+    let jac = iov_jacobian_gap(
+        &m,
+        &s,
+        &[0.06, -0.04, 0.05, -0.03, 0.04, 0.02, -0.05, 0.03],
+        "iov depot",
+    );
+    let grad = fd_oracle(&m, &s, true);
+    eprintln!("depot readout × IOV: ∂f/∂[η, κ] {jac:.2e}; gradient {grad:.2e}");
+    // Measured worst on Linux: 4.2e-12 and 4.5e-12.
+    assert!(jac < 5e-10 && grad < 5e-10, "{jac:.2e} {grad:.2e}");
+}
+
+/// More direct θ reads than the closed form has spare PK slots (twelve; the oral pool has
+/// at most eleven) leave the θ reads in the readout, which declined the model
+/// (`dual_evaluable` was false). They are read from the θ leaves now, so each `A_i` moves the
+/// prediction and the gradient. Premise asserted: the readout does read leaves.
+/// Both closed-form routes: static superposition and the event walk (time-varying weight).
+/// Mutation: pass empty θ to the readout's `eval_output_g` (in `analytic_static_predictions`, or
+/// in `readout_leaves` for the event walk) -> every `A_i` reads 0, the prediction is 0 and
+/// `measure` fails on a dead θ, on that route only.
+#[test]
+fn a_readout_reading_more_thetas_than_the_slot_layout_holds_is_served() {
+    let names: Vec<String> = (1..=12).map(|i| format!("A{i}")).collect();
+    let thetas: String = names
+        .iter()
+        .map(|n| format!("  theta {n}(1.0, 0.1, 10.0)\n"))
+        .collect();
+    let expr: String = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!("{}{n}", if i == 0 { "" } else { " + 0.05 * " }))
+        .collect();
+    let src = ONE_CPT_ORAL
+        .replace(
+            "  omega ETA_CL ~ 0.09\n",
+            &format!("{thetas}  omega ETA_CL ~ 0.09\n"),
+        )
+        .replace(
+            "[error_model]",
+            &format!("[scaling]\n  y = central / V * ({expr})\n[error_model]"),
+        );
+    for tv in [false, true] {
+        let src = if tv { tv_variant(&src) } else { src.clone() };
+        let m = tight(parse_model_string(&src).unwrap());
+        let prog = m
+            .analytic_readout
+            .as_ref()
+            .unwrap()
+            .program
+            .as_ref()
+            .unwrap();
+        assert!(
+            prog.reads_leaves(),
+            "premise: the θ reads stayed in the readout"
+        );
+        let s = cf_readout_subject(&m, tv, None);
+        assert!(recorder_in_scope(&m), "scope");
+        let label = format!("twelve direct θ reads, tv {tv}");
+        let (jac, grad) = measure(&m, &s, &[0, 1, 2, 3, 8, 14], &label);
+        // Measured worst on Linux: Jacobian 4.6e-11, gradient 2.0e-9.
+        assert!(jac < 5e-10 && grad < 3e-8, "{label}: {jac:.2e} {grad:.2e}");
+    }
+}
+
+/// An ODE readout whose θ level block is indexed by a compartment amount (the index is a
+/// dependent value in a recording): it stays in the readout, and used to decline the model.
+/// The recorders read the block from the θ leaves and select the level on every evaluation
+/// (`gather_select_g`), on the static walk, the event walk (time-varying weight) and under
+/// IOV. Both levels are live (asserted by `measure`: the central amount crosses 40 within the
+/// record), so a level fixed at the recording point fails the gradient.
+/// Mutations: record the index as a constant (`value_read_refused` back in `PushThetaGather`)
+/// -> the recording fails, `measure` fails on `served`; invert the window comparison in
+/// `gather_select_g` -> the prediction is NaN.
+#[test]
+fn an_ode_readout_gather_indexed_by_a_state_is_served_on_every_walk() {
+    let base = ODE_LAG
+        .replace(
+            "  theta TVLAG(0.4, 0.01, 5.0)\n",
+            "  theta SCALE[2](1.0, 0.1, 10.0)\n",
+        )
+        .replace("  LAGTIME = TVLAG * exp(ETA_LAG)\n", "")
+        .replace("  V = TVV\n", "  V = TVV * exp(ETA_LAG)\n")
+        .replace(
+            "  y = central / V\n",
+            "  y = central / V * SCALE[if (central > 40.0) 2 else 1]\n",
+        );
+    for tv in [false, true] {
+        let src = if tv { tv_variant(&base) } else { base.clone() };
+        let m = tight(parse_model_string(&src).unwrap());
+        let ro = m
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .readout_program
+            .as_ref()
+            .unwrap();
+        assert!(
+            ro.reads_leaves(),
+            "premise: the gather stays in the readout"
+        );
+        let s = cf_readout_subject(&m, tv, None);
+        let label = format!("state-indexed readout gather, tv {tv}");
+        assert!(recorder_in_scope(&m), "{label}: scope");
+        let (jac, grad) = measure(&m, &s, &[0, 1, 2, 3], &label);
+        // Measured worst on Linux: Jacobian 5.8e-12, gradient 2.1e-9.
+        assert!(jac < 5e-11 && grad < 3e-8, "{label}: {jac:.2e} {grad:.2e}");
+    }
+}
+
+/// The init baseline under IOV: the impulse's amount is the BSV-only snapshot's (`κ = 0`), its
+/// decay each observation's own occasion's, and the readout (curved in `V`, which carries κ)
+/// reads the sum. Mutation: add the impulse after the readout in `record_analytic_events`
+/// -> the stacked Jacobian gap is O(1).
+#[test]
+fn a_closed_form_readout_over_an_init_baseline_under_iov_matches_reconverged_fd() {
+    let src = super::tests::CF_IOV
+        .replace(
+            "  omega ETA_CL ~ 0.09\n",
+            "  theta TVC0(0.4, 0.01, 10.0)\n  omega ETA_CL ~ 0.09\n",
+        )
+        .replace(
+            "[error_model]",
+            "[initial_conditions]\n  init(central) = TVC0 * V\n\
+             [scaling]\n  y = central / V + 0.2 * central / (V * V)\n[error_model]",
+        );
+    let m = tight(parse_model_string(&src).unwrap());
+    assert!(!m.analytical_init.is_empty() && m.analytic_readout.is_some());
+    let s = super::tests::iov_subject(&m);
+    assert!(recorder_in_scope(&m) && served(&m, &s), "scope");
+    let jac = iov_jacobian_gap(
+        &m,
+        &s,
+        &[0.06, -0.04, 0.05, -0.03, 0.04, 0.02, -0.05, 0.03],
+        "iov init + readout",
+    );
+    let grad = fd_oracle(&m, &s, true);
+    eprintln!("init + readout × IOV: ∂f/∂[η, κ] {jac:.2e}; gradient {grad:.2e}");
+    assert!(jac < 5e-10 && grad < 5e-8, "{jac:.2e} {grad:.2e}");
+}
+
+/// A hand-built spec whose readout carries no compiled program (the parser builds one for every
+/// form) is outside the scope: the walks would read a zero for the observable. The guard is the
+/// ODE scope's, and the closed-form readout declines the subject. Mutation: drop the
+/// `programmed` clause in `ode_walk_model_scope` -> the ODE arm reads true.
+#[test]
+fn a_readout_without_a_compiled_program_is_declined_not_read_as_zero() {
+    let mut m = tight(parse_model_string(ODE_LAG).unwrap());
+    assert!(recorder_in_scope(&m), "premise");
+    m.ode_spec.as_mut().unwrap().readout_program = None;
+    assert!(
+        matches!(
+            m.ode_spec.as_ref().unwrap().readout,
+            crate::ode::OdeReadout::Single(_)
+        ),
+        "premise: a Form C readout"
+    );
+    assert!(!recorder_in_scope(&m), "a Single readout without a program");
+    // A readout of its own (no other test's plan is shared with it), declined before anything
+    // is recorded for it; the same model with its program is served.
+    let ro = "  y = 1.7 * central / V\n";
+    let mut cf = cf_readout(ro);
+    let s = cf_readout_subject(&cf, false, None);
+    cf.analytic_readout.as_mut().unwrap().program = None;
+    assert!(!served(&cf, &s), "a closed-form readout without a program");
+    let cf = cf_readout(ro);
+    assert!(served(&cf, &s), "premise: with its program it is served");
+}
+
+/// An ODE whose individual parameters take every usable PK slot: a θ read directly in the
+/// readout then has no slot to be desugared into, stays in the readout, and used to decline the
+/// model (the readout was not dual-evaluable). It is read from the θ leaves now, on the static
+/// walk and the event walk (time-varying weight). Premise: the readout does read leaves, and no
+/// synthetic parameter was injected. Mutation: pass empty θ to `resolve_obs_readout`'s program
+/// (`readout_leaves` in `record_ode`) -> the readout reads 0 for `TVCL`, the prediction is 0 and
+/// `measure` fails on a dead θ.
+#[test]
+fn an_ode_readout_reading_a_theta_with_every_pk_slot_taken_is_served() {
+    let usable = crate::types::MAX_PK_PARAMS - crate::types::RESERVED_PK_SLOTS.len();
+    let extras: String = (0..usable - 3)
+        .map(|i| format!("  EXTRA{i} = TVV\n"))
+        .collect();
+    let src = format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n  \
+         theta TVKA(1.2, 0.05, 20.0)\n  omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V = TVV\n  KA = TVKA\n{extras}\
+         [structural_model]\n  ode(states=[depot, central])\n[odes]\n  d/dt(depot) = -KA * depot\n  \
+         d/dt(central) = KA * depot - (CL/V) * central\n[scaling]\n  y = central / V * TVCL\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n"
+    );
+    for tv in [false, true] {
+        let src = if tv { tv_variant(&src) } else { src.clone() };
+        let m = tight(parse_model_string(&src).unwrap());
+        let ro = m
+            .ode_spec
+            .as_ref()
+            .unwrap()
+            .readout_program
+            .as_ref()
+            .unwrap();
+        assert!(ro.reads_leaves(), "premise: the θ read stayed direct");
+        assert!(
+            !m.indiv_param_names
+                .iter()
+                .any(|n| n.starts_with("__ferx_ro_")),
+            "premise: no synthetic parameter fit"
+        );
+        let s = cf_readout_subject(&m, tv, None);
+        let label = format!("ODE direct θ read, every slot taken, tv {tv}");
+        assert!(recorder_in_scope(&m), "{label}: scope");
+        let (jac, grad) = measure(&m, &s, &[0, 1, 2], &label);
+        assert!(jac < 5e-10 && grad < 3e-8, "{label}: {jac:.2e} {grad:.2e}");
+    }
 }

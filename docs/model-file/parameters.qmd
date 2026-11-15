@@ -178,15 +178,12 @@ compartment-free model. These two spellings fit identically:
 
 ferx moves a block read in the prediction into an individual parameter for
 you, the same way it handles a θ written there by name. Both keep the analytic
-gradient, with two exceptions. The first is an index that reads anything other
-than data columns, numbers and individual parameters: a compartment amount
-(`SCALE[central]`), `TIME` or `T`, a θ or η, another block, or an `if`. The
-second is a model with no spare parameter slot left for it; ferx warns, naming
-the block. In either case the read stays in the readout and uses
-finite-difference gradients, like any other readout term the analytic path
-cannot serve. An index that does not read a compartment amount can instead be
-computed in `[individual_parameters]` (`K = ...`, then `SCALE[K]`), which keeps
-the analytic gradient.
+gradient. An index that reads anything other than data columns, numbers and
+individual parameters (a compartment amount such as `SCALE[central]`, `TIME`
+or `T`, a θ or η, another block, or an `if`) stays in the readout, as does a
+read in a model with no spare parameter slot left for it; the adjoint reads
+such a block from the θ it records and selects the level at every evaluation,
+so the gradient is analytic there too.
 
 A block is readable exactly where a θ written by name is. Besides the two places
 above, that is a residual-error magnitude

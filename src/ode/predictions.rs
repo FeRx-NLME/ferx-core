@@ -2128,10 +2128,44 @@ pub(crate) fn active_infusion_doses(
     reset_floor: f64,
     n_states: usize,
 ) -> Vec<(usize, usize, f64, usize)> {
+    let f_of = |k: usize| dose_f_bio.get(k).copied().unwrap_or(1.0);
+    active_infusion_doses_g(
+        input_rate,
+        doses,
+        t_start,
+        t_end,
+        dose_lagtimes,
+        &|k, d| d.bioavailable_infusion(f_of(k)).1,
+        reset_floor,
+        n_states,
+    )
+    .into_iter()
+    .map(|(k, cmt, pulses)| (k, cmt, doses[k].bioavailable_infusion(f_of(k)).0, pulses))
+    .collect()
+}
+
+/// [`active_infusion_doses`] with the segment's ends and each dose's `F`-reshaped window
+/// `window_of(k, dose)` as numbers of the caller's type, giving `(k, compartment, pulses)`: the
+/// one implementation, so a recording type (#2786) decides every membership through the branch
+/// API — a window whose end moves with the parameters (an estimated `F`, a modeled `D`/`R`) is a
+/// guarded comparison, not an exact value — and `f64` reproduces the plain walk bit for bit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn active_infusion_doses_g<T: crate::sens::num::PkNum>(
+    input_rate: &[crate::pk::absorption::InputRateForcing],
+    doses: &[DoseEvent],
+    t_start: T,
+    t_end: T,
+    dose_lagtimes: &[f64],
+    window_of: &dyn Fn(usize, &DoseEvent) -> T,
+    reset_floor: f64,
+    n_states: usize,
+) -> Vec<(usize, usize, usize)> {
+    use crate::sens::num::BranchCmp::Ge;
+    let c = T::from_f64;
     // Both resets reached by this segment, built once (#1586): an infusion recorded before
     // an `SS=1` record or an EVID=3/4 reset is off, whether its window is running across the
     // record, pending behind a lag, or the #1121 residual of an earlier `SS=1` infusion.
-    let gate = ResetGate::at_segment(doses, reset_floor, t_start);
+    let gate = ResetGate::<T>::at_segment(doses, c(reset_floor), t_start);
     doses
         .iter()
         .enumerate()
@@ -2140,20 +2174,21 @@ pub(crate) fn active_infusion_doses(
             // real infusion, in-range compartment, not fed by a built-in absorption
             // forcing (whose mass arrives through `R_in_inf` instead, #719 gap 2).
             if !infusion_contributes(input_rate, d, n_states) {
-                return std::iter::repeat_n((k, 0, 0.0, 1), 0);
+                return std::iter::repeat_n((k, 0, 1), 0);
             }
             let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
-            let f_bio = dose_f_bio.get(k).copied().unwrap_or(1.0);
-            // `F`-reshaped rate and window (#419).
-            let (rate_eff, dur_eff) = d.bioavailable_infusion(f_bio);
+            // `F`-reshaped window (#419).
+            let dur_eff = window_of(k, d);
             let start = d.time + lag;
-            let end = start + dur_eff;
+            let end = c(start) + dur_eff;
             // Infusions recorded before the most recent reset — EVID=3/4 (#1587) or a
             // reached `SS=1` record (#1586) — are turned off, the same way the reset zeros
             // the compartments. Keyed on the record, so a lagged window opening after the
             // reset is off too.
             let live = gate.live(doses, k);
-            let own = start <= t_start + INFUSION_EPS && end >= t_end - INFUSION_EPS;
+            // `start <= t_start + EPS && end >= t_end - EPS`
+            let own = t_start.br_shift_cmp(INFUSION_EPS, Ge, start)
+                && end.br_cmp(Ge, t_end - c(INFUSION_EPS));
             // The earlier steady-state pulses of an `SS=1` infusion still running when its
             // periodic state is installed (#1121 for a seeded record; every overlapping pulse
             // when `T_inf > II`) keep delivering after the record, each on
@@ -2165,9 +2200,13 @@ pub(crate) fn active_infusion_doses(
             // seeded state, and a rate that survived it would refill a compartment the reset
             // just emptied — and a later `SS=1` record stops it the same way (#1586). One entry
             // per running pulse, so a caller that re-forms the rate from `k` sums them too.
-            let residual = if d.time <= t_start + INFUSION_EPS {
-                crate::dosing::ss_residual_ends(d, lag, f_bio)
-                    .count_ending_at_or_after(t_end - INFUSION_EPS)
+            let residual = if t_start.br_shift_cmp(INFUSION_EPS, Ge, d.time) {
+                crate::dosing::ss_residual_count_ending_at_or_after_g(
+                    d,
+                    lag,
+                    dur_eff,
+                    t_end - c(INFUSION_EPS),
+                )
             } else {
                 0
             };
@@ -2176,9 +2215,9 @@ pub(crate) fn active_infusion_doses(
             // toward 0 makes `T_inf`, hence the residual count, astronomically large) as one
             // entry carrying their count — never materialised.
             if pulses <= PULSES_INDIVIDUAL {
-                std::iter::repeat_n((k, d.cmt_idx(), rate_eff, 1), pulses)
+                std::iter::repeat_n((k, d.cmt_idx(), 1), pulses)
             } else {
-                std::iter::repeat_n((k, d.cmt_idx(), rate_eff, pulses), 1)
+                std::iter::repeat_n((k, d.cmt_idx(), pulses), 1)
             }
         })
         .collect()

@@ -1676,23 +1676,15 @@ fn ss_state_at_phase_g<T: PkNum>(
     let cycle = dose.ss_cycle_doses();
     let cycle_inf = cycle_window_duals(dose, inf, cycle.len());
     let (_, r) = infusion_window_g(&cycle[0], cycle_inf[0], pk);
-    // Overlapping pulses (`T_inf > II`) replay inside this flow: there the phase is guarded on
-    // its exact value. Without them the record is a number that follows the inputs (`phase` with its jets dropped: the lag's jet
-    // rides the arrival), so one recording serves every lag whose flow has this shape.
-    let t_inf = inf.map_or(T::from_f64(dose.duration), |(_, w)| w);
-    // (The cycle's own clock carries no lag: its pulses overlap when `T_inf > II`, a count
-    // `count_gt_multiples` pins by recorded comparisons. The running window of the *real* lag
-    // is the walk's residual windows', after this seed.)
-    let overlapping = cycle.len() > 1
-        || crate::dosing::ss_residual_infusions_g(dose, T::from_f64(0.0), t_inf).1 > 0;
-    let (phase_v, record_end, arrival) = if overlapping {
-        let v = phase.br_value();
-        (v, T::from_f64(v), lag - T::from_f64(lag.br_value()))
-    } else {
-        // value-read-ok: the bound's key in the walk's break list; its value is `record_end`, a recorded number
-        let v = phase.probe_value();
-        (v, phase.value_only(), lag - lag.value_only())
-    };
+    // The record is a number that follows the inputs (`phase` with its jets dropped: the lag's
+    // jet rides the arrival), so one recording serves every lag whose flow has this shape, the
+    // overlapping pulses (`T_inf > II`) included: they ride the same flow as bounds `0`, `r` and
+    // the record, the shape guarded by the recorded comparison of `phase` with `r` below.
+    // (The cycle's own clock carries no lag: its pulses' windows end at `r` and `II`; the
+    // running window of the *real* lag is the walk's residual windows', after this seed.)
+    // value-read-ok: the bound's key in the walk's break list; its value is `record_end`, a recorded number
+    let phase_v = phase.probe_value();
+    let (record_end, arrival) = (phase.value_only(), lag - lag.value_only());
     // The flow's shape — whether the newest window closes before the record — is a guard on
     // the phase.
     let bounds = if phase.br_cmp(B::Gt, r) {

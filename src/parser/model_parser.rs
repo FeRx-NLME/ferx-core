@@ -4867,16 +4867,10 @@ pub fn parse_full_model_with(
     // took no slot) must not start failing the fixed PK-slot layout now. If
     // the synthetics would overflow, keep the readout on the FD fallback (its prior
     // behaviour) instead of erroring, and note it.
-    let mut readout_fd_fallback_note: Option<String> = None;
     if uses_ode_param_layout {
         if !readout_synth_params.is_empty() {
             let free = ode_free_slot_count(&indiv_var_names);
             if readout_synth_params.len() > free {
-                readout_fd_fallback_note = Some(readout_synth_fd_note(
-                    readout_synth_params.len() - free,
-                    crate::types::MAX_PK_PARAMS,
-                    &readout_synth_params,
-                ));
                 readout_synth_params.clear();
             }
         }
@@ -5298,23 +5292,20 @@ pub fn parse_full_model_with(
     // `build_pk_param_fn` below, which is what actually consumes `indiv_var_names`/`indiv_stmts`.
     // Dropping the rest keeps `readout_synth_params` in step with the slots that exist, so
     // `parse_scaling_block`'s rewrite only rewrites θ/η it can actually resolve; anything left
-    // bare keeps `dual_evaluable = false` and the readout falls back to FD, as before #486.
+    // bare keeps the direct read, which the recorders evaluate on the θ and η leaves.
     //
     // Keyed on `uses_ode_param_layout`, **not** `is_ode`: a compartment-free model (#811) has
     // `is_ode == false` but appended its synthetics on the ODE-layout path upstream, and the
     // allocator returns an empty `accepted_synths` for it. Testing `is_ode` here therefore
     // overwrote `readout_synth_params` with that empty list, so `parse_scaling_block` never
     // rewrote the bare θ/η — leaving `PushTheta`/`PushEta` in the bytecode,
-    // `dual_evaluable = false`, and the model silently on finite differences behind a warning
-    // that blamed the readout's shape.
+    // `reads_leaves`, and the model on finite differences behind a warning that blamed the
+    // readout's shape (before the recorders read those ops from the leaves).
     if !uses_ode_param_layout {
         for s in &readout_alloc.accepted_synths {
             append_readout_synth_param(s, &mut indiv_var_names, &mut indiv_stmts);
         }
         readout_synth_params = readout_alloc.accepted_synths;
-        if let Some(note) = readout_alloc.fd_note {
-            readout_fd_fallback_note = Some(note);
-        }
     }
 
     // #1064: answer the model-side half of the a level block identifiability
@@ -6748,40 +6739,6 @@ pub fn parse_full_model_with(
                 } else {
                     analytic_readout_state_names(model.pk_model).0
                 };
-                // Warn (not silent) when the readout can't ride the analytic Dual2
-                // provider — it stays correct via FD of the readout-aware predictor,
-                // but the user loses the analytic-gradient speedup (#650). The
-                // dual-evaluable case (indiv-params/covariates only) is served
-                // analytically by the static superposition path.
-                let has_depot_slot = !is_algebraic
-                    && matches!(
-                        model.pk_model,
-                        PkModel::OneCptOral | PkModel::TwoCptOral | PkModel::ThreeCptOral
-                    );
-                let dual_ok = model.analytical_init.is_empty()
-                    && matches!(
-                        (&new_readout, &output_program),
-                        (crate::ode::OdeReadout::Single(_), Some(p))
-                            if p.is_dual_evaluable() && !(has_depot_slot && p.references_state(0))
-                    );
-                if !dual_ok {
-                    // Same condition, two homes for the readout: `[scaling]` on a
-                    // compartment model, `[structural_model]` on a compartment-free
-                    // one (#811), where the equation is the model.
-                    let block = if is_algebraic {
-                        "[structural_model]"
-                    } else {
-                        "[scaling]"
-                    };
-                    model.parse_warnings.push(format!(
-                        "{block} y: this readout (a per-CMT readout, a \
-                         direct THETA/ETA or θ level-block reference, a neural-network output, or a model with \
-                         [initial_conditions]) falls back to finite-difference gradients. The \
-                         prediction is exact; only the analytic-gradient speedup is lost. Use \
-                         individual-parameter / covariate references in the readout to keep it \
-                         analytic. See issue #650."
-                    ));
-                }
                 model.analytic_readout = Some(crate::types::AnalyticReadout {
                     readout: new_readout,
                     program: output_program,
@@ -7404,11 +7361,6 @@ pub fn parse_full_model_with(
         all_stmts.extend(endpoint_stmts);
         model.theta_eta_linked =
             classify_theta_eta_linked(&all_stmts, model.theta_names.len(), &nn_theta_deps);
-    }
-    // #486 — surface the FD fallback when a direct-θ/η readout could not be
-    // desugared because the PK-slot layout was full (see the headroom check above).
-    if let Some(note) = readout_fd_fallback_note.take() {
-        model.parse_warnings.push(note);
     }
 
     // A θ used only in a [mixture] mixing expression (logit(1) = MIXL, p(1) = P1) is not
@@ -14034,7 +13986,7 @@ pub(crate) fn build_y_output_fn(
     // back to `Variable(synthetic_name)`. The readout then compiles to `Op::PushVar`
     // and its θ/η dependence rides the individual-parameter sensitivity chain — so the
     // analytic gradient serves it instead of dropping the subject to FD. Any θ/η left
-    // un-desugared (none, in practice) keeps `dual_evaluable` false → FD fallback.
+    // un-desugared keeps the direct read, evaluated on the recording's θ and η leaves.
     rewrite_readout_synth(&mut expr, readout_synth);
     visit_expr_nodes(&expr, &mut |e| {
         if let Expression::Variable(n) = e {
@@ -14118,8 +14070,8 @@ pub(crate) fn build_y_output_fn(
     let bc = compile_bytecode(&expr);
 
     // Snapshot the readout as an `OdeOutputProgram` for the analytic-sensitivity
-    // path (issue #367): same bytecode + layout, evaluated over `Dual2<N>`. It is
-    // dual-evaluable when the expression references only states / individual
+    // path (issue #367): same bytecode + layout, evaluated over a dual or recording type.
+    // It reads no leaf when the expression references only states / individual
     // parameters / covariates / constants — covariates thread in as constants
     // from the per-observation snapshot (#540), and a direct θ/η reference is
     // *normally* desugared above into a synthetic individual parameter (#486).
@@ -14127,14 +14079,14 @@ pub(crate) fn build_y_output_fn(
     // The `PushTheta`/`PushEta` arms below are still load-bearing and must not be
     // removed: when the synthetic readout params overflow the fixed PK-slot layout,
     // the parser clears `readout_synth_params` and leaves the bare θ/η ops in the
-    // bytecode (the documented FD fallback). Those arms are what keep `dual_evaluable`
-    // `false` on that path; dropping them would wrongly route a slot-overflowed
+    // bytecode. Those arms are what keep `reads_leaves`
+    // `true` on that path; dropping them would wrongly route a slot-overflowed
     // direct-θ/η readout onto the analytic walk. `PushThetaGather` is the same arm
     // for a θ level block (#1636): a gather is lifted like a bare θ, and one that was
     // not (state-read index, or slot overflow) has no `Dual2` reader in the readout
     // program, so it must reach FD here rather than through the per-subject NaN guard.
     // `PushNnOutput` is the other disqualifier (an NN output is never desugared).
-    let output_dual_evaluable = !bc.ops.iter().any(|op| {
+    let output_reads_leaves = bc.ops.iter().any(|op| {
         matches!(
             op,
             Op::PushTheta(_) | Op::PushEta(_) | Op::PushThetaGather(_) | Op::PushNnOutput(_, _)
@@ -14146,7 +14098,7 @@ pub(crate) fn build_y_output_fn(
         n_indiv,
         indiv_to_pk: indiv_to_pk.clone(),
         cov_names: cov_names.clone(),
-        dual_evaluable: output_dual_evaluable,
+        reads_leaves: output_reads_leaves,
     };
 
     // Per-thread scratch for the y readout vars + covariate slice + bytecode
@@ -17205,7 +17157,7 @@ fn build_ode_spec_with(
                         return None;
                     }
                     let bc = compile_bytecode(&e);
-                    let dual_evaluable = !bc.ops.iter().any(|op| {
+                    let reads_leaves = bc.ops.iter().any(|op| {
                         matches!(
                             op,
                             Op::PushTheta(_)
@@ -17220,9 +17172,9 @@ fn build_ode_spec_with(
                         n_indiv: indiv_count,
                         indiv_to_pk: indiv_to_params_slot.clone(),
                         cov_names: Vec::new(),
-                        dual_evaluable,
+                        reads_leaves,
                     };
-                    dual_evaluable.then_some((*state_idx, prog))
+                    (!reads_leaves).then_some((*state_idx, prog))
                 })
                 .collect::<Option<Vec<_>>>()
         })
@@ -24995,6 +24947,26 @@ fn gather_g<T: crate::sens::num::PkNum>(spec: &GatherSpec, theta: &[T], raw: f64
     }
 }
 
+/// [`gather_g`] for a level index a recording holds as a dependent value: one selection per
+/// level, taken where the index lies within `1e-6` of that level (the window `gather_g`
+/// rounds into it) and `NaN` where it lies in none, so the recorded plan chooses again at
+/// every point. The index is piecewise constant, so no derivative flows through it; the
+/// chosen level's θ keeps its jet.
+fn gather_select_g<T: crate::sens::num::PkNum>(spec: &GatherSpec, theta: &[T], idx: T) -> T {
+    let mut acc = T::from_f64(f64::NAN);
+    for l in 1..=spec.levels.len() {
+        let at = gather_g::<T>(spec, theta, l as f64);
+        acc = T::select_if(
+            crate::sens::num::BranchCmp::Le,
+            (idx - T::from_f64(l as f64)).abs(),
+            T::from_f64(1e-6),
+            at,
+            acc,
+        );
+    }
+    acc
+}
+
 thread_local! {
     static MODEL_TIME: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
 }
@@ -27849,12 +27821,12 @@ fn check_scaling_intermediates_used(
 
 /// Outcome of [`allocate_readout_extra_slots`]: the `(indiv param name, PK slot)` pairs the
 /// analytic Form-C readout needs, plus — for the analytical engine only — which synthetic
-/// θ/η parameters (#486) actually got a slot and, if they did not, the FD-fallback note.
+/// θ/η parameters (#486) actually got a slot. One that did not stays a direct read in the
+/// readout, which the recorders evaluate on the θ and η leaves.
 #[derive(Default)]
 struct ReadoutExtraSlots {
     slots: Vec<(String, usize)>,
     accepted_synths: Vec<ReadoutSynthParam>,
-    fd_note: Option<String>,
 }
 
 /// Allocate free `PkParams` slots to the **non-structural** individual parameters
@@ -27983,10 +27955,6 @@ fn allocate_readout_extra_slots(
     let mut free: Vec<usize> = (0..=crate::types::PK_IDX_MTT)
         .filter(|&s| !pk_model.consumes_pk_slot(s) && !used.contains(&s))
         .collect();
-    // The pool THIS engine draws from, for the FD-fallback note. Not `MAX_PK_PARAMS`: the
-    // analytical allocator is confined to the differentiable spare region, so quoting the
-    // ODE layout would misstate the user's headroom tenfold (PR #950 review #5).
-    let layout_slots = free.len();
     // Text-referenced parameters have priority and keep their pre-#486 hard failure: the user
     // named them, so silently dropping the readout's analytic path would be the wrong answer.
     if referenced.len() > free.len() {
@@ -28006,16 +27974,10 @@ fn allocate_readout_extra_slots(
     let mut slots: Vec<(String, usize)> = referenced.into_iter().zip(free).collect();
     // Synthetic θ/η parameters are best-effort, mirroring the ODE sizing policy: a model that
     // parsed before #486 (where a direct θ/η in the readout took no slot at all) must not start
-    // failing now, so an overflow drops them and the readout keeps its FD fallback.
+    // failing now, so an overflow drops them and the readout keeps the direct read, which the
+    // recorders evaluate on the θ and η leaves.
     let mut accepted_synths: Vec<ReadoutSynthParam> = Vec::new();
-    let mut fd_note: Option<String> = None;
-    if synth_params.len() > remaining.len() {
-        fd_note = Some(readout_synth_fd_note(
-            synth_params.len() - remaining.len(),
-            layout_slots,
-            synth_params,
-        ));
-    } else {
+    if synth_params.len() <= remaining.len() {
         for (s, slot) in synth_params.iter().zip(remaining) {
             slots.push((s.name.clone(), slot));
             accepted_synths.push(s.clone());
@@ -28024,57 +27986,7 @@ fn allocate_readout_extra_slots(
     Ok(ReadoutExtraSlots {
         slots,
         accepted_synths,
-        fd_note,
     })
-}
-
-/// The documented FD-fallback warning when `short` synthetic readout parameters (#486) do
-/// not fit the PK-slot layout. Shared by the ODE and analytical sizing sites so the two
-/// cannot word the same condition differently.
-///
-/// `layout_slots` is the size of the pool the **calling engine** actually draws from, and the
-/// two differ by an order of magnitude: an ODE model allocates from the full
-/// [`MAX_PK_PARAMS`](crate::types::MAX_PK_PARAMS) (128) layout, while the analytical engine
-/// draws only from the differentiable spare region `0..=PK_IDX_MTT` minus the slots the closed
-/// form consumes — at most 11, typically 4–7. It is a parameter rather than a hard-coded
-/// constant because quoting the ODE figure in a warning the analytical allocator emitted told
-/// the user to free slots out of a layout their model never used (PR #950 review #5).
-///
-/// `synths` is every synthetic the readout asked for (all of them are dropped). A θ level
-/// block among them is named (#1636): "a direct THETA/ETA reference" would not describe a
-/// readout whose only direct read is `SCALE[STUDY]`.
-fn readout_synth_fd_note(
-    short: usize,
-    layout_slots: usize,
-    synths: &[ReadoutSynthParam],
-) -> String {
-    let mut blocks: Vec<&str> = Vec::new();
-    for s in synths {
-        if let ReadoutSynthSource::Gather {
-            expr: Expression::ThetaGather { spec, .. },
-            ..
-        } = &s.source
-        {
-            if !blocks.contains(&spec.name.as_str()) {
-                blocks.push(spec.name.as_str());
-            }
-        }
-    }
-    let what = if blocks.is_empty() {
-        "a direct THETA/ETA reference".to_string()
-    } else {
-        let names: Vec<String> = blocks.iter().map(|b| format!("`{b}`")).collect();
-        format!(
-            "a direct THETA/ETA or θ level-block ({}) reference",
-            names.join(", ")
-        )
-    };
-    format!(
-        "[scaling] y: {what} in the readout needs {short} more PK \
-         slot(s) than the {layout_slots}-slot layout has free; the readout falls back to \
-         finite-difference sensitivities. For analytic sensitivities, free up {short} \
-         individual-parameter slot(s)."
-    )
 }
 
 /// Append one synthetic readout parameter as a trailing individual parameter
@@ -28108,7 +28020,7 @@ fn readout_gather_key(spec: &GatherSpec, idx: &Expression) -> String {
 /// (#1636). The synth statement is evaluated there, so the index may read only what
 /// that program reads the same way the readout does: literals, data columns and
 /// individual parameters. Anything else stays in the readout, where
-/// `output_dual_evaluable` routes it to finite differences:
+/// `output_reads_leaves` marks it as read from the θ leaves:
 ///
 /// - a compartment amount. The pre-scan parses with only the individual parameters
 ///   in scope, so a state name arrives here as a `Covariate`; lifting it would
@@ -28343,8 +28255,7 @@ fn scaling_key_exprs(
 /// Rewrite the bare `THETA(i)` / `ETA(k)` nodes that the #486 desugaring covered into
 /// `Variable(synthetic_name)`, so the readout compiles to `Op::PushVar` (an ordinary
 /// individual-parameter reference) instead of `Op::PushTheta` / `Op::PushEta`. Any θ/η
-/// not in `synth` is left intact (it then keeps the readout on the FD fallback via the
-/// `dual_evaluable` gate). Mirrors [`resolve_expr_indices`]'s recursive shape.
+/// not in `synth` is left intact (it then reads the θ/η leaves directly). Mirrors [`resolve_expr_indices`]'s recursive shape.
 fn rewrite_readout_synth(expr: &mut Expression, synth: &[ReadoutSynthParam]) {
     match expr {
         Expression::Theta(i) => {
@@ -28365,7 +28276,7 @@ fn rewrite_readout_synth(expr: &mut Expression, synth: &[ReadoutSynthParam]) {
         }
         // A lifted gather (#1636) is replaced whole. One that was not lifted (its index
         // reads a state, or its synth overflowed the slot layout) keeps its
-        // `PushThetaGather`, which `output_dual_evaluable` routes to FD; only its index
+        // `PushThetaGather`, read from the θ leaves; only its index
         // is rewritten.
         Expression::ThetaGather { spec, idx } => {
             let key = readout_gather_key(spec, idx);
@@ -30626,16 +30537,16 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
             }
             // The level index is integer-valued data, so its jet is empty and
             // `.val()` loses nothing; the *gathered* θ keeps its full jet, which
-            // is what makes `∂f/∂θ_k` exact through a gather.
+            // is what makes `∂f/∂θ_k` exact through a gather. An index a recording holds as
+            // a dependent value (a compartment amount, say) selects the level on every
+            // evaluation instead (`gather_select_g`), its own derivative zero as the data
+            // index's is.
             Op::PushThetaGather(g) => {
-                // Integer-valued data (a level index): a recording holds it as a constant.
-                // A θ/η-dependent index is no level index: the recording fails (never a `NaN`
-                // substituted and recorded on).
                 let idx = pop!();
-                let raw = idx.nonrec_val().unwrap_or_else(|| idx.value_read_refused());
-                let v = match bc.gathers.get(g as usize) {
-                    Some(spec) => gather_g::<T>(spec, theta, raw),
-                    None => {
+                let v = match (bc.gathers.get(g as usize), idx.nonrec_val()) {
+                    (Some(spec), Some(raw)) => gather_g::<T>(spec, theta, raw),
+                    (Some(spec), None) => gather_select_g::<T>(spec, theta, idx),
+                    (None, _) => {
                         debug_assert!(false, "Op::PushThetaGather {g} out of bounds");
                         k(f64::NAN)
                     }
@@ -32488,7 +32399,7 @@ impl OdeRhsProgram {
         let (mut vars, mut stack) = (Vec::new(), Vec::new());
         let mut out = zeros.clone();
         for (idx, prog) in progs {
-            out[*idx] = prog.eval_output_g(&zeros, params, &empty, &mut vars, &mut stack);
+            out[*idx] = prog.eval_output_g(&zeros, params, &[], &[], &empty, &mut vars, &mut stack);
         }
         Some(out)
     }
@@ -34109,18 +34020,16 @@ pub struct OdeOutputProgram {
     /// and feeds them as constants — a covariate carries no parameter derivative
     /// in the individual-parameter dual basis the ODE provider seeds (#540).
     cov_names: Vec<String>,
-    /// True when the expression references only states / individual parameters /
-    /// covariates / constants — the case the dual readout can evaluate, threading
-    /// the covariate snapshot in while leaving θ/η empty. A θ/η referenced
-    /// *directly* in the readout is *normally* desugared at parse time into a
-    /// synthetic individual parameter (`__ferx_ro_*`, #486), so it reaches the
-    /// readout as an ordinary `PushVar` and rides the individual-parameter
-    /// sensitivity chain. The exception is the slot-overflow FD fallback: when the
-    /// synthetic params would exceed the PK-slot layout the parser leaves the bare
-    /// θ/η ops in place, and the `PushTheta`/`PushEta` check at the construction
-    /// site keeps this `false` so that readout stays on FD. An NN output
-    /// (`PushNnOutput`) is the other, always-FD disqualifier.
-    dual_evaluable: bool,
+    /// True when the expression reads a leaf the recording hands in beside the individual
+    /// parameters: a θ, an η, a θ level block (`PushThetaGather`) or a neural-network output.
+    /// Every such read is evaluated ([`Self::eval_output_g`] takes the θ and η leaves), so this is
+    /// no scope: it marks a readout that is **not** a function of the compartment state, the
+    /// individual parameters and the covariates alone, which the probing consumers (the
+    /// modified-release closed form, `init(...)`) need. A θ/η read directly is *normally*
+    /// desugared at parse time into a synthetic individual parameter (`__ferx_ro_*`, #486), so
+    /// it reaches the readout as an ordinary `PushVar`; the exception is the slot-overflow case,
+    /// where the bare ops stay in the bytecode.
+    reads_leaves: bool,
 }
 
 impl OdeOutputProgram {
@@ -34140,9 +34049,9 @@ impl OdeOutputProgram {
         );
     }
 
-    /// See [`OdeOutputProgram::dual_evaluable`].
-    pub(crate) fn is_dual_evaluable(&self) -> bool {
-        self.dual_evaluable
+    /// See [`OdeOutputProgram::reads_leaves`].
+    pub(crate) fn reads_leaves(&self) -> bool {
+        self.reads_leaves
     }
 
     /// Whether the readout reads the model-time built-in (`Op::PushTime`, from a
@@ -34188,12 +34097,14 @@ impl OdeOutputProgram {
     /// vector with the differentiated slots seeded as dual variables (so `V1`'s
     /// derivative flows into `central / V1`); `cov` is the per-observation
     /// covariate snapshot, whose values thread in as constants (#540). `vars`/
-    /// `stack` are caller-owned scratch. Only valid when
-    /// [`is_dual_evaluable`](Self::is_dual_evaluable) holds.
+    /// `stack` are caller-owned scratch. `theta` and `eta` are the recording's leaves, read by a readout that reads them
+    /// directly ([`reads_leaves`](Self::reads_leaves)).
     pub(crate) fn eval_output_g<T: crate::sens::num::vm::VmNum>(
         &self,
         state: &[T],
         params: &[T],
+        theta: &[T],
+        eta: &[T],
         cov: &HashMap<String, f64>,
         vars: &mut Vec<T>,
         stack: &mut Vec<T>,
@@ -34214,7 +34125,7 @@ impl OdeOutputProgram {
             .iter()
             .map(|n| cov.get(n).copied().unwrap_or(0.0))
             .collect();
-        eval_bytecode_g::<T>(&self.bc, &[], &[], &cov_vec, vars, &[], stack)
+        eval_bytecode_g::<T>(&self.bc, theta, eta, &cov_vec, vars, &[], stack)
     }
 }
 

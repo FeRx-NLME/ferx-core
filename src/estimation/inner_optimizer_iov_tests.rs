@@ -3631,52 +3631,6 @@ fn a_walk_served_iov_subject_stops_on_the_gradient_not_the_stall() {
     );
 }
 
-/// #1082 PR3: the one nested model the analytic walks decline — a closed-form transit
-/// one, whose IOV subjects run on an ODE twin — names its levels as the finite-difference
-/// reason, ahead of any per-subject cause. The same model with one level, and a nested
-/// model without a twin, do not: PR2 named the levels for every nested model.
-#[test]
-fn a_nested_transit_model_names_its_levels_as_the_fd_reason() {
-    const REASON: &str = "nested variability levels on a closed-form transit/IG model";
-    let parse = crate::parser::model_parser::parse_model_string;
-    let one_level = |src: &str| {
-        parse(
-            &src.replace("  level B by ARM in A\n", "")
-                .replace("at B", "at A"),
-        )
-    };
-    let algebraic = "[parameters]\n  theta T(1.0)\n  omega E ~ 0.1\n  level A by STUDY in ID\n  \
-                     level B by ARM in A\n  kappa KA ~ 0.2 at A\n  kappa KB ~ 0.3 at B\n  \
-                     sigma S ~ 0.1\n[individual_parameters]\n  P = T * exp(E + KA + KB)\n\
-                     [structural_model]\n  y = P\n[error_model]\n  DV ~ additive(S)\n";
-    let transit = "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  theta TVV(50.0, 5.0, 500.0)\n  \
-                   theta TVMTT(3.0, 0.05, 24.0)\n  theta TVN(3.0, 0.0, 30.0)\n  \
-                   omega ETA_V ~ 0.09\n  level A by STUDY in ID\n  level B by ARM in A\n  \
-                   kappa KA ~ 0.04 at A\n  kappa KB ~ 0.09 at B\n  sigma PROP ~ 0.15 (sd)\n\
-                   [individual_parameters]\n  CL = TVCL * exp(KA)\n  V = TVV * exp(ETA_V)\n  \
-                   MTT = TVMTT * exp(KB)\n  NTR = TVN\n[structural_model]\n  \
-                   pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n[error_model]\n  \
-                   DV ~ proportional(PROP)\n";
-    let subject = Subject {
-        obs_times: vec![1.0],
-        observations: vec![1.0],
-        obs_cmts: vec![1],
-        cens: vec![0],
-        occasions: vec![1],
-        ..Default::default()
-    };
-    let nested_transit = parse(transit).unwrap();
-    assert!(nested_transit.has_nested_levels());
-    assert_eq!(iov_fd_reason(&nested_transit, &subject), REASON);
-    for (label, m) in [
-        ("transit, one level", one_level(transit).unwrap()),
-        ("algebraic, nested", parse(algebraic).unwrap()),
-        ("algebraic, one level", one_level(algebraic).unwrap()),
-    ] {
-        assert_ne!(iov_fd_reason(&m, &subject), REASON, "{label}");
-    }
-}
-
 /// #1082 PR3: the analytic IOV inner gradient of a nested-level model is over the compact
 /// vector the EBE search moves — data term from the walk's compact jet, prior one block per
 /// group of each level — and matches central FD of the inner objective over that vector,
@@ -3749,14 +3703,14 @@ fn nested_inner_gradient_matches_fd_of_the_inner_objective_over_the_compact_vect
     }
 }
 
-/// #1082 PR3: the two nested cases the analytic walks decline do so at the walks' own
-/// entry, not only in the model-level predicates — so a caller that skips the predicate
-/// still gets `None` (→ FD) rather than a jet laid out per cell — and the FD-fallback
-/// reason names each: a closed-form transit model (its subjects run on an ODE twin) and a
-/// subject never given its level cells (its compact axes are unknown). The prepared
-/// closed-form / ODE twins of each fixture are served, so the declines are the cases' own.
+/// #1082 PR3: a subject never given its level cells declines at the walks' own entry, not
+/// only in the model-level predicates — so a caller that skips the predicate still gets
+/// `None` (→ FD) rather than a jet laid out per cell — and the FD-fallback reason names it
+/// (its compact axes are unknown). The prepared subject of each fixture is served,
+/// including a closed-form transit model's, whose subject runs on the ODE twin (an
+/// infusion) that carries the model's levels.
 #[test]
-fn the_nested_walks_decline_a_transit_twin_and_an_unprepared_subject() {
+fn the_nested_walks_decline_an_unprepared_subject() {
     use crate::sens::ode_provider::adjoint::{exact_inner_hessian, exact_obs_grads};
     use crate::stats::nested_levels::test_helpers as fx;
     // The first-order recording (inner gradient, η-Jacobian) and the second-order one
@@ -3770,16 +3724,14 @@ fn the_nested_walks_decline_a_transit_twin_and_an_unprepared_subject() {
             exact_obs_grads(m, s, &p.theta, &stacked).is_some(),
         )
     };
-    let (transit, pop) = fx::prepared(&fx::transit(), 1);
+    let (transit, mut pop) = fx::prepared(&fx::transit(), 1);
+    pop.subjects[0].doses[0] = crate::types::DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0);
     assert!(transit.absorption_ode_equivalent.is_some() && transit.has_nested_levels());
+    assert!(transit.effective_for(&pop.subjects[0]).ode_spec.is_some());
     assert_eq!(
         walks(&transit, &pop.subjects[0]),
-        (false, false),
+        (true, true),
         "transit twin"
-    );
-    assert_eq!(
-        iov_fd_reason(&transit, &pop.subjects[0]),
-        "nested variability levels on a closed-form transit/IG model"
     );
     for (label, src) in [
         ("algebraic", fx::algebraic()),

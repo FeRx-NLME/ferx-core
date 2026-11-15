@@ -28,7 +28,7 @@
 //! `ode_provider_*` / `check_full_provider_vs_fd` fixtures). All of that is retired; the
 //! rationale comments below still cite those names as history. The scope gates the adjoint
 //! uses are `ode_walk_model_scope`, `static_walk_subject_supported`,
-//! `event_walk_subject_supported`, `ode_iov_model_scope` and `ode_iov_walk_scope`, and FD
+//! `event_walk_subject_supported`, `ode_iov_walk_scope`, and FD
 //! parity is pinned by `fd_oracle` / `parity` in `src/sens/ode_adjoint_tests.rs`.
 #![allow(clippy::needless_range_loop)]
 
@@ -40,7 +40,7 @@ use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME
 use std::cell::RefCell;
 
 /// The ODE walks' model-level scope as the adjoint gradient sees it: what the dual
-/// integrator can carry — a dual-evaluable RHS and readout, the input-rate and lag kinds it
+/// integrator can carry — a dual-evaluable RHS, the input-rate and lag kinds it
 /// propagates — with a parameter program over the combined `[η, κ]`. (Before
 /// #2093 the retired `ode_analytical_supported` / `ode_iov_supported` layered the forward
 /// provider's own `(θ, η)` width and scaling limits on top.)
@@ -69,24 +69,14 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     // `init(...)` state (#662) alongside the per-event `TIME` seeding (#637) — so a
     // TIME + input-rate or TIME + `init(...)` model IS analytic on that walk (#486). (The old
     // decline here assumed the walk carried neither, which was true before #643/#662.)
-    // Readout: the state directly (`ObsCmt`), a simple Form C output program
-    // (`y = <expr>` over states/indiv params, e.g. `central / V1`), or a per-CMT
-    // Form C (`y[CMT=N] = <expr>`) where every endpoint carries a simple program
-    // (#439 — each observation reads its CMT's program over the dual state).
-    let readout_ok = match &ode.readout {
+    // Every readout form carries its compiled program. The parser builds one for each; a
+    // hand-built spec may not, and the walks would then read a zero for the observable.
+    let programmed = match &ode.readout {
         OdeReadout::ObsCmt(_) => true,
-        OdeReadout::Single(_) => ode
-            .readout_program
-            .as_ref()
-            .is_some_and(|p| p.is_dual_evaluable()),
-        OdeReadout::PerCmt(map) => {
-            !map.is_empty()
-                && map
-                    .values()
-                    .all(|r| r.program.as_ref().is_some_and(|p| p.is_dual_evaluable()))
-        }
+        OdeReadout::Single(_) => ode.readout_program.is_some(),
+        OdeReadout::PerCmt(map) => map.values().all(|r| r.program.is_some()),
     };
-    if !readout_ok {
+    if !programmed {
         return false;
     }
     // Built-in absorption input-rate forcing is evaluated over Dual2 only for
@@ -117,7 +107,7 @@ pub(crate) fn ode_walk_model_scope(model: &CompiledModel) -> bool {
     //     `weibull` + a compartment lagtime does below.
     // IOV (`n_kappa != 0`) route lag is declined *here* by the `n_kappa != 0` clause below (an IOV
     // model is off the non-IOV analytic gate outright), but IS analytic on the IOV path since #877
-    // — the IOV scope (`ode_iov_model_scope`) admits it via this same per-kernel
+    // — the IOV scope (`ode_iov_walk_scope`) admits it via this same per-kernel
     // `route_lag_analytic()` classifier.
     if ode
         .input_rate
@@ -453,25 +443,6 @@ pub(crate) fn modeled_slot_for(
     }
 }
 
-/// Whether a steady-state subject's RHS reads a clock the dual SS run-in cannot mirror:
-/// `TIME`/`T` or `TAFD` (no periodic steady state to converge to — production's own values
-/// for them under `SS=1` are #1139's open half), or `TAD` together with a lagged SS dose,
-/// whose pre-arrival phase window has its own anchoring convention (#1126). A `TAD`-only RHS
-/// under unlagged SS dosing is served: `equilibrate_ss_state_g` runs production's per-window
-/// clocks (`ss_run_in_params`), the quiet window included.
-///
-/// Asked of the **PK block** only. The wide (augmented-system) view differs from it only on a
-/// joint PK-TTE model, whose accumulator rows the run-in holds still (`mask_chz`, #1210): a
-/// hazard line reading a clock never enters the equilibration.
-fn ss_clock_out_of_scope(
-    program: &crate::parser::model_parser::OdeRhsProgram,
-    model: &CompiledModel,
-    subject: &Subject,
-) -> bool {
-    program.pk_reads_absolute_time()
-        || (program.pk_reads_tad() && model.has_lagtime() && subject.has_ss_doses())
-}
-
 /// The pre-#2093 `ode_tvcov_supported` without the retired forward provider's `(θ, η)`
 /// dual-width cap (`MAX_ODE_AXES`): the event-driven walk's subject scope as the adjoint
 /// gradient sees it. The adjoint seeds only the `nη` η-directions, so the cap does not apply.
@@ -597,9 +568,9 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
     // `integrate_tvcov_g` shifts each dose to `t_dose + lag` and injects the event-time
     // (saltation) sensitivity, propagated exactly through the per-event params (#439).
-    let Some(ode) = model.ode_spec.as_ref() else {
+    if model.ode_spec.is_none() {
         return false;
-    };
+    }
     // Built-in absorption input-rate forcing (transit/igd/weibull/first_order, #486):
     // the TV-cov event-driven walk (`integrate_tvcov_g`) now carries `R_in` via the
     // shared `add_prepared_input_rate_forcing` helper, exactly as the static walk
@@ -700,40 +671,14 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // observation's elapsed time since arrival still shifts with `lag`, and the crossing's
     // post-side flow (first order: `D·δlag`) captures exactly that — mirroring the existing
     // `x⁻ = 0` first-dose reduction.
-    // SS combined with an RHS reading an absolute clock (`TIME`/`T`/`TAFD`), or `TAD` under a
-    // lagged SS dose, routes to FD (`ss_clock_out_of_scope`). A `TAD`-only RHS under unlagged
-    // SS dosing is served since #2093: the dual run-in replays production's per-window clocks
-    // (`equilibrate_ss_state_g`), which is what #473 review #1 found the old monotonic `TAD`
-    // to miss. The history below is the pre-#2093 reasoning.
-    //
-    // `reads_model_time`, not the bare `uses_time_vars` this gate asked until #1124: a bare
-    // `TIME` in the RHS compiles to `Op::PushTime`, which `uses_time_vars` structurally cannot
-    // see, so that spelling reached `equilibrate_ss_state_g` while `T` — the same quantity —
-    // declined. The gap was known: this gate's own (pre-#2093, retired) regression test
-    // (`ode_ss_time_only_rhs_still_routes_to_fd`) spelled the term `T` *to work around it*.
-    //
-    // The gate is about the analytic-vs-FD **gradient** route, and one side of what it
-    // used to say has changed. The production *value* for `TAD` is now the periodic steady
-    // state, anchored per run-in window and NONMEM-anchored to 7.4e-9 (#1139,
-    // `tests/ss_model_time_nonmem_anchor.rs`) — this gate still declines it, because the
-    // *dual* equilibration is not the same recurrence: `equilibrate_ss_state_g` runs every
-    // window through one `eval_rhs_anchored::<T>(.., 0.0, T::from_f64(0.0), ..)`, so it does
-    // not re-anchor an infusion's quiet window at `−T_inf` the way the value path now does,
-    // and it makes `TAFD` cycle-local where the value path leaves it `NaN`. Both are
-    // unreachable while this gate holds, and neither is fixed here. `T`/`TIME`
-    // under SS is unchanged: it matches NONMEM while agreeing with neither engine's own
-    // dose train (67% apart — an absolute clock has no periodic limit to converge to), and
-    // `TAFD` under SS still reads `NaN` by design. Those are #1139's remaining half. The
-    // same note is at `pk/mod.rs` and `pk/modified_release.rs` (and was in the pre-#2093
-    // `ode_provider_tests.rs`).
-    if has_ss
-        && ode
-            .rhs_program
-            .as_ref()
-            .is_some_and(|p| ss_clock_out_of_scope(p, model, subject))
-    {
-        return false;
-    }
+    // SS combined with an RHS reading a clock (`TIME`/`T`, `TAFD`, `TAD`, lagged or not) IS
+    // served: the dual run-in replays production's per-window clocks (`ss_run_in_params`) —
+    // each window's local time from 0, `TAD` from the cycle's pulse (the quiet window of an
+    // infusion at `-T_inf`, the lagged seed's pre-arrival window at the previous cycle's pulse,
+    // `dosing::tad_referent`), `TAFD` `NaN` — in `equilibrate_ss_state_g`, `ss_state_at_phase_g`
+    // and the walk's own `K_SS_SEED` anchor. An absolute clock has no periodic limit, which is
+    // production's convention too (#1139): the value is whatever the windows' local clocks give,
+    // and the exact derivative of that is what the plan differentiates.
     // EVID 3/4 resets and finite-duration infusions ARE handled (resets zero the state;
     // infusions add `F·rate` forcing over their lagged window, with rate-boundary lagtime
     // saltation). EVID=2 pk-only breakpoints are ALSO carried now (#486): the timeline in
@@ -742,13 +687,6 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // the obs/dose breakpoints — with no κ there is no `iov_combined_pk_only` analogue to
     // build (mirrors the IOV path's #590 support).
     true
-}
-
-/// `ode_walk_model_scope` for an IOV model (IOV + FREM is scored by a sentinel).
-/// The retired (pre-#2093) `ode_iov_supported` added the forward provider's own width and
-/// scaling limits; the adjoint gradient needs only this.
-pub(crate) fn ode_iov_model_scope(model: &CompiledModel) -> bool {
-    model.n_kappa > 0 && model.frem_config.is_none() && ode_walk_model_scope(model)
 }
 
 /// Seed the ODE `init(...)` initial state for the **event-driven TV-cov walk**, on the
@@ -888,6 +826,15 @@ pub(crate) fn ltbs_readout<T: crate::sens::num::PkNum>(p: T) -> T {
     }
 }
 
+/// The θ and η a readout reads directly (a `THETA(i)` / `ETA(k)` / θ level block the parser
+/// could not give an individual-parameter slot), as the recording's own values: tape leaves
+/// for the adjoint. `eta` is the BSV part only: a readout cannot name a κ.
+#[derive(Clone, Copy)]
+pub(crate) struct ReadoutLeaves<'a, T> {
+    pub(crate) theta: &'a [T],
+    pub(crate) eta: &'a [T],
+}
+
 /// Resolve the ODE readout for observation `j` over the dual state `st`, then apply
 /// the negative-readout clamp and the output transform — the single readout site
 /// shared by the static `integrate_seeded_duals` and the TV-cov
@@ -902,6 +849,7 @@ fn resolve_obs_readout<T: crate::sens::num::vm::VmNum>(
     st: &[T],
     j: usize,
     params: &[T],
+    leaves: ReadoutLeaves<'_, T>,
     ro_vars: &mut Vec<T>,
     ro_stack: &mut Vec<T>,
     transform: bool,
@@ -927,7 +875,17 @@ fn resolve_obs_readout<T: crate::sens::num::vm::VmNum>(
         OdeReadout::Single(_) => ode
             .readout_program
             .as_ref()
-            .map(|p| p.eval_output_g::<T>(st, params, obs_cov, ro_vars, ro_stack))
+            .map(|p| {
+                p.eval_output_g::<T>(
+                    st,
+                    params,
+                    leaves.theta,
+                    leaves.eta,
+                    obs_cov,
+                    ro_vars,
+                    ro_stack,
+                )
+            })
             .unwrap_or(T::from_f64(0.0)),
         // Per-CMT (#439): observation j reads its own CMT's output program.
         OdeReadout::PerCmt(cmt_map) => subject
@@ -935,7 +893,17 @@ fn resolve_obs_readout<T: crate::sens::num::vm::VmNum>(
             .get(j)
             .and_then(|cmt| cmt_map.get(cmt))
             .and_then(|r| r.program.as_ref())
-            .map(|p| p.eval_output_g::<T>(st, params, obs_cov, ro_vars, ro_stack))
+            .map(|p| {
+                p.eval_output_g::<T>(
+                    st,
+                    params,
+                    leaves.theta,
+                    leaves.eta,
+                    obs_cov,
+                    ro_vars,
+                    ro_stack,
+                )
+            })
             .unwrap_or(T::from_f64(f64::NAN)),
     };
     // Negative-readout clamp (ODE overshoot guard), parity with production's
@@ -982,8 +950,17 @@ pub(crate) fn integrate_seeded_duals<T: crate::sens::num::vm::VmNum>(
     pk_values: &[f64],
     params_dual: &[T],
     init_state: &[T],
+    leaves: ReadoutLeaves<'_, T>,
 ) -> Option<Vec<T>> {
-    integrate_seeded_readout(model, subject, pk_values, params_dual, init_state, true)
+    integrate_seeded_readout(
+        model,
+        subject,
+        pk_values,
+        params_dual,
+        init_state,
+        leaves,
+        true,
+    )
 }
 
 /// [`integrate_seeded_duals`] with the output transform (`ScalarScale` divisor, LTBS log) left
@@ -995,6 +972,7 @@ pub(crate) fn integrate_seeded_readout<T: crate::sens::num::vm::VmNum>(
     pk_values: &[f64],
     params_dual: &[T],
     init_state: &[T],
+    leaves: ReadoutLeaves<'_, T>,
     transform: bool,
 ) -> Option<Vec<T>> {
     let ode = model.ode_spec.as_ref()?;
@@ -1070,6 +1048,7 @@ pub(crate) fn integrate_seeded_readout<T: crate::sens::num::vm::VmNum>(
                 st,
                 j,
                 params_dual,
+                leaves,
                 &mut ro_vars,
                 &mut ro_stack,
                 transform,
@@ -1095,6 +1074,7 @@ pub(crate) fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
     pk_at_obs: &[Vec<T>],
     pk_at_pk_only: &[Vec<T>],
     pk_at_reset: &[Vec<T>],
+    leaves: ReadoutLeaves<'_, T>,
     transform: bool,
 ) -> Vec<T> {
     // The model scope (`ode_walk_model_scope`, checked before any walk is reached; the
@@ -1215,6 +1195,7 @@ pub(crate) fn integrate_tvcov_readout<T: crate::sens::num::vm::VmNum>(
                 st,
                 j,
                 &pk_at_obs[j],
+                leaves,
                 &mut ro_vars,
                 &mut ro_stack,
                 transform,
@@ -1308,13 +1289,9 @@ pub(crate) fn ode_iov_walk_scope(
     subject: &Subject,
     layout: &crate::stats::stacked_layout::StackedLayout,
 ) -> Option<()> {
-    if !ode_iov_model_scope(model) {
+    if model.n_kappa == 0 || !ode_walk_model_scope(model) {
         return None;
     }
-    // Single scan for the periodic steady-state predicate reused by every SS gate
-    // below (the modeled-dose screen and the SS+lagtime / SS+time-RHS bails), rather
-    // than re-scanning `subject.doses` per branch on this hot per-subject path.
-    let has_ss = subject.has_periodic_ss_dose();
     // #530/#486: modeled-`RATE`/duration doses (`RATE=-1`/`-2`, `R{cmt}`/`D{cmt}`) are
     // resolved from their **per-occasion** PK slot as a live jet inside the event walk
     // (`inf_eff` reads `pk_at_dose[k][slot]`, seeded per occasion group by
@@ -1350,19 +1327,7 @@ pub(crate) fn ode_iov_walk_scope(
     // the shared `integrate_tvcov_g` walk carries the `K_SS_SEED` pre-arrival seed, and the
     // dose's own arrival still goes through the unmodified general lagtime saltation,
     // regardless of outer/IOV dispatch.
-    // SS combined with a non-autonomous RHS (reads `TIME`/`TAFD`/`TAD`) → FD: the SS
-    // equilibration assumes a time-invariant pulse train, so the cycle recurrence breaks
-    // (mirrors `event_walk_scope`, #473 review #1). `reads_model_time` so the bare-`TIME`
-    // spelling is covered too (#1124) — see the note at the `event_walk_scope` gate.
-    if has_ss
-        && model
-            .ode_spec
-            .as_ref()
-            .and_then(|o| o.rhs_program.as_ref())
-            .is_some_and(|p| ss_clock_out_of_scope(p, model, subject))
-    {
-        return None;
-    }
+    // SS combined with a clock-reading RHS is served (see `event_walk_scope`).
     // EVID 3/4 resets, finite-duration infusions, and EVID=2 pk-only breakpoints are
     // handled by the event-driven walk.
     (layout.n_groups() > 0).then_some(())
@@ -1952,6 +1917,27 @@ fn cross_rate_switch<T: crate::sens::num::PkNum>(
     }
 }
 
+/// [`cross_rate_switch`] for a rate switching **off** across a boundary where the clocks reset
+/// (the quiet leg of a steady-state infusion re-opens its local time at `0`): the field before
+/// the switch (`before`, without the switching rate) and after it (`after`) differ in more than
+/// the rate.
+fn cross_rate_switch_split<T: crate::sens::num::PkNum>(
+    u: &mut [T],
+    delta: T,
+    cmt: usize,
+    rate: &dyn Fn(T) -> T,
+    before: &mut OffsetRhs<'_, T>,
+    after: &mut OffsetRhs<'_, T>,
+) {
+    let mut pre = |x: &[T], s: T, out: &mut [T]| {
+        before(x, s, out);
+        if cmt < out.len() {
+            out[cmt] = out[cmt] + rate(s - delta);
+        }
+    };
+    cross_moving_boundary(u, delta, &mut pre, after, &|_| {});
+}
+
 /// The injected accumulators' values in `u` (`OdeSpec::chz_state_slots`), for
 /// [`restore_chz_rows`] after an SS equilibration replaces the state — the dual twin of the f64
 /// walk's `chz_snapshot` (#1210: the accumulator keeps the hazard accrued before the record).
@@ -2108,11 +2094,25 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                 // identical to the fallback loop's per-cycle `cross_rate_switch`.
                 let dtinf = inf_window - w;
                 {
-                    let mut base = |x: &[T], s: T, out: &mut [T]| {
+                    // Before the switch the active leg's clock (`t = T_inf`, pulse `0`); after
+                    // it the quiet leg's (`t = 0`, pulse `-T_inf`): the same `TAD`, a different
+                    // `TIME`.
+                    let mut before = |x: &[T], s: T, out: &mut [T]| {
                         rhs_anchored_at(x, params, w, s, T::from_f64(0.0), out);
                         add_held(out);
                     };
-                    cross_rate_switch(&mut y, dtinf, cmt_idx, &|_| inf_rate, false, &mut base);
+                    let mut after = |x: &[T], s: T, out: &mut [T]| {
+                        rhs_anchored_at(x, params, T::from_f64(0.0), s, -w, out);
+                        add_held(out);
+                    };
+                    cross_rate_switch_split(
+                        &mut y,
+                        dtinf,
+                        cmt_idx,
+                        &|_| inf_rate,
+                        &mut before,
+                        &mut after,
+                    );
                 }
                 let quiet = T::from_f64(dose.ii) - w;
                 let quiet_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
@@ -2190,11 +2190,25 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                 }
                 let dtinf = inf_window - w;
                 {
-                    let mut base = |x: &[T], s: T, out: &mut [T]| {
+                    // Before the switch the active leg's clock (`t = T_inf`, pulse `0`); after
+                    // it the quiet leg's (`t = 0`, pulse `-T_inf`): the same `TAD`, a different
+                    // `TIME`.
+                    let mut before = |x: &[T], s: T, out: &mut [T]| {
                         rhs_anchored_at(x, params, w, s, T::from_f64(0.0), out);
                         add_held(out);
                     };
-                    cross_rate_switch(&mut u, dtinf, cmt_idx, &|_| inf_rate, false, &mut base);
+                    let mut after = |x: &[T], s: T, out: &mut [T]| {
+                        rhs_anchored_at(x, params, T::from_f64(0.0), s, -w, out);
+                        add_held(out);
+                    };
+                    cross_rate_switch_split(
+                        &mut u,
+                        dtinf,
+                        cmt_idx,
+                        &|_| inf_rate,
+                        &mut before,
+                        &mut after,
+                    );
                 }
                 if quiet.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
                     let quiet_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
@@ -2366,16 +2380,15 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
 
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
-    // Disposition alone, cycle-relative time (anchor 0). An SS-admissible RHS is autonomous
-    // (a time/TAD-reading RHS is gated to FD upstream), so the anchor is immaterial — matching
-    // `equilibrate_ss_state_g`'s `eval_rhs_anchored(.., 0.0, 0.0, ..)`.
+    // Disposition alone on the run-in's clocks, as `equilibrate_ss_state_g`'s and production's
+    // (`ss_run_in_params`): local time from the cycle's pulse at `0`, `TAFD` `NaN`.
     let disposition = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
         eval_rhs_anchored::<T>(
             program,
             us,
             ps,
             t,
-            0.0,
+            f64::NAN,
             T::from_f64(0.0),
             du,
             &mut vars_cell.borrow_mut(),
@@ -2419,8 +2432,8 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
         );
     };
     // Exact `J` at `T = f64`: the disposition alone, then with the forcing's `f_t`.
-    let pj_disposition = ProgJac::new(program, 0.0, T::from_f64(0.0), chz);
-    let pj_forced = ProgJac::new(program, 0.0, T::from_f64(0.0), chz).with_forcing_ft(
+    let pj_disposition = ProgJac::new(program, f64::NAN, T::from_f64(0.0), chz);
+    let pj_forced = ProgJac::new(program, f64::NAN, T::from_f64(0.0), chz).with_forcing_ft(
         input_rate_ft(ode, &prepared, &local_ss, &lag0, &fbio1, &[], gate, None),
     );
     // Tightened equilibration tolerance so the fixed-point trough — and its dual jets — stay
@@ -2555,7 +2568,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
             du,
         );
     };
-    let pj_train = ProgJac::new(program, 0.0, T::from_f64(0.0), chz).with_forcing_ft(
+    let pj_train = ProgJac::new(program, f64::NAN, T::from_f64(0.0), chz).with_forcing_ft(
         input_rate_ft(ode, &prepared, &local_doses, &lags, &fbios, &[], gate, None),
     );
     let mut u = vec![T::from_f64(0.0); n];
@@ -2668,32 +2681,41 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
     }
     let vars_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
     let stack_cell: RefCell<Vec<T>> = RefCell::new(Vec::new());
-    let bare_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
-        eval_rhs_anchored::<T>(
+    // The run-in's clocks, as production's (`ss_run_in_params`, as in `equilibrate_ss_state_g`):
+    // each leg's local time from `0`, `TAD` from the advance's pulse -- an infusion's quiet leg
+    // re-opens its clock at `0` a window `T_inf` after it, so it reads `TAD = tau + T_inf` -- and
+    // `TAFD` `NaN`.
+    let rhs_anchored_at = |us: &[T], ps: &[T], t: T, dt: T, pulse: T, du: &mut [T]| {
+        eval_rhs_at_offset::<T>(
             program,
             us,
             ps,
             t,
-            0.0,
-            T::from_f64(0.0),
+            dt,
+            f64::NAN,
+            pulse,
             du,
             &mut vars_cell.borrow_mut(),
             &mut stack_cell.borrow_mut(),
         );
         crate::ode::predictions::mask_chz(chz, du);
     };
-    // Integrate `rhs` over `[0, end]`, the end a time that may move with the inputs.
-    let pj_bare = ProgJac::new(program, 0.0, T::from_f64(0.0), chz);
-    let flow = |u: &mut Vec<T>, rhs: &dyn Fn(&[T], &[T], T, &mut [T]), end: T| {
-        T::span_hint(tf(0.0), end);
-        let e = end.span_value();
-        register_prog_jac!(rhs, pj_bare);
-        let sol = solve_ode_g_certified(rhs, u, (0.0, e), params, &[e], opts);
-        let _ = T::take_span();
-        if let Some(last) = sol.last() {
-            u.copy_from_slice(&last.u);
-        }
+    let bare_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
+        rhs_anchored_at(us, ps, t, tf(0.0), tf(0.0), du);
     };
+    // Integrate `rhs` over `[0, end]`, the end a time that may move with the inputs.
+    let pj_bare = ProgJac::new(program, f64::NAN, T::from_f64(0.0), chz);
+    let flow =
+        |u: &mut Vec<T>, rhs: &dyn Fn(&[T], &[T], T, &mut [T]), end: T, pj: &ProgJac<'_, T>| {
+            T::span_hint(tf(0.0), end);
+            let e = end.span_value();
+            register_prog_jac!(rhs, pj);
+            let sol = solve_ode_g_certified(rhs, u, (0.0, e), params, &[e], opts);
+            let _ = T::take_span();
+            if let Some(last) = sol.last() {
+                u.copy_from_slice(&last.u);
+            }
+        };
     if let Some((inf_rate, inf_window)) = inf {
         // Overlapping pulses (`T_inf > II`): `m` earlier ones run through the whole phase as
         // `held`, the newest for `r` (`dosing::ss_overlap_split_g`); `m = 0` otherwise.
@@ -2705,11 +2727,13 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
             }
         };
         let on = held.map_or(inf_rate, |h| h + inf_rate);
-        let held_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
-            bare_rhs(us, ps, t, du);
+        let t_inf_v = inf_window.value_only();
+        // The quiet leg's clock re-opens at `0` a window after the pulse (`TAD` anchor `-T_inf`).
+        let quiet_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
+            rhs_anchored_at(us, ps, t, tf(0.0), -t_inf_v, du);
             add_held(du);
         };
-        let t_inf_v = inf_window.value_only();
+        let pj_quiet = ProgJac::new(program, f64::NAN, -t_inf_v, chz);
         let active_v = if phase_v.br_cmp(Lt, t_inf_v) {
             phase_v
         } else {
@@ -2721,7 +2745,7 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
                 du[cmt_idx] = du[cmt_idx] + on;
             }
         };
-        flow(&mut u, &rhs_active, active_v);
+        flow(&mut u, &rhs_active, active_v, &pj_bare);
         if phase_v.br_cmp(Le, t_inf_v) {
             // Still inside the active window at `phase`: extend along the SAME (active)
             // flow by the remaining dual part of `phase` itself.
@@ -2729,25 +2753,41 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
             extend_flow_by_dual_duration_g::<T>(&mut u, dt, rhs_active, params, active_v);
         } else {
             // Crossing the active/quiet boundary: the window itself may carry a jet
-            // (modeled `D`/`R`, or `F·duration`) — cross it with the same `cross_rate_switch`
-            // `equilibrate_ss_state_g`'s cycle loop uses (`d_off = inf_window − t_inf_val`).
+            // (modeled `D`/`R`, or `F*duration`) -- cross it with the same rate switch
+            // `equilibrate_ss_state_g`'s cycle loop uses (`d_off = inf_window - t_inf_val`),
+            // the field before it on the active leg's clock (`t = T_inf`, pulse `0`), after it
+            // on the quiet leg's (`t = 0`, pulse `-T_inf`): the same `TAD`, a different `TIME`.
             let dtinf = inf_window - t_inf_v;
-            // Constant infusion rate ⇒ no onset time-variation (#880).
+            // Constant infusion rate => no onset time-variation (#880).
             {
-                let mut base = |x: &[T], _s: T, out: &mut [T]| held_rhs(x, params, t_inf_v, out);
-                cross_rate_switch(&mut u, dtinf, cmt_idx, &|_| inf_rate, false, &mut base);
+                let mut before = |x: &[T], s: T, out: &mut [T]| {
+                    rhs_anchored_at(x, params, t_inf_v, s, tf(0.0), out);
+                    add_held(out);
+                };
+                let mut after = |x: &[T], s: T, out: &mut [T]| {
+                    rhs_anchored_at(x, params, tf(0.0), s, -t_inf_v, out);
+                    add_held(out);
+                };
+                cross_rate_switch_split(
+                    &mut u,
+                    dtinf,
+                    cmt_idx,
+                    &|_| inf_rate,
+                    &mut before,
+                    &mut after,
+                );
             }
             let quiet_v = phase_v - t_inf_v;
-            flow(&mut u, &held_rhs, quiet_v);
+            flow(&mut u, &quiet_rhs, quiet_v, &pj_quiet);
             // The crossing left the state at the window's value `t_inf_v`, its jet taken
             // there; the quiet leg runs from that value to `phase`, so only `phase`'s jet
             // extends it.
             let dt_quiet = phase - phase_v;
-            extend_flow_by_dual_duration_g::<T>(&mut u, dt_quiet, held_rhs, params, quiet_v);
+            extend_flow_by_dual_duration_g::<T>(&mut u, dt_quiet, quiet_rhs, params, quiet_v);
         }
     } else {
         u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
-        flow(&mut u, &bare_rhs, phase_v);
+        flow(&mut u, &bare_rhs, phase_v, &pj_bare);
         let dt = phase - phase_v;
         extend_flow_by_dual_duration_g::<T>(&mut u, dt, bare_rhs, params, phase_v);
     }
@@ -3572,6 +3612,11 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     // carries the jet of whichever dose arrives first — `d.time` is a data constant and
     // the whole jet comes from `lag_dual(k)`.
     let mut last_dose_eff = T::from_f64(f64::NAN);
+    // Whether `last_dose_eff` is still that seed: no dose has a `TAD` referent yet
+    // (`dosing::tad_referent`), so the first one to acquire it replaces the seed outright rather
+    // than competing with it for the latest (the seed is the earliest *arrival*, which a lagged
+    // `SS=1` dose's pre-arrival referent -- the previous cycle's pulse -- precedes).
+    let mut anchor_is_seed = true;
     {
         let mut earliest = tf(f64::INFINITY);
         for (k, d) in subject.doses.iter().enumerate() {
@@ -4431,6 +4476,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // folded at the top of this arm and consumed by the post-side velocities above, so
             // the boundary and the segment it opens cannot disagree.
             last_dose_eff = post_anchor;
+            anchor_is_seed = false;
             // The arrival is NOT a record: it must not become `last_params` (#1073). Its
             // dose row already did, at the `K_DOSE_REC` branch below.
         } else if kind == K_ROUTE_ONSET {
@@ -4578,6 +4624,27 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // through the walk's ordinary integration.
             let d = &subject.doses[idx];
             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
+            // `crate::dosing::ss_seed_phase` in dual form. The clamp is on the VALUE, and
+            // it kills the jet with it: past `lag = II` the phase is pinned at 0 for every
+            // nearby lag, so `∂phase/∂lag = 0` there. Taking `T::from_f64(d.ii) - lag`
+            // unconditionally would keep a jet the clamped value does not have, and the
+            // Dual2-vs-FD parity tests would see a derivative the predictor cannot produce.
+            let phase = if crate::dosing::ss_seed_phase_g(d, lag.value_only()).br_cmp_c(Gt, 0.0) {
+                T::from_f64(d.ii) - lag
+            } else {
+                T::from_f64(0.0)
+            };
+            // From the record to the lagged arrival `TAD` reads the previous cycle's pulse, at
+            // `d.time - phase` (`dosing::tad_referent`, #1126) -- the instant the seed below
+            // advances from, so the state and the clock it is read on come from one number. It
+            // carries the lag's jet (`∂TAD/∂lag = -1`) like an arrival does.
+            let referent = T::from_f64(d.time) - phase;
+            last_dose_eff = if anchor_is_seed {
+                referent
+            } else {
+                later_arrival(last_dose_eff, referent)
+            };
+            anchor_is_seed = false;
             // A bolus into a built-in absorption compartment (#2786) has no bolus to place and no
             // phase to advance: its periodic forcing is the whole input, so the record's state is
             // the fixed point of the cycle that starts at the record (the dose's own pulse
@@ -4599,16 +4666,6 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 last_params = &pk_at_dose[idx];
                 continue;
             }
-            // `crate::dosing::ss_seed_phase` in dual form. The clamp is on the VALUE, and
-            // it kills the jet with it: past `lag = II` the phase is pinned at 0 for every
-            // nearby lag, so `∂phase/∂lag = 0` there. Taking `T::from_f64(d.ii) - lag`
-            // unconditionally would keep a jet the clamped value does not have, and the
-            // Dual2-vs-FD parity tests would see a derivative the predictor cannot produce.
-            let phase = if crate::dosing::ss_seed_phase_g(d, lag.value_only()).br_cmp_c(Gt, 0.0) {
-                T::from_f64(d.ii) - lag
-            } else {
-                T::from_f64(0.0)
-            };
             let inf = ss_inf(d, idx);
             // The only SS equilibration this dose runs: since #1121 its `K_DOSE` event keeps
             // the state the walk flowed there rather than re-loading a trough, so there is no

@@ -17258,7 +17258,7 @@ fn test_parse_scaling_y_form_c_resolves_theta() {
 
 /// #486: a Form-C readout referencing θ/η directly is desugared into synthetic
 /// individual parameters (`__ferx_ro_*`), which makes the readout analytic
-/// (`is_dual_evaluable`) without adding any new random effect, and the synthetic
+/// (no direct θ/η read left in the readout) without adding any new random effect, and the synthetic
 /// names are suppressed from user-facing EBE output.
 #[test]
 fn test_form_c_direct_theta_eta_desugars_to_indiv_params() {
@@ -17278,15 +17278,15 @@ fn test_form_c_direct_theta_eta_desugars_to_indiv_params() {
     assert_eq!(synth.len(), 2, "one synthetic param per distinct θ/η ref");
     assert_eq!(model.indiv_param_names.len(), model.pk_indices.len());
 
-    // The desugared readout carries no bare θ/η ops, so it is dual-evaluable.
+    // The desugared readout carries no bare θ/η ops.
     let ode = model.ode_spec.as_ref().unwrap();
     let prog = ode
         .readout_program
         .as_ref()
         .expect("uniform Form-C readout has a sensitivity program");
     assert!(
-        prog.is_dual_evaluable(),
-        "a θ/η readout must be analytic after desugaring (#486)"
+        !prog.reads_leaves(),
+        "a θ/η readout must read no leaf after desugaring (#486)"
     );
 
     // The `ETA_CL` reference reuses the existing random effect — no new omega.
@@ -17345,10 +17345,11 @@ fn test_form_c_reserved_prefix_param_rejected() {
 
 /// #486 regression: a model that previously parsed (direct-θ readout served by the
 /// FD fallback) must not start failing the PK-slot layout once desugaring is
-/// available. When the synthetic param has no free slot, the readout falls back to
-/// FD (its prior behaviour) with a warning, instead of erroring.
+/// available. When the synthetic param has no free slot, the θ read stays in the
+/// readout (read from the θ leaves by the recorders), with no warning: nothing is
+/// lost, so there is nothing to say.
 #[test]
-fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
+fn test_form_c_direct_readout_stays_a_direct_read_when_slots_full() {
     // CL, V, KA take 3 of the (MAX_PK_PARAMS − reserved) usable slots; the
     // remaining are filled by EXTRA params → zero headroom. A direct-θ readout
     // would need one more.
@@ -17391,7 +17392,7 @@ fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
 "
     );
     let model = parse_model_string(&src)
-        .expect("a slot-full model with a direct-θ readout must still parse (FD fallback)");
+        .expect("a slot-full model with a direct-θ readout must still parse");
 
     // No synthetic param was injected — desugaring stood down for lack of a slot.
     assert!(
@@ -17401,13 +17402,18 @@ fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
             .any(|n| is_synthetic_readout_param(n)),
         "desugaring must not consume a slot it does not have"
     );
-    // The fallback is surfaced, not silent.
+    // The θ read stays in the readout, and no warning claims a lost gradient.
+    assert!(model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.readout_program.as_ref())
+        .is_some_and(|p| p.reads_leaves()));
     assert!(
-        model
+        !model
             .parse_warnings
             .iter()
             .any(|w| w.contains("finite-difference")),
-        "the FD fallback must be warned about, got: {:?}",
+        "no finite-difference note: {:?}",
         model.parse_warnings
     );
 }
@@ -29797,8 +29803,8 @@ fn a_readout_gather_is_lifted_into_a_synthetic_parameter_on_every_engine() {
             "[{engine}] the lifted gather must leave the readout bytecode"
         );
         assert!(
-            gather_readout_program(&m).is_dual_evaluable(),
-            "[{engine}] the readout must be dual-evaluable once the gather is lifted"
+            !gather_readout_program(&m).reads_leaves(),
+            "[{engine}] the readout must read no leaf once the gather is lifted"
         );
         assert!(
             !m.parse_warnings
@@ -29834,7 +29840,7 @@ fn readout_gather_synths_follow_the_theta_eta_synths() {
         ],
     );
     assert!(!readout_has_gather_op(&m));
-    assert!(gather_readout_program(&m).is_dual_evaluable());
+    assert!(!gather_readout_program(&m).reads_leaves());
 }
 
 /// An index that reads an individual parameter is lifted (its value is pinned by
@@ -29850,7 +29856,7 @@ fn a_readout_gather_indexed_by_an_individual_parameter_is_lifted() {
     .expect("parse");
     assert_eq!(readout_synth_names(&m), ["__ferx_ro_g0"]);
     assert!(!readout_has_gather_op(&m));
-    assert!(gather_readout_program(&m).is_dual_evaluable());
+    assert!(!gather_readout_program(&m).reads_leaves());
 }
 
 /// T2, unliftable index: a gather indexed by a compartment amount stays in the
@@ -29884,8 +29890,8 @@ fn a_state_indexed_readout_gather_stays_in_the_readout_and_routes_to_fd() {
         "premise: no bare θ/η op, so only `PushThetaGather` can disqualify the readout"
     );
     assert!(
-        !gather_readout_program(&m).is_dual_evaluable(),
-        "a gather left in the readout must route to FD"
+        gather_readout_program(&m).reads_leaves(),
+        "a gather left in the readout is read from the θ leaves"
     );
     assert!(
         !m.referenced_covariates.iter().any(|c| c == "central"),
@@ -29924,7 +29930,7 @@ fn a_time_alias_indexed_readout_gather_stays_in_the_readout() {
         readout_has_gather_op(&m),
         "premise: the gather is still in the readout"
     );
-    assert!(!gather_readout_program(&m).is_dual_evaluable());
+    assert!(gather_readout_program(&m).reads_leaves());
     assert!(
         !m.referenced_covariates.iter().any(|c| c == "T"),
         "`T` is the time alias here, not a data column: {:?}",
@@ -29933,10 +29939,10 @@ fn a_time_alias_indexed_readout_gather_stays_in_the_readout() {
 }
 
 /// T2, slot overflow on the analytical engine: three gathers into a 2-slot spare
-/// pool. Every synth is dropped, the gathers stay in the bytecode, the readout is
-/// not dual-evaluable, and the sizing note names the blocks.
+/// pool. Every synth is dropped and the gathers stay in the bytecode, where the recorders read
+/// them from the θ leaves: no finite-difference note, no warning at all about the readout.
 #[test]
-fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
+fn an_overflowing_readout_gather_stays_in_the_readout_and_warns_of_nothing() {
     let src = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -29977,33 +29983,12 @@ fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
         readout_has_gather_op(&m),
         "premise: the gathers stay in the readout"
     );
+    assert!(gather_readout_program(&m).reads_leaves());
     assert!(
-        !gather_readout_program(&m)
-            .bc
-            .ops
+        !m.parse_warnings
             .iter()
-            .any(|op| matches!(op, Op::PushTheta(_) | Op::PushEta(_))),
-        "premise: no bare θ/η op, so only `PushThetaGather` can disqualify the readout"
-    );
-    assert!(
-        !gather_readout_program(&m).is_dual_evaluable(),
-        "a gather left in the readout must make it non-dual-evaluable"
-    );
-    let note = m
-        .parse_warnings
-        .iter()
-        .find(|w| w.contains("more PK slot(s)"))
-        .expect("the sizing note");
-    assert!(
-        note.contains("a direct THETA/ETA or θ level-block (`SCALE`, `OFF`) reference")
-            && note.contains("needs 1 more PK slot(s) than the 2-slot layout has free"),
-        "the note must name the blocks and the analytical pool; got: {note}"
-    );
-    assert!(
-        m.parse_warnings
-            .iter()
-            .any(|w| w.contains("direct THETA/ETA or θ level-block reference, a neural")),
-        "the readout-shape note must list a level block among its causes: {:?}",
+            .any(|w| w.contains("finite-difference") || w.contains("more PK slot(s)")),
+        "the readout is served, so no note says otherwise: {:?}",
         m.parse_warnings
     );
     assert!(
@@ -30012,23 +29997,6 @@ fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
             .any(|w| w.contains("but not referenced")),
         "levels read only by an unlifted readout gather are still referenced: {:?}",
         m.parse_warnings
-    );
-}
-
-/// The θ/η-only note is worded as before when no gather was dropped.
-#[test]
-fn the_readout_sizing_note_names_no_block_when_none_was_dropped() {
-    let note = readout_synth_fd_note(
-        1,
-        2,
-        &[ReadoutSynthParam {
-            name: format!("{READOUT_SYNTH_PREFIX}th0"),
-            source: ReadoutSynthSource::Theta(0),
-        }],
-    );
-    assert!(
-        note.starts_with("[scaling] y: a direct THETA/ETA reference in the readout needs 1"),
-        "{note}"
     );
 }
 
@@ -37680,9 +37648,8 @@ fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
         .and_then(|ar| ar.program.as_ref())
         .expect("the equation compiles to a readout program");
     assert!(
-        program.is_dual_evaluable(),
-        "a desugared THETA/ETA must leave the readout dual-evaluable — otherwise the \
-         model loses its analytic gradient"
+        !program.reads_leaves(),
+        "a desugared THETA/ETA must leave the readout reading no leaf"
     );
     assert!(
         !model
@@ -39762,12 +39729,14 @@ fn ferx_check_reports_only_the_truly_unused_theta_of_a_mixture() {
     );
 }
 
-/// A gather index that follows θ or η is no level index: recording it fails the recording (the
-/// value was read as `NaN` and recorded on before). The control: an index read from a covariate
-/// (data) gathers its level and records. Mutation: `unwrap_or(f64::NAN)` back in
-/// `Op::PushThetaGather` -> the recording of the θ-dependent index succeeds.
+/// A gather index that follows θ or η is no level index, so the recording holds it as a value and
+/// selects the level from it at run time (`gather_select_g`; it used to fail the recording, and
+/// before that read `NaN`). The level follows the index at each recording (index 2 gathers
+/// `θ[1]`, index 1 gathers `θ[0]`), and a covariate index (data) gathers its level directly.
+/// Mutation: `value_read_refused` back in `Op::PushThetaGather` -> the θ-dependent recordings
+/// fail.
 #[test]
-fn a_theta_dependent_gather_index_fails_the_recording() {
+fn a_theta_dependent_gather_index_selects_its_level_in_the_recording() {
     use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
     let program = |index: Op| Bytecode {
         ops: vec![index, Op::PushThetaGather(0)],
@@ -39778,18 +39747,19 @@ fn a_theta_dependent_gather_index_fails_the_recording() {
             levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
         })],
     };
-    let run = |bc: &Bytecode| {
+    let run = |bc: &Bytecode, th1: f64| {
         kj::begin();
-        let th = [kj::Tr::theta(0, 5.0), kj::Tr::theta(1, 2.0)];
+        let th = [kj::Tr::theta(0, 5.0), kj::Tr::theta(1, th1)];
         let y = eval_bytecode_g(bc, &th, &[], &[2.0], &[], &[], &mut Vec::new());
         (y.recorded(), kj::end(Some(vec![y.reg()])))
     };
-    let (v, rec) = run(&program(Op::PushCov(0)));
+    let (v, rec) = run(&program(Op::PushCov(0)), 2.0);
     assert!(rec.is_ok(), "a covariate index records");
     assert_eq!(v, 2.0, "level 2 is θ[1]");
-    let (_, rec) = run(&program(Op::PushTheta(1)));
-    match rec {
-        Err((_, scope)) => assert_eq!(scope, kj::FailScope::Model),
-        Ok(_) => panic!("a θ-dependent index was recorded"),
+    // The index is θ[1] itself: 2.0 gathers level 2 (θ[1]), 1.0 gathers level 1 (θ[0]).
+    for (th1, want) in [(2.0, 2.0), (1.0, 5.0)] {
+        let (v, rec) = run(&program(Op::PushTheta(1)), th1);
+        assert!(rec.is_ok(), "a θ-dependent index records (θ[1] = {th1})");
+        assert_eq!(v, want, "θ[1] = {th1} selects its own level");
     }
 }
