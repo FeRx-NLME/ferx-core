@@ -75,8 +75,9 @@ mod vpc_tte;
 pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
     simulate_adaptive_with_inputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
+    DrawnParameters,
 };
-pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UnmatchedSubjects};
+pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UncertaintySpec, UnmatchedSubjects};
 pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
 #[cfg(feature = "survival")]
@@ -629,6 +630,11 @@ mod adaptive_round_to_tests;
 #[cfg(test)]
 #[path = "tests/adaptive_inputs_tests.rs"]
 mod adaptive_inputs_tests;
+
+// #946: parameter-uncertainty draws on the adaptive path.
+#[cfg(test)]
+#[path = "tests/adaptive_uncertainty_tests.rs"]
+mod adaptive_uncertainty_tests;
 
 // ── Tests: #748 independent adaptive-snapshot correctness check ──────────────
 //

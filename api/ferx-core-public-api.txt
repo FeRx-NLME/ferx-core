@@ -21,6 +21,7 @@ pub ferx_core::api::AdaptiveInputs::unmatched: ferx_core::UnmatchedSubjects
 impl<'a> ferx_core::AdaptiveInputs<'a>
 pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
+pub fn ferx_core::AdaptiveInputs<'a>::with_uncertainty(self, fit: &'a ferx_core::FitResult, spec: ferx_core::UncertaintySpec) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveSimulateOptions
 pub ferx_core::api::AdaptiveSimulateOptions::decision_covariates: core::option::Option<ferx_core::sim::adaptive::DecisionCovariates>
@@ -36,8 +37,12 @@ pub fn ferx_core::AdaptiveSimulateOptions::default() -> Self
 pub ferx_core::api::AdaptiveSimulationResult::decisions: alloc::vec::Vec<ferx_core::sim::adaptive::DecisionLogEntry>
 pub ferx_core::api::AdaptiveSimulationResult::ledger: alloc::vec::Vec<ferx_core::sim::adaptive::DoseLedgerEntry>
 pub ferx_core::api::AdaptiveSimulationResult::metrics: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveSubjectMetrics>
+pub ferx_core::api::AdaptiveSimulationResult::parameters: alloc::vec::Vec<ferx_core::DrawnParameters>
 pub ferx_core::api::AdaptiveSimulationResult::trajectories: alloc::vec::Vec<ferx_core::SimulationResult>
 pub ferx_core::api::AdaptiveSimulationResult::warnings: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub struct ferx_core::api::DrawnParameters
+pub ferx_core::api::DrawnParameters::draw: usize
+pub ferx_core::api::DrawnParameters::parameters: ferx_core::ModelParameters
 pub struct ferx_core::api::KmmcVpc
 pub ferx_core::api::KmmcVpc::censoring: ferx_core::VpcCensoring
 pub ferx_core::api::KmmcVpc::cmt: usize
@@ -220,6 +225,9 @@ pub ferx_core::api::TteVpcStratum::n_used: alloc::vec::Vec<usize>
 pub ferx_core::api::TteVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::api::TteVpcStratum::observed: ferx_core::stats::km::KmCurve
 pub ferx_core::api::TteVpcStratum::value: core::option::Option<f64>
+pub struct ferx_core::api::UncertaintySpec
+pub ferx_core::api::UncertaintySpec::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
+pub ferx_core::api::UncertaintySpec::n_draws: usize
 #[non_exhaustive] pub struct ferx_core::api::VpcKmmcOptions
 pub ferx_core::api::VpcKmmcOptions::covariate: alloc::string::String
 pub ferx_core::api::VpcKmmcOptions::level: core::option::Option<f64>
@@ -4673,6 +4681,7 @@ pub ferx_core::AdaptiveInputs::unmatched: ferx_core::UnmatchedSubjects
 impl<'a> ferx_core::AdaptiveInputs<'a>
 pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
+pub fn ferx_core::AdaptiveInputs<'a>::with_uncertainty(self, fit: &'a ferx_core::FitResult, spec: ferx_core::UncertaintySpec) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
 #[non_exhaustive] pub struct ferx_core::AdaptiveRule
 pub ferx_core::AdaptiveRule::action: ferx_core::sim::adaptive::AdaptiveAction
@@ -4693,6 +4702,7 @@ pub fn ferx_core::AdaptiveSimulateOptions::default() -> Self
 pub ferx_core::AdaptiveSimulationResult::decisions: alloc::vec::Vec<ferx_core::sim::adaptive::DecisionLogEntry>
 pub ferx_core::AdaptiveSimulationResult::ledger: alloc::vec::Vec<ferx_core::sim::adaptive::DoseLedgerEntry>
 pub ferx_core::AdaptiveSimulationResult::metrics: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveSubjectMetrics>
+pub ferx_core::AdaptiveSimulationResult::parameters: alloc::vec::Vec<ferx_core::DrawnParameters>
 pub ferx_core::AdaptiveSimulationResult::trajectories: alloc::vec::Vec<ferx_core::SimulationResult>
 pub ferx_core::AdaptiveSimulationResult::warnings: alloc::vec::Vec<alloc::string::String>
 #[non_exhaustive] pub struct ferx_core::AdaptiveSubjectMetrics
@@ -5050,6 +5060,9 @@ pub ferx_core::DoseLedgerEntry::rule_fired: alloc::string::String
 pub ferx_core::DoseLedgerEntry::sim: usize
 pub ferx_core::DoseLedgerEntry::subject: alloc::string::String
 pub ferx_core::DoseLedgerEntry::time: f64
+#[non_exhaustive] pub struct ferx_core::DrawnParameters
+pub ferx_core::DrawnParameters::draw: usize
+pub ferx_core::DrawnParameters::parameters: ferx_core::ModelParameters
 pub struct ferx_core::EndpointError
 pub ferx_core::EndpointError::error_model: ferx_core::ErrorModel
 pub ferx_core::EndpointError::sigma_idx: alloc::vec::Vec<usize>
@@ -5990,6 +6003,9 @@ pub ferx_core::TteVpcStratum::n_used: alloc::vec::Vec<usize>
 pub ferx_core::TteVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::TteVpcStratum::observed: ferx_core::stats::km::KmCurve
 pub ferx_core::TteVpcStratum::value: core::option::Option<f64>
+pub struct ferx_core::UncertaintySpec
+pub ferx_core::UncertaintySpec::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
+pub ferx_core::UncertaintySpec::n_draws: usize
 #[non_exhaustive] pub struct ferx_core::ViResult
 pub ferx_core::ViResult::converged: bool
 pub ferx_core::ViResult::data_term: f64
