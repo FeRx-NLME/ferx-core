@@ -19343,7 +19343,7 @@ fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
 /// of `eval_mixing_log_probs` itself, so the clamp and renormalisation the objective applies are
 /// exactly what is differentiated (#1956),
 /// stepping θⱼ by `1e-6·max(|θⱼ|, floorⱼ)` (#2147).
-pub(crate) fn mixing_logp_grad_fd(
+pub(crate) fn mixing_logp_grad(
     model: &CompiledModel,
     spec: &crate::types::MixtureSpec,
     theta: &[f64],

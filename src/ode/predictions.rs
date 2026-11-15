@@ -2505,10 +2505,11 @@ fn push_route_lag_break_times(
 
 /// Whether stage time `t` of a segment lies on the side of the infusion edge `edge` that the
 /// segment's start put it on: before it (`edge` ahead of the segment, `t ≤ edge`). The convolved
-/// infusion rate trusts the segment to lie wholly on one side of its onset and of its window end
-/// (`rate_infused`'s `tail_age`), which holds only while every caller's break list holds both
-/// times, the route lag's included; this is the debug check of that contract (#2786 review #14).
-/// The tolerance is the integrators' own time slack.
+/// infusion rate trusts the segment to lie wholly before its onset or past it, which holds only
+/// while every caller's break list holds the onset, the route lag's included; that is debug-checked
+/// (#2786 review #14). The window end is not trusted: a stage past it of a segment that starts
+/// before it is read on the tail side by this same test, in release as in debug. The tolerance is
+/// the integrators' own time slack.
 #[inline]
 fn infusion_edge_is_a_break(t: f64, edge: f64) -> bool {
     !(t.is_finite() && edge.is_finite()) || t <= edge + 1e-9 * (1.0 + edge.abs())
@@ -3132,19 +3133,21 @@ pub(crate) fn add_prepared_input_rate_forcing<
                     continue;
                 }
                 let end = t_eff + window;
-                let tail_age = end
-                    .br_cmp(crate::sens::num::BranchCmp::Le, reached)
-                    .then(|| t - end);
-                // Still running: every stage of the segment must precede the window end.
-                debug_assert!(
-                    tail_age.is_some()
-                        || infusion_edge_is_a_break(t.seen_value(), end.seen_value()),
-                    "infusion window end {} lies inside the segment [{}, {}]: a caller's \
-                     break list lacks it (onset or route-lag end)",
-                    end.seen_value(),
-                    since.seen_value(),
-                    t.seen_value()
-                );
+                // The segment decides which side of the window end it lies on (every caller's
+                // break list holds the end, so a segment is wholly on one side). A stage past
+                // the end of a segment that *starts* before it — a break list that lacks the
+                // end, which in release would run `R_in` on past the infusion as extra mass —
+                // is read on the tail side by its own time instead: one plain `f64` compare per
+                // stage, outside the recorded branches (so no recording or bit changes when
+                // the break is there), with the integrators' own time slack so a stage at the
+                // end itself never flips.
+                let tail_age = if end.br_cmp(crate::sens::num::BranchCmp::Le, reached)
+                    || !infusion_edge_is_a_break(t.seen_value(), end.seen_value())
+                {
+                    Some(t - end)
+                } else {
+                    None
+                };
                 prep.rate_infused(tad, dose_mass, window, tail_age)
             } else if T::RECORDS_BRANCHES {
                 // A recording type (#2786) records this inside an ODE step, where the stage

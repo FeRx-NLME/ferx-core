@@ -2310,6 +2310,9 @@ pub(crate) fn find_ebe_cached_from(
 thread_local! {
     /// Plan values `find_ebe_solve` has put in an objective memo.
     pub(crate) static MEMO_PLAN_PUTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The subset of [`MEMO_PLAN_PUTS`] whose evaluated model was an ODE twin or lagged — plan
+    /// values the memo must never hold next to native ones. Always 0 by construction.
+    pub(crate) static MEMO_PLAN_PUTS_NON_NATIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EBE_SOLVES_STARTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -3054,6 +3057,14 @@ fn find_ebe_solve(
     // be decided before the search runs.
     let stall_at = |e: &[f64]| inner_stall_enabled_at(model, subject, &params.theta, e);
     let enable_stall = stall_at(&eta);
+    // Whether the gradient pass's fused value at `e` is bit-equal to the native objective there:
+    // the model *actually evaluated* at `e` is closed form (not a transit/IG twin the search has
+    // crossed into) and one the plan scores bit-equal (`plan_value_bit_equal`, which excludes a
+    // lagged model). The memo must hold one engine's values for the line search to compare.
+    let fused_value_native_at = |e: &[f64]| -> bool {
+        let eff = crate::pk::effective_model_for_eval(model, subject, &params.theta, e);
+        eff.ode_spec.is_none() && crate::stats::likelihood::plan_value_bit_equal(eff)
+    };
     // Single gradient closure used by *both* the optimizer and the fallback's stationarity
     // check, so the two agree on convergence: the exact analytic η-gradient (Almquist 2015,
     // one provider eval per step) when in scope with a per-point FD fallback, else FD
@@ -3132,9 +3143,18 @@ fn find_ebe_solve(
                 // an mm fit's gradient points), and the memo must hold one engine's values for
                 // the line search to compare. Aligning the rules instead costs mm +19%
                 // instructions and moves its iterates; skipping the put costs +0.3%.
-                if let Some(v) = fused_value.filter(|_| !enable_stall) {
+                // Decided at this evaluation's `e` (see `fused_value_native_at`), not once per
+                // solve: a transit/IG solve can cross into its ODE twin partway through.
+                if let Some(v) = fused_value.filter(|_| fused_value_native_at(e)) {
                     #[cfg(test)]
-                    MEMO_PLAN_PUTS.with(|c| c.set(c.get() + 1));
+                    {
+                        MEMO_PLAN_PUTS.with(|c| c.set(c.get() + 1));
+                        let eff =
+                            crate::pk::effective_model_for_eval(model, subject, &params.theta, e);
+                        if eff.ode_spec.is_some() || eff.has_lagtime() {
+                            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.set(c.get() + 1));
+                        }
+                    }
                     memo_put(e, v);
                 }
                 {
@@ -3190,6 +3210,11 @@ fn find_ebe_solve(
         && subject.obs_records.is_empty()
         && subject.fremtype.iter().all(|&ft| ft == 0);
     let prime_fn = |e: &[f64]| -> Option<f64> {
+        // A point the effective model serves with an ODE twin is scored natively; the gradient
+        // pass the driver takes anyway is not run early.
+        if !fused_value_native_at(e) {
+            return None;
+        }
         let g = agrad(e);
         {
             let mut held = primed.borrow_mut();

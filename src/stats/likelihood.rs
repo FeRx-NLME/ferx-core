@@ -1114,6 +1114,15 @@ pub(crate) fn plan_value_route(model: &CompiledModel) -> bool {
     if PLAN_VALUES_OFF.with(|c| c.get()) {
         return false;
     }
+    plan_value_bit_equal(model)
+}
+
+/// The one predicate for "the plan's value is bit-equal to the native objective" for `model`:
+/// not a lagged model (the recorded onset arithmetic measured up to 5 ulp off the native walk)
+/// and not a nonlinear / RK45 `[odes]` model. Every place that scores, memoises or compares a
+/// plan value next to native ones asks this — [`plan_value_route`] and the inner solve's fused
+/// value (`find_ebe_solve`'s memo and fused line-search trial) — so they cannot disagree.
+pub(crate) fn plan_value_bit_equal(model: &CompiledModel) -> bool {
     !model.has_lagtime()
         && model
             .ode_spec

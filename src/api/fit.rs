@@ -1533,6 +1533,9 @@ fn fit_inner(
     // the data as read.
     let attr_map = model.active_dose_attr_map();
     let lowered = crate::dosing::lower_population_zero_order_ss(population, attr_map);
+    // The data as read: the data warnings below describe what the user wrote, not the lowered
+    // infusions (`RATE=-2`, `D1`) the engines walk, which are absent from their data and model.
+    let all_records_read: &Population = all_records;
     let all_lowered = (!std::ptr::eq(population, all_records))
         .then(|| crate::dosing::lower_population_zero_order_ss(all_records, attr_map));
     let all_records: &Population = match (&all_lowered, &lowered) {
@@ -1929,13 +1932,13 @@ fn fit_inner(
     // `check_model_data_warnings` so `ferx check` reports the same findings;
     // message text is unchanged. Probed against `population` (not the pruned
     // copy) and `init_params`, matching the historical inline checks.
-    for d in check_model_data_warnings(model, all_records, init_params) {
+    for d in check_model_data_warnings(model, all_records_read, init_params) {
         accumulated_warnings.push(d.message);
     }
     // Fit-only, so not in the bundle above that `simulate()` shares (#2459). Reads the
     // censoring method through `bloq_in_force`, armed by `fit_unstamped` (#1824).
     if let Some(d) =
-        crate::api::validation::check_zero_dv_magnitude_only(model, all_records, init_params)
+        crate::api::validation::check_zero_dv_magnitude_only(model, all_records_read, init_params)
     {
         accumulated_warnings.push(d.message);
     }
@@ -1969,7 +1972,7 @@ fn fit_inner(
     }
     // A `[covariate_nn]` input the data drive into saturation (#2549).
     #[cfg(feature = "nn")]
-    for d in crate::api::validation::check_nn_input_scale(model, all_records) {
+    for d in crate::api::validation::check_nn_input_scale(model, all_records_read) {
         accumulated_warnings.push(d.message);
     }
     if let Some(note) =

@@ -5451,6 +5451,64 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
     );
 }
 
+/// The infusion-into-kernel forcing is correct without trusting the caller's break list to hold
+/// the window end: a segment `[since, t] = [3, 6]` that *straddles* the end of a 4 h infusion (no
+/// break at 4) reads its stage on the tail side, `R_in = (dose/T)·[G(tad) − G(tad − T)]`, not the
+/// running side `(dose/T)·G(tad)` — which in release would deliver extra mass past the window.
+/// The control segment `[3, 4]` that ends *at* the window end (the break present) stays on the
+/// running side bit for bit, so the fallback never fires where the contract holds.
+#[test]
+fn infusion_into_kernel_window_end_is_right_without_a_break_at_it() {
+    let ode = first_order_one_cpt_spec();
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 2.0;
+    pk.values[crate::types::PK_IDX_V] = 20.0;
+    pk.values[4] = 0.6; // ka
+    let prepared = prepare_input_rates(&ode, &pk.values);
+    let (amt, rate) = (100.0_f64, 25.0_f64);
+    let window = amt / rate; // 4 h
+    let dose = DoseEvent::new(0.0, amt, 1, rate, false, 0.0);
+    let prep = &prepared.get(0, 0).prep;
+    let at = |since: f64, t: f64| {
+        let mut dy = [0.0_f64];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            std::slice::from_ref(&dose),
+            &[0.0],
+            &[1.0],
+            &[],
+            ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+            t,
+            since,
+            &mut dy,
+        );
+        dy[0]
+    };
+    // Straddling stage, 2 h past the end: the tail side, which differs from the running side.
+    let tail = prep.rate_infused(6.0, amt, window, Some(6.0 - window));
+    let running = prep.rate_infused(6.0, amt, window, None);
+    assert!(
+        (tail - running).abs() > 1e-6 * running.abs(),
+        "fixture drift: the two sides must differ ({tail} vs {running})"
+    );
+    assert_eq!(at(3.0, 6.0).to_bits(), tail.to_bits(), "straddling stage");
+    // Control: the stage at the window end of a segment that ends there is the running side.
+    let at_end = prep.rate_infused(4.0, amt, window, None);
+    assert_eq!(
+        at(3.0, 4.0).to_bits(),
+        at_end.to_bits(),
+        "segment ending at the end"
+    );
+    // And a segment wholly after the end is the tail side, as before.
+    let after = prep.rate_infused(7.0, amt, window, Some(3.0));
+    assert_eq!(
+        at(5.0, 7.0).to_bits(),
+        after.to_bits(),
+        "segment after the end"
+    );
+}
+
 /// A **rate-defined** infusion (`RATE>0`) under `F < 1` into a `first_order()` kernel, through
 /// the full ODE engine (#719 gap 2, #419). `F < 1` holds the rate and *shrinks* the window to
 /// `F·(amt/rate)`, delivering the bioavailable mass `F·amt` over `[0, F·T]`. The oracle sub-dose
@@ -17753,12 +17811,12 @@ fn public_ode_predictions_stops_an_infusion_at_an_off_row() {
     }
 }
 
-/// The convolved infusion input trusts its segment to lie wholly on one side of the infusion's
-/// onset and of its window end (`rate_infused`'s `tail_age`, #2786 review #14), so a caller
-/// whose break list lacks either edge must fail loudly in debug, not deliver a wrong rate.
-/// A segment `[1, 3]` straddles the window end of a 4 h infusion at `F = 0.6` (2.4 h) and one
-/// `[-1, 0.5]` straddles an onset at 0; the segments on the correct side of each edge, the same
-/// calls one step away, are the controls that do not panic. Dies when either assertion goes.
+/// The convolved infusion input trusts its segment to lie wholly before the infusion's onset or
+/// past it (`rate_infused`, #2786 review #14), so a caller whose break list lacks the onset must
+/// fail loudly in debug, not deliver a wrong rate. (The window end is not trusted any more: a
+/// straddling segment is served, see below.) A segment `[0, 2]` straddles an onset at 1; the
+/// segments on the correct side of each edge, the same calls one step away, are the controls that
+/// do not panic. Dies when the onset assertion goes.
 #[cfg(debug_assertions)]
 mod infusion_edge_contract {
     use super::*;
@@ -17796,9 +17854,11 @@ mod infusion_edge_contract {
         run(&[infusion(2.0)], 1.5, 1.0); // wholly before the onset
     }
 
+    /// The window end is not a contract: a segment straddling it is served (the tail side, by
+    /// the stage's own time — `infusion_into_kernel_window_end_is_right_without_a_break_at_it`
+    /// pins the value), so it neither panics in debug nor runs `R_in` past the end in release.
     #[test]
-    #[should_panic(expected = "window end")]
-    fn a_segment_straddling_the_window_end_is_refused() {
+    fn a_segment_straddling_the_window_end_is_served() {
         run(&[infusion(0.0)], 3.0, 1.0);
     }
 

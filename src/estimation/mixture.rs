@@ -29,10 +29,82 @@ use crate::estimation::parameterization::{
     theta_packs_log, unpack_params, PackedBounds,
 };
 use crate::parser::model_parser::{
-    eval_mixing_log_probs, mixing_logp_derivs, mixing_logp_grad_fd, MixtureClassGuard,
+    eval_mixing_log_probs, mixing_logp_derivs, mixing_logp_grad, MixtureClassGuard,
 };
 use crate::stats::likelihood::{foce_subject_nll_cov, foce_subject_nll_iov_cov};
 use crate::types::{CompiledModel, FitOptions, MixtureParams, ModelParameters, Population};
+
+/// `∂ ln p_ik / ∂ θ_j` for a set of subjects at one θ, recorded once per distinct value of the
+/// covariates the mixing expressions read — not once per subject. θ is fixed for the cache's
+/// life (one outer gradient, one score context), and the derivative depends on the subject only
+/// through those covariates, so subjects that share them share one recording and one run; a
+/// covariate-free mixing map records once for the whole population.
+pub(crate) struct MixingGradCache {
+    covariates: Vec<String>,
+    floor: Vec<f64>,
+    rows: std::sync::Mutex<
+        std::collections::HashMap<Vec<u64>, std::sync::Arc<std::sync::OnceLock<Vec<Vec<f64>>>>>,
+    >,
+    #[cfg(test)]
+    computed: std::sync::atomic::AtomicUsize,
+}
+
+impl MixingGradCache {
+    pub(crate) fn new(model: &CompiledModel) -> Self {
+        Self {
+            covariates: model
+                .mixture
+                .as_ref()
+                .map(|m| m.logit_covariates.clone())
+                .unwrap_or_default(),
+            floor: fd_theta_step_floors(model),
+            rows: Default::default(),
+            #[cfg(test)]
+            computed: Default::default(),
+        }
+    }
+
+    /// The subject's `K × n_theta` rows ([`mixing_logp_grad`]), bit-equal to calling it directly.
+    pub(crate) fn rows(
+        &self,
+        model: &CompiledModel,
+        spec: &crate::types::MixtureSpec,
+        theta: &[f64],
+        covariates: &std::collections::HashMap<String, f64>,
+    ) -> Vec<Vec<f64>> {
+        // A missing column and a stored value are different inputs; the flag keeps them apart.
+        let key: Vec<u64> = self
+            .covariates
+            .iter()
+            .flat_map(|n| match covariates.get(n) {
+                Some(v) => [1, v.to_bits()],
+                None => [0, 0],
+            })
+            .collect();
+        // One slot per key: workers racing on a new key wait on one recording, and the map's
+        // lock is not held while it runs, so distinct keys record in parallel.
+        let slot = self.rows.lock().unwrap().entry(key).or_default().clone();
+        slot.get_or_init(|| {
+            #[cfg(test)]
+            self.computed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            mixing_logp_grad(model, spec, theta, covariates, &self.floor)
+        })
+        .clone()
+    }
+
+    /// Recordings made so far.
+    #[cfg(test)]
+    pub(crate) fn computed(&self) -> usize {
+        self.computed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The recordings `mixture_subject_gradients` made in its last call on this thread.
+    pub(crate) static MIXING_RECORDINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Result of one mixture-objective evaluation.
 pub struct MixtureEval {
@@ -609,7 +681,7 @@ pub(crate) fn mixture_subject_gradients(
         return None;
     }
     let dtheta_dx = theta_chain_factors(params);
-    let theta_floor = fd_theta_step_floors(model);
+    let mixing = MixingGradCache::new(model);
     // Class k's packed layout [θ, Ω(base slots), σ, …], unpacked once per class.
     let classes: Vec<(ModelParameters, Vec<f64>)> = (0..mp.omega.len())
         .map(|cls| {
@@ -623,16 +695,10 @@ pub(crate) fn mixture_subject_gradients(
         .map(|(cp, x_k)| PackedPoint::new(cp, x_k))
         .collect();
     let n = packed_segments(params).total();
-    crate::par::map(population.subjects.len(), |i| {
+    let rows = crate::par::map(population.subjects.len(), |i| {
         let subject = &population.subjects[i];
         each(&|| {
-            let dlnp = mixing_logp_grad_fd(
-                model,
-                spec,
-                &params.theta,
-                &subject.covariates,
-                &theta_floor,
-            );
+            let dlnp = mixing.rows(model, spec, &params.theta, &subject.covariates);
             let mut g = vec![0.0f64; n];
             for (cls, (cp, _x_k)) in classes.iter().enumerate() {
                 let w = eval.pmix[i][cls];
@@ -676,9 +742,10 @@ pub(crate) fn mixture_subject_gradients(
             }
             Some(g)
         })
-    })
-    .into_iter()
-    .collect()
+    });
+    #[cfg(test)]
+    MIXING_RECORDINGS.with(|c| c.set(mixing.computed()));
+    rows.into_iter().collect()
 }
 
 /// `d(nll_ik)/dx_k` over the class-`cls` layout `pack_params(&class_params(params, cls))`
@@ -967,6 +1034,8 @@ pub(crate) struct MixtureScoreContext {
     modes: MixtureClassModes,
     classes: Vec<ClassScoreView>,
     dtheta_dx: Vec<f64>,
+    /// The mixing derivatives at `params.theta`, shared by the subjects' scores.
+    mixing: MixingGradCache,
 }
 
 impl MixtureScoreContext {
@@ -1029,6 +1098,7 @@ impl MixtureScoreContext {
             modes,
             classes,
             dtheta_dx,
+            mixing: MixingGradCache::new(model),
         }
     }
 
@@ -1046,8 +1116,9 @@ impl MixtureScoreContext {
             .expect("mixture score on a non-mixture model");
         let mp = self.params.mixture.as_ref().expect("mixture parameters");
         let covariates = &population.subjects[i].covariates;
-        let floor = fd_theta_step_floors(model);
-        let dlnp = mixing_logp_grad_fd(model, spec, &self.params.theta, covariates, &floor);
+        let dlnp = self
+            .mixing
+            .rows(model, spec, &self.params.theta, covariates);
         let mut g = vec![0.0f64; packed_segments(&self.params).total()];
         for (cls, view) in self.classes.iter().enumerate() {
             let w = self.eval.pmix[i][cls];
@@ -3391,5 +3462,101 @@ mod tests {
             w.contains("no analytic recorder serves them") && !w.contains("fixed-EBE"),
             "a structural mixture decline is reconverged, not held-EBE: {w}"
         );
+    }
+
+    /// The mixing map's derivatives are recorded once per distinct value of the covariates the
+    /// mixing expressions read, not once per subject: a covariate-free map records once for all
+    /// four subjects, a `WT`-dependent one once per distinct `WT` (two values over four
+    /// subjects), and every subject's rows are the bits a direct call returns. Both sides of the
+    /// key in one test: a cache keyed too coarsely returns one subject's rows for another's `WT`
+    /// (the rows differ between the two values, asserted), one keyed per subject records four times.
+    #[test]
+    fn mixing_derivatives_record_once_per_distinct_covariate_value() {
+        use super::{mixing_logp_grad, MixingGradCache};
+        let (free_model, pop) = mixture_with_one_declined_subject();
+        let cov_model = crate::parser::model_parser::parse_model_string(
+            r"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta MIXL(0.1, -10.0, 10.0)
+  theta BWT(0.05, -5.0, 5.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL + BWT * (WT - 70)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+",
+        )
+        .unwrap();
+        for (model, wts, want_records) in [
+            (&free_model, [70.0, 70.0, 70.0, 70.0], 1usize),
+            (&cov_model, [60.0, 90.0, 60.0, 90.0], 2),
+        ] {
+            let spec = model.mixture.as_ref().unwrap();
+            let theta = &model.default_params.theta;
+            let floor = crate::estimation::parameterization::fd_theta_step_floors(model);
+            let cache = MixingGradCache::new(model);
+            let mut rows = Vec::new();
+            for (i, subject) in pop.subjects.iter().enumerate() {
+                let mut cov = subject.covariates.clone();
+                cov.insert("WT".to_string(), wts[i]);
+                let got = cache.rows(model, spec, theta, &cov);
+                let want = mixing_logp_grad(model, spec, theta, &cov, &floor);
+                let bits = |m: &Vec<Vec<f64>>| -> Vec<u64> {
+                    m.iter().flatten().map(|v| v.to_bits()).collect()
+                };
+                assert!(got.iter().flatten().all(|v| v.is_finite()));
+                assert_eq!(bits(&got), bits(&want), "subject {i}: not the direct bits");
+                rows.push(got);
+            }
+            assert_eq!(cache.computed(), want_records, "recordings");
+            if want_records == 2 {
+                let a: Vec<u64> = rows[0].iter().flatten().map(|v| v.to_bits()).collect();
+                let b: Vec<u64> = rows[1].iter().flatten().map(|v| v.to_bits()).collect();
+                assert_ne!(a, b, "fixture: the two WT values must give different rows");
+            }
+        }
+    }
+
+    /// The outer gradient's per-subject assembly takes its mixing derivatives through the
+    /// shared cache: four subjects of a covariate-free mixing map make one recording.
+    #[test]
+    fn the_subject_gradients_record_the_mixing_map_once() {
+        use crate::estimation::parameterization::pack_params;
+        let (model, pop) = mixture_with_one_declined_subject();
+        let opts = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::FoceI,
+            interaction: true,
+            ..Default::default()
+        };
+        let params = &model.default_params;
+        let (eval, modes) = super::mixture_ofv_with_modes(&model, &pop, params, &opts, None);
+        let zero = |d: super::DeclinedTerm<'_>| Some(vec![0.0; pack_params(d.cp).len()]);
+        super::MIXING_RECORDINGS.with(|c| c.set(usize::MAX));
+        let rows = super::mixture_subject_gradients(
+            &model,
+            &pop,
+            params,
+            &opts,
+            &eval,
+            Some(&modes),
+            Some(&zero),
+            |f| f(),
+        )
+        .expect("salvaged");
+        assert_eq!(rows.len(), 4);
+        assert_eq!(super::MIXING_RECORDINGS.with(|c| c.get()), 1);
     }
 }

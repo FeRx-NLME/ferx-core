@@ -7776,6 +7776,76 @@ fn ode_objective_memo_holds_native_values_only_at_stiff_points() {
     );
 }
 
+/// A lagged closed-form model's plan value is up to 5 ulp off the native walk
+/// (`plan_value_bit_equal`), so the memo must not hold it: no fused value of an ALAG model is put
+/// in the objective memo, and the lag-free control of the same shape still is (both sides of the
+/// one predicate in one test).
+#[test]
+fn lagged_closed_form_memo_holds_native_values_only() {
+    use std::path::Path;
+    let puts = |mf: &str| {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_oral_lagtime.csv"), None, None)
+            .expect("data");
+        let (b0, b1) = (
+            MEMO_PLAN_PUTS.with(|c| c.get()),
+            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get()),
+        );
+        for subj in pop.subjects.iter().take(8) {
+            let _ = find_ebe(
+                &model,
+                subj,
+                &model.default_params,
+                500,
+                1e-8,
+                None,
+                None,
+                0,
+            );
+        }
+        (
+            MEMO_PLAN_PUTS.with(|c| c.get()) - b0,
+            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get()) - b1,
+        )
+    };
+    let lagged = puts("examples/oral_with_lagtime.ferx");
+    assert_eq!(lagged, (0, 0), "a lagged model's memo took a plan value");
+    let control = puts("examples/warfarin.ferx");
+    assert!(control.0 > 0, "the lag-free closed form stopped memoising");
+}
+
+/// The effective model is decided at each evaluation, not once per solve: a transit solve that
+/// starts in the closed form's domain and crosses into its ODE twin (the #1521 fixture) must put
+/// no fused value in the memo at an ODE-twin point, where plan and native integrations differ.
+#[test]
+fn memo_holds_no_plan_value_once_a_solve_crosses_into_the_ode_twin() {
+    let subject = flip_flop_transit_subject();
+    for tvcl in [4.0_f64, 4.5] {
+        let m = flip_flop_transit_model(tvcl, 110.0, 24.0, 0.0);
+        let p = m.default_params.clone();
+        let b = MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get());
+        let res = find_ebe(&m, &subject, &p, 200, 1e-6, None, None, 0);
+        // The straddle: the solve starts in the closed form and ends in the twin.
+        assert!(!crate::pk::absorption_flip_flop_at(
+            &m,
+            &subject,
+            &p.theta,
+            &vec![0.0; m.n_eta]
+        ));
+        assert!(crate::pk::absorption_flip_flop_at(
+            &m,
+            &subject,
+            &p.theta,
+            res.eta.as_slice()
+        ));
+        assert_eq!(
+            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get()) - b,
+            0,
+            "TVCL = {tvcl}: a plan value was memoised at an ODE-twin point"
+        );
+    }
+}
+
 /// The size of what the gate above avoids: at stiff thetas the plan's value differs from the
 /// native objective in the last bits only (measured worst 2e-15 relative; bound with headroom).
 #[test]
