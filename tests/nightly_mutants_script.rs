@@ -233,6 +233,11 @@ fn examine_re(text: &str) -> Vec<String> {
                     other => panic!("unexpected TOML escape \\{other:?} in {l}"),
                 },
                 '"' => panic!("unescaped quote in {l}"),
+                // TOML forbids a raw control character (tab aside) in a basic
+                // string; cargo-mutants' parser rejects the whole config (#2958).
+                c if c != '\t' && (c < ' ' || c == '\u{7f}') => {
+                    panic!("raw control character {c:?} in {l}")
+                }
                 c => s.push(c),
             }
         }
@@ -329,6 +334,69 @@ fn select_exact_names_every_listed_mutant() {
     let (n, hit) = selected(tmp.path(), &["--exact"]);
     assert_eq!(n, LIST.lines().count());
     assert_eq!(hit, LIST.lines().collect::<Vec<_>>());
+}
+
+/// #2958: with `CARGO_TERM_COLOR=always` (the workflow's setting), `cargo mutants
+/// --list` writes ANSI escapes even into a file, and `select` used to copy the raw
+/// ESC bytes into `examine_re` — a TOML parse error that named neither cause, every
+/// night. `select` must refuse the list, write no config, and name the fix.
+#[test]
+fn select_refuses_a_coloured_list_and_names_the_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let list = tmp.path().join("list.txt");
+    // Byte-for-byte the shape of the 2026-11-15 run's failing entry.
+    std::fs::write(
+        &list,
+        "src/b.rs:9:5: replace scale -> f64 with 0.0\n\
+         src/survival/mod.rs:989:5: replace \x1b[38;5;13mtte_record_diagnostics\x1b[0m \
+         \x1b[35m-> Vec<crate::types::TteObsDiagnostic>\x1b[0m with \x1b[33mvec![]\x1b[0m\n",
+    )
+    .unwrap();
+    for mode in [&[][..], &["--all-genres"], &["--exact"]] {
+        let cfg = tmp.path().join("select.toml");
+        let mut args = vec!["select", list.to_str().unwrap(), cfg.to_str().unwrap()];
+        args.extend_from_slice(mode);
+        let out = run(tmp.path(), &args);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{mode:?}: a coloured list must fail");
+        assert!(err.contains("entry 2"), "{mode:?}: names the entry: {err}");
+        assert!(
+            err.contains("--colors=never"),
+            "{mode:?}: names the fix: {err}"
+        );
+        assert!(!cfg.exists(), "{mode:?}: no config written");
+    }
+}
+
+/// #2958, the root: cargo-mutants reads its `--colors` default from
+/// CARGO_TERM_COLOR, which the workflow sets to `always` for cargo's own logs. Every
+/// `cargo mutants` call must therefore carry `--colors=never`, via MUTANTS_ARGS.
+#[test]
+fn workflow_lists_mutants_without_colours() {
+    let wf = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/mutants.yml"),
+    )
+    .unwrap();
+    let args = wf
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("MUTANTS_ARGS:"))
+        .expect("MUTANTS_ARGS is set");
+    assert!(
+        args.split_whitespace().any(|a| a == "--colors=never"),
+        "MUTANTS_ARGS must carry --colors=never: {args}"
+    );
+    let calls: Vec<&str> = wf
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#') && l.contains("cargo mutants "))
+        .collect();
+    assert!(calls.len() >= 3, "found the cargo mutants calls: {calls:?}");
+    for c in calls {
+        assert!(
+            c.contains("$MUTANTS_ARGS"),
+            "call without MUTANTS_ARGS: {c}"
+        );
+    }
 }
 
 #[test]

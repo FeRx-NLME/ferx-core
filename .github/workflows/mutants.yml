@@ -73,7 +73,14 @@ env:
   # test phase, so the build phase (`cargo test --no-run`) compiled all ~120
   # integration-test binaries per mutant — measured on #2633's first local run.
   # `--cargo-arg` goes to every cargo invocation, build and test alike.
-  MUTANTS_ARGS: -p ferx-core --no-default-features --features ci,markov,nn --profile mutants --cargo-arg=--lib
+  #
+  # `--colors=never`: cargo-mutants reads its `--colors` default from
+  # CARGO_TERM_COLOR, which is `always` above, so `cargo mutants --list > file`
+  # wrote every name wrapped in ANSI escapes. `select` then put the raw ESC bytes
+  # into plan/select.toml, which TOML rejects, and every non-empty night failed at
+  # planning from the workflow's first run until this flag (#2958). `select` now
+  # refuses a control character, so a coloured list fails there, by name.
+  MUTANTS_ARGS: -p ferx-core --no-default-features --features ci,markov,nn --profile mutants --cargo-arg=--lib --colors=never
   # Sizing (sdlc.qmd#nightly-mutants). PER_SHARD is how many mutants one shard is
   # planned to finish in BUDGET_MINUTES; it is a planning number, not a cap — a
   # shard that is slower than planned leaves a tail, and the tail goes to the next

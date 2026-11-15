@@ -247,6 +247,16 @@ def rust_escape(s):
 
 lines = [l.rstrip("\n") for l in open(list_path, encoding="utf-8")]
 lines = list(dict.fromkeys(l for l in lines if l))
+# A mutant name is printable text. A control character means a decorated list --
+# `cargo mutants --list` with colours on writes ANSI escapes even into a file --
+# and a raw one is invalid inside a TOML basic string, so cargo-mutants would
+# reject the config with a parse error that names neither cause (#2958).
+for n, line in enumerate(lines, 1):
+    bad = next((c for c in line if ord(c) < 0x20 or ord(c) == 0x7F), None)
+    if bad is not None:
+        sys.exit(f"select: {list_path}: entry {n} contains control character "
+                 f"{bad!r}: {line!r}\n"
+                 "select: a coloured `cargo mutants --list`? pass --colors=never")
 if mode == "exact":
     picked = lines
 else:
