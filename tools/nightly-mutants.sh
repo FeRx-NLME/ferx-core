@@ -31,6 +31,10 @@
 #                                     them to OUT as a cargo-mutants config whose
 #                                     `examine_re` names each one exactly; print the
 #                                     count.
+#   outcome-dirs ROOT                 print, one per line with a trailing `/`, every
+#                                     dir at most one level under ROOT (ROOT itself
+#                                     included) that holds cargo-mutants outcomes: the
+#                                     shard dirs to hand to `untested` and `summary`.
 #   untested SELECTED OUT DIR...      write the names in SELECTED that no DIR has an
 #                                     outcome for to OUT; print the count.
 #   summary [--selected N] [--window R] [--untested FILE [--continued]] DIR...
@@ -308,6 +312,28 @@ cat_in() {
   done | LC_ALL=C sort -t: -k1,1 -k2,2n -u
 }
 
+# The shard dirs under ROOT, found by what they hold, not by where they sit (#2958).
+# `download-artifact` with a `pattern` puts each matched artifact in its own
+# ROOT/<name>/, but when exactly ONE artifact matches -- every one-shard night, or a
+# night where only one shard uploaded -- it extracts it straight into ROOT. A
+# `ROOT/*/` glob then finds only that shard's own `diff/` and `log/` subdirs, so
+# `untested` reported every mutant as untested, `summary` said "0 of 0 examined",
+# and a follow-up pass re-ran mutants that were already tested.
+cmd_outcome_dirs() {
+  (($# == 1)) || die "outcome-dirs: usage: outcome-dirs ROOT"
+  local root="${1%/}" d f
+  [[ -d "$root" ]] || return 0
+  for d in "$root" "$root"/*/; do
+    d="${d%/}"
+    for f in outcomes.json caught.txt missed.txt timeout.txt unviable.txt; do
+      if [[ -f "$d/$f" ]]; then
+        echo "$d/"
+        break
+      fi
+    done
+  done
+}
+
 # The mutants of SELECTED (a `cargo mutants --list` output, one name per line) that
 # no shard dir records an outcome for: what a budget-hit pass left untested. Written
 # to OUT; the count is printed. The workflow hands OUT to the next pass.
@@ -444,6 +470,7 @@ main() {
     range) cmd_range "$@" ;;
     diff) cmd_diff "$@" ;;
     select) cmd_select "$@" ;;
+    outcome-dirs) cmd_outcome_dirs "$@" ;;
     untested) cmd_untested "$@" ;;
     summary) cmd_summary "$@" ;;
     *) die "unknown subcommand '$sub' (try --help)" ;;

@@ -302,8 +302,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PASS: ${{ inputs.pass || '1' }}
         run: |
-          shopt -s nullglob
-          dirs=(shards/*/)
+          # Found by content, not `shards/*/`: a lone artifact is extracted straight
+          # into shards/ (see `outcome-dirs` in the script, #2958).
+          mapfile -t dirs < <(tools/nightly-mutants.sh outcome-dirs shards)
           n="$(tools/nightly-mutants.sh untested plan/selected.txt untested.txt "${dirs[@]}")"
           echo "untested=$n" >> "$GITHUB_OUTPUT"
           if (( n == 0 )) || (( PASS >= MAX_PASSES )); then
@@ -338,8 +339,7 @@ jobs:
 
       - name: Write the summary
         run: |
-          shopt -s nullglob
-          dirs=(shards/*/)
+          mapfile -t dirs < <(tools/nightly-mutants.sh outcome-dirs shards)
           [[ -d plan/prior ]] && dirs+=(plan/prior)
           # shellcheck disable=SC1091
           source plan/window.env

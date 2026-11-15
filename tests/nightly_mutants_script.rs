@@ -445,6 +445,113 @@ fn shard(root: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
     d
 }
 
+/// #2958, review row 1: `download-artifact` extracts a LONE matched artifact straight
+/// into its `path`, not into `path/<name>/`. The summary job globbed `shards/*/`, so on
+/// a one-shard night it found only that shard's own `diff/` and `log/` subdirs:
+/// dispatch run 43696027642 tested 5 mutants (3 caught, 2 unviable) and reported
+/// "0 survived of 0 examined", then re-dispatched all 5 as untested. `outcome-dirs`
+/// must find the shard in both layouts, and hand `untested` / `summary` the real count.
+#[test]
+fn outcome_dirs_finds_a_lone_flattened_shard_and_nested_shards() {
+    let caught = "src/a.rs:1:1: replace x with ()\n";
+    let unviable = "src/a.rs:3:1: replace w -> T with Default::default()\n";
+    let selected = format!("{caught}{unviable}src/b.rs:9:5: replace scale -> f64 with 0.0\n");
+    let outcomes = [
+        ("caught.txt", caught),
+        ("unviable.txt", unviable),
+        ("outcomes.json", "{}"),
+    ];
+
+    // Flattened: the one artifact's `mutants.out` contents sit in ROOT itself, beside
+    // its `diff/` and `log/` subdirs, which hold no outcome file.
+    let flat = tempfile::tempdir().unwrap();
+    let root = flat.path().join("shards");
+    shard(&root, "", &outcomes);
+    shard(&root, "diff", &[("x.diff", "")]);
+    shard(&root, "log", &[("x.log", "")]);
+    // Nested: one subdir per artifact, plus an empty shard killed before any outcome.
+    let nest = tempfile::tempdir().unwrap();
+    let nroot = nest.path().join("shards");
+    shard(&nroot, "mutants-out-0", &outcomes[..1]);
+    shard(&nroot, "mutants-out-1", &outcomes[1..]);
+    shard(&nroot, "mutants-out-2", &[]);
+
+    for (tmp, root, want) in [
+        (flat.path(), &root, vec![format!("{}/", root.display())]),
+        (
+            nest.path(),
+            &nroot,
+            vec![
+                format!("{}/mutants-out-0/", nroot.display()),
+                format!("{}/mutants-out-1/", nroot.display()),
+            ],
+        ),
+    ] {
+        let out = ok_stdout(run(tmp, &["outcome-dirs", root.to_str().unwrap()]));
+        let dirs: Vec<&str> = out.lines().collect();
+        assert_eq!(dirs, want, "the shard dirs, by content");
+
+        // End to end, as the summary job chains them.
+        let sel = tmp.join("selected.txt");
+        std::fs::write(&sel, &selected).unwrap();
+        let unt = tmp.join("untested.txt");
+        let mut args = vec!["untested", sel.to_str().unwrap(), unt.to_str().unwrap()];
+        args.extend(dirs.iter().copied());
+        assert_eq!(
+            ok_stdout(run(tmp, &args)).trim(),
+            "1",
+            "only `scale` is untested"
+        );
+        let mut args = vec!["summary", "--selected", "3"];
+        args.extend(dirs.iter().copied());
+        let md = ok_stdout(run(tmp, &args));
+        assert!(md.contains("### Mutants: 0 survived of 2 examined"), "{md}");
+    }
+
+    // No outcomes anywhere (or no ROOT): nothing, so the job's "no shard produced
+    // outcomes" branch fires instead of a 0-of-0 report.
+    let empty = tempfile::tempdir().unwrap();
+    shard(&empty.path().join("shards"), "log", &[("x.log", "")]);
+    for r in ["shards", "missing"] {
+        let out = ok_stdout(run(empty.path(), &["outcome-dirs", r]));
+        assert_eq!(out, "", "{r}: no outcome dir");
+    }
+}
+
+/// #2958, review row 1, the workflow half: both summary steps that read the shard
+/// outcomes (the carry and the report) must take their dirs from `outcome-dirs`, not
+/// from a `shards/*/` glob, which misses a lone artifact extracted into `shards/`.
+#[test]
+fn workflow_finds_shard_dirs_by_content() {
+    let wf = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/mutants.yml"),
+    )
+    .unwrap();
+    let code: Vec<&str> = wf
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    let by_content = code
+        .iter()
+        .filter(|l| l.contains("nightly-mutants.sh outcome-dirs shards"))
+        .count();
+    assert_eq!(by_content, 2, "carry + summary steps use outcome-dirs");
+    let globs: Vec<&&str> = code.iter().filter(|l| l.contains("shards/*")).collect();
+    assert!(globs.is_empty(), "shard dirs by glob: {globs:?}");
+}
+
+/// The decoder is a stand-in for cargo-mutants' TOML parser, so it must refuse what
+/// TOML refuses: a raw control character in a basic string (#2958). `select` now
+/// never writes one, so only a direct feed reaches this arm.
+#[test]
+#[should_panic(expected = "raw control character")]
+fn examine_re_decoder_rejects_a_raw_control_character_as_toml_does() {
+    // Exactly `select`'s shape (`\\.` is TOML for a regex `\.`), so the control
+    // character is the only thing wrong with it.
+    examine_re("examine_re = [\n  \"^src/a\\\\.rs: replace \u{1b}[0mx$\",\n]\n");
+}
+
 #[test]
 fn summary_lists_every_survivor_across_shards_and_flags_a_budget_hit() {
     let tmp = tempfile::tempdir().unwrap();
