@@ -4367,9 +4367,12 @@ fn ss_into_a_clock_reading_rhs_is_served_and_matches_fd() {
         let grad = parity(&m, &s);
         eprintln!("{label}: dF/dEta vs FD {jac:.2e}; FOCEI gradient vs reconverged FD {grad:.2e}");
         assert!(jac.is_finite() && grad.is_finite(), "{label}");
-        // Measured on Linux (dev profile): dF/dEta <= 5.9e-11, FOCEI gradient <= 4.3e-5 (the lagged
-        // infusion cells; the oracle's own noise level there, as in the lagged TAD test above).
-        assert!(jac < 1e-8 && grad < 2e-4, "{label}: {jac:.2e} / {grad:.2e}");
+        // Measured on Linux (dev profile): dF/dEta <= 9.5e-11, FOCEI gradient <= 7.4e-7 (the
+        // lagged bolus cells). The lagged infusion cells read up to 4.3e-5 before the flow
+        // extension kept its explicit time derivative
+        // (`a_lagged_ss_infusion_on_a_clock_reading_rhs_has_the_exact_inner_hessian`): that was a
+        // real second-order gap, not the oracle's noise, so the bound is the measured one.
+        assert!(jac < 1e-9 && grad < 1e-5, "{label}: {jac:.2e} / {grad:.2e}");
     }
 }
 
@@ -5168,4 +5171,275 @@ fn an_infusion_into_a_lagged_weibull_stays_on_finite_differences() {
             assert!(served(&m, &b), "weibull {shape} {lag}: bolus");
         }
     }
+}
+
+/// One `SS=1` bolus at 0 (`II = 12`, an estimated lag of about 0.4 h) and nothing else, observed
+/// across four cycles: after the lagged arrival every later cycle start is a virtual pulse that
+/// `TAD` re-anchors to, with no real dose to take over the anchor.
+fn ss_only_subject(m: &CompiledModel, inf: bool) -> Subject {
+    let first = DoseEvent::new(0.0, 100.0, 1, if inf { 5.0 } else { 0.0 }, true, 12.0);
+    subject(
+        m,
+        vec![first],
+        &[
+            0.5, 1.0, 2.0, 4.0, 8.0, 11.0, 12.2, 13.0, 15.0, 17.0, 20.0, 23.0, 25.0, 28.0, 31.0,
+            36.0, 40.0,
+        ],
+        &[0.1, -0.05],
+    )
+}
+
+/// A lagged `SS=1` dose into a `TAD`-reading right-hand side, observed past its first cycle: the
+/// walk's `TAD` anchor follows every later cycle start (a virtual pulse before the record, and
+/// each cycle after the lagged arrival), as `dosing::tad_referent` does for the value.
+#[test]
+fn a_lagged_ss_dose_re_anchors_tad_at_every_later_cycle() {
+    for (factor, inf) in [
+        ("1 + 0.3 * exp(-0.5 * TAD)", false),
+        ("1 + 0.3 * exp(-0.5 * TAD)", true),
+        ("1 + 0.01 * TIME + 0.3 * exp(-0.5 * TAD)", false),
+    ] {
+        let label = format!("SS-only TAD `{factor}` inf={inf}");
+        let m = clock_model(factor, true);
+        let s = ss_only_subject(&m, inf);
+        let (jac, grad) = measure(&m, &s, &[0, 1, 2, 3], &label);
+        // Measured on Linux (dev profile): dF/dEta <= 1.6e-11, FOCEI gradient <= 9.8e-8. Without
+        // the per-cycle anchor the gradient is 0.1 .. 1.3 off from the first cycle on.
+        assert!(
+            jac < 2e-10 && grad < 1e-6,
+            "{label}: {jac:.2e} / {grad:.2e}"
+        );
+    }
+}
+
+/// The scope clause "`indiv_param_program` absent, axis not `n_eta + n_kappa`, or no
+/// `pk_indices`" (`ode_walk_model_scope`) is not reachable from a parsed model: the parser
+/// rejects a model with no individual parameter (an absent, empty or comment-only
+/// `[individual_parameters]` block is "Missing [individual_parameters] block"), so `pk_indices`
+/// (one slot per declared individual parameter) is never empty, and it builds the ODE spec's
+/// program in one place over the extended `[η, κ]` axis, for BSV and IOV models alike. Only a
+/// hand-built spec can reach it, and there it must route to FD rather than record: each of the
+/// three clauses declines on its own.
+/// Mutations: drop the `!pk_indices.is_empty()` conjunct, or the axis comparison, or the
+/// `let Some(p) = ..indiv_param_program else` -> the matching declined row turns green (and the
+/// recorder would run over a spec with no parameter map).
+#[test]
+fn the_individual_parameter_scope_clause_is_only_reachable_by_a_hand_built_spec() {
+    let base = "[parameters]\n  theta TVX(1.0, 0.1, 10.0)\n  sigma PROP_ERR ~ 0.1 (sd)\n";
+    let rest = "[structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  \
+                d/dt(central) = -0.2 * central\n[scaling]\n  y = central / 10.0\n\
+                [error_model]\n  DV ~ proportional(PROP_ERR)\n";
+    for (label, ind) in [
+        ("no block", ""),
+        ("empty block", "[individual_parameters]\n"),
+        (
+            "comment-only block",
+            "[individual_parameters]\n  # nothing\n",
+        ),
+    ] {
+        let err = parse_model_string(&format!("{base}{ind}{rest}"))
+            .err()
+            .unwrap_or_else(|| panic!("{label}: an ODE model with no individual parameter parsed"));
+        assert!(
+            format!("{err:?}").contains("individual_parameters"),
+            "{label}: {err:?}"
+        );
+    }
+    // Every parsed ODE model has the program over the `[eta, kappa]` axis and a slot per parameter.
+    for (label, src) in [
+        ("BSV", ODE_LAG),
+        ("IOV", IOV_LAG_ODE),
+        ("IOV 1 kappa", ODE_IOV_ONE_KAPPA),
+    ] {
+        let m = tight(parse_model_string(src).unwrap());
+        let p = m.ode_spec.as_ref().unwrap().indiv_param_program.as_ref();
+        assert!(
+            p.is_some_and(|p| p.n_eta_axis() == m.n_eta + m.n_kappa),
+            "{label}: the program is built over the extended axis"
+        );
+        assert!(!m.pk_indices.is_empty(), "{label}: a slot per parameter");
+        assert!(recorder_in_scope(&m), "{label}: control, in scope");
+    }
+    // The hand-built shapes decline, each on its own.
+    let fresh = || tight(parse_model_string(ODE_LAG).unwrap());
+    let mut no_slots = fresh();
+    no_slots.pk_indices.clear();
+    assert!(!recorder_in_scope(&no_slots), "no pk_indices");
+    let mut no_program = fresh();
+    no_program.ode_spec.as_mut().unwrap().indiv_param_program = None;
+    assert!(!recorder_in_scope(&no_program), "no program");
+    let mut wrong_axis = fresh();
+    wrong_axis.n_eta += 1;
+    assert!(!recorder_in_scope(&wrong_axis), "axis mismatch");
+}
+
+/// An SS dose into a built-in absorption kernel (`zero_order` / `first_order`, with a compartment
+/// `ALAG1` or a per-route `lag=`) on a right-hand side reading `TAD`, observed across four
+/// cycles: served by the plan, ∂f/∂η and the FOCEI gradient against reconverged FD. The route
+/// lag of the zero-order kernel moves its window, not the SS dose's arrival, so only its
+/// compartment-lag cells have the lagged-SS anchor; the route cells are the control that the
+/// per-cycle anchor leaves an unlagged SS dose unchanged.
+#[test]
+fn ss_into_absorption_with_a_lag_on_a_tad_rhs_matches_reconverged_fd() {
+    let times = [
+        0.4, 4.0, 6.5, 10.5, 13.5, 16.0, 19.0, 22.5, 26.5, 28.0, 31.0, 36.5,
+    ];
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    for (label, kernel, lag, lag_value, p) in [
+        ("ZO ALAG1 2 (dur 3)", "zero_order", "alag", 2.0, 3.0),
+        ("ZO route lag 2 (dur 3)", "zero_order", "route", 2.0, 3.0),
+        ("FO ALAG1 2", "first_order", "alag", 2.0, 0.4),
+        ("FO route lag 2", "first_order", "route", 2.0, 0.4),
+    ] {
+        let src = ss_lag_model(kernel, lag, lag_value, p).replace(
+            "- CL/V*central\n",
+            "- CL/V*central*(1 + 0.3*exp(-0.5*TAD))\n",
+        );
+        assert!(src.contains("TAD"), "{label}: premise");
+        let m = tight(parse_model_string(&src).unwrap());
+        let s = subject(&m, doses.clone(), &times, &[0.1, -0.05]);
+        assert!(s.has_periodic_ss_dose());
+        let (jac, grad) = measure(&m, &s, &[0, 2, 3], label);
+        // Measured on Linux (dev profile): dF/dEta <= 4.8e-8, FOCEI gradient <= 4.2e-8 (the
+        // first-order rows, whose periodic sum the value path truncates at 1e-10 relative);
+        // 1.8e-2 / 0.46 off on the zero-order compartment-lag row without the per-cycle anchor.
+        assert!(jac < 5e-7 && grad < 5e-7, "{label}: {jac:.2e} / {grad:.2e}");
+    }
+}
+
+/// The second lag derivative of a clock-reading field through a lagged `SS=1` infusion's seed:
+/// `ss_state_at_phase_g` advances the trough by `phase = II - lag` and extends the flow by the
+/// phase's jet-only part, whose second-order term is `1/2 (J g + dg/dt) dt^2`. The extension ran
+/// the field at a fixed clock, so for a right-hand side reading `TIME` or `TAD` (an explicit
+/// `dg/dt`) it dropped `dg/dt`: every first derivative (`df/deta`, 5e-11) and the theta
+/// dependence stayed exact while `d2l/deta_lag2` was off by 5e-4 (`TIME`) / 1.2e-5 (`TAD`), and
+/// with it the FOCEI gradient by 4e-5 (theta and sigma coordinates alike, whatever the FD step,
+/// the ODE tolerance or the EBE tolerance: a deterministic gap, not the oracle's conditioning).
+/// The exact inner Hessian is checked against a Richardson difference of the exact inner
+/// gradient, at an eta off the mode; the controls are the autonomous field (no `dg/dt`) and the
+/// clock-reading field with no estimated lag (no phase jet), both exact before the fix.
+/// Mutations: pass the step offset `s` of `extend_flow_by_dual_duration_g` through as `0` ->
+/// the lagged clock rows go to 5e-4 / 1.2e-5 and the controls stay at 1e-11.
+#[test]
+fn a_lagged_ss_infusion_on_a_clock_reading_rhs_has_the_exact_inner_hessian() {
+    let tt = "1 + 0.05 * TIME + 0.3 * exp(-0.5 * TAD)";
+    for (name, factor, lag) in [
+        ("autonomous", "1", true),
+        ("TIME", "1 + 0.05 * TIME", true),
+        ("TAD", "1 + 0.3 * exp(-0.5 * TAD)", true),
+        ("TIME + TAD", tt, true),
+        ("TIME + TAD, no lag", tt, false),
+    ] {
+        let m = with_tol(clock_model(factor, lag), 1e-12, 1e-14);
+        let s = clock_subject(&m, true);
+        let params = moved_params(&m);
+        let mode = ebe_for(&m, &s, &params, 1e-12, true);
+        let eta: Vec<f64> = mode.iter().map(|v| v + 0.03).collect();
+        let hx = exact_inner_hessian(&m, &s, &params, &eta).expect("exact inner Hessian");
+        let g = |e: &[f64]| exact_inner_gradient(&m, &s, &params, e, None).expect("inner gradient");
+        let n = eta.len();
+        let mut worst = 0.0f64;
+        for k in 0..n {
+            let col = |st: f64| {
+                let (mut ep, mut em) = (eta.clone(), eta.clone());
+                ep[k] += st;
+                em[k] -= st;
+                let (gp, gm) = (g(&ep), g(&em));
+                (0..n)
+                    .map(|j| (gp[j] - gm[j]) / (2.0 * st))
+                    .collect::<Vec<f64>>()
+            };
+            let (c1, c2) = (col(1e-4), col(2e-4));
+            for j in 0..n {
+                let fd = (4.0 * c1[j] - c2[j]) / 3.0;
+                assert!(
+                    hx[(j, k)].is_finite() && fd.is_finite(),
+                    "{name}: H[{j},{k}]"
+                );
+                worst = worst.max((hx[(j, k)] - fd).abs() / (1.0 + fd.abs()));
+            }
+        }
+        // Measured on Linux (dev profile): 5.1e-12 .. 5.0e-10 on every row; the unfixed
+        // extension reads 5.3e-4 (TIME) and 1.2e-5 (TAD) on the lagged clock rows.
+        assert!(
+            worst < 5e-9,
+            "{name}: d2l/deta2 vs FD of the exact gradient {worst:.2e}"
+        );
+    }
+}
+
+/// An SS dose into a lagged built-in absorption kernel (η on the lag and on `DUR`/`KA`) on a
+/// right-hand side reading `TIME`: the exact inner Hessian against a Richardson difference of
+/// the exact inner gradient, the autonomous rows the control. The zero-order SS dose is lowered
+/// to an infusion, and the run-in's quiet leg re-opens its `TIME` at the window's end, which
+/// moves with `DUR`; the plan ran that leg's clock from the window's value, losing
+/// `dTIME/dT_inf` -- `H[CL, DUR]` read -60.6 against FD's -167 (0.63 relative). Mutation: the
+/// quiet legs' offset `-dtinf` / anchor `-inf_window` back to `0` / `-T_inf` -> the zero-order
+/// `TIME` rows go to 0.63. The first-order rows (a lagged onset crossed inside the cycle by
+/// `equilibrate_ss_input_rate_state_g`) are exact as they stand: both sides of that switch share
+/// the base field, so its clock dependence cancels in the crossing.
+/// Measured on Linux (dev profile): every row <= 1.4e-9.
+#[test]
+fn a_lagged_ss_absorption_kink_on_a_clock_reading_rhs_has_the_exact_inner_hessian() {
+    let times = [0.4, 2.5, 4.0, 6.5, 10.5, 13.5, 16.0, 19.0, 22.5];
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0)];
+    let mut bad = Vec::new();
+    for (kernel, lag, p) in [
+        ("zero_order", "alag", 3.0),
+        ("zero_order", "route", 3.0),
+        ("first_order", "alag", 0.4),
+        ("first_order", "route", 0.4),
+    ] {
+        for (clock, factor) in [("autonomous", "1"), ("TIME", "(1 + 0.05*TIME)")] {
+            let name = format!("{kernel} {lag} {clock}");
+            let src = ss_lag_model(kernel, lag, 2.0, p)
+                .replace("- CL/V*central\n", &format!("- CL/V*central*{factor}\n"))
+                .replace("= TVLAG\n", "= TVLAG * exp(ETA_L)\n")
+                .replace("  sigma PROP_ERR", "  omega ETA_L ~ 0.04\n  sigma PROP_ERR");
+            assert!(src.contains("ETA_L)"), "{name}: premise, η on the lag");
+            let m = with_tol(tight(parse_model_string(&src).unwrap()), 1e-12, 1e-14);
+            let s = subject(&m, doses.clone(), &times, &[0.1, -0.05, 0.08]);
+            let params = moved_params(&m);
+            let mode = ebe_for(&m, &s, &params, 1e-12, true);
+            let eta: Vec<f64> = mode.iter().map(|v| v + 0.03).collect();
+            let hx = exact_inner_hessian(&m, &s, &params, &eta).expect("exact inner Hessian");
+            let g =
+                |e: &[f64]| exact_inner_gradient(&m, &s, &params, e, None).expect("inner gradient");
+            let n = eta.len();
+            let mut worst = 0.0f64;
+            for k in 0..n {
+                let col = |st: f64| {
+                    let (mut ep, mut em) = (eta.clone(), eta.clone());
+                    ep[k] += st;
+                    em[k] -= st;
+                    let (gp, gm) = (g(&ep), g(&em));
+                    (0..n)
+                        .map(|j| (gp[j] - gm[j]) / (2.0 * st))
+                        .collect::<Vec<f64>>()
+                };
+                let (c1, c2) = (col(1e-4), col(2e-4));
+                for j in 0..n {
+                    let fd = (4.0 * c1[j] - c2[j]) / 3.0;
+                    assert!(
+                        hx[(j, k)].is_finite() && fd.is_finite(),
+                        "{name}: H[{j},{k}]"
+                    );
+                    let e = (hx[(j, k)] - fd).abs() / (1.0 + fd.abs());
+                    assert!(e.is_finite(), "{name}: H[{j},{k}] gap");
+                    if e > 1e-6 {
+                        eprintln!("{name}: H[{j},{k}] exact {:.6e} fd {fd:.6e}", hx[(j, k)]);
+                    }
+                    worst = worst.max(e);
+                }
+            }
+            eprintln!("{name}: d2l/deta2 vs FD of the exact gradient {worst:.2e}");
+            if worst >= 5e-9 {
+                bad.push(format!("{name}: {worst:.2e}"));
+            }
+        }
+    }
+    assert!(
+        bad.is_empty(),
+        "d2l/deta2 vs FD of the exact gradient: {bad:?}"
+    );
 }

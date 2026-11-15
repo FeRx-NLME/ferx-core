@@ -1612,18 +1612,48 @@ const TAD_EPS: f64 = 1e-12;
 /// arrival, so there is no shorter elapsed time to report.
 #[inline]
 pub(crate) fn tad_referent(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
-    let arrival = dose.time + lag;
-    if arrival <= t + TAD_EPS {
+    tad_referent_g(dose, lag, t)
+}
+
+/// [`tad_referent`] for a lag and a time of any type (#2786): **the** implementation, which the
+/// `f64` form above is the plain instance of, so the dual walk's `TAD` anchor (a recording or a
+/// jet carrying `∂TAD/∂lag = −1`) cannot drift from the value's. A recording type decides every
+/// comparison through its branch API and the wrap through [`wrap_into_period_g`].
+#[inline]
+pub(crate) fn tad_referent_g<G: crate::sens::num::PkNum>(
+    dose: &DoseEvent,
+    lag: G,
+    t: G,
+) -> Option<G> {
+    use crate::sens::num::BranchCmp::Le;
+    let arrival = G::from_f64(dose.time) + lag;
+    if arrival.br_cmp(Le, t + G::from_f64(TAD_EPS)) {
         if dose.ss && dose.ii > 0.0 {
-            let elapsed = t - arrival;
-            return Some(t - elapsed.rem_euclid(dose.ii));
+            return Some(t - wrap_into_period_g(t - arrival, dose.ii));
         }
         return Some(arrival);
     }
-    if ss_seeded_at_record(dose, lag) && dose.time <= t + TAD_EPS {
-        return Some(dose.time - ss_seed_phase(dose, lag));
+    if ss_seeded_at_record_g(dose, lag)
+        && G::from_f64(dose.time).br_cmp(Le, t + G::from_f64(TAD_EPS))
+    {
+        return Some(G::from_f64(dose.time) - ss_seed_phase_g(dose, lag));
     }
     None
+}
+
+/// `x.rem_euclid(ii)` (`ii > 0`) for a value of any type: the value `x − m·ii` with `m =
+/// ⌊x / ii⌋`, `∂/∂x = 1` and no derivative in `m` (a whole number the value fixes). A plain
+/// number takes the remainder `f64::rem_euclid` gives, bit for bit (`x − x.value_only()` is the
+/// zero that keeps `x`'s jet, so the value is the remainder itself); a recording type counts
+/// the periods through [`PkNum::br_floor_div`], whose two comparisons it guards.
+///
+/// [`PkNum::br_floor_div`]: crate::sens::num::PkNum::br_floor_div
+#[inline]
+pub(crate) fn wrap_into_period_g<G: crate::sens::num::PkNum>(x: G, ii: f64) -> G {
+    match x.nonrec_val() {
+        Some(v) => (x - x.value_only()) + G::from_f64(v.rem_euclid(ii)),
+        None => x - G::from_f64(x.br_floor_div(ii) * ii),
+    }
 }
 
 /// `TAD` at `t` — [`tad_referent`] folded over a dose list, `NaN` when no dose has a referent.
@@ -2993,5 +3023,106 @@ mod zero_order_binding_tests {
         crate::api::fit(&model, &pop, &model.default_params, &o).expect("fit");
         let n = MARKER_LOWERINGS.load(Relaxed) - before;
         assert_eq!(n, pop.subjects.len(), "lowerings per fit");
+    }
+}
+
+#[cfg(test)]
+mod tad_referent_g_tests {
+    use super::{tad_referent, tad_referent_g, wrap_into_period_g, TAD_EPS};
+    use crate::sens::dual2::Dual2;
+    use crate::types::DoseEvent;
+
+    /// The rule as `tad_referent` was written before it became the `f64` instance of
+    /// [`tad_referent_g`] -- the reference the instance must still equal bit for bit.
+    fn reference(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
+        let arrival = dose.time + lag;
+        if arrival <= t + TAD_EPS {
+            if dose.ss && dose.ii > 0.0 {
+                let elapsed = t - arrival;
+                return Some(t - elapsed.rem_euclid(dose.ii));
+            }
+            return Some(arrival);
+        }
+        if super::ss_seeded_at_record(dose, lag) && dose.time <= t + TAD_EPS {
+            return Some(dose.time - super::ss_seed_phase(dose, lag));
+        }
+        None
+    }
+
+    /// Both ends of the walk's anchor fold: the `f64` instance is the old rule bit for bit (on
+    /// dyadic and non-dyadic `II`, before the record, in the seeded window, past the arrival
+    /// and at later cycles, with `lag` below, at and above `II`), and over `Dual2` the value is
+    /// the same number with the lag's jet: `∂referent/∂lag = +1` where the referent follows the
+    /// arrival or the seed's previous pulse (`d.time - (II - lag)`), `0` where the phase is
+    /// clamped (`lag >= II`), and `∂/∂t = 0` for a wrapped steady-state referent. The derivative
+    /// is checked against a central difference of the `f64` rule, away from its kinks.
+    /// Mutations: no wrap at later cycles (`elapsed` for `wrap_into_period_g`) -> the bit
+    /// comparison and the later-cycle `∂/∂t` fail; `Lt` for the clamp in `ss_seed_phase_g` ->
+    /// the `lag >= II` jet row fails.
+    #[test]
+    fn the_generic_referent_is_the_f64_rule_and_carries_the_lag_jet() {
+        for ii in [12.0, 7.3, 0.1 + 0.2] {
+            for ss in [true, false] {
+                for lag in [0.0, 0.4, 3.0, 11.0, 12.5, 15.0] {
+                    let d = DoseEvent::new(5.0, 100.0, 1, 0.0, ss, if ss { ii } else { 0.0 });
+                    for k in 0..60 {
+                        let t = 4.7 + 0.9 * k as f64 + 0.013 * (k % 7) as f64;
+                        let old = reference(&d, lag, t);
+                        assert_eq!(
+                            tad_referent(&d, lag, t).map(f64::to_bits),
+                            old.map(f64::to_bits),
+                            "f64 instance: ii {ii} ss {ss} lag {lag} t {t}"
+                        );
+                        let got =
+                            tad_referent_g(&d, Dual2::<2>::var(lag, 0), Dual2::<2>::var(t, 1));
+                        assert_eq!(
+                            got.map(|g| g.value.to_bits()),
+                            old.map(f64::to_bits),
+                            "Dual2 value: ii {ii} ss {ss} lag {lag} t {t}"
+                        );
+                        let Some(g) = got else { continue };
+                        // The finite differences must not straddle a kink of the rule.
+                        let h = 1e-6;
+                        let near = |a: f64, b: f64| (a - b).abs() < 10.0 * h;
+                        let arrival = d.time + lag;
+                        let kink = near(t, arrival)
+                            || near(t, d.time)
+                            || (ss
+                                && ((t - arrival) / ii - ((t - arrival) / ii).round()).abs()
+                                    < 1e-5)
+                            || near(lag, ii);
+                        if kink {
+                            continue;
+                        }
+                        let fd_lag = (reference(&d, lag + h, t).unwrap()
+                            - reference(&d, lag - h, t).unwrap())
+                            / (2.0 * h);
+                        let fd_t = (reference(&d, lag, t + h).unwrap()
+                            - reference(&d, lag, t - h).unwrap())
+                            / (2.0 * h);
+                        assert!(
+                            (g.grad[0] - fd_lag).abs() < 1e-6 && (g.grad[1] - fd_t).abs() < 1e-6,
+                            "jet: ii {ii} ss {ss} lag {lag} t {t}: {:?} vs ({fd_lag}, {fd_t})",
+                            g.grad
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The wrap alone: a plain number takes `f64::rem_euclid`'s remainder bit for bit, and a
+    /// negative or sub-period value wraps the same way.
+    #[test]
+    fn the_period_wrap_is_rem_euclid_bit_for_bit() {
+        for ii in [12.0, 7.3, 0.3] {
+            for x in [-30.5, -0.2, 0.0, 0.2, 7.3, 11.99, 12.0, 25.7, 479.123] {
+                assert_eq!(
+                    wrap_into_period_g(x, ii).to_bits(),
+                    f64::rem_euclid(x, ii).to_bits(),
+                    "x {x} ii {ii}"
+                );
+            }
+        }
     }
 }

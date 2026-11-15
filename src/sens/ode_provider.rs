@@ -2104,14 +2104,15 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                 let dtinf = inf_window - w;
                 {
                     // Before the switch the active leg's clock (`t = T_inf`, pulse `0`); after
-                    // it the quiet leg's (`t = 0`, pulse `-T_inf`): the same `TAD`, a different
-                    // `TIME`.
+                    // it the quiet leg's, which re-opens at the MOVING window end: `TIME`
+                    // offset by `-dtinf`, pulse `-inf_window` -- the same `TAD`, a different
+                    // `TIME` (dropping the offset lost `dTIME/dT_inf` on a `TIME`-reading RHS).
                     let mut before = |x: &[T], s: T, out: &mut [T]| {
                         rhs_anchored_at(x, params, w, s, T::from_f64(0.0), out);
                         add_held(out);
                     };
                     let mut after = |x: &[T], s: T, out: &mut [T]| {
-                        rhs_anchored_at(x, params, T::from_f64(0.0), s, -w, out);
+                        rhs_anchored_at(x, params, T::from_f64(0.0), s - dtinf, -inf_window, out);
                         add_held(out);
                     };
                     cross_rate_switch_split(
@@ -2125,7 +2126,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                 }
                 let quiet = T::from_f64(dose.ii) - w;
                 let quiet_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
-                    rhs_anchored_at(us, ps, t, T::from_f64(0.0), -w, du);
+                    rhs_anchored_at(us, ps, t, -dtinf, -inf_window, du);
                     add_held(du);
                 };
                 let pj_quiet = ProgJac::new(program, f64::NAN, -w, chz);
@@ -2200,14 +2201,15 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                 let dtinf = inf_window - w;
                 {
                     // Before the switch the active leg's clock (`t = T_inf`, pulse `0`); after
-                    // it the quiet leg's (`t = 0`, pulse `-T_inf`): the same `TAD`, a different
-                    // `TIME`.
+                    // it the quiet leg's, which re-opens at the MOVING window end: `TIME`
+                    // offset by `-dtinf`, pulse `-inf_window` -- the same `TAD`, a different
+                    // `TIME` (dropping the offset lost `dTIME/dT_inf` on a `TIME`-reading RHS).
                     let mut before = |x: &[T], s: T, out: &mut [T]| {
                         rhs_anchored_at(x, params, w, s, T::from_f64(0.0), out);
                         add_held(out);
                     };
                     let mut after = |x: &[T], s: T, out: &mut [T]| {
-                        rhs_anchored_at(x, params, T::from_f64(0.0), s, -w, out);
+                        rhs_anchored_at(x, params, T::from_f64(0.0), s - dtinf, -inf_window, out);
                         add_held(out);
                     };
                     cross_rate_switch_split(
@@ -2221,7 +2223,7 @@ fn equilibrate_ss_state_g<T: crate::sens::num::vm::VmNum>(
                 }
                 if quiet.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
                     let quiet_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
-                        rhs_anchored_at(us, ps, t, T::from_f64(0.0), -w, du);
+                        rhs_anchored_at(us, ps, t, -dtinf, -inf_window, du);
                         add_held(du);
                     };
                     let pj_quiet = ProgJac::new(program, f64::NAN, -w, chz);
@@ -2499,6 +2501,9 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
             let dr = prepared.get(fi, 0);
             let onset = |tau: T| dr.frac * dr.prep.rate_onset_continued(tau, dose_mass);
             // The field at the kink without this pulse (the others' own onsets are their kinks).
+            // At the fixed clock `pos`: both sides of the switch share this field, so its
+            // explicit `dg/dt` cancels in the crossing (a `TIME`-reading row is exact, pinned by
+            // `a_lagged_ss_absorption_kink_on_a_clock_reading_rhs_has_the_exact_inner_hessian`).
             let mut base = |x: &[T], _s: T, out: &mut [T]| forced(x, params, pos, out);
             cross_rate_switch(&mut y, jet_only(total), cmt_idx, &onset, true, &mut base);
             at = pos;
@@ -2617,17 +2622,20 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
 /// this is the sensitivity of a continuous flow's endpoint to its own duration, needed when
 /// the duration itself (not a forcing) carries a derivative jet: the SS+lagtime pre-arrival
 /// phase seed (#486, `ss_state_at_phase_g`), where `phase = II − lag` and its active/quiet
-/// split are dual-valued durations advanced from an otherwise lag-invariant trough. `rhs` is
-/// evaluated at the fixed `t_val` (the step's offset `s` is ignored); its possible constant
-/// forcing (e.g. the SS active window) rides along in the velocity.
+/// split are dual-valued durations advanced from an otherwise lag-invariant trough. `rhs(x, p,
+/// t_val, s, out)` is the field at the fixed clock `t_val` **plus the step's offset `s`**: a field
+/// that reads the clock (`TIME`, `TAD`) has an explicit time derivative, which is the `∂g/∂t` of
+/// the second-order term `½·(J·g + ∂g/∂t)·dt²` (dropped, it left the second lag derivative of a
+/// clock-reading field wrong by 5e-4 while every first derivative was exact). Its possible
+/// constant forcing (e.g. the SS active window) rides along in the velocity.
 fn extend_flow_by_dual_duration_g<T: crate::sens::num::vm::VmNum>(
     u: &mut [T],
     dt: T,
-    rhs: impl Fn(&[T], &[T], T, &mut [T]),
+    rhs: impl Fn(&[T], &[T], T, T, &mut [T]),
     params: &[T],
     t_val: T,
 ) {
-    let mut f = |x: &[T], _s: T, out: &mut [T]| rhs(x, params, t_val, out);
+    let mut f = |x: &[T], s: T, out: &mut [T]| rhs(x, params, t_val, s, out);
     let y = rk4_dual(u, T::from_f64(0.0), dt, &mut f);
     u.copy_from_slice(&y);
 }
@@ -2709,8 +2717,12 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
         );
         crate::ode::predictions::mask_chz(chz, du);
     };
+    // Each leg's field at the clock `t` plus a jet-only offset `s` (the extension's step).
+    let bare_rhs_s = |us: &[T], ps: &[T], t: T, s: T, du: &mut [T]| {
+        rhs_anchored_at(us, ps, t, s, tf(0.0), du);
+    };
     let bare_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
-        rhs_anchored_at(us, ps, t, tf(0.0), tf(0.0), du);
+        bare_rhs_s(us, ps, t, tf(0.0), du);
     };
     // Integrate `rhs` over `[0, end]`, the end a time that may move with the inputs.
     let pj_bare = ProgJac::new(program, f64::NAN, T::from_f64(0.0), chz);
@@ -2737,10 +2749,16 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
         };
         let on = held.map_or(inf_rate, |h| h + inf_rate);
         let t_inf_v = inf_window.value_only();
-        // The quiet leg's clock re-opens at `0` a window after the pulse (`TAD` anchor `-T_inf`).
-        let quiet_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
-            rhs_anchored_at(us, ps, t, tf(0.0), -t_inf_v, du);
+        // The quiet leg's clock re-opens at `0` at the window's end -- which moves with the
+        // window's jet `dtinf`: its local `TIME` is `t - dtinf` and its `TAD` anchor
+        // `-inf_window` (value `-T_inf`), so `TAD` stays `t + T_inf`.
+        let dtinf = inf_window - t_inf_v;
+        let quiet_rhs_s = |us: &[T], ps: &[T], t: T, s: T, du: &mut [T]| {
+            rhs_anchored_at(us, ps, t, s - dtinf, -inf_window, du);
             add_held(du);
+        };
+        let quiet_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
+            quiet_rhs_s(us, ps, t, tf(0.0), du);
         };
         let pj_quiet = ProgJac::new(program, f64::NAN, -t_inf_v, chz);
         let active_v = if phase_v.br_cmp(Lt, t_inf_v) {
@@ -2748,25 +2766,28 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
         } else {
             t_inf_v
         };
-        let rhs_active = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
-            bare_rhs(us, ps, t, du);
+        let rhs_active_s = |us: &[T], ps: &[T], t: T, s: T, du: &mut [T]| {
+            bare_rhs_s(us, ps, t, s, du);
             if cmt_idx < du.len() {
                 du[cmt_idx] = du[cmt_idx] + on;
             }
+        };
+        let rhs_active = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
+            rhs_active_s(us, ps, t, tf(0.0), du);
         };
         flow(&mut u, &rhs_active, active_v, &pj_bare);
         if phase_v.br_cmp(Le, t_inf_v) {
             // Still inside the active window at `phase`: extend along the SAME (active)
             // flow by the remaining dual part of `phase` itself.
             let dt = phase - phase_v;
-            extend_flow_by_dual_duration_g::<T>(&mut u, dt, rhs_active, params, active_v);
+            extend_flow_by_dual_duration_g::<T>(&mut u, dt, rhs_active_s, params, active_v);
         } else {
             // Crossing the active/quiet boundary: the window itself may carry a jet
             // (modeled `D`/`R`, or `F*duration`) -- cross it with the same rate switch
             // `equilibrate_ss_state_g`'s cycle loop uses (`d_off = inf_window - t_inf_val`),
             // the field before it on the active leg's clock (`t = T_inf`, pulse `0`), after it
-            // on the quiet leg's (`t = 0`, pulse `-T_inf`): the same `TAD`, a different `TIME`.
-            let dtinf = inf_window - t_inf_v;
+            // on the quiet leg's (from the moving window end: `TIME` offset `-dtinf`, pulse
+            // `-inf_window`): the same `TAD`, a different `TIME`.
             // Constant infusion rate => no onset time-variation (#880).
             {
                 let mut before = |x: &[T], s: T, out: &mut [T]| {
@@ -2774,7 +2795,7 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
                     add_held(out);
                 };
                 let mut after = |x: &[T], s: T, out: &mut [T]| {
-                    rhs_anchored_at(x, params, tf(0.0), s, -t_inf_v, out);
+                    rhs_anchored_at(x, params, tf(0.0), s - dtinf, -inf_window, out);
                     add_held(out);
                 };
                 cross_rate_switch_split(
@@ -2792,13 +2813,13 @@ fn ss_state_at_phase_g<T: crate::sens::num::vm::VmNum>(
             // there; the quiet leg runs from that value to `phase`, so only `phase`'s jet
             // extends it.
             let dt_quiet = phase - phase_v;
-            extend_flow_by_dual_duration_g::<T>(&mut u, dt_quiet, quiet_rhs, params, quiet_v);
+            extend_flow_by_dual_duration_g::<T>(&mut u, dt_quiet, quiet_rhs_s, params, quiet_v);
         }
     } else {
         u[cmt_idx] = u[cmt_idx] + f_bio * T::from_f64(dose.amt);
         flow(&mut u, &bare_rhs, phase_v, &pj_bare);
         let dt = phase - phase_v;
-        extend_flow_by_dual_duration_g::<T>(&mut u, dt, bare_rhs, params, phase_v);
+        extend_flow_by_dual_duration_g::<T>(&mut u, dt, bare_rhs_s, params, phase_v);
     }
     u
 }
@@ -3631,6 +3652,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
     // than competing with it for the latest (the seed is the earliest *arrival*, which a lagged
     // `SS=1` dose's pre-arrival referent -- the previous cycle's pulse -- precedes).
     let mut anchor_is_seed = true;
+    let ss_tad_doses = program.pk_reads_tad() && subject.doses.iter().any(|d| d.ss && d.ii > 0.0);
     {
         let mut earliest = tf(f64::INFINITY);
         for (k, d) in subject.doses.iter().enumerate() {
@@ -3700,6 +3722,28 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             (None, _) => next_record_params[p].map(&params_at).unwrap_or(last_params),
         };
         if t_event.br_cmp(Gt, cur_t) {
+            // The segment's `TAD` anchor over every steady-state dose, at the segment start: the
+            // same per-dose rule the value walks fold (`dosing::tad_referent`, here over `T`).
+            // An `SS=1` dose's referent is the pulse of whichever cycle the start falls in --
+            // the previous cycle's before the lagged arrival, each later cycle's after it -- so
+            // it moves at every cycle start, which the arrival event alone does not carry. Only
+            // an RHS reading `TAD` consumes the anchor; other doses keep their arrival, taken at
+            // the dose events.
+            if ss_tad_doses {
+                for (k, d) in subject.doses.iter().enumerate() {
+                    if !(d.ss && d.ii > 0.0) {
+                        continue;
+                    }
+                    if let Some(r) = crate::dosing::tad_referent_g(d, lag_dual(k), cur_t) {
+                        last_dose_eff = if anchor_is_seed {
+                            r
+                        } else {
+                            later_arrival(last_dose_eff, r)
+                        };
+                        anchor_is_seed = false;
+                    }
+                }
+            }
             // The segment start: its `f64` twin's reset gate (#1576, #1587, #1586), once per
             // segment — read by the infusion and zero-order windows and the forcing below.
             let gate =
@@ -4255,20 +4299,18 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                             let lag = pk_at_dose[idx][dose_lag_slot[idx]];
                             let dlag = jet_only(lag);
                             if crate::dosing::ss_equilibrates_at_arrival_g(d, lag_val(idx)) {
-                                let bare_rhs = |us: &[T], ps: &[T], t: T, du: &mut [T]| {
-                                    eval_rhs_anchored::<T>(
+                                // The field at the clock `t_event + s` (the flow-back's step
+                                // offset), `TAD` from the arrival: the extension's explicit time
+                                // derivative is the field's own, as everywhere a jet-only duration
+                                // extends a flow.
+                                let bare_rhs = |us: &[T], ps: &[T], t: T, s: T, du: &mut [T]| {
+                                    eval_rhs_at_offset::<T>(
                                         program,
                                         us,
                                         ps,
                                         t,
+                                        s,
                                         first_dose_time,
-                                        // Constant, deliberately: an SS dose whose RHS reads
-                                        // `TAD` declines to FD through the broad
-                                        // `uses_time_vars` SS gate, so no `TAD` jet is
-                                        // observable here — and the SS anchor's own wrap
-                                        // convention inside the pre-arrival window is
-                                        // unresolved (#1126). Lifting a jet we cannot
-                                        // validate would be worse than lifting none.
                                         t_event,
                                         du,
                                         &mut vars_cell.borrow_mut(),
@@ -4752,15 +4794,8 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             };
             // From the record to the lagged arrival `TAD` reads the previous cycle's pulse, at
             // `d.time - phase` (`dosing::tad_referent`, #1126) -- the instant the seed below
-            // advances from, so the state and the clock it is read on come from one number. It
-            // carries the lag's jet (`∂TAD/∂lag = -1`) like an arrival does.
-            let referent = T::from_f64(d.time) - phase;
-            last_dose_eff = if anchor_is_seed {
-                referent
-            } else {
-                later_arrival(last_dose_eff, referent)
-            };
-            anchor_is_seed = false;
+            // advances from. The segment-start anchor fold above takes it from the same rule, at
+            // the first segment this event opens.
             // A bolus into a built-in absorption compartment (#2786) has no bolus to place and no
             // phase to advance: its periodic forcing is the whole input, so the record's state is
             // the fixed point of the cycle that starts at the record (the dose's own pulse

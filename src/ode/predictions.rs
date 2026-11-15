@@ -4252,10 +4252,10 @@ fn tad_anchor(subject: &Subject, dose_lagtimes: &[f64], t_start: f64) -> f64 {
 /// Two are deliberately outside that, and both are recorded rather than left implicit:
 /// [`crate::types::Subject::data_tad`] (#1182/#1273) answers the lag-free *data* question
 /// with its own tie-convention switch — see the note on [`crate::dosing::tad_referent`];
-/// and the dual walk's anchors in `sens::ode_provider` (segment start, and the pre/post
-/// sides of a saltation) are a different shape (a running `max` over arrivals, not a
-/// per-segment re-fold) and unreachable for this model class behind the
-/// `has_ss && reads_model_time` FD gate — see #1272, which is where that is tracked.
+/// and the dual walk's running `max` over arrivals in `sens::ode_provider`, which takes
+/// every `SS=1` dose's referent at each segment start from [`crate::dosing::tad_referent_g`]
+/// (the same per-dose rule over its own number type), so the cycle wrap cannot drift from
+/// this fold.
 ///
 /// `dose_lagtimes` may be **shorter than `doses`, including empty** — a missing entry is
 /// zero lag, matching [`active_infusions`] and `api::output_columns::tad_at_time`. An
