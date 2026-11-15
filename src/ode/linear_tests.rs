@@ -1,6 +1,8 @@
 use super::*;
 use crate::ode::solver::{solve_ode, OdeMethod, OdeSolverOptions};
 use crate::sens::dual2::Dual2;
+#[allow(unused_imports)]
+use crate::sens::num::{NonRecRead, NonRecording};
 
 /// nalgebra's own `exp`. It runs the **same** algorithm (degree-13 Padé, Higham 2005) — it
 /// matches `expm_g` bit-for-bit on two of the four fixtures below — so it checks the wiring
@@ -965,7 +967,7 @@ mod pre_expm {
     #![allow(clippy::all)]
     use super::super::{MAX_SQUARINGS, PADE13, SELF_CHECK_RTOL, THETA13};
     use crate::sens::linsolve::{lu_factor_in_place_g, lu_solve_in_place_g};
-    use crate::sens::num::PkNum;
+    use crate::sens::num::{NonRecRead, PkNum};
 
     /// Row-major `n×n` product `x·y`.
     ///
@@ -1030,12 +1032,12 @@ mod pre_expm {
         if n == 0 {
             return Some(Vec::new());
         }
-        if a.iter().any(|x| !x.val().is_finite()) {
+        if a.iter().any(|x| !x.plain().is_finite()) {
             return None;
         }
         // ‖A‖₁ — max absolute column sum of the value part.
         let norm1 = (0..n)
-            .map(|j| (0..n).map(|i| a[i * n + j].val().abs()).sum::<f64>())
+            .map(|j| (0..n).map(|i| a[i * n + j].plain().abs()).sum::<f64>())
             .fold(0.0_f64, f64::max);
         let s = if norm1 > THETA13 {
             let s = (norm1 / THETA13).log2().ceil();
@@ -1093,7 +1095,7 @@ mod pre_expm {
         for _ in 0..s {
             r = matmul_old(&r, &r, n);
         }
-        if r.iter().any(|x| !x.val().is_finite() || !x.jets_finite()) {
+        if r.iter().any(|x| !x.plain().is_finite() || !x.jets_finite()) {
             return None;
         }
         Some(r)
@@ -1141,7 +1143,7 @@ mod pre_expm {
         let magnitude = b
             .iter()
             .chain(u0)
-            .fold(1.0_f64, |m, x| m.max(x.val().abs()).max(x.jet_max_abs()));
+            .fold(1.0_f64, |m, x| m.max(x.plain().abs()).max(x.jet_max_abs()));
         if !magnitude.is_finite() {
             return None;
         }
@@ -1160,7 +1162,7 @@ mod pre_expm {
                 a[i * n + j] = (col[i] - b[i]) * inv_scale;
             }
         }
-        if a.iter().chain(&b).any(|x| !x.val().is_finite()) {
+        if a.iter().chain(&b).any(|x| !x.plain().is_finite()) {
             return None;
         }
 
@@ -1171,7 +1173,7 @@ mod pre_expm {
             rhs(x, params, T::from_f64(t), direct);
             (0..n).all(|i| {
                 let mut assembled = b[i];
-                let mut scale = b[i].val().abs();
+                let mut scale = b[i].plain().abs();
                 let mut jet_scale = b[i].jet_max_abs();
                 for j in 0..n {
                     let (aij, xj) = (a[i * n + j], x[j]);
@@ -1183,14 +1185,14 @@ mod pre_expm {
                         continue;
                     }
                     assembled = assembled + aij * xj;
-                    scale += (aij.val() * xj.val()).abs();
-                    jet_scale += aij.jet_max_abs() * xj.val().abs()
-                        + aij.val().abs() * xj.jet_max_abs()
+                    scale += (aij.plain() * xj.plain()).abs();
+                    jet_scale += aij.jet_max_abs() * xj.plain().abs()
+                        + aij.plain().abs() * xj.jet_max_abs()
                         + aij.jet_max_abs() * xj.jet_max_abs();
                 }
                 let diff = direct[i] - assembled;
-                direct[i].val().is_finite()
-                    && diff.val().abs() <= SELF_CHECK_RTOL * scale + 1e-300
+                direct[i].plain().is_finite()
+                    && diff.plain().abs() <= SELF_CHECK_RTOL * scale + 1e-300
                     && diff.jet_max_abs() <= SELF_CHECK_RTOL * jet_scale + 1e-300
             })
         };
@@ -1209,12 +1211,12 @@ mod pre_expm {
         // ‖M‖, and with it the squaring count: `du/dt = 1e20 − u` over unit time needs ~64
         // squarings and was declined. Scaling the column to the rates' magnitude leaves the
         // squaring count to `A`, where it belongs; `c` is a plain constant, so the jets are exact.
-        let a_max = a.iter().fold(0.0_f64, |acc, x| acc.max(x.val().abs()));
+        let a_max = a.iter().fold(0.0_f64, |acc, x| acc.max(x.plain().abs()));
         // Jets included: a forcing whose value is 0 but whose derivative is 1e292 leaves the
         // generator's value at zero (no squarings) while the Padé numerator multiplies that jet by
         // ~3e16 and overflows it.
         let b_max = b.iter().fold(0.0_f64, |acc, x| {
-            acc.max(x.val().abs()).max(x.jet_max_abs())
+            acc.max(x.plain().abs()).max(x.jet_max_abs())
         });
         let c = (b_max / a_max.max(1.0)).max(1.0);
         let inv_c = T::from_f64(1.0 / c);

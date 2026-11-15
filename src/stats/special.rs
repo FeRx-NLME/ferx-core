@@ -8,6 +8,9 @@
 //! ambiguity, so a generic `PkNum`/`Dual2` instantiation differentiates them
 //! cleanly. (`normal_inv_cdf` is `f64`-only and off the gradient path.)
 
+use crate::sens::num::BranchCmp;
+#[cfg(test)]
+use crate::sens::num::NonRecording;
 use crate::sens::num::PkNum;
 
 /// 1 / sqrt(2)
@@ -707,10 +710,11 @@ pub fn regularized_gamma_q<T: PkNum>(a: T, x: T) -> T {
 /// [`gamma_pq_partial`] takes from this same body.
 pub(crate) fn gamma_pq_g<T: PkNum>(a: T, x: T, upper: bool) -> T {
     let one = T::from_f64(1.0);
-    if x.val() <= 0.0 {
+    // Branches through the branch API: a recording type decides on guards, never on a value.
+    if x.br_cmp_c(BranchCmp::Le, 0.0) {
         return if upper { one } else { T::from_f64(0.0) };
     }
-    match (x.val() < a.val() + 1.0, upper) {
+    match (x.br_cmp(BranchCmp::Lt, a + one), upper) {
         (true, false) => gamma_p_series(a, x),
         (true, true) => one - gamma_p_series(a, x),
         (false, false) => one - gamma_q_cf(a, x),
@@ -888,7 +892,10 @@ fn gamma_p_series<T: PkNum>(a: T, x: T) -> T {
         // Convergence is judged on the value part; the dual jets of `sum` are
         // resolved at least as tightly (the per-term derivatives decay with the
         // term), and the gradient-agreement tests confirm it.
-        if del.val().abs() < sum.val().abs() * EPS {
+        if del
+            .abs()
+            .br_cmp(BranchCmp::Lt, sum.abs() * T::from_f64(EPS))
+        {
             break;
         }
     }
@@ -911,8 +918,10 @@ fn gamma_p_series<T: PkNum>(a: T, x: T) -> T {
 /// (a transit `n` gone `NaN`) or `a = ∞` (`P(∞, ∞)` is indeterminate) falls through to the
 /// iteration and stays `NaN`, rather than reporting a confident `P = 1` (#2767 review r1 #3).
 fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
-    let av = a.val();
-    if x.val() == f64::INFINITY && av > 0.0 && av.is_finite() {
+    if x.br_cmp_c(BranchCmp::Eq, f64::INFINITY)
+        && a.br_cmp_c(BranchCmp::Gt, 0.0)
+        && a.br_abs_lt(f64::INFINITY)
+    {
         return T::from_f64(0.0);
     }
     const EPS: f64 = 1e-15;
@@ -944,17 +953,17 @@ fn gamma_q_cf<T: PkNum>(a: T, x: T) -> T {
         // Guard a vanishing denominator (Lentz). This fires with probability ~0 for
         // valid `a, x` (here `d, c` are O(1)); the constant rescue zeros the local
         // jet, but the flat region is never reached on the tested paths.
-        if d.val().abs() < FPMIN {
+        if d.br_abs_lt(FPMIN) {
             d = T::from_f64(FPMIN);
         }
         c = b + an / c;
-        if c.val().abs() < FPMIN {
+        if c.br_abs_lt(FPMIN) {
             c = T::from_f64(FPMIN);
         }
         d = one / d;
         let del = d * c;
         h = h * del;
-        if (del.val() - 1.0).abs() < EPS {
+        if (del - one).br_abs_lt(EPS) {
             settled += 1;
             if settled >= SETTLE {
                 break;

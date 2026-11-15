@@ -20,6 +20,7 @@
 use super::num::{bateman, one_minus_exp_rel, PkNum};
 use crate::pk::event_driven::{Event, EventKind, EventSchedule};
 use crate::pk::topology::Channel;
+use crate::sens::num::NonRecRead;
 use crate::types::{DoseEvent, PkModel, Subject};
 
 /// Whether a clearance or central volume leaves the closed forms with no answer
@@ -1404,7 +1405,7 @@ pub(crate) fn ss_dual_cycle_should_stop<T: PkNum>(
         return ss_cycle_converged_recorded(cycle, u, prev_t);
     }
     for (c, x) in cur.iter_mut().zip(u) {
-        *c = x.val();
+        *c = x.plain();
     }
     if cycle > 0
         && crate::dosing::ss_cycle_converged(cur, prev, crate::dosing::SS_EQUILIBRATION_TOL)
@@ -1666,7 +1667,7 @@ fn ss_state_at_phase_g<T: PkNum>(
         apply_step_g(&mut state, phase, pk, pk_model, (zero, zero, zero, zero));
         return state;
     }
-    let phase_v = phase.seen_value();
+    let phase_v = phase.br_value();
     let cycle = dose.ss_cycle_doses();
     let cycle_inf = cycle_window_duals(dose, inf, cycle.len());
     let (_, r) = infusion_window_g(&cycle[0], cycle_inf[0], pk);
@@ -1678,7 +1679,7 @@ fn ss_state_at_phase_g<T: PkNum>(
         vec![0.0, phase_v]
     };
     // The arrival: value 0 where recorded, the lag's jet (and its shift, on a replay at another lag).
-    let arrival = lag - T::from_f64(lag.seen_value());
+    let arrival = lag - T::from_f64(lag.br_value());
     propagate_bounds_g(
         &mut state,
         &bounds,

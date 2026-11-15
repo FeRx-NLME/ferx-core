@@ -19,6 +19,7 @@
 //! The whole module is gated behind `markov` (which implies `survival`).
 
 use crate::markov::{ctmm_data_term, StateObs};
+use crate::sens::num::NonRecRead;
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{CompiledModel, EndpointLikelihood, GeneratorFn, ObsRecord, Subject};
 use std::collections::HashMap;
@@ -680,7 +681,7 @@ fn inhomogeneous_nll_g<T: crate::sens::num::vm::VmNum>(
                     *o = acc;
                 }
             } else {
-                let (lo, hi, w_hi) = sub_bracket(tau.val(), dt);
+                let (lo, hi, w_hi) = sub_bracket(tau.plain(), dt);
                 let w_hi = T::from_f64(w_hi);
                 for (o, (x, y)) in st.iter_mut().zip(nodes[lo].iter().zip(nodes[hi].iter())) {
                     *o = *x + (*y - *x) * w_hi;

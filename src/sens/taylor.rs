@@ -235,6 +235,16 @@ impl<const P: usize, const ORD: usize, const L: usize> Div for Taylor<P, ORD, L>
 impl<const P: usize, const ORD: usize, const L: usize> crate::sens::num::RecHooks
     for Taylor<P, ORD, L>
 {
+    crate::sens::num::plain_rechooks_methods!();
+}
+
+impl<const P: usize, const ORD: usize, const L: usize> crate::sens::num::NonRecording
+    for Taylor<P, ORD, L>
+{
+    #[inline]
+    fn val(self) -> f64 {
+        self.c[0]
+    }
 }
 
 impl<const P: usize, const ORD: usize, const L: usize> PkNum for Taylor<P, ORD, L> {
@@ -250,9 +260,8 @@ impl<const P: usize, const ORD: usize, const L: usize> PkNum for Taylor<P, ORD, 
     fn var(x: f64, dim: usize) -> Self {
         Self::seed(x, dim)
     }
-    fn val(self) -> f64 {
-        self.c[0]
-    }
+    crate::sens::num::plain_pknum_methods!();
+    crate::sens::num::plain_sin_exprel!();
     fn exp(self) -> Self {
         let e = self.c[0].exp();
         self.compose(&[e; MAX_ORD + 1][..=ORD])

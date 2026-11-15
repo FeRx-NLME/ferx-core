@@ -35,6 +35,7 @@
 use crate::ode::predictions::{input_rate_consumes_cmt, OdeReadout, OdeSpec, PreparedForcings};
 use crate::ode::solver::{solve_ode_g_certified, solve_ode_g_with_auto_state, OdeAutoSwitchState};
 use crate::pk::absorption::{InputRateForcing, PreparedInputRate};
+use crate::sens::num::NonRecRead;
 use crate::types::{CompiledModel, ScalingSpec, Subject, PK_IDX_F, PK_IDX_LAGTIME};
 use std::cell::RefCell;
 
@@ -344,17 +345,14 @@ fn cmp_times<T: crate::sens::num::PkNum>(a: T, b: T) -> std::cmp::Ordering {
     use crate::sens::num::BranchCmp::Lt;
     use std::cmp::Ordering;
     if !T::RECORDS_BRANCHES {
-        return a.val().total_cmp(&b.val());
+        return a.plain().total_cmp(&b.plain());
     }
     if a.br_cmp(Lt, b) {
         Ordering::Less
     } else if b.br_cmp(Lt, a) {
         Ordering::Greater
     } else {
-        match (
-            crate::sens::num::RecHooks::seen_value(a).is_nan(),
-            crate::sens::num::RecHooks::seen_value(b).is_nan(),
-        ) {
+        match (a.br_is_nan(), b.br_is_nan()) {
             (true, false) => Ordering::Greater,
             (false, true) => Ordering::Less,
             _ => Ordering::Equal,
@@ -1640,7 +1638,7 @@ pub(crate) fn eval_rhs_at_offset<T: crate::sens::num::vm::VmNum>(
     let (t, dt) = if T::RECORDS_BRANCHES {
         (0.0, t + dt)
     } else {
-        (t.val(), dt)
+        (t.plain(), dt)
     };
     let tafd = if first_dose_time.is_finite() {
         t - first_dose_time
@@ -1874,7 +1872,7 @@ pub(crate) fn rk4_dual<T: crate::sens::num::PkNum>(
     h: T,
     f: &mut OffsetRhs<'_, T>,
 ) -> Vec<T> {
-    if h.is_constant() && h.val() == 0.0 {
+    if h.is_constant() && h.nonrec_val() == Some(0.0) {
         return u.to_vec();
     }
     let n = u.len();
@@ -1914,7 +1912,7 @@ fn cross_moving_boundary<T: crate::sens::num::PkNum>(
     post: &mut OffsetRhs<'_, T>,
     jump: &dyn Fn(&mut [T]),
 ) {
-    if delta.is_constant() && delta.val() == 0.0 {
+    if delta.is_constant() && delta.nonrec_val() == Some(0.0) {
         jump(u);
         return;
     }
@@ -2452,7 +2450,7 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
             kinks.push((total, fi));
         }
     }
-    kinks.sort_by(|a, b| a.0.seen_value().total_cmp(&b.0.seen_value()));
+    kinks.sort_by(|a, b| cmp_times(a.0, b.0));
     let dose_mass = f_bio * T::from_f64(dose.amt);
     // One stretch of the forced cycle, from nominal `a` to nominal `b` (times that move with the
     // lag on a recording type, like the phase seed's).
@@ -2512,13 +2510,26 @@ fn equilibrate_ss_input_rate_state_g<T: crate::sens::num::vm::VmNum>(
         .input_rate
         .iter()
         .find(|f| f.cmt == dose.cmt_idx())
-        .map_or(0.0, |f| f.route_lag(params).seen_value());
+        .map_or(T::from_f64(0.0), |f| f.route_lag(params));
+    // The clamped lag as a constant of the point (no derivative: the f64 twin's), computed from
+    // the inputs on every evaluation with its comparisons as branches, not read as a value.
     let train_lag = if lag.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
-        lag.seen_value().min((ii - route0).max(0.0))
+        let room = T::from_f64(ii) - route0;
+        let room = if room.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
+            room
+        } else {
+            T::from_f64(0.0)
+        };
+        if lag.br_cmp(crate::sens::num::BranchCmp::Lt, room) {
+            lag
+        } else {
+            room
+        }
+        .value_only()
     } else {
-        0.0
+        T::from_f64(0.0)
     };
-    let lags = vec![T::from_f64(train_lag); n_pulses];
+    let lags = vec![train_lag; n_pulses];
     let fbios = vec![f_bio; n_pulses];
     // Non-SS synthetic pulses: no `SS=1` record and no EVID=3/4 reset, so nothing to reach.
     let gate = crate::ode::predictions::ResetGate::at_segment(
@@ -3844,8 +3855,8 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             // exactly the input it is meant to tolerate.
             debug_assert!(
                 T::RECORDS_BRANCHES
-                    || post_anchor.val() == t_event.val()
-                    || !t_event.val().is_finite(),
+                    || post_anchor.plain() == t_event.plain()
+                    || !t_event.plain().is_finite(),
                 "the dual arrival must equal the K_DOSE timeline entry it replaces"
             );
             // #1060 / #1068: the covariate snapshot **both** sides of this moving boundary
@@ -4205,8 +4216,8 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                                 // (`predictions.rs` `last_dose_eff_ed`).
                                 debug_assert!(
                                     T::RECORDS_BRANCHES
-                                        || last_dose_eff.val().is_finite()
-                                        || !t_event.val().is_finite(),
+                                        || last_dose_eff.plain().is_finite()
+                                        || !t_event.plain().is_finite(),
                                     "last_dose_eff is seeded to the first arrival (#1073), so \
                                      it must be finite wherever this arrival is"
                                 );
@@ -4310,8 +4321,8 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         // review #3).
                         debug_assert!(
                             T::RECORDS_BRANCHES
-                                || last_dose_eff.val().is_finite()
-                                || !t_event.val().is_finite(),
+                                || last_dose_eff.plain().is_finite()
+                                || !t_event.plain().is_finite(),
                             "last_dose_eff is seeded to the first arrival (#1073), so it \
                              must be finite wherever this arrival is"
                         );

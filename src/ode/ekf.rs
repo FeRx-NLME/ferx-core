@@ -31,6 +31,7 @@ use crate::ode::solver::{solve_ode_g_with_auto_state, OdeAutoSwitchState, OdeSol
 use crate::sens::jet::DualT;
 use crate::sens::num::vm::VmNum;
 use crate::sens::num::BranchCmp;
+use crate::sens::num::NonRecRead;
 use crate::types::DoseEvent;
 
 /// A right-hand side `du = f(u, p, t)` the filter can evaluate over any number type, so the
@@ -250,7 +251,7 @@ fn propagate_covariance_between<T: VmNum, R: EkfRhs>(
     if dt.br_cmp_c(BranchCmp::Le, 1e-15) {
         return p_mat;
     }
-    let n_steps = ((dt.seen_value() / RICCATI_DT_MAX).ceil() as usize).max(1);
+    let n_steps = ((dt.br_value() / RICCATI_DT_MAX).ceil() as usize).max(1);
     if !dt.is_constant() {
         // The verdicts that give `n_steps`: `(n − 1)·Δ < dt ≤ n·Δ` (`dt / Δ` is exact, Δ a
         // power of two).
@@ -376,7 +377,7 @@ fn jet_part<T: VmNum>(t: T) -> Option<T> {
 /// A solve's saved point's time as a number of the filter's type: the span's (possibly
 /// moving) `end` when it is that end, the constant otherwise.
 fn point_time<T: VmNum>(t: f64, end: T) -> T {
-    if t.to_bits() == end.seen_value().to_bits() {
+    if t.to_bits() == end.br_value().to_bits() {
         end
     } else {
         T::from_f64(t)
@@ -448,7 +449,7 @@ fn equilibrate_ss_ekf<T: VmNum, R: EkfRhs>(
             (zero, t1),
             params,
             anchors,
-            &[t1.seen_value()],
+            &[t1.br_value()],
             opts,
         );
         let mut p_out = p_mat;
@@ -507,6 +508,9 @@ fn equilibrate_ss_ekf<T: VmNum, R: EkfRhs>(
 /// [`SS_EQUILIBRATION_CYCLES`] is spent, with the #867 non-convergence warning on a spent cap.
 /// The pair and what it is for a compiled plan's derivatives (`Found`): the fixed point of
 /// `cycle`, or the capped train's last iterate.
+///
+/// Non-recording: run at `f64` by a recording's run-time search (`T::ss_fixed_point`'s
+/// `solve`), and at `T` only in `equilibrate_ss_ekf`'s `!T::RECORDS_BRANCHES` arm.
 fn ss_train<T: VmNum>(
     n: usize,
     cycle: &dyn Fn(&[T]) -> Option<Vec<T>>,
@@ -524,7 +528,7 @@ fn ss_train<T: VmNum>(
         z = cycle(&z)?;
         cycles_run = m + 1;
         for (x, y) in pair.iter_mut().zip(&z) {
-            *x = y.val();
+            *x = y.plain();
         }
         if tracker.should_stop(m, &pair) {
             converged = true;
@@ -747,7 +751,7 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
     // caller's default point, so overwrite it with NaN ipreds rather than returning a
     // finite-looking filter pass built on a timeline that could not be ordered.
     if crate::ode::predictions::abandon_non_finite_timeline(
-        break_times.iter().map(|t| t.seen_value()),
+        break_times.iter().map(|t| t.br_value()),
         None,
     ) {
         // `fill`, not a per-field loop: one spelling of the struct, so a field added to
@@ -781,7 +785,7 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
         // The breaks as numbers of the filter's type (a window end moves), and their values
         // for the record reads and the infusions' membership, which the guarded order fixes.
         let (t_start_g, t_end_g) = (break_times[k], break_times[k + 1]);
-        let (t_start, t_end) = (t_start_g.seen_value(), t_end_g.seen_value());
+        let (t_start, t_end) = (t_start_g.br_value(), t_end_g.br_value());
 
         // Records read *at* t_start — the whole `EVENT_MATCH_TOL` band, through the same
         // helper as the ODE engines (#1226). A dose matches a break symmetrically within
@@ -920,7 +924,7 @@ pub(crate) fn solve_ekf_g<T: VmNum, R: EkfRhs>(
         // The EKF path has no per-dose lagtimes and no system resets. Membership is read on
         // the values (the guarded order fixes it); the rate and window carry `F` and a
         // modeled `D`/`R` ([`infusion_of`]).
-        let f_vals: Vec<f64> = dose_f_bio.iter().map(|f| f.seen_value()).collect();
+        let f_vals: Vec<f64> = dose_f_bio.iter().map(|f| f.br_value()).collect();
         let active: Vec<(usize, T)> = active_infusion_doses(
             &[],
             doses,
@@ -1042,12 +1046,12 @@ mod tests {
         fn eval<U: VmNum>(&self, u: &[U], p: &[U], t: U, anchors: Anchors<U>, du: &mut [U]) {
             let mut ext = vec![f64::NAN; crate::types::MAX_PK_PARAMS + 2];
             for (e, x) in ext.iter_mut().zip(p).take(crate::types::MAX_PK_PARAMS) {
-                *e = x.val();
+                *e = x.plain();
             }
             ext[crate::types::MAX_PK_PARAMS] = anchors.0;
-            ext[crate::types::MAX_PK_PARAMS + 1] = anchors.1.val();
-            let (n, t0) = (u.len(), t.val());
-            let u0: Vec<f64> = u.iter().map(|x| x.val()).collect();
+            ext[crate::types::MAX_PK_PARAMS + 1] = anchors.1.plain();
+            let (n, t0) = (u.len(), t.plain());
+            let u0: Vec<f64> = u.iter().map(|x| x.plain()).collect();
             let mut f0 = vec![0.0; n];
             (self.0)(&u0, &ext, t0, &mut f0);
             let mut jac = vec![0.0; n * n];

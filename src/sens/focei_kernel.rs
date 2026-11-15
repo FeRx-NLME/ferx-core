@@ -24,6 +24,8 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::sens::jet::DualT;
+#[cfg(test)]
+use crate::sens::num::NonRecording;
 use crate::sens::num::{wsum3, BranchCmp, PkNum};
 use crate::stats::residual_error::{LoadingForm, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};

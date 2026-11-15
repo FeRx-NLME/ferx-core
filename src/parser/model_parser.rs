@@ -1,5 +1,6 @@
 use crate::cold_sort::ColdSort;
 use crate::parser::covariate_model::CovariateStatBindings;
+use crate::sens::num::NonRecRead;
 use crate::sim::adaptive::{
     round_to_message, validate_increasing_finite, AdaptiveAction, AdaptiveDosingSpec,
     AdaptiveRoute, AdaptiveRule, Comparison, DecisionCovariates, DoseKnowledge, DoseStep,
@@ -19313,7 +19314,8 @@ fn mixing_logp_g<T: crate::sens::num::vm::VmNum>(
         // The shift is exact at any value: the one seen.
         let max = logits
             .iter()
-            .map(|l| l.seen_value())
+            // value-read-ok: the log-sum-exp shift cancels exactly, so any value is correct
+            .map(|l| l.probe_value())
             .fold(f64::NEG_INFINITY, f64::max);
         let mut sum = T::from_f64(0.0);
         for &l in &logits {
@@ -30426,9 +30428,10 @@ fn apply_unary<T: crate::sens::num::vm::VmNum>(op: Op, v: T) -> T {
             }
         }
         Op::Abs => v.abs(),
-        Op::Floor => T::from_f64(v.val().floor()),
-        Op::Ceil => T::from_f64(v.val().ceil()),
-        Op::Round => T::from_f64(v.val().round()),
+        // Constants of the value (no derivative), recorded as primitives by a recording type.
+        Op::Floor => v.floor_c(),
+        Op::Ceil => v.ceil_c(),
+        Op::Round => v.round_c(),
         _ => unreachable!("apply_unary: {op:?} is not a unary value op"),
     }
 }
@@ -30625,7 +30628,8 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
             // `.val()` loses nothing; the *gathered* θ keeps its full jet, which
             // is what makes `∂f/∂θ_k` exact through a gather.
             Op::PushThetaGather(g) => {
-                let raw = pop!().val();
+                // Integer-valued data (a level index): a recording holds it as a constant.
+                let raw = pop!().nonrec_val().unwrap_or(f64::NAN);
                 let v = match bc.gathers.get(g as usize) {
                     Some(spec) => gather_g::<T>(spec, theta, raw),
                     None => {
@@ -30666,7 +30670,20 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                 // The lift is `lift4`, not `lift2`: the map is affine, so every
                 // higher derivative is a known `0`, and the recorded Hessian
                 // of the Laplace/AGQ exact anchor poisons a `lift2` with a `NaN` `φ‴`.
-                let (av, bv) = (a.val(), b.val());
+                if T::RECORDS_BRANCHES {
+                    // `a − b·q` with `q = ⌊a/b⌋` and the value `rem_euclid`, both computed on
+                    // the values at run time by a host call (constants: no derivative), so the
+                    // jet is `a′ − q·b′` as below and the value is `rem_euclid` exactly.
+                    push!(if b.br_abs_lt(1e-30) {
+                        k(0.0)
+                    } else {
+                        let h = T::host(crate::sens::num::HostFn::RemEuclid, &[a, b]);
+                        (a - a.value_only()) + h[0] - h[1] * (b - b.value_only())
+                    });
+                    pc += 1;
+                    continue;
+                }
+                let (av, bv) = (a.plain(), b.plain());
                 push!(if bv.abs() < 1e-30 {
                     k(0.0)
                 } else {
@@ -30676,7 +30693,7 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                         out
                     } else {
                         let qb = b * k(q);
-                        out - (qb - k(qb.val()))
+                        out - (qb - k(qb.plain()))
                     }
                 });
             }
@@ -30747,7 +30764,7 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                     let bb = T::select_if(BranchCmp::Ne, b, k(0.0), k(1.0), k(0.0));
                     T::select_if(BranchCmp::Ne, a, k(0.0), bb, k(0.0))
                 } else {
-                    k(if a.val() != 0.0 && b.val() != 0.0 {
+                    k(if a.plain() != 0.0 && b.plain() != 0.0 {
                         1.0
                     } else {
                         0.0
@@ -30761,7 +30778,7 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                     let bb = T::select_if(BranchCmp::Ne, b, k(0.0), k(1.0), k(0.0));
                     T::select_if(BranchCmp::Ne, a, k(0.0), k(1.0), bb)
                 } else {
-                    k(if a.val() != 0.0 || b.val() != 0.0 {
+                    k(if a.plain() != 0.0 || b.plain() != 0.0 {
                         1.0
                     } else {
                         0.0
@@ -30773,7 +30790,7 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                 push!(if rec {
                     T::select_if(BranchCmp::Eq, v, k(0.0), k(1.0), k(0.0))
                 } else {
-                    k(if v.val() == 0.0 { 1.0 } else { 0.0 })
+                    k(if v.plain() == 0.0 { 1.0 } else { 0.0 })
                 });
             }
             Op::IsPresent => {
@@ -30815,8 +30832,9 @@ fn eval_bytecode_range_g<T: crate::sens::num::vm::VmNum>(
                 continue;
             }
             Op::JumpIfFalse(target) => {
+                // A recording takes the arm above unless the condition is a constant.
                 let v = pop!();
-                if v.val() == 0.0 {
+                if v.nonrec_val() == Some(0.0) {
                     pc = target as usize;
                     continue;
                 }
@@ -30989,7 +31007,7 @@ fn eval_statements_g<T: crate::sens::num::vm::VmNum>(
         Vec::new()
     } else {
         nn.iter()
-            .map(|net| net.iter().map(|v| v.val()).collect())
+            .map(|net| net.iter().map(|v| v.plain()).collect())
             .collect()
     };
     eval_statements_g_inner::<T>(
@@ -31127,10 +31145,12 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                 // Conditions are value-based; evaluate on `.val()` views. A recording type
                 // (#2786) evaluates the condition's bytecode instead, whose comparisons
                 // its branch API records.
-                let views = (!T::RECORDS_BRANCHES).then(|| {
-                    let view = |x: &[T]| x.iter().map(|v| v.val()).collect::<Vec<f64>>();
-                    (view(theta), view(eta), view(vars))
-                });
+                let views = if !T::RECORDS_BRANCHES {
+                    let view = |x: &[T]| x.iter().map(|v| v.plain()).collect::<Vec<f64>>();
+                    Some((view(theta), view(eta), view(vars)))
+                } else {
+                    None
+                };
                 let mut taken = false;
                 for (cond, body) in branches {
                     let holds = match &views {
@@ -31141,8 +31161,8 @@ fn eval_statements_g_inner<T: crate::sens::num::vm::VmNum>(
                             let mut bc = Bytecode::new();
                             compile_condition_into(&mut bc, cond);
                             bc.max_stack = compute_max_stack(&bc.ops);
-                            eval_bytecode_g::<T>(&bc, theta, eta, cov, vars, nn, bc_stack).val()
-                                != 0.0
+                            eval_bytecode_g::<T>(&bc, theta, eta, cov, vars, nn, bc_stack)
+                                .br_cmp_c(crate::sens::num::BranchCmp::Ne, 0.0)
                         }
                     };
                     if holds {
@@ -31528,8 +31548,8 @@ impl RhsHoist {
         // The id lives in the slot's value; its jet (zero) carries nothing, and
         // lifting `self.id` to a full dual just to compare it would cost a jet-sized
         // write per call.
-        let warm =
-            vars.len() == self.n_ext && vars[self.id_slot].val().to_bits() == self.id.to_bits();
+        let warm = vars.len() == self.n_ext
+            && vars[self.id_slot].nonrec_val().map(f64::to_bits) == Some(self.id.to_bits());
         if warm {
             if zero_own {
                 vars[..n_vars].fill(zero);
@@ -33939,9 +33959,10 @@ impl IndivParamProgram {
         let skip: &[bool] = &self.cov_static_mask;
         if !skip.is_empty() {
             // The slots folded are constant in θ and η: the values read here only fill the
-            // walk's arguments, so a recording type reads the ones it saw (`seen_value`).
+            // walk's arguments, so a recording type reads the ones it saw.
             let mut theta_v: Vec<f64> = crate::scratch::take();
-            theta_v.extend(theta.iter().map(|t| t.seen_value()));
+            // value-read-ok: the folded slots are constant in θ and η, so the result is independent of θ's value
+            theta_v.extend(theta.iter().map(|t| t.probe_value()));
             let static_vals = self.eval_cov_static_f64(&theta_v, &cov_vec);
             for (v, &is_static) in skip.iter().enumerate() {
                 if is_static {

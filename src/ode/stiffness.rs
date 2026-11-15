@@ -93,6 +93,7 @@
 //! fires it turns a 372 s fit into a 2.3 s one.
 
 use crate::ode::solver::{OdeMethod, OdeSolverOptions};
+use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
 
 /// `|Re λ|max` at or above which `resolve_method` calls a segment stiff.
@@ -177,6 +178,7 @@ pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
 /// One-sided finite-difference Jacobian at `(t, u)`, column-major (`jac[i + j * n]` is
 /// `∂f_i/∂u_j`, the layout `DMatrix` expects). `None` on an empty system or a non-finite
 /// entry — a caller that cannot form the Jacobian must not guess.
+/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
 fn fd_jacobian<T: PkNum>(
     rhs: &crate::ode::solver::RhsG<'_, T>,
     u: &[T],
@@ -190,7 +192,7 @@ fn fd_jacobian<T: PkNum>(
 
     let mut f0 = vec![T::from_f64(0.0); n];
     rhs(u, params, T::from_f64(t), &mut f0);
-    if f0.iter().any(|v| !v.val().is_finite()) {
+    if f0.iter().any(|v| !v.plain().is_finite()) {
         return None;
     }
 
@@ -198,12 +200,12 @@ fn fd_jacobian<T: PkNum>(
     let mut f1 = vec![T::from_f64(0.0); n];
     let mut jac = vec![0.0; n * n];
     for j in 0..n {
-        let h = JAC_FD_REL_STEP * u[j].val().abs().max(1.0);
+        let h = JAC_FD_REL_STEP * u[j].plain().abs().max(1.0);
         u_pert[j] = u[j] + T::from_f64(h);
         rhs(&u_pert, params, T::from_f64(t), &mut f1);
         u_pert[j] = u[j];
         for (i, f1i) in f1.iter().enumerate() {
-            let d = (f1i.val() - f0[i].val()) / h;
+            let d = (f1i.plain() - f0[i].plain()) / h;
             if !d.is_finite() {
                 return None;
             }

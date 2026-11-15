@@ -1900,6 +1900,8 @@ pub fn ferx_core::sens::dual2::Dual2<N>::neg(self) -> Self
 impl<const N: usize> core::ops::arith::Sub for ferx_core::sens::dual2::Dual2<N>
 pub type ferx_core::sens::dual2::Dual2<N>::Output = ferx_core::sens::dual2::Dual2<N>
 pub fn ferx_core::sens::dual2::Dual2<N>::sub(self, r: Self) -> Self
+impl<const N: usize> ferx_core::sens::num::NonRecording for ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::val(self) -> f64
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual2::Dual2<N>
 pub const ferx_core::sens::dual2::Dual2<N>::JET_ORDER: usize
 pub const ferx_core::sens::dual2::Dual2<N>::RECORDS_BRANCHES: bool
@@ -1911,6 +1913,7 @@ pub fn ferx_core::sens::dual2::Dual2<N>::br_abs_lt(self, tol: f64) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::br_absdiff_lt(self, other: Self, tol: f64) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::br_cmp(self, cc: ferx_core::sens::num::BranchCmp, other: Self) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::br_cmp_c(self, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_floor_div(self, step: f64) -> f64
 pub fn ferx_core::sens::dual2::Dual2<N>::br_is_nan(self) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::br_shift_cmp(self, base: f64, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::cos(self) -> Self
@@ -1932,12 +1935,12 @@ pub fn ferx_core::sens::dual2::Dual2<N>::lift4(self, v: f64, d1: f64, d2: f64, d
 pub fn ferx_core::sens::dual2::Dual2<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::ln_gamma(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::logit(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::nonrec_val(self) -> core::option::Option<f64>
 pub fn ferx_core::sens::dual2::Dual2<N>::pow(self, e: Self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual2::Dual2<N>::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::sin(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual2::Dual2<N>::val(self) -> f64
 pub fn ferx_core::sens::dual2::Dual2<N>::value_only(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::var(x: f64, dim: usize) -> Self
 pub fn ferx_core::sens::dual2::scalar_div<const N: usize>(s: f64, d: ferx_core::sens::dual2::Dual2<N>) -> ferx_core::sens::dual2::Dual2<N>
@@ -1955,16 +1958,25 @@ pub fn ferx_core::sens::num::BranchCmp::holds(self, a: f64, b: f64) -> bool
 pub ferx_core::sens::num::HostFn::ForcingScale
 pub ferx_core::sens::num::HostFn::LuFactor
 pub ferx_core::sens::num::HostFn::PadeSquarings
+pub ferx_core::sens::num::HostFn::RemEuclid
 pub ferx_core::sens::num::HostFn::Spectral
 pub enum ferx_core::sens::num::JetFn
 pub ferx_core::sens::num::JetFn::ExpM1
+pub ferx_core::sens::num::JetFn::Exprel
 pub ferx_core::sens::num::JetFn::InvMills
+pub ferx_core::sens::num::JetFn::LnGamma
 pub ferx_core::sens::num::JetFn::LogNormCdf
 pub ferx_core::sens::num::JetFn::Logistic
 pub ferx_core::sens::num::JetFn::NegLogNormCdf
 pub ferx_core::sens::num::JetFn::Pnorm
 pub ferx_core::sens::num::JetFn::Softplus
 pub ferx_core::sens::num::JetFn::Tanh
+pub trait ferx_core::sens::num::NonRecording: ferx_core::sens::num::PkNum
+pub fn ferx_core::sens::num::NonRecording::val(self) -> f64
+impl ferx_core::sens::num::NonRecording for f64
+pub fn f64::val(self) -> f64
+impl<const N: usize> ferx_core::sens::num::NonRecording for ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::val(self) -> f64
 pub trait ferx_core::sens::num::PkNum: core::marker::Copy + 'static + core::ops::arith::Add<Output = Self> + core::ops::arith::Sub<Output = Self> + core::ops::arith::Mul<Output = Self> + core::ops::arith::Div<Output = Self> + core::ops::arith::Neg<Output = Self> + RecHooks
 pub const ferx_core::sens::num::PkNum::JET_ORDER: usize
 pub const ferx_core::sens::num::PkNum::RECORDS_BRANCHES: bool
@@ -1976,6 +1988,7 @@ pub fn ferx_core::sens::num::PkNum::br_abs_lt(self, tol: f64) -> bool
 pub fn ferx_core::sens::num::PkNum::br_absdiff_lt(self, other: Self, tol: f64) -> bool
 pub fn ferx_core::sens::num::PkNum::br_cmp(self, cc: ferx_core::sens::num::BranchCmp, other: Self) -> bool
 pub fn ferx_core::sens::num::PkNum::br_cmp_c(self, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn ferx_core::sens::num::PkNum::br_floor_div(self, step: f64) -> f64
 pub fn ferx_core::sens::num::PkNum::br_is_nan(self) -> bool
 pub fn ferx_core::sens::num::PkNum::br_shift_cmp(self, base: f64, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
 pub fn ferx_core::sens::num::PkNum::cos(self) -> Self
@@ -1997,12 +2010,12 @@ pub fn ferx_core::sens::num::PkNum::lift4(self, v: f64, d1: f64, d2: f64, d3: f6
 pub fn ferx_core::sens::num::PkNum::ln(self) -> Self
 pub fn ferx_core::sens::num::PkNum::ln_gamma(self) -> Self
 pub fn ferx_core::sens::num::PkNum::logit(self) -> Self
+pub fn ferx_core::sens::num::PkNum::nonrec_val(self) -> core::option::Option<f64>
 pub fn ferx_core::sens::num::PkNum::pow(self, e: Self) -> Self
 pub fn ferx_core::sens::num::PkNum::same_bits_untaped(&self, _other: &Self) -> core::option::Option<bool>
 pub fn ferx_core::sens::num::PkNum::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
 pub fn ferx_core::sens::num::PkNum::sin(self) -> Self
 pub fn ferx_core::sens::num::PkNum::sqrt(self) -> Self
-pub fn ferx_core::sens::num::PkNum::val(self) -> f64
 pub fn ferx_core::sens::num::PkNum::value_only(self) -> Self
 pub fn ferx_core::sens::num::PkNum::var(x: f64, dim: usize) -> Self
 impl ferx_core::sens::num::PkNum for f64
@@ -2016,6 +2029,7 @@ pub fn f64::br_abs_lt(self, tol: f64) -> bool
 pub fn f64::br_absdiff_lt(self, other: Self, tol: f64) -> bool
 pub fn f64::br_cmp(self, cc: ferx_core::sens::num::BranchCmp, other: Self) -> bool
 pub fn f64::br_cmp_c(self, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn f64::br_floor_div(self, step: f64) -> f64
 pub fn f64::br_is_nan(self) -> bool
 pub fn f64::br_shift_cmp(self, base: f64, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
 pub fn f64::cos(self) -> Self
@@ -2037,12 +2051,12 @@ pub fn f64::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
 pub fn f64::ln(self) -> Self
 pub fn f64::ln_gamma(self) -> Self
 pub fn f64::logit(self) -> Self
+pub fn f64::nonrec_val(self) -> core::option::Option<f64>
 pub fn f64::pow(self, e: Self) -> Self
 pub fn f64::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
 pub fn f64::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
 pub fn f64::sin(self) -> Self
 pub fn f64::sqrt(self) -> Self
-pub fn f64::val(self) -> f64
 pub fn f64::value_only(self) -> Self
 pub fn f64::var(x: f64, _dim: usize) -> Self
 impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual2::Dual2<N>
@@ -2056,6 +2070,7 @@ pub fn ferx_core::sens::dual2::Dual2<N>::br_abs_lt(self, tol: f64) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::br_absdiff_lt(self, other: Self, tol: f64) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::br_cmp(self, cc: ferx_core::sens::num::BranchCmp, other: Self) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::br_cmp_c(self, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_floor_div(self, step: f64) -> f64
 pub fn ferx_core::sens::dual2::Dual2<N>::br_is_nan(self) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::br_shift_cmp(self, base: f64, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
 pub fn ferx_core::sens::dual2::Dual2<N>::cos(self) -> Self
@@ -2077,12 +2092,12 @@ pub fn ferx_core::sens::dual2::Dual2<N>::lift4(self, v: f64, d1: f64, d2: f64, d
 pub fn ferx_core::sens::dual2::Dual2<N>::ln(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::ln_gamma(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::logit(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::nonrec_val(self) -> core::option::Option<f64>
 pub fn ferx_core::sens::dual2::Dual2<N>::pow(self, e: Self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
 pub fn ferx_core::sens::dual2::Dual2<N>::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::sin(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual2::Dual2<N>::val(self) -> f64
 pub fn ferx_core::sens::dual2::Dual2<N>::value_only(self) -> Self
 pub fn ferx_core::sens::dual2::Dual2<N>::var(x: f64, dim: usize) -> Self
 pub mod ferx_core::sens::ode_provider

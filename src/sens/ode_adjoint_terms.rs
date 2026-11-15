@@ -156,9 +156,11 @@ pub(crate) enum TermKind {
     /// Every non-Gaussian endpoint summed (`NonGaussianTerm`).
     NonGaussian,
     Tte,
+    /// Read only by the `markov` endpoints.
+    #[cfg(feature = "markov")]
     Ctmm,
     Discrete,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "markov"))]
     Dtmm,
 }
 
@@ -168,9 +170,10 @@ impl TermKind {
         match self {
             TermKind::NonGaussian => 1,
             TermKind::Tte => 2,
+            #[cfg(feature = "markov")]
             TermKind::Ctmm => 3,
             TermKind::Discrete => 4,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "markov"))]
             TermKind::Dtmm => 5,
         }
     }

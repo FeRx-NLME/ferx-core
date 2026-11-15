@@ -18,6 +18,7 @@
 //
 // All functions guard against t ≤ 0 to avoid log/pow domain errors.
 
+use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
 use crate::types::HazardFamily;
 
@@ -113,7 +114,7 @@ pub(crate) fn hazard_and_cum_hazard_g<T: PkNum>(
                 // derivatives. The limit written as its value (`γ = 0 ⇒ H = α·t`) would
                 // drop every γ-derivative a dual carries — the FOCEI η-Hessian of a γ(η)
                 // at γ̂ = 0 lost its `α·t³/3` curvature that way (#2437).
-                let [v, d1, d2, d3, d4] = exprel_series(gt.val());
+                let [v, d1, d2, d3, d4] = exprel_series(gt.plain());
                 return (
                     h_val,
                     alpha * exp_loghr * (k(t) * gt.lift4(v, d1, d2, d3, d4)),

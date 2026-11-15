@@ -55,6 +55,7 @@
 //! 3rd-order accurate while its steps are 7th-order accurate.
 
 use super::solver::{hermite_g, scale_tol, OdeSolverOptions, Stepper};
+use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
 
 /// Widest tableau here (Vern7's 10 stages).
@@ -321,13 +322,14 @@ impl<T: PkNum> ErkStepper<T> {
     }
 
     /// The error estimate of the last [`Self::stages`].
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
     pub(crate) fn err_norm(&self, u: &[T], dt: f64, opts: &OdeSolverOptions) -> f64 {
         erk_err_norm(
             self.n,
             self.tab,
-            |stage, i| self.ks[stage][i].val(),
-            |i| self.u_new[i].val(),
-            |i| u[i].val(),
+            |stage, i| self.ks[stage][i].plain(),
+            |i| self.u_new[i].plain(),
+            |i| u[i].plain(),
             dt,
             opts,
         )

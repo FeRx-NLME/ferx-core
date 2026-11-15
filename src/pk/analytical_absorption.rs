@@ -100,11 +100,13 @@ impl<T: PkNum> TiltedAbsorption<T> for TransitAbsorption<T> {
         // which would otherwise propagate silently into the likelihood. The analytic
         // dispatch guards `ke < KTR` upstream (routing to the ODE path otherwise), so
         // this never fires on a valid call — it catches a guard regression in tests.
+        // A debug check on values: skipped on a dependent recorded value (nothing to check
+        // there that a guard would not over-constrain).
         debug_assert!(
-            k.seen_value() < ktr.seen_value(),
-            "transit MGF diverges for k ≥ KTR ({} ≥ {}); caller must guard ke < KTR",
-            k.seen_value(),
-            ktr.seen_value()
+            k.nonrec_val()
+                .zip(ktr.nonrec_val())
+                .is_none_or(|(a, b)| a < b),
+            "transit MGF diverges for k ≥ KTR; caller must guard ke < KTR"
         );
         (ktr / (ktr - k)).pow(self.n + T::from_f64(1.0))
     }
@@ -172,10 +174,10 @@ impl<T: PkNum> TiltedAbsorption<T> for IgAbsorption<T> {
         // dispatch still guards `ke < 1/(2·MAT·CV²)` upstream (routing to the ODE
         // `igd()` twin otherwise). The assert catches a guard regression in tests.
         debug_assert!(
-            self.two_mu2_over_lambda().seen_value() * k.seen_value() < 1.0,
-            "IG MGF diverges for k ≥ λ/(2μ²) ({} ≥ {}); caller must guard ke < 1/(2·MAT·CV²)",
-            k.seen_value(),
-            1.0 / self.two_mu2_over_lambda().seen_value()
+            (self.two_mu2_over_lambda() * k)
+                .nonrec_val()
+                .is_none_or(|p| p < 1.0),
+            "IG MGF diverges for k ≥ λ/(2μ²); caller must guard ke < 1/(2·MAT·CV²)"
         );
         (self.lambda_over_mu() * (T::from_f64(1.0) - self.tilt_r(k))).exp()
     }

@@ -3,6 +3,9 @@
 use super::*;
 use crate::ode::solver::{solve_ode_with_stats, OdeSolverStats};
 use crate::sens::dual2::Dual2;
+use crate::sens::num::NonRecRead;
+#[cfg(test)]
+use crate::sens::num::NonRecording;
 
 /// `du/dt = A u` for a diagonal `A` — eigenvalues are the diagonal, exactly.
 fn diagonal_rhs<T: PkNum>(rates: &'static [f64]) -> impl Fn(&[T], &[T], T, &mut [T]) {
@@ -1385,7 +1388,7 @@ fn rotating_rhs<T: PkNum>(w: f64) -> impl Fn(&[T], &[T], T, &mut [T]) {
 /// stiff half that clamps is a stall the guard is right to discard.
 fn clamps_then_turns_stiff<T: PkNum>() -> impl Fn(&[T], &[T], T, &mut [T]) {
     move |u: &[T], _p: &[T], t: T, du: &mut [T]| {
-        if t.val() < 1.0 {
+        if t.plain() < 1.0 {
             du[0] = u[1] * T::from_f64(200.0);
             du[1] = u[0] * T::from_f64(-200.0);
             du[2] = T::from_f64(1e-6);

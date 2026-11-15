@@ -31,6 +31,7 @@
 
 use super::solver::SolPointG;
 use crate::sens::linsolve::{lu_factor_in_place_g, lu_solve_in_place_g};
+use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
 
 /// Degree-13 Padé numerator coefficients `b_0..b_13` (Higham 2005, Table 10.4 / eq. 10.33).
@@ -1278,11 +1279,16 @@ fn segment_span<T: PkNum>(
     // A recording type (#2786) reads them off its recording instead, exactly
     // ([`RecHooks::affine_parts`]).
     if !T::affine_parts(rhs, params, t_mid, a, b) {
+        // A recording declined here has already failed (`not affine in the state`): there are
+        // no values to probe.
+        if T::RECORDS_BRANCHES {
+            return None;
+        }
         rhs(probe, params, T::from_f64(t_mid), b);
         let magnitude = b
             .iter()
             .chain(u0)
-            .fold(1.0_f64, |m, x| m.max(x.val().abs()).max(x.jet_max_abs()));
+            .fold(1.0_f64, |m, x| m.max(x.plain().abs()).max(x.jet_max_abs()));
         if !magnitude.is_finite() {
             return None;
         }
@@ -1331,7 +1337,7 @@ fn segment_span<T: PkNum>(
                         .br_cmp(crate::sens::num::BranchCmp::Le, tol);
             }
             let mut assembled = b[i];
-            let mut scale = b[i].val().abs();
+            let mut scale = b[i].plain().abs();
             let mut jet_scale = b[i].jet_max_abs();
             for j in 0..n {
                 let (aij, xj) = (a[i * n + j], x[j]);
@@ -1343,14 +1349,14 @@ fn segment_span<T: PkNum>(
                     continue;
                 }
                 assembled = assembled + aij * xj;
-                scale += (aij.val() * xj.val()).abs();
-                jet_scale += aij.jet_max_abs() * xj.val().abs()
-                    + aij.val().abs() * xj.jet_max_abs()
+                scale += (aij.plain() * xj.plain()).abs();
+                jet_scale += aij.jet_max_abs() * xj.plain().abs()
+                    + aij.plain().abs() * xj.jet_max_abs()
                     + aij.jet_max_abs() * xj.jet_max_abs();
             }
             let diff = direct[i] - assembled;
-            direct[i].val().is_finite()
-                && diff.val().abs() <= SELF_CHECK_RTOL * scale + 1e-300
+            direct[i].plain().is_finite()
+                && diff.plain().abs() <= SELF_CHECK_RTOL * scale + 1e-300
                 && diff.jet_max_abs() <= SELF_CHECK_RTOL * jet_scale + 1e-300
         })
     };
@@ -1398,7 +1404,7 @@ fn segment_span<T: PkNum>(
             }
         });
     } else {
-        order.sort_by(|&i, &j| req[i].val().total_cmp(&req[j].val()));
+        order.sort_by(|&i, &j| req[i].plain().total_cmp(&req[j].plain()));
     }
     times.clear();
     let mut pos = vec![0usize; req.len()];
@@ -1506,7 +1512,7 @@ fn segment_span<T: PkNum>(
         let c = T::host(crate::sens::num::HostFn::ForcingScale, &args)[0];
         (c, T::from_f64(1.0) / c)
     } else {
-        let a_max = a.iter().fold(0.0_f64, |acc, x| acc.max(x.val().abs()));
+        let a_max = a.iter().fold(0.0_f64, |acc, x| acc.max(x.plain().abs()));
         // Jets included: a forcing whose value is 0 but whose derivative is 1e292 leaves the
         // generator's value at zero (no squarings) while the Padé numerator multiplies that
         // jet by ~3e16 and overflows it.
@@ -1575,7 +1581,8 @@ fn segment_span<T: PkNum>(
         if dt_t.br_cmp_c(Gt, 0.0) {
             // A gap that moves with the inputs is its own exponential.
             let key = if dt_t.is_constant() {
-                dt_t.val().to_bits()
+                dt_t.nonrec_val()
+                    .map_or(u64::MAX - step as u64, f64::to_bits)
             } else {
                 u64::MAX - step as u64
             };

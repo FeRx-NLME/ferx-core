@@ -370,7 +370,7 @@ where
         }
     }
     let u_ss = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_m, &b, n)?;
-    if u_ss.iter().any(|x| !x.seen_value().is_finite()) {
+    if u_ss.iter().any(|x| !x.br_value().is_finite()) {
         return None;
     }
     // The checks below read the values a recording type saw (`seen_value`): they verify the map
@@ -383,7 +383,7 @@ where
     // nonlinear map whose true fixed point merely happens to sit within `vtol` after the first.
     let scale = u_ss
         .iter()
-        .fold(1e-12_f64, |a, x| a.max(x.seen_value().abs()));
+        .fold(1e-12_f64, |a, x| a.max(x.br_value().abs()));
     // Verification tolerance, scaled to the caller's own accuracy. For the ODE caller the
     // one-cycle residual of a genuinely *linear* map is not zero but a solver-noise floor: `b`
     // (forced from a zero state) and the check below (forced from `u_ss`) integrate the same
@@ -401,7 +401,7 @@ where
     let within = |a: &[T], b: &[T]| {
         a.iter()
             .zip(b)
-            .all(|(c, u)| (c.seen_value() - u.seen_value()).abs() <= vtol)
+            .all(|(c, u)| (c.br_value() - u.br_value()).abs() <= vtol)
     };
     let u_check = advance_forced(&u_ss)?;
     if !within(&u_check, &u_ss) {
@@ -1274,7 +1274,7 @@ pub(crate) fn count_gt_multiples<G: crate::sens::num::PkNum>(x: G, ii: f64) -> u
     if !x.br_cmp_c(Gt, 0.0) {
         return 0;
     }
-    let v = x.seen_value();
+    let v = x.br_value();
     let mut n = if v.is_finite() {
         (v / ii).ceil() as usize
     } else {
@@ -1359,7 +1359,7 @@ pub(crate) fn residual_end_indices_g<G: crate::sens::num::PkNum>(
     horizon: f64,
 ) -> std::ops::Range<usize> {
     use crate::sens::num::BranchCmp::{Gt, Le};
-    let j0 = ResidualEnds::new(t, first.seen_value(), ii, n).count_ending_after(horizon);
+    let j0 = ResidualEnds::new(t, first.br_value(), ii, n).count_ending_after(horizon);
     let end = |j: usize| G::from_f64(t) + first - G::from_f64(j as f64 * ii);
     if j0 > 0 {
         end(j0 - 1).br_cmp_c(Gt, horizon);

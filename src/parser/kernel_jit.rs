@@ -488,13 +488,23 @@ const T_EXPREL: u8 = 27;
 const T_STOPGRAD: u8 = 28;
 const T_SELECT: u8 = 29;
 const T_JET: u8 = 30;
-#[cfg(feature = "markov")]
 const T_FLOOR: u8 = 31;
+const T_CEIL: u8 = 33;
+const T_ROUND: u8 = 34;
 const T_GATE: u8 = 32;
 /// A comparison: this plus its `ir::Cc`.
 const T_CMP: u8 = 40;
 
 impl Tr {
+    /// The value, failing the recording when it depends on an input: a recording must never
+    /// read a value. Inherent — [`PkNum`] has no value accessor, so a `*_g<T: PkNum>` kernel
+    /// cannot reach this (#2786).
+    pub(crate) fn val(self) -> f64 {
+        if self.dep {
+            fail("value read".into());
+        }
+        self.v
+    }
     /// A recorded value; with `FERX_KJIT_DEBUG`, its value is kept for [`replay_check`].
     fn mk(v: f64, r: u32, dep: bool) -> Self {
         REC.with(|x| {
@@ -866,6 +876,17 @@ impl PkNum for Tr {
         }
         out
     }
+    fn nonrec_val(self) -> Option<f64> {
+        (!self.dep).then_some(self.v)
+    }
+    fn br_floor_div(self, step: f64) -> f64 {
+        let m = (self.v / step).floor();
+        // The two comparisons that make `m` the floor, recorded as guards (no-ops, and not
+        // recorded, on a constant).
+        let _ = Self::guard_cmp(self, ir::Cc::Ge, Self::k(m * step));
+        let _ = Self::guard_cmp(self, ir::Cc::Lt, Self::k((m + 1.0) * step));
+        m
+    }
     fn br_is_nan(self) -> bool {
         let out = self.v.is_nan();
         if self.dep {
@@ -882,12 +903,6 @@ impl PkNum for Tr {
     fn var(x: f64, _dim: usize) -> Self {
         fail("var".into());
         Self::k(x)
-    }
-    fn val(self) -> f64 {
-        if self.dep {
-            fail("value read".into());
-        }
-        self.v
     }
     fn exp(self) -> Self {
         self.unary(T_EXP, Unary::Exp, self.v.exp())
@@ -1066,14 +1081,14 @@ impl RecHooks for Tr {
         }
         self.v
     }
+    fn value_read_refused(self) -> f64 {
+        self.val()
+    }
     /// The value, with a guard that it comes out the same on every evaluation.
     fn br_value(self) -> f64 {
         if self.dep {
             Self::guard_cmp(self, ir::Cc::Eq, Self::k(self.v));
         }
-        self.v
-    }
-    fn seen_value(self) -> f64 {
         self.v
     }
     #[allow(clippy::type_complexity)]
@@ -1093,13 +1108,24 @@ impl RecHooks for Tr {
     ) -> Option<Option<Vec<Self>>> {
         Some(record_repeat(x0, count, body))
     }
-    #[cfg(feature = "markov")]
     fn floor_c(self) -> Self {
         self.unary(T_FLOOR, Unary::Floor, self.v.floor())
+    }
+    fn ceil_c(self) -> Self {
+        self.unary(T_CEIL, Unary::Ceil, self.v.ceil())
+    }
+    fn round_c(self) -> Self {
+        self.unary(T_ROUND, Unary::Round, self.v.round())
     }
     /// The value it saw: a pure scaling, so no guard.
     fn magnitude_hint(self) -> f64 {
         self.v.abs()
+    }
+    fn abs_hint(self) -> f64 {
+        self.v.abs()
+    }
+    fn probe_value(self) -> f64 {
+        self.v
     }
     fn order_gate(k: u8, skip: Self, take: Self) -> Self {
         Tr::gate_node(k, skip, take)

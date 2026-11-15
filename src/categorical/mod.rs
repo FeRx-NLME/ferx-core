@@ -19,6 +19,7 @@
 //! see `Cargo.toml`); [`LinkFn`]/[`LinearPredictorFn`] live under the same gate.
 
 use crate::parser::model_parser::with_model_time;
+use crate::sens::num::NonRecRead;
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{
     CompiledModel, DiscreteObsDiagnostic, EndpointLikelihood, EndpointPredictionResult,
@@ -73,12 +74,12 @@ fn binary_record_nll_g<T: crate::sens::num::PkNum>(link: LinkFn, lp: T, y: f64) 
     match link {
         LinkFn::Probit => {
             let s = if y > 0.5 { 1.0 } else { -1.0 };
-            let [v, d1, d2, d3, d4] = neg_log_normal_cdf_jet(s * lp.val());
+            let [v, d1, d2, d3, d4] = neg_log_normal_cdf_jet(s * lp.plain());
             // d^k/dlp^k g(s·lp) = s^k g^(k)(s·lp), and s^2 = 1.
             lp.lift4(v, s * d1, d2, s * d3, d4)
         }
         LinkFn::Logit => {
-            let x = lp.val();
+            let x = lp.plain();
             let p = inv_logit(x);
             let q = p * (1.0 - p);
             lp.lift4(

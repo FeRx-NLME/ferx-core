@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub mod baseline;
 pub mod nan_fold;
+pub mod recorded_value_read;
 pub mod scope;
 
 /// One finding.
@@ -55,7 +56,9 @@ pub fn default_baseline_path(root: &Path) -> PathBuf {
 /// Lint one source text as if it lived at `rel`.
 pub fn lint_source(rel: &str, text: &str, whole_test: bool) -> Result<Vec<Finding>, String> {
     let ast = syn::parse_file(text).map_err(|e| format!("{rel}: cannot parse: {e}"))?;
-    Ok(nan_fold::lint_file(rel, text, &ast, whole_test))
+    let mut out = nan_fold::lint_file(rel, text, &ast, whole_test);
+    out.extend(recorded_value_read::lint_file(rel, text, &ast, whole_test));
+    Ok(out)
 }
 
 /// The result of scanning a tree.
@@ -133,6 +136,12 @@ pub fn scan(root: &Path) -> Result<Scan, String> {
                 let mut out = Vec::new();
                 for (i, text, ast) in &mine {
                     out.extend(nan_fold::lint_file(&paths[*i].0, text, ast, flags[*i]));
+                    out.extend(recorded_value_read::lint_file(
+                        &paths[*i].0,
+                        text,
+                        ast,
+                        flags[*i],
+                    ));
                 }
                 Ok(out)
             }));

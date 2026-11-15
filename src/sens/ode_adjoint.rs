@@ -1172,9 +1172,14 @@ fn taped_params<T: VmNum>(
                     // Weights with no derivative (every inner recording): the network on
                     // `f64` — memoised across the solve — lifted, not on the dual.
                     if w.iter().all(|t| t.is_constant()) {
-                        let wf: Vec<f64> = w.iter().map(|t| t.val()).collect();
-                        if let Ok(y) = nn.mapper.forward_raw(&wf, cov) {
-                            return y.into_iter().map(T::from_f64).collect();
+                        if let Some(wf) = w
+                            .iter()
+                            .map(|t| t.nonrec_val())
+                            .collect::<Option<Vec<f64>>>()
+                        {
+                            if let Ok(y) = nn.mapper.forward_raw(&wf, cov) {
+                                return y.into_iter().map(T::from_f64).collect();
+                            }
                         }
                     }
                     nn.mapper.forward_raw_g(w, cov)
@@ -3219,7 +3224,7 @@ pub(crate) fn cumhaz_hazard_from_states<T: VmNum>(
 /// follows the lags. `lags` may be shorter than `doses` (a missing entry is no lag).
 #[cfg(feature = "survival")]
 fn tad_anchor_g<T: VmNum>(doses: &[crate::types::DoseEvent], lags: &[T], t: f64) -> T {
-    use crate::sens::num::BranchCmp::{Ge, Gt, Le, Lt};
+    use crate::sens::num::BranchCmp::{Gt, Le, Lt};
     let tf = T::from_f64;
     let lag = |i: usize| lags.get(i).copied().unwrap_or(tf(0.0));
     let eps = 1e-12; // `dosing::TAD_EPS`
@@ -3229,9 +3234,7 @@ fn tad_anchor_g<T: VmNum>(doses: &[crate::types::DoseEvent], lags: &[T], t: f64)
             if d.ss && d.ii > 0.0 {
                 // `t − (t − arrival).rem_euclid(II)`: the arrival plus its whole cycles by `t`.
                 let elapsed = tf(t) - arrival;
-                let m = (elapsed.seen_value() / d.ii).floor();
-                let _ = elapsed.br_cmp_c(Ge, m * d.ii);
-                let _ = elapsed.br_cmp_c(Lt, (m + 1.0) * d.ii);
+                let m = elapsed.br_floor_div(d.ii);
                 return Some(arrival + tf(m * d.ii));
             }
             return Some(arrival);
@@ -3292,10 +3295,12 @@ pub(crate) fn ode_states_at_g<T: VmNum>(
     if !ode_hazard_walk_in_scope(model, subject) || times.is_empty() {
         return None;
     }
-    // The values serve only the slots the tape shows constant in θ and η (`seen_value`); a
-    // live slot takes its tape value below.
-    let eta_v: Vec<f64> = eta.iter().map(|e| e.seen_value()).collect();
-    let theta_v: Vec<f64> = theta.iter().map(|t| t.seen_value()).collect();
+    // The values serve only the slots the tape shows constant in θ and η; a live slot takes its
+    // tape value below.
+    // value-read-ok: the f64 evaluation's results are used only for slots constant in θ and η
+    let eta_v: Vec<f64> = eta.iter().map(|e| e.probe_value()).collect();
+    // value-read-ok: same: only constant slots take a value from this evaluation
+    let theta_v: Vec<f64> = theta.iter().map(|t| t.probe_value()).collect();
     let snapshot = |cov: &std::collections::HashMap<String, f64>, time: f64| -> Vec<T> {
         let pk = (model.pk_param_fn)(&theta_v, &eta_v, cov, time);
         let by_slot = taped_params(

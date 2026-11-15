@@ -185,7 +185,53 @@ impl<const N: usize, B: PkNum> DualT<N, B> {
     }
 }
 
-impl<const N: usize, B: PkNum> crate::sens::num::RecHooks for DualT<N, B> {}
+impl<const N: usize, B: PkNum> crate::sens::num::RecHooks for DualT<N, B> {
+    fn floor_c(self) -> Self {
+        DualT {
+            v: self.v.floor_c(),
+            g: [B::from_f64(0.0); N],
+        }
+    }
+    fn ceil_c(self) -> Self {
+        DualT {
+            v: self.v.ceil_c(),
+            g: [B::from_f64(0.0); N],
+        }
+    }
+    fn round_c(self) -> Self {
+        DualT {
+            v: self.v.round_c(),
+            g: [B::from_f64(0.0); N],
+        }
+    }
+    fn span_value(self) -> f64 {
+        self.v.span_value()
+    }
+    fn br_value(self) -> f64 {
+        self.v.br_value()
+    }
+    fn value_read_refused(self) -> f64 {
+        self.v.value_read_refused()
+    }
+    fn magnitude_hint(self) -> f64 {
+        self.v.magnitude_hint()
+    }
+    fn abs_hint(self) -> f64 {
+        self.v.abs_hint()
+    }
+    fn probe_value(self) -> f64 {
+        self.v.probe_value()
+    }
+}
+
+impl<const N: usize, B: crate::sens::num::NonRecording> crate::sens::num::NonRecording
+    for DualT<N, B>
+{
+    #[inline]
+    fn val(self) -> f64 {
+        self.v.val()
+    }
+}
 
 impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     const SECOND_ORDER: bool = false;
@@ -227,6 +273,10 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     fn br_is_nan(self) -> bool {
         self.v.br_is_nan()
     }
+    #[inline]
+    fn br_floor_div(self, step: f64) -> f64 {
+        self.v.br_floor_div(step)
+    }
     /// Every part selected on the values' condition.
     #[inline]
     fn select_if(cc: crate::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self {
@@ -234,6 +284,25 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
             v: B::select_if(cc, x.v, y.v, a.v, b.v),
             g: std::array::from_fn(|k| B::select_if(cc, x.v, y.v, a.g[k], b.g[k])),
         }
+    }
+    fn nonrec_val(self) -> Option<f64> {
+        self.v.nonrec_val()
+    }
+    fn sin(self) -> Self {
+        self.chain(self.v.sin(), self.v.cos())
+    }
+    fn host(f: crate::sens::num::HostFn, args: &[Self]) -> Vec<Self> {
+        let vs: Vec<B> = args.iter().map(|a| a.v).collect();
+        B::host(f, &vs)
+            .into_iter()
+            .map(|v| DualT {
+                v,
+                g: [B::from_f64(0.0); N],
+            })
+            .collect()
+    }
+    fn exprel(self, _orders: usize) -> Self {
+        self.jet_k(crate::sens::num::JetFn::Exprel, 0)
     }
     #[inline]
     fn value_only(self) -> Self {
@@ -244,7 +313,11 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
     }
     #[inline]
     fn is_constant(self) -> bool {
-        self.v.is_constant() && self.g.iter().all(|d| d.is_constant() && d.val() == 0.0)
+        self.v.is_constant()
+            && self
+                .g
+                .iter()
+                .all(|d| d.is_constant() && d.br_cmp_c(crate::sens::num::BranchCmp::Eq, 0.0))
     }
     fn from_f64(x: f64) -> Self {
         DualT::constant(x)
@@ -255,9 +328,6 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
             d.g[dim] = B::from_f64(1.0);
         }
         d
-    }
-    fn val(self) -> f64 {
-        self.v.val()
     }
     fn exp(self) -> Self {
         let e = self.v.exp();
@@ -278,12 +348,26 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         // to finite differences (#2093 review). The forward dual's convention at `x = 0` (a zero
         // derivative) is kept, so this differentiates the function the gradient records.
         if e.is_constant() {
-            let n = e.v.val();
+            let n = e.v;
             if self.v.br_cmp_c(crate::sens::num::BranchCmp::Eq, 0.0) {
-                return DualT::constant(0.0f64.powf(n));
+                // `0ⁿ` as `f64::powf` has it, decided on the exponent through the branch API.
+                use crate::sens::num::BranchCmp::{Eq, Gt, Lt};
+                let v = if n.br_cmp_c(Eq, 0.0) {
+                    1.0
+                } else if n.br_cmp_c(Gt, 0.0) {
+                    0.0
+                } else if n.br_cmp_c(Lt, 0.0) {
+                    f64::INFINITY
+                } else {
+                    f64::NAN
+                };
+                return DualT {
+                    v: B::from_f64(v),
+                    g: [B::from_f64(0.0); N],
+                };
             }
-            let d1 = B::from_f64(n) * self.v.pow(B::from_f64(n - 1.0));
-            return self.chain(self.v.pow(B::from_f64(n)), d1);
+            let d1 = n * self.v.pow(n - B::from_f64(1.0));
+            return self.chain(self.v.pow(n), d1);
         }
         (e * self.ln()).exp()
     }
@@ -321,24 +405,19 @@ impl<const N: usize, B: PkNum> PkNum for DualT<N, B> {
         }
     }
     fn ln_gamma(self) -> Self {
-        let x = self.v.val();
-        // The derivative ψ lifted with its own ψ′ and ψ″ (tetragamma), so a second-order
-        // base differentiates it exactly instead of seeing a truncated `0`.
-        let d = self.v.lift2(
-            crate::stats::special::digamma(x),
-            crate::stats::special::trigamma(x),
-            crate::stats::special::tetragamma(x),
-        );
+        // The derivative ψ with its own ψ′, ψ″ (tetragamma) and ψ‴ on the base, so a
+        // higher-order base differentiates it exactly instead of seeing a truncated `0`.
+        let d = self.v.jet_k(crate::sens::num::JetFn::LnGamma, 1);
         self.chain(self.v.ln_gamma(), d)
     }
     fn jets_finite(self) -> bool {
-        self.g.iter().all(|x| x.val().is_finite())
+        self.g.iter().all(|x| x.br_abs_lt(f64::INFINITY))
     }
     /// The tangents, and the base's own jets of the value and of each tangent.
     fn jet_max_abs(self) -> f64 {
         crate::sens::num::nan_max_abs(
             std::iter::once(self.v.jet_max_abs())
-                .chain(self.g.iter().flat_map(|x| [x.val(), x.jet_max_abs()])),
+                .chain(self.g.iter().flat_map(|x| [x.abs_hint(), x.jet_max_abs()])),
         )
     }
     /// `φ(self)` with `φ = v`, `φ′ = d1`, `φ″ = d2`: the tangent factor `φ′(x)` is lifted
@@ -395,5 +474,55 @@ mod tests {
             g: [0.0, 1.0],
         };
         assert!(x.pow(live).v.is_nan(), "a live exponent keeps exp(e·ln x)");
+    }
+
+    /// `PkNum` has no value accessor, so `DualT` computes `sin`, `exprel` and `ln Γ` from its
+    /// base's own primitives (`JetFn::{Exprel, LnGamma}`, the base's `sin`/`cos`) instead of
+    /// reading a value. Pinned against the forward `Dual2` (value and first derivative, bit for
+    /// bit where the base is `f64`): dies if the tangent factor of any of the three is wrong.
+    #[test]
+    fn dualt_sin_exprel_ln_gamma_match_dual2() {
+        use crate::sens::dual2::Dual2;
+        for &x in &[0.3_f64, 1.7, 4.2] {
+            let d = DualT::<1, f64> { v: x, g: [1.0] };
+            let e = Dual2::<1>::var(x, 0);
+            let cases = [
+                ("sin", d.sin(), e.sin()),
+                ("exprel", d.exprel(2), e.exprel(2)),
+                ("ln_gamma", d.ln_gamma(), e.ln_gamma()),
+            ];
+            for (name, got, want) in cases {
+                assert!(got.v.is_finite() && got.g[0].is_finite(), "{name}({x})");
+                assert_eq!(got.v.to_bits(), want.value.to_bits(), "{name}({x}) value");
+                let rel = (got.g[0] - want.grad[0]).abs() / want.grad[0].abs().max(1e-300);
+                assert!(
+                    rel < 1e-13,
+                    "{name}({x}): tangent {} vs {}",
+                    got.g[0],
+                    want.grad[0]
+                );
+            }
+        }
+    }
+
+    /// The host-function and jet-function tables are exhaustive by construction (`index` is a
+    /// `match`); this pins `ALL` and `from_index` to it, so a variant added to the enum and the
+    /// `match` but not to the table fails here instead of panicking at run time.
+    #[test]
+    fn jet_and_host_function_tables_round_trip() {
+        use crate::sens::num::{HostFn, JetFn};
+        for (i, f) in JetFn::ALL.iter().enumerate() {
+            assert_eq!(f.index() as usize, i);
+            assert_eq!(JetFn::from_index(f.index()), *f);
+        }
+        for f in HostFn::ALL {
+            assert_eq!(HostFn::from_index(f.index()), f);
+        }
+        let mut out = Vec::new();
+        HostFn::RemEuclid.run(&[-7.5, 2.0], &mut out);
+        assert_eq!(
+            out,
+            vec![(-7.5f64).rem_euclid(2.0), (-7.5f64).div_euclid(2.0)]
+        );
     }
 }

@@ -12,6 +12,7 @@ use crate::ode::solver::{
     OdeSolverStats,
 };
 use crate::pk::absorption::{InputRateForcing, PreparedInputRate};
+use crate::sens::num::NonRecRead;
 use crate::sim::adaptive::{
     assay_standard_normal, AdaptiveMonitor, AdaptiveRun, AssayNoise, ControllerCtx,
     ControllerDecision, DecisionLogEntry, DecisionOutcome, DoseAction, DoseLedgerEntry,
@@ -1151,6 +1152,7 @@ const SS_ANDERSON_WINDOW: usize = 5;
 /// refinement ([`SS_NEWTON_REFINEMENTS`] more one-cycle solves) whose fixed point is exact in
 /// every dual part, so the cost is `O(n)` regardless of how slowly the model accumulates. Returns `None` on a singular `I − J_P` or a failed solve, so the
 /// caller keeps the value-only result.
+/// Non-recording: a recording type takes `T::ss_fixed_point` in the caller before this runs.
 fn newton_ss_derivative_correction_g<T, FFor>(
     u_star: &[T],
     n: usize,
@@ -1166,7 +1168,7 @@ where
     // carries no jet), so each column's dual parts are `∂J_P/∂(θ,η)` — exactly what the dual solve
     // below needs to propagate the 2nd-order derivative. Relative step, floored for a near-zero
     // trough; one-sided (reusing `g0`) keeps it to `n + 1` solves.
-    let scale = u_star.iter().fold(1e-8_f64, |m, x| m.max(x.val().abs()));
+    let scale = u_star.iter().fold(1e-8_f64, |m, x| m.max(x.plain().abs()));
     let eps = 1e-5 * scale;
     let mut i_minus_j = vec![T::from_f64(0.0); n * n];
     for i in 0..n {
@@ -1181,7 +1183,7 @@ where
     }
     let step = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_j, &residual, n)?;
     let mut u_new: Vec<T> = (0..n).map(|i| u_star[i] + step[i]).collect();
-    if u_new.iter().any(|x| !x.val().is_finite()) {
+    if u_new.iter().any(|x| !x.plain().is_finite()) {
         return None;
     }
     // The difference quotient's `J_P` is a preconditioner, not the answer: one step leaves the
@@ -1196,7 +1198,7 @@ where
         for i in 0..n {
             u_new[i] = u_new[i] + step[i];
         }
-        if u_new.iter().any(|x| !x.val().is_finite()) {
+        if u_new.iter().any(|x| !x.plain().is_finite()) {
             return None;
         }
     }
@@ -1228,6 +1230,7 @@ const SS_NEWTON_REFINEMENTS: usize = 2;
 /// contract within [`SS_ANDERSON_MAX_ITERS`] (a non-finite iterate, or `ρ ≥ 1`: no periodic SS).
 ///
 /// [Anderson acceleration]: https://doi.org/10.1137/10078356X
+/// Non-recording: a recording type takes `T::ss_fixed_point` in the caller before this runs.
 fn anderson_ss_fixed_point_g<T, FFor>(
     n: usize,
     ii: f64,
@@ -1256,7 +1259,7 @@ where
     // point (a huge value where a saturated RHS barely moves), whose small *relative* residual
     // would otherwise false-trip the convergence test. Bail so the caller falls to the capped
     // pulse train + #867 warning instead of returning garbage (e.g. a huge negative "trough").
-    let seed_mag = u.iter().fold(1.0_f64, |m, x| m.max(x.val().abs()));
+    let seed_mag = u.iter().fold(1.0_f64, |m, x| m.max(x.plain().abs()));
     // Tie the ceiling to the accuracy at which a genuine fixed point can still be
     // distinguished from solver noise. The previous fixed `1e8` factor contradicted
     // the seed-scale bound below: at the default reltol it admitted an over-capacity
@@ -1281,15 +1284,15 @@ where
     for iter in 0..SS_ANDERSON_MAX_ITERS {
         let g = advance_forced(&u)?;
         if g.iter()
-            .any(|x| !x.val().is_finite() || x.val().abs() > diverged_ceiling)
+            .any(|x| !x.plain().is_finite() || x.plain().abs() > diverged_ceiling)
         {
             return None;
         }
         // Relative-L∞ residual of the one-cycle map on the value parts.
         let (mut max_res, mut max_mag) = (0.0_f64, 0.0_f64);
         for (gi, ui) in g.iter().zip(&u) {
-            max_res = max_res.max((gi.val() - ui.val()).abs());
-            max_mag = max_mag.max(gi.val().abs());
+            max_res = max_res.max((gi.plain() - ui.plain()).abs());
+            max_mag = max_mag.max(gi.plain().abs());
         }
         let tol = conv_tol * max_mag + abstol;
         // Convergence needs BOTH a small residual (`u` is a fixed point of `P`) AND a settled
@@ -1301,7 +1304,7 @@ where
             Some(p) => {
                 u.iter()
                     .zip(p)
-                    .fold(0.0_f64, |m, (a, b)| m.max((a.val() - b.val()).abs()))
+                    .fold(0.0_f64, |m, (a, b)| m.max((a.plain() - b.plain()).abs()))
                     <= tol
             }
             None => false, // the seed is not, on its own, evidence of convergence
@@ -1313,7 +1316,7 @@ where
             // candidate that satisfies the relative test yet fails either is an over-capacity map
             // Anderson extrapolated to garbage; there is no periodic SS, so decline (→ caller's
             // capped pulse train + #867 warning) rather than return it.
-            let nonneg = g.iter().all(|x| x.val() >= -(tol + abstol));
+            let nonneg = g.iter().all(|x| x.plain() >= -(tol + abstol));
             if max_res > seed_residual_bound || !nonneg {
                 return None;
             }
@@ -1346,6 +1349,7 @@ where
 /// and return `g_last − ΔG·γ` in `T` arithmetic so a dual state's derivative rides the same
 /// combination. Reduces to a plain Picard step (`g_last`) with a single history point or a singular
 /// least-squares.
+/// Non-recording: called only by `anderson_ss_fixed_point_g`.
 fn anderson_combine<T: crate::sens::num::PkNum>(
     u_hist: &[Vec<T>],
     g_hist: &[Vec<T>],
@@ -1361,7 +1365,7 @@ fn anderson_combine<T: crate::sens::num::PkNum>(
     let f: Vec<Vec<f64>> = (0..k)
         .map(|i| {
             (0..n)
-                .map(|r| g_hist[i][r].val() - u_hist[i][r].val())
+                .map(|r| g_hist[i][r].plain() - u_hist[i][r].plain())
                 .collect()
         })
         .collect();
@@ -2850,12 +2854,12 @@ fn ss_periodic_forcing_shifted<T: crate::sens::num::PkNum>(
     let mut j = 0usize;
     while j < SS_EQUILIBRATION_CYCLES {
         let tad_j = tad_cycle(tad, ii, shift, j);
-        if tad_j.val() > 0.0 {
+        if tad_j.plain() > 0.0 {
             let term = prep.rate(tad_j, dose_mass);
             local = local + term;
             if j >= 1
-                && local.val().abs() > 0.0
-                && term.val().abs() <= SS_TAIL_REL_FLOOR * local.val().abs()
+                && local.plain().abs() > 0.0
+                && term.plain().abs() <= SS_TAIL_REL_FLOOR * local.plain().abs()
             {
                 break;
             }
@@ -3124,13 +3128,13 @@ pub(crate) fn add_prepared_input_rate_forcing<
                 if t_eff.br_cmp(crate::sens::num::BranchCmp::Gt, reached) {
                     // Not begun: every stage of the segment must precede the onset, i.e. the
                     // caller's break list holds it (`rate_infused` no longer decides pointwise).
+                    // A debug check on values, skipped on a dependent recorded value.
                     debug_assert!(
-                        infusion_edge_is_a_break(t.seen_value(), t_eff.seen_value()),
-                        "infusion onset {} lies inside the segment [{}, {}]: a caller's break \
-                         list lacks it",
-                        t_eff.seen_value(),
-                        since.seen_value(),
-                        t.seen_value()
+                        t.nonrec_val()
+                            .zip(t_eff.nonrec_val())
+                            .is_none_or(|(a, b)| infusion_edge_is_a_break(a, b)),
+                        "an infusion onset lies inside the segment: a caller's break list \
+                         lacks it"
                     );
                     continue;
                 }
@@ -3159,12 +3163,14 @@ pub(crate) fn add_prepared_input_rate_forcing<
                 } else {
                     // The same predicate, [`infusion_edge_is_a_break`] negated: one plain `f64`
                     // compare per stage for the number types that record nothing.
-                    let tail_age =
-                        if ended || !infusion_edge_is_a_break(t.seen_value(), end.seen_value()) {
-                            Some(t - end)
-                        } else {
-                            None
-                        };
+                    let tail_age = if ended
+                        || (!T::RECORDS_BRANCHES
+                            && !infusion_edge_is_a_break(t.plain(), end.plain()))
+                    {
+                        Some(t - end)
+                    } else {
+                        None
+                    };
                     prep.rate_infused(tad, dose_mass, window, tail_age)
                 }
             } else if T::RECORDS_BRANCHES {
@@ -3176,7 +3182,7 @@ pub(crate) fn add_prepared_input_rate_forcing<
                 let safe = T::select_if(Gt, tad, zero, tad, one);
                 T::select_if(Gt, tad, zero, prep.rate(safe, dose_mass), zero)
             } else {
-                if tad.val() <= 0.0 {
+                if tad.plain() <= 0.0 {
                     continue;
                 }
                 prep.rate(tad, dose_mass)

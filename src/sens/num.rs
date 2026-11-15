@@ -54,18 +54,30 @@ pub enum HostFn {
     LuFactor,
     /// The forcing column's scale in an augmented generator (`ode::linear::forcing_scale`).
     ForcingScale,
+    /// `[a.rem_euclid(b), a.div_euclid(b)]` of the model language's `mod`: the value and the
+    /// quotient its jet `a′ − q·b′` is built with.
+    RemEuclid,
 }
 
 impl HostFn {
     /// Every analysis, by index (a native call passes the index).
-    const ALL: [HostFn; 4] = [
+    pub(crate) const ALL: [HostFn; 5] = [
         HostFn::Spectral,
         HostFn::PadeSquarings,
         HostFn::LuFactor,
         HostFn::ForcingScale,
+        HostFn::RemEuclid,
     ];
+    /// Exhaustive on purpose: a new analysis does not compile until it has an index (and
+    /// [`Self::compute`] an arm), so it cannot be added half-wired.
     pub(crate) fn index(self) -> u16 {
-        Self::ALL.iter().position(|&f| f == self).expect("listed") as u16
+        match self {
+            HostFn::Spectral => 0,
+            HostFn::PadeSquarings => 1,
+            HostFn::LuFactor => 2,
+            HostFn::ForcingScale => 3,
+            HostFn::RemEuclid => 4,
+        }
     }
     pub(crate) fn from_index(i: u16) -> HostFn {
         Self::ALL[i as usize]
@@ -124,6 +136,11 @@ impl HostFn {
             HostFn::PadeSquarings => crate::ode::linear::pade_squarings(args, out),
             HostFn::LuFactor => crate::sens::linsolve::lu_factor_host(args, out),
             HostFn::ForcingScale => crate::ode::linear::forcing_scale(args, out),
+            HostFn::RemEuclid => {
+                out.clear();
+                out.push(args[0].rem_euclid(args[1]));
+                out.push(args[0].div_euclid(args[1]));
+            }
         }
     }
 }
@@ -149,6 +166,10 @@ pub enum JetFn {
     InvMills,
     /// `eˣ − 1` (an interval-censored record's probability).
     ExpM1,
+    /// `(eˣ − 1)/x`, through its removable point (`ode::linear::exprel_k`).
+    Exprel,
+    /// `ln Γ(x)` (`[lnΓ, ψ, ψ′, ψ″, ψ‴]`).
+    LnGamma,
 }
 
 impl JetFn {
@@ -170,23 +191,51 @@ impl JetFn {
                 let e = x.exp();
                 [x.exp_m1(), e, e, e, e]
             }
+            JetFn::Exprel => std::array::from_fn(|m| crate::ode::linear::exprel_k(x, m)),
+            JetFn::LnGamma => {
+                use crate::stats::special as sp;
+                [
+                    sp::ln_gamma(x),
+                    sp::digamma(x),
+                    sp::trigamma(x),
+                    sp::tetragamma(x),
+                    sp::pentagamma(x),
+                ]
+            }
         }
     }
+    /// Exhaustive on purpose: a new function does not compile until it has an index and a
+    /// [`Self::jet`] arm, which is its derivative rule — there is no jet-free `JetFn`.
     pub(crate) const fn index(self) -> u8 {
-        self as u8
+        match self {
+            JetFn::NegLogNormCdf => 0,
+            JetFn::Softplus => 1,
+            JetFn::Pnorm => 2,
+            JetFn::Tanh => 3,
+            JetFn::Logistic => 4,
+            JetFn::LogNormCdf => 5,
+            JetFn::InvMills => 6,
+            JetFn::ExpM1 => 7,
+            JetFn::Exprel => 8,
+            JetFn::LnGamma => 9,
+        }
     }
+    /// Every function, in index order (see the test pinning it to [`Self::index`]).
+    pub(crate) const ALL: [JetFn; 10] = [
+        JetFn::NegLogNormCdf,
+        JetFn::Softplus,
+        JetFn::Pnorm,
+        JetFn::Tanh,
+        JetFn::Logistic,
+        JetFn::LogNormCdf,
+        JetFn::InvMills,
+        JetFn::ExpM1,
+        JetFn::Exprel,
+        JetFn::LnGamma,
+    ];
     /// The function of [`Self::index`] `i`.
     pub(crate) const fn from_index(i: u8) -> JetFn {
-        match i {
-            0 => JetFn::NegLogNormCdf,
-            1 => JetFn::Softplus,
-            2 => JetFn::Pnorm,
-            3 => JetFn::Tanh,
-            4 => JetFn::Logistic,
-            5 => JetFn::LogNormCdf,
-            6 => JetFn::InvMills,
-            _ => JetFn::ExpM1,
-        }
+        Self::ALL[i as usize]
     }
 }
 
@@ -340,8 +389,14 @@ pub trait PkNum:
     /// Seed dual dimension `dim` as an independent variable at value `x`. `f64`
     /// carries no derivatives, so it ignores `dim` and behaves like `from_f64`.
     fn var(x: f64, dim: usize) -> Self;
-    /// The underlying value — for guards / branch conditions only.
-    fn val(self) -> f64;
+    /// The value, **only** when it is a plain number: `Some` for every non-recording type and
+    /// for a recording type's constants, `None` for a value the recording type (#2786) holds
+    /// as depending on an input. A recording must never read such a value, and this is the one
+    /// place the trait says so: there is no `val()` on `PkNum`. Code that cannot decide
+    /// without it decides through the branch API instead (`br_cmp`, `br_cmp_c`, `br_abs_lt`,
+    /// `br_is_nan`, `select_if`), or reads it with [`NonRecRead::plain`] inside an
+    /// `!T::RECORDS_BRANCHES` arm.
+    fn nonrec_val(self) -> Option<f64>;
     /// `exp`.
     fn exp(self) -> Self;
     /// `ln`.
@@ -360,11 +415,7 @@ pub trait PkNum:
     fn cos(self) -> Self;
     /// `sin` (the model language's, #2720): its jet lifted from the value, which a
     /// recording type (#2786) records as one primitive instead.
-    #[inline]
-    fn sin(self) -> Self {
-        let (s, c) = (self.val().sin(), self.val().cos());
-        self.lift4(s, c, -s, -c, s)
-    }
+    fn sin(self) -> Self;
     /// `acos` (3-cpt trigonometric cubic root solve).
     fn acos(self) -> Self;
     /// Lower-clamp the value to `lo` (branch on `.val()`), used by the bytecode
@@ -378,42 +429,26 @@ pub trait PkNum:
     /// `f` on the values of `args`: outputs that are constants of the computation (no
     /// derivative flows through them). A recording type (#2786) records a call that runs `f`
     /// again on every evaluation.
-    fn host(f: HostFn, args: &[Self]) -> Vec<Self> {
-        let vals: Vec<f64> = args.iter().map(|x| x.val()).collect();
-        let mut out = Vec::new();
-        f.run(&vals, &mut out);
-        out.into_iter().map(Self::from_f64).collect()
-    }
+    fn host(f: HostFn, args: &[Self]) -> Vec<Self>;
     /// `f(self)` for a function given by its jet ([`JetFn`]): the jet lifted, on every type
     /// but a recording one (#2786), which records one primitive.
-    #[inline]
-    fn jet_unary(self, f: JetFn) -> Self {
-        let [v, d1, d2, d3, d4] = f.jet(self.val());
-        self.lift4(v, d1, d2, d3, d4)
-    }
+    fn jet_unary(self, f: JetFn) -> Self;
     /// `f⁽ᵏ⁾(self)`, the `k`-th derivative of a jet function, as a function of `self`: the
     /// jet shifted by `k` and lifted (`NaN` past the fourth derivative), on every type but a
     /// recording one, which records one primitive. What a nested dual over a recording type
     /// builds [`Self::jet_unary`]'s chain rule from.
-    #[inline]
-    fn jet_k(self, f: JetFn, k: u8) -> Self {
-        let j = f.jet(self.val());
-        let at = |i: usize| j.get(k as usize + i).copied().unwrap_or(f64::NAN);
-        self.lift4(at(0), at(1), at(2), at(3), at(4))
-    }
+    fn jet_k(self, f: JetFn, k: u8) -> Self;
     /// The value as a constant: no derivative.
-    #[inline]
-    fn value_only(self) -> Self {
-        Self::from_f64(self.val())
-    }
+    fn value_only(self) -> Self;
+    /// `m = ⌊self / step⌋` (`step > 0`) as an `f64`, **with the two comparisons that make it
+    /// the floor** (`self ≥ m·step`, `self < (m+1)·step`) decided through the branch API: a
+    /// recording type (#2786) guards them, so the integer follows the value on every
+    /// evaluation. The one way to turn a recorded value into a whole-number count.
+    fn br_floor_div(self, step: f64) -> f64;
     /// `exprel(z) = (e^z − 1)/z` at `self`, through the derivative orders the type carries
     /// (`orders`, as `ode::linear` decides them): the spectral propagation's `φ(λ, Δ)/Δ`. A
     /// recording type (#2786) records it as one primitive.
-    #[inline]
-    fn exprel(self, orders: usize) -> Self {
-        let [g0, g1, g2, g3, g4] = crate::ode::linear::exprel_derivs(self.val(), orders);
-        self.lift4(g0, g1, g2, g3, g4)
-    }
+    fn exprel(self, orders: usize) -> Self;
     /// The regularized incomplete gamma `P(self, x)`, or `Q = 1 − P` when `upper`
     /// (`stats::special::regularized_gamma_p` / `_q`). A recording type (#2786) records it
     /// as one primitive rather than its value-dependent iteration.
@@ -440,52 +475,27 @@ pub trait PkNum:
     /// `self cc other` on the values, for a branch the code takes on them. The recording
     /// type (#2786) turns it into a guard its compiled plan re-evaluates, so a branch that
     /// would go the other way records another variant instead of being baked in.
-    #[inline]
-    fn br_cmp(self, cc: BranchCmp, other: Self) -> bool {
-        cc.holds(self.val(), other.val())
-    }
+    fn br_cmp(self, cc: BranchCmp, other: Self) -> bool;
     /// [`Self::br_cmp`] against a literal.
-    #[inline]
-    fn br_cmp_c(self, cc: BranchCmp, c: f64) -> bool {
-        cc.holds(self.val(), c)
-    }
+    fn br_cmp_c(self, cc: BranchCmp, c: f64) -> bool;
     /// `base + self cc c` on the values, for a branch (see [`Self::br_cmp`]): a time shifted
     /// by a parameter, such as a dose's lagged arrival `t_dose + lag` against a time.
-    #[inline]
-    fn br_shift_cmp(self, base: f64, cc: BranchCmp, c: f64) -> bool {
-        cc.holds(base + self.val(), c)
-    }
+    fn br_shift_cmp(self, base: f64, cc: BranchCmp, c: f64) -> bool;
     /// Whether this type records its branches (a recording type, #2786), so code that
     /// decides on an `f64` it derived from a parameter must decide through the branch API
     /// instead. `false` for every number type: their decisions stay as they are.
     const RECORDS_BRANCHES: bool = false;
     /// `|self| < tol` on the value, for a branch (see [`Self::br_cmp`]).
-    #[inline]
-    fn br_abs_lt(self, tol: f64) -> bool {
-        self.val().abs() < tol
-    }
+    fn br_abs_lt(self, tol: f64) -> bool;
     /// `|self − other| < tol` on the values, for a branch (see [`Self::br_cmp`]).
-    #[inline]
-    fn br_absdiff_lt(self, other: Self, tol: f64) -> bool {
-        (self.val() - other.val()).abs() < tol
-    }
+    fn br_absdiff_lt(self, other: Self, tol: f64) -> bool;
     /// `if x cc y { a } else { b }` on the values, as a selection rather than a branch: a
     /// recording type (#2786) records it, so the choice is made again on every evaluation —
     /// for a condition that changes inside the code it records (a time window inside an ODE
     /// step), where a branch's guard would fail.
-    #[inline]
-    fn select_if(cc: BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self {
-        if cc.holds(x.val(), y.val()) {
-            a
-        } else {
-            b
-        }
-    }
+    fn select_if(cc: BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self;
     /// Whether the value is `NaN`, for a branch (see [`Self::br_cmp`]).
-    #[inline]
-    fn br_is_nan(self) -> bool {
-        self.val().is_nan()
-    }
+    fn br_is_nan(self) -> bool;
     /// The largest absolute **derivative** component — gradient, and the Hessian block when
     /// the type carries one; `0.0` for `f64`. Like [`jets_finite`](Self::jets_finite) it
     /// ignores [`val`](Self::val).
@@ -511,10 +521,7 @@ pub trait PkNum:
     /// `self`'s jet), so an implementor outside this crate keeps compiling (#2093 review): it is
     /// exact for every type tracking at most second derivatives, which every external `PkNum`
     /// predating this member is. Every type in this crate overrides it.
-    fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
-        let dx = self - Self::from_f64(self.val());
-        Self::from_f64(v) + dx * Self::from_f64(d1) + dx * dx * Self::from_f64(0.5 * d2)
-    }
+    fn lift2(self, v: f64, d1: f64, d2: f64) -> Self;
     /// [`Self::lift2`] with the third derivative `d3 = φ‴` too, for types that carry a
     /// nested dual over a differentiable base (`sens::jet::DualT`): their
     /// `φ″` factor needs its own derivative. The default drops `d3`, which is exact for
@@ -558,14 +565,17 @@ pub(crate) trait RecHooks: Sized {
     }
     /// `⌊self⌋` as a constant (no derivative): a recording type (#2786) records it, so it
     /// follows the value on every evaluation.
-    #[cfg(feature = "markov")]
-    #[inline]
     fn floor_c(self) -> Self
     where
-        Self: PkNum,
-    {
-        Self::from_f64(self.val().floor())
-    }
+        Self: PkNum;
+    /// `⌈self⌉` as a constant (see [`Self::floor_c`]).
+    fn ceil_c(self) -> Self
+    where
+        Self: PkNum;
+    /// `self` rounded half away from zero, as a constant (see [`Self::floor_c`]).
+    fn round_c(self) -> Self
+    where
+        Self: PkNum;
     /// The next ODE segment's span is `[t0, t1]`, times that may depend on the inputs (a
     /// lagged arrival, a zero-order window's end), value-only. A recording type (#2786) keeps
     /// them so the segment it records takes its span as run-time inputs ([`Self::take_span`])
@@ -581,23 +591,21 @@ pub(crate) trait RecHooks: Sized {
     /// A segment time's value, for the solver's `f64` span: the value on every type; on a
     /// recording type the value it saw, allowed only for a time [`Self::span_hint`] named (the
     /// segment it is recording takes the time itself).
-    #[inline]
     fn span_value(self) -> f64
     where
-        Self: PkNum,
-    {
-        self.val()
-    }
+        Self: PkNum;
+    /// The value of a dependent value a recording refused to read: `fail`s the recording (it
+    /// falls back to finite differences) and returns what was seen; never reached by a type
+    /// that does not record.
+    fn value_read_refused(self) -> f64
+    where
+        Self: PkNum;
     /// The value, for a decision the code takes on it — a discrete outcome of a
     /// [`host`](Self::host) analysis. A recording type checks it comes out the same on every
     /// evaluation.
-    #[inline]
     fn br_value(self) -> f64
     where
-        Self: PkNum,
-    {
-        self.val()
-    }
+        Self: PkNum;
     /// `body` applied `count` times to `x0`, `count` a whole number the recording reads at run
     /// time (#2786, `kernel_jit::record_repeat`): `None` for every type that is not a recording
     /// type (the caller loops), `Some(None)` when the recording cannot take the call.
@@ -624,26 +632,26 @@ pub(crate) trait RecHooks: Sized {
     ) -> Option<Option<Vec<Self>>> {
         None
     }
-    /// The value, for a computation whose result is checked not to depend on it — a
-    /// parameter slot the tape shows constant in θ and η, evaluated with every other slot.
-    /// A recording type (#2786) reads the value it saw, with no guard.
-    #[inline]
-    fn seen_value(self) -> f64
-    where
-        Self: PkNum,
-    {
-        self.val()
-    }
     /// A magnitude to scale a computation by whose result does not depend on it — a probe
     /// step, a column scaling: the value's size, and the jets' where the type carries them. A
     /// recording type (#2786) keeps the one it saw; any scale gives the same exact result.
-    #[inline]
     fn magnitude_hint(self) -> f64
     where
-        Self: PkNum,
-    {
-        self.val().abs().max(self.jet_max_abs())
-    }
+        Self: PkNum;
+    /// A representative value to evaluate an `f64` computation at, whose result is **checked
+    /// not to depend on it** (a parameter slot the tape shows constant in θ and η, evaluated
+    /// with every other slot; a log-sum-exp shift that is exact at any value). Not a decision:
+    /// nothing branches on it. A recording type (#2786) hands over the value it saw, with no
+    /// guard, which is sound only for that use, so each call site names why (`value-read-ok`
+    /// marker, enforced by the `recorded-value-read` rule).
+    fn probe_value(self) -> f64
+    where
+        Self: PkNum;
+    /// `|value|` as a scale, `NaN` kept: a magnitude a check compares against that does not
+    /// decide anything. A recording type (#2786) keeps the one it saw, with no guard.
+    fn abs_hint(self) -> f64
+    where
+        Self: PkNum;
     /// Of two spellings of one quantity, `skip` and `take` — `take` the one with refinement
     /// step `k` applied, a step that makes derivative order `k` exact (`linsolve`'s solve, a
     /// spectral chord): `take` for every type but a recording type (#2786), whose compiled
@@ -700,7 +708,205 @@ pub(crate) trait RecHooks: Sized {
     fn chunk_mark() {}
 }
 
-impl RecHooks for f64 {}
+/// A number type that reads its value without recording anything: `f64`, the forward duals,
+/// `Taylor`, and a nested dual over one. **Not** the recording type `kernel_jit::Tr` (#2786):
+/// a recording must never read a value, so [`PkNum`] — what every `*_g<T: PkNum>` kernel is
+/// written over — has no value accessor at all, and a kernel that needs one cannot compile
+/// until it decides through the branch API (`br_cmp`, `br_cmp_c`, `br_abs_lt`, `br_is_nan`,
+/// `select_if`), or is itself bounded `T: NonRecording` (so it can never be recorded).
+pub trait NonRecording: PkNum {
+    /// The underlying value.
+    fn val(self) -> f64;
+}
+
+/// `plain()`: the value of a number in code that runs only for non-recording types (inside
+/// `if !T::RECORDS_BRANCHES`, or after `if T::RECORDS_BRANCHES { return .. }`). On a dependent
+/// recorded value it fails the recording ([`RecHooks::value_read_refused`]) — which the arm
+/// condition rules out — instead of handing the value over.
+pub(crate) trait NonRecRead: PkNum {
+    #[inline]
+    fn plain(self) -> f64 {
+        match self.nonrec_val() {
+            Some(v) => v,
+            None => self.value_read_refused(),
+        }
+    }
+}
+impl<T: PkNum> NonRecRead for T {}
+
+/// The value-reading methods of [`PkNum`], for a type that is [`NonRecording`]: the branch
+/// API and the lifts on the plain value. Expanded inside `impl PkNum for X`.
+macro_rules! plain_pknum_methods {
+    () => {
+        fn host(f: $crate::sens::num::HostFn, args: &[Self]) -> Vec<Self> {
+            let vals: Vec<f64> = args
+                .iter()
+                .map(|x| $crate::sens::num::NonRecording::val(*x))
+                .collect();
+            let mut out = Vec::new();
+            f.run(&vals, &mut out);
+            out.into_iter().map(Self::from_f64).collect()
+        }
+        #[inline]
+        fn jet_unary(self, f: $crate::sens::num::JetFn) -> Self {
+            let [v, d1, d2, d3, d4] = f.jet($crate::sens::num::NonRecording::val(self));
+            self.lift4(v, d1, d2, d3, d4)
+        }
+        #[inline]
+        fn jet_k(self, f: $crate::sens::num::JetFn, k: u8) -> Self {
+            let j = f.jet($crate::sens::num::NonRecording::val(self));
+            let at = |i: usize| j.get(k as usize + i).copied().unwrap_or(f64::NAN);
+            self.lift4(at(0), at(1), at(2), at(3), at(4))
+        }
+        #[inline]
+        fn value_only(self) -> Self {
+            Self::from_f64($crate::sens::num::NonRecording::val(self))
+        }
+        #[inline]
+        fn br_cmp(self, cc: $crate::sens::num::BranchCmp, other: Self) -> bool {
+            cc.holds(
+                $crate::sens::num::NonRecording::val(self),
+                $crate::sens::num::NonRecording::val(other),
+            )
+        }
+        #[inline]
+        fn br_cmp_c(self, cc: $crate::sens::num::BranchCmp, c: f64) -> bool {
+            cc.holds($crate::sens::num::NonRecording::val(self), c)
+        }
+        #[inline]
+        fn br_shift_cmp(self, base: f64, cc: $crate::sens::num::BranchCmp, c: f64) -> bool {
+            cc.holds(base + $crate::sens::num::NonRecording::val(self), c)
+        }
+        #[inline]
+        fn br_abs_lt(self, tol: f64) -> bool {
+            $crate::sens::num::NonRecording::val(self).abs() < tol
+        }
+        #[inline]
+        fn br_absdiff_lt(self, other: Self, tol: f64) -> bool {
+            ($crate::sens::num::NonRecording::val(self)
+                - $crate::sens::num::NonRecording::val(other))
+            .abs()
+                < tol
+        }
+        #[inline]
+        fn select_if(cc: $crate::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self {
+            if cc.holds(
+                $crate::sens::num::NonRecording::val(x),
+                $crate::sens::num::NonRecording::val(y),
+            ) {
+                a
+            } else {
+                b
+            }
+        }
+        #[inline]
+        fn br_is_nan(self) -> bool {
+            $crate::sens::num::NonRecording::val(self).is_nan()
+        }
+        #[inline]
+        fn br_floor_div(self, step: f64) -> f64 {
+            ($crate::sens::num::NonRecording::val(self) / step).floor()
+        }
+        #[inline]
+        fn nonrec_val(self) -> Option<f64> {
+            Some($crate::sens::num::NonRecording::val(self))
+        }
+    };
+}
+pub(crate) use plain_pknum_methods;
+
+/// [`plain_pknum_methods`]'s `sin` and `exprel`, for a type that has no hand-written ones.
+macro_rules! plain_sin_exprel {
+    () => {
+        #[inline]
+        fn sin(self) -> Self {
+            let v = $crate::sens::num::NonRecording::val(self);
+            let (s, c) = (v.sin(), v.cos());
+            self.lift4(s, c, -s, -c, s)
+        }
+        #[inline]
+        fn exprel(self, orders: usize) -> Self {
+            let [g0, g1, g2, g3, g4] = $crate::ode::linear::exprel_derivs(
+                $crate::sens::num::NonRecording::val(self),
+                orders,
+            );
+            self.lift4(g0, g1, g2, g3, g4)
+        }
+    };
+}
+pub(crate) use plain_sin_exprel;
+
+/// [`plain_pknum_methods`]'s `lift2`, for a type that has no hand-written one.
+#[cfg(test)]
+macro_rules! plain_lift2 {
+    () => {
+        fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
+            let dx = self - Self::from_f64($crate::sens::num::NonRecording::val(self));
+            Self::from_f64(v) + dx * Self::from_f64(d1) + dx * dx * Self::from_f64(0.5 * d2)
+        }
+    };
+}
+
+/// The value-reading [`RecHooks`] methods, for a [`NonRecording`] type.
+macro_rules! plain_rechooks_methods {
+    () => {
+        #[inline]
+        fn floor_c(self) -> Self {
+            <Self as $crate::sens::num::PkNum>::from_f64(
+                $crate::sens::num::NonRecording::val(self).floor(),
+            )
+        }
+        #[inline]
+        fn ceil_c(self) -> Self {
+            <Self as $crate::sens::num::PkNum>::from_f64(
+                $crate::sens::num::NonRecording::val(self).ceil(),
+            )
+        }
+        #[inline]
+        fn round_c(self) -> Self {
+            <Self as $crate::sens::num::PkNum>::from_f64(
+                $crate::sens::num::NonRecording::val(self).round(),
+            )
+        }
+        #[inline]
+        fn span_value(self) -> f64 {
+            $crate::sens::num::NonRecording::val(self)
+        }
+        #[inline]
+        fn br_value(self) -> f64 {
+            $crate::sens::num::NonRecording::val(self)
+        }
+        #[inline]
+        fn value_read_refused(self) -> f64 {
+            $crate::sens::num::NonRecording::val(self)
+        }
+        #[inline]
+        fn abs_hint(self) -> f64 {
+            $crate::sens::num::NonRecording::val(self).abs()
+        }
+        #[inline]
+        fn probe_value(self) -> f64 {
+            $crate::sens::num::NonRecording::val(self)
+        }
+        #[inline]
+        fn magnitude_hint(self) -> f64 {
+            $crate::sens::num::NonRecording::val(self)
+                .abs()
+                .max($crate::sens::num::PkNum::jet_max_abs(self))
+        }
+    };
+}
+pub(crate) use plain_rechooks_methods;
+
+impl RecHooks for f64 {
+    plain_rechooks_methods!();
+}
+impl NonRecording for f64 {
+    #[inline]
+    fn val(self) -> f64 {
+        self
+    }
+}
 
 impl PkNum for f64 {
     const SECOND_ORDER: bool = false;
@@ -726,10 +932,7 @@ impl PkNum for f64 {
     fn var(x: f64, _dim: usize) -> Self {
         x
     }
-    #[inline]
-    fn val(self) -> f64 {
-        self
-    }
+    plain_pknum_methods!();
     #[inline]
     fn exp(self) -> Self {
         f64::exp(self)
@@ -795,7 +998,15 @@ impl PkNum for f64 {
 /// scalar `f64` impl stays hand-written (its bodies are inline formulas, not delegation).
 macro_rules! impl_pknum_delegate {
     ($ty:ident<$(const $c:ident: usize),+>, second_order = $so:expr) => {
-        impl<$(const $c: usize),+> RecHooks for $ty<$($c),+> {}
+        impl<$(const $c: usize),+> RecHooks for $ty<$($c),+> {
+            plain_rechooks_methods!();
+        }
+        impl<$(const $c: usize),+> NonRecording for $ty<$($c),+> {
+            #[inline]
+            fn val(self) -> f64 {
+                self.value
+            }
+        }
         impl<$(const $c: usize),+> PkNum for $ty<$($c),+> {
             const SECOND_ORDER: bool = $so;
             const JET_ORDER: usize = if $so { 2 } else { 1 };
@@ -807,7 +1018,7 @@ macro_rules! impl_pknum_delegate {
             /// carry). A `NaN` or `−0.0` entry reads non-constant, the conservative side.
             #[inline]
             fn is_constant(self) -> bool {
-                $ty::same_bits(&self, &$ty::constant(self.val()))
+                $ty::same_bits(&self, &$ty::constant(self.value))
             }
             #[inline]
             fn from_f64(x: f64) -> Self {
@@ -817,10 +1028,8 @@ macro_rules! impl_pknum_delegate {
             fn var(x: f64, dim: usize) -> Self {
                 $ty::var(x, dim)
             }
-            #[inline]
-            fn val(self) -> f64 {
-                self.value
-            }
+            plain_pknum_methods!();
+            plain_sin_exprel!();
             #[inline]
             fn exp(self) -> Self {
                 $ty::exp(self)
@@ -1137,21 +1346,21 @@ mod tests {
     /// safe argument for all: positive (exp/ln/sqrt/pow), in `(0,1)` (logit/
     /// inv_logit) and in `[-1,1]` (acos).
     fn exercise<T: PkNum>(x: T) {
-        let _ = T::from_f64(1.0).val();
-        let _ = x.val();
-        let _ = x.exp().val();
-        let _ = x.ln().val();
-        let _ = x.sqrt().val();
-        let _ = x.pow(T::from_f64(2.0)).val();
-        let _ = x.abs().val();
-        let _ = (-x.abs()).abs().val(); // negative branch of abs
-        let _ = x.cos().val();
-        let _ = x.acos().val();
-        let _ = x.inv_logit().val();
-        let _ = x.logit().val();
-        let _ = x.guard_floor(1e-6).val();
-        let _ = x.guard_floor(10.0).val(); // floor-active branch
-        let _ = x.ln_gamma().val(); // 0.7 > 0, in the ln_gamma domain
+        let _ = T::from_f64(1.0).plain();
+        let _ = x.plain();
+        let _ = x.exp().plain();
+        let _ = x.ln().plain();
+        let _ = x.sqrt().plain();
+        let _ = x.pow(T::from_f64(2.0)).plain();
+        let _ = x.abs().plain();
+        let _ = (-x.abs()).abs().plain(); // negative branch of abs
+        let _ = x.cos().plain();
+        let _ = x.acos().plain();
+        let _ = x.inv_logit().plain();
+        let _ = x.logit().plain();
+        let _ = x.guard_floor(1e-6).plain();
+        let _ = x.guard_floor(10.0).plain(); // floor-active branch
+        let _ = x.ln_gamma().plain(); // 0.7 > 0, in the ln_gamma domain
     }
 
     #[test]
@@ -1186,17 +1395,17 @@ mod tests {
                         y.jets_finite() && y.is_constant(),
                         "{name}: sqrt({x:e}, floored = {floored}) is not flat \
                          (val = {}, jets_finite = {}, constant = {})",
-                        y.val(),
+                        y.plain(),
                         y.jets_finite(),
                         y.is_constant()
                     );
                     if floored || x == 0.0 {
-                        assert_eq!(y.val(), 0.0, "{name}: sqrt({x:e}) value");
+                        assert_eq!(y.plain(), 0.0, "{name}: sqrt({x:e}) value");
                     }
                 }
             }
             let y = mk(0.25).sqrt();
-            assert_eq!(y.val(), 0.5, "{name}: sqrt(0.25) value");
+            assert_eq!(y.plain(), 0.5, "{name}: sqrt(0.25) value");
             assert!(
                 y.jets_finite() && !y.is_constant(),
                 "{name}: sqrt(0.25) must carry a live derivative"
@@ -1316,7 +1525,14 @@ mod tests {
         macro_rules! un {
             ($($f:ident),*) => { $(fn $f(self) -> Self { Ext(PkNum::$f(self.0)) })* };
         }
-        impl RecHooks for Ext {}
+        impl RecHooks for Ext {
+            plain_rechooks_methods!();
+        }
+        impl NonRecording for Ext {
+            fn val(self) -> f64 {
+                NonRecording::val(self.0)
+            }
+        }
         impl PkNum for Ext {
             const SECOND_ORDER: bool = true;
             fn from_f64(x: f64) -> Self {
@@ -1325,9 +1541,9 @@ mod tests {
             fn var(x: f64, dim: usize) -> Self {
                 Ext(<Dual2<1> as PkNum>::var(x, dim))
             }
-            fn val(self) -> f64 {
-                PkNum::val(self.0)
-            }
+            plain_pknum_methods!();
+            plain_sin_exprel!();
+            plain_lift2!();
             un!(exp, ln, sqrt, abs, inv_logit, logit, cos, acos, ln_gamma);
             fn pow(self, e: Self) -> Self {
                 Ext(PkNum::pow(self.0, e.0))

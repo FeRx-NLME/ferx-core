@@ -872,14 +872,14 @@ enum NanOk {
 /// inside a string literal is not a comment — and whether the line holds any
 /// code outside comments.
 #[derive(Default, Clone)]
-struct LineComment {
-    text: Option<String>,
-    has_code: bool,
+pub(crate) struct LineComment {
+    pub(crate) text: Option<String>,
+    pub(crate) has_code: bool,
 }
 
 /// Lex `text` just far enough to find line comments: string, raw-string, byte-
 /// string and char literals are skipped, as are (nested) block comments.
-fn line_comments(text: &str) -> Vec<LineComment> {
+pub(crate) fn line_comments(text: &str) -> Vec<LineComment> {
     let c: Vec<char> = text.chars().collect();
     let mut out = vec![LineComment::default(); text.lines().count() + 1];
     let (mut i, mut line) = (0usize, 0usize);

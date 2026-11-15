@@ -1270,3 +1270,47 @@ fn the_inner_solve_decides_the_evaluated_model_once_per_point() {
         );
     }
 }
+
+/// The model language's `floor` / `ceil` / `round` of an input-dependent value (an η-dependent
+/// expression) record as primitives: they used to read the value (`val` fails a recording), so
+/// every model that used one on an η fell back to finite differences. The terms are multiplied
+/// by zero, so the fit is warfarin's; what is pinned is that the plan serves it. Dies when
+/// `apply_unary` reads a value again, or `Tr::{floor,ceil,round}_c` stop recording.
+#[test]
+fn floor_ceil_round_of_a_dependent_value_do_not_fall_back() {
+    let text = std::fs::read_to_string("examples/warfarin.ferx").expect("read");
+    let patched = text.replace(
+        "CL = TVCL * exp(ETA_CL)",
+        "CL = TVCL * exp(ETA_CL) + 0.0 * (floor(ETA_CL * 40.0 + 0.3) + ceil(ETA_V * 40.0) \
+         + round(ETA_KA * 40.0))",
+    );
+    assert_ne!(patched, text, "the fixture line moved");
+    let dir = tempfile::tempdir().expect("tmp");
+    let file = dir.path().join("w.ferx");
+    std::fs::write(&file, patched).expect("write");
+    let parsed = crate::parser::model_parser::parse_full_model_file(&file).expect("parse");
+    let (pop, _) = crate::api::read_population_for(
+        &parsed.model,
+        &parsed.covariate_decls,
+        "data/warfarin.csv",
+        None,
+        parsed.fit_options.iov_column.as_deref(),
+        None,
+        &parsed.column_map,
+    )
+    .expect("read data");
+    let o = opts(EstimationMethod::FoceI);
+    let fit = crate::api::fit(&parsed.model, &pop, &parsed.model.default_params, &o).expect("fit");
+    assert!(
+        !fit.warnings.iter().any(|w| w.contains(TOKEN)),
+        "{:?}",
+        fit.warnings
+    );
+    assert!(fit.ofv.is_finite());
+    // Straddle: the same fit with every plan failing does report the fallback, so the absence
+    // above is the plan serving the subject, not the warning being unreachable.
+    let forced = plans_failing(|| {
+        crate::api::fit(&parsed.model, &pop, &parsed.model.default_params, &o).expect("fit")
+    });
+    assert!(forced.warnings.iter().any(|w| w.contains(TOKEN)));
+}

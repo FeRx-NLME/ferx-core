@@ -36,6 +36,7 @@
 //! and keeps the interpreter. `sqrt` is translated (#2844): its guard is `apply_unary`'s.
 use super::{apply_binary_in, apply_scalar_in, apply_unary, Bytecode, Op, Statement};
 use crate::sens::num::vm::VmNum;
+use crate::sens::num::NonRecRead;
 use ir::Cc;
 
 /// An instruction operand.
@@ -1207,17 +1208,30 @@ impl RhsRegProgram {
                 Flat::Present { d, a } if rec => {
                     r[d as usize] = T::select_if(Eq, r[a as usize], r[a as usize], one, zero)
                 }
+                // The arms below are for plain types: a recording type's `if rec` arms above take
+                // every one of these ops (`select_if` on the values, recorded as guards).
                 Flat::Cmp { d, cc, a, b } => {
-                    r[d as usize] = b01(cc.holds(r[a as usize].val(), r[b as usize].val()))
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(cc.holds(r[a as usize].plain(), r[b as usize].plain()))
                 }
                 Flat::And { d, a, b } => {
-                    r[d as usize] = b01(r[a as usize].val() != 0.0 && r[b as usize].val() != 0.0)
+                    let (x, y) = (r[a as usize], r[b as usize]);
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(x.plain() != 0.0 && y.plain() != 0.0)
                 }
                 Flat::Or { d, a, b } => {
-                    r[d as usize] = b01(r[a as usize].val() != 0.0 || r[b as usize].val() != 0.0)
+                    let (x, y) = (r[a as usize], r[b as usize]);
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(x.plain() != 0.0 || y.plain() != 0.0)
                 }
-                Flat::Not { d, a } => r[d as usize] = b01(r[a as usize].val() == 0.0),
-                Flat::Present { d, a } => r[d as usize] = b01(!r[a as usize].val().is_nan()),
+                Flat::Not { d, a } => {
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(r[a as usize].plain() == 0.0)
+                }
+                Flat::Present { d, a } => {
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(!r[a as usize].plain().is_nan())
+                }
                 Flat::HostArg { .. } | Flat::Host { .. } | Flat::HostOut { .. } => {
                     unreachable!("only a kernel recording makes a host call")
                 }
@@ -1232,7 +1246,9 @@ impl RhsRegProgram {
                     pc = self.both_arms(code, pc, to as usize, c, u, params, seeds, du, r);
                 }
                 Flat::Branch { c, to } => {
-                    if r[c as usize].val() == 0.0 {
+                    // A recording reaches here only with a constant condition (the arm above takes
+                    // an input-dependent one): its value is a constant of the plan.
+                    if r[c as usize].nonrec_val() == Some(0.0) {
                         pc = to as usize;
                     }
                 }

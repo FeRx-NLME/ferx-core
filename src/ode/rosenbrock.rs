@@ -60,6 +60,7 @@
 use super::predictions::DirectStep;
 use super::solver::{scale_tol, DirectCall, OdeMethod, OdeSolverOptions, StageRhs, StepClock};
 use crate::sens::linsolve::{lu_factor_in_place_g, lu_solve_in_place_g};
+use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
 
 /// Widest tableau shipped (Rodas5P). Sizing the coefficient block as a fixed array keeps the
@@ -633,7 +634,9 @@ pub(crate) fn call_direct<T: PkNum>(
             std::slice::from_raw_parts_mut(du.as_mut_ptr().cast::<f64>(), du.len()),
         )
     };
-    if !direct.eval(uf, pf, t.val(), duf) {
+    // SAFETY: `T` is `f64` (the `debug_assert` above, `registered_direct`'s `TypeId` test).
+    let tf = unsafe { *(&t as *const T).cast::<f64>() };
+    if !direct.eval(uf, pf, tf, duf) {
         rhs(u, params, t, du);
     }
 }
@@ -828,6 +831,7 @@ impl<T: PkNum> RosWorkspace<T> {
     /// `J` and `f_t` by forward differences, `f0` already computed: one right-hand-side call
     /// per state and one for the time.
     #[inline(always)]
+    /// Non-recording: `T::rhs_jacobian` is `true` for a recording type, so `refresh_jacobian` never differences one.
     fn differenced_jacobian<R: StageRhs<T> + ?Sized>(
         &mut self,
         rhs: &R,
@@ -837,7 +841,7 @@ impl<T: PkNum> RosWorkspace<T> {
     ) {
         let n = self.n;
         for j in 0..n {
-            let delt = (f64::EPSILON * u[j].val().abs().max(FD_FLOOR)).sqrt();
+            let delt = (f64::EPSILON * u[j].plain().abs().max(FD_FLOOR)).sqrt();
             self.u_tmp.copy_from_slice(u);
             self.u_tmp[j] = u[j] + T::from_f64(delt);
             rhs.call(&self.u_tmp, params, clock.start(), &mut self.f_tmp);
@@ -1040,12 +1044,13 @@ impl<T: PkNum> RosWorkspace<T> {
     /// RMS error norm over the scale band `abstol + reltol·max(|u_new|, |u|)`, on **values
     /// only** — identical in form to the RK45 control so a model that converges under one
     /// integrator sees the same accuracy contract under the other.
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
     fn err_norm(&self, u: &[T], opts: &OdeSolverOptions) -> f64 {
         ros_err_norm(
             self.n,
-            |i| self.u_new[i].val(),
-            |i| self.err[i].val(),
-            |i| u[i].val(),
+            |i| self.u_new[i].plain(),
+            |i| self.err[i].plain(),
+            |i| u[i].plain(),
             opts,
         )
     }
@@ -1271,7 +1276,7 @@ impl<T: PkNum> super::solver::StepBody<T> for RosStepper<T> {
         }
         // A recording type (#2786) reads its carried state as variables: its step decides
         // `usable` itself (the factorization's guarded verdict), never from a carried value.
-        self.usable = T::RECORDS_BRANCHES || v[at].val() == 1.0;
+        self.usable = T::RECORDS_BRANCHES || v[at].plain() == 1.0;
         self.jac_valid = true;
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::sens::num::NonRecRead;
 
 // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
 
@@ -36603,14 +36604,14 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
             );
             for j in 0..2 {
                 assert!(
-                    want[j].val().is_finite(),
+                    want[j].plain().is_finite(),
                     "{name} call {k}: oracle du[{j}] not finite"
                 );
                 assert!(
                     got[j].same_bits(&want[j]),
                     "{name} call {k} du[{j}]: lean {} vs full {}",
-                    got[j].val(),
-                    want[j].val()
+                    got[j].plain(),
+                    want[j].plain()
                 );
             }
         }

@@ -535,3 +535,99 @@ fn a_float_associated_call_is_not_a_write_of_its_arguments() {
         );
     }
 }
+
+// ---- recorded-value-read ----------------------------------------------------------------
+
+fn rvr(src: &str) -> Vec<usize> {
+    crate::lint_source("src/fixture.rs", src, false)
+        .unwrap()
+        .iter()
+        .filter(|f| f.rule == crate::recorded_value_read::RULE)
+        .map(|f| f.line)
+        .collect()
+}
+
+#[test]
+fn recorded_value_read_flags_plain_in_a_number_generic_fn() {
+    let src = "fn a<T: PkNum>(x: T) -> f64 {\n    x.plain()\n}\n";
+    assert_eq!(rvr(src), vec![2]);
+    // A `where` clause, `impl PkNum` and a signature naming `Tr` count as generic too.
+    assert_eq!(
+        rvr("fn a<T>(x: T) -> f64 where T: PkNum { x.plain() }\n"),
+        vec![1]
+    );
+    assert_eq!(rvr("fn a(x: impl PkNum) -> f64 { x.plain() }\n"), vec![1]);
+    assert_eq!(rvr("fn a(x: Tr) -> f64 { x.plain() }\n"), vec![1]);
+    assert_eq!(
+        rvr("impl<T: VmNum> S<T> { fn m(&self, x: T) -> f64 { x.plain() } }\n"),
+        vec![1]
+    );
+    assert_eq!(
+        rvr("fn a<T: PkNum>(x: T) -> f64 { NonRecRead::plain(x) }\n"),
+        vec![1]
+    );
+}
+
+#[test]
+fn recorded_value_read_ignores_non_generic_test_and_non_src_code() {
+    assert!(rvr("fn a(x: f64) -> f64 { x.plain() }\n").is_empty());
+    assert!(rvr("#[cfg(test)]\nmod t { fn a<T: PkNum>(x: T) -> f64 { x.plain() } }\n").is_empty());
+    assert!(rvr("#[test]\nfn a<T: PkNum>(x: T) { x.plain(); }\n").is_empty());
+    // A nested free fn does not inherit the generics around it.
+    assert!(rvr("fn a<T: PkNum>(x: T) { fn b(y: f64) -> f64 { y.plain() } }\n").is_empty());
+    let src = "fn a<T: PkNum>(x: T) -> f64 { x.plain() }\n";
+    let outside = crate::lint_source("tests/fixture.rs", src, true).unwrap();
+    assert!(outside
+        .iter()
+        .all(|f| f.rule != crate::recorded_value_read::RULE));
+}
+
+#[test]
+fn recorded_value_read_exempts_exactly_the_non_recording_arms() {
+    let ok = [
+        "fn a<T: PkNum>(x: T) -> f64 { if !T::RECORDS_BRANCHES { x.plain() } else { 0.0 } }\n",
+        "fn a<T: PkNum>(x: T) -> f64 { if T::RECORDS_BRANCHES { 0.0 } else { x.plain() } }\n",
+        "fn a<T: PkNum>(x: T) -> bool { !T::RECORDS_BRANCHES && x.plain() > 0.0 }\n",
+        "fn a<T: PkNum>(x: T) -> bool { T::RECORDS_BRANCHES || x.plain() > 0.0 }\n",
+        "fn a<T: PkNum>(x: T) -> f64 { if T::RECORDS_BRANCHES { return 0.0; } x.plain() }\n",
+        "fn a<T: PkNum>(x: T) -> f64 { let rec = T::RECORDS_BRANCHES; if rec { 0.0 } else { x.plain() } }\n",
+    ];
+    for s in ok {
+        assert!(rvr(s).is_empty(), "{s}");
+    }
+    // The straddle: the recording arm, and conditions that do not imply `!RECORDS_BRANCHES`.
+    let bad = [
+        "fn a<T: PkNum>(x: T) -> f64 { if !T::RECORDS_BRANCHES { 0.0 } else { x.plain() } }\n",
+        "fn a<T: PkNum>(x: T) -> f64 { if T::RECORDS_BRANCHES { x.plain() } else { 0.0 } }\n",
+        "fn a<T: PkNum>(x: T, c: bool) -> f64 { if T::RECORDS_BRANCHES && c { 0.0 } else { x.plain() } }\n",
+        "fn a<T: PkNum>(x: T, c: bool) -> f64 { if !T::RECORDS_BRANCHES || c { x.plain() } else { 0.0 } }\n",
+        "fn a<T: PkNum>(x: T, c: bool) -> f64 { if c { return 0.0; } x.plain() }\n",
+        "fn a<T: PkNum>(x: T) -> f64 { if T::RECORDS_BRANCHES { 1.0; } x.plain() }\n",
+        "fn a<T: PkNum>(x: T) -> bool { T::RECORDS_BRANCHES && x.plain() > 0.0 }\n",
+    ];
+    for s in bad {
+        assert_eq!(rvr(s).len(), 1, "{s}");
+    }
+}
+
+#[test]
+fn recorded_value_read_markers_need_a_real_reason() {
+    let line = |c: &str| format!("fn a<T: PkNum>(x: T) -> f64 {{\n    x.plain() {c}\n}}\n");
+    assert!(rvr(&line(
+        "// value-read-ok: a finiteness check that only declines"
+    ))
+    .is_empty());
+    assert_eq!(rvr(&line("// value-read-ok:")), vec![2]);
+    assert_eq!(rvr(&line("// value-read-ok no colon")), vec![2]);
+    assert_eq!(rvr(&line("// nan-ok: wrong marker")), vec![2]);
+    let above =
+        "fn a<T: PkNum>(x: T) -> f64 {\n    // value-read-ok: constant slot\n    x.plain()\n}\n";
+    assert!(rvr(above).is_empty());
+    let in_string =
+        "fn a<T: PkNum>(x: T) -> f64 {\n    let _s = \"// value-read-ok: no\"; x.plain()\n}\n";
+    assert_eq!(rvr(in_string), vec![2]);
+    let doc = "/// Non-recording: reached only after the `T::RECORDS_BRANCHES` check.\nfn a<T: PkNum>(x: T) -> f64 { x.plain() }\n";
+    assert!(rvr(doc).is_empty());
+    let doc_bare = "/// Non-recording:\nfn a<T: PkNum>(x: T) -> f64 { x.plain() }\n";
+    assert_eq!(rvr(doc_bare), vec![2]);
+}

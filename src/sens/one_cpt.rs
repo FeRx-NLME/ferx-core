@@ -7,6 +7,7 @@
 
 use super::num::{bateman, bateman_ss, one_minus_exp_rel, ss_factor, PkNum};
 use crate::pk::analytical_absorption::{convolve_1cpt, IgAbsorption, TransitAbsorption};
+use crate::sens::num::NonRecRead;
 use crate::types::DoseEvent;
 
 // ── Generic closed-form single-dose solutions ────────────────────────────────
@@ -332,20 +333,12 @@ pub(crate) fn mode_infusion_ss<T: PkNum>(lam: T, r_v: T, dur: f64, ii: f64, t: T
     let infused = r_v * dd * one_minus_exp_rel(lam * dd);
     if dur > ii {
         let n_active = if T::RECORDS_BRANCHES {
-            // A recording reads the phase through guards, not `.val()` (#2949): `N` is the
-            // integer with `dur − N·II < t ≤ dur − (N−1)·II` (just `t > dur` at `N = 0`).
-            use crate::sens::num::BranchCmp::{Gt, Le};
-            let n = (((dur - t.seen_value()) / ii).floor() + 1.0).max(0.0);
-            let above = t.br_cmp_c(Gt, dur - n * ii);
-            let below = n == 0.0 || t.br_cmp_c(Le, dur - (n - 1.0) * ii);
-            debug_assert!(
-                above && below,
-                "phase {} outside its pulse count",
-                t.seen_value()
-            );
-            n
+            // A recording counts through guards, not a value (#2949): `N` is the integer with
+            // `dur − N·II < t ≤ dur − (N−1)·II` (just `t > dur` at `N = 0`), i.e. one more than
+            // `⌊(dur − t)/II⌋`, whose two comparisons `br_floor_div` records.
+            ((T::from_f64(dur) - t).br_floor_div(ii) + 1.0).max(0.0)
         } else {
-            (((dur - t.val()) / ii).floor() + 1.0).max(0.0)
+            (((dur - t.plain()) / ii).floor() + 1.0).max(0.0)
         };
         let active = (0..n_active as usize).fold(T::from_f64(0.0), |acc, j| {
             let tj = t + T::from_f64(j as f64 * ii);

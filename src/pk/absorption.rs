@@ -15,6 +15,8 @@
 //! these once targeted was retired in #367/#381; the recording type handles `max`/`min` by
 //! comparison, so the old `f64::max`/`min` restriction no longer applies.)
 
+#[cfg(test)]
+use crate::sens::num::NonRecording;
 use crate::sens::num::PkNum;
 
 /// `ln(2π)` — the inverse-Gaussian log-density normalisation constant. A literal

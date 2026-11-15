@@ -10,6 +10,7 @@
 //! ([`crate::ode::predictions`]) and the analytic-sensitivity walk at `T = Dual2/Dual2`
 //! ([`crate::sens::ode_provider`]) — one body, one source of truth (#835).
 
+use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
 
 /// Solve the dense `n×n` system `A·x = b` (row-major `a`, length-`n` `b`) by partial-pivoted
@@ -49,7 +50,7 @@ pub(crate) fn structural_zero<T: PkNum>(x: T) -> bool {
     if T::RECORDS_BRANCHES && RECORDED_ZEROS_KEPT.with(|c| c.get()) {
         return false;
     }
-    x.is_constant() && x.val() == 0.0
+    x.is_constant() && x.nonrec_val() == Some(0.0)
 }
 
 #[cfg(test)]
@@ -76,7 +77,7 @@ pub(crate) fn all_finite<T: PkNum>(x: T) -> bool {
     if T::RECORDS_BRANCHES {
         return x.br_abs_lt(f64::INFINITY);
     }
-    x.val().is_finite() && x.jets_finite()
+    x.plain().is_finite() && x.jets_finite()
 }
 
 /// Whether `T`'s kernels skip structural-zero products at all: not for a recording type
@@ -210,14 +211,17 @@ fn lu_factor_body<T: PkNum>(m: &mut [T], piv: &mut [T], n: usize) -> bool {
     }
     // Singular tolerance relative to the largest value-part magnitude, floored at 1.0 so a
     // uniformly small-entry system is not spuriously rejected.
-    let tol = 1e-12 * m.iter().fold(0.0_f64, |s, x| s.max(x.val().abs())).max(1.0);
+    let tol = 1e-12
+        * m.iter()
+            .fold(0.0_f64, |s, x| s.max(x.plain().abs()))
+            .max(1.0);
     for col in 0..n {
         // Partial pivot: largest value-part magnitude in this column, at or below the
         // diagonal.
         let mut p = col;
-        let mut best = m[col * n + col].val().abs();
+        let mut best = m[col * n + col].plain().abs();
         for r in (col + 1)..n {
-            let v = m[r * n + col].val().abs();
+            let v = m[r * n + col].plain().abs();
             if v > best {
                 best = v;
                 p = r;
@@ -440,7 +444,7 @@ fn lu_solve_body<T: PkNum>(m: &[T], piv: &[T], n: usize, b: &mut [T]) {
         return lu_solve_recorded(piv, n, b);
     }
     for col in 0..n {
-        let p = piv[col].val() as usize;
+        let p = piv[col].plain() as usize;
         if p != col {
             b.swap(col, p);
         }
@@ -483,13 +487,16 @@ mod tests {
     fn lu_reference<T: PkNum>(m: &[T], n: usize, b: &[T]) -> Option<Vec<T>> {
         let mut m = m.to_vec();
         let mut piv = vec![0usize; n];
-        let scale = m.iter().fold(0.0_f64, |s, x| s.max(x.val().abs())).max(1.0);
+        let scale = m
+            .iter()
+            .fold(0.0_f64, |s, x| s.max(x.plain().abs()))
+            .max(1.0);
         for col in 0..n {
             let mut p = col;
-            let mut best = m[col * n + col].val().abs();
+            let mut best = m[col * n + col].plain().abs();
             for r in (col + 1)..n {
-                if m[r * n + col].val().abs() > best {
-                    best = m[r * n + col].val().abs();
+                if m[r * n + col].plain().abs() > best {
+                    best = m[r * n + col].plain().abs();
                     p = r;
                 }
             }

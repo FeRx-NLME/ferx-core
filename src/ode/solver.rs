@@ -20,6 +20,7 @@
 //! `solve_ode_dense` and [`solve_ode_g`]) and [`solve_ode_until_threshold`] (event-time
 //! root-finding). `make_stepper` is the single place a method name selects an implementation.
 
+use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
 
 /// Dormand-Prince RK45 coefficients (Butcher tableau)
@@ -944,7 +945,10 @@ pub(crate) type RhsG<'a, T> = dyn Fn(&[T], &[T], T, &mut [T]) + 'a;
 pub(crate) fn rhs_of_f64_time<'a, T: PkNum>(
     f: &'a dyn Fn(&[T], &[T], f64, &mut [T]),
 ) -> impl Fn(&[T], &[T], T, &mut [T]) + 'a {
-    move |u, p, t, du| f(u, p, t.val(), du)
+    // Only the public `f64`-time entry points wrap a closure this way, at a time the driver
+    // builds with `T::from_f64`; a recording's own bodies use the generic `RhsG` directly.
+    // value-read-ok: constant time at every wrapped call, so `plain` never refuses it
+    move |u, p, t, du| f(u, p, t.plain(), du)
 }
 
 /// A step attempt's clock: its start `t` and size `dt` as `f64`, what every decision reads,
@@ -1231,11 +1235,12 @@ struct Switches<'a, 'r, T: PkNum> {
 
 impl<T: PkNum> Switches<'_, '_, T> {
     /// The functions at `(u, t)`.
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
     fn g(&mut self, u: &[T], t: f64) -> Vec<f64> {
         let (n, k) = (self.n, self.k);
         let mut out = vec![0.0; k];
         if let Some(h) = &self.hook {
-            let uv: Vec<f64> = u.iter().map(|x| x.val()).collect();
+            let uv: Vec<f64> = u.iter().map(|x| x.plain()).collect();
             h.switch_g(&uv, t, &mut out);
             return out;
         }
@@ -1246,7 +1251,7 @@ impl<T: PkNum> Switches<'_, '_, T> {
         self.du.resize(n + k, T::from_f64(0.0));
         (self.rhs)(&self.ue, self.params, T::from_f64(t), &mut self.du);
         for (o, d) in out.iter_mut().zip(&self.du[n..]) {
-            *o = d.val();
+            *o = d.plain();
         }
         out
     }
@@ -1888,6 +1893,7 @@ pub(crate) struct DirectCall<'a, T> {
     pub(crate) rhs: &'a RhsG<'a, T>,
 }
 
+/// Non-recording: a `BoundStep` binds native calls to `f64` parameters, so it is only built at `T = f64`.
 impl<T: PkNum> StageRhs<T> for super::predictions::BoundStep<'_> {
     #[inline(always)]
     fn call(&self, u: &[T], params: &[T], t: T, du: &mut [T]) {
@@ -1900,7 +1906,7 @@ impl<T: PkNum> StageRhs<T> for super::predictions::BoundStep<'_> {
                 std::slice::from_raw_parts_mut(du.as_mut_ptr().cast::<f64>(), du.len()),
             )
         };
-        self.eval(uf, pf, t.val(), duf)
+        self.eval(uf, pf, t.plain(), duf)
     }
 }
 
@@ -2061,10 +2067,17 @@ impl<T: PkNum> Rk45Stepper<T> {
     /// step sequence must not depend on derivative components.
     #[allow(clippy::needless_range_loop)]
     #[inline(always)]
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
     fn err_norm_len(&self, n: usize, u: &[T], dt_eff: f64, opts: &OdeSolverOptions) -> f64 {
         let blocks = self.blocks_n(n);
         let u = &u[..n];
-        rk45_err_norm(n, |b, i| blocks[b][i].val(), |i| u[i].val(), dt_eff, opts)
+        rk45_err_norm(
+            n,
+            |b, i| blocks[b][i].plain(),
+            |i| u[i].plain(),
+            dt_eff,
+            opts,
+        )
     }
 
     /// Every carried block cut to `n` (the [`StepBody::carried_into`] order), so a loop over
@@ -2214,9 +2227,10 @@ impl<T: PkNum> Stepper<T> for Rk45Stepper<T> {
         true
     }
 
+    /// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
     fn stiffness_indicator(&self, dt: f64) -> Option<f64> {
         let blocks = self.blocks_n(self.n);
-        rk45_stiffness(self.n, |b, i| blocks[b][i].val(), dt)
+        rk45_stiffness(self.n, |b, i| blocks[b][i].plain(), dt)
     }
 
     fn attempt_bound(
@@ -2421,6 +2435,7 @@ fn interp_idx_due(interp_at: &[f64], idx: usize, t_new: f64) -> bool {
 /// from the state already integrated (#1080 Part C). `method` is the starting choice — the
 /// segment-start probe's verdict, or the named method, which is never switched away from.
 #[allow(clippy::too_many_arguments)]
+/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
 fn integrate_dense_g<T: PkNum>(
     method: OdeMethod,
     rhs: &RhsG<'_, T>,
@@ -2798,7 +2813,7 @@ fn integrate_dense_g<T: PkNum>(
             // is counted as one below (`diverged_segments`) rather than here: its tail is
             // `NaN`, not freeze-padded, so the two counters partition the stopped segments.
             if let Some(s) = stats.as_deref_mut() {
-                if u.iter().all(|v| v.val().is_finite()) {
+                if u.iter().all(|v| v.plain().is_finite()) {
                     s.stiff_aborted_segments += 1;
                 }
             }
@@ -2823,7 +2838,7 @@ fn integrate_dense_g<T: PkNum>(
     // (#1539). Read by value only, like every other driver decision, so the `f64` and dual
     // solves agree on it.
     let unfinished = t < tf - 1e-15;
-    let diverged = unfinished && u.iter().any(|v| !v.val().is_finite());
+    let diverged = unfinished && u.iter().any(|v| !v.plain().is_finite());
     // Written once here rather than inside `record`, which cannot see which stepper is active.
     if let Some(s) = stats.as_deref_mut() {
         s.stiff_min_step_clamped_steps += stiff_min_step_clamps;
@@ -3454,7 +3469,7 @@ pub struct SolPointG<T> {
 /// path, instantiated at a dual number so the jets carry `∂u/∂p` and `∂²u/∂p²` through the
 /// integration. `params` holds the PK parameters seeded as dual variables.
 ///
-/// **Step-size control reads `.val()` only** — the accept/reject decision and `dt` adaptation
+/// **Step-size control reads `.plain()` only** — the accept/reject decision and `dt` adaptation
 /// depend on values, never on derivatives, so the derivative flows through a *fixed* step
 /// sequence. (Adapting on a derivative norm would make the sensitivity inconsistent with the
 /// prediction.)
@@ -3747,7 +3762,7 @@ fn integrate_resolved_g<T: PkNum>(
 /// silently re-solved as something else would be the worse surprise.
 ///
 /// Generic over `T`, so the `f64` prediction and the `Dual2` sensitivity solve share one copy
-/// of both the resolution and the guard. Every trigger but one reads `.val()` only and sees
+/// of both the resolution and the guard. Every trigger but one reads `.plain()` only and sees
 /// the same values, so the two make the same decision on the same segment and the gradient
 /// keeps differentiating the trajectory the predictor reports.
 ///
@@ -4021,10 +4036,11 @@ fn integrate_resolved_g_inner<T: PkNum>(
 
 /// Whether every saved state is finite, reading values only (`T = Dual2` decides identically
 /// to `T = f64`, which is what keeps the two paths on the same stepper).
+/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
 fn finite_g<T: PkNum>(points: &[SolPointG<T>]) -> bool {
     points
         .iter()
-        .all(|p| p.u.iter().all(|v| v.val().is_finite()))
+        .all(|p| p.u.iter().all(|v| v.plain().is_finite()))
 }
 
 /// Whether every saved state's **derivative jets** are finite, reading the jets only.
@@ -5422,7 +5438,7 @@ mod tests {
         }
     }
 
-    /// The budget must be read from `.val()` like every other driver decision, so the `f64`
+    /// The budget must be read from `.plain()` like every other driver decision, so the `f64`
     /// prediction and the `Dual2` sensitivity solve abort on the *same* step — otherwise the
     /// gradient would differentiate a trajectory the predictor never produced.
     #[test]

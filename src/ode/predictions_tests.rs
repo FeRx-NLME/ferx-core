@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::sens::num::NonRecording;
 use crate::sim::adaptive::AssayRow;
 use crate::types::DoseEvent;
 use approx::assert_relative_eq;
