@@ -459,8 +459,9 @@ impl Tr {
         });
         Tr { v, r, dep }
     }
-    /// The recorded value (tests read it without the dependence check of `val`).
-    #[cfg(test)]
+    /// The value seen at the recording point, read without the dependence check of `val`:
+    /// for decisions about the recording itself (is this trial point's output finite), never
+    /// for a value the plan replays.
     pub(crate) fn recorded(self) -> f64 {
         self.v
     }
