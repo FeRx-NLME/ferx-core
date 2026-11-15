@@ -256,7 +256,7 @@ fn absorbed_step_warning_names_the_draw_of_the_first_replicate() {
         absorbed_step_warning(spec, &population, 6, vec![plan(2, 1), plan(1, 3)]).expect("a line");
     assert!(
         w.contains(
-            "From the start dose on: '1' in 2 of 6 replicate(s), first in draw 1 sim 3 at 500."
+            "From the start dose on: '1' in 2 of 6 replicate(s), first in draw 1, sim 3 at 500."
         ),
         "{w}"
     );
@@ -693,7 +693,7 @@ fn params_must_carry_the_fits_values() {
         UncertaintyMethod::Asymptotic,
         1,
     ));
-    assert!(text.contains("σ[0] is 0.25, the fit's is 0.2"), "{text}");
+    assert!(text.contains("σ PROP is 0.25, the fit's is 0.2"), "{text}");
 }
 
 /// `first_value_difference` covers Ω_IOV and the residual ρ too, and ignores what it must:
@@ -722,6 +722,11 @@ fn value_difference_covers_iov_and_rho_and_ignores_flags() {
     }];
     let d = first_value_difference(&rho, &t).expect("ρ differs");
     assert_eq!(d, "residual ρ has 1 value(s), the fit's 0");
+    // Same length: named by the σ pair it correlates (review r1 row 6).
+    let mut fit_rho = rho.clone();
+    fit_rho.residual_correlations[0].rho = 0.3;
+    let d = first_value_difference(&rho, &fit_rho).expect("ρ value differs");
+    assert_eq!(d, "residual ρ (PROP, PROP) is 0.5, the fit's is 0.3");
 }
 
 /// §5 rows 2–4: no silent switch between methods (Q1). An asymptotic draw from a fit
@@ -952,4 +957,241 @@ fn a_theta_only_dose_expression_stays_at_the_point_estimate_in_every_draw() {
         draw_rows(&r, 2).traj,
         "θ_d moves the run"
     );
+}
+
+// ── round 1 (#2965 review) ─────────────────────────────────────────────────────────────
+
+/// An `[adaptive_dosing]` model whose dose plan reads `CL` (a random effect reaches it, Ω
+/// FIX 0 keeps it at TVCL), with `extra` block lines.
+fn oracle_spec(extra: &str) -> crate::ParsedModel {
+    crate::parser::model_parser::parse_full_model(&format!(
+        r#"
+[parameters]
+  theta TVCL(5.0, 0.1, 50.0)
+  theta TVV(50.0, 1.0, 500.0)
+  omega ETA_CL ~ 0.0 FIX
+  sigma PROP ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  ode(obs_cmt=central, states=[central])
+[odes]
+  d/dt(central) = -(CL / V) * central
+[error_model]
+  DV ~ proportional(PROP)
+[adaptive_dosing]
+  observe = central / V
+  at = [0, 24]
+  dose_knowledge = oracle
+  start_dose = 100 * CL
+  route = bolus(cmt=1)
+{extra}"#
+    ))
+    .expect("parse")
+}
+
+fn spec_run(
+    p: &crate::ParsedModel,
+    inputs: &AdaptiveInputs<'_>,
+) -> Result<AdaptiveSimulationResult, EngineError> {
+    let mut o = AdaptiveSimulateOptions::default();
+    o.seed = Some(SEED);
+    let spec = p.adaptive_dosing.as_ref().expect("block");
+    simulate_adaptive_from_spec_with_inputs(&p.model, &pop(1), inputs, 1, spec, &o)
+}
+
+/// Review r1 row 4: the oracle side of Q5. An `oracle` subject's plan reads its drawn
+/// values, so the draw's θ: draw 2's TVCL is 10% higher and so is its start dose. With
+/// `a_theta_only_dose_expression_stays_at_the_point_estimate_in_every_draw` this is the
+/// differential pair across the known / oracle gate.
+///
+/// Mutation: the oracle plan reading the run's θ̂ (`DrawnValues::theta` = `inputs.params`):
+/// draw 2 starts at 500.
+#[test]
+fn an_oracle_dose_plan_follows_the_draws_theta() {
+    let p = oracle_spec("  dose_bounds = [0, 1000]\n  when signal > 100000 : hold\n");
+    let p0 = p.model.default_params.clone();
+    let mut p1 = p0.clone();
+    p1.theta[0] = 5.5;
+    let draws = [p0.clone(), p1];
+    let r = spec_run(&p, &AdaptiveInputs::new(&p0).with_injected_draws(&draws)).expect("runs");
+    let first = |draw: usize| {
+        r.ledger
+            .iter()
+            .find(|e| e.draw == draw)
+            .unwrap_or_else(|| panic!("draw {draw} doses"))
+            .amt
+    };
+    assert_eq!(first(1), 500.0, "100 × TVCL₁");
+    assert_eq!(first(2), 550.0, "100 × TVCL₂");
+    assert!(r.metrics.iter().all(|m| m.dose_oracle));
+}
+
+/// Review r1 row 2 (§5 row 11): an oracle plan that breaks an invariant in one draw names
+/// the draw and the replicate; without uncertainty the same break names the replicate
+/// alone. Draw 2's TVCL = 7 puts the start dose at 700, above the bound of 600.
+///
+/// Mutations: `subject_message` dropping the draw (`replicate {}` for every tag): the on
+/// side reddens; always printing a draw: the off side.
+#[test]
+fn an_oracle_plan_refusal_names_the_draw_only_under_uncertainty() {
+    let p = oracle_spec("  dose_bounds = [0, 600]\n  when signal > 100000 : hold\n");
+    let p0 = p.model.default_params.clone();
+    let mut p1 = p0.clone();
+    p1.theta[0] = 7.0;
+    let draws = [p0.clone(), p1.clone()];
+    let (code, on) = refusal(spec_run(
+        &p,
+        &AdaptiveInputs::new(&p0).with_injected_draws(&draws),
+    ));
+    assert_eq!(code, "E_ADAPTIVE_DOSE_VALUE");
+    assert!(
+        on.contains("[adaptive_dosing] subject 1, draw 2, replicate 1: start_dose = 100 * CL"),
+        "{on}"
+    );
+    let (code, off) = refusal(spec_run(&p, &AdaptiveInputs::new(&p1)));
+    assert_eq!(code, "E_ADAPTIVE_DOSE_VALUE");
+    assert!(
+        off.contains("[adaptive_dosing] subject 1, replicate 1: start_dose = 100 * CL"),
+        "{off}"
+    );
+    assert!(!off.contains("draw"), "{off}");
+}
+
+/// Review r1 row 1 (§5 row 13): through the spec entry, `W_ADAPTIVE_STEP_ABSORBED` counts
+/// over `n_draws × n_sim` replicates and names the first by its draw. Two draws at θ̂, one
+/// sim: the oracle start dose 500 is absorbed by `increase 10%` under `round_to = 250` in
+/// both.
+///
+/// Mutation: the caller passing `n_sim` alone ("in 2 of 1 replicate(s)").
+#[test]
+fn absorbed_step_warning_counts_every_draw_through_the_spec_entry() {
+    let p = oracle_spec(
+        "  dose_bounds = [250, 4000]\n  round_to = 250\n  when signal < 0 : increase 10%\n",
+    );
+    let p0 = p.model.default_params.clone();
+    let draws = [p0.clone(), p0.clone()];
+    let r = spec_run(&p, &AdaptiveInputs::new(&p0).with_injected_draws(&draws)).expect("runs");
+    let w = r
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_ADAPTIVE_STEP_ABSORBED"))
+        .unwrap_or_else(|| panic!("no absorbed warning in {:?}", r.warnings));
+    assert!(
+        w.contains(
+            "From the start dose on: '1' in 2 of 2 replicate(s), first in draw 1, sim 1 at 500."
+        ),
+        "{w}"
+    );
+}
+
+fn with_spec_pop(
+    model: &CompiledModel,
+    params: &ModelParameters,
+    fit: &FitResult,
+    method: UncertaintyMethod,
+    n_draws: usize,
+    n_sim: usize,
+) -> AdaptiveSimulationResult {
+    simulate_adaptive_with_inputs(
+        model,
+        &pop(2),
+        &AdaptiveInputs::new(params).with_uncertainty(fit, UncertaintySpec { method, n_draws }),
+        n_sim,
+        fixed_bolus,
+        &opts(None),
+    )
+    .expect("runs")
+}
+
+/// Review r1 row 5: the public-path companion of the degenerate oracle. A SIR pool holding
+/// only the packed point estimate, drawn through the real `Sir` sampler, gives back θ̂ up
+/// to the pack / unpack round trip, and draw 1 then matches the run without uncertainty
+/// to within that. Measured on this fixture (macOS arm64): 1 ulp on the parameters and
+/// 1 ulp on IPRED; the bound is 4. A draw from anywhere else is ~1e13 ulp away.
+///
+/// Mutation: `Sir` drawing from anything but the pool (the parameters move by far more
+/// than the bound).
+#[test]
+fn a_sir_pool_at_the_point_estimate_reproduces_the_run_without_uncertainty() {
+    let model = iiv();
+    let mut fit = fit_of(&model);
+    let p =
+        crate::estimation::uncertainty_samples::fitted_params_from_result(&fit, &model).unwrap();
+    fit.covariance_matrix = None;
+    fit.sir_resamples_packed = Some(vec![crate::estimation::parameterization::pack_params(&p)]);
+    let ulps = |a: f64, b: f64| {
+        assert!(a.is_finite() && b.is_finite(), "{a} {b}");
+        (a.to_bits() as i64 - b.to_bits() as i64).unsigned_abs()
+    };
+    let base = simulate_adaptive(&model, &pop(2), &p, 2, fixed_bolus, &opts(None)).expect("base");
+    let sir = with_spec_pop(&model, &p, &fit, UncertaintyMethod::Sir, 1, 2);
+    let d = &sir.parameters[0].parameters;
+    let mut worst_param = 0u64;
+    for (a, b) in d
+        .theta
+        .iter()
+        .chain(d.omega.matrix.iter())
+        .chain(&d.sigma.values)
+        .zip(
+            p.theta
+                .iter()
+                .chain(p.omega.matrix.iter())
+                .chain(&p.sigma.values),
+        )
+    {
+        worst_param = worst_param.max(ulps(*a, *b));
+    }
+    let mut worst_row = 0u64;
+    assert_eq!(sir.trajectories.len(), base.trajectories.len());
+    for (a, b) in sir.trajectories.iter().zip(&base.trajectories) {
+        assert_eq!(
+            (a.sim, &a.id, a.time.to_bits()),
+            (b.sim, &b.id, b.time.to_bits())
+        );
+        worst_row = worst_row.max(ulps(a.ipred, b.ipred));
+    }
+    assert!(worst_param <= 4, "param {worst_param} ulp");
+    assert!(worst_row <= 4, "ipred {worst_row} ulp");
+}
+
+/// Review r1 row 5: the straddle of C1 (plan probe P3). `simulate_with_uncertainty` takes
+/// its parameter draws from the η stream, so its draw-1 rows **do** move with the number
+/// of draws, on the same fit and seed where the adaptive run's do not
+/// (`more_draws_leave_draw_one_unchanged_on_the_real_sampler`). If this goes equal, the
+/// static path changed its layering and C1 no longer separates the two designs.
+#[test]
+fn simulate_with_uncertainty_draw_one_moves_with_the_number_of_draws() {
+    let model = iiv();
+    let fit = fit_of(&model);
+    let dose = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    let dosed = population(
+        ["1", "2"]
+            .iter()
+            .map(|id| subj(id, OBS.to_vec(), dose.clone()))
+            .collect(),
+    );
+    let run = |n| {
+        simulate_with_uncertainty(
+            &model,
+            &dosed,
+            &fit,
+            &SimulateUncertaintyOptions {
+                n_uncertainty_draws: n,
+                n_sim_per_draw: 1,
+                seed: Some(SEED),
+                ..Default::default()
+            },
+        )
+        .expect("runs")
+        .into_iter()
+        .filter(|r| r.draw == 1)
+        .map(|r| r.ipred.to_bits())
+        .collect::<Vec<_>>()
+    };
+    let (one, three) = (run(1), run(3));
+    assert_eq!(one.len(), three.len());
+    assert!(!one.is_empty() && one.iter().all(|&b| f64::from_bits(b) > 0.0));
+    assert_ne!(one, three, "the static path's draw 1 depends on n_draws");
 }

@@ -884,9 +884,9 @@ held-at-bound parameters stay at their estimates.
 | Stream | Across draws |
 |---|---|
 | Parameter draws | A stream of their own, rooted at the run seed. Asking for more draws leaves the earlier ones, and every row simulated under them, unchanged. |
-| η | The one η stream continues from draw to draw, so each draw simulates new virtual patients. Draw 1's η are the ones the same seed gives without uncertainty. |
-| κ, `Dv` assay | Keyed by subject, draw and replicate. Draw 1 keeps the keys of a run without uncertainty. |
-| Mixture class | Keyed by subject, draw and replicate, under the draw's mixing probabilities. |
+| η | The one η stream continues from draw to draw, so each draw simulates new virtual patients. Draw 1 uses the standard normals the same seed gives without uncertainty, scaled by draw 1's Ω. |
+| κ, `Dv` assay | Keyed by subject, draw and sim. Draw 1 keeps the keys of a run without uncertainty. |
+| Mixture class | Keyed by subject, draw and sim (never an assay replicate), under the draw's mixing probabilities. |
 
 So a draw at the point estimate reproduces the run without uncertainty, row for row.
 `simulate_with_uncertainty` differs here: it draws its parameter sets from the same

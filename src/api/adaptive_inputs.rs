@@ -108,9 +108,10 @@ impl<'a> AdaptiveInputs<'a> {
     ///
     /// The draws are centred on the fit's point estimate, so `params` must carry the
     /// fit's values (θ, Ω, Ω_IOV, σ, residual ρ); the run refuses a `params` that
-    /// differs from them. The draws come from a stream of their own, so each subject's
-    /// η in draw 1 is the η the same seed gives without uncertainty, and the η stream
-    /// continues into the next draw: each draw simulates new virtual patients.
+    /// differs from them. The draws come from a stream of their own, so draw 1 uses the
+    /// standard normals the same seed gives without uncertainty; its η are those normals
+    /// under draw 1's Ω, so a draw at the point estimate reproduces that run. The η
+    /// stream continues into the next draw: each draw simulates new virtual patients.
     ///
     /// Cannot be combined with [`with_etas`](Self::with_etas): each supplied η was
     /// estimated at the fit's θ, so pairing it with a drawn θ would not describe the
@@ -442,20 +443,24 @@ pub(super) fn first_value_difference(
             .position(|(&x, &y)| !bits_eq(x, y))
             .map(Some)
     };
-    let len_or = |name: &str, k: Option<usize>, a: &[f64], b: &[f64]| match k {
-        None => format!("{name} has {} value(s), the fit's {}", a.len(), b.len()),
-        Some(k) => format!("{name}[{k}] is {}, the fit's is {}", a[k], b[k]),
+    // A vector parameter by the fit's name for the element: `θ TVCL is …`.
+    let named = |kind: &str,
+                 name: &dyn Fn(usize) -> String,
+                 k: Option<usize>,
+                 a: &[f64],
+                 b: &[f64]| {
+        match k {
+            None => format!("{kind} has {} value(s), the fit's {}", a.len(), b.len()),
+            Some(k) => format!("{kind} {} is {}, the fit's is {}", name(k), a[k], b[k]),
+        }
+    };
+    let by_name = |names: &[String]| {
+        let names = names.to_vec();
+        move |k: usize| names.get(k).cloned().unwrap_or_else(|| (k + 1).to_string())
     };
     if let Some(k) = first_in(&run.theta, &fit.theta) {
-        return Some(match k {
-            Some(k) => format!(
-                "θ {} is {}, the fit's is {}",
-                fit.theta_names.get(k).map_or("?", String::as_str),
-                run.theta[k],
-                fit.theta[k]
-            ),
-            None => len_or("θ", None, &run.theta, &fit.theta),
-        });
+        let (a, b) = (&run.theta, &fit.theta);
+        return Some(named("θ", &by_name(&fit.theta_names), k, a, b));
     }
     let matrix = |name: &str, a: &nalgebra::DMatrix<f64>, b: &nalgebra::DMatrix<f64>| {
         if a.shape() != b.shape() {
@@ -497,13 +502,22 @@ pub(super) fn first_value_difference(
         }
     }
     if let Some(k) = first_in(&run.sigma.values, &fit.sigma.values) {
-        return Some(len_or("σ", k, &run.sigma.values, &fit.sigma.values));
+        let (a, b) = (&run.sigma.values, &fit.sigma.values);
+        return Some(named("σ", &by_name(&fit.sigma.names), k, a, b));
     }
     let rho = |p: &ModelParameters| -> Vec<f64> {
         p.residual_correlations.iter().map(|c| c.rho).collect()
     };
     let (ra, rb) = (rho(run), rho(fit));
-    first_in(&ra, &rb).map(|k| len_or("residual ρ", k, &ra, &rb))
+    // A ρ by the σ pair it correlates: `residual ρ (PROP, ADD)`.
+    let sigma = by_name(&fit.sigma.names);
+    let pair = |k: usize| {
+        fit.residual_correlations.get(k).map_or_else(
+            || (k + 1).to_string(),
+            |c| format!("({}, {})", sigma(c.sigma_i), sigma(c.sigma_j)),
+        )
+    };
+    first_in(&ra, &rb).map(|k| named("residual ρ", &pair, k, &ra, &rb))
 }
 
 /// At most 10 IDs, then a count of the rest.

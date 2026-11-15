@@ -800,7 +800,7 @@ pub(super) fn absorbed_step_warning(
                     Some(k) => {
                         let first = match k.draw {
                             None => k.sim.to_string(),
-                            Some(d) => format!("draw {d} sim {}", k.sim),
+                            Some(_) => k.sim_label(),
                         };
                         format!(
                             "'{id}' in {n} of {n_replicates} replicate(s), first in {first} at \
@@ -1150,7 +1150,7 @@ where
     };
 
     // Parameter uncertainty (#946): the draws, on a stream of their own rooted at the
-    // same root, so the η `rng` above never sees them and draw 1's η are the ones the same
+    // same root, so the η `rng` above never sees them and draw 1 uses the normals the same
     // seed gives without uncertainty. Without uncertainty the one "draw" is `params`.
     let drawn_params = inputs.resolve_draws(model, assay_root)?;
     let uncertain = drawn_params.is_some();
@@ -1262,7 +1262,8 @@ where
         .collect();
 
     // The draw loop is outermost (#946), and the η `rng` runs on across it: each draw
-    // simulates new virtual patients, and draw 1 is exactly the run without uncertainty.
+    // simulates new virtual patients. Draw 1 uses the standard normals of the run without
+    // uncertainty, under its own Ω, so a draw at the point estimate reproduces that run.
     for (draw_idx, &draw_params) in draw_params.iter().enumerate() {
         let draw = draw_idx + 1;
         // η (and κ below) are drawn from the declared Ω, a zero η exactly 0 (#1605). The
