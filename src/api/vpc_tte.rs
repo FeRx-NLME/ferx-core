@@ -23,6 +23,16 @@
 //! replicates too little censoring and a band too narrow: measured coverage 0.855
 //! for a nominal 0.90 at 3H/4 with 45 % censored, against 0.91 with the draw.
 //! [`VpcCensoring::Horizon`] skips the step and censors every replicate at `H`.
+//!
+//! **The data on `[0, H]` only.** The observed records are cut at `H` the same way
+//! [`vpc_rtte`](super::vpc_rtte) cuts its streams (#2950): a record after `H` becomes a
+//! censoring at `H`, and an event exactly at `H` is kept. The result is the one for the
+//! data cut at `H` first. At every time up to `H` the curve and its band are the same
+//! either way. What changes: the raw `observed` curve now ends at `H` instead of running
+//! past the band; `obs_on_grid` at a [`VpcGrid::Times`] point past `H` is now `None`;
+//! and [`VpcGrid::Auto`] or [`VpcGrid::AllSteps`] can gain the point `H` itself, since
+//! the observed curve now steps there (the last even point is not always `H` to the
+//! bit). With `sim.horizon` unset `H` is the latest record and nothing is cut.
 
 use super::simulate::simulate_with_options_impl;
 use super::{SimulateOptions, SimulationResult};
@@ -102,6 +112,7 @@ pub struct VpcTteOptions {
     pub cmt: Option<usize>,
     /// Passed to the simulator. `sim.seed` seeds the replicates and the censoring draws;
     /// `sim.horizon` is `H`, and when `None` `H` is the latest time recorded on `cmt`.
+    /// The observed data are read on `[0, H]` only (see the module doc).
     pub sim: SimulateOptions,
 }
 
@@ -202,22 +213,49 @@ fn censoring_uniform(seed: u64, sim: usize, subject: usize) -> f64 {
 }
 
 /// One subject's observed record on the checked endpoint.
-struct ObsRow {
-    id: String,
-    time: f64,
-    event: bool,
+pub(super) struct ObsRow {
+    pub(super) id: String,
+    pub(super) time: f64,
+    pub(super) event: bool,
     /// Its own censoring time when every TTE record it has is right-censored.
-    censor_at: Option<f64>,
-    stratum: usize,
+    pub(super) censor_at: Option<f64>,
+    pub(super) stratum: usize,
+}
+
+/// The horizon `H` of a VPC, with the observed records read on `[0, H]` only. `H` is
+/// `sim_horizon`, or when `None` the latest record time (and then nothing is cut). A
+/// record after `H` becomes a censoring at `H`, and an event exactly at `H` is kept, so
+/// the result is the one for the data cut at `H` first. `censor_at` is left as it was: a
+/// censoring time past `H` can only censor a replicate draw later than `H`, and no draw
+/// is. The censoring curve `G` does change at `H` (a row censored past `H` now counts
+/// there), but not before `H`, and a draw landing at `H` instead of past it gives
+/// `c = H`, which censors no draw `≤ H` either. So on `[0, H]` a curve and its band do
+/// not move (#2950 for [`vpc_tte`], #2955 measures it for
+/// [`vpc_kmmc`](super::vpc_kmmc)); the raw observed curve stops running past the band.
+/// [`vpc_tte`] and [`vpc_kmmc`](super::vpc_kmmc) take `H` from here, and resolving `H`
+/// and cutting are one call, so neither can skip the cut.
+pub(super) fn horizon_and_cut(rows: &mut [ObsRow], sim_horizon: Option<f64>) -> f64 {
+    let horizon = sim_horizon.unwrap_or_else(|| {
+        rows.iter()
+            .map(|r| r.time)
+            .fold(f64::NEG_INFINITY, f64::max)
+    });
+    for r in rows.iter_mut().filter(|r| r.time > horizon) {
+        r.time = horizon;
+        r.event = false;
+    }
+    horizon
 }
 
 /// The entry point a shared helper refuses for, so each message carries the name of
 /// the function the caller called. [`vpc_rtte`](super::vpc_rtte) shares the endpoint,
-/// record, strata and grid helpers below.
+/// record, strata and grid helpers below, and [`vpc_kmmc`](super::vpc_kmmc) also the
+/// observed rows, the horizon and its cut ([`horizon_and_cut`]) and the replicate loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Entry {
     Tte,
     Rtte,
+    Kmmc,
 }
 
 impl std::fmt::Display for Entry {
@@ -225,8 +263,109 @@ impl std::fmt::Display for Entry {
         f.write_str(match self {
             Entry::Tte => "vpc_tte",
             Entry::Rtte => "vpc_rtte",
+            Entry::Kmmc => "vpc_kmmc",
         })
     }
+}
+
+/// How a replicate subject's censoring time is chosen under [`VpcCensoring::Observed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TteCensorRule {
+    /// [`vpc_tte`]: a subject observed censored keeps its own time; an event subject
+    /// draws from its stratum's `G` given `c > tᵢ` (the module doc).
+    KeepObserved,
+    /// [`vpc_kmmc`](super::vpc_kmmc): every subject draws from its stratum's `G`,
+    /// unconditionally (that module's doc says why).
+    DrawAll,
+}
+
+/// The censoring time of one replicate subject observed as `row`, with `g` its stratum's
+/// censoring distribution and `u` its uniform from [`censoring_uniform`].
+pub(super) fn replicate_censoring(
+    rule: TteCensorRule,
+    row: &ObsRow,
+    g: &KmCurve,
+    u: f64,
+    horizon: f64,
+) -> f64 {
+    match rule {
+        TteCensorRule::KeepObserved => row
+            .censor_at
+            .unwrap_or_else(|| draw_censoring(g, row.time, u, horizon)),
+        TteCensorRule::DrawAll => draw_censoring(g, 0.0, u, horizon),
+    }
+}
+
+/// One stratum of one replicate: the post-censored `(time, event)` of each simulated
+/// subject, and the index into the observed rows of the subject each came from.
+#[derive(Debug, Clone, Default)]
+pub(super) struct RepStratum {
+    pub(super) times: Vec<f64>,
+    pub(super) events: Vec<bool>,
+    pub(super) rows: Vec<usize>,
+}
+
+/// Simulate `opts.n_sim` replicates of `population` to `horizon` with one simulator call
+/// and collect, per replicate and stratum, each subject's draw on `cmt`, censored under
+/// `opts.censoring` with `rule`. Returns `reps[sim][stratum]` and the simulator's
+/// warnings. The censoring uniforms are keyed by `(sim.seed, sim, row index)`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn simulate_replicates(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    opts: &VpcTteOptions,
+    cmt: usize,
+    rows: &[ObsRow],
+    n_strata: usize,
+    horizon: f64,
+    rule: TteCensorRule,
+) -> Result<(Vec<Vec<RepStratum>>, Vec<String>), EngineError> {
+    let mut sim_opts = opts.sim.clone();
+    sim_opts.horizon = Some(horizon);
+    let out = simulate_with_options_impl(model, population, params, opts.n_sim, &sim_opts, false)?;
+
+    let by_id: HashMap<&str, (usize, &ObsRow)> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.id.as_str(), (i, r)))
+        .collect();
+    let g: Vec<KmCurve> = (0..n_strata)
+        .map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k)))
+        .collect();
+    let seed = opts.sim.seed.unwrap_or_else(rand::random);
+    let mut reps: Vec<Vec<RepStratum>> = vec![vec![RepStratum::default(); n_strata]; opts.n_sim];
+    for SimulationResult {
+        sim,
+        id,
+        cmt: rc,
+        outcome,
+        ..
+    } in &out.results
+    {
+        let SimOutcome::Event { time, observed } = outcome else {
+            continue;
+        };
+        if *rc != cmt {
+            continue;
+        }
+        let Some(&(i, row)) = by_id.get(id.as_str()) else {
+            continue;
+        };
+        let (t, e) = match opts.censoring {
+            VpcCensoring::Observed => {
+                let u = censoring_uniform(seed, *sim, i);
+                let c = replicate_censoring(rule, row, &g[row.stratum], u, horizon);
+                post_censor(*time, *observed, c)
+            }
+            VpcCensoring::Horizon => (*time, *observed),
+        };
+        let slot = &mut reps[sim - 1][row.stratum];
+        slot.times.push(t);
+        slot.events.push(e);
+        slot.rows.push(i);
+    }
+    Ok((reps, out.warnings))
 }
 
 pub(super) fn refuse(message: String) -> EngineError {
@@ -265,7 +404,8 @@ pub(super) fn check_band_options(
 }
 
 /// The endpoint `cmt` names, or the model's only TTE endpoint. It must be of the kind
-/// `who` draws: single-event for [`Entry::Tte`], repeated events for [`Entry::Rtte`].
+/// `who` draws: single-event for [`Entry::Tte`] and [`Entry::Kmmc`], repeated events for
+/// [`Entry::Rtte`].
 pub(super) fn resolve_cmt(
     who: Entry,
     model: &CompiledModel,
@@ -299,6 +439,10 @@ pub(super) fn resolve_cmt(
                      incidence: the curve is that cause's survival with the other causes as \
                      censoring."
                 }
+                Entry::Kmmc => {
+                    " Under competing risks the risk set of one cause holds the subjects \
+                     free of every cause, so the other causes act as censorings."
+                }
                 Entry::Rtte => "",
             };
             return Err(refuse(format!(
@@ -318,6 +462,11 @@ pub(super) fn resolve_cmt(
         (Entry::Tte, true) => Err(refuse(format!(
             "{who}: cmt {c} is a repeated-events (RTTE) endpoint. Use `vpc_rtte` for its \
              Kaplan–Meier and mean-cumulative-function VPC."
+        ))),
+        (Entry::Kmmc, true) => Err(refuse(format!(
+            "{who}: cmt {c} is a repeated-events (RTTE) endpoint. A Kaplan–Meier mean \
+             covariate by event order is not supported yet; `vpc_rtte` draws the \
+             Kaplan–Meier and mean-cumulative-function VPC of a repeated-events endpoint."
         ))),
         (Entry::Rtte, false) => Err(refuse(format!(
             "{who}: cmt {c} is a single-event TTE endpoint. Use `vpc_tte` for its \
@@ -369,6 +518,7 @@ pub(super) fn checked_record(
         EventType::IntervalCensored { .. } => {
             let needs = match who {
                 Entry::Tte => "A Kaplan–Meier curve needs",
+                Entry::Kmmc => "A Kaplan–Meier mean covariate needs",
                 Entry::Rtte => "The repeated-events curves need",
             };
             Err(refuse(format!(
@@ -441,19 +591,20 @@ pub(super) fn build_strata(
     Ok((values, labels, index))
 }
 
-/// The observed rows on `cmt`, and the strata's values (sorted) and labels.
+/// The observed rows on `cmt` of a single-event endpoint (one record per subject), and
+/// the strata's values (sorted) and labels. `who` names the entry point in a refusal.
 #[allow(clippy::type_complexity)]
-fn observed_rows(
+pub(super) fn observed_rows(
+    who: Entry,
     population: &Population,
     cmt: usize,
     stratify: &VpcStratify,
 ) -> Result<(Vec<ObsRow>, Vec<Option<f64>>, Vec<String>), EngineError> {
-    const WHO: Entry = Entry::Tte;
     let mut picked: Vec<(String, f64, bool, Option<f64>, Option<f64>)> = Vec::new();
     let mut seen: HashMap<&str, ()> = HashMap::new();
     for s in &population.subjects {
         if seen.insert(s.id.as_str(), ()).is_some() {
-            return Err(duplicate_id(WHO, &s.id));
+            return Err(duplicate_id(who, &s.id));
         }
         let mut on_cmt = Vec::new();
         let mut all_censored = true;
@@ -472,7 +623,7 @@ fn observed_rows(
                 continue;
             }
             on_cmt.push(checked_record(
-                WHO,
+                who,
                 &s.id,
                 cmt,
                 *time,
@@ -487,11 +638,11 @@ fn observed_rows(
                 *time,
                 *event,
                 all_censored.then_some(*time),
-                stratum_value(WHO, s, stratify)?,
+                stratum_value(who, s, stratify)?,
             )),
             more => {
                 return Err(refuse(format!(
-                    "vpc_tte: subject {} has {} records on cmt {cmt}. A single-event \
+                    "{who}: subject {} has {} records on cmt {cmt}. A single-event \
                      Kaplan–Meier curve takes one per subject.",
                     s.id,
                     more.len()
@@ -500,10 +651,10 @@ fn observed_rows(
         }
     }
     if picked.is_empty() {
-        return Err(no_record(WHO, cmt));
+        return Err(no_record(who, cmt));
     }
     let per_subject: Vec<Option<f64>> = picked.iter().map(|p| p.4).collect();
-    let (values, labels, index) = build_strata(WHO, &per_subject, stratify)?;
+    let (values, labels, index) = build_strata(who, &per_subject, stratify)?;
     let rows = picked
         .into_iter()
         .zip(index)
@@ -573,65 +724,22 @@ pub fn vpc_tte(
     let probs = opts.probs;
     check_band_options(Entry::Tte, probs, opts.n_sim, &opts.grid)?;
     let cmt = resolve_cmt(Entry::Tte, model, opts.cmt)?;
-    let (rows, values, labels) = observed_rows(population, cmt, &opts.stratify)?;
-    let horizon = opts.sim.horizon.unwrap_or_else(|| {
-        rows.iter()
-            .map(|r| r.time)
-            .fold(f64::NEG_INFINITY, f64::max)
-    });
+    let (mut rows, values, labels) = observed_rows(Entry::Tte, population, cmt, &opts.stratify)?;
+    // The data on [0, H] only (module doc).
+    let horizon = horizon_and_cut(&mut rows, opts.sim.horizon);
 
-    let mut sim_opts = opts.sim.clone();
-    sim_opts.horizon = Some(horizon);
-    let out = simulate_with_options_impl(model, population, params, opts.n_sim, &sim_opts, false)?;
-
-    let by_id: HashMap<&str, (usize, &ObsRow)> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| (r.id.as_str(), (i, r)))
-        .collect();
     let n_strata = values.len();
-    let g: Vec<KmCurve> = (0..n_strata)
-        .map(|k| censoring_curve(rows.iter().filter(|r| r.stratum == k)))
-        .collect();
-    let seed = opts.sim.seed.unwrap_or_else(rand::random);
-    // reps[sim][stratum] = (times, events)
-    let mut reps: Vec<Vec<(Vec<f64>, Vec<bool>)>> =
-        vec![vec![(Vec::new(), Vec::new()); n_strata]; opts.n_sim];
-    for SimulationResult {
-        sim,
-        id,
-        cmt: rc,
-        outcome,
-        ..
-    } in &out.results
-    {
-        let SimOutcome::Event { time, observed } = outcome else {
-            continue;
-        };
-        if *rc != cmt {
-            continue;
-        }
-        let Some(&(i, row)) = by_id.get(id.as_str()) else {
-            continue;
-        };
-        let (t, e) = match opts.censoring {
-            VpcCensoring::Observed => {
-                let c = row.censor_at.unwrap_or_else(|| {
-                    draw_censoring(
-                        &g[row.stratum],
-                        row.time,
-                        censoring_uniform(seed, *sim, i),
-                        horizon,
-                    )
-                });
-                post_censor(*time, *observed, c)
-            }
-            VpcCensoring::Horizon => (*time, *observed),
-        };
-        let slot = &mut reps[sim - 1][row.stratum];
-        slot.0.push(t);
-        slot.1.push(e);
-    }
+    let (reps, warnings) = simulate_replicates(
+        model,
+        population,
+        params,
+        opts,
+        cmt,
+        &rows,
+        n_strata,
+        horizon,
+        TteCensorRule::KeepObserved,
+    )?;
 
     let mut strata = Vec::with_capacity(n_strata);
     for (k, (value, label)) in values.into_iter().zip(labels).enumerate() {
@@ -643,7 +751,7 @@ pub fn vpc_tte(
         let observed = kaplan_meier(&ot, &oe).map_err(|e| refuse(format!("vpc_tte: {e}")))?;
         let curves = reps
             .iter()
-            .map(|r| kaplan_meier(&r[k].0, &r[k].1))
+            .map(|r| kaplan_meier(&r[k].times, &r[k].events))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| refuse(format!("vpc_tte: a replicate {e}")))?;
         let grid = stratum_grid(
@@ -673,7 +781,7 @@ pub fn vpc_tte(
         probs,
         censoring: opts.censoring,
         strata,
-        warnings: out.warnings,
+        warnings,
     })
 }
 

@@ -180,6 +180,17 @@ struct Rec {
     eta_regs: Vec<(u32, usize)>,
     theta_regs: Vec<(u32, usize)>,
     guard: Option<u32>,
+    /// While [`affine_parts`] records its call on state variables: which registers depend on
+    /// them. A fold that would guard such a value would make the right-hand side look
+    /// non-affine ([`Tr::zero_fold`]).
+    on_u: Option<Vec<bool>>,
+    /// Inside [`affine_parts`]: a literal-zero factor folds ([`Tr::zero_fold`]). Nowhere else:
+    /// a loop body runs on trial states that overshoot to `inf`, where its finiteness guard
+    /// would fail a body that is correct.
+    fold_zero: bool,
+    /// The registers holding a literal ([`Tr::k`]): data only, so a differentiation reads
+    /// them as the literals they are, not as dependent values.
+    lits: std::collections::HashSet<u32, FxBuild>,
     /// The exact linear path's segments this recording integrated instead
     /// ([`RecHooks::note_linear_decline`]): the plan reports them on every run.
     declined: usize,
@@ -205,6 +216,22 @@ type Key = (u8, u32, u32, u64);
 type Step = (Key, u32, bool);
 
 impl Rec {
+    /// Note the instruction just pushed as dependent on the state variables, when it reads one.
+    fn track_on_u(&mut self) {
+        let Some(o) = self.on_u.as_mut() else {
+            return;
+        };
+        let Some(f) = self.code.last() else {
+            return;
+        };
+        o.resize(self.n_regs as usize, false);
+        if let Some(d) = def(f) {
+            if uses(f).into_iter().flatten().any(|v| o[v as usize]) {
+                o[d as usize] = true;
+            }
+        }
+    }
+
     /// The register an earlier node with key `k` defined, where hash-consing shares one: the
     /// map's answer, or — replaying a template — the template's, its key checked (a literal's
     /// is the map's either way: its key holds the subject's value). A key the template did not
@@ -317,6 +344,7 @@ fn node(key: Option<Key>, mk: impl FnOnce(u32) -> Flat) -> u32 {
         }
         r.n_regs += 1;
         r.code.push(mk(d));
+        r.track_on_u();
         if let Some(k) = key {
             r.made(k, d);
         }
@@ -338,6 +366,7 @@ fn node_v(key: Key, v: f64, mk: impl FnOnce(u32) -> Flat) -> Tr {
                 }
                 r.n_regs += 1;
                 r.code.push(mk(d));
+                r.track_on_u();
                 r.made(key, d);
                 d
             }
@@ -452,6 +481,7 @@ impl Tr {
                         let idx = r.pool.len() as u32;
                         r.pool.push(c);
                         r.code.push(Flat::LoadSeed { d, k: idx });
+                        r.lits.insert(d);
                         r.cse.insert(key, d);
                         d
                     }
@@ -477,6 +507,25 @@ impl Tr {
         let r = node(None, |d| Flat::LoadParam { d, slot: j as u32 });
         rec(|rr| rr.theta_regs.push((r, j)));
         Tr::mk(v, r, true)
+    }
+    /// `z · x` as a literal when `z` is a literal zero and `x` a finite recorded value.
+    fn zero_fold(z: Self, x: Self) -> Option<Self> {
+        #[cfg(test)]
+        if crate::sens::linsolve::RECORDED_ZEROS_KEPT.with(|c| c.get()) {
+            return None;
+        }
+        if z.dep || z.v != 0.0 || !x.dep || !rec(|r| r.fold_zero) {
+            return None;
+        }
+        // Not a value on the state variables of the affine check: its guard would read them.
+        if rec(|r| {
+            r.on_u
+                .as_ref()
+                .is_some_and(|o| o.get(x.r as usize) == Some(&true))
+        }) {
+            return None;
+        }
+        x.br_abs_lt(f64::INFINITY).then(|| Self::k(z.v * x.v))
     }
     fn bin(self, o: Self, tag: u8, v: f64, mk: fn(u32, u32, u32) -> Flat) -> Self {
         if !self.dep && !o.dep {
@@ -692,6 +741,14 @@ impl Mul for Tr {
         }
         if self.is_unit() {
             return o;
+        }
+        // A literal-zero factor against a finite one is a literal zero, as it is to the
+        // `f64` objective (`structural_zero`): `ode::linear` then skips it, so a gated
+        // term `G·k·x` with the gate off is no edge of the generator and no state it
+        // feeds is live (#2760, #2761). `0·x` is `±0` only for a finite `x`, so the fold
+        // records that guard (`br_abs_lt`) and declines when it fails.
+        if let Some(z) = Self::zero_fold(self, o).or_else(|| Self::zero_fold(o, self)) {
+            return z;
         }
         self.bin(o, T_MUL, self.v * o.v, |d, a, b| Flat::Mul { d, a, b })
     }
@@ -1058,6 +1115,10 @@ impl crate::sens::num::vm::VmArith for Tr {
         if c == 1.0 {
             return;
         }
+        if let Some(z) = Self::zero_fold(Self::k(c), *self) {
+            *self = z;
+            return;
+        }
         *self = self.scalar(c, T_MULK, self.v * c, |d, a, c| Flat::MulK { d, a, c });
     }
     fn div_scalar_in(&mut self, c: f64) {
@@ -1412,6 +1473,19 @@ pub(crate) fn affine_parts(
     a: &mut [Tr],
     b: &mut [Tr],
 ) -> bool {
+    rec(|r| r.fold_zero = true);
+    let ok = affine_parts_folding(rhs, params, t, a, b);
+    rec(|r| r.fold_zero = false);
+    ok
+}
+
+fn affine_parts_folding(
+    rhs: &dyn Fn(&[Tr], &[Tr], Tr, &mut [Tr]),
+    params: &[Tr],
+    t: f64,
+    a: &mut [Tr],
+    b: &mut [Tr],
+) -> bool {
     let n = b.len();
     rec(|r| r.ode = true);
     let zeros = vec![Tr::k(0.0); n];
@@ -1420,8 +1494,16 @@ pub(crate) fn affine_parts(
     let u: Vec<Tr> = (0..n)
         .map(|_| Tr::mk(0.0, node(None, |d| Flat::LoadK { d, c: 0.0 }), true))
         .collect();
+    rec(|r| {
+        let mut o = vec![false; r.n_regs as usize];
+        for x in &u {
+            o[x.r as usize] = true;
+        }
+        r.on_u = Some(o);
+    });
     let mut f = vec![Tr::k(0.0); n];
     rhs(&u, params, Tr::k(t), &mut f);
+    rec(|r| r.on_u = None);
     let sweep = tangents(start);
     for j in 0..n {
         let tan = sweep(u[j].r as u32);
@@ -1458,8 +1540,19 @@ fn tangents(start: usize) -> impl Fn(u32) -> HashMap<u32, Tr, FxBuild> {
     // stiff segment's Jacobians quadratic in the recording. A register the region reads was
     // written before this call, and a register's value is never rewritten.
     let h = move |r: u32| {
-        let v = rec(|rc| rc.vals.get(r as usize).copied().unwrap_or(f64::NAN));
-        Tr::mk(v, r, true)
+        let (v, lit) = rec(|rc| {
+            (
+                rc.vals.get(r as usize).copied().unwrap_or(f64::NAN),
+                rc.lits.contains(&r),
+            )
+        });
+        // A literal stays one, so a tangent through a literal `0` is a literal `0` and the
+        // linear path sees a structural zero where the `f64` objective does.
+        if lit {
+            Tr { v, r, dep: false }
+        } else {
+            Tr::mk(v, r, true)
+        }
     };
     move |seed: u32| {
         let mut tan: HashMap<u32, Tr, FxBuild> = HashMap::default();

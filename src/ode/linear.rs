@@ -581,6 +581,14 @@ thread_local! {
     pub(crate) static SPECTRAL_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Segments the spectral path propagated on this thread.
     pub(crate) static SPECTRAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The coupling graph each `spectral` call on this thread built, as its reachability
+    /// `downstream(present, n)`, tagged `true` for a plan recording
+    /// (`parser::kernel_jit::Tr`) and `false` for `f64`; other number types are not
+    /// recorded. Reachability is what `spectral_of` reads `A`'s structural zeros through
+    /// (its blocks, its acyclic compartments and its projectors' support), so equal entries
+    /// mean the recording and the `f64` objective built the same construction (#2761 row 5).
+    pub(crate) static SPECTRAL_GRAPHS: std::cell::RefCell<Vec<(bool, [u8; 6])>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[inline]
@@ -610,6 +618,15 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
             m | (1 << i)
         }
     });
+    #[cfg(test)]
+    {
+        let ty = std::any::type_name::<T>();
+        let recorded = ty.ends_with("kernel_jit::Tr");
+        if recorded || ty == "f64" {
+            let down = downstream(present, n);
+            SPECTRAL_GRAPHS.with(|g| g.borrow_mut().push((recorded, down)));
+        }
+    }
     // The analysis runs on `A`'s values ([`spectral_analysis`]), as a host call: a recording
     // type (#2786) runs it again on every evaluation and re-checks its decisions there.
     let mut args: Vec<T> = a[..n * n].to_vec();
@@ -1222,7 +1239,6 @@ fn segment_span<T: PkNum>(
     }
     let zero = T::from_f64(0.0);
     let t_mid = t0 + 0.5 * h;
-    let m = n + 1;
     ws.size(n, zero);
     let LinWs {
         probe,
@@ -1239,6 +1255,7 @@ fn segment_span<T: PkNum>(
         n_props,
         states,
         expms,
+        live,
     } = ws;
 
     // ── Extract A (row-major n×n) and b at the midpoint: b = f(0), column j = (f(s·e_j) − b)/s.
@@ -1497,12 +1514,35 @@ fn segment_span<T: PkNum>(
         let c = (b_max / a_max.max(1.0)).max(1.0);
         (T::from_f64(c), T::from_f64(1.0 / c))
     };
-    for i in 0..n {
-        for j in 0..n {
-            gen[i * m + j] = a[i * n + j];
-        }
-        gen[i * m + n] = b[i] * inv_c;
+
+    // ── Dormant states: a state whose forcing, row and column of `A` are all structural zeros
+    // (`structural_zero`: value 0, no jet, no tape node) neither moves nor moves anything over
+    // the segment, so it is copied through and left out of the exponential. Its row and
+    // column of the full exponential are exactly the identity's: every product that would
+    // reach them is a structural zero, so leaving them out changes no other entry, and the
+    // squaring count, set by ‖A‖₁, is the same. A gated accumulator
+    // (`d/dt(u_k) = G_k·k·x` with `G_k = 0` in this segment) is such a state, and a model
+    // with many of them is a large system of which a few states move (#2760).
+    // Only structural zeros count: a value that is merely 0 (`θ − θ₀` at `θ = θ₀`) has a
+    // derivative and keeps its state live.
+    {
+        use crate::sens::linsolve::structural_zero as sz;
+        live.clear();
+        live.extend(
+            (0..n).filter(|&i| !sz(b[i]) || (0..n).any(|j| !sz(a[i * n + j]) || !sz(a[j * n + i]))),
+        );
     }
+    let nl = live.len();
+    #[cfg(test)]
+    DORMANT_STATES.with(|c| c.set(c.get() + (n - nl)));
+    let m = nl + 1;
+    for (li, &i) in live.iter().enumerate() {
+        for (lj, &j) in live.iter().enumerate() {
+            gen[li * m + lj] = a[i * n + j];
+        }
+        gen[li * m + nl] = b[i] * inv_c;
+    }
+    // The last row, the constant input's, stays the zeros `ws.size` filled it with.
 
     // Propagators keyed by the exact gap, so an evenly spaced grid pays one exponential (and
     // `Expm` shares the Padé step between gaps whose scaled generators coincide, here and in
@@ -1545,10 +1585,10 @@ fn segment_span<T: PkNum>(
                     // Each exponential its own chunk (#2786): its code depends only on the
                     // squaring count, so a recording type shares it across steps and segments.
                     T::chunk_mark();
-                    for (o, &g) in scaled.iter_mut().zip(gen.iter()) {
+                    for (o, &g) in scaled[..m * m].iter_mut().zip(gen[..m * m].iter()) {
                         *o = g * dt_t;
                     }
-                    let e = expm.exp(scaled)?;
+                    let e = expm.exp(&scaled[..m * m])?;
                     if *n_props == props.len() {
                         props.push((0, Vec::new()));
                     }
@@ -1566,14 +1606,15 @@ fn segment_span<T: PkNum>(
             // `x` is finite here: `u0` passed the magnitude check, and every propagated state
             // passed `reproduces`, which declines a non-finite one
             // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
-            for i in 0..n {
-                let acc = e[i * m + n] * c;
-                let mut acc = acc;
-                for j in 0..n {
-                    if crate::sens::linsolve::structural_zero(e[i * m + j]) {
+            // A dormant state is its entry value; `next` holds the previous step's states.
+            next.copy_from_slice(x);
+            for (li, &i) in live.iter().enumerate() {
+                let mut acc = e[li * m + nl] * c;
+                for (lj, &j) in live.iter().enumerate() {
+                    if crate::sens::linsolve::structural_zero(e[li * m + lj]) {
                         continue;
                     }
-                    acc = acc + e[i * m + j] * x[j];
+                    acc = acc + e[li * m + lj] * x[j];
                 }
                 next[i] = acc;
             }
@@ -1636,6 +1677,8 @@ struct LinWs<T> {
     states: Vec<T>,
     /// One exponential workspace per size, its Padé approximants kept between segments.
     expms: Vec<Expm<T>>,
+    /// The segment's live states (not dormant), ascending: the exponential's rows.
+    live: Vec<usize>,
 }
 
 impl<T: PkNum> LinWs<T> {
@@ -1655,6 +1698,7 @@ impl<T: PkNum> LinWs<T> {
             n_props: 0,
             states: Vec::new(),
             expms: Vec::new(),
+            live: Vec::new(),
         }
     }
     /// Every per-segment buffer at its size for `n` states, filled with `zero` (the values a
@@ -1675,6 +1719,13 @@ impl<T: PkNum> LinWs<T> {
             v.resize(len, zero);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Dormant states left out of an exponential, summed over this thread's segments: what
+    /// lets a test tell that the reduction ran, rather than a fixture with none to reduce.
+    pub(crate) static DORMANT_STATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {

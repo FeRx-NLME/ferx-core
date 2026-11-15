@@ -787,6 +787,31 @@ pub(super) fn simulate_with_options_impl(
     opts: &SimulateOptions,
     with_parameters: bool,
 ) -> Result<SimulationOutput, EngineError> {
+    simulate_with_options_tallied(
+        model,
+        population,
+        params,
+        n_sim,
+        opts,
+        with_parameters,
+        None,
+    )
+}
+
+/// [`simulate_with_options_impl`], handing the run's `W_TTE_DEGENERATE_HAZARD` tally to
+/// `degenerate_out` instead of rendering it into the warnings, when given. A caller that
+/// simulates one reference in several runs (`compute_tte_npde`'s batches) folds the
+/// tallies with `DegenerateHazardTally::absorb` and renders once, so each (subject, CMT)
+/// is one line counted over every replicate, not one line per run.
+pub(crate) fn simulate_with_options_tallied(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+    with_parameters: bool,
+    mut degenerate_out: Option<&mut DegenerateHazardTally>,
+) -> Result<SimulationOutput, EngineError> {
     use rand::SeedableRng;
 
     // Start the SS-equilibration non-convergence sink clean, then drain it into this run's
@@ -900,7 +925,10 @@ pub(super) fn simulate_with_options_impl(
                 )
             });
             let results = results?;
-            warnings.extend(degenerate.warnings_by_replicate());
+            match degenerate_out.as_deref_mut() {
+                Some(out) => *out = degenerate,
+                None => warnings.extend(degenerate.warnings_by_replicate()),
+            }
             warnings.extend(flip_flop.warning(model));
             warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
             warnings.extend(iov_warning);
@@ -1032,7 +1060,10 @@ pub(super) fn simulate_with_options_impl(
         )
     });
     let results = results?;
-    warnings.extend(degenerate.warnings_by_replicate());
+    match degenerate_out {
+        Some(out) => *out = degenerate,
+        None => warnings.extend(degenerate.warnings_by_replicate()),
+    }
     warnings.extend(flip_flop.warning(model));
     warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
     warnings.extend(iov_warning);
@@ -1057,7 +1088,7 @@ use crate::survival::DegenerateHazardTally;
 /// stand-in keeps the chokepoint's signature the same in both builds.
 #[cfg(not(feature = "survival"))]
 #[derive(Default)]
-struct DegenerateHazardTally;
+pub(crate) struct DegenerateHazardTally;
 
 #[cfg(not(feature = "survival"))]
 impl DegenerateHazardTally {

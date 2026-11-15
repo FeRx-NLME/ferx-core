@@ -30,13 +30,15 @@
 //! The reference draws come from [`crate::api::simulate_with_options_diag`] with the
 //! horizon at the latest scored time (nothing later is ever needed), in batches of
 //! [`BATCH`] replicates whose rows are reduced to integer counts before the next batch
-//! runs.
+//! runs. A `W_TTE_DEGENERATE_HAZARD` is counted over every batch and reported once per
+//! subject and CMT, as one simulation of all the replicates would report it (#1648).
 
 use super::npde::{clamp_prob, effective_seed};
-use crate::api::{simulate_with_options_diag, SimulateOptions};
+use crate::api::{simulate_with_options_tallied, SimulateOptions};
 use crate::diagnostics::EngineError;
 use crate::sim::adaptive::combine_seed;
 use crate::stats::special::normal_inv_cdf;
+use crate::survival::DegenerateHazardTally;
 use crate::types::{
     CompiledModel, EndpointLikelihood, EventType, IovOccasionRule, ModelParameters, ObsRecord,
     Population, SimOutcome, TteRecurrence,
@@ -296,6 +298,9 @@ pub(crate) fn reference_counts(
     let mut n_before = vec![0usize; records.len()];
     let mut n_drawn = vec![0usize; records.len()];
     let mut warnings = Vec::new();
+    // One tally over every batch: a per-batch line would name the subject once per
+    // batch, with `sim` indices that restart at 0 in each (#2933 × #2909).
+    let mut degenerate = DegenerateHazardTally::default();
     let mut done = 0;
     let mut batch = 0;
     while done < nsim {
@@ -306,7 +311,17 @@ pub(crate) fn reference_counts(
             iov_occasion: iov_occasion.cloned(),
             ..Default::default()
         };
-        let out = simulate_with_options_diag(model, population, params, n, &opts)?;
+        let mut tally = DegenerateHazardTally::default();
+        let out = simulate_with_options_tallied(
+            model,
+            population,
+            params,
+            n,
+            &opts,
+            false,
+            Some(&mut tally),
+        )?;
+        degenerate.absorb(tally, done);
         for row in &out.results {
             let SimOutcome::Event { time, observed } = row.outcome else {
                 continue;
@@ -327,14 +342,15 @@ pub(crate) fn reference_counts(
         done += n;
         batch += 1;
     }
+    warnings.extend(degenerate.warnings_by_replicate());
     Ok((n_before, n_drawn, warnings))
 }
 
 /// What a fit keeps of [`compute_tte_npde`]'s warnings (#1889): the failed event-time
 /// solves of the reference replicates, said as such. A `W_TTE_DEGENERATE_HAZARD` is
-/// dropped: the simulator raises it for every replicate that never has an event, which
-/// is what a cure-fraction hazard (Gompertz `gamma < 0`) legitimately draws, and its
-/// text ("check the hazard parameters") would be a false alarm on a correct fit.
+/// dropped: the simulator raises it for every subject with a replicate that never has an
+/// event, which is what a cure-fraction hazard (Gompertz `gamma < 0`) legitimately draws,
+/// and its text ("check the hazard parameters") would be a false alarm on a correct fit.
 pub(crate) fn fit_time_warnings(folded: Vec<String>) -> Vec<String> {
     const CODE: &str = "W_TTE_SOLVE_FAILED: ";
     folded

@@ -907,6 +907,12 @@ pub struct AdaptiveDosingSpec {
     /// (`AdaptiveInputs::with_etas`); with [`DoseKnowledge::Oracle`] it may also read
     /// the values the simulation draws, and each subject dosed from them is flagged.
     pub dose_knowledge: DoseKnowledge,
+    /// Which covariate row a decision carries as a record (#2895). Every decision is a
+    /// record of the run: a piece of the walk that ends at decision `g`, with no data
+    /// record at or before it, runs under that decision's parameters — κ of occasion `g`
+    /// and `TIME` at the decision — and under the covariate row this setting names. What
+    /// the controller reads at the decision is the LOCF row either way.
+    pub decision_covariates: DecisionCovariates,
     /// Optional therapeutic target band `[low, high]` (inclusive) for the
     /// monitored signal. It feeds **only** the `pct_time_in_window` outcome metric
     /// (#391 S2.4) — it never influences dosing (the `when` rules do). `high` may
@@ -981,6 +987,27 @@ pub enum DoseKnowledge {
     /// has [`AdaptiveSubjectMetrics::dose_oracle`] set, and the run warns
     /// (`W_ADAPTIVE_DOSE_ORACLE`).
     Oracle,
+}
+
+/// The covariate row a decision carries as a record (`decision_covariates`, #2895).
+///
+/// A decision ends the interval before it, as a dose row or an `EVID=2` row would in a
+/// static dataset, so that interval runs under the decision's own occasion κ and its
+/// `TIME`. The static equivalent of a run is its realized doses plus an `EVID=2` record
+/// at every decision, with blank covariate cells filled by this rule.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DecisionCovariates {
+    /// `decision_covariates = locf` (the default): the row in force at the decision —
+    /// the latest data record at or before it — which is also the row the controller
+    /// reads. ferx's reader fills a blank cell the same way.
+    #[default]
+    Locf,
+    /// `decision_covariates = nocb`: the row of the next data record at or after the
+    /// decision; past the last data record, the row in force (LOCF).
+    Nocb,
 }
 
 impl From<f64> for DoseValue {
@@ -2121,6 +2148,7 @@ mod tests {
             auc_target: None,
             round_to: None,
             dose_knowledge: Default::default(),
+            decision_covariates: Default::default(),
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 10.0,

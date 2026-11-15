@@ -45,7 +45,21 @@ pub(crate) fn solve_linear_system_g<T: PkNum>(a: &[T], b: &[T], n: usize) -> Opt
 /// nothing is skipped for it.
 #[inline]
 pub(crate) fn structural_zero<T: PkNum>(x: T) -> bool {
+    #[cfg(test)]
+    if T::RECORDS_BRANCHES && RECORDED_ZEROS_KEPT.with(|c| c.get()) {
+        return false;
+    }
     x.is_constant() && x.val() == 0.0
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: a plan recording (#2786) reads no zero as a structural one, so `ode::linear`
+    /// builds its generator with every entry an edge and keeps every state live — the
+    /// construction the `f64` objective never takes. The straddle of the tests that pin the
+    /// recording to the objective's construction (`sens::ode_adjoint_tests`).
+    pub(crate) static RECORDED_ZEROS_KEPT: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 /// Value and every derivative component finite. A structural zero is skipped only against a

@@ -449,8 +449,10 @@ mod npde_tte_fit {
 
     /// A correct fit of a cure-fraction model carries no hazard warning (review r1 #1).
     /// A Gompertz hazard with `gamma < 0` has replicates that never have an event; the
-    /// simulator reports each as `W_TTE_DEGENERATE_HAZARD`, which `compute_tte_npde`
-    /// returns once with a count, and which the fit does not repeat as its own warning.
+    /// simulator reports them as `W_TTE_DEGENERATE_HAZARD`, one line per subject counting
+    /// its replicates (#1648, summed over the reference batches by #2945), which
+    /// `compute_tte_npde` returns folded with a count, and which the fit does not repeat as
+    /// its own warning.
     ///
     /// Dies on: the degenerate-hazard warning forwarded to the fit; the fold dropped
     /// from the direct call.

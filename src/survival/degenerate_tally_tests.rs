@@ -179,6 +179,36 @@ fn every_cell_of_the_degenerate_hazard_text() {
     assert!(tally(4, 5, &[]).warnings_by_draw().is_empty());
 }
 
+/// U2: `absorb` folds the tally of a later run whose replicates continue this one's, as
+/// `compute_tte_npde` does over its reference batches (#2933 × #2909): the replicate count
+/// is the sum, a later run's `sim` is shifted past the earlier ones, a subject first hit in
+/// the later run gets its own line, and two runs of one parameter set stay one draw.
+///
+/// Dies if: the offset is dropped (`sim 2, 1, 3`); the replicates are not summed (`of 2`);
+/// the draws are summed (the uncertainty form, `in 1 of 2 simulated uncertainty draws`);
+/// a subject seen only in the later run is lost.
+#[test]
+fn absorb_continues_the_replicates_of_an_earlier_run() {
+    let mut whole = tally(1, 2, &[(1, 2)]);
+    let mut later = tally(1, 3, &[(1, 1), (1, 3)]);
+    later.record(1, "B", 2, 1, 1);
+    whole.absorb(later, 2);
+    let want = vec![
+        line(" in 3 of 5 replicates (sim 2, 3, 5)"),
+        line(" in 1 of 5 replicates (sim 3)").replace("'A'", "'B'"),
+    ];
+    assert_eq!(whole.warnings_by_replicate(), want);
+    assert_eq!(whole.warnings_by_draw(), want);
+
+    // A subject hit in every replicate of every run reads as all of them.
+    let mut whole = tally(1, 2, &[(1, 1), (1, 2)]);
+    whole.absorb(tally(1, 1, &[(1, 1)]), 2);
+    assert_eq!(
+        whole.warnings_by_replicate(),
+        vec![line(" in all 3 replicates")]
+    );
+}
+
 const ZERO_RATE: &str = "
 [parameters]
   theta TVLAMBDA(0.1, 0.001, 10.0)

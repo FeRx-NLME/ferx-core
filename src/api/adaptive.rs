@@ -88,8 +88,8 @@ pub(crate) fn check_adaptive_model_data(
 /// segment (#700). Inter-occasion variability (IOV / `kappa`) is **no longer**
 /// rejected either: a fresh κ is drawn per decision (occasion g starts at decision g)
 /// and threaded through the per-segment eta (#701). A segment runs under the κ of the
-/// record that ends it, so a window whose last record sits on decision g+1 runs under
-/// κ_{g+1}, not κ_g (#2771). System-reset events
+/// record that ends it, and every decision is a record, so the piece of a window that
+/// ends at decision g+1 runs under κ_{g+1} (#2771, #2895). System-reset events
 /// (EVID=3) are **no longer** rejected: the reactive driver now zeros the
 /// compartments at each reset and turns off infusions opened before it, and the
 /// frozen-replay verifier is reset-aware, so the reset is honored and checked (#716).
@@ -174,6 +174,12 @@ pub struct AdaptiveSimulateOptions {
     /// `decision_times`. A controller changes it with
     /// [`crate::sim::adaptive::DoseAction::SetInterval`].
     pub start_interval: Option<f64>,
+    /// Which covariate row a decision carries as a record (#2895): see
+    /// [`crate::sim::adaptive::DecisionCovariates`]. `None` (the default) is LOCF, the
+    /// row the controller reads. A declarative `[adaptive_dosing]` block sets it with its
+    /// own `decision_covariates` key instead, so `simulate_adaptive_from_spec` refuses a
+    /// `Some` here, as it refuses `decision_times`.
+    pub decision_covariates: Option<crate::sim::adaptive::DecisionCovariates>,
 }
 
 impl Default for AdaptiveSimulateOptions {
@@ -185,6 +191,7 @@ impl Default for AdaptiveSimulateOptions {
             verify: true,
             max_decisions: 10_000,
             start_interval: None,
+            decision_covariates: None,
         }
     }
 }
@@ -415,6 +422,7 @@ where
         AdaptiveEntry::Programmatic,
         // A caller's controller has no dose expressions.
         &[],
+        opts.decision_covariates.unwrap_or_default(),
     )
 }
 
@@ -1013,6 +1021,7 @@ fn run_adaptive_population<P, F, C>(
     opts: &AdaptiveSimulateOptions,
     entry: AdaptiveEntry,
     dose_covariates: &[(&str, &str)],
+    decision_covariates: crate::sim::adaptive::DecisionCovariates,
 ) -> Result<AdaptiveSimulationResult, EngineError>
 where
     P: FnOnce(&[Option<Vec<f64>>]) -> Result<F, EngineError>,
@@ -1189,11 +1198,45 @@ where
     // (#2163), keyed off the same root as the assay and κ substreams.
     let classes = super::simulate::SimClasses::new(model, params, assay_root)?;
 
+    // Every decision is a record (#2895), so an `ADDL`-implied dose between a decision and
+    // the next data record is governed by that decision. The driver, its replay and the #748
+    // check read this one copy per subject; the per-event condition is the one that gives the
+    // run its decision records below. It depends on the subject, the schedule and the rule
+    // alone, so it is built once, not per replicate (#2948 review row 5).
+    let governed_subjects: Vec<std::borrow::Cow<'_, Subject>> = population
+        .subjects
+        .iter()
+        .map(|subject| {
+            if model.n_kappa > 0 || crate::pk::subject_needs_per_event_pk(model, subject) {
+                let index =
+                    crate::ode::predictions::AdaptiveRecordIndex::new(subject, subject.doses.len());
+                let covs = crate::ode::predictions::decision_record_covs(
+                    decision_covariates,
+                    &index,
+                    decision_times,
+                    subject,
+                );
+                crate::ode::predictions::with_implied_doses_governed_by_decisions(
+                    subject,
+                    decision_times,
+                    &covs,
+                )
+            } else {
+                std::borrow::Cow::Borrowed(subject)
+            }
+        })
+        .collect();
+
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
-        for (subject_idx, (subject, supplied)) in
-            population.subjects.iter().zip(&supplied_etas).enumerate()
+        for (subject_idx, ((as_read, supplied), governed)) in population
+            .subjects
+            .iter()
+            .zip(&supplied_etas)
+            .zip(&governed_subjects)
+            .enumerate()
         {
+            let subject: &Subject = governed;
             // Held for the whole subject: the driver (and its window AUC) and the verifiers all
             // read `MIXNUM`, and every use of `params` below is this class's.
             let class = classes.enter(subject, 1, sim);
@@ -1219,9 +1262,9 @@ where
             // Inter-occasion variability (#701): draw a fresh κ per decision and build
             // the per-occasion eta `[η_bsv | κ_g]`, plus `decision_pk[g]` = the PK at
             // decision g under occasion g's κ. Occasion g starts at decision g. The
-            // driver threads into each segment the eta of the record that ENDS it, so
-            // the window after decision g runs under κ_{g+1} when a record sits on
-            // decision g+1 (#2771); `decision_pk[g]` is what the decision reads. κ is
+            // driver threads into each segment the eta of the record that ENDS it, and
+            // every decision is a record (#2895), so the piece ending at decision g+1 runs
+            // under κ_{g+1}; `decision_pk[g]` is what the decision reads. κ is
             // drawn on a dedicated substream keyed by (subject, replicate), disjoint
             // from the η and assay streams, so a non-IOV model (`n_kappa == 0`) draws
             // nothing and this whole block is skipped — the path stays byte-identical.
@@ -1320,6 +1363,37 @@ where
                     None
                 };
 
+            // Every decision is a record of the per-event walk (#2895): its covariate row
+            // (`decision_covariates`), `TIME` as written at the decision, and the decision's
+            // own `[η | κ_g]` — the `pk_param_fn` call that builds `decision_pk[g]` above,
+            // so under `locf` the two are equal to the bit. The constant path has one PK
+            // throughout and takes no records.
+            let decision_records = event_pk.map(|_| {
+                let index =
+                    crate::ode::predictions::AdaptiveRecordIndex::new(subject, subject.doses.len());
+                let cov = crate::ode::predictions::decision_record_covs(
+                    decision_covariates,
+                    &index,
+                    decision_times,
+                    subject,
+                );
+                let pk = decision_times
+                    .iter()
+                    .zip(&cov)
+                    .enumerate()
+                    .map(|(g, (&t, c))| {
+                        let e: &[f64] = eta_occ.as_ref().map_or(&eta_slice, |eo| &eo[g]);
+                        (model.pk_param_fn)(&params.theta, e, c, subject.param_time_at(t))
+                    })
+                    .collect();
+                crate::ode::predictions::DecisionRecords {
+                    times: decision_times,
+                    pk,
+                    cov,
+                    readout: decision_pk.clone(),
+                }
+            });
+
             // Baseline PK snapshot at the start of the simulation horizon (t=0).
             let pk = (model.pk_param_fn)(&params.theta, &eta_slice, &subject.covariates, 0.0);
 
@@ -1389,7 +1463,7 @@ where
                 ode,
                 &pk.values,
                 event_pk,
-                decision_pk.as_deref(),
+                decision_records.as_ref(),
                 eta_occ.as_deref(),
                 &params.theta,
                 &eta_slice,
@@ -1439,12 +1513,36 @@ where
                         subject.id
                     ))
                 })?;
+                if let Some(recs) = decision_records.as_ref() {
+                    let eta_of = |g: usize| -> Vec<f64> {
+                        eta_occ
+                            .as_ref()
+                            .map_or_else(|| eta_slice.clone(), |eo| eo[g].clone())
+                    };
+                    // The subject as read, not the re-governed copy: a re-governed implied
+                    // dose carries a row the code under check wrote (#2948 review row 2).
+                    verify_decision_records(
+                        model,
+                        &params.theta,
+                        as_read,
+                        decision_times,
+                        decision_covariates,
+                        &eta_of,
+                        recs,
+                    )
+                    .map_err(|e| {
+                        EngineError::uncoded(format!(
+                            "adaptive snapshot verification failed for subject '{}' (sim {sim}): {e}",
+                            subject.id
+                        ))
+                    })?;
+                }
 
                 crate::ode::verify_adaptive_frozen_replay(
                     ode,
                     &pk.values,
                     event_pk,
-                    decision_pk.as_deref(),
+                    decision_records.as_ref(),
                     eta_occ.as_deref(),
                     &params.theta,
                     &eta_slice,
@@ -2006,6 +2104,99 @@ pub(super) fn decision_covs_by_scan<'a>(
     out
 }
 
+/// The row of the next data record at or after each decision (`decision_covariates =
+/// nocb`, #2895), derived from the subject's raw records with **no code shared** with
+/// `AdaptiveRecordIndex`, as [`decision_covs_by_scan`] derives the LOCF row. `None` for a
+/// decision with no record at or after it. Parallel to `decision_times`.
+///
+/// The rule, written out: the record with the smallest time `≥ t`, compared exactly
+/// (decisions and records are bit-identical breaks); at one instant an EVID=3/4 reset
+/// first, then a dose (an `ADDL`-implied one too: it terminates a segment, carrying its
+/// governing record's covariates), an EVID=2 row, an observation — the first listed
+/// within a kind, except resets, where the last listed wins (the index keys co-timed
+/// resets by time and keeps the last).
+pub(super) fn decision_nocb_covs_by_scan<'a>(
+    subject: &'a Subject,
+    decision_times: &[f64],
+) -> Vec<Option<&'a HashMap<String, f64>>> {
+    let mut rows: Vec<(f64, &HashMap<String, f64>)> = Vec::new();
+    // Reversed, so that the stable sort leaves the last listed reset first at its instant.
+    rows.extend(
+        (0..subject.reset_times.len())
+            .rev()
+            .map(|r| (subject.reset_times[r], subject.reset_cov(r))),
+    );
+    rows.extend((0..subject.doses.len()).map(|k| (subject.doses[k].time, subject.dose_cov(k))));
+    rows.extend(
+        (0..subject.pk_only_times.len())
+            .map(|m| (subject.pk_only_times[m], subject.pk_only_cov(m))),
+    );
+    rows.extend((0..subject.obs_times.len()).map(|j| (subject.obs_times[j], subject.obs_cov(j))));
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+    decision_times
+        .iter()
+        .map(|&t| rows.get(rows.partition_point(|r| r.0 < t)).map(|r| r.1))
+        .collect()
+}
+
+/// The #748 check for the decision records of a per-event run (#2895): each decision's
+/// covariate row and PK snapshot re-derived from primitives and bit-compared with what the
+/// driver and its replay were both handed. A wrong record would be applied by both, so the
+/// replay cannot see it.
+///
+/// The row comes from the independent scans — [`decision_covs_by_scan`] for LOCF,
+/// [`decision_nocb_covs_by_scan`] (falling back to the LOCF scan past the last record) for
+/// NOCB — and the PK from `pk_param_fn` at that row, the decision's `TIME` as written and
+/// `eta(g)`: `[η | κ_g]` under IOV (already bit-checked by [`verify_adaptive_snapshots`]),
+/// else η.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_decision_records(
+    model: &CompiledModel,
+    theta: &[f64],
+    subject: &Subject,
+    decision_times: &[f64],
+    rule: crate::sim::adaptive::DecisionCovariates,
+    eta: &dyn Fn(usize) -> Vec<f64>,
+    records: &crate::ode::predictions::DecisionRecords,
+) -> Result<(), String> {
+    let n = decision_times.len();
+    if records.pk.len() != n
+        || records.cov.len() != n
+        || !slice_bits_eq(records.times, decision_times)
+    {
+        return Err(format!(
+            "the decision records are mis-sized or off the schedule: expected {n} (one per \
+             decision), got pk.len()={}, cov.len()={} (#2895)",
+            records.pk.len(),
+            records.cov.len()
+        ));
+    }
+    let locf = decision_covs_by_scan(subject, decision_times);
+    let nocb = match rule {
+        // Exhaustive on purpose (#2948 review row 1), like the engine's match: a new rule must
+        // get its own re-derivation, not fall into the LOCF one the engine might share.
+        crate::sim::adaptive::DecisionCovariates::Nocb => {
+            Some(decision_nocb_covs_by_scan(subject, decision_times))
+        }
+        crate::sim::adaptive::DecisionCovariates::Locf => None,
+    };
+    for (g, &t) in decision_times.iter().enumerate() {
+        let row = nocb.as_ref().and_then(|v| v[g]).unwrap_or(locf[g]);
+        check_decision_cov(g, t, row, records.cov[g])
+            .map_err(|e| format!("decision record (#2895): {e}"))?;
+        let want = (model.pk_param_fn)(theta, &eta(g), row, subject.param_time_at(t));
+        if !pk_bits_eq(&want, &records.pk[g]) {
+            return Err(format!(
+                "the record of decision {g} at t={t} carries a PK snapshot that diverges from an \
+                 independent re-derivation at its covariate row, its TIME and its occasion. The \
+                 driver and the frozen replay share this snapshot, so the replay cannot catch it \
+                 (#2895)."
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Bit-compare the covariate row the shared record index picked for decision `g` against
 /// the independently derived one (#1599). Same keys, same bits, or an `Err` naming the
 /// decision and the first covariate that differs.
@@ -2263,6 +2454,13 @@ pub fn simulate_adaptive_from_spec_with_inputs(
              `opts.start_interval` empty",
         ));
     }
+    if opts.decision_covariates.is_some() {
+        return Err(super::entry_refusals::adaptive_options(
+            "simulate_adaptive_from_spec takes its decision covariates from the \
+             [adaptive_dosing] block's `decision_covariates`; leave \
+             `opts.decision_covariates` empty",
+        ));
+    }
     // The block's starting interval reaches the driver through the same option the
     // programmatic entry uses, so both run one due mask and one up-front grid check.
     let mut opts = opts.clone();
@@ -2411,6 +2609,7 @@ pub fn simulate_adaptive_from_spec_with_inputs(
         // out too (review r2 N4): the warning stays silent rather than say something
         // false.
         &frem_only_dose_covariates(model, &dose_covs),
+        spec.decision_covariates,
     )?;
     // Never silent (#944): the subjects dosed from their drawn values, counted once each.
     let mut oracle_ids: Vec<&str> = result
