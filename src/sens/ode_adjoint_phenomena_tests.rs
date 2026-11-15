@@ -3403,8 +3403,8 @@ fn ss_into_absorption_with_a_lag_matches_reconverged_fd() {
     // the prediction, where central FD and the one-sided analytic derivative differ.
     let times = [0.4, 4.0, 6.5, 7.5, 10.5, 16.0, 19.0, 22.5, 28.0, 31.0];
     // The `lag >= II` rows keep the observations out of the whole range the estimated window
-    // end can sweep (`dur = 3 e^eta`, eta in +-0.5): a recorded plan whose window end crossed an
-    // observation across the inner search is the pre-existing hole noted on the control test.
+    // end can sweep (`dur = 3 e^eta`, eta in +-0.5): an EBE pinned on a window-edge kink has no
+    // gradient to match (`ss_modeled_duration_lag_ge_ii_ebe_on_window_edge_kink_is_not_differentiable`).
     let clamp_times = [
         0.4, 6.0, 7.5, 10.5, 13.0, 14.6, 21.0, 23.0, 25.0, 33.0, 36.0,
     ];
@@ -3450,11 +3450,10 @@ fn ss_into_absorption_with_a_lag_matches_reconverged_fd() {
 
 /// Control for the zero-order SS case: the same configurations written as a user-coded
 /// `RATE=-2` modeled-duration SS infusion (`D1`), the path the zero-order dose is lowered to.
-/// Not covered here: `lag >= II` with an estimated duration on a dense observation grid, where
-/// (before and independent of #2786, reproduced on this user-coded `D1` path) the θ gradient
-/// came back 0.3 off reconverged FD for a ten-observation grid whose observations sit inside the
-/// range the estimated window end sweeps, while each half of the grid alone matched to 1e-9 and
-/// the same subject with a fixed rate matched to 1e-8.
+/// The `lag >= II` rows with an estimated duration on a dense grid are in
+/// `ss_modeled_duration_lag_ge_ii_dense_grid_matches_reconverged_fd`; the θ gradient that once
+/// read as 0.3 off there is an EBE pinned on a window-edge kink, not a derivative defect (see
+/// `..._ebe_on_window_edge_kink_is_not_differentiable`).
 #[test]
 fn ss_modeled_duration_infusion_with_a_lag_matches_reconverged_fd() {
     let times = [0.4, 4.0, 6.5, 7.5, 10.5, 16.0, 19.0, 22.5, 28.0, 31.0];
@@ -3489,4 +3488,138 @@ fn ss_modeled_duration_infusion_with_a_lag_matches_reconverged_fd() {
         }
     }
     assert!(bad.is_empty(), "{bad:?}");
+}
+
+/// A `lag >= II` modeled-duration (`D1`) SS infusion, estimated window end `dur e^eta`
+/// (`TVDUR 3`, `TVLAG 14`, `II 12`).
+fn ss_d1_lag_ge_ii_model(fixed_duration: bool) -> CompiledModel {
+    let d1 = if fixed_duration {
+        "TVDUR"
+    } else {
+        "TVDUR * exp(ETA_P)"
+    };
+    let src = format!(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 50.0)\n  theta TVV(20.0, 0.5, 200.0)\n  \
+        theta TVDUR(3.0, 0.1, 40.0)\n  theta TVLAG(14.0, 0.0, 30.0)\n  omega ETA_CL ~ 0.09\n  \
+        omega ETA_P ~ 0.04\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  \
+        CL = TVCL * exp(ETA_CL)\n  V  = TVV\n  D1 = {d1}\n  ALAG1 = TVLAG\n\
+        [structural_model]\n  ode(obs_cmt=central, states=[central])\n[odes]\n  \
+        d/dt(central) = -CL/V*central\n[scaling]\n  y = central / V\n[error_model]\n  \
+        DV ~ proportional(PROP_ERR)\n"
+    );
+    tight(parse_model_string(&src).unwrap())
+}
+
+const SS_D1_DENSE_GRID: [f64; 10] = [0.4, 4.0, 6.5, 7.5, 10.5, 16.0, 19.0, 22.5, 28.0, 31.0];
+
+/// The subject of [`ss_d1_lag_ge_ii_model`] on the ten-observation grid, its DV generated at
+/// `eta_ref`, with the EBE the oracle will find and the largest jump of `∂f/∂η_P` across it
+/// (`> 0` only where an observation sits on a window edge, a kink of the prediction).
+fn ss_d1_dense_subject(m: &CompiledModel, eta_ref: [f64; 2]) -> (Subject, Vec<f64>, f64) {
+    let doses = vec![
+        DoseEvent::modeled(0.0, 100.0, 1, true, 12.0, RateMode::ModeledDuration),
+        DoseEvent::modeled(12.0, 100.0, 1, false, 0.0, RateMode::ModeledDuration),
+    ];
+    let s = subject(m, doses, &SS_D1_DENSE_GRID, &eta_ref);
+    assert!(
+        crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failures(
+            m,
+            std::slice::from_ref(&s)
+        )
+        .is_none(),
+        "a plan failed"
+    );
+    let params = moved_params(m);
+    let eta = ebe_for(m, &s, &params, 1e-12, true).as_slice().to_vec();
+    let slope = |e: f64| -> Vec<f64> {
+        let h = 1e-6;
+        let at =
+            |x: f64| crate::pk::compute_predictions_with_tv(m, &s, &params.theta, &[eta[0], x]);
+        at(e - h)
+            .iter()
+            .zip(at(e).iter())
+            .map(|(a, b)| (b - a) / h)
+            .collect()
+    };
+    let hh = 2e-5;
+    let (left, right) = (slope(eta[1] - hh), slope(eta[1] + hh));
+    let jump = left
+        .iter()
+        .zip(&right)
+        .map(|(l, r)| {
+            assert!(l.is_finite() && r.is_finite());
+            (l - r).abs()
+        })
+        .fold(0.0, f64::max);
+    (s, eta, jump)
+}
+
+/// The ten-observation `lag >= II` modeled-duration grid of the control test above, at data
+/// whose EBE is a smooth interior optimum: the θ gradient matches reconverged FD to 1e-8, the
+/// plan serving every subject. (A dense grid does not break the derivative: it makes an EBE
+/// pinned on a window-edge kink likely, which no gradient matches; see the next test.) Fixed
+/// rate and `lag < II` rows are the controls; the realised worst gap is 2.4e-9 (Linux), the
+/// bound ~10x.
+#[test]
+fn ss_modeled_duration_lag_ge_ii_dense_grid_matches_reconverged_fd() {
+    let mut bad = Vec::new();
+    let mut worst = 0.0f64;
+    for (fixed, eta_ref) in [
+        (false, [0.1, 0.1]),
+        (false, [0.2, 0.2]),
+        (false, [-0.1, 0.2]),
+        (false, [0.0, 0.3]),
+        (false, [-0.3, -0.3]),
+        (true, [0.1, -0.1]),
+    ] {
+        let m = ss_d1_lag_ge_ii_model(fixed);
+        let (s, eta, jump) = ss_d1_dense_subject(&m, eta_ref);
+        assert!(served(&m, &s));
+        // The EBE must be off every kink for the oracle to be a derivative.
+        assert!(
+            jump < 1e-3,
+            "fixed={fixed} {eta_ref:?}: EBE {eta:?} on a kink ({jump:.2e})"
+        );
+        let g = parity(&m, &s);
+        eprintln!("fixed={fixed} ref {eta_ref:?} EBE {eta:?}: gradient gap {g:.2e}");
+        assert!(g.is_finite());
+        worst = worst.max(g);
+        if g > 3e-8 {
+            bad.push(format!("fixed={fixed} {eta_ref:?}: {g:.2e}"));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+    eprintln!("SS D1 lag>=II dense grid: worst gradient gap {worst:.2e}");
+}
+
+/// The case that read as a gradient defect (the control test above: the θ gradient 0.1-0.9 off
+/// reconverged FD on this grid): the DV's data pull the EBE onto the kink where the estimated
+/// window end `lag - II + dur e^eta` crosses the observation at `t = 4` (`dur e^eta = 25/7`,
+/// so `eta_P = ln(25/21) = 0.17435`). The minimiser is pinned there for every nearby θ, `∂f/∂η`
+/// jumps across it (by `R/V · dD/dη`, ~5.5 here), and FOCEI's `H` and the EBE's stationarity
+/// are not defined at a kink: reconverged FD differences an objective whose EBE flips sides
+/// (slopes of ±100), and the adjoint's one-sided derivative cannot match it. Every other EBE on
+/// the same grid matches to 1e-8 (the test above). Pins the diagnosis, both halves: the EBE sits
+/// on the kink, and the oracle is not a derivative there.
+#[test]
+fn ss_modeled_duration_lag_ge_ii_ebe_on_window_edge_kink_is_not_differentiable() {
+    let m = ss_d1_lag_ge_ii_model(false);
+    for eta_ref in [[0.1, -0.1], [0.0, 0.0]] {
+        let (s, eta, jump) = ss_d1_dense_subject(&m, eta_ref);
+        let kink = (25.0f64 / 21.0).ln();
+        assert!(
+            (eta[1] - kink).abs() < 1e-6,
+            "{eta_ref:?}: EBE η_P {} is not on the kink {kink}",
+            eta[1]
+        );
+        assert!(
+            jump > 1.0,
+            "{eta_ref:?}: no slope jump at the EBE ({jump:.2e})"
+        );
+        let g = parity(&m, &s);
+        assert!(
+            g > 1e-2,
+            "{eta_ref:?}: the oracle matched on a kink ({g:.2e})"
+        );
+    }
 }
