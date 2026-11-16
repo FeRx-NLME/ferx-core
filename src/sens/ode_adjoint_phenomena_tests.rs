@@ -5145,31 +5145,151 @@ fn the_cumulative_frame_moves_the_predictions_at_integrator_tolerance() {
     );
 }
 
-/// The one Weibull shape the cumulative frame does not serve: an infusion into the kernel under
-/// an estimated lag (the convolved `R_in_inf`). Its lag derivative off the pointwise path is
-/// wrong (2.4e-2 at `β = 1.5`, measured), so the scope sends it to finite differences rather than
-/// serve it. Mutation: delete the infusion clause of `event_walk_scope` -> `β = 1.5` is served
-/// with that gap.
+/// The subject every lagged-infusion fixture is measured on: two infusions into the kernel's
+/// compartment (2 h each), the second landing on the first's residual drug, an η on CL and on
+/// the lag, and observations before, between and after both estimated onsets and both window
+/// ends, none within 0.4 h of one.
+fn lagged_infusion_subject(m: &CompiledModel) -> Subject {
+    subject(
+        m,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+            DoseEvent::new(6.0, 80.0, 1, 40.0, false, 0.0),
+        ],
+        &[
+            0.4, 1.5, 2.5, 3.6, 4.5, 6.5, 7.6, 8.5, 9.6, 11.0, 14.0, 18.0,
+        ],
+        &[0.1, -0.05],
+    )
+}
+
+/// `(kernel, shape, ∂f/∂η bound, FOCEI-gradient bound)` for a lagged infusion. Measured worst
+/// over the compartment and route lag on Linux, at `tight` tolerances (jac / grad): Weibull
+/// β = 0.5 9.7e-10 / 7.3e-7, 0.9 8.0e-10 / 2.3e-7, 1.5 2.6e-10 / 3.4e-8, 3 2.7e-9 / 4.2e-8;
+/// transit n = 0.5 2.4e-10 / 2.4e-8, 2.5 5.7e-10 / 5.8e-8. Bounds are ~10x the measured worst.
+/// Without the anchoring the gradient is off by 3.4e-3 (β = 1.5) and 1.5e-3 (n = 0.5), and a
+/// Weibull with β < 1 has no continuation at its onset at all (it declines):
+/// `an_unanchored_infusion_boundary_loses_the_second_derivative`.
+const LAGGED_INFUSION_CASES: &[(&str, f64, f64, f64)] = &[
+    ("weibull", 0.5, 1e-8, 7e-6),
+    ("weibull", 0.9, 1e-8, 3e-6),
+    ("weibull", 1.5, 3e-9, 4e-7),
+    ("weibull", 3.0, 3e-8, 5e-7),
+    ("transit", 0.5, 3e-9, 3e-7),
+    ("transit", 2.5, 6e-9, 6e-7),
+];
+
+/// An infusion into a Weibull (`β ∈ {0.5, 0.9, 1.5, 3}`) or transit (`n ∈ {0.5, 2.5}`) kernel
+/// under an estimated compartment `ALAG1` or per-route `lag=` is served by the plan and matches
+/// the reconverged-FD objective gradient and a Richardson `∂f/∂η`. The convolved input
+/// `R_in_inf = (D/T)·[G(τ) − G(τ − T)]` carries the kernel's CDF, singular where the infusion
+/// starts (`G ~ τ^β` for a Weibull, `τ^(n+1)` for a transit) and again where its window ends
+/// (`G(τ − T)` begins there): the segment after each is anchored at the true boundary
+/// (`onset_shift`), so the kernel is read at an age with no jet. Both boundaries move with the
+/// lag.
 #[test]
-fn an_infusion_into_a_lagged_weibull_stays_on_finite_differences() {
-    for shape in [0.5, 1.5] {
+fn a_lagged_infusion_into_a_weibull_or_transit_kernel_matches_reconverged_fd() {
+    for &(kernel, shape, jac_bound, grad_bound) in LAGGED_INFUSION_CASES {
         for lag in ["alag", "route"] {
-            let m = tight(parse_model_string(&lagged_kernel_model("weibull", shape, lag)).unwrap());
-            let s = subject(
-                &m,
-                vec![
-                    DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
-                    DoseEvent::new(6.0, 100.0, 1, 50.0, false, 0.0),
-                ],
-                &[0.4, 1.3, 2.0, 3.0, 4.5, 6.5, 7.5, 9.0, 12.0, 18.0],
-                &[0.1, -0.05],
-            );
-            assert!(!served(&m, &s), "weibull {shape} {lag}: declined by scope");
-            // The bolus twin of the same model is served (the scope is the infusion's, not the
-            // model's).
-            let b = lagged_kernel_subject(&m);
-            assert!(served(&m, &b), "weibull {shape} {lag}: bolus");
+            let label = format!("infusion, {kernel} {shape} {lag}");
+            let m = tight(parse_model_string(&lagged_kernel_model(kernel, shape, lag)).unwrap());
+            let s = lagged_infusion_subject(&m);
+            assert!(s.doses.iter().all(|d| d.is_infusion()), "{label}");
+            assert!(served(&m, &s), "{label}: must be served");
+            let (jac, grad) = measure(&m, &s, LAGGED_KERNEL_LIVE, &label);
+            assert!(jac < jac_bound, "{label} ∂f/∂η: {jac:.2e}");
+            assert!(grad < grad_bound, "{label} gradient: {grad:.2e}");
         }
+    }
+}
+
+/// The mutation the parity above must see: with the boundaries unanchored (the segments after
+/// the onset and the window end on the fixed grid), the kernel's age carries the lag's jet at
+/// stages a hair from the singular CDF, and the gradient is off by 3.4e-3 (Weibull `β = 1.5`)
+/// and 1.5e-3 (transit `n = 0.5`), measured.
+#[test]
+fn an_unanchored_infusion_boundary_loses_the_second_derivative() {
+    for (kernel, shape) in [("weibull", 1.5), ("transit", 0.5)] {
+        let m = tight(parse_model_string(&lagged_kernel_model(kernel, shape, "route")).unwrap());
+        let s = lagged_infusion_subject(&m);
+        let eta = probe_eta(m.n_eta);
+        let (jac, grad) =
+            with_onset_shift_off(|| (jacobian_gap(&m, &s, &eta, "mutated"), parity(&m, &s)));
+        eprintln!("G9 unanchored {kernel} {shape}: jac {jac:.2e} grad {grad:.2e}");
+        assert!(
+            grad > 5e-4,
+            "{kernel} {shape} unanchored: gradient gap {grad:.2e}"
+        );
+    }
+}
+
+/// The IOV model of [`iov_lag_subject`] with its depot replaced by an absorption `kernel`
+/// (`weibull(td, beta)` or `transit(n, mtt)`) under the compartment lag `ALAG1`: a κ on CL, η on
+/// CL and on the lag.
+fn iov_kernel_lag_model(kernel: &str, shape: f64) -> String {
+    let (call, extra, ind) = if kernel == "weibull" {
+        (
+            "weibull(td=TD, beta=BETA)",
+            format!("  theta TVTD(2.0, 0.05, 24.0)\n  theta TVBETA({shape}, 0.1, 10.0)\n"),
+            "  TD = TVTD\n  BETA = TVBETA\n",
+        )
+    } else {
+        (
+            "transit(n=N, mtt=MTT)",
+            format!("  theta TVMTT(2.0, 0.05, 24.0)\n  theta TVN({shape}, 0.1, 10.0)\n"),
+            "  MTT = TVMTT\n  N = TVN\n",
+        )
+    };
+    format!(
+        "[parameters]\n  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n{extra}  \
+         theta TVLAG(0.6, 0.01, 5.0)\n  omega ETA_CL ~ 0.09\n  omega ETA_LAG ~ 0.06\n  \
+         kappa KAPPA_CL ~ 0.03\n  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n  \
+         CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV\n{ind}  ALAG1 = TVLAG * exp(ETA_LAG)\n\
+         [structural_model]\n  ode(obs_cmt=central, states=[central])\n\
+         [odes]\n  d/dt(central) = {call} - (CL/V)*central\n[scaling]\n  y = central / V\n\
+         [error_model]\n  DV ~ proportional(PROP_ERR)\n[fit_options]\n  iov_column = OCC\n"
+    )
+}
+
+/// Three occasions, an infusion (2 h) opening each into the kernel, observations from
+/// `predict_iov` at known κ, none within 0.4 h of an onset or a window end.
+fn iov_infusion_subject(m: &CompiledModel) -> Subject {
+    let times = [1.5, 4.0, 10.0, 13.5, 16.0, 22.0, 25.5, 28.0, 34.0];
+    let doses = vec![
+        DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(12.0, 100.0, 1, 50.0, false, 0.0),
+        DoseEvent::new(24.0, 100.0, 1, 50.0, false, 0.0),
+    ];
+    let mut s = subject_shell(doses, &times);
+    s.occasions = vec![1, 1, 1, 2, 2, 2, 3, 3, 3];
+    s.dose_occasions = vec![1, 2, 3];
+    let kappas = vec![vec![0.1], vec![-0.08], vec![0.05]];
+    let preds = crate::pk::predict_iov(m, &s, &m.default_params.theta, &[0.1, -0.05], &kappas);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.12 * (1.7 * j as f64).sin()))
+        .collect();
+    s
+}
+
+/// The IOV walk is the same event-driven walk as the non-IOV one, so a lagged infusion into a
+/// Weibull / transit kernel is anchored at its onset and window end there too: served, with the
+/// stacked `∂f/∂[η, κ]` and the FOCEI gradient matching reconverged FD (measured worst on
+/// Linux: 1.6e-9 / 1.9e-7; the bounds are ~10x with a floor). The anchoring mutations of the
+/// non-IOV test redden this one too.
+#[test]
+fn an_iov_lagged_infusion_into_a_weibull_or_transit_kernel_matches_reconverged_fd() {
+    for (kernel, shape) in [("weibull", 0.5), ("weibull", 1.5), ("transit", 0.5)] {
+        let label = format!("IOV infusion, {kernel} {shape}");
+        let m = tight(parse_model_string(&iov_kernel_lag_model(kernel, shape)).unwrap());
+        let s = iov_infusion_subject(&m);
+        assert!(served(&m, &s), "{label}: must be served");
+        let jac = iov_jacobian_gap(&m, &s, &[0.06, -0.04, 0.05, -0.03, 0.04], &label);
+        let grad = fd_oracle(&m, &s, true);
+        eprintln!("{label}: ∂f/∂[η, κ] vs FD {jac:.2e}; FOCEI gradient vs FD {grad:.2e}");
+        assert!(jac < 2e-8, "{label} ∂f/∂[η, κ]: {jac:.2e}");
+        assert!(grad < 2e-6, "{label} gradient: {grad:.2e}");
     }
 }
 

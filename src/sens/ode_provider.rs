@@ -528,24 +528,9 @@ fn event_walk_scope(model: &CompiledModel, subject: &Subject) -> bool {
     // Estimated lagtime IS supported here (bare or per-compartment `ALAGn`):
     // `integrate_tvcov_g` shifts each dose to `t_dose + lag` and injects the event-time
     // (saltation) sensitivity, propagated exactly through the per-event params (#439).
-    let Some(ode) = model.ode_spec.as_ref() else {
+    let Some(_ode) = model.ode_spec.as_ref() else {
         return false;
     };
-    // An infusion into a Weibull kernel under an estimated lag: the input is the convolved
-    // `R_in_inf = (D/T)·[G(τ) − G(τ − T)]`, and the cumulative frame (`CumulativeInputs`)
-    // delivers boluses only. Its onset and window end sit on the same singular `G` for
-    // `β < 2`, so the pointwise path's lag derivative is off (2.4e-2 measured at `β = 1.5`, NaN
-    // jets at `β < 1`): the subject stays on finite differences.
-    if (model.has_lagtime() || has_route_lag)
-        && subject.doses.iter().any(|d| {
-            d.is_infusion()
-                && ode.input_rate.iter().any(|f| {
-                    f.cmt == d.cmt_idx() && f.kind == crate::pk::absorption::InputRateKind::Weibull
-                })
-        })
-    {
-        return false;
-    }
     // Built-in absorption input-rate forcing (transit/igd/weibull/first_order, #486):
     // the TV-cov event-driven walk (`integrate_tvcov_g`) now carries `R_in` via the
     // shared `add_prepared_input_rate_forcing` helper, exactly as the static walk
@@ -1857,7 +1842,10 @@ thread_local! {
 }
 
 /// Whether the segment after the event at `t_event` (timeline slot `p`) starts strictly later,
-/// so a Weibull / transit onset at `t_event` can anchor it (`onset_shift`).
+/// and no event precedes it at the same instant, so a Weibull / transit onset or infusion-window
+/// end at `t_event` can anchor it (`onset_shift`): the anchor shifts the clock of every dose, so
+/// a sibling event at the same instant would read a kernel at an age whose jet it does not
+/// cancel.
 fn next_event_is_later<T: crate::sens::num::PkNum>(
     tl: &[(T, u8, usize)],
     p: usize,
@@ -1867,9 +1855,14 @@ fn next_event_is_later<T: crate::sens::num::PkNum>(
     if ONSET_SHIFT_OFF.with(|c| c.get()) {
         return false;
     }
-    tl.get(p + 1).is_some_and(|e| {
+    let later = tl.get(p + 1).is_some_and(|e| {
         e.0.br_cmp(crate::sens::num::BranchCmp::Gt, t_event + T::from_f64(1e-9))
-    })
+    });
+    let alone = p == 0
+        || tl[p - 1]
+            .0
+            .br_cmp(crate::sens::num::BranchCmp::Lt, t_event - T::from_f64(1e-9));
+    later && alone
 }
 
 /// The state just after a switch whose true time is `t_b + δ` (`δ` jet-only, the walk
@@ -3585,6 +3578,27 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
             cross_moving_boundary(u, delta, &mut pre, &mut post, &|_| {});
         };
 
+    // The state at the true window end `t_ev + delta`, from the one at the nominal `t_ev`: the
+    // flow of the field with the infusion still running, over the jet-only interval. The
+    // segment after it is anchored there (`onset_shift`), so the kernel's CDF, singular where
+    // the tail starts, is read at an age with no jet.
+    let flow_to_kernel_end =
+        |u: &[T], delta: T, t_ev: T, params: &[T], last_dose: T, r_floor: T| -> Vec<T> {
+            let mut pre = |x: &[T], s: T, out: &mut [T]| {
+                out.copy_from_slice(&boundary_velocity_since(
+                    x,
+                    params,
+                    t_ev,
+                    s,
+                    last_dose,
+                    r_floor,
+                    false,
+                    just_before(t_ev),
+                ));
+            };
+            rk4_dual(u, T::from_f64(0.0), delta, &mut pre)
+        };
+
     // Every moving boundary reads ONE PK snapshot on both sides: the enclosing segment's
     // `params` below — the record terminating the interval the boundary lies in (#1073) —
     // and never a lookahead to a later record. A record is stationary, so its field jump
@@ -3890,6 +3904,7 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                         t,
                         seg_since,
                         cum.framed(),
+                        sj.is_some(),
                         du,
                     );
                 }
@@ -4945,14 +4960,28 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 } else {
                     T::from_f64(0.0)
                 };
-                cross_kernel_infusion_end(
-                    &mut u,
-                    dlag + jet_only(inf_eff[idx].1),
-                    t_event,
-                    params,
-                    last_dose_eff,
-                    reset_floor,
-                );
+                let delta = dlag + jet_only(inf_eff[idx].1);
+                if ode.input_rate.iter().any(|f| {
+                    f.cmt == d.cmt_idx()
+                        && f.lag_slot.is_none()
+                        && crate::ode::predictions::anchorable_dose(f.kind, d)
+                }) && !delta.is_constant()
+                    && next_event_is_later(&tl, p, t_event)
+                {
+                    // The kernel's CDF is singular at the window end (`G(τ − T)` starts there):
+                    // the segment after it starts at the true end (`onset_shift`).
+                    u = flow_to_kernel_end(&u, delta, t_event, params, last_dose_eff, reset_floor);
+                    onset_shift = Some(delta);
+                } else {
+                    cross_kernel_infusion_end(
+                        &mut u,
+                        delta,
+                        t_event,
+                        params,
+                        last_dose_eff,
+                        reset_floor,
+                    );
+                }
             }
         } else if kind == K_ROUTE_INF_END {
             // The end of an infusion into a route-lagged kernel, one window after the route's
@@ -4970,14 +4999,22 @@ fn integrate_tvcov_g<T: crate::sens::num::vm::VmNum>(
                 };
                 let delta = jet_only(lag_cmt + dose_forcings.get(fi, dose_idx).route_lag)
                     + jet_only(inf_eff[dose_idx].1);
-                cross_kernel_infusion_end(
-                    &mut u,
-                    delta,
-                    t_event,
-                    params,
-                    last_dose_eff,
-                    reset_floor,
-                );
+                if crate::ode::predictions::anchorable_dose(ode.input_rate[fi].kind, d)
+                    && !delta.is_constant()
+                    && next_event_is_later(&tl, p, t_event)
+                {
+                    u = flow_to_kernel_end(&u, delta, t_event, params, last_dose_eff, reset_floor);
+                    onset_shift = Some(delta);
+                } else {
+                    cross_kernel_infusion_end(
+                        &mut u,
+                        delta,
+                        t_event,
+                        params,
+                        last_dose_eff,
+                        reset_floor,
+                    );
+                }
             }
         } else if kind == K_ZO_END {
             // #486: zero-order window end (`idx` = the `zero_windows` index). The constant
@@ -5795,6 +5832,7 @@ fn integrate_g<T: crate::sens::num::vm::VmNum>(
                     t,
                     t_start,
                     cum.framed(),
+                    false,
                     du,
                 );
             }

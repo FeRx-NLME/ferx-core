@@ -894,7 +894,7 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// `Weibull β = 1`, and the onset moves with the inputs when the lag or the window does.
     /// `s < 0` (a stage rounded below its segment) is `0`.
     #[inline]
-    fn cdf_from_onset(&self, s: T) -> T {
+    fn cdf_from_onset(&self, s: T, anchored: bool) -> T {
         use crate::sens::num::BranchCmp::{Eq, Gt};
         let zero = T::from_f64(0.0);
         if T::RECORDS_BRANCHES {
@@ -902,7 +902,21 @@ impl<T: PkNum> PreparedInputRate<T> {
             // selection, with the kernel evaluated at a safe age before it.
             let safe = T::select_if(Gt, s, zero, s, T::from_f64(1.0));
             let away = T::select_if(Gt, s, zero, self.cdf(safe), zero);
-            T::select_if(Eq, s, zero, self.cdf_onset_continued(s), away)
+            if anchored {
+                // A segment anchored at the onset or the window end reads the kernel at an age
+                // with no jet (`onset_shift`): a stage at age zero is the flat `G = 0`, whose
+                // right-hand continuation does not exist where the kernel is singular there.
+                return away;
+            }
+            // A kernel whose density is infinite at the onset (`β < 1`) has no continuation:
+            // the tie is a recorded `NaN` (the recording declines), and the stages away from
+            // it, where this selection does not take it, must not carry one.
+            let tie = if self.frame_kernel() {
+                T::from_f64(f64::NAN)
+            } else {
+                self.cdf_onset_continued(s)
+            };
+            T::select_if(Eq, s, zero, tie, away)
         } else if s.br_cmp_c(Gt, 0.0) {
             self.cdf(s)
         } else if s.br_cmp_c(Eq, 0.0) && !s.is_constant() {
@@ -944,13 +958,29 @@ impl<T: PkNum> PreparedInputRate<T> {
     /// `tad − T` — says which side the stage is on, and the age is `≥ 0` on it.
     #[inline]
     pub fn rate_infused(&self, tad: T, dose: T, t_inf: T, tail_age: Option<T>) -> T {
+        self.rate_infused_from(tad, dose, t_inf, tail_age, false)
+    }
+
+    /// [`Self::rate_infused`], for a segment `anchored` at the onset or the window end of an
+    /// infusion that moves with the inputs (`onset_shift` of the analytic walk): every age it
+    /// reads is jet-free, so a recording's stage at age zero is the flat `G = 0` rather than
+    /// the onset continuation ([`Self::cdf_onset_continued`]).
+    #[inline]
+    pub(crate) fn rate_infused_from(
+        &self,
+        tad: T,
+        dose: T,
+        t_inf: T,
+        tail_age: Option<T>,
+        anchored: bool,
+    ) -> T {
         if dose.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
             || t_inf.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0)
         {
             return T::from_f64(0.0);
         }
-        let g_hi = self.cdf_from_onset(tad);
-        let g_lo = tail_age.map_or(T::from_f64(0.0), |age| self.cdf_from_onset(age));
+        let g_hi = self.cdf_from_onset(tad, anchored);
+        let g_lo = tail_age.map_or(T::from_f64(0.0), |age| self.cdf_from_onset(age, anchored));
         (g_hi - g_lo) * dose / t_inf
     }
 

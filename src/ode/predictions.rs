@@ -3086,6 +3086,7 @@ pub(crate) fn add_prepared_input_rate_forcing<
         t,
         since,
         &[],
+        false,
         dy,
     );
 }
@@ -3110,6 +3111,7 @@ pub(crate) fn add_input_rate_forcing_except_cumulative<
     t: T,
     since: T,
     framed: &[(usize, usize)],
+    anchored: bool,
     dy: &mut [T],
 ) {
     add_input_rate_forcing_core(
@@ -3123,6 +3125,7 @@ pub(crate) fn add_input_rate_forcing_except_cumulative<
         t,
         since,
         framed,
+        anchored,
         dy,
     );
 }
@@ -3140,6 +3143,7 @@ fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::num::
     t: T,
     since: T,
     framed: &[(usize, usize)],
+    anchored: bool,
     dy: &mut [T],
 ) {
     debug_assert!(
@@ -3266,8 +3270,8 @@ fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::num::
                     let slack = T::from_f64(1e-9) * (T::from_f64(1.0) + end.abs());
                     let (limit, one) = (end + slack, T::from_f64(1.0));
                     let age = T::select_if(Gt, t, limit, t - end, one);
-                    let tail = prep.rate_infused(tad, dose_mass, window, Some(age));
-                    let running = prep.rate_infused(tad, dose_mass, window, None);
+                    let tail = prep.rate_infused_from(tad, dose_mass, window, Some(age), anchored);
+                    let running = prep.rate_infused_from(tad, dose_mass, window, None, anchored);
                     T::select_if(Gt, t, limit, tail, running)
                 } else {
                     // The same predicate, [`infusion_edge_is_a_break`] negated: one plain `f64`
@@ -3280,7 +3284,7 @@ fn add_input_rate_forcing_core<T: crate::sens::num::PkNum, G: crate::sens::num::
                     } else {
                         None
                     };
-                    prep.rate_infused(tad, dose_mass, window, tail_age)
+                    prep.rate_infused_from(tad, dose_mass, window, tail_age, anchored)
                 }
             } else if T::RECORDS_BRANCHES {
                 // A recording type (#2786) records this inside an ODE step, where the stage
@@ -3324,13 +3328,15 @@ pub(crate) fn cumulative_dose(kind: crate::pk::absorption::InputRateKind, d: &Do
 }
 
 /// Whether the segment after the lagged onset of dose `d` into a forcing of `kind` can be
-/// anchored at the true onset (`ode_provider`'s `onset_shift`): a plain bolus into a Weibull or
-/// transit kernel, whose density is zero or infinite there and whose slope is singular for
-/// `β < 2` / `n < 1`. The segment then reads the kernel at an age with no jet.
+/// anchored at the true onset (`ode_provider`'s `onset_shift`): a bolus or an infusion (whose
+/// convolved `R_in_inf` carries the kernel's CDF, singular at the same onset, and again at its
+/// window end) into a Weibull or transit kernel, whose density is zero or infinite there and
+/// whose slope is singular for `β < 2` / `n < 1`. The segment then reads the kernel at an age
+/// with no jet. A steady-state train keeps the periodic sum.
 #[inline]
 pub(crate) fn anchorable_dose(kind: crate::pk::absorption::InputRateKind, d: &DoseEvent) -> bool {
     use crate::pk::absorption::InputRateKind::{Transit, Weibull};
-    matches!(kind, Weibull | Transit) && !(d.ss && d.ii > 0.0) && !d.is_infusion()
+    matches!(kind, Weibull | Transit) && !(d.ss && d.ii > 0.0)
 }
 
 /// The absorbed mass of a lagged Weibull (`β < 1`) bolus as a **state shift**, for one
@@ -3651,6 +3657,7 @@ fn forced_jac<'a>(
                     D1 { v: t, g: [1.0] },
                     lift1(force.gate.t_seg),
                     force.cum.framed(),
+                    false,
                     &mut dy,
                 );
                 for i in 0..n {
@@ -4034,6 +4041,7 @@ impl<'a> SegmentForcing<'a> {
                 t,
                 self.gate.t_seg,
                 self.cum.framed(),
+                false,
                 dy,
             );
         }
