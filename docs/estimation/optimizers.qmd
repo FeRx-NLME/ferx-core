@@ -67,7 +67,7 @@ aliases for `nlopt_lbfgs`. The built-in implementation is slated for removal.
 
 | Key | Algorithm | Notes |
 |-----|-----------|-------|
-| `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ gᵢgᵢᵀ` (always positive semi-definite). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. Stops when it can no longer make progress — see [convergence reporting](#trust-region-convergence-reporting). |
+| `trust_region` | Newton trust-region with Steihaug CG | Uses the analytic outer gradient and a BHHH approximate Hessian `H ≈ 4 Σ dᵢdᵢᵀ` built from the same per-subject total derivatives `dᵢ` the gradient sums (always positive semi-definite; [#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)). The CG budget defaults to `ceil(sqrt(n_params)).clamp(5, n_params)`; pin it with `steihaug_max_iters`. Best combined with `inits_from_nca` since it benefits from good starting values. Stops when it can no longer make progress — see [convergence reporting](#trust-region-convergence-reporting). |
 
 ### Trust-region convergence reporting {#trust-region-convergence-reporting}
 

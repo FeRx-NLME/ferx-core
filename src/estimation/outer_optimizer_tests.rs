@@ -805,9 +805,6 @@ fn test_assemble_score_cross_product_cancelled() {
     let n_subj = 4;
     let n_eta = 1;
     let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
-    let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
-        .map(|_| DMatrix::identity(n_eta, n_eta))
-        .collect();
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
     let free_idx: Vec<usize> = (0..x.len()).collect();
 
@@ -822,7 +819,6 @@ fn test_assemble_score_cross_product_cancelled() {
         &model,
         &population,
         &eta_hats,
-        &h_matrices,
         &kappas,
         &bounds,
         &options,

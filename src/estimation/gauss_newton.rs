@@ -235,7 +235,7 @@ pub fn run_foce_gn(
 
         // ---- Build the BHHH system ----
         // Gradient + outer-product Hessian approximation
-        let (mut grad, mut h_bhhh, mut per_subj_t) = build_gn_system_parts(
+        let (mut grad, mut h_bhhh, mut gn_rows) = build_gn_system_parts(
             &x,
             init_params,
             model,
@@ -264,19 +264,48 @@ pub fn run_foce_gn(
         }
 
         // #2777: one subject whose EBE mode sits near a fold can own the step
-        // direction through its `tᵢ`, which is exact at the point and wrong over any
-        // step GN can take. After a run of unclamped rejections, take such a subject
-        // back to its raw score `gᵢ`; the BHHH matrix already uses `gᵢ`. Only the
-        // coordinates the step can move count: a FIX one, or one held on its bound,
-        // played no part in the rejections.
-        for &s in &raw_score_subjects {
-            drop_ebe_response(&mut grad, &mut per_subj_t[s]);
+        // direction through its `tᵢ = dᵢ − gᵢ`, which is exact at the point and wrong over
+        // any step GN can take. After a run of unclamped rejections, take such a subject
+        // back to its raw score `gᵢ`. Only the coordinates the step can move count: a FIX
+        // one, or one held on its bound, played no part in the rejections.
+        //
+        // Since #2974 the subject's row `dᵢ` is in the BHHH matrix as well as the gradient,
+        // so taking it back swaps the row in both ([`swap_row`]); `tᵢ = dᵢ − gᵢ` is formed
+        // only when the stall test asks, from the fixed-mode scores of every subject.
+        let raw_at = |which: &[usize]| {
+            raw_scores(
+                which,
+                &x,
+                init_params,
+                model,
+                population,
+                &eta_hats,
+                &h_matrices,
+                &kappas,
+                &bounds,
+                options,
+            )
+        };
+        if !raw_score_subjects.is_empty() {
+            for (&s, g) in raw_score_subjects.iter().zip(raw_at(&raw_score_subjects)) {
+                swap_row(&mut grad, &mut h_bhhh, &mut gn_rows.rows[s], g);
+            }
         }
         if unclamped_stalls >= GN_DOMINANT_SUBJECT_STALLS {
             let held = bound_active_outward(&x, &grad, &bounds);
             let free: Vec<bool> = (0..n_packed).map(|i| !fixed_mask[i] && !held[i]).collect();
+            let all: Vec<usize> = (0..n_subj).collect();
+            let mut raw = raw_at(&all);
+            // A subject already taken back has `dᵢ = gᵢ` in the system: `tᵢ = 0`.
+            let per_subj_t: Vec<Vec<f64>> = gn_rows
+                .rows
+                .iter()
+                .zip(&raw)
+                .map(|(d, g)| d.iter().zip(g).map(|(a, b)| a - b).collect())
+                .collect();
             if let Some(s) = dominant_ebe_response_subject(&per_subj_t, &grad, &gn_scale, &free) {
-                drop_ebe_response(&mut grad, &mut per_subj_t[s]);
+                let g = std::mem::take(&mut raw[s]);
+                swap_row(&mut grad, &mut h_bhhh, &mut gn_rows.rows[s], g);
                 raw_score_subjects.push(s);
                 warnings.push(format!(
                     "Gauss-Newton: subject {} dominated the gradient through its EBE \
@@ -1114,15 +1143,6 @@ fn dominant_ebe_response_subject(
     sets_direction.then_some(s)
 }
 
-/// Take one subject's EBE-response term `t` back out of the gradient (`grad −= 2·t`) and
-/// zero it, so the subject contributes its raw score and cannot be picked again.
-fn drop_ebe_response(grad: &mut DVector<f64>, t: &mut [f64]) {
-    for (g, tk) in grad.iter_mut().zip(t.iter_mut()) {
-        *g -= 2.0 * *tk;
-        *tk = 0.0;
-    }
-}
-
 // ── Analytical gradient helpers ──────────────────────────────────────────────
 //
 // For each packed parameter x[k] the gradient of the FOCE NLL uses:
@@ -1669,13 +1689,6 @@ pub(crate) struct LaplaceGradCache {
     pub htilde_inv: DMatrix<f64>,
     /// Per-observation `qⱼ = aⱼ'H̃⁻¹aⱼ`.
     pub q: Vec<f64>,
-    /// Per-packed-parameter GN gradient EBE-response correction:
-    /// `t_i[k] = −½ Σⱼ (q̃ⱼ/Rⱼ) · ∂fⱼ/∂θ_k`
-    /// where `q̃ⱼ = (H̃⁻¹ gη)' aⱼ` and `gη[m] = Σⱼ βⱼ qⱼ a_{j,m}`.
-    /// Only the theta block (indices `0..n_theta`) is filled; omega/sigma stay zero (#1817).
-    /// Used by `build_gn_system` to correct the fixed-η̂ Laplace gradient for the
-    /// `log|H̃|` EBE-response term the envelope theorem drops.
-    pub gn_theta_correction: Vec<f64>,
 }
 
 /// As [`subject_nll_pop_grad_analytical_laplace`], but also returns the
@@ -1823,36 +1836,6 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     let log_det_omega = omega.log_det;
     let nll = 0.5 * (data_ll + eta_prior + log_det_omega + log_det_htilde);
 
-    // ── GN gradient EBE-response correction coefficients ─────────────────────
-    // The fixed-η̂ Laplace gradient drops the log|H̃| EBE-response curvature
-    // (envelope theorem zeros the inner NLL but not log|H̃|).  The total gradient
-    // correction for θ_k is t_i[k] = -½ Σⱼ (q̃ⱼ/Rⱼ) · ∂fⱼ/∂θ_k, where:
-    //   gη[m] = Σⱼ βⱼ qⱼ a_{j,m}   (∂log|H̃|/∂η, a-fixed)
-    //   w     = H̃⁻¹ gη              (IFT: dη̂/dθ_k = -H̃⁻¹ · Σⱼ (aⱼ/Rⱼ) ∂fⱼ/∂θ_k)
-    //   q̃ⱼ   = w' · aⱼ             (per-obs scalar)
-    // Accumulated in the theta FD loop below into `gn_theta_correction`.
-    // Identically zero for additive error (βⱼ = 0 when d = 0).
-    let mut g_eta_gn = DVector::zeros(n_eta);
-    for j in 0..n_obs {
-        let aj = h_matrix.row(j);
-        let beta_j = logdet_htilde_beta(d_vec[j], d2_vec[j], 1.0 / r_diag[j]);
-        let coef = beta_j * q[j];
-        for m in 0..n_eta {
-            g_eta_gn[m] += coef * aj[m];
-        }
-    }
-    let w_gn = &htilde_inv * &g_eta_gn;
-    let mut q_tilde = vec![0.0f64; n_obs];
-    for j in 0..n_obs {
-        let aj = h_matrix.row(j);
-        let mut s = 0.0;
-        for m in 0..n_eta {
-            s += w_gn[m] * aj[m];
-        }
-        q_tilde[j] = s;
-    }
-    let mut gn_theta_correction = vec![0.0f64; n];
-
     // ── Theta gradient (forward FD on predictions; closed-form chain rest) ──
     // Per-obs scalar coeff combines data_ll and log|H̃| contributions:
     //   per_j = αⱼ + βⱼ·qⱼ
@@ -1874,16 +1857,15 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     let mut grad = vec![0.0f64; n];
     // θ enters through the predictions alone (a θ-dependent residual magnitude is routed
     // away by the caller), so its block is two contractions of `∂f/∂θ` at η̂ — the
-    // objective's and the #274 correction's — taken exactly by one recording and one
-    // reverse sweep (`fixed_eta_theta_contractions`). The per-θ central difference below
-    // remains only where the recorders decline.
-    let corr_w: Vec<f64> = (0..n_obs).map(|j| -(q_tilde[j] / r_diag[j])).collect();
+    // objective's — taken exactly by one recording and one reverse sweep
+    // (`fixed_eta_theta_contractions`). The per-θ central difference below remains only
+    // where the recorders decline.
     let exact = crate::sens::ode_provider::adjoint::fixed_eta_theta_contractions(
         model,
         subject,
         &params.theta,
         eta_hat.as_slice(),
-        |_| Some(vec![theta_per_j.clone(), corr_w]),
+        |_| Some(vec![theta_per_j.clone()]),
     );
     if let Some(rows) = exact.filter(|_| !theta_fd_forced()) {
         for k in 0..n_theta {
@@ -1892,7 +1874,6 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
             }
             let pack = theta_packing_jacobian(params.theta[k], template.theta_lower[k]);
             grad[k] = 0.5 * pack * rows[0][k];
-            gn_theta_correction[k] = 0.5 * pack * rows[1][k];
         }
     } else {
         let eps = 1e-5;
@@ -1948,14 +1929,11 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
                 continue;
             }
             let mut s = 0.0f64;
-            let mut s_corr = 0.0f64;
             for j in 0..n_obs {
                 let df = (num_lhs[j] - num_rhs[j]) / denom;
                 s += theta_per_j[j] * df;
-                s_corr += -(q_tilde[j] / r_diag[j]) * df;
             }
             grad[k] = 0.5 * s;
-            gn_theta_correction[k] = 0.5 * s_corr;
         }
     }
 
@@ -2086,7 +2064,6 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         hrh,
         htilde_inv,
         q,
-        gn_theta_correction,
     };
     Some((nll, grad, cache))
 }
@@ -2279,8 +2256,8 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
 ///
 /// Holding η̂ fixed is exact for the inner NLL (envelope theorem) but not for log|H̃|. On
 /// a Gaussian model the exact adjoint gradient carries the dropped
-/// `∂_η log|H̃| · dη̂/dθ` term, GN and trust-region add it back from
-/// `LaplaceGradCache::gn_theta_correction`, and with additive error it is zero anyway.
+/// `∂_η log|H̃| · dη̂/dθ` term (GN and trust-region take it too since #2974,
+/// [`gn_subject_rows`]), and with additive error it is zero anyway.
 /// A TTE or discrete data term adds `H_data(η)` — `λe^η t` for an exponential
 /// hazard, `p(1−p)` for a Bernoulli — which is strongly η-dependent, while the FD branch
 /// these models take (see [`closed_form_fixed_ebe_grad_ok`]) has no correction. The term
@@ -2298,160 +2275,6 @@ pub(crate) fn fixed_ebe_score_drops_ebe_response(model: &CompiledModel) -> bool 
         return false;
     }
     model.n_eta > 0 && (model.has_tte() || model.has_discrete())
-}
-
-/// Whether GN's and trust-region's **gradient** for this model takes the exact total
-/// derivative `dᵢ` of every (non-IOV) subject rather than the fixed-EBE score `gᵢ` plus the
-/// closed form's `gn_theta_correction` (#2740).
-///
-/// Wider than [`fixed_ebe_score_drops_ebe_response`], which keeps routing the NLopt
-/// dispatcher: every **FOCEI** model with η is in. Its Laplace marginal carries
-/// `log|H̃(η̂)|`, which the envelope theorem does not zero, and neither cheap stand-in for
-/// `∂_η log|H̃| · dη̂/dx` was right. The kernel-score path (M3, IIV on RUV, a θ-dependent
-/// residual magnitude, `block_sigma`, FREM) had no cache and so `tᵢ = 0`: on
-/// `warfarin_bloq` GN's θ gradient read 49.86 against a central difference of 6.86. The
-/// closed form's θ-only correction drops the `errⱼ·∂²fⱼ/∂η∂θ` and `∂Rⱼ/∂θ` cross terms,
-/// replaces the exact inner Hessian by the Gauss–Newton `H̃`, and has no Ω/σ block: on
-/// `schnider` it read −1.40 against 4.37 on θ₁. Once the trust radius is small, GN's
-/// acceptance ratio is the true slope along δ over GN's, so a wrong gradient collapsed the
-/// radius far from the optimum (#2738). Taking `dᵢ` closed the GN − FOCEI OFV gap from
-/// +10.62 to 0.000 on `warfarin_bloq` and from +0.93 to 0.000 on `pkpd_nonmem`.
-///
-/// FOCE (`interaction = false`) keeps the score: its gradient is not the subject of the
-/// measurements above. A CTMM endpoint stays out for the reason given on
-/// [`fixed_ebe_score_drops_ebe_response`].
-pub(crate) fn gn_gradient_takes_total_derivative(
-    model: &CompiledModel,
-    options: &FitOptions,
-) -> bool {
-    #[cfg(feature = "markov")]
-    if model.has_ctmm() {
-        return false;
-    }
-    fixed_ebe_score_drops_ebe_response(model) || (model.n_eta > 0 && options.interaction)
-}
-
-/// The per-subject term `tᵢ` that GN and trust-region add to the raw fixed-EBE score `gᵢ`
-/// in their **gradient**, `2·Σ(gᵢ + tᵢ)`. Their BHHH Hessian `4·Σ gᵢgᵢᵀ` stays on `gᵢ`.
-///
-/// For a model inside [`gn_gradient_takes_total_derivative`] — every FOCEI model with η,
-/// and a TTE / discrete one under FOCE too — `tᵢ` is the gap to this subject's total
-/// derivative: `tᵢ = dᵢ − gᵢ`, `dᵢ` the
-/// adjoint's exact packed gradient (`subject_adjoint_gradient_at`, which carries the mode
-/// response), or for a subject it declines the reconverged difference
-/// (`outer_optimizer::subject_reconverged_fd_gradient`). The gradient is then `2·Σ dᵢ`, the
-/// same one the outer optimizers take. The Hessian keeps
-/// the raw score, as it does for a Gaussian FOCEI model whose `gᵢ` also lacks `tᵢ`; folding
-/// `dᵢ` into the outer product as well measured worse (see `build_gn_system`).
-///
-/// This fixes `method = gn` on a Gaussian FOCEI model (#2740, see
-/// [`gn_gradient_takes_total_derivative`]) and on a single-endpoint TTE model (`examples/tte_exponential.ferx`:
-/// 166.4983 reported as converged → 166.4395, BOBYQA 166.4394). It does not rescue GN on the
-/// joint PK + TTE example, which fails to converge with or without it (71.92 before, 72.63
-/// after, optimum 66.975); `gn_hybrid` reaches the optimum on both.
-///
-/// An IOV subject (`kappas` non-empty) takes `dᵢ` from
-/// `outer_optimizer::subject_iov_outer_gradient` on **every** model, Gaussian included: the
-/// raw IOV score holds κ̂ and η̂ fixed, and the GN path has no closed-form correction for
-/// them. It is the same per-subject gradient the NLopt IOV route sums — the exact adjoint
-/// where it takes the subject (at `pt`, unpacked once by the caller and `None` where the
-/// NLopt route would not ask the adjoint either), else the reconverged-FD salvage. Without
-/// it `method = gn` stopped on `examples/warfarin_iov.ferx` at 331.762270 reporting
-/// convergence, near its initial estimates, against the L-BFGS optimum 308.830465 (#2455).
-/// The adjoint's `dᵢ` is not masked on FIX'd coordinates; `build_gn_system` zeroes them.
-///
-/// Under `gradient = fd` (model, `FitOptions`, or the fit-scoped flag) or a model outside
-/// the adjoint's scope, `dᵢ` is always the reconverged difference.
-///
-/// Otherwise, or when the subject is repelled (`nll` unusable, `gᵢ` or `dᵢ` non-finite),
-/// it is the closed form's `gn_theta_correction`, or zero without a cache.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn ebe_response_correction(
-    x: &[f64],
-    template: &ModelParameters,
-    model: &CompiledModel,
-    population: &Population,
-    subj_idx: usize,
-    eta_hat: &DVector<f64>,
-    kappas: &[DVector<f64>],
-    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
-    nll: f64,
-    gi: &[f64],
-    cache: Option<&LaplaceGradCache>,
-    bounds: &PackedBounds,
-    options: &FitOptions,
-) -> Vec<f64> {
-    if !kappas.is_empty() && is_usable_subject_nll(nll) && gi.iter().all(|v| v.is_finite()) {
-        let stacked = crate::estimation::outer_optimizer::joint_warm_start(eta_hat, kappas);
-        let di = crate::estimation::outer_optimizer::subject_iov_outer_gradient(
-            x,
-            template,
-            model,
-            &population.subjects[subj_idx],
-            pt,
-            &stacked,
-            bounds,
-            options,
-        );
-        if di.iter().all(|v| v.is_finite()) {
-            return di.iter().zip(gi).map(|(d, g)| d - g).collect();
-        }
-    }
-    if kappas.is_empty()
-        && gn_gradient_takes_total_derivative(model, options)
-        && is_usable_subject_nll(nll)
-        && gi.iter().all(|v| v.is_finite())
-    {
-        let subject = &population.subjects[subj_idx];
-        // The exact total derivative `dᵢ` — the adjoint's packed gradient carries the mode
-        // response the fixed-EBE score drops. IOV subjects took the arm above. Asked only
-        // where the NLopt dispatch would ask it (`analytic_outer_gradient_available`, which
-        // reads the fit-scoped `gradient = fd` too, as the IOV arm's `pt` does) and where the
-        // caller's own options do not force FD; otherwise the reconverged difference below.
-        let analytic = crate::sens::provider::analytic_outer_gradient_available(model)
-            && GradientMethod::effective(model, options) != GradientMethod::Fd;
-        let exact = analytic
-            .then(|| crate::estimation::covariance::stacked_mode(model, subject, eta_hat, None))
-            .flatten()
-            .and_then(|b| {
-                let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
-                crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
-                    model,
-                    subject,
-                    &pt,
-                    &b,
-                    if options.interaction {
-                        crate::sens::ode_provider::adjoint::Objective::Focei
-                    } else {
-                        crate::sens::ode_provider::adjoint::Objective::Foce
-                    },
-                )
-            })
-            .filter(|d| d.len() == gi.len() && d.iter().all(|v| v.is_finite()));
-        // A subject the adjoint declines takes the reconverged difference.
-        let di = exact
-            .map(|mut d| {
-                for (v, &fixed) in d.iter_mut().zip(&packed_fixed_mask(template)) {
-                    if fixed {
-                        *v = 0.0;
-                    }
-                }
-                d
-            })
-            .or_else(|| {
-                Some(
-                    crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
-                        x, template, model, subject, eta_hat, bounds, options,
-                    ),
-                )
-            });
-        if let Some(di) = di.filter(|d| d.iter().all(|v| v.is_finite())) {
-            return di.iter().zip(gi).map(|(d, g)| d - g).collect();
-        }
-    }
-    cache
-        .map(|c| c.gn_theta_correction.clone())
-        .unwrap_or_else(|| vec![0.0; x.len()])
 }
 
 /// The Sheiner–Beal (non-INTER) closed form's scope **on top of**
@@ -2794,9 +2617,17 @@ fn build_gn_system(
     (grad, h_bhhh)
 }
 
-/// [`build_gn_system`], also returning each subject's EBE-response term `tᵢ` (unscaled
-/// packed space, before the factor 2 the gradient applies), so the step loop can take a
-/// subject back to its raw score (#2777, [`dominant_ebe_response_subject`]).
+/// The per-subject rows GN's system was built from: `rows[i]` is the vector subject `i`
+/// contributes to both the gradient (`2·Σ rows[i]`) and the BHHH matrix (`4·Σ rows[i]rows[i]ᵀ`),
+/// FIX coordinates zeroed. Since #2974 it is the subject's total derivative `dᵢ`
+/// ([`gn_subject_rows`]), until the step loop takes the subject back to its fixed-mode score
+/// `gᵢ` (#2777, [`raw_scores`]).
+struct GnRows {
+    rows: Vec<Vec<f64>>,
+}
+
+/// [`build_gn_system`], also returning the per-subject rows it summed ([`GnRows`]), so the
+/// step loop can take a subject back to its fixed-mode score (#2777).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn build_gn_system_parts(
     x: &[f64],
@@ -2808,41 +2639,92 @@ fn build_gn_system_parts(
     kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
-) -> (DVector<f64>, DMatrix<f64>, Vec<Vec<f64>>) {
+) -> (DVector<f64>, DMatrix<f64>, GnRows) {
+    let _ = h_matrices;
+    let rows = gn_subject_rows(
+        x, template, model, population, eta_hats, kappas, bounds, options,
+    );
     let n = x.len();
-    let n_subj = population.subjects.len();
-    // One unpack for the population, read by every IOV subject's outer gradient (#2455).
-    // Gated on the NLopt dispatch's `analytic_outer_gradient_available`: `gradient_method = fd`
-    // or a model outside the adjoint's scope gets `None`, so every IOV subject takes the
-    // reconverged-FD salvage. (NLopt also honours `reconverge_gradient_interval`; GN reads
-    // no such option.)
-    let pt = crate::sens::provider::analytic_outer_gradient_available(model)
-        .then(|| crate::sens::ode_provider::adjoint::PackedPoint::new(template, x))
-        .flatten();
+    let mut grad = DVector::zeros(n);
+    let mut h_bhhh = DMatrix::zeros(n, n);
+    for d in &rows {
+        let d = DVector::from_column_slice(d);
+        grad += 2.0 * &d;
+        h_bhhh.ger(4.0, &d, &d, 1.0);
+    }
+    (grad, h_bhhh, GnRows { rows })
+}
 
-    // For FOCEI (interaction) the fixed-η̂ analytic gradient drops the `log|H̃|`
-    // EBE-response term `t_i` (the #274/#289 Δ, envelope theorem zeros the inner
-    // objective but not `log|H̃|`). Adding it back gives the gradient optimizer
-    // the full marginal gradient, so it reaches the true minimum instead of
-    // stalling above it (warfarin FOCEI -276.6 → -286.0). We reuse the Laplace
-    // cache the gradient already formed, so the correction costs one extra
-    // n_eta×n_eta solve per subject (no re-derivation); identically zero for
-    // additive error.
-    //
-    // `t_i` is a *curvature* term (∂log|H̃|/∂η · dη̂/dθ), NOT part of the score.
-    // It is added to the GRADIENT only; the BHHH Hessian `4·Σ gᵢgᵢᵀ` must stay
-    // on the raw score `gᵢ` (folding `t_i` into the outer product corrupts the
-    // Hessian and sends GN to a spurious point). So each subject returns
-    // `(nll, gᵢ_raw, t_i)` separately.
-    let per_subj: Vec<(f64, Vec<f64>, Vec<f64>)> = (0..n_subj)
+/// Every subject's GN row (#2974): its total derivative `dᵢ = dnllᵢ/dx`, the mode re-estimated
+/// at every `x` — the subject's term of the outer gradient, and the covariance step's `S` row
+/// ([`crate::estimation::covariance::subject_total_score`]). FIX coordinates are zeroed.
+///
+/// Before #2974 GN took the fixed-mode score `gᵢ` (η̂, `H`, κ̂ held; its θ axis a forward
+/// difference of the predictions on the closed forms) for the BHHH matrix and `gᵢ + tᵢ` for the
+/// gradient, `tᵢ = dᵢ − gᵢ` the EBE-response gap (#2740, #2455). The gradient was already
+/// `2·Σ dᵢ` on every FOCEI and IOV model; the BHHH matrix now uses the same rows, so the
+/// quadratic model is the outer product of the gradient's own terms. FOCE takes `dᵢ` too: its
+/// fixed-mode score is not the gradient of its objective either.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gn_subject_rows(
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<Vec<f64>> {
+    let fixed = packed_fixed_mask(template);
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x);
+    (0..population.subjects.len())
         .into_par_iter()
         .map(|i| {
-            let kap_i = if i < kappas.len() {
-                kappas[i].as_slice()
-            } else {
-                &[]
-            };
-            let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
+            let kap_i = kappas.get(i).map_or(&[][..], |k| k.as_slice());
+            let mut d = crate::estimation::covariance::subject_total_score(
+                x,
+                template,
+                model,
+                population,
+                i,
+                &eta_hats[i],
+                kap_i,
+                pt.as_ref(),
+                bounds,
+                options,
+            );
+            for (v, &f) in d.iter_mut().zip(&fixed) {
+                if f {
+                    *v = 0.0;
+                }
+            }
+            d
+        })
+        .collect()
+}
+
+/// Subjects `which`' fixed-mode scores `gᵢ` (η̂, `H`, κ̂ held at `x`, FIX coordinates zeroed):
+/// what #2777 takes a subject whose mode sits near a fold back to.
+#[allow(clippy::too_many_arguments)]
+fn raw_scores(
+    which: &[usize],
+    x: &[f64],
+    template: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+) -> Vec<Vec<f64>> {
+    let fixed = packed_fixed_mask(template);
+    which
+        .par_iter()
+        .map(|&i| {
+            let kap_i = kappas.get(i).map_or(&[][..], |k| k.as_slice());
+            let (_, mut g) = subject_nll_pop_grad(
                 x,
                 template,
                 model,
@@ -2854,55 +2736,25 @@ fn build_gn_system_parts(
                 bounds,
                 options,
             );
-            let ti = ebe_response_correction(
-                x,
-                template,
-                model,
-                population,
-                i,
-                &eta_hats[i],
-                kap_i,
-                pt.as_ref(),
-                nll,
-                &gi,
-                cache.as_ref(),
-                bounds,
-                options,
-            );
-            (nll, gi, ti)
+            for (v, &f) in g.iter_mut().zip(&fixed) {
+                if f {
+                    *v = 0.0;
+                }
+            }
+            g
         })
-        .collect();
+        .collect()
+}
 
-    // For OFV = 2 * Σ nll_i:
-    //   grad(OFV)    = 2 * Σ (g_i + t_i)   (score + EBE-response curvature)
-    //   H_bhhh(OFV) ≈ 4 * Σ g_i g_i^T      (raw score outer product only)
-    // The raw score holds the outer product even under #1778, where `g_i + t_i` is itself
-    // a score (the reconverged one) and so the BHHH information identity would apply to
-    // it. Measured on the corrected-outer-product variant: `examples/tte_exponential.ferx`
-    // 166.4395 → 166.4397 and `examples/pktte_joint.ferx` 72.6344 → 72.9746, both worse.
-    let mut grad = DVector::zeros(n);
-    let mut h_bhhh = DMatrix::zeros(n, n);
-    for (_, gi, ti) in &per_subj {
-        let gi_vec = DVector::from_column_slice(gi);
-        grad += 2.0 * &gi_vec;
-        for (k, &tk) in ti.iter().enumerate() {
-            grad[k] += 2.0 * tk;
-        }
-        h_bhhh += 4.0 * &gi_vec * gi_vec.transpose();
-    }
-    // A FIX'd coordinate has zero gradient. The raw `gᵢ` and both FD `dᵢ` already skip it,
-    // but the IOV adjoint `dᵢ` does not, so its `tᵢ` would carry the free derivative there:
-    // 10.76 on TVKA in `gn_iov_2455`, reported as `FitResult.final_gradient` by the
-    // `grad_final` recompute (the step loop zeroes fixed rows itself). The NLopt IOV
-    // assembly masks the same way after summing (#2455 review, row 1).
-    for (g, fixed) in grad.iter_mut().zip(packed_fixed_mask(template)) {
-        if fixed {
-            *g = 0.0;
-        }
-    }
-
-    let per_subj_t = per_subj.into_iter().map(|(_, _, ti)| ti).collect();
-    (grad, h_bhhh, per_subj_t)
+/// Replace subject `s`'s row `d` by `g` in GN's system: `grad += 2(g − d)`,
+/// `H += 4(ggᵀ − ddᵀ)`.
+fn swap_row(grad: &mut DVector<f64>, h: &mut DMatrix<f64>, d: &mut Vec<f64>, g: Vec<f64>) {
+    let dv = DVector::from_column_slice(d);
+    let gv = DVector::from_column_slice(&g);
+    *grad += 2.0 * (&gv - &dv);
+    h.ger(4.0, &gv, &gv, 1.0);
+    h.ger(-4.0, &dv, &dv, 1.0);
+    *d = g;
 }
 
 /// Compute FOCE NLL for a single subject at given parameters with fixed EBEs.
@@ -3649,20 +3501,10 @@ mod tests {
         );
     }
 
-    /// #2777: dropping a subject's `tᵢ` leaves its raw score in the gradient and zeroes
-    /// the term, so a second detection cannot pick the same subject.
-    #[test]
-    fn drop_ebe_response_restores_the_raw_score_and_clears_the_term() {
-        let mut grad = DVector::from_vec(vec![10.0, -4.0]);
-        let mut t = vec![3.0, -1.0];
-        drop_ebe_response(&mut grad, &mut t);
-        assert_eq!(grad, DVector::from_vec(vec![4.0, -2.0]));
-        assert_eq!(t, vec![0.0, 0.0]);
-    }
-
-    /// Verify that build_gn_system returns a gradient and BHHH Hessian with
-    /// correct dimensions and that the gradient matches a sequential central-FD
-    /// reference to within numerical noise.
+    /// Verify that build_gn_system returns a gradient and BHHH Hessian with correct
+    /// dimensions, a symmetric matrix, and a gradient equal to the central difference of the
+    /// population objective with every subject's FOCE mode re-solved at each probe — the
+    /// total derivative GN steps along since #2974 (FOCE included).
     #[test]
     fn test_build_gn_system_gradient_matches_fd_reference() {
         let model = make_model();
@@ -3674,19 +3516,26 @@ mod tests {
         let bounds = compute_bounds(template);
         let n = x.len();
 
-        // h_matrix shape: (n_obs × n_eta) — here 3 observations, 1 eta
-        let n_obs = 3;
-        let n_eta = 1;
-        let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
-        let h_matrices: Vec<nalgebra::DMatrix<f64>> = (0..n_subj)
-            .map(|_| nalgebra::DMatrix::zeros(n_obs, n_eta))
-            .collect();
-        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
-        // FOCE: its GN gradient is the fixed-EBE score, which this η̂ = 0 / H = 0 reference
-        // differences. Under FOCEI the gradient is the total derivative at the mode
-        // (#2740), pinned by `gn_system_gradient_is_the_reconverged_fd_on_a_focei_model`.
         let mut options = FitOptions::default();
         options.interaction = false;
+        let mu_k = compute_mu_k(&model, &template.theta, options.mu_referencing);
+        let (mut eta_hats, mut h_matrices) = (Vec::new(), Vec::new());
+        for s in &population.subjects {
+            let ebe = crate::estimation::inner_optimizer::find_ebe_for_stage(
+                &model,
+                s,
+                template,
+                1000,
+                1e-12,
+                None,
+                Some(&mu_k),
+                0,
+                &options,
+            );
+            eta_hats.push(ebe.eta);
+            h_matrices.push(ebe.h_matrix);
+        }
+        let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
 
         let (grad, h_bhhh) = build_gn_system(
             &x,
@@ -3700,12 +3549,9 @@ mod tests {
             &options,
         );
 
-        // Dimensions
         assert_eq!(grad.len(), n);
         assert_eq!(h_bhhh.nrows(), n);
         assert_eq!(h_bhhh.ncols(), n);
-
-        // BHHH Hessian must be symmetric and positive semi-definite (all eigenvalues >= 0)
         for i in 0..n {
             for j in 0..n {
                 assert!(
@@ -3714,64 +3560,27 @@ mod tests {
                 );
             }
         }
-
-        // Gradient must be finite
-        for (k, g) in grad.iter().enumerate() {
-            assert!(g.is_finite(), "gradient[{k}] is not finite");
-        }
-
-        // Cross-check: sequential central-FD reference must agree with the
-        // parallel result to within FD numerical noise (~1e-6 relative).
-        let eps = 1e-4;
-        for j in 0..n {
-            let mut xp = x.clone();
-            let mut xm = x.clone();
-            xp[j] += eps * (1.0 + x[j].abs());
-            xm[j] -= eps * (1.0 + x[j].abs());
-            let actual_2h = xp[j] - xm[j];
-
-            let params_p = unpack_params(&xp, template);
-            let params_m = unpack_params(&xm, template);
-
-            let nll_p: f64 = (0..n_subj)
-                .map(|i| {
-                    subject_nll_at(
-                        &model,
-                        &population,
-                        i,
-                        &params_p,
-                        &eta_hats[i],
-                        &h_matrices[i],
-                        &[],
-                        &options,
-                    )
-                })
-                .sum();
-            let nll_m: f64 = (0..n_subj)
-                .map(|i| {
-                    subject_nll_at(
-                        &model,
-                        &population,
-                        i,
-                        &params_m,
-                        &eta_hats[i],
-                        &h_matrices[i],
-                        &[],
-                        &options,
-                    )
-                })
-                .sum();
-
-            let ref_grad_j = 2.0 * (nll_p - nll_m) / actual_2h;
-            let tol = 1e-4 * (1.0 + ref_grad_j.abs());
+        let reference = crate::estimation::outer_optimizer::reconverged_fd_gradient(
+            &x,
+            template,
+            &model,
+            &population,
+            &eta_hats,
+            &kappas,
+            &bounds,
+            &options,
+        );
+        let mut worst = 0.0f64;
+        for (j, (g, r)) in grad.iter().zip(&reference).enumerate() {
+            assert!(g.is_finite() && r.is_finite(), "gradient[{j}]: {g} vs {r}");
+            let rel = (g - r).abs() / (1.0 + r.abs());
+            worst = worst.max(rel);
             assert!(
-                (grad[j] - ref_grad_j).abs() < tol,
-                "gradient[{j}]: parallel={:.6e}, reference={:.6e}, diff={:.2e}",
-                grad[j],
-                ref_grad_j,
-                (grad[j] - ref_grad_j).abs()
+                rel < 1e-5,
+                "gradient[{j}]: GN {g:.6e}, reconverged FD {r:.6e}, rel {rel:.2e}"
             );
         }
+        eprintln!("GN gradient vs reconverged FD: worst rel {worst:.3e}");
     }
 
     /// Verify that the analytical gradient path agrees with central FD to tight
@@ -4161,10 +3970,10 @@ mod tests {
         }
     }
 
-    /// #2740: on a Gaussian FOCEI model GN's per-subject gradient `gᵢ + tᵢ` must be the
-    /// total derivative of the objective it evaluates — the central difference of the
-    /// subject NLL with η̂ re-solved warm at every point (`subject_reconverged_fd_gradient`)
-    /// — not the fixed-EBE score plus the closed form's θ-only `gn_theta_correction`.
+    /// #2740 / #2974: on a Gaussian FOCEI model GN's per-subject row `dᵢ` must be the total
+    /// derivative of the objective it evaluates — the central difference of the subject NLL
+    /// with η̂ re-solved warm at every point (`subject_reconverged_fd_gradient`) — not the
+    /// fixed-EBE score.
     ///
     /// One example per path the defect lived on: `warfarin_bloq` (M3, the kernel score,
     /// where `tᵢ` was zero), `schnider` and `pkpd_nonmem` (the Almquist closed form, whose
@@ -4195,16 +4004,16 @@ mod tests {
                 !fixed_ebe_score_drops_ebe_response(model),
                 "{m}: fixture precondition: Gaussian, outside the #1778 routing"
             );
-            assert!(gn_gradient_takes_total_derivative(model, options));
             let x = pack_params(template);
             let bounds = compute_bounds(template);
+            let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, &x);
             let (mut worst_new, mut worst_old) = (0.0f64, 0.0f64);
             for i in 0..3 {
                 let s = &prep.population.subjects[i];
                 let ebe = crate::estimation::inner_optimizer::find_ebe(
                     model, s, template, 500, 1e-10, None, None, 0,
                 );
-                let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
+                let (_, gi) = subject_nll_pop_grad(
                     &x,
                     template,
                     model,
@@ -4216,7 +4025,7 @@ mod tests {
                     &bounds,
                     options,
                 );
-                let ti = ebe_response_correction(
+                let di = crate::estimation::covariance::subject_total_score(
                     &x,
                     template,
                     model,
@@ -4224,42 +4033,32 @@ mod tests {
                     i,
                     &ebe.eta,
                     &[],
-                    None,
-                    nll,
-                    &gi,
-                    cache.as_ref(),
+                    pt.as_ref(),
                     &bounds,
                     options,
                 );
-                let old_t = cache
-                    .as_ref()
-                    .map(|c| c.gn_theta_correction.clone())
-                    .unwrap_or_else(|| vec![0.0; x.len()]);
                 let fd = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
                     &x, template, model, s, &ebe.eta, &bounds, options,
                 );
                 let tag = format!("{m} subject {i}");
                 assert!(
-                    gi.iter()
-                        .chain(&ti)
-                        .chain(&old_t)
-                        .chain(&fd)
-                        .all(|v| v.is_finite()),
-                    "{tag}: every side must be finite: g {gi:?}, t {ti:?}, fd {fd:?}"
+                    gi.iter().chain(&di).chain(&fd).all(|v| v.is_finite()),
+                    "{tag}: every side must be finite: g {gi:?}, d {di:?}, fd {fd:?}"
                 );
                 assert!(fd.iter().all(|e| e.is_finite()));
                 let scale = fd.iter().fold(1.0f64, |a, v| a.max(v.abs()));
                 for k in 0..x.len() {
-                    let new = (gi[k] + ti[k] - fd[k]).abs() / scale;
-                    let old = (gi[k] + old_t[k] - fd[k]).abs() / scale;
+                    let new = (di[k] - fd[k]).abs() / scale;
+                    let old = (gi[k] - fd[k]).abs() / scale;
                     assert!(new.is_finite() && old.is_finite(), "{tag}: coordinate {k}");
                     worst_new = worst_new.max(new);
                     worst_old = worst_old.max(old);
                 }
             }
-            // Measured (Linux): new 1.1e-7 / 2.2e-5 / 2.6e-6, old 0.71 / 4.5e-2 / 0.46 for
-            // warfarin_bloq / schnider / pkpd_nonmem — the new bound is the central
-            // difference's own truncation with ~5× headroom, the old floor ~4× below.
+            // Measured (Linux, #2740): new 1.1e-7 / 2.2e-5 / 2.6e-6 for warfarin_bloq / schnider /
+            // pkpd_nonmem — the new bound is the central difference's own truncation with ~5×
+            // headroom. "old" is the fixed-mode score `gᵢ` alone, which GN's BHHH matrix used
+            // before #2974; the floor sits below it.
             eprintln!("[#2740] {m}: new {worst_new:.3e}, old {worst_old:.3e} (rel. to ‖fd‖∞)");
             assert!(
                 worst_new < 1e-4,
@@ -4273,16 +4072,15 @@ mod tests {
         }
     }
 
-    /// #2740 review: the widened total-derivative arm must honour `gradient = fd` from every
-    /// source the rest of the crate reads — the model's flag, the caller's `FitOptions`, and
-    /// the fit-scoped flag `fit()` arms on its threads — by taking the reconverged difference
-    /// instead of the adjoint. Each forced side must equal `fd − g` **bit for bit**; the
-    /// unforced control must take the adjoint, which differs from `fd − g` in the bits and
-    /// agrees with the adjoint called directly. Without the gate every forced side reads
-    /// the adjoint's value and fails the bit check; a gate that ignores one source fails
-    /// that side alone (each names itself).
+    /// #2740 review / #2974: the per-subject row (`covariance::subject_total_score`, GN's and
+    /// the covariance `S`'s) must honour `gradient = fd` from every source the rest of the
+    /// crate reads — the model's flag, the caller's `FitOptions`, and the fit-scoped flag
+    /// `fit()` arms on its threads — by taking the reconverged difference instead of the
+    /// adjoint. Each forced side must equal the difference **bit for bit**; the unforced
+    /// control must equal the adjoint called directly, which differs from the difference in
+    /// the bits. A gate that ignores one source fails that side alone (each names itself).
     #[test]
-    fn total_derivative_arm_honours_forced_fd_from_every_source() {
+    fn total_derivative_row_honours_forced_fd_from_every_source() {
         use crate::sens::ode_provider::adjoint;
         let root = env!("CARGO_MANIFEST_DIR");
         let prep = crate::api::prepare_run(
@@ -4303,20 +4101,9 @@ mod tests {
         let ebe = crate::estimation::inner_optimizer::find_ebe(
             base_model, s, template, 500, 1e-10, None, None, 0,
         );
-        let correction = |model: &CompiledModel, opts: &FitOptions| {
-            let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
-                &x,
-                template,
-                model,
-                &prep.population,
-                0,
-                &ebe.eta,
-                &ebe.h_matrix,
-                &[],
-                &bounds,
-                opts,
-            );
-            let ti = ebe_response_correction(
+        let pt = adjoint::PackedPoint::new(template, &x).unwrap();
+        let row = |model: &CompiledModel, opts: &FitOptions| {
+            let d = crate::estimation::covariance::subject_total_score(
                 &x,
                 template,
                 model,
@@ -4324,23 +4111,18 @@ mod tests {
                 0,
                 &ebe.eta,
                 &[],
-                None,
-                nll,
-                &gi,
-                cache.as_ref(),
+                Some(&pt),
                 &bounds,
                 opts,
             );
             let fd = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
                 &x, template, model, s, &ebe.eta, &bounds, opts,
             );
-            let fd_t: Vec<f64> = fd.iter().zip(&gi).map(|(d, g)| d - g).collect();
-            (gi, ti, fd_t)
+            (d, fd)
         };
 
-        // Unforced control: the adjoint.
-        let (gi, ti, fd_t) = correction(base_model, &base_opts);
-        let pt = adjoint::PackedPoint::new(template, &x).unwrap();
+        // Unforced control: the adjoint, bit for bit.
+        let (d, fd) = row(base_model, &base_opts);
         let di = adjoint::subject_adjoint_gradient_at(
             base_model,
             s,
@@ -4349,17 +4131,10 @@ mod tests {
             adjoint::Objective::Focei,
         )
         .expect("in the adjoint's scope");
-        assert!(ti.iter().chain(&di).chain(&gi).all(|v| v.is_finite()));
-        for k in 0..x.len() {
-            let want = di[k] - gi[k];
-            assert!(
-                (ti[k] - want).abs() <= 1e-12 * (1.0 + want.abs()),
-                "unforced: coordinate {k} must take the adjoint, {} vs {want}",
-                ti[k]
-            );
-        }
+        assert!(d.iter().chain(&di).chain(&fd).all(|v| v.is_finite()));
+        assert_eq!(d, di, "unforced: the row must be the adjoint's");
         assert_ne!(
-            ti, fd_t,
+            d, fd,
             "fixture precondition: adjoint and FD differ in the bits"
         );
 
@@ -4368,16 +4143,16 @@ mod tests {
             gradient_method: GradientMethod::Fd,
             ..base_opts.clone()
         };
-        let (_, ti, fd_t) = correction(base_model, &fd_opts);
+        let (d, fd) = row(base_model, &fd_opts);
         assert_eq!(
-            ti, fd_t,
+            d, fd,
             "FitOptions gradient = fd must take the reconverged FD"
         );
         {
             let _armed = crate::types::arm_forced_fd(true);
-            let (_, ti, fd_t) = correction(base_model, &base_opts);
+            let (d, fd) = row(base_model, &base_opts);
             assert_eq!(
-                ti, fd_t,
+                d, fd,
                 "the fit-scoped gradient = fd must take the reconverged FD"
             );
         }
@@ -4389,15 +4164,14 @@ mod tests {
         .parsed
         .model;
         fd_model.gradient_method = GradientMethod::Fd;
-        let (_, ti, fd_t) = correction(&fd_model, &base_opts);
-        assert_eq!(ti, fd_t, "model gradient = fd must take the reconverged FD");
+        let (d, fd) = row(&fd_model, &base_opts);
+        assert_eq!(d, fd, "model gradient = fd must take the reconverged FD");
     }
 
     /// #2740, the GN call site: on a Gaussian FOCEI model `build_gn_system`'s gradient must
-    /// be `2·Σ dᵢ`, the reconverged central difference of the objective at the EBEs. The
-    /// helper test above pins `ebe_response_correction`; this one dies if `build_gn_system`
-    /// stops adding its `tᵢ` (the gradient falls back to the M3 kernel score `2·Σ gᵢ`, whose
-    /// correction was zero). `warfarin_bloq`, first four subjects, at the initial estimates.
+    /// be `2·Σ dᵢ`, the reconverged central difference of the objective at the EBEs. It dies
+    /// if `build_gn_system`'s rows fall back to the M3 kernel score `2·Σ gᵢ`.
+    /// `warfarin_bloq`, first four subjects, at the initial estimates.
     #[test]
     fn gn_system_gradient_is_the_reconverged_fd_on_a_focei_model() {
         let root = env!("CARGO_MANIFEST_DIR");
@@ -6312,9 +6086,8 @@ mod tests {
 
     /// #2023's routing, as a straddle: the FREM fixture shuts the fixed-EBE gate, and the
     /// same model with `frem_config` cleared opens it, so the FREM clause is what decides.
-    /// The gate also governs the FOCEI `log|H̃|` EBE-response term and, through it, the
-    /// covariance step's `s` / `rsr` subject score, which must match the central FD of
-    /// the objective on every coordinate. Measured worst rel 2.3e-6, bounded at 1e-4; with
+    /// The gate also governs the FOCEI `log|H̃|` EBE-response term, and the fixed-EBE score
+    /// (GN's BHHH rows) must match the central FD of the objective on every coordinate. Measured worst rel 2.3e-6, bounded at 1e-4; with
     /// the gate open the closed form scores `TV_WT` −1120 against FD −70.
     #[test]
     fn frem_routes_every_fixed_ebe_consumer_to_the_fd_fallback() {
@@ -6362,7 +6135,7 @@ mod tests {
             "a FREM model must decline the closed-form EBE-response term"
         );
 
-        let score = crate::estimation::covariance::fixed_ebe_subject_score(
+        let (_, score) = subject_nll_pop_grad(
             &x,
             &template,
             &model,
@@ -6381,7 +6154,7 @@ mod tests {
             let rel = (s - f).abs() / f.abs().max(1e-6);
             assert!(
                 rel < 1e-4,
-                "the covariance score of a FREM subject is the objective's gradient: \
+                "the fixed-EBE score of a FREM subject is the objective's gradient: \
                  score[{j}] = {s:.6e}, FD {f:.6e}, rel {rel:.2e}"
             );
             worst = worst.max(rel);
@@ -7336,243 +7109,6 @@ mod tests {
             }
         }
 
-        /// #1778: for a model whose fixed-EBE score is biased, GN's and trust-region's
-        /// gradient `2·Σ(gᵢ + tᵢ)` must be the **total** derivative `2·Σ dᵢ` — the one the
-        /// outer dispatcher takes, the adjoint's exact gradient at the mode — so
-        /// [`ebe_response_correction`] returns exactly the gap `dᵢ − gᵢ`, and `dᵢ` agrees with
-        /// the reconverged difference of the objective to that oracle's accuracy. Dropping that routing leaves `tᵢ = 0` on the FD path and the sum
-        /// short by the gap, which is the defect: L-BFGS, SLSQP, MMA, trust-region and GN
-        /// all stopped above the optimum on `examples/tte_exponential.ferx`.
-        ///
-        /// One cell per arm of [`fixed_ebe_score_drops_ebe_response`], each asserted on
-        /// **both** sides of the gate in this one test, so forcing either branch reddens it:
-        /// a guard spelled `has_tte()` fails the binary cell, one spelled
-        /// `has_tte() || has_discrete()` fails the CTMM cell, one without the CTMM
-        /// early return fails it the other way, and one without `n_eta > 0` fails the
-        /// η-free TTE cell. The Gaussian-only cell is outside that predicate but inside
-        /// [`gn_gradient_takes_total_derivative`] under FOCEI (#2740), so it is routed
-        /// too; under FOCE it is the open side — there `tᵢ` stays zero and the corrected
-        /// score is *not* the reconverged one, so a gate stuck open fails there.
-        ///
-        /// The gap is asserted non-degenerate: with `tᵢ = 0` the identity `gᵢ + tᵢ = dᵢ`
-        /// would hold only because `gᵢ` already equalled `dᵢ`, and the test would pin
-        /// nothing. Realised ‖t‖∞ is printed and bounded below.
-        #[test]
-        fn ebe_response_correction_is_the_reconverged_score_when_the_score_is_biased() {
-            let states = |cmt: usize, path: &[(f64, usize)]| -> Vec<ObsRecord> {
-                path.iter()
-                    .map(|&(time, state)| ObsRecord::DiscreteState {
-                        time,
-                        raw_time: time,
-                        state,
-                        cmt,
-                    })
-                    .collect()
-            };
-            #[cfg_attr(not(feature = "markov"), allow(unused_mut))]
-            // (label, endpoint, records, interaction, #1778 routing, GN routing)
-            let mut cases = vec![
-                (
-                    "Gaussian-only FOCEI",
-                    String::new(),
-                    vec![],
-                    true,
-                    false,
-                    true,
-                ),
-                (
-                    "Gaussian-only FOCE",
-                    String::new(),
-                    vec![],
-                    false,
-                    false,
-                    false,
-                ),
-                (
-                    "joint PK + TTE",
-                    JOINT_TTE_BLOCK.to_string(),
-                    vec![event(7.0, true)],
-                    true,
-                    true,
-                    true,
-                ),
-                (
-                    "joint PK + binary",
-                    "[binary_model]\n  cmt   = 3\n  logit = TVLAM + ETA_CL\n".to_string(),
-                    states(3, &[(2.0, 1), (6.0, 0)]),
-                    true,
-                    true,
-                    true,
-                ),
-            ];
-            #[cfg(feature = "markov")]
-            cases.push((
-                "joint PK + CTMM",
-                "[markov_model]\n  type   = ctmm\n  cmt    = 5\n  states = [awake=0, \
-                 asleep=1]\n  transition awake  -> asleep = TVLAM\n  transition asleep -> \
-                 awake  = TVLAM\n"
-                    .to_string(),
-                states(5, &[(0.0, 0), (3.0, 1), (6.0, 0)]),
-                true,
-                false,
-                false,
-            ));
-
-            for (label, endpoint, records, interaction, drops, biased) in cases {
-                let mut opts = FitOptions::default();
-                opts.interaction = interaction;
-                let model = parse(&format!("{JOINT_GAUSSIAN}{endpoint}"));
-                assert_eq!(model.n_eta, 1, "{label}: fixture precondition: one η");
-                assert_eq!(
-                    fixed_ebe_score_drops_ebe_response(&model),
-                    drops,
-                    "{label}: fixture precondition: the #1778 routing"
-                );
-                assert_eq!(
-                    gn_gradient_takes_total_derivative(&model, &opts),
-                    biased,
-                    "{label}: the #2740 GN routing"
-                );
-                let mut joint = joint_subject();
-                joint.obs_records = records;
-                let pop = population(&[], vec![joint]);
-                let template = model.default_params.clone();
-                let x = pack_params(&template);
-                let bounds = compute_bounds(&template);
-                // At the mode, as GN differentiates (its η̂ are the fit's EBEs).
-                let eta_hat = crate::estimation::inner_optimizer::find_ebe(
-                    &model,
-                    &pop.subjects[0],
-                    &template,
-                    500,
-                    1e-12,
-                    None,
-                    None,
-                    0,
-                )
-                .eta;
-                let h_matrix = crate::sens::ode_provider::adjoint::exact_eta_jacobian(
-                    &model,
-                    &pop.subjects[0],
-                    &template.theta,
-                    eta_hat.as_slice(),
-                )
-                .unwrap();
-
-                let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
-                    &x,
-                    &template,
-                    &model,
-                    &pop,
-                    0,
-                    &eta_hat,
-                    &h_matrix,
-                    &[],
-                    &bounds,
-                    &opts,
-                );
-                let ti = ebe_response_correction(
-                    &x,
-                    &template,
-                    &model,
-                    &pop,
-                    0,
-                    &eta_hat,
-                    &[],
-                    None,
-                    nll,
-                    &gi,
-                    cache.as_ref(),
-                    &bounds,
-                    &opts,
-                );
-                let pt =
-                    crate::sens::ode_provider::adjoint::PackedPoint::new(&template, &x).unwrap();
-                let di = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
-                    &model,
-                    &pop.subjects[0],
-                    &pt,
-                    eta_hat.as_slice(),
-                    if interaction {
-                        crate::sens::ode_provider::adjoint::Objective::Focei
-                    } else {
-                        crate::sens::ode_provider::adjoint::Objective::Foce
-                    },
-                )
-                .unwrap();
-                let fd = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
-                    &x,
-                    &template,
-                    &model,
-                    &pop.subjects[0],
-                    &eta_hat,
-                    &bounds,
-                    &opts,
-                );
-                // Fold nothing before every side is known finite: `f64::max` discards
-                // `NaN`, so a diverged solve would otherwise pass on the healthy
-                // coordinates alone.
-                for (what, v) in [
-                    ("score", &gi),
-                    ("correction", &ti),
-                    ("exact", &di),
-                    ("reconverged", &fd),
-                ] {
-                    assert!(
-                        v.iter().all(|c| c.is_finite()),
-                        "{label}: the {what} must be finite, got {v:?}"
-                    );
-                }
-                let worst = gi
-                    .iter()
-                    .zip(&ti)
-                    .zip(&di)
-                    .fold(0.0_f64, |m, ((g, t), d)| m.max(((g + t) - d).abs()));
-                let t_inf = ti.iter().fold(0.0_f64, |m, t| m.max(t.abs()));
-                eprintln!("[#1778] {label}: ‖g+t−d‖∞ = {worst:.3e}, ‖t‖∞ = {t_inf:.3e}");
-
-                let scale = di.iter().fold(1.0f64, |m, v| m.max(v.abs()));
-                let vs_fd = di
-                    .iter()
-                    .zip(&fd)
-                    .fold(0.0_f64, |m, (d, f)| m.max((d - f).abs() / scale));
-                eprintln!("[#1778] {label}: exact vs reconverged FD {vs_fd:.3e}");
-                if biased {
-                    // `g + (d − g)` read against `d`: rounding only.
-                    assert!(
-                        worst < 1e-12,
-                        "{label}: the corrected score must be the total derivative, \
-                         off by {worst:.3e}"
-                    );
-                    // The exact total derivative is the reconverged score's: within the
-                    // central difference's own truncation at its 1e-4 step.
-                    assert!(vs_fd < 1e-4, "{label}: exact vs reconverged {vs_fd:.3e}");
-                    // At the mode the gap is the #1778 `½∂_η log|H̃|·dη̂/dθ` term; a floor
-                    // keeps the identity above from holding merely because `t` is zero.
-                    assert!(
-                        t_inf > 1e-3,
-                        "{label}: the gap must be non-degenerate, got ‖t‖∞ = {t_inf:.3e}"
-                    );
-                } else {
-                    assert_eq!(
-                        ti,
-                        cache
-                            .as_ref()
-                            .map(|c| c.gn_theta_correction.clone())
-                            .unwrap_or_else(|| vec![0.0; x.len()]),
-                        "{label}: an out-of-scope model keeps the closed-form correction"
-                    );
-                    // The live fixed-EBE gap at the mode (its `log|H̃|` response), which
-                    // these models are *not* routed to close.
-                    assert!(
-                        worst > 1e-3,
-                        "{label}: an out-of-scope model must keep the fixed-EBE score, \
-                         but it already equals the reconverged one to {worst:.3e}"
-                    );
-                }
-            }
-        }
-
         /// The `n_eta > 0` arm of [`fixed_ebe_score_drops_ebe_response`], which the
         /// η-carrying cells above cannot see: with no random effects there is no `H̃` to
         /// differentiate, so the fixed-EBE score is already exact and the model keeps it.
@@ -7594,15 +7130,12 @@ mod tests {
             );
         }
 
-        /// #1778, the GN call site: on a model whose fixed-EBE score is biased,
-        /// `build_gn_system` must return the total-derivative gradient `2·dᵢ` (the adjoint's,
-        /// at the mode) and keep the BHHH
-        /// matrix on the raw score, `4·gᵢgᵢᵀ`. The helper test above pins
-        /// [`ebe_response_correction`] itself; this one dies if `build_gn_system` stops
-        /// calling it (the gradient falls back to `2·gᵢ`) or folds the corrected score
-        /// into the outer product — the variant measured worse on both TTE examples.
+        /// #1778 / #2974, the GN call site: on a model whose fixed-EBE score is biased,
+        /// `build_gn_system` returns the total-derivative gradient `2·dᵢ` (the adjoint's, at
+        /// the mode) and the BHHH matrix `4·dᵢdᵢᵀ` from the same row. It dies if either
+        /// falls back to the raw score `gᵢ`, which the fixture keeps visibly biased.
         #[test]
-        fn gn_system_takes_the_reconverged_gradient_and_the_raw_bhhh() {
+        fn gn_system_takes_the_total_derivative_for_the_gradient_and_the_bhhh() {
             let model = parse(&format!("{JOINT_GAUSSIAN}{JOINT_TTE_BLOCK}"));
             assert!(fixed_ebe_score_drops_ebe_response(&model));
             let mut joint = joint_subject();
@@ -7689,17 +7222,19 @@ mod tests {
                 raw_gap > 1e-3,
                 "fixture precondition: the raw score must be visibly biased, gap {raw_gap:.3e}"
             );
-            let g = DVector::from_column_slice(&gi);
+            // #2974: the BHHH matrix is built from the same row as the gradient.
+            let d = DVector::from_column_slice(&di);
+            let mut want = DMatrix::zeros(d.len(), d.len());
+            want.ger(4.0, &d, &d, 1.0);
             assert_eq!(
-                h_bhhh,
-                4.0 * &g * g.transpose(),
-                "the BHHH matrix stays on the raw fixed-EBE score"
+                h_bhhh, want,
+                "the BHHH matrix is 4·d dᵀ, the gradient's own row"
             );
         }
     }
 
     /// #2455: `method = gn` on an IOV model. The raw IOV score holds η̂ and κ̂ fixed, and
-    /// before #2455 [`ebe_response_correction`] returned zero for every IOV subject, so GN's
+    /// before #2455 GN's EBE-response correction was zero for every IOV subject, so its
     /// gradient was `2·Σ gᵢ` and the fit stopped near its initial estimates
     /// (`examples/warfarin_iov.ferx`: 331.762270 reported converged, optimum 308.830465).
     mod gn_iov_2455 {
@@ -7734,6 +7269,8 @@ mod tests {
             raw: Vec<f64>,
             /// `4·Σ gᵢgᵢᵀ`, summed in `build_gn_system`'s order.
             raw_bhhh: DMatrix<f64>,
+            /// GN's per-subject rows `dᵢ` (#2974).
+            rows: Vec<Vec<f64>>,
             /// The oracle: central FD of the production population objective with the
             /// EBEs (η̂ and κ̂) re-solved at every probe. Not the per-subject salvage
             /// under test.
@@ -7768,11 +7305,13 @@ mod tests {
             }
             let reference =
                 reconverged_fd_gradient(&x, &template, model, pop, &ehs, &kappas, &bounds, opts);
+            let rows = gn_subject_rows(&x, &template, model, pop, &ehs, &kappas, &bounds, opts);
             Sides {
                 grad,
                 h_bhhh,
                 raw,
                 raw_bhhh,
+                rows,
                 reference,
             }
         }
@@ -7891,78 +7430,29 @@ mod tests {
             }
         }
 
-        /// A repelled IOV subject keeps the fallback: an unusable `nll` (the sentinel) or a
-        /// non-finite raw score `gᵢ` must not be turned into `dᵢ − gᵢ`. Without a cache the
-        /// fallback is zero. The live control — the same subject, usable `nll`, finite
-        /// `gᵢ` — must give a non-zero `tᵢ`, so the zeros are the gates' doing (#2455 review,
-        /// row 2).
+        /// #2974: the BHHH matrix is the outer product of the gradient's own rows,
+        /// `4·Σ dᵢdᵢᵀ` with `dᵢ` the IOV subject's total derivative, so `H` and the
+        /// gradient come from one vector per subject — and it is not the raw IOV score's
+        /// `4·Σ gᵢgᵢᵀ` (the pre-#2974 matrix), which holds η̂ and κ̂ fixed.
         #[test]
-        fn a_repelled_iov_subject_keeps_the_zero_correction() {
-            let (model, pop) = warfarin_iov(1);
-            let template = model.default_params.clone();
-            let x = pack_params(&template);
-            let bounds = compute_bounds(&template);
-            let opts = FitOptions {
-                interaction: true,
-                ..FitOptions::default()
-            };
-            let (ehs, hms, _, kappas) =
-                run_inner_loop_warm(&model, &pop, &template, 500, 1e-10, None, None, 0, 0);
-            let (nll, gi, _) = subject_nll_pop_grad_with_cache(
-                &x, &template, &model, &pop, 0, &ehs[0], &hms[0], &kappas[0], &bounds, &opts,
-            );
-            let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&template, &x);
-            let t = |nll: f64, gi: &[f64]| {
-                ebe_response_correction(
-                    &x,
-                    &template,
-                    &model,
-                    &pop,
-                    0,
-                    &ehs[0],
-                    &kappas[0],
-                    pt.as_ref(),
-                    nll,
-                    gi,
-                    None,
-                    &bounds,
-                    &opts,
-                )
-            };
-            let live = t(nll, &gi);
-            assert!(
-                is_usable_subject_nll(nll) && live.iter().any(|v| *v != 0.0),
-                "control: a usable subject takes a non-zero IOV correction, got {live:?}"
-            );
-            let sentinel = t(crate::stats::likelihood::SUBJECT_SENTINEL_NLL, &gi);
-            assert_eq!(
-                sentinel,
-                vec![0.0; x.len()],
-                "[#2455] an unusable nll must keep the zero fallback"
-            );
-            let mut bad_gi = gi.clone();
-            bad_gi[0] = f64::NAN;
-            let nan = t(nll, &bad_gi);
-            assert_eq!(
-                nan,
-                vec![0.0; x.len()],
-                "[#2455] a non-finite gᵢ must keep the zero fallback"
-            );
-        }
-
-        /// The BHHH matrix stays on the raw score `4·Σ gᵢgᵢᵀ`, to the bit: folding `dᵢ`
-        /// into the outer product is the variant #1778 measured worse.
-        #[test]
-        fn gn_iov_bhhh_stays_on_the_raw_score() {
+        fn gn_iov_bhhh_is_the_outer_product_of_the_total_derivative() {
             let (model, pop) = warfarin_iov(4);
             let opts = FitOptions {
                 interaction: true,
                 ..FitOptions::default()
             };
             let s = sides(&model, &pop, &opts);
-            assert_eq!(
-                s.h_bhhh, s.raw_bhhh,
-                "[#2455] the BHHH matrix must stay on the raw IOV score"
+            let n = s.grad.len();
+            let mut want = DMatrix::zeros(n, n);
+            for d in &s.rows {
+                let d = DVector::from_column_slice(d);
+                want.ger(4.0, &d, &d, 1.0);
+            }
+            assert_eq!(s.h_bhhh, want, "[#2974] H = 4·Σ dᵢdᵢᵀ");
+            let gap = (&s.h_bhhh - &s.raw_bhhh).abs().max();
+            assert!(
+                gap > 1e-3 * s.raw_bhhh.abs().max(),
+                "[#2974] straddle: the raw IOV score's matrix must differ, gap {gap:.3e}"
             );
         }
 
@@ -7977,5 +7467,141 @@ mod tests {
         const PARITY_ADJOINT: f64 = 1e-4;
         const PARITY_FD: f64 = 1e-8;
         const RAW_GAP: f64 = 1.0;
+    }
+}
+
+/// #2974: GN's system is built from the subject rows `dᵢ`, the total derivative.
+#[cfg(test)]
+mod rows_tests {
+    use super::*;
+    use crate::estimation::parameterization::pack_with_bounds;
+
+    /// `examples/warfarin.ferx` on four subjects at its initial values, each mode solved.
+    fn fixture(
+        interaction: bool,
+    ) -> (
+        CompiledModel,
+        Population,
+        FitOptions,
+        Vec<DVector<f64>>,
+        Vec<DMatrix<f64>>,
+    ) {
+        let (model, pop, opts) = crate::estimation::inner_optimizer::test_helpers::load_iov_fixture(
+            include_str!("../../examples/warfarin.ferx"),
+            "data/warfarin.csv",
+            4,
+        );
+        let opts = FitOptions {
+            interaction,
+            ..opts
+        };
+        let p = &model.default_params;
+        let mu_k = compute_mu_k(&model, &p.theta, opts.mu_referencing);
+        let (mut etas, mut hs) = (Vec::new(), Vec::new());
+        for s in &pop.subjects {
+            let ebe = crate::estimation::inner_optimizer::find_ebe_for_stage(
+                &model,
+                s,
+                p,
+                1000,
+                1e-10,
+                None,
+                Some(&mu_k),
+                0,
+                &opts,
+            );
+            etas.push(ebe.eta);
+            hs.push(ebe.h_matrix);
+        }
+        (model, pop, opts, etas, hs)
+    }
+
+    /// The gradient is `2·Σ dᵢ` and the BHHH matrix `4·Σ dᵢdᵢᵀ`, bit for bit, with every row
+    /// the adjoint's exact total derivative — for FOCEI and FOCE. Under the pre-#2974 rows the
+    /// matrix was `4·Σ gᵢgᵢᵀ` with `gᵢ` the fixed-mode score, which misses `dᵢ` by far more
+    /// than rounding, so the equality fails on it (the straddle is asserted below).
+    #[test]
+    fn gn_system_is_the_outer_product_of_the_total_derivative_rows() {
+        for interaction in [true, false] {
+            let (model, pop, opts, etas, hs) = fixture(interaction);
+            let template = &model.default_params;
+            let start = pack_with_bounds(template);
+            let (x, bounds) = (&start.packed, &start.bounds);
+            let kappas = vec![Vec::new(); pop.subjects.len()];
+            let (grad, h) = build_gn_system(
+                x, template, &model, &pop, &etas, &hs, &kappas, bounds, &opts,
+            );
+            let rows = gn_subject_rows(x, template, &model, &pop, &etas, &kappas, bounds, &opts);
+            let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x).unwrap();
+            let objective = if interaction {
+                crate::sens::ode_provider::adjoint::Objective::Focei
+            } else {
+                crate::sens::ode_provider::adjoint::Objective::Foce
+            };
+            let (mut want_g, mut want_h) =
+                (DVector::zeros(x.len()), DMatrix::zeros(x.len(), x.len()));
+            let raw = raw_scores(
+                &(0..pop.subjects.len()).collect::<Vec<_>>(),
+                x,
+                template,
+                &model,
+                &pop,
+                &etas,
+                &hs,
+                &kappas,
+                bounds,
+                &opts,
+            );
+            let mut gap = 0.0f64;
+            for (i, s) in pop.subjects.iter().enumerate() {
+                let d = crate::sens::ode_provider::adjoint::subject_adjoint_gradient_at(
+                    &model,
+                    s,
+                    &pt,
+                    etas[i].as_slice(),
+                    objective,
+                )
+                .expect("the adjoint serves warfarin");
+                assert_eq!(rows[i], d, "row {i} is the adjoint's total derivative");
+                for (a, b) in d.iter().zip(&raw[i]) {
+                    assert!(a.is_finite() && b.is_finite());
+                    gap = gap.max((a - b).abs() / b.abs().max(1.0));
+                }
+                let dv = DVector::from_column_slice(&d);
+                want_g += 2.0 * &dv;
+                want_h.ger(4.0, &dv, &dv, 1.0);
+            }
+            assert_eq!(grad, want_g, "interaction {interaction}: gradient");
+            assert_eq!(h, want_h, "interaction {interaction}: BHHH matrix");
+            eprintln!("interaction {interaction}: worst |dᵢ − gᵢ| rel {gap:.3e}");
+            assert!(
+                gap > 1e-3,
+                "straddle: the fixed-mode rows must differ: {gap:.3e}"
+            );
+        }
+    }
+
+    /// #2777's take-back: `swap_row` replaces one subject's row in the gradient and the BHHH
+    /// matrix alike, so the result is the system built with that row from the start.
+    #[test]
+    fn swap_row_rebuilds_the_system_with_the_new_row() {
+        let rows = [vec![1.0, -2.0], vec![0.5, 3.0]];
+        let g = vec![-1.5, 0.25];
+        let build = |rs: &[Vec<f64>]| {
+            let (mut gr, mut h) = (DVector::zeros(2), DMatrix::zeros(2, 2));
+            for r in rs {
+                let v = DVector::from_column_slice(r);
+                gr += 2.0 * &v;
+                h.ger(4.0, &v, &v, 1.0);
+            }
+            (gr, h)
+        };
+        let (mut gr, mut h) = build(&rows);
+        let mut d = rows[1].clone();
+        swap_row(&mut gr, &mut h, &mut d, g.clone());
+        let (want_g, want_h) = build(&[rows[0].clone(), g.clone()]);
+        assert_eq!(d, g);
+        assert!((gr - want_g).abs().max() < 1e-14);
+        assert!((h - want_h).abs().max() < 1e-14);
     }
 }

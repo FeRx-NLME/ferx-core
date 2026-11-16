@@ -623,7 +623,9 @@ By default ferx reports the **R-matrix** covariance `R⁻¹` (the inverse observ
 | `s` | `S⁻¹` | `MATRIX=S` | You want the empirical-information (cross-product) SEs. |
 | `rsr` | `R⁻¹ S R⁻¹` | `MATRIX=RSR` | You want SEs robust to model mis-specification (the Huber–White "sandwich"). |
 
-Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vectors `gᵢ = ∂(−logLᵢ)/∂θ` — the same per-subject gradients the [Gauss–Newton](optimizers.qmd) optimizer uses for its BHHH step. At the MLE of a correctly-specified model the information-matrix equality gives `R ≈ S`, so all three estimators converge to the same SEs; they diverge when the model is mis-specified, where `rsr` is the conservative choice.
+Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vectors `gᵢ = d(−logLᵢ)/dθ`: the **total** derivative of subject `i`'s objective, with its EBEs (and κ̂ under IOV) re-estimated at every parameter value. That is what NONMEM's `MATRIX=S` differentiates. ferx takes it exactly, as the subject's term of the analytic outer gradient (one adjoint pass per subject), and it is the same row the [Gauss–Newton](gauss-newton.qmd) optimizer builds its BHHH matrix from. Under `gradient = fd`, or for a subject the adjoint declines, it is a central difference of the subject's objective with the EBEs re-solved at each point ([#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)).
+
+Before #2974 the score held each subject's EBEs and their linearisation at the estimates (a fixed-mode score). That score is biased at the MLE (`Σᵢ gᵢ ≠ 0`, because holding η̂ drops the response of the FOCEI `log|H̃|` term), so `s` and `rsr` differed from NONMEM's by an amount more subjects do not shrink: up to 25% on the anchors below, and 14% (`s`) and 36% (`rsr`) on the [mixture anchor](mixture.qmd#against-nonmem). At the MLE of a correctly-specified model the information-matrix equality gives `R ≈ S`, so all three estimators converge to the same SEs; they diverge when the model is mis-specified, where `rsr` is the conservative choice.
 
 ```
 [fit_options]
@@ -633,6 +635,18 @@ Here `S = Σᵢ gᵢgᵢᵀ` is the cross-product of the per-subject score vecto
 ```
 
 `s` and `rsr` are available for **FOCEI, FOCE, and IOV** fits. `s` builds no `R` (#1803): `S⁻¹` reads only the per-subject scores, so it needs a full-rank `S` and nothing else, and it costs one pass over those scores instead of the `2n²` re-converged objective evaluations of `R`'s finite-difference stencil. An `R` with no usable curvature therefore no longer fails an `s` step whose `S⁻¹` exists. `rsr` reads both matrices and still needs a positive-definite `R`.
+
+#### NONMEM cross-check at a common point (S, R, RSR)
+
+`S` contains no `R`, so it is the like-for-like comparison with NONMEM's `MATRIX=S`: both engines are evaluated at one fixed point, NONMEM 7.6's own MLE printed to six significant figures (`$ESTIMATION MAXEVAL=0`; ferx `outer_maxiter = 0`), and both re-estimate the EBEs there. Control streams and `.ext` files are `tests/nonmem/wf_{focei,foce,iov}_*`, guarded by `tests/covariance_s_nonmem_eval_anchor.rs`. Worst relative SE gap over θ, Ω (and the IOV variance):
+
+| Model | `s` vs `MATRIX=S` | `s` before #2974 | `r` vs `MATRIX=R` | `rsr` vs default `$COV` |
+|---|---|---|---|---|
+| warfarin FOCEI | 2.6e-6 | 5.9e-2 | 1.8e-4 | 3.1e-4 |
+| warfarin FOCE | 2.3e-6 | 8.8e-4 | 8.7e-5 | 1.5e-4 |
+| warfarin IOV (FOCEI) | 8.5e-6 | 2.5e-1 | 3.1e-3 | 6.2e-3 |
+
+NONMEM prints six significant figures, about 5e-6 of rounding, so `s` agrees to NONMEM's printed precision (on `SE(TVCL)` under FOCEI: 9.296176e-3 against 9.29617e-3, where the fixed-mode score gave 9.846194e-3). The `r` and `rsr` gaps are `R`'s: ferx's `R` is the exact analytic Hessian, NONMEM's a finite-difference one.
 
 #### NONMEM cross-check (S / RSR, FOCEI)
 

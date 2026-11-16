@@ -4038,7 +4038,6 @@ impl ProfileCtx<'_> {
             self.model,
             self.population,
             &solve.etas,
-            &solve.h_matrices,
             &solve.kappas,
             &bounds,
             self.options,

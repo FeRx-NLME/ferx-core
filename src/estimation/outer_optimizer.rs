@@ -10857,9 +10857,9 @@ fn declined_fill(nll: f64, held_ebe_grad: &[f64]) -> DeclinedFill {
 /// subject's EBE** (warm-started) at every perturbed point, so the Ω/σ EBE response is
 /// included. Since #1529 it serves two callers here: a structural decline
 /// ([`non_iov_declined_salvage`], #1536), and the last resort of [`held_ebe_salvage`] for
-/// a subject whose held-EBE gradient came back non-finite at a usable objective. GN and
-/// trust-region also read it for a model whose fixed-EBE score is biased
-/// (`gauss_newton::ebe_response_correction`, #1778).
+/// a subject whose held-EBE gradient came back non-finite at a usable objective. GN,
+/// trust-region and the covariance step's `S` read it for a subject the adjoint declines
+/// (`covariance::subject_total_score`, #2974).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_reconverged_fd_gradient(
     x: &[f64],
@@ -11896,7 +11896,8 @@ pub(crate) fn declined_salvage_reconverges(
 /// `x` is not the template's packed length: the adjoint declines then, but a subject with no
 /// data at all (no observations, no endpoint records) keeps the zero gradient it gives one.
 ///
-/// The analytic half of [`subject_iov_outer_gradient`], kept separate so
+/// The analytic half of an IOV subject's outer gradient (the reconverged-FD salvage
+/// [`subject_reconverged_fd_gradient_iov`] is the other), kept separate so
 /// [`population_gradient_sens_iov_mixed`] can put its #1520 guard between the two halves.
 fn subject_iov_analytic_gradient(
     pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
@@ -11920,38 +11921,6 @@ fn subject_iov_analytic_gradient(
         }
         None => packed_length_decline(subject, np),
     }
-}
-
-/// One IOV subject's packed outer gradient `dᵢ = ∂NLLᵢ/∂x`, κ̂ and η̂ response included: the
-/// exact adjoint where it takes the subject, else the reconverged-FD salvage
-/// [`subject_reconverged_fd_gradient_iov`]. The per-subject gradient the NLopt IOV route
-/// sums ([`population_gradient_sens_iov_mixed`]), so `method = gn` takes the same one
-/// (`gauss_newton::ebe_response_correction`, #2455). Unlike the population assembly it
-/// carries no #1520 salvage guard: GN has no incumbent to rank a trial point against.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn subject_iov_outer_gradient(
-    x: &[f64],
-    init_params: &ModelParameters,
-    model: &CompiledModel,
-    subject: &Subject,
-    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
-    stacked: &DVector<f64>,
-    bounds: &PackedBounds,
-    options: &FitOptions,
-) -> Vec<f64> {
-    subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options).unwrap_or_else(
-        |_| {
-            subject_reconverged_fd_gradient_iov(
-                x,
-                init_params,
-                model,
-                subject,
-                stacked,
-                bounds,
-                options,
-            )
-        },
-    )
 }
 
 /// **IOV** population gradient assembled **per subject** — the IOV analogue of
