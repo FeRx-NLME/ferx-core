@@ -2299,3 +2299,26 @@ fn the_ss_affinity_self_check_holds_at_another_point() {
     let want = 5.0 * 0.9f64.exp() / (1.0 - (-k * ii).exp());
     close(got[0][0], want, "the fixed point at the second point");
 }
+
+/// Every native target a plan is compiled for probes its stack inline (#2786 review: the
+/// analytic covariance R-matrix of a two-state ODE model segfaulted on Windows once its plan
+/// reached the native tier). A frame past one page skips Windows' guard page without a probe;
+/// Linux has no such requirement, so the crash cannot be reproduced here and this pins the
+/// cause instead: the plan targets and the RHS JIT's take their flags from one
+/// `jit::host_flags`, and every tier keeps the probe. Mutation: drop `enable_probestack` (or
+/// build the plan target's flags from a fresh `settings::builder()` again, as before the fix)
+/// -> the assertion names the tier.
+#[test]
+fn every_native_plan_tier_probes_its_stack() {
+    use cranelift_codegen::settings::ProbestackStrategy;
+    for (quick, opt) in [(true, "none"), (true, "speed"), (false, "speed")] {
+        let isa = plan_isa(quick, opt).expect("a host target");
+        let f = isa.flags();
+        assert!(f.enable_probestack(), "tier ({quick}, {opt}): no stack probes");
+        assert_eq!(
+            f.probestack_strategy(),
+            ProbestackStrategy::Inline,
+            "tier ({quick}, {opt}): probes not inline"
+        );
+    }
+}

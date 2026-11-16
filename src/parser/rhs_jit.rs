@@ -280,22 +280,34 @@ pub(super) fn native_cause() -> super::NativeCause {
 
 /// A JIT module for the host, or `None` when Cranelift cannot target it (or the native code
 /// is switched off, [`jit_enabled`]).
+/// The Cranelift flags every native module this crate builds starts from — this file's RHS
+/// programs and `kernel_jit`'s derivative plans alike, so the two cannot drift apart again.
+///
+/// Stack probes are the load-bearing one. A wide program keeps many values live and spills a
+/// frame past a page. Windows commits a thread's stack one guard page at a time: a store
+/// beyond the guard page without a probe is an access violation, not a stack extension
+/// (Linux maps the stack without that requirement, so a missing probe never shows there).
+/// The derivative plans once built their own flags without probes, and the covariance
+/// R-matrix plan of a two-state ODE model crashed on Windows as soon as it reached the native
+/// tier (#2786 review).
+pub(super) fn host_flags() -> Option<settings::Builder> {
+    let mut flags = settings::builder();
+    flags.set("use_colocated_libcalls", "false").ok()?;
+    flags.set("is_pic", "false").ok()?;
+    flags.set("enable_probestack", "true").ok()?;
+    flags.set("probestack_strategy", "inline").ok()?;
+    Some(flags)
+}
+
 fn new_module(fast_alloc: bool) -> Option<JITModule> {
     if !jit_enabled() {
         return None;
     }
-    let mut flags = settings::builder();
+    let mut flags = host_flags()?;
     flags.set("opt_level", "speed").ok()?;
     if fast_alloc {
         flags.set("regalloc_algorithm", "single_pass").ok()?;
     }
-    flags.set("use_colocated_libcalls", "false").ok()?;
-    flags.set("is_pic", "false").ok()?;
-    // A wide program keeps many prologue loads live and spills a frame past a page. Windows
-    // commits a stack one guard page at a time: a store beyond it without a probe is an access
-    // violation, not a stack extension.
-    flags.set("enable_probestack", "true").ok()?;
-    flags.set("probestack_strategy", "inline").ok()?;
     let isa = cranelift_native::builder()
         .ok()?
         .finish(settings::Flags::new(flags))

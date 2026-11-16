@@ -5882,6 +5882,25 @@ impl SegPlan {
 
 /// With `rev`, the first `prefix` instructions are the recomputed forward ([`ir::reverse`]):
 /// they run once, the rest in a loop over the seeds.
+/// The target a plan is compiled for at a tier (`quick`: the single-pass register allocator;
+/// `opt`: Cranelift's `opt_level`), on the host flags every module shares
+/// (`jit::host_flags`, stack probes included).
+fn plan_isa(quick: bool, opt: &str) -> Option<cranelift_codegen::isa::OwnedTargetIsa> {
+    use cranelift_codegen::settings::{self, Configurable};
+    let mut flags = super::jit::host_flags()?;
+    flags.set("opt_level", opt).ok()?;
+    // The IR verifier is a debugging check of Cranelift's own invariants.
+    flags.set("enable_verifier", "false").ok()?;
+    // The quick tier: the single-pass register allocator.
+    if quick {
+        flags.set("regalloc_algorithm", "single_pass").ok()?;
+    }
+    cranelift_native::builder()
+        .ok()?
+        .finish(settings::Flags::new(flags))
+        .ok()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_chunk_opt(
     f: &Func,
@@ -5913,22 +5932,7 @@ fn lower_chunk_opt(
         .lock()
         .unwrap()
         .entry((quick, opt.to_string()))
-        .or_insert_with(|| {
-            let mut flags = settings::builder();
-            flags.set("opt_level", opt).ok()?;
-            // The IR verifier is a debugging check of Cranelift's own invariants.
-            flags.set("enable_verifier", "false").ok()?;
-            // The quick tier: the single-pass register allocator.
-            if quick {
-                flags.set("regalloc_algorithm", "single_pass").ok()?;
-            }
-            flags.set("use_colocated_libcalls", "false").ok()?;
-            flags.set("is_pic", "false").ok()?;
-            cranelift_native::builder()
-                .ok()?
-                .finish(settings::Flags::new(flags))
-                .ok()
-        })
+        .or_insert_with(|| plan_isa(quick, opt))
         .clone()?;
     let mut module = JITModule::new(JITBuilder::with_isa(isa, default_libcall_names()));
     let target = module.target_config();
