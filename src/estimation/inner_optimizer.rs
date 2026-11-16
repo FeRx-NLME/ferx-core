@@ -411,6 +411,12 @@ fn subject_inner_runs_fd(
             return false;
         }
     }
+    // A subject with no observations at all (doses and `EVID=2` rows only) has a prior-only
+    // inner problem: no data term to differentiate, so no route of either kind. `exact_obs_grads`
+    // is `None` for its empty observation list, which would count it as finite differences.
+    if subject.obs_times.is_empty() && subject.obs_records.is_empty() {
+        return false;
+    }
     crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta).is_none()
 }
 
@@ -426,6 +432,11 @@ fn iov_fd_fallback_warning(
     for subject in &population.subjects {
         // A refused subject's search is skipped, so it runs no gradient of either kind.
         if refused_skipped && crate::stats::likelihood::iov_refuses_frem(model, subject) {
+            continue;
+        }
+        // A subject with no observations has a prior-only inner problem and no data gradient of
+        // either kind (`subject_inner_runs_fd`'s rule); the route is `None` for its empty list.
+        if subject.obs_times.is_empty() && subject.obs_records.is_empty() {
             continue;
         }
         if iov_inner_subject_route(model, subject, theta).is_none() {

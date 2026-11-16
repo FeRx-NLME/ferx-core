@@ -7318,3 +7318,49 @@ fn sde_iov_inner_search_takes_the_per_row_assembler() {
         "{analytic} analytic / {fd} FD steps"
     );
 }
+
+/// The IOV twin of `a_dose_only_subject_is_not_counted_as_finite_differences`: the IOV loop's
+/// warning counts a subject as finite differences when `iov_inner_subject_route` declines it,
+/// and that is `None` for a subject with no observations, whose inner problem is prior-only.
+/// Mutation: drop the no-observation `continue` in `iov_fd_fallback_warning` -> the warning
+/// reads "1 of 2 subjects … in the IOV loop".
+#[test]
+fn an_iov_dose_only_subject_is_not_counted_as_finite_differences() {
+    let dir = std::env::temp_dir().join(format!("ferx-iov-dose-only-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("d.csv");
+    std::fs::write(
+        &csv,
+        "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,OCC\n\
+         1,0,1,1,0,1000,0,1,1\n1,4,0,0,20,0,0,1,1\n1,10,0,0,10,0,0,1,1\n\
+         1,24,1,1,0,1000,0,1,2\n1,28,0,0,22,0,0,1,2\n1,34,0,0,11,0,0,1,2\n\
+         2,0,1,1,0,1000,0,1,1\n2,24,1,1,0,1000,0,1,2\n",
+    )
+    .unwrap();
+    let (model, pop, _) = crate::estimation::inner_optimizer::test_helpers::load_iov_fixture(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV(20.0, 1.0, 500.0)\n  \
+         omega ETA_CL ~ 0.09\n  omega ETA_V ~ 0.09\n  kappa KAPPA_CL ~ 0.01\n  \
+         sigma PROP ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL + KAPPA_CL)\n  V = TVV * exp(ETA_V)\n\
+         [structural_model]\n  pk one_cpt_iv(cl=CL, v=V)\n\
+         [error_model]\n  DV ~ proportional(PROP)\n\
+         [fit_options]\n  method = focei\n  iov_column = OCC\n",
+        csv.to_str().unwrap(),
+        2,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        model.default_params.omega_iov.is_some(),
+        "fixture precondition: an IOV model"
+    );
+    assert!(
+        pop.subjects[1].obs_times.is_empty() && pop.subjects[1].obs_records.is_empty(),
+        "fixture precondition: subject 2 has no observations"
+    );
+    let theta = &model.default_params.theta;
+    assert!(
+        iov_inner_subject_route(&model, &pop.subjects[0], theta).is_some(),
+        "control: the observed subject takes the exact IOV route"
+    );
+    assert_eq!(fd_fallback_warning(&model, &pop, theta), None);
+}

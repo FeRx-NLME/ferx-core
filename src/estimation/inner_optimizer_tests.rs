@@ -8121,3 +8121,47 @@ fn the_kept_walk_returns_the_modes_predictions_bit_for_bit() {
         "fixture: a solve whose last walk was another point"
     );
 }
+
+/// A subject with no observations (doses only) has a prior-only inner problem and no data term
+/// to differentiate: it is not a finite-difference subject, and the warning must not count it
+/// (reported on #2939's benchmark: "N of M subjects use finite-difference inner gradients" with N
+/// exactly the dose-only subjects). The data is the reporter's reprex. Mutation: drop the
+/// no-observation guard in `subject_inner_runs_fd` -> the warning reads "1 of 2 subjects".
+#[test]
+fn a_dose_only_subject_is_not_counted_as_finite_differences() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV1(20.0, 1.0, 500.0)\n  \
+         theta TVQ(2.0, 0.01, 100.0)\n  theta TVV2(40.0, 1.0, 1000.0)\n  \
+         omega ETA_CL ~ 0.09\n  omega ETA_V1 ~ 0.09\n  sigma PROP ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1 * exp(ETA_V1)\n  \
+         Q = TVQ\n  V2 = TVV2\n\
+         [structural_model]\n  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)\n\
+         [error_model]\n  DV ~ proportional(PROP)\n",
+    )
+    .expect("model parses");
+    let dir = std::env::temp_dir().join(format!("ferx-dose-only-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("d.csv");
+    std::fs::write(
+        &csv,
+        "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT\n1,0,1,1,0,1000,1000,1\n1,4,0,0,20,0,0,1\n\
+         1,10,0,0,10,0,0,1\n2,0,1,1,0,1000,1000,1\n2,12,1,1,0,1000,1000,1\n",
+    )
+    .unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(&csv, None, None).expect("data reads");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(pop.subjects.len(), 2, "fixture precondition: two subjects");
+    assert!(
+        pop.subjects[1].obs_times.is_empty() && pop.subjects[1].obs_records.is_empty(),
+        "fixture precondition: subject 2 has no observations"
+    );
+    let theta = &model.default_params.theta;
+    assert_eq!(fd_fallback_warning(&model, &pop, theta), None);
+    // The observed subject alone stays analytic (the control: the warning reads the route).
+    assert!(!subject_inner_runs_fd(
+        &model,
+        &pop.subjects[0],
+        theta,
+        &[0.0, 0.0]
+    ));
+}
