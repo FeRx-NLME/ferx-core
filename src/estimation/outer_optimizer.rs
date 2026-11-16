@@ -900,6 +900,13 @@ const IDENTITY_PROBE_MIN_FRACTION: f64 = 0.05;
 /// bar sits about two orders of magnitude from each side.
 const IDENTITY_MAX_PREDICTED_STEP: f64 = 10.0;
 
+/// Up to this many multiples of `|θ₀|`, a candidate whose predicted step is beyond
+/// [`IDENTITY_MAX_PREDICTED_STEP`] is scaled by that step rather than left on the unit scale
+/// ([`identity_scale_for_step`], #2975). Between the two kinds of θ the probe tells apart: a
+/// near-zero effect whose start is merely far from the optimum (34·|θ₀| measured) and an
+/// O(1) slope started at 0.001 (261 and 708·|θ₀| on `two_cpt_oral_cov`).
+const IDENTITY_MAX_STEP_SCALED: f64 = 100.0;
+
 /// The near-zero identity-packed θ the NLopt outer loop divides by their initial
 /// magnitude, as `(θ index, |θ₀|)` (#2159).
 ///
@@ -986,14 +993,22 @@ fn identity_theta_scales(
         if let Some(d) = &exact {
             let (g, h) = d[c];
             let delta = points[1] - points[0];
-            let scaled = h * delta * delta > 1e-6 * (1.0 + base.abs())
-                && (g / h).abs() <= IDENTITY_MAX_PREDICTED_STEP * magnitude;
+            let scaled = (h * delta * delta > 1e-6 * (1.0 + base.abs()))
+                .then(|| identity_scale_for_step((g / h).abs(), magnitude))
+                .flatten();
             // The probes' other arm: a move of the θ's own size the optimizer cannot take
             // (a non-finite or walled objective) scales it, whatever the local derivatives
             // say. Checked at the probe points with the EBEs held, only for a θ the
             // derivatives would leave on the unit scale.
-            if scaled || points.iter().any(|&p| p != t && !feasible(i, p)) {
-                scales.push((i, magnitude));
+            // A step-sized scale (#2975) yields to the wall: a move of the θ's own size the
+            // optimizer cannot take asks for the smaller, `|θ₀|`, scale.
+            match scaled {
+                Some(s) if s == magnitude => scales.push((i, s)),
+                _ if points.iter().any(|&p| p != t && !feasible(i, p)) => {
+                    scales.push((i, magnitude))
+                }
+                Some(s) => scales.push((i, s)),
+                None => {}
             }
             continue;
         }
@@ -1012,11 +1027,34 @@ fn identity_theta_scales(
         }
         let delta = points[1] - points[0];
         let minimizer = points[1] - delta * (f[2] - f[0]) / (2.0 * curvature);
-        if (minimizer - t).abs() <= IDENTITY_MAX_PREDICTED_STEP * magnitude {
-            scales.push((i, magnitude));
+        if let Some(s) = identity_scale_for_step((minimizer - t).abs(), magnitude) {
+            scales.push((i, s));
         }
     }
     scales
+}
+
+/// The NLopt scale for a near-zero identity-packed θ of size `magnitude` whose predicted
+/// Newton step from θ₀ is `step` (#2159, #2975), or `None` for the unit scale.
+///
+/// - `step ≤` [`IDENTITY_MAX_PREDICTED_STEP`]`·|θ₀|`: the moves that matter are of the θ's
+///   own size, and the scale is `|θ₀|` (#2159).
+/// - `step ≤` [`IDENTITY_MAX_STEP_SCALED`]`·|θ₀|`: the θ must travel tens of its own sizes,
+///   which at the unit scale is still a coordinate whose useful moves are far below the
+///   optimizer's unit step. The step itself is the coordinate's unit (#2975). A 28-subject
+///   1-cpt IV fit with `CL = TVCL·(1 + TWT·(WT − 134.1))·…`, `TWT` started at 0.001 with
+///   every other θ far from its optimum, predicts 34·|θ₀|; scaled by that step it takes 31
+///   iterations instead of 80, the same OFV. A step of 1 or more is the unit scale already.
+/// - farther: an O(1) slope started near zero (`two_cpt_oral_cov`'s exponents at 0.001
+///   predict 261 and 708·|θ₀|) keeps the unit scale, as before.
+fn identity_scale_for_step(step: f64, magnitude: f64) -> Option<f64> {
+    if !step.is_finite() || magnitude <= 0.0 {
+        return None;
+    }
+    if step <= IDENTITY_MAX_PREDICTED_STEP * magnitude {
+        return Some(magnitude);
+    }
+    (step <= IDENTITY_MAX_STEP_SCALED * magnitude && step < 1.0).then_some(step)
 }
 
 /// The three equally spaced probe points of [`identity_theta_scales`], ascending and

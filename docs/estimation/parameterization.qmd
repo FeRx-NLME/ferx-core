@@ -90,8 +90,16 @@ $$
 
 and the θ is divided by $|\theta_0|$ in the optimizer's scale vector when
 $|x^* - \theta_0| \le 10\,|\theta_0|$: the minimizer is predicted within a few
-times the θ's own size. Otherwise — and when the second difference shows no
-positive curvature above $10^{-6}(1 + |f(\theta_0)|)$ — it keeps the unit scale.
+times the θ's own size. When the predicted step is farther, but at most
+$100\,|\theta_0|$ and below 1, the θ is divided by the step $|x^* - \theta_0|$
+itself (#2975): it must travel tens of its own sizes, which on the unit scale is
+still a coordinate whose useful moves sit far below the optimizer's unit step. A
+covariate effect such as `CL = TVCL·(1 + TWT·(WT − 134))` with `TWT` started at
+`0.001` while the other θ are still far from their optimum predicts about
+$34\,|\theta_0|$; scaled by that step, a 28-subject fit took 31 iterations
+instead of 80, at the same OFV. Otherwise — a predicted step beyond
+$100\,|\theta_0|$ (an O(1) slope started near zero), or a second difference with
+no positive curvature above $10^{-6}(1 + |f(\theta_0)|)$ — it keeps the unit scale.
 A probe the optimizer could not take — a `NaN` or diverged objective, or one the
 EBE guard rejects (more than `max_unconverged_frac` of the subjects unconverged,
 or a hard-rejected start) — scales the θ, since a move of its own size already
