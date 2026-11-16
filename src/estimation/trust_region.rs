@@ -155,6 +155,7 @@ impl FoceiProblem<'_> {
             &vec![Vec::new(); n_subj],
             &self.bounds,
             self.options,
+            &[],
         );
         *self.grad_cache.lock().unwrap() = Some(GradCache {
             x: x.to_vec(),

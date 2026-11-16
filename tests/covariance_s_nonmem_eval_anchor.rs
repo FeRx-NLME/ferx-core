@@ -15,7 +15,8 @@
 //! (`Y = IPRED·(1 + θ₄·ε)`, `$SIGMA 1 FIX`), so its SE is on the SD scale, as ferx's
 //! `se_sigma` is; Ω and the IOV variance are on the variance scale in both.
 //!
-//! Measured worst relative SE gaps (Windows x86_64), and the bound each gets:
+//! Measured worst relative SE gaps (Linux x86_64, the reference platform; an earlier Windows run
+//! printed the same figures to the digits shown), and the bound each gets:
 //!
 //! | model          | `s` vs `MATRIX=S` | before #2974 | `r` vs `MATRIX=R` | `rsr` vs default |
 //! |----------------|-------------------|--------------|-------------------|------------------|

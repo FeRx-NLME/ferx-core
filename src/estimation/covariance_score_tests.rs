@@ -120,7 +120,8 @@ fn warfarin(n_subj: usize, interaction: bool) -> (CompiledModel, Population, Fit
     (model, pop, opts)
 }
 
-// Measured (Windows x86_64): total score vs oracle 1.2e-7, fixed-mode score 6.5e-1.
+// Measured (Linux x86_64; Windows printed the same): total score vs oracle 1.20e-7 (bound 1e-6,
+// 8.3x), fixed-mode score 6.5e-1 (straddle 1e-2, 65x).
 #[test]
 fn focei_score_is_the_reconverged_total_derivative() {
     let (model, pop, opts) = warfarin(4, true);
@@ -132,7 +133,8 @@ fn focei_score_is_the_reconverged_total_derivative() {
     );
 }
 
-// Measured (Windows x86_64): total score vs oracle 5.1e-7, fixed-mode score 4.4e-3.
+// Measured (Linux x86_64; Windows printed the same): total score vs oracle 5.06e-7 (bound 5e-6,
+// 9.9x), fixed-mode score 4.4e-3 (straddle 1e-3, 4.4x).
 #[test]
 fn foce_score_is_the_reconverged_total_derivative() {
     let (model, pop, opts) = warfarin(4, false);
@@ -144,7 +146,8 @@ fn foce_score_is_the_reconverged_total_derivative() {
     );
 }
 
-// Measured (Windows x86_64): total score vs oracle 4.6e-7, fixed-mode score 2.3e-1.
+// Measured (Linux x86_64; Windows printed the same): total score vs oracle 4.61e-7 (bound 5e-6,
+// 10.8x), fixed-mode score 2.3e-1 (straddle 1e-2, 23x).
 #[test]
 fn iov_score_is_the_reconverged_total_derivative() {
     let (model, pop, opts) =
@@ -162,7 +165,8 @@ fn iov_score_is_the_reconverged_total_derivative() {
 }
 
 #[cfg(feature = "survival")]
-// Measured (Windows x86_64): total score vs oracle 2.3e-8, fixed-mode score 1.1e-2.
+// Measured (Linux x86_64; Windows printed the same): total score vs oracle 2.25e-8 (bound 1e-6,
+// 44x), fixed-mode score 1.1e-2 (straddle 1e-3, 11x).
 #[test]
 fn tte_score_is_the_reconverged_total_derivative() {
     let (model, pop, opts) = crate::estimation::inner_optimizer::test_helpers::load_iov_fixture(
@@ -181,6 +185,125 @@ fn tte_score_is_the_reconverged_total_derivative() {
     assert!(
         held > 1e-3,
         "straddle: the fixed-mode score must miss the oracle: {held:.3e}"
+    );
+}
+
+/// #2978 review, item 1: the reconverged fallback's probes of S's rows re-solve at the
+/// covariance step's tolerance (`cov_inner_tol`, #2261), not the fit's. `gradient = fd` sends
+/// every row to the fallback; `S` from `assemble_score_cross_product` must equal, bit for bit,
+/// the cross-product of rows taken at `inner_tol = cov_inner_tol`, and differ from that of
+/// rows taken at the fit's `inner_tol` (the straddle). Mutation: pass `options` instead of
+/// `row_options` to `subject_total_score` and the first equality fails.
+#[test]
+fn the_fd_fallback_rows_of_s_use_the_covariance_inner_tolerance() {
+    let (model, pop, opts) = warfarin(3, true);
+    let opts = FitOptions {
+        gradient_method: crate::types::GradientMethod::Fd,
+        inner_tol: 1e-5,
+        cov_inner_tol: Some(1e-12),
+        ..opts
+    };
+    let template = &model.default_params;
+    let PackedStart {
+        packed: x,
+        bounds,
+        fixed,
+        ..
+    } = pack_with_bounds(template);
+    let (etas, _, kappas) = modes(&model, &pop, &opts, 1e-12);
+    let free: Vec<usize> = (0..x.len()).filter(|&j| !fixed[j]).collect();
+    let s = assemble_score_cross_product(
+        &x, template, &model, &pop, &etas, &kappas, &bounds, &opts, &free,
+    )
+    .expect("S assembles");
+    let cross = |inner_tol: f64| {
+        let o = FitOptions {
+            inner_tol,
+            ..opts.clone()
+        };
+        let mut m = DMatrix::<f64>::zeros(free.len(), free.len());
+        for i in 0..pop.subjects.len() {
+            let g = subject_total_score(
+                &x, template, &model, &pop, i, &etas[i], &kappas[i], None, &bounds, &o,
+            );
+            let gf = DVector::from_iterator(free.len(), free.iter().map(|&k| g[k]));
+            m.ger(1.0, &gf, &gf, 1.0);
+        }
+        m
+    };
+    let at_cov = cross(1e-12);
+    let at_fit = cross(1e-5);
+    let gap = (&at_cov - &at_fit)
+        .iter()
+        .fold(0.0_f64, |m, v| m.max(v.abs())); // nan-ok: asserted finite next
+    assert!(at_cov.iter().chain(at_fit.iter()).all(|v| v.is_finite()));
+    eprintln!("S at cov tolerance vs at the fit's: max abs gap {gap:.3e}");
+    assert_eq!(s, at_cov, "S rows re-solve at cov_inner_tol");
+    assert_ne!(
+        at_cov, at_fit,
+        "straddle: the fit's tolerance gives different rows"
+    );
+}
+
+/// #2978 review, item 2: a subject repelled at the point (some packed coordinate pushed to an
+/// extreme puts its objective on the `1e20` rail) contributes a zero row, as the outer
+/// gradient's salvage does; the same subject at the unperturbed `x` (the control) does not.
+/// The routing under test: the adjoint's vector at a repelled point is non-finite and filtered,
+/// the reconverged difference masks the rail. An explicit usability gate in front of both was
+/// tried and removed: no fixture could tell it from this routing (the mutation that deleted it
+/// survived this test), so it was a predicate that cannot change the answer.
+#[test]
+fn a_repelled_subject_contributes_a_zero_row() {
+    let (model, pop, opts) = warfarin(2, true);
+    let template = &model.default_params;
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(template);
+    let (etas, _, kappas) = modes(&model, &pop, &opts, 1e-12);
+    let probe = crate::estimation::outer_optimizer::subject_mode_probe(
+        template,
+        &model,
+        &pop.subjects[0],
+        etas[0].as_slice(),
+        &opts,
+    );
+    // The first packed coordinate that, pushed to an extreme, puts the subject on the rail.
+    let bad = (0..x.len())
+        .flat_map(|j| [-800.0, 800.0].map(|v| (j, v)))
+        .find_map(|(j, v)| {
+            let mut xb = x.clone();
+            xb[j] = v;
+            (!crate::stats::likelihood::is_usable_subject_nll(probe(&xb, 1e-7).0)).then_some(xb)
+        })
+        .expect("fixture precondition: some extreme coordinate repels the subject");
+    assert!(
+        crate::stats::likelihood::is_usable_subject_nll(probe(&x, 1e-7).0),
+        "control: usable at the healthy point"
+    );
+    let row = |xv: &[f64]| {
+        let pt = PackedPoint::new(template, xv);
+        subject_total_score(
+            xv,
+            template,
+            &model,
+            &pop,
+            0,
+            &etas[0],
+            &kappas[0],
+            pt.as_ref(),
+            &bounds,
+            &opts,
+        )
+    };
+    let healthy = row(&x);
+    assert!(
+        healthy.iter().any(|v| v.abs() > 1e-6),
+        "control: the healthy row is live: {healthy:?}"
+    );
+    assert_eq!(
+        row(&bad),
+        vec![0.0; x.len()],
+        "a repelled subject's row is zero"
     );
 }
 

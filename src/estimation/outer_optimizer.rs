@@ -10624,13 +10624,11 @@ fn subject_fixed_ebe_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> (f64, Vec<f64>) {
-    // For FOCEI (interaction), add the `log|H̃|` EBE-response term `t_i` (the
-    // #274/#289 Δ) the fixed-η̂ analytic gradient drops, so slsqp/L-BFGS see the
-    // full marginal gradient and reach the true minimum instead of stalling
-    // above it. Reuses the Laplace cache the gradient just formed (one extra
-    // n_eta×n_eta solve per subject); θ-block (mu-ref) only, zero for additive
-    // error.
-    let (nll, mut gi, cache) = crate::estimation::gauss_newton::subject_nll_pop_grad_with_cache(
+    // The held-EBE score as is: the `log|H̃|` EBE-response term the FOCEI score drops was
+    // once added back here from a closed form (#274/#289), which was identically zero since
+    // #338 Part A and has been removed. A subject whose response matters is reconverged
+    // instead (`declined_salvage_reconverges`).
+    crate::estimation::gauss_newton::subject_nll_pop_grad(
         x,
         init_params,
         model,
@@ -10641,27 +10639,7 @@ fn subject_fixed_ebe_gradient(
         kappas,
         bounds,
         options,
-    );
-    if let Some(c) = cache.as_ref() {
-        if let Some(t) = crate::estimation::gauss_newton::subject_eta_response_correction(
-            Some(c),
-            x,
-            init_params,
-            model,
-            population,
-            subj_idx,
-            eta_hat,
-            h_matrix,
-            kappas,
-            bounds,
-            options,
-        ) {
-            for (g, ti) in gi.iter_mut().zip(t.iter()) {
-                *g += *ti;
-            }
-        }
-    }
-    (nll, gi)
+    )
 }
 
 /// Is subject `subject`'s analytic outer-gradient decline **structural** — one it takes
@@ -10870,11 +10848,24 @@ pub(crate) fn subject_reconverged_fd_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    // Subject marginal NLL at a packed point, re-solving this subject's EBE
-    // (warm-started from `warm_eta`). Mirrors the objective's per-subject term
-    // (`foce_subject_nll`, summed by `pop_nll`); a non-finite or sentinel side is missing
-    // to `central_diff_packed_gated`, which takes the one-sided difference (#2378).
-    let probe = |xv: &[f64], tol: f64| -> (f64, bool) {
+    let probe = subject_mode_probe(init_params, model, subject, warm_eta.as_slice(), options);
+    subject_central_diff(x, init_params, model, bounds, options, probe)
+}
+
+/// The subject's marginal NLL at a packed point with its mode re-solved there (warm-started
+/// from `warm`, the stacked `[η̂, κ̂…]` under IOV), and whether that solve counts as resolved:
+/// `probe(x, tol)`. Mirrors the objective's per-subject term (`foce_subject_nll`, summed by
+/// `pop_nll`; the IOV marginal for `n_kappa > 0`). A non-finite or sentinel value is missing
+/// to `central_diff_packed_gated`, which takes the one-sided difference (#2378); the same
+/// value at `x` itself is how `covariance::subject_total_score` tells a repelled subject.
+pub(crate) fn subject_mode_probe<'a>(
+    init_params: &'a ModelParameters,
+    model: &'a CompiledModel,
+    subject: &'a Subject,
+    warm: &'a [f64],
+    options: &'a FitOptions,
+) -> impl Fn(&[f64], f64) -> (f64, bool) + 'a {
+    move |xv: &[f64], tol: f64| -> (f64, bool) {
         let params = unpack_params(xv, init_params);
         let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
         let ebe = find_ebe_for_stage(
@@ -10883,25 +10874,43 @@ pub(crate) fn subject_reconverged_fd_gradient(
             &params,
             options.inner_maxiter,
             tol,
-            Some(warm_eta.as_slice()),
+            Some(warm),
             Some(&mu_k),
             0,
             options,
         );
-        let nll = crate::stats::likelihood::foce_subject_nll_cov(
-            model,
-            subject,
-            &params.theta,
-            &ebe.eta,
-            &ebe.h_matrix,
-            &params.omega,
-            &params.sigma.values,
-            model.residual_cov_at(&params),
-            options.interaction,
-        );
+        let nll = if model.n_kappa > 0 {
+            crate::stats::likelihood::foce_subject_nll_iov_cov(
+                model,
+                subject,
+                &params.theta,
+                &ebe.eta,
+                &ebe.h_matrix,
+                &params.omega,
+                &params.sigma.values,
+                model.residual_cov_at(&params),
+                options.interaction,
+                &ebe.kappas,
+                params
+                    .omega_iov
+                    .as_ref()
+                    .expect("IOV model (n_kappa > 0) has omega_iov"),
+            )
+        } else {
+            crate::stats::likelihood::foce_subject_nll_cov(
+                model,
+                subject,
+                &params.theta,
+                &ebe.eta,
+                &ebe.h_matrix,
+                &params.omega,
+                &params.sigma.values,
+                model.residual_cov_at(&params),
+                options.interaction,
+            )
+        };
         (nll, crate::estimation::fd_resolution::ebe_resolved(&ebe))
-    };
-    subject_central_diff(x, init_params, model, bounds, options, probe)
+    }
 }
 
 /// The per-subject reconverged-FD gradients' shared difference: `probe(x, tol)` is the
@@ -10945,38 +10954,7 @@ pub(crate) fn subject_reconverged_fd_gradient_iov(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let probe = |xv: &[f64], tol: f64| -> (f64, bool) {
-        let params = unpack_params(xv, init_params);
-        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-        let ebe = find_ebe_for_stage(
-            model,
-            subject,
-            &params,
-            options.inner_maxiter,
-            tol,
-            Some(warm.as_slice()),
-            Some(&mu_k),
-            0,
-            options,
-        );
-        let nll = crate::stats::likelihood::foce_subject_nll_iov_cov(
-            model,
-            subject,
-            &params.theta,
-            &ebe.eta,
-            &ebe.h_matrix,
-            &params.omega,
-            &params.sigma.values,
-            model.residual_cov_at(&params),
-            options.interaction,
-            &ebe.kappas,
-            params
-                .omega_iov
-                .as_ref()
-                .expect("IOV model (n_kappa > 0) has omega_iov"),
-        );
-        (nll, crate::estimation::fd_resolution::ebe_resolved(&ebe))
-    };
+    let probe = subject_mode_probe(init_params, model, subject, warm.as_slice(), options);
     subject_central_diff(x, init_params, model, bounds, options, probe)
 }
 

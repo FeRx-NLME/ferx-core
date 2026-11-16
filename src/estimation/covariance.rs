@@ -762,6 +762,13 @@ pub(crate) fn assemble_score_cross_product(
     // (`Σᵢ gᵢ ≠ 0`), a gap more subjects do not close (`tests/mixture_cov_s_nonmem.rs`).
     // One packed point for the population, as the outer gradient unpacks it.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x_hat);
+    // The covariance step's inner tolerance for the reconverged fallback's probes too, not
+    // the outer gradient's stencil one (#2261).
+    let row_options = FitOptions {
+        inner_tol: options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
+        ..options.clone()
+    };
+    let mixture_points = mixture.as_ref().map(|c| c.class_points());
     let report = cov_progress("score matrix", n_subj, options.verbose);
     let scores: Vec<Result<Vec<f64>, String>> = (0..n_subj)
         .into_par_iter()
@@ -780,7 +787,12 @@ pub(crate) fn assemble_score_cross_product(
                 &[]
             };
             if let Some(context) = &mixture {
-                let score = context.score(model, population, i, options);
+                let score = context.score(
+                    model,
+                    population,
+                    i,
+                    mixture_points.as_deref().unwrap_or(&[]),
+                );
                 report();
                 return Ok(score);
             }
@@ -802,7 +814,7 @@ pub(crate) fn assemble_score_cross_product(
                 kap_i,
                 pt.as_ref(),
                 bounds,
-                options,
+                &row_options,
             );
             report();
             Ok(gi)
@@ -842,6 +854,11 @@ pub(crate) fn assemble_score_cross_product(
 /// forward difference of the predictions), which is biased at the MLE (`Σᵢ gᵢ ≠ 0`) and is
 /// not NONMEM's `S` (`tests/mixture_cov_s_nonmem.rs`). Fixed coordinates are not zeroed: the
 /// caller reads the free block only.
+///
+/// `options.inner_tol` is the tolerance of the reconverged difference's probes (floored at the
+/// stencil tolerance); the covariance step passes its own (`effective_cov_inner_tol`, #2261),
+/// not the fit's. A subject repelled at `x` returns zeros, as the outer gradient's salvage
+/// does (the adjoint's non-finite vector is filtered, and the difference masks the rail).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn subject_total_score(
     x: &[f64],
@@ -855,34 +872,43 @@ pub(crate) fn subject_total_score(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_at, Objective};
     let subject = &population.subjects[subj_idx];
     if subject.observations.is_empty() && subject.obs_records.is_empty() {
         return vec![0.0; x.len()];
     }
     let analytic = crate::sens::provider::analytic_outer_gradient_available(model)
         && GradientMethod::effective(model, options) != GradientMethod::Fd;
-    let objective = if options.interaction {
-        Objective::Focei
-    } else {
-        Objective::Foce
-    };
     let exact = analytic
         .then_some(pt)
         .flatten()
         .and_then(|pt| {
-            let kap = (model.n_kappa > 0).then(|| kappas.to_vec());
-            let b = stacked_mode(model, subject, eta_hat, kap.as_ref())?;
-            subject_adjoint_gradient_at(model, subject, pt, &b, objective)
+            let b = stacked_mode(
+                model,
+                subject,
+                eta_hat,
+                (model.n_kappa > 0).then_some(kappas),
+            )?;
+            crate::estimation::sens_outer_gradient::subject_gradient_at(
+                model,
+                subject,
+                pt,
+                &b,
+                options.interaction,
+            )
         })
         .filter(|g| g.len() == x.len() && g.iter().all(|v| v.is_finite()));
     if let Some(g) = exact {
         return g;
     }
+    // The reconverged difference masks a probe on the `1e20` rail (`central_diff_packed_gated`,
+    // #2378), so a subject repelled at `x` — for which the adjoint returned a non-finite
+    // vector, filtered above — contributes zero here, as the outer gradient's salvage does.
+    let warm = (model.n_kappa > 0)
+        .then(|| crate::estimation::outer_optimizer::joint_warm_start(eta_hat, kappas));
+    let warm = warm.as_ref().unwrap_or(eta_hat);
     if model.n_kappa > 0 {
-        let warm = crate::estimation::outer_optimizer::joint_warm_start(eta_hat, kappas);
         crate::estimation::outer_optimizer::subject_reconverged_fd_gradient_iov(
-            x, template, model, subject, &warm, bounds, options,
+            x, template, model, subject, warm, bounds, options,
         )
     } else {
         crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
@@ -1262,16 +1288,16 @@ const SALVAGE_MAX_DECLINED_FRACTION: f64 = 0.5;
 /// A subject's mode as the adjoint's recordings take it: `η̂`, followed under IOV by every
 /// occasion's `κ̂` (the stacked `[η, κ₁…κ_K]`), or `None` when the `κ̂` do not match the
 /// subject's occasions.
-pub(crate) fn stacked_mode<'a>(
+pub(crate) fn stacked_mode<'a, K: AsRef<[DVector<f64>]> + ?Sized>(
     model: &CompiledModel,
     subject: &Subject,
     eta_hat: &'a DVector<f64>,
-    kappas: Option<&Vec<DVector<f64>>>,
+    kappas: Option<&K>,
 ) -> Option<std::borrow::Cow<'a, [f64]>> {
     if model.n_kappa == 0 {
         return Some(std::borrow::Cow::Borrowed(eta_hat.as_slice()));
     }
-    let kap = kappas?;
+    let kap = kappas?.as_ref();
     if kap.len() != crate::stats::stacked_layout::group_count(subject)
         || kap.iter().any(|k| k.len() != model.n_kappa)
     {

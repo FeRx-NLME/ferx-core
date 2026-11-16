@@ -943,6 +943,9 @@ pub(crate) struct MixtureScoreContext {
     modes: MixtureClassModes,
     classes: Vec<ClassScoreView>,
     dtheta_dx: Vec<f64>,
+    /// The covariance step's options: the inner tolerance the modes were solved at, and the one
+    /// the reconverged fallback's probes re-solve at (#2261).
+    score_options: FitOptions,
 }
 
 impl MixtureScoreContext {
@@ -1005,16 +1008,28 @@ impl MixtureScoreContext {
             modes,
             classes,
             dtheta_dx,
+            score_options,
         }
     }
 
-    /// Subject `i`'s score `∂(−log Lᵢ)/∂x` over the full mixture packed layout.
+    /// Each class's packed point, unpacked once for the population (not per subject × class).
+    pub(crate) fn class_points(
+        &self,
+    ) -> Vec<Option<crate::sens::ode_provider::adjoint::PackedPoint<'_>>> {
+        self.classes
+            .iter()
+            .map(|v| crate::sens::ode_provider::adjoint::PackedPoint::new(&v.template, &v.x))
+            .collect()
+    }
+
+    /// Subject `i`'s score `∂(−log Lᵢ)/∂x` over the full mixture packed layout; `points` is
+    /// [`Self::class_points`].
     pub(crate) fn score(
         &self,
         model: &CompiledModel,
         population: &Population,
         i: usize,
-        options: &FitOptions,
+        points: &[Option<crate::sens::ode_provider::adjoint::PackedPoint<'_>>],
     ) -> Vec<f64> {
         let spec = model
             .mixture
@@ -1038,7 +1053,6 @@ impl MixtureScoreContext {
             // Asymmetry (#1973): the class kernel here is the single-population S's,
             // not `mixture_gradient`'s `per_subject_packed_gradients`; only the routing
             // is shared, so a kernel change moves one of S and the outer gradient.
-            let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(&view.template, &view.x);
             let g_c = crate::estimation::covariance::subject_total_score(
                 &view.x,
                 &view.template,
@@ -1047,9 +1061,9 @@ impl MixtureScoreContext {
                 i,
                 &self.eval.etas_by_class[cls][i],
                 &self.modes.kappas[cls][i],
-                pt.as_ref(),
+                points[cls].as_ref(),
                 &view.bounds,
-                options,
+                &self.score_options,
             );
             route_class_gradient(&mut g, &g_c, w, cls, &self.params, mp);
             subtract_mixing_gradient(&mut g, &dlnp[cls], w, &self.dtheta_dx);
@@ -2872,9 +2886,10 @@ mod tests {
         let f = |xv: &[f64], i: usize| {
             subject_marginal_reestimated(&model, pop, template, xv, i, &ctx, interaction)
         };
+        let points = ctx.class_points();
         let mut worst = 0.0f64;
         for i in 0..pop.subjects.len() {
-            let g = ctx.score(&model, pop, i, &opts);
+            let g = ctx.score(&model, pop, i, &points);
             assert_eq!(g.len(), x.len(), "{label}: score spans the packed layout");
             for j in (0..x.len()).filter(|&j| !fixed[j]) {
                 let h = 1e-5 * (1.0 + x[j].abs());

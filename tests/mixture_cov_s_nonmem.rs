@@ -294,14 +294,14 @@ fn mixture_r_se_matches_nonmem_r() {
 /// convention and against NONMEM's `MATRIX=S` / `R⁻¹SR⁻¹` directly (#2974), with the
 /// oracle's mode-held column as the straddle.
 ///
-/// Measured worst relative gaps (rows marked *before* macOS arm64; the ferx `s`/`rsr` rows
-/// Windows x86_64, #2974), and the bound each gets:
+/// Measured worst relative gaps (Linux x86_64, the reference platform, #2974; an earlier
+/// Windows run agreed on every row but `r` vs oracle, 2.1e-4 there), and the bound each gets:
 ///
 /// | comparison                        | worst            | bound | why that bound                       |
 /// |-----------------------------------|------------------|-------|--------------------------------------|
 /// | ferx `s` vs oracle total          | 1.3e-8 (TVCL1)   | 1e-6  | 75×; no `R` in `S⁻¹`                 |
 /// | ferx `s` vs NONMEM `MATRIX=S`     | 3.9e-6 (TVCL1)   | 2e-5  | 5×; NONMEM prints 6 figures (≤ 4e-6) |
-/// | ferx `r` vs oracle                | 2.1e-4 (V)       | 1e-3  | 4.7×; the two FD `R` stencils        |
+/// | ferx `r` vs oracle                | 2.1e-5 (V)       | 1e-3  | 47× (4.7× on Windows); two FD stencils |
 /// | ferx `rsr` vs oracle total        | 4.2e-5 (V)       | 3e-4  | 7×; inherits the `R` row above       |
 /// | NONMEM `S` vs oracle total        | 3.9e-6 (TVCL1)   | 2e-5  | 5×; NONMEM prints 6 figures (≤ 4e-6) |
 /// | NONMEM `R⁻¹SR⁻¹` vs oracle total  | 8.9e-3 (TVCL1)   | 2e-2  | 2.2×; NONMEM's FD `R` (see `r` test) |
