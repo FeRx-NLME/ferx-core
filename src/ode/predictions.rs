@@ -3945,8 +3945,9 @@ impl<'a> SegmentForcing<'a> {
     /// frame ([`CumulativeInputs`]): the caller integrates `v = u − shift` through
     /// [`forced`] and reads the physical state back with [`Self::physical`].
     fn cumulative(self) -> Self {
-        // `for_segment` frames nothing without a prepared forcing, and this is built with none:
-        // skip copying the lag times for it.
+        // `for_segment` frames nothing without a prepared forcing, so for an empty one the
+        // result equals `self` field for field: the early return is behaviour-neutral (no test
+        // can tell it from the full path) and only skips copying the lag times.
         if self.prepared.is_empty() {
             return self;
         }

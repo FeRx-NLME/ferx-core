@@ -39822,4 +39822,65 @@ fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() 
         prog.eval(&[0.3], &covs).to_bits(),
         "the fixture tells WT from AGE"
     );
+
+    // Covariates inside every nesting `covariate_names` walks: a condition operand and both
+    // branches of a `Conditional`, a `ThetaGather` index, a `UnaryFn` operand and both
+    // `Power` operands. Deleting any one walk arm drops its names, and each dropped covariate
+    // changes the value (it reads `0.0` in the snapshot): `CA` is read only by the first
+    // condition (missing → the else branch `CC`), `CD` only by the second (missing → the then
+    // branch `CE`); `CB` and `CF` are the branches taken.
+    let cond = |c: Condition, t: Expression, f: Expression| {
+        Expression::Conditional(Box::new(c), Box::new(t), Box::new(f))
+    };
+    let nested = [
+        cond(
+            Condition::Compare(cov("CA"), CmpOp::Gt, Expression::Literal(1.0)),
+            cov("CB"),
+            cov("CC"),
+        ),
+        cond(
+            Condition::Compare(cov("CD"), CmpOp::Lt, Expression::Literal(1.0)),
+            cov("CE"),
+            cov("CF"),
+        ),
+        Expression::ThetaGather {
+            spec: std::sync::Arc::new(GatherSpec {
+                name: "G".into(),
+                levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
+            }),
+            idx: Box::new(cov("LVL")),
+        },
+        Expression::UnaryFn("exp".into(), Box::new(cov("UF"))),
+        Expression::Power(Box::new(cov("PB")), Box::new(cov("PE"))),
+    ]
+    .into_iter()
+    .reduce(|a, b| bin(a, BinOp::Add, b))
+    .unwrap();
+    let nested = TypicalProgram::of(nested);
+    let covs: HashMap<String, f64> = [
+        ("CA", 5.0),
+        ("CB", 7.0),
+        ("CC", 11.0),
+        ("CD", 5.0),
+        ("CE", 13.0),
+        ("CF", 17.0),
+        ("LVL", 2.0),
+        ("UF", 0.4),
+        ("PB", 1.3),
+        ("PE", 2.2),
+    ]
+    .map(|(k, v)| (k.to_string(), v))
+    .into();
+    let names = nested.covariate_names();
+    assert_eq!(
+        names,
+        ["CA", "CB", "CC", "CD", "CE", "CF", "LVL", "UF", "PB", "PE"].map(String::from)
+    );
+    let snap = CovariateSnapshot::new(&names, &covs);
+    for theta in [[0.3, 1.9], [-1.7, 2.5]] {
+        assert_eq!(
+            nested.eval_snapshot(&theta, &snap).to_bits(),
+            nested.eval(&theta, &covs).to_bits()
+        );
+    }
 }

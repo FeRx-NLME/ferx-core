@@ -1167,7 +1167,17 @@ impl TypicalProgram {
                     walk(t, out);
                     walk(f, out);
                 }
-                _ => {}
+                // Every variant is listed, so a new one that can hold a covariate is a compile
+                // error here, not a covariate the snapshot silently reads as `0.0`.
+                Expression::Literal(_)
+                | Expression::Theta(_)
+                | Expression::Eta(_)
+                | Expression::Time
+                | Expression::MixNum
+                | Expression::Variable(_)
+                | Expression::VariableIdx(_)
+                | Expression::CovariateIdx(_)
+                | Expression::NnOutput { .. } => {}
             }
         }
         let mut out = Vec::new();
@@ -1301,7 +1311,8 @@ impl CovariateSource for HashMap<String, f64> {
 }
 
 /// A subject's values of the covariates a [`TypicalProgram`] reads
-/// ([`TypicalProgram::covariate_names`]), looked up once.
+/// ([`TypicalProgram::covariate_names`]), read from the subject's map once; each read then
+/// finds its name in that short list.
 pub(crate) struct CovariateSnapshot<'a> {
     names: &'a [String],
     values: Vec<f64>,
@@ -32311,8 +32322,10 @@ impl NativeJacobian<'_> {
         let [ub, pb, sb, db] = &mut *self.bufs.borrow_mut();
         // Every input element is its value, then its one-hot tangents: state `j` along
         // direction `j`, the clock's seeds (`T`, `TAFD`, `TAD`) along direction `n`. The
-        // tangent lanes never change and the native code only reads its inputs, so buffers
-        // already laid out for these lengths need only their values rewritten.
+        // tangent lanes never change and the native code only reads its inputs, so input
+        // buffers already laid out for these lengths need only their values rewritten. The
+        // output buffer is zeroed every call: the native code may leave lanes it does not
+        // write as they were, and nothing here should read a previous call's.
         let laid_out = ub.len() == u.len() * l
             && pb.len() == params.len() * l
             && sb.len() == 4 * l
@@ -32345,6 +32358,7 @@ impl NativeJacobian<'_> {
         for (i, x) in self.binding.f64_seeds(params, t).into_iter().enumerate() {
             sb[i * l] = x;
         }
+        db.fill(0.0);
         if !self.tan.run(ub, pb, sb, db) {
             return false;
         }

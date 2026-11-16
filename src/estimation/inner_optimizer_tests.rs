@@ -8166,6 +8166,69 @@ fn a_dose_only_subject_is_not_counted_as_finite_differences() {
     ));
 }
 
+/// A whole dense-BFGS solve at `n = BFGS_SMALL_DIM` (in-place update) and at `n = BFGS_SMALL_DIM
+/// + 1` (the operand-matrix buffers) is bit-identical to the same solve forced down the
+/// operand-matrix path (the pre-change implementation): every objective value the line search
+/// sees, and the minimiser. Mutation: route `n = BFGS_SMALL_DIM + 1` to the in-place update
+/// (`n > BFGS_SMALL_DIM + 1`) → its `rs[i]` / the update's debug assertion fails; change a
+/// term's order in `bfgs_update_small` → the `n = 5` trace differs.
+#[test]
+fn a_dense_bfgs_solve_matches_the_operand_matrix_update_either_side_of_the_small_width() {
+    let solve = |n: usize, force: bool| {
+        FORCE_BFGS_BUFFERS.with(|f| f.set(force));
+        let trace = std::cell::RefCell::new(Vec::<u64>::new());
+        let f = |x: &[f64]| {
+            let v: f64 = (0..x.len())
+                .map(|i| {
+                    let nxt = x[(i + 1) % x.len()];
+                    (1.0 - x[i]).powi(2) + 5.0 * (nxt - x[i] * x[i]).powi(2) + 0.1 * x[i] * nxt
+                })
+                .sum();
+            trace.borrow_mut().push(v.to_bits());
+            v
+        };
+        let grad = |x: &[f64]| {
+            let n = x.len();
+            let mut g = vec![0.0; n];
+            for i in 0..n {
+                let j = (i + 1) % n;
+                let r = x[j] - x[i] * x[i];
+                g[i] += -2.0 * (1.0 - x[i]) - 20.0 * r * x[i] + 0.1 * x[j];
+                g[j] += 10.0 * r + 0.1 * x[i];
+            }
+            g
+        };
+        let mut x: Vec<f64> = (0..n).map(|i| -0.8 + 0.37 * i as f64).collect();
+        let ok = dense_bfgs_core(
+            &f,
+            &grad,
+            &mut x,
+            n,
+            200,
+            1e-10,
+            None,
+            None,
+            None,
+            &|_| false,
+            false,
+        );
+        FORCE_BFGS_BUFFERS.with(|f| f.set(false));
+        (
+            ok,
+            x.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            trace.into_inner(),
+        )
+    };
+    for n in [BFGS_SMALL_DIM, BFGS_SMALL_DIM + 1] {
+        let (ok, x, trace) = solve(n, false);
+        let (ok_ref, x_ref, trace_ref) = solve(n, true);
+        assert!(trace.len() > 10, "n={n}: fixture runs several BFGS updates");
+        assert_eq!(ok, ok_ref, "n={n}");
+        assert_eq!(trace, trace_ref, "n={n}: the objective sequence");
+        assert_eq!(x, x_ref, "n={n}: the minimiser");
+    }
+}
+
 /// The in-place dense BFGS update ([`bfgs_update_small`]) and direction ([`neg_gemv`]) are the
 /// operations `nalgebra`'s `mul_to` / `gemv` ran before, bit for bit: every width up to
 /// [`BFGS_SMALL_DIM`] (the update) and beyond it (the direction), on values with mixed signs and

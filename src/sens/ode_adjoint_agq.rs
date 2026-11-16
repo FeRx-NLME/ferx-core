@@ -183,7 +183,8 @@ pub(super) fn agq_planned(
                     }
                 }
             }
-            let lh = factor_anchor(&mut h_a, &pr.omega.inv)?;
+            let nh = h_a.len();
+            let lh = factor_anchor(&mut h_a, pr.omega_inv(nh))?;
             let half_logdet = c(0.5) * crate::sens::focei_kernel::chol_logdet(&lh);
             let ng_q = ngr.as_ref().map_or(c(0.0), |n| n.q);
             let mut bs: Vec<T> = Vec::with_capacity(n_nodes_b * n);

@@ -177,8 +177,8 @@ pub(crate) fn max_abs_re_eigenvalue<T: PkNum>(
 
 /// One-sided finite-difference Jacobian at `(t, u)`, column-major (`jac[i + j * n]` is
 /// `∂f_i/∂u_j`, the layout `DMatrix` expects). `None` on an empty system or a non-finite
-/// entry — a caller that cannot form the Jacobian must not guess.
-/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+/// entry — a caller that cannot form the Jacobian must not guess. Test-only convenience over
+/// `fd_jacobian_into`.
 #[cfg(test)]
 fn fd_jacobian<T: PkNum>(
     rhs: &crate::ode::solver::RhsG<'_, T>,
@@ -194,10 +194,13 @@ fn fd_jacobian<T: PkNum>(
 /// The largest state count whose probe scratch lives on the stack.
 const PROBE_STACK_N: usize = 8;
 
-/// [`fd_jacobian`] into `jac` (`n * n` long); `false` where it returns `None`. The probe runs
-/// once per segment, so its three state-sized work vectors sit on the stack up to
-/// [`PROBE_STACK_N`] states.
-/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+/// The one-sided finite-difference Jacobian (see the test-only `fd_jacobian`) into `jac`
+/// (`n * n` long); `false` where that returns `None`. The probe runs once per segment, so its
+/// three state-sized work vectors sit on the stack up to [`PROBE_STACK_N`] states.
+///
+/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches
+/// it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time)
+/// and returns before this code, except after the recording has already failed.
 fn fd_jacobian_into<T: PkNum>(
     rhs: &crate::ode::solver::RhsG<'_, T>,
     u: &[T],
@@ -231,7 +234,9 @@ fn fd_jacobian_into<T: PkNum>(
 
 /// [`fd_jacobian_into`]'s arithmetic over the caller's `f0`, `u_pert` and `f1` (`n` long, any
 /// contents).
-/// Non-recording: the adaptive driver decides on the value lane. A recording type never reaches it: `T::ode_segment` records the segment as a loop call (the f64 driver runs at run time) and returns before this code, except after the recording has already failed.
+///
+/// Non-recording: reached only through [`fd_jacobian_into`], which the adaptive driver calls on
+/// the value lane (see there).
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn fd_jacobian_core<T: PkNum>(

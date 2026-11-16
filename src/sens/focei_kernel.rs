@@ -164,6 +164,32 @@ impl ParT<f64> {
     }
 }
 
+impl<T> ParT<T> {
+    /// `Ω⁻¹` for `n` random effects. A [`ParT`] from [`Self::map_rows`] / [`Self::wrap_rows`]
+    /// does not carry it, and reading one there would index an empty matrix (or, where the
+    /// width came from it, silently loop over nothing): fail with the cause instead.
+    #[inline]
+    pub(crate) fn omega_inv(&self, n: usize) -> &Vec<Vec<T>> {
+        debug_assert!(
+            self.omega.inv.len() >= n,
+            "Ω⁻¹ has {} rows, {n} needed: a ParT from map_rows/wrap_rows carries no Ω",
+            self.omega.inv.len()
+        );
+        &self.omega.inv
+    }
+
+    /// `L` (`Ω = LLᵀ`) for `n` random effects; see [`Self::omega_inv`].
+    #[inline]
+    pub(crate) fn omega_chol(&self, n: usize) -> &Vec<Vec<T>> {
+        debug_assert!(
+            self.omega.chol.len() >= n,
+            "Ω's factor has {} rows, {n} needed: a ParT from map_rows/wrap_rows carries no Ω",
+            self.omega.chol.len()
+        );
+        &self.omega.chol
+    }
+}
+
 impl<T: Copy> ParT<T> {
     /// The same parameters through `f` (lifting to a dual over `T`, say).
     pub(crate) fn map<U: Copy>(&self, f: impl Fn(T) -> U) -> ParT<U> {
@@ -423,7 +449,7 @@ impl<'a> LikCtx<'a> {
     /// `ηᵀΩ⁻¹η + log|Ω|`.
     fn prior<T: PkNum>(&self, eta: &[T], p: &ParT<T>) -> T {
         let n = eta.len();
-        let oi = &p.omega.inv;
+        let oi = p.omega_inv(n);
         wsum3(
             0.0,
             (0..n)
@@ -763,7 +789,7 @@ fn focei_rows<T: PkNum, const K: usize>(
             }
         }
     }
-    let oi = &p.omega.inv;
+    let oi = p.omega_inv(nn);
     let mut ht: Vec<Vec<T>> = vec![vec![c(0.0); nn]; nn];
     for a in 0..nn {
         for b in 0..=a {
@@ -842,7 +868,7 @@ pub(crate) fn foce_f<T: PkNum>(
     let unit =
         |k: usize| -> Vec<T> { (0..nn).map(|l| c(if l == k { 1.0 } else { 0.0 })).collect() };
     // Per row: prediction, η-sensitivity, linearised mean f₀ and LᵀG (for GΩGᵀ = (LᵀG)ᵀ(LᵀG)).
-    let lch = &p.omega.chol;
+    let lch = p.omega_chol(nn);
     let mut f0: Vec<T> = Vec::with_capacity(n);
     let mut lg: Vec<Vec<T>> = Vec::with_capacity(n);
     for j in 0..n {
@@ -1070,7 +1096,7 @@ fn focei_f_dense<T: PkNum>(
                 .collect()
         })
         .collect();
-    let mut ht: Vec<Vec<T>> = p.omega.inv.clone();
+    let mut ht: Vec<Vec<T>> = p.omega_inv(nn).clone();
     for a in 0..nn {
         for b in 0..nn {
             let mut hrh = c(0.0);
@@ -1294,6 +1320,13 @@ pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
     #[cfg(test)]
     note_inner_hessian_route(ctx.subject, false);
     let n = p.omega.inv.len();
+    // The width is Ω⁻¹'s own, so a `ParT` without Ω (`map_rows`) would give `n = 0` and a
+    // silently empty Hessian: the rows' η-sensitivities say how wide it must be.
+    debug_assert!(
+        g.first().is_none_or(|r| r.len() == n),
+        "Ω⁻¹ has {n} rows, the sensitivities {:?} columns: a ParT from map_rows/wrap_rows carries no Ω",
+        g.first().map(Vec::len)
+    );
     let half = T::from_f64(0.5);
     let pl = p.map_rows(d2_const);
     // A non-FREM row does not read η; the array only fills `row_l`'s signature.
@@ -1464,7 +1497,7 @@ pub(crate) fn inner_grad<T: PkNum>(
             }
         }
     }
-    let grad = assemble_grad(&p.omega.inv, eta, g, &dl, &explicit);
+    let grad = assemble_grad(p.omega_inv(eta.len()), eta, g, &dl, &explicit);
     Some(grad)
 }
 
@@ -1554,6 +1587,39 @@ mod tests {
         let mut bad = a.clone();
         bad[1][1] = 0.0;
         assert!(OmegaT::from_chol_cached(bad).is_none());
+    }
+
+    /// Reading Ω from the row passes' parameters fails with the cause in a debug build, not
+    /// with an index panic or an empty matrix; the full parameters answer at any width up to
+    /// their own. Mutation: drop the `debug_assert!` in `omega_inv` / `omega_chol` → the
+    /// `should_panic` rows fail.
+    #[test]
+    fn omega_readers_name_a_parameter_set_without_omega() {
+        let p = ParT::<f64> {
+            omega: OmegaT::from_chol(vec![vec![0.3, 0.0], vec![0.1, 0.5]]).unwrap(),
+            sigma: vec![],
+            rho: vec![],
+            serial_rho: None,
+            theta: vec![],
+            ruv_mult: None,
+        };
+        assert_eq!(p.omega_inv(2).len(), 2);
+        assert_eq!(p.omega_chol(1).len(), 2);
+        let rows = p.map_rows(|x| x);
+        let msg = |f: &dyn Fn()| {
+            let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("panics");
+            e.downcast_ref::<String>().cloned().unwrap_or_default()
+        };
+        if cfg!(debug_assertions) {
+            assert!(msg(&|| {
+                rows.omega_inv(2);
+            })
+            .contains("carries no Ω"));
+            assert!(msg(&|| {
+                rows.omega_chol(2);
+            })
+            .contains("carries no Ω"));
+        }
     }
 
     /// The row passes' lifted parameters (`map_rows`) carry every field the rows read — σ, ρ,

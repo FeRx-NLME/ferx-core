@@ -2332,6 +2332,7 @@ fn every_native_plan_tier_probes_its_stack() {
 /// must not stay pinned by the table). Mutation: back the table with one slot → the first
 /// assertion fails; skip the stale drop in `put` → the `strong_count` one fails; compare `hk`
 /// loosely in `get` → the collision row serves the wrong subject's variants.
+/// (The stale drop in `get` is `the_hot_table_releases_a_dropped_scopes_plans_on_the_next_get`.)
 #[test]
 fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
     let key = |s: usize| HotKey {
@@ -2351,18 +2352,14 @@ fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
     let mut t = HotTable::default();
     t.put(ka, stamp(7), None, a.clone());
     t.put(kb, stamp(7), None, b.clone());
-    let got = |t: &HotTable, k: &HotKey, g: usize| t.get(k, stamp(g), None);
+    let got = |t: &mut HotTable, k: &HotKey, g: usize| t.get(k, stamp(g), None);
     assert!(
-        Arc::ptr_eq(&got(&t, &ka, 7).expect("a"), &a),
+        Arc::ptr_eq(&got(&mut t, &ka, 7).expect("a"), &a),
         "subject a still held"
     );
     assert!(
-        Arc::ptr_eq(&got(&t, &kb, 7).expect("b"), &b),
+        Arc::ptr_eq(&got(&mut t, &kb, 7).expect("b"), &b),
         "subject b held beside it"
-    );
-    assert!(
-        got(&t, &ka, 8).is_none(),
-        "a newer generation serves nothing"
     );
     // A key that maps to a's slot evicts it, and is served as itself.
     let kc = (1..)
@@ -2371,8 +2368,8 @@ fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
         .unwrap();
     let c: Kernels = Arc::new(Variants::default());
     t.put(kc, stamp(7), None, c.clone());
-    assert!(got(&t, &ka, 7).is_none(), "the collision evicted a");
-    assert!(Arc::ptr_eq(&got(&t, &kc, 7).expect("c"), &c));
+    assert!(got(&mut t, &ka, 7).is_none(), "the collision evicted a");
+    assert!(Arc::ptr_eq(&got(&mut t, &kc, 7).expect("c"), &c));
     // A put under a newer stamp releases what the old one filled.
     assert!(Arc::strong_count(&b) > 1, "fixture: the table holds b");
     t.put(kc, stamp(9), None, c.clone());
@@ -2381,5 +2378,71 @@ fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
         1,
         "the stale entry was dropped, not pinned"
     );
-    assert!(got(&t, &kb, 7).is_none() && got(&t, &kb, 9).is_none());
+    assert!(got(&mut t, &kb, 7).is_none() && got(&mut t, &kb, 9).is_none());
+}
+
+/// A thread that only looks plans up (no put follows) lets go of a dropped scope's plans: a
+/// `get` under a newer stamp releases every entry filled under the old one, for either half of
+/// the stamp. Mutation: drop `release_stale` from `get` → the `strong_count` rows fail.
+#[test]
+fn the_hot_table_releases_a_dropped_scopes_plans_on_the_next_get() {
+    let key = HotKey {
+        model: 0x1000,
+        subject: 0x40_0000,
+        n: 1,
+        n_in: 2,
+        kind: 0,
+        class: 0,
+    };
+    for (what, newer) in [
+        ("generation", HotStamp { prints: 1, gen: 8 }),
+        ("registry", HotStamp { prints: 2, gen: 7 }),
+    ] {
+        let a: Kernels = Arc::new(Variants::default());
+        let mut t = HotTable::default();
+        t.put(key, HotStamp { prints: 1, gen: 7 }, None, a.clone());
+        assert_eq!(Arc::strong_count(&a), 2, "fixture: the table holds a");
+        assert!(t.get(&key, newer, None).is_none(), "{what}: nothing served");
+        assert_eq!(Arc::strong_count(&a), 1, "{what}: released by the get");
+    }
+}
+
+/// A row filled under a layout is served only to a call whose layout has the same structure,
+/// and a row filled with none only to a call with none. Mutation: drop the `(Some, Some)`
+/// comparison (`same = true`) → the different-structure row serves; make the mixed arms `true`
+/// → the none/Some rows serve.
+#[test]
+fn the_hot_table_compares_the_layout_structure() {
+    use crate::stats::stacked_layout::StackedLayout;
+    let subject_with = |occasions: Vec<u32>| crate::types::Subject {
+        obs_times: vec![1.0; occasions.len()],
+        occasions,
+        ..Default::default()
+    };
+    let lay = |occ: Vec<u32>| StackedLayout::new(1, 1, &subject_with(occ));
+    let (l_a, l_a2, l_b) = (lay(vec![1, 1, 2]), lay(vec![1, 1, 2]), lay(vec![1, 2, 2]));
+    let desc = |l: &StackedLayout| Desc::of(|c| l.canon(c));
+    assert_ne!(
+        desc(&l_a).bytes(),
+        desc(&l_b).bytes(),
+        "fixture: layouts differ"
+    );
+    let key = HotKey {
+        model: 0x1000,
+        subject: 0x40_0000,
+        n: 1,
+        n_in: 2,
+        kind: 0,
+        class: 0,
+    };
+    let stamp = HotStamp { prints: 1, gen: 7 };
+    let ks: Kernels = Arc::new(Variants::default());
+    let mut t = HotTable::default();
+    t.put(key, stamp, Some(desc(&l_a)), ks.clone());
+    assert!(t.get(&key, stamp, Some(&l_a2)).is_some(), "same structure");
+    assert!(t.get(&key, stamp, Some(&l_b)).is_none(), "other structure");
+    assert!(t.get(&key, stamp, None).is_none(), "layout vs none");
+    t.put(key, stamp, None, ks);
+    assert!(t.get(&key, stamp, None).is_some(), "none vs none");
+    assert!(t.get(&key, stamp, Some(&l_a)).is_none(), "none vs layout");
 }

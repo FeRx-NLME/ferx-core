@@ -3500,10 +3500,14 @@ mod tests {
     /// reach every arm (zero and subnormal and `NaN`, which the variance guard replaces and
     /// the slope gate zeroes; negative; large). A `PerCmt` spec with the same model at the
     /// one endpoint is the independent reference for the value and the slope, so a fast arm
-    /// that drifts from the general one reddens here. Mutation: drop the `variance_is_guarded`
-    /// return in the `dvar_df` fast arm → the `f = 0` row reads `2·0·σ² = 0` for a
-    /// proportional model but `0` vs the live slope for the others; use `sigma[1]` for
-    /// `prop_sigma` → the combined row differs.
+    /// that drifts from the general one reddens here.
+    ///
+    /// Mutations: drop the `variance_is_guarded` return in the `dvar_df` fast arm → the
+    /// `f = -0.0` row (measured: `Proportional slope at f = -0: -0 vs 0`, the live slope
+    /// `2·f·σ²` keeps the zero's sign where the gated one is `+0.0`) and the rows whose raw
+    /// variance underflows or is `NaN` (`1e-200`, `5e-324`, `NaN`: a live slope against `0.0`)
+    /// fail; the `f = 0.0` row does not, since `2·0·σ² = 0.0` is the gated value too. Use
+    /// `sigma[1]` for `prop_sigma` → the combined row differs.
     #[test]
     fn single_spec_fast_paths_match_the_per_endpoint_general_path() {
         for (em, sigma, idx) in [

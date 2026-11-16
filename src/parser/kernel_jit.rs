@@ -3276,8 +3276,9 @@ impl HotKey {
 }
 
 /// One thread's hot entries, direct-mapped by [`HotKey::slot`], all of them filled under one
-/// [`HotStamp`]: a [`put`](Self::put) under another stamp first drops the stale ones, so the
-/// table never pins plans a dropped scope released.
+/// [`HotStamp`]: the first [`get`](Self::get) or [`put`](Self::put) under another stamp drops
+/// the stale ones, so a thread that is still looking plans up never pins plans a dropped scope
+/// released. (A thread that never asks again keeps what it holds: nothing runs on it to let go.)
 #[derive(Default)]
 struct HotTable {
     slots: Vec<Option<HotEntry>>,
@@ -3287,7 +3288,35 @@ struct HotTable {
 }
 
 impl HotTable {
+    /// Drop every entry when the table was filled under a stamp other than `now`.
+    fn release_stale(&mut self, now: HotStamp) {
+        if self
+            .stamp
+            .is_some_and(|s| s.prints != now.prints || s.gen != now.gen)
+        {
+            for i in self.filled.drain(..) {
+                self.slots[usize::from(i)] = None;
+            }
+            self.stamp = None;
+        }
+    }
+
+    /// The entry for `k` under `now`, releasing the stale ones on a miss: under another stamp
+    /// every lookup misses, so the hit path pays nothing for the release.
     fn get(
+        &mut self,
+        k: &HotKey,
+        now: HotStamp,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    ) -> Option<Kernels> {
+        let hit = self.lookup(k, now, lay);
+        if hit.is_none() {
+            self.release_stale(now);
+        }
+        hit
+    }
+
+    fn lookup(
         &self,
         k: &HotKey,
         now: HotStamp,
@@ -3320,14 +3349,7 @@ impl HotTable {
         if self.slots.is_empty() {
             self.slots.resize_with(HOT_SLOTS, || None);
         }
-        if self
-            .stamp
-            .is_some_and(|s| s.prints != stamp.prints || s.gen != stamp.gen)
-        {
-            for i in self.filled.drain(..) {
-                self.slots[usize::from(i)] = None;
-            }
-        }
+        self.release_stale(stamp);
         self.stamp = Some(stamp);
         let i = k.slot();
         if self.slots[i].is_none() {
@@ -3378,7 +3400,7 @@ pub(crate) fn hot_get(
     if !hot_allowed_in_test() {
         return None;
     }
-    HOT.with(|h| h.borrow().get(k, now, lay))
+    HOT.with(|h| h.borrow_mut().get(k, now, lay))
 }
 
 /// Keep `ks`, found for `k` under `stamp`, for [`hot_get`] — only for a model and a subject

@@ -539,6 +539,74 @@ fn the_gershgorin_fast_path_agrees_with_the_exact_eigensolve() {
     }
 }
 
+/// The probe's pre-change algorithm, written out: fresh vectors, one-sided FD, column-major.
+fn reference_fd_jacobian(
+    rhs: &dyn Fn(&[f64], &[f64], f64, &mut [f64]),
+    u: &[f64],
+    t: f64,
+) -> Vec<f64> {
+    let n = u.len();
+    let mut f0 = vec![0.0; n];
+    rhs(u, &[], t, &mut f0);
+    let mut jac = vec![0.0; n * n];
+    for j in 0..n {
+        let h = JAC_FD_REL_STEP * u[j].abs().max(1.0);
+        let mut up = u.to_vec();
+        up[j] = u[j] + h;
+        let mut f1 = vec![0.0; n];
+        rhs(&up, &[], t, &mut f1);
+        for i in 0..n {
+            jac[i + j * n] = (f1[i] - f0[i]) / h;
+        }
+    }
+    jac
+}
+
+/// A coupled, non-symmetric right-hand side: every component reads its neighbours with
+/// different weights, so a stale `u_pert` entry, a transposed write or a missed restore each
+/// change the Jacobian.
+fn coupled_rhs(u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]) {
+    let n = u.len();
+    for i in 0..n {
+        let prev = u[(i + n - 1) % n];
+        let next = u[(i + 1) % n];
+        du[i] = 0.7 * (i as f64 + 1.0) * prev - 1.3 * u[i] + 0.1 * next * next * (i as f64 + 2.0);
+    }
+}
+
+/// `fd_jacobian_into` equals the pre-change algorithm bit for bit on both sides of the
+/// stack/heap scratch boundary. Mutations it kills: dropping `u_pert.copy_from_slice(u)`,
+/// writing `jac[j + i * n]`, skipping the `u_pert[j] = u[j]` restore.
+#[test]
+fn the_probe_jacobian_equals_the_reference_loop_bit_for_bit() {
+    for n in [
+        2,
+        PROBE_STACK_N - 1,
+        PROBE_STACK_N,
+        PROBE_STACK_N + 1,
+        2 * PROBE_STACK_N,
+    ] {
+        let u: Vec<f64> = (0..n).map(|i| 0.3 + 0.9 * i as f64).collect();
+        let want = reference_fd_jacobian(&coupled_rhs, &u, 0.0);
+        let mut got = vec![f64::NAN; n * n];
+        assert!(
+            fd_jacobian_into(&coupled_rhs, &u, &[], 0.0, &mut got),
+            "n={n}"
+        );
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        assert_eq!(
+            bits(&got),
+            bits(&want),
+            "n={n}: scratch placement changed the Jacobian"
+        );
+        assert_eq!(
+            bits(&fd_jacobian(&coupled_rhs, &u, &[], 0.0).unwrap()),
+            bits(&want),
+            "n={n}"
+        );
+    }
+}
+
 /// The probe keeps its work vectors on the stack up to `PROBE_STACK_N` states and on the heap
 /// above: both sides of that boundary read the same Jacobian and give the exact eigensolve's
 /// verdict, for a Jacobian that is stiff (`-500` on the diagonal, Gershgorin reaches the

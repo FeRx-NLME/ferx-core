@@ -1149,8 +1149,10 @@ impl<'a> CovPlan<'a> {
     pub(super) fn run(&self, dirs: &[Dir]) -> Option<CovRun> {
         let (model, subject, sc) = (self.sc.model, self.subject, self.sc);
         // One direction (a covariance-Hessian pass) runs the single-tangent layout: its forward
-        // and reverse carry 2 lanes instead of `1 + K`. Only these tangent counts are used.
-        debug_assert!(dirs.len() <= K);
+        // and reverse carry 2 lanes instead of `1 + K`. Production runs only 0, 1 or `K`
+        // directions; `2..K` (a test's `PASS_WIDTH_CAP`) runs the `K`-tangent layout with the
+        // unused tangents zero (`dirs.get(a)` is `None` there), which is exact, only wider.
+        assert!(dirs.len() <= K, "{} directions > K = {K}", dirs.len());
         let kt = match dirs.len() {
             0 => 0,
             1 => 1,
@@ -1480,7 +1482,8 @@ impl<'a> CovPlan<'a> {
                         }
                     }
                 }
-                let lh = factor_anchor(&mut h_a, &p.omega.inv)?;
+                let nh = h_a.len();
+                let lh = factor_anchor(&mut h_a, p.omega_inv(nh))?;
                 let grid = agq_grid(n_agq, sc.width);
                 if nodes {
                     // b = η + √2·L⁻ᵀz per node.

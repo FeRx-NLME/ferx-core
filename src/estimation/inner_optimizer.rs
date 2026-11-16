@@ -7028,6 +7028,23 @@ impl BfgsUpdateBuffers {
 /// order the update below does not reproduce.
 const BFGS_SMALL_DIM: usize = 5;
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: every width updates through the operand matrices (the form
+    /// [`bfgs_update_small`] replaced), so a test can run one solve down both paths.
+    static FORCE_BFGS_BUFFERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a solve of `n` random effects updates through the operand matrices (`true`) or in
+/// place ([`bfgs_update_small`]).
+fn bfgs_uses_buffers(n: usize) -> bool {
+    #[cfg(test)]
+    if FORCE_BFGS_BUFFERS.with(|f| f.get()) {
+        return true;
+    }
+    n > BFGS_SMALL_DIM
+}
+
 /// `d = −H·g` as `d_vec.gemv(-1.0, &h, &g_vec, 0.0)` computes it (`axcpy`: the first column
 /// `(α·h[i,0])·g₀`, each later one `(α·h[i,j])·gⱼ + dᵢ`), without the vector copies.
 fn neg_gemv(h: &DMatrix<f64>, g: &[f64], d: &mut [f64]) {
@@ -7151,7 +7168,7 @@ fn dense_bfgs_run(
     // The update's operand matrices, for the widths whose products `nalgebra` hands to
     // `matrixmultiply` (see [`bfgs_update_small`]); a narrower solve updates in place.
     let mut upd =
-        (n > BFGS_SMALL_DIM).then(|| (DMatrix::identity(n, n), BfgsUpdateBuffers::new(n)));
+        bfgs_uses_buffers(n).then(|| (DMatrix::identity(n, n), BfgsUpdateBuffers::new(n)));
     let mut line_search_point = vec![0.0; n];
     // Track the objective at the current iterate so the line search never has to
     // recompute `obj(x)` (one prediction walk per inner step on the hot path).

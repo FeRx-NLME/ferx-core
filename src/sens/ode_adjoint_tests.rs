@@ -5909,17 +5909,18 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
     let full = run(None);
     for cap in [3, 4] {
         let narrow = run(Some(cap));
-        let scale = full.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-        let mut worst = 0.0f64;
-        for (a, b) in narrow.iter().zip(full.iter()) {
+        assert_eq!(narrow.len(), full.len(), "width {cap}: shape");
+        for (i, (a, b)) in narrow.iter().zip(full.iter()).enumerate() {
             assert!(
                 a.is_finite() && b.is_finite(),
-                "width {cap}: non-finite entry"
+                "width {cap}: non-finite entry {i}"
             );
-            worst = worst.max((a - b).abs() / scale);
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "width {cap} vs 1: entry {i} differs ({a:e} vs {b:e})"
+            );
         }
-        eprintln!("cov Hessian at width {cap} vs 1: {worst:.2e}");
-        assert!(worst < 1e-12, "width {cap} vs 1: {worst:.2e}");
     }
 }
 

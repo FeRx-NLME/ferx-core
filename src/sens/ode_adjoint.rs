@@ -5410,7 +5410,8 @@ fn run_agq(
     // search left loosely converged, a flat direction): the jittered anchor, then the prior
     // precision `Ω⁻¹`. Each is part of the objective, so the gradient follows it rather
     // than declining.
-    let lh = factor_anchor(&mut h_a, &pv.omega.inv)?;
+    let nh = h_a.len();
+    let lh = factor_anchor(&mut h_a, pv.omega_inv(nh))?;
     // The tensor grid: per node its `z`, `c_j = Σ log w + ‖z‖²`, and `b_j` (f64).
     let one_point = n_agq == 1;
     let grid: Vec<(Vec<f64>, f64, Vec<f64>)> = if one_point {
