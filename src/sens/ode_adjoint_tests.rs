@@ -5319,6 +5319,26 @@ fn closed_form_per_compartment_scale_matches_reconverged_fd() {
 
 // ---- covariance Hessian (`hessian::subject_adjoint_cov_hessian`) -------------------------
 
+/// The worst `|got − want|` relative to `want`'s largest entry. Every entry is asserted finite
+/// first: a `max` fold drops a `NaN`, so a diverged entry would otherwise pass green.
+pub(super) fn rel_gap(got: &[f64], want: &[f64]) -> f64 {
+    assert_eq!(got.len(), want.len());
+    let mut scale = 0.0f64;
+    for &v in want {
+        assert!(v.is_finite(), "non-finite reference entry {v}");
+        scale = scale.max(v.abs());
+    }
+    let mut worst = 0.0f64;
+    for (&a, &b) in got.iter().zip(want) {
+        assert!(
+            a.is_finite() && b.is_finite() && scale.is_finite(),
+            "non-finite entry {a} vs {b}"
+        );
+        worst = worst.max((a - b).abs() / scale.max(1e-300));
+    }
+    worst
+}
+
 /// The adjoint profile Hessian against Richardson differences of the exact gradient with
 /// the EBE re-solved at every point — the profile objective's own definition of `d²F̂/dx²`,
 /// independent of `Uᵀ∇²ΨU`. Returns the worst relative gap `|H − ref| / (1 + |ref|)` (and
@@ -5414,16 +5434,8 @@ pub(super) fn hessian_gaps_for(
     let h_axes = hessian(false, false, true);
     let h_lanes = hessian(false, true, true);
     let h_rof = hessian(true, true, true);
-    let scale = h_rof.iter().fold(0.0f64, |m, v| m.max(v.abs()));
     let gap = |a: &DMatrix<f64>, what: &str| {
-        let mut worst = 0.0f64;
-        for (u, v) in a.iter().zip(h_rof.iter()) {
-            assert!(
-                u.is_finite() && v.is_finite(),
-                "non-finite entry: {what} {u}, per direction {v}"
-            );
-            worst = worst.max((u - v).abs() / scale);
-        }
+        let worst = rel_gap(a.as_slice(), h_rof.as_slice());
         eprintln!("hessian: {what} vs a reverse per direction {worst:.2e}");
         assert!(
             worst < 1e-12,
@@ -11791,122 +11803,6 @@ fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
     assert!(declined.is_empty(), "declined:\n{}", declined.join("\n"));
 }
 
-/// TEMPORARY PROBE (#2980 design, not for the PR): `rank(π_v)` on every bundled example, `π` the
-/// individual parameters with their η-jets (`p`, `p_η`, and under Laplace `p_ηη`), `v = (θ, η)`.
-/// Nested central differences on the model's own parameter program; rank at a 1e-6 relative
-/// singular-value threshold. Run: `cargo test --lib probe_cut_rank -- --ignored --nocapture`.
-#[test]
-#[ignore = "design probe"]
-fn probe_cut_rank() {
-    let mut rows = Vec::new();
-    let mut paths: Vec<_> = std::fs::read_dir("examples")
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "ferx"))
-        .collect();
-    paths.sort();
-    for path in paths {
-        let name = path.file_stem().unwrap().to_string_lossy().to_string();
-        let Ok(model) = crate::parser::model_parser::parse_model_file(&path) else {
-            continue;
-        };
-        let Some(prog) = model.indiv_param_partials.indiv_param_program.as_ref() else {
-            continue;
-        };
-        let params = moved_params(&model);
-        let n_packed = pack_params(&params).len();
-        let (nt, ne) = (params.theta.len(), model.n_eta);
-        if ne == 0 {
-            continue;
-        }
-        let cov: std::collections::HashMap<String, f64> = model
-            .referenced_covariates
-            .iter()
-            .enumerate()
-            .map(|(i, c)| (c.clone(), 1.3 + 0.37 * i as f64))
-            .collect();
-        let p_of =
-            |th: &[f64], et: &[f64]| -> Vec<f64> { prog.eval_params_g::<f64>(th, et, &cov, &[]) };
-        let eta0: Vec<f64> = (0..ne)
-            .map(|k| 0.11 * (k as f64 + 1.0) * if k % 2 == 0 { 1.0 } else { -1.0 })
-            .collect();
-        let m = p_of(&params.theta, &eta0).len();
-        if m == 0 {
-            continue;
-        }
-        let h1 = 1e-4;
-        // π(θ, η): p, p_η (central), p_ηη (second differences).
-        let pi = |th: &[f64], et: &[f64], second: bool| -> Vec<f64> {
-            let mut out = p_of(th, et);
-            for k in 0..ne {
-                let (mut ep, mut em) = (et.to_vec(), et.to_vec());
-                ep[k] += h1;
-                em[k] -= h1;
-                let (a, b) = (p_of(th, &ep), p_of(th, &em));
-                out.extend(a.iter().zip(&b).map(|(x, y)| (x - y) / (2.0 * h1)));
-            }
-            if second {
-                for k in 0..ne {
-                    for l in 0..=k {
-                        let at = |dk: f64, dl: f64| {
-                            let mut e = et.to_vec();
-                            e[k] += dk;
-                            e[l] += dl;
-                            p_of(th, &e)
-                        };
-                        let (pp, pm, mp, mm) = (at(h1, h1), at(h1, -h1), at(-h1, h1), at(-h1, -h1));
-                        out.extend(
-                            (0..m).map(|i| (pp[i] - pm[i] - mp[i] + mm[i]) / (4.0 * h1 * h1)),
-                        );
-                    }
-                }
-            }
-            out
-        };
-        let rank = |second: bool| -> usize {
-            let base = pi(&params.theta, &eta0, second);
-            let h2 = 1e-3;
-            let mut cols = Vec::new();
-            for j in 0..nt + ne {
-                let (mut tp, mut tm, mut ep, mut em) = (
-                    params.theta.clone(),
-                    params.theta.clone(),
-                    eta0.clone(),
-                    eta0.clone(),
-                );
-                if j < nt {
-                    let s = h2 * (1.0 + tp[j].abs());
-                    tp[j] += s;
-                    tm[j] -= s;
-                } else {
-                    ep[j - nt] += h2;
-                    em[j - nt] -= h2;
-                }
-                let (a, b) = (pi(&tp, &ep, second), pi(&tm, &em, second));
-                cols.push(a.iter().zip(&b).map(|(x, y)| x - y).collect::<Vec<f64>>());
-            }
-            let mut mat = DMatrix::<f64>::zeros(base.len(), cols.len());
-            for (j, c) in cols.iter().enumerate() {
-                for (i, v) in c.iter().enumerate() {
-                    mat[(i, j)] = if v.is_finite() { *v } else { 0.0 };
-                }
-            }
-            let sv = mat.singular_values();
-            let top = sv.iter().cloned().fold(0.0, f64::max);
-            sv.iter().filter(|&&s| s > 1e-6 * top).count()
-        };
-        let row = format!(
-            "{name:40} n={n_packed:3} nθ+nη={:3} m={m:2} nη={ne:2} | r(FOCE/I)={:3} r(Laplace)={:3}",
-            nt + ne,
-            rank(false),
-            rank(true)
-        );
-        eprintln!("{row}");
-        rows.push(row);
-    }
-    assert!(!rows.is_empty());
-}
-
 /// What the covariance Hessian's plans cost (#2980, #2982), pinned beside what they compute: on
 /// a log-normal one-compartment model (`n = 7` packed axes: three θ, three Ω, σ; `N = 3`) every
 /// plan runs on its η lanes alone — Ω and σ reach a plan only through η, and the three θ fold
@@ -11973,16 +11869,8 @@ fn the_plans_run_on_the_eta_lanes_of_a_mu_referenced_model() {
         runs.iter().all(|&(w, n)| (w, n) == (7, 7)),
         "one lane per direction: {runs:?}"
     );
-    let scale = h_global.iter().fold(0.0f64, |m, v| m.max(v.abs()));
     for (what, h) in [("folded", &h_fold), ("axes", &h_axes)] {
-        let worst = h
-            .iter()
-            .zip(h_global.iter())
-            .map(|(a, b)| (a - b).abs() / scale)
-            .fold(0.0f64, |m, v| {
-                assert!(v.is_finite(), "{what}: non-finite entry");
-                m.max(v)
-            });
+        let worst = rel_gap(h.as_slice(), h_global.as_slice());
         assert!(
             worst < 1e-12,
             "{what} vs one lane per direction: {worst:.2e}"
@@ -12066,15 +11954,7 @@ fn the_mu_folded_gradient_equals_the_plans_reverse() {
                 slow_hits, 0,
                 "{name} {objective:?}: the switch did not hold"
             );
-            let scale = slow.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-            let mut worst = 0.0f64;
-            for (a, b) in fast.iter().zip(&slow) {
-                assert!(
-                    a.is_finite() && b.is_finite(),
-                    "{name} {objective:?}: {a} vs {b}"
-                );
-                worst = worst.max((a - b).abs() / scale);
-            }
+            let worst = rel_gap(&fast, &slow);
             eprintln!("{name} {objective:?}: mu-folded gradient vs the plan's reverse {worst:.2e}");
             assert!(
                 worst < 1e-12,
@@ -12157,12 +12037,7 @@ fn a_fold_the_program_does_not_reproduce_is_declined() {
         "the fold should be declined (3 η + 3 θ lanes): {runs:?}"
     );
     let (h_global, _) = run(true);
-    let scale = h_global.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-    let worst = h
-        .iter()
-        .zip(h_global.iter())
-        .map(|(a, b)| (a - b).abs() / scale)
-        .fold(0.0f64, f64::max);
+    let worst = rel_gap(h.as_slice(), h_global.as_slice());
     assert!(
         worst < 1e-12,
         "declined fold vs one lane per direction: {worst:.2e}"

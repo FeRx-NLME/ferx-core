@@ -2398,6 +2398,7 @@ fn every_call_kind_sweeps_forward_over_reverse_as_a_reverse_per_direction() {
                             rf[a * 2 * l + k * l + lb + x * K + a],
                             &what("value"),
                         );
+                        assert!(want.is_finite(), "{name}: non-finite second derivative");
                         seen = seen.max(want.abs());
                     }
                 }
