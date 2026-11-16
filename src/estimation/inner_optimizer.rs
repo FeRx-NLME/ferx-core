@@ -434,6 +434,11 @@ fn iov_fd_fallback_warning(
         if refused_skipped && crate::stats::likelihood::iov_refuses_frem(model, subject) {
             continue;
         }
+        // A subject with no observations has a prior-only inner problem and no data gradient of
+        // either kind (`subject_inner_runs_fd`'s rule); the route is `None` for its empty list.
+        if subject.obs_times.is_empty() && subject.obs_records.is_empty() {
+            continue;
+        }
         if iov_inner_subject_route(model, subject, theta).is_none() {
             n_fd += 1;
             *reasons.entry(iov_fd_reason(model, subject)).or_insert(0) += 1;
