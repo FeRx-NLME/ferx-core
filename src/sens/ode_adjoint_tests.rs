@@ -5366,6 +5366,11 @@ pub(super) fn hessian_gaps_for(
             ) else {
                 break;
             };
+            // A nested-levels subject's exact inner derivatives are over its own resolved
+            // cells, not the full stacked layout `ebe_for` returns: no polish there.
+            if g.len() != e.len() {
+                break;
+            }
             match h.cholesky() {
                 Some(c) => e -= c.solve(&nalgebra::DVector::from_vec(g)),
                 None => break,

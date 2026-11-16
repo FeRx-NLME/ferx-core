@@ -17080,11 +17080,14 @@ fn a_round_does_not_take_a_stop_from_its_restart() {
     ignore = "slow: two fits to convergence; opt in with --features slow-tests"
 )]
 fn a_cold_mode_leg_below_the_verified_incumbent_is_kept() {
+    // A start where the pass has legs to run: since polished modes are adopted into the EBE
+    // store (#2786), the warm fit can already sit on the cold modes' optimum, leaving the pass
+    // nothing to do; the test is about a pass that does run.
     let ((off, off_legs), (on, on_legs)) = cold_mode_pair(
         "cold_wins.csv",
         BOTH_PASSES,
         &[LegStart::NewtonStep],
-        |_, _| true,
+        |off, on| on.len() > off.len(),
     );
     eprintln!(
         "off {} ({} legs), on {} ({} legs)",
