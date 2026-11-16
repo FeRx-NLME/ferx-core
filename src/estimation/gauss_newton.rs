@@ -100,6 +100,50 @@ pub(crate) fn gn_small_change_converged(rel_change: f64, iter: usize, radius: f6
     rel_change < 1e-6 && iter > 3 && radius >= GN_COLLAPSED_RADIUS
 }
 
+/// Whether a small OFV change at a collapsed trust radius (#2738) is convergence (#2974): the
+/// BHHH Newton decrement at the point, `sᵀS⁻¹s` over its per-subject rows in OFV units
+/// (`outer_optimizer::bhhh_newton_decrement`), is at most the outer optimizer's
+/// `LATCH_MAX_PREDICTED_GAIN`. A stall far from the optimum (#2738's warfarin_bloq stop, +10.6
+/// OFV with `|g|` 34.7) predicts a gain far above it; `None` (no free coordinate, a non-finite
+/// row) is not convergence.
+pub(crate) fn gn_collapsed_stop_converged(decrement: Option<f64>) -> bool {
+    decrement.is_some_and(|d| d <= crate::estimation::outer_optimizer::LATCH_MAX_PREDICTED_GAIN)
+}
+
+/// The BHHH Newton decrement over GN's rows at `x`, with the covariate-NN and prior penalties
+/// the GN system adds (their gradient and curvature, in OFV units), as the outer optimizer
+/// forms it.
+fn gn_rows_decrement(
+    rows: &[Vec<f64>],
+    nn_reg: &crate::estimation::nn_reg::NnRegularizer,
+    priors: &crate::estimation::priors::PriorSet,
+    x: &[f64],
+    init_params: &ModelParameters,
+    bounds: &PackedBounds,
+    fixed: &[bool],
+) -> Option<f64> {
+    let n = x.len();
+    let mut penalty_grad = vec![0.0; n];
+    let mut penalty_hess = DMatrix::zeros(n, n);
+    if nn_reg.is_active() {
+        let theta = unpack_params(x, init_params).theta;
+        nn_reg.add_packed_gradient(&theta, &mut penalty_grad);
+        nn_reg.add_packed_hessian(&theta, &mut |i, j, v| penalty_hess[(i, j)] += v);
+    }
+    if priors.is_active() {
+        priors.add_gradient(x, &mut penalty_grad);
+        priors.add_hessian(&mut |i, j, v| penalty_hess[(i, j)] += v);
+    }
+    crate::estimation::outer_optimizer::bhhh_newton_decrement(
+        rows,
+        &penalty_grad,
+        &penalty_hess,
+        x,
+        bounds,
+        fixed,
+    )
+}
+
 /// Whether a pure Gauss–Newton loop spent its iteration budget (#2799): it ran (`maxiter >
 /// 0`) and no stop rule, collapse or cancel broke out of it before the range ended.
 pub(crate) fn gn_loop_budget_spent(maxiter: usize, exited_early: bool) -> bool {
@@ -225,6 +269,10 @@ pub fn run_foce_gn(
     // the range spent its budget. `maxiter = 0` runs no iteration and spends nothing (an
     // evaluation).
     let mut exited_early = false;
+    // The last accepted step changed the OFV by less than `1e-6` relative at a collapsed
+    // radius (#2738): convergence is then decided at the next point from the BHHH Newton
+    // decrement over that point's rows (`gn_collapsed_stop_converged`).
+    let mut small_change_at_collapse = false;
     for iter in 1..=maxiter {
         if crate::cancel::is_cancelled(&options.cancel) {
             if verbose {
@@ -333,6 +381,35 @@ pub fn run_foce_gn(
                 }
             }
             unclamped_stalls = 0;
+        }
+        // A small change at a collapsed radius (#2738) is convergence when the quadratic model
+        // over this point's rows has less than `LATCH_MAX_PREDICTED_GAIN` OFV left to gain
+        // (#2974): with exact rows the ratio test turns into noise there (each predicted
+        // decrease falls below the objective's re-solve noise), so the radius keeps
+        // collapsing at a point that is already the optimum.
+        if small_change_at_collapse {
+            let decrement = gn_rows_decrement(
+                &subj_rows,
+                &nn_reg,
+                &priors,
+                &x,
+                init_params,
+                &bounds,
+                &fixed_mask,
+            );
+            if gn_collapsed_stop_converged(decrement) {
+                converged = true;
+                if verbose {
+                    eprintln!(
+                        "  GN iter {:>3}: converged at a collapsed radius, BHHH Newton \
+                         decrement {:.2e}",
+                        iter,
+                        decrement.unwrap_or(f64::NAN)
+                    );
+                }
+                exited_early = true;
+                break;
+            }
         }
         rows_at_x = Some(subj_rows);
 
@@ -599,7 +676,8 @@ pub fn run_foce_gn(
             exited_early = true;
             break;
         }
-        if verbose && rel_change < 1e-6 && iter > 3 {
+        small_change_at_collapse = rel_change < 1e-6 && iter > 3;
+        if verbose && small_change_at_collapse {
             eprintln!(
                 "  GN iter {:>3}: small OFV change at a collapsed trust radius \
                  ({:.2e}), not taken as convergence",
@@ -2871,6 +2949,22 @@ mod tests {
         assert!(!gn_small_change_converged(2e-6, 31, 0.5));
         assert!(!gn_small_change_converged(5.02e-7, 3, 0.5));
         assert!(gn_small_change_converged(5.02e-7, 4, 0.5));
+    }
+
+    /// A small change at a collapsed radius (#2738) is convergence exactly when the point's
+    /// BHHH Newton decrement is at most `LATCH_MAX_PREDICTED_GAIN` (#2974). Mutations: `<=` ->
+    /// `<` -> the threshold row fails; accept `None` -> the `None` row fails; drop the gate
+    /// (always converged) -> the far-stall row fails.
+    #[test]
+    fn a_collapsed_stop_is_convergence_only_with_nothing_left_to_gain() {
+        use crate::estimation::outer_optimizer::LATCH_MAX_PREDICTED_GAIN as MAX;
+        assert!(gn_collapsed_stop_converged(Some(1e-9)));
+        assert!(gn_collapsed_stop_converged(Some(MAX)));
+        assert!(!gn_collapsed_stop_converged(Some(MAX * (1.0 + 1e-12))));
+        // #2738's warfarin_bloq stall: +10.6 OFV from the optimum, |g| 34.7.
+        assert!(!gn_collapsed_stop_converged(Some(10.6)));
+        assert!(!gn_collapsed_stop_converged(None));
+        assert!(!gn_collapsed_stop_converged(Some(f64::NAN)));
     }
 
     /// #1049: a stop that is not a spent budget carries its own reason and not

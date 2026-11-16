@@ -4935,7 +4935,7 @@ fn per_subject_outer_gradients_checked(
 /// `1e-10·λ_max`, so a direction no subject's gradient spans contributes nothing rather
 /// than dividing by a rounding error. `None` when nothing is free or a component is not
 /// finite.
-fn bhhh_newton_decrement(
+pub(crate) fn bhhh_newton_decrement(
     per_subject: &[Vec<f64>],
     penalty_grad: &[f64],
     penalty_hess: &DMatrix<f64>,
@@ -5015,7 +5015,7 @@ fn bhhh_newton_step(
 /// at its eval-60 latch, and its optimum 1.8e-9. `0.1` sits ~400× above the first and
 /// ~150× below the second, and a fit predicted to gain less than a tenth of an OFV unit
 /// has nothing left in it a user could act on.
-const LATCH_MAX_PREDICTED_GAIN: f64 = 0.1;
+pub(crate) const LATCH_MAX_PREDICTED_GAIN: f64 = 0.1;
 
 /// The `ode_reltol` an integrated model's decrement is formed at (#2001); a fit already
 /// tighter keeps its own. Not a threshold: the decrement is compared against
