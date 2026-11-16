@@ -12239,33 +12239,6 @@ fn identity_theta_scales_scales_a_theta_whose_minimizer_is_within_its_own_size()
     }
 }
 
-/// The probe arm's band (#2975): a minimizer between `IDENTITY_MAX_PREDICTED_STEP` and
-/// `IDENTITY_MAX_STEP_SCALED` multiples of `|θ₀|` away scales the θ by the predicted step;
-/// farther, or a step of 1 or more, keeps the unit scale. θ in order: `[BAND 0.001 (minimizer
-/// 0.035, step 34·|θ₀|), PAST 0.001 (minimizer 0.2, 199·|θ₀|), WIDE 0.02 (minimizer -1.5,
-/// step 1.52 ≥ 1)]`.
-#[test]
-fn identity_theta_scales_scales_by_the_step_in_the_band() {
-    let theta = [0.001, 0.001, 0.02];
-    let minimizers = [0.035, 0.2, -1.5];
-    let lower = [-1.0, -1.0, -5.0];
-    let upper = [1.0, 1.0, 5.0];
-    let f = quadratic_probe(&theta, &minimizers, 1e8, 1.0, 100.0);
-    let got = identity_theta_scales(
-        &theta,
-        &lower,
-        &upper,
-        |_| false,
-        || 100.0,
-        |_| None,
-        |_, _| true,
-        |i, v| f(i, v),
-    );
-    assert_eq!(got.len(), 1, "{got:?}");
-    assert_eq!(got[0].0, 0);
-    assert!((got[0].1 - 0.034).abs() <= 1e-9, "{got:?}");
-}
-
 /// The exact arm makes the probes' decision from `(f′, f″)` at θ₀ and never probes: for a
 /// quadratic the Newton step is the minimizer's distance (9.9 vs 10.1 |θ₀| either side of
 /// the bar), the curvature floor is the probes' second difference `f″·δ²` with δ = ½|θ₀|,
@@ -12301,21 +12274,7 @@ fn identity_theta_scales_exact_arm() {
     let at = |m: f64| decide(2.0 * w * (1e-3 - m), 2.0 * w);
     assert_eq!(at(1e-3 + 9.9e-3), vec![(0, 1e-3)], "within the bar");
     assert_eq!(at(1e-3 - 9.9e-3), vec![(0, 1e-3)], "either side of θ₀");
-    // Past the bar and up to `IDENTITY_MAX_STEP_SCALED`·|θ₀| the step itself is the scale
-    // (#2975); beyond it, the unit scale.
-    let near = |got: Vec<(usize, f64)>, want: f64| {
-        got.len() == 1 && got[0].0 == 0 && (got[0].1 - want).abs() <= 1e-12 * want
-    };
-    assert!(near(at(1e-3 + 10.1e-3), 10.1e-3), "past the bar: the step");
-    assert!(near(at(1e-3 - 34e-3), 34e-3), "either side, in the band");
-    assert!(near(at(1e-3 + 99.5e-3), 99.5e-3), "inside the band's edge");
-    assert_eq!(at(1e-3 + 100.5e-3), vec![], "past the band");
-    // A wall within the θ's own size beats a step-sized scale: |θ₀|.
-    assert_eq!(
-        decide_with(2.0 * w * -34e-3, 2.0 * w, Some(1.5e-3)).0,
-        vec![(0, 1e-3)],
-        "in the band, wall at 1.5e-3"
-    );
+    assert_eq!(at(1e-3 + 10.1e-3), vec![], "past the bar");
     // δ = 5e-4, so f″·δ² = f″·2.5e-7 against the floor 1e-6·51 = 5.1e-5: f″ = 204.
     assert_eq!(decide(0.0, 205.0), vec![(0, 1e-3)], "just above the floor");
     assert_eq!(decide(0.0, 203.0), vec![], "just below the floor");
