@@ -12083,3 +12083,29 @@ fn the_mu_folded_gradient_equals_the_plans_reverse() {
         }
     }
 }
+
+/// The pass width's memory bound (#2980): one pass while the prediction plan's lanes stay
+/// within `PASS_LANES` (or the 4-direction pass's `5 × base`), else no wider than that budget
+/// allows. Pinned at the measured case — a 50-effect subject, 54 directions, peaked at 7.3 GB
+/// in one pass against 1.19 GB in 4-direction passes — under FOCEI (51 base lanes) and Laplace
+/// (1326), at typical folded and unfolded models, and at the budget's edge from both sides.
+///
+/// Mutations: the budget dropped (one pass everywhere: the 50-effect rows give 54); `5 × base`
+/// dropped (Laplace's 1326 base lanes would give width 1); `<=` as `<` at the edge.
+#[test]
+fn a_pass_is_as_wide_as_its_lane_budget_allows() {
+    use super::hessian::pass_width;
+    // 50 random effects, 3 θ, 50 Ω, σ: the old 4-direction footprint.
+    assert_eq!(pass_width(54, 51, 53), 4, "FOCEI, 50 effects");
+    assert_eq!(pass_width(54, 1326, 53), 4, "Laplace, 50 effects");
+    // A log-normal one-compartment model, folded (3 η lanes) or not (3 η + 3 θ).
+    assert_eq!(pass_width(7, 4, 3), 7, "folded");
+    assert_eq!(pass_width(7, 4, 6), 7, "unfolded");
+    // A Laplace plan of 5 effects (21 base lanes): mu-referenced (5 axes, 126 lanes) in one
+    // pass; with 7 unfolded θ (12 axes, 273 lanes) in passes of 256 / 21 − 1 = 11.
+    assert_eq!(pass_width(13, 21, 5), 13, "Laplace, 5 effects, folded");
+    assert_eq!(pass_width(13, 21, 12), 11, "Laplace, 5 effects, unfolded");
+    // The edge: 4 base lanes, budget 256 = 4·64: 63 directions fit, 64 do not.
+    assert_eq!(pass_width(63, 4, 63), 63);
+    assert_eq!(pass_width(64, 4, 64), 63);
+}
