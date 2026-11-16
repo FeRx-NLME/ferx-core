@@ -57,25 +57,33 @@ pub(crate) struct OmegaT<T> {
     pub log_det: T,
 }
 
+/// Widths [`OmegaT::from_chol_cached`] keeps a factorisation for, per thread.
+const OMEGA_CACHE_WIDTHS: usize = 8;
+
 thread_local! {
-    /// The last Ω [`OmegaT::from_chol_cached`] factored: Ω is one matrix for a whole outer
-    /// evaluation, so every subject on a thread after the first reuses its inverse.
-    static OMEGA_CACHE: std::cell::RefCell<Option<OmegaT<f64>>> = const { std::cell::RefCell::new(None) };
+    /// The Ω [`OmegaT::from_chol_cached`] last factored at each width: Ω is one matrix for a
+    /// whole outer evaluation, so every subject on a thread after the first reuses its inverse
+    /// — also when the subjects' stacked widths differ (IOV with unequal occasion counts), as
+    /// a single entry would miss on every alternation.
+    static OMEGA_CACHE: std::cell::RefCell<Vec<OmegaT<f64>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Factorisations the cache had to compute (test seam).
+    #[cfg(test)]
+    static OMEGA_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl OmegaT<f64> {
-    /// [`Self::from_chol`], reusing the previous call's `Ω⁻¹` and `log|Ω|` when `chol` is bit-for-bit
-    /// the factor they were formed from (`from_chol` is a function of `chol` alone, so the
-    /// reuse returns exactly what it would compute).
+    /// [`Self::from_chol`], reusing the `Ω⁻¹` and `log|Ω|` last formed at this width when `chol`
+    /// is bit-for-bit the (square) factor they were formed from (`from_chol` is a function of
+    /// `chol` alone, so the reuse returns exactly what it would compute).
     pub(crate) fn from_chol_cached(chol: Vec<Vec<f64>>) -> Option<Self> {
         OMEGA_CACHE.with(|c| {
             let mut c = c.borrow_mut();
-            if let Some(o) = c.as_ref().filter(|o| {
-                o.chol.len() == chol.len()
-                    && o.chol.iter().zip(&chol).all(|(a, b)| {
-                        a.len() == b.len()
-                            && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
-                    })
+            let at = c.iter().position(|o| o.chol.len() == chol.len());
+            if let Some(o) = at.map(|i| &c[i]).filter(|o| {
+                o.chol
+                    .iter()
+                    .zip(&chol)
+                    .all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()))
             }) {
                 return Some(OmegaT {
                     chol,
@@ -83,8 +91,18 @@ impl OmegaT<f64> {
                     log_det: o.log_det,
                 });
             }
+            #[cfg(test)]
+            OMEGA_MISSES.with(|m| m.set(m.get() + 1));
             let o = Self::from_chol(chol)?;
-            *c = Some(o.clone());
+            match at {
+                Some(i) => c[i] = o.clone(),
+                None => {
+                    if c.len() == OMEGA_CACHE_WIDTHS {
+                        c.swap_remove(0);
+                    }
+                    c.push(o.clone());
+                }
+            }
             Some(o)
         })
     }
@@ -170,7 +188,7 @@ impl<T> ParT<T> {
     /// width came from it, silently loop over nothing): fail with the cause instead.
     #[inline]
     pub(crate) fn omega_inv(&self, n: usize) -> &Vec<Vec<T>> {
-        debug_assert!(
+        assert!(
             self.omega.inv.len() >= n,
             "Ω⁻¹ has {} rows, {n} needed: a ParT from map_rows/wrap_rows carries no Ω",
             self.omega.inv.len()
@@ -181,7 +199,7 @@ impl<T> ParT<T> {
     /// `L` (`Ω = LLᵀ`) for `n` random effects; see [`Self::omega_inv`].
     #[inline]
     pub(crate) fn omega_chol(&self, n: usize) -> &Vec<Vec<T>> {
-        debug_assert!(
+        assert!(
             self.omega.chol.len() >= n,
             "Ω's factor has {} rows, {n} needed: a ParT from map_rows/wrap_rows carries no Ω",
             self.omega.chol.len()
@@ -1321,12 +1339,11 @@ pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
     note_inner_hessian_route(ctx.subject, false);
     let n = p.omega.inv.len();
     // The width is Ω⁻¹'s own, so a `ParT` without Ω (`map_rows`) would give `n = 0` and a
-    // silently empty Hessian: the rows' η-sensitivities say how wide it must be.
-    debug_assert!(
-        g.first().is_none_or(|r| r.len() == n),
-        "Ω⁻¹ has {n} rows, the sensitivities {:?} columns: a ParT from map_rows/wrap_rows carries no Ω",
-        g.first().map(Vec::len)
-    );
+    // silently empty Hessian: the rows' η-sensitivities say how wide it must be, and a
+    // mismatch declines (in every build) rather than assembling a wrong-width matrix.
+    if g.first().is_some_and(|r| r.len() != n) {
+        return None;
+    }
     let half = T::from_f64(0.5);
     let pl = p.map_rows(d2_const);
     // A non-FREM row does not read η; the array only fills `row_l`'s signature.
@@ -1560,39 +1577,101 @@ mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
 
-    /// `from_chol_cached` returns exactly `from_chol`'s `Ω⁻¹` and `log|Ω|`, on a miss, on a hit,
-    /// and after the factor changes (a stale entry would return the previous Ω's inverse),
-    /// including a factor that differs only in the sign of a zero. Measured: bit-identical.
+    /// `from_chol_cached` returns exactly `from_chol`'s `Ω⁻¹` and `log|Ω|`, and says when it
+    /// computed: on a miss, on a hit, after the factor changes (a stale entry would return the
+    /// previous Ω's inverse), for a factor that differs only in the sign of a lower-triangle
+    /// zero (a miss: reuse is by bit pattern), at widths 1, 2, 3 and 4, and when the widths
+    /// alternate (IOV with unequal occasion counts: one entry per width, so the alternation
+    /// after warm-up is all hits). Mutation: compare with `==` instead of `to_bits` → the
+    /// `-0.0` row hits; keep one entry → the alternation rows miss; skip the width lookup
+    /// (compare against the first entry) → a width change serves the wrong inverse.
     #[test]
     fn omega_cache_returns_exactly_what_from_chol_computes() {
-        let a = vec![
+        let m3 = vec![
             vec![0.3, 0.0, 0.0],
-            vec![0.1, 0.5, 0.0],
+            vec![0.0, 0.5, 0.0],
             vec![-0.2, 0.05, 0.4],
         ];
-        let mut b = a.clone();
+        let mut b = m3.clone();
         b[0][0] = 0.31;
-        let mut z = a.clone();
-        z[0][1] = -0.0;
-        for chol in [&a, &a, &b, &a, &z, &a] {
+        let mut z = m3.clone();
+        z[1][0] = -0.0;
+        let m1 = vec![vec![0.7]];
+        let m2 = vec![vec![0.3, 0.0], vec![0.1, 0.5]];
+        let m4: Vec<Vec<f64>> = (0..4)
+            .map(|i| {
+                (0..4)
+                    .map(|j| {
+                        if j <= i {
+                            0.2 + 0.1 * (i + j) as f64
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let misses = || OMEGA_MISSES.with(std::cell::Cell::get);
+        let bits =
+            |m: &[Vec<f64>]| -> Vec<u64> { m.iter().flatten().map(|x| x.to_bits()).collect() };
+        // (factor, whether the call has to compute)
+        let rows: Vec<(&str, &Vec<Vec<f64>>, bool)> = vec![
+            ("first", &m3, true),
+            ("again", &m3, false),
+            ("other values", &b, true),
+            ("back", &m3, true),
+            ("sign of a lower-triangle zero", &z, true),
+            ("same -0.0 again", &z, false),
+            ("n = 1", &m1, true),
+            ("n = 4", &m4, true),
+            ("n = 4 again", &m4, false),
+            ("width 3 (kept beside the others)", &z, false),
+            ("n = 2", &m2, true),
+            ("alternate 3", &z, false),
+            ("alternate 2", &m2, false),
+            ("alternate 1", &m1, false),
+            ("alternate 4", &m4, false),
+        ];
+        for (what, chol, computes) in rows {
+            let before = misses();
             let want = OmegaT::from_chol(chol.clone()).expect("positive definite");
             let got = OmegaT::from_chol_cached(chol.clone()).expect("positive definite");
-            let bits =
-                |m: &[Vec<f64>]| -> Vec<u64> { m.iter().flatten().map(|x| x.to_bits()).collect() };
-            assert_eq!(bits(&got.chol), bits(&want.chol));
-            assert_eq!(bits(&got.inv), bits(&want.inv));
-            assert_eq!(got.log_det.to_bits(), want.log_det.to_bits());
+            assert_eq!(misses() - before, usize::from(computes), "{what}: computed");
+            assert_eq!(bits(&got.chol), bits(&want.chol), "{what}");
+            assert_eq!(bits(&got.inv), bits(&want.inv), "{what}");
+            assert_eq!(got.log_det.to_bits(), want.log_det.to_bits(), "{what}");
         }
         // A non-positive diagonal declines, from the cache as from `from_chol`.
-        let mut bad = a.clone();
+        let mut bad = m3.clone();
         bad[1][1] = 0.0;
         assert!(OmegaT::from_chol_cached(bad).is_none());
+        // More widths than the cache keeps evict, and every answer stays exact.
+        for n in 1..=OMEGA_CACHE_WIDTHS + 2 {
+            let l: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| {
+                            if i == j {
+                                1.0 + n as f64
+                            } else if j < i {
+                                0.1
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let want = OmegaT::from_chol(l.clone()).expect("positive definite");
+            let got = OmegaT::from_chol_cached(l).expect("positive definite");
+            assert_eq!(bits(&got.inv), bits(&want.inv), "n = {n}");
+        }
     }
 
-    /// Reading Ω from the row passes' parameters fails with the cause in a debug build, not
+    /// Reading Ω from the row passes' parameters fails with the cause, in every build, not
     /// with an index panic or an empty matrix; the full parameters answer at any width up to
-    /// their own. Mutation: drop the `debug_assert!` in `omega_inv` / `omega_chol` → the
-    /// `should_panic` rows fail.
+    /// their own. Mutation: drop the `assert!` in `omega_inv` / `omega_chol` → the `catch_unwind`
+    /// rows see no panic with the cause.
     #[test]
     fn omega_readers_name_a_parameter_set_without_omega() {
         let p = ParT::<f64> {
@@ -1610,16 +1689,14 @@ mod tests {
             let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("panics");
             e.downcast_ref::<String>().cloned().unwrap_or_default()
         };
-        if cfg!(debug_assertions) {
-            assert!(msg(&|| {
-                rows.omega_inv(2);
-            })
-            .contains("carries no Ω"));
-            assert!(msg(&|| {
-                rows.omega_chol(2);
-            })
-            .contains("carries no Ω"));
-        }
+        assert!(msg(&|| {
+            rows.omega_inv(2);
+        })
+        .contains("carries no Ω"));
+        assert!(msg(&|| {
+            rows.omega_chol(2);
+        })
+        .contains("carries no Ω"));
     }
 
     /// The row passes' lifted parameters (`map_rows`) carry every field the rows read — σ, ρ,

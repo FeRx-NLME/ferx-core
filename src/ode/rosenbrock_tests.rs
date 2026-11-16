@@ -926,6 +926,48 @@ fn non_finite_rhs_terminates_and_pads_the_tail() {
     );
     // The pre-divergence save is still the correct decay value.
     assert_relative_eq!(got[0].u[0], (-0.25_f64).exp(), max_relative = 1e-4);
+    // The padded points carry a state (NaN lanes, a diverged stop), not an empty one.
+    for p in &got[1..] {
+        assert_eq!(
+            p.u.len(),
+            1,
+            "t = {}: a padded point carries the state",
+            p.t
+        );
+        assert!(p.u[0].is_nan(), "t = {}: diverged pads with NaN", p.t);
+    }
+}
+
+/// A solve that stops for a finite reason (the step budget) pads the `saveat` times it did not
+/// reach with the last state, one entry per component. With no `interp_at` times (every
+/// `solve_ode` caller) the tail is built because `saveat` is pending, whatever `interp_at`
+/// says. Mutation: `&&` → `||` in the tail's emptiness test in `integrate_dense_g` (`save_idx
+/// >= saveat.len() && interp_idx >= interp_at.len()`) → the padded points have no state and the
+/// length row fails.
+#[test]
+fn a_step_budget_stop_pads_the_unreached_saveat_times_with_the_last_state() {
+    let rhs = |u: &[f64], _p: &[f64], _t: f64, du: &mut [f64]| du[0] = -u[0];
+    let saveat = [0.5, 1000.0, 2000.0];
+    let got = solve_ode(
+        &rhs,
+        &[1.0],
+        (0.0, 2000.0),
+        &[],
+        &saveat,
+        &OdeSolverOptions {
+            max_steps: 3,
+            ..Default::default()
+        },
+    );
+    assert_eq!(got.len(), saveat.len());
+    for p in &got {
+        assert_eq!(p.u.len(), 1, "t = {}: one entry per component", p.t);
+        assert!(p.u[0].is_finite(), "t = {}: {}", p.t, p.u[0]);
+    }
+    assert_eq!(
+        got[1].u[0], got[2].u[0],
+        "the unreached times carry the same last state"
+    );
 }
 
 /// A zero-state system is a degenerate but reachable configuration (a model whose ODE block
