@@ -2325,3 +2325,61 @@ fn every_native_plan_tier_probes_its_stack() {
         );
     }
 }
+
+/// A thread's hot table serves several subjects at once (the solve of one subject follows
+/// another's, so one entry missed once per solve), evicts only on a slot collision, and a put
+/// under a newer stamp releases the entries filled under the old one (a dropped scope's plans
+/// must not stay pinned by the table). Mutation: back the table with one slot → the first
+/// assertion fails; skip the stale drop in `put` → the `strong_count` one fails; compare `hk`
+/// loosely in `get` → the collision row serves the wrong subject's variants.
+#[test]
+fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
+    let key = |s: usize| HotKey {
+        model: 0x1000,
+        subject: 0x40_0000 + s * 0x40,
+        n: 1,
+        n_in: 2,
+        kind: 0,
+        class: 0,
+    };
+    let stamp = |gen: usize| HotStamp { prints: 1, gen };
+    let (ka, kb) = {
+        let ka = key(0);
+        (ka, (1..).map(key).find(|k| k.slot() != ka.slot()).unwrap())
+    };
+    let (a, b): (Kernels, Kernels) = (Arc::new(Variants::default()), Arc::new(Variants::default()));
+    let mut t = HotTable::default();
+    t.put(ka, stamp(7), None, a.clone());
+    t.put(kb, stamp(7), None, b.clone());
+    let got = |t: &HotTable, k: &HotKey, g: usize| t.get(k, stamp(g), None);
+    assert!(
+        Arc::ptr_eq(&got(&t, &ka, 7).expect("a"), &a),
+        "subject a still held"
+    );
+    assert!(
+        Arc::ptr_eq(&got(&t, &kb, 7).expect("b"), &b),
+        "subject b held beside it"
+    );
+    assert!(
+        got(&t, &ka, 8).is_none(),
+        "a newer generation serves nothing"
+    );
+    // A key that maps to a's slot evicts it, and is served as itself.
+    let kc = (1..)
+        .map(|s| key(s * 7919))
+        .find(|k| k.slot() == ka.slot() && *k != ka)
+        .unwrap();
+    let c: Kernels = Arc::new(Variants::default());
+    t.put(kc, stamp(7), None, c.clone());
+    assert!(got(&t, &ka, 7).is_none(), "the collision evicted a");
+    assert!(Arc::ptr_eq(&got(&t, &kc, 7).expect("c"), &c));
+    // A put under a newer stamp releases what the old one filled.
+    assert!(Arc::strong_count(&b) > 1, "fixture: the table holds b");
+    t.put(kc, stamp(9), None, c.clone());
+    assert_eq!(
+        Arc::strong_count(&b),
+        1,
+        "the stale entry was dropped, not pinned"
+    );
+    assert!(got(&t, &kb, 7).is_none() && got(&t, &kb, 9).is_none());
+}

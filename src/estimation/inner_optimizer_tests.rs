@@ -8165,3 +8165,75 @@ fn a_dose_only_subject_is_not_counted_as_finite_differences() {
         &[0.0, 0.0]
     ));
 }
+
+/// The in-place dense BFGS update ([`bfgs_update_small`]) and direction ([`neg_gemv`]) are the
+/// operations `nalgebra`'s `mul_to` / `gemv` ran before, bit for bit: every width up to
+/// [`BFGS_SMALL_DIM`] (the update) and beyond it (the direction), on values with mixed signs and
+/// magnitudes so a reordered sum or a dropped rounding shows. Mutation: add the terms of a
+/// product in reverse column order, or fold `eye − p` to `−p` off the diagonal (it differs in
+/// the sign of a zero) → the compared bits differ.
+#[test]
+fn small_bfgs_update_and_direction_match_nalgebra_bit_for_bit() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        // Mixed signs, magnitudes over several decades, and the odd exact zero.
+        let u = (seed >> 11) as f64 / (1u64 << 53) as f64;
+        if seed % 17 == 0 {
+            0.0
+        } else {
+            (u - 0.5) * 10f64.powi((seed % 7) as i32 - 3)
+        }
+    };
+    for n in 1..=8usize {
+        for _ in 0..200 {
+            let h = DMatrix::from_fn(n, n, |_, _| next());
+            let g: Vec<f64> = (0..n).map(|_| next()).collect();
+            // The direction.
+            let mut want = DVector::zeros(n);
+            want.gemv(-1.0, &h, &DVector::from_column_slice(&g), 0.0);
+            let mut got = vec![0.0; n];
+            neg_gemv(&h, &g, &mut got);
+            for i in 0..n {
+                assert_eq!(got[i].to_bits(), want[i].to_bits(), "direction n={n} i={i}");
+            }
+            if n > BFGS_SMALL_DIM {
+                continue;
+            }
+            // The update, against the operand-matrix form it replaced.
+            let s: Vec<f64> = (0..n).map(|_| next()).collect();
+            let y: Vec<f64> = (0..n).map(|_| next()).collect();
+            let rho = 1.0 / next().max(1e-3);
+            let (s_vec, y_vec) = (
+                DVector::from_column_slice(&s),
+                DVector::from_column_slice(&y),
+            );
+            let eye = DMatrix::identity(n, n);
+            let mut upd = BfgsUpdateBuffers::new(n);
+            let mut h_ref = h.clone();
+            upd.rs.copy_from(&s_vec);
+            upd.rs *= rho;
+            upd.ry.copy_from(&y_vec);
+            upd.ry *= rho;
+            upd.yt.tr_copy_from(&y_vec);
+            upd.st.tr_copy_from(&s_vec);
+            upd.rs.mul_to(&upd.yt, &mut upd.outer_a);
+            upd.ry.mul_to(&upd.st, &mut upd.outer_b);
+            upd.left.copy_from(&eye);
+            upd.left -= &upd.outer_a;
+            upd.right.copy_from(&eye);
+            upd.right -= &upd.outer_b;
+            upd.left.mul_to(&h_ref, &mut upd.t);
+            upd.t.mul_to(&upd.right, &mut h_ref);
+            upd.rs.mul_to(&upd.st, &mut upd.outer_a);
+            h_ref += &upd.outer_a;
+            let mut h_new = h.clone();
+            bfgs_update_small(&mut h_new, &s, &y, rho);
+            for (a, b) in h_new.iter().zip(h_ref.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "update n={n}");
+            }
+        }
+    }
+}

@@ -3257,9 +3257,88 @@ pub(crate) struct HotStamp {
     gen: usize,
 }
 
+/// One thread's hot entry: what [`hot_put`] kept for a [`HotKey`].
+type HotEntry = (HotKey, HotStamp, Option<Desc>, Kernels);
+
+/// Slots of a thread's hot table (a power of two).
+const HOT_SLOTS: usize = 4096;
+
+impl HotKey {
+    /// The key's slot in the table. A subject's solve asks for the same plan many times in a
+    /// row, but the next subject the thread picks up is another one, so a single entry missed
+    /// once per solve; direct-mapped by the subject's address, a collision only costs the miss.
+    fn slot(&self) -> usize {
+        let h = (self.subject >> 4)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(usize::from(self.kind) + self.n_in * 31 + self.n * 7);
+        (h >> 20) & (HOT_SLOTS - 1)
+    }
+}
+
+/// One thread's hot entries, direct-mapped by [`HotKey::slot`], all of them filled under one
+/// [`HotStamp`]: a [`put`](Self::put) under another stamp first drops the stale ones, so the
+/// table never pins plans a dropped scope released.
+#[derive(Default)]
+struct HotTable {
+    slots: Vec<Option<HotEntry>>,
+    stamp: Option<HotStamp>,
+    /// The slots holding an entry, so dropping the stale ones costs what is held.
+    filled: Vec<u16>,
+}
+
+impl HotTable {
+    fn get(
+        &self,
+        k: &HotKey,
+        now: HotStamp,
+        lay: Option<&crate::stats::stacked_layout::StackedLayout>,
+    ) -> Option<Kernels> {
+        match self.slots.get(k.slot()) {
+            Some(Some((hk, st, want, ks)))
+                if hk == k && st.prints == now.prints && st.gen == now.gen =>
+            {
+                // The layout is rebuilt per call: its structure is compared, not its address.
+                let same = match (want, lay) {
+                    (None, None) => true,
+                    (Some(w), Some(l)) => {
+                        let mut c = SameBytes {
+                            rest: w.bytes(),
+                            same: true,
+                        };
+                        l.canon(&mut c);
+                        c.same && c.rest.is_empty()
+                    }
+                    _ => false,
+                };
+                same.then(|| ks.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn put(&mut self, k: HotKey, stamp: HotStamp, layout: Option<Desc>, ks: Kernels) {
+        if self.slots.is_empty() {
+            self.slots.resize_with(HOT_SLOTS, || None);
+        }
+        if self
+            .stamp
+            .is_some_and(|s| s.prints != stamp.prints || s.gen != stamp.gen)
+        {
+            for i in self.filled.drain(..) {
+                self.slots[usize::from(i)] = None;
+            }
+        }
+        self.stamp = Some(stamp);
+        let i = k.slot();
+        if self.slots[i].is_none() {
+            self.filled.push(i as u16);
+        }
+        self.slots[i] = Some((k, stamp, layout, ks));
+    }
+}
+
 thread_local! {
-    static HOT: RefCell<Option<(HotKey, HotStamp, Option<Desc>, Kernels)>> =
-        const { RefCell::new(None) };
+    static HOT: RefCell<HotTable> = RefCell::new(HotTable::default());
 }
 
 /// A `Hasher` that checks what is written against canonical bytes already kept ([`Desc`]),
@@ -3299,25 +3378,7 @@ pub(crate) fn hot_get(
     if !hot_allowed_in_test() {
         return None;
     }
-    HOT.with(|h| match &*h.borrow() {
-        Some((hk, st, want, ks)) if hk == k && st.prints == now.prints && st.gen == now.gen => {
-            // The layout is rebuilt per call: its structure is compared, not its address.
-            let same = match (want, lay) {
-                (None, None) => true,
-                (Some(w), Some(l)) => {
-                    let mut c = SameBytes {
-                        rest: w.bytes(),
-                        same: true,
-                    };
-                    l.canon(&mut c);
-                    c.same && c.rest.is_empty()
-                }
-                _ => false,
-            };
-            same.then(|| ks.clone())
-        }
-        _ => None,
-    })
+    HOT.with(|h| h.borrow().get(k, now, lay))
 }
 
 /// Keep `ks`, found for `k` under `stamp`, for [`hot_get`] — only for a model and a subject
@@ -3337,7 +3398,7 @@ pub(crate) fn hot_put(
     if registered(model as *const _ as usize).is_some()
         && registered(subject as *const _ as usize).is_some()
     {
-        HOT.with(|h| *h.borrow_mut() = Some((k, stamp, key.layout.clone(), ks.clone())));
+        HOT.with(|h| h.borrow_mut().put(k, stamp, key.layout.clone(), ks.clone()));
     }
 }
 
