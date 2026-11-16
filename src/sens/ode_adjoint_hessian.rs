@@ -317,12 +317,17 @@ fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix
         .then(|| (wv.iter().copied().collect(), eta_x))
 }
 
-/// Directions per `psi_along` pass: `K`, or fewer under the test cap.
+/// Directions per `psi_along` pass: 1, or (tests) the width `PASS_WIDTH_CAP` sets, up to `K`.
+/// One direction per pass is measured 2-2.5x cheaper than `K`-wide passes: a single-tangent
+/// pass carries 2 lanes where a `K`-wide one carries `1 + K` forward and `K` seeds of `1 + K`
+/// lanes in the reverse.
 fn pass_width() -> usize {
     #[cfg(test)]
-    return PASS_WIDTH_CAP.with(|c| c.get()).map_or(K, |cap| K.min(cap));
+    return PASS_WIDTH_CAP
+        .with(|c| c.get())
+        .map_or(1, |w| w.clamp(1, K));
     #[cfg(not(test))]
-    K
+    1
 }
 
 #[cfg(test)]
@@ -422,9 +427,9 @@ fn psi_lanes(
 ) -> Option<()> {
     let n = plan.pn();
     let width = pass_width().clamp(1, K);
-    let l = 1 + K;
     for (c, chunk) in dirs.chunks(width).enumerate() {
         let run = plan.run(chunk)?;
+        let l = 1 + run.kt;
         let out = run.out();
         // Seed `a`: `F`'s tangent lane `a` and `−w_k` on each `g_k`'s.
         let seeds: Vec<Vec<f64>> = (0..chunk.len())
@@ -831,7 +836,8 @@ impl Kept {
     /// Output `o`'s base lane `x` along tangent `a` (`None`: the value).
     fn out(&self, o: usize, x: usize, a: Option<usize>) -> f64 {
         let (l, lb) = (self.layout.lanes(), self.layout.base_lanes());
-        self.du[o * l + a.map_or(x, |a| lb + x * K + a)]
+        let tan = self.layout.tan as usize;
+        self.du[o * l + a.map_or(x, |a| lb + x * tan + a)]
     }
 }
 
@@ -1142,7 +1148,14 @@ impl<'a> CovPlan<'a> {
     /// One forward of the composition along `dirs` (the value layout with none).
     pub(super) fn run(&self, dirs: &[Dir]) -> Option<CovRun> {
         let (model, subject, sc) = (self.sc.model, self.subject, self.sc);
-        let kt = if dirs.is_empty() { 0 } else { K };
+        // One direction (a covariance-Hessian pass) runs the single-tangent layout: its forward
+        // and reverse carry 2 lanes instead of `1 + K`. Only these tangent counts are used.
+        debug_assert!(dirs.len() <= K);
+        let kt = match dirs.len() {
+            0 => 0,
+            1 => 1,
+            _ => K,
+        };
         let lk = 1 + kt;
         let n_obs = subject.observations.len();
         let pn = sc.width;
@@ -1673,7 +1686,7 @@ impl<'a> CovPlan<'a> {
                     }
                     du_bar[sd * w + j * l + x] = a[s * lk];
                     for t in 0..kt {
-                        du_bar[sd * w + j * l + lb + x * K + t] = a[s * lk + 1 + t];
+                        du_bar[sd * w + j * l + lb + x * kt + t] = a[s * lk + 1 + t];
                     }
                 }
             }

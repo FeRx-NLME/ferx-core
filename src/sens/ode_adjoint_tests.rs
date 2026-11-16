@@ -5858,11 +5858,11 @@ fn cov_hessian_matches_profile_fd_closed_form_focei_and_foce() {
     assert!(fd < 1e-5, "FOCE vs FD {fd:.2e}");
 }
 
-/// `psi_along` spends its directions over narrower passes under `PASS_WIDTH_CAP`. Each
+/// `psi_along` spends its directions over wider passes under `PASS_WIDTH_CAP`. Each
 /// column must still land on its own
 /// direction: width 3 over 7 packed axes leaves a ragged last pass, so an offset taken from
 /// the pass's own width rather than the planned one misplaces columns. Measured: bit-identical
-/// at widths 1 and 3 (a column's arithmetic does not see the other tangents); a misplaced
+/// at widths 1, 3 and 4 (a column's arithmetic does not see the other tangents); a misplaced
 /// column moves the matrix by O(1) of its largest entry.
 #[test]
 fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
@@ -5907,7 +5907,7 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
         .expect("in scope")
     };
     let full = run(None);
-    for cap in [1, 3] {
+    for cap in [3, 4] {
         let narrow = run(Some(cap));
         let scale = full.iter().fold(0.0f64, |m, v| m.max(v.abs()));
         let mut worst = 0.0f64;
@@ -5918,8 +5918,8 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
             );
             worst = worst.max((a - b).abs() / scale);
         }
-        eprintln!("cov Hessian at width {cap} vs 8: {worst:.2e}");
-        assert!(worst < 1e-12, "width {cap} vs 8: {worst:.2e}");
+        eprintln!("cov Hessian at width {cap} vs 1: {worst:.2e}");
+        assert!(worst < 1e-12, "width {cap} vs 1: {worst:.2e}");
     }
 }
 
