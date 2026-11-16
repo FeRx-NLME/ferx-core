@@ -5398,6 +5398,10 @@ pub(super) fn hessian_gaps_for(
     // Forward over reverse (production) against reverse over forward, one reverse per
     // direction (#2980): the same second derivatives of the same programs, so they differ by
     // the accumulation order only. Every fixture of this oracle is also that parity check.
+    // Measured over its 63 fixture runs (closed form, ODE, SDE, IOV, NN, steady state,
+    // non-Gaussian terms; FOCE, FOCEI, Laplace, AGQ): worst 2.1e-14 relative to the largest
+    // entry, so `1e-12` leaves ~50x headroom. A dropped lane-glue term (θ's `d²θ/dx²`, a value
+    // lane read for a tangent) moves an entry by O(1) of the matrix.
     let h = hessian(false);
     let h_rof = hessian(true);
     let scale = h_rof.iter().fold(0.0f64, |m, v| m.max(v.abs()));
@@ -5411,7 +5415,7 @@ pub(super) fn hessian_gaps_for(
     }
     eprintln!("hessian: forward over reverse vs a reverse per direction {worst_for:.2e}");
     assert!(
-        worst_for < 1e-10,
+        worst_for < 1e-12,
         "forward over reverse vs a reverse per direction: {worst_for:.2e}"
     );
     let n = x.len();
@@ -11806,6 +11810,9 @@ fn probe_cut_rank() {
             .map(|k| 0.11 * (k as f64 + 1.0) * if k % 2 == 0 { 1.0 } else { -1.0 })
             .collect();
         let m = p_of(&params.theta, &eta0).len();
+        if m == 0 {
+            continue;
+        }
         let h1 = 1e-4;
         // π(θ, η): p, p_η (central), p_ηη (second differences).
         let pi = |th: &[f64], et: &[f64], second: bool| -> Vec<f64> {
@@ -11867,14 +11874,14 @@ fn probe_cut_rank() {
             let top = sv.iter().cloned().fold(0.0, f64::max);
             sv.iter().filter(|&&s| s > 1e-6 * top).count()
         };
-        rows.push(format!(
+        let row = format!(
             "{name:40} n={n_packed:3} nθ+nη={:3} m={m:2} nη={ne:2} | r(FOCE/I)={:3} r(Laplace)={:3}",
             nt + ne,
             rank(false),
             rank(true)
-        ));
+        );
+        eprintln!("{row}");
+        rows.push(row);
     }
-    for r in &rows {
-        eprintln!("{r}");
-    }
+    assert!(!rows.is_empty());
 }
