@@ -539,6 +539,50 @@ fn the_gershgorin_fast_path_agrees_with_the_exact_eigensolve() {
     }
 }
 
+/// The probe keeps its work vectors on the stack up to `PROBE_STACK_N` states and on the heap
+/// above: both sides of that boundary read the same Jacobian and give the exact eigensolve's
+/// verdict, for a Jacobian that is stiff (`-500` on the diagonal, Gershgorin reaches the
+/// eigensolve) and for one that is not (`-1`, Gershgorin exits). A tail state that is `NaN`
+/// declines the probe on both sides alike.
+#[test]
+fn the_probe_agrees_across_the_stack_and_heap_scratch_boundary() {
+    for n in [
+        1,
+        PROBE_STACK_N - 1,
+        PROBE_STACK_N,
+        PROBE_STACK_N + 1,
+        2 * PROBE_STACK_N,
+    ] {
+        for (rate, stiff) in [(-1.0, false), (-500.0, true)] {
+            let rates: &'static [f64] = Box::leak(vec![rate; n].into_boxed_slice());
+            let rhs = diagonal_rhs::<f64>(rates);
+            let u = vec![1.0; n];
+            let jac = fd_jacobian(&rhs, &u, &[], 0.0).unwrap();
+            let mut into = vec![f64::NAN; n * n];
+            assert!(fd_jacobian_into(&rhs, &u, &[], 0.0, &mut into), "n={n}");
+            assert_eq!(jac, into, "n={n}: scratch placement changed the Jacobian");
+            let expected = if stiff {
+                OdeMethod::Rodas4
+            } else {
+                OdeMethod::EXPLICIT_FALLBACK
+            };
+            assert_eq!(
+                resolve_method(&rhs, &u, &[], 0.0, &loose()),
+                expected,
+                "n={n} rate={rate}"
+            );
+        }
+        let mut u = vec![1.0; n];
+        u[n - 1] = f64::NAN;
+        let rhs = diagonal_rhs::<f64>(Box::leak(vec![-500.0; n].into_boxed_slice()));
+        assert_eq!(
+            resolve_method(&rhs, &u, &[], 0.0, &loose()),
+            OdeMethod::EXPLICIT_FALLBACK,
+            "n={n}: a non-finite state must decline the probe"
+        );
+    }
+}
+
 /// Review follow-up (#1080): a discarded escalation's clamps are attributed to the *discarded*
 /// bucket, and a budgeted abort inside one is not reported as a truncated result — the caller
 /// received the explicit re-solve, not the attempt that was abandoned.

@@ -2382,7 +2382,7 @@ fn plain_attempts<T: PkNum, S: Stepper<T> + ?Sized>(
 /// `dst.copy_from_slice(src)`, with the small state sizes copied inline rather than through a
 /// `memcpy` call.
 #[inline(always)]
-fn copy_state<T: Copy>(dst: &mut [T], src: &[T]) {
+pub(crate) fn copy_state<T: Copy>(dst: &mut [T], src: &[T]) {
     assert_eq!(dst.len(), src.len());
     match dst.len() {
         1 => dst[0] = src[0],
@@ -2858,7 +2858,11 @@ fn integrate_dense_g<T: PkNum>(
     // through `u`, so once one state is non-finite no component past that point is an
     // integrated value — and a decoupled, observed state frozen at a finite value is exactly
     // the prediction nothing downstream can tell from a real one.
-    let tail: Vec<T> = if diverged {
+    // Built only when a time is left to pad: a segment that reached every requested time
+    // (the usual one) builds no tail.
+    let tail: Vec<T> = if save_idx >= saveat.len() && interp_idx >= interp_at.len() {
+        Vec::new()
+    } else if diverged {
         // `v · NaN` rather than `from_f64(NaN)`: a dual constant carries zero jets, while the
         // product rule puts `NaN` into the gradient and the Hessian block as well.
         u.iter().map(|&v| v * T::from_f64(f64::NAN)).collect()

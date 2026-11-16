@@ -32310,30 +32310,40 @@ impl NativeJacobian<'_> {
         }
         let [ub, pb, sb, db] = &mut *self.bufs.borrow_mut();
         // Every input element is its value, then its one-hot tangents: state `j` along
-        // direction `j`, the clock's seeds (`T`, `TAFD`, `TAD`) along direction `n`.
-        for (b, len) in [
-            (&mut *ub, u.len()),
-            (&mut *pb, params.len()),
-            (&mut *sb, 4),
-            (&mut *db, n),
-        ] {
-            b.clear();
-            b.resize(len * l, 0.0);
+        // direction `j`, the clock's seeds (`T`, `TAFD`, `TAD`) along direction `n`. The
+        // tangent lanes never change and the native code only reads its inputs, so buffers
+        // already laid out for these lengths need only their values rewritten.
+        let laid_out = ub.len() == u.len() * l
+            && pb.len() == params.len() * l
+            && sb.len() == 4 * l
+            && db.len() == n * l;
+        if !laid_out {
+            for (b, len) in [
+                (&mut *ub, u.len()),
+                (&mut *pb, params.len()),
+                (&mut *sb, 4),
+                (&mut *db, n),
+            ] {
+                b.clear();
+                b.resize(len * l, 0.0);
+            }
+            for j in 0..n.min(u.len()) {
+                ub[j * l + 1 + j] = 1.0;
+            }
+            if self.clock {
+                for i in 0..3 {
+                    sb[i * l + 1 + n] = 1.0;
+                }
+            }
         }
         for (j, &x) in u.iter().enumerate() {
             ub[j * l] = x;
-            if j < n {
-                ub[j * l + 1 + j] = 1.0;
-            }
         }
         for (j, &x) in params.iter().enumerate() {
             pb[j * l] = x;
         }
         for (i, x) in self.binding.f64_seeds(params, t).into_iter().enumerate() {
             sb[i * l] = x;
-            if self.clock && i < 3 {
-                sb[i * l + 1 + n] = 1.0;
-            }
         }
         if !self.tan.run(ub, pb, sb, db) {
             return false;
