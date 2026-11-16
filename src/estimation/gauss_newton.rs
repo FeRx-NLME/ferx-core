@@ -1196,12 +1196,15 @@ thread_local! {
     static THETA_FD_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether the per-θ difference quotient is forced (tests only; always `false` otherwise).
-fn theta_fd_forced() -> bool {
+/// Whether the per-θ difference quotient is forced: by the user's `gradient = fd` (model,
+/// `FitOptions` or the fit-scoped flag, the same predicate the FOCE family and the reported
+/// `gradient_method_outer` read), or by the test switch.
+fn theta_fd_forced(model: &CompiledModel) -> bool {
     #[cfg(test)]
-    return THETA_FD_FORCE.with(|c| c.get());
-    #[cfg(not(test))]
-    false
+    if THETA_FD_FORCE.with(|c| c.get()) {
+        return true;
+    }
+    crate::types::GradientMethod::forced_fd(model)
 }
 
 /// Analytical per-subject FOCE NLL gradient for non-IOV, non-ODE, non-M3 models.
@@ -1364,7 +1367,7 @@ fn subject_nll_pop_grad_analytical(
         };
         at_mode.zip(at_pop)
     };
-    if let Some((at_mode, at_pop)) = exact.filter(|_| !theta_fd_forced()) {
+    if let Some((at_mode, at_pop)) = exact.filter(|_| !theta_fd_forced(model)) {
         for k in 0..n_theta {
             if fixed_mask[k] {
                 continue;
@@ -1884,7 +1887,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
         eta_hat.as_slice(),
         |_| Some(vec![theta_per_j.clone(), corr_w]),
     );
-    if let Some(rows) = exact.filter(|_| !theta_fd_forced()) {
+    if let Some(rows) = exact.filter(|_| !theta_fd_forced(model)) {
         for k in 0..n_theta {
             if fixed_mask[k] {
                 continue;
@@ -2562,7 +2565,7 @@ pub(crate) fn subject_nll_pop_grad(
     // columns rebuilt from θ, as production's held objective rebuilds them (a non-Gaussian
     // term over the BSV block). The central difference below remains for an endpoint
     // without an exact channel and a decline outside the recorders' scope.
-    if !theta_fd_forced() {
+    if !theta_fd_forced(model) {
         let subject = &population.subjects[subj_idx];
         // Under IOV the score is taken at the stacked `[η̂, κ̂]`.
         let stacked: Option<Vec<f64>> = if kappas.is_empty() {

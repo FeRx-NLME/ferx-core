@@ -1100,7 +1100,8 @@ fn fit_unstamped(
     // refused rather than silently ignoring the mixture structure; so are `init_params`
     // with no per-class Ω/Σ (`E_PARAM_SHAPE` / `E_MIXTURE_METHOD`, #1788). Inter-occasion
     // variability under a mixture fits (#985): the per-class inner solve carries the shared
-    // base `omega_iov`, and the outer gradient routes to FD.
+    // base `omega_iov`, and the outer gradient is the exact one at every class's modes
+    // (`mixture_gradient_salvaged`).
     first_error(&crate::api::validation::check_mixture_options(
         model,
         options,

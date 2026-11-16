@@ -329,7 +329,9 @@ fn off_mode_eta(model: &CompiledModel, subject: &Subject) -> Vec<f64> {
 /// or counting the structural decline as held.
 #[test]
 fn the_gap_is_the_reconverged_difference() {
-    let (model, analytic, mut declining) = analytic_and_declining();
+    let (model, mut analytic, mut declining) = analytic_and_declining();
+    // A unique id, so only this test's subject has its polish switched off below.
+    analytic.id = "G15_POLISH_OFF".into();
     // The twin's SS infusion every 72 h rather than 24 h: at 24 h its reconverged salvage
     // caps an SS equilibration, whose warning lands in the process-wide sink and fails a
     // concurrently running `fit()` test that accounts for every warning (#1289). Measured:
@@ -390,7 +392,11 @@ fn the_gap_is_the_reconverged_difference() {
         (gap, brute)
     };
 
-    let (gap, brute) = at(&off);
+    // With the polish off the pass declines at the mode system: the subject is held.
+    let (gap, brute) = {
+        let _off = crate::sens::ode_provider::adjoint::PolishOffFor::new("G15_POLISH_OFF");
+        at(&off)
+    };
     assert_eq!(
         gap.n_held, 1,
         "the off-mode subject is held, the structural one not"
@@ -403,6 +409,13 @@ fn the_gap_is_the_reconverged_difference() {
         "subset {} vs brute force {brute}",
         gap.gap
     );
+
+    // G15: with the polish on, the same far corner is walked to the mode and served: nothing is
+    // held and the gap is exactly zero (this point sat on a saddle region where `‖∇l‖` grows
+    // along the descent direction, so the gradient-norm line search used to give it up).
+    let (gap, brute) = at(&off);
+    assert_eq!(gap.n_held, 0, "the polish serves the off-mode subject");
+    assert_eq!((gap.gap, brute), (0.0, 0.0));
 
     let (gap, brute) = at(&[0.0; 3]);
     assert_eq!(gap.n_held, 0, "at a served eta nothing is held");

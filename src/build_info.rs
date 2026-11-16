@@ -75,14 +75,9 @@ impl GradientMethodKind {
 /// model "finite differences".
 ///
 /// Per-subject fallbacks are reported by `gradient_route_summary` (banner) and
-/// `fd_fallback_warning`: **TV-cov + LTBS** on a closed-form model (the event-driven inner
-/// walk declines LTBS, so every such subject runs FD), and out-of-scope ODE subjects (oral
-/// infusion into a built-in absorption compartment, a rate-defined infusion under `F ≠ 1`).
-/// Steady-state and modeled-duration doses are **analytic** on the ODE event-driven walk, not
-/// FD (#914 / #530). A model with a non-Gaussian endpoint reports analytic when every
-/// endpoint has an exact η-channel (`analytic_inner_grad_supported_model`, #2482) and FD otherwise
-/// (#1861); a subject whose record that channel still declines — an ODE hazard beside a
-/// steady-state dose — is the FD-fallback warning's to report.
+/// `fd_fallback_warning`. Every model the parser accepts is in the plan recorders' scope
+/// (#2786), so a subject on finite differences is either the user's `gradient = fd` or a
+/// recorder defect, which `W_PLAN_FD_FALLBACK` names.
 pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
     if crate::estimation::inner_optimizer::inner_reports_analytic_model(model) {
         GradientMethodKind::Analytic
@@ -99,9 +94,10 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 /// force FD — mirroring the live dispatch in `outer_optimizer` (PR #381 review
 /// #4), so the report tracks the headline feature instead of always reading
 /// "finite differences". Otherwise:
-/// - NLopt-based: NLopt uses its own internal FD.
+/// - `gradient = fd`: finite differences.
 /// - BOBYQA: derivative-free — no outer gradient at all.
-/// - GN/GnHybrid: BHHH outer approximation — always FD.
+/// - GN/GnHybrid: the BHHH outer approximation over exact per-subject scores, on the same
+///   scope and override as the FOCE family.
 /// - SAEM/IMP/Bayes: no outer gradient step.
 ///
 /// (A per-fit `reconverge_gradient_interval` override can still force FD; this
@@ -153,8 +149,15 @@ pub fn gradient_method_outer(
                 GradientMethodKind::FiniteDifferences
             }
         }
+        // Gauss-Newton takes each subject's θ block from the exact fixed-η contractions
+        // (`fixed_eta_theta_contractions`) and its ω/σ block in closed form, on the same scope
+        // and the same `gradient = fd` override as the FOCE family.
         EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
-            GradientMethodKind::FiniteDifferences
+            if crate::sens::provider::analytic_outer_gradient_available(model) {
+                GradientMethodKind::Analytic
+            } else {
+                GradientMethodKind::FiniteDifferences
+            }
         }
         EstimationMethod::Foce | EstimationMethod::FoceI => {
             // Resolved by the outer loop's own dispatch rule (#1540), so a mixture
@@ -305,13 +308,23 @@ mod tests {
         );
     }
 
+    /// Gauss-Newton's per-subject θ block is exact wherever the FOCE family's is, and both
+    /// follow `gradient = fd`. Mutation: GN reported `FiniteDifferences` unconditionally (the
+    /// old label) -> the first assertion fails; GN ignoring the override -> the second.
     #[test]
-    fn outer_gn_always_fd() {
-        let m = test_helpers::analytical_model(GradientMethod::Auto);
-        assert_eq!(
-            gradient_method_outer(&ad_build(), EstimationMethod::FoceGn, Optimizer::Bobyqa, &m),
-            GradientMethodKind::FiniteDifferences
-        );
+    fn outer_gn_is_analytic_unless_fd_is_forced() {
+        for method in [EstimationMethod::FoceGn, EstimationMethod::FoceGnHybrid] {
+            let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
+            assert_eq!(
+                gradient_method_outer(&ad_build(), method, Optimizer::Bobyqa, &m),
+                GradientMethodKind::Analytic
+            );
+            let fd = test_helpers::parsed_analytical_model(GradientMethod::Fd);
+            assert_eq!(
+                gradient_method_outer(&ad_build(), method, Optimizer::Bobyqa, &fd),
+                GradientMethodKind::FiniteDifferences
+            );
+        }
     }
 
     /// #486 σ-magnitude FOCE port: a custom / time-varying residual-magnitude model

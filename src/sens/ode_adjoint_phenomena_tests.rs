@@ -5617,6 +5617,114 @@ fn an_unanchored_onset_loses_the_second_derivative() {
     assert!(served(&m, &s), "transit n = 0.5, anchored, is served");
 }
 
+/// Runs `f` with the refused-anchor clause (an event preceding the onset at its instant) on,
+/// restoring it.
+fn with_onset_alone_on<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            crate::sens::ode_provider::ONSET_ALONE_ON.with(|c| c.set(false));
+        }
+    }
+    crate::sens::ode_provider::ONSET_ALONE_ON.with(|c| c.set(true));
+    let _restore = Restore;
+    f()
+}
+
+/// A lagged-kernel subject whose first onset (`t = 0` plus the default lag 1.0, at `eta = 0`)
+/// has a sibling event at its own instant, `t = 1`, of the kind `sibling` names. The kinds sort
+/// before the onset in the walk's timeline: `"record"`, the record of a second dose at `t = 1`
+/// (whose own onset is at 2); `"dose"`, a second dose at `t = 0` whose onset lands at the same
+/// instant.
+fn coincident_onset_subject(m: &CompiledModel, sibling: &str) -> Subject {
+    let second = match sibling {
+        "record" => 1.0,
+        _ => 0.0,
+    };
+    let s = subject(
+        m,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(second, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &[0.4, 1.3, 2.4, 3.0, 4.5, 6.5, 9.0, 12.0],
+        &[0.0, 0.0],
+    );
+    s
+}
+
+/// `(df/deta gap, inner-Hessian gap)` at `eta = 0` on [`coincident_onset_subject`]: the plan's
+/// first derivative against a Richardson difference of the production predictor, and the plan's
+/// exact inner Hessian against a central difference of the plan's own exact inner gradient
+/// (which at `eta = +-h` has the onset off the coincidence). Both relative, `/(1+|fd|)`.
+fn coincident_onset_gaps(kernel: &str, shape: f64, lag: &str, sibling: &str) -> (f64, f64) {
+    let m = tight(parse_model_string(&lagged_kernel_model(kernel, shape, lag)).unwrap());
+    let s = coincident_onset_subject(&m, sibling);
+    let params = &m.default_params;
+    let eta = [0.0, 0.0];
+    assert_eq!(params.theta[4], 1.0, "fixture: the default lag is 1");
+    let jac = jacobian_gap(&m, &s, &eta, "coincident onset");
+    let h = crate::sens::ode_provider::adjoint::exact_inner_hessian(&m, &s, params, &eta)
+        .expect("the plan serves the coincident onset");
+    let g = |e: &[f64]| {
+        crate::sens::ode_provider::adjoint::exact_inner_gradient(&m, &s, params, e, None)
+            .expect("inner gradient")
+    };
+    let step = 1e-4;
+    let mut worst = 0.0f64;
+    for k in 0..2 {
+        let (mut ep, mut em) = (eta, eta);
+        ep[k] += step;
+        em[k] -= step;
+        let (gp, gm) = (g(&ep), g(&em));
+        for i in 0..2 {
+            let fd = (gp[i] - gm[i]) / (2.0 * step);
+            assert!(fd.is_finite() && h[(i, k)].is_finite());
+            worst = worst.max((h[(i, k)] - fd).abs() / (1.0 + fd.abs())); // nan-ok: finite asserted above
+        }
+    }
+    (jac, worst)
+}
+
+/// G15 (3): an onset with a sibling event at its own instant is anchored like any other, and
+/// exact. The fixture lands the first dose's onset (lag 1.0 at `eta = 0`) on the record of a
+/// second dose at `t = 1` (`"record"`) or on the onset of a second dose given at `t = 0`
+/// (`"dose"`). Measured, plan vs the reconverged production predictor (`df/deta` Richardson and
+/// a central difference of the plan's own exact inner gradient for the inner Hessian), worst over
+/// the siblings and the cases below: `df/deta` 3.9e-8, Hessian 2.2e-5. The clause G9 added
+/// (refuse the anchor with a preceding event at the instant) sends the onset to the
+/// moving-boundary crossing, whose rate-on is singular for `beta < 2`: Hessian gaps 1.6e1 /
+/// 2.2e1 (`beta = 0.5`, record / dose), 1.3e2 / 1.7e2 (`1.5`), 3.9e-4 / 3.4e-4 (`3`, alag), and
+/// no change for the transit `n = 2.5` (3.5e-6).
+/// Mutation: the clause back on (`ONSET_ALONE_ON`) -> the Hessian bound fails for the Weibull rows.
+#[test]
+fn a_coincident_onset_is_anchored_with_a_sibling_at_its_instant() {
+    // (kernel, shape, lag, whether the clause moves the answer past the bound)
+    let cases = [
+        ("weibull", 0.5, "route", true),
+        ("weibull", 1.5, "route", true),
+        ("weibull", 3.0, "alag", true),
+        ("transit", 2.5, "alag", false),
+    ];
+    for sibling in ["record", "dose"] {
+        for (kernel, shape, lag, moved) in cases {
+            let label = format!("{sibling} {kernel} {shape} {lag}");
+            let (jac, hess) = coincident_onset_gaps(kernel, shape, lag, sibling);
+            assert!(jac < 5e-7, "{label}: df/deta gap {jac:.2e}");
+            assert!(hess < 2e-4, "{label}: inner Hessian gap {hess:.2e}");
+            let (_, mutant) =
+                with_onset_alone_on(|| coincident_onset_gaps(kernel, shape, lag, sibling));
+            eprintln!("G15 {label}: jac {jac:.2e} hess {hess:.2e}; clause on: hess {mutant:.2e}");
+            if moved {
+                assert!(
+                    mutant > 2e-4,
+                    "{label}: with the clause, Hessian gap {mutant:.2e}"
+                );
+            }
+        }
+    }
+}
+
 /// The cumulative frame is a reformulation of the same ODE, so the predictions move only at the
 /// integrator's tolerance: the worst relative change over every fixture (only the Weibull
 /// `β < 1` ones are framed, the rest are unchanged), at the `tight` tolerances (1e-10 / 1e-12)

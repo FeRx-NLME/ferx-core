@@ -2113,6 +2113,60 @@ mod tests {
         );
     }
 
+    /// G15: the `Exact` anchor declines at a point the objective repels. A non-finite mode has
+    /// no exact Hessian (the recording is not served there) and the value path scores it as the
+    /// sentinel / non-finite, so the anchor is `None` (the consistent repel) and no finite
+    /// difference of a value that is not there is taken. At the converged mode of the same
+    /// subject it is a real matrix (the straddle, so a mutation to "always `None`" fails too).
+    /// Mutation: drop the `is_usable_subject_nll` gate -> the NaN point returns `Some(NaN ..)`.
+    #[test]
+    fn the_exact_anchor_is_none_at_a_point_the_objective_repels() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        let model = parse_model_string(M3_MODEL).expect("parse");
+        let theta = [0.22, 11.0, 1.4];
+        let subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta.to_vec();
+        let stack = Stack::new(&model, &params, 0);
+        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
+        let schedule = cacheable_schedule(&model, &subject);
+        let at = |b: &[f64], scratch: &mut pk::EventPkParams| {
+            anchor_hessian(
+                HessianAnchor::Exact,
+                &model,
+                &subject,
+                &params,
+                &stack,
+                b,
+                scratch,
+                schedule.as_ref(),
+            )
+        };
+        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
+        let h = at(ebe.eta.as_slice(), &mut scratch).expect("a real Hessian at the mode");
+        assert!(h.iter().all(|v| v.is_finite()));
+        let nan = vec![f64::NAN; stack.d()];
+        assert!(
+            crate::sens::ode_provider::adjoint::exact_inner_hessian(
+                &model, &subject, &params, &nan
+            )
+            .is_none(),
+            "fixture: the exact Hessian declines at a non-finite mode"
+        );
+        assert!(
+            !crate::stats::likelihood::is_usable_subject_nll(stack.nll_at(
+                &model,
+                &subject,
+                &params,
+                &nan,
+                &mut scratch,
+                schedule.as_ref()
+            )),
+            "fixture: the objective repels it"
+        );
+        assert!(at(&nan, &mut scratch).is_none());
+    }
+
     #[test]
     fn grid_size_saturates_instead_of_overflowing() {
         assert_eq!(grid_size(3, 4), 81);

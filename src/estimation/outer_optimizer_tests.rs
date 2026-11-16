@@ -6761,7 +6761,13 @@ pub(crate) mod outer_fd_fallback {
                 .0
                 .err()
         };
-        assert_eq!(cause(&analytic), Some(DeclineCause::ModeSystem));
+        // The polish walks an off-mode `η̂` to the mode (G11, G15), so the decline is read with
+        // it off; with it on the same subject is served, not declined.
+        {
+            let _off = crate::sens::ode_provider::adjoint::PolishOff::new();
+            assert_eq!(cause(&analytic), Some(DeclineCause::ModeSystem));
+        }
+        assert_eq!(cause(&analytic), None, "the polish serves it");
         assert_eq!(cause(&declining), Some(DeclineCause::Recording));
     }
 

@@ -1223,22 +1223,24 @@ fn a_point_failure_counts_the_subject_that_failed_not_its_design_twins() {
     assert_eq!(c.any, 2);
 }
 
-/// A fit whose outer route is already finite differences (Gauss-Newton: its outer step reads no
-/// analytic gradient) keeps that label when plans fail: no plan fed it, so none failed it, and
-/// "(compiled plan failed)" there would blame the plans for a route they never took (#2786
-/// round 2, finding 3). The inner route is the plans', and is rewritten. Mutation: let
-/// `plan_fallback_label` rewrite any label but `N/A` -> the outer label changes.
+/// A fit whose route is already finite differences (the user's `gradient = fd`) keeps that
+/// label when plans fail: no plan fed it, so none failed it, and "(compiled plan failed)" there
+/// would blame the plans for a route they never took (#2786 round 2, finding 3). Mutation: let
+/// `plan_fallback_label` rewrite any label but `N/A` -> the forced fit's labels change.
 #[test]
 fn a_finite_difference_outer_route_keeps_its_label_when_plans_fail() {
     let (m, p) = example("examples/warfarin.ferx", "data/warfarin.csv");
-    let (exact, forced) = pair(&m, &p, &opts(EstimationMethod::FoceGn));
-    assert_eq!(exact.gradient_method_outer, "finite differences");
-    assert_eq!(forced.gradient_method_outer, "finite differences");
-    assert_eq!(exact.gradient_method_inner, "analytic");
-    assert_eq!(
-        forced.gradient_method_inner,
-        "finite differences (compiled plan failed)"
-    );
+    // The user's `gradient = fd` is the outer route that is finite differences by choice
+    // (Gauss-Newton's own outer scores are exact, #2786).
+    let o = FitOptions {
+        gradient_method: crate::types::GradientMethod::Fd,
+        ..opts(EstimationMethod::FoceGn)
+    };
+    let (exact, forced) = pair(&m, &p, &o);
+    for r in [&exact, &forced] {
+        assert_eq!(r.gradient_method_outer, "finite differences");
+        assert_eq!(r.gradient_method_inner, "finite differences");
+    }
     use crate::api::postfit::plan_fallback_label as lab;
     assert_eq!(lab("finite differences", 1, 4), "finite differences");
     assert_eq!(lab("finite differences", 4, 4), "finite differences");

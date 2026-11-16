@@ -11414,14 +11414,14 @@ const GAP_POLISHED_VS_FD: f64 = 1e-8;
 #[test]
 fn the_polish_step_is_clipped_to_the_trust_radius() {
     let h = DMatrix::from_diagonal(&DVector::from_vec(vec![1.0, 0.0]));
-    let (dir, gn) = polish_proposal(&h, &[0.5, 1.0]).expect("finite");
+    let PolishStep { dir, gn, .. } = polish_proposal(&h, &[0.5, 1.0]).expect("finite");
     let norm = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
     assert!((norm - POLISH_RADIUS).abs() < 1e-12, "norm {norm}");
     assert_eq!(gn, 1.0);
     // Direction kept: the unclipped step is (-0.5, -1e8).
     assert!((dir[0] / dir[1] - 0.5e-8).abs() < 1e-12, "{dir:?}");
     // Below the radius the step is the plain damped Newton one.
-    let (small, _) = polish_proposal(&h, &[0.5, 0.0]).unwrap();
+    let small = polish_proposal(&h, &[0.5, 0.0]).unwrap().dir;
     assert_eq!(small, vec![-0.5, 0.0]);
 }
 
@@ -11440,7 +11440,7 @@ fn a_far_off_polish_start_needs_the_trust_radius() {
         polish: polish_proposal(&h, &grad(&eta0)),
         ..ModeOut::default()
     };
-    let r = polish_mode(&eta0, &mut out, |at, out| {
+    let r = polish_mode(&eta0, &mut out, POLISH_STEPS, |at, out| {
         if at.iter().map(|v| v * v).sum::<f64>().sqrt() > 10.0 {
             return None;
         }
@@ -11451,9 +11451,39 @@ fn a_far_off_polish_start_needs_the_trust_radius() {
     assert!(r.is_some(), "the walk served a point inside the map");
     let at = out.eta_polished.expect("the last served eta");
     assert!(
-        at.iter().map(|v| v * v).sum::<f64>().sqrt() < 10.0,
+        at.iter().map(|v| v * v).sum::<f64>().sqrt() <= 10.0,
         "{at:?}"
     );
+}
+
+/// G15: the walk leaves a saddle region. `l(x) = x^4/4 - x^2/2` has `g = x^3 - x`, `H = 3x^2 - 1`;
+/// from `x = 0.3` (`H < 0`) the reflected Newton step goes downhill in `l` toward the mode at
+/// `x = 1`, and `|g|` grows along it (to `0.385` at `x = 1/sqrt 3`) however short the step, so a
+/// line search on `|g|` alone halves six times and gives the subject up. The directional merit
+/// (`descends`) accepts it. The pass declines (`None`, carrying the proposal) until `|g|` is at the
+/// target, as a mode-system decline does.
+/// Mutation: drop `descends` from `polish_mode`'s acceptance -> `polish_mode` returns `None`.
+#[test]
+fn the_polish_leaves_a_saddle_region_where_the_gradient_norm_grows() {
+    let grad = |x: f64| vec![x * x * x - x];
+    let hess = |x: f64| DMatrix::from_element(1, 1, 3.0 * x * x - 1.0);
+    let eta0 = [0.3];
+    let mut out = ModeOut {
+        polish: polish_proposal(&hess(0.3), &grad(0.3)),
+        ..ModeOut::default()
+    };
+    let r = polish_mode(&eta0, &mut out, POLISH_STEPS, |at, out| {
+        let x = at[0];
+        out.polish = polish_proposal(&hess(x), &grad(x)).filter(|p| !(p.gn <= POLISH_TARGET_TOL));
+        out.objective = Some(0.0);
+        out.polish.is_none().then(|| vec![0.0])
+    });
+    assert!(r.is_some(), "the walk reached the mode");
+    let at = out.eta_polished.expect("the mode");
+    assert!((at[0] - 1.0).abs() < 1e-6, "{at:?}");
+    // The straddle: `|g|` really does grow along the first step, so the old merit refused it.
+    let step = polish_proposal(&hess(0.3), &grad(0.3)).unwrap().dir[0];
+    assert!(grad(0.3 + 0.01 * step)[0].abs() > grad(0.3)[0].abs());
 }
 
 // ---- G14: the exact inner Hessian's declines, and the FD Hessians they fed (deleted) ----------

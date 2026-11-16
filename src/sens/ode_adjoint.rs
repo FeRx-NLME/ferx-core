@@ -1023,7 +1023,9 @@ fn adjoint_gradient(
         if first.is_some() || held {
             return first;
         }
-        polish_mode(&sc.eta, o, |eta, o| attempt(eta, Some(o)))
+        polish_mode(&sc.eta, o, polish_steps(subject), |eta, o| {
+            attempt(eta, Some(o))
+        })
     }
     go(&sc, subject, template, x, objective, held, eta_dx)
 }
@@ -1031,10 +1033,37 @@ fn adjoint_gradient(
 /// The gradient [`polish_mode`] walks `‖∇_η l‖∞` down to.
 const POLISH_TARGET_TOL: f64 = MODE_STATIONARY_TOL * 0.1;
 
-/// [`newton_polish_step`] with the `‖∇_η l‖∞` it was taken at.
-fn polish_proposal(h: &DMatrix<f64>, grad_l: &[f64]) -> Option<(Vec<f64>, f64)> {
-    newton_polish_step(h, grad_l)
-        .map(|d| (d, crate::sens::num::nan_max_abs(grad_l.iter().copied())))
+/// What a pass hands [`polish_mode`] at an `η̂` off the mode: the damped Newton step from it, the
+/// `‖∇_η l‖∞` it was taken at, and that gradient itself (for the step's directional merit).
+#[derive(Debug)]
+pub(crate) struct PolishStep {
+    pub(crate) dir: Vec<f64>,
+    pub(crate) gn: f64,
+    pub(crate) grad: Vec<f64>,
+}
+
+/// [`newton_polish_step`] with the `∇_η l` (and its `‖·‖∞`) it was taken at.
+fn polish_proposal(h: &DMatrix<f64>, grad_l: &[f64]) -> Option<PolishStep> {
+    newton_polish_step(h, grad_l).map(|dir| PolishStep {
+        dir,
+        gn: crate::sens::num::nan_max_abs(grad_l.iter().copied()),
+        grad: grad_l.to_vec(),
+    })
+}
+
+/// Whether the step `d` taken between the gradients `g0` and `g1` is a descent of the inner
+/// objective: the trapezoid estimate of its change, `½(g0 + g1)·d`, is negative. Exact for a
+/// quadratic. The reflected Newton step walks a negative-curvature direction downhill in `l`,
+/// where `‖∇l‖` grows with the step however short, so `‖∇l‖` alone refuses every step off a
+/// saddle region.
+fn descends(g0: &[f64], g1: &[f64], d: &[f64]) -> bool {
+    let est: f64 = g0
+        .iter()
+        .zip(g1)
+        .zip(d)
+        .map(|((a, b), s)| (a + b) * s)
+        .sum();
+    est < 0.0
 }
 
 /// The most damped Newton steps [`polish_mode`] takes before it gives the subject up.
@@ -1049,6 +1078,11 @@ thread_local! {
     pub(crate) static POLISH_BUDGET: std::cell::Cell<usize> =
         const { std::cell::Cell::new(POLISH_STEPS) };
 }
+
+#[cfg(test)]
+/// Test hook: the ids of the subjects whose polish is off, on every thread (a population pass
+/// runs its subjects on the pool, where [`POLISH_BUDGET`] is not set).
+static POLISH_OFF_FOR: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Test guard: the polish off for its lifetime, to read the decline and its salvage.
 #[cfg(test)]
@@ -1068,11 +1102,41 @@ impl Drop for PolishOff {
     }
 }
 
-fn polish_steps() -> usize {
+/// Test guard: the polish off, on every thread, for the subject with this id only (keep the
+/// ids unique to the test).
+#[cfg(test)]
+pub(crate) struct PolishOffFor(String);
+
+#[cfg(test)]
+impl PolishOffFor {
+    pub(crate) fn new(id: &str) -> Self {
+        POLISH_OFF_FOR.lock().unwrap().push(id.to_string());
+        PolishOffFor(id.to_string())
+    }
+}
+
+#[cfg(test)]
+impl Drop for PolishOffFor {
+    fn drop(&mut self) {
+        let mut v = POLISH_OFF_FOR.lock().unwrap();
+        if let Some(i) = v.iter().position(|x| *x == self.0) {
+            v.remove(i);
+        }
+    }
+}
+
+fn polish_steps(subject: &Subject) -> usize {
     #[cfg(test)]
-    return POLISH_BUDGET.with(|c| c.get());
+    return if POLISH_OFF_FOR.lock().unwrap().contains(&subject.id) {
+        0
+    } else {
+        POLISH_BUDGET.with(|c| c.get())
+    };
     #[cfg(not(test))]
-    POLISH_STEPS
+    {
+        let _ = subject;
+        POLISH_STEPS
+    }
 }
 
 /// A pass that declined at its mode system (an `η̂` the inner search left off the mode, on
@@ -1090,30 +1154,38 @@ fn polish_steps() -> usize {
 fn polish_mode(
     eta0: &[f64],
     out: &mut ModeOut,
+    steps: usize,
     mut pass: impl FnMut(&[f64], &mut ModeOut) -> Option<Vec<f64>>,
 ) -> Option<Vec<f64>> {
     out.polishing = true;
     let mut last: Option<(Vec<f64>, Vec<f64>, Option<f64>)> = None;
     let mut at = eta0.to_vec();
-    // The iterate the current direction started from: (η, direction, ‖g‖∞, halvings).
-    let mut base: Option<(Vec<f64>, Vec<f64>, f64, u32)> = None;
-    for _ in 0..polish_steps() {
-        let Some((dir, gn)) = out.polish.take() else {
+    // The iterate the current direction started from.
+    let mut base: Option<Base> = None;
+    for _ in 0..steps {
+        let Some(PolishStep { dir, gn, grad }) = out.polish.take() else {
             return finish(out, last);
         };
-        let (from, dir, gn, halvings) = match base.take() {
-            // The step overshot: back off along the direction it was taken in.
-            Some((e0, d0, g0, k)) if !(gn < g0) => {
-                if k >= 6 {
+        let (from, dir, gn, grad, halvings) = match base.take() {
+            // The step is not a descent of `‖∇_η l‖∞` and not of `l` (an overshoot): back off
+            // along the direction it was taken in.
+            Some(b) if !(gn < b.gn) && !descends(&b.grad, &grad, &b.dir) => {
+                if b.halvings >= 6 {
                     return finish(out, last);
                 }
-                (e0, d0, g0, k + 1)
+                (b.from, b.dir, b.gn, b.grad, b.halvings + 1)
             }
-            _ => (at.clone(), dir, gn, 0),
+            _ => (at.clone(), dir, gn, grad, 0),
         };
         let scale = 0.5_f64.powi(halvings as i32);
         at = from.iter().zip(&dir).map(|(e, d)| e + scale * d).collect();
-        base = Some((from, dir, gn, halvings));
+        base = Some(Base {
+            from,
+            dir,
+            gn,
+            grad,
+            halvings,
+        });
         *out = ModeOut {
             want_dx: out.want_dx,
             want_hessian: out.want_hessian,
@@ -1129,6 +1201,15 @@ fn polish_mode(
         }
     }
     finish(out, last)
+}
+
+/// The iterate a [`polish_mode`] direction started from, with the gradient it was taken at.
+struct Base {
+    from: Vec<f64>,
+    dir: Vec<f64>,
+    gn: f64,
+    grad: Vec<f64>,
+    halvings: u32,
 }
 
 /// [`polish_mode`]'s result: the gradient, with its `η̂` and objective left on `out`.
@@ -4924,7 +5005,7 @@ fn run(
         return None;
     };
     if let Some(o) = eta_dx.as_deref_mut().filter(|o| o.polishing) {
-        o.polish = polish_proposal(&h, &grad_l).filter(|(_, gn)| !(*gn <= POLISH_TARGET_TOL));
+        o.polish = polish_proposal(&h, &grad_l).filter(|p| !(p.gn <= POLISH_TARGET_TOL));
         o.objective = Some(kr.value(0));
     }
 
@@ -5076,7 +5157,7 @@ pub(crate) struct ModeOut {
     /// What a mode-system decline hands the polish loop in [`adjoint_gradient`]: the damped
     /// Newton step from the `η̂` the pass declined at, and that `η̂`'s `‖∇_η l‖∞`. Cleared
     /// at the start of every pass, like `mode_system_declined`.
-    pub(crate) polish: Option<(Vec<f64>, f64)>,
+    pub(crate) polish: Option<PolishStep>,
     /// Set by [`polish_mode`] while it walks to the mode: a pass that is served at an `η̂`
     /// still above [`POLISH_TARGET_TOL`] (a definite `H` takes no stationarity gate) also
     /// hands back its step, so the walk goes on to the mode.

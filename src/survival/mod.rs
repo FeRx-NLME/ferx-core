@@ -554,8 +554,9 @@ pub(crate) fn tte_record_served(model: &CompiledModel, subject: &Subject, cmt: u
 
 /// Whether the TTE endpoint on `cmt` has an exact η-channel: an analytic hazard with a
 /// dual-evaluable program, or an ODE-accumulated one with a compiled RHS (the dual walk reads
-/// `h` as the RHS at the saved state, at the value path's clock anchors). A subject outside the walk's own scope
-/// (time-varying covariates, a lag, a steady-state dose) still declines per point.
+/// `h` as the RHS at the saved state, at the value path's clock anchors). Time-varying
+/// covariates, a lag and a steady-state dose are inside the walk's scope (#2786); a subject
+/// the walk still declines is a recorder defect, reported as such.
 pub(crate) fn tte_endpoint_served(model: &CompiledModel, cmt: usize) -> bool {
     match model.endpoints.get(&cmt) {
         Some(crate::types::EndpointLikelihood::Tte {

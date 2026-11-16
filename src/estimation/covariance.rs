@@ -932,10 +932,11 @@ const COV_STENCIL_ODE_MAX_STEPS_FACTOR: usize = 10;
 
 /// The ODE solver override a covariance step whose matrices are finite-differenced runs under
 /// (#520), or `None` to run every step at the fit's own tolerance. Which steps take it is
-/// [`compute_covariance_for`]'s call: one that differences `R`'s objective, and one that reads
-/// the score cross-product `S` alone — whose per-subject θ scores are differenced too, forward
-/// or central, even on the closed-form gradient paths (#520 review round 2). The whole step,
-/// not those matrices alone, so no estimate mixes tolerances (round 6).
+/// [`compute_covariance_for`]'s call: one that differences `R`'s objective (the user's
+/// `analytic_cov_hessian = false`, or a subject the exact R-matrix declines), and one whose
+/// score cross-product `S` takes a differenced per-subject score where the exact one declines
+/// (#520 review round 2). The whole step, not those matrices alone, so no estimate mixes
+/// tolerances (round 6).
 ///
 /// The stencil divides by `h²`, so it amplifies integration noise the fit's optimizer averages
 /// over: on the 3-cpt IV ODE fixture (180 subjects, `analytic_cov_hessian = false`) the default

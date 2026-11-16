@@ -1839,13 +1839,22 @@ thread_local! {
     /// integrates on the fixed grid with the kernel's age carrying the lag's jet — the
     /// mutation the anchoring's parity tests must see.
     pub(crate) static ONSET_SHIFT_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test switch: [`next_event_is_later`] refuses the anchor when another event precedes it at
+    /// the same instant (the clause G9 added and G15 removed), the mutation
+    /// `a_coincident_onset_is_anchored_with_a_sibling_at_its_instant` must see.
+    pub(crate) static ONSET_ALONE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether the segment after the event at `t_event` (timeline slot `p`) starts strictly later,
-/// and no event precedes it at the same instant, so a Weibull / transit onset or infusion-window
-/// end at `t_event` can anchor it (`onset_shift`): the anchor shifts the clock of every dose, so
-/// a sibling event at the same instant would read a kernel at an age whose jet it does not
-/// cancel.
+/// so a Weibull / transit onset or infusion-window end at `t_event` can anchor it
+/// (`onset_shift`).
+///
+/// An event at the same instant before this one (a second dose's record, a second dose whose
+/// onset coincides) does not stop the anchor: measured at the default lag with the sibling at
+/// the onset's own instant, the plan with no such clause is exact (inner-Hessian gap 2.2e-5
+/// worst over Weibull `β = 0.5, 1.5, 3`, transit `n = 2.5`, route and compartment lag), where
+/// a clause refusing the anchor falls to the moving-boundary crossing, whose singular rate-on
+/// is `1.7e2` off (`a_coincident_onset_is_anchored_with_a_sibling_at_its_instant`).
 fn next_event_is_later<T: crate::sens::num::PkNum>(
     tl: &[(T, u8, usize)],
     p: usize,
@@ -1858,11 +1867,15 @@ fn next_event_is_later<T: crate::sens::num::PkNum>(
     let later = tl.get(p + 1).is_some_and(|e| {
         e.0.br_cmp(crate::sens::num::BranchCmp::Gt, t_event + T::from_f64(1e-9))
     });
-    let alone = p == 0
-        || tl[p - 1]
-            .0
-            .br_cmp(crate::sens::num::BranchCmp::Lt, t_event - T::from_f64(1e-9));
-    later && alone
+    #[cfg(test)]
+    if ONSET_ALONE_ON.with(|c| c.get()) {
+        let alone = p == 0
+            || tl[p - 1]
+                .0
+                .br_cmp(crate::sens::num::BranchCmp::Lt, t_event - T::from_f64(1e-9));
+        return later && alone;
+    }
+    later
 }
 
 /// The state just after a switch whose true time is `t_b + δ` (`δ` jet-only, the walk

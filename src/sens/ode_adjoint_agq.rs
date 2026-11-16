@@ -421,8 +421,7 @@ pub(super) fn agq_planned(
     };
     if at_mode {
         if let Some(o) = eta_dx.as_deref_mut().filter(|o| o.polishing) {
-            o.polish =
-                polish_proposal(h_inner, &grad_l).filter(|(_, gn)| !(*gn <= POLISH_TARGET_TOL));
+            o.polish = polish_proposal(h_inner, &grad_l).filter(|p| !(p.gn <= POLISH_TARGET_TOL));
         }
     }
 
