@@ -1745,7 +1745,6 @@ fn the_analytic_rsr_step_keeps_s_with_r_at_the_fit_tolerance() {
             m,
             &population,
             &modes.0,
-            &modes.1,
             &modes.2,
             &bounds,
             &options,

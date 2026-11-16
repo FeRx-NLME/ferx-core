@@ -715,7 +715,6 @@ pub(crate) fn assemble_score_cross_product(
     model: &CompiledModel,
     population: &Population,
     eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
     kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
@@ -745,7 +744,7 @@ pub(crate) fn assemble_score_cross_product(
     // under the rayon worker's default `MIXNUM = 1` with the base Ω/Σ, so the
     // class-2-only θ and the mixing θ had identically-zero score columns: `s` was
     // refused as singular and `rsr` silently lost those coordinates. The mixture path
-    // computes its own per-class modes at `x̂`, so `eta_hats` / `h_matrices` /
+    // computes its own per-class modes at `x̂`, so `eta_hats` /
     // `kappas` (the MIXEST class's) are not read for it.
     let mixture = model.mixture.as_ref().map(|_| {
         crate::estimation::mixture::MixtureScoreContext::new(
@@ -753,20 +752,22 @@ pub(crate) fn assemble_score_cross_product(
         )
     });
 
-    // Per-subject scores in parallel (mirrors `build_gn_system`).
+    // Per-subject scores in parallel.
     //
-    // Convention: each row is the **fixed-mode** score, the per-subject gradient at x̂
-    // with η̂, `H` and κ̂ held at their x̂ values (`fixed_ebe_subject_score`). The FOCEI
-    // EBE-response term `tᵢ = ½·∂log|H̃|/∂η̂·dη̂/dθ` it adds back is identically zero
-    // today (#338 Part A removed the θ block; the ω/σ blocks are #1817), so S carries
-    // neither that term nor the θ-dependence of the held prediction Jacobian. The
-    // FD-built R reconverges η̂ at every stencil point and is unaffected. NONMEM's
-    // `MATRIX=S` differentiates the total `−2LLᵢ(x)`, η̂ re-estimated at every
-    // perturbed x. The held score is biased at the MLE (`Σᵢ gᵢ ≠ 0`), so the two S
-    // differ by a convention gap that more subjects do not close — measured on
-    // `mixture_iv` and its one-population twin in `tests/mixture_cov_s_nonmem.rs`.
-    // Closing it is #1817's territory. FOCE (`!interaction`) uses the Sheiner–Beal
-    // gradient, which has no `log|H̃|` term, so `tᵢ` is not called for it.
+    // Convention (#2974): each row is the subject's **total** derivative `dnllᵢ/dx`, the mode
+    // re-estimated at every `x` — the subject's term of the outer gradient
+    // ([`subject_total_score`]), which is what NONMEM's `MATRIX=S` differentiates. The
+    // fixed-mode score it replaces (η̂, `H`, κ̂ held at x̂) is biased at the MLE
+    // (`Σᵢ gᵢ ≠ 0`), a gap more subjects do not close (`tests/mixture_cov_s_nonmem.rs`).
+    // One packed point for the population, as the outer gradient unpacks it.
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x_hat);
+    // The covariance step's inner tolerance for the reconverged fallback's probes too, not
+    // the outer gradient's stencil one (#2261).
+    let row_options = FitOptions {
+        inner_tol: options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
+        ..options.clone()
+    };
+    let mixture_points = mixture.as_ref().map(|c| c.class_points());
     let report = cov_progress("score matrix", n_subj, options.verbose);
     let scores: Vec<Result<Vec<f64>, String>> = crate::par::map(n_subj, |i| {
         // Cooperative cancel: skip the per-subject gradient and return a
@@ -783,7 +784,12 @@ pub(crate) fn assemble_score_cross_product(
             &[]
         };
         if let Some(context) = &mixture {
-            let score = context.score(model, population, i, options);
+            let score = context.score(
+                model,
+                population,
+                i,
+                mixture_points.as_deref().unwrap_or(&[]),
+            );
             report();
             return Ok(score);
         }
@@ -795,17 +801,17 @@ pub(crate) fn assemble_score_cross_product(
             report();
             return score;
         }
-        let gi = fixed_ebe_subject_score(
+        let gi = subject_total_score(
             x_hat,
             template,
             model,
             population,
             i,
             &eta_hats[i],
-            &h_matrices[i],
             kap_i,
+            pt.as_ref(),
             bounds,
-            options,
+            &row_options,
         );
         report();
         Ok(gi)
@@ -826,38 +832,86 @@ pub(crate) fn assemble_score_cross_product(
     Ok(s)
 }
 
-/// One subject's single-population score `∂nllᵢ/∂x` at fixed modes (η̂, `H`, κ̂) — the
-/// row `assemble_score_cross_product` squares into S, and (#1956) each class's term
-/// of a mixture subject's score. `subject_nll_pop_grad` (closed form or central FD),
-/// plus the FOCEI `log|H̃|` EBE-response term `tᵢ`, which is identically zero today
-/// (#338 Part A); see the convention comment in `assemble_score_cross_product`.
+/// One subject's single-population score `dnllᵢ/dx` — the row `assemble_score_cross_product`
+/// squares into S, and (#1956) each class's term of a mixture subject's score — in NONMEM's
+/// `MATRIX=S` convention: the **total** derivative of the subject's objective, the mode
+/// `η̂` (and under IOV κ̂) re-estimated at every `x` (#2974).
+///
+/// It is the subject's term of the fit's outer gradient: the adjoint's exact packed gradient
+/// (`Ψ = F − wᵀ∇_η l`, which carries the mode response) wherever the outer gradient would ask
+/// the adjoint (`analytic_outer_gradient_available`, which honours `gradient = fd`), and
+/// otherwise — or where the adjoint declines the subject — the reconverged central difference
+/// of the subject's objective (`subject_reconverged_fd_gradient[_iov]`). That is the total
+/// derivative; the NLopt outer gradient salvages a non-structural decline with the held-EBE
+/// score instead unless reconvergence is scheduled, so on such a subject the two differ. One rule for every estimator and model class
+/// this path serves: FOCE and FOCEI, IOV, non-Gaussian endpoints, covariate networks, and a
+/// mixture's classes. (AGQ / Laplace take `SubjectScoreContext::score`, the same convention.)
+///
+/// Before #2974 the row was the **fixed-mode** score (η̂, `H`, κ̂ held at x̂, the θ axis a
+/// forward difference of the predictions), which is biased at the MLE (`Σᵢ gᵢ ≠ 0`) and is
+/// not NONMEM's `S` (`tests/mixture_cov_s_nonmem.rs`). Fixed coordinates are not zeroed: the
+/// caller reads the free block only.
+///
+/// `options.inner_tol` is the tolerance of the reconverged difference's probes (floored at the
+/// stencil tolerance); the covariance step passes its own (`effective_cov_inner_tol`, #2261),
+/// not the fit's. A subject repelled at `x` returns zeros, as the outer gradient's salvage
+/// does (the adjoint's non-finite vector is filtered, and the difference masks the rail).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fixed_ebe_subject_score(
+pub(crate) fn subject_total_score(
     x: &[f64],
     template: &ModelParameters,
     model: &CompiledModel,
     population: &Population,
     subj_idx: usize,
     eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
     kappas: &[DVector<f64>],
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let (_, mut gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
-        x, template, model, population, subj_idx, eta_hat, h_matrix, kappas, bounds, options,
-    );
-    if options.interaction {
-        if let Some(ti) = crate::estimation::gauss_newton::subject_eta_response_correction(
-            None, x, template, model, population, subj_idx, eta_hat, h_matrix, kappas, bounds,
-            options,
-        ) {
-            for (g, t) in gi.iter_mut().zip(ti.iter()) {
-                *g += *t;
-            }
-        }
+    let subject = &population.subjects[subj_idx];
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        return vec![0.0; x.len()];
     }
-    gi
+    let analytic = crate::sens::provider::analytic_outer_gradient_available(model)
+        && GradientMethod::effective(model, options) != GradientMethod::Fd;
+    let exact = analytic
+        .then_some(pt)
+        .flatten()
+        .and_then(|pt| {
+            let b = stacked_mode(
+                model,
+                subject,
+                eta_hat,
+                (model.n_kappa > 0).then_some(kappas),
+            )?;
+            crate::estimation::sens_outer_gradient::subject_gradient_at(
+                model,
+                subject,
+                pt,
+                &b,
+                options.interaction,
+            )
+        })
+        .filter(|g| g.len() == x.len() && g.iter().all(|v| v.is_finite()));
+    if let Some(g) = exact {
+        return g;
+    }
+    // The reconverged difference masks a probe on the `1e20` rail (`central_diff_packed_gated`,
+    // #2378), so a subject repelled at `x` — for which the adjoint returned a non-finite
+    // vector, filtered above — contributes zero here, as the outer gradient's salvage does.
+    let warm = (model.n_kappa > 0)
+        .then(|| crate::estimation::outer_optimizer::joint_warm_start(eta_hat, kappas));
+    let warm = warm.as_ref().unwrap_or(eta_hat);
+    if model.n_kappa > 0 {
+        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient_iov(
+            x, template, model, subject, warm, bounds, options,
+        )
+    } else {
+        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+            x, template, model, subject, eta_hat, bounds, options,
+        )
+    }
 }
 
 /// Test hook: subject ids whose analytic covariance term declines, so a test can reach the
@@ -1183,16 +1237,16 @@ const SALVAGE_MAX_DECLINED_FRACTION: f64 = 0.5;
 /// A subject's mode as the adjoint's recordings take it: `η̂`, followed under IOV by every
 /// occasion's `κ̂` (the stacked `[η, κ₁…κ_K]`), or `None` when the `κ̂` do not match the
 /// subject's occasions.
-pub(crate) fn stacked_mode<'a>(
+pub(crate) fn stacked_mode<'a, K: AsRef<[DVector<f64>]> + ?Sized>(
     model: &CompiledModel,
     subject: &Subject,
     eta_hat: &'a DVector<f64>,
-    kappas: Option<&Vec<DVector<f64>>>,
+    kappas: Option<&K>,
 ) -> Option<std::borrow::Cow<'a, [f64]>> {
     if model.n_kappa == 0 {
         return Some(std::borrow::Cow::Borrowed(eta_hat.as_slice()));
     }
-    let kap = kappas?;
+    let kap = kappas?.as_ref();
     if kap.len() != crate::stats::stacked_layout::group_count(subject)
         || kap.iter().any(|k| k.len() != model.n_kappa)
     {
@@ -2333,9 +2387,9 @@ fn covariance_step(
     // apply the penalty, so their SEs are the curvature of what they fitted).
     let nn_reg = cov_nn_regularizer(fit_method, model, population, options);
 
-    // `h_matrices` (the H from the fit) is read only by `S`
-    // (`assemble_score_cross_product`): `R` reconverges the EBEs at every perturbed
-    // point and recomputes H there.
+    // Neither `S` nor `R` reads the fit's `h_matrices`: `S` takes each subject's total
+    // derivative (#2974), and `R` reconverges the EBEs at every perturbed point and recomputes
+    // H there.
 
     let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
 
@@ -2534,8 +2588,7 @@ fn covariance_step(
     // whose placeholder rows are then never trusted.
     let score_cross_product = || {
         let s = assemble_score_cross_product(
-            x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
-            &free_idx,
+            x_hat, template, model, population, eta_hats, kappas, &bounds, options, &free_idx,
         );
         (!crate::cancel::is_cancelled(&options.cancel)).then_some(s)
     };
@@ -4277,6 +4330,10 @@ mod salvage_tests;
 #[cfg(test)]
 #[path = "covariance_stationarity_tests.rs"]
 mod stationarity_tests;
+
+#[cfg(test)]
+#[path = "covariance_score_tests.rs"]
+mod score_tests;
 
 #[cfg(all(test, feature = "nn"))]
 #[path = "covariance_nn_reg_tests.rs"]
@@ -6774,13 +6831,13 @@ mod tests {
         let out = success(out, "focei s");
         assert_eq!((out.method, evals), (CovarianceMethod::CrossProduct, 0));
 
-        let (x, p, etas, hs) = inputs_at_init(&model, &pop, &opts);
+        let (x, p, etas, _) = inputs_at_init(&model, &pop, &opts);
         let kappas = vec![Vec::new(); pop.subjects.len()];
         let super::PackedStart { bounds, fixed, .. } = super::pack_with_bounds(&p);
         let free_idx: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
         assert_eq!(free_idx.len(), 1, "fixture: ω² alone is free");
         let s = super::assemble_score_cross_product(
-            &x, &p, &model, &pop, &etas, &hs, &kappas, &bounds, &opts, &free_idx,
+            &x, &p, &model, &pop, &etas, &kappas, &bounds, &opts, &free_idx,
         )
         .expect("S");
         let want = super::embed_free(
@@ -7593,13 +7650,13 @@ mod tests {
             .filter(|(_, f)| !**f)
             .map(|(i, _)| i)
             .collect();
-        let (etas, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        let (etas, _, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
             &model, &pop, p, 200, 1e-8, None, None, 0, 0,
         );
         let rec = on_one_thread(|| {
             record_inner_solves(|| {
                 super::assemble_score_cross_product(
-                    &x, p, &model, &pop, &etas, &hms, &kappas, &bounds, &opts, &free,
+                    &x, p, &model, &pop, &etas, &kappas, &bounds, &opts, &free,
                 )
                 .expect("the S matrix")
             })
