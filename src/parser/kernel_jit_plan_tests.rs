@@ -2314,7 +2314,10 @@ fn every_native_plan_tier_probes_its_stack() {
     for (quick, opt) in [(true, "none"), (true, "speed"), (false, "speed")] {
         let isa = plan_isa(quick, opt).expect("a host target");
         let f = isa.flags();
-        assert!(f.enable_probestack(), "tier ({quick}, {opt}): no stack probes");
+        assert!(
+            f.enable_probestack(),
+            "tier ({quick}, {opt}): no stack probes"
+        );
         assert_eq!(
             f.probestack_strategy(),
             ProbestackStrategy::Inline,
