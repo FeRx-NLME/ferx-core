@@ -5858,15 +5858,50 @@ fn cov_hessian_matches_profile_fd_closed_form_focei_and_foce() {
     assert!(fd < 1e-5, "FOCE vs FD {fd:.2e}");
 }
 
-/// `psi_along` spends its directions over narrower passes under `PASS_WIDTH_CAP`. Each
-/// column must still land on its own
+/// The covariance Hessian's production passes (one direction each, the single-tangent layout:
+/// `psi_lanes` / `psi_diag`) equal the `K`-tangent layout that `PASS_WIDTH_CAP` runs in tests,
+/// where the directions are spent over wider passes. Each column must still land on its own
 /// direction: width 3 over 7 packed axes leaves a ragged last pass, so an offset taken from
-/// the pass's own width rather than the planned one misplaces columns. Measured: bit-identical
-/// at widths 1 and 3 (a column's arithmetic does not see the other tangents); a misplaced
-/// column moves the matrix by O(1) of its largest entry.
-#[test]
-fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
+/// the pass's own width rather than the planned one misplaces columns. On a plain subject, an
+/// AGQ one (`n_agq = 3`, non-exact anchor), an IOV one (stacked η/κ widths, per-occasion
+/// tangents) and, with `nn`, a reduced-basis `[covariate_nn]` one. A column's arithmetic does
+/// not see the other tangents, so equality is bit-for-bit where measured (printed with
+/// `--nocapture`); a misplaced column moves the matrix by O(1) of its largest entry.
+/// Mutation: offset `psi_lanes`'s `lane(c * width + a, ..)` by the last pass's width → the ragged
+/// width-3 rows differ.
+fn single_tangent_equals_k_wide(label: &str, model: &CompiledModel, s: &Subject, o: Objective) {
     use super::hessian::PASS_WIDTH_CAP;
+    let params = moved_params(model);
+    let x = pack_params(&params);
+    let eta = ebe_for(model, s, &params, 1e-12, o != Objective::Foce);
+    let run = |cap: Option<usize>| {
+        with_fit_stack(|| {
+            PASS_WIDTH_CAP.with(|c| c.set(cap));
+            let h = subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), o);
+            PASS_WIDTH_CAP.with(|c| c.set(None));
+            h
+        })
+        .unwrap_or_else(|| panic!("{label}: in scope"))
+    };
+    let single = run(None);
+    for cap in [3, 4] {
+        let wide = run(Some(cap));
+        assert_eq!(wide.shape(), single.shape(), "{label} width {cap}: shape");
+        let mut worst = 0.0f64;
+        for (i, (a, b)) in wide.iter().zip(single.iter()).enumerate() {
+            assert!(
+                a.is_finite() && b.is_finite(),
+                "{label} width {cap}: non-finite entry {i}"
+            );
+            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+        }
+        eprintln!("{label}: single-tangent vs width {cap}: {worst:.2e}");
+        assert!(worst == 0.0, "{label} width {cap}: {worst:.2e}");
+    }
+}
+
+#[test]
+fn cov_hessian_single_tangent_passes_equal_the_k_wide_ones() {
     let one = parse_model_string(ONE_CPT_ORAL).unwrap();
     let s = subject(
         &one,
@@ -5877,49 +5912,28 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
         &TIMES,
         &[0.1, -0.05, 0.2],
     );
-    let params = moved_params(&one);
-    let x = pack_params(&params);
     assert_eq!(
-        x.len(),
+        pack_params(&moved_params(&one)).len(),
         7,
         "the fixture must leave a ragged last pass at width 3"
     );
-    let eta = ebe_for(&one, &s, &params, 1e-12, true);
-    let run = |cap: Option<usize>| {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .stack_size(crate::FIT_RAYON_STACK_SIZE)
-                .spawn_scoped(scope, || {
-                    PASS_WIDTH_CAP.with(|c| c.set(cap));
-                    subject_adjoint_cov_hessian(
-                        &one,
-                        &s,
-                        &params,
-                        &x,
-                        eta.as_slice(),
-                        Objective::Focei,
-                    )
-                })
-                .expect("spawn")
-                .join()
-                .expect("join")
-        })
-        .expect("in scope")
-    };
-    let full = run(None);
-    for cap in [1, 3] {
-        let narrow = run(Some(cap));
-        let scale = full.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-        let mut worst = 0.0f64;
-        for (a, b) in narrow.iter().zip(full.iter()) {
-            assert!(
-                a.is_finite() && b.is_finite(),
-                "width {cap}: non-finite entry"
-            );
-            worst = worst.max((a - b).abs() / scale);
-        }
-        eprintln!("cov Hessian at width {cap} vs 8: {worst:.2e}");
-        assert!(worst < 1e-12, "width {cap} vs 8: {worst:.2e}");
+    single_tangent_equals_k_wide("FOCEI", &one, &s, Objective::Focei);
+    single_tangent_equals_k_wide(
+        "AGQ-3",
+        &one,
+        &s,
+        Objective::Agq {
+            n_agq: 3,
+            exact: false,
+        },
+    );
+    let iov = parse_model_string(ODE_IOV).unwrap();
+    let s_iov = iov_subject(&iov);
+    single_tangent_equals_k_wide("IOV", &iov, &s_iov, Objective::Focei);
+    #[cfg(feature = "nn")]
+    {
+        let (m, s) = covariate_nn_fixture();
+        single_tangent_equals_k_wide("covariate NN", &m, &s, Objective::Focei);
     }
 }
 
@@ -7721,6 +7735,33 @@ fn closed_vs_generic(
         }
     }
     worst
+}
+
+/// The closed form declines, in every build, when its row sensitivities are not as wide as
+/// Ω⁻¹ (a `ParT` from `map_rows` carries no Ω, so its width would be 0 and the Hessian
+/// silently empty); a `ParT` with Ω answers. Mutation: drop the width check in
+/// `inner_hessian_through_predictions` → the no-Ω call returns `Some` of an empty matrix.
+#[test]
+fn the_inner_hessian_through_predictions_declines_a_width_it_cannot_assemble() {
+    use crate::sens::focei_kernel::{inner_hessian_through_predictions, LikCtx, ParT};
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &model.default_params;
+    let ctx = LikCtx::new(&model, &s, params);
+    let (f, g, q) = live_jets(TIMES.len(), 3);
+    let full = ParT::of(&model, &s, params);
+    let h = inner_hessian_through_predictions(&ctx, &f, &g, &q, &full).expect("with Ω");
+    assert_eq!((h.len(), h[0].len()), (3, 3));
+    let rows = full.map_rows(|x| x);
+    assert!(
+        inner_hessian_through_predictions(&ctx, &f, &g, &q, &rows).is_none(),
+        "a ParT without Ω declines"
+    );
 }
 
 /// The closed form is the generic exact inner Hessian, on arbitrary jets — the identity is

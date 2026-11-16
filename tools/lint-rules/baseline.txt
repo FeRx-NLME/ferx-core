@@ -168,7 +168,6 @@ nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_block_on_a_covariate_nn_subject_is
 nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_block_on_axes_is_the_full_hessians_block
 nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_diag_on_a_covariate_nn_subject_runs_in_the_reduced_basis
 nan-fold 1 src/sens/ode_adjoint_tests.rs::cov_diag_on_axes_is_the_full_hessians_diagonal
-nan-fold 2 src/sens/ode_adjoint_tests.rs::cov_hessian_narrow_passes_equal_the_full_width_ones
 nan-fold 1 src/sens/ode_adjoint_tests.rs::eta_dx_matches_the_re_solved_ebe_with_a_non_gaussian_term
 nan-fold 1 src/sens/ode_adjoint_tests.rs::exact_inner_hessian_matches_fd_of_the_production_objective
 nan-fold 2 src/sens/ode_adjoint_tests.rs::fd_oracle

@@ -58,7 +58,9 @@
 //! [`crate::sens::linsolve::lu_factor_in_place_g`]).
 
 use super::predictions::DirectStep;
-use super::solver::{scale_tol, DirectCall, OdeMethod, OdeSolverOptions, StageRhs, StepClock};
+use super::solver::{
+    copy_state, scale_tol, DirectCall, OdeMethod, OdeSolverOptions, StageRhs, StepClock,
+};
 use crate::sens::linsolve::{lu_factor_in_place_g, lu_solve_in_place_g};
 use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
@@ -927,7 +929,7 @@ impl<T: PkNum> RosWorkspace<T> {
         let (rhs_tmp, u) = (&mut rhs_tmp[..n], &u[..n]);
         for i in 0..s {
             // u_i = u + Σ_{j<i} a_ij k_j, left to right.
-            u_tmp.copy_from_slice(u);
+            copy_state(u_tmp, u);
             for (j, kj) in ks[..i].iter().enumerate() {
                 let wt = T::from_f64(tab.a[i][j]);
                 let kj = &kj[..n];
@@ -937,7 +939,7 @@ impl<T: PkNum> RosWorkspace<T> {
             }
             if i == 0 {
                 // Stage 1 evaluates at (u, t), already in `f0`.
-                f_tmp.copy_from_slice(f0);
+                copy_state(f_tmp, f0);
             } else {
                 rhs.call(u_tmp, params, clock.at(tab.alpha[i]), f_tmp);
             }
@@ -953,7 +955,7 @@ impl<T: PkNum> RosWorkspace<T> {
                     rhs_tmp[idx] = rhs_tmp[idx] + kj[idx] * wt;
                 }
             }
-            ks[i][..n].copy_from_slice(rhs_tmp);
+            copy_state(&mut ks[i][..n], rhs_tmp);
             lu_solve_in_place_g(w, piv, n, &mut ks[i][..n]);
         }
         // Stiffly accurate: b_i = a_{s,i} (i < s) and b_s = 1, so the solution is the last

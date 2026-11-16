@@ -2325,3 +2325,194 @@ fn every_native_plan_tier_probes_its_stack() {
         );
     }
 }
+
+/// A thread's hot table serves several subjects at once (the solve of one subject follows
+/// another's, so one entry missed once per solve), evicts only on a slot collision, and a put
+/// under a newer stamp releases the entries filled under the old one (a dropped scope's plans
+/// must not stay pinned by the table). Mutation: back the table with one slot → the first
+/// assertion fails; skip the stale drop in `put` → the `weak_count` one fails; compare `hk`
+/// loosely in `get` → the collision row serves the wrong subject's variants.
+/// (The stale drop in `get` is `the_hot_table_releases_a_dropped_scopes_plans_on_the_next_get`.)
+#[test]
+fn the_hot_table_serves_several_subjects_and_drops_stale_entries() {
+    let key = |s: usize| HotKey {
+        model: 0x1000,
+        subject: 0x40_0000 + s * 0x40,
+        n: 1,
+        n_in: 2,
+        kind: 0,
+        class: 0,
+    };
+    let stamp = |gen: usize| HotStamp { prints: 1, gen };
+    let (ka, kb) = {
+        let ka = key(0);
+        (ka, (1..).map(key).find(|k| k.slot() != ka.slot()).unwrap())
+    };
+    let (a, b): (Kernels, Kernels) = (Arc::new(Variants::default()), Arc::new(Variants::default()));
+    let mut t = HotTable::default();
+    t.put(ka, stamp(7), None, &a);
+    t.put(kb, stamp(7), None, &b);
+    let got = |t: &mut HotTable, k: &HotKey, g: usize| t.get(k, stamp(g), None);
+    assert!(
+        Arc::ptr_eq(&got(&mut t, &ka, 7).expect("a"), &a),
+        "subject a still held"
+    );
+    assert!(
+        Arc::ptr_eq(&got(&mut t, &kb, 7).expect("b"), &b),
+        "subject b held beside it"
+    );
+    // A key that maps to a's slot evicts it, and is served as itself.
+    let kc = (1..)
+        .map(|s| key(s * 7919))
+        .find(|k| k.slot() == ka.slot() && *k != ka)
+        .unwrap();
+    let c: Kernels = Arc::new(Variants::default());
+    t.put(kc, stamp(7), None, &c);
+    assert!(got(&mut t, &ka, 7).is_none(), "the collision evicted a");
+    assert!(Arc::ptr_eq(&got(&mut t, &kc, 7).expect("c"), &c));
+    // A put under a newer stamp releases what the old one filled.
+    assert_eq!(Arc::weak_count(&b), 1, "fixture: the table holds b");
+    t.put(kc, stamp(9), None, &c);
+    assert_eq!(
+        Arc::weak_count(&b),
+        0,
+        "the stale entry was dropped, not kept"
+    );
+    assert!(got(&mut t, &kb, 7).is_none() && got(&mut t, &kb, 9).is_none());
+}
+
+/// The variants of one subject (the plan kinds, the widths) do not share a slot: a lookup
+/// alternates between them within one solve, and sharing one evicted the other on every call
+/// (8000 of 8000 simulated variant pairs shared a slot while the variant was added after the
+/// multiply). Mutation: restore the old hash (`(subject >> 4) * K + kind + n_in * 31 + n * 7`,
+/// slot `(h >> 20) & 4095`) → the collision count is 256 and the second `get` misses.
+#[test]
+fn the_variants_of_one_subject_hold_different_hot_slots() {
+    let key = |s: usize, kind: u8, n_in: usize| HotKey {
+        model: 0x1000,
+        subject: 0x40_0000 + s * 0x40,
+        n: 3,
+        n_in,
+        kind,
+        class: 0,
+    };
+    let by = |f: &dyn Fn(usize) -> (HotKey, HotKey)| {
+        (0..256).filter(|&s| f(s).0.slot() == f(s).1.slot()).count()
+    };
+    // 256 pairs of a 1/4096 chance each: a handful at most (measured: 0).
+    assert!(by(&|s| (key(s, 0, 2), key(s, 1, 2))) <= 4, "kind");
+    assert!(by(&|s| (key(s, 0, 2), key(s, 0, 3))) <= 4, "n_in");
+    let (a, b): (Kernels, Kernels) = (Arc::new(Variants::default()), Arc::new(Variants::default()));
+    let s = (0..)
+        .find(|&s| key(s, 0, 2).slot() != key(s, 1, 2).slot())
+        .unwrap();
+    let stamp = HotStamp { prints: 1, gen: 7 };
+    let mut t = HotTable::default();
+    t.put(key(s, 0, 2), stamp, None, &a);
+    t.put(key(s, 1, 2), stamp, None, &b);
+    assert!(Arc::ptr_eq(
+        &t.get(&key(s, 0, 2), stamp, None).expect("a"),
+        &a
+    ));
+    assert!(Arc::ptr_eq(
+        &t.get(&key(s, 1, 2), stamp, None).expect("b"),
+        &b
+    ));
+}
+
+/// The table does not keep a dropped scope's plans alive: it holds the variants weakly, so
+/// they are freed when their owner drops them, with no further lookup on this thread, and the
+/// entry then misses. Mutation: store the `Arc` (a strong clone) → `strong_count` is 2 and the
+/// final `get` still serves the variants.
+#[test]
+fn the_hot_table_does_not_pin_released_variants() {
+    let key = HotKey {
+        model: 0x1000,
+        subject: 0x40_0000,
+        n: 1,
+        n_in: 2,
+        kind: 0,
+        class: 0,
+    };
+    let stamp = HotStamp { prints: 1, gen: 7 };
+    let a: Kernels = Arc::new(Variants::default());
+    let mut t = HotTable::default();
+    t.put(key, stamp, None, &a);
+    assert_eq!(
+        Arc::strong_count(&a),
+        1,
+        "the table holds no strong reference"
+    );
+    assert!(t.get(&key, stamp, None).is_some(), "served while owned");
+    drop(a);
+    assert!(
+        t.get(&key, stamp, None).is_none(),
+        "an entry whose variants were dropped misses"
+    );
+}
+
+/// A thread that only looks plans up (no put follows) lets go of a dropped scope's plans: a
+/// `get` under a newer stamp releases every entry filled under the old one, for either half of
+/// the stamp. Mutation: drop `release_stale` from `get` → the `weak_count` rows fail.
+#[test]
+fn the_hot_table_releases_a_dropped_scopes_plans_on_the_next_get() {
+    let key = HotKey {
+        model: 0x1000,
+        subject: 0x40_0000,
+        n: 1,
+        n_in: 2,
+        kind: 0,
+        class: 0,
+    };
+    for (what, newer) in [
+        ("generation", HotStamp { prints: 1, gen: 8 }),
+        ("registry", HotStamp { prints: 2, gen: 7 }),
+    ] {
+        let a: Kernels = Arc::new(Variants::default());
+        let mut t = HotTable::default();
+        t.put(key, HotStamp { prints: 1, gen: 7 }, None, &a);
+        assert_eq!(Arc::weak_count(&a), 1, "fixture: the table holds a");
+        assert!(t.get(&key, newer, None).is_none(), "{what}: nothing served");
+        assert_eq!(Arc::weak_count(&a), 0, "{what}: released by the get");
+    }
+}
+
+/// A row filled under a layout is served only to a call whose layout has the same structure,
+/// and a row filled with none only to a call with none. Mutation: drop the `(Some, Some)`
+/// comparison (`same = true`) → the different-structure row serves; make the mixed arms `true`
+/// → the none/Some rows serve.
+#[test]
+fn the_hot_table_compares_the_layout_structure() {
+    use crate::stats::stacked_layout::StackedLayout;
+    let subject_with = |occasions: Vec<u32>| crate::types::Subject {
+        obs_times: vec![1.0; occasions.len()],
+        occasions,
+        ..Default::default()
+    };
+    let lay = |occ: Vec<u32>| StackedLayout::new(1, 1, &subject_with(occ));
+    let (l_a, l_a2, l_b) = (lay(vec![1, 1, 2]), lay(vec![1, 1, 2]), lay(vec![1, 2, 2]));
+    let desc = |l: &StackedLayout| Desc::of(|c| l.canon(c));
+    assert_ne!(
+        desc(&l_a).bytes(),
+        desc(&l_b).bytes(),
+        "fixture: layouts differ"
+    );
+    let key = HotKey {
+        model: 0x1000,
+        subject: 0x40_0000,
+        n: 1,
+        n_in: 2,
+        kind: 0,
+        class: 0,
+    };
+    let stamp = HotStamp { prints: 1, gen: 7 };
+    let ks: Kernels = Arc::new(Variants::default());
+    let mut t = HotTable::default();
+    t.put(key, stamp, Some(desc(&l_a)), &ks);
+    assert!(t.get(&key, stamp, Some(&l_a2)).is_some(), "same structure");
+    assert!(t.get(&key, stamp, Some(&l_b)).is_none(), "other structure");
+    assert!(t.get(&key, stamp, None).is_none(), "layout vs none");
+    t.put(key, stamp, None, &ks);
+    assert!(t.get(&key, stamp, None).is_some(), "none vs none");
+    assert!(t.get(&key, stamp, Some(&l_a)).is_none(), "none vs layout");
+}

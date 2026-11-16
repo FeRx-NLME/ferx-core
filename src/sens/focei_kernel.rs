@@ -29,6 +29,7 @@ use crate::sens::num::NonRecording;
 use crate::sens::num::{wsum3, BranchCmp, PkNum};
 use crate::stats::residual_error::{LoadingForm, ResidualCov};
 use crate::types::{CompiledModel, ModelParameters, Subject};
+use std::borrow::Cow;
 
 /// The population parameters the likelihood reads directly, as kernel values: Ω (by
 /// its Cholesky factor, with the `Ω⁻¹` and `log|Ω|` built from it), σ, the
@@ -54,6 +55,57 @@ pub(crate) struct OmegaT<T> {
     pub chol: Vec<Vec<T>>,
     pub inv: Vec<Vec<T>>,
     pub log_det: T,
+}
+
+/// Widths [`OmegaT::from_chol_cached`] keeps a factorisation for, per thread.
+const OMEGA_CACHE_WIDTHS: usize = 8;
+
+thread_local! {
+    /// The Ω [`OmegaT::from_chol_cached`] last factored at each width: Ω is one matrix for a
+    /// whole outer evaluation, so every subject on a thread after the first reuses its inverse
+    /// — also when the subjects' stacked widths differ (IOV with unequal occasion counts), as
+    /// a single entry would miss on every alternation.
+    static OMEGA_CACHE: std::cell::RefCell<Vec<OmegaT<f64>>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Factorisations the cache had to compute (test seam).
+    #[cfg(test)]
+    static OMEGA_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl OmegaT<f64> {
+    /// [`Self::from_chol`], reusing the `Ω⁻¹` and `log|Ω|` last formed at this width when `chol`
+    /// is bit-for-bit the (square) factor they were formed from (`from_chol` is a function of
+    /// `chol` alone, so the reuse returns exactly what it would compute).
+    pub(crate) fn from_chol_cached(chol: Vec<Vec<f64>>) -> Option<Self> {
+        OMEGA_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            let at = c.iter().position(|o| o.chol.len() == chol.len());
+            if let Some(o) = at.map(|i| &c[i]).filter(|o| {
+                o.chol
+                    .iter()
+                    .zip(&chol)
+                    .all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()))
+            }) {
+                return Some(OmegaT {
+                    chol,
+                    inv: o.inv.clone(),
+                    log_det: o.log_det,
+                });
+            }
+            #[cfg(test)]
+            OMEGA_MISSES.with(|m| m.set(m.get() + 1));
+            let o = Self::from_chol(chol)?;
+            match at {
+                Some(i) => c[i] = o.clone(),
+                None => {
+                    if c.len() == OMEGA_CACHE_WIDTHS {
+                        c.swap_remove(0);
+                    }
+                    c.push(o.clone());
+                }
+            }
+            Some(o)
+        })
+    }
 }
 
 impl<T: PkNum> OmegaT<T> {
@@ -92,8 +144,11 @@ impl ParT<f64> {
     pub(crate) fn of(model: &CompiledModel, subject: &Subject, params: &ModelParameters) -> Self {
         let n = params.omega.chol.nrows();
         let l = &params.omega.chol;
-        ParT {
-            omega: OmegaT {
+        Self::of_with_omega(
+            model,
+            subject,
+            params,
+            OmegaT {
                 chol: (0..n)
                     .map(|r| (0..n).map(|c| l[(r, c)]).collect())
                     .collect(),
@@ -102,6 +157,19 @@ impl ParT<f64> {
                     .collect(),
                 log_det: params.omega.log_det,
             },
+        )
+    }
+
+    /// [`Self::of`] with Ω given (the stacked prior's factor, [`OmegaT::from_chol`]): the
+    /// params' own Ω is not copied just to be replaced.
+    pub(crate) fn of_with_omega(
+        model: &CompiledModel,
+        subject: &Subject,
+        params: &ModelParameters,
+        omega: OmegaT<f64>,
+    ) -> Self {
+        ParT {
+            omega,
             sigma: params.sigma.values.clone(),
             rho: params.residual_correlations.iter().map(|c| c.rho).collect(),
             serial_rho: model
@@ -111,6 +179,32 @@ impl ParT<f64> {
             theta: params.theta.clone(),
             ruv_mult: model.ruv_obs_mult(subject, &params.theta),
         }
+    }
+}
+
+impl<T> ParT<T> {
+    /// `Ω⁻¹` for `n` random effects. A [`ParT`] from [`Self::map_rows`] / [`Self::wrap_rows`]
+    /// does not carry it, and reading one there would index an empty matrix (or, where the
+    /// width came from it, silently loop over nothing): fail with the cause instead.
+    #[inline]
+    pub(crate) fn omega_inv(&self, n: usize) -> &Vec<Vec<T>> {
+        assert!(
+            self.omega.inv.len() >= n,
+            "Ω⁻¹ has {} rows, {n} needed: a ParT from map_rows/wrap_rows carries no Ω",
+            self.omega.inv.len()
+        );
+        &self.omega.inv
+    }
+
+    /// `L` (`Ω = LLᵀ`) for `n` random effects; see [`Self::omega_inv`].
+    #[inline]
+    pub(crate) fn omega_chol(&self, n: usize) -> &Vec<Vec<T>> {
+        assert!(
+            self.omega.chol.len() >= n,
+            "Ω's factor has {} rows, {n} needed: a ParT from map_rows/wrap_rows carries no Ω",
+            self.omega.chol.len()
+        );
+        &self.omega.chol
     }
 }
 
@@ -141,10 +235,42 @@ impl<T: Copy> ParT<T> {
     }
 }
 
+impl<T: Copy> ParT<T> {
+    /// [`Self::map`] without Ω's factor and inverse (only `log|Ω|` is carried): for the row
+    /// passes, which read σ, ρ, θ and the RUV multipliers but never Ω (the prior is scored
+    /// from the unlifted `ParT`). Saves the `2n + 2` allocations of lifting Ω at every call.
+    pub(crate) fn map_rows<U: Copy>(&self, f: impl Fn(T) -> U) -> ParT<U> {
+        ParT {
+            omega: OmegaT {
+                chol: Vec::new(),
+                inv: Vec::new(),
+                log_det: f(self.omega.log_det),
+            },
+            sigma: self.sigma.iter().map(|&x| f(x)).collect(),
+            rho: self.rho.iter().map(|&x| f(x)).collect(),
+            serial_rho: self.serial_rho.map(&f),
+            theta: self.theta.iter().map(|&x| f(x)).collect(),
+            ruv_mult: self.ruv_mult.as_ref().map(|m| {
+                m.iter()
+                    .map(|r| r.iter().map(|&x| f(x)).collect())
+                    .collect()
+            }),
+        }
+    }
+}
+
 impl<T: PkNum> ParT<T> {
     /// Lift to a first-order dual over `T` (constant in the dual's directions).
     pub(crate) fn wrap<const K: usize>(&self) -> ParT<DualT<K, T>> {
         self.map(|x| DualT {
+            v: x,
+            g: [T::from_f64(0.0); K],
+        })
+    }
+
+    /// [`Self::wrap`] for the row passes ([`Self::map_rows`]): Ω is not lifted.
+    pub(crate) fn wrap_rows<const K: usize>(&self) -> ParT<DualT<K, T>> {
+        self.map_rows(|x| DualT {
             v: x,
             g: [T::from_f64(0.0); K],
         })
@@ -321,7 +447,7 @@ impl<'a> LikCtx<'a> {
     /// `(V, ∂V/∂f, ∂²V/∂f²)` of row `j` at `f`, times the RUV scale: [`Self::loadings`]
     /// over a second-order dual in `f`.
     fn variance<T: PkNum>(&self, j: usize, f: T, ruv: T, p: &ParT<T>) -> (T, T, T) {
-        let v = self.loadings_variance(j, d2_seed(f), &p.map(d2_const));
+        let v = self.loadings_variance(j, d2_seed(f), &p.map_rows(d2_const));
         (v.v.v * ruv, v.v.g[0] * ruv, v.g[0].g[0] * ruv)
     }
 
@@ -341,7 +467,7 @@ impl<'a> LikCtx<'a> {
     /// `ηᵀΩ⁻¹η + log|Ω|`.
     fn prior<T: PkNum>(&self, eta: &[T], p: &ParT<T>) -> T {
         let n = eta.len();
-        let oi = &p.omega.inv;
+        let oi = p.omega_inv(n);
         wsum3(
             0.0,
             (0..n)
@@ -547,7 +673,7 @@ fn focei_rows<T: PkNum, const K: usize>(
         v: x,
         g: [c(0.0); K],
     };
-    let pk = p.wrap::<K>();
+    let pk = p.wrap_rows::<K>();
     let ed: Vec<DualT<K, T>> = (0..nn)
         .map(|k| {
             let mut d = lift(eta[k]);
@@ -566,7 +692,7 @@ fn focei_rows<T: PkNum, const K: usize>(
     let mut dl = vec![c(0.0); n];
     let mut explicit = vec![c(0.0); nn];
     // H̃ = Ω⁻¹ + Σ_t α_t·u_t·v_tᵀ; the terms come in symmetric pairs, so H̃ stays symmetric.
-    let mut terms: Vec<(T, Vec<T>, Vec<T>)> = Vec::with_capacity(n + 1);
+    let mut terms: Vec<(T, Cow<[T]>, Cow<[T]>)> = Vec::with_capacity(n + 1);
     for j in 0..n {
         let y = ctx.subject.observations[j];
         if let Some(row) = ctx.frem_row(j) {
@@ -587,7 +713,11 @@ fn focei_rows<T: PkNum, const K: usize>(
             )?;
             data = data + d.v;
             explicit[e] = explicit[e] + d.g[0];
-            terms.push((one / ctx.frem_pred_var(row, eta, p).1, unit(e), unit(e)));
+            terms.push((
+                one / ctx.frem_pred_var(row, eta, p).1,
+                Cow::Owned(unit(e)),
+                Cow::Owned(unit(e)),
+            ));
             continue;
         }
         let mut fd = lift(f[j]);
@@ -622,14 +752,16 @@ fn focei_rows<T: PkNum, const K: usize>(
                 let cs = vd.g[0] / vd.v;
                 // g·gᵀ/V + ½·c̃c̃ᵀ with c̃ = (∂V/∂f / V)·g, whose η_r entry is 2 under RUV IIV.
                 match (rr, interaction) {
-                    (_, false) => terms.push((iv, gj.clone(), gj.clone())),
-                    (None, true) => terms.push((iv + c(0.5) * cs * cs, gj.clone(), gj.clone())),
+                    (_, false) => terms.push((iv, Cow::Borrowed(gj), Cow::Borrowed(gj))),
+                    (None, true) => {
+                        terms.push((iv + c(0.5) * cs * cs, Cow::Borrowed(gj), Cow::Borrowed(gj)))
+                    }
                     (Some(r), true) => {
                         let ck: Vec<T> = (0..nn)
                             .map(|k| if k == r { c(2.0) } else { cs * gj[k] })
                             .collect();
-                        terms.push((iv, gj.clone(), gj.clone()));
-                        terms.push((c(0.5), ck.clone(), ck));
+                        terms.push((iv, Cow::Borrowed(gj), Cow::Borrowed(gj)));
+                        terms.push((c(0.5), Cow::Owned(ck.clone()), Cow::Owned(ck)));
                     }
                 }
             }
@@ -663,19 +795,19 @@ fn focei_rows<T: PkNum, const K: usize>(
                     }
                 }
                 if interaction {
-                    terms.push((g2, gj.clone(), gj.clone()));
+                    terms.push((g2, Cow::Borrowed(gj), Cow::Borrowed(gj)));
                     if let Some(r) = rr {
                         let mut go = gj.clone();
                         go[r] = c(0.0);
-                        terms.push((cz, unit(r), unit(r)));
-                        terms.push((cm, unit(r), go.clone()));
-                        terms.push((cm, go, unit(r)));
+                        terms.push((cz, Cow::Owned(unit(r)), Cow::Owned(unit(r))));
+                        terms.push((cm, Cow::Owned(unit(r)), Cow::Owned(go.clone())));
+                        terms.push((cm, Cow::Owned(go), Cow::Owned(unit(r))));
                     }
                 }
             }
         }
     }
-    let oi = &p.omega.inv;
+    let oi = p.omega_inv(nn);
     let mut ht: Vec<Vec<T>> = vec![vec![c(0.0); nn]; nn];
     for a in 0..nn {
         for b in 0..=a {
@@ -754,7 +886,7 @@ pub(crate) fn foce_f<T: PkNum>(
     let unit =
         |k: usize| -> Vec<T> { (0..nn).map(|l| c(if l == k { 1.0 } else { 0.0 })).collect() };
     // Per row: prediction, η-sensitivity, linearised mean f₀ and LᵀG (for GΩGᵀ = (LᵀG)ᵀ(LᵀG)).
-    let lch = &p.omega.chol;
+    let lch = p.omega_chol(nn);
     let mut f0: Vec<T> = Vec::with_capacity(n);
     let mut lg: Vec<Vec<T>> = Vec::with_capacity(n);
     for j in 0..n {
@@ -966,7 +1098,7 @@ fn focei_f_dense<T: PkNum>(
         .map(|k| {
             let (fd, ed) = direction_duals(f, g, eta, k);
             let ruv = ctx.ruv_scale(&ed);
-            let rd = ctx.r_matrix(&fd, &p.wrap::<1>());
+            let rd = ctx.r_matrix(&fd, &p.wrap_rows::<1>());
             (0..n)
                 .map(|col| {
                     chol_solve(
@@ -982,7 +1114,7 @@ fn focei_f_dense<T: PkNum>(
                 .collect()
         })
         .collect();
-    let mut ht: Vec<Vec<T>> = p.omega.inv.clone();
+    let mut ht: Vec<Vec<T>> = p.omega_inv(nn).clone();
     for a in 0..nn {
         for b in 0..nn {
             let mut hrh = c(0.0);
@@ -1206,8 +1338,14 @@ pub(crate) fn inner_hessian_through_predictions<T: PkNum>(
     #[cfg(test)]
     note_inner_hessian_route(ctx.subject, false);
     let n = p.omega.inv.len();
+    // The width is Ω⁻¹'s own, so a `ParT` without Ω (`map_rows`) would give `n = 0` and a
+    // silently empty Hessian: the rows' η-sensitivities say how wide it must be, and a
+    // mismatch declines (in every build) rather than assembling a wrong-width matrix.
+    if g.first().is_some_and(|r| r.len() != n) {
+        return None;
+    }
     let half = T::from_f64(0.5);
-    let pl = p.map(d2_const);
+    let pl = p.map_rows(d2_const);
     // A non-FREM row does not read η; the array only fills `row_l`'s signature.
     let el: [D2<T>; 1] = [d2_const(T::from_f64(0.0))];
     let ruv = d2_const(T::from_f64(1.0));
@@ -1318,7 +1456,7 @@ pub(crate) fn inner_grad<T: PkNum>(
         return Some(focei_f_grad(ctx, f, g, eta, p)?.1);
     };
     // FOCE's frozen variance: a row reads η only through f (FREM rows through η_e).
-    let p1 = p.wrap::<1>();
+    let p1 = p.wrap_rows::<1>();
     let lift = |x: T| DualT { v: x, g: [c(0.0)] };
     let n = ctx.n();
     let mut dl = vec![c(0.0); n];
@@ -1376,7 +1514,7 @@ pub(crate) fn inner_grad<T: PkNum>(
             }
         }
     }
-    let grad = assemble_grad(&p.omega.inv, eta, g, &dl, &explicit);
+    let grad = assemble_grad(p.omega_inv(eta.len()), eta, g, &dl, &explicit);
     Some(grad)
 }
 
@@ -1438,6 +1576,150 @@ fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
 mod tests {
     use super::*;
     use crate::sens::dual2::Dual2;
+
+    /// `from_chol_cached` returns exactly `from_chol`'s `Ω⁻¹` and `log|Ω|`, and says when it
+    /// computed: on a miss, on a hit, after the factor changes (a stale entry would return the
+    /// previous Ω's inverse), for a factor that differs only in the sign of a lower-triangle
+    /// zero (a miss: reuse is by bit pattern), at widths 1, 2, 3 and 4, and when the widths
+    /// alternate (IOV with unequal occasion counts: one entry per width, so the alternation
+    /// after warm-up is all hits). Mutation: compare with `==` instead of `to_bits` → the
+    /// `-0.0` row hits; keep one entry → the alternation rows miss; skip the width lookup
+    /// (compare against the first entry) → a width change serves the wrong inverse.
+    #[test]
+    fn omega_cache_returns_exactly_what_from_chol_computes() {
+        let m3 = vec![
+            vec![0.3, 0.0, 0.0],
+            vec![0.0, 0.5, 0.0],
+            vec![-0.2, 0.05, 0.4],
+        ];
+        let mut b = m3.clone();
+        b[0][0] = 0.31;
+        let mut z = m3.clone();
+        z[1][0] = -0.0;
+        let m1 = vec![vec![0.7]];
+        let m2 = vec![vec![0.3, 0.0], vec![0.1, 0.5]];
+        let m4: Vec<Vec<f64>> = (0..4)
+            .map(|i| {
+                (0..4)
+                    .map(|j| {
+                        if j <= i {
+                            0.2 + 0.1 * (i + j) as f64
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let misses = || OMEGA_MISSES.with(std::cell::Cell::get);
+        let bits =
+            |m: &[Vec<f64>]| -> Vec<u64> { m.iter().flatten().map(|x| x.to_bits()).collect() };
+        // (factor, whether the call has to compute)
+        let rows: Vec<(&str, &Vec<Vec<f64>>, bool)> = vec![
+            ("first", &m3, true),
+            ("again", &m3, false),
+            ("other values", &b, true),
+            ("back", &m3, true),
+            ("sign of a lower-triangle zero", &z, true),
+            ("same -0.0 again", &z, false),
+            ("n = 1", &m1, true),
+            ("n = 4", &m4, true),
+            ("n = 4 again", &m4, false),
+            ("width 3 (kept beside the others)", &z, false),
+            ("n = 2", &m2, true),
+            ("alternate 3", &z, false),
+            ("alternate 2", &m2, false),
+            ("alternate 1", &m1, false),
+            ("alternate 4", &m4, false),
+        ];
+        for (what, chol, computes) in rows {
+            let before = misses();
+            let want = OmegaT::from_chol(chol.clone()).expect("positive definite");
+            let got = OmegaT::from_chol_cached(chol.clone()).expect("positive definite");
+            assert_eq!(misses() - before, usize::from(computes), "{what}: computed");
+            assert_eq!(bits(&got.chol), bits(&want.chol), "{what}");
+            assert_eq!(bits(&got.inv), bits(&want.inv), "{what}");
+            assert_eq!(got.log_det.to_bits(), want.log_det.to_bits(), "{what}");
+        }
+        // A non-positive diagonal declines, from the cache as from `from_chol`.
+        let mut bad = m3.clone();
+        bad[1][1] = 0.0;
+        assert!(OmegaT::from_chol_cached(bad).is_none());
+        // More widths than the cache keeps evict, and every answer stays exact.
+        for n in 1..=OMEGA_CACHE_WIDTHS + 2 {
+            let l: Vec<Vec<f64>> = (0..n)
+                .map(|i| {
+                    (0..n)
+                        .map(|j| {
+                            if i == j {
+                                1.0 + n as f64
+                            } else if j < i {
+                                0.1
+                            } else {
+                                0.0
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            let want = OmegaT::from_chol(l.clone()).expect("positive definite");
+            let got = OmegaT::from_chol_cached(l).expect("positive definite");
+            assert_eq!(bits(&got.inv), bits(&want.inv), "n = {n}");
+        }
+    }
+
+    /// Reading Ω from the row passes' parameters fails with the cause, in every build, not
+    /// with an index panic or an empty matrix; the full parameters answer at any width up to
+    /// their own. Mutation: drop the `assert!` in `omega_inv` / `omega_chol` → the `catch_unwind`
+    /// rows see no panic with the cause.
+    #[test]
+    fn omega_readers_name_a_parameter_set_without_omega() {
+        let p = ParT::<f64> {
+            omega: OmegaT::from_chol(vec![vec![0.3, 0.0], vec![0.1, 0.5]]).unwrap(),
+            sigma: vec![],
+            rho: vec![],
+            serial_rho: None,
+            theta: vec![],
+            ruv_mult: None,
+        };
+        assert_eq!(p.omega_inv(2).len(), 2);
+        assert_eq!(p.omega_chol(1).len(), 2);
+        let rows = p.map_rows(|x| x);
+        let msg = |f: &dyn Fn()| {
+            let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("panics");
+            e.downcast_ref::<String>().cloned().unwrap_or_default()
+        };
+        assert!(msg(&|| {
+            rows.omega_inv(2);
+        })
+        .contains("carries no Ω"));
+        assert!(msg(&|| {
+            rows.omega_chol(2);
+        })
+        .contains("carries no Ω"));
+    }
+
+    /// The row passes' lifted parameters (`map_rows`) carry every field the rows read — σ, ρ,
+    /// the serial ρ, θ, the RUV multipliers, `log|Ω|` — and drop only Ω's factor and inverse.
+    #[test]
+    fn map_rows_keeps_what_the_rows_read_and_drops_omega() {
+        let p = ParT::<f64> {
+            omega: OmegaT::from_chol(vec![vec![0.3, 0.0], vec![0.1, 0.5]]).unwrap(),
+            sigma: vec![0.1, 0.2],
+            rho: vec![0.3],
+            serial_rho: Some(0.4),
+            theta: vec![1.0, 2.0, 3.0],
+            ruv_mult: Some(vec![vec![1.5], vec![2.5]]),
+        };
+        let (full, rows) = (p.map(|x| x * 2.0), p.map_rows(|x| x * 2.0));
+        assert!(rows.omega.chol.is_empty() && rows.omega.inv.is_empty());
+        assert_eq!(rows.omega.log_det, full.omega.log_det);
+        assert_eq!(rows.sigma, full.sigma);
+        assert_eq!(rows.rho, full.rho);
+        assert_eq!(rows.serial_rho, full.serial_rho);
+        assert_eq!(rows.theta, full.theta);
+        assert_eq!(rows.ruv_mult, full.ruv_mult);
+    }
 
     /// #2762 on the adjoint's M3 kernel (`m3_terms`, behind the exact FOCEI gradient, `H̃`
     /// and R-matrix). It lifts the f64 `log_normal_cdf` / `inv_mills` by hand, so the value-
