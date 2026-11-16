@@ -145,7 +145,7 @@ pub(crate) fn for_each_sobol_uniform(
         dim <= SOBOL_MAX_DIMS,
         "Sobol draws support at most {SOBOL_MAX_DIMS} dimensions but {dim} were requested"
     );
-    let dirs = &sobol_directions()[..dim];
+    let dirs = &sobol_directions(dim)[..dim];
     let seeds = owen_coordinate_seeds(dim, seed);
     let mut x = vec![0u32; dim];
     let mut u = vec![0.0f64; dim];
@@ -164,15 +164,34 @@ pub(crate) fn for_each_sobol_uniform(
     }
 }
 
-/// The 32-bit direction numbers of every coordinate [`sobol_params`] carries,
-/// built once. A coordinate's directions do not depend on how many follow it,
-/// so one table serves every dimension.
-fn sobol_directions() -> &'static [Vec<u32>] {
+/// The 32-bit direction numbers of the first `dim` coordinates, built once per table. A
+/// coordinate's directions do not depend on how many follow it, so one table serves every
+/// dimension up to its size. Up to [`SOBOL_MIN_DIMS`] coordinates — every random-effect
+/// screen of a model with that few ηs, which is every fit that screens — the 100-row
+/// `minimal()` table is the one decompressed and expanded (a tenth of the work of the
+/// 1000-row one, which a fit of a few seconds otherwise pays for at its first screen); it
+/// is the 1000-row table's own first 100 rows (`standard_sobol_table_extends_the_minimal_one`).
+fn sobol_directions(dim: usize) -> &'static [Vec<u32>] {
+    static SMALL: std::sync::OnceLock<Vec<Vec<u32>>> = std::sync::OnceLock::new();
     static DIRS: std::sync::OnceLock<Vec<Vec<u32>>> = std::sync::OnceLock::new();
-    DIRS.get_or_init(|| {
-        sobol::Sobol::<u32>::init_direction_vals(SOBOL_MAX_DIMS, 32, sobol_params())
-    })
+    if dim <= SOBOL_MIN_DIMS {
+        SMALL.get_or_init(|| {
+            sobol::Sobol::<u32>::init_direction_vals(
+                SOBOL_MIN_DIMS,
+                32,
+                &sobol::params::JoeKuoD6::minimal(),
+            )
+        })
+    } else {
+        DIRS.get_or_init(|| {
+            sobol::Sobol::<u32>::init_direction_vals(SOBOL_MAX_DIMS, 32, sobol_params())
+        })
+    }
 }
+
+/// The rows of the `minimal()` Joe–Kuo table: the dimensions [`sobol_directions`] serves
+/// without the full one.
+const SOBOL_MIN_DIMS: usize = 100;
 
 /// Largest Sobol dimension [`sobol_params`] supports. A quasi-random draw uses
 /// `n_eta` coordinates plus one for a Student-t scale and one for a mixture
@@ -3532,6 +3551,20 @@ mod tests {
         assert_eq!(old.len(), 100);
         assert!(old.iter().all(|v| v.len() == 32));
         assert_eq!(old, new);
+    }
+
+    /// [`sobol_directions`] serves up to [`SOBOL_MIN_DIMS`] coordinates from the 100-row
+    /// table and more from the 1000-row one: the two must hand out the same numbers for
+    /// every coordinate they share, at the smallest and the largest dimension of each side,
+    /// or a model with 101 random effects would walk a different sequence than one with 100.
+    #[test]
+    fn the_small_and_full_direction_tables_agree_on_every_shared_coordinate() {
+        let small = sobol_directions(SOBOL_MIN_DIMS);
+        let full = sobol_directions(SOBOL_MIN_DIMS + 1);
+        assert_eq!(small.len(), SOBOL_MIN_DIMS);
+        assert_eq!(full.len(), SOBOL_MAX_DIMS);
+        assert_eq!(small, &full[..SOBOL_MIN_DIMS]);
+        assert!(std::ptr::eq(sobol_directions(1), small));
     }
 
     /// The defining property of Owen's nested scramble: points that share their

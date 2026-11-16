@@ -21873,7 +21873,6 @@ fn split_correlation_line(
     static FULL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"(?i)^\s*correlation\s+(\w+)\s*\(\s*(\w+)\s*\)\s+by\s+(\(?\s*\w+(?:\s*,\s*\w+)*\s*\)?)\s*$",).unwrap()
     });
-    let full = &*FULL_RE;
     let mut rest = Vec::with_capacity(lines.len());
     let mut decl: Option<CorrelationDecl> = None;
     for line in lines {
@@ -21889,7 +21888,7 @@ fn split_correlation_line(
                     .to_string(),
             );
         }
-        let Some(c) = full.captures(code) else {
+        let Some(c) = FULL_RE.captures(code) else {
             return Err(format!(
                 "[error_model]: cannot read `{code}`. Expected `correlation <structure>(THETA) by \
                  COLUMN`, e.g. `correlation cs(RHO) by ARM`, where <structure> is one of: {}.",
@@ -22003,7 +22002,13 @@ fn parse_error_model_inner(
     let mut depth = 0_usize;
     for line in lines {
         let code = line.split('#').next().unwrap_or("").trim();
-        match IIV_RE.captures(code) {
+        // The pattern is anchored at the keyword, so only a line that starts with it builds the
+        // regex (a Unicode-aware `\w` compiles to a large automaton: ~1M instructions).
+        let iiv = code
+            .get(.."iiv_on_ruv".len())
+            .filter(|head| head.eq_ignore_ascii_case("iiv_on_ruv"))
+            .and_then(|_| IIV_RE.captures(code));
+        match iiv {
             Some(c) if depth > 0 => {
                 return Err(format!(
                     "[error_model] `iiv_on_ruv = {}` is inside an `if/else` branch. It scales \
@@ -22065,10 +22070,8 @@ fn parse_error_model_inner(
     static LOG_LHS_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"^\s*log\s*\(\s*(\w+)\s*\)\s*~\s*(\w+)\s*\((.+)\)\s*$").unwrap()
     });
-    let log_lhs_re = &*LOG_LHS_RE;
     static CMT_RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$").unwrap());
-    let cmt_re = &*CMT_RE;
 
     // singles carry the per-line LTBS flags so the chosen single can stamp them,
     // and the `power(...)` exponent expression when the line is that form.
@@ -22087,7 +22090,12 @@ fn parse_error_model_inner(
         }
 
         // Peel off an optional `CMT=N:` prefix.
-        let (cmt_opt, body) = if let Some(c) = cmt_re.captures(trimmed) {
+        // The pattern is anchored at the literal `CMT`: any other line never builds the regex.
+        let cmt_caps = trimmed
+            .starts_with("CMT")
+            .then(|| CMT_RE.captures(trimmed))
+            .flatten();
+        let (cmt_opt, body) = if let Some(c) = cmt_caps {
             let cmt: usize = c[1]
                 .parse()
                 .map_err(|_| format!("Invalid CMT index in [error_model] line: {}", trimmed))?;
@@ -22104,7 +22112,13 @@ fn parse_error_model_inner(
 
         // A `log(DV)` LHS (case 2) is detected first since the plain regex's
         // `\w+` LHS can't match the parenthesised form.
-        let (lhs_logged, caps) = if let Some(c) = log_lhs_re.captures(&body) {
+        // Likewise anchored at `log`.
+        let log_caps = body
+            .trim_start()
+            .starts_with("log")
+            .then(|| LOG_LHS_RE.captures(&body))
+            .flatten();
+        let (lhs_logged, caps) = if let Some(c) = log_caps {
             (true, c)
         } else {
             match re.captures(&body) {

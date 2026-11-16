@@ -13641,6 +13641,30 @@ fn test_iiv_on_ruv_resolves_eta_index() {
     assert!((model.residual_var_scale(&[0.3, 0.5]) - (2.0_f64 * 0.5).exp()).abs() < 1e-12);
 }
 
+/// The statement regexes are built only for a line that starts with their anchor literal
+/// (`iiv_on_ruv`, `log`): the guard must not narrow what the regex took. `iiv_on_ruv` is
+/// case-insensitive and may be indented; `log (DV)` may be indented and spaced. Each of
+/// the two spellings below is read exactly as the regex alone would.
+#[test]
+fn prefiltered_statement_regexes_still_read_indented_and_cased_lines() {
+    let model = parse_full_model(&iiv_ruv_model_str(
+        "  DV ~ proportional(PROP_ERR)\n      IIV_On_Ruv = ETA_RUV",
+    ))
+    .unwrap()
+    .model;
+    assert_eq!(model.residual_error_eta, Some(1));
+
+    let content = sigma_order_model(
+        "  sigma S_BIG ~ 2.0 (sd)\n  sigma ADD_LOG ~ 0.1 (sd)",
+        "   log ( DV ) ~ additive(ADD_LOG)",
+    );
+    let err = expect_parse_err(&content);
+    assert!(
+        err.contains("consumed positionally") && err.contains("ADD_LOG"),
+        "an indented, spaced `log ( DV )` must still reach the LTBS arm: {err}"
+    );
+}
+
 #[test]
 fn test_iiv_on_ruv_eta_not_flagged_unused() {
     // The residual-error eta is referenced from [error_model] (not any
