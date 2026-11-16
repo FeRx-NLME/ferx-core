@@ -22,10 +22,10 @@
 //! - The plan's value forward and one reverse seeded with each output give the gradients of
 //!   `F` and of every `g_k` with respect to every input: `∇_η F`, `H` and `∂g` along any
 //!   direction at once (`mode_response`).
-//! - The plan's forward along `u_1 … u_K` (its tangent layout) and one reverse seeded with
-//!   each tangent component `∂Ψ_w/∂u_a` give the `K` Hessian columns
-//!   `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`, contracted with every `u_b` (`psi_along`): reverse over
-//!   forward, so the Hessian costs `⌈n/K⌉` passes of one compiled program.
+//! - The plan's forward along every `u_a` at once (its tangent layout) and one
+//!   forward-over-reverse sweep seeded with `Ψ_w` on the value lanes give, on the adjoints'
+//!   tangent lanes, every Hessian column `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`, contracted with every
+//!   `u_b` (`psi_along`): one pass of one compiled program per Hessian (#2980).
 //!
 //! There are no third-order sensitivity tables and no finite differences, and FOCE's
 //! frozen-variance mode (whose `R⁰` moves with θ through `f(η = 0)`) is just another term
@@ -39,14 +39,13 @@ use crate::sens::focei_kernel::{chol_logdet, focei_htilde, OmegaT};
 use crate::sens::num::vm::Layout;
 use crate::sens::num::{log_sum_exp, PkNum};
 
-/// Directions per pass: the plan's tangent lanes, and the seeds of each reverse.
+/// The most directions one pass carries as the plans' tangent lanes (`Layout::tan` is a `u8`).
 ///
-/// A pass's reverse runs `K` seeds over `1 + K` lanes, so its cost grows as `K²` while the
-/// `⌈n/K⌉` passes each repeat the forward. 4, not 8: measured on #1564's bench kit (exact
-/// R-matrix, interleaved, release, one core): 1-cpt oral (8 packed coordinates, one pass at 8)
-/// 0.14 → 0.11 s, 2-cpt oral (13) 0.39 → 0.33 s, their ODE twins 1.28 → 1.04 s and 5.45 → 3.94
-/// s. `K = 2` measured within ±8% of 4 either way.
-const K: usize = 4;
+/// A pass is one forward along its directions and one forward-over-reverse sweep, each over
+/// `1 + width` lanes, so every direction costs a lane and the base lane is paid once per pass:
+/// all directions go in one pass (#2980). Under the reverse per direction it replaced, a pass
+/// cost `width²` lanes and 4 directions per pass measured fastest.
+const MAX_PASS: usize = u8::MAX as usize;
 
 /// A direction of a pass: the packed coordinate it moves, the `[covariate_nn]` raw output
 /// it moves (the reduced basis, [`NnReduction`]), and its η tangent (empty: none).
@@ -292,7 +291,7 @@ fn x_dirs(n: usize) -> Vec<Dir> {
 /// (`F`, `g_k`).
 fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix<f64>)> {
     let n = plan.pn();
-    let run = plan.run(&[])?;
+    let run = plan.run(&[], 0)?;
     let unit = |o: usize| -> Vec<f64> { (0..=n).map(|c| if c == o { 1.0 } else { 0.0 }).collect() };
     let rows = plan.reverse(&run, &(0..=n).map(unit).collect::<Vec<_>>())?;
     // ∇_η F, H = ∂g/∂η and ∂g along `along`, from the inputs' adjoints.
@@ -317,12 +316,15 @@ fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix
         .then(|| (wv.iter().copied().collect(), eta_x))
 }
 
-/// Directions per `psi_along` pass: `K`, or fewer under the test cap.
-fn pass_width() -> usize {
+/// Directions per pass over `n` of them: all, up to [`MAX_PASS`] (fewer under the test cap).
+fn pass_width(n: usize) -> usize {
+    let w = n.clamp(1, MAX_PASS);
     #[cfg(test)]
-    return PASS_WIDTH_CAP.with(|c| c.get()).map_or(K, |cap| K.min(cap));
+    return PASS_WIDTH_CAP
+        .with(|c| c.get())
+        .map_or(w, |cap| w.min(cap.max(1)));
     #[cfg(not(test))]
-    K
+    w
 }
 
 #[cfg(test)]
@@ -384,10 +386,10 @@ fn hessian_with(
     out.all_finite().then_some(out)
 }
 
-/// `∇Ψ_w` and `∇²Ψ_w` along `dirs`, `Ψ_w = F − wᵀg`, by reverse over forward: per pass,
-/// `width` (≤ `K`) of the directions as the forward tangents, and one sweep whose lane `a`
-/// is `∂Ψ_w/∂u_a`, so its leaf adjoints are the column `∇²Ψ_w u_a`, read along every
-/// direction. Symmetrised: the two triangles agree to rounding.
+/// `∇Ψ_w` and `∇²Ψ_w` along `dirs`, `Ψ_w = F − wᵀg`, by forward over reverse: per pass, the
+/// directions as the forward tangents, and one sweep of `Ψ_w` whose adjoints' tangent `a` is
+/// the column `∇²Ψ_w u_a`, read along every direction. Symmetrised: the two triangles agree
+/// to rounding.
 fn psi_along(plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir]) -> Option<(DVector<f64>, DMatrix<f64>)> {
     let n = dirs.len();
     let mut grad = DVector::<f64>::zeros(n);
@@ -409,11 +411,10 @@ fn psi_diag(plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir]) -> Option<Vec<f64>> {
     Some(diag)
 }
 
-/// The passes [`psi_along`] and [`psi_diag`] share: per pass `pass_width()` (≤ `K`) of `dirs`
-/// as the plan's tangents, and one reverse seeded with each tangent component of
-/// `Ψ_w = F − wᵀg`, then `lane(i, ∂Ψ_w/∂u_i, along)` for each direction `i` in the pass,
-/// where `along(d)` reads `d`'s component of the column `∇²Ψ_w u_i` off that seed's
-/// reverse.
+/// The passes [`psi_along`] and [`psi_diag`] share: per pass [`pass_width`] of `dirs` as the
+/// plan's tangents and one forward-over-reverse sweep of `Ψ_w = F − wᵀg` (under the test
+/// switch, a reverse per direction), then `lane(i, ∂Ψ_w/∂u_i, along)` for each direction `i`
+/// in the pass, where `along(d)` reads `d`'s component of the column `∇²Ψ_w u_i`.
 fn psi_lanes(
     plan: &CovPlan<'_>,
     w: &[f64],
@@ -421,29 +422,55 @@ fn psi_lanes(
     mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
     let n = plan.pn();
-    let width = pass_width().clamp(1, K);
-    let l = 1 + K;
+    let width = pass_width(dirs.len());
+    let l = 1 + width;
     for (c, chunk) in dirs.chunks(width).enumerate() {
-        let run = plan.run(chunk)?;
+        let run = plan.run(chunk, width)?;
         let out = run.out();
-        // Seed `a`: `F`'s tangent lane `a` and `−w_k` on each `g_k`'s.
-        let seeds: Vec<Vec<f64>> = (0..chunk.len())
-            .map(|a| {
-                let mut s = vec![0.0; (1 + n) * l];
-                s[1 + a] = 1.0;
-                for k in 0..n {
-                    s[(1 + k) * l + 1 + a] = -w[k];
-                }
-                s
-            })
-            .collect();
-        let rows = plan.reverse(&run, &seeds)?;
+        let rows = if reverse_per_direction() {
+            // Seed `a`: `F`'s tangent lane `a` and `−w_k` on each `g_k`'s.
+            let seeds: Vec<Vec<f64>> = (0..chunk.len())
+                .map(|a| {
+                    let mut s = vec![0.0; (1 + n) * l];
+                    s[1 + a] = 1.0;
+                    for k in 0..n {
+                        s[(1 + k) * l + 1 + a] = -w[k];
+                    }
+                    s
+                })
+                .collect();
+            plan.reverse(&run, &seeds)?
+        } else {
+            // One sweep: `Ψ_w`'s seed on the value lanes, every direction's column on the
+            // adjoints' tangent lanes.
+            let mut s = vec![0.0; (1 + n) * l];
+            s[0] = 1.0;
+            for k in 0..n {
+                s[(1 + k) * l] = -w[k];
+            }
+            plan.reverse_tangent(&run, &s)?
+        };
         for a in 0..chunk.len() {
             let psi_a = out[1 + a] - (0..n).map(|k| w[k] * out[(1 + k) * l + 1 + a]).sum::<f64>();
             lane(c * width + a, psi_a, &|d: &Dir| plan.along(&rows[a], d));
         }
     }
     Some(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch (#2980): the columns by a reverse per direction (reverse over forward), the
+    /// forward-over-reverse sweep's oracle.
+    pub(crate) static REVERSE_PER_DIRECTION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn reverse_per_direction() -> bool {
+    #[cfg(test)]
+    return REVERSE_PER_DIRECTION.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
 }
 
 #[cfg(all(test, feature = "nn"))]
@@ -640,7 +667,7 @@ impl<'s> NnReduction<'s> {
             let mut jcols: Vec<Vec<f64>> = vec![vec![0.0; n_z]; n_w];
             // The network as a plan over θ's packed coordinates (#2786): its outputs' rows from
             // one reverse per output, and per output the Hessian columns along the weights in
-            // blocks of `K` (reverse over forward, as `psi_along`).
+            // blocks of `K`, one forward-over-reverse sweep per block (as `psi_lanes`, #2980).
             let record = |lv: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
                 let th = unpack_theta(template, |m| lv[m]);
                 let out = model.covariate_nns[net]
@@ -649,16 +676,17 @@ impl<'s> NnReduction<'s> {
                 (out.len() == mlp_out).then_some(out)
             };
             let variant = super::kernel::variant_of(&(7u8, net, off, n_w));
+            let width = pass_width(n_w);
             let run = |dirs: &[usize]| {
                 let (layout, l) = if dirs.is_empty() {
                     (Layout::F64, 1)
                 } else {
                     (
                         Layout {
-                            tan: K as u8,
+                            tan: width as u8,
                             ..Layout::F64
                         },
-                        1 + K,
+                        1 + width,
                     )
                 };
                 let mut inputs = vec![0.0; n_th * l];
@@ -690,21 +718,18 @@ impl<'s> NnReduction<'s> {
                     jcols[i - off][z0 + o] = row[i];
                 }
             }
-            let l = 1 + K;
-            for blk in (off..off + n_w).collect::<Vec<_>>().chunks(K) {
+            let l = 1 + width;
+            for blk in (off..off + n_w).collect::<Vec<_>>().chunks(width) {
                 let kr = run(blk)?;
                 for o in 0..mlp_out {
-                    let seeds: Vec<Vec<f64>> = (0..blk.len())
-                        .map(|p| {
-                            let mut s = vec![0.0; mlp_out * l];
-                            s[o * l + 1 + p] = 1.0;
-                            s
-                        })
-                        .collect();
-                    let adj = kr.reverse(&seeds)?;
+                    // Output `o`'s value lane: tangent `p` of each weight's adjoint is the
+                    // column along `blk[p]`.
+                    let mut s = vec![0.0; mlp_out * l];
+                    s[o * l] = 1.0;
+                    let adj = kr.reverse_tangent(&s)?;
                     for (p, &i) in blk.iter().enumerate() {
                         for j in off..off + n_w {
-                            let v = adj[p][j * l];
+                            let v = adj[j * l + 1 + p];
                             if v != 0.0 {
                                 hz[z0 + o].push(((i, j), v));
                             }
@@ -725,9 +750,9 @@ impl<'s> NnReduction<'s> {
 /// the quadrature (more than one node) the kernel runs in two stages: the first returns the
 /// nodes `b_j` (a function of the anchor), the node predictions (and term values) are the
 /// plans' at `b_j`, and the second scores them. Every plan runs at the value layout
-/// (`mode_response`) or along up to `K` directions (`psi_lanes`, the plans' tangent layout);
-/// one multi-seed reverse runs back through every stage, θ's packing chain closed by hand
-/// (its second derivative included).
+/// (`mode_response`) or along a pass's directions (`psi_lanes`, the plans' tangent layout);
+/// one reverse — multi-seed, or forward over reverse — runs back through every stage, θ's
+/// packing chain closed by hand (its second derivative included).
 pub(super) struct CovPlan<'a> {
     ctx: &'a LikCtx<'a>,
     sc: &'a Scoped<'a>,
@@ -831,7 +856,8 @@ impl Kept {
     /// Output `o`'s base lane `x` along tangent `a` (`None`: the value).
     fn out(&self, o: usize, x: usize, a: Option<usize>) -> f64 {
         let (l, lb) = (self.layout.lanes(), self.layout.base_lanes());
-        self.du[o * l + a.map_or(x, |a| lb + x * K + a)]
+        let kt = self.layout.tan as usize;
+        self.du[o * l + a.map_or(x, |a| lb + x * kt + a)]
     }
 }
 
@@ -853,7 +879,7 @@ pub(super) struct CovRun {
 }
 
 impl CovRun {
-    /// The kernel's outputs: per output (`F`, then each `g_k`), its value and `K` tangents
+    /// The kernel's outputs: per output (`F`, then each `g_k`), its value and `kt` tangents
     /// (the value alone at the value layout).
     pub(super) fn out(&self) -> &[f64] {
         &self.k2.out
@@ -1139,10 +1165,15 @@ impl<'a> CovPlan<'a> {
         })
     }
 
-    /// One forward of the composition along `dirs` (the value layout with none).
-    pub(super) fn run(&self, dirs: &[Dir]) -> Option<CovRun> {
+    /// One forward of the composition along `dirs` as `width` tangent lanes (the value layout
+    /// with none; a pass's lanes past its directions carry zeros, so a ragged last pass runs
+    /// at the same layout as the others).
+    pub(super) fn run(&self, dirs: &[Dir], width: usize) -> Option<CovRun> {
         let (model, subject, sc) = (self.sc.model, self.subject, self.sc);
-        let kt = if dirs.is_empty() { 0 } else { K };
+        let kt = if dirs.is_empty() { 0 } else { width };
+        if dirs.len() > kt {
+            return None;
+        }
         let lk = 1 + kt;
         let n_obs = subject.observations.len();
         let pn = sc.width;
@@ -1530,20 +1561,47 @@ impl<'a> CovPlan<'a> {
     /// outputs, `1 + kt` lanes each): per seed, the adjoint of every packed coordinate,
     /// network output and η (`nx + nz + N`).
     pub(super) fn reverse(&self, r: &CovRun, seeds: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
+        self.sweep(r, seeds, false)
+    }
+
+    /// Forward over reverse (#2980): one sweep of `run` seeded with `seed` (laid out as the
+    /// kernel's outputs; its value lanes `ū`, its tangent lanes zero) carrying every adjoint's
+    /// tangents along the run's directions. Per direction `a`, the row [`Self::reverse`] gives
+    /// for the seed `ū` on the outputs' tangent lane `a`: the second derivative of `ūᵀ·out`
+    /// along direction `a`, one sweep for every direction.
+    ///
+    /// Each kernel input's adjoint lanes stand in for that reverse's seeds: tangent `a` of the
+    /// value lane's adjoint is seed `a`'s value-lane adjoint, and the value lane's adjoint is
+    /// seed `a`'s adjoint on tangent lane `a` (zero on the others — tangent lanes do not mix).
+    pub(super) fn reverse_tangent(&self, r: &CovRun, seed: &[f64]) -> Option<Vec<Vec<f64>>> {
+        if r.kt == 0 {
+            return None;
+        }
+        self.sweep(r, &[seed.to_vec()], true)
+    }
+
+    /// [`Self::reverse`] (`tangent` false: a reverse per seed) and [`Self::reverse_tangent`]
+    /// (`tangent`: one seed, its adjoints' tangents carried; a row per direction).
+    fn sweep(&self, r: &CovRun, seeds: &[Vec<f64>], tangent: bool) -> Option<Vec<Vec<f64>>> {
         let sl = &r.slots;
         let lk = 1 + r.kt;
-        let ns = seeds.len();
+        let ns = if tangent { r.kt } else { seeds.len() };
         let pn = self.pn();
         let width = self.nx + self.nz + pn;
         let mut rows = vec![vec![0.0; width]; ns];
         // Stage 2, then the nodes back to their locations, then stage 1.
-        let mut adj = r.k2.reverse(seeds)?;
+        let mut adj = if tangent {
+            vec![r.k2.reverse_tangent(&seeds[0])?.to_vec()]
+        } else {
+            r.k2.reverse(seeds)?
+        };
         if let Some(k1) = r.k1.as_ref() {
-            let mut b_seeds = vec![vec![0.0; sl.n_nodes * pn * lk]; ns];
+            let mut b_seeds = vec![vec![0.0; sl.n_nodes * pn * lk]; adj.len()];
             for (nd, (fb, qb, fv)) in r.nodes.iter().enumerate() {
                 let mut node =
                     |kept: &Kept, slot: &dyn Fn(usize) -> usize, n_out: usize| -> Option<()> {
-                        let back = self.plan_reverse(kept, r, &adj, slot, n_out, &mut rows)?;
+                        let back =
+                            self.plan_reverse(kept, r, &adj, slot, n_out, tangent, &mut rows)?;
                         for (sd, ub) in back.iter().enumerate() {
                             for k in 0..ub.len() / lk {
                                 for x in 0..lk {
@@ -1563,7 +1621,11 @@ impl<'a> CovPlan<'a> {
                     node(qb, &|_| sl.nq_node + nd, 1)?;
                 }
             }
-            let adj1 = k1.reverse(&b_seeds)?;
+            let adj1 = if tangent {
+                vec![k1.reverse_tangent(&b_seeds[0])?.to_vec()]
+            } else {
+                k1.reverse(&b_seeds)?
+            };
             for (a2, a1) in adj.iter_mut().zip(&adj1) {
                 for (x, y) in a2.iter_mut().zip(a1) {
                     *x += y;
@@ -1573,9 +1635,10 @@ impl<'a> CovPlan<'a> {
         // The predictions, FOCE's population predictions and the term, back to θ and η.
         if let Some(pk) = r.pred.as_ref() {
             let lb = sl.lb;
+            let slot = |j, x| sl.f(j, x);
             let e =
-                self.plan_reverse_lanes(pk, r, &adj, &|j, x| sl.f(j, x), sl.n_obs, lb, &mut rows)?;
-            self.eta_into(&e, lk, &mut rows);
+                self.plan_reverse_lanes(pk, r, &adj, &slot, sl.n_obs, lb, tangent, &mut rows)?;
+            self.eta_into(&e, lk, tangent, &mut rows);
         }
         if let Some(vk) = r.var.as_ref() {
             let lb = sl.lb;
@@ -1586,12 +1649,13 @@ impl<'a> CovPlan<'a> {
                 &|j, x| sl.f(sl.n_obs + j, x),
                 sl.n_obs,
                 lb,
+                tangent,
                 &mut rows,
             )?;
-            self.eta_into(&e, lk, &mut rows);
+            self.eta_into(&e, lk, tangent, &mut rows);
         }
         if let Some(pp) = r.pop.as_ref() {
-            self.plan_reverse(pp, r, &adj, &|j| sl.pop + j, sl.n_obs, &mut rows)?;
+            self.plan_reverse(pp, r, &adj, &|j| sl.pop + j, sl.n_obs, tangent, &mut rows)?;
         }
         if let Some(t) = r.ng.as_ref() {
             let nb = sl.nb;
@@ -1606,26 +1670,27 @@ impl<'a> CovPlan<'a> {
                     sl.ng_h(k, l)
                 }
             };
-            let e = self.plan_reverse_lanes(t, r, &adj, &slot, 1, lb, &mut rows)?;
-            self.eta_into(&e, lk, &mut rows);
+            let e = self.plan_reverse_lanes(t, r, &adj, &slot, 1, lb, tangent, &mut rows)?;
+            self.eta_into(&e, lk, tangent, &mut rows);
         }
         // The kernel's own η and packed coordinates.
         for (sd, row) in rows.iter_mut().enumerate() {
             for k in 0..pn {
-                row[self.eta_slot(k)] += adj[sd][(sl.eta + k) * lk];
+                row[self.eta_slot(k)] += seed_value(&adj, tangent, sd, (sl.eta + k) * lk);
             }
             for i in 0..self.nx {
-                row[i] += adj[sd][(sl.x + i) * lk];
+                row[i] += seed_value(&adj, tangent, sd, (sl.x + i) * lk);
             }
         }
         rows.iter().flatten().all(|v| v.is_finite()).then_some(rows)
     }
 
-    /// The value lanes of a plan's η adjoints (`e`, per seed, `lk` lanes per η) into `rows`.
-    fn eta_into(&self, e: &[Vec<f64>], lk: usize, rows: &mut [Vec<f64>]) {
-        for (row, e) in rows.iter_mut().zip(e) {
-            for k in 0..e.len() / lk {
-                row[self.eta_slot(k)] += e[k * lk];
+    /// The value lanes of a plan's η adjoints (`e`, per seed, `lk` lanes per η) into `rows`
+    /// (under `tangent`, each direction's: see [`seed_value`]).
+    fn eta_into(&self, e: &[Vec<f64>], lk: usize, tangent: bool, rows: &mut [Vec<f64>]) {
+        for (sd, row) in rows.iter_mut().enumerate() {
+            for k in 0..e[0].len() / lk {
+                row[self.eta_slot(k)] += seed_value(e, tangent, sd, k * lk);
             }
         }
     }
@@ -1640,14 +1705,17 @@ impl<'a> CovPlan<'a> {
         adj: &[Vec<f64>],
         slot: &dyn Fn(usize) -> usize,
         n_out: usize,
+        tangent: bool,
         rows: &mut [Vec<f64>],
     ) -> Option<Vec<Vec<f64>>> {
         let s2 = |j: usize, x: usize| if x == 0 { slot(j) } else { usize::MAX };
-        self.plan_reverse_lanes(kept, r, adj, &s2, n_out, 1, rows)
+        self.plan_reverse_lanes(kept, r, adj, &s2, n_out, 1, tangent, rows)
     }
 
     /// The general case of [`Self::plan_reverse`]: output `j`'s base lane `x < nl` is kernel
-    /// input `slot(j, x)` (`usize::MAX`: not an input).
+    /// input `slot(j, x)` (`usize::MAX`: not an input). Under `tangent`, `adj` is the one
+    /// forward-over-reverse buffer and the plan's reverse is its own forward over reverse, so
+    /// the plan's adjoints come back in the same form.
     #[allow(clippy::too_many_arguments)]
     fn plan_reverse_lanes(
         &self,
@@ -1657,6 +1725,7 @@ impl<'a> CovPlan<'a> {
         slot: &dyn Fn(usize, usize) -> usize,
         n_out: usize,
         nl: usize,
+        tangent: bool,
         rows: &mut [Vec<f64>],
     ) -> Option<Vec<Vec<f64>>> {
         let (kt, lk) = (r.kt, 1 + r.kt);
@@ -1673,7 +1742,7 @@ impl<'a> CovPlan<'a> {
                     }
                     du_bar[sd * w + j * l + x] = a[s * lk];
                     for t in 0..kt {
-                        du_bar[sd * w + j * l + lb + x * K + t] = a[s * lk + 1 + t];
+                        du_bar[sd * w + j * l + lb + x * kt + t] = a[s * lk + 1 + t];
                     }
                 }
             }
@@ -1681,15 +1750,51 @@ impl<'a> CovPlan<'a> {
         let (n_eta, n_par) = (kept.plan.n_eta(), kept.plan.n_theta());
         let (nu, np) = (n_eta * l, n_par * l);
         let (mut ub, mut pb) = (kj::Buf::new(ns * nu), kj::Buf::new(ns * np));
-        if !kept
-            .plan
-            .reverse_from(&kept.fwd, kept.layout, ns, &mut ub, &mut pb, &du_bar)
-        {
+        let swept = if tangent {
+            kept.plan
+                .reverse_tangent_from(&kept.fwd, &mut ub, &mut pb, &du_bar)
+        } else {
+            kept.plan
+                .reverse_from(&kept.fwd, kept.layout, ns, &mut ub, &mut pb, &du_bar)
+        };
+        if !swept {
             return None;
         }
         let n_th = self.th.len();
         let s0 = packed_segments(self.template).sigma_start();
         let sigma = self.sc.params.sigma.values.as_slice();
+        if tangent {
+            // Per direction `a`: θ's value adjoint's tangent `a` through dθ/dx, and (on the
+            // axis `a` moves) its value adjoint through d²θ/dx² — the reverse over forward's
+            // two terms, each seed's lanes read off the one buffer ([`seed_value`]).
+            for (a, row) in rows.iter_mut().enumerate() {
+                for i in 0..n_par {
+                    let (pv, pa) = (pb[i * l], pb[i * l + lb + a]);
+                    if i < n_th {
+                        row[i] += pa * self.d1[i];
+                        if r.dir_x[a] == Some(i) {
+                            row[i] += pv * self.d2[i];
+                        }
+                    } else if i - n_th < self.nz {
+                        row[self.nx + (i - n_th)] += pa;
+                    } else {
+                        let k = i - n_th - self.nz;
+                        row[s0 + k] += pa * sigma[k];
+                        if r.dir_x[a] == Some(s0 + k) {
+                            row[s0 + k] += pv * sigma[k];
+                        }
+                    }
+                }
+            }
+            let mut e = vec![0.0; n_eta * lk];
+            for k in 0..n_eta {
+                e[k * lk] = ub[k * l];
+                for t in 0..kt {
+                    e[k * lk + 1 + t] = ub[k * l + lb + t];
+                }
+            }
+            return Some(vec![e]);
+        }
         let mut eta_back = Vec::with_capacity(ns);
         for (sd, row) in rows.iter_mut().enumerate() {
             let pb = &pb[sd * np..(sd + 1) * np];
@@ -1731,6 +1836,18 @@ impl<'a> CovPlan<'a> {
             eta_back.push(e);
         }
         Some(eta_back)
+    }
+}
+
+/// Seed `sd`'s value-lane adjoint at lane offset `at` (a location's `lk` lanes start there):
+/// row `sd` of a reverse per seed, or — from one forward-over-reverse buffer (`tangent`),
+/// whose tangent `sd` is that seed's value-lane adjoint ([`CovPlan::reverse_tangent`]) —
+/// the value adjoint's tangent along direction `sd`.
+fn seed_value(adj: &[Vec<f64>], tangent: bool, sd: usize, at: usize) -> f64 {
+    if tangent {
+        adj[0][at + 1 + sd]
+    } else {
+        adj[sd][at]
     }
 }
 

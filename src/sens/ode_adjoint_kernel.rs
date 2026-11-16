@@ -49,6 +49,22 @@ impl KernelRun {
         p_bar.iter().all(|v| v.is_finite()).then_some(p_bar)
     }
 
+    /// Forward over reverse (#2980) from a forward at a tangent layout: one sweep seeded with
+    /// `seed` (laid out like the outputs, value and tangent lanes), giving every leaf's lanes
+    /// laid out the same way — the value lanes' adjoints and their tangents along each
+    /// direction ([`kj::Plan::reverse_tangent_from`]).
+    pub(super) fn reverse_tangent(&self, seed: &[f64]) -> Option<kj::Buf> {
+        let mut p_bar = kj::Buf::new(self.n_in * self.layout.lanes());
+        if seed.len() != self.n_out * self.layout.lanes()
+            || !self
+                .plan
+                .reverse_tangent_from(&self.fwd, &mut [], &mut p_bar, seed)
+        {
+            return None;
+        }
+        p_bar.iter().all(|v| v.is_finite()).then_some(p_bar)
+    }
+
     /// [`Self::reverse_flat`] for one seed.
     pub(super) fn reverse_one(&self, seed: &[f64]) -> Option<kj::Buf> {
         self.reverse_flat(seed, 1)

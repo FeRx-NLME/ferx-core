@@ -526,7 +526,7 @@ pub(super) fn record_segment(
     let mut out = vec![0.0; spec.n_out()];
     // No kernel for this segment is structural (the subject's); a run that fails on its values
     // is this point's.
-    let Some(kernels) = LoopKernels::resolve(&spec, Layout::F64, false) else {
+    let Some(kernels) = LoopKernels::resolve(&spec, Layout::F64, Sweep::Forward) else {
         fail_subject("an ODE segment has no kernels");
         return None;
     };
@@ -611,10 +611,15 @@ pub(crate) struct LoopKernels {
 }
 
 impl LoopKernels {
-    /// The kernels at `layout`, the bodies' reverse passes when `rev`.
-    pub(crate) fn resolve(spec: &LoopSpec, layout: Layout, rev: bool) -> Option<Arc<LoopKernels>> {
-        let get = |b: &LoopBody| b.prog.get(layout, rev);
-        let rhs_f64 = spec.rhs.prog.get(Layout::F64, false)?;
+    /// The kernels at `layout` for `sweep` (the bodies' passes; the right-hand side and the
+    /// switch functions are always the value forward).
+    pub(crate) fn resolve(
+        spec: &LoopSpec,
+        layout: Layout,
+        sweep: Sweep,
+    ) -> Option<Arc<LoopKernels>> {
+        let get = |b: &LoopBody| b.prog.get(layout, sweep);
+        let rhs_f64 = spec.rhs.prog.get(Layout::F64, Sweep::Forward)?;
         let methods = spec
             .methods
             .iter()
@@ -644,7 +649,7 @@ impl LoopKernels {
             .collect::<Option<Vec<_>>>()?;
         let sw_f64 = match &spec.sw_g {
             Some(b) => Some((
-                b.prog.get(Layout::F64, false)?,
+                b.prog.get(Layout::F64, Sweep::Forward)?,
                 (0..slots(b) as u32).collect(),
             )),
             None => None,

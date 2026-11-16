@@ -1272,11 +1272,11 @@ pub(crate) fn recording_open() -> bool {
 
 /// Exact derivatives of a small function of its inputs alone, recorded on the spot (no cache:
 /// mixing probabilities, a Jacobian's log-determinant). Per output, its value, gradient and —
-/// `second` — row-major Hessian: one forward along every input direction and a reverse seeded
-/// on each output's tangent lanes, whose value lanes are the Hessian's rows and tangent lanes
-/// the gradient. `None` where `f` declines or the recording fails; its caller then takes finite
-/// differences, so the failure is noted against `model`'s fit for every subject
-/// ([`note_model_failure`]).
+/// `second` — row-major Hessian: one forward along every input direction and, per output, one
+/// forward-over-reverse sweep seeded on its value lane, whose adjoints are the gradient and
+/// their tangents the Hessian. `None` where `f` declines or the recording fails; its caller
+/// then takes finite differences, so the failure is noted against `model`'s fit for every
+/// subject ([`note_model_failure`]).
 #[allow(clippy::type_complexity)]
 pub(crate) fn derivs(
     model: &crate::types::CompiledModel,
@@ -1328,34 +1328,42 @@ fn derivs_of(
     let fwd = plan
         .forward_layout(layout, &[], &p, &mut du)
         .ok_or("the forward failed")?;
-    // Seed `(o, j)`: output `o`'s tangent lane `j` (its value lane without tangents).
-    let per = t.max(1);
-    let mut du_bar = vec![0.0; n_out * per * n_out * l];
-    for o in 0..n_out {
-        for j in 0..per {
-            du_bar[(o * per + j) * n_out * l + o * l + usize::from(second) * (1 + j)] = 1.0;
+    let vals = (0..n_out).map(|o| du[o * l]).collect();
+    let (mut grad, mut hess) = (Vec::with_capacity(n_out), Vec::with_capacity(n_out));
+    if second {
+        // Per output one forward-over-reverse sweep seeded on its value lane (#2980): the
+        // inputs' value-lane adjoints are the gradient, tangent `j` of input `i`'s is
+        // `∂²y/∂x_i∂x_j`.
+        for o in 0..n_out {
+            let mut du_bar = vec![0.0; n_out * l];
+            du_bar[o * l] = 1.0;
+            let mut pb = vec![0.0; n * l];
+            if !plan.reverse_tangent_from(&fwd, &mut [], &mut pb, &du_bar) {
+                return Err("the reverse failed".into());
+            }
+            grad.push((0..n).map(|i| pb[i * l]).collect());
+            hess.push(
+                (0..n)
+                    .flat_map(|j| (0..n).map(move |i| (i, j)))
+                    .map(|(i, j)| pb[i * l + 1 + j])
+                    .collect(),
+            );
+        }
+    } else {
+        // Seed `o`: output `o`'s value lane.
+        let mut du_bar = vec![0.0; n_out * n_out];
+        for o in 0..n_out {
+            du_bar[o * n_out + o] = 1.0;
+        }
+        let mut pb = vec![0.0; n_out * n];
+        if !plan.reverse_from(&fwd, layout, n_out, &mut [], &mut pb, &du_bar) {
+            return Err("the reverse failed".into());
+        }
+        for o in 0..n_out {
+            grad.push(pb[o * n..(o + 1) * n].to_vec());
+            hess.push(Vec::new());
         }
     }
-    let mut pb = vec![0.0; n_out * per * n * l];
-    if !plan.reverse_from(&fwd, layout, n_out * per, &mut [], &mut pb, &du_bar) {
-        return Err("the reverse failed".into());
-    }
-    let row = |o: usize, j: usize, lane: usize| -> Vec<f64> {
-        (0..n)
-            .map(|i| pb[(o * per + j) * n * l + i * l + lane])
-            .collect()
-    };
-    let vals = (0..n_out).map(|o| du[o * l]).collect();
-    let grad = (0..n_out).map(|o| row(o, 0, usize::from(second))).collect();
-    let hess = (0..n_out)
-        .map(|o| {
-            if second {
-                (0..n).flat_map(|j| row(o, j, 0)).collect()
-            } else {
-                Vec::new()
-            }
-        })
-        .collect();
     let out = (vals, grad, hess);
     let finite = |v: &Vec<Vec<f64>>| v.iter().flatten().all(|x| x.is_finite());
     if finite(&out.1) && finite(&out.2) {
@@ -3817,13 +3825,46 @@ impl Tiered {
     }
 }
 
-/// A chunk's program, independent of layout: compiled per (layout, direction) on first use.
+/// Which pass of a chunk a kernel runs (#2980).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Sweep {
+    /// The forward over the layout.
+    Forward,
+    /// Reverse over the layout's forward: at a tangent layout, reverse over forward
+    /// (`reverse(tangent(f))`), one seed per output lane wanted.
+    Reverse,
+    /// Forward over reverse (`tangent(reverse(f))`), at a tangent layout only: one seed whose
+    /// adjoint buffer is laid out like the forward's — per slot the base lanes' adjoints, then
+    /// their tangents along the layout's directions. Tangent `j` of an input's adjoint is the
+    /// second derivative of `ū·f` along direction `j`, so one sweep gives every direction's
+    /// Hessian column that [`Sweep::Reverse`] needs one seed per direction for.
+    TangentReverse,
+}
+
+impl Sweep {
+    /// Whether the kernel is a reverse pass (it reads and writes an adjoint buffer).
+    pub(crate) fn rev(self) -> bool {
+        self != Sweep::Forward
+    }
+
+    /// The sweep a kernel at `layout` actually runs: without tangents, forward over reverse
+    /// is the plain reverse.
+    fn at(self, layout: Layout) -> Sweep {
+        if self == Sweep::TangentReverse && layout.tan == 0 {
+            Sweep::Reverse
+        } else {
+            self
+        }
+    }
+}
+
+/// A chunk's program, independent of layout: compiled per (layout, sweep) on first use.
 pub(crate) struct ChunkProgram {
     code: Vec<Flat>,
     n_regs: usize,
     spec: Vec<(DirMask, u16)>,
     n_in: usize,
-    compiled: Mutex<HashMap<(Layout, bool), Option<Arc<Tiered>>>>,
+    compiled: Mutex<HashMap<(Layout, Sweep), Option<Arc<Tiered>>>>,
 }
 
 /// The gate orders a variant can have: a second-order payload, a tangent block and a reverse.
@@ -3871,13 +3912,16 @@ fn resolve_gates(code: &[Flat], n_regs: usize, g: usize) -> Option<Vec<Flat>> {
 }
 
 impl ChunkProgram {
-    /// The kernel over `layout`, the reverse pass when `rev` (built on first use).
-    fn get(&self, layout: Layout, rev: bool) -> Option<Arc<Tiered>> {
+    /// The kernel over `layout` for `sweep` (built on first use).
+    fn get(&self, layout: Layout, sweep: Sweep) -> Option<Arc<Tiered>> {
+        let sweep = sweep.at(layout);
+        let rev = sweep.rev();
         let mut c = self.compiled.lock().unwrap();
-        if let Some(k) = c.get(&(layout, rev)) {
+        if let Some(k) = c.get(&(layout, sweep)) {
             return k.clone();
         }
-        // The steps a gate leaves to a higher order are not this variant's.
+        // The steps a gate leaves to a higher order are not this variant's. Forward over
+        // reverse is the same derivative order as reverse over forward.
         let gate = (layout.order() + rev as usize).min(GATE_ORDERS - 1);
         let gated = resolve_gates(&self.code, self.n_regs, gate);
         let code = match &gated {
@@ -3889,6 +3933,17 @@ impl ChunkProgram {
         let base = layout.base();
         let f = ir::forward(code, self.n_regs, base);
         let f = fold_chunk(&f, base, &self.spec);
+        if sweep == Sweep::TangentReverse {
+            // The base layout's reverse, differentiated forward along the layout's directions:
+            // the adjoint arguments get tangent lanes packed as the values' are, so the
+            // kernel's buffers are laid out as the reverse over forward's. It runs one seed,
+            // so its forward prefix needs no split from the seed's sweep (`prefix` 0).
+            let f = ir::tangent_packed(&ir::reverse(&f), layout.tan as usize, base.lanes(), false);
+            let (f, _) = ir::dedup_calls(&f, 0);
+            let k = Some(Tiered::new(f, layout, self.n_in, true, 0));
+            c.insert((layout, sweep), k.clone());
+            return k;
+        }
         let f = if layout.tan > 0 {
             ir::tangent_packed(&f, layout.tan as usize, base.lanes(), false)
         } else {
@@ -3906,7 +3961,7 @@ impl ChunkProgram {
         let f = if rev { ir::reverse(&f) } else { f };
         let (f, prefix) = ir::dedup_calls(&f, prefix);
         let k = Some(Tiered::new(f, layout, self.n_in, rev, prefix));
-        c.insert((layout, rev), k.clone());
+        c.insert((layout, sweep), k.clone());
         k
     }
 }
@@ -4069,7 +4124,7 @@ const RESOLVED_SLOTS: usize = 16;
 
 /// A plan's kernels over one key, resolved once.
 struct Resolved {
-    key: (Layout, bool),
+    key: (Layout, Sweep),
     kerns: Option<Vec<Kern>>,
 }
 
@@ -5197,29 +5252,30 @@ impl Plan {
         self.n_eta
     }
 
-    /// Every chunk's entry point over `(layout, rev)`, resolved once and then read lock-free.
+    /// Every chunk's entry point over `(layout, sweep)`, resolved once and then read lock-free.
     /// More distinct keys than slots (none in practice) resolve on every call instead.
-    fn fns(&self, layout: Layout, rev: bool) -> Option<Fns<'_>> {
+    fn fns(&self, layout: Layout, sweep: Sweep) -> Option<Fns<'_>> {
+        let sweep = sweep.at(layout);
         for slot in &self.resolved {
             let e = slot.get_or_init(|| Resolved {
-                key: (layout, rev),
-                kerns: self.resolve(layout, rev),
+                key: (layout, sweep),
+                kerns: self.resolve(layout, sweep),
             });
-            if e.key == (layout, rev) {
+            if e.key == (layout, sweep) {
                 return e.kerns.as_deref().map(Fns::Shared);
             }
         }
-        self.resolve(layout, rev).map(Fns::Own)
+        self.resolve(layout, sweep).map(Fns::Own)
     }
 
-    fn resolve(&self, layout: Layout, rev: bool) -> Option<Vec<Kern>> {
+    fn resolve(&self, layout: Layout, sweep: Sweep) -> Option<Vec<Kern>> {
         self.calls
             .iter()
             .map(|c| match c {
-                Call::Chunk { prog, .. } => prog.get(layout, rev).map(Kern::Chunk),
+                Call::Chunk { prog, .. } => prog.get(layout, sweep).map(Kern::Chunk),
                 Call::Loop { spec, .. } => match spec {
                     CallKind::Ode(s) => {
-                        ode_loop::LoopKernels::resolve(s, layout, rev).map(Kern::Loop)
+                        ode_loop::LoopKernels::resolve(s, layout, sweep).map(Kern::Loop)
                     }
                     CallKind::Fixed(f) => Some(Kern::Fixed(f.clone())),
                     CallKind::Repeat(r) => Some(Kern::Repeat(r.clone())),
@@ -5375,7 +5431,7 @@ impl Plan {
     /// Run over the inner loop's layout at `(theta, eta)` (η seeded one-hot), writing each
     /// output's lanes to `out` (`n_out × lanes`); `false` when a guard fails.
     pub(crate) fn run(&self, theta: &[f64], eta: &[f64], out: &mut [f64]) -> bool {
-        let Some(fns) = self.fns(self.layout, false) else {
+        let Some(fns) = self.fns(self.layout, Sweep::Forward) else {
             return false;
         };
         LAST_RUN.with(|c| c.set(None));
@@ -5432,7 +5488,7 @@ impl Plan {
     /// forward at [`Layout::F64`] over this thread's buffer, with no kept forward, no run logs
     /// and no allocation. `false` when a guard fails or a call cannot run.
     pub(crate) fn run_values(&self, theta: &[f64], eta: &[f64], out: &mut [f64]) -> bool {
-        let Some(fns) = self.fns(Layout::F64, false) else {
+        let Some(fns) = self.fns(Layout::F64, Sweep::Forward) else {
             return false;
         };
         VBUF.with(|b| {
@@ -5519,7 +5575,7 @@ impl Plan {
     /// one-hot), kept for reverse passes: `None` when a loop call fails. The guard is not
     /// judged here ([`Self::kept_guard`]).
     pub(crate) fn forward_kept(&self, layout: Layout, u: &[f64], params: &[f64]) -> Option<Fwd> {
-        let fwd = self.fns(layout, false)?;
+        let fwd = self.fns(layout, Sweep::Forward)?;
         let l = layout.lanes();
         let ins = (self.n_eta + self.n_theta) * l;
         let mut buf = take(self.n_slots * l);
@@ -5569,10 +5625,45 @@ impl Plan {
         p_bar: &mut [f64],
         du_bar: &[f64],
     ) -> bool {
+        self.sweep_back(f, layout, Sweep::Reverse, seeds, u_bar, p_bar, du_bar)
+    }
+
+    /// Forward over reverse (#2980): one reverse sweep of a kept forward at the tangent layout
+    /// `f.layout`, carrying the tangents of every adjoint along the layout's directions. `du_bar`,
+    /// `u_bar` and `p_bar` are laid out as the forward's lanes: per location the base lanes'
+    /// adjoints, then each one's tangents (`Layout::tan`). Seeded with `ū` on the outputs' base
+    /// lanes and `u̇̄` on their tangent lanes, it adds `ūᵀ·∂du/∂(η, θ)` on the base lanes and its
+    /// directional derivative along each direction on the tangent lanes: with `u̇̄ = 0` the
+    /// columns of the second derivative of `ūᵀ·du` that [`Self::reverse_from`] at the same
+    /// layout needs one seed per direction for.
+    pub(crate) fn reverse_tangent_from(
+        &self,
+        f: &Fwd,
+        u_bar: &mut [f64],
+        p_bar: &mut [f64],
+        du_bar: &[f64],
+    ) -> bool {
+        let sweep = Sweep::TangentReverse.at(f.layout);
+        self.sweep_back(f, f.layout, sweep, 1, u_bar, p_bar, du_bar)
+    }
+
+    /// [`Self::reverse_from`] and [`Self::reverse_tangent_from`]: the same buffers and the same
+    /// walk back through the calls, the chunks' kernels and the loops' bodies those of `sweep`.
+    #[allow(clippy::too_many_arguments)]
+    fn sweep_back(
+        &self,
+        f: &Fwd,
+        layout: Layout,
+        sweep: Sweep,
+        seeds: usize,
+        u_bar: &mut [f64],
+        p_bar: &mut [f64],
+        du_bar: &[f64],
+    ) -> bool {
         if f.plan != self as *const Plan as usize || !prefix_layout(layout, f.layout) {
             return false;
         }
-        let Some(rev) = self.fns(layout, true) else {
+        let Some(rev) = self.fns(layout, sweep) else {
             return false;
         };
         let l = layout.lanes();
@@ -5659,10 +5750,10 @@ impl Plan {
                                 )
                             }
                             (CallKind::Fixed(_), Kern::Fixed(fx), CallLog::Fixed(Some(fl))) => {
-                                fx.run_rev(layout, fl, seeds, &out_adj, &mut in_adj)
+                                fx.run_rev(layout, sweep, fl, seeds, &out_adj, &mut in_adj)
                             }
                             (CallKind::Repeat(_), Kern::Repeat(rp), CallLog::Fixed(Some(fl))) => {
-                                rp.run_rev(layout, fl, seeds, &out_adj, &mut in_adj)
+                                rp.run_rev(layout, sweep, fl, seeds, &out_adj, &mut in_adj)
                             }
                             _ => false,
                         };

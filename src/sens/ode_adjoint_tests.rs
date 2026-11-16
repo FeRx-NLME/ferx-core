@@ -5381,17 +5381,39 @@ pub(super) fn hessian_gaps_for(
     let eta = ebe(&params);
     // On a thread with the fit pool's worker stack (`FIT_RAYON_STACK_SIZE`), where
     // production runs the nested-dual passes; a test thread's default 2 MB is too small.
-    let h = std::thread::scope(|scope| {
-        std::thread::Builder::new()
-            .stack_size(crate::FIT_RAYON_STACK_SIZE)
-            .spawn_scoped(scope, || {
-                subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), objective)
-            })
-            .expect("spawn")
-            .join()
-            .expect("join")
-    })
-    .expect("subject must be in adjoint scope");
+    let hessian = |per_direction: bool| {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(crate::FIT_RAYON_STACK_SIZE)
+                .spawn_scoped(scope, || {
+                    super::hessian::REVERSE_PER_DIRECTION.with(|c| c.set(per_direction));
+                    subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), objective)
+                })
+                .expect("spawn")
+                .join()
+                .expect("join")
+        })
+        .expect("subject must be in adjoint scope")
+    };
+    // Forward over reverse (production) against reverse over forward, one reverse per
+    // direction (#2980): the same second derivatives of the same programs, so they differ by
+    // the accumulation order only. Every fixture of this oracle is also that parity check.
+    let h = hessian(false);
+    let h_rof = hessian(true);
+    let scale = h_rof.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let mut worst_for = 0.0f64;
+    for (a, b) in h.iter().zip(h_rof.iter()) {
+        assert!(
+            a.is_finite() && b.is_finite(),
+            "non-finite entry: forward over reverse {a}, per direction {b}"
+        );
+        worst_for = worst_for.max((a - b).abs() / scale);
+    }
+    eprintln!("hessian: forward over reverse vs a reverse per direction {worst_for:.2e}");
+    assert!(
+        worst_for < 1e-10,
+        "forward over reverse vs a reverse per direction: {worst_for:.2e}"
+    );
     let n = x.len();
     assert_eq!((h.nrows(), h.ncols()), (n, n));
     let mut fd = DMatrix::<f64>::zeros(n, n);
@@ -11742,4 +11764,117 @@ fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
     );
     assert!(ran >= 60, "only {ran} subjects ran");
     assert!(declined.is_empty(), "declined:\n{}", declined.join("\n"));
+}
+
+/// TEMPORARY PROBE (#2980 design, not for the PR): `rank(π_v)` on every bundled example, `π` the
+/// individual parameters with their η-jets (`p`, `p_η`, and under Laplace `p_ηη`), `v = (θ, η)`.
+/// Nested central differences on the model's own parameter program; rank at a 1e-6 relative
+/// singular-value threshold. Run: `cargo test --lib probe_cut_rank -- --ignored --nocapture`.
+#[test]
+#[ignore = "design probe"]
+fn probe_cut_rank() {
+    let mut rows = Vec::new();
+    let mut paths: Vec<_> = std::fs::read_dir("examples")
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "ferx"))
+        .collect();
+    paths.sort();
+    for path in paths {
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        let Ok(model) = crate::parser::model_parser::parse_model_file(&path) else {
+            continue;
+        };
+        let Some(prog) = model.indiv_param_partials.indiv_param_program.as_ref() else {
+            continue;
+        };
+        let params = moved_params(&model);
+        let n_packed = pack_params(&params).len();
+        let (nt, ne) = (params.theta.len(), model.n_eta);
+        if ne == 0 {
+            continue;
+        }
+        let cov: std::collections::HashMap<String, f64> = model
+            .referenced_covariates
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.clone(), 1.3 + 0.37 * i as f64))
+            .collect();
+        let p_of =
+            |th: &[f64], et: &[f64]| -> Vec<f64> { prog.eval_params_g::<f64>(th, et, &cov, &[]) };
+        let eta0: Vec<f64> = (0..ne)
+            .map(|k| 0.11 * (k as f64 + 1.0) * if k % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let m = p_of(&params.theta, &eta0).len();
+        let h1 = 1e-4;
+        // π(θ, η): p, p_η (central), p_ηη (second differences).
+        let pi = |th: &[f64], et: &[f64], second: bool| -> Vec<f64> {
+            let mut out = p_of(th, et);
+            for k in 0..ne {
+                let (mut ep, mut em) = (et.to_vec(), et.to_vec());
+                ep[k] += h1;
+                em[k] -= h1;
+                let (a, b) = (p_of(th, &ep), p_of(th, &em));
+                out.extend(a.iter().zip(&b).map(|(x, y)| (x - y) / (2.0 * h1)));
+            }
+            if second {
+                for k in 0..ne {
+                    for l in 0..=k {
+                        let at = |dk: f64, dl: f64| {
+                            let mut e = et.to_vec();
+                            e[k] += dk;
+                            e[l] += dl;
+                            p_of(th, &e)
+                        };
+                        let (pp, pm, mp, mm) = (at(h1, h1), at(h1, -h1), at(-h1, h1), at(-h1, -h1));
+                        out.extend(
+                            (0..m).map(|i| (pp[i] - pm[i] - mp[i] + mm[i]) / (4.0 * h1 * h1)),
+                        );
+                    }
+                }
+            }
+            out
+        };
+        let rank = |second: bool| -> usize {
+            let base = pi(&params.theta, &eta0, second);
+            let h2 = 1e-3;
+            let mut cols = Vec::new();
+            for j in 0..nt + ne {
+                let (mut tp, mut tm, mut ep, mut em) = (
+                    params.theta.clone(),
+                    params.theta.clone(),
+                    eta0.clone(),
+                    eta0.clone(),
+                );
+                if j < nt {
+                    let s = h2 * (1.0 + tp[j].abs());
+                    tp[j] += s;
+                    tm[j] -= s;
+                } else {
+                    ep[j - nt] += h2;
+                    em[j - nt] -= h2;
+                }
+                let (a, b) = (pi(&tp, &ep, second), pi(&tm, &em, second));
+                cols.push(a.iter().zip(&b).map(|(x, y)| x - y).collect::<Vec<f64>>());
+            }
+            let mut mat = DMatrix::<f64>::zeros(base.len(), cols.len());
+            for (j, c) in cols.iter().enumerate() {
+                for (i, v) in c.iter().enumerate() {
+                    mat[(i, j)] = if v.is_finite() { *v } else { 0.0 };
+                }
+            }
+            let sv = mat.singular_values();
+            let top = sv.iter().cloned().fold(0.0, f64::max);
+            sv.iter().filter(|&&s| s > 1e-6 * top).count()
+        };
+        rows.push(format!(
+            "{name:40} n={n_packed:3} nθ+nη={:3} m={m:2} nη={ne:2} | r(FOCE/I)={:3} r(Laplace)={:3}",
+            nt + ne,
+            rank(false),
+            rank(true)
+        ));
+    }
+    for r in &rows {
+        eprintln!("{r}");
+    }
 }

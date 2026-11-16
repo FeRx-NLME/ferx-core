@@ -990,7 +990,7 @@ fn the_forward_tiers_agree_bit_for_bit_on_a_structurally_zero_tangent() {
         let (v, live) = v;
         let (cp, layout) = zero_tangent_chunk(live);
         let l = layout.lanes();
-        let t = cp.get(layout, false).expect("a kernel");
+        let t = cp.get(layout, Sweep::Forward).expect("a kernel");
         let idx: Vec<u32> = (0..5).collect();
         let lits = [0.0f64];
         let mut interp = zero_tangent_inputs(v, l);
@@ -1044,7 +1044,7 @@ fn the_forward_tiers_agree_bit_for_bit_on_a_structurally_zero_tangent() {
 fn the_reverse_tiers_agree_bit_for_bit_across_seeds() {
     let (cp, layout) = zero_tangent_chunk(false);
     let l = layout.lanes();
-    let t = cp.get(layout, true).expect("a kernel");
+    let t = cp.get(layout, Sweep::Reverse).expect("a kernel");
     let idx: Vec<u32> = (0..5).collect();
     let lits = [0.0f64];
     let (seeds, stride) = (3, 5 * l);
@@ -1157,7 +1157,7 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
     let idx: Vec<u32> = (0..5).collect();
     let lits = [0.0f64];
     // The forward.
-    let t = cp.get(layout, false).expect("a kernel");
+    let t = cp.get(layout, Sweep::Forward).expect("a kernel");
     let p = simd::packs(&t.f, l, false, 0).expect("the forward packs");
     let vec_ops = p
         .members
@@ -1196,7 +1196,7 @@ fn the_vector_tiers_agree_bit_for_bit_with_the_scalar_ones() {
         assert_eq!(interp[c].to_bits(), native[c].to_bits(), "forward lane {c}");
     }
     // The reverse, several seeds at once.
-    let t = cp.get(layout, true).expect("a kernel");
+    let t = cp.get(layout, Sweep::Reverse).expect("a kernel");
     assert!(
         simd::packs(&t.f, l, true, t.prefix).is_some(),
         "the reverse packs"
@@ -1492,8 +1492,8 @@ fn resolved_kernels_are_shared_per_key_and_serve_past_the_slots() {
     let mut shared = 0;
     for tan in 0..(RESOLVED_SLOTS as u8 + 4) {
         let lay = Layout { tan, ..base };
-        let a = plan.fns(lay, false).expect("resolves");
-        let b = plan.fns(lay, false).expect("resolves");
+        let a = plan.fns(lay, Sweep::Forward).expect("resolves");
+        let b = plan.fns(lay, Sweep::Forward).expect("resolves");
         assert_eq!(a.len(), b.len());
         if matches!(a, Fns::Shared(_)) {
             assert!(
@@ -1722,7 +1722,7 @@ fn the_caches_shrink_when_a_model_drops() {
     };
     assert!(held_by_cache(&mine), "the program is shared by structure");
     // Compile it, so there is native code to free.
-    let k = prog.get(l2(), false).expect("a kernel");
+    let k = prog.get(l2(), Sweep::Forward).expect("a kernel");
     k.promote(true, "none");
     assert_ne!(k.native.load(std::sync::atomic::Ordering::Acquire), 0);
     drop((k, prog, plan));
@@ -2323,5 +2323,89 @@ fn every_native_plan_tier_probes_its_stack() {
             ProbestackStrategy::Inline,
             "tier ({quick}, {opt}): probes not inline"
         );
+    }
+}
+
+/// Forward over reverse (#2980) against reverse over forward, through every call kind's
+/// reverse (the repeat call's walk back, the fixed point's transposed steps, the recorded
+/// solve): at the first-order layout with two tangent directions on η, one sweep seeded with
+/// `ū` on the outputs' value lanes must give, on each η adjoint's tangent lane `a`, what the
+/// reverse seeded with `ū` on tangent lane `a` gives on the value lane — and on the value
+/// lanes, that reverse's tangent-lane-`a` adjoint (the plain gradient `ūᵀ·∂y/∂η`). Every base
+/// lane is compared, the η-dual lanes included, so a sub-plan reverse that dropped the
+/// adjoints' tangents (or read the value lanes for them) shows on the second-order entries.
+#[test]
+fn every_call_kind_sweeps_forward_over_reverse_as_a_reverse_per_direction() {
+    let l1 = Layout {
+        n: 2,
+        m: 0,
+        th: false,
+        wide: false,
+        tan: 0,
+    };
+    const K: usize = 2;
+    let lt = Layout { tan: K as u8, ..l1 };
+    let (lb, l) = (l1.lanes(), lt.lanes());
+    for (name, f) in CASES {
+        begin();
+        let et: Vec<Tr> = (0..2).map(|k| Tr::eta(k, [0.3, 0.2][k])).collect();
+        let y = f(&et);
+        let rec = end(Some(y.iter().map(|v| v.reg()).collect())).expect("records");
+        let plan = rec.plan(l1, 2, 0).expect("plans");
+        let n_out = y.len();
+        let u_bar: Vec<f64> = (0..n_out).map(|j| 0.7 - 0.4 * j as f64).collect();
+        for eta in [[0.3, 0.2], [1.2, 0.9]] {
+            // η's value and one-hot duals; direction `a` moves η_a's value.
+            let mut u = vec![0.0; 2 * l];
+            for k in 0..2 {
+                u[k * l] = eta[k];
+                u[k * l + 1 + k] = 1.0;
+                u[k * l + lb + k] = 1.0;
+            }
+            let fwd = plan.forward_kept(lt, &u, &[]).expect("runs");
+            let mut du_bar = vec![0.0; n_out * l];
+            for j in 0..n_out {
+                // The value lane and `∂y/∂η₀`'s, so the η-dual lanes' adjoints are live too.
+                du_bar[j * l] = u_bar[j];
+                du_bar[j * l + 1] = 0.5 * u_bar[j] + 0.3;
+            }
+            let mut fr = vec![0.0; 2 * l];
+            assert!(
+                plan.reverse_tangent_from(&fwd, &mut fr, &mut [], &du_bar),
+                "{name}: forward over reverse sweeps"
+            );
+            let mut du_rf = vec![0.0; K * n_out * l];
+            for a in 0..K {
+                for j in 0..n_out {
+                    du_rf[a * n_out * l + j * l + lb + a] = u_bar[j];
+                    du_rf[a * n_out * l + j * l + lb + K + a] = 0.5 * u_bar[j] + 0.3;
+                }
+            }
+            let mut rf = vec![0.0; K * 2 * l];
+            assert!(
+                plan.reverse_from(&fwd, lt, K, &mut rf, &mut [], &du_rf),
+                "{name}: reverse over forward sweeps"
+            );
+            let mut seen = 0.0f64;
+            for a in 0..K {
+                for k in 0..2 {
+                    for x in 0..lb {
+                        let what = |s: &str| format!("{name} η{k} lane {x} dir {a} {s} at {eta:?}");
+                        let want = rf[a * 2 * l + k * l + x];
+                        close(fr[k * l + lb + x * K + a], want, &what("tangent"));
+                        close(
+                            fr[k * l + x],
+                            rf[a * 2 * l + k * l + lb + x * K + a],
+                            &what("value"),
+                        );
+                        seen = seen.max(want.abs());
+                    }
+                }
+            }
+            assert!(
+                seen > 1e-3,
+                "{name}: the second derivatives vanish, testing nothing"
+            );
+        }
     }
 }
