@@ -654,15 +654,15 @@ Same warfarin FOCEI fit as the `MATRIX=R` table above, with two additional NONME
 
 | Parameter | ferx `s` | NONMEM `MATRIX=S` | rel. diff | ferx `rsr` | NONMEM `MATRIX=RSR` | rel. diff |
 |-----------|----------|-------------------|-----------|------------|---------------------|-----------|
-| TVCL      | 0.01031  | 0.00930 | +10.9% | 0.00742 | 0.00710 | +4.6% |
-| TVV       | 0.4250   | 0.4602  | −7.7%  | 0.2418  | 0.2403  | +0.6% |
-| TVKA      | 0.2157   | 0.2268  | −4.9%  | 0.1555  | 0.1487  | +4.5% |
-| PROP_ERR (SD) | 0.001519 | 0.001545 | −1.7% | 0.000790 | 0.000796 | −0.7% |
-| ω²(CL)    | 0.02005  | 0.01764 | +13.7% | 0.01170 | 0.01093 | +7.1% |
-| ω²(V)     | 0.007139 | 0.008287 | −13.9% | 0.003699 | 0.003978 | −7.0% |
-| ω²(KA)    | 0.2265   | 0.2596  | −12.8% | 0.1311  | 0.1396  | −6.1% |
+| TVCL | 0.009297 | 0.009297 | −3.8e−06 | 0.007097 | 0.007098 | −7.3e−05 |
+| TVV | 0.4602 | 0.4602 | +1.5e−05 | 0.2403 | 0.2403 | −3.1e−05 |
+| TVKA | 0.2268 | 0.2268 | −1.7e−05 | 0.1487 | 0.1487 | −1.0e−04 |
+| PROP_ERR (SD) | 0.001545 | 0.001545 | +6.5e−07 | 0.0007962 | 0.0007962 | −2.0e−06 |
+| ω²(CL) | 0.01764 | 0.01764 | −9.1e−06 | 0.01093 | 0.01093 | −4.6e−06 |
+| ω²(V) | 0.008287 | 0.008287 | +3.1e−05 | 0.003978 | 0.003978 | +1.4e−05 |
+| ω²(KA) | 0.2596 | 0.2596 | −3.6e−05 | 0.1396 | 0.1396 | −1.4e−05 |
 
-(`ci`/FD build.) The `s` cross-product matches NONMEM within ~14% and `rsr` within ~7%. Guarded by `covariance_se_matches_nonmem_s_rsr` in `tests/covariance_method_sandwich.rs` (20% band for `s`, 15% for `rsr`). The per-subject score `S` is on the `−logL` (NLL) scale and, unlike `R`, carries no factor of two; the close agreement confirms that scaling is correct.
+Both are ferx's converged fit against NONMEM's (Linux x86_64): `s` within 3.6e-5 and `rsr` within 1.0e-4, the residue of the two optima and of NONMEM's six printed figures. Under the fixed-mode score used before [#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974), `s` was up to 14% off. Guarded by `covariance_se_matches_nonmem_s_rsr` in `tests/covariance_method_sandwich.rs` (bands 5e-4 for `s`, 1e-3 for `rsr`). The per-subject score `S` is on the `−logL` (NLL) scale and, unlike `R`, carries no factor of two; the close agreement confirms that scaling is correct.
 
 #### NONMEM cross-check (S / RSR, FOCE)
 
@@ -670,15 +670,15 @@ Same warfarin model, `$EST METHOD=1` (no `INTER`), `$COVARIANCE MATRIX=S` and `M
 
 | Parameter | ferx `s` | NONMEM `MATRIX=S` | rel. diff | ferx `rsr` | NONMEM `MATRIX=RSR` | rel. diff |
 |-----------|----------|-------------------|-----------|------------|---------------------|-----------|
-| TVCL      | 0.00824  | 0.00838 | −1.6%  | 0.00720 | 0.00757 | −4.9% |
-| TVV       | 0.3822   | 0.3996  | −4.4%  | 0.2552  | 0.2457  | +3.8% |
-| TVKA      | 0.1445   | 0.1495  | −3.3%  | 0.1373  | 0.1328  | +3.4% |
-| PROP_ERR (SD) | 0.001593 | 0.001573 | +1.3% | 0.000942 | 0.000947 | −0.6% |
-| ω²(CL)    | 0.01604  | 0.01771 | −9.4%  | 0.01038 | 0.01092 | −5.0% |
-| ω²(V)     | 0.008768 | 0.008387 | +4.5%  | 0.004057 | 0.003957 | +2.5% |
-| ω²(KA)    | 0.2443   | 0.2336  | +4.5%  | 0.1460  | 0.1549  | −5.7% |
+| TVCL | 0.008381 | 0.008381 | +3.5e−06 | 0.007569 | 0.00757 | −5.5e−05 |
+| TVV | 0.3996 | 0.3996 | −2.1e−05 | 0.2457 | 0.2457 | +2.5e−05 |
+| TVKA | 0.1495 | 0.1495 | +2.2e−04 | 0.1328 | 0.1328 | +3.2e−05 |
+| PROP_ERR (SD) | 0.001574 | 0.001573 | +1.7e−04 | 0.0009473 | 0.0009472 | +8.5e−05 |
+| ω²(CL) | 0.01771 | 0.01771 | +5.3e−05 | 0.01092 | 0.01092 | +5.5e−06 |
+| ω²(V) | 0.008387 | 0.008387 | +1.5e−05 | 0.003957 | 0.003957 | +7.8e−06 |
+| ω²(KA) | 0.2338 | 0.2336 | +6.4e−04 | 0.1549 | 0.1549 | +4.2e−04 |
 
-(`ci`/FD build.) All within ~10%. Guarded by `covariance_se_matches_nonmem_foce_s_rsr` in `tests/covariance_method_sandwich.rs`.
+Linux x86_64, ferx's converged fit against NONMEM's: `s` within 6.4e-4 and `rsr` within 4.2e-4 (up to ~10% under the fixed-mode score before [#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)). Guarded by `covariance_se_matches_nonmem_foce_s_rsr` in `tests/covariance_method_sandwich.rs` (bands 5e-3).
 
 Note that ferx defaults to `covariance_method = r` whereas NONMEM's `$COVARIANCE` default is the `rsr` sandwich; set `covariance_method = rsr` when reconciling SEs against a default NONMEM run.
 

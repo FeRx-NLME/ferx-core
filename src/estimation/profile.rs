@@ -4019,7 +4019,7 @@ impl ProfileCtx<'_> {
     }
 
     /// The score cross-product `S = Σᵢ sᵢsᵢᵀ` of the unprofiled step
-    /// (`assemble_score_cross_product`, the fixed-mode scores at the solve's modes) over
+    /// (`assemble_score_cross_product`, each subject's total derivative at the solve's modes) over
     /// every free packed coordinate, the profiled levels included, with those coordinates
     /// and the template they are free in ([`unheld_template`]): the levels are scored as the
     /// free θ they are in the fit's template, not held.

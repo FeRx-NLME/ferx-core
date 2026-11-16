@@ -8,8 +8,9 @@
 //! NONMEM anchors (NONMEM 7.5.1 `$COV MATRIX=S` / `MATRIX=RSR`):
 //!   - FOCEI (`$EST METHOD=1 INTER`) — `covariance_se_matches_nonmem_s_rsr` (#266)
 //!   - FOCE  (`$EST METHOD=1`)       — `covariance_se_matches_nonmem_foce_s_rsr` (#250)
-//! Both within ~10% of NONMEM; a factor-of-2 score-scale error would shift `s`
-//! SEs ~29–41% systematically, well outside the 20% band.
+//! Since #2974 (`S` is each subject's total derivative, NONMEM's `MATRIX=S` convention)
+//! both land within 6.4e-4 of NONMEM (Linux x86_64); a factor-of-2 score-scale error would
+//! shift `s` SEs ~29–41%, a convention slip back to the fixed-mode score 1–25%.
 //!
 //! The older `covariance_methods_produce_consistent_ses_on_warfarin` keeps the
 //! information-matrix sanity anchor (`R ≈ S` at the MLE) as a build-independent
@@ -171,15 +172,13 @@ fn covariance_methods_produce_consistent_ses_on_warfarin() {
 /// [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA]; ω are variance-scale, PROP_ERR is
 /// the proportional-SD THETA(4) (SD-scale), matching ferx's `se_sigma[0]`.
 ///
-/// Bands: the `s` cross-product is the noisiest estimator (a 10-subject
-/// outer-product info matrix), so it gets the same 20% band as the R-matrix
-/// reference (`warfarin_covariance_nonmem.rs`); on the `ci`/FD build ferx lands
-/// within ~14%. The `rsr` sandwich tracks R closely (ferx within ~7%), so it is
-/// held to 15%. A factor-of-2 error in the score scale would push the `s` SEs
-/// ~29–41% off systematically — well outside these bands (issue #266 note).
+/// Bands (#2974), measured on Linux x86_64 from ferx's converged fit against NONMEM's: `s`
+/// worst 3.6e-5 (ωKA), `rsr` worst 1.0e-4 (TVKA), the residue of the two optima and of
+/// NONMEM's six printed figures. Held to 5e-4 and 1e-3 (~14× and 10× headroom). Under the
+/// fixed-mode score `s` sat up to ~14% off, and a factor-of-2 score-scale error moves it
+/// ~29–41%; both are far outside these bands.
 #[test]
-// The `s` (pure cross-product) estimator is a 10-subject outer-product and is
-// inherently noisier (20% band). The RSR sandwich `R⁻¹SR⁻¹` draws its `R` from
+// The RSR sandwich `R⁻¹SR⁻¹` draws its `R` from
 // the analytic covariance Hessian (#436, default-on) — a noise-free R with no FD
 // step to condition, so it is stable near the optimum. This fixture relies on the
 // default `Auto` optimizer (→ analytic-gradient NLopt L-BFGS) converging, which
@@ -228,18 +227,17 @@ fn covariance_se_matches_nonmem_s_rsr() {
     };
 
     for (method, nm, tol) in [
-        (CovarianceMethod::CrossProduct, &nm_s, 0.20),
-        (CovarianceMethod::Sandwich, &nm_rsr, 0.15),
+        (CovarianceMethod::CrossProduct, &nm_s, 5e-4),
+        (CovarianceMethod::Sandwich, &nm_rsr, 1e-3),
     ] {
         let ferx = ferx_ses(method);
         for ((name, &f), &n) in names.iter().zip(ferx.iter()).zip(nm.iter()) {
             let rel = (f - n).abs() / n;
+            eprintln!("{method:?} SE({name}): ferx {f:.6e} NONMEM {n:.6e} rel {rel:.3e}");
             assert!(
                 f.is_finite() && rel < tol,
                 "{method:?} SE({name}) = {f:.6e} vs NONMEM {n:.6e} — relative diff \
-                 {:.1}% exceeds {:.0}% band",
-                rel * 100.0,
-                tol * 100.0
+                 {rel:.3e} exceeds the {tol:.0e} band"
             );
         }
     }
@@ -254,9 +252,9 @@ fn covariance_se_matches_nonmem_s_rsr() {
 /// SEs are the `.ext` row at `ITERATION = -1000000001`, order
 /// [TVCL, TVV, TVKA, PROP_SD, ωCL, ωV, ωKA]; ω variance-scale, PROP_ERR SD-scale.
 ///
-/// Bands: 20% for `s` (noisy outer-product estimator, ferx within ~10%); 15% for
-/// `rsr` (ferx within ~6%). A factor-of-2 score-scale error would shift `s` SEs
-/// ~29–41% off systematically — well outside the 20% band.
+/// Bands (#2974), Linux x86_64, converged fit against NONMEM: `s` worst 6.4e-4 (ωKA), `rsr`
+/// worst 4.2e-4 (ωKA). Held to 5e-3 each (~8× and 12× headroom). Under the fixed-mode score
+/// `s` sat up to ~10% off; a factor-of-2 score-scale error moves it ~29–41%.
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -301,18 +299,17 @@ fn covariance_se_matches_nonmem_foce_s_rsr() {
     };
 
     for (method, nm, tol) in [
-        (CovarianceMethod::CrossProduct, &nm_s, 0.20),
-        (CovarianceMethod::Sandwich, &nm_rsr, 0.15),
+        (CovarianceMethod::CrossProduct, &nm_s, 5e-3),
+        (CovarianceMethod::Sandwich, &nm_rsr, 5e-3),
     ] {
         let ferx = ferx_ses(method);
         for ((name, &f), &n) in names.iter().zip(ferx.iter()).zip(nm.iter()) {
             let rel = (f - n).abs() / n;
+            eprintln!("{method:?} SE({name}): ferx {f:.6e} NONMEM {n:.6e} rel {rel:.3e}");
             assert!(
                 f.is_finite() && rel < tol,
                 "{method:?} FOCE SE({name}) = {f:.6e} vs NONMEM {n:.6e} — relative diff \
-                 {:.1}% exceeds {:.0}% band",
-                rel * 100.0,
-                tol * 100.0
+                 {rel:.3e} exceeds the {tol:.0e} band"
             );
         }
     }
