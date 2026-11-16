@@ -505,7 +505,7 @@ pub(super) fn agq_planned(
     );
     if let Some(o) = eta_dx {
         o.eta_dx = None;
-        o.hessian = (o.want_hessian && at_mode && !iov_frem_mismatch(model, subject))
+        o.hessian = (o.want_hessian && at_mode)
             .then(|| h_inner.clone())
             .filter(|h| h.iter().all(|v| v.is_finite()));
         let n_rows = seeds - 1;

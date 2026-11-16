@@ -2514,6 +2514,58 @@ fn adopt_warm_start(guarded: bool, ofv: f64, best_ofv: f64) -> bool {
     !guarded && ofv < best_ofv
 }
 
+/// Replace the EBE store's `η̂` (with κ̂ and the linearisation `H = ∂f/∂η`) by the mode a
+/// polished gradient pass differentiated at (`polished`, per subject, the stacked `[η̂, κ̂]`;
+/// `ModeResponses::polished`). A subject whose inner search left it off the mode is walked to
+/// it by the pass (`polish_mode`) and its gradient taken there; the store would otherwise keep
+/// the off-mode `η̂`, so the next solve would warm-start from it and the incumbent's final
+/// EBEs would be the unconverged ones. Subjects the pass served where they stood are
+/// untouched, as is any subject whose polished width is not `η` plus its stored κ̂ cells (a
+/// nested-level layout is over compact axes).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn adopt_polished_modes(
+    model: &CompiledModel,
+    population: &Population,
+    init_params: &ModelParameters,
+    x: &[f64],
+    polished: &[Option<Vec<f64>>],
+    ehs: &mut [DVector<f64>],
+    hms: &mut [DMatrix<f64>],
+    kappas: &mut [Vec<DVector<f64>>],
+) {
+    if polished.iter().all(Option::is_none) || model.has_nested_levels() {
+        return;
+    }
+    let theta = unpack_params(x, init_params).theta;
+    let n_eta = model.n_eta;
+    for (i, stacked) in polished.iter().enumerate() {
+        let Some(stacked) = stacked else { continue };
+        let cells: usize = kappas.get(i).map_or(0, |k| k.iter().map(|c| c.len()).sum());
+        if i >= ehs.len() || stacked.len() != n_eta + cells {
+            continue;
+        }
+        let Some(jac) = crate::sens::ode_provider::adjoint::exact_eta_jacobian(
+            model,
+            &population.subjects[i],
+            &theta,
+            stacked,
+        ) else {
+            continue;
+        };
+        if jac.ncols() < n_eta || !jac.iter().all(|v| v.is_finite()) {
+            continue;
+        }
+        hms[i] = jac.columns(0, n_eta).into_owned();
+        ehs[i] = DVector::from_column_slice(&stacked[..n_eta]);
+        let mut at = n_eta;
+        for cell in kappas.get_mut(i).into_iter().flatten() {
+            let w = cell.len();
+            *cell = DVector::from_column_slice(&stacked[at..at + w]);
+            at += w;
+        }
+    }
+}
+
 fn new_nlopt_state(
     n_subj: usize,
     n_eta: usize,
@@ -7655,9 +7707,9 @@ fn optimize_nlopt_attempt_probed(
                         // The predictor reads the mode response only where this evaluation
                         // becomes the incumbent's warm start.
                         // So does a quadrature tolerance stop's decrement (`scores`).
-                        ((warm_predictor || options.agq_nodes().is_some())
-                            && adopt_warm_start(guarded, ofv, state.best_ofv))
-                        .then_some(&mut eta_dx),
+                        // And, with it, the `η̂` a polished subject's gradient was taken at
+                        // ([`adopt_polished_modes`]).
+                        adopt_warm_start(guarded, ofv, state.best_ofv).then_some(&mut eta_dx),
                     )
                 };
                 // Splice in the NN penalty gradient (computed above, in the same
@@ -7723,7 +7775,18 @@ fn optimize_nlopt_attempt_probed(
         // by skipping the `cached_etas` write, restored from the snapshot for the
         // mixture cache the branch above has already overwritten (#1290).
         let warm_start_improved = adopt_warm_start(guarded, ofv, state.best_ofv);
+        let (mut ehs, mut hms, mut kappas) = (ehs, hms, kappas);
         if warm_start_improved {
+            adopt_polished_modes(
+                model,
+                population,
+                init_params,
+                &x,
+                &eta_dx.polished,
+                &mut ehs,
+                &mut hms,
+                &mut kappas,
+            );
             // The next evaluation starts every subject at this one's whole mode, κ̂ with
             // η̂, rather than restarting an IOV subject's κ at 0 (#2261) — except on an
             // ODE + IOV model, see `outer_cache_warm_starts` (#2508).
@@ -9639,83 +9702,98 @@ fn optimize_bfgs(
     // `predicted_from`: where `prev_etas` were predicted from, when they are predicted
     // starts (`run_inner_loop_predicted_map_cached`); `eta_dx`: where to put this point's mode
     // response, formed by the gradient's own sweeps.
-    let fdfg =
-        |x: &[f64],
-         prev_etas: &[DVector<f64>],
-         predicted_from: Option<crate::estimation::inner_optimizer::PredictedFromAll<'_>>,
-         grad_eval_idx: &mut usize,
-         incumbent: Option<(f64, &[f64])>,
-         eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>|
-         -> (
-            f64,
-            Vec<f64>,
-            Vec<DVector<f64>>,
-            Vec<DMatrix<f64>>,
-            Vec<f64>,
-        ) {
-            let params = unpack_params(x, init_params);
-            let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-            let (ehs, hms, _, kappas, nll, _, contribs) = run_inner_loop_and_nll_prepared(
-                model,
-                population,
-                &params,
-                options,
-                Some(prev_etas),
-                predicted_from,
-                Some(&mu_k),
-                None,
-                None,
-                cached_etas_kind.replace(PrevEtas::Solved),
-                None, // the built-in BFGS loop polls between iterations (#574)
-                None,
-            );
-            let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();
-            let ofv = 2.0 * nll;
-            // The value the optimizer ranks this point on, for the guard: the penalties are
-            // re-added below together with their gradients, in the original order, so the
-            // returned `f` and `g` are unchanged by this read.
-            let trial = OuterTrial {
-                ofv: ofv + nn_reg.penalty_value(&params.theta) + priors.penalty(x),
-                contribs: &contribs,
-                incumbent,
-            };
-            // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x), and with `eta_dx` the mode response from the
-            // same sweeps.
-            let mut g = population_gradient_with_agq_evaluation(
-                x,
-                n_subj,
-                init_params,
-                model,
-                population,
-                &ehs,
-                &hms,
-                &kappas,
-                &bounds,
-                options,
-                grad_eval_idx,
-                None,
-                trial,
-                declines,
-                eta_dx,
-            );
-            // Penalized value + matching gradient fed to the optimizer (unregularized
-            // fits unchanged), in one pass. `ofv_at_fixed` above stays clean for
-            // final reporting.
-            let ofv = ofv + nn_reg.penalty_and_gradient(&params.theta, &mut g);
-            // Parameter priors (#254), value and gradient from one call, in the same
-            // packed space `g` is already expressed in.
-            let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
-            let f = if ofv.is_finite() { ofv } else { 1e20 };
-            // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261), except
-            // on an ODE + IOV model (#2508).
-            (
-                f,
-                g,
-                outer_cache_warm_starts(model, &ehs, &kappas),
-                hms,
-                contribs,
-            )
+    let fdfg = |x: &[f64],
+                prev_etas: &[DVector<f64>],
+                predicted_from: Option<
+        crate::estimation::inner_optimizer::PredictedFromAll<'_>,
+    >,
+                grad_eval_idx: &mut usize,
+                incumbent: Option<(f64, &[f64])>,
+                eta_dx: Option<&mut crate::estimation::sens_outer_gradient::ModeResponses>|
+     -> (
+        f64,
+        Vec<f64>,
+        Vec<DVector<f64>>,
+        Vec<DMatrix<f64>>,
+        Vec<f64>,
+    ) {
+        let params = unpack_params(x, init_params);
+        let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+        let (mut ehs, mut hms, _, mut kappas, nll, _, contribs) = run_inner_loop_and_nll_prepared(
+            model,
+            population,
+            &params,
+            options,
+            Some(prev_etas),
+            predicted_from,
+            Some(&mu_k),
+            None,
+            None,
+            cached_etas_kind.replace(PrevEtas::Solved),
+            None, // the built-in BFGS loop polls between iterations (#574)
+            None,
+        );
+        let contribs: Vec<f64> = contribs.iter().map(|v| 2.0 * v).collect();
+        let ofv = 2.0 * nll;
+        // The value the optimizer ranks this point on, for the guard: the penalties are
+        // re-added below together with their gradients, in the original order, so the
+        // returned `f` and `g` are unchanged by this read.
+        let trial = OuterTrial {
+            ofv: ofv + nn_reg.penalty_value(&params.theta) + priors.penalty(x),
+            contribs: &contribs,
+            incumbent,
         };
+        // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x), and with `eta_dx` the mode response from the
+        // same sweeps.
+        let mut own = crate::estimation::sens_outer_gradient::ModeResponses::default();
+        let slot = eta_dx.unwrap_or(&mut own);
+        let mut g = population_gradient_with_agq_evaluation(
+            x,
+            n_subj,
+            init_params,
+            model,
+            population,
+            &ehs,
+            &hms,
+            &kappas,
+            &bounds,
+            options,
+            grad_eval_idx,
+            None,
+            trial,
+            declines,
+            Some(&mut *slot),
+        );
+        // A polished subject's `η̂` (and `H`) replace its off-mode ones in what comes back
+        // as the next solve's warm start.
+        adopt_polished_modes(
+            model,
+            population,
+            init_params,
+            x,
+            &slot.polished,
+            &mut ehs,
+            &mut hms,
+            &mut kappas,
+        );
+        // Penalized value + matching gradient fed to the optimizer (unregularized
+        // fits unchanged), in one pass. `ofv_at_fixed` above stays clean for
+        // final reporting.
+        let ofv = ofv + nn_reg.penalty_and_gradient(&params.theta, &mut g);
+        // Parameter priors (#254), value and gradient from one call, in the same
+        // packed space `g` is already expressed in.
+        let ofv = ofv + priors.penalty_and_gradient(x, &mut g);
+        let f = if ofv.is_finite() { ofv } else { 1e20 };
+        // The EBEs come back as the next solve's warm starts, κ̂ with η̂ (#2261), except
+        // on an ODE + IOV model (#2508).
+        (
+            f,
+            g,
+            outer_cache_warm_starts(model, &ehs, &kappas),
+            hms,
+            contribs,
+        )
+    };
 
     // Per-element scale factors for the BFGS outer loop.
     let scale = bfgs_scale(&x, &bounds, init_params, options);
@@ -11052,7 +11130,10 @@ fn subject_analytic_outer_gradient(
 
 /// `subject_analytic_outer_gradient`, and with `want_eta_dx` the subject's mode response
 /// `dη̂/dx` formed from the same recording; the response is `None` wherever the gradient is.
-/// A declined gradient comes back as its [`DeclineCause`] (#2713).
+/// A declined gradient comes back as its [`DeclineCause`] (#2713). The third element is the
+/// `η̂` the gradient was taken at when the pass polished an off-mode start to the mode
+/// (stacked `[η, κ]` under IOV): the store's `η̂` and `H` are replaced by it
+/// ([`adopt_polished_modes`]).
 fn subject_analytic_outer_gradient_dx(
     model: &CompiledModel,
     subject: &Subject,
@@ -11060,11 +11141,15 @@ fn subject_analytic_outer_gradient_dx(
     eta_hat: &[f64],
     interaction: bool,
     want_eta_dx: bool,
-) -> (Result<Vec<f64>, DeclineCause>, Option<Vec<DVector<f64>>>) {
+) -> (
+    Result<Vec<f64>, DeclineCause>,
+    Option<Vec<DVector<f64>>>,
+    Option<Vec<f64>>,
+) {
     use crate::sens::ode_provider::adjoint::{subject_adjoint_gradient_and_mode_at, ModeOut};
     // No data at all contributes nothing (`sens_outer_gradient::subject_gradient_at`).
     if subject.observations.is_empty() && subject.obs_records.is_empty() {
-        return (Ok(vec![0.0; pt.x.len()]), None);
+        return (Ok(vec![0.0; pt.x.len()]), None, None);
     }
     let objective = if interaction {
         crate::sens::ode_provider::adjoint::Objective::Focei
@@ -11077,9 +11162,9 @@ fn subject_analytic_outer_gradient_dx(
     };
     let g = subject_adjoint_gradient_and_mode_at(model, subject, pt, eta_hat, objective, &mut out);
     match g {
-        Some(g) if g.iter().all(|v| v.is_finite()) => (Ok(g), out.eta_dx),
-        _ if out.mode_system_declined => (Err(DeclineCause::ModeSystem), None),
-        _ => (Err(DeclineCause::Recording), None),
+        Some(g) if g.iter().all(|v| v.is_finite()) => (Ok(g), out.eta_dx, out.eta_polished),
+        _ if out.mode_system_declined => (Err(DeclineCause::ModeSystem), None, None),
+        _ => (Err(DeclineCause::Recording), None, None),
     }
 }
 
@@ -11810,7 +11895,8 @@ pub(crate) fn population_gradient_sens_mixed(
 /// With `want_eta_dx` it also returns each subject's mode response `dη̂ᵢ/dx` from its
 /// gradient's own recording
 /// (`adjoint::subject_adjoint_gradient_with_eta_dx_at`): the EBE warm-start predictor's
-/// Jacobians, zero for a subject the response does not reach.
+/// Jacobians, zero for a subject the response does not reach. The third element holds, per
+/// subject, the `η̂` a polished pass took its gradient at ([`adopt_polished_modes`]).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub(crate) fn population_gradient_sens_mixed_dx(
     x: &[f64],
@@ -11824,17 +11910,22 @@ pub(crate) fn population_gradient_sens_mixed_dx(
     trial: OuterTrial<'_>,
     declines: &OuterFdDeclineLog,
     want_eta_dx: bool,
-) -> (Vec<f64>, Option<Vec<Vec<DVector<f64>>>>) {
+) -> (
+    Vec<f64>,
+    Option<Vec<Vec<DVector<f64>>>>,
+    Vec<Option<Vec<f64>>>,
+) {
     let np = x.len();
     let n_obs_total = population_n_obs(population);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
-    let filled: Vec<(Vec<f64>, Option<Vec<DVector<f64>>>)> =
+    #[allow(clippy::type_complexity)]
+    let filled: Vec<(Vec<f64>, Option<Vec<DVector<f64>>>, Option<Vec<f64>>)> =
         crate::par::map(population.subjects.len(), |i| {
             let subject = &population.subjects[i];
             // Complete the fallback on this worker as soon as its analytic
             // result is known; do not wait for a second population-wide pass.
-            let (analytic, dx) = match pt.as_ref() {
+            let (analytic, dx, polished) = match pt.as_ref() {
                 Some(pt) => subject_analytic_outer_gradient_dx(
                     model,
                     subject,
@@ -11843,7 +11934,7 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                     options.interaction,
                     want_eta_dx,
                 ),
-                None => (packed_length_decline(subject, x.len()), None),
+                None => (packed_length_decline(subject, x.len()), None, None),
             };
             #[cfg(test)]
             let analytic = declines.forced_cause(i).map_or(analytic, Err);
@@ -11885,10 +11976,10 @@ pub(crate) fn population_gradient_sens_mixed_dx(
                     )
                 }
             };
-            (g, dx)
+            (g, dx, polished)
         });
     let mut grad = vec![0.0f64; np];
-    for (gi, _) in &filled {
+    for (gi, _, _) in &filled {
         for k in 0..np {
             grad[k] += 2.0 * gi[k];
         }
@@ -11901,17 +11992,17 @@ pub(crate) fn population_gradient_sens_mixed_dx(
     }
     // A subject the response does not reach (declined, no data, a singular inner Hessian)
     // is predicted not to move.
+    let (dxs, polished): (Vec<_>, Vec<_>) = filled.into_iter().map(|(_, dx, p)| (dx, p)).unzip();
     let eta_dx = want_eta_dx.then(|| {
-        filled
-            .into_iter()
+        dxs.into_iter()
             .zip(ehs)
-            .map(|((_, dx), e)| {
+            .map(|(dx, e)| {
                 dx.filter(|c| c.len() == np && c.iter().all(|v| v.len() == e.len()))
                     .unwrap_or_else(|| vec![DVector::zeros(e.len()); np])
             })
             .collect()
     });
-    (grad, eta_dx)
+    (grad, eta_dx, polished)
 }
 
 /// Whether a declined non-IOV subject takes the reconverged salvage in
@@ -11937,7 +12028,8 @@ pub(crate) fn declined_salvage_reconverges(
 /// data at all (no observations, no endpoint records) keeps the zero gradient it gives one.
 ///
 /// The analytic half of [`subject_iov_outer_gradient`], kept separate so
-/// [`population_gradient_sens_iov_mixed`] can put its #1520 guard between the two halves.
+/// [`population_gradient_sens_iov_polished`] can put its #1520 guard between the two halves.
+/// The second element is the stacked `η̂` a polished pass took its gradient at.
 fn subject_iov_analytic_gradient(
     pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
     model: &CompiledModel,
@@ -11945,20 +12037,20 @@ fn subject_iov_analytic_gradient(
     stacked: &DVector<f64>,
     np: usize,
     options: &FitOptions,
-) -> Result<Vec<f64>, DeclineCause> {
+) -> (Result<Vec<f64>, DeclineCause>, Option<Vec<f64>>) {
     match pt {
         Some(pt) => {
-            subject_analytic_outer_gradient_dx(
+            let (g, _, polished) = subject_analytic_outer_gradient_dx(
                 model,
                 subject,
                 pt,
                 stacked.as_slice(),
                 options.interaction,
                 false,
-            )
-            .0
+            );
+            (g, polished)
         }
-        None => packed_length_decline(subject, np),
+        None => (packed_length_decline(subject, np), None),
     }
 }
 
@@ -11979,8 +12071,9 @@ pub(crate) fn subject_iov_outer_gradient(
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options).unwrap_or_else(
-        |_| {
+    subject_iov_analytic_gradient(pt, model, subject, stacked, x.len(), options)
+        .0
+        .unwrap_or_else(|_| {
             subject_reconverged_fd_gradient_iov(
                 x,
                 init_params,
@@ -11990,8 +12083,7 @@ pub(crate) fn subject_iov_outer_gradient(
                 bounds,
                 options,
             )
-        },
-    )
+        })
 }
 
 /// **IOV** population gradient assembled **per subject** — the IOV analogue of
@@ -12004,6 +12096,7 @@ pub(crate) fn subject_iov_outer_gradient(
 /// Returns the packed `2·Σᵢ dᵢ` with fixed coordinates zeroed.
 ///
 /// `trial` serves the #1520 guard, exactly as on the non-IOV twin.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn population_gradient_sens_iov_mixed(
     x: &[f64],
@@ -12017,34 +12110,76 @@ pub(crate) fn population_gradient_sens_iov_mixed(
     trial: OuterTrial<'_>,
     declines: &OuterFdDeclineLog,
 ) -> Vec<f64> {
+    population_gradient_sens_iov_polished(
+        x,
+        init_params,
+        model,
+        population,
+        ehs,
+        kappas,
+        bounds,
+        options,
+        trial,
+        declines,
+    )
+    .0
+}
+
+/// [`population_gradient_sens_iov_mixed`] and, per subject, the stacked `[η̂, κ̂]` a polished
+/// pass took its gradient at ([`adopt_polished_modes`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn population_gradient_sens_iov_polished(
+    x: &[f64],
+    init_params: &ModelParameters,
+    model: &CompiledModel,
+    population: &Population,
+    ehs: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    bounds: &PackedBounds,
+    options: &FitOptions,
+    trial: OuterTrial<'_>,
+    declines: &OuterFdDeclineLog,
+) -> (Vec<f64>, Vec<Option<Vec<f64>>>) {
     let np = x.len();
     let n_obs_total = population_n_obs(population);
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(init_params, x);
-    let filled: Vec<Vec<f64>> = crate::par::map(population.subjects.len(), |i| {
-        let subject = &population.subjects[i];
-        let stacked = joint_warm_start(&ehs[i], &kappas[i]);
-        match subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options) {
-            Ok(g) => g,
-            Err(cause) => {
-                declines.record(i);
-                declines.record_cause(i, cause);
-                declined_subject_gradient(np, population, i, &trial, n_obs_total, declines, || {
-                    subject_reconverged_fd_gradient_iov(
-                        x,
-                        init_params,
-                        model,
-                        subject,
-                        &stacked,
-                        bounds,
-                        options,
+    let filled: Vec<(Vec<f64>, Option<Vec<f64>>)> =
+        crate::par::map(population.subjects.len(), |i| {
+            let subject = &population.subjects[i];
+            let stacked = joint_warm_start(&ehs[i], &kappas[i]);
+            let (analytic, polished) =
+                subject_iov_analytic_gradient(pt.as_ref(), model, subject, &stacked, np, options);
+            let g = match analytic {
+                Ok(g) => g,
+                Err(cause) => {
+                    declines.record(i);
+                    declines.record_cause(i, cause);
+                    declined_subject_gradient(
+                        np,
+                        population,
+                        i,
+                        &trial,
+                        n_obs_total,
+                        declines,
+                        || {
+                            subject_reconverged_fd_gradient_iov(
+                                x,
+                                init_params,
+                                model,
+                                subject,
+                                &stacked,
+                                bounds,
+                                options,
+                            )
+                        },
                     )
-                })
-            }
-        }
-    });
+                }
+            };
+            (g, polished)
+        });
     let mut grad = vec![0.0f64; np];
-    for gi in &filled {
+    for (gi, _) in &filled {
         for k in 0..np {
             grad[k] += 2.0 * gi[k];
         }
@@ -12055,7 +12190,7 @@ pub(crate) fn population_gradient_sens_iov_mixed(
             grad[k] = 0.0;
         }
     }
-    grad
+    (grad, filled.into_iter().map(|(_, p)| p).collect())
 }
 
 /// Compute `d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x)` by summing per-subject
@@ -12301,7 +12436,7 @@ fn population_gradient_with_agq_evaluation(
             // for out-of-scope ones — always `Some`, mirroring the non-IOV mixed path. A
             // single out-of-scope subject no longer drops the whole population to FD (and
             // so the reported `gradient_method` stays accurate) (#466 review round 2).
-            Some(population_gradient_sens_iov_mixed(
+            let (g, polished) = population_gradient_sens_iov_polished(
                 x,
                 init_params,
                 model,
@@ -12312,7 +12447,11 @@ fn population_gradient_with_agq_evaluation(
                 options,
                 trial,
                 declines,
-            ))
+            );
+            if let Some(slot) = eta_dx {
+                slot.polished = polished;
+            }
+            Some(g)
         } else {
             // Non-IOV: assemble per subject — exact analytic for in-scope
             // subjects, held-EBE per-subject gradient for out-of-scope ones (#1529).
@@ -12320,7 +12459,7 @@ fn population_gradient_with_agq_evaluation(
             // is the fix for focei-slsqp-fixed-ebe-gradient-bias: one out-of-scope
             // subject no longer drops the whole population to the biased θ-only
             // fixed-EBE fallback (`ad_population_gradient`).
-            let (g, dx) = population_gradient_sens_mixed_dx(
+            let (g, dx, polished) = population_gradient_sens_mixed_dx(
                 x,
                 init_params,
                 model,
@@ -12333,8 +12472,11 @@ fn population_gradient_with_agq_evaluation(
                 declines,
                 eta_dx.as_ref().is_some_and(|s| s.want_dx),
             );
-            if let (Some(slot), Some(dx)) = (eta_dx, dx) {
-                slot.eta_dx = Some(dx);
+            if let Some(slot) = eta_dx {
+                slot.polished = polished;
+                if let Some(dx) = dx {
+                    slot.eta_dx = Some(dx);
+                }
             }
             Some(g)
         };

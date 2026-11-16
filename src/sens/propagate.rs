@@ -933,25 +933,24 @@ fn record_pk_at_g<T: PkNum>(
 /// ([`crate::types::DoseEvent::bioavailable_infusion`], #419): a rate-defined window
 /// stretched to `F·dur` (so its end moves with `F`), a duration-defined rate scaled. The
 /// walk injects that rate as-is. Empty (or `None` entries) recover the fixed-window walk.
+/// Every break of the walk on `[lo, hi]`, as `(value, dual position, which break)`: each live
+/// dose's arrival and window end where they move (an estimated lag; a modeled window), the
+/// earlier pulses of an `SS=1` infusion, the caller's own `extra_moving` positions, and, with no
+/// lag, the fixed arrivals and window ends that share an instant with a moving one. In dose
+/// order; the one construction of the list, shared by the interval walk
+/// ([`propagate_bounds_g`]) and an observation's reading ([`obs_group_reading`]).
 #[allow(clippy::too_many_arguments)]
-fn propagate_bounds_g<T: PkNum>(
-    state: &mut [T],
-    bounds: &[f64],
-    pk: &PkDual<T>,
-    pk_model: PkModel,
+fn collect_breaks<T: PkNum>(
+    lo: Option<f64>,
+    hi: Option<f64>,
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
     dose_lag_dual: &[T],
     dose_inf_dual: &[Option<(T, T)>],
     reset_floor: f64,
-    // A `DoseIndex` over these `doses` and `dose_lagtimes` (#2754): the reset gate's `SS=1`
-    // cutoff, the doses that can carry a rate, and the doses with a boundary near this
-    // interval come from it instead of a scan of every dose.
     index: &crate::dosing::DoseIndex,
-    // Break positions whose dual the caller supplies (`value`, dual): matched like the moving
-    // breaks below, so a recording can hold a break as a number that follows its inputs.
     extra_moving: &[(f64, T)],
-) {
+) -> Vec<(f64, T, BrkKind)> {
     // Dual clock position of dose `k`'s arrival, `τ_k = t_k + ALAG`. With an estimated
     // lagtime this boundary **moves**: `dose_lag_dual[k]` carries `∂ALAG/∂(θ,η)`, so the
     // sub-intervals on either side of the arrival pick up `±∂ALAG` in their dual lengths
@@ -976,10 +975,9 @@ fn propagate_bounds_g<T: PkNum>(
     // with a reset break does not thread a spurious jet into the post-reset window (#486
     // review #3), and a cancelled lagged dose's arrival moves nothing.
     //
-    // The provider declines to FD any subject whose moving boundaries are not *separable* —
-    // two breaks coinciding in `f64` while carrying different jets (`moving_bounds_separable`)
-    // — so at most one entry matches a given break and coincidences that survive share an
-    // identical dual. The first match below is therefore exact (#486 review #2).
+    // Breaks that coincide at the value level each keep their own jet: a group's crossing is
+    // taken below (the provider's `moving_bounds_separable` declines only a break on a reset or
+    // a covariate change, and a sample on several).
     //
     // Only boundaries that genuinely *move* are recorded: with no lagtime and no modeled
     // window nothing does, so this stays empty and `dual_pos` below is the same no-op scan it
@@ -991,18 +989,18 @@ fn propagate_bounds_g<T: PkNum>(
     // per dose per interval, which made this list most of a lagged walk. The candidates come
     // in dose order, so the surviving entries, and so every first match, are the scan's.
     let has_lag = !dose_lag_dual.is_empty();
-    let mut moving_bounds: Vec<(f64, T)> = Vec::new();
+    let mut moving_bounds: Vec<(f64, T, BrkKind)> = Vec::new();
     let gate = crate::ode::predictions::ResetGate::at_segment_indexed(
         index,
         doses,
         reset_floor,
-        bounds.first().copied().unwrap_or(f64::NEG_INFINITY),
+        lo.unwrap_or(f64::NEG_INFINITY),
     );
-    let near = match (bounds.first(), bounds.last()) {
-        (Some(&lo), Some(&hi)) => index.near_moving_points(lo, hi),
+    let near = match (lo, hi) {
+        (Some(lo), Some(hi)) => index.near_moving_points(lo, hi),
         _ => Vec::new(),
     };
-    for k in near {
+    for &k in &near {
         let d = &doses[k];
         let (t_start, dual_start) = dose_start(k, d);
         if !gate.live(doses, k) {
@@ -1010,7 +1008,7 @@ fn propagate_bounds_g<T: PkNum>(
         }
         // The arrival moves only under a lagtime.
         if has_lag {
-            moving_bounds.push((t_start, dual_start));
+            moving_bounds.push((t_start, dual_start, BrkKind::Onset(k)));
         }
         if d.rate > 0.0 && d.duration > 0.0 {
             // The window end moves with the arrival *and* (for a modeled `RATE=-1/-2` dose)
@@ -1022,36 +1020,134 @@ fn propagate_bounds_g<T: PkNum>(
                 None => None,
             };
             if let Some(dual_end) = dual_end {
-                moving_bounds.push((t_start + d.duration, dual_end));
+                moving_bounds.push((t_start + d.duration, dual_end, BrkKind::End(k)));
             }
         }
         // The earlier pulses of an SS infusion still running after its record (#1121 when
         // seeded; every overlapping pulse when `T_inf > II`) stop at `t + T_inf − ψ − j·II`:
         // they move with the lag (through a seeded phase) and with a modeled duration.
-        moving_bounds.extend(residual_ends_g(
-            k,
-            d,
-            dose_lagtimes,
-            dose_lag_dual,
-            dose_inf_dual,
-            bounds.first().copied().unwrap_or(f64::NEG_INFINITY),
-            bounds.last().copied().unwrap_or(f64::INFINITY),
-        ));
+        moving_bounds.extend(
+            residual_ends_g(
+                k,
+                d,
+                dose_lagtimes,
+                dose_lag_dual,
+                dose_inf_dual,
+                lo.unwrap_or(f64::NEG_INFINITY),
+                hi.unwrap_or(f64::INFINITY),
+            )
+            .into_iter()
+            .map(|(v, e)| (v, e, BrkKind::Residual(k))),
+        );
     }
-    moving_bounds.extend_from_slice(extra_moving);
+    moving_bounds.extend(extra_moving.iter().map(|&(v, e)| (v, e, BrkKind::Marker)));
+    // Without a lagtime a fixed arrival or window end is no moving break, so a moving one (a
+    // modeled window's end) can share its instant with it unseen: the walk would then move the
+    // fixed break with the moving one's jet. Such breaks join the group at their own constant.
+    if !has_lag && !moving_bounds.is_empty() {
+        let mut fixed: Vec<(f64, T, BrkKind)> = Vec::new();
+        let hit = |v: f64| moving_bounds.iter().any(|m| (m.0 - v).abs() < 1e-9);
+        for &k in &near {
+            let d = &doses[k];
+            if !gate.live(doses, k) {
+                continue;
+            }
+            let t_start = d.time + dose_lagtimes.get(k).copied().unwrap_or(0.0);
+            if hit(t_start) {
+                fixed.push((t_start, T::from_f64(t_start), BrkKind::Onset(k)));
+            }
+            let t_end = t_start + d.duration;
+            if d.rate > 0.0
+                && d.duration > 0.0
+                && dose_inf_dual.get(k).copied().flatten().is_none()
+                && hit(t_end)
+            {
+                fixed.push((t_end, T::from_f64(t_end), BrkKind::End(k)));
+            }
+        }
+        moving_bounds.extend(fixed);
+    }
+    moving_bounds
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propagate_bounds_g<T: PkNum>(
+    state: &mut [T],
+    bounds: &[f64],
+    pk: &PkDual<T>,
+    pk_model: PkModel,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    dose_lag_dual: &[T],
+    dose_inf_dual: &[Option<(T, T)>],
+    reset_floor: f64,
+    // A `DoseIndex` over these `doses` and `dose_lagtimes` (#2754): the reset gate's `SS=1`
+    // cutoff, the doses that can carry a rate, and the doses with a boundary near this
+    // interval come from it instead of a scan of every dose.
+    index: &crate::dosing::DoseIndex,
+    // Break positions whose dual the caller supplies (`value`, dual): matched like the moving
+    // breaks below, so a recording can hold a break as a number that follows its inputs.
+    extra_moving: &[(f64, T)],
+    // A covariate-change record at the interval's left / right edge (see below).
+    rec_left: bool,
+    rec_right: bool,
+) -> Option<EdgeGroup<T>> {
+    let lo = bounds.first().copied();
+    let hi = bounds.last().copied();
+    let mut moving_bounds = collect_breaks(
+        lo,
+        hi,
+        doses,
+        dose_lagtimes,
+        dose_lag_dual,
+        dose_inf_dual,
+        reset_floor,
+        index,
+        extra_moving,
+    );
+    // A covariate-change record sits at an edge of the interval, where the parameters switch at
+    // a fixed instant: the breaks that cross there cross on the value path's side of it. An
+    // arrival is in force when the record's parameters are (it sorts before the record), a
+    // window end after them (it sorts after). So the interval that ends on the record carries
+    // the arrivals up to it and stops at the record's own, jet-free, position; the interval that
+    // starts on it crosses the ends there, from that position.
+    if let Some(h) = hi.filter(|_| rec_right) {
+        moving_bounds.retain(|m| (m.0 - h).abs() >= 1e-9 || matches!(m.2, BrkKind::Onset(_)));
+        if moving_bounds.iter().any(|m| (m.0 - h).abs() < 1e-9) {
+            moving_bounds.push((h, T::from_f64(h), BrkKind::Marker));
+        }
+    }
+    if let Some(l) = lo.filter(|_| rec_left) {
+        moving_bounds.retain(|m| (m.0 - l).abs() >= 1e-9 || !matches!(m.2, BrkKind::Onset(_)));
+    }
+    // Breaks that coincide at the value level cross together (below). A coincident group is
+    // the only way this walk differs from the plain lookup, so the ordinary subject keeps it.
+    let coincident = moving_bounds
+        .iter()
+        .enumerate()
+        .any(|(i, m)| moving_bounds[..i].iter().any(|u| (u.0 - m.0).abs() < 1e-9));
     let dual_pos = |w: f64| -> T {
-        for &(val, dual) in &moving_bounds {
-            if (w - val).abs() < 1e-9 {
-                return dual;
+        if coincident {
+            // A group's position is its last member's: every break of it has been crossed.
+            for &(val, dual, _) in moving_bounds.iter().rev() {
+                if (w - val).abs() < 1e-9 {
+                    return dual;
+                }
+            }
+        } else {
+            for &(val, dual, _) in &moving_bounds {
+                if (w - val).abs() < 1e-9 {
+                    return dual;
+                }
             }
         }
         T::from_f64(w)
     };
+    let mut left_pending = rec_left;
     for w in bounds.windows(2) {
         if w[1] - w[0] <= 0.0 {
             continue;
         }
-        let dt = dual_pos(w[1]) - dual_pos(w[0]);
         let mid = 0.5 * (w[0] + w[1]);
         let rates = active_rates_g(
             doses,
@@ -1064,7 +1160,121 @@ fn propagate_bounds_g<T: PkNum>(
             false,
             index,
         );
-        apply_step_g(state, dt, pk, pk_model, rates);
+        if left_pending {
+            left_pending = false;
+            // The interval starts on a covariate-change record: the window ends that cross at
+            // this instant cross after the record's parameters are in force, from its own
+            // position, under the rates that held before them.
+            let ends: Vec<usize> = (0..moving_bounds.len())
+                .filter(|&i| (moving_bounds[i].0 - w[0]).abs() < 1e-9)
+                .collect();
+            if !ends.is_empty() {
+                let mut cur = rates;
+                for &i in &ends {
+                    let (_, _, kind) = moving_bounds[i];
+                    if let Some((ch, r)) = break_rate_jump(kind, doses, dose_inf_dual, pk, pk_model)
+                    {
+                        cur = add_rate(cur, ch, T::from_f64(0.0) - r);
+                    }
+                }
+                let mut at = T::from_f64(w[0]);
+                for &i in &ends {
+                    let (_, dual, kind) = moving_bounds[i];
+                    apply_step_g(state, dual - at, pk, pk_model, cur);
+                    at = dual;
+                    if let Some((ch, r)) = break_rate_jump(kind, doses, dose_inf_dual, pk, pk_model)
+                    {
+                        cur = add_rate(cur, ch, r);
+                    }
+                }
+            }
+        }
+        let group: Vec<usize> = if coincident {
+            (0..moving_bounds.len())
+                .filter(|&i| (moving_bounds[i].0 - w[1]).abs() < 1e-9)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if group.len() < 2 {
+            let dt = dual_pos(w[1]) - dual_pos(w[0]);
+            apply_step_g(state, dt, pk, pk_model, rates);
+            continue;
+        }
+        // Several breaks at this instant, each carrying its own jet. The flow is linear in
+        // its input, so each break's effect is its own, whichever is crossed first: step to
+        // the first, then across the zero-length gaps between the others, each under the
+        // rates that hold once the earlier ones are crossed. Every break lands at its dual.
+        let mut at = dual_pos(w[0]);
+        let mut rates = rates;
+        for &i in &group {
+            let (_, dual, kind) = moving_bounds[i];
+            apply_step_g(state, dual - at, pk, pk_model, rates);
+            at = dual;
+            if let Some((ch, r)) = break_rate_jump(kind, doses, dose_inf_dual, pk, pk_model) {
+                rates = add_rate(rates, ch, r);
+            }
+        }
+    }
+    // The right edge's group, for a dose event landing in it.
+    if !coincident {
+        return None;
+    }
+    let last = bounds.last().copied()?;
+    moving_bounds
+        .iter()
+        .rev()
+        .find(|m| (m.0 - last).abs() < 1e-9)
+        .map(|&(_, pos, kind)| EdgeGroup { pos, last: kind })
+}
+
+/// Which break of the walk a position is, so a group crossing knows the rate it switches.
+/// `Marker` is a position the caller supplies, which switches nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BrkKind {
+    Onset(usize),
+    End(usize),
+    Residual(usize),
+    Marker,
+}
+
+/// Where a walk interval's right edge lands when breaks coincide there: the position every
+/// later step starts from (the last crossed break's dual) and which break that is.
+struct EdgeGroup<T> {
+    pos: T,
+    last: BrkKind,
+}
+
+/// The channel and signed rate a break switches: an infusing dose's window opening adds its
+/// rate, its end (or an earlier pulse's) removes it; a bolus arrival or a marker switches
+/// nothing.
+fn break_rate_jump<T: PkNum>(
+    kind: BrkKind,
+    doses: &[DoseEvent],
+    dose_inf_dual: &[Option<(T, T)>],
+    pk: &PkDual<T>,
+    pk_model: PkModel,
+) -> Option<(Channel, T)> {
+    let (k, opens) = match kind {
+        BrkKind::Onset(k) => (k, true),
+        BrkKind::End(k) | BrkKind::Residual(k) => (k, false),
+        BrkKind::Marker => return None,
+    };
+    let d = &doses[k];
+    if !(d.rate > 0.0 && d.duration > 0.0) {
+        return None;
+    }
+    let (one, _) = infusion_window_g(d, dose_inf_dual.get(k).copied().flatten(), pk);
+    let ch = pk_model.topology().dose_channel(d.cmt_raw())?;
+    Some((ch, if opens { one } else { T::from_f64(0.0) - one }))
+}
+
+fn add_rate<T: PkNum>(r: (T, T, T, T), ch: Channel, x: T) -> (T, T, T, T) {
+    match ch {
+        Channel::Central => (r.0 + x, r.1, r.2, r.3),
+        Channel::Periph1 => (r.0, r.1 + x, r.2, r.3),
+        Channel::Periph2 => (r.0, r.1, r.2 + x, r.3),
+        Channel::Depot => (r.0, r.1, r.2, r.3 + x),
     }
 }
 
@@ -1373,6 +1583,62 @@ fn obs_boundary_correction<T: PkNum>(
     None
 }
 
+/// The state an observation reads when several breaks share its instant, from the walk's `state`
+/// at the group's position (its last break's dual). The reading's convention is the single
+/// break's ([`obs_boundary_correction`]): arrivals have landed, window ends still contribute.
+/// The flow is linear in its input, so it is the state flowed from the group's position to the
+/// sample's own instant under the rates once every arrival is in and every end is out, plus,
+/// for each end, the input it still delivers from its own position to the sample's instant.
+#[allow(clippy::too_many_arguments)]
+fn obs_group_reading<T: PkNum>(
+    state: &[T],
+    group: &[(f64, T, BrkKind)],
+    t: f64,
+    doses: &[DoseEvent],
+    dose_lagtimes: &[f64],
+    dose_inf_dual: &[Option<(T, T)>],
+    pk: &PkDual<T>,
+    pk_model: PkModel,
+    reset_floor: f64,
+    index: &crate::dosing::DoseIndex,
+) -> Vec<T> {
+    let zero = T::from_f64(0.0);
+    let at_t = T::from_f64(t);
+    let mut read = state.to_vec();
+    // Every arrival in, every end still on, then the ends taken out.
+    let mut rates = active_rates_g(
+        doses,
+        dose_lagtimes,
+        dose_inf_dual,
+        pk,
+        pk_model,
+        reset_floor,
+        t,
+        false,
+        index,
+    );
+    let mut ends: Vec<(T, (Channel, T))> = Vec::new();
+    for &(_, dual, kind) in group {
+        if matches!(kind, BrkKind::End(_) | BrkKind::Residual(_)) {
+            if let Some((ch, minus_r)) = break_rate_jump(kind, doses, dose_inf_dual, pk, pk_model) {
+                rates = add_rate(rates, ch, minus_r);
+                ends.push((dual, (ch, zero - minus_r)));
+            }
+        }
+    }
+    let position = group.last().map_or(at_t, |m| m.1);
+    apply_step_g(&mut read, at_t - position, pk, pk_model, rates);
+    for (dual, (ch, r)) in ends {
+        let mut extra = vec![zero; state.len()];
+        let only = add_rate((zero, zero, zero, zero), ch, r);
+        apply_step_g(&mut extra, at_t - dual, pk, pk_model, only);
+        for (x, e) in read.iter_mut().zip(extra) {
+            *x = *x + e;
+        }
+    }
+    read
+}
+
 /// Shared early-stop driver for the **dual** SS-equilibration loops (#519; #532 review #9/#10):
 /// refresh `cur` from the value parts (`PkNum::val`) of the dual state `u`, decide the stop on
 /// the *same* [`crate::dosing::ss_cycle_converged`] criterion the f64 predictor uses
@@ -1572,6 +1838,8 @@ fn equilibrate_ss_g<T: PkNum>(
             f64::NEG_INFINITY,
             index,
             &[],
+            false,
+            false,
         );
         Some(s)
     };
@@ -1614,6 +1882,8 @@ fn equilibrate_ss_g<T: PkNum>(
             f64::NEG_INFINITY,
             &synthetic_index,
             &[],
+            false,
+            false,
         );
         cycles_run = cycle + 1;
         if ss_dual_cycle_should_stop(cycle, &state, &mut cur, &mut prev, &mut prev_t) {
@@ -1705,6 +1975,8 @@ fn ss_state_at_phase_g<T: PkNum>(
         f64::NEG_INFINITY,
         &crate::dosing::DoseIndex::new(&cycle, &vec![0.0; cycle.len()]),
         &[(phase_v, record_end)],
+        false,
+        false,
     );
     state
 }
@@ -1897,6 +2169,10 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
     let mut state = vec![T::from_f64(0.0); n_states];
     let mut cur_t = schedule.events[0].time;
     let mut reset_floor = f64::NEG_INFINITY;
+    // The breaks that coincide at the instant the last interval ended at, when any do: the
+    // walk's position there is the last of them, and a bolus landing in the group arrives
+    // at its own break.
+    let mut edge: Option<EdgeGroup<T>> = None;
     // Whether a dose has arrived since the last reset — `observe_central_g`'s `dosed`.
     let mut dosed = false;
 
@@ -1933,7 +2209,18 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
 
         if ev.time > cur_t {
             let bounds = &schedule.bounds_per_interval[i - 1];
-            propagate_bounds_g(
+            // A covariate-change record at either edge of the interval: its breaks cross on the
+            // side of it the value path puts them (see `propagate_bounds_g`).
+            let rec_left = schedule.events[..i]
+                .iter()
+                .rev()
+                .take_while(|e| e.time == cur_t)
+                .any(|e| e.kind == EventKind::PkOnly);
+            let rec_right = schedule.events[i..]
+                .iter()
+                .take_while(|e| e.time == ev.time)
+                .any(|e| e.kind == EventKind::PkOnly);
+            edge = propagate_bounds_g(
                 &mut state,
                 bounds,
                 &pk_now,
@@ -1945,6 +2232,8 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 reset_floor,
                 &dose_index,
                 &[],
+                rec_left,
+                rec_right,
             );
             cur_t = ev.time;
         }
@@ -2001,7 +2290,34 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                 if d.rate <= 0.0 {
                     let cmt_idx = d.cmt_idx();
                     if cmt_idx < n_states {
-                        state[cmt_idx] = state[cmt_idx] + dose_pk.f * T::from_f64(d.amt);
+                        let bolus = dose_pk.f * T::from_f64(d.amt);
+                        match edge
+                            .as_ref()
+                            .filter(|e| e.last != BrkKind::Onset(ev.orig_idx))
+                        {
+                            None => state[cmt_idx] = state[cmt_idx] + bolus,
+                            // The walk stands at the group's last break, this dose arrived at
+                            // its own: it has been in the body for the gap between them.
+                            Some(e) => {
+                                let own = match dose_lag_dual.get(ev.orig_idx) {
+                                    Some(&lag_d) => T::from_f64(d.time) + lag_d,
+                                    None => T::from_f64(d.time + lag),
+                                };
+                                let zero = T::from_f64(0.0);
+                                let mut gap = vec![zero; n_states];
+                                gap[cmt_idx] = bolus;
+                                apply_step_g(
+                                    &mut gap,
+                                    e.pos - own,
+                                    &pk_now,
+                                    pk_model,
+                                    (zero, zero, zero, zero),
+                                );
+                                for (x, g) in state.iter_mut().zip(gap) {
+                                    *x = *x + g;
+                                }
+                            }
+                        }
                     } else {
                         // Unreachable from a validated call — `check_dose_compartments`
                         // (#375) rejects `cmt > n_states` up front. Kept as a defensive
@@ -2054,27 +2370,70 @@ pub fn event_driven_sens_with_doses_g<T: PkNum>(
                     ev.time,
                     &dose_index,
                 ) {
+                    // The sample sits on a covariate-change record too: the walk stands at the
+                    // record, with the arrivals crossed and the window ends still ahead, which
+                    // is the reading's convention already.
+                    Some(_)
+                        if schedule.events[..i]
+                            .iter()
+                            .rev()
+                            .take_while(|e| e.time == ev.time)
+                            .any(|e| e.kind == EventKind::PkOnly) =>
+                    {
+                        &state[..]
+                    }
                     Some((delta, strict_start)) => {
-                        obs_state = state.clone();
-                        let rates = active_rates_g(
+                        // Several breaks at this instant: each end's effect is its own.
+                        let here: Vec<_> = collect_breaks(
+                            Some(ev.time),
+                            Some(ev.time),
                             eff_doses,
                             &schedule.dose_lagtimes,
+                            dose_lag_dual,
                             dose_inf_dual,
-                            &pk_now,
-                            pk_model,
                             reset_floor,
-                            ev.time,
-                            strict_start,
                             &dose_index,
-                        );
-                        apply_step_g(
-                            &mut obs_state,
-                            T::from_f64(0.0) - delta,
-                            &pk_now,
-                            pk_model,
-                            rates,
-                        );
-                        &obs_state[..]
+                            &[],
+                        )
+                        .into_iter()
+                        .filter(|m| (m.0 - ev.time).abs() < 1e-9)
+                        .collect();
+                        if here.len() >= 2 {
+                            obs_state = obs_group_reading(
+                                &state,
+                                &here,
+                                ev.time,
+                                eff_doses,
+                                &schedule.dose_lagtimes,
+                                dose_inf_dual,
+                                &pk_now,
+                                pk_model,
+                                reset_floor,
+                                &dose_index,
+                            );
+                            &obs_state[..]
+                        } else {
+                            obs_state = state.clone();
+                            let rates = active_rates_g(
+                                eff_doses,
+                                &schedule.dose_lagtimes,
+                                dose_inf_dual,
+                                &pk_now,
+                                pk_model,
+                                reset_floor,
+                                ev.time,
+                                strict_start,
+                                &dose_index,
+                            );
+                            apply_step_g(
+                                &mut obs_state,
+                                T::from_f64(0.0) - delta,
+                                &pk_now,
+                                pk_model,
+                                rates,
+                            );
+                            &obs_state[..]
+                        }
                     }
                     None => &state[..],
                 };

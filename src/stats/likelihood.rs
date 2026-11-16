@@ -2010,8 +2010,9 @@ fn non_gaussian_mode_terms(
         tte_nll_at_mode += mode;
     }
     // The curvature, exact: the whole term's η-Hessian from its plan (#2786). A subject a
-    // part already repels by its value takes none. One whose term cannot be recorded (never
-    // expected) takes the central-difference Hessian of the same NLL — the safety net — and is
+    // part already repels by its value takes none. One whose term cannot be recorded (a plan
+    // defect: every decline of the exact Hessian at a point the value scores is one, see
+    // `adjoint::HessianDecline`) takes the central-difference Hessian of the same NLL — the safety net — and is
     // repelled only when that is not finite either.
     if n_eta > 0 && tte_nll_at_mode < crate::survival::REPEL_SENTINEL_FLOOR {
         match crate::survival::non_gaussian_eta_jets2(model, subject, theta, eta_hat.as_slice()) {

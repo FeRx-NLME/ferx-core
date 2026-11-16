@@ -550,10 +550,6 @@ pub(crate) trait RecHooks: Sized {
     /// recording) must not be integrated. The driver's entry point asserts this in a `const`
     /// block, so instantiating it over such a type is a compile error, not a run-time failure.
     const ODE_DRIVER_OK: bool = true;
-    /// A recording type (#2786) fails the recording as this point's own (a decline that depends
-    /// on the values here, not on the subject's structure: counted, nothing condemned); no-op for
-    /// every other type, whose caller declines by returning `None` anyway.
-    fn fail_point(_why: &str) {}
     /// One adaptive ODE segment, for a recording type (#2786) that records it as a call the
     /// solver's driver runs at run time; `None` — the generic integration — for every number
     /// type. `auto` is the driver's auto-switch state.

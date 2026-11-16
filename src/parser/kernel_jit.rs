@@ -1191,9 +1191,6 @@ impl RecHooks for Tr {
     fn same_node(&self, other: &Self) -> bool {
         self.r == other.r && self.dep == other.dep && self.v.to_bits() == other.v.to_bits()
     }
-    fn fail_point(why: &str) {
-        fail_here(why);
-    }
     fn note_linear_decline() {
         rec(|r| r.declined += 1);
     }

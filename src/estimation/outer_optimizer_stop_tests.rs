@@ -449,3 +449,102 @@ fn an_unconverged_gradient_fit_carries_the_report() {
         }
     }
 }
+
+/// G14: a subject whose gradient pass polished an off-mode `η̂` to the mode has that `η̂` (and its
+/// `H = ∂f/∂η`) adopted into the EBE store, so the next objective is evaluated where the
+/// gradient differentiates. The objective at the stored pair equals the objective at the
+/// converged EBE; at the handed-in off-mode `η̂` it is a different number (the discriminator).
+/// Mutation: drop the `adopt_polished_modes` write (or its `ehs[i]` line) -> the store keeps the
+/// off-mode `η̂` and the first objective assertion fails.
+#[test]
+fn a_polished_subject_replaces_its_off_mode_eta_and_h_in_the_ebe_store() {
+    use crate::estimation::inner_optimizer::find_ebe;
+    use crate::sens::ode_provider::adjoint::exact_eta_jacobian;
+    let (model, analytic, _) = analytic_and_declining();
+    let pop = mk_pop(vec![analytic]);
+    let params = &model.default_params;
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(params);
+    let opts = focei();
+    let s = &pop.subjects[0];
+    // An off-mode start the polish walks to the mode: the first grid point with an indefinite
+    // exact `H` that the subject's gradient serves (the far corner `[-2.5; 3]` that
+    // `off_mode_eta` returns is not walked to the mode on this model, and stays a decline).
+    let grid = [-0.75, 0.75, -1.5, 1.5, -2.5, 2.5];
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).expect("packed");
+    let mut points = Vec::new();
+    for &a in &grid {
+        for &b in &grid {
+            for &c in &grid {
+                points.push(vec![a, b, c]);
+            }
+        }
+    }
+    let off = points
+        .into_iter()
+        .find(|e| {
+            crate::sens::ode_provider::adjoint::exact_inner_hessian(&model, s, params, e)
+                .is_some_and(|h| h.cholesky().is_none())
+                && subject_analytic_outer_gradient_dx(&model, s, &pt, e, true, false)
+                    .2
+                    .is_some()
+        })
+        .expect("an indefinite point the polish serves");
+    let mut ehs = vec![DVector::from_column_slice(&off)];
+    let mut hms = vec![exact_eta_jacobian(&model, s, &params.theta, &off).expect("jacobian")];
+    let mut kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new()];
+    let log = OuterFdDeclineLog::new(1);
+    let (g, _, polished) = population_gradient_sens_mixed_dx(
+        &x,
+        params,
+        &model,
+        &pop,
+        &ehs,
+        &hms,
+        &bounds,
+        &opts,
+        OuterTrial::unknown(),
+        &log,
+        false,
+    );
+    assert!(g.iter().all(|v| v.is_finite()));
+    assert!(log.declined_indices().is_empty(), "served, not declined");
+    assert!(polished[0].is_some(), "the off-mode subject was polished");
+    let nll_at = |e: &DVector<f64>, h: &DMatrix<f64>| {
+        crate::stats::likelihood::foce_subject_nll_cov(
+            &model,
+            s,
+            &params.theta,
+            e,
+            h,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_with(&params.residual_correlations, &params.theta),
+            true,
+        )
+    };
+    let f_off = nll_at(&ehs[0], &hms[0]);
+    adopt_polished_modes(
+        &model,
+        &pop,
+        params,
+        &x,
+        &polished,
+        &mut ehs,
+        &mut hms,
+        &mut kappas,
+    );
+    let ebe = find_ebe(&model, s, params, 500, 1e-11, None, None, 0);
+    let f_mode = nll_at(&ebe.eta, &ebe.h_matrix);
+    let f_store = nll_at(&ehs[0], &hms[0]);
+    eprintln!("objective: off-mode {f_off:.9}, stored {f_store:.9}, converged EBE {f_mode:.9}");
+    assert!(
+        (f_store - f_mode).abs() <= 1e-12 * (1.0 + f_mode.abs()),
+        "stored {f_store} vs mode {f_mode}"
+    );
+    assert!(
+        (f_off - f_mode).abs() > 1e-12 * (1.0 + f_mode.abs()),
+        "the off-mode objective {f_off} differs from the mode's {f_mode}, so the check discriminates"
+    );
+}

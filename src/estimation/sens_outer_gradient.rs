@@ -195,6 +195,11 @@ pub(crate) struct ModeResponses {
     /// Under the quadrature, each subject's exact packed score — the rows the gradient sums —
     /// kept for the BHHH decrement at a tolerance stop (`quadrature_predicted_remaining_gain`).
     pub(crate) scores: Option<Vec<Vec<f64>>>,
+    /// Per subject, the stacked `[η̂, κ̂]` its gradient was taken at when the pass polished an
+    /// off-mode start to the mode (`None` for one served where it stood; empty when no pass
+    /// ran). The caller's EBE store takes these ([`adopt_polished_modes`]), so the next
+    /// objective is evaluated at the `η̂` this gradient differentiates.
+    pub(crate) polished: Vec<Option<Vec<f64>>>,
 }
 
 /// The EBE warm start at `x_new` from the modes at `x_prev`: the mode map's first-order

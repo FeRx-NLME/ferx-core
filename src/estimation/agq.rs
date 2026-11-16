@@ -236,6 +236,10 @@ pub(crate) struct PopulationEvaluation {
     /// Each subject's packed score, when every subject has one (#2549): the BHHH decrement's
     /// rows at a tolerance stop.
     scores: Option<Vec<Vec<f64>>>,
+    /// Each subject's stacked mode the score was taken at when its pass polished an off-mode
+    /// start (`None` where it was served as handed): the objective was evaluated there too, and
+    /// the caller's EBE store adopts it.
+    polished: Vec<Option<Vec<f64>>>,
     /// How each subject's score was formed, in subject order (for the outer FD-fallback
     /// warning).
     routes: Vec<ScoreRoute>,
@@ -443,7 +447,8 @@ impl Stack {
     }
 }
 
-/// Central-difference Hessian of the exact conditional NLL w.r.t. the integration variable
+/// Recorder-defect safety net (never a scope route): central-difference Hessian of the exact
+/// conditional NLL w.r.t. the integration variable
 /// `b` at `b_hat` (see [`Stack`] — `b = η`, or `[η, κ₁..κ_K]` under IOV).
 ///
 /// Step `hᵢ = max(ε^¼ · √Ω_joint,ᵢᵢ, 1e-4)`: `ε^¼` is the standard second-difference step (it
@@ -505,9 +510,11 @@ fn fd_posterior_hessian(
 ///
 /// * [`HessianAnchor::Exact`] → the exact conditional Hessian `∂²nll/∂b²`. This is
 ///   Laplace / adaptive GH quadrature. Taken **analytically** from the unified recording
-///   (`adjoint::exact_inner_hessian`) wherever it serves the subject, and from the
-///   `2d²+1`-evaluation [`fd_posterior_hessian`] sweep only outside it (TTE, categorical),
-///   whose likelihood has no `PkNum` twin.
+///   (`adjoint::exact_inner_hessian`) for every subject of every model. Its declines
+///   (`adjoint::HessianDecline`) are points the objective repels too, so there the anchor is
+///   `None` (the sentinel). Only a point the exact Hessian declines **and the objective
+///   scores** — a plan that failed, a recorder defect — takes the `2d²+1`-evaluation
+///   [`fd_posterior_hessian`] sweep, as the gradient and inner paths take theirs.
 /// * [`HessianAnchor::GaussNewton`] → the Almquist `H̃`, the *same* Hessian FOCEI's own
 ///   objective and gradient use, so `focei` with `n_agq > 1` is a genuine quadrature
 ///   refinement of FOCEI.
@@ -521,8 +528,9 @@ fn fd_posterior_hessian(
 ///
 /// Returns `None` when a Gauss-Newton anchor is out of the provider's scope (the caller then
 /// yields the NLL sentinel, and `api::check_model_options` rejects `focei, n_agq > 1` outside
-/// that scope up front so this does not surprise a fit at runtime). The `Exact` arm always
-/// yields a matrix, falling back to FD.
+/// that scope up front so this does not surprise a fit at runtime), and for the exact anchor
+/// where the Hessian declines at a point the objective itself repels (non-finite or the
+/// sentinel): the consistent repel, with no finite difference of a value that is not there.
 fn anchor_hessian(
     anchor: HessianAnchor,
     model: &CompiledModel,
@@ -535,16 +543,16 @@ fn anchor_hessian(
 ) -> Option<DMatrix<f64>> {
     match anchor {
         HessianAnchor::Exact => {
-            // The exact Hessian from the unified recording (every engine it serves), before
-            // any finite difference.
             if let Some(h) = crate::sens::ode_provider::adjoint::exact_inner_hessian(
                 model, subject, params, b_hat,
             ) {
                 return Some(h);
             }
-            Some(fd_posterior_hessian(
-                model, subject, params, stack, b_hat, scratch, schedule,
-            ))
+            // A decline at a point the value path scores is a plan defect (see above).
+            let at_mode = stack.nll_at(model, subject, params, b_hat, scratch, schedule);
+            is_usable_subject_nll(at_mode).then(|| {
+                fd_posterior_hessian(model, subject, params, stack, b_hat, scratch, schedule)
+            })
         }
         HessianAnchor::GaussNewton => {
             crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, b_hat)
@@ -1072,12 +1080,20 @@ fn agq_population_evaluate_impl(
                 true,
                 &mut mode,
             );
+            // A pass that polished the start to the mode took its score, and formed its exact
+            // Hessian, there: the objective is evaluated at that same mode, so the value and
+            // the gradient are of one function.
+            let b_eval = mode
+                .eta_polished
+                .as_deref()
+                .filter(|p| p.len() == b_hat.len())
+                .unwrap_or(&b_hat);
             let nll = agq_subject_evaluate(
                 model,
                 subject,
                 params,
                 &stack,
-                &b_hat,
+                b_eval,
                 &nodes,
                 &log_weights,
                 anchor,
@@ -1105,6 +1121,10 @@ fn agq_population_evaluate_impl(
         .iter()
         .map(|(_, s, _)| s.as_ref().map(|(g, _)| g.clone()))
         .collect();
+    let polished = per_subject
+        .iter()
+        .map(|(_, _, m)| m.eta_polished.clone())
+        .collect();
     let (eta_dx, mode_hessians): (Vec<_>, Vec<_>) = per_subject
         .into_iter()
         .map(|(_, _, m)| (m.eta_dx, m.hessian))
@@ -1113,6 +1133,7 @@ fn agq_population_evaluate_impl(
         nll,
         gradient,
         routes,
+        polished,
         eta_dx: want_eta_dx.then_some(eta_dx),
         mode_hessians: (want_eta_dx && exact_anchor).then_some(mode_hessians),
         scores,
@@ -1440,6 +1461,7 @@ pub(crate) fn population_gradient_mixed(
                 slot.hessians = evaluation.mode_hessians;
             }
             slot.scores = evaluation.scores;
+            slot.polished = evaluation.polished;
         }
         return evaluation.gradient;
     }
@@ -1466,7 +1488,9 @@ pub(crate) fn population_gradient_mixed(
     let mut per = Vec::with_capacity(scores.len());
     let mut hessians = Vec::with_capacity(scores.len());
     let mut rows = Vec::with_capacity(scores.len());
+    let mut polished = Vec::with_capacity(scores.len());
     for (i, (score, mode)) in scores.into_iter().enumerate() {
+        polished.push(mode.eta_polished);
         per.push(mode.eta_dx);
         hessians.push(mode.hessian);
         let (score, route) = score?;
@@ -1484,6 +1508,7 @@ pub(crate) fn population_gradient_mixed(
             slot.hessians = want_hessian.then_some(hessians);
         }
         slot.scores = Some(rows);
+        slot.polished = polished;
     }
     result.iter().all(|v| v.is_finite()).then_some(result)
 }

@@ -4004,43 +4004,70 @@ pub(crate) fn exact_obs_grads_into(
     true
 }
 
-/// IOV scores FREM rows by a sentinel, not the kernel's `l`, so the kernel's exact inner
-/// Hessian is not that subject's (as `exact_htilde` and `exact_inner_gradient_in` decline).
-/// The one decline of [`exact_inner_hessian`] that a quadrature gradient pass does not
-/// share, so that pass hands back no Hessian there either (#2585 review #4).
+/// The IOV FOCE-family marginal scores FREM rows by a sentinel, not the kernel's `l`, so the
+/// kernel's `H̃` and inner gradient are not that subject's (`exact_htilde` and
+/// `exact_inner_gradient_in` decline). The conditional objective the quadrature integrates
+/// scores them as the kernel does, so [`exact_inner_hessian`] serves them.
 fn iov_frem_mismatch(model: &CompiledModel, subject: &Subject) -> bool {
     model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0)
 }
 
+/// Why [`exact_inner_hessian_or_decline`] has no Hessian at a point. Each is a *value*
+/// condition at that `(θ, η)` or a shape the caller never builds, none a scope exclusion of a
+/// parsed model: the objective the Hessian belongs to is itself repelled (or never asked) there,
+/// so a consumer repels too. A decline at a point the objective *does* score is a plan defect,
+/// and only that takes the consumers' finite-difference safety net (`agq::anchor_hessian`,
+/// `stats::likelihood`'s non-Gaussian curvature).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HessianDecline {
+    /// `eta` is not the subject's stacked width, or an IOV subject has no layout.
+    Width,
+    /// A non-Gaussian record without an exact channel (`non_gaussian_terms_supported`).
+    NonGaussianUnserved,
+    /// The non-Gaussian term repels (sentinel objective) or has a non-finite derivative at
+    /// `eta` ([`crate::survival::non_gaussian_eta_jets2`]).
+    NonGaussianTerm,
+    /// The prediction plan does not serve `eta`: no plan, or a point failure.
+    Predictions,
+    /// Ω is not positive definite (a non-positive Cholesky diagonal).
+    Omega,
+    /// The kernel's row is undefined at `eta` (no valid variance), or the Hessian is not finite.
+    Kernel,
+}
+
 /// The exact conditional Hessian `∇²_η l` at `eta`: the kernel's `l` over a second-order
 /// η-dual whose predictions carry `(f, G, Q)` from one canonical recording. The analytic
-/// replacement for a finite-difference posterior Hessian.
+/// replacement for a finite-difference posterior Hessian. `None` is one of
+/// [`HessianDecline`] (see [`exact_inner_hessian_or_decline`]).
 pub(crate) fn exact_inner_hessian(
     model: &CompiledModel,
     subject: &Subject,
     params: &ModelParameters,
     eta: &[f64],
 ) -> Option<DMatrix<f64>> {
-    let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
-    if iov_frem_mismatch(&model, subject) {
-        return None;
-    }
+    exact_inner_hessian_or_decline(model, subject, params, eta).ok()
+}
+
+/// [`exact_inner_hessian`] with the reason it has none.
+pub(crate) fn exact_inner_hessian_or_decline(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    eta: &[f64],
+) -> Result<DMatrix<f64>, HessianDecline> {
+    use HessianDecline as D;
+    let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None).ok_or(D::Width)?;
     // A subject's non-Gaussian records add their term's exact η-Hessian.
     let ng = if subject.obs_records.is_empty() {
-        if !likelihood_supported(model, subject, params) {
-            return None;
-        }
         None
     } else {
         if !non_gaussian_terms_supported(model, subject) {
-            return None;
+            return Err(D::NonGaussianUnserved);
         }
-        Some(non_gaussian_eta_hessian(
-            model,
-            subject,
-            &params.theta,
-            &eta[..model.n_eta],
-        )?)
+        Some(
+            non_gaussian_eta_hessian(model, subject, &params.theta, &eta[..model.n_eta])
+                .ok_or(D::NonGaussianTerm)?,
+        )
     };
     // An endpoint-only subject has no Gaussian rows to record.
     let p = if subject.observations.is_empty() && !subject.obs_records.is_empty() {
@@ -4053,27 +4080,30 @@ pub(crate) fn exact_inner_hessian(
             &params.theta,
             Some(&params.sigma.values),
             &eta,
-        )?
+        )
+        .ok_or(D::Predictions)?
     };
     let ctx = LikCtx::new(model, subject, params);
     let mut pv = ParT::of(model, subject, params);
     pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
         stacked_omega(model, subject, params, params, w).chol,
-    )?;
+    )
+    .ok_or(D::Omega)?;
     let f: Vec<f64> = (0..p.rows()).map(|j| p.v(j)).collect();
     let g: Vec<Vec<f64>> = (0..p.rows()).map(|j| p.row_g(j).to_vec()).collect();
     let q: Vec<Vec<f64>> = (0..p.rows()).map(|j| p.row_q(j).to_vec()).collect();
-    let h = crate::sens::focei_kernel::exact_inner_hessian_kernel(&ctx, &f, &g, &q, &eta, &pv)?;
+    let h = crate::sens::focei_kernel::exact_inner_hessian_kernel(&ctx, &f, &g, &q, &eta, &pv)
+        .ok_or(D::Kernel)?;
     let mut h = DMatrix::from_fn(w, w, |a, b| h[a][b]);
     if !h.iter().all(|v| v.is_finite()) {
-        return None;
+        return Err(D::Kernel);
     }
     if let Some(q) = ng {
         let n = q.nrows();
         let mut blk = h.view_mut((0, 0), (n, n));
         blk += q;
     }
-    Some(h)
+    Ok(h)
 }
 
 /// Whether the adjoint's kernels serve a subject's non-Gaussian records: every one has an
@@ -4121,8 +4151,7 @@ pub(crate) fn exact_htilde(
 ) -> Option<DMatrix<f64>> {
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, None)?;
     // IOV scores FREM rows by a sentinel, not the kernel's `l`.
-    let iov_mismatch = model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0);
-    if iov_mismatch {
+    if iov_frem_mismatch(model, subject) {
         return None;
     }
     // A subject's non-Gaussian records add their term's exact η-Hessian, as FOCEI's own
@@ -4201,8 +4230,7 @@ pub(crate) fn exact_inner_gradient_in(
 ) -> Option<Vec<f64>> {
     let (model, w, eta, lay) = resolve(model, subject, &params.theta, eta, layout)?;
     // IOV scores FREM rows by a sentinel, not the kernel's `l`.
-    let iov_mismatch = model.n_kappa > 0 && subject.fremtype.iter().any(|&ft| ft > 0);
-    if iov_mismatch || !likelihood_supported(model, subject, params) {
+    if iov_frem_mismatch(model, subject) || !likelihood_supported(model, subject, params) {
         return None;
     }
     let p = canonical_jets1(
@@ -5066,6 +5094,7 @@ impl ModeOut {
     pub(crate) fn clear(&mut self) {
         self.eta_dx = None;
         self.hessian = None;
+        self.eta_polished = None;
     }
 }
 

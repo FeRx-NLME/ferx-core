@@ -1060,108 +1060,6 @@ fn dose_lag_duals<T: crate::sens::num::PkNum>(
         .collect()
 }
 
-/// True when the walk's **moving** breaks are separable, i.e. representable by the single-`dt`
-/// dual walk. A break moves when the model has an estimated lagtime (every dose arrival, and
-/// every infusion end riding it) or when a dose is a modeled `RATE=-1/-2` infusion (its end).
-///
-/// The walk resolves a break time to **one** dual position (`dual_pos`, first match within 1e-9).
-/// So the subject declines to FD when either
-///
-/// 1. **two distinct moving breaks coincide.** They generally carry *different* jets, and the walk
-///    would silently hand the first one's jet to both.
-///
-///    This is deliberately conservative — it declines even breaks that happen to share a `D`/`R`
-///    slot. It has to be: since #486 each dose's lagtime and window are seeded from **that dose's
-///    own snapshot** (its occasion under IOV, its covariates under TV-cov, its event time under
-///    `TIME`), so two breaks backed by the same PK slot no longer imply the same dual. Keying the
-///    check on the slot — as it used to — would admit, say, a κ-on-`ALAG` subject whose occasion-2
-///    arrival lands on occasion-1's infusion end, and differentiate one with respect to the other's
-///    jet. The duals themselves are not comparable here (this runs on `f64` times, before any is
-///    built), so coincidence alone is the decline.
-///
-/// 2. a moving break coincides with a **fixed** break — a reset, a covariate-change (`PkOnly`), or,
-///    when the model has no lagtime, a **dose event time** (with a lagtime every arrival is itself a
-///    moving break, so those are covered by (1) instead). Those times do not move with `(θ, η)`, but
-///    the walk resolves one dual position per break, so it would drag the fixed event along with the
-///    moving one.
-///
-///    **Observations are exempt**: the walk *corrects* them instead of declining, stepping the
-///    read-out state back across the sliver between the sample and the boundary
-///    (`crate::sens::propagate::event_driven_sens_with_doses_g`). An observation landing on *two*
-///    moving breaks is still declined — by (1), since those two breaks coincide with each other.
-///
-/// Both are degenerate, measure-zero coincidences. `eff` are the resolved doses the walk sees.
-fn moving_bounds_separable(
-    model: &CompiledModel,
-    subject: &Subject,
-    eff: &[crate::types::DoseEvent],
-    dose_lagtimes: &[f64],
-) -> bool {
-    let attr_map = model.active_dose_attr_map();
-    let has_lag = model.has_lagtime();
-    let mut moving: Vec<f64> = Vec::new();
-    // The last time the walk reaches: a residual pulse ending after it is no break at all.
-    let horizon = subject
-        .obs_times
-        .iter()
-        .chain(subject.pk_only_times.iter())
-        .chain(subject.reset_times.iter())
-        .copied()
-        .fold(f64::NEG_INFINITY, f64::max);
-    for (k, d) in subject.doses.iter().enumerate() {
-        // The walk's break times are the *lagged* arrivals, so compare on those.
-        let t_start = eff[k].time + dose_lagtimes.get(k).copied().unwrap_or(0.0);
-        // Dose arrival: moves only under a lagtime.
-        if has_lag {
-            moving.push(t_start);
-        }
-        // Infusion end: moves under a lagtime (riding the arrival) and/or when modeled.
-        if eff[k].rate > 0.0 && eff[k].duration > 0.0 {
-            let modeled = crate::sens::ode_provider::modeled_slot_for(attr_map, d).is_some();
-            if modeled || has_lag {
-                moving.push(t_start + eff[k].duration);
-            }
-        }
-        // An SS infusion's earlier pulses still running after its record end where the lag
-        // (through a seeded phase) and a modeled window move them.
-        let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
-        moving.extend(crate::dosing::ss_residual_infusion_ends(
-            &eff[k],
-            lag,
-            1.0,
-            f64::NEG_INFINITY,
-            horizon,
-        ));
-    }
-    if moving.is_empty() {
-        return true;
-    }
-    // (1) Two distinct moving breaks may not coincide.
-    for (i, &t) in moving.iter().enumerate() {
-        if moving[..i].iter().any(|&u| (u - t).abs() < 1e-9) {
-            return false;
-        }
-    }
-    // (2) A moving break may not land on a fixed one. Observations are corrected, not declined.
-    let mut fixed: Vec<f64> = subject
-        .pk_only_times
-        .iter()
-        .chain(subject.reset_times.iter())
-        .copied()
-        .collect();
-    if !has_lag {
-        // Without a lagtime a dose lands at its record time, which is a fixed break the walk must
-        // not drag along with someone else's moving infusion end.
-        fixed.extend(eff.iter().map(|d| d.time));
-    }
-    for f in fixed {
-        if moving.iter().any(|&t| (t - f).abs() < 1e-9) {
-            return false;
-        }
-    }
-    true
-}
-
 /// Per-dose infusion duals `(rate, window)` for the event walk
 /// (`crate::sens::propagate::event_driven_sens_with_doses_g`, #486): `Some` for a
 /// modeled `RATE=-1/-2` dose, and under bioavailability for every infusion; `None`
@@ -1322,15 +1220,8 @@ pub(crate) fn closed_form_event_predictions<T: crate::sens::num::vm::VmNum>(
     // (production parity) and the walk threads `∂ALAG` through the dual sub-interval
     // lengths, so the arrival is a moving boundary like a modeled infusion end.
     let dose_lagtimes = dose_lagtime_values(model, dose_pk);
-    // Coincident moving breaks carrying different jets — and, under a lagtime, a moving
-    // break landing on a fixed obs/reset/cov-change time — aren't representable by the
-    // single-`dt` walk; decline to FD (#486 review #2).
-    if !moving_bounds_separable(model, subject, &eff_doses, &dose_lagtimes) {
-        // Read off this point's resolved values: another point need not coincide, so a recording
-        // fails as the point's (declined and counted), not the subject's (condemned).
-        T::fail_point("moving breaks coincide at this point");
-        return None;
-    }
+    // Breaks that land on one instant — with one another, or on a record — are crossed by the
+    // walk itself (`propagate_bounds_g`), each at its own jet: no coincidence declines a point.
     let schedule = cached_event_schedule(subject, model.pk_model, &eff_doses, &dose_lagtimes);
     let dose_inf_dual = modeled_dose_inf_duals::<T>(model, subject, slot_dual);
     let dose_lag_dual = dose_lag_duals::<T>(model, subject, slot_dual);

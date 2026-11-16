@@ -11407,3 +11407,304 @@ fn an_off_mode_indefinite_point_is_polished_and_served() {
 const GAP_POLISHED_VS_EBE: f64 = 1e-9;
 // Measured 1.0e-9 (Richardson central FD, reconverged EBE): ten times that.
 const GAP_POLISHED_VS_FD: f64 = 1e-8;
+
+/// G14: the polish step is clipped to `POLISH_RADIUS`. On `H = diag(1, 0)` (a flat direction)
+/// the reflected Newton step along it is `g / floor = 1e8`; clipped, it keeps its direction at
+/// norm 1. Mutation: delete the clip in `newton_polish_step` -> the norm assertion fails.
+#[test]
+fn the_polish_step_is_clipped_to_the_trust_radius() {
+    let h = DMatrix::from_diagonal(&DVector::from_vec(vec![1.0, 0.0]));
+    let (dir, gn) = polish_proposal(&h, &[0.5, 1.0]).expect("finite");
+    let norm = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt();
+    assert!((norm - POLISH_RADIUS).abs() < 1e-12, "norm {norm}");
+    assert_eq!(gn, 1.0);
+    // Direction kept: the unclipped step is (-0.5, -1e8).
+    assert!((dir[0] / dir[1] - 0.5e-8).abs() < 1e-12, "{dir:?}");
+    // Below the radius the step is the plain damped Newton one.
+    let (small, _) = polish_proposal(&h, &[0.5, 0.0]).unwrap();
+    assert_eq!(small, vec![-0.5, 0.0]);
+}
+
+/// G14: a far-off start that diverges without the radius. The synthetic pass serves only
+/// inside `‖η‖ < 10` (as an overflowing model does) and proposes the damped Newton step of a
+/// landscape that is linear along a flat direction. With the clip the walk takes unit steps
+/// and ends on the last point it served; without it the first step is `1e8` long, the pass
+/// declines there, and the polish returns `None`.
+/// Mutation: delete the clip -> `polish_mode` returns `None`.
+#[test]
+fn a_far_off_polish_start_needs_the_trust_radius() {
+    let h = DMatrix::from_diagonal(&DVector::from_vec(vec![1.0, 0.0]));
+    let grad = |at: &[f64]| vec![at[0] + 0.5, 1.0];
+    let eta0 = [0.0, 0.0];
+    let mut out = ModeOut {
+        polish: polish_proposal(&h, &grad(&eta0)),
+        ..ModeOut::default()
+    };
+    let r = polish_mode(&eta0, &mut out, |at, out| {
+        if at.iter().map(|v| v * v).sum::<f64>().sqrt() > 10.0 {
+            return None;
+        }
+        out.polish = polish_proposal(&h, &grad(at));
+        out.objective = Some(0.0);
+        Some(vec![0.0])
+    });
+    assert!(r.is_some(), "the walk served a point inside the map");
+    let at = out.eta_polished.expect("the last served eta");
+    assert!(
+        at.iter().map(|v| v * v).sum::<f64>().sqrt() < 10.0,
+        "{at:?}"
+    );
+}
+
+// ---- G14: the exact inner Hessian's declines, and the FD Hessians they fed (deleted) ----------
+
+/// `exact_inner_hessian_or_decline`'s reason on a width that is not the subject's: the one shape
+/// no consumer builds (the quadrature's mode is `stack_mode(η̂, κ̂)`, the subject's own stacked
+/// width; nested levels, whose compact axes differ, are refused for every quadrature method by
+/// `E_NESTED_LEVEL_METHOD_UNSUPPORTED`). Mutation: drop the `Width` return -> panics on index.
+#[test]
+fn a_wrong_width_eta_has_no_exact_inner_hessian() {
+    let m = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &m,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let p = &m.default_params;
+    assert_eq!(
+        exact_inner_hessian_or_decline(&m, &s, p, &[0.0; 4]).err(),
+        Some(HessianDecline::Width)
+    );
+    assert!(exact_inner_hessian_or_decline(&m, &s, p, &[0.0; 3]).is_ok());
+}
+
+/// The property that makes a deleted FD Hessian safe: wherever the exact Hessian declines, the
+/// value path does not score the point either (non-finite, or the sentinel). Checked at an
+/// overflowing η on a closed form and at a zero Ω (the parser accepts `omega ~ 0`, whose
+/// Cholesky diagonal is the `Omega` decline). Mutation: decline at a point the value path
+/// scores -> the assertion names it.
+#[test]
+fn where_the_exact_hessian_declines_the_objective_repels() {
+    let m = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &m,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let usable = |m: &CompiledModel, s: &Subject, p: &ModelParameters, eta: &[f64]| {
+        crate::stats::likelihood::is_usable_subject_nll(crate::stats::likelihood::individual_nll(
+            m,
+            s,
+            &p.theta,
+            eta,
+            &p.omega,
+            &p.sigma.values,
+        ))
+    };
+    let p = &m.default_params;
+    let mut n_declined = 0;
+    for extreme in [
+        [800.0, 800.0, 800.0],
+        [-800.0, 800.0, 0.0],
+        [0.0, 0.0, 800.0],
+    ] {
+        let why = exact_inner_hessian_or_decline(&m, &s, p, &extreme);
+        let ok = usable(&m, &s, p, &extreme);
+        eprintln!(
+            "eta {extreme:?}: hessian declined = {}, objective usable = {ok}",
+            why.is_err()
+        );
+        if why.is_err() {
+            n_declined += 1;
+            assert!(
+                !ok,
+                "{extreme:?}: the Hessian declines ({why:?}) where the objective scores"
+            );
+        }
+    }
+    eprintln!("{n_declined} of 3 overflow points decline");
+    // A zero variance: the parser takes it but floors it (the Cholesky diagonal stays positive),
+    // so the `Omega` decline is not reachable from a parsed model; a hand-built zero diagonal
+    // is the only way to it.
+    let zero = ONE_CPT_ORAL.replacen("omega ETA_CL ~ 0.09", "omega ETA_CL ~ 0.0", 1);
+    assert_ne!(zero, ONE_CPT_ORAL, "the fixture names ETA_CL");
+    let mz = parse_model_string(&zero).expect("a zero omega parses");
+    assert!(
+        mz.default_params.omega.chol[(0, 0)] > 0.0,
+        "floored by the parser"
+    );
+    assert!(exact_inner_hessian_or_decline(&mz, &s, &mz.default_params, &[0.0; 3]).is_ok());
+    let mut hand = m.default_params.clone();
+    hand.omega.chol[(0, 0)] = 0.0;
+    assert_eq!(
+        exact_inner_hessian_or_decline(&m, &s, &hand, &[0.0; 3]).err(),
+        Some(HessianDecline::Omega)
+    );
+}
+
+/// G14: FREM rows under κ are served by the exact inner Hessian, as the conditional objective
+/// the quadrature integrates scores them. Fixture: `frem_iov_ode`'s refused subject (a FREM
+/// weight row on an ODE + IOV model) at its quadrature mode, against central second differences
+/// of `individual_nll_iov_with_scratch` (the integrand `Stack::nll_at` evaluates), Richardson in
+/// the step. Mutation: restore the `iov_frem_mismatch` decline in
+/// `exact_inner_hessian_or_decline` -> the `expect` fails.
+#[test]
+fn iov_frem_rows_have_the_exact_inner_hessian_of_the_quadrature_integrand() {
+    use crate::estimation::inner_optimizer::find_ebe_for_stage;
+    use crate::types::{EstimationMethod, FitOptions};
+    let model = frem_iov_ode();
+    let (_, refused) = frem_iov_pair(&model);
+    let params = moved_params(&model);
+    let mut o = FitOptions {
+        method: EstimationMethod::Laplace,
+        ..FitOptions::default()
+    };
+    o.n_agq = 1;
+    let r = find_ebe_for_stage(&model, &refused, &params, 200, 1e-10, None, None, 0, &o);
+    let mut b: Vec<f64> = r.eta.iter().copied().collect();
+    for k in &r.kappas {
+        b.extend(k.iter().copied());
+    }
+    let h = exact_inner_hessian_or_decline(&model, &refused, &params, &b)
+        .expect("FREM rows under kappa are served");
+    let n_eta = model.n_eta;
+    let nk = model.n_kappa;
+    let nll = |b: &[f64]| {
+        let kappas: Vec<&[f64]> = b[n_eta..].chunks(nk).collect();
+        crate::stats::likelihood::individual_nll_iov_with_scratch(
+            &model,
+            &refused,
+            &params.theta,
+            &b[..n_eta],
+            &kappas,
+            &params.omega,
+            params.omega_iov.as_ref(),
+            &params.sigma.values,
+            &mut crate::pk::EventPkParams::default(),
+        )
+    };
+    let d = b.len();
+    let second = |i: usize, j: usize, hh: f64| {
+        let at = |si: f64, sj: f64| {
+            let mut x = b.clone();
+            x[i] += si * hh;
+            x[j] += sj * hh;
+            nll(&x)
+        };
+        (at(1.0, 1.0) - at(1.0, -1.0) - at(-1.0, 1.0) + at(-1.0, -1.0)) / (4.0 * hh * hh)
+    };
+    let mut worst = 0.0_f64;
+    for i in 0..d {
+        for j in 0..d {
+            let rich = (4.0 * second(i, j, 1e-3) - second(i, j, 2e-3)) / 3.0;
+            assert!(rich.is_finite() && h[(i, j)].is_finite());
+            worst = worst.max((h[(i, j)] - rich).abs() / (1.0 + rich.abs())); // nan-ok: finite asserted above
+        }
+    }
+    eprintln!("IOV + FREM exact inner Hessian vs central FD: {worst:.3e}");
+    assert!(worst < 1e-5, "{worst:.3e}");
+}
+
+/// A TTE term at an overflowing η repels by its value (the sentinel or a non-finite NLL) and
+/// has no exact Hessian there: `NonGaussianTerm` is the same point as the objective's repel, so
+/// the Laplace objective reads the sentinel and `foce_subject_nll_cov` adds
+/// `SUBJECT_SENTINEL_NLL` — never a finite-difference curvature. At the subject's own EBE the
+/// term is served. Mutation: map the `jets2` decline to `Ok` -> the first assertion fails.
+#[cfg(feature = "survival")]
+#[test]
+fn a_repelled_tte_term_declines_the_hessian_where_the_objective_repels() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let prep = crate::api::prepare_run(
+        &format!("{root}/examples/tte_exponential.ferx"),
+        Some(&format!("{root}/data/tte_exponential.csv")),
+    )
+    .unwrap();
+    let model = &prep.parsed.model;
+    let s = prep
+        .population
+        .subjects
+        .iter()
+        .find(|s| !s.obs_records.is_empty())
+        .expect("a TTE subject")
+        .clone();
+    let p = &model.default_params;
+    let ok = exact_inner_hessian_or_decline(model, &s, p, &vec![0.1; model.n_eta]);
+    assert!(ok.is_ok(), "served at an ordinary point: {:?}", ok.err());
+    let eta = vec![800.0; model.n_eta];
+    assert_eq!(
+        exact_inner_hessian_or_decline(model, &s, p, &eta).err(),
+        Some(HessianDecline::NonGaussianTerm)
+    );
+    let mut acc = 0.0;
+    crate::stats::likelihood::accumulate_non_gaussian_nll(
+        model, &s, &p.theta, &eta, None, 1.0, &mut acc,
+    );
+    assert!(
+        !acc.is_finite() || acc >= crate::survival::REPEL_SENTINEL_FLOOR,
+        "the value path scores {acc} where the Hessian declines"
+    );
+}
+
+/// G14 sweep: at its own EBE, every subject of every committed model that has a dataset has an
+/// exact inner Hessian (no `HessianDecline`), so the quadrature's exact anchor and the non-Gaussian
+/// curvature never reach a point the value path scores and the Hessian cannot. First two
+/// subjects with data of each model; the stacked `[η̂, κ̂]` under IOV. Tier 3 (it solves ~100 EBEs).
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: solves EBEs of every committed model; opt in with --features slow-tests"
+)]
+fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
+    let root = env!("CARGO_MANIFEST_DIR");
+    let mut paths: Vec<_> = std::fs::read_dir(format!("{root}/examples"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ferx"))
+        .collect();
+    paths.sort();
+    let (mut ran, mut declined) = (0usize, Vec::new());
+    for p in paths {
+        let stem = p.file_stem().unwrap().to_str().unwrap().to_string();
+        let data = format!("{root}/data/{stem}.csv");
+        if !std::path::Path::new(&data).is_file() {
+            continue;
+        }
+        let Ok(prep) = crate::api::prepare_run(p.to_str().unwrap(), Some(&data)) else {
+            continue;
+        };
+        let model = &prep.parsed.model;
+        if model.n_eta + model.n_kappa == 0 || model.is_sde() || model.mixture.is_some() {
+            continue;
+        }
+        let params = &model.default_params;
+        for s in prep
+            .population
+            .subjects
+            .iter()
+            .filter(|s| !s.observations.is_empty() || !s.obs_records.is_empty())
+            .take(2)
+        {
+            let r = find_ebe(model, s, params, 300, 1e-8, None, None, 0);
+            if r.hard_reject || !r.nll.is_finite() {
+                continue;
+            }
+            let mut b: Vec<f64> = r.eta.iter().copied().collect();
+            for k in &r.kappas {
+                b.extend(k.iter().copied());
+            }
+            ran += 1;
+            if let Err(why) = exact_inner_hessian_or_decline(model, s, params, &b) {
+                declined.push(format!("{stem} / {}: {why:?}", s.id));
+            }
+        }
+    }
+    eprintln!(
+        "exact inner Hessian sweep: {ran} subjects, {} declined",
+        declined.len()
+    );
+    assert!(ran >= 60, "only {ran} subjects ran");
+    assert!(declined.is_empty(), "declined:\n{}", declined.join("\n"));
+}

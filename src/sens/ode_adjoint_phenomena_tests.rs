@@ -4272,35 +4272,546 @@ fn scope_declines_are_enumerated() {
     }
 }
 
-/// Two lagged infusions whose window ends coincide (`0 + 2` and `1 + 1`, both shifted by the lag)
-/// are not representable by the single-`dt` walk, and that is read off this point's values: the
-/// recording fails as the point's (declined, counted), and the subject is not condemned for the
-/// fit. Mutation: drop `T::fail_point` in `closed_form_event_predictions` -> the recorder
-/// returns `None` with finite values, which `end` maps to the subject's scope, and the key reads
-/// `Bad`.
+/// A one-compartment oral model (closed form, whose infusions into the central compartment take
+/// the event walk, or its one-state ODE twin) with an estimated lag (`ALAG`) and/or
+/// a modeled duration `D1`, for the cells where two moving breaks land on one instant.
+fn coincident_model(ode: bool, lag: bool, d1: bool, wt: bool) -> CompiledModel {
+    let mut theta = String::from("  theta TVCL(4.0, 0.1, 100.0)\n  theta TVV(30.0, 1.0, 500.0)\n");
+    let mut omega = String::from("  omega ETA_CL ~ 0.09\n");
+    let mut indiv = String::from("  CL = TVCL * exp(ETA_CL)\n  V = TVV\n");
+    let mut call = String::from("cl=CL, v=V, ka=KA");
+    if !ode {
+        theta += "  theta TVKA(1.2, 0.05, 20.0)\n";
+        indiv += "  KA = TVKA\n";
+    }
+    if lag {
+        theta += "  theta TVLAG(0.5, 0.01, 5.0)\n";
+        omega += "  omega ETA_LAG ~ 0.1\n";
+        indiv += "  ALAG = TVLAG * exp(ETA_LAG)\n";
+        call += ", lagtime=ALAG";
+    }
+    if d1 {
+        theta += "  theta TVD1(2.0, 0.1, 24.0)\n";
+        omega += "  omega ETA_D1 ~ 0.04\n";
+        // The duration of the central compartment's infusions: `D1` on the one-state ODE,
+        // `D2` beside the closed form's depot.
+        indiv += &format!("  D{} = TVD1 * exp(ETA_D1)\n", if ode { 1 } else { 2 });
+    }
+    let structure = if ode {
+        "  ode(states=[central])\n[odes]\n  d/dt(central) = -CL/V * central\n[scaling]\n  y = central / V\n"
+            .to_string()
+    } else {
+        format!("  pk one_cpt_oral({call})\n")
+    };
+    let mut src = format!(
+        "[parameters]\n{theta}{omega}  sigma PROP_ERR ~ 0.1 (sd)\n[individual_parameters]\n{indiv}\
+         [structural_model]\n{structure}[error_model]\n  DV ~ proportional(PROP_ERR)\n"
+    );
+    if ode && lag {
+        src = src.replace("ALAG =", "LAGTIME =");
+    }
+    if wt {
+        // `WT` scales the clearance: a covariate-change record moves it.
+        src = src
+            .replace(
+                "CL = TVCL * exp(ETA_CL)",
+                "CL = TVCL * (WT / 70) * exp(ETA_CL)",
+            )
+            .replace(
+                "[error_model]",
+                "[covariates]\n  WT continuous\n[error_model]",
+            );
+    }
+    tight(parse_model_string(&src).unwrap())
+}
+
+/// The coincidence cells: `(label, lag, modeled D1, doses, observations)`. Where `D1` is
+/// modeled the dose's window end carries the duration's jet next to the lag's, so the two
+/// breaks of a group carry different jets; the groups sit at one instant when `ETA_D1 = 0`.
+#[allow(clippy::type_complexity)]
+fn coincident_cells(cmt: usize) -> Vec<(&'static str, bool, bool, Vec<DoseEvent>, Vec<f64>)> {
+    let inf = |t: f64, amt: f64, rate: f64| DoseEvent::new(t, amt, cmt, rate, false, 0.0);
+    let bolus = |t: f64, amt: f64| DoseEvent::new(t, amt, cmt, 0.0, false, 0.0);
+    let modeled = |t: f64| DoseEvent::modeled(t, 100.0, cmt, false, 0.0, RateMode::ModeledDuration);
+    let obs = vec![0.3, 1.0, 1.8, 2.2, 2.9, 3.6, 5.0, 8.0];
+    vec![
+        // `0 + 2` and `1 + 1`, both shifted by the lag: one jet.
+        (
+            "two window ends",
+            true,
+            false,
+            vec![inf(0.0, 100.0, 50.0), inf(1.0, 50.0, 50.0)],
+            obs.clone(),
+        ),
+        // The second window opens as the first closes.
+        (
+            "onset on a window end",
+            true,
+            false,
+            vec![inf(0.0, 100.0, 50.0), inf(2.0, 50.0, 25.0)],
+            obs.clone(),
+        ),
+        // A bolus lands as the first window closes, residual drug present.
+        (
+            "window end and a later dose's arrival",
+            true,
+            false,
+            vec![inf(0.0, 100.0, 50.0), bolus(2.0, 50.0)],
+            obs.clone(),
+        ),
+        // A modeled window end (the duration's jet and the lag's) on a fixed one (the lag's).
+        (
+            "two window ends, different jets",
+            true,
+            true,
+            vec![modeled(0.0), inf(1.0, 50.0, 50.0)],
+            obs.clone(),
+        ),
+        (
+            "onset on a window end, different jets",
+            true,
+            true,
+            vec![modeled(0.0), inf(2.0, 50.0, 25.0)],
+            obs.clone(),
+        ),
+        (
+            "window end and a later dose's arrival, different jets",
+            true,
+            true,
+            vec![modeled(0.0), bolus(2.0, 50.0)],
+            obs.clone(),
+        ),
+        // The bolus listed before the window it lands on: the walk stands at the window's end,
+        // the bolus arrived at its own instant (the lag's jet, or none).
+        (
+            "a bolus listed before the modeled end it lands on",
+            true,
+            true,
+            vec![bolus(2.0, 50.0), modeled(0.0)],
+            obs.clone(),
+        ),
+        (
+            "a bolus listed before the modeled end it lands on, no lag",
+            false,
+            true,
+            vec![bolus(2.0, 50.0), modeled(0.0)],
+            vec![0.5, 1.5, 2.5, 4.0, 8.0],
+        ),
+        // No lag: the modeled end meets a fixed record's arrival and a fixed window's end.
+        (
+            "modeled end on a fixed bolus",
+            false,
+            true,
+            vec![modeled(0.0), bolus(2.0, 50.0)],
+            vec![0.5, 1.5, 2.5, 4.0, 8.0],
+        ),
+        (
+            "modeled end on a fixed window's end and onset",
+            false,
+            true,
+            vec![modeled(0.0), inf(1.0, 50.0, 50.0), inf(2.0, 50.0, 25.0)],
+            vec![0.5, 1.5, 2.5, 4.0, 8.0],
+        ),
+    ]
+}
+
+/// The `η` at which a cell's breaks coincide: any `ETA_LAG` keeps breaks sharing the lag's jet
+/// together; a modeled `D1` meets its partner only at `ETA_D1 = 0`.
+fn coincident_eta(lag: bool, d1: bool) -> Vec<f64> {
+    let mut eta = vec![0.06];
+    if lag {
+        eta.push(-0.052);
+    }
+    if d1 {
+        eta.push(0.0);
+    }
+    eta
+}
+
+/// Breaks that land on one instant are crossed together at their own jets, so a group is
+/// served -- the closed-form walk and the ODE event walk alike -- with `∂f/∂η` matching the
+/// reconverged central difference of the production predictor, which is smooth across the
+/// coincidence (the flow is linear in its input: each break's effect is its own, whichever is
+/// crossed first). It used to decline the point to FD (`T::fail_point`). Cells: two lagged window
+/// ends (`0+2`, `1+1`), an onset on an end, an end on a later dose's arrival, each with one jet
+/// and with two (a modeled duration beside the lag), and the no-lag modeled end on fixed breaks.
+/// Mutations, each failing this test: restoring the decline of every coincidence in
+/// `moving_bounds_separable`; dropping `break_rate_jump`'s rates between the crossings of a
+/// group (the infusion cells); dropping the bolus's `EdgeGroup` gap (the bolus cells).
 #[test]
-fn coincident_moving_breaks_decline_the_point_not_the_subject() {
-    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
-    let m = parse_model_string(CF_SS_LAG).unwrap();
-    let s = subject(
-        &m,
-        vec![
-            DoseEvent::new(0.0, 100.0, 2, 50.0, false, 0.0),
-            DoseEvent::new(1.0, 50.0, 2, 50.0, false, 0.0),
-        ],
-        &[0.5, 3.0, 5.0, 8.0],
-        &[0.1, -0.05],
-    );
-    let theta = m.default_params.theta.clone();
-    assert!(
-        plan_forward(&m, &s, None, &theta, &[0.1, -0.05], terms::layout1(2)).is_none(),
-        "premise: the coincident breaks decline the walk"
-    );
-    let key = kj::SubjectKey::new(&m, &s, 2, theta.len()).with_layout(None);
-    assert!(
-        !matches!(kj::lookup(&key), kj::Lookup::Bad),
-        "the subject is not condemned for a point's coincidence"
-    );
+fn coincident_moving_breaks_are_served_and_match_fd() {
+    for ode in [false, true] {
+        for (label, lag, d1, doses, obs) in coincident_cells(if ode { 1 } else { 2 }) {
+            let label = format!("{} / {label}", if ode { "ODE" } else { "closed form" });
+            let m = coincident_model(ode, lag, d1, false);
+            let eta = coincident_eta(lag, d1);
+            let s = subject(&m, doses, &obs, &eta);
+            let jac = jacobian_gap(&m, &s, &eta, &label);
+            let theta = m.default_params.theta.clone();
+            let layout = terms::layout1(m.n_eta);
+            assert!(
+                plan_forward(&m, &s, None, &theta, &eta, layout).is_some(),
+                "{label}: served"
+            );
+            eprintln!("{label}: dF/dEta vs FD {jac:.2e}");
+            // Measured on Linux (dev profile): worst 9.6e-12 over the cells; ~10x headroom.
+            assert!(jac < 1e-10, "{label}: {jac:.2e}");
+            // One jet: the group persists at every η the fit visits, so the FOCEI gradient
+            // (the EBE re-found at each point) is checked as well.
+            if !d1 {
+                let grad = parity(&m, &s);
+                eprintln!("{label}: FOCEI gradient vs reconverged FD {grad:.2e}");
+                // Measured: closed form <= 1.9e-9, ODE <= 4.4e-8 (the ODE oracle's own noise).
+                let bound = if ode { 5e-7 } else { 2e-8 };
+                assert!(grad < bound, "{label}: gradient {grad:.2e}");
+            }
+        }
+    }
+}
+
+/// One cell of the tie tests: breaks that share their instant with a fixed record.
+struct TieCell {
+    label: &'static str,
+    /// The model reads `WT` (a covariate change moves `CL`).
+    wt: bool,
+    lag: bool,
+    d1: bool,
+    /// The doses (the central compartment is `cmt`).
+    doses: fn(usize) -> Vec<DoseEvent>,
+    /// The sample times; `None` stands for the tie's instant.
+    obs: &'static [Option<f64>],
+    /// A covariate-change record at the tie (`WT` 70 -> 140), or a reset.
+    record: Record,
+    /// Which way `η_lag` (and `η_D1`) must move for the breaks to stay on the value path's
+    /// side of the record: `+1` (later), `-1` (earlier), `0` (the function is smooth there).
+    side: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Record {
+    None,
+    Change,
+    Reset,
+}
+
+fn tie_cells() -> Vec<TieCell> {
+    vec![
+        // A window end on the record: the end is crossed after the new parameters hold.
+        TieCell {
+            label: "window end on a covariate change",
+            wt: true,
+            lag: true,
+            d1: false,
+            doses: |c| vec![DoseEvent::new(0.0, 100.0, c, 50.0, false, 0.0)],
+            obs: &[
+                Some(0.3),
+                Some(1.0),
+                Some(1.8),
+                Some(2.9),
+                Some(3.5),
+                Some(5.0),
+                Some(8.0),
+            ],
+            record: Record::Change,
+            side: 1.0,
+        },
+        // A window opening on the record: it opens before the new parameters hold.
+        TieCell {
+            label: "window onset on a covariate change",
+            wt: true,
+            lag: true,
+            d1: false,
+            doses: |c| {
+                vec![
+                    DoseEvent::new(0.0, 25.0, c, 50.0, false, 0.0),
+                    DoseEvent::new(2.0, 50.0, c, 25.0, false, 0.0),
+                ]
+            },
+            obs: &[
+                Some(0.3),
+                Some(1.0),
+                Some(1.8),
+                Some(2.9),
+                Some(3.5),
+                Some(5.0),
+                Some(8.0),
+            ],
+            record: Record::Change,
+            side: -1.0,
+        },
+        // A bolus on the record, residual drug present.
+        TieCell {
+            label: "bolus on a covariate change",
+            wt: true,
+            lag: true,
+            d1: false,
+            doses: |c| {
+                vec![
+                    DoseEvent::new(0.0, 100.0, c, 100.0, false, 0.0),
+                    DoseEvent::new(2.0, 50.0, c, 0.0, false, 0.0),
+                ]
+            },
+            obs: &[
+                Some(0.3),
+                Some(1.0),
+                Some(1.8),
+                Some(2.9),
+                Some(3.5),
+                Some(5.0),
+                Some(8.0),
+            ],
+            record: Record::Change,
+            side: -1.0,
+        },
+        // The window end is cut short by a reset on it: nothing of it survives either way.
+        TieCell {
+            label: "window end on a reset",
+            wt: false,
+            lag: true,
+            d1: false,
+            doses: |c| {
+                vec![
+                    DoseEvent::new(0.0, 100.0, c, 50.0, false, 0.0),
+                    DoseEvent::new(3.0, 50.0, c, 0.0, false, 0.0),
+                ]
+            },
+            obs: &[
+                Some(0.3),
+                Some(1.0),
+                Some(1.8),
+                Some(2.9),
+                Some(3.5),
+                Some(5.0),
+                Some(8.0),
+            ],
+            record: Record::Reset,
+            side: 0.0,
+        },
+        // Samples on the group: the ends still contribute.
+        TieCell {
+            label: "sample on two window ends",
+            wt: false,
+            lag: true,
+            d1: false,
+            doses: |c| {
+                vec![
+                    DoseEvent::new(0.0, 100.0, c, 50.0, false, 0.0),
+                    DoseEvent::new(1.0, 50.0, c, 50.0, false, 0.0),
+                ]
+            },
+            obs: &[
+                Some(0.3),
+                Some(1.0),
+                Some(1.8),
+                None,
+                Some(3.5),
+                Some(5.0),
+                Some(8.0),
+            ],
+            record: Record::None,
+            side: 1.0,
+        },
+        TieCell {
+            label: "sample on two window ends, different jets",
+            wt: false,
+            lag: true,
+            d1: true,
+            doses: |c| {
+                vec![
+                    DoseEvent::modeled(0.0, 100.0, c, false, 0.0, RateMode::ModeledDuration),
+                    DoseEvent::new(1.0, 50.0, c, 50.0, false, 0.0),
+                ]
+            },
+            obs: &[
+                Some(0.3),
+                Some(1.0),
+                Some(1.8),
+                None,
+                Some(3.5),
+                Some(5.0),
+                Some(8.0),
+            ],
+            record: Record::None,
+            side: 1.0,
+        },
+        // A modeled end and a fixed window's end on one sample, no lag.
+        TieCell {
+            label: "sample on a modeled end and a fixed window's end",
+            wt: false,
+            lag: false,
+            d1: true,
+            doses: |c| {
+                vec![
+                    DoseEvent::modeled(0.0, 100.0, c, false, 0.0, RateMode::ModeledDuration),
+                    DoseEvent::new(1.0, 50.0, c, 50.0, false, 0.0),
+                ]
+            },
+            obs: &[
+                Some(0.3),
+                Some(1.0),
+                Some(1.8),
+                None,
+                Some(3.5),
+                Some(5.0),
+                Some(8.0),
+            ],
+            record: Record::None,
+            side: 1.0,
+        },
+    ]
+}
+
+/// The subject of a [`TieCell`], its record and tie instant `t0` placed: `WT` is 70 on every
+/// dose and sample and 140 on the covariate-change record.
+fn tie_subject(m: &CompiledModel, c: &TieCell, cmt: usize, t0: f64) -> Subject {
+    let wt = |v: f64| HashMap::from([("WT".to_string(), v)]);
+    let times: Vec<f64> = c.obs.iter().map(|t| t.unwrap_or(t0)).collect();
+    let mut s = subject_shell((c.doses)(cmt), &times);
+    if c.wt {
+        s.covariates = wt(70.0);
+        s.dose_covariates = vec![wt(70.0); s.doses.len()];
+        // The record's own `WT` governs the interval that ends on it; the sample after it is back
+        // at 70, so the parameters differ across the instant the breaks land on.
+        s.obs_covariates = vec![wt(70.0); times.len()];
+    }
+    match c.record {
+        Record::Change => {
+            s.pk_only_times = vec![t0];
+            s.pk_only_raw_times = vec![t0];
+            s.pk_only_covariates = vec![wt(140.0)];
+            s.pk_only_occasions = vec![1];
+        }
+        Record::Reset => s.reset_times = vec![t0],
+        Record::None => {}
+    }
+    let eta = coincident_eta(c.lag, c.d1);
+    let preds = crate::pk::compute_predictions_with_tv(m, &s, &m.default_params.theta, &eta);
+    s.observations = preds
+        .iter()
+        .enumerate()
+        .map(|(j, p)| p * (1.0 + 0.15 * (1.3 * j as f64).sin()))
+        .collect();
+    s
+}
+
+/// `∂f/∂η` of the production predictor from one side: the second-order difference toward `side`
+/// (`+1` later, `-1` earlier; a smooth cell takes `+1`).
+fn one_sided_jacobian(
+    m: &CompiledModel,
+    s: &Subject,
+    theta: &[f64],
+    eta: &[f64],
+    side: f64,
+) -> nalgebra::DMatrix<f64> {
+    let side = if side == 0.0 { 1.0 } else { side };
+    let mut out = nalgebra::DMatrix::zeros(s.obs_times.len(), m.n_eta);
+    let h = 1e-4 * side;
+    for k in 0..m.n_eta {
+        let at = |d: f64| {
+            let mut e = eta.to_vec();
+            e[k] += d;
+            crate::pk::compute_predictions_with_tv(m, s, theta, &e)
+        };
+        let (f0, f1, f2) = (at(0.0), at(h), at(2.0 * h));
+        for j in 0..f0.len() {
+            out[(j, k)] = (-3.0 * f0[j] + 4.0 * f1[j] - f2[j]) / (2.0 * h);
+        }
+    }
+    out
+}
+
+/// Breaks that share their instant with a fixed record are crossed on the value path's side of
+/// it, in the closed-form walk and the ODE event walk alike, and never decline a point: a window
+/// end after a covariate change (`WT` moves `CL`) crosses once the new parameters hold, a window
+/// opening or a bolus before them, a reset discards the state whatever crossed, and a sample on
+/// two coincident breaks reads them as a single break does (arrivals landed, ends still
+/// contributing). `∂f/∂η` against the one-sided second-order difference of the production
+/// predictor, which is how the kinked cells are read. Mutations, each failing this test:
+/// dropping the `rec_right` / `rec_left` handling in `propagate_bounds_g` (the covariate-change
+/// cells); `obs_group_reading` returning the state unflowed (the sample cells).
+#[test]
+fn breaks_on_a_fixed_record_are_served_and_match_one_sided_fd() {
+    for ode in [false, true] {
+        for c in tie_cells() {
+            let label = format!("{} / {}", if ode { "ODE" } else { "closed form" }, c.label);
+            let m = coincident_model(ode, c.lag, c.d1, c.wt);
+            let eta = coincident_eta(c.lag, c.d1);
+            let theta = m.default_params.theta.clone();
+            let lag = if c.lag {
+                theta[if ode { 2 } else { 3 }] * eta[1].exp()
+            } else {
+                0.0
+            };
+            let s = tie_subject(&m, &c, if ode { 1 } else { 2 }, 2.0 + lag);
+            let jac = exact_eta_jacobian(&m, &s, &theta, &eta)
+                .unwrap_or_else(|| panic!("{label}: the recorder declined the η-Jacobian"));
+            let fd = one_sided_jacobian(&m, &s, &theta, &eta, c.side);
+            let mut worst = 0.0f64;
+            for (a, b) in jac.iter().zip(fd.iter()) {
+                assert!(
+                    a.is_finite() && b.is_finite(),
+                    "{label}: non-finite {a} vs {b}"
+                );
+                worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+            }
+            eprintln!("{label}: dF/dEta vs one-sided FD {worst:.2e}");
+            assert!(worst < 1e-6, "{label}: {worst:.2e}");
+        }
+    }
+}
+
+/// The second-order half of the ties: the exact inner Hessian `∇²_η l` against a Richardson
+/// difference of the exact inner gradient, at a tie of breaks sharing one jet (the two cells whose
+/// function is smooth across the tie, so the central difference is the oracle), on the closed
+/// form and on the ODE twin. Measured: the ODE walk's kind-ordered crossing of the tie leaves no
+/// second-order gap on either cell, so its order stays as it is and this test pins that.
+/// (A tie of one jet is an equality of duals, so crossing its breaks in any order, or with the
+/// rates between them dropped, is the same function: the cells that see the rates are the
+/// different-jet ones of `coincident_moving_breaks_are_served_and_match_fd`. Mutation here:
+/// declining a coincident group, which leaves no exact Hessian to compare.)
+#[test]
+fn the_inner_hessian_at_a_tie_matches_the_gradient_difference() {
+    for ode in [false, true] {
+        for (label, lag, d1, doses, obs) in coincident_cells(if ode { 1 } else { 2 }) {
+            if d1 || !matches!(label, "two window ends" | "onset on a window end") {
+                continue;
+            }
+            let label = format!("{} / {label}", if ode { "ODE" } else { "closed form" });
+            let m = coincident_model(ode, lag, d1, false);
+            let eta = coincident_eta(lag, d1);
+            let s = subject(&m, doses, &obs, &eta);
+            let p = &m.default_params;
+            let h = exact_inner_hessian(&m, &s, p, &eta)
+                .unwrap_or_else(|| panic!("{label}: no exact Hessian"));
+            let g = |e: &[f64]| {
+                exact_inner_gradient(&m, &s, p, e, None)
+                    .unwrap_or_else(|| panic!("{label}: no exact gradient"))
+            };
+            let mut worst = 0.0f64;
+            for b in 0..m.n_eta {
+                let d = |st: f64| {
+                    let (mut ep, mut em) = (eta.clone(), eta.clone());
+                    ep[b] += st;
+                    em[b] -= st;
+                    let (gp, gm) = (g(&ep), g(&em));
+                    (0..m.n_eta)
+                        .map(|a| (gp[a] - gm[a]) / (2.0 * st))
+                        .collect::<Vec<f64>>()
+                };
+                let (d1v, d2v) = (d(1e-4), d(2e-4));
+                for a in 0..m.n_eta {
+                    let rich = (4.0 * d1v[a] - d2v[a]) / 3.0;
+                    assert!(
+                        h[(a, b)].is_finite() && rich.is_finite(),
+                        "{label}: non-finite"
+                    );
+                    worst = worst.max((h[(a, b)] - rich).abs() / (1.0 + rich.abs()));
+                }
+            }
+            eprintln!("{label}: exact Hessian vs Richardson of the exact gradient {worst:.2e}");
+            assert!(worst < 1e-6, "{label}: {worst:.2e}");
+        }
+    }
 }
 
 // ---- steady state under a clock-reading right-hand side (AD everywhere, G1) ---------------
