@@ -919,7 +919,7 @@ impl MuFold {
     ) -> Option<Self> {
         let spec = &model.indiv_param_partials.mu_fold;
         if spec.thetas.is_empty()
-            || !model.covariate_nns.is_empty()
+            || model.has_covariate_nn()
             || model.mixture.is_some()
             || model.n_kappa > 0
             || subject.has_tv_covariates()
