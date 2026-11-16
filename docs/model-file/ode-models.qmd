@@ -55,31 +55,26 @@ Expressions can reference:
   of `0`.
 
   An `if` that switches during the integration at a time a model parameter can
-  move runs on finite-difference gradients, because exact derivatives cannot see
-  the switching time move. The fit carries a warning naming a parameter. That
-  covers `if (tau > LAGT)`, and also the example above, since `central` depends
-  on the parameters in its equation. A `FIX` parameter counts too. `TAD` and
-  `TAFD` move with an estimated lag. These stay analytic: a clock or a state that
-  no parameter reaches against a literal (`if (TIME > 24)`), a threshold computed
-  from covariates alone, `min`, `max`, `clamp` with literal bounds, and an inline
-  `if` whose arms meet at its switch, such as the Friberg feedback
-  `if (rb < CIRC0) (CIRC0 / rb)^0.16 else 1.0`, where both arms are 1 at
-  `rb = CIRC0`. A right-hand side that is continuous at the switch puts no jump in
-  the first-order sensitivities. Its gradient is still inexact to second order, by
-  about 1% on a measured feedback model. ferx checks the arms by evaluating them at
-  points on the switch, and keeps finite differences when it cannot: for a compound
-  condition, `==` or `!=`, a nested `if`, `mod`, any function other than `log` and
-  `sqrt`, a condition that is not linear in what it reads, or an arm so steep
-  that rounding hides the gap at the switch. The check samples values up to about
-  1000 and works in floating point, so it can't see a kink built by hand from
-  `sqrt(x * x)` beyond that, a power term like `(x / 1200)^1000` that rounds away
-  below it, or a jump near rounding error. An
-  intermediate is treated as a free value, so arms that meet only once it is
-  expanded also stay on finite differences; write the expression in the arm.
+  move is a **moving switch**: `if (tau > LAGT)`, and also the example above,
+  since `central` depends on the parameters in its equation. `TAD` and `TAFD`
+  move with an estimated lag. The integrator locates each one: when a step
+  crosses it, the step is shortened to end on the crossing, so the right-hand
+  side changes arm there rather than somewhere inside a step, and the exact
+  derivatives jump there by the sensitivity the switching time carries (#2649).
+  Values change too, by about the solver tolerance: a step no longer straddles
+  the switch. A model without a moving switch is integrated exactly as before.
 
-  Finite differences of the FOCE Jacobian amplify ODE solver error, so on this route
-  a default `ode_reltol` can move the objective a long way. Check the OFV at a much
-  tighter tolerance before trusting it.
+  Nothing is located for a clock or a state that no parameter reaches against a
+  literal (`if (TIME > 24)`), a comparison by `==` or `!=`, `min`, `max`, `clamp`
+  with literal bounds, or an inline `if` whose arms meet at its switch, such as
+  the Friberg feedback `if (rb < CIRC0) (CIRC0 / rb)^0.16 else 1.0`, where both
+  arms are 1 at `rb = CIRC0`: a right-hand side continuous at the switch puts no
+  jump in the first-order sensitivities. Its gradient is still inexact to second
+  order, by about 1% on a measured feedback model. ferx checks the arms by
+  evaluating them at points on the switch, and locates the switch when it
+  cannot: for a compound condition, a nested `if`, `mod`, any function other than
+  `log` and `sqrt`, a condition that is not linear in what it reads, or an arm so
+  steep that rounding hides the gap at the switch.
 
 ### `TAD` before the first dose arrives
 
@@ -418,7 +413,7 @@ arithmetic, each type's own operations in its own order — and that one form is
 ways:
 
 - **forward**, for every number type whose parts are all plain numbers: the predictions, the
-  inner gradient's first-order sensitivities (up to 48 random effects) and the exact inner
+  inner gradient's first-order sensitivities and the exact inner
   Hessian's second-order ones (Laplace). The integrators call it directly at every stage and
   Jacobian column, and values that depend only on the parameters are computed once per solve;
 - **in reverse**, as the right-hand side's vector-Jacobian product. The adjoint gradient's
@@ -768,8 +763,8 @@ time without buying accuracy — see below.
   ode_abstol = 1e-11
 ```
 
-A stiff step is more expensive than an explicit one — it builds a finite-difference Jacobian
-(`n + 1` extra right-hand-side evaluations) and factorizes an `n × n` matrix once per step —
+A stiff step is more expensive than an explicit one — it builds the right-hand side's exact Jacobian
+(a forward tangent of the compiled `[odes]` program along each state and the clock) and factorizes an `n × n` matrix once per step —
 so on a non-stiff one- to three-compartment model RK45 remains faster. Switch only when
 stiffness, not accuracy, is what is capping the step size.
 

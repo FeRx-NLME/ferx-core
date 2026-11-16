@@ -2,7 +2,7 @@
 //! adjoint recording of a static subject goes through) applies the same degenerate-`CL`/`V`
 //! rule as the value path it differentiates.
 use super::*;
-use crate::sens::dual1::Dual1;
+use crate::sens::dual2::Dual2;
 use crate::types::{
     DoseEvent, PK_IDX_CL, PK_IDX_KA, PK_IDX_Q, PK_IDX_Q3, PK_IDX_V, PK_IDX_V2, PK_IDX_V3,
 };
@@ -152,13 +152,13 @@ fn static_recording_matches_the_prediction_on_a_degenerate_clearance_or_volume()
             let got = analytic_static_predictions::<f64>(&model, &subj, &pk, |_| None, &[], &[])
                 .unwrap_or_else(|| panic!("{at}: the static recording must serve this subject"));
             // CL and V seeded on two η-tangent axes.
-            let jets = analytic_static_predictions::<Dual1<2>>(
+            let jets = analytic_static_predictions::<Dual2<2>>(
                 &model,
                 &subj,
                 &pk,
                 |slot| match slot {
-                    PK_IDX_CL => Some(Dual1::var(pk.values[PK_IDX_CL], 0)),
-                    PK_IDX_V => Some(Dual1::var(pk.values[PK_IDX_V], 1)),
+                    PK_IDX_CL => Some(Dual2::var(pk.values[PK_IDX_CL], 0)),
+                    PK_IDX_V => Some(Dual2::var(pk.values[PK_IDX_V], 1)),
                     _ => None,
                 },
                 &[],
@@ -214,7 +214,7 @@ fn static_recording_matches_the_prediction_on_a_degenerate_clearance_or_volume()
 /// The degenerate rule lives in the closed forms themselves too, not only in the private
 /// dispatchers, so a caller of the exported kernels sees the same convention as
 /// `predict_concentration` (#2104 review). Every 1-/2-/3-cpt dispatcher × every dose kind ×
-/// every degenerate case returns exactly 0, and on `Dual1` a constant 0 — before, `CL = +inf`
+/// every degenerate case returns exactly 0, and on `Dual2` a constant 0 — before, `CL = +inf`
 /// passed the kernels' `≤ 0` guards and came back `NaN` (`exp(−inf · 0)`). The f64 public
 /// entry points and the superposition state helpers (the peripheral forms) are checked too.
 ///
@@ -275,16 +275,16 @@ fn the_exported_kernels_drop_a_degenerate_dose_themselves() {
                     let want =
                         crate::pk::predict_concentration(model, std::slice::from_ref(dose), t, &p);
                     assert_eq!(want, 0.0, "{at}: predict_concentration");
-                    let d = |x: f64, i: usize| Dual1::<2>::var(x, i);
-                    let j2 = two_cpt_conc_g::<Dual1<2>>(
+                    let d = |x: f64, i: usize| Dual2::<2>::var(x, i);
+                    let j2 = two_cpt_conc_g::<Dual2<2>>(
                         dose,
-                        Dual1::constant(t),
+                        Dual2::constant(t),
                         d(cl, 0),
                         d(v, 1),
-                        Dual1::constant(q),
-                        Dual1::constant(v2),
-                        Dual1::constant(ka),
-                        Dual1::constant(f_bio),
+                        Dual2::constant(q),
+                        Dual2::constant(v2),
+                        Dual2::constant(ka),
+                        Dual2::constant(f_bio),
                         *oral,
                     );
                     assert_eq!((j2.value, j2.grad), (0.0, [0.0; 2]), "{at}: 2-cpt jet");
@@ -362,8 +362,8 @@ fn the_exported_kernels_serve_a_nan_clearance_or_volume_as_nan() {
                     "{at}: 1/2/3-cpt kernels gave {c1}, {c2}, {c3}"
                 );
                 // And a `NaN` jet, not a zero one (see the static-recording test).
-                let d = |x: f64, i: usize| Dual1::<2>::var(x, i);
-                let k = Dual1::<2>::constant;
+                let d = |x: f64, i: usize| Dual2::<2>::var(x, i);
+                let k = Dual2::<2>::constant;
                 let jets = [
                     one_cpt_conc_g(dose, k(t), d(cl, 0), d(v, 1), k(ka), k(f), *oral),
                     two_cpt_conc_g(

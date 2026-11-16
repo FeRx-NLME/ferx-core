@@ -58,3 +58,23 @@ fn the_scan_actually_reaches_test_code() {
         "no src/**/*_tests.rs sibling test file was scanned"
     );
 }
+
+/// `recorded-value-read` starts at zero and stays there: it may be fixed or marked with a
+/// reason, never baselined (#2786).
+#[test]
+fn recorded_value_read_has_no_baseline_entries() {
+    let root = repo_root();
+    let base = Baseline::load(&default_baseline_path(&root)).expect("parse the baseline");
+    let entries: Vec<_> = base
+        .entries
+        .keys()
+        .filter(|(rule, _)| rule == "recorded-value-read")
+        .collect();
+    assert!(entries.is_empty(), "baselined: {entries:?}");
+    let findings = lint_tree(&root).expect("scan the tree");
+    let n = findings
+        .iter()
+        .filter(|f| f.rule == "recorded-value-read")
+        .count();
+    assert_eq!(n, 0, "recorded-value-read findings: {n}");
+}

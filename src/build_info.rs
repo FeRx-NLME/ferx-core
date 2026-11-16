@@ -42,10 +42,21 @@ pub enum GradientMethodKind {
     NotApplicable,
 }
 
+/// The label an earlier engine wrote for the analytic route (`.fitrx` bundles and fit YAMLs
+/// saved by it still carry it).
+pub(crate) const LEGACY_ANALYTIC_LABEL: &str = "analytic (Dual2)";
+
+/// Whether a stored route label names the analytic route: today's [`GradientMethodKind::Analytic`]
+/// or the legacy [`LEGACY_ANALYTIC_LABEL`]. The one place labels are compared against it, so a
+/// result an earlier engine wrote reads the same as one this engine writes.
+pub(crate) fn is_analytic_label(label: &str) -> bool {
+    label == GradientMethodKind::Analytic.as_str() || label == LEGACY_ANALYTIC_LABEL
+}
+
 impl GradientMethodKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Analytic => "analytic (Dual2)",
+            Self::Analytic => "analytic",
             Self::FiniteDifferences => "finite differences",
             Self::NotApplicable => "N/A",
         }
@@ -56,7 +67,7 @@ impl GradientMethodKind {
 ///
 /// Best-case, model-level mirror of the per-subject route
 /// `estimation::inner_optimizer::analytic_inner_grad_supported` runs. The reported method is
-/// the union of the three in-scope inner routes — closed-form / CTMM, the light `Dual1` ODE
+/// the union of the three in-scope inner routes — closed-form / CTMM, the compiled-plan ODE
 /// walk (#410), and the stacked-η IOV walk — computed by the shared
 /// `inner_reports_analytic_model` predicate that `fd_fallback_warning` reads too, so the
 /// reported label and the FD-fallback warning cannot drift (#378 task B / #926). Otherwise
@@ -64,14 +75,9 @@ impl GradientMethodKind {
 /// model "finite differences".
 ///
 /// Per-subject fallbacks are reported by `gradient_route_summary` (banner) and
-/// `fd_fallback_warning`: **TV-cov + LTBS** on a closed-form model (the event-driven inner
-/// walk declines LTBS, so every such subject runs FD), and out-of-scope ODE subjects (oral
-/// infusion into a built-in absorption compartment, a rate-defined infusion under `F ≠ 1`).
-/// Steady-state and modeled-duration doses are **analytic** on the ODE event-driven walk, not
-/// FD (#914 / #530). A model with a non-Gaussian endpoint reports analytic when every
-/// endpoint has an exact η-channel (`analytic_inner_grad_supported_model`, #2482) and FD otherwise
-/// (#1861); a subject whose record that channel still declines — an ODE hazard beside a
-/// steady-state dose — is the FD-fallback warning's to report.
+/// `fd_fallback_warning`. Every model the parser accepts is in the plan recorders' scope
+/// (#2786), so a subject on finite differences is either the user's `gradient = fd` or a
+/// recorder defect, which `W_PLAN_FD_FALLBACK` names.
 pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> GradientMethodKind {
     if crate::estimation::inner_optimizer::inner_reports_analytic_model(model) {
         GradientMethodKind::Analytic
@@ -88,9 +94,10 @@ pub fn gradient_method_inner(_build: &BuildInfo, model: &CompiledModel) -> Gradi
 /// force FD — mirroring the live dispatch in `outer_optimizer` (PR #381 review
 /// #4), so the report tracks the headline feature instead of always reading
 /// "finite differences". Otherwise:
-/// - NLopt-based: NLopt uses its own internal FD.
+/// - `gradient = fd`: finite differences.
 /// - BOBYQA: derivative-free — no outer gradient at all.
-/// - GN/GnHybrid: BHHH outer approximation — always FD.
+/// - GN/GnHybrid: the BHHH outer approximation over exact per-subject scores, on the same
+///   scope and override as the FOCE family.
 /// - SAEM/IMP/Bayes: no outer gradient step.
 ///
 /// (A per-fit `reconverge_gradient_interval` override can still force FD; this
@@ -126,12 +133,12 @@ pub fn gradient_method_outer(
         | EstimationMethod::Bayes => GradientMethodKind::NotApplicable,
         // VI's gradient route is per-subject and reported on `FitResult::vi`
         // (`n_fd_subjects`), not as a single population-wide classification: the
-        // analytic `Dual2` η-gradient serves most subjects while any it declines
+        // analytic plan η-gradient serves most subjects while any it declines
         // fall back to finite differences individually.
         EstimationMethod::Vi => GradientMethodKind::NotApplicable,
         // AGQ always differentiates the quadrature marginal itself — the posterior-weighted
         // score over the nodes plus the grid-response term, neither of which re-solves the
-        // inner loop. What varies is only the θ/σ score: analytic from the `Dual2` provider
+        // inner loop. What varies is only the θ/σ score: analytic from the plan provider
         // where it reaches, finite-differenced at fixed η otherwise (TTE, categorical, ODE,
         // M3, LTBS…). Report that distinction, not a scope gate — there isn't one.
         // Laplace is AGQ at one node — same objective, same gradient, so same report.
@@ -142,19 +149,20 @@ pub fn gradient_method_outer(
                 GradientMethodKind::FiniteDifferences
             }
         }
+        // Gauss-Newton takes each subject's θ block from the exact fixed-η contractions
+        // (`fixed_eta_theta_contractions`) and its ω/σ block in closed form, on the same scope
+        // and the same `gradient = fd` override as the FOCE family.
         EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid => {
-            GradientMethodKind::FiniteDifferences
+            if crate::sens::provider::analytic_outer_gradient_available(model) {
+                GradientMethodKind::Analytic
+            } else {
+                GradientMethodKind::FiniteDifferences
+            }
         }
         EstimationMethod::Foce | EstimationMethod::FoceI => {
-            // A FOCE / FOCEI stage scores under the flag its method implies
-            // (`crate::types::interaction_for`: FOCEI on, FOCE off, whatever the
-            // caller's `FitOptions::interaction` says), so `method` alone fixes it
-            // here; this function does not receive the options.
-            let interaction = crate::types::interaction_for(method, false);
             // Resolved by the outer loop's own dispatch rule (#1540), so a mixture
             // model's `auto` → BOBYQA downgrade reports "no outer gradient" here too.
-            let analytic =
-                crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction);
+            let analytic = crate::sens::provider::analytic_outer_gradient_available(model);
             let (resolved, _) = crate::estimation::outer_optimizer::resolve_outer_optimizer(
                 optimizer,
                 model,
@@ -300,13 +308,23 @@ mod tests {
         );
     }
 
+    /// Gauss-Newton's per-subject θ block is exact wherever the FOCE family's is, and both
+    /// follow `gradient = fd`. Mutation: GN reported `FiniteDifferences` unconditionally (the
+    /// old label) -> the first assertion fails; GN ignoring the override -> the second.
     #[test]
-    fn outer_gn_always_fd() {
-        let m = test_helpers::analytical_model(GradientMethod::Auto);
-        assert_eq!(
-            gradient_method_outer(&ad_build(), EstimationMethod::FoceGn, Optimizer::Bobyqa, &m),
-            GradientMethodKind::FiniteDifferences
-        );
+    fn outer_gn_is_analytic_unless_fd_is_forced() {
+        for method in [EstimationMethod::FoceGn, EstimationMethod::FoceGnHybrid] {
+            let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
+            assert_eq!(
+                gradient_method_outer(&ad_build(), method, Optimizer::Bobyqa, &m),
+                GradientMethodKind::Analytic
+            );
+            let fd = test_helpers::parsed_analytical_model(GradientMethod::Fd);
+            assert_eq!(
+                gradient_method_outer(&ad_build(), method, Optimizer::Bobyqa, &fd),
+                GradientMethodKind::FiniteDifferences
+            );
+        }
     }
 
     /// #486 σ-magnitude FOCE port: a custom / time-varying residual-magnitude model

@@ -41,11 +41,10 @@ use std::path::{Path, PathBuf};
 const ALLOWED: &[(&str, usize, &str)] = &[
     (
         "src/api/fit.rs",
-        9,
+        8,
         "the stage loop resolves `stage_opts.interaction` through `interaction_for`; the \
          `post_opts` shadow resolves it for the post-fit block, so every later \
-         `options.interaction` there is the resolved flag; the optimizer label reads it \
-         through `analytic_outer_gradient_for_interaction` on a stage's options",
+         `options.interaction` there is the resolved flag",
     ),
     (
         "src/api/postfit.rs",
@@ -98,16 +97,17 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/outer_optimizer.rs",
-        17,
+        14,
         "the outer optimizer and objective, run on a stage's options; \
          `warm_ebe_start_check` (#2097) runs on the Gauss–Newton stage's options \
          (#2549: the built-in BFGS loop's two standalone `population_eta_dx` reads went \
          with its separate mode-response pass); the #2093 basin probe's switched-subject \
-         count (#2600) scores the cold solve on the same stage options",
+         count (#2600) scores the cold solve on the same stage options; #2786 removed two reads \
+         with the dual-number gradient paths",
     ),
     (
         "src/estimation/profile.rs",
-        3,
+        2,
         "the profiled outer loop is a stage of the stage loop, on its stage options; the \
          profile solve's adjoint level gradient (#2109) differentiates the same stage objective",
     ),

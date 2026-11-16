@@ -239,6 +239,18 @@ impl FitScope {
         // it, so a one-thread scope sees what its caller set (#520 review round 3).
         #[cfg(test)]
         let declined = crate::ode::solver::FORCE_LINEAR_DECLINE.get();
+        // So does the plan layer's forced failure (#2786).
+        #[cfg(test)]
+        let f = {
+            use crate::parser::model_parser::rhs_regcode::kernel_jit::FORCE_PLAN_FAIL;
+            let fail = FORCE_PLAN_FAIL.get();
+            move || {
+                let was = FORCE_PLAN_FAIL.replace(fail);
+                let out = f();
+                FORCE_PLAN_FAIL.set(was);
+                out
+            }
+        };
         // A test recording inner solves on the calling thread follows the call onto the
         // thread that runs it (#2261).
         #[cfg(test)]
@@ -255,6 +267,9 @@ impl FitScope {
                 f()
             }
         };
+        // The fit the caller runs (#2786): its plans, bad marks and failures key under it on
+        // whichever worker runs `f`.
+        let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
         move || {
             #[cfg(test)]
             let _declined = ForcedDeclineGuard::set(declined);
@@ -262,7 +277,7 @@ impl FitScope {
             let _inner = crate::estimation::inner_optimizer::arm_inner_settings(self.inner);
             let _fd = crate::types::arm_forced_fd(self.fd);
             let _bloq = crate::types::arm_bloq_override(self.bloq);
-            f()
+            crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(fit, f)
         }
     }
 

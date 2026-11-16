@@ -47,8 +47,7 @@ $$
 \frac{\partial}{\partial\eta}\bigl(-\log P_{jj}\bigr) = \frac{\sum_{k\ne j}\partial P_{jk}/\partial\eta}{P_{jj}}.
 $$
 
-and likewise to second order. A model whose probabilities cannot be replayed exactly (or
-whose η count is past the widest dual bucket) falls back to finite differences, and the fit
+and likewise to second order. A model whose probabilities cannot be replayed exactly falls back to finite differences, and the fit
 reports the route.
 
 ## Validation against NONMEM

@@ -233,7 +233,7 @@ the model has fewer than two valid residuals, and `cov_condition_number` is
   "covariance_wall_time_secs": 0.1,
   "n_threads_used": 4,
   "uses_ode_solver": false,
-  "gradient_method_inner": "analytic (Dual2)",
+  "gradient_method_inner": "analytic",
   "gradient_method_outer": "finite differences",
   "nlopt_missing_algorithms": [],
   "covariance_status": "computed",

@@ -1614,7 +1614,7 @@ fn a_positive_definite_r_under_the_floor_is_clipped_and_takes_the_fallback() {
 
 // ---- #2093 review round 2 (finding 7): the decline/remedy sentence cells, rebuilt on the
 // adjoint's clause set. `GradientFd` and `Disabled` carry a one-line remedy; `Mixture`,
-// `NonGaussianEndpoint`, `ModelOutOfScope`, `TooManyRandomEffects` and `PerSubjectBail` do not.
+// `NonGaussianEndpoint`, `ModelOutOfScope` and `PerSubjectBail` do not.
 
 #[test]
 fn a_clause_with_a_remedy_prints_it_and_one_without_prints_none() {
@@ -1653,8 +1653,7 @@ fn several_unremediable_clauses_invent_no_advice() {
             "the model is a mixture model under Laplace/AGQ, the model is outside the analytic \
              recorders' scope \
              and the model has a non-Gaussian endpoint ([event_model] / [binary_model]) \
-             outside the exact term (an endpoint without an exact channel, more than 8 BSV \
-             random effects, or an SDE)."
+             outside the exact term (an endpoint without an exact channel, or an SDE)."
         ),
         "{m}"
     );
@@ -1674,10 +1673,10 @@ fn the_declined_clause_sentence_is_fd_route_only() {
 
 #[test]
 fn the_decline_sentence_names_the_subjects_that_declined_not_the_whole_fit() {
-    // #1516 review §2, on the adjoint's width clause: on the hybrid route only the salvaged
+    // #1516 review §2: on the hybrid route only the salvaged
     // minority declined, so the sentence's subject is those subjects.
     let mut fd = measured_severe_facts();
-    fd.declines = &[CovScopeDecline::TooManyRandomEffects];
+    fd.declines = &[CovScopeDecline::ModelOutOfScope];
     fd.source = CovHessianSource::FdStencil;
     let mut hybrid = fd;
     hybrid.source = CovHessianSource::HybridRMatrix;
@@ -1685,7 +1684,7 @@ fn the_decline_sentence_names_the_subjects_that_declined_not_the_whole_fit() {
         format_regularized_warning(&fd),
         format_regularized_warning(&hybrid),
     );
-    let clause = CovScopeDecline::TooManyRandomEffects.clause();
+    let clause = CovScopeDecline::ModelOutOfScope.clause();
     assert!(
         m_fd.contains(&format!(
             "The exact analytic covariance R-matrix was declined because {clause}."
@@ -1757,7 +1756,7 @@ fn the_remedy_sentences_move_the_subjects_not_the_fit_on_the_hybrid_route() {
     let mut hybrid_mixed = hybrid;
     hybrid_mixed.declines = &[
         CovScopeDecline::GradientFd,
-        CovScopeDecline::TooManyRandomEffects,
+        CovScopeDecline::ModelOutOfScope,
     ];
     let mut fd_mixed = hybrid_mixed;
     fd_mixed.source = CovHessianSource::FdStencil;

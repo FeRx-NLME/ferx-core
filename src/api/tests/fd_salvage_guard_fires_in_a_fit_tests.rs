@@ -1,0 +1,104 @@
+//! Tier 2 — the #1520 salvage guard, end to end through `fit()`.
+//!
+//! The unit tests in `outer_optimizer_tests.rs` pin the predicate, the assembly and the
+//! per-optimizer bookkeeping with hand-built inputs; nothing there can see whether the
+//! NLopt closure actually *wires* them — records each evaluation, asks the bookkeeping
+//! for a reference, hands the assembly a real `OuterTrial`. This test does: a fit on the
+//! bundled `warfarin_if` example, which the instrumented sweep behind #1520 found reaching
+//! blown-up first trials at evaluations 2 and 4 under SLSQP (excess over the iterate
+//! `2.2e5` and `3.7e6` on 320 observations) and under NLopt L-BFGS (`1.7e4`, `1.0e5`), so
+//! eight evaluations are enough and the fit returns in well under a second. Asserted on
+//! the `FitResult` warning the guard extends:
+//!
+//! - under **SLSQP** the sentence is present with a non-zero count — a closure that never
+//!   records an evaluation, or hands the assembly `OuterTrial::unknown()`, leaves it out;
+//! - under **NLopt L-BFGS** the sentence is absent — its policy is `Off` (PR #1525 review:
+//!   no reference ferx can form is a rejected-trial guarantee for Luksan's line search),
+//!   so a wiring that fired there anyway reddens this.
+//!
+//! Deliberately not asserted: the OFV, which the guard must not be able to move at an
+//! accepted point, and which #1515 established is not evidence about a gradient anyway.
+
+use crate::{fit, read_nonmem_csv, EstimationMethod, FitOptions, Optimizer};
+use std::path::Path;
+
+fn skipped_salvages_in(warnings: &[String]) -> Option<usize> {
+    warnings.iter().find_map(|w| {
+        let marker = " of their salvage gradients were skipped";
+        let end = w.find(marker)?;
+        let head = &w[..end];
+        head.rsplit(' ').next()?.parse().ok()
+    })
+}
+
+#[test]
+fn a_blown_up_first_trial_skips_the_salvage_under_slsqp_and_never_under_lbfgs() {
+    // The bundled example plus one subject the adjoint declines for good: a constant lag
+    // time, subject 0's dose a steady-state infusion into the depot, and every plan of that
+    // subject forced to fail (`fail_plans_of`).
+    let src = std::fs::read_to_string("examples/warfarin_if.ferx").expect("bundled example");
+    let src = src
+        .replace(
+            "  KA = TVKA * exp(ETA_KA)\n",
+            "  KA = TVKA * exp(ETA_KA)\n  ALAG = 0.3\n",
+        )
+        .replace(
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)",
+            "pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA, lagtime=ALAG)",
+        );
+    assert!(
+        src.contains("lagtime=ALAG") && src.contains("ALAG = 0.3"),
+        "every edit must take"
+    );
+    let model = crate::parser::model_parser::parse_model_string(&src).expect("edited example");
+    let mut pop =
+        read_nonmem_csv(Path::new("data/warfarin_if.csv"), None, None).expect("bundled data");
+    let dose = &mut pop.subjects[0].doses[0];
+    *dose = crate::DoseEvent::new(dose.time, dose.amt, 1, 50.0, true, 24.0);
+    // No regular-path shape declines after #2786, so force it (a `#[cfg(test)]` seam, which is
+    // why this file moved from `tests/` into the lib).
+    crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&pop.subjects[0]);
+    for (optimizer, expect_skips) in [(Optimizer::Slsqp, true), (Optimizer::NloptLbfgs, false)] {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            optimizer,
+            outer_maxiter: 8,
+            // The #1520 sweep predates the #2013 Sobol screen. With the screen on, the
+            // cold start's EBEs move and neither optimizer declines a subject within 8
+            // evaluations (measured: SLSQP on Linux, NLopt L-BFGS on macOS arm64), so the
+            // guard has nothing to skip. The screen is not what this test is about.
+            inner_screen: 0,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let result = fit(&model, &pop, &model.default_params, &opts)
+            .unwrap_or_else(|e| panic!("{optimizer:?}: the short fit must return Ok: {e}"));
+        let fd = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("could not be given the exact analytic outer gradient"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "{optimizer:?}: the fixture must still decline a subject on this path, \
+                     or the guard has nothing to skip; warnings: {:?}",
+                    result.warnings
+                )
+            });
+        let skipped = skipped_salvages_in(&result.warnings);
+        if expect_skips {
+            assert!(
+                skipped.is_some_and(|k| k >= 1),
+                "{optimizer:?}: at least one salvage must be skipped within 8 evaluations; \
+                 got: {fd}"
+            );
+        } else {
+            assert!(
+                skipped.is_none(),
+                "{optimizer:?}: the guard is off for this optimizer and must skip nothing; \
+                 got: {fd}"
+            );
+        }
+    }
+}

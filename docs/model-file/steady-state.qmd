@@ -129,9 +129,10 @@ collapses per eigenvalue: every exponential `A·exp(-λ·t)` in the
 single-dose response contributes a steady-state amplitude
 `A·exp(-λ·τ) / (1 - exp(-λ·II))`. ferx evaluates this exactly — no
 iteration, single-pass cost equivalent to evaluating the single-dose
-formula plus one extra division per eigenvalue. For oral models when
-`KA ≈ λ` the closed form needs the L'Hopital limit; ferx handles that
-case automatically.
+formula plus one extra division per eigenvalue. For oral models the
+per-eigenvalue absorption term is written as one smooth function of `KA` and
+`λ`, so `KA = λ` (and every point near it) needs no special case: values and
+parameter derivatives stay exact there.
 
 ### ODE path: exact fixed point, with a numerical fallback
 
@@ -391,7 +392,7 @@ the ODE solver), and the result is validated against NONMEM `ALAG1` +
 > the record exactly as in NONMEM. See [Lag time](lagtime.qmd) and the
 > anchors `nonmem_anchor/ss_lag_infusion.ctl` and
 > `nonmem_anchor/ss_arrival_flow_lag{11,12}.ctl` (ID 5). Overlapping
-> infusions (`T_inf > II`) are rejected as described under *Limitations*.
+> infusions (`T_inf > II`) are supported too — see below.
 
 ## Steady state with a `TAD`-reading RHS
 
@@ -534,14 +535,19 @@ dose time, so don't interpret the fit as a steady-state fit.
   The SS branch is gated on `dose.ii > 0`, so the dose falls through
   to the single-dose path. Set `II` in the dataset or remove the
   `SS=1` flag.
-- **`SS=1` infusion with `T_inf > II`** (overlapping pulses) — handled
-  for the analytical 1-/2-/3-compartment models: the steady-state
-  concentration superposes the infinite past pulse train (several
-  infusions simultaneously active). Only **ODE** models, and analytical
-  subjects whose timeline routes to the event-driven walker (EVID=3/4
-  resets), still skip SS pre-equilibration here and emit the warning;
-  for those, model the overlapping infusions with an `[odes]` block and
-  explicit periodic dose records (without `SS=1`).
+
+### Overlapping infusions (`T_inf > II`) {#overlapping-infusions}
+
+An `SS=1` infusion longer than its interval has several pulses running at once. With
+`T_inf = m·II + r` (`0 < r ≤ II`), every cycle of the steady state has `m + 1` pulses infusing
+for the first `r` hours and `m` for the rest, and at the record `m` earlier pulses are still
+running — they stop `T_inf − II`, `T_inf − 2·II`, … after it (`ALAG` later under a lag time).
+Every engine computes exactly that: the analytical superposition and event walk, the ODE
+solver and the SDE filter, and the exact gradients of each.
+`nonmem_anchor/ss_infusion_overlap_{1cpt,2cpt}.ctl` holds the 1.5·`II`, 2.5·`II` and exactly
+2·`II` cases, with and without a lag time and a time-varying covariate, each followed by a
+dose on residual drug; ferx matches an exact pulse-train superposition of them
+(`ss_infusion_overlap_ref.py`) on every engine.
 
 ### SS with an ODE-accumulated hazard {#ss-with-an-ode-accumulated-hazard}
 

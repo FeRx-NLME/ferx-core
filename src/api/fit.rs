@@ -317,10 +317,7 @@ pub(crate) fn reported_optimizer_label(
                 options.optimizer,
                 model,
                 has_mixture,
-                crate::sens::provider::analytic_outer_gradient_for_interaction(
-                    model,
-                    options.interaction,
-                ),
+                crate::sens::provider::analytic_outer_gradient_available(model),
             );
             if options.optimizer == Optimizer::Auto {
                 format!("auto ({})", resolved.label())
@@ -935,6 +932,7 @@ pub fn fit(
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
     let mut result = fit_unstamped(model, population, init_params, options)?;
+    crate::parser::model_parser::rhs_regcode::kernel_jit::report();
     // Under a derived `iov_occasion` rule the fit overwrites the occasion labels, so
     // the ones the population carries are not part of what it was given (#1685
     // review r1 #1): `run_model_with_data` hands back its population with them set.
@@ -1102,7 +1100,8 @@ fn fit_unstamped(
     // refused rather than silently ignoring the mixture structure; so are `init_params`
     // with no per-class Ω/Σ (`E_PARAM_SHAPE` / `E_MIXTURE_METHOD`, #1788). Inter-occasion
     // variability under a mixture fits (#985): the per-class inner solve carries the shared
-    // base `omega_iov`, and the outer gradient routes to FD.
+    // base `omega_iov`, and the outer gradient is the exact one at every class's modes
+    // (`mixture_gradient_salvaged`).
     first_error(&crate::api::validation::check_mixture_options(
         model,
         options,
@@ -1110,6 +1109,7 @@ fn fit_unstamped(
     ))?;
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
@@ -1298,34 +1298,31 @@ fn fit_unstamped(
     }
 
     let par_starts = || -> Vec<(usize, Result<FitResult, EngineError>)> {
-        (0..n)
-            .into_par_iter()
-            .map(|k| {
-                let init_k = perturb_init(init_params, k, sigma, base_seed);
-                // Per-start option overrides for k > 0:
-                // - saem_seed / bayes_seed: derive from base so each start gets a different
-                //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
-                //   perturbing it every start runs an identical RNG trajectory (differing
-                //   only by the perturbed init) — wasted compute and false multi-start
-                //   robustness. Start 0 keeps the user's seeds for reproducibility.
-                // - global_search: CRS2-LM ignores the starting point and samples freely in
-                //   [lower, upper], so running it on starts 1..n overrides the perturbation
-                //   and makes multi-start a no-op for those starts. Only run it on start 0.
-                let opts_k_storage;
-                let opts_ref: &FitOptions = if k == 0 {
-                    options
-                } else {
-                    opts_k_storage = FitOptions {
-                        saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
-                        bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
-                        global_search: false,
-                        ..options.clone()
-                    };
-                    &opts_k_storage
+        crate::par::map(n, |k| {
+            let init_k = perturb_init(init_params, k, sigma, base_seed);
+            // Per-start option overrides for k > 0:
+            // - saem_seed / bayes_seed: derive from base so each start gets a different
+            //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
+            //   perturbing it every start runs an identical RNG trajectory (differing
+            //   only by the perturbed init) — wasted compute and false multi-start
+            //   robustness. Start 0 keeps the user's seeds for reproducibility.
+            // - global_search: CRS2-LM ignores the starting point and samples freely in
+            //   [lower, upper], so running it on starts 1..n overrides the perturbation
+            //   and makes multi-start a no-op for those starts. Only run it on start 0.
+            let opts_k_storage;
+            let opts_ref: &FitOptions = if k == 0 {
+                options
+            } else {
+                opts_k_storage = FitOptions {
+                    saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
+                    bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
+                    global_search: false,
+                    ..options.clone()
                 };
-                (k, fit_inner(model, scored_ref, pop_ref, &init_k, opts_ref))
-            })
-            .collect()
+                &opts_k_storage
+            };
+            (k, fit_inner(model, scored_ref, pop_ref, &init_k, opts_ref))
+        })
     };
 
     // Run the start fan-out on the pinned fit-scoped pool when `threads` is set, else on the
@@ -1523,45 +1520,6 @@ fn floor_escaped(
     })
 }
 
-/// Fits in progress in this process: [`LastFitOut`] guards.
-static FITS_IN_PROGRESS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Held for the whole of one [`fit_inner`], on the single-start and the multi-start arm
-/// alike. Dropping the guard of the **last** fit in progress runs `on_last`, so a finishing
-/// fit never releases the tapes of another that is still recording on a shared pool.
-struct LastFitOut {
-    count: &'static std::sync::atomic::AtomicUsize,
-    on_last: fn(),
-}
-
-impl LastFitOut {
-    fn enter(count: &'static std::sync::atomic::AtomicUsize, on_last: fn()) -> Self {
-        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        LastFitOut { count, on_last }
-    }
-}
-
-impl Drop for LastFitOut {
-    fn drop(&mut self) {
-        if self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-            (self.on_last)();
-        }
-    }
-}
-
-/// Release the outer gradient's vector tape once no fit is in progress (#2481 §2.7): each
-/// worker keeps its peak recording's buffers between subjects, and past the fits nothing
-/// needs them at that size. On a Rayon worker (the fit pool) every worker of that pool is
-/// trimmed; off one, only this thread, so the release never builds Rayon's global pool
-/// (#1460).
-fn release_worker_tapes() {
-    if rayon::current_thread_index().is_some() {
-        rayon::broadcast(|_| crate::sens::vtape::vtape_trim(0));
-    } else {
-        crate::sens::vtape::vtape_trim(0);
-    }
-}
-
 /// One fit of `population`, the records the estimators score (`scored_population`, #2778).
 /// `all_records` is the same population with every record, for the data warnings and the
 /// `[derived]` outputs, whose grids run past the last observation.
@@ -1572,7 +1530,24 @@ fn fit_inner(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
-    let _tapes = LastFitOut::enter(&FITS_IN_PROGRESS, release_worker_tapes);
+    // `SS=1` doses into a `zero_order()` compartment are lowered to the infusions they are
+    // once, here, not by a clone of the subject in every walk (#2786). Validation has seen
+    // the data as read.
+    let attr_map = model.active_dose_attr_map();
+    let lowered = crate::dosing::lower_population_zero_order_ss(population, attr_map);
+    // The data as read: the data warnings below describe what the user wrote, not the lowered
+    // infusions (`RATE=-2`, `D1`) the engines walk, which are absent from their data and model.
+    let all_records_read: &Population = all_records;
+    let all_lowered = (!std::ptr::eq(population, all_records))
+        .then(|| crate::dosing::lower_population_zero_order_ss(all_records, attr_map));
+    let all_records: &Population = match (&all_lowered, &lowered) {
+        (Some(a), _) => &**a,
+        (None, l) => &**l,
+    };
+    let population: &Population = &lowered;
+    // The plans' keys read this fit's fingerprints instead of hashing per lookup.
+    let _prints =
+        crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
     // LTBS needs the inner EBE loop converged tighter than the default for
     // reproducible standard errors (see `FitOptions::effective_inner_tol` /
     // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
@@ -1719,9 +1694,8 @@ fn fit_inner(
 
     // Reset gradient timing counters for this fit so FERX_TIME_GRADIENTS
     // readouts are per-call rather than cumulative across a long R session.
-    let time_gradients = std::env::var("FERX_TIME_GRADIENTS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let time_gradients = crate::estimation::inner_optimizer::GRADIENT_TIMINGS
+        .arm(std::env::var("FERX_TIME_GRADIENTS").ok().as_deref());
     if time_gradients {
         crate::estimation::inner_optimizer::GRADIENT_TIMINGS.reset();
     }
@@ -1864,10 +1838,9 @@ fn fit_inner(
     // but suppress the numeric estimate. No note at all when the step will run
     // an estimator that builds no `R` (#1803).
     // The route is predicted from the covariance step's own scope walk (#2054): no note on
-    // the analytic R-matrix, and on the #1514 salvage the note names the declined subset.
+    // the analytic R-matrix.
     let covariance_route = crate::estimation::covariance::predicted_r_route(
         model,
-        population,
         options,
         init_params.mixture.is_some(),
     );
@@ -1936,10 +1909,17 @@ fn fit_inner(
                 | EstimationMethod::Laplace
         )
     }) {
-        if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
+        if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning_skipping(
             model,
             population,
             &init_params.theta,
+            // Every stage skips a refused subject's EBE search (`InnerSolvePolicy::skip_refused`).
+            chain.iter().all(|&m| {
+                crate::estimation::inner_optimizer::skips_refused_subjects(&FitOptions {
+                    method: m,
+                    ..options.clone()
+                })
+            }),
         ) {
             accumulated_warnings.push(w);
         }
@@ -1961,13 +1941,13 @@ fn fit_inner(
     // `check_model_data_warnings` so `ferx check` reports the same findings;
     // message text is unchanged. Probed against `population` (not the pruned
     // copy) and `init_params`, matching the historical inline checks.
-    for d in check_model_data_warnings(model, all_records, init_params) {
+    for d in check_model_data_warnings(model, all_records_read, init_params) {
         accumulated_warnings.push(d.message);
     }
     // Fit-only, so not in the bundle above that `simulate()` shares (#2459). Reads the
     // censoring method through `bloq_in_force`, armed by `fit_unstamped` (#1824).
     if let Some(d) =
-        crate::api::validation::check_zero_dv_magnitude_only(model, all_records, init_params)
+        crate::api::validation::check_zero_dv_magnitude_only(model, all_records_read, init_params)
     {
         accumulated_warnings.push(d.message);
     }
@@ -2001,14 +1981,12 @@ fn fit_inner(
     }
     // A `[covariate_nn]` input the data drive into saturation (#2549).
     #[cfg(feature = "nn")]
-    for d in crate::api::validation::check_nn_input_scale(model, all_records) {
+    for d in crate::api::validation::check_nn_input_scale(model, all_records_read) {
         accumulated_warnings.push(d.message);
     }
-    if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
-        n_params_pre,
-        covariance_cost,
-        covariance_route,
-    ) {
+    if let Some(note) =
+        crate::estimation::covariance::pre_fit_covariance_cost_note(n_params_pre, covariance_cost)
+    {
         accumulated_warnings.push(note);
     }
 
@@ -2919,7 +2897,7 @@ fn fit_inner(
 
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
     // (with individual lagtime) for the mandatory TAD column in output.rs.
-    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
+    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_dose_lag() {
         compute_extra_output_columns(
             model,
             all_records,
@@ -3945,6 +3923,19 @@ fn fit_inner(
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }
+    // Subjects whose compiled plan failed and took finite differences instead (#2786).
+    // Counted once: the warning and both route labels read the same counts.
+    if let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
+        model,
+        &population.subjects,
+    ) {
+        // The realised route, not the model's: those subjects ran finite differences.
+        crate::api::postfit::apply_plan_failures(
+            &mut fit_result,
+            Some(&c),
+            population.subjects.len(),
+        );
+    }
 
     // The `[covariate_model]` echo (#1111): the relations as declared, joined to
     // the θ this fit estimated and their standard errors. Built here rather than
@@ -4037,42 +4028,5 @@ mod trace_file_path_tests {
         for _ in 0..1_000 {
             assert!(seen.insert(trace_file_path()), "duplicate trace path");
         }
-    }
-}
-
-#[cfg(test)]
-mod last_fit_out_tests {
-    use super::LastFitOut;
-    use std::sync::atomic::AtomicUsize;
-
-    static COUNT: AtomicUsize = AtomicUsize::new(0);
-    thread_local! {
-        static RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-    fn release() {
-        RELEASES.with(|r| r.set(r.get() + 1));
-    }
-
-    /// Review r1 #2: the tape release runs once, when the last of overlapping fits ends —
-    /// not when the first does, which would trim the tapes another fit is still recording on.
-    /// Mutation: release on every drop → 2 after the first fit ends.
-    #[test]
-    fn the_tapes_are_released_when_the_last_fit_ends() {
-        let first = LastFitOut::enter(&COUNT, release);
-        let second = LastFitOut::enter(&COUNT, release);
-        drop(first);
-        assert_eq!(
-            RELEASES.with(|r| r.get()),
-            0,
-            "another fit is still in progress"
-        );
-        drop(second);
-        assert_eq!(RELEASES.with(|r| r.get()), 1, "the last fit out releases");
-        drop(LastFitOut::enter(&COUNT, release));
-        assert_eq!(
-            RELEASES.with(|r| r.get()),
-            2,
-            "a lone fit releases on its own"
-        );
     }
 }
