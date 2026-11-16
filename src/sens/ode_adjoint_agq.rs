@@ -38,7 +38,7 @@ pub(super) fn agq_planned(
     exact: bool,
     held: bool,
     ng: Option<&AgqNg>,
-    eta_dx: Option<&mut ModeOut>,
+    mut eta_dx: Option<&mut ModeOut>,
     mode_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
     var_fwd: Option<&(PlanArc, Vec<f64>, kj_fwd::Fwd)>,
     p1: &PredLanes<&[f64]>,
@@ -412,8 +412,19 @@ pub(super) fn agq_planned(
             at_mode = false;
             DVector::zeros(n)
         }
-        None => return None,
+        None => {
+            if let Some(o) = eta_dx {
+                o.polish = polish_proposal(h_inner, &grad_l);
+            }
+            return None;
+        }
     };
+    if at_mode {
+        if let Some(o) = eta_dx.as_deref_mut().filter(|o| o.polishing) {
+            o.polish =
+                polish_proposal(h_inner, &grad_l).filter(|(_, gn)| !(*gn <= POLISH_TARGET_TOL));
+        }
+    }
 
     // ---- reverse 2: −wᵀ∇_η l and the rows, from the kept forward -----------------------
     let mut coefs: Vec<Vec<f64>> = vec![std::iter::once(0.0).chain(w.iter().map(|v| -v)).collect()];

@@ -537,9 +537,12 @@ pub(crate) fn mixture_ofv_with_modes(
 /// gradient (theta slots only). The un-scaled gradient the objective closure
 /// then multiplies by `scale[k]` for optimizer space.
 ///
-/// Returns `None` (→ the caller falls back to FD of the mixture OFV) when the
-/// gradient is out of analytic scope: inter-occasion variability (κ), whose per-class κ̂
-/// `eval` does not carry (`mixture_gradient_with_modes` takes them).
+/// Under inter-occasion variability (κ) `eval` does not carry every class's κ̂ (it keeps the
+/// MIXEST class's), so the per-class modes are re-solved here, warm from `eval`'s own EBEs
+/// (`mixture_ofv_with_modes`), and the gradient is taken on that evaluation: an IOV
+/// mixture is served exactly like any other. The fit itself holds the modes already and
+/// calls `mixture_gradient_with_modes` directly. `None` only when
+/// `mixture_gradient_with_modes` declines.
 pub fn mixture_gradient(
     model: &CompiledModel,
     population: &Population,
@@ -547,6 +550,16 @@ pub fn mixture_gradient(
     options: &FitOptions,
     eval: &MixtureEval,
 ) -> Option<Vec<f64>> {
+    if params.omega_iov.is_some() {
+        let (own, modes) = mixture_ofv_with_modes(
+            model,
+            population,
+            params,
+            options,
+            Some(&eval.etas_by_class),
+        );
+        return mixture_gradient_with_modes(model, population, params, options, &own, Some(&modes));
+    }
     mixture_gradient_with_modes(model, population, params, options, eval, None)
 }
 
@@ -555,8 +568,8 @@ pub fn mixture_gradient(
 /// stacked `[η̂, κ̂]`, so an IOV mixture is exact too. The base Ω may be a block: a class
 /// override can only name a diagonal base Ω's coordinate (a parse-time rule), so a block
 /// Ω's coordinates route to themselves. A subject gradient the adjoint declines (a failed
-/// plan, #2786) takes its own reconverged central difference in its class; under IOV the
-/// whole gradient routes to FD.
+/// plan, #2786) is `None` for the whole ([`mixture_gradient_salvaged`] salvages it per
+/// term). Under IOV without `modes` there is no κ̂ to differentiate at, so it is `None`.
 pub(crate) fn mixture_gradient_with_modes(
     model: &CompiledModel,
     population: &Population,
@@ -1935,25 +1948,31 @@ mod tests {
     }
 
     #[test]
-    fn iov_mixture_gradient_falls_back_to_fd() {
-        // #985: the analytic mixture gradient does not yet emit κ-slot gradients and
-        // its override-tail offset would collide with the IOV segment, so an IOV
-        // mixture must route to central FD (mixture_gradient returns None). A scope
-        // gap here would silently return a wrong-length / mis-slotted gradient.
+    fn iov_mixture_gradient_is_served() {
+        // The eval-only entry point re-solves every class's κ̂ and serves an IOV mixture
+        // exactly (it was `None`, routing to whole-objective FD, #985). A wrong-length or
+        // mis-slotted κ gradient would fail the length and FD-parity checks below.
         let model = crate::parser::model_parser::parse_model_string(MIX_IOV_MODEL).unwrap();
         let pop = read_pop_iov(&bimodal_iov_csv(3, 1.0, 3.0));
-        let opts = crate::types::FitOptions::default();
+        let opts = crate::types::FitOptions {
+            inner_tol: 1e-10,
+            ..crate::types::FitOptions::default()
+        };
         let eval = super::mixture_ofv(&model, &pop, &model.default_params, &opts, None);
-        assert!(
-            super::mixture_gradient(&model, &pop, &model.default_params, &opts, &eval).is_none(),
-            "IOV + mixture must route to FD (no analytic kappa gradient)"
-        );
-        // The FD gradient is still well-formed: full packed length, all finite.
+        let g = super::mixture_gradient(&model, &pop, &model.default_params, &opts, &eval)
+            .expect("an IOV mixture is served, not routed to FD");
         use crate::estimation::parameterization::{pack_params, packed_len};
+        assert_eq!(g.len(), packed_len(&model.default_params));
         let x = pack_params(&model.default_params);
         let fd = super::mixture_gradient_fd(&model, &pop, &x, &model.default_params, &opts);
-        assert_eq!(fd.len(), packed_len(&model.default_params));
-        assert!(fd.iter().all(|g| g.is_finite()));
+        assert_eq!(fd.len(), g.len());
+        let mut worst = 0.0f64;
+        for (e, f) in g.iter().zip(&fd) {
+            assert!(e.is_finite() && f.is_finite());
+            worst = worst.max((e - f).abs() / (1.0 + f.abs()));
+        }
+        eprintln!("IOV mixture_gradient vs reconverged FD: worst {worst:.2e}");
+        assert!(worst < 1e-7, "{worst:.2e}");
     }
 
     #[test]
@@ -2359,8 +2378,7 @@ mod tests {
 
     /// An IOV mixture's outer gradient is exact (each class's subject gradient at its stacked
     /// `[η̂, κ̂]`), against the central difference of the reconverged mixture objective
-    /// (`mixture_gradient_fd`); the eval-only entry point, which has no per-class κ̂, still
-    /// declines rather than mis-slot.
+    /// (`mixture_gradient_fd`); the eval-only entry point re-solves the per-class κ̂ and agrees.
     #[test]
     fn an_iov_mixture_gradient_is_exact() {
         use crate::estimation::parameterization::pack_params;
@@ -2383,7 +2401,11 @@ mod tests {
                 worst = worst.max((e - f).abs() / (1.0 + f.abs()));
             }
             let eval = super::mixture_ofv(&model, &pop, params, &opts, None);
-            assert!(super::mixture_gradient(&model, &pop, params, &opts, &eval).is_none());
+            let direct = super::mixture_gradient(&model, &pop, params, &opts, &eval)
+                .expect("the eval-only entry re-solves the modes and serves IOV");
+            for (d, e) in direct.iter().zip(&exact) {
+                assert!((d - e).abs() <= 1e-6 * (1.0 + e.abs()), "{d} vs {e}");
+            }
         }
         eprintln!("IOV mixture gradient vs reconverged FD: worst {worst:.2e}");
         assert!(worst < 1e-4, "{worst:.2e}");

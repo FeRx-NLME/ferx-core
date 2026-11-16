@@ -942,6 +942,10 @@ fn adjoint_gradient(
     let mut eta_dx = eta_dx;
     if let Some(o) = eta_dx.as_deref_mut() {
         o.mode_system_declined = false;
+        o.polish = None;
+        o.polishing = false;
+        o.eta_polished = None;
+        o.objective = None;
     }
     if marginal_refused(model, subject, objective) {
         return Some(vec![0.0; pt.x.len()]);
@@ -964,7 +968,7 @@ fn adjoint_gradient(
         held: bool,
         eta_dx: Option<&mut ModeOut>,
     ) -> Option<Vec<f64>> {
-        let go_run = |eta_dx: Option<&mut ModeOut>| match objective {
+        let go_run = |eta: &[f64], eta_dx: Option<&mut ModeOut>| match objective {
             Objective::Agq { n_agq, exact } => run_agq(
                 sc.model,
                 subject,
@@ -972,7 +976,7 @@ fn adjoint_gradient(
                 template,
                 sc.params,
                 x,
-                &sc.eta,
+                eta,
                 n_agq,
                 exact,
                 held,
@@ -986,35 +990,156 @@ fn adjoint_gradient(
                 template,
                 sc.params,
                 x,
-                &sc.eta,
+                eta,
                 objective != Objective::Foce,
                 eta_dx,
             ),
         };
-        match eta_dx {
-            None => go_run(None),
+        let attempt = |eta: &[f64], eta_dx: Option<&mut ModeOut>| match eta_dx {
+            None => go_run(eta, None),
             // The mode response shares the gradient's sweeps, and a lane that fails there (a
             // non-finite row adjoint, say from a near-singular `H`) fails the whole pass. The
             // gradient must not depend on whether the response was asked for, so a failed
             // fused pass is re-run as the gradient alone, whose Ψ is the same arithmetic, and
             // reports no response (#2549 review r2 #2).
-            Some(o) => match go_run(Some(&mut *o)) {
+            Some(o) => match go_run(eta, Some(&mut *o)) {
                 Some(g) => Some(g),
                 None if o.want_dx => {
                     let mut lite = ModeOut {
                         want_hessian: o.want_hessian,
                         ..ModeOut::default()
                     };
-                    let g = go_run(Some(&mut lite));
+                    let g = go_run(eta, Some(&mut lite));
                     o.eta_dx = None;
                     o.hessian = lite.hessian;
                     g
                 }
                 None => None,
             },
+        };
+        let mut own = ModeOut::default();
+        let o = eta_dx.unwrap_or(&mut own);
+        let first = attempt(&sc.eta, Some(&mut *o));
+        if first.is_some() || held {
+            return first;
         }
+        polish_mode(&sc.eta, o, |eta, o| attempt(eta, Some(o)))
     }
     go(&sc, subject, template, x, objective, held, eta_dx)
+}
+
+/// The gradient [`polish_mode`] walks `‖∇_η l‖∞` down to.
+const POLISH_TARGET_TOL: f64 = MODE_STATIONARY_TOL * 0.1;
+
+/// [`newton_polish_step`] with the `‖∇_η l‖∞` it was taken at.
+fn polish_proposal(h: &DMatrix<f64>, grad_l: &[f64]) -> Option<(Vec<f64>, f64)> {
+    newton_polish_step(h, grad_l)
+        .map(|d| (d, crate::sens::num::nan_max_abs(grad_l.iter().copied())))
+}
+
+/// The most damped Newton steps [`polish_mode`] takes before it gives the subject up.
+const POLISH_STEPS: usize = 40;
+
+/// The longest polish step, in the stacked random-effect units (log-scale effects).
+const POLISH_RADIUS: f64 = 1.0;
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: the polish budget in place of [`POLISH_STEPS`] (0 reads the decline itself).
+    pub(crate) static POLISH_BUDGET: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(POLISH_STEPS) };
+}
+
+/// Test guard: the polish off for its lifetime, to read the decline and its salvage.
+#[cfg(test)]
+pub(crate) struct PolishOff(usize);
+
+#[cfg(test)]
+impl PolishOff {
+    pub(crate) fn new() -> Self {
+        PolishOff(POLISH_BUDGET.with(|c| c.replace(0)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for PolishOff {
+    fn drop(&mut self) {
+        POLISH_BUDGET.with(|c| c.set(self.0));
+    }
+}
+
+fn polish_steps() -> usize {
+    #[cfg(test)]
+    return POLISH_BUDGET.with(|c| c.get());
+    #[cfg(not(test))]
+    POLISH_STEPS
+}
+
+/// A pass that declined at its mode system (an `η̂` the inner search left off the mode, on
+/// an indefinite or singular `H`) is not an FD subject: the objective is defined at the
+/// inner optimum, so walk `η̂` to it with damped Newton steps on the plan's own exact
+/// gradient and `H` ([`newton_polish_step`]), re-running `pass` at each iterate, and take
+/// the exact gradient there (a served pass still above [`POLISH_TARGET_TOL`] goes on; the
+/// last served gradient is the answer if the budget runs out). A step that does not shrink `‖∇_η l‖∞` is halved (backtracking
+/// along the same direction) up to six times. `None` when the pass declined for any other
+/// reason (no proposal), or the budget ran out with the mode system still declining;
+/// `out` then carries that last decline, and the caller's salvage is unchanged.
+///
+/// A pass that is served at the given `η̂` never reaches this, so every stationary subject
+/// keeps its values bit for bit.
+fn polish_mode(
+    eta0: &[f64],
+    out: &mut ModeOut,
+    mut pass: impl FnMut(&[f64], &mut ModeOut) -> Option<Vec<f64>>,
+) -> Option<Vec<f64>> {
+    out.polishing = true;
+    let mut last: Option<(Vec<f64>, Vec<f64>, Option<f64>)> = None;
+    let mut at = eta0.to_vec();
+    // The iterate the current direction started from: (η, direction, ‖g‖∞, halvings).
+    let mut base: Option<(Vec<f64>, Vec<f64>, f64, u32)> = None;
+    for _ in 0..polish_steps() {
+        let Some((dir, gn)) = out.polish.take() else {
+            return finish(out, last);
+        };
+        let (from, dir, gn, halvings) = match base.take() {
+            // The step overshot: back off along the direction it was taken in.
+            Some((e0, d0, g0, k)) if !(gn < g0) => {
+                if k >= 6 {
+                    return finish(out, last);
+                }
+                (e0, d0, g0, k + 1)
+            }
+            _ => (at.clone(), dir, gn, 0),
+        };
+        let scale = 0.5_f64.powi(halvings as i32);
+        at = from.iter().zip(&dir).map(|(e, d)| e + scale * d).collect();
+        base = Some((from, dir, gn, halvings));
+        *out = ModeOut {
+            want_dx: out.want_dx,
+            want_hessian: out.want_hessian,
+            polishing: true,
+            ..ModeOut::default()
+        };
+        if let Some(g) = pass(&at, out) {
+            let served = (g, at.clone(), out.objective);
+            if out.polish.is_none() {
+                return finish(out, Some(served));
+            }
+            last = Some(served);
+        }
+    }
+    finish(out, last)
+}
+
+/// [`polish_mode`]'s result: the gradient, with its `η̂` and objective left on `out`.
+fn finish(
+    out: &mut ModeOut,
+    served: Option<(Vec<f64>, Vec<f64>, Option<f64>)>,
+) -> Option<Vec<f64>> {
+    let (g, eta, objective) = served?;
+    out.eta_polished = Some(eta);
+    out.objective = objective;
+    Some(g)
 }
 
 /// `H⁻¹b` for the mode system `H w = ∇_η F` (`H` the exact inner Hessian at `η̂`): a
@@ -1051,13 +1176,76 @@ fn mode_solve(
     if let Some(c) = h.clone().cholesky() {
         return Some(c.solve(b));
     }
-    let w = h.clone().full_piv_lu().solve(b)?;
-    if !w.iter().all(|v| v.is_finite()) {
-        return None;
-    }
     let stationary =
         |g: &[f64]| crate::sens::num::nan_max_abs(g.iter().copied()) <= MODE_STATIONARY_TOL;
-    (stationary(grad_l) || inner().is_some_and(|g| stationary(&g))).then_some(w)
+    if !(stationary(grad_l) || inner().is_some_and(|g| stationary(&g))) {
+        return None;
+    }
+    // A stationary point whose `H` is not definite. Nonsingular: the plain solve. Singular
+    // (exactly, or to within `PINV_RCOND` of its largest eigenvalue, where the solve is
+    // rounding): the pseudo-inverse response, `dη̂/dx` in the range of `H`, which is the
+    // limit the objective has.
+    h.clone()
+        .full_piv_lu()
+        .solve(b)
+        .filter(|w| w.iter().all(|v| v.is_finite()) && !nearly_singular(h))
+        .or_else(|| pinv_solve(h, b))
+}
+
+/// The eigenvalues below this fraction of `H`'s largest, in magnitude, are a null space.
+const PINV_RCOND: f64 = 1e-12;
+
+fn nearly_singular(h: &DMatrix<f64>) -> bool {
+    let ev = h.clone().symmetric_eigen().eigenvalues;
+    let top = crate::sens::num::nan_max_abs(ev.iter().copied());
+    !top.is_finite() || ev.iter().any(|v| v.abs() <= PINV_RCOND * top)
+}
+
+/// `H⁺ b`: the Moore–Penrose solve over the eigenvalues above [`PINV_RCOND`]. `None` when
+/// `H` is not finite.
+fn pinv_solve(h: &DMatrix<f64>, b: &DVector<f64>) -> Option<DVector<f64>> {
+    if !h.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let eig = h.clone().symmetric_eigen();
+    let top = crate::sens::num::nan_max_abs(eig.eigenvalues.iter().copied());
+    let mut w = DVector::zeros(b.len());
+    for (k, &lam) in eig.eigenvalues.iter().enumerate() {
+        if lam.abs() > PINV_RCOND * top {
+            let v = eig.eigenvectors.column(k);
+            w += &v * (v.dot(b) / lam);
+        }
+    }
+    w.iter().all(|v| v.is_finite()).then_some(w)
+}
+
+/// A damped Newton step on the inner objective from `η̂` where `∇_η l = g`, `∇²_η l = H`:
+/// `−Σ_k v_k (v_kᵀg) / max(|λ_k|, floor)`, the spectrum reflected (a negative eigenvalue is
+/// walked downhill, not up) and floored at `PINV_RCOND` of its largest, the same
+/// Levenberg-style safeguard as the inner search's fallback. `None` when `H` or `g` is not
+/// finite.
+fn newton_polish_step(h: &DMatrix<f64>, g: &[f64]) -> Option<Vec<f64>> {
+    if !h.iter().chain(g).all(|v| v.is_finite()) {
+        return None;
+    }
+    let eig = h.clone().symmetric_eigen();
+    let top = crate::sens::num::nan_max_abs(eig.eigenvalues.iter().copied());
+    let floor = (1e-8 * top).max(f64::MIN_POSITIVE);
+    let gv = DVector::from_column_slice(g);
+    let mut step = DVector::zeros(g.len());
+    for (k, &lam) in eig.eigenvalues.iter().enumerate() {
+        let v = eig.eigenvectors.column(k);
+        step -= &v * (v.dot(&gv) / lam.abs().max(floor));
+    }
+    // A trust radius: a reflected Newton step from far off the mode (a flat direction, a
+    // saddle) can be arbitrarily long, and the objective is not quadratic out there.
+    let norm = step.norm();
+    if norm > POLISH_RADIUS {
+        step *= POLISH_RADIUS / norm;
+    }
+    step.iter()
+        .all(|v| v.is_finite())
+        .then(|| step.as_slice().to_vec())
 }
 
 /// `∇_η l(η̂)` by the engine the inner search converged with ([`exact_inner_gradient`]'s
@@ -4497,7 +4685,7 @@ fn run(
     x: &[f64],
     eta: &[f64],
     interaction: bool,
-    eta_dx: Option<&mut ModeOut>,
+    mut eta_dx: Option<&mut ModeOut>,
 ) -> Option<Vec<f64>> {
     let theta = &params.theta;
     let n = eta.len();
@@ -4703,9 +4891,14 @@ fn run(
     }) else {
         if let Some(o) = eta_dx {
             o.mode_system_declined = true;
+            o.polish = polish_proposal(&h, &grad_l);
         }
         return None;
     };
+    if let Some(o) = eta_dx.as_deref_mut().filter(|o| o.polishing) {
+        o.polish = polish_proposal(&h, &grad_l).filter(|(_, gn)| !(*gn <= POLISH_TARGET_TOL));
+        o.objective = Some(kr.value(0));
+    }
 
     // ---- 3. Ψ = F − wᵀ∇_η l and (with the mode response) its rows, from the lanes -----
     // Row `r` is `y_r = Σ_k Z_rk (∇_η l)_k`, `Z` the BSV rows of `H⁻¹`, so
@@ -4852,6 +5045,20 @@ pub(crate) struct ModeOut {
     /// (scope, a failed or non-finite recording) leaves it `false` (#2713). Reset at the
     /// start of every pass; [`Self::clear`] keeps it.
     pub(crate) mode_system_declined: bool,
+    /// What a mode-system decline hands the polish loop in [`adjoint_gradient`]: the damped
+    /// Newton step from the `η̂` the pass declined at, and that `η̂`'s `‖∇_η l‖∞`. Cleared
+    /// at the start of every pass, like `mode_system_declined`.
+    pub(crate) polish: Option<(Vec<f64>, f64)>,
+    /// Set by [`polish_mode`] while it walks to the mode: a pass that is served at an `η̂`
+    /// still above [`POLISH_TARGET_TOL`] (a definite `H` takes no stationarity gate) also
+    /// hands back its step, so the walk goes on to the mode.
+    pub(crate) polishing: bool,
+    /// After a polish ([`polish_mode`]): the `η̂` (in the pass's stacked layout) the returned
+    /// gradient is taken at, and the pass's objective `F` there. The objective the optimizer
+    /// sees must be evaluated at this `η̂`, not at the one the pass was handed, or the
+    /// gradient differentiates a different function.
+    pub(crate) eta_polished: Option<Vec<f64>>,
+    pub(crate) objective: Option<f64>,
 }
 
 impl ModeOut {

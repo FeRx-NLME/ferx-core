@@ -55,8 +55,10 @@
 //! subject**, so that a single `z` mediates every observation. A time-varying NN
 //! input breaks that: there is then a distinct `z^{(e)}` per event, the bias FD
 //! returns `Σ_e ∂NLL/∂z_k^{(e)}`, and the per-event terms are not recoverable
-//! from it. [`NnGradPlan::build`] declines in that case and the caller keeps its
-//! per-θ FD loop — the AGENTS.md "route to FD via a support predicate, and
+//! from it. [`NnGradPlan::build`] declines in that case; the fixed-η score is then
+//! the adjoint's (`exact_theta_score` records the network per event, so a time-varying
+//! input is served exactly, #2786) and the caller's per-θ FD loop runs only when that
+//! adjoint declines — the AGENTS.md "route to FD via a support predicate, and
 //! unit-test the routing" rule. Non-NN θ are never touched by this module, so a
 //! model with no `[covariate_nn]` block is bit-for-bit unaffected.
 //!

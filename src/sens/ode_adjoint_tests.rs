@@ -4211,6 +4211,7 @@ fn laplace_serves_the_prior_precision_anchor_fallback() {
         &TIMES,
         &[0.1, -0.05, 0.2],
     );
+    let _off = super::PolishOff::new();
     let params = &one.default_params;
     let x = pack_params(params);
     let indefinite = |eta: &[f64]| {
@@ -4369,10 +4370,13 @@ fn a_mode_system_decline_is_named() {
             want_dx,
             ..ModeOut::default()
         };
+        // The decline itself, with the polish off.
+        let off = super::PolishOff::new();
         let g =
             subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
+        drop(off);
         assert!(
-            g.is_none() && out.mode_system_declined,
+            g.is_none() && out.mode_system_declined && out.polish.is_some(),
             "want_dx = {want_dx}: off the mode, H indefinite must decline at the mode system"
         );
         let g = subject_adjoint_gradient_and_mode_at(
@@ -7222,9 +7226,18 @@ fn mode_solve_takes_an_indefinite_nonsingular_hessian() {
     let spd = DMatrix::from_row_slice(2, 2, &[2.0, 0.5, 0.5, 1.0]);
     let w = super::mode_solve(&spd, &b, &stationary, || None).expect("definite");
     assert!((&spd * &w - &b).norm() < 1e-14);
-    // Singular: declined, not a non-finite `w`.
+    // Singular at a stationary point: the pseudo-inverse response, not a non-finite `w`.
+    // `H = [[1,1],[1,1]]` has eigenpair (2, (1,1)/sqrt 2), so `H+ b = (1,1)(b0+b1)/4`.
     let sing = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
-    assert!(super::mode_solve(&sing, &b, &stationary, || None).is_none());
+    let w = super::mode_solve(&sing, &b, &stationary, || None).expect("pseudo-inverse");
+    assert!(
+        (w[0] + 0.5).abs() < 1e-14 && (w[1] + 0.5).abs() < 1e-14,
+        "{w}"
+    );
+    // Nearly singular (rcond 1e-14): the plain solve is rounding, the range part is kept.
+    let near = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0 - 1e-14]);
+    let w = super::mode_solve(&near, &b, &stationary, || None).expect("pseudo-inverse");
+    assert!(w.norm() < 1.0, "the null direction is not amplified: {w}");
 }
 
 /// #2093 review (round 2, finding 14): the indefinite branch serves only a stationary `η̂`.
@@ -7322,12 +7335,12 @@ fn mode_solve_judges_a_declined_gate_by_the_inner_search_gradient() {
     calls.set(0);
     assert!(super::mode_solve(&spd, &b, &[1e-2, 0.0], inner([1.0, 1.0])).is_some());
     assert!(super::mode_solve(&indefinite, &b, &[0.0, 5e-5], inner([1.0, 1.0])).is_some());
-    // #2468 review: a singular `H` declines whatever the gradient, so a declined gate there
-    // never pays the inner search's recording.
+    // A singular `H` is judged by the same gate (its pseudo-inverse response is the limit at
+    // a stationary point only): off the mode it declines to the polish.
     let singular = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 1.0, 1.0]);
-    let never = || -> Option<Vec<f64>> { panic!("a singular H must not re-judge the gate") };
-    assert!(super::mode_solve(&singular, &b, &[1e-2, 0.0], never).is_none());
-    assert_eq!(calls.get(), 0);
+    assert!(super::mode_solve(&singular, &b, &[1e-2, 0.0], || None).is_none());
+    assert!(super::mode_solve(&singular, &b, &[1e-2, 0.0], inner([5e-5, 0.0])).is_some());
+    assert!(super::mode_solve(&singular, &b, &[0.0, 0.0], || None).is_some());
 }
 
 /// `inner_search_gradient` is the inner search's gradient: `exact_inner_gradient`, under
@@ -11271,3 +11284,126 @@ fn an_overflowing_eta_does_not_condemn_a_plain_or_a_steady_state_subject() {
         }
     }
 }
+
+/// G11: a pass that finds an indefinite `H` off the mode no longer declines to the held-EBE or
+/// reconverged-FD score: it walks `eta` to the mode with damped Newton steps on its own exact
+/// gradient and `H`, and serves the exact gradient there. Fixture: the grid point of
+/// `a_mode_system_decline_is_named` (exact `H` indefinite). FOCEI is compared with the
+/// reconverged-FD gradient, and FOCEI and Laplace with the gradient from the converged EBE.
+/// Mutation: with the polish budget at 0 the first assertion fails (the pass declines).
+#[test]
+fn an_off_mode_indefinite_point_is_polished_and_served() {
+    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &one,
+        vec![
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = &one.default_params;
+    let x = pack_params(params);
+    let grid = [-2.5, -1.5, -0.75, 0.75, 1.5, 2.5];
+    let mut eta = None;
+    'find: for &a in &grid {
+        for &b in &grid {
+            for &c in &grid {
+                let e = [a, b, c];
+                let h = exact_inner_hessian(&one, &s, params, &e).expect("recorded");
+                if h.cholesky().is_none() {
+                    eta = Some(e);
+                    break 'find;
+                }
+            }
+        }
+    }
+    let eta = eta.expect("a point where the exact H is indefinite");
+    let ebe = find_ebe(&one, &s, params, 500, 1e-11, None, None, 0).eta;
+    let laplace = Objective::Agq {
+        n_agq: 1,
+        exact: true,
+    };
+    for objective in [Objective::Focei, laplace] {
+        let polished = subject_adjoint_gradient(&one, &s, params, &x, &eta, objective)
+            .expect("the off-mode indefinite point is served, not declined");
+        let truth = subject_adjoint_gradient(&one, &s, params, &x, ebe.as_slice(), objective)
+            .expect("served at the EBE");
+        let mut worst = 0.0_f64;
+        for (a, b) in polished.iter().zip(&truth) {
+            assert!(a.is_finite() && b.is_finite());
+            worst = worst.max((a - b).abs() / (1.0 + b.abs())); // nan-ok: finite asserted above
+        }
+        eprintln!("{objective:?}: polished vs EBE gradient, worst rel {worst:.3e}");
+        assert!(worst < GAP_POLISHED_VS_EBE, "{objective:?}: {worst:.3e}");
+    }
+    // FOCEI against the reconverged finite difference of the objective.
+    let polished = subject_adjoint_gradient(&one, &s, params, &x, &eta, Objective::Focei).unwrap();
+    let mut worst = 0.0_f64;
+    for k in 0..x.len() {
+        let fd = |h: f64| {
+            let (mut xp, mut xm) = (x.clone(), x.clone());
+            xp[k] += h;
+            xm[k] -= h;
+            (reconverged_f_for(&one, &s, params, &xp, true)
+                - reconverged_f_for(&one, &s, params, &xm, true))
+                / (2.0 * h)
+        };
+        let rich = (4.0 * fd(1e-3) - fd(2e-3)) / 3.0;
+        assert!(rich.is_finite() && polished[k].is_finite());
+        worst = worst.max((polished[k] - rich).abs() / (1.0 + rich.abs())); // nan-ok: finite asserted above
+    }
+    eprintln!("FOCEI polished vs reconverged FD, worst rel {worst:.3e}");
+    assert!(worst < GAP_POLISHED_VS_FD, "{worst:.3e}");
+    // The mode-system flag is clear when the polish serves the subject.
+    let mut out = ModeOut::default();
+    let pt = PackedPoint::new(params, &x).expect("packed point");
+    let g = subject_adjoint_gradient_and_mode_at(&one, &s, &pt, &eta, Objective::Focei, &mut out);
+    assert!(g.is_some() && !out.mode_system_declined && out.polish.is_none());
+    // The gradient and the objective are of the same `η̂`: the pass hands back the `η̂` it
+    // differentiated at, and the objective it differentiated there is the production
+    // objective at that `η̂` (not at the off-mode one it was handed).
+    let moved = out
+        .eta_polished
+        .clone()
+        .expect("the polished eta is handed back");
+    assert!(
+        moved.iter().zip(&eta).any(|(a, b)| (a - b).abs() > 0.1),
+        "the polish moved eta"
+    );
+    let at = |e: &[f64]| {
+        let e = DVector::from_column_slice(e);
+        let hm = oracle_jacobian(&one, &s, &params.theta, e.as_slice());
+        crate::stats::likelihood::foce_subject_nll_cov(
+            &one,
+            &s,
+            &params.theta,
+            &e,
+            &hm,
+            &params.omega,
+            &params.sigma.values,
+            one.residual_cov_with(&params.residual_correlations, &params.theta),
+            true,
+        )
+    };
+    let f_pass = out.objective.expect("the pass objective");
+    let f_polished = at(&moved);
+    let f_handed = at(&eta);
+    eprintln!(
+        "F pass {f_pass:.12e}, production at polished {f_polished:.12e}, at handed {f_handed:.12e}"
+    );
+    assert!(
+        (f_pass - f_polished).abs() <= 1e-9 * (1.0 + f_polished.abs()),
+        "pass objective {f_pass} vs production at the polished eta {f_polished}"
+    );
+    assert!(
+        (f_handed - f_polished).abs() > 1e-3,
+        "the handed-in eta is a different objective value, so the check discriminates"
+    );
+}
+
+// Measured 9.6e-11 (Laplace; FOCEI 2.0e-11): ten times that.
+const GAP_POLISHED_VS_EBE: f64 = 1e-9;
+// Measured 1.0e-9 (Richardson central FD, reconverged EBE): ten times that.
+const GAP_POLISHED_VS_FD: f64 = 1e-8;

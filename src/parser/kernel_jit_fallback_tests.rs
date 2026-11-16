@@ -1378,3 +1378,117 @@ fn floor_ceil_round_of_a_dependent_value_do_not_fall_back() {
     });
     assert!(forced.warnings.iter().any(|w| w.contains(TOKEN)));
 }
+
+// ---- #2786 G12: steady-state ODE fixtures that once looked like point failures ---------------
+
+/// A three-subject steady-state bolus dose (`II = ii`) into the two-compartment amounts ODE.
+fn ss_bolus_data(ii: f64) -> String {
+    let mut s = String::from("ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,II,SS\n");
+    for (id, dv) in [
+        (1, [4.0, 3.5, 3.0]),
+        (2, [4.2, 3.7, 3.1]),
+        (3, [3.8, 3.4, 2.9]),
+    ] {
+        s += &format!("{id},0,1,1,.,100,0,1,{ii},1\n");
+        for (t, y) in [0.5, 1.0, 2.0].iter().zip(dv) {
+            s += &format!("{id},{t},0,0,{y},0,0,1,0,0\n");
+        }
+    }
+    s
+}
+
+/// The audit's O2 (`fail_here` Point failures in `record_fixed` / the ODE segment's record-time
+/// run) named a short `II` against a slow elimination and a step-limited stiff ODE as the shapes
+/// that might reach them. Measured: neither does. A cycle count past `SS_EQUILIBRATION_CYCLES`
+/// serves as `Found::Iterated`, and a step-limited segment's freeze-padded tail is served through
+/// `LaneHook::tail`, so both fits report no `W_PLAN_FD_FALLBACK`. Pins that route: a regression
+/// that makes either decline at its record-time run puts the token back. (No mutation check
+/// was run: both cases are measured green on the unmodified tree, the sites are not reached.)
+#[test]
+fn short_interval_and_step_limited_steady_states_plan_without_fallback() {
+    for (label, cl, q, ii, extra) in [
+        ("tiny II", "5.0", "2.0", 0.001, ""),
+        (
+            "fast Q, step-limited",
+            "5.0",
+            "50000.0",
+            1.0,
+            "\n  ode_max_steps = 40",
+        ),
+    ] {
+        let model = TWO_CPT_AMOUNTS
+            .replace(
+                "theta TVCL(5.0, 0.1, 100.0)",
+                &format!("theta TVCL({cl}, 1e-6, 100.0)"),
+            )
+            .replace(
+                "theta TVQ(2.0, 0.05, 50.0)",
+                &format!("theta TVQ({q}, 0.05, 1e6)"),
+            )
+            .replace("covariance = false", &format!("covariance = false{extra}"));
+        let (m, p) = from_text(&model, &ss_bolus_data(ii));
+        let o = FitOptions {
+            outer_maxiter: 3,
+            ..opts(EstimationMethod::FoceI)
+        };
+        let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
+        assert!(
+            !fit.warnings.iter().any(|w| w.contains(TOKEN)),
+            "{label}: {:?}",
+            fit.warnings
+        );
+        assert!(fit.ofv.is_finite(), "{label}: {}", fit.ofv);
+    }
+}
+
+const GROWTH: &str = r#"[data]
+  path=data.csv
+[parameters]
+  theta TVK(3.5e-6, 1e-8, 1e-3)
+  omega ETA_K ~ 0.01
+  sigma PROP_ERR ~ 0.2
+[individual_parameters]
+  K = TVK * exp(ETA_K)
+[structural_model]
+  ode(obs_cmt=A, states=[A])
+[odes]
+  d/dt(A) = (K * 1000000.0) * A
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method     = focei
+  maxiter    = 0
+  covariance = false
+"#;
+
+/// The audit's O3: a state of ~1e304 (the #1204 repro's scale) is a point the VALUE path repels
+/// before any derivative exists: a Gaussian residual variance `(σ·f)²` overflows from `f ≈ 1e154`,
+/// so the subject scores the `2e20` sentinel and the exact gradient is declined. No
+/// `W_PLAN_FD_FALLBACK`, and the outer step backtracks (the fit stays at its start with
+/// `W_NO_FEASIBLE_EVAL`). Pins that the plan path agrees with the value path at that point.
+#[test]
+fn an_overflowing_growth_state_is_repelled_not_sent_to_finite_differences() {
+    let mut data = String::from("ID,TIME,EVID,MDV,DV,AMT,RATE,CMT\n");
+    for id in 1..=3 {
+        data +=
+            &format!("{id},0,1,1,.,1,0,1\n{id},100,0,0,1e150,0,0,1\n{id},200,0,0,1e300,0,0,1\n");
+    }
+    let (m, p) = from_text(GROWTH, &data);
+    let o = FitOptions {
+        outer_maxiter: 3,
+        ..opts(EstimationMethod::FoceI)
+    };
+    let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");
+    assert!(
+        !fit.warnings.iter().any(|w| w.contains(TOKEN)),
+        "{:?}",
+        fit.warnings
+    );
+    assert!(
+        fit.warnings
+            .iter()
+            .any(|w| w.contains("W_NO_FEASIBLE_EVAL")),
+        "every trial is repelled: {:?}",
+        fit.warnings
+    );
+}
