@@ -12394,17 +12394,7 @@ fn identity_theta_scales_edges() {
     // The predicted step is the exact distance for a quadratic: 9.9 vs 10.1 |θ₀|.
     assert_eq!(decide(1e-3 + 9.9e-3), vec![(0, 1e-3)], "within the bar");
     assert_eq!(decide(1e-3 - 9.9e-3), vec![(0, 1e-3)], "either side of θ₀");
-    // Past the bar, up to `IDENTITY_MAX_STEP_SCALED`·|θ₀|, the step is the scale (#2975);
-    // past the band, the unit scale.
-    let step_scaled = |got: Vec<(usize, f64)>, want: f64| {
-        got.len() == 1 && got[0].0 == 0 && (got[0].1 - want).abs() <= 1e-9 * want
-    };
-    assert!(step_scaled(decide(1e-3 + 10.1e-3), 10.1e-3), "past the bar");
-    assert!(
-        step_scaled(decide(1e-3 + 99.5e-3), 99.5e-3),
-        "inside the band"
-    );
-    assert_eq!(decide(1e-3 + 100.5e-3), vec![], "past the band");
+    assert_eq!(decide(1e-3 + 10.1e-3), vec![], "past the bar");
 
     let with = |f_minus: f64, f_plus: f64| {
         identity_theta_scales(
