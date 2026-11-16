@@ -329,12 +329,16 @@ fn off_mode_eta(model: &CompiledModel, subject: &Subject) -> Vec<f64> {
 /// or counting the structural decline as held.
 #[test]
 fn the_gap_is_the_reconverged_difference() {
-    let (model, analytic, mut declining) = analytic_and_declining();
+    let (model, mut analytic, mut declining) = analytic_and_declining();
+    // A unique id, so only this test's subject has its polish switched off below.
+    analytic.id = "G15_POLISH_OFF".into();
     // The twin's SS infusion every 72 h rather than 24 h: at 24 h its reconverged salvage
     // caps an SS equilibration, whose warning lands in the process-wide sink and fails a
     // concurrently running `fit()` test that accounts for every warning (#1289). Measured:
     // the sink stays empty at 72 h.
     declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, true, 72.0)];
+    // The plans' failure is keyed by the subject's content, so re-key it after the edit.
+    crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&declining);
     let pop = mk_pop(vec![analytic, declining]);
     let params = &model.default_params;
     let opts = focei();
@@ -388,7 +392,11 @@ fn the_gap_is_the_reconverged_difference() {
         (gap, brute)
     };
 
-    let (gap, brute) = at(&off);
+    // With the polish off the pass declines at the mode system: the subject is held.
+    let (gap, brute) = {
+        let _off = crate::sens::ode_provider::adjoint::PolishOffFor::new("G15_POLISH_OFF");
+        at(&off)
+    };
     assert_eq!(
         gap.n_held, 1,
         "the off-mode subject is held, the structural one not"
@@ -401,6 +409,13 @@ fn the_gap_is_the_reconverged_difference() {
         "subset {} vs brute force {brute}",
         gap.gap
     );
+
+    // G15: with the polish on, the same far corner is walked to the mode and served: nothing is
+    // held and the gap is exactly zero (this point sat on a saddle region where `‖∇l‖` grows
+    // along the descent direction, so the gradient-norm line search used to give it up).
+    let (gap, brute) = at(&off);
+    assert_eq!(gap.n_held, 0, "the polish serves the off-mode subject");
+    assert_eq!((gap.gap, brute), (0.0, 0.0));
 
     let (gap, brute) = at(&[0.0; 3]);
     assert_eq!(gap.n_held, 0, "at a served eta nothing is held");
@@ -446,4 +461,103 @@ fn an_unconverged_gradient_fit_carries_the_report() {
             );
         }
     }
+}
+
+/// G14: a subject whose gradient pass polished an off-mode `η̂` to the mode has that `η̂` (and its
+/// `H = ∂f/∂η`) adopted into the EBE store, so the next objective is evaluated where the
+/// gradient differentiates. The objective at the stored pair equals the objective at the
+/// converged EBE; at the handed-in off-mode `η̂` it is a different number (the discriminator).
+/// Mutation: drop the `adopt_polished_modes` write (or its `ehs[i]` line) -> the store keeps the
+/// off-mode `η̂` and the first objective assertion fails.
+#[test]
+fn a_polished_subject_replaces_its_off_mode_eta_and_h_in_the_ebe_store() {
+    use crate::estimation::inner_optimizer::find_ebe;
+    use crate::sens::ode_provider::adjoint::exact_eta_jacobian;
+    let (model, analytic, _) = analytic_and_declining();
+    let pop = mk_pop(vec![analytic]);
+    let params = &model.default_params;
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(params);
+    let opts = focei();
+    let s = &pop.subjects[0];
+    // An off-mode start the polish walks to the mode: the first grid point with an indefinite
+    // exact `H` that the subject's gradient serves (the far corner `[-2.5; 3]` that
+    // `off_mode_eta` returns is not walked to the mode on this model, and stays a decline).
+    let grid = [-0.75, 0.75, -1.5, 1.5, -2.5, 2.5];
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(params, &x).expect("packed");
+    let mut points = Vec::new();
+    for &a in &grid {
+        for &b in &grid {
+            for &c in &grid {
+                points.push(vec![a, b, c]);
+            }
+        }
+    }
+    let off = points
+        .into_iter()
+        .find(|e| {
+            crate::sens::ode_provider::adjoint::exact_inner_hessian(&model, s, params, e)
+                .is_some_and(|h| h.cholesky().is_none())
+                && subject_analytic_outer_gradient_dx(&model, s, &pt, e, true, false)
+                    .2
+                    .is_some()
+        })
+        .expect("an indefinite point the polish serves");
+    let mut ehs = vec![DVector::from_column_slice(&off)];
+    let mut hms = vec![exact_eta_jacobian(&model, s, &params.theta, &off).expect("jacobian")];
+    let mut kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new()];
+    let log = OuterFdDeclineLog::new(1);
+    let (g, _, polished) = population_gradient_sens_mixed_dx(
+        &x,
+        params,
+        &model,
+        &pop,
+        &ehs,
+        &hms,
+        &bounds,
+        &opts,
+        OuterTrial::unknown(),
+        &log,
+        false,
+    );
+    assert!(g.iter().all(|v| v.is_finite()));
+    assert!(log.declined_indices().is_empty(), "served, not declined");
+    assert!(polished[0].is_some(), "the off-mode subject was polished");
+    let nll_at = |e: &DVector<f64>, h: &DMatrix<f64>| {
+        crate::stats::likelihood::foce_subject_nll_cov(
+            &model,
+            s,
+            &params.theta,
+            e,
+            h,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_with(&params.residual_correlations, &params.theta),
+            true,
+        )
+    };
+    let f_off = nll_at(&ehs[0], &hms[0]);
+    adopt_polished_modes(
+        &model,
+        &pop,
+        params,
+        &x,
+        &polished,
+        &mut ehs,
+        &mut hms,
+        &mut kappas,
+    );
+    let ebe = find_ebe(&model, s, params, 500, 1e-11, None, None, 0);
+    let f_mode = nll_at(&ebe.eta, &ebe.h_matrix);
+    let f_store = nll_at(&ehs[0], &hms[0]);
+    eprintln!("objective: off-mode {f_off:.9}, stored {f_store:.9}, converged EBE {f_mode:.9}");
+    assert!(
+        (f_store - f_mode).abs() <= 1e-12 * (1.0 + f_mode.abs()),
+        "stored {f_store} vs mode {f_mode}"
+    );
+    assert!(
+        (f_off - f_mode).abs() > 1e-12 * (1.0 + f_mode.abs()),
+        "the off-mode objective {f_off} differs from the mode's {f_mode}, so the check discriminates"
+    );
 }

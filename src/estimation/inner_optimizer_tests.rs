@@ -284,9 +284,10 @@ fn residual_inner_obs_is_zero_where_inv_mills_underflows() {
             "{far:e}: z={z}, m={m}"
         );
         for y in [near, far] {
-            let (coef, ruv_term) =
-                residual_inner_obs(&model, 1, y, f, sigma, None, ruv_scale, true, cens, None)
-                    .expect("positive variance");
+            let (coef, ruv_term, _) = residual_inner_obs(
+                &model, 1, y, f, sigma, None, ruv_scale, true, cens, None, 0.0,
+            )
+            .expect("positive variance");
             assert!(coef == 0.0, "h·m at y={y:e}, cens={cens}: {coef}");
             assert!(ruv_term == 0.0, "h·z at y={y:e}, cens={cens}: {ruv_term}");
         }
@@ -948,7 +949,7 @@ fn legacy_step(
     n: usize,
     f0: f64,
 ) -> (f64, f64, Option<Vec<f64>>) {
-    match exact_step_verified_by_gradient(obj, grad, x, d, f0, g, None, false) {
+    match exact_step_verified_by_gradient(obj, None, grad, x, d, f0, g, None, false) {
         Verdict::Verified(fc, gc) => (1.0, fc, Some(gc)),
         Verdict::Rejected(g_full) => {
             let (alpha, f) = legacy_line_search(obj, x, d, g, n, f0);
@@ -1247,7 +1248,7 @@ fn line_search_finds_armijo_step_quickly() {
     };
     let mut trial = [0.0];
     let (alpha, f_new) =
-        backtracking_line_search(&counting, &x, &d, &g, f0, &mut trial, false, false);
+        backtracking_line_search(&counting, None, &x, &d, &g, f0, &mut trial, false, false);
     let evals = evals.get();
     assert!(alpha > 0.0, "a descent step must be found");
     let c1 = 1e-4;
@@ -1280,7 +1281,8 @@ fn line_search_rejects_non_descent_direction() {
     let d = [g[0]]; // SAME sign as g → dg = +36 ≥ 0 (ascent)
     let f0 = obj(&x);
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial, false, false);
+    let (alpha, f_new) =
+        backtracking_line_search(&obj, None, &x, &d, &g, f0, &mut trial, false, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1303,13 +1305,13 @@ fn line_search_survives_non_finite_objective() {
     let nan_obj = |_: &[f64]| -> f64 { f64::NAN };
     let mut trial = [0.0];
     let (alpha, f_new) =
-        backtracking_line_search(&nan_obj, &x, &d, &g, f0, &mut trial, false, false);
+        backtracking_line_search(&nan_obj, None, &x, &d, &g, f0, &mut trial, false, false);
     assert_eq!(alpha, 0.0, "a never-finite objective yields no step");
     assert_eq!(f_new, f0, "baseline objective is returned unchanged");
     // +inf trials behave identically (never accepted, never a panic).
     let inf_obj = |_: &[f64]| -> f64 { f64::INFINITY };
     let (alpha, f_new) =
-        backtracking_line_search(&inf_obj, &x, &d, &g, f0, &mut trial, false, false);
+        backtracking_line_search(&inf_obj, None, &x, &d, &g, f0, &mut trial, false, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1325,7 +1327,8 @@ fn line_search_rejects_non_finite_direction() {
     let d = [f64::INFINITY]; // dg = −inf: a non-finite "descent" direction
     let f0 = obj(&x);
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial, false, false);
+    let (alpha, f_new) =
+        backtracking_line_search(&obj, None, &x, &d, &g, f0, &mut trial, false, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1438,6 +1441,7 @@ fn test_ebe_result_converged_flag() {
         h_matrix: nalgebra::DMatrix::identity(2, 2),
         fd_h_redone: false,
         terminal_hessian: None,
+        ipreds: None,
         converged: true,
         used_fallback: false,
         nm_polished: false,
@@ -1677,6 +1681,7 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
+                skip_refused: false,
             },
             h.map(|h| PredictedFrom {
                 mode: &warm,
@@ -1760,6 +1765,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
+                skip_refused: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1790,6 +1796,7 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
+                skip_refused: false,
             },
             true,
             None,
@@ -1869,6 +1876,7 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         init_is_warm: false,
         keep_certified_start: false,
         unseeded_iov_warm: false,
+        skip_refused: false,
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)
@@ -1985,6 +1993,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             h_matrix: nalgebra::DMatrix::identity(1, 1),
             fd_h_redone: false,
             terminal_hessian: None,
+            ipreds: None,
             converged: false, // unconverged
             used_fallback: false,
             nm_polished: false,
@@ -2000,6 +2009,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             h_matrix: nalgebra::DMatrix::identity(1, 1),
             fd_h_redone: false,
             terminal_hessian: None,
+            ipreds: None,
             converged: false, // also unconverged
             used_fallback: true,
             nm_polished: false,
@@ -2036,6 +2046,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
         h_matrix: nalgebra::DMatrix::zeros(1, 1),
         fd_h_redone: false,
         terminal_hessian: None,
+        ipreds: None,
         converged: false,
         used_fallback: false,
         nm_polished: false,
@@ -2106,6 +2117,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -4269,11 +4281,10 @@ mod frozen_ebe_variance {
 }
 
 /// A subject carrying a TTE record on a drug-driven (ODE-accumulated) hazard resolves its
-/// inner η-gradient to **analytic** when the dual walk serves it — the hazard's curves on
-/// the η-dual (`cumhaz_hazard_from_states`) — and to **FD** when it does not: the same subject
-/// under a steady-state dose, which the dual equilibration cannot carry an accumulator
-/// through (#1210). The route the predicate reports is the one that runs. The control is
-/// the same subject without its event record.
+/// inner η-gradient to **analytic**: the hazard's curves on the η-dual
+/// (`cumhaz_hazard_from_states`), off the static walk, or — under a steady-state dose, whose
+/// run-in holds the accumulator (#1210) — off the event-driven walk. The control is the same
+/// subject without its event record.
 #[cfg(feature = "survival")]
 #[test]
 fn an_ode_hazard_subject_resolves_its_inner_gradient_by_the_walks_scope() {
@@ -4338,8 +4349,8 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_by_the_walks_scope() {
     ss.doses = vec![DoseEvent::new(1.0, 100.0, 1, 0.0, true, 12.0)];
     assert_eq!(
         resolve_gradient_method(&model, &ss),
-        InnerGradientMethod::Fd,
-        "under a steady-state dose the hazard's static walk declines, and the route says so"
+        InnerGradientMethod::Analytic,
+        "under a steady-state dose the event-driven walk serves the hazard"
     );
 }
 
@@ -4423,6 +4434,8 @@ fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
     let mut ss = DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0);
     ss.rate_mode = RateMode::Fixed;
     c.doses = vec![ss];
+    // Every plan of `c` fails: no regular-path shape declines since #2786.
+    crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&c);
     let theta = &tte_model.default_params.theta;
     let zeros = [0.0];
     assert_eq!(subject_inner_fd_reason(&tte_model, &a, theta, &zeros), None);
@@ -4433,7 +4446,7 @@ fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
     assert_eq!(
         subject_inner_fd_reason(&tte_model, &c, theta, &zeros),
         Some(InnerFdReason::Shape),
-        "fixture precondition: the SS infusion under a lag is a shape decline"
+        "fixture precondition: a subject whose plans fail is a shape decline"
     );
 
     let warn = |subjects: Vec<Subject>| {
@@ -4824,6 +4837,77 @@ fn gradient_fd_keeps_the_inner_search_and_h_off_the_exact_routes() {
         gap < 1e-4,
         "the FD H must still be the same matrix: gap {gap:.2e}"
     );
+}
+
+/// An SDE subject's inner search runs on the per-row assembler, which reads the EKF variance
+/// rows off the subject's plan: every step on the analytic route, none on the kernel's
+/// fallback or on finite differences, and no plan failure (`W_PLAN_FD_FALLBACK` counts none).
+/// The seed's fused first gradient is that same gradient. Dies when `analytic_inner_grad_supported`
+/// declines the model again (the steps move to the kernel route) or when the seed or the
+/// assembler drops the variance rows (the seed's gradient parts from the assembler's).
+#[test]
+fn sde_inner_search_runs_on_the_per_row_assembler() {
+    use std::path::Path;
+    let model =
+        crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin_sde.ferx"))
+            .expect("warfarin_sde parses");
+    let pop = crate::read_nonmem_csv(Path::new("data/warfarin_sde.csv"), None, None)
+        .expect("warfarin_sde data loads");
+    let subj = &pop.subjects[0];
+    let params = model.default_params.clone();
+    assert!(model.is_sde());
+    INNER_AGRAD_ROUTE.with(|c| c.set((0, 0, 0)));
+    let ebe = find_ebe(&model, subj, &params, 200, 1e-8, None, None, 0);
+    let (analytic, exact, fd) = INNER_AGRAD_ROUTE.with(|c| c.get());
+    assert!(
+        ebe.nll.is_finite() && ebe.converged,
+        "{} {}",
+        ebe.nll,
+        ebe.converged
+    );
+    assert!(
+        analytic > 0 && exact == 0 && fd == 0,
+        "{analytic} analytic / {exact} exact / {fd} FD steps"
+    );
+    assert!(
+        crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failures(
+            &model,
+            std::slice::from_ref(subj)
+        )
+        .is_none(),
+        "a plan failed"
+    );
+    let eta = [0.08, -0.06, 0.1];
+    let keys = model.error_spec.obs_keys(subj);
+    let (_, seed_g) = analytic_inner_seed_hessian(
+        &model,
+        subj,
+        &params,
+        &eta,
+        None,
+        None,
+        keys.as_ref(),
+        &mut Vec::new(),
+        false,
+        None,
+    )
+    .expect("the seed serves an SDE subject");
+    let seed_g = seed_g.expect("the light seed fuses the first gradient");
+    let g = analytic_eta_nll_gradient(
+        &model,
+        subj,
+        &params.theta,
+        &eta,
+        &params.omega,
+        &params.sigma.values,
+    )
+    .expect("served");
+    for (a, b) in seed_g.iter().zip(&g) {
+        assert!(
+            (a - b).abs() <= 1e-12 * (1.0 + b.abs()),
+            "seed {a} vs assembler {b}"
+        );
+    }
 }
 
 /// A cold start on a steep objective takes a bounded first step (`cap_curvature_free_step`).
@@ -5418,6 +5502,7 @@ fn choose_step_takes_each_arm() {
         let mut buf = [0.0];
         choose_step(
             &obj,
+            None,
             &grad,
             &[x0],
             &[d],
@@ -5986,7 +6071,7 @@ mod weighted_dense_residual_inner {
             } else {
                 assert_eq!(label, GradientMethodKind::Analytic, "{cell}");
                 assert!(
-                    banner.starts_with("analytic (Dual2)  [requested: auto]"),
+                    banner.starts_with("analytic  [requested: auto]"),
                     "{cell}: {banner}"
                 );
                 assert!(
@@ -6920,6 +7005,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
         let exit = if dense {
             dense_bfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -6934,6 +7020,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
         } else {
             lbfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -6983,6 +7070,7 @@ fn inner_drivers_do_not_call_a_moving_gradient_stuck() {
             let exit = if dense {
                 dense_bfgs_run(
                     &obj,
+                    None,
                     &grad,
                     &mut x,
                     2,
@@ -6997,6 +7085,7 @@ fn inner_drivers_do_not_call_a_moving_gradient_stuck() {
             } else {
                 lbfgs_run(
                     &obj,
+                    None,
                     &grad,
                     &mut x,
                     2,
@@ -7035,6 +7124,7 @@ fn inner_drivers_do_not_call_a_moving_iterate_stuck() {
         let exit = if dense {
             dense_bfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -7049,6 +7139,7 @@ fn inner_drivers_do_not_call_a_moving_iterate_stuck() {
         } else {
             lbfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -7085,6 +7176,7 @@ fn inner_drivers_do_not_call_a_cumulative_drift_stuck() {
         let exit = if dense {
             dense_bfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -7099,6 +7191,7 @@ fn inner_drivers_do_not_call_a_cumulative_drift_stuck() {
         } else {
             lbfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -7342,6 +7435,7 @@ fn an_unusable_predicted_start_or_end_takes_the_mode() {
             h_matrix: DMatrix::zeros(0, 2),
             fd_h_redone: false,
             terminal_hessian: None,
+            ipreds: None,
             converged: false,
             used_fallback: true,
             nm_polished: false,
@@ -7543,6 +7637,291 @@ fn a_carried_exact_seed_replaces_the_fresh_one_and_reaches_the_same_mode() {
     );
 }
 
+/// Value/gradient fusion: the value [`analytic_eta_nll_value_gradient_with_schedule`] scores off
+/// the recorder's predictions is the objective's own value, and its gradient the plain
+/// gradient's, bit for bit — the line search compares one with the other, so a rounding gap
+/// between the two sources would be read as a step's gain. The worst relative gap is printed
+/// (`--nocapture`) per model class; the bound is the measured gap with headroom.
+#[test]
+fn fused_value_is_the_native_objective_value() {
+    use std::path::Path;
+    // (model, data, bound): closed form and a nonlinear (Michaelis-Menten) ODE.
+    let cases = [
+        ("examples/warfarin.ferx", "data/warfarin.csv", 1e-12),
+        ("examples/two_cpt_iv_ode.ferx", "data/two_cpt_iv.csv", 1e-12),
+        ("examples/mm_oral.ferx", "data/mm_oral.csv", 1e-6),
+        ("examples/mm_iv.ferx", "data/mm_iv.csv", 1e-6),
+    ];
+    for (mf, df, bound) in cases {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+        let pop = crate::read_nonmem_csv(Path::new(df), None, None).expect("data");
+        let params = model.default_params.clone();
+        let mut worst = 0.0_f64;
+        let mut n_fused = 0usize;
+        let mut n_bits = 0usize;
+        for subj in pop.subjects.iter().take(6) {
+            for scale in [0.0, 0.3, -0.5] {
+                let eta: Vec<f64> = (0..model.n_eta)
+                    .map(|k| scale * (1.0 + 0.1 * k as f64))
+                    .collect();
+                let keys = model.error_spec.obs_keys(subj);
+                let mult = model.ruv_obs_mult(subj, &params.theta);
+                let mut v = None;
+                let g = analytic_eta_nll_value_gradient_with_schedule(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    None,
+                    mult.as_deref(),
+                    keys.as_ref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(model.n_eta),
+                    &mut DVector::zeros(model.n_eta),
+                    None,
+                    Some(&mut v),
+                )
+                .expect("in scope");
+                let g0 = analytic_eta_nll_gradient(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                )
+                .expect("in scope");
+                assert_eq!(
+                    g.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    g0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "the fused pass must return the plain gradient bit for bit"
+                );
+                let v = v.expect("a plain Gaussian subject is scored");
+                n_fused += 1;
+                let want = individual_nll_into_prepared_with_schedule_frozen(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    &mut pk::EventPkParams::default(),
+                    None,
+                    keys.as_ref(),
+                    mult.as_deref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(eta.len()),
+                    &mut DVector::zeros(eta.len()),
+                    None,
+                );
+                assert!(v.is_finite() && want.is_finite());
+                n_bits += usize::from(v.to_bits() == want.to_bits());
+                let gap = (v - want).abs() / (1.0 + want.abs());
+                assert!(gap.is_finite());
+                worst = worst.max(gap); // nan-ok: gap asserted finite above
+            }
+        }
+        eprintln!(
+            "fused value vs native objective, {mf}: {n_fused} points ({n_bits} bit-equal), worst relative gap {worst:.3e}"
+        );
+        assert!(
+            worst < bound,
+            "{mf}: fused value gap {worst:.3e} >= {bound:.0e}"
+        );
+        // The inner solve memoises this value next to native ones (`obj`'s memo), so the line
+        // search compares one engine's values only if they are bit-equal. Measured on Linux
+        // x86_64: every point of all four classes (closed form, linear ODE, nonlinear ODE
+        // oral and IV) is bit-equal at the gradient pass's first-order layout.
+        assert_eq!(
+            n_bits, n_fused,
+            "{mf}: the memoised fused value must be bit-equal"
+        );
+    }
+}
+
+/// The objective memo of one inner solve is one engine's values. The gradient pass's fused value
+/// ([`analytic_eta_nll_value_gradient_with_schedule`]) is the native objective to ~1e-15 on an ODE
+/// objective but not bit for bit (measured: 69 of 600 points over mm thetas x1..x10, worst
+/// relative gap 2e-15; `x3` and `x10` take the Rosenbrock stepper), so `find_ebe_solve` puts it in
+/// the memo for a closed-form objective only. Both sides of that gate in one test: an ODE
+/// subject at stiff thetas leaves the memo untouched by the plan, a closed-form one fills it.
+#[test]
+fn ode_objective_memo_holds_native_values_only_at_stiff_points() {
+    use std::path::Path;
+    let puts = |mf: &str, df: &str, scales: &[f64]| {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+        let pop = crate::read_nonmem_csv(Path::new(df), None, None).expect("data");
+        let before = MEMO_PLAN_PUTS.with(|c| c.get());
+        for &ts in scales {
+            let mut params = model.default_params.clone();
+            for (k, th) in params.theta.iter_mut().enumerate() {
+                *th *= if k % 2 == 0 { ts } else { 1.0 / ts };
+            }
+            for subj in pop.subjects.iter().take(8) {
+                let _ = find_ebe(&model, subj, &params, 500, 1e-8, None, None, 0);
+            }
+        }
+        MEMO_PLAN_PUTS.with(|c| c.get()) - before
+    };
+    let ode = puts(
+        "examples/mm_oral.ferx",
+        "data/mm_oral.csv",
+        &[1.0, 3.0, 10.0],
+    );
+    let closed = puts("examples/warfarin.ferx", "data/warfarin.csv", &[1.0]);
+    assert_eq!(ode, 0, "an ODE objective's memo took a plan value");
+    assert!(
+        closed > 0,
+        "the closed-form route stopped memoising the fused value"
+    );
+}
+
+/// A lagged closed-form model's plan value is up to 5 ulp off the native walk
+/// (`plan_value_bit_equal`), so the memo must not hold it: no fused value of an ALAG model is put
+/// in the objective memo, and the lag-free control of the same shape still is (both sides of the
+/// one predicate in one test).
+#[test]
+fn lagged_closed_form_memo_holds_native_values_only() {
+    use std::path::Path;
+    let puts = |mf: &str| {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_oral_lagtime.csv"), None, None)
+            .expect("data");
+        let (b0, b1) = (
+            MEMO_PLAN_PUTS.with(|c| c.get()),
+            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get()),
+        );
+        for subj in pop.subjects.iter().take(8) {
+            let _ = find_ebe(
+                &model,
+                subj,
+                &model.default_params,
+                500,
+                1e-8,
+                None,
+                None,
+                0,
+            );
+        }
+        (
+            MEMO_PLAN_PUTS.with(|c| c.get()) - b0,
+            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get()) - b1,
+        )
+    };
+    let lagged = puts("examples/oral_with_lagtime.ferx");
+    assert_eq!(lagged, (0, 0), "a lagged model's memo took a plan value");
+    let control = puts("examples/warfarin.ferx");
+    assert!(control.0 > 0, "the lag-free closed form stopped memoising");
+}
+
+/// The effective model is decided at each evaluation, not once per solve: a transit solve that
+/// starts in the closed form's domain and crosses into its ODE twin (the #1521 fixture) must put
+/// no fused value in the memo at an ODE-twin point, where plan and native integrations differ.
+#[test]
+fn memo_holds_no_plan_value_once_a_solve_crosses_into_the_ode_twin() {
+    let subject = flip_flop_transit_subject();
+    for tvcl in [4.0_f64, 4.5] {
+        let m = flip_flop_transit_model(tvcl, 110.0, 24.0, 0.0);
+        let p = m.default_params.clone();
+        let b = MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get());
+        let res = find_ebe(&m, &subject, &p, 200, 1e-6, None, None, 0);
+        // The straddle: the solve starts in the closed form and ends in the twin.
+        assert!(!crate::pk::absorption_flip_flop_at(
+            &m,
+            &subject,
+            &p.theta,
+            &vec![0.0; m.n_eta]
+        ));
+        assert!(crate::pk::absorption_flip_flop_at(
+            &m,
+            &subject,
+            &p.theta,
+            res.eta.as_slice()
+        ));
+        assert_eq!(
+            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get()) - b,
+            0,
+            "TVCL = {tvcl}: a plan value was memoised at an ODE-twin point"
+        );
+    }
+}
+
+/// The size of what the gate above avoids: at stiff thetas the plan's value differs from the
+/// native objective in the last bits only (measured worst 2e-15 relative; bound with headroom).
+#[test]
+fn fused_value_gap_to_native_at_stiff_points_is_last_bits() {
+    use std::path::Path;
+    let (mf, df) = ("examples/mm_oral.ferx", "data/mm_oral.csv");
+    let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+    let pop = crate::read_nonmem_csv(Path::new(df), None, None).expect("data");
+    let (mut n, mut n_bad) = (0usize, 0usize);
+    let mut worst = 0.0_f64;
+    for ts in [1.0, 3.0, 10.0, 0.3, 0.1] {
+        let mut params = model.default_params.clone();
+        for (k, th) in params.theta.iter_mut().enumerate() {
+            *th *= if k % 2 == 0 { ts } else { 1.0 / ts };
+        }
+        for subj in pop.subjects.iter().take(20) {
+            for scale in [0.0, 0.3, -0.5, 1.0, -1.5, 2.5] {
+                let eta: Vec<f64> = (0..model.n_eta)
+                    .map(|k| scale * (1.0 + 0.1 * k as f64))
+                    .collect();
+                let keys = model.error_spec.obs_keys(subj);
+                let mult = model.ruv_obs_mult(subj, &params.theta);
+                let mut v = None;
+                analytic_eta_nll_value_gradient_with_schedule(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    None,
+                    mult.as_deref(),
+                    keys.as_ref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(model.n_eta),
+                    &mut DVector::zeros(model.n_eta),
+                    None,
+                    Some(&mut v),
+                )
+                .expect("in scope");
+                let Some(v) = v else { continue };
+                let want = individual_nll_into_prepared_with_schedule_frozen(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    &mut pk::EventPkParams::default(),
+                    None,
+                    keys.as_ref(),
+                    mult.as_deref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(eta.len()),
+                    &mut DVector::zeros(eta.len()),
+                    None,
+                );
+                assert!(v.is_finite() && want.is_finite());
+                n += 1;
+                n_bad += usize::from(v.to_bits() != want.to_bits());
+                let gap = (v - want).abs() / (1.0 + want.abs());
+                assert!(gap.is_finite());
+                worst = worst.max(gap); // nan-ok: gap asserted finite above
+            }
+        }
+    }
+    eprintln!("{n} points, {n_bad} differ in bits, worst relative gap {worst:.3e}");
+    assert!(n > 0 && worst < 1e-12, "fused value gap {worst:.3e}");
+}
+
 /// #2709: [`GuardStop`] counts exactly what the end-of-pass [`InnerLoopStats`] counts, and
 /// stops at exactly the count `outer_optimizer::ebe_guard_rejects` rejects on. Each case is
 /// one input that flips the answer from its neighbour.
@@ -7574,6 +7953,7 @@ mod guard_stop {
             hard_reject,
             screen_moved: false,
             twin_moved: false,
+            ipreds: None,
         }
     }
 
@@ -7664,4 +8044,80 @@ mod guard_stop {
             }
         }
     }
+}
+
+/// `FERX_TIME_GRADIENTS` is read per fit, not once per process: a second fit in one session
+/// follows the variable's value then (the first printed timings, the second's counters stayed
+/// zero because the span flag was cached). Mutation: cache the flag in a `OnceLock` again ->
+/// the second `arm` does not turn timing off / on.
+#[test]
+fn gradient_timing_follows_each_fits_reading_of_the_variable() {
+    let t = GradientTimings::new();
+    assert!(t.start().is_none(), "off until a fit arms it");
+    assert!(t.arm(Some("1")));
+    assert!(t.start().is_some());
+    // The next fit reads the variable unset: no spans.
+    assert!(!t.arm(None));
+    assert!(t.start().is_none());
+    // And set again, in either spelling.
+    assert!(t.arm(Some("TRUE")));
+    assert!(t.start().is_some());
+    assert!(!t.arm(Some("0")));
+    assert!(t.start().is_none());
+}
+
+/// The mode's predictions are handed back bit for bit from the one walk kept per solve, also
+/// where the search's last walk was another point (a probe beside the mode), and a solve of an
+/// ODE model holds one entry however many points it visited. Mutation: drop the kept walk's
+/// read-back at the end of the solve -> `ipreds` is `None` for the solves counted below.
+#[test]
+fn the_kept_walk_returns_the_modes_predictions_bit_for_bit() {
+    use std::path::Path;
+    let model = crate::parser::model_parser::parse_model_file(Path::new("examples/mm_oral.ferx"))
+        .expect("model");
+    let pop = crate::read_nonmem_csv(Path::new("data/mm_oral.csv"), None, None).expect("data");
+    let params = model.default_params.clone();
+    let before = BEST_WALK_RESTORES.with(|c| c.get());
+    let mut n_some = 0;
+    for subj in pop.subjects.iter().take(8) {
+        let r = find_ebe(&model, subj, &params, 500, 1e-8, None, None, 0);
+        let Some(ip) = r.ipreds.as_ref() else {
+            continue;
+        };
+        n_some += 1;
+        let eta: Vec<f64> = r.eta.iter().copied().collect();
+        let keys = model.error_spec.obs_keys(subj);
+        let mult = model.ruv_obs_mult(subj, &params.theta);
+        let mut want = Vec::new();
+        let _ = individual_nll_into_prepared_with_schedule_frozen(
+            &model,
+            subj,
+            &params.theta,
+            &eta,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_at(&params),
+            &mut pk::EventPkParams::default(),
+            None,
+            keys.as_ref(),
+            mult.as_deref(),
+            &mut want,
+            &mut DVector::zeros(eta.len()),
+            &mut DVector::zeros(eta.len()),
+            None,
+        );
+        assert_eq!(
+            ip.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "subject {}: the mode's predictions",
+            subj.id
+        );
+    }
+    let restored = BEST_WALK_RESTORES.with(|c| c.get()) - before;
+    eprintln!("{n_some} solves returned ipreds, {restored} from the kept walk");
+    assert_eq!(n_some, 8, "every ODE solve hands its predictions back");
+    assert!(
+        restored > 0,
+        "fixture: a solve whose last walk was another point"
+    );
 }

@@ -1,5 +1,6 @@
-/// Population pooling: aggregate per-subject NCA estimates to geometric means.
 use super::nca::SubjectNca;
+/// Population pooling: aggregate per-subject NCA estimates to geometric means.
+use crate::cold_sort::ColdSort;
 
 /// Population-level NCA summary (geometric means across subjects).
 #[derive(Debug, Clone)]
@@ -53,7 +54,7 @@ pub fn pool_nca(subjects: &[SubjectNca]) -> PopNca {
         .map(|s| s.tmax)
         .filter(|t| t.is_finite())
         .collect();
-    tmaxes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    tmaxes.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap());
     let tmax_median = median_f64(&tmaxes);
 
     // Median lag time — use median rather than geomean because tlag is often a
@@ -65,7 +66,7 @@ pub fn pool_nca(subjects: &[SubjectNca]) -> PopNca {
             .filter_map(|s| s.tlag)
             .filter(|&t| t > 0.0 && t.is_finite())
             .collect();
-        tlags.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        tlags.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap());
         if tlags.is_empty() {
             None
         } else {

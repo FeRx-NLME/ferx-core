@@ -321,7 +321,7 @@ fn resolve_auto_picks_nlopt_lbfgs_when_analytic() {
     // available, so `auto` resolves to the gradient-based NLopt L-BFGS (#490).
     let m = test_helpers::parsed_analytical_model(GradientMethod::Auto);
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&m, true),
+        Optimizer::Auto.resolve_auto(&m),
         Optimizer::NloptLbfgs,
         "analytic-gradient model should resolve auto → nlopt_lbfgs"
     );
@@ -335,7 +335,7 @@ fn resolve_auto_picks_bobyqa_when_fd_only() {
     let forced_fd = test_helpers::analytical_model(GradientMethod::Fd);
     for m in [&ode, &forced_fd] {
         assert_eq!(
-            Optimizer::Auto.resolve_auto(m, true),
+            Optimizer::Auto.resolve_auto(m),
             Optimizer::Bobyqa,
             "FD-only model should resolve auto → bobyqa"
         );
@@ -353,12 +353,12 @@ fn resolve_auto_analytic_for_custom_magnitude_both_loops() {
     assert!(m.has_custom_ruv_magnitude());
     assert!(crate::sens::provider::analytic_outer_gradient_available(&m));
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&m, false),
+        Optimizer::Auto.resolve_auto(&m),
         Optimizer::NloptLbfgs,
         "FOCE + custom magnitude now has the analytic gradient"
     );
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&m, true),
+        Optimizer::Auto.resolve_auto(&m),
         Optimizer::NloptLbfgs,
         "FOCEI + custom magnitude has the analytic gradient"
     );
@@ -377,7 +377,7 @@ fn resolve_auto_is_identity_for_concrete_optimizers() {
         Optimizer::Bobyqa,
         Optimizer::TrustRegion,
     ] {
-        assert_eq!(opt.resolve_auto(&m, true), opt);
+        assert_eq!(opt.resolve_auto(&m), opt);
     }
 }
 
@@ -2214,17 +2214,19 @@ fn dose_cmt_accessors_resolve_cmt_zero_to_the_default_compartment() {
     }
 }
 
-/// `synthetic_cycle_dose()` (#912/#419) repositions a dose to a single SS cycle's
+/// `ss_cycle_doses()` (#912/#419) repositions a dose to a single SS cycle's
 /// origin — `time = 0`, `ss`/`ii` cleared — while preserving the compartment and
 /// the bioavailability-reshaped `(rate, duration)` that a bare `DoseEvent::new`
 /// would recompute and drop. It is the replacement for the `..dose.clone()`
 /// struct-update the now-private `cmt` field forbids outside this module.
 #[test]
-fn synthetic_cycle_dose_preserves_shape_and_clears_steady_state() {
+fn ss_cycle_doses_preserve_shape_and_clear_steady_state() {
     // An SS infusion into compartment 2, then F-reshaped so (rate, duration) no
     // longer equal the raw amt/rate pair `::new` would derive.
     let dose = DoseEvent::new(5.0, 100.0, 2, 25.0, true, 12.0).with_bioavailable_infusion(0.5);
-    let cyc = dose.synthetic_cycle_dose();
+    let cycle = dose.ss_cycle_doses();
+    assert_eq!(cycle.len(), 1, "no overlap: one window");
+    let cyc = &cycle[0];
 
     // Repositioned to the cycle origin.
     assert_eq!(cyc.time, 0.0);
@@ -2245,9 +2247,22 @@ fn synthetic_cycle_dose_preserves_shape_and_clears_steady_state() {
     // reshaped `Fixed` case above would pass even if they were hard-coded to
     // `Fixed`/`RateDefined`, which is exactly what `DoseEvent::new` would do).
     let modeled = DoseEvent::modeled(5.0, 100.0, 2, true, 12.0, RateMode::ModeledDuration);
-    let mcyc = modeled.synthetic_cycle_dose();
+    let mcyc = &modeled.ss_cycle_doses()[0];
     assert_eq!(mcyc.rate_mode, RateMode::ModeledDuration);
     assert_eq!(mcyc.infusion_def, modeled.infusion_def);
+
+    // Overlapping pulses (`T_inf = 20 = 2.5·II`): the newest over `r = 4`, and the two that
+    // run the whole cycle as one window at twice the rate.
+    let overlap = DoseEvent::new(5.0, 1000.0, 1, 50.0, true, 8.0).ss_cycle_doses();
+    let shape: Vec<(f64, f64, f64)> = overlap
+        .iter()
+        .map(|d| (d.time, d.rate, d.duration))
+        .collect();
+    assert_eq!(shape, vec![(0.0, 50.0, 4.0), (0.0, 100.0, 8.0)]);
+    // Exactly `2·II`: `r = II`, one earlier pulse.
+    let edge = DoseEvent::new(5.0, 800.0, 1, 50.0, true, 8.0).ss_cycle_doses();
+    let shape: Vec<(f64, f64)> = edge.iter().map(|d| (d.rate, d.duration)).collect();
+    assert_eq!(shape, vec![(50.0, 8.0), (50.0, 8.0)]);
 }
 
 #[test]
@@ -2427,7 +2442,7 @@ fn dose_event_resolve_rate_repels_a_non_finite_duration_or_rate() {
     //
     // The property that makes the engines repel instead is that the resolved
     // dose's **time** is non-finite: that is what every walk's timeline guard
-    // reads (`timeline_has_non_finite` / `EventSchedule::non_finite_event_time`,
+    // reads (`times_have_non_finite` / `EventSchedule::non_finite_event_time`,
     // and `predict_concentration`'s `t_eff` guard). The `(rate, duration)` pair
     // cannot carry it — `is_real_infusion` demands both finite and positive, so
     // a non-finite pair falls to the bolus branch, which reads only `amt`.
@@ -3558,7 +3573,7 @@ mod theta_block_scale_guards {
         model.gradient_method = crate::types::GradientMethod::Fd;
         assert!(model.free_packed_dim() <= BOBYQA_MAX_DIM);
         assert_eq!(
-            Optimizer::Auto.resolve_auto(&model, true),
+            Optimizer::Auto.resolve_auto(&model),
             Optimizer::Bobyqa,
             "small models must be unaffected by the scale guard"
         );
@@ -3570,10 +3585,7 @@ mod theta_block_scale_guards {
         // resolves to the gradient-based optimizer exactly as it would without
         // the block.
         let model = wide_model(4);
-        assert_eq!(
-            Optimizer::Auto.resolve_auto(&model, true),
-            Optimizer::NloptLbfgs
-        );
+        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::NloptLbfgs);
     }
 
     #[test]
@@ -3582,10 +3594,7 @@ mod theta_block_scale_guards {
         // hundred θ the interpolation set alone is the whole budget.
         let model = wide_model(BOBYQA_MAX_DIM + 10);
         assert!(model.free_packed_dim() > BOBYQA_MAX_DIM);
-        assert_eq!(
-            Optimizer::Auto.resolve_auto(&model, true),
-            Optimizer::NloptLbfgs
-        );
+        assert_eq!(Optimizer::Auto.resolve_auto(&model), Optimizer::NloptLbfgs);
     }
 
     #[test]
@@ -3597,7 +3606,7 @@ mod theta_block_scale_guards {
             Optimizer::Mma,
             Optimizer::TrustRegion,
         ] {
-            assert_eq!(opt.resolve_auto(&model, true), opt);
+            assert_eq!(opt.resolve_auto(&model), opt);
         }
     }
 
@@ -4488,12 +4497,7 @@ mod kappa_correlation_auto_route {
         for m in [&on, &kappa_only, &corr_only] {
             assert!(m.free_packed_dim() <= BOBYQA_MAX_DIM);
             assert!(analytic_outer_gradient_in_scope(m));
-            for interaction in [true, false] {
-                assert_eq!(
-                    Optimizer::Auto.resolve_auto(m, interaction),
-                    Optimizer::NloptLbfgs
-                );
-            }
+            assert_eq!(Optimizer::Auto.resolve_auto(m), Optimizer::NloptLbfgs);
             assert_eq!(
                 Optimizer::Auto.resolve_auto_given_analytic(m, false),
                 Optimizer::Bobyqa

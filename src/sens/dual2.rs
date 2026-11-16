@@ -1,34 +1,256 @@
-//! `Dual2<N>` — a small, explicit forward-mode second-order multivariate dual
-//! number for analytic PK-parameter sensitivities.
+//! `Dual2<N>` — the independent forward-mode second-order dual (value, gradient, full
+//! Hessian over `N` seeded inputs) the tests check the compiled per-subject plans
+//! (`parser::kernel_jit`) against, and the one scalar jet production still needs
+//! (`residual_rd2_corr`, the cov-static fold's bit-exact value arithmetic).
 //!
-//! This is **not** Enzyme / compile-time AD: it is a plain value-plus-jet struct
-//! (value, gradient, Hessian over `N` seeded variables) with hand-written
-//! operator rules. Evaluating a closed-form PK solution generic over `Dual2<N>`
-//! yields `f`, `∂f/∂pkᵢ`, and `∂²f/∂pkᵢ∂pkⱼ` exactly, in one pass, reusing the
-//! solution code instead of hand-deriving each model. It is the
-//! [`crate::sens`] counterpart to the hand-written closed-form derivatives, and
-//! the natural seed of the future num-dual path.
-//!
-//! `N` is the number of differentiated inputs (PK parameters), a small const
-//! (≤ 8: CL, V/V1, Q2, V2, KA, F, Q3, V3). The Hessian is symmetric; rules
-//! maintain that.
-// Indexed loops over the `[f64; N]` grad / `[[f64; N]; N]` hess jets read more
-// clearly than zipped iterators here, and `Div` is defined as `× recip` (the
-// `suspicious_arithmetic_impl` lint is a false positive for that identity).
+//! Every elementary function is `lift2`: `φ(x)` from `φ, φ′, φ″` at the argument, so a
+//! unary rule is one line and the Hessian is always `φ′x″ + φ″ x′⊗x′`.
 #![allow(clippy::needless_range_loop, clippy::suspicious_arithmetic_impl)]
 
-/// `scalar_div(k, d) = k / d` — re-exported from the [`DualMixed`] module so the
-/// `crate::sens::dual2::scalar_div` path (and `Dual2`'s own tests) keep working after
-/// the dual-number rules moved there (#448 review #3).
-pub use super::dual_mixed::scalar_div;
-use super::dual_mixed::DualMixed;
+use std::ops::{Add, Div, Mul, Neg, Sub};
 
-/// `Dual2<N>` is the **square-Hessian** case of [`DualMixed`]: the full `N×N`
-/// Hessian, every seeded input differentiated to second order. Since #448 it is a
-/// type alias, not a second hand-written copy of the dual-number rules — the
-/// rectangular [`DualMixed<NA, N>`](DualMixed) (which drops the IIV-free Hessian
-/// block, #445) is the single source, so the two cannot drift (#448 review #3).
-pub type Dual2<const N: usize> = DualMixed<N, N>;
+#[derive(Clone, Copy, Debug)]
+pub struct Dual2<const N: usize> {
+    pub value: f64,
+    pub grad: [f64; N],
+    pub hess: [[f64; N]; N],
+}
+
+impl<const N: usize> Dual2<N> {
+    pub fn constant(value: f64) -> Self {
+        Dual2 {
+            value,
+            grad: [0.0; N],
+            hess: [[0.0; N]; N],
+        }
+    }
+
+    /// Seed input `i`: `value` with `∂/∂xᵢ = 1`.
+    pub fn var(value: f64, i: usize) -> Self {
+        let mut d = Self::constant(value);
+        d.grad[i] = 1.0;
+        d
+    }
+
+    /// `φ(self)` from `v = φ(x)`, `d1 = φ′(x)`, `d2 = φ″(x)`:
+    /// `u′ = φ′x′`, `u″ = φ′x″ + φ″x′⊗x′`.
+    pub fn lift2(self, v: f64, d1: f64, d2: f64) -> Self {
+        let mut o = Self::constant(v);
+        for i in 0..N {
+            o.grad[i] = d1 * self.grad[i];
+            for c in 0..N {
+                o.hess[i][c] = d1 * self.hess[i][c] + d2 * self.grad[i] * self.grad[c];
+            }
+        }
+        o
+    }
+
+    pub fn exp(self) -> Self {
+        let v = self.value.exp();
+        self.lift2(v, v, v)
+    }
+
+    /// A non-positive argument returns a flat (zero-derivative) value, not `inf`/`NaN`
+    /// from the singular `1/(2√x)` factors.
+    pub fn sqrt(self) -> Self {
+        if !(self.value > 0.0) {
+            return Self::constant(0.0);
+        }
+        let v = self.value.sqrt();
+        self.lift2(v, 0.5 / v, -0.25 / (v * v * v))
+    }
+
+    pub fn cos(self) -> Self {
+        let (s, c) = self.value.sin_cos();
+        self.lift2(c, -s, -c)
+    }
+
+    /// Self-defending at `|x| → 1` (clamp + floor of `1 − x²`).
+    pub fn acos(self) -> Self {
+        let x = self.value;
+        let om = (1.0 - x * x).max(1e-12);
+        let s = om.sqrt();
+        self.lift2(x.clamp(-1.0, 1.0).acos(), -1.0 / s, -x / (om * s))
+    }
+
+    pub fn ln(self) -> Self {
+        let inv = 1.0 / self.value;
+        self.lift2(self.value.ln(), inv, -inv * inv)
+    }
+
+    pub fn ln_gamma(self) -> Self {
+        let x = self.value;
+        let (d1, d2) = (
+            crate::stats::special::digamma(x),
+            crate::stats::special::trigamma(x),
+        );
+        self.lift2(crate::stats::special::ln_gamma(x), d1, d2)
+    }
+
+    /// `self^e`: a constant exponent is the power rule (exact for any base sign with
+    /// integer `n`); otherwise `exp(e·ln(self))` (needs `self.value > 0`).
+    pub fn powd(self, e: Self) -> Self {
+        let const_exp =
+            e.grad.iter().all(|&g| g == 0.0) && e.hess.iter().flatten().all(|&h| h == 0.0);
+        if !const_exp {
+            return (e * self.ln()).exp();
+        }
+        let (n, a) = (e.value, self.value);
+        if a == 0.0 {
+            return Self::constant(a.powf(n));
+        }
+        self.lift2(
+            a.powf(n),
+            n * a.powf(n - 1.0),
+            n * (n - 1.0) * a.powf(n - 2.0),
+        )
+    }
+
+    pub fn abs(self) -> Self {
+        if self.value >= 0.0 {
+            self
+        } else {
+            -self
+        }
+    }
+
+    pub fn inv_logit(self) -> Self {
+        ((-self).exp() + 1.0).recip()
+    }
+
+    pub fn logit(self) -> Self {
+        self.ln() - ((-self) + 1.0).ln()
+    }
+
+    pub fn recip(self) -> Self {
+        let inv = 1.0 / self.value;
+        self.lift2(inv, -inv * inv, 2.0 * inv * inv * inv)
+    }
+
+    /// Bit-for-bit equality of the value and every jet entry.
+    pub(crate) fn same_bits(&self, o: &Self) -> bool {
+        self.value.to_bits() == o.value.to_bits()
+            && self
+                .grad
+                .iter()
+                .zip(&o.grad)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+            && self
+                .hess
+                .iter()
+                .flatten()
+                .zip(o.hess.iter().flatten())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+
+    /// Whether every gradient and Hessian entry is finite (the value is checked apart:
+    /// an overflow reaches the Hessian first, #1204).
+    pub fn jets_finite(self) -> bool {
+        self.grad
+            .iter()
+            .chain(self.hess.iter().flatten())
+            .all(|x| x.is_finite())
+    }
+
+    /// The largest absolute gradient or Hessian entry; `NaN` if any entry is `NaN`.
+    pub fn jet_max_abs(self) -> f64 {
+        self.grad
+            .iter()
+            .chain(self.hess.iter().flatten())
+            .fold(0.0_f64, |m, g| {
+                if g.is_nan() || m.is_nan() {
+                    f64::NAN
+                } else {
+                    m.max(g.abs())
+                }
+            })
+    }
+}
+
+impl<const N: usize> Add for Dual2<N> {
+    type Output = Self;
+    fn add(self, r: Self) -> Self {
+        let mut o = self;
+        o.value += r.value;
+        for i in 0..N {
+            o.grad[i] += r.grad[i];
+            for c in 0..N {
+                o.hess[i][c] += r.hess[i][c];
+            }
+        }
+        o
+    }
+}
+
+impl<const N: usize> Neg for Dual2<N> {
+    type Output = Self;
+    fn neg(self) -> Self {
+        let mut o = self;
+        o.value = -o.value;
+        for i in 0..N {
+            o.grad[i] = -o.grad[i];
+            for c in 0..N {
+                o.hess[i][c] = -o.hess[i][c];
+            }
+        }
+        o
+    }
+}
+
+impl<const N: usize> Sub for Dual2<N> {
+    type Output = Self;
+    fn sub(self, r: Self) -> Self {
+        self + (-r)
+    }
+}
+
+impl<const N: usize> Mul for Dual2<N> {
+    type Output = Self;
+    /// Leibniz: `(ab)ᵢ = a·bᵢ + aᵢ·b`, `(ab)ᵢⱼ = a·bᵢⱼ + aᵢbⱼ + aⱼbᵢ + aᵢⱼ·b`.
+    fn mul(self, r: Self) -> Self {
+        let (a, b) = (self.value, r.value);
+        let mut o = Self::constant(a * b);
+        for i in 0..N {
+            o.grad[i] = a * r.grad[i] + self.grad[i] * b;
+            for c in 0..N {
+                o.hess[i][c] = a * r.hess[i][c]
+                    + self.grad[i] * r.grad[c]
+                    + self.grad[c] * r.grad[i]
+                    + self.hess[i][c] * b;
+            }
+        }
+        o
+    }
+}
+
+impl<const N: usize> Div for Dual2<N> {
+    type Output = Self;
+    fn div(self, r: Self) -> Self {
+        self * r.recip()
+    }
+}
+
+impl<const N: usize> Mul<f64> for Dual2<N> {
+    type Output = Self;
+    fn mul(self, s: f64) -> Self {
+        self * Self::constant(s)
+    }
+}
+
+impl<const N: usize> Add<f64> for Dual2<N> {
+    type Output = Self;
+    fn add(self, s: f64) -> Self {
+        Dual2 {
+            value: self.value + s,
+            ..self
+        }
+    }
+}
+
+/// `s / dual` (scalar numerator).
+pub fn scalar_div<const N: usize>(s: f64, d: Dual2<N>) -> Dual2<N> {
+    d.recip() * s
+}
 
 #[cfg(test)]
 mod tests {

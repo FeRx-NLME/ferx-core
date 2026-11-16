@@ -68,13 +68,13 @@ fn parse(src: &str) -> CompiledModel {
 /// The premise both tests rest on: the model is in analytic outer-gradient scope,
 /// so `Optimizer::resolve_auto` alone picks the gradient-based L-BFGS. If this ever
 /// stops holding, the mixture assertions below turn tautological.
-fn assert_analytic_scope(model: &CompiledModel, interaction: bool) {
+fn assert_analytic_scope(model: &CompiledModel) {
     assert!(
-        crate::sens::provider::analytic_outer_gradient_for_interaction(model, interaction),
-        "fixture must be in analytic outer-gradient scope (interaction = {interaction})"
+        crate::sens::provider::analytic_outer_gradient_available(model),
+        "fixture must be in analytic outer-gradient scope"
     );
     assert_eq!(
-        Optimizer::Auto.resolve_auto(model, interaction),
+        Optimizer::Auto.resolve_auto(model),
         Optimizer::NloptLbfgs,
         "the mixture-blind resolver must pick L-BFGS here, or the pair does not straddle"
     );
@@ -83,7 +83,7 @@ fn assert_analytic_scope(model: &CompiledModel, interaction: bool) {
 /// The helper, both sides of the mixture gate, for both FOCE and FOCEI.
 ///
 /// Mutation that must redden this: building the label from
-/// `options.optimizer.resolve_auto(model, options.interaction)` again (the pre-#1540
+/// `options.optimizer.resolve_auto(model)` again (the pre-#1540
 /// code) — the mixture arm then reads `auto (nlopt_lbfgs)`.
 #[test]
 fn auto_label_follows_the_mixture_downgrade() {
@@ -93,7 +93,7 @@ fn auto_label_follows_the_mixture_downgrade() {
         (EstimationMethod::Foce, false),
         (EstimationMethod::FoceI, true),
     ] {
-        assert_analytic_scope(&model, interaction);
+        assert_analytic_scope(&model);
         let opts = FitOptions {
             method,
             interaction,
@@ -233,7 +233,7 @@ fn fit_reports_auto_bobyqa_for_a_mixture_model() {
         (NO_MIXTURE, "auto (nlopt_lbfgs)"),
     ] {
         let model = parse(src);
-        assert_analytic_scope(&model, true);
+        assert_analytic_scope(&model);
         let result = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
         assert_eq!(
             result.optimizer,

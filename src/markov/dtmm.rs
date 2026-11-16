@@ -93,38 +93,50 @@ fn collect_states(
 /// Whether the declared probabilities `probs` (parallel to `transitions`) define a
 /// stochastic `n_states × n_states` matrix: every one finite and in `[0, 1]`, and every
 /// row's off-diagonals summing to at most 1 (so every stay probability is in `[0, 1]`).
-fn is_stochastic(transitions: &[(usize, usize)], probs: &[f64], n_states: usize) -> bool {
-    let mut row_sum = vec![0.0_f64; n_states];
+fn is_stochastic<T: crate::sens::num::PkNum>(
+    transitions: &[(usize, usize)],
+    probs: &[T],
+    n_states: usize,
+) -> bool {
+    use crate::sens::num::BranchCmp::{Ge, Le};
+    // Through the branch API: a recording type (#2786) guards each verdict.
+    let mut row_sum = vec![T::from_f64(0.0); n_states];
     for (&(j, _), &p) in transitions.iter().zip(probs) {
-        if !p.is_finite() || !(-PROB_TOL..=1.0 + PROB_TOL).contains(&p) {
+        if !p.br_abs_lt(f64::INFINITY)
+            || !p.br_cmp_c(Ge, -PROB_TOL)
+            || !p.br_cmp_c(Le, 1.0 + PROB_TOL)
+        {
             return false;
         }
-        row_sum[j] += p;
+        row_sum[j] = row_sum[j] + p;
     }
-    row_sum.iter().all(|&s| s <= 1.0 + PROB_TOL)
+    row_sum.iter().all(|s| s.br_cmp_c(Le, 1.0 + PROB_TOL))
 }
 
 /// The probability of the observed step `from → to` in a matrix already checked by
 /// [`is_stochastic`]: the declared off-diagonal, or the filled-in stay probability. `None`
 /// when it is `≤ 0` — an observed step the parameters make impossible.
-fn step_probability(
+fn step_probability<T: crate::sens::num::PkNum>(
     transitions: &[(usize, usize)],
-    probs: &[f64],
+    probs: &[T],
     from: usize,
     to: usize,
-) -> Option<f64> {
-    let mut off_sum = 0.0;
-    let mut p_to = 0.0;
+) -> Option<T> {
+    use crate::sens::num::BranchCmp::{Gt, Lt};
+    let one = T::from_f64(1.0);
+    let mut off_sum = T::from_f64(0.0);
+    let mut p_to = T::from_f64(0.0);
     for (&(j, k), &p) in transitions.iter().zip(probs) {
         if j == from {
-            off_sum += p;
+            off_sum = off_sum + p;
             if k == to {
                 p_to = p;
             }
         }
     }
-    let p = if from == to { 1.0 - off_sum } else { p_to };
-    (p > 0.0).then_some(p.min(1.0))
+    let p = if from == to { one - off_sum } else { p_to };
+    p.br_cmp_c(Gt, 0.0)
+        .then(|| T::select_if(Lt, p, one, p, one))
 }
 
 /// Negative DTMM log-likelihood for one subject on one `Dtmm` endpoint. Raw (positive);
@@ -261,11 +273,10 @@ impl crate::survival::SubjectTerm for DtmmTerm<'_> {
                 if probs.len() != transitions.len() {
                     return None;
                 }
-                let vals: Vec<f64> = probs.iter().map(|p| p.val()).collect();
-                if !is_stochastic(transitions, &vals, *n_states) {
+                if !is_stochastic(transitions, &probs, *n_states) {
                     return None;
                 }
-                step_probability(transitions, &vals, from, to)?;
+                step_probability(transitions, &probs, from, to)?;
                 // `P_obs`: the observed off-diagonal, or one minus the row's off-diagonals.
                 let mut p_obs = T::from_f64(if from == to { 1.0 } else { 0.0 });
                 for (&(j, k2), &p) in transitions.iter().zip(&probs) {
@@ -294,15 +305,11 @@ pub(crate) fn dtmm_subject_eta_grad(
     theta: &[f64],
     eta: &[f64],
 ) -> Option<(f64, Vec<f64>)> {
-    let f = crate::survival::FixedTheta {
-        theta,
-        term: &DtmmTerm { model, subject },
-    };
-    if eta.is_empty() {
-        use crate::sens::eta_jets::EtaFunction;
-        return Some((f.eval::<f64>(&[])?, Vec::new()));
-    }
-    crate::survival::eta_gradient_by_bucket(eta, &f)
+    // The subject's compiled term (#2786).
+    use crate::sens::ode_provider::adjoint::terms::{term_gradient_planned, TermKind};
+    let term = DtmmTerm { model, subject };
+    let (q, g) = term_gradient_planned(model, subject, TermKind::Dtmm, &term, theta, eta)?;
+    (q.is_finite() && g.iter().all(|v| v.is_finite())).then_some((q, g))
 }
 
 /// Whether every `Dtmm` endpoint of `model` carries a dual-evaluable probability program,

@@ -23,7 +23,7 @@
 //!   ODE sensitivity provider's event-driven walk, sized on `θ + η` rather
 //!   than on `pk_indices.len()`; the outer gradient now comes from the
 //!   adjoint (`sens::ode_provider::adjoint`), whose only width limit is the
-//!   per-subject random-effect count (`MAX_WIDTH = 24`). This test asserts
+//!   per-subject random-effect count (uncapped). This test asserts
 //!   only that the fit runs and stays finite.
 //!
 //! - **Closed-form analytic path**
@@ -84,7 +84,7 @@
 //! gate. Since #2093 the analytic gradient is the adjoint, whose scope
 //! (`sens::ode_provider::adjoint::model_in_scope`) carries no slot cap; its
 //! only width limit is the per-subject random-effect count
-//! (`subject_width` / `MAX_WIDTH = 24`). Adjoint-vs-FD parity lives in
+//! (`subject_width`, uncapped). Adjoint-vs-FD parity lives in
 //! `src/sens/ode_adjoint_tests.rs`. The closed-form analytic path has no
 //! slot cap either and is exercised here as well.
 

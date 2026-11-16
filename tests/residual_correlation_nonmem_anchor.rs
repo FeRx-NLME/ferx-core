@@ -116,7 +116,7 @@ fn residual_correlation_matches_nonmem_at_fixed_parameters() {
         let r = run(&twin(kind, rho), Some(0), false);
         // `weight = WPSE` × `correlation`: the inner search runs on the exact dense-`R`
         // gradient, and the label says so (#2209).
-        assert_eq!(r.gradient_method_inner, "analytic (Dual2)", "{probe}");
+        assert_eq!(r.gradient_method_inner, "analytic", "{probe}");
         let ofv = r.ofv;
         // Finite first: `f64::max` would discard a NaN and keep the rows that worked.
         assert!(ofv.is_finite(), "{probe}: OFV {ofv}");

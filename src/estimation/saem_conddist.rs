@@ -31,7 +31,6 @@ use crate::types::*;
 use nalgebra::DVector;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use rayon::prelude::*;
 
 /// Seed offset for the conditional-distribution pass so its RNG stream is
 /// reproducible and independent of the SAEM E-step stream (which keys on
@@ -108,11 +107,11 @@ pub fn run_conditional_distribution(
         samples: Vec<Vec<f64>>,
     }
 
-    let results: Vec<SubjResult> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map_init(MhScratch::default, |mh_scratch, (i, subject)| {
+    let results: Vec<SubjResult> = crate::par::map_init(
+        population.subjects.len(),
+        MhScratch::default,
+        |mh_scratch, i| {
+            let subject = &population.subjects[i];
             let mut rng = StdRng::seed_from_u64(master_seed.wrapping_add(i as u64));
             // Same per-subject hoist as the SAEM E-step: the η-independent NLL
             // inputs and the proposal buffers are rebuilt here, not per proposal.
@@ -309,8 +308,8 @@ pub fn run_conditional_distribution(
                 .collect();
 
             SubjResult { mean, sd, samples }
-        })
-        .collect();
+        },
+    );
 
     let cond_mean: Vec<Vec<f64>> = results.iter().map(|r| r.mean.clone()).collect();
     let cond_sd: Vec<Vec<f64>> = results.iter().map(|r| r.sd.clone()).collect();

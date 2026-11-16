@@ -36,6 +36,7 @@
 //! and keeps the interpreter. `sqrt` is translated (#2844): its guard is `apply_unary`'s.
 use super::{apply_binary_in, apply_scalar_in, apply_unary, Bytecode, Op, Statement};
 use crate::sens::num::vm::VmNum;
+use crate::sens::num::NonRecRead;
 use ir::Cc;
 
 /// An instruction operand.
@@ -74,11 +75,38 @@ impl Arith {
 }
 
 /// A unary operation applied to a materialised value.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Unary {
     Exp,
     Ln,
+    /// `PkNum::ln`, unguarded: kernel recordings only. [`Unary::Ln`] is the interpreter's
+    /// `Op::Ln`, floored at `1e-30` (the VM's `guard_floor`).
+    LnRaw,
+    /// Kernel recordings only: `sin`, the polygammas (the derivatives of `LnGamma`), and the
+    /// `k`-th derivative of `exprel(z) = (e^z − 1)/z` (`ode::linear::exprel_derivs`).
+    Sin,
+    Digamma,
+    Trigamma,
+    Tetragamma,
+    ExpRel(u8),
+    /// The `k`-th derivative of a function given by its jet (`JetFn`): kernel recordings only.
+    Jet(crate::sens::num::JetFn, u8),
+    /// The value as a constant (`PkNum::value_only`): kernel recordings only.
+    StopGrad,
+    /// `PkNum::sqrt` as a kernel recording (`kernel_jit`, #2786) emits it: flat at a
+    /// non-positive argument, the value `√x` with zero jets and no `inf·0` for a reverse pass
+    /// to carry (#2892). A negative argument stays `NaN`, as the `f64` prediction has it.
     Sqrt,
+    /// `Op::Sqrt` as the RHS compiler emits it (#2844): the interpreter's own guard, where a
+    /// non-positive argument is the constant `±0` (a zero keeps its sign) or `+0` (negative,
+    /// `NaN`), with zero jets.
+    SqrtRhs,
+    /// `PkNum::inv_logit`, `logit`, `cos`, `acos` (unguarded): kernel recordings only.
+    InvLogit,
+    Logit,
+    Cos,
+    Acos,
+    LnGamma,
     Abs,
     Floor,
     Ceil,
@@ -90,7 +118,22 @@ impl Unary {
         match self {
             Unary::Exp => Op::Exp,
             Unary::Ln => Op::Ln,
-            Unary::Sqrt => Op::Sqrt,
+            Unary::Sqrt | Unary::SqrtRhs => Op::Sqrt,
+            Unary::InvLogit => Op::InvLogit,
+            Unary::Logit => Op::Logit,
+            Unary::Cos => Op::Cos,
+            Unary::Acos
+            | Unary::LnGamma
+            | Unary::LnRaw
+            | Unary::Sin
+            | Unary::Digamma
+            | Unary::Trigamma
+            | Unary::Tetragamma
+            | Unary::ExpRel(_)
+            | Unary::Jet(..)
+            | Unary::StopGrad => {
+                unreachable!("only a kernel recording emits these, never interpreted")
+            }
             Unary::Abs => Op::Abs,
             Unary::Floor => Op::Floor,
             Unary::Ceil => Op::Ceil,
@@ -177,128 +220,238 @@ enum Ins {
 /// A lowered instruction: every operand is an index into the one register file, so an
 /// instruction is a single dispatch. The arithmetic primitive of each arm is the
 /// interpreter's own for that operation and operand form (see the module docs).
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Flat {
+/// A register of a [`Flat`] program: a recording's (#2786) can number past 65k.
+pub(super) type Reg = u32;
+
+/// A field of a [`Flat`] instruction as its [`FlatKey`] holds it: itself, or a literal's bits.
+trait KeyBits: Copy {
+    type Bits: Copy + Eq + std::hash::Hash;
+    fn key_bits(self) -> Self::Bits;
+}
+macro_rules! key_bits_self {
+    ($($t:ty),*) => {$(impl KeyBits for $t {
+        type Bits = $t;
+        #[inline]
+        fn key_bits(self) -> $t {
+            self
+        }
+    })*};
+}
+key_bits_self!(u8, u32, bool, Cc, Unary, crate::sens::num::HostFn);
+impl KeyBits for f64 {
+    type Bits = u64;
+    #[inline]
+    fn key_bits(self) -> u64 {
+        self.to_bits()
+    }
+}
+
+/// Defines [`Flat`] and, from the same variant list, [`FlatKey`]: the instruction with its
+/// literals as bits, which derives the exact content equality and hash the compiled path's
+/// caches key programs on (#2786), with no text rendering.
+macro_rules! flat_enum {
+    ($($(#[$m:meta])* $v:ident { $($f:ident : $t:ty),* $(,)? }),* $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Flat {
+            $($(#[$m])* $v { $($f: $t),* }),*
+        }
+        /// [`Flat`] with literals by their bits (`-0.0` is not `0.0`, a `NaN` is itself).
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum FlatKey {
+            $($v { $($f: <$t as KeyBits>::Bits),* }),*
+        }
+        impl Flat {
+            fn key(&self) -> FlatKey {
+                match *self {
+                    $(Flat::$v { $($f),* } => FlatKey::$v { $($f: $f.key_bits()),* }),*
+                }
+            }
+        }
+    };
+}
+
+flat_enum! {
     /// `r[d] = u[i]` (`0` past `u.len()`, as the binding fills a short `u`).
     LoadState {
-        d: u16,
+        d: Reg,
         i: u32,
     },
     /// `r[d] = params[slot]` (`0` past `params.len()`, as the binding reads it).
     LoadParam {
-        d: u16,
+        d: Reg,
         slot: u32,
     },
-    /// `r[d] = seeds[k]`: the `T`, `TAFD`, `TAD` and `MACHEPS` slots.
+    /// `r[d] = seeds[k]`: the `T`, `TAFD`, `TAD` and `MACHEPS` slots; for a kernel
+    /// recording (#2786), its literal pool.
     LoadSeed {
-        d: u16,
-        k: u8,
+        d: Reg,
+        k: u32,
     },
     /// `r[d] = k(c)`: a literal the interpreter pushes as a dual constant.
     LoadK {
-        d: u16,
+        d: Reg,
         c: f64,
     },
     Add {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     Sub {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     RSub {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     Mul {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     Div {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// `a / b` unguarded — `PkNum`'s division (the forward dual's `div`), which a kernel recording
+    /// (`kernel_jit`, #2786) emits; `Div` is the interpreter's guarded one.
+    DivRaw {
+        d: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// Kernel recordings only (#2786): a host call. `HostArg`s queue its arguments' values in
+    /// order, `Host` runs the analysis on them, and each `HostOut` reads one of its outputs, a
+    /// constant of the computation (no derivative).
+    HostArg {
+        a: Reg,
+    },
+    Host {
+        f: crate::sens::num::HostFn,
+    },
+    HostOut {
+        d: Reg,
+        k: u32,
+    },
+    /// Kernel recordings only (#2786): an ODE segment as a loop call. `LoopArg`s list its
+    /// inputs (the initial state, then the outer values its bodies read), `Loop` names the
+    /// recording's loop `id`, and each `LoopOut` defines one output (a state component at a
+    /// save point). Never inside a chunk: the plan runs the call itself.
+    /// Kernel recordings only (#2786): `r[d] = r[c] ≠ 0 ? r[a] : r[b]` (`c` a condition).
+    Select {
+        d: Reg,
+        c: Reg,
+        a: Reg,
+        b: Reg,
+    },
+    /// Kernel recordings only (#2786, `RecHooks::order_gate`): `r[d] = r[b]` in a compiled
+    /// variant whose derivative order reaches `k`, `r[a]` below it. Resolved per variant
+    /// before lowering (`kernel_jit::resolve_gates`).
+    Gate {
+        d: Reg,
+        a: Reg,
+        b: Reg,
+        k: u8,
+    },
+    LoopArg {
+        a: Reg,
+    },
+    Loop {
+        id: u32,
+    },
+    LoopOut {
+        d: Reg,
+        k: u32,
+    },
+    /// `∂^(i+j) P(a, x) / ∂aⁱ ∂xʲ` (of `Q` when `upper`); `i = j = 0` is [`PkNum::gamma_pq`]
+    /// as one primitive. Only a kernel recording emits it (#2786).
+    GammaPq {
+        d: Reg,
+        a: Reg,
+        x: Reg,
+        upper: bool,
+        i: u8,
+        j: u8,
     },
     AddK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     SubK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     RSubK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     MulK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     /// A division by a literal, through `apply_scalar_in`'s guard.
     DivK {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
         c: f64,
     },
     Pow {
-        d: u16,
-        a: u16,
-        e: u16,
+        d: Reg,
+        a: Reg,
+        e: Reg,
     },
     Unary {
-        d: u16,
+        d: Reg,
         op: Unary,
-        a: u16,
+        a: Reg,
     },
     /// `du[state] = r[a]`.
     Deriv {
         state: u32,
-        a: u16,
+        a: Reg,
     },
     /// `r[d] = k(1)` when `r[a].val() cc r[b].val()`, else `k(0)`: the interpreter's `Cmp*`.
     Cmp {
-        d: u16,
+        d: Reg,
         cc: Cc,
-        a: u16,
-        b: u16,
+        a: Reg,
+        b: Reg,
     },
     /// `r[d] = k(1)` when both values are nonzero (`LogicAnd`).
     And {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     /// `r[d] = k(1)` when either value is nonzero (`LogicOr`).
     Or {
-        d: u16,
-        a: u16,
-        b: u16,
+        d: Reg,
+        a: Reg,
+        b: Reg,
     },
     /// `r[d] = k(1)` when the value is zero (`LogicNot`).
     Not {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
     },
     /// `r[d] = k(1)` unless the value is `NaN` (`IsPresent`).
     Present {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
     },
     /// Continue at `to` (the else arm) when `r[c].val() == 0` (`JumpIfFalse`). The then arm
     /// runs from the next instruction to a [`Flat::Jump`] at `to − 1`, which continues past the
     /// else arm; each arm ends with the [`Flat::Move`]s of its results.
     Branch {
-        c: u16,
+        c: Reg,
         to: u32,
     },
     Jump {
@@ -306,9 +459,23 @@ enum Flat {
     },
     /// `r[d] = r[a]`: an arm's result into the register both arms of an `if` write.
     Move {
-        d: u16,
-        a: u16,
+        d: Reg,
+        a: Reg,
     },
+}
+
+impl std::hash::Hash for Flat {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.key().hash(h)
+    }
+}
+
+impl Flat {
+    /// Equal instruction for instruction, literals bit for bit (`-0.0` is not `0.0`, a `NaN`
+    /// is itself): two programs that are `same` compute the same values.
+    pub(super) fn same(&self, other: &Flat) -> bool {
+        self.key() == other.key()
+    }
 }
 
 /// Where each of the RHS's `vars` slots comes from, as `OdeRhsProgram`'s binding fills it:
@@ -335,7 +502,7 @@ impl RhsLayout<'_> {
             });
         }
         let k = self.seed_slots.iter().position(|&s| s == slot)?;
-        Some(Flat::LoadSeed { d: 0, k: k as u8 })
+        Some(Flat::LoadSeed { d: 0, k: k as u32 })
     }
 }
 
@@ -562,23 +729,16 @@ pub(crate) struct HoistCache {
 #[derive(Clone, Copy)]
 pub(crate) struct NativeF64<'a>(jit::Resolved<'a, (jit::PrepFn, jit::MainFn)>);
 
+/// The native `main` function of [`NativeF64`]: `(u, params, seeds, du, cache)`.
+pub(crate) type NativeMain =
+    unsafe extern "C" fn(*const f64, *const f64, *const f64, *mut f64, *const f64);
+
 impl NativeF64<'_> {
-    /// [`RhsRegProgram::try_native`] at `f64`, bit for bit: `true` when it ran (and wrote
-    /// `du`), `false` with nothing written when a slice is shorter than the program reads.
+    /// The parameter-only values in `cache` for `params`: recomputed unless the key says they
+    /// are these parameters' already. `fits` covers `params`.
     #[inline(always)]
-    pub(crate) fn run(
-        &self,
-        u: &[f64],
-        params: &[f64],
-        seeds: &[f64; 4],
-        du: &mut [f64],
-        cache: &mut HoistCache,
-    ) -> bool {
+    fn fill(&self, params: &[f64], seeds: &[f64; 4], cache: &mut HoistCache) {
         let pair = &self.0;
-        if !pair.fits(u.len(), params.len(), du.len()) {
-            return false;
-        }
-        // `fits` covers every slot the program loads.
         let slots = pair.param_slots();
         let fresh = cache.key.len() == slots.len() + 1
             && slots
@@ -594,9 +754,46 @@ impl NativeF64<'_> {
             cache.key.push(seeds[3].to_bits());
             cache.vals.clear();
             cache.vals.resize(pair.cache_len(), 0.0);
-            // SAFETY: `fits` checked `params`; `cache` holds `cache_len` values.
+            // SAFETY: the caller checked `fits`; `cache` holds `cache_len` values.
             unsafe { pair.prep(params.as_ptr(), seeds.as_ptr(), cache.vals.as_mut_ptr()) };
         }
+    }
+
+    /// The `main` function and its filled cache for a caller that makes many calls at these
+    /// `params` itself ([`Self::run`] without its per-call checks): `None` when a slice of
+    /// `u_len` / `params.len()` / `du_len` is shorter than the program reads. Each call is then
+    /// `main(u, params, seeds, du, cache)`, valid while `params` is unchanged and the cache is
+    /// not refilled for other parameters.
+    pub(crate) fn main_call(
+        &self,
+        (u_len, du_len): (usize, usize),
+        params: &[f64],
+        seeds: &[f64; 4],
+        cache: &mut HoistCache,
+    ) -> Option<(NativeMain, *const f64)> {
+        if !self.0.fits(u_len, params.len(), du_len) {
+            return None;
+        }
+        self.fill(params, seeds, cache);
+        Some((self.0.main_fn(), cache.vals.as_ptr()))
+    }
+
+    /// [`RhsRegProgram::try_native`] at `f64`, bit for bit: `true` when it ran (and wrote
+    /// `du`), `false` with nothing written when a slice is shorter than the program reads.
+    #[inline(always)]
+    pub(crate) fn run(
+        &self,
+        u: &[f64],
+        params: &[f64],
+        seeds: &[f64; 4],
+        du: &mut [f64],
+        cache: &mut HoistCache,
+    ) -> bool {
+        let pair = &self.0;
+        if !pair.fits(u.len(), params.len(), du.len()) {
+            return false;
+        }
+        self.fill(params, seeds, cache);
         // SAFETY: `fits` checked the slices, and the key says `cache` was filled from
         // these parameters.
         unsafe {
@@ -607,6 +804,36 @@ impl NativeF64<'_> {
                 du.as_mut_ptr(),
                 cache.vals.as_ptr(),
             )
+        };
+        true
+    }
+}
+
+/// The `f64` RHS with its forward tangents along `k` directions, one native call
+/// ([`RhsRegProgram::native_tangent`]): every input and output element is `1 + k` lanes, the
+/// value then its `k` tangents.
+#[derive(Clone, Copy)]
+pub(crate) struct NativeTan<'a>(jit::Resolved<'a, jit::RhsFn>, usize);
+
+impl NativeTan<'_> {
+    /// Lanes of one element.
+    pub(crate) fn lanes(&self) -> usize {
+        1 + self.1
+    }
+
+    /// `du` (value and tangents) from `u`, `params` and the four `seeds`, each element
+    /// [`Self::lanes`] long; `false`, nothing written, when a slice is shorter than the
+    /// program reads.
+    pub(crate) fn run(&self, u: &[f64], params: &[f64], seeds: &[f64], du: &mut [f64]) -> bool {
+        let l = self.lanes();
+        if seeds.len() < 4 * l || !self.0.fits(u.len() / l, params.len() / l, du.len() / l) {
+            return false;
+        }
+        // SAFETY: `fits` covers every element the program loads or stores, at `l` lanes each,
+        // and `seeds` holds four elements; `du` is a separate slice.
+        unsafe {
+            self.0
+                .call(u.as_ptr(), params.as_ptr(), seeds.as_ptr(), du.as_mut_ptr())
         };
         true
     }
@@ -711,25 +938,6 @@ impl RhsRegProgram {
         T::LANES.is_some_and(|l| self.jit.as_ref().is_some_and(|j| j.has(l)))
     }
 
-    /// Record the call whole on `T`'s tape (`VmArith::tape_rhs`): `false`, with nothing
-    /// written, when the type or the kernel cannot.
-    #[inline]
-    pub(super) fn try_tape_block<T: VmNum>(
-        &self,
-        u: &[T],
-        params: &[T],
-        seeds: &[T; 4],
-        du: &mut [T],
-    ) -> bool {
-        #[cfg(test)]
-        if RHS_JIT_DISABLED.with(|c| c.get()) {
-            return false;
-        }
-        self.jit
-            .as_ref()
-            .is_some_and(|j| T::tape_rhs(j.kernel(), u, params, seeds, du))
-    }
-
     /// Registers the program uses; [`Self::run`]'s `regs` must hold at least this many.
     pub(super) fn n_regs(&self) -> usize {
         self.n_regs
@@ -750,11 +958,6 @@ impl RhsRegProgram {
         if self.run_native(u, params, seeds, du) {
             return;
         }
-        // A taped call: one tape block whose reverse rule is the compiled reverse pass,
-        // where the type has one, instead of a node per operation.
-        if T::RECORDS_TAPE && self.try_tape_block(u, params, seeds, du) {
-            return;
-        }
         self.exec(&self.code, u, params, seeds, du, &mut regs[..self.n_regs]);
     }
 
@@ -768,15 +971,6 @@ impl RhsRegProgram {
         self.jit.as_ref().is_some_and(|j| j.has(ir::Layout::F64))
     }
 
-    /// Whether the `f64` native function can read slices of these lengths (`u`, `params`) and
-    /// write `ndu` derivatives.
-    pub(super) fn native_f64_fits(&self, nu: usize, np: usize, ndu: usize) -> bool {
-        self.jit
-            .as_ref()
-            .and_then(|j| j.resolve(ir::Layout::F64))
-            .is_some_and(|f| f.fits(nu, np, ndu))
-    }
-
     /// The `f64` native function, resolved once for a caller that runs it many times
     /// (`DirectRhsF64`). `None` where [`Self::has_native_f64`] is `false`.
     pub(super) fn native_f64(&self) -> Option<NativeF64<'_>> {
@@ -788,6 +982,20 @@ impl RhsRegProgram {
             .as_ref()?
             .resolve_hoisted(ir::Layout::F64)
             .map(NativeF64)
+    }
+
+    /// The `f64` RHS over `k` forward tangent directions as one native function (built on
+    /// first use); `None` where there is no native code for it.
+    pub(super) fn native_tangent(&self, k: usize) -> Option<NativeTan<'_>> {
+        #[cfg(test)]
+        if RHS_JIT_DISABLED.with(|c| c.get()) {
+            return None;
+        }
+        let layout = ir::Layout {
+            tan: u8::try_from(k).ok()?,
+            ..ir::Layout::F64
+        };
+        self.jit.as_ref()?.resolve(layout).map(|f| NativeTan(f, k))
     }
 
     /// [`Self::run`] when `T` has a native function, without the register file: `true` when
@@ -804,8 +1012,8 @@ impl RhsRegProgram {
     }
 
     /// [`Self::run`] through the native function when `T` has one (`VmArith::LANES`):
-    /// `f64` and the forward duals, the contiguous ones in place and `DualV` through its
-    /// lanes when no input is on a tape. `false`, with nothing written, otherwise.
+    /// `f64` and the duals with lanes, the contiguous ones in place and the rest through
+    /// their lanes when no input is on a tape. `false`, with nothing written, otherwise.
     #[inline(always)]
     fn run_native<T: VmNum>(&self, u: &[T], params: &[T], seeds: &[T; 4], du: &mut [T]) -> bool {
         let Some(layout) = T::LANES else {
@@ -888,6 +1096,23 @@ impl RhsRegProgram {
         du: &mut [T],
         r: &mut [T],
     ) {
+        self.exec_range(code, 0, code.len(), u, params, seeds, du, r)
+    }
+
+    /// [`Self::exec`] over the instructions `start..end`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn exec_range<T: VmNum>(
+        &self,
+        code: &[Flat],
+        start: usize,
+        end: usize,
+        u: &[T],
+        params: &[T],
+        seeds: &[T; 4],
+        du: &mut [T],
+        r: &mut [T],
+    ) {
         let k = T::from_f64;
         macro_rules! bin {
             ($d:expr, $a:expr, $f:expr) => {{
@@ -897,8 +1122,15 @@ impl RhsRegProgram {
             }};
         }
         let b01 = |c: bool| k(if c { 1.0 } else { 0.0 });
-        let mut pc = 0;
-        while let Some(f) = code.get(pc) {
+        // A recording type (#2786) records a condition as data — the comparisons and their
+        // combinations as selections — and both arms of an `if` on it ([`Self::both_arms`]):
+        // an ODE step evaluates the right-hand side at states where either arm holds.
+        let rec = T::RECORDS_BRANCHES;
+        let (zero, one) = (k(0.0), k(1.0));
+        use crate::sens::num::BranchCmp::{Eq, Ne};
+        let mut pc = start;
+        while pc < end {
+            let f = &code[pc];
             pc += 1;
             match *f {
                 Flat::LoadState { d, i } => {
@@ -930,31 +1162,93 @@ impl RhsRegProgram {
                     let y = r[b as usize];
                     bin!(d, a, |x: &mut T| apply_binary_in(x, Op::Div, &y))
                 }
+                Flat::DivRaw { d, a, b } => {
+                    let y = r[b as usize];
+                    bin!(d, a, |x: &mut T| x.div_in(&y))
+                }
                 Flat::AddK { d, a, c } => bin!(d, a, |x: &mut T| x.add_scalar_in(c)),
                 Flat::SubK { d, a, c } => bin!(d, a, |x: &mut T| x.sub_scalar_in(c)),
                 Flat::RSubK { d, a, c } => bin!(d, a, |x: &mut T| x.rsub_scalar_in(c)),
                 Flat::MulK { d, a, c } => bin!(d, a, |x: &mut T| x.mul_scalar_in(c)),
                 Flat::DivK { d, a, c } => bin!(d, a, |x: &mut T| apply_scalar_in(x, Op::Div, c)),
                 Flat::Pow { d, a, e } => r[d as usize] = r[a as usize].pow(r[e as usize]),
+                Flat::GammaPq {
+                    d,
+                    a,
+                    x,
+                    upper,
+                    i,
+                    j,
+                } => {
+                    debug_assert!(i == 0 && j == 0, "a partial is never interpreted");
+                    r[d as usize] = r[a as usize].gamma_pq(r[x as usize], upper)
+                }
                 Flat::Unary { d, op, a } => r[d as usize] = apply_unary(op.op(), r[a as usize]),
                 Flat::Deriv { state, a } => {
                     if let Some(x) = du.get_mut(state as usize) {
                         *x = r[a as usize];
                     }
                 }
+                Flat::Cmp { d, cc, a, b } if rec => {
+                    r[d as usize] =
+                        T::select_if(cc.branch(), r[a as usize], r[b as usize], one, zero)
+                }
+                Flat::And { d, a, b } if rec => {
+                    let rb = T::select_if(Ne, r[b as usize], zero, one, zero);
+                    r[d as usize] = T::select_if(Ne, r[a as usize], zero, rb, zero)
+                }
+                Flat::Or { d, a, b } if rec => {
+                    let rb = T::select_if(Ne, r[b as usize], zero, one, zero);
+                    r[d as usize] = T::select_if(Ne, r[a as usize], zero, one, rb)
+                }
+                Flat::Not { d, a } if rec => {
+                    r[d as usize] = T::select_if(Eq, r[a as usize], zero, one, zero)
+                }
+                // `x == x` is false exactly for a `NaN`.
+                Flat::Present { d, a } if rec => {
+                    r[d as usize] = T::select_if(Eq, r[a as usize], r[a as usize], one, zero)
+                }
+                // The arms below are for plain types: a recording type's `if rec` arms above take
+                // every one of these ops (`select_if` on the values, recorded as guards).
                 Flat::Cmp { d, cc, a, b } => {
-                    r[d as usize] = b01(cc.holds(r[a as usize].val(), r[b as usize].val()))
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(cc.holds(r[a as usize].plain(), r[b as usize].plain()))
                 }
                 Flat::And { d, a, b } => {
-                    r[d as usize] = b01(r[a as usize].val() != 0.0 && r[b as usize].val() != 0.0)
+                    let (x, y) = (r[a as usize], r[b as usize]);
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(x.plain() != 0.0 && y.plain() != 0.0)
                 }
                 Flat::Or { d, a, b } => {
-                    r[d as usize] = b01(r[a as usize].val() != 0.0 || r[b as usize].val() != 0.0)
+                    let (x, y) = (r[a as usize], r[b as usize]);
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(x.plain() != 0.0 || y.plain() != 0.0)
                 }
-                Flat::Not { d, a } => r[d as usize] = b01(r[a as usize].val() == 0.0),
-                Flat::Present { d, a } => r[d as usize] = b01(!r[a as usize].val().is_nan()),
+                Flat::Not { d, a } => {
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(r[a as usize].plain() == 0.0)
+                }
+                Flat::Present { d, a } => {
+                    // value-read-ok: unreachable for a recording type, whose `if rec` arm above takes this op
+                    r[d as usize] = b01(!r[a as usize].plain().is_nan())
+                }
+                Flat::HostArg { .. } | Flat::Host { .. } | Flat::HostOut { .. } => {
+                    unreachable!("only a kernel recording makes a host call")
+                }
+                Flat::LoopArg { .. }
+                | Flat::Loop { .. }
+                | Flat::LoopOut { .. }
+                | Flat::Select { .. }
+                | Flat::Gate { .. } => {
+                    unreachable!("only a kernel recording makes a loop call, a select or a gate")
+                }
+                Flat::Branch { c, to } if rec && !r[c as usize].is_constant() => {
+                    pc = self.both_arms(code, pc, to as usize, c, u, params, seeds, du, r);
+                }
                 Flat::Branch { c, to } => {
-                    if r[c as usize].val() == 0.0 {
+                    // A recording reaches here only with a constant condition (the arm above takes
+                    // an input-dependent one): its value is a constant of the plan.
+                    if r[c as usize].nonrec_val() == Some(0.0) {
                         pc = to as usize;
                     }
                 }
@@ -963,206 +1257,102 @@ impl RhsRegProgram {
             }
         }
     }
-}
 
-/// Whether `code` holds an instruction [`structural_zeros`] marks a structural zero without
-/// a structural-zero operand: a literal `0`, a product with the constant `0`, or a
-/// comparison or connective (whose `0` is the dual constant). Every other rule needs a
-/// structural-zero input, so for a program without one of these, loaded inputs
-/// ([`loaded_inputs`]) none of which is a structural zero leave every output live — and the
-/// analysis can be skipped, exactly.
-pub(super) fn makes_structural_zeros(code: &[Flat]) -> bool {
-    code.iter().any(|f| match *f {
-        Flat::LoadK { c, .. } | Flat::MulK { c, .. } => c == 0.0,
-        Flat::Cmp { .. } | Flat::And { .. } | Flat::Or { .. } | Flat::Not { .. } => true,
-        Flat::Present { .. } => true,
-        _ => false,
-    })
-}
-
-/// The inputs `code` loads: its states, its `params` slots and its seeds, each listed once.
-/// [`structural_zeros`] reads an input's structural-zero flag only through these loads, so
-/// a flag on any other input — a `params` slot below the extent the program never reads —
-/// cannot mark an output.
-pub(super) fn loaded_inputs(code: &[Flat]) -> (Vec<u32>, Vec<u32>, [bool; 4]) {
-    let (mut u, mut p, mut s) = (Vec::new(), Vec::new(), [false; 4]);
-    for f in code {
-        match *f {
-            Flat::LoadState { i, .. } if !u.contains(&i) => u.push(i),
-            Flat::LoadParam { slot, .. } if !p.contains(&slot) => p.push(slot),
-            Flat::LoadSeed { k, .. } => s[usize::from(k)] = true,
-            _ => {}
-        }
-    }
-    (u, p, s)
-}
-
-/// Which derivatives are **structural zeros** — exactly `0` and identically so near the
-/// inputs, so every derivative of every order is `0` too — given which inputs are
-/// (`zu`, `zp`, `zs`: an untaped constant `0`, [`crate::sens::linsolve::structural_zero`]).
-/// `out[state]` is `true` for such a derivative and `false` for every other, including one
-/// the program does not write. Run on the inputs' values (`u`, `params`, `seeds`), through
-/// `RhsRegProgram::exec`'s own `f64` primitives, so it takes the branches the interpreter
-/// takes.
-///
-/// The rules are the exact ones: a sum or difference of structural zeros, a structural
-/// zero times (or divided by) a value that is finite (and, as a divisor, nonzero), a
-/// literal `0`, a comparison or logical result (the dual constants `0`/`1`), and the
-/// abs/floor/ceil/round of a structural zero. Everything else is not, so the analysis can
-/// only under-report — and the caller checks every lane of an output it reports before
-/// dropping its derivatives (`vtape::record_rhs`).
-///
-/// A taped number type records an RHS call as one opaque block whose every output is a
-/// tape node (`vtape::record_rhs`), so a gated term `G·k·x` with the gate `G = 0` reads as
-/// a live coefficient to the exact linear path's sparsity skips; this is what lets the
-/// block leave such an output off the tape (#2760).
-#[allow(clippy::too_many_arguments)]
-fn structural_zeros(
-    code: &[Flat],
-    n_regs: usize,
-    u: &[f64],
-    params: &[f64],
-    seeds: &[f64; 4],
-    zu: &[bool],
-    zp: &[bool],
-    zs: &[bool; 4],
-    out: &mut [bool],
-) {
-    use crate::sens::num::vm::VmArith;
-    use crate::sens::num::PkNum;
-    let mut v = vec![0.0_f64; n_regs];
-    let mut z = vec![false; n_regs];
-    out.fill(false);
-    let mut pc = 0;
-    while let Some(f) = code.get(pc) {
-        pc += 1;
-        // `(value, structural zero)` of the destination.
-        let (d, val, zero) = match *f {
-            Flat::LoadState { d, i } => {
-                let i = i as usize;
-                // Past the end, the binding reads the constant `0`.
-                (
-                    d,
-                    u.get(i).copied().unwrap_or(0.0),
-                    zu.get(i).copied().unwrap_or(true),
-                )
+    /// Both arms of an `if` on the data condition `r[c]` (a recording type, #2786), the
+    /// then-arm at `then_start..else_start` (its closing `Jump` excluded), the else-arm up to
+    /// that `Jump`'s target; returns the instruction after the `if`. Every register and
+    /// derivative an arm writes becomes the selection of the two on `r[c]`.
+    ///
+    /// Each arm reads its inputs through `select(arm live, x, value_only(x))`: in the arm not
+    /// taken the inputs are constants, so a non-finite local derivative there (a negative
+    /// base's power, a negative `sqrt`) meets a zero adjoint inside the arm and never reaches
+    /// `x` — the selection hands the arm's adjoints to the constant.
+    #[allow(clippy::too_many_arguments)]
+    fn both_arms<T: VmNum>(
+        &self,
+        code: &[Flat],
+        then_start: usize,
+        else_start: usize,
+        c: u32,
+        u: &[T],
+        params: &[T],
+        seeds: &[T; 4],
+        du: &mut [T],
+        r: &mut [T],
+    ) -> usize {
+        use crate::sens::num::BranchCmp::{Eq, Ne};
+        let zero = T::from_f64(0.0);
+        let cond = r[c as usize];
+        let (then_end, end) = match code.get(else_start.wrapping_sub(1)) {
+            Some(&Flat::Jump { to }) if (to as usize) >= else_start => {
+                (else_start - 1, to as usize)
             }
-            Flat::LoadParam { d, slot } => {
-                let s = slot as usize;
-                (
-                    d,
-                    params.get(s).copied().unwrap_or(0.0),
-                    zp.get(s).copied().unwrap_or(true),
-                )
-            }
-            Flat::LoadSeed { d, k } => (d, seeds[k as usize], zs[k as usize]),
-            Flat::LoadK { d, c } => (d, c, c == 0.0),
-            Flat::Add { d, a, b } | Flat::Sub { d, a, b } | Flat::RSub { d, a, b } => {
-                let (x, y) = (v[a as usize], v[b as usize]);
-                let mut r = x;
-                match *f {
-                    Flat::Add { .. } => r.add_in(&y),
-                    Flat::Sub { .. } => r.sub_in(&y),
-                    _ => r.rsub_in(&y),
-                }
-                (d, r, z[a as usize] && z[b as usize])
-            }
-            Flat::Mul { d, a, b } => {
-                let (x, y) = (v[a as usize], v[b as usize]);
-                let mut r = x;
-                r.mul_in(&y);
-                let zero = (z[a as usize] && y.is_finite()) || (z[b as usize] && x.is_finite());
-                (d, r, zero)
-            }
-            Flat::Div { d, a, b } => {
-                let (x, y) = (v[a as usize], v[b as usize]);
-                let mut r = x;
-                apply_binary_in(&mut r, Op::Div, &y);
-                (d, r, z[a as usize] && y.is_finite() && y != 0.0)
-            }
-            Flat::AddK { d, a, c } | Flat::SubK { d, a, c } | Flat::RSubK { d, a, c } => {
-                let mut r = v[a as usize];
-                match *f {
-                    Flat::AddK { .. } => r.add_scalar_in(c),
-                    Flat::SubK { .. } => r.sub_scalar_in(c),
-                    _ => r.rsub_scalar_in(c),
-                }
-                (d, r, z[a as usize] && c == 0.0)
-            }
-            Flat::MulK { d, a, c } => {
-                let mut r = v[a as usize];
-                r.mul_scalar_in(c);
-                let zero =
-                    (z[a as usize] && c.is_finite()) || (c == 0.0 && v[a as usize].is_finite());
-                (d, r, zero)
-            }
-            Flat::DivK { d, a, c } => {
-                let mut r = v[a as usize];
-                apply_scalar_in(&mut r, Op::Div, c);
-                (d, r, z[a as usize] && c.is_finite() && c != 0.0)
-            }
-            Flat::Pow { d, a, e } => (d, v[a as usize].pow(v[e as usize]), false),
-            Flat::Unary { d, op, a } => {
-                let keeps_zero =
-                    matches!(op, Unary::Abs | Unary::Floor | Unary::Ceil | Unary::Round);
-                (
-                    d,
-                    apply_unary(op.op(), v[a as usize]),
-                    keeps_zero && z[a as usize],
-                )
-            }
-            Flat::Deriv { state, a } => {
-                if let Some(o) = out.get_mut(state as usize) {
-                    *o = z[a as usize];
-                }
-                continue;
-            }
-            Flat::Cmp { d, cc, a, b } => {
-                let r = if cc.holds(v[a as usize], v[b as usize]) {
-                    1.0
-                } else {
-                    0.0
-                };
-                (d, r, r == 0.0)
-            }
-            Flat::And { d, a, b } => {
-                let r = if v[a as usize] != 0.0 && v[b as usize] != 0.0 {
-                    1.0
-                } else {
-                    0.0
-                };
-                (d, r, r == 0.0)
-            }
-            Flat::Or { d, a, b } => {
-                let r = if v[a as usize] != 0.0 || v[b as usize] != 0.0 {
-                    1.0
-                } else {
-                    0.0
-                };
-                (d, r, r == 0.0)
-            }
-            Flat::Not { d, a } => {
-                let r = if v[a as usize] == 0.0 { 1.0 } else { 0.0 };
-                (d, r, r == 0.0)
-            }
-            Flat::Present { d, a } => {
-                let r = if v[a as usize].is_nan() { 0.0 } else { 1.0 };
-                (d, r, r == 0.0)
-            }
-            Flat::Branch { c, to } => {
-                if v[c as usize] == 0.0 {
-                    pc = to as usize;
-                }
-                continue;
-            }
-            Flat::Jump { to } => {
-                pc = to as usize;
-                continue;
-            }
-            Flat::Move { d, a } => (d, v[a as usize], z[a as usize]),
+            _ => (else_start, else_start),
         };
-        v[d as usize] = val;
-        z[d as usize] = zero;
+        // The registers and derivatives an arm reads and writes.
+        let scan = |range: std::ops::Range<usize>| {
+            let (mut reads, mut writes, mut derivs) = (Vec::new(), Vec::new(), Vec::new());
+            for f in &code[range] {
+                let mut g = *f;
+                if let Flat::Deriv { state, .. } = g {
+                    derivs.push(state as usize);
+                }
+                let (d, us) = regs_of(&mut g);
+                reads.extend(us.into_iter().flatten().map(|x| *x as usize));
+                if let Some(d) = d {
+                    writes.push(*d as usize);
+                }
+            }
+            (reads, writes, derivs)
+        };
+        let snap_r = r.to_vec();
+        let snap_du = du.to_vec();
+        let mut arm = |range: std::ops::Range<usize>, live: crate::sens::num::BranchCmp| {
+            r.copy_from_slice(&snap_r);
+            du.copy_from_slice(&snap_du);
+            let (reads, _, _) = scan(range.clone());
+            for i in reads {
+                let x = snap_r[i];
+                r[i] = T::select_if(live, cond, zero, x, x.value_only());
+            }
+            self.exec_range(code, range.start, range.end, u, params, seeds, du, r);
+            (r.to_vec(), du.to_vec())
+        };
+        let (r_then, du_then) = arm(then_start..then_end, Ne);
+        let (r_else, du_else) = arm(else_start..end, Eq);
+        r.copy_from_slice(&snap_r);
+        du.copy_from_slice(&snap_du);
+        let (_, w_then, d_then) = scan(then_start..then_end);
+        let (_, w_else, d_else) = scan(else_start..end);
+        for i in w_then.iter().chain(&w_else).copied() {
+            let t = if w_then.contains(&i) {
+                r_then[i]
+            } else {
+                snap_r[i]
+            };
+            let e = if w_else.contains(&i) {
+                r_else[i]
+            } else {
+                snap_r[i]
+            };
+            r[i] = T::select_if(Ne, cond, zero, t, e);
+        }
+        for s in d_then.iter().chain(&d_else).copied() {
+            if s < du.len() {
+                let t = if d_then.contains(&s) {
+                    du_then[s]
+                } else {
+                    snap_du[s]
+                };
+                let e = if d_else.contains(&s) {
+                    du_else[s]
+                } else {
+                    snap_du[s]
+                };
+                du[s] = T::select_if(Ne, cond, zero, t, e);
+            }
+        }
+        end
     }
 }
 
@@ -1181,23 +1371,23 @@ fn lower(
     layout: &RhsLayout<'_>,
 ) -> Result<RhsRegProgram, RhsRefusal> {
     let mut next = n_tmp;
-    let mut alloc = || -> Option<u16> {
-        let r = u16::try_from(next).ok()?;
+    let mut alloc = || -> Option<u32> {
+        let r = u32::try_from(next).ok()?;
         next += 1;
         Some(r)
     };
     let mut prologue: Vec<Flat> = Vec::new();
     let mut body: Vec<Flat> = Vec::new();
     // Current register of a slot: its prologue load, or the value last assigned to it.
-    let mut slot_reg: std::collections::HashMap<u32, u16> = std::collections::HashMap::new();
+    let mut slot_reg: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
     // The refusals below are a construct; the loop adds the statement's site.
     let mut operand = |s: Src,
-                       slot_reg: &mut std::collections::HashMap<u32, u16>,
+                       slot_reg: &mut std::collections::HashMap<u32, u32>,
                        prologue: &mut Vec<Flat>,
                        body: &mut Vec<Flat>|
-     -> Result<u16, RhsConstruct> {
+     -> Result<u32, RhsConstruct> {
         Ok(match s {
-            Src::Tmp(t) => u16::try_from(t).map_err(|_| RhsConstruct::Shape)?,
+            Src::Tmp(t) => u32::try_from(t).map_err(|_| RhsConstruct::Shape)?,
             Src::Var(slot) => match slot_reg.get(&slot) {
                 Some(&r) => r,
                 // A slot read before any assignment: one of the binding's inputs, loaded
@@ -1229,7 +1419,7 @@ fn lower(
     for (n, i) in ins.iter().enumerate() {
         let site = sites[n];
         let at = |construct| RhsRefusal { construct, site };
-        let reg = |r: u32| u16::try_from(r).map_err(|_| at(RhsConstruct::Shape));
+        let reg = |r: u32| u32::try_from(r).map_err(|_| at(RhsConstruct::Shape));
         let to = |pos: usize| u32::try_from(pos).map_err(|_| at(RhsConstruct::Shape));
         // An `if`'s markers out of order: the builder emitted something it never does.
         let unbalanced = || at(RhsConstruct::InlineIf);
@@ -1371,7 +1561,7 @@ fn lower(
 }
 
 /// The register an instruction writes, and the ones it reads.
-fn regs_of(f: &mut Flat) -> (Option<&mut u16>, [Option<&mut u16>; 2]) {
+fn regs_of(f: &mut Flat) -> (Option<&mut u32>, [Option<&mut u32>; 2]) {
     match f {
         Flat::LoadState { d, .. }
         | Flat::LoadParam { d, .. }
@@ -1381,8 +1571,10 @@ fn regs_of(f: &mut Flat) -> (Option<&mut u16>, [Option<&mut u16>; 2]) {
         | Flat::Sub { d, a, b }
         | Flat::RSub { d, a, b }
         | Flat::Mul { d, a, b }
-        | Flat::Div { d, a, b } => (Some(d), [Some(a), Some(b)]),
+        | Flat::Div { d, a, b }
+        | Flat::DivRaw { d, a, b } => (Some(d), [Some(a), Some(b)]),
         Flat::Pow { d, a, e } => (Some(d), [Some(a), Some(e)]),
+        Flat::GammaPq { d, a, x, .. } => (Some(d), [Some(a), Some(x)]),
         Flat::AddK { d, a, .. }
         | Flat::SubK { d, a, .. }
         | Flat::RSubK { d, a, .. }
@@ -1395,8 +1587,15 @@ fn regs_of(f: &mut Flat) -> (Option<&mut u16>, [Option<&mut u16>; 2]) {
         Flat::Not { d, a } | Flat::Present { d, a } | Flat::Move { d, a } => {
             (Some(d), [Some(a), None])
         }
-        Flat::Deriv { a, .. } | Flat::Branch { c: a, .. } => (None, [Some(a), None]),
-        Flat::Jump { .. } => (None, [None, None]),
+        Flat::Deriv { a, .. }
+        | Flat::Branch { c: a, .. }
+        | Flat::HostArg { a }
+        | Flat::LoopArg { a } => (None, [Some(a), None]),
+        Flat::Jump { .. } | Flat::Host { .. } | Flat::Loop { .. } => (None, [None, None]),
+        Flat::HostOut { d, .. } | Flat::LoopOut { d, .. } => (Some(d), [None, None]),
+        Flat::Select { .. } | Flat::Gate { .. } => {
+            unreachable!("never register-allocated: kernel recordings only")
+        }
     }
 }
 
@@ -1428,9 +1627,9 @@ fn reuse_registers(mut code: Vec<Flat>, n_virtual: usize) -> (Vec<Flat>, usize) 
             last_use[*r as usize] = i;
         }
     }
-    let mut phys: Vec<Option<u16>> = vec![None; n_virtual];
-    let mut free: Vec<u16> = Vec::new();
-    let mut n_phys: u16 = 0;
+    let mut phys: Vec<Option<u32>> = vec![None; n_virtual];
+    let mut free: Vec<u32> = Vec::new();
+    let mut n_phys: u32 = 0;
     for (i, f) in code.iter_mut().enumerate() {
         let (def, uses) = regs_of(f);
         for r in uses.into_iter().flatten() {
@@ -1584,7 +1783,7 @@ impl Builder {
                 let op = match op {
                     Op::Exp => Unary::Exp,
                     Op::Ln => Unary::Ln,
-                    Op::Sqrt => Unary::Sqrt,
+                    Op::Sqrt => Unary::SqrtRhs,
                     Op::Abs => Unary::Abs,
                     Op::Floor => Unary::Floor,
                     Op::Ceil => Unary::Ceil,
@@ -1742,6 +1941,8 @@ impl Builder {
 mod ir;
 #[path = "rhs_jit.rs"]
 mod jit;
+#[path = "kernel_jit.rs"]
+pub(crate) mod kernel_jit;
 
 thread_local! {
     /// Lane buffers for a non-contiguous type's native call (`run_native`).

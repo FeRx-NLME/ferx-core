@@ -108,7 +108,7 @@ fn three_cpt_iv_ode_matches_analytical_foce_marginal_ofv() {
 
     let dofv = (an.ofv - ode.ofv).abs();
     // The two forms compute the *same* SB-FOCE marginal with analytic
-    // sensitivities (closed-form Dual2 vs the RK45-integrated Dual1 walk), so at
+    // sensitivities (closed-form Dual2 vs the RK45-integrated Dual2 walk), so at
     // the tight ode_reltol they must agree to well within solver tolerance. Pre-fix
     // this diverged by ~0.13 here (macOS) / ~18 (Linux CI). 1e-3 catches that
     // regression with a >100x margin while tolerating RK45 round-off.

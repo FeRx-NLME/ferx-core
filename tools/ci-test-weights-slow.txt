@@ -43,7 +43,6 @@
 6 tte_smoke
 5 ci_test_shards
 5 kappa_correlation_auto_lbfgs_fits
-4 outer_gradient_fd_fallback_warning
 4 new_optimizers
 4 transit_nonmem_anchor
 4 warfarin_impmap_nonmem
@@ -53,7 +52,6 @@
 4 warfarin_imp_nonmem
 3 weighted_error_all_methods
 3 transit_analytic_equivalence
-3 fd_salvage_guard_fires_in_a_fit
 3 residual_correlation_nonmem_anchor
 3 nested_levels_degenerate_oracle
 2233 lib:estimation::trust_region

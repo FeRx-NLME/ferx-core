@@ -2715,8 +2715,13 @@ fn read_json<T: serde::de::DeserializeOwned, R: Read + std::io::Seek>(
     archive: &mut ZipArchive<R>,
     name: &str,
 ) -> Result<T, FitrxError> {
+    // Parsed to a `Value` and read through `NullAsNan`, the reader `FitResult::from_json_str`
+    // uses: the types `fit.json` shares with `FitResult` are then deserialized by one
+    // `Deserializer` instead of two, and a non-finite float written as `null` reads back
+    // as `NaN` wherever it lands.
     let buf = read_bytes(archive, name)?;
-    Ok(serde_json::from_slice(&buf)?)
+    let value: serde_json::Value = serde_json::from_slice(&buf)?;
+    Ok(T::deserialize(crate::io::serde_nan::NullAsNan(value))?)
 }
 
 /// Column indices of the `PMIX_{k}` headers, ordered by class number `k` rather

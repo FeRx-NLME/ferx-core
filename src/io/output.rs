@@ -1,3 +1,4 @@
+use crate::cold_sort::ColdSort;
 use crate::types::*;
 
 fn fixed_label(name: &str) -> String {
@@ -1234,7 +1235,7 @@ pub fn block_summary(values: &[f64]) -> (f64, f64, f64) {
         return (f64::NAN, f64::NAN, f64::NAN);
     }
     let mut sorted: Vec<f64> = values.to_vec();
-    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted.cold_sort_by(&|a, b| a.total_cmp(b));
     let n = sorted.len();
     (sorted[0], sorted[(n - 1) / 2], sorted[n - 1])
 }

@@ -21,7 +21,6 @@ use crate::estimation::trust_region::{adaptive_steihaug_budget, solve_trust_regi
 use crate::stats::likelihood::{chol_log_det, compute_r_tilde, is_usable_subject_nll};
 use crate::types::*;
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 
 /// The #1006 post-fit warning carried by a **pure** Gauss-Newton run that ends
 /// unconverged on a fixed-effects-only model (`n_eta = 0`).
@@ -1259,7 +1258,8 @@ fn dominant_ebe_response_subject(
 //   dL = 0.5 * sum_j (d r_j) * ((R^{-1})_jj - A_j^2)
 //
 // Theta x[k] (log-packed or identity):
-//   d(ipreds) from forward FD of compute_predictions_with_tv
+//   d(ipreds) contracted exactly (`fixed_eta_theta_contractions`, one recording + one reverse
+//   sweep); a per-theta difference only where the recorders decline or `gradient = fd`
 //   d(f0) = d(ipreds),  d(r) via chain rule through residual variance
 //   dv = -d(f0)
 //   dL = -A^T d(f0)  +  0.5 * (sum_j d(r_j) * ((R^{-1})_jj - A_j^2))
@@ -1310,12 +1310,15 @@ thread_local! {
     static THETA_FD_FORCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Whether the per-θ difference quotient is forced (tests only; always `false` otherwise).
-fn theta_fd_forced() -> bool {
+/// Whether the per-θ difference quotient is forced: by the user's `gradient = fd` (model,
+/// `FitOptions` or the fit-scoped flag, the same predicate the FOCE family and the reported
+/// `gradient_method_outer` read), or by the test switch.
+fn theta_fd_forced(model: &CompiledModel) -> bool {
     #[cfg(test)]
-    return THETA_FD_FORCE.with(|c| c.get());
-    #[cfg(not(test))]
-    false
+    if THETA_FD_FORCE.with(|c| c.get()) {
+        return true;
+    }
+    crate::types::GradientMethod::forced_fd(model)
 }
 
 /// Analytical per-subject FOCE NLL gradient for non-IOV, non-ODE, non-M3 models.
@@ -1323,9 +1326,9 @@ fn theta_fd_forced() -> bool {
 /// Returns `None` if the Cholesky of R_tilde fails (degenerate parameters) so
 /// the caller can fall back to central FD.
 ///
-/// The gradient is exact for omega and sigma packed parameters. For theta packed
-/// parameters, uses forward FD of `compute_predictions_with_tv` only (cheap —
-/// no matrix work per perturbation).
+/// The gradient is exact in every packed parameter: ω and σ in closed form, θ through the
+/// exact fixed-η contractions (`fixed_eta_theta_contractions`). The per-θ difference of
+/// `compute_predictions_with_tv` runs only where the recorders decline or `gradient = fd`.
 #[allow(clippy::too_many_arguments)]
 fn subject_nll_pop_grad_analytical(
     x: &[f64],
@@ -1478,7 +1481,7 @@ fn subject_nll_pop_grad_analytical(
         };
         at_mode.zip(at_pop)
     };
-    if let Some((at_mode, at_pop)) = exact.filter(|_| !theta_fd_forced()) {
+    if let Some((at_mode, at_pop)) = exact.filter(|_| !theta_fd_forced(model)) {
         for k in 0..n_theta {
             if fixed_mask[k] {
                 continue;
@@ -1721,8 +1724,9 @@ fn subject_nll_pop_grad_analytical(
 /// Like the SB path, η̂ and H (= a) are held fixed under all parameter
 /// perturbations — the "fixed-EBE" gradient. The chain rule then closes
 /// cheaply on small (n_eta × n_eta) Hessian matrices:
-///   - **θ_k**: 1 forward-FD call on `compute_predictions_with_tv` per θ_k,
-///     then `0.5·Σⱼ (αⱼ + βⱼ·qⱼ) · ∂fⱼ/∂θ_k` where
+///   - **θ_k**: `0.5·Σⱼ (αⱼ + βⱼ·qⱼ) · ∂fⱼ/∂θ_k`, the contraction taken exactly by one
+///     recording and one reverse sweep (`fixed_eta_theta_contractions`; a per-θ central
+///     difference only where the recorders decline or `gradient = fd`), where
 ///     αⱼ = −2·errⱼ/Rⱼ + dⱼ·(Rⱼ − errⱼ²)/Rⱼ²    (data_ll piece)
 ///     βⱼ = −dⱼ/Rⱼ² + dⱼ·d2ⱼ/Rⱼ² − dⱼ³/Rⱼ³     (log|H̃| piece via chain on R, c̃)
 ///     qⱼ = aⱼ'·H̃⁻¹·aⱼ                          (pre-computed once)
@@ -1737,8 +1741,8 @@ fn subject_nll_pop_grad_analytical(
 ///   - **σ_s**: closed form using ∂R/∂log σ_s and ∂d/∂log σ_s on the same
 ///     scalar `qⱼ` reservoir.
 ///
-/// **Cost** is the same order as the SB analytical path: one prediction call
-/// per non-fixed θ, then a single per-obs sweep for the inner accumulators.
+/// **Cost** is the same order as the SB analytical path: one recorded contraction for θ,
+/// then a single per-obs sweep for the inner accumulators.
 /// The n_eta × n_eta matrix ops (Cholesky, inverse, G product) are
 /// constant-cost on n_eta ≲ 10 — far cheaper than the n_obs × n_obs Cholesky
 /// the SB path uses.
@@ -1887,7 +1891,7 @@ fn subject_nll_pop_grad_analytical_laplace(
     let log_det_omega = omega.log_det;
     let nll = 0.5 * (data_ll + eta_prior + log_det_omega + log_det_htilde);
 
-    // ── Theta gradient (forward FD on predictions; closed-form chain rest) ──
+    // ── Theta gradient (exact contraction of ∂f/∂θ; closed-form chain rest) ──
     // Per-obs scalar coeff combines data_ll and log|H̃| contributions:
     //   per_j = αⱼ + βⱼ·qⱼ
     //   αⱼ   = −2·errⱼ/Rⱼ + dⱼ·(Rⱼ − errⱼ²)/Rⱼ²
@@ -1907,7 +1911,7 @@ fn subject_nll_pop_grad_analytical_laplace(
 
     let mut grad = vec![0.0f64; n];
     // θ enters through the predictions alone (a θ-dependent residual magnitude is routed
-    // away by the caller), so its block is two contractions of `∂f/∂θ` at η̂ — the
+    // away by the caller), so its block is one contraction of `∂f/∂θ` at η̂ — the
     // objective's — taken exactly by one recording and one reverse sweep
     // (`fixed_eta_theta_contractions`). The per-θ central difference below remains only
     // where the recorders decline.
@@ -1918,7 +1922,7 @@ fn subject_nll_pop_grad_analytical_laplace(
         eta_hat.as_slice(),
         |_| Some(vec![theta_per_j.clone()]),
     );
-    if let Some(rows) = exact.filter(|_| !theta_fd_forced()) {
+    if let Some(rows) = exact.filter(|_| !theta_fd_forced(model)) {
         for k in 0..n_theta {
             if fixed_mask[k] {
                 continue;
@@ -2113,9 +2117,8 @@ fn subject_nll_pop_grad_analytical_laplace(
 
 /// Per-observation coefficient of the `qⱼ = aⱼ'H̃⁻¹aⱼ` reservoir in the `log|H̃|`
 /// chain rule along the prediction axis: `βⱼ = −dⱼ/Rⱼ² + dⱼ·d2ⱼ/Rⱼ² − dⱼ³/Rⱼ³`,
-/// where `dⱼ = ∂R/∂f` and `d2ⱼ = ∂²R/∂f²`. Shared by the Laplace θ-gradient
-/// (`∂log|H̃|/∂θ` via `df/dθ`) and the #274 EBE-response correction
-/// (`∂log|H̃|/∂η` via `df/dη = a`), so the formula lives in one place.
+/// where `dⱼ = ∂R/∂f` and `d2ⱼ = ∂²R/∂f²`. Read by the Laplace θ-gradient
+/// (`∂log|H̃|/∂θ` via `df/dθ`).
 #[inline]
 fn logdet_htilde_beta(d: f64, d2: f64, inv_r: f64) -> f64 {
     let inv_r2 = inv_r * inv_r;
@@ -2176,7 +2179,10 @@ pub(crate) fn closed_form_fixed_ebe_grad_ok(
 /// An η-free model has no H̃ to differentiate, so it keeps the fixed-EBE score. A CTMM
 /// endpoint is left out on purpose: there the reconverged score did not reach BOBYQA's
 /// optimum either, because the objective itself moves 0.73 OFV with the FD Hessian step —
-/// a different defect, with its own issue.
+/// a different defect, with its own issue. (This is the NLopt salvage's rule. `method = gn` is
+/// refused on CTMM, `E_CTMM_GN_UNSUPPORTED`; trust region and the covariance `S` take each
+/// subject's total derivative there, which the adjoint serves — matched to the reconverged
+/// oracle to 2e-6 in `the_row_is_the_reconverged_total_derivative_on_binary_and_ctmm_endpoints`.)
 pub(crate) fn fixed_ebe_score_drops_ebe_response(model: &CompiledModel) -> bool {
     #[cfg(feature = "markov")]
     if model.has_ctmm() {
@@ -2294,7 +2300,7 @@ pub(crate) fn subject_nll_pop_grad(
     // columns rebuilt from θ, as production's held objective rebuilds them (a non-Gaussian
     // term over the BSV block). The central difference below remains for an endpoint
     // without an exact channel and a decline outside the recorders' scope.
-    if !theta_fd_forced() {
+    if !theta_fd_forced(model) {
         let subject = &population.subjects[subj_idx];
         // Under IOV the score is taken at the stacked `[η̂, κ̂]`.
         let stacked: Option<Vec<f64>> = if kappas.is_empty() {
@@ -2545,43 +2551,40 @@ pub(crate) fn gn_subject_rows(
 ) -> Vec<Vec<f64>> {
     let fixed = packed_fixed_mask(template);
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x);
-    (0..population.subjects.len())
-        .into_par_iter()
-        .map(|i| {
-            let kap_i = kappas.get(i).map_or(&[][..], |k| k.as_slice());
-            let mut row = match raw.iter().find(|&&(s, _)| s == i) {
-                Some(&(_, h)) => {
-                    subject_nll_pop_grad(
-                        x,
-                        template,
-                        model,
-                        population,
-                        i,
-                        &eta_hats[i],
-                        h,
-                        kap_i,
-                        bounds,
-                        options,
-                    )
-                    .1
-                }
-                None => crate::estimation::covariance::subject_total_score(
+    crate::par::map(population.subjects.len(), |i| {
+        let kap_i = kappas.get(i).map_or(&[][..], |k| k.as_slice());
+        let mut row = match raw.iter().find(|&&(s, _)| s == i) {
+            Some(&(_, h)) => {
+                subject_nll_pop_grad(
                     x,
                     template,
                     model,
                     population,
                     i,
                     &eta_hats[i],
+                    h,
                     kap_i,
-                    pt.as_ref(),
                     bounds,
                     options,
-                ),
-            };
-            zero_fixed(&mut row, &fixed);
-            row
-        })
-        .collect()
+                )
+                .1
+            }
+            None => crate::estimation::covariance::subject_total_score(
+                x,
+                template,
+                model,
+                population,
+                i,
+                &eta_hats[i],
+                kap_i,
+                pt.as_ref(),
+                bounds,
+                options,
+            ),
+        };
+        zero_fixed(&mut row, &fixed);
+        row
+    })
 }
 
 /// Zero the FIX coordinates of a row.
@@ -2610,26 +2613,24 @@ fn raw_scores(
     options: &FitOptions,
 ) -> Vec<Vec<f64>> {
     let fixed = packed_fixed_mask(template);
-    which
-        .par_iter()
-        .map(|&i| {
-            let kap_i = kappas.get(i).map_or(&[][..], |k| k.as_slice());
-            let (_, mut g) = subject_nll_pop_grad(
-                x,
-                template,
-                model,
-                population,
-                i,
-                &eta_hats[i],
-                &h_matrices[i],
-                kap_i,
-                bounds,
-                options,
-            );
-            zero_fixed(&mut g, &fixed);
-            g
-        })
-        .collect()
+    crate::par::map(which.len(), |k| {
+        let i = which[k];
+        let kap_i = kappas.get(i).map_or(&[][..], |k| k.as_slice());
+        let (_, mut g) = subject_nll_pop_grad(
+            x,
+            template,
+            model,
+            population,
+            i,
+            &eta_hats[i],
+            &h_matrices[i],
+            kap_i,
+            bounds,
+            options,
+        );
+        zero_fixed(&mut g, &fixed);
+        g
+    })
 }
 
 /// Whether #2777's take-back can apply to this model: the models whose fixed-mode score
@@ -2726,6 +2727,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
@@ -3267,6 +3269,10 @@ mod tests {
     /// vacuous. Mutation: drop the `rows_at_x` keep (`rows_at_x = None` on every iteration) and
     /// a `B` follows the `R`.
     #[test]
+    #[cfg_attr(
+        not(feature = "slow-tests"),
+        ignore = "slow: a GN population fit; opt in with --features slow-tests"
+    )]
     fn gn_keeps_its_rows_across_a_rejected_step() {
         let (model, pop, opts) = warfarin_for_gn(6);
         let opts = FitOptions {
@@ -4873,6 +4879,7 @@ mod tests {
             mixture: None,
         };
         let model = CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
@@ -5172,6 +5179,7 @@ mod tests {
             mixture: None,
         };
         CompiledModel {
+            plan_id: Default::default(),
             residual_serial: None,
             priors: Vec::new(),
             prior_from_fit: None,
@@ -5460,6 +5468,88 @@ mod tests {
             }
         }
         assert!(worst < 1e-6, "{worst:.2e}");
+    }
+
+    /// An SDE subject's fixed-EBE score (the covariance step's S-matrix and the held salvage
+    /// read it) is exact: the EKF variance rows' θ and σ adjoints are in it. Exact branch
+    /// against the forced difference quotient of production's held objective.
+    #[test]
+    fn the_fixed_ebe_score_is_exact_for_an_sde_subject() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        let prep = crate::api::prepare_run(
+            &format!("{root}/examples/warfarin_sde.ferx"),
+            Some(&format!("{root}/data/warfarin.csv")),
+        )
+        .unwrap();
+        // The example's model at a tight integrator tolerance, so the quotient differences the
+        // filter's discretisation and not its error control.
+        let src = std::fs::read_to_string(format!("{root}/examples/warfarin_sde.ferx")).unwrap();
+        let mut model = crate::parser::model_parser::parse_model_string(&src).unwrap();
+        let ode = model.ode_spec.as_mut().unwrap();
+        ode.solver_opts.reltol = 1e-11;
+        ode.solver_opts.abstol = 1e-13;
+        let model = &model;
+        assert!(model.is_sde());
+        let mut template = prep.init_params.clone();
+        template.theta_fixed.fill(false);
+        template.omega_fixed.fill(false);
+        template.sigma_fixed.fill(false);
+        let template = &template;
+        let x = pack_params(template);
+        let bounds = compute_bounds(template);
+        let mut worst = 0.0f64;
+        for interaction in [false, true] {
+            let options = FitOptions {
+                interaction,
+                ..FitOptions::default()
+            };
+            for i in 0..3 {
+                let s = &prep.population.subjects[i];
+                let ebe = crate::estimation::inner_optimizer::find_ebe(
+                    model, s, template, 200, 1e-8, None, None, 0,
+                );
+                let run = |force: bool| {
+                    THETA_FD_FORCE.with(|c| c.set(force));
+                    let r = subject_nll_pop_grad(
+                        &x,
+                        template,
+                        model,
+                        &prep.population,
+                        i,
+                        &ebe.eta,
+                        &ebe.h_matrix,
+                        &[],
+                        &bounds,
+                        &options,
+                    );
+                    THETA_FD_FORCE.with(|c| c.set(false));
+                    r
+                };
+                let (nll_e, g_e) = run(false);
+                let (nll_f, g_f) = run(true);
+                let tag = format!("interaction={interaction} subject {i}");
+                assert!(
+                    (nll_e - nll_f).abs() <= 1e-9 * (1.0 + nll_f.abs()),
+                    "{tag}: {nll_e} vs {nll_f}"
+                );
+                assert!(
+                    g_e.iter()
+                        .zip(&g_f)
+                        .any(|(a, b)| a.to_bits() != b.to_bits()),
+                    "{tag}: exact branch did not run"
+                );
+                assert!(g_f.iter().all(|v| v.is_finite()), "{tag}");
+                let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs()));
+                for (a, b) in g_e.iter().zip(&g_f) {
+                    assert!(a.is_finite() && b.is_finite(), "{tag}");
+                    worst = worst.max((a - b).abs() / scale); // nan-ok: a, b, scale finite asserted above; scale >= 1
+                }
+            }
+        }
+        eprintln!("sde fixed-EBE score vs the central difference: worst {worst:.2e} of the row");
+        // Measured 7.0e-7 at tolerance 1e-11 (1.6e-2 at the default tolerance: the quotient
+        // then differences the integrator's error control); 14× headroom.
+        assert!(worst < 1e-5, "{worst:.2e}");
     }
 
     /// #338 Part A quantification: with the mu-ref H-column gradient shortcut

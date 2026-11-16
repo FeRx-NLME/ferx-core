@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use crate::sens::num::NonRecording;
 use crate::sim::adaptive::AssayRow;
 use crate::types::DoseEvent;
 use approx::assert_relative_eq;
@@ -5004,38 +5006,6 @@ fn dense_solve_ss_lagged_infusion_runs() {
     assert!(states.iter().all(|s| s.iter().all(|x| x.is_finite())));
 }
 
-/// Coverage: the `ode_predictions_ekf` wrapper (a 1-state `[diffusion]` spec);
-/// elsewhere only `solve_ekf` is exercised directly.
-#[test]
-fn ode_predictions_ekf_wrapper_runs() {
-    let ode = OdeSpec {
-        chz_state_slots: Vec::new(),
-        rhs: Box::new(|y: &[f64], p: &[f64], _t: f64, dy: &mut [f64]| {
-            let cl = p[crate::types::PK_IDX_CL];
-            let v = p[crate::types::PK_IDX_V];
-            let ke = if v > 0.0 { cl / v } else { 0.0 };
-            dy[0] = -ke * y[0];
-        }),
-        n_states: 1,
-        state_names: vec!["central".into()],
-        readout: OdeReadout::ObsCmt(0),
-        diffusion_var: vec![0.1],
-        solver_opts: OdeSolverOptions::default(),
-        input_rate: Vec::new(),
-        rhs_program: None,
-        readout_program: None,
-        indiv_param_program: None,
-        dose_attr_map: Default::default(),
-        init_fn: None,
-    };
-    let pk = pk_one(5.0, 80.0);
-    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
-    let subj = make_subject(doses, vec![2.0, 8.0]);
-    let (ipreds, p_obs) = ode_predictions_ekf(&ode, &pk.values, &subj, |_| 1.0);
-    assert_eq!(ipreds.len(), 2);
-    assert!(ipreds.iter().chain(p_obs.iter()).all(|x| x.is_finite()));
-}
-
 /// Turnover model with a baseline initial condition:
 ///   d/dt(R) = kin - kout*R,  init(R) = kin/kout
 /// params: kin @ slot 0, kout @ slot 1. Observable reads R (state 0).
@@ -5438,8 +5408,10 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
         std::slice::from_ref(&rate_defined),
         &lags,
         &f_bio,
+        &[],
         // No `SS=1` record in these doses and no EVID=3/4 reset.
         ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+        tad,
         tad,
         &mut dy_rate,
     );
@@ -5450,22 +5422,26 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
         std::slice::from_ref(&dur_defined),
         &lags,
         &f_bio,
+        &[],
         // No `SS=1` record in these doses and no EVID=3/4 reset.
         ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+        tad,
         tad,
         &mut dy_dur,
     );
 
     // Rate-defined: mass F·amt = 60 over the *shrunk* window F·nominal = 2.4 h.
-    let want_rate = prepared
-        .get(0, 0)
-        .prep
-        .rate_infused(tad, f * amt, f * nominal_window);
+    let want_rate = prepared.get(0, 0).prep.rate_infused(
+        tad,
+        f * amt,
+        f * nominal_window,
+        Some(tad - f * nominal_window),
+    );
     // Duration-defined: mass F·amt = 60 over the *held* window nominal = 4 h.
     let want_dur = prepared
         .get(0, 0)
         .prep
-        .rate_infused(tad, f * amt, nominal_window);
+        .rate_infused(tad, f * amt, nominal_window, None);
     assert_relative_eq!(dy_rate[0], want_rate, max_relative = 1e-12);
     assert_relative_eq!(dy_dur[0], want_dur, max_relative = 1e-12);
     assert!(
@@ -5474,6 +5450,64 @@ fn infusion_into_kernel_f_reshaping_is_mode_aware() {
              rate-defined {:.6} vs duration-defined {:.6}",
         dy_rate[0],
         dy_dur[0]
+    );
+}
+
+/// The infusion-into-kernel forcing is correct without trusting the caller's break list to hold
+/// the window end: a segment `[since, t] = [3, 6]` that *straddles* the end of a 4 h infusion (no
+/// break at 4) reads its stage on the tail side, `R_in = (dose/T)·[G(tad) − G(tad − T)]`, not the
+/// running side `(dose/T)·G(tad)` — which in release would deliver extra mass past the window.
+/// The control segment `[3, 4]` that ends *at* the window end (the break present) stays on the
+/// running side bit for bit, so the fallback never fires where the contract holds.
+#[test]
+fn infusion_into_kernel_window_end_is_right_without_a_break_at_it() {
+    let ode = first_order_one_cpt_spec();
+    let mut pk = PkParams::default();
+    pk.values[crate::types::PK_IDX_CL] = 2.0;
+    pk.values[crate::types::PK_IDX_V] = 20.0;
+    pk.values[4] = 0.6; // ka
+    let prepared = prepare_input_rates(&ode, &pk.values);
+    let (amt, rate) = (100.0_f64, 25.0_f64);
+    let window = amt / rate; // 4 h
+    let dose = DoseEvent::new(0.0, amt, 1, rate, false, 0.0);
+    let prep = &prepared.get(0, 0).prep;
+    let at = |since: f64, t: f64| {
+        let mut dy = [0.0_f64];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            std::slice::from_ref(&dose),
+            &[0.0],
+            &[1.0],
+            &[],
+            ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+            t,
+            since,
+            &mut dy,
+        );
+        dy[0]
+    };
+    // Straddling stage, 2 h past the end: the tail side, which differs from the running side.
+    let tail = prep.rate_infused(6.0, amt, window, Some(6.0 - window));
+    let running = prep.rate_infused(6.0, amt, window, None);
+    assert!(
+        (tail - running).abs() > 1e-6 * running.abs(),
+        "fixture drift: the two sides must differ ({tail} vs {running})"
+    );
+    assert_eq!(at(3.0, 6.0).to_bits(), tail.to_bits(), "straddling stage");
+    // Control: the stage at the window end of a segment that ends there is the running side.
+    let at_end = prep.rate_infused(4.0, amt, window, None);
+    assert_eq!(
+        at(3.0, 4.0).to_bits(),
+        at_end.to_bits(),
+        "segment ending at the end"
+    );
+    // And a segment wholly after the end is the tail side, as before.
+    let after = prep.rate_infused(7.0, amt, window, Some(3.0));
+    assert_eq!(
+        at(5.0, 7.0).to_bits(),
+        after.to_bits(),
+        "segment after the end"
     );
 }
 
@@ -5610,7 +5644,7 @@ fn gated_infusions_suppresses_infusion_into_input_rate_cmt() {
         DoseEvent::new(0.0, 21.0, 2, 7.0, false, 0.0),
     ];
     let f_bio = vec![1.0, 1.0];
-    let active = vec![(0usize, 1.0, 3.0), (1usize, 1.0, 3.0)];
+    let active = vec![(0usize, 1.0, 3.0, 1), (1usize, 1.0, 3.0, 1)];
     let forcing = transit_one_cpt_oral_spec().input_rate; // forcing on state 0
 
     // No forcing applied → both plain `+rate` injections are kept.
@@ -6207,11 +6241,29 @@ fn push_route_lag_break_times_adds_route_onsets() {
     ];
     let subj = make_subject(doses, vec![]);
     let mut breaks = Vec::new();
-    push_route_lag_break_times(&mut breaks, &ode, &subj, &[0.5, 0.0, 0.0], |f, _| {
-        f.route_lag(&params)
-    });
+    push_route_lag_break_times(
+        &mut breaks,
+        &ode,
+        &subj,
+        &[0.5, 0.0, 0.0],
+        &[1.0, 1.0, 1.0],
+        |f, _| f.route_lag(&params),
+    );
     // Only the lagged forcing × the valid dose: 2.0 + 0.5 (cmt lag) + 1.5 (route lag).
     assert_eq!(breaks, vec![4.0]);
+
+    // An infusion into the lagged route's kernel ends one (F-scaled) window after the route's
+    // onset, not after the compartment's: `RATE = 40`, `AMT = 100` is a 2.5 h window, `F = 0.8`
+    // makes it 2.0 h — the break the convolved `R_in_inf` kink needs (`2.0 + 0.5 + 1.5 + 2.0`).
+    let infusion = make_subject(
+        vec![DoseEvent::new(2.0, 100.0, 1, 40.0, false, 0.0)],
+        vec![],
+    );
+    let mut breaks = Vec::new();
+    push_route_lag_break_times(&mut breaks, &ode, &infusion, &[0.5], &[0.8], |f, _| {
+        f.route_lag(&params)
+    });
+    assert_eq!(breaks, vec![4.0, 6.0]);
 }
 
 #[test]
@@ -6262,7 +6314,7 @@ fn an_ss_record_stops_a_running_infusion_from_the_segment_that_reaches_it() {
         |t0: f64, t1: f64| active_infusions(&[], &doses, t0, t1, &[], &f_bio, f64::NEG_INFINITY, 2);
     let gated = |t0: f64| {
         let gate = ResetGate::at_segment(&doses, f64::NEG_INFINITY, t0);
-        gated_infusions(&[], &[(0, 0.0, 2.0)], &doses, &f_bio, 2, &gate)
+        gated_infusions(&[], &[(0, 0.0, 2.0, 1)], &doses, &f_bio, 2, &gate)
     };
     // Before the record: running, on both resolvers.
     assert_eq!(spanning(0.5, t_s), vec![(1, 10.0)]);
@@ -6539,10 +6591,10 @@ fn gated_infusions_resolves_rate_and_drops_unaddressable() {
     ];
     let f_bio = vec![0.5, 1.0, 1.0, 0.5];
     let active = vec![
-        (0usize, 1.0, 3.0),
-        (1, 1.0, 3.0),
-        (2, 1.0, 3.0),
-        (3, 1.0, 3.0),
+        (0usize, 1.0, 3.0, 1),
+        (1, 1.0, 3.0, 1),
+        (2, 1.0, 3.0, 1),
+        (3, 1.0, 3.0, 1),
     ];
     let gated = gated_infusions(
         &[],
@@ -6606,8 +6658,10 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
         &doses,
         &lags,
         &f_bio,
+        &[],
         // No `SS=1` record in these doses and no EVID=3/4 reset.
         ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+        t,
         t,
         &mut dy,
     );
@@ -6623,8 +6677,10 @@ fn add_prepared_forcing_superposes_skips_other_cmt_and_respects_floor() {
         &doses,
         &lags,
         &f_bio,
+        &[],
         // EVID=3/4 floor at 1.0; no `SS=1` record in these doses.
         ResetGate::at_segment(&[], 1.0, f64::NEG_INFINITY),
+        t,
         t,
         &mut dy_off,
     );
@@ -6694,6 +6750,34 @@ fn ss_periodic_forcing_break_is_dose_local_not_cross_dose() {
     );
 }
 
+/// **The clamp of a lagged SS train (#2786).** Past `lag = II` the earlier pulses stay on the
+/// record: the dose's own pulse is read at `tad`, pulse `j ≥ 1` at `tad + j·II + shift`, with
+/// `shift = max(L − II, 0)` the lag's excess over one interval. Pins `shift = 0` as the
+/// unlagged sum bit for bit, and a positive shift as moving every earlier pulse — and only
+/// those — by exactly that much (the own pulse term is unchanged).
+#[test]
+fn ss_periodic_forcing_shift_moves_the_earlier_pulses_only() {
+    let prep = transit_accumulator_spec().input_rate[0].prepare(&pk_transit_vec(3.0, 4.0, 1.0));
+    let (tad, ii, mass) = (2.5_f64, 6.0_f64, 1.0_f64);
+    let unshifted = ss_periodic_forcing_shifted(&prep, tad, ii, mass, 0.0);
+    assert_eq!(unshifted, ss_periodic_forcing(&prep, tad, ii, mass));
+    let shift = 1.75_f64;
+    let own = prep.rate(tad, mass);
+    // Brute force: the own pulse at `tad`, each earlier one `j·II + shift` older.
+    let mut want = own;
+    for j in 1..SS_EQUILIBRATION_CYCLES {
+        want += prep.rate(tad + ii * j as f64 + shift, mass);
+    }
+    let got = ss_periodic_forcing_shifted(&prep, tad, ii, mass, shift);
+    assert_relative_eq!(got, want, max_relative = 1e-9);
+    // Both halves are live: the earlier pulses carry mass at this age, and the shift moves it.
+    assert!(want - own > 1e-6 * own, "the earlier pulses are negligible");
+    assert!(
+        (got - unshifted).abs() > 1e-4 * unshifted,
+        "the shift moved nothing: {got} vs {unshifted}"
+    );
+}
+
 #[test]
 fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
     // Biphasic IG (#388): two igd forcings on one compartment, split FR1/FR2.
@@ -6701,7 +6785,7 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
     // linearly, the analytic dual derivative ∂(dy)/∂FR1 is exactly R_in1 (so
     // the FOCEI/Bayes gradient w.r.t. a pathway fraction is exact, no FD).
     use crate::pk::absorption::{InputRateForcing, InputRateKind};
-    use crate::sens::dual_mixed::DualMixed;
+    use crate::sens::dual2::Dual2;
     use crate::sens::num::PkNum;
     use crate::types::{MAX_PK_PARAMS, PK_IDX_F};
 
@@ -6759,15 +6843,17 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         &doses,
         &[0.0],
         &f_bio,
+        &[],
         // No `SS=1` record in these doses and no EVID=3/4 reset.
         ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+        t,
         t,
         &mut dy,
     );
     assert_relative_eq!(dy[0], fr1 * r1 + fr2 * r2, max_relative = 1e-12);
 
     // Dual: seed FR1 as the variable ⇒ value matches f64 and ∂(dy)/∂FR1 = R_in1.
-    type D = DualMixed<1, 1>;
+    type D = Dual2<1>;
     let mut dp = vec![D::constant(0.0); MAX_PK_PARAMS];
     dp[0] = D::var(fr1, 0);
     dp[1] = D::constant(fr2);
@@ -6787,9 +6873,11 @@ fn add_prepared_forcing_applies_pathway_fraction_linear_in_frac() {
         &doses,
         &[],
         &f_bio_d,
+        &[],
         // No `SS=1` record in these doses and no EVID=3/4 reset.
         ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
-        t,
+        D::from_f64(t),
+        D::from_f64(t),
         &mut dyd,
     );
     assert_relative_eq!(dyd[0].val(), fr1 * r1 + fr2 * r2, max_relative = 1e-12);
@@ -8992,14 +9080,14 @@ fn ss_input_rate_no_steady_state_warns() {
 /// jets, the derivative would be wrong even though the value converged.
 #[test]
 fn ss_input_rate_nonlinear_dual_gradient_matches_fd() {
-    use crate::sens::dual1::Dual1;
+    use crate::sens::dual2::Dual2;
     let theta_val = 2.0_f64;
     // P(u; θ) = θ / (1 + u), with θ seeded as the single differentiation variable.
-    let advance_dual = |u: &[Dual1<1>]| -> Option<Vec<Dual1<1>>> {
-        let theta = Dual1::<1>::var(theta_val, 0);
-        Some(vec![theta / (Dual1::<1>::constant(1.0) + u[0])])
+    let advance_dual = |u: &[Dual2<1>]| -> Option<Vec<Dual2<1>>> {
+        let theta = Dual2::<1>::var(theta_val, 0);
+        Some(vec![theta / (Dual2::<1>::constant(1.0) + u[0])])
     };
-    let u_star = anderson_ss_fixed_point_g::<Dual1<1>, _>(1, 1.0, 1e-12, 1e-14, &advance_dual)
+    let u_star = anderson_ss_fixed_point_g::<Dual2<1>, _>(1, 1.0, 1e-12, 1e-14, &advance_dual)
         .expect("a scalar contraction converges");
     let analytic_deriv = 1.0 / (1.0 + 4.0 * theta_val).sqrt(); // 1/3
     assert!(
@@ -9981,6 +10069,29 @@ fn ss_arrival_equilibration_is_the_complement_of_the_record_seed() {
 /// record and turns over at exactly `t = 2 = 8 − 12 + 6`.
 #[test]
 fn ss_residual_infusion_window_ends_where_the_previous_cycle_does() {
+    // Without overlap at most one earlier pulse is still running at the record.
+    let ss_residual_infusion_end = |d: &DoseEvent, lag: f64, f: f64| {
+        let ends: Vec<f64> =
+            ss_residual_infusion_ends(d, lag, f, f64::NEG_INFINITY, f64::INFINITY).collect();
+        assert!(ends.len() <= 1, "{ends:?}");
+        ends.first().copied()
+    };
+    // Overlapping pulses (`T_inf = 20 = 2.5·II`): two earlier pulses run past the record,
+    // stopping `II` apart — at the arrival when unseeded, `ALAG` later when seeded.
+    let overlap = DoseEvent::new(0.0, 1000.0, 1, 50.0, true, 8.0);
+    let ends = |lag: f64| {
+        ss_residual_infusion_ends(&overlap, lag, 1.0, f64::NEG_INFINITY, f64::INFINITY)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ends(0.0), vec![12.0, 4.0]);
+    assert_eq!(ends(3.0), vec![15.0, 7.0]);
+    // Exactly `2·II`: the pulse two intervals back stops on the record, so one remains.
+    let edge = DoseEvent::new(0.0, 800.0, 1, 50.0, true, 8.0);
+    assert_eq!(
+        ss_residual_infusion_ends(&edge, 0.0, 1.0, f64::NEG_INFINITY, f64::INFINITY)
+            .collect::<Vec<_>>(),
+        vec![8.0]
+    );
     // AMT 600 at RATE 100 => `DoseEvent::new` derives T_inf = 6, against II = 12.
     let inf = DoseEvent::new(0.0, 600.0, 1, 100.0, true, 12.0);
     assert_relative_eq!(inf.duration, 6.0, max_relative = 1e-12);
@@ -10012,7 +10123,7 @@ fn ss_residual_infusion_window_ends_where_the_previous_cycle_does() {
     assert_eq!(
         ss_residual_infusion_end(&inf, 0.0, 1.0),
         None,
-        "lag 0 is not seeded"
+        "lag 0 without overlap leaves nothing running"
     );
 
     // `F` reshapes a rate-defined window (#419), so the residual edge moves with it —
@@ -10088,9 +10199,15 @@ fn route_lagged_zero_order_break_builders_agree() {
     // The dense builder additionally brackets the timeline with the integration
     // start and the terminal, so add both to the prediction side before comparing.
     let mut from_predictions = vec![subject_integration_start(&subject), 24.0];
-    collect_dose_break_times(&mut from_predictions, &ode, &subject, &lags, &f_bio, |_| {
-        &pk[..]
-    });
+    collect_dose_break_times(
+        &mut from_predictions,
+        &ode,
+        &subject,
+        &lags,
+        &f_bio,
+        24.0,
+        |_| &pk[..],
+    );
     let from_predictions = normalize(from_predictions);
 
     let from_dense = build_segment_break_times(
@@ -10259,9 +10376,15 @@ fn route_lagged_first_order_onset_reaches_both_dense_builders() {
 
     // …and the prediction builder, which always had it, must agree.
     let mut from_predictions = Vec::new();
-    collect_dose_break_times(&mut from_predictions, &ode, &subject, &lags, &f_bio, |_| {
-        &pk[..]
-    });
+    collect_dose_break_times(
+        &mut from_predictions,
+        &ode,
+        &subject,
+        &lags,
+        &f_bio,
+        24.0,
+        |_| &pk[..],
+    );
     for want in [LAG_CMT + LAG_ROUTE, 12.0 + LAG_CMT + LAG_ROUTE] {
         assert!(
             from_predictions.iter().any(|&t| (t - want).abs() < 1e-12),
@@ -11470,7 +11593,7 @@ mod break_collision_1186 {
         let gated: std::collections::BTreeSet<usize> = (0..ds.len())
             .filter(|&k| {
                 let gate = ResetGate::at_segment(&ds, f64::NEG_INFINITY, f64::NEG_INFINITY);
-                !gated_infusions(&ir, &[(k, 0.0, 1.0)], &ds, &f, n_states, &gate).is_empty()
+                !gated_infusions(&ir, &[(k, 0.0, 1.0, 1)], &ds, &f, n_states, &gate).is_empty()
             })
             .collect();
 
@@ -11517,8 +11640,9 @@ mod break_collision_1186 {
         let residual = |cmt: usize| {
             let d = DoseEvent::new(0.0, 600.0, cmt, 100.0, true, 12.0);
             assert_eq!(
-                ss_residual_infusion_end(&d, 8.0, 1.0),
-                Some(2.0),
+                ss_residual_infusion_ends(&d, 8.0, 1.0, f64::NEG_INFINITY, f64::INFINITY)
+                    .collect::<Vec<_>>(),
+                vec![2.0],
                 "fixture: the residual window must be [0, 2] for CMT {cmt}"
             );
             active_infusions(
@@ -11566,7 +11690,7 @@ mod break_collision_1186 {
     /// no panic, and every prediction `NaN`.
     ///
     /// Mutation — restore `partial_cmp(..).unwrap()` → panic; delete the
-    /// `timeline_has_non_finite` guard → finite predictions and the assert below fires.
+    /// `times_have_non_finite` guard → finite predictions and the assert below fires.
     #[test]
     fn non_finite_lag_yields_non_finite_subject_not_panic() {
         let ode = spec();
@@ -11606,7 +11730,7 @@ mod break_collision_1186 {
     /// that fired unconditionally would pass.
     ///
     /// Mutation (run): revert any one engine's `abandon_non_finite_timeline` to the bare
-    /// `timeline_has_non_finite` → that engine's arm fires by name and the other three stay
+    /// `times_have_non_finite` → that engine's arm fires by name and the other three stay
     /// green.
     #[test]
     fn every_dense_engine_records_its_own_abandoned_walk() {
@@ -11707,12 +11831,12 @@ mod break_collision_1186 {
     /// .unwrap_or(Ordering::Equal)`, the spelling elsewhere in the codebase *as* the
     /// NaN-safe fix, is not a total order either, and `sort_by` panics when it detects
     /// one — but that detection is opportunistic (see
-    /// [`timeline_has_non_finite`](crate::ode::predictions::timeline_has_non_finite) for
+    /// [`times_have_non_finite`](crate::ode::predictions::times_have_non_finite) for
     /// the measurement), so it cannot be relied on as a test signal. What this asserts is
     /// therefore the *outcome*: no panic, and a non-finite subject on every engine.
     ///
     /// Mutations (run): restore `partial_cmp(..).unwrap()` on the objective builder →
-    /// panic; drop the objective's `timeline_has_non_finite` guard → finite predictions
+    /// panic; drop the objective's `times_have_non_finite` guard → finite predictions
     /// and the assert below fires.
     #[test]
     fn timeline_sort_never_panics_on_nan() {
@@ -13231,9 +13355,10 @@ fn ss_into_absorption_monotone_train_advances_the_tad_anchor_each_cycle() {
 /// The branch tag reports **`None`** when an equilibration bails out, rather than leaving
 /// the previous call's value.
 ///
-/// Written because the enum's doc claimed that behaviour before the code had it: the three
-/// early returns in `equilibrate_ss_pk_state` (`II <= 0`, an out-of-range dose compartment,
-/// an overlapping infusion) used to leave whatever the last completing call had recorded.
+/// Written because the enum's doc claimed that behaviour before the code had it: the early
+/// returns in `equilibrate_ss_pk_state` (`II <= 0`, an out-of-range dose compartment; an
+/// overlapping infusion too, until #2786 equilibrated it) used to leave whatever the last
+/// completing call had recorded.
 /// A test asserting a branch after one of those would have read a stale tag and passed for
 /// the wrong reason — the un-failable-assertion class the tag exists to close, reappearing
 /// inside the tag itself.
@@ -13260,7 +13385,7 @@ fn a_bailed_out_ss_equilibration_reports_no_branch() {
          below passes on the initial value and tests nothing"
     );
 
-    // 2. `II <= 0`: the first of the three early returns.
+    // 2. `II <= 0`: the first of the two early returns.
     let bad_ii = DoseEvent::new(480.0, amt, 1, 0.0, true, 0.0);
     let _ = equilibrate_ss_state(&ode, &pk.values, &bad_ii, &ode.solver_opts, &[]);
     assert_eq!(
@@ -13278,37 +13403,6 @@ fn a_bailed_out_ss_equilibration_reports_no_branch() {
         crate::dosing::last_ss_equilibration_branch(),
         crate::dosing::SsBranch::None,
         "an out-of-range dose compartment must clear the tag too"
-    );
-
-    // 4. …and the **overlapping infusion** (`T_inf > II`), the third bail-out the enum's doc
-    //    names — so the doc and the test agree on the set rather than on two thirds of it.
-    //
-    //    What this arm does *not* buy, measured rather than assumed: it is **not** the unique
-    //    catcher of a clear that migrates downward. The clear sits above all three returns, so
-    //    moving it below any of them breaks the *earliest* affected arm first — mutating it to
-    //    just above `let is_inf` was expected to leave 2 and 3 green and kill only this one,
-    //    and instead tripped arm 2 (`II <= 0`). An earlier draft of this comment claimed
-    //    otherwise. What arm 4 uniquely covers is a branch tag being *recorded* between the
-    //    compartment check and the overlap return — e.g. if resolving the infusion window ever
-    //    grows a `record_ss_equilibration_branch` of its own — which arms 2 and 3 return before
-    //    reaching.
-    let _ = equilibrate_ss_state(&ode, &pk.values, &good, &ode.solver_opts, &[]);
-    let overlapping = DoseEvent::new(480.0, amt, 1, 5.0, true, ii); // T_inf = 20 > II = 12
-    assert!(
-        overlapping.is_infusion(),
-        "precondition: this arm needs a real infusion"
-    );
-    let (_, t_inf) = overlapping.bioavailable_infusion(1.0);
-    assert!(
-        t_inf > ii,
-        "precondition: T_inf ({t_inf}) must exceed II ({ii}) to reach the third bail-out"
-    );
-    let _ = equilibrate_ss_state(&ode, &pk.values, &overlapping, &ode.solver_opts, &[]);
-    assert_eq!(
-        crate::dosing::last_ss_equilibration_branch(),
-        crate::dosing::SsBranch::None,
-        "an overlapping SS infusion must clear the tag too — this is the bail-out furthest \
-         from the clear, so it is the one that would break first if the clear moved"
     );
 }
 
@@ -13382,7 +13476,7 @@ fn ss_monotone_run_in_anchor_is_the_same_with_an_empty_lag_slice() {
 /// dose time must record nothing, so this cannot pass on a counter that fires on every run.
 ///
 /// Mutation: delete the record at `ode_predictions_adaptive_impl`'s guard (route it through
-/// the bare `timeline_has_non_finite` again) → the abandoned arm reads 0 and the first
+/// the bare `times_have_non_finite` again) → the abandoned arm reads 0 and the first
 /// assert fires naming the driver; no other test in the tree moves.
 #[test]
 fn the_adaptive_driver_records_an_abandoned_walk() {
@@ -13535,7 +13629,7 @@ fn the_adaptive_frozen_replay_records_an_abandoned_walk() {
 
 /// **The pairing is structural, not conventional (#1234 §5).**
 ///
-/// `timeline_has_non_finite` / `times_have_non_finite` decide *whether* a walk is abandoned;
+/// `times_have_non_finite` / `times_have_non_finite` decide *whether* a walk is abandoned;
 /// [`abandon_non_finite_timeline`](crate::ode::predictions::abandon_non_finite_timeline) also
 /// *records* it. Nothing in the type system stops a ninth guard from taking the bare
 /// predicate — it would compile, run, and silently put the diagnostic back to `0/0/0` for
@@ -13546,7 +13640,7 @@ fn the_adaptive_frozen_replay_records_an_abandoned_walk() {
 /// this lists both rather than allowing a directory:
 ///
 /// * `src/ode/predictions.rs` — twice, and both inside the shared helpers themselves
-///   (`timeline_has_non_finite`'s one-line body, and `abandon_non_finite_timeline`'s test).
+///   (`times_have_non_finite`'s one-line body, and `abandon_non_finite_timeline`'s test).
 ///   A third would be a guard that bypassed the recorder.
 /// * `src/sens/ode_provider.rs` — twice, the two analytic-sensitivity walks, which carry the
 ///   same predicate and deliberately do **not** record: their sweep is collected in a
@@ -13558,7 +13652,7 @@ fn the_adaptive_frozen_replay_records_an_abandoned_walk() {
 /// exclusion cannot quietly widen or vanish.
 ///
 /// Mutation (run): revert any one of the eight engine guards to
-/// `timeline_has_non_finite(&break_times)` → `src/ode/predictions.rs` reads 3 and this fires
+/// `times_have_non_finite(&break_times)` → `src/ode/predictions.rs` reads 3 and this fires
 /// naming the file. Adding a bare call in a new file fires with that file named.
 #[test]
 fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
@@ -13599,7 +13693,7 @@ fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
             // Comments are where these names legitimately appear everywhere — the guards'
             // own prose, the mutation notes, the field doc. Only code counts.
             let code = line.split("//").next().unwrap_or("");
-            for name in ["timeline_has_non_finite", "times_have_non_finite"] {
+            for name in ["times_have_non_finite"] {
                 // `fn <name>(` is the definition, not a call.
                 let defined = code.contains(&format!("fn {name}("));
                 if code.contains(&format!("{name}(")) && !defined {
@@ -13613,13 +13707,13 @@ fn the_bare_timeline_predicates_are_not_called_outside_this_guard() {
     // Non-degeneracy: a rename that made the scan match nothing would otherwise pass.
     assert_eq!(
         seen_name.len(),
-        2,
-        "both predicate names must still be called somewhere, or this test is scanning for \
-         strings that no longer exist: {seen_name:?}"
+        1,
+        "the predicate must still be called somewhere, or this test is scanning for a \
+         string that no longer exists: {seen_name:?}"
     );
 
     let expected: BTreeMap<String, usize> = [
-        ("src/ode/predictions.rs".to_string(), 2),
+        ("src/ode/predictions.rs".to_string(), 1),
         ("src/sens/ode_provider.rs".to_string(), 2),
     ]
     .into_iter()
@@ -15963,142 +16057,22 @@ fn adaptive_nan_amount_from_a_finite_state_is_still_a_controller_action() {
     assert!(!msg.contains("diverged"), "{msg}");
 }
 
-/// A stiff, non-linear model integrated by Rosenbrock: `J` is filled from the batched lane
-/// evaluator (`OdeRhsProgram::rhs_columns` through `rosenbrock::FdColumnsGuard`), and the
-/// whole solve must be bit-identical to the scalar column loop. `cond` adds a branch on the
-/// state, whose lanes can disagree near the switch and then fall back to scalar columns.
-fn batched_jacobian_model(cond: bool) -> crate::types::CompiledModel {
-    let elim = if cond {
-        "(if (central > 20.0) VMAX else 0.5 * VMAX) * central / (KM + central)"
-    } else {
-        "VMAX * central / (KM + central)"
-    };
+/// A stiff, non-linear Rodas4 model over `odes`: Michaelis-Menten elimination (a branch on
+/// the state when `cond`), a stiff central/peripheral exchange and, in `odes`, whatever reads
+/// time or forces (`TIME`, `transit()`).
+fn stiff_model(odes: &str) -> crate::types::CompiledModel {
     let src = format!(
         "[parameters]
   theta TVKA(1.2, 0.01, 10.0)
   theta TVVMAX(40.0, 0.1, 1000.0)
   theta TVKM(2.0, 0.01, 100.0)
+  theta TVMTT(1.0, 0.01, 10.0)
   omega ETA_KA ~ 0.09
   sigma PROP_ERR ~ 0.04
 [individual_parameters]
   KA = TVKA * exp(ETA_KA)
   VMAX = TVVMAX
   KM = TVKM
-[structural_model]
-  ode(obs_cmt=central, states=[depot, central, periph])
-[odes]
-  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - {elim} - 300.0 * central + 30.0 * periph
-  d/dt(periph) = 300.0 * central - 30.0 * periph
-[error_model]
-  DV ~ proportional(PROP_ERR)
-[fit_options]
-  ode_method = rodas4
-"
-    );
-    crate::parser::model_parser::parse_model_string(&src).expect("model must parse")
-}
-
-#[test]
-fn batched_fd_jacobian_columns_are_bit_identical_to_the_scalar_loop() {
-    use crate::ode::rosenbrock::{DIRECT_STEP_OFF, FD_COLUMNS_HITS, FD_COLUMNS_OFF};
-    let s = make_subject(
-        vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
-            // An infusion: a forcing the batched columns must add per column too.
-            DoseEvent::new(30.0, 50.0, 2, 25.0, false, 0.0),
-        ],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0],
-    );
-    for cond in [false, true] {
-        let model = batched_jacobian_model(cond);
-        // A compiled program's steps call its machine code directly (`DIRECT_STEP_OFF`),
-        // columns included, which bypasses the batched columns: switched off for the
-        // batched-vs-scalar comparison, and compared on its own below.
-        let run = |off: bool, direct: bool| {
-            FD_COLUMNS_OFF.with(|c| c.set(off));
-            DIRECT_STEP_OFF.with(|c| c.set(!direct));
-            FD_COLUMNS_HITS.with(|c| c.set(0));
-            let p = crate::pk::compute_predictions_with_tv(
-                &model,
-                &s,
-                &model.default_params.theta,
-                &[0.1],
-            );
-            FD_COLUMNS_OFF.with(|c| c.set(false));
-            DIRECT_STEP_OFF.with(|c| c.set(false));
-            (p, FD_COLUMNS_HITS.with(|c| c.get()))
-        };
-        let (batched, hits) = run(false, false);
-        let (scalar, scalar_hits) = run(true, false);
-        let (direct, _) = run(false, true);
-        for (j, (a, b)) in direct.iter().zip(&scalar).enumerate() {
-            assert_eq!(
-                a.to_bits(),
-                b.to_bits(),
-                "cond={cond} obs {j}: direct steps {a} vs scalar loop {b}"
-            );
-        }
-        assert!(
-            hits > 0,
-            "cond={cond}: the batched columns must actually fill J (non-vacuity)"
-        );
-        assert_eq!(scalar_hits, 0);
-        assert!(batched.iter().all(|v| v.is_finite()), "{batched:?}");
-        for (j, (a, b)) in batched.iter().zip(&scalar).enumerate() {
-            assert_eq!(a.to_bits(), b.to_bits(), "cond={cond} obs {j}: {a} vs {b}");
-        }
-    }
-}
-
-/// A Rosenbrock step on an autonomous segment forms `f_t` without its second right-hand-side
-/// call (`FdColumnsGuard`'s `autonomous`), and the predictions are bit for bit the call's.
-/// The two controls read time — through the program (`TIME`) and through an input-rate
-/// forcing (`transit()`, a function of time since dose) — and must keep the call, or their
-/// `f_t` would silently become zero.
-#[test]
-fn an_autonomous_segment_takes_f_t_without_a_second_rhs_call_bit_for_bit() {
-    use crate::ode::rosenbrock::{FT_SKIPS, FT_SKIP_OFF};
-    let s = make_subject(
-        vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
-            // A spanning infusion: constant over each segment, so still autonomous.
-            DoseEvent::new(30.0, 50.0, 2, 25.0, false, 0.0),
-        ],
-        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0],
-    );
-    let run = |model: &crate::types::CompiledModel, off: bool| {
-        FT_SKIP_OFF.with(|c| c.set(off));
-        FT_SKIPS.with(|c| c.set(0));
-        let p =
-            crate::pk::compute_predictions_with_tv(model, &s, &model.default_params.theta, &[0.1]);
-        FT_SKIP_OFF.with(|c| c.set(false));
-        (p, FT_SKIPS.with(|c| c.get()))
-    };
-    let model = batched_jacobian_model(false);
-    let (skipped, skips) = run(&model, false);
-    let (called, called_skips) = run(&model, true);
-    assert!(
-        skips > 0,
-        "the autonomous segments must actually skip the call (non-vacuity)"
-    );
-    assert_eq!(called_skips, 0);
-    assert!(skipped.iter().all(|v| v.is_finite()), "{skipped:?}");
-    for (j, (a, b)) in skipped.iter().zip(&called).enumerate() {
-        assert_eq!(a.to_bits(), b.to_bits(), "obs {j}: {a} vs {b}");
-    }
-
-    let reads_time = |odes: &str| -> crate::types::CompiledModel {
-        let src = format!(
-            "[parameters]
-  theta TVKA(1.2, 0.01, 10.0)
-  theta TVMTT(1.0, 0.01, 10.0)
-  omega ETA_KA ~ 0.09
-  sigma PROP_ERR ~ 0.04
-[individual_parameters]
-  KA = TVKA * exp(ETA_KA)
   MTT = TVMTT
   NTR = 3
 [structural_model]
@@ -16110,99 +16084,299 @@ fn an_autonomous_segment_takes_f_t_without_a_second_rhs_call_bit_for_bit() {
 [fit_options]
   ode_method = rodas4
 "
-        );
-        crate::parser::model_parser::parse_model_string(&src).expect("model must parse")
-    };
-    for (label, odes) in [
-        (
-            "TIME in the program",
-            "  d/dt(depot) = -KA * depot
-  d/dt(central) = KA * depot - 300.0 * central * exp(-0.01 * TIME) + 30.0 * periph
-  d/dt(periph) = 300.0 * central - 30.0 * periph",
-        ),
-        (
-            "an input-rate forcing",
-            "  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA * depot
-  d/dt(central) = KA * depot - 300.0 * central + 30.0 * periph
-  d/dt(periph) = 300.0 * central - 30.0 * periph",
-        ),
-    ] {
-        let (_, skips) = run(&reads_time(odes), false);
-        assert_eq!(skips, 0, "{label}: f_t reads time, the call must stay");
-    }
+    );
+    crate::parser::model_parser::parse_model_string(&src).expect("model must parse")
 }
 
-/// The gated engines' leg of `segment_autonomous`: an infusion **gated** inside a segment
-/// (switched on and off by its window rather than broken on) makes the forced RHS depend on
-/// time, so the Rosenbrock `f_t` must stay a real evaluation. Through all three engines that
-/// gate infusions — `ode_predictions_with_states`, the dense solve, the CHZ-threshold solve —
-/// an infusion running over every segment must skip nothing, while the same subject with
-/// bolus doses skips (the straddle: the predicate, not the engine, decides).
-#[test]
-fn a_gated_infusion_keeps_f_t_on_every_gated_engine() {
-    use crate::ode::rosenbrock::FT_SKIPS;
-    let model = batched_jacobian_model(false);
-    let ode = model.ode_spec.as_ref().expect("ODE model");
-    let pk = (model.pk_param_fn)(
+const STIFF_MM: &str = "  d/dt(depot) = -KA * depot
+  d/dt(central) = KA * depot - (if (central > 20.0) VMAX else 0.5 * VMAX) * central / (KM + central) - 300.0 * central * exp(-0.01 * TIME) + 30.0 * periph
+  d/dt(periph) = 300.0 * central * exp(-0.01 * TIME) - 30.0 * periph";
+const STIFF_TRANSIT: &str = "  d/dt(depot) = transit(n=NTR, mtt=MTT) - KA * depot
+  d/dt(central) = KA * depot - VMAX * central / (KM + central) - 300.0 * central + 30.0 * periph
+  d/dt(periph) = 300.0 * central - 30.0 * periph";
+
+/// The model's extended parameter vector, anchored at a first dose at `0`.
+fn stiff_params(model: &crate::types::CompiledModel) -> Vec<f64> {
+    let mut p = (model.pk_param_fn)(
         &model.default_params.theta,
         &[0.1],
         &Default::default(),
         0.0,
     )
-    .values;
-    let obs = vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0];
-    // Rate 2 for 60 h: active across every observation segment.
-    let infused = make_subject(
-        vec![
-            DoseEvent::new(0.0, 120.0, 2, 2.0, false, 0.0),
-            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        obs.clone(),
+    .values
+    .to_vec();
+    p.resize(crate::types::MAX_PK_PARAMS + 2, 0.0);
+    p
+}
+
+/// The exact `J` and `f_t` of the forced right-hand side (`forced_jac`) against central
+/// differences of the same closure: through the program's time (`TIME`), a spanning infusion
+/// and a branch on the state, and through a built-in absorption forcing, whose time
+/// derivative is the one part that does not come from the program.
+///
+/// Measured worst relative error `|a − b| / max(1, |b|)` (central difference, step
+/// `1e-6·max(1, |x|)`, Linux x86_64): 4.8e-8 on both — the central difference's own
+/// `O(h²)` and rounding error, `1e-6·max(1, |x|)` steps on entries up to `300`; the bound
+/// `2e-6` is 40× that. A mutated `J` entry or a dropped `f_t` term
+/// is off by `≥ 1e-2` relative.
+#[test]
+fn the_exact_rhs_jacobian_matches_central_differences() {
+    const TOL: f64 = 2e-6;
+    let doses = vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)];
+    for (label, odes) in [("STIFF_MM", STIFF_MM), ("STIFF_TRANSIT", STIFF_TRANSIT)] {
+        let model = stiff_model(odes);
+        let ode = model.ode_spec.as_ref().expect("ODE model");
+        let p = stiff_params(&model);
+        let prepared = prepare_input_rates(ode, &p);
+        let force = forcing_adder(
+            ode,
+            &doses,
+            &[0.0],
+            &[1.0],
+            f64::NEG_INFINITY,
+            0.0,
+            &prepared,
+            InfusionInput::Spanning(vec![(1, 3.0)]),
+            &[],
+        );
+        let f = forced(ode, &force);
+        let jac = forced_jac(ode, &force, false).expect("the spec's RHS is its program's");
+        let n = ode.n_states;
+        let eval = |u: &[f64], t: f64| {
+            let mut du = vec![0.0; n];
+            f(u, &p, t, &mut du);
+            du
+        };
+        let mut worst = 0.0_f64;
+        let (mut max_ft, mut max_off) = (0.0_f64, 0.0_f64);
+        // On both sides of the state branch (`central > 20`), away from its kink.
+        for (u, t) in [
+            ([5.0, 3.0, 0.5], 1.7),
+            ([0.4, 80.0, 2.0], 9.0),
+            ([0.0, 0.0, 0.0], 0.3),
+        ] {
+            let (mut j, mut ft) = (vec![0.0; n * n], vec![0.0; n]);
+            assert!(jac(&u, &p, t, &mut j, &mut ft));
+            let mut check = |got: f64, want: f64| {
+                assert!(
+                    got.is_finite() && want.is_finite(),
+                    "{label}: {got} vs {want}"
+                );
+                worst = worst.max((got - want).abs() / want.abs().max(1.0));
+            };
+            for c in 0..n {
+                let h = 1e-6 * u[c].abs().max(1.0);
+                let (mut up, mut dn) = (u, u);
+                up[c] += h;
+                dn[c] -= h;
+                let (fp, fm) = (eval(&up, t), eval(&dn, t));
+                for r in 0..n {
+                    check(j[r * n + c], (fp[r] - fm[r]) / (2.0 * h));
+                    if r != c {
+                        assert!(j[r * n + c].is_finite(), "{label}: J[{r}][{c}]");
+                        max_off = max_off.max(j[r * n + c].abs());
+                    }
+                }
+            }
+            let h = 1e-6 * t.abs().max(1.0);
+            let (fp, fm) = (eval(&u, t + h), eval(&u, t - h));
+            for r in 0..n {
+                check(ft[r], (fp[r] - fm[r]) / (2.0 * h));
+                assert!(ft[r].is_finite(), "{label}: f_t[{r}]");
+                max_ft = max_ft.max(ft[r].abs());
+            }
+        }
+        eprintln!("{label}: worst relative error {worst:e}");
+        assert!(worst < TOL, "{label}: worst relative error {worst:e}");
+        // Non-vacuity: the time derivative and the coupling are live.
+        assert!(max_ft > 1e-3, "{label}: f_t is dead ({max_ft})");
+        assert!(max_off > 1.0, "{label}: J has no coupling ({max_off})");
+    }
+}
+
+/// The recording type's `J` and `f_t` (`kernel_jit::jacobian`, read off the recording of one
+/// call) equal the `f64` evaluator's (`forced_jac`) on the same program, state and clock.
+/// Measured worst relative difference 0 (bit-identical on the points below); the bound is
+/// `1e-12`, since the two are not promised to associate alike.
+#[test]
+fn the_recorded_rhs_jacobian_matches_the_f64_one() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use crate::sens::num::PkNum;
+    let model = stiff_model(STIFF_MM);
+    let ode = model.ode_spec.as_ref().expect("ODE model");
+    let prog = ode.rhs_program.as_ref().expect("program");
+    let p = stiff_params(&model);
+    let prepared = prepare_input_rates(ode, &p);
+    let force = forcing_adder(
+        ode,
+        &[],
+        &[],
+        &[],
+        f64::NEG_INFINITY,
+        0.0,
+        &prepared,
+        InfusionInput::Spanning(vec![]),
+        &[],
     );
-    let bolus = make_subject(
+    let jac = forced_jac(ode, &force, false).expect("the spec's RHS is its program's");
+    let n = ode.n_states;
+    let mut worst = 0.0_f64;
+    for (u, t) in [([5.0, 3.0, 0.5], 1.7), ([0.4, 80.0, 2.0], 9.0)] {
+        let (mut want_j, mut want_ft) = (vec![0.0; n * n], vec![0.0; n]);
+        assert!(jac(&u, &p, t, &mut want_j, &mut want_ft));
+        kj::begin();
+        let ut: Vec<kj::Tr> = u
+            .iter()
+            .enumerate()
+            .map(|(j, &x)| kj::Tr::theta(j, x))
+            .collect();
+        let pt: Vec<kj::Tr> = p.iter().map(|&x| kj::Tr::from_f64(x)).collect();
+        let rhs = |u: &[kj::Tr], p: &[kj::Tr], t: kj::Tr, du: &mut [kj::Tr]| {
+            let (mut vars, mut stack) = (Vec::new(), Vec::new());
+            crate::sens::ode_provider::eval_rhs_at_offset(
+                prog,
+                u,
+                p,
+                t,
+                kj::Tr::from_f64(0.0),
+                p[crate::types::MAX_PK_PARAMS].val(),
+                p[crate::types::MAX_PK_PARAMS + 1],
+                du,
+                &mut vars,
+                &mut stack,
+            );
+        };
+        let zero = kj::Tr::from_f64(0.0);
+        let (mut f, mut j, mut ft) = (vec![zero; n], vec![zero; n * n], vec![zero; n]);
+        assert!(<kj::Tr as crate::sens::num::RecHooks>::rhs_jacobian(
+            &rhs,
+            &ut,
+            &pt,
+            kj::Tr::from_f64(t),
+            &mut f,
+            &mut j,
+            &mut ft
+        ));
+        let got: Vec<f64> = j.iter().chain(&ft).map(|x| x.recorded()).collect();
+        let want: Vec<f64> = want_j.iter().chain(&want_ft).copied().collect();
+        let _ = kj::end(Some(vec![]));
+        for (g, w) in got.iter().zip(&want) {
+            assert!(g.is_finite() && w.is_finite(), "{g} vs {w}");
+            worst = worst.max((g - w).abs() / w.abs().max(1.0));
+        }
+        assert!(want.iter().any(|w| w.abs() > 1.0), "non-vacuity");
+    }
+    eprintln!("recorded vs f64 J: worst relative difference {worst:e}");
+    assert!(worst < 1e-12, "{worst:e}");
+}
+
+/// A stiff solve with the exact `J` and `f_t` against the same solve with the differenced
+/// ones (`EXACT_JAC_OFF`, the host-closure fallback): the textbook method with `J` moves the
+/// solution by the solver's own tolerance, and the two are not the same bits (non-vacuity:
+/// the registered evaluator is what the first run takes). Measured worst relative shift of the
+/// predictions (Linux x86_64): 1.0e-8 (`STIFF_MM`) and 3.4e-8 (`STIFF_TRANSIT`, which a cumulative-frame segment steps on `v + shift(t)`: 3.6e-9 before it); the bound is
+/// `1e-7`.
+#[test]
+fn an_exact_jacobian_moves_a_stiff_solve_by_the_solver_tolerance() {
+    use crate::ode::rosenbrock::EXACT_JAC_OFF;
+    let s = make_subject(
         vec![
-            DoseEvent::new(0.0, 120.0, 2, 0.0, false, 0.0),
+            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
             DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(30.0, 50.0, 2, 25.0, false, 0.0),
         ],
-        obs.clone(),
+        vec![0.5, 1.0, 2.0, 4.0, 8.0, 12.5, 16.0, 24.0, 31.0, 36.0, 48.0],
     );
-    let skips = |f: &dyn Fn(&Subject)| -> [usize; 2] {
-        [&infused, &bolus].map(|s| {
-            FT_SKIPS.with(|c| c.set(0));
-            f(s);
-            FT_SKIPS.with(|c| c.get())
-        })
-    };
-    #[allow(unused_mut)]
-    let mut engines: Vec<(&str, Box<dyn Fn(&Subject)>)> = vec![
+    for (label, odes) in [("STIFF_MM", STIFF_MM), ("STIFF_TRANSIT", STIFF_TRANSIT)] {
+        let model = stiff_model(odes);
+        let run = |off: bool| {
+            EXACT_JAC_OFF.with(|c| c.set(off));
+            let p = crate::pk::compute_predictions_with_tv(
+                &model,
+                &s,
+                &model.default_params.theta,
+                &[0.1],
+            );
+            EXACT_JAC_OFF.with(|c| c.set(false));
+            p
+        };
+        let (exact, differenced) = (run(false), run(true));
+        assert!(exact.iter().all(|v| v.is_finite()), "{label}: {exact:?}");
+        let worst = exact
+            .iter()
+            .zip(&differenced)
+            .map(|(a, b)| (a - b).abs() / b.abs().max(1e-3))
+            .fold(0.0_f64, f64::max); // nan-ok: the predictions are asserted finite above
+        eprintln!("{label}: exact vs differenced J, worst relative shift {worst:e}");
+        assert!(
+            worst > 0.0,
+            "{label}: the exact J was not taken (non-vacuity)"
+        );
+        assert!(worst < 1e-7, "{label}: shift {worst:e}");
+    }
+}
+
+/// The steady-state run-ins take the exact `J` too: `equilibrate_ss_state` (the capped pulse
+/// train on a saturable disposition, the infusion windows, the input-rate branch on a transit
+/// absorption) and `ss_state_at_phase`, each on a stiff method, against the same run with the
+/// registrations off (`EXACT_JAC_OFF`). Non-vacuity: every shift is nonzero (the registered
+/// evaluator is what the first run takes), and a run-in closure left unregistered shows as a
+/// zero shift on its own row. Measured worst relative shift of the run-in state (Linux x86_64):
+/// 2.4e-8 (`STIFF_MM` trough), 8.7e-10 .. 3.3e-9 on the phase advances, 2.9e-12 and 5.2e-12 on
+/// the transit troughs (a linear disposition: the exact fixed point barely reads `J`); bound
+/// `1e-7`.
+#[test]
+fn an_exact_jacobian_moves_a_stiff_steady_state_run_in_by_the_solver_tolerance() {
+    use crate::ode::rosenbrock::EXACT_JAC_OFF;
+    let cases: [(&str, &str, DoseEvent); 4] = [
         (
-            "ode_predictions_with_states",
-            Box::new(|s: &Subject| {
-                ode_predictions_with_states(ode, &pk, &[], &[], s);
-            }),
+            "STIFF_MM bolus",
+            STIFF_MM,
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
         ),
         (
-            "ode_dense_solve_states",
-            Box::new(|s: &Subject| {
-                ode_dense_solve_states(ode, &pk, &[], &[], s, &obs);
-            }),
+            "STIFF_MM infusion",
+            STIFF_MM,
+            DoseEvent::new(0.0, 100.0, 2, 20.0, true, 12.0),
+        ),
+        (
+            "STIFF_TRANSIT bolus (input-rate branch)",
+            STIFF_TRANSIT,
+            DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0),
+        ),
+        (
+            "STIFF_TRANSIT infusion",
+            STIFF_TRANSIT,
+            DoseEvent::new(0.0, 100.0, 2, 20.0, true, 12.0),
         ),
     ];
-    #[cfg(feature = "survival")]
-    engines.push((
-        "ode_solve_until_chz_threshold",
-        Box::new(|s: &Subject| {
-            // A threshold never reached: the solve runs every segment to the horizon.
-            ode_solve_until_chz_threshold(ode, &pk, DoseReads::Shared(&pk), s, 2, 1e300, 48.0);
-        }),
-    ));
-    for (name, f) in &engines {
-        let [gated, plain] = skips(f.as_ref());
-        assert_eq!(
-            gated, 0,
-            "{name}: a gated infusion's segments must keep the f_t call"
-        );
-        assert!(plain > 0, "{name}: the bolus twin must skip (non-vacuity)");
+    for (label, odes, dose) in cases {
+        let model = stiff_model(odes);
+        let ode = model.ode_spec.as_ref().unwrap();
+        let p = stiff_params(&model);
+        let opts = ode.effective_solver_opts();
+        let run = |off: bool| {
+            EXACT_JAC_OFF.with(|c| c.set(off));
+            let at_trough = equilibrate_ss_state(ode, &p, &dose, &opts, &[]);
+            let at_phase = ss_state_at_phase(ode, &p, &dose, 3.0, &opts, &[]);
+            EXACT_JAC_OFF.with(|c| c.set(false));
+            (at_trough, at_phase)
+        };
+        let ((e_t, e_p), (d_t, d_p)) = (run(false), run(true));
+        for (what, exact, differenced) in [("trough", e_t, d_t), ("phase", e_p, d_p)] {
+            assert!(
+                exact.iter().all(|v| v.is_finite()),
+                "{label} {what}: {exact:?}"
+            );
+            let worst = exact
+                .iter()
+                .zip(&differenced)
+                .map(|(a, b)| (a - b).abs() / b.abs().max(1e-3))
+                .fold(0.0_f64, f64::max); // nan-ok: the states are asserted finite above
+            eprintln!("{label} {what}: exact vs differenced J, worst relative shift {worst:e}");
+            assert!(worst > 0.0, "{label} {what}: the exact J was not taken");
+            assert!(worst < 1e-7, "{label} {what}: shift {worst:e}");
+        }
     }
 }
 
@@ -17637,4 +17811,155 @@ fn public_ode_predictions_stops_an_infusion_at_an_off_row() {
             "{name}: worst rel {worst:e}: {got:?} vs {want:?}"
         );
     }
+}
+
+/// The convolved infusion input trusts its segment to lie wholly before the infusion's onset or
+/// past it (`rate_infused`, #2786 review #14), so a caller whose break list lacks the onset must
+/// fail loudly in debug, not deliver a wrong rate. (The window end is not trusted any more: a
+/// straddling segment is served, see below.) A segment `[0, 2]` straddles an onset at 1; the
+/// segments on the correct side of each edge, the same calls one step away, are the controls that
+/// do not panic. Dies when the onset assertion goes.
+#[cfg(debug_assertions)]
+mod infusion_edge_contract {
+    use super::*;
+
+    fn run(doses: &[DoseEvent], t: f64, since: f64) {
+        let ode = first_order_one_cpt_spec();
+        let mut pk = PkParams::default();
+        pk.values[crate::types::PK_IDX_CL] = 2.0;
+        pk.values[crate::types::PK_IDX_V] = 20.0;
+        pk.values[4] = 0.6;
+        let prepared = prepare_input_rates(&ode, &pk.values);
+        let mut dy = [0.0_f64];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            doses,
+            &[0.0],
+            &[0.6],
+            &[],
+            ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+            t,
+            since,
+            &mut dy,
+        );
+    }
+
+    fn infusion(at: f64) -> DoseEvent {
+        DoseEvent::new(at, 100.0, 1, 25.0, false, 0.0)
+    }
+
+    #[test]
+    fn segments_on_one_side_of_each_edge_are_accepted() {
+        run(&[infusion(0.0)], 2.0, 1.0); // wholly inside the window (ends at 2.4)
+        run(&[infusion(0.0)], 3.0, 2.5); // wholly past it
+        run(&[infusion(2.0)], 1.5, 1.0); // wholly before the onset
+    }
+
+    /// The window end is not a contract: a segment straddling it is served (the tail side, by
+    /// the stage's own time — `infusion_into_kernel_window_end_is_right_without_a_break_at_it`
+    /// pins the value), so it neither panics in debug nor runs `R_in` past the end in release.
+    #[test]
+    fn a_segment_straddling_the_window_end_is_served() {
+        run(&[infusion(0.0)], 3.0, 1.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "onset")]
+    fn a_segment_straddling_the_onset_is_refused() {
+        run(&[infusion(1.0)], 2.0, 0.0);
+    }
+}
+
+/// The side of the infusion window's end a stage lies on is a recorded decision, not a plain
+/// read (#2786 round 2, finding 5): a plan recorded with the stage before the end (the running
+/// side) must not serve the running side at a θ that moves the end before the stage. Window `5`
+/// (end 5, stage 4) records; window `3.5` (end before the stage) must give the tail side's value
+/// (or decline); `4.5` (same side) still serves, matching the `f64` engine. Mutation: decide
+/// the side from `t.seen_value()` (the old plain read) -> the plan serves the running-side
+/// value at window 3.5.
+#[test]
+fn the_window_end_side_of_a_stage_is_a_guard_of_the_plan() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use crate::sens::num::vm::Layout;
+    use crate::sens::num::PkNum;
+    let ode = first_order_one_cpt_spec();
+    let (amt, since, t) = (100.0_f64, 3.0_f64, 4.0_f64);
+    let dose = DoseEvent::new(0.0, amt, 1, 25.0, false, 0.0);
+    let ka = 0.6;
+    let f64_at = |window: f64| -> f64 {
+        let mut pk = vec![0.0; crate::types::MAX_PK_PARAMS];
+        pk[4] = ka;
+        let prepared = prepare_input_rates(&ode, &pk);
+        let mut dy = [0.0_f64];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            std::slice::from_ref(&dose),
+            &[0.0],
+            &[1.0],
+            &[Some(window)],
+            ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+            t,
+            since,
+            &mut dy,
+        );
+        dy[0]
+    };
+    // The plan recorded at `window` (θ slot 0): the forcing's value at stage `t`.
+    let record = |window: f64| {
+        kj::begin();
+        let w = kj::Tr::theta(0, window);
+        let c = |v: f64| <kj::Tr as PkNum>::from_f64(v);
+        let params: Vec<kj::Tr> = (0..crate::types::MAX_PK_PARAMS)
+            .map(|i| c(if i == 4 { ka } else { 0.0 }))
+            .collect();
+        let prepared = PreparedForcings::shared(&ode, &params, |f, p| {
+            f.prepare_dual(p).expect("first-order is supported")
+        });
+        let mut dy = [c(0.0)];
+        add_prepared_input_rate_forcing(
+            &ode,
+            &prepared,
+            std::slice::from_ref(&dose),
+            &[c(0.0)],
+            &[c(1.0)],
+            &[Some(w)],
+            ResetGate::at_segment(&[], f64::NEG_INFINITY, f64::NEG_INFINITY),
+            c(t),
+            c(since),
+            &mut dy,
+        );
+        let rec = kj::end(Some(vec![dy[0].reg()])).expect("records");
+        rec.plan(Layout::F64, 0, 1).expect("plans")
+    };
+    // `Some(value)` where the plan's guard holds at `window`.
+    let run = |plan: &kj::Plan, window: f64| -> Option<f64> {
+        let mut out = kj::Buf::new(2);
+        plan.forward_layout(Layout::F64, &[], &[window], &mut out)?;
+        (out[1] == 1.0).then(|| out[0])
+    };
+    let (running, tail) = (f64_at(5.0), f64_at(3.5));
+    assert!(
+        (running - tail).abs() > 1e-6 * running.abs(),
+        "fixture drift: the two sides must differ ({running} vs {tail})"
+    );
+    let plan = record(5.0);
+    let own = run(&plan, 5.0).expect("serves at its own point");
+    assert_relative_eq!(own, running, max_relative = 1e-12);
+    // The same side: still served, exactly.
+    let near = run(&plan, 4.5).expect("serves on the same side");
+    assert_relative_eq!(near, f64_at(4.5), max_relative = 1e-12);
+    // The other side: the plan serves the tail side's value (the side is a selection on the
+    // stage's time, not a baked choice) or, were it a guard, declines — never the running side's.
+    if let Some(v) = run(&plan, 3.5) {
+        assert_relative_eq!(v, tail, max_relative = 1e-12);
+    }
+    // Recorded there, the plan reads the tail side.
+    let fresh = record(3.5);
+    assert_relative_eq!(
+        run(&fresh, 3.5).expect("serves"),
+        tail,
+        max_relative = 1e-12
+    );
 }

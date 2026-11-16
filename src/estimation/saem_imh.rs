@@ -456,19 +456,22 @@ pub(crate) fn refresh_proposal(
     // the residual variance, so the curvature is the interaction form.
     let curvature_at = |eta: &[f64]| -> Option<DMatrix<f64>> {
         let t0 = std::time::Instant::now();
-        let out = eta_jacobian_and_preds(model, subject, theta, eta).and_then(|(h, f)| {
-            conditional_eta_precision(
-                model,
-                subject,
-                theta,
-                eta,
-                &f,
-                &h,
-                omega,
-                sigma_values,
-                true,
-            )
-        });
+        let sigma = model.is_sde().then_some(sigma_values);
+        let out =
+            eta_jacobian_and_preds(model, subject, theta, sigma, eta).and_then(|(h, f, p)| {
+                conditional_eta_precision(
+                    model,
+                    subject,
+                    theta,
+                    eta,
+                    &f,
+                    &p,
+                    &h,
+                    omega,
+                    sigma_values,
+                    true,
+                )
+            });
         bump(&counters.map_jac_ns, t0.elapsed().as_nanos() as u64);
         bump(&counters.map_jac_evals, 1);
         out
@@ -589,24 +592,30 @@ impl ImhSlot {
 }
 
 /// The η-Jacobian `H` (`n_obs × n_eta`) and the predictions `f` it was taken at,
-/// from one exact dual sweep. The curvature needs both; reading `f` off the same
-/// sweep spares the refresh a second full predictor evaluation. `None` when the
-/// sweep is out of scope or any entry is non-finite.
+/// from one exact recording, and with `sigma` an SDE subject's EKF variances `p_obs`
+/// off the same recording (empty otherwise). The curvature needs all of them; reading
+/// them off one plan run spares the refresh a second solve. `None` when the
+/// recording is out of scope or any entry is non-finite.
 pub(crate) fn eta_jacobian_and_preds(
     model: &CompiledModel,
     subject: &Subject,
     theta: &[f64],
+    sigma: Option<&[f64]>,
     eta: &[f64],
-) -> Option<(DMatrix<f64>, Vec<f64>)> {
-    let grads = crate::sens::provider::subject_eta_grad(model, subject, theta, eta)?;
+) -> Option<(DMatrix<f64>, Vec<f64>, Vec<f64>)> {
+    let rows = crate::sens::ode_provider::adjoint::exact_obs_grads_in(
+        model, subject, None, theta, sigma, eta,
+    )?;
+    let (grads, var) = rows.split_at(rows.len().min(subject.observations.len()));
     let n_eta = eta.len();
     let f: Vec<f64> = grads.iter().map(|o| o.f).collect();
+    let p: Vec<f64> = var.iter().map(|o| o.f).collect();
     let h = DMatrix::from_row_iterator(
         grads.len(),
         n_eta,
         grads.iter().flat_map(|o| o.df_deta.iter().copied()),
     );
-    (h.iter().chain(f.iter()).all(|v| v.is_finite())).then_some((h, f))
+    (h.iter().chain(&f).chain(&p).all(|v| v.is_finite())).then_some((h, f, p))
 }
 
 /// Solve `H̃ δ = g` given the lower Cholesky factor `L` of `H̃` (forward then

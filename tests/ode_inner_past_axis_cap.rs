@@ -160,7 +160,7 @@ fn assert_twins_agree(case: &str, ode_tol: Option<(f64, f64)>) {
 
     for (label, r) in [("24 axes", &at_cap), ("25 axes", &past_cap)] {
         assert_eq!(
-            r.gradient_method_inner, "analytic (Dual2)",
+            r.gradient_method_inner, "analytic",
             "{case}, {label}: the inner η-gradient is seeded on η only, so it must stay analytic"
         );
         let fd: Vec<&String> = r
@@ -217,7 +217,7 @@ fn outer_route_is_the_same_past_the_cap() {
     let past_cap = run(15);
     for (label, r) in [("24 axes", &at_cap), ("25 axes", &past_cap)] {
         assert_eq!(
-            r.gradient_method_outer, "analytic (Dual2)",
+            r.gradient_method_outer, "analytic",
             "{label}: the adjoint outer gradient has no θ + η cap"
         );
         assert_eq!(
