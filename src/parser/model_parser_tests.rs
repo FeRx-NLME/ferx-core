@@ -39763,3 +39763,63 @@ fn a_theta_dependent_gather_index_selects_its_level_in_the_recording() {
         assert_eq!(v, want, "θ[1] = {th1} selects its own level");
     }
 }
+
+/// A snapshot of a subject's covariates evaluates a typical value bit-for-bit as the map does,
+/// an absent covariate reads `0.0` in both, a program with more definitions than the stack
+/// buffer holds agrees too, and the names are each covariate once in first-read order. Dies when
+/// the snapshot resolves a name to another's slot (`WT` and `AGE` swapped changes the value) or
+/// the snapshot drops the absent-is-zero rule (`GHOST` would be NaN or panic).
+#[test]
+fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() {
+    let cov = |n: &str| Expression::Covariate(n.to_string());
+    let bin = |l, op, r| Expression::BinOp(Box::new(l), op, Box::new(r));
+    let root = bin(
+        bin(cov("WT"), BinOp::Div, Expression::Literal(70.0)),
+        BinOp::Add,
+        bin(
+            bin(cov("AGE"), BinOp::Mul, cov("WT")),
+            BinOp::Add,
+            bin(cov("GHOST"), BinOp::Add, Expression::Theta(0)),
+        ),
+    );
+    let wide = |k: usize| {
+        // `k` chained definitions, each reading the one before and a covariate.
+        let defs: Vec<Expression> = (0..k)
+            .map(|j| {
+                let prev = if j == 0 {
+                    Expression::Theta(0)
+                } else {
+                    Expression::VariableIdx(j - 1)
+                };
+                bin(prev, BinOp::Add, bin(cov("AGE"), BinOp::Mul, cov("WT")))
+            })
+            .collect();
+        let tail = bin(Expression::VariableIdx(k - 1), BinOp::Add, root.clone());
+        TypicalProgram { defs, root: tail }
+    };
+    let mut covs: HashMap<String, f64> = HashMap::new();
+    covs.insert("WT".to_string(), 83.5);
+    covs.insert("AGE".to_string(), 41.0);
+    covs.insert("UNREAD".to_string(), 9.0);
+    for prog in [TypicalProgram::of(root.clone()), wide(3), wide(12)] {
+        let names = prog.covariate_names();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"GHOST".to_string()));
+        let snap = CovariateSnapshot::new(&names, &covs);
+        for theta in [[0.3], [-1.7]] {
+            assert_eq!(
+                prog.eval_snapshot(&theta, &snap).to_bits(),
+                prog.eval(&theta, &covs).to_bits()
+            );
+        }
+    }
+    let swapped: HashMap<String, f64> = [("WT", 41.0), ("AGE", 83.5)]
+        .map(|(k, v)| (k.to_string(), v))
+        .into();
+    let prog = TypicalProgram::of(root);
+    assert_ne!(
+        prog.eval(&[0.3], &swapped).to_bits(),
+        prog.eval(&[0.3], &covs).to_bits(),
+        "the fixture tells WT from AGE"
+    );
+}
