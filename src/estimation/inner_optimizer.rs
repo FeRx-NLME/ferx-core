@@ -411,6 +411,12 @@ fn subject_inner_runs_fd(
             return false;
         }
     }
+    // A subject with no observations at all (doses and `EVID=2` rows only) has a prior-only
+    // inner problem: no data term to differentiate, so no route of either kind. `exact_obs_grads`
+    // is `None` for its empty observation list, which would count it as finite differences.
+    if subject.obs_times.is_empty() && subject.obs_records.is_empty() {
+        return false;
+    }
     crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta).is_none()
 }
 
