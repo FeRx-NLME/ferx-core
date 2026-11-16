@@ -1,0 +1,33 @@
+# Amikacin (int) — translation of NONMEM/rerun/ami_int__cv_sigl7_siglo7_RS (ADVAN3 TRANS4)
+[data]
+  path = ../data/ami_irr.csv
+
+[parameters]
+  theta TVCL(0.08, 0.0, 10.0)
+  theta TVV1(0.947, 0.0, 100.0)
+  theta TQ(0.426, 0.0, 100.0)
+  theta TCW(0.897, 0.0, 20.0)
+  theta TBW(0.7, 0.0, 20.0)
+  theta TGA(2, 0.0, 20.0)
+  theta TINT(1.0, 0.0, 20.0)
+  omega ETA_CL ~ 0.088
+  sigma PROP ~ 0.0471
+  sigma ADD  ~ 0.351
+
+[individual_parameters]
+  CL = TVCL * exp(log(BW/2180)*TBW + log(GA/34)*TGA + log(BW/2180)*log(GA/34)*TINT) * exp(ETA_CL)
+  V1 = TVV1 * (CW/2120)^TCW
+  Q  = TQ * CL
+  V2 = V1
+
+[structural_model]
+  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)
+
+[error_model]
+  DV ~ combined(PROP, ADD)
+
+[fit_options]
+  method     = focei
+  maxiter    = 9999
+  covariance = true
+  covariance_method = rsr

@@ -6,6 +6,7 @@
 //! screen alone: on these subjects the seed reaches the deeper mode first.
 
 use super::*;
+use crate::estimation::outer_optimizer::OuterScales;
 use crate::parser::model_parser::parse_full_model;
 use crate::types::{DoseEvent, FitOptions, Population, Subject};
 
@@ -1099,7 +1100,7 @@ fn the_nlopt_leg_names_the_subject_it_kept_off_the_cold_solve() {
             &options,
             &OuterFdDeclineLog::new(population.subjects.len()),
             None,
-            &[],
+            &OuterScales::default(),
         );
         HELD_FIRST_H_SCALE.with(|c| c.set(None));
         let at_restored = HELD_SOLVE_AT_RESTORED.with(|c| c.get());

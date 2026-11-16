@@ -69,6 +69,10 @@ the parameterization.
 
 #### An identity-packed θ started near zero {#identity-theta-near-zero}
 
+> Under `parameter_scaling = auto` the gradient optimizers (`nlopt_lbfgs`, `slsqp`) scale
+> every coordinate by its curvature instead ([below](#outer-curvature-scaling), #2975); this
+> rule serves `bobyqa`, `mma` and an explicit `abs`.
+
 An identity-packed θ reaches the NLopt outer optimizers on its natural scale, so
 one started at, say, `1e-5` is a coordinate whose useful moves sit five orders of
 magnitude below the optimizer's unit step and its stopping tolerances (#2159).
@@ -146,6 +150,10 @@ the same small-unit volume stopped at OFV 303.06 under BOBYQA and now reaches
 301.58, its plain model's minimum.
 
 #### An identity-packed θ far from 1 {#identity-theta-large}
+
+> Under `parameter_scaling = auto` the gradient optimizers (`nlopt_lbfgs`, `slsqp`) scale
+> every coordinate by its curvature instead ([below](#outer-curvature-scaling), #2975); this
+> rule serves `bobyqa`, `mma` and an explicit `abs`.
 
 The NLopt outer optimizers' default magnitude scaling (`parameter_scaling = abs`,
 which `auto` resolves to for the gradient-based optimizers) divides each packed
@@ -254,6 +262,56 @@ on `data/covmuref_power.csv` with `V = (TVV_S + ETA_VS) / k` in a block with
 10^{-4}$ the $L_{21}$ diagonal reaches $10^7$, and before #2274 `r` and `rsr`
 reported a regularized step and `s` refused $S$; every SE now equals the $k = 1$
 fit's to within $10^{-6}$, at $k = 15$ as well.
+
+## The optimizer's scale: curvature at the start {#outer-curvature-scaling}
+
+The gradient-based NLopt optimizers (`nlopt_lbfgs`, and `slsqp`) do not move the packed
+coordinates $x_a$ directly but $z_a = x_a / s_a$. L-BFGS starts from an identity Hessian, so
+its opening steps are only good when one unit of $z_a$ changes the objective by about the
+same amount on every axis. Under `parameter_scaling = auto` (the default) ferx chooses
+$s_a$ from the objective itself (#2975):
+
+$$
+s_a = \frac{1}{\sqrt{\left|\partial^2 \mathrm{OFV} / \partial x_a^2\right|}}
+\quad\text{at the start, capped at half the axis's bound range.}
+$$
+
+In scaled coordinates every diagonal curvature is then 1, which is what L-BFGS's identity
+start assumes, so its first step is the diagonal Newton step on every axis at once. The
+same rule serves a log-packed clearance, an identity-packed covariate effect started near
+zero, a volume written in odd units and an Ω or σ coordinate: the scale follows from how
+much the objective changes along the axis, not from the start value.
+
+- **The curvature** is the R-matrix diagonal at the start, with the EBEs re-solved at the
+  covariance step's tolerance: exact (the adjoint and plan derivatives the covariance
+  step uses) when every subject is served exactly, otherwise a central second difference
+  of the same objective, $0.1$ of the coordinate's size to either side ($0.1\,|\theta_0|$
+  on an identity-packed θ), with the EBEs re-solved. It is one rule; the two sources
+  differ only in precision. On warfarin they agree within 1% on every axis.
+- **A negative curvature** (a concave axis at the start, common for an Ω or an additive σ
+  far from its optimum) takes its magnitude; a zero or non-finite one takes the median of
+  the other axes' scales.
+- **A restart leg** keeps the start's scales, except that an identity-packed θ that grew
+  past 10 in magnitude is divided by at least its current magnitude
+  ([#2146 / #2272](#identity-theta-large)).
+
+The rules in [An identity-packed θ started near zero](#identity-theta-near-zero) and
+[An identity-packed θ far from 1](#identity-theta-large), and the magnitude scaling of
+`abs`, still apply to the derivative-free optimizers (`bobyqa`, `mma`) and to an explicit
+`parameter_scaling = abs`.
+
+Measured on 29 FOCEI fits (21 bundled examples, the #2159 fixtures, synthetic and real-data
+benchmarks; L-BFGS, 4 threads), against the magnitude rules it replaces:
+
+| | iterations | EBE solves | fits at the best OFV |
+|---|---|---|---|
+| magnitude rules (before #2975) | 1570 | 236k | 29 / 29 |
+| curvature scaling | 1214 (−23%) | 164k (−31%) | 29 / 29 |
+
+It is fastest where the old rules mis-scaled a coordinate: `three_cpt_iv` 62 → 29
+iterations, `two_cpt_oral_cov` 53 → 25, `warfarin` 49 → 28. It is slower on a few models
+with a strongly concave start along one axis, e.g. a 28-subject model with a linear
+weight × sex interaction on CL, 36 → 49.
 
 ## Bounds
 

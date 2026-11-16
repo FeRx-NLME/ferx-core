@@ -1,0 +1,106 @@
+{
+ "one_cpt_iv": [
+  "examples/one_cpt_iv.ferx",
+  "data/one_cpt_iv.csv"
+ ],
+ "one_cpt_infusion": [
+  "examples/one_cpt_infusion.ferx",
+  "data/one_cpt_infusion.csv"
+ ],
+ "two_cpt_iv": [
+  "examples/two_cpt_iv.ferx",
+  "data/two_cpt_iv.csv"
+ ],
+ "three_cpt_iv": [
+  "examples/three_cpt_iv.ferx",
+  "data/three_cpt_iv.csv"
+ ],
+ "two_cpt_oral_cov": [
+  "examples/two_cpt_oral_cov.ferx",
+  "data/two_cpt_oral_cov.csv"
+ ],
+ "warfarin": [
+  "examples/warfarin.ferx",
+  "data/warfarin.csv"
+ ],
+ "warfarin_block_omega": [
+  "examples/warfarin_block_omega.ferx",
+  "data/warfarin_block_omega.csv"
+ ],
+ "warfarin_iov": [
+  "examples/warfarin_iov.ferx",
+  "data/warfarin_iov.csv"
+ ],
+ "warfarin_logit_f": [
+  "examples/warfarin_logit_f.ferx",
+  "data/warfarin_logit_f.csv"
+ ],
+ "warfarin_additive_eta": [
+  "examples/warfarin_additive_eta.ferx",
+  "data/warfarin_additive_eta.csv"
+ ],
+ "warfarin_scaled": [
+  "examples/warfarin_scaled.ferx",
+  "data/warfarin_scaled.csv"
+ ],
+ "warfarin_bloq": [
+  "examples/warfarin_bloq.ferx",
+  "data/warfarin_bloq.csv"
+ ],
+ "emax_pkpd": [
+  "examples/emax_pkpd.ferx",
+  "data/emax_pkpd.csv"
+ ],
+ "emax_timecourse": [
+  "examples/emax_timecourse.ferx",
+  "data/emax_timecourse.csv"
+ ],
+ "mm_iv": [
+  "examples/mm_iv.ferx",
+  "data/mm_iv.csv"
+ ],
+ "pkpd_nonmem": [
+  "examples/pkpd_nonmem.ferx",
+  "data/pkpd_nonmem.csv"
+ ],
+ "bioavailability": [
+  "examples/bioavailability.ferx",
+  "data/bioavailability.csv"
+ ],
+ "transit_2cpt": [
+  "examples/transit_2cpt.ferx",
+  "data/transit_2cpt.csv"
+ ],
+ "dose_rate": [
+  "examples/dose_rate.ferx",
+  "data/dose_rate.csv"
+ ],
+ "fx_two_cpt_oral_cov_nz": [
+  "bench/scaling_2975/models/fx_two_cpt_oral_cov_nz.ferx",
+  null
+ ],
+ "fx_warfarin_tvvs": [
+  "bench/scaling_2975/models/fx_warfarin_tvvs.ferx",
+  null
+ ],
+ "syn_ami_mult_irr": [
+  "bench/scaling_2975/models/ami_mult_irr.ferx",
+  null
+ ],
+ "syn_ami_int_irr": [
+  "bench/scaling_2975/models/ami_int_irr.ferx",
+  null
+ ],
+ "syn_pcm_mult": [
+  "bench/scaling_2975/models/pcm_mult.ferx",
+  null
+ ],
+ "syn_pcm_int": [
+  "bench/scaling_2975/models/pcm_int.ferx",
+  null
+ ],
+ "fx_ode_obs_scale": [
+  "bench/scaling_2975/models/fx_ode_obs_scale.ferx",
+  null
+ ]
+}

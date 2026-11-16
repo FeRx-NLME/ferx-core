@@ -1,0 +1,31 @@
+# Regression fixture: the 6-subject 2-cpt amount ODE with obs_scale = V1 of
+# kernel_jit_fallback_tests::an_ode_expression_scale_on_an_individual_parameter_plans_without_fallback
+[data]
+  path = ../data/ode_obs_scale.csv
+[parameters]
+  theta TVCL(5.0, 0.1, 100.0)
+  theta TVV1(10.0, 0.5, 500.0)
+  theta TVQ(2.0, 0.05, 50.0)
+  theta TVV2(20.0, 0.5, 1000.0)
+  omega ETA_CL ~ 0.2
+  omega ETA_V1 ~ 0.2
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V1 = TVV1 * exp(ETA_V1)
+  Q  = TVQ
+  V2 = TVV2
+[structural_model]
+  ode(obs_cmt=central, states=[central, peripheral])
+[odes]
+  d/dt(central)    = -(CL/V1) * central - (Q/V1) * central + (Q/V2) * peripheral
+  d/dt(peripheral) =  (Q/V1) * central  - (Q/V2) * peripheral
+[scaling]
+  obs_scale = V1
+[error_model]
+  DV ~ proportional(PROP_ERR)
+[fit_options]
+  method = focei
+  maxiter = 500
+  threads = 1
+  covariance = false

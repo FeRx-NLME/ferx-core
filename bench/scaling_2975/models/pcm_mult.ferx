@@ -1,0 +1,29 @@
+# Paracetamol multiplicative — translation of NONMEM/rerun/pcm_mult__cv_sigl7_siglo7_RS (ADVAN1 TRANS2)
+[data]
+  path = ../data/pcm_syn.csv
+
+[parameters]
+  theta TVCL(0.5, 0.0, 100.0)
+  theta TVV(70, 0.0, 10000.0)
+  theta TWT(0.001, -1.0, 1.0)
+  theta TSEX(0.1, -10.0, 10.0)
+  omega ETA_CL ~ 0.02
+  omega ETA_V  ~ 0.02
+  sigma PROP ~ 0.0016
+
+[individual_parameters]
+  SEXC = SEX - 0.3214
+  CL = TVCL * (1 + TWT*(WT-134.1)) * (1 + TSEX*SEXC) * exp(ETA_CL)
+  V  = TVV * exp(ETA_V)
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(PROP)
+
+[fit_options]
+  method     = focei
+  maxiter    = 9999
+  covariance = true
+  covariance_method = rsr

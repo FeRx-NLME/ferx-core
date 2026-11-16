@@ -1374,6 +1374,72 @@ pub(crate) fn exact_candidate_derivatives(
     Some(acc)
 }
 
+/// [`exact_candidate_derivatives`] with the dense curvature block: the exact gradient along
+/// `axes` and `∂²OFV/∂x_a∂x_b` for `a, b ∈ axes` (in `axes` order), both at the same tightly
+/// reconverged modes. What the #2975 curvature scaling reads the full start-point R from.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn exact_candidate_hessian(
+    model: &CompiledModel,
+    population: &Population,
+    template: &ModelParameters,
+    x: &[f64],
+    warm: &[DVector<f64>],
+    options: &FitOptions,
+    axes: &[usize],
+) -> Option<(Vec<f64>, DMatrix<f64>)> {
+    use crate::sens::ode_provider::adjoint::{
+        subject_adjoint_cov_block_at, subject_adjoint_gradient_at,
+    };
+    if !options.analytic_cov_hessian || warm.len() != population.subjects.len() {
+        return None;
+    }
+    let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+    let (_, ehs, _, kaps, all_converged, _) = reconverge_population_checked(
+        x,
+        model,
+        population,
+        template,
+        warm,
+        options,
+        cov_inner_tol,
+        true,
+    );
+    if !all_converged {
+        return None;
+    }
+    let per_subject = per_subject_adjoint(
+        model,
+        population,
+        template,
+        x,
+        &ehs,
+        &kaps,
+        options,
+        |subject, pt, b, objective| {
+            let g = subject_adjoint_gradient_at(model, subject, pt, b, objective)?;
+            let h = subject_adjoint_cov_block_at(model, subject, pt, b, objective, axes)?;
+            let g: Vec<f64> = axes
+                .iter()
+                .map(|&a| g.get(a).copied().unwrap_or(f64::NAN))
+                .collect();
+            (g.iter().all(|v| v.is_finite()) && h.iter().all(|v| v.is_finite())).then_some((g, h))
+        },
+    )?;
+    if crate::cancel::is_cancelled(&options.cancel) {
+        return None;
+    }
+    let n = axes.len();
+    let (mut g, mut h) = (vec![0.0; n], DMatrix::zeros(n, n));
+    for r in per_subject {
+        let (gi, hi) = r?;
+        for k in 0..n {
+            g[k] += 2.0 * gi[k];
+        }
+        h += 2.0 * hi;
+    }
+    Some((g, h))
+}
+
 /// The packed axes [`analytic_cov_assembly`] differentiates along, when that is fewer than all
 /// of them: the free coordinates, in packed order, or `None` for the full Hessian.
 ///
