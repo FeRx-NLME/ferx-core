@@ -151,6 +151,7 @@ fn worst_rel(label: &str, names: &[&str], got: &[f64], want: &[f64]) -> f64 {
     for ((n, g), w) in names.iter().zip(got).zip(want) {
         assert!(g.is_finite() && *g > 0.0, "{label} {n}: {g}");
         let rel = (g - w).abs() / w;
+        assert!(rel.is_finite(), "{label} {n}: gap {rel} (NONMEM {w})");
         eprintln!("{label} {n}: ferx {g:.6e} NONMEM {w:.6e} rel {rel:.3e}");
         worst = worst.max(rel);
     }

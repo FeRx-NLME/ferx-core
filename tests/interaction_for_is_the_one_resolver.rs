@@ -75,11 +75,10 @@ const ALLOWED: &[(&str, usize, &str)] = &[
     ),
     (
         "src/estimation/gauss_newton.rs",
-        14,
-        "the GN optimizer and its gradient kernels receive the stage options (the exact \
-         fixed-EBE score and EBE-response correction pick their objective from them, #2482; \
-         `gn_gradient_takes_total_derivative` routes FOCEI subjects to the total derivative \
-         on the same GN / trust-region stage options, #2740)",
+        12,
+        "the GN optimizer and its gradient kernels receive the stage options (the fixed-EBE \
+         score picks its objective from them, #2482; the per-subject rows are each subject's \
+         total derivative on the same GN / trust-region stage options, #2974)",
     ),
     (
         "src/estimation/impmap.rs",

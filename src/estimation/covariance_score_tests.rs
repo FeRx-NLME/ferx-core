@@ -86,6 +86,10 @@ fn score_vs_oracle(
             );
             let err = (g[j] - fd[j]).abs() / fd[j].abs().max(1.0);
             let err_held = (held[j] - fd[j]).abs() / fd[j].abs().max(1.0);
+            assert!(
+                err.is_finite() && err_held.is_finite(),
+                "{label}: subject {i} coord {j}: gaps {err} / held {err_held}"
+            );
             worst = worst.max(err);
             worst_held = worst_held.max(err_held);
         }

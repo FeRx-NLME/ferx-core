@@ -3574,6 +3574,7 @@ mod tests {
         for (j, (g, r)) in grad.iter().zip(&reference).enumerate() {
             assert!(g.is_finite() && r.is_finite(), "gradient[{j}]: {g} vs {r}");
             let rel = (g - r).abs() / (1.0 + r.abs());
+            assert!(rel.is_finite(), "gradient[{j}]: gap {rel}");
             worst = worst.max(rel);
             assert!(
                 rel < 1e-5,
@@ -7205,11 +7206,11 @@ mod tests {
             let off_reconverged = grad
                 .iter()
                 .zip(&di)
-                .fold(0.0_f64, |m, (g, d)| m.max((g - 2.0 * d).abs()));
+                .fold(0.0_f64, |m, (g, d)| m.max((g - 2.0 * d).abs())); // nan-ok: grad, g and d asserted finite above
             let raw_gap = gi
                 .iter()
                 .zip(&di)
-                .fold(0.0_f64, |m, (g, d)| m.max((2.0 * (g - d)).abs()));
+                .fold(0.0_f64, |m, (g, d)| m.max((2.0 * (g - d)).abs())); // nan-ok: grad, g and d asserted finite above
             eprintln!(
                 "[#1778] GN: ‖grad − 2d‖∞ = {off_reconverged:.3e}, ‖2g − 2d‖∞ = {raw_gap:.3e}"
             );
