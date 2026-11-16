@@ -5916,7 +5916,6 @@ fn lower_chunk_opt(
     use cranelift_codegen::ir::condcodes::FloatCC;
     let _ = Shim1::Nan;
     use cranelift_codegen::ir::{types, AbiParam, InstBuilder, MemFlagsData, Signature, Value};
-    use cranelift_codegen::settings::{self, Configurable};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
     use cranelift_jit::{JITBuilder, JITModule};
     use cranelift_module::{default_libcall_names, Linkage, Module};

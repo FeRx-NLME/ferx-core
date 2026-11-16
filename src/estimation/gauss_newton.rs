@@ -1145,7 +1145,8 @@ fn drop_ebe_response(grad: &mut DVector<f64>, t: &mut [f64]) {
 //   dL = 0.5 * sum_j (d r_j) * ((R^{-1})_jj - A_j^2)
 //
 // Theta x[k] (log-packed or identity):
-//   d(ipreds) from forward FD of compute_predictions_with_tv
+//   d(ipreds) contracted exactly (`fixed_eta_theta_contractions`, one recording + one reverse
+//   sweep); a per-theta difference only where the recorders decline or `gradient = fd`
 //   d(f0) = d(ipreds),  d(r) via chain rule through residual variance
 //   dv = -d(f0)
 //   dL = -A^T d(f0)  +  0.5 * (sum_j d(r_j) * ((R^{-1})_jj - A_j^2))
@@ -1212,9 +1213,9 @@ fn theta_fd_forced(model: &CompiledModel) -> bool {
 /// Returns `None` if the Cholesky of R_tilde fails (degenerate parameters) so
 /// the caller can fall back to central FD.
 ///
-/// The gradient is exact for omega and sigma packed parameters. For theta packed
-/// parameters, uses forward FD of `compute_predictions_with_tv` only (cheap —
-/// no matrix work per perturbation).
+/// The gradient is exact in every packed parameter: ω and σ in closed form, θ through the
+/// exact fixed-η contractions (`fixed_eta_theta_contractions`). The per-θ difference of
+/// `compute_predictions_with_tv` runs only where the recorders decline or `gradient = fd`.
 #[allow(clippy::too_many_arguments)]
 fn subject_nll_pop_grad_analytical(
     x: &[f64],
@@ -1610,8 +1611,9 @@ fn subject_nll_pop_grad_analytical(
 /// Like the SB path, η̂ and H (= a) are held fixed under all parameter
 /// perturbations — the "fixed-EBE" gradient. The chain rule then closes
 /// cheaply on small (n_eta × n_eta) Hessian matrices:
-///   - **θ_k**: 1 forward-FD call on `compute_predictions_with_tv` per θ_k,
-///     then `0.5·Σⱼ (αⱼ + βⱼ·qⱼ) · ∂fⱼ/∂θ_k` where
+///   - **θ_k**: `0.5·Σⱼ (αⱼ + βⱼ·qⱼ) · ∂fⱼ/∂θ_k`, the contraction taken exactly by one
+///     recording and one reverse sweep (`fixed_eta_theta_contractions`; a per-θ central
+///     difference only where the recorders decline or `gradient = fd`), where
 ///     αⱼ = −2·errⱼ/Rⱼ + dⱼ·(Rⱼ − errⱼ²)/Rⱼ²    (data_ll piece)
 ///     βⱼ = −dⱼ/Rⱼ² + dⱼ·d2ⱼ/Rⱼ² − dⱼ³/Rⱼ³     (log|H̃| piece via chain on R, c̃)
 ///     qⱼ = aⱼ'·H̃⁻¹·aⱼ                          (pre-computed once)
@@ -1626,8 +1628,8 @@ fn subject_nll_pop_grad_analytical(
 ///   - **σ_s**: closed form using ∂R/∂log σ_s and ∂d/∂log σ_s on the same
 ///     scalar `qⱼ` reservoir.
 ///
-/// **Cost** is the same order as the SB analytical path: one prediction call
-/// per non-fixed θ, then a single per-obs sweep for the inner accumulators.
+/// **Cost** is the same order as the SB analytical path: one recorded contraction for θ,
+/// then a single per-obs sweep for the inner accumulators.
 /// The n_eta × n_eta matrix ops (Cholesky, inverse, G product) are
 /// constant-cost on n_eta ≲ 10 — far cheaper than the n_obs × n_obs Cholesky
 /// the SB path uses.
@@ -1855,7 +1857,7 @@ fn subject_nll_pop_grad_analytical_laplace_cached(
     }
     let mut gn_theta_correction = vec![0.0f64; n];
 
-    // ── Theta gradient (forward FD on predictions; closed-form chain rest) ──
+    // ── Theta gradient (exact contraction of ∂f/∂θ; closed-form chain rest) ──
     // Per-obs scalar coeff combines data_ll and log|H̃| contributions:
     //   per_j = αⱼ + βⱼ·qⱼ
     //   αⱼ   = −2·errⱼ/Rⱼ + dⱼ·(Rⱼ − errⱼ²)/Rⱼ²
