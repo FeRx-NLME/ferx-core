@@ -12109,3 +12109,62 @@ fn a_pass_is_as_wide_as_its_lane_budget_allows() {
     assert_eq!(pass_width(63, 4, 63), 63);
     assert_eq!(pass_width(64, 4, 64), 63);
 }
+
+/// The mu fold's runtime guard (#2982): where the parameter program does not reproduce
+/// `g⁻¹(μ + η)` at the subject's η, the fold is declined and the plans keep their unfolded
+/// lanes — so a line the parse misjudges can cost a lane, never a wrong Hessian. The spec here
+/// is the parse's with every line's link swapped to identity (`μ = P(θ, 0)`, finite, so only the
+/// guard can refuse it: `θ·e^η` is not `θ + η`); the Hessian must still be the one-lane-per-
+/// direction one.
+///
+/// Mutation: the guard's comparison dropped (the folded lanes then carry `∂μ/∂θ` of the wrong
+/// link and the Hessian moves by O(1)).
+#[test]
+fn a_fold_the_program_does_not_reproduce_is_declined() {
+    use super::hessian::{PLAN_AXES_OFF, PLAN_LANES};
+    let mut one = parse_model_string(ONE_CPT_ORAL).unwrap();
+    for line in &mut one.indiv_param_partials.mu_fold.lines {
+        line.2 = crate::types::MuTransform::Identity;
+    }
+    let s = subject(
+        &one,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = moved_params(&one);
+    let x = pack_params(&params);
+    let eta = ebe_for(&one, &s, &params, 1e-12, true);
+    let run = |axes_off: bool| {
+        with_fit_stack(|| {
+            PLAN_AXES_OFF.with(|c| c.set(axes_off));
+            PLAN_LANES.with(|v| v.borrow_mut().clear());
+            let h = subject_adjoint_cov_hessian(
+                &one,
+                &s,
+                &params,
+                &x,
+                eta.as_slice(),
+                Objective::Focei,
+            )
+            .expect("in scope");
+            (h, PLAN_LANES.with(|v| v.borrow().clone()))
+        })
+    };
+    let (h, runs) = run(false);
+    assert!(
+        runs.iter().all(|&(w, n)| (w, n) == (6, 7)),
+        "the fold should be declined (3 η + 3 θ lanes): {runs:?}"
+    );
+    let (h_global, _) = run(true);
+    let scale = h_global.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let worst = h
+        .iter()
+        .zip(h_global.iter())
+        .map(|(a, b)| (a - b).abs() / scale)
+        .fold(0.0f64, f64::max);
+    assert!(
+        worst < 1e-12,
+        "declined fold vs one lane per direction: {worst:.2e}"
+    );
+}

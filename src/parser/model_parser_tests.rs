@@ -39813,6 +39813,15 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
         names(&m)
     );
 
+    // V's line reads a second η no other line reads: each η has one reader, so only the
+    // one-η rule keeps V's line (and TVV) out.
+    let m = model(
+        "  omega ETA_X ~ 0.01",
+        "  CL = TVCL * exp(ETA_CL)\n  V  = TVV  * exp(ETA_V + ETA_X)",
+        rhs,
+    );
+    assert_eq!(names(&m), ["TVCL"], "a line reading two η");
+
     // An η scaled by a θ: `exp(TH_S·η)` is not `g⁻¹(A + η)`.
     let m = model(
         "  theta TH_S(1.0, 0.1, 10.0)",
