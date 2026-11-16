@@ -38,6 +38,7 @@ use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
 use crate::sens::focei_kernel::{chol_logdet, focei_htilde, OmegaT};
 use crate::sens::num::vm::Layout;
 use crate::sens::num::{log_sum_exp, PkNum};
+use crate::types::MuTransform;
 
 /// The most directions one pass carries as the plans' tangent lanes (`Layout::tan` is a `u8`).
 ///
@@ -466,6 +467,46 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch (#2980): every plan runs one lane per direction (`PlanDirs::global`), the
+    /// input-axis lanes' oracle.
+    pub(crate) static PLAN_AXES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per plan run along a pass on this thread: its tangent lanes and the pass's directions
+    /// (#2980), so a test can pin what the plans cost, not only what they compute.
+    pub(crate) static PLAN_LANES: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch (#2982): no θ carried on the η lanes, the mu fold's oracle.
+    pub(crate) static MU_FOLD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the plans may carry the folded θ on their η lanes ([`MuFold`]).
+fn mu_fold_on() -> bool {
+    #[cfg(test)]
+    if MU_FOLD_OFF.with(std::cell::Cell::get) {
+        return false;
+    }
+    true
+}
+
+/// Whether plans may run on their input axes ([`PlanDirs`]); a reverse per direction seeds
+/// each direction's own lane, so it keeps one lane per direction.
+fn plan_axes_on() -> bool {
+    #[cfg(test)]
+    if PLAN_AXES_OFF.with(std::cell::Cell::get) {
+        return false;
+    }
+    !reverse_per_direction()
+}
+
 fn reverse_per_direction() -> bool {
     #[cfg(test)]
     return REVERSE_PER_DIRECTION.with(std::cell::Cell::get);
@@ -770,6 +811,8 @@ pub(super) struct CovPlan<'a> {
     d2: Vec<f64>,
     second: bool,
     variant: kj::Desc,
+    /// The θ the plans carry on their η lanes ([`MuFold`], #2982).
+    fold: Option<MuFold>,
 }
 
 /// The kernel's input slots for one subject's pass: per observation the prediction plan's
@@ -844,20 +887,280 @@ impl Slots {
     }
 }
 
-/// A plan run kept for its reverse: the plan, its forward, its layout.
+/// A plan's input coordinate: η slot `k`, or parameter slot `i`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Input {
+    Eta(usize),
+    Param(usize),
+}
+
+/// The mu fold at one subject (#2982): θ that reach every plan only through exclusive mu lines
+/// `P_k = g_k⁻¹(μ_k(θ) + η_{e(k)})` ([`crate::parser::model_parser::MuFoldSpec`]) move the
+/// predictions exactly as the η-direction `Σ_k ∂μ_k/∂θ·e_{e(k)}` does, so a plan carries them on
+/// its η lanes instead of a lane of their own.
+pub(super) struct MuFold {
+    /// Per θ: `(η, ∂μ/∂θ)` over the lines it reaches; empty for a θ that is not folded.
+    pub(super) d1: Vec<Vec<(usize, f64)>>,
+    /// Per `(θ_i, θ_j)`, `i` folded: `(η, ∂²μ/∂θ_i∂θ_j)` — what the fold, which uses `∂μ/∂θ_i`
+    /// at this point, leaves out of the curvature along θ_i.
+    d2: Vec<Vec<Vec<(usize, f64)>>>,
+}
+
+impl MuFold {
+    /// The fold at `(θ, η)`: `None` where the model has no foldable θ, where its plans read θ
+    /// another way the parse cannot see (covariate networks, mixtures, an IOV model's
+    /// population plan), where the subject's covariates vary over its records (`μ` would be
+    /// per record), or where the program does not reproduce `g⁻¹(μ + η)` at this `η`.
+    pub(super) fn at(
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        eta: &[f64],
+    ) -> Option<Self> {
+        let spec = &model.indiv_param_partials.mu_fold;
+        if spec.thetas.is_empty()
+            || !model.covariate_nns.is_empty()
+            || model.mixture.is_some()
+            || model.n_kappa > 0
+            || subject.has_tv_covariates()
+        {
+            return None;
+        }
+        let prog = model.indiv_param_partials.indiv_param_program.as_ref()?;
+        let cov = &subject.covariates;
+        let n_th = theta.len();
+        let inv = |t: MuTransform, u: f64| match t {
+            MuTransform::Log => u.exp(),
+            MuTransform::Logit => 1.0 / (1.0 + (-u).exp()),
+            _ => u,
+        };
+        let zeros = vec![0.0; eta.len()];
+        let f = |th: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
+            let z: Vec<kj::Tr> = zeros
+                .iter()
+                .map(|&v| <kj::Tr as PkNum>::from_f64(v))
+                .collect();
+            Some(
+                spec.lines
+                    .iter()
+                    .map(|&(_, slot, t)| {
+                        let v = prog.eval_var_g(th, &z, cov, slot);
+                        match t {
+                            MuTransform::Log => v.ln(),
+                            MuTransform::Logit => (v / (<kj::Tr as PkNum>::from_f64(1.0) - v)).ln(),
+                            _ => v,
+                        }
+                    })
+                    .collect(),
+            )
+        };
+        let (mu, grad, hess) = kj::derivs_of(theta, spec.lines.len(), true, &f).ok()?;
+        // The structure at this point: each line's value at the current η is `g⁻¹(μ + η)`. The
+        // two sides are one identity evaluated two ways (through `exp`/`log` and back), so they
+        // differ by rounding — ~1e-15 relative; a line that is not of that form misses by O(1).
+        for (k, &(e, slot, t)) in spec.lines.iter().enumerate() {
+            let p = prog.eval_var_g(theta, eta, cov, slot);
+            let want = inv(t, mu[k] + eta.get(e).copied()?);
+            if !(p.is_finite() && (p - want).abs() <= 1e-10 * (1.0 + want.abs())) {
+                return None;
+            }
+        }
+        let mut d1 = vec![Vec::new(); n_th];
+        let mut d2 = vec![vec![Vec::new(); n_th]; n_th];
+        for &i in &spec.thetas {
+            if i >= n_th {
+                continue;
+            }
+            for (k, &(e, _, _)) in spec.lines.iter().enumerate() {
+                if grad[k][i] != 0.0 {
+                    d1[i].push((e, grad[k][i]));
+                }
+                for j in 0..n_th {
+                    let h = hess[k][j * n_th + i];
+                    if h != 0.0 {
+                        d2[i][j].push((e, h));
+                    }
+                }
+            }
+        }
+        (d1.iter().any(|d| !d.is_empty())).then_some(MuFold { d1, d2 })
+    }
+}
+
+/// How a plan carries a pass's directions (#2980).
+///
+/// The kernels run along the pass's directions (`a`); a plan runs along its own tangent lanes:
+/// either the directions themselves (`Global`, one lane per direction), or the **input axes** a
+/// direction moves (`Axes`), each direction's tangent then a combination of the lanes (its
+/// tangent is linear in its inputs' tangents). Ω, σ (outside an SDE's variance plan) and ρ never
+/// reach a plan but through η, so the axes are the η slots and the parameter slots a direction
+/// moves — fewer lanes than directions on every model whose Ω, σ or ρ is estimated. Under
+/// `Axes` the plan's reverse runs one forward-over-reverse sweep along the lanes with its seeds'
+/// tangents zero, and each direction's adjoint tangent is assembled from the lanes'
+/// (`CovPlan::plan_reverse_lanes`): the curvature along the direction plus the Gauss–Newton term
+/// `Y_πᵀ Ȳ̇_a` from the lanes' forward tangents.
+#[derive(Clone)]
+struct PlanDirs {
+    /// The lanes' inputs (`Axes`); empty with `global`.
+    lanes: Vec<Input>,
+    /// One lane per direction (the plan's inputs moved along each direction itself).
+    global: bool,
+    /// Directions in the pass.
+    n_dirs: usize,
+    /// `Axes`: per direction, its coefficient on each lane.
+    coef: Vec<Vec<f64>>,
+    /// `Axes`: per direction, the θ it moves that [`MuFold`] carried onto the η lanes, with
+    /// that θ's tangent.
+    folded: Vec<Vec<(usize, f64)>>,
+}
+
+impl PlanDirs {
+    /// The lanes for `n_dirs` directions over a plan of `n_eta` η slots and `n_par` parameter
+    /// slots (θ first), direction `a` moving η `k` by `eta_t(k, a)` and parameter `i` by
+    /// `p_t(i, a)`, with `fold`'s θ carried on the η lanes: the input axes when that is
+    /// narrower than the directions (and `axes`), else the directions themselves.
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        n_eta: usize,
+        n_par: usize,
+        n_dirs: usize,
+        eta_t: &dyn Fn(usize, usize) -> f64,
+        p_t: &dyn Fn(usize, usize) -> f64,
+        axes: bool,
+        fold: Option<&MuFold>,
+    ) -> Self {
+        let global = PlanDirs {
+            lanes: Vec::new(),
+            global: true,
+            n_dirs,
+            coef: Vec::new(),
+            folded: Vec::new(),
+        };
+        if !axes || n_dirs == 0 {
+            return global;
+        }
+        let folds = |i: usize| fold.and_then(|f| f.d1.get(i)).filter(|d| !d.is_empty());
+        // Per direction, its tangent on every input: η slots, then parameter slots, a folded
+        // θ's moved onto the η slots it maps to.
+        let mut folded = vec![Vec::new(); n_dirs];
+        let full: Vec<Vec<f64>> = (0..n_dirs)
+            .map(|a| {
+                let mut v: Vec<f64> = (0..n_eta)
+                    .map(|k| eta_t(k, a))
+                    .chain((0..n_par).map(|i| p_t(i, a)))
+                    .collect();
+                for i in 0..n_par {
+                    let ti = v[n_eta + i];
+                    if let Some(d) = folds(i).filter(|_| ti != 0.0) {
+                        for &(k, m) in d {
+                            if k < n_eta {
+                                v[k] += ti * m;
+                            }
+                        }
+                        v[n_eta + i] = 0.0;
+                        folded[a].push((i, ti));
+                    }
+                }
+                v
+            })
+            .collect();
+        // Every η slot is a lane: a plan's η adjoints are seeds upstream too (an AGQ node's are
+        // its location's, back through the first stage), so each needs its own Gauss–Newton
+        // term, which only a lane's forward tangent gives. A parameter slot's adjoint only
+        // reaches the rows, read along the directions, so an unmoved one needs no lane.
+        let idx: Vec<usize> = (0..n_eta + n_par)
+            .filter(|&j| j < n_eta || full.iter().any(|v| v[j] != 0.0))
+            .collect();
+        if idx.len() >= n_dirs {
+            return global;
+        }
+        let lanes = idx
+            .iter()
+            .map(|&j| {
+                if j < n_eta {
+                    Input::Eta(j)
+                } else {
+                    Input::Param(j - n_eta)
+                }
+            })
+            .collect();
+        let coef = full
+            .iter()
+            .map(|v| idx.iter().map(|&j| v[j]).collect())
+            .collect();
+        PlanDirs {
+            lanes,
+            global: false,
+            n_dirs,
+            coef,
+            folded,
+        }
+    }
+
+    /// The plan's tangent lanes.
+    fn width(&self) -> usize {
+        if self.global {
+            self.n_dirs
+        } else {
+            self.lanes.len()
+        }
+    }
+
+    /// Input `inp`'s tangent on lane `b` (the plan's seed).
+    fn seed(
+        &self,
+        inp: Input,
+        b: usize,
+        eta_t: &dyn Fn(usize, usize) -> f64,
+        p_t: &dyn Fn(usize, usize) -> f64,
+    ) -> f64 {
+        if self.global {
+            match inp {
+                Input::Eta(k) => eta_t(k, b),
+                Input::Param(i) => p_t(i, b),
+            }
+        } else if self.lanes[b] == inp {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
+    /// The lane carrying input `inp` (`Axes`).
+    fn lane_of(&self, inp: Input) -> Option<usize> {
+        self.lanes.iter().position(|&l| l == inp)
+    }
+}
+
+/// A plan run kept for its reverse: the plan, its forward, its layout and its lanes.
 struct Kept {
     plan: PlanArc,
     fwd: kj::Fwd,
     layout: Layout,
     du: Vec<f64>,
+    dirs: PlanDirs,
 }
 
 impl Kept {
-    /// Output `o`'s base lane `x` along tangent `a` (`None`: the value).
-    fn out(&self, o: usize, x: usize, a: Option<usize>) -> f64 {
+    /// Output `o`'s base lane `x` on the plan's tangent lane `b`.
+    fn lane(&self, o: usize, x: usize, b: usize) -> f64 {
         let (l, lb) = (self.layout.lanes(), self.layout.base_lanes());
         let kt = self.layout.tan as usize;
-        self.du[o * l + a.map_or(x, |a| lb + x * kt + a)]
+        self.du[o * l + lb + x * kt + b]
+    }
+
+    /// Output `o`'s base lane `x` along direction `a` (`None`: the value).
+    fn out(&self, o: usize, x: usize, a: Option<usize>) -> f64 {
+        match a {
+            None => self.du[o * self.layout.lanes() + x],
+            Some(a) if self.dirs.global => self.lane(o, x, a),
+            Some(a) => self.dirs.coef[a]
+                .iter()
+                .enumerate()
+                .filter(|(_, &c)| c != 0.0)
+                .map(|(b, &c)| c * self.lane(o, x, b))
+                .sum(),
+        }
     }
 }
 
@@ -922,6 +1225,11 @@ impl<'a> CovPlan<'a> {
             sc.width,
             &so.placed.iter().map(|p| p.1.clone()).collect::<Vec<_>>(),
         ));
+        let fold = if mu_fold_on() {
+            MuFold::at(sc.model, subject, &th, &sc.eta)
+        } else {
+            None
+        };
         CovPlan {
             ctx,
             sc,
@@ -938,6 +1246,7 @@ impl<'a> CovPlan<'a> {
             d2,
             second,
             variant,
+            fold,
         }
     }
 
@@ -968,37 +1277,62 @@ impl<'a> CovPlan<'a> {
         s
     }
 
-    /// A plan's inputs at `layout` (`kt` tangent blocks): η (value, one-hot over `n` base
-    /// tangents, tangent `a` = `eta_t(k, a)`) and the parameter slots (value, tangent `a` =
-    /// `p_t(i, a)`).
-    #[allow(clippy::too_many_arguments)]
+    /// A plan's inputs at `layout` (the lanes of `dirs`): η (value, one-hot over `n` base
+    /// tangents, its tangent lanes) and the parameter slots (value, its tangent lanes), direction
+    /// `a` moving η `k` by `eta_t(k, a)` and parameter `i` by `p_t(i, a)`.
     fn plan_inputs(
         layout: Layout,
         eta: &[f64],
         eta_t: &dyn Fn(usize, usize) -> f64,
         params: &[f64],
         p_t: &dyn Fn(usize, usize) -> f64,
-        kt: usize,
+        dirs: &PlanDirs,
     ) -> (Vec<f64>, Vec<f64>) {
         let (l, lb) = (layout.lanes(), layout.base_lanes());
+        let kt = dirs.width();
         let mut u = vec![0.0; eta.len() * l];
         for (k, &v) in eta.iter().enumerate() {
             u[k * l] = v;
             if layout.n > 0 {
                 u[k * l + 1 + k] = 1.0;
             }
-            for a in 0..kt {
-                u[k * l + lb + a] = eta_t(k, a);
+            for b in 0..kt {
+                u[k * l + lb + b] = dirs.seed(Input::Eta(k), b, eta_t, p_t);
             }
         }
         let mut p = vec![0.0; params.len() * l];
         for (i, &v) in params.iter().enumerate() {
             p[i * l] = v;
-            for a in 0..kt {
-                p[i * l + lb + a] = p_t(i, a);
+            for b in 0..kt {
+                p[i * l + lb + b] = dirs.seed(Input::Param(i), b, eta_t, p_t);
             }
         }
         (u, p)
+    }
+
+    /// The lanes a plan of `n_eta` η and `n_par` parameter slots runs `n_dirs` directions on.
+    fn plan_dirs(
+        &self,
+        n_eta: usize,
+        n_par: usize,
+        n_dirs: usize,
+        eta_t: &dyn Fn(usize, usize) -> f64,
+        p_t: &dyn Fn(usize, usize) -> f64,
+    ) -> PlanDirs {
+        let pd = PlanDirs::new(
+            n_eta,
+            n_par,
+            n_dirs,
+            eta_t,
+            p_t,
+            plan_axes_on(),
+            self.fold.as_ref(),
+        );
+        #[cfg(test)]
+        if n_dirs > 0 {
+            PLAN_LANES.with(|v| v.borrow_mut().push((pd.width(), n_dirs)));
+        }
+        pd
     }
 
     /// θ's tangent along direction `a` of `dirs` (`dθ/dx` along the packed axis it moves).
@@ -1044,14 +1378,15 @@ impl<'a> CovPlan<'a> {
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
+        let (params, p_t) = self.pred_params(dirs);
+        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &*p_t);
         let layout = Layout {
-            tan: kt as u8,
+            tan: pd.width() as u8,
             ..base
         };
-        let (params, p_t) = self.pred_params(dirs);
         let n_obs = self.subject.observations.len();
         let mut serve = |pl: &PlanArc| -> Option<Kept> {
-            let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &*p_t, kt);
+            let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &*p_t, &pd);
             let mut du = vec![0.0; (n_obs + 1) * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
             (du[n_obs * layout.lanes()] == 1.0).then(|| Kept {
@@ -1059,6 +1394,7 @@ impl<'a> CovPlan<'a> {
                 fwd,
                 layout,
                 du,
+                dirs: pd.clone(),
             })
         };
         match self.nn_z {
@@ -1085,10 +1421,6 @@ impl<'a> CovPlan<'a> {
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
-        let layout = Layout {
-            tan: kt as u8,
-            ..base
-        };
         let sigma = self.sc.params.sigma.values.as_slice();
         let s0 = packed_segments(self.template).sigma_start();
         let (mut params, pred_t) = self.pred_params(dirs);
@@ -1103,9 +1435,14 @@ impl<'a> CovPlan<'a> {
                 0.0
             }
         };
+        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &p_t);
+        let layout = Layout {
+            tan: pd.width() as u8,
+            ..base
+        };
         let n_obs = self.subject.observations.len();
         let mut serve = |pl: &PlanArc| -> Option<Kept> {
-            let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, kt);
+            let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, &pd);
             let mut du = vec![0.0; (n_obs + 1) * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
             (du[n_obs * layout.lanes()] == 1.0).then(|| Kept {
@@ -1113,6 +1450,7 @@ impl<'a> CovPlan<'a> {
                 fwd,
                 layout,
                 du,
+                dirs: pd.clone(),
             })
         };
         match self.nn_z {
@@ -1146,13 +1484,14 @@ impl<'a> CovPlan<'a> {
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
-        let layout = Layout {
-            tan: kt as u8,
-            ..base
-        };
         let plans = super::terms::non_gaussian_plans(self.sc.model, self.subject, &self.th, eta)?;
         let p_t = |i: usize, a: usize| self.theta_t(dirs, i, a);
-        let (u, p) = Self::plan_inputs(layout, eta, eta_t, &self.th, &p_t, kt);
+        let pd = self.plan_dirs(eta.len(), self.th.len(), kt, eta_t, &p_t);
+        let layout = Layout {
+            tan: pd.width() as u8,
+            ..base
+        };
+        let (u, p) = Self::plan_inputs(layout, eta, eta_t, &self.th, &p_t, &pd);
         plans.iter().find_map(|pl| {
             let mut du = vec![0.0; 2 * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
@@ -1161,6 +1500,7 @@ impl<'a> CovPlan<'a> {
                 fwd,
                 layout,
                 du,
+                dirs: pd.clone(),
             })
         })
     }
@@ -1730,6 +2070,8 @@ impl<'a> CovPlan<'a> {
     ) -> Option<Vec<Vec<f64>>> {
         let (kt, lk) = (r.kt, 1 + r.kt);
         let (l, lb) = (kept.layout.lanes(), kept.layout.base_lanes());
+        let pd = &kept.dirs;
+        let kb = pd.width();
         let ns = adj.len();
         let w = n_out * l;
         let mut du_bar = kj::Buf::new(ns * w);
@@ -1741,8 +2083,12 @@ impl<'a> CovPlan<'a> {
                         continue;
                     }
                     du_bar[sd * w + j * l + x] = a[s * lk];
-                    for t in 0..kt {
-                        du_bar[sd * w + j * l + lb + x * kt + t] = a[s * lk + 1 + t];
+                    // On the input axes the seeds' tangents stay zero: the Gauss–Newton term
+                    // they carry is assembled below from the lanes' forward tangents.
+                    if pd.global {
+                        for t in 0..kt {
+                            du_bar[sd * w + j * l + lb + x * kt + t] = a[s * lk + 1 + t];
+                        }
                     }
                 }
             }
@@ -1764,12 +2110,95 @@ impl<'a> CovPlan<'a> {
         let s0 = packed_segments(self.template).sigma_start();
         let sigma = self.sc.params.sigma.values.as_slice();
         if tangent {
+            // Each input's value adjoint, and its tangent along direction `a`: on one lane per
+            // direction the buffer's lane `a`; on the input axes, the curvature along `a`
+            // (`Σ_b c_ab·∇²(Ȳ·Y)·e_b`, the sweep's lane `b` at that input) plus the
+            // Gauss–Newton term `Ȳ̇_aᵀ·∂Y/∂input`, `∂Y/∂input` the input's lane's forward
+            // tangent (every η is a lane; a parameter on none is moved by no direction, and no
+            // row reads its tangent).
+            let g = |inp: Input| match inp {
+                Input::Eta(k) => ub[k * l],
+                Input::Param(i) => pb[i * l],
+            };
+            let lane = |inp: Input, b: usize| match inp {
+                Input::Eta(k) => ub[k * l + lb + b],
+                Input::Param(i) => pb[i * l + lb + b],
+            };
+            // `S[a][b]`: the kernel's adjoint tangents along `a` against lane `b`'s outputs.
+            let gn: Vec<Vec<f64>> = if pd.global {
+                Vec::new()
+            } else {
+                let a0 = &adj[0];
+                (0..kt)
+                    .map(|a| {
+                        (0..kb)
+                            .map(|b| {
+                                let mut s = 0.0;
+                                for j in 0..n_out {
+                                    for x in 0..nl {
+                                        let at = slot(j, x);
+                                        if at != usize::MAX {
+                                            s += a0[at * lk + 1 + a] * kept.lane(j, x, b);
+                                        }
+                                    }
+                                }
+                                s
+                            })
+                            .collect()
+                    })
+                    .collect()
+            };
+            // A folded θ has no lane: its column `∂Y/∂θ_i` is `Σ_k (∂μ_k/∂θ_i)·∂Y/∂η_{e(k)}`.
+            let fold_of = |i: usize| {
+                self.fold
+                    .as_ref()
+                    .and_then(|f| f.d1.get(i))
+                    .filter(|d| !d.is_empty())
+            };
+            let t = |a: usize, inp: Input| -> f64 {
+                if pd.global {
+                    return lane(inp, a);
+                }
+                let gnv = match (pd.lane_of(inp), inp) {
+                    (Some(b0), _) => gn[a][b0],
+                    (None, Input::Param(i)) => match fold_of(i) {
+                        Some(d) => d
+                            .iter()
+                            .filter_map(|&(k, m)| pd.lane_of(Input::Eta(k)).map(|b| m * gn[a][b]))
+                            .sum(),
+                        None => return 0.0,
+                    },
+                    (None, Input::Eta(_)) => return 0.0,
+                };
+                let curv: f64 = pd.coef[a]
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, &c)| c != 0.0)
+                    .map(|(b, &c)| c * lane(inp, b))
+                    .sum();
+                // The fold moved θ_i along `∂μ/∂θ_i` frozen at this point; the true direction's
+                // curvature also carries that vector's own θ-derivative, read off the η value
+                // adjoints (the plan sees θ_i only through those lines).
+                let corr: f64 = match (inp, self.fold.as_ref()) {
+                    (Input::Param(j), Some(f)) if j < f.d1.len() => pd.folded[a]
+                        .iter()
+                        .map(|&(i, ti)| {
+                            ti * f.d2[i][j]
+                                .iter()
+                                .map(|&(k, h)| h * g(Input::Eta(k)))
+                                .sum::<f64>()
+                        })
+                        .sum(),
+                    _ => 0.0,
+                };
+                curv + gnv + corr
+            };
             // Per direction `a`: θ's value adjoint's tangent `a` through dθ/dx, and (on the
             // axis `a` moves) its value adjoint through d²θ/dx² — the reverse over forward's
             // two terms, each seed's lanes read off the one buffer ([`seed_value`]).
             for (a, row) in rows.iter_mut().enumerate() {
                 for i in 0..n_par {
-                    let (pv, pa) = (pb[i * l], pb[i * l + lb + a]);
+                    let (pv, pa) = (g(Input::Param(i)), t(a, Input::Param(i)));
                     if i < n_th {
                         row[i] += pa * self.d1[i];
                         if r.dir_x[a] == Some(i) {
@@ -1788,9 +2217,9 @@ impl<'a> CovPlan<'a> {
             }
             let mut e = vec![0.0; n_eta * lk];
             for k in 0..n_eta {
-                e[k * lk] = ub[k * l];
-                for t in 0..kt {
-                    e[k * lk + 1 + t] = ub[k * l + lb + t];
+                e[k * lk] = g(Input::Eta(k));
+                for a in 0..kt {
+                    e[k * lk + 1 + a] = t(a, Input::Eta(k));
                 }
             }
             return Some(vec![e]);

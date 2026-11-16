@@ -1030,6 +1030,26 @@ fn adjoint_gradient(
     go(&sc, subject, template, x, objective, held, eta_dx)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test switch (#2982): the FOCE/FOCEI gradient reverses the prediction plan even when every
+    /// θ is mu-folded — the fold's oracle.
+    pub(crate) static MU_FAST_GRADIENT_OFF: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// FOCE/FOCEI gradients on this thread that took the fold (no reverse through the plan).
+    pub(crate) static MU_FAST_GRADIENT_HITS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Whether the FOCE/FOCEI gradient may take the mu fold in place of the plan's reverse.
+fn mu_fast_gradient_on() -> bool {
+    #[cfg(test)]
+    if MU_FAST_GRADIENT_OFF.with(std::cell::Cell::get) {
+        return false;
+    }
+    true
+}
+
 /// The gradient [`polish_mode`] walks `‖∇_η l‖∞` down to.
 const POLISH_TARGET_TOL: f64 = MODE_STATIONARY_TOL * 0.1;
 
@@ -4803,8 +4823,29 @@ fn run(
     // Its forward gives the predictions with their η-tangents; its reverse (step 2) gives
     // every η- and θ-derivative through them, the η-Hessian of `f` only ever contracted
     // with an adjoint of `G`, never formed. An endpoint-only subject has no prediction rows.
+    //
+    // When every θ is mu-folded (#2982: it reaches the predictions only as the η-direction
+    // `∂μ/∂θ`), the plan needs no reverse at all: one forward at the second-order layout gives
+    // `∂G/∂η = Q`, so the η-derivatives through the predictions are `F_f·G + F_G·Q`, and the
+    // θ-derivatives are those through `∂μ/∂θ`. That trades the `(1 + N)`-seed reverse for
+    // `N(N+1)/2` more forward lanes. Not for an SDE's variance rows or a non-Gaussian term,
+    // whose plans read θ their own way.
+    let fold = (mu_fast_gradient_on()
+        && !model.is_sde()
+        && subject.obs_records.is_empty()
+        && model.indiv_param_partials.mu_fold.thetas.len() == theta.len())
+    .then(|| hessian::MuFold::at(model, subject, theta, eta))
+    .flatten();
+    #[cfg(test)]
+    if fold.is_some() {
+        MU_FAST_GRADIENT_HITS.with(|c| c.set(c.get() + 1));
+    }
     let n_obs = subject.observations.len();
-    let fl = terms::layout1(n);
+    let fl = if fold.is_some() {
+        terms::layout2(n)
+    } else {
+        terms::layout1(n)
+    };
     let planned = if n_obs == 0 {
         None
     } else {
@@ -4832,7 +4873,7 @@ fn run(
             .flat_map(|p| p.1.iter().copied())
             .collect::<Vec<f64>>(),
         n,
-        false,
+        fold.is_some(),
     );
     let n_rows = preds.rows();
     // A subject's non-Gaussian records (TTE, binary, CTMM): the term and its η-derivatives
@@ -4849,13 +4890,25 @@ fn run(
     // production's objective takes the conditional variance, but the EBE is still the
     // frozen-variance inner objective's stationary point (#1722), so `∇_η l` reads this
     // point either way.
+    // Under the fold its θ-derivatives are its η-tangents at η = 0 through `∂μ/∂θ`, so it runs
+    // at the first-order layout instead of being reversed.
+    let pop_layout = if fold.is_some() {
+        terms::layout1(n)
+    } else {
+        crate::sens::num::vm::Layout::F64
+    };
     let planned_pop = if n_obs > 0 && !interaction && model.error_spec.has_f_dependent_variance() {
         let zeros = vec![0.0; n];
-        let f64l = crate::sens::num::vm::Layout::F64;
-        Some(plan_forward(pop_model, subject, lay, theta, &zeros, f64l)?)
+        Some(plan_forward(
+            pop_model, subject, lay, theta, &zeros, pop_layout,
+        )?)
     } else {
         None
     };
+    // The population predictions' values (lane 0 of each row).
+    let pop_vals: Option<Vec<f64>> = planned_pop
+        .as_ref()
+        .map(|(_, v, _)| v.iter().step_by(pop_layout.lanes()).copied().collect());
 
     // ---- 2. F and ∇_η l from the kernel plan, one (1 + N)-lane reverse ---------------------
     // Every derivative below is a combination of this sweep's input adjoints: `∇_η F` and
@@ -4871,9 +4924,9 @@ fn run(
     let gr: Vec<Vec<kernel::Leaf>> = (0..n_rows)
         .map(|j| (0..n).map(|k| inp.leaf(preds.g(j, k))).collect())
         .collect();
-    let pr0: Option<Vec<kernel::Leaf>> = planned_pop
+    let pr0: Option<Vec<kernel::Leaf>> = pop_vals
         .as_ref()
-        .map(|(_, v, _)| v.iter().map(|&x| inp.leaf(x)).collect());
+        .map(|v| v.iter().map(|&x| inp.leaf(x)).collect());
     let er: Vec<kernel::Leaf> = eta.iter().map(|&v| inp.leaf(v)).collect();
     let (pr, om) = param_leaves(&pv, &so, &mut inp);
     // The non-Gaussian term's value, η-gradient and (symmetric, one input per k ≥ l)
@@ -4938,7 +4991,28 @@ fn run(
     let n_lanes = 1 + n;
     let mut pred_eta = vec![vec![0.0; n]; n_lanes];
     let mut pred_theta = vec![vec![0.0; theta.len() + n_sigma]; n_lanes];
+    if let Some(fold) = fold.as_ref() {
+        // The plan's η-adjoints from its own lanes, its θ-adjoints through the fold.
+        for o in 0..n_lanes {
+            for j in 0..n_obs {
+                let (af, row) = (ba(o, fr[j]), preds.lanes(j));
+                for k in 0..n {
+                    let mut d = af * row[1 + k];
+                    for m in 0..n {
+                        d += ba(o, gr[j][m]) * row[terms::h_lane(n, m, k)];
+                    }
+                    pred_eta[o][k] += d;
+                }
+            }
+            for (i, d1) in fold.d1.iter().enumerate() {
+                pred_theta[o][i] = d1.iter().map(|&(k, m)| m * pred_eta[o][k]).sum();
+            }
+        }
+    }
     for (row0, p) in [(0, planned.as_ref()), (n_obs, planned_p.as_ref())] {
+        if fold.is_some() {
+            break;
+        }
         let Some((plan, _, fwd)) = p else { continue };
         let l = fl.lanes();
         let w = n_obs * l;
@@ -4983,11 +5057,7 @@ fn run(
     let rows: Vec<Vec<f64>> = (0..n).map(|k| d_eta(1 + k)).collect::<Option<_>>()?;
     let h = DMatrix::from_fn(n, n, |k, m| 0.5 * (rows[k][m] + rows[m][k]));
     let grad_l: Vec<f64> = (0..n).map(|k| kr.value(1 + k)).collect();
-    let fz = if interaction {
-        None
-    } else {
-        planned_pop.as_ref().map(|(_, v, _)| v.clone())
-    };
+    let fz = if interaction { None } else { pop_vals.clone() };
     let Some(w) = mode_solve(&h, &grad_f, &grad_l, || {
         let mut g =
             inner_search_gradient(model, subject, lay, theta, eta, &ctx, &pv, fz.as_deref())?;
@@ -5040,7 +5110,26 @@ fn run(
         })
         .collect();
     // FOCE's population prediction: its adjoints through its plan at η = 0, values only.
-    if let (Some((pp, _, pf)), Some(p0)) = (planned_pop.as_ref(), pr0.as_ref()) {
+    if let (Some((_, pv1, _)), Some(p0), Some(fold)) =
+        (planned_pop.as_ref(), pr0.as_ref(), fold.as_ref())
+    {
+        // Under the fold: each output's adjoint of `f_pop` against its η-tangents at η = 0.
+        let l1 = pop_layout.lanes();
+        for (o, ta) in lane_theta.iter_mut().enumerate() {
+            for (j, &x) in p0.iter().enumerate() {
+                let a = out_adj(o, x);
+                if a == 0.0 {
+                    continue;
+                }
+                for (i, d1) in fold.d1.iter().enumerate() {
+                    ta[i] += a * d1
+                        .iter()
+                        .map(|&(k, m)| m * pv1[j * l1 + 1 + k])
+                        .sum::<f64>();
+                }
+            }
+        }
+    } else if let (Some((pp, _, pf)), Some(p0)) = (planned_pop.as_ref(), pr0.as_ref()) {
         let f64l = crate::sens::num::vm::Layout::F64;
         let no = n_outs;
         let mut du_bar = vec![0.0; no * n_obs];
