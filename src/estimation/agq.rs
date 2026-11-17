@@ -73,10 +73,10 @@
 //! which is the entire cost. Dimensionality is therefore bounded by [`MAX_AGQ_GRID`]
 //! instead, and a sparse (Smolyak) rule is the real answer for `d = 5..8` (issue #251).
 
+use crate::cold_sort::ColdSort;
 use crate::sens::ode_provider::adjoint::ModeOut;
 use crate::stats::stacked_layout::{kappa_range, stacked_width};
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 use std::f64::consts::PI;
 use std::sync::OnceLock;
 
@@ -177,7 +177,7 @@ pub(crate) fn gauss_hermite(n: usize) -> (Vec<f64>, Vec<f64>) {
         .collect();
     // Ascending node order: the grid is then deterministic and reproducible run to run,
     // independent of whatever order the eigensolver happened to converge in.
-    pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).expect("GH nodes are finite"));
+    pairs.cold_sort_by(&|a, b| a.0.partial_cmp(&b.0).expect("GH nodes are finite"));
     pairs.into_iter().unzip()
 }
 
@@ -236,6 +236,10 @@ pub(crate) struct PopulationEvaluation {
     /// Each subject's packed score, when every subject has one (#2549): the BHHH decrement's
     /// rows at a tolerance stop.
     scores: Option<Vec<Vec<f64>>>,
+    /// Each subject's stacked mode the score was taken at when its pass polished an off-mode
+    /// start (`None` where it was served as handed): the objective was evaluated there too, and
+    /// the caller's EBE store adopts it.
+    polished: Vec<Option<Vec<f64>>>,
     /// How each subject's score was formed, in subject order (for the outer FD-fallback
     /// warning).
     routes: Vec<ScoreRoute>,
@@ -443,7 +447,8 @@ impl Stack {
     }
 }
 
-/// Central-difference Hessian of the exact conditional NLL w.r.t. the integration variable
+/// Recorder-defect safety net (never a scope route): central-difference Hessian of the exact
+/// conditional NLL w.r.t. the integration variable
 /// `b` at `b_hat` (see [`Stack`] — `b = η`, or `[η, κ₁..κ_K]` under IOV).
 ///
 /// Step `hᵢ = max(ε^¼ · √Ω_joint,ᵢᵢ, 1e-4)`: `ε^¼` is the standard second-difference step (it
@@ -505,9 +510,11 @@ fn fd_posterior_hessian(
 ///
 /// * [`HessianAnchor::Exact`] → the exact conditional Hessian `∂²nll/∂b²`. This is
 ///   Laplace / adaptive GH quadrature. Taken **analytically** from the unified recording
-///   (`adjoint::exact_inner_hessian`) wherever it serves the subject, and from the
-///   `2d²+1`-evaluation [`fd_posterior_hessian`] sweep only outside it (TTE, categorical),
-///   whose likelihood has no `PkNum` twin.
+///   (`adjoint::exact_inner_hessian`) for every subject of every model. Its declines
+///   (`adjoint::HessianDecline`) are points the objective repels too, so there the anchor is
+///   `None` (the sentinel). Only a point the exact Hessian declines **and the objective
+///   scores** — a plan that failed, a recorder defect — takes the `2d²+1`-evaluation
+///   [`fd_posterior_hessian`] sweep, as the gradient and inner paths take theirs.
 /// * [`HessianAnchor::GaussNewton`] → the Almquist `H̃`, the *same* Hessian FOCEI's own
 ///   objective and gradient use, so `focei` with `n_agq > 1` is a genuine quadrature
 ///   refinement of FOCEI.
@@ -521,8 +528,9 @@ fn fd_posterior_hessian(
 ///
 /// Returns `None` when a Gauss-Newton anchor is out of the provider's scope (the caller then
 /// yields the NLL sentinel, and `api::check_model_options` rejects `focei, n_agq > 1` outside
-/// that scope up front so this does not surprise a fit at runtime). The `Exact` arm always
-/// yields a matrix, falling back to FD.
+/// that scope up front so this does not surprise a fit at runtime), and for the exact anchor
+/// where the Hessian declines at a point the objective itself repels (non-finite or the
+/// sentinel): the consistent repel, with no finite difference of a value that is not there.
 fn anchor_hessian(
     anchor: HessianAnchor,
     model: &CompiledModel,
@@ -535,16 +543,16 @@ fn anchor_hessian(
 ) -> Option<DMatrix<f64>> {
     match anchor {
         HessianAnchor::Exact => {
-            // The exact Hessian from the unified recording (every engine it serves), before
-            // any finite difference.
             if let Some(h) = crate::sens::ode_provider::adjoint::exact_inner_hessian(
                 model, subject, params, b_hat,
             ) {
                 return Some(h);
             }
-            Some(fd_posterior_hessian(
-                model, subject, params, stack, b_hat, scratch, schedule,
-            ))
+            // A decline at a point the value path scores is a plan defect (see above).
+            let at_mode = stack.nll_at(model, subject, params, b_hat, scratch, schedule);
+            is_usable_subject_nll(at_mode).then(|| {
+                fd_posterior_hessian(model, subject, params, stack, b_hat, scratch, schedule)
+            })
         }
         HessianAnchor::GaussNewton => {
             crate::sens::ode_provider::adjoint::exact_htilde(model, subject, params, b_hat)
@@ -674,10 +682,8 @@ fn agq_subject_evaluate(
     // normalization term algebraically.
     if nodes.len() == 1 && laplace_one_point_fast_enabled() {
         let reusable_nll = terminal_mode_nll.filter(|_| laplace_mode_nll_reuse_enabled());
-        let mode_nll = reusable_nll.map_or_else(
-            || stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule),
-            |nll| nll,
-        );
+        let mode_nll = reusable_nll
+            .unwrap_or_else(|| stack.nll_at(model, subject, params, b_hat, &mut scratch, schedule));
         let nll = mode_nll + 0.5 * proposal.log_det_inv_scale;
         return if nll.is_finite() {
             nll
@@ -926,30 +932,26 @@ fn agq_population_nll_impl(
         uncached_log_weights = weights.iter().map(|w| w.ln()).collect::<Vec<_>>();
         &uncached_log_weights
     };
-    let per_subject: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            let stack = Stack::new(model, params, subj_kappas.len());
-            let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
-            let schedule = schedules.and_then(|s| s[i].as_ref());
-            agq_subject_evaluate(
-                model,
-                subject,
-                params,
-                &stack,
-                &b_hat,
-                nodes,
-                log_weights,
-                anchor,
-                schedule,
-                terminal_work.and_then(|all| all[i].0.as_ref()),
-                terminal_work.map(|all| all[i].1),
-            )
-        })
-        .collect();
+    let per_subject: Vec<f64> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        let stack = Stack::new(model, params, subj_kappas.len());
+        let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
+        let schedule = schedules.and_then(|s| s[i].as_ref());
+        agq_subject_evaluate(
+            model,
+            subject,
+            params,
+            &stack,
+            &b_hat,
+            nodes,
+            log_weights,
+            anchor,
+            schedule,
+            terminal_work.and_then(|all| all[i].0.as_ref()),
+            terminal_work.map(|all| all[i].1),
+        )
+    });
     per_subject.iter().sum()
 }
 
@@ -1050,11 +1052,9 @@ fn agq_population_evaluate_impl(
     let context = SubjectScoreContext::new(model, template, x, options, bounds, false);
 
     let exact_anchor = matches!(anchor, HessianAnchor::Exact);
-    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subject: Vec<(f64, Option<(Vec<f64>, ScoreRoute)>, ModeOut)> =
+        crate::par::map(population.subjects.len(), |i| {
+            let subject = &population.subjects[i];
             let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
             let stack = Stack::new(model, params, subj_kappas.len());
             let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
@@ -1080,12 +1080,20 @@ fn agq_population_evaluate_impl(
                 true,
                 &mut mode,
             );
+            // A pass that polished the start to the mode took its score, and formed its exact
+            // Hessian, there: the objective is evaluated at that same mode, so the value and
+            // the gradient are of one function.
+            let b_eval = mode
+                .eta_polished
+                .as_deref()
+                .filter(|p| p.len() == b_hat.len())
+                .unwrap_or(&b_hat);
             let nll = agq_subject_evaluate(
                 model,
                 subject,
                 params,
                 &stack,
-                &b_hat,
+                b_eval,
                 &nodes,
                 &log_weights,
                 anchor,
@@ -1094,8 +1102,7 @@ fn agq_population_evaluate_impl(
                 terminal_work.map(|all| all[i].1),
             );
             (nll, score, mode)
-        })
-        .collect();
+        });
     let nll = per_subject.iter().map(|(nll, _, _)| nll).sum();
     let gradient = per_subject.iter().try_fold(
         vec![0.0; x.len()],
@@ -1114,6 +1121,10 @@ fn agq_population_evaluate_impl(
         .iter()
         .map(|(_, s, _)| s.as_ref().map(|(g, _)| g.clone()))
         .collect();
+    let polished = per_subject
+        .iter()
+        .map(|(_, _, m)| m.eta_polished.clone())
+        .collect();
     let (eta_dx, mode_hessians): (Vec<_>, Vec<_>) = per_subject
         .into_iter()
         .map(|(_, _, m)| (m.eta_dx, m.hessian))
@@ -1122,6 +1133,7 @@ fn agq_population_evaluate_impl(
         nll,
         gradient,
         routes,
+        polished,
         eta_dx: want_eta_dx.then_some(eta_dx),
         mode_hessians: (want_eta_dx && exact_anchor).then_some(mode_hessians),
         scores,
@@ -1449,37 +1461,36 @@ pub(crate) fn population_gradient_mixed(
                 slot.hessians = evaluation.mode_hessians;
             }
             slot.scores = evaluation.scores;
+            slot.polished = evaluation.polished;
         }
         return evaluation.gradient;
     }
     let want_eta_dx = eta_dx.as_ref().is_some_and(|s| s.want_dx);
     let want_hessian = want_eta_dx && matches!(options.hessian_anchor(), HessianAnchor::Exact);
     let context = SubjectScoreContext::new(model, template, x, options, bounds, force_fd);
-    let scores: Vec<_> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            let mut mode = ModeOut {
-                want_dx: want_eta_dx,
-                want_hessian,
-                ..ModeOut::default()
-            };
-            let score = context.score_routed_with_mode(
-                subject,
-                eta_hats[i].as_slice(),
-                kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
-                true,
-                &mut mode,
-            );
-            (score, mode)
-        })
-        .collect();
+    let scores: Vec<_> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let mut mode = ModeOut {
+            want_dx: want_eta_dx,
+            want_hessian,
+            ..ModeOut::default()
+        };
+        let score = context.score_routed_with_mode(
+            subject,
+            eta_hats[i].as_slice(),
+            kappas.get(i).map(Vec::as_slice).unwrap_or(&[]),
+            true,
+            &mut mode,
+        );
+        (score, mode)
+    });
     let mut result = vec![0.0; x.len()];
     let mut per = Vec::with_capacity(scores.len());
     let mut hessians = Vec::with_capacity(scores.len());
     let mut rows = Vec::with_capacity(scores.len());
+    let mut polished = Vec::with_capacity(scores.len());
     for (i, (score, mode)) in scores.into_iter().enumerate() {
+        polished.push(mode.eta_polished);
         per.push(mode.eta_dx);
         hessians.push(mode.hessian);
         let (score, route) = score?;
@@ -1497,6 +1508,7 @@ pub(crate) fn population_gradient_mixed(
             slot.hessians = want_hessian.then_some(hessians);
         }
         slot.scores = Some(rows);
+        slot.polished = polished;
     }
     result.iter().all(|v| v.is_finite()).then_some(result)
 }
@@ -1540,18 +1552,14 @@ pub fn agq_population_gradient(
     let _ = params;
     // One unpack for the population: every subject is at the same packed point.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
-    let per_subject: Vec<Option<Vec<f64>>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
-            let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
-            let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
-            let mut g = vec![0.0f64; n_packed];
-            agq_subject_packed_gradient(model, subject, &pt, &b_hat, n_nodes, anchor, &mut g)
-                .map(|()| g)
-        })
-        .collect();
+    let per_subject: Vec<Option<Vec<f64>>> = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let subj_kappas = kappas.get(i).map(Vec::as_slice).unwrap_or(&[]);
+        let b_hat = stack_mode(eta_hats[i].as_slice(), subj_kappas);
+        let mut g = vec![0.0f64; n_packed];
+        agq_subject_packed_gradient(model, subject, &pt, &b_hat, n_nodes, anchor, &mut g)
+            .map(|()| g)
+    });
 
     let mut out = vec![0.0f64; n_packed];
     for g in per_subject {
@@ -2103,6 +2111,60 @@ mod tests {
             "AGQ(1, GaussNewton) must be the FOCEI marginal: agq={agq}, focei={focei}, \
              gap={gap:.3e}, the old jitter offset was ~{jitter_scale:.3e}"
         );
+    }
+
+    /// G15: the `Exact` anchor declines at a point the objective repels. A non-finite mode has
+    /// no exact Hessian (the recording is not served there) and the value path scores it as the
+    /// sentinel / non-finite, so the anchor is `None` (the consistent repel) and no finite
+    /// difference of a value that is not there is taken. At the converged mode of the same
+    /// subject it is a real matrix (the straddle, so a mutation to "always `None`" fails too).
+    /// Mutation: drop the `is_usable_subject_nll` gate -> the NaN point returns `Some(NaN ..)`.
+    #[test]
+    fn the_exact_anchor_is_none_at_a_point_the_objective_repels() {
+        use crate::estimation::inner_optimizer::find_ebe;
+        let model = parse_model_string(M3_MODEL).expect("parse");
+        let theta = [0.22, 11.0, 1.4];
+        let subject = score_subject(&model, &theta, &[0.5, 1.0, 2.0, 4.0, 8.0, 24.0]);
+        let mut params = model.default_params.clone();
+        params.theta = theta.to_vec();
+        let stack = Stack::new(&model, &params, 0);
+        let mut scratch = pk::EventPkParams::with_capacity_for(&subject);
+        let schedule = cacheable_schedule(&model, &subject);
+        let at = |b: &[f64], scratch: &mut pk::EventPkParams| {
+            anchor_hessian(
+                HessianAnchor::Exact,
+                &model,
+                &subject,
+                &params,
+                &stack,
+                b,
+                scratch,
+                schedule.as_ref(),
+            )
+        };
+        let ebe = find_ebe(&model, &subject, &params, 200, 1e-11, None, None, 0);
+        let h = at(ebe.eta.as_slice(), &mut scratch).expect("a real Hessian at the mode");
+        assert!(h.iter().all(|v| v.is_finite()));
+        let nan = vec![f64::NAN; stack.d()];
+        assert!(
+            crate::sens::ode_provider::adjoint::exact_inner_hessian(
+                &model, &subject, &params, &nan
+            )
+            .is_none(),
+            "fixture: the exact Hessian declines at a non-finite mode"
+        );
+        assert!(
+            !crate::stats::likelihood::is_usable_subject_nll(stack.nll_at(
+                &model,
+                &subject,
+                &params,
+                &nan,
+                &mut scratch,
+                schedule.as_ref()
+            )),
+            "fixture: the objective repels it"
+        );
+        assert!(at(&nan, &mut scratch).is_none());
     }
 
     #[test]

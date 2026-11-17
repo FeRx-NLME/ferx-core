@@ -161,7 +161,7 @@ fn wide_ode_model_matches_nonmem_at_their_optimum() {
         .expect("evaluation at NONMEM's optimum must run");
 
     assert_eq!(
-        result.gradient_method_inner, "analytic (Dual2)",
+        result.gradient_method_inner, "analytic",
         "#1661: a model past 12 individual parameters must take the analytic inner route"
     );
     assert!(
@@ -225,7 +225,7 @@ fn wide_ode_model_fit_matches_nonmem() {
     let pop = read_nonmem_csv(Path::new(DATA_FILE), None, None).expect("anchor data");
     let result = fit(&model, &pop, &model.default_params, &options(None)).expect("fit");
 
-    assert_eq!(result.gradient_method_inner, "analytic (Dual2)");
+    assert_eq!(result.gradient_method_inner, "analytic");
 
     // Measured gaps, ferx against NONMEM:
     //   OFV 95.685274 vs 95.685257 (1.7e-5);

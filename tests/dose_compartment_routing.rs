@@ -1020,13 +1020,14 @@ fn an_ode_cmt_zero_dose_into_a_zero_order_compartment_predicts_like_cmt_one() {
     }
 }
 
-/// C (validation gate): steady-state dosing into a zero_order absorption compartment is
-/// unsupported (`E_ABSORPTION_SS_ZERO_ORDER`). That rejection keyed on the raw `d.cmt`
-/// against a set of `f.cmt + 1`, so a `CMT=0` SS dose slipped the gate — landing on the
-/// event-driven zero-order drop above instead of a clean error. It must be rejected exactly
-/// like the `CMT=1` spelling.
+/// C (validation gate): steady-state dosing into a lone zero_order absorption compartment is
+/// served since #2786 (it was refused as `E_ABSORPTION_SS_ZERO_ORDER`). That gate keyed on the
+/// raw `d.cmt` against a set of `f.cmt + 1`, so a `CMT=0` SS dose slipped it — landing on the
+/// event-driven zero-order drop above instead of a clean error. Both spellings must now pass it
+/// the same way, and **predict the same**: the `CMT=0` dose is lowered like the `CMT=1` one
+/// rather than dropped.
 #[test]
-fn an_ode_cmt_zero_ss_zero_order_dose_is_rejected_not_silently_dropped() {
+fn an_ode_cmt_zero_ss_zero_order_dose_is_served_like_cmt_one() {
     let model = model_of(ODE_ZERO_ORDER);
     let ss_row = |cmt: usize| {
         pop_of(&format!(
@@ -1036,8 +1037,18 @@ fn an_ode_cmt_zero_ss_zero_order_dose_is_rejected_not_silently_dropped() {
     for cmt in [0usize, 1] {
         let diags = check_model_data(&model, &ss_row(cmt));
         assert!(
-            diags.iter().any(|d| d.code == "E_ABSORPTION_SS_ZERO_ORDER"),
-            "SS zero-order dose CMT={cmt} must be rejected, not bypassed: {diags:?}"
+            !diags.iter().any(|d| d.code.starts_with("E_ABSORPTION_SS_")),
+            "SS zero-order dose CMT={cmt} is served: {diags:?}"
         );
+    }
+    let at = |cmt: usize| {
+        let pop = ss_row(cmt);
+        ferx_core::predict(&model, &pop, &model.default_params).expect("predict")
+    };
+    let (zero, one) = (at(0), at(1));
+    assert!(!zero.is_empty() && zero.len() == one.len());
+    for (z, o) in zero.iter().zip(one.iter()) {
+        assert!(z.pred.is_finite() && z.pred > 0.0, "{z:?}");
+        assert_eq!(z.pred, o.pred, "CMT=0 SS zero-order dose must equal CMT=1");
     }
 }

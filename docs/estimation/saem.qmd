@@ -187,8 +187,8 @@ Three details carry the design:
   fixed $c = 1.2$.
 - **Two gates, decided before the run.** Scope: an analytical PK or ODE model
   whose η-gradient and η-Jacobian the adjoint's recorder serves exactly (an ODE
-  model whose right-hand side and readout the dual ODE walk covers; an SDE, or an
-  ODE the walk declines, is out), and none of IOV, `iiv_on_ruv`, mixture, FREM,
+  model whose right-hand side and readout the dual ODE walk covers, an SDE
+  included; an ODE the walk declines is out), and none of IOV, `iiv_on_ruv`, mixture, FREM,
   `block_sigma`, M3, non-Gaussian endpoint or LTBS. Information: at least
   `saem_imh_min_obs_per_eta` (default 2.0) mean observations per subject per η —
   below that the conditional is barely narrower than the prior, and the

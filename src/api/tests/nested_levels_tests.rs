@@ -823,8 +823,20 @@ fn every_nested_parity_fixture_fits_on_the_analytic_walks() {
         ("algebraic", fx::algebraic()),
         ("closed form", fx::closed_form()),
         ("ode", fx::ode()),
+        ("transit walk", fx::transit()),
+        ("transit twin", fx::transit()),
     ] {
-        let (m, pop) = fx::prepared(&src, 2);
+        let (m, mut pop) = fx::prepared(&src, 2);
+        if label.starts_with("transit twin") {
+            // An infusion routes every subject to the ODE twin (`effective_for`).
+            for s in &mut pop.subjects {
+                s.doses[0] = crate::types::DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0);
+            }
+            assert!(
+                m.effective_for(&pop.subjects[0]).ode_spec.is_some(),
+                "{label}: the subjects must run on the twin"
+            );
+        }
         let opts = FitOptions {
             method: EstimationMethod::FoceI,
             iov_occasion: IovOccasionRule::Column,
@@ -857,53 +869,34 @@ const TRANSIT_NESTED: &str = "[parameters]\n  theta TVCL(5.0, 0.1, 100.0)\n  \
     pk one_cpt_transit(cl=CL, v=V, n=NTR, mtt=MTT)\n[error_model]\n  \
     DV ~ proportional(PROP)\n";
 
-/// #1082 PR3: a nested model reports the analytic walks on every gradient, as its
-/// one-level twin does — the walks seed κ on the compact axes. The one nested model left
-/// on finite differences is a closed-form transit/IG one, whose IOV subjects run on an ODE
-/// twin not known to carry the levels; its one-level twin stays analytic, so the decline
-/// follows the nesting and not the model class.
+/// A nested model reports the analytic walks on every gradient, on every model class: the
+/// closed-form transit one too, whose IOV subjects can run on an ODE twin that carries the
+/// levels (its emitted source declares them).
 #[test]
-fn a_nested_model_reports_the_analytic_walks_unless_it_runs_on_a_transit_twin() {
-    let one_level = |src: &str, inner: &str, outer: &str| {
-        parse_model_string(
-            &src.replace(&format!("  level {inner} by {inner} in {outer}\n"), "")
-                .replace(&format!("at {inner}"), &format!("at {outer}")),
-        )
-        .unwrap()
-    };
-    let nested = model();
-    let one = one_level(&src(), "ARM", "STUDY");
+fn a_nested_model_reports_the_analytic_walks_on_every_class() {
     let transit = parse_model_string(TRANSIT_NESTED).unwrap();
-    let transit_one = one_level(TRANSIT_NESTED, "ARM", "STUDY");
+    let twin = transit
+        .absorption_ode_equivalent
+        .as_ref()
+        .expect("the transit fixture must carry an ODE twin, or it cannot see the decline")
+        .built();
     assert!(
-        transit.absorption_ode_equivalent.is_some(),
-        "the transit fixture must carry an ODE twin, or it cannot see the decline"
+        transit.has_nested_levels() && twin.has_nested_levels(),
+        "the twin carries the primary's levels"
     );
-    for (label, m, nested_levels, analytic) in [
-        ("algebraic, nested", &nested, true, true),
-        ("algebraic, one level", &one, false, true),
-        ("transit, nested", &transit, true, false),
-        ("transit, one level", &transit_one, false, true),
-    ] {
-        assert_eq!(m.has_nested_levels(), nested_levels, "{label}");
-        assert_eq!(
-            crate::sens::ode_provider::adjoint::nested_levels_outside_scope(m),
-            !analytic,
+    assert_eq!(twin.nested_levels(), transit.nested_levels());
+    for (label, m) in [("algebraic", model()), ("transit", transit)] {
+        assert!(m.has_nested_levels(), "{label}");
+        assert!(
+            crate::sens::ode_provider::adjoint::recorder_in_scope(&m),
             "{label}"
         );
-        assert_eq!(
-            crate::sens::ode_provider::adjoint::recorder_in_scope(m),
-            analytic,
+        assert!(
+            crate::estimation::inner_optimizer::inner_reports_analytic_model(&m),
             "{label}"
         );
-        assert_eq!(
-            crate::estimation::inner_optimizer::inner_reports_analytic_model(m),
-            analytic,
-            "{label}"
-        );
-        assert_eq!(
-            crate::sens::provider::analytic_outer_gradient_in_scope(m),
-            analytic,
+        assert!(
+            crate::sens::provider::analytic_outer_gradient_in_scope(&m),
             "{label}"
         );
     }

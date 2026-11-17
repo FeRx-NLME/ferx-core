@@ -450,7 +450,10 @@ fn an_oracle_subject_whose_replicates_differ_is_named_in_both_groups() {
     let population = pop(&[("s1", 70.0), ("s2", 70.0)]);
     let plan = |replicate, found| AbsorbedPlan {
         subject: 0,
-        replicate: Some(replicate),
+        replicate: Some(crate::sim::adaptive::ReplicateTag {
+            draw: None,
+            sim: replicate,
+        }),
         found,
     };
     let plans = vec![

@@ -4,6 +4,8 @@
 //! future HMC/NUTS variant or SIR posterior summaries tomorrow — shares one
 //! implementation and one definition of each statistic.
 
+use crate::cold_sort::ColdSort;
+
 /// Mean of a slice. NaN for an empty slice.
 pub(crate) fn mean(xs: &[f64]) -> f64 {
     if xs.is_empty() {
@@ -182,7 +184,7 @@ fn rank_normalized(chains: &[Vec<f64>]) -> Vec<Vec<f64>> {
     }
     // Average ranks (1-based) with tie handling.
     let mut order: Vec<usize> = (0..s).collect();
-    order.sort_by(|&a, &b| {
+    order.cold_sort_by(&|&a, &b| {
         flat[a]
             .2
             .partial_cmp(&flat[b].2)
@@ -225,7 +227,7 @@ pub fn ess_tail(chains: &[Vec<f64>]) -> f64 {
     if pooled.len() < 4 {
         return (pooled.len()) as f64;
     }
-    pooled.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    pooled.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let q05 = quantile_sorted(&pooled, 0.05);
     let q95 = quantile_sorted(&pooled, 0.95);
     let indicator = |thresh: f64| -> Vec<Vec<f64>> {

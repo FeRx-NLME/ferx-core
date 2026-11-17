@@ -998,25 +998,6 @@ fn valid_modeled_dose_predicts_without_panicking() {
 }
 
 #[test]
-fn modeled_duration_steady_state_overlap_warns() {
-    // W_STEADY_STATE_INFUSION (T_inf > II) must fire for a *modeled* SS infusion
-    // too: the warning's effective-duration check resolves `D{cmt}` at init
-    // params (#384), since `dose.duration` is 0 until `resolve_rate`. Here
-    // D1=5 > II=4, so the overlapping-pulse warning is expected.
-    let model = model_of(ODE_D1);
-    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS\n\
-               1,0,.,1,100,1,-2,1,4,1\n\
-               1,2,0,0,0,1,0,0,0,0\n";
-    let pop = pop_of(csv);
-    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
-    assert!(
-        diags.iter().any(|d| d.code == "W_STEADY_STATE_INFUSION"),
-        "modeled SS infusion with D1=5 > II=4 must warn; got {:?}",
-        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
-    );
-}
-
-#[test]
 fn modeled_duration_nonpositive_at_init_warns() {
     // Review #3: a modeled duration `D1` that is ≤ 0 at the initial typical value
     // (here TVD1 = -1 via a `D1 = TVD1` identity link) is accepted by
@@ -1064,10 +1045,8 @@ fn modeled_duration_warnings_are_panic_free_when_param_missing() {
     // error from `check_model_data` (E_MODELED_DURATION_NO_PARAM), but the
     // separate `check_model_data_warnings` pass can still be called on it and
     // must stay panic-free — it must NOT hit `resolve_rate`'s slot `.expect`.
-    // This exercises the slot-absent fallbacks in both modeled-dose warnings:
-    // the SS-overlap check's `effective_duration` (`_ => 0.0`) and the
-    // non-positive-duration loop's `indexed_slot(..) == None` skip. With no slot,
-    // the effective duration is 0 (no overlap) and neither warning fires.
+    // This exercises the non-positive-duration loop's slot-absent
+    // `indexed_slot(..) == None` skip: with no slot, the warning does not fire.
     let model = model_of(ODE_NO_D1);
     assert!(model.ode_spec.is_some(), "model must be ODE");
     // The data is genuinely unsupported (the join would reject it)…
@@ -1085,27 +1064,8 @@ fn modeled_duration_warnings_are_panic_free_when_param_missing() {
     assert!(
         !diags
             .iter()
-            .any(|d| d.code == "W_STEADY_STATE_INFUSION"
-                || d.code == "W_MODELED_DURATION_NONPOSITIVE"),
+            .any(|d| d.code == "W_MODELED_DURATION_NONPOSITIVE"),
         "slot-absent modeled dose raises no modeled-dose warning; got {:?}",
-        diags.iter().map(|d| &d.code).collect::<Vec<_>>()
-    );
-}
-
-#[test]
-fn modeled_duration_steady_state_no_overlap_does_not_warn() {
-    // Converse: D1=5 <= II=6 is a non-overlapping SS infusion — no warning. This
-    // pins that the effective-duration resolution compares the *resolved* D, not
-    // the unresolved 0 (which would never warn) nor a false positive.
-    let model = model_of(ODE_D1);
-    let csv = "ID,TIME,DV,EVID,AMT,CMT,RATE,MDV,II,SS\n\
-               1,0,.,1,100,1,-2,1,6,1\n\
-               1,2,0,0,0,1,0,0,0,0\n";
-    let pop = pop_of(csv);
-    let diags = check_model_data_warnings(&model, &pop, &model.default_params);
-    assert!(
-        !diags.iter().any(|d| d.code == "W_STEADY_STATE_INFUSION"),
-        "D1=5 <= II=6 must not warn; got {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
 }

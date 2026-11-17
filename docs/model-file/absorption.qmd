@@ -183,10 +183,36 @@ the nonlinear Anderson solve carries them through the same fixed-point recursion
 derivative correction (#867) — not the FD-of-prediction fallback the earlier nonlinear case used.
 (The Newton correction's state-Jacobian `J_P` is itself a finite difference, so the nonlinear-SS
 gradient carries an `O(reltol/eps)` term amplified by `1/(1−ρ)`; it is accurate across the clinical
-range but loosens as `ρ → 1`.) Two `SS` combinations remain **rejected with a clear error**: a
-`zero_order()` window (`E_ABSORPTION_SS_ZERO_ORDER` — a spanning window needs a
-distinct periodic-window equilibration) and an absorption **lagtime**
-(`E_ABSORPTION_SS_LAG` — the SS + lagtime pre-arrival seed is still bolus-only).
+range but loosens as `ρ → 1`.)
+
+### Steady state with a lag, and into a `zero_order()` window {#ss-absorption-lag}
+
+Both combinations that used to be rejected (`E_ABSORPTION_SS_LAG`,
+`E_ABSORPTION_SS_ZERO_ORDER`, #719) are supported (#2786), with exact analytic gradients
+and no finite-difference fallback.
+
+**A lag** — a compartment `lagtime`/`ALAG{c}` or a per-route `lag=`, the two add — moves the
+dose's own pulse `L` after its record; the earlier pulses of the periodic train are anchored on
+the record. The state the record installs is the fixed point of the cycle that starts there with
+the own pulse arriving `L` into it, the forcing after the record is the same periodic sum, and
+for `L ≥ II` the train **clamps** onto the record (the pulse before the dose lands on it), as
+for every other lagged steady-state dose ([lagtime](lagtime.qmd)).
+
+**A `zero_order()` window** is an infusion — rate `F·AMT/dur` over `[t + lag, t + lag + dur]` —
+so an `SS=1` dose into a compartment fed by a lone `zero_order()` is carried as the
+duration-modeled steady-state infusion it is: the periodic window seed, the windows of earlier
+pulses still running at the record (`dur > II`, or lag + `dur` past `II`) and the exact
+derivatives through `dur` and the lag are the steady-state infusion's own. A per-route `lag=` on
+such a compartment is its `ALAG{c}`; the two spellings are the same model.
+
+Anchored against an independent pulse-train reference to 1e-9 and against NONMEM 7.6.0
+(`nonmem_anchor/ss_zero_order_lag.ctl`, `ss_first_order_lag.ctl`, `tests/ss_absorption_lag_anchor.rs`).
+For `lag > II` NONMEM's analytic `ADVAN1`/`ADVAN2` follow the unclamped periodic train from
+`t = lag − II` on (and are not a concentration before it); ferx follows the documented clamp,
+verified against `ADVAN13`. Two cases stay **rejected with a clear error**: a `zero_order()` window mixed
+with another absorption function on the same compartment (`E_ABSORPTION_SS_ZERO_ORDER_MIXED`),
+and a zero-order compartment carrying both a per-route `lag=` and its own `ALAG{c}`
+(`E_ABSORPTION_SS_ZERO_ORDER_LAG`).
 
 ### Infusion (`RATE>0`) into an absorption compartment
 
@@ -207,10 +233,13 @@ matches NONMEM's native `ADVAN2` zero-order-into-depot behaviour exactly (see
 closed-form `pk *_transit` / `*_ig` model with an infusion reroutes to its ODE
 twin automatically. Because every kernel's CDF is a closed form
 (`regularized_gamma_p` for transit, the two-`Φ` IG CDF, elementary for
-Weibull/first-order), `R_in_inf` is exact and cheap; fit-time sensitivities use a
-finite-difference fallback (the dual walk's `+rate` suppression is a follow-up),
-which runs at normal FOCEI speed since an infusion prediction needs no
-equilibration.
+Weibull/first-order), `R_in_inf` is exact and cheap, and fit-time sensitivities are
+exact: the adjoint walks deliver the infusion through the same convolved `R_in_inf`
+(no plain `+rate`), and when the window's start or end moves with an estimated
+parameter — `F` on a rate-defined infusion, a modeled `RATE=-1`/`-2` dose, or a
+compartment or per-route lag — the kink of `R_in_inf` there is crossed as a moving
+boundary. The window end is a break of every integration timeline, including under a
+per-route lag (where it sits one window after the route's onset).
 
 Two infusion combinations remain **rejected with a clear error**: into a
 `zero_order()` window (`E_ABSORPTION_RATE_ZERO_ORDER` — a window-with-window
@@ -837,9 +866,9 @@ Jacobian jumps across the boundary too, not just the forcing). Because the IOV w
 the same event-driven walk, **every** absorption forcing is analytic under **IOV** too
 (#486 — the smooth densities `igd`/`transit`/`weibull`/`first_order`, the moving-window
 `zero_order`, and any composition `mixed`/`parallel`; each forcing's rate/window is rebuilt
-from its dose's own occasion-seeded PK jet); the only IOV holdouts are `weibull` + lagtime
-(β<1 onset divergence) and any forcing combined with a **steady-state** dose (the dual SS
-equilibration does not spread the forcing over the cycle).
+from its dose's own occasion-seeded PK jet); the only IOV holdout is any forcing combined
+with a **steady-state** dose (the dual SS equilibration does not spread the forcing over the
+cycle).
 See [#530](https://github.com/FeRx-NLME/ferx-core/issues/530).
 
 The **smooth-density forcings** (`igd`, `transit`, `weibull`, `first_order`) have a
@@ -852,9 +881,18 @@ lagtime**, `igd`/`transit`/`first_order` are *also* analytic (#486): the continu
 `∂R_in/∂lag` rides the walk's dual time-after-dose, and the forcing's onset at the
 dose's lagged arrival is injected as an exact rate-on saltation — the sign-mirror of
 the `zero_order` rate-off saltation above, generalised from a constant rate to
-`R_in(0⁺)`. `weibull` + lagtime still falls back to finite differences: its onset can
-diverge for shape `β < 1` (an integrable spike, not a finite jump), so no closed-form
-saltation exists there.
+`R_in(0⁺)`. `weibull` and `transit` boluses are *also* analytic under a lagtime, for every
+shape — including `β < 1` and `0 < n < 1`, where the density is infinite (or its slope not
+integrable) at the onset and no rate-on saltation exists. The segment after a moving onset is
+integrated from the state at the true onset, on the walk's clock shifted by the onset's jet, so
+the kernel is read at an age with no derivative and the state is flowed back to the fixed time
+afterwards, where the field is smooth. A Weibull with `β < 1` — whose density is infinite at the
+onset — is integrated as the absorbed mass besides: its lagged dose shifts the state by
+`D·(S(τ₀) − S(τ))`, with `S = 1 − G` the not-yet-absorbed fraction (a closed form), so the
+right-hand side reads `S`, which is continuous there, instead of the density. Predictions are
+unchanged for every other kernel and shape; the framed Weibull's move only at the integrator's
+tolerance (≤ 7e-7 relative at `reltol = 1e-10`), a tolerance that is relative to the shifted
+state, so on a long segment with fast elimination tighten `reltol` for the late amounts.
 :::
 
 ### Worked examples — zero-order sensitivity
@@ -964,10 +1002,8 @@ rather than aborting the run.
 
 A plain **infusion** (`RATE>0`) into a per-route-lagged compartment composes as expected
 (the whole infused-kernel appearance is delayed by `lag`). **Steady-state** dosing
-(`SS=1`) into a per-route-lagged compartment is *rejected* (`E_ABSORPTION_SS_LAG`) — the
-same limitation as a compartment `lagtime`/`ALAG` under `SS` ([#719](https://github.com/FeRx-NLME/ferx-core/issues/719)):
-the steady-state pre-arrival seed does not yet route the dose through the absorption
-kernel over a lagged onset.
+(`SS=1`) into a per-route-lagged compartment is supported
+([above](#ss-absorption-lag), #2786).
 
 ### Closed-form evaluation {#mr-closed-form}
 
@@ -1012,12 +1048,11 @@ carries the same jet on its rate-off at the window end; for the smooth kernels
 continuous `∂R_in/∂lag_route` alone, with a timeline break at the onset. The predicted
 values are unchanged — only the gradient moves off finite differences.
 
-Two cases remain on the **finite-difference** fallback: a per-route lag on a **`weibull`**
-forcing (its onset diverges for shape `β < 1`, so no finite rate-on saltation exists — the
-exact analogue of the `weibull()` + compartment-lagtime fallback), and a per-route lag
-combined with **IOV** (`κ`). Both stay exact in predictions and simulation; only their
-FOCEI gradient is FD. Analytic IOV per-route lag is a planned follow-up
-([#856](https://github.com/FeRx-NLME/ferx-core/issues/856)).
+A per-route lag on a **`weibull`** forcing is analytic too (see the lagtime note above: its
+bolus is delivered as absorbed mass, with no onset to cross). One case remains on the
+**finite-difference** fallback: a per-route lag combined with **IOV** (`κ`). It stays exact
+in predictions and simulation; only its FOCEI gradient is FD. Analytic IOV per-route lag is
+a planned follow-up ([#856](https://github.com/FeRx-NLME/ferx-core/issues/856)).
 :::
 
 ### Sensitivities

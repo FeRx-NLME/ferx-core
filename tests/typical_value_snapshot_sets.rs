@@ -1422,7 +1422,7 @@ fn states_equilibrate_a_steady_state_dose_on_its_own_record() {
 
 /// [`TV_COV_F_MODEL`] with a constant compartment lag, so an `SS = 1` dose is seeded at its
 /// **record** (`ss_state_at_phase`, #1121) rather than equilibrated at its arrival. (A lagged
-/// SS dose into a built-in absorption compartment is refused, `E_ABSORPTION_SS_LAG`, so the
+/// SS dose into a built-in absorption compartment takes the absorption seed (#2786), so the
 /// seed's dose quantity here is `F`.)
 const TV_COV_F_LAGGED_MODEL: &str = r#"
 [parameters]

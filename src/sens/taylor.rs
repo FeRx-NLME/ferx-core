@@ -28,73 +28,17 @@ pub(crate) const fn binom(n: usize, k: usize) -> usize {
     r
 }
 
-/// How many `(i, j)` monomial products of total degree ≤ `ord` a `(p, ord)` [`Table`]
-/// lists: the terms one product sums.
-pub(crate) const fn mul_len(p: usize, ord: usize) -> usize {
-    // Monomials of exact degree `d` in `p` variables: `C(d + p − 1, d)`.
-    let mut n = 0usize;
-    let mut a = 0usize;
-    while a <= ord {
-        let mut b = 0usize;
-        while a + b <= ord {
-            n += binom(a + p - 1, a) * binom(b + p - 1, b);
-            b += 1;
-        }
-        a += 1;
-    }
-    n
-}
-
 /// The monomial structure of one `(P, ORD)`.
 pub(crate) struct Table {
     /// Exponent vector of each monomial (`P` entries each), graded order; index 0 is `1`.
+    #[cfg(test)]
     pub(crate) exps: Vec<Vec<u8>>,
     /// Total degree of each monomial.
     pub(crate) deg: Vec<u8>,
     /// `(i, j, k)`: monomial `i` times monomial `j` is monomial `k` (degree ≤ `ORD`).
     pub(crate) mul: Vec<(u16, u16, u16)>,
-    /// For each monomial of degree ≥ 1: `(β, v)` with `α = β + e_v` (`β` earlier).
-    pub(crate) parent: Vec<(u16, u8)>,
     /// The index of `e_v`, the first-degree monomial of each variable.
     pub(crate) var: Vec<u16>,
-    /// [`LiveBasis`] of each live count `n ≤ P`, built on first use.
-    live: Vec<OnceLock<LiveBasis>>,
-}
-
-/// The monomials of degree ≥ 1 that read only the first `n` variables, in the table's order,
-/// with each one's parent in that same compact numbering (#2549): what an evaluation of the
-/// polynomial on `n` live directions needs, computed once per `(table, n)` instead of on
-/// every call.
-pub(crate) struct LiveBasis {
-    /// Table index of each kept monomial.
-    pub(crate) idx: Vec<usize>,
-    /// `(b, v)`: kept monomial `j` is `δp_v` when `b == 0`, else kept monomial `b − 1`
-    /// times `δp_v`.
-    pub(crate) parent: Vec<(usize, usize)>,
-}
-
-impl Table {
-    /// [`LiveBasis`] for `n` live directions.
-    pub(crate) fn live(&self, n: usize) -> &LiveBasis {
-        self.live[n].get_or_init(|| {
-            let keep = |k: usize| self.exps[k].iter().skip(n).all(|&x| x == 0);
-            let idx: Vec<usize> = (1..self.exps.len()).filter(|&k| keep(k)).collect();
-            let mut compact = vec![usize::MAX; self.exps.len()];
-            for (j, &k) in idx.iter().enumerate() {
-                compact[k] = j;
-            }
-            let parent = idx
-                .iter()
-                .map(|&k| {
-                    let (b, v) = self.parent[k];
-                    // A kept monomial's parent reads a subset of its variables: kept too.
-                    let b = if b == 0 { 0 } else { compact[b as usize] + 1 };
-                    (b, v as usize)
-                })
-                .collect();
-            LiveBasis { idx, parent }
-        })
-    }
 }
 
 const MAX_P: usize = 12;
@@ -147,13 +91,6 @@ fn build(p: usize, ord: usize) -> Table {
             mul.push((i as u16, j as u16, index[&s]));
         }
     }
-    let mut parent = vec![(0u16, 0u8); exps.len()];
-    for (k, e) in exps.iter().enumerate().skip(1) {
-        let v = e.iter().position(|&x| x > 0).expect("degree ≥ 1");
-        let mut b = e.clone();
-        b[v] -= 1;
-        parent[k] = (index[&b], v as u8);
-    }
     let var = (0..p)
         .map(|v| {
             let mut e = vec![0u8; p];
@@ -162,11 +99,10 @@ fn build(p: usize, ord: usize) -> Table {
         })
         .collect();
     Table {
-        live: (0..=p).map(|_| OnceLock::new()).collect(),
+        #[cfg(test)]
         exps,
         deg,
         mul,
-        parent,
         var,
     }
 }
@@ -296,11 +232,24 @@ impl<const P: usize, const ORD: usize, const L: usize> Div for Taylor<P, ORD, L>
     }
 }
 
+impl<const P: usize, const ORD: usize, const L: usize> crate::sens::num::RecHooks
+    for Taylor<P, ORD, L>
+{
+    crate::sens::num::plain_rechooks_methods!();
+}
+
+impl<const P: usize, const ORD: usize, const L: usize> crate::sens::num::NonRecording
+    for Taylor<P, ORD, L>
+{
+    #[inline]
+    fn val(self) -> f64 {
+        self.c[0]
+    }
+}
+
 impl<const P: usize, const ORD: usize, const L: usize> PkNum for Taylor<P, ORD, L> {
     const SECOND_ORDER: bool = ORD >= 2;
     const JET_ORDER: usize = ORD;
-    /// A product sums one term per pair of monomials of total degree ≤ `ORD`.
-    const WORK: usize = mul_len(P, ORD);
     #[inline]
     fn is_constant(self) -> bool {
         self.zero_jet()
@@ -311,9 +260,8 @@ impl<const P: usize, const ORD: usize, const L: usize> PkNum for Taylor<P, ORD, 
     fn var(x: f64, dim: usize) -> Self {
         Self::seed(x, dim)
     }
-    fn val(self) -> f64 {
-        self.c[0]
-    }
+    crate::sens::num::plain_pknum_methods!();
+    crate::sens::num::plain_sin_exprel!();
     fn exp(self) -> Self {
         let e = self.c[0].exp();
         self.compose(&[e; MAX_ORD + 1][..=ORD])
@@ -529,19 +477,6 @@ mod tests {
     /// Every coefficient of a composite against its closed form: `f(x, y) = exp(x·y) /
     /// (1 + x²) + ln(y)·x³` at `(0.3, 1.7)`, whose normalised Taylor coefficients to third
     /// order are computed here by hand-expanded derivatives.
-    #[test]
-    fn the_work_counts_every_product_the_table_lists() {
-        for p in 1..=8 {
-            for ord in 1..=4 {
-                assert_eq!(
-                    mul_len(p, ord),
-                    table(p, ord).mul.len(),
-                    "p = {p}, ord = {ord}"
-                );
-            }
-        }
-    }
-
     #[test]
     fn third_order_coefficients_are_exact() {
         let (x0, y0) = (0.3f64, 1.7f64);

@@ -35,36 +35,6 @@ use ferx_core::{
     SimulateOptions,
 };
 
-/// Serializes every test in this binary that runs an `SS=1` model (#1113).
-///
-/// The #867 SS-equilibration non-convergence warning is collected in a
-/// **process-global** sink (`dosing::ss_nonconvergence_sink`) because the capped
-/// pulse train runs deep inside the rayon-parallelised per-subject prediction walk
-/// and its numeric signatures carry no warning channel. Each draining `api`
-/// entrypoint brackets its own run — `clear` on entry, `take` on exit — which is
-/// correct for one top-level operation at a time, but cargo runs the tests in a
-/// binary as **threads of one process**. So a warning written by one test's fit can
-/// land inside another test's clear→take window and be drained by it.
-///
-/// That is exactly what made `simulate_stays_silent_for_benign_nonlinear_ss_absorption`
-/// flap in the nightly: `fit_on_ss_absorption_converges` (slow-gated, so it only
-/// runs there) writes ~100 warnings over its lifetime — legitimately, since the
-/// outer optimizer probes `CL → 0`, where the pulse train genuinely stops
-/// contracting — and the benign test, whose own simulate produces none, drained one
-/// of them and failed on a message about a model it never ran.
-///
-/// The lock is taken by *every* test here, writers included: a reader-only guard
-/// would not keep a writer out of the reader's window. Poisoning is ignored
-/// (`into_inner`) so one failing test reports its own failure instead of cascading
-/// the rest into panics.
-static SS_WARN_SINK_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn ss_sink_guard() -> std::sync::MutexGuard<'static, ()> {
-    SS_WARN_SINK_GUARD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 // `first_order(ka)` appears in central directly (its R_in is the appearance rate of an
 // ADVAN2 depot→central first-order absorption), and the readout `y = central/V` matches
 // NONMEM's `S2 = V` concentration. Thetas are FIXed at the NONMEM values.
@@ -103,7 +73,6 @@ const SS_FIRST_ORDER_MODEL: &str = r#"
 #[test]
 fn predict_matches_nonmem_ss_first_order_absorption() {
     // Serialize against the other SS tests in this binary (#1113).
-    let _sink_guard = ss_sink_guard();
     let parsed = parse_full_model(SS_FIRST_ORDER_MODEL).expect("model parses");
     let model = parsed.model;
 
@@ -158,7 +127,6 @@ fn predict_matches_nonmem_ss_first_order_absorption() {
 )]
 fn fit_on_ss_absorption_converges() {
     // Serialize against the other SS tests in this binary (#1113).
-    let _sink_guard = ss_sink_guard();
     let src = SS_FIRST_ORDER_MODEL.replace("omega ETA_CL ~ 0.0", "omega ETA_CL ~ 0.05");
     let parsed = parse_full_model(&src).expect("model parses");
     let model = parsed.model;
@@ -277,7 +245,6 @@ const SS_MM_MODEL: &str = r#"
 #[test]
 fn predict_matches_nonmem_mm_ss_absorption() {
     // Serialize against the other SS tests in this binary (#1113).
-    let _sink_guard = ss_sink_guard();
     let parsed = parse_full_model(SS_MM_MODEL).expect("model parses");
     let model = parsed.model;
     let population =
@@ -313,7 +280,6 @@ fn predict_matches_nonmem_mm_ss_absorption() {
 #[test]
 fn simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
     // Serialize against the other SS tests in this binary (#1113).
-    let _sink_guard = ss_sink_guard();
     let parsed = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
     let model = parsed.model;
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
@@ -351,7 +317,6 @@ fn simulate_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
 #[test]
 fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
     // Serialize against the other SS tests in this binary (#1113).
-    let _sink_guard = ss_sink_guard();
     let parsed = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
     let model = parsed.model;
     let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
@@ -374,6 +339,67 @@ fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
     );
 }
 
+/// #2067: the SS non-convergence notes are per run, so two fits started together (the lanes of
+/// a model search) each report exactly the notes of their own serial run. Before, one global set
+/// was cleared and drained by both, and one fit reported the other's notes (6 + 5 in 20 of 20
+/// repetitions) and lost its own.
+///
+/// Run concurrently on purpose: attributing per run is the point. Mutation: key the sink
+/// by a constant (the old global set) -> the capped fit's concurrent set differs from its serial
+/// one in every repetition.
+#[test]
+fn concurrent_fits_each_report_only_their_own_ss_notes() {
+    let capped = parse_full_model(SS_MM_NO_STEADY_STATE_MODEL).expect("model parses");
+    let benign_src = SS_MM_NO_STEADY_STATE_MODEL.replace(
+        "theta TVVMAX(10.0, 1.0, 100.0)",
+        "theta TVVMAX(500.0, 1.0, 5000.0)",
+    );
+    let benign = parse_full_model(&benign_src).expect("model parses");
+    let population = read_nonmem_csv(std::path::Path::new("data/ss_first_order.csv"), None, None)
+        .expect("dataset loads");
+    let notes = |parsed: &ferx_core::types::ParsedModel| -> Vec<String> {
+        let mut opts = parsed.fit_options.clone();
+        opts.outer_maxiter = 3;
+        opts.run_covariance_step = false;
+        let r = fit(
+            &parsed.model,
+            &population,
+            &parsed.model.default_params,
+            &opts,
+        )
+        .expect("fit returns Ok");
+        let mut v: Vec<String> = r
+            .warnings
+            .into_iter()
+            .filter(|w| w.contains("Steady-state (SS=1) equilibration"))
+            .collect();
+        v.sort();
+        v
+    };
+    let (serial_capped, serial_benign) = (notes(&capped), notes(&benign));
+    assert!(!serial_capped.is_empty(), "the capped fit warns serially");
+    assert_ne!(
+        serial_capped, serial_benign,
+        "the two fits' notes differ, so a swap is visible"
+    );
+    for rep in 0..2 {
+        let gate = std::sync::Barrier::new(2);
+        let (c, b) = std::thread::scope(|s| {
+            let hc = s.spawn(|| {
+                gate.wait();
+                notes(&capped)
+            });
+            let hb = s.spawn(|| {
+                gate.wait();
+                notes(&benign)
+            });
+            (hc.join().unwrap(), hb.join().unwrap())
+        });
+        assert_eq!(c, serial_capped, "rep {rep}: the capped fit's own notes");
+        assert_eq!(b, serial_benign, "rep {rep}: the benign fit's own notes");
+    }
+}
+
 /// False-positive guard (#874 review): a *nonlinear* (Michaelis–Menten) SS-absorption model that
 /// still declines the linear closed-form fast path, but eliminates fast (`Vmax` ≫ mean input, so
 /// little saturation) — the pulse train contracts quickly and settles well inside the cycle
@@ -382,7 +408,6 @@ fn fit_surfaces_ss_nonconvergence_warning_for_over_capacity_dosing() {
 #[test]
 fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
     // Serialize against the other SS tests in this binary (#1113).
-    let _sink_guard = ss_sink_guard();
     let src = SS_MM_NO_STEADY_STATE_MODEL.replace(
         "theta TVVMAX(10.0, 1.0, 100.0)",
         "theta TVVMAX(500.0, 1.0, 5000.0)",
@@ -420,7 +445,7 @@ fn simulate_stays_silent_for_benign_nonlinear_ss_absorption() {
 //
 // Engine: every fixture here is an `[odes]` model, so each pass runs the ODE value path
 // (`equilibrate_ss_state`'s capped pulse train); no gradient is computed, so FD vs dual does not
-// apply. Every test takes `ss_sink_guard()` — the sink is process-global (#1113).
+// apply. The sink is per run (#2067), so the tests run concurrently.
 
 const SS_NOTE: &str = "Steady-state (SS=1) equilibration";
 
@@ -494,7 +519,6 @@ fn leave_capped_residue() {
 /// T1. Mutation: drop the `take` in `predict_diag` → no note.
 #[test]
 fn predict_diag_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
-    let _sink_guard = ss_sink_guard();
     let (model, population) = capped_fixture();
     let out = run_predict_diag(&model, &population);
     assert!(
@@ -512,7 +536,6 @@ fn predict_diag_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
 /// T2. Mutation: drop the `take` in `run_adaptive_population` → no note.
 #[test]
 fn adaptive_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
-    let _sink_guard = ss_sink_guard();
     let (model, population) = capped_fixture();
     let res = run_adaptive(&model, &population);
     assert!(
@@ -530,7 +553,6 @@ fn adaptive_surfaces_ss_nonconvergence_warning_when_no_steady_state() {
 /// T3. Mutation: drop the `clear` in `predict_diag` → the residue is reported as this pass's.
 #[test]
 fn predict_diag_does_not_report_a_previous_calls_note() {
-    let _sink_guard = ss_sink_guard();
     leave_capped_residue();
     let (model, population) = benign_fixture();
     let out = run_predict_diag(&model, &population);
@@ -545,7 +567,6 @@ fn predict_diag_does_not_report_a_previous_calls_note() {
 /// T4. Mutation: drop the `clear` in `run_adaptive_population` → the residue is reported.
 #[test]
 fn adaptive_does_not_report_a_previous_calls_note() {
-    let _sink_guard = ss_sink_guard();
     leave_capped_residue();
     let (model, population) = benign_fixture();
     let res = run_adaptive(&model, &population);
@@ -561,7 +582,6 @@ fn adaptive_does_not_report_a_previous_calls_note() {
 /// for the two new drains. Control mutation: a `take` that always yields the note reddens it.
 #[test]
 fn predict_diag_and_adaptive_stay_silent_for_benign_nonlinear_ss() {
-    let _sink_guard = ss_sink_guard();
     let (model, population) = benign_fixture();
     let out = run_predict_diag(&model, &population);
     assert!(

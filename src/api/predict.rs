@@ -146,6 +146,7 @@ pub fn predict_diag(
     // Start the process-global SS-equilibration non-convergence sink clean, then drain it into
     // this pass's `warnings` (#867, #1652) — the order `simulate_with_options_diag` uses. Without
     // the clear, a note left by an earlier non-draining caller would be reported as this pass's.
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
     let out = predict_diag_undrained(model, population, params)?;
     let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
@@ -300,7 +301,15 @@ pub(crate) fn predict_diag_undrained(
         }
         (results, stats)
     };
-    let predict_subjects = || assemble(population.subjects.par_iter().map(predict_one).collect());
+    // The run this call belongs to, carried onto the pool worker that runs `predict_subjects`
+    // (its tasks read it: the SS note sink is per run, #2067).
+    let run = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
+    let predict_subjects = || {
+        let subjects = &population.subjects;
+        assemble(crate::par::map(subjects.len(), |i| {
+            predict_one(&subjects[i])
+        }))
+    };
     let predict_subjects_serial =
         || assemble(population.subjects.iter().map(predict_one).collect());
 
@@ -316,8 +325,15 @@ pub(crate) fn predict_diag_undrained(
         }
     } else {
         match super::pool::default_fit_pool() {
-            Some(pool) if pool.current_num_threads() > 1 => pool.install(predict_subjects),
-            Some(pool) => pool.install(predict_subjects_serial),
+            Some(pool) if pool.current_num_threads() > 1 => pool.install(|| {
+                crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(run, predict_subjects)
+            }),
+            Some(pool) => pool.install(|| {
+                crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(
+                    run,
+                    predict_subjects_serial,
+                )
+            }),
             None if rayon::current_num_threads() > 1 => predict_subjects(),
             None => predict_subjects_serial(),
         }
@@ -616,6 +632,7 @@ fn predict_survival_output(
 ) -> Result<SurvivalPredictionOutput, EngineError> {
     // The order `predict_diag` uses (#867, #1652): start the sink clean, then drain it ahead
     // of the rest of the bundle.
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
     let (results, stats) = predict_survival_rows(model, population, params, etas, time_grid)?;
     let mut warnings = crate::dosing::take_ss_nonconvergence_warnings();
