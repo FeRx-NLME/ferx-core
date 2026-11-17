@@ -11804,14 +11804,16 @@ fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
 }
 
 /// What the covariance Hessian's plans cost (#2980, #2982), pinned beside what they compute: on
-/// a log-normal one-compartment model (`n = 7` packed axes: three θ, three Ω, σ; `N = 3`) every
-/// plan runs on its η lanes alone — Ω and σ reach a plan only through η, and the three θ fold
-/// onto η (each is `log`-mu-referenced and read nowhere else). Without the fold the θ keep a
-/// lane each (6); with one lane per direction, the 7 directions. The Hessians the three
-/// assemble agree (the FD oracle above holds each to the reverse per direction).
+/// a log-normal one-compartment model (`n = 7` packed axes: three θ, three Ω, σ; `N = 3`) the
+/// directions go in two passes of width 4 (the second padded), and each pass's plan runs on its
+/// 3 η lanes alone — Ω and σ reach a plan only through η, and the three θ fold onto η (each is
+/// `log`-mu-referenced and read nowhere else). Without the fold every θ some direction moves
+/// keeps a lane in every pass (each pass's columns are read along all directions), 3 + 3 = 6,
+/// more than the pass's 4, so the plan runs one lane per direction. The Hessians agree (the FD
+/// oracle above holds each to the reverse per direction).
 ///
-/// Mutations: Ω or σ given a plan lane (`PlanDirs::new` filtering on a moved η only); the fold
-/// skipped (6 lanes); `PlanDirs` falling back to one lane per direction (7).
+/// Mutations: Ω or σ given a plan lane (`PlanDirs::new` filtering on a moved η only: one lane
+/// per direction); the fold skipped (4 lanes); `PlanDirs` always one lane per direction (4).
 #[test]
 fn the_plans_run_on_the_eta_lanes_of_a_mu_referenced_model() {
     use super::hessian::{MU_FOLD_OFF, PLAN_AXES_OFF, PLAN_LANES};
@@ -11855,20 +11857,11 @@ fn the_plans_run_on_the_eta_lanes_of_a_mu_referenced_model() {
     };
     let (h_fold, runs) = lanes(false, false);
     assert!(!runs.is_empty(), "no plan ran along a pass");
-    assert!(
-        runs.iter().all(|&(w, n)| (w, n) == (3, 7)),
-        "folded: {runs:?}"
-    );
+    assert!(runs == [(3, 4), (3, 4)], "folded: {runs:?}");
     let (h_axes, runs) = lanes(false, true);
-    assert!(
-        runs.iter().all(|&(w, n)| (w, n) == (6, 7)),
-        "axes: {runs:?}"
-    );
+    assert!(runs == [(4, 4), (4, 4)], "axes: {runs:?}");
     let (h_global, runs) = lanes(true, true);
-    assert!(
-        runs.iter().all(|&(w, n)| (w, n) == (7, 7)),
-        "one lane per direction: {runs:?}"
-    );
+    assert!(runs == [(4, 4), (4, 4)], "one lane per direction: {runs:?}");
     for (what, h) in [("folded", &h_fold), ("axes", &h_axes)] {
         let worst = rel_gap(h.as_slice(), h_global.as_slice());
         assert!(
@@ -11876,32 +11869,6 @@ fn the_plans_run_on_the_eta_lanes_of_a_mu_referenced_model() {
             "{what} vs one lane per direction: {worst:.2e}"
         );
     }
-}
-
-/// The pass width's memory bound (#2980): one pass while the prediction plan's lanes stay
-/// within `PASS_LANES` (or the 4-direction pass's `5 × base`), else no wider than that budget
-/// allows. Pinned at the measured case — a 50-effect subject, 54 directions, peaked at 7.3 GB
-/// in one pass against 1.19 GB in 4-direction passes — under FOCEI (51 base lanes) and Laplace
-/// (1326), at typical folded and unfolded models, and at the budget's edge from both sides.
-///
-/// Mutations: the budget dropped (one pass everywhere: the 50-effect rows give 54); `5 × base`
-/// dropped (Laplace's 1326 base lanes would give width 1); `<=` as `<` at the edge.
-#[test]
-fn a_pass_is_as_wide_as_its_lane_budget_allows() {
-    use super::hessian::pass_width;
-    // 50 random effects, 3 θ, 50 Ω, σ: the old 4-direction footprint.
-    assert_eq!(pass_width(54, 51, 53), 4, "FOCEI, 50 effects");
-    assert_eq!(pass_width(54, 1326, 53), 4, "Laplace, 50 effects");
-    // A log-normal one-compartment model, folded (3 η lanes) or not (3 η + 3 θ).
-    assert_eq!(pass_width(7, 4, 3), 7, "folded");
-    assert_eq!(pass_width(7, 4, 6), 7, "unfolded");
-    // A Laplace plan of 5 effects (21 base lanes): mu-referenced (5 axes, 126 lanes) in one
-    // pass; with 7 unfolded θ (12 axes, 273 lanes) in passes of 256 / 21 − 1 = 11.
-    assert_eq!(pass_width(13, 21, 5), 13, "Laplace, 5 effects, folded");
-    assert_eq!(pass_width(13, 21, 12), 11, "Laplace, 5 effects, unfolded");
-    // The edge: 4 base lanes, budget 256 = 4·64: 63 directions fit, 64 do not.
-    assert_eq!(pass_width(63, 4, 63), 63);
-    assert_eq!(pass_width(64, 4, 64), 63);
 }
 
 /// The mu fold's runtime guard (#2982): where the parameter program does not reproduce
@@ -11947,8 +11914,8 @@ fn a_fold_the_program_does_not_reproduce_is_declined() {
     };
     let (h, runs) = run(false);
     assert!(
-        runs.iter().all(|&(w, n)| (w, n) == (6, 7)),
-        "the fold should be declined (3 η + 3 θ lanes): {runs:?}"
+        runs == [(4, 4), (4, 4)],
+        "the fold should be declined (one lane per direction, not 3 η lanes): {runs:?}"
     );
     let (h_global, _) = run(true);
     let worst = rel_gap(h.as_slice(), h_global.as_slice());

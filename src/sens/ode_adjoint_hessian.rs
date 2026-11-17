@@ -40,25 +40,20 @@ use crate::sens::num::vm::Layout;
 use crate::sens::num::{log_sum_exp, PkNum};
 use crate::types::MuTransform;
 
-/// The most directions one pass carries as the plans' tangent lanes (`Layout::tan` is a `u8`).
+/// The most directions one pass carries as the plans' tangent lanes.
 ///
-/// A pass is one forward along its directions and one forward-over-reverse sweep, each over
-/// `1 + width` lanes, so every direction costs a lane and the base lane is paid once per pass:
-/// all directions go in one pass (#2980), within [`PASS_LANES`]. Under the reverse per
-/// direction it replaced, a pass cost `width²` lanes and 4 directions per pass measured fastest.
-const MAX_PASS: usize = u8::MAX as usize;
-
-/// The lanes a pass's prediction plan may hold per slot (its base lanes times `1 +` its tangent
-/// lanes) beyond the 4-direction pass's footprint, `5 ×` base, which a pass may always use.
-///
-/// One pass is the least work, but a plan's buffers and its compiled kernels grow with its
-/// lanes, and its base already grows as `N²` under Laplace's exact anchor. Measured on a
-/// 50-effect subject (`a_subject_with_fifty_random_effects_has_an_exact_gradient`, Laplace and
-/// FOCEI Hessians): one pass of 54 directions over 1326 base lanes (71,604 lanes) peaked at
-/// 7.3 GB against 1.19 GB for the 4-direction passes. Below this budget the memory is small
-/// on any model (a FOCEI plan of 3–6 random effects over every packed axis is 16–100 lanes),
-/// so a typical fit keeps its one pass; past it a pass is no wider than before.
-const PASS_LANES: usize = 256;
+/// A pass is one forward along its directions and one forward-over-reverse sweep over
+/// `1 + width` lanes. Fewer, wider passes are fewer lane-operations, but a covariance step
+/// builds its kernels per subject and runs each a handful of times, so what a pass costs is
+/// mostly building and first-tier running a kernel of its width, and one 4-wide layout is
+/// built once and serves every pass. Measured (#2980, ci-fast, instructions, 22 covariance
+/// sets — FOCE, FOCEI, Laplace and AGQ under both anchors, closed form and ODE): the
+/// covariance step at width 4 took 0.68× the reverse-per-direction baseline's instructions,
+/// at width 8 0.82×, and in one pass of every direction 0.80× (one-pass JIT compile time
+/// 440 ms against 203 ms on `pk2_big_cov`). It also keeps a plan's lanes within the old
+/// 4-direction pass's: one pass of 54 directions over Laplace's 1326 base lanes on a 50-effect
+/// subject peaked at 7.3 GB, against 1.19 GB.
+const MAX_PASS: usize = 4;
 
 /// A direction of a pass: the packed coordinate it moves, the `[covariate_nn]` raw output
 /// it moves (the reduced basis, [`NnReduction`]), and its η tangent (empty: none).
@@ -329,20 +324,9 @@ fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix
         .then(|| (wv.iter().copied().collect(), eta_x))
 }
 
-/// Directions per pass over `n` of them for a plan of `base` lanes per slot whose input axes
-/// for all `n` would be `axes` lanes: all of them while the plan's lanes stay within
-/// [`PASS_LANES`] (or the 4-direction pass's `5 × base`), else as many as fit (fewer under the
-/// test cap). A narrower pass's plans run on whichever of its directions or input axes is
-/// fewer ([`PlanDirs`]), so its lanes stay within the budget too.
-pub(super) fn pass_width(n: usize, base: usize, axes: usize) -> usize {
-    let budget = (5 * base).max(PASS_LANES);
-    let one = base * (1 + n.min(axes));
-    let w = if one <= budget {
-        n
-    } else {
-        (budget / base.max(1)).saturating_sub(1)
-    }
-    .clamp(1, MAX_PASS);
+/// Directions per pass over `n` of them: up to [`MAX_PASS`] (fewer under the test cap).
+fn pass_width(n: usize) -> usize {
+    let w = n.clamp(1, MAX_PASS);
     #[cfg(test)]
     return PASS_WIDTH_CAP
         .with(|c| c.get())
@@ -446,8 +430,9 @@ fn psi_lanes(
     mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
     let n = plan.pn();
-    let width = pass_width(dirs.len(), plan.base_lanes(), plan.axes_for(dirs));
+    let width = pass_width(dirs.len());
     let l = 1 + width;
+    *plan.all_dirs.borrow_mut() = dirs.to_vec();
     for (c, chunk) in dirs.chunks(width).enumerate() {
         let run = plan.run(chunk, width)?;
         let out = run.out();
@@ -740,8 +725,7 @@ impl<'s> NnReduction<'s> {
                 (out.len() == mlp_out).then_some(out)
             };
             let variant = super::kernel::variant_of(&(7u8, net, off, n_w));
-            // A network's plan has one base lane and its weights as inputs.
-            let width = pass_width(n_w, 1, n_w);
+            let width = pass_width(n_w);
             let run = |dirs: &[usize]| {
                 let (layout, l) = if dirs.is_empty() {
                     (Layout::F64, 1)
@@ -837,6 +821,9 @@ pub(super) struct CovPlan<'a> {
     variant: kj::Desc,
     /// The θ the plans carry on their η lanes ([`MuFold`], #2982).
     fold: Option<MuFold>,
+    /// Every direction of the Hessian being assembled ([`psi_lanes`]): a pass's plans need a
+    /// lane for each parameter any of them moves ([`PlanDirs::new`]).
+    all_dirs: std::cell::RefCell<Vec<Dir>>,
 }
 
 /// The kernel's input slots for one subject's pass: per observation the prediction plan's
@@ -1045,6 +1032,7 @@ impl PlanDirs {
         n_dirs: usize,
         eta_t: &dyn Fn(usize, usize) -> f64,
         p_t: &dyn Fn(usize, usize) -> f64,
+        read: &dyn Fn(usize) -> bool,
         axes: bool,
         fold: Option<&MuFold>,
     ) -> Self {
@@ -1085,10 +1073,15 @@ impl PlanDirs {
             .collect();
         // Every η slot is a lane: a plan's η adjoints are seeds upstream too (an AGQ node's are
         // its location's, back through the first stage), so each needs its own Gauss–Newton
-        // term, which only a lane's forward tangent gives. A parameter slot's adjoint only
-        // reaches the rows, read along the directions, so an unmoved one needs no lane.
+        // term, which only a lane's forward tangent gives. A parameter slot's adjoint reaches
+        // the rows, read along every direction of the Hessian — not only this pass's — so any
+        // slot some direction moves (`read`) needs a lane, unless the fold carries it on η.
         let idx: Vec<usize> = (0..n_eta + n_par)
-            .filter(|&j| j < n_eta || full.iter().any(|v| v[j] != 0.0))
+            .filter(|&j| {
+                j < n_eta
+                    || full.iter().any(|v| v[j] != 0.0)
+                    || (read(j - n_eta) && folds(j - n_eta).is_none())
+            })
             .collect();
         if idx.len() >= n_dirs {
             return global;
@@ -1266,41 +1259,13 @@ impl<'a> CovPlan<'a> {
             second,
             variant,
             fold,
+            all_dirs: std::cell::RefCell::new(Vec::new()),
         }
     }
 
     /// The subject's random-effect width.
     fn pn(&self) -> usize {
         self.sc.width
-    }
-
-    /// The prediction plan's base lanes per slot: value, η-gradient, and (under the exact
-    /// anchor) the η-Hessian's lower triangle.
-    fn base_lanes(&self) -> usize {
-        let pn = self.pn();
-        1 + pn + if self.second { pn * (pn + 1) / 2 } else { 0 }
-    }
-
-    /// The input axes a pass over all of `dirs` would put on a prediction plan ([`PlanDirs`]):
-    /// every η, and each parameter a direction moves that the fold does not carry on η.
-    fn axes_for(&self, dirs: &[Dir]) -> usize {
-        let folded = |i: usize| {
-            self.fold
-                .as_ref()
-                .and_then(|f| f.d1.get(i))
-                .is_some_and(|d| !d.is_empty())
-        };
-        let mut moved: Vec<usize> = dirs
-            .iter()
-            .filter_map(|d| match (d.x, d.z) {
-                (Some(i), _) if i < self.th.len() && !folded(i) => Some(i),
-                (_, Some(z)) => Some(self.th.len() + z),
-                _ => None,
-            })
-            .collect();
-        moved.sort_unstable();
-        moved.dedup();
-        self.pn() + moved.len()
     }
 
     /// The slot of η `k` in a reverse row (`x`, the network outputs, η).
@@ -1358,7 +1323,8 @@ impl<'a> CovPlan<'a> {
         (u, p)
     }
 
-    /// The lanes a plan of `n_eta` η and `n_par` parameter slots runs `n_dirs` directions on.
+    /// The lanes a plan of `n_eta` η and `n_par` parameter slots runs `n_dirs` directions on,
+    /// its parameters θ, then (`n_p` on) the network outputs, then an SDE's σ.
     fn plan_dirs(
         &self,
         n_eta: usize,
@@ -1367,12 +1333,27 @@ impl<'a> CovPlan<'a> {
         eta_t: &dyn Fn(usize, usize) -> f64,
         p_t: &dyn Fn(usize, usize) -> f64,
     ) -> PlanDirs {
+        let all = self.all_dirs.borrow();
+        let (n_th, n_p) = (self.th.len(), self.th.len() + self.nz);
+        let s0 = packed_segments(self.template).sigma_start();
+        let read = |i: usize| {
+            all.iter().any(|d| {
+                if i < n_th {
+                    d.x == Some(i)
+                } else if i < n_p {
+                    d.z == Some(i - n_th)
+                } else {
+                    d.x == Some(s0 + i - n_p)
+                }
+            })
+        };
         let pd = PlanDirs::new(
             n_eta,
             n_par,
             n_dirs,
             eta_t,
             p_t,
+            &read,
             plan_axes_on(),
             self.fold.as_ref(),
         );
