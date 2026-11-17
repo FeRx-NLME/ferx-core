@@ -5297,6 +5297,14 @@ pub fn run_saem(
     // established rebuild-per-call behaviour.
     let schedules = saem_schedule_cache(model, population);
 
+    // NONMEM's SAEMOBJ: per subject the log of the mean joint density over the convergence
+    // phase's draws (`saem_objective`). Free: it reads the NLL cache the iteration refreshes.
+    let mut saemobj = crate::estimation::saem_objective::SaemObjAccumulator::new(
+        n_subjects,
+        crate::estimation::saem_objective::unsupported(model).is_none(),
+        model.n_eta == 0,
+    );
+
     // Main loop
     for k in 1..=n_iter {
         // Per-iteration combined (block + componentwise) accept / proposal
@@ -6762,6 +6770,9 @@ pub fn run_saem(
                 });
             state.nll_cache = new_nlls;
         }
+        if k > k1 {
+            saemobj.update(&state.nll_cache);
+        }
 
         // #903 review: re-anchor the iiv_on_ruv growth caps to the data-informed
         // σ/ω_RUV reached by the end of the exploration phase, taking the *looser*
@@ -7278,6 +7289,7 @@ pub fn run_saem(
         covariance_wall_time_secs,
         warnings,
         saem_mu_ref_m_step_evals_saved,
+        saem_objective_value: saemobj.value(),
         saem_n_subjects_hmc,
         saem_mh_accept_tail,
         ebe_convergence_warnings: 0,
@@ -8177,6 +8189,22 @@ mod tests {
             opts.iov_column = Some("OCC".to_string());
         }
         crate::api::fit(&model, &pop, &model.default_params, &opts).expect("SAEM Ok")
+    }
+
+    /// The SAEM objective of a mixture is not anchored by NONMEM, so the default readout says so
+    /// and reports the importance-sampled value instead of falling back silently (#2973).
+    #[test]
+    fn mixture_saem_objective_falls_back_to_imp_with_a_named_warning() {
+        let r = mix996_fit("TVV * exp(ETA_V)", false, true);
+        let obj = r.saem_objective.as_ref().expect("a reported objective");
+        assert_eq!(obj.kind, crate::types::SaemOfv::Imp);
+        assert!(
+            r.warnings
+                .iter()
+                .any(|w| w.contains("saem_ofv = saem unavailable") && w.contains("mixture")),
+            "{:?}",
+            r.warnings
+        );
     }
 
     /// #2548 item 1: an additive mu-referenced typical value under a `[mixture]` is named

@@ -468,6 +468,9 @@ fn main() {
             // FOCE/Laplace value the old number was.
             if let Some(o) = &fit_result.saem_objective {
                 let kind = match o.kind {
+                    ferx_core::types::SaemOfv::Saem => {
+                        "SAEM objective (NONMEM SAEMOBJ convention; not a likelihood)"
+                    }
                     ferx_core::types::SaemOfv::Agq => "adaptive Gauss-Hermite -2LL",
                     _ => "importance-sampled -2LL (NONMEM IMP EONLY=1)",
                 };

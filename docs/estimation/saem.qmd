@@ -1111,44 +1111,90 @@ After the SAEM iterations complete:
    check it yourself (RSE, σ-correlation, profile likelihood), and on sparse
    data prefer the importance-sampling −2LL over the Laplace OFV when judging
    whether the additive term is real.
-3. **Reported OFV**: Evaluate the importance-sampled `−2 log L` at the final estimates (NONMEM `$EST METHOD=IMP EONLY=1`, `saem_ofv = imp`, the default) and report it as `ofv`, with its Monte-Carlo standard error; AIC and BIC are built from it. The FOCE/Laplace objective at the same estimates is kept as a separately labelled diagnostic (see [The reported OFV](#saem-reported-ofv))
+3. **Reported OFV**: Report NONMEM's SAEM objective (`SAEMOBJ`, `saem_ofv = saem`, the default; not a likelihood) at the final estimates as `ofv`. The importance-sampled `−2 log L` (NONMEM `$EST METHOD=IMP EONLY=1`, `saem_ofv = imp`) is the explicit follow-up. AIC and BIC are built from the FOCE/Laplace objective at the same estimates, which is kept as a separately labelled diagnostic (see [The reported OFV](#saem-reported-ofv))
 4. **Covariance Step**: Optionally compute standard errors via the covariance step's Hessian (same method as FOCE: the exact R matrix in scope, the finite-difference stencil outside it) — on the FOCEI objective for an all-Gaussian model, and on the quadrature marginal when the model has a non-Gaussian endpoint (see [below](#saem-covariance-non-gaussian))
 5. **Diagnostics**: Compute PRED, IPRED, CWRES, IWRES for each subject
 
 ### The reported OFV {#saem-reported-ofv}
 
-SAEM maximises the exact marginal likelihood but produces no usable value of it: NONMEM's
-own SAEM objective is a stochastic-approximation quantity (−2210 on the shared-θ anchor, where
-the exact marginal is −1199), and the established workflow follows `METHOD=SAEM` with
-`METHOD=IMP EONLY=1`. ferx does the same by default, so the `ofv` of a SAEM fit is the
-importance-sampled `−2 log L` at the final estimates, the number to compare with NONMEM's
-`EONLY` objective, to rank models, and to build AIC/BIC from. The FOCE/Laplace value is the
-linearised approximation, which is biased exactly where SAEM is usually chosen over FOCE
-(sparse data, strong non-linearity; see
-[the `iiv_on_ruv` example](importance-sampling.qmd#adaptive-evaluation)), so it is no longer the
-headline.
+SAEM maximises the exact marginal likelihood but produces no usable value of it. NONMEM
+reports its **`SAEMOBJ`** for the SAEM step, a stochastic-approximation readout of the
+complete-data objective that is *not a likelihood*, and follows `METHOD=SAEM` with
+`METHOD=IMP EONLY=1` when the marginal `−2 log L` is wanted. ferx does the same: the `ofv` of a
+SAEM fit is the SAEM objective, and the importance-sampled `−2 log L` is the explicit follow-up
+(`saem_ofv = imp`, or `method = [saem, imp]` with `imp_eval_only = true`). **Do not compare the
+SAEM objective across models or with a FOCE/FOCEI/IMP objective**: it is −2210 on the shared-θ
+anchor where the exact marginal is −1199. AIC and BIC are therefore built from the FOCE/Laplace
+value at the same estimates (`saem_objective.foce_ofv`) under the default; rank models by the
+importance-sampled objective (see
+[the `iiv_on_ruv` example](importance-sampling.qmd#adaptive-evaluation) for why the Laplace value
+is biased where SAEM is usually chosen).
 
 ```
 [fit_options]
   method           = saem
-  saem_ofv         = imp     # imp (default) | agq | focei
+  saem_ofv         = saem    # saem (default) | imp | agq | focei
   saem_ofv_samples = 3000    # importance samples per subject, saem_ofv = imp
   saem_ofv_nodes   = 11      # nodes per random effect, saem_ofv = agq
 ```
 
-| `saem_ofv` | `ofv`, AIC, BIC | Notes |
-|---|---|---|
-| `imp` (default) | importance-sampled `−2 log L`, NONMEM `IMP EONLY=1` | `saem_ofv_samples` draws per subject (3000, the `ISAMPLE=3000` setting the [NONMEM comparison](importance-sampling.qmd#nonmem-comparison) uses), seeded by `imp_seed` so two runs agree to the bit. Carries a Monte-Carlo standard error. |
-| `agq` | adaptive Gauss–Hermite quadrature at the final estimates | Deterministic and exact up to the node count; `saem_ofv_nodes ^ n_eta` evaluations per subject, so up to three random effects. A mixture or a model with more random effects falls back to `imp` with a warning. A natural cross-check of the IS value. |
-| `focei` | the FOCE/Laplace objective | The behaviour before #2973, and the value that is directly comparable with a FOCE/FOCEI fit. |
+| `saem_ofv` | `ofv` | AIC, BIC | Notes |
+|---|---|---|---|
+| `saem` (default) | NONMEM's `SAEMOBJ` | FOCE/Laplace value | Free (accumulated from the E-step's draws). IOV models average the joint density of data, η and κ draws; a model with no random effects reports the data `−2 log L`. A mixture has no NONMEM-anchored convention, so it reports the `imp` value **with a warning** naming the fallback. |
+| `imp` | importance-sampled `−2 log L`, NONMEM `IMP EONLY=1` | `ofv` | `saem_ofv_samples` draws per subject (3000, the `ISAMPLE=3000` setting the [NONMEM comparison](importance-sampling.qmd#nonmem-comparison) uses), seeded by `imp_seed` so two runs agree to the bit. Carries a Monte-Carlo standard error. |
+| `agq` | adaptive Gauss–Hermite quadrature at the final estimates | `ofv` | Deterministic and exact up to the node count; `saem_ofv_nodes ^ n_eta` evaluations per subject, so up to three random effects. A mixture or a model with more random effects falls back to `imp` with a warning. A natural cross-check of the IS value. |
+| `focei` | the FOCE/Laplace objective | `ofv` | The behaviour before #2973, and the value that is directly comparable with a FOCE/FOCEI fit. |
+
+#### What the SAEM objective is {#saem-objective-definition}
+
+$$\text{SAEMOBJ} = \sum_i -2\log\Big(\tfrac1K\sum_k p(y_i,\eta_{ik}\mid\theta,\Omega,\sigma)\Big)$$
+
+the joint density of the data and the random effects, **no `2π` constants** (neither
+`N_obs·log 2π` nor `NIND·NETA·log 2π`; `log|Ω|` and `log σ²` are in), averaged *inside* the log.
+During burn-in the average runs over the chain states of the current iteration; in the
+accumulation phase over the draws **and the iterations**, which is the value NONMEM prints last.
+ferx keeps a running log-sum-exp of the joint density per subject over its convergence phase
+(one draw per iteration, scored under the parameters the iteration ends with; with the step
+$\gamma_k = 1/(k-K_1)$ the stochastic-approximation average is this plain mean), so the
+objective costs nothing beyond the NLL cache the E-step already refreshes.
+
+This was established on NONMEM 7.6.0 with a linear-Gaussian model where the posterior
+expectation $E[-2\log p]$ and the marginal are closed-form, and it explains the offset the
+committed SAEM runs show against the posterior expectation: the log of a mean of many posterior
+draws sits $n_\eta(\ln 2 - 1) = -0.307$ per subject per random effect below $E[-2\log p]$
+(`linear_gaussian_offset_from_the_posterior_expectation_is_ln2_minus_one` reproduces it in closed
+form). On the ten committed runs `(SAEMOBJ − E[−2 log p]) / (N·n_η)` is 0.299–0.323, mean 0.312
+(a non-Gaussian posterior moves it; a constant `1 − ln 2 = 0.307`, `ln(2π)/6 = 0.306` or
+`1/π = 0.318` each sits within 2.5 standard errors of that mean but none within the scatter, which
+is why the closed-form experiment, not the anchors, settles it). `IMP EONLY=1` prints the marginal
+`−2 log L` without `N_obs·log 2π` and with the `NIND·NETA·log 2π` term, which is what ferx's
+importance-sampled readout reports.
+
+A complete ferx SAEM fit (default settings, the committed `*_fit.ferx` models) against NONMEM's
+own printed SAEMOBJ. Both sides are one Monte-Carlo run with its own estimates, so the
+difference is the two runs' spread, not a convention gap:
+
+| anchor | NONMEM `SAEMOBJ` | ferx | (ferx − NONMEM) / (N·n_η) |
+|---|---:|---:|---:|
+| `covmuref_additive_saem` | −1855.592 | −1856.433 | −0.007 |
+| `covmuref_power_saem` | −1887.202 | −1887.145 | +0.000 |
+| `covmuref_shared_saem` | −2210.147 | −2208.459 | +0.011 |
+| `covmuref_anchor_a_saem` | −2210.552 | −2216.564 | −0.040 |
+| `covmuref_anchor_b_saem` | −2210.896 | −2216.564 | −0.038 |
+| `logit_fraction_saem` (ODE) | −4603.996 | −4604.612 | −0.003 |
+| `saem_additive_mu` | 151.755 | 151.604 | −0.025 |
+
+The worst is 0.040 per subject per random effect, a fifth of the 0.31 by which the posterior
+expectation differs, and `src/estimation/saem_objective_tests.rs` asserts 0.04 on the three
+fastest anchors.
 
 #### Where it is reported, and explicit stages {#saem-ofv-where}
 
 
-- **Console / summary file:** the OFV row reads `OFV (IS -2LL, NONMEM IMP EONLY=1; MC SE = …, K = …)`
-  (or `OFV (AGQ -2LL, n nodes)`), followed by `FOCE/Laplace OFV (diagnostic)`. The verbose progress
+- **Console / summary file:** the OFV row reads `OFV (SAEM objective, NONMEM SAEMOBJ convention; not a likelihood)`
+  (or `OFV (IS -2LL, NONMEM IMP EONLY=1; MC SE = …, K = …)`, `OFV (AGQ -2LL, n nodes)`), followed by `FOCE/Laplace OFV (diagnostic)`. The verbose progress
   line `SAEM completed. FOCE/Laplace OFV = …` is that diagnostic, printed before the covariance step.
-- **`fit.yaml`:** `objective_function` carries `ofv_type: importance_sampling` (or `agq`),
+- **`fit.yaml`:** `objective_function` carries `ofv_type: saem_objective` (or `importance_sampling`, `agq`),
   `ofv_mc_standard_error`, `ofv_n_samples` (or `ofv_n_nodes`) and `ofv_foce_laplace`. A
   `saem_ofv = focei` fit carries none of these.
 - **R / Rust:** `FitResult.saem_objective` (`fit$saem_objective`) holds the kind, SE, sample or
@@ -1160,7 +1206,7 @@ To compare a SAEM fit with a FOCE/FOCEI fit, use `saem_objective.foce_ofv` (or s
 
 **Explicit stages still work.** `method = [saem, imp]` with `imp_eval_only = true` is the same
 workflow spelled out: its IS value (at `imp_samples`, default 1000) becomes the reported `ofv`
-under `saem_ofv = imp`, with `saem_ofv_samples` unused. A chain with its own evaluator stage
+under the default and under `saem_ofv = imp`, with `saem_ofv_samples` unused. A chain with its own evaluator stage
 (`imp_eval_only`, or `agq_eval_only` with a trailing `laplace`) is never given a second readout.
 `imp_eval_only = true` is required for the `imp` stage: without it the stage is an estimator
 (NONMEM `METHOD=IMP`) and re-fits θ/Ω/σ.
@@ -1771,7 +1817,7 @@ SAEM completed. FOCE/Laplace OFV = ...
 Running covariance step...
 ```
 
-The `FOCE/Laplace OFV = ...` line is printed **before** the covariance step starts (#893). It is the diagnostic value; the reported OFV (the importance-sampled `−2 log L` by default) follows in the final report. See [The reported OFV](#saem-reported-ofv).
+The `FOCE/Laplace OFV = ...` line is printed **before** the covariance step starts (#893). It is the diagnostic value; the reported OFV (NONMEM's SAEM objective by default, the importance-sampled `−2 log L` under `saem_ofv = imp`) follows in the final report. See [The reported OFV](#saem-reported-ofv).
 SAEM only learns its OFV at the very end (the final FOCE approximation), and the
 covariance matrix is often the most expensive part of the run — so seeing the OFV
 first lets you interrupt (Ctrl-C) when the OFV already rules the run out, instead of
@@ -1794,7 +1840,7 @@ $$
 
 This is a cheap per-iteration progress signal. It is **not** the marginal objective function value (OFV): it is evaluated at one stochastic draw of the random effects rather than integrated over their distribution, so unlike the FOCE/FOCEI outer-loop OFV it is noisy, will not decrease monotonically, and is **not comparable across runs** for model selection.
 
-The marginal **OFV** ($-2 \log L$, by default importance-sampled as NONMEM's `IMP EONLY=1`) is expensive and is therefore computed only once, after the iterations finish; the `FOCE/Laplace OFV = ...` line is the Laplace diagnostic computed first. See [Post-SAEM Finalization](#post-saem-finalization).
+The reported **OFV** is computed only once, after the iterations finish: by default NONMEM's SAEM objective (one refinement of the conditional modes), or under `saem_ofv = imp` the marginal $-2 \log L$ importance-sampled as NONMEM's `IMP EONLY=1`, which is expensive; the `FOCE/Laplace OFV = ...` line is the Laplace diagnostic computed first. See [Post-SAEM Finalization](#post-saem-finalization).
 
 (`NLL` = *negative log-likelihood*, i.e. $-\log L$. NONMEM's `OFV = -2 \log L` is essentially `2 × NLL` plus a constant.)
 

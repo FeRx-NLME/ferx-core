@@ -1417,6 +1417,9 @@ fn is_marginal_line(result: &FitResult) -> Option<String> {
 fn saem_ofv_label(result: &FitResult) -> Option<String> {
     let o = result.saem_objective.as_ref()?;
     Some(match o.kind {
+        SaemOfv::Saem => {
+            "OFV (SAEM objective, NONMEM SAEMOBJ convention; not a likelihood)".to_string()
+        }
         SaemOfv::Imp => format!(
             "OFV (IS -2LL, NONMEM IMP EONLY=1; MC SE = {:.4}, K = {})",
             o.mc_standard_error.unwrap_or(f64::NAN),
@@ -1435,6 +1438,11 @@ fn objective_notes(result: &FitResult) -> Vec<&'static str> {
     let mut notes = Vec::new();
     if let Some(o) = &result.saem_objective {
         notes.push(match o.kind {
+            SaemOfv::Saem => {
+                "OFV is NONMEM's SAEMOBJ convention (the SAEM objective, not a likelihood): do not \
+                 compare it across models. AIC and BIC come from the FOCE/Laplace value, reported \
+                 separately; saem_ofv = imp gives the importance-sampled -2LL (NONMEM IMP EONLY=1)."
+            }
             SaemOfv::Imp => {
                 "OFV, AIC and BIC come from the importance-sampled -2LL at the SAEM estimates \
                  (NONMEM IMP EONLY=1); the FOCE/Laplace value is reported separately as a diagnostic."
@@ -3394,6 +3402,7 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     // method, so their YAML is unchanged.
     if let Some(o) = &result.saem_objective {
         let ty = match o.kind {
+            SaemOfv::Saem => "saem_objective",
             SaemOfv::Imp => "importance_sampling",
             _ => "agq",
         };

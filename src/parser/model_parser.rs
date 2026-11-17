@@ -12953,12 +12953,13 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "agq_eval_only" => opts.agq_eval_only = parse_bool("agq_eval_only")?,
         "saem_ofv" => {
             opts.saem_ofv = match value.trim().to_lowercase().as_str() {
+                "saem" | "saemobj" => crate::types::SaemOfv::Saem,
                 "imp" => crate::types::SaemOfv::Imp,
                 "agq" => crate::types::SaemOfv::Agq,
                 "focei" | "foce" | "laplace" => crate::types::SaemOfv::Focei,
                 other => {
                     return Err(format!(
-                        "saem_ofv must be `imp`, `agq` or `focei`, got `{other}`"
+                        "saem_ofv must be `saem`, `imp`, `agq` or `focei`, got `{other}`"
                     ))
                 }
             }

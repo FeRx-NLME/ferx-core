@@ -2235,6 +2235,7 @@ pub fn run_bayes(
         covariance_wall_time_secs: 0.0,
         warnings,
         saem_mu_ref_m_step_evals_saved: None,
+        saem_objective_value: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
         // Post-loop EBE health at the posterior mean. Non-convergence is likelier

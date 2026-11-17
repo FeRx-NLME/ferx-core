@@ -515,8 +515,8 @@ seeds, compared with NONMEM's exact-likelihood IMPMAP estimate. The mean agrees
 to 0.6 % on `V` and 0.15 % on the clearances, and the 40-seed spread is 0.7 %
 (`TVCL1`), 0.45 % (`TVCL2`) and 0.9 % (`V`) per run. With `saem_ofv = focei` ferx reports
 the FOCEI-type mixture marginal as the SAEM OFV: 301.90 against NONMEM's FOCEI minimum of
-301.58, which it sits above because the estimate is the exact-likelihood MLE. By default
-(`saem_ofv = imp`) the SAEM `ofv` is instead the class-marginal importance-sampled
+301.58, which it sits above because the estimate is the exact-likelihood MLE. A mixture has no NONMEM-anchored SAEM objective, so by default
+(`saem_ofv = saem` falls back to `imp` here with a warning, as does an explicit `saem_ofv = imp` without one) the SAEM `ofv` is the class-marginal importance-sampled
 `−2 log L`, the number NONMEM's `METHOD=IMP EONLY=1` pass reports (300.87 on this model;
 ferx's chained `[saem, imp]` evaluation is pinned to it in
 `tests/mixture_nonmem.rs::imp_mixture_marginal_matches_nonmem`), and the FOCEI value is kept

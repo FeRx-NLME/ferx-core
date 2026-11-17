@@ -1,5 +1,8 @@
-//! #2973: a SAEM fit reports the importance-sampled −2 log L (NONMEM `IMP EONLY=1`)
-//! as its OFV, with the FOCE/Laplace value kept as a labelled diagnostic.
+//! #2973: a SAEM fit reports NONMEM's SAEM objective (`SAEMOBJ`) as its OFV, the
+//! importance-sampled −2 log L (NONMEM `IMP EONLY=1`) being the explicit follow-up
+//! (`saem_ofv = imp`, or `method = [saem, imp]` + `imp_eval_only`), with the FOCE/Laplace
+//! value kept as a labelled diagnostic. The SAEM objective's own NONMEM anchors are in
+//! `src/estimation/saem_objective_tests.rs`.
 //!
 //! Tier 2: every fit here is a handful of SAEM iterations, and every anchor is one
 //! importance-sampling evaluation at fixed estimates.
@@ -47,9 +50,9 @@ fn warfarin_fit(opts: &FitOptions) -> FitResult {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn saem_ofv_defaults_to_imp_and_parses_each_spelling() {
+fn saem_ofv_defaults_to_saem_and_parses_each_spelling() {
     let d = FitOptions::default();
-    assert_eq!(d.saem_ofv, SaemOfv::Imp);
+    assert_eq!(d.saem_ofv, SaemOfv::Saem);
     assert_eq!(d.saem_ofv_samples, 3000);
     assert_eq!(d.saem_ofv_nodes, 11);
 
@@ -60,6 +63,8 @@ fn saem_ofv_defaults_to_imp_and_parses_each_spelling() {
         ferx_core::parser::model_parser::parse_full_model(&text)
     };
     for (v, want) in [
+        ("saem_ofv = saem", SaemOfv::Saem),
+        ("saem_ofv = SAEMOBJ", SaemOfv::Saem),
         ("saem_ofv = imp", SaemOfv::Imp),
         ("saem_ofv = agq", SaemOfv::Agq),
         ("saem_ofv = focei", SaemOfv::Focei),
@@ -89,11 +94,11 @@ fn saem_ofv_defaults_to_imp_and_parses_each_spelling() {
 // The reported objective
 // ---------------------------------------------------------------------------
 
-/// Default: the OFV *is* the importance-sampled value, its SE is published, AIC/BIC are built
-/// from it, and the FOCE/Laplace value survives on the side — equal to what `saem_ofv = focei`
-/// reports for the same (seeded) SAEM run.
+/// `saem_ofv = imp`: the OFV *is* the importance-sampled value, its SE is published, AIC/BIC are
+/// built from it, and the FOCE/Laplace value survives on the side — equal to what
+/// `saem_ofv = focei` reports for the same (seeded) SAEM run.
 #[test]
-fn default_saem_fit_reports_the_is_objective_with_the_foce_value_beside_it() {
+fn imp_readout_reports_the_is_objective_with_the_foce_value_beside_it() {
     let imp = warfarin_fit(&short_saem(SaemOfv::Imp));
     let focei = warfarin_fit(&short_saem(SaemOfv::Focei));
 
@@ -107,7 +112,7 @@ fn default_saem_fit_reports_the_is_objective_with_the_foce_value_beside_it() {
     let obj = imp
         .saem_objective
         .as_ref()
-        .expect("default reports a SAEM objective");
+        .expect("imp reports a SAEM objective");
     let is = imp
         .importance_sampling
         .as_ref()
@@ -141,12 +146,87 @@ fn default_saem_fit_reports_the_is_objective_with_the_foce_value_beside_it() {
     assert!((imp.aic - focei.aic - (imp.ofv - focei.ofv)).abs() < 1e-9);
 }
 
-/// Seeded and deterministic: two default fits agree to the bit.
+/// Default: the OFV is NONMEM's SAEM objective — no IS result, no Monte-Carlo SE, a label that
+/// says it is not a likelihood — the FOCE/Laplace value sits beside it, and AIC / BIC come from
+/// that value, not from the SAEM objective. It is deterministic, and `imp` is the follow-up.
 #[test]
-fn default_saem_objective_is_deterministic() {
+fn default_saem_fit_reports_the_saem_objective_and_builds_aic_from_the_foce_value() {
+    let d = FitOptions::default();
+    let mut o = short_saem(d.saem_ofv);
+    assert_eq!(o.saem_ofv, SaemOfv::Saem);
+    o.saem_ofv_samples = 500;
+    let saem = warfarin_fit(&o);
+    let focei = warfarin_fit(&short_saem(SaemOfv::Focei));
+    let imp = warfarin_fit(&short_saem(SaemOfv::Imp));
+
+    assert_eq!(
+        saem.theta, focei.theta,
+        "the readout must not move estimates"
+    );
+    let obj = saem.saem_objective.as_ref().expect("a SAEM objective");
+    assert_eq!(obj.kind, SaemOfv::Saem);
+    assert!(obj.mc_standard_error.is_none() && obj.n_samples.is_none() && obj.n_nodes.is_none());
+    assert!(
+        saem.importance_sampling.is_none(),
+        "no importance sampling is run"
+    );
+    assert_eq!(obj.foce_ofv.to_bits(), focei.ofv.to_bits());
+    assert!(
+        (saem.ofv - focei.ofv).abs() > 1e-6 && (saem.ofv - imp.ofv).abs() > 1e-6,
+        "the SAEM objective is neither the FOCE/Laplace nor the IS value"
+    );
+
+    // Information criteria are of the likelihood-valued objective.
+    let k = saem.n_parameters as f64;
+    assert!((saem.aic - (focei.ofv + 2.0 * k)).abs() < 1e-9);
+    assert!((saem.aic - focei.aic).abs() < 1e-9);
+    assert!((saem.bic - focei.bic).abs() < 1e-9);
+    assert!(
+        (imp.aic - (imp.ofv + 2.0 * k)).abs() < 1e-9,
+        "imp keeps its own"
+    );
+
+    // Seeded and deterministic: two fits agree to the bit.
+    assert_eq!(warfarin_fit(&o).ofv.to_bits(), saem.ofv.to_bits());
+}
+
+/// Seeded and deterministic: two `imp` fits agree to the bit.
+#[test]
+fn imp_saem_objective_is_deterministic() {
     let a = warfarin_fit(&short_saem(SaemOfv::Imp));
     let b = warfarin_fit(&short_saem(SaemOfv::Imp));
     assert_eq!(a.ofv.to_bits(), b.ofv.to_bits());
+}
+
+/// An occasion-effect (IOV) model reports the SAEM objective too: the joint density of the data,
+/// η and κ draws, averaged inside the log. No fallback, no warning.
+#[test]
+fn iov_models_report_the_saem_objective_with_no_fallback() {
+    let prep = prepare_run(
+        "examples/warfarin_iov_saem.ferx",
+        Some("data/warfarin_iov_saem.csv"),
+    )
+    .expect("prepare");
+    let mut o = FitOptions {
+        saem_ofv: SaemOfv::Saem,
+        ..prep.parsed.fit_options.clone()
+    };
+    o.saem_n_exploration = 10;
+    o.saem_n_convergence = 10;
+    o.saem_ofv_samples = 200;
+    o.run_covariance_step = false;
+    o.verbose = false;
+    o.threads = Some(1);
+    let r = fit(&prep.parsed.model, &prep.population, &prep.init_params, &o).expect("fit");
+    let obj = r.saem_objective.as_ref().expect("a reported objective");
+    assert_eq!(obj.kind, SaemOfv::Saem);
+    assert!(r.importance_sampling.is_none());
+    assert!(r.ofv.is_finite());
+    assert!(
+        !r.warnings.iter().any(|w| w.contains("saem_ofv")),
+        "{:?}",
+        r.warnings
+    );
 }
 
 /// `agq`: deterministic, labelled, no Monte-Carlo SE, no IS result; its value agrees with the
@@ -256,11 +336,11 @@ fn agq_falls_back_to_imp_beyond_three_random_effects() {
     );
 }
 
-/// `[saem, imp]` + `imp_eval_only` is the explicit spelling of the same workflow: its IS value is
-/// the reported OFV under the default, with no second readout (the chain's IS result is the one
-/// published, at `imp_samples`, not `saem_ofv_samples`); under `saem_ofv = focei` it leaves the
-/// FOCE/Laplace `ofv` alone, as before. A trailing `agq_eval_only` stage is its own explicit
-/// readout and gets no `saem_objective`.
+/// `[saem, imp]` + `imp_eval_only` is NONMEM's `SAEM` → `IMP EONLY=1` spelled out: its IS value is
+/// the reported OFV under the default and under `saem_ofv = imp`, with no second readout (the
+/// chain's IS result is the one published, at `imp_samples`, not `saem_ofv_samples`); under
+/// `saem_ofv = focei` it leaves the FOCE/Laplace `ofv` alone, as before. A trailing
+/// `agq_eval_only` stage is its own explicit readout and gets no `saem_objective`.
 #[test]
 fn explicit_evaluator_chains_follow_saem_ofv() {
     let chained = |ofv: SaemOfv| {
@@ -270,7 +350,17 @@ fn explicit_evaluator_chains_follow_saem_ofv() {
         o.imp_samples = 400;
         warfarin_fit(&o)
     };
+    let by_default = chained(SaemOfv::Saem);
     let imp = chained(SaemOfv::Imp);
+    assert_eq!(
+        by_default.ofv.to_bits(),
+        imp.ofv.to_bits(),
+        "the explicit IMP stage is the reported objective under the default too"
+    );
+    assert_eq!(
+        by_default.saem_objective.as_ref().map(|o| o.kind),
+        Some(SaemOfv::Imp)
+    );
     let obj = imp
         .saem_objective
         .as_ref()
@@ -395,6 +485,22 @@ fn outputs_label_the_objective_and_carry_the_foce_diagnostic() {
     assert!(yaml.contains("  ofv_mc_standard_error: "), "{yaml}");
     assert!(yaml.contains("  ofv_n_samples: 500\n"), "{yaml}");
     assert!(yaml.contains("  ofv_foce_laplace: "), "{yaml}");
+
+    let saem = warfarin_fit(&short_saem(SaemOfv::Saem));
+    ferx_core::io::output::write_estimates_yaml(&saem, yaml_path.to_str().unwrap()).expect("yaml");
+    let yaml = std::fs::read_to_string(&yaml_path).unwrap();
+    assert!(yaml.contains("  ofv_type: saem_objective\n"), "{yaml}");
+    assert!(yaml.contains("  ofv_foce_laplace: "), "{yaml}");
+    assert!(
+        !yaml.contains("ofv_mc_standard_error") && !yaml.contains("ofv_n_samples"),
+        "{yaml}"
+    );
+    let report = ferx_core::io::output::format_summary(&saem);
+    assert!(
+        report.contains("OFV (SAEM objective, NONMEM SAEMOBJ convention; not a likelihood):"),
+        "{report}"
+    );
+    assert!(report.contains("not a likelihood"), "{report}");
 
     let focei = warfarin_fit(&short_saem(SaemOfv::Focei));
     ferx_core::io::output::write_estimates_yaml(&focei, yaml_path.to_str().unwrap()).expect("yaml");
@@ -571,4 +677,23 @@ fn is_objective_matches_nonmem_eonly_at_nonmem_estimates() {
             );
         }
     }
+}
+
+/// The objective is accumulated over the convergence phase only: a run with no convergence
+/// iteration has no SAEM objective, and says so by reporting the importance-sampled value with
+/// a warning naming the reason (exploration-phase draws are not averaged in).
+#[test]
+fn a_run_without_a_convergence_phase_has_no_saem_objective_and_says_so() {
+    let mut o = short_saem(SaemOfv::Saem);
+    o.saem_n_convergence = 0;
+    o.saem_ofv_samples = 200;
+    let r = warfarin_fit(&o);
+    assert_eq!(r.saem_objective.as_ref().unwrap().kind, SaemOfv::Imp);
+    assert!(
+        r.warnings
+            .iter()
+            .any(|w| w.contains("saem_ofv = saem unavailable") && w.contains("convergence")),
+        "{:?}",
+        r.warnings
+    );
 }

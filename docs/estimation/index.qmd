@@ -53,7 +53,7 @@ The outer loop optimizer is selected independently of the method. See **[Outer O
 | Local minima robustness | Can get stuck | Can get stuck | More robust |
 | Gradient required | Yes (analytic or FD) | Yes (FD, per-subject) | No (E-step) |
 | Stochastic | No | No | Yes |
-| OFV comparable to FOCE | — | Yes (post-GN Laplace) | Only with `saem_ofv = focei` (default: importance-sampled −2LL, as NONMEM `IMP EONLY=1`; the Laplace value is `saem_objective.foce_ofv`) |
+| OFV comparable to FOCE | — | Yes (post-GN Laplace) | Only with `saem_ofv = focei` (default: NONMEM's SAEM objective, not a likelihood; `saem_ofv = imp` gives the importance-sampled −2LL, as NONMEM `IMP EONLY=1`; the Laplace value is `saem_objective.foce_ofv`) |
 | Best for | General use | Fast model development | Complex models, many ETAs |
 
 ## Choosing a method

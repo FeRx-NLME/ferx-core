@@ -1533,6 +1533,24 @@ fn saem_reported_objective(
 ) -> Result<(f64, SaemObjective, Option<ImportanceSamplingResult>), String> {
     match kind {
         SaemOfv::Focei => Err("saem_ofv = focei reports the FOCE/Laplace objective".into()),
+        SaemOfv::Saem => {
+            let ofv = prev
+                .saem_objective_value
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| {
+                    crate::estimation::saem_objective::unsupported(model)
+                        .unwrap_or("the run had no convergence-phase draw")
+                        .to_string()
+                })?;
+            let obj = SaemObjective {
+                kind,
+                mc_standard_error: None,
+                n_samples: None,
+                n_nodes: None,
+                foce_ofv: prev.ofv,
+            };
+            Ok((ofv, obj, None))
+        }
         SaemOfv::Imp => {
             let mut o = opts.clone();
             o.imp_samples = opts.saem_ofv_samples;
@@ -2500,6 +2518,7 @@ fn fit_inner(
                         covariance_wall_time_secs: 0.0,
                         warnings: gate_warning.into_iter().collect(),
                         saem_mu_ref_m_step_evals_saved: None,
+                        saem_objective_value: None,
                         saem_n_subjects_hmc: None,
                         saem_mh_accept_tail: None,
                         ebe_convergence_warnings: 0,
@@ -2603,6 +2622,7 @@ fn fit_inner(
                     covariance_wall_time_secs: 0.0,
                     warnings: gate_warning.into_iter().collect(),
                     saem_mu_ref_m_step_evals_saved: None,
+                    saem_objective_value: None,
                     saem_n_subjects_hmc: None,
                     saem_mh_accept_tail: None,
                     ebe_convergence_warnings: 0,
@@ -2707,7 +2727,7 @@ fn fit_inner(
                         .find(|m| !eval_only_methods.contains(m))
                         == Some(&EstimationMethod::Saem);
                     if after_saem
-                        && stage_opts.saem_ofv == SaemOfv::Imp
+                        && matches!(stage_opts.saem_ofv, SaemOfv::Saem | SaemOfv::Imp)
                         && r.minus2_log_likelihood.is_finite()
                     {
                         if let Some(prev) = result.as_mut() {
@@ -2856,6 +2876,13 @@ fn fit_inner(
             let outcome = loop {
                 match saem_reported_objective(model, population, prev, &stage_opts, tried) {
                     Ok(x) => break Some(x),
+                    Err(e) if tried == SaemOfv::Saem => {
+                        accumulated_warnings.push(format!(
+                            "saem_ofv = saem unavailable ({e}); reporting the importance-sampled \
+                             −2 log L instead."
+                        ));
+                        tried = SaemOfv::Imp;
+                    }
                     Err(e) if tried == SaemOfv::Agq => {
                         accumulated_warnings.push(format!(
                             "saem_ofv = agq unavailable ({e}); reporting the importance-sampled \
@@ -3177,7 +3204,13 @@ fn fit_inner(
     let prior_summary = prior_set.summarize(&packed_final);
     let ofv_data = result.ofv;
     let ofv = ofv_data + ofv_prior;
-    let aic = ofv_data + 2.0 * n_params as f64;
+    // The SAEM objective (`saem_ofv = saem`) is NONMEM's SAEMOBJ, not a likelihood: the
+    // information criteria are built from the FOCE/Laplace value at the same estimates.
+    let ic_ofv = match &saem_objective {
+        Some(o) if o.kind == SaemOfv::Saem => o.foce_ofv,
+        _ => ofv_data,
+    };
+    let aic = ic_ofv + 2.0 * n_params as f64;
     // BIC = OFV + k·ln(n). For TTE-only models n_obs == 0 (no Gaussian records),
     // giving ln(0) = -inf. Use total record count (Gaussian + TTE) so BIC is finite.
     #[cfg(feature = "survival")]
@@ -3190,7 +3223,7 @@ fn fit_inner(
     #[cfg(not(feature = "survival"))]
     let n_for_bic: usize = n_obs;
     let bic = if n_for_bic > 0 {
-        ofv_data + n_params as f64 * (n_for_bic as f64).ln()
+        ic_ofv + n_params as f64 * (n_for_bic as f64).ln()
     } else {
         f64::NAN
     };

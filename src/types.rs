@@ -8719,8 +8719,8 @@ pub struct FitResult {
     /// sparsely-sampled subjects and is the preferred quantity for AIC/BIC
     /// model comparison in those settings. See [`ImportanceSamplingResult`].
     pub importance_sampling: Option<ImportanceSamplingResult>,
-    /// `Some` when `ofv` of a SAEM fit is the importance-sampled or quadrature `−2 log L`
-    /// (`saem_ofv`, default `imp`, #2973) rather than the FOCE/Laplace objective, which it
+    /// `Some` when `ofv` of a SAEM fit is NONMEM's SAEM objective or the importance-sampled /
+    /// quadrature `−2 log L` (`saem_ofv`, default `saem`, #2973) rather than the FOCE/Laplace objective, which it
     /// then carries as [`SaemObjective::foce_ofv`]. `None` for every other fit and for
     /// `saem_ofv = focei`.
     #[serde(default)]
@@ -10332,7 +10332,7 @@ pub struct FitOptions {
     /// adaptive quadrature centres itself on the conditional mode.
     pub agq_eval_only: bool,
     /// Which objective a SAEM fit reports as its OFV (and builds AIC/BIC from): see
-    /// [`SaemOfv`]. Default [`SaemOfv::Imp`], NONMEM's `METHOD=IMP EONLY=1` convention.
+    /// [`SaemOfv`]. Default [`SaemOfv::Saem`], NONMEM's `SAEMOBJ`; `imp` is its `IMP EONLY=1` follow-up.
     /// Read only when SAEM is the last estimating stage and the chain has no explicit
     /// evaluator stage of its own.
     pub saem_ofv: SaemOfv,
@@ -11608,16 +11608,25 @@ pub enum ViSigmaUpdate {
 
 /// Which objective a SAEM fit reports as its OFV (`saem_ofv`, #2973).
 ///
-/// SAEM maximises the exact marginal likelihood but produces no usable value of it, so
-/// NONMEM follows `METHOD=SAEM` with `METHOD=IMP EONLY=1` and reports that importance-sampled
-/// `−2 log L`. That is the default here. The FOCE/Laplace value stays available on
-/// [`SaemObjective::foce_ofv`] either way.
+/// SAEM maximises the exact marginal likelihood but produces no usable value of it. NONMEM
+/// reports its **`SAEMOBJ`** for the SAEM step — the stochastic-approximation readout of the
+/// complete-data objective, not a likelihood — and follows it with `METHOD=IMP EONLY=1` for the
+/// marginal `−2 log L` when one is wanted. That is the default here, and the importance-sampled
+/// value is the explicit follow-up (`saem_ofv = imp`, or `method = [saem, imp]` with
+/// `imp_eval_only`). The FOCE/Laplace value stays available on [`SaemObjective::foce_ofv`] either
+/// way, and AIC/BIC are built from it under the default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SaemOfv {
+    /// NONMEM's `SAEMOBJ`: `−2 Σ_i log( mean p(y_i, η_i) )`, the log of the mean joint density of
+    /// the data and the random effects over the convergence phase's draws and iterations (no
+    /// `2π` constants; `estimation/saem_objective.rs`). **Not a likelihood**: it is not comparable
+    /// across models or with a FOCE/FOCEI/IMP objective, and AIC/BIC are not built from it.
+    /// A mixture, whose convention no NONMEM run anchors, reports `imp` with a warning.
+    #[default]
+    Saem,
     /// Importance-sampled `−2 log L` at the final estimates (NONMEM `IMP EONLY=1`), with
     /// its Monte-Carlo standard error: `saem_ofv_samples` draws per subject, seeded by
     /// `imp_seed`, so two runs agree.
-    #[default]
     Imp,
     /// Adaptive Gauss–Hermite quadrature at the final estimates, `saem_ofv_nodes` nodes per
     /// random effect. Deterministic; practical for up to three random effects, beyond which
@@ -11634,15 +11643,16 @@ pub enum SaemOfv {
 pub struct SaemObjective {
     /// Which evaluator produced `FitResult::ofv` (never [`SaemOfv::Focei`]).
     pub kind: SaemOfv,
-    /// Monte-Carlo standard error of `ofv` under [`SaemOfv::Imp`]; `None` under `agq`.
+    /// Monte-Carlo standard error of `ofv` under [`SaemOfv::Imp`]; `None` under `saem` and `agq`.
     pub mc_standard_error: Option<f64>,
-    /// Importance samples per subject under `imp`; `None` under `agq`.
+    /// Importance samples per subject under `imp`; `None` under `saem` and `agq`.
     pub n_samples: Option<usize>,
-    /// Quadrature nodes per random effect under `agq`; `None` under `imp`.
+    /// Quadrature nodes per random effect under `agq`; `None` under `saem` and `imp`.
     pub n_nodes: Option<usize>,
     /// The FOCE/Laplace objective at the same estimates, `2·pop_nll` after the EBE
     /// refinement: the value SAEM fits reported before #2973, kept as a diagnostic and for
-    /// comparison with a FOCE fit. AIC/BIC are *not* built from it.
+    /// comparison with a FOCE fit. AIC/BIC are built from it under [`SaemOfv::Saem`] (the SAEM
+    /// objective is not a likelihood) and from `ofv` under `imp` and `agq`.
     pub foce_ofv: f64,
 }
 
