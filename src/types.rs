@@ -10052,6 +10052,9 @@ pub struct FitOptions {
     /// random walk; [`SaemKernel::Imh`] is the opt-in f-SAEM independent
     /// Metropolis-Hastings kernel. See [`SaemKernel`] for when it pays.
     pub saem_kernel: SaemKernel,
+    /// Parameter-expanded Omega update, `[fit_options] saem_px` (default `off`); see
+    /// [`SaemPx`].
+    pub saem_px: SaemPx,
     /// Independent-MH proposals per subject per SAEM iteration under
     /// [`SaemKernel::Imh`] (`[fit_options] saem_imh_proposals`). Each costs one
     /// individual-NLL evaluation; they **replace** the `n_mh_steps` block
@@ -10779,6 +10782,7 @@ impl Default for FitOptions {
             saem_conddist_keep_samples: false,
             saem_n_leapfrog: 0,
             saem_kernel: SaemKernel::default(),
+            saem_px: SaemPx::default(),
             saem_imh_proposals: 2,
             saem_imh_refresh: 5,
             saem_imh_defensive: 0.05,
@@ -11125,6 +11129,23 @@ pub enum ScaleAdaptation {
     /// case — see the SAEM docs page for the six-seed measurement behind both.
     #[default]
     RobbinsMonro,
+}
+
+/// Parameter-expanded Omega update of the SAEM M-step (PX-SAEM, Liu, Rubin & Wu 1998;
+/// Lavielle & Meza 2007), set via `[fit_options] saem_px`. The draws are rescaled by the
+/// matrix `A` that maximises the data part of the expected complete-data log-likelihood and
+/// Omega's statistic becomes `A S Aᵀ`; `A = I` is the plain update and `A -> I` at the
+/// maximum-likelihood estimate, so the same likelihood is maximised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SaemPx {
+    /// The plain update (the default).
+    #[default]
+    Off,
+    /// Expanded update while the exploration phase runs, plain afterwards. Measured on a
+    /// 5-eta two-compartment model: the whole gain of `All` at a lower cost.
+    Exploration,
+    /// Expanded update on every iteration after the Omega burn-in.
+    All,
 }
 
 /// The SAEM E-step's primary kernel, set via `[fit_options] saem_kernel`
@@ -12412,6 +12433,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "mstep_draws",
             "saem_mstep_draws",
             "saem_kernel",
+            "saem_px",
             "saem_imh_proposals",
             "saem_imh_refresh",
             "saem_imh_defensive",

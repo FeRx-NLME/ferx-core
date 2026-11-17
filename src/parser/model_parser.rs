@@ -12744,6 +12744,18 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
+        "saem_px" => {
+            opts.saem_px = match value.to_lowercase().as_str() {
+                "off" | "false" | "none" => crate::types::SaemPx::Off,
+                "exploration" | "explore" => crate::types::SaemPx::Exploration,
+                "all" | "true" => crate::types::SaemPx::All,
+                other => {
+                    return Err(format!(
+                        "fit option `{key}`: unknown value `{other}` — expected off/exploration/all"
+                    ));
+                }
+            };
+        }
         "saem_imh_proposals" => {
             let v = parse_usize(key)?;
             if v == 0 {
