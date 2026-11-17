@@ -328,7 +328,7 @@ fn fd_r_on_a_rescaled_volume_matches_nonmem_matrix_r() {
 }
 
 /// A mixture subject's score adds `−∂ ln pᵢₖ/∂θ` from the mixing map, a finite difference
-/// in θ's own units (`mixing_logp_grad`, `mixing_logp_grad_fd` for the `p` form). It stepped
+/// in θ's own units (`mixing_logp_grad`, `mixing_logp_grad` for the `p` form). It stepped
 /// `1e-6·max(|θ|, 1)`, so a mixing θ near `1e-6` was stepped through zero. The
 /// `tests/mixture_cov_s_nonmem.rs` model at the NONMEM finals, with its mixing parameter
 /// rewritten nonlinearly through a rescaled θ `M_S` (`M = sqrt(M_S / k)`, so the mixing map is
@@ -430,6 +430,6 @@ fn s_mixture_logit_mixing_score_steps_a_small_theta_relatively() {
 #[test]
 fn s_mixture_p_mixing_score_steps_a_small_theta_relatively() {
     // Measured (macOS arm64, Linux x86_64): worst 6.4e-9 with the fix; 4.9e-4 with
-    // `mixing_logp_grad_fd`'s step floor at 1.
+    // `mixing_logp_grad`'s step floor at 1.
     assert_mixture_scale_invariant(false, 1e-6);
 }

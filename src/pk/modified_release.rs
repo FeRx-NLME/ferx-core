@@ -50,6 +50,7 @@
 
 use crate::ode::predictions::OdeSpec;
 use crate::pk::absorption::{InputRateForcing, InputRateKind};
+use crate::sens::num::BranchCmp;
 use crate::sens::num::PkNum;
 use crate::sens::one_cpt::{one_cpt_ig_g, one_cpt_oral_g, one_cpt_transit_g, one_cpt_zero_order_g};
 use crate::sens::two_cpt::{two_cpt_ig_g, two_cpt_oral_g, two_cpt_transit_g, two_cpt_zero_order_g};
@@ -187,7 +188,7 @@ pub fn identify_disposition(spec: &OdeSpec, p: &[f64], t: f64) -> Option<MrDispo
     // path exists anyway).
     spec.rhs_program.as_ref()?;
     let ro = spec.readout_program.as_ref()?;
-    if !ro.is_dual_evaluable() {
+    if ro.reads_leaves() {
         return None;
     }
     let n = spec.n_states;
@@ -411,23 +412,28 @@ pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
     e_c[disp.central] = T::from_f64(1.0);
     let mut e_c2 = vec![T::from_f64(0.0); n];
     e_c2[disp.central] = T::from_f64(2.0);
-    let y0 = ro.eval_output_g::<T>(&zero_state, p, cov, &mut vars, &mut stack);
-    let y1 = ro.eval_output_g::<T>(&e_c, p, cov, &mut vars, &mut stack);
-    let y2 = ro.eval_output_g::<T>(&e_c2, p, cov, &mut vars, &mut stack);
+    let y0 = ro.eval_output_g::<T>(&zero_state, p, &[], &[], cov, &mut vars, &mut stack);
+    let y1 = ro.eval_output_g::<T>(&e_c, p, &[], &[], cov, &mut vars, &mut stack);
+    let y2 = ro.eval_output_g::<T>(&e_c2, p, &[], &[], cov, &mut vars, &mut stack);
     // The observable must be **linear through the origin** in the central amount:
     // `mr_observable_g` sums `mass·kernel_conc = m·amount`, so a readout with a
     // non-zero intercept (a baseline `y = central/V + BASE`) or any curvature in
     // central (`y = central²/V`) would be silently mispredicted — the `identify`
     // readout check only pins *which* state is read, not that it is read linearly.
     // Require `readout(0) ≈ 0` and `readout(2) ≈ 2·readout(1)`, else decline.
-    if y0.val().abs() > LINEARITY_TOL * (1.0 + y1.val().abs()) {
+    // Branches through the branch API: a recording type guards them, never reads the values.
+    let (one, tol) = (T::from_f64(1.0), T::from_f64(LINEARITY_TOL));
+    if y0.abs().br_cmp(BranchCmp::Gt, tol * (one + y1.abs())) {
         return None;
     }
-    if (y2.val() - 2.0 * y1.val()).abs() > LINEARITY_TOL * (1.0 + y2.val().abs()) {
+    if (y2 - T::from_f64(2.0) * y1)
+        .abs()
+        .br_cmp(BranchCmp::Gt, tol * (one + y2.abs()))
+    {
         return None;
     }
     let m = y1 - y0;
-    if m.val() <= 0.0 {
+    if m.br_cmp_c(BranchCmp::Le, 0.0) {
         return None;
     }
     let v = T::from_f64(1.0) / m;
@@ -436,7 +442,7 @@ pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
     match disp.kind {
         MrDispositionKind::OneCpt => {
             let ke = -du_ec[disp.central]; // du = −ke·1
-            if ke.val() <= 0.0 {
+            if ke.br_cmp_c(BranchCmp::Le, 0.0) {
                 return None;
             }
             Some(DispParams {
@@ -453,7 +459,10 @@ pub fn recover_disp_params_g<T: crate::sens::num::vm::VmNum>(
             let k12 = du_ec[periph]; // central → periph
             let k21 = du_ep[disp.central]; // periph → central
             let k10 = -du_ec[disp.central] - k12; // −(c_self) − k12
-            if k10.val() <= 0.0 || k12.val() <= 0.0 || k21.val() <= 0.0 {
+            if k10.br_cmp_c(BranchCmp::Le, 0.0)
+                || k12.br_cmp_c(BranchCmp::Le, 0.0)
+                || k21.br_cmp_c(BranchCmp::Le, 0.0)
+            {
                 return None;
             }
             let v1 = v;

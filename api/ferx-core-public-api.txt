@@ -21,8 +21,10 @@ pub ferx_core::api::AdaptiveInputs::unmatched: ferx_core::UnmatchedSubjects
 impl<'a> ferx_core::AdaptiveInputs<'a>
 pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
+pub fn ferx_core::AdaptiveInputs<'a>::with_uncertainty(self, fit: &'a ferx_core::FitResult, spec: ferx_core::UncertaintySpec) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
 #[non_exhaustive] pub struct ferx_core::api::AdaptiveSimulateOptions
+pub ferx_core::api::AdaptiveSimulateOptions::decision_covariates: core::option::Option<ferx_core::sim::adaptive::DecisionCovariates>
 pub ferx_core::api::AdaptiveSimulateOptions::decision_times: alloc::vec::Vec<f64>
 pub ferx_core::api::AdaptiveSimulateOptions::max_decisions: usize
 pub ferx_core::api::AdaptiveSimulateOptions::monitors: alloc::vec::Vec<ferx_core::sim::adaptive::MonitorSpec>
@@ -35,8 +37,34 @@ pub fn ferx_core::AdaptiveSimulateOptions::default() -> Self
 pub ferx_core::api::AdaptiveSimulationResult::decisions: alloc::vec::Vec<ferx_core::sim::adaptive::DecisionLogEntry>
 pub ferx_core::api::AdaptiveSimulationResult::ledger: alloc::vec::Vec<ferx_core::sim::adaptive::DoseLedgerEntry>
 pub ferx_core::api::AdaptiveSimulationResult::metrics: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveSubjectMetrics>
+pub ferx_core::api::AdaptiveSimulationResult::parameters: alloc::vec::Vec<ferx_core::DrawnParameters>
 pub ferx_core::api::AdaptiveSimulationResult::trajectories: alloc::vec::Vec<ferx_core::SimulationResult>
 pub ferx_core::api::AdaptiveSimulationResult::warnings: alloc::vec::Vec<alloc::string::String>
+#[non_exhaustive] pub struct ferx_core::api::DrawnParameters
+pub ferx_core::api::DrawnParameters::draw: usize
+pub ferx_core::api::DrawnParameters::parameters: ferx_core::ModelParameters
+pub struct ferx_core::api::KmmcVpc
+pub ferx_core::api::KmmcVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::api::KmmcVpc::cmt: usize
+pub ferx_core::api::KmmcVpc::covariate: alloc::string::String
+pub ferx_core::api::KmmcVpc::horizon: f64
+pub ferx_core::api::KmmcVpc::level: core::option::Option<f64>
+pub ferx_core::api::KmmcVpc::min_at_risk: usize
+pub ferx_core::api::KmmcVpc::n_sim: usize
+pub ferx_core::api::KmmcVpc::probs: [f64; 3]
+pub ferx_core::api::KmmcVpc::strata: alloc::vec::Vec<ferx_core::KmmcVpcStratum>
+pub ferx_core::api::KmmcVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::api::KmmcVpcStratum
+pub ferx_core::api::KmmcVpcStratum::grid: alloc::vec::Vec<f64>
+pub ferx_core::api::KmmcVpcStratum::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::KmmcVpcStratum::label: alloc::string::String
+pub ferx_core::api::KmmcVpcStratum::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::KmmcVpcStratum::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::KmmcVpcStratum::n_subjects: usize
+pub ferx_core::api::KmmcVpcStratum::n_used: alloc::vec::Vec<usize>
+pub ferx_core::api::KmmcVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::api::KmmcVpcStratum::observed: ferx_core::stats::km::KmmcCurve
+pub ferx_core::api::KmmcVpcStratum::value: core::option::Option<f64>
 pub struct ferx_core::api::PoolPlan
 impl ferx_core::PoolPlan
 pub fn ferx_core::PoolPlan::apply_to(&self, options: &mut ferx_core::FitOptions)
@@ -197,6 +225,18 @@ pub ferx_core::api::TteVpcStratum::n_used: alloc::vec::Vec<usize>
 pub ferx_core::api::TteVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::api::TteVpcStratum::observed: ferx_core::stats::km::KmCurve
 pub ferx_core::api::TteVpcStratum::value: core::option::Option<f64>
+pub struct ferx_core::api::UncertaintySpec
+pub ferx_core::api::UncertaintySpec::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
+pub ferx_core::api::UncertaintySpec::n_draws: usize
+#[non_exhaustive] pub struct ferx_core::api::VpcKmmcOptions
+pub ferx_core::api::VpcKmmcOptions::covariate: alloc::string::String
+pub ferx_core::api::VpcKmmcOptions::level: core::option::Option<f64>
+pub ferx_core::api::VpcKmmcOptions::min_at_risk: usize
+pub ferx_core::api::VpcKmmcOptions::vpc: ferx_core::VpcTteOptions
+impl ferx_core::VpcKmmcOptions
+pub fn ferx_core::VpcKmmcOptions::new(covariate: impl core::convert::Into<alloc::string::String>) -> Self
+impl core::default::Default for ferx_core::VpcKmmcOptions
+pub fn ferx_core::VpcKmmcOptions::default() -> Self
 pub struct ferx_core::api::VpcRtteOptions
 pub ferx_core::api::VpcRtteOptions::censoring: ferx_core::VpcCensoring
 pub ferx_core::api::VpcRtteOptions::cmt: core::option::Option<usize>
@@ -269,6 +309,7 @@ pub fn ferx_core::api::theta_level_values(model: &ferx_core::CompiledModel, thet
 pub fn ferx_core::api::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::api::validate_output_columns(model: &ferx_core::CompiledModel, population: &ferx_core::Population) -> alloc::vec::Vec<ferx_core::diagnostics::Diagnostic>
+pub fn ferx_core::api::vpc_kmmc(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcKmmcOptions) -> core::result::Result<ferx_core::KmmcVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::api::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
 pub mod ferx_core::build_info
@@ -664,7 +705,6 @@ pub fn ferx_core::estimation::saem_conddist::run_conditional_distribution(model:
 pub mod ferx_core::estimation::sens_outer_gradient
 pub fn ferx_core::estimation::sens_outer_gradient::per_subject_packed_gradients(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], interaction: bool, mixture_class: core::option::Option<usize>) -> alloc::vec::Vec<core::option::Option<alloc::vec::Vec<f64>>>
 pub fn ferx_core::estimation::sens_outer_gradient::per_subject_packed_gradients_iov(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], kappas: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], interaction: bool) -> alloc::vec::Vec<core::option::Option<alloc::vec::Vec<f64>>>
-pub fn ferx_core::estimation::sens_outer_gradient::population_eta_dx(model: &ferx_core::CompiledModel, population: &ferx_core::Population, template: &ferx_core::ModelParameters, x: &[f64], eta_hats: &[nalgebra::base::alias::DVector<f64>], interaction: bool) -> core::option::Option<alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>>>
 pub fn ferx_core::estimation::sens_outer_gradient::predict_warm_etas(prev_etas: &[nalgebra::base::alias::DVector<f64>], jacs: &[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>], x_prev: &[f64], x_new: &[f64]) -> alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub fn ferx_core::estimation::sens_outer_gradient::subject_packed_gradient_foce(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, template: &ferx_core::ModelParameters, x: &[f64], eta_hat: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
@@ -1206,8 +1246,8 @@ pub ferx_core::markov::StateObs::state: usize
 pub ferx_core::markov::StateObs::time: f64
 pub fn ferx_core::markov::ctmm_data_term(q: &nalgebra::base::alias::DMatrix<f64>, obs: &[ferx_core::markov::StateObs]) -> core::result::Result<f64, ferx_core::markov::MarkovError>
 pub fn ferx_core::markov::ctmm_data_term_grad(q: &nalgebra::base::alias::DMatrix<f64>, dq: &[nalgebra::base::alias::DMatrix<f64>], obs: &[ferx_core::markov::StateObs]) -> core::result::Result<core::option::Option<(f64, alloc::vec::Vec<f64>)>, ferx_core::markov::MarkovError>
-pub fn ferx_core::markov::ctmm_inhomogeneous_transition(q_at: impl core::ops::function::Fn(f64) -> nalgebra::base::alias::DMatrix<f64>, delta_t: f64, n_states: usize) -> nalgebra::base::alias::DMatrix<f64>
-pub fn ferx_core::markov::ctmm_inhomogeneous_transition_with_opts(q_at: impl core::ops::function::Fn(f64) -> nalgebra::base::alias::DMatrix<f64>, delta_t: f64, n_states: usize, opts: &ferx_core::ode::OdeSolverOptions) -> nalgebra::base::alias::DMatrix<f64>
+pub fn ferx_core::markov::ctmm_inhomogeneous_transition(q_at: impl core::ops::function::Fn(f64) -> nalgebra::base::alias::DMatrix<f64>, dq_at: impl core::ops::function::Fn(f64) -> core::option::Option<nalgebra::base::alias::DMatrix<f64>>, delta_t: f64, n_states: usize) -> nalgebra::base::alias::DMatrix<f64>
+pub fn ferx_core::markov::ctmm_inhomogeneous_transition_with_opts(q_at: impl core::ops::function::Fn(f64) -> nalgebra::base::alias::DMatrix<f64>, dq_at: impl core::ops::function::Fn(f64) -> core::option::Option<nalgebra::base::alias::DMatrix<f64>>, delta_t: f64, n_states: usize, opts: &ferx_core::ode::OdeSolverOptions) -> nalgebra::base::alias::DMatrix<f64>
 pub fn ferx_core::markov::generator_rate_direction(s: usize, j: usize, k: usize, dt: f64) -> nalgebra::base::alias::DMatrix<f64>
 pub fn ferx_core::markov::matrix_exp(a: &nalgebra::base::alias::DMatrix<f64>) -> nalgebra::base::alias::DMatrix<f64>
 pub fn ferx_core::markov::matrix_exp_frechet(a: &nalgebra::base::alias::DMatrix<f64>, e: &nalgebra::base::alias::DMatrix<f64>) -> nalgebra::base::alias::DMatrix<f64>
@@ -1370,7 +1410,6 @@ pub ferx_core::ode::predictions::PerCmtReadout::out_fn: ferx_core::ode::OdeOutpu
 pub ferx_core::ode::predictions::PerCmtReadout::program: core::option::Option<ferx_core::parser::model_parser::OdeOutputProgram>
 pub fn ferx_core::ode::predictions::ode_dense_solve_states(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject, saveat: &[f64]) -> alloc::vec::Vec<alloc::vec::Vec<f64>>
 pub fn ferx_core::ode::predictions::ode_predictions(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject) -> alloc::vec::Vec<f64>
-pub fn ferx_core::ode::predictions::ode_predictions_ekf(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], subject: &ferx_core::Subject, r_obs_fn: impl core::ops::function::Fn(f64) -> f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<f64>)
 pub fn ferx_core::ode::predictions::ode_predictions_ekf_with_diffusion(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], subject: &ferx_core::Subject, diffusion_var: &[f64], r_obs_fn: impl core::ops::function::Fn(f64) -> f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<f64>)
 pub fn ferx_core::ode::predictions::ode_predictions_event_driven(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams], pk_at_reset: &[ferx_core::PkParams]) -> alloc::vec::Vec<f64>
 pub fn ferx_core::ode::predictions::ode_predictions_event_driven_with_states(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams], pk_at_reset: &[ferx_core::PkParams]) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
@@ -1524,7 +1563,6 @@ pub ferx_core::ode::SolPointG::t: f64
 pub ferx_core::ode::SolPointG::u: alloc::vec::Vec<T>
 pub fn ferx_core::ode::ode_dense_solve_states(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject, saveat: &[f64]) -> alloc::vec::Vec<alloc::vec::Vec<f64>>
 pub fn ferx_core::ode::ode_predictions(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], theta: &[f64], eta: &[f64], subject: &ferx_core::Subject) -> alloc::vec::Vec<f64>
-pub fn ferx_core::ode::ode_predictions_ekf(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], subject: &ferx_core::Subject, r_obs_fn: impl core::ops::function::Fn(f64) -> f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<f64>)
 pub fn ferx_core::ode::ode_predictions_ekf_with_diffusion(ode: &ferx_core::ode::OdeSpec, pk_params_flat: &[f64], subject: &ferx_core::Subject, diffusion_var: &[f64], r_obs_fn: impl core::ops::function::Fn(f64) -> f64) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<f64>)
 pub fn ferx_core::ode::ode_predictions_event_driven(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams], pk_at_reset: &[ferx_core::PkParams]) -> alloc::vec::Vec<f64>
 pub fn ferx_core::ode::ode_predictions_event_driven_with_states(ode: &ferx_core::ode::OdeSpec, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64], pk_at_dose: &[ferx_core::PkParams], pk_at_obs: &[ferx_core::PkParams], pk_at_pk_only: &[ferx_core::PkParams], pk_at_reset: &[ferx_core::PkParams]) -> (alloc::vec::Vec<f64>, alloc::vec::Vec<alloc::vec::Vec<f64>>)
@@ -1635,7 +1673,7 @@ pub ferx_core::pk::absorption::PreparedInputRate::ZeroOrder::inv_dur: T
 impl<T: ferx_core::sens::num::PkNum> ferx_core::pk::absorption::PreparedInputRate<T>
 pub fn ferx_core::pk::absorption::PreparedInputRate<T>::cdf(&self, s: T) -> T
 pub fn ferx_core::pk::absorption::PreparedInputRate<T>::rate(&self, tad: T, dose: T) -> T
-pub fn ferx_core::pk::absorption::PreparedInputRate<T>::rate_infused(&self, tad: T, dose: T, t_inf: T) -> T
+pub fn ferx_core::pk::absorption::PreparedInputRate<T>::rate_infused(&self, tad: T, dose: T, t_inf: T, tail_age: core::option::Option<T>) -> T
 pub struct ferx_core::pk::absorption::InputRateForcing
 pub ferx_core::pk::absorption::InputRateForcing::arg_slots: alloc::vec::Vec<usize>
 pub ferx_core::pk::absorption::InputRateForcing::cmt: usize
@@ -1827,345 +1865,251 @@ pub fn ferx_core::propensity_match::mahalanobis_sq(a: &[f64], b: &[f64], omega_i
 pub fn ferx_core::propensity_match::match_draws_to_fitted(pool: &[nalgebra::base::alias::DVector<f64>], fitted: &[nalgebra::base::alias::DVector<f64>], omega_inv: &nalgebra::base::alias::DMatrix<f64>, method: ferx_core::propensity_match::MatchMethod) -> alloc::vec::Vec<usize>
 pub fn ferx_core::propensity_match::optimal_assignment(cost: &nalgebra::base::alias::DMatrix<f64>) -> alloc::vec::Vec<usize>
 pub mod ferx_core::sens
-pub mod ferx_core::sens::dual1
-pub struct ferx_core::sens::dual1::Dual1<const N: usize>
-pub ferx_core::sens::dual1::Dual1::grad: [f64; N]
-pub ferx_core::sens::dual1::Dual1::value: f64
-impl<const N: usize> ferx_core::sens::dual1::Dual1<N>
-pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::acos(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::constant(value: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
-pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
-pub fn ferx_core::sens::dual1::Dual1<N>::lift2(self, v: f64, d1: f64, _d2: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::powd(self, e: Self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::recip(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::var(value: f64, i: usize) -> Self
-impl<const N: usize> core::ops::arith::Add for ferx_core::sens::dual1::Dual1<N>
-pub type ferx_core::sens::dual1::Dual1<N>::Output = ferx_core::sens::dual1::Dual1<N>
-pub fn ferx_core::sens::dual1::Dual1<N>::add(self, rhs: Self) -> Self
-impl<const N: usize> core::ops::arith::Div for ferx_core::sens::dual1::Dual1<N>
-pub type ferx_core::sens::dual1::Dual1<N>::Output = ferx_core::sens::dual1::Dual1<N>
-pub fn ferx_core::sens::dual1::Dual1<N>::div(self, rhs: Self) -> Self
-impl<const N: usize> core::ops::arith::Mul for ferx_core::sens::dual1::Dual1<N>
-pub type ferx_core::sens::dual1::Dual1<N>::Output = ferx_core::sens::dual1::Dual1<N>
-pub fn ferx_core::sens::dual1::Dual1<N>::mul(self, rhs: Self) -> Self
-impl<const N: usize> core::ops::arith::Neg for ferx_core::sens::dual1::Dual1<N>
-pub type ferx_core::sens::dual1::Dual1<N>::Output = ferx_core::sens::dual1::Dual1<N>
-pub fn ferx_core::sens::dual1::Dual1<N>::neg(self) -> Self
-impl<const N: usize> core::ops::arith::Sub for ferx_core::sens::dual1::Dual1<N>
-pub type ferx_core::sens::dual1::Dual1<N>::Output = ferx_core::sens::dual1::Dual1<N>
-pub fn ferx_core::sens::dual1::Dual1<N>::sub(self, rhs: Self) -> Self
-impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual1::Dual1<N>
-pub const ferx_core::sens::dual1::Dual1<N>::ETA_HESSIAN: bool
-pub const ferx_core::sens::dual1::Dual1<N>::FUSED_FOLDS: bool
-pub const ferx_core::sens::dual1::Dual1<N>::JET_ORDER: usize
-pub const ferx_core::sens::dual1::Dual1<N>::SECOND_ORDER: bool
-pub const ferx_core::sens::dual1::Dual1<N>::TAYLOR2_EXACT: bool
-pub const ferx_core::sens::dual1::Dual1<N>::WORK: usize
-pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::acos(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::detach(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::is_constant(self) -> bool
-pub fn ferx_core::sens::dual1::Dual1<N>::is_taped(self) -> bool
-pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
-pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
-pub fn ferx_core::sens::dual1::Dual1<N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
-pub fn ferx_core::sens::dual1::Dual1<N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
-pub fn ferx_core::sens::dual1::Dual1<N>::pow(self, e: Self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
-pub fn ferx_core::sens::dual1::Dual1<N>::scaled_diff(a: Self, b: Self, s: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::tape_mark() -> usize
-pub fn ferx_core::sens::dual1::Dual1<N>::tape_rollback(_mark: usize)
-pub fn ferx_core::sens::dual1::Dual1<N>::val(self) -> f64
-pub fn ferx_core::sens::dual1::Dual1<N>::var(x: f64, dim: usize) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 pub mod ferx_core::sens::dual2
-pub fn ferx_core::sens::dual2::scalar_div<const NA: usize, const N: usize>(s: f64, d: ferx_core::sens::dual_mixed::DualMixed<NA, N>) -> ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub type ferx_core::sens::dual2::Dual2<const N: usize> = ferx_core::sens::dual_mixed::DualMixed<N, N>
-pub mod ferx_core::sens::dual_mixed
-pub struct ferx_core::sens::dual_mixed::DualMixed<const NA: usize, const N: usize>
-pub ferx_core::sens::dual_mixed::DualMixed::grad: [f64; N]
-pub ferx_core::sens::dual_mixed::DualMixed::hess: [[f64; N]; NA]
-pub ferx_core::sens::dual_mixed::DualMixed::value: f64
-impl<const NA: usize, const N: usize> ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::acos(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::constant(value: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::powd(self, e: Self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::recip(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::var(value: f64, i: usize) -> Self
-impl<const NA: usize, const N: usize> core::ops::arith::Add for ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::add(self, rhs: Self) -> Self
-impl<const NA: usize, const N: usize> core::ops::arith::Add<f64> for ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::add(self, s: f64) -> Self
-impl<const NA: usize, const N: usize> core::ops::arith::Div for ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::div(self, rhs: Self) -> Self
-impl<const NA: usize, const N: usize> core::ops::arith::Mul for ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::mul(self, rhs: Self) -> Self
-impl<const NA: usize, const N: usize> core::ops::arith::Mul<f64> for ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::mul(self, s: f64) -> Self
-impl<const NA: usize, const N: usize> core::ops::arith::Neg for ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::neg(self) -> Self
-impl<const NA: usize, const N: usize> core::ops::arith::Sub for ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub type ferx_core::sens::dual_mixed::DualMixed<NA, N>::Output = ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sub(self, rhs: Self) -> Self
-impl<const NA: usize, const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::ETA_HESSIAN: bool
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::FUSED_FOLDS: bool
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::JET_ORDER: usize
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::SECOND_ORDER: bool
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::TAYLOR2_EXACT: bool
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::WORK: usize
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::acos(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::detach(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::is_constant(self) -> bool
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::is_taped(self) -> bool
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::pow(self, e: Self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::scaled_diff(a: Self, b: Self, s: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_mark() -> usize
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_rollback(_mark: usize)
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::val(self) -> f64
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::var(x: f64, dim: usize) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
-pub fn ferx_core::sens::dual_mixed::scalar_div<const NA: usize, const N: usize>(s: f64, d: ferx_core::sens::dual_mixed::DualMixed<NA, N>) -> ferx_core::sens::dual_mixed::DualMixed<NA, N>
+pub struct ferx_core::sens::dual2::Dual2<const N: usize>
+pub ferx_core::sens::dual2::Dual2::grad: [f64; N]
+pub ferx_core::sens::dual2::Dual2::hess: [[f64; N]; N]
+pub ferx_core::sens::dual2::Dual2::value: f64
+impl<const N: usize> ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::abs(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::acos(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::constant(value: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::cos(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::exp(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::jet_max_abs(self) -> f64
+pub fn ferx_core::sens::dual2::Dual2<N>::jets_finite(self) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::ln(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::ln_gamma(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::logit(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::powd(self, e: Self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::recip(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::sqrt(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::var(value: f64, i: usize) -> Self
+impl<const N: usize> core::ops::arith::Add for ferx_core::sens::dual2::Dual2<N>
+pub type ferx_core::sens::dual2::Dual2<N>::Output = ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::add(self, r: Self) -> Self
+impl<const N: usize> core::ops::arith::Add<f64> for ferx_core::sens::dual2::Dual2<N>
+pub type ferx_core::sens::dual2::Dual2<N>::Output = ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::add(self, s: f64) -> Self
+impl<const N: usize> core::ops::arith::Div for ferx_core::sens::dual2::Dual2<N>
+pub type ferx_core::sens::dual2::Dual2<N>::Output = ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::div(self, r: Self) -> Self
+impl<const N: usize> core::ops::arith::Mul for ferx_core::sens::dual2::Dual2<N>
+pub type ferx_core::sens::dual2::Dual2<N>::Output = ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::mul(self, r: Self) -> Self
+impl<const N: usize> core::ops::arith::Mul<f64> for ferx_core::sens::dual2::Dual2<N>
+pub type ferx_core::sens::dual2::Dual2<N>::Output = ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::mul(self, s: f64) -> Self
+impl<const N: usize> core::ops::arith::Neg for ferx_core::sens::dual2::Dual2<N>
+pub type ferx_core::sens::dual2::Dual2<N>::Output = ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::neg(self) -> Self
+impl<const N: usize> core::ops::arith::Sub for ferx_core::sens::dual2::Dual2<N>
+pub type ferx_core::sens::dual2::Dual2<N>::Output = ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::sub(self, r: Self) -> Self
+impl<const N: usize> ferx_core::sens::num::NonRecording for ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::val(self) -> f64
+impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual2::Dual2<N>
+pub const ferx_core::sens::dual2::Dual2<N>::JET_ORDER: usize
+pub const ferx_core::sens::dual2::Dual2<N>::RECORDS_BRANCHES: bool
+pub const ferx_core::sens::dual2::Dual2<N>::SECOND_ORDER: bool
+pub const ferx_core::sens::dual2::Dual2<N>::TAYLOR2_EXACT: bool
+pub fn ferx_core::sens::dual2::Dual2<N>::abs(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::acos(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::br_abs_lt(self, tol: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_absdiff_lt(self, other: Self, tol: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_cmp(self, cc: ferx_core::sens::num::BranchCmp, other: Self) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_cmp_c(self, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_floor_div(self, step: f64) -> f64
+pub fn ferx_core::sens::dual2::Dual2<N>::br_is_nan(self) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_shift_cmp(self, base: f64, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::cos(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::exp(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::exprel(self, orders: usize) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::from_f64(x: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::gamma_pq(self, x: Self, upper: bool) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::guard_floor(self, lo: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::host(f: ferx_core::sens::num::HostFn, args: &[Self]) -> alloc::vec::Vec<Self>
+pub fn ferx_core::sens::dual2::Dual2<N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::is_constant(self) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::jet_k(self, f: ferx_core::sens::num::JetFn, k: u8) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::jet_max_abs(self) -> f64
+pub fn ferx_core::sens::dual2::Dual2<N>::jet_unary(self, f: ferx_core::sens::num::JetFn) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::jets_finite(self) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::ln(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::ln_gamma(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::logit(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::nonrec_val(self) -> core::option::Option<f64>
+pub fn ferx_core::sens::dual2::Dual2<N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual2::Dual2<N>::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::sin(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::sqrt(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::value_only(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::var(x: f64, dim: usize) -> Self
+pub fn ferx_core::sens::dual2::scalar_div<const N: usize>(s: f64, d: ferx_core::sens::dual2::Dual2<N>) -> ferx_core::sens::dual2::Dual2<N>
 pub mod ferx_core::sens::num
-pub trait ferx_core::sens::num::PkNum: core::marker::Copy + 'static + core::ops::arith::Add<Output = Self> + core::ops::arith::Sub<Output = Self> + core::ops::arith::Mul<Output = Self> + core::ops::arith::Div<Output = Self> + core::ops::arith::Neg<Output = Self>
-pub const ferx_core::sens::num::PkNum::ETA_HESSIAN: bool
-pub const ferx_core::sens::num::PkNum::FUSED_FOLDS: bool
+pub enum ferx_core::sens::num::BranchCmp
+pub ferx_core::sens::num::BranchCmp::Eq
+pub ferx_core::sens::num::BranchCmp::Ge
+pub ferx_core::sens::num::BranchCmp::Gt
+pub ferx_core::sens::num::BranchCmp::Le
+pub ferx_core::sens::num::BranchCmp::Lt
+pub ferx_core::sens::num::BranchCmp::Ne
+impl ferx_core::sens::num::BranchCmp
+pub fn ferx_core::sens::num::BranchCmp::holds(self, a: f64, b: f64) -> bool
+#[non_exhaustive] pub enum ferx_core::sens::num::HostFn
+pub ferx_core::sens::num::HostFn::ForcingScale
+pub ferx_core::sens::num::HostFn::LuFactor
+pub ferx_core::sens::num::HostFn::PadeSquarings
+pub ferx_core::sens::num::HostFn::RemEuclid
+pub ferx_core::sens::num::HostFn::Spectral
+pub enum ferx_core::sens::num::JetFn
+pub ferx_core::sens::num::JetFn::ExpM1
+pub ferx_core::sens::num::JetFn::Exprel
+pub ferx_core::sens::num::JetFn::InvMills
+pub ferx_core::sens::num::JetFn::LnGamma
+pub ferx_core::sens::num::JetFn::LogNormCdf
+pub ferx_core::sens::num::JetFn::Logistic
+pub ferx_core::sens::num::JetFn::NegLogNormCdf
+pub ferx_core::sens::num::JetFn::Pnorm
+pub ferx_core::sens::num::JetFn::Softplus
+pub ferx_core::sens::num::JetFn::Tanh
+pub trait ferx_core::sens::num::NonRecording: ferx_core::sens::num::PkNum
+pub fn ferx_core::sens::num::NonRecording::val(self) -> f64
+impl ferx_core::sens::num::NonRecording for f64
+pub fn f64::val(self) -> f64
+impl<const N: usize> ferx_core::sens::num::NonRecording for ferx_core::sens::dual2::Dual2<N>
+pub fn ferx_core::sens::dual2::Dual2<N>::val(self) -> f64
+pub trait ferx_core::sens::num::PkNum: core::marker::Copy + 'static + core::ops::arith::Add<Output = Self> + core::ops::arith::Sub<Output = Self> + core::ops::arith::Mul<Output = Self> + core::ops::arith::Div<Output = Self> + core::ops::arith::Neg<Output = Self> + RecHooks
 pub const ferx_core::sens::num::PkNum::JET_ORDER: usize
+pub const ferx_core::sens::num::PkNum::RECORDS_BRANCHES: bool
 pub const ferx_core::sens::num::PkNum::SECOND_ORDER: bool
 pub const ferx_core::sens::num::PkNum::TAYLOR2_EXACT: bool
-pub const ferx_core::sens::num::PkNum::WORK: usize
 pub fn ferx_core::sens::num::PkNum::abs(self) -> Self
 pub fn ferx_core::sens::num::PkNum::acos(self) -> Self
-pub fn ferx_core::sens::num::PkNum::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
-pub fn ferx_core::sens::num::PkNum::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
+pub fn ferx_core::sens::num::PkNum::br_abs_lt(self, tol: f64) -> bool
+pub fn ferx_core::sens::num::PkNum::br_absdiff_lt(self, other: Self, tol: f64) -> bool
+pub fn ferx_core::sens::num::PkNum::br_cmp(self, cc: ferx_core::sens::num::BranchCmp, other: Self) -> bool
+pub fn ferx_core::sens::num::PkNum::br_cmp_c(self, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn ferx_core::sens::num::PkNum::br_floor_div(self, step: f64) -> f64
+pub fn ferx_core::sens::num::PkNum::br_is_nan(self) -> bool
+pub fn ferx_core::sens::num::PkNum::br_shift_cmp(self, base: f64, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
 pub fn ferx_core::sens::num::PkNum::cos(self) -> Self
-pub fn ferx_core::sens::num::PkNum::detach(self) -> Self
-pub fn ferx_core::sens::num::PkNum::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
-pub fn ferx_core::sens::num::PkNum::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
-pub fn ferx_core::sens::num::PkNum::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn ferx_core::sens::num::PkNum::exp(self) -> Self
+pub fn ferx_core::sens::num::PkNum::exprel(self, orders: usize) -> Self
 pub fn ferx_core::sens::num::PkNum::from_f64(x: f64) -> Self
+pub fn ferx_core::sens::num::PkNum::gamma_pq(self, x: Self, upper: bool) -> Self
 pub fn ferx_core::sens::num::PkNum::guard_floor(self, lo: f64) -> Self
+pub fn ferx_core::sens::num::PkNum::host(f: ferx_core::sens::num::HostFn, args: &[Self]) -> alloc::vec::Vec<Self>
 pub fn ferx_core::sens::num::PkNum::inv_logit(self) -> Self
 pub fn ferx_core::sens::num::PkNum::is_constant(self) -> bool
-pub fn ferx_core::sens::num::PkNum::is_taped(self) -> bool
+pub fn ferx_core::sens::num::PkNum::jet_k(self, f: ferx_core::sens::num::JetFn, k: u8) -> Self
 pub fn ferx_core::sens::num::PkNum::jet_max_abs(self) -> f64
+pub fn ferx_core::sens::num::PkNum::jet_unary(self, f: ferx_core::sens::num::JetFn) -> Self
 pub fn ferx_core::sens::num::PkNum::jets_finite(self) -> bool
 pub fn ferx_core::sens::num::PkNum::lift2(self, v: f64, d1: f64, d2: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
 pub fn ferx_core::sens::num::PkNum::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
-pub fn ferx_core::sens::num::PkNum::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn ferx_core::sens::num::PkNum::ln(self) -> Self
 pub fn ferx_core::sens::num::PkNum::ln_gamma(self) -> Self
 pub fn ferx_core::sens::num::PkNum::logit(self) -> Self
-pub fn ferx_core::sens::num::PkNum::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
-pub fn ferx_core::sens::num::PkNum::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
+pub fn ferx_core::sens::num::PkNum::nonrec_val(self) -> core::option::Option<f64>
 pub fn ferx_core::sens::num::PkNum::pow(self, e: Self) -> Self
 pub fn ferx_core::sens::num::PkNum::same_bits_untaped(&self, _other: &Self) -> core::option::Option<bool>
-pub fn ferx_core::sens::num::PkNum::scaled_diff(a: Self, b: Self, s: f64) -> Self
+pub fn ferx_core::sens::num::PkNum::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
+pub fn ferx_core::sens::num::PkNum::sin(self) -> Self
 pub fn ferx_core::sens::num::PkNum::sqrt(self) -> Self
-pub fn ferx_core::sens::num::PkNum::tape_mark() -> usize
-pub fn ferx_core::sens::num::PkNum::tape_rollback(_mark: usize)
-pub fn ferx_core::sens::num::PkNum::val(self) -> f64
+pub fn ferx_core::sens::num::PkNum::value_only(self) -> Self
 pub fn ferx_core::sens::num::PkNum::var(x: f64, dim: usize) -> Self
-pub fn ferx_core::sens::num::PkNum::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
 impl ferx_core::sens::num::PkNum for f64
-pub const f64::ETA_HESSIAN: bool
-pub const f64::FUSED_FOLDS: bool
 pub const f64::JET_ORDER: usize
+pub const f64::RECORDS_BRANCHES: bool
 pub const f64::SECOND_ORDER: bool
 pub const f64::TAYLOR2_EXACT: bool
-pub const f64::WORK: usize
 pub fn f64::abs(self) -> Self
 pub fn f64::acos(self) -> Self
-pub fn f64::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
-pub fn f64::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
+pub fn f64::br_abs_lt(self, tol: f64) -> bool
+pub fn f64::br_absdiff_lt(self, other: Self, tol: f64) -> bool
+pub fn f64::br_cmp(self, cc: ferx_core::sens::num::BranchCmp, other: Self) -> bool
+pub fn f64::br_cmp_c(self, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn f64::br_floor_div(self, step: f64) -> f64
+pub fn f64::br_is_nan(self) -> bool
+pub fn f64::br_shift_cmp(self, base: f64, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
 pub fn f64::cos(self) -> Self
-pub fn f64::detach(self) -> Self
-pub fn f64::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
-pub fn f64::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
-pub fn f64::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
 pub fn f64::exp(self) -> Self
+pub fn f64::exprel(self, _orders: usize) -> Self
 pub fn f64::from_f64(x: f64) -> Self
+pub fn f64::gamma_pq(self, x: Self, upper: bool) -> Self
 pub fn f64::guard_floor(self, lo: f64) -> Self
+pub fn f64::host(f: ferx_core::sens::num::HostFn, args: &[Self]) -> alloc::vec::Vec<Self>
 pub fn f64::inv_logit(self) -> Self
 pub fn f64::is_constant(self) -> bool
-pub fn f64::is_taped(self) -> bool
+pub fn f64::jet_k(self, f: ferx_core::sens::num::JetFn, k: u8) -> Self
 pub fn f64::jet_max_abs(self) -> f64
+pub fn f64::jet_unary(self, f: ferx_core::sens::num::JetFn) -> Self
 pub fn f64::jets_finite(self) -> bool
 pub fn f64::lift2(self, v: f64, _d1: f64, _d2: f64) -> Self
 pub fn f64::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
 pub fn f64::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
-pub fn f64::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
 pub fn f64::ln(self) -> Self
 pub fn f64::ln_gamma(self) -> Self
 pub fn f64::logit(self) -> Self
-pub fn f64::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
-pub fn f64::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
+pub fn f64::nonrec_val(self) -> core::option::Option<f64>
 pub fn f64::pow(self, e: Self) -> Self
 pub fn f64::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
-pub fn f64::scaled_diff(a: Self, b: Self, s: f64) -> Self
+pub fn f64::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
+pub fn f64::sin(self) -> Self
 pub fn f64::sqrt(self) -> Self
-pub fn f64::tape_mark() -> usize
-pub fn f64::tape_rollback(_mark: usize)
-pub fn f64::val(self) -> f64
+pub fn f64::value_only(self) -> Self
 pub fn f64::var(x: f64, _dim: usize) -> Self
-pub fn f64::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
-impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual1::Dual1<N>
-pub const ferx_core::sens::dual1::Dual1<N>::ETA_HESSIAN: bool
-pub const ferx_core::sens::dual1::Dual1<N>::FUSED_FOLDS: bool
-pub const ferx_core::sens::dual1::Dual1<N>::JET_ORDER: usize
-pub const ferx_core::sens::dual1::Dual1<N>::SECOND_ORDER: bool
-pub const ferx_core::sens::dual1::Dual1<N>::TAYLOR2_EXACT: bool
-pub const ferx_core::sens::dual1::Dual1<N>::WORK: usize
-pub fn ferx_core::sens::dual1::Dual1<N>::abs(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::acos(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::cos(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::detach(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::exp(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::from_f64(x: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::guard_floor(self, lo: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::inv_logit(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::is_constant(self) -> bool
-pub fn ferx_core::sens::dual1::Dual1<N>::is_taped(self) -> bool
-pub fn ferx_core::sens::dual1::Dual1<N>::jet_max_abs(self) -> f64
-pub fn ferx_core::sens::dual1::Dual1<N>::jets_finite(self) -> bool
-pub fn ferx_core::sens::dual1::Dual1<N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::ln(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::ln_gamma(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::logit(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
-pub fn ferx_core::sens::dual1::Dual1<N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
-pub fn ferx_core::sens::dual1::Dual1<N>::pow(self, e: Self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
-pub fn ferx_core::sens::dual1::Dual1<N>::scaled_diff(a: Self, b: Self, s: f64) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::tape_mark() -> usize
-pub fn ferx_core::sens::dual1::Dual1<N>::tape_rollback(_mark: usize)
-pub fn ferx_core::sens::dual1::Dual1<N>::val(self) -> f64
-pub fn ferx_core::sens::dual1::Dual1<N>::var(x: f64, dim: usize) -> Self
-pub fn ferx_core::sens::dual1::Dual1<N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
-impl<const NA: usize, const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual_mixed::DualMixed<NA, N>
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::ETA_HESSIAN: bool
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::FUSED_FOLDS: bool
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::JET_ORDER: usize
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::SECOND_ORDER: bool
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::TAYLOR2_EXACT: bool
-pub const ferx_core::sens::dual_mixed::DualMixed<NA, N>::WORK: usize
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::abs(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::acos(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::axpy_fold(acc: Self, terms: &[(Self, f64)]) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::caxpy_fold(acc: Self, terms: &[(f64, Self)]) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::cos(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::detach(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot2(x1: Self, y1: Self, x2: Self, y2: Self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot4(x1: Self, y1: Self, x2: Self, y2: Self, x3: Self, y3: Self, x4: Self, y4: Self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::dot_fold(acc: Self, pairs: &[(Self, Self)]) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::exp(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::from_f64(x: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::guard_floor(self, lo: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::inv_logit(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::is_constant(self) -> bool
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::is_taped(self) -> bool
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jet_max_abs(self) -> f64
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::jets_finite(self) -> bool
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lincomb(u: Self, h: f64, cs: &[f64], ks: &[Self]) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::ln_gamma(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::logit(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_factor_hook(_m: &mut [Self], _piv: &mut [usize], _n: usize) -> core::option::Option<bool>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::lu_solve_hook(_m: &[Self], _piv: &[usize], _n: usize, _b: &mut [Self]) -> bool
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::pow(self, e: Self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::scaled_diff(a: Self, b: Self, s: f64) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::sqrt(self) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_mark() -> usize
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::tape_rollback(_mark: usize)
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::val(self) -> f64
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::var(x: f64, dim: usize) -> Self
-pub fn ferx_core::sens::dual_mixed::DualMixed<NA, N>::wsum3(base: f64, terms: impl core::iter::traits::iterator::Iterator<Item = (Self, Self, Self)>) -> Self
+impl<const N: usize> ferx_core::sens::num::PkNum for ferx_core::sens::dual2::Dual2<N>
+pub const ferx_core::sens::dual2::Dual2<N>::JET_ORDER: usize
+pub const ferx_core::sens::dual2::Dual2<N>::RECORDS_BRANCHES: bool
+pub const ferx_core::sens::dual2::Dual2<N>::SECOND_ORDER: bool
+pub const ferx_core::sens::dual2::Dual2<N>::TAYLOR2_EXACT: bool
+pub fn ferx_core::sens::dual2::Dual2<N>::abs(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::acos(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::br_abs_lt(self, tol: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_absdiff_lt(self, other: Self, tol: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_cmp(self, cc: ferx_core::sens::num::BranchCmp, other: Self) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_cmp_c(self, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_floor_div(self, step: f64) -> f64
+pub fn ferx_core::sens::dual2::Dual2<N>::br_is_nan(self) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::br_shift_cmp(self, base: f64, cc: ferx_core::sens::num::BranchCmp, c: f64) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::cos(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::exp(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::exprel(self, orders: usize) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::from_f64(x: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::gamma_pq(self, x: Self, upper: bool) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::guard_floor(self, lo: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::host(f: ferx_core::sens::num::HostFn, args: &[Self]) -> alloc::vec::Vec<Self>
+pub fn ferx_core::sens::dual2::Dual2<N>::inv_logit(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::is_constant(self) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::jet_k(self, f: ferx_core::sens::num::JetFn, k: u8) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::jet_max_abs(self) -> f64
+pub fn ferx_core::sens::dual2::Dual2<N>::jet_unary(self, f: ferx_core::sens::num::JetFn) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::jets_finite(self) -> bool
+pub fn ferx_core::sens::dual2::Dual2<N>::lift2(self, v: f64, d1: f64, d2: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::lift3(self, v: f64, d1: f64, d2: f64, _d3: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::lift4(self, v: f64, d1: f64, d2: f64, d3: f64, _d4: f64) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::ln(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::ln_gamma(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::logit(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::nonrec_val(self) -> core::option::Option<f64>
+pub fn ferx_core::sens::dual2::Dual2<N>::pow(self, e: Self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::same_bits_untaped(&self, other: &Self) -> core::option::Option<bool>
+pub fn ferx_core::sens::dual2::Dual2<N>::select_if(cc: ferx_core::sens::num::BranchCmp, x: Self, y: Self, a: Self, b: Self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::sin(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::sqrt(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::value_only(self) -> Self
+pub fn ferx_core::sens::dual2::Dual2<N>::var(x: f64, dim: usize) -> Self
 pub mod ferx_core::sens::ode_provider
 pub mod ferx_core::sens::one_cpt
-pub fn ferx_core::sens::one_cpt::iv_bolus_sens(amt: f64, t: f64, cl: f64, v: f64) -> (f64, [f64; 2], [[f64; 2]; 2])
 pub fn ferx_core::sens::one_cpt::one_cpt_conc_g<T: ferx_core::sens::num::PkNum>(dose: &ferx_core::DoseEvent, t: T, cl: T, v: T, ka: T, f_bio: T, oral: bool) -> T
 pub fn ferx_core::sens::one_cpt::one_cpt_ig_amt_g<T: ferx_core::sens::num::PkNum>(amt: T, t: T, cl: T, v: T, mat: T, cv2: T, f_bio: T) -> T
 pub fn ferx_core::sens::one_cpt::one_cpt_ig_conc_g<T: ferx_core::sens::num::PkNum>(dose: &ferx_core::DoseEvent, t: T, cl: T, v: T, mat: T, cv2: T, f_bio: T) -> T
@@ -2182,7 +2126,6 @@ pub fn ferx_core::sens::one_cpt::one_cpt_transit_amt_g<T: ferx_core::sens::num::
 pub fn ferx_core::sens::one_cpt::one_cpt_transit_conc_g<T: ferx_core::sens::num::PkNum>(dose: &ferx_core::DoseEvent, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T
 pub fn ferx_core::sens::one_cpt::one_cpt_transit_g<T: ferx_core::sens::num::PkNum>(amt: f64, t: T, cl: T, v: T, n: T, mtt: T, f_bio: T) -> T
 pub fn ferx_core::sens::one_cpt::one_cpt_zero_order_g<T: ferx_core::sens::num::PkNum>(amt: f64, t: T, cl: T, v: T, dur: T, f_bio: T) -> T
-pub fn ferx_core::sens::one_cpt::oral_sens(amt: f64, t: f64, cl: f64, v: f64, ka: f64, f_bio: f64) -> (f64, [f64; 4], [[f64; 4]; 4])
 pub mod ferx_core::sens::propagate
 pub struct ferx_core::sens::propagate::EigenCacheG
 impl ferx_core::sens::propagate::EigenCacheG
@@ -2245,7 +2188,6 @@ pub struct ferx_core::sens::provider::ObsGrad
 pub ferx_core::sens::provider::ObsGrad::df_deta: alloc::vec::Vec<f64>
 pub ferx_core::sens::provider::ObsGrad::f: f64
 pub fn ferx_core::sens::provider::analytic_outer_gradient_available(model: &ferx_core::CompiledModel) -> bool
-pub fn ferx_core::sens::provider::analytic_outer_gradient_for_interaction(model: &ferx_core::CompiledModel, interaction: bool) -> bool
 pub fn ferx_core::sens::provider::subject_eta_grad(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<alloc::vec::Vec<ferx_core::sens::provider::ObsGrad>>
 pub fn ferx_core::sens::provider::subject_eta_jacobian(model: &ferx_core::CompiledModel, subject: &ferx_core::Subject, theta: &[f64], eta: &[f64]) -> core::option::Option<alloc::vec::Vec<f64>>
 pub mod ferx_core::sens::three_cpt
@@ -2295,6 +2237,9 @@ pub ferx_core::sim::adaptive::Comparison::Ge
 pub ferx_core::sim::adaptive::Comparison::Gt
 pub ferx_core::sim::adaptive::Comparison::Le
 pub ferx_core::sim::adaptive::Comparison::Lt
+#[non_exhaustive] pub enum ferx_core::sim::adaptive::DecisionCovariates
+pub ferx_core::sim::adaptive::DecisionCovariates::Locf
+pub ferx_core::sim::adaptive::DecisionCovariates::Nocb
 #[non_exhaustive] pub enum ferx_core::sim::adaptive::DecisionOutcome
 pub ferx_core::sim::adaptive::DecisionOutcome::Dosed
 pub ferx_core::sim::adaptive::DecisionOutcome::Dosed::n: usize
@@ -2348,6 +2293,7 @@ pub ferx_core::sim::adaptive::AdaptiveDosingSpec::assay_cmt: core::option::Optio
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::confirm: u32
+pub ferx_core::sim::adaptive::AdaptiveDosingSpec::decision_covariates: ferx_core::sim::adaptive::DecisionCovariates
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::dose_knowledge: ferx_core::sim::adaptive::DoseKnowledge
 pub ferx_core::sim::adaptive::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
@@ -2450,9 +2396,15 @@ pub ferx_core::stats::km::KmInputError::BadProbs::probs: [f64; 3]
 pub ferx_core::stats::km::KmInputError::BadTime
 pub ferx_core::stats::km::KmInputError::BadTime::index: usize
 pub ferx_core::stats::km::KmInputError::BadTime::value: f64
+pub ferx_core::stats::km::KmInputError::BadValue
+pub ferx_core::stats::km::KmInputError::BadValue::index: usize
+pub ferx_core::stats::km::KmInputError::BadValue::value: f64
 pub ferx_core::stats::km::KmInputError::LengthMismatch
 pub ferx_core::stats::km::KmInputError::LengthMismatch::events: usize
 pub ferx_core::stats::km::KmInputError::LengthMismatch::times: usize
+pub ferx_core::stats::km::KmInputError::ValueLengthMismatch
+pub ferx_core::stats::km::KmInputError::ValueLengthMismatch::times: usize
+pub ferx_core::stats::km::KmInputError::ValueLengthMismatch::values: usize
 impl core::error::Error for ferx_core::stats::km::KmInputError
 impl core::fmt::Display for ferx_core::stats::km::KmInputError
 pub fn ferx_core::stats::km::KmInputError::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
@@ -2477,6 +2429,14 @@ pub ferx_core::stats::km::KmCurve::surv: alloc::vec::Vec<f64>
 pub ferx_core::stats::km::KmCurve::time: alloc::vec::Vec<f64>
 impl ferx_core::stats::km::KmCurve
 pub fn ferx_core::stats::km::KmCurve::at(&self, t: f64) -> core::option::Option<f64>
+pub struct ferx_core::stats::km::KmmcCurve
+pub ferx_core::stats::km::KmmcCurve::mean: alloc::vec::Vec<f64>
+pub ferx_core::stats::km::KmmcCurve::n_censor: alloc::vec::Vec<usize>
+pub ferx_core::stats::km::KmmcCurve::n_event: alloc::vec::Vec<usize>
+pub ferx_core::stats::km::KmmcCurve::n_risk: alloc::vec::Vec<usize>
+pub ferx_core::stats::km::KmmcCurve::time: alloc::vec::Vec<f64>
+impl ferx_core::stats::km::KmmcCurve
+pub fn ferx_core::stats::km::KmmcCurve::at(&self, t: f64, min_at_risk: usize) -> core::option::Option<f64>
 pub struct ferx_core::stats::km::McfCurve
 pub ferx_core::stats::km::McfCurve::mcf: alloc::vec::Vec<f64>
 pub ferx_core::stats::km::McfCurve::n_event: alloc::vec::Vec<usize>
@@ -2490,10 +2450,12 @@ pub ferx_core::stats::km::VpcBand::lo: alloc::vec::Vec<core::option::Option<f64>
 pub ferx_core::stats::km::VpcBand::med: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::stats::km::VpcBand::n_used: alloc::vec::Vec<usize>
 pub fn ferx_core::stats::km::kaplan_meier(times: &[f64], events: &[bool]) -> core::result::Result<ferx_core::stats::km::KmCurve, ferx_core::stats::km::KmInputError>
+pub fn ferx_core::stats::km::kaplan_meier_mean_covariate(times: &[f64], events: &[bool], values: &[f64]) -> core::result::Result<ferx_core::stats::km::KmmcCurve, ferx_core::stats::km::KmInputError>
 pub fn ferx_core::stats::km::mean_cumulative(event_times: &[f64], follow_up_ends: &[f64]) -> core::result::Result<ferx_core::stats::km::McfCurve, ferx_core::stats::km::McfInputError>
 pub fn ferx_core::stats::km::min_curves_for(probs: [f64; 3]) -> usize
 pub fn ferx_core::stats::km::probs_valid(probs: [f64; 3]) -> bool
 pub fn ferx_core::stats::km::vpc_band(curves: &[ferx_core::stats::km::KmCurve], grid: &[f64], probs: [f64; 3]) -> core::result::Result<ferx_core::stats::km::VpcBand, ferx_core::stats::km::KmInputError>
+pub fn ferx_core::stats::km::vpc_band_kmmc(curves: &[ferx_core::stats::km::KmmcCurve], grid: &[f64], probs: [f64; 3], min_at_risk: usize) -> core::result::Result<ferx_core::stats::km::VpcBand, ferx_core::stats::km::KmInputError>
 pub fn ferx_core::stats::km::vpc_band_mcf(curves: &[ferx_core::stats::km::McfCurve], grid: &[f64], probs: [f64; 3]) -> core::result::Result<ferx_core::stats::km::VpcBand, ferx_core::stats::km::KmInputError>
 pub mod ferx_core::stats::likelihood
 pub fn ferx_core::stats::likelihood::apply_frem_r_overrides(r_diag: &mut [f64], overrides: &[core::option::Option<f64>])
@@ -2522,8 +2484,15 @@ pub ferx_core::stats::npde::SubjectNpde::epred: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::npd: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::npde: alloc::vec::Vec<f64>
 pub ferx_core::stats::npde::SubjectNpde::pwres: alloc::vec::Vec<f64>
+pub struct ferx_core::stats::npde::TteNpde
+pub ferx_core::stats::npde::TteNpde::cmt: usize
+pub ferx_core::stats::npde::TteNpde::imputed: bool
+pub ferx_core::stats::npde::TteNpde::npde: f64
+pub ferx_core::stats::npde::TteNpde::pd: f64
+pub ferx_core::stats::npde::TteNpde::time: f64
 pub fn ferx_core::stats::npde::compute_npde_npd(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::compute_npde_npd_diag(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<(alloc::vec::Vec<ferx_core::stats::npde::SubjectNpde>, alloc::vec::Vec<alloc::string::String>), ferx_core::diagnostics::EngineError>
+pub fn ferx_core::stats::npde::compute_tte_npde(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, nsim: usize, seed: core::option::Option<u64>, iov_occasion: core::option::Option<&ferx_core::IovOccasionRule>) -> core::result::Result<(alloc::vec::Vec<alloc::vec::Vec<ferx_core::stats::npde::TteNpde>>, alloc::vec::Vec<alloc::string::String>), ferx_core::diagnostics::EngineError>
 pub fn ferx_core::stats::npde::effective_seed(seed: core::option::Option<u64>) -> u64
 pub mod ferx_core::stats::residual_error
 pub fn ferx_core::stats::residual_error::compute_d2r_df2_matrices(error_spec: &ferx_core::ErrorSpec, ipreds: &[f64], obs_cmts: &[usize], obs_times: &[f64], obs_raw_times: &[f64], occasions: &[u32], obs_l2: &[i64], sigma_values: &[f64], correlations: &[ferx_core::ResidualCorrelation], mult: core::option::Option<&[alloc::vec::Vec<f64>]>) -> alloc::vec::Vec<alloc::vec::Vec<nalgebra::base::alias::DMatrix<f64>>>
@@ -2582,7 +2551,6 @@ pub fn ferx_core::survival::MonoTol::from_solver(opts: &ferx_core::ode::OdeSolve
 impl core::default::Default for ferx_core::survival::MonoTol
 pub fn ferx_core::survival::MonoTol::default() -> Self
 pub fn ferx_core::survival::cum_hazard(family: ferx_core::HazardFamily, t: f64, params: &[f64]) -> f64
-pub fn ferx_core::survival::data_term_hessian_fd(eval: impl core::ops::function::Fn(&[f64]) -> f64, eta_hat: &[f64], eps: &[f64]) -> nalgebra::base::alias::DMatrix<f64>
 pub fn ferx_core::survival::hazard_and_cum_hazard(family: ferx_core::HazardFamily, t: f64, params: &[f64]) -> (f64, f64)
 pub fn ferx_core::survival::mean_survival(family: ferx_core::HazardFamily, params: &[f64]) -> f64
 pub fn ferx_core::survival::median_survival(family: ferx_core::HazardFamily, params: &[f64]) -> f64
@@ -2875,7 +2843,7 @@ pub ferx_core::types::Optimizer::Slsqp
 pub ferx_core::types::Optimizer::TrustRegion
 impl ferx_core::Optimizer
 pub fn ferx_core::Optimizer::label(self) -> &'static str
-pub fn ferx_core::Optimizer::resolve_auto(self, model: &ferx_core::CompiledModel, interaction: bool) -> ferx_core::Optimizer
+pub fn ferx_core::Optimizer::resolve_auto(self, model: &ferx_core::CompiledModel) -> ferx_core::Optimizer
 pub enum ferx_core::types::ParameterKind
 pub ferx_core::types::ParameterKind::Kappa
 pub ferx_core::types::ParameterKind::Omega
@@ -3130,6 +3098,7 @@ pub ferx_core::types::CompiledModel::pk_idx_f64: alloc::vec::Vec<f64>
 pub ferx_core::types::CompiledModel::pk_indices: alloc::vec::Vec<usize>
 pub ferx_core::types::CompiledModel::pk_model: ferx_core::PkModel
 pub ferx_core::types::CompiledModel::pk_param_fn: ferx_core::PkParamFn
+pub ferx_core::types::CompiledModel::plan_id: ferx_core::PlanId
 pub ferx_core::types::CompiledModel::prior_from_fit: core::option::Option<alloc::string::String>
 pub ferx_core::types::CompiledModel::priors: alloc::vec::Vec<ferx_core::ParameterPrior>
 pub ferx_core::types::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
@@ -3821,6 +3790,15 @@ pub fn ferx_core::PkParams::v2(&self) -> f64
 pub fn ferx_core::PkParams::v3(&self) -> f64
 impl core::default::Default for ferx_core::PkParams
 pub fn ferx_core::PkParams::default() -> Self
+pub struct ferx_core::types::PlanId(_)
+impl ferx_core::PlanId
+pub fn ferx_core::PlanId::new() -> Self
+impl core::clone::Clone for ferx_core::PlanId
+pub fn ferx_core::PlanId::clone(&self) -> Self
+impl core::default::Default for ferx_core::PlanId
+pub fn ferx_core::PlanId::default() -> Self
+impl core::ops::drop::Drop for ferx_core::PlanId
+pub fn ferx_core::PlanId::drop(&mut self)
 pub struct ferx_core::types::Population
 pub ferx_core::types::Population::covariate_names: alloc::vec::Vec<alloc::string::String>
 pub ferx_core::types::Population::dv_column: alloc::string::String
@@ -3981,6 +3959,7 @@ pub ferx_core::types::TteObsDiagnostic::coxsnell: f64
 pub ferx_core::types::TteObsDiagnostic::deviance: f64
 pub ferx_core::types::TteObsDiagnostic::dv: f64
 pub ferx_core::types::TteObsDiagnostic::martingale: f64
+pub ferx_core::types::TteObsDiagnostic::npde: f64
 pub ferx_core::types::TteObsDiagnostic::pit: f64
 pub ferx_core::types::TteObsDiagnostic::time: f64
 #[non_exhaustive] pub struct ferx_core::types::ViResult
@@ -4386,7 +4365,7 @@ pub ferx_core::Optimizer::Slsqp
 pub ferx_core::Optimizer::TrustRegion
 impl ferx_core::Optimizer
 pub fn ferx_core::Optimizer::label(self) -> &'static str
-pub fn ferx_core::Optimizer::resolve_auto(self, model: &ferx_core::CompiledModel, interaction: bool) -> ferx_core::Optimizer
+pub fn ferx_core::Optimizer::resolve_auto(self, model: &ferx_core::CompiledModel) -> ferx_core::Optimizer
 pub enum ferx_core::ParameterKind
 pub ferx_core::ParameterKind::Kappa
 pub ferx_core::ParameterKind::Omega
@@ -4589,6 +4568,7 @@ pub ferx_core::AdaptiveDosingSpec::assay_cmt: core::option::Option<usize>
 pub ferx_core::AdaptiveDosingSpec::at: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveDosingSpec::auc_target: core::option::Option<(f64, f64)>
 pub ferx_core::AdaptiveDosingSpec::confirm: u32
+pub ferx_core::AdaptiveDosingSpec::decision_covariates: ferx_core::sim::adaptive::DecisionCovariates
 pub ferx_core::AdaptiveDosingSpec::dose_bounds: (ferx_core::sim::adaptive::DoseValue, ferx_core::sim::adaptive::DoseValue)
 pub ferx_core::AdaptiveDosingSpec::dose_knowledge: ferx_core::sim::adaptive::DoseKnowledge
 pub ferx_core::AdaptiveDosingSpec::intervals: core::option::Option<alloc::vec::Vec<f64>>
@@ -4611,6 +4591,7 @@ pub ferx_core::AdaptiveInputs::unmatched: ferx_core::UnmatchedSubjects
 impl<'a> ferx_core::AdaptiveInputs<'a>
 pub fn ferx_core::AdaptiveInputs<'a>::new(params: &'a ferx_core::ModelParameters) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_etas(self, etas: &'a ferx_core::SuppliedEtas) -> Self
+pub fn ferx_core::AdaptiveInputs<'a>::with_uncertainty(self, fit: &'a ferx_core::FitResult, spec: ferx_core::UncertaintySpec) -> Self
 pub fn ferx_core::AdaptiveInputs<'a>::with_unmatched(self, policy: ferx_core::UnmatchedSubjects) -> Self
 #[non_exhaustive] pub struct ferx_core::AdaptiveRule
 pub ferx_core::AdaptiveRule::action: ferx_core::sim::adaptive::AdaptiveAction
@@ -4618,6 +4599,7 @@ pub ferx_core::AdaptiveRule::interval: core::option::Option<ferx_core::sim::adap
 pub ferx_core::AdaptiveRule::op: ferx_core::sim::adaptive::Comparison
 pub ferx_core::AdaptiveRule::threshold: f64
 #[non_exhaustive] pub struct ferx_core::AdaptiveSimulateOptions
+pub ferx_core::AdaptiveSimulateOptions::decision_covariates: core::option::Option<ferx_core::sim::adaptive::DecisionCovariates>
 pub ferx_core::AdaptiveSimulateOptions::decision_times: alloc::vec::Vec<f64>
 pub ferx_core::AdaptiveSimulateOptions::max_decisions: usize
 pub ferx_core::AdaptiveSimulateOptions::monitors: alloc::vec::Vec<ferx_core::sim::adaptive::MonitorSpec>
@@ -4630,6 +4612,7 @@ pub fn ferx_core::AdaptiveSimulateOptions::default() -> Self
 pub ferx_core::AdaptiveSimulationResult::decisions: alloc::vec::Vec<ferx_core::sim::adaptive::DecisionLogEntry>
 pub ferx_core::AdaptiveSimulationResult::ledger: alloc::vec::Vec<ferx_core::sim::adaptive::DoseLedgerEntry>
 pub ferx_core::AdaptiveSimulationResult::metrics: alloc::vec::Vec<ferx_core::sim::adaptive::AdaptiveSubjectMetrics>
+pub ferx_core::AdaptiveSimulationResult::parameters: alloc::vec::Vec<ferx_core::DrawnParameters>
 pub ferx_core::AdaptiveSimulationResult::trajectories: alloc::vec::Vec<ferx_core::SimulationResult>
 pub ferx_core::AdaptiveSimulationResult::warnings: alloc::vec::Vec<alloc::string::String>
 #[non_exhaustive] pub struct ferx_core::AdaptiveSubjectMetrics
@@ -4745,6 +4728,7 @@ pub ferx_core::CompiledModel::pk_idx_f64: alloc::vec::Vec<f64>
 pub ferx_core::CompiledModel::pk_indices: alloc::vec::Vec<usize>
 pub ferx_core::CompiledModel::pk_model: ferx_core::PkModel
 pub ferx_core::CompiledModel::pk_param_fn: ferx_core::PkParamFn
+pub ferx_core::CompiledModel::plan_id: ferx_core::PlanId
 pub ferx_core::CompiledModel::prior_from_fit: core::option::Option<alloc::string::String>
 pub ferx_core::CompiledModel::priors: alloc::vec::Vec<ferx_core::ParameterPrior>
 pub ferx_core::CompiledModel::referenced_covariates: alloc::vec::Vec<alloc::string::String>
@@ -4987,6 +4971,9 @@ pub ferx_core::DoseLedgerEntry::rule_fired: alloc::string::String
 pub ferx_core::DoseLedgerEntry::sim: usize
 pub ferx_core::DoseLedgerEntry::subject: alloc::string::String
 pub ferx_core::DoseLedgerEntry::time: f64
+#[non_exhaustive] pub struct ferx_core::DrawnParameters
+pub ferx_core::DrawnParameters::draw: usize
+pub ferx_core::DrawnParameters::parameters: ferx_core::ModelParameters
 pub struct ferx_core::EndpointError
 pub ferx_core::EndpointError::error_model: ferx_core::ErrorModel
 pub ferx_core::EndpointError::sigma_idx: alloc::vec::Vec<usize>
@@ -5405,6 +5392,28 @@ pub ferx_core::KappaWeight::eval: ferx_core::KappaWeightFn
 pub ferx_core::KappaWeight::expr: alloc::string::String
 impl core::fmt::Debug for ferx_core::KappaWeight
 pub fn ferx_core::KappaWeight::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct ferx_core::KmmcVpc
+pub ferx_core::KmmcVpc::censoring: ferx_core::VpcCensoring
+pub ferx_core::KmmcVpc::cmt: usize
+pub ferx_core::KmmcVpc::covariate: alloc::string::String
+pub ferx_core::KmmcVpc::horizon: f64
+pub ferx_core::KmmcVpc::level: core::option::Option<f64>
+pub ferx_core::KmmcVpc::min_at_risk: usize
+pub ferx_core::KmmcVpc::n_sim: usize
+pub ferx_core::KmmcVpc::probs: [f64; 3]
+pub ferx_core::KmmcVpc::strata: alloc::vec::Vec<ferx_core::KmmcVpcStratum>
+pub ferx_core::KmmcVpc::warnings: alloc::vec::Vec<alloc::string::String>
+pub struct ferx_core::KmmcVpcStratum
+pub ferx_core::KmmcVpcStratum::grid: alloc::vec::Vec<f64>
+pub ferx_core::KmmcVpcStratum::hi: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::KmmcVpcStratum::label: alloc::string::String
+pub ferx_core::KmmcVpcStratum::lo: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::KmmcVpcStratum::med: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::KmmcVpcStratum::n_subjects: usize
+pub ferx_core::KmmcVpcStratum::n_used: alloc::vec::Vec<usize>
+pub ferx_core::KmmcVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
+pub ferx_core::KmmcVpcStratum::observed: ferx_core::stats::km::KmmcCurve
+pub ferx_core::KmmcVpcStratum::value: core::option::Option<f64>
 pub struct ferx_core::LevelGroupEbe
 pub ferx_core::LevelGroupEbe::kappa: alloc::vec::Vec<f64>
 pub ferx_core::LevelGroupEbe::labels: alloc::vec::Vec<f64>
@@ -5547,6 +5556,15 @@ pub fn ferx_core::PkParams::v2(&self) -> f64
 pub fn ferx_core::PkParams::v3(&self) -> f64
 impl core::default::Default for ferx_core::PkParams
 pub fn ferx_core::PkParams::default() -> Self
+pub struct ferx_core::PlanId(_)
+impl ferx_core::PlanId
+pub fn ferx_core::PlanId::new() -> Self
+impl core::clone::Clone for ferx_core::PlanId
+pub fn ferx_core::PlanId::clone(&self) -> Self
+impl core::default::Default for ferx_core::PlanId
+pub fn ferx_core::PlanId::default() -> Self
+impl core::ops::drop::Drop for ferx_core::PlanId
+pub fn ferx_core::PlanId::drop(&mut self)
 pub struct ferx_core::PoolPlan
 impl ferx_core::PoolPlan
 pub fn ferx_core::PoolPlan::apply_to(&self, options: &mut ferx_core::FitOptions)
@@ -5883,6 +5901,7 @@ pub ferx_core::TteObsDiagnostic::coxsnell: f64
 pub ferx_core::TteObsDiagnostic::deviance: f64
 pub ferx_core::TteObsDiagnostic::dv: f64
 pub ferx_core::TteObsDiagnostic::martingale: f64
+pub ferx_core::TteObsDiagnostic::npde: f64
 pub ferx_core::TteObsDiagnostic::pit: f64
 pub ferx_core::TteObsDiagnostic::time: f64
 pub struct ferx_core::TteVpc
@@ -5904,6 +5923,9 @@ pub ferx_core::TteVpcStratum::n_used: alloc::vec::Vec<usize>
 pub ferx_core::TteVpcStratum::obs_on_grid: alloc::vec::Vec<core::option::Option<f64>>
 pub ferx_core::TteVpcStratum::observed: ferx_core::stats::km::KmCurve
 pub ferx_core::TteVpcStratum::value: core::option::Option<f64>
+pub struct ferx_core::UncertaintySpec
+pub ferx_core::UncertaintySpec::method: ferx_core::estimation::uncertainty_samples::UncertaintyMethod
+pub ferx_core::UncertaintySpec::n_draws: usize
 #[non_exhaustive] pub struct ferx_core::ViResult
 pub ferx_core::ViResult::converged: bool
 pub ferx_core::ViResult::data_term: f64
@@ -5922,6 +5944,15 @@ pub ferx_core::ViResult::n_mc_samples: usize
 pub ferx_core::ViResult::neg_two_elbo: f64
 pub ferx_core::ViResult::objective_trace: alloc::vec::Vec<f64>
 pub ferx_core::ViResult::superseded_by: core::option::Option<alloc::string::String>
+#[non_exhaustive] pub struct ferx_core::VpcKmmcOptions
+pub ferx_core::VpcKmmcOptions::covariate: alloc::string::String
+pub ferx_core::VpcKmmcOptions::level: core::option::Option<f64>
+pub ferx_core::VpcKmmcOptions::min_at_risk: usize
+pub ferx_core::VpcKmmcOptions::vpc: ferx_core::VpcTteOptions
+impl ferx_core::VpcKmmcOptions
+pub fn ferx_core::VpcKmmcOptions::new(covariate: impl core::convert::Into<alloc::string::String>) -> Self
+impl core::default::Default for ferx_core::VpcKmmcOptions
+pub fn ferx_core::VpcKmmcOptions::default() -> Self
 pub struct ferx_core::VpcRtteOptions
 pub ferx_core::VpcRtteOptions::censoring: ferx_core::VpcCensoring
 pub ferx_core::VpcRtteOptions::cmt: core::option::Option<usize>
@@ -6032,6 +6063,7 @@ pub fn ferx_core::theta_level_map(model: &ferx_core::CompiledModel) -> std::coll
 pub fn ferx_core::theta_level_values(model: &ferx_core::CompiledModel, theta: &[f64], covariance: core::option::Option<&nalgebra::base::alias::DMatrix<f64>>, sir_resamples_packed: core::option::Option<&[alloc::vec::Vec<f64>]>) -> core::result::Result<std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<ferx_core::api::ThetaLevelValue>>, alloc::string::String>
 pub fn ferx_core::validate_model_file(model_path: &str, data_path: core::option::Option<&str>) -> ferx_core::diagnostics::CheckReport
 pub fn ferx_core::validate_model_file_with(model_path: &str, data_path: core::option::Option<&str>, overrides: &[(alloc::string::String, alloc::string::String)]) -> ferx_core::diagnostics::CheckReport
+pub fn ferx_core::vpc_kmmc(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcKmmcOptions) -> core::result::Result<ferx_core::KmmcVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_rtte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcRtteOptions) -> core::result::Result<ferx_core::RtteVpc, ferx_core::diagnostics::EngineError>
 pub fn ferx_core::vpc_tte(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, opts: &ferx_core::VpcTteOptions) -> core::result::Result<ferx_core::TteVpc, ferx_core::diagnostics::EngineError>
 pub type ferx_core::DerivedEvalFn = alloc::boxed::Box<(dyn core::ops::function::Fn(&ferx_core::DerivedContext<'_>) -> f64 + core::marker::Send + core::marker::Sync)>

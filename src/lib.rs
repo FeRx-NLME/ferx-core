@@ -3,6 +3,7 @@ pub mod build_info;
 pub mod cancel;
 #[cfg(feature = "survival")]
 pub mod categorical;
+pub(crate) mod cold_sort;
 pub mod diagnostics;
 pub(crate) mod dosing;
 pub mod edit;
@@ -15,6 +16,7 @@ pub mod markov;
 pub mod model_selection;
 pub mod nn;
 pub mod ode;
+pub(crate) mod par;
 pub mod parser;
 pub mod pk;
 pub mod propensity_match;
@@ -42,9 +44,10 @@ pub use api::{
     simulate_with_options_diag, simulate_with_seed, simulate_with_uncertainty,
     simulate_with_uncertainty_diag, theta_level_map, theta_level_values, validate_model_file,
     validate_model_file_with, AdaptiveInputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
-    PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings, RunOverrides,
-    SimulateOptions, SimulateUncertaintyOptions, SimulatedParameters, SimulatedSubjectParameters,
-    SimulationOutput, SimulationResult, SuppliedEtas, UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
+    DrawnParameters, PoolPlan, PredictionOutput, PredictionResult, PreparedRun, ReaderSettings,
+    RunOverrides, SimulateOptions, SimulateUncertaintyOptions, SimulatedParameters,
+    SimulatedSubjectParameters, SimulationOutput, SimulationResult, SuppliedEtas, UncertaintySpec,
+    UnmatchedSubjects, FIT_RAYON_STACK_SIZE,
 };
 pub use cancel::CancelFlag;
 pub use diagnostics::{CheckReport, Diagnostic, EngineError, Severity};
@@ -83,6 +86,9 @@ pub use api::{
     predict_categorical, predict_survival, predict_survival_at_etas_diag, predict_survival_diag,
     SurvivalPredictionOutput, SurvivalPredictionResult,
 };
+// Kaplan–Meier mean covariate VPC of a single-event TTE endpoint (#1886).
+#[cfg(feature = "survival")]
+pub use api::{vpc_kmmc, KmmcVpc, KmmcVpcStratum, VpcKmmcOptions};
 // VPC of a repeated-events endpoint: mean cumulative function and Kaplan–Meier by
 // event order (#1886).
 #[cfg(feature = "survival")]

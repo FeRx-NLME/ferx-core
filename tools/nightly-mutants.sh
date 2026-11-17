@@ -31,6 +31,10 @@
 #                                     them to OUT as a cargo-mutants config whose
 #                                     `examine_re` names each one exactly; print the
 #                                     count.
+#   outcome-dirs ROOT                 print, one per line with a trailing `/`, every
+#                                     dir at most one level under ROOT (ROOT itself
+#                                     included) that holds cargo-mutants outcomes: the
+#                                     shard dirs to hand to `untested` and `summary`.
 #   untested SELECTED OUT DIR...      write the names in SELECTED that no DIR has an
 #                                     outcome for to OUT; print the count.
 #   summary [--selected N] [--window R] [--untested FILE [--continued]] DIR...
@@ -247,6 +251,16 @@ def rust_escape(s):
 
 lines = [l.rstrip("\n") for l in open(list_path, encoding="utf-8")]
 lines = list(dict.fromkeys(l for l in lines if l))
+# A mutant name is printable text. A control character means a decorated list --
+# `cargo mutants --list` with colours on writes ANSI escapes even into a file --
+# and a raw one is invalid inside a TOML basic string, so cargo-mutants would
+# reject the config with a parse error that names neither cause (#2958).
+for n, line in enumerate(lines, 1):
+    bad = next((c for c in line if ord(c) < 0x20 or ord(c) == 0x7F), None)
+    if bad is not None:
+        sys.exit(f"select: {list_path}: entry {n} contains control character "
+                 f"{bad!r}: {line!r}\n"
+                 "select: a coloured `cargo mutants --list`? pass --colors=never")
 if mode == "exact":
     picked = lines
 else:
@@ -296,6 +310,28 @@ cat_in() {
   for d in "$@"; do
     [[ -f "$d/$name" ]] && grep . "$d/$name" || true
   done | LC_ALL=C sort -t: -k1,1 -k2,2n -u
+}
+
+# The shard dirs under ROOT, found by what they hold, not by where they sit (#2958).
+# `download-artifact` with a `pattern` puts each matched artifact in its own
+# ROOT/<name>/, but when exactly ONE artifact matches -- every one-shard night, or a
+# night where only one shard uploaded -- it extracts it straight into ROOT. A
+# `ROOT/*/` glob then finds only that shard's own `diff/` and `log/` subdirs, so
+# `untested` reported every mutant as untested, `summary` said "0 of 0 examined",
+# and a follow-up pass re-ran mutants that were already tested.
+cmd_outcome_dirs() {
+  (($# == 1)) || die "outcome-dirs: usage: outcome-dirs ROOT"
+  local root="${1%/}" d f
+  [[ -d "$root" ]] || return 0
+  for d in "$root" "$root"/*/; do
+    d="${d%/}"
+    for f in outcomes.json caught.txt missed.txt timeout.txt unviable.txt; do
+      if [[ -f "$d/$f" ]]; then
+        echo "$d/"
+        break
+      fi
+    done
+  done
 }
 
 # The mutants of SELECTED (a `cargo mutants --list` output, one name per line) that
@@ -434,6 +470,7 @@ main() {
     range) cmd_range "$@" ;;
     diff) cmd_diff "$@" ;;
     select) cmd_select "$@" ;;
+    outcome-dirs) cmd_outcome_dirs "$@" ;;
     untested) cmd_untested "$@" ;;
     summary) cmd_summary "$@" ;;
     *) die "unknown subcommand '$sub' (try --help)" ;;

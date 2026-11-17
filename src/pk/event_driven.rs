@@ -278,8 +278,11 @@ impl EventSchedule {
         doses: &[DoseEvent],
         dose_lagtimes: &[f64],
     ) -> Self {
+        // A plan's recording builds what its runs replay: runtime work only (#2786).
         #[cfg(test)]
-        SCHEDULE_BUILDS.with(|c| c.set(c.get() + 1));
+        if !crate::parser::model_parser::rhs_regcode::kernel_jit::recording_open() {
+            SCHEDULE_BUILDS.with(|c| c.set(c.get() + 1));
+        }
         assert_eq!(
             doses.len(),
             subject.doses.len(),
@@ -480,7 +483,7 @@ fn compute_propagation_bounds(
     let inner = index.breaks_within(t_from + 1e-15, t_to - 1e-15);
     let mut bounds: Vec<f64> = Vec::with_capacity(2 + inner.len());
     bounds.extend([t_from, t_to]);
-    bounds.extend_from_slice(inner);
+    bounds.extend_from_slice(&inner);
     bounds.sort_by(|a, b| a.total_cmp(b));
     bounds.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     bounds
@@ -525,8 +528,9 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
 /// exists there, so the capped loop now also raises the #867 non-convergence warning instead of
 /// returning a silently-truncated state.
 ///
-/// `dose.ii > 0` and `dose.duration <= dose.ii` are required (callers
-/// already guard the first; overlapping infusions are rejected).
+/// `dose.ii > 0` is required (callers already guard it). Overlapping infusions
+/// (`T_inf > II`) replay their `m` always-running pulses as one more cycle window
+/// (`DoseEvent::ss_cycle_doses`).
 fn equilibrate_ss_state_event_driven(
     pk_model: PkModel,
     pk: &PkParams,
@@ -558,27 +562,21 @@ fn equilibrate_ss_state_event_driven(
         return state;
     }
     let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
-    if is_inf && dose.duration > dose.ii {
-        // Overlapping infusions: no closed-form pulse expansion. Caller's
-        // api.rs warning fires for this case.
-        return state;
-    }
-
     // Synthetic single-dose at t=0 inside each cycle; propagate over
     // [0, T_inf, II] for infusions (so the bounds split at the infusion
     // end) or [0, II] for boluses. Clone `dose` (not `DoseEvent::new`) so the
     // bioavailability-reshaped `(rate, duration)` it already carries survive -
     // `::new` would recompute `duration = amt/rate` and drop `F` (#419).
     let synthetic_dose = if is_inf {
-        vec![dose.synthetic_cycle_dose()]
+        dose.ss_cycle_doses()
     } else {
         Vec::new()
     };
-    let synthetic_lagtimes: Vec<f64> = if is_inf { vec![0.0] } else { Vec::new() };
+    let synthetic_lagtimes = vec![0.0; synthetic_dose.len()];
     let synthetic_index = crate::dosing::DoseIndex::new(&synthetic_dose, &synthetic_lagtimes);
     let empty_index = crate::dosing::DoseIndex::default();
     let bounds: Vec<f64> = if is_inf {
-        vec![0.0, dose.duration, dose.ii]
+        vec![0.0, synthetic_dose[0].duration, dose.ii]
     } else {
         vec![0.0, dose.ii]
     };
@@ -676,8 +674,8 @@ fn equilibrate_ss_state_event_driven(
 /// Used to recover the *previous interval's* steady-state tail for an SS
 /// dose with a lagtime: observations between the dose record time and the
 /// lagged arrival sit at phase `II − lagtime` … `II` (issue #15). For SS
-/// infusions this assumes `phase ≥ dose.duration` (`lagtime ≤ II − T_inf`),
-/// the realistic regime; overlapping infusions are rejected upstream.
+/// infusions a `phase` inside the newest pulse leaves it (and any overlapping
+/// earlier pulse) mid-flight; the caller's residual windows carry them on.
 fn ss_state_at_phase_event_driven(
     pk_model: PkModel,
     pk: &PkParams,
@@ -706,11 +704,10 @@ fn ss_state_at_phase_event_driven(
 
     let mut eigen = crate::sens::propagate::EigenCacheG::default();
     if is_inf {
-        let t_inf = dose.duration;
-        // Clone so the `F`-reshaped `(rate, duration)` survive (see
-        // `equilibrate_ss_state_event_driven`; #419).
-        let synthetic_dose = vec![dose.synthetic_cycle_dose()];
-        let synthetic_lagtimes = vec![0.0];
+        // The cycle's windows, `F`-reshaped (see `equilibrate_ss_state_event_driven`; #419).
+        let synthetic_dose = dose.ss_cycle_doses();
+        let synthetic_lagtimes = vec![0.0; synthetic_dose.len()];
+        let t_inf = synthetic_dose[0].duration;
         let bounds: Vec<f64> = if phase > t_inf {
             vec![0.0, t_inf, phase]
         } else {
@@ -1213,8 +1210,8 @@ fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
     // each sub-interval. Both are fixed at the source now: the trough is loaded at
     // the `DoseRecord` event and the ordinary walk carries it, so pre-arrival
     // observations are read off a real state by the normal `EventKind::Obs` arm and
-    // need no overlay. The overlay was also what kept SS × lagtime off the
-    // closed-form dual walk — see `sens::provider::ss_lagtime_walk_unsupported`.)
+    // need no overlay. The dual walk seeds the same state (`sens::propagate`'s
+    // `ss_state_at_phase_g`).)
 
     preds
 }
@@ -1289,8 +1286,11 @@ fn active_rates_at(
         // below. Its own reset floor is the *record*, not the arrival: an
         // EVID=3/4 inside the pre-arrival window zeros the seeded state, and
         // a rate that survived it would refill what the reset just emptied.
-        let residual = crate::dosing::ss_residual_infusion_end(d, lag, 1.0)
-            .is_some_and(|end| d.time <= mid && end >= mid);
+        let residual = if d.time <= mid {
+            crate::dosing::ss_residual_ends(d, lag, 1.0).count_ending_at_or_after(mid)
+        } else {
+            0
+        };
         // Infusions recorded before the last reset — EVID=3/4 (#1587) or `SS=1` (#1586) —
         // are turned off, keyed on the record, so a lagged window opening after the reset
         // is off too. This also covers the seeded residual above, whose own floor is the
@@ -1298,8 +1298,10 @@ fn active_rates_at(
         if !gate.live(doses, k) {
             continue;
         }
-        if residual || (d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid) {
-            let r = d.rate;
+        let own = d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid;
+        let pulses = residual + usize::from(own);
+        if pulses > 0 {
+            let r = pulses as f64 * d.rate;
             match pk_model.topology().dose_channel(d.cmt_raw()) {
                 Some(Channel::Central) => rate_central += r,
                 Some(Channel::Periph1) => rate_periph1 += r,
@@ -2193,8 +2195,15 @@ mod tests {
         // previous cycle's infusion crosses the record and ends at 21 h.
         assert!(crate::dosing::ss_seeded_at_record(&subj.doses[2], lag[2]));
         assert_eq!(
-            crate::dosing::ss_residual_infusion_end(&subj.doses[2], lag[2], 1.0),
-            Some(21.0)
+            crate::dosing::ss_residual_infusion_ends(
+                &subj.doses[2],
+                lag[2],
+                1.0,
+                f64::NEG_INFINITY,
+                f64::INFINITY
+            )
+            .collect::<Vec<_>>(),
+            vec![21.0]
         );
         let sched = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &subj.doses, &lag);
         assert!(sched.rates_valid_for(&subj.doses));

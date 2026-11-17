@@ -109,8 +109,8 @@ Analytical IV models support:
 ### Numerical Stability
 
 The analytical solutions include special handling for:
-- **Near-equal rate constants**: When absorption and elimination rates are similar (KA ~ k), L'Hopital's rule is used to avoid division by zero
-- **Two-compartment eigenvalues**: Vieta's formula is used for robust computation of alpha and beta
+- **Near-equal rate constants**: Where absorption meets a disposition rate (KA ~ k, or KA ~ α, β, γ) the Bateman term `(e^{−k·t} − e^{−KA·t})/(KA − k)` is evaluated as `t·e^{−k·t}·(1 − e^{−x})/x` with `x = (KA − k)·t`, one smooth function through `KA = k` — no switch, no loss of digits next to it, exact parameter derivatives of every order. Infusion and steady-state factors (`1 − e^{−k·t}`, `1/(1 − e^{−k·II})`) are written the same way, so a slow elimination loses no digits either
+- **Eigenvalues**: Vieta's formula gives the slower 2-cpt rate `β = k10·k21/α`; the 3-cpt rates start from the trigonometric solution and are refined on the cubic itself, so their derivatives never pass through `acos`
 
 ## ODE Models
 
@@ -305,11 +305,9 @@ the usual BTAV declaration — is served on the same path: the weight is applied
 rewriting the reference as `K / sqrt(NARM)`, which reaches the equation as an
 ordinary individual parameter.
 
-Finite differences are used — correctly, just more slowly, and reported as FD
-rather than claimed as analytic — past the width cap: more than 48 random effects
-for a subject, counting the stacked `(η, kappa₁…kappa_K)` across its occasions
-under IOV (24 for Laplace's exact anchor).
-The number of θ does not count.
+There is no width cap: the gradient is analytic at any number of random effects for a
+subject, counting the stacked `(η, kappa₁…kappa_K)` across its occasions under IOV.
+The number of θ does not count either.
 
 See [Scaling](scaling.qmd) for the Form C readout on top of a *compartment*
 model, which shares this grammar.

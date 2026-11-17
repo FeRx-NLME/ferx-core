@@ -444,8 +444,12 @@ group_docs() {
 
 group_patterns() {
   CI_JOB="Patterns lint"
-  # Source-pattern lints over TEST code (#2634), rule files and the shrink-only
-  # baseline under `tools/lint-rules/`. The first rule is `nan-fold`: a
+  # Source-pattern lints (#2634), rule files and the shrink-only baseline under
+  # `tools/lint-rules/`. `nan-fold` lints test code; `recorded-value-read` (#2786) lints
+  # `src/` production code for a `.plain()` value read a recording could reach, and starts at
+  # zero (nothing for it in the baseline). Both run in `cargo test -p patterns-lint`.
+  #
+  # (`nan-fold`, in detail:) The first rule is `nan-fold`: a
   # `x = x.max(e)` / `.fold(…, f64::max)` in a test discards NaN, so the
   # assertion passes on the finite rows and a solver returning NaN goes green —
   # the hole AGENTS.md documents and `pktte_tdep_nonmem_anchor` shipped with.

@@ -1,7 +1,8 @@
 //! Tier-1 tests for the repeated-events VPC driver (#1886 PR2): the per-order risk
 //! sets on the plan's fixture R1 (T6, T7), the follow-up of the replicates (T8), the
 //! one-stream-per-subject contract of the simulator (T-sim), the order range (T9),
-//! strata (T10) and every refusal's whole text (T11).
+//! strata (T10), every refusal's whole text (T11), and the cut of the observed data at
+//! `sim.horizon` (#2908, plan T1–T4).
 
 use super::*;
 use crate::parser::model_parser::parse_model_string;
@@ -360,8 +361,10 @@ fn short_and_long() -> Population {
 /// Through the entry point, by arm. Under `Observed` no ARM-0 replicate is followed
 /// past 4, so at t = 5 none of its curves is defined, and with every replicate step on
 /// the grid none of its times is past 4. Under `Horizon` both arms run to `H = 20`.
-/// With `sim.horizon = 2`, below every follow-up end, `H` wins in both arms. Ending
-/// follow-up at `H` under `Observed` makes the first ARM-0 count at 5 twenty.
+/// With `sim.horizon = 2`, below every follow-up end, `H` wins in both arms, and the
+/// observed curves end at `H` too (#2908): ARM 1's MCF and its absolute order-2 curve
+/// (all censored at 2 in the cut data, events at 12 uncut) last at 2. Ending follow-up
+/// at `H` under `Observed` makes the first ARM-0 count at 5 twenty.
 #[test]
 fn observed_follow_up_ends_each_replicate_subject_at_its_own_time() {
     let p = short_and_long();
@@ -404,8 +407,9 @@ fn observed_follow_up_ends_each_replicate_subject_at_its_own_time() {
     for s in &v.strata {
         assert_eq!(s.mcf.n_used, [20, 0], "{}", s.label);
     }
-    // The observed curves are not cut at `H`.
-    assert_eq!(v.strata[1].mcf.observed.time.last(), Some(&20.0));
+    // The observed curves are cut at `H` as well, the absolute-time ones included.
+    assert_eq!(v.strata[1].mcf.observed.time.last(), Some(&2.0));
+    assert_eq!(v.strata[1].absolute[1].observed.time.last(), Some(&2.0));
 }
 
 /// One stratum holding both cohorts, rate 0.15 with no variability, so the replicate
@@ -612,34 +616,225 @@ fn warns_when_subjects_end_on_an_event_record() {
     assert_eq!(run(RTTE, &tied, &opts(20)).unwrap().warnings, [""; 0]);
 }
 
-/// A horizon below the follow-up end of 30 of 60 subjects, with gap-time curves asked
-/// for: the result says the gap-time comparison is approximate. Nothing is said when
-/// the horizon is not below any follow-up end, when it is unset, or when no gap-time
-/// curve is returned (`max_order = 1`), since the other curves are unaffected.
+/// `W_VPC_RTTE_ENDS_ON_EVENT` counts the data cut at `H` (#2908 plan T4). On F at
+/// `H = 10` only `E7` (last record an event at 7 ≤ `H`) is counted. `E415` (last record
+/// an event at 15 > `H`) is cut to a follow-up ending at 10 on no event, and `X10` (an
+/// event exactly at `H`, followed to 20) ends at `H` on a censoring, as the tied case
+/// above. With `H` unset both `E7` and `E415` count. Counting the uncut streams says
+/// 2 at `H = 10`.
+///
+/// No horizon raises a second warning (the dropped `W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP`):
+/// `short_and_long` closes every stream with a censoring record, so at every `max_order`
+/// and every horizon, below all, half or none of its follow-up ends, it is silent.
 #[test]
-fn warns_when_the_horizon_is_below_the_follow_up_and_gap_curves_are_returned() {
-    let p = short_and_long();
-    let warned = |horizon: Option<f64>, max_order: usize| {
-        let mut o = opts(20);
-        o.max_order = Some(max_order);
-        o.sim.horizon = horizon;
-        run(RTTE, &p, &o).unwrap().warnings
+fn ends_on_event_counts_the_data_cut_at_the_horizon() {
+    let ends_on_event = |n: usize, total: usize| {
+        format!(
+            "W_VPC_RTTE_ENDS_ON_EVENT: {n} of {total} subjects on cmt 2 have an event as their last \
+             record, so their follow-up ends at that event. Such a subject has an event exactly \
+             at its follow-up end, which a simulated subject almost never has. If follow-up \
+             went on after the last event, add a censoring record at its end."
+        )
     };
-    assert_eq!(
-        warned(Some(10.0), 2),
-        [
-            "W_VPC_RTTE_HORIZON_BELOW_FOLLOW_UP: `sim.horizon = 10` is below the follow-up end \
-          of 30 of 60 subjects on cmt 2. The observed curves are not cut at the horizon and the \
-          replicates are, so each gap-time comparison is approximate. The mean cumulative \
-          function and the absolute-time curves are unaffected up to the horizon. Leave \
-          `sim.horizon` unset, or cut the data at the horizon first."
-        ]
+    // This check's own codes only: the simulator's warnings come from a sink other
+    // tests in the binary share.
+    let own = |o: &VpcRtteOptions, p: &Population| -> Vec<String> {
+        run(RTTE, p, o)
+            .unwrap()
+            .warnings
+            .into_iter()
+            .filter(|w| w.starts_with("W_VPC_RTTE_"))
+            .collect()
+    };
+    let f = pop(fixture_f());
+    let mut o = opts(20);
+    o.sim.horizon = Some(F_HORIZON);
+    assert_eq!(own(&o, &f), [ends_on_event(1, 28)]);
+    o.sim.horizon = None;
+    assert_eq!(own(&o, &f), [ends_on_event(2, 28)]);
+
+    // An event exactly at `H` that is the subject's last record (`cᵢ = H`) still ends
+    // follow-up on an event, both with `H` set to it and with `H` unset, where `H` is the
+    // latest follow-up end and is that subject's (review r1 row 1).
+    let at_h = pop(vec![
+        stream("A", 10.0, &[3.0, 10.0]),
+        stream("B", 6.0, &[2.0]),
+    ]);
+    for horizon in [Some(10.0), None] {
+        o.sim.horizon = horizon;
+        assert_eq!(
+            own(&o, &at_h),
+            [ends_on_event(1, 2)],
+            "horizon {horizon:?}: A's last record is its event at H"
+        );
+    }
+
+    let p = short_and_long();
+    for max_order in [1, 2] {
+        for horizon in [Some(2.0), Some(10.0), Some(20.0), None] {
+            let mut o = opts(20);
+            o.max_order = Some(max_order);
+            o.sim.horizon = horizon;
+            let w = own(&o, &p);
+            assert!(
+                w.is_empty(),
+                "max_order {max_order}, horizon {horizon:?}: {w:?}"
+            );
+        }
+    }
+}
+
+// ── #2908: the observed data are read on [0, H] ──────────────────────────────
+
+const F_HORIZON: f64 = 10.0;
+
+/// Fixture F (#2908 plan §3), followed to 20 with `H = 10`. Uncut, 12 subjects have three
+/// events, so the default `max_order` is 3; cut at 10 they have two, beside the 12
+/// short subjects and `E7`, so it is 2.
+///
+/// - `1`–`12`: events 3, 8, 12, censored at 20: two events kept, one cut.
+/// - `13`–`24`: events 2, 5, censored at 6: `cᵢ ≤ H`, the control.
+/// - `X10`: an event exactly at `H`, censored at 20.
+/// - `X12`: its first event at 12, past `H`, censored at 20.
+/// - `E415`: events 4 and 15, the last record the event at 15 (ends on an event past `H`).
+/// - `E7`: events 2 and 7, the last record the event at 7 (ends on an event before `H`).
+fn fixture_f() -> Vec<Subject> {
+    let mut f = cohort(1, 12, 20.0, &[3.0, 8.0, 12.0]);
+    f.extend(cohort(13, 12, 6.0, &[2.0, 5.0]));
+    f.push(stream("X10", 20.0, &[10.0]));
+    f.push(stream("X12", 20.0, &[12.0]));
+    f.push(stream("E415", 15.0, &[4.0, 15.0]));
+    f.push(stream("E7", 7.0, &[2.0, 7.0]));
+    f
+}
+
+fn record_time(r: &ObsRecord) -> f64 {
+    match r {
+        ObsRecord::Event { time, .. } => *time,
+        _ => unreachable!("fixture F holds event records only"),
+    }
+}
+
+/// The data cut at `h` by hand, independently of the engine's `cut_at`: a subject whose
+/// last record is after `h` keeps its records up to `h` (one exactly at `h` kept) and
+/// gets a censoring record at `h`; any other subject is unchanged.
+fn cut_by_hand(subjects: &[Subject], h: f64) -> Vec<Subject> {
+    subjects
+        .iter()
+        .map(|s| {
+            let last = s.obs_records.last().map(record_time).unwrap();
+            if last <= h {
+                return s.clone();
+            }
+            let mut records: Vec<ObsRecord> = s
+                .obs_records
+                .iter()
+                .filter(|r| record_time(r) <= h)
+                .cloned()
+                .collect();
+            records.push(rec(h, EventType::RightCensored));
+            subj(&s.id, records)
+        })
+        .collect()
+}
+
+/// T1. `sim.horizon = H` below the follow-up equals calling on the data cut at `H` first:
+/// the whole `RtteVpc`, every curve, band, `n_subjects`, the default `max_order` and the
+/// warnings, under both censorings. The replicates do not depend on the observed records'
+/// count (plan §0 M1), so any difference is the observed side.
+///
+/// The straddle is asserted first: F has records after `H`, so the two populations
+/// differ and the equality cannot hold by both being the same data.
+///
+/// Mutations that redden it: no cut; a cut of the gap-time curves only; a partition at
+/// `cᵢ` rather than `min(cᵢ, H)` (`X12`'s event at 12 kept); the end left at `cᵢ`;
+/// the default `max_order` read before the cut (3 against 2); `ends_on_event` not
+/// updated (`E415`); the cut under `Observed` only. Not `<` for `<=` at `H`: that
+/// mutation also drops an event at a subject's own end when `cᵢ ≤ H`, so it acts on
+/// the hand-cut side (`X10`: event at 10, end 10) too and both sides agree by
+/// construction. `gap_curve_reads_the_data_cut_at_the_horizon` and
+/// `cut_at_partitions_at_the_earlier_of_the_end_and_the_horizon` kill it (measured).
+#[test]
+fn horizon_below_follow_up_equals_the_data_cut_at_the_horizon() {
+    let f = fixture_f();
+    let cut = cut_by_hand(&f, F_HORIZON);
+    let times = |s: &[Subject]| -> Vec<f64> {
+        s.iter()
+            .flat_map(|s| s.obs_records.iter())
+            .map(record_time)
+            .collect()
+    };
+    assert!(
+        times(&f).iter().any(|&t| t > F_HORIZON),
+        "F has records past H"
     );
-    assert_eq!(warned(Some(10.0), 1), [""; 0]);
-    assert_eq!(warned(Some(20.0), 2), [""; 0]);
-    assert_eq!(warned(None, 2), [""; 0]);
-    // Below every follow-up end: all 60.
-    assert!(warned(Some(2.0), 2)[0].contains("of 60 of 60 subjects"));
+    assert!(
+        times(&cut).iter().all(|&t| t <= F_HORIZON),
+        "the cut has none"
+    );
+
+    for censoring in [VpcCensoring::Observed, VpcCensoring::Horizon] {
+        let mut o = opts(20);
+        o.censoring = censoring;
+        o.sim.horizon = Some(F_HORIZON);
+        let got = run(RTTE, &pop(f.clone()), &o).unwrap();
+        let want = run(RTTE, &pop(cut.clone()), &o).unwrap();
+        assert_eq!(
+            got.max_order, 2,
+            "{censoring:?}: default max_order on the cut data"
+        );
+        assert_eq!(got, want, "{censoring:?}");
+    }
+}
+
+/// T2, the readable twin of T1: gap order 2 of F at `H = 10`, row by row, each row
+/// naming the subjects it rests on. In the cut data the 12 long subjects have gap 8 − 3
+/// = 5, the 12 short ones 5 − 2 = 3, `E7` 7 − 2 = 5; `E415` is censored at 10 − 4 = 6;
+/// `X10` is censored at 0; `X12` has no event by 10 and is not in the risk set.
+#[test]
+fn gap_curve_reads_the_data_cut_at_the_horizon() {
+    let mut o = opts(20);
+    o.sim.horizon = Some(F_HORIZON);
+    o.max_order = Some(2);
+    let v = run(RTTE, &pop(fixture_f()), &o).unwrap();
+    let g2 = &v.strata[0].gap[0];
+    assert_eq!(g2.order, 2);
+    assert_eq!(
+        g2.n_subjects, 27,
+        "X12 (first event at 12, past H) is not at risk; X10 (event at H) is"
+    );
+    let c = &g2.observed;
+    assert_eq!(c.time, [0.0, 3.0, 5.0, 6.0], "gap times");
+    assert_eq!(
+        (c.n_risk[0], c.n_event[0], c.n_censor[0]),
+        (27, 0, 1),
+        "X10 is censored at gap 0: its event at H, its follow-up ending at H"
+    );
+    assert_eq!(
+        (c.n_risk[1], c.n_event[1]),
+        (26, 12),
+        "subjects 13–24, gap 5 − 2 = 3"
+    );
+    assert_eq!(
+        (c.n_risk[2], c.n_event[2], c.n_censor[2]),
+        (14, 13, 0),
+        "subjects 1–12 (gap 8 − 3, their event at 12 cut) and E7 (gap 7 − 2) at 5"
+    );
+    assert_eq!(
+        (c.n_risk[3], c.n_event[3], c.n_censor[3]),
+        (1, 0, 1),
+        "E415 is censored at 10 − 4 = 6, its event at 15 cut"
+    );
+}
+
+/// `cut_at` on one stream: the events up to `min(end, horizon)`, one exactly there kept,
+/// and that time as the end.
+#[test]
+fn cut_at_partitions_at_the_earlier_of_the_end_and_the_horizon() {
+    let ev = [3.0, 8.0, 10.0, 12.0];
+    assert_eq!(cut_at(&ev, 20.0, 10.0), (&ev[..3], 10.0));
+    assert_eq!(cut_at(&ev, 9.0, 10.0), (&ev[..2], 9.0));
+    assert_eq!(cut_at(&ev, 20.0, 30.0), (&ev[..], 20.0));
 }
 
 // ── T9: which orders ─────────────────────────────────────────────────────────

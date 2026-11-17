@@ -2,7 +2,7 @@
 //! exponential tilting** — the #386 / absorption-Phase-3 acceleration that moves
 //! `transit()` (#386) and `igd()` (inverse-Gaussian, #790) off the numerical ODE
 //! forcing path onto the analytic `pk` path, where sensitivities come from
-//! `sens/`'s `Dual2` jets rather than finite differences.
+//! `sens/`'s generic `PkNum` kernels (compiled plans) rather than finite differences.
 //!
 //! ## The tilting identity
 //!
@@ -100,11 +100,13 @@ impl<T: PkNum> TiltedAbsorption<T> for TransitAbsorption<T> {
         // which would otherwise propagate silently into the likelihood. The analytic
         // dispatch guards `ke < KTR` upstream (routing to the ODE path otherwise), so
         // this never fires on a valid call — it catches a guard regression in tests.
+        // A debug check on values: skipped on a dependent recorded value (nothing to check
+        // there that a guard would not over-constrain).
         debug_assert!(
-            k.val() < ktr.val(),
-            "transit MGF diverges for k ≥ KTR ({} ≥ {}); caller must guard ke < KTR",
-            k.val(),
-            ktr.val()
+            k.nonrec_val()
+                .zip(ktr.nonrec_val())
+                .is_none_or(|(a, b)| a < b),
+            "transit MGF diverges for k ≥ KTR; caller must guard ke < KTR"
         );
         (ktr / (ktr - k)).pow(self.n + T::from_f64(1.0))
     }
@@ -172,10 +174,10 @@ impl<T: PkNum> TiltedAbsorption<T> for IgAbsorption<T> {
         // dispatch still guards `ke < 1/(2·MAT·CV²)` upstream (routing to the ODE
         // `igd()` twin otherwise). The assert catches a guard regression in tests.
         debug_assert!(
-            self.two_mu2_over_lambda().val() * k.val() < 1.0,
-            "IG MGF diverges for k ≥ λ/(2μ²) ({} ≥ {}); caller must guard ke < 1/(2·MAT·CV²)",
-            k.val(),
-            1.0 / self.two_mu2_over_lambda().val()
+            (self.two_mu2_over_lambda() * k)
+                .nonrec_val()
+                .is_none_or(|p| p < 1.0),
+            "IG MGF diverges for k ≥ λ/(2μ²); caller must guard ke < 1/(2·MAT·CV²)"
         );
         (self.lambda_over_mu() * (T::from_f64(1.0) - self.tilt_r(k))).exp()
     }
@@ -191,7 +193,7 @@ impl<T: PkNum> TiltedAbsorption<T> for IgAbsorption<T> {
         // `exp(2λ/μ* + ln Φ(z₂))` via [`log_normal_cdf_g`] avoids the catastrophic
         // cancellation of a direct product (which would underflow to a spurious 0).
         // `z₂ < 0` for all `t > 0`, so the log form is always in its stable regime.
-        if t.val() <= 0.0 {
+        if t.br_cmp_c(crate::sens::num::BranchCmp::Le, 0.0) {
             return T::from_f64(0.0);
         }
         let r = self.tilt_r(k);

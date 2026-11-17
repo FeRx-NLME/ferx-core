@@ -1,0 +1,382 @@
+//! #1154 — a runtime analytic-sensitivity decline must reach `FitResult::warnings`.
+//!
+//! A subject whose data shape falls out of the analytic outer gradient's scope is
+//! salvaged onto a per-subject gradient (held-EBE since #1529; reconverged FD under IOV).
+//! Before #1154 that was invisible: no warning code, no count, and
+//! `FitResult::gradient_method_outer` keeps reporting `analytic` because it reads a
+//! **model**-level predicate. The Tier-1 tests in
+//! `estimation::outer_optimizer::tests::outer_fd_fallback` pin the recording; this pins the
+//! wiring — that the warning reaches `FitResult::warnings`, that it does so while the
+//! reported outer gradient method still says analytic, and that a fit which never
+//! evaluates an analytic outer gradient stays silent.
+//!
+//! Lives in the lib since #2786: the decline is forced through `kernel_jit::fail_plans_of`, a
+//! `#[cfg(test)]` seam an integration test cannot reach.
+//!
+//! `outer_maxiter = 1` runs one gradient evaluation and stops. It must not be `0`
+//! — that is the evaluation-only path, which computes no outer gradient at all, so there
+//! would be nothing to report and the test would pass for the wrong reason.
+
+use crate::types::{
+    CompiledModel, DoseEvent, EstimationMethod, FitOptions, Optimizer, Population, RateMode,
+};
+use std::path::Path;
+
+/// Warfarin with a bioavailability `F < 1` and a lag time.
+///
+/// One subject is made to decline (`make_subject_0_decline`: its dose becomes a steady-state
+/// infusion and every plan of it is forced to fail), while every bolus-dosed subject is
+/// unaffected and the model as a whole stays inside the analytic outer scope. That
+/// combination is exactly the shape this warning exists for: valid data, a model the report
+/// calls analytic, and one subject that quietly runs FD.
+/// The lag is 0.25, not the 0.5 it was: `data/warfarin.csv` samples at t = 0.5, where a
+/// 0.5 lag predicts exactly 0 and the proportional variance collapses to its guard, so
+/// the objective was 2.4e14 from the start (`W_NONFINITE_OBJECTIVE`). A line-search trial on
+/// that surface could legitimately carry a subject to where the adjoint declines, which
+/// is not what the in-scope control tests (#2549: the EBE warm-start predictor reached one).
+const WARFARIN_F: &str = r#"
+[parameters]
+  theta TVCL(0.2, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+  ALAG = 0.25
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// [`WARFARIN_F`] with a two-class `[mixture]`, where an optimizer the mixture objective
+/// cannot carry is replaced by BOBYQA (`resolve_outer_optimizer`).
+const MIXTURE_F: &str = r#"
+[parameters]
+  theta TVCL1(0.15, 0.001, 10.0)
+  theta TVCL2(0.30, 0.001, 10.0)
+  theta TVV(10.0, 0.1, 500.0)
+  theta TVKA(1.5, 0.01, 50.0)
+  theta TVF(0.7, 0.05, 1.0)
+  theta MIXL(0.0, -10.0, 10.0)
+
+  omega ETA_CL ~ 0.09
+  omega ETA_V  ~ 0.04
+  omega ETA_KA ~ 0.30
+
+  sigma PROP_ERR ~ 0.02 (sd)
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV  * exp(ETA_V)
+  KA = TVKA * exp(ETA_KA)
+  F  = TVF
+  ALAG = 0.5
+
+[structural_model]
+  pk one_cpt_oral(cl=CL, v=V, ka=KA, f=F, lagtime=ALAG)
+
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"#;
+
+/// The fallback sentence `outer_fd_fallback_warning` emits. Matched on the phrase that
+/// carries the signal rather than the whole sentence, so a wording change does not redden
+/// this while a dropped call does. (Not on the salvage's name: since #1529 that differs
+/// between the non-IOV held-EBE and the IOV reconverged routes.)
+fn outer_fd_warning(warnings: &[String]) -> Option<&String> {
+    warnings
+        .iter()
+        .find(|w| w.contains("could not be given the exact analytic outer gradient"))
+}
+
+/// The same population with subject 0's bolus replaced by a steady-state infusion — the
+/// dose shape the adjoint declines under a lag time. Replaced rather than added: the point
+/// is a data *shape* the adjoint declines, not a different amount of drug.
+fn make_subject_0_decline(population: &mut Population) -> String {
+    let declining = &mut population.subjects[0];
+    let mut dose = DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0);
+    dose.rate_mode = RateMode::Fixed;
+    declining.doses = vec![dose];
+    // After #2786 no regular-path shape declines the adjoint (an SS infusion under a lag is
+    // served by the plan's walk), so the decline is forced: every plan of this subject fails.
+    crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(declining);
+    declining.id.clone()
+}
+
+fn fixture() -> (CompiledModel, Population) {
+    let model = crate::parse_model_string(WARFARIN_F).expect("model parses");
+    let population = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    (model, population)
+}
+
+fn one_gradient_eval_options() -> FitOptions {
+    FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        // The analytic outer gradient is only dispatched for a gradient-driven optimizer;
+        // derivative-free BOBYQA has no outer gradient to fall back from.
+        optimizer: Optimizer::NloptLbfgs,
+        // One real gradient evaluation. NOT `0` — see the module docs.
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..Default::default()
+    }
+}
+
+/// Control: an unmodified population is entirely inside the provider's scope, so no
+/// warning. Without this a warning that fired unconditionally would pass the test below.
+#[test]
+fn in_scope_population_emits_no_outer_fd_warning() {
+    let (model, population) = fixture();
+    let result = crate::fit(
+        &model,
+        &population,
+        &model.default_params,
+        &one_gradient_eval_options(),
+    )
+    .expect("fit succeeds");
+    assert_eq!(
+        result.gradient_method_outer, "analytic",
+        "fixture precondition: the model must report the analytic outer route"
+    );
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "in-scope population must not warn; got {:?}",
+        result.warnings
+    );
+}
+
+/// One subject whose dose is a steady-state infusion falls out of the adjoint's scope
+/// under the model's lag time. The fit still reports the model-level `analytic`
+/// route — correctly, for the model — and the warning is what reconciles that with what
+/// the subject actually ran.
+#[test]
+fn out_of_scope_subject_warns_while_the_report_still_says_analytic() {
+    let (model, mut population) = fixture();
+    let n_total = population.subjects.len();
+    assert!(n_total > 1, "fixture precondition: need a mixed population");
+    let declining_id = make_subject_0_decline(&mut population);
+
+    let result = crate::fit(
+        &model,
+        &population,
+        &model.default_params,
+        &one_gradient_eval_options(),
+    )
+    .expect("fit succeeds");
+
+    let w = outer_fd_warning(&result.warnings).unwrap_or_else(|| {
+        panic!(
+            "an out-of-scope subject must warn; got {:?}",
+            result.warnings
+        )
+    });
+    assert!(
+        w.contains(&format!("1 of {n_total}")),
+        "warning must count exactly the declining subject; got: {w}"
+    );
+    assert!(
+        w.contains(&declining_id),
+        "warning must name the declining subject ({declining_id}); got: {w}"
+    );
+    // #2093 review round 2 (finding 4): the subject's decline is scope, so it took the
+    // reconverged gradient, and the sentence says why in those terms. Before, it told this
+    // subject (diagonal proportional error) that its residuals were correlated.
+    assert!(
+        w.contains("no analytic recorder serves them")
+            && w.contains("include the EBE-response term but are slower"),
+        "the structural sentence must name the recorder scope; got: {w}"
+    );
+    assert!(
+        !w.contains("correlated across observation rows"),
+        "a diagonal-error subject must not be told its residuals are correlated; got: {w}"
+    );
+    // The whole point: the report and the run disagree, and only the warning says so.
+    assert_eq!(
+        result.gradient_method_outer, "analytic",
+        "the reported outer method is model-level and must still read analytic — if it \
+         ever reports the per-subject route instead, this warning's framing needs updating"
+    );
+}
+
+/// PR #1418 review, finding 2. A derivative-free fit requests no outer gradient at all, so
+/// no subject can have taken an FD *outer* gradient and the warning must stay silent even
+/// with a subject the provider would decline.
+///
+/// The vehicle is a `[mixture]` model under `optimizer = trust_region`, which the mixture
+/// objective cannot carry: `resolve_outer_optimizer` replaces it with BOBYQA. (Until #2739
+/// a mixture's `auto` was the vehicle, because every mixture ran BOBYQA whatever its
+/// gradient; `auto` now follows the analytic gradient like any other model's, so it is
+/// L-BFGS on this fixture and no longer derivative-free.)
+///
+/// When this test was written `build_info::gradient_method_outer` did not model the
+/// replacement and still reported `analytic` here, so a gate written against it
+/// would have emitted "1 of 2 ... could not be given the exact analytic outer gradient".
+/// Since #1540 the report resolves through `resolve_outer_optimizer` too and reads `N/A`,
+/// which is asserted below alongside `FitResult::optimizer`. The warning's silence still
+/// comes from its runtime log, not from either report.
+#[test]
+fn a_derivative_free_mixture_fit_does_not_warn() {
+    let model = crate::parse_model_string(MIXTURE_F).expect("mixture model parses");
+    let mut population = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    make_subject_0_decline(&mut population);
+
+    let options = FitOptions {
+        method: EstimationMethod::FoceI,
+        interaction: true,
+        // The knob under test: an optimizer the mixture objective cannot carry runs as BOBYQA.
+        optimizer: Optimizer::TrustRegion,
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..Default::default()
+    };
+    let result = crate::fit(&model, &population, &model.default_params, &options)
+        .expect("mixture fit succeeds");
+
+    // Both reports describe the BOBYQA run (#1540), so the fixture is the derivative-free
+    // fit this test is about.
+    assert_eq!(result.optimizer, "bobyqa");
+    assert_eq!(
+        result.gradient_method_outer, "N/A",
+        "a derivative-free fit has no outer gradient to report"
+    );
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "a derivative-free fit computes no outer gradient, so no subject can have fallen \
+         back to an FD one; got {:?}",
+        result.warnings
+    );
+}
+
+/// An evaluation-only run (`outer_maxiter = 0`) short-circuits before any optimizer is
+/// built and computes no outer gradient, so it must not report outer FD fallbacks either.
+/// Same population and model as the warning test above, so the only difference is the
+/// number of iterations.
+#[test]
+fn an_evaluation_only_fit_does_not_warn() {
+    let (model, mut population) = fixture();
+    make_subject_0_decline(&mut population);
+
+    let options = FitOptions {
+        outer_maxiter: 0,
+        ..one_gradient_eval_options()
+    };
+    let result =
+        crate::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "an evaluation-only fit runs no outer gradient; got {:?}",
+        result.warnings
+    );
+}
+
+/// PR #1418 review, finding 1. `reconverge_gradient_interval = 1` is the documented
+/// escape hatch that forces the reconverged-FD outer gradient on **every** evaluation, so
+/// the analytic branch is never selected and no subject "fell outside the provider's
+/// scope". Attributing that fit's FD gradients to a scope gap would be a false cause even
+/// though the fit really is on FD throughout.
+#[test]
+fn forcing_the_reconverged_gradient_does_not_warn_about_scope() {
+    let (model, mut population) = fixture();
+    make_subject_0_decline(&mut population);
+
+    let options = FitOptions {
+        reconverge_gradient_interval: 1,
+        ..one_gradient_eval_options()
+    };
+    let result =
+        crate::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "`reconverge_gradient_interval = 1` bypasses the analytic branch for every \
+         subject, which is not a provider scope gap; got {:?}",
+        result.warnings
+    );
+}
+
+/// #1529 review. The flat-theta pre-flight (#826) evaluates one outer gradient for
+/// **every** non-mixture fit, including derivative-free BOBYQA. It used to write to the
+/// same decline log, so a BOBYQA fit with a declining subject warned — and advised
+/// `reconverge_gradient_interval` — about a gradient its optimizer never used. The
+/// pre-flight now keeps its own log. `out_of_scope_subject_warns_while_the_report_still_says_analytic`
+/// is the other side of this gate: the same population on a gradient-driven optimizer
+/// does warn.
+#[test]
+fn a_derivative_free_fit_does_not_warn_about_the_preflight_gradient() {
+    let (model, mut population) = fixture();
+    make_subject_0_decline(&mut population);
+
+    let options = FitOptions {
+        optimizer: Optimizer::Bobyqa,
+        ..one_gradient_eval_options()
+    };
+    let result =
+        crate::fit(&model, &population, &model.default_params, &options).expect("fit succeeds");
+    assert!(
+        outer_fd_warning(&result.warnings).is_none(),
+        "a BOBYQA fit's only outer gradient is the flat-theta pre-flight, which must not \
+         be reported; got {:?}",
+        result.warnings
+    );
+}
+
+/// #2906. A mixture on an NLopt **gradient** optimizer with one subject the adjoint
+/// declines. That subject's (subject × class) terms used to send the whole mixture gradient
+/// to a central difference of the full objective, with no warning, while
+/// `gradient_method_outer` kept reading `analytic`. The terms are now salvaged on
+/// their own (reconverged, so the structural sentence), and the decline reaches the #1154
+/// warning like a single-population one. Lag 0.25, as in [`WARFARIN_F`], so the start
+/// objective is not the degenerate one a 0.5 lag gives on this data.
+#[test]
+fn a_gradient_driven_mixture_fit_warns_about_its_declined_subject() {
+    let src = MIXTURE_F.replace("ALAG = 0.5", "ALAG = 0.25");
+    assert!(src.contains("ALAG = 0.25"), "fixture: lag replaced");
+    let model = crate::parse_model_string(&src).expect("mixture model parses");
+    let mut population = crate::read_nonmem_csv(Path::new("data/warfarin.csv"), None, None)
+        .expect("warfarin data loads");
+    let n_total = population.subjects.len();
+    let declining_id = make_subject_0_decline(&mut population);
+
+    let result = crate::fit(
+        &model,
+        &population,
+        &model.default_params,
+        &one_gradient_eval_options(),
+    )
+    .expect("mixture fit succeeds");
+    assert_eq!(result.optimizer, "nlopt_lbfgs");
+    assert_eq!(result.gradient_method_outer, "analytic");
+    let w = outer_fd_warning(&result.warnings).unwrap_or_else(|| {
+        panic!(
+            "a declined mixture subject must warn; got {:?}",
+            result.warnings
+        )
+    });
+    assert!(
+        w.contains(&format!("1 of {n_total}")) && w.contains(&declining_id),
+        "warning must count and name exactly the declining subject; got: {w}"
+    );
+    assert!(
+        w.contains("no analytic recorder serves them") && !w.contains("fixed-EBE"),
+        "a mixture salvage is reconverged, never held-EBE; got: {w}"
+    );
+}

@@ -94,22 +94,6 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// A forward pass kept for a backward pass ([`MlpMapper::vjp_at`]): the inputs and every
-/// layer's pre- and post-activations.
-#[derive(Debug, Clone)]
-pub(crate) struct NnForward {
-    x: Vec<f64>,
-    pre: Vec<Vec<f64>>,
-    post: Vec<Vec<f64>>,
-}
-
-impl NnForward {
-    /// The network's output `a_L`.
-    pub(crate) fn output(&self) -> &[f64] {
-        self.post.last().expect("at least one layer activation")
-    }
-}
-
 /// The working vectors of [`MlpMapper::backprop`]: the running adjoint `da_l` (the seed on
 /// entry) and `dz_l`.
 #[derive(Default)]
@@ -348,46 +332,6 @@ impl MlpMapper {
         }
 
         Ok((output, jac))
-    }
-
-    /// The vector–Jacobian product `seedᵀ·∂a_L/∂weights` (post-activation): one backward
-    /// pass, the row [`Self::jacobian`] would return combined by `seed`, at the cost of a
-    /// single output's backprop.
-    /// `None` when `x`, `weights` or `seed` has the wrong length.
-    #[cfg(test)]
-    pub(crate) fn vjp(&self, x: &[f64], weights: &[f64], seed: &[f64]) -> Option<Vec<f64>> {
-        self.vjp_at(&self.forward_kept(x.to_vec(), weights)?, weights, seed)
-    }
-
-    /// The forward pass at `(x, weights)`, kept for a later [`Self::vjp_at`]; `None` when
-    /// either has the wrong length.
-    pub(crate) fn forward_kept(&self, x: Vec<f64>, weights: &[f64]) -> Option<NnForward> {
-        self.check_shapes(&x, weights).ok()?;
-        let (pre, post) = self.forward_cache(&x, weights);
-        Some(NnForward { x, pre, post })
-    }
-
-    /// `seedᵀ·∂a_L/∂weights` at a kept forward pass: one backward pass, no second forward.
-    /// `None` when `seed` or `weights` has the wrong length.
-    pub(crate) fn vjp_at(
-        &self,
-        fwd: &NnForward,
-        weights: &[f64],
-        seed: &[f64],
-    ) -> Option<Vec<f64>> {
-        if weights.len() != self.n_params || seed.len() != self.n_outputs() {
-            return None;
-        }
-        let mut out = vec![0.0; self.n_params];
-        let mut scratch = Backprop {
-            adjoint: seed.to_vec(),
-            dz: Vec::new(),
-        };
-        let (x, pre, post) = (&fwd.x, &fwd.pre, &fwd.post);
-        self.backprop(x, weights, pre, post, false, &mut scratch, |c, v| {
-            out[c] = v
-        });
-        Some(out)
     }
 
     /// One backward pass from `da_L = scratch.adjoint` (the caller's seed) at the cached
@@ -1153,17 +1097,6 @@ impl NamedMlpMapper {
     ) -> Result<DMatrix<f64>, NnError> {
         let x = self.build_input_vec_zero_fill(covariates);
         self.mlp.jacobian_preactivation(&x, weights)
-    }
-
-    /// [`Self::forward_raw`]'s pass (the same zero-fill inputs and outputs) kept for a
-    /// backward pass ([`MlpMapper::vjp_at`]); not memoised, since the caller keeps it.
-    pub(crate) fn forward_kept_raw(
-        &self,
-        weights: &[f64],
-        covariates: &HashMap<String, f64>,
-    ) -> Option<NnForward> {
-        self.mlp
-            .forward_kept(self.build_input_vec_zero_fill(covariates), weights)
     }
 
     /// Strict variant used by [`CovariateMapper::forward`] / `jacobian`: errors
@@ -2012,37 +1945,6 @@ mod tests {
                 assert_relative_eq!(jac[(i, j)], fd, epsilon = 1e-6, max_relative = 1e-5);
             }
         }
-    }
-
-    /// One seeded backward pass is the seed's combination of the Jacobian's rows: on a
-    /// `tanh`/`softplus` network at a non-trivial point, with every output seeded; a
-    /// wrongly sized seed is refused.
-    #[test]
-    fn vjp_is_the_seed_combination_of_the_jacobian_rows() {
-        let mlp = MlpMapper::new(vec![2, 4, 3], Activation::Tanh, Activation::Softplus).unwrap();
-        let n_w = mlp.n_weights();
-        let weights: Vec<f64> = (0..n_w)
-            .map(|i| 0.4 * (i as f64).sin() + 0.2 * ((i * 7) as f64).cos())
-            .collect();
-        let x = vec![0.3, -0.7];
-        let seed = [0.7, -1.3, 2.1];
-        let jac = mlp.jacobian(&x, &weights).unwrap();
-        let vjp = mlp.vjp(&x, &weights, &seed).unwrap();
-        assert_eq!(vjp.len(), n_w);
-        let mut live = 0;
-        let mut worst = 0.0f64;
-        for (c, &v) in vjp.iter().enumerate() {
-            let want: f64 = (0..3).map(|k| seed[k] * jac[(k, c)]).sum();
-            worst = worst.max((v - want).abs() / (1e-300 + want.abs()));
-            // Measured worst relative 3.6e-16 on Linux (one pass vs n_out passes summed: a
-            // rounding-level reorder); ~10× headroom, and an absolute floor for exact zeros.
-            assert_relative_eq!(v, want, epsilon = 1e-15, max_relative = 4e-15);
-            live += usize::from(want.abs() > 1e-3);
-        }
-        eprintln!("vjp vs seedᵀJ: worst relative {worst:.2e}");
-        assert!(live > n_w / 2, "a vanishing product tests nothing");
-        assert!(mlp.vjp(&x, &weights, &seed[..2]).is_none());
-        assert!(mlp.vjp(&x, &weights[1..], &seed).is_none());
     }
 
     /// ReLU has a kink at 0; verify the jacobian matches FD on the smooth

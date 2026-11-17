@@ -1,3 +1,4 @@
+use crate::cold_sort::ColdSort;
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SigmaType, Subject, SubjectResult};
 use nalgebra::DMatrix;
@@ -135,12 +136,14 @@ impl<T: Copy> IntoIterator for Loads<T> {
 ///
 /// A variance that cannot be scored (`NaN`, `≤ 0`, subnormal) is replaced by
 /// `MIN_VARIANCE`; every positive normal variance is returned as it is (#2441).
+#[inline]
 pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f64]) -> f64 {
     guard_variance(residual_variance_raw(error_model, f_pred, sigma_values))
 }
 
 /// [`residual_variance`] before the invalid-variance guard: the variance the
 /// #958 derivative gates test with [`variance_is_guarded`].
+#[inline]
 pub(crate) fn residual_variance_raw(
     error_model: ErrorModel,
     f_pred: f64,
@@ -548,7 +551,28 @@ impl ErrorSpec {
     /// `2·f·σ_prop²` (σ_prop is the endpoint's proportional sigma, which is the
     /// first sigma for both `Proportional` and `Combined`). `Single` ignores
     /// `cmt`; `PerCmt` dispatches on the endpoint registered for `cmt`.
+    #[inline]
     pub fn dvar_df(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
+        // `Single` without the `exp(−f)` slot, the common spec: the gate below on the raw
+        // variance, then the closed slope — the very expressions of the general path
+        // ([`Self::dvar_df_raw`] reads `σ₀` as `sigma.first()`), without building the
+        // loading shape to learn there is no such slot. `LogCombined` takes the general one.
+        if let ErrorSpec::Single(em) = self {
+            if !matches!(em, ErrorModel::LogCombined) {
+                if variance_is_guarded(residual_variance_raw(*em, f, sigma)) {
+                    return 0.0;
+                }
+                let prop_sigma = sigma.first().copied().unwrap_or(0.0);
+                return match em {
+                    ErrorModel::Additive => 0.0,
+                    _ => 2.0 * f * prop_sigma * prop_sigma,
+                };
+            }
+        }
+        self.dvar_df_general(cmt, f, sigma)
+    }
+
+    fn dvar_df_general(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
         // Guard-aware derivative: where `variance_at` replaces the raw variance by
         // the constant `MIN_VARIANCE` (`variance_is_guarded`: NaN, ≤ 0 or
         // subnormal — e.g. `f = 0` under proportional error) the variance is
@@ -918,14 +942,25 @@ impl ErrorSpec {
         }
     }
 
+    // `Single` (one error model for every endpoint, the common spec) is read inline, so the
+    // per-row dispatch the inner loop runs a million times a fit is a compare and the
+    // variance expression; the per-endpoint spec stays out of line in `variance_at_by`.
+    #[inline]
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
-        self.variance_at_by(cmt, f_pred, sigma, residual_variance)
+        match self {
+            ErrorSpec::Single(em) => residual_variance(*em, f_pred, sigma),
+            _ => self.variance_at_by(cmt, f_pred, sigma, residual_variance),
+        }
     }
 
     /// [`variance_at`](Self::variance_at) before the invalid-variance guard
     /// ([`variance_is_guarded`]). `NaN` for an unregistered `PerCmt` cmt, as there.
+    #[inline]
     pub(crate) fn variance_at_raw(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
-        self.variance_at_by(cmt, f_pred, sigma, residual_variance_raw)
+        match self {
+            ErrorSpec::Single(em) => residual_variance_raw(*em, f_pred, sigma),
+            _ => self.variance_at_by(cmt, f_pred, sigma, residual_variance_raw),
+        }
     }
 
     fn variance_at_by(
@@ -1190,7 +1225,10 @@ pub(crate) fn loadings_variance_g<T: crate::sens::num::PkNum>(
     rho: impl Fn(usize) -> T,
 ) -> T {
     match loadings_variance_sum(loadings, sigma, correlations, rho) {
-        Some(v) if variance_is_guarded(v.val()) => T::from_f64(MIN_VARIANCE),
+        // `variance_is_guarded` through the branch API (a recording records it, #2786).
+        Some(v) if !v.br_cmp_c(crate::sens::num::BranchCmp::Ge, f64::MIN_POSITIVE) => {
+            T::from_f64(MIN_VARIANCE)
+        }
         Some(v) => v,
         None => T::from_f64(f64::NAN),
     }
@@ -1291,11 +1329,13 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
     if !cov.is_dense() {
         return r;
     }
+    // The pairing reads the loadings' slots only (the value covariance it also returns is
+    // recomputed below on `T`): no value of a generic number is read.
     let lf: Vec<Vec<(usize, f64)>> = lt
         .iter()
-        .map(|l| l.iter().map(|&(i, c)| (i, c.val())).collect())
+        .map(|l| l.iter().map(|&(i, _)| (i, 0.0)).collect())
         .collect();
-    let sigma_v: Vec<f64> = sigma.iter().map(|x| x.val()).collect();
+    let sigma_v = vec![0.0; sigma.len()];
     for (j, k, _) in match_partners(
         &lf,
         &subject.obs_times,
@@ -1310,20 +1350,18 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
         r[k][j] = c;
     }
     if let (Some(serial), Some(rho_t)) = (cov.serial, serial_rho) {
-        match serial_pairs_jet(
-            serial,
+        match serial_pairs_shape(
+            serial.kind,
             &subject.obs_rgroup,
             &subject.obs_times,
             &subject.obs_raw_times,
             n,
         ) {
             Some(pairs) => {
-                for (j, k, [c, d1, d2, d3, d4]) in pairs {
-                    // C_jk(ρ) with four ρ-derivatives, so the serial ρ is differentiated
-                    // exactly to every order a recording reads (the exact anchor's covariance
-                    // nested dual reads the fourth).
-                    let v = rho_t.lift4(c, d1, d2, d3, d4)
-                        * same_slot_covariance(&lt[j], &lt[k], sigma);
+                for (j, k, shape) in pairs {
+                    // C_jk(ρ) on `T`, so the serial ρ is differentiated exactly to every
+                    // order (#2786: a recording takes the power, not a jet at ρ's value).
+                    let v = shape.coefficient(rho_t) * same_slot_covariance(&lt[j], &lt[k], sigma);
                     r[j][k] = r[j][k] + v;
                     r[k][j] = r[k][j] + v;
                 }
@@ -1657,6 +1695,75 @@ fn serial_pairs_jet(
     obs_raw_times: &[f64],
     n: usize,
 ) -> Option<Vec<(usize, usize, [f64; 5])>> {
+    let rho = serial.rho;
+    Some(
+        serial_pairs_shape(serial.kind, obs_rgroup, obs_times, obs_raw_times, n)?
+            .into_iter()
+            .map(|(j, k, shape)| (j, k, shape.jet(rho)))
+            .filter(|(_, _, c)| c.iter().any(|&x| x != 0.0))
+            .collect(),
+    )
+}
+
+/// How a serial pair's coefficient depends on `ρ`: `ρ` itself (`cs`), or `ρᵉ` with
+/// `e = |p_j − p_k|` (`ar1`, an integer) or `e = |t_j − t_k|` (`car1`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SerialShape {
+    Linear,
+    Power(f64),
+    IntPower(i32),
+}
+
+impl SerialShape {
+    /// `[C, ∂C/∂ρ, …, ∂⁴C/∂ρ⁴]` at `rho`, each term written so a zero falling-factorial
+    /// coefficient never multiplies a pole at `ρ = 0`.
+    fn jet(self, rho: f64) -> [f64; 5] {
+        match self {
+            SerialShape::Linear => [rho, 1.0, 0.0, 0.0, 0.0],
+            SerialShape::IntPower(lag) => std::array::from_fn(|order| {
+                let order = order as i32;
+                if lag < order {
+                    0.0
+                } else {
+                    let coef: i32 = (0..order).map(|i| lag - i).product();
+                    coef as f64 * rho.powi(lag - order)
+                }
+            }),
+            SerialShape::Power(e) => std::array::from_fn(|order| {
+                let coef: f64 = (0..order).map(|i| e - i as f64).product();
+                if coef == 0.0 {
+                    0.0
+                } else {
+                    coef * rho.powf(e - order as f64)
+                }
+            }),
+        }
+    }
+
+    /// `C(ρ)` on `T`: `ρ`, `ρ` multiplied by itself `lag` times, or `ρᵉ` (`1` at `e = 0`).
+    pub(crate) fn coefficient<T: crate::sens::num::PkNum>(self, rho: T) -> T {
+        match self {
+            SerialShape::Linear => rho,
+            SerialShape::IntPower(lag) => (1..lag)
+                .fold(if lag == 0 { T::from_f64(1.0) } else { rho }, |a, _| {
+                    a * rho
+                }),
+            SerialShape::Power(e) if e == 0.0 => T::from_f64(1.0),
+            SerialShape::Power(e) => rho.pow(T::from_f64(e)),
+        }
+    }
+}
+
+/// Each serial pair `(j, k)` with its coefficient's [`SerialShape`]: the pairs of one
+/// residual group (`obs_rgroup`, `0` none), `ar1`'s lag from each row's position in its
+/// group's time order. `None` when the population lacks its residual blocks.
+fn serial_pairs_shape(
+    kind: crate::types::ResidualSerialKind,
+    obs_rgroup: &[u32],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    n: usize,
+) -> Option<Vec<(usize, usize, SerialShape)>> {
     if n == 0 {
         return Some(Vec::new());
     }
@@ -1665,9 +1772,9 @@ fn serial_pairs_jet(
     }
     let time = |j: usize| crate::types::written_time(obs_times, obs_raw_times, j);
     let mut pos = vec![0usize; n];
-    if serial.kind == crate::types::ResidualSerialKind::Ar1 {
+    if kind == crate::types::ResidualSerialKind::Ar1 {
         let mut order: Vec<usize> = (0..n).filter(|&j| obs_rgroup[j] != 0).collect();
-        order.sort_by(|&a, &b| {
+        order.cold_sort_by(&|&a, &b| {
             obs_rgroup[a]
                 .cmp(&obs_rgroup[b])
                 .then(time(a).total_cmp(&time(b)))
@@ -1694,39 +1801,16 @@ fn serial_pairs_jet(
             if obs_rgroup[k] != g {
                 continue;
             }
-            let rho = serial.rho;
-            // `ρᵉ` and its first four ρ-derivatives (the exact anchor's covariance nested dual
-            // reads all four), each term written so a zero falling-factorial coefficient
-            // (`e ∈ {0, 1, 2, 3}`) never multiplies a pole at `ρ = 0`.
-            let power = |e: f64| -> [f64; 5] {
-                std::array::from_fn(|order| {
-                    let coef: f64 = (0..order).map(|i| e - i as f64).product();
-                    if coef == 0.0 {
-                        0.0
-                    } else {
-                        coef * rho.powf(e - order as f64)
-                    }
-                })
-            };
-            let c = match serial.kind {
-                crate::types::ResidualSerialKind::Cs => [rho, 1.0, 0.0, 0.0, 0.0],
+            let shape = match kind {
+                crate::types::ResidualSerialKind::Cs => SerialShape::Linear,
                 crate::types::ResidualSerialKind::Ar1 => {
-                    let lag = pos[j].abs_diff(pos[k]) as i32;
-                    std::array::from_fn(|order| {
-                        let order = order as i32;
-                        if lag < order {
-                            0.0
-                        } else {
-                            let coef: i32 = (0..order).map(|i| lag - i).product();
-                            coef as f64 * rho.powi(lag - order)
-                        }
-                    })
+                    SerialShape::IntPower(pos[j].abs_diff(pos[k]) as i32)
                 }
-                crate::types::ResidualSerialKind::Car1 => power((time(j) - time(k)).abs()),
+                crate::types::ResidualSerialKind::Car1 => {
+                    SerialShape::Power((time(j) - time(k)).abs())
+                }
             };
-            if c.iter().any(|&x| x != 0.0) {
-                out.push((j, k, c));
-            }
+            out.push((j, k, shape));
         }
     }
     Some(out)
@@ -3409,6 +3493,74 @@ mod tests {
         // A row of the wrong length carries no exponent half.
         assert_eq!(slot_exponent(&[1.0, 1.0, 1.3], 2, 0), None);
         assert_eq!(slot_exponent(&[1.3], 0, 0), None);
+    }
+
+    /// The `Single` fast paths of `variance_at`, `variance_at_raw` and `dvar_df` are the
+    /// per-endpoint general path bit for bit: every error model, over predictions that
+    /// reach every arm (zero and subnormal and `NaN`, which the variance guard replaces and
+    /// the slope gate zeroes; negative; large). A `PerCmt` spec with the same model at the
+    /// one endpoint is the independent reference for the value and the slope, so a fast arm
+    /// that drifts from the general one reddens here.
+    ///
+    /// Mutations: drop the `variance_is_guarded` return in the `dvar_df` fast arm → the
+    /// `f = -0.0` row (measured: `Proportional slope at f = -0: -0 vs 0`, the live slope
+    /// `2·f·σ²` keeps the zero's sign where the gated one is `+0.0`) and the rows whose raw
+    /// variance underflows or is `NaN` (`1e-200`, `5e-324`, `NaN`: a live slope against `0.0`)
+    /// fail; the `f = 0.0` row does not, since `2·0·σ² = 0.0` is the gated value too. Use
+    /// `sigma[1]` for `prop_sigma` → the combined row differs.
+    #[test]
+    fn single_spec_fast_paths_match_the_per_endpoint_general_path() {
+        for (em, sigma, idx) in [
+            (ErrorModel::Additive, vec![0.3], vec![0usize]),
+            (ErrorModel::Proportional, vec![0.2], vec![0]),
+            (ErrorModel::Combined, vec![0.2, 0.7], vec![0, 1]),
+            (ErrorModel::LogCombined, vec![0.2, 0.7], vec![0, 1]),
+        ] {
+            let single = ErrorSpec::Single(em);
+            let mut map = HashMap::new();
+            map.insert(
+                1usize,
+                EndpointError {
+                    error_model: em,
+                    sigma_idx: idx,
+                },
+            );
+            let per = ErrorSpec::PerCmt(map);
+            for f in [
+                0.0,
+                -0.0,
+                1e-200,
+                5e-324,
+                f64::NAN,
+                -2.5,
+                0.7,
+                13.0,
+                1e150,
+                f64::INFINITY,
+            ] {
+                let same = |a: f64, b: f64, what: &str| {
+                    assert!(
+                        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                        "{em:?} {what} at f = {f}: {a} vs {b}"
+                    );
+                };
+                same(
+                    single.variance_at(1, f, &sigma),
+                    per.variance_at(1, f, &sigma),
+                    "value",
+                );
+                same(
+                    single.variance_at_raw(1, f, &sigma),
+                    per.variance_at_raw(1, f, &sigma),
+                    "raw value",
+                );
+                same(
+                    single.dvar_df(1, f, &sigma),
+                    per.dvar_df(1, f, &sigma),
+                    "slope",
+                );
+            }
+        }
     }
 
     /// `variance_at_scaled` under an exponent is `m²σ²|f|^{2p}` (+ `σ_add²`

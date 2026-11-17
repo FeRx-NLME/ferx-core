@@ -1,4 +1,5 @@
 use super::*;
+use crate::sens::num::NonRecRead;
 
 // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
 
@@ -9571,7 +9572,7 @@ fn test_ruv_magnitude_theta_not_flagged_as_unused() {
 }
 
 /// `∂(program)/∂θ` through the live generic evaluator (`RuvMagDerivProgram::eval_g`,
-/// the one the adjoint tape records), seeded with `Dual1` θ leaves.
+/// the one the adjoint tape records), seeded with `Dual2` θ leaves.
 fn deriv_theta_grad<const N: usize>(
     p: &RuvMagDerivProgram,
     theta: &[f64; N],
@@ -9579,8 +9580,8 @@ fn deriv_theta_grad<const N: usize>(
     time: f64,
     tad: f64,
 ) -> Vec<f64> {
-    use crate::sens::dual1::Dual1;
-    let th: Vec<Dual1<N>> = (0..N).map(|m| Dual1::var(theta[m], m)).collect();
+    use crate::sens::dual2::Dual2;
+    let th: Vec<Dual2<N>> = (0..N).map(|m| Dual2::var(theta[m], m)).collect();
     p.eval_g(&th, cov, time, tad)
         .expect("θ count matches")
         .grad
@@ -9588,7 +9589,7 @@ fn deriv_theta_grad<const N: usize>(
 }
 
 /// xhigh review: `MACHEPS` inside a magnitude expression must resolve to
-/// `f64::EPSILON` in the `Dual1` θ-derivative program too (not just the
+/// `f64::EPSILON` in the `Dual2` θ-derivative program too (not just the
 /// value-only runtime closure) — `RuvMagDerivProgram` reserves a var slot
 /// for it now. Regression case: `WT + MACHEPS` guards a denominator; at
 /// `WT = 0.0` the pre-fix bug (`MACHEPS` silently resolving to `0.0` in the
@@ -17257,7 +17258,7 @@ fn test_parse_scaling_y_form_c_resolves_theta() {
 
 /// #486: a Form-C readout referencing θ/η directly is desugared into synthetic
 /// individual parameters (`__ferx_ro_*`), which makes the readout analytic
-/// (`is_dual_evaluable`) without adding any new random effect, and the synthetic
+/// (no direct θ/η read left in the readout) without adding any new random effect, and the synthetic
 /// names are suppressed from user-facing EBE output.
 #[test]
 fn test_form_c_direct_theta_eta_desugars_to_indiv_params() {
@@ -17277,15 +17278,15 @@ fn test_form_c_direct_theta_eta_desugars_to_indiv_params() {
     assert_eq!(synth.len(), 2, "one synthetic param per distinct θ/η ref");
     assert_eq!(model.indiv_param_names.len(), model.pk_indices.len());
 
-    // The desugared readout carries no bare θ/η ops, so it is dual-evaluable.
+    // The desugared readout carries no bare θ/η ops.
     let ode = model.ode_spec.as_ref().unwrap();
     let prog = ode
         .readout_program
         .as_ref()
         .expect("uniform Form-C readout has a sensitivity program");
     assert!(
-        prog.is_dual_evaluable(),
-        "a θ/η readout must be analytic after desugaring (#486)"
+        !prog.reads_leaves(),
+        "a θ/η readout must read no leaf after desugaring (#486)"
     );
 
     // The `ETA_CL` reference reuses the existing random effect — no new omega.
@@ -17344,10 +17345,11 @@ fn test_form_c_reserved_prefix_param_rejected() {
 
 /// #486 regression: a model that previously parsed (direct-θ readout served by the
 /// FD fallback) must not start failing the PK-slot layout once desugaring is
-/// available. When the synthetic param has no free slot, the readout falls back to
-/// FD (its prior behaviour) with a warning, instead of erroring.
+/// available. When the synthetic param has no free slot, the θ read stays in the
+/// readout (read from the θ leaves by the recorders), with no warning: nothing is
+/// lost, so there is nothing to say.
 #[test]
-fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
+fn test_form_c_direct_readout_stays_a_direct_read_when_slots_full() {
     // CL, V, KA take 3 of the (MAX_PK_PARAMS − reserved) usable slots; the
     // remaining are filled by EXTRA params → zero headroom. A direct-θ readout
     // would need one more.
@@ -17390,7 +17392,7 @@ fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
 "
     );
     let model = parse_model_string(&src)
-        .expect("a slot-full model with a direct-θ readout must still parse (FD fallback)");
+        .expect("a slot-full model with a direct-θ readout must still parse");
 
     // No synthetic param was injected — desugaring stood down for lack of a slot.
     assert!(
@@ -17400,13 +17402,18 @@ fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
             .any(|n| is_synthetic_readout_param(n)),
         "desugaring must not consume a slot it does not have"
     );
-    // The fallback is surfaced, not silent.
+    // The θ read stays in the readout, and no warning claims a lost gradient.
+    assert!(model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.readout_program.as_ref())
+        .is_some_and(|p| p.reads_leaves()));
     assert!(
-        model
+        !model
             .parse_warnings
             .iter()
             .any(|w| w.contains("finite-difference")),
-        "the FD fallback must be warned about, got: {:?}",
+        "no finite-difference note: {:?}",
         model.parse_warnings
     );
 }
@@ -18366,56 +18373,9 @@ fn bytecode_g_mod_carries_the_jet_of_both_operands() {
     assert_eq!((d.value, d.grad), (0.0, [0.0; 2]), "a mod 0");
 }
 
-/// `Op::Mod` on the taped-Hessian `DualV<_, _, true>` of the Laplace/AGQ exact
-/// anchor: the reverse sweep reaches the third derivative of each record, so the
-/// lift must say it is `0`. A `lift2` there records a `NaN` `φ‴` and the sweep
-/// comes back non-finite, which `Dual2` cannot see (#2150 review). With
-/// `S = w₀·f + w₁·∂ₓf + w₂·∂ᵧf + …` and `f = x mod y` affine between jumps,
-/// `∂S/∂x = w₀` and `∂S/∂y = −q·w₀` exactly.
-#[test]
-fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
-    use crate::sens::vtape::{vadj_index_h, vadj_init, vsweep_h, vtape_reset, DualV};
-    type V = DualV<2, 2, true>;
-    let expr = binop(BinOp::Mod, varidx(0), varidx(1));
-    let bc = compile_bytecode(&expr);
-    let w = [0.6, -1.1, 0.8, 0.5, -0.7];
-    for (x, y) in [(1.3_f64, 2.5_f64), (7.1, 2.5), (7.1, -2.5)] {
-        let q = x.div_euclid(y);
-        vtape_reset(1 + 2 + 2);
-        let vd = [
-            V::leaf(x, [1.0, 0.0], [0.0; 2]),
-            V::leaf(y, [0.0, 1.0], [0.0; 2]),
-        ];
-        let mut sd: Vec<V> = Vec::new();
-        let f = eval_bytecode_g::<V>(&bc, &[], &[], &[], &vd, &[], &mut sd);
-        assert_eq!(
-            f.v.to_bits(),
-            x.rem_euclid(y).to_bits(),
-            "value of {x} mod {y}"
-        );
-        assert_eq!((f.g, f.h), ([1.0, -q], [0.0; 2]), "jet of {x} mod {y}");
-        let adj = vadj_init::<1>();
-        for (comp, wc) in w.iter().enumerate() {
-            adj[vadj_index_h::<2, 2>(f.i, comp)] = *wc;
-        }
-        let adj = vsweep_h::<2, 2>(f.i as usize + 1).to_vec();
-        let got = vd.map(|l| adj[vadj_index_h::<2, 2>(l.i, 0)]);
-        assert!(
-            got.iter().all(|g| g.is_finite()),
-            "{x} mod {y}: sweep {got:?}"
-        );
-        assert!(
-            (got[0] - w[0]).abs() < 1e-12 && (got[1] + q * w[0]).abs() < 1e-12,
-            "{x} mod {y}: sweep {got:?}, want [{}, {}]",
-            w[0],
-            -q * w[0]
-        );
-    }
-}
-
 // ── In-place operand fusion in `eval_bytecode_g` ───────────────────────────
 //
-// For the outer `DualMixed` type `eval_bytecode_g` combines operands in place and
+// For the second-order `Dual2` type `eval_bytecode_g` combines operands in place and
 // applies a pushed constant / covariate / `TIME` / variable straight to the stack
 // top, and the compiler emits a literal-left `c ⊕ E` with the literal on top
 // (`Op::RSub` for `c - E`). The oracle below is the by-value evaluation those
@@ -18423,9 +18383,9 @@ fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
 // keep — including `Op::Div`'s `|b| < 1e-30 → 0` guard on both the stack and the
 // fused side.
 
-type Dm = crate::sens::dual_mixed::DualMixed<2, 3>;
+type Dm = crate::sens::dual2::Dual2<3>;
 
-/// By-value reference: every operand a full `DualMixed`, constants lifted to a
+/// By-value reference: every operand a full `Dual2`, constants lifted to a
 /// zero jet, the `Op::Div` guard applied — what `eval_bytecode_g` computed before
 /// operand fusion.
 fn dm_reference(e: &Expression, vars: &[Dm], covs: &[f64], time: f64) -> Dm {
@@ -18478,12 +18438,12 @@ fn dm_vars() -> Vec<Dm> {
     let signed_zero = Dm {
         value: 2.0,
         grad: [-0.0, 1.5, -0.0],
-        hess: [[-0.0, 0.25, -0.0], [0.25, -0.0, 0.0]],
+        hess: [[-0.0, 0.25, -0.0], [0.25, -0.0, 0.0], [-0.0, 0.0, 0.0]],
     };
     let infinite = Dm {
         value: 1.0,
         grad: [f64::INFINITY, -2.0, 0.0],
-        hess: [[0.0, 1.0, -0.0], [1.0, 0.0, 3.0]],
+        hess: [[0.0, 1.0, -0.0], [1.0, 0.0, 3.0], [0.0, 0.0, 0.0]],
     };
     vec![
         x * y + z,
@@ -27054,7 +27014,7 @@ fn power_form_with_unit_exponent_is_the_proportional_variance_bit_for_bit() {
 }
 
 /// `TAD` inside a magnitude expression is the record's data-derived time after
-/// dose, in both the runtime closure and the `Dual1` θ-program.
+/// dose, in both the runtime closure and the `Dual2` θ-program.
 #[test]
 fn magnitude_expression_reads_tad() {
     let content = r#"
@@ -29843,8 +29803,8 @@ fn a_readout_gather_is_lifted_into_a_synthetic_parameter_on_every_engine() {
             "[{engine}] the lifted gather must leave the readout bytecode"
         );
         assert!(
-            gather_readout_program(&m).is_dual_evaluable(),
-            "[{engine}] the readout must be dual-evaluable once the gather is lifted"
+            !gather_readout_program(&m).reads_leaves(),
+            "[{engine}] the readout must read no leaf once the gather is lifted"
         );
         assert!(
             !m.parse_warnings
@@ -29880,7 +29840,7 @@ fn readout_gather_synths_follow_the_theta_eta_synths() {
         ],
     );
     assert!(!readout_has_gather_op(&m));
-    assert!(gather_readout_program(&m).is_dual_evaluable());
+    assert!(!gather_readout_program(&m).reads_leaves());
 }
 
 /// An index that reads an individual parameter is lifted (its value is pinned by
@@ -29896,7 +29856,7 @@ fn a_readout_gather_indexed_by_an_individual_parameter_is_lifted() {
     .expect("parse");
     assert_eq!(readout_synth_names(&m), ["__ferx_ro_g0"]);
     assert!(!readout_has_gather_op(&m));
-    assert!(gather_readout_program(&m).is_dual_evaluable());
+    assert!(!gather_readout_program(&m).reads_leaves());
 }
 
 /// T2, unliftable index: a gather indexed by a compartment amount stays in the
@@ -29930,8 +29890,8 @@ fn a_state_indexed_readout_gather_stays_in_the_readout_and_routes_to_fd() {
         "premise: no bare θ/η op, so only `PushThetaGather` can disqualify the readout"
     );
     assert!(
-        !gather_readout_program(&m).is_dual_evaluable(),
-        "a gather left in the readout must route to FD"
+        gather_readout_program(&m).reads_leaves(),
+        "a gather left in the readout is read from the θ leaves"
     );
     assert!(
         !m.referenced_covariates.iter().any(|c| c == "central"),
@@ -29970,7 +29930,7 @@ fn a_time_alias_indexed_readout_gather_stays_in_the_readout() {
         readout_has_gather_op(&m),
         "premise: the gather is still in the readout"
     );
-    assert!(!gather_readout_program(&m).is_dual_evaluable());
+    assert!(gather_readout_program(&m).reads_leaves());
     assert!(
         !m.referenced_covariates.iter().any(|c| c == "T"),
         "`T` is the time alias here, not a data column: {:?}",
@@ -29979,10 +29939,10 @@ fn a_time_alias_indexed_readout_gather_stays_in_the_readout() {
 }
 
 /// T2, slot overflow on the analytical engine: three gathers into a 2-slot spare
-/// pool. Every synth is dropped, the gathers stay in the bytecode, the readout is
-/// not dual-evaluable, and the sizing note names the blocks.
+/// pool. Every synth is dropped and the gathers stay in the bytecode, where the recorders read
+/// them from the θ leaves: no finite-difference note, no warning at all about the readout.
 #[test]
-fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
+fn an_overflowing_readout_gather_stays_in_the_readout_and_warns_of_nothing() {
     let src = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -30023,33 +29983,12 @@ fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
         readout_has_gather_op(&m),
         "premise: the gathers stay in the readout"
     );
+    assert!(gather_readout_program(&m).reads_leaves());
     assert!(
-        !gather_readout_program(&m)
-            .bc
-            .ops
+        !m.parse_warnings
             .iter()
-            .any(|op| matches!(op, Op::PushTheta(_) | Op::PushEta(_))),
-        "premise: no bare θ/η op, so only `PushThetaGather` can disqualify the readout"
-    );
-    assert!(
-        !gather_readout_program(&m).is_dual_evaluable(),
-        "a gather left in the readout must make it non-dual-evaluable"
-    );
-    let note = m
-        .parse_warnings
-        .iter()
-        .find(|w| w.contains("more PK slot(s)"))
-        .expect("the sizing note");
-    assert!(
-        note.contains("a direct THETA/ETA or θ level-block (`SCALE`, `OFF`) reference")
-            && note.contains("needs 1 more PK slot(s) than the 2-slot layout has free"),
-        "the note must name the blocks and the analytical pool; got: {note}"
-    );
-    assert!(
-        m.parse_warnings
-            .iter()
-            .any(|w| w.contains("direct THETA/ETA or θ level-block reference, a neural")),
-        "the readout-shape note must list a level block among its causes: {:?}",
+            .any(|w| w.contains("finite-difference") || w.contains("more PK slot(s)")),
+        "the readout is served, so no note says otherwise: {:?}",
         m.parse_warnings
     );
     assert!(
@@ -30058,23 +29997,6 @@ fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
             .any(|w| w.contains("but not referenced")),
         "levels read only by an unlifted readout gather are still referenced: {:?}",
         m.parse_warnings
-    );
-}
-
-/// The θ/η-only note is worded as before when no gather was dropped.
-#[test]
-fn the_readout_sizing_note_names_no_block_when_none_was_dropped() {
-    let note = readout_synth_fd_note(
-        1,
-        2,
-        &[ReadoutSynthParam {
-            name: format!("{READOUT_SYNTH_PREFIX}th0"),
-            source: ReadoutSynthSource::Theta(0),
-        }],
-    );
-    assert!(
-        note.starts_with("[scaling] y: a direct THETA/ETA reference in the readout needs 1"),
-        "{note}"
     );
 }
 
@@ -34810,18 +34732,19 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         }
     }
 
-    // `Dual1`: the jets must be keyed too. Calls 0 and 1 carry the same parameter
+    // A first-order dual: the jets must be keyed too. Calls 0 and 1 carry the same parameter
     // *values* but seed Q on different axes, so a value-only key would replay Q's
     // jet from the wrong axis.
-    type D = crate::sens::dual1::Dual1<3>;
+    type D = crate::sens::jet::DualT<3, f64>;
+    use crate::sens::num::PkNum;
     let seed = |p: &[f64; 6], q_axis: usize| -> Vec<D> {
         vec![
-            D::var(p[0], 0),
+            <D as PkNum>::var(p[0], 0),
             D::constant(p[1]),
-            D::var(p[2], q_axis),
-            D::var(p[3], 2),
+            <D as PkNum>::var(p[2], q_axis),
+            <D as PkNum>::var(p[3], 2),
             D::constant(p[4]),
-            D::var(p[5], 0) + D::var(0.0, 1),
+            <D as PkNum>::var(p[5], 0) + <D as PkNum>::var(0.0, 1),
         ]
     };
     let dcalls: [(Vec<D>, [f64; 2], f64); 5] = [
@@ -34837,7 +34760,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
     let mut stack_p: Vec<D> = Vec::new();
     for (k, (p, u, t)) in dcalls.iter().enumerate() {
         let params = hoist_params::<D>(prog, p);
-        let ud = [D::constant(u[0]), D::var(u[1], 2)];
+        let ud = [D::constant(u[0]), <D as PkNum>::var(u[1], 2)];
         let mut want = [D::constant(0.0); 2];
         plain.eval_rhs_g::<D>(
             &ud,
@@ -34862,23 +34785,23 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             &mut vars_h,
             &mut stack_h,
         );
-        // The lift is live for `Dual1`: its scratch carries the cache tail.
+        // The lift is live for a first-order dual: its scratch carries the cache tail.
         assert_eq!(
             vars_h.len(),
             prog.hoist.as_ref().unwrap().n_ext,
-            "Dual1 uses the lift"
+            "a first-order dual uses the lift"
         );
         for j in 0..2 {
             assert!(
-                hoist_bits_eq(got[j].value, want[j].value),
+                hoist_bits_eq(got[j].v, want[j].v),
                 "dual call {k} du[{j}] value"
             );
             for a in 0..3 {
                 assert!(
-                    hoist_bits_eq(got[j].grad[a], want[j].grad[a]),
+                    hoist_bits_eq(got[j].g[a], want[j].g[a]),
                     "dual call {k} du[{j}] grad[{a}]: {} vs {}",
-                    got[j].grad[a],
-                    want[j].grad[a]
+                    got[j].g[a],
+                    want[j].g[a]
                 );
             }
         }
@@ -34886,7 +34809,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
 
     // Second-order duals skip the lift (their key would cost what the lift saves):
     // the scratch never grows a cache tail, and the result is the unlifted one.
-    type M = crate::sens::dual_mixed::DualMixed<2, 3>;
+    type M = crate::sens::dual2::Dual2<3>;
     let params = hoist_params::<M>(
         prog,
         &[
@@ -34915,7 +34838,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
     assert_eq!(
         vars_m.len(),
         prog.n_vars_total,
-        "DualMixed must not use the lift"
+        "Dual2 must not use the lift"
     );
     let mut want = [M::constant(0.0); 2];
     plain.eval_rhs_g::<M>(
@@ -34930,7 +34853,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         &mut Vec::new(),
     );
     for j in 0..2 {
-        assert!(got[j].same_bits(&want[j]), "DualMixed du[{j}]");
+        assert!(got[j].same_bits(&want[j]), "Dual2 du[{j}]");
     }
 }
 
@@ -35341,7 +35264,7 @@ const HOIST_BRANCH_ONLY_WRITE: &str = "
 
 /// Lifted vs unlifted over `(state, time)` calls on one parameter set — every call
 /// after the first a cache hit on a persistent scratch — for the f64 closure,
-/// `eval_rhs_g::<f64>` and `::<Dual1>`.
+/// `eval_rhs_g::<f64>` and `::<Dual2>`.
 fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &[(Vec<f64>, f64)]) {
     let model = hoist_model(src);
     let prog = hoist_program(&model);
@@ -35350,7 +35273,7 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
     let plain = hoist_program(&plain_model);
     let params = hoist_params::<f64>(prog, &[3.0, 30.0]);
     let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
-    type D = crate::sens::dual1::Dual1<2>;
+    type D = crate::sens::dual2::Dual2<2>;
     let dparams = hoist_params::<D>(prog, &[D::var(3.0, 0), D::var(30.0, 1)]);
     let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
     for (k, (u, t)) in calls.iter().enumerate() {
@@ -35422,12 +35345,12 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
             // Entry by entry: `same_bits` is part of the code under test.
             assert!(
                 hoist_bits_eq(dgot[j].value, dwant[j].value),
-                "call {k} du[{j}] Dual1 value"
+                "call {k} du[{j}] Dual2 value"
             );
             for a in 0..2 {
                 assert!(
                     hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
-                    "call {k} du[{j}] Dual1 grad[{a}]"
+                    "call {k} du[{j}] Dual2 grad[{a}]"
                 );
             }
         }
@@ -35539,7 +35462,7 @@ fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
 /// parameter alone (between time-varying-parameter snapshots that is exactly what
 /// happens to `V2` while `Q` stays put), on one persistent scratch, and require
 /// parity with the unlifted program for the f64 closure, `eval_rhs_g::<f64>` and
-/// `::<Dual1>`. A key comparison that skips any one slot replays a stale lift here.
+/// `::<Dual2>`. A key comparison that skips any one slot replays a stale lift here.
 #[test]
 fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
     // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
@@ -35551,7 +35474,7 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
     let plain = hoist_program(&plain_model);
     let rhs = &model.ode_spec.as_ref().unwrap().rhs;
-    type D = crate::sens::dual1::Dual1<2>;
+    type D = crate::sens::dual2::Dual2<2>;
     let base = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06];
     let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
     let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
@@ -35632,12 +35555,12 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             );
             assert!(
                 hoist_bits_eq(dgot[j].value, dwant[j].value),
-                "set {c} {p:?} du[{j}] Dual1 value"
+                "set {c} {p:?} du[{j}] Dual2 value"
             );
             for a in 0..2 {
                 assert!(
                     hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
-                    "set {c} {p:?} du[{j}] Dual1 grad[{a}]"
+                    "set {c} {p:?} du[{j}] Dual2 grad[{a}]"
                 );
             }
         }
@@ -35730,7 +35653,7 @@ fn rhs_hoist_key_tells_signed_zeros_apart() {
     }
 }
 
-/// A `Dual1` key must compare every gradient component: at fixed parameter
+/// A first-order dual's key must compare every gradient component: at fixed parameter
 /// *values*, change one jet entry of one parameter at a time between cache hits.
 #[test]
 fn rhs_hoist_dual1_key_compares_every_gradient_component() {
@@ -35741,23 +35664,24 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
     let prog = hoist_program(&model);
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
     let plain = hoist_program(&plain_model);
-    type D = crate::sens::dual1::Dual1<3>;
+    type D = crate::sens::jet::DualT<3, f64>;
+    use crate::sens::num::PkNum;
     let base: Vec<D> = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06]
         .iter()
         .enumerate()
-        .map(|(i, &v)| D::var(v, i % 3))
+        .map(|(i, &v)| <D as PkNum>::var(v, i % 3))
         .collect();
     let mut sets = vec![base.clone()];
     for p in [1usize, 2, 3, 5] {
         // V1, Q, V2, SH: the four the lifted code reads.
         for k in 0..3 {
             let mut s = base.clone();
-            s[p].grad[k] += 0.5;
+            s[p].g[k] += 0.5;
             sets.push(s);
             sets.push(base.clone());
         }
     }
-    let ud = [D::constant(80.0), D::var(9.0, 2)];
+    let ud = [D::constant(80.0), <D as PkNum>::var(9.0, 2)];
     let (mut vars, mut stack) = (Vec::<D>::new(), Vec::<D>::new());
     for (c, s) in sets.iter().enumerate() {
         let params = hoist_params::<D>(prog, s);
@@ -35787,16 +35711,13 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
         );
         // Compared entry by entry, not through `same_bits` — the function under test.
         for j in 0..2 {
-            assert!(
-                hoist_bits_eq(got[j].value, want[j].value),
-                "set {c} du[{j}] value"
-            );
+            assert!(hoist_bits_eq(got[j].v, want[j].v), "set {c} du[{j}] value");
             for k in 0..3 {
                 assert!(
-                    hoist_bits_eq(got[j].grad[k], want[j].grad[k]),
+                    hoist_bits_eq(got[j].g[k], want[j].g[k]),
                     "set {c} du[{j}] grad[{k}]: {} vs {}",
-                    got[j].grad[k],
-                    want[j].grad[k]
+                    got[j].g[k],
+                    want[j].g[k]
                 );
             }
         }
@@ -36583,7 +36504,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
     // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
     // both), which every program the compiler declines still takes.
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
-    type D1 = crate::sens::dual1::Dual1<3>;
+    type D1 = crate::sens::dual2::Dual2<3>;
     type D2 = crate::sens::dual2::Dual2<2>;
 
     let p1 = [4.0, 40.0, 0.7];
@@ -36651,14 +36572,14 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
             );
             for j in 0..2 {
                 assert!(
-                    want[j].val().is_finite(),
+                    want[j].plain().is_finite(),
                     "{name} call {k}: oracle du[{j}] not finite"
                 );
                 assert!(
                     got[j].same_bits(&want[j]),
                     "{name} call {k} du[{j}]: lean {} vs full {}",
-                    got[j].val(),
-                    want[j].val()
+                    got[j].plain(),
+                    want[j].plain()
                 );
             }
         }
@@ -36714,7 +36635,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
         let seq: Vec<(Vec<f64>, [f64; 2], f64)> =
             calls.iter().map(|(p, u, t)| (ext(p), *u, *t)).collect();
         run_g::<f64>(name, lean, full, &seq, tafd_of, |t| t - last);
-        // Dual1: CL, V, Q on axes 0, 1, 2; TAD carries ∂/∂lag on axis 0.
+        // Dual2: CL, V, Q on axes 0, 1, 2; TAD carries ∂/∂lag on axis 0.
         let seq: Vec<(Vec<D1>, [f64; 2], f64)> = calls
             .iter()
             .map(|(p, u, t)| {
@@ -37727,9 +37648,8 @@ fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
         .and_then(|ar| ar.program.as_ref())
         .expect("the equation compiles to a readout program");
     assert!(
-        program.is_dual_evaluable(),
-        "a desugared THETA/ETA must leave the readout dual-evaluable — otherwise the \
-         model loses its analytic gradient"
+        !program.reads_leaves(),
+        "a desugared THETA/ETA must leave the readout reading no leaf"
     );
     assert!(
         !model
@@ -39807,4 +39727,160 @@ fn ferx_check_reports_only_the_truly_unused_theta_of_a_mixture() {
         "{:?}",
         report.diagnostics
     );
+}
+
+/// A gather index that follows θ or η is no level index, so the recording holds it as a value and
+/// selects the level from it at run time (`gather_select_g`; it used to fail the recording, and
+/// before that read `NaN`). The level follows the index at each recording (index 2 gathers
+/// `θ[1]`, index 1 gathers `θ[0]`), and a covariate index (data) gathers its level directly.
+/// Mutation: `value_read_refused` back in `Op::PushThetaGather` -> the θ-dependent recordings
+/// fail.
+#[test]
+fn a_theta_dependent_gather_index_selects_its_level_in_the_recording() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let program = |index: Op| Bytecode {
+        ops: vec![index, Op::PushThetaGather(0)],
+        constants: vec![0.0],
+        max_stack: 2,
+        gathers: vec![std::sync::Arc::new(GatherSpec {
+            name: "G".into(),
+            levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
+        })],
+    };
+    let run = |bc: &Bytecode, th1: f64| {
+        kj::begin();
+        let th = [kj::Tr::theta(0, 5.0), kj::Tr::theta(1, th1)];
+        let y = eval_bytecode_g(bc, &th, &[], &[2.0], &[], &[], &mut Vec::new());
+        (y.recorded(), kj::end(Some(vec![y.reg()])))
+    };
+    let (v, rec) = run(&program(Op::PushCov(0)), 2.0);
+    assert!(rec.is_ok(), "a covariate index records");
+    assert_eq!(v, 2.0, "level 2 is θ[1]");
+    // The index is θ[1] itself: 2.0 gathers level 2 (θ[1]), 1.0 gathers level 1 (θ[0]).
+    for (th1, want) in [(2.0, 2.0), (1.0, 5.0)] {
+        let (v, rec) = run(&program(Op::PushTheta(1)), th1);
+        assert!(rec.is_ok(), "a θ-dependent index records (θ[1] = {th1})");
+        assert_eq!(v, want, "θ[1] = {th1} selects its own level");
+    }
+}
+
+/// A snapshot of a subject's covariates evaluates a typical value bit-for-bit as the map does,
+/// an absent covariate reads `0.0` in both, a program with more definitions than the stack
+/// buffer holds agrees too, and the names are each covariate once in first-read order. Dies when
+/// the snapshot resolves a name to another's slot (`WT` and `AGE` swapped changes the value) or
+/// the snapshot drops the absent-is-zero rule (`GHOST` would be NaN or panic).
+#[test]
+fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() {
+    let cov = |n: &str| Expression::Covariate(n.to_string());
+    let bin = |l, op, r| Expression::BinOp(Box::new(l), op, Box::new(r));
+    let root = bin(
+        bin(cov("WT"), BinOp::Div, Expression::Literal(70.0)),
+        BinOp::Add,
+        bin(
+            bin(cov("AGE"), BinOp::Mul, cov("WT")),
+            BinOp::Add,
+            bin(cov("GHOST"), BinOp::Add, Expression::Theta(0)),
+        ),
+    );
+    let wide = |k: usize| {
+        // `k` chained definitions, each reading the one before and a covariate.
+        let defs: Vec<Expression> = (0..k)
+            .map(|j| {
+                let prev = if j == 0 {
+                    Expression::Theta(0)
+                } else {
+                    Expression::VariableIdx(j - 1)
+                };
+                bin(prev, BinOp::Add, bin(cov("AGE"), BinOp::Mul, cov("WT")))
+            })
+            .collect();
+        let tail = bin(Expression::VariableIdx(k - 1), BinOp::Add, root.clone());
+        TypicalProgram { defs, root: tail }
+    };
+    let mut covs: HashMap<String, f64> = HashMap::new();
+    covs.insert("WT".to_string(), 83.5);
+    covs.insert("AGE".to_string(), 41.0);
+    covs.insert("UNREAD".to_string(), 9.0);
+    for prog in [TypicalProgram::of(root.clone()), wide(3), wide(12)] {
+        let names = prog.covariate_names();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"GHOST".to_string()));
+        let snap = CovariateSnapshot::new(&names, &covs);
+        for theta in [[0.3], [-1.7]] {
+            assert_eq!(
+                prog.eval_snapshot(&theta, &snap).to_bits(),
+                prog.eval(&theta, &covs).to_bits()
+            );
+        }
+    }
+    let swapped: HashMap<String, f64> = [("WT", 41.0), ("AGE", 83.5)]
+        .map(|(k, v)| (k.to_string(), v))
+        .into();
+    let prog = TypicalProgram::of(root);
+    assert_ne!(
+        prog.eval(&[0.3], &swapped).to_bits(),
+        prog.eval(&[0.3], &covs).to_bits(),
+        "the fixture tells WT from AGE"
+    );
+
+    // Covariates inside every nesting `covariate_names` walks: a condition operand and both
+    // branches of a `Conditional`, a `ThetaGather` index, a `UnaryFn` operand and both
+    // `Power` operands. Deleting any one walk arm drops its names, and each dropped covariate
+    // changes the value (it reads `0.0` in the snapshot): `CA` is read only by the first
+    // condition (missing → the else branch `CC`), `CD` only by the second (missing → the then
+    // branch `CE`); `CB` and `CF` are the branches taken.
+    let cond = |c: Condition, t: Expression, f: Expression| {
+        Expression::Conditional(Box::new(c), Box::new(t), Box::new(f))
+    };
+    let nested = [
+        cond(
+            Condition::Compare(cov("CA"), CmpOp::Gt, Expression::Literal(1.0)),
+            cov("CB"),
+            cov("CC"),
+        ),
+        cond(
+            Condition::Compare(cov("CD"), CmpOp::Lt, Expression::Literal(1.0)),
+            cov("CE"),
+            cov("CF"),
+        ),
+        Expression::ThetaGather {
+            spec: std::sync::Arc::new(GatherSpec {
+                name: "G".into(),
+                levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
+            }),
+            idx: Box::new(cov("LVL")),
+        },
+        Expression::UnaryFn("exp".into(), Box::new(cov("UF"))),
+        Expression::Power(Box::new(cov("PB")), Box::new(cov("PE"))),
+    ]
+    .into_iter()
+    .reduce(|a, b| bin(a, BinOp::Add, b))
+    .unwrap();
+    let nested = TypicalProgram::of(nested);
+    let covs: HashMap<String, f64> = [
+        ("CA", 5.0),
+        ("CB", 7.0),
+        ("CC", 11.0),
+        ("CD", 5.0),
+        ("CE", 13.0),
+        ("CF", 17.0),
+        ("LVL", 2.0),
+        ("UF", 0.4),
+        ("PB", 1.3),
+        ("PE", 2.2),
+    ]
+    .map(|(k, v)| (k.to_string(), v))
+    .into();
+    let names = nested.covariate_names();
+    assert_eq!(
+        names,
+        ["CA", "CB", "CC", "CD", "CE", "CF", "LVL", "UF", "PB", "PE"].map(String::from)
+    );
+    let snap = CovariateSnapshot::new(&names, &covs);
+    for theta in [[0.3, 1.9], [-1.7, 2.5]] {
+        assert_eq!(
+            nested.eval_snapshot(&theta, &snap).to_bits(),
+            nested.eval(&theta, &covs).to_bits()
+        );
+    }
 }

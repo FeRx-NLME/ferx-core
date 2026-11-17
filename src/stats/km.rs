@@ -1,10 +1,10 @@
 //! Kaplan–Meier and Nelson–Aalen estimates, the mean cumulative function of
-//! repeated events, and the pointwise band a visual predictive check draws from
-//! replicate curves (#1886).
+//! repeated events, the Kaplan–Meier mean covariate, and the pointwise band a visual
+//! predictive check draws from replicate curves (#1886).
 //!
-//! Pure `f64` math with no feature gate: the TTE VPC drivers (`api::vpc_tte` and
-//! `api::vpc_rtte`, behind `survival`) feed it, and so can any caller holding
-//! `(time, event)` pairs or event times with follow-up ends.
+//! Pure `f64` math with no feature gate: the TTE VPC drivers (`api::vpc_tte`,
+//! `api::vpc_rtte` and `api::vpc_kmmc`, behind `survival`) feed it, and so can any
+//! caller holding `(time, event)` pairs or event times with follow-up ends.
 //!
 //! **Tie convention.** The one R's `survival::survfit` uses, so a curve here
 //! equals survfit's row for row. One row per distinct time, event or censoring.
@@ -13,10 +13,11 @@
 //! still in the risk set of the events at `t`. Then
 //! `S(t) = Π (1 − d_j / n_j)` and `H(t) = Σ d_j / n_j` over the rows up to `t`.
 //!
-//! **One counting pass.** [`kaplan_meier`] and [`mean_cumulative`] count their rows
-//! in the same private pass. They differ in one thing: whether a subject leaves the
-//! risk set at its event (Kaplan–Meier) or stays in it until its follow-up ends (the
-//! mean cumulative function, where a subject can have any number of events).
+//! **One counting pass.** [`kaplan_meier`], [`kaplan_meier_mean_covariate`] and
+//! [`mean_cumulative`] count their rows in the same private pass. They differ in one
+//! thing: whether a subject leaves the risk set at its event (Kaplan–Meier and its
+//! mean covariate) or stays in it until its follow-up ends (the mean cumulative
+//! function, where a subject can have any number of events).
 //!
 //! **Quantile type.** The band uses
 //! [`quantile_sorted`], R's default
@@ -41,7 +42,8 @@ pub struct KmCurve {
     pub cumhaz: Vec<f64>,
 }
 
-/// Why [`kaplan_meier`], [`vpc_band`] or [`vpc_band_mcf`] refused its input.
+/// Why [`kaplan_meier`], [`kaplan_meier_mean_covariate`], [`vpc_band`],
+/// [`vpc_band_mcf`] or [`vpc_band_kmmc`] refused its input.
 #[derive(Debug, Clone, PartialEq)]
 pub enum KmInputError {
     /// `times` and `events` have different lengths.
@@ -50,6 +52,10 @@ pub enum KmInputError {
     BadTime { index: usize, value: f64 },
     /// Band probabilities that are not strictly inside (0, 1) and strictly increasing.
     BadProbs { probs: [f64; 3] },
+    /// [`kaplan_meier_mean_covariate`]: `times` and `values` have different lengths.
+    ValueLengthMismatch { times: usize, values: usize },
+    /// [`kaplan_meier_mean_covariate`]: a covariate value that is not finite.
+    BadValue { index: usize, value: f64 },
 }
 
 impl std::fmt::Display for KmInputError {
@@ -66,6 +72,16 @@ impl std::fmt::Display for KmInputError {
             KmInputError::BadProbs { probs } => write!(
                 f,
                 "band probabilities {probs:?} must be strictly inside (0, 1) and strictly increasing"
+            ),
+            KmInputError::ValueLengthMismatch { times, values } => write!(
+                f,
+                "kaplan_meier_mean_covariate: {times} times but {values} covariate values; give \
+                 one value per time"
+            ),
+            KmInputError::BadValue { index, value } => write!(
+                f,
+                "kaplan_meier_mean_covariate: covariate value {value} at index {index} is not a \
+                 finite number"
             ),
         }
     }
@@ -100,7 +116,7 @@ pub fn kaplan_meier(times: &[f64], events: &[bool]) -> Result<KmCurve, KmInputEr
     let marks: Vec<(f64, bool)> = times.iter().copied().zip(events.iter().copied()).collect();
     let mut curve = KmCurve::default();
     let (mut s, mut h) = (1.0_f64, 0.0_f64);
-    for row in count_pass(&marks, true) {
+    for row in count_pass(&marks, true).0 {
         if row.n_event > 0 {
             s *= 1.0 - row.n_event as f64 / row.n_risk as f64;
             h += row.n_event as f64 / row.n_risk as f64;
@@ -115,13 +131,115 @@ pub fn kaplan_meier(times: &[f64], events: &[bool]) -> Result<KmCurve, KmInputEr
     Ok(curve)
 }
 
+/// A Kaplan–Meier mean covariate (KMMC) curve: at each row of the Kaplan–Meier
+/// curve of the same data, the mean of a per-subject value over the subjects at
+/// risk there (Hooker & Karlsson, PAGE 21 (2012) Abstr 2564).
+///
+/// The vectors are parallel, and `time`, `n_risk`, `n_event` and `n_censor` equal
+/// [`kaplan_meier`]'s on the same `(times, events)` row for row, since both come
+/// from one counting pass. `mean[j]` is the mean of the values of the `n_risk[j]`
+/// subjects with time `≥ time[j]`: a subject censored at a tied time is still in
+/// the set (the module's tie convention). For a 0/1 value it is the share coded 1.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct KmmcCurve {
+    pub time: Vec<f64>,
+    pub n_risk: Vec<usize>,
+    pub n_event: Vec<usize>,
+    pub n_censor: Vec<usize>,
+    pub mean: Vec<f64>,
+}
+
+/// The Kaplan–Meier mean covariate curve of `(times, events)` with one covariate
+/// value per subject in `values`: the mean of `values` over each Kaplan–Meier risk
+/// set `{i : times[i] ≥ t}`. See [`KmmcCurve`].
+///
+/// An empty input gives an empty curve, on which [`KmmcCurve::at`] is `None`
+/// everywhere.
+///
+/// # Errors
+///
+/// As [`kaplan_meier`], plus [`KmInputError::ValueLengthMismatch`] when `values`
+/// is not as long as `times`, and [`KmInputError::BadValue`] for a value that is
+/// not finite (a missing covariate is `NaN` and would make every mean `NaN`).
+pub fn kaplan_meier_mean_covariate(
+    times: &[f64],
+    events: &[bool],
+    values: &[f64],
+) -> Result<KmmcCurve, KmInputError> {
+    if times.len() != events.len() {
+        return Err(KmInputError::LengthMismatch {
+            times: times.len(),
+            events: events.len(),
+        });
+    }
+    if times.len() != values.len() {
+        return Err(KmInputError::ValueLengthMismatch {
+            times: times.len(),
+            values: values.len(),
+        });
+    }
+    if let Some((index, &value)) = times
+        .iter()
+        .enumerate()
+        .find(|(_, t)| !(t.is_finite() && **t >= 0.0))
+    {
+        return Err(KmInputError::BadTime { index, value });
+    }
+    if let Some((index, &value)) = values.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+        return Err(KmInputError::BadValue { index, value });
+    }
+    let marks: Vec<(f64, bool)> = times.iter().copied().zip(events.iter().copied()).collect();
+    let (rows, order) = count_pass(&marks, true);
+    // suffix[k] = the sum of the values at sorted positions k.., so the risk set of a
+    // row starting at `start` sums to suffix[start].
+    let mut suffix = vec![0.0_f64; order.len() + 1];
+    for k in (0..order.len()).rev() {
+        suffix[k] = suffix[k + 1] + values[order[k]];
+    }
+    let mut curve = KmmcCurve::default();
+    for row in rows {
+        debug_assert_eq!(row.n_risk, order.len() - row.start);
+        curve.time.push(row.time);
+        curve.n_risk.push(row.n_risk);
+        curve.n_event.push(row.n_event);
+        curve.n_censor.push(row.n_leave);
+        curve.mean.push(suffix[row.start] / row.n_risk as f64);
+    }
+    Ok(curve)
+}
+
+impl KmmcCurve {
+    /// The mean covariate over the subjects at risk **at** `t`: the value of the first
+    /// row with time `≥ t`, so the curve is left-continuous (it takes a row's value
+    /// up to and including that row's time, and the next row's just after it).
+    /// Before the first row it is the mean over everyone.
+    ///
+    /// `None` past the last time (nobody is at risk), where that row's `n_risk` is
+    /// below `min_at_risk` (too few subjects for a mean worth plotting), for an
+    /// empty curve, and for a `t` that is not a number.
+    pub fn at(&self, t: f64, min_at_risk: usize) -> Option<f64> {
+        if t.is_nan() {
+            return None;
+        }
+        // Number of rows with time < t, i.e. the index of the first row with time ≥ t.
+        let j = self.time.partition_point(|&x| x < t);
+        if j >= self.time.len() || self.n_risk[j] < min_at_risk {
+            return None;
+        }
+        Some(self.mean[j])
+    }
+}
+
 /// One row of [`count_pass`]: a distinct time, the risk set at it, and the events
-/// and the departures at exactly that time.
+/// and the departures at exactly that time. `start` is the position of the row's
+/// first mark in the pass's sorted order, so under `event_leaves` the risk set is
+/// the marks at sorted positions `start..`.
 struct CountRow {
     time: f64,
     n_risk: usize,
     n_event: usize,
     n_leave: usize,
+    start: usize,
 }
 
 /// The counting pass [`kaplan_meier`] and [`mean_cumulative`] share, under the
@@ -134,7 +252,9 @@ struct CountRow {
 ///
 /// One row per distinct time, in increasing order. Events at a time are counted
 /// before the departures at it, so `n_risk` still holds the subjects leaving there.
-fn count_pass(marks: &[(f64, bool)], event_leaves: bool) -> Vec<CountRow> {
+/// The second value is the sorted order itself (indices into `marks`), which
+/// [`kaplan_meier_mean_covariate`] reads the risk sets from.
+fn count_pass(marks: &[(f64, bool)], event_leaves: bool) -> (Vec<CountRow>, Vec<usize>) {
     let mut order: Vec<usize> = (0..marks.len()).collect();
     order.sort_by(|&a, &b| marks[a].0.total_cmp(&marks[b].0));
 
@@ -147,6 +267,7 @@ fn count_pass(marks: &[(f64, bool)], event_leaves: bool) -> Vec<CountRow> {
     let mut k = 0;
     while k < order.len() {
         let t = marks[order[k]].0;
+        let start = k;
         let (mut d, mut c) = (0usize, 0usize);
         while k < order.len() && marks[order[k]].0 == t {
             if marks[order[k]].1 {
@@ -162,10 +283,11 @@ fn count_pass(marks: &[(f64, bool)], event_leaves: bool) -> Vec<CountRow> {
             n_risk: at_risk,
             n_event: d,
             n_leave: c,
+            start,
         });
         at_risk -= if event_leaves { d + c } else { c };
     }
-    rows
+    (rows, order)
 }
 
 /// The mean cumulative function (MCF) of repeated events with its risk set, one row
@@ -257,7 +379,7 @@ pub fn mean_cumulative(
         .collect();
     let mut curve = McfCurve::default();
     let mut m = 0.0_f64;
-    for row in count_pass(&marks, false) {
+    for row in count_pass(&marks, false).0 {
         if row.n_event > 0 {
             if row.n_risk == 0 {
                 return Err(McfInputError::EventAfterFollowUp { time: row.time });
@@ -371,6 +493,29 @@ pub fn vpc_band_mcf(
     probs: [f64; 3],
 ) -> Result<VpcBand, KmInputError> {
     band_over(curves.len(), |j, t| curves[j].at(t), grid, probs)
+}
+
+/// [`vpc_band`] over Kaplan–Meier mean covariate curves: the pointwise `probs` band
+/// of [`KmmcCurve::at`]`(t, min_at_risk)` on `grid`. A curve past its last time, or
+/// with fewer than `min_at_risk` subjects at risk at `t`, is left out at `t`, so the
+/// at-risk floor applies to each replicate on its own, as it does to the observed
+/// curve. The same [`min_curves_for`] floor then applies to the curves that remain.
+///
+/// # Errors
+///
+/// [`KmInputError::BadProbs`] unless [`probs_valid`].
+pub fn vpc_band_kmmc(
+    curves: &[KmmcCurve],
+    grid: &[f64],
+    probs: [f64; 3],
+    min_at_risk: usize,
+) -> Result<VpcBand, KmInputError> {
+    band_over(
+        curves.len(),
+        |j, t| curves[j].at(t, min_at_risk),
+        grid,
+        probs,
+    )
 }
 
 /// The band of `n_curves` curves, `at(j, t)` being curve `j` at time `t`, or `None`

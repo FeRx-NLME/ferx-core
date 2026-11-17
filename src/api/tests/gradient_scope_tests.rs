@@ -16,7 +16,7 @@ use super::*;
 use crate::types::{GradientMethod, Optimizer};
 
 const FD: &str = "finite differences";
-const ANALYTIC: &str = "analytic (Dual2)";
+const ANALYTIC: &str = "analytic";
 
 /// `examples/warfarin.ferx` on `data/warfarin.csv`: closed-form, in analytic scope on both
 /// loops, so `Auto` and `Fd` take different engines.

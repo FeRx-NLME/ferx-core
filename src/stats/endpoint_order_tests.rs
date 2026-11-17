@@ -85,7 +85,6 @@ fn non_gaussian_mode_terms_sum_endpoints_in_ascending_cmt_order() {
     let cmts = fx.cmts();
     let (m, pop) = fx.compile();
     let theta = m.default_params.theta.clone();
-    let omega = m.default_params.omega.matrix.clone();
     let eta_hat = DVector::from_column_slice(&ETA);
     let singles: Vec<_> = cmts.iter().map(|&c| fx.compile_only(c)).collect();
     // Per subject, per endpoint: (nll, H[0,0]) of that endpoint alone.
@@ -96,8 +95,7 @@ fn non_gaussian_mode_terms_sum_endpoints_in_ascending_cmt_order() {
             singles
                 .iter()
                 .map(|ms| {
-                    let (q, h) =
-                        non_gaussian_mode_terms(ms, s, &theta, &eta_hat, None, &omega, &mut None);
+                    let (q, h) = non_gaussian_mode_terms(ms, s, &theta, &eta_hat, None, &mut None);
                     assert_eq!(h.shape(), (1, 1));
                     (q, h[(0, 0)])
                 })
@@ -123,7 +121,7 @@ fn non_gaussian_mode_terms_sum_endpoints_in_ascending_cmt_order() {
     for k in 0..COMPILES {
         let (m, pop) = fx.compile();
         for (s, (tq, th)) in pop.subjects.iter().zip(&terms) {
-            let (q, h) = non_gaussian_mode_terms(&m, s, &theta, &eta_hat, None, &omega, &mut None);
+            let (q, h) = non_gaussian_mode_terms(&m, s, &theta, &eta_hat, None, &mut None);
             let (want_q, want_h) = (fold(0.0, tq), fold(0.0, th));
             assert_eq!(
                 (q.to_bits(), h[(0, 0)].to_bits()),

@@ -1,0 +1,70 @@
+# Parent + metabolite with urine collected over 8 intervals (bench/dormant_states/sim_urine_intervals.py).
+# ferx has no per-compartment reset, so each interval's urine is its own accumulator,
+# switched on by the time-varying interval index IDX: 18 states, of which at most
+# four move in any segment.
+# Data: urine_intervals_k8.csv
+
+[parameters]
+  theta TVV(16, 0.1, 1000)
+  theta TVCLR(1.3, 0.01, 100)
+  theta TVCLM(1.5, 0.01, 100)
+  theta TVKM(0.4, 0.001, 10)
+  omega ETA_V ~ 0.1
+  omega ETA_CLR ~ 0.1
+  omega ETA_CLM ~ 0.1
+  sigma PROP_PL ~ 0.02
+  sigma PROP_UP ~ 0.02
+  sigma PROP_UM ~ 0.02
+
+[individual_parameters]
+  V = TVV * exp(ETA_V)
+  CLR = TVCLR * exp(ETA_CLR)
+  CLM = TVCLM * exp(ETA_CLM)
+  KM = TVKM
+  K12 = CLM / V
+  K15 = CLR / V
+  G1 = if (IDX == 1) 1 else 0
+  G2 = if (IDX == 2) 1 else 0
+  G3 = if (IDX == 3) 1 else 0
+  G4 = if (IDX == 4) 1 else 0
+  G5 = if (IDX == 5) 1 else 0
+  G6 = if (IDX == 6) 1 else 0
+  G7 = if (IDX == 7) 1 else 0
+  G8 = if (IDX == 8) 1 else 0
+
+[structural_model]
+  ode(states=[parent, m1, up1, up2, up3, up4, up5, up6, up7, up8, um1, um2, um3, um4, um5, um6, um7, um8])
+
+[odes]
+  d/dt(parent) = -(K12 + K15) * parent
+  d/dt(m1) = K12 * parent - KM * m1
+  d/dt(up1) = G1 * K15 * parent
+  d/dt(up2) = G2 * K15 * parent
+  d/dt(up3) = G3 * K15 * parent
+  d/dt(up4) = G4 * K15 * parent
+  d/dt(up5) = G5 * K15 * parent
+  d/dt(up6) = G6 * K15 * parent
+  d/dt(up7) = G7 * K15 * parent
+  d/dt(up8) = G8 * K15 * parent
+  d/dt(um1) = G1 * KM * m1
+  d/dt(um2) = G2 * KM * m1
+  d/dt(um3) = G3 * KM * m1
+  d/dt(um4) = G4 * KM * m1
+  d/dt(um5) = G5 * KM * m1
+  d/dt(um6) = G6 * KM * m1
+  d/dt(um7) = G7 * KM * m1
+  d/dt(um8) = G8 * KM * m1
+
+[scaling]
+  y[CMT=1] = parent / V
+  y[CMT=2] = G1 * up1 + G2 * up2 + G3 * up3 + G4 * up4 + G5 * up5 + G6 * up6 + G7 * up7 + G8 * up8
+  y[CMT=3] = G1 * um1 + G2 * um2 + G3 * um3 + G4 * um4 + G5 * um5 + G6 * um6 + G7 * um7 + G8 * um8
+
+[error_model]
+  CMT=1: DV ~ proportional(PROP_PL)
+  CMT=2: DV ~ proportional(PROP_UP)
+  CMT=3: DV ~ proportional(PROP_UM)
+
+[fit_options]
+  method = focei
+  covariance = true

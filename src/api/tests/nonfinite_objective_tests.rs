@@ -140,7 +140,7 @@ fn one_iteration_opts() -> FitOptions {
 /// The fixture is #1296's, unchanged, and the premise it asserts is the reason this
 /// is reachable at all: nothing upstream rejects the population. `check_model_data`
 /// checks dose *attributes* (`ALAG`/`F`/`D`/`R`, #1286), not record *times*, so the
-/// subject reaches the engine, the `timeline_has_non_finite` guard `NaN`-fills it,
+/// subject reaches the engine, the `times_have_non_finite` guard `NaN`-fills it,
 /// and the objective is `NaN` for the whole population — including the healthy
 /// subject, which is #1235's "one bad subject in ten destroys the objective for
 /// everyone".
@@ -3692,6 +3692,9 @@ fn poisoned(
         poison(theta, eta, &mut pk);
         pk
     });
+    // The poisoned closure is no longer the parsed program, so no program may stand in for it:
+    // a compiled plan (#2786) records the program and would predict the unpoisoned model.
+    model.indiv_param_partials = crate::types::IndivParamPartials::empty();
     model
 }
 

@@ -182,22 +182,28 @@ fn an_implied_dose_takes_its_own_routes_lag_from_its_parent() {
     assert_route_lags_follow_the_parent(ROUTE_LAG_MODEL);
 }
 
-/// The same with both routes `zero_order(dur=…, lag=…)` (#2367's changelog covers every
+/// The same with both routes `transit(n=…, mtt=…, lag=…)` (#2367's changelog covers every
 /// lagged absorption kind). The copy is per forcing and blind to its kind, so this pins
 /// that a second kind reaches it with the same slots, through the same three builders.
+/// (A lone `zero_order(dur=…, lag=…)` compartment is not a case of it any more: its per-route
+/// lag is the compartment's `ALAG{c}` from the parser on, #2786, and an implied dose takes
+/// that through the compartment-lag copy every `ALAG` already rides.)
 #[test]
-fn an_implied_dose_takes_its_zero_order_routes_lag_from_its_parent() {
+fn an_implied_dose_takes_its_transit_routes_lag_from_its_parent() {
     let src = ROUTE_LAG_MODEL
-        .replace("  LC = 0.1 * X\n", "  LC = 0.1 * X\n  DUR = 2.0\n")
+        .replace(
+            "  LC = 0.1 * X\n",
+            "  LC = 0.1 * X\n  NN = 2.0\n  MM = 1.5\n",
+        )
         .replace(
             "first_order(ka=KA, lag=LA) - KA*depot",
-            "zero_order(dur=DUR, lag=LA) - KA*depot",
+            "transit(n=NN, mtt=MM, lag=LA) - KA*depot",
         )
         .replace(
             "first_order(ka=KA, lag=LC) + KA*depot",
-            "zero_order(dur=DUR, lag=LC) + KA*depot",
+            "transit(n=NN, mtt=MM, lag=LC) + KA*depot",
         );
-    assert!(src.matches("zero_order(").count() == 2, "{src}");
+    assert!(src.matches("transit(").count() == 2, "{src}");
     assert_route_lags_follow_the_parent(&src);
 }
 

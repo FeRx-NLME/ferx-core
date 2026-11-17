@@ -729,6 +729,59 @@ pub(crate) fn combine_seed(seed: u64, component: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Purpose tag of [`replicate_key`]'s folded key, so a `(draw, rep)` key cannot coincide
+/// with a key any other substream derives from the same components.
+const REPLICATE_KEY_SALT: u64 = 0x5EED_D2A3_0E9E_0001;
+
+/// The replicate component of the κ and assay substream keys of the cell
+/// `(sim, draw, rep)` (#946): `sim` itself at `(draw, rep) = (1, 1)`, so a run without
+/// parameter uncertainty keeps the keys it always had, and otherwise all three indices
+/// folded into one key, so no two cells share a draw. `rep` is the within-`(draw, sim)`
+/// assay replicate, `1` until the variance decomposition draws more than one.
+///
+/// The build loop and the snapshot verifier both call this one function. The mixture
+/// class is keyed by `(draw, sim)` and never by `rep`: the class is a between-subject
+/// draw, fixed across a subject's assay replicates.
+pub(crate) fn replicate_key(sim: usize, draw: usize, rep: usize) -> usize {
+    if draw == 1 && rep == 1 {
+        return sim;
+    }
+    let k = combine_seed(
+        combine_seed(combine_seed(REPLICATE_KEY_SALT, draw as u64), rep as u64),
+        sim as u64,
+    );
+    // Truncation on a 32-bit target is still a deterministic key.
+    k as usize
+}
+
+/// Which replicate a message names (#946): the replicate `sim` and, only when the run
+/// draws parameter uncertainty, the parameter draw. Without uncertainty every message
+/// keeps its old wording ("sim 3"); with it the draw comes first ("draw 2, sim 3").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ReplicateTag {
+    /// The parameter draw, `None` when the run draws no parameter uncertainty.
+    pub(crate) draw: Option<usize>,
+    pub(crate) sim: usize,
+}
+
+impl ReplicateTag {
+    /// `"sim 3"`, or `"draw 2, sim 3"` under uncertainty.
+    pub(crate) fn sim_label(self) -> String {
+        match self.draw {
+            None => format!("sim {}", self.sim),
+            Some(d) => format!("draw {d}, sim {}", self.sim),
+        }
+    }
+
+    /// `"replicate 3"`, or `"draw 2, replicate 3"` under uncertainty.
+    pub(crate) fn replicate_label(self) -> String {
+        match self.draw {
+            None => format!("replicate {}", self.sim),
+            Some(d) => format!("draw {d}, replicate {}", self.sim),
+        }
+    }
+}
+
 /// Per-(subject, replicate) base seed for the controller-assay substream, rooted
 /// at the run-level `root` seed. Keyed by the subject *id* (not its loop
 /// position), so the stream is permutation-invariant.
@@ -907,6 +960,12 @@ pub struct AdaptiveDosingSpec {
     /// (`AdaptiveInputs::with_etas`); with [`DoseKnowledge::Oracle`] it may also read
     /// the values the simulation draws, and each subject dosed from them is flagged.
     pub dose_knowledge: DoseKnowledge,
+    /// Which covariate row a decision carries as a record (#2895). Every decision is a
+    /// record of the run: a piece of the walk that ends at decision `g`, with no data
+    /// record at or before it, runs under that decision's parameters — κ of occasion `g`
+    /// and `TIME` at the decision — and under the covariate row this setting names. What
+    /// the controller reads at the decision is the LOCF row either way.
+    pub decision_covariates: DecisionCovariates,
     /// Optional therapeutic target band `[low, high]` (inclusive) for the
     /// monitored signal. It feeds **only** the `pct_time_in_window` outcome metric
     /// (#391 S2.4) — it never influences dosing (the `when` rules do). `high` may
@@ -981,6 +1040,27 @@ pub enum DoseKnowledge {
     /// has [`AdaptiveSubjectMetrics::dose_oracle`] set, and the run warns
     /// (`W_ADAPTIVE_DOSE_ORACLE`).
     Oracle,
+}
+
+/// The covariate row a decision carries as a record (`decision_covariates`, #2895).
+///
+/// A decision ends the interval before it, as a dose row or an `EVID=2` row would in a
+/// static dataset, so that interval runs under the decision's own occasion κ and its
+/// `TIME`. The static equivalent of a run is its realized doses plus an `EVID=2` record
+/// at every decision, with blank covariate cells filled by this rule.
+///
+/// `#[non_exhaustive]`: match it with a wildcard arm downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum DecisionCovariates {
+    /// `decision_covariates = locf` (the default): the row in force at the decision —
+    /// the latest data record at or before it — which is also the row the controller
+    /// reads. ferx's reader fills a blank cell the same way.
+    #[default]
+    Locf,
+    /// `decision_covariates = nocb`: the row of the next data record at or after the
+    /// decision; past the last data record, the row in force (LOCF).
+    Nocb,
 }
 
 impl From<f64> for DoseValue {
@@ -1423,14 +1503,17 @@ impl DosePlanViolation {
         spec: &AdaptiveDosingSpec,
         plan: &SubjectDosePlan,
         subject_id: &str,
-        replicate: Option<usize>,
+        replicate: Option<ReplicateTag>,
         reads: &[(String, f64)],
     ) -> String {
         let (lo, hi) = plan.dose_bounds;
         let d = plan.start_dose;
         let head = match replicate {
             None => format!("[adaptive_dosing] subject {subject_id}:"),
-            Some(k) => format!("[adaptive_dosing] subject {subject_id}, replicate {k}:"),
+            Some(k) => format!(
+                "[adaptive_dosing] subject {subject_id}, {}:",
+                k.replicate_label()
+            ),
         };
         let start = spec.start_dose.source();
         let bounds = format!(
@@ -2121,6 +2204,7 @@ mod tests {
             auc_target: None,
             round_to: None,
             dose_knowledge: Default::default(),
+            decision_covariates: Default::default(),
             rules: vec![AdaptiveRule {
                 op: Comparison::Lt,
                 threshold: 10.0,
@@ -3071,6 +3155,31 @@ mod tests {
             subject_assay_base_seed(42, "subj-1", 1),
             "kappa and assay substreams are disjoint under the same root"
         );
+    }
+
+    /// #946 (audit A3): `replicate_key` is the identity on `sim` in draw 1 / rep 1, so a
+    /// run without uncertainty keeps its κ and assay keys, and is distinct everywhere
+    /// else: across every cell of a 4 × 4 × 3 grid, and from every plain `sim` key.
+    ///
+    /// Mutations: dropping `draw` or `rep` from the fold (two cells collide); returning
+    /// the fold at (1, 1) too (the identity fails).
+    #[test]
+    fn replicate_key_is_sim_at_draw_one_rep_one_and_distinct_elsewhere() {
+        for sim in 1..=50 {
+            assert_eq!(replicate_key(sim, 1, 1), sim);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for draw in 1..=4 {
+            for sim in 1..=4 {
+                for rep in 1..=3 {
+                    let k = replicate_key(sim, draw, rep);
+                    assert!(seen.insert(k), "({sim}, {draw}, {rep}) collides");
+                    if (draw, rep) != (1, 1) {
+                        assert!(k > 1_000_000, "({sim}, {draw}, {rep}) is a plain sim: {k}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
