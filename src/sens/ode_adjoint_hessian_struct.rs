@@ -625,6 +625,38 @@ impl CovPlan<'_> {
         std::cell::Ref::filter_map(rows, Option::as_ref).ok()
     }
 
+    /// [`Self::rows`] from a pass's kernel inputs `inputs` (value, then `kt` tangents per slot).
+    fn rows_at(&self, inputs: &[f64], sl: &Slots, kt: usize) -> Option<std::cell::Ref<'_, Rows>> {
+        let (pn, lk) = (self.pn(), 1 + kt);
+        let val = |s: usize| inputs[s * lk];
+        self.rows(
+            &|j| val(sl.f(j, 0)),
+            &|j| sl.has_pop.then(|| val(sl.pop + j)),
+            &|j, k| val(sl.f(j, 1 + k)),
+            &|j, t| val(sl.f(j, 1 + pn + t)),
+            &|i| val(sl.x + i),
+        )
+    }
+
+    /// Whether the structured form holds at a pass's kernel inputs: the anchor rows, and a
+    /// quadrature subject's node rows, form here ([`Self::struct_adjoint`] reads both). Where
+    /// they do not, the pass takes the recorded kernel instead.
+    pub(super) fn struct_rows_hold(&self, inputs: &[f64], sl: &Slots, kt: usize) -> bool {
+        let Some(nodes) = self.rows_at(inputs, sl, kt).map(|r| r.family.nodes()) else {
+            return false;
+        };
+        if !nodes || sl.n_nodes == 0 {
+            return true;
+        }
+        let val = |s: usize| inputs[s * (1 + kt)];
+        self.node_rows(
+            &|d, j| val(sl.nf + d * sl.n_rows + j),
+            &|i| val(sl.x + i),
+            sl.n_nodes,
+        )
+        .is_some()
+    }
+
     /// The anchor rows' tangents along a pass's `kt` directions, read from the kernel inputs
     /// `inputs` (value, then `kt` tangents per slot), and the aggregates' tangents.
     fn anchor_tan(&self, rows: &Rows, inputs: &[f64], sl: &Slots, kt: usize) -> AnchorTan {
@@ -746,18 +778,14 @@ impl CovPlan<'_> {
         let family = self.family().filter(|f| f.nodes())?;
         let pn = self.pn();
         let lk = 1 + kt;
-        let val = |s: usize| inputs[s * lk];
-        let rows = self.rows(
-            &|j| val(sl.f(j, 0)),
-            &|j| sl.has_pop.then(|| val(sl.pop + j)),
-            &|j, k| val(sl.f(j, 1 + k)),
-            &|j, t| val(sl.f(j, 1 + pn + t)),
-            &|i| val(sl.x + i),
-        )?;
+        let rows = self.rows_at(inputs, sl, kt)?;
         let at = self.anchor_tan(&rows, inputs, sl, kt);
         let rin = self.stage1_in(&rows, &at, inputs, sl, kt);
         let nb = sl.n_nodes * pn;
         let n_in = rin.len() / lk;
+        if let Some(out) = self.nodes_rows(family, &rin, kt, nb) {
+            return Some(out);
+        }
         let mut out = vec![0.0; nb * lk];
         let mut one = vec![0.0; n_in * 2];
         for a in 0..kt.max(1) {
@@ -773,6 +801,43 @@ impl CovPlan<'_> {
                 if kt > 0 {
                     out[o * lk + 1 + a] = kr.out[o * 2 + 1];
                 }
+            }
+        }
+        Some(out)
+    }
+
+    /// The stage-1 reduce's node locations through the rows kernels (#2980): its values once,
+    /// each direction a seed of their tangents (`rin` and the result laid out as
+    /// [`Self::struct_nodes`]). `None` where the plan has no rows kernels or its guard does not
+    /// hold; the caller then runs a direction at a time.
+    fn nodes_rows(&self, family: Family, rin: &[f64], kt: usize, nb: usize) -> Option<Vec<f64>> {
+        let lk = 1 + kt;
+        let n_in = rin.len() / lk;
+        if kt == 0 {
+            return None;
+        }
+        let vals: Vec<f64> = (0..n_in).map(|i| rin[i * lk]).collect();
+        let kr = self.reduce_run(family, 1, &vals, 0, nb)?;
+        let plan = kr.plan();
+        if !plan.rows_serve(Layout::F64) {
+            return None;
+        }
+        let mut tu = vec![0.0; kt * n_in];
+        for a in 0..kt {
+            for i in 0..n_in {
+                tu[a * n_in + i] = rin[i * lk + 1 + a];
+            }
+        }
+        let rf = plan.forward_rows(Layout::F64, &[], &vals, &tu, kt)?;
+        if !plan.rows_guard(&rf) {
+            return None;
+        }
+        let mut out = vec![0.0; nb * lk];
+        for o in 0..nb {
+            for a in 0..kt {
+                let (v, t) = plan.rows_out(&rf, o, a);
+                out[o * lk] = v[0];
+                out[o * lk + 1 + a] = t[0];
             }
         }
         Some(out)
@@ -1135,13 +1200,7 @@ impl CovPlan<'_> {
         let w: Vec<f64> = (0..pn).map(|k| -seed[(1 + k) * lk]).collect();
         let val = |s: usize| inputs[s * lk];
         let tan = |s: usize, a: usize| inputs[s * lk + 1 + a];
-        let rows = self.rows(
-            &|j| val(sl.f(j, 0)),
-            &|j| sl.has_pop.then(|| val(sl.pop + j)),
-            &|j, k| val(sl.f(j, 1 + k)),
-            &|j, t| val(sl.f(j, 1 + pn + t)),
-            &|i| val(sl.x + i),
-        )?;
+        let rows = self.rows_at(inputs, sl, kt)?;
         let family = rows.family;
         let na = rows.aggr.len();
         let at = self.anchor_tan(&rows, inputs, sl, kt);
@@ -1441,6 +1500,9 @@ impl CovPlan<'_> {
         };
         let eta = &self.sc.eta[..pn];
         let zero = |_: usize, _: usize| 0.0;
+        // Only a basis serves here: a plan the basis is not narrower for declines before running
+        // along the directions (that run would be discarded, and the recorded path answers).
+        let axes_only = |lanes: Lanes<'_>| matches!(lanes, Lanes::Axes(_));
         let pr = self.plan_run(
             PlanKey::Pred,
             along,
@@ -1449,7 +1511,11 @@ impl CovPlan<'_> {
             true,
             &zero,
             kt,
-            &|lanes, et, k| self.run_pred(model, eta, et, lanes, base, k),
+            &|lanes, et, k| {
+                axes_only(lanes)
+                    .then(|| self.run_pred(model, eta, et, lanes, base, k))
+                    .flatten()
+            },
         )?;
         if !matches!(pr, PlanRun::Basis(_)) {
             return None;
@@ -1464,7 +1530,13 @@ impl CovPlan<'_> {
                 false,
                 &zero,
                 kt,
-                &|lanes, et, k| self.run_pred(self.sc.pop_model, &zeros, et, lanes, Layout::F64, k),
+                &|lanes, et, k| {
+                    axes_only(lanes)
+                        .then(|| {
+                            self.run_pred(self.sc.pop_model, &zeros, et, lanes, Layout::F64, k)
+                        })
+                        .flatten()
+                },
             )?;
             if !matches!(pp, PlanRun::Basis(_)) {
                 return None;
@@ -1513,7 +1585,11 @@ impl CovPlan<'_> {
                 true,
                 &zero,
                 kt,
-                &|lanes, et, k| self.run_pred(model, bv, et, lanes, Layout::F64, k),
+                &|lanes, et, k| {
+                    axes_only(lanes)
+                        .then(|| self.run_pred(model, bv, et, lanes, Layout::F64, k))
+                        .flatten()
+                },
             )?;
             if !matches!(pr, PlanRun::Basis(_)) {
                 return None;

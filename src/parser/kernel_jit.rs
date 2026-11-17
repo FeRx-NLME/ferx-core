@@ -3743,7 +3743,15 @@ impl Tiered {
     /// The doubled slot table a rows reverse call passes: `idx`'s first [`Self::entries`]
     /// entries, then each `off` on.
     pub(crate) fn doubled(&self, idx: &[u32], off: u32, out: &mut Vec<u32>) {
-        let e = &idx[..self.entries.min(idx.len())];
+        // The kernel's second-half offsets assume exactly `entries` entries before them: a
+        // shorter table would shift every adjoint it reads, so it is a bug, not a clamp.
+        assert!(
+            self.rows && idx.len() >= self.entries,
+            "a rows reverse's slot table: {} entries < {}",
+            idx.len(),
+            self.entries
+        );
+        let e = &idx[..self.entries];
         out.clear();
         out.extend_from_slice(e);
         out.extend(e.iter().map(|&x| x + off));
@@ -6184,20 +6192,8 @@ impl Plan {
                             out_adj.extend_from_slice(&tsd[need + o * l..need + (o + 1) * l]);
                         }
                         let mut in_adj = vec![0.0; args.len() * w];
+                        // (An ODE call is the arm above, every seed in one reverse.)
                         let ok = match (spec, k, &r.logs[sd][li]) {
-                            (CallKind::Ode(spec), Kern::Loop(rk), CallLog::Ode(lg)) => {
-                                ode_loop::run_loop_rev(
-                                    spec,
-                                    rk,
-                                    w,
-                                    &inputs,
-                                    lg,
-                                    w,
-                                    1,
-                                    &out_adj,
-                                    &mut in_adj,
-                                )
-                            }
                             (CallKind::Fixed(_), Kern::Fixed(fx), CallLog::Fixed(Some(fl))) => {
                                 fx.run_rev(lt, Sweep::TangentReverse, fl, 1, &out_adj, &mut in_adj)
                             }
@@ -6274,8 +6270,7 @@ impl Plan {
         }
         let l = layout.lanes();
         let stride = self.n_slots * l;
-        let mut autos: Vec<crate::ode::solver::OdeAutoSwitchState> =
-            (0..seeds).map(|_| Default::default()).collect();
+        let mut auto = crate::ode::solver::OdeAutoSwitchState::default();
         for (c, k) in self.calls.iter().zip(fns) {
             match (c, k) {
                 (
@@ -6394,7 +6389,7 @@ impl Plan {
                         seeds,
                         &mut out,
                         &mut tout,
-                        &mut autos[0],
+                        &mut auto,
                         Some(&mut lgs),
                     ) {
                         return None;
@@ -6426,21 +6421,8 @@ impl Plan {
                             );
                         }
                         let mut out = take(outs.len() * w);
+                        // (An ODE call is the arm above, every seed in one run.)
                         let ok = match (spec, k) {
-                            (CallKind::Ode(spec), Kern::Loop(lk)) => {
-                                let mut log = ode_loop::Log::take();
-                                let ok = ode_loop::run_loop(
-                                    spec,
-                                    lk,
-                                    w,
-                                    &inputs,
-                                    &mut out,
-                                    &mut autos[sd],
-                                    Some(&mut log),
-                                );
-                                logs[sd].push(CallLog::Ode(log));
-                                ok
-                            }
                             (_, Kern::Fixed(_) | Kern::Repeat(_) | Kern::Mat(_)) => {
                                 let mut flog = None;
                                 let ok = match k {

@@ -97,7 +97,8 @@ fn at(n: usize, l: usize, i: usize, j: usize, p: usize) -> usize {
 
 /// `C[L] += κ·A[p]·B[q]` for every table entry: a product of lane-stacked matrices. The value
 /// lane (`(0, 0, 0)`, first) accumulates in the value path's order (`ode::linear`'s
-/// `accumulate`: `i`, then `k`, then `j`).
+/// `accumulate`: `i`, then `k`, then `j`), and skips a zero factor only where it does — when
+/// the row of `B` it multiplies is finite, so `0·∞ = NaN` reaches the result as it does there.
 fn mul_lanes(
     n: usize,
     l: usize,
@@ -106,20 +107,24 @@ fn mul_lanes(
     b: &[f64],
     c: &mut [f64],
 ) {
+    // Per lane `q` and row `m` of `B`: whether every entry is finite.
+    let row_finite: Vec<bool> = (0..l * n)
+        .map(|e| {
+            let (q, m) = (e / n, e % n);
+            (0..n).all(|j| b[at(n, l, m, j, q)].is_finite())
+        })
+        .collect();
     for &(ll, p, q, k) in kap {
         for i in 0..n {
             for m in 0..n {
                 let aik = a[at(n, l, i, m, p)];
-                if aik == 0.0 {
+                if aik == 0.0 && row_finite[q * n + m] {
                     continue;
                 }
+                // `k·aik` is `aik` itself at `k = 1`, so one form serves every entry.
                 let s = k * aik;
                 for j in 0..n {
-                    c[at(n, l, i, j, ll)] += if k == 1.0 {
-                        aik * b[at(n, l, m, j, q)]
-                    } else {
-                        s * b[at(n, l, m, j, q)]
-                    };
+                    c[at(n, l, i, j, ll)] += s * b[at(n, l, m, j, q)];
                 }
             }
         }
@@ -209,8 +214,7 @@ impl MatSpec {
         // is its tangent `t`, so `Ā_{t,p}` gains `κ·(C̄_{t,L}·B_{0,q} + C̄_{0,L}·B_{t,q})`,
         // exactly `kappa(layout)` read with the adjoint in the tangent's place).
         let kap = match sweep {
-            Sweep::Reverse => kappa(layout),
-            Sweep::TangentReverse => kappa(layout),
+            Sweep::Reverse | Sweep::TangentReverse => kappa(layout),
             // Forwards (a tangent-rows forward runs a matrix call at one tangent per seed).
             Sweep::Forward | Sweep::TangentRows | Sweep::TangentReverseRows => return false,
         };
@@ -526,6 +530,10 @@ pub(crate) fn record_mat(op: MatOp, a: &[Tr], b: &[Tr], n: usize) -> Option<Vec<
     let spec = Arc::new(MatSpec { op, n });
     let inputs: Vec<f64> = a.iter().chain(b).map(|v| v.v).collect();
     let mut out = vec![0.0; n * n];
+    // Only a singular solve fails here (the product always runs). The value path's Padé then
+    // declines, but a recording cannot follow it: that decline depends on the values with no
+    // guard, so the plan would replay it where the factorization is regular. Failing the
+    // recording costs this subject the FD fallback at a singular point, never a wrong answer.
     if !spec.run(Layout::F64, &inputs, &mut out) {
         fail_here("a matrix call's record-time run failed");
         return None;

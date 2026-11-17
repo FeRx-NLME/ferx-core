@@ -335,7 +335,8 @@ fn pass_width(structured: bool, n_dirs: usize) -> usize {
         return w.max(1);
     }
     if structured {
-        n_dirs.max(1)
+        // A layout carries at most `u8::MAX` tangents (`Layout::tan`).
+        n_dirs.clamp(1, usize::from(u8::MAX))
     } else {
         1
     }
@@ -1664,8 +1665,13 @@ impl<'a> CovPlan<'a> {
             None
         };
         // A tangent pass of a structured subject keeps the kernel's inputs for [`st`] instead of
-        // running the recorded kernel.
-        let structured = kt > 0 && self.structured() && (slots.n_nodes == 0 || st_nodes.is_some());
+        // running the recorded kernel — where its rows hold at this point: a row off its domain,
+        // or FOCE past its Woodbury gate (production then factors `R̃` itself), takes the
+        // recorded kernel rather than declining the subject.
+        let structured = kt > 0
+            && self.structured()
+            && (slots.n_nodes == 0 || st_nodes.is_some())
+            && self.struct_rows_hold(&inputs, &slots, kt);
         let k2 = if structured {
             None
         } else {

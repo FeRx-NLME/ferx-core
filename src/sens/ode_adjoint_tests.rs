@@ -11969,6 +11969,62 @@ fn structured_reduce_is_shared_across_subjects_exactly() {
     });
 }
 
+/// A FOCE subject past the Woodbury gate (`1 + tr(LᵀSL) > 1e6`, where production factors `R̃`
+/// itself) is outside the structured kernel's form, so its passes take the recorded kernel
+/// rather than declining the subject (#2980 review). The pair straddles the gate: at the
+/// fixture's σ the subject takes the structured kernel, at a σ shrunk `1e-5`× (the trace far
+/// past `1e6`) none of its passes does — both asserted — and each Hessian matches the recorded
+/// kernel's (measured: 3.4e-15 structured, exactly 0 on the recorded route; bound as
+/// `structured_reduce_is_shared_across_subjects_exactly`'s).
+/// Mutation: drop `struct_rows_hold` from `CovPlan::run`'s gate → the shrunk-σ subject's
+/// Hessian is `None` (its structured sweep cannot form the rows).
+#[test]
+fn foce_past_the_woodbury_gate_takes_the_recorded_kernel() {
+    use super::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let base = moved_params(&model);
+    let mut tight = base.clone();
+    for v in tight.sigma.values.iter_mut() {
+        *v *= 1e-5;
+    }
+    with_fit_stack(|| {
+        for (params, want_structured) in [(&base, true), (&tight, false)] {
+            let x = pack_params(params);
+            let eta = ebe_for(&model, &s, params, 1e-12, false);
+            let h = |off: bool| {
+                STRUCT_OFF.with(|c| c.set(off));
+                let h = subject_adjoint_cov_hessian(
+                    &model,
+                    &s,
+                    params,
+                    &x,
+                    eta.as_slice(),
+                    Objective::Foce,
+                );
+                STRUCT_OFF.with(|c| c.set(false));
+                h
+            };
+            STRUCT_PASSES.with(|c| c.set(0));
+            let got = h(false).expect("the exact Hessian, structured or recorded");
+            let structured = STRUCT_PASSES.with(std::cell::Cell::get) > 0;
+            assert_eq!(
+                structured, want_structured,
+                "structured passes: {structured}, want {want_structured}"
+            );
+            let want = h(true).expect("the recorded kernel's Hessian");
+            let gap = rel_gap(got.as_slice(), want.as_slice());
+            eprintln!("Woodbury straddle, structured {structured}: gap {gap:.2e}");
+            assert!(gap < 1e-12, "{gap:.2e}");
+        }
+    });
+}
+
 /// A shared kernel (`kernel_run_shared`) serves a point on the other side of a branch its
 /// first recording took: the recording carries that branch as a guard, so the second point
 /// fails it and is served by a plan recorded there — the Laplace reduce factors `H` or
