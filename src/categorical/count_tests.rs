@@ -58,6 +58,73 @@ fn negbin_tends_to_poisson_and_differs_at_small_size() {
     }
 }
 
+/// A size large enough that `λ/r` falls below machine epsilon is still a valid law (the
+/// Poisson limit), and the kernel must keep `r·log1p(λ/r)` there: `r·ln(1 + λ/r)` rounds
+/// `1 + λ/r` to 1 and scored `λ = 1, r = 1e17, k = 0` as ~0 instead of ~1. Values are
+/// checked against `count_log_pmf` (which uses `f64::ln_1p`) and against the Poisson; the
+/// dual's `∂/∂λ` and `∂²/∂λ²` against the closed forms `(k+r)/(r+λ) − k/λ` and
+/// `k/λ² − (k+r)/(r+λ)²`. Both sides of the series switch (`λ/r = 1e-3`) are visited, and
+/// the two branches meet without a jump. Measured worst relative value gap 6.8e-16 (bound 1e-13).
+#[test]
+fn negbin_keeps_its_digits_at_huge_size() {
+    let k0 = count_record_nll_g(NB, LIN, 1.0, 1e17, 0).unwrap();
+    assert!((k0 - 1.0).abs() < 1e-14, "λ=1, r=1e17, k=0: {k0} (want 1)");
+    let mut worst = 0.0f64;
+    for (lam, r) in [
+        (1.0, 1e17),
+        (3.7, 1e300),
+        (2.0, 1e12),
+        (2.0, 1999.0), // λ/r just above the switch
+        (2.0, 2001.0), // just below it
+        (0.5, 3.0),
+    ] {
+        for k in [0u32, 1, 3, 7] {
+            let got = count_record_nll_g(NB, LIN, lam, r, k).unwrap();
+            let pmf = -count_log_pmf(lam, Some(r), f64::from(k));
+            assert!(got.is_finite() && pmf.is_finite());
+            let gap = (got - pmf).abs() / pmf.abs().max(1.0);
+            assert!(gap.is_finite());
+            worst = worst.max(gap);
+            assert!(
+                gap < 1e-13,
+                "λ={lam} r={r} k={k}: {got} vs count_log_pmf {pmf}"
+            );
+            if r >= 1e12 {
+                let pois = count_record_nll_g(P, LIN, lam, 0.0, k).unwrap();
+                assert!(
+                    (got - pois).abs() < 1e-10,
+                    "λ={lam} r={r} k={k}: {got} vs Poisson {pois}"
+                );
+            }
+            let d = count_record_nll_g(NB, LIN, Dual2::<1>::var(lam, 0), Dual2::constant(r), k)
+                .unwrap();
+            let kf = f64::from(k);
+            let g = (kf + r) / (r + lam) - kf / lam;
+            let h = kf / (lam * lam) - (kf + r) / ((r + lam) * (r + lam));
+            assert!(d.grad[0].is_finite() && d.hess[0][0].is_finite());
+            assert!(
+                (d.grad[0] - g).abs() < 1e-12,
+                "λ={lam} r={r} k={k}: ∂λ {} vs {g}",
+                d.grad[0]
+            );
+            assert!(
+                (d.hess[0][0] - h).abs() < 1e-12,
+                "λ={lam} r={r} k={k}: ∂²λ {} vs {h}",
+                d.hess[0][0]
+            );
+        }
+    }
+    // The two branches agree where they meet: one ulp either side of `λ/r = 1e-3`.
+    let r = 1000.0;
+    let below = count_record_nll_g(NB, LIN, 1.0 - 1e-12, r, 2).unwrap();
+    let above = count_record_nll_g(NB, LIN, 1.0 + 1e-12, r, 2).unwrap();
+    assert!(
+        (below - above).abs() < 1e-11,
+        "switch jump {below} vs {above}"
+    );
+    eprintln!("NB huge-size worst relative value gap {worst:.2e}");
+}
+
 /// Both sides of `NEGBIN_SUM_MAX_K`: the term-by-term sum and the `ln Γ` difference agree
 /// with each other and with `count_log_pmf` at a count either side of the switch (an
 /// off-by-one in either branch, or a sum over the wrong range, moves the value by `ln(r+k)`).
