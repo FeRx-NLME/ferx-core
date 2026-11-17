@@ -277,6 +277,12 @@ struct FitWire {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "nan_tolerant"
     )]
+    saem_objective: Option<crate::types::SaemObjective>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "nan_tolerant"
+    )]
     impmap_trace: Option<ImpmapTrace>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     exclusions: Option<ExclusionSummary>,
@@ -1797,6 +1803,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         }),
         bayes: r.bayes.clone(),
         importance_sampling: r.importance_sampling.clone(),
+        saem_objective: r.saem_objective.clone(),
         impmap_trace: r.impmap_trace.clone(),
         exclusions: r.exclusions.clone(),
         stalled_at_init: crate::model_selection::stalled_at_init(r),
@@ -3953,6 +3960,7 @@ fn wire_to_fit_result(
         sir_ess,
         sir_resamples_packed,
         importance_sampling,
+        saem_objective: w.saem_objective,
         impmap_trace: w.impmap_trace,
         bayes: w.bayes,
         vi,
@@ -9198,6 +9206,38 @@ mod tests {
             assert_eq!((got.n_samples, got.adapt_passes), (500, 2));
             assert_eq!(got.kappa_treatment, KappaTreatment::Marginalized);
         }
+    }
+
+    /// #2973: the SAEM objective (kind, SE, counts, the FOCE/Laplace diagnostic) round-trips,
+    /// and a bundle written without it (`saem_ofv = focei`, or any older `.fitrx`) loads as
+    /// `None`.
+    #[test]
+    fn roundtrip_saem_objective() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut r = minimal_fit_result();
+        assert!(load_fit(&saved(&dir, &r))
+            .unwrap()
+            .fit
+            .saem_objective
+            .is_none());
+        r.saem_objective = Some(crate::types::SaemObjective {
+            kind: crate::types::SaemOfv::Agq,
+            mc_standard_error: None,
+            n_samples: None,
+            n_nodes: Some(11),
+            foce_ofv: 321.5,
+        });
+        let got = load_fit(&saved(&dir, &r))
+            .unwrap()
+            .fit
+            .saem_objective
+            .unwrap();
+        assert_eq!(got.kind, crate::types::SaemOfv::Agq);
+        assert_eq!(
+            (got.n_nodes, got.n_samples, got.mc_standard_error),
+            (Some(11), None, None)
+        );
+        assert_eq!(got.foce_ofv, 321.5);
     }
 
     /// #2695: `impmap_trace` round-trips, its sentinel iteration and a `NaN` OFV included.

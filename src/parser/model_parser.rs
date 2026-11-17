@@ -12937,6 +12937,10 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
             opts.imp_low_ess_threshold = parse_unit_interval("imp_low_ess_threshold")?
         }
         "imp_adapt_passes" => opts.imp_adapt_passes = parse_usize("imp_adapt_passes")?,
+        "imp_adapt_samples" => opts.imp_adapt_samples = parse_usize("imp_adapt_samples")?,
+        "saem_ofv_pilot_samples" => {
+            opts.saem_ofv_pilot_samples = parse_usize("saem_ofv_pilot_samples")?
+        }
         "imp_iterations" => {
             let v = parse_usize("imp_iterations")?;
             if v < 1 {
@@ -12947,6 +12951,35 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "imp_averaging" => opts.imp_averaging = parse_usize("imp_averaging")?,
         "imp_eval_only" => opts.imp_eval_only = parse_bool("imp_eval_only")?,
         "agq_eval_only" => opts.agq_eval_only = parse_bool("agq_eval_only")?,
+        "saem_ofv" => {
+            opts.saem_ofv = match value.trim().to_lowercase().as_str() {
+                "imp" => crate::types::SaemOfv::Imp,
+                "agq" => crate::types::SaemOfv::Agq,
+                "focei" | "foce" | "laplace" => crate::types::SaemOfv::Focei,
+                other => {
+                    return Err(format!(
+                        "saem_ofv must be `imp`, `agq` or `focei`, got `{other}`"
+                    ))
+                }
+            }
+        }
+        "saem_ofv_samples" => {
+            let v = parse_usize("saem_ofv_samples")?;
+            if v < 2 {
+                return Err(format!("saem_ofv_samples must be >= 2, got {v}"));
+            }
+            opts.saem_ofv_samples = v;
+        }
+        "saem_ofv_nodes" => {
+            let v = parse_usize("saem_ofv_nodes")?;
+            if !(2..=crate::estimation::agq::MAX_AGQ_NODES).contains(&v) {
+                return Err(format!(
+                    "saem_ofv_nodes must be in 2..={}, got {v}",
+                    crate::estimation::agq::MAX_AGQ_NODES
+                ));
+            }
+            opts.saem_ofv_nodes = v;
+        }
         "impmap_iterations" => {
             let v = parse_usize("impmap_iterations")?;
             if v < 1 {

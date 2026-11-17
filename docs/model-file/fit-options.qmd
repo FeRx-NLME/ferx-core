@@ -861,6 +861,15 @@ Suits deep compartment models (`[covariate_nn]`), models where the FOCE inner lo
 | `omega_burnin` | `20` | Initial exploration iterations during which Ω (and Ω<sub>IOV</sub>) are held at their starting values while the MH chain warms up. Clamped to `n_exploration`; set `0` to disable. Prevents the Ω collapse described in the SAEM page. |
 | `seed` | `12345` | RNG seed for reproducibility |
 
+### Reported objective
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `saem_ofv` | `imp` | Which objective a SAEM fit reports as `ofv` (and builds AIC/BIC from). `imp`: the importance-sampled `−2 log L` at the final estimates, NONMEM `IMP EONLY=1`, with its Monte-Carlo SE. `agq`: adaptive Gauss–Hermite quadrature at the final estimates (deterministic; up to three random effects, else falls back to `imp` with a warning). `focei`: the FOCE/Laplace objective, the behaviour before #2973. The FOCE/Laplace value is kept as `saem_objective.foce_ofv` under `imp` and `agq`. Not read when the chain has its own evaluator stage. See [The reported OFV](../estimation/saem.qmd#saem-reported-ofv). |
+| `saem_ofv_samples` | `3000` | Importance samples per subject for `saem_ofv = imp` (NONMEM `ISAMPLE=3000`). Seeded by `imp_seed`. Must be ≥ 2. |
+| `saem_ofv_nodes` | `11` | Gauss–Hermite nodes per random effect for `saem_ofv = agq`, `2`–`21`. Chosen by measured convergence (see [The reported OFV](../estimation/saem.qmd#saem-reported-ofv)). |
+| `saem_ofv_pilot_samples` | `300` | Draws per pilot pass of the `saem_ofv = imp` readout's proposal adaptation (`imp_adapt_passes` passes, default 5); the final readout always draws `saem_ofv_samples`. 300 cuts the readout to under half the cost of full-size pilots for a 4% larger Monte-Carlo SE (see [The reported OFV](../estimation/saem.qmd#saem-ofv-cost)); `0` runs the pilots at the full `saem_ofv_samples`. |
+
 ### f-SAEM E-step kernel
 
 | Key | Default | Description |
@@ -987,6 +996,7 @@ sparsely-sampled PK).
 | Key | Default | Description |
 |-----|---------|-------------|
 | `imp_eval_only` | `false` | `true` ⇒ evaluate `−2 log L` at fixed parameters (NONMEM `EONLY=1`); must be the terminal chain stage. `false` ⇒ estimate (NONMEM `METHOD=IMP`). |
+| `imp_adapt_samples` | `0` | Draws per pilot pass of an evaluation's proposal adaptation (`imp_adapt_passes`). `0` runs every pilot at `imp_samples`, as NONMEM's `EONLY=1` iterations do; a smaller value (at least 2) fits the proposal from fewer draws and keeps the final readout at `imp_samples`. Not read by the estimating `imp` iterations. |
 | `imp_iterations` | `200` | MCEM iterations (estimator only). |
 | `imp_averaging` | `50` | Terminal iterations averaged into the reported estimate (estimator only). |
 | `imp_samples` | `1000` | Importance samples K per subject. 2000–5000 recommended for publication-quality MC SE. |

@@ -1394,13 +1394,36 @@ fn ofv_is_imp_laplace(result: &FitResult) -> bool {
 }
 
 /// The importance-sampling marginal, printed next to `ofv` so the two cannot be
-/// mistaken for one another. `None` when the fit has no marginal.
+/// mistaken for one another. `None` when the fit has no marginal, or when the marginal
+/// *is* `ofv` (a SAEM fit under `saem_ofv = imp`, whose OFV row carries its SE).
 fn is_marginal_line(result: &FitResult) -> Option<String> {
+    if result
+        .saem_objective
+        .as_ref()
+        .is_some_and(|o| o.kind == SaemOfv::Imp)
+    {
+        return None;
+    }
     result.importance_sampling.as_ref().map(|is| {
         format!(
             "IS marginal -2LL:  {:.4}  (MC SE = {:.4}, K = {})",
             is.minus2_log_likelihood, is.mc_standard_error, is.n_samples
         )
+    })
+}
+
+/// How the OFV row of a SAEM fit names what it is (#2973), `None` when it is the
+/// FOCE/Laplace objective.
+fn saem_ofv_label(result: &FitResult) -> Option<String> {
+    let o = result.saem_objective.as_ref()?;
+    Some(match o.kind {
+        SaemOfv::Imp => format!(
+            "OFV (IS -2LL, NONMEM IMP EONLY=1; MC SE = {:.4}, K = {})",
+            o.mc_standard_error.unwrap_or(f64::NAN),
+            o.n_samples.unwrap_or(0)
+        ),
+        SaemOfv::Agq => format!("OFV (AGQ -2LL, {} nodes)", o.n_nodes.unwrap_or(0)),
+        SaemOfv::Focei => "OFV".to_string(),
     })
 }
 
@@ -1410,6 +1433,19 @@ fn is_marginal_line(result: &FitResult) -> Option<String> {
 fn objective_notes(result: &FitResult) -> Vec<&'static str> {
     let laplace = ofv_is_imp_laplace(result);
     let mut notes = Vec::new();
+    if let Some(o) = &result.saem_objective {
+        notes.push(match o.kind {
+            SaemOfv::Imp => {
+                "OFV, AIC and BIC come from the importance-sampled -2LL at the SAEM estimates \
+                 (NONMEM IMP EONLY=1); the FOCE/Laplace value is reported separately as a diagnostic."
+            }
+            _ => {
+                "OFV, AIC and BIC come from adaptive Gauss-Hermite quadrature at the SAEM \
+                 estimates; the FOCE/Laplace value is reported separately as a diagnostic."
+            }
+        });
+        return notes;
+    }
     if laplace {
         notes.push("OFV, AIC and BIC come from a final Laplace pass, not the IS marginal.");
     }
@@ -1429,11 +1465,13 @@ fn objective_notes(result: &FitResult) -> Vec<&'static str> {
 /// only in `indent`.
 fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
     use std::fmt::Write as _;
-    let ofv_label = if ofv_is_imp_laplace(result) {
-        "OFV (Laplace)"
-    } else {
-        "OFV"
-    };
+    let ofv_label = saem_ofv_label(result).unwrap_or_else(|| {
+        if ofv_is_imp_laplace(result) {
+            "OFV (Laplace)".to_string()
+        } else {
+            "OFV".to_string()
+        }
+    });
     let _ = writeln!(out, "{indent}{ofv_label}:  {:.4}", result.ofv);
     // Under parameter priors (#254) the OFV above is the penalized objective
     // that was minimised, so the split is printed right under it — and AIC/BIC
@@ -1442,6 +1480,13 @@ fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
     if !result.prior_summary.is_empty() {
         let _ = writeln!(out, "{indent}  data:  {:.4}", result.ofv_data);
         let _ = writeln!(out, "{indent}  prior: {:.4}", result.ofv_prior);
+    }
+    if let Some(o) = &result.saem_objective {
+        let _ = writeln!(
+            out,
+            "{indent}FOCE/Laplace OFV (diagnostic):  {:.4}",
+            o.foce_ofv
+        );
     }
     if let Some(line) = is_marginal_line(result) {
         let _ = writeln!(out, "{indent}{line}");
@@ -3344,6 +3389,26 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
     if ofv_is_imp_laplace(result) {
         writeln!(f, "  ofv_type: laplace").map_err(|e| e.to_string())?;
     }
+    // A SAEM fit's objective (#2973): what `ofv` is, its Monte-Carlo SE, and the
+    // FOCE/Laplace value it replaced. Absent under `saem_ofv = focei` and for every other
+    // method, so their YAML is unchanged.
+    if let Some(o) = &result.saem_objective {
+        let ty = match o.kind {
+            SaemOfv::Imp => "importance_sampling",
+            _ => "agq",
+        };
+        writeln!(f, "  ofv_type: {ty}").map_err(|e| e.to_string())?;
+        if let Some(se) = o.mc_standard_error {
+            writeln!(f, "  ofv_mc_standard_error: {se:.6}").map_err(|e| e.to_string())?;
+        }
+        if let Some(k) = o.n_samples {
+            writeln!(f, "  ofv_n_samples: {k}").map_err(|e| e.to_string())?;
+        }
+        if let Some(n) = o.n_nodes {
+            writeln!(f, "  ofv_n_nodes: {n}").map_err(|e| e.to_string())?;
+        }
+        writeln!(f, "  ofv_foce_laplace: {:.6}", o.foce_ofv).map_err(|e| e.to_string())?;
+    }
     if let Some(ref is) = result.importance_sampling {
         writeln!(
             f,
@@ -4217,6 +4282,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            saem_objective: None,
             impmap_trace: None,
             bayes: None,
             vi: None,
@@ -5744,6 +5810,7 @@ mod tests {
             sir_ess: None,
             sir_resamples_packed: None,
             importance_sampling: None,
+            saem_objective: None,
             impmap_trace: None,
             bayes: None,
             vi: None,
@@ -8195,6 +8262,98 @@ mod tests {
         assert!(!summary.contains("marginal"), "{summary}");
         let yaml = objective_yaml(&r);
         assert!(yaml.contains("  ofv: 4326.600000\n  aic:"), "{yaml}");
+    }
+
+    /// #2973: a SAEM fit whose OFV is the importance-sampled (or quadrature) −2 log L says so
+    /// in the report and the YAML, prints the FOCE/Laplace value as a separate diagnostic, and
+    /// does not repeat the IS marginal on a second row. Each sentence has its own assertion,
+    /// and the `saem_ofv = focei` fit (no `saem_objective`) carries none of it.
+    #[test]
+    fn saem_objective_is_labelled_with_the_foce_value_as_a_diagnostic() {
+        use EstimationMethod::Saem;
+        let mut r = imp_objective_result(Saem, &[Saem], Some(KappaTreatment::NotApplicable));
+        r.ofv = 4299.6;
+        r.saem_objective = Some(SaemObjective {
+            kind: SaemOfv::Imp,
+            mc_standard_error: Some(0.75),
+            n_samples: Some(1000),
+            n_nodes: None,
+            foce_ofv: 4326.6,
+        });
+        let summary = format_summary(&r);
+        assert!(
+            summary.contains(
+                "OFV (IS -2LL, NONMEM IMP EONLY=1; MC SE = 0.7500, K = 1000):  4299.6000"
+            ),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("FOCE/Laplace OFV (diagnostic):  4326.6000"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("importance-sampled -2LL at the SAEM estimates"),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("IS marginal -2LL"),
+            "the marginal is the OFV row, not a second one: {summary}"
+        );
+        // Not the IMP-estimator wording: a SAEM fit is not an `ofv_is_imp_laplace` fit.
+        assert!(
+            !summary.contains(LAPLACE_NOTE) && !summary.contains(COMPARE_NOTE),
+            "{summary}"
+        );
+        let yaml = objective_yaml(&r);
+        for line in [
+            "  ofv: 4299.600000\n",
+            "  ofv_type: importance_sampling\n",
+            "  ofv_mc_standard_error: 0.750000\n",
+            "  ofv_n_samples: 1000\n",
+            "  ofv_foce_laplace: 4326.600000\n",
+        ] {
+            assert!(yaml.contains(line), "{line:?} missing from {yaml}");
+        }
+        assert!(!yaml.contains("ofv_n_nodes"), "{yaml}");
+
+        // The quadrature spelling: a node count, no Monte-Carlo SE.
+        r.saem_objective = Some(SaemObjective {
+            kind: SaemOfv::Agq,
+            mc_standard_error: None,
+            n_samples: None,
+            n_nodes: Some(11),
+            foce_ofv: 4326.6,
+        });
+        r.importance_sampling = None;
+        let summary = format_summary(&r);
+        assert!(
+            summary.contains("OFV (AGQ -2LL, 11 nodes):  4299.6000"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("adaptive Gauss-Hermite quadrature"),
+            "{summary}"
+        );
+        let yaml = objective_yaml(&r);
+        assert!(yaml.contains("  ofv_type: agq\n"), "{yaml}");
+        assert!(yaml.contains("  ofv_n_nodes: 11\n"), "{yaml}");
+        assert!(
+            !yaml.contains("ofv_mc_standard_error") && !yaml.contains("ofv_n_samples"),
+            "{yaml}"
+        );
+
+        // `saem_ofv = focei`: nothing of the above.
+        r.saem_objective = None;
+        let summary = format_summary(&r);
+        assert!(
+            !summary.contains("diagnostic") && !summary.contains("IS -2LL"),
+            "{summary}"
+        );
+        let yaml = objective_yaml(&r);
+        assert!(
+            !yaml.contains("ofv_type") && !yaml.contains("ofv_foce_laplace"),
+            "{yaml}"
+        );
     }
 
     #[test]

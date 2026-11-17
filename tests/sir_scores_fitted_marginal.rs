@@ -1113,6 +1113,9 @@ fn saem_mixture_sir_fit() -> (ferx_core::CompiledModel, ferx_core::Population, F
         saem_n_exploration: 60,
         saem_n_convergence: 60,
         saem_seed: Some(1765),
+        // The tests below compare the reported OFV with a FOCEI evaluation at the same estimates
+        // (#1765); the IS default of #2973 is a different integral.
+        saem_ofv: ferx_core::types::SaemOfv::Focei,
         run_covariance_step: true,
         sir: true,
         ..sir_defaults()
@@ -1256,6 +1259,9 @@ fn saem_mixture_sigma_override_run_sir_and_covariance_are_identical_to_in_fit() 
         saem_n_exploration: 60,
         saem_n_convergence: 60,
         saem_seed: Some(1765),
+        // The tests below compare the reported OFV with a FOCEI evaluation at the same estimates
+        // (#1765); the IS default of #2973 is a different integral.
+        saem_ofv: ferx_core::types::SaemOfv::Focei,
         run_covariance_step: true,
         sir: true,
         ..sir_defaults()

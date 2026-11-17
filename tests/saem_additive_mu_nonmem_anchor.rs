@@ -74,6 +74,9 @@ fn fit(model: &str) -> ferx_core::types::FitResult {
     .expect("prepare");
     let opts = ferx_core::types::FitOptions {
         verbose: false,
+        // NONMEM scored these estimates with FOCEI (`METHOD=1 MAXEVAL=0`), so the oracle is the
+        // FOCE/Laplace readout, not the importance-sampled default of #2973.
+        saem_ofv: ferx_core::types::SaemOfv::Focei,
         ..prep.parsed.fit_options.clone()
     };
     ferx_core::fit(

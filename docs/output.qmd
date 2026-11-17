@@ -375,6 +375,12 @@ Off-diagonal Cholesky entries appear as `chol_<eta_row>_<eta_col>` (`L_ij`,
 not log-transformed). See [Packed Parameter
 Space](estimation/parameterization.qmd) for the full layout and bounds.
 
+A SAEM fit reports the importance-sampled `−2 log L` as `ofv` by default (`saem_ofv`), and
+`objective_function` then carries `ofv_type: importance_sampling` (or `agq`),
+`ofv_mc_standard_error`, `ofv_n_samples` (or `ofv_n_nodes`) and `ofv_foce_laplace`, the
+FOCE/Laplace value it replaced. AIC and BIC are built from `ofv`. See
+[The reported OFV](estimation/saem.qmd#saem-reported-ofv).
+
 On an IMP or IMPMAP fit, `objective_function` also carries `ofv_type: laplace`,
 and any fit with an importance-sampling marginal carries
 `marginal_minus2_log_likelihood` and `marginal_mc_standard_error`. See

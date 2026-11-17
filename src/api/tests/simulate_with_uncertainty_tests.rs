@@ -756,6 +756,7 @@ pub(super) fn synthetic_fit(template: &ModelParameters) -> FitResult {
         sir_ess: None,
         sir_resamples_packed: None,
         importance_sampling: None,
+        saem_objective: None,
         impmap_trace: None,
         bayes: None,
         vi: None,

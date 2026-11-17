@@ -1520,6 +1520,112 @@ fn floor_escaped(
     })
 }
 
+/// The `−2 log L` a SAEM fit reports at its final estimates (#2973), by `saem_ofv`:
+/// the importance-sampled value (NONMEM `IMP EONLY=1`) or the adaptive-quadrature one.
+/// `prev` is the SAEM stage's result, whose EBEs and Hessians seed the evaluator and whose
+/// `ofv` (the FOCE/Laplace objective) is kept as `SaemObjective::foce_ofv`.
+fn saem_reported_objective(
+    model: &CompiledModel,
+    population: &Population,
+    prev: &crate::estimation::outer_optimizer::OuterResult,
+    opts: &FitOptions,
+    kind: SaemOfv,
+) -> Result<(f64, SaemObjective, Option<ImportanceSamplingResult>), String> {
+    match kind {
+        SaemOfv::Focei => Err("saem_ofv = focei reports the FOCE/Laplace objective".into()),
+        SaemOfv::Imp => {
+            let mut o = opts.clone();
+            o.imp_samples = opts.saem_ofv_samples;
+            o.imp_adapt_samples = opts.saem_ofv_pilot_samples;
+            let is = if model.mixture.is_some() {
+                crate::estimation::importance_sampling::run_importance_sampling_mixture(
+                    model,
+                    population,
+                    &prev.params,
+                    &o,
+                )
+            } else {
+                crate::estimation::importance_sampling::run_importance_sampling(
+                    model,
+                    population,
+                    &prev.params,
+                    &prev.eta_hats,
+                    &prev.h_matrices,
+                    &prev.kappas,
+                    &o,
+                )
+            }?;
+            let obj = SaemObjective {
+                kind,
+                mc_standard_error: Some(is.mc_standard_error),
+                n_samples: Some(is.n_samples),
+                n_nodes: None,
+                foce_ofv: prev.ofv,
+            };
+            Ok((is.minus2_log_likelihood, obj, Some(is)))
+        }
+        SaemOfv::Agq => {
+            let n_nodes = opts.saem_ofv_nodes;
+            if model.mixture.is_some() {
+                return Err("saem_ofv = agq does not support mixture models".into());
+            }
+            if model.n_eta == 0 {
+                return Err("saem_ofv = agq needs at least one random effect".into());
+            }
+            if model.n_eta > 3 {
+                return Err(format!(
+                    "saem_ofv = agq grids {n_nodes}^n_eta nodes per subject and is limited to \
+                     three random effects (this model has {})",
+                    model.n_eta
+                ));
+            }
+            // Reconverged exactly like the `agq_eval_only` stage: the grid is centred on the
+            // conditional mode and scaled by its Hessian, at the tolerance quadrature needs.
+            let mut o = opts.clone();
+            o.inner_tol = o.inner_tol.min(1e-8);
+            let mu_k = crate::estimation::parameterization::compute_mu_k(
+                model,
+                &prev.params.theta,
+                o.mu_referencing,
+            );
+            let warm =
+                crate::estimation::outer_optimizer::joint_warm_starts(&prev.eta_hats, &prev.kappas);
+            let (eta_hats, _h, _stats, kappas) =
+                crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
+                    model,
+                    population,
+                    &prev.params,
+                    o.inner_maxiter,
+                    o.inner_tol,
+                    Some(warm.as_slice()),
+                    Some(&mu_k),
+                    o.min_obs_for_convergence_check as usize,
+                    o.inner_restarts,
+                    crate::estimation::inner_optimizer::InnerHessianSeed::None,
+                    &o,
+                    crate::estimation::inner_optimizer::PrevEtas::Solved,
+                );
+            let nll = crate::estimation::agq::agq_population_nll(
+                model,
+                population,
+                &prev.params,
+                &eta_hats,
+                &kappas,
+                n_nodes,
+                crate::types::HessianAnchor::Exact,
+            );
+            let obj = SaemObjective {
+                kind,
+                mc_standard_error: None,
+                n_samples: None,
+                n_nodes: Some(n_nodes),
+                foce_ofv: prev.ofv,
+            };
+            Ok((2.0 * nll, obj, None))
+        }
+    }
+}
+
 /// One fit of `population`, the records the estimators score (`scored_population`, #2778).
 /// `all_records` is the same population with every record, for the data warnings and the
 /// `[derived]` outputs, whose grids run past the last observation.
@@ -2033,6 +2139,8 @@ fn fit_inner(
 
     let mut total_iterations: usize = 0;
     let mut is_result: Option<ImportanceSamplingResult> = None;
+    // `Some` once a SAEM stage's `ofv` was replaced by its IS / quadrature −2 log L (#2973).
+    let mut saem_objective: Option<SaemObjective> = None;
     // Which stage last **wrote** `result.ofv` — i.e. who owns the number this fit
     // will publish as `FitResult::ofv` (#1303).
     //
@@ -2589,6 +2697,30 @@ fn fit_inner(
                             msg
                         });
                     }
+                    // `[saem, imp]` + `imp_eval_only` is NONMEM's `SAEM` → `IMP EONLY=1`
+                    // workflow spelled out: under the default `saem_ofv = imp` its IS value
+                    // is the reported objective, as the implicit readout would have been
+                    // (#2973). A later `agq_eval_only` stage still replaces it.
+                    let after_saem = chain[..stage_idx]
+                        .iter()
+                        .rev()
+                        .find(|m| !eval_only_methods.contains(m))
+                        == Some(&EstimationMethod::Saem);
+                    if after_saem
+                        && stage_opts.saem_ofv == SaemOfv::Imp
+                        && r.minus2_log_likelihood.is_finite()
+                    {
+                        if let Some(prev) = result.as_mut() {
+                            saem_objective = Some(SaemObjective {
+                                kind: SaemOfv::Imp,
+                                mc_standard_error: Some(r.mc_standard_error),
+                                n_samples: Some(r.n_samples),
+                                n_nodes: None,
+                                foce_ofv: prev.ofv,
+                            });
+                            prev.ofv = r.minus2_log_likelihood;
+                        }
+                    }
                     is_result = Some(r);
                 }
                 Err(e) => {
@@ -2707,6 +2839,51 @@ fn fit_inner(
         // so it becomes the owner of the published `ofv` (#1303).
         objective_stage = Some(method);
         result = Some(stage_result);
+
+        // SAEM's reported objective (#2973): NONMEM follows `METHOD=SAEM` with
+        // `METHOD=IMP EONLY=1` and reports that importance-sampled −2 log L, so that is the
+        // default `ofv`; the FOCE/Laplace value moves to `SaemObjective::foce_ofv`. A chain
+        // that carries its own evaluator stage (`imp_eval_only` / `agq_eval_only`) is
+        // explicit and handled by that stage. Best-effort like the IMP marginal below: a
+        // model the evaluator cannot score keeps the FOCE/Laplace `ofv`, with a warning.
+        if method == EstimationMethod::Saem
+            && is_last_estimating
+            && eval_only_methods.is_empty()
+            && stage_opts.saem_ofv != SaemOfv::Focei
+        {
+            let prev = result.as_mut().expect("stage result was just set");
+            let mut tried = stage_opts.saem_ofv;
+            let outcome = loop {
+                match saem_reported_objective(model, population, prev, &stage_opts, tried) {
+                    Ok(x) => break Some(x),
+                    Err(e) if tried == SaemOfv::Agq => {
+                        accumulated_warnings.push(format!(
+                            "saem_ofv = agq unavailable ({e}); reporting the importance-sampled \
+                             −2 log L instead."
+                        ));
+                        tried = SaemOfv::Imp;
+                    }
+                    Err(e) => {
+                        accumulated_warnings.push(format!(
+                            "SAEM objective: importance-sampled −2 log L skipped ({e}); \
+                             reporting the FOCE/Laplace OFV."
+                        ));
+                        break None;
+                    }
+                }
+            };
+            if let Some((ofv, obj, is)) = outcome.filter(|(ofv, ..)| ofv.is_finite()) {
+                if let Some(msg) = is
+                    .as_ref()
+                    .and_then(crate::estimation::importance_sampling::marginal_reliability_warning)
+                {
+                    accumulated_warnings.push(msg);
+                }
+                prev.ofv = ofv;
+                saem_objective = Some(obj);
+                is_result = is;
+            }
+        }
 
         // NONMEM-comparable IMP / IMPMAP objective. The reported `OuterResult.ofv`
         // is a final FOCE *Laplace* pass (kept for cross-method AIC/BIC
@@ -3710,6 +3887,7 @@ fn fit_inner(
         sir_ess: None,
         sir_resamples_packed: None,
         importance_sampling: is_result,
+        saem_objective,
         impmap_trace: result.impmap_trace.clone(),
         bayes: result.bayes.clone(),
         vi: vi_result.clone(),

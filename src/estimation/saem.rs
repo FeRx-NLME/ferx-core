@@ -4267,7 +4267,7 @@ pub(crate) fn componentwise_sweeps(n_mh_steps: usize, n_eta: usize) -> usize {
 /// bad OFV before paying for the covariance matrix. Kept as a pure function so
 /// the message is unit-testable.
 fn saem_final_ofv_report(ofv: f64) -> String {
-    format!("SAEM completed. Final OFV = {:.4}", ofv)
+    format!("SAEM completed. FOCE/Laplace OFV = {:.4}", ofv)
 }
 
 pub fn run_saem(
@@ -9182,11 +9182,11 @@ mod tests {
         // CLI user can judge the fit before the covariance step runs.
         assert_eq!(
             saem_final_ofv_report(1234.56789),
-            "SAEM completed. Final OFV = 1234.5679"
+            "SAEM completed. FOCE/Laplace OFV = 1234.5679"
         );
         assert_eq!(
             saem_final_ofv_report(-42.0),
-            "SAEM completed. Final OFV = -42.0000"
+            "SAEM completed. FOCE/Laplace OFV = -42.0000"
         );
     }
 
