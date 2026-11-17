@@ -33,7 +33,7 @@ use super::basis::Input;
 use super::*;
 use crate::sens::dual2::Dual2;
 use crate::sens::focei_kernel::{
-    chol, foce_row, foce_woodbury_ok, focei_gauss_row, laplace_row, prior_of,
+    chol, foce_row, foce_woodbury_ok, focei_gauss_row, gauss_row_l, laplace_row, prior_of,
     structured_rows_supported,
 };
 
@@ -556,7 +556,7 @@ impl CovPlan<'_> {
                 let mut row = Vec::with_capacity(n_obs);
                 let mut sum = 0.0;
                 for j in 0..n_obs {
-                    let x = laplace_row(self.ctx, j, Dual2::var(fb(d, j), 0), &p)?[0];
+                    let x = gauss_row_l(self.ctx, j, Dual2::var(fb(d, j), 0), &p)?;
                     sum += x.value;
                     row.push(x);
                 }

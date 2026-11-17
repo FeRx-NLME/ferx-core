@@ -671,6 +671,17 @@ pub(crate) fn focei_gauss_row<T: PkNum>(
     Some((lj.v, lj.g[0], focei_alpha(vd.v, vd.g[0])))
 }
 
+/// Row `j`'s `ℓ = r²/V + log V` alone at prediction `f` (an uncensored Gaussian row, as
+/// [`focei_gauss_row`]): what a quadrature node's aggregate `Σℓ` reads (#2980) — no
+/// derivative in `f` carried beyond `T`'s own.
+pub(crate) fn gauss_row_l<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -> Option<T> {
+    let v = ctx.variance_v(j, f, T::from_f64(1.0), p);
+    if !positive_finite(v) {
+        return None;
+    }
+    Some(gauss_l(ctx.subject.observations[j], f, v))
+}
+
 /// Whether a subject's FOCEI objective is the row-and-reduce form [`focei_gauss_row`] and the
 /// reduce `½·[ηᵀΩ⁻¹η + log|Ω| + log|Ω⁻¹ + Σ αGGᵀ|]` describe exactly: the diagonal path with
 /// every row an uncensored Gaussian one, no RUV IIV, no SDE, no FREM rows, no non-Gaussian
