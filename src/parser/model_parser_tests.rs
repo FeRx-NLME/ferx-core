@@ -33466,6 +33466,16 @@ fn word_valued_keys_reject_an_identifier_value() {
             ),
             "link `V` is not supported",
         ));
+        cases.push((
+            "count_model",
+            "type",
+            cond_ode_model(
+                ip,
+                rhs,
+                "[count_model]\n  cmt = 3\n  lambda = 2.0\n  type = V\n",
+            ),
+            "type `V` is not supported",
+        ));
     }
     #[cfg(feature = "markov")]
     {

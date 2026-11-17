@@ -21,6 +21,8 @@ categorical_smoke
 cmt_data_selection_scope
 cmt_endpoint_scope
 cmt_toggle_refusals
+count_nonmem_anchor
+count_simulate_roundtrip
 ctmm_time_dependent_pk
 dcm_export_predict
 dose_compartment_routing
