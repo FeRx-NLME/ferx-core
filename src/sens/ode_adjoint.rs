@@ -528,8 +528,12 @@ fn fixed_ebe_score(
     };
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega(model, subject, template, params, sc.width);
-    let mut pv = ParT::of(model, subject, params);
-    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
+    let pv = ParT::of_with_omega(
+        model,
+        subject,
+        params,
+        crate::sens::focei_kernel::OmegaT::from_chol_cached(so.chol.clone())?,
+    );
 
     // The objective's kernel plan (`H` and `η̂` constants), scored inside the η̂
     // recording's weights callback on that recording's own prediction values — one
@@ -764,8 +768,12 @@ fn fixed_ebe_score_iov(
         };
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega(model, subject, template, params, sc.width);
-    let mut pv = ParT::of(model, subject, params);
-    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
+    let pv = ParT::of_with_omega(
+        model,
+        subject,
+        params,
+        crate::sens::focei_kernel::OmegaT::from_chol_cached(so.chol.clone())?,
+    );
 
     let mut inp = kernel::Inputs::default();
     let mut fr: Vec<kernel::Leaf> = (0..n_obs).map(|j| inp.leaf(lanes[j * lw])).collect();
@@ -4165,11 +4173,11 @@ pub(crate) fn exact_inner_hessian_or_decline(
         .ok_or(D::Predictions)?
     };
     let ctx = LikCtx::new(model, subject, params);
-    let mut pv = ParT::of(model, subject, params);
-    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
-        stacked_omega(model, subject, params, params, w).chol,
-    )
+    let omega = crate::sens::focei_kernel::OmegaT::from_chol_cached(stacked_chol(
+        model, subject, params, w,
+    ))
     .ok_or(D::Omega)?;
+    let pv = ParT::of_with_omega(model, subject, params, omega);
     let f: Vec<f64> = (0..p.rows()).map(|j| p.v(j)).collect();
     let g: Vec<Vec<f64>> = (0..p.rows()).map(|j| p.row_g(j).to_vec()).collect();
     let q: Vec<Vec<f64>> = (0..p.rows()).map(|j| p.row_q(j).to_vec()).collect();
@@ -4267,10 +4275,14 @@ pub(crate) fn exact_htilde(
         )?
     };
     let ctx = LikCtx::new(model, subject, params);
-    let mut pv = ParT::of(model, subject, params);
-    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
-        stacked_omega(model, subject, params, params, w).chol,
-    )?;
+    let pv = ParT::of_with_omega(
+        model,
+        subject,
+        params,
+        crate::sens::focei_kernel::OmegaT::from_chol_cached(stacked_chol(
+            model, subject, params, w,
+        ))?,
+    );
     let (f, g) = p.f_g();
     let ht = crate::sens::focei_kernel::focei_htilde(&ctx, &f, &g, &eta, &pv)?;
     let mut h = DMatrix::from_fn(w, w, |a, b| ht[a][b]);
@@ -4323,10 +4335,14 @@ pub(crate) fn exact_inner_gradient_in(
         &eta,
     )?;
     let ctx = LikCtx::new(model, subject, params);
-    let mut pv = ParT::of(model, subject, params);
-    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(
-        stacked_omega(model, subject, params, params, w).chol,
-    )?;
+    let pv = ParT::of_with_omega(
+        model,
+        subject,
+        params,
+        crate::sens::focei_kernel::OmegaT::from_chol_cached(stacked_chol(
+            model, subject, params, w,
+        ))?,
+    );
     let (f, g) = p.f_g();
     let gr = inner_grad(&ctx, &f, &g, &eta, &pv, frozen)?;
     gr.iter().all(|v| v.is_finite()).then_some(gr)
@@ -4357,17 +4373,41 @@ fn stacked_omega(
     params: &ModelParameters,
     active: usize,
 ) -> StackedOmega {
+    stacked_parts(model, subject, Some(template), params, active)
+}
+
+/// The stacked prior's Cholesky factor alone ([`stacked_omega`]'s `chol`, without the packed
+/// placement the gradient's chain rule reads): for the entries that only score the prior.
+fn stacked_chol(
+    model: &CompiledModel,
+    subject: &Subject,
+    params: &ModelParameters,
+    active: usize,
+) -> Vec<Vec<f64>> {
+    stacked_parts(model, subject, None, params, active).chol
+}
+
+/// [`stacked_omega`], its `placed` entries only when a `template` gives the packed layout.
+fn stacked_parts(
+    model: &CompiledModel,
+    subject: &Subject,
+    template: Option<&ModelParameters>,
+    params: &ModelParameters,
+    active: usize,
+) -> StackedOmega {
     let (n_eta, omega) = (model.n_eta, &params.omega);
-    let seg = crate::estimation::parameterization::packed_segments(template);
+    let seg = template.map(crate::estimation::parameterization::packed_segments);
     let mut chol = vec![vec![0.0; active]; active];
     let mut placed = Vec::new();
     for (e, &(r, c)) in lower_tri_entries(n_eta, omega.diagonal).iter().enumerate() {
         chol[r][c] = omega.chol[(r, c)];
-        placed.push((
-            seg.omega_start() + e,
-            vec![(r, c)],
-            if r == c { omega.chol[(r, r)] } else { 1.0 },
-        ));
+        if let Some(seg) = &seg {
+            placed.push((
+                seg.omega_start() + e,
+                vec![(r, c)],
+                if r == c { omega.chol[(r, r)] } else { 1.0 },
+            ));
+        }
     }
     if let Some(oi) = params.omega_iov.as_ref().filter(|_| model.n_kappa > 0) {
         let nk = model.n_kappa;
@@ -4393,11 +4433,13 @@ fn stacked_omega(
             for &(i, j) in &at {
                 chol[i][j] = oi.chol[(r, c)];
             }
-            placed.push((
-                seg.iov_start() + e,
-                at,
-                if r == c { oi.chol[(r, r)] } else { 1.0 },
-            ));
+            if let Some(seg) = &seg {
+                placed.push((
+                    seg.iov_start() + e,
+                    at,
+                    if r == c { oi.chol[(r, r)] } else { 1.0 },
+                ));
+            }
         }
     }
     StackedOmega { chol, placed }
@@ -4864,8 +4906,12 @@ fn run(
     // Ψ = F − wᵀ∇_η l and the mode-response rows as fixed linear combinations of the lanes.
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega(model, subject, template, params, n);
-    let mut pv = ParT::of(model, subject, params);
-    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
+    let pv = ParT::of_with_omega(
+        model,
+        subject,
+        params,
+        crate::sens::focei_kernel::OmegaT::from_chol_cached(so.chol.clone())?,
+    );
     let mut inp = kernel::Inputs::default();
     let fr: Vec<kernel::Leaf> = (0..n_rows).map(|j| inp.leaf(preds.v(j))).collect();
     let gr: Vec<Vec<kernel::Leaf>> = (0..n_rows)
@@ -5274,8 +5320,12 @@ fn run_agq(
     let theta = &params.theta;
     let ctx = LikCtx::new(model, subject, params);
     let so = stacked_omega(model, subject, template, params, eta.len());
-    let mut pv = ParT::of(model, subject, params);
-    pv.omega = crate::sens::focei_kernel::OmegaT::from_chol(so.chol.clone())?;
+    let pv = ParT::of_with_omega(
+        model,
+        subject,
+        params,
+        crate::sens::focei_kernel::OmegaT::from_chol_cached(so.chol.clone())?,
+    );
     let n = eta.len();
 
     // ---- 1. values at η̂ (the plan's second-order forward): f, G, Q; the exact H and the
@@ -5360,7 +5410,8 @@ fn run_agq(
     // search left loosely converged, a flat direction): the jittered anchor, then the prior
     // precision `Ω⁻¹`. Each is part of the objective, so the gradient follows it rather
     // than declining.
-    let lh = factor_anchor(&mut h_a, &pv.omega.inv)?;
+    let nh = h_a.len();
+    let lh = factor_anchor(&mut h_a, pv.omega_inv(nh))?;
     // The tensor grid: per node its `z`, `c_j = Σ log w + ‖z‖²`, and `b_j` (f64).
     let one_point = n_agq == 1;
     let grid: Vec<(Vec<f64>, f64, Vec<f64>)> = if one_point {

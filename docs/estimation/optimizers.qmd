@@ -94,8 +94,8 @@ still refused (`E_OPTIMIZER_AGQ`).
 
 It stops when the exact Newton decrement $\tfrac12 g^\top |H|^{-1} g$ — the objective drop the
 next Newton step predicts — is at most $10^{-6}$. An iteration whose exact Hessian cannot be
-formed (a subject's EBE does not re-converge there) uses BHHH from the exact per-subject
-gradients for that step. `steihaug_max_iters` no longer has an effect.
+formed (a subject's EBE does not re-converge there) uses BHHH, `4 Σ dᵢdᵢᵀ` from each subject's
+exact total derivative ([#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974)), for that step. `steihaug_max_iters` no longer has an effect.
 
 Measured (#2975; FOCEI, 26 bundled and synthetic models, 5 perturbed starts each, against
 `nlopt_lbfgs` before #2975): about a fifth of the iterations and half the EBE solves, every

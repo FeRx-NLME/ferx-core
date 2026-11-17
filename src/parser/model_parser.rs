@@ -1143,19 +1143,80 @@ impl TypicalProgram {
 
     /// The typical value at `theta` and one subject's covariate snapshot.
     pub(crate) fn eval(&self, theta: &[f64], covariates: &HashMap<String, f64>) -> f64 {
-        let mut values = Vec::with_capacity(self.defs.len());
+        self.eval_in(theta, covariates)
+    }
+
+    /// The covariates the program reads, each once, in first-read order: the names of a
+    /// [`CovariateSnapshot`].
+    pub(crate) fn covariate_names(&self) -> Vec<String> {
+        fn walk(e: &Expression, out: &mut Vec<String>) {
+            match e {
+                Expression::Covariate(c) => {
+                    if !out.contains(c) {
+                        out.push(c.clone());
+                    }
+                }
+                Expression::BinOp(l, _, r) | Expression::Power(l, r) => {
+                    walk(l, out);
+                    walk(r, out);
+                }
+                Expression::UnaryFn(_, a) => walk(a, out),
+                Expression::ThetaGather { idx, .. } => walk(idx, out),
+                Expression::Conditional(c, t, f) => {
+                    for_each_condition_operand(c, &mut |x| walk(x, out));
+                    walk(t, out);
+                    walk(f, out);
+                }
+                // Every variant is listed, so a new one that can hold a covariate is a compile
+                // error here, not a covariate the snapshot silently reads as `0.0`.
+                Expression::Literal(_)
+                | Expression::Theta(_)
+                | Expression::Eta(_)
+                | Expression::Time
+                | Expression::MixNum
+                | Expression::Variable(_)
+                | Expression::VariableIdx(_)
+                | Expression::CovariateIdx(_)
+                | Expression::NnOutput { .. } => {}
+            }
+        }
+        let mut out = Vec::new();
         for d in &self.defs {
+            walk(d, &mut out);
+        }
+        walk(&self.root, &mut out);
+        out
+    }
+
+    /// [`Self::eval`] over a subject's covariates read once ([`CovariateSnapshot`]): a solve
+    /// that evaluates the same subjects at many θ looks each covariate up by name once, not at
+    /// every evaluation. Bit-identical to [`Self::eval`] on the map the snapshot was taken from.
+    pub(crate) fn eval_snapshot(&self, theta: &[f64], snapshot: &CovariateSnapshot<'_>) -> f64 {
+        self.eval_in(theta, snapshot)
+    }
+
+    fn eval_in<C: CovariateSource>(&self, theta: &[f64], covariates: &C) -> f64 {
+        // The definitions are few: a stack buffer keeps the common program allocation-free.
+        let mut stack = [0.0f64; 8];
+        let mut heap;
+        let values: &mut [f64] = if self.defs.len() <= stack.len() {
+            &mut stack[..self.defs.len()]
+        } else {
+            heap = vec![0.0f64; self.defs.len()];
+            &mut heap
+        };
+        for (j, d) in self.defs.iter().enumerate() {
             let v = eval_expr(
                 d,
                 theta,
                 &[],
                 &TypicalEnv {
                     covariates,
-                    defs: &values,
+                    defs: &values[..j],
                 },
                 &[],
             );
-            values.push(v);
+            values[j] = v;
         }
         eval_expr(
             &self.root,
@@ -1163,7 +1224,7 @@ impl TypicalProgram {
             &[],
             &TypicalEnv {
                 covariates,
-                defs: &values,
+                defs: values,
             },
             &[],
         )
@@ -1232,16 +1293,55 @@ pub(crate) struct ProgramDefs {
 /// the definitions computed so far by index. A stray local name reads `0.0`
 /// (`MACHEPS` excepted, as in [`MapEnv`]), which is why detection rejects one
 /// rather than letting it through.
-struct TypicalEnv<'a> {
-    covariates: &'a HashMap<String, f64>,
+struct TypicalEnv<'a, C: CovariateSource> {
+    covariates: &'a C,
     defs: &'a [f64],
 }
 
-impl EvalEnv for TypicalEnv<'_> {
+/// Where a [`TypicalProgram`] reads a covariate by name; an absent one is `0.0`.
+pub(crate) trait CovariateSource {
+    fn covariate(&self, name: &str) -> f64;
+}
+
+impl CovariateSource for HashMap<String, f64> {
+    #[inline]
+    fn covariate(&self, name: &str) -> f64 {
+        self.get(name).copied().unwrap_or(0.0)
+    }
+}
+
+/// A subject's values of the covariates a [`TypicalProgram`] reads
+/// ([`TypicalProgram::covariate_names`]), read from the subject's map once; each read then
+/// finds its name in that short list.
+pub(crate) struct CovariateSnapshot<'a> {
+    names: &'a [String],
+    values: Vec<f64>,
+}
+
+impl<'a> CovariateSnapshot<'a> {
+    pub(crate) fn new(names: &'a [String], covariates: &HashMap<String, f64>) -> Self {
+        CovariateSnapshot {
+            names,
+            values: names.iter().map(|n| covariates.covariate(n)).collect(),
+        }
+    }
+}
+
+impl CovariateSource for CovariateSnapshot<'_> {
+    #[inline]
+    fn covariate(&self, name: &str) -> f64 {
+        self.names
+            .iter()
+            .position(|n| n == name)
+            .map_or(0.0, |i| self.values[i])
+    }
+}
+
+impl<C: CovariateSource> EvalEnv for TypicalEnv<'_, C> {
     #[inline]
     fn resolve(&self, expr: &Expression) -> f64 {
         match expr {
-            Expression::Covariate(name) => self.covariates.get(name).copied().unwrap_or(0.0),
+            Expression::Covariate(name) => self.covariates.covariate(name),
             Expression::Variable(name) if name.eq_ignore_ascii_case("MACHEPS") => f64::EPSILON,
             Expression::VariableIdx(j) => self.defs.get(*j).copied().unwrap_or(0.0),
             _ => 0.0,
@@ -32221,31 +32321,44 @@ impl NativeJacobian<'_> {
         }
         let [ub, pb, sb, db] = &mut *self.bufs.borrow_mut();
         // Every input element is its value, then its one-hot tangents: state `j` along
-        // direction `j`, the clock's seeds (`T`, `TAFD`, `TAD`) along direction `n`.
-        for (b, len) in [
-            (&mut *ub, u.len()),
-            (&mut *pb, params.len()),
-            (&mut *sb, 4),
-            (&mut *db, n),
-        ] {
-            b.clear();
-            b.resize(len * l, 0.0);
+        // direction `j`, the clock's seeds (`T`, `TAFD`, `TAD`) along direction `n`. The
+        // tangent lanes never change and the native code only reads its inputs, so input
+        // buffers already laid out for these lengths need only their values rewritten. The
+        // output buffer is zeroed every call: the native code may leave lanes it does not
+        // write as they were, and nothing here should read a previous call's.
+        let laid_out = ub.len() == u.len() * l
+            && pb.len() == params.len() * l
+            && sb.len() == 4 * l
+            && db.len() == n * l;
+        if !laid_out {
+            for (b, len) in [
+                (&mut *ub, u.len()),
+                (&mut *pb, params.len()),
+                (&mut *sb, 4),
+                (&mut *db, n),
+            ] {
+                b.clear();
+                b.resize(len * l, 0.0);
+            }
+            for j in 0..n.min(u.len()) {
+                ub[j * l + 1 + j] = 1.0;
+            }
+            if self.clock {
+                for i in 0..3 {
+                    sb[i * l + 1 + n] = 1.0;
+                }
+            }
         }
         for (j, &x) in u.iter().enumerate() {
             ub[j * l] = x;
-            if j < n {
-                ub[j * l + 1 + j] = 1.0;
-            }
         }
         for (j, &x) in params.iter().enumerate() {
             pb[j * l] = x;
         }
         for (i, x) in self.binding.f64_seeds(params, t).into_iter().enumerate() {
             sb[i * l] = x;
-            if self.clock && i < 3 {
-                sb[i * l + 1 + n] = 1.0;
-            }
         }
+        db.fill(0.0);
         if !self.tan.run(ub, pb, sb, db) {
             return false;
         }

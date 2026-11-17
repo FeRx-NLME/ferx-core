@@ -164,7 +164,7 @@ A covariate the data lack is refused when the run starts, with
 |---|---|---|
 | A number, θ | yes | The same for every subject. |
 | A data covariate | yes | Known when the dose is written. Read at `at[0]`. |
-| An individual parameter that no random effect reaches (`TVCLW = TVCL * (WT / 70)`) | yes | A function of θ, covariates and `TIME` alone, so known for every subject. Read at `at[0]`. |
+| An individual parameter that no random effect reaches (`TVCLW = TVCL * (WT / 70)`) | yes | A function of θ, covariates and `TIME` alone, so known for every subject. Read at `at[0]`. Under [parameter uncertainty](#parameter-uncertainty) it is read at the point estimate θ̂ in every draw. |
 | An individual parameter that a random effect reaches (`CL = TVCLW * exp(ETA_CL)`, or any parameter computed from one), or a random effect (`ETA_CL`) | for a supplied subject; for a drawn one only under `dose_knowledge = oracle` | Known at dosing time only when the subject's η come from input; see [Which subjects' values are known](#which-subjects-values-are-known). A parameter counts as reached when an η, a κ or `MIXNUM` enters it through any intermediate or `if` condition. |
 | A state (`CENT`) | no | The expression runs once; to follow the drug level, write a `when signal …` rule. |
 | `TIME` (or `T`) | no | It would always be `at[0]`; write the value. |
@@ -848,7 +848,79 @@ The result bundles four tidy, long-form artifacts — each tagged by
   windows are not counted — discontinuation is already its own metric, and folding
   it in here too would double-count it; this keeps `auc_target_attainment` on the
   same realized basis as `pct_time_in_window`. Population summaries **with
-  uncertainty bands** ride with the uncertainty slice, where bands carry meaning.
+  uncertainty bands** across the draws of a run with
+  [parameter uncertainty](#parameter-uncertainty) are a follow-up (#946).
+
+## Parameter uncertainty
+
+A run can also propagate a fit's **parameter uncertainty**
+([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)): it draws parameter sets
+(θ, Ω, σ, Ω_IOV) from the fit and simulates every subject and replicate under each. In
+Rust, add `AdaptiveInputs::with_uncertainty` to the inputs of
+`simulate_adaptive_with_inputs` or `simulate_adaptive_from_spec_with_inputs`:
+
+```rust
+let params = fitted_params_from_result(&fit, &model)?;
+let inputs = AdaptiveInputs::new(&params).with_uncertainty(
+    &fit,
+    UncertaintySpec { method: UncertaintyMethod::Asymptotic, n_draws: 200 },
+);
+let res = simulate_adaptive_from_spec_with_inputs(&model, &pop, &inputs, n_sim, &spec, &opts)?;
+```
+
+The run simulates `n_draws × n_sim` replicates of every subject. Every trajectory, ledger,
+decision and metrics row carries its real `draw` (1 to `n_draws`), and
+`AdaptiveSimulationResult::parameters` holds each draw's parameter set, in draw order.
+A run without uncertainty tags every row `draw = 1` and returns no `parameters`. The R
+wrapper does not expose this yet.
+
+### What each draw changes
+
+The parameter sets come from the sampler `simulate_with_uncertainty` uses: a
+multivariate normal on the fit's covariance matrix (`UncertaintyMethod::Asymptotic`, the
+default), or the fit's retained SIR resamples (`UncertaintyMethod::Sir`). FIX and
+held-at-bound parameters stay at their estimates.
+
+| Stream | Across draws |
+|---|---|
+| Parameter draws | A stream of their own, rooted at the run seed. Asking for more draws leaves the earlier ones, and every row simulated under them, unchanged. |
+| η | The one η stream continues from draw to draw, so each draw simulates new virtual patients. Draw 1 uses the standard normals the same seed gives without uncertainty, scaled by draw 1's Ω. |
+| κ, `Dv` assay | Keyed by subject, draw and sim. Draw 1 keeps the keys of a run without uncertainty. |
+| Mixture class | Keyed by subject, draw and sim (never an assay replicate), under the draw's mixing probabilities. |
+
+So a draw at the point estimate reproduces the run without uncertainty, row for row.
+`simulate_with_uncertainty` differs here: it draws its parameter sets from the same
+stream as η, so its draw-1 rows change with the number of draws.
+
+The draw loop is the outermost. Each draw's κ, assay, σ and class follow that draw's
+parameters. A failure in any draw stops the run, as a failure in any replicate does
+today: dropping a draw would bias the uncertainty distribution. Messages then name the
+draw as well as the replicate, `subject '7' (draw 3, sim 2): …`. Without uncertainty they
+keep `(sim 2)`.
+
+### Dose knowledge under a drawn θ
+
+A dose expression that reads only θ, covariates and individual parameters no random
+effect reaches is the prescriber's rule. It is evaluated once, at the point estimate θ̂
+the run is given, and gives the same plan in every draw: the run asks how that rule
+performs when the true θ is uncertain. An `oracle` subject reads its drawn values, and
+so the draw's θ, in each replicate, as it reads its drawn η.
+
+### What is refused
+
+| Input | Outcome |
+|---|---|
+| `n_draws = 0` | `E_ADAPTIVE_OPTIONS`. Omit `with_uncertainty` to simulate at the point estimate. |
+| `params` whose θ, Ω, Ω_IOV, σ or residual ρ differ from the fit's | `E_ADAPTIVE_OPTIONS`, naming the first that differs. The draws centre on the fit's estimate, so the run's parameters must be that estimate. FIX flags, masks and bounds are not compared. |
+| `Asymptotic` on a fit with no covariance matrix | `E_FIT_INPUT_MISSING`. The message points to `UncertaintyMethod::Sir` when the fit kept a SIR pool, and to a refit with `covariance_fallback = sir` and `sir_keep_samples = true` when it did not. The run never switches method by itself. |
+| `Sir` on a fit with no SIR pool | `E_FIT_INPUT_MISSING`, as in `simulate_with_uncertainty`. |
+| Supplied η (`with_etas`), under either `UnmatchedSubjects` policy | `E_SUPPLIED_ETAS`. Each supplied η was estimated at the fit's θ, so pairing it with a drawn θ would not describe the same patient. #2154 tracks drawing η from its posterior under each draw. |
+
+There is no NONMEM run to compare with: NONMEM has no feedback dosing. The path is
+validated by the degenerate oracle (draws at the point estimate reproduce the run
+without uncertainty, bit for bit) and by a cross-check against
+`simulate_with_uncertainty` on the same draws under a fixed regimen (IPRED equal to
+the bit).
 
 ## Verification (on by default)
 
@@ -1313,8 +1385,6 @@ cannot see a failure in the solver itself.
   assay streams), so a non-IOV run is unchanged and enabling a `Dv` monitor never
   shifts the draws. `auc_target` reads each segment under the κ it was integrated with
   (#943).
-  Between-subject η is still drawn per subject/replicate; parameter-uncertainty
-  propagation is a later layer.
 - **Deterministic ODE only** — a stochastic (`[diffusion]` / SDE) model is rejected
   (the reactive integrator carries no process noise).
 - **Diagonal assay noise** — each `Dv` monitor draws independently; correlated

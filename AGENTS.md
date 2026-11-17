@@ -537,7 +537,7 @@ The estimation engine uses a nested optimization structure:
 
 ### Gauss-Newton (BHHH) Optimizer
 
-An alternative estimation method using the BHHH (Berndt-Hall-Hall-Hausman) approximation to the Hessian is available in `estimation/gauss_newton.rs`. It uses the outer product of per-subject gradients (`H ≈ Σ gᵢgᵢᵀ`) as the Hessian of a trust-region step: Steihaug truncated CG on the scaled BHHH system, with the radius set by the ratio of actual to predicted OFV reduction. Two variants are available:
+An alternative estimation method using the BHHH (Berndt-Hall-Hall-Hausman) approximation to the Hessian is available in `estimation/gauss_newton.rs`. It uses the outer product of per-subject gradients (`H ≈ Σ dᵢdᵢᵀ`, `dᵢ` each subject's total derivative, the same rows as the gradient and the covariance step's `S`, #2974) as the Hessian of a trust-region step: Steihaug truncated CG on the scaled BHHH system, with the radius set by the ratio of actual to predicted OFV reduction. Two variants are available:
 
 - **`method = gn`** (pure Gauss-Newton): Fast convergence for well-conditioned problems.
 - **`method = gn_hybrid`**: Runs GN first, then polishes with FOCEI via `outer_optimizer.rs` for robustness.

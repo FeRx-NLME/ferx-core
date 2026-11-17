@@ -332,13 +332,11 @@ pub fn mixture_ofv(
 }
 
 /// Every class's inner modes at one mixture evaluation, `[class][subject]`: the
-/// per-class H and κ̂ that `MixtureEval` keeps only for the MIXEST class (its
+/// per-class κ̂ that `MixtureEval` keeps only for the MIXEST class (its
 /// [`MixtureEval::etas_by_class`] already holds every class). The covariance step's
 /// per-subject mixture score (#1956) differentiates every class's `nll_ik` at its own
-/// fixed modes, so it needs them all.
+/// mode, so it needs them all.
 pub(crate) struct MixtureClassModes {
-    /// Inner Hessian / linearization `H` per class per subject.
-    pub(crate) h_mats: Vec<Vec<DMatrix<f64>>>,
     /// Per-occasion κ̂ per class per subject (empty inner `Vec` without IOV).
     pub(crate) kappas: Vec<Vec<Vec<DVector<f64>>>>,
 }
@@ -524,7 +522,6 @@ pub(crate) fn mixture_ofv_with_modes(
         class_nll,
     };
     let modes = MixtureClassModes {
-        h_mats: hmats_by_class,
         kappas: kappas_by_class,
     };
     (eval, modes)
@@ -1033,11 +1030,10 @@ struct ClassScoreView {
 /// ```
 ///
 /// on the −logL scale (S's scale; [`mixture_gradient`] is the same sum ×2 over
-/// subjects). Each `∂nllᵢₖ/∂x` is the single-population fixed-mode score
-/// (`covariance::fixed_ebe_subject_score`, so the closed-form-vs-FD dispatch and the
-/// fixed-mode convention, η̂/H/κ̂ held at `x̂`, are the ones every other S uses; see
-/// the convention comment in `covariance::assemble_score_cross_product`) evaluated under
-/// `MIXNUM = k`, with class `k`'s own η̂/H/κ̂ and Ω/Σ, then routed onto the mixture
+/// subjects). Each `dnllᵢₖ/dx` is the single-population total-derivative score
+/// (`covariance::subject_total_score`, the class mode re-estimated at every `x` — NONMEM's
+/// `MATRIX=S` convention, the one every other S uses since #2974) evaluated under
+/// `MIXNUM = k`, with class `k`'s own η̂/κ̂ and Ω/Σ, then routed onto the mixture
 /// layout by `route_class_gradient` — the routing the outer gradient uses. The modes
 /// come from one cold `mixture_ofv` at `x̂` and the covariance inner tolerance, the
 /// same evaluation `compute_covariance` takes its base OFV from.
@@ -1047,6 +1043,9 @@ pub(crate) struct MixtureScoreContext {
     modes: MixtureClassModes,
     classes: Vec<ClassScoreView>,
     dtheta_dx: Vec<f64>,
+    /// The covariance step's options: the inner tolerance the modes were solved at, and the one
+    /// the reconverged fallback's probes re-solve at (#2261).
+    score_options: FitOptions,
     /// The mixing derivatives at `params.theta`, shared by the subjects' scores.
     mixing: MixingGradCache,
 }
@@ -1111,17 +1110,29 @@ impl MixtureScoreContext {
             modes,
             classes,
             dtheta_dx,
+            score_options,
             mixing: MixingGradCache::new(model),
         }
     }
 
-    /// Subject `i`'s score `∂(−log Lᵢ)/∂x` over the full mixture packed layout.
+    /// Each class's packed point, unpacked once for the population (not per subject × class).
+    pub(crate) fn class_points(
+        &self,
+    ) -> Vec<Option<crate::sens::ode_provider::adjoint::PackedPoint<'_>>> {
+        self.classes
+            .iter()
+            .map(|v| crate::sens::ode_provider::adjoint::PackedPoint::new(&v.template, &v.x))
+            .collect()
+    }
+
+    /// Subject `i`'s score `∂(−log Lᵢ)/∂x` over the full mixture packed layout; `points` is
+    /// [`Self::class_points`].
     pub(crate) fn score(
         &self,
         model: &CompiledModel,
         population: &Population,
         i: usize,
-        options: &FitOptions,
+        points: &[Option<crate::sens::ode_provider::adjoint::PackedPoint<'_>>],
     ) -> Vec<f64> {
         let spec = model
             .mixture
@@ -1143,17 +1154,17 @@ impl MixtureScoreContext {
             // Asymmetry (#1973): the class kernel here is the single-population S's,
             // not `mixture_gradient`'s `subject_gradient_at`; only the routing
             // is shared, so a kernel change moves one of S and the outer gradient.
-            let g_c = crate::estimation::covariance::fixed_ebe_subject_score(
+            let g_c = crate::estimation::covariance::subject_total_score(
                 &view.x,
                 &view.template,
                 model,
                 population,
                 i,
                 &self.eval.etas_by_class[cls][i],
-                &self.modes.h_mats[cls][i],
                 &self.modes.kappas[cls][i],
+                points[cls].as_ref(),
                 &view.bounds,
-                options,
+                &self.score_options,
             );
             route_class_gradient(&mut g, &g_c, w, cls, &self.params, mp);
             subtract_mixing_gradient(&mut g, &dlnp[cls], w, &self.dtheta_dx);
@@ -2875,13 +2886,14 @@ mod tests {
 
     // ── Per-subject mixture score for the covariance S (#1956) ──
 
-    /// Subject `i`'s mixture marginal `−log Σₖ pᵢₖ e^{−nllᵢₖ}` at packed `x`, every
-    /// class held at the context's own fixed modes — the function whose gradient the
-    /// score is. Built from the objective's pieces directly (`unpack_params`'s override
-    /// routing, `class_params`, the per-class FOCE nll `mixture_ofv` takes, the mixing
-    /// map), not from anything `MixtureScoreContext::score` calls for its routing,
-    /// mixing gradient or class weights.
-    fn subject_marginal_at_fixed_modes(
+    /// Subject `i`'s mixture marginal `−log Σₖ pᵢₖ e^{−nllᵢₖ}` at packed `x`, every class's
+    /// mode re-estimated at `x` (warm-started from the context's) — the function whose total
+    /// derivative the score is since #2974, NONMEM's `MATRIX=S` convention. Built from the
+    /// objective's pieces directly (`unpack_params`'s override routing, `class_params`, the
+    /// inner search, the per-class FOCE nll `mixture_ofv` takes, the mixing map), not from
+    /// anything `MixtureScoreContext::score` calls for its routing, mixing gradient or class
+    /// weights.
+    fn subject_marginal_reestimated(
         model: &crate::types::CompiledModel,
         pop: &crate::types::Population,
         template: &crate::types::ModelParameters,
@@ -2897,33 +2909,55 @@ mod tests {
             &p.theta,
             &subject.covariates,
         );
+        let opts = crate::types::FitOptions {
+            interaction,
+            ..Default::default()
+        };
         let k = p.mixture.as_ref().unwrap().omega.len();
         let nll: Vec<f64> = (0..k)
             .map(|c| {
                 let _guard = super::MixtureClassGuard::enter(c + 1);
                 let cp = super::class_params(&p, c);
-                let eta = &ctx.eval.etas_by_class[c][i];
-                let h = &ctx.modes.h_mats[c][i];
+                let warm = crate::estimation::outer_optimizer::joint_warm_start(
+                    &ctx.eval.etas_by_class[c][i],
+                    &ctx.modes.kappas[c][i],
+                );
+                let mu_k = crate::estimation::parameterization::compute_mu_k(
+                    model,
+                    &cp.theta,
+                    opts.mu_referencing,
+                );
+                let ebe = crate::estimation::inner_optimizer::find_ebe_for_stage(
+                    model,
+                    subject,
+                    &cp,
+                    1000,
+                    1e-12,
+                    Some(warm.as_slice()),
+                    Some(&mu_k),
+                    0,
+                    &opts,
+                );
                 match cp.omega_iov.as_ref() {
                     Some(iov) => super::foce_subject_nll_iov_cov(
                         model,
                         subject,
                         &cp.theta,
-                        eta,
-                        h,
+                        &ebe.eta,
+                        &ebe.h_matrix,
                         &cp.omega,
                         &cp.sigma.values,
                         model.residual_cov_at(&cp),
                         interaction,
-                        &ctx.modes.kappas[c][i],
+                        &ebe.kappas,
                         iov,
                     ),
                     None => super::foce_subject_nll_cov(
                         model,
                         subject,
                         &cp.theta,
-                        eta,
-                        h,
+                        &ebe.eta,
+                        &ebe.h_matrix,
                         &cp.omega,
                         &cp.sigma.values,
                         model.residual_cov_at(&cp),
@@ -2956,11 +2990,12 @@ mod tests {
         let ctx = super::MixtureScoreContext::new(&model, pop, template, &x, &opts);
         let fixed = packed_fixed_mask(template);
         let f = |xv: &[f64], i: usize| {
-            subject_marginal_at_fixed_modes(&model, pop, template, xv, i, &ctx, interaction)
+            subject_marginal_reestimated(&model, pop, template, xv, i, &ctx, interaction)
         };
+        let points = ctx.class_points();
         let mut worst = 0.0f64;
         for i in 0..pop.subjects.len() {
-            let g = ctx.score(&model, pop, i, &opts);
+            let g = ctx.score(&model, pop, i, &points);
             assert_eq!(g.len(), x.len(), "{label}: score spans the packed layout");
             for j in (0..x.len()).filter(|&j| !fixed[j]) {
                 let h = 1e-5 * (1.0 + x[j].abs());
@@ -3162,7 +3197,6 @@ mod tests {
                 &model,
                 &pop,
                 &eval.mixest_etas,
-                &eval.mixest_h_mats,
                 &eval.mixest_kappas,
                 &start.bounds,
                 &opts,
@@ -3216,7 +3250,6 @@ mod tests {
             &model,
             &pop,
             &eval.mixest_etas,
-            &eval.mixest_h_mats,
             &eval.mixest_kappas,
             &start.bounds,
             &opts,

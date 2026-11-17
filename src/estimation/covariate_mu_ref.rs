@@ -81,7 +81,7 @@
 //! M-steps prefer the group. FOCE / FOCEI / Laplace fits are byte-identical with
 //! and without a group.
 
-use crate::parser::model_parser::eval_typical_value;
+use crate::parser::model_parser::{eval_typical_value, CovariateSnapshot};
 use crate::types::{CompiledModel, CovariateMuRef, MuTransform, Population, Subject};
 use nalgebra::{DMatrix, DVector};
 
@@ -110,6 +110,30 @@ impl GroupMember<'_> {
     /// caller treats a `NaN` mu as "this θ is not admissible".
     pub fn mu(&self, theta: &[f64], subject: &Subject) -> f64 {
         let a = eval_typical_value(&self.spec.typical, theta, &subject.covariates);
+        self.link(a)
+    }
+
+    /// [`Self::mu`] over a subject's covariates read once ([`Self::snapshots`]).
+    fn mu_snapshot(&self, theta: &[f64], snapshot: &CovariateSnapshot<'_>) -> f64 {
+        self.link(self.spec.typical.eval_snapshot(theta, snapshot))
+    }
+
+    /// Each subject's covariates this member's typical value reads, looked up once for a solve
+    /// that evaluates [`Self::mu_snapshot`] at many θ. `names` is
+    /// `TypicalProgram::covariate_names`.
+    fn snapshots<'n>(
+        &self,
+        names: &'n [String],
+        population: &Population,
+    ) -> Vec<CovariateSnapshot<'n>> {
+        population
+            .subjects
+            .iter()
+            .map(|s| CovariateSnapshot::new(names, &s.covariates))
+            .collect()
+    }
+
+    fn link(&self, a: f64) -> f64 {
         match self.transform {
             MuTransform::Log => {
                 if a.is_finite() && a > 0.0 {
@@ -954,16 +978,27 @@ impl CovariateMuGroup<'_> {
             Some(c) => c.l().transpose(),
             None => DMatrix::from_diagonal(&w.diagonal().map(|v| v.max(0.0).sqrt())),
         };
+        let names: Vec<Vec<String>> = self
+            .members
+            .iter()
+            .map(|m| m.spec.typical.covariate_names())
+            .collect();
+        let snaps: Vec<Vec<CovariateSnapshot<'_>>> = self
+            .members
+            .iter()
+            .zip(&names)
+            .map(|(m, n)| m.snapshots(n, population))
+            .collect();
         let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
             let mut r = Vec::with_capacity(population.subjects.len() * q);
             let mut ss = 0.0;
-            for (i, s) in population.subjects.iter().enumerate() {
+            for i in 0..population.subjects.len() {
                 let mut e = DVector::<f64>::zeros(q);
                 for (l, v) in input.etas[i].iter().take(q).enumerate() {
                     e[l] = *v;
                 }
                 for (m, member) in self.members.iter().enumerate() {
-                    let mu = member.mu(theta, s);
+                    let mu = member.mu_snapshot(theta, &snaps[m][i]);
                     if !mu.is_finite() {
                         return None;
                     }
@@ -1142,11 +1177,13 @@ fn solve_exact_single(
             t
         })
         .collect();
+    let names = member.spec.typical.covariate_names();
+    let snaps = member.snapshots(&names, population);
     let residuals = |theta: &[f64]| -> Option<(Vec<f64>, f64)> {
         let mut r = Vec::with_capacity(n);
         let mut ss = 0.0;
-        for (i, s) in population.subjects.iter().enumerate() {
-            let m = member.mu(theta, s);
+        for i in 0..n {
+            let m = member.mu_snapshot(theta, &snaps[i]);
             if !m.is_finite() {
                 return None;
             }

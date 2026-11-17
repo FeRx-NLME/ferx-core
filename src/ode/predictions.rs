@@ -3945,6 +3945,12 @@ impl<'a> SegmentForcing<'a> {
     /// frame ([`CumulativeInputs`]): the caller integrates `v = u − shift` through
     /// [`forced`] and reads the physical state back with [`Self::physical`].
     fn cumulative(self) -> Self {
+        // `for_segment` frames nothing without a prepared forcing, so for an empty one the
+        // result equals `self` field for field: the early return is behaviour-neutral (no test
+        // can tell it from the full path) and only skips copying the lag times.
+        if self.prepared.is_empty() {
+            return self;
+        }
         let lags: Vec<f64> = self.dose_lagtimes.to_vec();
         let cum = CumulativeInputs::for_segment(
             self.ode,
@@ -3967,7 +3973,6 @@ impl<'a> SegmentForcing<'a> {
     }
 
     /// `u` (the cumulative-frame state at `t`) as the physical state, in place.
-    #[cfg(feature = "survival")]
     pub(crate) fn to_physical(&self, t: f64, u: &mut [f64]) {
         self.cum.add_shift(t, u);
     }
@@ -5318,8 +5323,12 @@ fn integrate_segment(
         auto_state,
     );
 
-    // The cumulative frame's `v` is read back as the physical state at each saved point.
-    let physical = |pt: &crate::ode::solver::SolPoint| force.physical(pt);
+    // The cumulative frame's `v` is read back as the physical state at each saved point
+    // (shifted in place: the points are this call's own).
+    let (mut sol, mut soft) = (sol, soft);
+    for pt in sol.iter_mut().chain(soft.iter_mut()) {
+        force.to_physical(pt.t, &mut pt.u);
+    }
 
     // Extract predictions and update state
     for pt in &sol {
@@ -5327,7 +5336,7 @@ fn integrate_segment(
             record_observations(
                 ode,
                 obs_idxs,
-                &physical(pt),
+                &pt.u,
                 pk_params_flat,
                 theta,
                 eta,
@@ -5340,13 +5349,13 @@ fn integrate_segment(
 
     // State at end of segment
     if let Some(last) = sol.last() {
-        u.copy_from_slice(&physical(last));
+        u.copy_from_slice(&last.u);
     }
 
     // #570: full interpolated state at each requested soft time, in `chz_times`
     // order. Empty (just an empty Vec, no heap alloc) on the `chz_times = &[]` hot
     // path, so existing callers ignore a no-op return.
-    soft.iter().map(physical).collect()
+    soft.into_iter().map(|pt| pt.u).collect()
 }
 
 /// Dose events are handled as state discontinuities between integration segments.
@@ -9694,7 +9703,8 @@ fn event_driven_walk(
                 &mut auto_state,
             );
             if let Some(last) = sol.last() {
-                u.copy_from_slice(&force.physical(last));
+                u.copy_from_slice(&last.u);
+                force.to_physical(last.t, &mut u);
             }
             cur_t = t_event;
         }
@@ -10253,7 +10263,8 @@ pub fn ode_predictions_with_states(
         }
 
         if let Some(last) = sol.last() {
-            u.copy_from_slice(&force.physical(last));
+            u.copy_from_slice(&last.u);
+            force.to_physical(last.t, &mut u);
         }
     }
 
@@ -11007,7 +11018,8 @@ fn ode_dense_solve_states_seeded(
         }
 
         if let Some(last) = sol.last() {
-            u.copy_from_slice(&force.physical(last));
+            u.copy_from_slice(&last.u);
+            force.to_physical(last.t, &mut u);
         }
     }
 
