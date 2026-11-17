@@ -3951,6 +3951,12 @@ pub(crate) enum Sweep {
     /// second derivative of `ū·f` along direction `j`, so one sweep gives every direction's
     /// Hessian column that [`Sweep::Reverse`] needs one seed per direction for.
     TangentReverse,
+    /// The forward at a base layout and, per seed, its tangent along that seed's input
+    /// tangents (#2980): the kernel runs its primal once per call and its tangent once per
+    /// seed (`ir::tangent_rows`), each seed's tangents in its own buffer laid out like the
+    /// forward's — the reverse kernels' calling convention, read as tangents. A plan's loop
+    /// calls take their forward at one tangent per seed instead ([`Plan::forward_rows`]).
+    TangentRows,
 }
 
 impl Sweep {
@@ -4045,6 +4051,18 @@ impl ChunkProgram {
         let base = layout.base();
         let f = ir::forward(code, self.n_regs, base);
         let f = fold_chunk(&f, base, &self.spec);
+        if sweep == Sweep::TangentRows {
+            // At a base layout only: the seeds are the directions.
+            let k = (layout.tan == 0)
+                .then(|| ir::tangent_rows(&f))
+                .flatten()
+                .map(|(g, prefix)| {
+                    let (g, prefix) = ir::dedup_calls(&g, prefix);
+                    Tiered::new(g, layout, self.n_in, true, prefix)
+                });
+            c.insert((layout, sweep), k.clone());
+            return k;
+        }
         if sweep == Sweep::TangentReverse {
             // The base layout's reverse, differentiated forward along the layout's directions:
             // the adjoint arguments get tangent lanes packed as the values' are, so the
@@ -4177,8 +4195,11 @@ impl Interp {
                     let (j, lane) = (off as usize / lanes, off as usize % lanes);
                     let y = r(v);
                     match arg {
-                        3 if !rev => *base.add(slot(n_in + j) + lane) = y,
+                        3 => *base.add(slot(n_in + j) + lane) = y,
                         4 if rev => *adjp.add(slot(j) + lane) = y,
+                        // A tangent-rows kernel's output tangents (#2980); no reverse kernel
+                        // stores an output's adjoint.
+                        7 if rev => *adjp.add(slot(n_in + j) + lane) = y,
                         _ => {}
                     }
                     y
@@ -5399,6 +5420,15 @@ impl Plan {
             .map(|c| match c {
                 Call::Chunk { prog, .. } => prog.get(layout, sweep).map(Kern::Chunk),
                 Call::Loop { spec, .. } => match spec {
+                    // A tangent-rows forward runs each loop call per seed at one tangent.
+                    CallKind::Ode(s) if sweep == Sweep::TangentRows => {
+                        ode_loop::LoopKernels::resolve(
+                            s,
+                            Layout { tan: 1, ..layout },
+                            Sweep::Forward,
+                        )
+                        .map(Kern::Loop)
+                    }
                     CallKind::Ode(s) => {
                         ode_loop::LoopKernels::resolve(s, layout, sweep).map(Kern::Loop)
                     }
@@ -5699,6 +5729,171 @@ impl Plan {
         g.fill(0.0);
         g[0] = if self.kept_guard(&f) { 1.0 } else { 0.0 };
         Some(f)
+    }
+
+    /// The forward at the base layout `layout` and its tangent along each of `seeds` directions
+    /// (#2980), kept per seed exactly as [`Self::forward_kept`] at one tangent
+    /// (`Layout { tan: 1, .. }`) would keep it — every slot's values then tangents, every loop
+    /// call's log — so its outputs ([`Self::kept_out`]) and reverse passes read it the same way.
+    /// `u` and `params` as `forward_kept`'s at `layout`; `tu` per seed every input's tangents
+    /// (η's then θ's, `layout`'s lanes each). Each chunk runs its primal once and each seed's
+    /// tangent ([`Sweep::TangentRows`]); a loop call runs per seed at one tangent. `None` where a
+    /// chunk has no such kernel or a loop call fails; a failed guard shows in each seed's kept
+    /// forward ([`Self::kept_guard`]).
+    pub(crate) fn forward_rows(
+        &self,
+        layout: Layout,
+        u: &[f64],
+        params: &[f64],
+        tu: &[f64],
+        seeds: usize,
+    ) -> Option<Vec<Fwd>> {
+        if layout.tan != 0 {
+            return None;
+        }
+        let fns = self.fns(layout, Sweep::TangentRows)?;
+        let l = layout.lanes();
+        let stride = self.n_slots * l;
+        let n_in = (self.n_eta + self.n_theta) * l;
+        let mut buf = take(stride);
+        buf[..self.n_eta * l].copy_from_slice(&u[..self.n_eta * l]);
+        buf[self.n_eta * l..n_in].copy_from_slice(&params[..self.n_theta * l]);
+        let mut tb = take(stride * seeds);
+        for sd in 0..seeds {
+            tb[sd * stride..sd * stride + n_in].copy_from_slice(&tu[sd * n_in..(sd + 1) * n_in]);
+        }
+        let mut logs: Vec<Vec<CallLog>> = (0..seeds).map(|_| Vec::new()).collect();
+        let ok = self.forward_rows_into(&fns, &mut buf, &mut tb, layout, seeds, &mut logs);
+        let lt = Layout { tan: 1, ..layout };
+        let out = ok.map(|()| {
+            logs.into_iter()
+                .enumerate()
+                .map(|(sd, lg)| {
+                    // Per slot: its values, then their tangents (`ir::tangent_packed` at `k = 1`).
+                    let mut packed = take(self.n_slots * 2 * l);
+                    for i in 0..self.n_slots {
+                        packed[i * 2 * l..i * 2 * l + l].copy_from_slice(&buf[i * l..(i + 1) * l]);
+                        packed[i * 2 * l + l..(i + 1) * 2 * l]
+                            .copy_from_slice(&tb[sd * stride + i * l..sd * stride + (i + 1) * l]);
+                    }
+                    Fwd {
+                        plan: self as *const Plan as usize,
+                        layout: lt,
+                        buf: packed,
+                        logs: lg,
+                    }
+                })
+                .collect()
+        });
+        give(buf);
+        give(tb);
+        out
+    }
+
+    fn forward_rows_into(
+        &self,
+        fns: &[Kern],
+        buf: &mut [f64],
+        tb: &mut [f64],
+        layout: Layout,
+        seeds: usize,
+        logs: &mut [Vec<CallLog>],
+    ) -> Option<()> {
+        if let Some(ov) = self.ode_override {
+            if crate::ode::solver::current_ode_override() != ov {
+                return None;
+            }
+        }
+        let l = layout.lanes();
+        let stride = self.n_slots * l;
+        let mut autos: Vec<crate::ode::solver::OdeAutoSwitchState> =
+            (0..seeds).map(|_| Default::default()).collect();
+        for (c, k) in self.calls.iter().zip(fns) {
+            match (c, k) {
+                (
+                    Call::Chunk {
+                        idx, lits, guard, ..
+                    },
+                    Kern::Chunk(k),
+                ) => {
+                    // SAFETY: as `forward_logged`'s chunk call, `tb` holding `seeds` blocks laid
+                    // out like `buf`.
+                    unsafe {
+                        k.call_seeds(
+                            buf.as_mut_ptr(),
+                            tb.as_mut_ptr(),
+                            stride,
+                            seeds,
+                            idx.as_ptr(),
+                            lits.as_ptr(),
+                        )
+                    };
+                    if guard.is_some_and(|g| buf[g as usize * l] != 1.0) {
+                        return Some(());
+                    }
+                }
+                (Call::Loop { spec, args, outs }, k) => {
+                    // Per seed at one tangent: the packed lanes are the values, then the tangents.
+                    let lt = Layout { tan: 1, ..layout };
+                    let w = lt.lanes();
+                    for sd in 0..seeds {
+                        let mut inputs = take(0);
+                        for &a in args {
+                            let a = a as usize;
+                            inputs.extend_from_slice(&buf[a * l..(a + 1) * l]);
+                            inputs.extend_from_slice(
+                                &tb[sd * stride + a * l..sd * stride + (a + 1) * l],
+                            );
+                        }
+                        let mut out = take(outs.len() * w);
+                        let ok = match (spec, k) {
+                            (CallKind::Ode(spec), Kern::Loop(lk)) => {
+                                let mut log = ode_loop::Log::take();
+                                let ok = ode_loop::run_loop(
+                                    spec,
+                                    lk,
+                                    w,
+                                    &inputs,
+                                    &mut out,
+                                    &mut autos[sd],
+                                    Some(&mut log),
+                                );
+                                logs[sd].push(CallLog::Ode(log));
+                                ok
+                            }
+                            (_, Kern::Fixed(_) | Kern::Repeat(_) | Kern::Mat(_)) => {
+                                let mut flog = None;
+                                let ok = match k {
+                                    Kern::Fixed(f) => f.run(lt, &inputs, &mut out, Some(&mut flog)),
+                                    Kern::Repeat(r) => {
+                                        r.run(lt, &inputs, &mut out, Some(&mut flog))
+                                    }
+                                    Kern::Mat(m) => m.run(lt, &inputs, &mut out),
+                                    _ => false,
+                                };
+                                logs[sd].push(CallLog::Fixed(flog));
+                                ok
+                            }
+                            _ => false,
+                        };
+                        give(inputs);
+                        if !ok {
+                            give(out);
+                            return None;
+                        }
+                        for (j, &o) in outs.iter().enumerate() {
+                            let o = o as usize;
+                            buf[o * l..(o + 1) * l].copy_from_slice(&out[j * w..j * w + l]);
+                            tb[sd * stride + o * l..sd * stride + (o + 1) * l]
+                                .copy_from_slice(&out[j * w + l..(j + 1) * w]);
+                        }
+                        give(out);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        Some(())
     }
 
     /// The forward over `layout` from `u` and `params` (laid out at its lanes, η seeded
@@ -6383,6 +6578,14 @@ fn lower_chunk_opt(
                                         false,
                                     ),
                                     4 => slot_addr(&mut b, &mut offs, &mut addr, adjp, j, true),
+                                    7 => slot_addr(
+                                        &mut b,
+                                        &mut offs,
+                                        &mut addr,
+                                        adjp,
+                                        n_in + j,
+                                        true,
+                                    ),
                                     _ => return None,
                                 };
                                 b.ins().store(fl, x, a, (lane * 8) as i32);
@@ -6558,7 +6761,7 @@ fn lower_chunk_opt(
                     Inst::Store { arg, off, v: x } => {
                         let (j, lane) = (off as usize / lanes, off as usize % lanes);
                         let a = match arg {
-                            3 if !rev => Some(slot_addr(
+                            3 => Some(slot_addr(
                                 &mut b,
                                 &mut offs,
                                 &mut addr,
@@ -6569,6 +6772,15 @@ fn lower_chunk_opt(
                             4 if rev => {
                                 Some(slot_addr(&mut b, &mut offs, &mut addr, adjp, j, true))
                             }
+                            // A tangent-rows kernel's output tangents (#2980).
+                            7 if rev => Some(slot_addr(
+                                &mut b,
+                                &mut offs,
+                                &mut addr,
+                                adjp,
+                                n_in + j,
+                                true,
+                            )),
                             // The literals' adjoints: discarded.
                             6 if rev => None,
                             _ => return None,

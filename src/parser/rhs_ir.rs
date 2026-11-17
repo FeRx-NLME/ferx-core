@@ -1791,6 +1791,141 @@ pub(super) fn tangent(f: &Func, k: usize, prefix: usize) -> (Func, usize) {
     (b, emitted)
 }
 
+/// An instruction's value operands, as a list (tests).
+#[cfg(test)]
+pub(super) fn value_operands(inst: &Inst) -> Vec<V> {
+    let (o, k) = operands(inst);
+    o[..k].to_vec()
+}
+
+/// An instruction's value operands.
+fn operands(inst: &Inst) -> ([V; 3], usize) {
+    match *inst {
+        Inst::Load { .. } | Inst::Const(_) | Inst::Host(_) | Inst::HostOut(_) => ([0; 3], 0),
+        Inst::Neg(x)
+        | Inst::Abs(x)
+        | Inst::Floor(x)
+        | Inst::Ceil(x)
+        | Inst::Call1(_, x)
+        | Inst::StopGrad(x)
+        | Inst::HostArg(x) => ([x, 0, 0], 1),
+        Inst::Store { v, .. } => ([v, 0, 0], 1),
+        Inst::Add(x, y)
+        | Inst::Sub(x, y)
+        | Inst::Mul(x, y)
+        | Inst::Div(x, y)
+        | Inst::Powf(x, y)
+        | Inst::Cmp(_, x, y)
+        | Inst::And(x, y)
+        | Inst::Or(x, y) => ([x, y, 0], 2),
+        Inst::Gamma { a, x, .. } => ([a, x, 0], 2),
+        Inst::Select(c, x, y) => ([c, x, y], 3),
+    }
+}
+
+/// `inst` with each value operand mapped by `m`.
+fn remap(inst: Inst, m: impl Fn(V) -> V) -> Inst {
+    match inst {
+        Inst::Load { .. } | Inst::Const(_) | Inst::Host(_) | Inst::HostOut(_) => inst,
+        Inst::Add(x, y) => Inst::Add(m(x), m(y)),
+        Inst::Sub(x, y) => Inst::Sub(m(x), m(y)),
+        Inst::Mul(x, y) => Inst::Mul(m(x), m(y)),
+        Inst::Div(x, y) => Inst::Div(m(x), m(y)),
+        Inst::Neg(x) => Inst::Neg(m(x)),
+        Inst::Abs(x) => Inst::Abs(m(x)),
+        Inst::Floor(x) => Inst::Floor(m(x)),
+        Inst::Ceil(x) => Inst::Ceil(m(x)),
+        Inst::Call1(s, x) => Inst::Call1(s, m(x)),
+        Inst::Powf(x, y) => Inst::Powf(m(x), m(y)),
+        Inst::Gamma { upper, i, j, a, x } => Inst::Gamma {
+            upper,
+            i,
+            j,
+            a: m(a),
+            x: m(x),
+        },
+        Inst::Cmp(c, x, y) => Inst::Cmp(c, m(x), m(y)),
+        Inst::And(x, y) => Inst::And(m(x), m(y)),
+        Inst::Or(x, y) => Inst::Or(m(x), m(y)),
+        Inst::Select(c, x, y) => Inst::Select(m(c), m(x), m(y)),
+        Inst::StopGrad(x) => Inst::StopGrad(m(x)),
+        Inst::HostArg(x) => Inst::HostArg(m(x)),
+        Inst::Store { arg, off, v } => Inst::Store { arg, off, v: m(v) },
+    }
+}
+
+/// The forward `f` differentiated along one direction, laid out for a multi-seed call
+/// (#2980): the tangent of argument `a` is argument `n + a` at the same offsets ([`tangent`]
+/// at `k = 1`), which the reverse kernels' calling convention binds to a per-seed buffer; and
+/// every instruction that reads no tangent comes first. Those — the primal, its stores
+/// included — run once per call; the rest once per seed, each seed's tangents in its own
+/// buffer. Returns the function and that prefix's length.
+///
+/// Exact: no tangent-free instruction reads a tangent one, so moving every tangent one after
+/// them keeps each value's operands before it; a host call's arguments, call and outputs are
+/// tied by order rather than by operand, so a call any of whose arguments reads a tangent
+/// moves whole. `None` for a function with dead-arm conditions (`live`), whose masks a reorder
+/// would have to carry: such a chunk keeps its direction-per-run kernel.
+pub(super) fn tangent_rows(f: &Func) -> Option<(Func, usize)> {
+    if f.live.iter().any(Option::is_some) {
+        return None;
+    }
+    let (g, _) = tangent(f, 1, 0);
+    if g.live.iter().any(Option::is_some) {
+        return None;
+    }
+    let n = f.n_args;
+    // The literals' tangents (argument `n + 2`) are zeros, so reading them reads no tangent.
+    let tangent_arg = |a: u8| a >= n && a != n + 2;
+    let mut dep = vec![false; g.insts.len()];
+    let mut call_dep = false;
+    let mut after_host = false;
+    for (i, inst) in g.insts.iter().enumerate() {
+        let (ops, k) = operands(inst);
+        let reads = ops[..k].iter().any(|&x| dep[x as usize]);
+        dep[i] = match *inst {
+            Inst::Load { arg, .. } => tangent_arg(arg),
+            Inst::Store { arg, .. } => reads || tangent_arg(arg),
+            Inst::HostArg(_) => {
+                if after_host {
+                    call_dep = false;
+                    after_host = false;
+                }
+                call_dep |= reads;
+                reads
+            }
+            Inst::Host(_) => {
+                after_host = true;
+                call_dep
+            }
+            Inst::HostOut(_) => call_dep,
+            _ => reads,
+        };
+    }
+    // A host call's arguments follow its dependence too: a call that moves takes them along.
+    let mut i = g.insts.len();
+    let mut group = false;
+    while i > 0 {
+        i -= 1;
+        match g.insts[i] {
+            Inst::Host(_) => group = dep[i],
+            Inst::HostArg(_) if group => dep[i] = true,
+            _ => {}
+        }
+    }
+    let mut out = Func::new(g.n_args);
+    let mut map = vec![V::MAX; g.insts.len()];
+    for pass in [false, true] {
+        for (i, &inst) in g.insts.iter().enumerate() {
+            if dep[i] == pass {
+                map[i] = out.push(remap(inst, |x| map[x as usize]));
+            }
+        }
+    }
+    let prefix = dep.iter().filter(|d| !**d).count();
+    Some((out, prefix))
+}
+
 /// [`tangent`] in `k` directions with the tangents packed into the value arguments: a
 /// function of the same arguments over slots of `l·(1 + k)` lanes, location `i·l + lane` of
 /// the base function at `i·l(1+k) + lane` and its tangent along `j` at

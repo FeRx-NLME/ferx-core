@@ -433,9 +433,13 @@ impl CovPlan<'_> {
         eta_up: bool,
         eta_t: &dyn Fn(usize, usize) -> f64,
         width: usize,
-        run: &dyn Fn(Lanes<'_>, &dyn Fn(usize, usize) -> f64, usize) -> Option<Kept>,
+        run: &dyn Fn(Lanes<'_>, &dyn Fn(usize, usize) -> f64, usize) -> Option<Vec<Kept>>,
     ) -> Option<PlanRun> {
-        let direct = || run(Lanes::Dirs(dirs), eta_t, width).map(PlanRun::Direct);
+        let direct = || {
+            run(Lanes::Dirs(dirs), eta_t, width)
+                .and_then(|mut v| v.pop())
+                .map(PlanRun::Direct)
+        };
         let moved = self.moved.borrow();
         let Some(m) = moved.as_ref().filter(|_| {
             !dirs.is_empty() && !plan_per_direction() && !super::reverse_per_direction()
@@ -513,14 +517,11 @@ impl CovPlan<'_> {
             // the axes are split. Measured (#2980) on 300 subjects with an ODE: one run of every
             // axis compiled 2.7× the code of this.
             let bw = 1;
-            let runs = axes
-                .chunks(bw)
-                .map(|ch| {
-                    let t =
-                        |k: usize, b: usize| f64::from(u8::from(ch.get(b) == Some(&Input::Eta(k))));
-                    run(Lanes::Axes(ch), &t, bw)
-                })
-                .collect::<Option<Vec<Kept>>>()?;
+            let t = |k: usize, b: usize| f64::from(u8::from(axes.get(b) == Some(&Input::Eta(k))));
+            let runs = run(Lanes::Axes(&axes), &t, bw)?;
+            if runs.len() != axes.len() {
+                return None;
+            }
             let (lb, vals, jac) = Basis::dense(&runs, bw, axes.len());
             self.bases.borrow_mut().insert(
                 key,

@@ -899,6 +899,72 @@ impl Slots {
 }
 
 /// A plan run kept for its reverse: the plan, its forward, its layout.
+/// A plan's runs along `n` input axes at one tangent each (`inputs(a)`: axis `a`'s inputs at
+/// that layout): one forward with the primal shared ([`kj::Plan::forward_rows`], #2980), or —
+/// where some chunk has no such kernel — one forward per axis. Either way one [`Kept`] per axis,
+/// as a one-tangent run keeps it; `None` where a run fails or the guard does not hold.
+fn rows_or_each(
+    pl: &PlanArc,
+    n: usize,
+    inputs: impl Fn(usize) -> (Vec<f64>, Vec<f64>),
+    base: Layout,
+    n_obs: usize,
+) -> Option<Vec<Kept>> {
+    let lt = Layout { tan: 1, ..base };
+    let (l, w) = (base.lanes(), lt.lanes());
+    let keep = |fwd: kj::Fwd| -> Option<Kept> {
+        if !pl.kept_guard(&fwd) {
+            return None;
+        }
+        let mut du = vec![0.0; (n_obs + 1) * w];
+        for o in 0..n_obs {
+            du[o * w..(o + 1) * w].copy_from_slice(pl.kept_out(&fwd, o));
+        }
+        du[n_obs * w] = 1.0;
+        Some(Kept {
+            plan: pl.clone(),
+            fwd,
+            layout: lt,
+            du,
+        })
+    };
+    // The packed inputs' values (the base lanes) and, per axis, their tangents.
+    let packed: Vec<(Vec<f64>, Vec<f64>)> = (0..n).map(&inputs).collect();
+    let split = |v: &[f64], tan: bool| -> Vec<f64> {
+        v.chunks(w)
+            .flat_map(|s| if tan { &s[l..] } else { &s[..l] })
+            .copied()
+            .collect()
+    };
+    if let Some(&(ref u0, ref p0)) = packed.first() {
+        let (u, p) = (split(u0, false), split(p0, false));
+        let tu: Vec<f64> = packed
+            .iter()
+            .flat_map(|(u1, p1)| {
+                let mut t = split(u1, true);
+                t.extend(split(p1, true));
+                t
+            })
+            .collect();
+        if let Some(fwds) = pl.forward_rows(base, &u, &p, &tu, n) {
+            return fwds.into_iter().map(keep).collect();
+        }
+    }
+    packed
+        .into_iter()
+        .map(|(u, p)| {
+            let mut du = vec![0.0; (n_obs + 1) * w];
+            let fwd = pl.forward_layout(lt, &u, &p, &mut du)?;
+            (du[n_obs * w] == 1.0).then(|| Kept {
+                plan: pl.clone(),
+                fwd,
+                layout: lt,
+                du,
+            })
+        })
+        .collect()
+}
+
 struct Kept {
     plan: PlanArc,
     fwd: kj::Fwd,
@@ -1101,7 +1167,7 @@ impl<'a> CovPlan<'a> {
         lanes: Lanes<'_>,
         base: Layout,
         kt: usize,
-    ) -> Option<Kept> {
+    ) -> Option<Vec<Kept>> {
         let layout = Layout {
             tan: kt as u8,
             ..base
@@ -1109,15 +1175,33 @@ impl<'a> CovPlan<'a> {
         let params = self.pred_values();
         let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let n_obs = self.subject.observations.len();
-        let mut serve = |pl: &PlanArc| -> Option<Kept> {
+        let mut serve = |pl: &PlanArc| -> Option<Vec<Kept>> {
+            // Along input axes: every axis's run at once, the primal shared (#2980) — or, where a
+            // chunk has no such kernel, one run per axis.
+            if let Lanes::Axes(ax) = lanes {
+                return rows_or_each(
+                    pl,
+                    ax.len(),
+                    |a| {
+                        let ax1 = &ax[a..a + 1];
+                        let et1 = |k: usize, _: usize| eta_t(k, a);
+                        let p1 = |i: usize, _: usize| self.param_t(Lanes::Axes(ax1), i, 0);
+                        Self::plan_inputs(Layout { tan: 1, ..base }, eta, &et1, &params, &p1, 1)
+                    },
+                    base,
+                    n_obs,
+                );
+            }
             let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, kt);
             let mut du = vec![0.0; (n_obs + 1) * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
-            (du[n_obs * layout.lanes()] == 1.0).then(|| Kept {
-                plan: pl.clone(),
-                fwd,
-                layout,
-                du,
+            (du[n_obs * layout.lanes()] == 1.0).then(|| {
+                vec![Kept {
+                    plan: pl.clone(),
+                    fwd,
+                    layout,
+                    du,
+                }]
             })
         };
         match self.nn_z {
@@ -1143,7 +1227,16 @@ impl<'a> CovPlan<'a> {
         lanes: Lanes<'_>,
         base: Layout,
         kt: usize,
-    ) -> Option<Kept> {
+    ) -> Option<Vec<Kept>> {
+        if let Lanes::Axes(ax) = lanes {
+            return (0..ax.len())
+                .map(|a| {
+                    let et1 = |k: usize, _: usize| eta_t(k, a);
+                    self.run_var(eta, &et1, Lanes::Axes(&ax[a..a + 1]), base, 1)
+                        .and_then(|mut v| v.pop())
+                })
+                .collect();
+        }
         let layout = Layout {
             tan: kt as u8,
             ..base
@@ -1153,15 +1246,17 @@ impl<'a> CovPlan<'a> {
         params.extend_from_slice(sigma);
         let p_t = |i: usize, a: usize| self.param_t(lanes, i, a);
         let n_obs = self.subject.observations.len();
-        let mut serve = |pl: &PlanArc| -> Option<Kept> {
+        let mut serve = |pl: &PlanArc| -> Option<Vec<Kept>> {
             let (u, p) = Self::plan_inputs(layout, eta, eta_t, &params, &p_t, kt);
             let mut du = vec![0.0; (n_obs + 1) * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
-            (du[n_obs * layout.lanes()] == 1.0).then(|| Kept {
-                plan: pl.clone(),
-                fwd,
-                layout,
-                du,
+            (du[n_obs * layout.lanes()] == 1.0).then(|| {
+                vec![Kept {
+                    plan: pl.clone(),
+                    fwd,
+                    layout,
+                    du,
+                }]
             })
         };
         match self.nn_z {
@@ -1194,7 +1289,16 @@ impl<'a> CovPlan<'a> {
         lanes: Lanes<'_>,
         base: Layout,
         kt: usize,
-    ) -> Option<Kept> {
+    ) -> Option<Vec<Kept>> {
+        if let Lanes::Axes(ax) = lanes {
+            return (0..ax.len())
+                .map(|a| {
+                    let et1 = |k: usize, _: usize| eta_t(k, a);
+                    self.run_term(eta, &et1, Lanes::Axes(&ax[a..a + 1]), base, 1)
+                        .and_then(|mut v| v.pop())
+                })
+                .collect();
+        }
         let layout = Layout {
             tan: kt as u8,
             ..base
@@ -1205,11 +1309,13 @@ impl<'a> CovPlan<'a> {
         plans.iter().find_map(|pl| {
             let mut du = vec![0.0; 2 * layout.lanes()];
             let fwd = pl.forward_layout(layout, &u, &p, &mut du)?;
-            (du[layout.lanes()] == 1.0).then(|| Kept {
-                plan: pl.clone(),
-                fwd,
-                layout,
-                du,
+            (du[layout.lanes()] == 1.0).then(|| {
+                vec![Kept {
+                    plan: pl.clone(),
+                    fwd,
+                    layout,
+                    du,
+                }]
             })
         })
     }
