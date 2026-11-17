@@ -6130,6 +6130,13 @@ fn cov_hessian_matches_profile_fd_laplace_and_agq() {
         ),
         (
             Objective::Agq {
+                n_agq: 1,
+                exact: false,
+            },
+            "Laplace H̃",
+        ),
+        (
+            Objective::Agq {
                 n_agq: 3,
                 exact: false,
             },
