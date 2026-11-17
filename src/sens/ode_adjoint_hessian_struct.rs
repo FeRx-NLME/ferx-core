@@ -146,21 +146,90 @@ fn dotv(a: &[f64], b: &[f64]) -> f64 {
 }
 
 /// An aggregate's adjoint prepared for the rows: a scalar, a vector, or (`Gg`) the symmetric
-/// `Q` of its packed triangle — formed once per pass, not per row.
-enum Prep {
+/// `Q` of its packed triangle, row-major — a view into a pass's [`Preps`].
+#[derive(Clone, Copy)]
+enum Prep<'a> {
     One(f64),
-    G(Vec<f64>),
-    /// Row-major `m × m`.
-    Gg(Vec<f64>),
+    G(&'a [f64]),
+    Gg(&'a [f64]),
 }
 
-impl Prep {
-    fn of(mono: Mono, a: &[f64], m: usize) -> Self {
-        match mono {
-            Mono::One => Prep::One(a[0]),
-            Mono::G => Prep::G(a[..m].to_vec()),
-            Mono::Q => Prep::G(a[..m * (m + 1) / 2].to_vec()),
-            Mono::Gg => Prep::Gg(sym(a, m).concat()),
+/// Every aggregate's prepared adjoint, for one or several adjoint vectors (a pass's value and
+/// each direction's tangent), in one buffer: formed once per pass, not per row, and allocated
+/// once.
+struct Preps {
+    buf: Vec<f64>,
+    off: Vec<usize>,
+    width: usize,
+    monos: Vec<Mono>,
+}
+
+impl Preps {
+    /// The prepared adjoints of `n` adjoint vectors, vector `v`'s aggregate `k` read from
+    /// `src(v)[at[k]..]`.
+    fn new<'s>(
+        aggs: &[(usize, Mono)],
+        at: &[usize],
+        m: usize,
+        n: usize,
+        src: impl Fn(usize) -> &'s [f64],
+    ) -> Self {
+        let mut off = Vec::with_capacity(aggs.len());
+        let mut width = 0;
+        for &(_, mono) in aggs {
+            off.push(width);
+            width += match mono {
+                Mono::One => 1,
+                Mono::G => m,
+                Mono::Q => m * (m + 1) / 2,
+                Mono::Gg => m * m,
+            };
+        }
+        let mut buf = vec![0.0; n * width];
+        for v in 0..n {
+            let a = src(v);
+            for (k, &(_, mono)) in aggs.iter().enumerate() {
+                let a = &a[at[k]..];
+                let o = &mut buf[v * width + off[k]..];
+                match mono {
+                    Mono::One => o[0] = a[0],
+                    Mono::G => o[..m].copy_from_slice(&a[..m]),
+                    Mono::Q => o[..m * (m + 1) / 2].copy_from_slice(&a[..m * (m + 1) / 2]),
+                    Mono::Gg => {
+                        for kk in 0..m {
+                            for l in 0..=kk {
+                                let x = a[tri(kk, l)];
+                                let x = if kk == l { x } else { 0.5 * x };
+                                o[kk * m + l] = x;
+                                o[l * m + kk] = x;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Preps {
+            buf,
+            off,
+            width,
+            monos: aggs.iter().map(|a| a.1).collect(),
+        }
+    }
+
+    /// Vector `v`'s aggregate `k`.
+    #[inline]
+    fn get(&self, v: usize, k: usize) -> Prep<'_> {
+        let o = &self.buf[v * self.width + self.off[k]..];
+        match self.monos[k] {
+            Mono::One => Prep::One(o[0]),
+            Mono::G | Mono::Q => {
+                let w = self.off.get(k + 1).copied().unwrap_or(self.width) - self.off[k];
+                Prep::G(&o[..w])
+            }
+            Mono::Gg => {
+                let w = self.off.get(k + 1).copied().unwrap_or(self.width) - self.off[k];
+                Prep::Gg(&o[..w])
+            }
         }
     }
 }
@@ -181,9 +250,9 @@ fn mv_into(q: &[f64], v: &[f64], y: &mut [f64]) {
 
 /// A row's scalar adjoint `⟨a, m(G)⟩` and its `G`-adjoint `r·∂⟨a, m(G)⟩/∂G` into `dg`, given
 /// the aggregate's prepared adjoint `a`; `qg` is scratch of width `m`.
-fn back(a: &Prep, g: &[f64], r: f64, dg: &mut [f64], qg: &mut [f64]) -> f64 {
+fn back(a: Prep<'_>, g: &[f64], r: f64, dg: &mut [f64], qg: &mut [f64]) -> f64 {
     match a {
-        Prep::One(v) => *v,
+        Prep::One(v) => v,
         Prep::G(av) => {
             for (d, x) in dg.iter_mut().zip(av) {
                 *d += r * x;
@@ -205,8 +274,8 @@ fn back(a: &Prep, g: &[f64], r: f64, dg: &mut [f64], qg: &mut [f64]) -> f64 {
 /// is `P·G` as [`back`] left it (a `Gg` aggregate; direction-free), `sc` scratch of width `2m`.
 #[allow(clippy::too_many_arguments)]
 fn back_t(
-    a: &Prep,
-    ad: &Prep,
+    a: Prep<'_>,
+    ad: Prep<'_>,
     g: &[f64],
     gd: &[f64],
     r: f64,
@@ -216,7 +285,7 @@ fn back_t(
     sc: &mut [f64],
 ) -> f64 {
     match (a, ad) {
-        (Prep::One(_), Prep::One(v)) => *v,
+        (Prep::One(_), Prep::One(v)) => v,
         (Prep::G(av), Prep::G(adv)) => {
             for ((d, x), y) in dgd.iter_mut().zip(av).zip(adv) {
                 *d += rd * x + r * y;
@@ -699,19 +768,8 @@ impl CovPlan<'_> {
         let a_tan: Vec<Vec<f64>> = (0..kt)
             .map(|a| (0..na).map(|t| radj[(pn + nx + t) * lk + 1 + a]).collect())
             .collect();
-        let pv: Vec<Prep> = aggs
-            .iter()
-            .enumerate()
-            .map(|(k, &(_, mono))| Prep::of(mono, &a_val[at[k]..], pn))
-            .collect();
-        let pt: Vec<Vec<Prep>> = (0..kt)
-            .map(|a| {
-                aggs.iter()
-                    .enumerate()
-                    .map(|(k, &(_, mono))| Prep::of(mono, &a_tan[a][at[k]..], pn))
-                    .collect()
-            })
-            .collect();
+        let pv = Preps::new(aggs, &at, pn, 1, |_| &a_val[..]);
+        let pt = Preps::new(aggs, &at, pn, kt, |a| &a_tan[a][..]);
         let mut adj = vec![0.0; sl.end * lk];
         for k in 0..pn {
             adj[(sl.eta + k) * lk..(sl.eta + k + 1) * lk]
@@ -740,7 +798,13 @@ impl CovPlan<'_> {
                 } else {
                     (g, &mut dg[..])
                 };
-                ds[si] += back(&pv[k], v, rj[si].value, dv, &mut qg[k * pn..(k + 1) * pn]);
+                ds[si] += back(
+                    pv.get(0, k),
+                    v,
+                    rj[si].value,
+                    dv,
+                    &mut qg[k * pn..(k + 1) * pn],
+                );
             }
             for (lane, &s) in ls.iter().enumerate().take(nla) {
                 if s != usize::MAX {
@@ -767,8 +831,8 @@ impl CovPlan<'_> {
                         (g, &t[o_g..o_q], &mut dgd[..])
                     };
                     dsd[si] += back_t(
-                        &pv[k],
-                        &pt[a][k],
+                        pv.get(0, k),
+                        pt.get(a, k),
                         v,
                         vd,
                         rj[si].value,
@@ -925,11 +989,7 @@ impl CovPlan<'_> {
             let ay: Vec<f64> = (0..na)
                 .map(|t| sign(y) * radj[(pn + nx + t) * lk + lane(y)])
                 .collect();
-            let py: Vec<Prep> = aggs
-                .iter()
-                .enumerate()
-                .map(|(k, &(_, mono))| Prep::of(mono, &ay[at[k]..], pn))
-                .collect();
+            let py = Preps::new(aggs, &at, pn, 1, |_| &ay[..]);
             let kk = family.n_scalars();
             for j in 0..n_obs {
                 let (g, q) = (&rows.g[j], &rows.q[j]);
@@ -944,7 +1004,7 @@ impl CovPlan<'_> {
                     } else {
                         (&g[..], &mut dg[..])
                     };
-                    ds[si] += back(&py[k], v, rj[si].value, dv, &mut sc);
+                    ds[si] += back(py.get(0, k), v, rj[si].value, dv, &mut sc);
                 }
                 kf[y][j * lb] += (0..kk).map(|k| ds[k] * rj[k].grad[0]).sum::<f64>();
                 if rows.pop_lane.is_some() {
