@@ -85,18 +85,32 @@ pub(crate) const GN_BUDGET_WARNING: &str =
 /// it is singular by construction, and the trust-region steps it models can stall along the
 /// directions it does not see (`pktte_joint`: 6 subjects, 7 free parameters, every step
 /// after iteration 5 rejected). `gn_hybrid` finishes with an L-BFGS polish that needs no BHHH.
-pub(crate) fn gn_rank_deficient_warning(n_subjects: usize, n_free: usize) -> String {
+/// Owed only to plain `gn` (not `gn_hybrid`) that ends unconverged with fewer subjects than
+/// free parameters, else `None`; `fit` drops it from a GN stage a later stage re-optimises
+/// ([`GN_RANK_DEFICIENT_HEAD`], `postfit::keep_gn_zero_eta_warning`).
+pub(crate) fn gn_rank_deficient_warning(
+    converged: bool,
+    n_subjects: usize,
+    n_free: usize,
+    method: EstimationMethod,
+) -> Option<String> {
+    if converged || n_subjects >= n_free || method == EstimationMethod::FoceGnHybrid {
+        return None;
+    }
     let subjects = if n_subjects == 1 {
         "subject"
     } else {
         "subjects"
     };
-    format!(
-        "Gauss-Newton (BHHH): {n_subjects} {subjects} for {n_free} free parameters, so the \
+    Some(format!(
+        "{GN_RANK_DEFICIENT_HEAD}{n_subjects} {subjects} for {n_free} free parameters, so the \
          BHHH information has rank at most {n_subjects} and is singular; its steps can stall \
          short of the optimum. Use method = gn_hybrid, or a different optimizer."
-    )
+    ))
 }
+
+/// The opening of [`gn_rank_deficient_warning`], by which `fit` recognises it.
+pub(crate) const GN_RANK_DEFICIENT_HEAD: &str = "Gauss-Newton (BHHH): ";
 
 /// Whether an accepted step ends the GN loop as converged on the small-change rule:
 /// the OFV moved by less than `1e-6` relative, from iteration 4 on, **and** the radius the
@@ -225,11 +239,6 @@ pub fn run_foce_gn(
              consider method=foce_i for heavy censoring fractions (>20%)."
                 .to_string(),
         );
-    }
-
-    let n_free = fixed_mask.iter().filter(|&&f| !f).count();
-    if n_subj < n_free && !matches!(options.method, EstimationMethod::FoceGnHybrid) {
-        warnings.push(gn_rank_deficient_warning(n_subj, n_free));
     }
 
     if verbose {
@@ -730,6 +739,15 @@ pub fn run_foce_gn(
             warnings.push(GN_ZERO_ETA_NONCONVERGENCE_WARNING.to_string());
         }
     }
+    // #2438: with fewer subjects than free parameters the BHHH is singular, the likely reason
+    // the loop stalled.
+    let n_free = fixed_mask.iter().filter(|&&f| !f).count();
+    warnings.extend(gn_rank_deficient_warning(
+        converged,
+        n_subj,
+        n_free,
+        options.method,
+    ));
 
     // Recompute gradient at the final accepted x so the stored value is always
     // at the converged point (mid-loop capture would be off by one step).
@@ -2912,12 +2930,10 @@ mod tests {
         }
     }
 
-    /// #816 follow-up regression: GN and its FOCEI hybrid both optimize in packed
-    /// Cholesky space, so their covariance step uses the optimizer's exact factor
-    /// `L`. Both return sites must carry `packed_estimate` so a standalone
-    /// #2438: plain `gn` warns, once, when the population has fewer subjects than free
-    /// parameters, since its BHHH is then singular by construction. One more subject, or
-    /// `gn_hybrid`, does not warn. `make_model` has 4 free parameters, `make_population` 3.
+    /// #2438: plain `gn` that ends unconverged (`outer_maxiter = 0`) warns, once, when the
+    /// population has fewer subjects than free parameters, since its BHHH is then singular by
+    /// construction. One more subject, or `gn_hybrid`, does not warn. `make_model` has 4 free
+    /// parameters, `make_population` 3.
     #[test]
     fn gn_warns_when_its_bhhh_is_rank_deficient_by_construction() {
         let model = make_model();
@@ -2932,7 +2948,7 @@ mod tests {
             run_foce_gn(&model, p, &model.default_params, o)
                 .warnings
                 .into_iter()
-                .filter(|w| w.starts_with("Gauss-Newton (BHHH): "))
+                .filter(|w| w.starts_with(GN_RANK_DEFICIENT_HEAD))
                 .collect()
         };
         assert_eq!(
@@ -2957,9 +2973,22 @@ mod tests {
             ..opts.clone()
         };
         assert!(rank(&pop, &hybrid).is_empty(), "gn_hybrid");
-        assert!(gn_rank_deficient_warning(1, 2).starts_with("Gauss-Newton (BHHH): 1 subject for"));
+        // A fit that converged is not told it stalled. No `gn` fixture with fewer subjects than
+        // parameters converges (this one stalls at OFV 5.7e4 in 100 iterations), so the gate
+        // is pinned on the function.
+        assert_eq!(
+            gn_rank_deficient_warning(true, 3, 4, EstimationMethod::FoceGn),
+            None
+        );
+        assert!(
+            gn_rank_deficient_warning(false, 1, 2, EstimationMethod::FoceGn)
+                .is_some_and(|w| w.starts_with("Gauss-Newton (BHHH): 1 subject for"))
+        );
     }
 
+    /// #816 follow-up regression: GN and its FOCEI hybrid both optimize in packed
+    /// Cholesky space, so their covariance step uses the optimizer's exact factor
+    /// `L`. Both return sites must carry `packed_estimate` so a standalone
     /// `run_covariance` reproduces the inline covariance bit-for-bit (without it the
     /// standalone step re-decomposes `chol(L·Lᵀ) ≠ L` and diverges on an
     /// ill-conditioned ω). Fails if either return regresses to `None`.
@@ -6488,8 +6517,9 @@ mod tests {
         );
         // The GN phase's own record of how the polish's start was reached stays. `pure` runs
         // that phase as plain `gn`, whose rank warning (#2438) the hybrid does not raise.
-        let gn_only = |w: &&String| !w.starts_with("Gauss-Newton (BHHH): ");
-        for w in pure.warnings.iter().filter(gn_only) {
+        let rank =
+            gn_rank_deficient_warning(false, pop.subjects.len(), 4, EstimationMethod::FoceGn);
+        for w in pure.warnings.iter().filter(|w| Some(*w) != rank.as_ref()) {
             assert!(
                 hybrid.warnings.contains(w),
                 "GN-phase warning {w:?} dropped: {:?}",
