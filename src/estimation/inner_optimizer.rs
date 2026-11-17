@@ -190,11 +190,16 @@ fn iov_inner_subject_route(
     subject: &Subject,
     theta: &[f64],
 ) -> Option<Vec<crate::sens::provider::ObsGrad>> {
+    // The search's own rule (`analytic_iov_inner_supported`): an endpoint term the exact
+    // programs serve folds into the BSV block, so such a subject is not an FD one.
     if model.default_params.omega_iov.is_none()
         || analytic_inner_common_bail(model)
-        || subject_has_survival_records(subject)
+        || !non_gaussian_eta_grad_served(model, subject)
     {
         return None;
+    }
+    if subject.obs_times.is_empty() && subject_has_survival_records(subject) {
+        return Some(Vec::new());
     }
     let k_occasions = crate::stats::stacked_layout::group_count(subject);
     let stacked = vec![0.0; stacked_width(model.n_eta, model.n_kappa, k_occasions)];
@@ -245,7 +250,7 @@ fn iov_fd_reason(model: &CompiledModel, subject: &Subject) -> &'static str {
     if model.default_params.omega_iov.is_none() {
         return "missing omega_iov";
     }
-    if subject_has_survival_records(subject) {
+    if !non_gaussian_eta_grad_served(model, subject) {
         return IOV_SURVIVAL_REASON;
     }
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
@@ -4314,10 +4319,10 @@ fn find_ebe_iov_seeded(
             };
         }
         let Some(layout) = &layout else {
-            // An unprepared nested subject: no axes, so no walk (`sens_of` declines it).
-            #[cfg(test)]
-            IOV_AGRAD_ROUTE.with(|c| c.set((c.get().0, c.get().1 + 1)));
-            return gradient_fd(&obj, p, n_flat);
+            // An unprepared nested subject (only a direct caller reaches it: `find_ebe_solve`
+            // refuses it first): its objective is the constant refusal sentinel, whose
+            // gradient is exactly zero.
+            return vec![0.0; n_flat];
         };
         let omega_iov = omega_iov_ref.expect("analytic_iov_inner requires omega_iov");
         // Recover stacked_true = [η_true (= psi − mu), κ…] from the psi-space `p`; the
@@ -8543,6 +8548,10 @@ pub fn run_inner_loop_warm(
     InnerLoopStats,
     Vec<Vec<DVector<f64>>>,
 ) {
+    // A population handed as read has no level cells under nested levels; give them here, as
+    // `fit()` does, rather than have every subject refused (#3004).
+    let cells = crate::stats::nested_levels::with_level_cells(model, population);
+    let population = &*cells;
     let (etas, h_matrices, stats, kappas, _) = run_inner_loop_warm_map(
         model,
         population,
