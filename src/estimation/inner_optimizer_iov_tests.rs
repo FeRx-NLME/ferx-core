@@ -3762,6 +3762,41 @@ fn the_nested_walks_decline_an_unprepared_subject() {
     }
 }
 
+/// #3004: a nested-level population handed to the public inner loop as read (no level cells)
+/// is given its cells there, as `fit()` does, so the exact adjoint serves it. Before, every
+/// subject was refused (zero etas, no kappas). Mutation: drop `with_level_cells` from
+/// `run_inner_loop_warm` -> the raw run returns no kappas and this fails.
+#[test]
+fn the_public_inner_loop_gives_a_raw_nested_population_its_cells() {
+    use crate::stats::nested_levels::test_helpers as fx;
+    for (label, src) in [
+        ("algebraic", fx::algebraic()),
+        ("closed form", fx::closed_form()),
+        ("ode", fx::ode()),
+    ] {
+        let (m, prepared) = fx::prepared(&src, 2);
+        let mut raw = prepared.clone();
+        for s in &mut raw.subjects {
+            s.occasions.clear();
+            s.dose_occasions.clear();
+            s.pk_only_occasions.clear();
+            s.reset_occasions.clear();
+            assert!(crate::stats::nested_levels::unprepared(&m, s), "{label}");
+        }
+        let run = |pop: &crate::types::Population| {
+            super::run_inner_loop(&m, pop, &m.default_params, 200, 1e-6)
+        };
+        let (e_raw, _, _, k_raw) = run(&raw);
+        let (e_ok, _, _, k_ok) = run(&prepared);
+        for i in 0..2 {
+            assert!(!k_raw[i].is_empty(), "{label}: raw subject {i} was refused");
+            assert!(e_raw[i].iter().all(|v| v.is_finite()), "{label}");
+            assert_eq!(e_raw[i], e_ok[i], "{label}: eta {i}");
+            assert_eq!(k_raw[i], k_ok[i], "{label}: kappa {i}");
+        }
+    }
+}
+
 /// #1082 PR3, review 1 finding 1: the nested EBE search really runs on the analytic
 /// gradient. `find_ebe_iov` searches the compact vector, and `agrad` must hand the walk
 /// the per-cell stack; handed the compact one, the analytic gradient declines and every
@@ -5797,10 +5832,16 @@ fn iov_inner_gradient_serves_an_analytic_hazard() {
         "an analytic hazard is served"
     );
     let params = &model.default_params;
+    assert!(
+        fd_fallback_warning(&model, &pop, &params.theta).is_none(),
+        "a served hazard raises no FD-fallback warning"
+    );
     let omega_iov = params.omega_iov.as_ref().expect("Ω_IOV");
     let mut worst = 0.0f64;
     for s in pop.subjects.iter().take(4) {
         assert!(super::analytic_iov_inner_supported(&model, s, params));
+        // The route report agrees with the search: a served hazard is not an FD subject.
+        assert!(iov_inner_subject_route(&model, s, &params.theta).is_some());
         let n_occ = crate::stats::likelihood::iov_occasion_groups(s).len();
         let mut stacked = vec![0.15];
         stacked.extend(std::iter::repeat_n(0.02, n_occ * model.n_kappa));

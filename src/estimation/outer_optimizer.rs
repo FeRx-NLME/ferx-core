@@ -261,6 +261,10 @@ pub fn optimize_population(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> OuterResult {
+    // A population handed as read has no level cells under nested levels; give them here, as
+    // `fit()` does, rather than have every subject refused (#3004).
+    let cells = crate::stats::nested_levels::with_level_cells(model, population);
+    let population = &*cells;
     // `outer_maxiter == 0` requests an evaluation-only run (NONMEM `MAXEVAL=0`):
     // report the objective at the *initial* parameters with no minimisation. This
     // must short-circuit before any optimizer is constructed, because NLopt's
