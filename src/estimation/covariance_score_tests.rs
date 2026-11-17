@@ -351,3 +351,120 @@ fn iov_s_matrix_is_the_adjoint_rows_over_the_stacked_mode() {
     }
     assert_eq!(s, want, "S is the adjoint rows' cross-product");
 }
+
+// ── #1780: the reason `covariance_method = s` gives when `S` is singular ─────────────────
+
+/// `S = Σᵢ gᵢgᵢᵀ` from per-subject scores `g`.
+fn cross(g: &[[f64; 3]]) -> DMatrix<f64> {
+    g.iter().fold(DMatrix::zeros(3, 3), |s, r| {
+        let v = DVector::from_row_slice(r);
+        s + &v * v.transpose()
+    })
+}
+
+fn singular_msg(s: &DMatrix<f64>, n_subjects: usize) -> String {
+    use super::CoordUnits::{Dimensionless, IdentityTheta};
+    let names = ["TVKON".to_string(), "TVVB".into(), "TVV".into()];
+    super::s_singular_msg(
+        s,
+        &[Dimensionless, Dimensionless, IdentityTheta],
+        &names,
+        n_subjects,
+    )
+}
+
+/// A score that is zero in every subject names its parameters, for all of them and for some,
+/// and gives neither the design's rank nor the `r`/`rsr` advice, which cannot help there.
+#[test]
+fn a_zero_score_names_its_parameters() {
+    let all = singular_msg(&DMatrix::zeros(3, 3), 1);
+    assert!(all.starts_with(
+        "Covariance step failed: the score cross-product matrix S is singular \
+         (covariance_method = s). The per-subject score is zero for every free parameter, so \
+         no subject's likelihood depends on the estimated parameters as scored."
+    ));
+    assert!(all.ends_with(" SE estimates not available."), "{all}");
+    let one = singular_msg(
+        &cross(&[[1.0, 0.0, 2.0], [3.0, 0.0, -1.0], [2.0, 0.0, 5.0]]),
+        3,
+    );
+    assert!(
+        one.contains(
+            "The score for TVVB is zero in every subject, so the data do not inform it; fix or \
+             remove it."
+        ),
+        "{one}"
+    );
+    let two = singular_msg(&cross(&[[1.0, 0.0, 0.0], [3.0, 0.0, 0.0]]), 3);
+    assert!(
+        two.contains(
+            "The score for TVVB, TVV is zero in every subject, so the data do not inform them; \
+             fix or remove them."
+        ),
+        "{two}"
+    );
+    for m in [&all, &one, &two] {
+        assert!(!m.contains("rank at most") && !m.contains("rsr"), "{m}");
+    }
+}
+
+/// Fewer subjects than free parameters states the rank and advises `r`/`rsr`; the same `S`
+/// with as many subjects as parameters is diagnosed by its scores instead.
+#[test]
+fn fewer_subjects_than_parameters_states_the_rank_only_below_the_count() {
+    let s = cross(&[[1.0, 2.0, 0.5], [-1.0, 0.5, 2.0]]);
+    let design = |n: usize, subjects: &str| {
+        format!(
+            "With {n} {subjects} and 3 free parameters S has rank at most {n}, so it is singular \
+             on this design at any estimate. Use covariance_method = r or rsr, which never \
+             invert S; both need R positive definite at the estimate, which after saem, imp, \
+             impmap or vi it may not be."
+        )
+    };
+    assert!(singular_msg(&s, 2).contains(&design(2, "subjects")));
+    assert!(singular_msg(&s, 1).contains(&design(1, "subject")));
+    let at_count = singular_msg(&s, 3);
+    assert!(
+        !at_count.contains("rank at most") && !at_count.contains("rsr"),
+        "{at_count}"
+    );
+    assert!(at_count.contains("are collinear"), "{at_count}");
+    // A zero score and the design are separate causes, and both are named.
+    let both = singular_msg(&cross(&[[1.0, 0.0, 2.0], [3.0, 0.0, -1.0]]), 2);
+    assert!(
+        both.contains(
+            "in every subject, so the data do not inform it; fix or remove it. With 2 subjects"
+        ),
+        "{both}"
+    );
+    assert!(!both.contains("collinear"), "{both}");
+}
+
+/// Two parameters whose scores cancel in every subject (the likelihood reads only their ratio)
+/// are named, and the third is not; the same design with the pair informed separately inverts.
+#[test]
+fn collinear_scores_name_the_parameters_they_cancel_in() {
+    let bad = cross(&[
+        [1.0, -1.0, 40.0],
+        [2.0, -2.0, -30.0],
+        [-0.5, 0.5, 70.0],
+        [3.0, -3.0, 10.0],
+    ]);
+    let ok = cross(&[
+        [1.0, -0.2, 40.0],
+        [2.0, -2.0, -30.0],
+        [-0.5, 0.9, 70.0],
+        [3.0, -1.0, 10.0],
+    ]);
+    let units = [super::CoordUnits::Dimensionless; 3];
+    assert!(super::invert_cross_product(&bad, &units).is_none());
+    assert!(super::invert_cross_product(&ok, &units).is_some());
+    let m = singular_msg(&bad, 4);
+    assert!(
+        m.contains(
+            "(covariance_method = s). The per-subject scores of TVKON, TVVB are collinear, so \
+             the data inform only a combination of them; fix or remove one of them. SE"
+        ),
+        "{m}"
+    );
+}

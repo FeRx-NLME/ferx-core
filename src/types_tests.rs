@@ -663,8 +663,16 @@ fn classify_warning_every_covariance_step_failure_is_covariance_failed() {
                 .into(),
             "",
         ),
-        // covariance.rs `S_SINGULAR_MSG`.
-        (crate::estimation::covariance::S_SINGULAR_MSG.into(), ""),
+        // covariance.rs `s_singular_msg`.
+        (
+            crate::estimation::covariance::s_singular_msg(
+                &nalgebra::DMatrix::zeros(1, 1),
+                &[crate::estimation::covariance::CoordUnits::IdentityTheta],
+                &["TVCL".into()],
+                12,
+            ),
+            "",
+        ),
         // covariance.rs quadrature score.
         (
             "Covariance step failed: could not obtain a converged, finite quadrature score \

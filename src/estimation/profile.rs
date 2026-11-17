@@ -4068,8 +4068,15 @@ impl ProfileCtx<'_> {
             &free_all,
             &self.model.nn_weight_theta_ranges(),
         );
-        let inv = crate::estimation::covariance::invert_cross_product(&s, &units)
-            .ok_or_else(|| crate::estimation::covariance::S_SINGULAR_MSG.to_string())?;
+        let inv =
+            crate::estimation::covariance::invert_cross_product(&s, &units).ok_or_else(|| {
+                crate::estimation::covariance::s_singular_msg(
+                    &s,
+                    &units,
+                    &crate::estimation::covariance::free_coordinate_names(&unheld, &free_all),
+                    self.population.subjects.len(),
+                )
+            })?;
         // #2816: `S⁻¹` conditional on the coordinates collapsed on the guard, once `S` itself
         // inverted cleanly — the unprofiled step's rule (#2797), so a held collapse is the
         // same coordinate `FIX`. `unheld` is the template `free_all` indexes.
