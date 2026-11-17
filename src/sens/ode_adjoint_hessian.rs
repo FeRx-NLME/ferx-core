@@ -839,7 +839,9 @@ pub(super) struct CovPlan<'a> {
     /// The structured kernel's rows at this point ([`st`]), formed on the first pass.
     st_rows: std::cell::RefCell<Option<st::Rows>>,
     /// The structured kernel's reduce plan, once looked up.
-    st_reduce: std::cell::RefCell<Option<std::sync::Arc<kj::Plan>>>,
+    st_reduce: std::cell::RefCell<[Option<std::sync::Arc<kj::Plan>>; 2]>,
+    /// A quadrature subject's rows at its nodes ([`st::NodeRows`]).
+    st_node_rows: std::cell::RefCell<Option<st::NodeRows>>,
 }
 
 /// The kernel's input slots for one subject's pass: per observation the prediction plan's
@@ -1023,7 +1025,8 @@ impl<'a> CovPlan<'a> {
             moved: std::cell::RefCell::new(None),
             bases: std::cell::RefCell::new(std::collections::HashMap::new()),
             st_rows: std::cell::RefCell::new(None),
-            st_reduce: std::cell::RefCell::new(None),
+            st_reduce: std::cell::RefCell::new([None, None]),
+            st_node_rows: std::cell::RefCell::new(None),
         }
     }
 
@@ -1443,19 +1446,33 @@ impl<'a> CovPlan<'a> {
         };
         // The quadrature's nodes: stage 1, then the node predictions (and term values) there.
         let mut nodes = Vec::new();
+        // A structured quadrature subject's pass takes its nodes from the structured stage 1.
+        let st_nodes = if kt > 0 && slots.n_nodes > 0 {
+            self.struct_nodes(&inputs[..n_base * lk], &slots, kt)
+        } else {
+            None
+        };
         let k1 = if slots.n_nodes > 0 {
-            let k1 = super::kernel::kernel_run(
-                model,
-                subject,
-                super::kernel::variant_of(&(self.variant.bytes(), 1u8, slots.end)),
-                layout_k,
-                &inputs[..n_base * lk],
-                slots.n_nodes * pn,
-                &record_k1,
-            )?;
+            let k1 = match st_nodes {
+                Some(_) => None,
+                None => Some(super::kernel::kernel_run(
+                    model,
+                    subject,
+                    super::kernel::variant_of(&(self.variant.bytes(), 1u8, slots.end)),
+                    layout_k,
+                    &inputs[..n_base * lk],
+                    slots.n_nodes * pn,
+                    &record_k1,
+                )?),
+            };
+            let bout: &[f64] = match (&st_nodes, &k1) {
+                (Some(b), _) => b,
+                (None, Some(k)) => &k.out,
+                (None, None) => return None,
+            };
             for nd in 0..slots.n_nodes {
-                let bv: Vec<f64> = (0..pn).map(|k| k1.out[(nd * pn + k) * lk]).collect();
-                let bt = |k: usize, a: usize| k1.out[(nd * pn + k) * lk + 1 + a];
+                let bv: Vec<f64> = (0..pn).map(|k| bout[(nd * pn + k) * lk]).collect();
+                let bt = |k: usize, a: usize| bout[(nd * pn + k) * lk + 1 + a];
                 let fb = if n_obs > 0 {
                     let fb = self.plan_run(
                         PlanKey::Node(nd),
@@ -1525,13 +1542,13 @@ impl<'a> CovPlan<'a> {
                 };
                 nodes.push((fb, qb, fv));
             }
-            Some(k1)
+            k1
         } else {
             None
         };
         // A tangent pass of a structured subject keeps the kernel's inputs for [`st`] instead of
         // running the recorded kernel.
-        let structured = kt > 0 && slots.n_nodes == 0 && self.structured();
+        let structured = kt > 0 && self.structured() && (slots.n_nodes == 0 || st_nodes.is_some());
         let k2 = if structured {
             None
         } else {
@@ -1738,11 +1755,13 @@ impl<'a> CovPlan<'a> {
         let width = self.nx + self.nz + pn;
         let mut rows = vec![vec![0.0; width]; ns];
         // Stage 2, then the nodes back to their locations, then stage 1.
+        let mut pending = None;
         let mut adj = if tangent {
             match r.st_inputs.as_ref() {
                 Some(_) => {
-                    let (adj, psi) = self.struct_adjoint(r, &seeds[0])?;
+                    let (adj, psi, pend) = self.struct_adjoint(r, &seeds[0])?;
                     *r.psi.borrow_mut() = Some(psi);
+                    pending = Some(pend);
                     vec![adj]
                 }
                 None => vec![r.k2.as_ref()?.reverse_tangent(&seeds[0])?.to_vec()],
@@ -1750,7 +1769,7 @@ impl<'a> CovPlan<'a> {
         } else {
             r.k2.as_ref()?.reverse(seeds)?
         };
-        if let Some(k1) = r.k1.as_ref() {
+        if sl.n_nodes > 0 {
             let mut b_seeds = vec![vec![0.0; sl.n_nodes * pn * lk]; adj.len()];
             for (nd, (fb, qb, fv)) in r.nodes.iter().enumerate() {
                 let mut node =
@@ -1776,16 +1795,26 @@ impl<'a> CovPlan<'a> {
                     node(qb, &|_| sl.nq_node + nd, 1)?;
                 }
             }
-            let adj1 = if tangent {
-                vec![k1.reverse_tangent(&b_seeds[0])?.to_vec()]
-            } else {
-                k1.reverse(&b_seeds)?
-            };
-            for (a2, a1) in adj.iter_mut().zip(&adj1) {
-                for (x, y) in a2.iter_mut().zip(a1) {
-                    *x += y;
+            match (pending.take(), r.k1.as_ref()) {
+                // Stage 1 structured: its forward over reverse, then the anchor rows.
+                (Some(pend), _) => self.struct_finish(r, &mut adj[0], pend, Some(&b_seeds[0]))?,
+                (None, Some(k1)) => {
+                    let adj1 = if tangent {
+                        vec![k1.reverse_tangent(&b_seeds[0])?.to_vec()]
+                    } else {
+                        k1.reverse(&b_seeds)?
+                    };
+                    for (a2, a1) in adj.iter_mut().zip(&adj1) {
+                        for (x, y) in a2.iter_mut().zip(a1) {
+                            *x += y;
+                        }
+                    }
                 }
+                (None, None) => return None,
             }
+        }
+        if let Some(pend) = pending.take() {
+            self.struct_finish(r, &mut adj[0], pend, None)?;
         }
         // The predictions, FOCE's population predictions and the term, back to θ and η.
         if let Some(pk) = r.pred.as_ref() {
