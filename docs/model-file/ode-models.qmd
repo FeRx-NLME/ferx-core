@@ -433,12 +433,18 @@ Scope and limits:
   the modes under the readout's settings. A `[mixture]` model, an objective published by a
   Monte-Carlo estimator and a model solved exactly by the [matrix exponential](#linear-exact)
   are not checked.
-- If the tighter solve cannot be set up (its worker pool cannot be built), the fit carries
-  `W_ODE_OFV_SETTLEMENT_UNCHECKED` instead, so a check that did not run never reads as a
-  settled objective.
+- If the tighter solve cannot be set up (its worker pool cannot be built), or does not
+  integrate cleanly at the re-found EBEs (a step forced at the minimum step size, a segment
+  left unfinished, stiff-aborted or diverged, an abandoned timeline), the fit carries
+  `W_ODE_OFV_SETTLEMENT_UNCHECKED` instead, naming the reason. Each of those failures can
+  still return a finite OFV that never met the tighter tolerance, so a check that did not
+  really run never reads as a settled objective.
+- The EBEs are re-found under the settings of the stage that published the OFV, such as the
+  tighter `inner_tol` a `laplace` stage uses, so EBE convergence error does not enter the shift.
 - It costs one inner-loop pass over all subjects at the tighter tolerance.
-- A fit already at `ode_reltol = 1e-12` is not checked, since one more decade would measure
-  round-off.
+- Neither tolerance goes below its floor (`ode_reltol = 1e-12`, `ode_abstol = 1e-14`), since
+  one more decade would measure round-off. A tolerance already at its floor stays there while
+  the other is tightened, and only a fit with both at their floors is not checked.
 - One decade estimates the remaining error. It does not bound it. When something other
   than the tolerance limits the step size, such as the spacing of the output times or the
   initial step, two tolerances can accept the same steps. On `mm_iv`, `ode_reltol = 1e-1`

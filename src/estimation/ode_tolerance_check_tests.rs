@@ -9,6 +9,7 @@ fn shift(fit_ofv: f64, tight_ofv: f64) -> OdeToleranceShift {
         tight_abstol: 1e-7,
         fit_ofv,
         tight_ofv,
+        inner_tol: 1e-5,
     }
 }
 
@@ -98,9 +99,24 @@ fn the_override_tightens_one_decade_and_keeps_the_callers_method() {
     assert_eq!(o.max_steps, Some(base.max_steps * 10));
     assert_eq!(o.method, Some(crate::ode::OdeMethod::Rodas5P));
 
+    // #2994 review r2: a `reltol` at its floor still has its `abstol` tightened...
     let mut floored = mm_iv().parsed.model;
     floored.ode_spec.as_mut().unwrap().solver_opts.reltol = RELTOL_FLOOR;
-    assert!(tightened_override(&floored, &opts).is_none());
+    let o = tightened_override(&floored, &opts).expect("abstol 1e-6 can still be tightened");
+    assert_eq!(o.reltol, Some(RELTOL_FLOOR), "reltol stays at its floor");
+    assert_eq!(o.abstol, Some(base.abstol * 0.1));
+    // ...and the mirror image...
+    let mut abs_floored = mm_iv().parsed.model;
+    abs_floored.ode_spec.as_mut().unwrap().solver_opts.abstol = ABSTOL_FLOOR;
+    let o = tightened_override(&abs_floored, &opts).expect("reltol can still be tightened");
+    assert_eq!(o.reltol, Some(base.reltol * 0.1));
+    assert_eq!(o.abstol, Some(ABSTOL_FLOOR));
+    // ...and only both at their floors skips the check.
+    let mut both = mm_iv().parsed.model;
+    let so = &mut both.ode_spec.as_mut().unwrap().solver_opts;
+    so.reltol = RELTOL_FLOOR;
+    so.abstol = ABSTOL_FLOOR;
+    assert!(tightened_override(&both, &opts).is_none());
     let mut above = mm_iv().parsed.model;
     above.ode_spec.as_mut().unwrap().solver_opts.reltol = 1e-11;
     assert_eq!(
@@ -275,7 +291,7 @@ fn a_check_that_could_not_run_is_reported_not_silent() {
     for clause in [
         "W_ODE_OFV_SETTLEMENT_UNCHECKED: ",
         "whether the OFV is settled at the fit's ODE tolerance could not be checked",
-        "could not be set up (pool build failed)",
+        "could not be completed, because pool build failed.",
         "The fit and its OFV are unaffected",
         "refit once with tighter ode_reltol / ode_abstol and compare the OFV",
     ] {
@@ -292,4 +308,143 @@ fn a_check_that_could_not_run_is_reported_not_silent() {
     let classified = crate::types::classify_warning(&msg);
     assert_eq!(classified.category, WarningCode::OdeSolver);
     assert_eq!(classified.severity, WarningSeverity::Warning);
+}
+
+/// Each counter that marks a padded or abandoned trajectory makes the tight pass unclean, by
+/// name; a clamp or stop in an `auto` attempt the guard discarded does not.
+#[test]
+fn an_unclean_tight_pass_names_the_counters_that_were_not_clean() {
+    use crate::ode::solver::OdeSolverStats;
+    assert_eq!(unclean_integration(&OdeSolverStats::default()), None);
+    let discarded = OdeSolverStats {
+        min_step_clamped_steps: 4,
+        discarded_clamped_steps: 4,
+        unfinished_segments: 2,
+        discarded_unfinished_segments: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        unclean_integration(&discarded),
+        None,
+        "discarded attempts were re-solved"
+    );
+    for (st, want) in [
+        (
+            OdeSolverStats {
+                min_step_clamped_steps: 3,
+                discarded_clamped_steps: 1,
+                ..Default::default()
+            },
+            "2 steps clamped at the minimum step size",
+        ),
+        (
+            OdeSolverStats {
+                unfinished_segments: 1,
+                ..Default::default()
+            },
+            "1 unfinished segments",
+        ),
+        (
+            OdeSolverStats {
+                stiff_aborted_segments: 5,
+                ..Default::default()
+            },
+            "5 stiff-aborted segments",
+        ),
+        (
+            OdeSolverStats {
+                diverged_segments: 1,
+                ..Default::default()
+            },
+            "1 diverged segments",
+        ),
+        (
+            OdeSolverStats {
+                abandoned_non_finite_timeline: 2,
+                ..Default::default()
+            },
+            "2 abandoned non-finite timelines",
+        ),
+    ] {
+        assert_eq!(unclean_integration(&st).as_deref(), Some(want));
+    }
+}
+
+/// #2994 review r2, end to end on real solves: a tighter pass that clamps at `min_dt` returns
+/// a finite objective that never met its tolerance, so it is reported as unchecked rather than
+/// compared. `min_dt = 0.5` is where the fit's own tolerance (1e-8) integrates cleanly — the
+/// post-fit solver pass carries no `W_ODE_SOLVER_DIAGNOSTICS` — while 1e-9 force-accepts steps
+/// there (measured: macOS arm64). The straddle is asserted, so the fixture cannot quietly turn
+/// into one where the fit itself is unclean.
+#[test]
+fn a_tight_pass_that_clamped_is_reported_unchecked_not_compared() {
+    let mut prep = mm_iv();
+    prep.parsed
+        .model
+        .ode_spec
+        .as_mut()
+        .unwrap()
+        .solver_opts
+        .min_dt = 0.5;
+    let r = evaluate(&prep, 1e-8);
+    assert!(
+        !r.warnings
+            .iter()
+            .any(|w| w.starts_with("W_ODE_SOLVER_DIAGNOSTICS")),
+        "fixture: the fit's own tolerance must integrate cleanly: {:?}",
+        r.warnings
+    );
+    assert!(not_settled(&r).is_none(), "{:?}", r.warnings);
+    let msg = r
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_ODE_OFV_SETTLEMENT_UNCHECKED:"))
+        .unwrap_or_else(|| panic!("no unchecked warning in {:?}", r.warnings));
+    assert!(
+        msg.contains("because the tighter solve did not integrate cleanly at the re-found EBEs:"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("steps clamped at the minimum step size"),
+        "{msg}"
+    );
+    let entry = r
+        .warnings_structured
+        .iter()
+        .find(|e| e.message.starts_with("W_ODE_OFV_SETTLEMENT_UNCHECKED:"))
+        .expect("typed at source");
+    assert_eq!(entry.category, WarningCode::OdeSolver);
+}
+
+/// #2994 review r2: an estimating Laplace stage is checked under its own stage options, whose
+/// `inner_tol` the stage tightens to at most 1e-8, not under the top-level ones (1e-5 here).
+#[test]
+fn an_estimating_laplace_stage_is_checked_under_its_own_stage_options() {
+    let prep = mm_iv();
+    let opts = FitOptions {
+        verbose: false,
+        method: EstimationMethod::Laplace,
+        methods: Vec::new(),
+        outer_maxiter: 0,
+        inner_tol: 1e-5,
+        run_covariance_step: false,
+        ode_reltol: 1e-3,
+        ode_abstol: 1e-3,
+        ode_method: crate::ode::OdeMethod::Rk45,
+        ..prep.parsed.fit_options.clone()
+    };
+    let r = crate::fit(
+        &prep.parsed.model,
+        &prep.population,
+        &prep.init_params,
+        &opts,
+    )
+    .expect("the evaluation runs");
+    let d =
+        details_of(&r).unwrap_or_else(|| panic!("no W_ODE_OFV_NOT_SETTLED in {:?}", r.warnings));
+    let tol = d["inner_tol"].as_f64().expect("inner_tol recorded");
+    assert!(
+        tol <= 1e-8,
+        "checked at inner_tol = {tol}, not the Laplace stage's"
+    );
 }

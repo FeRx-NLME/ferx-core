@@ -4120,6 +4120,7 @@ pub(crate) fn ode_ofv_not_settled_warning(
         "fit_abstol": s.fit_abstol,
         "tight_reltol": s.tight_reltol,
         "tight_abstol": s.tight_abstol,
+        "inner_tol": s.inner_tol,
     });
     let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), Some(details));
     Some((msg, entry))

@@ -2058,11 +2058,16 @@ fn fit_inner(
     //
     // `None` only until the first stage writes one.
     let mut objective_stage: Option<EstimationMethod> = None;
-    // The options of an `agq_eval_only` readout while it owns the published objective, so the
-    // post-fit ODE tolerance check (#2994) re-scores *that* objective — its method, `n_agq` and
-    // inner settings — rather than the preceding estimator's. Cleared by every other stage that
-    // takes ownership.
-    let mut objective_stage_opts: Option<FitOptions> = None;
+    // The options of the stage that owns the published objective, and which modes scored it,
+    // so the post-fit ODE tolerance check (#2994) re-scores *that* objective under that
+    // stage's own method, `n_agq` and inner settings — an estimating Laplace stage tightens
+    // `inner_tol`, which the top-level options do not carry (#2994 review r2). An estimating
+    // stage scored the modes it stores (`Stored`); an `agq_eval_only` readout re-found its own
+    // and kept only the OFV (`Resolved`). `None` while no stage the check can re-score owns it.
+    let mut objective_stage_opts: Option<(
+        FitOptions,
+        crate::estimation::ode_tolerance_check::FitSide,
+    )> = None;
     // A VI stage's result must survive later stages of a chain: `method = [vi, imp]`
     // is the *recommended* way to finish a VI fit, and reading `vi` off only the
     // final stage would silently discard it exactly when it was used correctly.
@@ -2364,7 +2369,10 @@ fn fit_inner(
             // This stage writes `result.ofv` on both branches, so it owns the
             // published objective even though it estimates nothing (#1303).
             objective_stage = Some(method);
-            objective_stage_opts = Some(stage_opts.clone());
+            objective_stage_opts = Some((
+                stage_opts.clone(),
+                crate::estimation::ode_tolerance_check::FitSide::Resolved,
+            ));
             match result.as_mut() {
                 // Chained: keep the estimator's parameters and replace only the OFV, so the
                 // reported objective is the quadrature marginal at the point it reached.
@@ -2713,7 +2721,10 @@ fn fit_inner(
         // An estimating stage replaces the whole `OuterResult`, objective included,
         // so it becomes the owner of the published `ofv` (#1303).
         objective_stage = Some(method);
-        objective_stage_opts = None;
+        objective_stage_opts = Some((
+            stage_opts.clone(),
+            crate::estimation::ode_tolerance_check::FitSide::Stored,
+        ));
         result = Some(stage_result);
 
         // NONMEM-comparable IMP / IMPMAP objective. The reported `OuterResult.ofv`
@@ -3492,16 +3503,15 @@ fn fit_inner(
     // one published, so its stage is the tracked owner of `ofv` (`objective_stage`), not
     // `final_method`: a trailing `agq_eval_only` readout publishes its quadrature marginal
     // while the stored modes stay the estimator's, so its check runs under the readout's own
-    // options and re-finds the modes on both sides (`FitSide::Resolved`). A mixture's
+    // options and re-finds the modes on both sides (`FitSide::Resolved`); an estimating owner
+    // is checked under its own stage options too, not the top-level ones. A mixture's
     // objective is the K-class marginal, which this single-population re-score would not
     // reproduce, and the Monte-Carlo estimators publish an objective it does not compute, so
     // both are out of scope.
     {
         use crate::estimation::ode_tolerance_check::{self as otc, FitSide};
         let (stage, fit_side) = match objective_stage_opts {
-            Some(ref readout) if readout.method == objective_stage => {
-                (readout.clone(), FitSide::Resolved)
-            }
+            Some((ref owner, side)) if owner.method == objective_stage => (owner.clone(), side),
             _ => (
                 FitOptions {
                     method: objective_stage,

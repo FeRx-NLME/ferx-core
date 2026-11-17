@@ -40,10 +40,15 @@ pub(crate) const TIGHTEN_FACTOR: f64 = 0.1;
 /// `W_ODE_SOLVER_DIAGNOSTICS` already. The same factor the covariance stencil uses (#520).
 pub(crate) const MAX_STEPS_FACTOR: usize = 10;
 
-/// The tightest `reltol` the re-solve runs at. A fit already at or inside it is not checked:
-/// below it an explicit stepper is limited by round-off rather than by the tolerance, so a
-/// further decade measures the arithmetic, not the integration.
+/// The tightest `reltol` the re-solve runs at: below it an explicit stepper is limited by
+/// round-off rather than by the tolerance, so a further decade measures the arithmetic, not
+/// the integration. A fit already there keeps it, while its `abstol` is still tightened.
 pub(crate) const RELTOL_FLOOR: f64 = 1e-12;
+
+/// The tightest `abstol` the re-solve runs at, for the same reason. The check is skipped only
+/// when neither tolerance can be tightened (#2994 review r2): a fit at `ode_reltol = 1e-12`
+/// with `ode_abstol = 1e-6` can still be dominated by its absolute tolerance.
+pub(crate) const ABSTOL_FLOOR: f64 = 1e-14;
 
 /// `|ΔOFV|` above which the fit is warned. Well below the 3.84 of a 1-df likelihood-ratio
 /// test, so a shift that could change a model comparison is reported, and far above the
@@ -68,6 +73,8 @@ pub(crate) struct OdeToleranceShift {
     pub(crate) fit_ofv: f64,
     /// The same objective, EBEs re-found, at the tighter tolerance.
     pub(crate) tight_ofv: f64,
+    /// The inner tolerance the EBEs were re-found at: the owning stage's.
+    pub(crate) inner_tol: f64,
 }
 
 impl OdeToleranceShift {
@@ -101,36 +108,74 @@ pub(crate) fn method_in_scope(method: EstimationMethod) -> bool {
 
 /// The ODE override the re-solve runs under, or `None` when there is nothing to check: a model
 /// that integrates nothing, one solved exactly by matrix exponential (no tolerance enters), or
-/// a fit already at [`RELTOL_FLOOR`]. Read on the thread the fit runs on, where its own
-/// override is armed, so the tolerance tightened is the one the fit integrated at.
+/// a fit whose `reltol` and `abstol` are both already at their floors ([`RELTOL_FLOOR`],
+/// [`ABSTOL_FLOOR`]). Each tolerance is tightened one decade, but not past its floor. Read on
+/// the thread the fit runs on, where its own override is armed, so the tolerance tightened is
+/// the one the fit integrated at.
 pub(crate) fn tightened_override(
     model: &CompiledModel,
     options: &FitOptions,
 ) -> Option<crate::ode::solver::OdeSolverOverride> {
     let eff = model.integrator_spec()?.effective_solver_opts();
-    if eff.method == crate::ode::OdeMethod::Linear || eff.reltol <= RELTOL_FLOOR {
+    if eff.method == crate::ode::OdeMethod::Linear {
+        return None;
+    }
+    let reltol = (eff.reltol * TIGHTEN_FACTOR)
+        .max(RELTOL_FLOOR)
+        .min(eff.reltol);
+    let abstol = (eff.abstol * TIGHTEN_FACTOR)
+        .max(ABSTOL_FLOOR)
+        .min(eff.abstol);
+    if reltol >= eff.reltol && abstol >= eff.abstol {
         return None;
     }
     Some(crate::ode::solver::OdeSolverOverride {
-        reltol: Some((eff.reltol * TIGHTEN_FACTOR).max(RELTOL_FLOOR)),
-        abstol: Some(eff.abstol * TIGHTEN_FACTOR),
+        reltol: Some(reltol),
+        abstol: Some(abstol),
         max_steps: Some(eff.max_steps.saturating_mul(MAX_STEPS_FACTOR)),
         ..options.ode_solver_override()
     })
+}
+
+/// Whether the tight pass's kept trajectories were integrated, not padded (#2994 review r2):
+/// no segment left unfinished, stiff-aborted or diverged, no step force-accepted at `min_dt`,
+/// no timeline abandoned. Each of those returns a finite trajectory (or a sentinel-clamped
+/// objective) that never met the tighter tolerance, so a small shift from it would read as a
+/// settled objective. An `auto` attempt the guard discarded and re-solved cleanly does not
+/// count. `None` when clean, else the counters that were not, for the warning.
+pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Option<String> {
+    let parts: Vec<String> = [
+        (
+            st.kept_clamped_steps(),
+            "steps clamped at the minimum step size",
+        ),
+        (st.kept_unfinished_segments(), "unfinished segments"),
+        (st.stiff_aborted_segments, "stiff-aborted segments"),
+        (st.diverged_segments, "diverged segments"),
+        (
+            st.abandoned_non_finite_timeline,
+            "abandoned non-finite timelines",
+        ),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(n, what)| format!("{n} {what}"))
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
 }
 
 /// Re-find every subject's EBEs warm from the fit's joint modes (η̂ and κ̂) and score the
 /// objective, at whatever ODE tolerance is armed on the calling thread. The same seeded warm
 /// solve an `agq_eval_only` stage runs, so on the fit-tolerance side it reproduces that
 /// stage's objective.
-fn rescored_ofv(
+fn rescored_with_modes(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     eta_hats: &[DVector<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> f64 {
+) -> (f64, EbeModes) {
     use crate::estimation::inner_optimizer::{
         run_inner_loop_warm_seeded, InnerHessianSeed, PrevEtas,
     };
@@ -150,7 +195,55 @@ fn rescored_ofv(
         options,
         PrevEtas::Solved,
     );
-    2.0 * pop_nll_opts(model, population, params, &etas, &hs, &kappas, options)
+    let ofv = 2.0 * pop_nll_opts(model, population, params, &etas, &hs, &kappas, options);
+    (ofv, (etas, hs, kappas))
+}
+
+/// [`rescored_with_modes`]'s objective alone.
+fn rescored_ofv(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> f64 {
+    rescored_with_modes(model, population, params, eta_hats, kappas, options).0
+}
+
+/// A re-found η̂ / `H` / κ̂ triple.
+type EbeModes = (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>);
+
+/// [`rescored_ofv`], `Err` with the counters when the solve at the re-found modes did not
+/// integrate cleanly ([`unclean_integration`]). The counters come from one prediction sweep
+/// per subject at those modes, each on its own worker under its own
+/// [`crate::ode::solver::SolverStatsScope`] (the scope is per thread) — the post-fit sweep's
+/// shape, run here under the tighter tolerance, since that sweep runs at the fit's.
+fn rescored_ofv_checked(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> Result<f64, String> {
+    let (ofv, (etas, hs, kappas)) =
+        rescored_with_modes(model, population, params, eta_hats, kappas, options);
+    let (_, stats) = crate::api::postfit::compute_subject_results(
+        model,
+        population,
+        params,
+        &etas,
+        &hs,
+        &kappas,
+        options.interaction,
+        None,
+        true,
+    );
+    match unclean_integration(&stats) {
+        None => Ok(ofv),
+        Some(why) => Err(why),
+    }
 }
 
 /// Which modes the fit-tolerance side of the check scores.
@@ -166,7 +259,8 @@ pub(crate) enum FitSide {
 }
 
 /// The check itself (#2994): `None` when it does not apply ([`tightened_override`]), `Err`
-/// with the reason when the scope carrying the tighter tolerance could not be built.
+/// with the reason when the tighter scope could not be built or the tighter solve did not
+/// integrate cleanly ([`unclean_integration`]).
 ///
 /// `options` must be the options of the stage that owns the published OFV (its `method`,
 /// `interaction`, `n_agq` and inner settings), so the objective re-scored is the one the fit
@@ -194,10 +288,15 @@ pub(crate) fn ofv_tolerance_shift(
         FitSide::Resolved => rescored_ofv(model, population, params, eta_hats, kappas, options),
     };
     let tight_ofv = match crate::api::with_fit_scope_ode(options, tight, || {
-        rescored_ofv(model, population, params, eta_hats, kappas, options)
+        rescored_ofv_checked(model, population, params, eta_hats, kappas, options)
     }) {
-        Ok(v) => v,
-        Err(e) => return Some(Err(e.to_string())),
+        Ok(Ok(v)) => v,
+        Ok(Err(unclean)) => {
+            return Some(Err(format!(
+                "the tighter solve did not integrate cleanly at the re-found EBEs: {unclean}"
+            )))
+        }
+        Err(e) => return Some(Err(format!("its scope could not be set up: {e}"))),
     };
     Some(Ok(OdeToleranceShift {
         fit_reltol: eff.reltol,
@@ -206,20 +305,22 @@ pub(crate) fn ofv_tolerance_shift(
         tight_abstol: tight.abstol.expect("set by tightened_override"),
         fit_ofv,
         tight_ofv,
+        inner_tol: options.inner_tol,
     }))
 }
 
 /// The token of [`not_checked_warning`]; `classify_warning` maps it to `ode_solver`.
 pub(crate) const NOT_CHECKED_TOKEN: &str = "W_ODE_OFV_SETTLEMENT_UNCHECKED";
 
-/// The warning for a check that applied but could not run, because the scope carrying the
-/// tighter tolerance could not be built (`reason`). Never silent: an inapplicable check and a
-/// failed one must not read the same (#2994 review r1).
+/// The warning for a check that applied but could not be completed (`reason`): the scope
+/// carrying the tighter tolerance could not be built, or the tighter solve did not integrate
+/// cleanly. Never silent: an inapplicable check, a failed one and a settled objective must not
+/// read the same (#2994 review r1, r2).
 pub(crate) fn not_checked_warning(reason: &str) -> String {
     format!(
         "{NOT_CHECKED_TOKEN}: whether the OFV is settled at the fit's ODE tolerance could not \
-         be checked: re-solving at a one decade tighter ode_reltol / ode_abstol could not be \
-         set up ({reason}). The fit and its OFV are unaffected; refit once with tighter \
+         be checked: re-solving at a tighter ode_reltol / ode_abstol could not be completed, \
+         because {reason}. The fit and its OFV are unaffected; refit once with tighter \
          ode_reltol / ode_abstol and compare the OFV before comparing models by it (#2994)."
     )
 }
@@ -236,6 +337,7 @@ pub(crate) fn not_settled_warning(s: &OdeToleranceShift) -> Option<String> {
         tight_abstol,
         fit_ofv,
         tight_ofv,
+        ..
     } = *s;
     let tolerances = format!(
         "ode_reltol = {tight_reltol:.0e} / ode_abstol = {tight_abstol:.0e} instead of the \
