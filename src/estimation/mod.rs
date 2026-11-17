@@ -19,6 +19,7 @@ pub mod inner_optimizer;
 pub mod mixture;
 pub(crate) mod nn_reg;
 pub(crate) mod nn_theta_gradient;
+pub(crate) mod ode_tolerance_check;
 pub mod outer_optimizer;
 pub mod parameterization;
 pub(crate) mod priors;

@@ -355,6 +355,8 @@ On the finite-difference route the step trades two errors against each other: th
 
 Accuracy and step budget for `[odes]` models, and for the auto-generated ODE twin that closed-form transit / inverse-Gaussian absorption models carry. See [ODE Models](ode-models.qmd#solver-details).
 
+After a fit, ferx re-scores the OFV once with `ode_reltol` / `ode_abstol` one decade tighter and warns with `W_ODE_OFV_NOT_SETTLED` when it moves by more than 0.1 units: the default is not tight enough for every model ([details](ode-models.qmd#ofv-tolerance-check), #2994).
+
 #### Where the value comes from {#ode-tolerance-precedence}
 
 These six keys (and the two stepper keys below) can also arrive from a caller, and precedence is **per key** either way: a key the caller sets wins over the model file for that fit, a key the caller does not set keeps the file's value. What counts as "set" differs between the two front ends, so check which one you are on.

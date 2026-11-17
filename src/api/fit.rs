@@ -3479,6 +3479,33 @@ fn fit_inner(
         warnings.push(msg);
         native_warnings.push(entry);
     }
+    // Whether the OFV is settled at the ODE tolerance the fit integrated at (#2994): the EBEs
+    // and the objective re-solved once at one decade tighter. A mixture's objective is the
+    // K-class marginal, which this single-population re-score would not reproduce, and the
+    // Monte-Carlo estimators report an objective it does not compute, so both are out of scope.
+    if result.mixture_posteriors.is_none()
+        && crate::estimation::ode_tolerance_check::method_in_scope(final_method)
+    {
+        let stage = FitOptions {
+            method: final_method,
+            ..options.clone()
+        };
+        if let Some((msg, entry)) = crate::estimation::ode_tolerance_check::ofv_tolerance_shift(
+            model,
+            population,
+            &result.params,
+            &result.eta_hats,
+            &result.h_matrices,
+            &result.kappas,
+            &stage,
+        )
+        .as_ref()
+        .and_then(super::postfit::ode_ofv_not_settled_warning)
+        {
+            warnings.push(msg);
+            native_warnings.push(entry);
+        }
+    }
     // Twin-less transit/IG absorption closed form whose fitted per-subject EBE crosses
     // into the flip-flop regime — a silently degenerate subject the η = 0 fit-start
     // reject could not catch (#785). Emitted typed at source.
