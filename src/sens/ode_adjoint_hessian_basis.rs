@@ -44,9 +44,16 @@ pub(super) enum PlanKey {
 
 impl PlanKey {
     /// Whether the plan reads θ the way the predictions do, so the mu fold holds for it: the
-    /// predictions at η̂ and at the nodes. (The other plans keep an axis per moved θ.)
-    fn folds(self) -> bool {
-        matches!(self, PlanKey::Pred | PlanKey::Node(_))
+    /// predictions at η̂ and at the nodes, and FOCE's population predictions — the same plan at
+    /// `η = 0`, where `g⁻¹(μ(θ) + η)` folds with the same coefficients — when they are the
+    /// model's own (`pop_is_model`: no IOV, whose effective model is another). The other plans
+    /// keep an axis per moved θ.
+    fn folds(self, pop_is_model: bool) -> bool {
+        match self {
+            PlanKey::Pred | PlanKey::Node(_) => true,
+            PlanKey::Pop => pop_is_model,
+            _ => false,
+        }
     }
 }
 
@@ -407,7 +414,8 @@ impl CovPlan<'_> {
         }) else {
             return direct();
         };
-        let fold = self.fold.as_ref().filter(|_| key.folds());
+        let pop_is_model = std::ptr::eq(self.sc.pop_model, self.sc.model);
+        let fold = self.fold.as_ref().filter(|_| key.folds(pop_is_model));
         let folds = |i: usize| fold.and_then(|f| f.of(i));
         // The axes: the η slots where read (or where a folded θ lands), and the parameter slots
         // some direction moves that the fold does not carry.

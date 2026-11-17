@@ -795,9 +795,11 @@ impl CovPlan<'_> {
         let nx = self.nx;
         let n_obs = self.subject.observations.len();
         let f_dep = model.error_spec.has_f_dependent_variance();
-        if along.is_empty() || n_obs == 0 || (family == Family::Foce && f_dep) {
+        if along.is_empty() || n_obs == 0 {
             return None;
         }
+        // FOCE under an `f`-dependent variance reads the population predictions too.
+        let need_pop = family == Family::Foce && f_dep;
         self.prepare(along);
         let kt = super::pass_width();
         let nq = if self.second { pn * (pn + 1) / 2 } else { 0 };
@@ -823,12 +825,33 @@ impl CovPlan<'_> {
         if !matches!(pr, PlanRun::Basis(_)) {
             return None;
         }
+        if need_pop {
+            let zeros = vec![0.0; pn];
+            let pp = self.plan_run(
+                PlanKey::Pop,
+                along,
+                pn,
+                self.th.len() + self.nz,
+                false,
+                &zero,
+                kt,
+                &|lanes, et, k| self.run_pred(self.sc.pop_model, &zeros, et, lanes, Layout::F64, k),
+            )?;
+            if !matches!(pp, PlanRun::Basis(_)) {
+                return None;
+            }
+        }
         let bases = self.bases.borrow();
         let (axes, lb, vals, jac) = bases.get(&PlanKey::Pred)?.parts();
         let n_ax = axes.len();
+        let pop = if need_pop {
+            Some(bases.get(&PlanKey::Pop)?.parts())
+        } else {
+            None
+        };
         let rows = self.rows(
             &|j| vals[j * lb],
-            &|_| None,
+            &|j| pop.map(|(_, plb, pv, _)| pv[j * plb]),
             &|j, k| vals[j * lb + 1 + k],
             &|j, t| vals[j * lb + 1 + pn + t],
             &|i| self.x[i],
@@ -860,6 +883,8 @@ impl CovPlan<'_> {
         let sign = |y: usize| if y == 0 { 1.0 } else { -1.0 };
         let lane = |y: usize| if y == 0 { 0 } else { y };
         let mut kf = vec![vec![0.0; n_obs * lb]; ny];
+        // The kernel's adjoints of the population predictions (FOCE's local lane 1).
+        let mut kp = vec![vec![0.0; n_obs]; ny];
         let mut ke = vec![vec![0.0; pn]; ny];
         let mut kx = vec![vec![0.0; nx]; ny];
         for y in 0..ny {
@@ -894,6 +919,9 @@ impl CovPlan<'_> {
                     ds[si] += back(&py[k], v, rj[si].value, dv, &mut sc);
                 }
                 kf[y][j * lb] += (0..kk).map(|k| ds[k] * rj[k].grad[0]).sum::<f64>();
+                if rows.pop_lane.is_some() {
+                    kp[y][j] += (0..kk).map(|k| ds[k] * rj[k].grad[1]).sum::<f64>();
+                }
                 for k in 0..pn {
                     kf[y][j * lb + 1 + k] += dg[k];
                 }
@@ -933,13 +961,35 @@ impl CovPlan<'_> {
                     Input::Param(i) => row[self.nx + (i - n_th)] += on_axis[b],
                 }
             }
+            // The population predictions: `Jᵀ` on their axes; an η axis there carries only a
+            // folded θ (η is held at 0), so it reaches θ through the fold and not `η̂`.
+            let mut pop_eta = vec![0.0; pn];
+            if let Some((pax, plb, _, pjac)) = pop {
+                let np = pax.len();
+                let mut on_p = vec![0.0; np];
+                for j in 0..n_obs {
+                    let a = kp[y][j];
+                    if a != 0.0 {
+                        for (b, s) in on_p.iter_mut().enumerate() {
+                            *s += a * pjac[j * plb * np + b];
+                        }
+                    }
+                }
+                for (b, &ax) in pax.iter().enumerate() {
+                    match ax {
+                        Input::Eta(k) => pop_eta[k] = on_p[b],
+                        Input::Param(i) if i < n_th => row[i] += on_p[b] * self.d1[i],
+                        Input::Param(i) => row[self.nx + (i - n_th)] += on_p[b],
+                    }
+                }
+            }
             if let Some(f) = fold {
                 for i in 0..n_th {
                     if let Some(d) = f.of(i) {
                         let s: f64 = d
                             .iter()
                             .filter(|e| e.0 < pn)
-                            .map(|&(k, m)| m * eta_ax[k])
+                            .map(|&(k, m)| m * (eta_ax[k] + pop_eta[k]))
                             .sum();
                         row[i] += s * self.d1[i];
                     }
