@@ -507,11 +507,12 @@ impl CovPlan<'_> {
         }
         drop(moved);
         if !self.bases.borrow().contains_key(&key) {
-            // One run carries every axis: the plan's primal (an ODE solve, a superposition) is
-            // computed once per subject, not once per axis — the cost that grows with patients
-            // and timepoints. Its kernels' code grows with the axes, but each is compiled once
-            // per model and called for every subject and step.
-            let bw = axes.len();
+            // One axis per run. A plan's kernels follow its subject's event sequence, so subjects
+            // with different designs compile their own: the compiled code grows with the tangent
+            // width times the number of distinct designs, while the arithmetic is the same however
+            // the axes are split. Measured (#2980) on 300 subjects with an ODE: one run of every
+            // axis compiled 2.7× the code of this.
+            let bw = 1;
             let runs = axes
                 .chunks(bw)
                 .map(|ch| {
