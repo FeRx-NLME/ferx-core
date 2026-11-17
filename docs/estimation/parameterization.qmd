@@ -282,12 +282,13 @@ same rule serves a log-packed clearance, an identity-packed covariate effect sta
 zero, a volume written in odd units and an Ω or σ coordinate: the scale follows from how
 much the objective changes along the axis, not from the start value.
 
-- **The curvature** is the R-matrix diagonal at the start, with the EBEs re-solved at the
-  covariance step's tolerance: exact (the adjoint and plan derivatives the covariance
-  step uses) when every subject is served exactly, otherwise a central second difference
-  of the same objective, $0.1$ of the coordinate's size to either side ($0.1\,|\theta_0|$
-  on an identity-packed θ), with the EBEs re-solved. It is one rule; the two sources
-  differ only in precision. On warfarin they agree within 1% on every axis.
+- **The curvature** is the exact R-matrix diagonal at the start (the adjoint and plan
+  derivatives the covariance step uses), with the EBEs re-solved at the covariance step's
+  tolerance. Only a model outside the exact derivatives' scope, or a fit with
+  `gradient = fd`, falls back to a central second difference of the same objective, $0.1$ of
+  the coordinate's size to either side ($0.1\,|\theta_0|$ on an identity-packed θ), EBEs
+  re-solved: the same quantity at lower precision (on warfarin the two agree within 1% on
+  every axis).
 - **A negative curvature** (a concave axis at the start, common for an Ω or an additive σ
   far from its optimum) takes its magnitude; a zero or non-finite one takes the median of
   the other axes' scales.
@@ -300,18 +301,33 @@ The rules in [An identity-packed θ started near zero](#identity-theta-near-zero
 `abs`, still apply to the derivative-free optimizers (`bobyqa`, `mma`) and to an explicit
 `parameter_scaling = abs`.
 
-Measured on 29 FOCEI fits (21 bundled examples, the #2159 fixtures, synthetic and real-data
-benchmarks; L-BFGS, 4 threads), against the magnitude rules it replaces:
+Measured on 26 FOCEI fits — 19 bundled examples, the #2159 fixtures and synthetic benchmarks
+(`bench/scaling_2975/`) — each from five starts with every θ scaled by 0.97 to 1.03, L-BFGS,
+4 threads (Linux x86_64), against the magnitude rules it replaces. Single-start counts move
+±30% with the start, so the ensemble is what is compared:
 
-| | iterations | EBE solves | fits at the best OFV |
-|---|---|---|---|
-| magnitude rules (before #2975) | 1570 | 236k | 29 / 29 |
-| curvature scaling | 1214 (−23%) | 164k (−31%) | 29 / 29 |
+| | iterations | EBE solves | typical model (geometric mean) | fits above the best OFV |
+|---|---|---|---|---|
+| magnitude rules (before #2975) | 7639 | 615k | — | 0 / 130 |
+| curvature scaling | 6544 (−14%) | 463k (−25%) | −24% iterations | 0 / 130 |
 
-It is fastest where the old rules mis-scaled a coordinate: `three_cpt_iv` 62 → 29
-iterations, `two_cpt_oral_cov` 53 → 25, `warfarin` 49 → 28. It is slower on a few models
-with a strongly concave start along one axis, e.g. a 28-subject model with a linear
-weight × sex interaction on CL, 36 → 49.
+23 of the 26 models are faster, up to 2× (`three_cpt_iv` 59 → 28 iterations,
+`two_cpt_oral_cov` 61 → 25). With the covariance step on, wall time over seven of them fell
+17%, the largest models most (a 932-subject synthetic amikacin fit 0.78 → 0.62 s).
+
+Three are slower, each for one measured reason: a variance that starts far from its estimate
+(`syn_pcm_int`, residual σ started 10× too small and an Ω that collapses onto its floor, 54 →
+94 iterations; `fx_ode_obs_scale`, the same, 126 → 221; `emax_pkpd`, an Ω that shrinks 80×,
+123 → 143). Far below its estimate a variance inflates the start curvature of every coordinate
+by up to (σ̂/σ₀)², so the scales set there are too small for the path the fit then takes.
+Measured and rejected as remedies (#2975): the curvature at the optimum itself used from the
+start (no faster), a scale bounded below by the diagonal Newton step (fixes these three, slows
+others more), seeding L-BFGS with the full exact start Hessian (slower, and its bound handling
+broke fits), and a closed-form Newton step on every variance before the start (fixes them in
+iterations, costs more wall time on the larger models than it saves). `optimizer = trust_region`
+— a Newton method that re-forms the exact Hessian every iteration ([How `trust_region`
+works](optimizers.qmd#trust-region-method)) — is not affected: 17, 19 and 39 iterations on the
+three.
 
 ## Bounds
 

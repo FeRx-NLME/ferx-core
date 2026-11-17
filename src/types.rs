@@ -10446,10 +10446,8 @@ pub struct FitOptions {
     /// RNG seed for the NPDE/NPD simulation. `None` falls back to a fixed
     /// default so the diagnostic is reproducible across invocations.
     pub npde_seed: Option<u64>,
-    /// Maximum CG iterations for the Steihaug subproblem solver (trust-region only).
-    /// `None` (default) uses a size-adaptive budget of `ceil(sqrt(n_params)).clamp(5, n_params)`,
-    /// which is 5 for typical NLME problems (n_params ≈ 7–15) and grows with model size.
-    /// `Some(n)` pins the budget to `n` — set to `50` to recover the previous fixed behaviour.
+    /// No effect since #2975: `optimizer = trust_region` solves its subproblem exactly on the
+    /// exact Hessian's eigenbasis. Kept so existing model files and callers still parse.
     pub steihaug_max_iters: Option<usize>,
     /// If true (default), use automatically detected mu-referencing to centre
     /// ETA starting points on the current population mean at each outer step.

@@ -6896,9 +6896,9 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
     // A quadrature stage minimises the AGQ marginal, and every optimizer reaches it through
     // `pop_nll_opts`. Only the *gradient* differs: `optimize_nlopt` and `optimize_bfgs` both
     // go through `population_gradient`, which branches on `agq_nodes()` and hands the job to
-    // `agq::agq_population_gradient`. The trust-region path has its own `Gradient` impl
-    // (`trust_region::FoceiProblem`) with no such branch — it returns the FOCE/Laplace
-    // closed form regardless.
+    // `agq::agq_population_gradient`. The trust-region path forms its own exact gradient and
+    // Hessian (`covariance::exact_candidate_hessian`, and BHHH from
+    // `trust_region::FoceiProblem` as a fallback) with no such branch.
     //
     // That mismatch does not fail loudly. `FitOptions::agq_nodes` and `population_gradient`
     // both spell out what it does instead: "an outer loop minimising the AGQ objective while
@@ -7258,19 +7258,6 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
-    }
-
-    // The trust-region outer optimizer does not thread kappas through its OFV.
-    if model.n_kappa > 0 && options.optimizer == Optimizer::TrustRegion {
-        diags.push(
-            Diagnostic::error(
-                "E_OPTIMIZER_IOV",
-                "optimizer = trust_region does not support IOV (n_kappa > 0). \
-                 Use optimizer = bobyqa, slsqp, lbfgs, nlopt_lbfgs, mma, or bfgs \
-                 for models with kappa declarations.",
-            )
-            .with_block("fit_options"),
-        );
     }
 
     diags

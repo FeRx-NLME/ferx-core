@@ -1376,7 +1376,7 @@ pub(crate) fn exact_candidate_derivatives(
 
 /// [`exact_candidate_derivatives`] with the dense curvature block: the exact gradient along
 /// `axes` and `∂²OFV/∂x_a∂x_b` for `a, b ∈ axes` (in `axes` order), both at the same tightly
-/// reconverged modes. What the #2975 curvature scaling reads the full start-point R from.
+/// reconverged modes. What `optimizer = trust_region` models each iterate with (#2975).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn exact_candidate_hessian(
     model: &CompiledModel,

@@ -777,43 +777,13 @@ fn freeze_flat_thetas(
         let curvature = curvature_scaling
             .then(|| {
                 let mut per_axis = vec![None; x.len()];
-                // EXPERIMENT (#2975): `FERX_SCALE_SCHEME=marginal` reads the full exact block
-                // and scales each axis by √[(|R|⁻¹)ₐₐ] (|R| = V|Λ|Vᵀ).
-                let marginal = std::env::var("FERX_SCALE_SCHEME").as_deref() == Ok("marginal");
-                let full_block = marginal
-                    .then(|| {
-                        crate::estimation::covariance::exact_candidate_hessian(
-                            model,
-                            population,
-                            init_params,
-                            &x,
-                            &ehs,
-                            options,
-                            &free_axes,
-                        )
-                    })
-                    .flatten();
-                match (&all_axes, &full_block) {
-                    (_, Some((_, hb))) => {
-                        let eig = nalgebra::SymmetricEigen::new(hb.clone());
-                        let lmax = eig.eigenvalues.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-                        let inv_abs = eig.eigenvalues.map(|l| 1.0 / l.abs().max(1e-10 * lmax));
-                        let hinv = &eig.eigenvectors
-                            * nalgebra::DMatrix::from_diagonal(&inv_abs)
-                            * eig.eigenvectors.transpose();
-                        for (k, &a) in free_axes.iter().enumerate() {
-                            per_axis[a] = Some(1.0 / hinv[(k, k)]);
-                        }
-                        if options.verbose {
-                            eprintln!("Outer scaling (marginal): full exact block used");
-                        }
-                    }
-                    (Some(d), None) => {
+                match &all_axes {
+                    Some(d) => {
                         for (&a, &(_, h)) in free_axes.iter().zip(d) {
                             per_axis[a] = Some(h);
                         }
                     }
-                    (None, None) => {
+                    None => {
                         let f0 = objective(base_ofv(), &params, &base_stats);
                         for &a in &free_axes {
                             let identity =

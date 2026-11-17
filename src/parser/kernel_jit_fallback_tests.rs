@@ -846,8 +846,12 @@ fn an_ode_expression_scale_on_an_individual_parameter_plans_without_fallback() {
     let model = TWO_CPT_AMOUNTS;
     let data = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT\n1,0,1,1,.,100,100,1\n1,0.5,0,0,4.2931,0,0,1\n1,1.0,0,0,4.2024,0,0,1\n1,2.0,0,0,3.2577,0,0,1\n1,4.0,0,0,2.9236,0,0,1\n1,8.0,0,0,1.9541,0,0,1\n1,24.0,0,0,0.5111,0,0,1\n2,0,1,1,.,100,100,1\n2,0.5,0,0,3.9917,0,0,1\n2,1.0,0,0,3.9186,0,0,1\n2,2.0,0,0,3.6982,0,0,1\n2,4.0,0,0,2.7256,0,0,1\n2,8.0,0,0,1.8316,0,0,1\n2,24.0,0,0,0.5425,0,0,1\n3,0,1,1,.,100,100,1\n3,0.5,0,0,3.6904,0,0,1\n3,1.0,0,0,3.6348,0,0,1\n3,2.0,0,0,3.4465,0,0,1\n3,4.0,0,0,2.5276,0,0,1\n3,8.0,0,0,1.7090,0,0,1\n3,24.0,0,0,0.5245,0,0,1\n4,0,1,1,.,100,100,1\n4,0.5,0,0,4.2177,0,0,1\n4,1.0,0,0,4.1315,0,0,1\n4,2.0,0,0,3.1948,0,0,1\n4,4.0,0,0,2.8741,0,0,1\n4,8.0,0,0,1.9235,0,0,1\n4,24.0,0,0,0.5066,0,0,1\n5,0,1,1,.,100,100,1\n5,0.5,0,0,3.9164,0,0,1\n5,1.0,0,0,3.8477,0,0,1\n5,2.0,0,0,3.6353,0,0,1\n5,4.0,0,0,2.6761,0,0,1\n5,8.0,0,0,1.8009,0,0,1\n5,24.0,0,0,0.5380,0,0,1\n6,0,1,1,.,100,100,1\n6,0.5,0,0,4.4438,0,0,1\n6,1.0,0,0,3.5639,0,0,1\n6,2.0,0,0,3.3836,0,0,1\n6,4.0,0,0,3.0226,0,0,1\n6,8.0,0,0,1.6784,0,0,1\n6,24.0,0,0,0.5200,0,0,1";
     let (m, p) = from_text(model, data);
+    // 40, not 25 (#2975): both Ω collapse onto their floor here and θ end on their bounds, a
+    // crawl the curvature-scaled L-BFGS takes ~230 evaluations over (Linux x86_64) against the
+    // magnitude rules' ~80 — over the 25 × 8 = 200 the old budget allowed. The test is about
+    // the plan, not the optimizer's speed; 40 × 8 = 320 leaves ~40% headroom.
     let o = FitOptions {
-        outer_maxiter: 25,
+        outer_maxiter: 40,
         ..opts(EstimationMethod::FoceI)
     };
     let fit = crate::api::fit(&m, &p, &m.default_params, &o).expect("fit");

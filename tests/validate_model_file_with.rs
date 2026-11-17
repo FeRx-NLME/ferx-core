@@ -177,20 +177,24 @@ fn selection_override_reaches_the_data_read() {
     }
 }
 
-/// `check_model_options` reads the merged options: trust-region cannot carry an
-/// IOV model's kappas.
+/// `check_model_options` reads the merged options: trust-region does not route the
+/// quadrature objective's gradient (`E_OPTIMIZER_AGQ`), so the refusal appears only when the
+/// overrides combine `method = laplace` with `optimizer = trust_region`.
 #[test]
 fn optimizer_override_reaches_check_model_options() {
     let file_only = validate_model_file_with(IOV_MODEL, None, &[]);
     assert!(
-        !error_codes(&file_only).contains(&"E_OPTIMIZER_IOV"),
+        !error_codes(&file_only).contains(&"E_OPTIMIZER_AGQ"),
         "{:#?}",
         file_only.diagnostics
     );
-    let overridden =
-        validate_model_file_with(IOV_MODEL, None, &pairs(&[("optimizer", "trust_region")]));
+    let overridden = validate_model_file_with(
+        IOV_MODEL,
+        None,
+        &pairs(&[("method", "laplace"), ("optimizer", "trust_region")]),
+    );
     assert!(
-        error_codes(&overridden).contains(&"E_OPTIMIZER_IOV"),
+        error_codes(&overridden).contains(&"E_OPTIMIZER_AGQ"),
         "{:#?}",
         overridden.diagnostics
     );

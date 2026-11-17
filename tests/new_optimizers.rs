@@ -265,43 +265,39 @@ fn gn_tr_warmstart_returns_finite_ofv() {
     );
 }
 
-/// Verify that the pre-warm cache change in `cost()` is transparent end-to-end:
-/// after the refactor, `gradient()` is called on the same x that `cost()` just
-/// evaluated (partial hit path), and the result must still be a finite, non-NaN OFV.
-/// Uses a very low `outer_maxiter` so this runs fast on every PR.
+/// The exact-Hessian trust region (#2975) returns a finite, non-NaN fit after a handful
+/// of iterations, through the exact gradient and Hessian and the final EBE check.
 #[test]
-fn trust_region_cost_prewarm_cache_is_transparent() {
+fn trust_region_returns_a_finite_fit_after_a_few_iterations() {
     let (model, population) = data_and_model();
     let mut opts = base_options();
     opts.optimizer = Optimizer::TrustRegion;
-    opts.steihaug_max_iters = Some(5);
     opts.outer_maxiter = 5;
-    let result = fit(&model, &population, &model.default_params, &opts)
-        .expect("trust_region must not panic with cost() pre-warm cache");
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("trust_region must return");
     assert!(
         result.ofv.is_finite(),
-        "OFV must be finite after cost() pre-warm, got {}",
+        "OFV must be finite, got {}",
         result.ofv
     );
     assert!(
         !result.theta.iter().any(|x| x.is_nan()),
-        "theta must not contain NaN after cost() pre-warm"
+        "theta must not contain NaN"
     );
 }
 
+/// `steihaug_max_iters` still parses but no longer has an effect (#2975): the trust region
+/// solves its subproblem exactly, so the same fit with and without it is bit-identical.
 #[test]
-fn steihaug_max_iters_is_respected_by_trust_region() {
-    // A very small steihaug_max_iters degrades step quality but should still
-    // return a valid FitResult without crashing. Catches regressions in the
-    // wiring from FitOptions to the argmin Steihaug subsolver.
+fn steihaug_max_iters_has_no_effect_on_the_trust_region() {
     let (model, population) = data_and_model();
     let mut opts = base_options();
     opts.optimizer = Optimizer::TrustRegion;
-    opts.steihaug_max_iters = Some(2); // intentionally aggressive
-    opts.outer_maxiter = 30;
-    let result = fit(&model, &population, &model.default_params, &opts)
-        .expect("trust_region with tight CG budget must still return");
-    assert!(result.ofv.is_finite());
+    opts.outer_maxiter = 5;
+    let plain = fit(&model, &population, &model.default_params, &opts).expect("fit");
+    opts.steihaug_max_iters = Some(2);
+    let pinned = fit(&model, &population, &model.default_params, &opts).expect("fit");
+    assert_eq!(plain.ofv.to_bits(), pinned.ofv.to_bits());
 }
 
 /// IOV analytical gradient path: fit() on warfarin_iov with method=focei and
@@ -420,19 +416,11 @@ fn flat_theta_is_frozen_and_fit_proceeds() {
 /// report `converged` at all, which before the fix came for free from any `Ok(_)`
 /// and now depends on the no-progress stopping rule firing.
 ///
-/// Warfarin under `foce` settles at iteration 59, well inside this budget, so
-/// reaching `maxiter` here would itself be the regression. The OFV is checked
-/// against the optimizer `auto` picks for the same options rather than a
-/// hardcoded constant, so the anchor cannot drift out of step with the objective
-/// these options select.
-///
-/// `foce` specifically: on the `focei` objective this same fit settles 4.1 OFV
-/// units above what `auto` reaches (−281.88 vs −286.00) — a genuine stall at a
-/// non-stationary point, which is
-/// [#864](https://github.com/FeRx-NLME/ferx-core/issues/864) and not what #1000
-/// is about. `trust_region` reports "converged" for a stall the same way the
-/// NLopt optimizers report their own `xtol`/`ftol` stops; what #1000 fixed is the
-/// separate case of *budget exhaustion* being labelled converged.
+/// Since #2975 the trust region is a Newton method on the exact Hessian and stops on the
+/// exact Newton decrement: warfarin under `focei` settles in ~10 iterations, so reaching
+/// `maxiter` would itself be the regression. The OFV is checked against the optimizer `auto`
+/// picks for the same options rather than a hardcoded constant, and the bound is 1e-3 — the
+/// BHHH trust region it replaced settled 4.1 OFV units above `auto` on this objective (#864).
 #[test]
 #[cfg_attr(
     not(feature = "slow-tests"),
@@ -441,7 +429,7 @@ fn flat_theta_is_frozen_and_fit_proceeds() {
 fn trust_region_reports_converged_when_it_settles() {
     let (model, population) = data_and_model();
     let mut opts = base_options();
-    opts.method = EstimationMethod::Foce;
+    opts.method = EstimationMethod::FoceI;
     opts.optimizer = Optimizer::TrustRegion;
     opts.outer_maxiter = 1000;
     let result = fit(&model, &population, &model.default_params, &opts)
@@ -469,15 +457,46 @@ fn trust_region_reports_converged_when_it_settles() {
     // BOBYQA is an improvement, not a regression, and must not turn the nightly
     // job red — so only the shortfall is bounded.
     let mut ref_opts = base_options();
-    ref_opts.method = EstimationMethod::Foce;
+    ref_opts.method = EstimationMethod::FoceI;
     ref_opts.optimizer = Optimizer::Auto;
     ref_opts.outer_maxiter = 1000;
     let reference = fit(&model, &population, &model.default_params, &ref_opts)
         .expect("reference fit must succeed");
     assert!(
-        result.ofv < reference.ofv + 0.05,
+        result.ofv < reference.ofv + 1e-3,
         "trust_region reported converged at OFV {} but the default optimizer reaches {}",
         result.ofv,
+        reference.ofv
+    );
+}
+
+/// #2975, Tier 3: `trust_region` on an IOV model. Its objective, exact Hessian and final EBE
+/// check carry κ̂, so it must land at the default optimizer's optimum (one-sided, 1e-3). On
+/// the #2975 benchmark it took 8 iterations on `warfarin_iov` against L-BFGS's ~47.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn trust_region_reaches_the_default_optimum_on_an_iov_model() {
+    let model =
+        ferx_core::parser::model_parser::parse_model_file(Path::new("examples/warfarin_iov.ferx"))
+            .expect("warfarin_iov model must parse");
+    let population =
+        ferx_core::read_nonmem_csv(Path::new("data/warfarin_iov.csv"), None, Some("OCC"))
+            .expect("warfarin_iov data must load");
+    let mut opts = base_options();
+    opts.method = EstimationMethod::FoceI;
+    opts.optimizer = Optimizer::TrustRegion;
+    opts.outer_maxiter = 300;
+    let tr = fit(&model, &population, &model.default_params, &opts).expect("trust_region fit");
+    assert!(tr.converged, "warnings {:?}", tr.warnings);
+    opts.optimizer = Optimizer::Auto;
+    let reference = fit(&model, &population, &model.default_params, &opts).expect("reference");
+    assert!(
+        tr.ofv < reference.ofv + 1e-3,
+        "trust_region {} vs default {}",
+        tr.ofv,
         reference.ofv
     );
 }

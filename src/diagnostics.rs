@@ -49,7 +49,6 @@
 //! | `E_SAEM_NO_RANDOM_EFFECTS`| `method = saem` anywhere in a chain on a model with `n_eta = 0` |
 //! | `E_METHOD_NO_RANDOM_EFFECTS` | `method = imp` / `impmap` / `bayes` anywhere in a chain on a model with `n_eta = 0` |
 //! | `W_GN_NO_RANDOM_EFFECTS`  | `method = gn` as the last estimating stage on a model with `n_eta = 0` (start-sensitive; prefer `gn_hybrid`) |
-//! | `E_OPTIMIZER_IOV`         | `optimizer = trust_region` used with an IOV model |
 //! | `E_OPTIMIZER_AGQ`         | `optimizer = trust_region` used with a quadrature stage (`laplace`, or `focei` with `n_agq > 1`) |
 //! | `E_SIGMA_ORDER_MISMATCH`  | a single-endpoint `[error_model]` names its sigmas in an order other than the `[parameters]` declaration order |
 //! | `E_BLOCK_VARIANCE_ONLY`   | a scale tag (`(sd)` / `(variance)` / `(var)`) on a `block_omega` / `block_sigma` / `block_kappa` declaration, whose lower triangle mixes variances and covariances and so takes no single scale. The repair depends on which tag was written and rides along in `suggestion`: an `(sd)` author squares each SD into a variance and writes the off-diagonals as covariances; a `(variance)` / `(var)` author deletes the tag, which claimed nothing the lower triangle did not already say (#1377) |
