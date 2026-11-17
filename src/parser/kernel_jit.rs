@@ -1291,9 +1291,7 @@ pub(crate) fn derivs(
 }
 
 #[allow(clippy::type_complexity)]
-/// [`derivs`] without noting a failure against the model: for a caller with an exact fallback of
-/// its own (the covariance Hessian's mu fold, #2982), for which a failed recording is no FD route.
-pub(crate) fn derivs_of(
+fn derivs_of(
     x: &[f64],
     n_out: usize,
     second: bool,

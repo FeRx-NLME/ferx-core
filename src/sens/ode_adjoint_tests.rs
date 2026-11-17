@@ -5319,8 +5319,9 @@ fn closed_form_per_compartment_scale_matches_reconverged_fd() {
 
 // ---- covariance Hessian (`hessian::subject_adjoint_cov_hessian`) -------------------------
 
-/// The worst `|got − want|` relative to `want`'s largest entry. Every entry is asserted finite
-/// first: a `max` fold drops a `NaN`, so a diverged entry would otherwise pass green.
+/// The worst `|got − want|` relative to `want`'s largest entry. Every entry (and the scale it
+/// divides by) is asserted finite first: a `max` fold drops a `NaN`, so a diverged entry would
+/// otherwise pass green.
 pub(super) fn rel_gap(got: &[f64], want: &[f64]) -> f64 {
     assert_eq!(got.len(), want.len());
     let mut scale = 0.0f64;
@@ -5401,18 +5402,12 @@ pub(super) fn hessian_gaps_for(
     let eta = ebe(&params);
     // On a thread with the fit pool's worker stack (`FIT_RAYON_STACK_SIZE`), where
     // production runs the nested-dual passes; a test thread's default 2 MB is too small.
-    // `(per_direction, axes_off, fold_off)`: a reverse per direction (which runs one plan lane
-    // per direction), or forward over reverse with the plans on one lane per direction, on
-    // their input axes, or on their input axes with the mu-folded θ on the η lanes
-    // (production).
-    let hessian = |per_direction: bool, axes_off: bool, fold_off: bool| {
+    let hessian = |per_direction: bool| {
         std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .stack_size(crate::FIT_RAYON_STACK_SIZE)
                 .spawn_scoped(scope, || {
                     super::hessian::REVERSE_PER_DIRECTION.with(|c| c.set(per_direction));
-                    super::hessian::PLAN_AXES_OFF.with(|c| c.set(axes_off));
-                    super::hessian::MU_FOLD_OFF.with(|c| c.set(fold_off));
                     subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), objective)
                 })
                 .expect("spawn")
@@ -5421,30 +5416,21 @@ pub(super) fn hessian_gaps_for(
         })
         .expect("subject must be in adjoint scope")
     };
-    // Three assemblies of the same second derivatives (#2980), which differ by the
-    // accumulation order only, so every fixture of this oracle is also their parity check:
-    // forward over reverse on the plans' input axes (production) and on one plan lane per
-    // direction, each against reverse over forward, one reverse per direction.
-    // Forward over reverse, one lane per direction: measured over the oracle's 63 fixture runs
-    // (closed form, ODE, SDE, IOV, NN, steady state, non-Gaussian terms; FOCE, FOCEI, Laplace,
-    // AGQ) worst 2.1e-14 relative to the largest entry, so `1e-12` leaves ~50x headroom. A
-    // dropped lane-glue term (θ's `d²θ/dx²`, a value lane read for a tangent) moved an entry by
-    // 6e-2 to 2.7e-1 of the matrix (mutation-checked).
-    let h = hessian(false, false, false);
-    let h_axes = hessian(false, false, true);
-    let h_lanes = hessian(false, true, true);
-    let h_rof = hessian(true, true, true);
-    let gap = |a: &DMatrix<f64>, what: &str| {
-        let worst = rel_gap(a.as_slice(), h_rof.as_slice());
-        eprintln!("hessian: {what} vs a reverse per direction {worst:.2e}");
-        assert!(
-            worst < 1e-12,
-            "{what} vs a reverse per direction: {worst:.2e}"
-        );
-    };
-    gap(&h_lanes, "forward over reverse");
-    gap(&h_axes, "forward over reverse on the input axes");
-    gap(&h, "forward over reverse on the input axes, mu-folded");
+    // Forward over reverse (production) against reverse over forward, one reverse per
+    // direction (#2980): the same second derivatives of the same programs, so they differ by
+    // the accumulation order only. Every fixture of this oracle is also that parity check.
+    // Measured over its 63 fixture runs (closed form, ODE, SDE, IOV, NN, steady state,
+    // non-Gaussian terms; FOCE, FOCEI, Laplace, AGQ): worst 2.1e-14 relative to the largest
+    // entry, so `1e-12` leaves ~50x headroom. A dropped lane-glue term (θ's `d²θ/dx²`, a value
+    // lane read for a tangent) moves an entry by O(1) of the matrix.
+    let h = hessian(false);
+    let h_rof = hessian(true);
+    let worst_for = rel_gap(h.as_slice(), h_rof.as_slice());
+    eprintln!("hessian: forward over reverse vs a reverse per direction {worst_for:.2e}");
+    assert!(
+        worst_for < 1e-12,
+        "forward over reverse vs a reverse per direction: {worst_for:.2e}"
+    );
     let n = x.len();
     assert_eq!((h.nrows(), h.ncols()), (n, n));
     let mut fd = DMatrix::<f64>::zeros(n, n);
@@ -5630,11 +5616,9 @@ fn with_fit_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
 /// `subject_adjoint_cov_diag_at` is the full Hessian's diagonal along `axes`, in `axes`
 /// order: on a five-effect subject (bucket 6) under FOCEI, FOCE and Laplace's exact anchor
 /// (bucket 8), with the axes out of order and spanning θ, Ω and σ. Each entry is the same
-/// second derivative on either route, but the prediction plans run on the input axes the
-/// pass's directions move (#2980), and a diagonal along four axes moves fewer of them than the
-/// full Hessian, so the two sum their lanes in a different order: measured worst 9.2e-16
-/// relative (it was bit-identical while every plan ran one lane per direction); `1e-13`
-/// leaves 100x. An axis past `x` is refused.
+/// lane of the same sweep on either route, read along its own direction only, so the
+/// diagonal is the full Hessian's to the bit: measured worst 0 on Linux. An axis past `x`
+/// is refused.
 #[test]
 fn cov_diag_on_axes_is_the_full_hessians_diagonal() {
     let five = parse_model_string(&one_cpt_oral_n_eta(5)).unwrap();
@@ -5678,7 +5662,7 @@ fn cov_diag_on_axes_is_the_full_hessians_diagonal() {
         }
     }
     eprintln!("axes diagonal vs full Hessian: worst rel {worst:.2e}");
-    assert!(worst < 1e-13, "{worst:.2e}");
+    assert!(worst == 0.0, "{worst:.2e}");
     let eta = ebe_for(&five, &s, &params, 1e-10, true);
     let past = [x.len()];
     assert!(
@@ -5691,10 +5675,8 @@ fn cov_diag_on_axes_is_the_full_hessians_diagonal() {
 /// `subject_adjoint_cov_block_at` is the full Hessian's dense sub-block over `axes`, rows and
 /// columns in `axes` order (#2109): same subject, objectives and out-of-order axes as the
 /// diagonal's test, plus the off-diagonal pairs the diagonal never reads. Each entry is the
-/// same second derivative on either route, summed over the plans' input-axis lanes in an order
-/// that depends on which axes the pass moves (#2980): measured worst 1.5e-15 relative
-/// (bit-identical before the plans ran on input axes); `1e-13` leaves ~70x. An axis past `x`
-/// is refused. Dies
+/// same lane of a sweep along the same direction on either route, so the block is the full
+/// Hessian's to the bit: measured worst 0 (macOS arm64). An axis past `x` is refused. Dies
 /// when the block is read in sorted rather than `axes` order. Not when the η tangent is
 /// dropped: the full Hessian shares that code, so the profile's C2 and C4 are its oracle.
 #[test]
@@ -5742,7 +5724,7 @@ fn cov_block_on_axes_is_the_full_hessians_block() {
         }
     }
     eprintln!("axes block vs full Hessian: worst rel {worst:.2e}");
-    assert!(worst < 1e-13, "{worst:.2e}");
+    assert!(worst == 0.0, "{worst:.2e}");
     let eta = ebe_for(&five, &s, &params, 1e-10, true);
     assert!(
         subject_adjoint_cov_block_at(
@@ -5764,8 +5746,6 @@ fn cov_block_on_axes_is_the_full_hessians_block() {
 /// a network (`check_profiled_levels` does not refuse one), so this is the route its
 /// covariance step reads (#2417 review row 5). The counter shows the reduced basis did not
 /// run for the block. Dies when a block reaches `NnReduction::hessian` (its `unreachable!`).
-/// The two routes sum the plans' input-axis lanes in different orders (#2980): measured worst
-/// 4.3e-15 relative; `1e-13` leaves ~20x.
 #[cfg(feature = "nn")]
 #[test]
 fn cov_block_on_a_covariate_nn_subject_is_the_full_hessians_block() {
@@ -5801,7 +5781,7 @@ fn cov_block_on_a_covariate_nn_subject_is_the_full_hessians_block() {
         }
     }
     eprintln!("covariate NN: block vs full Hessian {worst:.2e}");
-    assert!(worst < 1e-13, "{worst:.2e}");
+    assert!(worst == 0.0, "{worst:.2e}");
 }
 
 /// The diagonal on a `[covariate_nn]` subject goes through the networks' reduced basis
@@ -5917,12 +5897,12 @@ fn cov_hessian_matches_profile_fd_closed_form_focei_and_foce() {
     assert!(fd < 1e-5, "FOCE vs FD {fd:.2e}");
 }
 
-/// `psi_along` spends its directions over narrower passes under `PASS_WIDTH_CAP`. Each
-/// column must still land on its own
-/// direction: width 3 over 7 packed axes leaves a ragged last pass, so an offset taken from
-/// the pass's own width rather than the planned one misplaces columns. Measured: bit-identical
-/// at widths 1 and 3 (a column's arithmetic does not see the other tangents); a misplaced
-/// column moves the matrix by O(1) of its largest entry.
+/// `psi_along` spends its directions over passes of `MAX_PASS` (2), or narrower under
+/// `PASS_WIDTH_CAP`. Each column must still land on its own direction: width 2 over 7 packed
+/// axes leaves a ragged last pass, so an offset taken from the pass's own width rather than the
+/// planned one misplaces columns; width 1 has none, and is the reference. Measured:
+/// bit-identical (a column's arithmetic does not see the other tangents); a misplaced column
+/// moves the matrix by O(1) of its largest entry.
 #[test]
 fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
     use super::hessian::PASS_WIDTH_CAP;
@@ -5941,7 +5921,7 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
     assert_eq!(
         x.len(),
         7,
-        "the fixture must leave a ragged last pass at width 3"
+        "the fixture must leave a ragged last pass at width 2"
     );
     let eta = ebe_for(&one, &s, &params, 1e-12, true);
     let run = |cap: Option<usize>| {
@@ -5966,7 +5946,8 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
         .expect("in scope")
     };
     let full = run(None);
-    for cap in [1, 3] {
+    {
+        let cap = 1;
         let narrow = run(Some(cap));
         let scale = full.iter().fold(0.0f64, |m, v| m.max(v.abs()));
         let mut worst = 0.0f64;
@@ -5977,8 +5958,8 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
             );
             worst = worst.max((a - b).abs() / scale);
         }
-        eprintln!("cov Hessian at width {cap} vs 8: {worst:.2e}");
-        assert!(worst < 1e-12, "width {cap} vs 8: {worst:.2e}");
+        eprintln!("cov Hessian at width {cap} vs 2: {worst:.2e}");
+        assert!(worst < 1e-12, "width {cap} vs 2: {worst:.2e}");
     }
 }
 
@@ -11801,185 +11782,4 @@ fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
     );
     assert!(ran >= 60, "only {ran} subjects ran");
     assert!(declined.is_empty(), "declined:\n{}", declined.join("\n"));
-}
-
-/// What the covariance Hessian's plans cost (#2980, #2982), pinned beside what they compute: on
-/// a log-normal one-compartment model (`n = 7` packed axes: three θ, three Ω, σ; `N = 3`) the
-/// directions go in two passes of width 4 (the second padded), and each pass's plan runs on its
-/// 3 η lanes alone — Ω and σ reach a plan only through η, and the three θ fold onto η (each is
-/// `log`-mu-referenced and read nowhere else). Without the fold every θ some direction moves
-/// keeps a lane in every pass (each pass's columns are read along all directions), 3 + 3 = 6,
-/// more than the pass's 4, so the plan runs one lane per direction. The Hessians agree (the FD
-/// oracle above holds each to the reverse per direction).
-///
-/// Mutations: Ω or σ given a plan lane (`PlanDirs::new` filtering on a moved η only: one lane
-/// per direction); the fold skipped (4 lanes); `PlanDirs` always one lane per direction (4).
-#[test]
-fn the_plans_run_on_the_eta_lanes_of_a_mu_referenced_model() {
-    use super::hessian::{MU_FOLD_OFF, PLAN_AXES_OFF, PLAN_LANES};
-    let one = parse_model_string(ONE_CPT_ORAL).unwrap();
-    let s = subject(
-        &one,
-        vec![
-            DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
-            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
-        ],
-        &TIMES,
-        &[0.1, -0.05, 0.2],
-    );
-    let params = moved_params(&one);
-    let x = pack_params(&params);
-    assert_eq!(x.len(), 7, "premise: three θ, three Ω, σ");
-    let eta = ebe_for(&one, &s, &params, 1e-12, true);
-    let lanes = |axes_off: bool, fold_off: bool| {
-        std::thread::scope(|scope| {
-            std::thread::Builder::new()
-                .stack_size(crate::FIT_RAYON_STACK_SIZE)
-                .spawn_scoped(scope, || {
-                    PLAN_AXES_OFF.with(|c| c.set(axes_off));
-                    MU_FOLD_OFF.with(|c| c.set(fold_off));
-                    PLAN_LANES.with(|v| v.borrow_mut().clear());
-                    super::hessian::FOLD_CHECK_WORST.with(|c| c.set(0.0));
-                    let h = subject_adjoint_cov_hessian(
-                        &one,
-                        &s,
-                        &params,
-                        &x,
-                        eta.as_slice(),
-                        Objective::Focei,
-                    )
-                    .expect("in scope");
-                    let check = super::hessian::FOLD_CHECK_WORST.with(std::cell::Cell::get);
-                    (h, PLAN_LANES.with(|v| v.borrow().clone()), check)
-                })
-                .expect("spawn")
-                .join()
-                .expect("join")
-        })
-    };
-    let (h_fold, runs, check) = lanes(false, false);
-    assert!(!runs.is_empty(), "no plan ran along a pass");
-    assert!(runs == [(3, 4), (3, 4)], "folded: {runs:?}");
-    // The fold's adjoint check (θ's value adjoint against the η adjoints along `∂μ/∂θ`) on a
-    // genuine fold: the same sum two ways. Measured CHECK_MEASURED; its bound, 1e-8, is far above.
-    eprintln!("fold adjoint check, worst relative gap {check:.2e}");
-    assert!(
-        check.is_finite() && check < 1e-12,
-        "fold adjoint check: {check:.2e}"
-    );
-    let (h_axes, runs, _) = lanes(false, true);
-    assert!(runs == [(4, 4), (4, 4)], "axes: {runs:?}");
-    let (h_global, runs, _) = lanes(true, true);
-    assert!(runs == [(4, 4), (4, 4)], "one lane per direction: {runs:?}");
-    for (what, h) in [("folded", &h_fold), ("axes", &h_axes)] {
-        let worst = rel_gap(h.as_slice(), h_global.as_slice());
-        assert!(
-            worst < 1e-12,
-            "{what} vs one lane per direction: {worst:.2e}"
-        );
-    }
-}
-
-/// The mu fold's runtime guard (#2982): where the parameter program does not reproduce
-/// `g⁻¹(μ + η)` at the subject's η, the fold is declined and the plans keep their unfolded
-/// lanes — so a line the parse misjudges can cost a lane, never a wrong Hessian. The spec here
-/// is the parse's with every line's link swapped to identity (`μ = P(θ, 0)`, finite, so only the
-/// guard can refuse it: `θ·e^η` is not `θ + η`); the Hessian must still be the one-lane-per-
-/// direction one.
-///
-/// Mutations: the guard's comparison dropped (the folded lanes then carry `∂μ/∂θ` of the wrong
-/// link and the Hessian moves by O(1)); the guard checking the current η only (the η = 0 case
-/// passes it).
-#[test]
-fn a_fold_the_program_does_not_reproduce_is_declined() {
-    use super::hessian::{PLAN_AXES_OFF, PLAN_LANES};
-    let mut one = parse_model_string(ONE_CPT_ORAL).unwrap();
-    for line in &mut one.indiv_param_partials.mu_fold.lines {
-        line.2 = crate::types::MuTransform::Identity;
-    }
-    let s = subject(
-        &one,
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        &TIMES,
-        &[0.1, -0.05, 0.2],
-    );
-    let params = moved_params(&one);
-    let x = pack_params(&params);
-    // At the mode, and at η = 0, where the identity holds for any link (`P(θ, 0) = μ`) and only
-    // the guard's second, moved point can refuse it.
-    let mode = ebe_for(&one, &s, &params, 1e-12, true);
-    for (what, eta) in [("η̂", mode.as_slice().to_vec()), ("η = 0", vec![0.0; 3])] {
-        let run = |axes_off: bool| {
-            with_fit_stack(|| {
-                PLAN_AXES_OFF.with(|c| c.set(axes_off));
-                PLAN_LANES.with(|v| v.borrow_mut().clear());
-                let h = subject_adjoint_cov_hessian(&one, &s, &params, &x, &eta, Objective::Focei)
-                    .expect("in scope");
-                (h, PLAN_LANES.with(|v| v.borrow().clone()))
-            })
-        };
-        let (h, runs) = run(false);
-        assert!(
-            runs == [(4, 4), (4, 4)],
-            "{what}: the fold should be declined (one lane per direction, not 3 η lanes): {runs:?}"
-        );
-        let (h_global, _) = run(true);
-        let worst = rel_gap(h.as_slice(), h_global.as_slice());
-        assert!(
-            worst < 1e-12,
-            "{what}: declined fold vs one lane per direction: {worst:.2e}"
-        );
-    }
-}
-
-/// The fold's adjoint check (#2982): a θ the spec folds but the plan also reads another way —
-/// here through a local the right-hand side reads, which the parse correctly refuses to fold and
-/// the spec is tampered to fold anyway — must not give a Hessian. The plan's θ adjoint then
-/// differs from the η adjoints along `∂μ/∂θ` by the other route, and the subject declines (its
-/// term is left to the covariance step's per-subject salvage). Untampered, the same subject is
-/// served.
-///
-/// Mutation: the check removed (the tampered fold then returns a Hessian missing the route).
-#[test]
-fn a_fold_the_plan_contradicts_declines_the_subject() {
-    let src = ONE_CPT_ORAL_ODE
-        .replace(
-            "  KA = TVKA\n",
-            "  KA = TVKA * exp(ETA_KA)\n  K2 = 0.001 * TVCL\n",
-        )
-        .replace(
-            "  omega ETA_V ~ 0.06\n",
-            "  omega ETA_V ~ 0.06\n  omega ETA_KA ~ 0.2\n",
-        )
-        .replace(
-            "d/dt(central) = KA * depot - (CL/V) * central",
-            "d/dt(central) = KA * depot - (CL/V) * central - K2 * central",
-        );
-    let honest = parse_model_string(&src).unwrap();
-    let tvcl = honest.theta_names.iter().position(|n| n == "TVCL").unwrap();
-    assert!(
-        !honest.indiv_param_partials.mu_fold.thetas.contains(&tvcl),
-        "premise: the parse refuses to fold TVCL (K2 reads it)"
-    );
-    let mut tampered = parse_model_string(&src).unwrap();
-    tampered.indiv_param_partials.mu_fold.thetas.push(tvcl);
-    let s = subject(
-        &honest,
-        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
-        &TIMES,
-        &[0.1, -0.05, 0.2],
-    );
-    let params = moved_params(&honest);
-    let x = pack_params(&params);
-    let eta = ebe_for(&honest, &s, &params, 1e-12, true);
-    let h = |m: &CompiledModel| {
-        with_fit_stack(|| {
-            subject_adjoint_cov_hessian(m, &s, &params, &x, eta.as_slice(), Objective::Focei)
-        })
-    };
-    assert!(h(&honest).is_some(), "the honest model is served");
-    assert!(
-        h(&tampered).is_none(),
-        "a fold the plan contradicts must decline, not return a Hessian"
-    );
 }

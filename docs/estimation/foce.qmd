@@ -539,7 +539,7 @@ The covariance is `2·H⁻¹`, where `H` is the Hessian of the objective. There 
 
 #### Sensitivity assembly
 
-The **analytic R-matrix** (`analytic_cov_hessian = true`, the default since [#436](https://github.com/FeRx-NLME/ferx-core/issues/436)) assembles `H` exactly, differencing nothing. Since #486 it is the adjoint gradient's identity one order up: at the mode, `Ψ = F − wᵀ∇_η l` (`w = H⁻¹∇_η F`) is stationary in `η`, so the profile Hessian is the second derivative of that one scalar along the mode's tangent directions, `Uᵀ∇²Ψ U` with `U = [I; dη̂/dx]`. It is assembled by forward over reverse through the same recorder and likelihood kernel the gradient uses: per pass of four tangent directions, one forward and one reverse sweep that carries every adjoint's tangents along them give their four Hessian columns ([#2980](https://github.com/FeRx-NLME/ferx-core/issues/2980); one more pass, swept once per output, gives `∇_η F`, `H` and `dη̂/dx`), with the predictions carrying an inner η-dual for `∂f/∂η` (and `∂²f/∂η²` under Laplace's exact anchor). All passes run at the converged point, with no inner re-solve and no finite-difference step.
+The **analytic R-matrix** (`analytic_cov_hessian = true`, the default since [#436](https://github.com/FeRx-NLME/ferx-core/issues/436)) assembles `H` exactly, differencing nothing. Since #486 it is the adjoint gradient's identity one order up: at the mode, `Ψ = F − wᵀ∇_η l` (`w = H⁻¹∇_η F`) is stationary in `η`, so the profile Hessian is the second derivative of that one scalar along the mode's tangent directions, `Uᵀ∇²Ψ U` with `U = [I; dη̂/dx]`. It is assembled by forward over reverse through the same recorder and likelihood kernel the gradient uses: per pass of two tangent directions, one forward and one reverse sweep that carries every adjoint's tangents along them give their two Hessian columns ([#2980](https://github.com/FeRx-NLME/ferx-core/issues/2980); one more pass, swept once per output, gives `∇_η F`, `H` and `dη̂/dx`), with the predictions carrying an inner η-dual for `∂f/∂η` (and `∂²f/∂η²` under Laplace's exact anchor). All passes run at the converged point, with no inner re-solve and no finite-difference step.
 
 Event times that move with the parameters are inside it too: an estimated `LAGTIME`, a per-route `lag=`, a modeled infusion duration `D{n}`. The ODE walk crosses each moving event exactly, by flowing the state over the event's (dual) shift on either side of the switch. That keeps the third-order derivatives the R-matrix needs exact, not only the gradient's. So is an `[odes]` `if` whose switching time moves with a parameter (#2649; see [ODE models](../model-file/ode-models.qmd)).
 
@@ -554,29 +554,6 @@ The measured effect where it does apply: on a 55-subject 2-state ODE FOCEI fit w
 ##### Moving dose events
 
 Where an axis moves a dose event — an estimated lag, a `zero_order` duration, `F` on an infusion — the step is bounded further, so that no observation, `EVID=2`, reset or dose record changes sides of the event between the two points of the pair: the subject's events are enumerated by the ODE engine's own break-time builder at both perturbed points and the step is shrunk until the pair is clear. Before that bound, `SE(TVLAG)` on a lagged-dose fixture moved 27 % with the step. A subject whose mode sits exactly on a moving event — a corner minimum of the inner objective, which a lagged arrival at a dense early sample does produce — has no third derivative there and declines to the per-subject salvage above rather than differencing across the corner ([#1505](https://github.com/FeRx-NLME/ferx-core/issues/1505)).
-
-#### Which directions reach the predictions {#hessian-plan-directions}
-
-The Hessian has a direction per packed coordinate, but the predictions — the costly part, an
-ODE solve or a closed-form walk per subject — see far fewer. Ω, σ and ρ reach them only
-through `η̂` (an SDE's EKF variance rows read σ directly, as a lane of their own), so a
-prediction plan runs along its own **input axes** — its η slots and the θ that move it —
-whenever those are fewer than the pass's four directions
-([#2980](https://github.com/FeRx-NLME/ferx-core/issues/2980)). Each
-direction's tangent is then a combination of those lanes, and the reverse adds back the
-Gauss–Newton term `Ȳ̇ᵀ·∂Y/∂input` from the lanes' own forward tangents, so nothing is
-approximated.
-
-A **mu-referenced** θ costs the predictions nothing either
-([#2982](https://github.com/FeRx-NLME/ferx-core/issues/2982)). When an individual parameter
-is `P = g⁻¹(A(θ, covariates) + η)` — `TVCL·exp(ETA_CL)`, `exp(log(TVCL) + ETA_CL)`,
-`inv_logit(LOGIT_F + ETA_F)`, `TVV + ETA_V`, a covariate power `TVCL·(WT/70)^TH_WT·exp(ETA_CL)`
-— and nothing else reads its η, a θ that reaches the likelihood *only* through such lines
-moves every prediction exactly as the η-direction `∂A/∂θ` does, so it rides on the η lanes:
-on a model with fewer than four random effects, a pass's plans run on the `N` random effects
-alone. A θ read anywhere else — an `[odes]` right-hand side, the error model,
-a line whose η is shared or scaled by a θ — keeps a lane of its own; a parameter block with a
-conditional statement takes no fold at all.
 
 #### Finite-difference fallback
 
