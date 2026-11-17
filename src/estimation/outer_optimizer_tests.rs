@@ -8868,6 +8868,66 @@ pub(crate) mod outer_fd_fallback {
     }
 
     // ── #1081: a `correlation` line's ρ is a direct-θ channel into `R` ─────────────
+
+    /// #2776: once the fit is cancelled, the reconverged FD gradients' probes are missing,
+    /// not solved. Their re-solves do not poll the flag, so before this the #2406 gate grew a
+    /// floored step through every one of them. On fixture A (`BETA` declared at `1e-4`, so
+    /// the gate runs), each of the three gradients returns the live gradient with no flag
+    /// and solves nothing (an all-zero gradient) with the flag already set.
+    #[test]
+    fn a_cancelled_fd_gradient_solves_no_probe() {
+        let (model, pop) = two_cpt_cov_beta(1e-4, 0.68 - 1e-4);
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let bounds = compute_bounds(params);
+        let live = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let flag = crate::cancel::CancelFlag::new();
+        flag.cancel();
+        let cancelled = FitOptions {
+            cancel: Some(flag),
+            ..live.clone()
+        };
+        crate::api::with_fit_scope(&live, || {
+            let mu = compute_mu_k(&model, &params.theta, live.mu_referencing);
+            let (ehs, _, _, kappas) =
+                run_inner_loop_warm(&model, &pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+            let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &live);
+            let priors = build_prior_set(&model, params);
+            let grads = |o: &FitOptions| {
+                [
+                    reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, o),
+                    reporting_fd_gradient(
+                        &x, params, &model, &pop, &ehs, &kappas, &bounds, o, &nn_reg, &priors,
+                    ),
+                    subject_reconverged_fd_gradient(
+                        &x,
+                        params,
+                        &model,
+                        &pop.subjects[0],
+                        &ehs[0],
+                        &bounds,
+                        o,
+                    ),
+                ]
+            };
+            let names = ["population", "reporting", "per-subject"];
+            for ((name, g), c) in names.iter().zip(grads(&live)).zip(grads(&cancelled)) {
+                assert!(
+                    g.iter().any(|v| *v != 0.0),
+                    "fixture: {name} gradient is live"
+                );
+                assert!(
+                    c.iter().all(|v| *v == 0.0),
+                    "{name}: a probe ran after the cancel: {c:?}"
+                );
+            }
+        })
+        .expect("the fit scope runs");
+    }
 }
 
 // ── #1934: the BHHH Newton decrement and the latch-time veto ───────────────────────
