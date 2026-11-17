@@ -1803,3 +1803,259 @@ pub(crate) fn run_loop_rev(
     }
     true
 }
+
+/// [`run_loop_rev`] for a rows forward (#2980, `super::Sweep::TangentReverseRows` kernels at
+/// the base layout, `l` lanes): forward over reverse with the adjoint seed every seed shares.
+/// The adjoints are blocks — block 0 their values, block `1 + s` seed `s`'s tangents of them —
+/// and every step of the reverse that is linear in them (points, the continuous extension, a
+/// fresh stepper, the inputs at the start) applies to each block as `run_loop_rev`'s seeds;
+/// a body runs its reverse once and each seed's tangent of it, on the shared `[values |
+/// adjoint values]` and each seed's `[tangents | adjoint tangents]` through a doubled slot
+/// table. `inputs`/`tin` the values and per-seed tangents of the call's inputs, `logs` each
+/// seed's one-tangent log ([`run_loop_rows`]), `out_adj`/`in_adj` laid out by block.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_loop_rev_rows(
+    spec: &LoopSpec,
+    rev: &LoopKernels,
+    l: usize,
+    inputs: &[f64],
+    tin: &[f64],
+    logs: &[&Log],
+    out_adj: &[f64],
+    in_adj: &mut [f64],
+) -> bool {
+    let seeds = logs.len();
+    let Some(log) = logs.first() else {
+        return false;
+    };
+    let blocks = 1 + seeds;
+    let hl = 2 * l;
+    let n = spec.n;
+    let n_hard = spec.saveat.len();
+    let (out_w, in_w) = (out_adj.len() / blocks, in_adj.len() / blocks);
+    let nl = n * l;
+    let cap_w = spec.n_caps * l;
+    let w_in = (n + spec.n_caps) * l;
+    let mut ubar = vec![0.0; blocks * nl];
+    let mut capbar = vec![0.0; blocks * cap_w];
+    let (mut cbar, mut probe, mut a_c) = (Vec::new(), Vec::new(), Vec::new());
+    // A body's reverse: the shared buffer and each seed's, through the doubled table.
+    let body = |b: &LoopBody,
+                k: &Tiered,
+                at: usize,
+                out_adj_of: &dyn Fn(usize, &mut [f64]),
+                back: &mut dyn FnMut(usize, &[f64])|
+     -> bool {
+        let n_in = b.n_vars + b.caps.len();
+        let n_slots = n_in + b.n_out + b.guarded as usize;
+        let w = n_slots * l;
+        let mut sh = vec![0.0; 2 * w];
+        let mut ts = vec![0.0; seeds * 2 * w];
+        for j in 0..b.n_vars {
+            sh[j * l..(j + 1) * l].copy_from_slice(&log.vars[at + j * hl..at + j * hl + l]);
+            for (sd, lg) in logs.iter().enumerate() {
+                ts[sd * 2 * w + j * l..sd * 2 * w + (j + 1) * l]
+                    .copy_from_slice(&lg.vars[at + j * hl + l..at + (j + 1) * hl]);
+            }
+        }
+        for (j, &cp) in b.caps.iter().enumerate() {
+            let o = (b.n_vars + j) * l;
+            sh[o..o + l].copy_from_slice(&inputs[(n + cp) * l..(n + cp + 1) * l]);
+            for sd in 0..seeds {
+                ts[sd * 2 * w + o..sd * 2 * w + o + l]
+                    .copy_from_slice(&tin[sd * w_in + (n + cp) * l..sd * w_in + (n + cp + 1) * l]);
+            }
+        }
+        out_adj_of(0, &mut sh[w..]);
+        for sd in 0..seeds {
+            out_adj_of(1 + sd, &mut ts[sd * 2 * w + w..(sd + 1) * 2 * w]);
+        }
+        let iota2: Vec<u32> = (0..2 * n_slots as u32).collect();
+        // SAFETY: `iota2` names the `2·n_slots` slots `sh` and each seed's block of `ts` hold.
+        unsafe {
+            k.call_seeds(
+                sh.as_mut_ptr(),
+                ts.as_mut_ptr(),
+                2 * w,
+                seeds,
+                iota2.as_ptr(),
+                b.lits.as_ptr(),
+            )
+        };
+        back(0, &sh[w..]);
+        for sd in 0..seeds {
+            back(1 + sd, &ts[sd * 2 * w + w..(sd + 1) * 2 * w]);
+        }
+        sh.iter().chain(&ts).all(|v| v.is_finite())
+    };
+    for e in log.entries.iter().rev() {
+        match e {
+            Entry::Point {
+                soft,
+                idx: k,
+                diverged,
+            } => {
+                let at = (if *soft { n_hard + k } else { *k }) * nl;
+                for bk in 0..blocks {
+                    let src = &out_adj[bk * out_w + at..bk * out_w + at + nl];
+                    for (x, &g) in ubar[bk * nl..(bk + 1) * nl].iter_mut().zip(src) {
+                        *x += if *diverged { g * f64::NAN } else { g };
+                    }
+                }
+            }
+            Entry::Interp {
+                m,
+                idx: k,
+                i,
+                theta,
+                dt,
+            } => {
+                let mb = &spec.methods[*m];
+                let cl = mb.c * l;
+                if cbar.len() != blocks * cl {
+                    cbar.clear();
+                    cbar.resize(blocks * cl, 0.0);
+                }
+                probe.clear();
+                probe.resize(mb.c, 0.0);
+                let a_u = mb
+                    .cl
+                    .interp(sol::Carried::new(&probe, 1), *theta, 1.0, *dt, *i);
+                a_c.clear();
+                for j in 0..mb.c {
+                    probe[j] = 1.0;
+                    a_c.push(
+                        mb.cl
+                            .interp(sol::Carried::new(&probe, 1), *theta, 0.0, *dt, *i),
+                    );
+                    probe[j] = 0.0;
+                }
+                let at = (n_hard + k) * nl + i * l;
+                for bk in 0..blocks {
+                    for x in 0..l {
+                        let g = out_adj[bk * out_w + at + x];
+                        ubar[bk * nl + i * l + x] += g * a_u;
+                        for (j, &a) in a_c.iter().enumerate() {
+                            cbar[bk * cl + j * l + x] += g * a;
+                        }
+                    }
+                }
+            }
+            Entry::NewStepper => cbar.clear(),
+            Entry::Body { m, kind: 3, at } => {
+                let b = &spec.jumps[*m];
+                let k = &rev.jumps[*m].0;
+                let n_in = b.n_vars + b.caps.len();
+                let ub = ubar.clone();
+                let mut ub_new = ubar.clone();
+                let mut cap_add = vec![0.0; blocks * cap_w];
+                let ok = body(
+                    b,
+                    k,
+                    *at,
+                    &|bk, a| {
+                        a[n_in * l..n_in * l + nl].copy_from_slice(&ub[bk * nl..(bk + 1) * nl])
+                    },
+                    &mut |bk, a| {
+                        for (j, &cp) in b.caps.iter().enumerate() {
+                            for x in 0..l {
+                                cap_add[bk * cap_w + cp * l + x] += a[(b.n_vars + j) * l + x];
+                            }
+                        }
+                        ub_new[bk * nl..(bk + 1) * nl].copy_from_slice(&a[..nl]);
+                    },
+                );
+                if !ok {
+                    return false;
+                }
+                ubar = ub_new;
+                for (x, y) in capbar.iter_mut().zip(&cap_add) {
+                    *x += y;
+                }
+            }
+            Entry::Begin => {
+                for bk in 0..blocks {
+                    for (x, &g) in in_adj[bk * in_w..bk * in_w + nl]
+                        .iter_mut()
+                        .zip(&ubar[bk * nl..(bk + 1) * nl])
+                    {
+                        *x += g;
+                    }
+                }
+                break;
+            }
+            Entry::Body { m, kind, at } => {
+                let mb = &spec.methods[*m];
+                let c = mb.c;
+                let cl = c * l;
+                if cbar.len() != blocks * cl {
+                    cbar.clear();
+                    cbar.resize(blocks * cl, 0.0);
+                }
+                let (b, k) = match kind {
+                    0 => (&mb.start, &rev.methods[*m][0]),
+                    1 => (&mb.step, &rev.methods[*m][1]),
+                    2 => (&mb.accept, &rev.methods[*m][2]),
+                    j => (
+                        &mb.forced[*j as usize - 4],
+                        &rev.forced[*m][*j as usize - 4].0,
+                    ),
+                };
+                let n_in = b.n_vars + b.caps.len();
+                let accept = *kind == 2;
+                let (ub, cb) = (ubar.clone(), cbar.clone());
+                let (mut ub_new, mut cb_new) = (ubar.clone(), cbar.clone());
+                let mut cap_add = vec![0.0; blocks * cap_w];
+                let ok = body(
+                    b,
+                    k,
+                    *at,
+                    &|bk, a| {
+                        a[n_in * l..n_in * l + cl].copy_from_slice(&cb[bk * cl..(bk + 1) * cl]);
+                        if accept {
+                            a[n_in * l + cl..n_in * l + cl + nl]
+                                .copy_from_slice(&ub[bk * nl..(bk + 1) * nl]);
+                        }
+                    },
+                    &mut |bk, a| {
+                        for (j, &cp) in b.caps.iter().enumerate() {
+                            for x in 0..l {
+                                cap_add[bk * cap_w + cp * l + x] += a[(b.n_vars + j) * l + x];
+                            }
+                        }
+                        let (u, c) = (
+                            &mut ub_new[bk * nl..(bk + 1) * nl],
+                            &mut cb_new[bk * cl..(bk + 1) * cl],
+                        );
+                        if accept {
+                            c.copy_from_slice(&a[..cl]);
+                            u.fill(0.0);
+                        } else {
+                            for (x, &g) in u.iter_mut().zip(&a[..nl]) {
+                                *x += g;
+                            }
+                            c.copy_from_slice(&a[nl..nl + cl]);
+                        }
+                    },
+                );
+                if !ok {
+                    return false;
+                }
+                ubar = ub_new;
+                cbar = cb_new;
+                for (x, y) in capbar.iter_mut().zip(&cap_add) {
+                    *x += y;
+                }
+            }
+        }
+    }
+    for bk in 0..blocks {
+        for (x, &g) in in_adj[bk * in_w + nl..(bk + 1) * in_w]
+            .iter_mut()
+            .zip(&capbar[bk * cap_w..(bk + 1) * cap_w])
+        {
+            *x += g;
+        }
+    }
+    true
+}

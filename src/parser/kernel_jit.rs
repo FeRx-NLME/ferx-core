@@ -5462,12 +5462,8 @@ impl Plan {
                             .map(Kern::Loop)
                     }
                     CallKind::Ode(s) if sweep == Sweep::TangentReverseRows => {
-                        ode_loop::LoopKernels::resolve(
-                            s,
-                            Layout { tan: 1, ..layout },
-                            Sweep::TangentReverse,
-                        )
-                        .map(Kern::Loop)
+                        ode_loop::LoopKernels::resolve(s, layout, Sweep::TangentReverseRows)
+                            .map(Kern::Loop)
                     }
                     CallKind::Ode(s) => {
                         ode_loop::LoopKernels::resolve(s, layout, sweep).map(Kern::Loop)
@@ -5895,6 +5891,77 @@ impl Plan {
                             lits.as_ptr(),
                         )
                     };
+                }
+                (
+                    Call::Loop {
+                        spec: CallKind::Ode(spec),
+                        args,
+                        outs,
+                    },
+                    Kern::Loop(rk),
+                ) if li > 0 => {
+                    li -= 1;
+                    // Every seed in one reverse: block 0 the adjoints' values, block `1 + s`
+                    // seed `s`'s tangents of them.
+                    let blocks = 1 + seeds;
+                    let (wi, wo) = (args.len() * l, outs.len() * l);
+                    let mut inputs = Vec::with_capacity(wi);
+                    let mut tin = Vec::with_capacity(seeds * wi);
+                    for &a in args {
+                        inputs.extend_from_slice(&sh[a as usize * l..(a as usize + 1) * l]);
+                    }
+                    for sd in 0..seeds {
+                        for &a in args {
+                            let o = sd * 2 * need + a as usize * l;
+                            tin.extend_from_slice(&ts[o..o + l]);
+                        }
+                    }
+                    let mut out_adj = Vec::with_capacity(blocks * wo);
+                    for &o in outs {
+                        out_adj.extend_from_slice(
+                            &sh[need + o as usize * l..need + (o as usize + 1) * l],
+                        );
+                    }
+                    for sd in 0..seeds {
+                        for &o in outs {
+                            let at = sd * 2 * need + need + o as usize * l;
+                            out_adj.extend_from_slice(&ts[at..at + l]);
+                        }
+                    }
+                    let lgs: Option<Vec<&ode_loop::Log>> = r
+                        .logs
+                        .iter()
+                        .map(|lg| match &lg[li] {
+                            CallLog::Ode(x) => Some(x),
+                            CallLog::Fixed(_) => None,
+                        })
+                        .collect();
+                    let Some(lgs) = lgs else {
+                        return false;
+                    };
+                    let mut in_adj = vec![0.0; blocks * wi];
+                    if !ode_loop::run_loop_rev_rows(
+                        spec,
+                        rk,
+                        l,
+                        &inputs,
+                        &tin,
+                        &lgs,
+                        &out_adj,
+                        &mut in_adj,
+                    ) {
+                        return false;
+                    }
+                    for (j, &a) in args.iter().enumerate() {
+                        let a = a as usize;
+                        for x in 0..l {
+                            sh[need + a * l + x] += in_adj[j * l + x];
+                            for sd in 0..seeds {
+                                ts[sd * 2 * need + need + a * l + x] +=
+                                    in_adj[(1 + sd) * wi + j * l + x];
+                            }
+                        }
+                    }
                 }
                 (Call::Loop { spec, args, outs }, k) if li > 0 => {
                     li -= 1;
