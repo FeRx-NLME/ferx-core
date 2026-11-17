@@ -162,6 +162,18 @@ fn tri(k: usize, l: usize) -> usize {
     k * (k + 1) / 2 + l
 }
 
+/// `d` on the rows' stored dual: its lanes first, the rest exact zeros.
+fn widen<const L: usize>(d: Dual2<L>) -> Dual2<NL> {
+    let mut o = Dual2::<NL>::constant(d.value);
+    for i in 0..L {
+        o.grad[i] = d.grad[i];
+        for c in 0..L {
+            o.hess[i][c] = d.hess[i][c];
+        }
+    }
+    o
+}
+
 /// Each aggregate's offset in the aggregate vector, and the total width.
 fn offsets(aggs: &[(usize, Mono)], m: usize) -> (Vec<usize>, usize) {
     let mut at = Vec::with_capacity(aggs.len());
@@ -433,23 +445,12 @@ impl CovPlan<'_> {
                 .map(|k| s0 + k)
                 .collect();
             let lane0 = 1 + usize::from(pop_lane.is_some());
-            let xo = |i: usize| -> Dual2<NL> {
-                let v = xv(i);
-                match sig.iter().position(|&s| s == i) {
-                    Some(q) => Dual2::var(v, lane0 + q),
-                    None => Dual2::constant(v),
-                }
-            };
-            let theta: Vec<Dual2<NL>> = unpack_theta(self.template, xo);
-            let p = population_params(
-                self.sc.model,
-                self.subject,
-                self.template,
-                self.sc.params,
-                self.so,
-                &theta,
-                xo,
-            )?;
+            let (rs, l_chol) = match lane0 + sig.len() {
+                0..=2 => self.eval_rows::<2>(family, n_obs, f, fp, xv, &sig, lane0),
+                3 => self.eval_rows::<3>(family, n_obs, f, fp, xv, &sig, lane0),
+                4 => self.eval_rows::<4>(family, n_obs, f, fp, xv, &sig, lane0),
+                _ => self.eval_rows::<NL>(family, n_obs, f, fp, xv, &sig, lane0),
+            }?;
             let aggs = family.aggs();
             let (at, na) = offsets(aggs, pn);
             let nq = if family.rows() == Family::Laplace {
@@ -461,24 +462,7 @@ impl CovPlan<'_> {
             let mut g = Vec::with_capacity(n_obs);
             let mut qs = Vec::with_capacity(n_obs);
             let mut aggr = vec![0.0; na];
-            for j in 0..n_obs {
-                let fd = Dual2::var(f(j), 0);
-                let r: Vec<Dual2<NL>> = match family.rows() {
-                    Family::Focei => {
-                        let (l, dl, al) = focei_gauss_row(self.ctx, j, fd, &p)?;
-                        vec![l, dl, al]
-                    }
-                    Family::Foce => {
-                        // `R⁰` at the population prediction where the variance reads `f`, else
-                        // at anything (it does not).
-                        let r_eval = match fp(j) {
-                            Some(v) => Dual2::var(v, 1),
-                            None => Dual2::constant(f(j)),
-                        };
-                        foce_row(self.ctx, j, fd, r_eval, &p)?.to_vec()
-                    }
-                    _ => laplace_row(self.ctx, j, fd, &p)?.to_vec(),
-                };
+            for (j, r) in rs.into_iter().enumerate() {
                 let gj: Vec<f64> = (0..pn).map(|k| gv(j, k)).collect();
                 let qj: Vec<f64> = (0..nq).map(|t| qv(j, t)).collect();
                 for (k, &(si, mono)) in aggs.iter().enumerate() {
@@ -492,13 +476,13 @@ impl CovPlan<'_> {
             }
             if family == Family::Foce {
                 // Production's gate: `1 + tr(LᵀSL)` (`S` the third aggregate).
-                let l = p.omega_chol(pn);
+                let l = &l_chol;
                 let sq = sym(&aggr[at[2]..at[2] + pn * (pn + 1) / 2], pn);
                 let mut tr = 0.0;
                 for c in 0..pn {
                     for a in 0..pn {
                         for b in 0..pn {
-                            tr += l[a][c].value * sq[a][b] * l[b][c].value;
+                            tr += l[a][c] * sq[a][b] * l[b][c];
                         }
                     }
                 }
@@ -520,6 +504,102 @@ impl CovPlan<'_> {
         std::cell::Ref::filter_map(rows, Option::as_ref).ok()
     }
 
+    /// The population parameters on `Dual2<L>`: σ's packed coordinates `sig` on lanes
+    /// `lane0 ..`, everything else constant.
+    fn local_params<const L: usize>(
+        &self,
+        xv: &dyn Fn(usize) -> f64,
+        sig: &[usize],
+        lane0: usize,
+    ) -> Option<crate::sens::focei_kernel::ParT<Dual2<L>>> {
+        let xo = |i: usize| -> Dual2<L> {
+            let v = xv(i);
+            match sig.iter().position(|&s| s == i) {
+                Some(q) => Dual2::var(v, lane0 + q),
+                None => Dual2::constant(v),
+            }
+        };
+        let theta: Vec<Dual2<L>> = unpack_theta(self.template, xo);
+        population_params(
+            self.sc.model,
+            self.subject,
+            self.template,
+            self.sc.params,
+            self.so,
+            &theta,
+            xo,
+        )
+    }
+
+    /// The anchor rows' scalars on `Dual2<L>`, `L` the live local lanes (a dense second-order
+    /// dual costs `L²` per operation), widened to the stored [`NL`]; and Ω's factor's values
+    /// (FOCE's Woodbury gate).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_rows<const L: usize>(
+        &self,
+        family: Family,
+        n_obs: usize,
+        f: &dyn Fn(usize) -> f64,
+        fp: &dyn Fn(usize) -> Option<f64>,
+        xv: &dyn Fn(usize) -> f64,
+        sig: &[usize],
+        lane0: usize,
+    ) -> Option<(Vec<Vec<Dual2<NL>>>, Vec<Vec<f64>>)> {
+        let p = self.local_params::<L>(xv, sig, lane0)?;
+        let mut out = Vec::with_capacity(n_obs);
+        for j in 0..n_obs {
+            let fd = Dual2::<L>::var(f(j), 0);
+            let r: Vec<Dual2<L>> = match family.rows() {
+                Family::Focei => {
+                    let (l, dl, al) = focei_gauss_row(self.ctx, j, fd, &p)?;
+                    vec![l, dl, al]
+                }
+                Family::Foce => {
+                    // `R⁰` at the population prediction where the variance reads `f`, else at
+                    // anything (it does not).
+                    let r_eval = match fp(j) {
+                        Some(v) => Dual2::var(v, 1),
+                        None => Dual2::constant(f(j)),
+                    };
+                    foce_row(self.ctx, j, fd, r_eval, &p)?.to_vec()
+                }
+                _ => laplace_row(self.ctx, j, fd, &p)?.to_vec(),
+            };
+            out.push(r.into_iter().map(widen).collect());
+        }
+        let pn = self.pn();
+        let l = if family == Family::Foce {
+            let lc = p.omega_chol(pn);
+            (0..pn)
+                .map(|a| (0..pn).map(|c| lc[a][c].value).collect())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Some((out, l))
+    }
+
+    /// The quadrature node rows' `ℓ` on `Dual2<L>` (prediction, then σ), widened.
+    fn eval_node_rows<const L: usize>(
+        &self,
+        fb: &dyn Fn(usize, usize) -> f64,
+        xv: &dyn Fn(usize) -> f64,
+        n_nodes: usize,
+        n_obs: usize,
+        s0: usize,
+        n_sig: usize,
+    ) -> Option<Vec<Vec<Dual2<NL>>>> {
+        let sig: Vec<usize> = (s0..s0 + n_sig).collect();
+        let p = self.local_params::<L>(xv, &sig, 1)?;
+        (0..n_nodes)
+            .map(|d| {
+                (0..n_obs)
+                    .map(|j| gauss_row_l(self.ctx, j, Dual2::<L>::var(fb(d, j), 0), &p).map(widen))
+                    .collect()
+            })
+            .collect()
+    }
+
     /// The rows at the quadrature's nodes (formed once, as [`Self::rows`]): `fb(d, j)` node
     /// `d`'s prediction of observation `j`, `xv` the packed coordinates.
     fn node_rows(
@@ -532,37 +612,13 @@ impl CovPlan<'_> {
             let n_obs = self.subject.observations.len();
             let s0 = packed_segments(self.template).sigma_start();
             let n_sig = self.sc.params.sigma.values.len();
-            let xo = |i: usize| -> Dual2<NL> {
-                let v = xv(i);
-                if (s0..s0 + n_sig).contains(&i) {
-                    Dual2::var(v, 1 + i - s0)
-                } else {
-                    Dual2::constant(v)
-                }
-            };
-            let theta: Vec<Dual2<NL>> = unpack_theta(self.template, xo);
-            let p = population_params(
-                self.sc.model,
-                self.subject,
-                self.template,
-                self.sc.params,
-                self.so,
-                &theta,
-                xo,
-            )?;
-            let mut l = Vec::with_capacity(n_nodes);
-            let mut agg = Vec::with_capacity(n_nodes);
-            for d in 0..n_nodes {
-                let mut row = Vec::with_capacity(n_obs);
-                let mut sum = 0.0;
-                for j in 0..n_obs {
-                    let x = gauss_row_l(self.ctx, j, Dual2::var(fb(d, j), 0), &p)?;
-                    sum += x.value;
-                    row.push(x);
-                }
-                l.push(row);
-                agg.push(sum);
-            }
+            let l = match 1 + n_sig {
+                0..=2 => self.eval_node_rows::<2>(fb, xv, n_nodes, n_obs, s0, n_sig),
+                3 => self.eval_node_rows::<3>(fb, xv, n_nodes, n_obs, s0, n_sig),
+                4 => self.eval_node_rows::<4>(fb, xv, n_nodes, n_obs, s0, n_sig),
+                _ => self.eval_node_rows::<NL>(fb, xv, n_nodes, n_obs, s0, n_sig),
+            }?;
+            let agg = l.iter().map(|r| r.iter().map(|x| x.value).sum()).collect();
             *self.st_node_rows.borrow_mut() = Some(NodeRows { l, agg });
         }
         let rows = self.st_node_rows.borrow();
