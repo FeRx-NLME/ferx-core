@@ -274,6 +274,10 @@ lower-is-better:
 | `bic_iiv`, `bic_random`, `bic_fixed` | the other three `calculate_bic` conventions (#1177) |
 | `penalized` | pyDarwin's penalized fitness (#1185): OFV + 10 per estimated θ / Ω / σ element + 100 per failure (non-convergence, no covariance step, \|r\| > 0.95, condition number > 1000), `[rank.penalties]` overlaying any charge — see [Global model search](global-search.qmd#penalized-fitness). The default for `globalsearch`; usable by every tool |
 
+A candidate whose fit has no AIC/BIC — a SAEM fit under the default `saem_ofv = saem`, whose
+objective is not a likelihood — stops the run with an error naming `saem_ofv = imp`; set
+`saem_ofv = imp` (or `agq` / `focei`) in the candidates' `[fit_options]`.
+
 `cutoff` is the improvement a candidate must show over its parent, on the
 criterion's own scale; how a tool applies it (a ΔOFV in an SCM step, a ΔBIC in
 a structural search) is the tool's, and omitting it leaves the tool's default.

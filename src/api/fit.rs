@@ -3204,13 +3204,18 @@ fn fit_inner(
     let prior_summary = prior_set.summarize(&packed_final);
     let ofv_data = result.ofv;
     let ofv = ofv_data + ofv_prior;
-    // The SAEM objective (`saem_ofv = saem`) is NONMEM's SAEMOBJ, not a likelihood: the
-    // information criteria are built from the FOCE/Laplace value at the same estimates.
-    let ic_ofv = match &saem_objective {
-        Some(o) if o.kind == SaemOfv::Saem => o.foce_ofv,
-        _ => ofv_data,
+    // The SAEM objective (`saem_ofv = saem`) is NONMEM's SAEMOBJ, not a likelihood: no
+    // information criterion exists for it, so AIC/BIC are `None` (#2973). Every other
+    // reported objective (FOCE/Laplace, IS, AGQ) is a likelihood and they are built from it.
+    let ic_ofv: Option<f64> = match &saem_objective {
+        Some(o) if o.kind == SaemOfv::Saem => None,
+        _ => Some(ofv_data),
     };
-    let aic = ic_ofv + 2.0 * n_params as f64;
+    // A non-finite value (a VI fit with no objective, a record-free BIC) is `None` too: one
+    // way to say "no information criterion", and a `.fitrx` round trip that is lossless.
+    let aic = ic_ofv
+        .map(|o| o + 2.0 * n_params as f64)
+        .filter(|v| v.is_finite());
     // BIC = OFV + k·ln(n). For TTE-only models n_obs == 0 (no Gaussian records),
     // giving ln(0) = -inf. Use total record count (Gaussian + TTE) so BIC is finite.
     #[cfg(feature = "survival")]
@@ -3222,11 +3227,10 @@ fn fit_inner(
             .sum::<usize>();
     #[cfg(not(feature = "survival"))]
     let n_for_bic: usize = n_obs;
-    let bic = if n_for_bic > 0 {
-        ic_ofv + n_params as f64 * (n_for_bic as f64).ln()
-    } else {
-        f64::NAN
-    };
+    let bic = ic_ofv
+        .filter(|_| n_for_bic > 0)
+        .map(|o| o + n_params as f64 * (n_for_bic as f64).ln())
+        .filter(|v| v.is_finite());
     // Delattre class tally behind the BIC variants (#1177): the same packed
     // held mask `n_params` was counted from, split by segment.
     let bic_inputs =

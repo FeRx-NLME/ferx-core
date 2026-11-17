@@ -90,14 +90,16 @@ impl BicInputs {
 /// time-to-event records). `Fixed` therefore reproduces `FitResult::bic`
 /// exactly.
 ///
-/// Returns `NaN` when the tally cannot support the penalty: a hand-built result
+/// Returns `NaN` when the fit has no information criterion (`FitResult::bic` is `None`,
+/// #2973), or when the tally cannot support the penalty: a hand-built result
 /// (all-zero counts with `n_parameters > 0`), or a zero subject / record count under a convention that needs its log. A
 /// count of zero never needs a log — every variant is `ofv` for a fit with no
 /// free parameter, whatever `n_subjects` / `n_obs` say — so the four variants
 /// agree on such a fit and `Fixed` stays equal to `FitResult::bic` on it.
 pub fn bic(result: &FitResult, kind: BicType) -> f64 {
     let inp = &result.bic_inputs;
-    if inp.n_free() != result.n_parameters {
+    // No likelihood, no information criterion (#2973): a SAEM objective is not one.
+    if result.bic.is_none() || inp.n_free() != result.n_parameters {
         return f64::NAN;
     }
     let ln_subj = || {

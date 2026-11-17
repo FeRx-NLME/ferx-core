@@ -59,7 +59,7 @@ fn n_parameters_excludes_block_omega_structural_zeros_on_a_fit() {
     assert!(bic(&result, BicType::Mixed).is_finite());
     assert_eq!(
         bic(&result, BicType::Fixed).to_bits(),
-        result.bic.to_bits(),
+        result.bic.unwrap().to_bits(),
         "Fixed reproduces FitResult::bic on a live fit"
     );
     // The NLopt outer loop records its own init-escape verdict.

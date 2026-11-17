@@ -163,7 +163,7 @@ struct FitWire {
     method_chain: Vec<String>,
     converged: bool,
     /// `NaN` for a VI fit under the default `vi_final_ofv = none` (#2058), and so
-    /// `aic` / `bic` with it; written as `null`, read back as `NaN`.
+    /// `aic` / `bic` with it (those are `None`).
     #[serde(with = "crate::io::serde_nan::scalar")]
     ofv: f64,
     /// Parameter-prior split (#254): the data likelihood and the prior's share of `ofv`.
@@ -176,10 +176,12 @@ struct FitWire {
     ofv_prior: f64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     prior_summary: Vec<crate::types::PriorSummary>,
-    #[serde(with = "crate::io::serde_nan::scalar")]
-    aic: f64,
-    #[serde(with = "crate::io::serde_nan::scalar")]
-    bic: f64,
+    /// `None` (`null`) when the objective is not a likelihood (#2973); an older file's
+    /// number reads as `Some`, its `null` (a VI fit with no objective) as `None`.
+    #[serde(default, with = "crate::io::serde_nan::opt")]
+    aic: Option<f64>,
+    #[serde(default, with = "crate::io::serde_nan::opt")]
+    bic: Option<f64>,
     n_obs: usize,
     n_subjects: usize,
     n_parameters: usize,
@@ -7519,8 +7521,8 @@ mod tests {
         r.ofv = f64::NAN;
         r.ofv_data = f64::NAN;
         r.ofv_prior = 1.5;
-        r.aic = f64::NAN;
-        r.bic = f64::NAN;
+        r.aic = None;
+        r.bic = None;
         r.prior_summary = vec![crate::types::PriorSummary {
             name: "CL".into(),
             prior_value: 1.0,
@@ -7573,14 +7575,10 @@ mod tests {
 
         let l = load_fit(&path).expect("a NaN-OFV VI bundle must load").fit;
         assert_eq!(l.method, EstimationMethod::Vi);
-        for (name, v) in [
-            ("ofv", l.ofv),
-            ("ofv_data", l.ofv_data),
-            ("aic", l.aic),
-            ("bic", l.bic),
-        ] {
+        for (name, v) in [("ofv", l.ofv), ("ofv_data", l.ofv_data)] {
             assert!(v.is_nan(), "{name} must come back NaN, got {v}");
         }
+        assert!(l.aic.is_none() && l.bic.is_none(), "no objective, no IC");
         assert_eq!(l.ofv_prior, 1.5);
         assert_eq!(
             format!("{:?}", l.vi),
@@ -7599,6 +7597,52 @@ mod tests {
             wire["vi"]["eta_names"],
             serde_json::json!(["eta_CL", "eta_V"])
         );
+    }
+
+    /// #2973: `aic` / `bic` are `None` for a fit with no likelihood (a SAEM fit under the
+    /// default `saem_ofv = saem`) and survive a round trip as `None`, written as `null`; a
+    /// `Some` round-trips bit for bit; and a file written before the change, whose `aic` /
+    /// `bic` are plain numbers (or absent), still reads.
+    /// Mutations: `Some(0.0)` on load for `null`; drop `with = opt` (a `null` fails to load);
+    /// drop `default` (the absent-key read fails).
+    #[test]
+    fn aic_bic_none_and_old_numeric_files_round_trip_through_fitrx() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dummy_population(&["S1", "S2"], 3);
+        let mut r = minimal_fit_result();
+        let round = |r: &FitResult, name: &str| {
+            let path = dir.path().join(name);
+            save_fit(r, &p, "model source\n", &path, SaveFitOptions::default()).unwrap();
+            load_fit(&path).expect("loads").fit
+        };
+
+        r.aic = None;
+        r.bic = None;
+        let wire = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        assert!(wire["aic"].is_null() && wire["bic"].is_null());
+        let l = round(&r, "none.fitrx");
+        assert!(l.aic.is_none() && l.bic.is_none());
+
+        r.aic = Some(123.456_789_012_345);
+        r.bic = Some(130.25);
+        let l = round(&r, "some.fitrx");
+        assert_eq!(l.aic.map(f64::to_bits), r.aic.map(f64::to_bits));
+        assert_eq!(l.bic, r.bic);
+
+        // An old file: plain numbers, exactly what `FitWire` stored before the field was optional.
+        let mut value = serde_json::to_value(build_fit_wire(&r)).unwrap();
+        value["aic"] = serde_json::json!(98.5);
+        value["bic"] = serde_json::json!(101.5);
+        let wire: FitWire = serde_json::from_value(value.clone()).unwrap();
+        let old = wire_to_fit_result(wire, r.subjects.clone(), Vec::new()).unwrap();
+        assert_eq!((old.aic, old.bic), (Some(98.5), Some(101.5)));
+        // And an absent key reads as `None`.
+        value.as_object_mut().unwrap().remove("aic");
+        let wire: FitWire = serde_json::from_value(value).unwrap();
+        assert!(wire_to_fit_result(wire, r.subjects.clone(), Vec::new())
+            .unwrap()
+            .aic
+            .is_none());
     }
 
     /// A VI result with no per-subject covariances and no κ (a model without IOV)

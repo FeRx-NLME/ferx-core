@@ -107,6 +107,64 @@ fn two_candidates_with_the_same_canonical_text_are_fitted_once() {
     assert_eq!(report.results[1].parent.as_deref(), Some("first"));
 }
 
+/// #2973: a candidate whose fit has no information criterion (a SAEM fit under the default
+/// `saem_ofv = saem`) stops the run with an error that names the fix, under every criterion;
+/// it is never ranked on its non-likelihood objective, and later candidates are not fitted.
+/// Mutations: drop the `aic/bic is_none` arm (the run returns Ok and ranks it); drop the
+/// `no_ic` check at the top of `fit_one` (the later candidates are fitted); drop the fix
+/// from the message.
+#[test]
+fn a_fit_without_an_information_criterion_stops_the_run_naming_the_fix() {
+    for criterion in [
+        Criterion::Ofv,
+        Criterion::Aic,
+        Criterion::Bic(BicType::Mixed),
+    ] {
+        let candidates = vec![
+            candidate("first", "[parameters]\ntheta CL = 1\n"),
+            candidate("second", "[parameters]\ntheta CL = 2\n"),
+        ];
+        let recorder = Recorder::new();
+        let mut options = lenient();
+        options.criterion = criterion;
+        let err = Runner::new()
+            .threads(1)
+            .run_with_fitter(&candidates, &population(&["1"]), &options, |c, _| {
+                recorder.record(&c.id);
+                let mut fit = converged_fit(100.0);
+                fit.aic = None;
+                fit.bic = None;
+                Ok(fit)
+            })
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            err.contains("`first`") && err.contains("saem_ofv = imp"),
+            "{err}"
+        );
+        assert_eq!(recorder.ids(), vec!["first"], "the run did not stop");
+    }
+    // Control: with criteria present the same candidates rank.
+    let candidates = vec![candidate("first", "[parameters]\ntheta CL = 1\n")];
+    let report = Runner::new()
+        .threads(1)
+        .run_with_fitter(&candidates, &population(&["1"]), &lenient(), |_, _| {
+            Ok(converged_fit(100.0))
+        })
+        .expect("a fit with criteria is ranked");
+    assert_eq!(report.results.len(), 1);
+}
+
+// A fit with no criterion scores NaN under `Criterion::Aic` and every BIC type, never 0.
+#[test]
+fn criteria_of_a_fit_without_aic_bic_are_nan() {
+    let mut fit = converged_fit(100.0);
+    fit.aic = None;
+    fit.bic = None;
+    assert!(Criterion::Aic.of(&fit).is_nan());
+    assert!(Criterion::Bic(BicType::Mixed).of(&fit).is_nan());
+}
+
 #[test]
 fn candidates_with_different_text_are_each_fitted() {
     let candidates = vec![
@@ -1574,7 +1632,7 @@ fn a_run_reuses_fits_from_another_directory_and_rescores_them() {
     assert_eq!(bb.ofv, Some(102.0));
     // Re-scored under *this* run's criterion, not carried over from the
     // other run's OFV ranking.
-    assert_eq!(bb.criterion, converged_fit(102.0).aic);
+    assert_eq!(bb.criterion, converged_fit(102.0).aic.unwrap());
     assert!(bb.fit.is_some(), "the cached fit came along");
     assert!(bb.verdict.passed);
     assert!(!report.results[1].reused);

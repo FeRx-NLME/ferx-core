@@ -8618,8 +8618,12 @@ pub struct FitResult {
     /// the **penalized** objective — MAP / penalized-ML SEs, not posterior SDs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prior_summary: Vec<PriorSummary>,
-    pub aic: f64,
-    pub bic: f64,
+    /// `ofv_data + 2k`, or `None` when the reported objective is not a likelihood: a SAEM
+    /// fit under `saem_ofv = saem` (NONMEM's SAEMOBJ, #2973). Set `saem_ofv = imp`
+    /// (or `agq` / `focei`) for a value. `Some(NaN)` marks an estimator with no objective.
+    pub aic: Option<f64>,
+    /// `ofv_data + k·ln(n)`; `None` exactly when [`Self::aic`] is.
+    pub bic: Option<f64>,
     pub theta: Vec<f64>,
     pub theta_names: Vec<String>,
     /// Names of the random effects (etas), parallel to the omega diagonal.
@@ -10331,7 +10335,7 @@ pub struct FitOptions {
     /// The EBEs are reconverged at the incoming parameters before the grid is laid, because
     /// adaptive quadrature centres itself on the conditional mode.
     pub agq_eval_only: bool,
-    /// Which objective a SAEM fit reports as its OFV (and builds AIC/BIC from): see
+    /// Which objective a SAEM fit reports as its OFV (AIC/BIC exist only for a likelihood readout): see
     /// [`SaemOfv`]. Default [`SaemOfv::Saem`], NONMEM's `SAEMOBJ`; `imp` is its `IMP EONLY=1` follow-up.
     /// Read only when SAEM is the last estimating stage and the chain has no explicit
     /// evaluator stage of its own.
@@ -11614,7 +11618,7 @@ pub enum ViSigmaUpdate {
 /// marginal `−2 log L` when one is wanted. That is the default here, and the importance-sampled
 /// value is the explicit follow-up (`saem_ofv = imp`, or `method = [saem, imp]` with
 /// `imp_eval_only`). The FOCE/Laplace value stays available on [`SaemObjective::foce_ofv`] either
-/// way, and AIC/BIC are built from it under the default.
+/// way; under the default AIC/BIC are `None` (no likelihood is reported).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SaemOfv {
     /// NONMEM's `SAEMOBJ`: `−2 Σ_i log( mean p(y_i, η_i) )`, the log of the mean joint density of
@@ -11651,8 +11655,8 @@ pub struct SaemObjective {
     pub n_nodes: Option<usize>,
     /// The FOCE/Laplace objective at the same estimates, `2·pop_nll` after the EBE
     /// refinement: the value SAEM fits reported before #2973, kept as a diagnostic and for
-    /// comparison with a FOCE fit. AIC/BIC are built from it under [`SaemOfv::Saem`] (the SAEM
-    /// objective is not a likelihood) and from `ofv` under `imp` and `agq`.
+    /// comparison with a FOCE fit. AIC/BIC are `None` under [`SaemOfv::Saem`] (the SAEM
+    /// objective is not a likelihood) and built from `ofv` under `imp` and `agq`.
     pub foce_ofv: f64,
 }
 

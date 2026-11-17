@@ -141,16 +141,20 @@ fn imp_readout_reports_the_is_objective_with_the_foce_value_beside_it() {
 
     // AIC / BIC come from the reported (IS) objective.
     let k = imp.n_parameters as f64;
-    assert!((imp.aic - (imp.ofv + 2.0 * k)).abs() < 1e-9);
-    assert!((focei.aic - (focei.ofv + 2.0 * k)).abs() < 1e-9);
-    assert!((imp.aic - focei.aic - (imp.ofv - focei.ofv)).abs() < 1e-9);
+    let (iaic, ibic) = (imp.aic.unwrap(), imp.bic.unwrap());
+    let (faic, fbic) = (focei.aic.unwrap(), focei.bic.unwrap());
+    assert!((iaic - (imp.ofv + 2.0 * k)).abs() < 1e-9);
+    assert!((faic - (focei.ofv + 2.0 * k)).abs() < 1e-9);
+    assert!((iaic - faic - (imp.ofv - focei.ofv)).abs() < 1e-9);
+    assert!((ibic - fbic - (imp.ofv - focei.ofv)).abs() < 1e-9);
 }
 
 /// Default: the OFV is NONMEM's SAEM objective — no IS result, no Monte-Carlo SE, a label that
 /// says it is not a likelihood — the FOCE/Laplace value sits beside it, and AIC / BIC come from
 /// that value, not from the SAEM objective. It is deterministic, and `imp` is the follow-up.
+/// AIC / BIC are `None`: the SAEM objective is not a likelihood.
 #[test]
-fn default_saem_fit_reports_the_saem_objective_and_builds_aic_from_the_foce_value() {
+fn default_saem_fit_reports_the_saem_objective_and_has_no_aic_bic() {
     let d = FitOptions::default();
     let mut o = short_saem(d.saem_ofv);
     assert_eq!(o.saem_ofv, SaemOfv::Saem);
@@ -176,15 +180,11 @@ fn default_saem_fit_reports_the_saem_objective_and_builds_aic_from_the_foce_valu
         "the SAEM objective is neither the FOCE/Laplace nor the IS value"
     );
 
-    // Information criteria are of the likelihood-valued objective.
+    // No likelihood, no information criterion; the likelihood readouts keep theirs.
     let k = saem.n_parameters as f64;
-    assert!((saem.aic - (focei.ofv + 2.0 * k)).abs() < 1e-9);
-    assert!((saem.aic - focei.aic).abs() < 1e-9);
-    assert!((saem.bic - focei.bic).abs() < 1e-9);
-    assert!(
-        (imp.aic - (imp.ofv + 2.0 * k)).abs() < 1e-9,
-        "imp keeps its own"
-    );
+    assert!(saem.aic.is_none() && saem.bic.is_none());
+    assert!((imp.aic.unwrap() - (imp.ofv + 2.0 * k)).abs() < 1e-9);
+    assert!((focei.aic.unwrap() - (focei.ofv + 2.0 * k)).abs() < 1e-9);
 
     // Seeded and deterministic: two fits agree to the bit.
     assert_eq!(warfarin_fit(&o).ofv.to_bits(), saem.ofv.to_bits());
@@ -243,6 +243,10 @@ fn agq_readout_is_deterministic_and_agrees_with_is_within_its_se() {
     assert_eq!(obj.n_nodes, Some(11));
     assert!(obj.mc_standard_error.is_none() && obj.n_samples.is_none());
     assert!(a.importance_sampling.is_none());
+    // AIC / BIC are built from the AGQ value (a likelihood).
+    let k = a.n_parameters as f64;
+    assert!((a.aic.unwrap() - (a.ofv + 2.0 * k)).abs() < 1e-9);
+    assert!(a.bic.unwrap().is_finite());
 
     o.saem_ofv_nodes = 15;
     let eleven = warfarin_fit(&o);
@@ -372,8 +376,18 @@ fn explicit_evaluator_chains_follow_saem_ofv() {
     );
     assert_eq!(obj.n_samples, Some(400));
     assert_eq!(imp.ofv.to_bits(), is.minus2_log_likelihood.to_bits());
+    // The chain's IS value is a likelihood: AIC / BIC exist and are built from it, also
+    // under the default `saem_ofv = saem`.
+    let k = imp.n_parameters as f64;
+    assert!((imp.aic.unwrap() - (is.minus2_log_likelihood + 2.0 * k)).abs() < 1e-9);
+    assert_eq!(
+        by_default.aic.map(f64::to_bits),
+        imp.aic.map(f64::to_bits),
+        "the chain under the default has the same AIC"
+    );
 
     let focei = chained(SaemOfv::Focei);
+    assert!((focei.aic.unwrap() - (focei.ofv + 2.0 * k)).abs() < 1e-9);
     assert!(focei.saem_objective.is_none());
     assert_eq!(
         focei.ofv.to_bits(),

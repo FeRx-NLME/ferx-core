@@ -87,7 +87,7 @@ fn the_builders_carry_provenance() {
 fn each_criterion_reads_the_field_it_names() {
     let fit = converged_fit(123.0);
     assert_eq!(Criterion::Ofv.of(&fit), fit.ofv);
-    assert_eq!(Criterion::Aic.of(&fit), fit.aic);
+    assert_eq!(Criterion::Aic.of(&fit), fit.aic.unwrap());
     for kind in [
         BicType::Mixed,
         BicType::Iiv,

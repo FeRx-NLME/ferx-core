@@ -3481,9 +3481,9 @@ pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Ve
 impl core::default::Default for ferx_core::FitOptions
 pub fn ferx_core::FitOptions::default() -> Self
 pub struct ferx_core::types::FitResult
-pub ferx_core::types::FitResult::aic: f64
+pub ferx_core::types::FitResult::aic: core::option::Option<f64>
 pub ferx_core::types::FitResult::bayes: core::option::Option<ferx_core::BayesResult>
-pub ferx_core::types::FitResult::bic: f64
+pub ferx_core::types::FitResult::bic: core::option::Option<f64>
 pub ferx_core::types::FitResult::bic_inputs: ferx_core::BicInputs
 pub ferx_core::types::FitResult::bloq_method: alloc::string::String
 pub ferx_core::types::FitResult::cond_dist: core::option::Option<ferx_core::CondDist>
@@ -5206,9 +5206,9 @@ pub fn ferx_core::FitOptions::unsupported_keys_warnings(&self) -> alloc::vec::Ve
 impl core::default::Default for ferx_core::FitOptions
 pub fn ferx_core::FitOptions::default() -> Self
 pub struct ferx_core::FitResult
-pub ferx_core::FitResult::aic: f64
+pub ferx_core::FitResult::aic: core::option::Option<f64>
 pub ferx_core::FitResult::bayes: core::option::Option<ferx_core::BayesResult>
-pub ferx_core::FitResult::bic: f64
+pub ferx_core::FitResult::bic: core::option::Option<f64>
 pub ferx_core::FitResult::bic_inputs: ferx_core::BicInputs
 pub ferx_core::FitResult::bloq_method: alloc::string::String
 pub ferx_core::FitResult::cond_dist: core::option::Option<ferx_core::CondDist>

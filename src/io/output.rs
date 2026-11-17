@@ -1430,6 +1430,17 @@ fn saem_ofv_label(result: &FitResult) -> Option<String> {
     })
 }
 
+/// The console line standing in for AIC/BIC when the fit has none (#2973).
+fn ic_unavailable_line(result: &FitResult) -> &'static str {
+    match &result.saem_objective {
+        Some(o) if o.kind == SaemOfv::Saem => {
+            "AIC/BIC: n/a \u{2014} the SAEM objective is not a likelihood; set saem_ofv = imp \
+             (or agq/focei) for information criteria"
+        }
+        _ => "AIC/BIC: n/a \u{2014} the fit reports no likelihood",
+    }
+}
+
 /// What a reader comparing this objective with a NONMEM `.lst` needs to be told
 /// (#2654). Empty for a fit with no importance-sampling stage, so its output is
 /// unchanged. Shared by the console, the summary file and the YAML comments.
@@ -1440,8 +1451,8 @@ fn objective_notes(result: &FitResult) -> Vec<&'static str> {
         notes.push(match o.kind {
             SaemOfv::Saem => {
                 "OFV is NONMEM's SAEMOBJ convention (the SAEM objective, not a likelihood): do not \
-                 compare it across models. AIC and BIC come from the FOCE/Laplace value, reported \
-                 separately; saem_ofv = imp gives the importance-sampled -2LL (NONMEM IMP EONLY=1)."
+                 compare it across models. There is no AIC or BIC for it (they are null); \
+                 the FOCE/Laplace value is reported separately, and saem_ofv = imp gives the importance-sampled -2LL (NONMEM IMP EONLY=1)."
             }
             SaemOfv::Imp => {
                 "OFV, AIC and BIC come from the importance-sampled -2LL at the SAEM estimates \
@@ -1499,8 +1510,15 @@ fn write_objective_lines(out: &mut String, result: &FitResult, indent: &str) {
     if let Some(line) = is_marginal_line(result) {
         let _ = writeln!(out, "{indent}{line}");
     }
-    let _ = writeln!(out, "{indent}AIC:  {:.4}", result.aic);
-    let _ = writeln!(out, "{indent}BIC:  {:.4}", result.bic);
+    match (result.aic, result.bic) {
+        (Some(aic), Some(bic)) => {
+            let _ = writeln!(out, "{indent}AIC:  {aic:.4}");
+            let _ = writeln!(out, "{indent}BIC:  {bic:.4}");
+        }
+        _ => {
+            let _ = writeln!(out, "{indent}{}", ic_unavailable_line(result));
+        }
+    }
     for note in objective_notes(result) {
         let _ = writeln!(out, "{indent}{note}");
     }
@@ -2180,7 +2198,7 @@ pub fn format_comparison(runs: &[(String, &FitResult)]) -> String {
         "AIC",
         &runs
             .iter()
-            .map(|(_, r)| format!("{:.4}", r.aic))
+            .map(|(_, r)| r.aic.map_or("n/a".to_string(), |v| format!("{v:.4}")))
             .collect::<Vec<_>>(),
     );
     row(
@@ -2188,7 +2206,7 @@ pub fn format_comparison(runs: &[(String, &FitResult)]) -> String {
         "BIC",
         &runs
             .iter()
-            .map(|(_, r)| format!("{:.4}", r.bic))
+            .map(|(_, r)| r.bic.map_or("n/a".to_string(), |v| format!("{v:.4}")))
             .collect::<Vec<_>>(),
     );
     row(
@@ -3447,8 +3465,13 @@ pub fn write_estimates_yaml(result: &FitResult, path: &str) -> Result<(), String
         .map_err(|e| e.to_string())?;
         writeln!(f, "  # is not a log-likelihood.").map_err(|e| e.to_string())?;
     }
-    writeln!(f, "  aic: {:.6}", result.aic).map_err(|e| e.to_string())?;
-    writeln!(f, "  bic: {:.6}", result.bic).map_err(|e| e.to_string())?;
+    for (key, v) in [("aic", result.aic), ("bic", result.bic)] {
+        match v {
+            Some(v) => writeln!(f, "  {key}: {v:.6}"),
+            None => writeln!(f, "  {key}: null"),
+        }
+        .map_err(|e| e.to_string())?;
+    }
 
     if !result.prior_summary.is_empty() {
         writeln!(f, "\nparameter_priors:").map_err(|e| e.to_string())?;
@@ -4257,8 +4280,8 @@ mod tests {
             covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
-            aic: 0.0,
-            bic: 0.0,
+            aic: Some(0.0),
+            bic: Some(0.0),
             theta: Vec::new(),
             theta_names: Vec::new(),
             eta_names: Vec::new(),
@@ -4411,8 +4434,8 @@ mod tests {
         r.method_chain = vec![EstimationMethod::FoceI];
         r.converged = true;
         r.ofv = 123.45;
-        r.aic = 130.0;
-        r.bic = 140.0;
+        r.aic = Some(130.0);
+        r.bic = Some(140.0);
         r.n_subjects = 12;
         r.n_obs = 96;
         r.n_parameters = 4;
@@ -5785,8 +5808,8 @@ mod tests {
             covariance_wall_time_secs: 0.0,
             converged: true,
             ofv: 0.0,
-            aic: 0.0,
-            bic: 0.0,
+            aic: Some(0.0),
+            bic: Some(0.0),
             theta: Vec::new(),
             theta_names: Vec::new(),
             eta_names: Vec::new(),
@@ -8271,6 +8294,67 @@ mod tests {
         assert!(!summary.contains("marginal"), "{summary}");
         let yaml = objective_yaml(&r);
         assert!(yaml.contains("  ofv: 4326.600000\n  aic:"), "{yaml}");
+    }
+
+    /// #2973: a SAEM fit under the default `saem_ofv = saem` has no information criterion.
+    /// The YAML keeps the keys as `null`, the console says why and names the fix, and a
+    /// likelihood readout (`imp`) or a non-SAEM fit prints its numbers as before.
+    /// Mutations: print AIC/BIC from `ofv`; drop the fix from the n/a line; write `0` for the
+    /// key; swap the Saem/Imp arms of `ic_unavailable_line`.
+    #[test]
+    fn saem_default_prints_no_aic_bic_and_names_the_fix() {
+        use EstimationMethod::Saem;
+        let mut r = imp_objective_result(Saem, &[Saem], Some(KappaTreatment::NotApplicable));
+        r.saem_objective = Some(SaemObjective {
+            kind: SaemOfv::Saem,
+            mc_standard_error: None,
+            n_samples: None,
+            n_nodes: None,
+            foce_ofv: 4326.6,
+        });
+        r.aic = None;
+        r.bic = None;
+        let summary = format_summary(&r);
+        assert!(
+            summary.contains(
+                "AIC/BIC: n/a \u{2014} the SAEM objective is not a likelihood; set saem_ofv = imp \
+                 (or agq/focei) for information criteria"
+            ),
+            "{summary}"
+        );
+        assert!(
+            !summary.contains("AIC:  ") && !summary.contains("BIC:  "),
+            "{summary}"
+        );
+        let yaml = objective_yaml(&r);
+        assert!(yaml.contains("  aic: null\n  bic: null\n"), "{yaml}");
+
+        // A likelihood readout prints both numbers and no n/a line.
+        r.saem_objective.as_mut().unwrap().kind = SaemOfv::Imp;
+        r.aic = Some(4400.0);
+        r.bic = Some(4410.0);
+        let summary = format_summary(&r);
+        assert!(summary.contains("AIC:  4400.0000") && summary.contains("BIC:  4410.0000"));
+        assert!(!summary.contains("AIC/BIC: n/a"), "{summary}");
+        let yaml = objective_yaml(&r);
+        assert!(
+            yaml.contains("  aic: 4400.000000\n  bic: 4410.000000\n"),
+            "{yaml}"
+        );
+
+        // A non-SAEM fit with no criterion (no likelihood at all) says so without the SAEM advice.
+        r.saem_objective = None;
+        r.aic = None;
+        r.bic = None;
+        let summary = format_summary(&r);
+        assert!(summary.contains("AIC/BIC: n/a"), "{summary}");
+        assert!(
+            !summary.contains(
+                "saem_ofv = imp \
+             (or"
+            ),
+            "{summary}"
+        );
     }
 
     /// #2973: a SAEM fit whose OFV is the importance-sampled (or quadrature) −2 log L says so

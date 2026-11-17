@@ -1111,7 +1111,7 @@ After the SAEM iterations complete:
    check it yourself (RSE, σ-correlation, profile likelihood), and on sparse
    data prefer the importance-sampling −2LL over the Laplace OFV when judging
    whether the additive term is real.
-3. **Reported OFV**: Report NONMEM's SAEM objective (`SAEMOBJ`, `saem_ofv = saem`, the default; not a likelihood) at the final estimates as `ofv`. The importance-sampled `−2 log L` (NONMEM `$EST METHOD=IMP EONLY=1`, `saem_ofv = imp`) is the explicit follow-up. AIC and BIC are built from the FOCE/Laplace objective at the same estimates, which is kept as a separately labelled diagnostic (see [The reported OFV](#saem-reported-ofv))
+3. **Reported OFV**: Report NONMEM's SAEM objective (`SAEMOBJ`, `saem_ofv = saem`, the default; not a likelihood) at the final estimates as `ofv`. The importance-sampled `−2 log L` (NONMEM `$EST METHOD=IMP EONLY=1`, `saem_ofv = imp`) is the explicit follow-up. There is no AIC or BIC for it (`aic` / `bic` are `None` / `null`, as NONMEM reports none); the FOCE/Laplace objective at the same estimates is kept as a separately labelled diagnostic (see [The reported OFV](#saem-reported-ofv))
 4. **Covariance Step**: Optionally compute standard errors via the covariance step's Hessian (same method as FOCE: the exact R matrix in scope, the finite-difference stencil outside it) — on the FOCEI objective for an all-Gaussian model, and on the quadrature marginal when the model has a non-Gaussian endpoint (see [below](#saem-covariance-non-gaussian))
 5. **Diagnostics**: Compute PRED, IPRED, CWRES, IWRES for each subject
 
@@ -1124,8 +1124,10 @@ complete-data objective that is *not a likelihood*, and follows `METHOD=SAEM` wi
 SAEM fit is the SAEM objective, and the importance-sampled `−2 log L` is the explicit follow-up
 (`saem_ofv = imp`, or `method = [saem, imp]` with `imp_eval_only = true`). **Do not compare the
 SAEM objective across models or with a FOCE/FOCEI/IMP objective**: it is −2210 on the shared-θ
-anchor where the exact marginal is −1199. AIC and BIC are therefore built from the FOCE/Laplace
-value at the same estimates (`saem_objective.foce_ofv`) under the default; rank models by the
+anchor where the exact marginal is −1199. AIC and BIC are therefore absent under the default
+(`FitResult::aic` / `bic` are `None`, `aic: null` in `fit.yaml`; model search and the other
+ranking tools stop with an error naming `saem_ofv = imp`). Set `saem_ofv = imp`, `agq` or
+`focei` for information criteria, built from that likelihood value; rank models by the
 importance-sampled objective (see
 [the `iiv_on_ruv` example](importance-sampling.qmd#adaptive-evaluation) for why the Laplace value
 is biased where SAEM is usually chosen).
@@ -1140,10 +1142,10 @@ is biased where SAEM is usually chosen).
 
 | `saem_ofv` | `ofv` | AIC, BIC | Notes |
 |---|---|---|---|
-| `saem` (default) | NONMEM's `SAEMOBJ` | FOCE/Laplace value | Free (accumulated from the E-step's draws). IOV models average the joint density of data, η and κ draws; a model with no random effects reports the data `−2 log L`. A mixture has no NONMEM-anchored convention, so it reports the `imp` value **with a warning** naming the fallback. |
-| `imp` | importance-sampled `−2 log L`, NONMEM `IMP EONLY=1` | `ofv` | `saem_ofv_samples` draws per subject (3000, the `ISAMPLE=3000` setting the [NONMEM comparison](importance-sampling.qmd#nonmem-comparison) uses), seeded by `imp_seed` so two runs agree to the bit. Carries a Monte-Carlo standard error. |
-| `agq` | adaptive Gauss–Hermite quadrature at the final estimates | `ofv` | Deterministic and exact up to the node count; `saem_ofv_nodes ^ n_eta` evaluations per subject, so up to three random effects. A mixture or a model with more random effects falls back to `imp` with a warning. A natural cross-check of the IS value. |
-| `focei` | the FOCE/Laplace objective | `ofv` | The behaviour before #2973, and the value that is directly comparable with a FOCE/FOCEI fit. |
+| `saem` (default) | NONMEM's `SAEMOBJ` | none (`None`) | Free (accumulated from the E-step's draws). IOV models average the joint density of data, η and κ draws; a model with no random effects reports the data `−2 log L`. A mixture has no NONMEM-anchored convention, so it reports the `imp` value **with a warning** naming the fallback. |
+| `imp` | importance-sampled `−2 log L`, NONMEM `IMP EONLY=1` | from `ofv` | `saem_ofv_samples` draws per subject (3000, the `ISAMPLE=3000` setting the [NONMEM comparison](importance-sampling.qmd#nonmem-comparison) uses), seeded by `imp_seed` so two runs agree to the bit. Carries a Monte-Carlo standard error. |
+| `agq` | adaptive Gauss–Hermite quadrature at the final estimates | from `ofv` | Deterministic and exact up to the node count; `saem_ofv_nodes ^ n_eta` evaluations per subject, so up to three random effects. A mixture or a model with more random effects falls back to `imp` with a warning. A natural cross-check of the IS value. |
+| `focei` | the FOCE/Laplace objective | from `ofv` | The behaviour before #2973, and the value that is directly comparable with a FOCE/FOCEI fit. |
 
 #### What the SAEM objective is {#saem-objective-definition}
 

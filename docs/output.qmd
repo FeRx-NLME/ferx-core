@@ -377,8 +377,9 @@ Space](estimation/parameterization.qmd) for the full layout and bounds.
 
 A SAEM fit reports NONMEM's SAEM objective (`SAEMOBJ`) as `ofv` by default (`saem_ofv = saem`),
 which is not a likelihood; `objective_function` then carries `ofv_type: saem_objective` and
-`ofv_foce_laplace`, the FOCE/Laplace value at the same estimates, from which AIC and BIC are
-built. Under `saem_ofv = imp` (or `agq`) `ofv` is the importance-sampled `−2 log L` and
+`ofv_foce_laplace`, the FOCE/Laplace value at the same estimates. There is no AIC or BIC for it:
+`aic` and `bic` are written as `null` and the console prints `AIC/BIC: n/a` with the fix
+(`saem_ofv = imp`, or `agq` / `focei`). Under `saem_ofv = imp` (or `agq`) `ofv` is the importance-sampled `−2 log L` and
 `objective_function` carries `ofv_type: importance_sampling` (or `agq`),
 `ofv_mc_standard_error`, `ofv_n_samples` (or `ofv_n_nodes`) and `ofv_foce_laplace`; AIC and BIC
 are built from `ofv`. See [The reported OFV](estimation/saem.qmd#saem-reported-ofv).
@@ -471,7 +472,8 @@ which the fit JSON and the `.fitrx` bundle carry as `starts`.
   qualify it, always present (`[]` when there are none). See [Fit
   status](#fit-status) (#2799).
 - **ofv**: Objective Function Value (-2 log-likelihood)
-- **aic**: Akaike Information Criterion (OFV + 2p)
+- **aic**: Akaike Information Criterion (OFV + 2p); `null` when the reported objective is not a
+  likelihood (a SAEM fit under the default `saem_ofv = saem`, #2973)
 - **bic**: Bayesian Information Criterion (OFV + p * ln(n), with n the number of
   observations). The Delattre-style variants a model search ranks on (`mixed`,
   `iiv`, `random`) are computed from the same result by `ferx_core::bic()` — see

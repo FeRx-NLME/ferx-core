@@ -88,8 +88,8 @@ fn bic_variants_match_hand_computed_penalties() {
 fn bic_fixed_reproduces_fit_result_bic_bit_for_bit() {
     // The same expression `fit()` evaluates, so `Fixed` is not merely close.
     let mut r = pheno_like();
-    r.bic = r.ofv + r.n_parameters as f64 * (r.bic_inputs.n_obs as f64).ln();
-    assert_eq!(bic(&r, BicType::Fixed).to_bits(), r.bic.to_bits());
+    r.bic = Some(r.ofv + r.n_parameters as f64 * (r.bic_inputs.n_obs as f64).ln());
+    assert_eq!(bic(&r, BicType::Fixed).to_bits(), r.bic.unwrap().to_bits());
 }
 
 #[test]
@@ -1079,4 +1079,22 @@ fn a_regularized_covariance_fails_the_matrix_reading_gates() {
         ..Strictness::default()
     };
     assert!(check_strictness(&r, &others_on).passed);
+}
+
+/// #2973: a fit with no information criterion (`FitResult::bic` is `None`) has no BIC of any
+/// type, whatever its `ofv` holds. Mutation: drop the `bic.is_none()` arm of `bic()`.
+#[test]
+fn bic_variants_are_nan_without_a_likelihood() {
+    let mut r = pheno_like();
+    r.bic = None;
+    for kind in [
+        BicType::Mixed,
+        BicType::Iiv,
+        BicType::Random,
+        BicType::Fixed,
+    ] {
+        assert!(bic(&r, kind).is_nan(), "{kind:?}");
+    }
+    r.bic = Some(100.0);
+    assert!(bic(&r, BicType::Fixed).is_finite());
 }
