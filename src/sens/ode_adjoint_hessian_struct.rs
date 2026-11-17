@@ -1374,7 +1374,7 @@ impl CovPlan<'_> {
         // FOCE under an `f`-dependent variance reads the population predictions too.
         let need_pop = family == Family::Foce && f_dep;
         self.prepare(along);
-        let kt = super::pass_width();
+        let kt = super::pass_width(true, along.len());
         let nq = if self.second { pn * (pn + 1) / 2 } else { 0 };
         let base = Layout {
             n: pn as u16,

@@ -5962,34 +5962,35 @@ fn cov_hessian_matches_profile_fd_closed_form_focei_and_foce() {
     assert!(fd < 1e-5, "FOCE vs FD {fd:.2e}");
 }
 
-/// The covariance Hessian's production passes (`MAX_PASS` = 2 directions each, forward over
-/// reverse) equal one direction per pass (`PASS_WIDTH_CAP` = 1), on a plain subject, an AGQ one
-/// (`n_agq = 3`, non-exact anchor), an IOV one (stacked η/κ widths, per-occasion tangents) and,
-/// with `nn`, a reduced-basis `[covariate_nn]` one. Width 2 over 7 packed axes leaves a ragged
-/// last pass, so an offset taken from the pass's own width rather than the planned one
-/// misplaces columns; width 1 has none, and is the reference. Measured: bit-identical (a
-/// column's arithmetic does not see the other tangent); a misplaced column moves the matrix by
-/// O(1) of its largest entry.
+/// The covariance Hessian's production passes (structured: one pass of every direction;
+/// recorded: one per direction) equal passes of exactly one and of two directions
+/// (`PASS_WIDTH`), on a plain subject, an AGQ one (`n_agq = 3`, non-exact anchor), an IOV one
+/// (stacked η/κ widths, per-occasion tangents) and, with `nn`, a reduced-basis `[covariate_nn]`
+/// one. Width 2 over 7 packed axes leaves a ragged last pass, so an offset taken from the pass's
+/// own width rather than the planned one misplaces columns; width 1 has none, and is the
+/// reference. Measured: equal to rounding (a column's arithmetic does not see the other
+/// tangent); a misplaced column moves the matrix by O(1) of its largest entry.
 fn narrow_equals_production(label: &str, model: &CompiledModel, s: &Subject, o: Objective) {
-    use super::hessian::PASS_WIDTH_CAP;
+    use super::hessian::PASS_WIDTH;
     let params = moved_params(model);
     let x = pack_params(&params);
     let eta = ebe_for(model, s, &params, 1e-12, o != Objective::Foce);
-    let run = |cap: Option<usize>| {
+    let run = |w: Option<usize>| {
         with_fit_stack(|| {
-            PASS_WIDTH_CAP.with(|c| c.set(cap));
+            PASS_WIDTH.with(|c| c.set(w));
             let h = subject_adjoint_cov_hessian(model, s, &params, &x, eta.as_slice(), o);
-            PASS_WIDTH_CAP.with(|c| c.set(None));
+            PASS_WIDTH.with(|c| c.set(None));
             h
         })
         .unwrap_or_else(|| panic!("{label}: in scope"))
     };
-    let production = run(None);
     let narrow = run(Some(1));
-    assert_eq!(narrow.shape(), production.shape(), "{label}: shape");
-    let worst = rel_gap(narrow.as_slice(), production.as_slice());
-    eprintln!("{label}: width 1 vs 2: {worst:.2e}");
-    assert!(worst < 1e-12, "{label}: width 1 vs 2: {worst:.2e}");
+    for (name, h) in [("width 2", run(Some(2))), ("production", run(None))] {
+        assert_eq!(narrow.shape(), h.shape(), "{label}: shape");
+        let worst = rel_gap(narrow.as_slice(), h.as_slice());
+        eprintln!("{label}: width 1 vs {name}: {worst:.2e}");
+        assert!(worst < 1e-12, "{label}: width 1 vs {name}: {worst:.2e}");
+    }
 }
 
 #[test]

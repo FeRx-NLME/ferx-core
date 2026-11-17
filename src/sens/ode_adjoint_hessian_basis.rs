@@ -507,11 +507,11 @@ impl CovPlan<'_> {
         }
         drop(moved);
         if !self.bases.borrow().contains_key(&key) {
-            // One axis per run. A compiled kernel's code grows with its tangent width while the
-            // calls that amortize its interpretation and compile shrink with it; the arithmetic
-            // is the same however the axes are split. So the narrowest kernel is the cheapest:
-            // one shape for every subject and axis count, compiled once and called most.
-            let bw = 1;
+            // One run carries every axis: the plan's primal (an ODE solve, a superposition) is
+            // computed once per subject, not once per axis — the cost that grows with patients
+            // and timepoints. Its kernels' code grows with the axes, but each is compiled once
+            // per model and called for every subject and step.
+            let bw = axes.len();
             let runs = axes
                 .chunks(bw)
                 .map(|ch| {

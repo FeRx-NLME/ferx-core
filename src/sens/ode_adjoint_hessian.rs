@@ -22,11 +22,11 @@
 //! - The plan's value forward and one reverse seeded with each output give the gradients of
 //!   `F` and of every `g_k` with respect to every input: `∇_η F`, `H` and `∂g` along any
 //!   direction at once (`mode_response`).
-//! - Per pass of [`MAX_PASS`] directions, the plan's forward along their `u_a` (its tangent
-//!   layout) and one forward-over-reverse sweep seeded with `Ψ_w` on the value lanes give, on
-//!   the adjoints' tangent lanes, their Hessian columns `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`,
-//!   contracted with every `u_b` (`psi_along`): `⌈n / MAX_PASS⌉` passes of one compiled
-//!   program, its layout shared by every pass (#2980).
+//! - Per pass, the plan's forward along the pass's directions `u_a` (its tangent layout) and
+//!   one forward-over-reverse sweep seeded with `Ψ_w` on the value lanes give, on the
+//!   adjoints' tangent lanes, their Hessian columns `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`, contracted
+//!   with every `u_b` (`psi_along`). A structured subject ([`st`]) takes one pass of every
+//!   direction; the recorded kernel one pass per direction ([`pass_width`], #2980).
 //!
 //! There are no third-order sensitivity tables and no finite differences, and FOCE's
 //! frozen-variance mode (whose `R⁰` moves with θ through `f(η = 0)`) is just another term
@@ -45,20 +45,6 @@ pub(super) mod basis;
 use basis::{Basis, Lanes, Moved, MuFold, PlanKey, PlanRun};
 #[path = "ode_adjoint_hessian_struct.rs"]
 pub(super) mod st;
-
-/// The most directions one pass carries as the plans' tangent lanes.
-///
-/// A pass is one forward along its directions and one forward-over-reverse sweep over
-/// `1 + width` lanes. Fewer, wider passes are fewer lane-operations, but the covariance step
-/// builds its kernels per subject and runs each a handful of times, so what a pass costs is
-/// mostly building and first-tier running a kernel of its width; one narrow layout is built
-/// once and serves every pass. Measured (#2980; ci-fast, instructions; 22 covariance sets —
-/// FOCE, FOCEI, Laplace and AGQ under both anchors, closed form and ODE), the covariance step
-/// against the reverse per direction at 4 it replaced: width 1 0.77×, 2 0.60×, 4 0.67×, 8 0.74×,
-/// one pass of every direction 0.80× (its JIT compile time 440 ms against 203 ms on
-/// `pk2_big_cov`; on a 50-effect Laplace subject 7.3 GB against 1.19 GB). At 2 every set was
-/// faster, 0.41× to 0.80×.
-const MAX_PASS: usize = 2;
 
 /// A direction of a pass: the packed coordinate it moves, the `[covariate_nn]` raw output
 /// it moves (the reduced basis, [`NnReduction`]), and its η tangent (empty: none).
@@ -339,23 +325,26 @@ fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix
         .then(|| (wv.iter().copied().collect(), eta_x))
 }
 
-/// Directions per pass: [`MAX_PASS`] (fewer under the test cap), however few directions there
-/// are — a pass's unused lanes carry zeros, and one width means one compiled layout for a
-/// single-axis diagonal as for the full Hessian (#2980 review r3).
-fn pass_width() -> usize {
-    let w = MAX_PASS;
+/// Directions per pass of `n_dirs`. A structured subject's pass carries all of them: its
+/// compiled kernels are the reduce's, one tangent per run, and the plans' bases, run once
+/// whatever the directions. A recorded kernel's pass carries one: that kernel's code grows with
+/// the width a pass carries while its arithmetic does not (#2980).
+fn pass_width(structured: bool, n_dirs: usize) -> usize {
     #[cfg(test)]
-    return PASS_WIDTH_CAP
-        .with(|c| c.get())
-        .map_or(w, |cap| w.min(cap.max(1)));
-    #[cfg(not(test))]
-    w
+    if let Some(w) = PASS_WIDTH.with(std::cell::Cell::get) {
+        return w.max(1);
+    }
+    if structured {
+        n_dirs.max(1)
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Test switch: cap `psi_along`'s directions per pass.
-    pub(crate) static PASS_WIDTH_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Test switch: every pass carries exactly this many directions (the last one fewer).
+    pub(crate) static PASS_WIDTH: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 fn hessian_with(
@@ -447,14 +436,7 @@ fn psi_lanes(
     mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
     let n = plan.pn();
-    // A structured subject runs no large kernel per pass (its plans come from their bases, its
-    // likelihood kernel is the rows and the reduce): one pass carries every direction, so the
-    // passes' fixed work is paid once.
-    let width = if plan.structured() && !dirs.is_empty() {
-        dirs.len()
-    } else {
-        pass_width()
-    };
+    let width = pass_width(plan.structured(), dirs.len());
     let l = 1 + width;
     plan.prepare(dirs);
     for (c, chunk) in dirs.chunks(width).enumerate() {
@@ -703,8 +685,8 @@ impl<'s> NnReduction<'s> {
             let mut jcols: Vec<Vec<f64>> = vec![vec![0.0; n_z]; n_w];
             // The network as a plan over θ's packed coordinates (#2786): its outputs' rows from
             // one reverse per output, and per output the Hessian columns along the weights in
-            // blocks of `MAX_PASS`, one forward-over-reverse sweep per block (as `psi_lanes`,
-            // #2980).
+            // passes of [`pass_width`] (a recorded kernel's), one forward-over-reverse sweep per
+            // pass (as `psi_lanes`, #2980).
             let record = |lv: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
                 let th = unpack_theta(template, |m| lv[m]);
                 let out = model.covariate_nns[net]
@@ -713,7 +695,7 @@ impl<'s> NnReduction<'s> {
                 (out.len() == mlp_out).then_some(out)
             };
             let variant = super::kernel::variant_of(&(7u8, net, off, n_w));
-            let width = pass_width();
+            let width = pass_width(false, n_w);
             let run = |dirs: &[usize]| {
                 let (layout, l) = if dirs.is_empty() {
                     (Layout::F64, 1)
