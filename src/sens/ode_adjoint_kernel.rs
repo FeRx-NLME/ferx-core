@@ -251,47 +251,36 @@ pub(super) fn kernel_run_shared(
         .with_kind(KERNEL_KIND)
         .with_variant(variant)
         .family();
-    let cached = SHARED.with(|c| {
+    // Every plan recorded under the key: a recorded program carries the branches its recording
+    // point took as guards, so a point on another branch is served by the plan recorded there.
+    let cached: Vec<Arc<kj::Plan>> = SHARED.with(|c| {
         c.borrow()
             .iter()
-            .find(|(k, _)| *k == key)
+            .filter(|(k, _)| *k == key)
             .map(|(_, p)| p.clone())
+            .collect()
     });
-    let plan = match cached {
-        Some(p) => p,
-        None => {
-            let rec = kj::recorded(&key, || {
-                let leaves: Vec<kj::Tr> =
-                    (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
-                f(&leaves)
-                    .filter(|y| y.len() == n_out)
-                    .map(|y| y.iter().map(|x| x.reg()).collect())
-            })
-            .ok()?;
-            let p = Arc::new(rec.plan(Layout::F64, 0, n_in)?);
-            SHARED.with(|c| {
-                let mut c = c.borrow_mut();
-                if c.len() >= KEEP {
-                    c.remove(0);
-                }
-                c.push((key, p.clone()));
-            });
-            p
+    for plan in &cached {
+        if let Some(kr) = KernelRun::of_plan(plan, layout, inputs, n_out) {
+            return Some(kr);
         }
-    };
-    let mut out = kj::Buf::new((n_out + 1) * l);
-    let fwd = plan.forward_layout(layout, &[], inputs, &mut out)?;
-    if out[n_out * l] != 1.0 {
-        return None;
     }
-    Some(KernelRun {
-        plan,
-        fwd,
-        layout,
-        n_in,
-        n_out,
-        out,
+    let rec = kj::recorded(&key, || {
+        let leaves: Vec<kj::Tr> = (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
+        f(&leaves)
+            .filter(|y| y.len() == n_out)
+            .map(|y| y.iter().map(|x| x.reg()).collect())
     })
+    .ok()?;
+    let p = Arc::new(rec.plan(Layout::F64, 0, n_in)?);
+    SHARED.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= KEEP {
+            c.remove(0);
+        }
+        c.push((key, p.clone()));
+    });
+    KernelRun::of_plan(&p, layout, inputs, n_out)
 }
 
 /// A kernel configuration's [`kj::SubjectKey`] variant: everything that shapes the kernel's

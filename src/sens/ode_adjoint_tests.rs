@@ -11935,3 +11935,51 @@ fn structured_reduce_is_shared_across_subjects_exactly() {
         assert!(g1 < 1e-12 && g2 < 1e-12, "{g1:.2e} {g2:.2e}");
     });
 }
+
+/// A shared kernel (`kernel_run_shared`) serves a point on the other side of a branch its
+/// first recording took: the recording carries that branch as a guard, so the second point
+/// fails it and is served by a plan recorded there — the Laplace reduce factors `H` or
+/// jitters it per subject (`factor_anchor`), on one shared key. The straddle is asserted:
+/// both points must take the same key and opposite branches, and each value is the branch's
+/// own closed form. Mutation: serve only the first plan under a key → the second point
+/// declines (`None`); serve it without its guard → the second point gets `x²` (= 9, not 6).
+#[test]
+fn shared_kernel_serves_both_sides_of_a_recorded_branch() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    use crate::sens::num::vm::Layout;
+    use crate::sens::num::{BranchCmp, PkNum};
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let taken = std::cell::RefCell::new(Vec::new());
+    let f = |lv: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
+        let x = lv[0];
+        let pos = x.br_cmp_c(BranchCmp::Gt, 0.0);
+        taken.borrow_mut().push(pos);
+        Some(vec![if pos {
+            x * x
+        } else {
+            x * <kj::Tr as PkNum>::from_f64(-3.0)
+        }])
+    };
+    let variant = super::kernel::variant_of(&("branch test", 1u8));
+    let run = |v: f64| {
+        super::kernel::kernel_run_shared(&model, &s, variant.clone(), Layout::F64, &[v], 1, &f)
+            .map(|k| k.value(0))
+    };
+    let a = run(2.0).expect("first point records");
+    let b = run(-2.0).expect("the other branch is served by its own recording");
+    let c = run(3.0).expect("the first branch is served again");
+    // A family-template replay may run the recorder once more on the new branch before it
+    // records afresh; what matters is that both branches were recorded and nothing after.
+    let t = taken.borrow();
+    assert!(
+        t[0] && t[1..].iter().all(|p| !p) && t.len() >= 2,
+        "the straddle: the first point positive, the second recorded on the other branch: {t:?}"
+    );
+    assert_eq!((a, b, c), (4.0, 6.0, 9.0));
+}

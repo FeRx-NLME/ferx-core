@@ -709,6 +709,26 @@ pub(crate) fn foce_row<T: PkNum>(
     Some([iv * e * e, iv * e, iv, v.ln()])
 }
 
+/// Row `j` of the Laplace objective as the structured covariance Hessian reads it (#2980):
+/// `(ℓ, ℓ′, ℓ″)` of [`row_l`] in its prediction — the row term and the derivatives
+/// [`inner_hessian_through_predictions`] builds the exact inner Hessian from.
+pub(crate) fn laplace_row<T: PkNum>(ctx: &LikCtx, j: usize, f: T, p: &ParT<T>) -> Option<[T; 3]> {
+    let pl = p.map_rows(d2_const);
+    let el: [D2<T>; 1] = [d2_const(T::from_f64(0.0))];
+    let fj = d2_seed(f);
+    let l = row_l(
+        ctx,
+        j,
+        fj,
+        fj,
+        d2_const(T::from_f64(0.0)),
+        d2_const(T::from_f64(1.0)),
+        &el,
+        &pl,
+    )?;
+    Some([l.v.v, l.v.g[0], l.g[0].g[0]])
+}
+
 /// Whether [`foce_f`] takes its Woodbury form at `S = LᵀGᵀD⁻¹GL` with trace `tr_s` — the
 /// form the structured FOCE kernel is (#2980): otherwise production factors `R̃` itself.
 pub(crate) fn foce_woodbury_ok(tr_s: f64) -> bool {

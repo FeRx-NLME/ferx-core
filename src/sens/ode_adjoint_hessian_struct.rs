@@ -11,7 +11,10 @@
 //!   `Ψ_w = ½[Σℓ + ηᵀΩ⁻¹η + log|Ω| + log|Ω⁻¹ + S|] − wᵀ(Ω⁻¹η + ½B)`;
 //! - FOCE (Woodbury): `(iv·e², iv·e, iv, log V)` → `E`, `c = Σ iv·e·G`, `S = Σ iv·GGᵀ`, `LR`;
 //!   with `A = I + LᵀSL` (`Ω = LLᵀ`), `Ψ_w = ½[E + 2cᵀη + ηᵀSη − (c+Sη)ᵀLA⁻¹Lᵀ(c+Sη) + LR +
-//!   log|A|] − wᵀ(Ω⁻¹η − c)`.
+//!   log|A|] − wᵀ(Ω⁻¹η − c)`;
+//! - Laplace (one node, the exact anchor): `(ℓ, ℓ′, ℓ″)` → `Σℓ`, `B = Σ ℓ′·G`,
+//!   `S = Σ ℓ″·GGᵀ`, `T = Σ ℓ′·Q` (`Q` the prediction's packed η-Hessian, a fourth monomial);
+//!   `H = Ω⁻¹ + ½(S + T)`, `Ψ_w = ½[Σℓ + ηᵀΩ⁻¹η + log|Ω|] + ½log|H| − wᵀ(Ω⁻¹η + ½B)`.
 //!
 //! So the adjoint tangents the sweep would return are assembled from: the rows, once per
 //! subject on a second-order dual over their local inputs (the same row functions production's
@@ -24,7 +27,8 @@ use super::basis::Input;
 use super::*;
 use crate::sens::dual2::Dual2;
 use crate::sens::focei_kernel::{
-    chol, foce_row, foce_woodbury_ok, focei_gauss_row, prior_of, structured_rows_supported,
+    chol, foce_row, foce_woodbury_ok, focei_gauss_row, laplace_row, prior_of,
+    structured_rows_supported,
 };
 
 /// A row's local dual: its prediction, its population prediction (FOCE), then up to `NL − 2`
@@ -53,6 +57,8 @@ enum Mono {
     One,
     G,
     Gg,
+    /// The prediction's packed η-Hessian (Laplace's exact anchor).
+    Q,
 }
 
 /// The objective's structured form.
@@ -60,13 +66,23 @@ enum Mono {
 enum Family {
     Focei,
     Foce,
+    Laplace,
 }
 
 impl Family {
-    fn monos(self) -> &'static [Mono] {
+    /// The aggregates: `(row scalar, monomial)`; a scalar may feed several.
+    fn aggs(self) -> &'static [(usize, Mono)] {
         match self {
-            Family::Focei => &[Mono::One, Mono::G, Mono::Gg],
-            Family::Foce => &[Mono::One, Mono::G, Mono::Gg, Mono::One],
+            Family::Focei => &[(0, Mono::One), (1, Mono::G), (2, Mono::Gg)],
+            Family::Foce => &[(0, Mono::One), (1, Mono::G), (2, Mono::Gg), (3, Mono::One)],
+            Family::Laplace => &[(0, Mono::One), (1, Mono::G), (2, Mono::Gg), (1, Mono::Q)],
+        }
+    }
+    /// Row scalars.
+    fn n_scalars(self) -> usize {
+        match self {
+            Family::Focei | Family::Laplace => 3,
+            Family::Foce => 4,
         }
     }
 }
@@ -81,6 +97,8 @@ pub(super) struct Rows {
     /// Per row its scalars on the local dual.
     s: Vec<Vec<Dual2<NL>>>,
     g: Vec<Vec<f64>>,
+    /// Per row its packed η-Hessian (Laplace; empty otherwise).
+    q: Vec<Vec<f64>>,
     /// The aggregates, concatenated in [`Family::monos`] order.
     aggr: Vec<f64>,
 }
@@ -91,16 +109,16 @@ fn tri(k: usize, l: usize) -> usize {
     k * (k + 1) / 2 + l
 }
 
-/// Each monomial's offset in the aggregate vector, and the total width.
-fn offsets(monos: &[Mono], m: usize) -> (Vec<usize>, usize) {
-    let mut at = Vec::with_capacity(monos.len());
+/// Each aggregate's offset in the aggregate vector, and the total width.
+fn offsets(aggs: &[(usize, Mono)], m: usize) -> (Vec<usize>, usize) {
+    let mut at = Vec::with_capacity(aggs.len());
     let mut w = 0;
-    for mono in monos {
+    for (_, mono) in aggs {
         at.push(w);
         w += match mono {
             Mono::One => 1,
             Mono::G => m,
-            Mono::Gg => m * (m + 1) / 2,
+            Mono::Gg | Mono::Q => m * (m + 1) / 2,
         };
     }
     (at, w)
@@ -140,6 +158,7 @@ impl Prep {
         match mono {
             Mono::One => Prep::One(a[0]),
             Mono::G => Prep::G(a[..m].to_vec()),
+            Mono::Q => Prep::G(a[..m * (m + 1) / 2].to_vec()),
             Mono::Gg => Prep::Gg(sym(a, m)),
         }
     }
@@ -174,8 +193,8 @@ fn back(a: &Prep, g: &[f64], r: f64, dg: &mut [f64], qg: &mut [f64]) -> f64 {
 }
 
 /// [`back`]'s tangent along a direction moving the aggregate adjoint by `ad`, the scalar by
-/// `rd` and `G` by `gd`: the scalar adjoint's tangent, and the `G`-adjoint's into `dgd`.
-/// `sc` is scratch of width `3m`.
+/// `rd` and `G` by `gd`: the scalar adjoint's tangent, and the `G`-adjoint's into `dgd`. `qg`
+/// is `P·G` as [`back`] left it (a `Gg` aggregate; direction-free), `sc` scratch of width `2m`.
 #[allow(clippy::too_many_arguments)]
 fn back_t(
     a: &Prep,
@@ -184,6 +203,7 @@ fn back_t(
     gd: &[f64],
     r: f64,
     rd: f64,
+    qg: &[f64],
     dgd: &mut [f64],
     sc: &mut [f64],
 ) -> f64 {
@@ -197,9 +217,7 @@ fn back_t(
         }
         (Prep::Gg(q), Prep::Gg(qd)) => {
             let m = g.len();
-            let (qg, rest) = sc.split_at_mut(m);
-            let (qdg, qgd) = rest.split_at_mut(m);
-            mv_into(q, g, qg);
+            let (qdg, qgd) = sc.split_at_mut(m);
             mv_into(qd, g, qdg);
             mv_into(q, gd, &mut qgd[..m]);
             for k in 0..m {
@@ -215,8 +233,9 @@ fn back_t(
 fn aggr_t(mono: Mono, g: &[f64], gd: &[f64], r: f64, rd: f64, m: usize, out: &mut [f64]) {
     match mono {
         Mono::One => out[0] += rd,
-        Mono::G => {
-            for k in 0..m {
+        // `G`, or `Q` (a vector of its own length).
+        Mono::G | Mono::Q => {
+            for k in 0..g.len() {
                 out[k] += rd * g[k] + r * gd[k];
             }
         }
@@ -238,6 +257,10 @@ impl CovPlan<'_> {
         let fam = match self.objective {
             Objective::Focei => Family::Focei,
             Objective::Foce => Family::Foce,
+            Objective::Agq {
+                n_agq: 1,
+                exact: true,
+            } => Family::Laplace,
             Objective::Agq { .. } => return None,
         };
         (!struct_off()
@@ -262,6 +285,7 @@ impl CovPlan<'_> {
         f: &dyn Fn(usize) -> f64,
         fp: &dyn Fn(usize) -> Option<f64>,
         gv: &dyn Fn(usize, usize) -> f64,
+        qv: &dyn Fn(usize, usize) -> f64,
         xv: &dyn Fn(usize) -> f64,
     ) -> Option<std::cell::Ref<'_, Rows>> {
         if self.st_rows.borrow().is_none() {
@@ -291,10 +315,16 @@ impl CovPlan<'_> {
                 &theta,
                 xo,
             )?;
-            let monos = family.monos();
-            let (at, na) = offsets(monos, pn);
+            let aggs = family.aggs();
+            let (at, na) = offsets(aggs, pn);
+            let nq = if family == Family::Laplace {
+                pn * (pn + 1) / 2
+            } else {
+                0
+            };
             let mut s = Vec::with_capacity(n_obs);
             let mut g = Vec::with_capacity(n_obs);
+            let mut qs = Vec::with_capacity(n_obs);
             let mut aggr = vec![0.0; na];
             for j in 0..n_obs {
                 let fd = Dual2::var(f(j), 0);
@@ -312,14 +342,18 @@ impl CovPlan<'_> {
                         };
                         foce_row(self.ctx, j, fd, r_eval, &p)?.to_vec()
                     }
+                    Family::Laplace => laplace_row(self.ctx, j, fd, &p)?.to_vec(),
                 };
                 let gj: Vec<f64> = (0..pn).map(|k| gv(j, k)).collect();
-                for (k, mono) in monos.iter().enumerate() {
-                    let zero = vec![0.0; pn];
-                    aggr_t(*mono, &gj, &zero, 0.0, r[k].value, pn, &mut aggr[at[k]..]);
+                let qj: Vec<f64> = (0..nq).map(|t| qv(j, t)).collect();
+                for (k, &(si, mono)) in aggs.iter().enumerate() {
+                    let v = if mono == Mono::Q { &qj } else { &gj };
+                    let zero = vec![0.0; v.len()];
+                    aggr_t(mono, v, &zero, 0.0, r[si].value, pn, &mut aggr[at[k]..]);
                 }
                 s.push(r);
                 g.push(gj);
+                qs.push(qj);
             }
             if family == Family::Foce {
                 // Production's gate: `1 + tr(LᵀSL)` (`S` the third aggregate).
@@ -343,6 +377,7 @@ impl CovPlan<'_> {
                 sig,
                 s,
                 g,
+                q: qs,
                 aggr,
             });
         }
@@ -363,13 +398,14 @@ impl CovPlan<'_> {
             ..Layout::F64
         };
         // The subject's reduce plan, looked up once (its key hashes the subject and the
-        // parameters); every later run goes straight to it.
-        if let Some(p) = self.st_reduce.borrow().as_ref() {
-            return super::kernel::KernelRun::of_plan(p, layout, rin, 1);
+        // parameters); every later run goes straight to it unless a guard sends it back.
+        let mine = self.st_reduce.borrow().clone();
+        if let Some(kr) = mine.and_then(|p| super::kernel::KernelRun::of_plan(&p, layout, rin, 1)) {
+            return Some(kr);
         }
         let pn = self.pn();
         let nx = self.nx;
-        let (at, na) = offsets(family.monos(), pn);
+        let (at, na) = offsets(family.aggs(), pn);
         let (model, subject, template, sc, so, ctx) = (
             self.sc.model,
             self.subject,
@@ -457,11 +493,34 @@ impl CovPlan<'_> {
                     }
                     Some(vec![c(0.5) * (quad + ag(at[3]) + chol_logdet(&la)) - wg])
                 }
+                Family::Laplace => {
+                    // The exact anchor `H = ½(Ω⁻¹ + Ω⁻ᵀ) + ½(S + T)`, factored by production's rule.
+                    let (s, t) = (mat(at[2]), mat(at[3]));
+                    let mut h: Vec<Vec<T>> = (0..pn)
+                        .map(|k| {
+                            (0..pn)
+                                .map(|l| {
+                                    c(0.5) * (oi[k][l] + oi[l][k]) + c(0.5) * (s[k][l] + t[k][l])
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let lh = factor_anchor(&mut h, &oi)?;
+                    let mut wg = c(0.0);
+                    for k in 0..pn {
+                        wg = wg + w(k) * (oieta[k] + c(0.5) * ag(at[1] + k));
+                    }
+                    Some(vec![
+                        c(0.5) * (ag(at[0]) + prior_of(ctx, &eta, &p)) + c(0.5) * chol_logdet(&lh)
+                            - wg,
+                    ])
+                }
             }
         };
         let tag = match family {
             Family::Focei => 7u8,
             Family::Foce => 8u8,
+            Family::Laplace => 9u8,
         };
         // Shared across subjects: the reduce reads no subject data. Its literals are Ω's
         // placed factor and the parameters at this point, so their bits key it.
@@ -486,22 +545,6 @@ impl CovPlan<'_> {
         Some(kr)
     }
 
-    /// Per row, its local inputs' tangents along direction `a` (`tan(slot, a)`): the
-    /// prediction, the population prediction, σ.
-    fn local_t(&self, rows: &Rows, sl: &Slots, j: usize, tan: &dyn Fn(usize) -> f64) -> [f64; NL] {
-        let mut u = [0.0; NL];
-        u[0] = tan(sl.f(j, 0));
-        let mut lane = 1;
-        if rows.pop_lane.is_some() {
-            u[1] = if sl.has_pop { tan(sl.pop + j) } else { 0.0 };
-            lane = 2;
-        }
-        for (q, &i) in rows.sig.iter().enumerate() {
-            u[lane + q] = tan(sl.x + i);
-        }
-        u
-    }
-
     /// The structured pass's forward over reverse: the buffer
     /// [`super::kernel::KernelRun::reverse_tangent`] returns for the kernel at `seed` (`Ψ_w`: `1`
     /// on `F`, `−w` on `g`, value lanes only) — per kernel input its value adjoint and its
@@ -522,28 +565,74 @@ impl CovPlan<'_> {
             &|j| val(sl.f(j, 0)),
             &|j| sl.has_pop.then(|| val(sl.pop + j)),
             &|j, k| val(sl.f(j, 1 + k)),
+            &|j, t| val(sl.f(j, 1 + pn + t)),
             &|i| val(sl.x + i),
         )?;
         let family = rows.family;
-        let monos = family.monos();
-        let (at, na) = offsets(monos, pn);
+        let aggs = family.aggs();
+        let (at, na) = offsets(aggs, pn);
+        let nq = rows.q.first().map_or(0, Vec::len);
         let n_obs = sl.n_obs;
-        let ud = |j: usize, a: usize| self.local_t(&rows, sl, j, &|s| tan(s, a));
-        let dot = |d: &Dual2<NL>, u: &[f64; NL]| (0..NL).map(|q| d.grad[q] * u[q]).sum::<f64>();
+        let kk = family.n_scalars();
+        // The live local lanes: prediction, population prediction (FOCE), σ.
+        let lane0 = 1 + usize::from(rows.pop_lane.is_some());
+        let nla = lane0 + rows.sig.len();
+        // Per row, its local lanes' kernel slots; per row and direction, the gathered tangents
+        // `u` (local), `Ġ`, `Q̇` and each scalar's `ṙ = ∇r·u` — read once, used by both loops.
+        let (o_g, o_q, o_r) = (NL, NL + pn, NL + pn + nq);
+        let stride = o_r + kk;
+        let mut tg = vec![0.0; n_obs * kt * stride];
+        let mut slots = vec![[usize::MAX; NL]; n_obs];
+        for j in 0..n_obs {
+            let ls = &mut slots[j];
+            ls[0] = sl.f(j, 0);
+            if rows.pop_lane.is_some() && sl.has_pop {
+                ls[1] = sl.pop + j;
+            }
+            for (q, &i) in rows.sig.iter().enumerate() {
+                ls[lane0 + q] = sl.x + i;
+            }
+            let mut gather = |s: usize, at: usize| {
+                let src = &inputs[s * lk + 1..(s + 1) * lk];
+                for (a, v) in src.iter().enumerate() {
+                    tg[(j * kt + a) * stride + at] = *v;
+                }
+            };
+            for (lane, &s) in ls.iter().enumerate() {
+                if s != usize::MAX {
+                    gather(s, lane);
+                }
+            }
+            for k in 0..pn + nq {
+                gather(sl.f(j, 1 + k), o_g + k);
+            }
+            for a in 0..kt {
+                let t = &mut tg[(j * kt + a) * stride..(j * kt + a + 1) * stride];
+                for si in 0..kk {
+                    let d = &rows.s[j][si].grad;
+                    t[o_r + si] = (0..nla).map(|q| d[q] * t[q]).sum();
+                }
+            }
+        }
         // The aggregates' tangents along each direction.
-        let mut adot = vec![vec![0.0; na]; kt];
-        for (a, ad) in adot.iter_mut().enumerate() {
-            for j in 0..n_obs {
-                let u = ud(j, a);
-                let gd: Vec<f64> = (0..pn).map(|k| tan(sl.f(j, 1 + k), a)).collect();
-                for (k, mono) in monos.iter().enumerate() {
-                    let rk = &rows.s[j][k];
+        let mut adot = vec![0.0; kt * na];
+        for j in 0..n_obs {
+            let (g, q) = (&rows.g[j][..], &rows.q[j][..]);
+            for a in 0..kt {
+                let t = &tg[(j * kt + a) * stride..(j * kt + a + 1) * stride];
+                let ad = &mut adot[a * na..(a + 1) * na];
+                for (k, &(si, mono)) in aggs.iter().enumerate() {
+                    let (v, vd) = if mono == Mono::Q {
+                        (q, &t[o_q..o_r])
+                    } else {
+                        (g, &t[o_g..o_q])
+                    };
                     aggr_t(
-                        *mono,
-                        &rows.g[j],
-                        &gd,
-                        rk.value,
-                        dot(rk, &u),
+                        mono,
+                        v,
+                        vd,
+                        rows.s[j][si].value,
+                        t[o_r + si],
                         pn,
                         &mut ad[at[k]..],
                     );
@@ -565,7 +654,7 @@ impl CovPlan<'_> {
             let o = (pn + nx + t) * lk;
             rin[o] = rows.aggr[t];
             for a in 0..kt {
-                rin[o + 1 + a] = adot[a][t];
+                rin[o + 1 + a] = adot[a * na + t];
             }
         }
         for k in 0..pn {
@@ -579,13 +668,16 @@ impl CovPlan<'_> {
         let a_tan: Vec<Vec<f64>> = (0..kt)
             .map(|a| (0..na).map(|t| radj[(pn + nx + t) * lk + 1 + a]).collect())
             .collect();
-        let pv: Vec<Prep> = (0..monos.len())
-            .map(|k| Prep::of(monos[k], &a_val[at[k]..], pn))
+        let pv: Vec<Prep> = aggs
+            .iter()
+            .enumerate()
+            .map(|(k, &(_, mono))| Prep::of(mono, &a_val[at[k]..], pn))
             .collect();
         let pt: Vec<Vec<Prep>> = (0..kt)
             .map(|a| {
-                (0..monos.len())
-                    .map(|k| Prep::of(monos[k], &a_tan[a][at[k]..], pn))
+                aggs.iter()
+                    .enumerate()
+                    .map(|(k, &(_, mono))| Prep::of(mono, &a_tan[a][at[k]..], pn))
                     .collect()
             })
             .collect();
@@ -598,68 +690,83 @@ impl CovPlan<'_> {
             adj[(sl.x + i) * lk..(sl.x + i + 1) * lk]
                 .copy_from_slice(&radj[(pn + i) * lk..(pn + i + 1) * lk]);
         }
-        // Local lane `p` of row `j` → its kernel slot.
-        let lane_slot = |j: usize, p: usize| -> Option<usize> {
-            match (p, rows.pop_lane) {
-                (0, _) => Some(sl.f(j, 0)),
-                (1, Some(_)) => sl.has_pop.then_some(sl.pop + j),
-                (p, pl) => {
-                    let q = p - 1 - usize::from(pl.is_some());
-                    rows.sig.get(q).map(|&i| sl.x + i)
-                }
-            }
-        };
-        let kk = monos.len();
-        let (mut dg, mut dgd, mut gd) = (vec![0.0; pn], vec![0.0; pn], vec![0.0; pn]);
-        let (mut ds, mut dsd) = (vec![0.0; kk], vec![0.0; kk]);
-        let mut scratch = vec![0.0; 3 * pn];
+        let (mut dg, mut dq, mut ds) = (vec![0.0; pn], vec![0.0; nq], vec![0.0; kk]);
+        let (mut dgd, mut dqd, mut dsd) = (vec![0.0; pn], vec![0.0; nq], vec![0.0; kk]);
+        // Per aggregate, `P·G` of a `Gg` aggregate's value adjoint at the row: direction-free.
+        let mut qg = vec![0.0; aggs.len() * pn];
+        let mut sc = vec![0.0; 2 * pn];
         for j in 0..n_obs {
-            let g = &rows.g[j];
-            let rj = &rows.s[j];
-            // Values: each scalar's adjoint and the `G`-adjoint.
+            let (g, q) = (&rows.g[j][..], &rows.q[j][..]);
+            let (rj, ls) = (&rows.s[j], &slots[j]);
+            // Values: each scalar's adjoint (summed over the aggregates it feeds) and the `G`-
+            // and `Q`-adjoints.
             dg.fill(0.0);
-            for k in 0..kk {
-                ds[k] = back(&pv[k], g, rj[k].value, &mut dg, &mut scratch[..pn]);
+            dq.fill(0.0);
+            ds.fill(0.0);
+            for (k, &(si, mono)) in aggs.iter().enumerate() {
+                let (v, dv) = if mono == Mono::Q {
+                    (q, &mut dq[..])
+                } else {
+                    (g, &mut dg[..])
+                };
+                ds[si] += back(&pv[k], v, rj[si].value, dv, &mut qg[k * pn..(k + 1) * pn]);
             }
-            for p in 0..NL {
-                if let Some(s) = lane_slot(j, p) {
-                    adj[s * lk] += (0..kk).map(|k| ds[k] * rj[k].grad[p]).sum::<f64>();
+            for (lane, &s) in ls.iter().enumerate().take(nla) {
+                if s != usize::MAX {
+                    adj[s * lk] += (0..kk).map(|k| ds[k] * rj[k].grad[lane]).sum::<f64>();
                 }
             }
             for k in 0..pn {
                 adj[sl.f(j, 1 + k) * lk] += dg[k];
             }
+            for t in 0..nq {
+                adj[sl.f(j, 1 + pn + t) * lk] += dq[t];
+            }
             // Tangents along each direction.
             for a in 0..kt {
-                let u = ud(j, a);
-                for (k, v) in gd.iter_mut().enumerate() {
-                    *v = tan(sl.f(j, 1 + k), a);
-                }
+                let t = &tg[(j * kt + a) * stride..(j * kt + a + 1) * stride];
+                let u = &t[..nla];
                 dgd.fill(0.0);
-                for k in 0..kk {
-                    dsd[k] = back_t(
+                dqd.fill(0.0);
+                dsd.fill(0.0);
+                for (k, &(si, mono)) in aggs.iter().enumerate() {
+                    let (v, vd, dvd) = if mono == Mono::Q {
+                        (q, &t[o_q..o_r], &mut dqd[..])
+                    } else {
+                        (g, &t[o_g..o_q], &mut dgd[..])
+                    };
+                    dsd[si] += back_t(
                         &pv[k],
                         &pt[a][k],
-                        g,
-                        &gd,
-                        rj[k].value,
-                        dot(&rj[k], &u),
-                        &mut dgd,
-                        &mut scratch,
+                        v,
+                        vd,
+                        rj[si].value,
+                        t[o_r + si],
+                        &qg[k * pn..(k + 1) * pn],
+                        dvd,
+                        &mut sc,
                     );
                 }
-                for p in 0..NL {
-                    let Some(s) = lane_slot(j, p) else { continue };
-                    let v: f64 = (0..kk)
-                        .map(|k| {
-                            let hu: f64 = (0..NL).map(|q| rj[k].hess[p][q] * u[q]).sum();
-                            ds[k] * hu + dsd[k] * rj[k].grad[p]
-                        })
-                        .sum();
+                for (lane, &s) in ls.iter().enumerate().take(nla) {
+                    if s == usize::MAX {
+                        continue;
+                    }
+                    let mut v = 0.0;
+                    for k in 0..kk {
+                        let hu: f64 = rj[k].hess[lane][..nla]
+                            .iter()
+                            .zip(u)
+                            .map(|(h, x)| h * x)
+                            .sum();
+                        v += ds[k] * hu + dsd[k] * rj[k].grad[lane];
+                    }
                     adj[s * lk + 1 + a] += v;
                 }
                 for k in 0..pn {
                     adj[sl.f(j, 1 + k) * lk + 1 + a] += dgd[k];
+                }
+                for t in 0..nq {
+                    adj[sl.f(j, 1 + pn + t) * lk + 1 + a] += dqd[t];
                 }
             }
         }
@@ -693,9 +800,10 @@ impl CovPlan<'_> {
         }
         self.prepare(along);
         let kt = super::pass_width();
+        let nq = if self.second { pn * (pn + 1) / 2 } else { 0 };
         let base = Layout {
             n: pn as u16,
-            m: 0,
+            m: nq as u16,
             th: false,
             wide: false,
             tan: 0,
@@ -722,10 +830,11 @@ impl CovPlan<'_> {
             &|j| vals[j * lb],
             &|_| None,
             &|j, k| vals[j * lb + 1 + k],
+            &|j, t| vals[j * lb + 1 + pn + t],
             &|i| self.x[i],
         )?;
-        let monos = family.monos();
-        let (at, na) = offsets(monos, pn);
+        let aggs = family.aggs();
+        let (at, na) = offsets(aggs, pn);
         // The reduce at `w = 0` along each `w_o`: values `∂F/∂·`, tangent `o` `−∂g_o/∂·`.
         let lk = 1 + pn;
         let n_in = pn + nx + na + pn;
@@ -763,26 +872,37 @@ impl CovPlan<'_> {
             let ay: Vec<f64> = (0..na)
                 .map(|t| sign(y) * radj[(pn + nx + t) * lk + lane(y)])
                 .collect();
-            let py: Vec<Prep> = (0..monos.len())
-                .map(|k| Prep::of(monos[k], &ay[at[k]..], pn))
+            let py: Vec<Prep> = aggs
+                .iter()
+                .enumerate()
+                .map(|(k, &(_, mono))| Prep::of(mono, &ay[at[k]..], pn))
                 .collect();
+            let kk = family.n_scalars();
             for j in 0..n_obs {
-                let g = &rows.g[j];
+                let (g, q) = (&rows.g[j], &rows.q[j]);
                 let rj = &rows.s[j];
                 let mut dg = vec![0.0; pn];
-                let mut qg = vec![0.0; pn];
-                let ds: Vec<f64> = (0..monos.len())
-                    .map(|k| back(&py[k], g, rj[k].value, &mut dg, &mut qg))
-                    .collect();
-                kf[y][j * lb] += (0..monos.len()).map(|k| ds[k] * rj[k].grad[0]).sum::<f64>();
+                let mut dq = vec![0.0; q.len()];
+                let mut sc = vec![0.0; pn];
+                let mut ds = vec![0.0; kk];
+                for (k, &(si, mono)) in aggs.iter().enumerate() {
+                    let (v, dv) = if mono == Mono::Q {
+                        (&q[..], &mut dq[..])
+                    } else {
+                        (&g[..], &mut dg[..])
+                    };
+                    ds[si] += back(&py[k], v, rj[si].value, dv, &mut sc);
+                }
+                kf[y][j * lb] += (0..kk).map(|k| ds[k] * rj[k].grad[0]).sum::<f64>();
                 for k in 0..pn {
                     kf[y][j * lb + 1 + k] += dg[k];
                 }
+                for (t, &v) in dq.iter().enumerate() {
+                    kf[y][j * lb + 1 + pn + t] += v;
+                }
                 let lane0 = 1 + usize::from(rows.pop_lane.is_some());
-                for (q, &i) in rows.sig.iter().enumerate() {
-                    kx[y][i] += (0..monos.len())
-                        .map(|k| ds[k] * rj[k].grad[lane0 + q])
-                        .sum::<f64>();
+                for (qi, &i) in rows.sig.iter().enumerate() {
+                    kx[y][i] += (0..kk).map(|k| ds[k] * rj[k].grad[lane0 + qi]).sum::<f64>();
                 }
             }
         }
