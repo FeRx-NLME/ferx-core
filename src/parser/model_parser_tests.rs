@@ -40116,3 +40116,52 @@ fn a_block_declared_covariate_theta_folds_as_its_hand_written_relation() {
         "the block form must fold exactly what the hand form folds"
     );
 }
+
+/// #3004: the endpoint program builders are total. Each leaf with no slot binds to what the
+/// `f64` closure reads (`MACHEPS` is epsilon, an unassigned `Variable` is `0.0`, a covariate
+/// the caller left out of the list is read from the map), and a zero `(θ, η)` width is a
+/// constant program, not a missing one. One test per binding, so a mutation of one arm of
+/// `compile_endpoint_exprs` names itself.
+#[cfg(feature = "survival")]
+fn leaf_program(e: Expression, stmts: &[Statement]) -> EndpointExprProgram {
+    build_endpoint_expr_program(&[&e], stmts, &[], 0, 0)
+}
+
+#[cfg(feature = "survival")]
+fn leaf_value(p: &EndpointExprProgram, cov: &[(&str, f64)]) -> f64 {
+    let cov: HashMap<String, f64> = cov.iter().map(|(k, v)| (k.to_string(), *v)).collect();
+    p.eval_g::<f64>(&[], &[], &cov).expect("zero width")[0]
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn endpoint_program_binds_macheps_to_epsilon() {
+    let p = leaf_program(Expression::Variable("macheps".into()), &[]);
+    assert_eq!(leaf_value(&p, &[]).to_bits(), f64::EPSILON.to_bits());
+    // Even when a statement assigns the name, the closure reads epsilon.
+    let assigned = [Statement::Assign(
+        "MACHEPS".into(),
+        Expression::Literal(7.0),
+    )];
+    let p = leaf_program(Expression::Variable("MACHEPS".into()), &assigned);
+    assert_eq!(leaf_value(&p, &[]).to_bits(), f64::EPSILON.to_bits());
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn endpoint_program_binds_an_unassigned_variable_to_zero() {
+    let sum = Expression::BinOp(
+        Box::new(Expression::Variable("Z".into())),
+        BinOp::Add,
+        Box::new(Expression::Literal(1.0)),
+    );
+    assert_eq!(leaf_value(&leaf_program(sum, &[]), &[]), 1.0);
+}
+
+#[cfg(feature = "survival")]
+#[test]
+fn endpoint_program_reads_a_covariate_missing_from_its_list_by_name() {
+    let p = leaf_program(Expression::Covariate("X".into()), &[]);
+    assert_eq!(leaf_value(&p, &[("X", 5.0)]), 5.0);
+    assert_eq!(leaf_value(&p, &[]), 0.0);
+}

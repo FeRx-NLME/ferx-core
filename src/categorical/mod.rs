@@ -415,7 +415,7 @@ pub(crate) fn binary_subject_nll(
 /// the same sum [`discrete_subject_nll`] returns.
 ///
 /// `None` — caller falls back to FD for this point — when *any* binary endpoint on the
-/// subject cannot be served exactly: no dual program (an unbindable identifier), or a
+/// subject cannot be served exactly: no dual program (an opaque Rust-closure endpoint), or a
 /// non-finite predictor on some record, where the value is the flat `1e20` repellent with
 /// no meaningful derivative.
 ///

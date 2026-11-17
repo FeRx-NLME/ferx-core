@@ -5280,9 +5280,8 @@ fn non_gaussian_records_fully_analytic(model: &CompiledModel, subject: &Subject)
     {
         use crate::types::{EndpointLikelihood, ObsRecord};
         // The CMTs whose endpoint term we can differentiate exactly. A binary endpoint with
-        // no `lp_program`, or a CTMM endpoint with no `generator_program` — a
-        // time-inhomogeneous (drug-driven) generator, whose likelihood is an occupancy ODE
-        // rather than an `expm` — is not one of them.
+        // no `lp_program`, or a CTMM endpoint with no `generator_program`, is not one of
+        // them; a parsed endpoint always has its program, so that is an opaque Rust closure.
         let served = |cmt: usize| -> bool {
             match model.endpoints.get(&cmt) {
                 Some(EndpointLikelihood::Binary { lp_program, .. }) => lp_program.is_some(),
@@ -5412,8 +5411,9 @@ pub(crate) fn analytic_inner_grad_supported_model(model: &CompiledModel) -> bool
         return false;
     }
     // CTMM (#759): a subject's CTMM term is analytic only when its generator carries a
-    // dual-evaluable program. Without one — a drug-driven `Q(t)`, a `(θ, η)` width past the
-    // dual dispatch cap, an intensity we could not resolve — *every* subject declines at the
+    // dual-evaluable program. A parsed generator always has one (a drug-driven `Q(t)` and a
+    // wide `(θ, η)` included); only an opaque Rust-closure endpoint lacks it, and then
+    // *every* subject declines at the
     // survival-record guard in `analytic_inner_grad_supported`, so reporting "analytic" here
     // would be a pure misreport.
     //
@@ -5513,8 +5513,7 @@ fn analytic_inner_grad_supported(model: &CompiledModel, subject: &Subject) -> bo
     //
     // **Ordering is load-bearing:** this branch is only sound *after* the guard above. A
     // CTMM subject always carries `DiscreteState` records, so an endpoint-only CTMM whose
-    // generator has no dual-evaluable program (past the axis cap, or an intensity we could
-    // not resolve) is already rejected there — it can never fall through to here and claim
+    // generator has no dual-evaluable program (an opaque Rust closure) is already rejected there — it can never fall through to here and claim
     // an analytic route the gradient cannot supply. Reaching this line therefore means the
     // subject's non-Gaussian term is either absent or exactly served, and the only thing
     // left is the prior. (Pinned by `program_less_endpoint_only_ctmm_stays_fd`.)

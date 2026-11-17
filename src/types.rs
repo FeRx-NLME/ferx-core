@@ -4732,9 +4732,9 @@ pub enum EndpointLikelihood {
         /// expressions, in the [`HazardParamFn`] layout minus a trailing absent `loghr`, for
         /// the **exact** η-Hessian of the FOCEI Laplace term (#2437).
         ///
-        /// `None` — and the Laplace term finite-differences this endpoint's η-Hessian —
-        /// for an [`HazardSpec::OdeAccumulated`] hazard, or when the expressions cannot be
-        /// represented exactly (see `build_endpoint_expr_program`).
+        /// `None` for an [`HazardSpec::OdeAccumulated`] hazard (served by the RHS program) and
+        /// for a hazard whose `param_fn` is an opaque Rust closure, which has no expression
+        /// tree to compile; its terms then take FD. A parsed analytic hazard always has one.
         hazard_program: Option<crate::parser::model_parser::EndpointExprProgram>,
     },
     /// Binary / Bernoulli endpoint — mixed-effects logistic regression (§3.5 of
@@ -4750,8 +4750,8 @@ pub enum EndpointLikelihood {
         /// through the closed-form Bernoulli score `(p − y)` instead of
         /// finite-differencing the whole data term (#2024).
         ///
-        /// `None` — and the endpoint keeps its FD gradient — when the predictor cannot be
-        /// represented exactly (an unbindable identifier). A program past the gradient's
+        /// `None` — and the endpoint keeps its FD gradient — only for an opaque Rust closure
+        /// `lp_fn`; a parsed predictor always has one. A program past the gradient's
         /// dual dispatch cap still serves the exact η-Hessian; the gradient checks its own
         /// scope (#2437).
         lp_program: Option<crate::parser::model_parser::EndpointExprProgram>,
@@ -4789,8 +4789,8 @@ pub enum EndpointLikelihood {
         /// or for a time-**inhomogeneous** endpoint the occupancy ODE with the ODE states
         /// from the dual state solve) instead of finite-differencing it (#759).
         ///
-        /// `None` — and the endpoint keeps its FD gradient — when the program cannot be
-        /// represented exactly (see `build_ctmm_generator_program`).
+        /// `None` — and the endpoint keeps its FD gradient — only for an opaque Rust closure
+        /// `generator_fn`; a parsed generator always has one.
         generator_program: Option<crate::parser::model_parser::CtmmGeneratorProgram>,
         /// Covariate names referenced by any transition intensity (including any
         /// reached transitively through `[individual_parameters]`). Evaluated at a
@@ -4839,8 +4839,8 @@ pub enum EndpointLikelihood {
         /// Resolved, dual-evaluable form of the same probabilities (one output per
         /// transition), for the **analytic** inner gradient: `∂P_jk/∂(θ,η)` exactly,
         /// chained through `∂(−log P)/∂P` instead of finite-differencing the data term.
-        /// `None` — and the endpoint keeps its FD gradient — when an expression cannot be
-        /// represented exactly or the `(θ, η)` width is past the dual dispatch cap.
+        /// `None` — and the endpoint keeps its FD gradient — only for an opaque Rust closure
+        /// `prob_fn`; a parsed probability always has one.
         prob_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by any transition probability (including those
         /// reached through `[individual_parameters]`). Read at the **record being scored**,

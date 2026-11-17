@@ -4015,8 +4015,9 @@ fn an_sde_infusion_with_an_estimated_window_is_one_plan_across_a_fit() {
 /// `(label, source, undefined identifier read)` of the non-Gaussian endpoint kinds whose term
 /// evaluators return `None` without a compiled program: a binary linear predictor
 /// (`DiscreteTerm::eval`, `lp_program?`), an analytic hazard (`TteTerm::eval_shared`,
-/// `ep.program?`) and a CTMM intensity (`CtmmTerm`, `generator_program`). Each program is `None`
-/// only for an identifier it cannot bind, or a zero `(θ, η)` width.
+/// `ep.program?`) and a CTMM intensity (`CtmmTerm`, `generator_program`). A parsed endpoint
+/// always carries its program (the binder is total, #3004); a program is absent only for an
+/// opaque Rust closure endpoint.
 #[cfg(feature = "survival")]
 fn unbound_identifier_sources() -> Vec<(&'static str, String)> {
     let head = "[parameters]\n  theta TVL(-0.3, -5.0, 5.0)\n  omega ETA_S ~ 0.25\n";
@@ -4047,8 +4048,8 @@ fn unbound_identifier_sources() -> Vec<(&'static str, String)> {
 /// A binary / hazard / CTMM endpoint reading a name nothing defines is refused by the parser, so
 /// the term evaluators' `lp_program?` / `ep.program?` / generator-program `None` is unreachable
 /// for an accepted model; declaring the name as a covariate (the control) parses and carries the
-/// program. Mutation: let the parser accept the unbound name (build the program as `None`
-/// instead of refusing) -> the first assertion fails for that kind.
+/// program (`endpoint_programs_are_total` in `inner_optimizer_tests.rs` covers the one leaf the
+/// parser accepts and the binder once could not place, `MACHEPS`).
 #[cfg(feature = "survival")]
 #[test]
 fn an_endpoint_program_is_missing_only_for_a_model_the_parser_refuses() {
