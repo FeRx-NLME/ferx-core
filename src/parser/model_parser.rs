@@ -2029,7 +2029,10 @@ fn mu_fold_spec(
             .iter()
             .filter(|s| matches!(s, Statement::Assign(n, _) if n.eq_ignore_ascii_case(var)))
             .count();
-        let Some(slot) = indiv_var_names.iter().position(|n| n == var) else {
+        let Some(slot) = indiv_var_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(var))
+        else {
             continue;
         };
         if etas_of(expr).len() != 1 || local_eta || assigned != 1 {

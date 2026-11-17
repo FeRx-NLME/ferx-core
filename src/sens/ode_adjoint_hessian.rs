@@ -299,7 +299,7 @@ fn x_dirs(n: usize) -> Vec<Dir> {
 /// (`F`, `g_k`).
 fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix<f64>)> {
     let n = plan.pn();
-    let run = plan.run(&[], 0)?;
+    let run = plan.run(&[], 0, &[])?;
     let unit = |o: usize| -> Vec<f64> { (0..=n).map(|c| if c == o { 1.0 } else { 0.0 }).collect() };
     let rows = plan.reverse(&run, &(0..=n).map(unit).collect::<Vec<_>>())?;
     // ∇_η F, H = ∂g/∂η and ∂g along `along`, from the inputs' adjoints.
@@ -402,7 +402,7 @@ fn psi_along(plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir]) -> Option<(DVector<f64
     let n = dirs.len();
     let mut grad = DVector::<f64>::zeros(n);
     let mut hess = DMatrix::<f64>::zeros(n, n);
-    psi_lanes(plan, w, dirs, |i, g, along| {
+    psi_lanes(plan, w, dirs, false, |i, g, along| {
         grad[i] = g;
         for (j, d) in dirs.iter().enumerate() {
             hess[(j, i)] = along(d);
@@ -415,7 +415,7 @@ fn psi_along(plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir]) -> Option<(DVector<f64
 /// direction only, `O(n)` reads instead of `O(n²)` and no `n × n` matrix.
 fn psi_diag(plan: &CovPlan<'_>, w: &[f64], dirs: &[Dir]) -> Option<Vec<f64>> {
     let mut diag = vec![0.0; dirs.len()];
-    psi_lanes(plan, w, dirs, |i, _, along| diag[i] = along(&dirs[i]))?;
+    psi_lanes(plan, w, dirs, true, |i, _, along| diag[i] = along(&dirs[i]))?;
     Some(diag)
 }
 
@@ -427,14 +427,18 @@ fn psi_lanes(
     plan: &CovPlan<'_>,
     w: &[f64],
     dirs: &[Dir],
+    own: bool,
     mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
     let n = plan.pn();
     let width = pass_width(dirs.len());
     let l = 1 + width;
-    *plan.all_dirs.borrow_mut() = dirs.to_vec();
     for (c, chunk) in dirs.chunks(width).enumerate() {
-        let run = plan.run(chunk, width)?;
+        // A pass's columns are read along every direction, unless only the diagonal is wanted
+        // (each column along its own direction), and its plans need a lane for each parameter
+        // the directions read move ([`PlanDirs::new`]).
+        let read = if own { chunk } else { dirs };
+        let run = plan.run(chunk, width, read)?;
         let out = run.out();
         let rows = if reverse_per_direction() {
             // Seed `a`: `F`'s tangent lane `a` and `−w_k` on each `g_k`'s.
@@ -716,7 +720,8 @@ impl<'s> NnReduction<'s> {
             let mut jcols: Vec<Vec<f64>> = vec![vec![0.0; n_z]; n_w];
             // The network as a plan over θ's packed coordinates (#2786): its outputs' rows from
             // one reverse per output, and per output the Hessian columns along the weights in
-            // blocks of `K`, one forward-over-reverse sweep per block (as `psi_lanes`, #2980).
+            // blocks of `MAX_PASS`, one forward-over-reverse sweep per block (as `psi_lanes`,
+            // #2980).
             let record = |lv: &[kj::Tr]| -> Option<Vec<kj::Tr>> {
                 let th = unpack_theta(template, |m| lv[m]);
                 let out = model.covariate_nns[net]
@@ -821,9 +826,6 @@ pub(super) struct CovPlan<'a> {
     variant: kj::Desc,
     /// The θ the plans carry on their η lanes ([`MuFold`], #2982).
     fold: Option<MuFold>,
-    /// Every direction of the Hessian being assembled ([`psi_lanes`]): a pass's plans need a
-    /// lane for each parameter any of them moves ([`PlanDirs::new`]).
-    all_dirs: std::cell::RefCell<Vec<Dir>>,
 }
 
 /// The kernel's input slots for one subject's pass: per observation the prediction plan's
@@ -961,14 +963,19 @@ impl MuFold {
             )
         };
         let (mu, grad, hess) = kj::derivs_of(theta, spec.lines.len(), true, &f).ok()?;
-        // The structure at this point: each line's value at the current η is `g⁻¹(μ + η)`. The
-        // two sides are one identity evaluated two ways (through `exp`/`log` and back), so they
-        // differ by rounding — ~1e-15 relative; a line that is not of that form misses by O(1).
-        for (k, &(e, slot, t)) in spec.lines.iter().enumerate() {
-            let p = prog.eval_var_g(theta, eta, cov, slot);
-            let want = inv(t, mu[k] + eta.get(e).copied()?);
-            if !(p.is_finite() && (p - want).abs() <= 1e-10 * (1.0 + want.abs())) {
-                return None;
+        // The structure: each line's value is `g⁻¹(μ + η)` at the current η and at η moved by a
+        // half on every effect — one point alone says nothing where η̂ is (near) zero, and AGQ's
+        // plans run at nodes away from it. The two sides are one identity evaluated two ways
+        // (through `exp`/`log` and back), so they differ by rounding, ~1e-15 relative; a line
+        // that is not of that form misses by O(1) at the moved point.
+        let moved: Vec<f64> = eta.iter().map(|v| v + 0.5).collect();
+        for at in [eta, moved.as_slice()] {
+            for (k, &(e, slot, t)) in spec.lines.iter().enumerate() {
+                let p = prog.eval_var_g(theta, at, cov, slot);
+                let want = inv(t, mu[k] + at.get(e).copied()?);
+                if !(p.is_finite() && (p - want).abs() <= 1e-10 * (1.0 + want.abs())) {
+                    return None;
+                }
             }
         }
         let mut d1 = vec![Vec::new(); n_th];
@@ -1237,7 +1244,9 @@ impl<'a> CovPlan<'a> {
             sc.width,
             &so.placed.iter().map(|p| p.1.clone()).collect::<Vec<_>>(),
         ));
-        let fold = if mu_fold_on() {
+        // The η slots are always a plan's lanes, so the fold can only narrow a plan below a
+        // pass's directions when there are fewer random effects than that.
+        let fold = if mu_fold_on() && sc.width < MAX_PASS {
             MuFold::at(sc.model, subject, &th, &sc.eta)
         } else {
             None
@@ -1259,7 +1268,6 @@ impl<'a> CovPlan<'a> {
             second,
             variant,
             fold,
-            all_dirs: std::cell::RefCell::new(Vec::new()),
         }
     }
 
@@ -1325,6 +1333,7 @@ impl<'a> CovPlan<'a> {
 
     /// The lanes a plan of `n_eta` η and `n_par` parameter slots runs `n_dirs` directions on,
     /// its parameters θ, then (`n_p` on) the network outputs, then an SDE's σ.
+    #[allow(clippy::too_many_arguments)]
     fn plan_dirs(
         &self,
         n_eta: usize,
@@ -1332,8 +1341,8 @@ impl<'a> CovPlan<'a> {
         n_dirs: usize,
         eta_t: &dyn Fn(usize, usize) -> f64,
         p_t: &dyn Fn(usize, usize) -> f64,
+        all: &[Dir],
     ) -> PlanDirs {
-        let all = self.all_dirs.borrow();
         let (n_th, n_p) = (self.th.len(), self.th.len() + self.nz);
         let s0 = packed_segments(self.template).sigma_start();
         let read = |i: usize| {
@@ -1404,11 +1413,12 @@ impl<'a> CovPlan<'a> {
         eta: &[f64],
         eta_t: &dyn Fn(usize, usize) -> f64,
         dirs: &[Dir],
+        all: &[Dir],
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
         let (params, p_t) = self.pred_params(dirs);
-        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &*p_t);
+        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &*p_t, all);
         let layout = Layout {
             tan: pd.width() as u8,
             ..base
@@ -1447,6 +1457,7 @@ impl<'a> CovPlan<'a> {
         eta: &[f64],
         eta_t: &dyn Fn(usize, usize) -> f64,
         dirs: &[Dir],
+        all: &[Dir],
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
@@ -1464,7 +1475,7 @@ impl<'a> CovPlan<'a> {
                 0.0
             }
         };
-        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &p_t);
+        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &p_t, all);
         let layout = Layout {
             tan: pd.width() as u8,
             ..base
@@ -1510,12 +1521,13 @@ impl<'a> CovPlan<'a> {
         eta: &[f64],
         eta_t: &dyn Fn(usize, usize) -> f64,
         dirs: &[Dir],
+        all: &[Dir],
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
         let plans = super::terms::non_gaussian_plans(self.sc.model, self.subject, &self.th, eta)?;
         let p_t = |i: usize, a: usize| self.theta_t(dirs, i, a);
-        let pd = self.plan_dirs(eta.len(), self.th.len(), kt, eta_t, &p_t);
+        let pd = self.plan_dirs(eta.len(), self.th.len(), kt, eta_t, &p_t, all);
         let layout = Layout {
             tan: pd.width() as u8,
             ..base
@@ -1537,7 +1549,7 @@ impl<'a> CovPlan<'a> {
     /// One forward of the composition along `dirs` as `width` tangent lanes (the value layout
     /// with none; a pass's lanes past its directions carry zeros, so a ragged last pass runs
     /// at the same layout as the others).
-    pub(super) fn run(&self, dirs: &[Dir], width: usize) -> Option<CovRun> {
+    pub(super) fn run(&self, dirs: &[Dir], width: usize, all: &[Dir]) -> Option<CovRun> {
         let (model, subject, sc) = (self.sc.model, self.subject, self.sc);
         let kt = if dirs.is_empty() { 0 } else { width };
         if dirs.len() > kt {
@@ -1563,12 +1575,12 @@ impl<'a> CovPlan<'a> {
             tan: 0,
         };
         let pred = if n_obs > 0 {
-            Some(self.run_pred(model, eta, &eta_t, dirs, base, kt)?)
+            Some(self.run_pred(model, eta, &eta_t, dirs, all, base, kt)?)
         } else {
             None
         };
         let var = if n_obs > 0 && model.is_sde() {
-            Some(self.run_var(eta, &eta_t, dirs, base, kt)?)
+            Some(self.run_var(eta, &eta_t, dirs, all, base, kt)?)
         } else {
             None
         };
@@ -1590,7 +1602,7 @@ impl<'a> CovPlan<'a> {
         {
             let zero_t = |_: usize, _: usize| 0.0;
             let zeros = vec![0.0; pn];
-            Some(self.run_pred(sc.pop_model, &zeros, &zero_t, dirs, Layout::F64, kt)?)
+            Some(self.run_pred(sc.pop_model, &zeros, &zero_t, dirs, all, Layout::F64, kt)?)
         } else {
             None
         };
@@ -1598,7 +1610,7 @@ impl<'a> CovPlan<'a> {
         let nb = model.n_eta;
         let ng = if has_ng {
             let base = super::terms::layout2(nb);
-            Some(self.run_term(&sc.eta[..nb], &eta_t, dirs, base, kt)?)
+            Some(self.run_term(&sc.eta[..nb], &eta_t, dirs, all, base, kt)?)
         } else {
             None
         };
@@ -1718,7 +1730,7 @@ impl<'a> CovPlan<'a> {
                 let bv: Vec<f64> = (0..pn).map(|k| k1.out[(nd * pn + k) * lk]).collect();
                 let bt = |k: usize, a: usize| k1.out[(nd * pn + k) * lk + 1 + a];
                 let fb = if n_obs > 0 {
-                    let fb = self.run_pred(model, &bv, &bt, dirs, Layout::F64, kt)?;
+                    let fb = self.run_pred(model, &bv, &bt, dirs, all, Layout::F64, kt)?;
                     for j in 0..n_obs {
                         put!(slots.nf + nd * n_rows + j, fb.out(j, 0, None), &|a| fb.out(
                             j,
@@ -1731,7 +1743,7 @@ impl<'a> CovPlan<'a> {
                     None
                 };
                 let fv = if n_obs > 0 && model.is_sde() {
-                    let fv = self.run_var(&bv, &bt, dirs, Layout::F64, kt)?;
+                    let fv = self.run_var(&bv, &bt, dirs, all, Layout::F64, kt)?;
                     for j in 0..n_obs {
                         put!(
                             slots.nf + nd * n_rows + n_obs + j,
@@ -1745,7 +1757,7 @@ impl<'a> CovPlan<'a> {
                 };
                 let qb = if ng.is_some() {
                     let bb: Vec<f64> = bv[..nb].to_vec();
-                    let t = self.run_term(&bb, &bt, dirs, Layout::F64, kt)?;
+                    let t = self.run_term(&bb, &bt, dirs, all, Layout::F64, kt)?;
                     put!(slots.nq_node + nd, t.out(0, 0, None), &|a| t.out(
                         0,
                         0,
@@ -2252,6 +2264,10 @@ impl<'a> CovPlan<'a> {
                 }
             }
             return Some(vec![e]);
+        }
+        // A reverse per seed reads each direction's own lane; a plan on input axes has none.
+        if !pd.global {
+            return None;
         }
         let mut eta_back = Vec::with_capacity(ns);
         for (sd, row) in rows.iter_mut().enumerate() {

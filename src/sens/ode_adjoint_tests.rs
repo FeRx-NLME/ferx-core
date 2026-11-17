@@ -11878,8 +11878,9 @@ fn the_plans_run_on_the_eta_lanes_of_a_mu_referenced_model() {
 /// guard can refuse it: `θ·e^η` is not `θ + η`); the Hessian must still be the one-lane-per-
 /// direction one.
 ///
-/// Mutation: the guard's comparison dropped (the folded lanes then carry `∂μ/∂θ` of the wrong
-/// link and the Hessian moves by O(1)).
+/// Mutations: the guard's comparison dropped (the folded lanes then carry `∂μ/∂θ` of the wrong
+/// link and the Hessian moves by O(1)); the guard checking the current η only (the η = 0 case
+/// passes it).
 #[test]
 fn a_fold_the_program_does_not_reproduce_is_declined() {
     use super::hessian::{PLAN_AXES_OFF, PLAN_LANES};
@@ -11895,32 +11896,29 @@ fn a_fold_the_program_does_not_reproduce_is_declined() {
     );
     let params = moved_params(&one);
     let x = pack_params(&params);
-    let eta = ebe_for(&one, &s, &params, 1e-12, true);
-    let run = |axes_off: bool| {
-        with_fit_stack(|| {
-            PLAN_AXES_OFF.with(|c| c.set(axes_off));
-            PLAN_LANES.with(|v| v.borrow_mut().clear());
-            let h = subject_adjoint_cov_hessian(
-                &one,
-                &s,
-                &params,
-                &x,
-                eta.as_slice(),
-                Objective::Focei,
-            )
-            .expect("in scope");
-            (h, PLAN_LANES.with(|v| v.borrow().clone()))
-        })
-    };
-    let (h, runs) = run(false);
-    assert!(
-        runs == [(4, 4), (4, 4)],
-        "the fold should be declined (one lane per direction, not 3 η lanes): {runs:?}"
-    );
-    let (h_global, _) = run(true);
-    let worst = rel_gap(h.as_slice(), h_global.as_slice());
-    assert!(
-        worst < 1e-12,
-        "declined fold vs one lane per direction: {worst:.2e}"
-    );
+    // At the mode, and at η = 0, where the identity holds for any link (`P(θ, 0) = μ`) and only
+    // the guard's second, moved point can refuse it.
+    let mode = ebe_for(&one, &s, &params, 1e-12, true);
+    for (what, eta) in [("η̂", mode.as_slice().to_vec()), ("η = 0", vec![0.0; 3])] {
+        let run = |axes_off: bool| {
+            with_fit_stack(|| {
+                PLAN_AXES_OFF.with(|c| c.set(axes_off));
+                PLAN_LANES.with(|v| v.borrow_mut().clear());
+                let h = subject_adjoint_cov_hessian(&one, &s, &params, &x, &eta, Objective::Focei)
+                    .expect("in scope");
+                (h, PLAN_LANES.with(|v| v.borrow().clone()))
+            })
+        };
+        let (h, runs) = run(false);
+        assert!(
+            runs == [(4, 4), (4, 4)],
+            "{what}: the fold should be declined (one lane per direction, not 3 η lanes): {runs:?}"
+        );
+        let (h_global, _) = run(true);
+        let worst = rel_gap(h.as_slice(), h_global.as_slice());
+        assert!(
+            worst < 1e-12,
+            "{what}: declined fold vs one lane per direction: {worst:.2e}"
+        );
+    }
 }

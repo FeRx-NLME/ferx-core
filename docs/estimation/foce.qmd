@@ -559,8 +559,9 @@ Where an axis moves a dose event — an estimated lag, a `zero_order` duration, 
 
 The Hessian has a direction per packed coordinate, but the predictions — the costly part, an
 ODE solve or a closed-form walk per subject — see far fewer. Ω, σ and ρ reach them only
-through `η̂`, so a prediction plan runs along its own **input axes** — its η slots and the θ
-that move it — whenever those are fewer than the pass's four directions
+through `η̂` (an SDE's EKF variance rows read σ directly, as a lane of their own), so a
+prediction plan runs along its own **input axes** — its η slots and the θ that move it —
+whenever those are fewer than the pass's four directions
 ([#2980](https://github.com/FeRx-NLME/ferx-core/issues/2980)). Each
 direction's tangent is then a combination of those lanes, and the reverse adds back the
 Gauss–Newton term `Ȳ̇ᵀ·∂Y/∂input` from the lanes' own forward tangents, so nothing is
@@ -572,7 +573,8 @@ is `P = g⁻¹(A(θ, covariates) + η)` — `TVCL·exp(ETA_CL)`, `exp(log(TVCL) 
 `inv_logit(LOGIT_F + ETA_F)`, `TVV + ETA_V`, a covariate power `TVCL·(WT/70)^TH_WT·exp(ETA_CL)`
 — and nothing else reads its η, a θ that reaches the likelihood *only* through such lines
 moves every prediction exactly as the η-direction `∂A/∂θ` does, so it rides on the η lanes:
-a pass's plans run on the `N` random effects whenever that is fewer than the pass's directions. A θ read anywhere else — an `[odes]` right-hand side, the error model,
+on a model with fewer than four random effects, a pass's plans run on the `N` random effects
+alone. A θ read anywhere else — an `[odes]` right-hand side, the error model,
 a line whose η is shared or scaled by a θ — keeps a lane of its own; a parameter block with a
 conditional statement takes no fold at all.
 
