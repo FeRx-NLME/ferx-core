@@ -31,6 +31,8 @@
 mod fallback_tests;
 #[path = "kernel_jit_fixed.rs"]
 mod fixed;
+#[path = "kernel_jit_matrix.rs"]
+mod matrix;
 #[path = "kernel_jit_loop.rs"]
 mod ode_loop;
 #[cfg(test)]
@@ -39,6 +41,7 @@ mod plan_tests;
 #[path = "kernel_jit_simd.rs"]
 mod simd;
 pub(crate) use fixed::{record_fixed, record_repeat, Found, SolveFn};
+pub(crate) use matrix::{record_mat, MatOp};
 
 /// What a plan's call (`Flat::Loop`) runs: an ODE segment, or a steady-state fixed point.
 #[derive(Clone)]
@@ -46,6 +49,8 @@ pub(crate) enum CallKind {
     Ode(Arc<LoopSpec>),
     Fixed(Arc<fixed::FixedSpec>),
     Repeat(Arc<fixed::RepeatSpec>),
+    /// A matrix product or solve ([`matrix`], #2980).
+    Mat(Arc<matrix::MatSpec>),
 }
 
 impl CallKind {
@@ -54,6 +59,7 @@ impl CallKind {
             CallKind::Ode(s) => s.n_in(),
             CallKind::Fixed(f) => f.n_caps,
             CallKind::Repeat(r) => r.n + 1 + r.n_caps,
+            CallKind::Mat(m) => m.n_in(),
         }
     }
     fn n_out(&self) -> usize {
@@ -61,6 +67,7 @@ impl CallKind {
             CallKind::Ode(s) => s.n_out(),
             CallKind::Fixed(f) => f.n,
             CallKind::Repeat(r) => r.n,
+            CallKind::Mat(m) => m.n_out(),
         }
     }
 }
@@ -1165,6 +1172,12 @@ impl RecHooks for Tr {
         body: &dyn Fn(&[Self]) -> Vec<Self>,
     ) -> Option<Option<Vec<Self>>> {
         Some(record_repeat(x0, count, body))
+    }
+    fn mat_mul(x: &[Self], y: &[Self], n: usize) -> Option<Option<Vec<Self>>> {
+        Some(record_mat(MatOp::Mul, x, y, n))
+    }
+    fn mat_solve(q: &[Self], p: &[Self], n: usize) -> Option<Option<Vec<Self>>> {
+        Some(record_mat(MatOp::Solve, q, p, n))
     }
     fn floor_c(self) -> Self {
         self.unary(T_FLOOR, Unary::Floor, self.v.floor())
@@ -4261,6 +4274,7 @@ pub(crate) enum Kern {
     Loop(Arc<ode_loop::LoopKernels>),
     Fixed(Arc<fixed::FixedSpec>),
     Repeat(Arc<fixed::RepeatSpec>),
+    Mat(Arc<matrix::MatSpec>),
 }
 
 /// One step of a plan: a chunk's kernel over its slots, or an ODE segment's loop call.
@@ -5390,6 +5404,7 @@ impl Plan {
                     }
                     CallKind::Fixed(f) => Some(Kern::Fixed(f.clone())),
                     CallKind::Repeat(r) => Some(Kern::Repeat(r.clone())),
+                    CallKind::Mat(m) => Some(Kern::Mat(m.clone())),
                 },
             })
             .collect()
@@ -5457,7 +5472,10 @@ impl Plan {
                         return Some(false);
                     }
                 }
-                (Call::Loop { args, outs, .. }, k @ (Kern::Fixed(_) | Kern::Repeat(_))) => {
+                (
+                    Call::Loop { args, outs, .. },
+                    k @ (Kern::Fixed(_) | Kern::Repeat(_) | Kern::Mat(_)),
+                ) => {
                     #[cfg(test)]
                     CALLS_RUN.with(|n| n.set(n.get() + 1));
                     let inputs: Vec<f64> = args
@@ -5474,6 +5492,7 @@ impl Plan {
                         Kern::Repeat(r) => {
                             r.run(layout, &inputs, &mut out, want.then_some(&mut flog))
                         }
+                        Kern::Mat(m) => m.run(layout, &inputs, &mut out),
                         _ => false,
                     };
                     if !ok {
@@ -5833,7 +5852,7 @@ impl Plan {
                     }
                     (
                         Call::Loop { spec, args, outs },
-                        k @ (Kern::Loop(_) | Kern::Fixed(_) | Kern::Repeat(_)),
+                        k @ (Kern::Loop(_) | Kern::Fixed(_) | Kern::Repeat(_) | Kern::Mat(_)),
                     ) if li > 0 => {
                         li -= 1;
                         let mut inputs = take(0);
@@ -5867,6 +5886,9 @@ impl Plan {
                             }
                             (CallKind::Repeat(_), Kern::Repeat(rp), CallLog::Fixed(Some(fl))) => {
                                 rp.run_rev(layout, sweep, fl, seeds, &out_adj, &mut in_adj)
+                            }
+                            (CallKind::Mat(_), Kern::Mat(m), CallLog::Fixed(_)) => {
+                                m.run_rev(layout, sweep, &inputs, seeds, &out_adj, &mut in_adj)
                             }
                             _ => false,
                         };
