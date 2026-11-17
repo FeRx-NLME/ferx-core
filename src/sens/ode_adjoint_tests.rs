@@ -5365,15 +5365,6 @@ pub(super) fn hessian_gaps_for(
     s: &Subject,
     objective: Objective,
 ) -> (f64, f64) {
-    // Every rows-reverse chunk checked against its per-direction kernel on the way (#2980).
-    use crate::parser::model_parser::rhs_regcode::kernel_jit::ROWS_CHECK;
-    ROWS_CHECK.with(|c| c.set(true));
-    let out = hessian_gaps_inner(model, s, objective);
-    ROWS_CHECK.with(|c| c.set(false));
-    out
-}
-
-fn hessian_gaps_inner(model: &CompiledModel, s: &Subject, objective: Objective) -> (f64, f64) {
     let interaction = objective != Objective::Foce;
     use crate::estimation::parameterization::unpack_params;
     let params = moved_params(model);
@@ -12026,15 +12017,21 @@ fn shared_kernel_serves_both_sides_of_a_recorded_branch() {
     assert_eq!((a, b, c), (4.0, 6.0, 9.0));
 }
 
-/// The covariance Hessian's bases take the shared-primal kernels (#2980): on a closed-form
-/// subject the rows forward and the rows forward-over-reverse run, and on an ODE subject the
-/// ODE loop runs as rows too — each counted where it completes, so a silent fallback to the
+/// The covariance Hessian's bases take the shared-primal kernels (#2980): on closed-form and
+/// linear-ODE subjects the rows forward and the rows forward-over-reverse run, and on a
+/// nonlinear-ODE subject the ODE step loop runs as rows too — each counted where it completes, so a silent fallback to the
 /// per-axis runs (correct, and invisible to every oracle) fails here. The Hessians themselves
 /// are pinned by the oracles (`hessian_gaps_for`); this pins which engine produced them.
 #[test]
 fn the_covariance_bases_take_the_shared_primal_kernels() {
     use crate::parser::model_parser::rhs_regcode::kernel_jit::ROWS_RUNS;
-    for (src, ode) in [(ONE_CPT_ORAL, false), (ONE_CPT_ORAL_ODE, true)] {
+    // Closed form; a linear ODE (its matrix exponential, no step loop); a nonlinear one (the
+    // step loop).
+    for (src, ode) in [
+        (ONE_CPT_ORAL, false),
+        (ONE_CPT_ORAL_ODE, false),
+        (MM_ODE, true),
+    ] {
         let model = parse_model_string(src).unwrap();
         let s = subject(
             &model,
@@ -12048,12 +12045,13 @@ fn the_covariance_bases_take_the_shared_primal_kernels() {
         let params = moved_params(&model);
         let x = pack_params(&params);
         let eta = ebe_for(&model, &s, &params, 1e-12, true);
-        ROWS_RUNS.with(|c| c.set([0; 3]));
-        with_fit_stack(|| {
+        // Counted on the thread that runs the step (`with_fit_stack` runs it on its own).
+        let [fwd, rev, loops] = with_fit_stack(|| {
+            ROWS_RUNS.with(|c| c.set([0; 3]));
             subject_adjoint_cov_hessian(&model, &s, &params, &x, eta.as_slice(), Objective::Focei)
-                .expect("in scope")
+                .expect("in scope");
+            ROWS_RUNS.with(std::cell::Cell::get)
         });
-        let [fwd, rev, loops] = ROWS_RUNS.with(std::cell::Cell::get);
         eprintln!("ode {ode}: rows forwards {fwd}, reverses {rev}, loop runs {loops}");
         assert!(
             fwd > 0 && rev > 0,

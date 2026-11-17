@@ -5417,12 +5417,6 @@ thread_local! {
     pub(crate) static ROWS_RUNS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test switch: check every rows-reverse chunk against its per-direction kernel.
-    pub(crate) static ROWS_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
 /// One seed of a rows reverse through a chunk's per-direction forward over reverse at one
 /// tangent (`ktr`): the shared `[values | adjoints]` `sh` and the seed's `[tangents |
 /// adjoints' tangents]` `tsd` packed as that kernel reads them; the adjoints' tangents back into
@@ -6022,10 +6016,9 @@ impl Plan {
                         continue;
                     }
                     let idx2 = k.doubled(idx, self.n_slots as u32);
+                    // Test builds check every rows-reverse chunk against its per-direction kernel.
                     #[cfg(test)]
-                    let before = ROWS_CHECK
-                        .with(std::cell::Cell::get)
-                        .then(|| (sh.clone(), ts.clone()));
+                    let before = Some((sh.clone(), ts.clone()));
                     // SAFETY: the doubled table's entries are below `2·n_slots`, `sh` and each
                     // seed's block of `ts` hold that many lane blocks.
                     unsafe {

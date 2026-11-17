@@ -1838,7 +1838,6 @@ pub(crate) fn run_loop_rev_rows(
         return false;
     };
     let blocks = 1 + seeds;
-    let hl = 2 * l;
     let n = spec.n;
     let n_hard = spec.saveat.len();
     let (out_w, in_w) = (out_adj.len() / blocks, in_adj.len() / blocks);
@@ -1848,56 +1847,9 @@ pub(crate) fn run_loop_rev_rows(
     let mut ubar = vec![0.0; blocks * nl];
     let mut capbar = vec![0.0; blocks * cap_w];
     let (mut cbar, mut probe, mut a_c) = (Vec::new(), Vec::new(), Vec::new());
-    // A body's reverse: the shared buffer and each seed's, through the doubled table.
-    let body = |b: &LoopBody,
-                k: &Tiered,
-                at: usize,
-                out_adj_of: &dyn Fn(usize, &mut [f64]),
-                back: &mut dyn FnMut(usize, &[f64])|
-     -> bool {
-        let n_in = b.n_vars + b.caps.len();
-        let n_slots = n_in + b.n_out + b.guarded as usize;
-        let w = n_slots * l;
-        let mut sh = vec![0.0; 2 * w];
-        let mut ts = vec![0.0; seeds * 2 * w];
-        for j in 0..b.n_vars {
-            sh[j * l..(j + 1) * l].copy_from_slice(&log.vars[at + j * hl..at + j * hl + l]);
-            for (sd, lg) in logs.iter().enumerate() {
-                ts[sd * 2 * w + j * l..sd * 2 * w + (j + 1) * l]
-                    .copy_from_slice(&lg.vars[at + j * hl + l..at + (j + 1) * hl]);
-            }
-        }
-        for (j, &cp) in b.caps.iter().enumerate() {
-            let o = (b.n_vars + j) * l;
-            sh[o..o + l].copy_from_slice(&inputs[(n + cp) * l..(n + cp + 1) * l]);
-            for sd in 0..seeds {
-                ts[sd * 2 * w + o..sd * 2 * w + o + l]
-                    .copy_from_slice(&tin[sd * w_in + (n + cp) * l..sd * w_in + (n + cp + 1) * l]);
-            }
-        }
-        out_adj_of(0, &mut sh[w..]);
-        for sd in 0..seeds {
-            out_adj_of(1 + sd, &mut ts[sd * 2 * w + w..(sd + 1) * 2 * w]);
-        }
-        let iota: Vec<u32> = (0..n_slots as u32).collect();
-        let iota2 = k.doubled(&iota, n_slots as u32);
-        // SAFETY: `iota2` names the `2·n_slots` slots `sh` and each seed's block of `ts` hold.
-        unsafe {
-            k.call_seeds(
-                sh.as_mut_ptr(),
-                ts.as_mut_ptr(),
-                2 * w,
-                seeds,
-                iota2.as_ptr(),
-                b.lits.as_ptr(),
-            )
-        };
-        back(0, &sh[w..]);
-        for sd in 0..seeds {
-            back(1 + sd, &ts[sd * 2 * w + w..(sd + 1) * 2 * w]);
-        }
-        sh.iter().chain(&ts).all(|v| v.is_finite())
-    };
+    // A body's reverse: the shared buffer and each seed's, through the doubled table — buffers
+    // reused across the run's bodies.
+    let (mut sh, mut ts, mut tbl) = (Vec::new(), Vec::new(), Vec::new());
     for e in log.entries.iter().rev() {
         match e {
             Entry::Point {
@@ -1956,31 +1908,20 @@ pub(crate) fn run_loop_rev_rows(
                 let b = &spec.jumps[*m];
                 let k = &rev.jumps[*m].0;
                 let n_in = b.n_vars + b.caps.len();
-                let ub = ubar.clone();
-                let mut ub_new = ubar.clone();
-                let mut cap_add = vec![0.0; blocks * cap_w];
-                let ok = body(
-                    b,
-                    k,
-                    *at,
-                    &|bk, a| {
-                        a[n_in * l..n_in * l + nl].copy_from_slice(&ub[bk * nl..(bk + 1) * nl])
-                    },
-                    &mut |bk, a| {
-                        for (j, &cp) in b.caps.iter().enumerate() {
-                            for x in 0..l {
-                                cap_add[bk * cap_w + cp * l + x] += a[(b.n_vars + j) * l + x];
-                            }
-                        }
-                        ub_new[bk * nl..(bk + 1) * nl].copy_from_slice(&a[..nl]);
-                    },
-                );
-                if !ok {
-                    return false;
+                let w = rows_body_inputs(b, l, n, w_in, logs, inputs, tin, *at, &mut sh, &mut ts);
+                for bk in 0..blocks {
+                    let a = rows_block(&mut sh, &mut ts, w, bk);
+                    a[n_in * l..n_in * l + nl].copy_from_slice(&ubar[bk * nl..(bk + 1) * nl]);
                 }
-                ubar = ub_new;
-                for (x, y) in capbar.iter_mut().zip(&cap_add) {
-                    *x += y;
+                rows_body_call(k, b, l, seeds, &mut sh, &mut ts, &mut tbl);
+                for bk in 0..blocks {
+                    let a = rows_block(&mut sh, &mut ts, w, bk);
+                    for (j, &cp) in b.caps.iter().enumerate() {
+                        for x in 0..l {
+                            capbar[bk * cap_w + cp * l + x] += a[(b.n_vars + j) * l + x];
+                        }
+                    }
+                    ubar[bk * nl..(bk + 1) * nl].copy_from_slice(&a[..nl]);
                 }
             }
             Entry::Begin => {
@@ -2013,48 +1954,36 @@ pub(crate) fn run_loop_rev_rows(
                 };
                 let n_in = b.n_vars + b.caps.len();
                 let accept = *kind == 2;
-                let (ub, cb) = (ubar.clone(), cbar.clone());
-                let (mut ub_new, mut cb_new) = (ubar.clone(), cbar.clone());
-                let mut cap_add = vec![0.0; blocks * cap_w];
-                let ok = body(
-                    b,
-                    k,
-                    *at,
-                    &|bk, a| {
-                        a[n_in * l..n_in * l + cl].copy_from_slice(&cb[bk * cl..(bk + 1) * cl]);
-                        if accept {
-                            a[n_in * l + cl..n_in * l + cl + nl]
-                                .copy_from_slice(&ub[bk * nl..(bk + 1) * nl]);
-                        }
-                    },
-                    &mut |bk, a| {
-                        for (j, &cp) in b.caps.iter().enumerate() {
-                            for x in 0..l {
-                                cap_add[bk * cap_w + cp * l + x] += a[(b.n_vars + j) * l + x];
-                            }
-                        }
-                        let (u, c) = (
-                            &mut ub_new[bk * nl..(bk + 1) * nl],
-                            &mut cb_new[bk * cl..(bk + 1) * cl],
-                        );
-                        if accept {
-                            c.copy_from_slice(&a[..cl]);
-                            u.fill(0.0);
-                        } else {
-                            for (x, &g) in u.iter_mut().zip(&a[..nl]) {
-                                *x += g;
-                            }
-                            c.copy_from_slice(&a[nl..nl + cl]);
-                        }
-                    },
-                );
-                if !ok {
-                    return false;
+                let w = rows_body_inputs(b, l, n, w_in, logs, inputs, tin, *at, &mut sh, &mut ts);
+                for bk in 0..blocks {
+                    let a = rows_block(&mut sh, &mut ts, w, bk);
+                    a[n_in * l..n_in * l + cl].copy_from_slice(&cbar[bk * cl..(bk + 1) * cl]);
+                    if accept {
+                        a[n_in * l + cl..n_in * l + cl + nl]
+                            .copy_from_slice(&ubar[bk * nl..(bk + 1) * nl]);
+                    }
                 }
-                ubar = ub_new;
-                cbar = cb_new;
-                for (x, y) in capbar.iter_mut().zip(&cap_add) {
-                    *x += y;
+                rows_body_call(k, b, l, seeds, &mut sh, &mut ts, &mut tbl);
+                for bk in 0..blocks {
+                    let a = rows_block(&mut sh, &mut ts, w, bk);
+                    for (j, &cp) in b.caps.iter().enumerate() {
+                        for x in 0..l {
+                            capbar[bk * cap_w + cp * l + x] += a[(b.n_vars + j) * l + x];
+                        }
+                    }
+                    let (u, c) = (
+                        &mut ubar[bk * nl..(bk + 1) * nl],
+                        &mut cbar[bk * cl..(bk + 1) * cl],
+                    );
+                    if accept {
+                        c.copy_from_slice(&a[..cl]);
+                        u.fill(0.0);
+                    } else {
+                        for (x, &g) in u.iter_mut().zip(&a[..nl]) {
+                            *x += g;
+                        }
+                        c.copy_from_slice(&a[nl..nl + cl]);
+                    }
                 }
             }
         }
@@ -2068,4 +1997,85 @@ pub(crate) fn run_loop_rev_rows(
         }
     }
     true
+}
+
+/// A rows reverse body's inputs (#2980): the shared `[values | ·]` from the first seed's log and
+/// each seed's `[tangents | ·]` from its own, the captures from the call's inputs; the adjoint
+/// halves zeroed. Returns the half width `w` (`n_slots × l`).
+#[allow(clippy::too_many_arguments)]
+fn rows_body_inputs(
+    b: &LoopBody,
+    l: usize,
+    n: usize,
+    w_in: usize,
+    logs: &[&Log],
+    inputs: &[f64],
+    tin: &[f64],
+    at: usize,
+    sh: &mut Vec<f64>,
+    ts: &mut Vec<f64>,
+) -> usize {
+    let hl = 2 * l;
+    let seeds = logs.len();
+    let n_slots = b.n_vars + b.caps.len() + b.n_out + b.guarded as usize;
+    let w = n_slots * l;
+    sh.clear();
+    sh.resize(2 * w, 0.0);
+    ts.clear();
+    ts.resize(seeds * 2 * w, 0.0);
+    for j in 0..b.n_vars {
+        sh[j * l..(j + 1) * l].copy_from_slice(&logs[0].vars[at + j * hl..at + j * hl + l]);
+        for (sd, lg) in logs.iter().enumerate() {
+            ts[sd * 2 * w + j * l..sd * 2 * w + (j + 1) * l]
+                .copy_from_slice(&lg.vars[at + j * hl + l..at + (j + 1) * hl]);
+        }
+    }
+    for (j, &cp) in b.caps.iter().enumerate() {
+        let o = (b.n_vars + j) * l;
+        sh[o..o + l].copy_from_slice(&inputs[(n + cp) * l..(n + cp + 1) * l]);
+        for sd in 0..seeds {
+            ts[sd * 2 * w + o..sd * 2 * w + o + l]
+                .copy_from_slice(&tin[sd * w_in + (n + cp) * l..sd * w_in + (n + cp + 1) * l]);
+        }
+    }
+    w
+}
+
+/// Block `bk`'s adjoint half: the shared buffer's for block 0, seed `bk − 1`'s after.
+fn rows_block<'a>(sh: &'a mut [f64], ts: &'a mut [f64], w: usize, bk: usize) -> &'a mut [f64] {
+    if bk == 0 {
+        &mut sh[w..2 * w]
+    } else {
+        let o = (bk - 1) * 2 * w;
+        &mut ts[o + w..o + 2 * w]
+    }
+}
+
+/// A rows reverse body's kernel over the shared buffer and every seed's, through its doubled
+/// table (built into `tbl`).
+fn rows_body_call(
+    k: &Tiered,
+    b: &LoopBody,
+    l: usize,
+    seeds: usize,
+    sh: &mut [f64],
+    ts: &mut [f64],
+    tbl: &mut Vec<u32>,
+) {
+    let n_slots = b.n_vars + b.caps.len() + b.n_out + b.guarded as usize;
+    tbl.clear();
+    tbl.extend(0..n_slots as u32);
+    let t2 = k.doubled(tbl, n_slots as u32);
+    // SAFETY: `t2` names slots below `2·n_slots`, whose `l` lanes `sh` and each seed's block of
+    // `ts` hold.
+    unsafe {
+        k.call_seeds(
+            sh.as_mut_ptr(),
+            ts.as_mut_ptr(),
+            2 * n_slots * l,
+            seeds,
+            t2.as_ptr(),
+            b.lits.as_ptr(),
+        )
+    };
 }
