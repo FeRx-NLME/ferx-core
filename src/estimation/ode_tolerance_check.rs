@@ -165,61 +165,26 @@ pub(crate) fn unclean_integration(st: &crate::ode::solver::OdeSolverStats) -> Op
 }
 
 /// Re-find every subject's EBEs warm from the fit's joint modes (η̂ and κ̂) and score the
-/// objective, at whatever ODE tolerance is armed on the calling thread. The same seeded warm
-/// solve an `agq_eval_only` stage runs, so on the fit-tolerance side it reproduces that
-/// stage's objective.
-fn rescored_with_modes(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    options: &FitOptions,
-) -> (f64, EbeModes) {
-    use crate::estimation::inner_optimizer::{
-        run_inner_loop_warm_seeded, InnerHessianSeed, PrevEtas,
-    };
-    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
-    let (etas, hs, _stats, kappas) = run_inner_loop_warm_seeded(
-        model,
-        population,
-        params,
-        options.inner_maxiter,
-        options.inner_tol,
-        Some(&warm),
-        Some(&mu_k),
-        options.min_obs_for_convergence_check as usize,
-        options.inner_restarts,
-        InnerHessianSeed::for_options(options),
-        options,
-        PrevEtas::Solved,
-    );
-    let ofv = 2.0 * pop_nll_opts(model, population, params, &etas, &hs, &kappas, options);
-    (ofv, (etas, hs, kappas))
-}
-
-/// [`rescored_with_modes`]'s objective alone.
-fn rescored_ofv(
-    model: &CompiledModel,
-    population: &Population,
-    params: &ModelParameters,
-    eta_hats: &[DVector<f64>],
-    kappas: &[Vec<DVector<f64>>],
-    options: &FitOptions,
-) -> f64 {
-    rescored_with_modes(model, population, params, eta_hats, kappas, options).0
-}
-
-/// A re-found η̂ / `H` / κ̂ triple.
-type EbeModes = (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>);
-
-/// [`rescored_ofv`], `Err` with the counters when the solve at the re-found modes did not
-/// integrate cleanly ([`unclean_integration`]). The counters come from one prediction sweep
-/// per subject at those modes, each on its own worker under its own
-/// [`crate::ode::solver::SolverStatsScope`] (the scope is per thread) — the post-fit sweep's
-/// shape, run here under the tighter tolerance, since that sweep runs at the fit's.
-fn rescored_ofv_checked(
+/// objective, at whatever ODE tolerance is armed on the calling thread — `Err` with the reason
+/// when the result cannot be trusted (#2994 review r2, r3):
+///
+/// * **an integration behind it was not clean** ([`unclean_integration`]). Every integration
+///   that forms a subject's term — the EBE search, its `H` (finite-difference Jacobian or
+///   exact jets), every AGQ node — is counted, because each subject is solved *and* scored in
+///   one task under one [`crate::ode::solver::SolverStatsScope`]. The scope is per thread, and
+///   a subject's solve and score fan out over nothing but that subject, so the task's thread
+///   runs all of it;
+/// * **the EBE pass fails the production guard** ([`ebe_guard_rejects`]): a start the inner
+///   loop hard-rejected (its η̂ / `H` are placeholders), or more unconverged subjects than
+///   `max_unconverged_frac` allows. Such a pass is rejected by every objective evaluation
+///   of the fit, and scoring it here would blame EBE error on the ODE tolerance.
+///
+/// The solve is the seeded warm one an `agq_eval_only` stage runs, per subject, so on the
+/// fit-tolerance side it reproduces that stage's objective; the score is `pop_nll_opts`' term
+/// for that subject (the AGQ marginal when the stage has nodes, the FOCE/FOCEI one otherwise).
+///
+/// [`ebe_guard_rejects`]: crate::estimation::outer_optimizer::ebe_guard_rejects
+fn rescore_checked(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
@@ -227,23 +192,111 @@ fn rescored_ofv_checked(
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> Result<f64, String> {
-    let (ofv, (etas, hs, kappas)) =
-        rescored_with_modes(model, population, params, eta_hats, kappas, options);
-    let (_, stats) = crate::api::postfit::compute_subject_results(
-        model,
-        population,
-        params,
-        &etas,
-        &hs,
-        &kappas,
-        options.interaction,
-        None,
-        true,
-    );
-    match unclean_integration(&stats) {
-        None => Ok(ofv),
-        Some(why) => Err(why),
+    let (ofv, ebe_stats, solver) =
+        rescore_counted(model, population, params, eta_hats, kappas, options);
+    // Every reason, not the first: a clamped trajectory usually also stalls the EBE search,
+    // and the clamp is the cause the user can act on.
+    let mut why = Vec::new();
+    if crate::estimation::outer_optimizer::ebe_guard_rejects(
+        &ebe_stats,
+        population.subjects.len(),
+        ofv,
+        options.max_unconverged_frac,
+    ) {
+        why.push(format!(
+            "the re-found EBEs fail the fit's own convergence guard ({} of {} subjects \
+             hard-rejected at their start, {} unconverged, max_unconverged_frac = {})",
+            ebe_stats.n_start_rejected,
+            population.subjects.len(),
+            ebe_stats.n_unconverged,
+            options.max_unconverged_frac
+        ));
     }
+    if let Some(counters) = unclean_integration(&solver) {
+        why.push(format!("the solve did not integrate cleanly: {counters}"));
+    }
+    if why.is_empty() {
+        Ok(ofv)
+    } else {
+        Err(why.join("; "))
+    }
+}
+
+/// [`rescore_checked`]'s objective, with the EBE pass's statistics and the solver counters of
+/// every integration behind it, before either is judged.
+fn rescore_counted(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> (
+    f64,
+    crate::estimation::inner_optimizer::InnerLoopStats,
+    crate::ode::solver::OdeSolverStats,
+) {
+    use crate::estimation::inner_optimizer::{
+        cacheable_schedule, find_ebe_cached, InnerHessianSeed, InnerLoopStats, InnerSolvePolicy,
+        PrevEtas,
+    };
+    let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
+    let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
+    let policy = InnerSolvePolicy {
+        seed: InnerHessianSeed::for_options(options),
+        ..InnerSolvePolicy::for_stage(options, model)
+    }
+    .with_prev_etas(PrevEtas::Solved);
+    let min_obs = (options.min_obs_for_convergence_check as usize).max(1);
+    let per_subject = crate::par::map(population.subjects.len(), |i| {
+        let subject = &population.subjects[i];
+        let scope = crate::ode::solver::SolverStatsScope::enter();
+        let schedule = cacheable_schedule(model, subject);
+        let ebe = find_ebe_cached(
+            model,
+            subject,
+            params,
+            options.inner_maxiter,
+            options.inner_tol,
+            Some(warm[i].as_slice()),
+            Some(&mu_k),
+            options.inner_restarts,
+            schedule.as_ref(),
+            policy,
+        );
+        let nll = match options.agq_nodes() {
+            Some(n_nodes) => crate::estimation::agq::agq_subject_nll_at_mode(
+                model,
+                subject,
+                params,
+                &ebe.eta,
+                &ebe.kappas,
+                n_nodes,
+                options.hessian_anchor(),
+            ),
+            None => crate::estimation::outer_optimizer::subject_nll(
+                model,
+                subject,
+                params,
+                &ebe.eta,
+                &ebe.h_matrix,
+                &ebe.kappas,
+                options.interaction,
+            ),
+        };
+        let unconverged = !ebe.converged && subject.n_scored_rows() >= min_obs;
+        (nll, unconverged, ebe.hard_reject, scope.collected())
+    });
+    let mut ofv = 0.0;
+    let mut ebe_stats = InnerLoopStats::default();
+    let mut solver = crate::ode::solver::OdeSolverStats::default();
+    for (nll, unconverged, hard_reject, st) in &per_subject {
+        ofv += 2.0 * nll;
+        ebe_stats.n_unconverged += usize::from(*unconverged);
+        ebe_stats.n_start_rejected += usize::from(*hard_reject);
+        solver.merge(st);
+    }
+    (ofv, ebe_stats, solver)
 }
 
 /// Which modes the fit-tolerance side of the check scores.
@@ -259,8 +312,8 @@ pub(crate) enum FitSide {
 }
 
 /// The check itself (#2994): `None` when it does not apply ([`tightened_override`]), `Err`
-/// with the reason when the tighter scope could not be built or the tighter solve did not
-/// integrate cleanly ([`unclean_integration`]).
+/// with the reason when the tighter scope could not be built, or a re-scored side cannot be
+/// trusted ([`rescore_checked`]).
 ///
 /// `options` must be the options of the stage that owns the published OFV (its `method`,
 /// `interaction`, `n_agq` and inner settings), so the objective re-scored is the one the fit
@@ -285,17 +338,20 @@ pub(crate) fn ofv_tolerance_shift(
                 model, population, params, eta_hats, h_matrices, kappas, options,
             )
         }
-        FitSide::Resolved => rescored_ofv(model, population, params, eta_hats, kappas, options),
+        FitSide::Resolved => {
+            match rescore_checked(model, population, params, eta_hats, kappas, options) {
+                Ok(v) => v,
+                Err(why) => {
+                    return Some(Err(format!("at the fit's own tolerance, {why}")));
+                }
+            }
+        }
     };
     let tight_ofv = match crate::api::with_fit_scope_ode(options, tight, || {
-        rescored_ofv_checked(model, population, params, eta_hats, kappas, options)
+        rescore_checked(model, population, params, eta_hats, kappas, options)
     }) {
         Ok(Ok(v)) => v,
-        Ok(Err(unclean)) => {
-            return Some(Err(format!(
-                "the tighter solve did not integrate cleanly at the re-found EBEs: {unclean}"
-            )))
-        }
+        Ok(Err(why)) => return Some(Err(format!("at the tighter tolerance, {why}"))),
         Err(e) => return Some(Err(format!("its scope could not be set up: {e}"))),
     };
     Some(Ok(OdeToleranceShift {
@@ -313,8 +369,8 @@ pub(crate) fn ofv_tolerance_shift(
 pub(crate) const NOT_CHECKED_TOKEN: &str = "W_ODE_OFV_SETTLEMENT_UNCHECKED";
 
 /// The warning for a check that applied but could not be completed (`reason`): the scope
-/// carrying the tighter tolerance could not be built, or the tighter solve did not integrate
-/// cleanly. Never silent: an inapplicable check, a failed one and a settled objective must not
+/// carrying the tighter tolerance could not be built, or a re-scored side did not integrate
+/// cleanly or failed the EBE convergence guard. Never silent: an inapplicable check, a failed one and a settled objective must not
 /// read the same (#2994 review r1, r2).
 pub(crate) fn not_checked_warning(reason: &str) -> String {
     format!(

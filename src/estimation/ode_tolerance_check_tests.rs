@@ -400,8 +400,9 @@ fn a_tight_pass_that_clamped_is_reported_unchecked_not_compared() {
         .iter()
         .find(|w| w.starts_with("W_ODE_OFV_SETTLEMENT_UNCHECKED:"))
         .unwrap_or_else(|| panic!("no unchecked warning in {:?}", r.warnings));
+    assert!(msg.contains("because at the tighter tolerance, "), "{msg}");
     assert!(
-        msg.contains("because the tighter solve did not integrate cleanly at the re-found EBEs:"),
+        msg.contains("the solve did not integrate cleanly:"),
         "{msg}"
     );
     assert!(
@@ -446,5 +447,107 @@ fn an_estimating_laplace_stage_is_checked_under_its_own_stage_options() {
     assert!(
         tol <= 1e-8,
         "checked at inner_tol = {tol}, not the Laplace stage's"
+    );
+}
+
+/// #2994 review r3: the counters cover every integration that forms the re-scored objective,
+/// not a prediction at the mode. Each AGQ node integrates the subject again, so the same
+/// re-score counts more accepted steps at 3 nodes than at 1; a mode-only sweep counts the
+/// same at both. And the per-subject score is `pop_nll_opts`' objective at the re-found modes.
+#[test]
+fn the_rescore_counts_the_integrations_behind_every_term() {
+    let prep = mm_iv();
+    let model = &prep.parsed.model;
+    let params = &prep.init_params;
+    let n = prep.population.subjects.len();
+    let etas: Vec<DVector<f64>> = (0..n).map(|_| DVector::zeros(model.n_eta)).collect();
+    let kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n];
+    let at = |n_agq: usize| {
+        let opts = FitOptions {
+            method: EstimationMethod::Laplace,
+            n_agq,
+            ..FitOptions::default()
+        };
+        rescore_counted(model, &prep.population, params, &etas, &kappas, &opts)
+    };
+    let (ofv1, ebe1, one) = at(1);
+    let (_, _, three) = at(3);
+    assert_eq!(ebe1.n_start_rejected, 0);
+    assert!(one.accepted_steps > 0, "integrations were counted");
+    assert!(
+        three.accepted_steps > one.accepted_steps,
+        "AGQ nodes integrate: {} at 3 nodes vs {} at 1",
+        three.accepted_steps,
+        one.accepted_steps
+    );
+
+    let opts = FitOptions {
+        method: EstimationMethod::Laplace,
+        ..FitOptions::default()
+    };
+    let (e, h, k) = {
+        let mu_k = compute_mu_k(model, &params.theta, opts.mu_referencing);
+        let (e, h, _, k) = crate::estimation::inner_optimizer::run_inner_loop_warm_seeded(
+            model,
+            &prep.population,
+            params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            Some(&etas),
+            Some(&mu_k),
+            opts.min_obs_for_convergence_check as usize,
+            opts.inner_restarts,
+            crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&opts),
+            &opts,
+            crate::estimation::inner_optimizer::PrevEtas::Solved,
+        );
+        (e, h, k)
+    };
+    let pop = 2.0 * pop_nll_opts(model, &prep.population, params, &e, &h, &k, &opts);
+    assert!(
+        (ofv1 - pop).abs() < 1e-9 * pop.abs().max(1.0),
+        "per-subject re-score {ofv1} vs population objective {pop}"
+    );
+}
+
+/// #2994 review r3: a re-found EBE pass that fails the fit's own convergence guard is not
+/// scored. With one inner iteration and `max_unconverged_frac = 0`, the readout's re-solve
+/// leaves subjects unconverged, so the check reports itself unchecked instead of a shift.
+#[test]
+fn an_ebe_pass_failing_the_convergence_guard_is_reported_unchecked() {
+    let prep = mm_iv();
+    let opts = FitOptions {
+        verbose: false,
+        methods: vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
+        agq_eval_only: true,
+        outer_maxiter: 0,
+        inner_maxiter: 1,
+        max_unconverged_frac: 0.0,
+        run_covariance_step: false,
+        ode_reltol: 1e-3,
+        ode_abstol: 1e-3,
+        ode_method: crate::ode::OdeMethod::Rk45,
+        ..prep.parsed.fit_options.clone()
+    };
+    let r = crate::fit(
+        &prep.parsed.model,
+        &prep.population,
+        &prep.init_params,
+        &opts,
+    )
+    .expect("the chain runs");
+    assert!(not_settled(&r).is_none(), "{:?}", r.warnings);
+    let msg = r
+        .warnings
+        .iter()
+        .find(|w| w.starts_with("W_ODE_OFV_SETTLEMENT_UNCHECKED:"))
+        .unwrap_or_else(|| panic!("no unchecked warning in {:?}", r.warnings));
+    assert!(
+        msg.contains("the re-found EBEs fail the fit's own convergence guard"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("unconverged, max_unconverged_frac = 0"),
+        "{msg}"
     );
 }
