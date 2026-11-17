@@ -1337,8 +1337,8 @@ fn a_subscripted_read_never_reaches_the_binder() {
 /// #2751: the clause naming the data's time-to-event records.
 const EVENT_CLAUSE: &str = ", and its time-to-event records define no level";
 /// #2751: the clause naming the data's count records.
-const COUNT_CLAUSE: &str =
-    ", and its count records define no level, since no endpoint scores a count record";
+const COUNT_CLAUSE: &str = ", and its count records define no level, since a level is defined \
+     only by a Gaussian row or a binary / DTMM state record";
 
 /// The record kinds a #2751 cell's data carries, none of them on an endpoint that reads
 /// the block (CMT 3 and up; the reading endpoints are on CMT 1).

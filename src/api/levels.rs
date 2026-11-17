@@ -1461,7 +1461,8 @@ fn no_levels_message(decl: &LevelBlockDecl, population: &Population) -> String {
     }
     if counts {
         message.push_str(
-            ", and its count records define no level, since no endpoint scores a count record",
+            ", and its count records define no level, since a level is defined only by a \
+             Gaussian row or a binary / DTMM state record",
         );
     }
     message.push('.');

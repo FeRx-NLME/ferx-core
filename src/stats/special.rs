@@ -538,6 +538,41 @@ pub fn ln_gamma(x: f64) -> f64 {
     HALF_LN_2PI + (y + 0.5) * t.ln() - t + a.ln()
 }
 
+/// `log P(Y = k)` for a count endpoint (#2877): Poisson with mean `lambda` when `size` is
+/// `None`, negative binomial with mean `lambda` and size `r = size` otherwise (variance
+/// `λ + λ²/r`). `NaN` for a mean or size that is not finite and positive, or a `k` that is
+/// not a non-negative integer — the caller decides what an undefined law means.
+///
+/// The value side of the `[count_model]` record kernel, which differentiates the same
+/// formula on its own number type; this is the `f64` form the public
+/// [`Prediction::prob`](crate::types::Prediction::prob) and the tests read.
+pub fn count_log_pmf(lambda: f64, size: Option<f64>, k: f64) -> f64 {
+    let valid = |x: f64| x.is_finite() && x > 0.0;
+    if !valid(lambda) || !(k >= 0.0 && k.fract() == 0.0 && k.is_finite()) {
+        return f64::NAN;
+    }
+    match size {
+        None => k * lambda.ln() - lambda - ln_gamma(k + 1.0),
+        Some(r) if valid(r) => {
+            // The `[count_model]` kernel's stable form: `ln Γ(k+r) − ln Γ(r)` as a finite
+            // sum for a modest `k`, and `r·log(r/(r+λ))` as `−r·ln_1p(λ/r)`.
+            let lg = if k <= 256.0 {
+                (0..k as u32).map(|j| (r + f64::from(j)).ln()).sum::<f64>()
+            } else {
+                ln_gamma(k + r) - ln_gamma(r)
+            };
+            lg - ln_gamma(k + 1.0) - r * (lambda / r).ln_1p()
+                + k * (lambda.ln() - (r + lambda).ln())
+        }
+        Some(_) => f64::NAN,
+    }
+}
+
+/// `P(Y = k)` for a count endpoint: `exp` of [`count_log_pmf`].
+pub fn count_pmf(lambda: f64, size: Option<f64>, k: f64) -> f64 {
+    count_log_pmf(lambda, size, k).exp()
+}
+
 /// Digamma ψ(x) = d/dx ln Γ(x) — the exact analytic derivative of [`ln_gamma`]'s
 /// Lanczos form (same `LANCZOS_COEF` / `LANCZOS_G`), so a finite difference of
 /// `ln_gamma` and `digamma` agree to ~1e-12 (an independent ψ approximation would

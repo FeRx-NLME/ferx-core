@@ -191,6 +191,7 @@
 //! | `E_FOCEI_NAGQ_UNSUPPORTED` | `method = focei` with `n_agq > 1` on a model outside the analytic sensitivity (adjoint) scope; use `laplace` with `n_agq > 1` instead (#251) |
 //! | `E_VI_NAGQ_UNSUPPORTED` | `n_agq > 1` on a chain containing `method = vi` but no `laplace` or `focei` stage to consume it |
 //! | `E_BINARY_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[binary_model]` (binary / categorical) endpoint (#760) |
+//! | `E_COUNT_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[count_model]` (Poisson / negative-binomial) endpoint (#2877) |
 //! | `E_CTMM_GN_UNSUPPORTED` | `method = gn` / `gn_hybrid` anywhere in the chain on a model with a `[markov_model]` (CTMM or DTMM) endpoint (#759, #2473) |
 //! | `E_CTMM_IOV_UNSUPPORTED` | a `[markov_model]` (CTMM or DTMM) endpoint on a model with IOV (`n_kappa > 0`); the generator / transition probabilities use BSV η only, so κ would be ignored (#759, #2473) |
 //! | `E_IMP_MIXTURE_IOV_UNSUPPORTED` | `method = imp` / `impmap` anywhere in the chain on a `[mixture]` model with IOV (`n_kappa > 0`); their mixture E-step has no κ (#2301) |

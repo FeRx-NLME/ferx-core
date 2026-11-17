@@ -853,6 +853,7 @@ pub(crate) fn check_endpoint_routing(
             EndpointLikelihood::Binary { .. } => {
                 Some(("binary (`[binary_model]`)", "binary_model"))
             }
+            EndpointLikelihood::Count { .. } => Some(("count (`[count_model]`)", "count_model")),
             #[cfg(feature = "markov")]
             EndpointLikelihood::Ctmm { .. } | EndpointLikelihood::Dtmm { .. } => {
                 Some(("Markov (`[markov_model]`)", "markov_model"))
@@ -5119,6 +5120,38 @@ pub(crate) fn check_survival_tv_covariates(
                 }
                 continue;
             }
+            // Count (#2877): the mean and size read each record's own snapshot, as the binary
+            // predictor does, with the same refusal when the snapshot cannot line up.
+            if let EndpointLikelihood::Count {
+                count_covariates, ..
+            } = endpoint
+            {
+                if let Some(name) = count_covariates
+                    .iter()
+                    .find(|c| tv_set.contains(c.as_str()))
+                {
+                    if subject.record_covariate_snapshots().is_none() {
+                        return refuse(
+                            "count_model",
+                            format!(
+                                "[count_model] on CMT={cmt}: the count mean or size references \
+                                 {}, which is time-varying for subject `{}`, but that subject \
+                                 carries no per-record covariate snapshot aligned with its \
+                                 count records (it also has time-to-event records, or was built \
+                                 in memory without `endpoint_covariates`), so the expression \
+                                 could only read the baseline value (#741). {}",
+                                tv_reference(name),
+                                subject.id,
+                                tv_remedy(
+                                    name,
+                                    "fit the count endpoint without the time-to-event endpoint"
+                                ),
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
             // DTMM (#2473): the transition probabilities read each record's own covariate
             // snapshot, so a time-varying covariate is honoured — provided the subject's
             // snapshot lines up with its records (`record_covariate_snapshots`). One that
@@ -6188,6 +6221,7 @@ fn profile_refused_endpoint(model: &CompiledModel) -> Option<&'static str> {
         match e {
             E::Gaussian(_) | E::Binary { .. } => None,
             E::Tte { .. } => Some((0, "time-to-event")),
+            E::Count { .. } => Some((1, "count")),
             #[cfg(feature = "markov")]
             E::Dtmm { .. } => Some((1, "Markov (DTMM)")),
             #[cfg(feature = "markov")]
@@ -6617,6 +6651,23 @@ pub fn check_model_options(model: &CompiledModel, options: &FitOptions) -> Vec<D
                 .with_block("fit_options"),
             );
         }
+    }
+
+    // Count (#2877): the same Gauss-Newton gap as binary.
+    if model.has_count()
+        && chain
+            .iter()
+            .any(|&m| matches!(m, EstimationMethod::FoceGn | EstimationMethod::FoceGnHybrid))
+    {
+        diags.push(
+            Diagnostic::error(
+                "E_COUNT_GN_UNSUPPORTED",
+                "method = gn / gn_hybrid is not supported with a [count_model] endpoint. The \
+                 Gauss-Newton gradient is built from the Gaussian residual structure and ignores \
+                 the count likelihood. Use method = focei (default), saem, or imp.",
+            )
+            .with_block("fit_options"),
+        );
     }
 
     // CTMM (#759) endpoint compatibility — same shape as the binary case above. FOCEI

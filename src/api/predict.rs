@@ -419,6 +419,7 @@ pub fn predict_categorical(
     let mut results = Vec::new();
     for subject in &population.subjects {
         crate::categorical::predict_binary(model, subject, &params.theta, &zero_eta, &mut results);
+        crate::categorical::predict_count(model, subject, &params.theta, &zero_eta, &mut results);
     }
     Ok(results)
 }

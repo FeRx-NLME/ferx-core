@@ -251,6 +251,7 @@ A method that cannot score the model's non-Gaussian endpoint or its inter-occasi
 | Code | Severity | Meaning |
 |------|----------|---------|
 | `E_BINARY_GN_UNSUPPORTED` | error | `gn` or `gn_hybrid` anywhere in the method chain on a model with a `[binary_model]` (binary or categorical) endpoint. The Gauss-Newton gradient is built from the Gaussian residuals and ignores the logistic likelihood; use `focei`, `saem` or `imp`. |
+| `E_COUNT_GN_UNSUPPORTED` | error | `gn` or `gn_hybrid` anywhere in the method chain on a model with a `[count_model]` (Poisson or negative-binomial) endpoint. The Gauss-Newton gradient ignores the count likelihood; use `focei`, `saem` or `imp`. |
 | `E_CTMM_GN_UNSUPPORTED` | error | `gn` or `gn_hybrid` anywhere in the method chain on a model with a `[markov_model]` (CTMM) endpoint. The Gauss-Newton gradient ignores the Markov transition likelihood; use `focei`, `saem` or `imp`. |
 | `E_CTMM_IOV_UNSUPPORTED` | error | A `[markov_model]` (CTMM) endpoint on a model with inter-occasion variability (`n_kappa > 0`), whatever the method. The transition generator is built from the between-subject η only, so κ would be ignored. |
 | `E_IMP_MIXTURE_IOV_UNSUPPORTED` | error | `imp` or `impmap` anywhere in the method chain on a `[mixture]` model with inter-occasion variability (`n_kappa > 0`). IMP and IMPMAP estimate IOV, but not in their mixture E-step; use `saem` or `focei`. |
