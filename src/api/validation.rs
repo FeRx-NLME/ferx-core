@@ -1221,18 +1221,21 @@ pub(crate) fn check_theta_gather_indices(
             // then dose rows, which read the individual parameters too.
             // Each row's TIME as written (#1959, #1969): a dose in a reset period that
             // restarts TIME runs at a shifted engine time the file does not hold.
-            // Discrete-state records too: a `[binary_model]` predictor or a DTMM reads the
-            // index from each record's own snapshot (#2562).
+            // Discrete-state and count records too: a `[binary_model]` predictor, a DTMM or a
+            // `[count_model]` mean reads the index from each record's own snapshot (#2562,
+            // #2877).
             let snaps = subj.record_covariate_snapshots();
             let records = subj
                 .obs_records
                 .iter()
                 .enumerate()
                 .filter_map(|(r, rec)| match rec {
-                    crate::types::ObsRecord::DiscreteState { raw_time, .. } => {
+                    crate::types::ObsRecord::DiscreteState { raw_time, .. }
+                    | crate::types::ObsRecord::Count { raw_time, .. } => {
                         Some((*raw_time, subj.record_cov(snaps, r)))
                     }
-                    _ => None,
+                    #[cfg(feature = "survival")]
+                    crate::types::ObsRecord::Event { .. } => None,
                 });
             let rows = (0..subj.obs_times.len())
                 .map(|j| (subj.readout_time(j), subj.obs_cov(j)))

@@ -550,3 +550,123 @@ fn simulate_estimate_stamps_count_draws_and_needs_times() {
     );
     assert!(msg.contains("needs `times = [...]`"), "{msg}");
 }
+
+/// A gather index read by a count mean is validated on the count records' own snapshots:
+/// an out-of-range value on a later count record is the `E_THETA_GATHER_INDEX_RANGE` data
+/// error naming its TIME, a missing one `E_THETA_GATHER_INDEX_MISSING`, and an in-range
+/// one passes (review r2 #2).
+#[test]
+fn gather_index_is_validated_on_count_records() {
+    use crate::types::Population;
+    let model = crate::parser::model_parser::parse_full_model(
+        r"
+[parameters]
+  theta RATE[2](2.0, 0.01, 100.0)
+[count_model]
+  cmt    = 1
+  lambda = RATE[IDX]
+",
+    )
+    .unwrap()
+    .model;
+    let population = |second: Option<f64>| {
+        let idx = |v: Option<f64>| {
+            v.map(|v| HashMap::from([("IDX".to_string(), v)]))
+                .unwrap_or_default()
+        };
+        let mut s = Subject {
+            id: "1".into(),
+            covariates: idx(Some(1.0)),
+            endpoint_covariates: vec![idx(Some(1.0)), idx(second)],
+            ..Default::default()
+        };
+        s.obs_records = [0.0, 4.0]
+            .map(|t| ObsRecord::Count {
+                time: t,
+                raw_time: t,
+                count: 2,
+                cmt: 1,
+            })
+            .to_vec();
+        Population {
+            subjects: vec![s],
+            covariate_names: vec!["IDX".into()],
+            dv_column: "DV".into(),
+            input_columns: Vec::new(),
+            exclusions: None,
+            warnings: Vec::new(),
+        }
+    };
+    let codes = |second: Option<f64>| -> Vec<(String, String)> {
+        crate::api::check_model_data(&model, &population(second))
+            .into_iter()
+            .filter(|d| d.code.starts_with("E_THETA_GATHER_INDEX"))
+            .map(|d| (d.code.to_string(), d.message))
+            .collect()
+    };
+    let refused = codes(Some(3.0));
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert_eq!(refused[0].0, "E_THETA_GATHER_INDEX_RANGE");
+    assert!(
+        refused[0].1.contains("is 3 on subject `1` at TIME 4"),
+        "{}",
+        refused[0].1
+    );
+    let missing = codes(None);
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(missing[0].0, "E_THETA_GATHER_INDEX_MISSING");
+    assert!(missing[0].1.contains("at TIME 4"), "{}", missing[0].1);
+    assert!(codes(Some(2.0)).is_empty(), "in range");
+}
+
+/// The zero-mean limit (a `log_lambda` that underflows `λ` to 0) is the law with all mass
+/// at 0 everywhere: the likelihood, the PMF helper behind `Prediction::prob`, and the
+/// sampler for both families — the negative binomial included, whose gamma mixture cannot
+/// be built at a zero scale (review r2 #3).
+#[test]
+fn zero_mean_limit_is_consistent_across_likelihood_pmf_and_sampler() {
+    use rand::SeedableRng;
+    for size in [None, Some(2.0)] {
+        assert_eq!(count_log_pmf(0.0, size, 0.0), 0.0, "{size:?}");
+        assert_eq!(count_log_pmf(0.0, size, 3.0), f64::NEG_INFINITY, "{size:?}");
+        let p = Prediction::Rate { lambda: 0.0, size };
+        assert_eq!(p.prob(0), Some(1.0), "{size:?}");
+        assert_eq!(p.prob(1), Some(0.0), "{size:?}");
+    }
+    assert!(
+        count_log_pmf(0.0, Some(-1.0), 0.0).is_nan(),
+        "a bad size stays undefined"
+    );
+    assert!(count_log_pmf(-1.0, None, 0.0).is_nan());
+    assert_eq!(count_record_nll_g(NB, LOG, -800.0, 2.0, 0), Some(0.0));
+    let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+    assert_eq!(draw_count(0.0, Some(2.0), &mut rng), Some(0));
+    // Through `simulate_count`: every record draws 0 and nothing is skipped or warned.
+    let prep = load(
+        &NB_MODEL.replace(
+            "lambda = BASE * exp(BETA * (WT / 70 - 1) + GAM * TRT * exp(ETA_G) + ETA_C)",
+            "log_lambda = -800 + ETA_C",
+        ),
+        "nonmem_anchor/count_nb.csv",
+    );
+    let model = &prep.parsed.model;
+    let s = &prep.population.subjects[0];
+    let (mut out, mut warn) = (Vec::new(), Vec::new());
+    let th = &model.default_params.theta;
+    simulate_count(
+        model,
+        s,
+        th,
+        &[0.0, 0.0],
+        0,
+        0,
+        &mut rng,
+        &mut out,
+        &mut warn,
+    );
+    assert!(warn.is_empty(), "{warn:?}");
+    assert_eq!(out.len(), 6);
+    assert!(out
+        .iter()
+        .all(|r| matches!(r.outcome, SimOutcome::Count { count: 0 })));
+}

@@ -288,6 +288,11 @@ pub(crate) fn all_count_endpoints_analytic(model: &CompiledModel) -> bool {
 /// when the draw does not fit a `u32` count.
 fn draw_count<R: rand::Rng>(lambda: f64, size: Option<f64>, rng: &mut R) -> Option<u32> {
     use rand_distr::Distribution;
+    if lambda <= 0.0 {
+        // The zero-mean limit (a `log_lambda` that underflows): zero with probability one,
+        // for either family. Checked first, since `Gamma::new(r, 0)` refuses a zero scale.
+        return Some(0);
+    }
     let rate = match size {
         None => lambda,
         Some(r) => rand_distr::Gamma::new(r, lambda / r).ok()?.sample(rng),
