@@ -633,7 +633,6 @@ pub ferx_core::estimation::mixture::MixtureEval::pmix: alloc::vec::Vec<alloc::ve
 pub fn ferx_core::estimation::mixture::class_params(params: &ferx_core::ModelParameters, k: usize) -> ferx_core::ModelParameters
 pub fn ferx_core::estimation::mixture::combine_subject(logp: &[f64], nll: &[f64]) -> (f64, alloc::vec::Vec<f64>, usize)
 pub fn ferx_core::estimation::mixture::mixture_gradient(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions, eval: &ferx_core::estimation::mixture::MixtureEval) -> core::option::Option<alloc::vec::Vec<f64>>
-pub fn ferx_core::estimation::mixture::mixture_gradient_fd(model: &ferx_core::CompiledModel, population: &ferx_core::Population, x: &[f64], init_params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions) -> alloc::vec::Vec<f64>
 pub fn ferx_core::estimation::mixture::mixture_ofv(model: &ferx_core::CompiledModel, population: &ferx_core::Population, params: &ferx_core::ModelParameters, options: &ferx_core::FitOptions, warm: core::option::Option<&[alloc::vec::Vec<nalgebra::base::alias::DVector<f64>>]>) -> ferx_core::estimation::mixture::MixtureEval
 pub mod ferx_core::estimation::outer_optimizer
 pub struct ferx_core::estimation::outer_optimizer::MixturePosteriors

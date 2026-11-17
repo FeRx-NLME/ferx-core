@@ -97,6 +97,12 @@ fn endpoint_only(model: &CompiledModel) -> bool {
 /// [`likelihood_supported`], plus the dual ODE walk or a closed form (or compartment-free
 /// readout) with a parameter program over `[η, κ]`. The inner loop's scope: a subject
 /// without non-Gaussian records is served even on a joint model.
+///
+/// Every parsed model carries the programs this reads (`parse_model_string` attaches them to
+/// `indiv_param_partials` and the `OdeSpec`); only a `CompiledModel` assembled by hand through
+/// the public struct literal lacks them. Its `rhs` / `pk_param_fn` are opaque Rust closures
+/// that no recording can differentiate, so it is declined here and takes finite differences
+/// (#3004: the one scope gap that is not a parser model).
 pub(crate) fn recorder_in_scope(model: &CompiledModel) -> bool {
     match model.ode_spec.as_ref() {
         _ if model.is_algebraic() => model

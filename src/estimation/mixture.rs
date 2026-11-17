@@ -25,8 +25,8 @@ use nalgebra::{DMatrix, DVector};
 
 use crate::estimation::inner_optimizer::{find_ebe_for_stage_with_prev, InnerLoopStats, PrevEtas};
 use crate::estimation::parameterization::{
-    fd_step_floors, fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments,
-    theta_packs_log, unpack_params, PackedBounds,
+    fd_theta_step_floors, pack_params, pack_with_bounds, packed_segments, theta_packs_log,
+    unpack_params, PackedBounds,
 };
 use crate::parser::model_parser::{
     eval_mixing_log_probs, mixing_logp_derivs, mixing_logp_grad, MixtureClassGuard,
@@ -600,8 +600,10 @@ pub(crate) fn mixture_gradient_with_modes(
 /// Each subject that took a salvage is recorded on `declines` (structural when no
 /// recorder serves the subject's data shape under that class, as
 /// `outer_optimizer::is_structural_decline` asks), so the fit's #1154 warning reports
-/// it. Still `None` when the mixing map declines (a model-level gap, so the caller's
-/// whole-objective FD is the only gradient there is), or under IOV without `modes`.
+/// it. Total: the mixing map's own derivative is exact, or its central difference after a
+/// plan failure ([`crate::parser::model_parser::mixing_logp_grad`]), so no model reaches a
+/// whole-objective difference. Under IOV `modes` must be supplied (the fit's outer loop
+/// always holds them, `mixture_ofv_with_modes`).
 pub(crate) fn mixture_gradient_salvaged(
     model: &CompiledModel,
     population: &Population,
@@ -610,7 +612,7 @@ pub(crate) fn mixture_gradient_salvaged(
     eval: &MixtureEval,
     modes: Option<&MixtureClassModes>,
     declines: &crate::estimation::outer_optimizer::OuterFdDeclineLog,
-) -> Option<Vec<f64>> {
+) -> Vec<f64> {
     let salvage = |d: DeclinedTerm<'_>| {
         let subject = &population.subjects[d.subject];
         declines.record(d.subject);
@@ -638,14 +640,15 @@ pub(crate) fn mixture_gradient_salvaged(
         modes,
         Some(&salvage),
         |f| f(),
-    )?;
+    )
+    .expect("an IOV mixture gradient needs every class's κ̂ (`modes`), one per occasion");
     let mut grad = vec![0.0f64; packed_segments(params).total()];
     for row in &rows {
         for (g, v) in grad.iter_mut().zip(row) {
             *g += 2.0 * v;
         }
     }
-    Some(grad)
+    grad
 }
 
 /// One (subject × class) term the adjoint declined: what its salvage needs.
@@ -1173,9 +1176,9 @@ impl MixtureScoreContext {
     }
 }
 
-/// Central-FD outer gradient of the mixture OFV in real packed space — the
-/// fallback when [`mixture_gradient`] is out of analytic scope (#977 Phase 4).
-/// Re-runs `mixture_ofv` at `x ± hᵢ` per coordinate (`2·n` cold evals).
+/// Central-FD outer gradient of the mixture OFV in real packed space — the test oracle
+/// for the exact gradient ([`mixture_gradient_salvaged`]; no model reaches it in a fit,
+/// #3004). Re-runs `mixture_ofv` at `x ± hᵢ` per coordinate (`2·n` cold evals).
 ///
 /// `hᵢ = 1e-5·floorᵢ`, `floor` from `fd_step_floors`: a flat `1e-5` on every coordinate
 /// but a small identity-packed θ, whose packed coordinate is the θ itself, so a flat step
@@ -1186,14 +1189,15 @@ impl MixtureScoreContext {
 /// does, so a coordinate on a bound is differenced one-sidedly inside it rather than
 /// evaluated at a point the optimizer can never reach. A FIX coordinate's box is pinned
 /// to a point, so its span is zero and its gradient stays 0.
-pub fn mixture_gradient_fd(
+#[cfg(test)]
+pub(crate) fn mixture_gradient_fd(
     model: &CompiledModel,
     population: &Population,
     x: &[f64],
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let floor = fd_step_floors(init_params, model);
+    let floor = crate::estimation::parameterization::fd_step_floors(init_params, model);
     let bounds = crate::estimation::parameterization::compute_bounds(init_params);
     let n = x.len();
     let mut g = vec![0.0f64; n];
@@ -3459,8 +3463,7 @@ mod tests {
             &eval,
             Some(&modes),
             &log,
-        )
-        .expect("the mixing map is in scope, so the salvage forms a gradient");
+        );
         assert_eq!(log.declined_indices(), vec![0], "only subject 0 declined");
 
         // The same assembly with subject 0's salvage zeroed: how much its terms carry.
