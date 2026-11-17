@@ -1414,7 +1414,12 @@ fn stacked_prior_keeps_block_structure_and_marks_cross_block_zeros() {
 /// quantity, so a fixture where every subject agreed would not exercise
 /// [`Families::PerSubject`] or catch an offset computed from the wrong subject's `K`.
 fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
-    let model = crate::parser::model_parser::parse_model_string(
+    iov_fixture_with("")
+}
+
+/// [`iov_fixture`] with `extra` appended to its `[fit_options]` block.
+fn iov_fixture_with(extra: &str) -> (CompiledModel, Population, ModelParameters) {
+    let model = crate::parser::model_parser::parse_model_string(&format!(
         r"
 [parameters]
   theta TVCL(1.0, 0.1, 10.0)
@@ -1436,8 +1441,9 @@ fn iov_fixture() -> (CompiledModel, Population, ModelParameters) {
 
 [fit_options]
   iov_column = OCC
-",
-    )
+{extra}
+"
+    ))
     .expect("IOV fixture parses");
 
     let subject = |id: &str, occ: Vec<u32>, scale: f64| Subject {
@@ -2491,5 +2497,59 @@ fn the_data_eta_gradient_is_exact_past_the_closed_forms() {
     eprintln!("exact data η-gradient vs the central quotient: worst {worst:.2e} of the row");
     // Measured 6.8e-10: the central quotient's truncation at its `1e-5` step. A dropped
     // censored-row weight or residual-η channel misses by O(1).
+    assert!(worst < 1e-6, "{worst:.2e}");
+}
+
+/// Under IOV the data η-gradient is exact past the closed forms too: with M3 censoring the
+/// `Auto` route (`eta_data_grad` → `fixed_theta_data_eta_grad` over the stacked `[η, κ…]`)
+/// reports no FD flag and agrees with the `Fd` route's central quotient. Subject 0 carries a
+/// censored record in each of its two occasions, so the censored-row weight is live on both
+/// occasions' κ columns; subject 1 (uncensored, three occasions) is the control beside it
+/// (#3004).
+#[test]
+fn the_iov_data_eta_gradient_is_exact_past_the_closed_forms() {
+    let (model, mut population, params) = iov_fixture_with("  bloq_method = m3");
+    assert!(model.n_kappa > 0, "fixture must carry IOV");
+    // Censored below the quantification limit: DV is the limit, `cens = 1`.
+    population.subjects[0].cens = vec![0, 1, 0, 1];
+    population.subjects[0].observations[1] = 2.0;
+    population.subjects[0].observations[3] = 1.5;
+    let mut worst = 0.0f64;
+    let mut scratch = EventPkParams::default();
+    for (i, s) in population.subjects.iter().enumerate() {
+        let k = subject_k_occasions(&model, s);
+        let z: Vec<f64> = (0..model.n_eta + k * model.n_kappa)
+            .map(|j| 0.05 + 0.03 * j as f64)
+            .collect();
+        let prior = stacked_prior(&params.omega, params.omega_iov.as_ref(), k);
+        let run = |mode: EtaGradMode, scratch: &mut EventPkParams| {
+            super::eta_data_grad(
+                &model,
+                s,
+                &params.theta,
+                &params,
+                &prior,
+                &params.sigma.values,
+                &z,
+                &[],
+                k,
+                mode,
+                scratch,
+            )
+        };
+        let (g_e, fd_e) = run(EtaGradMode::Auto, &mut scratch);
+        let (g_f, fd_f) = run(EtaGradMode::Fd, &mut scratch);
+        assert!(
+            !fd_e && fd_f,
+            "subject {i}: Auto must be exact, Fd the quotient"
+        );
+        assert!(g_f.iter().all(|v| v.is_finite()), "subject {i}");
+        let scale = g_f.iter().fold(1.0f64, |a, &v| a.max(v.abs())); // nan-ok: g_f finite asserted above
+        for (a, b) in g_e.iter().zip(&g_f) {
+            assert!(a.is_finite() && b.is_finite(), "subject {i}");
+            worst = worst.max((a - b).abs() / scale); // nan-ok: a, b finite asserted above; scale >= 1
+        }
+    }
+    eprintln!("IOV exact data η-gradient vs the central quotient: worst {worst:.2e} of the row");
     assert!(worst < 1e-6, "{worst:.2e}");
 }

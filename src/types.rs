@@ -5602,10 +5602,10 @@ pub struct FremConfig {
 /// The inner optimizer is BFGS; what differs across variants is how the
 /// gradient of the individual NLL w.r.t. ETA is computed.
 ///
-/// - `Auto` (default): use the exact analytic `Dual2` sensitivities whenever
-///   the model is in scope for them (analytical PK path: `tv_fn` populated,
-///   no LTBS / expression-scale inner / SDE), else fall back to `Fd`. The
-///   resolved per-subject route is reported in the startup banner.
+/// - `Auto` (default): the exact adjoint gradient (the compiled per-subject plans) for every
+///   model the parser accepts — closed-form, ODE, compartment-free, LTBS, expression scale,
+///   SDE, IOV. `Fd` is taken only for a subject whose plan fails at a point (reported as
+///   `W_PLAN_FD_FALLBACK`). The resolved per-subject route is reported in the startup banner.
 /// - `Fd`: central finite differences on the forward NLL. Performs `2·n_eta`
 ///   forward evaluations per gradient, so cost scales linearly with the
 ///   number of random effects. Always available, including for ODE models.

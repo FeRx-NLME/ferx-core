@@ -7655,8 +7655,7 @@ fn optimize_nlopt_attempt_probed(
                 // d(OFV)/d(x) = 2 · Σᵢ d(NLL_i)/d(x); then scale for optimizer space.
                 // Mixture (#977 Phase 4): analytic posterior-weighted gradient, a
                 // declined (subject × class) term salvaged on its own and recorded for
-                // the #1154 warning (#2906); whole-objective FD only when the mixing map
-                // itself is out of analytic scope.
+                // the #1154 warning (#2906). No whole-objective difference (#3004).
                 // #1520: per the optimizer's own acceptance test (`SalvageGuardPolicy`),
                 // the incumbent the salvage guard may measure this gradient point against.
                 let guard_reference = state.salvage_guard.reference(xs);
@@ -7670,15 +7669,6 @@ fn optimize_nlopt_attempt_probed(
                         mixmodes.as_ref(),
                         declines,
                     )
-                    .unwrap_or_else(|| {
-                        crate::estimation::mixture::mixture_gradient_fd(
-                            model,
-                            population,
-                            &x,
-                            init_params,
-                            options,
-                        )
-                    })
                 } else {
                     population_gradient_with_agq_evaluation(
                         &x,
