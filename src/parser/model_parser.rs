@@ -34116,16 +34116,18 @@ impl IndivParamProgram {
         })
     }
 
-    /// Variable `var_slot` (a top-level `[individual_parameters]` name's slot) at `(θ, η)` on
-    /// any number type: a folded mu line's typical value (#2982).
-    pub(crate) fn eval_var_g<T: crate::sens::num::vm::VmNum>(
+    /// Variables `slots` (top-level `[individual_parameters]` names' slots) at `(θ, η)` on any
+    /// number type, from one run of the program: the folded mu lines' values (#2982).
+    pub(crate) fn eval_var_slots_g<T: crate::sens::num::vm::VmNum>(
         &self,
         theta: &[T],
         eta: &[T],
         covariates: &HashMap<String, f64>,
-        var_slot: usize,
-    ) -> T {
-        self.eval_vars_g(theta, eta, covariates, &[], |v| v[var_slot])
+        slots: &[usize],
+    ) -> Vec<T> {
+        self.eval_vars_g(theta, eta, covariates, &[], |v| {
+            slots.iter().map(|&s| v[s]).collect()
+        })
     }
 
     /// The shared body of [`Self::eval_params_g`] and [`Self::eval_var_slots_g`]: run the

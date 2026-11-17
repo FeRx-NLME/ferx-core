@@ -108,17 +108,17 @@ impl MuFold {
         // `θ_j` (the same θ for `i = j`), so `hess[0][1]` is `∂²μ/∂θ_i∂θ_j`. A mu line is a few
         // operations, so this is cheaper than recording one.
         use crate::sens::dual2::Dual2;
+        let slots: Vec<usize> = spec.lines.iter().map(|l| l.1).collect();
         let mu_of = |th: &[Dual2<2>]| -> Vec<Dual2<2>> {
             let z = vec![Dual2::<2>::constant(0.0); eta.len()];
+            let vals = prog.eval_var_slots_g(th, &z, cov, &slots);
             spec.lines
                 .iter()
-                .map(|&(_, slot, t)| {
-                    let v = prog.eval_var_g(th, &z, cov, slot);
-                    match t {
-                        MuTransform::Log => v.ln(),
-                        MuTransform::Logit => (v / (Dual2::<2>::constant(1.0) - v)).ln(),
-                        _ => v,
-                    }
+                .zip(vals)
+                .map(|(&(_, _, t), v)| match t {
+                    MuTransform::Log => v.ln(),
+                    MuTransform::Logit => (v / (Dual2::<2>::constant(1.0) - v)).ln(),
+                    _ => v,
                 })
                 .collect()
         };
@@ -171,8 +171,8 @@ impl MuFold {
         // that is not of that form misses by O(1) at the moved point.
         let moved: Vec<f64> = eta.iter().map(|v| v + 0.5).collect();
         for at in [eta, moved.as_slice()] {
-            for (k, &(e, slot, t)) in spec.lines.iter().enumerate() {
-                let p = prog.eval_var_g(theta, at, cov, slot);
+            let vals = prog.eval_var_slots_g(theta, at, cov, &slots);
+            for (k, (&(e, _, t), &p)) in spec.lines.iter().zip(&vals).enumerate() {
                 let want = inv(t, mu[k] + at.get(e).copied()?);
                 if !(p.is_finite() && (p - want).abs() <= 1e-10 * (1.0 + want.abs())) {
                     return None;
