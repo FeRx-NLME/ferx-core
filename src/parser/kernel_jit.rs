@@ -3633,6 +3633,10 @@ pub(crate) struct Tiered {
     prefix: usize,
     /// The modules every native entry point lives in (an older one may still be running).
     modules: Mutex<Vec<ChunkKernel>>,
+    /// A rows reverse kernel's slot-table split (`ir::tangent_reverse_rows`): its calls pass
+    /// their first `entries` entries, then the same entries a plan's slot count on. `0` for
+    /// every other kernel.
+    entries: usize,
     /// Itself, for the compile queue ([`compile_queue`]).
     me: std::sync::Weak<Tiered>,
     /// How a kernel too large for one native frame is cut into segments ([`SegPlan`]), made at
@@ -3709,7 +3713,38 @@ impl Tiered {
             calls: AtomicUsize::new(0),
             tier: std::sync::atomic::AtomicU8::new(0),
             modules: Mutex::new(Vec::new()),
+            entries: 0,
         })
+    }
+
+    /// [`Self::new`] for a rows reverse kernel splitting its slot table at `entries`.
+    fn new_rows(f: Func, layout: Layout, n_in: usize, prefix: usize, entries: usize) -> Arc<Self> {
+        Arc::new_cyclic(|me| Tiered {
+            me: me.clone(),
+            spill: OnceLock::new(),
+            want: std::sync::atomic::AtomicU8::new(0),
+            queued: std::sync::atomic::AtomicBool::new(false),
+            prefix,
+            f,
+            layout,
+            n_in,
+            rev: true,
+            native: std::sync::atomic::AtomicUsize::new(0),
+            calls: AtomicUsize::new(0),
+            tier: std::sync::atomic::AtomicU8::new(0),
+            modules: Mutex::new(Vec::new()),
+            entries,
+        })
+    }
+
+    /// The doubled slot table a rows reverse call passes: `idx`'s first [`Self::entries`]
+    /// entries, then each `off` on.
+    pub(crate) fn doubled(&self, idx: &[u32], off: u32) -> Vec<u32> {
+        let e = &idx[..self.entries.min(idx.len())];
+        e.iter()
+            .copied()
+            .chain(e.iter().map(|&x| x + off))
+            .collect()
     }
 
     /// Run the kernel: `adj` is the adjoint buffer of a reverse kernel (null otherwise).
@@ -4057,13 +4092,27 @@ impl ChunkProgram {
         let f = ir::forward(code, self.n_regs, base);
         let f = fold_chunk(&f, base, &self.spec);
         if sweep == Sweep::TangentReverseRows {
-            let k = (layout.tan == 0)
+            let built = (layout.tan == 0)
                 .then(|| ir::tangent_reverse_rows(&f, self.n_in, layout.lanes()))
-                .flatten()
-                .map(|(g, prefix)| {
-                    let (g, prefix) = ir::dedup_calls(&g, prefix);
-                    Tiered::new(g, layout, self.n_in, true, prefix)
-                });
+                .flatten();
+            if built.is_none() && debug() {
+                let args: std::collections::BTreeSet<u8> = ir::reverse(&f)
+                    .insts
+                    .iter()
+                    .filter_map(|i| match *i {
+                        Inst::Load { arg, .. } | Inst::Store { arg, .. } => Some(arg),
+                        _ => None,
+                    })
+                    .collect();
+                eprintln!(
+                    "kjit: no rows reverse: n_args {} reverse args {args:?}",
+                    f.n_args
+                );
+            }
+            let k = built.map(|(g, prefix, entries)| {
+                let (g, prefix) = ir::dedup_calls(&g, prefix);
+                Tiered::new_rows(g, layout, self.n_in, prefix, entries)
+            });
             c.insert((layout, sweep), k.clone());
             return k;
         }
@@ -5361,6 +5410,70 @@ pub(crate) fn kept_in(scope: u64) -> usize {
     kept_lock().values().filter(|k| k.scope == scope).count()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Rows forwards, rows reverses and rows loop runs this thread completed (#2980): what a
+    /// test reads to see the shared-primal path served rather than its per-direction fallback.
+    pub(crate) static ROWS_RUNS: std::cell::Cell<[usize; 3]> = const { std::cell::Cell::new([0; 3]) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test switch: check every rows-reverse chunk against its per-direction kernel.
+    pub(crate) static ROWS_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One seed of a rows reverse through a chunk's per-direction forward over reverse at one
+/// tangent (`ktr`): the shared `[values | adjoints]` `sh` and the seed's `[tangents |
+/// adjoints' tangents]` `tsd` packed as that kernel reads them; the adjoints' tangents back into
+/// `tsd`'s second half, and the adjoints' values returned (every seed's: the caller takes one).
+fn per_direction(
+    n_slots: usize,
+    l: usize,
+    sh: &[f64],
+    tsd: &mut [f64],
+    ktr: &Tiered,
+    idx: &[u32],
+    lits: &[f64],
+) -> Vec<f64> {
+    let need = n_slots * l;
+    let w = 2 * l;
+    let mut pb = vec![0.0; n_slots * w];
+    let mut pa = vec![0.0; n_slots * w];
+    for s in 0..n_slots {
+        pb[s * w..s * w + l].copy_from_slice(&sh[s * l..(s + 1) * l]);
+        pb[s * w + l..(s + 1) * w].copy_from_slice(&tsd[s * l..(s + 1) * l]);
+        pa[s * w..s * w + l].copy_from_slice(&sh[need + s * l..need + (s + 1) * l]);
+        pa[s * w + l..(s + 1) * w].copy_from_slice(&tsd[need + s * l..need + (s + 1) * l]);
+    }
+    // SAFETY: `idx` names slots below `n_slots`; `pb` and `pa` hold that many packed blocks.
+    unsafe {
+        ktr.call_seeds(
+            pb.as_mut_ptr(),
+            pa.as_mut_ptr(),
+            n_slots * w,
+            1,
+            idx.as_ptr(),
+            lits.as_ptr(),
+        )
+    };
+    let mut vals = vec![0.0; need];
+    for s in 0..n_slots {
+        tsd[need + s * l..need + (s + 1) * l].copy_from_slice(&pa[s * w + l..(s + 1) * w]);
+        vals[s * l..(s + 1) * l].copy_from_slice(&pa[s * w..s * w + l]);
+    }
+    vals
+}
+
+#[cfg(test)]
+pub(crate) fn note_rows(i: usize) {
+    ROWS_RUNS.with(|c| {
+        let mut v = c.get();
+        v[i] += 1;
+        c.set(v);
+    });
+}
+
 /// A plan's forward along several directions at once, kept for its reverse
 /// ([`Plan::forward_rows`], [`Plan::reverse_rows`]): every slot's values, per seed every slot's
 /// tangents, per seed every loop call's log (#2980).
@@ -5453,6 +5566,10 @@ impl Plan {
         self.calls
             .iter()
             .map(|c| match c {
+                Call::Chunk { prog, .. } if sweep == Sweep::TangentReverseRows => prog
+                    .get(layout, sweep)
+                    .or_else(|| prog.get(Layout { tan: 1, ..layout }, Sweep::TangentReverse))
+                    .map(Kern::Chunk),
                 Call::Chunk { prog, .. } => prog.get(layout, sweep).map(Kern::Chunk),
                 Call::Loop { spec, .. } => match spec {
                     // A tangent-rows forward runs an ODE loop's bodies as rows kernels too
@@ -5797,6 +5914,8 @@ impl Plan {
         }
         let mut logs: Vec<Vec<CallLog>> = (0..seeds).map(|_| Vec::new()).collect();
         self.forward_rows_into(&fns, &mut buf, &mut tb, layout, seeds, &mut logs)?;
+        #[cfg(test)]
+        note_rows(0);
         Some(RowsFwd {
             plan: self as *const Plan as usize,
             layout,
@@ -5805,6 +5924,15 @@ impl Plan {
             tb,
             logs,
         })
+    }
+
+    /// Whether this plan's rows forward and its rows reverse both have kernels at `layout`: what
+    /// a caller checks before committing to [`Self::forward_rows`], whose result only
+    /// [`Self::reverse_rows`] reverses.
+    pub(crate) fn rows_serve(&self, layout: Layout) -> bool {
+        layout.tan == 0
+            && self.fns(layout, Sweep::TangentRows).is_some()
+            && self.fns(layout, Sweep::TangentReverseRows).is_some()
     }
 
     /// Output `o`'s lanes in a kept rows forward: its values, and seed `sd`'s tangents.
@@ -5872,13 +6000,32 @@ impl Plan {
         let mut li = r.logs.first().map_or(0, Vec::len);
         for (c, k) in self.calls.iter().zip(fns.iter()).rev() {
             match (c, k) {
-                (Call::Chunk { idx, lits, .. }, Kern::Chunk(k)) => {
-                    let n_slots = self.n_slots as u32;
-                    let idx2: Vec<u32> = idx
-                        .iter()
-                        .copied()
-                        .chain(idx.iter().map(|&e| e + n_slots))
-                        .collect();
+                (
+                    Call::Chunk {
+                        idx, lits, prog, ..
+                    },
+                    Kern::Chunk(k),
+                ) => {
+                    // A chunk without a rows reverse (`ir::tangent_reverse_rows` declined it):
+                    // its per-direction forward over reverse at one tangent, each seed from the
+                    // state before the chunk; the adjoints' values are every seed's, taken once.
+                    if k.entries == 0 {
+                        let sh0 = sh.clone();
+                        for sd in 0..seeds {
+                            let tsd = &mut ts[sd * 2 * need..(sd + 1) * 2 * need];
+                            let vals = per_direction(self.n_slots, l, &sh0, tsd, k, idx, lits);
+                            if sd == 0 {
+                                sh[need..].copy_from_slice(&vals);
+                            }
+                        }
+                        let _ = prog;
+                        continue;
+                    }
+                    let idx2 = k.doubled(idx, self.n_slots as u32);
+                    #[cfg(test)]
+                    let before = ROWS_CHECK
+                        .with(std::cell::Cell::get)
+                        .then(|| (sh.clone(), ts.clone()));
                     // SAFETY: the doubled table's entries are below `2·n_slots`, `sh` and each
                     // seed's block of `ts` hold that many lane blocks.
                     unsafe {
@@ -5891,6 +6038,39 @@ impl Plan {
                             lits.as_ptr(),
                         )
                     };
+                    // Test check: from the state before, each seed's per-direction kernel must
+                    // give the adjoints' values and tangents the rows kernel gave.
+                    #[cfg(test)]
+                    if let Some((sh0, mut ts0)) = before {
+                        let lt = Layout { tan: 1, ..layout };
+                        let ktr = prog
+                            .get(lt, Sweep::TangentReverse)
+                            .expect("a reverse kernel");
+                        let mut worst = 0.0f64;
+                        for sd in 0..seeds {
+                            let t0 = &mut ts0[sd * 2 * need..(sd + 1) * 2 * need];
+                            let vals = per_direction(self.n_slots, l, &sh0, t0, &ktr, idx, lits);
+                            for (a, b) in sh[need..].iter().zip(&vals) {
+                                assert!(a.is_finite() == b.is_finite(), "values: {a} vs {b}");
+                                if b.is_finite() {
+                                    worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                                    // nan-ok: a and b asserted finite together just above
+                                }
+                            }
+                        }
+                        for (a, b) in ts.iter().zip(&ts0) {
+                            assert!(a.is_finite() == b.is_finite(), "tangents: {a} vs {b}");
+                            if b.is_finite() {
+                                worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                                // nan-ok: a and b asserted finite together just above
+                            }
+                        }
+                        assert!(
+                            worst < 1e-12,
+                            "rows reverse vs per-direction on a {}-instruction chunk: {worst:e}",
+                            k.f.insts.len()
+                        );
+                    }
                 }
                 (
                     Call::Loop {
@@ -5937,6 +6117,9 @@ impl Plan {
                         })
                         .collect();
                     let Some(lgs) = lgs else {
+                        if debug() {
+                            eprintln!("kjit: rows reverse: a loop call without its log");
+                        }
                         return false;
                     };
                     let mut in_adj = vec![0.0; blocks * wi];
@@ -5950,6 +6133,9 @@ impl Plan {
                         &out_adj,
                         &mut in_adj,
                     ) {
+                        if debug() {
+                            eprintln!("kjit: rows reverse: loop reverse failed");
+                        }
                         return false;
                     }
                     for (j, &a) in args.iter().enumerate() {
@@ -6047,7 +6233,11 @@ impl Plan {
                 *x += *y;
             }
         }
-        sh.iter().chain(&ts).all(|v| v.is_finite())
+        #[cfg(test)]
+        note_rows(1);
+        // As `sweep_back`: a working slot may hold a non-finite intermediate (a dead arm's value)
+        // that reaches no adjoint; the callers judge the adjoints themselves.
+        true
     }
 
     fn forward_rows_into(
@@ -6118,6 +6308,8 @@ impl Plan {
                     let w_out = outs.len() * l;
                     let mut out = vec![0.0; w_out];
                     let mut tout = vec![0.0; seeds * w_out];
+                    #[cfg(test)]
+                    note_rows(2);
                     let mut lgs: Vec<ode_loop::Log> =
                         (0..seeds).map(|_| ode_loop::Log::take()).collect();
                     if !ode_loop::run_loop_rows(

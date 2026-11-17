@@ -598,6 +598,7 @@ fn tangent_rows_split_the_primal_from_each_seeds_tangent_on_random_programs() {
                         "case {case} {l:?}: output tangent {j}: {got} vs {exp}"
                     );
                     if exp.is_finite() {
+                        assert!(got.is_finite() && exp.is_finite());
                         worst = worst.max((got - exp).abs() / (1.0 + exp.abs()));
                     }
                 }

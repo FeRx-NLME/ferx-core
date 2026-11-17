@@ -1930,10 +1930,22 @@ pub(super) fn tangent_rows(f: &Func) -> Option<(Func, usize)> {
 /// `[values' tangents | adjoints' tangents]`, through the arguments a kernel already binds
 /// (inputs `0`, outputs `3`, a seed's inputs `4` and outputs `7`). `n_in` is the chunk's input
 /// entries, `l` the lanes. The values and adjoints (the forward recomputation and the reverse
-/// seeded with the shared `ū`) run once per call; every tangent once per seed.
-pub(super) fn tangent_reverse_rows(f: &Func, n_in: usize, l: usize) -> Option<(Func, usize)> {
+/// seeded with the shared `ū`) run once per call; every tangent once per seed. Returns the
+/// function, its prefix, and the entry count `k` the table's second half starts at: a caller
+/// builds the doubled table from the first `k` entries ([`super::kernel_jit`]).
+pub(super) fn tangent_reverse_rows(
+    f: &Func,
+    n_in: usize,
+    l: usize,
+) -> Option<(Func, usize, usize)> {
     let n = f.n_args;
     if n != 4 {
+        return None;
+    }
+    // A chunk calling a host function keeps its per-direction kernel: measured (#2980), the
+    // rows form of such a chunk's reverse disagreed with it (up to 1e-1 on the linear-ODE
+    // matrix exponential's chunks) while every host-free chunk agreed exactly.
+    if f.insts.iter().any(|i| matches!(i, Inst::Host(_))) {
         return None;
     }
     let n_out = f
@@ -1999,7 +2011,8 @@ pub(super) fn tangent_reverse_rows(f: &Func, n_in: usize, l: usize) -> Option<(F
         h.insts.push(inst);
         h.live.push(None);
     }
-    Some(split_per_seed(&h, |a| a == 4 || a == 7))
+    let (g, prefix) = split_per_seed(&h, |a| a == 4 || a == 7);
+    Some((g, prefix, n_in + n_out))
 }
 
 /// [`tangent`] in `k` directions with the tangents packed into the value arguments: a

@@ -5365,6 +5365,15 @@ pub(super) fn hessian_gaps_for(
     s: &Subject,
     objective: Objective,
 ) -> (f64, f64) {
+    // Every rows-reverse chunk checked against its per-direction kernel on the way (#2980).
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::ROWS_CHECK;
+    ROWS_CHECK.with(|c| c.set(true));
+    let out = hessian_gaps_inner(model, s, objective);
+    ROWS_CHECK.with(|c| c.set(false));
+    out
+}
+
+fn hessian_gaps_inner(model: &CompiledModel, s: &Subject, objective: Objective) -> (f64, f64) {
     let interaction = objective != Objective::Foce;
     use crate::estimation::parameterization::unpack_params;
     let params = moved_params(model);
@@ -5539,10 +5548,9 @@ pub(super) fn hessian_gaps_for(
         "asymmetric: {:.2e}",
         gap(&h, &h.transpose())
     );
-    assert!(
-        h.iter().map(|v| v.abs()).fold(0.0, f64::max) > 1e-1,
-        "a vanishing Hessian tests nothing"
-    );
+    let peak = h.iter().map(|v| v.abs()).fold(0.0, f64::max); // nan-ok: the fold is asserted finite on the next line
+    assert!(peak.is_finite(), "a non-finite Hessian entry");
+    assert!(peak > 1e-1, "a vanishing Hessian tests nothing");
     let vs_fd = gap(&h, &fd);
     eprintln!("hessian: vs reconverged FD of the gradient {vs_fd:.2e}");
     (vs_fd, f64::NAN)
@@ -12016,4 +12024,41 @@ fn shared_kernel_serves_both_sides_of_a_recorded_branch() {
         "the straddle: the first point positive, the second recorded on the other branch: {t:?}"
     );
     assert_eq!((a, b, c), (4.0, 6.0, 9.0));
+}
+
+/// The covariance Hessian's bases take the shared-primal kernels (#2980): on a closed-form
+/// subject the rows forward and the rows forward-over-reverse run, and on an ODE subject the
+/// ODE loop runs as rows too — each counted where it completes, so a silent fallback to the
+/// per-axis runs (correct, and invisible to every oracle) fails here. The Hessians themselves
+/// are pinned by the oracles (`hessian_gaps_for`); this pins which engine produced them.
+#[test]
+fn the_covariance_bases_take_the_shared_primal_kernels() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::ROWS_RUNS;
+    for (src, ode) in [(ONE_CPT_ORAL, false), (ONE_CPT_ORAL_ODE, true)] {
+        let model = parse_model_string(src).unwrap();
+        let s = subject(
+            &model,
+            vec![
+                DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0),
+                DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+            ],
+            &TIMES,
+            &[0.1, -0.05, 0.2],
+        );
+        let params = moved_params(&model);
+        let x = pack_params(&params);
+        let eta = ebe_for(&model, &s, &params, 1e-12, true);
+        ROWS_RUNS.with(|c| c.set([0; 3]));
+        with_fit_stack(|| {
+            subject_adjoint_cov_hessian(&model, &s, &params, &x, eta.as_slice(), Objective::Focei)
+                .expect("in scope")
+        });
+        let [fwd, rev, loops] = ROWS_RUNS.with(std::cell::Cell::get);
+        eprintln!("ode {ode}: rows forwards {fwd}, reverses {rev}, loop runs {loops}");
+        assert!(
+            fwd > 0 && rev > 0,
+            "ode {ode}: rows forward {fwd}, reverse {rev}"
+        );
+        assert_eq!(loops > 0, ode, "ode {ode}: rows loop runs {loops}");
+    }
 }

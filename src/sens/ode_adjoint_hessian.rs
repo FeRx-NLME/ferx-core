@@ -920,7 +920,7 @@ fn rows_or_each(
             .copied()
             .collect()
     };
-    if let Some(&(ref u0, ref p0)) = packed.first() {
+    if let Some(&(ref u0, ref p0)) = packed.first().filter(|_| pl.rows_serve(base)) {
         let (u, p) = (split(u0, false), split(p0, false));
         let tu: Vec<f64> = packed
             .iter()

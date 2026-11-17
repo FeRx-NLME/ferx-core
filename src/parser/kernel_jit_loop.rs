@@ -1415,7 +1415,16 @@ pub(crate) fn run_loop_rows(
         let vars = io.map(|r| r.vars_out).unwrap_or_default();
         for (sd, lg) in logs.iter_mut().enumerate() {
             lg.clear();
-            lg.entries.extend_from_slice(&main.entries);
+            // A seed's log holds each body input as a one-tangent run's: its values, then its
+            // tangents — twice the lanes of the run's own, so every body's offset doubles.
+            lg.entries.extend(main.entries.iter().map(|e| match *e {
+                Entry::Body { m, kind, at } => Entry::Body {
+                    m,
+                    kind,
+                    at: 2 * at,
+                },
+                ref e => e.clone(),
+            }));
             if let Some(v) = vars.get(sd) {
                 lg.vars.extend_from_slice(v);
             }
@@ -1870,7 +1879,8 @@ pub(crate) fn run_loop_rev_rows(
         for sd in 0..seeds {
             out_adj_of(1 + sd, &mut ts[sd * 2 * w + w..(sd + 1) * 2 * w]);
         }
-        let iota2: Vec<u32> = (0..2 * n_slots as u32).collect();
+        let iota: Vec<u32> = (0..n_slots as u32).collect();
+        let iota2 = k.doubled(&iota, n_slots as u32);
         // SAFETY: `iota2` names the `2·n_slots` slots `sh` and each seed's block of `ts` hold.
         unsafe {
             k.call_seeds(
