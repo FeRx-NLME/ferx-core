@@ -127,7 +127,10 @@ pub struct FitOptions {
     pub global_search: bool,           // Default: false
     pub global_maxeval: usize,         // Default: 0 (auto)
     // SAEM-specific
-    pub saem_n_exploration: usize,     // Default: 150
+    pub saem_n_exploration: Option<usize>, // Default: None = automatic stop; Some(n) = fixed length
+    pub saem_exploration_min: usize,   // Default: 150 (automatic stop only)
+    pub saem_exploration_max: usize,   // Default: 500 (automatic stop only)
+    pub saem_smoothing_exponent: f64,  // Default: 1.0, step 1/(k-K1)^a
     pub saem_n_convergence: usize,     // Default: 250
     pub saem_n_mh_steps: usize,        // Default: 0 (auto — sized from the data)
     pub saem_adapt_interval: usize,    // Default: 50

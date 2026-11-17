@@ -24,13 +24,55 @@ SAEM replaces the deterministic inner loop of FOCE with stochastic sampling, fol
 
 Step size $\gamma_k = 1$. The algorithm explores the parameter space rapidly, with the sufficient statistics being fully replaced each iteration. This allows fast movement toward the basin of the MLE.
 
-Default: 150 iterations.
+By default K1 is **chosen by the run** (see [the automatic stop](#exploration-stop)): at least 150 iterations (`n_exploration_min`), at most 500 (`n_exploration_max`). Setting `n_exploration = n` instead fixes K1 = n and turns the automatic stop off.
 
 ### Phase 2: Convergence (iterations K1+1 to K1+K2)
 
-Step size $\gamma_k = 1/(k - K_1)$. The algorithm performs a decreasing-weight average, which guarantees almost-sure convergence to the MLE under regularity conditions.
+Step size $\gamma_k = 1/(k - K_1)^a$, with $a = 1$ by default (`smoothing_exponent`). The algorithm performs a decreasing-weight average, which guarantees almost-sure convergence to the MLE under regularity conditions (the Robbins-Monro conditions need $a \in (1/2, 1]$).
 
 Default: 250 iterations.
+
+### The exploration stop {#exploration-stop}
+
+The convergence phase *freezes* whatever the exploration phase reached: with $a = 1$ the averaging weight of iteration $K_1 + 1$ is 1 and the weights then decay, so a parameter that is still moving at $K_1$ is pinned near where it was. Weakly identified Ω entries are the ones that move slowly: under the exploration cap on the Ω step ($\gamma^\Omega \le 0.1$) a variance component whose optimum is far below its start decays over hundreds of iterations. On the 5-η, 9-θ `pk2_big` benchmark the fixed 150 iterations ended while $\omega^2_Q$ was still at 0.019 (optimum ≈ 0.003), and the importance-sampled −2 log L stayed 10.6 above the optimum (median of 5 seeds); a longer averaging phase barely helps, a longer *exploration* does.
+
+Monolix ends exploration by a convergence test between a minimum of 150 and a maximum of 500 iterations; NONMEM's SAEM burn-in stops (`CTYPE`/`CITER`/`CALPHA`) when a regression slope of each monitored quantity over a trailing window is not significantly different from zero. ferx does the same, with the standard correction for the autocorrelation of SAEM trajectories.
+
+#### The rule {#exploration-stop-rule}
+
+- **Tracked coordinates.** θ, log Ω<sub>jj</sub>, the correlations $\Omega_{jk}/\sqrt{\Omega_{jj}\Omega_{kk}}$ (and the same for Ω<sub>IOV</sub>), and log σ. A fixed parameter or structural zero is constant and cannot drift.
+- **Test.** The trailing 100 iterations are cut into five batches of 20. The least-squares slope of the five batch means on the batch index is tested against zero with a Student t (3 degrees of freedom, two-sided 5 %). The batch length is twice the time constant (10 iterations) of the capped Ω step, so the batch means are close to independent; an ordinary regression on the raw iterates treats autocorrelated draws as independent and reads wobble as trend (on stationary SAEM traces it flagged 20–40 % of windows at a nominal 5 %, so the phase would never end). Calibration on simulated AR(1) noise: 5.1 % / 5.8 % / 8.7 % false trend rate at lag-1 correlation 0 / 0.5 / 0.9; a drift of 4 marginal standard deviations over the window is caught 75 % of the time at 0.9.
+- **Rule.** Exploration ends at the first iteration ≥ `n_exploration_min` at which *no* tracked coordinate trends, and never later than `n_exploration_max`. The level is not multiplicity-corrected, deliberately: a correction would make the rule stop *sooner*, the direction in which it can fail.
+- **The Ω exploration step cap is kept.** Removing it alone made the E-step unstable in the investigation that led here; with the automatic stop the cap only slows the decay, and the stop waits for it.
+- **Precedence.** `n_exploration` present in the model file (or `saem_n_exploration = Some(n)` in code) is a *fixed* length: `n_exploration_min` / `n_exploration_max` are ignored, no test runs. Absent, the stop is automatic.
+- **Reporting.** The length used is `saem_n_exploration` in `-fit.yaml` (`FitResult::saem_n_exploration_used`; `verbose` prints it). If the maximum is reached while a coordinate still trends, a warning says so — raise `n_exploration_max` and compare.
+
+#### Measured {#exploration-stop-measured}
+
+Five seeds each, `--threads 1`; gap = importance-sampled −2 log L above the model's reference optimum — `pk1_sparse` against its AGQ optimum 1412.34, whose TVCL sits on its lower bound, so that gap has a floor; instructions in billions; the exploration length each seed chose is listed.
+
+| set | schedule | gap median (range) | gap SD | param. distance, RMS in SE | Ginstr | K1 chosen |
+|---|---|---|---|---|---|---|
+| pk1 (3 η) | fixed 150 | +0.03 (0.01–0.06) | 0.02 | 0.06 | 28.1 | 150 |
+| | automatic | +0.04 (0.03–0.06) | 0.01 | 0.08 | 28.7 | 150, 203, 150, 157, 150 |
+| pk1 ODE | fixed 150 | +0.03 (0.01–0.06) | 0.02 | 0.06 | 81.3 | 150 |
+| | automatic | +0.04 (0.03–0.06) | 0.01 | 0.08 | 82.7 | 150, 203, 150, 157, 150 |
+| pk2_big (5 η, block Ω) | fixed 150 | +10.63 (8.68–18.64) | 3.86 | 1.01 | 42.2 | 150 |
+| | automatic | +2.94 (1.65–3.08) | 0.61 | 0.42 | 67.5 | 500 (all: cap reached) |
+| pk1_sparse | fixed 150 | +2.62 (2.52–3.25) | 0.30 | 0.51 | 11.4 | 150 |
+| | automatic | +2.53 (2.28–4.22) | 0.78 | 0.68 | 14.1 | 211, 415, 349, 208, 208 |
+| wiov | fixed 150 | +0.06 (−0.07–0.42) | 0.21 | 0.24 | 83.6 | 150 |
+| | automatic | +0.08 (−0.23–0.11) | 0.17 | 0.16 | 105.9 | 340, 252, 284, 275, 253 |
+| corr | fixed 150 | +0.15 (0.09–0.92) | 0.36 | 0.10 | 8.2 | 150 |
+| | automatic | +0.16 (0.11–0.41) | 0.13 | 0.12 | 9.2 | 160, 191, 153, 194, 308 |
+
+The easy models stop at or just after the minimum (+2 % instructions); the one set the old default got wrong improves 3.6× with +60 % instructions. `pk1_sparse` is a degenerate ridge, not a schedule problem: its gap is unchanged in the median and its spread grew.
+
+#### Maximum and smoothing exponent {#exploration-stop-max}
+
+**Maximum.** `pk2_big` reaches the 500 cap on every seed; `n_exploration_max = 800` gives +2.00 (range 1.36–2.97) at 85.7 Ginstr (K1 = 615, 800, 738, 800, 800) against +2.94 at 67.5 for 500. 500 is Monolix's cap and bounds an automatic fit at 750 iterations against the old 400 (measured +60 % instructions on pk2_big); raise it when the fit warns that it was reached.
+
+**Smoothing exponent.** `smoothing_exponent = 0.7` (Monolix's $\gamma_k = 1/(k-K_1)^{0.7}$) was measured on the same sets and is *not* the default, because it is worse on an easy model: wiov +0.08 → +0.45 (median gap, automatic exploration), pk1 +0.04 → +0.05, pk1_sparse +2.53 → +2.91, against pk2_big +2.94 → +2.54 and corr +0.16 → +0.11. The option is there for users who want it.
 
 ## Per-Iteration Steps
 
@@ -327,7 +369,7 @@ $$
 
 with structurally-zero entries (cross-block off-diagonals, standalone-vs-block off-diagonals, and all off-diagonals in a fully-diagonal Ω) zeroed out — the SA accumulator $(1/N) \sum_i \eta_i \eta_i^T$ is dense by construction, but the model declares which entries are free parameters. Without this projection the chain feeds spurious sampling correlations into the next iteration's MH proposal Cholesky and Ω drifts toward rank-deficiency. Free diagonals are then floored at `1e-6` to keep them away from zero (which would collapse the per-eta proposal scale `δ·chol(Ω)`); this floor does not by itself guarantee positive-definiteness of a full block Ω.
 
-**Burn-in.** This M-step is suppressed for the first `omega_burnin` iterations (default 20, clamped to `n_exploration`): Ω is held at its starting value while the MH chain warms up. The MH proposal scale is $\delta_i \cdot \mathrm{chol}(\Omega)$, so Ω and the sampler are coupled. On sparse data (few observations per subject) a cold-start chain (η = 0, only `n_mh_steps` proposals) produces a tiny $(1/N) \sum_i \eta_i \eta_i^T$; with $\gamma_1 = 1$ the M-step would install that as Ω on iteration 1, shrinking the proposal, which keeps the chain near zero — a self-reinforcing collapse that dumps between-subject variability into the residual error. The SA statistic $S_2$ is still refreshed each burn-in iteration (at the damped rate $\gamma_k^\Omega$, so it is a running average of the warming chain), so the first Ω update after burn-in reflects the warmed-up chain rather than the cold-start spread. Set `omega_burnin = 0` to disable the burn-in; note that the damped Ω step above now also guards this cold-start collapse on its own (it is a strict generalisation — continuous rather than for the first `omega_burnin` iterations only), so disabling the burn-in no longer reproduces the collapse by itself.
+**Burn-in.** This M-step is suppressed for the first `omega_burnin` iterations (default 20, clamped to the exploration length — `n_exploration_min` under the automatic stop): Ω is held at its starting value while the MH chain warms up. The MH proposal scale is $\delta_i \cdot \mathrm{chol}(\Omega)$, so Ω and the sampler are coupled. On sparse data (few observations per subject) a cold-start chain (η = 0, only `n_mh_steps` proposals) produces a tiny $(1/N) \sum_i \eta_i \eta_i^T$; with $\gamma_1 = 1$ the M-step would install that as Ω on iteration 1, shrinking the proposal, which keeps the chain near zero — a self-reinforcing collapse that dumps between-subject variability into the residual error. The SA statistic $S_2$ is still refreshed each burn-in iteration (at the damped rate $\gamma_k^\Omega$, so it is a running average of the warming chain), so the first Ω update after burn-in reflects the warmed-up chain rather than the cold-start spread. Set `omega_burnin = 0` to disable the burn-in; note that the damped Ω step above now also guards this cold-start collapse on its own (it is a strict generalisation — continuous rather than for the first `omega_burnin` iterations only), so disabling the burn-in no longer reproduces the collapse by itself.
 
 ### 4. M-Step for Theta and Sigma (Optimization) {#4-m-step-for-theta-and-sigma-optimization}
 
@@ -1501,7 +1543,10 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 ```
 [fit_options]
   method        = saem
-  n_exploration = 150      # Phase 1 iterations
+  # n_exploration = 150    # Phase 1 length; omit for the automatic stop (150..500)
+  n_exploration_min = 150  # automatic stop only
+  n_exploration_max = 500  # automatic stop only
+  smoothing_exponent = 1.0 # Phase 2 step 1/(k-K1)^a
   n_convergence = 250      # Phase 2 iterations
   n_mh_steps    = auto     # block-MH steps/subject/iteration, or `auto` (see above)
   n_leapfrog    = 0        # Set > 0 (e.g. 3) to use HMC instead of MH
@@ -1522,7 +1567,7 @@ well, which is what a direct `fit()` caller bypassing `ferx check` sees.
 
 ### Not Converging
 
-- Increase `n_exploration` (e.g., 300) to give more time for basin finding
+- If the fit warns that exploration reached its maximum, raise `n_exploration_max` (e.g., 800); to force a length instead, set `n_exploration` (e.g., 300)
 - Increase `n_convergence` (e.g., 500) for a longer averaging window
 - Raise `n_mh_steps` above what `auto` resolves to (e.g. 30-50) for better
   mixing in the E-step on hard surfaces. The rule caps at 20, the count

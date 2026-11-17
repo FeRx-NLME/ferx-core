@@ -531,7 +531,7 @@ fn frem_covariate_omega_matches_sample_variance() {
     // Run to convergence with SAEM (natural choice for large block omega).
     let mut opts = FitOptions::default();
     opts.method = ferx_core::EstimationMethod::Saem;
-    opts.saem_n_exploration = 500;
+    opts.saem_n_exploration = Some(500);
     opts.saem_n_convergence = 800;
     opts.run_covariance_step = false;
     opts.verbose = false;
@@ -599,7 +599,7 @@ fn frem_iiv_on_ruv_saem_stays_bounded() {
 
     let mut opts = FitOptions::default();
     opts.method = ferx_core::EstimationMethod::Saem;
-    opts.saem_n_exploration = 500;
+    opts.saem_n_exploration = Some(500);
     opts.saem_n_convergence = 500;
     opts.saem_omega_burnin = 20;
     opts.imp_seed = Some(12345);
@@ -755,7 +755,7 @@ fn frem_saem_does_not_collapse_pk_residual_error() {
     let saem_opts = || {
         let mut o = FitOptions::default();
         o.method = ferx_core::EstimationMethod::Saem;
-        o.saem_n_exploration = 500;
+        o.saem_n_exploration = Some(500);
         o.saem_n_convergence = 800;
         o.saem_seed = Some(20260611);
         o.run_covariance_step = false;
@@ -892,7 +892,7 @@ fn frem_estimation_method_comparison() {
     {
         let mut opts = FitOptions::default();
         opts.method = ferx_core::EstimationMethod::Saem;
-        opts.saem_n_exploration = 500;
+        opts.saem_n_exploration = Some(500);
         opts.saem_n_convergence = 800;
         opts.saem_seed = Some(20260614);
         opts.run_covariance_step = false;

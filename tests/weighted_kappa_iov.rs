@@ -137,7 +137,7 @@ fn smoke_opts(method: EstimationMethod) -> FitOptions {
     };
     o.method = method;
     o.iov_column = Some("OCC".to_string());
-    o.saem_n_exploration = 2;
+    o.saem_n_exploration = Some(2);
     o.saem_n_convergence = 2;
     o.imp_iterations = 2;
     o.imp_samples = 64;

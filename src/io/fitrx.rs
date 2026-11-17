@@ -219,6 +219,7 @@ struct FitWire {
     saem_n_subjects_hmc: Option<usize>,
     /// Post-burn-in tail MH acceptance (#1444).
     saem_mh_accept_tail: Option<f64>,
+    saem_n_exploration_used: Option<usize>,
 
     theta: ThetaWire,
     omega: OmegaWire,
@@ -1706,6 +1707,7 @@ fn build_fit_wire(r: &FitResult) -> FitWire {
         saem_mu_ref_m_step_evals_saved: r.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: r.saem_n_subjects_hmc,
         saem_mh_accept_tail: r.saem_mh_accept_tail,
+        saem_n_exploration_used: r.saem_n_exploration_used,
         theta: ThetaWire {
             names: r.theta_names.clone(),
             estimates: r.theta.clone(),
@@ -3972,6 +3974,7 @@ fn wire_to_fit_result(
         saem_mu_ref_m_step_evals_saved: w.saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc: w.saem_n_subjects_hmc,
         saem_mh_accept_tail: w.saem_mh_accept_tail,
+        saem_n_exploration_used: w.saem_n_exploration_used,
         gradient_method_inner: w.gradient_method_inner,
         gradient_method_outer: w.gradient_method_outer,
         uses_ode_solver: w.uses_ode_solver,

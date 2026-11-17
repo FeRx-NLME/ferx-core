@@ -336,7 +336,7 @@ fn saem_mixture_fit_matches_nonmem_saem() {
         let mut opts = FitOptions::default();
         opts.method = ferx_core::EstimationMethod::Saem;
         opts.interaction = true;
-        opts.saem_n_exploration = 1000;
+        opts.saem_n_exploration = Some(1000);
         opts.saem_n_convergence = 1000;
         opts.saem_seed = Some(seed);
 
@@ -514,7 +514,7 @@ fn saem_covariate_mixing_separates_and_recovers_beta() {
     let mut opts = FitOptions::default();
     opts.method = ferx_core::EstimationMethod::Saem;
     opts.interaction = true;
-    opts.saem_n_exploration = 500;
+    opts.saem_n_exploration = Some(500);
     opts.saem_n_convergence = 500;
     opts.saem_seed = Some(20250818);
 
@@ -650,7 +650,7 @@ fn imp_mixture_marginal_matches_nonmem() {
         ferx_core::EstimationMethod::Imp,
     ];
     opts.interaction = true;
-    opts.saem_n_exploration = 600;
+    opts.saem_n_exploration = Some(600);
     opts.saem_n_convergence = 800;
     opts.saem_seed = Some(20250818);
     opts.imp_eval_only = true;

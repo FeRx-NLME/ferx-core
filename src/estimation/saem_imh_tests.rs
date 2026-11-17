@@ -1186,7 +1186,7 @@ fn imh_model_gate_rejects_the_shapes_the_curvature_does_not_score() {
 fn imh_opts(seed: u64) -> FitOptions {
     FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 6,
+        saem_n_exploration: Some(6),
         saem_n_convergence: 6,
         saem_seed: Some(seed),
         run_covariance_step: false,
@@ -1380,7 +1380,7 @@ fn imh_acceptance_never_steers_the_random_walk_scale() {
     let pop = population_of(&well_conditioned_subject(), 4);
     for rule in [ScaleAdaptation::RobbinsMonro, ScaleAdaptation::Interval] {
         let base = FitOptions {
-            saem_n_exploration: 30,
+            saem_n_exploration: Some(30),
             saem_n_convergence: 30,
             saem_adapt_interval: 10,
             saem_scale_adaptation: rule,
@@ -1825,7 +1825,7 @@ fn the_mixing_tally_leaves_the_imh_move_out() {
     let model = parse_model_string(IV_MODEL).expect("parse");
     let pop = population_of(&well_conditioned_subject(), 3);
     let opts = FitOptions {
-        saem_n_exploration: 10,
+        saem_n_exploration: Some(10),
         saem_n_convergence: 10,
         saem_omega_burnin: 0,
         ..imh_opts(9)
@@ -1890,7 +1890,7 @@ fn the_default_random_walk_fit_matches_main() {
     };
     let opts = FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 8,
+        saem_n_exploration: Some(8),
         saem_n_convergence: 8,
         saem_seed: Some(11),
         run_covariance_step: false,

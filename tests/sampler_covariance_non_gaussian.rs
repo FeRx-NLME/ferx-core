@@ -85,8 +85,16 @@ fn sampler_standard_errors_on_a_tte_model_match_the_exact_marginal() {
             CovarianceMethod::Sandwich,
             CovarianceMethod::CrossProduct,
         ] {
+            // This test is about the covariance estimator, not SAEM's exploration
+            // schedule: the 10% / 20% bands measure how far each estimator's SE at the
+            // fitted point sits from the exact marginal's SE, and that SE moves with the
+            // point itself (the automatic stop lands SAEM at a slightly different
+            // estimate: SE(lambda) +5.0% -> +10.7% of the reference). Pin the exploration
+            // to the former fixed default so the bands keep measuring the estimator and
+            // not which iteration the automatic rule stopped at.
             let opts = FitOptions {
                 method,
+                saem_n_exploration: Some(150),
                 covariance_method: cm,
                 covariance_method_set: true,
                 run_covariance_step: true,

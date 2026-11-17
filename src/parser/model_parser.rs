@@ -12650,7 +12650,21 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
         "steihaug_max_iters" => opts.steihaug_max_iters = Some(parse_usize("steihaug_max_iters")?),
         "global_search" => opts.global_search = parse_bool("global_search")?,
         "global_maxeval" => opts.global_maxeval = parse_usize("global_maxeval")?,
-        "n_exploration" => opts.saem_n_exploration = parse_usize("n_exploration")?,
+        // An explicit length is a fixed length and overrides the automatic stop and
+        // its min/max (`FitOptions::saem_n_exploration`).
+        "n_exploration" => opts.saem_n_exploration = Some(parse_usize("n_exploration")?),
+        "n_exploration_min" => opts.saem_exploration_min = parse_usize("n_exploration_min")?,
+        "n_exploration_max" => opts.saem_exploration_max = parse_usize("n_exploration_max")?,
+        "smoothing_exponent" => {
+            let v = parse_f64(key)?;
+            if !(v.is_finite() && v > 0.5 && v <= 1.0) {
+                return Err(format!(
+                    "fit option `{key}` must lie in (0.5, 1] (the Robbins-Monro conditions \
+                     on the step 1/(k-K1)^a), got {v}"
+                ));
+            }
+            opts.saem_smoothing_exponent = v;
+        }
         "n_convergence" => opts.saem_n_convergence = parse_usize("n_convergence")?,
         // `auto` (the default) sizes the block kernel from the dataset — see
         // `estimation::saem::auto_n_mh_steps` (#1459). It is spelled out here

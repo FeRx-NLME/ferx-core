@@ -3829,7 +3829,7 @@ fn test_apply_fit_option_known_applies() {
         apply_fit_option(&mut opts, "n_exploration", "200"),
         Ok(true)
     );
-    assert_eq!(opts.saem_n_exploration, 200);
+    assert_eq!(opts.saem_n_exploration, Some(200));
 
     assert_eq!(
         apply_fit_option(&mut opts, "n_convergence", "400"),
@@ -4163,7 +4163,57 @@ fn test_apply_fit_option_malformed_value_errors() {
     assert!(apply_fit_option(&mut opts, "sir_df", "0.0").is_err());
     assert!(apply_fit_option(&mut opts, "sir_df", "0.5").is_err());
     // Failed apply must not mutate — default preserved.
-    assert_eq!(opts.saem_n_exploration, 150);
+    assert_eq!(opts.saem_n_exploration, None);
+}
+
+/// The automatic exploration stop's options: absent `n_exploration` is automatic (`None`) with
+/// the documented bounds; each key lands in its own field; an explicit length is `Some`; the
+/// smoothing exponent is confined to the Robbins-Monro range (0.5, 1] and a rejected value
+/// leaves the default.
+#[test]
+fn test_apply_fit_option_saem_exploration_stop_and_smoothing() {
+    let mut opts = FitOptions::default();
+    assert_eq!(opts.saem_n_exploration, None);
+    assert_eq!(opts.saem_exploration_min, 150);
+    assert_eq!(opts.saem_exploration_max, 500);
+    assert_eq!(opts.saem_smoothing_exponent, 1.0);
+
+    assert_eq!(
+        apply_fit_option(&mut opts, "n_exploration_min", "80"),
+        Ok(true)
+    );
+    assert_eq!(
+        apply_fit_option(&mut opts, "n_exploration_max", "700"),
+        Ok(true)
+    );
+    assert_eq!(
+        apply_fit_option(&mut opts, "smoothing_exponent", "0.7"),
+        Ok(true)
+    );
+    assert_eq!(opts.saem_exploration_min, 80);
+    assert_eq!(opts.saem_exploration_max, 700);
+    assert_eq!(opts.saem_smoothing_exponent, 0.7);
+    // min/max alone never make the length explicit.
+    assert_eq!(opts.saem_n_exploration, None);
+    // An explicit length does.
+    assert_eq!(apply_fit_option(&mut opts, "n_exploration", "40"), Ok(true));
+    assert_eq!(opts.saem_n_exploration, Some(40));
+
+    for bad in ["0.5", "0.3", "1.01", "-1", "nan", "inf", "x"] {
+        let mut o = FitOptions::default();
+        assert!(
+            apply_fit_option(&mut o, "smoothing_exponent", bad).is_err(),
+            "{bad}"
+        );
+        assert_eq!(o.saem_smoothing_exponent, 1.0, "{bad} must not mutate");
+    }
+    let mut o = FitOptions::default();
+    assert_eq!(
+        apply_fit_option(&mut o, "smoothing_exponent", "1"),
+        Ok(true)
+    );
+    assert!(apply_fit_option(&mut o, "n_exploration_min", "-3").is_err());
+    assert!(apply_fit_option(&mut o, "n_exploration_max", "x").is_err());
 }
 
 #[test]
@@ -5892,7 +5942,7 @@ fn test_parse_fit_options_applies_known_keys() {
     ];
     let opts = parse_fit_options(&lines).unwrap();
     assert_eq!(opts.method, EstimationMethod::Saem);
-    assert_eq!(opts.saem_n_exploration, 200);
+    assert_eq!(opts.saem_n_exploration, Some(200));
     assert_eq!(opts.saem_n_convergence, 400);
     assert!(opts.sir);
     assert_eq!(opts.sir_samples, 2000);

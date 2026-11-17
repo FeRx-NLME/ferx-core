@@ -851,8 +851,11 @@ Suits deep compartment models (`[covariate_nn]`), models where the FOCE inner lo
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `n_exploration` | `150` | Phase 1 iterations (step size = 1) |
-| `n_convergence` | `250` | Phase 2 iterations (step size = 1/k) |
+| `n_exploration` | automatic | Phase 1 (step size = 1) length. **Absent** (the default): the phase runs at least `n_exploration_min` iterations and ends at the first iteration where no Ω / σ / θ trajectory still trends (see the [SAEM page](../estimation/saem.qmd#exploration-stop)), at most `n_exploration_max`. **Set**: a fixed length of exactly that many iterations — it takes precedence over, and disables, the automatic stop and its min/max. The length used is reported as `saem_n_exploration` in `-fit.yaml` (`FitResult::saem_n_exploration_used`). |
+| `n_exploration_min` | `150` | Minimum exploration length under the automatic stop (Monolix's minimum). Ignored when `n_exploration` is set. |
+| `n_exploration_max` | `500` | Maximum exploration length under the automatic stop (Monolix's maximum); a value below the minimum is raised to it. Reaching it with a parameter still trending adds a warning. Ignored when `n_exploration` is set. |
+| `n_convergence` | `250` | Phase 2 iterations (step size = 1/(k−K1)^a) |
+| `smoothing_exponent` | `1.0` | Exponent `a` of the Phase 2 step `1/(k−K1)^a`; must lie in (0.5, 1]. `1` is the classical Kuhn–Lavielle schedule; Monolix uses `0.7`. See the [SAEM page](../estimation/saem.qmd#exploration-stop). |
 | `n_mh_steps` | `auto` | Block Metropolis-Hastings steps per subject per iteration, or `auto` — the default — to size it from the dataset as `2.5 × observations per subject per η`, clamped to `[6, 20]`. Also sizes the componentwise decorrelating kernel that prevents block-Ω collapse (`max(2, n_mh_steps / n_eta)` sweeps; multi-η models only — skipped when `n_eta < 2`). When `n_leapfrog > 0`, this applies to subjects that fall back to MH (see below); HMC subjects use one proposal per iteration regardless. `method = bayes` reads this option but **not** the `auto` rule: its η block keeps the historical fixed count of 20 unless you set one (the rule is calibrated on SAEM, whose componentwise kernel that sampler does not run). See [Choosing `n_mh_steps`](../estimation/saem.qmd#choosing-n_mh_steps). |
 | `n_leapfrog` | `0` | Leapfrog steps per HMC proposal (0 = use MH; see below). When > 0, subjects for which HMC is unavailable (ODE model, missing analytical PK path, non-finite Ω, unsupported TV-cov path) fall back to MH using `n_mh_steps` proposals. |
 | `adapt_interval` | `50` | Iterations between step-size adaptation, under `scale_adaptation = interval`. Also governs the κ (IOV) scales under either rule. |

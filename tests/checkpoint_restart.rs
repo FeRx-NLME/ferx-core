@@ -283,7 +283,7 @@ fn saem_fit_checkpoints_and_cleans_up() {
 
     let mut opts = base_opts(&path);
     opts.method = EstimationMethod::Saem;
-    opts.saem_n_exploration = 2;
+    opts.saem_n_exploration = Some(2);
     opts.saem_n_convergence = 2;
     opts.checkpoint_interval_secs = 0;
 

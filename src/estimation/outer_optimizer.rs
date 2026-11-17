@@ -75,6 +75,7 @@ pub struct OuterResult {
     /// post-burn-in iterations the acceptance diagnostic reads. `None` for
     /// non-SAEM methods and when no post-burn-in proposal was made.
     pub saem_mh_accept_tail: Option<f64>,
+    pub saem_n_exploration_used: Option<usize>,
     pub ebe_convergence_warnings: u32,
     pub max_unconverged_subjects: u32,
     pub total_ebe_fallbacks: u32,
@@ -1283,6 +1284,7 @@ fn evaluate_at_initial_params(
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        saem_n_exploration_used: None,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -9440,6 +9442,7 @@ fn optimize_nlopt_attempt_probed(
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        saem_n_exploration_used: None,
         ebe_convergence_warnings: ebe_final.n_convergence_warnings as u32,
         max_unconverged_subjects: ebe_final.max_unconverged as u32,
         total_ebe_fallbacks: ebe_final.total_fallback as u32,
@@ -10170,6 +10173,7 @@ fn optimize_bfgs(
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
+        saem_n_exploration_used: None,
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,

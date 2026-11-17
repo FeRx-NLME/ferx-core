@@ -131,7 +131,7 @@ fn covariate_mu_refs_are_detected_in_both_anchor_models() {
 fn saem_covariate_group_removes_the_not_mu_referenced_warning() {
     let (model, pop) = load("covmuref_additive_saem_fit.ferx", "covmuref_additive.csv");
     let opts = FitOptions {
-        saem_n_exploration: 2,
+        saem_n_exploration: Some(2),
         saem_n_convergence: 1,
         ..saem_opts()
     };
@@ -191,7 +191,7 @@ fn an_if_else_assigned_covariate_local_joins_the_group() {
     );
 
     let opts = FitOptions {
-        saem_n_exploration: 2,
+        saem_n_exploration: Some(2),
         saem_n_convergence: 1,
         ..saem_opts()
     };
@@ -548,7 +548,7 @@ fn score_sa_reaches_the_allometric_exponent_on_a_longer_schedule() {
         "score_sa @ 300/700",
         FitOptions {
             saem_mstep_solver: SaemMstepSolver::ScoreSa,
-            saem_n_exploration: 300,
+            saem_n_exploration: Some(300),
             saem_n_convergence: 700,
             outer_maxiter: 1000,
             ..saem_opts()
@@ -639,7 +639,7 @@ fn assert_mstep_arm_recovers_th_wt(name: &str, opts: FitOptions) {
 fn an_out_of_scope_model_falls_back_from_the_new_mstep_estimators() {
     let (model, pop) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
     let short = |mut o: FitOptions| {
-        o.saem_n_exploration = 2;
+        o.saem_n_exploration = Some(2);
         o.saem_n_convergence = 2;
         o.saem_n_mh_steps = 2;
         o
@@ -748,7 +748,7 @@ fn each_mstep_option_changes_the_fit_through_the_public_api() {
     let (model, pop) = load("covmuref_power_numeric_saem_fit.ferx", "covmuref_power.csv");
 
     let short = |mut o: FitOptions| {
-        o.saem_n_exploration = 8;
+        o.saem_n_exploration = Some(8);
         o.saem_n_convergence = 8;
         o.saem_n_mh_steps = 3;
         o
@@ -856,7 +856,7 @@ fn mstep_damping_reaches_sigma_under_score_sa() {
             saem_mstep_solver: SaemMstepSolver::ScoreSa,
             saem_mstep_damping: damping,
             mu_referencing,
-            saem_n_exploration: 25,
+            saem_n_exploration: Some(25),
             saem_n_convergence: 10,
             saem_n_mh_steps: 3,
             ..saem_opts()
@@ -1040,7 +1040,7 @@ fn saem_recovers_a_shared_allometric_exponent_on_every_mstep_arm() {
     let sa = fit_shared(|o| o.saem_mstep_solver = SaemMstepSolver::ScoreSa);
     assert_saem_shared_arm("SAEM score_sa 150/250", &sa);
     let long = fit_shared(|o| {
-        o.saem_n_exploration = 300;
+        o.saem_n_exploration = Some(300);
         o.saem_n_convergence = 700;
     });
     assert_saem_shared_arm("SAEM 300/700", &long);
@@ -1206,7 +1206,7 @@ fn saem_merges_a_group_reading_a_superseded_anchor() {
 )]
 fn saem_takes_a_colliding_plain_anchor_into_the_group() {
     let (result, notes) = fit_anchor_twin("covmuref_anchor_b_saem_fit.ferx", |o| {
-        o.saem_n_exploration = 300;
+        o.saem_n_exploration = Some(300);
         o.saem_n_convergence = 700;
     });
     assert_eq!(

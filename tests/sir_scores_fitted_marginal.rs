@@ -1110,7 +1110,7 @@ fn saem_mixture_sir_fit() -> (ferx_core::CompiledModel, ferx_core::Population, F
         ferx_core::estimation::parameterization::unpack_params(&MIX_PACKED, &model.default_params);
     let opts = FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 60,
+        saem_n_exploration: Some(60),
         saem_n_convergence: 60,
         saem_seed: Some(1765),
         run_covariance_step: true,
@@ -1253,7 +1253,7 @@ fn saem_mixture_sigma_override_run_sir_and_covariance_are_identical_to_in_fit() 
     .expect("mixture data must load");
     let opts = FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 60,
+        saem_n_exploration: Some(60),
         saem_n_convergence: 60,
         saem_seed: Some(1765),
         run_covariance_step: true,

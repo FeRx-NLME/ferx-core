@@ -222,7 +222,7 @@ fn sir_falls_back_to_fd() {
 fn saem_falls_back_to_fd() {
     let (m, p) = example("examples/warfarin.ferx", "data/warfarin.csv");
     let o = FitOptions {
-        saem_n_exploration: 5,
+        saem_n_exploration: Some(5),
         saem_n_convergence: 5,
         saem_seed: Some(3),
         // Every θ through the M-step's numerical score, not the mu-referenced closed form.

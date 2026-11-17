@@ -112,7 +112,7 @@ fn fit_with_regularization_runs_under_gn() {
 fn non_foce_final_stage_warns_that_regularization_is_not_applied() {
     let (model, mut options, population) = load();
     options.method = EstimationMethod::Saem;
-    options.saem_n_exploration = 2;
+    options.saem_n_exploration = Some(2);
     options.saem_n_convergence = 1;
     options.nn_l2_lambda = 5e-2;
     // Any outcome is fine — the warning is assembled before the fit starts —

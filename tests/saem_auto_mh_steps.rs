@@ -139,7 +139,7 @@ fn dense_population(model: &CompiledModel) -> Population {
 fn short_saem_opts(n_mh_steps: usize) -> FitOptions {
     FitOptions {
         method: EstimationMethod::Saem,
-        saem_n_exploration: 8,
+        saem_n_exploration: Some(8),
         saem_n_convergence: 8,
         saem_omega_burnin: 4,
         saem_seed: Some(4242),

@@ -8806,6 +8806,10 @@ pub struct FitResult {
     /// across whichever ran (issue #1444).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saem_mh_accept_tail: Option<f64>,
+    /// Exploration-phase length SAEM actually ran (fixed `n_exploration`, or the
+    /// iteration the automatic stop chose). `None` for non-SAEM methods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saem_n_exploration_used: Option<usize>,
     /// Gradient method used in the inner (per-subject EBE) BFGS loop.
     pub gradient_method_inner: String,
     /// Gradient method used in the outer (population parameter) optimizer.
@@ -9860,7 +9864,27 @@ pub struct FitOptions {
     /// Max evaluations for the global pre-search (0 = auto).
     pub global_maxeval: usize,
     // SAEM-specific options
-    pub saem_n_exploration: usize,
+    /// Length of SAEM's exploration phase (step size γ = 1).
+    ///
+    /// `None` (the default, `n_exploration` absent from the model file) ends the
+    /// phase by a convergence test: at least [`Self::saem_exploration_min`]
+    /// iterations, then as soon as no tracked Ω / σ / θ trajectory shows a
+    /// significant trend over a trailing window, but never beyond
+    /// [`Self::saem_exploration_max`]. `Some(n)` — `n_exploration = n` — is a
+    /// fixed length and takes precedence over both bounds. The length a run
+    /// used is reported in [`FitResult::saem_n_exploration_used`].
+    pub saem_n_exploration: Option<usize>,
+    /// Minimum exploration length under the automatic stop (default 150, the
+    /// former fixed length and Monolix's minimum). Ignored when
+    /// `saem_n_exploration` is `Some`.
+    pub saem_exploration_min: usize,
+    /// Maximum exploration length under the automatic stop (default 500, Monolix's
+    /// maximum). Ignored when `saem_n_exploration` is `Some`.
+    pub saem_exploration_max: usize,
+    /// Exponent `a` of the convergence-phase step `γ_k = 1/(k − K1)^a`
+    /// (default `1.0`, the classical Kuhn–Lavielle choice; Monolix uses `0.7`).
+    /// Must lie in `(0.5, 1]` — the Robbins–Monro conditions `Σγ = ∞`, `Σγ² < ∞`.
+    pub saem_smoothing_exponent: f64,
     pub saem_n_convergence: usize,
     /// Number of block-kernel MH proposals per subject per SAEM outer
     /// iteration, or `0` — the default, written `n_mh_steps = auto` in a model
@@ -9993,7 +10017,7 @@ pub struct FitOptions {
     /// warms up. Prevents the iteration-1 Ω collapse on sparse data, where a
     /// cold-start chain (η = 0, few MH steps) yields a tiny `(1/N)Σηηᵀ` that
     /// the γ=1 M-step would otherwise install as Ω, starving the proposal.
-    /// Clamped to `saem_n_exploration` at use. `0` disables the burn-in.
+    /// Clamped to the exploration length (the minimum under the automatic stop) at use. `0` disables the burn-in.
     pub saem_omega_burnin: usize,
     pub saem_seed: Option<u64>,
     /// Run a post-fit conditional-distribution pass after SAEM converges.
@@ -10733,7 +10757,10 @@ impl Default for FitOptions {
             lbfgs_memory: 5,
             global_search: false,
             global_maxeval: 0,
-            saem_n_exploration: 150,
+            saem_n_exploration: None,
+            saem_exploration_min: 150,
+            saem_exploration_max: 500,
+            saem_smoothing_exponent: 1.0,
             saem_n_convergence: 250,
             // 0 = `auto`: resolved from the dataset by
             // `estimation::saem::auto_n_mh_steps` (#1459).
@@ -12366,6 +12393,9 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "inner_tol",
             "inner_optimizer",
             "n_exploration",
+            "n_exploration_min",
+            "n_exploration_max",
+            "smoothing_exponent",
             "n_convergence",
             "n_mh_steps",
             "n_leapfrog",

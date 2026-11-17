@@ -128,7 +128,7 @@ fn per_cmt_saem_fit_runs() {
 
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
-    opts.saem_n_exploration = 5;
+    opts.saem_n_exploration = Some(5);
     opts.saem_n_convergence = 5;
     opts.run_covariance_step = false;
     opts.verbose = false;

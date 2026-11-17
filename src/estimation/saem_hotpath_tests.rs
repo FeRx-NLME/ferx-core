@@ -171,7 +171,7 @@ fn tv_population(with_occasions: bool) -> Population {
 
 fn saem_opts() -> FitOptions {
     FitOptions {
-        saem_n_exploration: 4,
+        saem_n_exploration: Some(4),
         saem_n_convergence: 3,
         saem_n_mh_steps: 4,
         saem_omega_burnin: 0,
@@ -987,7 +987,7 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
 
         let short = saem_opts();
         let long = FitOptions {
-            saem_n_exploration: short.saem_n_exploration * 3,
+            saem_n_exploration: short.saem_n_exploration.map(|n| n * 3),
             saem_n_convergence: short.saem_n_convergence * 3,
             ..short.clone()
         };
@@ -1017,8 +1017,8 @@ fn saem_schedule_builds_do_not_grow_with_iteration_count() {
         // `extra_iters · n` = 84. The bound below is a quarter of that: 21, so
         // 4× clear of the leak it must catch and 2.3× clear of the worst drift
         // it must tolerate.
-        let extra_iters = (long.saem_n_exploration + long.saem_n_convergence
-            - short.saem_n_exploration
+        let extra_iters = (long.saem_n_exploration.unwrap() + long.saem_n_convergence
+            - short.saem_n_exploration.unwrap()
             - short.saem_n_convergence) as u64;
         let leak_bound = extra_iters * n as u64 / 4;
         assert!(
@@ -1077,7 +1077,7 @@ fn the_score_sa_mstep_rebuilds_the_event_schedule() {
         ..saem_opts()
     };
     let long = FitOptions {
-        saem_n_exploration: short.saem_n_exploration * 3,
+        saem_n_exploration: short.saem_n_exploration.map(|n| n * 3),
         saem_n_convergence: short.saem_n_convergence * 3,
         ..short.clone()
     };
@@ -1085,8 +1085,8 @@ fn the_score_sa_mstep_rebuilds_the_event_schedule() {
         with_build_count_1thread(|| run_bits_with(&model, &pop, opts)).1
     };
     let (a, b) = (count(&short), count(&long));
-    let extra_iters = (long.saem_n_exploration + long.saem_n_convergence
-        - short.saem_n_exploration
+    let extra_iters = (long.saem_n_exploration.unwrap() + long.saem_n_convergence
+        - short.saem_n_exploration.unwrap()
         - short.saem_n_convergence) as u64;
     let drift = b.saturating_sub(a);
     // One build per subject per iteration, on the nose (measured 67 → 151 over

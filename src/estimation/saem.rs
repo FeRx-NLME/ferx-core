@@ -4288,14 +4288,25 @@ pub fn run_saem(
             .to_string());
     }
     let n_kappa = model.n_kappa;
-    let k1 = options.saem_n_exploration;
+    // Exploration length. An explicit `n_exploration` is a fixed length; otherwise
+    // the phase runs for at least `exploration_min` and stops at the first
+    // iteration where no Ω / σ / θ trajectory still trends, at most
+    // `exploration_max` (see `saem_exploration`). `k1` is the *current* end of the
+    // phase: `k_max` while it is open, the stopping iteration once decided.
+    let (auto_exploration, k_min, k_max) =
+        crate::estimation::saem_exploration::exploration_bounds(options);
+    let mut k1 = k_max;
     let k2 = options.saem_n_convergence;
-    let n_iter = k1 + k2;
+    let mut n_iter = k1 + k2;
+    let smoothing_exponent = options.saem_smoothing_exponent;
+    let mut exploration_monitor =
+        crate::estimation::saem_exploration::ExplorationMonitor::default();
+    let mut exploration_hit_max = false;
     // Suppress the Ω M-step for the first `omega_burnin` iterations so the MH
     // chain warms up at the initial Ω before any variance component is
     // estimated. Clamped to the exploration length — burning in past K1 would
     // freeze Ω into the convergence phase. See `FitOptions::saem_omega_burnin`.
-    let omega_burnin = options.saem_omega_burnin.min(k1);
+    let omega_burnin = options.saem_omega_burnin.min(k_min);
     let n_mh_steps = resolve_n_mh_steps(
         options.saem_n_mh_steps,
         population.n_obs(),
@@ -4339,8 +4350,17 @@ pub fn run_saem(
 
     if verbose {
         eprintln!(
-            "SAEM: {} subjects, {} ETAs, {} total iter ({} explore + {} converge)",
-            n_subjects, n_eta, n_iter, k1, k2
+            "SAEM: {} subjects, {} ETAs, up to {} total iter ({} explore{} + {} converge)",
+            n_subjects,
+            n_eta,
+            n_iter,
+            k1,
+            if auto_exploration {
+                format!(" at most, at least {k_min}, automatic stop")
+            } else {
+                String::new()
+            },
+            k2
         );
         // The block count is data-derived unless the caller pinned it, so say
         // which of the two a run is using — otherwise a reader cannot tell the
@@ -5298,7 +5318,10 @@ pub fn run_saem(
     let schedules = saem_schedule_cache(model, population);
 
     // Main loop
-    for k in 1..=n_iter {
+    for k in 1..=k_max + k2 {
+        if k > n_iter {
+            break;
+        }
         // Per-iteration combined (block + componentwise) accept / proposal
         // tallies — the honest E-step mixing rate reported to the trace (#895).
         let mut iter_acc: usize = 0;
@@ -5313,7 +5336,13 @@ pub fn run_saem(
             }
             break;
         }
-        let gamma = if k <= k1 { 1.0 } else { 1.0 / (k - k1) as f64 };
+        let gamma = if k <= k1 {
+            1.0
+        } else if smoothing_exponent == 1.0 {
+            1.0 / (k - k1) as f64
+        } else {
+            1.0 / ((k - k1) as f64).powf(smoothing_exponent)
+        };
         // Damped SA step for the Ω sufficient statistic during exploration only.
         // With the full γ=1 used for θ, an undamped Ω would be overwritten each
         // exploration iteration by a single (warm-started, not-yet-equilibrated)
@@ -6772,6 +6801,21 @@ pub fn run_saem(
         // ever loosens (`max`), so a genuine post-exploration runaway is still
         // bounded, and it preserves the bit-for-bit trajectory of a fit that never
         // approaches either ceiling.
+        if auto_exploration && k <= k1 {
+            let omega_iov = (n_kappa > 0).then_some(&state.omega_iov_mat);
+            exploration_monitor.push(&crate::estimation::saem_exploration::exploration_coords(
+                &state.theta,
+                &state.omega_mat,
+                omega_iov,
+                &state.sigma_vals,
+            ));
+            if k < k1 && exploration_monitor.may_stop_at(k, k_min) {
+                k1 = k;
+                n_iter = k1 + k2;
+            } else if k == k1 && !exploration_monitor.converged() {
+                exploration_hit_max = true;
+            }
+        }
         if k == k1 {
             reanchor_ruv_sigma_caps(&mut ruv_sigma_caps, &log_sigma, &log_sigma_upper);
             if let Some(kr) = model.residual_error_eta {
@@ -6946,6 +6990,20 @@ pub fn run_saem(
         // every other SE (#987 review). Their SEs report as 0, matching FIX.
         mp.sigma_override_fixed = vec![true; mp.sigma_override_addr.len()];
         final_params.mixture = Some(mp);
+    }
+
+    if exploration_hit_max {
+        warnings.push(format!(
+            "SAEM: the exploration phase reached its maximum of {k_max} iterations while a \
+             parameter trajectory still trended (parameters still drifting: {}). The \
+             convergence phase averaged from there, so weakly identified variance \
+             components may be frozen above their optimum; raise `n_exploration_max` \
+             (or set `n_exploration`) and compare.",
+            exploration_monitor.drifting().len()
+        ));
+    }
+    if verbose && auto_exploration {
+        eprintln!("SAEM: exploration ended after {k1} iterations (min {k_min}, max {k_max})");
     }
 
     if combined_additive_sigma_at_floor(model, &final_params) {
@@ -7280,6 +7338,7 @@ pub fn run_saem(
         saem_mu_ref_m_step_evals_saved,
         saem_n_subjects_hmc,
         saem_mh_accept_tail,
+        saem_n_exploration_used: Some(k1),
         ebe_convergence_warnings: 0,
         max_unconverged_subjects: 0,
         total_ebe_fallbacks: 0,
@@ -7410,7 +7469,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(406);
         opts.run_covariance_step = false;
@@ -7549,7 +7608,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(1715);
         opts.run_covariance_step = false;
@@ -7606,7 +7665,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(406);
         opts.run_covariance_step = false;
@@ -7639,7 +7698,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(406);
         opts.run_covariance_step = false;
@@ -8099,7 +8158,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(406);
         opts.run_covariance_step = false;
@@ -8168,7 +8227,7 @@ mod tests {
         };
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(996);
         opts.run_covariance_step = false;
@@ -8197,7 +8256,7 @@ mod tests {
             let model = crate::parser::model_parser::parse_model_string(src).expect("parses");
             let mut opts = FitOptions::default();
             opts.method = crate::types::EstimationMethod::Saem;
-            opts.saem_n_exploration = 4;
+            opts.saem_n_exploration = Some(4);
             opts.saem_n_convergence = 2;
             opts.saem_seed = Some(2548);
             opts.run_covariance_step = false;
@@ -8332,7 +8391,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(996);
         opts.run_covariance_step = false;
@@ -8363,7 +8422,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(996);
         opts.run_covariance_step = false;
@@ -8422,7 +8481,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(918);
         opts.run_covariance_step = false;
@@ -8486,7 +8545,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(918);
         opts.run_covariance_step = false;
@@ -8603,7 +8662,7 @@ mod tests {
         let pop = covmuref_pop(false);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 6;
+        opts.saem_n_exploration = Some(6);
         opts.saem_n_convergence = 3;
         opts.saem_seed = Some(619);
         opts.run_covariance_step = false;
@@ -8676,7 +8735,7 @@ mod tests {
         let pop = covmuref_pop(true);
         let mut saem = FitOptions::default();
         saem.method = crate::types::EstimationMethod::Saem;
-        saem.saem_n_exploration = 4;
+        saem.saem_n_exploration = Some(4);
         saem.saem_n_convergence = 2;
         saem.saem_seed = Some(1620);
         saem.run_covariance_step = false;
@@ -8722,7 +8781,7 @@ mod tests {
         let pop = covmuref_pop(true);
         let mut saem = FitOptions::default();
         saem.method = crate::types::EstimationMethod::Saem;
-        saem.saem_n_exploration = 4;
+        saem.saem_n_exploration = Some(4);
         saem.saem_n_convergence = 2;
         saem.saem_seed = Some(1620);
         saem.run_covariance_step = false;
@@ -8787,7 +8846,7 @@ mod tests {
         let pop = covmuref_pop(false);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(918);
         opts.run_covariance_step = false;
@@ -8812,7 +8871,7 @@ mod tests {
         let pop = covmuref_pop(false);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(619);
         opts.run_covariance_step = false;
@@ -8832,7 +8891,7 @@ mod tests {
             let pop = covmuref_pop(true);
             let mut opts = FitOptions::default();
             opts.method = crate::types::EstimationMethod::Saem;
-            opts.saem_n_exploration = 3;
+            opts.saem_n_exploration = Some(3);
             opts.saem_n_convergence = 2;
             opts.saem_seed = Some(1630);
             opts.run_covariance_step = false;
@@ -8885,7 +8944,7 @@ mod tests {
         let pop = covmuref_pop(true);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 3;
+        opts.saem_n_exploration = Some(3);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(619);
         opts.run_covariance_step = false;
@@ -8942,7 +9001,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(918);
         opts.run_covariance_step = false;
@@ -9092,7 +9151,7 @@ mod tests {
         let pop = mix996_pop(3);
         let mut opts = FitOptions::default();
         opts.method = crate::types::EstimationMethod::Saem;
-        opts.saem_n_exploration = 4;
+        opts.saem_n_exploration = Some(4);
         opts.saem_n_convergence = 2;
         opts.saem_seed = Some(996);
         opts.run_covariance_step = false;
@@ -11214,7 +11273,7 @@ DV ~ additive(EPS)
         let model = mix_iov_model();
         let population = mix_iov_pop();
         let opts = FitOptions {
-            saem_n_exploration: 3,
+            saem_n_exploration: Some(3),
             saem_n_convergence: 2,
             saem_n_mh_steps: 4,
             saem_omega_burnin: 0,
@@ -11386,7 +11445,7 @@ DV ~ additive(EPS)
         crate::estimation::trace::init(path.clone(), &coord_names).unwrap();
 
         let opts = FitOptions {
-            saem_n_exploration: 2,
+            saem_n_exploration: Some(2),
             saem_n_convergence: 0,
             run_covariance_step: false,
             verbose: false,
@@ -12426,7 +12485,7 @@ DV ~ additive(EPS)
         let pop = mix996_pop(4);
         let opts = FitOptions {
             method: EstimationMethod::Saem,
-            saem_n_exploration: 40,
+            saem_n_exploration: Some(40),
             saem_n_convergence: 20,
             saem_adapt_interval: 25,
             // `omega_burnin = 30` puts the whole reported window (iterations
@@ -12455,7 +12514,7 @@ DV ~ additive(EPS)
         let pop = mix996_pop(4);
         let base = FitOptions {
             method: EstimationMethod::Saem,
-            saem_n_exploration: 40,
+            saem_n_exploration: Some(40),
             saem_n_convergence: 20,
             saem_adapt_interval: 25,
             saem_seed: Some(1444),
@@ -12763,7 +12822,7 @@ DV ~ additive(EPS)
         let pop = mix996_pop(4);
         let opts = FitOptions {
             method: EstimationMethod::Saem,
-            saem_n_exploration: 40,
+            saem_n_exploration: Some(40),
             saem_n_convergence: 5,
             saem_adapt_interval: 50,
             saem_omega_burnin: 20,

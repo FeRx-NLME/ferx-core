@@ -131,7 +131,7 @@ fn fit_trace(
 ) -> f64 {
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
-    opts.saem_n_exploration = 120;
+    opts.saem_n_exploration = Some(120);
     opts.saem_n_convergence = 120;
     opts.saem_n_mh_steps = 3;
     opts.saem_omega_burnin = omega_burnin;

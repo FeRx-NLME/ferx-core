@@ -223,7 +223,7 @@ fn a_chain_ending_in_focei_accepts_a_prior() {
     let model = warfarin_with(&params_with_cl_prior(0.15, 25.0));
     let mut opts = short_focei();
     opts.methods = vec![EstimationMethod::Saem, EstimationMethod::FoceI];
-    opts.saem_n_exploration = 1;
+    opts.saem_n_exploration = Some(1);
     opts.saem_n_convergence = 1;
 
     let r = fit_model(&model, &warfarin_population(), &opts);
@@ -238,7 +238,7 @@ fn a_chain_ending_in_focei_accepts_a_prior() {
     // pass on a gate that looked at any stage, or at none.
     let mut reversed = short_focei();
     reversed.methods = vec![EstimationMethod::FoceI, EstimationMethod::Saem];
-    reversed.saem_n_exploration = 1;
+    reversed.saem_n_exploration = Some(1);
     reversed.saem_n_convergence = 1;
     assert!(fit_model(&model, &warfarin_population(), &reversed).is_err());
 }
@@ -852,7 +852,7 @@ fn the_prior_method_gate_looks_past_evaluation_only_stages() {
     let mut eval_tail = short_focei();
     eval_tail.methods = vec![EstimationMethod::Saem, EstimationMethod::Laplace];
     eval_tail.agq_eval_only = true;
-    eval_tail.saem_n_exploration = 1;
+    eval_tail.saem_n_exploration = Some(1);
     eval_tail.saem_n_convergence = 1;
     let err = fit_model(&model, &pop, &eval_tail)
         .expect_err("an eval-only tail must not launder an unsupported estimator");

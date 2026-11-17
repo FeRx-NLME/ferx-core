@@ -1329,7 +1329,7 @@ mod tests {
 
         let opts = crate::types::FitOptions {
             method: crate::types::EstimationMethod::Saem,
-            saem_n_exploration: 20,
+            saem_n_exploration: Some(20),
             saem_n_convergence: 20,
             saem_omega_burnin: 2,
             saem_seed: Some(7),

@@ -169,7 +169,7 @@ mod binary_smoke {
         let pop = common::binary_pop(&subjects, 3);
         let opts = FitOptions {
             method: EstimationMethod::Saem,
-            saem_n_exploration: 2,
+            saem_n_exploration: Some(2),
             saem_n_convergence: 2,
             ..Default::default()
         };

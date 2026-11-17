@@ -166,7 +166,7 @@ fn saem_imp_opts(defensive_alpha: f64, pin_iscale: bool) -> FitOptions {
     opts.verbose = false;
     opts.run_covariance_step = false;
     opts.methods = vec![EstimationMethod::Saem, EstimationMethod::Imp];
-    opts.saem_n_exploration = 150;
+    opts.saem_n_exploration = Some(150);
     opts.saem_n_convergence = 150;
     opts.imp_iterations = 30;
     opts.imp_samples = 500;

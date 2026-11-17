@@ -99,7 +99,7 @@ fn run_saem_kernel_with_threads(n: usize, kernel: ferx_core::types::SaemKernel) 
     opts.saem_kernel = kernel;
     // Small, fixed-length exploration/convergence phases (no adaptive stop) —
     // mirrors the fast SAEM setup in tests/importance_sampling_api.rs.
-    opts.saem_n_exploration = 5;
+    opts.saem_n_exploration = Some(5);
     opts.saem_n_convergence = 5;
     opts.saem_seed = Some(267);
     opts.run_covariance_step = false;
@@ -160,7 +160,7 @@ fn run_saem_iov_with_threads(n: usize) -> f64 {
     let (model, population) = warfarin_iov();
     let mut opts = FitOptions::default();
     opts.method = EstimationMethod::Saem;
-    opts.saem_n_exploration = 5;
+    opts.saem_n_exploration = Some(5);
     opts.saem_n_convergence = 5;
     opts.saem_seed = Some(267);
     opts.run_covariance_step = false;
