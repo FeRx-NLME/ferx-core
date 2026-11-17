@@ -11839,6 +11839,7 @@ fn the_plans_run_on_the_eta_lanes_of_a_mu_referenced_model() {
                     PLAN_AXES_OFF.with(|c| c.set(axes_off));
                     MU_FOLD_OFF.with(|c| c.set(fold_off));
                     PLAN_LANES.with(|v| v.borrow_mut().clear());
+                    super::hessian::FOLD_CHECK_WORST.with(|c| c.set(0.0));
                     let h = subject_adjoint_cov_hessian(
                         &one,
                         &s,
@@ -11848,19 +11849,27 @@ fn the_plans_run_on_the_eta_lanes_of_a_mu_referenced_model() {
                         Objective::Focei,
                     )
                     .expect("in scope");
-                    (h, PLAN_LANES.with(|v| v.borrow().clone()))
+                    let check = super::hessian::FOLD_CHECK_WORST.with(std::cell::Cell::get);
+                    (h, PLAN_LANES.with(|v| v.borrow().clone()), check)
                 })
                 .expect("spawn")
                 .join()
                 .expect("join")
         })
     };
-    let (h_fold, runs) = lanes(false, false);
+    let (h_fold, runs, check) = lanes(false, false);
     assert!(!runs.is_empty(), "no plan ran along a pass");
     assert!(runs == [(3, 4), (3, 4)], "folded: {runs:?}");
-    let (h_axes, runs) = lanes(false, true);
+    // The fold's adjoint check (θ's value adjoint against the η adjoints along `∂μ/∂θ`) on a
+    // genuine fold: the same sum two ways. Measured CHECK_MEASURED; its bound, 1e-8, is far above.
+    eprintln!("fold adjoint check, worst relative gap {check:.2e}");
+    assert!(
+        check.is_finite() && check < 1e-12,
+        "fold adjoint check: {check:.2e}"
+    );
+    let (h_axes, runs, _) = lanes(false, true);
     assert!(runs == [(4, 4), (4, 4)], "axes: {runs:?}");
-    let (h_global, runs) = lanes(true, true);
+    let (h_global, runs, _) = lanes(true, true);
     assert!(runs == [(4, 4), (4, 4)], "one lane per direction: {runs:?}");
     for (what, h) in [("folded", &h_fold), ("axes", &h_axes)] {
         let worst = rel_gap(h.as_slice(), h_global.as_slice());
@@ -11921,4 +11930,56 @@ fn a_fold_the_program_does_not_reproduce_is_declined() {
             "{what}: declined fold vs one lane per direction: {worst:.2e}"
         );
     }
+}
+
+/// The fold's adjoint check (#2982): a θ the spec folds but the plan also reads another way —
+/// here through a local the right-hand side reads, which the parse correctly refuses to fold and
+/// the spec is tampered to fold anyway — must not give a Hessian. The plan's θ adjoint then
+/// differs from the η adjoints along `∂μ/∂θ` by the other route, and the subject declines (its
+/// term is left to the covariance step's per-subject salvage). Untampered, the same subject is
+/// served.
+///
+/// Mutation: the check removed (the tampered fold then returns a Hessian missing the route).
+#[test]
+fn a_fold_the_plan_contradicts_declines_the_subject() {
+    let src = ONE_CPT_ORAL_ODE
+        .replace(
+            "  KA = TVKA\n",
+            "  KA = TVKA * exp(ETA_KA)\n  K2 = 0.001 * TVCL\n",
+        )
+        .replace(
+            "  omega ETA_V ~ 0.06\n",
+            "  omega ETA_V ~ 0.06\n  omega ETA_KA ~ 0.2\n",
+        )
+        .replace(
+            "d/dt(central) = KA * depot - (CL/V) * central",
+            "d/dt(central) = KA * depot - (CL/V) * central - K2 * central",
+        );
+    let honest = parse_model_string(&src).unwrap();
+    let tvcl = honest.theta_names.iter().position(|n| n == "TVCL").unwrap();
+    assert!(
+        !honest.indiv_param_partials.mu_fold.thetas.contains(&tvcl),
+        "premise: the parse refuses to fold TVCL (K2 reads it)"
+    );
+    let mut tampered = parse_model_string(&src).unwrap();
+    tampered.indiv_param_partials.mu_fold.thetas.push(tvcl);
+    let s = subject(
+        &honest,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let params = moved_params(&honest);
+    let x = pack_params(&params);
+    let eta = ebe_for(&honest, &s, &params, 1e-12, true);
+    let h = |m: &CompiledModel| {
+        with_fit_stack(|| {
+            subject_adjoint_cov_hessian(m, &s, &params, &x, eta.as_slice(), Objective::Focei)
+        })
+    };
+    assert!(h(&honest).is_some(), "the honest model is served");
+    assert!(
+        h(&tampered).is_none(),
+        "a fold the plan contradicts must decline, not return a Hessian"
+    );
 }

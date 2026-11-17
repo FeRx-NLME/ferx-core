@@ -39859,6 +39859,26 @@ fn the_mu_fold_takes_only_theta_whose_every_route_ends_at_an_exclusive_mu_line()
         "a shared covariate exponent"
     );
 
+    // A dose attribute the engine reads by name (#993), with no reader in any other block: a
+    // mu-referenced lag folds its θ; the same θ also read by `F1` does not (code review r2).
+    let lag = "  theta TVLAG(0.5, 0.01, 5.0)\n  omega ETA_LAG ~ 0.1";
+    let m = model(
+        lag,
+        &format!("{plain}\n  ALAG1 = TVLAG * exp(ETA_LAG)"),
+        rhs,
+    );
+    assert_eq!(names(&m), ["TVCL", "TVV", "TVLAG"], "a mu-referenced lag");
+    let m = model(
+        lag,
+        &format!("{plain}\n  ALAG1 = TVLAG * exp(ETA_LAG)\n  F1 = 1 - 0.01 * TVLAG"),
+        rhs,
+    );
+    assert_eq!(
+        names(&m),
+        ["TVCL", "TVV"],
+        "θ also read by a dose attribute"
+    );
+
     // An additive line (identity link).
     let m = model("", "  CL = TVCL * exp(ETA_CL)\n  V  = TVV + ETA_V", rhs);
     assert_eq!(names(&m), ["TVCL", "TVV"], "an additive line");

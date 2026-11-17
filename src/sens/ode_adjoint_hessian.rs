@@ -496,6 +496,13 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
+    /// The worst relative gap the fold's adjoint check has seen on this thread (#2982), so a
+    /// test can pin its bound to what it measures.
+    pub(crate) static FOLD_CHECK_WORST: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test switch (#2982): no θ carried on the η lanes, the mu fold's oracle.
     pub(crate) static MU_FOLD_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -1040,6 +1047,7 @@ impl PlanDirs {
         eta_t: &dyn Fn(usize, usize) -> f64,
         p_t: &dyn Fn(usize, usize) -> f64,
         read: &dyn Fn(usize) -> bool,
+        eta_up: bool,
         axes: bool,
         fold: Option<&MuFold>,
     ) -> Self {
@@ -1078,14 +1086,16 @@ impl PlanDirs {
                 v
             })
             .collect();
-        // Every η slot is a lane: a plan's η adjoints are seeds upstream too (an AGQ node's are
-        // its location's, back through the first stage), so each needs its own Gauss–Newton
-        // term, which only a lane's forward tangent gives. A parameter slot's adjoint reaches
-        // the rows, read along every direction of the Hessian — not only this pass's — so any
-        // slot some direction moves (`read`) needs a lane, unless the fold carries it on η.
+        // Every η slot is a lane where the plan's η adjoints are read (`eta_up`): they are seeds
+        // upstream too (an AGQ node's are its location's, back through the first stage), so each
+        // needs its own Gauss–Newton term, which only a lane's forward tangent gives. FOCE's
+        // population plan, at a frozen η = 0, needs one only where the fold puts a θ on it. A
+        // parameter slot's adjoint reaches the rows, read along every direction of the Hessian —
+        // not only this pass's — so any slot some direction moves (`read`) needs a lane, unless
+        // the fold carries it on η.
         let idx: Vec<usize> = (0..n_eta + n_par)
             .filter(|&j| {
-                j < n_eta
+                (j < n_eta && eta_up)
                     || full.iter().any(|v| v[j] != 0.0)
                     || (read(j - n_eta) && folds(j - n_eta).is_none())
             })
@@ -1342,6 +1352,7 @@ impl<'a> CovPlan<'a> {
         eta_t: &dyn Fn(usize, usize) -> f64,
         p_t: &dyn Fn(usize, usize) -> f64,
         all: &[Dir],
+        eta_up: bool,
     ) -> PlanDirs {
         let (n_th, n_p) = (self.th.len(), self.th.len() + self.nz);
         let s0 = packed_segments(self.template).sigma_start();
@@ -1363,6 +1374,7 @@ impl<'a> CovPlan<'a> {
             eta_t,
             p_t,
             &read,
+            eta_up,
             plan_axes_on(),
             self.fold.as_ref(),
         );
@@ -1414,11 +1426,12 @@ impl<'a> CovPlan<'a> {
         eta_t: &dyn Fn(usize, usize) -> f64,
         dirs: &[Dir],
         all: &[Dir],
+        eta_up: bool,
         base: Layout,
         kt: usize,
     ) -> Option<Kept> {
         let (params, p_t) = self.pred_params(dirs);
-        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &*p_t, all);
+        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &*p_t, all, eta_up);
         let layout = Layout {
             tan: pd.width() as u8,
             ..base
@@ -1475,7 +1488,7 @@ impl<'a> CovPlan<'a> {
                 0.0
             }
         };
-        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &p_t, all);
+        let pd = self.plan_dirs(eta.len(), params.len(), kt, eta_t, &p_t, all, true);
         let layout = Layout {
             tan: pd.width() as u8,
             ..base
@@ -1527,7 +1540,7 @@ impl<'a> CovPlan<'a> {
     ) -> Option<Kept> {
         let plans = super::terms::non_gaussian_plans(self.sc.model, self.subject, &self.th, eta)?;
         let p_t = |i: usize, a: usize| self.theta_t(dirs, i, a);
-        let pd = self.plan_dirs(eta.len(), self.th.len(), kt, eta_t, &p_t, all);
+        let pd = self.plan_dirs(eta.len(), self.th.len(), kt, eta_t, &p_t, all, true);
         let layout = Layout {
             tan: pd.width() as u8,
             ..base
@@ -1575,7 +1588,7 @@ impl<'a> CovPlan<'a> {
             tan: 0,
         };
         let pred = if n_obs > 0 {
-            Some(self.run_pred(model, eta, &eta_t, dirs, all, base, kt)?)
+            Some(self.run_pred(model, eta, &eta_t, dirs, all, true, base, kt)?)
         } else {
             None
         };
@@ -1602,7 +1615,16 @@ impl<'a> CovPlan<'a> {
         {
             let zero_t = |_: usize, _: usize| 0.0;
             let zeros = vec![0.0; pn];
-            Some(self.run_pred(sc.pop_model, &zeros, &zero_t, dirs, all, Layout::F64, kt)?)
+            Some(self.run_pred(
+                sc.pop_model,
+                &zeros,
+                &zero_t,
+                dirs,
+                all,
+                false,
+                Layout::F64,
+                kt,
+            )?)
         } else {
             None
         };
@@ -1730,7 +1752,7 @@ impl<'a> CovPlan<'a> {
                 let bv: Vec<f64> = (0..pn).map(|k| k1.out[(nd * pn + k) * lk]).collect();
                 let bt = |k: usize, a: usize| k1.out[(nd * pn + k) * lk + 1 + a];
                 let fb = if n_obs > 0 {
-                    let fb = self.run_pred(model, &bv, &bt, dirs, all, Layout::F64, kt)?;
+                    let fb = self.run_pred(model, &bv, &bt, dirs, all, true, Layout::F64, kt)?;
                     for j in 0..n_obs {
                         put!(slots.nf + nd * n_rows + j, fb.out(j, 0, None), &|a| fb.out(
                             j,
@@ -2069,8 +2091,9 @@ impl<'a> CovPlan<'a> {
     /// The value lanes of a plan's η adjoints (`e`, per seed, `lk` lanes per η) into `rows`
     /// (under `tangent`, each direction's: see [`seed_value`]).
     fn eta_into(&self, e: &[Vec<f64>], lk: usize, tangent: bool, rows: &mut [Vec<f64>]) {
+        let Some(first) = e.first() else { return };
         for (sd, row) in rows.iter_mut().enumerate() {
-            for k in 0..e[0].len() / lk {
+            for k in 0..first.len() / lk {
                 row[self.eta_slot(k)] += seed_value(e, tangent, sd, k * lk);
             }
         }
@@ -2196,6 +2219,36 @@ impl<'a> CovPlan<'a> {
                     .and_then(|f| f.d1.get(i))
                     .filter(|d| !d.is_empty())
             };
+            // The fold's own check, on what the plan computed: a θ it carries reaches this plan
+            // only through its mu lines, so the plan's value adjoint of it is the η adjoints
+            // along `∂μ/∂θ` — one sum two ways, equal to rounding. Any other route (a name the
+            // parse did not see) shows here as an O(1) gap, and the subject declines rather than
+            // returning a Hessian without that route.
+            if !pd.global {
+                for i in
+                    (0..n_par).filter(|&i| pd.folded.iter().any(|f| f.iter().any(|x| x.0 == i)))
+                {
+                    let Some(d) = fold_of(i) else { continue };
+                    let (gi, terms): (f64, Vec<f64>) = (
+                        g(Input::Param(i)),
+                        d.iter().map(|&(k, m)| m * g(Input::Eta(k))).collect(),
+                    );
+                    let (sum, size) = terms
+                        .iter()
+                        .fold((0.0, gi.abs()), |(s, z), v| (s + v, z + v.abs()));
+                    #[cfg(test)]
+                    FOLD_CHECK_WORST.with(|c| {
+                        let gap = (gi - sum).abs() / size.max(1e-300);
+                        // A NaN gap is recorded too: it is the worst there is.
+                        if !(gap <= c.get()) {
+                            c.set(gap);
+                        }
+                    });
+                    if !((gi - sum).abs() <= 1e-8 * size + f64::MIN_POSITIVE) {
+                        return None;
+                    }
+                }
+            }
             let t = |a: usize, inp: Input| -> f64 {
                 if pd.global {
                     return lane(inp, a);

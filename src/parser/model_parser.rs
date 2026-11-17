@@ -1947,8 +1947,9 @@ pub(crate) struct MuFoldSpec {
 
 /// [`MuFoldSpec`] of `[individual_parameters]` `stmts`: the exclusive mu lines among the
 /// detected BSV mu-references (`mu_refs`, and the covariate groups `cov_refs`), and the θ
-/// whose every route to the likelihood ends at one of them
-/// ([`thetas_read_outside_the_group`] with those lines as the owners).
+/// that reach one of them and whose every route to the likelihood ends at one
+/// ([`thetas_read_outside_the_group`] with those lines as the owners, the dose attributes the
+/// engine reads by name counted as outside reads).
 #[allow(clippy::too_many_arguments)]
 fn mu_fold_spec(
     stmts: &[Statement],
@@ -2044,18 +2045,36 @@ fn mu_fold_spec(
     if lines.is_empty() {
         return MuFoldSpec::default();
     }
+    // The names the likelihood reads: every other block's, and the dose attributes (`F1`,
+    // `ALAG2`, `D1`, …), which the engine applies by name with no textual reader (#993).
+    let mut outside = outside_idents.clone();
+    outside.extend(stmts.iter().filter_map(|s| match s {
+        Statement::Assign(n, _) if engine_dose_attr(n, false).is_some() => {
+            Some(n.to_ascii_uppercase())
+        }
+        _ => None,
+    }));
     let thetas = theta_names
         .iter()
         .enumerate()
-        .filter(|(_, t)| {
-            thetas_read_outside_the_group(
-                stmts,
-                theta_names,
-                outside_idents,
-                &owners,
-                std::slice::from_ref(*t),
-            )
-            .is_empty()
+        .filter(|&(i, t)| {
+            // It reaches some line (else there is nothing to fold) …
+            let mut reach = HashSet::new();
+            spread_theta_taint(stmts, i, &[], &mut reach);
+            let reaches = owners.iter().any(|o| match o {
+                Statement::Assign(n, _) => reach.contains(&n.to_ascii_uppercase()),
+                _ => false,
+            });
+            // … and nothing else.
+            reaches
+                && thetas_read_outside_the_group(
+                    stmts,
+                    theta_names,
+                    &outside,
+                    &owners,
+                    std::slice::from_ref(t),
+                )
+                .is_empty()
         })
         .map(|(i, _)| i)
         .collect();
