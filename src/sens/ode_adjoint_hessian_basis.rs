@@ -78,15 +78,61 @@ pub(super) struct MuFold {
     /// Per θ: `(η, ∂μ/∂θ)` over the lines it reaches; empty for a θ that is not folded.
     d1: Vec<Vec<(usize, f64)>>,
     /// Per `(θ_i, θ_j)`, `i` folded: `(η, ∂²μ/∂θ_i∂θ_j)` — what the fold, which uses `∂μ/∂θ_i`
-    /// at this point, leaves out of the curvature along θ_i.
-    d2: Vec<Vec<Vec<(usize, f64)>>>,
+    /// at this point, leaves out of the curvature along θ_i. Formed on first read
+    /// ([`Self::d2`]): a pair of θ per program run, and only the covariance Hessian's curvature
+    /// reads it — the mode response (the outer optimizer's predictor) does not.
+    d2: std::cell::OnceCell<Option<Vec<Vec<Vec<(usize, f64)>>>>>,
+}
+
+/// The mu lines' `μ_k(θ) = g_k(P_k(θ, η = 0))` on a forward second-order dual seeded with lane
+/// 0 along `θ_i` and lane 1 along `θ_j` (`usize::MAX`: no lane), from one program run: a mu
+/// line is a few operations, so this is cheaper than recording one.
+fn mu_dual(
+    model: &CompiledModel,
+    subject: &Subject,
+    theta: &[f64],
+    n_eta: usize,
+    i: usize,
+    j: usize,
+) -> Option<Vec<crate::sens::dual2::Dual2<2>>> {
+    use crate::sens::dual2::Dual2;
+    let spec = &model.indiv_param_partials.mu_fold;
+    let prog = model.indiv_param_partials.indiv_param_program.as_ref()?;
+    let slots: Vec<usize> = spec.lines.iter().map(|l| l.1).collect();
+    let th: Vec<Dual2<2>> = theta
+        .iter()
+        .enumerate()
+        .map(|(m, &v)| {
+            let mut d = Dual2::<2>::constant(v);
+            if m == i {
+                d.grad[0] = 1.0;
+            }
+            if m == j {
+                d.grad[1] = 1.0;
+            }
+            d
+        })
+        .collect();
+    let z = vec![Dual2::<2>::constant(0.0); n_eta];
+    let vals = prog.eval_var_slots_g(&th, &z, &subject.covariates, &slots);
+    Some(
+        spec.lines
+            .iter()
+            .zip(vals)
+            .map(|(&(_, _, t), v)| match t {
+                MuTransform::Log => v.ln(),
+                MuTransform::Logit => (v / (Dual2::<2>::constant(1.0) - v)).ln(),
+                _ => v,
+            })
+            .collect(),
+    )
 }
 
 impl MuFold {
     /// The fold at `(θ, η)`: `None` where the model has no foldable θ, where its plans read θ
     /// another way the parse cannot see (covariate networks, mixtures, IOV), where the
     /// subject's covariates vary over its records (`μ` would be per record), or where the
-    /// program does not reproduce `g⁻¹(μ + η)` at this `η`.
+    /// program does not reproduce `g⁻¹(μ + η)` at this `η`. One program run per folded θ.
     pub(super) fn at(
         model: &CompiledModel,
         subject: &Subject,
@@ -110,70 +156,24 @@ impl MuFold {
             MuTransform::Logit => 1.0 / (1.0 + (-u).exp()),
             _ => u,
         };
-        // `μ_k(θ) = g_k(P_k(θ, η = 0))` and its derivatives by a forward second-order dual, one
-        // evaluation per pair `(θ_i, θ_j)` with `θ_i` folded: lane 0 along `θ_i`, lane 1 along
-        // `θ_j` (the same θ for `i = j`), so `hess[0][1]` is `∂²μ/∂θ_i∂θ_j`. A mu line is a few
-        // operations, so this is cheaper than recording one.
-        use crate::sens::dual2::Dual2;
         let slots: Vec<usize> = spec.lines.iter().map(|l| l.1).collect();
-        let mu_of = |th: &[Dual2<2>]| -> Vec<Dual2<2>> {
-            let z = vec![Dual2::<2>::constant(0.0); eta.len()];
-            let vals = prog.eval_var_slots_g(th, &z, cov, &slots);
-            spec.lines
-                .iter()
-                .zip(vals)
-                .map(|(&(_, _, t), v)| match t {
-                    MuTransform::Log => v.ln(),
-                    MuTransform::Logit => (v / (Dual2::<2>::constant(1.0) - v)).ln(),
-                    _ => v,
-                })
-                .collect()
-        };
-        let seeded = |i: usize, j: usize| -> Vec<Dual2<2>> {
-            let th: Vec<Dual2<2>> = theta
-                .iter()
-                .enumerate()
-                .map(|(m, &v)| {
-                    let mut d = Dual2::<2>::constant(v);
-                    if m == i {
-                        d.grad[0] = 1.0;
-                    }
-                    if m == j {
-                        d.grad[1] = 1.0;
-                    }
-                    d
-                })
-                .collect();
-            mu_of(&th)
-        };
-        let n_lines = spec.lines.len();
-        let mu: Vec<f64> = seeded(usize::MAX, usize::MAX)
-            .iter()
-            .map(|d| d.value)
-            .collect();
-        // Per line: `∂μ/∂θ_i` and `∂²μ/∂θ_i∂θ_j` (`j·n_th + i`) for the folded `i`.
-        let mut grad = vec![vec![0.0; n_th]; n_lines];
-        let mut hess = vec![vec![0.0; n_th * n_th]; n_lines];
-        // `∂²μ/∂θ_i∂θ_j` is symmetric: a pair of folded θ takes one run, filling both entries.
-        let folded = |m: usize| spec.thetas.contains(&m);
+        let mut mu: Vec<f64> = Vec::new();
+        let mut d1 = vec![Vec::new(); n_th];
         for &i in spec.thetas.iter().filter(|&&i| i < n_th) {
-            for j in (0..n_th).filter(|&j| !(folded(j) && j < i)) {
-                for (k, d) in seeded(i, j).iter().enumerate() {
-                    grad[k][i] = d.grad[0];
-                    hess[k][j * n_th + i] = d.hess[0][1];
-                    if folded(j) {
-                        hess[k][i * n_th + j] = d.hess[0][1];
-                    }
+            let d = mu_dual(model, subject, theta, eta.len(), i, usize::MAX)?;
+            if mu.is_empty() {
+                mu = d.iter().map(|x| x.value).collect();
+            }
+            for (k, x) in d.iter().enumerate() {
+                if !(x.value.is_finite() && x.grad[0].is_finite()) {
+                    return None;
+                }
+                if x.grad[0] != 0.0 {
+                    d1[i].push((spec.lines[k].0, x.grad[0]));
                 }
             }
         }
-        if !(mu.iter().all(|v| v.is_finite())
-            && grad
-                .iter()
-                .flatten()
-                .chain(hess.iter().flatten())
-                .all(|v| v.is_finite()))
-        {
+        if mu.is_empty() {
             return None;
         }
         // The structure: each line's value is `g⁻¹(μ + η)` at the current η and at η moved by a
@@ -191,30 +191,54 @@ impl MuFold {
                 }
             }
         }
-        let mut d1 = vec![Vec::new(); n_th];
-        let mut d2 = vec![vec![Vec::new(); n_th]; n_th];
-        for &i in &spec.thetas {
-            if i >= n_th {
-                continue;
-            }
-            for (k, &(e, _, _)) in spec.lines.iter().enumerate() {
-                if grad[k][i] != 0.0 {
-                    d1[i].push((e, grad[k][i]));
-                }
-                for j in 0..n_th {
-                    let h = hess[k][j * n_th + i];
-                    if h != 0.0 {
-                        d2[i][j].push((e, h));
-                    }
-                }
-            }
-        }
-        (d1.iter().any(|d| !d.is_empty())).then_some(MuFold { d1, d2 })
+        (d1.iter().any(|d| !d.is_empty())).then_some(MuFold {
+            d1,
+            d2: std::cell::OnceCell::new(),
+        })
     }
 
     /// θ `i`'s lines, if the fold carries it.
     pub(super) fn of(&self, i: usize) -> Option<&[(usize, f64)]> {
         self.d1.get(i).map(Vec::as_slice).filter(|d| !d.is_empty())
+    }
+
+    /// `∂²μ/∂θ_i∂θ_j` per folded `i` (as the field), formed on the first read: one program run
+    /// per pair, a pair of folded θ taking one run for both entries. `None`: a non-finite
+    /// derivative, where the caller declines.
+    pub(super) fn d2(
+        &self,
+        model: &CompiledModel,
+        subject: &Subject,
+        theta: &[f64],
+        n_eta: usize,
+    ) -> Option<&Vec<Vec<Vec<(usize, f64)>>>> {
+        self.d2
+            .get_or_init(|| {
+                let spec = &model.indiv_param_partials.mu_fold;
+                let n_th = theta.len();
+                let folded = |m: usize| self.of(m).is_some();
+                let mut d2 = vec![vec![Vec::new(); n_th]; n_th];
+                for i in (0..n_th).filter(|&i| folded(i)) {
+                    for j in (0..n_th).filter(|&j| !(folded(j) && j < i)) {
+                        let d = mu_dual(model, subject, theta, n_eta, i, j)?;
+                        for (k, x) in d.iter().enumerate() {
+                            let h = x.hess[0][1];
+                            if !h.is_finite() {
+                                return None;
+                            }
+                            if h != 0.0 {
+                                let e = spec.lines[k].0;
+                                d2[i][j].push((e, h));
+                                if folded(j) && j != i {
+                                    d2[j][i].push((e, h));
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(d2)
+            })
+            .as_ref()
     }
 }
 
@@ -668,6 +692,11 @@ impl CovPlan<'_> {
             }
         }
         let fold = self.fold.as_ref().filter(|_| b.folded);
+        // The fold's second derivatives, formed here on first use (the curvature below).
+        let fold_d2 = match fold {
+            Some(f) => Some(f.d2(self.sc.model, self.subject, &self.th, self.pn())?),
+            None => None,
+        };
         // Input `inp`'s adjoint tangent along direction `a`.
         let tan = |a: usize, inp: Input| -> f64 {
             let Some(c) = u.coef.get(a) else { return 0.0 };
@@ -692,11 +721,11 @@ impl CovPlan<'_> {
             // The fold moved θ_i along `∂μ/∂θ_i` frozen at this point; the true direction's
             // curvature also carries that vector's own θ-derivative, read off the η value
             // adjoints (the plan sees θ_i only through those lines).
-            let corr: f64 = match (inp, fold) {
-                (Input::Param(j), Some(f)) if j < f.d1.len() => u.folded[a]
+            let corr: f64 = match (inp, fold_d2) {
+                (Input::Param(j), Some(d2)) if j < d2.len() => u.folded[a]
                     .iter()
                     .map(|&(i, ti)| {
-                        ti * f.d2[i][j]
+                        ti * d2[i][j]
                             .iter()
                             .filter(|&&(k, _)| k < b.n_eta)
                             .map(|&(k, h)| h * ba.g[k])
