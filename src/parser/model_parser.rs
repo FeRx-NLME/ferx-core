@@ -18240,6 +18240,27 @@ fn keyword_captures<'h>(
     }
 }
 
+/// Whether `line`, after leading Unicode `White_Space`, starts with `lit` (case-sensitive):
+/// exactly the precondition of a `^\s*lit…` pattern, the case-sensitive sibling of
+/// [`leads_with_keyword_ci`].
+fn leads_with_literal(line: &str, lit: &str) -> bool {
+    line.trim_start().starts_with(lit)
+}
+
+/// `re.captures(line)` for a case-sensitive `^\s*lit…` pattern, compiling `re` only when the
+/// line leads with `lit` ([`leads_with_literal`]).
+fn literal_captures<'h>(
+    re: &std::sync::LazyLock<Regex>,
+    lit: &str,
+    line: &'h str,
+) -> Option<regex::Captures<'h>> {
+    if leads_with_literal(line, lit) {
+        re.captures(line)
+    } else {
+        None
+    }
+}
+
 fn parse_model_name(content: &str) -> Result<String, String> {
     // `extract_blocks`' own header pattern: the preamble ends where the first block opens.
     let header_re = &*BLOCK_HEADER_RE;
@@ -21533,8 +21554,7 @@ fn parse_error_endpoint_body(body: &str) -> Result<(ErrorModel, Vec<String>), St
     }
     static LOG_LHS_RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"^\s*log\s*\(\s*\w+\s*\)\s*~").unwrap());
-    let log_lhs_re = &*LOG_LHS_RE;
-    if log_lhs_re.is_match(body) {
+    if leads_with_literal(body, "log") && LOG_LHS_RE.is_match(body) {
         return Err(
             "[error_model] log-transform-both-sides (`log(DV) ~ …`) is not supported inside a \
              covariate-selected if/else block"
@@ -21869,7 +21889,6 @@ fn split_correlation_line(
 ) -> Result<(Vec<String>, Option<CorrelationDecl>), String> {
     static HEAD_RE: std::sync::LazyLock<Regex> =
         std::sync::LazyLock::new(|| Regex::new(r"(?i)^\s*correlation\b").unwrap());
-    let head = &*HEAD_RE;
     static FULL_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
         Regex::new(r"(?i)^\s*correlation\s+(\w+)\s*\(\s*(\w+)\s*\)\s+by\s+(\(?\s*\w+(?:\s*,\s*\w+)*\s*\)?)\s*$",).unwrap()
     });
@@ -21877,7 +21896,7 @@ fn split_correlation_line(
     let mut decl: Option<CorrelationDecl> = None;
     for line in lines {
         let code = line.split('#').next().unwrap_or("").trim();
-        if !head.is_match(code) {
+        if !(leads_with_keyword_ci(code, "correlation") && HEAD_RE.is_match(code)) {
             rest.push(line.clone());
             continue;
         }
@@ -22004,10 +22023,7 @@ fn parse_error_model_inner(
         let code = line.split('#').next().unwrap_or("").trim();
         // The pattern is anchored at the keyword, so only a line that starts with it builds the
         // regex (a Unicode-aware `\w` compiles to a large automaton: ~1M instructions).
-        let iiv = code
-            .get(.."iiv_on_ruv".len())
-            .filter(|head| head.eq_ignore_ascii_case("iiv_on_ruv"))
-            .and_then(|_| IIV_RE.captures(code));
+        let iiv = keyword_captures(&IIV_RE, "iiv_on_ruv", code);
         match iiv {
             Some(c) if depth > 0 => {
                 return Err(format!(
@@ -22091,10 +22107,7 @@ fn parse_error_model_inner(
 
         // Peel off an optional `CMT=N:` prefix.
         // The pattern is anchored at the literal `CMT`: any other line never builds the regex.
-        let cmt_caps = trimmed
-            .starts_with("CMT")
-            .then(|| CMT_RE.captures(trimmed))
-            .flatten();
+        let cmt_caps = literal_captures(&CMT_RE, "CMT", trimmed);
         let (cmt_opt, body) = if let Some(c) = cmt_caps {
             let cmt: usize = c[1]
                 .parse()
@@ -22113,11 +22126,7 @@ fn parse_error_model_inner(
         // A `log(DV)` LHS (case 2) is detected first since the plain regex's
         // `\w+` LHS can't match the parenthesised form.
         // Likewise anchored at `log`.
-        let log_caps = body
-            .trim_start()
-            .starts_with("log")
-            .then(|| LOG_LHS_RE.captures(&body))
-            .flatten();
+        let log_caps = literal_captures(&LOG_LHS_RE, "log", &body);
         let (lhs_logged, caps) = if let Some(c) = log_caps {
             (true, c)
         } else {

@@ -13641,19 +13641,65 @@ fn test_iiv_on_ruv_resolves_eta_index() {
     assert!((model.residual_var_scale(&[0.3, 0.5]) - (2.0_f64 * 0.5).exp()).abs() < 1e-12);
 }
 
-/// The statement regexes are built only for a line that starts with their anchor literal
-/// (`iiv_on_ruv`, `log`): the guard must not narrow what the regex took. `iiv_on_ruv` is
-/// case-insensitive and may be indented; `log (DV)` may be indented and spaced. Each of
-/// the two spellings below is read exactly as the regex alone would.
+/// The statement regexes are built only for a line that leads with their anchor
+/// (`leads_with_keyword_ci` for the case-insensitive `iiv_on_ruv` / `correlation`,
+/// `leads_with_literal` for the case-sensitive `CMT` / `log`): each gate must accept every line
+/// its regex matches, or a statement would be silently dropped. Checked against the patterns
+/// themselves on lines that reach the gate untrimmed, with indentation and mixed case (neither
+/// keyword has an `s` or `k`, so the Unicode folds onto those letters cannot arise). Mutations: a
+/// case-sensitive keyword gate ->
+/// the mixed-case rows fail; dropping `trim_start` from either gate -> the indented rows fail.
+/// End to end, a mixed-case `IIV_On_Ruv` and a spaced `log ( DV )` still parse.
 #[test]
-fn prefiltered_statement_regexes_still_read_indented_and_cased_lines() {
+fn statement_prefilters_accept_every_line_their_regex_matches() {
+    use super::{leads_with_keyword_ci, leads_with_literal};
+    let ci = [
+        (r"(?i)^\s*iiv_on_ruv\s*=\s*(\w+)\s*$", "iiv_on_ruv"),
+        (r"(?i)^\s*correlation\b", "correlation"),
+    ];
+    let cs = [
+        (r"^\s*CMT\s*=\s*(\d+)\s*:\s*(.*)$", "CMT"),
+        (r"^\s*log\s*\(\s*(\w+)\s*\)\s*~", "log"),
+    ];
+    let lines = [
+        "iiv_on_ruv = ETA_RUV",
+        "   IIV_On_Ruv=ETA",
+        "\tiiv_on_ruv = E",
+        "correlation cs(RHO) by ARM",
+        "  CORRELATION ar1(R) by OCC",
+        "correlation_x",
+        "CMT=2: DV ~ additive(S)",
+        "   CMT = 1 : DV ~ proportional(P)",
+        "cmt=1: DV ~ additive(S)",
+        "log(DV) ~ additive(A)",
+        "   log ( DV ) ~ additive(A)",
+        "Log(DV) ~ additive(A)",
+        "DV ~ additive(A)",
+        "",
+    ];
+    for (pat, kw) in ci {
+        let re = regex::Regex::new(pat).unwrap();
+        for line in lines {
+            if re.is_match(line) {
+                assert!(leads_with_keyword_ci(line, kw), "{kw}: gate drops `{line}`");
+            }
+        }
+    }
+    for (pat, lit) in cs {
+        let re = regex::Regex::new(pat).unwrap();
+        for line in lines {
+            if re.is_match(line) {
+                assert!(leads_with_literal(line, lit), "{lit}: gate drops `{line}`");
+            }
+        }
+    }
+
     let model = parse_full_model(&iiv_ruv_model_str(
         "  DV ~ proportional(PROP_ERR)\n      IIV_On_Ruv = ETA_RUV",
     ))
     .unwrap()
     .model;
     assert_eq!(model.residual_error_eta, Some(1));
-
     let content = sigma_order_model(
         "  sigma S_BIG ~ 2.0 (sd)\n  sigma ADD_LOG ~ 0.1 (sd)",
         "   log ( DV ) ~ additive(ADD_LOG)",
@@ -13661,7 +13707,7 @@ fn prefiltered_statement_regexes_still_read_indented_and_cased_lines() {
     let err = expect_parse_err(&content);
     assert!(
         err.contains("consumed positionally") && err.contains("ADD_LOG"),
-        "an indented, spaced `log ( DV )` must still reach the LTBS arm: {err}"
+        "a spaced `log ( DV )` must still reach the LTBS arm: {err}"
     );
 }
 
