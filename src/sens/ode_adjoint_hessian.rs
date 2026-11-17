@@ -436,6 +436,22 @@ fn psi_lanes(
     dirs: &[Dir],
     mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
+    let declined = plan.st_declined.get();
+    match psi_passes(plan, w, dirs, &mut lane) {
+        // The structured form did not hold at this point ([`CovPlan::run`]): every pass again,
+        // on the recorded kernels.
+        None if !declined && plan.st_declined.get() => psi_passes(plan, w, dirs, &mut lane),
+        r => r,
+    }
+}
+
+/// [`psi_lanes`]' passes at the width the plan's kernel takes.
+fn psi_passes(
+    plan: &CovPlan<'_>,
+    w: &[f64],
+    dirs: &[Dir],
+    lane: &mut impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
+) -> Option<()> {
     let n = plan.pn();
     let width = pass_width(plan.structured(), dirs.len());
     let l = 1 + width;
@@ -825,6 +841,9 @@ pub(super) struct CovPlan<'a> {
     st_reduce: std::cell::RefCell<[Option<std::sync::Arc<kj::Plan>>; 2]>,
     /// A quadrature subject's rows at its nodes ([`st::NodeRows`]).
     st_node_rows: std::cell::RefCell<Option<st::NodeRows>>,
+    /// Set where the structured form does not hold at this point ([`Self::run`]): every later
+    /// pass takes the recorded kernel, one direction a pass ([`pass_width`]).
+    st_declined: std::cell::Cell<bool>,
 }
 
 /// The kernel's input slots for one subject's pass: per observation the prediction plan's
@@ -1099,6 +1118,7 @@ impl<'a> CovPlan<'a> {
             st_rows: std::cell::RefCell::new(None),
             st_reduce: std::cell::RefCell::new([None, None]),
             st_node_rows: std::cell::RefCell::new(None),
+            st_declined: std::cell::Cell::new(false),
         }
     }
 
@@ -1565,7 +1585,7 @@ impl<'a> CovPlan<'a> {
         // The quadrature's nodes: stage 1, then the node predictions (and term values) there.
         let mut nodes = Vec::new();
         // A structured quadrature subject's pass takes its nodes from the structured stage 1.
-        let st_nodes = if kt > 0 && slots.n_nodes > 0 {
+        let st_nodes = if kt > 0 && slots.n_nodes > 0 && self.structured() {
             self.struct_nodes(&inputs[..n_base * lk], &slots, kt)
         } else {
             None
@@ -1665,13 +1685,19 @@ impl<'a> CovPlan<'a> {
             None
         };
         // A tangent pass of a structured subject keeps the kernel's inputs for [`st`] instead of
-        // running the recorded kernel — where its rows hold at this point: a row off its domain,
-        // or FOCE past its Woodbury gate (production then factors `R̃` itself), takes the
-        // recorded kernel rather than declining the subject.
-        let structured = kt > 0
-            && self.structured()
-            && (slots.n_nodes == 0 || st_nodes.is_some())
-            && self.struct_rows_hold(&inputs, &slots, kt);
+        // running the recorded kernel — where its rows hold at this point. Where they do not (a
+        // row off its domain, FOCE past its Woodbury gate, where production factors `R̃` itself,
+        // or a structured stage 1 that did not form), this pass is laid out at the structured
+        // width and, under quadrature, has no recorded stage 1: it is declined here and
+        // [`psi_lanes`] reruns every pass on the recorded kernels, one direction each.
+        let structured = kt > 0 && self.structured();
+        if structured
+            && !((slots.n_nodes == 0 || st_nodes.is_some())
+                && self.struct_rows_hold(&inputs, &slots, kt))
+        {
+            self.st_declined.set(true);
+            return None;
+        }
         let k2 = if structured {
             None
         } else {

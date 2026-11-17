@@ -420,7 +420,7 @@ impl CovPlan<'_> {
 
     /// Whether this subject's passes take the structured kernel.
     pub(super) fn structured(&self) -> bool {
-        self.family().is_some()
+        self.family().is_some() && !self.st_declined.get()
     }
 
     /// The rows at this point (it does not move between passes): formed once, from the
@@ -640,7 +640,7 @@ impl CovPlan<'_> {
 
     /// Whether the structured form holds at a pass's kernel inputs: the anchor rows, and a
     /// quadrature subject's node rows, form here ([`Self::struct_adjoint`] reads both). Where
-    /// they do not, the pass takes the recorded kernel instead.
+    /// they do not, the subject's passes take the recorded kernels instead (`CovPlan::run`).
     pub(super) fn struct_rows_hold(&self, inputs: &[f64], sl: &Slots, kt: usize) -> bool {
         let Some(nodes) = self.rows_at(inputs, sl, kt).map(|r| r.family.nodes()) else {
             return false;
@@ -812,26 +812,7 @@ impl CovPlan<'_> {
     /// hold; the caller then runs a direction at a time.
     fn nodes_rows(&self, family: Family, rin: &[f64], kt: usize, nb: usize) -> Option<Vec<f64>> {
         let lk = 1 + kt;
-        let n_in = rin.len() / lk;
-        if kt == 0 {
-            return None;
-        }
-        let vals: Vec<f64> = (0..n_in).map(|i| rin[i * lk]).collect();
-        let kr = self.reduce_run(family, 1, &vals, 0, nb)?;
-        let plan = kr.plan();
-        if !plan.rows_serve(Layout::F64) {
-            return None;
-        }
-        let mut tu = vec![0.0; kt * n_in];
-        for a in 0..kt {
-            for i in 0..n_in {
-                tu[a * n_in + i] = rin[i * lk + 1 + a];
-            }
-        }
-        let rf = plan.forward_rows(Layout::F64, &[], &vals, &tu, kt)?;
-        if !plan.rows_guard(&rf) {
-            return None;
-        }
+        let (plan, rf) = self.reduce_fwd_rows(family, 1, rin, kt, nb)?;
         let mut out = vec![0.0; nb * lk];
         for o in 0..nb {
             for a in 0..kt {
@@ -901,25 +882,7 @@ impl CovPlan<'_> {
     ) -> Option<Vec<f64>> {
         let lk = 1 + kt;
         let (n_in, n_out) = (rin.len() / lk, seed.len() / lk);
-        if kt == 0 {
-            return None;
-        }
-        let vals: Vec<f64> = (0..n_in).map(|i| rin[i * lk]).collect();
-        let kr = self.reduce_run(family, stage, &vals, 0, n_out)?;
-        let plan = kr.plan();
-        if !plan.rows_serve(Layout::F64) {
-            return None;
-        }
-        let mut tu = vec![0.0; kt * n_in];
-        for a in 0..kt {
-            for i in 0..n_in {
-                tu[a * n_in + i] = rin[i * lk + 1 + a];
-            }
-        }
-        let rf = plan.forward_rows(Layout::F64, &[], &vals, &tu, kt)?;
-        if !plan.rows_guard(&rf) {
-            return None;
-        }
+        let (plan, rf) = self.reduce_fwd_rows(family, stage, rin, kt, n_out)?;
         let du: Vec<f64> = (0..n_out).map(|o| seed[o * lk]).collect();
         let mut dut = vec![0.0; kt * n_out];
         for a in 0..kt {
@@ -939,6 +902,40 @@ impl CovPlan<'_> {
             }
         }
         Some(out)
+    }
+
+    /// The reduce's rows forward (#2980) at `rin`'s values (laid out as [`Self::reduce_for`]'s),
+    /// each of its `kt` directions a seed: its plan and the kept forward. `None` without
+    /// tangents, where the plan has no rows kernels, or where its guard does not hold.
+    fn reduce_fwd_rows(
+        &self,
+        family: Family,
+        stage: u8,
+        rin: &[f64],
+        kt: usize,
+        n_out: usize,
+    ) -> Option<(std::sync::Arc<kj::Plan>, kj::RowsFwd)> {
+        let lk = 1 + kt;
+        let n_in = rin.len() / lk;
+        if kt == 0 {
+            return None;
+        }
+        let vals: Vec<f64> = (0..n_in).map(|i| rin[i * lk]).collect();
+        let plan = self
+            .reduce_run(family, stage, &vals, 0, n_out)?
+            .plan()
+            .clone();
+        if !plan.rows_serve(Layout::F64) {
+            return None;
+        }
+        let mut tu = vec![0.0; kt * n_in];
+        for a in 0..kt {
+            for i in 0..n_in {
+                tu[a * n_in + i] = rin[i * lk + 1 + a];
+            }
+        }
+        let rf = plan.forward_rows(Layout::F64, &[], &vals, &tu, kt)?;
+        plan.rows_guard(&rf).then_some((plan, rf))
     }
 
     /// The reduce `R(η, x, A, w)` along `kt` tangents (`rin`: each input's value, then its
