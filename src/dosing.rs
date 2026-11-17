@@ -54,12 +54,103 @@ pub(crate) fn resolve_subject_doses_with<'a>(
     // dose to resolve, so skip the per-dose `all_doses_fixed()` scan entirely —
     // the overwhelmingly common case (no `D{cmt}`). A modeled dose cannot reach
     // here with an empty map: it would have been rejected by the data gate first.
-    if attr_map.is_empty() || subject.all_doses_fixed() {
+    let base = lower_zero_order_ss(subject, attr_map);
+    if (attr_map.is_empty() && !attr_map.has_zero_order()) || base.all_doses_fixed() {
+        return base;
+    }
+    let mut owned = base.into_owned();
+    for (k, d) in owned.doses.iter_mut().enumerate() {
+        *d = d.resolve_rate(attr_map, pk_for_dose(k));
+    }
+    Cow::Owned(owned)
+}
+
+/// Whether `d` is a plain `SS=1` bolus record into a compartment fed by one `zero_order()`
+/// window and nothing else (#2786) — the doses [`lower_zero_order_ss`] rewrites.
+fn is_zero_order_ss_record(attr_map: &crate::types::DoseAttrMap, d: &DoseEvent) -> bool {
+    d.ss && d.ii > 0.0
+        && d.amt > 0.0
+        && matches!(d.rate_mode, crate::types::RateMode::Fixed)
+        && !d.is_infusion()
+        && attr_map.zero_order_slot(d.cmt_1based()).is_some()
+}
+
+/// Whether `d` is such a dose **after** lowering: a duration-modeled `SS=1` infusion whose
+/// compartment is a pure zero-order one. A user-coded infusion into a zero-order compartment is
+/// refused by validation, so this names the lowered doses and only them. Every walk asks it to
+/// keep such a dose on the plain-infusion paths (no forcing onset, no `R_in_inf`).
+pub(crate) fn is_lowered_zero_order_ss(
+    attr_map: &crate::types::DoseAttrMap,
+    d: &DoseEvent,
+) -> bool {
+    d.ss && d.ii > 0.0 && d.is_infusion() && attr_map.zero_order_slot(d.cmt_1based()).is_some()
+}
+
+/// Rewrite every `SS=1` bolus into a pure zero-order compartment as a duration-modeled
+/// infusion (`RATE=-2` with the forcing's `dur` as its `D{cmt}`), #2786.
+///
+/// A zero-order window *is* an infusion: rate `F·amt/dur` over `[t + lag, t + lag + dur]`. The
+/// engines already carry a steady-state infusion exactly — the periodic seed with its active and
+/// quiet windows, the pulses of an overlapping train still running after the record, the lag
+/// phase and its clamp, resets — in value and in every derivative order, including the moving
+/// window end through the modeled duration's jet. Lowering the dose reuses all of it instead of
+/// growing a second implementation of the same train for `zero_order()`; non-SS doses keep the
+/// window machinery. Borrowed (no allocation) unless a dose is rewritten.
+pub(crate) fn lower_zero_order_ss<'a>(
+    subject: &'a Subject,
+    attr_map: &crate::types::DoseAttrMap,
+) -> Cow<'a, Subject> {
+    if !attr_map.has_zero_order()
+        || !subject
+            .doses
+            .iter()
+            .any(|d| is_zero_order_ss_record(attr_map, d))
+    {
         return Cow::Borrowed(subject);
     }
     let mut owned = subject.clone();
-    for (k, d) in owned.doses.iter_mut().enumerate() {
-        *d = d.resolve_rate(attr_map, pk_for_dose(k));
+    lower_zero_order_ss_in_place(&mut owned, attr_map);
+    Cow::Owned(owned)
+}
+
+/// Test seam: subjects lowered whose first dose carries the marker amount of this module's fit
+/// fixture, so a test counts its own fit's lowerings among the parallel suite's.
+#[cfg(test)]
+static MARKER_LOWERINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn lower_zero_order_ss_in_place(subject: &mut Subject, attr_map: &crate::types::DoseAttrMap) {
+    #[cfg(test)]
+    if subject.doses.first().is_some_and(|d| d.amt == 4321.5) {
+        MARKER_LOWERINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    for d in subject
+        .doses
+        .iter_mut()
+        .filter(|d| is_zero_order_ss_record(attr_map, d))
+    {
+        d.rate_mode = crate::types::RateMode::ModeledDuration;
+        d.infusion_def = crate::types::InfusionDef::DurationDefined;
+        d.rate = 0.0;
+        d.duration = 0.0;
+        d.resolve_default_cmt();
+    }
+}
+
+/// [`lower_zero_order_ss`] for a whole population, once where a fit binds it to its model:
+/// the lowered doses are infusions no walk rewrites again, so the engines' own
+/// [`lower_zero_order_ss`] on a bound subject is a scan that borrows instead of cloning the
+/// subject on every walk of every inner solve. Borrowed unless a dose is rewritten.
+pub(crate) fn lower_population_zero_order_ss<'a>(
+    population: &'a crate::types::Population,
+    attr_map: &crate::types::DoseAttrMap,
+) -> Cow<'a, crate::types::Population> {
+    let has = |s: &Subject| s.doses.iter().any(|d| is_zero_order_ss_record(attr_map, d));
+    if !attr_map.has_zero_order() || !population.subjects.iter().any(has) {
+        return Cow::Borrowed(population);
+    }
+    let mut owned = population.clone();
+    for s in owned.subjects.iter_mut().filter(|s| has(s)) {
+        lower_zero_order_ss_in_place(s, attr_map);
     }
     Cow::Owned(owned)
 }
@@ -279,15 +370,22 @@ where
         }
     }
     let u_ss = crate::sens::linsolve::solve_linear_system_g::<T>(&i_minus_m, &b, n)?;
-    if u_ss.iter().any(|x| !x.val().is_finite()) {
+    // `|x| < ∞`, as a branch (a `NaN` fails it too): a guard on the verdict, not on the value.
+    if u_ss.iter().any(|x| !x.br_abs_lt(f64::INFINITY)) {
         return None;
     }
+    // The checks below verify the map is affine — a property of the model, not of the point —
+    // and the solution above does not depend on their verdict. Each is a branch on the
+    // difference against a tolerance, so a recording holds while the verdict does and not at the
+    // one value it saw: an exact-value guard on `u_ss` or on a cycle's result would fail at
+    // every other point and record again on every evaluation.
     // Confirm linearity on the value part: one and two forced cycles from u_ss must both return
     // u_ss (only an affine one-cycle map does). The tolerance is scaled to the caller's own
     // accuracy so the fast path is not falsely abandoned at a loose `ode_reltol`; a genuinely
     // nonlinear map diverges by O(scale) and is rejected. Two cycles (not one) rejects a weakly-
     // nonlinear map whose true fixed point merely happens to sit within `vtol` after the first.
-    let scale = u_ss.iter().fold(1e-12_f64, |a, x| a.max(x.val().abs()));
+    // The scale is a magnitude (`abs_hint`, no guard): it only sets how loose the bound is.
+    let scale = u_ss.iter().fold(1e-12_f64, |a, x| a.max(x.abs_hint()));
     // Verification tolerance, scaled to the caller's own accuracy. For the ODE caller the
     // one-cycle residual of a genuinely *linear* map is not zero but a solver-noise floor: `b`
     // (forced from a zero state) and the check below (forced from `u_ss`) integrate the same
@@ -302,10 +400,12 @@ where
     // propagators need — seven orders above their measured ~1e-16 residual and still eight orders
     // below a nonlinear map's O(scale).
     let vtol = (256.0 * reltol + 1e-9) * scale + 256.0 * abstol;
+    // `|c − u| ≤ vtol` is `< next_up(vtol)`, exactly, for a finite `vtol`.
+    let vtol_open = vtol.next_up();
     let within = |a: &[T], b: &[T]| {
         a.iter()
             .zip(b)
-            .all(|(c, u)| (c.val() - u.val()).abs() <= vtol)
+            .all(|(&c, &u)| c.br_absdiff_lt(u, vtol_open))
     };
     let u_check = advance_forced(&u_ss)?;
     if !within(&u_check, &u_ss) {
@@ -359,6 +459,12 @@ pub(crate) fn ss_cycle_converged(cur: &[f64], prev: &[f64], tol: f64) -> bool {
     cur.iter()
         .zip(prev)
         .all(|(&a, &b)| (a - b).abs() <= tol * a.abs() + atol)
+}
+
+/// The test-only full-budget switch, for the recording type's convergence test.
+#[cfg(test)]
+pub(crate) fn force_full_ss_equilibration() -> bool {
+    FORCE_FULL_SS_EQUILIBRATION.with(|c| c.get())
 }
 
 /// Rolling prev-state tracker for the f64 SS-equilibration early stop. Owns the previous
@@ -559,7 +665,7 @@ pub(crate) enum SsBranch {
     /// No SS equilibration has completed on this thread since the last one started.
     ///
     /// Written at the top of `equilibrate_ss_pk_state`, so a call that **bails out early**
-    /// (`II <= 0`, an out-of-range compartment, overlapping infusions) leaves `None` rather
+    /// (`II <= 0`, an out-of-range compartment) leaves `None` rather
     /// than the previous call's tag. That matters: without it a test asserting a branch
     /// after a bail-out would read a stale value and pass for the wrong reason — the class
     /// of un-failable assertion this enum exists to prevent.
@@ -661,7 +767,7 @@ pub(crate) fn record_ss_nonconvergence_warning(_warning: Option<&str>) {}
 /// path (`(I − M)⁻¹·b`, #835) and never reaches this iteration.
 pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 
-/// Process-global collector for steady-state equilibration non-convergence warnings (#867).
+/// Per-run collector for steady-state equilibration non-convergence warnings (#867, #2067).
 ///
 /// The capped pulse-train equilibration runs deep inside the per-subject prediction walk
 /// (`ode::predictions::equilibrate_ss_state`), which rayon parallelises across subjects and whose
@@ -669,7 +775,7 @@ pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 /// `ode_predictions_*` variant and its callers would be a wide, invasive change for a rare
 /// diagnostic, and a thread-local would be lost on the rayon worker threads. So the message —
 /// written only on the rare non-converged nonlinear branch — is deduplicated into this cross-thread
-/// set and drained by every `api` boundary that returns a `warnings` channel — `fit`,
+/// map, one set per *run* (the id the pool tasks carry as their fit, [`run_scope`]), and drained by every `api` boundary that returns a `warnings` channel — `fit`,
 /// `simulate_with_options_diag`, `simulate_with_uncertainty_diag`, `predict_diag` and the adaptive
 /// driver behind `simulate_adaptive` / `simulate_adaptive_from_spec` (#1652) — via
 /// [`take_ss_nonconvergence_warnings`]. Bare `predict()` / `simulate()` are wrappers over their
@@ -677,21 +783,57 @@ pub(crate) const SS_WARN_REL_TOL: f64 = 1e-2;
 ///
 /// The message is model-structural (independent of subject and of objective-eval count), so the
 /// `BTreeSet` collapses the thousands of identical writes a fit produces down to one entry, and its
-/// deterministic ordering keeps the surfaced list stable. This assumes one top-level `api`
-/// operation per process at a time (the CLI / ferx-r usage): each draining entrypoint
-/// [`clear_ss_nonconvergence_warnings`] on entry and [`take_ss_nonconvergence_warnings`] on exit to
-/// bracket its own run; genuinely concurrent in-process operations would share the sink. A
-/// draining call *nested* inside another's window clears the outer run's notes, so code that runs
-/// inside an entry point must not call one. `suggest_start::sweep`, which predicts inside `fit()`
-/// (via `inits_from_nca`) — once per start of a multi-start fit, concurrently with the other
-/// starts' objective passes — therefore uses the non-draining `api::predict_diag_undrained`
+/// deterministic ordering keeps the surfaced list stable. Each draining entrypoint opens a
+/// [`run_scope`] (joining the fit it runs inside, if any), so concurrent in-process operations —
+/// the candidate fits of a model search — keep their notes apart (#2067); a write from a thread
+/// that runs no scope lands in the shared bucket `0`. [`clear_ss_nonconvergence_warnings`] on entry
+/// and [`take_ss_nonconvergence_warnings`] on exit bracket the run's own set. A draining call
+/// *nested* inside another's window of the same run clears the outer run's notes, so code that
+/// runs inside an entry point must not call one. `suggest_start::sweep`, which predicts inside
+/// `fit()` (via `inits_from_nca`), therefore uses the non-draining `api::predict_diag_undrained`
 /// rather than `predict()` (#1652 review r1 #1). Writers that do not drain (e.g. the public
-/// `pk::compute_predictions_with_states`) leave their note for the next draining entrypoint,
-/// whose clear discards it.
-fn ss_nonconvergence_sink() -> &'static std::sync::Mutex<std::collections::BTreeSet<String>> {
-    static SINK: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> =
-        std::sync::OnceLock::new();
+/// `pk::compute_predictions_with_states`) leave their note for the next draining entrypoint of
+/// the same run, whose clear discards it.
+type SsSink = std::sync::Mutex<std::collections::HashMap<u64, std::collections::BTreeSet<String>>>;
+
+fn ss_nonconvergence_sink() -> &'static SsSink {
+    static SINK: std::sync::OnceLock<SsSink> = std::sync::OnceLock::new();
     SINK.get_or_init(std::sync::Mutex::default)
+}
+
+/// The sink bucket of the run the calling thread belongs to.
+fn ss_run_key() -> u64 {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    kj::run_of(kj::current_fit())
+}
+
+/// Hold the run scope of a top-level draining operation: a thread outside any fit takes a fresh
+/// run id for the operation's duration (carried by its pool tasks), a thread inside one joins it.
+/// Dropping it discards what the run left in the sink.
+pub(crate) struct SsRunScope(
+    Option<(
+        u64,
+        crate::parser::model_parser::rhs_regcode::kernel_jit::FitGuard,
+    )>,
+);
+
+pub(crate) fn run_scope() -> SsRunScope {
+    SsRunScope(crate::parser::model_parser::rhs_regcode::kernel_jit::open_run())
+}
+
+impl Drop for SsRunScope {
+    fn drop(&mut self) {
+        if let Some((id, _)) = &self.0 {
+            drop_ss_run(*id);
+        }
+    }
+}
+
+/// Forget run `run`'s bucket (its scope ended).
+pub(crate) fn drop_ss_run(run: u64) {
+    if let Ok(mut m) = ss_nonconvergence_sink().lock() {
+        m.remove(&run);
+    }
 }
 
 /// Estimate the un-taken geometric tail of a cycle-capped SS equilibration and, if it is
@@ -712,8 +854,8 @@ pub(crate) fn note_ss_nonconvergence_if_capped(
     // records — see `record_ss_nonconvergence_warning`.
     record_ss_nonconvergence_warning(warning.as_deref());
     if let Some(msg) = warning {
-        if let Ok(mut set) = ss_nonconvergence_sink().lock() {
-            set.insert(msg);
+        if let Ok(mut m) = ss_nonconvergence_sink().lock() {
+            m.entry(ss_run_key()).or_default().insert(msg);
         }
     }
 }
@@ -816,7 +958,9 @@ pub(crate) fn take_ss_nonconvergence_warnings() -> Vec<String> {
     SS_SINK_DRAINS.with(|c| c.set(c.get() + 1));
     ss_nonconvergence_sink()
         .lock()
-        .map(|mut set| std::mem::take(&mut *set).into_iter().collect())
+        .ok()
+        .and_then(|mut m| m.remove(&ss_run_key()))
+        .map(|set| set.into_iter().collect())
         .unwrap_or_default()
 }
 
@@ -825,9 +969,7 @@ pub(crate) fn take_ss_nonconvergence_warnings() -> Vec<String> {
 pub(crate) fn clear_ss_nonconvergence_warnings() {
     #[cfg(test)]
     SS_SINK_DRAINS.with(|c| c.set(c.get() + 1));
-    if let Ok(mut set) = ss_nonconvergence_sink().lock() {
-        set.clear();
-    }
+    drop_ss_run(ss_run_key());
 }
 
 #[cfg(test)]
@@ -852,6 +994,54 @@ mod ss_warn_tests {
         note_ss_nonconvergence_if_capped(true, 1.0, 2.0, 10.0);
         assert_eq!(last_ss_equilibration_warning(), None);
         assert!(!last_ss_equilibration_warned());
+    }
+
+    /// #2067: two runs open at once keep their notes apart, including a note written by a pool
+    /// task that carries the run's id. Each run clears on entry and takes on exit, and sees only
+    /// its own. Mutation: key every write and read by one constant -> both runs read both notes.
+    #[test]
+    fn concurrent_runs_keep_their_ss_notes_apart() {
+        use crate::parser::model_parser::rhs_regcode::kernel_jit::{current_fit, in_fit};
+        let gate = std::sync::Barrier::new(2);
+        let run = |mag: f64| {
+            let _run = run_scope();
+            clear_ss_nonconvergence_warnings();
+            let fit = current_fit();
+            assert_ne!(fit, 0, "a top-level run opens a scope");
+            // The write comes from another thread running the run's id, as a pool task does.
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    in_fit(fit, || {
+                        note_ss_nonconvergence_if_capped(false, 1.0, 2.0, mag)
+                    })
+                })
+                .join()
+                .unwrap();
+            });
+            gate.wait(); // both runs have written before either reads
+            (fit, take_ss_nonconvergence_warnings())
+        };
+        let ((fa, a), (fb, b)) = std::thread::scope(|s| {
+            let ha = s.spawn(|| run(10.0));
+            let hb = s.spawn(|| run(40.0));
+            (ha.join().unwrap(), hb.join().unwrap())
+        });
+        let want = |mag: f64| {
+            vec![ss_equilibration_tail_warning(false, 1.0, 2.0, mag).expect("fixture warns")]
+        };
+        assert_eq!(a, want(10.0));
+        assert_eq!(b, want(40.0));
+        // A run that ends leaves nothing behind: its bucket is gone.
+        let left = {
+            let run = run_scope();
+            let fit = current_fit();
+            note_ss_nonconvergence_if_capped(false, 1.0, 2.0, 10.0);
+            assert!(ss_nonconvergence_sink().lock().unwrap().contains_key(&fit));
+            drop(run);
+            fit
+        };
+        let m = ss_nonconvergence_sink().lock().unwrap();
+        assert!(![fa, fb, left].iter().any(|k| m.contains_key(k)));
     }
 
     /// Every clear and every take counts as a drain on the calling thread (#2071).
@@ -1031,7 +1221,13 @@ pub(crate) fn infusion_has_rate_channel(d: &DoseEvent) -> bool {
 /// the one thing the `fd_oracle` / `parity` tests (`sens/ode_adjoint_tests.rs`), which
 /// difference the production objective, cannot forgive.
 pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
-    dose.ss && dose.ii > 0.0 && lag > 0.0
+    ss_seeded_at_record_g(dose, lag)
+}
+
+/// [`ss_seeded_at_record`] for a lag of any type: a recording type (#2786) decides it
+/// through its branch API.
+pub(crate) fn ss_seeded_at_record_g<G: crate::sens::num::PkNum>(dose: &DoseEvent, lag: G) -> bool {
+    dose.ss && dose.ii > 0.0 && lag.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0)
 }
 
 /// Whether this steady-state dose's periodic state is equilibrated at its
@@ -1053,28 +1249,15 @@ pub(crate) fn ss_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
 /// (`nonmem_anchor/ss_arrival_flow_*`, ADVAN13; `ss_reset_tie_*`, ADVAN2), while the
 /// event-driven walks, which already flowed, matched.
 pub(crate) fn ss_equilibrates_at_arrival(dose: &DoseEvent, lag: f64) -> bool {
-    dose.ss && dose.ii > 0.0 && !ss_seeded_at_record(dose, lag)
+    ss_equilibrates_at_arrival_g(dose, lag)
 }
 
-/// Whether this seeded steady-state dose is the **bolus** case the dual event walk
-/// serves analytically (#1311) — the subset of [`ss_seeded_at_record`] with no
-/// previous-cycle infusion rate still running across the record.
-///
-/// Spelled once, deliberately. `sens::propagate`'s dual walk reads it twice per dose —
-/// at the `DoseRecord`, to seed the periodic state at phase [`ss_seed_phase`], and again
-/// at the `Dose`, to *suppress* the arrival-time re-equilibration that would otherwise
-/// discard what the walk just propagated. Two differently-spelled copies that drifted
-/// would make the walk either seed and then throw the seed away, or never load a state
-/// at all; neither is a compile error and both are wrong in *value*.
-///
-/// `rate <= 0.0` is the bolus half, and it nests inside the FD decline that
-/// `sens::provider::ss_lagtime_walk_unsupported` applies with
-/// [`DoseEvent::is_infusion`]: `{rate > 0} ⊆ {is_infusion}`, and a
-/// `rate <= 0 ∧ is_infusion` dose (a modeled-duration window) is declined to FD upstream,
-/// so the walk is never handed one. That containment is what makes this predicate the
-/// bolus test rather than merely a rate test — assert it, do not re-derive it.
-pub(crate) fn ss_bolus_seeded_at_record(dose: &DoseEvent, lag: f64) -> bool {
-    dose.rate <= 0.0 && ss_seeded_at_record(dose, lag)
+/// [`ss_equilibrates_at_arrival`] for a lag of any type (#2786).
+pub(crate) fn ss_equilibrates_at_arrival_g<G: crate::sens::num::PkNum>(
+    dose: &DoseEvent,
+    lag: G,
+) -> bool {
+    dose.ss && dose.ii > 0.0 && !ss_seeded_at_record_g(dose, lag)
 }
 
 /// Cycle phase the dose **record** sits at, for a steady-state dose seeded there.
@@ -1103,42 +1286,240 @@ pub(crate) fn ss_seed_phase(dose: &DoseEvent, lag: f64) -> f64 {
     (dose.ii - lag).max(0.0)
 }
 
-/// End time of the previous cycle's infusion when it is **still running at the
-/// dose record** of a seeded steady-state dose — `None` when it has already
-/// finished (the ordinary case) or the dose is not an infusion.
+/// [`ss_seed_phase`] for a lag of any type (#2786): `II − lag` where positive, else `0`
+/// (a `NaN` phase floors, as `f64::max` does).
+pub(crate) fn ss_seed_phase_g<G: crate::sens::num::PkNum>(dose: &DoseEvent, lag: G) -> G {
+    let p = G::from_f64(dose.ii) - lag;
+    if p.br_cmp_c(crate::sens::num::BranchCmp::Gt, 0.0) {
+        p
+    } else {
+        G::from_f64(0.0)
+    }
+}
+
+/// How a steady-state infusion of length `t_inf` tiles its own interval: `m` earlier pulses
+/// run through the whole cycle and the newest for `r = t_inf − m·II ∈ (0, II]`, so `m + 1`
+/// pulses infuse on `[0, r)` and `m` on `[r, II)`. `m = 0` and `r = t_inf` (bit for bit) when
+/// the pulses do not overlap (`t_inf ≤ II`). Every engine's one-cycle forcing, value and
+/// recorded, reads this split, so an overlapping `SS=1` infusion (`T_inf > II`) is one more
+/// constant rate on the cycle rather than a case of its own. Each comparison deciding `m` is a
+/// recorded branch.
+pub(crate) fn ss_overlap_split_g<G: crate::sens::num::PkNum>(t_inf: G, ii: f64) -> (usize, G) {
+    // `m = #{k ≥ 1 : t_inf > k·II}`: the residual count of `t_inf`, less its `k = 0` term.
+    let m = count_gt_multiples(t_inf, ii).saturating_sub(1);
+    (m, t_inf - G::from_f64(m as f64 * ii))
+}
+
+/// The earlier steady-state pulses of an `SS=1` infusion that are **still running** when its
+/// periodic state is installed — at the record for a seeded dose (`lag > 0`), else at the
+/// arrival — as `(first, n)`: they stop at `dose.time + first − j·II`, `j = 0 … n − 1`.
 ///
-/// The pulse before the record is at `dose.time − p` for `p = ss_seed_phase(…)`,
-/// so its infusion occupies `[dose.time − p, dose.time − p + T_inf]` and crosses
-/// the record whenever `p < T_inf`, i.e. `lag > II − T_inf`. The pre-arrival
-/// window must then carry `+rate` on `[dose.time, dose.time + (T_inf − p)]`:
-/// `ss_state_at_phase` hands back a state with the infusion mid-flight, and a
-/// walk that forgot the rate would silently resume the decay early.
-///
-/// Confirmed against NONMEM 7.6.0 (`nonmem_anchor/results/ss_lag_infusion.tab`):
-/// with `II = 12`, `T_inf = 6`, `ALAG1 = 8` the concentration *rises* from
-/// `6.5468` at the record to `6.8754` at `t = 0.5` and turns over at exactly
-/// `t = 2 = 8 − 12 + 6`.
-///
-/// Like every other infusion edge the window is `F`-reshaped (#419), so callers
-/// pass the same `f_bio` they used to build the dose's own window and the two
-/// edges cannot drift apart.
+/// The state installed is the cycle's phase `ψ` (`ss_seed_phase` when seeded, `II` — the
+/// trough before the dose's own pulse — otherwise), so pulse `j` arrived `ψ + j·II` before the
+/// record and still infuses while `ψ + j·II < T_inf`. A walk must carry `+rate` for each of them
+/// after the record: the installed state has them mid-flight. Unseeded, that is the overlapping
+/// case alone (`T_inf > II`); seeded, it is also the previous cycle crossing the record whenever
+/// `lag > II − T_inf` (#1121, confirmed against NONMEM 7.6.0 in
+/// `nonmem_anchor/results/ss_lag_infusion.tab`: `II = 12`, `T_inf = 6`, `ALAG1 = 8` rises from
+/// `6.5468` at the record to `6.8754` at `t = 0.5` and turns over at `t = 2 = 8 − 12 + 6`).
+/// `t_inf` is the dose's `F`-reshaped window (#419), the one its own window uses.
 ///
 /// # `lag ≥ II` with an infusion is ferx's answer, not NONMEM's
 ///
-/// Under the [`ss_seed_phase`] clamp this returns `dose.time + T_inf` — the
-/// previous cycle's infusion starting on the record, which is what the clamped
-/// phase means and is mass-balanced. NONMEM instead delivers `T_inf + (lag − II)`
-/// hours of drug for that geometry (measured: an `AMT = 600`, `RATE = 100`,
-/// `II = 12`, `ALAG1 = 14` dose infuses over `[0, 8]`, i.e. 800 mg), which is not
-/// a physical reading of a 600 mg dose. ferx does not reproduce it; see
+/// Under the [`ss_seed_phase`] clamp the phase is 0: the previous cycle's infusion starts on
+/// the record, which is what the clamped phase means and is mass-balanced. NONMEM instead
+/// delivers `T_inf + (lag − II)` hours of drug for that geometry (measured: an `AMT = 600`,
+/// `RATE = 100`, `II = 12`, `ALAG1 = 14` dose infuses over `[0, 8]`, i.e. 800 mg), which is
+/// not a physical reading of a 600 mg dose. ferx does not reproduce it; see
 /// `docs/model-file/lagtime.qmd`.
-pub(crate) fn ss_residual_infusion_end(dose: &DoseEvent, lag: f64, f_bio: f64) -> Option<f64> {
-    if !ss_seeded_at_record(dose, lag) || !is_real_infusion(dose) {
-        return None;
+pub(crate) fn ss_residual_infusions_g<G: crate::sens::num::PkNum>(
+    dose: &DoseEvent,
+    lag: G,
+    t_inf: G,
+) -> (G, usize) {
+    let psi = if ss_seeded_at_record_g(dose, lag) {
+        ss_seed_phase_g(dose, lag)
+    } else {
+        G::from_f64(dose.ii)
+    };
+    let first = t_inf - psi;
+    let n = if dose.ss && dose.ii > 0.0 {
+        count_gt_multiples(first, dose.ii)
+    } else {
+        0
+    };
+    (first, n)
+}
+
+/// `#{j ≥ 0 : x > j·ii}` for `ii > 0` — what `while x > n·ii { n += 1 }` counts — in O(1)
+/// (a modeled infusion rate driven toward 0 makes `x ~ 1e11` and the loop `~1e10` long). The
+/// count is estimated from the value, then pinned by the two boundary comparisons the loop
+/// made at its end (`x > (n−1)·ii`, `¬ x > n·ii`), recorded as branches like the loop's.
+/// Saturates at `usize::MAX` for an `x` no finite count reaches.
+pub(crate) fn count_gt_multiples<G: crate::sens::num::PkNum>(x: G, ii: f64) -> usize {
+    use crate::sens::num::BranchCmp::Gt;
+    debug_assert!(ii > 0.0, "count_gt_multiples needs an interval, got {ii}");
+    if !x.br_cmp_c(Gt, 0.0) {
+        return 0;
     }
-    let (_, t_inf) = dose.bioavailable_infusion(f_bio);
-    let phase = ss_seed_phase(dose, lag);
-    (phase < t_inf).then(|| dose.time + (t_inf - phase))
+    // value-read-ok: an estimate; the two comparisons recorded below pin `n`, the value is not a decision
+    let v = x.probe_value();
+    let mut n = if v.is_finite() {
+        (v / ii).ceil() as usize
+    } else {
+        usize::MAX
+    };
+    n = n.max(1);
+    // The loop's own arithmetic `n as f64 * ii`; correct the estimate by rounding.
+    if n < (1usize << 52) {
+        while n > 1 && v <= (n - 1) as f64 * ii {
+            n -= 1;
+        }
+        while v > n as f64 * ii {
+            n += 1;
+        }
+    }
+    if n >= 2 {
+        x.br_cmp_c(Gt, (n - 1) as f64 * ii);
+    }
+    x.br_cmp_c(Gt, n as f64 * ii);
+    n
+}
+
+/// The stop times `t + first − j·ii`, `j = 0 … n − 1` (descending) of the residual pulses of
+/// one dose, searched by index so a caller asks for the ones in a time range without
+/// materialising the `n` of them.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResidualEnds {
+    t: f64,
+    first: f64,
+    ii: f64,
+    n: usize,
+}
+
+impl ResidualEnds {
+    /// The ends of `n` pulses stopping at `t + first − j·ii`.
+    pub(crate) fn new(t: f64, first: f64, ii: f64, n: usize) -> Self {
+        Self { t, first, ii, n }
+    }
+    /// Pulse `j`'s stop time.
+    #[inline]
+    pub(crate) fn end(&self, j: usize) -> f64 {
+        self.t + self.first - j as f64 * self.ii
+    }
+    /// Smallest `j ≤ n` whose end satisfies `pred` (`pred` monotone: false then true).
+    fn first_where(&self, pred: impl Fn(f64) -> bool) -> usize {
+        let (mut lo, mut hi) = (0usize, self.n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if pred(self.end(mid)) {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        lo
+    }
+    /// Number of pulses still running at `lo`: those with end `≥ lo`.
+    pub(crate) fn count_ending_at_or_after(&self, lo: f64) -> usize {
+        self.first_where(|e| e < lo)
+    }
+    /// Number of pulses whose end lies after `hi` — never reached by a walk that stops at
+    /// `hi`, yet running (their rate counts) throughout it. They are the first `j`s.
+    pub(crate) fn count_ending_after(&self, hi: f64) -> usize {
+        self.first_where(|e| e <= hi)
+    }
+    /// `(j, end)` for the ends in `[lo, hi]`, descending.
+    pub(crate) fn within(&self, lo: f64, hi: f64) -> impl Iterator<Item = (usize, f64)> {
+        let me = *self;
+        (me.count_ending_after(hi)..me.count_ending_at_or_after(lo)).map(move |j| (j, me.end(j)))
+    }
+}
+
+/// The pulse indices `j0..n` of [`ss_residual_infusions_g`]'s `(first, n)` whose stop time
+/// `t + first − j·ii` is at or before `horizon` — the ones a walk ending there can reach. The
+/// split is read from the value; a recording type guards both sides of it (`end(j0−1) >
+/// horizon`, `end(j0) ≤ horizon`) so the kept set is what a replay at other parameters keeps.
+pub(crate) fn residual_end_indices_g<G: crate::sens::num::PkNum>(
+    t: f64,
+    first: G,
+    ii: f64,
+    n: usize,
+    horizon: f64,
+) -> std::ops::Range<usize> {
+    use crate::sens::num::BranchCmp::{Gt, Le};
+    // value-read-ok: an estimate of the split; the two comparisons recorded below pin it
+    let j0 = ResidualEnds::new(t, first.probe_value(), ii, n).count_ending_after(horizon);
+    let end = |j: usize| G::from_f64(t) + first - G::from_f64(j as f64 * ii);
+    if j0 > 0 {
+        end(j0 - 1).br_cmp_c(Gt, horizon);
+    }
+    if j0 < n {
+        end(j0).br_cmp_c(Le, horizon);
+    }
+    j0..n
+}
+
+/// The number of [`ss_residual_ends`]'s pulses of `dose` still running at `lo` (end `≥ lo`), the
+/// window `dur_eff` and `lo` numbers of the caller's type. The count is estimated from the
+/// values and pinned by the two comparisons either side of it, recorded as branches by a
+/// recording type (as [`residual_end_indices_g`]), so a replay at other parameters keeps the
+/// pulses it kept.
+pub(crate) fn ss_residual_count_ending_at_or_after_g<G: crate::sens::num::PkNum>(
+    dose: &DoseEvent,
+    lag: f64,
+    dur_eff: G,
+    lo: G,
+) -> usize {
+    use crate::sens::num::BranchCmp::{Ge, Lt};
+    if !is_real_infusion(dose) {
+        return 0;
+    }
+    let (first, n) = ss_residual_infusions_g(dose, G::from_f64(lag), dur_eff);
+    if n == 0 {
+        return 0;
+    }
+    // An estimate of the count; the two comparisons recorded below pin it.
+    // value-read-ok: estimate only, pinned by the recorded comparisons below
+    let (first_v, lo_v) = (first.probe_value(), lo.probe_value());
+    let j0 = ResidualEnds::new(dose.time, first_v, dose.ii, n).count_ending_at_or_after(lo_v);
+    let end = |j: usize| G::from_f64(dose.time) + first - G::from_f64(j as f64 * dose.ii);
+    if j0 > 0 {
+        end(j0 - 1).br_cmp(Ge, lo);
+    }
+    if j0 < n {
+        end(j0).br_cmp(Lt, lo);
+    }
+    j0
+}
+
+/// [`ss_residual_infusions_g`]'s stop times, for an `F`-reshaped real infusion (else none).
+pub(crate) fn ss_residual_ends(dose: &DoseEvent, lag: f64, f_bio: f64) -> ResidualEnds {
+    let (first, n) = if is_real_infusion(dose) {
+        ss_residual_infusions_g(dose, lag, dose.bioavailable_infusion(f_bio).1)
+    } else {
+        (0.0, 0)
+    };
+    ResidualEnds {
+        t: dose.time,
+        first,
+        ii: dose.ii,
+        n,
+    }
+}
+
+/// [`ss_residual_ends`]'s stop times lying in `[lo, hi]` — the span a caller integrates over;
+/// an end outside it is never reached (the pulse still counts in the rate, through `n`).
+pub(crate) fn ss_residual_infusion_ends(
+    dose: &DoseEvent,
+    lag: f64,
+    f_bio: f64,
+    lo: f64,
+    hi: f64,
+) -> impl Iterator<Item = f64> {
+    ss_residual_ends(dose, lag, f_bio)
+        .within(lo, hi)
+        .map(|(_, e)| e)
 }
 
 /// Whether flowing a seeded steady-state dose from its record to its lagged
@@ -1231,18 +1612,48 @@ const TAD_EPS: f64 = 1e-12;
 /// arrival, so there is no shorter elapsed time to report.
 #[inline]
 pub(crate) fn tad_referent(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
-    let arrival = dose.time + lag;
-    if arrival <= t + TAD_EPS {
+    tad_referent_g(dose, lag, t)
+}
+
+/// [`tad_referent`] for a lag and a time of any type (#2786): **the** implementation, which the
+/// `f64` form above is the plain instance of, so the dual walk's `TAD` anchor (a recording or a
+/// jet carrying `∂TAD/∂lag = −1`) cannot drift from the value's. A recording type decides every
+/// comparison through its branch API and the wrap through [`wrap_into_period_g`].
+#[inline]
+pub(crate) fn tad_referent_g<G: crate::sens::num::PkNum>(
+    dose: &DoseEvent,
+    lag: G,
+    t: G,
+) -> Option<G> {
+    use crate::sens::num::BranchCmp::Le;
+    let arrival = G::from_f64(dose.time) + lag;
+    if arrival.br_cmp(Le, t + G::from_f64(TAD_EPS)) {
         if dose.ss && dose.ii > 0.0 {
-            let elapsed = t - arrival;
-            return Some(t - elapsed.rem_euclid(dose.ii));
+            return Some(t - wrap_into_period_g(t - arrival, dose.ii));
         }
         return Some(arrival);
     }
-    if ss_seeded_at_record(dose, lag) && dose.time <= t + TAD_EPS {
-        return Some(dose.time - ss_seed_phase(dose, lag));
+    if ss_seeded_at_record_g(dose, lag)
+        && G::from_f64(dose.time).br_cmp(Le, t + G::from_f64(TAD_EPS))
+    {
+        return Some(G::from_f64(dose.time) - ss_seed_phase_g(dose, lag));
     }
     None
+}
+
+/// `x.rem_euclid(ii)` (`ii > 0`) for a value of any type: the value `x − m·ii` with `m =
+/// ⌊x / ii⌋`, `∂/∂x = 1` and no derivative in `m` (a whole number the value fixes). A plain
+/// number takes the remainder `f64::rem_euclid` gives, bit for bit (`x − x.value_only()` is the
+/// zero that keeps `x`'s jet, so the value is the remainder itself); a recording type counts
+/// the periods through [`PkNum::br_floor_div`], whose two comparisons it guards.
+///
+/// [`PkNum::br_floor_div`]: crate::sens::num::PkNum::br_floor_div
+#[inline]
+pub(crate) fn wrap_into_period_g<G: crate::sens::num::PkNum>(x: G, ii: f64) -> G {
+    match x.nonrec_val() {
+        Some(v) => (x - x.value_only()) + G::from_f64(v.rem_euclid(ii)),
+        None => x - G::from_f64(x.br_floor_div(ii) * ii),
+    }
 }
 
 /// `TAD` at `t` — [`tad_referent`] folded over a dose list, `NaN` when no dose has a referent.
@@ -1310,9 +1721,18 @@ pub(crate) fn tad_at(doses: &[DoseEvent], dose_lagtimes: &[f64], t: f64) -> f64 
 /// window's membership (#1586). O(n), no allocation.
 #[inline]
 pub(crate) fn ss_reset_cutoff(doses: &[DoseEvent], t: f64) -> Option<usize> {
+    ss_reset_cutoff_g(doses, t)
+}
+
+/// [`ss_reset_cutoff`] at a time of any type: a recording type (#2786) decides `record ≤ t`
+/// through its branch API.
+pub(crate) fn ss_reset_cutoff_g<G: crate::sens::num::PkNum>(
+    doses: &[DoseEvent],
+    t: G,
+) -> Option<usize> {
     let mut best: Option<usize> = None;
     for (i, d) in doses.iter().enumerate() {
-        if !(d.ss && d.ii > 0.0) || d.time > t {
+        if !(d.ss && d.ii > 0.0) || G::from_f64(d.time).br_cmp(crate::sens::num::BranchCmp::Gt, t) {
             continue;
         }
         best = match best {
@@ -1381,6 +1801,10 @@ pub(crate) struct DoseIndex {
     /// end and seeded-`SS=1` residual end of each `rate > 0 && duration > 0` dose — sorted
     /// ascending, `NaN` dropped (it never passes the open-interval test).
     breaks: Vec<f64>,
+    /// The residual pulses' stop times of each seeded `SS=1` infusion with any (#1121, and every
+    /// overlapping pulse when `T_inf > II`), as ranges searched by index: materialising them
+    /// would be one entry per pulse, and a modeled rate driven toward 0 makes that `~1e10`.
+    residuals: Vec<(usize, ResidualEnds)>,
     /// `(value, k)` of every dose's arrival `t_k + lag_k`, and of every infusing dose's
     /// window end `t_k + lag_k + D_k`, sorted by value; non-finite values dropped (they
     /// never lie within a finite tolerance of anything).
@@ -1395,6 +1819,7 @@ impl DoseIndex {
         let mut ss_records = Vec::new();
         let mut infusing = Vec::new();
         let mut breaks = Vec::new();
+        let mut residuals = Vec::new();
         let mut moving_points = Vec::with_capacity(doses.len());
         for (k, d) in doses.iter().enumerate() {
             if d.ss && d.ii > 0.0 {
@@ -1417,10 +1842,10 @@ impl DoseIndex {
             if d.rate > 0.0 && d.duration > 0.0 {
                 let end = d.time + lag + d.duration;
                 breaks.extend([t_start, end].into_iter().filter(|b| !b.is_nan()));
-                if let Some(residual_end) = ss_residual_infusion_end(d, lag, 1.0) {
-                    if !residual_end.is_nan() {
-                        breaks.push(residual_end);
-                    }
+                // Every earlier pulse still infusing at the record, not only the last.
+                let ends = ss_residual_ends(d, lag, 1.0);
+                if ends.n > 0 {
+                    residuals.push((k, ends));
                 }
             }
         }
@@ -1437,6 +1862,7 @@ impl DoseIndex {
             ss_scan_fallback,
             infusing,
             breaks,
+            residuals,
             moving_points,
         }
     }
@@ -1467,10 +1893,24 @@ impl DoseIndex {
     /// The infusion breaks `b` with `lo < b < hi`, ascending — the candidates
     /// `compute_propagation_bounds` pushes for an interval, as a slice.
     #[inline]
-    pub(crate) fn breaks_within(&self, lo: f64, hi: f64) -> &[f64] {
+    pub(crate) fn breaks_within(&self, lo: f64, hi: f64) -> std::borrow::Cow<'_, [f64]> {
         let from = self.breaks.partition_point(|&b| !(b > lo));
         let len = self.breaks[from..].partition_point(|&b| b < hi);
-        &self.breaks[from..from + len]
+        let own = &self.breaks[from..from + len];
+        if self.residuals.is_empty() {
+            // The per-interval hot path: no residual pulses, so no allocation.
+            return std::borrow::Cow::Borrowed(own);
+        }
+        let mut out = own.to_vec();
+        for (_, ends) in &self.residuals {
+            out.extend(
+                ends.within(lo, hi)
+                    .map(|(_, e)| e)
+                    .filter(|&e| e > lo && e < hi),
+            );
+        }
+        out.sort_by(|a, b| a.total_cmp(b));
+        std::borrow::Cow::Owned(out)
     }
 
     /// Every dose with an arrival or window end within a margin of `[lo, hi]`, ascending
@@ -1486,6 +1926,13 @@ impl DoseIndex {
             .take_while(|&&(v, _)| v <= hi)
             .map(|&(_, k)| k)
             .collect();
+        // A dose whose earlier pulse stops here is a candidate too (the residual ends are
+        // not materialised in `moving_points`).
+        for &(k, ends) in &self.residuals {
+            if ends.within(lo, hi).next().is_some() {
+                ks.push(k);
+            }
+        }
         ks.sort_unstable();
         ks.dedup();
         ks
@@ -1500,7 +1947,7 @@ impl DoseIndex {
 /// residual window.
 #[cfg(test)]
 mod dose_index_tests {
-    use super::{ss_reset_cutoff, ss_residual_infusion_end, DoseIndex};
+    use super::{ss_reset_cutoff, ss_residual_infusion_ends, DoseIndex};
     use crate::types::DoseEvent;
 
     /// A deterministic xorshift, so a failure reproduces.
@@ -1632,8 +2079,8 @@ mod dose_index_tests {
                 let lag = lags.get(k).copied().unwrap_or(0.0);
                 let start = d.time + lag;
                 let end = d.time + lag + d.duration;
-                let residual = ss_residual_infusion_end(d, lag, 1.0);
-                for b in [Some(start), Some(end), residual].into_iter().flatten() {
+                let residual = ss_residual_infusion_ends(d, lag, 1.0, lo, hi);
+                for b in [start, end].into_iter().chain(residual) {
                     if b > lo && b < hi {
                         out.push(b);
                     }
@@ -1642,6 +2089,26 @@ mod dose_index_tests {
         }
         out.sort_by(|a, b| a.total_cmp(b));
         out
+    }
+
+    /// With no residual pulses `breaks_within` hands back a slice of the index and allocates
+    /// nothing (the per-interval hot path); with one it owns the merged, sorted list. Dies when
+    /// the borrowed arm goes back to a `Vec`, or the residual arm stops merging.
+    #[test]
+    fn breaks_within_borrows_unless_a_residual_pulse_is_live() {
+        use std::borrow::Cow;
+        let plain = vec![DoseEvent::new(0.0, 100.0, 1, 20.0, false, 0.0)];
+        let index = DoseIndex::new(&plain, &[]);
+        let got = index.breaks_within(0.5, 9.0);
+        assert!(matches!(got, Cow::Borrowed(_)), "no residuals: borrowed");
+        assert_eq!(&*got, &[5.0], "the window end only (onset 0 is outside)");
+        // An SS infusion longer than its interval: earlier pulses still run at the record.
+        let ss = vec![DoseEvent::new(0.0, 100.0, 1, 20.0, true, 4.0)];
+        let index = DoseIndex::new(&ss, &[]);
+        let got = index.breaks_within(-1.0, 9.0);
+        assert!(matches!(got, Cow::Owned(_)), "residuals: owned");
+        assert!(got.windows(2).all(|w| w[0] <= w[1]), "sorted: {got:?}");
+        assert!(got.len() > 2, "the residual ends are merged: {got:?}");
     }
 
     #[test]
@@ -2359,5 +2826,303 @@ mod evid_reset_tests {
             "recorded at the reset (EVID=4)"
         );
         assert!(evid_reset_live(10.001, 10.0), "recorded after the reset");
+    }
+}
+
+#[cfg(test)]
+mod residual_pulse_count_tests {
+    use super::*;
+
+    /// The loop `count_gt_multiples` replaced, as the reference.
+    fn loop_count(x: f64, ii: f64) -> usize {
+        let mut n = 0usize;
+        while x > n as f64 * ii {
+            n += 1;
+        }
+        n
+    }
+
+    /// The count is the loop's, for every `x` the loop could reach: a sweep through each
+    /// boundary `k·II` (exactly on it, one ulp either side) and off it, at several `II`.
+    #[test]
+    fn count_matches_the_loop_through_every_boundary() {
+        for ii in [12.0, 7.3, 0.1, 1.0 / 3.0] {
+            for k in 1..60usize {
+                let b = k as f64 * ii;
+                for x in [
+                    b,
+                    f64::from_bits(b.to_bits() + 1),
+                    f64::from_bits(b.to_bits() - 1),
+                    b + 0.5 * ii,
+                    b - 0.5 * ii,
+                ] {
+                    assert_eq!(
+                        count_gt_multiples(x, ii),
+                        loop_count(x, ii),
+                        "x = {x:e}, II = {ii}"
+                    );
+                }
+            }
+        }
+        assert_eq!(count_gt_multiples(-3.0, 12.0), 0);
+        assert_eq!(count_gt_multiples(0.0, 12.0), 0);
+    }
+
+    /// `T_inf ∈ {6, 30, 1e6, 1e11, 1e300}` at `II = 12`. Integer `T_inf` against exact integer
+    /// arithmetic (`n = ⌈x/II⌉` in `u128`); `30` and `6` against the loop; `1e300` saturates —
+    /// no finite count reaches it — instead of looping or allocating.
+    #[test]
+    fn count_for_large_windows_is_exact_integer_arithmetic() {
+        for x in [6.0f64, 30.0, 1e6, 1e11] {
+            let exact = ((x as u128) + 11) / 12;
+            assert_eq!(count_gt_multiples(x, 12.0) as u128, exact, "x = {x:e}");
+        }
+        assert_eq!(count_gt_multiples(6.0, 12.0), loop_count(6.0, 12.0));
+        assert_eq!(count_gt_multiples(30.0, 12.0), loop_count(30.0, 12.0));
+        assert_eq!(count_gt_multiples(1e6, 12.0), loop_count(1e6, 12.0));
+        assert_eq!(count_gt_multiples(1e300, 12.0), usize::MAX);
+        // And through the dose entry point: `RATE = 1e-9` makes `T_inf = 1e11`, `n ~ 8.3e9`.
+        let d = DoseEvent::new(0.0, 100.0, 1, 1e-9, true, 12.0);
+        let (first, n) = ss_residual_infusions_g(&d, 0.0, d.duration);
+        assert_eq!(first, d.duration - 12.0);
+        assert_eq!(n as u128, (((d.duration - 12.0) as u128) + 11) / 12);
+    }
+
+    /// The ends listed for a time range are exactly the loop's materialised ends that lie in
+    /// it, in the same (descending) order, and the running count is the loop's.
+    #[test]
+    fn ends_in_a_range_are_the_loops_ends_in_that_range() {
+        let ends_of = |d: &DoseEvent, lag: f64| -> Vec<f64> {
+            let (first, _) = ss_residual_infusions_g(d, lag, d.duration);
+            let n = loop_count(first, d.ii);
+            (0..n).map(|j| d.time + first - j as f64 * d.ii).collect()
+        };
+        // T_inf = 20 over II = 8, unseeded and seeded (lag 3); and T_inf = 250 over II = 12.
+        for (d, lag) in [
+            (DoseEvent::new(5.0, 1000.0, 1, 50.0, true, 8.0), 0.0),
+            (DoseEvent::new(5.0, 1000.0, 1, 50.0, true, 8.0), 3.0),
+            (DoseEvent::new(0.0, 1000.0, 1, 4.0, true, 12.0), 0.0),
+        ] {
+            let all = ends_of(&d, lag);
+            assert!(!all.is_empty());
+            for (lo, hi) in [
+                (f64::NEG_INFINITY, f64::INFINITY),
+                (0.0, 40.0),
+                (all[all.len() - 1], all[0]),
+                (all[all.len() - 1] + 1e-9, all[0] - 1e-9),
+                (30.0, 20.0),
+                (1e9, 2e9),
+                (-5.0, -1.0),
+            ] {
+                let want: Vec<f64> = all
+                    .iter()
+                    .copied()
+                    .filter(|&e| e >= lo && e <= hi)
+                    .collect();
+                let got: Vec<f64> = ss_residual_infusion_ends(&d, lag, 1.0, lo, hi).collect();
+                assert_eq!(got, want, "dose {d:?} lag {lag} range [{lo}, {hi}]");
+            }
+            for lo in [f64::NEG_INFINITY, 0.0, 12.0, 25.5, all[0], all[0] + 1.0] {
+                let want = all.iter().filter(|&&e| e >= lo).count();
+                assert_eq!(
+                    ss_residual_ends(&d, lag, 1.0).count_ending_at_or_after(lo),
+                    want,
+                    "count at {lo}"
+                );
+            }
+        }
+    }
+
+    /// The case the cap rejected: `n ~ 8e9` pulses, every one of them running, and none
+    /// materialised — the in-horizon list is empty, the far count is exact.
+    #[test]
+    fn astronomical_pulse_count_is_not_materialised() {
+        let d = DoseEvent::new(0.0, 100.0, 1, 1e-9, true, 12.0);
+        let re = ss_residual_ends(&d, 0.0, 1.0);
+        let (_, n) = ss_residual_infusions_g(&d, 0.0, d.duration);
+        assert!(n > 8_000_000_000);
+        // `first ≡ 4 (mod 12)`: the ends in `(0, 100]` are 4, 16, …, 100 — the last 9 of the
+        // `n`. Every other pulse ends beyond 100: counted, not listed.
+        let near: Vec<f64> = ss_residual_infusion_ends(&d, 0.0, 1.0, 0.0, 100.0).collect();
+        assert_eq!(near.len(), 9);
+        assert_eq!((near[0], near[8]), (100.0, 4.0));
+        assert_eq!(re.count_ending_after(100.0), n - 9);
+        assert_eq!(re.count_ending_at_or_after(0.0), n);
+        assert_eq!(re.count_ending_at_or_after(100.0), n - 8);
+    }
+}
+
+#[cfg(test)]
+mod zero_order_binding_tests {
+    //! A fit lowers an `SS=1` dose into a `zero_order()` window once, where it binds the data,
+    //! not by a clone of the subject in every walk (#2786 review).
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    const DATA: &str = "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT,II,SS
+1,0,1,1,0,4321.5,0,1,12,1
+1,2,0,0,80.0,0,0,1,0,0
+1,6,0,0,55.0,0,0,1,0,0
+1,10,0,0,40.0,0,0,1,0,0
+2,0,1,1,0,4321.5,0,1,12,1
+2,2,0,0,90.0,0,0,1,0,0
+2,6,0,0,60.0,0,0,1,0,0
+2,10,0,0,45.0,0,0,1,0,0
+";
+
+    fn fixture(amt: &str) -> (crate::types::CompiledModel, crate::types::Population) {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(
+            "examples/zero_order_absorption.ferx",
+        ))
+        .expect("model");
+        let dir = tempfile::tempdir().expect("tmp");
+        let csv = dir.path().join("d.csv");
+        std::fs::write(&csv, DATA.replace("4321.5", amt)).expect("write");
+        let pop = crate::read_nonmem_csv(&csv, None, None).expect("data");
+        (model, pop)
+    }
+
+    /// Mutation: return `Cow::Borrowed` from `lower_population_zero_order_ss` -> the bound
+    /// population is not lowered and every walk clones its subject.
+    #[test]
+    fn a_bound_population_is_lowered_once_and_its_walks_borrow() {
+        let (model, pop) = fixture("4321.25");
+        let map = model.active_dose_attr_map();
+        assert!(
+            matches!(lower_zero_order_ss(&pop.subjects[0], map), Cow::Owned(_)),
+            "fixture: the data as read is rewritten by every walk"
+        );
+        let bound = lower_population_zero_order_ss(&pop, map);
+        assert!(matches!(bound, Cow::Owned(_)));
+        for s in &bound.subjects {
+            assert!(matches!(lower_zero_order_ss(s, map), Cow::Borrowed(_)));
+            assert!(is_lowered_zero_order_ss(map, &s.doses[0]));
+        }
+        assert!(matches!(
+            lower_population_zero_order_ss(&bound, map),
+            Cow::Borrowed(_)
+        ));
+        // The data as read is untouched: the lowering is the fit's own.
+        assert!(!pop.subjects[0].doses[0].is_infusion());
+    }
+
+    /// A whole fit lowers each affected subject exactly once. Mutation: drop the binding in
+    /// `fit_inner` -> every walk lowers (thousands of lowerings, not 2).
+    #[test]
+    fn a_fit_lowers_each_subject_once() {
+        let (model, pop) = fixture("4321.5");
+        let o = crate::types::FitOptions {
+            method: crate::types::EstimationMethod::FoceI,
+            outer_maxiter: 2,
+            threads: Some(1),
+            verbose: false,
+            ..crate::types::FitOptions::default()
+        };
+        let before = MARKER_LOWERINGS.load(Relaxed);
+        crate::api::fit(&model, &pop, &model.default_params, &o).expect("fit");
+        let n = MARKER_LOWERINGS.load(Relaxed) - before;
+        assert_eq!(n, pop.subjects.len(), "lowerings per fit");
+    }
+}
+
+#[cfg(test)]
+mod tad_referent_g_tests {
+    use super::{tad_referent, tad_referent_g, wrap_into_period_g, TAD_EPS};
+    use crate::sens::dual2::Dual2;
+    use crate::types::DoseEvent;
+
+    /// The rule as `tad_referent` was written before it became the `f64` instance of
+    /// [`tad_referent_g`] -- the reference the instance must still equal bit for bit.
+    fn reference(dose: &DoseEvent, lag: f64, t: f64) -> Option<f64> {
+        let arrival = dose.time + lag;
+        if arrival <= t + TAD_EPS {
+            if dose.ss && dose.ii > 0.0 {
+                let elapsed = t - arrival;
+                return Some(t - elapsed.rem_euclid(dose.ii));
+            }
+            return Some(arrival);
+        }
+        if super::ss_seeded_at_record(dose, lag) && dose.time <= t + TAD_EPS {
+            return Some(dose.time - super::ss_seed_phase(dose, lag));
+        }
+        None
+    }
+
+    /// Both ends of the walk's anchor fold: the `f64` instance is the old rule bit for bit (on
+    /// dyadic and non-dyadic `II`, before the record, in the seeded window, past the arrival
+    /// and at later cycles, with `lag` below, at and above `II`), and over `Dual2` the value is
+    /// the same number with the lag's jet: `∂referent/∂lag = +1` where the referent follows the
+    /// arrival or the seed's previous pulse (`d.time - (II - lag)`), `0` where the phase is
+    /// clamped (`lag >= II`), and `∂/∂t = 0` for a wrapped steady-state referent. The derivative
+    /// is checked against a central difference of the `f64` rule, away from its kinks.
+    /// Mutations: no wrap at later cycles (`elapsed` for `wrap_into_period_g`) -> the bit
+    /// comparison and the later-cycle `∂/∂t` fail; `Lt` for the clamp in `ss_seed_phase_g` ->
+    /// the `lag >= II` jet row fails.
+    #[test]
+    fn the_generic_referent_is_the_f64_rule_and_carries_the_lag_jet() {
+        for ii in [12.0, 7.3, 0.1 + 0.2] {
+            for ss in [true, false] {
+                for lag in [0.0, 0.4, 3.0, 11.0, 12.5, 15.0] {
+                    let d = DoseEvent::new(5.0, 100.0, 1, 0.0, ss, if ss { ii } else { 0.0 });
+                    for k in 0..60 {
+                        let t = 4.7 + 0.9 * k as f64 + 0.013 * (k % 7) as f64;
+                        let old = reference(&d, lag, t);
+                        assert_eq!(
+                            tad_referent(&d, lag, t).map(f64::to_bits),
+                            old.map(f64::to_bits),
+                            "f64 instance: ii {ii} ss {ss} lag {lag} t {t}"
+                        );
+                        let got =
+                            tad_referent_g(&d, Dual2::<2>::var(lag, 0), Dual2::<2>::var(t, 1));
+                        assert_eq!(
+                            got.map(|g| g.value.to_bits()),
+                            old.map(f64::to_bits),
+                            "Dual2 value: ii {ii} ss {ss} lag {lag} t {t}"
+                        );
+                        let Some(g) = got else { continue };
+                        // The finite differences must not straddle a kink of the rule.
+                        let h = 1e-6;
+                        let near = |a: f64, b: f64| (a - b).abs() < 10.0 * h;
+                        let arrival = d.time + lag;
+                        let kink = near(t, arrival)
+                            || near(t, d.time)
+                            || (ss
+                                && ((t - arrival) / ii - ((t - arrival) / ii).round()).abs()
+                                    < 1e-5)
+                            || near(lag, ii);
+                        if kink {
+                            continue;
+                        }
+                        let fd_lag = (reference(&d, lag + h, t).unwrap()
+                            - reference(&d, lag - h, t).unwrap())
+                            / (2.0 * h);
+                        let fd_t = (reference(&d, lag, t + h).unwrap()
+                            - reference(&d, lag, t - h).unwrap())
+                            / (2.0 * h);
+                        assert!(
+                            (g.grad[0] - fd_lag).abs() < 1e-6 && (g.grad[1] - fd_t).abs() < 1e-6,
+                            "jet: ii {ii} ss {ss} lag {lag} t {t}: {:?} vs ({fd_lag}, {fd_t})",
+                            g.grad
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The wrap alone: a plain number takes `f64::rem_euclid`'s remainder bit for bit, and a
+    /// negative or sub-period value wraps the same way.
+    #[test]
+    fn the_period_wrap_is_rem_euclid_bit_for_bit() {
+        for ii in [12.0, 7.3, 0.3] {
+            for x in [-30.5, -0.2, 0.0, 0.2, 7.3, 11.99, 12.0, 25.7, 479.123] {
+                assert_eq!(
+                    wrap_into_period_g(x, ii).to_bits(),
+                    f64::rem_euclid(x, ii).to_bits(),
+                    "x {x} ii {ii}"
+                );
+            }
+        }
     }
 }

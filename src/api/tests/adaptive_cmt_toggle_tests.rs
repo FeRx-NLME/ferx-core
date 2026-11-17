@@ -420,12 +420,12 @@ fn adaptive_cmt_toggle_under_a_time_varying_covariate() {
             .map(|&(t, e, c, cr)| (t, e, 0.0, c, cr))
             .collect();
         // A dose row is a record, and the segment ending at it runs under its row (#1073).
-        // The adaptive run has no row there, so its segment runs under the next record's:
-        // give each dose row that record's `CRCL` (100 at 0, 40 at 6) so both segment alike.
+        // In the adaptive run the decision is that record (#2895) and carries the LOCF row:
+        // give each dose row that `CRCL` (the baseline 100 at 0, the row at 4's 60 at 6).
         all.extend(
             doses
                 .iter()
-                .map(|&(t, a)| (t, 1, a, 1, if t < 1.0 { 100.0 } else { 40.0 })),
+                .map(|&(t, a)| (t, 1, a, 1, if t < 1.0 { 100.0 } else { 60.0 })),
         );
         all.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut s = String::from("ID,TIME,DV,EVID,AMT,CMT,MDV,CRCL\n");

@@ -8,9 +8,12 @@
 //! condition gets an analytic gradient of exactly zero, so the fit never moves it.
 //!
 //! This module reports, for each condition, the individual parameters that reach it and whether
-//! it also reads something that varies during the integration (a state or a clock). The parser
-//! then decides, against `[individual_parameters]`, which conditions depend on an estimated
-//! parameter; `OdeRhsProgram::moving_switch` carries that verdict to the scope gates.
+//! it also reads something that varies during the integration (a state or a clock). Each
+//! comparison that does both is a **moving switch**: the parser builds a second program from
+//! the equations, [`instrument`]ed so that it also returns the switch function `g = lhs − rhs`
+//! of every such comparison and can force either of its arms, and the integrator locates where
+//! `g` changes sign and applies the sensitivity jump there (`ode::solver`'s event location, the
+//! recorded jump in `kernel_jit_loop`).
 //!
 //! A parameter reaches a condition directly, through an intermediate (`L = 2*LAGT` then
 //! `if (tau > L)`), or through a state: with `d/dt(tau) = RATE`, `if (tau > 2)` switches at
@@ -53,6 +56,30 @@ pub(super) struct ConditionReads {
     /// Whether it also reads a state or clock. Without one, the condition is decided by the
     /// parameters alone unless a parameter itself reads `TIME`, which only the caller knows.
     pub(super) moves: bool,
+    /// Its moving switches: each `<`/`<=`/`>`/`>=` comparison in it that a parameter reaches
+    /// and that reads a state or clock, by [`leaf_key`].
+    pub(super) leaves: Vec<String>,
+}
+
+/// A comparison's identity across the two parses of one `[odes]` block.
+fn leaf_key(l: &Expression, op: CmpOp, r: &Expression) -> String {
+    format!("{l:?} {op:?} {r:?}")
+}
+
+/// Every `<`/`<=`/`>`/`>=` comparison in `c`. `==` and `!=` hold on a set no trajectory
+/// crosses, so they have no switching time.
+fn ordered_leaves<'c>(c: &'c Condition, out: &mut Vec<(&'c Expression, CmpOp, &'c Expression)>) {
+    match c {
+        Condition::Compare(l, op @ (CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge), r) => {
+            out.push((l, *op, r))
+        }
+        Condition::And(a, b) | Condition::Or(a, b) => {
+            ordered_leaves(a, out);
+            ordered_leaves(b, out);
+        }
+        Condition::Not(a) => ordered_leaves(a, out),
+        Condition::Compare(..) | Condition::Present(_) => {}
+    }
 }
 
 /// The names a condition can read, and what reaches the states from outside the equations.
@@ -78,6 +105,7 @@ struct Walker<'a> {
     scope: Scope,
     /// The parameters reaching each state; seeded, then grown from the equations.
     state_reads: Scope,
+    /// Each distinct report.
     found: Vec<ConditionReads>,
 }
 
@@ -124,31 +152,56 @@ impl Walker<'_> {
         out
     }
 
-    fn record(&mut self, r: &Reads) {
+    /// Record condition `c`, which reads `r`, with its moving switches.
+    fn record(&mut self, c: &Condition, r: &Reads) {
         if r.params.is_empty() {
             return;
         }
-        let c = ConditionReads {
-            params: r.params.iter().cloned().collect(),
-            moves: r.moves,
+        let mut cmp = Vec::new();
+        ordered_leaves(c, &mut cmp);
+        let leaves: Vec<String> = cmp
+            .into_iter()
+            .filter_map(|(l, op, rr)| {
+                let mut x = self.expr_reads(l);
+                x.merge(&self.expr_reads(rr));
+                (x.moves && !x.params.is_empty()).then(|| leaf_key(l, op, rr))
+            })
+            .collect();
+        let params: Vec<String> = r.params.iter().cloned().collect();
+        let i = match self
+            .found
+            .iter()
+            .position(|f| f.params == params && f.moves == r.moves)
+        {
+            Some(i) => i,
+            None => {
+                self.found.push(ConditionReads {
+                    params,
+                    moves: r.moves,
+                    leaves: Vec::new(),
+                });
+                self.found.len() - 1
+            }
         };
-        if !self.found.contains(&c) {
-            self.found.push(c);
+        for k in leaves {
+            if !self.found[i].leaves.contains(&k) {
+                self.found[i].leaves.push(k);
+            }
         }
     }
 
     /// Record every inline conditional inside `e`.
     fn inline_conditions(&mut self, e: &Expression) {
-        let mut conds: Vec<Reads> = Vec::new();
+        let mut conds: Vec<(Condition, Reads)> = Vec::new();
         super::visit_expr_nodes(e, &mut |n| {
             if let Expression::Conditional(c, t, f) = n {
                 if !is_continuous_select(c, t, f) && !arms_agree_on_switch(c, t, f) {
-                    conds.push(self.cond_reads(c));
+                    conds.push(((**c).clone(), self.cond_reads(c)));
                 }
             }
         });
-        for c in &conds {
-            self.record(c);
+        for (c, r) in conds {
+            self.record(&c, &r);
         }
     }
 
@@ -181,7 +234,7 @@ impl Walker<'_> {
                     let mut arm_ctx = ctx.clone();
                     for (cond, body) in branches {
                         let r = self.cond_reads(cond);
-                        self.record(&r);
+                        self.record(cond, &r);
                         arm_ctx.merge(&r);
                         self.stmts(body, &arm_ctx);
                     }
@@ -423,6 +476,92 @@ pub(super) fn conditions_reading_params(
         if (&w.scope, &w.state_reads) == (&before.0, &before.1) {
             return w.found;
         }
+    }
+}
+
+/// The moving switches of `reads`, each once, in a fixed order: switch `k` is the `k`-th.
+pub(super) fn switch_leaves(reads: &[ConditionReads]) -> Vec<String> {
+    let set: BTreeSet<&String> = reads.iter().flat_map(|c| &c.leaves).collect();
+    set.into_iter().cloned().collect()
+}
+
+/// The name of the hidden state that carries switch `k`'s function out of the program (its
+/// `d/dt`) and its forcing in (its value), in the program [`instrument`] builds.
+pub(super) fn switch_state(k: usize) -> String {
+    format!("__sw_{k}")
+}
+
+/// Rewrite the **unresolved** `[odes]` program `stmts` for the switch program: every
+/// comparison `l ? r` named in `leaves` (switch `k`) becomes `(l − r) + s_k ? 0` over the
+/// hidden state `s_k` ([`switch_state`]), and `d/dt(s_k) = l − r` is evaluated before the
+/// statement that holds it. With `s_k = 0` the program takes the arms the model takes, since
+/// `l ? r` and `l − r ? 0` agree for every finite pair; `s_k = ±B` with `B` beyond any `g`
+/// forces the arm of `g > 0` or of `g < 0`, which is how the jump at a switch reads both
+/// one-sided limits of the field at one state.
+pub(super) fn instrument(stmts: &mut Vec<Statement>, leaves: &[String]) {
+    fn cond(c: &mut Condition, leaves: &[String], g: &mut Vec<(usize, Expression)>) {
+        match c {
+            Condition::Compare(l, op, r) => {
+                let key = leaf_key(l, *op, r);
+                if let Some(k) = leaves.iter().position(|x| *x == key) {
+                    let diff =
+                        Expression::BinOp(Box::new(l.clone()), BinOp::Sub, Box::new(r.clone()));
+                    if !g.iter().any(|(j, _)| *j == k) {
+                        g.push((k, diff.clone()));
+                    }
+                    *l = Expression::BinOp(
+                        Box::new(diff),
+                        BinOp::Add,
+                        Box::new(Expression::Variable(switch_state(k))),
+                    );
+                    *r = Expression::Literal(0.0);
+                }
+            }
+            Condition::And(a, b) | Condition::Or(a, b) => {
+                cond(a, leaves, g);
+                cond(b, leaves, g);
+            }
+            Condition::Not(a) => cond(a, leaves, g),
+            Condition::Present(_) => {}
+        }
+    }
+    fn expr(e: &mut Expression, leaves: &[String], g: &mut Vec<(usize, Expression)>) {
+        super::visit_expr_nodes_mut(e, &mut |n| {
+            if let Expression::Conditional(c, _, _) = n {
+                cond(c, leaves, g);
+            }
+        });
+    }
+    // The switches whose `d/dt` this scope already holds: one per scope.
+    let mut done: Vec<usize> = Vec::new();
+    for mut s in std::mem::take(stmts) {
+        let mut g = Vec::new();
+        match &mut s {
+            Statement::Assign(_, e) | Statement::DiffEq(_, e) => expr(e, leaves, &mut g),
+            Statement::If {
+                branches,
+                else_body,
+            } => {
+                for (c, body) in branches.iter_mut() {
+                    cond(c, leaves, &mut g);
+                    instrument(body, leaves);
+                }
+                if let Some(body) = else_body {
+                    instrument(body, leaves);
+                }
+            }
+            Statement::AssignIdx(..)
+            | Statement::DiffEqIdx(..)
+            | Statement::AssignBc(..)
+            | Statement::DiffEqBc(..) => {}
+        }
+        for (k, e) in g {
+            if !done.contains(&k) {
+                done.push(k);
+                stmts.push(Statement::DiffEq(switch_state(k), e));
+            }
+        }
+        stmts.push(s);
     }
 }
 

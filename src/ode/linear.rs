@@ -24,13 +24,14 @@
 //! ill-conditioned there. Padé never diagonalizes, so a repeated eigenvalue is a non-event.
 //!
 //! **One implementation for the value and the gradient.** Both functions are generic over
-//! [`PkNum`]: at `T = f64` they are the prediction, at `T = Dual1`/`Dual2` the exact `∂/∂(θ,η)`
+//! [`PkNum`]: at `T = f64` they are the prediction, at `T = Dual2`/`Dual2` the exact `∂/∂(θ,η)`
 //! and its second order, by the same `*_g<T: PkNum>` rule the closed forms follow. Every
 //! branch — the squaring count, LU pivoting, the self-checks below — reads [`PkNum::val`]
 //! only, so the dual run differentiates the very computation the `f64` run reports.
 
 use super::solver::SolPointG;
 use crate::sens::linsolve::{lu_factor_in_place_g, lu_solve_in_place_g};
+use crate::sens::num::NonRecRead;
 use crate::sens::num::PkNum;
 
 /// Degree-13 Padé numerator coefficients `b_0..b_13` (Higham 2005, Table 10.4 / eq. 10.33).
@@ -69,30 +70,12 @@ const MAX_SQUARINGS: u32 = 64;
 /// a dual type every skipped product is a full jet multiply. A zero that is only *numerically*
 /// zero — `θ − θ₀` at `θ = θ₀`, a taped or jet-carrying value — is not constant and is kept.
 fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: &mut [bool]) {
-    use crate::sens::linsolve::{all_finite, structural_zero};
+    use crate::sens::linsolve::all_finite;
     // A skipped `x[i][k]` multiplies row `k` of `y`, which must be finite for the skipped
     // products to be exactly `±0` (`all_finite`).
     for (k, f) in row_finite.iter_mut().enumerate().take(n) {
-        *f = y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v));
-    }
-    if T::FUSED_FOLDS {
-        // A taped type folds each entry as one tape node (`PkNum::dot_fold`): the same
-        // products, in the same ascending-`k` order, as the loop below.
-        let mut pairs: Vec<(T, T)> = Vec::with_capacity(n);
-        for i in 0..n {
-            for j in 0..n {
-                pairs.clear();
-                for k in 0..n {
-                    let xik = x[i * n + k];
-                    if row_finite[k] && structural_zero(xik) {
-                        continue;
-                    }
-                    pairs.push((xik, y[k * n + j]));
-                }
-                out[i * n + j] = T::dot_fold(T::from_f64(0.0), &pairs);
-            }
-        }
-        return;
+        *f = crate::sens::linsolve::skips_zeros::<T>()
+            && y[k * n..(k + 1) * n].iter().all(|&v| all_finite(v));
     }
     // The common compartment counts as literals into the one inlined loop, so it unrolls at
     // each size; the same products in the same order, skips included (#1564).
@@ -135,21 +118,11 @@ fn matmul<T: PkNum>(x: &[T], y: &[T], n: usize) -> Vec<T> {
 /// `Σ_k c_k·M_k`, each `M_k` an `n×n` row-major matrix, plus `c_I·I` when `c_i` is nonzero,
 /// into `out`.
 fn lincomb_into<T: PkNum>(terms: &[(f64, &[T])], c_i: f64, n: usize, out: &mut [T]) {
-    if T::FUSED_FOLDS {
-        // One linear tape node per entry (`PkNum::caxpy_fold`), the loop below's values.
-        let mut ts: Vec<(f64, T)> = Vec::with_capacity(terms.len());
-        for (e, o) in out[..n * n].iter_mut().enumerate() {
-            ts.clear();
-            ts.extend(terms.iter().map(|&(c, m)| (c, m[e])));
-            *o = T::caxpy_fold(T::from_f64(0.0), &ts);
-        }
-    } else {
-        out[..n * n].fill(T::from_f64(0.0));
-        for &(c, m) in terms {
-            let c = T::from_f64(c);
-            for (o, &v) in out.iter_mut().zip(&m[..n * n]) {
-                *o = *o + c * v;
-            }
+    out[..n * n].fill(T::from_f64(0.0));
+    for &(c, m) in terms {
+        let c = T::from_f64(c);
+        for (o, &v) in out.iter_mut().zip(&m[..n * n]) {
+            *o = *o + c * v;
         }
     }
     if c_i != 0.0 {
@@ -196,7 +169,7 @@ pub(crate) struct Expm<T> {
     u: Vec<T>,
     v: Vec<T>,
     col: Vec<T>,
-    piv: Vec<usize>,
+    piv: Vec<T>,
     row_finite: Vec<bool>,
     cache: Vec<PadeEntry<T>>,
     /// `n×n` buffers [`Self::reset`] released, handed out again for approximants, their
@@ -221,7 +194,7 @@ impl<T: PkNum> Expm<T> {
             u: z(),
             v: z(),
             col: vec![T::from_f64(0.0); n],
-            piv: vec![0; n],
+            piv: vec![T::from_f64(0.0); crate::sens::linsolve::lu_piv_len::<T>(n)],
             row_finite: vec![false; n],
             cache: Vec::new(),
             spare: Vec::new(),
@@ -267,27 +240,32 @@ impl<T: PkNum> Expm<T> {
         if n == 0 {
             return None;
         }
-        if a.iter().any(|x| !x.val().is_finite()) {
-            return None;
-        }
-        // ‖A‖₁ — max absolute column sum of the value part.
-        let norm1 = (0..n)
-            .map(|j| (0..n).map(|i| a[i * n + j].val().abs()).sum::<f64>())
-            .fold(0.0_f64, f64::max);
-        let s = if norm1 > THETA13 {
-            let s = (norm1 / THETA13).log2().ceil();
-            if !(s <= MAX_SQUARINGS as f64) {
+        // The squaring count, on the values ([`pade_squarings`]; a recording type re-checks it
+        // on every evaluation): `−1` for a non-finite value or a norm past `MAX_SQUARINGS`.
+        let mut args = a[..n * n].to_vec();
+        args.push(T::from_f64(n as f64));
+        let host = T::host(crate::sens::num::HostFn::PadeSquarings, &args);
+        let need = host[0];
+        let out1 = host.get(1).copied().unwrap_or_else(|| T::from_f64(1.0));
+        // A recording type (#2786) takes the count as data: the scale `2⁻ˢ` the analysis returns
+        // with it, the squarings a run-time repeat call (`RecHooks::repeat`) — the value path's
+        // arithmetic at every count, checked only that the count exists.
+        let (s, counted, scale) = if T::RECORDS_BRANCHES {
+            if !need.br_cmp_c(crate::sens::num::BranchCmp::Ge, 0.0) {
                 return None;
             }
-            s as usize
+            (0, Some(need), out1)
         } else {
-            0
+            let s = need.br_value();
+            if s < 0.0 {
+                return None;
+            }
+            (s as usize, None, T::from_f64(0.5_f64.powi(s as i32)))
         };
-        let scale = T::from_f64(0.5_f64.powi(s as i32));
         for (o, &x) in self.a1.iter_mut().zip(a) {
             *o = x * scale;
         }
-        let reusable = self.a1[0].same_bits_untaped(&self.a1[0]).is_some();
+        let reusable = counted.is_none() && self.a1[0].same_bits_untaped(&self.a1[0]).is_some();
         let found = reusable
             .then(|| {
                 self.cache.iter().position(|e| {
@@ -341,6 +319,19 @@ impl<T: PkNum> Expm<T> {
         } else {
             // Never matched again: square in place and keep only the result.
             let mut sq = Self::buffer(spare, n);
+            if let Some(need) = counted {
+                let n2 = n;
+                let square = |x: &[T]| -> Vec<T> {
+                    let mut y = vec![T::from_f64(0.0); n2 * n2];
+                    let mut rf = vec![true; n2];
+                    matmul_into(x, x, n2, &mut y, &mut rf);
+                    y
+                };
+                match T::repeat(&entry.powers[0], need, &square) {
+                    Some(Some(y)) => entry.powers[0].copy_from_slice(&y),
+                    _ => return None,
+                }
+            }
             for _ in 0..s {
                 matmul_into(&entry.powers[0], &entry.powers[0], n, &mut sq, row_finite);
                 std::mem::swap(&mut entry.powers[0], &mut sq);
@@ -349,7 +340,7 @@ impl<T: PkNum> Expm<T> {
         }
         let power = if entry.reusable { s } else { 0 };
         let r = &entry.powers[power];
-        if r.iter().any(|x| !x.val().is_finite() || !x.jets_finite()) {
+        if r.iter().any(|x| !crate::sens::linsolve::all_finite(*x)) {
             return None;
         }
         Some(ExpmSlot { entry: idx, power })
@@ -434,6 +425,48 @@ impl<T: PkNum> Expm<T> {
     }
 }
 
+/// The [`HostFn::ForcingScale`](crate::sens::num::HostFn) analysis: `args = [A (n·n), b (n),
+/// n]` → `[c]`, `c = max(1, max|b| / max(1, max|A|))`, the augmented generator's forcing
+/// column scale on the values.
+pub(crate) fn forcing_scale(args: &[f64], out: &mut Vec<f64>) {
+    let n = args[args.len() - 1] as usize;
+    let a_max = args[..n * n].iter().fold(0.0_f64, |m, x| m.max(x.abs()));
+    let b_max = args[n * n..n * n + n]
+        .iter()
+        .fold(0.0_f64, |m, x| m.max(x.abs()));
+    out.clear();
+    out.push((b_max / a_max.max(1.0)).max(1.0));
+}
+
+/// The [`HostFn::PadeSquarings`](crate::sens::num::HostFn) analysis: `args = [A (n·n), n]`
+/// → `[s]`, the halvings that bring `‖A‖₁` under `θ₁₃`, or `−1` when a value is not finite or
+/// more than [`MAX_SQUARINGS`] are needed.
+pub(crate) fn pade_squarings(args: &[f64], out: &mut Vec<f64>) {
+    let n = args[args.len() - 1] as usize;
+    let a = &args[..n * n];
+    out.clear();
+    if a.iter().any(|x| !x.is_finite()) {
+        out.push(-1.0);
+        return;
+    }
+    // ‖A‖₁ — max absolute column sum of the value part.
+    let norm1 = (0..n)
+        .map(|j| (0..n).map(|i| a[i * n + j].abs()).sum::<f64>())
+        .fold(0.0_f64, f64::max);
+    let s = if norm1 > THETA13 {
+        let s = (norm1 / THETA13).log2().ceil();
+        if !(s <= MAX_SQUARINGS as f64) {
+            out.push(-1.0);
+            return;
+        }
+        s
+    } else {
+        0.0
+    };
+    out.push(s);
+    out.push(0.5_f64.powi(s as i32));
+}
+
 /// Most Padé approximants a thread's [`Expm`] keeps between segments. Each holds `s + 1`
 /// matrices, so this bounds a thread's memory; past it the next segment forgets them all (and
 /// recomputes, bit-identically).
@@ -504,7 +537,7 @@ const SELF_CHECK_RTOL: f64 = 1e-9;
 /// term whose `Km` is far above every state it reaches is affine to rounding at every checked
 /// point — and then the exact answer is the right one to that same precision.
 pub(crate) fn linear_segment_g<T: PkNum>(
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &crate::ode::solver::RhsG<'_, T>,
     u0: &[T],
     t_span: (f64, f64),
     params: &[T],
@@ -532,6 +565,7 @@ pub(super) struct Spectral<T> {
 /// transit chain at one rate, `KA = CL/V`) takes the Padé path, which needs no
 /// diagonalisation. A numerical-validity bound, checked again on the result below.
 const SPECTRAL_MIN_REL_GAP: f64 = 1e-4;
+
 /// Largest projector entry the spectral path accepts (see `spectral_of`).
 const SPECTRAL_MAX_KAPPA: f64 = 32.0;
 /// The projectors must reproduce `I = Σ P_i` and `A = Σ λ_i P_i` to this relative accuracy
@@ -547,7 +581,15 @@ thread_local! {
     /// Test switch: propagate every segment by Padé, as before the spectral path.
     pub(crate) static SPECTRAL_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Segments the spectral path propagated on this thread.
-    pub(super) static SPECTRAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static SPECTRAL_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The coupling graph each `spectral` call on this thread built, as its reachability
+    /// `downstream(present, n)`, tagged `true` for a plan recording
+    /// (`parser::kernel_jit::Tr`) and `false` for `f64`; other number types are not
+    /// recorded. Reachability is what `spectral_of` reads `A`'s structural zeros through
+    /// (its blocks, its acyclic compartments and its projectors' support), so equal entries
+    /// mean the recording and the `f64` objective built the same construction (#2761 row 5).
+    pub(crate) static SPECTRAL_GRAPHS: std::cell::RefCell<Vec<(bool, [u8; 6])>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[inline]
@@ -566,11 +608,6 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
     if n == 0 || n > 6 {
         return None;
     }
-    let mut buf = [0.0_f64; 36];
-    let vals = &mut buf[..n * n];
-    for (v, x) in vals.iter_mut().zip(a) {
-        *v = x.val();
-    }
     // The coupling graph: entry `r·n + c` is an edge unless it is a structural zero — value 0
     // and no derivative ([`crate::sens::linsolve::structural_zero`], the convention the Padé
     // kernels skip on). A rate whose value sits at 0 while it carries a jet is an edge: its
@@ -582,10 +619,106 @@ pub(super) fn spectral<T: PkNum>(a: &[T], n: usize) -> Option<Spectral<T>> {
             m | (1 << i)
         }
     });
-    if repeated_singleton_eigenvalue(vals, present, n) {
+    #[cfg(test)]
+    {
+        let ty = std::any::type_name::<T>();
+        let recorded = ty.ends_with("kernel_jit::Tr");
+        if recorded || ty == "f64" {
+            let down = downstream(present, n);
+            SPECTRAL_GRAPHS.with(|g| g.borrow_mut().push((recorded, down)));
+        }
+    }
+    // The analysis runs on `A`'s values ([`spectral_analysis`]), as a host call: a recording
+    // type (#2786) runs it again on every evaluation and re-checks its decisions there.
+    let mut args: Vec<T> = a[..n * n].to_vec();
+    args.push(T::from_f64(n as f64));
+    args.push(T::from_f64(present as f64));
+    let out = T::host(crate::sens::num::HostFn::Spectral, &args);
+    if out[0].br_value() != 1.0 {
         return None;
     }
-    spectral_of(a, n, vals, present)
+    spectral_of(a, n, &out)
+}
+
+/// The `f64` half of the spectral form — every decision and every quantity read off `A`'s
+/// values (`args = [A (n·n), n, present]`) — into `out`, laid out as [`SpectralLayout`]: `ok`
+/// (`1` when the spectral path applies, else `0` and nothing more), the eigenvalues, each one's
+/// diagonal compartment (`−1` when it is not a diagonal), each projector's support masks, the
+/// `f64` projectors, and per non-diagonal eigenvalue the chord system's `v₀` and `J₀⁻¹`.
+pub(crate) fn spectral_analysis(args: &[f64], out: &mut Vec<f64>) {
+    out.clear();
+    let n = args[args.len() - 2] as usize;
+    let present = args[args.len() - 1] as u64;
+    let vals = &args[..n * n];
+    match spectral_f64(vals, n, present) {
+        None => out.push(0.0),
+        Some(an) => {
+            out.push(1.0);
+            out.extend_from_slice(&an.lam);
+            out.extend(an.exact.iter().map(|e| e.map_or(-1.0, |i| i as f64)));
+            out.extend(an.masks.iter().flat_map(|&(r, c)| [r as f64, c as f64]));
+            out.extend_from_slice(&an.pf);
+            out.extend_from_slice(&an.v0);
+            out.extend_from_slice(&an.jinv);
+        }
+    }
+}
+
+/// Where [`spectral_analysis`]'s outputs sit for an `n`-state generator.
+struct SpectralLayout {
+    n: usize,
+}
+
+impl SpectralLayout {
+    fn lam(&self, k: usize) -> usize {
+        1 + k
+    }
+    fn exact(&self, k: usize) -> usize {
+        1 + self.n + k
+    }
+    fn mask(&self, k: usize) -> (usize, usize) {
+        (1 + 2 * self.n + 2 * k, 2 + 2 * self.n + 2 * k)
+    }
+    fn pf(&self, i: usize) -> usize {
+        1 + 4 * self.n + i
+    }
+    fn v0(&self, k: usize, r: usize) -> usize {
+        1 + 4 * self.n + self.n * self.n * self.n + k * self.n + r
+    }
+    fn jinv(&self, k: usize, r: usize, c: usize) -> usize {
+        let m = self.n + 1;
+        1 + 4 * self.n + self.n * self.n * self.n + self.n * self.n + k * m * m + r * m + c
+    }
+}
+
+/// [`spectral_analysis`]'s result.
+struct SpectralF64 {
+    lam: Vec<f64>,
+    exact: Vec<Option<usize>>,
+    masks: Vec<(u8, u8)>,
+    pf: Vec<f64>,
+    /// `v₀` per eigenvalue (`n` each; zeros for a diagonal one).
+    v0: Vec<f64>,
+    /// `J₀⁻¹` per eigenvalue (`(n+1)²` each, row-major; zeros for a diagonal one).
+    jinv: Vec<f64>,
+}
+
+/// The eigenvalues of `[[a, b], [c, d]]`, when real, in a fixed order (the larger first when the
+/// trace is positive, else the smaller): the larger-magnitude root from the stable sum
+/// `m ± √disc`, the other from the determinant over it, so neither cancels. `None` for a
+/// complex pair or a non-finite result.
+fn eigenvalues_2x2(a: f64, b: f64, c: f64, d: f64) -> Option<(f64, f64)> {
+    let m = 0.5 * (a + d);
+    let h = 0.5 * (a - d);
+    let disc = h * h + b * c;
+    if !(disc > 0.0) {
+        return None;
+    }
+    let s = disc.sqrt();
+    let q = if m >= 0.0 { m + s } else { m - s };
+    let det = a * d - b * c;
+    let r = if q != 0.0 { det / q } else { return None };
+    (q.is_finite() && r.is_finite()).then_some((q, r))
 }
 
 /// Whether two compartments that sit on no cycle of `A`'s coupling graph have (nearly) the same
@@ -704,40 +837,39 @@ fn projectors<U: PkNum>(a: &[U], lambda: &[U], masks: &[(u8, u8)], n: usize) -> 
 /// the projectors' size and the identities they must reproduce never read a jet, so a
 /// declined segment records nothing on a tape, and `f64` and every dual or tape type take the
 /// same decision — unless an entry's value is 0 while it carries a derivative, which is an
-/// edge for the dual run and not for the `f64` one. Only an accepted form is built in `T`.
-fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64], present: u64) -> Option<Spectral<T>> {
-    let ev = nalgebra::DMatrix::<f64>::from_row_slice(n, n, vals).complex_eigenvalues();
+/// edge for the dual run and not for the `f64` one.
+fn spectral_f64(vals: &[f64], n: usize, present: u64) -> Option<SpectralF64> {
+    // A host analysis runs before a compiled plan's guards are read, so it must end on any
+    // input: nalgebra's Schur iteration has no cap and never converges on a `NaN`/`inf`.
+    if vals.iter().any(|x| !x.is_finite()) {
+        return None;
+    }
+    if repeated_singleton_eigenvalue(vals, present, n) {
+        return None;
+    }
     let scale = vals.iter().fold(0.0_f64, |s, x| s.max(x.abs())).max(1e-300);
-    let mut lam_f: Vec<f64> = Vec::with_capacity(n);
-    for z in ev.iter() {
-        if !(z.re.is_finite() && z.im.is_finite()) || z.im.abs() > 1e-12 * scale {
-            return None;
-        }
-        lam_f.push(z.re);
-    }
-    lam_f.sort_by(|x, y| x.total_cmp(y));
-    let lmax = lam_f
-        .iter()
-        .fold(0.0_f64, |s, x| s.max(x.abs()))
-        .max(scale * 1e-12);
-    for w in lam_f.windows(2) {
-        if (w[1] - w[0]).abs() < SPECTRAL_MIN_REL_GAP * lmax {
-            return None;
-        }
-    }
     // Each eigenvalue belongs to one diagonal block of `A`'s block-triangular form: a strongly
-    // connected set of compartments. An acyclic compartment is a 1×1 block, its diagonal an
-    // eigenvalue exactly, which the eigensolver returns to within an ulp or so: snapping to
-    // the exact bits makes `A − λI` zero that compartment's row (measured: a depot decayed to
-    // 1e-6 of its dose otherwise read 5.5e-10 off, the other modes leaking `ε·‖x‖` into it).
-    // A cyclic block's eigenvalues are found by solving that block alone. The block fixes the
-    // projector's support — rows downstream of it, columns upstream — which the products then
-    // keep as exact zeros rather than rounding residue. (Entries a projector's support does
-    // include can still carry the modes' algebraic cancellation: a stiff chain's
-    // `∂²u₁/∂k₂²`, exactly 0, reads ~1e-12 through mode 0's `(A − λ₂I)/(λ₀ − λ₂)`.) `exact[k]`: the compartment eigenvalue `k` is the diagonal of.
+    // connected set of compartments, and `A`'s spectrum is the union of the blocks' — so the
+    // blocks are solved alone, never `A` whole. An acyclic compartment is a 1×1 block, its
+    // diagonal an eigenvalue exactly: using the exact bits makes `A − λI` zero that
+    // compartment's row (measured: a depot decayed to 1e-6 of its dose otherwise read 5.5e-10
+    // off, the other modes leaking `ε·‖x‖` into it). A 2×2 block has a closed form
+    // ([`eigenvalues_2x2`]); a larger one goes to the eigensolver, which sees a block and not
+    // the whole matrix. The block fixes the projector's support — rows downstream of it,
+    // columns upstream — which the products then keep as exact zeros rather than rounding
+    // residue. (Entries a projector's support does include can still carry the modes'
+    // algebraic cancellation: a stiff chain's `∂²u₁/∂k₂²`, exactly 0, reads ~1e-12 through
+    // mode 0's `(A − λ₂I)/(λ₀ − λ₂)`.) `exact[k]`: the compartment eigenvalue `k` is the
+    // diagonal of.
+    //
+    // The eigenvalues come in block order — the coupling graph's, fixed by the model — rather
+    // than by value: two that cross as the parameters move keep their indices, so every
+    // per-mode decision (`exact`, the masks) is the same at both points and a compiled plan's
+    // checks on them hold (#2786).
     let down = downstream(present, n);
-    let mut exact: [Option<usize>; 6] = [None; 6];
-    let mut block: [u8; 6] = [0; 6];
+    let mut lam_f: Vec<f64> = Vec::with_capacity(n);
+    let mut exact: Vec<Option<usize>> = Vec::with_capacity(n);
+    let mut block: Vec<u8> = Vec::with_capacity(n);
     let mut done = 0u8;
     for i in 0..n {
         if done & (1 << i) != 0 {
@@ -752,26 +884,54 @@ fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64], present: u64) -> Optio
         });
         done |= scc;
         let members: Vec<usize> = (0..n).filter(|&j| scc & (1 << j) != 0).collect();
-        let targets: Vec<f64> = if members.len() == 1 {
-            vec![vals[i * n + i]]
-        } else {
-            let sub = nalgebra::DMatrix::<f64>::from_fn(members.len(), members.len(), |r, c| {
-                vals[members[r] * n + members[c]]
-            });
-            sub.complex_eigenvalues().iter().map(|z| z.re).collect()
-        };
-        for d in targets {
-            let k = (0..n)
-                .filter(|&k| block[k] == 0)
-                .min_by(|&x, &y| (lam_f[x] - d).abs().total_cmp(&(lam_f[y] - d).abs()))?;
-            if !((lam_f[k] - d).abs() <= SPECTRAL_CHECK_RTOL * lmax) {
-                return None;
+        match members.len() {
+            1 => {
+                lam_f.push(vals[i * n + i]);
+                exact.push(Some(i));
+                block.push(scc);
             }
-            block[k] = scc;
-            if members.len() == 1 {
-                lam_f[k] = d;
-                exact[k] = Some(i);
+            2 => {
+                let (p, q) = (members[0], members[1]);
+                let (l0, l1) = eigenvalues_2x2(
+                    vals[p * n + p],
+                    vals[p * n + q],
+                    vals[q * n + p],
+                    vals[q * n + q],
+                )?;
+                for l in [l0, l1] {
+                    lam_f.push(l);
+                    exact.push(None);
+                    block.push(scc);
+                }
             }
+            _ => {
+                let sub =
+                    nalgebra::DMatrix::<f64>::from_fn(members.len(), members.len(), |r, c| {
+                        vals[members[r] * n + members[c]]
+                    });
+                for z in sub.complex_eigenvalues().iter() {
+                    if !(z.re.is_finite() && z.im.is_finite()) || z.im.abs() > 1e-12 * scale {
+                        return None;
+                    }
+                    lam_f.push(z.re);
+                    exact.push(None);
+                    block.push(scc);
+                }
+            }
+        }
+    }
+    if lam_f.len() != n || !lam_f.iter().all(|l| l.is_finite()) {
+        return None;
+    }
+    let lmax = lam_f
+        .iter()
+        .fold(0.0_f64, |s, x| s.max(x.abs()))
+        .max(scale * 1e-12);
+    let mut sorted = lam_f.clone();
+    sorted.sort_by(|x, y| x.total_cmp(y));
+    for w in sorted.windows(2) {
+        if (w[1] - w[0]).abs() < SPECTRAL_MIN_REL_GAP * lmax {
+            return None;
         }
     }
     let masks: Vec<(u8, u8)> = (0..n)
@@ -815,28 +975,11 @@ fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64], present: u64) -> Optio
             }
         }
     }
-    if a.iter().all(|x| x.is_constant()) {
-        return Some(Spectral {
-            lambda: lam_f.into_iter().map(T::from_f64).collect(),
-            proj: pf.into_iter().map(T::from_f64).collect(),
-        });
-    }
-    // ── The jets. Each eigenpair `(λ, v)` solves `(A − λI)v = 0, v₀ᵀv = 1`, with `v₀` the
-    // `f64` eigenvector (`P_k`'s largest column). A chord step `z ← z − J₀⁻¹F(z)`, with `J₀`
-    // that system's exact `f64` Jacobian at the eigensolver's `(λ, v₀)`, makes one more
-    // derivative order exact; its value part is dropped, so `λ` keeps the eigensolver's
-    // value bit for bit. No characteristic polynomial is formed: its coefficients cancel on a
-    // stiff spectrum (rates 10, 0.5, 0.005 left the slowest eigenvalue's jets 4e-9 off Padé).
-    let zero = T::from_f64(0.0);
-    let one = T::from_f64(1.0);
     let m = n + 1;
-    let mut lambda: Vec<T> = Vec::with_capacity(n);
-    let mut v: Vec<T> = vec![zero; n];
-    let mut fz: Vec<T> = vec![zero; m];
+    let mut v0s = vec![0.0; n * n];
+    let mut jinvs = vec![0.0; n * m * m];
     for (k, &l0) in lam_f.iter().enumerate() {
-        if let Some(i) = exact[k] {
-            // The diagonal itself: exact in value and in every jet.
-            lambda.push(a[i * n + i]);
+        if exact[k].is_some() {
             continue;
         }
         let pk = &pf[k * n * n..(k + 1) * n * n];
@@ -862,11 +1005,72 @@ fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64], present: u64) -> Optio
         if !jinv.iter().all(|x| x.is_finite()) {
             return None;
         }
-        for (vi, &x) in v.iter_mut().zip(&v0) {
-            *vi = T::from_f64(x);
+        v0s[k * n..(k + 1) * n].copy_from_slice(&v0);
+        for r in 0..m {
+            for c in 0..m {
+                jinvs[k * m * m + r * m + c] = jinv[(r, c)];
+            }
         }
-        let mut l = T::from_f64(l0);
-        for _ in 0..SPECTRAL_JET_STEPS {
+    }
+    Some(SpectralF64 {
+        lam: lam_f,
+        exact,
+        masks,
+        pf,
+        v0: v0s,
+        jinv: jinvs,
+    })
+}
+
+/// The spectral form in `T` from [`spectral_analysis`]'s outputs `out` (each a `T`: a
+/// constant, or a recording type's host-call result). The eigenvalue of an acyclic
+/// compartment is its diagonal, exact in value and in every jet; any other carries the
+/// analysis's value and the exact implicit derivatives of its eigenpair: each eigenpair
+/// `(λ, v)` solves `(A − λI)v = 0, v₀ᵀv = 1`, with `v₀` the `f64` eigenvector (`P_k`'s largest
+/// column). A chord step `z ← z − J₀⁻¹F(z)`, with `J₀` that system's exact `f64` Jacobian at
+/// the eigensolver's `(λ, v₀)`, makes one more derivative order exact; its value part is
+/// dropped ([`PkNum::value_only`]), so `λ` keeps the eigensolver's value bit for bit. No
+/// characteristic polynomial is formed: its coefficients cancel on a stiff spectrum (rates
+/// 10, 0.5, 0.005 left the slowest eigenvalue's jets 4e-9 off Padé).
+fn spectral_of<T: PkNum>(a: &[T], n: usize, out: &[T]) -> Option<Spectral<T>> {
+    let lay = SpectralLayout { n };
+    let exact: Vec<Option<usize>> = (0..n)
+        .map(|k| {
+            let e = out[lay.exact(k)].br_value();
+            (e >= 0.0).then_some(e as usize)
+        })
+        .collect();
+    let masks: Vec<(u8, u8)> = (0..n)
+        .map(|k| {
+            let (r, c) = lay.mask(k);
+            (out[r].br_value() as u8, out[c].br_value() as u8)
+        })
+        .collect();
+    if a.iter().all(|x| x.is_constant()) {
+        return Some(Spectral {
+            lambda: (0..n).map(|k| out[lay.lam(k)]).collect(),
+            proj: (0..n * n * n).map(|i| out[lay.pf(i)]).collect(),
+        });
+    }
+    let zero = T::from_f64(0.0);
+    let one = T::from_f64(1.0);
+    let m = n + 1;
+    let mut lambda: Vec<T> = Vec::with_capacity(n);
+    let mut v: Vec<T> = vec![zero; n];
+    let mut fz: Vec<T> = vec![zero; m];
+    for k in 0..n {
+        if let Some(i) = exact[k] {
+            // The diagonal itself: exact in value and in every jet.
+            lambda.push(a[i * n + i]);
+            continue;
+        }
+        for (r, vi) in v.iter_mut().enumerate() {
+            *vi = out[lay.v0(k, r)];
+        }
+        let mut l = out[lay.lam(k)];
+        // Step `s` is gated at order `s` (`RecHooks::order_gate`): a recording's compiled
+        // variant runs the steps its order needs (a reverse one more), a value forward none.
+        for step in 1..=SPECTRAL_JET_STEPS {
             for r in 0..n {
                 let mut acc = zero - l * v[r];
                 for c in 0..n {
@@ -876,19 +1080,20 @@ fn spectral_of<T: PkNum>(a: &[T], n: usize, vals: &[f64], present: u64) -> Optio
             }
             let mut dot = zero - one;
             for c in 0..n {
-                dot = dot + T::from_f64(v0[c]) * v[c];
+                dot = dot + out[lay.v0(k, c)] * v[c];
             }
             fz[n] = dot;
             for r in 0..m {
                 let mut d = zero;
                 for c in 0..m {
-                    d = d + T::from_f64(jinv[(r, c)]) * fz[c];
+                    d = d + out[lay.jinv(k, r, c)] * fz[c];
                 }
-                let d = d - T::from_f64(d.val());
+                let d = d - d.value_only();
+                let g = step as u8;
                 if r < n {
-                    v[r] = v[r] - d;
+                    v[r] = T::order_gate(g, v[r], v[r] - d);
                 } else {
-                    l = l - d;
+                    l = T::order_gate(g, l, l - d);
                 }
             }
         }
@@ -909,13 +1114,42 @@ const RECIP: [f64; 48] = {
     r
 };
 
+/// The order-`m` derivative of `g(z) = (e^z − 1)/z` alone (`m ≤ 4`): what a compiled plan's or a
+/// recording's `ExpRel(m)` reads — one accumulator, where [`exprel_derivs`] carries five — and
+/// the same bits as [`exprel_derivs`]`(z, 4)[m]`.
+pub(crate) fn exprel_k(z: f64, m: usize) -> f64 {
+    debug_assert!(m <= 4);
+    // Order 0's closed form `expm1(z)/z` cancels nowhere (`expm1` is accurate at small `z`):
+    // it is the whole function but its removable point `z = 0`, where the series' one term is
+    // the limit `1`.
+    if m == 0 && z != 0.0 {
+        return z.exp_m1() / z;
+    }
+    if z.abs() <= 2.0 {
+        // `exprel_derivs`'s series for one order: the same terms, in the same order, with the
+        // same stop (its `top = 4` bound), so the bits equal its entry `m`. Over a fixed range
+        // with `m ≤ 4` known, so the loop carries no bounds check.
+        let m = m.min(4);
+        let (mut p, mut o) = (1.0, 0.0);
+        for k in 0..43 {
+            o += p * RECIP[k + m + 1];
+            p *= z * RECIP[k + 1];
+            if p.abs() < 1e-19 {
+                break;
+            }
+        }
+        return o;
+    }
+    exprel_closed(z, z.exp(), m)
+}
+
 /// `g(z) = (e^z − 1)/z` and its derivatives up to `orders` (≤ 4), the rest left 0, so
 /// `φ(λ, Δ) = Δ·g(λΔ)` is lifted exactly through the jet orders a number type carries
 /// ([`PkNum::lift4`]). Near `z = 0` the closed forms cancel (`g⁗` loses ~7 digits at `z = 0.1`),
 /// so `|z| ≤ 2` sums `g⁽ᵐ⁾(z) = Σ_k (zᵏ/k!)/(k + m + 1)` in one pass over `k`; past it the
 /// closed forms lose at most ~2. Each order accumulates on its own, so `g` is the same bits
 /// whatever `orders` asks for: the `f64` run and a dual run read one value.
-fn exprel_derivs(z: f64, orders: usize) -> [f64; 5] {
+pub(crate) fn exprel_derivs(z: f64, orders: usize) -> [f64; 5] {
     let mut out = [0.0; 5];
     let top = orders.min(4);
     if z.abs() <= 2.0 {
@@ -933,49 +1167,79 @@ fn exprel_derivs(z: f64, orders: usize) -> [f64; 5] {
                 break;
             }
         }
+        if z != 0.0 {
+            out[0] = z.exp_m1() / z;
+        }
         return out;
     }
-    let e = z.exp();
-    let (z2, z3, z4) = (z * z, z * z * z, z * z * z * z);
-    // Past `z ≈ −745` the exponential is 0 and the polynomials it multiplies may overflow
-    // (`0·inf = NaN`): drop the term, leaving each closed form's constant over `zᵐ⁺¹`.
-    let e_term = |poly: f64| if e == 0.0 { 0.0 } else { e * poly };
     out[0] = z.exp_m1() / z;
-    if top >= 1 {
-        out[1] = (e_term(z - 1.0) + 1.0) / z2;
-    }
-    if top >= 2 {
-        out[2] = (e_term(z2 - 2.0 * z + 2.0) - 2.0) / z3;
-    }
-    if top >= 3 {
-        out[3] = (e_term(z3 - 3.0 * z2 + 6.0 * z - 6.0) + 6.0) / z4;
-    }
-    if top >= 4 {
-        out[4] = (e_term(z4 - 4.0 * z3 + 12.0 * z2 - 24.0 * z + 24.0) - 24.0) / (z4 * z);
+    let e = if top > 0 { z.exp() } else { 0.0 };
+    for (m, o) in out.iter_mut().enumerate().take(top + 1).skip(1) {
+        *o = exprel_closed(z, e, m);
     }
     out
+}
+
+/// `exprel`'s order-`m` closed form at `|z| > 2` (`1 ≤ m ≤ 4`; order 0 is `expm1(z)/z`, which
+/// needs no `e`), `e = eᶻ`. Past `z ≈ −745` the exponential is 0 and the polynomials it
+/// multiplies may overflow (`0·inf = NaN`): the term is dropped, leaving each closed form's
+/// constant over `zᵐ⁺¹`.
+fn exprel_closed(z: f64, e: f64, m: usize) -> f64 {
+    let (z2, z3, z4) = (z * z, z * z * z, z * z * z * z);
+    let e_term = |poly: f64| if e == 0.0 { 0.0 } else { e * poly };
+    match m {
+        1 => (e_term(z - 1.0) + 1.0) / z2,
+        2 => (e_term(z2 - 2.0 * z + 2.0) - 2.0) / z3,
+        3 => (e_term(z3 - 3.0 * z2 + 6.0 * z - 6.0) + 6.0) / z4,
+        _ => (e_term(z4 - 4.0 * z3 + 12.0 * z2 - 24.0 * z + 24.0) - 24.0) / (z4 * z),
+    }
 }
 
 /// [`linear_segment_g`] on a reused workspace: every buffer a segment needs, so a fit's
 /// thousands of segments allocate their outputs and nothing else.
 fn segment_in<T: PkNum>(
     ws: &mut LinWs<T>,
-    rhs: &dyn Fn(&[T], &[T], f64, &mut [T]),
+    rhs: &crate::ode::solver::RhsG<'_, T>,
     u0: &[T],
     t_span: (f64, f64),
     params: &[T],
     saveat: &[f64],
     interp_at: &[f64],
 ) -> Option<(Vec<SolPointG<T>>, Vec<SolPointG<T>>)> {
+    // The walk's moving span (`RecHooks::span_hint`), or the values; handed back on a decline,
+    // so the integration the walk falls back to takes it.
+    let span = T::take_span();
+    let r = segment_span(ws, rhs, u0, t_span, span, params, saveat, interp_at);
+    if r.is_none() {
+        if let Some((a, b)) = span {
+            T::span_hint(a, b);
+        }
+    }
+    r
+}
+
+#[allow(clippy::too_many_arguments)]
+fn segment_span<T: PkNum>(
+    ws: &mut LinWs<T>,
+    rhs: &crate::ode::solver::RhsG<'_, T>,
+    u0: &[T],
+    t_span: (f64, f64),
+    span: Option<(T, T)>,
+    params: &[T],
+    saveat: &[f64],
+    interp_at: &[f64],
+) -> Option<(Vec<SolPointG<T>>, Vec<SolPointG<T>>)> {
+    use crate::sens::num::BranchCmp::{Eq, Gt, Lt};
     let n = u0.len();
     let (t0, t1) = t_span;
     let h = t1 - t0;
-    if !(h > 0.0) || !h.is_finite() {
+    let (t0_t, t1_t) = span.unwrap_or((T::from_f64(t0), T::from_f64(t1)));
+    let h_t = t1_t - t0_t;
+    if !h_t.br_cmp_c(Gt, 0.0) || !h_t.br_abs_lt(f64::INFINITY) {
         return None;
     }
     let zero = T::from_f64(0.0);
     let t_mid = t0 + 0.5 * h;
-    let m = n + 1;
     ws.size(n, zero);
     let LinWs {
         probe,
@@ -987,16 +1251,12 @@ fn segment_in<T: PkNum>(
         scaled,
         next,
         x,
-        pairs,
-        params_d,
-        a_d,
-        b_d,
-        x_d,
         times,
         props,
         n_props,
         states,
         expms,
+        live,
     } = ws;
 
     // ── Extract A (row-major n×n) and b at the midpoint: b = f(0), column j = (f(s·e_j) − b)/s.
@@ -1015,52 +1275,70 @@ fn segment_in<T: PkNum>(
     // Whatever cancellation remains is not trusted: the self-check below compares the
     // derivative components too, and a column read wrongly in any of them declines the
     // segment rather than returning a wrong gradient.
-    rhs(probe, params, t_mid, b);
-    let magnitude = b
-        .iter()
-        .chain(u0)
-        .fold(1.0_f64, |m, x| m.max(x.val().abs()).max(x.jet_max_abs()));
-    if !magnitude.is_finite() {
-        return None;
-    }
-    let scale = 2f64.powi(magnitude.log2().ceil() as i32 + 20);
-    if !scale.is_finite() {
-        return None;
-    }
-    for j in 0..n {
-        probe[j] = T::from_f64(scale);
-        rhs(probe, params, t_mid, col);
-        probe[j] = zero;
-        for i in 0..n {
-            a[i * n + j] = T::scaled_diff(col[i], b[i], 1.0 / scale);
+    //
+    // A recording type (#2786) reads them off its recording instead, exactly
+    // ([`RecHooks::affine_parts`]).
+    if !T::affine_parts(rhs, params, t_mid, a, b) {
+        // A recording that found the right-hand side not affine in the state declines the
+        // segment (the recorder has undone what it tried): the caller integrates it. There
+        // are no values to probe.
+        if T::RECORDS_BRANCHES {
+            return None;
+        }
+        rhs(probe, params, T::from_f64(t_mid), b);
+        let magnitude = b
+            .iter()
+            .chain(u0)
+            .fold(1.0_f64, |m, x| m.max(x.plain().abs()).max(x.jet_max_abs()));
+        if !magnitude.is_finite() {
+            return None;
+        }
+        let scale = 2f64.powi(magnitude.log2().ceil() as i32 + 20);
+        if !scale.is_finite() {
+            return None;
+        }
+        for j in 0..n {
+            probe[j] = T::from_f64(scale);
+            rhs(probe, params, T::from_f64(t_mid), col);
+            probe[j] = zero;
+            for i in 0..n {
+                a[i * n + j] = (col[i] - b[i]) * T::from_f64(1.0 / scale);
+            }
         }
     }
-    if a.iter().chain(b.iter()).any(|x| !x.val().is_finite()) {
+    // `|x| < ∞`: the value finite (a `NaN` fails it too).
+    if a.iter()
+        .chain(b.iter())
+        .any(|x| !x.br_abs_lt(f64::INFINITY))
+    {
         return None;
     }
 
     // `f(x, t) == A·x + b` to rounding — the affine claim at one state and time.
     // In the value and in the derivative components alike: a column whose jets were lost to
-    // cancellation reproduces the RHS's value exactly and its gradient not at all. It reads
-    // values only, so it runs on detached copies (`PkNum::detach`): a taped type records
-    // nothing for it.
-    params_d.clear();
-    params_d.extend(params.iter().map(|p| p.detach()));
-    for (d, s) in a_d.iter_mut().zip(a.iter()) {
-        *d = s.detach();
-    }
-    for (d, s) in b_d.iter_mut().zip(b.iter()) {
-        *d = s.detach();
-    }
-    let mut reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
-        for (d, s) in x_d.iter_mut().zip(x) {
-            *d = s.detach();
-        }
-        let (a, b, x) = (&*a_d, &*b_d, &*x_d);
-        rhs(x, params_d, t, direct);
+    // cancellation reproduces the RHS's value exactly and its gradient not at all.
+    let reproduces = |x: &[T], t: f64, direct: &mut [T]| -> bool {
+        let (a, b) = (&*a, &*b);
+        rhs(x, params, T::from_f64(t), direct);
         (0..n).all(|i| {
+            // A recording type (#2786) checks the values through its branch API, as the same
+            // sums: its `A` is exact, so there is no jet cancellation to catch.
+            if T::RECORDS_BRANCHES {
+                let mut assembled = b[i];
+                let mut scale = b[i].abs();
+                for j in 0..n {
+                    let (aij, xj) = (a[i * n + j], x[j]);
+                    assembled = assembled + aij * xj;
+                    scale = scale + (aij * xj).abs();
+                }
+                let tol = scale * T::from_f64(SELF_CHECK_RTOL) + T::from_f64(1e-300);
+                return direct[i].br_abs_lt(f64::INFINITY)
+                    && (direct[i] - assembled)
+                        .abs()
+                        .br_cmp(crate::sens::num::BranchCmp::Le, tol);
+            }
             let mut assembled = b[i];
-            let mut scale = b[i].val().abs();
+            let mut scale = b[i].plain().abs();
             let mut jet_scale = b[i].jet_max_abs();
             for j in 0..n {
                 let (aij, xj) = (a[i * n + j], x[j]);
@@ -1072,14 +1350,14 @@ fn segment_in<T: PkNum>(
                     continue;
                 }
                 assembled = assembled + aij * xj;
-                scale += (aij.val() * xj.val()).abs();
-                jet_scale += aij.jet_max_abs() * xj.val().abs()
-                    + aij.val().abs() * xj.jet_max_abs()
+                scale += (aij.plain() * xj.plain()).abs();
+                jet_scale += aij.jet_max_abs() * xj.plain().abs()
+                    + aij.plain().abs() * xj.jet_max_abs()
                     + aij.jet_max_abs() * xj.jet_max_abs();
             }
             let diff = direct[i] - assembled;
-            direct[i].val().is_finite()
-                && diff.val().abs() <= SELF_CHECK_RTOL * scale + 1e-300
+            direct[i].plain().is_finite()
+                && diff.plain().abs() <= SELF_CHECK_RTOL * scale + 1e-300
                 && diff.jet_max_abs() <= SELF_CHECK_RTOL * jet_scale + 1e-300
         })
     };
@@ -1092,12 +1370,51 @@ fn segment_in<T: PkNum>(
         }
     }
 
-    // Every requested time, clamped into the span, visited once in ascending order.
-    let clamp = |t: f64| t.clamp(t0, t1);
+    // Every requested time, clamped into the span, visited once in ascending order; `pos`
+    // maps each request (`saveat`, then `interp_at`) to its time. The last `saveat` time is
+    // the span's end, which moves with it.
+    let n_save = saveat.len();
+    let req: Vec<T> = saveat
+        .iter()
+        .chain(interp_at)
+        .enumerate()
+        .map(|(i, &t)| {
+            let tt = if span.is_some() && i + 1 == n_save && t.to_bits() == t1.to_bits() {
+                t1_t
+            } else {
+                T::from_f64(t)
+            };
+            if tt.br_cmp(Lt, t0_t) {
+                t0_t
+            } else if tt.br_cmp(Gt, t1_t) {
+                t1_t
+            } else {
+                tt
+            }
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..req.len()).collect();
+    if T::RECORDS_BRANCHES {
+        order.sort_by(|&i, &j| {
+            if req[i].br_cmp(Lt, req[j]) {
+                std::cmp::Ordering::Less
+            } else if req[j].br_cmp(Lt, req[i]) {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        });
+    } else {
+        order.sort_by(|&i, &j| req[i].plain().total_cmp(&req[j].plain()));
+    }
     times.clear();
-    times.extend(saveat.iter().chain(interp_at).map(|&t| clamp(t)));
-    times.sort_by(|x, y| x.total_cmp(y));
-    times.dedup();
+    let mut pos = vec![0usize; req.len()];
+    for (k, &i) in order.iter().enumerate() {
+        if k == 0 || !req[i].br_cmp(Eq, *times.last().expect("one pushed")) {
+            times.push(req[i]);
+        }
+        pos[i] = times.len() - 1;
+    }
 
     // ── Spectral fast path (#2706 follow-up): a diagonalisable `A` with real, distinct
     // eigenvalues — every 1/2/3-compartment disposition with first-order absorption — is
@@ -1125,14 +1442,8 @@ fn segment_in<T: PkNum>(
                 let pk = &sp.proj[k * n * n..(k + 1) * n * n];
                 for r in 0..n {
                     let mut acc = zero;
-                    if T::FUSED_FOLDS {
-                        pairs.clear();
-                        pairs.extend((0..n).map(|col| (pk[r * n + col], b[col])));
-                        acc = T::dot_fold(acc, pairs);
-                    } else {
-                        for col in 0..n {
-                            acc = acc + pk[r * n + col] * b[col];
-                        }
+                    for col in 0..n {
+                        acc = acc + pk[r * n + col] * b[col];
                     }
                     pb[k * n + r] = acc;
                 }
@@ -1140,12 +1451,14 @@ fn segment_in<T: PkNum>(
             states.clear();
             x.clear();
             x.extend_from_slice(u0);
-            let mut t_prev = t0;
+            let mut t_prev = t0_t;
             let mut ok = true;
             for &t in times.iter() {
-                let dt = t - t_prev;
-                if dt > 0.0 {
-                    let dt_t = T::from_f64(dt);
+                // One step a chunk (#2786): every step of every segment is the same code, so
+                // a recording type shares one compiled step whatever the sampling design.
+                T::chunk_mark();
+                let dt_t = t - t_prev;
+                if dt_t.br_cmp_c(Gt, 0.0) {
                     for v in next.iter_mut().take(n) {
                         *v = zero;
                     }
@@ -1154,29 +1467,22 @@ fn segment_in<T: PkNum>(
                         let z = lam * dt_t;
                         let e = z.exp();
                         // φ(λ, Δ) = (e^{λΔ} − 1)/λ = Δ·g(λΔ), lifted exactly ([`exprel_derivs`]).
-                        let [g0, g1, g2, g3, g4] = exprel_derivs(z.val(), jet_orders);
-                        let phi = dt_t * z.lift4(g0, g1, g2, g3, g4);
+                        let phi = dt_t * z.exprel(jet_orders);
                         let pk = &sp.proj[k * n * n..(k + 1) * n * n];
                         for r in 0..n {
-                            // One tape node per entry on a taped type (`PkNum::dot_fold`), as
-                            // the Padé path's products.
-                            let px = if T::FUSED_FOLDS {
-                                pairs.clear();
-                                pairs.extend((0..n).map(|col| (pk[r * n + col], x[col])));
-                                T::dot_fold(zero, pairs)
-                            } else {
-                                let mut px = zero;
-                                for col in 0..n {
-                                    px = px + pk[r * n + col] * x[col];
-                                }
-                                px
-                            };
+                            let mut px = zero;
+                            for col in 0..n {
+                                px = px + pk[r * n + col] * x[col];
+                            }
                             next[r] = next[r] + e * px + phi * pb[k * n + r];
                         }
                     }
                     std::mem::swap(x, next);
                     t_prev = t;
-                    if !reproduces(x, t_mid, direct) {
+                    // A recording type's generator is exact and its RHS proven affine
+                    // ([`RecHooks::affine_parts`]): there is nothing for a propagated state to
+                    // catch.
+                    if !T::RECORDS_BRANCHES && !reproduces(x, t_mid, direct) {
                         ok = false;
                         break;
                     }
@@ -1184,22 +1490,9 @@ fn segment_in<T: PkNum>(
                 states.extend_from_slice(x);
             }
             if ok {
-                let lookup = |t: f64| -> Vec<T> {
-                    let tc = clamp(t);
-                    if tc <= t0 {
-                        return u0.to_vec();
-                    }
-                    let i = times
-                        .binary_search_by(|s| s.total_cmp(&tc))
-                        .expect("every requested time was propagated");
-                    states[i * n..(i + 1) * n].to_vec()
-                };
-                let at = |ts: &[f64]| -> Vec<SolPointG<T>> {
-                    ts.iter().map(|&t| SolPointG { t, u: lookup(t) }).collect()
-                };
                 #[cfg(test)]
                 SPECTRAL_HITS.with(|c| c.set(c.get() + 1));
-                return Some((at(saveat), at(interp_at)));
+                return Some(points(saveat, interp_at, &pos, states, n));
             }
         }
     }
@@ -1209,22 +1502,54 @@ fn segment_in<T: PkNum>(
     // ‖M‖, and with it the squaring count: `du/dt = 1e20 − u` over unit time needs ~64
     // squarings and was declined. Scaling the column to the rates' magnitude leaves the
     // squaring count to `A`, where it belongs; `c` is a plain constant, so the jets are exact.
-    let a_max = a.iter().fold(0.0_f64, |acc, x| acc.max(x.val().abs()));
-    // Jets included: a forcing whose value is 0 but whose derivative is 1e292 leaves the
-    // generator's value at zero (no squarings) while the Padé numerator multiplies that jet by
-    // ~3e16 and overflows it.
-    let b_max = b.iter().fold(0.0_f64, |acc, x| {
-        acc.max(x.val().abs()).max(x.jet_max_abs())
-    });
-    let c = (b_max / a_max.max(1.0)).max(1.0);
-    let inv_c = T::from_f64(1.0 / c);
-    for i in 0..n {
-        for j in 0..n {
-            gen[i * m + j] = a[i * n + j];
-        }
-        gen[i * m + n] = b[i] * inv_c;
+    // Magnitudes only scale: `c` is a plain constant, any value of it exact.
+    let (c, inv_c) = if T::RECORDS_BRANCHES {
+        // A recording type (#2786) reads `c` off the values at run time ([`forcing_scale`]):
+        // data, so the jets stay exact, and a plan's result is the same whatever point it
+        // was recorded at — a scale fixed at recording would round differently elsewhere.
+        let mut args: Vec<T> = a[..n * n].to_vec();
+        args.extend_from_slice(&b[..n]);
+        args.push(T::from_f64(n as f64));
+        let c = T::host(crate::sens::num::HostFn::ForcingScale, &args)[0];
+        (c, T::from_f64(1.0) / c)
+    } else {
+        let a_max = a.iter().fold(0.0_f64, |acc, x| acc.max(x.plain().abs()));
+        // Jets included: a forcing whose value is 0 but whose derivative is 1e292 leaves the
+        // generator's value at zero (no squarings) while the Padé numerator multiplies that
+        // jet by ~3e16 and overflows it.
+        let b_max = b.iter().fold(0.0_f64, |acc, x| acc.max(x.magnitude_hint()));
+        let c = (b_max / a_max.max(1.0)).max(1.0);
+        (T::from_f64(c), T::from_f64(1.0 / c))
+    };
+
+    // ── Dormant states: a state whose forcing, row and column of `A` are all structural zeros
+    // (`structural_zero`: value 0, no jet, no tape node) neither moves nor moves anything over
+    // the segment, so it is copied through and left out of the exponential. Its row and
+    // column of the full exponential are exactly the identity's: every product that would
+    // reach them is a structural zero, so leaving them out changes no other entry, and the
+    // squaring count, set by ‖A‖₁, is the same. A gated accumulator
+    // (`d/dt(u_k) = G_k·k·x` with `G_k = 0` in this segment) is such a state, and a model
+    // with many of them is a large system of which a few states move (#2760).
+    // Only structural zeros count: a value that is merely 0 (`θ − θ₀` at `θ = θ₀`) has a
+    // derivative and keeps its state live.
+    {
+        use crate::sens::linsolve::structural_zero as sz;
+        live.clear();
+        live.extend(
+            (0..n).filter(|&i| !sz(b[i]) || (0..n).any(|j| !sz(a[i * n + j]) || !sz(a[j * n + i]))),
+        );
     }
-    let c = T::from_f64(c);
+    let nl = live.len();
+    #[cfg(test)]
+    DORMANT_STATES.with(|c| c.set(c.get() + (n - nl)));
+    let m = nl + 1;
+    for (li, &i) in live.iter().enumerate() {
+        for (lj, &j) in live.iter().enumerate() {
+            gen[li * m + lj] = a[i * n + j];
+        }
+        gen[li * m + nl] = b[i] * inv_c;
+    }
+    // The last row, the constant input's, stays the zeros `ws.size` filled it with.
 
     // Propagators keyed by the exact gap, so an evenly spaced grid pays one exponential (and
     // `Expm` shares the Padé step between gaps whose scaled generators coincide, here and in
@@ -1250,19 +1575,28 @@ fn segment_in<T: PkNum>(
     states.clear();
     x.clear();
     x.extend_from_slice(u0);
-    let mut t_prev = t0;
-    for &t in times.iter() {
-        let dt = t - t_prev;
-        if dt > 0.0 {
-            let key = dt.to_bits();
+    let mut t_prev = t0_t;
+    for (step, &t) in times.iter().enumerate() {
+        T::chunk_mark();
+        let dt_t = t - t_prev;
+        if dt_t.br_cmp_c(Gt, 0.0) {
+            // A gap that moves with the inputs is its own exponential.
+            let key = if dt_t.is_constant() {
+                dt_t.nonrec_val()
+                    .map_or(u64::MAX - step as u64, f64::to_bits)
+            } else {
+                u64::MAX - step as u64
+            };
             let idx = match props[..*n_props].iter().position(|(k, _)| *k == key) {
                 Some(i) => i,
                 None => {
-                    let dt_t = T::from_f64(dt);
-                    for (o, &g) in scaled.iter_mut().zip(gen.iter()) {
+                    // Each exponential its own chunk (#2786): its code depends only on the
+                    // squaring count, so a recording type shares it across steps and segments.
+                    T::chunk_mark();
+                    for (o, &g) in scaled[..m * m].iter_mut().zip(gen[..m * m].iter()) {
                         *o = g * dt_t;
                     }
-                    let e = expm.exp(scaled)?;
+                    let e = expm.exp(&scaled[..m * m])?;
                     if *n_props == props.len() {
                         props.push((0, Vec::new()));
                     }
@@ -1274,29 +1608,21 @@ fn segment_in<T: PkNum>(
                     *n_props - 1
                 }
             };
+            // The step itself: the same code whether or not it paid for a new exponential.
+            T::chunk_mark();
             let e = &props[idx].1;
             // `x` is finite here: `u0` passed the magnitude check, and every propagated state
             // passed `reproduces`, which declines a non-finite one
             // (`a_segment_whose_state_overflows_declines`). So a skipped term is exactly `±0`.
-            for i in 0..n {
-                let acc = e[i * m + n] * c;
-                if T::FUSED_FOLDS {
-                    // One tape node per state (`PkNum::dot_fold`), the loop's values.
-                    pairs.clear();
-                    for j in 0..n {
-                        if !crate::sens::linsolve::structural_zero(e[i * m + j]) {
-                            pairs.push((e[i * m + j], x[j]));
-                        }
-                    }
-                    next[i] = T::dot_fold(acc, &pairs);
-                    continue;
-                }
-                let mut acc = acc;
-                for j in 0..n {
-                    if crate::sens::linsolve::structural_zero(e[i * m + j]) {
+            // A dormant state is its entry value; `next` holds the previous step's states.
+            next.copy_from_slice(x);
+            for (li, &i) in live.iter().enumerate() {
+                let mut acc = e[li * m + nl] * c;
+                for (lj, &j) in live.iter().enumerate() {
+                    if crate::sens::linsolve::structural_zero(e[li * m + lj]) {
                         continue;
                     }
-                    acc = acc + e[i * m + j] * x[j];
+                    acc = acc + e[li * m + lj] * x[j];
                 }
                 next[i] = acc;
             }
@@ -1306,29 +1632,38 @@ fn segment_in<T: PkNum>(
             // read the next segment's forcing). The probes and `u0` alone leave a nonlinear
             // RHS undetected whenever it agrees with its secant there — `du/dt = u²` from
             // `u0 = 1` is reproduced exactly at both — but not at the states it then reaches.
-            if !reproduces(x, t_mid, direct) {
+            if !T::RECORDS_BRANCHES && !reproduces(x, t_mid, direct) {
                 return None;
             }
         }
         states.extend_from_slice(x);
     }
 
-    let lookup = |t: f64| -> Vec<T> {
-        let tc = clamp(t);
-        if tc <= t0 {
-            return u0.to_vec();
-        }
-        // `times` is sorted and contains `tc` exactly; `states` holds its state at the same
-        // index.
-        let i = times
-            .binary_search_by(|s| s.total_cmp(&tc))
-            .expect("every requested time was propagated");
-        states[i * n..(i + 1) * n].to_vec()
+    Some(points(saveat, interp_at, &pos, states, n))
+}
+
+/// The save points of a propagation: request `i` (`saveat`, then `interp_at`) reads the state
+/// at its time's position `pos[i]` in `states` (`n` per time).
+fn points<T: PkNum>(
+    saveat: &[f64],
+    interp_at: &[f64],
+    pos: &[usize],
+    states: &[T],
+    n: usize,
+) -> (Vec<SolPointG<T>>, Vec<SolPointG<T>>) {
+    let at = |ts: &[f64], base: usize| -> Vec<SolPointG<T>> {
+        ts.iter()
+            .enumerate()
+            .map(|(k, &t)| {
+                let i = pos[base + k];
+                SolPointG {
+                    t,
+                    u: states[i * n..(i + 1) * n].to_vec(),
+                }
+            })
+            .collect()
     };
-    let at = |ts: &[f64]| -> Vec<SolPointG<T>> {
-        ts.iter().map(|&t| SolPointG { t, u: lookup(t) }).collect()
-    };
-    Some((at(saveat), at(interp_at)))
+    (at(saveat, 0), at(interp_at, saveat.len()))
 }
 
 /// Every buffer [`segment_in`] reuses across segments, for one number type.
@@ -1342,12 +1677,7 @@ struct LinWs<T> {
     scaled: Vec<T>,
     next: Vec<T>,
     x: Vec<T>,
-    pairs: Vec<(T, T)>,
-    params_d: Vec<T>,
-    a_d: Vec<T>,
-    b_d: Vec<T>,
-    x_d: Vec<T>,
-    times: Vec<f64>,
+    times: Vec<T>,
     /// Propagators by the bits of their gap; the first `n_props` are this segment's.
     props: Vec<(u64, Vec<T>)>,
     n_props: usize,
@@ -1355,6 +1685,8 @@ struct LinWs<T> {
     states: Vec<T>,
     /// One exponential workspace per size, its Padé approximants kept between segments.
     expms: Vec<Expm<T>>,
+    /// The segment's live states (not dormant), ascending: the exponential's rows.
+    live: Vec<usize>,
 }
 
 impl<T: PkNum> LinWs<T> {
@@ -1369,16 +1701,12 @@ impl<T: PkNum> LinWs<T> {
             scaled: Vec::new(),
             next: Vec::new(),
             x: Vec::new(),
-            pairs: Vec::new(),
-            params_d: Vec::new(),
-            a_d: Vec::new(),
-            b_d: Vec::new(),
-            x_d: Vec::new(),
             times: Vec::new(),
             props: Vec::new(),
             n_props: 0,
             states: Vec::new(),
             expms: Vec::new(),
+            live: Vec::new(),
         }
     }
     /// Every per-segment buffer at its size for `n` states, filled with `zero` (the values a
@@ -1394,15 +1722,18 @@ impl<T: PkNum> LinWs<T> {
             (&mut self.gen, m * m),
             (&mut self.scaled, m * m),
             (&mut self.next, n),
-            (&mut self.a_d, n * n),
-            (&mut self.b_d, n),
-            (&mut self.x_d, n),
         ] {
             v.clear();
             v.resize(len, zero);
         }
-        self.pairs.clear();
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Dormant states left out of an exponential, summed over this thread's segments: what
+    /// lets a test tell that the reduction ran, rather than a fixture with none to reduce.
+    pub(crate) static DORMANT_STATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 thread_local! {

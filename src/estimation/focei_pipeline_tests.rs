@@ -32,13 +32,14 @@ fn fixture(iov: bool, mixed_fallback: bool) -> (CompiledModel, Population) {
     if mixed_fallback {
         // One subject the adjoint declines while the others stay exact: per-record
         // covariate snapshots (constant, so predictions are unchanged) route it to the
-        // event walk, which declines an SS infusion under a lag time
-        // (`ss_lagtime_walk_unsupported`).
+        // event walk, and every plan of it fails (`kernel_jit::fail_plans_of`; no
+        // regular-path shape declines since #2786).
         let s0 = &mut pop.subjects[0];
         s0.doses[0] = DoseEvent::new(0.0, 100.0, 1, 25.0, true, 24.0);
         let snap: std::collections::HashMap<String, f64> = [("WT".to_string(), 70.0)].into();
         s0.dose_covariates = vec![snap.clone(); s0.doses.len()];
         s0.obs_covariates = vec![snap; s0.obs_times.len()];
+        crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(s0);
     }
     (model, pop)
 }
@@ -82,6 +83,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                         opts.inner_restarts,
                         seed,
                         &opts,
+                        PrevEtas::Placeholder,
                     );
                     for warm in [None, Some(reference.0.as_slice())] {
                         let separate = run_inner_loop_warm_seeded(
@@ -96,6 +98,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                             opts.inner_restarts,
                             seed,
                             &opts,
+                            PrevEtas::Placeholder,
                         );
                         let expected_nll = if iov {
                             crate::stats::likelihood::foce_population_nll_iov(
@@ -129,6 +132,7 @@ fn fused_inner_and_marginal_match_separate_passes() {
                             params,
                             &opts,
                             warm,
+                            PrevEtas::Placeholder,
                             Some(&mu),
                             None,
                             None,
@@ -181,6 +185,7 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             opts.inner_restarts,
             InnerHessianSeed::for_options(&opts),
             &opts,
+            PrevEtas::Placeholder,
         );
         let expected = pop_nll_opts(
             &model,
@@ -191,7 +196,17 @@ fn fused_dispatch_keeps_laplace_and_agq_objectives() {
             &separate.3,
             &opts,
         );
-        let fused = run_inner_loop_and_nll(&model, &pop, params, &opts, None, None, None, None);
+        let fused = run_inner_loop_and_nll(
+            &model,
+            &pop,
+            params,
+            &opts,
+            None,
+            PrevEtas::Placeholder,
+            None,
+            None,
+            None,
+        );
         assert_eq!(expected.to_bits(), fused.4.to_bits());
     }
 }
@@ -634,6 +649,7 @@ fn the_stage_seeded_inner_pass_ignores_a_cancel() {
             0,
             InnerHessianSeed::for_options(&stage),
             &stage,
+            PrevEtas::Placeholder,
         )
         .2
     });
@@ -681,8 +697,9 @@ fn a_cancelled_inner_pass_scores_no_objective() {
                 None,
                 gradient_inputs,
                 None,
-                false,
+                PrevEtas::Placeholder,
                 cancel,
+                None,
             )
         };
 

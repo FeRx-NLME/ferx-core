@@ -35,7 +35,7 @@ Each sweep, for each chain, cycles these blocks:
    prior's $\mathrm{chol}(\Omega)$), followed by componentwise sweeps with a
    step per η. Gradient-guided **HMC** replaces it when requested
    (`n_leapfrog > 0`, an analytical-PK model, no IOV, no mixture). The HMC
-   gradient is the exact analytic `Dual2` η-gradient — the same one FOCEI uses.
+   gradient is the exact analytic η-gradient (compiled plans) — the same one FOCEI uses.
    Every chain starts each subject's η at its empirical Bayes estimate (EBE) at
    the initial parameters; see [Why the chains start at the EBEs](#why-the-chains-start-at-the-ebes).
 

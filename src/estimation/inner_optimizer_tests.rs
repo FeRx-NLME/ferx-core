@@ -284,9 +284,10 @@ fn residual_inner_obs_is_zero_where_inv_mills_underflows() {
             "{far:e}: z={z}, m={m}"
         );
         for y in [near, far] {
-            let (coef, ruv_term) =
-                residual_inner_obs(&model, 1, y, f, sigma, None, ruv_scale, true, cens, None)
-                    .expect("positive variance");
+            let (coef, ruv_term, _) = residual_inner_obs(
+                &model, 1, y, f, sigma, None, ruv_scale, true, cens, None, 0.0,
+            )
+            .expect("positive variance");
             assert!(coef == 0.0, "h·m at y={y:e}, cens={cens}: {coef}");
             assert!(ruv_term == 0.0, "h·z at y={y:e}, cens={cens}: {ruv_term}");
         }
@@ -948,7 +949,7 @@ fn legacy_step(
     n: usize,
     f0: f64,
 ) -> (f64, f64, Option<Vec<f64>>) {
-    match exact_step_verified_by_gradient(obj, grad, x, d, f0, g, None, false) {
+    match exact_step_verified_by_gradient(obj, None, grad, x, d, f0, g, None, false) {
         Verdict::Verified(fc, gc) => (1.0, fc, Some(gc)),
         Verdict::Rejected(g_full) => {
             let (alpha, f) = legacy_line_search(obj, x, d, g, n, f0);
@@ -1247,7 +1248,7 @@ fn line_search_finds_armijo_step_quickly() {
     };
     let mut trial = [0.0];
     let (alpha, f_new) =
-        backtracking_line_search(&counting, &x, &d, &g, f0, &mut trial, false, false);
+        backtracking_line_search(&counting, None, &x, &d, &g, f0, &mut trial, false, false);
     let evals = evals.get();
     assert!(alpha > 0.0, "a descent step must be found");
     let c1 = 1e-4;
@@ -1280,7 +1281,8 @@ fn line_search_rejects_non_descent_direction() {
     let d = [g[0]]; // SAME sign as g → dg = +36 ≥ 0 (ascent)
     let f0 = obj(&x);
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial, false, false);
+    let (alpha, f_new) =
+        backtracking_line_search(&obj, None, &x, &d, &g, f0, &mut trial, false, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1303,13 +1305,13 @@ fn line_search_survives_non_finite_objective() {
     let nan_obj = |_: &[f64]| -> f64 { f64::NAN };
     let mut trial = [0.0];
     let (alpha, f_new) =
-        backtracking_line_search(&nan_obj, &x, &d, &g, f0, &mut trial, false, false);
+        backtracking_line_search(&nan_obj, None, &x, &d, &g, f0, &mut trial, false, false);
     assert_eq!(alpha, 0.0, "a never-finite objective yields no step");
     assert_eq!(f_new, f0, "baseline objective is returned unchanged");
     // +inf trials behave identically (never accepted, never a panic).
     let inf_obj = |_: &[f64]| -> f64 { f64::INFINITY };
     let (alpha, f_new) =
-        backtracking_line_search(&inf_obj, &x, &d, &g, f0, &mut trial, false, false);
+        backtracking_line_search(&inf_obj, None, &x, &d, &g, f0, &mut trial, false, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1325,7 +1327,8 @@ fn line_search_rejects_non_finite_direction() {
     let d = [f64::INFINITY]; // dg = −inf: a non-finite "descent" direction
     let f0 = obj(&x);
     let mut trial = [0.0];
-    let (alpha, f_new) = backtracking_line_search(&obj, &x, &d, &g, f0, &mut trial, false, false);
+    let (alpha, f_new) =
+        backtracking_line_search(&obj, None, &x, &d, &g, f0, &mut trial, false, false);
     assert_eq!(alpha, 0.0);
     assert_eq!(f_new, f0);
 }
@@ -1438,6 +1441,7 @@ fn test_ebe_result_converged_flag() {
         h_matrix: nalgebra::DMatrix::identity(2, 2),
         fd_h_redone: false,
         terminal_hessian: None,
+        ipreds: None,
         converged: true,
         used_fallback: false,
         nm_polished: false,
@@ -1674,8 +1678,10 @@ fn hessian_seed_declines_under_the_fd_inner_gradient_hatch() {
                 screen: 0,
                 twin_seed: false,
                 init_is_mode: false,
+                init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
+                skip_refused: false,
             },
             h.map(|h| PredictedFrom {
                 mode: &warm,
@@ -1756,8 +1762,10 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 screen: 0,
                 twin_seed: false,
                 init_is_mode: false,
+                init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
+                skip_refused: false,
             },
         );
         (r.eta, r.h_matrix, r.grad_norm, r.nll)
@@ -1785,8 +1793,10 @@ fn hessian_seed_applies_only_to_genuinely_warm_started_solves() {
                 screen: 0,
                 twin_seed: false,
                 init_is_mode: false,
+                init_is_warm: false,
                 keep_certified_start: false,
                 unseeded_iov_warm: false,
+                skip_refused: false,
             },
             true,
             None,
@@ -1863,8 +1873,10 @@ fn cold_seeded_solve_keeps_the_lower_of_both_metrics() {
         screen: 0,
         twin_seed: false,
         init_is_mode: false,
+        init_is_warm: false,
         keep_certified_start: false,
         unseeded_iov_warm: false,
+        skip_refused: false,
     };
     let cases = [
         // (subject id, theta index to scale, factor, seeded side should win)
@@ -1981,6 +1993,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             h_matrix: nalgebra::DMatrix::identity(1, 1),
             fd_h_redone: false,
             terminal_hessian: None,
+            ipreds: None,
             converged: false, // unconverged
             used_fallback: false,
             nm_polished: false,
@@ -1996,6 +2009,7 @@ fn test_inner_loop_stats_min_obs_filter() {
             h_matrix: nalgebra::DMatrix::identity(1, 1),
             fd_h_redone: false,
             terminal_hessian: None,
+            ipreds: None,
             converged: false, // also unconverged
             used_fallback: true,
             nm_polished: false,
@@ -2032,6 +2046,7 @@ fn test_inner_loop_stats_counts_hard_reject_regardless_of_obs() {
         h_matrix: nalgebra::DMatrix::zeros(1, 1),
         fd_h_redone: false,
         terminal_hessian: None,
+        ipreds: None,
         converged: false,
         used_fallback: false,
         nm_polished: false,
@@ -2102,6 +2117,7 @@ fn frem_model_and_subject() -> (CompiledModel, Subject) {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -2732,6 +2748,7 @@ fn cached_schedule_inner_loop_matches_uncached() {
         0,
         &schedules,
         InnerSolvePolicy::default(),
+        None,
         None,
         |_, _| (),
     );
@@ -3859,6 +3876,7 @@ mod frozen_ebe_variance {
                 interaction: false,
                 ..Default::default()
             },
+            PrevEtas::Placeholder,
         );
         assert_eq!(
             stats.n_fallback, 0,
@@ -4263,11 +4281,10 @@ mod frozen_ebe_variance {
 }
 
 /// A subject carrying a TTE record on a drug-driven (ODE-accumulated) hazard resolves its
-/// inner η-gradient to **analytic** when the dual walk serves it — the hazard's curves on
-/// the η-dual (`cumhaz_hazard_from_states`) — and to **FD** when it does not: the same subject
-/// under a steady-state dose, which the dual equilibration cannot carry an accumulator
-/// through (#1210). The route the predicate reports is the one that runs. The control is
-/// the same subject without its event record.
+/// inner η-gradient to **analytic**: the hazard's curves on the η-dual
+/// (`cumhaz_hazard_from_states`), off the static walk, or — under a steady-state dose, whose
+/// run-in holds the accumulator (#1210) — off the event-driven walk. The control is the same
+/// subject without its event record.
 #[cfg(feature = "survival")]
 #[test]
 fn an_ode_hazard_subject_resolves_its_inner_gradient_by_the_walks_scope() {
@@ -4332,8 +4349,8 @@ fn an_ode_hazard_subject_resolves_its_inner_gradient_by_the_walks_scope() {
     ss.doses = vec![DoseEvent::new(1.0, 100.0, 1, 0.0, true, 12.0)];
     assert_eq!(
         resolve_gradient_method(&model, &ss),
-        InnerGradientMethod::Fd,
-        "under a steady-state dose the hazard's static walk declines, and the route says so"
+        InnerGradientMethod::Analytic,
+        "under a steady-state dose the event-driven walk serves the hazard"
     );
 }
 
@@ -4417,6 +4434,8 @@ fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
     let mut ss = DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0);
     ss.rate_mode = RateMode::Fixed;
     c.doses = vec![ss];
+    // Every plan of `c` fails: no regular-path shape declines since #2786.
+    crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&c);
     let theta = &tte_model.default_params.theta;
     let zeros = [0.0];
     assert_eq!(subject_inner_fd_reason(&tte_model, &a, theta, &zeros), None);
@@ -4427,7 +4446,7 @@ fn fd_fallback_warning_names_the_survival_cause_and_the_label_reports_fd() {
     assert_eq!(
         subject_inner_fd_reason(&tte_model, &c, theta, &zeros),
         Some(InnerFdReason::Shape),
-        "fixture precondition: the SS infusion under a lag is a shape decline"
+        "fixture precondition: a subject whose plans fail is a shape decline"
     );
 
     let warn = |subjects: Vec<Subject>| {
@@ -4818,6 +4837,77 @@ fn gradient_fd_keeps_the_inner_search_and_h_off_the_exact_routes() {
         gap < 1e-4,
         "the FD H must still be the same matrix: gap {gap:.2e}"
     );
+}
+
+/// An SDE subject's inner search runs on the per-row assembler, which reads the EKF variance
+/// rows off the subject's plan: every step on the analytic route, none on the kernel's
+/// fallback or on finite differences, and no plan failure (`W_PLAN_FD_FALLBACK` counts none).
+/// The seed's fused first gradient is that same gradient. Dies when `analytic_inner_grad_supported`
+/// declines the model again (the steps move to the kernel route) or when the seed or the
+/// assembler drops the variance rows (the seed's gradient parts from the assembler's).
+#[test]
+fn sde_inner_search_runs_on_the_per_row_assembler() {
+    use std::path::Path;
+    let model =
+        crate::parser::model_parser::parse_model_file(Path::new("examples/warfarin_sde.ferx"))
+            .expect("warfarin_sde parses");
+    let pop = crate::read_nonmem_csv(Path::new("data/warfarin_sde.csv"), None, None)
+        .expect("warfarin_sde data loads");
+    let subj = &pop.subjects[0];
+    let params = model.default_params.clone();
+    assert!(model.is_sde());
+    INNER_AGRAD_ROUTE.with(|c| c.set((0, 0, 0)));
+    let ebe = find_ebe(&model, subj, &params, 200, 1e-8, None, None, 0);
+    let (analytic, exact, fd) = INNER_AGRAD_ROUTE.with(|c| c.get());
+    assert!(
+        ebe.nll.is_finite() && ebe.converged,
+        "{} {}",
+        ebe.nll,
+        ebe.converged
+    );
+    assert!(
+        analytic > 0 && exact == 0 && fd == 0,
+        "{analytic} analytic / {exact} exact / {fd} FD steps"
+    );
+    assert!(
+        crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failures(
+            &model,
+            std::slice::from_ref(subj)
+        )
+        .is_none(),
+        "a plan failed"
+    );
+    let eta = [0.08, -0.06, 0.1];
+    let keys = model.error_spec.obs_keys(subj);
+    let (_, seed_g) = analytic_inner_seed_hessian(
+        &model,
+        subj,
+        &params,
+        &eta,
+        None,
+        None,
+        keys.as_ref(),
+        &mut Vec::new(),
+        false,
+        None,
+    )
+    .expect("the seed serves an SDE subject");
+    let seed_g = seed_g.expect("the light seed fuses the first gradient");
+    let g = analytic_eta_nll_gradient(
+        &model,
+        subj,
+        &params.theta,
+        &eta,
+        &params.omega,
+        &params.sigma.values,
+    )
+    .expect("served");
+    for (a, b) in seed_g.iter().zip(&g) {
+        assert!(
+            (a - b).abs() <= 1e-12 * (1.0 + b.abs()),
+            "seed {a} vs assembler {b}"
+        );
+    }
 }
 
 /// A cold start on a steep objective takes a bounded first step (`cap_curvature_free_step`).
@@ -5412,6 +5502,7 @@ fn choose_step_takes_each_arm() {
         let mut buf = [0.0];
         choose_step(
             &obj,
+            None,
             &grad,
             &[x0],
             &[d],
@@ -5980,7 +6071,7 @@ mod weighted_dense_residual_inner {
             } else {
                 assert_eq!(label, GradientMethodKind::Analytic, "{cell}");
                 assert!(
-                    banner.starts_with("analytic (Dual2)  [requested: auto]"),
+                    banner.starts_with("analytic  [requested: auto]"),
                     "{cell}: {banner}"
                 );
                 assert!(
@@ -6914,6 +7005,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
         let exit = if dense {
             dense_bfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -6928,6 +7020,7 @@ fn inner_drivers_stop_on_repeated_exact_non_moves() {
         } else {
             lbfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -6977,6 +7070,7 @@ fn inner_drivers_do_not_call_a_moving_gradient_stuck() {
             let exit = if dense {
                 dense_bfgs_run(
                     &obj,
+                    None,
                     &grad,
                     &mut x,
                     2,
@@ -6991,6 +7085,7 @@ fn inner_drivers_do_not_call_a_moving_gradient_stuck() {
             } else {
                 lbfgs_run(
                     &obj,
+                    None,
                     &grad,
                     &mut x,
                     2,
@@ -7029,6 +7124,7 @@ fn inner_drivers_do_not_call_a_moving_iterate_stuck() {
         let exit = if dense {
             dense_bfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -7043,6 +7139,7 @@ fn inner_drivers_do_not_call_a_moving_iterate_stuck() {
         } else {
             lbfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -7079,6 +7176,7 @@ fn inner_drivers_do_not_call_a_cumulative_drift_stuck() {
         let exit = if dense {
             dense_bfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -7093,6 +7191,7 @@ fn inner_drivers_do_not_call_a_cumulative_drift_stuck() {
         } else {
             lbfgs_run(
                 &obj,
+                None,
                 &grad,
                 &mut x,
                 2,
@@ -7336,6 +7435,7 @@ fn an_unusable_predicted_start_or_end_takes_the_mode() {
             h_matrix: DMatrix::zeros(0, 2),
             fd_h_redone: false,
             terminal_hessian: None,
+            ipreds: None,
             converged: false,
             used_fallback: true,
             nm_polished: false,
@@ -7417,6 +7517,7 @@ fn an_extrapolated_predicted_start_still_reaches_the_mode() {
             0,
             None,
             policy,
+            None,
             None,
             outcome,
         );
@@ -7534,4 +7635,668 @@ fn a_carried_exact_seed_replaces_the_fresh_one_and_reaches_the_same_mode() {
         worst < 1e-10,
         "carried vs fresh seed reach different modes ({worst:.3e})"
     );
+}
+
+/// Value/gradient fusion: the value [`analytic_eta_nll_value_gradient_with_schedule`] scores off
+/// the recorder's predictions is the objective's own value, and its gradient the plain
+/// gradient's, bit for bit — the line search compares one with the other, so a rounding gap
+/// between the two sources would be read as a step's gain. The worst relative gap is printed
+/// (`--nocapture`) per model class; the bound is the measured gap with headroom.
+#[test]
+fn fused_value_is_the_native_objective_value() {
+    use std::path::Path;
+    // (model, data, bound): closed form and a nonlinear (Michaelis-Menten) ODE.
+    let cases = [
+        ("examples/warfarin.ferx", "data/warfarin.csv", 1e-12),
+        ("examples/two_cpt_iv_ode.ferx", "data/two_cpt_iv.csv", 1e-12),
+        ("examples/mm_oral.ferx", "data/mm_oral.csv", 1e-6),
+        ("examples/mm_iv.ferx", "data/mm_iv.csv", 1e-6),
+    ];
+    for (mf, df, bound) in cases {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+        let pop = crate::read_nonmem_csv(Path::new(df), None, None).expect("data");
+        let params = model.default_params.clone();
+        let mut worst = 0.0_f64;
+        let mut n_fused = 0usize;
+        let mut n_bits = 0usize;
+        for subj in pop.subjects.iter().take(6) {
+            for scale in [0.0, 0.3, -0.5] {
+                let eta: Vec<f64> = (0..model.n_eta)
+                    .map(|k| scale * (1.0 + 0.1 * k as f64))
+                    .collect();
+                let keys = model.error_spec.obs_keys(subj);
+                let mult = model.ruv_obs_mult(subj, &params.theta);
+                let mut v = None;
+                let g = analytic_eta_nll_value_gradient_with_schedule(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    None,
+                    mult.as_deref(),
+                    keys.as_ref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(model.n_eta),
+                    &mut DVector::zeros(model.n_eta),
+                    None,
+                    Some(&mut v),
+                )
+                .expect("in scope");
+                let g0 = analytic_eta_nll_gradient(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                )
+                .expect("in scope");
+                assert_eq!(
+                    g.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    g0.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "the fused pass must return the plain gradient bit for bit"
+                );
+                let v = v.expect("a plain Gaussian subject is scored");
+                n_fused += 1;
+                let want = individual_nll_into_prepared_with_schedule_frozen(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    &mut pk::EventPkParams::default(),
+                    None,
+                    keys.as_ref(),
+                    mult.as_deref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(eta.len()),
+                    &mut DVector::zeros(eta.len()),
+                    None,
+                );
+                assert!(v.is_finite() && want.is_finite());
+                n_bits += usize::from(v.to_bits() == want.to_bits());
+                let gap = (v - want).abs() / (1.0 + want.abs());
+                assert!(gap.is_finite());
+                worst = worst.max(gap); // nan-ok: gap asserted finite above
+            }
+        }
+        eprintln!(
+            "fused value vs native objective, {mf}: {n_fused} points ({n_bits} bit-equal), worst relative gap {worst:.3e}"
+        );
+        assert!(
+            worst < bound,
+            "{mf}: fused value gap {worst:.3e} >= {bound:.0e}"
+        );
+        // The inner solve memoises this value next to native ones (`obj`'s memo), so the line
+        // search compares one engine's values only if they are bit-equal. Measured on Linux
+        // x86_64: every point of all four classes (closed form, linear ODE, nonlinear ODE
+        // oral and IV) is bit-equal at the gradient pass's first-order layout.
+        assert_eq!(
+            n_bits, n_fused,
+            "{mf}: the memoised fused value must be bit-equal"
+        );
+    }
+}
+
+/// The objective memo of one inner solve is one engine's values. The gradient pass's fused value
+/// ([`analytic_eta_nll_value_gradient_with_schedule`]) is the native objective to ~1e-15 on an ODE
+/// objective but not bit for bit (measured: 69 of 600 points over mm thetas x1..x10, worst
+/// relative gap 2e-15; `x3` and `x10` take the Rosenbrock stepper), so `find_ebe_solve` puts it in
+/// the memo for a closed-form objective only. Both sides of that gate in one test: an ODE
+/// subject at stiff thetas leaves the memo untouched by the plan, a closed-form one fills it.
+#[test]
+fn ode_objective_memo_holds_native_values_only_at_stiff_points() {
+    use std::path::Path;
+    let puts = |mf: &str, df: &str, scales: &[f64]| {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+        let pop = crate::read_nonmem_csv(Path::new(df), None, None).expect("data");
+        let before = MEMO_PLAN_PUTS.with(|c| c.get());
+        for &ts in scales {
+            let mut params = model.default_params.clone();
+            for (k, th) in params.theta.iter_mut().enumerate() {
+                *th *= if k % 2 == 0 { ts } else { 1.0 / ts };
+            }
+            for subj in pop.subjects.iter().take(8) {
+                let _ = find_ebe(&model, subj, &params, 500, 1e-8, None, None, 0);
+            }
+        }
+        MEMO_PLAN_PUTS.with(|c| c.get()) - before
+    };
+    let ode = puts(
+        "examples/mm_oral.ferx",
+        "data/mm_oral.csv",
+        &[1.0, 3.0, 10.0],
+    );
+    let closed = puts("examples/warfarin.ferx", "data/warfarin.csv", &[1.0]);
+    assert_eq!(ode, 0, "an ODE objective's memo took a plan value");
+    assert!(
+        closed > 0,
+        "the closed-form route stopped memoising the fused value"
+    );
+}
+
+/// A lagged closed-form model's plan value is up to 5 ulp off the native walk
+/// (`plan_value_bit_equal`), so the memo must not hold it: no fused value of an ALAG model is put
+/// in the objective memo, and the lag-free control of the same shape still is (both sides of the
+/// one predicate in one test).
+#[test]
+fn lagged_closed_form_memo_holds_native_values_only() {
+    use std::path::Path;
+    let puts = |mf: &str| {
+        let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+        let pop = crate::read_nonmem_csv(Path::new("data/one_cpt_oral_lagtime.csv"), None, None)
+            .expect("data");
+        let (b0, b1) = (
+            MEMO_PLAN_PUTS.with(|c| c.get()),
+            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get()),
+        );
+        for subj in pop.subjects.iter().take(8) {
+            let _ = find_ebe(
+                &model,
+                subj,
+                &model.default_params,
+                500,
+                1e-8,
+                None,
+                None,
+                0,
+            );
+        }
+        (
+            MEMO_PLAN_PUTS.with(|c| c.get()) - b0,
+            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get()) - b1,
+        )
+    };
+    let lagged = puts("examples/oral_with_lagtime.ferx");
+    assert_eq!(lagged, (0, 0), "a lagged model's memo took a plan value");
+    let control = puts("examples/warfarin.ferx");
+    assert!(control.0 > 0, "the lag-free closed form stopped memoising");
+}
+
+/// The effective model is decided at each evaluation, not once per solve: a transit solve that
+/// starts in the closed form's domain and crosses into its ODE twin (the #1521 fixture) must put
+/// no fused value in the memo at an ODE-twin point, where plan and native integrations differ.
+#[test]
+fn memo_holds_no_plan_value_once_a_solve_crosses_into_the_ode_twin() {
+    let subject = flip_flop_transit_subject();
+    for tvcl in [4.0_f64, 4.5] {
+        let m = flip_flop_transit_model(tvcl, 110.0, 24.0, 0.0);
+        let p = m.default_params.clone();
+        let b = MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get());
+        let res = find_ebe(&m, &subject, &p, 200, 1e-6, None, None, 0);
+        // The straddle: the solve starts in the closed form and ends in the twin.
+        assert!(!crate::pk::absorption_flip_flop_at(
+            &m,
+            &subject,
+            &p.theta,
+            &vec![0.0; m.n_eta]
+        ));
+        assert!(crate::pk::absorption_flip_flop_at(
+            &m,
+            &subject,
+            &p.theta,
+            res.eta.as_slice()
+        ));
+        assert_eq!(
+            MEMO_PLAN_PUTS_NON_NATIVE.with(|c| c.get()) - b,
+            0,
+            "TVCL = {tvcl}: a plan value was memoised at an ODE-twin point"
+        );
+    }
+}
+
+/// The size of what the gate above avoids: at stiff thetas the plan's value differs from the
+/// native objective in the last bits only (measured worst 2e-15 relative; bound with headroom).
+#[test]
+fn fused_value_gap_to_native_at_stiff_points_is_last_bits() {
+    use std::path::Path;
+    let (mf, df) = ("examples/mm_oral.ferx", "data/mm_oral.csv");
+    let model = crate::parser::model_parser::parse_model_file(Path::new(mf)).expect("model");
+    let pop = crate::read_nonmem_csv(Path::new(df), None, None).expect("data");
+    let (mut n, mut n_bad) = (0usize, 0usize);
+    let mut worst = 0.0_f64;
+    for ts in [1.0, 3.0, 10.0, 0.3, 0.1] {
+        let mut params = model.default_params.clone();
+        for (k, th) in params.theta.iter_mut().enumerate() {
+            *th *= if k % 2 == 0 { ts } else { 1.0 / ts };
+        }
+        for subj in pop.subjects.iter().take(20) {
+            for scale in [0.0, 0.3, -0.5, 1.0, -1.5, 2.5] {
+                let eta: Vec<f64> = (0..model.n_eta)
+                    .map(|k| scale * (1.0 + 0.1 * k as f64))
+                    .collect();
+                let keys = model.error_spec.obs_keys(subj);
+                let mult = model.ruv_obs_mult(subj, &params.theta);
+                let mut v = None;
+                analytic_eta_nll_value_gradient_with_schedule(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    None,
+                    mult.as_deref(),
+                    keys.as_ref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(model.n_eta),
+                    &mut DVector::zeros(model.n_eta),
+                    None,
+                    Some(&mut v),
+                )
+                .expect("in scope");
+                let Some(v) = v else { continue };
+                let want = individual_nll_into_prepared_with_schedule_frozen(
+                    &model,
+                    subj,
+                    &params.theta,
+                    &eta,
+                    &params.omega,
+                    &params.sigma.values,
+                    model.residual_cov_at(&params),
+                    &mut pk::EventPkParams::default(),
+                    None,
+                    keys.as_ref(),
+                    mult.as_deref(),
+                    &mut Vec::new(),
+                    &mut DVector::zeros(eta.len()),
+                    &mut DVector::zeros(eta.len()),
+                    None,
+                );
+                assert!(v.is_finite() && want.is_finite());
+                n += 1;
+                n_bad += usize::from(v.to_bits() != want.to_bits());
+                let gap = (v - want).abs() / (1.0 + want.abs());
+                assert!(gap.is_finite());
+                worst = worst.max(gap); // nan-ok: gap asserted finite above
+            }
+        }
+    }
+    eprintln!("{n} points, {n_bad} differ in bits, worst relative gap {worst:.3e}");
+    assert!(n > 0 && worst < 1e-12, "fused value gap {worst:.3e}");
+}
+
+/// #2709: [`GuardStop`] counts exactly what the end-of-pass [`InnerLoopStats`] counts, and
+/// stops at exactly the count `outer_optimizer::ebe_guard_rejects` rejects on. Each case is
+/// one input that flips the answer from its neighbour.
+mod guard_stop {
+    use super::*;
+
+    /// A subject with `n_obs` scored rows.
+    fn subject(n_obs: usize) -> Subject {
+        Subject {
+            id: format!("S{n_obs}"),
+            observations: vec![1.0; n_obs],
+            ..Default::default()
+        }
+    }
+
+    /// An EBE result with the given verdict.
+    fn result(converged: bool, hard_reject: bool) -> EbeResult {
+        EbeResult {
+            eta: DVector::zeros(1),
+            h_matrix: DMatrix::zeros(1, 1),
+            fd_h_redone: false,
+            terminal_hessian: None,
+            converged,
+            used_fallback: false,
+            nm_polished: false,
+            grad_norm: 0.0,
+            nll: 0.0,
+            kappas: Vec::new(),
+            hard_reject,
+            screen_moved: false,
+            twin_moved: false,
+            ipreds: None,
+        }
+    }
+
+    #[test]
+    fn the_fraction_arm_stops_one_past_the_threshold() {
+        // 10 subjects at `max_unconverged_frac = 0.1`: the guard rejects 2 unconverged
+        // (0.2 > 0.1), not 1 (0.1 is not > 0.1).
+        let stop = GuardStop::new(10, 1, 0.1);
+        stop.record(&subject(5), &result(false, false));
+        assert!(!stop.stopped(), "1 of 10 is not past 0.1");
+        stop.record(&subject(5), &result(true, false));
+        assert!(!stop.stopped(), "a converged subject adds nothing");
+        stop.record(&subject(5), &result(false, false));
+        assert!(stop.stopped(), "2 of 10 is past 0.1");
+        assert_eq!(stop.solved(), 3);
+        let s = stop.observed_stats();
+        assert_eq!((s.n_unconverged, s.n_start_rejected), (2, 0));
+    }
+
+    #[test]
+    fn a_hard_rejection_stops_at_once_and_counts_without_the_min_obs_filter() {
+        // A subject below `min_obs`, hard-rejected: the guard's hard-reject arm takes it,
+        // whatever its row count; its unconverged flag does not count.
+        let stop = GuardStop::new(10, 3, 0.5);
+        stop.record(&subject(1), &result(false, true));
+        assert!(stop.stopped());
+        let s = stop.observed_stats();
+        assert_eq!((s.n_unconverged, s.n_start_rejected), (0, 1));
+    }
+
+    #[test]
+    fn an_unconverged_subject_below_min_obs_is_not_counted() {
+        // `min_obs = 3`: the 2-row subjects are left out of the fraction, the 3-row one counts.
+        let stop = GuardStop::new(4, 3, 0.0);
+        stop.record(&subject(2), &result(false, false));
+        stop.record(&subject(2), &result(false, false));
+        assert!(!stop.stopped(), "below min_obs: not counted");
+        assert_eq!(stop.observed_stats().n_unconverged, 0);
+        stop.record(&subject(3), &result(false, false));
+        assert!(stop.stopped(), "at min_obs: counted, 1 of 4 > 0.0");
+    }
+
+    #[test]
+    fn a_negative_fraction_disables_the_fraction_arm_but_not_a_hard_rejection() {
+        let stop = GuardStop::new(2, 1, -1.0);
+        stop.record(&subject(5), &result(false, false));
+        stop.record(&subject(5), &result(false, false));
+        assert!(
+            !stop.stopped(),
+            "every subject unconverged, fraction arm off"
+        );
+        stop.record(&subject(5), &result(false, true));
+        assert!(stop.stopped(), "a hard rejection still rejects");
+    }
+
+    /// The token reproduces the end-of-pass guard verdict on any record sequence: once it
+    /// has stopped, `ebe_guard_rejects` on the counts of *all* subjects rejects too
+    /// (counts only grow), and a sequence that never stops it is one the guard accepts.
+    #[test]
+    fn its_verdict_matches_the_guard_on_the_whole_pass() {
+        use crate::estimation::outer_optimizer::ebe_guard_rejects;
+        let verdicts = [(true, false), (false, false), (false, true)];
+        // Every 4-subject sequence of the three verdicts, at three thresholds.
+        for frac in [0.0, 0.25, 0.5] {
+            for code in 0..81usize {
+                let seq: Vec<(bool, bool)> = (0..4)
+                    .map(|k| verdicts[(code / 3usize.pow(k)) % 3])
+                    .collect();
+                let stop = GuardStop::new(4, 1, frac);
+                let mut stopped_at = None;
+                for (i, &(c, h)) in seq.iter().enumerate() {
+                    stop.record(&subject(5), &result(c, h));
+                    if stop.stopped() && stopped_at.is_none() {
+                        stopped_at = Some(i);
+                    }
+                }
+                let whole = InnerLoopStats {
+                    n_unconverged: seq.iter().filter(|(c, _)| !c).count(),
+                    n_start_rejected: seq.iter().filter(|(_, h)| *h).count(),
+                    ..Default::default()
+                };
+                let rejects = ebe_guard_rejects(&whole, 4, -100.0, frac);
+                assert_eq!(
+                    stopped_at.is_some(),
+                    rejects,
+                    "frac {frac}, sequence {seq:?}: stopped at {stopped_at:?}, guard {rejects}"
+                );
+            }
+        }
+    }
+}
+
+/// `FERX_TIME_GRADIENTS` is read per fit, not once per process: a second fit in one session
+/// follows the variable's value then (the first printed timings, the second's counters stayed
+/// zero because the span flag was cached). Mutation: cache the flag in a `OnceLock` again ->
+/// the second `arm` does not turn timing off / on.
+#[test]
+fn gradient_timing_follows_each_fits_reading_of_the_variable() {
+    let t = GradientTimings::new();
+    assert!(t.start().is_none(), "off until a fit arms it");
+    assert!(t.arm(Some("1")));
+    assert!(t.start().is_some());
+    // The next fit reads the variable unset: no spans.
+    assert!(!t.arm(None));
+    assert!(t.start().is_none());
+    // And set again, in either spelling.
+    assert!(t.arm(Some("TRUE")));
+    assert!(t.start().is_some());
+    assert!(!t.arm(Some("0")));
+    assert!(t.start().is_none());
+}
+
+/// The mode's predictions are handed back bit for bit from the one walk kept per solve, also
+/// where the search's last walk was another point (a probe beside the mode), and a solve of an
+/// ODE model holds one entry however many points it visited. Mutation: drop the kept walk's
+/// read-back at the end of the solve -> `ipreds` is `None` for the solves counted below.
+#[test]
+fn the_kept_walk_returns_the_modes_predictions_bit_for_bit() {
+    use std::path::Path;
+    let model = crate::parser::model_parser::parse_model_file(Path::new("examples/mm_oral.ferx"))
+        .expect("model");
+    let pop = crate::read_nonmem_csv(Path::new("data/mm_oral.csv"), None, None).expect("data");
+    let params = model.default_params.clone();
+    let before = BEST_WALK_RESTORES.with(|c| c.get());
+    let mut n_some = 0;
+    for subj in pop.subjects.iter().take(8) {
+        let r = find_ebe(&model, subj, &params, 500, 1e-8, None, None, 0);
+        let Some(ip) = r.ipreds.as_ref() else {
+            continue;
+        };
+        n_some += 1;
+        let eta: Vec<f64> = r.eta.iter().copied().collect();
+        let keys = model.error_spec.obs_keys(subj);
+        let mult = model.ruv_obs_mult(subj, &params.theta);
+        let mut want = Vec::new();
+        let _ = individual_nll_into_prepared_with_schedule_frozen(
+            &model,
+            subj,
+            &params.theta,
+            &eta,
+            &params.omega,
+            &params.sigma.values,
+            model.residual_cov_at(&params),
+            &mut pk::EventPkParams::default(),
+            None,
+            keys.as_ref(),
+            mult.as_deref(),
+            &mut want,
+            &mut DVector::zeros(eta.len()),
+            &mut DVector::zeros(eta.len()),
+            None,
+        );
+        assert_eq!(
+            ip.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            "subject {}: the mode's predictions",
+            subj.id
+        );
+    }
+    let restored = BEST_WALK_RESTORES.with(|c| c.get()) - before;
+    eprintln!("{n_some} solves returned ipreds, {restored} from the kept walk");
+    assert_eq!(n_some, 8, "every ODE solve hands its predictions back");
+    assert!(
+        restored > 0,
+        "fixture: a solve whose last walk was another point"
+    );
+}
+
+/// A subject with no observations (doses only) has a prior-only inner problem and no data term
+/// to differentiate: it is not a finite-difference subject, and the warning must not count it
+/// (reported on #2939's benchmark: "N of M subjects use finite-difference inner gradients" with N
+/// exactly the dose-only subjects). The data is the reporter's reprex. Mutation: drop the
+/// no-observation guard in `subject_inner_runs_fd` -> the warning reads "1 of 2 subjects".
+#[test]
+fn a_dose_only_subject_is_not_counted_as_finite_differences() {
+    let model = crate::parser::model_parser::parse_model_string(
+        "[parameters]\n  theta TVCL(1.0, 0.01, 100.0)\n  theta TVV1(20.0, 1.0, 500.0)\n  \
+         theta TVQ(2.0, 0.01, 100.0)\n  theta TVV2(40.0, 1.0, 1000.0)\n  \
+         omega ETA_CL ~ 0.09\n  omega ETA_V1 ~ 0.09\n  sigma PROP ~ 0.1 (sd)\n\
+         [individual_parameters]\n  CL = TVCL * exp(ETA_CL)\n  V1 = TVV1 * exp(ETA_V1)\n  \
+         Q = TVQ\n  V2 = TVV2\n\
+         [structural_model]\n  pk two_cpt_iv(cl=CL, v1=V1, q=Q, v2=V2)\n\
+         [error_model]\n  DV ~ proportional(PROP)\n",
+    )
+    .expect("model parses");
+    let dir = std::env::temp_dir().join(format!("ferx-dose-only-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("d.csv");
+    std::fs::write(
+        &csv,
+        "ID,TIME,EVID,MDV,DV,AMT,RATE,CMT\n1,0,1,1,0,1000,1000,1\n1,4,0,0,20,0,0,1\n\
+         1,10,0,0,10,0,0,1\n2,0,1,1,0,1000,1000,1\n2,12,1,1,0,1000,1000,1\n",
+    )
+    .unwrap();
+    let pop = crate::io::datareader::read_nonmem_csv(&csv, None, None).expect("data reads");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(pop.subjects.len(), 2, "fixture precondition: two subjects");
+    assert!(
+        pop.subjects[1].obs_times.is_empty() && pop.subjects[1].obs_records.is_empty(),
+        "fixture precondition: subject 2 has no observations"
+    );
+    let theta = &model.default_params.theta;
+    assert_eq!(fd_fallback_warning(&model, &pop, theta), None);
+    // The observed subject alone stays analytic (the control: the warning reads the route).
+    assert!(!subject_inner_runs_fd(
+        &model,
+        &pop.subjects[0],
+        theta,
+        &[0.0, 0.0]
+    ));
+}
+
+/// A whole dense-BFGS solve at `n = BFGS_SMALL_DIM` (in-place update) and at `n = BFGS_SMALL_DIM
+/// + 1` (the operand-matrix buffers) is bit-identical to the same solve forced down the
+/// operand-matrix path (the pre-change implementation): every objective value the line search
+/// sees, and the minimiser. Mutation: route `n = BFGS_SMALL_DIM + 1` to the in-place update
+/// (`n > BFGS_SMALL_DIM + 1`) → its `rs[i]` / the update's debug assertion fails; change a
+/// term's order in `bfgs_update_small` → the `n = 5` trace differs.
+#[test]
+fn a_dense_bfgs_solve_matches_the_operand_matrix_update_either_side_of_the_small_width() {
+    let solve = |n: usize, force: bool| {
+        FORCE_BFGS_BUFFERS.with(|f| f.set(force));
+        let trace = std::cell::RefCell::new(Vec::<u64>::new());
+        let f = |x: &[f64]| {
+            let v: f64 = (0..x.len())
+                .map(|i| {
+                    let nxt = x[(i + 1) % x.len()];
+                    (1.0 - x[i]).powi(2) + 5.0 * (nxt - x[i] * x[i]).powi(2) + 0.1 * x[i] * nxt
+                })
+                .sum();
+            trace.borrow_mut().push(v.to_bits());
+            v
+        };
+        let grad = |x: &[f64]| {
+            let n = x.len();
+            let mut g = vec![0.0; n];
+            for i in 0..n {
+                let j = (i + 1) % n;
+                let r = x[j] - x[i] * x[i];
+                g[i] += -2.0 * (1.0 - x[i]) - 20.0 * r * x[i] + 0.1 * x[j];
+                g[j] += 10.0 * r + 0.1 * x[i];
+            }
+            g
+        };
+        let mut x: Vec<f64> = (0..n).map(|i| -0.8 + 0.37 * i as f64).collect();
+        let ok = dense_bfgs_core(
+            &f,
+            &grad,
+            &mut x,
+            n,
+            200,
+            1e-10,
+            None,
+            None,
+            None,
+            &|_| false,
+            false,
+        );
+        FORCE_BFGS_BUFFERS.with(|f| f.set(false));
+        (
+            ok,
+            x.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            trace.into_inner(),
+        )
+    };
+    for n in [BFGS_SMALL_DIM, BFGS_SMALL_DIM + 1] {
+        let (ok, x, trace) = solve(n, false);
+        let (ok_ref, x_ref, trace_ref) = solve(n, true);
+        assert!(trace.len() > 10, "n={n}: fixture runs several BFGS updates");
+        assert_eq!(ok, ok_ref, "n={n}");
+        assert_eq!(trace, trace_ref, "n={n}: the objective sequence");
+        assert_eq!(x, x_ref, "n={n}: the minimiser");
+    }
+}
+
+/// The in-place dense BFGS update ([`bfgs_update_small`]) and direction ([`neg_gemv`]) are the
+/// operations `nalgebra`'s `mul_to` / `gemv` ran before, bit for bit: every width up to
+/// [`BFGS_SMALL_DIM`] (the update) and beyond it (the direction), on values with mixed signs and
+/// magnitudes so a reordered sum or a dropped rounding shows. Mutation: add the terms of a
+/// product in reverse column order, or fold `eye − p` to `−p` off the diagonal (it differs in
+/// the sign of a zero) → the compared bits differ.
+#[test]
+fn small_bfgs_update_and_direction_match_nalgebra_bit_for_bit() {
+    let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        // Mixed signs, magnitudes over several decades, and the odd exact zero.
+        let u = (seed >> 11) as f64 / (1u64 << 53) as f64;
+        if seed % 17 == 0 {
+            0.0
+        } else {
+            (u - 0.5) * 10f64.powi((seed % 7) as i32 - 3)
+        }
+    };
+    for n in 1..=8usize {
+        for _ in 0..200 {
+            let h = DMatrix::from_fn(n, n, |_, _| next());
+            let g: Vec<f64> = (0..n).map(|_| next()).collect();
+            // The direction.
+            let mut want = DVector::zeros(n);
+            want.gemv(-1.0, &h, &DVector::from_column_slice(&g), 0.0);
+            let mut got = vec![0.0; n];
+            neg_gemv(&h, &g, &mut got);
+            for i in 0..n {
+                assert_eq!(got[i].to_bits(), want[i].to_bits(), "direction n={n} i={i}");
+            }
+            if n > BFGS_SMALL_DIM {
+                continue;
+            }
+            // The update, against the operand-matrix form it replaced.
+            let s: Vec<f64> = (0..n).map(|_| next()).collect();
+            let y: Vec<f64> = (0..n).map(|_| next()).collect();
+            let rho = 1.0 / next().max(1e-3);
+            let (s_vec, y_vec) = (
+                DVector::from_column_slice(&s),
+                DVector::from_column_slice(&y),
+            );
+            let eye = DMatrix::identity(n, n);
+            let mut upd = BfgsUpdateBuffers::new(n);
+            let mut h_ref = h.clone();
+            upd.rs.copy_from(&s_vec);
+            upd.rs *= rho;
+            upd.ry.copy_from(&y_vec);
+            upd.ry *= rho;
+            upd.yt.tr_copy_from(&y_vec);
+            upd.st.tr_copy_from(&s_vec);
+            upd.rs.mul_to(&upd.yt, &mut upd.outer_a);
+            upd.ry.mul_to(&upd.st, &mut upd.outer_b);
+            upd.left.copy_from(&eye);
+            upd.left -= &upd.outer_a;
+            upd.right.copy_from(&eye);
+            upd.right -= &upd.outer_b;
+            upd.left.mul_to(&h_ref, &mut upd.t);
+            upd.t.mul_to(&upd.right, &mut h_ref);
+            upd.rs.mul_to(&upd.st, &mut upd.outer_a);
+            h_ref += &upd.outer_a;
+            let mut h_new = h.clone();
+            bfgs_update_small(&mut h_new, &s, &y, rho);
+            for (a, b) in h_new.iter().zip(h_ref.iter()) {
+                assert_eq!(a.to_bits(), b.to_bits(), "update n={n}");
+            }
+        }
+    }
 }

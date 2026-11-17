@@ -626,11 +626,10 @@ fn zero_order_normal_dosing_passes_data_checks() {
 }
 
 #[test]
-fn zero_order_steady_state_dosing_is_rejected() {
-    // SS=1 into a zero_order compartment is rejected with E_ABSORPTION_SS_ZERO_ORDER (#719):
-    // the density kernels (transit/igd/weibull/first_order) now support SS through the
-    // periodic-sum R_in, but a zero_order input is a spanning window whose periodic steady
-    // state needs a distinct window-based equilibration (a follow-up), so it stays rejected.
+fn zero_order_steady_state_dosing_is_accepted() {
+    // SS=1 into a lone zero_order compartment was rejected with E_ABSORPTION_SS_ZERO_ORDER
+    // (#719) and is served since #2786: the dose is lowered to a duration-modeled SS infusion.
+    // Values: `tests/ss_absorption_lag_anchor.rs`.
     use ferx_core::check_model_data;
     let model = parse_full_model(ZERO_ORDER_MODEL)
         .expect("zero_order model parses")
@@ -653,8 +652,8 @@ fn zero_order_steady_state_dosing_is_rejected() {
     };
     let diags = check_model_data(&model, &pop);
     assert!(
-        diags.iter().any(|d| d.code == "E_ABSORPTION_SS_ZERO_ORDER"),
-        "SS into a zero_order compartment must raise E_ABSORPTION_SS_ZERO_ORDER, got: {:?}",
+        !diags.iter().any(|d| d.code.starts_with("E_ABSORPTION_SS_")),
+        "SS into a lone zero_order compartment is served, got: {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
 }
@@ -698,6 +697,59 @@ fn infusion_into_zero_order_compartment_is_rejected() {
 /// Tier-3 (slow): full FOCEI fit recovering the zero-order **duration**. Gated out
 /// of the default PR job; runs nightly / on estimation-touching pushes.
 ///
+/// `fit()` lowers an `SS=1` dose into a `zero_order()` compartment to the modeled-duration
+/// infusion (`RATE=-2`, `D1`) it is served as, for the engines. The data warnings describe the
+/// user's data and model, so they must run on the data as read: a `zero_order(dur=DUR)` model with
+/// `DUR` at its floor and an `SS=1` bolus has no `RATE=-2` record and no `D1` parameter, and a
+/// `W_MODELED_DURATION_NONPOSITIVE` naming them (computed on the lowered record) is a message about
+/// constructs absent from the file.
+#[test]
+fn zero_order_ss_fit_warnings_do_not_name_the_lowered_rate_minus_2_construct() {
+    use ferx_core::{fit, FitOptions};
+    let src = ZERO_ORDER_MODEL.replace(
+        "theta TVDUR(4.0, 0.05,  24.0)",
+        "theta TVDUR(1e-9, 1e-10, 24.0)",
+    );
+    assert_ne!(
+        src, ZERO_ORDER_MODEL,
+        "fixture drift: the DUR theta line moved"
+    );
+    let model = parse_full_model(&src)
+        .expect("zero_order model parses")
+        .model;
+    let mut ss_dose = DoseEvent::new(0.0, 100.0, 1, 0.0, true, 12.0);
+    ss_dose.ii = 12.0;
+    let pop = Population {
+        covariate_names: Vec::new(),
+        dv_column: "DV".into(),
+        input_columns: vec![],
+        exclusions: None,
+        warnings: vec![],
+        subjects: vec![common::subject(
+            "1",
+            vec![ss_dose],
+            vec![1.0, 4.0, 8.0],
+            vec![4.0, 3.0, 2.0],
+            vec![1; 3],
+        )],
+    };
+    let opts = FitOptions {
+        outer_maxiter: 1,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let fitted = fit(&model, &pop, &model.default_params, &opts).expect("fit runs");
+    let named: Vec<&String> = fitted
+        .warnings
+        .iter()
+        .filter(|w| w.contains("RATE=-2") || w.contains("D1"))
+        .collect();
+    assert!(
+        named.is_empty(),
+        "a warning names the lowered RATE=-2 / D1 construct: {named:?}"
+    );
+}
+
 /// Generates a noise-free single-dose curve at the truth (`DUR = 4 h`), then fits
 /// it back from a **perturbed** start (`DUR = 2 h`) — so the optimiser must climb
 /// the duration, not merely sit at the truth — and asserts it recovers `DUR ≈ 4`.

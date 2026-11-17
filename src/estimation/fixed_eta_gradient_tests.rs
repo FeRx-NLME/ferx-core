@@ -158,6 +158,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 
     // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -706,6 +707,13 @@ fn assert_magnitude_takes_the_exact_score(model: &CompiledModel, theta: &[f64], 
     };
     let (nll_e, g_e) = run(false);
     let (nll_f, g_f) = run(true);
+    // A failed plan (#2786) takes the same per-θ quotient as the switch.
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::FORCE_PLAN_FAIL;
+    FORCE_PLAN_FAIL.set(true);
+    let (nll_p, g_p) = run(false);
+    FORCE_PLAN_FAIL.set(false);
+    assert_eq!(nll_e.to_bits(), nll_p.to_bits());
+    assert_eq!(g_f, g_p, "a failed plan takes the forced quotient");
     assert_eq!(nll_e.to_bits(), nll_f.to_bits());
     assert!(
         (0..n_theta).any(|i| g_e[i].to_bits() != g_f[i].to_bits()),
@@ -773,6 +781,37 @@ fn check_saem_mstep_matches_fd(model: &CompiledModel, theta: &[f64], sigma_value
             sigma_values[k] * (obs_nll_sum(model, &population, theta, &sp, &etas, &[]) - f0) / h;
     }
 
+    // Plans working, then every plan failing (#2786): the M-step score's per-θ fallback
+    // must meet the same reference.
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::FORCE_PLAN_FAIL;
+    for fail in [false, true] {
+        FORCE_PLAN_FAIL.set(fail);
+        check_saem_mstep_score(
+            model,
+            &population,
+            theta,
+            sigma_values,
+            &etas,
+            f0,
+            &ref_grad,
+        );
+        FORCE_PLAN_FAIL.set(false);
+    }
+}
+
+/// [`check_saem_mstep_matches_fd`]'s comparison of the M-step `(nll, grad)` against `f0` and
+/// its forward difference `ref_grad`.
+fn check_saem_mstep_score(
+    model: &CompiledModel,
+    population: &crate::types::Population,
+    theta: &[f64],
+    sigma_values: &[f64],
+    etas: &[Vec<f64>],
+    f0: f64,
+    ref_grad: &[f64],
+) {
+    let (n_theta, n_sigma) = (theta.len(), sigma_values.len());
+    let n = n_theta + n_sigma;
     let mask = vec![true; n_theta];
     let lo = vec![-1e30f64; n];
     let hi = vec![1e30f64; n];
@@ -2810,7 +2849,7 @@ fn the_fixed_eta_score_is_exact_with_a_non_gaussian_term() {
 /// subject the predictor routes to its ODE twin, FREM covariate rows on the closed form
 /// (whose prediction the adjoint overrides to `θ_cov + η_cov`), the same FREM rows under
 /// IOV (the stacked `[η | κ_0 | κ_1 …]`), and an IOV subject whose stack (51) is wider than
-/// the widest η-dispatch bucket (48), which a θ-only recording does not need.
+/// the old widest η-dispatch bucket (48), which no recording needs now.
 ///
 /// The ODE fixtures integrate at `1e-10`/`1e-12`, so the differences of the adaptive
 /// solve resolve the score; the bound is relative to the largest component, so a θ whose

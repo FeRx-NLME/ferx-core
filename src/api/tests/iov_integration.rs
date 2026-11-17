@@ -29,6 +29,7 @@ fn make_iov_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -217,7 +218,7 @@ fn test_iov_foce_auto_reports_resolved_optimizer() {
     let opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
     assert_iov_fit_ok(&result);
-    let resolved = Optimizer::Auto.resolve_auto(&model, false);
+    let resolved = Optimizer::Auto.resolve_auto(&model);
     assert_eq!(result.optimizer, format!("auto ({})", resolved.label()));
     assert_eq!(resolved, Optimizer::Bobyqa);
 }
@@ -340,7 +341,7 @@ fn test_iov_ode_fit_matches_analytical_twin() {
     // seeding built-in BFGS at the optimum converges fine — so it was
     // optimizer basin-capture, not an ODE-IOV gradient defect. See #439/#486.
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&ode, false),
+        Optimizer::Auto.resolve_auto(&ode),
         Optimizer::NloptLbfgs,
         "ODE IOV twin should resolve `auto` to the analytic-gradient L-BFGS"
     );

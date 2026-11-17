@@ -1120,18 +1120,16 @@ fn route_lag_multi_dose_equals_compartment_lag_transit() {
 // ── Composition with SS (#834) and infusion (#836) into an absorption compartment ──
 //
 // Both landed on `main` after this branch forked, editing the same forcing machinery.
-// A per-route lag lives on the forcing (`lag_slot`), NOT `has_lagtime()`, so these guard
-// the two combinations: SS must be *rejected* (the SS trough seed cannot route a lagged
-// onset — the same limitation that rejects SS + compartment lag, `E_ABSORPTION_SS_LAG`),
-// while a plain infusion must *compose* (a single infusion whose whole appearance is
-// simply delayed by the route lag).
+// A per-route lag lives on the forcing (`lag_slot`), NOT `has_lagtime()`. SS into it was
+// refused (`E_ABSORPTION_SS_LAG`) until #2786 and is served now (`tests/ss_absorption_lag_anchor.rs`
+// anchors the values); a plain infusion must *compose* (a single infusion whose whole
+// appearance is simply delayed by the route lag).
 
-/// SS=1 into `first_order(ka, lag=L)` must raise `E_ABSORPTION_SS_LAG` — the per-route
-/// lag is invisible to `has_lagtime_on_cmt`, so without the forcing-`lag_slot` arm of the
-/// gate this SS dose would slip through and be silently mis-served by the (lag-unaware)
-/// steady-state equilibration seed.
+/// SS=1 into `first_order(ka, lag=L)` is accepted — and equals its compartment-lag twin, the
+/// same delay carried on `lagtime` (the equality this file's other tests pin for non-SS doses;
+/// here the SS state at the record is the thing that must agree).
 #[test]
-fn ss_into_per_route_lag_is_rejected() {
+fn ss_into_per_route_lag_is_accepted_and_equals_compartment_lag() {
     let model = parse_full_model(ROUTE_LAG_SINGLE).expect("parses").model;
     let obs: Vec<f64> = (0..=24).map(|i| i as f64 * 0.5).collect();
     let n = obs.len();
@@ -1153,11 +1151,24 @@ fn ss_into_per_route_lag_is_rejected() {
     // the SS/absorption gates live there, not in `check_model_data_warnings`.
     let diags = check_model_data(&model, &population);
     assert!(
-        diags.iter().any(|d| d.code == "E_ABSORPTION_SS_LAG"),
-        "SS into a per-route-lagged absorption compartment must be rejected with \
-         E_ABSORPTION_SS_LAG (per-route lag is not seen by has_lagtime_on_cmt); got: {:?}",
+        !diags.iter().any(|d| d.code.starts_with("E_ABSORPTION_SS_")),
+        "SS into a per-route-lagged absorption compartment is served; got: {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
+    let comp = parse_full_model(COMP_LAG_SINGLE).expect("parses").model;
+    let route = predict(&model, &population, &model.default_params).expect("route twin");
+    let cmt = predict(&comp, &population, &comp.default_params).expect("compartment twin");
+    assert_eq!(route.len(), cmt.len());
+    for (r, c) in route.iter().zip(&cmt) {
+        assert!(r.pred.is_finite() && r.pred > 0.0, "{r:?}");
+        assert!(
+            (r.pred - c.pred).abs() <= 1e-6 * c.pred.abs(),
+            "t={}: route lag {} vs compartment lag {}",
+            r.time,
+            r.pred,
+            c.pred
+        );
+    }
 }
 
 /// A plain infusion (`RATE>0`) into `first_order(ka, lag=L)` composes correctly: it equals

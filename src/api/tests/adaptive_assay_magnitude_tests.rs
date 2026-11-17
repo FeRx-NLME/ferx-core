@@ -224,6 +224,7 @@ fn bare_model_readings_keep_their_bits() {
         confirm: 1,
         round_to: None,
         dose_knowledge: Default::default(),
+        decision_covariates: Default::default(),
         levels: None,
         target_window: None,
         auc_target: None,

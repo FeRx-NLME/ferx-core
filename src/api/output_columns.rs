@@ -2,6 +2,7 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
+use crate::cold_sort::ColdSort;
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
@@ -103,7 +104,7 @@ pub(crate) fn trapezoid(points: &[(f64, f64)]) -> f64 {
         return f64::NAN;
     }
     let mut sorted = points.to_vec();
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    sorted.cold_sort_by(&|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut auc = 0.0;
     for w in sorted.windows(2) {
         let dt = w[1].0 - w[0].0;
@@ -209,7 +210,7 @@ pub(crate) fn compute_extra_output_columns(
         // subject (dose-indexed). Skipped entirely when the model declares no lag:
         // `dose_lagtimes` stays empty and `tad_at_time` falls back to zero lag,
         // so the common no-lag case pays nothing for this per-dose pass.
-        let dose_lagtimes: Vec<f64> = if model.has_lagtime() {
+        let dose_lagtimes: Vec<f64> = if model.has_dose_lag() {
             let mut pk_dose: Vec<_> = (0..subject.doses.len())
                 .map(|d| {
                     let occ = crate::pk::dose_row_occasion(subject, d).unwrap_or(u32::MAX);
@@ -242,7 +243,7 @@ pub(crate) fn compute_extra_output_columns(
                     match &model.ode_spec {
                         Some(ode) => ode
                             .dose_attr_map
-                            .lagtime(subject.doses[d].cmt_raw(), &pk_d.values),
+                            .lagtime_for_dose(&subject.doses[d], &pk_d.values),
                         None => pk_d.lagtime(),
                     }
                 })

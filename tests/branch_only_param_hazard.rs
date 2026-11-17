@@ -98,7 +98,7 @@ fn all_arm_hazard_parameter_predicts_like_its_ternary_twin() {
 /// Which engine that search runs on: every subject here carries a TTE record on a
 /// drug-driven hazard, which has an exact η-channel since #2482 (the dual walk reads
 /// `h` off the RHS at the saved state). So each subject runs the analytic inner
-/// gradient, the label reads `analytic (Dual2)` and no FD warning fires — where
+/// gradient, the label reads `analytic` and no FD warning fires — where
 /// before #2482 the whole inner gradient was finite-differenced and the #1861
 /// warning named the time-to-event record as the cause (`tests/tte_inner_fd_warning.rs`
 /// keeps that warning pinned on the steady-state subject the walk still declines).
@@ -155,7 +155,7 @@ fn all_arm_hazard_parameter_with_eta_fits_like_its_ternary_twin() {
         // The drug-driven hazard has an exact η-channel (the dual walk, #2482), so both
         // spellings run the analytic inner gradient and no subject warns of FD.
         assert_eq!(
-            r.gradient_method_inner, "analytic (Dual2)",
+            r.gradient_method_inner, "analytic",
             "{label}: every TTE subject runs the exact inner gradient"
         );
         assert!(

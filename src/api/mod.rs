@@ -6,7 +6,6 @@ use crate::types::*;
 use nalgebra::{DMatrix, DVector};
 #[cfg(test)]
 use rand::RngExt;
-use rayon::prelude::*;
 use std::path::Path;
 
 // ── validation subsystem (extracted verbatim; see src/api/validation.rs) ──
@@ -66,6 +65,8 @@ mod run;
 mod scoring_horizon;
 mod simulate;
 #[cfg(feature = "survival")]
+mod vpc_kmmc;
+#[cfg(feature = "survival")]
 mod vpc_rtte;
 #[cfg(feature = "survival")]
 mod vpc_tte;
@@ -73,10 +74,13 @@ mod vpc_tte;
 pub use adaptive::{
     simulate_adaptive, simulate_adaptive_from_spec, simulate_adaptive_from_spec_with_inputs,
     simulate_adaptive_with_inputs, AdaptiveSimulateOptions, AdaptiveSimulationResult,
+    DrawnParameters,
 };
-pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UnmatchedSubjects};
+pub use adaptive_inputs::{AdaptiveInputs, SuppliedEtas, UncertaintySpec, UnmatchedSubjects};
 pub(crate) use covariate_stats::check_stats_on;
 pub use covariate_stats::{assert_covariate_model_bound, bind_covariate_stats};
+#[cfg(feature = "survival")]
+pub(crate) use entry_refusals::npde_tte_input;
 pub(crate) use entry_refusals::{
     adaptive_spec, adaptive_unsupported_diag, fit_input_changed, fit_input_missing,
     fit_input_model, level_mixed_with_iov_rule, logit_theta_out_of_range, param_shape,
@@ -148,6 +152,10 @@ pub use run::{
 };
 pub(crate) use simulate::check_theta_length;
 #[cfg(feature = "survival")]
+pub(crate) use simulate::simulate_with_options_tallied;
+#[cfg(feature = "survival")]
+pub use vpc_kmmc::{vpc_kmmc, KmmcVpc, KmmcVpcStratum, VpcKmmcOptions};
+#[cfg(feature = "survival")]
 pub use vpc_rtte::{vpc_rtte, RtteMcfBand, RtteOrderBand, RtteVpc, RtteVpcStratum, VpcRtteOptions};
 #[cfg(feature = "survival")]
 pub use vpc_tte::{
@@ -191,7 +199,7 @@ pub(crate) use fit::fitted_population;
 pub(crate) use fit::{
     dw_autocorrelation_warning, multistart_prefers, perturb_init, saem_active_covariate_group_etas,
     saem_active_mixture_switched_etas, saem_non_mu_referenced_individual_params_warning,
-    select_start, DwAdvice,
+    select_start, DwAdvice, SubjectLine,
 };
 #[cfg(test)]
 pub(crate) use pool::{
@@ -319,6 +327,14 @@ mod thread_env_tests;
 #[cfg(test)]
 #[path = "tests/dose_compartment_tests.rs"]
 mod dose_compartment_tests;
+
+#[cfg(test)]
+#[path = "tests/outer_fd_fallback_warning_tests.rs"]
+mod outer_fd_fallback_warning_tests;
+
+#[cfg(test)]
+#[path = "tests/fd_salvage_guard_fires_in_a_fit_tests.rs"]
+mod fd_salvage_guard_fires_in_a_fit_tests;
 
 #[cfg(test)]
 #[path = "tests/reader_warning_suppression_tests.rs"]
@@ -478,6 +494,9 @@ mod ctmm_time_dependent_pk_tests;
 #[path = "tests/entry_point_errors_tests.rs"]
 mod entry_point_errors_tests;
 // #1774: the codes of the predict / simulate / adaptive refusals `ferx check` cannot reach.
+#[cfg(all(test, feature = "survival"))]
+#[path = "tests/degenerate_hazard_once_tests.rs"]
+mod degenerate_hazard_once_tests;
 #[cfg(test)]
 #[path = "tests/entry_refusal_codes_tests.rs"]
 mod entry_refusal_codes_tests;
@@ -555,6 +574,11 @@ mod tests_derived_iov_kappa;
 #[path = "tests/adaptive_sim_tests.rs"]
 mod adaptive_sim_tests;
 
+// ── Tests: under IOV every decision is a record (#2895) ──
+#[cfg(test)]
+#[path = "tests/adaptive_decision_record_tests.rs"]
+mod adaptive_decision_record_tests;
+
 // ── Tests: `auc_target` under a time-varying covariate, `TIME` in the PK and IOV (#943) ──
 #[cfg(test)]
 #[path = "tests/adaptive_auc_tv_tests.rs"]
@@ -613,6 +637,11 @@ mod adaptive_round_to_tests;
 #[cfg(test)]
 #[path = "tests/adaptive_inputs_tests.rs"]
 mod adaptive_inputs_tests;
+
+// #946: parameter-uncertainty draws on the adaptive path.
+#[cfg(test)]
+#[path = "tests/adaptive_uncertainty_tests.rs"]
+mod adaptive_uncertainty_tests;
 
 // ── Tests: #748 independent adaptive-snapshot correctness check ──────────────
 //

@@ -182,14 +182,8 @@ fn compartment_free_route_ignores_the_old_axis_cap_and_fix_theta() {
         }
         assert_eq!(r.ofv, at_cap.ofv, "{label}: OFV vs 24 axes");
 
-        assert_eq!(
-            r.gradient_method_inner, "analytic (Dual2)",
-            "{label}: inner"
-        );
-        assert_eq!(
-            r.gradient_method_outer, "analytic (Dual2)",
-            "{label}: outer"
-        );
+        assert_eq!(r.gradient_method_inner, "analytic", "{label}: inner");
+        assert_eq!(r.gradient_method_outer, "analytic", "{label}: outer");
         assert_eq!(
             r.optimizer, "auto (nlopt_lbfgs)",
             "{label}: `auto` takes L-BFGS on an analytic outer gradient, not BOBYQA"

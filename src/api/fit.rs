@@ -161,6 +161,16 @@ pub(crate) fn derived_cmt_time_varying_warnings(
     out
 }
 
+/// `W_NPDE_TTE_SKIPPED`: why a fit with `npde_nsim > 0` left its time-to-event rows
+/// without a score (#1889), quoting the reason `compute_tte_npde` or the simulator gave.
+#[cfg(feature = "survival")]
+fn tte_npde_skipped_warning(why: &EngineError) -> String {
+    format!(
+        "W_NPDE_TTE_SKIPPED: the time-to-event records were not scored, so the NPDE / NPD \
+         cells of their rows are blank. Every other row is scored as usual. Reason: {why}"
+    )
+}
+
 #[cfg(test)]
 #[path = "tests/dw_autocorrelation_warning_tests.rs"]
 mod dw_autocorrelation_warning_tests;
@@ -318,10 +328,7 @@ pub(crate) fn reported_optimizer_label(
                 options.optimizer,
                 model,
                 has_mixture,
-                crate::sens::provider::analytic_outer_gradient_for_interaction(
-                    model,
-                    options.interaction,
-                ),
+                crate::sens::provider::analytic_outer_gradient_available(model),
                 &symmetric_pairs(),
             );
             let label = if options.optimizer == Optimizer::Auto {
@@ -367,10 +374,15 @@ pub(crate) fn bobyqa_scale_warning(optimizer: Optimizer, dim: usize) -> Option<S
 /// the lag is what `ar1` models (measured on the naproxen MBMA at NONMEM's optima,
 /// with the statistic split by arm and pair-normalised since #2798: `cs` leaves DW
 /// 1.63, `ar1` 1.96 — the classic whole-subject form read 1.43 and 1.69).
+///
+/// `across_blocks` is [`dw_across_blocks`]: `Some` when the statistic paired rows of
+/// consecutive blocks (#2858). The positive text then says so and names the line that
+/// would correlate them, since no structure of the line as written can.
 pub(crate) fn dw_autocorrelation_warning_decorrelated(
     dw: f64,
     line: &str,
     kind: crate::types::ResidualSerialKind,
+    across_blocks: Option<SubjectLine>,
 ) -> Option<String> {
     if !dw.is_finite() {
         return None;
@@ -394,9 +406,18 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
                  dependent."
             }
         };
+        let across = match &across_blocks {
+            None => String::new(),
+            Some(by) => format!(
+                " The blocks of this line follow one another in time, so the statistic \
+                 also pairs rows of consecutive blocks, which the line leaves \
+                 independent.{}",
+                by.sentence(kind)
+            ),
+        };
         Some(format!(
             "Positive autocorrelation remains {what}: the within-group correlation does \
-             not explain it.{advice}"
+             not explain it.{advice}{across}"
         ))
     } else if dw > 2.5 {
         Some(format!(
@@ -406,6 +427,147 @@ pub(crate) fn dw_autocorrelation_warning_decorrelated(
     } else {
         None
     }
+}
+
+/// How a `correlation` line that spans a subject is written (#2858): `by` the
+/// subject column when every subject's id is a number, else `by` a placeholder
+/// column with what it has to be. A `by` column is read as a number, so on a text
+/// id the line `by ID` puts every row in no block.
+///
+/// The subject column is named as the data spell it. `by` is case-sensitive while
+/// the reader's `ID` role is not: on a file whose header is `id`, the line `by ID`
+/// is refused ("covariate(s) not found in data (case-sensitive): ID"). A
+/// `[data] ID = SUBJ` mapping renames the column, and `by ID` then reads it
+/// (measured: the same objective as on a file with an `ID` header).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SubjectLine {
+    /// `by` this column: the data's subject column, `ID` unless spelt otherwise.
+    ById(String),
+    ByNumericColumn,
+}
+
+impl SubjectLine {
+    pub(crate) fn of(prepared: &Population) -> Self {
+        if prepared
+            .subjects
+            .iter()
+            .all(|s| s.id.parse::<f64>().is_ok())
+        {
+            // The header as written; a population built without a file has none.
+            let header = prepared
+                .input_columns
+                .iter()
+                .find(|c| c.eq_ignore_ascii_case("ID"))
+                .map_or("ID", String::as_str);
+            SubjectLine::ById(header.to_string())
+        } else {
+            SubjectLine::ByNumericColumn
+        }
+    }
+
+    fn column(&self) -> &str {
+        match self {
+            SubjectLine::ById(header) => header,
+            SubjectLine::ByNumericColumn => "COL",
+        }
+    }
+
+    /// The sentence naming the line that spans a subject, for a model whose
+    /// `correlation` line has structure `kind` (review of #2883, row 1).
+    ///
+    /// Under `ar1` / `car1` only the `by` changes. Under `cs` the structure has to
+    /// change too: compound symmetry over a whole subject is the covariance a
+    /// subject-level random effect gives, so next to an additive one ρ and its
+    /// variance are not identified together. Measured on
+    /// `tests/data/dw_sequential_algebraic/rich.csv`: `cs(RHO) by ID` converges to
+    /// −132.318001, the objective of the model without a line, with ρ left at 0.30.
+    fn sentence(&self, kind: crate::types::ResidualSerialKind) -> String {
+        let (by, clause) = (self.column(), self.clause());
+        match kind {
+            crate::types::ResidualSerialKind::Cs => format!(
+                " A `correlation ar1(RHO) by {by}` line correlates all rows of one \
+                 subject{clause}, decaying with the number of visits between them; \
+                 `car1(RHO)` decays it with the time between rows instead. `cs` over a \
+                 whole subject is the correlation a subject-level random effect already \
+                 gives, so it would add nothing."
+            ),
+            crate::types::ResidualSerialKind::Ar1 | crate::types::ResidualSerialKind::Car1 => {
+                format!(" A line `by {by}` correlates all rows of one subject{clause}.")
+            }
+        }
+    }
+
+    fn clause(&self) -> &'static str {
+        match self {
+            SubjectLine::ById(_) => "",
+            SubjectLine::ByNumericColumn => {
+                ", with COL a numeric data column that has one value per subject \
+                 (`ID` is not numeric in this data)"
+            }
+        }
+    }
+}
+
+/// The fewest cross-block pairs [`dw_cross_block_warning`] reads (#2858). The
+/// Durbin–Watson statistic over `n` independent pairs has a standard deviation of
+/// about `2/√n`, so the 1.5 threshold is `√n/4` deviations below 2: 1.96 at 62
+/// pairs. Measured on independent rows in `cross_block_dw_is_calibrated_on_white_noise`:
+/// a false-positive rate of 2.25% at 62 pairs, 13.3% at 20. The pooled warning has no such
+/// floor; this one is a second look at a subset, so it gets one.
+pub(crate) const DW_CROSS_BLOCK_MIN_PAIRS: usize = 62;
+
+/// The warning for positive autocorrelation **between consecutive blocks** of a
+/// `correlation` line (#2858), or `None`. `cross` is `whitened_cross_block_dw`: the
+/// count of lag pairs that join two blocks in time and the statistic over them.
+/// `pooled` is the fit's `dw_statistic`.
+///
+/// It speaks only when the pooled warning does not (`pooled` not below 1.5): that
+/// one already names the subject line when the statistic paired across blocks. The
+/// case it exists for is a line `by` the visits with several rows per visit, where
+/// the pairs inside a block, which the line models, outnumber the ones across and
+/// pull the pooled statistic into the band.
+///
+/// A non-finite `pooled` is silent. No fit reaches it: every pair that joins two
+/// blocks is also a pooled pair, so the pooled statistic is finite whenever this
+/// one is.
+pub(crate) fn dw_cross_block_warning(
+    cross: (usize, f64),
+    pooled: f64,
+    line: &str,
+    kind: crate::types::ResidualSerialKind,
+    by: &SubjectLine,
+) -> Option<String> {
+    let (pairs, dw) = cross;
+    if pairs < DW_CROSS_BLOCK_MIN_PAIRS
+        || !dw.is_finite()
+        || dw >= 1.5
+        || !pooled.is_finite()
+        || pooled < 1.5
+    {
+        return None;
+    }
+    Some(format!(
+        "Positive autocorrelation between consecutive blocks of `{line}` (Durbin-Watson = \
+         {dw:.2} over the {pairs} pairs that join two blocks; {pooled:.2} over all pairs). \
+         The blocks follow one another in time, and the line leaves rows of different \
+         blocks independent.{}",
+        by.sentence(kind)
+    ))
+}
+
+/// Whether the decorrelated statistic paired rows **across** residual blocks on
+/// `prepared` (#2858), and if so how a line spanning the subject is written: some
+/// subject has more than one block and its blocks run in time
+/// (`residual_blocks_run_in_time`), so `split_by_residual_group` joined them.
+pub(crate) fn dw_across_blocks(prepared: &Population) -> Option<SubjectLine> {
+    prepared
+        .subjects
+        .iter()
+        .any(|s| {
+            s.obs_rgroup.windows(2).any(|w| w[0] != w[1])
+                && crate::stats::residual_error::residual_blocks_run_in_time(s)
+        })
+        .then(|| SubjectLine::of(prepared))
 }
 
 /// Which remedies the positive-DW warning may name (#2798): only ones the fitted
@@ -421,6 +583,11 @@ pub(crate) enum DwAdvice {
     /// the name such a line can read, or `None` when the model declares no grouping
     /// a `by` can name.
     Algebraic { group: Option<String> },
+    /// A compartment-free model whose subjects carry occasions that all **run in
+    /// time** (#2858): the statistic was taken across them, so a `correlation` line
+    /// has to span the subject. A line `by` the occasions cannot, as a block never
+    /// joins rows of two occasions. `by` is how the line that does is written.
+    AlgebraicInTime { by: SubjectLine },
 }
 
 /// The [`DwAdvice`] for `model` fitted under `options` on `prepared` (#2798).
@@ -436,8 +603,16 @@ pub(crate) enum DwAdvice {
 ///   writes the level's column into it): that **column**. A one-level model has no
 ///   named level a `by` can read (`residual_level` needs more than one).
 ///
-/// Otherwise `None`: the model declares no grouping, or every subject's occasions
-/// run in time and the statistic was taken over whole subjects. Also `None` for
+/// When no subject is split and some subject carries more than one occasion, the
+/// statistic paired rows **across** occasions that run in time, and the advice is
+/// [`DwAdvice::AlgebraicInTime`] (#2858), whatever declared the occasions (a column,
+/// a level, nested levels or a derived rule): a line `by` that grouping is the one
+/// line that cannot model those pairs. Measured on `tests/data/dw_sequential_algebraic`:
+/// with one row per occasion `ar1(RHO) by OCC` leaves the OFV at −37.739613 and ρ at
+/// its initial value, where `by ID` reaches −124.232414.
+///
+/// Otherwise `group` is `None`: the model declares no grouping, or no subject has
+/// two occasions. Also `None` for
 /// occasions a derived rule wrote (`iov_occasion = dose` / `time(...)` on a model
 /// with a kappa, `run::occasions_are_derived`): they come from the timeline, so no
 /// column labels them, and the rule overrides `iov_column`. On one running clock
@@ -458,6 +633,19 @@ pub(crate) fn dw_advice(
         .subjects
         .iter()
         .any(|s| !crate::stats::residual_error::occasions_run_in_time(s));
+    if !split_at_occasions {
+        // More than one label in some subject: only then is there a pair that
+        // crosses occasions for the advice to speak about.
+        let across_occasions = prepared
+            .subjects
+            .iter()
+            .any(|s| s.occasions.windows(2).any(|w| w[0] != w[1]));
+        if across_occasions {
+            return DwAdvice::AlgebraicInTime {
+                by: SubjectLine::of(prepared),
+            };
+        }
+    }
     let group = if !split_at_occasions {
         None
     } else if let Some(levels) = model.nested_levels() {
@@ -514,6 +702,18 @@ pub(crate) fn dw_autocorrelation_warning(dw: f64, advice: &DwAdvice) -> Option<S
                  them correlate, decaying with the number of visits between them; \
                  {CAR1_AND_METHOD}"
             ),
+            DwAdvice::AlgebraicInTime { by } => {
+                let (by, column) = (by.column(), by.clause());
+                format!(
+                    "{what} Consecutive rows of one subject may share what the structural \
+                     model leaves out, across its occasions too: they follow one another in \
+                     time, so the statistic pairs rows of different occasions. A \
+                     `correlation ar1(RHO) by {by}` line in [error_model] correlates all rows \
+                     of one subject{column}, decaying with the number of visits between \
+                     them; {CAR1_AND_METHOD} A line `by` the occasions themselves cannot \
+                     model this: a block never joins rows of two occasions."
+                )
+            }
             DwAdvice::Algebraic { group: None } => format!(
                 "{what} Rows of one subject may share what the structural model leaves \
                  out, such as the visits of one arm or occasion. A `correlation \
@@ -722,8 +922,8 @@ pub(crate) fn nn_regularization_unapplied_warning(
 /// same process can use different thread counts). When `None`, the shared
 /// big-stack fit pool is used, sized to the width a front end declared with
 /// [`configure_global_thread_pool`](crate::configure_global_thread_pool) if any,
-/// else a positive `RAYON_NUM_THREADS` (#2800), else available cores minus one
-/// capped at 8 (#707).
+/// else a positive `RAYON_NUM_THREADS` (#2800), else available cores minus one,
+/// at least two where two cores exist, capped at 8 (#707).
 /// Rayon's own global pool is not used either way, and `--threads N` no longer
 /// sizes it (#1460).
 ///
@@ -745,6 +945,7 @@ pub fn fit(
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
     let mut result = fit_unstamped(model, population, init_params, options)?;
+    crate::parser::model_parser::rhs_regcode::kernel_jit::report();
     // Under a derived `iov_occasion` rule the fit overwrites the occasion labels, so
     // the ones the population carries are not part of what it was given (#1685
     // review r1 #1): `run_model_with_data` hands back its population with them set.
@@ -912,7 +1113,8 @@ fn fit_unstamped(
     // refused rather than silently ignoring the mixture structure; so are `init_params`
     // with no per-class Ω/Σ (`E_PARAM_SHAPE` / `E_MIXTURE_METHOD`, #1788). Inter-occasion
     // variability under a mixture fits (#985): the per-class inner solve carries the shared
-    // base `omega_iov`, and the outer gradient routes to FD.
+    // base `omega_iov`, and the outer gradient is the exact one at every class's modes
+    // (`mixture_gradient_salvaged`).
     first_error(&crate::api::validation::check_mixture_options(
         model,
         options,
@@ -920,6 +1122,7 @@ fn fit_unstamped(
     ))?;
     // Start the SS-equilibration non-convergence sink clean so a prior in-process call's residue
     // can't leak into this fit's warnings; drained back out just before `Ok(result)` (#867).
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
     // Reject one_cpt_transit + unsupported feature (SS/IOV/TV-cov/infusion, #386)
     // before any prediction reaches the superposition dispatch's `unreachable!` arms.
@@ -1108,34 +1311,31 @@ fn fit_unstamped(
     }
 
     let par_starts = || -> Vec<(usize, Result<FitResult, EngineError>)> {
-        (0..n)
-            .into_par_iter()
-            .map(|k| {
-                let init_k = perturb_init(init_params, k, sigma, base_seed);
-                // Per-start option overrides for k > 0:
-                // - saem_seed / bayes_seed: derive from base so each start gets a different
-                //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
-                //   perturbing it every start runs an identical RNG trajectory (differing
-                //   only by the perturbed init) — wasted compute and false multi-start
-                //   robustness. Start 0 keeps the user's seeds for reproducibility.
-                // - global_search: CRS2-LM ignores the starting point and samples freely in
-                //   [lower, upper], so running it on starts 1..n overrides the perturbation
-                //   and makes multi-start a no-op for those starts. Only run it on start 0.
-                let opts_k_storage;
-                let opts_ref: &FitOptions = if k == 0 {
-                    options
-                } else {
-                    opts_k_storage = FitOptions {
-                        saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
-                        bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
-                        global_search: false,
-                        ..options.clone()
-                    };
-                    &opts_k_storage
+        crate::par::map(n, |k| {
+            let init_k = perturb_init(init_params, k, sigma, base_seed);
+            // Per-start option overrides for k > 0:
+            // - saem_seed / bayes_seed: derive from base so each start gets a different
+            //   MH/MCMC trajectory. The Bayes sampler keys off bayes_seed, so without
+            //   perturbing it every start runs an identical RNG trajectory (differing
+            //   only by the perturbed init) — wasted compute and false multi-start
+            //   robustness. Start 0 keeps the user's seeds for reproducibility.
+            // - global_search: CRS2-LM ignores the starting point and samples freely in
+            //   [lower, upper], so running it on starts 1..n overrides the perturbation
+            //   and makes multi-start a no-op for those starts. Only run it on start 0.
+            let opts_k_storage;
+            let opts_ref: &FitOptions = if k == 0 {
+                options
+            } else {
+                opts_k_storage = FitOptions {
+                    saem_seed: Some(base_saem_seed.wrapping_add(k as u64)),
+                    bayes_seed: Some(base_bayes_seed.wrapping_add(k as u64)),
+                    global_search: false,
+                    ..options.clone()
                 };
-                (k, fit_inner(model, scored_ref, pop_ref, &init_k, opts_ref))
-            })
-            .collect()
+                &opts_k_storage
+            };
+            (k, fit_inner(model, scored_ref, pop_ref, &init_k, opts_ref))
+        })
     };
 
     // Run the start fan-out on the pinned fit-scoped pool when `threads` is set, else on the
@@ -1333,45 +1533,6 @@ fn floor_escaped(
     })
 }
 
-/// Fits in progress in this process: [`LastFitOut`] guards.
-static FITS_IN_PROGRESS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// Held for the whole of one [`fit_inner`], on the single-start and the multi-start arm
-/// alike. Dropping the guard of the **last** fit in progress runs `on_last`, so a finishing
-/// fit never releases the tapes of another that is still recording on a shared pool.
-struct LastFitOut {
-    count: &'static std::sync::atomic::AtomicUsize,
-    on_last: fn(),
-}
-
-impl LastFitOut {
-    fn enter(count: &'static std::sync::atomic::AtomicUsize, on_last: fn()) -> Self {
-        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        LastFitOut { count, on_last }
-    }
-}
-
-impl Drop for LastFitOut {
-    fn drop(&mut self) {
-        if self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
-            (self.on_last)();
-        }
-    }
-}
-
-/// Release the outer gradient's vector tape once no fit is in progress (#2481 §2.7): each
-/// worker keeps its peak recording's buffers between subjects, and past the fits nothing
-/// needs them at that size. On a Rayon worker (the fit pool) every worker of that pool is
-/// trimmed; off one, only this thread, so the release never builds Rayon's global pool
-/// (#1460).
-fn release_worker_tapes() {
-    if rayon::current_thread_index().is_some() {
-        rayon::broadcast(|_| crate::sens::vtape::vtape_trim(0));
-    } else {
-        crate::sens::vtape::vtape_trim(0);
-    }
-}
-
 /// One fit of `population`, the records the estimators score (`scored_population`, #2778).
 /// `all_records` is the same population with every record, for the data warnings and the
 /// `[derived]` outputs, whose grids run past the last observation.
@@ -1382,7 +1543,24 @@ fn fit_inner(
     init_params: &ModelParameters,
     options: &FitOptions,
 ) -> Result<FitResult, EngineError> {
-    let _tapes = LastFitOut::enter(&FITS_IN_PROGRESS, release_worker_tapes);
+    // `SS=1` doses into a `zero_order()` compartment are lowered to the infusions they are
+    // once, here, not by a clone of the subject in every walk (#2786). Validation has seen
+    // the data as read.
+    let attr_map = model.active_dose_attr_map();
+    let lowered = crate::dosing::lower_population_zero_order_ss(population, attr_map);
+    // The data as read: the data warnings below describe what the user wrote, not the lowered
+    // infusions (`RATE=-2`, `D1`) the engines walk, which are absent from their data and model.
+    let all_records_read: &Population = all_records;
+    let all_lowered = (!std::ptr::eq(population, all_records))
+        .then(|| crate::dosing::lower_population_zero_order_ss(all_records, attr_map));
+    let all_records: &Population = match (&all_lowered, &lowered) {
+        (Some(a), _) => &**a,
+        (None, l) => &**l,
+    };
+    let population: &Population = &lowered;
+    // The plans' keys read this fit's fingerprints instead of hashing per lookup.
+    let _prints =
+        crate::parser::model_parser::rhs_regcode::kernel_jit::register(model, &population.subjects);
     // LTBS needs the inner EBE loop converged tighter than the default for
     // reproducible standard errors (see `FitOptions::effective_inner_tol` /
     // `LTBS_FIT_INNER_TOL`). Resolve it once here so both the outer optimisation and
@@ -1529,9 +1707,8 @@ fn fit_inner(
 
     // Reset gradient timing counters for this fit so FERX_TIME_GRADIENTS
     // readouts are per-call rather than cumulative across a long R session.
-    let time_gradients = std::env::var("FERX_TIME_GRADIENTS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let time_gradients = crate::estimation::inner_optimizer::GRADIENT_TIMINGS
+        .arm(std::env::var("FERX_TIME_GRADIENTS").ok().as_deref());
     if time_gradients {
         crate::estimation::inner_optimizer::GRADIENT_TIMINGS.reset();
     }
@@ -1674,10 +1851,9 @@ fn fit_inner(
     // but suppress the numeric estimate. No note at all when the step will run
     // an estimator that builds no `R` (#1803).
     // The route is predicted from the covariance step's own scope walk (#2054): no note on
-    // the analytic R-matrix, and on the #1514 salvage the note names the declined subset.
+    // the analytic R-matrix.
     let covariance_route = crate::estimation::covariance::predicted_r_route(
         model,
-        population,
         options,
         init_params.mixture.is_some(),
     );
@@ -1746,10 +1922,17 @@ fn fit_inner(
                 | EstimationMethod::Laplace
         )
     }) {
-        if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning(
+        if let Some(w) = crate::estimation::inner_optimizer::fd_fallback_warning_skipping(
             model,
             population,
             &init_params.theta,
+            // Every stage skips a refused subject's EBE search (`InnerSolvePolicy::skip_refused`).
+            chain.iter().all(|&m| {
+                crate::estimation::inner_optimizer::skips_refused_subjects(&FitOptions {
+                    method: m,
+                    ..options.clone()
+                })
+            }),
         ) {
             accumulated_warnings.push(w);
         }
@@ -1771,13 +1954,13 @@ fn fit_inner(
     // `check_model_data_warnings` so `ferx check` reports the same findings;
     // message text is unchanged. Probed against `population` (not the pruned
     // copy) and `init_params`, matching the historical inline checks.
-    for d in check_model_data_warnings(model, all_records, init_params) {
+    for d in check_model_data_warnings(model, all_records_read, init_params) {
         accumulated_warnings.push(d.message);
     }
     // Fit-only, so not in the bundle above that `simulate()` shares (#2459). Reads the
     // censoring method through `bloq_in_force`, armed by `fit_unstamped` (#1824).
     if let Some(d) =
-        crate::api::validation::check_zero_dv_magnitude_only(model, all_records, init_params)
+        crate::api::validation::check_zero_dv_magnitude_only(model, all_records_read, init_params)
     {
         accumulated_warnings.push(d.message);
     }
@@ -1811,14 +1994,12 @@ fn fit_inner(
     }
     // A `[covariate_nn]` input the data drive into saturation (#2549).
     #[cfg(feature = "nn")]
-    for d in crate::api::validation::check_nn_input_scale(model, all_records) {
+    for d in crate::api::validation::check_nn_input_scale(model, all_records_read) {
         accumulated_warnings.push(d.message);
     }
-    if let Some(note) = crate::estimation::covariance::pre_fit_covariance_cost_note(
-        n_params_pre,
-        covariance_cost,
-        covariance_route,
-    ) {
+    if let Some(note) =
+        crate::estimation::covariance::pre_fit_covariance_cost_note(n_params_pre, covariance_cost)
+    {
         accumulated_warnings.push(note);
     }
 
@@ -2193,6 +2374,7 @@ fn fit_inner(
                     stage_opts.inner_restarts,
                     crate::estimation::inner_optimizer::InnerHessianSeed::for_options(&stage_opts),
                     &stage_opts,
+                    crate::estimation::inner_optimizer::PrevEtas::Solved,
                 );
             let nll = crate::estimation::agq::agq_population_nll(
                 model,
@@ -2302,6 +2484,7 @@ fn fit_inner(
                         stage_opts.inner_restarts,
                         crate::estimation::inner_optimizer::InnerHessianSeed::None,
                         &stage_opts,
+                        crate::estimation::inner_optimizer::PrevEtas::Placeholder,
                     );
                 let nll = crate::estimation::outer_optimizer::pop_nll(
                     model,
@@ -2745,7 +2928,7 @@ fn fit_inner(
 
     // Post-fit: compute [derived] and [output] columns, and populate per_obs_tad
     // (with individual lagtime) for the mandatory TAD column in output.rs.
-    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_lagtime() {
+    if !model.derived_exprs.is_empty() || !model.output_columns.is_empty() || model.has_dose_lag() {
         compute_extra_output_columns(
             model,
             all_records,
@@ -2783,6 +2966,40 @@ fn fit_inner(
             sr.npd = sn.npd;
             sr.epred = sn.epred;
             sr.pwres = sn.pwres;
+        }
+    }
+
+    // The single-event time-to-event records' npde (#1889), from draws of their own, so
+    // the Gaussian scores above are what they are without it. A model with no TTE
+    // endpoint makes no call. An input the score would be wrong on (repeated events,
+    // competing risks, left truncation, an interval-censored record) and a failed
+    // reference simulation are a warning, never a failed fit: those fits succeeded
+    // before the score existed.
+    #[cfg(feature = "survival")]
+    if options.npde_nsim > 0 && !model.tte_cmts().is_empty() {
+        match crate::stats::npde::compute_tte_npde(
+            model,
+            population,
+            &result.params,
+            options.npde_nsim,
+            options.npde_seed,
+            None,
+        ) {
+            Ok((per_subj, npde_warnings)) => {
+                // One score per record, in `tte_rows` order; a subject with no TTE
+                // record has neither. Zipped by subject, never flattened.
+                for (sr, scores) in subjects.iter_mut().zip(per_subj) {
+                    for (row, score) in sr.tte_rows.iter_mut().zip(scores) {
+                        row.npde = score.npde;
+                    }
+                }
+                // A failed event-time solve among the reference draws is worth a line;
+                // a replicate that simply never has an event is not.
+                result
+                    .warnings
+                    .extend(crate::stats::npde::fit_time_warnings(npde_warnings));
+            }
+            Err(why) => result.warnings.push(tte_npde_skipped_warning(&why)),
         }
     }
 
@@ -3314,7 +3531,8 @@ fn fit_inner(
     // Under a `correlation` line the raw IWRES are correlated by construction; the
     // statistic is taken on them decorrelated by the fitted `R` instead (#1081).
     // Either way each subject's series is split at its residual blocks and at its
-    // parallel occasions (#2798); occasions that run in time stay one series (#2829).
+    // occasions when these are parallel (#2798); blocks and occasions that run in
+    // time stay one series (#2829, #2858).
     // Both are read off `population` — the prepared one this fit scored, whose
     // occasions carry the `iov_column`, a derived rule's labels or the level cells.
     let (iwres_lag1_r, dw_statistic) = if model.residual_serial.is_some() {
@@ -3394,17 +3612,39 @@ fn fit_inner(
     });
 
     // DW autocorrelation warnings
-    let dw_warning = match (
-        &model.residual_serial,
-        crate::api::validation::residual_correlation_line(model),
-    ) {
-        (Some(serial), Some(line)) => {
-            dw_autocorrelation_warning_decorrelated(dw_statistic, &line, serial.kind)
-        }
-        _ => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options, population)),
+    let serial_line = model
+        .residual_serial
+        .as_ref()
+        .zip(crate::api::validation::residual_correlation_line(model));
+    let across_blocks = serial_line
+        .as_ref()
+        .and_then(|_| dw_across_blocks(population));
+    let dw_warning = match &serial_line {
+        Some((serial, line)) => dw_autocorrelation_warning_decorrelated(
+            dw_statistic,
+            line,
+            serial.kind,
+            across_blocks.clone(),
+        ),
+        None => dw_autocorrelation_warning(dw_statistic, &dw_advice(model, options, population)),
     };
     if let Some(msg) = dw_warning {
         warnings.push(msg);
+    }
+    if let (Some((serial, line)), Some(by)) = (&serial_line, &across_blocks) {
+        let cross = crate::stats::residual_error::whitened_cross_block_dw(
+            model,
+            population,
+            &result.params,
+            &subjects,
+        );
+        warnings.extend(dw_cross_block_warning(
+            cross,
+            dw_statistic,
+            line,
+            serial.kind,
+            by,
+        ));
     }
     // The published method is `None` whenever the step produced no matrix, so the method
     // gate inside is the only gate (#2415 review row 3).
@@ -3736,6 +3976,19 @@ fn fit_inner(
         fit_result.warnings.push(msg);
         fit_result.warnings_structured.push(entry);
     }
+    // Subjects whose compiled plan failed and took finite differences instead (#2786).
+    // Counted once: the warning and both route labels read the same counts.
+    if let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
+        model,
+        &population.subjects,
+    ) {
+        // The realised route, not the model's: those subjects ran finite differences.
+        crate::api::postfit::apply_plan_failures(
+            &mut fit_result,
+            Some(&c),
+            population.subjects.len(),
+        );
+    }
 
     // The `[covariate_model]` echo (#1111): the relations as declared, joined to
     // the θ this fit estimated and their standard errors. Built here rather than
@@ -3828,42 +4081,5 @@ mod trace_file_path_tests {
         for _ in 0..1_000 {
             assert!(seen.insert(trace_file_path()), "duplicate trace path");
         }
-    }
-}
-
-#[cfg(test)]
-mod last_fit_out_tests {
-    use super::LastFitOut;
-    use std::sync::atomic::AtomicUsize;
-
-    static COUNT: AtomicUsize = AtomicUsize::new(0);
-    thread_local! {
-        static RELEASES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    }
-    fn release() {
-        RELEASES.with(|r| r.set(r.get() + 1));
-    }
-
-    /// Review r1 #2: the tape release runs once, when the last of overlapping fits ends —
-    /// not when the first does, which would trim the tapes another fit is still recording on.
-    /// Mutation: release on every drop → 2 after the first fit ends.
-    #[test]
-    fn the_tapes_are_released_when_the_last_fit_ends() {
-        let first = LastFitOut::enter(&COUNT, release);
-        let second = LastFitOut::enter(&COUNT, release);
-        drop(first);
-        assert_eq!(
-            RELEASES.with(|r| r.get()),
-            0,
-            "another fit is still in progress"
-        );
-        drop(second);
-        assert_eq!(RELEASES.with(|r| r.get()), 1, "the last fit out releases");
-        drop(LastFitOut::enter(&COUNT, release));
-        assert_eq!(
-            RELEASES.with(|r| r.get()),
-            2,
-            "a lone fit releases on its own"
-        );
     }
 }

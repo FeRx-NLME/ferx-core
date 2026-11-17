@@ -33,4 +33,3 @@
 [fit_options]
   method   = foce
   maxiter  = 300
-  gradient = fd

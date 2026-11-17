@@ -926,7 +926,6 @@ fn sigma_log_se(
     etas: &[Vec<f64>],
     schedules: &[Option<crate::pk::event_driven::EventSchedule>],
 ) -> Option<Vec<f64>> {
-    use rayon::prelude::*;
     let free_idx: Vec<usize> = (0..sigma.len())
         .filter(|&k| free.get(k).copied().unwrap_or(false))
         .collect();
@@ -936,11 +935,11 @@ fn sigma_log_se(
     }
     // Collected in subject order and folded serially, as everywhere else in
     // this file: a parallel reduction would depend on the worker count (#703).
-    let per_subj: Vec<Vec<f64>> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+    let per_subj: Vec<Vec<f64>> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             let preds = crate::pk::compute_predictions_with_tv_into_with_schedule(
                 model,
                 subject,
@@ -969,8 +968,8 @@ fn sigma_log_se(
                 }
             }
             info
-        })
-        .collect();
+        },
+    );
     let mut info = DMatrix::<f64>::zeros(m, m);
     for s in &per_subj {
         for a in 0..m {
@@ -1012,8 +1011,9 @@ fn sigma_log_se(
 ///   class draw as well as on η, and neither the stored-draw bookkeeping nor the
 ///   information block has been derived for them.
 /// * **M3**, a **TTE endpoint**, and a **`block_sigma` residual correlation** —
-///   the per-subject gradient takes the whole-NLL finite-difference path there
-///   and never forms a per-observation prediction derivative.
+///   the per-subject gradient is exact there (the kernel's data score), but the
+///   information block is built from per-observation `∂f/∂θ` rows and variance
+///   derivatives that are not derived for censored, hazard or dense-`R` rows.
 /// * **`[covariate_nn]`** — its θ derivatives are assembled in output space.
 /// * a **residual magnitude** (#484/#1029) — θ reaches the residual variance
 ///   through a channel the closed form does not carry.
@@ -1483,7 +1483,6 @@ impl MstepScoreSa {
         gamma_sigma: &[f64],
         schedules: &[Option<crate::pk::event_driven::EventSchedule>],
     ) -> bool {
-        use rayon::prelude::*;
         let n_theta = self.n_theta;
         let n_sigma = self.n_sigma;
         let n = n_theta + n_sigma;
@@ -1513,11 +1512,11 @@ impl MstepScoreSa {
         // Collected in subject order and folded serially: a parallel `reduce`
         // would combine partials along thread-count-dependent boundaries and
         // f64 addition is not associative (#703).
-        let per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)> = population
-            .subjects
-            .par_iter()
-            .zip(etas.par_iter())
-            .map_init(EventPkParams::default, |scratch, (subject, eta)| {
+        let per_subj: Vec<(f64, Vec<f64>, Option<Vec<f64>>)> = crate::par::map_init(
+            population.subjects.len().min(etas.len()),
+            EventPkParams::default,
+            |scratch, idx| {
+                let (subject, eta) = (&population.subjects[idx], &etas[idx]);
                 crate::estimation::fixed_eta_gradient::obs_nll_subject_grad_fisher(
                     model,
                     subject,
@@ -1531,8 +1530,8 @@ impl MstepScoreSa {
                     n_sigma,
                     scratch,
                 )
-            })
-            .collect();
+            },
+        );
 
         let mut grad = vec![0.0f64; n];
         let mut fisher = vec![0.0f64; n * n];
@@ -1813,13 +1812,11 @@ fn scalar_residual_sse(
     etas: &[Vec<f64>],
     residual_model: ScalarResidualModel,
 ) -> Option<(f64, usize)> {
-    use rayon::prelude::*;
-
-    let per_subject: Vec<Option<(f64, usize)>> = population
-        .subjects
-        .par_iter()
-        .zip(etas.par_iter())
-        .map_init(EventPkParams::default, |scratch, (subject, eta)| {
+    let per_subject: Vec<Option<(f64, usize)>> = crate::par::map_init(
+        population.subjects.len().min(etas.len()),
+        EventPkParams::default,
+        |scratch, idx| {
+            let (subject, eta) = (&population.subjects[idx], &etas[idx]);
             let predictions =
                 crate::pk::compute_predictions_with_tv_into(model, subject, theta, eta, scratch);
             if predictions.len() != subject.observations.len() {
@@ -1846,8 +1843,8 @@ fn scalar_residual_sse(
                 sse += term;
             }
             Some((sse, subject.observations.len()))
-        })
-        .collect();
+        },
+    );
 
     // Preserve thread-count reproducibility: Rayon may schedule subjects in a
     // different partition, but the collected vector remains input ordered.
@@ -2529,17 +2526,13 @@ fn theta_sigma_mstep_light(
     // (#1458) can call it once per stored draw; at `mstep_draws = 1` there is
     // exactly one call and the arithmetic is unchanged.
     let one_draw_grad = |th: &[f64], sg: &[f64], etas: &[Vec<f64>]| -> (f64, Vec<f64>) {
-        use rayon::prelude::*;
         if let Some(kappas) = kappas_opt {
-            let per_subj: Vec<(f64, Vec<f64>)> = population
-                .subjects
-                .par_iter()
-                .zip(etas.par_iter())
-                .zip(kappas.par_iter())
-                .enumerate()
-                .map_init(
-                    EventPkParams::default,
-                    |scratch, (i, ((subject, eta), kaps))| {
+            let per_subj: Vec<(f64, Vec<f64>)> = crate::par::map_init(
+                population.subjects.len().min(etas.len()).min(kappas.len()),
+                EventPkParams::default,
+                |scratch, i| {
+                    let ((subject, eta), kaps) = ((&population.subjects[i], &etas[i]), &kappas[i]);
+                    {
                         let cls = mix_mstep.map(|m| m.classes[i]);
                         let _g = cls
                             .map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
@@ -2571,17 +2564,16 @@ fn theta_sigma_mstep_light(
                             }
                         }
                         (nll, grad)
-                    },
-                )
-                .collect();
+                    }
+                },
+            );
             fold_nll_grad(per_subj, n)
         } else {
-            let per_subj: Vec<(f64, Vec<f64>)> = population
-                .subjects
-                .par_iter()
-                .zip(etas.par_iter())
-                .enumerate()
-                .map_init(EventPkParams::default, |scratch, (i, (subject, eta))| {
+            let per_subj: Vec<(f64, Vec<f64>)> = crate::par::map_init(
+                population.subjects.len().min(etas.len()),
+                EventPkParams::default,
+                |scratch, i| {
+                    let (subject, eta) = (&population.subjects[i], &etas[i]);
                     let cls = mix_mstep.map(|m| m.classes[i]);
                     let _g =
                         cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
@@ -2610,8 +2602,8 @@ fn theta_sigma_mstep_light(
                         }
                     }
                     (nll, grad)
-                })
-                .collect();
+                },
+            );
             fold_nll_grad(per_subj, n)
         }
     };
@@ -2781,15 +2773,14 @@ pub(crate) fn obs_nll_sum(
     // what the tests and any caller without one pass.
     schedules: &[Option<crate::pk::event_driven::EventSchedule>],
 ) -> f64 {
-    use rayon::prelude::*;
     // Collect in subject order and sum serially so the objective does not
     // depend on the rayon worker count (f64 addition is non-associative and a
     // parallel `.sum()` splits by thread count) — #703.
-    let per_subj: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             crate::stats::likelihood::obs_nll_subject_into_with_schedule(
                 model,
                 subject,
@@ -2800,8 +2791,8 @@ pub(crate) fn obs_nll_sum(
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
             )
-        })
-        .collect();
+        },
+    );
     per_subj.iter().sum()
 }
 
@@ -2817,15 +2808,14 @@ fn obs_nll_sum_iov(
     // `&[]` means "no cache" and reproduces the per-call rebuild exactly.
     schedules: &[Option<crate::pk::event_driven::EventSchedule>],
 ) -> f64 {
-    use rayon::prelude::*;
     // Deterministic reduction (collect in subject order, fold serially): a
     // parallel `.sum()` would make the objective depend on the rayon worker
     // count — #703.
-    let per_subj: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             crate::estimation::fixed_eta_gradient::obs_nll_subject_into_iov_with_schedule(
                 model,
                 subject,
@@ -2836,8 +2826,8 @@ fn obs_nll_sum_iov(
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
             )
-        })
-        .collect();
+        },
+    );
     per_subj.iter().sum()
 }
 
@@ -2854,12 +2844,11 @@ fn obs_nll_sum_mix(
     mix: MixMstep<'_>,
     schedules: &[Option<crate::pk::event_driven::EventSchedule>],
 ) -> f64 {
-    use rayon::prelude::*;
-    let per_subj: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             let c = mix.classes[i];
             let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
             let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
@@ -2874,8 +2863,8 @@ fn obs_nll_sum_mix(
                 scratch,
                 schedules.get(i).and_then(|s| s.as_ref()),
             )
-        })
-        .collect();
+        },
+    );
     per_subj.iter().sum()
 }
 
@@ -2889,19 +2878,18 @@ fn obs_nll_sum_iov_mix(
     kappas: &[Vec<Vec<f64>>],
     mix: MixMstep<'_>,
 ) -> f64 {
-    use rayon::prelude::*;
-    let per_subj: Vec<f64> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map_init(EventPkParams::default, |scratch, (i, subject)| {
+    let per_subj: Vec<f64> = crate::par::map_init(
+        population.subjects.len(),
+        EventPkParams::default,
+        |scratch, i| {
+            let subject = &population.subjects[i];
             let c = mix.classes[i];
             let _g = crate::parser::model_parser::MixtureClassGuard::enter(c + 1);
             let sub_sg = class_sigma_subst(sigma_values, &mix.class_sigma_over[c]);
             let sg_i: &[f64] = sub_sg.as_deref().unwrap_or(sigma_values);
             obs_nll_subject_into_iov(model, subject, theta, sg_i, &etas[i], &kappas[i], scratch)
-        })
-        .collect();
+        },
+    );
     per_subj.iter().sum()
 }
 
@@ -3824,9 +3812,14 @@ pub(crate) fn mixture_mu_ref_means(
 /// recorder, so its scope (`recorder_in_scope`, read through the inner-gradient
 /// predicate) is the single structural gate: it admits analytical PK models and
 /// ODE models whose dual ODE walk serves the RHS and readout (#2639), and keeps
-/// out SDE (`[diffusion]`) and any ODE shape the recorder declines. There is no
-/// separate analytical-PK conjunct — a second gate rejecting the same inputs
-/// would leave one of them untestable.
+/// out any ODE shape the recorder declines. There is no separate analytical-PK
+/// conjunct — a second gate rejecting the same inputs would leave one of them
+/// untestable.
+///
+/// SDE (`[diffusion]`) is served: the refresh's gradient and curvature read the EKF
+/// variance rows off the subject's recording beside the predictions
+/// (`analytic_eta_nll_gradient`, `saem_imh::eta_jacobian_and_preds`), so they describe the
+/// likelihood SAEM samples.
 ///
 /// The remaining conditions are no IOV, no `iiv_on_ruv`, no mixture, and the
 /// shapes
@@ -5474,6 +5467,7 @@ pub fn run_saem(
                 ))
             };
             let imh_counters_ref = &imh_counters;
+            let e_step_fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
             #[cfg(test)]
             let rw_block_calls_ref = &rw_block_calls;
 
@@ -5509,6 +5503,10 @@ pub fn run_saem(
                 .map_init(
                     MhScratch::default,
                     |mh_scratch, (i, (((((eta, &nll), &scale), cw_sc_i), kappas_i), imh_slot))| {
+                        // This task's plans key under the fit that spawned it (#2786).
+                        let _fit = crate::parser::model_parser::rhs_regcode::kernel_jit::enter_fit(
+                            e_step_fit,
+                        );
                         let subject = &population.subjects[i];
                         let mut rng = StdRng::seed_from_u64(
                             master_seed
@@ -5915,11 +5913,9 @@ pub fn run_saem(
         if n_kappa > 0 {
             if let Some(omega_iov_cur) = omega_iov_cur_opt.as_ref() {
                 // Shared reborrow: the parallel phase only reads the state.
-                use rayon::prelude::*;
                 let st = &state;
-                let updates: Vec<(Vec<Vec<f64>>, f64, usize, usize)> = (0..n_subjects)
-                    .into_par_iter()
-                    .map(|i| {
+                let updates: Vec<(Vec<Vec<f64>>, f64, usize, usize)> =
+                    crate::par::map(n_subjects, |i| {
                         let mut kappas_i = st.kappas[i].clone();
                         let subject = &population.subjects[i];
                         // Mixture (#985): κ must be sampled inside the subject's drawn
@@ -5979,8 +5975,7 @@ pub fn run_saem(
                             &mut kappa_pk,
                         );
                         (kappas_i, nll_new, n_acc, n_prop)
-                    })
-                    .collect();
+                    });
                 // Applied in subject order, so the counters accumulate identically to the
                 // serial loop however the workers finished.
                 for (i, (kappas_i, nll_new, n_acc, n_prop)) in updates.into_iter().enumerate() {
@@ -6733,7 +6728,6 @@ pub fn run_saem(
                 .collect();
             state.nll_cache = new_nlls;
         } else {
-            use rayon::prelude::*;
             // map_init lets each rayon worker keep one `EventPkParams`
             // scratch alive across every subject it handles, the same
             // pattern as the MH step above. Without it, the per-iter
@@ -6742,11 +6736,9 @@ pub fn run_saem(
             let mix_omegas_ref = &mix_omegas;
             let mix_sigmas_ref = &mix_sigmas;
             let mix_classes_ref = mix_classes.as_ref();
-            let new_nlls: Vec<f64> = state
-                .etas
-                .par_iter()
-                .enumerate()
-                .map_init(EventPkParams::default, |scratch, (i, eta)| {
+            let new_nlls: Vec<f64> =
+                crate::par::map_init(state.etas.len(), EventPkParams::default, |scratch, i| {
+                    let eta = &state.etas[i];
                     let cls = mix_classes_ref.map(|c| c[i]);
                     let _g =
                         cls.map(|c| crate::parser::model_parser::MixtureClassGuard::enter(c + 1));
@@ -6767,8 +6759,7 @@ pub fn run_saem(
                         scratch,
                         schedules.get(i).and_then(|s| s.as_ref()),
                     )
-                })
-                .collect();
+                });
             state.nll_cache = new_nlls;
         }
 
@@ -7167,6 +7158,8 @@ pub fn run_saem(
                     0, // SAEM final EBE is warm-started; no inner multi-start
                     crate::estimation::inner_optimizer::InnerHessianSeed::None,
                     options,
+                    // The chain's state, no solve's; inert anyway without restarts or a seed.
+                    crate::estimation::inner_optimizer::PrevEtas::Placeholder,
                 );
             let ofv = 2.0
                 * pop_nll(

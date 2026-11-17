@@ -32,6 +32,8 @@ enum Walk {
     Algebraic,
     ClosedForm,
     Ode,
+    /// A closed-form transit model whose subject is routed to its ODE twin (an infusion).
+    Transit,
 }
 
 fn fixture(walk: Walk) -> (CompiledModel, Subject) {
@@ -39,8 +41,20 @@ fn fixture(walk: Walk) -> (CompiledModel, Subject) {
         Walk::Algebraic => fx::algebraic(),
         Walk::ClosedForm => fx::closed_form(),
         Walk::Ode => fx::ode(),
+        Walk::Transit => fx::transit(),
     };
-    let (model, mut pop) = fx::prepared(&src, 1);
+    let (mut model, mut pop) = fx::prepared(&src, 1);
+    if matches!(walk, Walk::Transit) {
+        // The twin integrates at the tolerances the oracle's central differences need
+        // (the `ode()` fixture's own), not the parse default.
+        model.sync_ode_solver_opts(&crate::types::FitOptions {
+            ode_reltol: 1e-10,
+            ode_abstol: 1e-12,
+            ..Default::default()
+        });
+        // An infusion routes the subject to the ODE twin (`CompiledModel::effective_for`).
+        pop.subjects[0].doses[0] = crate::types::DoseEvent::new(0.0, 100.0, 1, 50.0, false, 0.0);
+    }
     assert!(model.has_nested_levels(), "{walk:?}: the fixture must nest");
     // Which engine the recording runs — asserted, so a fixture that slid onto another one
     // (or out of the recorders' scope) cannot pass for this one.
@@ -52,6 +66,13 @@ fn fixture(walk: Walk) -> (CompiledModel, Subject) {
                 && model.absorption_ode_equivalent.is_none()
         }
         Walk::Ode => model.ode_spec.is_some(),
+        Walk::Transit => {
+            // The recording runs on the twin, which carries the levels it lays κ out by.
+            let twin = model.effective_for(&pop.subjects[0]);
+            model.absorption_ode_equivalent.is_some()
+                && twin.ode_spec.is_some()
+                && twin.nested_levels() == model.nested_levels()
+        }
     };
     assert!(engine, "{walk:?}: the fixture is not on its engine");
     assert!(
@@ -286,6 +307,12 @@ fn nested_ode_recording_matches_fd_over_the_compact_vector() {
     check_inner_hessian(Walk::Ode);
 }
 
+#[test]
+fn nested_transit_twin_recording_matches_fd_over_the_compact_vector() {
+    check_jacobian(Walk::Transit);
+    check_inner_hessian(Walk::Transit);
+}
+
 /// #2468 review: the fixed-η θ adjoint (SAEM's M-step, VI's score) on a nested-level subject
 /// reads the per-cell stacked vector its callers hold, and records over the compact axes it
 /// expands from (`resolve`), not per cell: `∂f_j/∂θ` against central differences of the
@@ -331,7 +358,7 @@ fn check_fixed_eta_theta(walk: Walk) {
 
 #[test]
 fn nested_fixed_eta_theta_adjoint_matches_fd_over_theta() {
-    for walk in [Walk::Algebraic, Walk::ClosedForm, Walk::Ode] {
+    for walk in [Walk::Algebraic, Walk::ClosedForm, Walk::Ode, Walk::Transit] {
         check_fixed_eta_theta(walk);
     }
 }
