@@ -1562,15 +1562,12 @@ pub(super) fn reverse(fwd: &Func) -> Func {
 /// Tangents are kept sparse: a value no input reaches has none, and emits nothing. A dead
 /// arm needs no mask here — its value is only read through the [`Inst::Select`] that chose
 /// it, and the select picks the taken arm's tangent.
-pub(super) fn tangent(f: &Func, k: usize) -> Func {
-    tangent_prefix(f, k, 0).0
-}
-
-/// [`tangent`], also returning how many of its instructions come from `f`'s first `prefix`:
-/// the tangent of a prefix that reads none of `f`'s later arguments reads none of their
-/// tangents either, so a reverse's forward recomputation stays a prefix of its forward over
-/// reverse (#2980) — run once and shared by every seed.
-pub(super) fn tangent_prefix(f: &Func, k: usize, prefix: usize) -> (Func, usize) {
+///
+/// Also returns how many of its instructions come from `f`'s first `prefix`: the tangent of a
+/// prefix that reads none of `f`'s later arguments reads none of their tangents either, so a
+/// reverse's forward recomputation stays a prefix of its forward over reverse (#2980) — run
+/// once and shared by every seed (`prefix` 0: none).
+pub(super) fn tangent(f: &Func, k: usize, prefix: usize) -> (Func, usize) {
     type Tan = Option<Vec<V>>;
     // `Σ ± scale·tangent`, sparse: `None` when every term is.
     fn lin(b: &mut Func, k: usize, terms: &[(&Tan, Option<V>, bool)]) -> Tan {
@@ -1803,8 +1800,8 @@ pub(super) fn tangent_packed(f: &Func, k: usize, l: usize, seed_tangents: bool) 
     tangent_packed_prefix(f, k, l, seed_tangents, 0).0
 }
 
-/// [`tangent_packed`] with [`tangent_prefix`]'s count of the instructions `f`'s first `prefix`
-/// became (packing moves locations, never instructions).
+/// [`tangent_packed`] with [`tangent`]'s count of the instructions `f`'s first `prefix` became
+/// (packing moves locations, never instructions).
 pub(super) fn tangent_packed_prefix(
     f: &Func,
     k: usize,
@@ -1812,7 +1809,7 @@ pub(super) fn tangent_packed_prefix(
     seed_tangents: bool,
     prefix: usize,
 ) -> (Func, usize) {
-    let (t, emitted) = tangent_prefix(f, k, prefix);
+    let (t, emitted) = tangent(f, k, prefix);
     let n = f.n_args;
     let wl = (l * (1 + k)) as u32;
     let (l32, k32) = (l as u32, k as u32);

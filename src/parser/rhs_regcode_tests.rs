@@ -534,7 +534,7 @@ fn forward_over_reverse_is_the_hessian_on_random_programs() {
         let du_bar: Vec<f64> = (0..3).map(|_| rng.unit() * 2.0 - 1.0).collect();
         let zeros = |n: usize| vec![0.0; n];
         // `ir::tangent` against the tangent interpreter, two directions at once.
-        let t2 = ir::tangent(&fwd, 2);
+        let t2 = ir::tangent(&fwd, 2, 0).0;
         let mut dirs: Vec<Vec<f64>> = [3, n_params, 4, 3].iter().map(|&n| zeros(2 * n)).collect();
         for (a, d) in dirs.iter_mut().enumerate().take(3) {
             for (i, x) in d.iter_mut().enumerate() {
@@ -572,8 +572,8 @@ fn forward_over_reverse_is_the_hessian_on_random_programs() {
         }
         // Forward-over-reverse: row `i` of `H = ∂²(ū·f)/∂u²`, the tangent of `ū` along `eᵢ`.
         let rev = ir::reverse(&fwd);
-        let fr = ir::tangent(&rev, 1);
-        let ff = ir::tangent(&ir::tangent(&fwd, 1), 1);
+        let fr = ir::tangent(&rev, 1, 0).0;
+        let ff = ir::tangent(&ir::tangent(&fwd, 1, 0).0, 1, 0).0;
         for i in 0..3 {
             let mut bufs: Vec<Vec<f64>> = vec![
                 u.clone(),
