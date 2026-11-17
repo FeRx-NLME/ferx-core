@@ -174,6 +174,11 @@ pub(super) struct Basis {
     /// Chunk `c` carries axes `c·w ..`.
     runs: Vec<Kept>,
     w: usize,
+    /// The outputs' base lanes, row `o·lb + x`: their values, and their Jacobian over the axes
+    /// (row-major, a row per output lane) — read by every pass without touching the runs.
+    lb: usize,
+    vals: Vec<f64>,
+    jac: Vec<f64>,
     /// The plan's fold, if it carries folded θ on its η axes.
     folded: bool,
     adj: Option<BasisAdj>,
@@ -198,12 +203,24 @@ impl Basis {
         self.axes.iter().position(|&a| a == inp)
     }
 
-    /// Output `o`'s base lane `x`: its value, or its tangent along axis `b`.
-    fn out(&self, o: usize, x: usize, b: Option<usize>) -> f64 {
-        match b {
-            None => self.runs[0].out(o, x, None),
-            Some(b) => self.runs[b / self.w].out(o, x, Some(b % self.w)),
+    /// The runs' outputs as [`Self::vals`] and [`Self::jac`].
+    fn dense(runs: &[Kept], w: usize, n_ax: usize) -> (usize, Vec<f64>, Vec<f64>) {
+        let k0 = &runs[0];
+        let (l, lb) = (k0.layout.lanes(), k0.layout.base_lanes());
+        let n_out = (k0.du.len() / l).saturating_sub(1);
+        let rows = n_out * lb;
+        let mut vals = vec![0.0; rows];
+        let mut jac = vec![0.0; rows * n_ax];
+        for o in 0..n_out {
+            for x in 0..lb {
+                let r = o * lb + x;
+                vals[r] = k0.out(o, x, None);
+                for ax in 0..n_ax {
+                    jac[r * n_ax + ax] = runs[ax / w].out(o, x, Some(ax % w));
+                }
+            }
         }
+        (lb, vals, jac)
     }
 }
 
@@ -213,6 +230,11 @@ pub(super) struct BasisUse {
     key: PlanKey,
     coef: Vec<Vec<f64>>,
     folded: Vec<Vec<(usize, f64)>>,
+    /// The outputs' base lanes (row `o·lb + x`): values, and per direction its tangent
+    /// (`J·c_a`, row-major over the pass's directions).
+    lb: usize,
+    vals: Vec<f64>,
+    tan: Vec<f64>,
 }
 
 /// A plan of a pass: run along the pass's directions, or assembled from its basis.
@@ -401,6 +423,7 @@ impl CovPlan<'_> {
                     run(Lanes::Axes(ch), &t)
                 })
                 .collect::<Option<Vec<Kept>>>()?;
+            let (lb, vals, jac) = Basis::dense(&runs, width, axes.len());
             self.bases.borrow_mut().insert(
                 key,
                 Basis {
@@ -409,14 +432,38 @@ impl CovPlan<'_> {
                     n_par,
                     runs,
                     w: width,
+                    lb,
+                    vals,
+                    jac,
                     folded: fold.is_some(),
                     adj: None,
                 },
             );
         }
+        // The pass's tangents, `J·c_a` per output lane, once.
+        let bases = self.bases.borrow();
+        let b = &bases[&key];
+        let (n_ax, nd) = (b.axes.len(), coef.len());
+        let rows = b.vals.len();
+        let mut tan = vec![0.0; rows * nd];
+        for r in 0..rows {
+            let jr = &b.jac[r * n_ax..(r + 1) * n_ax];
+            for (a, c) in coef.iter().enumerate() {
+                tan[r * nd + a] = jr.iter().zip(c).map(|(j, c)| j * c).sum();
+            }
+        }
+        let (lb, vals) = (b.lb, b.vals.clone());
+        drop(bases);
         #[cfg(test)]
         BASIS_PLANS.with(|c| c.set(c.get() + 1));
-        Some(PlanRun::Basis(BasisUse { key, coef, folded }))
+        Some(PlanRun::Basis(BasisUse {
+            key,
+            coef,
+            folded,
+            lb,
+            vals,
+            tan,
+        }))
     }
 
     /// Output `o`'s base lane `x` of a pass's plan: its value, or its tangent along the pass's
@@ -425,19 +472,11 @@ impl CovPlan<'_> {
         match pr {
             PlanRun::Direct(k) => k.out(o, x, a),
             PlanRun::Basis(u) => {
-                let bases = self.bases.borrow();
-                let b = &bases[&u.key];
+                let r = o * u.lb + x;
                 match a {
-                    None => b.out(o, x, None),
-                    Some(a) => match u.coef.get(a) {
-                        Some(c) => c
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, &v)| v != 0.0)
-                            .map(|(j, &v)| v * b.out(o, x, Some(j)))
-                            .sum(),
-                        None => 0.0,
-                    },
+                    None => u.vals[r],
+                    Some(a) if a < u.coef.len() => u.tan[r * u.coef.len() + a],
+                    Some(_) => 0.0,
                 }
             }
         }
@@ -540,27 +579,25 @@ impl CovPlan<'_> {
         let ba = b.adj.as_ref()?;
         // `Jᵀ·u̇̄_a` on each axis: the kernel's adjoint tangents of the outputs against the
         // basis's forward tangents.
-        let gn: Vec<Vec<f64>> = (0..kt)
-            .map(|a| {
-                (0..b.axes.len())
-                    .map(|ax| {
-                        let mut s = 0.0;
-                        for j in 0..n_out {
-                            for x in 0..nl {
-                                let at = slot(j, x);
-                                if at != usize::MAX {
-                                    let ud = a0[at * lk + 1 + a];
-                                    if ud != 0.0 {
-                                        s += ud * b.out(j, x, Some(ax));
-                                    }
-                                }
-                            }
+        let n_ax = b.axes.len();
+        let mut gn = vec![vec![0.0; n_ax]; kt];
+        for j in 0..n_out {
+            for x in 0..nl.min(b.lb) {
+                let at = slot(j, x);
+                if at == usize::MAX {
+                    continue;
+                }
+                let jr = &b.jac[(j * b.lb + x) * n_ax..(j * b.lb + x + 1) * n_ax];
+                for (a, g) in gn.iter_mut().enumerate() {
+                    let ud = a0[at * lk + 1 + a];
+                    if ud != 0.0 {
+                        for (gv, jv) in g.iter_mut().zip(jr) {
+                            *gv += ud * jv;
                         }
-                        s
-                    })
-                    .collect()
-            })
-            .collect();
+                    }
+                }
+            }
+        }
         let fold = self.fold.as_ref().filter(|_| b.folded);
         // Input `inp`'s adjoint tangent along direction `a`.
         let tan = |a: usize, inp: Input| -> f64 {
