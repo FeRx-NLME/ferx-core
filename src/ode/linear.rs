@@ -74,8 +74,11 @@ fn matmul_into<T: PkNum>(x: &[T], y: &[T], n: usize, out: &mut [T], row_finite: 
     // A recording takes the product as one call (#2980): compact code at run time, not the
     // product written out lane by lane in the plan's kernel. (A failed call fails the recording.)
     if let Some(c) = T::mat_mul(&x[..n * n], &y[..n * n], n) {
-        if let Some(c) = c {
-            out[..n * n].copy_from_slice(&c);
+        match c {
+            Some(c) => out[..n * n].copy_from_slice(&c),
+            // The recorder failed the recording; nothing reads this product, but leave no stale
+            // one behind.
+            None => out[..n * n].fill(T::from_f64(f64::NAN)),
         }
         return;
     }

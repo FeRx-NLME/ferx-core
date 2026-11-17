@@ -796,6 +796,9 @@ impl CovPlan<'_> {
         let lk = 1 + kt;
         let n_in = rin.len() / lk;
         let n_out = seed.len() / lk;
+        if let Some(out) = self.reduce_rows(family, stage, rin, kt, seed) {
+            return Some(out);
+        }
         let mut out = vec![0.0; n_in * lk];
         let mut one = vec![0.0; n_in * 2];
         let mut s1 = vec![0.0; n_out * 2];
@@ -815,6 +818,59 @@ impl CovPlan<'_> {
                     out[i * lk] = radj[2 * i];
                 }
                 out[i * lk + 1 + a] = radj[2 * i + 1];
+            }
+        }
+        Some(out)
+    }
+
+    /// [`Self::reduce_for`] through the rows kernels (#2980): the reduce's values and adjoints
+    /// once, each direction a seed of its tangents. `None` where its plan has no rows kernels or
+    /// its guard does not hold at these values; the caller then runs a direction at a time.
+    fn reduce_rows(
+        &self,
+        family: Family,
+        stage: u8,
+        rin: &[f64],
+        kt: usize,
+        seed: &[f64],
+    ) -> Option<Vec<f64>> {
+        let lk = 1 + kt;
+        let (n_in, n_out) = (rin.len() / lk, seed.len() / lk);
+        if kt == 0 {
+            return None;
+        }
+        let vals: Vec<f64> = (0..n_in).map(|i| rin[i * lk]).collect();
+        let kr = self.reduce_run(family, stage, &vals, 0, n_out)?;
+        let plan = kr.plan();
+        if !plan.rows_serve(Layout::F64) {
+            return None;
+        }
+        let mut tu = vec![0.0; kt * n_in];
+        for a in 0..kt {
+            for i in 0..n_in {
+                tu[a * n_in + i] = rin[i * lk + 1 + a];
+            }
+        }
+        let rf = plan.forward_rows(Layout::F64, &[], &vals, &tu, kt)?;
+        if !plan.rows_guard(&rf) {
+            return None;
+        }
+        let du: Vec<f64> = (0..n_out).map(|o| seed[o * lk]).collect();
+        let mut dut = vec![0.0; kt * n_out];
+        for a in 0..kt {
+            for o in 0..n_out {
+                dut[a * n_out + o] = seed[o * lk + 1 + a];
+            }
+        }
+        let (mut pb, mut pt) = (vec![0.0; n_in], vec![0.0; kt * n_in]);
+        if !plan.reverse_rows(&rf, &du, Some(&dut), &mut [], &mut pb, &mut [], &mut pt) {
+            return None;
+        }
+        let mut out = vec![0.0; n_in * lk];
+        for i in 0..n_in {
+            out[i * lk] = pb[i];
+            for a in 0..kt {
+                out[i * lk + 1 + a] = pt[a * n_in + i];
             }
         }
         Some(out)

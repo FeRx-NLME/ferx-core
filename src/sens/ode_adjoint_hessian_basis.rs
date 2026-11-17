@@ -269,6 +269,9 @@ pub(super) struct Basis {
 struct BasisAdj {
     g: Vec<f64>,
     t: Vec<Vec<f64>>,
+    /// The seed `ū` it was formed with (per output, its base lanes' adjoints): another seed
+    /// forms it again.
+    seed: Vec<f64>,
 }
 
 impl Basis {
@@ -510,6 +513,15 @@ impl CovPlan<'_> {
             coef.push(c);
         }
         drop(moved);
+        // A basis cached along other axes (another `eta_up`, another moved set) is rebuilt.
+        if self
+            .bases
+            .borrow()
+            .get(&key)
+            .is_some_and(|b| b.axes != axes)
+        {
+            self.bases.borrow_mut().remove(&key);
+        }
         if !self.bases.borrow().contains_key(&key) {
             // One axis per run. A plan's kernels follow its subject's event sequence, so subjects
             // with different designs compile their own: the compiled code grows with the tangent
@@ -603,6 +615,20 @@ impl CovPlan<'_> {
         let mut bases = self.bases.borrow_mut();
         let b = bases.get_mut(&u.key)?;
         let n_in = b.n_eta + b.n_par;
+        let seed: Vec<f64> = (0..n_out)
+            .flat_map(|j| (0..nl).map(move |x| (j, x)))
+            .map(|(j, x)| {
+                let s = slot(j, x);
+                if s == usize::MAX {
+                    0.0
+                } else {
+                    a0[s * lk]
+                }
+            })
+            .collect();
+        if b.adj.as_ref().is_some_and(|a| a.seed != seed) {
+            b.adj = None;
+        }
         if b.adj.is_none() {
             // `∇²(ūᵀP)·B`: the basis's forward over reverse, `ū` on the value lanes.
             let mut g = vec![0.0; n_in];
@@ -632,7 +658,7 @@ impl CovPlan<'_> {
                 if rf.seeds() != n_ax
                     || !kept
                         .plan
-                        .reverse_rows(rf, &du_bar, &mut ub, &mut pb, &mut ut, &mut pt)
+                        .reverse_rows(rf, &du_bar, None, &mut ub, &mut pb, &mut ut, &mut pt)
                 {
                     return None;
                 }
@@ -721,7 +747,7 @@ impl CovPlan<'_> {
                     }
                 }
             }
-            b.adj = Some(BasisAdj { g, t });
+            b.adj = Some(BasisAdj { g, t, seed });
         }
         let b = &*b;
         let ba = b.adj.as_ref()?;

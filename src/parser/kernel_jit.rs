@@ -3634,9 +3634,10 @@ pub(crate) struct Tiered {
     /// The modules every native entry point lives in (an older one may still be running).
     modules: Mutex<Vec<ChunkKernel>>,
     /// A rows reverse kernel's slot-table split (`ir::tangent_reverse_rows`): its calls pass
-    /// their first `entries` entries, then the same entries a plan's slot count on. `0` for
-    /// every other kernel.
+    /// their first `entries` entries, then the same entries a plan's slot count on.
     entries: usize,
+    /// Whether this is a rows reverse kernel ([`Self::new_rows`]).
+    rows: bool,
     /// Itself, for the compile queue ([`compile_queue`]).
     me: std::sync::Weak<Tiered>,
     /// How a kernel too large for one native frame is cut into segments ([`SegPlan`]), made at
@@ -3714,6 +3715,7 @@ impl Tiered {
             tier: std::sync::atomic::AtomicU8::new(0),
             modules: Mutex::new(Vec::new()),
             entries: 0,
+            rows: false,
         })
     }
 
@@ -3734,6 +3736,7 @@ impl Tiered {
             tier: std::sync::atomic::AtomicU8::new(0),
             modules: Mutex::new(Vec::new()),
             entries,
+            rows: true,
         })
     }
 
@@ -4079,8 +4082,15 @@ impl ChunkProgram {
             return k.clone();
         }
         // The steps a gate leaves to a higher order are not this variant's. Forward over
-        // reverse is the same derivative order as reverse over forward.
-        let gate = (layout.order() + rev as usize).min(GATE_ORDERS - 1);
+        // reverse is the same derivative order as reverse over forward. A rows kernel is built
+        // at a base layout but differentiates past it: its tangent counts one order (and its
+        // reverse one more), not its calling convention (#2980).
+        let order = match sweep {
+            Sweep::TangentRows => layout.order() + 1,
+            Sweep::TangentReverseRows => layout.order() + 2,
+            _ => layout.order() + rev as usize,
+        };
+        let gate = order.min(GATE_ORDERS - 1);
         let gated = resolve_gates(&self.code, self.n_regs, gate);
         let code = match &gated {
             Some(c) => c.as_slice(),
@@ -4104,8 +4114,13 @@ impl ChunkProgram {
                         _ => None,
                     })
                     .collect();
+                let hosts = f
+                    .insts
+                    .iter()
+                    .filter(|i| matches!(i, Inst::Host(_)))
+                    .count();
                 eprintln!(
-                    "kjit: no rows reverse: n_args {} reverse args {args:?}",
+                    "kjit: no rows reverse: n_args {} reverse args {args:?}, {hosts} host calls",
                     f.n_args
                 );
             }
@@ -5962,6 +5977,7 @@ impl Plan {
         &self,
         r: &RowsFwd,
         du_bar: &[f64],
+        dut_bar: Option<&[f64]>,
         u_bar: &mut [f64],
         p_bar: &mut [f64],
         ut_bar: &mut [f64],
@@ -5987,6 +6003,14 @@ impl Plan {
         for (i, &o) in self.outs.iter().enumerate() {
             for c in 0..l {
                 sh[need + o as usize * l + c] += du_bar[i * l + c];
+                // A seed's own tangent of the output seed, where it has one.
+                if let Some(t) = dut_bar {
+                    let n_out = self.outs.len();
+                    for sd in 0..seeds {
+                        ts[sd * 2 * need + need + o as usize * l + c] +=
+                            t[(sd * n_out + i) * l + c];
+                    }
+                }
             }
         }
         let lt = Layout { tan: 1, ..layout };
@@ -6003,7 +6027,7 @@ impl Plan {
                     // A chunk without a rows reverse (`ir::tangent_reverse_rows` declined it):
                     // its per-direction forward over reverse at one tangent, each seed from the
                     // state before the chunk; the adjoints' values are every seed's, taken once.
-                    if k.entries == 0 {
+                    if !k.rows {
                         let sh0 = sh.clone();
                         for sd in 0..seeds {
                             let tsd = &mut ts[sd * 2 * need..(sd + 1) * 2 * need];
@@ -6255,10 +6279,17 @@ impl Plan {
             match (c, k) {
                 (
                     Call::Chunk {
-                        idx, lits, guard, ..
+                        idx,
+                        lits,
+                        guard,
+                        prog,
                     },
                     Kern::Chunk(k),
                 ) => {
+                    #[cfg(test)]
+                    let before = (buf.to_vec(), tb.to_vec());
+                    #[cfg(not(test))]
+                    let _ = prog;
                     // SAFETY: as `forward_logged`'s chunk call, `tb` holding `seeds` blocks laid
                     // out like `buf`.
                     unsafe {
@@ -6271,6 +6302,54 @@ impl Plan {
                             lits.as_ptr(),
                         )
                     };
+                    // Test builds check each seed against the chunk's forward at one tangent from
+                    // the state before: values and tangents equal.
+                    #[cfg(test)]
+                    {
+                        let (b0, t0) = before;
+                        let lt = Layout { tan: 1, ..layout };
+                        let kf = prog.get(lt, Sweep::Forward).expect("a forward kernel");
+                        let w = 2 * l;
+                        let mut worst = 0.0f64;
+                        for sd in 0..seeds {
+                            let mut pk = vec![0.0; self.n_slots * w];
+                            for s in 0..self.n_slots {
+                                pk[s * w..s * w + l].copy_from_slice(&b0[s * l..(s + 1) * l]);
+                                pk[s * w + l..(s + 1) * w].copy_from_slice(
+                                    &t0[sd * stride + s * l..sd * stride + (s + 1) * l],
+                                );
+                            }
+                            // SAFETY: as above, at the one-tangent layout.
+                            unsafe {
+                                kf.call(
+                                    pk.as_mut_ptr(),
+                                    std::ptr::null_mut(),
+                                    idx.as_ptr(),
+                                    lits.as_ptr(),
+                                )
+                            };
+                            for s in 0..self.n_slots {
+                                for x in 0..l {
+                                    let pairs = [
+                                        (buf[s * l + x], pk[s * w + x]),
+                                        (tb[sd * stride + s * l + x], pk[s * w + l + x]),
+                                    ];
+                                    for (a, b) in pairs {
+                                        assert!(a.is_finite() == b.is_finite(), "{a} vs {b}");
+                                        if b.is_finite() {
+                                            assert!(a.is_finite() && b.is_finite());
+                                            worst = worst.max((a - b).abs() / (1.0 + b.abs()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        assert!(
+                            worst < 1e-12,
+                            "rows forward vs one tangent on a {}-instruction chunk: {worst:e}",
+                            k.f.insts.len()
+                        );
+                    }
                     if guard.is_some_and(|g| buf[g as usize * l] != 1.0) {
                         return Some(());
                     }

@@ -1942,12 +1942,6 @@ pub(super) fn tangent_reverse_rows(
     if n != 4 {
         return None;
     }
-    // A chunk calling a host function keeps its per-direction kernel: measured (#2980), the
-    // rows form of such a chunk's reverse disagreed with it (up to 1e-1 on the linear-ODE
-    // matrix exponential's chunks) while every host-free chunk agreed exactly.
-    if f.insts.iter().any(|i| matches!(i, Inst::Host(_))) {
-        return None;
-    }
     let n_out = f
         .insts
         .iter()
