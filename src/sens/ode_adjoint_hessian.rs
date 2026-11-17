@@ -922,9 +922,9 @@ enum Input {
 /// `P_k = g_k⁻¹(μ_k(θ) + η_{e(k)})` ([`crate::parser::model_parser::MuFoldSpec`]) move the
 /// predictions exactly as the η-direction `Σ_k ∂μ_k/∂θ·e_{e(k)}` does, so a plan carries them on
 /// its η lanes instead of a lane of their own.
-pub(super) struct MuFold {
+struct MuFold {
     /// Per θ: `(η, ∂μ/∂θ)` over the lines it reaches; empty for a θ that is not folded.
-    pub(super) d1: Vec<Vec<(usize, f64)>>,
+    d1: Vec<Vec<(usize, f64)>>,
     /// Per `(θ_i, θ_j)`, `i` folded: `(η, ∂²μ/∂θ_i∂θ_j)` — what the fold, which uses `∂μ/∂θ_i`
     /// at this point, leaves out of the curvature along θ_i.
     d2: Vec<Vec<Vec<(usize, f64)>>>,
@@ -935,12 +935,7 @@ impl MuFold {
     /// another way the parse cannot see (covariate networks, mixtures, an IOV model's
     /// population plan), where the subject's covariates vary over its records (`μ` would be
     /// per record), or where the program does not reproduce `g⁻¹(μ + η)` at this `η`.
-    pub(super) fn at(
-        model: &CompiledModel,
-        subject: &Subject,
-        theta: &[f64],
-        eta: &[f64],
-    ) -> Option<Self> {
+    fn at(model: &CompiledModel, subject: &Subject, theta: &[f64], eta: &[f64]) -> Option<Self> {
         let spec = &model.indiv_param_partials.mu_fold;
         if spec.thetas.is_empty()
             || model.has_covariate_nn()

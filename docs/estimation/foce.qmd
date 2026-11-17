@@ -574,10 +574,7 @@ moves every prediction exactly as the η-direction `∂A/∂θ` does, so it ride
 On a fully mu-referenced model the plans run `N` lanes (the random effects) instead of one
 per packed coordinate. A θ read anywhere else — an `[odes]` right-hand side, the error model,
 a line whose η is shared or scaled by a θ — keeps a lane of its own; a parameter block with a
-conditional statement takes no fold at all. The same identity lets a FOCE or FOCEI gradient
-of a fully mu-referenced subject skip the reverse sweep through the predictions: a
-second-order forward gives their η-derivatives, and the θ-derivatives follow through
-`∂A/∂θ`.
+conditional statement takes no fold at all.
 
 #### Finite-difference fallback
 
