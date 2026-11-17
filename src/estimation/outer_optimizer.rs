@@ -11506,11 +11506,10 @@ fn declined_subject_gradient(
 /// at some other parameter point predicts would run. That distinction is the whole reason
 /// this is a log and not a predicate:
 ///
-/// - **The provider's own declines are parameter-dependent.** `moving_bounds_separable`
-///   reads the *resolved* infusion durations and lag times, which are functions of θ and
-///   η. A subject whose two modeled `RATE=-2` windows coincide at `η = 0` declines there
-///   and is served at its EBE, where they no longer coincide — so a zero-η probe reports
-///   an FD fallback for a subject that never took one (PR #1418 review, finding 1).
+/// - **The provider's own declines are parameter-dependent.** A subject can decline at
+///   `η = 0` (a plan failure, an inner Hessian that is not positive definite) and be served
+///   at its EBE — so a zero-η probe reports an FD fallback for a subject that never took
+///   one (PR #1418 review, finding 1).
 /// - **The outer *assembly* declines away from the mode for a second reason.**
 ///   The adjoint's `mode_solve` needs `η̂` stationary and the exact inner Hessian `H`
 ///   nonsingular (an indefinite `H` only within `MODE_STATIONARY_TOL` of stationarity),

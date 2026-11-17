@@ -139,8 +139,8 @@ pub fn gradient_method_outer(
         // AGQ always differentiates the quadrature marginal itself — the posterior-weighted
         // score over the nodes plus the grid-response term, neither of which re-solves the
         // inner loop. What varies is only the θ/σ score: analytic from the plan provider
-        // where it reaches, finite-differenced at fixed η otherwise (TTE, categorical, ODE,
-        // M3, LTBS…). Report that distinction, not a scope gate — there isn't one.
+        // where it reaches, finite-differenced at fixed η where the adjoint declines a subject
+        // (a model no recorder serves, a plan failure at a point). Report that distinction, not a scope gate — there isn't one.
         // Laplace is AGQ at one node — same objective, same gradient, so same report.
         EstimationMethod::Laplace => {
             if crate::estimation::agq::analytic_score_supported_model(model) {

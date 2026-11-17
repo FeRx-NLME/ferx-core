@@ -347,11 +347,7 @@ fn analytical_supported_core(model: &CompiledModel) -> bool {
         && closed_form_slot_count_supported(model)
 }
 
-/// Widest differentiated-slot count the closed-form scope admits. Historically (before
-/// #2093) the forward provider's outer (`subject_sensitivities` → `run_obs`) and inner
-/// (`run_obs_grad`) dispatch tables enumerated `1..=9` and a wider model fell through their
-/// `_ => None` arm; the bound is kept so the absorption-walk scope
-/// (`absorption_walk_sens_in_scope`) is unchanged.
+/// Widest differentiated-slot count `closed_form_slot_count_supported` admits.
 const MAX_CLOSED_FORM_SLOTS: usize = 9;
 
 const ANALYTIC_MIXED_N: [usize; 2] = [4, 6];
@@ -368,22 +364,10 @@ thread_local! {
 
 /// Whether the model's differentiated-slot count fits the closed-form dispatch tables.
 ///
-/// Without this the count is unbounded: `analytical_supported_core` checks only that every
-/// slot *maps* via `slot_to_dim`, never how many there are. A readout that claims several
-/// spare slots (`allocate_readout_extra_slots` — text-referenced parameters, and synthetic
-/// direct θ/η as of #486) can push `pk_slots_ref()` past 9 on top of the structural set, so
-/// (before #2093) the then-predicate `analytical_supported` returned `true`, `build_info::gradient_method{,_inner}` persisted
-/// "analytic", and then *every* subject fell through `const_dispatch!`'s `_ => None` to
-/// finite differences at ~10× the cost — precisely the "claim analytic then FD every
-/// subject" drift the route predicates exist to prevent (#637). Declining
-/// here changes no numbers (those subjects already ran on FD); it makes the reported method
-/// match the route (PR #950 review #2).
-///
-/// Bounds the **program** slot list, which is what the readout allocator grows. (From #1899
-/// until its retirement in #2093 the `lognormal_param_derivatives` fallback dispatched on the
-/// same list — `CompiledModel::pk_slot_rows` is the program's `(pk_slot, var_slot)` pairs
-/// whenever a program exists — so the bound covered both routes; before #1899 it keyed on
-/// `model.pk_indices`, which this gate never saw.)
+/// `analytical_supported_core` checks only that every slot *maps* via `slot_to_dim`, never how
+/// many there are; a readout that claims several spare slots (`allocate_readout_extra_slots`)
+/// can push `pk_slots_ref()` past 9 on top of the structural set. Bounds the **program** slot
+/// list, which is what the readout allocator grows.
 fn closed_form_slot_count_supported(model: &CompiledModel) -> bool {
     model
         .indiv_param_partials
@@ -587,9 +571,8 @@ pub fn analytic_outer_gradient_available(model: &CompiledModel) -> bool {
 /// forced?" — off the *same* predicate the live decision uses, rather than a second
 /// copy of the scope list that would drift from it.
 pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
-    // The adjoint gradient's model scope: it carries none of the retired (pre-#2093) forward
-    // provider's width or slot limits, and serves kappa with a residual `correlation … by` line (#1082 PR5,
-    // #2101) — the IOV marginal is the non-IOV dense one over the stacked system.
+    // The adjoint gradient's model scope: it serves kappa with a residual `correlation … by`
+    // line (#1082 PR5, #2101) — the IOV marginal is the non-IOV dense one over the stacked system.
     crate::sens::ode_provider::adjoint::outer_model_in_scope(model)
 }
 
@@ -608,9 +591,8 @@ pub(crate) fn analytic_outer_gradient_in_scope(model: &CompiledModel) -> bool {
 //   `[η_bsv (n_eta) , κ_group0 (n_kappa) , κ_group1 , … , κ_group(K−1)]`
 // with `K = iov_occasion_groups(subject).len()`. The adjoint differentiates over that
 // stacked vector (the subject's own `[η, κ]` width, uncapped), so the caller's block-Ω
-// (BSV ⊕ K·IOV) assembly consumes it directly. (Much of the clause-by-clause history
-// below describes the pre-#2093 forward provider; the predicate now only gates the
-// absorption-walk routing, `absorption_walk_sens_in_scope`.)
+// (BSV ⊕ K·IOV) assembly consumes it directly. (The clause-by-clause predicates below now
+// only gate the absorption-walk routing, `absorption_walk_sens_in_scope`.)
 
 /// Dual width of one IOV program evaluation on the outer builder: the declared θ, the
 /// combined `[η_bsv, κ]`, and — for a `[covariate_nn]` model — one axis per network

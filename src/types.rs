@@ -4752,8 +4752,8 @@ pub enum EndpointLikelihood {
         ///
         /// `None` — and the endpoint keeps its FD gradient — when the predictor cannot be
         /// represented exactly (an unbindable identifier). A program past the gradient's
-        /// dual dispatch cap still serves the exact η-Hessian; the gradient checks
-        /// `EndpointExprProgram::gradient_in_scope` (#2437).
+        /// dual dispatch cap still serves the exact η-Hessian; the gradient checks its own
+        /// scope (#2437).
         lp_program: Option<crate::parser::model_parser::EndpointExprProgram>,
         /// Covariate names referenced by the linear predictor (including any reached
         /// transitively through `[individual_parameters]`). Evaluated at a baseline

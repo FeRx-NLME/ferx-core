@@ -33578,7 +33578,7 @@ impl CtmmGeneratorProgram {
 /// identifier we cannot bind (which would silently lower to a constant `0.0` push and thus
 /// a silently-wrong derivative), or no `(θ, η)` axis at all. A width past the gradient's
 /// dual dispatch cap still gets a program: the η-Hessian runs it on η alone (#2437), and
-/// [`CtmmGeneratorProgram::gradient_in_scope`] routes the gradient.
+/// the gradient's own scope check routes it.
 #[cfg(feature = "markov")]
 fn build_ctmm_generator_program(
     transitions: &[(usize, usize, Expression)],
@@ -33805,7 +33805,7 @@ impl EndpointExprProgram {
 /// expression cannot be represented exactly (an identifier we cannot bind) or the
 /// `(θ, η)` width is zero. A width past the gradient's dual dispatch cap still gets a
 /// program: the η-Hessian runs it on η alone (#2437), and
-/// [`EndpointExprProgram::gradient_in_scope`] routes the gradient.
+/// the gradient's own scope check routes it.
 #[cfg(feature = "survival")]
 fn build_endpoint_expr_program(
     exprs: &[&Expression],

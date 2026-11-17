@@ -1220,11 +1220,8 @@ under `method = foce` / `method = focei` (the EKF variance is added to the dense
 `R`) but are rejected under `method = saem`, whose M-step data term does not yet
 include the process-noise inflation.
 
-An estimated correlation is also why `method = laplace` (and `focei` with
-`n_agq > 1`) falls back to the reconverged finite-difference outer gradient: the
-AGQ score has no rho block, so it is declined rather than reporting a zero
-gradient for a coordinate the objective actually depends on. Fits are correct,
-just slower. A `FIX`ed block keeps the analytic score.
+Under `method = laplace` (and `focei` with `n_agq > 1`) the AGQ score covers every
+block, an estimated ρ included, so the exact outer gradient is kept.
 
 An **estimated** correlation additionally restricts method *chains*. Only `foce`,
 `focei` and `laplace` move the off-diagonal; the other supported estimators read
@@ -1381,8 +1378,7 @@ Notes and constraints:
   exact outer θ/Ω/σ gradient — the residual-eta enters through the variance scale
   `exp(2·ETA_RUV)`, contributing the Almquist interaction column to `H̃` and the
   matching `∂NLL/∂η_ruv = Σ(1−ε²/v)` data term. The inner EBE gradient is analytic
-  too except under LTBS, where it keeps finite differences (the established LTBS
-  choice). Since #2093 IOV and M3-BLOQ `iiv_on_ruv` models are exact too: the
+  too, LTBS included. Since #2093 IOV and M3-BLOQ `iiv_on_ruv` models are exact too: the
   adjoint serves their outer gradient, and their inner gradient is the analytic
   stacked one (pinned against FD, M3 × IOV × `iiv_on_ruv` included).
 

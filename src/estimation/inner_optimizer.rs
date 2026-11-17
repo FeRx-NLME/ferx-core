@@ -18,18 +18,16 @@ const OBJ_MEMO: usize = 4;
 /// The inner-loop η-gradient route resolved for a subject. Reported in the
 /// startup banner ([`gradient_route_summary`]) and used by [`find_ebe`].
 ///
-/// The Enzyme AD path was retired; the two live routes are the exact analytic
-/// `Dual2` η-gradient ([`analytic_eta_nll_gradient`]) and central finite
-/// differences. The choice is [`analytic_inner_grad_supported`].
+/// The two routes are the exact adjoint η-gradient and central finite differences. The
+/// choice is [`analytic_inner_grad_supported`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InnerGradientMethod {
     /// Exact analytic η-gradient from the adjoint's unified recorder
     /// (`exact_obs_grads_into` / `exact_inner_gradient`) — one
     /// recorder evaluation per inner step (vs FD's `~2·n_eta+1` predictions).
     Analytic,
-    /// Central finite differences. Used when the provider can't serve the model
-    /// (ODE, LTBS, time-varying covariates, SDE) or the `FERX_NO_ANALYTIC_INNER`
-    /// escape hatch is set. (η-dependent `ExpressionScale` is now analytic, #486.)
+    /// Central finite differences. Used when no recorder serves the model, or on the
+    /// `gradient = fd` / `FERX_NO_ANALYTIC_INNER` opt-outs.
     Fd,
 }
 

@@ -21,9 +21,9 @@ fn iov_joint_warm_start_preserves_kappas() {
 
 #[test]
 fn gradient_route_summary_reports_route_taken_not_requested() {
-    // make_iov_model has `tv_fn: None` and the default `gradient_method:
-    // Auto`. With no `tv_fn`, AD is unavailable, so the route resolves to
-    // FD in every build — even though the *requested* method is `auto`.
+    // make_iov_model is hand-built: no compiled individual-parameter program, so no recorder
+    // serves it (`recorder_in_scope` is false) and the route resolves to FD in every build —
+    // even though the *requested* method is `auto`.
     // The banner must report the route actually taken (FD) and surface the
     // request, so a silent AD→FD fallback is visible.
     let model = make_iov_model();
@@ -40,7 +40,7 @@ fn gradient_route_summary_reports_route_taken_not_requested() {
     let summary = gradient_route_summary(&model, &population, GradientMethod::Auto);
     assert!(
         summary.starts_with("FD"),
-        "tv_fn=None must resolve to FD, got: {summary}"
+        "a model with no compiled program must resolve to FD, got: {summary}"
     );
     // The bracket echoes the requested method, e.g. "[requested: auto]".
     assert!(

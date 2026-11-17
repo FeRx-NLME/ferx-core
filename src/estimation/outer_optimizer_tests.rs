@@ -6527,7 +6527,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
 /// These pin the *recording*, which is what makes the report honest. An earlier revision
 /// probed the provider at `η = 0` instead, and PR #1418's review showed that reports
 /// fallbacks that never happen: the provider's own declines are parameter-dependent
-/// (`moving_bounds_separable` reads the resolved infusion windows and lag times), so a
+/// (they depend on the point the gradient is evaluated at), so a
 /// subject can decline at the probe point and be served at its EBE. Both halves of that
 /// are pinned below.
 pub(crate) mod outer_fd_fallback {
@@ -6537,8 +6537,8 @@ pub(crate) mod outer_fd_fallback {
     /// Warfarin with a bioavailability `F < 1`, where a **rate-defined** (`RATE > 0`)
     /// infusion reshapes the dosing window in a way the closed-form walk cannot express,
     /// so the adjoint outer gradient (`subject_adjoint_packed_gradient`) declines that subject while every bolus-dosed one stays
-    /// analytic (#419). Unlike the `moving_bounds_separable` declines, this one really is
-    /// a property of the records — which is what makes it a stable fixture.
+    /// analytic (#419). Unlike a parameter-dependent decline, this one was a property of the
+    /// records — which is what made it a stable fixture.
     const WARFARIN_F: &str = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)

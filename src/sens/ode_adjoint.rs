@@ -42,8 +42,9 @@
 //! The same recordings are replayed by value for the inner loop's η-Jacobians,
 //! inner gradients and Hessians ([`exact_obs_grads`], [`exact_inner_hessian`], …).
 //!
-//! Out of scope (`None`, and the caller salvages the subject by finite differences): SDE,
-//! subjects with non-Gaussian records, engine shapes no recorder serves.
+//! Out of scope (`None`, and the caller salvages the subject by finite differences): a model
+//! no recorder serves (see `recorder_in_scope`) and the per-point plan failures. SDE models
+//! and non-Gaussian records are served.
 #![allow(clippy::needless_range_loop)]
 
 use super::*;
