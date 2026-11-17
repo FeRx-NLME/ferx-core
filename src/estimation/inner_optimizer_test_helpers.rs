@@ -223,9 +223,11 @@ pub(crate) fn assert_every_warm_pass_is_joint(
 }
 
 /// #2261: every inner solve of `rec` for a subject `select` picks ran at the stencil
-/// tolerance `stencil_inner_tol(stage_tol)`, and `stage_tol` is looser than it, so a stencil
-/// that dropped the tightening would show. Returns the number of solves, which must be
-/// positive.
+/// tolerance `stencil_inner_tol(stage_tol)` — or, for a floored θ's #2406 twin, at a
+/// hundredth of it — and at least one at the stencil tolerance itself. `stage_tol` is looser
+/// than the stencil's, so a stencil that dropped the tightening would show: its probes would
+/// run at `stage_tol`, which is neither. Returns the number of solves at the stencil
+/// tolerance, which must be positive.
 pub(crate) fn assert_solves_at_stencil_tol(
     label: &str,
     rec: &InnerRecording,
@@ -233,20 +235,21 @@ pub(crate) fn assert_solves_at_stencil_tol(
     stage_tol: f64,
 ) -> usize {
     let want = super::stencil_inner_tol(stage_tol);
+    let twin = crate::estimation::fd_resolution::tight_tol(want);
     assert!(
         want < stage_tol,
         "{label}: fixture: the stage tolerance {stage_tol:e} is already at the stencil's"
     );
     let mut n = 0;
     for (subject, tol) in rec.solve_tols.iter().filter(|(s, _)| select(s)) {
-        assert_eq!(
-            tol.to_bits(),
-            want.to_bits(),
-            "{label}: subject {subject} re-solved at {tol:e}, not the stencil tolerance {want:e}"
+        assert!(
+            tol.to_bits() == want.to_bits() || tol.to_bits() == twin.to_bits(),
+            "{label}: subject {subject} re-solved at {tol:e}, not the stencil tolerance {want:e} \
+             (or its twin's {twin:e})"
         );
-        n += 1;
+        n += usize::from(tol.to_bits() == want.to_bits());
     }
-    assert!(n > 0, "{label}: no solve was selected");
+    assert!(n > 0, "{label}: no solve ran at the stencil tolerance");
     n
 }
 

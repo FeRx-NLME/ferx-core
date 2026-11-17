@@ -22,6 +22,7 @@ The optional `[output]` block lists additional columns to include in the sdtab b
 | Individual parameters | `CL`, `V` | EBE-derived per-subject value |
 | Derived column names | `AUC`, `Cmax` | Defined in the `[derived]` block |
 | Eta names | `ETA_CL`, `ETA_V` | ETAs are not sdtab columns; declaration is ignored with `W_OUTPUT_DUPLICATE` |
+| `MIXNUM` | `MIXNUM` | `[mixture]` models only: the subject's class — simulated, else the fitted `MIXEST` — never a data column of that name ([mixture output](../estimation/mixture.qmd#output)) |
 
 ### Mandatory minimum (always present)
 
@@ -46,6 +47,7 @@ weighted residual. Both are `NaN` on censored records.
 |------|----------|-------|
 | `E_OUTPUT_UNKNOWN_COLUMN` | error | A name is not a covariate, individual parameter, or derived expression |
 | `W_OUTPUT_DUPLICATE` | warning | A name is already in the mandatory minimum |
+| `W_OUTPUT_MIXNUM_IS_CLASS` | warning | `MIXNUM` on a `[mixture]` model whose data also carry a `MIXNUM` column: the sdtab column is the class, not that data |
 
 ## Interaction with `[derived]`
 

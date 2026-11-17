@@ -1041,6 +1041,8 @@ pub fn run_vi(
             0,
             crate::estimation::inner_optimizer::InnerHessianSeed::None,
             options,
+            // Variational means, no solve's; inert anyway without restarts or a seed.
+            crate::estimation::inner_optimizer::PrevEtas::Placeholder,
         );
 
     // Judged on the run that actually happened, not on the `vi_iters` ceiling — under

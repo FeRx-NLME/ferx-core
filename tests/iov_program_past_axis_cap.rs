@@ -3,7 +3,7 @@
 //!
 //! Before #1907 the program evaluator returned `None` past 24 axes while the model-level
 //! gate still admitted the model, so every subject ran a reconverged finite-difference outer
-//! gradient, and a finite-difference inner one, under `analytic (Dual2)` labels — the one
+//! gradient, and a finite-difference inner one, under `analytic` labels — the one
 //! signal being the outer-fallback warning. The fixture is `examples/warfarin_iov.ferx`
 //! (3 θ, 3 η, 1 κ: 7 axes) padded with fixed thetas `P_i`, each entering `CL` at 0: 17 pads
 //! is the last single-chunk program (24 axes), 18 is one past it.
@@ -69,8 +69,8 @@ fn iov_program_one_past_the_axis_cap_keeps_the_analytic_gradient() {
             "{name}: a pad is not in the program: {:?}",
             r.warnings
         );
-        assert_eq!(r.gradient_method_inner, "analytic (Dual2)", "{name}: inner");
-        assert_eq!(r.gradient_method_outer, "analytic (Dual2)", "{name}: outer");
+        assert_eq!(r.gradient_method_inner, "analytic", "{name}: inner");
+        assert_eq!(r.gradient_method_outer, "analytic", "{name}: outer");
         // The inner route has no trial-point declines: any inner FD use is structural.
         assert!(
             !r.warnings

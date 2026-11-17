@@ -332,7 +332,7 @@ fn rendered_override_rows_cover_the_input_space() {
         row(&summary, "eta_CL").ends_with("SE = 0.010000"),
         "{summary}"
     );
-    let yaml = yaml_of(&held_r);
+    let yaml = top_level_yaml(&yaml_of(&held_r));
     assert!(
         yaml.contains("    cv_pct: 59.15\n    se: ~\n    held: collapsed_at_guard\n"),
         "{yaml}"

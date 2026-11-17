@@ -29,6 +29,7 @@ pub(crate) fn ode_model(gradient_method: GradientMethod) -> CompiledModel {
 
 fn make_compiled_model(with_ode: bool, gradient_method: GradientMethod) -> CompiledModel {
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -163,6 +164,7 @@ pub(crate) fn tv_cov_iv_model_and_subject() -> (CompiledModel, Subject) {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -404,6 +406,7 @@ pub(crate) fn empty_fit_result() -> FitResult {
         optimizer: String::new(),
         n_starts: 1,
         multi_start_seed: None,
+        starts: Vec::new(),
         saem_seed: None,
         sir_seed: None,
         sir_settings: None,
@@ -511,7 +514,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         saem_mu_ref_m_step_evals_saved: None,
         saem_n_subjects_hmc: None,
         saem_mh_accept_tail: None,
-        gradient_method_inner: "analytic (Dual2)".into(),
+        gradient_method_inner: "analytic".into(),
         gradient_method_outer: "finite differences".into(),
         uses_ode_solver: false,
         ode_linear_exact: false,
@@ -589,6 +592,7 @@ pub(crate) fn minimal_fit_result() -> FitResult {
         optimizer: "slsqp".to_string(),
         n_starts: 1,
         multi_start_seed: None,
+        starts: Vec::new(),
         saem_seed: None,
         sir_seed: None,
         sir_settings: None,
@@ -631,6 +635,8 @@ pub(crate) fn dummy_subject(id: &str, n_eta: usize, n_obs: usize) -> SubjectResu
         cwres: (0..n_obs).map(|j| -0.02 * j as f64).collect(),
         npde: vec![],
         npd: vec![],
+        epred: vec![],
+        pwres: vec![],
         ofv_contribution: 12.34,
         cens: vec![0; n_obs],
         n_obs,

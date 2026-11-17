@@ -2,6 +2,7 @@
 //! Extracted verbatim from `api/mod.rs` (production peel). See the module-
 //! doc / Key Modules table for the split rationale.
 use super::*;
+use crate::cold_sort::ColdSort;
 use crate::diagnostics::{first_error, CheckReport, Diagnostic};
 use crate::estimation::outer_optimizer::optimize_population;
 use crate::estimation::parameterization::{
@@ -623,7 +624,7 @@ pub(crate) fn cov_diagnostics(cov: Option<&DMatrix<f64>>) -> (Option<Vec<f64>>, 
     });
     let eig = cor.symmetric_eigen();
     let mut eigenvalues: Vec<f64> = eig.eigenvalues.iter().cloned().collect();
-    eigenvalues.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    eigenvalues.cold_sort_by(&|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let min_ev = eigenvalues.last().copied().unwrap_or(0.0);
     let max_ev = eigenvalues.first().copied().unwrap_or(0.0);
     let condition_number = if min_ev > 1e-10 {
@@ -676,11 +677,9 @@ pub(crate) fn compute_subject_results(
     mixest: Option<&[usize]>,
     collect_solver_stats: bool,
 ) -> (Vec<SubjectResult>, crate::ode::solver::OdeSolverStats) {
-    let per_subject: Vec<(SubjectResult, crate::ode::solver::OdeSolverStats)> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subject: Vec<(SubjectResult, crate::ode::solver::OdeSolverStats)> =
+        crate::par::map(population.subjects.len(), |i| {
+            let subject = &population.subjects[i];
             // Declared before the mixture guard so it is dropped *after* it: the
             // scope must still be open while this subject's integrations run.
             let stats_scope =
@@ -928,6 +927,8 @@ pub(crate) fn compute_subject_results(
                 // Filled post-fit (only when npde_nsim > 0); see compute_npde_npd.
                 npde: vec![],
                 npd: vec![],
+                epred: vec![],
+                pwres: vec![],
                 ofv_contribution: 2.0 * ofv_i,
                 cens: subject.cens.clone(),
                 n_obs: subject.observations.len(),
@@ -964,8 +965,7 @@ pub(crate) fn compute_subject_results(
             // scope (usually none) this worker had before.
             let stats = stats_scope.map(|s| s.collected()).unwrap_or_default();
             (subject_result, stats)
-        })
-        .collect();
+        });
 
     let mut solver_stats = crate::ode::solver::OdeSolverStats::default();
     let mut subjects = Vec::with_capacity(per_subject.len());
@@ -1070,7 +1070,7 @@ pub(crate) fn kappa_weight_typicals(
             if vals.is_empty() {
                 return None;
             }
-            vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            vals.cold_sort_by(&|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             Some(vals[vals.len() / 2])
         })
         .collect()
@@ -1818,6 +1818,118 @@ pub(crate) fn ode_rhs_route_warning(model: &CompiledModel) -> Option<(String, Wa
         Some(details),
     );
     Some((msg, entry))
+}
+
+/// The fit's subjects whose compiled plan failed at runtime and so took finite-difference
+/// derivatives (`W_PLAN_FD_FALLBACK`, #2786), counted from what ran: in theory never, so the
+/// message asks for a report. `None` when every plan held.
+pub(crate) fn plan_fd_fallback_warning(
+    counts: &crate::parser::model_parser::rhs_regcode::kernel_jit::PlanFailureCounts,
+    n: usize,
+) -> (String, WarningEntry) {
+    let (k, why) = (counts.any, &counts.why);
+    let msg = format!(
+        "W_PLAN_FD_FALLBACK: {k} of {n} subjects fell back to finite-difference derivatives \
+         because their compiled plan failed ({why}); results are correct but slower — please \
+         report this as a bug."
+    );
+    let details = serde_json::json!({ "n_subjects": k, "n_total": n, "reason": why });
+    (
+        msg.clone(),
+        warning_entry(WarningCode::GradientFallback, msg, Some(details)),
+    )
+}
+
+/// A standalone post-fit step's (`run_covariance`, `run_sir`) own plan failures, over a clone of
+/// an earlier fit's result. The incoming fit's route labels and its `W_PLAN_FD_FALLBACK` describe
+/// how *its estimation* computed gradients, which this step did not rerun: they are kept as they
+/// are. A step whose own plans failed adds one more warning naming the step (`step`: "the
+/// covariance step"), replacing the one an earlier call of the same step left. Called while the
+/// call's [`register`](crate::parser::model_parser::rhs_regcode::kernel_jit::register) guard is
+/// alive, since the failures leave with the scope.
+pub(crate) fn refresh_plan_fd_fallback(
+    model: &CompiledModel,
+    population: &Population,
+    step: &str,
+    out: &mut FitResult,
+) {
+    let tag = format!("W_PLAN_FD_FALLBACK ({step}):");
+    out.warnings.retain(|w| !w.starts_with(&tag));
+    out.warnings_structured
+        .retain(|e| !e.message.starts_with(&tag));
+    let Some(c) = crate::parser::model_parser::rhs_regcode::kernel_jit::plan_failure_counts(
+        model,
+        &population.subjects,
+    ) else {
+        return;
+    };
+    let (n, why) = (population.subjects.len(), &c.why);
+    let msg = format!(
+        "{tag} {} of {n} subjects fell back to finite-difference derivatives in {step} because \
+         their compiled plan failed ({why}); the estimation's gradient routes above are \
+         unchanged; results are correct but slower — please report this as a bug.",
+        c.any
+    );
+    let details = serde_json::json!({
+        "step": step, "n_subjects": c.any, "n_total": n, "reason": why
+    });
+    out.warnings.push(msg.clone());
+    out.warnings_structured.push(warning_entry(
+        WarningCode::GradientFallback,
+        msg,
+        Some(details),
+    ));
+}
+
+/// Report `counts` (`None`: no plan failed) on `out`: the warning, and each route's label from
+/// its own count — a θ-only failure is the outer gradient's alone, a covariance-step one
+/// neither's. The labels restart from the base route they were rewritten from, so a result that
+/// already carries a rewritten label (an earlier fit's) reads what these counts say and
+/// nothing else. The one place the warning and the labels are made from the same counts.
+pub(crate) fn apply_plan_failures(
+    out: &mut FitResult,
+    counts: Option<&crate::parser::model_parser::rhs_regcode::kernel_jit::PlanFailureCounts>,
+    n: usize,
+) {
+    let (inner, outer) = counts.map_or((0, 0), |c| (c.inner, c.outer));
+    out.gradient_method_inner =
+        plan_fallback_label(&plan_fallback_base(&out.gradient_method_inner), inner, n);
+    out.gradient_method_outer =
+        plan_fallback_label(&plan_fallback_base(&out.gradient_method_outer), outer, n);
+    if let Some(c) = counts {
+        let (msg, entry) = plan_fd_fallback_warning(c, n);
+        out.warnings.push(msg);
+        out.warnings_structured.push(entry);
+    }
+}
+
+/// The route label [`plan_fallback_label`] rewrote `label` from: `analytic` for either of its
+/// forms (it rewrites only an analytic route), `label` itself otherwise.
+fn plan_fallback_base(label: &str) -> String {
+    if label == PLAN_FAILED_ALL_FD || label.starts_with("analytic ×") {
+        crate::build_info::GradientMethodKind::Analytic
+            .as_str()
+            .to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+const PLAN_FAILED_ALL_FD: &str = "finite differences (compiled plan failed)";
+
+/// The route label of a fit with `k` of `n` subjects on finite differences because their
+/// plans failed (#2949): `label` unchanged for `k = 0` or for a label that is not the analytic
+/// route (`N/A`, or `finite differences` already: no plan fed that gradient, so none failed
+/// it); every subject on FD reads `finite differences (compiled plan failed)`; a split reads
+/// like the banner's, `analytic ×a, FD ×k`.
+pub(crate) fn plan_fallback_label(label: &str, k: usize, n: usize) -> String {
+    if k == 0 || !crate::build_info::is_analytic_label(label) {
+        label.to_string()
+    } else if k >= n {
+        PLAN_FAILED_ALL_FD.to_string()
+    } else {
+        format!("analytic ×{}, FD ×{k}", n - k)
+    }
 }
 
 /// Shared scaffold for the list-style fit-end warnings: given a set of `hits`,
@@ -4036,7 +4148,7 @@ pub(crate) fn with_solver_stats<T>(
 ///
 /// The post-fit prediction sweep is an `f64` sweep, and one whole class of solver decision is
 /// invisible to it: the `auto` escalation guard's jet-finiteness clause can only fire on a
-/// `Dual1`/`Dual2` instantiation, because `f64` carries no jets to check. A counter that no
+/// `Dual2`/`Dual2` instantiation, because `f64` carries no jets to check. A counter that no
 /// production path could ever set would be exactly the dead diagnostic #1080 item 3 existed to
 /// remove, so the diagnostic scope has to see a dual solve as well as a scalar one.
 ///
@@ -4055,7 +4167,7 @@ pub(crate) fn with_solver_stats<T>(
 ///
 /// And the *order* matters. The overflow this exists to observe reaches the Hessian first and
 /// the gradient only later — value `7.2e303`, gradient `1.4e306`, Hessian `NaN` on the #1204
-/// repro — so a first-order `Dual1` sweep would miss exactly the case the counter is named
+/// repro — so a first-order `Dual2` sweep would miss exactly the case the counter is named
 /// for. When the model has an analytic **outer** gradient the sweep runs the unified
 /// recorder's second-order η-jets (`adjoint::exact_inner_hessian`), which is what FOCEI
 /// differentiates; when only the inner loop is analytic it runs the first-order
@@ -4085,11 +4197,9 @@ pub(crate) fn sweep_sensitivity_solver_stats(
         return merged;
     }
     let second_order = crate::sens::provider::analytic_outer_gradient_available(model);
-    let per_subject: Vec<crate::ode::solver::OdeSolverStats> = population
-        .subjects
-        .par_iter()
-        .enumerate()
-        .map(|(i, subject)| {
+    let per_subject: Vec<crate::ode::solver::OdeSolverStats> =
+        crate::par::map(population.subjects.len(), |i| {
+            let subject = &population.subjects[i];
             let Some(eta) = eta_hats.get(i) else {
                 return crate::ode::solver::OdeSolverStats::default();
             };
@@ -4110,8 +4220,7 @@ pub(crate) fn sweep_sensitivity_solver_stats(
                     crate::sens::ode_provider::adjoint::exact_obs_grads(model, subject, theta, eta);
             }
             stats_scope.collected()
-        })
-        .collect();
+        });
     // In subject order, so a future non-additive counter cannot become
     // worker-count dependent.
     for stats in &per_subject {

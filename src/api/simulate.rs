@@ -134,14 +134,88 @@ pub struct SimulateOptions {
 }
 
 /// What a `simulate*` entry point lets its caller supply as the TTE administrative
-/// horizon, for [`validate_tte_simulatable`]'s refusal when one is required.
-#[cfg(feature = "survival")]
+/// horizon. It carries the value and is the one owner of the option's name, which both
+/// horizon refusals quote: `validate_tte_simulatable`'s (a required horizon is missing) and
+/// `check_horizon_value`'s (the supplied value is unusable).
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum TteHorizon {
-    /// The entry point takes a horizon; this is the one supplied (`None`: not set).
+    /// `[simulation] horizon` or `SimulateOptions.horizon`, as supplied (`None`: not set).
     Given(Option<f64>),
-    /// The entry point takes none (`simulate_with_uncertainty`).
-    NotAccepted,
+    /// `SimulateUncertaintyOptions.horizon`, as supplied (`None`: not set). The same
+    /// requirement as [`TteHorizon::Given`]; a separate variant only so the refusal names
+    /// the option this caller can set (#1774, #2003).
+    Uncertainty(Option<f64>),
+}
+
+impl TteHorizon {
+    /// The supplied horizon (`None`: not set).
+    fn value(self) -> Option<f64> {
+        match self {
+            TteHorizon::Given(h) | TteHorizon::Uncertainty(h) => h,
+        }
+    }
+
+    /// The API option this caller sets, as the value refusals name it.
+    fn option_name(self) -> &'static str {
+        match self {
+            TteHorizon::Given(_) => "SimulateOptions.horizon",
+            TteHorizon::Uncertainty(_) => "SimulateUncertaintyOptions.horizon",
+        }
+    }
+
+    /// Every way this caller can set the horizon, for the "set ..." half of the refusal
+    /// when a required one is missing. The options path is also reached from a
+    /// `[simulation]` block, so it names that key first.
+    #[cfg(feature = "survival")]
+    fn how_to_set(self) -> String {
+        let option = self.option_name();
+        match self {
+            TteHorizon::Given(_) => format!("`[simulation] horizon` (or `{option}`)"),
+            TteHorizon::Uncertainty(_) => format!("`{option}`"),
+        }
+    }
+}
+
+/// The value checks every horizon-taking `simulate*` entry point applies to a supplied
+/// horizon: finite and `> 0`, and not below any subject's TTE entry time. The refusal names
+/// the option the caller set (`TteHorizon::option_name`). `None` passes.
+///
+/// The `.ferx` parser already rejects a non-finite / non-positive horizon, but a direct
+/// caller of the API must get the same guard: a NaN window makes every `t_event < window`
+/// test false (silent NaN event times), and a `<= 0` horizon censors every subject at or
+/// before entry (#522 review).
+#[cfg_attr(not(feature = "survival"), allow(unused_variables))]
+fn check_horizon_value(population: &Population, horizon: TteHorizon) -> Result<(), EngineError> {
+    let option_name = horizon.option_name();
+    let Some(h) = horizon.value() else {
+        return Ok(());
+    };
+    if !h.is_finite() || h <= 0.0 {
+        return Err(super::entry_refusals::simulate_horizon(format!(
+            "{option_name} must be finite and > 0 (got {h})"
+        )));
+    }
+    // A horizon below a subject's TTE entry_time would censor it before it entered
+    // observation (a row with time = h < entry_time). The `[simulation]`-block path always
+    // enters at 0, but a left-truncated population passed to the API must be rejected
+    // (#522 review).
+    #[cfg(feature = "survival")]
+    for subject in &population.subjects {
+        for record in &subject.obs_records {
+            let crate::types::ObsRecord::Event { entry_time, .. } = record else {
+                continue;
+            };
+            if *entry_time > h {
+                return Err(super::entry_refusals::simulate_horizon(format!(
+                    "{option_name} ({h}) is below subject '{}' entry_time \
+                     ({entry_time}); the administrative horizon must be ≥ every \
+                     subject's entry time",
+                    subject.id
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validate the preventable preconditions of TTE event-time simulation, returning a
@@ -181,10 +255,11 @@ pub(crate) enum TteHorizon {
 /// during integration, per subject: that subject is censored at the window and named in
 /// a `W_TTE_SOLVE_FAILED` warning (#2087), never silently.
 ///
-/// `horizon` says what the caller could have supplied. Where a horizon is required and
-/// missing, a caller that takes one is told to set it (`E_SIMULATE_HORIZON`); a caller
-/// that takes none (`simulate_with_uncertainty`) cannot act on that, so it is told the
-/// model cannot be simulated there and where it can (`E_TTE_NOT_SIMULATABLE`, #1774).
+/// `horizon` carries the supplied horizon and says which option the caller reads it from.
+/// Where a horizon is required and missing, the refusal (`E_SIMULATE_HORIZON`) names that
+/// option, never one the caller cannot set (#1774): `[simulation] horizon` /
+/// `SimulateOptions.horizon` for the options path, `SimulateUncertaintyOptions.horizon`
+/// for `simulate_with_uncertainty` (#2003).
 #[cfg(feature = "survival")]
 pub(crate) fn validate_tte_simulatable(
     model: &CompiledModel,
@@ -194,21 +269,13 @@ pub(crate) fn validate_tte_simulatable(
     use super::entry_refusals::{simulate_horizon, tte_not_simulatable};
     // The refusal for a required horizon that is missing or not finite and positive.
     // `what` names the endpoint kind, `why` the reason it needs one.
-    let missing_horizon = |what: &str, why: &str| match horizon {
-        TteHorizon::Given(_) => simulate_horizon(format!(
+    let set_it = horizon.how_to_set();
+    let horizon = horizon.value();
+    let missing_horizon = |what: &str, why: &str| {
+        simulate_horizon(format!(
             "{what} simulation requires a finite, positive administrative horizon: set \
-             `[simulation] horizon` (or `SimulateOptions.horizon`). {why}"
-        )),
-        TteHorizon::NotAccepted => tte_not_simulatable(format!(
-            "{what} simulation requires a finite, positive administrative horizon, and \
-             `simulate_with_uncertainty` takes none (`SimulateUncertaintyOptions` has no \
-             horizon). {why} Simulate this model with `simulate_with_options` and \
-             `SimulateOptions.horizon` instead."
-        )),
-    };
-    let horizon = match horizon {
-        TteHorizon::Given(h) => h,
-        TteHorizon::NotAccepted => None,
+             {set_it}. {why}"
+        ))
     };
     use crate::types::{EndpointLikelihood, HazardSpec, ObsRecord, TteRecurrence};
 
@@ -680,8 +747,10 @@ pub fn simulate_with_options(
 /// rows and any non-fatal warnings. [`simulate_with_options`] is the thin wrapper that returns
 /// only the rows.
 ///
-/// Five sources feed `warnings`, in this order: per-subject simulation diagnostics (a
-/// degenerate hazard draw, #763; a degenerate recurrent stream skipped, #762), one
+/// Six sources feed `warnings`, in this order: per-subject simulation diagnostics (a
+/// degenerate recurrent stream skipped, #762; a failed event-time solve, #2087), one
+/// `W_TTE_DEGENERATE_HAZARD` line per subject and CMT whose analytic hazard draw
+/// degenerated, with the replicates it happened in (#763, #1648), one
 /// `W_SIMULATED_FLIP_FLOP` count of the simulated individuals dosed before one of their
 /// observations whose sampled η entered a twin-less transit / IG closed form's flip-flop
 /// regime, so their entire dose-driven concentration was clamped to zero (#1823), capped
@@ -718,11 +787,37 @@ pub(super) fn simulate_with_options_impl(
     opts: &SimulateOptions,
     with_parameters: bool,
 ) -> Result<SimulationOutput, EngineError> {
+    simulate_with_options_tallied(
+        model,
+        population,
+        params,
+        n_sim,
+        opts,
+        with_parameters,
+        None,
+    )
+}
+
+/// [`simulate_with_options_impl`], handing the run's `W_TTE_DEGENERATE_HAZARD` tally to
+/// `degenerate_out` instead of rendering it into the warnings, when given. A caller that
+/// simulates one reference in several runs (`compute_tte_npde`'s batches) folds the
+/// tallies with `DegenerateHazardTally::absorb` and renders once, so each (subject, CMT)
+/// is one line counted over every replicate, not one line per run.
+pub(crate) fn simulate_with_options_tallied(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    n_sim: usize,
+    opts: &SimulateOptions,
+    with_parameters: bool,
+    mut degenerate_out: Option<&mut DegenerateHazardTally>,
+) -> Result<SimulationOutput, EngineError> {
     use rand::SeedableRng;
 
     // Start the SS-equilibration non-convergence sink clean, then drain it into this run's
     // `warnings` at each return (#867): a capped nonlinear pulse-train can silently under-report
     // the SS trough, biasing simulated concentrations low.
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
 
     // A derived rule on a nested model would regroup its level cells (#1082 PR4), the
@@ -776,38 +871,8 @@ pub(super) fn simulate_with_options_impl(
     // list.
     first_error(&check_simulation_data(model, population))?;
 
-    // Validate the TTE horizon on the library path too — the `.ferx` parser
-    // already rejects a non-finite / non-positive horizon, but a direct caller of
-    // this API must get the same guard: a NaN window makes every `t_event < window`
-    // test false (silent NaN event times), and a `<= 0` horizon censors every
-    // subject at or before entry (#522 review).
-    if let Some(h) = opts.horizon {
-        if !h.is_finite() || h <= 0.0 {
-            return Err(super::entry_refusals::simulate_horizon(format!(
-                "SimulateOptions.horizon must be finite and > 0 (got {h})"
-            )));
-        }
-        // A horizon below a subject's TTE entry_time would censor it before it
-        // entered observation (a row with time = h < entry_time). The
-        // `[simulation]`-block path always enters at 0, but a left-truncated
-        // population passed to this API must be rejected (#522 review).
-        #[cfg(feature = "survival")]
-        for subject in &population.subjects {
-            for record in &subject.obs_records {
-                let crate::types::ObsRecord::Event { entry_time, .. } = record else {
-                    continue;
-                };
-                if *entry_time > h {
-                    return Err(super::entry_refusals::simulate_horizon(format!(
-                        "SimulateOptions.horizon ({h}) is below subject '{}' entry_time \
-                         ({entry_time}); the administrative horizon must be ≥ every \
-                         subject's entry time",
-                        subject.id
-                    )));
-                }
-            }
-        }
-    }
+    // Validate the TTE horizon on the library path too (#522 review).
+    check_horizon_value(population, TteHorizon::Given(opts.horizon))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(s) => rand::rngs::StdRng::seed_from_u64(s),
@@ -838,6 +903,7 @@ pub(super) fn simulate_with_options_impl(
         None => {
             let mut warnings = Vec::new();
             let mut flip_flop = SimulatedFlipFlopTally::default();
+            let mut degenerate = DegenerateHazardTally::default();
             // One scope around the whole pass, not one per subject: this loop is serial (the
             // RNG draw order is part of `simulate`'s contract), so the thread-local scope sees
             // every subject's integrations. #1304.
@@ -855,10 +921,15 @@ pub(super) fn simulate_with_options_impl(
                     &mut rng,
                     &mut warnings,
                     &mut flip_flop,
+                    &mut degenerate,
                     with_parameters.then_some(&mut table),
                 )
             });
             let results = results?;
+            match degenerate_out.as_deref_mut() {
+                Some(out) => *out = degenerate,
+                None => warnings.extend(degenerate.warnings_by_replicate()),
+            }
             warnings.extend(flip_flop.warning(model));
             warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
             warnings.extend(iov_warning);
@@ -966,6 +1037,7 @@ pub(super) fn simulate_with_options_impl(
     let omega_inv = &params.omega.inv;
     let mut warnings = Vec::new();
     let mut flip_flop = SimulatedFlipFlopTally::default();
+    let mut degenerate = DegenerateHazardTally::default();
     // Same scope the non-propensity branch opens. Both branches, not the shared chokepoint
     // below them: `simulate_inner_with_draw` is also what `simulate_with_uncertainty_diag`
     // calls once per draw, and that caller opens one scope around all of its draws (with its
@@ -984,10 +1056,15 @@ pub(super) fn simulate_with_options_impl(
             &mut rng,
             &mut warnings,
             &mut flip_flop,
+            &mut degenerate,
             with_parameters.then_some(&mut table),
         )
     });
     let results = results?;
+    match degenerate_out {
+        Some(out) => *out = degenerate,
+        None => warnings.extend(degenerate.warnings_by_replicate()),
+    }
     warnings.extend(flip_flop.warning(model));
     warnings.extend(crate::dosing::take_ss_nonconvergence_warnings());
     warnings.extend(iov_warning);
@@ -1003,6 +1080,28 @@ pub(super) fn simulate_with_options_impl(
         warnings,
         parameters: table,
     })
+}
+
+#[cfg(feature = "survival")]
+use crate::survival::DegenerateHazardTally;
+
+/// Without the `survival` feature there is no TTE endpoint and so nothing to tally: the
+/// stand-in keeps the chokepoint's signature the same in both builds.
+#[cfg(not(feature = "survival"))]
+#[derive(Default)]
+pub(crate) struct DegenerateHazardTally;
+
+#[cfg(not(feature = "survival"))]
+impl DegenerateHazardTally {
+    fn count_draw(&mut self, _n_sim: usize) {}
+
+    fn warnings_by_replicate(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    fn warnings_by_draw(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 fn simulate_inner<R: rand::Rng>(
@@ -1039,6 +1138,8 @@ fn simulate_inner<R: rand::Rng>(
         rng,
         &mut warnings,
         &mut flip_flop,
+        // Dropped, as the flip-flop tally is: these entry points return rows only.
+        &mut DegenerateHazardTally::default(),
         None,
     )
 }
@@ -1058,6 +1159,9 @@ pub(crate) fn obs_row_time(subject: &Subject, j: usize) -> f64 {
 fn emit_subject_rows<R: rand::Rng>(
     model: &CompiledModel,
     subject: &Subject,
+    // The subject's position in the population: what the #1648 tally keys on, since two
+    // subjects may share an id.
+    subject_index: usize,
     kappa_draw: Option<&crate::stats::nested_levels::KappaDraw>,
     params: &ModelParameters,
     eta_slice: &[f64],
@@ -1068,11 +1172,13 @@ fn emit_subject_rows<R: rand::Rng>(
     rng: &mut R,
     results: &mut Vec<SimulationResult>,
     warnings: &mut Vec<String>,
+    degenerate: &mut DegenerateHazardTally,
 ) -> DrawnPrediction {
-    // `horizon` and `warnings` are consumed only by the TTE path below; without the
-    // `survival` feature there are no TTE endpoints, so discard them to avoid unused-arg warns.
+    // `horizon`, `warnings` and `degenerate` are consumed only by the TTE path below;
+    // without the `survival` feature there are no TTE endpoints, so discard them to avoid
+    // unused-arg warns.
     #[cfg(not(feature = "survival"))]
-    let _ = (horizon, &mut *warnings);
+    let _ = (horizon, &mut *warnings, &mut *degenerate, subject_index);
 
     // Predict IPRED. For IOV models (`n_kappa > 0`) route through the
     // occasion-aware `predict_iov`, drawing one independent κ ~ N(0, Ω_IOV) per
@@ -1185,19 +1291,28 @@ fn emit_subject_rows<R: rand::Rng>(
     }
 
     // TTE simulation path (requires survival feature)
+    // A degenerate analytic hazard draw (#763) goes to the run's tally, which reports each
+    // (subject, CMT) once (#1648), not to `warnings` once per replicate.
     #[cfg(feature = "survival")]
-    crate::survival::simulate_tte(
-        model,
-        subject,
-        &params.theta,
-        eta_slice,
-        draw,
-        sim,
-        horizon,
-        rng,
-        results,
-        warnings,
-    );
+    {
+        let mut degenerate_cmts = Vec::new();
+        crate::survival::simulate_tte_reporting(
+            model,
+            subject,
+            &params.theta,
+            eta_slice,
+            draw,
+            sim,
+            horizon,
+            rng,
+            results,
+            warnings,
+            &mut degenerate_cmts,
+        );
+        for cmt in degenerate_cmts {
+            degenerate.record(subject_index, &subject.id, cmt, draw, sim);
+        }
+    }
 
     // Binary / discrete-endpoint simulation path (#760 Slice 1b). Like the TTE path
     // above, these rows live in `obs_records` and are invisible to the Gaussian
@@ -1639,6 +1754,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
     rng: &mut R,
     warnings: &mut Vec<String>,
     flip_flop: &mut SimulatedFlipFlopTally,
+    degenerate: &mut DegenerateHazardTally,
     mut table: Option<&mut SimulatedParameters>,
 ) -> Result<Vec<SimulationResult>, EngineError> {
     use rand_distr::Normal;
@@ -1731,6 +1847,10 @@ fn simulate_inner_with_draw<R: rand::Rng>(
 
     let mut results = Vec::new();
 
+    // Past every refusal above: this draw's `n_sim` replicates are simulated, so they are
+    // the denominator the #1648 degenerate-hazard lines report against.
+    degenerate.count_draw(n_sim);
+
     for sim_idx in 0..n_sim {
         let sim = sim_idx + 1;
         // What each subject of this replicate was drawn with, for the parameter table
@@ -1770,6 +1890,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     let predicted = emit_subject_rows(
                         model,
                         subject,
+                        i,
                         kappa_draws.get(i),
                         params,
                         &eta_slice,
@@ -1780,6 +1901,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         rng,
                         &mut results,
                         &mut *warnings,
+                        &mut *degenerate,
                     );
                     if table.is_some() {
                         drawn.push(DrawnSubject::new(
@@ -1806,6 +1928,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                     let predicted = emit_subject_rows(
                         model,
                         subject,
+                        i,
                         kappa_draws.get(i),
                         class.params,
                         &eta_slice,
@@ -1816,6 +1939,7 @@ fn simulate_inner_with_draw<R: rand::Rng>(
                         rng,
                         &mut results,
                         &mut *warnings,
+                        &mut *degenerate,
                     );
                     // Every row the subject emitted — Gaussian, TTE and categorical alike —
                     // reports the class it ran under (#2372).
@@ -2041,6 +2165,8 @@ fn drawn_derived_columns(
                 cwres: vec![f64::NAN; n_obs],
                 npde: Vec::new(),
                 npd: Vec::new(),
+                epred: Vec::new(),
+                pwres: Vec::new(),
                 ofv_contribution: f64::NAN,
                 cens: subject.cens.clone(),
                 n_obs,
@@ -2100,6 +2226,13 @@ pub struct SimulateUncertaintyOptions {
     pub method: crate::estimation::uncertainty_samples::UncertaintyMethod,
     /// Optional seed for reproducibility. `None` draws from entropy.
     pub seed: Option<u64>,
+    /// Administrative horizon for TTE endpoints, the same one for every draw: the
+    /// uncertainty twin of [`SimulateOptions::horizon`], validated by the same code. When
+    /// `Some(h)`, every TTE subject is administratively censored at `h` regardless of its
+    /// record's `time`. Required (finite and `> 0`) for a repeated-event (`type = rtte`) or
+    /// ODE-accumulated (joint PK-TTE) hazard, which have no implicit window; `None` keeps
+    /// the per-record window otherwise. No effect on Gaussian endpoints (#2003).
+    pub horizon: Option<f64>,
 }
 
 /// Simulate observations while propagating parameter uncertainty.
@@ -2117,6 +2250,11 @@ pub struct SimulateUncertaintyOptions {
 /// ([`FitResult::iov_occasion`]) has the population's occasion labels re-derived with that
 /// rule first, as `fit()` derived them, so κ is drawn per occasion (#1955).
 ///
+/// For a TTE endpoint, `opts.horizon` is the administrative censoring horizon of every
+/// draw. A repeated-event or ODE-accumulated hazard requires one (`E_SIMULATE_HORIZON`
+/// otherwise), as on [`simulate_with_options`]. Each draw is simulated the way that
+/// function simulates the draw's parameters under the same horizon (#2003).
+///
 /// Thin wrapper over [`simulate_with_uncertainty_diag`] that discards its
 /// [`SimulationOutput::warnings`]; the rows are the same, bit for bit.
 pub fn simulate_with_uncertainty(
@@ -2132,7 +2270,9 @@ pub fn simulate_with_uncertainty(
 /// [`simulate_with_options_diag`].
 ///
 /// `results` is exactly what [`simulate_with_uncertainty`] returns. `warnings` carries, in this
-/// order: the per-subject simulation diagnostics (a degenerate hazard draw, #763 / #762), one
+/// order: the per-subject simulation diagnostics (#762, #2087), one `W_TTE_DEGENERATE_HAZARD`
+/// line per subject and CMT whose analytic hazard draw degenerated, with the number of
+/// replicates and the uncertainty draws it happened in (#763, #1648), one
 /// `W_UNCERTAINTY_DRAWS_SKIPPED` warning naming every draw skipped because it landed in the
 /// flip-flop regime of a twin-less transit / IG closed form (#786, #1485), one
 /// `W_SIMULATED_FLIP_FLOP` count of the eligible individuals *inside* the draws that ran
@@ -2179,6 +2319,7 @@ fn simulate_with_uncertainty_impl(
 
     // Start the SS-equilibration non-convergence sink clean, as `simulate_with_options_diag`
     // does, so this run's `warnings` carry only its own capped equilibrations (#867).
+    let _ss_run = crate::dosing::run_scope();
     crate::dosing::clear_ss_nonconvergence_warnings();
 
     // The occasions the fit derived (#1955): `FitResult::iov_occasion` is the rule it ran
@@ -2201,11 +2342,11 @@ fn simulate_with_uncertainty_impl(
     // Ω / σ / Ω_IOV (#1764, #1833) are refused by `fitted_params_from_result` below,
     // before any draw: a second gate here rejected exactly the same inputs.
 
-    // A repeated-event or ODE-accumulated TTE simulation needs a finite horizon, which this
-    // uncertainty path does not expose — validate once here rather than per draw, and say
-    // so rather than ask for an option the caller cannot set (#1774).
+    // A repeated-event or ODE-accumulated TTE simulation needs a finite horizon. Validated
+    // once here rather than per draw (and so before any draw); a missing one is refused
+    // naming this entry point's own option (#1774, #2003).
     #[cfg(feature = "survival")]
-    validate_tte_simulatable(model, population, TteHorizon::NotAccepted)?;
+    validate_tte_simulatable(model, population, TteHorizon::Uncertainty(opts.horizon))?;
 
     // Parity with `fit()`: reject a referenced covariate absent from the data
     // rather than silently reading it as 0.0 (a `Selected` error-model selector
@@ -2213,6 +2354,9 @@ fn simulate_with_uncertainty_impl(
     // κ or a weighted residual, a non-positive weight before it collapses to zero
     // (#1031 / #1029 / #1083).
     first_error(&check_simulation_data(model, population))?;
+
+    // The same value checks, at the same position, as `simulate_with_options` (#2003).
+    check_horizon_value(population, TteHorizon::Uncertainty(opts.horizon))?;
 
     let mut rng: rand::rngs::StdRng = match opts.seed {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
@@ -2291,8 +2435,12 @@ fn simulate_with_uncertainty_impl(
 }
 
 /// The per-draw loop of [`simulate_with_uncertainty_diag`], appending each draw's rows to
-/// `results`. Split out so the caller can run it inside one solver-stats scope.
-fn simulate_uncertainty_draws(
+/// `results`. Split out so the caller can run it inside one solver-stats scope, and
+/// `pub(super)` so a test can hand it parameter sets directly: the samplers consume the
+/// run's RNG before the first simulated subject, so only here can a draw equal to the
+/// point estimate be compared with `simulate_with_options` at the same RNG position (#2003).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn simulate_uncertainty_draws(
     model: &CompiledModel,
     population: &Population,
     draws: &[ModelParameters],
@@ -2312,6 +2460,9 @@ fn simulate_uncertainty_draws(
     // tallied individual is an η within an otherwise serviceable draw — so both warnings
     // can fire on one run.
     let mut flip_flop = SimulatedFlipFlopTally::default();
+    // One #1648 tally across the same draws: a (subject, CMT) whose analytic hazard draw
+    // degenerated is reported once, against the replicates and draws that ran.
+    let mut degenerate = DegenerateHazardTally::default();
     // The draw-independent half of the chokepoint's list, run once at the first draw that is
     // simulated (#1288). Not "at draw 1": the skip below can pass over draw 1, and a check
     // keyed to it would then never run. Lazily, so a run whose every draw is skipped is
@@ -2344,16 +2495,20 @@ fn simulate_uncertainty_draws(
             opts.n_sim_per_draw,
             k + 1,
             None,
-            None,
+            opts.horizon,
             Some(proof),
             class_root,
             rng,
             sim_warnings,
             &mut flip_flop,
+            &mut degenerate,
             table.as_deref_mut(),
         )?;
         results.append(&mut rows);
     }
+    // After every per-subject line and before the two run-level findings below. A run whose
+    // every draw was skipped simulated nothing, so this is empty when the refusal fires.
+    sim_warnings.extend(degenerate.warnings_by_draw());
     if let Some(reason) = first_reason {
         if skipped.len() == draws.len() {
             first_error(&all_uncertainty_draws_skipped_diags(
@@ -2490,7 +2645,8 @@ impl SimulatedParameters {
 /// no event (#763), or a hazard so extreme its recurrent stream is skipped rather than
 /// materialised (#762) — is handled *per subject* (censored / skipped, the run
 /// continues) and named here, instead of silently vanishing into the censored rows or
-/// aborting the whole run. Since #1280 / #1304 it also carries the shared non-fit diagnostics
+/// aborting the whole run. A degenerate hazard draw is named once per subject and CMT for
+/// the whole run, with the replicates affected, not once per replicate (#1648). Since #1280 / #1304 it also carries the shared non-fit diagnostics
 /// bundle: parse warnings, data-reader warnings, the model/data checks (`W_STEADY_STATE_*`,
 /// `W_SDE_*`, `W_NEGATIVE_LAGTIME`, …), experimental-feature notices, and this pass's
 /// ODE-solver diagnostics (`W_ODE_SOLVER_DIAGNOSTICS`). Empty for a clean simulation of a

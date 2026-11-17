@@ -21,6 +21,7 @@ use std::collections::HashMap;
 /// Caller supplies `derived_exprs`.
 fn minimal_model(derived_exprs: Vec<DerivedExprSpec>) -> CompiledModel {
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -155,6 +156,8 @@ fn sr_for(n_obs: usize) -> SubjectResult {
         cwres: vec![0.0; n_obs],
         npde: vec![],
         npd: vec![],
+        epred: vec![],
+        pwres: vec![],
         ofv_contribution: 0.0,
         cens: vec![0; n_obs],
         n_obs,

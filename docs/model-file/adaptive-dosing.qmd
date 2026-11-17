@@ -58,6 +58,7 @@ with the run, never with a fitted model's parameters.
 | `levels` | | Discrete titration ladder `[d1, d2, …]` (oncology). With `levels`, bare `increase`/`decrease` step one rung; without it, use `increase N%` / `decrease N%`. Each rung is a number or a per-subject expression. |
 | `round_to` | | Dose grid step, a number `> 0` (e.g. `250` for 250 mg vials): every dose the controller sets is rounded to the nearest multiple, then clamped to the multiples inside `dose_bounds`. Not with `levels`. See [Rounding doses to a grid](#rounding-doses-to-a-grid). |
 | `dose_knowledge` | | `known` (default) or `oracle`: whether a dose expression may read a drawn subject's individual parameters. See [Which subjects' values are known](#which-subjects-values-are-known). |
+| `decision_covariates` | | `locf` (default) or `nocb`: the covariate row each decision carries as a record, for the interval that ends at it. See [Every decision is a record](#decision-records). |
 | `intervals` | | Dosing-interval ladder `[d1, d2, …]`, strictly increasing and positive. Rules step it with `lengthen` / `shorten`. Requires `start_interval`. See [Changing the dosing interval](#changing-the-dosing-interval). |
 | `start_interval` | | The dosing interval in force from the first decision; one of `intervals`, and required with it. |
 | `target_window` | | Therapeutic band `[low, high]` for the monitored signal, used **only** to report the `pct_time_in_window` outcome metric — it does **not** influence dosing (the `when` rules do). `high` may be `inf` for a one-sided "at or above `low`" target. Omit it to leave `pct_time_in_window` unreported, rather than guessing a band from the rule thresholds. |
@@ -163,7 +164,7 @@ A covariate the data lack is refused when the run starts, with
 |---|---|---|
 | A number, θ | yes | The same for every subject. |
 | A data covariate | yes | Known when the dose is written. Read at `at[0]`. |
-| An individual parameter that no random effect reaches (`TVCLW = TVCL * (WT / 70)`) | yes | A function of θ, covariates and `TIME` alone, so known for every subject. Read at `at[0]`. |
+| An individual parameter that no random effect reaches (`TVCLW = TVCL * (WT / 70)`) | yes | A function of θ, covariates and `TIME` alone, so known for every subject. Read at `at[0]`. Under [parameter uncertainty](#parameter-uncertainty) it is read at the point estimate θ̂ in every draw. |
 | An individual parameter that a random effect reaches (`CL = TVCLW * exp(ETA_CL)`, or any parameter computed from one), or a random effect (`ETA_CL`) | for a supplied subject; for a drawn one only under `dose_knowledge = oracle` | Known at dosing time only when the subject's η come from input; see [Which subjects' values are known](#which-subjects-values-are-known). A parameter counts as reached when an η, a κ or `MIXNUM` enters it through any intermediate or `if` condition. |
 | A state (`CENT`) | no | The expression runs once; to follow the drug level, write a `when signal …` rule. |
 | `TIME` (or `T`) | no | It would always be `at[0]`; write the value. |
@@ -206,9 +207,10 @@ The individual parameters are evaluated at the first decision: at the covariates
 force there and at `TIME` as written there, the same point the driver evaluates the
 first decision's PK at. κ is drawn per occasion, so a supplied subject reads κ = 0. An
 oracle subject reads the κ of the first decision's occasion, the one the driver resolves
-the first dose's attributes under. With a record at the next decision, the disposition
-over the first window follows that record's occasion ([#943](https://github.com/FeRx-NLME/ferx-core/issues/943)), so the
-oracle's κ and the κ its first trough reflects can differ.
+the first dose's attributes under. The disposition over the first window runs under
+the next decision's occasion from its last record on ([#943](https://github.com/FeRx-NLME/ferx-core/issues/943), [#2895](https://github.com/FeRx-NLME/ferx-core/issues/2895)), so the
+oracle's κ and the κ its first trough reflects can differ
+(see [Which κ a decision window runs under](#window-kappa)).
 
 **The oracle is never silent.** `dose_knowledge = oracle` is a perfect-information
 comparison arm, a standard benchmark in model-informed dosing studies. Each subject
@@ -288,6 +290,12 @@ at every decision and the dose never moves: with a step of 250, `increase 25%` f
 Likewise, because ties go up, 500 `decrease 25%` gives 375, which rounds back to
 500. Choose the step and the percentages together so the lowest doses can still
 move, or check `rule_fired` against the realized `amt` in the ledger.
+
+The run warns (`W_ADAPTIVE_STEP_ABSORBED`) when the smallest `increase N%` is absorbed
+at a dose a subject can be at: its start dose, or the lowest dose the decrease rules
+bring it to. The warning names those subjects with the dose, and the lowest dose that
+step can raise. A dose at the upper bound, and a dose that only cannot go down, do not
+warn.
 
 `round_to` does not combine with `levels`: a ladder is already discrete, so write
 the rounded doses as the rungs. Without `round_to`, nothing changes: doses are clamped
@@ -491,19 +499,133 @@ wins.
 | before the subject's first record | the baseline covariates and the t = 0 parameters |
 | after an observation, EVID=2 or dose row | that row's covariates and parameters |
 | after an EVID=3/4 reset, with no record in between | the reset row's covariates and parameters |
-| on an IOV model | the same record, under the `kappa` of the decision's own window |
+| on an IOV model | the same record, under the κ of the decision's own occasion |
 
 A subject whose covariates never change reads the same values at every decision.
 
 The state a decision reads (`ctx.state`) follows the rule `predict()` uses: an
-interval is integrated under the record that ends it. A reset row is a record,
-so a decision between the last record and a later reset reads a state integrated
-under the reset row's parameters. The reset then restarts the state, so this
-changes what the controller sees before the reset, not any prediction.
+interval is integrated under the record that ends it, and every decision is a
+record ([Every decision is a record](#decision-records)). So the piece just before
+a decision runs under the decision's own parameters unless a data record ends it
+first.
 
 A reset row's own `$PK` is anchored to NONMEM (`reset_init_snapshot_J`). NONMEM
 has no feedback dosing, so the decision rule itself has no NONMEM counterpart. It
 is tested against `predict()` on the realized doses and against closed forms.
+
+### Every decision is a record {#decision-records}
+
+A decision ends the interval before it, the way a dose row or an `EVID=2` row
+does in a static dataset. This holds whether the controller doses or holds: the
+piece that ends at a decision is integrated before the controller chooses. The
+piece runs under the parameters of the decision's record:
+
+- the κ of the decision's own occasion (IOV);
+- `TIME` as written at the decision (a PK that reads `TIME`);
+- a covariate row chosen by `decision_covariates`.
+
+| `decision_covariates` | The decision's covariate row |
+|---|---|
+| `locf` (default) | The row in force at the decision: the latest data record at or before it. This is the row the controller reads, and the row ferx's reader fills a blank cell with. |
+| `nocb` | The row of the next data record at or after the decision. Past the last data record, the row in force (LOCF). |
+
+What the controller reads (`ctx.covariates`, the parameters behind its signals)
+is the LOCF row under both settings. A controller cannot read a covariate that
+has not been recorded yet. The setting only chooses the row the piece *before*
+the decision runs under.
+
+A data record at the decision's time keeps priority, so a layout with a data
+record on every decision runs the same under both settings. Every scheduled
+decision is a record, including a decision after a `Stop`. An `ADDL`-implied dose
+takes its governing record's covariates, `TIME` and occasion. Its governing
+record is the first record at or after it, and that can now be a decision.
+
+A model with constant parameters has nothing to choose and runs the same under
+both settings. Through the programmatic API, set
+`AdaptiveSimulateOptions::decision_covariates`. With a declarative block, set the
+block's key; `simulate_adaptive_from_spec` refuses the option there.
+
+**The static equivalent of a run** is its realized doses plus an `EVID=2` record
+at every decision. Fill each record's blank covariate cells by the run's
+`decision_covariates` rule, and give it the decision's occasion. `predict()` (or
+`predict_iov` with the run's η and κ) on that dataset gives the run's trajectory
+to the bit. This is tested on four record layouts, with and without a held
+decision (`the_run_equals_predict_iov_on_the_realized_doses_plus_a_record_per_decision`,
+`each_decision_covariates_rule_equals_predict_on_its_own_fill`, #2895). The
+`EVID=2` row's own `OCC` governing the interval it ends is anchored to NONMEM
+(`nonmem_anchor/iov_pk_only_*`, #1876).
+
+`predict_iov` takes its κ vectors in the order of the subject's occasion groups,
+not in decision order: first the occasions that own an observation, in the order
+they appear, then those only a dose, an `EVID=2` row or a reset carries
+(`iov_occasion_groups`). Hand it the run's κ in decision order and any layout
+where some occasion owns no observation gets the wrong κ. That mistake made the
+gaps first reported on #2895 look 25–50 times larger than they were.
+
+Before #2895 a decision was not a record, so a piece ran under the next *data*
+record, however many decisions later. Under IOV that was a later occasion's κ.
+With a `TIME`-reading PK it was a later `TIME`. With a time-varying covariate it
+was a row that only a NOCB-filled dataset reproduces: `decision_covariates = nocb`
+keeps that covariate rule, but not the old κ or `TIME`.
+
+### Which κ a decision window runs under {#window-kappa}
+
+On an IOV model the driver draws one κ per decision. Occasion `g` starts at decision
+`g`, and a data record belongs to the occasion of the latest decision at or before its
+time. A record on a decision (within 1e-9) belongs to that decision's occasion. A
+record before the first decision belongs to none and runs under κ = 0.
+
+Between records the driver applies the rule every ferx engine uses, which is also
+NONMEM's: **an interval runs under the record that ends it**
+(see [Occasions](iov.qmd#occasions)). A decision is a record
+([Every decision is a record](#decision-records)). So each piece of a window runs
+under the κ of the first data record or decision at or after its end. The window
+after decision `g` runs under κ_{g+1} from its last record on, and under the κ of
+its own records before that.
+
+With a dose at every decision, the clearance in force is:
+
+| Decisions at | Data records at | Clearance |
+|---|---|---|
+| 0, 24 | 0, 24, 48 | κ₁ over (0, 24] |
+| 0, 24 | 0, 12, 24 | κ₀ over (0, 12], κ₁ over (12, 24] |
+| 0, 24 | 0, 23, 47 | κ₀ over (0, 23], κ₁ over (23, 24] |
+| 0, 24 | 0, 23, 24, 48 | the same as the row above |
+| 0, 24, 48 | 0, 12, 48 | κ₀ over (0, 12], κ₁ over (12, 24], κ₂ over (24, 48] |
+| 0, 24, 48, 72 | 0, 72 | κ₁ over (0, 24], κ₂ over (24, 48], κ₃ over (48, 72] |
+| 0, 24, 48 | 0, 23 | κ₀ over (0, 23], κ₁ over (23, 24], κ₂ over (24, 48] |
+
+Each row is tested against the clearance backed out of the simulated concentrations
+(`a_decision_window_runs_under_the_kappa_of_the_record_that_ends_each_piece`, #2771,
+#2895). The first row is the layout the mrgsolve anchors use: day `g` on occasion
+`g+1` (#943). Before #2895 the last three rows differed: a piece ran under the next
+data record's κ, so with records only at 0 and 72 all three windows ran under κ₃.
+
+### Placing records under IOV {#window-kappa-records}
+
+Where you put data records no longer changes which κ a window runs under, except
+inside the window: a record at 12 in the window from 0 to 24 splits it into a piece
+under κ₀ and a piece under κ₁. A record on the decision changes nothing.
+
+- A record carries the covariates for the interval it ends, so a moved or added
+  record changes where a time-varying covariate takes effect.
+- With no record on a decision, there is no trajectory row at that time. The
+  pre-dose value is still in the decision log (`observed_signals`), which is what
+  the controller read.
+
+Some quantities are read at the decision, under the decision's own κ (κ of occasion
+`g` at decision `g`):
+
+| Quantity | κ it reads |
+|---|---|
+| The parameters behind the monitored signal (a `V` in `observe = central / V`) | the decision's own |
+| The bioavailability `F` of a dose the controller issues, and the infusion window `F` scales | the decision's own |
+| The lag check on a controller dose (a non-zero lag is refused, see [Current scope and limits](#current-scope-and-limits)) | the decision's own |
+| A `dose_knowledge = oracle` dose | the first decision's, κ₀ ([Which subjects' values are known](#which-subjects-values-are-known)) |
+| The `F` of a pre-scheduled base dose | the occasion of the dose's own time: κ = 0 before the first decision. For an `ADDL`-implied dose, the occasion of the record that governs it, which can be a decision |
+
+A controller infusion carries its own rate, so no modeled `D{n}` or `R{n}` is read
+for it.
 
 ### One controller per subject
 
@@ -726,7 +848,79 @@ The result bundles four tidy, long-form artifacts — each tagged by
   windows are not counted — discontinuation is already its own metric, and folding
   it in here too would double-count it; this keeps `auc_target_attainment` on the
   same realized basis as `pct_time_in_window`. Population summaries **with
-  uncertainty bands** ride with the uncertainty slice, where bands carry meaning.
+  uncertainty bands** across the draws of a run with
+  [parameter uncertainty](#parameter-uncertainty) are a follow-up (#946).
+
+## Parameter uncertainty
+
+A run can also propagate a fit's **parameter uncertainty**
+([#946](https://github.com/FeRx-NLME/ferx-core/issues/946)): it draws parameter sets
+(θ, Ω, σ, Ω_IOV) from the fit and simulates every subject and replicate under each. In
+Rust, add `AdaptiveInputs::with_uncertainty` to the inputs of
+`simulate_adaptive_with_inputs` or `simulate_adaptive_from_spec_with_inputs`:
+
+```rust
+let params = fitted_params_from_result(&fit, &model)?;
+let inputs = AdaptiveInputs::new(&params).with_uncertainty(
+    &fit,
+    UncertaintySpec { method: UncertaintyMethod::Asymptotic, n_draws: 200 },
+);
+let res = simulate_adaptive_from_spec_with_inputs(&model, &pop, &inputs, n_sim, &spec, &opts)?;
+```
+
+The run simulates `n_draws × n_sim` replicates of every subject. Every trajectory, ledger,
+decision and metrics row carries its real `draw` (1 to `n_draws`), and
+`AdaptiveSimulationResult::parameters` holds each draw's parameter set, in draw order.
+A run without uncertainty tags every row `draw = 1` and returns no `parameters`. The R
+wrapper does not expose this yet.
+
+### What each draw changes
+
+The parameter sets come from the sampler `simulate_with_uncertainty` uses: a
+multivariate normal on the fit's covariance matrix (`UncertaintyMethod::Asymptotic`, the
+default), or the fit's retained SIR resamples (`UncertaintyMethod::Sir`). FIX and
+held-at-bound parameters stay at their estimates.
+
+| Stream | Across draws |
+|---|---|
+| Parameter draws | A stream of their own, rooted at the run seed. Asking for more draws leaves the earlier ones, and every row simulated under them, unchanged. |
+| η | The one η stream continues from draw to draw, so each draw simulates new virtual patients. Draw 1 uses the standard normals the same seed gives without uncertainty, scaled by draw 1's Ω. |
+| κ, `Dv` assay | Keyed by subject, draw and sim. Draw 1 keeps the keys of a run without uncertainty. |
+| Mixture class | Keyed by subject, draw and sim (never an assay replicate), under the draw's mixing probabilities. |
+
+So a draw at the point estimate reproduces the run without uncertainty, row for row.
+`simulate_with_uncertainty` differs here: it draws its parameter sets from the same
+stream as η, so its draw-1 rows change with the number of draws.
+
+The draw loop is the outermost. Each draw's κ, assay, σ and class follow that draw's
+parameters. A failure in any draw stops the run, as a failure in any replicate does
+today: dropping a draw would bias the uncertainty distribution. Messages then name the
+draw as well as the replicate, `subject '7' (draw 3, sim 2): …`. Without uncertainty they
+keep `(sim 2)`.
+
+### Dose knowledge under a drawn θ
+
+A dose expression that reads only θ, covariates and individual parameters no random
+effect reaches is the prescriber's rule. It is evaluated once, at the point estimate θ̂
+the run is given, and gives the same plan in every draw: the run asks how that rule
+performs when the true θ is uncertain. An `oracle` subject reads its drawn values, and
+so the draw's θ, in each replicate, as it reads its drawn η.
+
+### What is refused
+
+| Input | Outcome |
+|---|---|
+| `n_draws = 0` | `E_ADAPTIVE_OPTIONS`. Omit `with_uncertainty` to simulate at the point estimate. |
+| `params` whose θ, Ω, Ω_IOV, σ or residual ρ differ from the fit's | `E_ADAPTIVE_OPTIONS`, naming the first that differs. The draws centre on the fit's estimate, so the run's parameters must be that estimate. FIX flags, masks and bounds are not compared. |
+| `Asymptotic` on a fit with no covariance matrix | `E_FIT_INPUT_MISSING`. The message points to `UncertaintyMethod::Sir` when the fit kept a SIR pool, and to a refit with `covariance_fallback = sir` and `sir_keep_samples = true` when it did not. The run never switches method by itself. |
+| `Sir` on a fit with no SIR pool | `E_FIT_INPUT_MISSING`, as in `simulate_with_uncertainty`. |
+| Supplied η (`with_etas`), under either `UnmatchedSubjects` policy | `E_SUPPLIED_ETAS`. Each supplied η was estimated at the fit's θ, so pairing it with a drawn θ would not describe the same patient. #2154 tracks drawing η from its posterior under each draw. |
+
+There is no NONMEM run to compare with: NONMEM has no feedback dosing. The path is
+validated by the degenerate oracle (draws at the point estimate reproduce the run
+without uncertainty, bit for bit) and by a cross-check against
+`simulate_with_uncertainty` on the same draws under a fixed regimen (IPRED equal to
+the bit).
 
 ## Verification (on by default)
 
@@ -1158,10 +1352,10 @@ cannot see a failure in the solver itself.
   whose per-dose SS / lag / input-rate / rate-resolution bookkeeping the frozen-replay engine does
   not yet reproduce).
 - **Time-varying covariates are supported** — the driver recomputes PK per
-  event/segment from the covariate active in that segment (the NONMEM
-  end-of-interval convention that `predict()` / `simulate()` use), so a covariate
-  that changes over the horizon (e.g. declining renal function driving clearance)
-  correctly drives CL/V/KA, the monitored signal, and every dose decision; the
+  segment under the record that ends it (the end-of-interval convention of
+  `predict()` / `simulate()`; every decision is a record, see
+  [Every decision is a record](#decision-records)), so a covariate that changes
+  over the horizon drives CL/V/KA, the monitored signal and every decision; the
   frozen-replay verifier validates the per-event bookkeeping. A model whose PK reads
   the `TIME` built-in is covered the same way, `auc_target` included (#943).
 - **System resets (EVID=3) are supported** — the reactive driver zeros the
@@ -1177,10 +1371,10 @@ cannot see a failure in the solver itself.
   straddles a reset carries a node at the state the reset found and one at
   the state it left, so the drop integrates exactly.
 - **Inter-occasion variability (IOV) is supported** — a fresh occasion `kappa` is
-  drawn per **decision window** (occasion = decision index) and threaded through the
-  per-event PK, so occasion-to-occasion shifts in CL/V drive the trajectory, the
-  monitored signal, and every reactive dose; the frozen-replay verifier validates the
-  per-occasion bookkeeping. A **pre-scheduled base regimen** (a loading dose) composes with
+  drawn per **decision** (occasion `g` starts at decision `g`) and threaded through the
+  per-event PK. A piece runs under the κ of the record or decision that ends it, see
+  [Which κ a decision window runs under](#window-kappa). The frozen-replay verifier
+  validates the per-occasion bookkeeping. A **pre-scheduled base regimen** (a loading dose) composes with
   IOV (#931): each base dose's `F` resolves under the κ of the occasion active at its
   administration time — see *Pre-scheduled base regimens* above. It also composes with
   time-varying covariates — the
@@ -1190,10 +1384,7 @@ cannot see a failure in the solver itself.
   drawn on a dedicated per-(subject, replicate) substream (disjoint from the η and
   assay streams), so a non-IOV run is unchanged and enabling a `Dv` monitor never
   shifts the draws. `auc_target` reads each segment under the κ it was integrated with
-  (#943), the governing record's: with records only at the decisions, a window carries
-  the **next** window's κ, as its trajectory does.
-  Between-subject η is still drawn per subject/replicate; parameter-uncertainty
-  propagation is a later layer.
+  (#943).
 - **Deterministic ODE only** — a stochastic (`[diffusion]` / SDE) model is rejected
   (the reactive integrator carries no process noise).
 - **Diagonal assay noise** — each `Dv` monitor draws independently; correlated

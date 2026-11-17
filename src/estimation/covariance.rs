@@ -5,6 +5,7 @@
 //! population optimizers, the outer-gradient family, `OuterResult`, and
 //! `pop_nll`/`pop_nll_opts` (imported below).
 
+use crate::cold_sort::ColdSort;
 use crate::estimation::cov_diagnostics::{
     cov_objective_method, cov_objective_route, decrement_is_non_stationary,
     estimate_minimises_cov_objective, format_non_stationary_gradient_warning,
@@ -236,7 +237,7 @@ pub(crate) fn extract_eigenvalues(sym: &DMatrix<f64>) -> Option<Vec<f64>> {
         return None;
     }
     let mut eigvals: Vec<f64> = eig.eigenvalues.iter().cloned().collect();
-    eigvals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    eigvals.cold_sort_by(&|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     Some(eigvals)
 }
 
@@ -365,7 +366,7 @@ fn fd_diag_specs(x_hat: &[f64], free_idx: &[usize], eps: f64, floor: &[f64]) -> 
 
 /// Evaluate `ofv` at one perturbed point. Each call clones `x_hat` once, so a `par_iter` over
 /// specs keeps only ~n_threads vectors live instead of all ~2·nf² perturbed points (#298).
-fn eval_fd_point<F: Fn(&[f64]) -> f64>(x_hat: &[f64], p: FdPert, ofv: &F) -> f64 {
+fn eval_fd_point<R, F: Fn(&[f64]) -> R>(x_hat: &[f64], p: FdPert, ofv: &F) -> R {
     let mut xv = x_hat.to_vec();
     match p {
         FdPert::Single { i, di } => xv[i] += di,
@@ -427,18 +428,16 @@ pub(crate) fn select_fd_step<F: Fn(&[f64]) -> f64 + Sync>(
     for halvings in 0..MAX_HALVINGS {
         let specs = fd_diag_specs(x_hat, free_idx, eps, floor);
         let report = cov_progress("step probe", specs.len(), options.verbose);
-        let vals: Vec<f64> = specs
-            .par_iter()
-            .map(|&p| {
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    report();
-                    return f64::NAN;
-                }
-                let v = eval_fd_point(x_hat, p, ofv);
+        let vals: Vec<f64> = crate::par::map(specs.len(), |idx| {
+            let &p = &specs[idx];
+            if crate::cancel::is_cancelled(&options.cancel) {
                 report();
-                v
-            })
-            .collect();
+                return f64::NAN;
+            }
+            let v = eval_fd_point(x_hat, p, ofv);
+            report();
+            v
+        });
         if crate::cancel::is_cancelled(&options.cancel) {
             return FdStep {
                 eps,
@@ -716,7 +715,6 @@ pub(crate) fn assemble_score_cross_product(
     model: &CompiledModel,
     population: &Population,
     eta_hats: &[DVector<f64>],
-    h_matrices: &[DMatrix<f64>],
     kappas: &[Vec<DVector<f64>>],
     bounds: &PackedBounds,
     options: &FitOptions,
@@ -746,7 +744,7 @@ pub(crate) fn assemble_score_cross_product(
     // under the rayon worker's default `MIXNUM = 1` with the base Ω/Σ, so the
     // class-2-only θ and the mixing θ had identically-zero score columns: `s` was
     // refused as singular and `rsr` silently lost those coordinates. The mixture path
-    // computes its own per-class modes at `x̂`, so `eta_hats` / `h_matrices` /
+    // computes its own per-class modes at `x̂`, so `eta_hats` /
     // `kappas` (the MIXEST class's) are not read for it.
     let mixture = model.mixture.as_ref().map(|_| {
         crate::estimation::mixture::MixtureScoreContext::new(
@@ -754,66 +752,70 @@ pub(crate) fn assemble_score_cross_product(
         )
     });
 
-    // Per-subject scores in parallel (mirrors `build_gn_system`).
+    // Per-subject scores in parallel.
     //
-    // Convention: each row is the **fixed-mode** score, the per-subject gradient at x̂
-    // with η̂, `H` and κ̂ held at their x̂ values (`fixed_ebe_subject_score`). The FOCEI
-    // EBE-response term `tᵢ = ½·∂log|H̃|/∂η̂·dη̂/dθ` it adds back is identically zero
-    // today (#338 Part A removed the θ block; the ω/σ blocks are #1817), so S carries
-    // neither that term nor the θ-dependence of the held prediction Jacobian. The
-    // FD-built R reconverges η̂ at every stencil point and is unaffected. NONMEM's
-    // `MATRIX=S` differentiates the total `−2LLᵢ(x)`, η̂ re-estimated at every
-    // perturbed x. The held score is biased at the MLE (`Σᵢ gᵢ ≠ 0`), so the two S
-    // differ by a convention gap that more subjects do not close — measured on
-    // `mixture_iv` and its one-population twin in `tests/mixture_cov_s_nonmem.rs`.
-    // Closing it is #1817's territory. FOCE (`!interaction`) uses the Sheiner–Beal
-    // gradient, which has no `log|H̃|` term, so `tᵢ` is not called for it.
+    // Convention (#2974): each row is the subject's **total** derivative `dnllᵢ/dx`, the mode
+    // re-estimated at every `x` — the subject's term of the outer gradient
+    // ([`subject_total_score`]), which is what NONMEM's `MATRIX=S` differentiates. The
+    // fixed-mode score it replaces (η̂, `H`, κ̂ held at x̂) is biased at the MLE
+    // (`Σᵢ gᵢ ≠ 0`), a gap more subjects do not close (`tests/mixture_cov_s_nonmem.rs`).
+    // One packed point for the population, as the outer gradient unpacks it.
+    let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x_hat);
+    // The covariance step's inner tolerance for the reconverged fallback's probes too, not
+    // the outer gradient's stencil one (#2261).
+    let row_options = FitOptions {
+        inner_tol: options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner()),
+        ..options.clone()
+    };
+    let mixture_points = mixture.as_ref().map(|c| c.class_points());
     let report = cov_progress("score matrix", n_subj, options.verbose);
-    let scores: Vec<Result<Vec<f64>, String>> = (0..n_subj)
-        .into_par_iter()
-        .map(|i| {
-            // Cooperative cancel: skip the per-subject gradient and return a
-            // cheap zero score so the in-flight rayon queue drains fast. The
-            // caller (`compute_covariance`) re-checks the flag and discards this
-            // matrix before it is used, so the placeholder is never trusted.
-            if crate::cancel::is_cancelled(&options.cancel) {
-                report();
-                return Ok(vec![0.0; x_hat.len()]);
-            }
-            let kap_i = if i < kappas.len() {
-                kappas[i].as_slice()
-            } else {
-                &[]
-            };
-            if let Some(context) = &mixture {
-                let score = context.score(model, population, i, options);
-                report();
-                return Ok(score);
-            }
-            if let Some(context) = &quadrature {
-                // The subject score has NLL units already and cannot contain the
-                // optimizer's population-level EBE penalty. Never square a failed row.
-                let score = context.score(&population.subjects[i], eta_hats[i].as_slice(), kap_i)
-                    .ok_or_else(|| format!("Covariance step failed: could not obtain a converged, finite quadrature score for subject {}. SE estimates not available.", population.subjects[i].id));
-                report();
-                return score;
-            }
-            let gi = fixed_ebe_subject_score(
-                x_hat,
-                template,
+    let scores: Vec<Result<Vec<f64>, String>> = crate::par::map(n_subj, |i| {
+        // Cooperative cancel: skip the per-subject gradient and return a
+        // cheap zero score so the in-flight rayon queue drains fast. The
+        // caller (`compute_covariance`) re-checks the flag and discards this
+        // matrix before it is used, so the placeholder is never trusted.
+        if crate::cancel::is_cancelled(&options.cancel) {
+            report();
+            return Ok(vec![0.0; x_hat.len()]);
+        }
+        let kap_i = if i < kappas.len() {
+            kappas[i].as_slice()
+        } else {
+            &[]
+        };
+        if let Some(context) = &mixture {
+            let score = context.score(
                 model,
                 population,
                 i,
-                &eta_hats[i],
-                &h_matrices[i],
-                kap_i,
-                bounds,
-                options,
+                mixture_points.as_deref().unwrap_or(&[]),
             );
             report();
-            Ok(gi)
-        })
-        .collect();
+            return Ok(score);
+        }
+        if let Some(context) = &quadrature {
+            // The subject score has NLL units already and cannot contain the
+            // optimizer's population-level EBE penalty. Never square a failed row.
+            let score = context.score(&population.subjects[i], eta_hats[i].as_slice(), kap_i)
+                    .ok_or_else(|| format!("Covariance step failed: could not obtain a converged, finite quadrature score for subject {}. SE estimates not available.", population.subjects[i].id));
+            report();
+            return score;
+        }
+        let gi = subject_total_score(
+            x_hat,
+            template,
+            model,
+            population,
+            i,
+            &eta_hats[i],
+            kap_i,
+            pt.as_ref(),
+            bounds,
+            &row_options,
+        );
+        report();
+        Ok(gi)
+    });
 
     let mut s = DMatrix::zeros(n_free, n_free);
     for gi in scores {
@@ -830,38 +832,86 @@ pub(crate) fn assemble_score_cross_product(
     Ok(s)
 }
 
-/// One subject's single-population score `∂nllᵢ/∂x` at fixed modes (η̂, `H`, κ̂) — the
-/// row `assemble_score_cross_product` squares into S, and (#1956) each class's term
-/// of a mixture subject's score. `subject_nll_pop_grad` (closed form or central FD),
-/// plus the FOCEI `log|H̃|` EBE-response term `tᵢ`, which is identically zero today
-/// (#338 Part A); see the convention comment in `assemble_score_cross_product`.
+/// One subject's single-population score `dnllᵢ/dx` — the row `assemble_score_cross_product`
+/// squares into S, and (#1956) each class's term of a mixture subject's score — in NONMEM's
+/// `MATRIX=S` convention: the **total** derivative of the subject's objective, the mode
+/// `η̂` (and under IOV κ̂) re-estimated at every `x` (#2974).
+///
+/// It is the subject's term of the fit's outer gradient: the adjoint's exact packed gradient
+/// (`Ψ = F − wᵀ∇_η l`, which carries the mode response) wherever the outer gradient would ask
+/// the adjoint (`analytic_outer_gradient_available`, which honours `gradient = fd`), and
+/// otherwise — or where the adjoint declines the subject — the reconverged central difference
+/// of the subject's objective (`subject_reconverged_fd_gradient[_iov]`). That is the total
+/// derivative; the NLopt outer gradient salvages a non-structural decline with the held-EBE
+/// score instead unless reconvergence is scheduled, so on such a subject the two differ. One rule for every estimator and model class
+/// this path serves: FOCE and FOCEI, IOV, non-Gaussian endpoints, covariate networks, and a
+/// mixture's classes. (AGQ / Laplace take `SubjectScoreContext::score`, the same convention.)
+///
+/// Before #2974 the row was the **fixed-mode** score (η̂, `H`, κ̂ held at x̂, the θ axis a
+/// forward difference of the predictions), which is biased at the MLE (`Σᵢ gᵢ ≠ 0`) and is
+/// not NONMEM's `S` (`tests/mixture_cov_s_nonmem.rs`). Fixed coordinates are not zeroed: the
+/// caller reads the free block only.
+///
+/// `options.inner_tol` is the tolerance of the reconverged difference's probes (floored at the
+/// stencil tolerance); the covariance step passes its own (`effective_cov_inner_tol`, #2261),
+/// not the fit's. A subject repelled at `x` returns zeros, as the outer gradient's salvage
+/// does (the adjoint's non-finite vector is filtered, and the difference masks the rail).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn fixed_ebe_subject_score(
+pub(crate) fn subject_total_score(
     x: &[f64],
     template: &ModelParameters,
     model: &CompiledModel,
     population: &Population,
     subj_idx: usize,
     eta_hat: &DVector<f64>,
-    h_matrix: &DMatrix<f64>,
     kappas: &[DVector<f64>],
+    pt: Option<&crate::sens::ode_provider::adjoint::PackedPoint<'_>>,
     bounds: &PackedBounds,
     options: &FitOptions,
 ) -> Vec<f64> {
-    let (_, mut gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
-        x, template, model, population, subj_idx, eta_hat, h_matrix, kappas, bounds, options,
-    );
-    if options.interaction {
-        if let Some(ti) = crate::estimation::gauss_newton::subject_eta_response_correction(
-            None, x, template, model, population, subj_idx, eta_hat, h_matrix, kappas, bounds,
-            options,
-        ) {
-            for (g, t) in gi.iter_mut().zip(ti.iter()) {
-                *g += *t;
-            }
-        }
+    let subject = &population.subjects[subj_idx];
+    if subject.observations.is_empty() && subject.obs_records.is_empty() {
+        return vec![0.0; x.len()];
     }
-    gi
+    let analytic = crate::sens::provider::analytic_outer_gradient_available(model)
+        && GradientMethod::effective(model, options) != GradientMethod::Fd;
+    let exact = analytic
+        .then_some(pt)
+        .flatten()
+        .and_then(|pt| {
+            let b = stacked_mode(
+                model,
+                subject,
+                eta_hat,
+                (model.n_kappa > 0).then_some(kappas),
+            )?;
+            crate::estimation::sens_outer_gradient::subject_gradient_at(
+                model,
+                subject,
+                pt,
+                &b,
+                options.interaction,
+            )
+        })
+        .filter(|g| g.len() == x.len() && g.iter().all(|v| v.is_finite()));
+    if let Some(g) = exact {
+        return g;
+    }
+    // The reconverged difference masks a probe on the `1e20` rail (`central_diff_packed_gated`,
+    // #2378), so a subject repelled at `x` — for which the adjoint returned a non-finite
+    // vector, filtered above — contributes zero here, as the outer gradient's salvage does.
+    let warm = (model.n_kappa > 0)
+        .then(|| crate::estimation::outer_optimizer::joint_warm_start(eta_hat, kappas));
+    let warm = warm.as_ref().unwrap_or(eta_hat);
+    if model.n_kappa > 0 {
+        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient_iov(
+            x, template, model, subject, warm, bounds, options,
+        )
+    } else {
+        crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
+            x, template, model, subject, eta_hat, bounds, options,
+        )
+    }
 }
 
 /// Test hook: subject ids whose analytic covariance term declines, so a test can reach the
@@ -884,8 +934,8 @@ pub(super) mod forced_cov_decline {
 }
 
 /// The objective the analytic R-matrix differentiates: the one the fit minimised (see
-/// `analytic_cov_hessian`).
-fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
+/// `analytic_cov_hessian`), and whose per-subject gradients the BHHH decrement reads.
+pub(crate) fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Objective {
     use crate::sens::ode_provider::adjoint::Objective;
     match options.agq_nodes() {
         Some(n_agq) => Objective::Agq {
@@ -904,10 +954,7 @@ fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Ob
 /// declined. Dropping `gradient = fd` does not move a non-Gaussian model, and enabling
 /// `analytic_cov_hessian` does not move a mixture — both were promised unconditionally before
 /// (#1508 review §3). The three model-level gates are therefore collected side by side rather
-/// than short-circuited, and the per-subject width clause asks
-/// `sens::ode_provider::adjoint::cov_width_declines`, the rule the Hessian dispatch itself
-/// runs on — so a five-effect Laplace fit with `analytic_cov_hessian = false` is told that
-/// enabling the flag would not move it (Copilot review on #2093).
+/// than short-circuited.
 ///
 /// Returns an empty vec only when the analytic route was in fact taken — so a caller that has
 /// already observed `analytic_cov_hessian(..) == None` and still finds nothing here has found a
@@ -921,11 +968,10 @@ fn cov_objective(options: &FitOptions) -> crate::sens::ode_provider::adjoint::Ob
 /// a stencil that has just spent `2·n_free²` reconverged population objectives.
 fn analytic_cov_declines(
     model: &CompiledModel,
-    population: &Population,
     options: &FitOptions,
     is_mixture: bool,
 ) -> Vec<CovScopeDecline> {
-    let mut out = analytic_cov_scope_declines(model, population, options, is_mixture);
+    let mut out = analytic_cov_model_declines(model, options, is_mixture);
     if out.is_empty() {
         out.push(CovScopeDecline::PerSubjectBail);
     }
@@ -940,10 +986,11 @@ const COV_STENCIL_ODE_MAX_STEPS_FACTOR: usize = 10;
 
 /// The ODE solver override a covariance step whose matrices are finite-differenced runs under
 /// (#520), or `None` to run every step at the fit's own tolerance. Which steps take it is
-/// [`compute_covariance_for`]'s call: one that differences `R`'s objective, and one that reads
-/// the score cross-product `S` alone — whose per-subject θ scores are differenced too, forward
-/// or central, even on the closed-form gradient paths (#520 review round 2). The whole step,
-/// not those matrices alone, so no estimate mixes tolerances (round 6).
+/// [`compute_covariance_for`]'s call: one that differences `R`'s objective (the user's
+/// `analytic_cov_hessian = false`, or a subject the exact R-matrix declines), and one whose
+/// score cross-product `S` takes a differenced per-subject score where the exact one declines
+/// (#520 review round 2). The whole step, not those matrices alone, so no estimate mixes
+/// tolerances (round 6).
 ///
 /// The stencil divides by `h²`, so it amplifies integration noise the fit's optimizer averages
 /// over: on the 3-cpt IV ODE fixture (180 subjects, `analytic_cov_hessian = false`) the default
@@ -1011,26 +1058,22 @@ pub(crate) fn stencil_scope_failure_warning(reason: &str) -> String {
 }
 
 /// Which route the covariance step is expected to build `R` on, predicted before the fit from
-/// the same walk [`analytic_cov_declines`] reports (#2054): the model-level gates, then
-/// `cov_width_declines` per subject, then the salvage cut [`salvages_declined`] the assembly
-/// itself applies. The prediction can still be wrong when a subject bails at run time (a trial
-/// point the recorder cannot form) — then that subject joins the salvaged minority, or, past
-/// the cut, the whole population takes the stencil — which is why every message built from it
-/// is worded as an expectation.
+/// the same walk [`analytic_cov_declines`] reports (#2054): the model-level gates. The
+/// prediction can still be wrong when a subject bails at run time (a trial point the recorder
+/// cannot form) — then that subject joins the salvaged minority [`salvages_declined`] cuts, or,
+/// past the cut, the whole population takes the stencil — which is why every message built from
+/// it is worded as an expectation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PredictedRRoute {
     /// Every subject on the analytic assembly: no finite-difference objective at all.
     Analytic,
-    /// A strict minority of subjects declines; the `2·n²`-point stencil runs over those
-    /// `declined` of `n_subjects` alone (#1514).
-    Salvage { declined: usize, n_subjects: usize },
     /// The whole-population stencil.
     Stencil,
 }
 
 /// Whether the assembly salvages `declined` of `n_subjects` declining subjects on their own
-/// stencil, rather than taking the population stencil — the one cut both
-/// [`analytic_cov_assembly`] and [`predicted_r_route`] read. `declined > 0` is the caller's.
+/// stencil, rather than taking the population stencil ([`analytic_cov_assembly`]'s cut).
+/// `declined > 0` is the caller's.
 fn salvages_declined(declined: usize, n_subjects: usize) -> bool {
     (declined as f64) < SALVAGE_MAX_DECLINED_FRACTION * n_subjects as f64
 }
@@ -1043,23 +1086,13 @@ fn salvages_declined(declined: usize, n_subjects: usize) -> bool {
 /// [`PredictedRRoute::Analytic`].
 pub(crate) fn predicted_r_route(
     model: &CompiledModel,
-    population: &Population,
     options: &FitOptions,
     is_mixture: bool,
 ) -> PredictedRRoute {
-    if !analytic_cov_model_declines(model, options, is_mixture).is_empty() {
-        return PredictedRRoute::Stencil;
-    }
-    let n_subjects = population.subjects.len();
-    match width_declined_subjects(model, population, options) {
-        0 => PredictedRRoute::Analytic,
-        // The mixture objective is not a per-subject sum: no salvage, all or nothing.
-        _ if is_mixture => PredictedRRoute::Stencil,
-        declined if salvages_declined(declined, n_subjects) => PredictedRRoute::Salvage {
-            declined,
-            n_subjects,
-        },
-        _ => PredictedRRoute::Stencil,
+    if analytic_cov_model_declines(model, options, is_mixture).is_empty() {
+        PredictedRRoute::Analytic
+    } else {
+        PredictedRRoute::Stencil
     }
 }
 
@@ -1068,29 +1101,14 @@ pub(crate) fn predicted_r_route(
 /// [`analytic_cov_declines`]'s walk fires.
 pub(crate) fn analytic_r_expected(
     model: &CompiledModel,
-    population: &Population,
     options: &FitOptions,
     is_mixture: bool,
 ) -> bool {
-    predicted_r_route(model, population, options, is_mixture) == PredictedRRoute::Analytic
+    predicted_r_route(model, options, is_mixture) == PredictedRRoute::Analytic
 }
 
-/// The clauses of [`analytic_cov_declines`], empty when none fires.
-fn analytic_cov_scope_declines(
-    model: &CompiledModel,
-    population: &Population,
-    options: &FitOptions,
-    is_mixture: bool,
-) -> Vec<CovScopeDecline> {
-    let mut out = analytic_cov_model_declines(model, options, is_mixture);
-    if width_declined_subjects(model, population, options) > 0 {
-        out.push(CovScopeDecline::TooManyRandomEffects);
-    }
-    out
-}
-
-/// The model-level clauses of [`analytic_cov_declines`] — every one that sends the whole
-/// population to the stencil, whatever the subjects look like.
+/// The clauses of [`analytic_cov_declines`] — every one that sends the whole population to
+/// the stencil, whatever the subjects look like. Empty when none fires.
 fn analytic_cov_model_declines(
     model: &CompiledModel,
     options: &FitOptions,
@@ -1113,8 +1131,7 @@ fn analytic_cov_model_declines(
     }
     // The adjoint's profile Hessian serves every estimator and anchor; what it declines is
     // the model (a shape no recorder serves, a non-Gaussian endpoint outside FOCE/FOCEI's
-    // exact term), a subject wider than
-    // its buckets, or the user's `gradient = fd` opt-out from analytic derivatives.
+    // exact term) or the user's `gradient = fd` opt-out from analytic derivatives.
     if !crate::sens::ode_provider::adjoint::recorder_in_scope(model) {
         out.push(CovScopeDecline::ModelOutOfScope);
     }
@@ -1130,21 +1147,6 @@ fn analytic_cov_model_declines(
         out.push(CovScopeDecline::NonGaussianEndpoint);
     }
     out
-}
-
-/// How many subjects are too wide for the profile Hessian's buckets under the fit's
-/// objective — the per-subject clause, through the rule the Hessian dispatch itself runs on.
-fn width_declined_subjects(
-    model: &CompiledModel,
-    population: &Population,
-    options: &FitOptions,
-) -> usize {
-    let objective = cov_objective(options);
-    population
-        .subjects
-        .iter()
-        .filter(|s| crate::sens::ode_provider::adjoint::cov_width_declines(model, s, objective))
-        .count()
 }
 
 /// Compute the parameter covariance matrix at convergence (the R-matrix:
@@ -1235,16 +1237,16 @@ const SALVAGE_MAX_DECLINED_FRACTION: f64 = 0.5;
 /// A subject's mode as the adjoint's recordings take it: `η̂`, followed under IOV by every
 /// occasion's `κ̂` (the stacked `[η, κ₁…κ_K]`), or `None` when the `κ̂` do not match the
 /// subject's occasions.
-pub(crate) fn stacked_mode<'a>(
+pub(crate) fn stacked_mode<'a, K: AsRef<[DVector<f64>]> + ?Sized>(
     model: &CompiledModel,
     subject: &Subject,
     eta_hat: &'a DVector<f64>,
-    kappas: Option<&Vec<DVector<f64>>>,
+    kappas: Option<&K>,
 ) -> Option<std::borrow::Cow<'a, [f64]>> {
     if model.n_kappa == 0 {
         return Some(std::borrow::Cow::Borrowed(eta_hat.as_slice()));
     }
-    let kap = kappas?;
+    let kap = kappas?.as_ref();
     if kap.len() != crate::stats::stacked_layout::group_count(subject)
         || kap.iter().any(|k| k.len() != model.n_kappa)
     {
@@ -1315,40 +1317,36 @@ fn per_subject_adjoint<R: Send>(
     let objective = cov_objective(options);
     // One unpack for the population: every subject is at `x`.
     let pt = crate::sens::ode_provider::adjoint::PackedPoint::new(template, x)?;
-    Some(
-        population
-            .subjects
-            .par_iter()
-            .zip(eta_hats.par_iter())
-            .enumerate()
-            .map(|(i, (subject, eta_hat))| {
-                let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
-                // Cooperative cancel. The FD stencil checks on every perturbed point; this loop
-                // is `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs)
-                // assembly per subject, and for the default `covariance_method = r` there is no
-                // later checkpoint — so without this, the Ctrl-C affordance `saem.rs`
-                // advertises before the covariance step (#893) was inoperative. Returning
-                // `None` alone would drop into the *more* expensive FD stencil; the caller
-                // re-checks the flag and reports cancelled instead (PR #953 review finding 10).
-                if crate::cancel::is_cancelled(&options.cancel) {
-                    return None;
-                }
-                #[cfg(test)]
-                if forced_cov_decline::declines(&subject.id) {
-                    return None;
-                }
-                #[cfg(test)]
-                if let Ok(mut watch) = SUBJECT_SWEEP_WATCH.lock() {
-                    if let Some((addr, n)) = watch.as_mut() {
-                        if *addr == template as *const ModelParameters as usize {
-                            *n += 1;
-                        }
+    Some(crate::par::map(
+        population.subjects.len().min(eta_hats.len()),
+        |i| {
+            let (subject, eta_hat) = (&population.subjects[i], &eta_hats[i]);
+            let b = stacked_mode(model, subject, eta_hat, kappas.get(i))?;
+            // Cooperative cancel. The FD stencil checks on every perturbed point; this loop
+            // is `2·(n_theta+n_eta)+1` provider evaluations plus an O(n_eta³·n_obs)
+            // assembly per subject, and for the default `covariance_method = r` there is no
+            // later checkpoint — so without this, the Ctrl-C affordance `saem.rs`
+            // advertises before the covariance step (#893) was inoperative. Returning
+            // `None` alone would drop into the *more* expensive FD stencil; the caller
+            // re-checks the flag and reports cancelled instead (PR #953 review finding 10).
+            if crate::cancel::is_cancelled(&options.cancel) {
+                return None;
+            }
+            #[cfg(test)]
+            if forced_cov_decline::declines(&subject.id) {
+                return None;
+            }
+            #[cfg(test)]
+            if let Ok(mut watch) = SUBJECT_SWEEP_WATCH.lock() {
+                if let Some((addr, n)) = watch.as_mut() {
+                    if *addr == template as *const ModelParameters as usize {
+                        *n += 1;
                     }
                 }
-                f(subject, &pt, &b, objective)
-            })
-            .collect(),
-    )
+            }
+            f(subject, &pt, &b, objective)
+        },
+    ))
 }
 
 /// The slope and the curvature of the OFV along each packed axis in `axes`, exact: `∂OFV/∂x_a`
@@ -1380,7 +1378,7 @@ pub(crate) fn exact_candidate_derivatives(
         return None;
     }
     let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
-    let (_, ehs, _, kaps, all_converged) = reconverge_population_checked(
+    let (_, ehs, _, kaps, all_converged, _) = reconverge_population_checked(
         x,
         model,
         population,
@@ -1521,15 +1519,6 @@ pub(super) fn analytic_cov_assembly(
     ) else {
         return AnalyticCovAssembly::Unavailable;
     };
-    // The R-matrix passes record on each worker's reverse tape, which keeps its buffers
-    // between subjects so they are not reallocated per pass. Past the last subject nothing
-    // else needs them at that size, so release them on every worker of the pool (#2093):
-    // a 1M-node tape — what `rtape_trim`'s per-pass threshold lets a worker keep — is
-    // ~100 MB (offsets, entries and eight adjoint lanes per node), and stayed pinned for the
-    // rest of a long-lived process (an R session). This does not lower the step's own peak,
-    // which is the tape at its largest during the passes: measured +4–5 MB of peak RSS over
-    // `main` without the covariance step and +13–27 MB with it on the bundled models.
-    rayon::broadcast(|_| crate::sens::rtape::rtape_trim(0));
     let mut acc = DMatrix::<f64>::zeros(n, n);
     let mut declined: Vec<usize> = Vec::new();
     for (i, h) in per_subject.into_iter().enumerate() {
@@ -1693,6 +1682,7 @@ pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
     if let Some(d) = diag {
         vals.extend_from_slice(d);
     }
+    let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
     vals.par_extend(specs[skip..].par_iter().map(|&p| {
         // Cooperative cancel: skip this point's EBE reconvergence and
         // return NaN so the queue drains; bailed on below.
@@ -1700,7 +1690,9 @@ pub(super) fn fd_ofv_stencil<F: Fn(&[f64]) -> f64 + Sync>(
             report();
             return f64::NAN;
         }
-        let v = eval_fd_point(x_hat, p, ofv);
+        let v = crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(fit, || {
+            eval_fd_point(x_hat, p, ofv)
+        });
         report();
         v
     }));
@@ -1763,6 +1755,42 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
     ofv: &F,
     options: &FitOptions,
 ) -> Option<FdStencil> {
+    fd_ofv_hessian_gated(
+        n,
+        x_hat,
+        free_idx,
+        floor,
+        initial_eps,
+        f0,
+        ofv,
+        None,
+        options,
+    )
+}
+
+/// The objective re-solved at τ/100 — the tight twin of [`fd_ofv_hessian_gated`]'s `ofv` —
+/// `None` where a solve fell to Nelder–Mead or did not converge.
+pub(super) type TightOfv<'a> = &'a (dyn Fn(&[f64]) -> Option<f64> + Sync);
+
+/// [`fd_ofv_hessian`], with the resolution gate of
+/// [`resolve_floored_step`](crate::estimation::fd_resolution::resolve_floored_step) on the
+/// diagonal of every free coordinate whose floor is below 1 (#2406); without `tight` no
+/// coordinate is gated. A gated coordinate's step grows until its second difference is
+/// resolved, the off-diagonal pairs it enters are taken at that grown step, and its diagonal
+/// entry is the τ/100 second difference. Where no step had a τ/100 one, the step stays at its
+/// floor and the entry is the τ second difference there.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fd_ofv_hessian_gated<F: Fn(&[f64]) -> f64 + Sync>(
+    n: usize,
+    x_hat: &[f64],
+    free_idx: &[usize],
+    floor: &[f64],
+    initial_eps: f64,
+    f0: f64,
+    ofv: &F,
+    tight: Option<TightOfv<'_>>,
+    options: &FitOptions,
+) -> Option<FdStencil> {
     #[cfg(test)]
     reconverge_log::record_fd_hessian(initial_eps);
     // Adaptively select the FD step: halve up to 8× until all free-parameter diagonal stencils
@@ -1781,17 +1809,136 @@ pub(super) fn fd_ofv_hessian<F: Fn(&[f64]) -> f64 + Sync>(
             if step.n_halvings == 1 { "" } else { "s" }
         );
     }
-    fd_ofv_stencil(
+    let diag = step.diag;
+    let mut floor = floor.to_vec();
+    let mut resolved_diag: Vec<(usize, f64)> = Vec::new();
+    if let (Some(tight), Some(d)) = (tight, diag.as_deref()) {
+        // A gated coordinate's off-diagonal pairs are stepped at the floor it settled on. Its
+        // two axis points in `diag` stay the first step's: they feed only its own diagonal
+        // entry, which the resolved value replaces below.
+        for (i, r) in resolve_fd_diag(x_hat, free_idx, &floor, step.eps, f0, d, ofv, tight) {
+            floor[i] = r.floor;
+            resolved_diag.push((i, r.value));
+        }
+        if crate::cancel::is_cancelled(&options.cancel) {
+            return None;
+        }
+    }
+    let mut stencil = fd_ofv_stencil(
         n,
         x_hat,
         free_idx,
-        floor,
+        &floor,
         step.eps,
         f0,
-        step.diag.as_deref(),
+        diag.as_deref(),
         ofv,
         options,
-    )
+    )?;
+    for (i, v) in resolved_diag {
+        if v.is_finite() {
+            stencil.hess[(i, i)] = v;
+            stencil.diag_nan.remove(&i);
+        }
+    }
+    Some(stencil)
+}
+
+/// The gated diagonal of [`fd_ofv_hessian_gated`]: for each free coordinate (packed `i`) whose
+/// floor is below 1, where its step settled, as `(i, resolved)`. `diag` is the accepted pass
+/// of [`select_fd_step`], reused as the τ side of the first step. The τ/100 side's centre is
+/// `tight(x̂)`, evaluated once and only when some coordinate is floored, so all three points
+/// of its second difference share a tolerance.
+#[allow(clippy::too_many_arguments)]
+fn resolve_fd_diag<F: Fn(&[f64]) -> f64 + Sync>(
+    x_hat: &[f64],
+    free_idx: &[usize],
+    floor: &[f64],
+    eps: f64,
+    f0: f64,
+    diag: &[f64],
+    ofv: &F,
+    tight: TightOfv<'_>,
+) -> Vec<(usize, crate::estimation::fd_resolution::Resolved)> {
+    use crate::estimation::fd_resolution::{resolve_floored_step, Difference};
+    let gated: Vec<(usize, usize)> = free_idx
+        .iter()
+        .enumerate()
+        .filter(|&(_, &i)| floor[i] < 1.0)
+        .map(|(a, &i)| (a, i))
+        .collect();
+    if gated.is_empty() {
+        return Vec::new();
+    }
+    let f0_tight = tight(x_hat);
+    // A point on the `1e20` wall is missing, not a value, as on the gradient side: two walled
+    // diagonals agree to an ulp and clear the noise guard, so differenced they would accept
+    // a diagonal of ~2e20/h² and an SE of ~0. Growing ×10 toward the bounds is what reaches
+    // the wall; the ungated stencil only ever halves.
+    let usable = crate::stats::likelihood::is_usable_subject_nll;
+    let second = |fp: f64, f0: f64, fm: f64, h: f64| {
+        if !(usable(fp) && usable(f0) && usable(fm)) {
+            return None;
+        }
+        let numer = fp - 2.0 * f0 + fm;
+        let value = numer / (h * h);
+        value.is_finite().then_some(Difference {
+            value,
+            numer: numer.abs(),
+            scale: f0.abs(),
+            span: 2.0 * h,
+        })
+    };
+    let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
+    gated
+        .par_iter()
+        .filter_map(|&(a, i)| {
+            let r = resolve_floored_step(floor[i], |fl, at_tight| {
+                let h = fd_step(eps, x_hat[i], fl);
+                let plus = FdPert::Single { i, di: h };
+                let minus = FdPert::Single { i, di: -h };
+                if at_tight {
+                    let f0t = f0_tight?;
+                    let (fp, fm) = rayon::join(
+                        || {
+                            crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(
+                                fit,
+                                || eval_fd_point(x_hat, plus, &tight),
+                            )
+                        },
+                        || {
+                            crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(
+                                fit,
+                                || eval_fd_point(x_hat, minus, &tight),
+                            )
+                        },
+                    );
+                    second(fp?, f0t, fm?, h)
+                } else {
+                    let (fp, fm) = if fl == floor[i] {
+                        (diag[2 * a], diag[2 * a + 1])
+                    } else {
+                        rayon::join(
+                            || {
+                                crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(
+                                    fit,
+                                    || eval_fd_point(x_hat, plus, ofv),
+                                )
+                            },
+                            || {
+                                crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(
+                                    fit,
+                                    || eval_fd_point(x_hat, minus, ofv),
+                                )
+                            },
+                        )
+                    };
+                    second(fp, f0, fm, h)
+                }
+            })?;
+            Some((i, r))
+        })
+        .collect()
 }
 
 /// Test-only record of every [`reconverge_population`] call (#1935), written by
@@ -1860,7 +2007,11 @@ fn map_subjects<T: Send, F: Fn(usize) -> T + Sync>(
     if parallel {
         #[cfg(test)]
         reconverge_log::record(pop, true);
-        (0..n).into_par_iter().map(&f).collect()
+        let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
+        (0..n)
+            .into_par_iter()
+            .map(|i| crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(fit, || f(i)))
+            .collect()
     } else {
         #[cfg(test)]
         reconverge_log::record(pop, false);
@@ -1921,7 +2072,7 @@ pub(super) fn reconverge_population(
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
 ) {
-    let (params, ehs, hms, kaps, _) = reconverge_population_checked(
+    let (params, ehs, hms, kaps, _, _) = reconverge_population_checked(
         xv,
         model,
         pop,
@@ -1934,7 +2085,10 @@ pub(super) fn reconverge_population(
     (params, ehs, hms, kaps)
 }
 
-/// [`reconverge_population`], and whether every subject's inner solve converged.
+/// [`reconverge_population`], whether every subject's inner solve converged, and whether every
+/// one is resolved in the sense of
+/// [`ebe_resolved`](crate::estimation::fd_resolution::ebe_resolved) — converged without a
+/// Nelder–Mead fallback or polish, which the FD resolution gate's tight twin requires (#2406).
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn reconverge_population_checked(
     xv: &[f64],
@@ -1950,6 +2104,7 @@ fn reconverge_population_checked(
     Vec<DVector<f64>>,
     Vec<DMatrix<f64>>,
     Vec<Vec<DVector<f64>>>,
+    bool,
     bool,
 ) {
     let params = unpack_params(xv, template);
@@ -1972,13 +2127,15 @@ fn reconverge_population_checked(
     let mut hms = Vec::with_capacity(n);
     let mut kaps = Vec::with_capacity(n);
     let mut all_converged = true;
+    let mut all_resolved = true;
     for ebe in ebes {
         all_converged &= ebe.converged;
+        all_resolved &= crate::estimation::fd_resolution::ebe_resolved(&ebe);
         ehs.push(ebe.eta);
         hms.push(ebe.h_matrix);
         kaps.push(ebe.kappas);
     }
-    (params, ehs, hms, kaps, all_converged)
+    (params, ehs, hms, kaps, all_converged, all_resolved)
 }
 
 /// [`compute_covariance_for`] for an estimate the step's own objective produced — the form
@@ -2059,7 +2216,7 @@ pub(crate) fn compute_covariance_for(
         return at_fit_tolerance(false).expect("a step that may take any route always completes");
     };
     if needs_r(options.covariance_method)
-        && predicted_r_route(model, population, options, template.mixture.is_some())
+        && predicted_r_route(model, options, template.mixture.is_some())
             == PredictedRRoute::Analytic
     {
         if let Some(out) = at_fit_tolerance(true) {
@@ -2230,9 +2387,9 @@ fn covariance_step(
     // apply the penalty, so their SEs are the curvature of what they fitted).
     let nn_reg = cov_nn_regularizer(fit_method, model, population, options);
 
-    // `h_matrices` (the H from the fit) is read only by `S`
-    // (`assemble_score_cross_product`): `R` reconverges the EBEs at every perturbed
-    // point and recomputes H there.
+    // Neither `S` nor `R` reads the fit's `h_matrices`: `S` takes each subject's total
+    // derivative (#2974), and `R` reconverges the EBEs at every perturbed point and recomputes
+    // H there.
 
     let cov_inner_tol = options.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
 
@@ -2431,8 +2588,7 @@ fn covariance_step(
     // whose placeholder rows are then never trusted.
     let score_cross_product = || {
         let s = assemble_score_cross_product(
-            x_hat, template, model, population, eta_hats, h_matrices, kappas, &bounds, options,
-            &free_idx,
+            x_hat, template, model, population, eta_hats, kappas, &bounds, options, &free_idx,
         );
         (!crate::cancel::is_cancelled(&options.cancel)).then_some(s)
     };
@@ -2671,8 +2827,48 @@ fn covariance_step(
             FdScope::Subset { pop, warm } => subset_cov_ofv(x_hat, pop, warm, true),
         };
 
-        let fd_floor = fd_step_floors(template, &model.default_params);
-        let stencil = fd_ofv_hessian(
+        // The resolution gate's tight twin (#2406): `fd_ofv` re-solved at `cov_inner_tol`/100,
+        // `None` when any subject's solve is unresolved. Built on the same subject set and warm
+        // starts as `fd_ofv`, so it differs from it only in the tolerance.
+        let tight_inner_tol = crate::estimation::fd_resolution::tight_tol(cov_inner_tol);
+        let tight_mixture_options = FitOptions {
+            inner_tol: tight_inner_tol,
+            ..options.clone()
+        };
+        let subset_tight_ofv = |xv: &[f64], pop: &Population, warm: &[DVector<f64>]| {
+            let (params, ehs, hms, kaps, _, resolved) = reconverge_population_checked(
+                xv,
+                model,
+                pop,
+                template,
+                warm,
+                options,
+                tight_inner_tol,
+                false,
+            );
+            resolved.then(|| 2.0 * pop_nll_opts(model, pop, &params, &ehs, &hms, &kaps, options))
+        };
+        let tight_ofv = |xv: &[f64]| -> Option<f64> {
+            #[cfg(test)]
+            fd_evals.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match scope {
+                FdScope::Whole if is_mixture => {
+                    let m = crate::estimation::mixture::mixture_ofv(
+                        model,
+                        population,
+                        &unpack_params(xv, template),
+                        &tight_mixture_options,
+                        None,
+                    );
+                    crate::estimation::fd_resolution::inner_resolved(&m.ebe_stats).then_some(m.ofv)
+                }
+                FdScope::Whole => subset_tight_ofv(xv, population, &warm),
+                FdScope::Subset { pop, warm } => subset_tight_ofv(xv, pop, warm),
+            }
+        };
+
+        let fd_floor = fd_step_floors(template, model);
+        let stencil = fd_ofv_hessian_gated(
             n,
             x_hat,
             &free_idx,
@@ -2680,6 +2876,7 @@ fn covariance_step(
             initial_eps,
             f0_fd,
             &fd_ofv,
+            Some(&tight_ofv),
             options,
         );
         // Read here, on the thread the stencil ran on: inside a tightened step it is the
@@ -2693,7 +2890,7 @@ fn covariance_step(
             None => {
                 return Some(CovarianceStepResult::Unusable(
                     COV_CANCELLED_MSG.to_string(),
-                ))
+                ));
             }
         };
         // `+=`, not `copy_from`: on the salvage route `hess` already holds the analytic terms.
@@ -2926,7 +3123,7 @@ fn covariance_step(
                 None => {
                     return Some(CovarianceStepResult::Unusable(
                         COV_CANCELLED_MSG.to_string(),
-                    ))
+                    ));
                 }
             },
         };
@@ -2942,7 +3139,7 @@ fn covariance_step(
                         4.0,
                         &unit_coords,
                     ),
-                })
+                });
             }
             Err(reason) => return Some(CovarianceStepResult::Unusable(reason)),
         };
@@ -3132,7 +3329,7 @@ fn covariance_step(
         // on a fit that had no complaint to make. On the hybrid route it is the *salvaged*
         // subjects' clauses it names — the same walk, since every other subject passes it.
         let declines = if source.emits_fd_guidance() {
-            analytic_cov_declines(model, population, options, is_mixture)
+            analytic_cov_declines(model, options, is_mixture)
         } else {
             Vec::new()
         };
@@ -3880,9 +4077,7 @@ pub(crate) fn routed_covariance_method(
 /// no note is due — the step is off, `n ≤ 30`, `R` is expected on the analytic assembly for
 /// every subject (`route`, see [`predicted_r_route`]; #2054), or the estimator the step will
 /// actually run (after [`scale_routed_covariance_method`]) builds no `R` — else `Some` of
-/// `fd_r_objective_evals`, itself `None` on overflow (#1803). On
-/// [`PredictedRRoute::Salvage`] the count is the same `2·n²`, but each evaluation covers only
-/// the declined subjects; [`pre_fit_covariance_cost_note`] says so. Before #1803 the note fired
+/// `fd_r_objective_evals`, itself `None` on overflow (#1803). Before #1803 the note fired
 /// under `covariance_method = s` too, and quoted `n²`; before #2054 it ignored the route.
 pub(crate) fn pre_fit_covariance_cost(
     n: usize,
@@ -3898,36 +4093,22 @@ pub(crate) fn pre_fit_covariance_cost(
 }
 
 /// The pre-fit cost note for a [`pre_fit_covariance_cost`] result at `n` free coordinates, or
-/// `None` when no note is due. On overflow it still warns, without the (wrapped) number. On
-/// [`PredictedRRoute::Salvage`] it names the subject subset the stencil is expected to cover.
+/// `None` when no note is due. On overflow it still warns, without the (wrapped) number.
 /// Worded as an expectation: a subject the walk predicts in scope can still bail at run time.
 pub(crate) fn pre_fit_covariance_cost_note(
     n: usize,
     cost: Option<Option<usize>>,
-    route: PredictedRRoute,
 ) -> Option<String> {
     let count = match cost? {
         Some(n_evals) => n_evals.to_string(),
         None => "2n²".to_string(),
-    };
-    let scope = match route {
-        PredictedRRoute::Salvage {
-            declined,
-            n_subjects,
-        } => format!(
-            " over {declined} of {n_subjects} subjects (finite-difference Hessian for the \
-             subjects outside the analytic R-matrix; the rest are analytic)"
-        ),
-        PredictedRRoute::Analytic | PredictedRRoute::Stencil => {
-            " (finite-difference Hessian)".to_string()
-        }
     };
     let tail = match cost? {
         Some(_) => "This may take several minutes on complex models.",
         None => "Estimate exceeds usize range; expect this to be very slow.",
     };
     Some(format!(
-        "Covariance step: {n} parameters → {count} OFV evaluations expected{scope}. {tail}"
+        "Covariance step: {n} parameters → {count} OFV evaluations expected (finite-difference Hessian). {tail}"
     ))
 }
 
@@ -3965,7 +4146,7 @@ pub(crate) fn run_covariance_step_inner(
         model.free_packed_dim(),
         options,
         !model.priors.is_empty(),
-        analytic_r_expected(model, population, options, template.mixture.is_some()),
+        analytic_r_expected(model, options, template.mixture.is_some()),
     );
     if let Some(w) = scale_warning {
         warnings.push(w);
@@ -4150,6 +4331,10 @@ mod salvage_tests;
 #[path = "covariance_stationarity_tests.rs"]
 mod stationarity_tests;
 
+#[cfg(test)]
+#[path = "covariance_score_tests.rs"]
+mod score_tests;
+
 #[cfg(all(test, feature = "nn"))]
 #[path = "covariance_nn_reg_tests.rs"]
 mod nn_reg_tests;
@@ -4167,13 +4352,14 @@ mod tests {
     use crate::types::{CovarianceMethod, COV_HESSIAN_MAX_DIM};
     use nalgebra::DMatrix;
 
-    /// Copilot on #2093: a nine-effect Laplace fit with `analytic_cov_hessian = false` is
-    /// told about the width clause too, so the remedy sentence (gated on the flag clearing
-    /// *every* clause) no longer promises the analytic route. Three effects, the flag alone.
+    /// A nine-effect Laplace fit with `analytic_cov_hessian = false` is told about the flag
+    /// alone: no subject is too wide for the exact R-matrix (it once declined past 8 effects
+    /// under Laplace's exact anchor, past 24 otherwise), so the remedy sentence — gated on the
+    /// flag clearing *every* clause — promises the analytic route at any width.
     #[test]
-    fn analytic_cov_declines_names_a_subject_too_wide_for_the_exact_anchor() {
+    fn analytic_cov_declines_names_no_width_clause_at_any_width() {
         use crate::estimation::cov_diagnostics::CovScopeDecline;
-        use crate::types::{EstimationMethod, FitOptions, Population, Subject};
+        use crate::types::{EstimationMethod, FitOptions};
         let model = |n_extra: usize| {
             let extra: String = (0..n_extra)
                 .map(|k| format!("  omega ETA_X{k} ~ 0.02\n"))
@@ -4190,34 +4376,17 @@ mod tests {
             ))
             .unwrap()
         };
-        let population = Population {
-            subjects: vec![Subject::default()],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
         let options = FitOptions {
             method: EstimationMethod::Laplace,
             analytic_cov_hessian: false,
             ..FitOptions::default()
         };
-        for (n_extra, want) in [
-            (0, vec![CovScopeDecline::Disabled]),
-            (
-                6,
-                vec![
-                    CovScopeDecline::Disabled,
-                    CovScopeDecline::TooManyRandomEffects,
-                ],
-            ),
-        ] {
+        for n_extra in [0, 6, 60] {
             let m = model(n_extra);
             assert_eq!(m.n_eta, 3 + n_extra);
             assert_eq!(
-                super::analytic_cov_declines(&m, &population, &options, false),
-                want,
+                super::analytic_cov_declines(&m, &options, false),
+                vec![CovScopeDecline::Disabled],
                 "{} η",
                 m.n_eta
             );
@@ -4232,31 +4401,18 @@ mod tests {
     #[test]
     fn the_scope_walk_reports_every_clause_and_the_routing_predicate_agrees() {
         use crate::estimation::cov_diagnostics::CovScopeDecline;
-        use crate::types::{FitOptions, GradientMethod, Population, Subject};
+        use crate::types::{FitOptions, GradientMethod};
         let src = "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
                    omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n\
                    CL = TVCL * exp(ETA_CL)\n  V = TVV\n[structural_model]\n\
                    pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n";
-        let population = Population {
-            subjects: vec![Subject::default()],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
         let in_scope = crate::parser::model_parser::parse_model_string(src).unwrap();
         let on = FitOptions::default();
         assert_eq!(
-            super::analytic_cov_declines(&in_scope, &population, &on, false),
+            super::analytic_cov_declines(&in_scope, &on, false),
             vec![CovScopeDecline::PerSubjectBail]
         );
-        assert!(super::analytic_r_expected(
-            &in_scope,
-            &population,
-            &on,
-            false
-        ));
+        assert!(super::analytic_r_expected(&in_scope, &on, false));
 
         let mut fd = crate::parser::model_parser::parse_model_string(src).unwrap();
         fd.gradient_method = GradientMethod::Fd;
@@ -4267,7 +4423,7 @@ mod tests {
             ..FitOptions::default()
         };
         assert_eq!(
-            super::analytic_cov_declines(&fd, &population, &off, true),
+            super::analytic_cov_declines(&fd, &off, true),
             vec![
                 CovScopeDecline::Disabled,
                 CovScopeDecline::Mixture,
@@ -4275,14 +4431,14 @@ mod tests {
             ],
             "every clause, in gate order"
         );
-        assert!(!super::analytic_r_expected(&fd, &population, &off, true));
+        assert!(!super::analytic_r_expected(&fd, &off, true));
         // Each clause alone moves the predicate.
         assert!(
-            !super::analytic_r_expected(&fd, &population, &on, false),
+            !super::analytic_r_expected(&fd, &on, false),
             "gradient = fd"
         );
         assert!(
-            !super::analytic_r_expected(&in_scope, &population, &off, false),
+            !super::analytic_r_expected(&in_scope, &off, false),
             "disabled"
         );
     }
@@ -4293,7 +4449,7 @@ mod tests {
     #[test]
     fn the_scope_walk_reads_the_calls_gradient_fd() {
         use crate::estimation::cov_diagnostics::CovScopeDecline;
-        use crate::types::{FitOptions, GradientMethod, Population, Subject};
+        use crate::types::{FitOptions, GradientMethod};
         let model = crate::parser::model_parser::parse_model_string(
             "[parameters]\n  theta TVCL(0.2, 0.001, 10.0)\n  theta TVV(10.0, 0.1, 500.0)\n\
              omega ETA_CL ~ 0.09\n  sigma PROP_ERR ~ 0.04\n[individual_parameters]\n\
@@ -4302,17 +4458,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(model.gradient_method, GradientMethod::Auto);
-        let population = Population {
-            subjects: vec![Subject::default()],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
         let opts = FitOptions::default();
         let has_fd = || {
-            super::analytic_cov_declines(&model, &population, &opts, false)
+            super::analytic_cov_declines(&model, &opts, false)
                 .contains(&CovScopeDecline::GradientFd)
         };
         assert!(!has_fd(), "control: unarmed, no gradient = fd clause");
@@ -4322,12 +4470,7 @@ mod tests {
                 has_fd(),
                 "fit's guard: the call's gradient = fd declines the R-matrix"
             );
-            assert!(!super::analytic_r_expected(
-                &model,
-                &population,
-                &opts,
-                false
-            ));
+            assert!(!super::analytic_r_expected(&model, &opts, false));
         }
         let fd_opts = FitOptions {
             gradient_method: GradientMethod::Fd,
@@ -4346,7 +4489,7 @@ mod tests {
     /// a mixture and on `analytic_cov_hessian`.
     #[test]
     fn the_analytic_r_matrix_is_not_rerouted_or_costed_as_a_stencil() {
-        use crate::types::{FitOptions, Population, Subject};
+        use crate::types::FitOptions;
         let n = COV_HESSIAN_MAX_DIM + 1;
         let defaulted = FitOptions {
             run_covariance_step: true,
@@ -4381,24 +4524,11 @@ mod tests {
              pk one_cpt_iv(cl=CL, v=V)\n[error_model]\n  DV ~ proportional(PROP_ERR)\n",
         )
         .unwrap();
-        let population = Population {
-            subjects: vec![Subject::default()],
-            covariate_names: Vec::new(),
-            dv_column: "DV".into(),
-            input_columns: Vec::new(),
-            exclusions: None,
-            warnings: Vec::new(),
-        };
-        assert!(super::analytic_r_expected(
-            &m,
-            &population,
-            &defaulted,
-            false
-        ));
+        assert!(super::analytic_r_expected(&m, &defaulted, false));
         // A FOCE/FOCEI mixture has its own exact R (`mixture::mixture_cov_hessian`); under
         // the quadrature it takes the stencil.
         assert!(
-            super::analytic_r_expected(&m, &population, &defaulted, true),
+            super::analytic_r_expected(&m, &defaulted, true),
             "a FOCE/FOCEI mixture is analytic"
         );
         let laplace = FitOptions {
@@ -4406,19 +4536,14 @@ mod tests {
             ..defaulted.clone()
         };
         assert!(
-            !super::analytic_r_expected(&m, &population, &laplace, true),
+            !super::analytic_r_expected(&m, &laplace, true),
             "a Laplace mixture takes the stencil"
         );
         let disabled = FitOptions {
             analytic_cov_hessian: false,
             ..defaulted
         };
-        assert!(!super::analytic_r_expected(
-            &m,
-            &population,
-            &disabled,
-            false
-        ));
+        assert!(!super::analytic_r_expected(&m, &disabled, false));
     }
 
     // ── #520 C1: the magnitudes the severity grade is made from ──────────────
@@ -5579,44 +5704,24 @@ mod tests {
 
     /// #1803 / #2054: the note's text, pinned whole on every arm so deleting any sentence
     /// reddens it, and still classified as the `covariance_step` Info it was before the count
-    /// changed. The salvage arm names the declined subset; the stencil arm does not.
+    /// changed.
     #[test]
     fn the_pre_fit_cost_note_quotes_the_r_count_or_says_it_overflowed() {
         use super::pre_fit_covariance_cost_note as note;
-        use super::PredictedRRoute;
         use crate::types::{classify_warning, WarningCode, WarningSeverity};
-        let salvage = PredictedRRoute::Salvage {
-            declined: 2,
-            n_subjects: 20,
-        };
-        let counted = note(31, Some(Some(1922)), PredictedRRoute::Stencil).expect("a note is due");
+        let counted = note(31, Some(Some(1922))).expect("a note is due");
         assert_eq!(
             counted,
             "Covariance step: 31 parameters → 1922 OFV evaluations expected (finite-difference \
              Hessian). This may take several minutes on complex models."
         );
-        let overflowed = note(31, Some(None), PredictedRRoute::Stencil).expect("a note is due");
+        let overflowed = note(31, Some(None)).expect("a note is due");
         assert_eq!(
             overflowed,
             "Covariance step: 31 parameters → 2n² OFV evaluations expected (finite-difference \
              Hessian). Estimate exceeds usize range; expect this to be very slow."
         );
-        let salvaged = note(31, Some(Some(1922)), salvage).expect("a note is due");
-        assert_eq!(
-            salvaged,
-            "Covariance step: 31 parameters → 1922 OFV evaluations expected over 2 of 20 \
-             subjects (finite-difference Hessian for the subjects outside the analytic \
-             R-matrix; the rest are analytic). This may take several minutes on complex models."
-        );
-        let salvaged_overflow = note(31, Some(None), salvage).expect("a note is due");
-        assert_eq!(
-            salvaged_overflow,
-            "Covariance step: 31 parameters → 2n² OFV evaluations expected over 2 of 20 \
-             subjects (finite-difference Hessian for the subjects outside the analytic \
-             R-matrix; the rest are analytic). Estimate exceeds usize range; expect this to be \
-             very slow."
-        );
-        for msg in [&counted, &overflowed, &salvaged, &salvaged_overflow] {
+        for msg in [&counted, &overflowed] {
             let entry = classify_warning(msg);
             assert_eq!(
                 (entry.severity, entry.category),
@@ -5626,7 +5731,7 @@ mod tests {
             // ferx-r's `ferx_get_warnings()` advice arm matches this exact token.
             assert!(msg.contains("OFV evaluations"), "{msg}");
         }
-        assert_eq!(note(31, None, salvage), None, "no cost, no note");
+        assert_eq!(note(31, None), None, "no cost, no note");
     }
 
     /// A variance mixture (per-class Ω/Σ overrides) so the packed vector carries
@@ -6726,13 +6831,13 @@ mod tests {
         let out = success(out, "focei s");
         assert_eq!((out.method, evals), (CovarianceMethod::CrossProduct, 0));
 
-        let (x, p, etas, hs) = inputs_at_init(&model, &pop, &opts);
+        let (x, p, etas, _) = inputs_at_init(&model, &pop, &opts);
         let kappas = vec![Vec::new(); pop.subjects.len()];
         let super::PackedStart { bounds, fixed, .. } = super::pack_with_bounds(&p);
         let free_idx: Vec<usize> = (0..x.len()).filter(|&i| !fixed[i]).collect();
         assert_eq!(free_idx.len(), 1, "fixture: ω² alone is free");
         let s = super::assemble_score_cross_product(
-            &x, &p, &model, &pop, &etas, &hs, &kappas, &bounds, &opts, &free_idx,
+            &x, &p, &model, &pop, &etas, &kappas, &bounds, &opts, &free_idx,
         )
         .expect("S");
         let want = super::embed_free(
@@ -7106,6 +7211,224 @@ mod tests {
         assert!(legacy.hess[(0, 0)] > 1e19, "H00 = {}", legacy.hess[(0, 0)]);
     }
 
+    /// The R-matrix fixtures of the #2406 gate: `f = 3x₀² + 0.2x₀x₁ + 0.5x₁² + x₀³x₁` at
+    /// `x̂ = (0.0077, 7.7)`, coordinate 0 floored at `|θ₀|`. The cubic makes the central
+    /// mixed difference read `0.2 + 3x₀² + h₀²`, so an off-diagonal pair shows which step it
+    /// was taken at.
+    fn gate_fixture(x: &[f64]) -> f64 {
+        3.0 * x[0] * x[0] + 0.2 * x[0] * x[1] + 0.5 * x[1] * x[1] + x[0].powi(3) * x[1]
+    }
+
+    fn hess_bits(s: &super::FdStencil) -> Vec<u64> {
+        s.hess.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// #2406: the gate is entered only for a coordinate whose floor is below 1. With every
+    /// floor 1 the gated stencil is the ungated one bit for bit and the twin is never called;
+    /// with coordinate 0 floored and a twin that agrees, it is accepted at the first step, from
+    /// three twin objectives (its centre and two probes): its diagonal is the twin's second
+    /// difference at the #2187 step and every other entry is the ungated stencil's bit for bit.
+    /// The twin's curvature in `x₀` is the objective's plus 1e-6, well inside `RESOLVED_REL`
+    /// but a different number, so the diagonal shows which side it came from. Coordinate 0 sits at 0.077 here, where its
+    /// second difference clears the noise guard at the first step.
+    #[test]
+    fn the_hessian_gate_leaves_floor_one_and_resolved_coordinates_alone() {
+        use super::{fd_ofv_hessian, fd_ofv_hessian_gated, fd_step};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.077f64, 7.7];
+        let f0 = gate_fixture(&x_hat);
+        let eps = 1e-2;
+        let panics = |_: &[f64]| -> Option<f64> { panic!("a floor-1 coordinate reached the gate") };
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &[1.0; 2],
+            eps,
+            f0,
+            &gate_fixture,
+            Some(&panics),
+            &opts,
+        )
+        .unwrap();
+        let ungated =
+            fd_ofv_hessian(2, &x_hat, &[0, 1], &[1.0; 2], eps, f0, &gate_fixture, &opts).unwrap();
+        assert_eq!(hess_bits(&gated), hess_bits(&ungated));
+
+        let floor = [0.077, 1.0];
+        let calls = AtomicUsize::new(0);
+        let shifted = |x: &[f64]| gate_fixture(x) + 0.25 + 5e-7 * x[0] * x[0];
+        let twin = |x: &[f64]| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Some(shifted(x))
+        };
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &floor,
+            eps,
+            f0,
+            &gate_fixture,
+            Some(&twin),
+            &opts,
+        )
+        .unwrap();
+        let ungated =
+            fd_ofv_hessian(2, &x_hat, &[0, 1], &floor, eps, f0, &gate_fixture, &opts).unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        let h = fd_step(eps, x_hat[0], floor[0]);
+        let twin_diag = (shifted(&[x_hat[0] + h, x_hat[1]]) - 2.0 * shifted(&x_hat)
+            + shifted(&[x_hat[0] - h, x_hat[1]]))
+            / (h * h);
+        assert_eq!(gated.hess[(0, 0)].to_bits(), twin_diag.to_bits());
+        assert_ne!(
+            twin_diag.to_bits(),
+            ungated.hess[(0, 0)].to_bits(),
+            "fixture: the twin's diagonal is distinguishable from the stencil's"
+        );
+        assert!(
+            (gated.hess[(0, 0)] - ungated.hess[(0, 0)]).abs() < 1e-3,
+            "{} vs {}",
+            gated.hess[(0, 0)],
+            ungated.hess[(0, 0)]
+        );
+        for ij in [(0, 1), (1, 0), (1, 1)] {
+            assert_eq!(
+                gated.hess[ij].to_bits(),
+                ungated.hess[ij].to_bits(),
+                "H{ij:?}"
+            );
+        }
+    }
+
+    /// #2406 review r1, row 3: a floored coordinate whose grown step reaches the `1e20` wall.
+    /// The twin's curvature differs by 2e-4 relative, so the gate grows; past `|Δx₀| = 5e-3`
+    /// every point, τ and τ/100, is the wall, which floor 0.77 (`h ≈ 7.7e-3`) reaches. Two
+    /// walled second differences agree to an ulp and their numerator clears the noise guard,
+    /// so the gate accepted a diagonal of ~2e20/h²; read as missing, the walled floors give
+    /// nothing, and the diagonal is the twin's at floor 0. Both sides of the gate: the wall is
+    /// reached, and the diagonal is the fixture's curvature, not the wall's.
+    #[test]
+    fn the_hessian_gate_reads_a_walled_probe_as_missing() {
+        use super::fd_ofv_hessian_gated;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.077f64, 7.7];
+        let walls = AtomicUsize::new(0);
+        let walled = |f: f64, x: &[f64]| {
+            if (x[0] - x_hat[0]).abs() > 5e-3 {
+                walls.fetch_add(1, Ordering::Relaxed);
+                crate::stats::likelihood::SUBJECT_SENTINEL_NLL
+            } else {
+                f
+            }
+        };
+        let ofv = |x: &[f64]| walled(gate_fixture(x), x);
+        let twin = |x: &[f64]| Some(walled(gate_fixture(x) + 1e-3 * x[0] * x[0], x));
+        let f0 = gate_fixture(&x_hat);
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &[0.077, 1.0],
+            1e-2,
+            f0,
+            &ofv,
+            Some(&twin),
+            &opts,
+        )
+        .unwrap();
+        assert!(
+            walls.load(Ordering::Relaxed) > 0,
+            "fixture: the grown step reaches the wall"
+        );
+        // f₀₀ = 6 + 6·x₀·x₁, plus the twin's 2e-3.
+        let want = 6.0 + 6.0 * x_hat[0] * x_hat[1] + 2e-3;
+        let got = gated.hess[(0, 0)];
+        assert!(
+            got.is_finite() && (got - want).abs() < 1e-3,
+            "H00 {got:e} vs {want}"
+        );
+        // The off-diagonal pair is stepped at the floor the gate settled on, floor 0, where no
+        // point is the wall's: stepped at a walled floor it would be ~1e20. f₀₁ = 0.2 + 3·x₀².
+        let want01 = 0.2 + 3.0 * x_hat[0] * x_hat[0];
+        let got01 = gated.hess[(0, 1)];
+        assert!(
+            got01.is_finite() && (got01 - want01).abs() < 1e-2,
+            "H01 {got01:e} vs {want01}"
+        );
+    }
+
+    /// #2406: a floored coordinate whose τ objective *stalls* near `x̂` — modelled as
+    /// `−min(d₀², s²)` with `s = 1e-5`, which biases its second difference by `−2s²/h²` once
+    /// `h > s` — is grown until the exact τ/100 twin agrees: a bias of 1.4e-3 relative at the
+    /// #2187 step `h = 1.54e-4`, 4.6e-5 at floor 0.077, and 5.5e-7 at floor 0.77, the first
+    /// inside `RESOLVED_REL`. Its diagonal is the twin's there, and every other entry is the
+    /// ungated stencil's **at the grown floor**, bit for bit — so the pair it enters was taken
+    /// at the grown step, which the cubic's `h₀²` makes visible.
+    #[test]
+    fn the_hessian_gate_grows_a_stalled_diagonal_and_takes_its_pairs_there() {
+        use super::{fd_ofv_hessian, fd_ofv_hessian_gated, fd_step};
+        use crate::estimation::fd_resolution::{RESOLVED_REL, STEP_GROWTH};
+
+        let opts = crate::types::FitOptions::default();
+        let x_hat = [0.0077f64, 7.7];
+        let s = 1e-5;
+        let stalled = |x: &[f64]| gate_fixture(x) - (x[0] - x_hat[0]).powi(2).min(s * s);
+        let twin = |x: &[f64]| Some(gate_fixture(x));
+        let f0 = stalled(&x_hat);
+        let eps = 1e-2;
+        let floor = [0.0077, 1.0];
+        let want = 6.0 + 6.0 * x_hat[0] * x_hat[1];
+
+        let gated = fd_ofv_hessian_gated(
+            2,
+            &x_hat,
+            &[0, 1],
+            &floor,
+            eps,
+            f0,
+            &stalled,
+            Some(&twin),
+            &opts,
+        )
+        .unwrap();
+        let ungated = fd_ofv_hessian(2, &x_hat, &[0, 1], &floor, eps, f0, &stalled, &opts).unwrap();
+        let rel = |h: f64| (h - want).abs() / want;
+        let (rel_gated, rel_ungated) = (rel(gated.hess[(0, 0)]), rel(ungated.hess[(0, 0)]));
+        eprintln!("MEASURE #2406 stalled H00: gated {rel_gated:e}, ungated {rel_ungated:e}");
+        assert!(
+            rel_ungated > 1e-3,
+            "fixture: the τ objective stalls ({rel_ungated:e})"
+        );
+        assert!(rel_gated < RESOLVED_REL, "{rel_gated:e}");
+
+        let grown = [floor[0] * STEP_GROWTH * STEP_GROWTH, 1.0];
+        let h = fd_step(eps, x_hat[0], grown[0]);
+        let twin_diag = (gate_fixture(&[x_hat[0] + h, x_hat[1]]) - 2.0 * gate_fixture(&x_hat)
+            + gate_fixture(&[x_hat[0] - h, x_hat[1]]))
+            / (h * h);
+        assert_eq!(gated.hess[(0, 0)].to_bits(), twin_diag.to_bits());
+        let at_grown =
+            fd_ofv_hessian(2, &x_hat, &[0, 1], &grown, eps, f0, &stalled, &opts).unwrap();
+        for ij in [(0, 1), (1, 0), (1, 1)] {
+            assert_eq!(
+                gated.hess[ij].to_bits(),
+                at_grown.hess[ij].to_bits(),
+                "H{ij:?}"
+            );
+        }
+        assert_ne!(
+            at_grown.hess[(0, 1)],
+            ungated.hess[(0, 1)],
+            "fixture: the pair reads its step"
+        );
+    }
+
     /// #1935: `map_subjects` with `parallel = true` really re-solves subjects concurrently,
     /// and with `false` really does not — both sides of the flag in one test, so a branch
     /// stuck on either arm fails it. Combined with the production test that reads the log
@@ -7232,8 +7555,12 @@ mod tests {
         let (etas, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
             &model, &pop, p, 200, 1e-8, None, None, 0, 0,
         );
+        // `cov_inner_tol` is set so that neither it nor the #2406 gate's twin, at a hundredth
+        // of it, is the stencil tolerance: at an inner tolerance of 1e-5 the twin's 1e-7 *is*
+        // `STENCIL_INNER_TOL`, and a twin solve would read as the defect below.
         let opts = FitOptions {
             analytic_cov_hessian: false,
+            cov_inner_tol: Some(1e-6),
             ..opts
         };
         let x = crate::estimation::parameterization::pack_params(p);
@@ -7249,17 +7576,27 @@ mod tests {
         );
         assert_starts_at_modes(label, &rec, |_| true, &pop, &etas, &kappas);
         // The base reconvergence and every stencil point keep `cov_inner_tol`, not the FD
-        // gradients' stencil tolerance (#2261), so a user's `cov_inner_tol` is what runs.
+        // gradients' stencil tolerance (#2261), so a user's `cov_inner_tol` is what runs. A
+        // floored θ's twin re-solves at `tight_tol(cov_inner_tol)` (#2406).
         let cov_tol = opts.effective_cov_inner_tol(model.uses_closed_form_ltbs_inner());
+        let twin_tol = crate::estimation::fd_resolution::tight_tol(cov_tol);
+        let stencil = crate::estimation::inner_optimizer::STENCIL_INNER_TOL;
         assert!(
-            cov_tol > crate::estimation::inner_optimizer::STENCIL_INNER_TOL,
-            "{label}: fixture: cov_inner_tol must differ from the stencil tolerance"
+            cov_tol > stencil && twin_tol.to_bits() != stencil.to_bits(),
+            "{label}: fixture: cov_inner_tol and its twin must differ from the stencil tolerance"
         );
         assert!(
             rec.solve_tols
                 .iter()
-                .all(|(_, t)| t.to_bits() == cov_tol.to_bits()),
-            "{label}: the covariance step re-solved at {:?}, not cov_inner_tol {cov_tol:e}",
+                .any(|(_, t)| t.to_bits() == cov_tol.to_bits()),
+            "{label}: no solve of the covariance step ran at cov_inner_tol {cov_tol:e}"
+        );
+        assert!(
+            rec.solve_tols.iter().all(|(_, t)| [cov_tol, twin_tol]
+                .iter()
+                .any(|w| t.to_bits() == w.to_bits())),
+            "{label}: the covariance step re-solved at {:?}, not cov_inner_tol {cov_tol:e} \
+             (or its twin's {twin_tol:e})",
             rec.solve_tols
                 .iter()
                 .map(|(_, t)| format!("{t:e}"))
@@ -7313,13 +7650,13 @@ mod tests {
             .filter(|(_, f)| !**f)
             .map(|(i, _)| i)
             .collect();
-        let (etas, hms, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
+        let (etas, _, _, kappas) = crate::estimation::inner_optimizer::run_inner_loop_warm(
             &model, &pop, p, 200, 1e-8, None, None, 0, 0,
         );
         let rec = on_one_thread(|| {
             record_inner_solves(|| {
                 super::assemble_score_cross_product(
-                    &x, p, &model, &pop, &etas, &hms, &kappas, &bounds, &opts, &free,
+                    &x, p, &model, &pop, &etas, &kappas, &bounds, &opts, &free,
                 )
                 .expect("the S matrix")
             })

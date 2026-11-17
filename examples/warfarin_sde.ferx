@@ -13,10 +13,8 @@
 # covariance: V_total = P[central] + sigma^2(PRED).
 # DIFF_CENTRAL is estimated on the variance scale (not SD).
 #
-# Note: the ODE+EKF path has no analytic-sensitivity provider, so gradients
-# are computed by finite differences (gradient_method = fd, set below). Each
-# ODE+EKF evaluation is therefore significantly slower than an equivalent
-# analytical PK model.
+# The FOCE/FOCEI gradient is exact (the filter's process-noise variance is
+# differentiated through the adjoint), as for any other ODE model.
 
 [parameters]
   theta TVCL(0.134, 0.001, 10.0)
@@ -54,4 +52,3 @@
   method          = foce
   maxiter         = 300
   covariance      = true
-  gradient_method = fd

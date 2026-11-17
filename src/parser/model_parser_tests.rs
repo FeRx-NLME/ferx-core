@@ -1,4 +1,5 @@
 use super::*;
+use crate::sens::num::NonRecRead;
 
 // ── ode_template desugaring + error rule (#322 Phase 0b) ─────────────────
 
@@ -3765,8 +3766,8 @@ fn test_parse_threads_auto() {
 #[test]
 fn test_parse_threads_zero_means_auto() {
     // `threads = 0` is treated as "use the engine's default thread count"
-    // (available cores - 1, floored at 1, capped at 8 — #707), matching the
-    // R binding's `threads <= 0` sentinel.
+    // (available cores minus one, at least two where two cores exist, capped
+    // at 8 — #707), matching the R binding's `threads <= 0` sentinel.
     let opts = parse_fit_options(&["threads = 0".to_string()]).unwrap();
     assert_eq!(opts.threads, None);
 }
@@ -5900,17 +5901,30 @@ fn test_parse_fit_options_applies_known_keys() {
 #[test]
 fn test_parse_data_block_path() {
     let (path, map) = parse_data_block(&["path = warfarin.csv".to_string()]).unwrap();
-    assert_eq!(path, "warfarin.csv");
+    assert_eq!(path.as_deref(), Some("warfarin.csv"));
     assert!(map.is_empty());
     // Quoted paths (e.g. containing spaces) are accepted, quotes stripped.
     let (path, _) = parse_data_block(&["path = \"my data.csv\"".to_string()]).unwrap();
-    assert_eq!(path, "my data.csv");
+    assert_eq!(path.as_deref(), Some("my data.csv"));
 }
 
+/// #2914: `path` is optional — a block carrying only column maps parses, with
+/// no path and the maps intact, so a caller-supplied dataset can use them.
 #[test]
-fn test_parse_data_block_missing_path_is_error() {
-    let err = parse_data_block(&[]).unwrap_err();
-    assert!(err.contains("missing required key `path`"), "{err}");
+fn test_parse_data_block_without_path_keeps_column_map() {
+    let (path, map) =
+        parse_data_block(&["TIME = TAFD".to_string(), "DV = CONC".to_string()]).unwrap();
+    assert_eq!(path, None);
+    assert_eq!(
+        map,
+        vec![
+            ("TIME".to_string(), "TAFD".to_string()),
+            ("DV".to_string(), "CONC".to_string())
+        ]
+    );
+    let (path, map) = parse_data_block(&[]).unwrap();
+    assert_eq!(path, None);
+    assert!(map.is_empty());
 }
 
 #[test]
@@ -5938,7 +5952,7 @@ fn test_parse_data_block_column_mapping() {
         "DV = CONC".to_string(),
     ])
     .unwrap();
-    assert_eq!(path, "mydata.csv");
+    assert_eq!(path.as_deref(), Some("mydata.csv"));
     assert_eq!(
         map,
         vec![
@@ -9558,7 +9572,7 @@ fn test_ruv_magnitude_theta_not_flagged_as_unused() {
 }
 
 /// `∂(program)/∂θ` through the live generic evaluator (`RuvMagDerivProgram::eval_g`,
-/// the one the adjoint tape records), seeded with `Dual1` θ leaves.
+/// the one the adjoint tape records), seeded with `Dual2` θ leaves.
 fn deriv_theta_grad<const N: usize>(
     p: &RuvMagDerivProgram,
     theta: &[f64; N],
@@ -9566,8 +9580,8 @@ fn deriv_theta_grad<const N: usize>(
     time: f64,
     tad: f64,
 ) -> Vec<f64> {
-    use crate::sens::dual1::Dual1;
-    let th: Vec<Dual1<N>> = (0..N).map(|m| Dual1::var(theta[m], m)).collect();
+    use crate::sens::dual2::Dual2;
+    let th: Vec<Dual2<N>> = (0..N).map(|m| Dual2::var(theta[m], m)).collect();
     p.eval_g(&th, cov, time, tad)
         .expect("θ count matches")
         .grad
@@ -9575,7 +9589,7 @@ fn deriv_theta_grad<const N: usize>(
 }
 
 /// xhigh review: `MACHEPS` inside a magnitude expression must resolve to
-/// `f64::EPSILON` in the `Dual1` θ-derivative program too (not just the
+/// `f64::EPSILON` in the `Dual2` θ-derivative program too (not just the
 /// value-only runtime closure) — `RuvMagDerivProgram` reserves a var slot
 /// for it now. Regression case: `WT + MACHEPS` guards a denominator; at
 /// `WT = 0.0` the pre-fix bug (`MACHEPS` silently resolving to `0.0` in the
@@ -9707,6 +9721,469 @@ fn test_ruv_magnitude_rejects_covariate_without_covariates_block() {
 "#;
     let err = expect_parse_err(content);
     assert!(err.contains("undeclared covariate"), "got: {err}");
+}
+
+// ── #2915: [error_model] magnitudes read [individual_parameters] names ──────
+
+/// A one-compartment model whose magnitude is `mag` and whose
+/// [individual_parameters] block carries the extra lines `indiv` (#2915).
+/// Declares `WT` so an inlined body may read it.
+fn ruv_indiv_model(indiv: &str, mag: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV_K(1.5, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+{indiv}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional({mag})
+[covariates]
+  WT continuous
+"#
+    )
+}
+
+/// The value the magnitude multiplies its sigma by at each `WT` row.
+fn ruv_indiv_mults(model_str: &str, wts: &[f64]) -> Vec<f64> {
+    let model = parse_full_model(model_str).unwrap().model;
+    let rows: Vec<(usize, f64)> = wts.iter().map(|w| (1, *w)).collect();
+    let s = magnitude_rows_subject(&rows, "WT");
+    let theta = model.default_params.theta.clone();
+    model
+        .ruv_obs_mult(&s, &theta)
+        .unwrap()
+        .into_iter()
+        .map(|r| r[0])
+        .collect()
+}
+
+/// The issue's case: a name assigned in [individual_parameters] is read as its
+/// value, not refused as an undeclared covariate. The literal is not 1, so a
+/// regression that read the name as 0 (undeclared) or dropped the factor (1)
+/// both fail.
+#[test]
+fn ruv_magnitude_reads_a_constant_assigned_in_individual_parameters() {
+    let m = ruv_indiv_mults(&ruv_indiv_model("  ISPK = 3", "PROP_ERR * ISPK"), &[70.0]);
+    assert_eq!(m, vec![3.0]);
+}
+
+/// A θ- and covariate-dependent definition, through a chain of two names: the
+/// runtime value follows the per-observation covariate, and the θ-derivative
+/// program (the adjoint's) sees the inlined θ, so the magnitude counts as
+/// θ-dependent and `∂mult/∂RUV_K = WT/70`.
+#[test]
+fn ruv_magnitude_inlines_a_theta_covariate_chain_from_individual_parameters() {
+    let src = ruv_indiv_model("  WTN = WT / 70\n  ISPK = RUV_K * WTN", "PROP_ERR * ISPK");
+    assert_eq!(ruv_indiv_mults(&src, &[70.0, 35.0]), vec![1.5, 0.75]);
+    let model = parse_full_model(&src).unwrap().model;
+    assert!(model.has_theta_dependent_ruv_magnitude());
+    assert!(model.referenced_covariates.iter().any(|c| c == "WT"));
+    let rm = model.ruv_magnitude.as_ref().expect("magnitude present");
+    let deriv = rm.per_sigma_deriv[0].as_ref().expect("deriv program");
+    let cov = HashMap::from([("WT".to_string(), 35.0)]);
+    let grad = deriv_theta_grad(deriv, &[0.2, 10.0, 1.5], &cov, 1.0, 1.0);
+    approx::assert_relative_eq!(grad[2], 0.5, max_relative = 1e-12);
+    assert_eq!(grad[0], 0.0);
+}
+
+/// A definition that reaches itself is refused, not recursed into without
+/// bound. [individual_parameters] refuses a self-reference as a forward
+/// reference before this scope runs, so it is pinned on the scope directly.
+#[test]
+fn ruv_indiv_scope_refuses_a_self_reference_instead_of_recursing() {
+    let stmts = vec![Statement::Assign(
+        "WT".to_string(),
+        Expression::BinOp(
+            Box::new(Expression::Covariate("WT".to_string())),
+            BinOp::Mul,
+            Box::new(Expression::Literal(2.0)),
+        ),
+    )];
+    let scope = RuvIndivScope::new(&stmts);
+    let why = scope.verdict("WT").unwrap_err();
+    assert!(
+        why.contains("reads `WT`, which is defined in terms of itself"),
+        "{why}"
+    );
+}
+
+/// Review round 1 (#2915): a refused name must refuse every name that reads
+/// it, even when the refused name collides with an RUV built-in. With `TAD`
+/// assigned twice, `ISPK = TAD` used to be stored as the bare leaf `TAD`,
+/// which the error model then read as the engine's time after dose — `3` in
+/// every other block, `TAD` here, with no message.
+#[test]
+fn ruv_magnitude_refusal_propagates_through_a_wrapper_of_a_reassigned_name() {
+    let err = expect_parse_err(&ruv_indiv_model(
+        "  TAD = 2\n  ISPK = TAD\n  TAD = 3",
+        "PROP_ERR * ISPK",
+    ));
+    assert!(
+        err.contains("`ISPK`, which [individual_parameters] assigns but which reads `TAD`, which is assigned more than once"),
+        "{err}"
+    );
+}
+
+/// A name the block assigns that the error model reads as its own built-in
+/// (`TAD`) or as the scaled sigma: two blocks would read two values, so it is
+/// refused by name.
+#[test]
+fn ruv_magnitude_refuses_a_builtin_name_the_block_assigns() {
+    let err = expect_parse_err(&ruv_indiv_model("  TAD = 2", "PROP_ERR * (1 + TAD)"));
+    assert!(
+        err.contains("references `TAD`, which [individual_parameters] assigns, but which in [error_model] names"),
+        "{err}"
+    );
+}
+
+/// `n` levels of a diamond (`B_i = X_i + 2`, `C_i = X_i + 3`,
+/// `X_{i+1} = B_i + C_i`): the substituted tree doubles per level.
+fn ruv_indiv_diamond(n: usize) -> String {
+    let mut s = String::from("  X0 = RUV_K\n");
+    for i in 0..n {
+        s += &format!(
+            "  B{i} = X{i} + 2\n  C{i} = X{i} + 3\n  X{} = B{i} + C{i}\n",
+            i + 1
+        );
+    }
+    s
+}
+
+/// Review round 1 (#2915): substitution is judged lazily and by size, never
+/// materialised up front. A 60-level diamond is ~2^60 nodes expanded; a model
+/// whose magnitude does not read it parses (the scope only indexes the block),
+/// and one whose magnitude does is refused on size — both in linear time, so
+/// an exponential regression hangs this test rather than passing it.
+#[test]
+fn ruv_magnitude_diamond_is_judged_linearly() {
+    let deep = ruv_indiv_diamond(60);
+    // Read by nothing in the error model: parses as before.
+    parse_full_model(&ruv_indiv_model(&deep, "PROP_ERR * RUV_K")).unwrap();
+    // Read by the magnitude: refused on size, naming the top name.
+    let err = expect_parse_err(&ruv_indiv_model(&deep, "PROP_ERR * X60"));
+    assert!(
+        err.contains("`X60`, which [individual_parameters] assigns but which")
+            && err.contains("expands to more than 10000 expression nodes"),
+        "{err}"
+    );
+    // A shallow diamond is substituted, with the value of the expanded tree:
+    // X1 = 2·X0 + 5 = 8, X2 = 2·X1 + 5 = 21 at RUV_K = 1.5.
+    let m = ruv_indiv_mults(
+        &ruv_indiv_model(&ruv_indiv_diamond(2), "PROP_ERR * X2"),
+        &[70.0],
+    );
+    assert_eq!(m, vec![21.0]);
+}
+
+/// A model whose magnitude reads a counted θ block `RUV[3]` through an
+/// index assigned in [individual_parameters] (#2915 review 2). `GRP` is a
+/// declared column. θ = [TVCL, TVV, RUV[1..3]].
+fn ruv_gather_model(indiv: &str) -> String {
+    ruv_gather_model_with(indiv, "PROP_ERR * RUV[IDX]")
+}
+
+/// [`ruv_gather_model`] with the magnitude `mag`.
+fn ruv_gather_model_with(indiv: &str, mag: &str) -> String {
+    format!(
+        r#"
+[parameters]
+  theta TVCL(0.2)
+  theta TVV(10.0)
+  theta RUV[3](1.0, 0.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = TVCL * exp(ETA_CL)
+  V  = TVV
+{indiv}
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional({mag})
+[covariates]
+  GRP continuous
+"#
+    )
+}
+
+/// The gather index columns the pre-fit check will walk.
+fn ruv_gather_index_columns(model: &CompiledModel) -> Vec<(String, String)> {
+    model
+        .theta_blocks()
+        .index_columns()
+        .map(|(b, c, _)| (b.to_string(), c.to_string()))
+        .collect()
+}
+
+/// Review 2 (#2915): the parse records `RUV[IDX]` as a gather over a data
+/// column `IDX` before substitution makes the index the literal `2`. That
+/// stale record made fit/predict demand an `IDX` column the expression never
+/// reads (`E_THETA_GATHER_INDEX_MISSING`). After substitution the literal is
+/// folded to level 2's θ, as `RUV[2]` written inline is, and no column is
+/// recorded.
+#[test]
+fn ruv_magnitude_assigned_literal_gather_index_folds_and_records_no_column() {
+    let model = parse_full_model(&ruv_gather_model("  IDX = 2"))
+        .unwrap()
+        .model;
+    assert!(
+        ruv_gather_index_columns(&model).is_empty(),
+        "{:?}",
+        ruv_gather_index_columns(&model)
+    );
+    let s = magnitude_rows_subject(&[(1, 1.0)], "GRP");
+    let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
+    assert_eq!(rows[0][0], 2.2);
+}
+
+/// The column the substituted index reads is the one recorded — `GRP`, never
+/// the name as written — so the pre-fit level check walks the right column,
+/// and each row reads its own level.
+#[test]
+fn ruv_magnitude_assigned_column_gather_index_records_the_substituted_column() {
+    let model = parse_full_model(&ruv_gather_model("  IDX = GRP"))
+        .unwrap()
+        .model;
+    assert_eq!(
+        ruv_gather_index_columns(&model),
+        vec![("RUV".to_string(), "GRP".to_string())]
+    );
+    let s = magnitude_rows_subject(&[(1, 1.0), (1, 3.0)], "GRP");
+    let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
+    assert_eq!((rows[0][0], rows[1][0]), (1.1, 3.3));
+}
+
+/// A substituted literal index is range-checked like a written one.
+#[test]
+fn ruv_magnitude_assigned_literal_gather_index_out_of_range_is_refused() {
+    // Read twice: the walk stops at the first refusal and skips the second.
+    let err = expect_parse_err(&ruv_gather_model_with(
+        "  IDX = 5",
+        "PROP_ERR * RUV[IDX] * RUV[IDX]",
+    ));
+    assert!(
+        err.contains("`RUV[5]`: level index must be an integer in 1..=3"),
+        "{err}"
+    );
+}
+
+/// A substituted index that is neither a column nor a literal (`GRP + 0`)
+/// has no single column for the pre-fit check to walk, so nothing is
+/// recorded — as for the same index written inline — and the rows still read
+/// their own level.
+#[test]
+fn ruv_magnitude_assigned_computed_gather_index_records_no_column() {
+    let model = parse_full_model(&ruv_gather_model("  IDX = GRP + 0"))
+        .unwrap()
+        .model;
+    assert!(ruv_gather_index_columns(&model).is_empty());
+    let s = magnitude_rows_subject(&[(1, 2.0)], "GRP");
+    let rows = model.ruv_obs_mult(&s, &[0.2, 10.0, 1.1, 2.2, 3.3]).unwrap();
+    assert_eq!(rows[0][0], 2.2);
+}
+
+/// A data-driven block read bare beside a substituted name: its implicit index
+/// is not a recorded gather site, before or after substitution.
+#[test]
+fn ruv_magnitude_substitution_leaves_a_data_driven_block_unrecorded() {
+    let src = ruv_gather_model_with("  ISPK = 2", "PROP_ERR * ERRSCALE * ISPK").replace(
+        "  theta RUV[3](1.0, 0.0, 10.0)\n",
+        "  theta ERRSCALE[GRP](1.0, 0.1, 10.0)\n",
+    );
+    let model = parse_full_model(&src).unwrap().model;
+    assert!(
+        ruv_gather_index_columns(&model)
+            .iter()
+            .all(|(b, _)| b != "ERRSCALE"),
+        "{:?}",
+        ruv_gather_index_columns(&model)
+    );
+}
+
+/// A name read twice is substituted at both sites and reported once.
+#[test]
+fn ruv_magnitude_reads_the_same_assigned_name_twice() {
+    let m = ruv_indiv_mults(
+        &ruv_indiv_model("  ISPK = 3", "PROP_ERR * ISPK * ISPK"),
+        &[70.0],
+    );
+    assert_eq!(m, vec![9.0]);
+    let err = expect_parse_err(&ruv_indiv_model("  ISPK = AGE", "PROP_ERR * ISPK * ISPK"));
+    assert!(err.contains("definition of `ISPK`)"), "{err}");
+}
+
+/// Each name under the node cap, the expression over it: `X10` is 6139 nodes
+/// (`|X_n| = 6·2^n − 5`), read twice it is 12278, so the whole magnitude is
+/// refused on size even though each name alone is accepted.
+#[test]
+fn ruv_magnitude_total_size_is_capped_across_names() {
+    let src = ruv_indiv_model(&ruv_indiv_diamond(10), "PROP_ERR * X10 * X10");
+    let err = expect_parse_err(&src);
+    assert!(
+        err.contains("expands to more than 10000 expression nodes once its [individual_parameters] names are substituted"),
+        "{err}"
+    );
+    // One read of the same name stays under the cap and is substituted.
+    parse_full_model(&ruv_indiv_model(&ruv_indiv_diamond(10), "PROP_ERR * X10")).unwrap();
+}
+
+/// Every node shape a definition can carry is rebuilt by the substitution —
+/// a function call, a power, and an inline `if` whose condition uses `&&`,
+/// `||`, `!` and `present(...)` — with the earlier name `A` substituted
+/// inside the condition too. Each `WT` row lands on a different arm, so a
+/// shape dropped or left unsubstituted changes a value.
+#[test]
+fn ruv_magnitude_substitutes_through_every_expression_shape() {
+    let src = ruv_indiv_model(
+        "  A = RUV_K\n  ISPK = if (((A > 1) && !(WT < 50)) || (present(WT) && WT > 200)) exp(A)^2 else sqrt(A)",
+        "PROP_ERR * ISPK",
+    );
+    let m = ruv_indiv_mults(&src, &[100.0, 10.0]);
+    approx::assert_relative_eq!(m[0], (3.0f64).exp(), max_relative = 1e-12);
+    approx::assert_relative_eq!(m[1], 1.5f64.sqrt(), max_relative = 1e-12);
+}
+
+/// The refusals no parsed fixture reaches without an optional feature or a
+/// mixture block, pinned on the scope: a definition reading the mixture class,
+/// a neural-network output, or a `Variable` the block does not assign (an
+/// engine built-in the RUV scope would reinterpret).
+#[test]
+fn ruv_indiv_scope_refuses_mixnum_nn_and_unknown_variables() {
+    let stmts = vec![
+        Statement::Assign("M".to_string(), Expression::MixNum),
+        Statement::Assign(
+            "N".to_string(),
+            Expression::NnOutput {
+                nn_idx: 0,
+                output_idx: 0,
+            },
+        ),
+        Statement::Assign("U".to_string(), Expression::Variable("ZZZ".to_string())),
+    ];
+    let scope = RuvIndivScope::new(&stmts);
+    for (name, want) in [
+        ("M", "depends on the mixture class (MIXNUM)"),
+        ("N", "depends on a neural-network output"),
+        (
+            "U",
+            "reads `ZZZ`, which is not a theta, a covariate or a name assigned in [individual_parameters]",
+        ),
+    ] {
+        let why = scope.verdict(name).unwrap_err();
+        assert_eq!(why, want, "{name}");
+    }
+}
+
+/// A name whose value depends on η is refused by name, with the reason — not
+/// sent to [covariates], which is the wrong fix for a derived quantity. Also
+/// pins the transitive case: the η reaches `A` only through `CL`.
+#[test]
+fn ruv_magnitude_refuses_an_eta_dependent_individual_parameter() {
+    for (indiv, mag, why) in [
+        ("", "PROP_ERR * CL * 2", "`CL`, which [individual_parameters] assigns but which depends on a random effect"),
+        (
+            "  A = CL * 2",
+            "PROP_ERR * A",
+            "`A`, which [individual_parameters] assigns but which reads `CL`, which depends on a random effect",
+        ),
+    ] {
+        let err = expect_parse_err(&ruv_indiv_model(indiv, mag));
+        assert!(err.contains(why), "{mag}: {err}");
+        assert!(!err.contains("undeclared covariate"), "{mag}: {err}");
+        assert!(!err.contains("declare it in"), "{mag}: {err}");
+    }
+}
+
+/// A θ that [individual_parameters] reassigns under its own name (`theta CL`,
+/// `CL = CL * exp(ETA_CL)`) is read in the error model as the assigned value,
+/// like every other block — not as the raw θ, which θ-first name resolution
+/// would otherwise hand the magnitude silently (#2915 review 4). The η-bearing
+/// spelling is refused by name; the η-free one is substituted, and its value
+/// (θ × WT/70) differs from the raw θ at WT ≠ 70, so a regression back to the
+/// θ leaf fails on the 140 row.
+#[test]
+fn ruv_magnitude_reads_a_theta_reassigned_in_individual_parameters_as_its_value() {
+    let eta_model = r#"
+[parameters]
+  theta CL(0.2)
+  theta TVV(10.0)
+  omega ETA_CL ~ 0.09
+  sigma PROP_ERR ~ 0.04
+[individual_parameters]
+  CL = CL * exp(ETA_CL)
+  V = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(PROP_ERR * CL)
+"#;
+    let err = expect_parse_err(eta_model);
+    assert!(
+        err.contains(
+            "`CL`, which [individual_parameters] assigns but which depends on a random effect"
+        ),
+        "{err}"
+    );
+
+    // RUV_K defaults to 1.5; the assigned value is RUV_K * WT / 70.
+    let model = ruv_indiv_model("  RUV_K = RUV_K * WT / 70", "PROP_ERR * RUV_K");
+    let got = ruv_indiv_mults(&model, &[70.0, 140.0]);
+    assert_eq!(got, vec![1.5, 3.0]);
+}
+
+/// A name assigned inside an `if/else`, or twice, has no single definition:
+/// refused with that reason. `if` with no `else` and a later override are the
+/// two shapes — both would read a different value than the statement order
+/// produces if the first top-level line were substituted.
+#[test]
+fn ruv_magnitude_refuses_a_conditional_or_reassigned_individual_parameter() {
+    for indiv in [
+        "  if (WT > 70) {\n    ISPK = 2\n  } else {\n    ISPK = 1\n  }",
+        "  ISPK = 1\n  if (WT > 70) {\n    ISPK = 2\n  }",
+    ] {
+        let err = expect_parse_err(&ruv_indiv_model(indiv, "PROP_ERR * ISPK"));
+        assert!(
+            err.contains("`ISPK`, which [individual_parameters] assigns")
+                && err.contains("assigned more than once or inside an `if/else` branch"),
+            "{indiv}: {err}"
+        );
+        assert!(!err.contains("undeclared covariate"), "{indiv}: {err}");
+    }
+}
+
+/// An inlined body is held to the magnitude's own rules: a covariate it reads
+/// must be declared, and the message says the reference came in through the
+/// substituted name (else the user hunts for `AGE` in an error model that
+/// never wrote it).
+#[test]
+fn ruv_magnitude_inlined_body_keeps_the_declared_covariate_rule() {
+    let err = expect_parse_err(&ruv_indiv_model("  ISPK = AGE / 40", "PROP_ERR * ISPK"));
+    assert!(err.contains("undeclared covariate `AGE`"), "{err}");
+    assert!(
+        err.contains("after substituting the [individual_parameters] definition of `ISPK`"),
+        "{err}"
+    );
+}
+
+/// A genuinely undefined name keeps the original error, and the advice now
+/// names both places a name can be defined.
+#[test]
+fn ruv_magnitude_undefined_name_still_rejected() {
+    let err = expect_parse_err(&ruv_indiv_model("", "PROP_ERR * NOPE"));
+    assert!(err.contains("undeclared covariate `NOPE`"), "{err}");
+    assert!(
+        err.contains("declare it in [covariates], or assign it in [individual_parameters]"),
+        "{err}"
+    );
+    assert!(!err.contains("after substituting"), "{err}");
 }
 
 #[test]
@@ -12580,7 +13057,11 @@ fn endpoint_magnitude_keeps_the_plain_line_rules() {
         ("TPF * 2.0", "references no declared sigma"),
         ("PROP_ERR_PK * ADD_ERR_PD", "references multiple sigmas"),
         ("ADD_ERR_PD * ETA_CL", "random effect"),
-        ("ADD_ERR_PD * CL", "undeclared covariate `CL`"),
+        // `CL` is η-bearing in [individual_parameters] (#2915), not undeclared.
+        (
+            "ADD_ERR_PD * CL",
+            "`CL`, which [individual_parameters] assigns",
+        ),
         ("ADD_ERR_PD * IPRED", "may not reference `IPRED`"),
         ("ADD_ERR_PD * NOPE", "undeclared covariate `NOPE`"),
     ] {
@@ -15141,19 +15622,53 @@ fn test_known_block_names_track_the_build_features() {
 /// parser stopped reading it silently, and `nearest_block_name` finds nothing
 /// close enough to suggest (`initial_conditions` is far past edit distance 2),
 /// so the generic path would leave the user with no explanation at all.
+///
+/// It is a warning, not an error (#2913): the block was already inert, so a
+/// stored model carrying one must keep parsing across an upgrade.
 #[test]
-fn test_deprecated_block_is_rejected_with_its_remediation() {
+fn test_deprecated_block_is_a_warning_with_its_remediation() {
     assert_eq!(nearest_block_name("initial_values"), None);
     let src = model_with_extra_block("[initial_values]\n  theta = [0.2, 10.0]\n  sigma = [0.02]\n");
-    let err = parse_model_string(&src).expect_err("deprecated block must be an error");
+    let model = parse_model_string(&src).expect("a deprecated block must not fail the parse");
+    let hits: Vec<&String> = model
+        .parse_warnings
+        .iter()
+        .filter(|w| w.contains("W_DEPRECATED_BLOCK"))
+        .collect();
+    assert_eq!(hits.len(), 1, "{:?}", model.parse_warnings);
+    let w = hits[0];
     assert!(
-        err.starts_with("Deprecated block `[initial_values]` (line 16) is no longer read:"),
-        "{err}"
+        w.starts_with("Deprecated block `[initial_values]` (line 16) is ignored:"),
+        "{w}"
     );
-    assert!(err.contains("declared inline in `[parameters]`"), "{err}");
-    assert!(err.contains("delete it"), "{err}");
+    assert!(w.contains("declared inline in `[parameters]`"), "{w}");
+    assert!(w.contains("delete it"), "{w}");
+    assert!(w.contains("never affected the fit"), "{w}");
     // Not the generic bucket: no "valid blocks" dump, no did-you-mean.
-    assert!(!err.contains("Valid blocks"), "{err}");
+    assert!(!w.contains("Valid blocks"), "{w}");
+}
+
+/// The deprecated block's lines are dropped at extraction, so nothing
+/// downstream — the absorption twin re-emits `unnamed` — can read them, and a
+/// repeated header warns once.
+#[test]
+fn test_deprecated_block_lines_are_dropped_at_extraction() {
+    let src = model_with_extra_block(
+        "[initial_values]\n  theta = [0.2, 10.0]\n\n[initial_values]\n  sigma = [0.02]\n",
+    );
+    let extracted = extract_blocks(&src).expect("extracts");
+    assert!(!extracted.unnamed.contains_key("initial_values"));
+    assert!(!extracted.block_lines.contains_key("initial_values"));
+    assert_eq!(extracted.warnings.len(), 1, "{:?}", extracted.warnings);
+}
+
+/// A deprecated block never masks a real header error: an unknown block in the
+/// same file still fails the parse.
+#[test]
+fn test_deprecated_block_does_not_mask_an_unknown_block() {
+    let src = model_with_extra_block("[initial_values]\n  theta = [0.2]\n\n[foo]\n  k = 1\n");
+    let err = parse_model_string(&src).expect_err("unknown block must still be an error");
+    assert!(err.starts_with("Unknown block `[foo]`"), "{err}");
 }
 
 /// An unknown header written with an instance name is echoed as written, so
@@ -16743,7 +17258,7 @@ fn test_parse_scaling_y_form_c_resolves_theta() {
 
 /// #486: a Form-C readout referencing θ/η directly is desugared into synthetic
 /// individual parameters (`__ferx_ro_*`), which makes the readout analytic
-/// (`is_dual_evaluable`) without adding any new random effect, and the synthetic
+/// (no direct θ/η read left in the readout) without adding any new random effect, and the synthetic
 /// names are suppressed from user-facing EBE output.
 #[test]
 fn test_form_c_direct_theta_eta_desugars_to_indiv_params() {
@@ -16763,15 +17278,15 @@ fn test_form_c_direct_theta_eta_desugars_to_indiv_params() {
     assert_eq!(synth.len(), 2, "one synthetic param per distinct θ/η ref");
     assert_eq!(model.indiv_param_names.len(), model.pk_indices.len());
 
-    // The desugared readout carries no bare θ/η ops, so it is dual-evaluable.
+    // The desugared readout carries no bare θ/η ops.
     let ode = model.ode_spec.as_ref().unwrap();
     let prog = ode
         .readout_program
         .as_ref()
         .expect("uniform Form-C readout has a sensitivity program");
     assert!(
-        prog.is_dual_evaluable(),
-        "a θ/η readout must be analytic after desugaring (#486)"
+        !prog.reads_leaves(),
+        "a θ/η readout must read no leaf after desugaring (#486)"
     );
 
     // The `ETA_CL` reference reuses the existing random effect — no new omega.
@@ -16830,10 +17345,11 @@ fn test_form_c_reserved_prefix_param_rejected() {
 
 /// #486 regression: a model that previously parsed (direct-θ readout served by the
 /// FD fallback) must not start failing the PK-slot layout once desugaring is
-/// available. When the synthetic param has no free slot, the readout falls back to
-/// FD (its prior behaviour) with a warning, instead of erroring.
+/// available. When the synthetic param has no free slot, the θ read stays in the
+/// readout (read from the θ leaves by the recorders), with no warning: nothing is
+/// lost, so there is nothing to say.
 #[test]
-fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
+fn test_form_c_direct_readout_stays_a_direct_read_when_slots_full() {
     // CL, V, KA take 3 of the (MAX_PK_PARAMS − reserved) usable slots; the
     // remaining are filled by EXTRA params → zero headroom. A direct-θ readout
     // would need one more.
@@ -16876,7 +17392,7 @@ fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
 "
     );
     let model = parse_model_string(&src)
-        .expect("a slot-full model with a direct-θ readout must still parse (FD fallback)");
+        .expect("a slot-full model with a direct-θ readout must still parse");
 
     // No synthetic param was injected — desugaring stood down for lack of a slot.
     assert!(
@@ -16886,13 +17402,18 @@ fn test_form_c_direct_readout_falls_back_to_fd_when_slots_full() {
             .any(|n| is_synthetic_readout_param(n)),
         "desugaring must not consume a slot it does not have"
     );
-    // The fallback is surfaced, not silent.
+    // The θ read stays in the readout, and no warning claims a lost gradient.
+    assert!(model
+        .ode_spec
+        .as_ref()
+        .and_then(|o| o.readout_program.as_ref())
+        .is_some_and(|p| p.reads_leaves()));
     assert!(
-        model
+        !model
             .parse_warnings
             .iter()
             .any(|w| w.contains("finite-difference")),
-        "the FD fallback must be warned about, got: {:?}",
+        "no finite-difference note: {:?}",
         model.parse_warnings
     );
 }
@@ -17852,56 +18373,9 @@ fn bytecode_g_mod_carries_the_jet_of_both_operands() {
     assert_eq!((d.value, d.grad), (0.0, [0.0; 2]), "a mod 0");
 }
 
-/// `Op::Mod` on the taped-Hessian `DualV<_, _, true>` of the Laplace/AGQ exact
-/// anchor: the reverse sweep reaches the third derivative of each record, so the
-/// lift must say it is `0`. A `lift2` there records a `NaN` `φ‴` and the sweep
-/// comes back non-finite, which `Dual2` cannot see (#2150 review). With
-/// `S = w₀·f + w₁·∂ₓf + w₂·∂ᵧf + …` and `f = x mod y` affine between jumps,
-/// `∂S/∂x = w₀` and `∂S/∂y = −q·w₀` exactly.
-#[test]
-fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
-    use crate::sens::vtape::{vadj_index_h, vadj_init, vsweep_h, vtape_reset, DualV};
-    type V = DualV<2, 2, true>;
-    let expr = binop(BinOp::Mod, varidx(0), varidx(1));
-    let bc = compile_bytecode(&expr);
-    let w = [0.6, -1.1, 0.8, 0.5, -0.7];
-    for (x, y) in [(1.3_f64, 2.5_f64), (7.1, 2.5), (7.1, -2.5)] {
-        let q = x.div_euclid(y);
-        vtape_reset(1 + 2 + 2);
-        let vd = [
-            V::leaf(x, [1.0, 0.0], [0.0; 2]),
-            V::leaf(y, [0.0, 1.0], [0.0; 2]),
-        ];
-        let mut sd: Vec<V> = Vec::new();
-        let f = eval_bytecode_g::<V>(&bc, &[], &[], &[], &vd, &[], &mut sd);
-        assert_eq!(
-            f.v.to_bits(),
-            x.rem_euclid(y).to_bits(),
-            "value of {x} mod {y}"
-        );
-        assert_eq!((f.g, f.h), ([1.0, -q], [0.0; 2]), "jet of {x} mod {y}");
-        let adj = vadj_init::<1>();
-        for (comp, wc) in w.iter().enumerate() {
-            adj[vadj_index_h::<2, 2>(f.i, comp)] = *wc;
-        }
-        let adj = vsweep_h::<2, 2>(f.i as usize + 1).to_vec();
-        let got = vd.map(|l| adj[vadj_index_h::<2, 2>(l.i, 0)]);
-        assert!(
-            got.iter().all(|g| g.is_finite()),
-            "{x} mod {y}: sweep {got:?}"
-        );
-        assert!(
-            (got[0] - w[0]).abs() < 1e-12 && (got[1] + q * w[0]).abs() < 1e-12,
-            "{x} mod {y}: sweep {got:?}, want [{}, {}]",
-            w[0],
-            -q * w[0]
-        );
-    }
-}
-
 // ── In-place operand fusion in `eval_bytecode_g` ───────────────────────────
 //
-// For the outer `DualMixed` type `eval_bytecode_g` combines operands in place and
+// For the second-order `Dual2` type `eval_bytecode_g` combines operands in place and
 // applies a pushed constant / covariate / `TIME` / variable straight to the stack
 // top, and the compiler emits a literal-left `c ⊕ E` with the literal on top
 // (`Op::RSub` for `c - E`). The oracle below is the by-value evaluation those
@@ -17909,9 +18383,9 @@ fn bytecode_g_mod_is_exact_on_the_taped_hessian_sweep() {
 // keep — including `Op::Div`'s `|b| < 1e-30 → 0` guard on both the stack and the
 // fused side.
 
-type Dm = crate::sens::dual_mixed::DualMixed<2, 3>;
+type Dm = crate::sens::dual2::Dual2<3>;
 
-/// By-value reference: every operand a full `DualMixed`, constants lifted to a
+/// By-value reference: every operand a full `Dual2`, constants lifted to a
 /// zero jet, the `Op::Div` guard applied — what `eval_bytecode_g` computed before
 /// operand fusion.
 fn dm_reference(e: &Expression, vars: &[Dm], covs: &[f64], time: f64) -> Dm {
@@ -17964,12 +18438,12 @@ fn dm_vars() -> Vec<Dm> {
     let signed_zero = Dm {
         value: 2.0,
         grad: [-0.0, 1.5, -0.0],
-        hess: [[-0.0, 0.25, -0.0], [0.25, -0.0, 0.0]],
+        hess: [[-0.0, 0.25, -0.0], [0.25, -0.0, 0.0], [-0.0, 0.0, 0.0]],
     };
     let infinite = Dm {
         value: 1.0,
         grad: [f64::INFINITY, -2.0, 0.0],
-        hess: [[0.0, 1.0, -0.0], [1.0, 0.0, 3.0]],
+        hess: [[0.0, 1.0, -0.0], [1.0, 0.0, 3.0], [0.0, 0.0, 0.0]],
     };
     vec![
         x * y + z,
@@ -26540,7 +27014,7 @@ fn power_form_with_unit_exponent_is_the_proportional_variance_bit_for_bit() {
 }
 
 /// `TAD` inside a magnitude expression is the record's data-derived time after
-/// dose, in both the runtime closure and the `Dual1` θ-program.
+/// dose, in both the runtime closure and the `Dual2` θ-program.
 #[test]
 fn magnitude_expression_reads_tad() {
     let content = r#"
@@ -29329,8 +29803,8 @@ fn a_readout_gather_is_lifted_into_a_synthetic_parameter_on_every_engine() {
             "[{engine}] the lifted gather must leave the readout bytecode"
         );
         assert!(
-            gather_readout_program(&m).is_dual_evaluable(),
-            "[{engine}] the readout must be dual-evaluable once the gather is lifted"
+            !gather_readout_program(&m).reads_leaves(),
+            "[{engine}] the readout must read no leaf once the gather is lifted"
         );
         assert!(
             !m.parse_warnings
@@ -29366,7 +29840,7 @@ fn readout_gather_synths_follow_the_theta_eta_synths() {
         ],
     );
     assert!(!readout_has_gather_op(&m));
-    assert!(gather_readout_program(&m).is_dual_evaluable());
+    assert!(!gather_readout_program(&m).reads_leaves());
 }
 
 /// An index that reads an individual parameter is lifted (its value is pinned by
@@ -29382,7 +29856,7 @@ fn a_readout_gather_indexed_by_an_individual_parameter_is_lifted() {
     .expect("parse");
     assert_eq!(readout_synth_names(&m), ["__ferx_ro_g0"]);
     assert!(!readout_has_gather_op(&m));
-    assert!(gather_readout_program(&m).is_dual_evaluable());
+    assert!(!gather_readout_program(&m).reads_leaves());
 }
 
 /// T2, unliftable index: a gather indexed by a compartment amount stays in the
@@ -29416,8 +29890,8 @@ fn a_state_indexed_readout_gather_stays_in_the_readout_and_routes_to_fd() {
         "premise: no bare θ/η op, so only `PushThetaGather` can disqualify the readout"
     );
     assert!(
-        !gather_readout_program(&m).is_dual_evaluable(),
-        "a gather left in the readout must route to FD"
+        gather_readout_program(&m).reads_leaves(),
+        "a gather left in the readout is read from the θ leaves"
     );
     assert!(
         !m.referenced_covariates.iter().any(|c| c == "central"),
@@ -29456,7 +29930,7 @@ fn a_time_alias_indexed_readout_gather_stays_in_the_readout() {
         readout_has_gather_op(&m),
         "premise: the gather is still in the readout"
     );
-    assert!(!gather_readout_program(&m).is_dual_evaluable());
+    assert!(gather_readout_program(&m).reads_leaves());
     assert!(
         !m.referenced_covariates.iter().any(|c| c == "T"),
         "`T` is the time alias here, not a data column: {:?}",
@@ -29465,10 +29939,10 @@ fn a_time_alias_indexed_readout_gather_stays_in_the_readout() {
 }
 
 /// T2, slot overflow on the analytical engine: three gathers into a 2-slot spare
-/// pool. Every synth is dropped, the gathers stay in the bytecode, the readout is
-/// not dual-evaluable, and the sizing note names the blocks.
+/// pool. Every synth is dropped and the gathers stay in the bytecode, where the recorders read
+/// them from the θ leaves: no finite-difference note, no warning at all about the readout.
 #[test]
-fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
+fn an_overflowing_readout_gather_stays_in_the_readout_and_warns_of_nothing() {
     let src = r#"
 [parameters]
   theta TVCL(0.2, 0.001, 10.0)
@@ -29509,33 +29983,12 @@ fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
         readout_has_gather_op(&m),
         "premise: the gathers stay in the readout"
     );
+    assert!(gather_readout_program(&m).reads_leaves());
     assert!(
-        !gather_readout_program(&m)
-            .bc
-            .ops
+        !m.parse_warnings
             .iter()
-            .any(|op| matches!(op, Op::PushTheta(_) | Op::PushEta(_))),
-        "premise: no bare θ/η op, so only `PushThetaGather` can disqualify the readout"
-    );
-    assert!(
-        !gather_readout_program(&m).is_dual_evaluable(),
-        "a gather left in the readout must make it non-dual-evaluable"
-    );
-    let note = m
-        .parse_warnings
-        .iter()
-        .find(|w| w.contains("more PK slot(s)"))
-        .expect("the sizing note");
-    assert!(
-        note.contains("a direct THETA/ETA or θ level-block (`SCALE`, `OFF`) reference")
-            && note.contains("needs 1 more PK slot(s) than the 2-slot layout has free"),
-        "the note must name the blocks and the analytical pool; got: {note}"
-    );
-    assert!(
-        m.parse_warnings
-            .iter()
-            .any(|w| w.contains("direct THETA/ETA or θ level-block reference, a neural")),
-        "the readout-shape note must list a level block among its causes: {:?}",
+            .any(|w| w.contains("finite-difference") || w.contains("more PK slot(s)")),
+        "the readout is served, so no note says otherwise: {:?}",
         m.parse_warnings
     );
     assert!(
@@ -29544,23 +29997,6 @@ fn an_overflowing_readout_gather_drops_to_fd_and_the_note_names_the_block() {
             .any(|w| w.contains("but not referenced")),
         "levels read only by an unlifted readout gather are still referenced: {:?}",
         m.parse_warnings
-    );
-}
-
-/// The θ/η-only note is worded as before when no gather was dropped.
-#[test]
-fn the_readout_sizing_note_names_no_block_when_none_was_dropped() {
-    let note = readout_synth_fd_note(
-        1,
-        2,
-        &[ReadoutSynthParam {
-            name: format!("{READOUT_SYNTH_PREFIX}th0"),
-            source: ReadoutSynthSource::Theta(0),
-        }],
-    );
-    assert!(
-        note.starts_with("[scaling] y: a direct THETA/ETA reference in the readout needs 1"),
-        "{note}"
     );
 }
 
@@ -32695,13 +33131,20 @@ fn conditional_name_read_by_each_downstream_block_is_refused() {
         let err = refused_with_valid_twin(&src, name);
         assert_conditional_read(&err, name, &format!("named in `{block}`"));
     }
-    // `[error_model]` reads no individual parameter even when it is assigned on
-    // every path (its twin is refused as an undeclared covariate), so only the
-    // message changes: the conditional name is named as such, not as a column.
+    // `[error_model]` reads an individual parameter only through a single
+    // top-level η-free definition (#2915), so a name assigned on every path of
+    // an `if/else` is refused there too — by name, as a branch-assigned value,
+    // not as a column. Only the message differs: the conditional name is named
+    // as such.
     let src =
         cond_ode_model(&s, rhs, "").replace("proportional(PROP_ERR)", "proportional(PROP_ERR * S)");
     let twin_err = parse_err(&else_twin(&src, "S"));
-    assert!(twin_err.contains("undeclared covariate `S`"), "{twin_err}");
+    assert!(
+        twin_err.contains("`S`, which [individual_parameters] assigns")
+            && twin_err.contains("inside an `if/else` branch")
+            && !twin_err.contains("undeclared covariate"),
+        "{twin_err}"
+    );
     assert_conditional_read(&parse_err(&src), "S", "named in `[error_model]`");
 }
 
@@ -34289,18 +34732,19 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         }
     }
 
-    // `Dual1`: the jets must be keyed too. Calls 0 and 1 carry the same parameter
+    // A first-order dual: the jets must be keyed too. Calls 0 and 1 carry the same parameter
     // *values* but seed Q on different axes, so a value-only key would replay Q's
     // jet from the wrong axis.
-    type D = crate::sens::dual1::Dual1<3>;
+    type D = crate::sens::jet::DualT<3, f64>;
+    use crate::sens::num::PkNum;
     let seed = |p: &[f64; 6], q_axis: usize| -> Vec<D> {
         vec![
-            D::var(p[0], 0),
+            <D as PkNum>::var(p[0], 0),
             D::constant(p[1]),
-            D::var(p[2], q_axis),
-            D::var(p[3], 2),
+            <D as PkNum>::var(p[2], q_axis),
+            <D as PkNum>::var(p[3], 2),
             D::constant(p[4]),
-            D::var(p[5], 0) + D::var(0.0, 1),
+            <D as PkNum>::var(p[5], 0) + <D as PkNum>::var(0.0, 1),
         ]
     };
     let dcalls: [(Vec<D>, [f64; 2], f64); 5] = [
@@ -34316,7 +34760,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
     let mut stack_p: Vec<D> = Vec::new();
     for (k, (p, u, t)) in dcalls.iter().enumerate() {
         let params = hoist_params::<D>(prog, p);
-        let ud = [D::constant(u[0]), D::var(u[1], 2)];
+        let ud = [D::constant(u[0]), <D as PkNum>::var(u[1], 2)];
         let mut want = [D::constant(0.0); 2];
         plain.eval_rhs_g::<D>(
             &ud,
@@ -34341,23 +34785,23 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
             &mut vars_h,
             &mut stack_h,
         );
-        // The lift is live for `Dual1`: its scratch carries the cache tail.
+        // The lift is live for a first-order dual: its scratch carries the cache tail.
         assert_eq!(
             vars_h.len(),
             prog.hoist.as_ref().unwrap().n_ext,
-            "Dual1 uses the lift"
+            "a first-order dual uses the lift"
         );
         for j in 0..2 {
             assert!(
-                hoist_bits_eq(got[j].value, want[j].value),
+                hoist_bits_eq(got[j].v, want[j].v),
                 "dual call {k} du[{j}] value"
             );
             for a in 0..3 {
                 assert!(
-                    hoist_bits_eq(got[j].grad[a], want[j].grad[a]),
+                    hoist_bits_eq(got[j].g[a], want[j].g[a]),
                     "dual call {k} du[{j}] grad[{a}]: {} vs {}",
-                    got[j].grad[a],
-                    want[j].grad[a]
+                    got[j].g[a],
+                    want[j].g[a]
                 );
             }
         }
@@ -34365,7 +34809,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
 
     // Second-order duals skip the lift (their key would cost what the lift saves):
     // the scratch never grows a cache tail, and the result is the unlifted one.
-    type M = crate::sens::dual_mixed::DualMixed<2, 3>;
+    type M = crate::sens::dual2::Dual2<3>;
     let params = hoist_params::<M>(
         prog,
         &[
@@ -34394,7 +34838,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
     assert_eq!(
         vars_m.len(),
         prog.n_vars_total,
-        "DualMixed must not use the lift"
+        "Dual2 must not use the lift"
     );
     let mut want = [M::constant(0.0); 2];
     plain.eval_rhs_g::<M>(
@@ -34409,7 +34853,7 @@ fn rhs_hoist_is_bit_identical_to_the_unlifted_rhs_through_cache_hits_and_misses(
         &mut Vec::new(),
     );
     for j in 0..2 {
-        assert!(got[j].same_bits(&want[j]), "DualMixed du[{j}]");
+        assert!(got[j].same_bits(&want[j]), "Dual2 du[{j}]");
     }
 }
 
@@ -34820,7 +35264,7 @@ const HOIST_BRANCH_ONLY_WRITE: &str = "
 
 /// Lifted vs unlifted over `(state, time)` calls on one parameter set — every call
 /// after the first a cache hit on a persistent scratch — for the f64 closure,
-/// `eval_rhs_g::<f64>` and `::<Dual1>`.
+/// `eval_rhs_g::<f64>` and `::<Dual2>`.
 fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &[(Vec<f64>, f64)]) {
     let model = hoist_model(src);
     let prog = hoist_program(&model);
@@ -34829,7 +35273,7 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
     let plain = hoist_program(&plain_model);
     let params = hoist_params::<f64>(prog, &[3.0, 30.0]);
     let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
-    type D = crate::sens::dual1::Dual1<2>;
+    type D = crate::sens::dual2::Dual2<2>;
     let dparams = hoist_params::<D>(prog, &[D::var(3.0, 0), D::var(30.0, 1)]);
     let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
     for (k, (u, t)) in calls.iter().enumerate() {
@@ -34901,12 +35345,12 @@ fn assert_hoist_matches_unlifted_over_calls(src: &str, n_states: usize, calls: &
             // Entry by entry: `same_bits` is part of the code under test.
             assert!(
                 hoist_bits_eq(dgot[j].value, dwant[j].value),
-                "call {k} du[{j}] Dual1 value"
+                "call {k} du[{j}] Dual2 value"
             );
             for a in 0..2 {
                 assert!(
                     hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
-                    "call {k} du[{j}] Dual1 grad[{a}]"
+                    "call {k} du[{j}] Dual2 grad[{a}]"
                 );
             }
         }
@@ -35018,7 +35462,7 @@ fn rhs_hoist_f64_closure_hit_reuses_its_thread_local_cache() {
 /// parameter alone (between time-varying-parameter snapshots that is exactly what
 /// happens to `V2` while `Q` stays put), on one persistent scratch, and require
 /// parity with the unlifted program for the f64 closure, `eval_rhs_g::<f64>` and
-/// `::<Dual1>`. A key comparison that skips any one slot replays a stale lift here.
+/// `::<Dual2>`. A key comparison that skips any one slot replays a stale lift here.
 #[test]
 fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
     // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
@@ -35030,7 +35474,7 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
     let plain = hoist_program(&plain_model);
     let rhs = &model.ode_spec.as_ref().unwrap().rhs;
-    type D = crate::sens::dual1::Dual1<2>;
+    type D = crate::sens::dual2::Dual2<2>;
     let base = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06];
     let (mut vars, mut stack) = (Vec::<f64>::new(), Vec::<f64>::new());
     let (mut dvars, mut dstack) = (Vec::<D>::new(), Vec::<D>::new());
@@ -35111,12 +35555,12 @@ fn rhs_hoist_each_key_slot_invalidates_the_cache_on_its_own() {
             );
             assert!(
                 hoist_bits_eq(dgot[j].value, dwant[j].value),
-                "set {c} {p:?} du[{j}] Dual1 value"
+                "set {c} {p:?} du[{j}] Dual2 value"
             );
             for a in 0..2 {
                 assert!(
                     hoist_bits_eq(dgot[j].grad[a], dwant[j].grad[a]),
-                    "set {c} {p:?} du[{j}] Dual1 grad[{a}]"
+                    "set {c} {p:?} du[{j}] Dual2 grad[{a}]"
                 );
             }
         }
@@ -35209,7 +35653,7 @@ fn rhs_hoist_key_tells_signed_zeros_apart() {
     }
 }
 
-/// A `Dual1` key must compare every gradient component: at fixed parameter
+/// A first-order dual's key must compare every gradient component: at fixed parameter
 /// *values*, change one jet entry of one parameter at a time between cache hits.
 #[test]
 fn rhs_hoist_dual1_key_compares_every_gradient_component() {
@@ -35220,23 +35664,24 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
     let prog = hoist_program(&model);
     let plain_model = hoist_model_unlifted(HOIST_TWO_CPT);
     let plain = hoist_program(&plain_model);
-    type D = crate::sens::dual1::Dual1<3>;
+    type D = crate::sens::jet::DualT<3, f64>;
+    use crate::sens::num::PkNum;
     let base: Vec<D> = [9.0, 41.0, 19.0, 14.0, 0.12, 0.06]
         .iter()
         .enumerate()
-        .map(|(i, &v)| D::var(v, i % 3))
+        .map(|(i, &v)| <D as PkNum>::var(v, i % 3))
         .collect();
     let mut sets = vec![base.clone()];
     for p in [1usize, 2, 3, 5] {
         // V1, Q, V2, SH: the four the lifted code reads.
         for k in 0..3 {
             let mut s = base.clone();
-            s[p].grad[k] += 0.5;
+            s[p].g[k] += 0.5;
             sets.push(s);
             sets.push(base.clone());
         }
     }
-    let ud = [D::constant(80.0), D::var(9.0, 2)];
+    let ud = [D::constant(80.0), <D as PkNum>::var(9.0, 2)];
     let (mut vars, mut stack) = (Vec::<D>::new(), Vec::<D>::new());
     for (c, s) in sets.iter().enumerate() {
         let params = hoist_params::<D>(prog, s);
@@ -35266,16 +35711,13 @@ fn rhs_hoist_dual1_key_compares_every_gradient_component() {
         );
         // Compared entry by entry, not through `same_bits` — the function under test.
         for j in 0..2 {
-            assert!(
-                hoist_bits_eq(got[j].value, want[j].value),
-                "set {c} du[{j}] value"
-            );
+            assert!(hoist_bits_eq(got[j].v, want[j].v), "set {c} du[{j}] value");
             for k in 0..3 {
                 assert!(
-                    hoist_bits_eq(got[j].grad[k], want[j].grad[k]),
+                    hoist_bits_eq(got[j].g[k], want[j].g[k]),
                     "set {c} du[{j}] grad[{k}]: {} vs {}",
-                    got[j].grad[k],
-                    want[j].grad[k]
+                    got[j].g[k],
+                    want[j].g[k]
                 );
             }
         }
@@ -36062,7 +36504,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
     // The hoist and the lean binding run on the interpreter path (`rhs_regcode` bypasses
     // both), which every program the compiler declines still takes.
     let _regcode_off = crate::parser::model_parser::RhsRegcodeOff::enter();
-    type D1 = crate::sens::dual1::Dual1<3>;
+    type D1 = crate::sens::dual2::Dual2<3>;
     type D2 = crate::sens::dual2::Dual2<2>;
 
     let p1 = [4.0, 40.0, 0.7];
@@ -36130,14 +36572,14 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
             );
             for j in 0..2 {
                 assert!(
-                    want[j].val().is_finite(),
+                    want[j].plain().is_finite(),
                     "{name} call {k}: oracle du[{j}] not finite"
                 );
                 assert!(
                     got[j].same_bits(&want[j]),
                     "{name} call {k} du[{j}]: lean {} vs full {}",
-                    got[j].val(),
-                    want[j].val()
+                    got[j].plain(),
+                    want[j].plain()
                 );
             }
         }
@@ -36193,7 +36635,7 @@ fn lean_rhs_binding_is_bit_identical_to_the_full_binding_on_polluted_scratch() {
         let seq: Vec<(Vec<f64>, [f64; 2], f64)> =
             calls.iter().map(|(p, u, t)| (ext(p), *u, *t)).collect();
         run_g::<f64>(name, lean, full, &seq, tafd_of, |t| t - last);
-        // Dual1: CL, V, Q on axes 0, 1, 2; TAD carries ∂/∂lag on axis 0.
+        // Dual2: CL, V, Q on axes 0, 1, 2; TAD carries ∂/∂lag on axis 0.
         let seq: Vec<(Vec<D1>, [f64; 2], f64)> = calls
             .iter()
             .map(|(p, u, t)| {
@@ -37206,9 +37648,8 @@ fn algebraic_structural_model_desugars_a_bare_theta_and_eta() {
         .and_then(|ar| ar.program.as_ref())
         .expect("the equation compiles to a readout program");
     assert!(
-        program.is_dual_evaluable(),
-        "a desugared THETA/ETA must leave the readout dual-evaluable — otherwise the \
-         model loses its analytic gradient"
+        !program.reads_leaves(),
+        "a desugared THETA/ETA must leave the readout reading no leaf"
     );
     assert!(
         !model
@@ -39103,6 +39544,343 @@ fn an_ode_scope_remedy_reads_a_data_driven_block_bare() {
         assert!(
             why.contains("an ODE-accumulated `hazard` cannot read") && why.contains(want),
             "hazard, index_covariate {index_covariate:?}: {why}"
+        );
+    }
+}
+
+/// #2766: a θ used only in a `[mixture]` mixing expression is not unused.
+#[test]
+fn a_theta_used_only_in_the_mixing_expression_is_not_flagged_unused() {
+    // Logit form: MIXL appears only in `logit(1) = MIXL`.
+    let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXL(0.0, -10.0, 10.0)
+  theta UNUSED(42.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parsed = parse_full_model(src).expect("parse ok");
+    let unused: Vec<&str> = parsed
+        .model
+        .parse_warnings
+        .iter()
+        .filter(|w| w.contains("not referenced in any model expression"))
+        .map(|w| w.as_str())
+        .collect();
+    assert!(
+        !unused.iter().any(|w| w.contains("'MIXL'")),
+        "MIXL is used in `logit(1) = MIXL` and must not be flagged; got: {unused:?}"
+    );
+    // The straddle: UNUSED really is unused and must still be flagged.
+    assert!(
+        unused.iter().any(|w| w.contains("'UNUSED'")),
+        "UNUSED is declared and used nowhere; got: {unused:?}"
+    );
+}
+
+/// Same as the logit test above, but for the `p(1) = P1` mixing form (#2766).
+#[test]
+fn the_p_form_mixing_theta_is_not_flagged_unused_either() {
+    let src = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta P1(0.5, 0.001, 0.999)
+  theta UNUSED(42.0)
+  omega ETA_CL ~ 0.05
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 2
+  p(1) = P1
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let parsed = parse_full_model(src).expect("parse ok");
+    let unused = unused_theta_warnings(&parsed.model.parse_warnings);
+    assert!(
+        !unused.iter().any(|w| w.contains("'P1'")),
+        "P1 is used in `p(1) = P1`; got: {unused:?}"
+    );
+    // The straddle: the check still runs, and still flags a θ nothing reads.
+    assert!(
+        unused.iter().any(|w| w.contains("'UNUSED'")),
+        "UNUSED is declared and used nowhere; got: {unused:?}"
+    );
+}
+
+/// The unused-parameter warnings among `warnings`.
+fn unused_theta_warnings(warnings: &[String]) -> Vec<&str> {
+    warnings
+        .iter()
+        .filter(|w| w.contains("not referenced in any model expression"))
+        .map(|w| w.as_str())
+        .collect()
+}
+
+/// Three mixture classes: a compound mixing expression in the first, a bare θ in the
+/// second, and one θ (`UNUSED`) that nothing reads (#2766).
+const THREE_CLASS_MIXING_MODEL: &str = r"
+[parameters]
+  theta TVCL1(1.0, 0.01, 100.0)
+  theta TVCL2(3.0, 0.01, 100.0)
+  theta TVCL3(9.0, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  theta MIXA(0.0, -10.0, 10.0)
+  theta MIXB(0.5, -10.0, 10.0)
+  theta MIXC(0.0, -10.0, 10.0)
+  theta UNUSED(42.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+
+[mixture]
+  nsub = 3
+  logit(1) = MIXA + MIXB
+  logit(2) = MIXC
+
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else if (MIXNUM == 2) TVCL2 * exp(ETA_CL) else TVCL3 * exp(ETA_CL)
+  V  = TVV
+
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+
+[error_model]
+  DV ~ proportional(EPS)
+";
+
+/// Every mixing expression is scanned, and every node of each (#2766). A fix that read
+/// only `mixing[0]`, or only an expression's top node, leaves `MIXB` or `MIXC` flagged.
+#[test]
+fn every_theta_of_every_mixing_expression_is_used() {
+    let parsed = parse_full_model(THREE_CLASS_MIXING_MODEL).expect("parse ok");
+    let unused = unused_theta_warnings(&parsed.model.parse_warnings);
+    for name in ["MIXA", "MIXB", "MIXC"] {
+        assert!(
+            !unused.iter().any(|w| w.contains(&format!("'{name}'"))),
+            "{name} is read by a mixing expression and must not be flagged; got: {unused:?}"
+        );
+    }
+    assert!(
+        unused.iter().any(|w| w.contains("'UNUSED'")),
+        "UNUSED is declared and used nowhere; got: {unused:?}"
+    );
+}
+
+/// The user-visible path the changelog names (#2766): `ferx check`'s report
+/// (`validate_model_file`) carries `W_UNUSED_PARAM` for `UNUSED` and for no mixing θ.
+/// The parser test above reads `parse_warnings`; this one reads what a user sees after
+/// `classify_warning` codes them, so a second emitter of the warning would show here.
+#[test]
+fn ferx_check_reports_only_the_truly_unused_theta_of_a_mixture() {
+    use std::io::Write;
+    let mut f = tempfile::Builder::new()
+        .suffix(".ferx")
+        .tempfile()
+        .expect("create temp model");
+    f.write_all(THREE_CLASS_MIXING_MODEL.as_bytes())
+        .expect("write temp model");
+    f.flush().expect("flush temp model");
+    let report = crate::api::validate_model_file(f.path().to_str().expect("utf-8 path"), None);
+    let mut flagged: Vec<String> = report
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == "W_UNUSED_PARAM")
+        .map(|d| {
+            d.message
+                .split('\'')
+                .nth(1)
+                .unwrap_or(&d.message)
+                .to_string()
+        })
+        .collect();
+    flagged.sort();
+    assert_eq!(
+        flagged,
+        vec!["UNUSED".to_string()],
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+/// A gather index that follows θ or η is no level index, so the recording holds it as a value and
+/// selects the level from it at run time (`gather_select_g`; it used to fail the recording, and
+/// before that read `NaN`). The level follows the index at each recording (index 2 gathers
+/// `θ[1]`, index 1 gathers `θ[0]`), and a covariate index (data) gathers its level directly.
+/// Mutation: `value_read_refused` back in `Op::PushThetaGather` -> the θ-dependent recordings
+/// fail.
+#[test]
+fn a_theta_dependent_gather_index_selects_its_level_in_the_recording() {
+    use crate::parser::model_parser::rhs_regcode::kernel_jit as kj;
+    let program = |index: Op| Bytecode {
+        ops: vec![index, Op::PushThetaGather(0)],
+        constants: vec![0.0],
+        max_stack: 2,
+        gathers: vec![std::sync::Arc::new(GatherSpec {
+            name: "G".into(),
+            levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
+        })],
+    };
+    let run = |bc: &Bytecode, th1: f64| {
+        kj::begin();
+        let th = [kj::Tr::theta(0, 5.0), kj::Tr::theta(1, th1)];
+        let y = eval_bytecode_g(bc, &th, &[], &[2.0], &[], &[], &mut Vec::new());
+        (y.recorded(), kj::end(Some(vec![y.reg()])))
+    };
+    let (v, rec) = run(&program(Op::PushCov(0)), 2.0);
+    assert!(rec.is_ok(), "a covariate index records");
+    assert_eq!(v, 2.0, "level 2 is θ[1]");
+    // The index is θ[1] itself: 2.0 gathers level 2 (θ[1]), 1.0 gathers level 1 (θ[0]).
+    for (th1, want) in [(2.0, 2.0), (1.0, 5.0)] {
+        let (v, rec) = run(&program(Op::PushTheta(1)), th1);
+        assert!(rec.is_ok(), "a θ-dependent index records (θ[1] = {th1})");
+        assert_eq!(v, want, "θ[1] = {th1} selects its own level");
+    }
+}
+
+/// A snapshot of a subject's covariates evaluates a typical value bit-for-bit as the map does,
+/// an absent covariate reads `0.0` in both, a program with more definitions than the stack
+/// buffer holds agrees too, and the names are each covariate once in first-read order. Dies when
+/// the snapshot resolves a name to another's slot (`WT` and `AGE` swapped changes the value) or
+/// the snapshot drops the absent-is-zero rule (`GHOST` would be NaN or panic).
+#[test]
+fn a_covariate_snapshot_evaluates_a_typical_value_bit_for_bit_as_the_map_does() {
+    let cov = |n: &str| Expression::Covariate(n.to_string());
+    let bin = |l, op, r| Expression::BinOp(Box::new(l), op, Box::new(r));
+    let root = bin(
+        bin(cov("WT"), BinOp::Div, Expression::Literal(70.0)),
+        BinOp::Add,
+        bin(
+            bin(cov("AGE"), BinOp::Mul, cov("WT")),
+            BinOp::Add,
+            bin(cov("GHOST"), BinOp::Add, Expression::Theta(0)),
+        ),
+    );
+    let wide = |k: usize| {
+        // `k` chained definitions, each reading the one before and a covariate.
+        let defs: Vec<Expression> = (0..k)
+            .map(|j| {
+                let prev = if j == 0 {
+                    Expression::Theta(0)
+                } else {
+                    Expression::VariableIdx(j - 1)
+                };
+                bin(prev, BinOp::Add, bin(cov("AGE"), BinOp::Mul, cov("WT")))
+            })
+            .collect();
+        let tail = bin(Expression::VariableIdx(k - 1), BinOp::Add, root.clone());
+        TypicalProgram { defs, root: tail }
+    };
+    let mut covs: HashMap<String, f64> = HashMap::new();
+    covs.insert("WT".to_string(), 83.5);
+    covs.insert("AGE".to_string(), 41.0);
+    covs.insert("UNREAD".to_string(), 9.0);
+    for prog in [TypicalProgram::of(root.clone()), wide(3), wide(12)] {
+        let names = prog.covariate_names();
+        assert_eq!(names.len(), 3);
+        assert!(names.contains(&"GHOST".to_string()));
+        let snap = CovariateSnapshot::new(&names, &covs);
+        for theta in [[0.3], [-1.7]] {
+            assert_eq!(
+                prog.eval_snapshot(&theta, &snap).to_bits(),
+                prog.eval(&theta, &covs).to_bits()
+            );
+        }
+    }
+    let swapped: HashMap<String, f64> = [("WT", 41.0), ("AGE", 83.5)]
+        .map(|(k, v)| (k.to_string(), v))
+        .into();
+    let prog = TypicalProgram::of(root);
+    assert_ne!(
+        prog.eval(&[0.3], &swapped).to_bits(),
+        prog.eval(&[0.3], &covs).to_bits(),
+        "the fixture tells WT from AGE"
+    );
+
+    // Covariates inside every nesting `covariate_names` walks: a condition operand and both
+    // branches of a `Conditional`, a `ThetaGather` index, a `UnaryFn` operand and both
+    // `Power` operands. Deleting any one walk arm drops its names, and each dropped covariate
+    // changes the value (it reads `0.0` in the snapshot): `CA` is read only by the first
+    // condition (missing → the else branch `CC`), `CD` only by the second (missing → the then
+    // branch `CE`); `CB` and `CF` are the branches taken.
+    let cond = |c: Condition, t: Expression, f: Expression| {
+        Expression::Conditional(Box::new(c), Box::new(t), Box::new(f))
+    };
+    let nested = [
+        cond(
+            Condition::Compare(cov("CA"), CmpOp::Gt, Expression::Literal(1.0)),
+            cov("CB"),
+            cov("CC"),
+        ),
+        cond(
+            Condition::Compare(cov("CD"), CmpOp::Lt, Expression::Literal(1.0)),
+            cov("CE"),
+            cov("CF"),
+        ),
+        Expression::ThetaGather {
+            spec: std::sync::Arc::new(GatherSpec {
+                name: "G".into(),
+                levels: vec![LevelRule::Free(0), LevelRule::Free(1)],
+            }),
+            idx: Box::new(cov("LVL")),
+        },
+        Expression::UnaryFn("exp".into(), Box::new(cov("UF"))),
+        Expression::Power(Box::new(cov("PB")), Box::new(cov("PE"))),
+    ]
+    .into_iter()
+    .reduce(|a, b| bin(a, BinOp::Add, b))
+    .unwrap();
+    let nested = TypicalProgram::of(nested);
+    let covs: HashMap<String, f64> = [
+        ("CA", 5.0),
+        ("CB", 7.0),
+        ("CC", 11.0),
+        ("CD", 5.0),
+        ("CE", 13.0),
+        ("CF", 17.0),
+        ("LVL", 2.0),
+        ("UF", 0.4),
+        ("PB", 1.3),
+        ("PE", 2.2),
+    ]
+    .map(|(k, v)| (k.to_string(), v))
+    .into();
+    let names = nested.covariate_names();
+    assert_eq!(
+        names,
+        ["CA", "CB", "CC", "CD", "CE", "CF", "LVL", "UF", "PB", "PE"].map(String::from)
+    );
+    let snap = CovariateSnapshot::new(&names, &covs);
+    for theta in [[0.3, 1.9], [-1.7, 2.5]] {
+        assert_eq!(
+            nested.eval_snapshot(&theta, &snap).to_bits(),
+            nested.eval(&theta, &covs).to_bits()
         );
     }
 }

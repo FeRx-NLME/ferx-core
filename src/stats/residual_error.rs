@@ -1,3 +1,4 @@
+use crate::cold_sort::ColdSort;
 use crate::stats::likelihood::SUBJECT_SENTINEL_NLL;
 use crate::types::{ErrorModel, ErrorSpec, ResidualCorrelation, SigmaType, Subject, SubjectResult};
 use nalgebra::DMatrix;
@@ -135,12 +136,14 @@ impl<T: Copy> IntoIterator for Loads<T> {
 ///
 /// A variance that cannot be scored (`NaN`, `≤ 0`, subnormal) is replaced by
 /// `MIN_VARIANCE`; every positive normal variance is returned as it is (#2441).
+#[inline]
 pub fn residual_variance(error_model: ErrorModel, f_pred: f64, sigma_values: &[f64]) -> f64 {
     guard_variance(residual_variance_raw(error_model, f_pred, sigma_values))
 }
 
 /// [`residual_variance`] before the invalid-variance guard: the variance the
 /// #958 derivative gates test with [`variance_is_guarded`].
+#[inline]
 pub(crate) fn residual_variance_raw(
     error_model: ErrorModel,
     f_pred: f64,
@@ -548,7 +551,28 @@ impl ErrorSpec {
     /// `2·f·σ_prop²` (σ_prop is the endpoint's proportional sigma, which is the
     /// first sigma for both `Proportional` and `Combined`). `Single` ignores
     /// `cmt`; `PerCmt` dispatches on the endpoint registered for `cmt`.
+    #[inline]
     pub fn dvar_df(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
+        // `Single` without the `exp(−f)` slot, the common spec: the gate below on the raw
+        // variance, then the closed slope — the very expressions of the general path
+        // ([`Self::dvar_df_raw`] reads `σ₀` as `sigma.first()`), without building the
+        // loading shape to learn there is no such slot. `LogCombined` takes the general one.
+        if let ErrorSpec::Single(em) = self {
+            if !matches!(em, ErrorModel::LogCombined) {
+                if variance_is_guarded(residual_variance_raw(*em, f, sigma)) {
+                    return 0.0;
+                }
+                let prop_sigma = sigma.first().copied().unwrap_or(0.0);
+                return match em {
+                    ErrorModel::Additive => 0.0,
+                    _ => 2.0 * f * prop_sigma * prop_sigma,
+                };
+            }
+        }
+        self.dvar_df_general(cmt, f, sigma)
+    }
+
+    fn dvar_df_general(&self, cmt: usize, f: f64, sigma: &[f64]) -> f64 {
         // Guard-aware derivative: where `variance_at` replaces the raw variance by
         // the constant `MIN_VARIANCE` (`variance_is_guarded`: NaN, ≤ 0 or
         // subnormal — e.g. `f = 0` under proportional error) the variance is
@@ -918,14 +942,25 @@ impl ErrorSpec {
         }
     }
 
+    // `Single` (one error model for every endpoint, the common spec) is read inline, so the
+    // per-row dispatch the inner loop runs a million times a fit is a compare and the
+    // variance expression; the per-endpoint spec stays out of line in `variance_at_by`.
+    #[inline]
     pub fn variance_at(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
-        self.variance_at_by(cmt, f_pred, sigma, residual_variance)
+        match self {
+            ErrorSpec::Single(em) => residual_variance(*em, f_pred, sigma),
+            _ => self.variance_at_by(cmt, f_pred, sigma, residual_variance),
+        }
     }
 
     /// [`variance_at`](Self::variance_at) before the invalid-variance guard
     /// ([`variance_is_guarded`]). `NaN` for an unregistered `PerCmt` cmt, as there.
+    #[inline]
     pub(crate) fn variance_at_raw(&self, cmt: usize, f_pred: f64, sigma: &[f64]) -> f64 {
-        self.variance_at_by(cmt, f_pred, sigma, residual_variance_raw)
+        match self {
+            ErrorSpec::Single(em) => residual_variance_raw(*em, f_pred, sigma),
+            _ => self.variance_at_by(cmt, f_pred, sigma, residual_variance_raw),
+        }
     }
 
     fn variance_at_by(
@@ -1190,7 +1225,10 @@ pub(crate) fn loadings_variance_g<T: crate::sens::num::PkNum>(
     rho: impl Fn(usize) -> T,
 ) -> T {
     match loadings_variance_sum(loadings, sigma, correlations, rho) {
-        Some(v) if variance_is_guarded(v.val()) => T::from_f64(MIN_VARIANCE),
+        // `variance_is_guarded` through the branch API (a recording records it, #2786).
+        Some(v) if !v.br_cmp_c(crate::sens::num::BranchCmp::Ge, f64::MIN_POSITIVE) => {
+            T::from_f64(MIN_VARIANCE)
+        }
         Some(v) => v,
         None => T::from_f64(f64::NAN),
     }
@@ -1291,11 +1329,13 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
     if !cov.is_dense() {
         return r;
     }
+    // The pairing reads the loadings' slots only (the value covariance it also returns is
+    // recomputed below on `T`): no value of a generic number is read.
     let lf: Vec<Vec<(usize, f64)>> = lt
         .iter()
-        .map(|l| l.iter().map(|&(i, c)| (i, c.val())).collect())
+        .map(|l| l.iter().map(|&(i, _)| (i, 0.0)).collect())
         .collect();
-    let sigma_v: Vec<f64> = sigma.iter().map(|x| x.val()).collect();
+    let sigma_v = vec![0.0; sigma.len()];
     for (j, k, _) in match_partners(
         &lf,
         &subject.obs_times,
@@ -1310,20 +1350,18 @@ pub(crate) fn r_matrix_g<T: crate::sens::num::PkNum>(
         r[k][j] = c;
     }
     if let (Some(serial), Some(rho_t)) = (cov.serial, serial_rho) {
-        match serial_pairs_jet(
-            serial,
+        match serial_pairs_shape(
+            serial.kind,
             &subject.obs_rgroup,
             &subject.obs_times,
             &subject.obs_raw_times,
             n,
         ) {
             Some(pairs) => {
-                for (j, k, [c, d1, d2, d3, d4]) in pairs {
-                    // C_jk(ρ) with four ρ-derivatives, so the serial ρ is differentiated
-                    // exactly to every order a recording reads (the exact anchor's covariance
-                    // nested dual reads the fourth).
-                    let v = rho_t.lift4(c, d1, d2, d3, d4)
-                        * same_slot_covariance(&lt[j], &lt[k], sigma);
+                for (j, k, shape) in pairs {
+                    // C_jk(ρ) on `T`, so the serial ρ is differentiated exactly to every
+                    // order (#2786: a recording takes the power, not a jet at ρ's value).
+                    let v = shape.coefficient(rho_t) * same_slot_covariance(&lt[j], &lt[k], sigma);
                     r[j][k] = r[j][k] + v;
                     r[k][j] = r[k][j] + v;
                 }
@@ -1657,6 +1695,75 @@ fn serial_pairs_jet(
     obs_raw_times: &[f64],
     n: usize,
 ) -> Option<Vec<(usize, usize, [f64; 5])>> {
+    let rho = serial.rho;
+    Some(
+        serial_pairs_shape(serial.kind, obs_rgroup, obs_times, obs_raw_times, n)?
+            .into_iter()
+            .map(|(j, k, shape)| (j, k, shape.jet(rho)))
+            .filter(|(_, _, c)| c.iter().any(|&x| x != 0.0))
+            .collect(),
+    )
+}
+
+/// How a serial pair's coefficient depends on `ρ`: `ρ` itself (`cs`), or `ρᵉ` with
+/// `e = |p_j − p_k|` (`ar1`, an integer) or `e = |t_j − t_k|` (`car1`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum SerialShape {
+    Linear,
+    Power(f64),
+    IntPower(i32),
+}
+
+impl SerialShape {
+    /// `[C, ∂C/∂ρ, …, ∂⁴C/∂ρ⁴]` at `rho`, each term written so a zero falling-factorial
+    /// coefficient never multiplies a pole at `ρ = 0`.
+    fn jet(self, rho: f64) -> [f64; 5] {
+        match self {
+            SerialShape::Linear => [rho, 1.0, 0.0, 0.0, 0.0],
+            SerialShape::IntPower(lag) => std::array::from_fn(|order| {
+                let order = order as i32;
+                if lag < order {
+                    0.0
+                } else {
+                    let coef: i32 = (0..order).map(|i| lag - i).product();
+                    coef as f64 * rho.powi(lag - order)
+                }
+            }),
+            SerialShape::Power(e) => std::array::from_fn(|order| {
+                let coef: f64 = (0..order).map(|i| e - i as f64).product();
+                if coef == 0.0 {
+                    0.0
+                } else {
+                    coef * rho.powf(e - order as f64)
+                }
+            }),
+        }
+    }
+
+    /// `C(ρ)` on `T`: `ρ`, `ρ` multiplied by itself `lag` times, or `ρᵉ` (`1` at `e = 0`).
+    pub(crate) fn coefficient<T: crate::sens::num::PkNum>(self, rho: T) -> T {
+        match self {
+            SerialShape::Linear => rho,
+            SerialShape::IntPower(lag) => (1..lag)
+                .fold(if lag == 0 { T::from_f64(1.0) } else { rho }, |a, _| {
+                    a * rho
+                }),
+            SerialShape::Power(e) if e == 0.0 => T::from_f64(1.0),
+            SerialShape::Power(e) => rho.pow(T::from_f64(e)),
+        }
+    }
+}
+
+/// Each serial pair `(j, k)` with its coefficient's [`SerialShape`]: the pairs of one
+/// residual group (`obs_rgroup`, `0` none), `ar1`'s lag from each row's position in its
+/// group's time order. `None` when the population lacks its residual blocks.
+fn serial_pairs_shape(
+    kind: crate::types::ResidualSerialKind,
+    obs_rgroup: &[u32],
+    obs_times: &[f64],
+    obs_raw_times: &[f64],
+    n: usize,
+) -> Option<Vec<(usize, usize, SerialShape)>> {
     if n == 0 {
         return Some(Vec::new());
     }
@@ -1665,9 +1772,9 @@ fn serial_pairs_jet(
     }
     let time = |j: usize| crate::types::written_time(obs_times, obs_raw_times, j);
     let mut pos = vec![0usize; n];
-    if serial.kind == crate::types::ResidualSerialKind::Ar1 {
+    if kind == crate::types::ResidualSerialKind::Ar1 {
         let mut order: Vec<usize> = (0..n).filter(|&j| obs_rgroup[j] != 0).collect();
-        order.sort_by(|&a, &b| {
+        order.cold_sort_by(&|&a, &b| {
             obs_rgroup[a]
                 .cmp(&obs_rgroup[b])
                 .then(time(a).total_cmp(&time(b)))
@@ -1694,39 +1801,16 @@ fn serial_pairs_jet(
             if obs_rgroup[k] != g {
                 continue;
             }
-            let rho = serial.rho;
-            // `ρᵉ` and its first four ρ-derivatives (the exact anchor's covariance nested dual
-            // reads all four), each term written so a zero falling-factorial coefficient
-            // (`e ∈ {0, 1, 2, 3}`) never multiplies a pole at `ρ = 0`.
-            let power = |e: f64| -> [f64; 5] {
-                std::array::from_fn(|order| {
-                    let coef: f64 = (0..order).map(|i| e - i as f64).product();
-                    if coef == 0.0 {
-                        0.0
-                    } else {
-                        coef * rho.powf(e - order as f64)
-                    }
-                })
-            };
-            let c = match serial.kind {
-                crate::types::ResidualSerialKind::Cs => [rho, 1.0, 0.0, 0.0, 0.0],
+            let shape = match kind {
+                crate::types::ResidualSerialKind::Cs => SerialShape::Linear,
                 crate::types::ResidualSerialKind::Ar1 => {
-                    let lag = pos[j].abs_diff(pos[k]) as i32;
-                    std::array::from_fn(|order| {
-                        let order = order as i32;
-                        if lag < order {
-                            0.0
-                        } else {
-                            let coef: i32 = (0..order).map(|i| lag - i).product();
-                            coef as f64 * rho.powi(lag - order)
-                        }
-                    })
+                    SerialShape::IntPower(pos[j].abs_diff(pos[k]) as i32)
                 }
-                crate::types::ResidualSerialKind::Car1 => power((time(j) - time(k)).abs()),
+                crate::types::ResidualSerialKind::Car1 => {
+                    SerialShape::Power((time(j) - time(k)).abs())
+                }
             };
-            if c.iter().any(|&x| x != 0.0) {
-                out.push((j, k, c));
-            }
+            out.push((j, k, shape));
         }
     }
     Some(out)
@@ -2686,18 +2770,39 @@ pub fn iwres_autocorrelation(subjects: &[SubjectResult]) -> (f64, f64) {
 /// - A derived `iov_occasion` rule always passes: its labels count the edges at or
 ///   before each time.
 pub(crate) fn occasions_run_in_time(subject: &crate::types::Subject) -> bool {
-    let occ = &subject.occasions;
+    labels_run_in_time(&subject.occasions, &subject.obs_times)
+}
+
+/// Whether `subject`'s **residual blocks** run in time (#2858): the rule of
+/// [`occasions_run_in_time`] on `obs_rgroup`, the blocks of a `correlation … by`
+/// line. Block 0, the rows in no block, is a label like any other. True for a
+/// subject with no blocks or one.
+///
+/// A line `by` a column whose groups follow one another in time (`by OCC` over
+/// visits) leaves the rows of two consecutive blocks independent, and a pair that
+/// joins one block's last row to the next block's first is then a real lag pair of
+/// the decorrelated residuals. Blocks that restart the clock (`by ARM`) are parallel
+/// and stay apart.
+pub(crate) fn residual_blocks_run_in_time(subject: &crate::types::Subject) -> bool {
+    labels_run_in_time(&subject.obs_rgroup, &subject.obs_times)
+}
+
+/// The one rule behind [`occasions_run_in_time`] and
+/// [`residual_blocks_run_in_time`]: every label of `labels` (one per observation
+/// row) is one contiguous run, and each change of label is at a strictly later
+/// `obs_times`.
+fn labels_run_in_time(labels: &[u32], obs_times: &[f64]) -> bool {
     let mut closed: Vec<u32> = Vec::new();
-    for j in 1..occ.len() {
-        if occ[j] == occ[j - 1] {
+    for j in 1..labels.len() {
+        if labels[j] == labels[j - 1] {
             continue;
         }
-        closed.push(occ[j - 1]);
-        let later = match (subject.obs_times.get(j), subject.obs_times.get(j - 1)) {
+        closed.push(labels[j - 1]);
+        let later = match (obs_times.get(j), obs_times.get(j - 1)) {
             (Some(t), Some(prev)) => t > prev,
             _ => false,
         };
-        if !later || closed.contains(&occ[j]) {
+        if !later || closed.contains(&labels[j]) {
             return false;
         }
     }
@@ -2706,11 +2811,11 @@ pub(crate) fn occasions_run_in_time(subject: &crate::types::Subject) -> bool {
 
 /// The series the fit's Durbin–Watson statistic pairs within (#2798): `values`
 /// (one per observation row of `subject`) split into the rows sharing the key
-/// `(occasions[j], obs_rgroup[j])`. The residual-block part is read whenever the
-/// subject carries it; the occasion part only when the subject's occasions do
-/// **not** run in time ([`occasions_run_in_time`], #2829). Rows are grouped **by
-/// key**, not by contiguous run, and kept in row order; the groups come out in order
-/// of first appearance.
+/// `(occasions[j], obs_rgroup[j])`. Each part is read only when it does **not** run
+/// in time: the occasions ([`occasions_run_in_time`], #2829) and the residual blocks
+/// ([`residual_blocks_run_in_time`], #2858) are tested apart, by the same rule. Rows
+/// are grouped **by key**, not by contiguous run, and kept in row order; the groups
+/// come out in order of first appearance.
 ///
 /// The key is what the fit grouped the rows by: the occasions are the prepared
 /// population's (an `iov_column`, a derived `iov_occasion` rule, or a nested
@@ -2724,7 +2829,11 @@ pub(crate) fn occasions_run_in_time(subject: &crate::types::Subject) -> bool {
 ///
 /// Whitened residuals split the same way: the Cholesky factor of a block-diagonal
 /// (up to permutation) `R` has no fill between blocks, so whitening never mixes two
-/// residual blocks, and occasions are joined only inside one block.
+/// residual blocks. Under the model the whitened rows of two blocks are independent,
+/// so a pair across blocks in time asks the statistic's own question: is there
+/// dependence the line does not explain? Split there, a line `by` the visits hid the
+/// cross-visit pairs from the statistic, and with one row per block left it `NaN`
+/// (#2858).
 pub(crate) fn split_by_residual_group(
     values: &[f64],
     subject: &crate::types::Subject,
@@ -2737,10 +2846,15 @@ pub(crate) fn split_by_residual_group(
     } else {
         &subject.occasions
     };
+    let blocks: &[u32] = if residual_blocks_run_in_time(subject) {
+        &[]
+    } else {
+        &subject.obs_rgroup
+    };
     let mut keys: Vec<(Option<u32>, Option<u32>)> = Vec::new();
     let mut groups: Vec<Vec<f64>> = Vec::new();
     for (j, &e) in values.iter().enumerate() {
-        let key = (part(occasions, j), part(&subject.obs_rgroup, j));
+        let key = (part(occasions, j), part(blocks, j));
         match keys.iter().position(|k| *k == key) {
             Some(g) => groups[g].push(e),
             None => {
@@ -2787,8 +2901,8 @@ pub(crate) fn grouped_iwres_autocorrelation(
 /// not factor contributes nothing, as a subject with < 2 finite IWRES does.
 ///
 /// The whitened series is split like the raw one ([`split_by_residual_group`],
-/// #2798): pairs stay within one residual block, and within one occasion when the
-/// subject's occasions are parallel (#2829).
+/// #2798): pairs stay within one residual block when the subject's blocks are
+/// parallel (#2858), and within one occasion when its occasions are (#2829).
 pub(crate) fn whitened_residual_autocorrelation(
     model: &crate::types::CompiledModel,
     population: &crate::types::Population,
@@ -2800,35 +2914,89 @@ pub(crate) fn whitened_residual_autocorrelation(
         .iter()
         .zip(subjects)
         .flat_map(|(subject, res)| {
-            let n = res.iwres.len();
-            if n != subject.observations.len() || res.iwres.iter().any(|v| !v.is_finite()) {
-                return Vec::new();
-            }
-            let err_keys = model.error_spec.obs_keys(subject);
-            let mult = model.ruv_obs_mult(subject, &params.theta);
-            let r = r_matrix_maybe_scaled(
-                &model.error_spec,
-                &res.ipred,
-                err_keys.as_ref(),
-                subject,
-                &params.sigma.values,
-                model.residual_cov_at(params),
-                mult.as_deref(),
-            );
-            let Some(chol) = r.clone().cholesky() else {
-                return Vec::new();
-            };
-            let e = nalgebra::DVector::from_iterator(
-                n,
-                (0..n).map(|j| res.iwres[j] * r[(j, j)].sqrt()),
-            );
-            chol.l()
-                .solve_lower_triangular(&e)
-                .map(|w| split_by_residual_group(w.as_slice(), subject))
+            whitened_rows(model, subject, params, res)
+                .map(|w| split_by_residual_group(&w, subject))
                 .unwrap_or_default()
         })
         .collect();
     residual_autocorrelation(series.iter().map(Vec::as_slice))
+}
+
+/// One subject's residuals decorrelated by its fitted `R`: `w = L⁻¹ D · iwres`
+/// (see [`whitened_residual_autocorrelation`]). `None` when the subject has a
+/// non-finite IWRES, its rows do not line up, or its `R` does not factor.
+fn whitened_rows(
+    model: &crate::types::CompiledModel,
+    subject: &crate::types::Subject,
+    params: &crate::types::ModelParameters,
+    res: &SubjectResult,
+) -> Option<Vec<f64>> {
+    let n = res.iwres.len();
+    if n != subject.observations.len() || res.iwres.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let err_keys = model.error_spec.obs_keys(subject);
+    let mult = model.ruv_obs_mult(subject, &params.theta);
+    let r = r_matrix_maybe_scaled(
+        &model.error_spec,
+        &res.ipred,
+        err_keys.as_ref(),
+        subject,
+        &params.sigma.values,
+        model.residual_cov_at(params),
+        mult.as_deref(),
+    );
+    let chol = r.clone().cholesky()?;
+    let e = nalgebra::DVector::from_iterator(n, (0..n).map(|j| res.iwres[j] * r[(j, j)].sqrt()));
+    chol.l()
+        .solve_lower_triangular(&e)
+        .map(|w| w.as_slice().to_vec())
+}
+
+/// The Durbin–Watson statistic over the lag pairs that **join two residual blocks**
+/// (#2858), with their count: in every subject whose blocks run in time
+/// ([`residual_blocks_run_in_time`]), the consecutive rows `(j − 1, j)` of the
+/// decorrelated series whose blocks differ. `(0, NaN)` when there is none.
+///
+/// These are the pairs a `correlation … by` line over groups in time leaves
+/// independent. The pooled statistic averages them with the pairs inside a block,
+/// which the line models: with three rows per visit, two pairs in three are inside
+/// (measured on `tests/data/dw_sequential_algebraic/rich.csv` under `ar1(RHO) by
+/// OCC`: 1.36 across blocks, 2.11 inside, 1.94 pooled). Pair-normalised like the
+/// pooled one, so independent rows give 2.
+///
+/// A pair that also crosses a parallel occasion is left out, as the pooled
+/// statistic leaves it out.
+pub(crate) fn whitened_cross_block_dw(
+    model: &crate::types::CompiledModel,
+    population: &crate::types::Population,
+    params: &crate::types::ModelParameters,
+    subjects: &[SubjectResult],
+) -> (usize, f64) {
+    let (mut pairs, mut num, mut den) = (0usize, 0.0_f64, 0.0_f64);
+    for (subject, res) in population.subjects.iter().zip(subjects) {
+        if !residual_blocks_run_in_time(subject) {
+            continue;
+        }
+        let Some(w) = whitened_rows(model, subject, params, res) else {
+            continue;
+        };
+        let occasions_joined = occasions_run_in_time(subject);
+        let label = |v: &[u32], j: usize| v.get(j).copied();
+        for j in 1..w.len() {
+            let blocks = &subject.obs_rgroup;
+            let occ = &subject.occasions;
+            if label(blocks, j) == label(blocks, j - 1)
+                || (!occasions_joined && label(occ, j) != label(occ, j - 1))
+            {
+                continue;
+            }
+            pairs += 1;
+            num += (w[j] - w[j - 1]).powi(2);
+            den += (w[j] * w[j] + w[j - 1] * w[j - 1]) / 2.0;
+        }
+    }
+    (pairs, if pairs == 0 { f64::NAN } else { num / den })
 }
 
 /// Pooled lag-1 Pearson correlation and Durbin–Watson statistic of residual series
@@ -3325,6 +3493,74 @@ mod tests {
         // A row of the wrong length carries no exponent half.
         assert_eq!(slot_exponent(&[1.0, 1.0, 1.3], 2, 0), None);
         assert_eq!(slot_exponent(&[1.3], 0, 0), None);
+    }
+
+    /// The `Single` fast paths of `variance_at`, `variance_at_raw` and `dvar_df` are the
+    /// per-endpoint general path bit for bit: every error model, over predictions that
+    /// reach every arm (zero and subnormal and `NaN`, which the variance guard replaces and
+    /// the slope gate zeroes; negative; large). A `PerCmt` spec with the same model at the
+    /// one endpoint is the independent reference for the value and the slope, so a fast arm
+    /// that drifts from the general one reddens here.
+    ///
+    /// Mutations: drop the `variance_is_guarded` return in the `dvar_df` fast arm → the
+    /// `f = -0.0` row (measured: `Proportional slope at f = -0: -0 vs 0`, the live slope
+    /// `2·f·σ²` keeps the zero's sign where the gated one is `+0.0`) and the rows whose raw
+    /// variance underflows or is `NaN` (`1e-200`, `5e-324`, `NaN`: a live slope against `0.0`)
+    /// fail; the `f = 0.0` row does not, since `2·0·σ² = 0.0` is the gated value too. Use
+    /// `sigma[1]` for `prop_sigma` → the combined row differs.
+    #[test]
+    fn single_spec_fast_paths_match_the_per_endpoint_general_path() {
+        for (em, sigma, idx) in [
+            (ErrorModel::Additive, vec![0.3], vec![0usize]),
+            (ErrorModel::Proportional, vec![0.2], vec![0]),
+            (ErrorModel::Combined, vec![0.2, 0.7], vec![0, 1]),
+            (ErrorModel::LogCombined, vec![0.2, 0.7], vec![0, 1]),
+        ] {
+            let single = ErrorSpec::Single(em);
+            let mut map = HashMap::new();
+            map.insert(
+                1usize,
+                EndpointError {
+                    error_model: em,
+                    sigma_idx: idx,
+                },
+            );
+            let per = ErrorSpec::PerCmt(map);
+            for f in [
+                0.0,
+                -0.0,
+                1e-200,
+                5e-324,
+                f64::NAN,
+                -2.5,
+                0.7,
+                13.0,
+                1e150,
+                f64::INFINITY,
+            ] {
+                let same = |a: f64, b: f64, what: &str| {
+                    assert!(
+                        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                        "{em:?} {what} at f = {f}: {a} vs {b}"
+                    );
+                };
+                same(
+                    single.variance_at(1, f, &sigma),
+                    per.variance_at(1, f, &sigma),
+                    "value",
+                );
+                same(
+                    single.variance_at_raw(1, f, &sigma),
+                    per.variance_at_raw(1, f, &sigma),
+                    "raw value",
+                );
+                same(
+                    single.dvar_df(1, f, &sigma),
+                    per.dvar_df(1, f, &sigma),
+                    "slope",
+                );
+            }
+        }
     }
 
     /// `variance_at_scaled` under an exponent is `m²σ²|f|^{2p}` (+ `σ_add²`
@@ -4771,6 +5007,8 @@ mod tests {
             cwres: vec![],
             npde: vec![],
             npd: vec![],
+            epred: vec![],
+            pwres: vec![],
             ofv_contribution: 0.0,
             cens: vec![],
             n_obs: 0,

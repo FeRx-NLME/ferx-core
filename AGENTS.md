@@ -468,7 +468,7 @@ mutation-tested it" does **not** cover:
   This is the whole of `check-report.qmd`'s value and none of it is numeric, which is why the
   rules above do not reach it.
 
-**Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a dual-vs-FD parity test.** The closed-form PK solutions, event-driven propagators and ODE solvers are written once as generic `*_g<T: PkNum>` functions; the adjoint (`sens::ode_provider::adjoint`, `sens/ode_adjoint.rs`) records them over its own dual types and gives FOCE, FOCEI, Laplace and AGQ their exact outer gradient, inner gradient, `H` and covariance R-matrix. A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the recorder or likelihood kernel that consumes them, assert it against central finite differences of the `T = f64` production objective (with the EBE re-found at every point), to a measured tolerance, in a Tier-1 unit test. That parity pins the *derivative* against the value path, not the value path itself — when both share a wrong convention it passes against the exact derivative of the wrong function, which is how #1079 survived. It is an oracle for the gradient only; see the non-degeneracy rule above for what it cannot see. Follow the existing pattern: the reconverged-FD oracles `fd_oracle` / `fd_oracle_agq` (outer gradient) and `hessian_gaps_for` (R-matrix), and the kernel-vs-production `objective_gaps` check, all in `sens/ode_adjoint_tests.rs`, plus the per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`). If a model or subject is outside the recorders' scope it must route to FD via the scope predicates (`adjoint::model_in_scope` / `recorder_in_scope`, `analytic_inner_grad_supported_model`, `cov_width_declines`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.) **Before believing such a fix is complete, ask which engine each fixture actually ran on**: a fixture that routes to FD cannot observe the dual path at all, so a green anchor on it says nothing about the gradient side. Read the `FitResult` FD-fallback warning — on #1210 all seven `nonmem_anchor/ss_chz_*` arms reported "1 of 1 subjects use finite-difference inner gradients", so a green `--lib` suite and green CI never touched `sens/ode_provider.rs`'s dual SS equilibration, and only a Tier-3 convergence fit on a 300-subject joint PK-TTE population reached it. If every fixture says FD, the dual twin is untested.
+**Every change to an analytic sensitivity, gradient, marginal, or likelihood path requires a dual-vs-FD parity test.** The closed-form PK solutions, event-driven propagators and ODE solvers are written once as generic `*_g<T: PkNum>` functions; the adjoint (`sens::ode_provider::adjoint`, `sens/ode_adjoint.rs`) records them into compiled per-subject plans and gives FOCE, FOCEI, Laplace and AGQ their exact outer gradient, inner gradient, `H` and covariance R-matrix. A wrong sensitivity compiles and runs silently — there is no second copy of the formula to disagree with it — so when you add or modify one of these kernels, or the recorder or likelihood kernel that consumes them, assert it against central finite differences of the `T = f64` production objective (with the EBE re-found at every point), to a measured tolerance, in a Tier-1 unit test. That parity pins the *derivative* against the value path, not the value path itself — when both share a wrong convention it passes against the exact derivative of the wrong function, which is how #1079 survived. It is an oracle for the gradient only; see the non-degeneracy rule above for what it cannot see. Follow the existing pattern: the reconverged-FD oracles `fd_oracle` / `fd_oracle_agq` (outer gradient) and `hessian_gaps_for` (R-matrix), and the kernel-vs-production `objective_gaps` check, all in `sens/ode_adjoint_tests.rs`, plus the per-kernel `*_g_dual_matches_fd` checks (`sens/propagate.rs`). If a model or subject is outside the recorders' scope it must route to FD via the scope predicates (`adjoint::model_in_scope` / `recorder_in_scope`, `analytic_inner_grad_supported_model`, `cov_width_declines`); unit-test that routing so a scope gap fails loudly to FD instead of silently returning a wrong gradient. (This is the post-Enzyme successor to the retired `AD↔FD` parity rule — see #285 / #281.) **Before believing such a fix is complete, ask which engine each fixture actually ran on**: a fixture that routes to FD cannot observe the plan path at all, so a green anchor on it says nothing about the gradient side. Read the `FitResult` FD-fallback warning — on #1210 all seven `nonmem_anchor/ss_chz_*` arms reported "1 of 1 subjects use finite-difference inner gradients", so a green `--lib` suite and green CI never touched `sens/ode_provider.rs`'s dual SS equilibration, and only a Tier-3 convergence fit on a 300-subject joint PK-TTE population reached it. If every fixture says FD, the dual twin is untested.
 
 **Coverage is gated per PR.** A PR's changed lines must carry their own tests — the Codecov `patch` status enforces ≥90% coverage on the diff, and a 90% project floor is enforced on the weekly `main` run (see `codecov.yml`). This is the automated backstop to the rules above; slow-tests never run on PRs, so unit / Tier-2 tests are what register coverage. When excluding code from coverage, **scope `ignore`s by role, not by coverage %**: leave code out for *what it is* — dev-only tooling (e.g. `src/bin/generate_data.rs`), generated code (`build.rs`), or test scaffolding (`tests/`) — never because it reads red. (Feature-gated code that the coverage build doesn't compile reads as "missed" but is a measurement gap, not an ignore target — see #293.)
 
@@ -537,7 +537,7 @@ The estimation engine uses a nested optimization structure:
 
 ### Gauss-Newton (BHHH) Optimizer
 
-An alternative estimation method using the BHHH (Berndt-Hall-Hall-Hausman) approximation to the Hessian is available in `estimation/gauss_newton.rs`. It uses the outer product of per-subject gradients (`H ≈ Σ gᵢgᵢᵀ`) as the Hessian of a trust-region step: Steihaug truncated CG on the scaled BHHH system, with the radius set by the ratio of actual to predicted OFV reduction. Two variants are available:
+An alternative estimation method using the BHHH (Berndt-Hall-Hall-Hausman) approximation to the Hessian is available in `estimation/gauss_newton.rs`. It uses the outer product of per-subject gradients (`H ≈ Σ dᵢdᵢᵀ`, `dᵢ` each subject's total derivative, the same rows as the gradient and the covariance step's `S`, #2974) as the Hessian of a trust-region step: Steihaug truncated CG on the scaled BHHH system, with the radius set by the ratio of actual to predicted OFV reduction. Two variants are available:
 
 - **`method = gn`** (pure Gauss-Newton): Fast convergence for well-conditioned problems.
 - **`method = gn_hybrid`**: Runs GN first, then polishes with FOCEI via `outer_optimizer.rs` for robustness.
@@ -571,7 +571,7 @@ FitResult → io/output.rs → sdtab CSV + fit YAML
 | `estimation/covariance.rs` | Covariance/SE step: FD-of-OFV Hessian, eigen-floor inverse, score cross-product, non-PD SIR fallback (`compute_covariance`, `run_covariance_step`) |
 | `stats/likelihood.rs` | Individual, FOCE, and FOCEI negative log-likelihood computations |
 | `stats/residual_error.rs` | Additive, proportional, combined error models; IWRES/CWRES. **Sole owner of the residual-variance-and-derivatives math**: the `residual_variance` primitive, the `ErrorSpec` dispatch layer (`variance_at{,_scaled,_with_correlations}`, `dvar_df{,_scaled}`, `d2var_df2{,_scaled}`, `sigma_loadings`/`_slopes`, …), the `residual_rd`/`residual_rd2` scalar accessors, and the dense-`R`/IWRES consumers. `types.rs` keeps only the `ErrorSpec` data definition + `obs_key`/`obs_keys`. Two association traps: `variance_at` (legacy `(f·σ)·(f·σ)`) is deliberately **not** collapsed into `variance_at_scaled` (`((f·f)·σ)·σ`) — they differ by ~1 ULP and every bare-σ R/OFV/CWRES is pinned to the legacy form; and `ruv_scale` is applied by each **caller**, never folded into `residual_rd` |
-| `sens/` | Dual number types over the `PkNum` trait and the adjoint that records the generic kernels on them (`ode_provider::adjoint`): the exact outer and inner gradients, `H` and covariance R-matrix of FOCE/FOCEI/Laplace/AGQ |
+| `sens/` | The `PkNum` trait with the generic `*_g<T>` kernels, and the adjoint that records them into compiled per-subject plans (`ode_provider::adjoint`, plans built by `parser/kernel_jit.rs`): the exact outer and inner gradients, `H` and covariance R-matrix of FOCE/FOCEI/Laplace/AGQ. `Dual2` (`sens/dual2.rs`) is the independent forward second-order dual the tests check the plans against; `jet::DualT` is the forward jet used inside kernels |
 | `io/datareader.rs` | NONMEM-format CSV reader (ID, TIME, DV, EVID, AMT, CMT, RATE, MDV, II, SS) |
 
 ### Model File Format (.ferx)
@@ -595,11 +595,16 @@ Warnings and non-fatal issues should be collected into `FitResult.warnings` (a `
 The closed-form PK solutions, event-driven propagators and ODE solvers are written
 **once** as generic `*_g<T: PkNum>` functions (`sens/`, `pk/event_driven.rs`, `ode/`);
 `T = f64` gives the predictions. The adjoint (`sens/ode_adjoint.rs`, re-exported as
-`sens::ode_provider::adjoint`) records the same functions over its own dual types — `vtape::DualV`
-(θ on a reverse tape, η-jets forward), `vfree::DualF` (tape-free η-jets for the inner loop) and
-`rtape::{DualT, DualH}` (the covariance step's nested duals) — and assembles the exact outer
-gradient (`Ψ = F − wᵀ∇_η l`), inner gradient, `H` and R-matrix for FOCE, FOCEI, Laplace and AGQ
-from them. There is no second copy of any formula to keep in sync — edit the generic version.
+`sens::ode_provider::adjoint`) records the same functions on the recording type
+`kernel_jit::Tr` into a per-subject **plan**: a template (one per event structure and
+configuration) that is Cranelift-compiled and replayed at new `(θ, η)` by a forward pass
+(values, η-tangents, optionally second order) and by multi-seed reverse passes. The
+likelihood kernel (`sens/focei_kernel.rs`, generic over the number type) is recorded the same
+way, so the exact outer gradient (`Ψ = F − wᵀ∇_η l`), inner gradient, `H` and R-matrix for
+FOCE, FOCEI, Laplace and AGQ are combinations of reverse passes through the kernel plan and
+the prediction plan, at any number of random effects. `Dual2` and `jet::DualT` remain as
+plain forward types (test oracles and local derivatives recorded into a plan), not as an
+AD engine. There is no second copy of any formula to keep in sync — edit the generic version.
 
 ## Changelog
 
@@ -634,6 +639,27 @@ updates the compare links and deletes the fragments; `tools/changelog.sh
 preview` shows what is pending. The R wrapper (`../ferx-r`) tracks its own
 user-facing changes in `NEWS.md`, so a cross-repo change may need an entry in
 both.
+
+## Priority labels
+
+Issues and PRs are triaged with four GitHub priority labels (`gh label list`);
+they live only on GitHub, not anywhere in the tree. The axis is **correctness
+severity × how common the trigger**:
+
+| Label | Priority | Scope |
+|-------|----------|-------|
+| `P0` | Critical | silent wrong results / data corruption in common use |
+| `P1` | High | correctness bug or wrong result in realistic use, or loud failure blocking common workflows |
+| `P2` | Medium | edge-case correctness, important features, UX/diagnostics |
+| `P3` | Low | performance, refactors, nice-to-haves, research |
+
+So P0/P1 are about a *wrong answer* (P0 silent in common use, P1 in realistic
+use or a loud blocker), P2 widens to edge-case correctness plus features and
+diagnostics, and P3 is everything not about a wrong result.
+
+**The applied label is the source of truth.** A `P1`/`P2` typed into an issue
+*title* is prose and can disagree with the label actually set — e.g. #1716 is
+titled `(#359 P1)` but carries the `P2` label. Trust the label, not the title.
 
 ## Pull Requests
 

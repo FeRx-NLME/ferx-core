@@ -802,8 +802,8 @@ fn ctmm_refusals_are_coded() {
 fn a_missing_data_path_is_coded() {
     let f = write_model(ONE_CPT_IV);
     let path = f.path().to_str().unwrap();
-    let want = "no dataset specified — pass a data path, or add a `[data]` block \
-                (`path = ...`) to the model file";
+    let want = "no dataset specified — pass a data path, or set `path = ...` in the \
+                model file's `[data]` block";
     let errs = [
         (
             "fit_from_files",

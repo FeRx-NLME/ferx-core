@@ -105,18 +105,8 @@ pub fn three_cpt_oral(
 // --- Steady-state (SS=1) variants ---
 //
 // Same geometric-series pattern as 1-/2-cpt: each exponential A·exp(-λ·t) gets
-// scaled by 1/(1 - exp(-λ·II)). For oral, the per-eigenvalue Bateman function
-// is summed in closed form, including a L'Hopital limit when ka ≈ λ.
-
-#[inline]
-fn ss_coeff_3(lambda: f64, ii: f64) -> f64 {
-    let denom = 1.0 - (-lambda * ii).exp();
-    if denom > 0.0 {
-        1.0 / denom
-    } else {
-        0.0
-    }
-}
+// scaled by 1/(1 - exp(-λ·II)); for oral, the per-eigenvalue Bateman function
+// gets its own geometric sum (`sens::num::bateman_ss`), smooth through ka = λ.
 
 /// Three-compartment IV bolus at steady state.
 #[inline]
@@ -221,101 +211,43 @@ pub(crate) fn three_cpt_iv_peripherals(
     if v2 <= 0.0 || v3 <= 0.0 || q2 < 0.0 || q3 < 0.0 {
         return [0.0; 2];
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
+    let Some([m2, m3]) = peripheral_modes(cl, v1, q2, v2, q3, v3) else {
         return [0.0; 2];
+    };
+    let mode = |lam| crate::sens::one_cpt::mode_dose(dose, lam, tau);
+    use crate::sens::one_cpt::modal_sum;
+    [
+        q2 / (v1 * v2) * modal_sum(&m2, mode),
+        q3 / (v1 * v3) * modal_sum(&m3, mode),
+    ]
+}
+
+/// The modes `(c, λ)` of each peripheral's response to a unit central impulse (the factor
+/// `k12`, `k13` left to the caller): the residues of `(s + k31)` (peripheral 1) and `(s + k21)`
+/// (peripheral 2) over `(s + α)(s + β)(s + γ)`. `None` at a repeated root, which needs a zero
+/// inter-compartmental clearance.
+#[allow(clippy::type_complexity)]
+fn peripheral_modes(
+    cl: f64,
+    v1: f64,
+    q2: f64,
+    v2: f64,
+    q3: f64,
+    v3: f64,
+) -> Option<[[(f64, f64); 3]; 2]> {
+    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
+    let (ab, ag, bg) = (alpha - beta, alpha - gamma, beta - gamma);
+    if ab <= 0.0 || bg <= 0.0 {
+        return None;
     }
-
-    let c2_scalar = q2 / (v1 * v2); // k12/v2
-    let c3_scalar = q3 / (v1 * v3); // k13/v3
-    let d = dose.amt;
-    let is_ss = dose.ss && dose.ii > 0.0;
-
-    // Per-eigenvalue steady-state geometric factor, folded conditionally exactly as
-    // `three_cpt_oral_peripherals` does: 1/(1−e^{−λ·II}) at SS, else 1. Kept as a
-    // *separate* trailing factor (not multiplied into e^{−λτ}), so the residue
-    // arithmetic is bit-identical to the four hand-written copies this collapses —
-    // `x * 1.0` is the identity, so the non-SS path is unchanged, and the SS path
-    // keeps the original `((coeff · e^{−λτ}) · ss_coeff_3)` association.
-    let term = |lambda: f64| -> f64 {
-        if is_ss {
-            ss_coeff_3(lambda, dose.ii)
-        } else {
-            1.0
-        }
-    };
-
-    // Bolus tri-exponential residue — the single closed form for single-dose,
-    // SS, and degenerate (`dur ≤ 0`) infusion. C_periph1 uses (c2_scalar, k31);
-    // C_periph2 swaps k31↔k21 and q2/v2 → q3/v3 (i.e. c3_scalar, k21).
-    let periph_bolus = |c_scalar: f64, k_far: f64| -> f64 {
-        c_scalar
-            * d
-            * (-(alpha - k_far) / (ab * ag) * (-alpha * tau).exp() * term(alpha)
-                + (beta - k_far) / (ab * bg) * (-beta * tau).exp() * term(beta)
-                - (gamma - k_far) / (ag * bg) * (-gamma * tau).exp() * term(gamma))
-    };
-
-    if dose.is_infusion() {
-        let dur = dose.duration;
-        if dur <= 0.0 {
-            // Degenerate infusion → treat as bolus (SS folds through `term`).
-            return [periph_bolus(c2_scalar, k31), periph_bolus(c3_scalar, k21)];
-        }
-        if is_ss && dur > dose.ii {
-            return [0.0; 2];
-        }
-        // After-infusion peripheral formula. During the infusion window the SS case
-        // additionally superposes the past-pulse train (each pulse carrying its own
-        // `ss_coeff_3` geometric factor); after the window every term picks up the
-        // conditional `term(λ)` factor (1 for non-SS).
-        let infusion_periph = |c_scalar: f64, k_far: f64| -> f64 {
-            let r = dose.rate;
-            // coeff_X = rate · c_scalar · (X_eigenvalue_residue) / (product · eigenvalue)
-            let coeff_a = -r * c_scalar * (alpha - k_far) / (ab * ag * alpha);
-            let coeff_b = r * c_scalar * (beta - k_far) / (ab * bg * beta);
-            let coeff_g = -r * c_scalar * (gamma - k_far) / (ag * bg * gamma);
-            if tau <= dur {
-                let cur = coeff_a * (1.0 - (-alpha * tau).exp())
-                    + coeff_b * (1.0 - (-beta * tau).exp())
-                    + coeff_g * (1.0 - (-gamma * tau).exp());
-                if is_ss {
-                    let past = coeff_a
-                        * (1.0 - (-alpha * dur).exp())
-                        * (-alpha * (tau - dur)).exp()
-                        * (-alpha * dose.ii).exp()
-                        * ss_coeff_3(alpha, dose.ii)
-                        + coeff_b
-                            * (1.0 - (-beta * dur).exp())
-                            * (-beta * (tau - dur)).exp()
-                            * (-beta * dose.ii).exp()
-                            * ss_coeff_3(beta, dose.ii)
-                        + coeff_g
-                            * (1.0 - (-gamma * dur).exp())
-                            * (-gamma * (tau - dur)).exp()
-                            * (-gamma * dose.ii).exp()
-                            * ss_coeff_3(gamma, dose.ii);
-                    cur + past
-                } else {
-                    cur
-                }
-            } else {
-                let dt = tau - dur;
-                coeff_a * (1.0 - (-alpha * dur).exp()) * (-alpha * dt).exp() * term(alpha)
-                    + coeff_b * (1.0 - (-beta * dur).exp()) * (-beta * dt).exp() * term(beta)
-                    + coeff_g * (1.0 - (-gamma * dur).exp()) * (-gamma * dt).exp() * term(gamma)
-            }
-        };
+    let modes = |k: f64| {
         [
-            infusion_periph(c2_scalar, k31),
-            infusion_periph(c3_scalar, k21),
+            (-(alpha - k) / (ab * ag), alpha),
+            ((beta - k) / (ab * bg), beta),
+            (-(gamma - k) / (ag * bg), gamma),
         ]
-    } else {
-        [periph_bolus(c2_scalar, k31), periph_bolus(c3_scalar, k21)]
-    }
+    };
+    Some([modes(k31), modes(k21)])
 }
 
 /// Returns [C_periph1, C_periph2] for a 3-cpt oral single dose at elapsed time tau.
@@ -325,8 +257,8 @@ pub(crate) fn three_cpt_iv_peripherals(
 ///                        − (γ−k31)/((ka−γ)·ag·bg) · e^(−γτ)
 ///                        + (k31−ka)/((α−ka)(β−ka)(γ−ka)) · e^(−kaτ) ]
 /// and C3 likewise with k21 substituted for k31 and (q3/v3) for (q2/v2).
-/// Each exp term gains a 1/(1−e^(−λ·II)) factor at steady state.
-/// Returns 0 when ka ≈ any eigenvalue (L'Hôpital singularity, see body).
+/// Each exp term gains a 1/(1−e^(−λ·II)) factor at steady state. Written through the
+/// Bateman function, which is smooth where `ka` meets an eigenvalue.
 pub(crate) fn three_cpt_oral_peripherals(
     dose: &DoseEvent,
     tau: f64,
@@ -357,66 +289,29 @@ pub(crate) fn three_cpt_oral_peripherals(
     if v2 <= 0.0 || v3 <= 0.0 || q2 < 0.0 || q3 < 0.0 || ka <= 0.0 {
         return [0.0; 2];
     }
-    let (alpha, beta, gamma, k21, k31) = macro_rates_three_cpt(cl, v1, q2, v2, q3, v3);
-    let ab = alpha - beta;
-    let ag = alpha - gamma;
-    let bg = beta - gamma;
-    if ab.abs() < 1e-12 || ag.abs() < 1e-12 || bg.abs() < 1e-12 {
+    let Some([m2, m3]) = peripheral_modes(cl, v1, q2, v2, q3, v3) else {
         return [0.0; 2];
-    }
-
-    let d = f_bio * dose.amt * ka / v1;
-    let q2_over_v2 = q2 / v2;
-    let q3_over_v3 = q3 / v3;
-
-    // When ka ≈ any eigenvalue the (ka−λ) residue denominators below are
-    // singular (a genuine L'Hôpital case). The finite limit is algebraically
-    // complex; we conservatively zero the *entire* peripheral result. This
-    // matches the 2-cpt oral peripheral and the edge case (ka coinciding with
-    // a 3-cpt eigenvalue) is rare in real PK data. The central concentration is
-    // unaffected (handled separately in the central formula).
-    if (ka - alpha).abs() < 1e-6 || (ka - beta).abs() < 1e-6 || (ka - gamma).abs() < 1e-6 {
-        return [0.0, 0.0];
-    }
-
-    // Per-exponential term, with steady-state geometric accumulation when SS.
-    // The single-dose solution is a sum of exp(−λτ) terms (λ ∈ {α,β,γ,ka}); SS
-    // superposition applies the 1/(1−exp(−λ·II)) factor to each independently.
-    let term = |lambda: f64| -> f64 {
-        let base = (-lambda * tau).exp();
-        if dose.ss && dose.ii > 0.0 {
-            base * ss_coeff_3(lambda, dose.ii)
+    };
+    // In Laplace space the central *amount* after oral input is
+    //   A1(s) = F·D·ka·(s+k21)(s+k31) / [(s+ka)(s+α)(s+β)(s+γ)],
+    // so A2(s) = k12·A1(s)/(s+k21) and A3(s) = k13·A1(s)/(s+k31): the coupling pole cancels,
+    // leaving each peripheral's central-impulse modes convolved with the depot's drain —
+    // Bateman functions, smooth through `ka` at any root (at steady state, their geometric
+    // sums). Issue #205, NONMEM-validated.
+    let (d, ii) = (f_bio * dose.amt * ka / v1, dose.ii);
+    let ss = dose.ss && ii > 0.0;
+    let bateman = |lam| {
+        if ss {
+            crate::sens::num::bateman_ss(lam, ka, tau, ii)
         } else {
-            base
+            crate::sens::num::bateman(lam, ka, tau)
         }
     };
-
-    // Closed form (issue #205, NONMEM-validated). In Laplace space the central
-    // *amount* after oral input is
-    //   A1(s) = F·D·ka·(s+k21)(s+k31) / [(s+ka)(s+α)(s+β)(s+γ)],
-    // so the peripheral amounts are
-    //   A2(s) = k12·A1(s)/(s+k21) = F·D·ka·k12·(s+k31) / [(s+ka)(s+α)(s+β)(s+γ)]
-    //   A3(s) = k13·A1(s)/(s+k31) = F·D·ka·k13·(s+k21) / [(s+ka)(s+α)(s+β)(s+γ)]
-    // — the coupling pole cancels, leaving four poles. Inverting and dividing
-    // by the peripheral volume gives a residue on each exp(−λτ), λ ∈ {α,β,γ,ka}.
-    // (The prior implementation multiplied each eigenvalue residue by a Bateman
-    // helper, introducing a spurious extra 1/(ka−λ) and a double-counted
-    // exp(−ka·τ) pole — it produced wrong, often negative, peripheral states.)
-    let c2 = q2_over_v2
-        * d
-        * (-(alpha - k31) / ((ka - alpha) * ab * ag) * term(alpha)
-            + (beta - k31) / ((ka - beta) * ab * bg) * term(beta)
-            - (gamma - k31) / ((ka - gamma) * ag * bg) * term(gamma)
-            + (k31 - ka) / ((alpha - ka) * (beta - ka) * (gamma - ka)) * term(ka));
-
-    let c3 = q3_over_v3
-        * d
-        * (-(alpha - k21) / ((ka - alpha) * ab * ag) * term(alpha)
-            + (beta - k21) / ((ka - beta) * ab * bg) * term(beta)
-            - (gamma - k21) / ((ka - gamma) * ag * bg) * term(gamma)
-            + (k21 - ka) / ((alpha - ka) * (beta - ka) * (gamma - ka)) * term(ka));
-
-    [c2, c3]
+    use crate::sens::one_cpt::modal_sum;
+    [
+        q2 / v2 * d * modal_sum(&m2, bateman),
+        q3 / v3 * d * modal_sum(&m3, bateman),
+    ]
 }
 
 /// Predict concentration from a single dose at elapsed time t using 3-cmt model.

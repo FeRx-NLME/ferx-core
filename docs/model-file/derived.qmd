@@ -117,7 +117,7 @@ AUC24_grid = integral(IPRED, from=0, to=24, step=0.5)
 
 A `[derived]` name must **not** clash with:
 
-- Built-in sdtab columns: `ID`, `TIME`, `DV`, `PRED`, `IPRED`, `CWRES`, `IWRES`, `EBE_OFV`, `N_OBS`, `TAFD`, `TAD`, `CENS`, `OCC`, `CMT`
+- Built-in sdtab columns: `ID`, `TIME`, `DV`, `PRED`, `IPRED`, `CWRES`, `IWRES`, `EBE_OFV`, `N_OBS`, `TAFD`, `TAD`, `CENS`, `OCC`, `CMT`, and the mixture columns `MIXNUM`, `MIXEST` (#2784)
 - Any theta, eta, or individual-parameter name in the model
 
 Shadowing a **covariate** name is permitted (the covariate column is replaced) but will emit a `W_DERIVED_COVARIATE_SHADOW` warning.

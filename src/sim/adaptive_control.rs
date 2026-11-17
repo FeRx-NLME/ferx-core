@@ -21,9 +21,9 @@
 use crate::diagnostics::Diagnostic;
 use crate::ode::OdeOutputFn;
 use crate::sim::adaptive::{
-    dose_plan_violation, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute, AdaptiveRule,
-    Comparison, ControllerCtx, ControllerDecision, DoseAction, DoseGrid, DosePlanViolation,
-    DoseStep, IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
+    dose_plan_violation, percent_step, AdaptiveAction, AdaptiveDosingSpec, AdaptiveRoute,
+    AdaptiveRule, Comparison, ControllerCtx, ControllerDecision, DoseAction, DoseGrid,
+    DosePlanViolation, DoseStep, IntervalStep, MonitorSpec, ObserveMode, SubjectDosePlan,
 };
 use crate::types::CompiledModel;
 
@@ -233,11 +233,9 @@ impl AdaptiveController {
         let (lo, hi) = self.dose_bounds;
         match (step, &self.levels) {
             (DoseStep::Percent(p), _) => {
-                let factor = if up { 1.0 + p / 100.0 } else { 1.0 - p / 100.0 };
-                let x = self.dose * factor;
                 self.dose = match &self.grid {
-                    Some(g) => g.place(x),
-                    None => x.clamp(lo, hi),
+                    Some(g) => g.step_percent(self.dose, p, up),
+                    None => percent_step(self.dose, p, up).clamp(lo, hi),
                 };
             }
             (DoseStep::Level, Some(levels)) => {
@@ -705,6 +703,7 @@ mod tests {
             auc_target: None,
             round_to: None,
             dose_knowledge: Default::default(),
+            decision_covariates: Default::default(),
             rules,
             intervals: None,
             start_interval: None,
@@ -1066,6 +1065,7 @@ mod tests {
             auc_target: None,
             round_to: None,
             dose_knowledge: Default::default(),
+            decision_covariates: Default::default(),
             rules: vec![rule(Comparison::Gt, 1000.0, AdaptiveAction::Hold)],
             intervals: None,
             start_interval: None,

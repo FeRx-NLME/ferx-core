@@ -4,11 +4,9 @@ use argmin::core::{
 };
 use argmin::solver::trustregion::{Steihaug, TrustRegion};
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 
-use crate::estimation::gauss_newton::{ebe_response_correction, subject_nll_pop_grad_with_cache};
 use crate::estimation::inner_optimizer::{
-    run_inner_loop_warm_map, InnerHessianSeed, InnerSolvePolicy,
+    run_inner_loop_warm_map, InnerHessianSeed, InnerSolvePolicy, PrevEtas,
 };
 use crate::estimation::outer_optimizer::{
     ebe_screen_moved_warning, final_ebe_check, final_inner_solve, gate_converged_on_objective,
@@ -26,13 +24,9 @@ struct GradCache {
     x: Vec<f64>,
     etas: Vec<DVector<f64>>,
     h_mats: Vec<DMatrix<f64>>,
-    /// Raw per-subject score `gᵢ` — the BHHH Hessian's outer-product input.
+    /// Per-subject total derivative `dᵢ` (#2974) — the gradient's terms and the BHHH
+    /// Hessian's outer-product input alike.
     per_subj_grads: Vec<Vec<f64>>,
-    /// Per-subject FOCEI EBE-response correction `tᵢ` (`∂log|H̃|/∂η · dη̂/dθ`),
-    /// all-zero under FOCE / additive error. Kept alongside `gᵢ` rather than
-    /// folded into it: the gradient wants `gᵢ + tᵢ`, the BHHH Hessian must stay
-    /// on the raw score (see [`Gradient`] / [`Hessian`] below).
-    per_subj_corrections: Vec<Vec<f64>>,
 }
 
 struct FoceiProblem<'a> {
@@ -42,10 +36,11 @@ struct FoceiProblem<'a> {
     init_params: &'a ModelParameters,
     bounds: PackedBounds,
     cached_etas: std::sync::Mutex<Vec<DVector<f64>>>,
-    /// `cached_etas` are converged modes at the start point, not yet consumed: the next
-    /// inner pass takes them as warm starts whatever their values
-    /// (`InnerSolvePolicy::init_is_mode`, #2076) and clears the flag.
-    cached_etas_are_modes: std::sync::atomic::AtomicBool,
+    /// What `cached_etas` are: `ModesHere` while they are converged modes at the start
+    /// point, not yet consumed — the next inner pass takes them as warm starts whatever
+    /// their values (`InnerSolvePolicy::init_is_mode`, #2076) — and `Solved` once a pass
+    /// wrote them, so an exactly-zero EBE is not re-solved as a cold start.
+    cached_etas_kind: std::sync::Mutex<PrevEtas>,
     grad_cache: std::sync::Mutex<Option<GradCache>>,
     /// Covariate-NN (DCM) regularizer. No-op when both λ are 0. Added to the
     /// optimizer objective (`cost`/`ofv_fixed`), gradient and Hessian, not to
@@ -67,9 +62,11 @@ impl FoceiProblem<'_> {
         };
         let mu_k = compute_mu_k(self.model, &params.theta, self.options.mu_referencing);
         // `run_inner_loop_warm_seeded`'s solve, with the #2076 certificate carried through.
-        let init_is_mode = self
-            .cached_etas_are_modes
-            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        // Every pass's modes become the cache below.
+        let prev = std::mem::replace(
+            &mut *self.cached_etas_kind.lock().unwrap(),
+            PrevEtas::Solved,
+        );
         let (etas, h_mats, _, _kappas, _) = run_inner_loop_warm_map(
             self.model,
             self.population,
@@ -82,9 +79,9 @@ impl FoceiProblem<'_> {
             self.options.inner_restarts,
             InnerSolvePolicy {
                 seed: InnerHessianSeed::for_options(self.options),
-                init_is_mode,
                 ..InnerSolvePolicy::for_stage(self.options, self.model)
-            },
+            }
+            .with_prev_etas(prev),
             None,
             |_, _| (),
         );
@@ -112,13 +109,11 @@ impl FoceiProblem<'_> {
         }
     }
 
-    /// Compute per-subject NLL gradients via `subject_nll_pop_grad_with_cache`,
-    /// caching the result so that `hessian()` can reuse it without a second
-    /// inner-loop solve.
+    /// Compute the per-subject rows `dᵢ` (`gauss_newton::gn_subject_rows`, each subject's
+    /// total derivative), caching the result so that `hessian()` can reuse it without a
+    /// second inner-loop solve.
     ///
-    /// Returns `(etas, h_mats, gᵢ, tᵢ)`: the raw score and the FOCEI EBE-response
-    /// correction separately, because they have different consumers — see the
-    /// [`Gradient`] and [`Hessian`] impls.
+    /// Returns `(etas, h_mats, dᵢ)`.
     ///
     /// Three cache states (keyed by `x` equality and sentinel field):
     ///   Full hit:    `c.x == x` and `!c.per_subj_grads.is_empty()` → return everything cached.
@@ -126,27 +121,14 @@ impl FoceiProblem<'_> {
     ///                                                                   run AD pass only.
     ///   Miss:        `c.x != x` or cache is `None`                 → full inner solve + AD.
     #[allow(clippy::type_complexity)]
-    fn compute_ad_grads(
-        &self,
-        x: &[f64],
-    ) -> (
-        Vec<DVector<f64>>,
-        Vec<DMatrix<f64>>,
-        Vec<Vec<f64>>,
-        Vec<Vec<f64>>,
-    ) {
+    fn compute_ad_grads(&self, x: &[f64]) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<f64>>) {
         let maybe_warm: Option<(Vec<DVector<f64>>, Vec<DMatrix<f64>>)> = {
             let cache = self.grad_cache.lock().unwrap();
             if let Some(ref c) = *cache {
                 if c.x == x {
                     if !c.per_subj_grads.is_empty() {
                         // Full hit: EBEs and AD gradients both cached.
-                        return (
-                            c.etas.clone(),
-                            c.h_mats.clone(),
-                            c.per_subj_grads.clone(),
-                            c.per_subj_corrections.clone(),
-                        );
+                        return (c.etas.clone(), c.h_mats.clone(), c.per_subj_grads.clone());
                     }
                     // Partial hit: EBEs ready from cost(), AD not yet done.
                     Some((c.etas.clone(), c.h_mats.clone()))
@@ -162,51 +144,26 @@ impl FoceiProblem<'_> {
         let (etas, h_mats) = maybe_warm.unwrap_or_else(|| self.run_inner(x));
         let n_subj = self.population.subjects.len();
 
-        let per_subj: Vec<(Vec<f64>, Vec<f64>)> = (0..n_subj)
-            .into_par_iter()
-            .map(|i| {
-                let (nll, gi, cache) = subject_nll_pop_grad_with_cache(
-                    x,
-                    self.init_params,
-                    self.model,
-                    self.population,
-                    i,
-                    &etas[i],
-                    &h_mats[i],
-                    &[], // IOV not yet supported in trust_region path
-                    &self.bounds,
-                    self.options,
-                );
-                let ti = ebe_response_correction(
-                    x,
-                    self.init_params,
-                    self.model,
-                    self.population,
-                    i,
-                    &etas[i],
-                    &[],
-                    None,
-                    nll,
-                    &gi,
-                    cache.as_ref(),
-                    &self.bounds,
-                    self.options,
-                );
-                (gi, ti)
-            })
-            .collect();
-
-        let (grads, corrections): (Vec<Vec<f64>>, Vec<Vec<f64>>) = per_subj.into_iter().unzip();
-
+        // #2974: each subject's row is its total derivative `dᵢ`, in the gradient and the BHHH
+        // matrix alike (`gauss_newton::gn_subject_rows`).
+        let rows = crate::estimation::gauss_newton::gn_subject_rows(
+            x,
+            self.init_params,
+            self.model,
+            self.population,
+            &etas,
+            &vec![Vec::new(); n_subj],
+            &self.bounds,
+            self.options,
+            &[],
+        );
         *self.grad_cache.lock().unwrap() = Some(GradCache {
             x: x.to_vec(),
             etas: etas.clone(),
             h_mats: h_mats.clone(),
-            per_subj_grads: grads.clone(),
-            per_subj_corrections: corrections.clone(),
+            per_subj_grads: rows.clone(),
         });
-
-        (etas, h_mats, grads, corrections)
+        (etas, h_mats, rows)
     }
 }
 
@@ -228,7 +185,6 @@ impl CostFunction for FoceiProblem<'_> {
             etas,
             h_mats,
             per_subj_grads: vec![],
-            per_subj_corrections: vec![],
         });
         Ok(ofv)
     }
@@ -238,22 +194,16 @@ impl Gradient for FoceiProblem<'_> {
     type Param = Vec<f64>;
     type Gradient = Vec<f64>;
 
-    /// `grad(OFV) = 2 · Σᵢ (gᵢ + tᵢ)` — the score plus the FOCEI `log|H̃|`
-    /// EBE-response curvature.
-    ///
-    /// `tᵢ` is not optional polish: under `interaction` the fixed-η̂ analytic
-    /// gradient drops it (the #274/#289 Δ — the envelope theorem zeros the inner
-    /// objective but not `log|H̃|`), and a gradient optimizer descending on the
-    /// truncated score stalls above the minimum (warfarin FOCEI −276.6 instead of
-    /// −286.0, `gauss_newton::build_gn_system`). It is identically zero under
-    /// FOCE and for additive error, so those paths are unchanged bit-for-bit.
+    /// `grad(OFV) = 2 · Σᵢ dᵢ`, `dᵢ` each subject's total derivative (the EBE response
+    /// included; a fixed-η̂ score drops the FOCEI `log|H̃|` response, and a gradient optimizer
+    /// descending on it stalls above the minimum — warfarin FOCEI −276.6 instead of −286.0).
     fn gradient(&self, p: &Vec<f64>) -> Result<Vec<f64>, Error> {
-        let (_, _, per_subj, corrections) = self.compute_ad_grads(p);
+        let (_, _, per_subj) = self.compute_ad_grads(p);
         let n = p.len();
         let mut g = vec![0.0_f64; n];
-        for (gi, ti) in per_subj.iter().zip(&corrections) {
+        for di in &per_subj {
             for k in 0..n {
-                g[k] += 2.0 * (gi[k] + ti[k]);
+                g[k] += 2.0 * di[k];
             }
         }
         // NN penalty gradient. NN weights are identity-packed, so a natural-space
@@ -273,14 +223,11 @@ impl Hessian for FoceiProblem<'_> {
     type Hessian = Vec<Vec<f64>>;
 
     fn hessian(&self, p: &Vec<f64>) -> Result<Vec<Vec<f64>>, Error> {
-        let (_, _, per_subj, _) = self.compute_ad_grads(p);
+        let (_, _, per_subj) = self.compute_ad_grads(p);
         let n = p.len();
-        // BHHH approximation: H ≈ 4 Σ gᵢgᵢᵀ  (factor 4 because OFV = 2*NLL,
-        // so grad(OFV) = 2*gᵢ and the outer product scales by 4).
-        //
-        // Raw score only — the FOCEI `tᵢ` correction the gradient carries is a
-        // *curvature* term, not part of the score, and folding it into the outer
-        // product corrupts the Hessian (same rule as `build_gn_system`).
+        // BHHH approximation: H ≈ 4 Σ dᵢdᵢᵀ (factor 4 because OFV = 2*NLL, so
+        // grad(OFV) = 2*dᵢ and the outer product scales by 4), from the gradient's own
+        // rows (#2974).
         let mut h = vec![vec![0.0_f64; n]; n];
         for gi in &per_subj {
             for i in 0..n {
@@ -830,8 +777,12 @@ pub(crate) fn optimize_trust_region_seeded(
             Some(etas) if etas.len() == n_subj => etas.to_vec(),
             _ => vec![DVector::zeros(n_eta); n_subj],
         }),
-        cached_etas_are_modes: std::sync::atomic::AtomicBool::new(
-            first_eval_etas.is_some_and(|e| e.len() == n_subj),
+        cached_etas_kind: std::sync::Mutex::new(
+            if first_eval_etas.is_some_and(|e| e.len() == n_subj) {
+                PrevEtas::ModesHere
+            } else {
+                PrevEtas::Placeholder
+            },
         ),
         grad_cache: std::sync::Mutex::new(None),
         priors: crate::estimation::outer_optimizer::build_prior_set(model, init_params),
@@ -1228,7 +1179,6 @@ mod tests {
             etas: vec![DVector::from_element(1, eta)],
             h_mats: vec![DMatrix::from_element(1, 1, eta)],
             per_subj_grads: vec![],
-            per_subj_corrections: vec![],
         };
         let eta_of = |h: &Option<HeldEbes>| h.as_ref().map(|h| (h.x[0], h.cost, h.etas[0][0]));
         let mut held = None;
@@ -1293,7 +1243,7 @@ mod tests {
             init_params: &model.default_params,
             bounds,
             cached_etas: std::sync::Mutex::new(vec![DVector::zeros(model.n_eta); n_subj]),
-            cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+            cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
             priors: crate::estimation::outer_optimizer::build_prior_set(
@@ -1353,7 +1303,7 @@ mod tests {
             init_params: &model.default_params,
             bounds,
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(n_eta); n_subj]),
-            cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+            cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
             priors: crate::estimation::outer_optimizer::build_prior_set(
@@ -1418,9 +1368,8 @@ mod tests {
 
     /// #1778, the trust-region call site: on a TTE model with η, whose fixed-EBE score
     /// drops `∂_η log|H̃| · dη̂/dθ`, `gradient()` must be the total derivative `2·Σ dᵢ` (the
-    /// exact adjoint) at the EBEs `compute_ad_grads` solved. Dies if `compute_ad_grads`
-    /// stops calling `gauss_newton::ebe_response_correction` (each `tᵢ` falls back to zero
-    /// and the gradient to the biased `2·Σ gᵢ`).
+    /// exact adjoint) at the EBEs `compute_ad_grads` solved. Dies if the rows fall back to
+    /// the fixed-mode score (the gradient to the biased `2·Σ gᵢ`).
     #[cfg(feature = "survival")]
     #[test]
     fn gradient_is_the_total_derivative_on_a_tte_model_with_eta() {
@@ -1452,7 +1401,7 @@ mod tests {
             init_params: &model.default_params,
             bounds,
             cached_etas: std::sync::Mutex::new(vec![nalgebra::DVector::zeros(model.n_eta); n_subj]),
-            cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+            cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
             grad_cache: std::sync::Mutex::new(None),
             nn_reg: crate::estimation::nn_reg::NnRegularizer::build(&model, &population, &options),
             priors: crate::estimation::outer_optimizer::build_prior_set(
@@ -1461,7 +1410,7 @@ mod tests {
             ),
         };
 
-        let (etas, _, per_subj, _) = problem.compute_ad_grads(&x0);
+        let (etas, h_mats, _) = problem.compute_ad_grads(&x0);
         let g = problem.gradient(&x0).expect("gradient");
         // `dᵢ`: the exact total derivative (the adjoint at the mode), and the reconverged
         // difference as a loose cross-check of it.
@@ -1480,6 +1429,18 @@ mod tests {
                 crate::sens::ode_provider::adjoint::Objective::Focei,
             )
             .expect("in the adjoint's scope");
+            let (_, gi) = crate::estimation::gauss_newton::subject_nll_pop_grad(
+                &x0,
+                &model.default_params,
+                &model,
+                &population,
+                i,
+                &etas[i],
+                &h_mats[i],
+                &[],
+                &problem.bounds,
+                &options,
+            );
             let fi = crate::estimation::outer_optimizer::subject_reconverged_fd_gradient(
                 &x0,
                 &model.default_params,
@@ -1494,7 +1455,7 @@ mod tests {
                     want[k] += 2.0 * di[k];
                 }
                 fd[k] += 2.0 * fi[k];
-                raw[k] += 2.0 * per_subj[i][k];
+                raw[k] += 2.0 * gi[k];
             }
         }
         assert!(
@@ -1516,7 +1477,7 @@ mod tests {
             .zip(&want)
             .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs()));
         eprintln!("[#1778] trust-region: ‖g − 2Σd‖∞ = {off:.3e}, ‖2Σg − 2Σd‖∞ = {raw_gap:.3e}");
-        // Each `gᵢ + (dᵢ − gᵢ)` rounds back to `dᵢ`: 1e-10 allows for summation-order
+        // The gradient sums the rows `dᵢ` themselves: 1e-10 allows for summation-order
         // rounding. The raw gap was measured at 2.435e-1; 5e-2 is 4.9× under it.
         assert!(
             off < 1e-10,
@@ -1766,7 +1727,7 @@ mod tests {
                     DVector::zeros(model.n_eta);
                     population.subjects.len()
                 ]),
-                cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+                cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
                 grad_cache: std::sync::Mutex::new(None),
                 priors: crate::estimation::outer_optimizer::build_prior_set(&model, init),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(
@@ -1861,7 +1822,7 @@ mod tests {
                     DVector::zeros(model.n_eta);
                     population.subjects.len()
                 ]),
-                cached_etas_are_modes: std::sync::atomic::AtomicBool::new(false),
+                cached_etas_kind: std::sync::Mutex::new(PrevEtas::Placeholder),
                 grad_cache: std::sync::Mutex::new(None),
                 nn_reg: crate::estimation::nn_reg::NnRegularizer::build(model, population, options),
                 priors: crate::estimation::outer_optimizer::build_prior_set(model, init),

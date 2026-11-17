@@ -29,6 +29,7 @@ fn make_iov_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -217,7 +218,7 @@ fn test_iov_foce_auto_reports_resolved_optimizer() {
     let opts = fast_opts(EstimationMethod::Foce, Optimizer::Auto, false);
     let result = fit(&model, &pop, &model.default_params, &opts).expect("fit should succeed");
     assert_iov_fit_ok(&result);
-    let resolved = Optimizer::Auto.resolve_auto(&model, false);
+    let resolved = Optimizer::Auto.resolve_auto(&model);
     assert_eq!(result.optimizer, format!("auto ({})", resolved.label()));
     assert_eq!(resolved, Optimizer::Bobyqa);
 }
@@ -340,7 +341,7 @@ fn test_iov_ode_fit_matches_analytical_twin() {
     // seeding built-in BFGS at the optimum converges fine — so it was
     // optimizer basin-capture, not an ODE-IOV gradient defect. See #439/#486.
     assert_eq!(
-        Optimizer::Auto.resolve_auto(&ode, false),
+        Optimizer::Auto.resolve_auto(&ode),
         Optimizer::NloptLbfgs,
         "ODE IOV twin should resolve `auto` to the analytic-gradient L-BFGS"
     );
@@ -3115,6 +3116,14 @@ fn test_npde_post_hoc_matches_the_fit_under_a_derived_rule() {
         .collect();
     assert!(at_fit.iter().all(|(npd, _)| !npd.is_empty()));
     assert_eq!(npde_bits(&post_hoc), at_fit);
+    // #2871: the fit's post-fit step carries EPRED / PWRES from the same pass onto
+    // `SubjectResult`, bit for bit.
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+    for (sr, sn) in res.subjects.iter().zip(&post_hoc) {
+        assert!(!sr.epred.is_empty() && !sr.pwres.is_empty());
+        assert_eq!(bits(&sr.epred), bits(&sn.epred), "subject {} EPRED", sr.id);
+        assert_eq!(bits(&sr.pwres), bits(&sn.pwres), "subject {} PWRES", sr.id);
+    }
 }
 
 // ── #1955: a derived `iov_occasion` rule reaches simulate ────────────────
@@ -3239,6 +3248,7 @@ fn simulate_with_uncertainty_derives_occasions_from_the_fits_rule() {
         n_sim_per_draw: 2,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(5),
+        horizon: None,
     };
     let rows = |pop: &Population, rule: Option<IovOccasionRule>| {
         let mut fit = fit.clone();
@@ -3376,6 +3386,7 @@ fn iov_simulate_warns_when_no_kappa_is_drawn() {
         n_sim_per_draw: 1,
         method: UncertaintyMethod::Asymptotic,
         seed: Some(5),
+        horizon: None,
     };
     let uncertainty = |pop: &Population, rule: Option<IovOccasionRule>| {
         let mut fit = fit.clone();

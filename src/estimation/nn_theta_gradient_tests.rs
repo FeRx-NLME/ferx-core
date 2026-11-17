@@ -393,12 +393,13 @@ fn hybrid_is_closer_to_central_fd_than_forward_fd() {
     );
 }
 
-/// AGENTS.md's routing rule: a model outside the analytic scope must fail
-/// loudly to FD, not silently return a wrong gradient. A time-varying NN input
-/// gives the network a distinct output vector per event, which the
-/// single-`z` factorization cannot represent.
+/// A time-varying NN input gives the network a distinct output vector per event, which
+/// the single-`z` factorization ([`NnGradPlan`]) cannot represent, so the plan declines.
+/// The fixed-η score is nevertheless exact: `exact_theta_score` records the network per
+/// event on the tape, so the θ-gradient is the adjoint's and not the per-θ FD loop
+/// (#2786): the served-score counter moves, and every NN weight matches central FD.
 #[test]
-fn time_varying_nn_input_declines_the_plan_and_still_matches_fd() {
+fn time_varying_nn_input_is_served_exactly_though_the_plan_declines() {
     let model = parse_model_string(&dcm_model_src()).expect("DCM model parses");
     let mut subject = static_subject();
     // CRCL drifts across the observation records; WT stays put.
@@ -423,6 +424,9 @@ fn time_varying_nn_input_declines_the_plan_and_still_matches_fd() {
     let eta = vec![0.15f64, -0.1f64];
     let (mask, lo, hi) = unpinned(&model, n_theta + 1);
     let mut scratch = EventPkParams::default();
+    let served =
+        || crate::estimation::fixed_eta_gradient::EXACT_THETA_SCORES.with(std::cell::Cell::get);
+    let before = served();
     let (_nll, grad) = obs_nll_subject_grad(
         &model,
         &subject,
@@ -436,15 +440,25 @@ fn time_varying_nn_input_declines_the_plan_and_still_matches_fd() {
         1,
         &mut scratch,
     );
+    assert_eq!(
+        served(),
+        before + 1,
+        "the time-varying NN subject must take the exact adjoint score, not the per-theta FD loop"
+    );
     let reference = central_fd_theta_grad(&model, &subject, &theta, &sigma_values, &eta, &mask);
+    let mut worst = 0.0f64;
     for &i in &nn_theta_indices(&model) {
+        let rel = relative(grad[i], reference[i]);
         assert!(
-            relative(grad[i], reference[i]) < 1e-3,
-            "FD fallback theta[{i}]: got {:.8e}, central FD {:.8e}",
+            rel.is_finite(),
+            "theta {i}: {} vs {}",
             grad[i],
             reference[i]
         );
+        worst = worst.max(rel);
     }
+    eprintln!("time-varying NN exact score vs central FD: worst relative {worst:.2e}");
+    assert!(worst < 1e-5, "{worst:.2e}");
 }
 
 /// A *non*-NN covariate varying in time is irrelevant to the factorization —

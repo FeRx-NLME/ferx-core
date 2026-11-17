@@ -216,6 +216,9 @@ pub struct EventSchedule {
     /// reused in the first case (its *bounds* do not move), so the rates are
     /// validated per walk rather than assumed.
     pub(crate) rates_dose_key: Vec<(f64, f64)>,
+    /// The `doses` this schedule was built from, indexed once (#2754). Valid for exactly
+    /// the doses [`Self::rates_valid_for`] accepts — see [`Self::dose_index_for`].
+    pub(crate) dose_index: crate::dosing::DoseIndex,
 }
 
 impl EventSchedule {
@@ -232,6 +235,23 @@ impl EventSchedule {
                 .all(|(&(r, d), dose)| {
                     r.to_bits() == dose.rate.to_bits() && d.to_bits() == dose.duration.to_bits()
                 })
+    }
+
+    /// A [`crate::dosing::DoseIndex`] over `doses` under this schedule's lagtimes: the
+    /// schedule's own when `doses` are the ones it was built from (`rates_valid` — the
+    /// result of [`Self::rates_valid_for`]`(doses)`, which the caller already holds), a
+    /// fresh `O(n log n)` build otherwise. The index reads only times, `ss`/`ii`, lagtimes
+    /// (all schedule-static) and `rate`/`duration` (what `rates_valid_for` checks).
+    pub(crate) fn dose_index_for(
+        &self,
+        doses: &[DoseEvent],
+        rates_valid: bool,
+    ) -> std::borrow::Cow<'_, crate::dosing::DoseIndex> {
+        if rates_valid {
+            std::borrow::Cow::Borrowed(&self.dose_index)
+        } else {
+            std::borrow::Cow::Owned(crate::dosing::DoseIndex::new(doses, &self.dose_lagtimes))
+        }
     }
 
     /// Pre-compute the event timeline and per-interval infusion bounds
@@ -258,8 +278,11 @@ impl EventSchedule {
         doses: &[DoseEvent],
         dose_lagtimes: &[f64],
     ) -> Self {
+        // A plan's recording builds what its runs replay: runtime work only (#2786).
         #[cfg(test)]
-        SCHEDULE_BUILDS.with(|c| c.set(c.get() + 1));
+        if !crate::parser::model_parser::rhs_regcode::kernel_jit::recording_open() {
+            SCHEDULE_BUILDS.with(|c| c.set(c.get() + 1));
+        }
         assert_eq!(
             doses.len(),
             subject.doses.len(),
@@ -337,6 +360,10 @@ impl EventSchedule {
             dose_lagtimes.to_vec()
         };
 
+        // Every per-interval query below reads this index instead of scanning `doses`
+        // (#2754): schedule construction runs per likelihood call on a lagtime model.
+        let dose_index = crate::dosing::DoseIndex::new(doses, &stored_lagtimes);
+
         let mut bounds_per_interval = Vec::with_capacity(events.len().saturating_sub(1));
         for w in events.windows(2) {
             // Zero-length intervals get no bounds. Both walks skip them (`ev.time >
@@ -352,8 +379,7 @@ impl EventSchedule {
                 bounds_per_interval.push(compute_propagation_bounds(
                     w[0].time,
                     w[1].time,
-                    doses,
-                    &stored_lagtimes,
+                    &dose_index,
                 ));
             } else {
                 bounds_per_interval.push(Vec::new());
@@ -384,6 +410,7 @@ impl EventSchedule {
                             0.5 * (w[0] + w[1]),
                             doses,
                             &stored_lagtimes,
+                            &dose_index,
                             reset_floor,
                             pk_model,
                         )
@@ -400,6 +427,7 @@ impl EventSchedule {
             non_finite_event_time,
             rates_per_interval,
             rates_dose_key,
+            dose_index,
         }
     }
 }
@@ -438,39 +466,24 @@ pub(crate) fn is_record(k: EventKind) -> bool {
 /// endpoints, so `windows(2)` enumerates every sub-interval over which
 /// the rate matrix is constant.
 ///
-/// `dose_lagtimes[k]` shifts dose `k`'s effective start (and therefore
-/// end) by that amount. Must be parallel to `doses`.
+/// The candidate breaks come from `index` ([`crate::dosing::DoseIndex::breaks_within`],
+/// #2754): every `rate > 0 && duration > 0` dose's lagged window start and end, plus —
+/// for a seeded SS dose (#1121) — the previous cycle's residual infusion end
+/// `residual_end`, which is a sub-interval boundary just like the dose's own window
+/// edges: `propagate_with_bounds` decides the rate from each sub-interval's midpoint, so
+/// an unsplit interval straddling `residual_end` would take the rate for all of it or
+/// none. The index was built from the `F`-reshaped `eff_doses`, so `f_bio = 1` there.
+/// The scan this replaced pushed the same values in dose order; the total-order sort
+/// below makes the result independent of push order, so it is the same `Vec`.
 fn compute_propagation_bounds(
     t_from: f64,
     t_to: f64,
-    doses: &[DoseEvent],
-    dose_lagtimes: &[f64],
+    index: &crate::dosing::DoseIndex,
 ) -> Vec<f64> {
-    let mut bounds: Vec<f64> = vec![t_from, t_to];
-    for (k, d) in doses.iter().enumerate() {
-        if d.rate > 0.0 && d.duration > 0.0 {
-            let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
-            let start = d.time + lag;
-            let end = d.time + lag + d.duration;
-            if start > t_from + 1e-15 && start < t_to - 1e-15 {
-                bounds.push(start);
-            }
-            if end > t_from + 1e-15 && end < t_to - 1e-15 {
-                bounds.push(end);
-            }
-            // The previous cycle's infusion of a seeded SS dose (#1121) runs on
-            // `[d.time, residual_end]`, which is a sub-interval boundary just
-            // like the dose's own window edges — `propagate_with_bounds` decides
-            // the rate from each sub-interval's midpoint, so an unsplit interval
-            // straddling `residual_end` would take the rate for all of it or
-            // none. `doses` are the `F`-reshaped `eff_doses`, so `f_bio = 1`.
-            if let Some(residual_end) = crate::dosing::ss_residual_infusion_end(d, lag, 1.0) {
-                if residual_end > t_from + 1e-15 && residual_end < t_to - 1e-15 {
-                    bounds.push(residual_end);
-                }
-            }
-        }
-    }
+    let inner = index.breaks_within(t_from + 1e-15, t_to - 1e-15);
+    let mut bounds: Vec<f64> = Vec::with_capacity(2 + inner.len());
+    bounds.extend([t_from, t_to]);
+    bounds.extend_from_slice(&inner);
     bounds.sort_by(|a, b| a.total_cmp(b));
     bounds.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
     bounds
@@ -515,8 +528,9 @@ fn state_layout(pk_model: PkModel) -> (usize, usize) {
 /// exists there, so the capped loop now also raises the #867 non-convergence warning instead of
 /// returning a silently-truncated state.
 ///
-/// `dose.ii > 0` and `dose.duration <= dose.ii` are required (callers
-/// already guard the first; overlapping infusions are rejected).
+/// `dose.ii > 0` is required (callers already guard it). Overlapping infusions
+/// (`T_inf > II`) replay their `m` always-running pulses as one more cycle window
+/// (`DoseEvent::ss_cycle_doses`).
 fn equilibrate_ss_state_event_driven(
     pk_model: PkModel,
     pk: &PkParams,
@@ -548,25 +562,21 @@ fn equilibrate_ss_state_event_driven(
         return state;
     }
     let is_inf = dose.rate > 0.0 && dose.duration > 0.0 && dose.duration.is_finite();
-    if is_inf && dose.duration > dose.ii {
-        // Overlapping infusions: no closed-form pulse expansion. Caller's
-        // api.rs warning fires for this case.
-        return state;
-    }
-
     // Synthetic single-dose at t=0 inside each cycle; propagate over
     // [0, T_inf, II] for infusions (so the bounds split at the infusion
     // end) or [0, II] for boluses. Clone `dose` (not `DoseEvent::new`) so the
     // bioavailability-reshaped `(rate, duration)` it already carries survive -
     // `::new` would recompute `duration = amt/rate` and drop `F` (#419).
     let synthetic_dose = if is_inf {
-        vec![dose.synthetic_cycle_dose()]
+        dose.ss_cycle_doses()
     } else {
         Vec::new()
     };
-    let synthetic_lagtimes: Vec<f64> = if is_inf { vec![0.0] } else { Vec::new() };
+    let synthetic_lagtimes = vec![0.0; synthetic_dose.len()];
+    let synthetic_index = crate::dosing::DoseIndex::new(&synthetic_dose, &synthetic_lagtimes);
+    let empty_index = crate::dosing::DoseIndex::default();
     let bounds: Vec<f64> = if is_inf {
-        vec![0.0, dose.duration, dose.ii]
+        vec![0.0, synthetic_dose[0].duration, dose.ii]
     } else {
         vec![0.0, dose.ii]
     };
@@ -585,10 +595,10 @@ fn equilibrate_ss_state_event_driven(
             // Bolus pulse: instantaneous amount jump (with F).
             s[cmt_idx] += pk.bioavailable_amount(dose.amt);
         }
-        let (doses, lagtimes): (&[DoseEvent], &[f64]) = if forced {
-            (&synthetic_dose, &synthetic_lagtimes)
+        let (doses, lagtimes, index): (&[DoseEvent], &[f64], _) = if forced {
+            (&synthetic_dose, &synthetic_lagtimes, &synthetic_index)
         } else {
-            (&[], &[])
+            (&[], &[], &empty_index)
         };
         propagate_with_bounds(
             &mut s,
@@ -600,6 +610,7 @@ fn equilibrate_ss_state_event_driven(
             f64::NEG_INFINITY,
             &mut eigen.borrow_mut(),
             None,
+            index,
         );
         Some(s)
     };
@@ -640,6 +651,7 @@ fn equilibrate_ss_state_event_driven(
             f64::NEG_INFINITY,
             &mut eigen.borrow_mut(),
             None,
+            &synthetic_index,
         );
         cycles_run = cycle + 1;
         if tracker.should_stop(cycle, &state) {
@@ -662,8 +674,8 @@ fn equilibrate_ss_state_event_driven(
 /// Used to recover the *previous interval's* steady-state tail for an SS
 /// dose with a lagtime: observations between the dose record time and the
 /// lagged arrival sit at phase `II − lagtime` … `II` (issue #15). For SS
-/// infusions this assumes `phase ≥ dose.duration` (`lagtime ≤ II − T_inf`),
-/// the realistic regime; overlapping infusions are rejected upstream.
+/// infusions a `phase` inside the newest pulse leaves it (and any overlapping
+/// earlier pulse) mid-flight; the caller's residual windows carry them on.
 fn ss_state_at_phase_event_driven(
     pk_model: PkModel,
     pk: &PkParams,
@@ -692,16 +704,16 @@ fn ss_state_at_phase_event_driven(
 
     let mut eigen = crate::sens::propagate::EigenCacheG::default();
     if is_inf {
-        let t_inf = dose.duration;
-        // Clone so the `F`-reshaped `(rate, duration)` survive (see
-        // `equilibrate_ss_state_event_driven`; #419).
-        let synthetic_dose = vec![dose.synthetic_cycle_dose()];
-        let synthetic_lagtimes = vec![0.0];
+        // The cycle's windows, `F`-reshaped (see `equilibrate_ss_state_event_driven`; #419).
+        let synthetic_dose = dose.ss_cycle_doses();
+        let synthetic_lagtimes = vec![0.0; synthetic_dose.len()];
+        let t_inf = synthetic_dose[0].duration;
         let bounds: Vec<f64> = if phase > t_inf {
             vec![0.0, t_inf, phase]
         } else {
             vec![0.0, phase]
         };
+        let synthetic_index = crate::dosing::DoseIndex::new(&synthetic_dose, &synthetic_lagtimes);
         propagate_with_bounds(
             &mut state,
             &bounds,
@@ -712,6 +724,7 @@ fn ss_state_at_phase_event_driven(
             f64::NEG_INFINITY,
             &mut eigen,
             None,
+            &synthetic_index,
         );
     } else {
         state[cmt_idx] += pk.bioavailable_amount(dose.amt);
@@ -725,6 +738,7 @@ fn ss_state_at_phase_event_driven(
             f64::NEG_INFINITY,
             &mut eigen,
             None,
+            &crate::dosing::DoseIndex::default(),
         );
     }
     state
@@ -978,6 +992,9 @@ fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
     // the doses it was built from (`F` may have reshaped a rate, #419; a modeled
     // dose resolves per η); checked once here, not assumed (#1477).
     let rates_valid = schedule.rates_valid_for(eff_doses);
+    // The dose list indexed once per walk (the schedule's own when it applies), so the
+    // arrival gate and any per-call rate scan are not `O(n_doses)` each (#2754).
+    let dose_index = schedule.dose_index_for(eff_doses, rates_valid);
 
     // Parameters for the interval ENDING at each event (#1073). A record supplies
     // its own; a non-record — the lagged dose arrival — supplies none and takes
@@ -1049,6 +1066,7 @@ fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
                 reset_floor,
                 &mut eigen,
                 rates,
+                &dose_index,
             );
             cur_t = ev.time;
         }
@@ -1091,8 +1109,13 @@ fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
                 // (`DoseRecord < Dose`), so list order alone cannot express this. Nor
                 // does a dose recorded before the EVID=3/4 reset in force arrive (#1587);
                 // `Reset < Dose` has already raised `reset_floor` for a co-timed reset.
-                if !crate::ode::predictions::ResetGate::at_segment(eff_doses, reset_floor, ev.time)
-                    .live(eff_doses, ev.orig_idx)
+                if !crate::ode::predictions::ResetGate::at_segment_indexed(
+                    &dose_index,
+                    eff_doses,
+                    reset_floor,
+                    ev.time,
+                )
+                .live(eff_doses, ev.orig_idx)
                 {
                     continue;
                 }
@@ -1187,8 +1210,8 @@ fn event_driven_predictions_with_schedule_impl<P: PkAt + ?Sized>(
     // each sub-interval. Both are fixed at the source now: the trough is loaded at
     // the `DoseRecord` event and the ordinary walk carries it, so pre-arrival
     // observations are read off a real state by the normal `EventKind::Obs` arm and
-    // need no overlay. The overlay was also what kept SS × lagtime off the
-    // closed-form dual walk — see `sens::provider::ss_lagtime_walk_unsupported`.)
+    // need no overlay. The dual walk seeds the same state (`sens::propagate`'s
+    // `ss_state_at_phase_g`).)
 
     preds
 }
@@ -1233,10 +1256,15 @@ fn pk_for<'a, P: PkAt + ?Sized>(
 /// window opens after it. The depot channel (`cmt 1`, #400) is a zero-order release into
 /// the oral depot followed by first-order `ka` absorption — distinct from the
 /// central channel (cmt 2, depot bypass).
+///
+/// `index` is a [`crate::dosing::DoseIndex`] over these `doses` and lagtimes (#2754): the
+/// `SS=1` cutoff is a binary search, and only doses that can carry a rate
+/// (`duration > 0`) are visited — in dose order, so the sums are the scan's, bit for bit.
 fn active_rates_at(
     mid: f64,
     doses: &[DoseEvent],
     dose_lagtimes: &[f64],
+    index: &crate::dosing::DoseIndex,
     reset_floor: f64,
     pk_model: PkModel,
 ) -> [f64; 4] {
@@ -1244,8 +1272,10 @@ fn active_rates_at(
     let mut rate_periph1 = 0.0;
     let mut rate_periph2 = 0.0;
     let mut rate_depot = 0.0;
-    let gate = crate::ode::predictions::ResetGate::at_segment(doses, reset_floor, mid);
-    for (k, d) in doses.iter().enumerate() {
+    let gate =
+        crate::ode::predictions::ResetGate::at_segment_indexed(index, doses, reset_floor, mid);
+    for &k in index.infusing() {
+        let d = &doses[k];
         let lag = dose_lagtimes.get(k).copied().unwrap_or(0.0);
         let t_start = d.time + lag;
         let t_end = t_start + d.duration;
@@ -1256,8 +1286,11 @@ fn active_rates_at(
         // below. Its own reset floor is the *record*, not the arrival: an
         // EVID=3/4 inside the pre-arrival window zeros the seeded state, and
         // a rate that survived it would refill what the reset just emptied.
-        let residual = crate::dosing::ss_residual_infusion_end(d, lag, 1.0)
-            .is_some_and(|end| d.time <= mid && end >= mid);
+        let residual = if d.time <= mid {
+            crate::dosing::ss_residual_ends(d, lag, 1.0).count_ending_at_or_after(mid)
+        } else {
+            0
+        };
         // Infusions recorded before the last reset — EVID=3/4 (#1587) or `SS=1` (#1586) —
         // are turned off, keyed on the record, so a lagged window opening after the reset
         // is off too. This also covers the seeded residual above, whose own floor is the
@@ -1265,8 +1298,10 @@ fn active_rates_at(
         if !gate.live(doses, k) {
             continue;
         }
-        if residual || (d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid) {
-            let r = d.rate;
+        let own = d.rate > 0.0 && d.duration > 0.0 && t_start <= mid && t_end >= mid;
+        let pulses = residual + usize::from(own);
+        if pulses > 0 {
+            let r = pulses as f64 * d.rate;
             match pk_model.topology().dose_channel(d.cmt_raw()) {
                 Some(Channel::Central) => rate_central += r,
                 Some(Channel::Periph1) => rate_periph1 += r,
@@ -1317,8 +1352,9 @@ fn propagate_with_bounds(
     eigen: &mut crate::sens::propagate::EigenCacheG,
     // The active rates of every sub-interval of `bounds`, parallel to
     // `bounds.windows(2)`, when the schedule precomputed them for exactly these
-    // `doses` (`EventSchedule::rates_valid_for`, #1477); `None` scans `doses`.
+    // `doses` (`EventSchedule::rates_valid_for`, #1477); `None` asks `index`.
     precomputed: Option<&[[f64; 4]]>,
+    index: &crate::dosing::DoseIndex,
 ) {
     for (wi, w) in bounds.windows(2).enumerate() {
         let s0 = w[0];
@@ -1329,7 +1365,14 @@ fn propagate_with_bounds(
         }
         let [rate_central, rate_periph1, rate_periph2, rate_depot] = match precomputed {
             Some(r) => r[wi],
-            None => active_rates_at(0.5 * (s0 + s1), doses, dose_lagtimes, reset_floor, pk_model),
+            None => active_rates_at(
+                0.5 * (s0 + s1),
+                doses,
+                dose_lagtimes,
+                index,
+                reset_floor,
+                pk_model,
+            ),
         };
 
         // 2-/3-cpt dispatch goes through the per-walk eigendata memo (`eigen`) and
@@ -2152,8 +2195,15 @@ mod tests {
         // previous cycle's infusion crosses the record and ends at 21 h.
         assert!(crate::dosing::ss_seeded_at_record(&subj.doses[2], lag[2]));
         assert_eq!(
-            crate::dosing::ss_residual_infusion_end(&subj.doses[2], lag[2], 1.0),
-            Some(21.0)
+            crate::dosing::ss_residual_infusion_ends(
+                &subj.doses[2],
+                lag[2],
+                1.0,
+                f64::NEG_INFINITY,
+                f64::INFINITY
+            )
+            .collect::<Vec<_>>(),
+            vec![21.0]
         );
         let sched = EventSchedule::for_subject(&subj, PkModel::TwoCptIv, &subj.doses, &lag);
         assert!(sched.rates_valid_for(&subj.doses));

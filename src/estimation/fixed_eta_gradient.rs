@@ -217,14 +217,29 @@ pub(crate) fn obs_nll_subject_into_iov_with_schedule(
 /// `floor = 1` it is the pre-#2187 `h·(1 + |θᵢ|)` bit for bit; on a θ declared below 1 in
 /// magnitude it is relative to that magnitude, where `h·(1 + |θᵢ|)` is an absolute `h` —
 /// 1.2 % of a θ of 8e-4 at `h = 1e-5`, a first-order error in a forward difference (#2187).
-/// Every θ difference of the SAEM M-step and the VI ELBO goes through it.
+/// A `[covariate_nn]` weight keeps floor 1 whatever its θ₀ (#2406). Every θ difference of
+/// the SAEM M-step and the VI ELBO goes through it.
 #[inline]
 fn theta_fd_step(model: &CompiledModel, h: f64, theta: &[f64], i: usize) -> f64 {
     crate::estimation::parameterization::fd_step(
         h,
         theta[i],
-        crate::estimation::parameterization::fd_theta_step_floor(&model.default_params, i),
+        crate::estimation::parameterization::fd_theta_step_floor(model, i),
     )
+}
+
+/// The forward-difference step of σ `s` in the M3 / dense-`R` fixed-η score: `h·|s|`, and `h`
+/// at `s = 0`. σ is log-packed, so the step is relative to σ like every other log-packed
+/// coordinate's; the earlier `h·(1 + |s|)` was an absolute `h` on a σ below 1, and its
+/// first-order error in the log-σ score grows as `1/σ` — 5.0e-3 relative at an sd of 0.003
+/// against the exact score, 1.5e-5 at 1 (#2406).
+#[inline]
+fn sigma_fd_step(h: f64, s: f64) -> f64 {
+    if s != 0.0 {
+        h * s.abs()
+    } else {
+        h
+    }
 }
 
 /// The exact fixed-η θ score by the adjoint
@@ -410,7 +425,7 @@ pub(crate) fn obs_nll_subject_grad_iov(
             } else {
                 let k = i - n_theta;
                 let mut sigma_p = sigma_values.to_vec();
-                let delta = h * (1.0 + sigma_values[k].abs());
+                let delta = sigma_fd_step(h, sigma_values[k]);
                 sigma_p[k] += delta;
                 let nll_p = obs_nll_subject_into_iov(
                     model, subject, theta, &sigma_p, eta, kappas, pk_scratch,
@@ -615,14 +630,10 @@ pub(crate) fn obs_nll_subject_grad_iov(
 /// `[log_theta_0 … log_theta_{P-1} | log_sigma_0 … log_sigma_{Q-1}]`
 /// for a single subject with ETAs held fixed.
 ///
-/// For non-M3 models:
-/// - Sigma: analytical from the residual-variance formula (no extra predict call).
-/// - Theta: forward-FD of `compute_predictions_with_tv_into` + chain rule through
-///   obs_nll (one extra predict call per non-pinned theta, not one full-subject
-///   NLL call).
-///
-/// For M3 models (complex Mills-ratio sigma gradient): forward-FD of
-/// `obs_nll_subject_into` for all parameters.
+/// Every class is exact: the θ and σ score of an M3, dense-residual or non-Gaussian
+/// subject is the kernel's data score ([`exact_data_score`]); a Gaussian subject's σ is
+/// analytical and its θ the adjoint ([`exact_theta_score`]). Forward differences of the
+/// whole NLL / the predictions remain only as the fallback when the plans decline.
 ///
 /// `lower`/`upper` are the packed-space bounds used to detect pinned dimensions
 /// (`lower[i] == upper[i]`); pinned dimensions contribute 0 to the gradient and
@@ -682,8 +693,8 @@ pub(crate) fn obs_nll_subject_grad(
 /// **Returns `None` for the information** — the gradient is still exact —
 /// whenever this subject is outside that closed form:
 ///
-/// * an M3, TTE, or dense-residual-covariance model (the whole-NLL FD path,
-///   which never forms per-observation prediction derivatives);
+/// * an M3, TTE, or dense-residual-covariance model (its gradient is exact, but the
+///   information block is not derived for it: no per-observation prediction rows);
 /// * a `[covariate_nn]` θ assembled by [`NnGradPlan`] (its θ derivatives come
 ///   from output-space differences, not per-observation ones);
 /// * a residual **magnitude** (`#484`/`#1029`) or FREM covariate rows, where θ
@@ -855,7 +866,7 @@ fn obs_nll_subject_grad_impl(
             } else {
                 let k = i - n_theta;
                 let mut sigma_p = sigma_values.to_vec();
-                let delta = h * (1.0 + sigma_values[k].abs());
+                let delta = sigma_fd_step(h, sigma_values[k]);
                 sigma_p[k] += delta;
                 let nll_p = obs_nll_subject_from_preds(
                     model,

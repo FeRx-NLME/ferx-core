@@ -223,6 +223,14 @@ fn gn_warfarin_bloq_m3_matches_nonmem() {
         "[#2740] GN warfarin_bloq: OFV {:.6}, θ {:?}, σ {:?}, converged {}",
         result.ofv, result.theta, result.sigma, result.converged
     );
+    // #2738: before #2740 this fit stopped at −206.196 (+10.6 above FOCEI's −216.8187,
+    // max |grad| 34.7) on a micro-step at a collapsed radius and reported converged. A
+    // `converged: true` must now sit at the optimum; 0.1 OFV is far below that gap.
+    assert!(
+        !result.converged || (result.ofv - (-216.8187)).abs() < 0.1,
+        "GN reports converged at OFV {} away from FOCEI's -216.8187",
+        result.ofv
+    );
 
     let rel = |got: f64, want: f64| (got - want).abs() / want.abs();
     for (name, got, want, tol) in [
@@ -282,6 +290,46 @@ fn gn_one_cpt_transit_does_not_collapse_on_the_volume_bound() {
     assert!(
         result.ofv < 1497.0,
         "GN OFV {} regressed toward the collapsed 1513.94",
+        result.ofv
+    );
+}
+
+/// #2974: on `pkpd_nonmem`, GN's exact total-derivative rows reach a lower OFV than the
+/// fixed-mode rows did (−60.097043 against −60.097016, Linux x86_64), but near the optimum
+/// each predicted decrease falls below the objective's re-solve noise, the ratio test rejects
+/// step after step and the radius collapses. #2738's rule refuses a small change at a collapsed
+/// radius, so the fit ran on to a degenerate-BHHH collapse and reported `converged: false`. The
+/// BHHH Newton decrement at that point (1.34e-4 OFV) shows nothing left to gain, so it now
+/// stops converged. Mutation: `gn_collapsed_stop_converged` always false -> `converged` false.
+#[test]
+#[cfg_attr(
+    not(feature = "slow-tests"),
+    ignore = "slow: opt in with --features slow-tests"
+)]
+fn gn_pkpd_nonmem_converges_at_its_optimum() {
+    let model = parse_model_file(Path::new("examples/pkpd_nonmem.ferx"))
+        .expect("pkpd_nonmem model must parse");
+    let population = read_nonmem_csv(Path::new("data/pkpd_nonmem.csv"), None, None)
+        .expect("pkpd_nonmem data must load");
+    let mut opts = FitOptions::default();
+    opts.method = EstimationMethod::FoceGn;
+    opts.run_covariance_step = false;
+    opts.verbose = false;
+    let result =
+        fit(&model, &population, &model.default_params, &opts).expect("GN fit must succeed");
+    eprintln!(
+        "[#2974] GN pkpd_nonmem: OFV {:.6}, converged {}, warnings {:?}",
+        result.ofv, result.converged, result.warnings
+    );
+    assert!(result.ofv.is_finite(), "OFV {}", result.ofv);
+    assert!(
+        result.converged,
+        "GN must report convergence at its optimum"
+    );
+    // At or below the fixed-mode rows' stop (−60.097016); 1e-5 is the last printed digit.
+    assert!(
+        result.ofv < -60.097016 + 1e-5,
+        "OFV {:.6} above the fixed-mode rows' −60.097016",
         result.ofv
     );
 }

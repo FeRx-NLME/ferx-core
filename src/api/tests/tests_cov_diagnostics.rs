@@ -212,7 +212,7 @@ fn gn_zero_eta_filter_passes_every_other_warning_through() {
     // reach the user.
     for w in [
         "Gauss-Newton: max iterations reached without convergence",
-        "Gauss-Newton: trust radius collapsed",
+        "Gauss-Newton: trust radius collapsed without convergence",
         "Covariance step failed — SEs not available",
     ] {
         assert!(keep_gn_zero_eta_warning(w, false), "wrongly dropped: {w}");

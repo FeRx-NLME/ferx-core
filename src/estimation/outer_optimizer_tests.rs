@@ -805,9 +805,6 @@ fn test_assemble_score_cross_product_cancelled() {
     let n_subj = 4;
     let n_eta = 1;
     let eta_hats: Vec<DVector<f64>> = (0..n_subj).map(|_| DVector::zeros(n_eta)).collect();
-    let h_matrices: Vec<DMatrix<f64>> = (0..n_subj)
-        .map(|_| DMatrix::identity(n_eta, n_eta))
-        .collect();
     let kappas: Vec<Vec<DVector<f64>>> = vec![vec![]; n_subj];
     let free_idx: Vec<usize> = (0..x.len()).collect();
 
@@ -822,7 +819,6 @@ fn test_assemble_score_cross_product_cancelled() {
         &model,
         &population,
         &eta_hats,
-        &h_matrices,
         &kappas,
         &bounds,
         &options,
@@ -857,7 +853,7 @@ fn test_invert_psd_with_floor_empty() {
 fn fresh_state() -> NloptState {
     NloptState {
         cached_etas: Vec::new(),
-        cached_etas_are_modes: false,
+        cached_etas_kind: PrevEtas::Placeholder,
         cached_h_mats: Vec::new(),
         cached_etas_by_class: Vec::new(),
         best_ofv: 0.0,
@@ -1969,6 +1965,7 @@ fn make_model() -> CompiledModel {
         mixture: None,
     };
     CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -2310,6 +2307,7 @@ fn test_outer_ad_gradient_block_omega() {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -2807,6 +2805,7 @@ fn test_compute_covariance_iov_runs_and_is_pd() {
         mixture: None,
     };
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -4081,6 +4080,7 @@ fn global_presearch_probes_skip_the_inner_multistart() {
             init,
             &opts,
             Some(&zeros),
+            PrevEtas::Placeholder,
             Some(&mu_k),
             None,
             None,
@@ -6521,7 +6521,7 @@ fn reporting_fd_gradient_differences_the_mixture_objective() {
 ///
 /// A per-subject decline of the analytic outer gradient is salvaged onto
 /// `subject_reconverged_fd_gradient`: correct, several times slower on that subject, and
-/// invisible — no count, and `gradient_method_outer` keeps reporting `analytic (Dual2)`
+/// invisible — no count, and `gradient_method_outer` keeps reporting `analytic`
 /// because it reads a **model**-level predicate.
 ///
 /// These pin the *recording*, which is what makes the report honest. An earlier revision
@@ -6579,9 +6579,9 @@ pub(crate) mod outer_fd_fallback {
     }
 
     /// The analytic subject, and a twin whose bolus is replaced by a steady-state
-    /// infusion into the depot. An oral infusion routes the subject to the event walk,
-    /// and the walk declines an SS infusion under a lag time
-    /// (`ss_lagtime_walk_unsupported`), so the twin falls back while its sibling stays exact.
+    /// infusion into the depot, every plan of which fails (`kernel_jit::fail_plans_of`; no
+    /// regular-path shape declines since #2786), so the twin falls back while its sibling
+    /// stays exact.
     pub(crate) fn analytic_and_declining() -> (CompiledModel, Subject, Subject) {
         let model =
             crate::parser::model_parser::parse_model_string(WARFARIN_F).expect("model parses");
@@ -6592,6 +6592,7 @@ pub(crate) mod outer_fd_fallback {
         let mut declining = pop.subjects[0].clone();
         declining.id = "OUT_OF_SCOPE".into();
         declining.doses = vec![DoseEvent::new(0.0, 100.0, 1, 50.0, true, 24.0)];
+        crate::parser::model_parser::rhs_regcode::kernel_jit::fail_plans_of(&declining);
         (model, analytic, declining)
     }
 
@@ -6756,7 +6757,13 @@ pub(crate) mod outer_fd_fallback {
                 .0
                 .err()
         };
-        assert_eq!(cause(&analytic), Some(DeclineCause::ModeSystem));
+        // The polish walks an off-mode `η̂` to the mode (G11, G15), so the decline is read with
+        // it off; with it on the same subject is served, not declined.
+        {
+            let _off = crate::sens::ode_provider::adjoint::PolishOff::new();
+            assert_eq!(cause(&analytic), Some(DeclineCause::ModeSystem));
+        }
+        assert_eq!(cause(&analytic), None, "the polish serves it");
         assert_eq!(cause(&declining), Some(DeclineCause::Recording));
     }
 
@@ -6946,9 +6953,9 @@ pub(crate) mod outer_fd_fallback {
         let pop = mk_pop(vec![analytic, declining]);
         // Whole sentences, so deleting any clause of either one reddens a cell.
         const STRUCT: &str = "used reconverged finite-difference outer gradients because \
-             no analytic recorder serves them: their data shape is outside the recorders' scope \
-             at every parameter point (for example a steady-state infusion under a lag time on \
-             the event walk). Those gradients include the EBE-response term but are slower.";
+             no analytic recorder serves them: recording their exact derivatives failed, as it \
+             will at every parameter point. Those gradients include the EBE-response term but \
+             are slower.";
         const CORRECT: &str = "include the EBE-response term but are slower";
         const HELD: &str = "used fixed-EBE outer gradients, which omit the EBE-response \
              term the analytic gradient carries. If the fit stalls, \
@@ -7345,7 +7352,9 @@ pub(crate) mod outer_fd_fallback {
                         .filter(|&&step| {
                             let mut xw = x.clone();
                             xw[k] = (x[k] + step).clamp(bounds.lower[k], bounds.upper[k]);
-                            let f = reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts);
+                            let tol = stencil_inner_tol(opts.inner_tol);
+                            let (f, _) =
+                                reconverged_probe_ofv(&xw, params, &model, &pop, &warm, &opts, tol);
                             !(f.is_finite() && f < 1e19)
                         })
                         .count();
@@ -7630,6 +7639,622 @@ pub(crate) mod outer_fd_fallback {
             .collect();
         for (label, rel) in ["population", "reporting", "subject"].iter().zip(&rels) {
             assert!(*rel < 1e-5, "{label}: rel {rel:e}");
+        }
+    }
+
+    /// #2406: the production reconverged-FD gradient of a `[covariate_nn]` weight declared
+    /// at `1e-4`, against the exact adjoint gradient at the same point and EBEs. Before
+    /// #2406 the weight took the `|θ₀|` floor, a step of about `1e-8` in its own units; it
+    /// now keeps the unit floor. `TVKA`, outside the network, is the control: the two
+    /// gradients must agree there too, or the comparison is in the wrong units.
+    #[cfg(feature = "nn")]
+    #[test]
+    fn a_small_covariate_nn_weight_gets_its_exact_gradient_from_the_fd_route() {
+        let mut model = crate::parser::model_parser::parse_model_string(
+            "[parameters]
+  theta TVQ(6.0, 0.1, 50.0)
+  theta TVKA(0.5, 0.05, 10.0)
+  omega ETA_CL ~ 0.1
+  sigma PROP ~ 0.1 (sd)
+
+[covariate_nn TYPICAL_PK]
+  inputs     = [CRCL, WT]
+  center     = [90, 70]
+  scale      = [30, 15]
+  outputs    = [CL, V1, V2]
+  layers     = [3]
+  activation = tanh
+  output     = softplus
+  init       = [4.0, 40.0, 80.0]
+
+[individual_parameters]
+  CL = TYPICAL_PK.CL * exp(ETA_CL)
+  V1 = TYPICAL_PK.V1
+  Q  = TVQ
+  V2 = TYPICAL_PK.V2
+  KA = TVKA
+
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+
+[error_model]
+  DV ~ proportional(PROP)
+",
+        )
+        .expect("model parses");
+        // The output layer's zero init leaves every first-layer weight's gradient at 0, so
+        // each weight gets a fixed non-zero value first; the one under test is then set to
+        // 1e-4, a first-layer weight drawn small.
+        let ranges = model.nn_weight_theta_ranges();
+        for i in ranges.iter().flat_map(|r| r.clone()) {
+            model.default_params.theta[i] = 0.3 * (1.7 * i as f64).sin();
+        }
+        let w = ranges.first().expect("the network has weights").start;
+        model.default_params.theta[w] = 1e-4;
+        let mut pop = crate::read_nonmem_csv(
+            std::path::Path::new("data/two_cpt_oral_cov.csv"),
+            None,
+            None,
+        )
+        .expect("data loads");
+        pop.subjects.truncate(8);
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let params = &model.default_params;
+        let x = pack_params(params);
+        assert_eq!(
+            x[w], 1e-4,
+            "fixture: the weight is identity-packed at its θ₀"
+        );
+        let bounds = compute_bounds(params);
+        let (fd, exact) = crate::api::with_fit_scope(&opts, || {
+            let mu = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+            let (ehs, _, _, kappas) =
+                run_inner_loop_warm(&model, &pop, params, 500, 1e-10, None, Some(&mu), 0, 0);
+            let fd =
+                reconverged_fd_gradient(&x, params, &model, &pop, &ehs, &kappas, &bounds, &opts);
+            let mut exact = vec![0.0; x.len()];
+            for (s, eh) in pop.subjects.iter().zip(&ehs) {
+                let g = crate::estimation::sens_outer_gradient::subject_packed_gradient(
+                    &model,
+                    s,
+                    params,
+                    &x,
+                    eh.as_slice(),
+                )
+                .expect("the adjoint serves every subject of this fixture");
+                // `subject_packed_gradient` is of the subject's −log L; the reconverged FD is of
+                // the OFV, −2 log L (the control coordinate pins the factor: both legs off by
+                // exactly 2 without it).
+                for (e, gi) in exact.iter_mut().zip(&g) {
+                    *e += 2.0 * gi;
+                }
+            }
+            (fd, exact)
+        })
+        .unwrap();
+        for (label, k) in [("weight", w), ("TVKA (control)", 1)] {
+            let (f, e) = (fd[k], exact[k]);
+            assert!(f.is_finite() && e.is_finite(), "{label}: fd {f} exact {e}");
+            assert!(
+                e.abs() > 1e-3,
+                "fixture: the {label} gradient is live ({e})"
+            );
+            let rel = (f - e).abs() / e.abs();
+            eprintln!("MEASURE #2406 {label}: fd {f:e} exact {e:e} rel {rel:e}");
+            // Measured (Linux x86_64): weight 1.1e-8, TVKA 4.7e-9; 1e-7 is 9× the weight's.
+            // Under the pre-#2406 |θ₀| floor the weight is 6.4e-3 off.
+            assert!(rel < 1e-7, "{label}: fd {f:e} vs exact {e:e}, rel {rel:e}");
+        }
+    }
+
+    /// #2406: the resolution gate is entered only for a coordinate whose floor is below 1 —
+    /// a floor-1 coordinate takes the ungated difference bit for bit and never calls the tight
+    /// twin — and a floored coordinate whose twin agrees keeps its #2187 step: on a clean
+    /// objective it is accepted at the first step, from two twin probes, and takes the twin's
+    /// difference there. The twin's slope in `x₀` is the objective's plus 1e-5, well inside
+    /// `RESOLVED_REL` but a different number, so the difference shows which side it came from.
+    #[test]
+    fn the_gradient_gate_leaves_floor_one_and_resolved_coordinates_alone() {
+        use crate::estimation::parameterization::fd_step;
+        let x = [2e-3, 1.5];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        };
+        let f = |v: &[f64]| 3.0 * v[0] + 5.0 * v[0] * v[0] + 0.5 * v[1] * v[1] + v[0] * v[1];
+        let bits = |g: &[f64]| g.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let panics = |_: &[f64]| -> Option<f64> { panic!("a floor-1 coordinate reached the gate") };
+        let gated = central_diff_packed_gated(&x, &fixed, &[1.0; 2], &bounds, f, Some(&panics));
+        let ungated = central_diff_packed(&x, &fixed, &[1.0; 2], &bounds, f);
+        assert_eq!(bits(&gated), bits(&ungated));
+
+        let floor = [2e-3, 1.0];
+        let calls = std::cell::Cell::new(0usize);
+        let shifted = |v: &[f64]| f(v) + 0.25 + 1e-5 * v[0];
+        let twin = |v: &[f64]| {
+            calls.set(calls.get() + 1);
+            Some(shifted(v))
+        };
+        let gated = central_diff_packed_gated(&x, &fixed, &floor, &bounds, f, Some(&twin));
+        let ungated = central_diff_packed(&x, &fixed, &floor, &bounds, f);
+        assert_eq!(
+            calls.get(),
+            2,
+            "accepted at the first step, on its two twin probes"
+        );
+        let h = fd_step(1e-4, x[0], floor[0]);
+        let at = |x0: f64| shifted(&[x0, x[1]]);
+        let twin_diff = (at(x[0] + h) - at(x[0] - h)) / ((x[0] + h) - (x[0] - h));
+        assert_eq!(gated[0].to_bits(), twin_diff.to_bits());
+        assert_ne!(
+            twin_diff.to_bits(),
+            ungated[0].to_bits(),
+            "fixture: the twin's difference is distinguishable from the stencil's"
+        );
+        assert!(
+            (gated[0] - ungated[0]).abs() < 2e-5,
+            "{gated:?} vs {ungated:?}"
+        );
+        assert_eq!(gated[1].to_bits(), ungated[1].to_bits());
+    }
+
+    /// #2406: a floored coordinate whose τ probes *stall* — warm-started at the mode, they stop
+    /// inside the tolerance ball when the perturbation is small — is grown until its twin agrees,
+    /// and takes the twin's difference there. The stall is modelled as a flat spot of
+    /// half-width `s = 1e-12` in the τ objective: it biases the τ slope by `s/h`, i.e. 1.7e-3 at
+    /// the #2187 step `h = 2e-10`, 3.3e-5 at floor 1e-4, and 3.3e-6 at floor 1e-3, the first
+    /// inside `RESOLVED_REL`. The τ/100 twin is the exact objective. The other coordinate,
+    /// floor 1, keeps its ungated difference bit for bit.
+    #[test]
+    fn the_gradient_gate_grows_a_stalled_step_and_returns_the_twin_difference() {
+        use crate::estimation::fd_resolution::{RESOLVED_REL, STEP_GROWTH};
+        use crate::estimation::parameterization::fd_step;
+
+        let x = [1e-6, 1.5];
+        let floor = [1e-6, 1.0];
+        let fixed = [false, false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0; 2],
+            upper: vec![10.0; 2],
+        };
+        let g = |v: &[f64]| 3.0 * v[0] + 5.0 * v[0] * v[0] + 0.5 * v[1] * v[1];
+        let s = 1e-12;
+        let stalled = |v: &[f64]| g(v) - (v[0] - x[0]).clamp(-s, s);
+        let twin = |v: &[f64]| Some(g(v));
+        let want = 3.0 + 10.0 * x[0];
+
+        let gated = central_diff_packed_gated(&x, &fixed, &floor, &bounds, stalled, Some(&twin));
+        let ungated = central_diff_packed(&x, &fixed, &floor, &bounds, stalled);
+        let (rel_gated, rel_ungated) = (
+            (gated[0] - want).abs() / want,
+            (ungated[0] - want).abs() / want,
+        );
+        eprintln!("MEASURE #2406 stalled slope: gated {rel_gated:e}, ungated {rel_ungated:e}");
+        // The straddle: ungated, the stall is the 1.7e-3 the docstring derives.
+        assert!(
+            rel_ungated > 1e-3,
+            "fixture: the τ probes stall ({rel_ungated:e})"
+        );
+        // The value is the twin's difference at floor 1e-3, bit for bit — not the τ one there
+        // (3.3e-6 off), and not the twin's at any other floor.
+        let accepted = floor[0] * STEP_GROWTH * STEP_GROWTH * STEP_GROWTH;
+        let h = fd_step(1e-4, x[0], accepted);
+        let at = |x0: f64| g(&[x0, x[1]]);
+        let twin_diff = (at(x[0] + h) - at(x[0] - h)) / ((x[0] + h) - (x[0] - h));
+        assert_eq!(
+            gated[0].to_bits(),
+            twin_diff.to_bits(),
+            "{} vs {twin_diff}",
+            gated[0]
+        );
+        assert!(rel_gated < RESOLVED_REL, "{rel_gated:e}");
+        assert_eq!(gated[1].to_bits(), ungated[1].to_bits());
+    }
+
+    /// #2406: a floored coordinate whose τ probe is missing at every step up to the cap leaves
+    /// the gate with nothing, and takes the ungated difference at its own floor, with its
+    /// one-sided fallback — the covariance gate's fallback too — not the one at floor 1, the
+    /// largest step there is (review r1, row 2: on a `TVV/k` volume that step is the one
+    /// through `V ≤ 0`). `f = (x0 − 1)²` is missing below `x0`; one-sided at step `h` it reads
+    /// `2(x0 − 1) + h`.
+    #[test]
+    fn the_gradient_gate_falls_back_to_its_own_floor_when_a_side_stays_missing() {
+        let x = [1e-3];
+        let fixed = [false];
+        let bounds = PackedBounds {
+            lower: vec![-10.0],
+            upper: vec![10.0],
+        };
+        let f = |v: &[f64]| {
+            if v[0] < x[0] {
+                f64::NAN
+            } else {
+                (v[0] - 1.0).powi(2)
+            }
+        };
+        let twin = |v: &[f64]| Some(f(v));
+        let gated = central_diff_packed_gated(&x, &fixed, &[1e-3], &bounds, f, Some(&twin));
+        let at_floor_one = central_diff_packed(&x, &fixed, &[1.0], &bounds, f);
+        let at_own_floor = central_diff_packed(&x, &fixed, &[1e-3], &bounds, f);
+        assert_eq!(
+            gated[0].to_bits(),
+            at_own_floor[0].to_bits(),
+            "{gated:?} vs {at_own_floor:?}"
+        );
+        assert_ne!(
+            at_floor_one[0], at_own_floor[0],
+            "fixture: the two steps differ"
+        );
+    }
+
+    /// The #2406 reproduction: `examples/two_cpt_oral_cov.ferx`'s model with a covariate
+    /// exponent `BETA` on CRCL, declared at `t0` (identity-packed, bounded `±5`; packed
+    /// coordinate 6) and entering as `(CRCL/100)^(BETA + c)`. Its sensitivity is O(1), not
+    /// `1/t0`, so the #2187 step `1e-4·t0` is the wrong one for it.
+    fn two_cpt_cov_beta(t0: f64, c: f64) -> (CompiledModel, Population) {
+        let src = format!(
+            "[parameters]
+  theta TVCL(4.0, 0.1, 100.0)
+  theta TVV1(40.0, 1.0, 500.0)
+  theta TVQ(8.0, 0.1, 100.0)
+  theta TVV2(80.0, 1.0, 500.0)
+  theta TVKA(1.0, 0.01, 10.0)
+  theta THETA_WT(0.6, 0.01, 5.0)
+  theta BETA({t0:e}, -5.0, 5.0)
+  omega ETA_CL ~ 0.15
+  omega ETA_V1 ~ 0.15
+  omega ETA_Q  ~ 0.08
+  omega ETA_V2 ~ 0.08
+  omega ETA_KA ~ 0.20
+  sigma PROP_ERR ~ 0.04 (sd)
+[individual_parameters]
+  CL = TVCL * (WT / 70)^THETA_WT * (CRCL / 100)^(BETA + {c:e}) * exp(ETA_CL)
+  V1 = TVV1 * (WT / 70)^THETA_WT * exp(ETA_V1)
+  Q  = TVQ  * exp(ETA_Q)
+  V2 = TVV2 * exp(ETA_V2)
+  KA = TVKA * exp(ETA_KA)
+[structural_model]
+  pk two_cpt_oral(cl=CL, v1=V1, q=Q, v2=V2, ka=KA)
+[error_model]
+  DV ~ proportional(PROP_ERR)
+"
+        );
+        let model = crate::parser::model_parser::parse_model_string(&src).expect("model parses");
+        let mut pop = crate::read_nonmem_csv(Path::new("data/two_cpt_oral_cov.csv"), None, None)
+            .expect("data loads");
+        pop.subjects.truncate(8);
+        (model, pop)
+    }
+
+    /// #2406: the R-matrix side of the gate, end to end through the covariance step, on
+    /// fixture A at its FOCEI estimate (`β̂ = 0.6798`; `THETA_WT` sits on its lower bound
+    /// there). The estimate is moved to `BETA = δ = 1e-4` by shifting the exponent,
+    /// `c = β̂ − δ`, so it is the same objective with `BETA` declared at `1e-4`. Under the
+    /// #2187 step its FD SE(BETA) was 96 % from the analytic one; the gate grows that
+    /// diagonal's step until the τ/100 re-solve agrees. SE(TVCL), floor 1, is the fixture's
+    /// own FD-vs-analytic gap, which the gate does not touch.
+    #[test]
+    fn the_covariance_gate_resolves_a_small_covariate_exponents_se() {
+        let beta_hat = 0.6797630658491339;
+        let delta = 1e-4;
+        let (m, p) = two_cpt_cov_beta(delta, beta_hat - delta);
+        let mut est = m.default_params.clone();
+        est.theta = vec![
+            5.2731892416136725,
+            44.80341226071577,
+            9.584412470148976,
+            92.16535593441313,
+            1.4074112031924877,
+            0.010000000000000005,
+            delta,
+        ];
+        est.omega = crate::types::OmegaMatrix::from_matrix(
+            DMatrix::from_diagonal(&DVector::from_vec(vec![
+                0.04468165236754428,
+                0.12184225657519575,
+                0.05501817239402348,
+                0.060478622240645215,
+                0.1913558297443002,
+            ])),
+            est.omega.eta_names.clone(),
+            true,
+        );
+        est.sigma.values = vec![0.0160462218419714];
+        let se = |analytic: bool| -> Vec<f64> {
+            let opts = FitOptions {
+                method: EstimationMethod::FoceI,
+                interaction: true,
+                outer_maxiter: 0,
+                run_covariance_step: true,
+                covariance_method: crate::types::CovarianceMethod::Hessian,
+                covariance_method_set: true,
+                analytic_cov_hessian: analytic,
+                ..FitOptions::default()
+            };
+            let r = crate::fit(&m, &p, &est, &opts).unwrap();
+            r.se_theta
+                .clone()
+                .expect("fixture: the covariance step succeeds")
+        };
+        let (exact, fd) = (se(true), se(false));
+        let rel = |k: usize| (fd[k] - exact[k]).abs() / exact[k];
+        let (rel_beta, rel_cl) = (rel(6), rel(0));
+        eprintln!(
+            "MEASURE #2406 cov SE(BETA) {:e} vs {:e}: {rel_beta:e}; SE(TVCL) {rel_cl:e}",
+            fd[6], exact[6]
+        );
+        assert!(exact[6] > 0.1, "fixture: SE(BETA) {}", exact[6]);
+        // Measured (macOS arm64): SE(BETA) 4.1e-5, SE(TVCL) 3.9e-4.
+        assert!(rel_beta < 2e-4, "SE(BETA): rel {rel_beta:e}");
+        assert!(rel_cl < 2e-3, "SE(TVCL): rel {rel_cl:e}");
+    }
+
+    /// One coordinate `ib` of the reconverged population gradient through
+    /// [`central_diff_packed_gated`] at the default point, with the number of population
+    /// re-solves it took, its ungated twin, and the exact gradient at a 1e-12 inner solve.
+    fn gated_gradient_cell(
+        model: &CompiledModel,
+        pop: &Population,
+        opts: &FitOptions,
+        ib: usize,
+    ) -> (f64, usize, f64, f64) {
+        gated_gradient_cell_twin(model, pop, opts, ib, true)
+    }
+
+    /// [`gated_gradient_cell`], with `twin_resolves = false` making every τ/100 re-solve read
+    /// as unresolved: what `inner_resolved` gives when one subject falls to Nelder–Mead or
+    /// stops unconverged there. The re-solves still run and are counted.
+    fn gated_gradient_cell_twin(
+        model: &CompiledModel,
+        pop: &Population,
+        opts: &FitOptions,
+        ib: usize,
+        twin_resolves: bool,
+    ) -> (f64, usize, f64, f64) {
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let bounds = compute_bounds(params);
+        let floors = fd_step_floors(params, model);
+        let mut only = vec![true; x.len()];
+        only[ib] = false;
+        crate::api::with_fit_scope(opts, || {
+            let mu = compute_mu_k(model, &params.theta, opts.mu_referencing);
+            let (ehs, _, _, kappas) =
+                run_inner_loop_warm(model, pop, params, 500, 1e-8, None, Some(&mu), 0, 0);
+            let warm = joint_warm_starts(&ehs, &kappas);
+            let n = std::cell::Cell::new(0usize);
+            let probe = |xv: &[f64], tol: f64| {
+                n.set(n.get() + 1);
+                reconverged_probe_ofv(xv, params, model, pop, &warm, opts, tol)
+            };
+            let tol = stencil_inner_tol(opts.inner_tol);
+            let tight = |xv: &[f64]| {
+                let (v, st) = probe(xv, crate::estimation::fd_resolution::tight_tol(tol));
+                (twin_resolves && crate::estimation::fd_resolution::inner_resolved(&st))
+                    .then_some(v)
+            };
+            let gated = central_diff_packed_gated(
+                &x,
+                &only,
+                &floors,
+                &bounds,
+                |xv| probe(xv, tol).0,
+                Some(&tight),
+            )[ib];
+            let evals = n.replace(0);
+            let ungated =
+                central_diff_packed(&x, &only, &floors, &bounds, |xv| probe(xv, tol).0)[ib];
+            let (ehs_t, hms_t, _, kappas_t) =
+                run_inner_loop_warm(model, pop, params, 2000, 1e-12, None, Some(&mu), 0, 0);
+            let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(model, pop, opts);
+            let priors = build_prior_set(model, params);
+            let exact = exact_reporting_gradient(
+                &x, params, model, pop, &ehs_t, &hms_t, &kappas_t, &bounds, opts, &nn_reg, &priors,
+            )
+            .expect("fixture: exact gradient in scope")[ib];
+            (gated, evals, ungated, exact)
+        })
+        .unwrap()
+    }
+
+    /// #2406: the gate on fixture A's `BETA`, against the exact gradient. Under the #2187 step
+    /// the reconverged difference was 53 % off at `t0 = 1e-10` and 0.28 % at `1e-4`; the gate
+    /// grows the step until the τ/100 twin agrees. A `V = TVV_S/k` volume, whose sensitivity
+    /// *does* scale as `1/k`, is accepted at its first step: two τ probes and two twins.
+    #[test]
+    fn the_gradient_gate_resolves_a_small_covariate_exponent_and_keeps_a_scaled_volume_step() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        for t0 in [1e-10, 1e-4] {
+            let (m, p) = two_cpt_cov_beta(t0, 0.0);
+            let (gated, evals, ungated, exact) = gated_gradient_cell(&m, &p, &opts, 6);
+            assert!(
+                gated.is_finite() && exact.abs() > 1.0,
+                "fixture A: {gated} vs {exact}"
+            );
+            let (rel, rel_ungated) = (
+                (gated - exact).abs() / exact.abs(),
+                (ungated - exact).abs() / exact.abs(),
+            );
+            eprintln!("MEASURE #2406 A t0={t0:e}: gated {rel:e} [{evals} re-solves], ungated {rel_ungated:e}");
+            assert!(
+                rel_ungated > 1e-3,
+                "fixture A at t0={t0:e}: the #2187 step is off ({rel_ungated:e})"
+            );
+            assert!(rel < 1e-7, "A t0={t0:e}: rel {rel:e}");
+        }
+        let (m, p) = warfarin_scaled_v(1e-6);
+        let (gated, evals, ungated, exact) = gated_gradient_cell(&m, &p, &opts, 1);
+        let rel = (gated - exact).abs() / exact.abs();
+        eprintln!(
+            "MEASURE #2406 B k=1e-6: gated {rel:e} [{evals} re-solves], ungated {:e}",
+            (ungated - exact).abs() / exact.abs()
+        );
+        assert_eq!(evals, 4, "B is accepted at its first step");
+        assert!(rel < 1e-5, "B: rel {rel:e}");
+    }
+
+    /// #2406 review r1, row 1: fixture B at its stationary point, where the gradient is too
+    /// small for the relative test or the noise guard ever to pass. The gate grew the step until
+    /// truncation error made the difference large enough to pass them, and accepted
+    /// `k·g = −1.11e-2` at `k = 1e-4…1e-8` (`−2.2e-4` at `1e-2`) after 12 re-solves, where the
+    /// ungated difference is `−4.37e-6`; the truncation test now stops at floor 1 and keeps floor
+    /// 0's difference, 8 re-solves. `TVV_S = 7.611829143·k` is the stationary value (a secant on
+    /// the exact gradient gives it for every `k`), checked here by the exact gradient itself.
+    /// Measured (Linux x86_64): gated `k·g = −4.3571e-6` and ungated `−4.3577e-6` against an
+    /// exact `1.1e-8`, at both `k`, against an off-optimum `k·g` of 13.3.
+    #[test]
+    fn the_gradient_gate_keeps_a_scaled_volumes_step_at_its_stationary_point() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        for k in [1e-2, 1e-6] {
+            let (mut m, p) = warfarin_scaled_v(k);
+            m.default_params.theta[1] = 7.611829143 * k;
+            let (gated, evals, ungated, exact) = gated_gradient_cell(&m, &p, &opts, 1);
+            let (gated, ungated, exact) = (gated * k, ungated * k, exact * k);
+            eprintln!(
+                "MEASURE #2406 B stationary k={k:e}: gated {gated:e} [{evals} re-solves], \
+                 ungated {ungated:e}, exact {exact:e}"
+            );
+            // At the stationary point to well inside the FD error under test (4.4e-6): the
+            // ten-digit TVV_S leaves an exact k·g of 1.1e-8 at both k (Linux x86_64).
+            assert!(
+                exact.abs() < 1e-7,
+                "fixture: not at the stationary point ({exact:e})"
+            );
+            assert!(gated.is_finite() && ungated.is_finite());
+            // Floor 0, then floor 1 to see the move: τ and τ/100 at each.
+            assert_eq!(
+                evals, 8,
+                "k={k:e}: stopped on the truncation test at floor 1"
+            );
+            // No worse than the ungated step, 4.37e-6 from the exact gradient here; the gate
+            // without the truncation test was 2550× worse at k = 1e-6.
+            assert!(
+                (gated - exact).abs() <= 1.01 * (ungated - exact).abs(),
+                "k={k:e}: gated {gated:e} vs ungated {ungated:e}, exact {exact:e}"
+            );
+        }
+    }
+
+    /// #2406 review r2: fixture B at `k = 1e-6` with the τ/100 twin unresolved at every floor,
+    /// off the optimum and at the stationary point. The gate learned nothing, so it must keep
+    /// the ungated difference, bit for bit: the same two τ probes at `floor0`. Returning the
+    /// cap's τ difference instead gave `k·g = −2.85e13` at both points, against an exact 13.3
+    /// and 1.1e-8 (TeunP, macOS arm64). Measured with the fix (macOS arm64): gated = ungated =
+    /// 13.339523609018514 off the optimum and −4.357688762219833e-6 at the stationary point,
+    /// 21 re-solves each (τ at all seven floors, and the first τ/100 probe at each).
+    #[test]
+    fn the_gradient_gate_without_a_resolved_twin_keeps_the_ungated_step() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let k = 1e-6;
+        for stationary in [false, true] {
+            let (mut m, p) = warfarin_scaled_v(k);
+            if stationary {
+                m.default_params.theta[1] = 7.611829143 * k;
+            }
+            let (gated, evals, ungated, exact) = gated_gradient_cell_twin(&m, &p, &opts, 1, false);
+            let (gated, ungated, exact) = (gated * k, ungated * k, exact * k);
+            eprintln!(
+                "MEASURE #2406 B no-twin stationary={stationary} k={k:e}: gated {gated:e} \
+                 [{evals} re-solves], ungated {ungated:e}, exact {exact:e}"
+            );
+            assert!(gated.is_finite() && ungated.is_finite());
+            assert_eq!(
+                gated.to_bits(),
+                ungated.to_bits(),
+                "stationary={stationary}: gated {gated:e} vs ungated {ungated:e}, exact {exact:e}"
+            );
+        }
+    }
+
+    /// #2406: every production caller of the reconverged FD gradient hands
+    /// [`central_diff_packed_gated`] its tight twin — population, reporting, and per-subject.
+    /// Fixture A at `t0 = 1e-4`, where the #2187 step is 0.28 % off. The reference is the same
+    /// model declared at `BETA = 1` with the exponent shifted back by `c = t0 − 1`: one function
+    /// of the same exponent, stepped at floor 1, which the gate does not touch. A caller passing
+    /// no twin reads the #2187 error and names itself.
+    #[test]
+    fn every_reconverged_fd_gradient_caller_takes_the_gate() {
+        let opts = FitOptions {
+            method: EstimationMethod::FoceI,
+            interaction: true,
+            ..FitOptions::default()
+        };
+        let ib = 6;
+        let t0 = 1e-4;
+        let grads = |m: &CompiledModel, p: &Population| -> [f64; 3] {
+            let params = &m.default_params;
+            let x = pack_params(params);
+            let bounds = compute_bounds(params);
+            crate::api::with_fit_scope(&opts, || {
+                let mu = compute_mu_k(m, &params.theta, opts.mu_referencing);
+                let (ehs, _, _, kappas) =
+                    run_inner_loop_warm(m, p, params, 500, 1e-8, None, Some(&mu), 0, 0);
+                let pop_g =
+                    reconverged_fd_gradient(&x, params, m, p, &ehs, &kappas, &bounds, &opts);
+                let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(m, p, &opts);
+                let priors = build_prior_set(m, params);
+                let rep_g = reporting_fd_gradient(
+                    &x, params, m, p, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                );
+                let sub_g = subject_reconverged_fd_gradient(
+                    &x,
+                    params,
+                    m,
+                    &p.subjects[0],
+                    &ehs[0],
+                    &bounds,
+                    &opts,
+                );
+                [pop_g[ib], rep_g[ib], sub_g[ib]]
+            })
+            .unwrap()
+        };
+        let (m, p) = two_cpt_cov_beta(t0, 0.0);
+        let small = grads(&m, &p);
+        let (m1, p1) = two_cpt_cov_beta(1.0, t0 - 1.0);
+        let reference = grads(&m1, &p1);
+        let rels: Vec<f64> = ["population", "reporting", "subject"]
+            .iter()
+            .zip(small.iter().zip(reference.iter()))
+            .map(|(label, (s, r))| {
+                assert!(s.is_finite() && r.is_finite(), "{label}: {s} vs {r}");
+                assert!(
+                    r.abs() > 1e-2,
+                    "fixture: {label} gradient in BETA is live ({r})"
+                );
+                let rel = (s - r).abs() / r.abs();
+                eprintln!(
+                    "MEASURE #2406 callers {label}: t0=1e-4 {s:e}, floor-1 twin {r:e}, rel {rel:e}"
+                );
+                rel
+            })
+            .collect();
+        // Measured (macOS arm64): population and reporting 2.0e-7, subject 3.8e-6 — the
+        // floor-1 reference's own error, since the gated population leg is 5.8e-9 from the
+        // exact gradient (above). With a caller's twin removed that leg reads the #2187 step.
+        for ((label, rel), bound) in ["population", "reporting", "subject"]
+            .iter()
+            .zip(&rels)
+            .zip([1e-6, 1e-6, 2e-5])
+        {
+            assert!(*rel < bound, "{label}: rel {rel:e}");
         }
     }
 
@@ -8955,6 +9580,7 @@ fn predicted_remaining_gain_is_withheld_when_the_tight_integration_is_unfinished
             0,
             InnerHessianSeed::for_options(&opts),
             &opts,
+            PrevEtas::Solved,
         );
         let gradients = |strict| {
             per_subject_outer_gradients_checked(&m, &pop, p, &x, &e, &k, &opts, strict).is_some()
@@ -9078,6 +9704,9 @@ fn predicted_remaining_gain_is_withheld_when_the_exact_path_declines_a_segment()
         let (x, ehs, _, kappas) = ebes_at(&m, p, &pop, &opts);
         let exact = gain_with(&m, &pop, p, &x, &ehs, &kappas, &opts);
         FORCE_LINEAR_DECLINE.set(true);
+        // The seam is no value a compiled plan's guard reads (#2786): the plans recorded on
+        // the exact path go, so the declined pass records its own.
+        crate::parser::model_parser::rhs_regcode::kernel_jit::reset();
         let declined = gain_with(&m, &pop, p, &x, &ehs, &kappas, &opts);
         FORCE_LINEAR_DECLINE.set(false);
         (exact, declined)
@@ -9093,10 +9722,11 @@ fn predicted_remaining_gain_is_withheld_when_the_exact_path_declines_a_segment()
     );
 }
 
-/// #2143 review: an objective the decrement cannot be formed for skips the tight re-solve
+/// #2143 review: a model the decrement cannot be formed for skips the tight re-solve
 /// instead of paying for it (up to a 100× step budget) and then returning `None`. Both
-/// sides on one integrated fixture, the #1934 model's ODE twin under rk45: FOCEI starts one
-/// re-solve and forms a decrement, AGQ starts none and forms none.
+/// sides on one integrated fixture, the #1934 model's ODE twin under rk45: FOCEI and AGQ
+/// each start one re-solve and form a decrement; the same model under `gradient = fd`
+/// starts none and forms none.
 #[test]
 fn predicted_remaining_gain_skips_the_tight_re_solve_out_of_scope() {
     use crate::parser::model_parser::parse_model_string;
@@ -9104,26 +9734,35 @@ fn predicted_remaining_gain_skips_the_tight_re_solve_out_of_scope() {
     use std::path::Path;
 
     let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
-    let m = parse_model_string(&issue_1934_ode_model(
-        6.735588,
-        16.155540,
-        0.011638,
-        23.488333,
-        [0.061883, -0.018713, 0.101651],
-        0.043717,
-        "rk45",
-    ))
-    .expect("fixture parses");
+    let parse = || {
+        parse_model_string(&issue_1934_ode_model(
+            6.735588,
+            16.155540,
+            0.011638,
+            23.488333,
+            [0.061883, -0.018713, 0.101651],
+            0.043717,
+            "rk45",
+        ))
+        .expect("fixture parses")
+    };
+    let m = parse();
     let opts = focei_options();
     let (x, ehs, _, kappas) = ebes_at(&m, &m.default_params, &pop, &opts);
     let agq = FitOptions {
         n_agq: 3,
         ..focei_options()
     };
+    let mut fd = parse();
+    fd.gradient_method = crate::types::GradientMethod::Fd;
     let resolves = || super::TIGHT_RESOLVES.with(|n| n.get());
-    for (label, o, in_scope) in [("FOCEI", &opts, true), ("AGQ", &agq, false)] {
+    for (label, model, o, in_scope) in [
+        ("FOCEI", &m, &opts, true),
+        ("AGQ", &m, &agq, true),
+        ("gradient = fd", &fd, &opts, false),
+    ] {
         let before = resolves();
-        let got = gain_with(&m, &pop, &m.default_params, &x, &ehs, &kappas, o);
+        let got = gain_with(model, &pop, &m.default_params, &x, &ehs, &kappas, o);
         assert_eq!(got.is_some(), in_scope, "{label}: {got:?}");
         assert_eq!(
             resolves() - before,
@@ -9388,79 +10027,115 @@ fn predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms() {
     );
 }
 
-/// Where no decrement is formed, both sides of each exclusion: AGQ, whose objective is not
-/// the one `subject_analytic_outer_gradient` differentiates, and a mixture. An ODE model
-/// is no longer one (#2001): see `predicted_remaining_gain_on_an_exact_ode_model_is_the_closed_forms`
-/// and `predicted_remaining_gain_on_an_integrated_ode_model_is_the_exact_one`.
+/// The decrement serves the quadrature and mixture objectives too, each from its own exact
+/// per-subject gradients: twice their sum is the optimizer's gradient of that objective — the
+/// AGQ gradient (`agq_population_gradient`) and the mixture's (`mixture_gradient_with_modes`)
+/// — on every free coordinate, and the decrement formed from them is finite. A regression to
+/// FOCEI rows on an AGQ fit, or to one class's marginal on a mixture, misses the sum; one that
+/// withholds the rows again leaves the decrement `None`.
 #[test]
-fn predicted_remaining_gain_is_withheld_from_inexact_objectives() {
+fn per_subject_outer_gradients_serve_agq_and_mixtures() {
     use crate::parser::model_parser::parse_model_file;
     use crate::read_nonmem_csv;
     use std::path::Path;
 
-    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
-    let opts = focei_options();
-    let closed = parse_model_file(Path::new("examples/two_cpt_iv.ferx")).expect("parses");
-    assert!(gain_at(&closed, &pop, &opts).is_some(), "closed form");
+    let sums_to = |label: &str, rows: &[Vec<f64>], want: &[f64], params: &ModelParameters| {
+        let fixed = packed_fixed_mask(params);
+        let mut free = 0;
+        for k in (0..want.len()).filter(|&k| !fixed[k]) {
+            let ours = 2.0 * rows.iter().map(|g| g[k]).sum::<f64>();
+            assert!(ours.is_finite() && want[k].is_finite(), "{label} [{k}]");
+            assert!(
+                (ours - want[k]).abs() <= 1e-9 * (1.0 + want[k].abs()),
+                "{label} coordinate {k}: {ours} vs {}",
+                want[k]
+            );
+            free += usize::from(want[k] != 0.0);
+        }
+        assert!(
+            free > 1,
+            "{label}: the gradient must be live on several coordinates"
+        );
+    };
 
+    // AGQ (3 nodes, FOCEI anchor) on the closed-form two-compartment model.
+    let pop = read_nonmem_csv(Path::new("data/two_cpt_iv.csv"), None, None).expect("data loads");
+    let model = parse_model_file(Path::new("examples/two_cpt_iv.ferx")).expect("parses");
+    let params = &model.default_params;
     let agq = FitOptions {
         n_agq: 3,
         ..focei_options()
     };
-    let (x, ehs, _, kappas) = ebes_at(&closed, &closed.default_params, &pop, &opts);
-    let per_subject = |o: &FitOptions| {
-        per_subject_outer_gradients(&closed, &pop, &closed.default_params, &x, &ehs, &kappas, o)
-    };
-    assert!(per_subject(&opts).is_some(), "FOCEI");
-    assert_eq!(per_subject(&agq), None, "AGQ");
+    let (x, ehs, _, kappas) = ebes_at(&model, params, &pop, &agq);
+    let rows = per_subject_outer_gradients(&model, &pop, params, &x, &ehs, &kappas, &agq)
+        .expect("AGQ rows");
+    let want = crate::estimation::agq::agq_population_gradient(
+        &model,
+        &pop,
+        params,
+        params,
+        &x,
+        &ehs,
+        &kappas,
+        3,
+        agq.hessian_anchor(),
+    )
+    .expect("AGQ gradient");
+    sums_to("AGQ", &rows, &want, params);
+    let gain = gain_at(&model, &pop, &agq).expect("AGQ decrement");
+    assert!(gain.is_finite() && gain >= 0.0, "AGQ decrement {gain}");
 
-    // A mixture's objective is the class log-sum-exp, not one class's marginal: its
-    // twin with the `[mixture]` block removed is in scope, the mixture is not.
-    let mixture_src = |mixture: bool| {
-        format!(
-            "[parameters]
+    // A two-class mixture: the class log-sum-exp, every class at its own mode.
+    let mix = crate::parser::model_parser::parse_model_string(
+        "[parameters]
   theta TVCL1(1.2, 0.01, 100.0)
   theta TVCL2(2.5, 0.01, 100.0)
   theta TVV(10.0, 0.1, 1000.0)
-  theta MIXL(0.0, -10.0, 10.0)
-  omega ETA_CL ~ 0.09 FIX
-  sigma EPS ~ 0.04 FIX
-{}
+  theta MIXL(0.3, -10.0, 10.0)
+  omega ETA_CL ~ 0.09
+  sigma EPS ~ 0.04
+[mixture]
+  nsub = 2
+  logit(1) = MIXL
 [individual_parameters]
-  CL = {}
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
   V  = TVV
 [structural_model]
   pk one_cpt_iv(cl=CL, v=V)
 [error_model]
   DV ~ proportional(EPS)
 ",
-            if mixture {
-                "[mixture]\n  nsub = 2\n  logit(1) = MIXL\n"
-            } else {
-                ""
-            },
-            if mixture {
-                "if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)"
-            } else {
-                "TVCL1 * exp(ETA_CL) * (TVCL2 / TVCL2) * exp(MIXL - MIXL)"
-            }
-        )
-    };
+    )
+    .expect("parses");
     let mix_pop = read_nonmem_csv(
         Path::new("tests/nonmem/mixture_iv.csv"),
         Some(&["WT"]),
         None,
     )
     .expect("mixture data loads");
-    for (mixture, want_some) in [(false, true), (true, false)] {
-        let m =
-            crate::parser::model_parser::parse_model_string(&mixture_src(mixture)).expect("parses");
-        assert_eq!(m.mixture.is_some(), mixture, "fixture's mixture status");
-        let (x, ehs, _, kappas) = ebes_at(&m, &m.default_params, &mix_pop, &opts);
-        let got =
-            per_subject_outer_gradients(&m, &mix_pop, &m.default_params, &x, &ehs, &kappas, &opts);
-        assert_eq!(got.is_some(), want_some, "mixture = {mixture}");
-    }
+    let opts = focei_options();
+    let params = &mix.default_params;
+    let (x, ehs, _, kappas) = ebes_at(&mix, params, &mix_pop, &opts);
+    let rows = per_subject_outer_gradients(&mix, &mix_pop, params, &x, &ehs, &kappas, &opts)
+        .expect("mixture rows");
+    let (eval, modes) =
+        crate::estimation::mixture::mixture_ofv_with_modes(&mix, &mix_pop, params, &opts, None);
+    assert!(
+        eval.pmix.iter().any(|p| p.iter().all(|&w| w > 1e-3)),
+        "a subject must carry both classes, or the log-sum-exp is one class's marginal"
+    );
+    let want = crate::estimation::mixture::mixture_gradient_with_modes(
+        &mix,
+        &mix_pop,
+        params,
+        &opts,
+        &eval,
+        Some(&modes),
+    )
+    .expect("mixture gradient");
+    sums_to("mixture", &rows, &want, params);
+    let gain = gain_at(&mix, &mix_pop, &opts).expect("mixture decrement");
+    assert!(gain.is_finite() && gain >= 0.0, "mixture decrement {gain}");
 }
 
 /// `per_subject_outer_gradients` is the optimizer's own gradient taken apart: twice its
@@ -10118,6 +10793,11 @@ fn an_absorbed_cold_incumbent_is_not_displaced_by_a_point_between_the_two() {
         state.cached_etas, cold_modes,
         "warm starts are the cold solve's η then κ"
     );
+    assert_eq!(
+        state.cached_etas_kind,
+        PrevEtas::Solved,
+        "the cold solve's modes are a solve's output, an exactly-zero one included (#2688)"
+    );
     assert!(
         state.pred_jac.is_none(),
         "the warm modes' response goes with them"
@@ -10739,6 +11419,456 @@ fn an_exactly_zero_preflight_mode_still_skips_the_first_eval_multistart() {
     }
 }
 
+/// `make_population(4)` with distinct ids and its last subject, `EMPTY`, stripped of every
+/// observation, so its mode is exactly η = 0. Returns the population and an informed
+/// subject's id.
+fn population_with_an_empty_subject() -> (Population, String) {
+    let mut pop = make_population(4);
+    // `make_population` names every subject alike; the tests count per subject.
+    for (i, s) in pop.subjects.iter_mut().enumerate() {
+        s.id = format!("S{}", i + 1);
+    }
+    let empty = &mut pop.subjects[3];
+    empty.id = "EMPTY".into();
+    empty.obs_times.clear();
+    empty.observations.clear();
+    empty.obs_cmts.clear();
+    empty.cens.clear();
+    empty.occasions.clear();
+    let informed = pop.subjects[0].id.clone();
+    (pop, informed)
+}
+
+/// An EBE a solve returned as exactly zero — the prior mode of a subject with no
+/// observations, or of an η the model never reads — is that subject's warm start like any
+/// other: once one pass has solved it, the next pass does not run its cold multi-start
+/// again. The value test alone reads it as the cold placeholder, so before the cache kind
+/// ([`PrevEtas`]) every outer evaluation re-ran it: on `examples/mm_iv.ferx` with an inert
+/// `ETA_DUMMY` as the only η, 920 multi-starts against 60.
+///
+/// Per driver, from a cold cache: the empty subject is multi-started exactly as often as
+/// an informed one, whose nonzero mode is warm after its first solve. The straddle: the
+/// empty subject is solved more often than that, so the old behaviour (a multi-start at
+/// every solve) cannot pass.
+#[test]
+fn an_exactly_zero_solved_ebe_is_not_multistarted_at_every_evaluation() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::types::{EstimationMethod, FitOptions};
+    let (pop, informed) = population_with_an_empty_subject();
+    let model = make_model();
+    let init = &model.default_params;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    for (label, optimizer, method) in [
+        ("nlopt bobyqa", Optimizer::Bobyqa, EstimationMethod::Foce),
+        ("nlopt slsqp", Optimizer::Slsqp, EstimationMethod::Foce),
+        ("built-in bfgs", Optimizer::Bfgs, EstimationMethod::Foce),
+        (
+            "trust region",
+            Optimizer::TrustRegion,
+            EstimationMethod::Foce,
+        ),
+        ("gauss-newton", Optimizer::Bobyqa, EstimationMethod::FoceGn),
+    ] {
+        let opts = FitOptions {
+            method,
+            optimizer,
+            outer_maxiter: 4,
+            inner_restarts: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let declines = OuterFdDeclineLog::new(pop.subjects.len());
+        let (ofv, rec) = pool.install(|| {
+            record_inner_solves(|| {
+                match (method, optimizer) {
+                    (EstimationMethod::FoceGn, _) => {
+                        crate::estimation::gauss_newton::run_foce_gn(&model, &pop, init, &opts)
+                    }
+                    (_, Optimizer::Bfgs) => {
+                        optimize_bfgs(&model, &pop, init, &opts, &declines, None)
+                    }
+                    (_, Optimizer::TrustRegion) => {
+                        crate::estimation::trust_region::optimize_trust_region(
+                            &model, &pop, init, &opts,
+                        )
+                    }
+                    _ => optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[]),
+                }
+                .ofv
+            })
+        });
+        assert!(ofv.is_finite(), "{label}: OFV {ofv}");
+        let count =
+            |ids: &mut dyn Iterator<Item = &String>, id: &str| ids.filter(|s| *s == id).count();
+        let (ms_empty, ms_informed) = (
+            count(&mut rec.multistarts.iter(), "EMPTY"),
+            count(&mut rec.multistarts.iter(), &informed),
+        );
+        let solves_empty = count(&mut rec.solve_tols.iter().map(|(id, _)| id), "EMPTY");
+        assert!(
+            ms_informed >= 1,
+            "{label}: fixture must reach the multi-start gate"
+        );
+        assert!(
+            solves_empty > ms_informed,
+            "{label}: fixture must solve the empty subject warm at least once \
+             ({solves_empty} solves, {ms_informed} cold passes)"
+        );
+        assert_eq!(
+            ms_empty, ms_informed,
+            "{label}: the exactly-zero EBE was multi-started as a cold start \
+             ({ms_empty} times, the informed subject {ms_informed}, in {solves_empty} solves)"
+        );
+    }
+}
+
+/// #2682's warm re-solve of a guard-rejected start swaps the cache to the cold solve's modes
+/// and back, and the cache kind ([`PrevEtas`]) has to travel with it, in both directions:
+///
+/// - **in:** the re-solve reads its start as `Solved`, so the empty subject's exactly-zero
+///   mode is warm there like an informed subject's nonzero one. Kept as the cold
+///   `Placeholder`, the re-solve multi-starts the empty subject once more than the informed
+///   one (measured 6 vs 5 accepted, 21 vs 20 rejected; Linux x86_64);
+/// - **out:** the cold solve's cache is restored as `Placeholder`. Left `Solved`, every later
+///   evaluation of a start that stays rejected — still at the zero fill, since nothing was
+///   adopted — takes the zeros for a solve's modes and skips its cold multi-start: measured 2
+///   multi-starts of the informed subject in 29 solves, against 20 restored.
+///
+/// Two fixtures on the same population, `max_unconverged_frac = 0`: at `inner_maxiter = 1`
+/// the re-solve converges the start and is accepted, at `0` it stays rejected.
+#[test]
+fn the_start_warm_resolve_carries_the_cache_kind_both_ways() {
+    use crate::estimation::inner_optimizer::{record_inner_solves, InnerLoopStats};
+    use crate::types::FitOptions;
+    let (pop, informed) = population_with_an_empty_subject();
+    let n_subj = pop.subjects.len();
+    let model = make_model();
+    let init = &model.default_params;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    let fit = |inner_maxiter: usize| {
+        let opts = FitOptions {
+            outer_maxiter: 1,
+            inner_maxiter,
+            max_unconverged_frac: 0.0,
+            inner_restarts: 1,
+            run_covariance_step: false,
+            verbose: false,
+            ..FitOptions::default()
+        };
+        let declines = OuterFdDeclineLog::new(n_subj);
+        // The #2709 stop would leave a rejected pass's later subjects unsolved: switched off
+        // inside the pool, where the objective runs.
+        let (r, rec) = pool.install(|| {
+            GUARD_STOP_DISABLED.with(|c| c.set(true));
+            let out = record_inner_solves(|| {
+                optimize_nlopt(&model, &pop, init, &opts, &declines, None, &[])
+            });
+            GUARD_STOP_DISABLED.with(|c| c.set(false));
+            out
+        });
+        let start = r.start_eval.expect("the unprofiled loop records its start");
+        let ms = |id: &str| rec.multistarts.iter().filter(|s| *s == id).count();
+        let solves_of = |id: &str| rec.solve_tols.iter().filter(|(i, _)| i == id).count();
+        // `multistarts` and `solve_tols` are pushed from the rayon worker that ran the solve,
+        // and `record_inner_solves` sees only the recording thread's, so a pass spread over
+        // several workers records a subset — per subject, by scheduling. Measured on this
+        // 4-subject fixture: at one thread every subject records 218 solves, at two threads
+        // two of them record 0, at four threads 4 / 218 / 8 / 5. The pool above is one thread
+        // so the recording is complete, and this asserts that rather than trusting it: a
+        // partial recording would otherwise read as a difference in multi-starts and send the
+        // next reader after a defect that is not there (#2691 CI).
+        let counts: Vec<(String, usize, usize)> = pop
+            .subjects
+            .iter()
+            .map(|s| (s.id.clone(), solves_of(&s.id), ms(&s.id)))
+            .collect();
+        let complete = counts.iter().all(|(_, n, _)| *n == counts[0].1);
+        assert!(
+            complete,
+            "the recording is incomplete, so its per-subject counts cannot be compared: \
+             (id, solves, multi-starts) = {counts:?}. Every subject must record the same \
+             number of solves; `record_inner_solves` keeps only the recording thread's."
+        );
+        // Per pass, the multi-starts of each subject (#2691 CI trace): the property is
+        // per-pass — a solved zero mode is not multi-started where a nonzero one is taken as
+        // warm — and counting over the whole fit hides which pass broke it. `multistart_passes`
+        // is parallel to `multistarts`.
+        let per_pass = |id: &str| -> std::collections::BTreeMap<Option<usize>, usize> {
+            let mut m = std::collections::BTreeMap::new();
+            for (s, p) in rec.multistarts.iter().zip(&rec.multistart_passes) {
+                if s == id {
+                    *m.entry(*p).or_insert(0) += 1;
+                }
+            }
+            m
+        };
+        let empty_by_pass = per_pass("EMPTY");
+        let informed_by_pass = per_pass(&informed);
+        // Every pass, not a chosen few: a pass either starts cold (every subject at the zero
+        // placeholder, so both are multi-started alike) or from modes an earlier pass returned
+        // (so neither is), and a pass where EMPTY alone is multi-started has read its
+        // exactly-zero mode as the placeholder. How many passes a fit runs differs by platform
+        // (#1688, CI 219 against 218 locally), which is why this is asked per pass and not as
+        // a count over the fit. CI's pass 210 was such a pass: the final solve seeded from the
+        // incumbent's modes, which carried no kind (#2691 review row 1) and runs only when
+        // the cold final solve misses the incumbent.
+        let offending: Vec<(Option<usize>, usize, usize)> = empty_by_pass
+            .keys()
+            .chain(informed_by_pass.keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|p| {
+                (
+                    p,
+                    empty_by_pass.get(&p).copied().unwrap_or(0),
+                    informed_by_pass.get(&p).copied().unwrap_or(0),
+                )
+            })
+            .filter(|&(_, e, i)| e > i)
+            .collect();
+        (
+            start,
+            ms("EMPTY"),
+            ms(&informed),
+            solves_of(&informed),
+            counts,
+            offending,
+        )
+    };
+
+    let (start, _ms_empty, ms_informed, _, counts, offending) = fit(1);
+    assert!(
+        !start.guard_rejected && start.warm_rescored_from.is_some_and(|n| n > 0),
+        "fixture: the cold start must be rejected and its warm re-solve accepted: {start:?}"
+    );
+    assert!(ms_informed >= 1, "fixture must reach the multi-start gate");
+    // Per pass, not over the whole fit: the property — the exactly-zero mode is never
+    // multi-started on a pass where an informed subject's nonzero mode is taken as warm — is a
+    // per-pass one, and a count over the fit mixes passes whose number differs by platform
+    // (#1688). `offending` is the passes where EMPTY exceeds the informed subject. Mutation A
+    // (the re-solve reads `Placeholder`) makes EMPTY cold on the re-solve pass, which lands
+    // there.
+    assert!(
+        offending.is_empty(),
+        "accepted re-solve: on (pass, EMPTY, informed) = {offending:?} the exactly-zero mode was \
+         multi-started as a cold start where the informed subject's was taken as warm; \
+         (id, solves, multi-starts) = {counts:?}"
+    );
+
+    let (start, _ms_empty, ms_informed, solves, counts, offending) = fit(0);
+    let cold = InnerLoopStats {
+        n_unconverged: start.n_unconverged,
+        n_start_rejected: start.n_start_rejected,
+        ..Default::default()
+    };
+    assert!(
+        start.guard_rejected
+            && start.warm_rescored_from.is_none()
+            && start.ofv.is_finite()
+            && wants_start_warm_rescore(&cold, n_subj, start.ofv, 0.0),
+        "fixture: the start must earn the warm re-solve and stay rejected after it: {start:?}"
+    );
+    assert!(
+        offending.is_empty(),
+        "rejected re-solve: on (pass, EMPTY, informed) = {offending:?} the exactly-zero mode was \
+         multi-started as a cold start where the informed subject's was taken as warm; \
+         (id, solves, multi-starts) = {counts:?}"
+    );
+    assert!(
+        2 * ms_informed > solves,
+        "rejected start: the zero fill was restored as a solve's modes, so later evaluations \
+         skipped their cold multi-start ({ms_informed} multi-starts in {solves} solves)"
+    );
+}
+
+/// `restart_from_modes` is the one place a cold incumbent's and a verification leg's held
+/// modes enter the cache, and it has to label them: `Solved` with the modes, or an
+/// exactly-zero one among them is multi-started at the next evaluation while the nonzero
+/// ones are warm (#2691 review row 3). Without modes, or with a count that is not one per
+/// subject, the start is the cold placeholder and must say so, or the next evaluation
+/// skips the multi-start a cold start owes.
+#[test]
+fn a_restart_from_held_modes_labels_the_cache() {
+    let xs = vec![0.1, 0.2, 0.3];
+    let state_with_a_solved_cache = || {
+        let mut state = new_nlopt_state(2, 2, &xs, SalvageGuardPolicy::Off);
+        state.cached_etas = vec![DVector::from_element(2, 0.3); 2];
+        state.cached_etas_kind = PrevEtas::Solved;
+        state
+    };
+    // Subject 1's held mode is exactly zero: the case the label exists for.
+    let held = vec![DVector::from_element(2, -0.5), DVector::zeros(2)];
+
+    let mut state = state_with_a_solved_cache();
+    state.restart_from_modes(Some(held.clone()));
+    assert_eq!(state.cached_etas, held);
+    assert_eq!(state.cached_etas_kind, PrevEtas::Solved);
+
+    for (label, modes) in [
+        ("none", None),
+        ("one subject short", Some(held[..1].to_vec())),
+    ] {
+        let mut state = state_with_a_solved_cache();
+        state.restart_from_modes(modes);
+        assert!(
+            state
+                .cached_etas
+                .iter()
+                .all(|e| e.iter().all(|&v| v == 0.0)),
+            "{label}: a cold start is the zero placeholder, got {:?}",
+            state.cached_etas
+        );
+        assert_eq!(state.cached_etas.len(), 2, "{label}: one start per subject");
+        assert_eq!(state.cached_etas_kind, PrevEtas::Placeholder, "{label}");
+    }
+}
+
+/// A final solve seeded from modes an earlier pass returned ([`best_final_candidate`]'s, the
+/// trust region's readout) takes an exactly-zero one among them as warm, like the nonzero
+/// ones beside it: no subject is multi-started. Unlabelled, the seed read as the cold
+/// placeholder and `EMPTY` alone was multi-started (#2691 review row 1) — one pass, and only
+/// on a fit whose cold final solve missed the incumbent, which is why it showed as one extra
+/// multi-start on one platform. The straddle: the cold solve of the same fixture does
+/// multi-start both subjects, so the gate is reachable here.
+#[test]
+fn a_seeded_final_solve_takes_an_exactly_zero_mode_as_warm() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::types::FitOptions;
+    let (pop, informed) = population_with_an_empty_subject();
+    let model = make_model();
+    let params = &model.default_params;
+    let opts = FitOptions {
+        inner_restarts: 1,
+        verbose: false,
+        ..FitOptions::default()
+    };
+    let mu_k = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    let solve = |seed: Option<&[DVector<f64>]>| {
+        pool.install(|| {
+            record_inner_solves(|| final_inner_solve(&model, &pop, params, &mu_k, seed, &opts))
+        })
+    };
+
+    let (cold, cold_rec) = solve(None);
+    assert!(
+        cold.etas[3].iter().all(|&v| v == 0.0) && cold.etas[0].iter().any(|&v| v != 0.0),
+        "fixture: the empty subject's mode must be exactly zero and an informed one's not: \
+         {:?} / {:?}",
+        cold.etas[3],
+        cold.etas[0]
+    );
+    for id in ["EMPTY", informed.as_str()] {
+        assert!(
+            cold_rec.multistarts.iter().any(|s| s == id),
+            "fixture: the cold solve must multi-start {id}, got {:?}",
+            cold_rec.multistarts
+        );
+    }
+
+    let (_, seeded_rec) = solve(Some(&cold.etas));
+    assert_eq!(
+        seeded_rec.solve_tols.len(),
+        pop.subjects.len(),
+        "the seeded pass must solve every subject on the recording thread"
+    );
+    assert!(
+        seeded_rec.multistarts.is_empty(),
+        "a final solve seeded from a solve's modes multi-started {:?}",
+        seeded_rec.multistarts
+    );
+}
+
+/// The two re-solving FD stencils warm every probe from the modes the gradient is taken at,
+/// so an exactly-zero mode among them is no cold start either: no probe multi-starts any
+/// subject. Both `2·n_free` probes deep — the reconverged gradient at every outer
+/// evaluation of an IOV or TTE model, the reporting one once per derivative-free fit.
+#[test]
+fn the_fd_stencils_take_an_exactly_zero_mode_as_warm() {
+    use crate::estimation::inner_optimizer::record_inner_solves;
+    use crate::types::FitOptions;
+    let (pop, _) = population_with_an_empty_subject();
+    let model = make_model();
+    let init = &model.default_params;
+    let opts = FitOptions {
+        inner_restarts: 1,
+        ..FitOptions::default()
+    };
+    let PackedStart {
+        packed: x, bounds, ..
+    } = pack_with_bounds(init);
+    let params = unpack_params(&x, init);
+    let mu_k = compute_mu_k(&model, &params.theta, opts.mu_referencing);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .stack_size(crate::FIT_RAYON_STACK_SIZE)
+        .build()
+        .unwrap();
+    let (ehs, _, _, kappas) = pool.install(|| {
+        run_inner_loop_warm_seeded(
+            &model,
+            &pop,
+            &params,
+            opts.inner_maxiter,
+            opts.inner_tol,
+            None,
+            Some(&mu_k),
+            opts.min_obs_for_convergence_check as usize,
+            opts.inner_restarts,
+            InnerHessianSeed::for_options(&opts),
+            &opts,
+            PrevEtas::Placeholder,
+        )
+    });
+    assert!(
+        ehs[3].iter().all(|&v| v == 0.0) && ehs[0].iter().any(|&v| v != 0.0),
+        "fixture: the empty subject's mode is exactly zero, an informed one's is not"
+    );
+    let nn_reg = crate::estimation::nn_reg::NnRegularizer::build(&model, &pop, &opts);
+    let priors = build_prior_set(&model, init);
+    for label in ["reconverged_fd_gradient", "reporting_fd_gradient"] {
+        let (g, rec) = pool.install(|| {
+            record_inner_solves(|| match label {
+                "reconverged_fd_gradient" => {
+                    reconverged_fd_gradient(&x, init, &model, &pop, &ehs, &kappas, &bounds, &opts)
+                }
+                _ => reporting_fd_gradient(
+                    &x, init, &model, &pop, &ehs, &kappas, &bounds, &opts, &nn_reg, &priors,
+                ),
+            })
+        });
+        assert!(g.iter().all(|v| v.is_finite()), "{label}: gradient {g:?}");
+        let empty_solves = rec
+            .solve_tols
+            .iter()
+            .filter(|(id, _)| id == "EMPTY")
+            .count();
+        assert!(
+            empty_solves >= 2,
+            "{label}: fixture must re-solve the empty subject ({empty_solves} solves)"
+        );
+        assert!(
+            rec.multistarts.is_empty(),
+            "{label}: a probe warm from the modes ran a cold multi-start: {:?}",
+            rec.multistarts
+        );
+    }
+}
+
 /// #2076 review: a pre-flight subject that exhausts `inner_maxiter` stopped on a partial
 /// descent, not a mode. Handing it over would make the first evaluation warm — no second
 /// Hessian metric, no multi-start, a fresh iteration budget — and change the first
@@ -10806,6 +11936,7 @@ fn preflight_start_modes(
             opts.inner_restarts,
             InnerHessianSeed::for_options(opts),
             opts,
+            PrevEtas::Placeholder,
         )
     });
     PreflightStart {
@@ -10872,7 +12003,8 @@ fn assert_first_eval_starts_at_preflight_mode(
                     Some(&mu_k),
                     None,
                     None,
-                    true,
+                    PrevEtas::ModesHere,
+                    None,
                     None,
                 )
                 .4;
@@ -11663,6 +12795,7 @@ fn identity_exact_derivatives_match_fd_of_the_probed_objective() {
                 opts.inner_restarts,
                 InnerHessianSeed::for_options(&opts),
                 &opts,
+                PrevEtas::Placeholder,
             )
         };
         // The production input: the pre-flight's cold solve at the fit's own `inner_tol`.
@@ -11772,6 +12905,7 @@ fn exact_candidate_derivatives_decline_off_the_mode_and_when_switched_off() {
         base.inner_restarts,
         InnerHessianSeed::for_options(&base),
         &base,
+        PrevEtas::Placeholder,
     );
     let off_mode: Vec<DVector<f64>> = modes.iter().map(|e| e.map(|v| v + 0.2)).collect();
     let at = |opts: &FitOptions, warm: &[DVector<f64>]| {
@@ -12489,7 +13623,16 @@ fn assert_next_pass_restarts_kappa(
 ) {
     use crate::estimation::inner_optimizer::record_inner_solves;
     let (model, pop, opts) = warfarin_iov_ode_fixture();
-    let rec = on_one_thread(|| record_inner_solves(|| run(&model, &pop, &opts)).1);
+    // Every subject's start in pass `b` is the object under test, so the pass must be solved
+    // in full. On this fixture NLopt's second evaluation is a trial the EBE guard rejects,
+    // and the #2709 stop would leave its later subjects unsolved: switched off here (inside
+    // the pool, where the objective runs).
+    let rec = on_one_thread(|| {
+        GUARD_STOP_DISABLED.with(|c| c.set(true));
+        let rec = record_inner_solves(|| run(&model, &pop, &opts)).1;
+        GUARD_STOP_DISABLED.with(|c| c.set(false));
+        rec
+    });
     let a = rec
         .passes
         .iter()
@@ -15090,6 +16233,7 @@ fn a_verified_start_takes_every_point_field_from_the_lower_run() {
                 pmix: vec![vec![tag]],
                 mixest: vec![],
                 n_fd_h_redone: 0,
+                class_nll: vec![],
             }),
             converged: tag == 2.0,
             warnings: vec![format!("{tag}")],
@@ -15932,11 +17076,14 @@ fn a_round_does_not_take_a_stop_from_its_restart() {
     ignore = "slow: two fits to convergence; opt in with --features slow-tests"
 )]
 fn a_cold_mode_leg_below_the_verified_incumbent_is_kept() {
+    // A start where the pass has legs to run: since polished modes are adopted into the EBE
+    // store (#2786), the warm fit can already sit on the cold modes' optimum, leaving the pass
+    // nothing to do; the test is about a pass that does run.
     let ((off, off_legs), (on, on_legs)) = cold_mode_pair(
         "cold_wins.csv",
         BOTH_PASSES,
         &[LegStart::NewtonStep],
-        |_, _| true,
+        |off, on| on.len() > off.len(),
     );
     eprintln!(
         "off {} ({} legs), on {} ({} legs)",
@@ -16228,7 +17375,7 @@ fn the_lower_cold_mode_count_is_the_subjects_the_held_state_scores_worse() {
 fn a_cold_start_drops_the_mode_response() {
     let mut state = new_nlopt_state(2, 2, &[0.0; 3], SalvageGuardPolicy::Off);
     state.cached_etas = vec![DVector::from_vec(vec![0.3, -0.1]); 2];
-    state.cached_etas_are_modes = true;
+    state.cached_etas_kind = PrevEtas::Solved;
     state.pred_jac = Some(vec![vec![DVector::from_vec(vec![1.0, 2.0]); 3]; 2]);
     state.pred_anchor = vec![0.5; 3];
     state.reset_to_cold_start();
@@ -16236,7 +17383,9 @@ fn a_cold_start_drops_the_mode_response() {
         .cached_etas
         .iter()
         .all(|e| e.len() == 2 && e.iter().all(|&v| v == 0.0)));
-    assert!(!state.cached_etas_are_modes);
+    // The zero fill is the cold placeholder again: kept as `Solved`, the next pass would
+    // take it for a solve's output and skip every subject's cold multi-start.
+    assert_eq!(state.cached_etas_kind, PrevEtas::Placeholder);
     assert!(state.pred_jac.is_none(), "the response went with the modes");
     assert!(state.pred_anchor.is_empty());
 }
@@ -16638,6 +17787,362 @@ mod start_warm_rescore {
     }
 }
 
+/// #2709: an outer evaluation whose inner pass the EBE guard is certain to reject stops
+/// solving subjects ([`GuardStop`]).
+mod guard_stop {
+    use super::*;
+    use crate::estimation::inner_optimizer::record_inner_solves;
+
+    /// `examples/mm_iv.ferx` with every θ bound widened to (0, 1e5) and `inner_maxiter = 5`.
+    /// The wide box lets the L-BFGS line search probe points far from the data, where 5 to
+    /// 10 of the 10 subjects' inner loops do not converge in 5 iterations, so the guard
+    /// rejects them. Measured on Linux x86_64 at `b9867c13`: 29 guard-rejected evaluations
+    /// after the first feasible one at the default `max_unconverged_frac = 0.1`, and the
+    /// fit still ends at OFV −336.6017.
+    fn fixture() -> (CompiledModel, Population, ModelParameters, FitOptions) {
+        let src = std::fs::read_to_string("examples/mm_iv.ferx").expect("example exists");
+        let src = src
+            .replace(
+                "theta TVVMAX(5.0,  0.1, 100.0)",
+                "theta TVVMAX(5.0, 0, 100000)",
+            )
+            .replace(
+                "theta TVKM(2.0,   0.01, 50.0)",
+                "theta TVKM(2.0, 0, 100000)",
+            )
+            .replace(
+                "theta TVV(10.0,   0.5, 200.0)",
+                "theta TVV(10.0, 0, 100000)",
+            );
+        assert_eq!(
+            src.matches("100000").count(),
+            3,
+            "the bound edit must apply"
+        );
+        let parsed = crate::parser::model_parser::parse_full_model(&src).expect("parses");
+        let population = crate::read_nonmem_csv(std::path::Path::new("data/mm_iv.csv"), None, None)
+            .expect("data loads");
+        let opts = FitOptions {
+            inner_maxiter: 5,
+            outer_maxiter: 12,
+            run_covariance_step: false,
+            verbose: false,
+            ..parsed.fit_options.clone()
+        };
+        let init = parsed.model.default_params.clone();
+        (parsed.model, population, init, opts)
+    }
+
+    /// One fit on one thread, so the solve count is deterministic: its result, the solves
+    /// it ran and how many evaluations the stop cut short.
+    fn fit(
+        method: crate::types::EstimationMethod,
+        stop_disabled: bool,
+    ) -> (OuterResult, usize, usize) {
+        let (model, population, init, opts) = fixture();
+        let opts = FitOptions { method, ..opts };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .build()
+            .unwrap();
+        // The objective runs on the pool's worker, so the thread-locals are set and read
+        // there, inside `install`.
+        let ((result, rec), stops) = pool.install(|| {
+            GUARD_STOP_DISABLED.with(|c| c.set(stop_disabled));
+            GUARD_STOPS.with(|c| c.set(0));
+            let out = record_inner_solves(|| {
+                optimize_nlopt(
+                    &model,
+                    &population,
+                    &init,
+                    &opts,
+                    &OuterFdDeclineLog::new(population.subjects.len()),
+                    None,
+                    &[],
+                )
+            });
+            let stops = GUARD_STOPS.with(std::cell::Cell::get);
+            GUARD_STOP_DISABLED.with(|c| c.set(false));
+            (out, stops)
+        });
+        (result, rec.solve_tols.len(), stops)
+    }
+
+    /// The stop changes nothing the optimizer sees: the same objective at every point, so
+    /// the same path, bit for bit. Only the solve count drops. Under FOCEI and under
+    /// Laplace, which are the two arms of `run_inner_loop_and_nll_prepared`; Laplace's
+    /// stopped pass skips its quadrature and reports an infinite objective.
+    ///
+    /// Mutations:
+    /// - stopping below the threshold (`>=` for `>` in the fraction test) stops passes the
+    ///   guard would accept: the path changes and the equalities fail;
+    /// - never stopping fails `stops > 0` and the solve count;
+    /// - dropping the forced guard verdict on a stopped pass files Laplace's stopped
+    ///   evaluations, with their infinite objective, as non-finite rejections: the
+    ///   `ebe_convergence_warnings` equality fails.
+    #[test]
+    fn a_fit_is_bit_identical_with_the_stop_and_solves_fewer_subjects() {
+        use crate::types::EstimationMethod;
+        for method in [EstimationMethod::FoceI, EstimationMethod::Laplace] {
+            let (off, solves_off, stops_off) = fit(method, true);
+            let (on, solves_on, stops_on) = fit(method, false);
+            assert_eq!(stops_off, 0, "{method:?}: the switch must disable the stop");
+            assert!(
+                stops_on > 0,
+                "{method:?}: fixture: the stop must fire on a guard-rejected evaluation"
+            );
+            assert!(off.ofv.is_finite() && on.ofv.is_finite());
+            assert_eq!(
+                on.ofv.to_bits(),
+                off.ofv.to_bits(),
+                "{method:?}: {} vs {}",
+                on.ofv,
+                off.ofv
+            );
+            assert_eq!(on.n_iterations, off.n_iterations, "{method:?}");
+            assert_eq!(on.converged, off.converged, "{method:?}");
+            // A stopped evaluation is still a guard rejection, not a non-finite one: the
+            // count of guard-rejected evaluations is the same either way.
+            assert_eq!(
+                on.ebe_convergence_warnings, off.ebe_convergence_warnings,
+                "{method:?}: a stopped evaluation must be counted as a guard rejection"
+            );
+            let bits = |p: &ModelParameters| -> Vec<u64> {
+                p.theta
+                    .iter()
+                    .chain(p.omega.matrix.iter())
+                    .chain(p.sigma.values.iter())
+                    .map(|v| v.to_bits())
+                    .collect()
+            };
+            assert_eq!(
+                bits(&on.params),
+                bits(&off.params),
+                "{method:?}: the estimates differ"
+            );
+            assert!(
+                solves_on < solves_off,
+                "{method:?}: the stopped passes must solve fewer subjects \
+                 ({solves_on} vs {solves_off})"
+            );
+            eprintln!(
+                "guard stop {method:?}: {stops_on} stopped evaluations, {solves_on} solves vs \
+                 {solves_off}"
+            );
+        }
+    }
+
+    /// A stopped Laplace/AGQ pass does not run its quadrature over the placeholders: its
+    /// objective is infinite. Without the skip every fit result is the same (the caller
+    /// rejects the evaluation either way), so this pins the work it saves where it is done:
+    /// removing the skip returns the quadrature's finite sum instead.
+    #[test]
+    fn a_stopped_quadrature_pass_skips_the_quadrature() {
+        use crate::estimation::inner_optimizer::{build_schedule_cache, EbeResult, GuardStop};
+        let (model, population, init, opts) = fixture();
+        let opts = FitOptions {
+            method: crate::types::EstimationMethod::Laplace,
+            ..opts
+        };
+        let schedules = build_schedule_cache(&model, &population);
+        let run = |stop: Option<&GuardStop>| {
+            run_inner_loop_and_nll_prepared(
+                &model,
+                &population,
+                &init,
+                &opts,
+                None,
+                None,
+                None,
+                None,
+                Some(&schedules),
+                PrevEtas::Placeholder,
+                None,
+                stop,
+            )
+            .4
+        };
+        let full = run(None);
+        assert!(
+            full.is_finite(),
+            "premise: the unstopped quadrature is finite ({full})"
+        );
+        // A token already stopped by a hard rejection: every subject gets a placeholder.
+        let stop = GuardStop::new(population.subjects.len(), 1, 0.1);
+        let rejected = EbeResult {
+            eta: DVector::zeros(model.n_eta),
+            h_matrix: DMatrix::zeros(1, model.n_eta),
+            fd_h_redone: false,
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: false,
+            nm_polished: false,
+            grad_norm: 0.0,
+            nll: f64::INFINITY,
+            kappas: Vec::new(),
+            hard_reject: true,
+            screen_moved: false,
+            twin_moved: false,
+            ipreds: None,
+        };
+        stop.record(&population.subjects[0], &rejected);
+        assert!(stop.stopped(), "premise: the token is stopped");
+        let stopped = run(Some(&stop));
+        assert!(
+            stopped == f64::INFINITY,
+            "a stopped quadrature pass must not be summed ({stopped})"
+        );
+    }
+
+    /// A run with no feasible evaluation never stops a pass, so its `W_NO_FEASIBLE_EVAL`
+    /// reports the worst unconverged count over full passes, as before #2709. The same gate
+    /// keeps the stop off the first evaluation, which #2682 re-solves from its own EBEs
+    /// (killed there by `start_warm_rescore::a_start_rejected_cold_is_accepted_when_its_warm_resolve_converges`).
+    ///
+    /// `two_cpt_oral_cov` at `inner_maxiter = 1` is never feasible: every evaluation leaves
+    /// most of the 30 subjects unconverged. Mutation: arming the stop on an infeasible run
+    /// (`>= 0` for `> 0` on the feasible count) stops every pass after 4 subjects, and the
+    /// warning's "at worst" count drops.
+    #[test]
+    fn a_run_with_no_feasible_evaluation_never_stops_a_pass() {
+        let prep = crate::api::prepare_run(
+            "examples/two_cpt_oral_cov.ferx",
+            Some("data/two_cpt_oral_cov.csv"),
+        )
+        .expect("prepare two_cpt_oral_cov");
+        let opts = FitOptions {
+            inner_maxiter: 1,
+            outer_maxiter: 5,
+            run_covariance_step: false,
+            verbose: false,
+            ..prep.parsed.fit_options.clone()
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .stack_size(crate::FIT_RAYON_STACK_SIZE)
+            .build()
+            .unwrap();
+        let run = |disabled: bool| {
+            pool.install(|| {
+                GUARD_STOP_DISABLED.with(|c| c.set(disabled));
+                GUARD_STOPS.with(|c| c.set(0));
+                let r = optimize_nlopt(
+                    &prep.parsed.model,
+                    &prep.population,
+                    &prep.init_params,
+                    &opts,
+                    &OuterFdDeclineLog::new(prep.population.subjects.len()),
+                    None,
+                    &[],
+                );
+                let stops = GUARD_STOPS.with(std::cell::Cell::get);
+                GUARD_STOP_DISABLED.with(|c| c.set(false));
+                (r, stops)
+            })
+        };
+        let (off, _) = run(true);
+        let (on, stops) = run(false);
+        let no_feasible =
+            |r: &OuterResult| r.warnings.iter().any(|w| w.contains("W_NO_FEASIBLE_EVAL"));
+        assert!(
+            no_feasible(&off),
+            "fixture: the run must have no feasible evaluation: {:?}",
+            off.warnings
+        );
+        assert_eq!(
+            stops, 0,
+            "a run with no feasible evaluation must not stop a pass"
+        );
+        assert_eq!(on.max_unconverged_subjects, off.max_unconverged_subjects);
+        assert_eq!(on.warnings, off.warnings);
+    }
+
+    /// A stopped pass is reported on the subjects it solved, not on its end-of-pass
+    /// statistics, which also count every unsolved placeholder as a hard rejection and as
+    /// unconverged; an unstopped pass, or none, keeps its own.
+    #[test]
+    fn a_stopped_pass_reports_the_counts_of_the_subjects_it_solved() {
+        use crate::estimation::inner_optimizer::{EbeResult, GuardStop};
+        let unconverged = EbeResult {
+            eta: DVector::zeros(1),
+            h_matrix: DMatrix::zeros(1, 1),
+            fd_h_redone: false,
+            terminal_hessian: None,
+            converged: false,
+            used_fallback: true,
+            nm_polished: false,
+            grad_norm: 0.0,
+            nll: 0.0,
+            kappas: Vec::new(),
+            hard_reject: false,
+            screen_moved: false,
+            twin_moved: false,
+            ipreds: None,
+        };
+        let subject = Subject {
+            id: "1".into(),
+            observations: vec![1.0; 4],
+            ..Default::default()
+        };
+        // The placeholders' end-of-pass picture: 8 more unconverged and hard-rejected.
+        let pass = InnerLoopStats {
+            n_unconverged: 10,
+            n_fallback: 2,
+            n_nm_polished: 0,
+            n_start_rejected: 8,
+        };
+        let stop = GuardStop::new(10, 1, 0.1);
+        stop.record(&subject, &unconverged);
+        let (stats, solved) = stopped_pass_stats(Some(&stop), pass.clone());
+        assert_eq!(solved, None, "1 of 10 does not stop");
+        assert_eq!(stats.n_start_rejected, 8, "an unstopped pass keeps its own");
+        stop.record(&subject, &unconverged);
+        let (stats, solved) = stopped_pass_stats(Some(&stop), pass.clone());
+        assert_eq!(solved, Some(2));
+        assert_eq!(
+            (
+                stats.n_unconverged,
+                stats.n_fallback,
+                stats.n_start_rejected
+            ),
+            (2, 2, 0),
+            "{stats:?}"
+        );
+        let (stats, solved) = stopped_pass_stats(None, pass);
+        assert_eq!((stats.n_start_rejected, solved), (8, None));
+    }
+
+    /// The verbose line of a stopped evaluation names its trigger, the counts it stopped on
+    /// and the subjects it left unsolved. Each arm is asserted with the other's text absent.
+    #[test]
+    fn the_stopped_line_names_its_trigger_and_the_unsolved_subjects() {
+        let stats = |n_unconverged, n_start_rejected| InnerLoopStats {
+            n_unconverged,
+            n_start_rejected,
+            ..Default::default()
+        };
+        let frac = stopped_eval_line(&stats(2, 0), 3, 10, 0.1);
+        assert!(
+            frac.contains("after 3 of 10 subjects")
+                && frac.contains("2 subjects' inner loops did not converge")
+                && frac.contains("`max_unconverged_frac` = 0.1")
+                && frac.contains("the other 7 were not solved")
+                && !frac.contains("rejected at their inner start")
+                && !frac.contains("not finite"),
+            "{frac}"
+        );
+        let hard = stopped_eval_line(&stats(1, 1), 1, 10, 0.1);
+        assert!(
+            hard.contains("after 1 of 10 subjects")
+                && hard.contains("1 subjects rejected at their inner start")
+                && hard.contains("the other 9 were not solved")
+                && !hard.contains("did not converge"),
+            "{hard}"
+        );
+    }
+}
+
 /// #2799: `eval_budget_spent` is the budget state *after* a stagnation latch on the last
 /// permitted evaluation has been attributed to the guard. On `one_cpt_iv` / SLSQP with the
 /// #2462 verification leg off (the rule BOBYQA's polish keeps; under the verification a spent
@@ -16757,4 +18262,96 @@ fn internal_bfgs_reports_a_spent_iteration_budget() {
     assert!(gtol.converged, "{:?}", gtol.warnings);
     assert_eq!(gtol.n_iterations, 1);
     assert!(!gtol.eval_budget_spent);
+}
+
+/// The Newton step from a verified incumbent (`predicted_newton_step`) is gated on
+/// `analytic_outer_gradient_available`, which since #2786 includes AGQ and `[mixture]` models
+/// as well as the FOCE-family scope the gate used to name. Both now form a step, with the
+/// objective's own per-subject scores: AGQ's at `n_agq = 3`, a mixture's K-class marginal rows.
+/// A model forced onto finite differences (`gradient = fd`) forms none, the control that shows
+/// the gate and not the fixture decides. Dies when the gate narrows back (AGQ or the mixture
+/// returns `None`, so those fits lose the Newton-start leg and report a different convergence
+/// path) or stops honouring `gradient = fd`.
+#[test]
+fn the_newton_step_is_formed_for_agq_and_mixture_models_and_withheld_under_fd() {
+    let base = r"
+[parameters]
+  theta TVCL1(1.2, 0.01, 100.0)
+  theta TVCL2(2.5, 0.01, 100.0)
+  theta TVV(10.0, 0.1, 1000.0)
+  omega ETA_CL ~ 0.05
+  sigma EPS ~ 0.01
+";
+    let tail = r"
+[individual_parameters]
+  CL = if (MIXNUM == 1) TVCL1 * exp(ETA_CL) else TVCL2 * exp(ETA_CL)
+  V  = TVV
+[structural_model]
+  pk one_cpt_iv(cl=CL, v=V)
+[error_model]
+  DV ~ proportional(EPS)
+";
+    let mixture = format!(
+        "{base}  theta MIXL(0.0, -10.0, 10.0)\n[mixture]\n  nsub = 2\n  logit(1) = MIXL\n{tail}"
+    );
+    let plain = format!("{base}{tail}").replace("MIXNUM == 1", "TVCL1 > 0.0");
+    let pop = make_population(6);
+    let step_for = |model: &CompiledModel, opts: &FitOptions| {
+        let params = &model.default_params;
+        let x = pack_params(params);
+        let warm: Vec<DVector<f64>> = (0..pop.subjects.len())
+            .map(|_| DVector::zeros(model.n_eta))
+            .collect();
+        let kappas = vec![Vec::new(); pop.subjects.len()];
+        let ehs = if params.mixture.is_some() {
+            warm
+        } else {
+            ebes_at(model, params, &pop, opts).1
+        };
+        predicted_newton_step(
+            model,
+            &pop,
+            params,
+            &x,
+            &ehs,
+            &kappas,
+            &compute_bounds(params),
+            opts,
+            &crate::estimation::nn_reg::NnRegularizer::build(model, &pop, opts),
+            &build_prior_set(model, params),
+        )
+    };
+    let finite = |label: &str, r: Option<(f64, Vec<f64>)>| {
+        let (gain, step) = r.unwrap_or_else(|| panic!("{label}: the Newton step forms"));
+        assert!(
+            gain.is_finite() && step.iter().all(|d| d.is_finite()),
+            "{label}: gain {gain}, step {step:?}"
+        );
+        eprintln!("{label}: predicted gain {gain:.4e}");
+    };
+    let agq = FitOptions {
+        method: EstimationMethod::Laplace,
+        n_agq: 3,
+        run_covariance_step: false,
+        ..FitOptions::default()
+    };
+    let m_plain = crate::parser::model_parser::parse_model_string(&plain).unwrap();
+    let m_mix = crate::parser::model_parser::parse_model_string(&mixture).unwrap();
+    assert!(
+        m_mix.default_params.mixture.is_some(),
+        "the mixture fixture is one"
+    );
+    finite("AGQ (n_agq = 3)", step_for(&m_plain, &agq));
+    finite("mixture", step_for(&m_mix, &focei_options()));
+    for (label, src, o) in [
+        ("AGQ", &plain, &agq),
+        ("mixture", &mixture, &focei_options()),
+    ] {
+        let mut fd = crate::parser::model_parser::parse_model_string(src).unwrap();
+        fd.gradient_method = crate::types::GradientMethod::Fd;
+        assert!(
+            step_for(&fd, o).is_none(),
+            "{label}: gradient = fd forms no Newton step"
+        );
+    }
 }

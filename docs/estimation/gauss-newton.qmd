@@ -30,40 +30,14 @@ $$
 The BHHH approximation uses the outer product of per-subject gradients as an approximate Hessian:
 
 $$
-H_{\text{BHHH}} = 4 \sum_{i=1}^{N} g_i \, g_i^T
+H_{\text{BHHH}} = 4 \sum_{i=1}^{N} d_i \, d_i^T, \qquad \nabla\,\text{OFV} = 2 \sum_{i=1}^{N} d_i
 $$
 
-where $g_i = \nabla_x \text{NLL}_i$ is the gradient of the negative log-likelihood for subject $i$ with respect to the packed parameter vector, evaluated with each subject's EBEs $\hat\eta_i$ held fixed.
+where $d_i = d\,\text{NLL}_i / dx$ is the **total** derivative of subject $i$'s objective with respect to the packed parameter vector: its EBEs $\hat\eta_i$ (and, under IOV, the occasion effects $\hat\kappa_{ik}$) re-estimated at every $x$, so their response to $x$ is included. It is the subject's term of the outer gradient the NLopt optimizers take, from the analytic adjoint at the mode (one pass per subject, every estimator and model class it serves), and the same row the covariance step squares into its $S$ matrix ([`covariance_method = s` / `rsr`](foce.qmd#covariance-estimator-r-s-or-sandwich)). Under `gradient = fd`, or for a subject the adjoint declines, it is a central difference of the subject's objective with $\hat\eta_i$ re-solved at each point.
 
-Per-subject gradients come from a closed form at fixed $\hat\eta_i$ whenever the model is inside its scope:
+Before [#2974](https://github.com/FeRx-NLME/ferx-core/issues/2974), the BHHH matrix was built from the **fixed-mode** score $g_i$ instead, with $\hat\eta_i$, its linearisation $H$ and $\hat\kappa_i$ held at their values (its θ axis a forward difference of the predictions on the closed forms), and the gradient added the gap $t_i = d_i - g_i$ for FOCEI, TTE / discrete and IOV subjects ([#2740](https://github.com/FeRx-NLME/ferx-core/issues/2740), [#2455](https://github.com/FeRx-NLME/ferx-core/issues/2455)). Holding $\hat\eta_i$ drops the response of the FOCEI $\log|\tilde H(\hat\eta_i)|$ term, which is non-zero under proportional or combined error, so the quadratic model's curvature and its slope came from two different vectors. Both now come from $d_i$, for FOCE as well as FOCEI.
 
-- **Almquist Laplace** when `interaction = true` (FOCEI): the exact fixed-EBE score in $\Omega$ and $\sigma$, with the $\theta$ axis contracted exactly from the fixed-$\eta$ θ-adjoint (one reverse sweep per eight weight rows). Runs on analytical and ODE models and on per-compartment error models.
-- **Sheiner–Beal** when `interaction = false` (FOCE): the same $\theta$ axis, but its linearisation additionally requires an analytical (non-ODE) structural model and a single error model.
-
-Where a closed form does not apply, the score is the **exact fixed-EBE score of the analytic likelihood kernel** — the per-subject objective with $\hat\eta_i$ and $H$ held, one reverse sweep plus the θ contractions. That covers what the closed forms decline: M3 BLOQ censoring, inter-occasion variability (the stacked marginal at $[\hat\eta, \hat\kappa]$), IIV on the residual error, a θ-dependent residual-error magnitude, `block_sigma` residual correlations, FREM rows, and a non-Gaussian data term (`[event_model]` TTE / RTTE, `[binary_model]`, CTMM — over the BSV block under IOV). The closed forms' own scope is `closed_form_fixed_ebe_grad_ok` in [`src/estimation/gauss_newton.rs`](https://github.com/FeRx-NLME/ferx-core/blob/main/src/estimation/gauss_newton.rs), whose doc comment says, for each exclusion, which term of the objective they do not carry.
-
-Central finite differences of the per-subject objective remain only for an endpoint without an exact channel and for a subject outside the recorders' scope (see [Known FD fallbacks](foce.qmd#known-fd-fallbacks)). A closed form also hands one subject on to the kernel score at one evaluation when the matrix it factorises ($\tilde H$ for Laplace, $\tilde R$ for Sheiner–Beal) is not positive definite.
-
-These are the scores the BHHH matrix is built from. They are **not** the gradient GN steps
-along on a FOCEI model. The Laplace marginal carries $\log|\tilde H(\hat\eta_i)|$, and holding
-$\hat\eta_i$ fixed drops its response $\partial_\eta \log|\tilde H| \cdot d\hat\eta_i/dx$, which is
-non-zero under proportional or combined error. So for every FOCEI subject with random effects,
-GN steps along the subject's exact total derivative: the analytic adjoint at the mode, or a
-finite difference with $\hat\eta_i$ re-solved at each point where the adjoint declines. The
-same holds for a TTE or discrete endpoint under FOCE. Before
-[#2740](https://github.com/FeRx-NLME/ferx-core/issues/2740), the gradient was the score plus a
-θ-only approximation of that term, or nothing at all past the closed forms (M3, IIV on RUV, …).
-It disagreed with the objective, sometimes in sign, and GN's trust region collapsed far from
-the optimum (`warfarin_bloq` stopped 10.6 OFV above FOCEI). FOCE Gaussian models keep the
-fixed-EBE score.
-
-On a subject with IOV, the gradient GN steps along is not the fixed-EBE score either: it is the
-per-subject outer gradient the NLopt optimizers take, with $\hat\eta_i$ and the occasion
-$\hat\kappa_{ik}$ responding to $x$. That gradient is exact where the analytic adjoint serves
-the subject, and a reconverged finite difference otherwise. Without it, `method = gn` stopped
-on `examples/warfarin_iov.ferx` near its initial estimates, 22.9 OFV above the optimum, while
-reporting convergence ([#2455](https://github.com/FeRx-NLME/ferx-core/issues/2455)). The BHHH
-matrix stays on the raw score $g_i$.
+**A subject whose mode sits near a fold** ([#2777](https://github.com/FeRx-NLME/ferx-core/issues/2777)). Its $d_i$ is exact at the point but changes over a distance far smaller than any step GN can take. After three rejected, unclamped steps in a row, GN looks for one subject whose $\lVert d_i - g_i\rVert$ is at least ten times every other subject's and outweighs the rest of the gradient on some coordinate, and takes that subject back to its fixed-mode score $g_i$ in both the gradient and the BHHH matrix for the rest of the fit, with a warning naming it.
 
 This approximation is equivalent to the Gauss-Newton Hessian for log-likelihood objectives and is guaranteed positive semi-definite.
 
@@ -124,24 +98,29 @@ term.
 The GN loop ends at the first of:
 
 - **Converged, small change:** an accepted step changes the OFV by less than $10^{-6}$ relative
-  to $\max(\lvert\text{OFV}\rvert, 1)$, from iteration 4 on. One such step is enough.
+  to $\max(\lvert\text{OFV}\rvert, 1)$, from iteration 4 on, and the trust radius the step
+  was taken at is at least $10^{-3}$. One such step is enough. Below that radius a step changes
+  the OFV little *because* it is tiny, whatever the gradient, so it does not count; the loop goes
+  on and ends on one of the rules below
+  ([#2738](https://github.com/FeRx-NLME/ferx-core/issues/2738)). Near a real optimum the
+  quadratic model predicts well, so accepted steps double the radius and it climbs back above
+  $10^{-3}$ within a few iterations.
 - **Converged, stationary point:** the predicted reduction is below $10^{-10}$ and the scaled
   gradient norm is below $10^{-8}$.
 - **Not converged, trust radius collapsed:** the radius falls below $10^{-10}$, after rejected
   steps or degenerate-BHHH retries. The fit adds the warning "Gauss-Newton: trust radius
-  collapsed" (or "degenerate BHHH Hessian, trust radius collapsed").
+  collapsed without convergence" (or "degenerate BHHH Hessian, trust radius collapsed without
+  convergence"), classified critical, like the budget warning.
 - **Not converged, budget spent:** `maxiter` iterations ran, with the warning "Gauss-Newton:
-  max iterations reached without convergence". A collapsed radius or a cancelled fit currently
-  carries that warning too, next to its own
+  max iterations reached without convergence". Only this stop carries it: a collapsed radius or
+  a cancelled fit reports its own reason alone
   ([#1049](https://github.com/FeRx-NLME/ferx-core/issues/1049)).
 
 This is the loop's verdict, not yet the fit's. Pure `gn` re-checks `converged` afterwards: a
 cold re-solve of the EBEs at the final estimates
 ([#2097](https://github.com/FeRx-NLME/ferx-core/issues/2097)), the covariance step's check that
 the end point is stationary ([#2785](https://github.com/FeRx-NLME/ferx-core/issues/2785)), and a
-check that the final objective is finite can each demote it. The small-change rule has no gradient condition, so
-a tiny step taken after the radius has shrunk also satisfies it
-([#2738](https://github.com/FeRx-NLME/ferx-core/issues/2738)).
+check that the final objective is finite can each demote it.
 
 The optimizer trace (`optimizer_trace = true`) logs one row per step. For GN rows its
 `lm_lambda` column holds the trust radius: the radius the step was tried with on a rejected row,

@@ -8,12 +8,14 @@
 //! `vpc_tte` then simulates `N` replicates of each dataset's design from the same
 //! model. If the band and its censoring are right, the replicates are exchangeable
 //! with the data and the observed curve falls inside the 5–95 % band at a fixed time
-//! in about 90 % of datasets.
+//! in about 89 % of datasets: a band read from `N` replicates with the type-7 quantile
+//! covers an exchangeable observation with probability `0.90·(N − 1)/(N + 1)`, which
+//! is 0.891 for 200, not the nominal 0.90 (#2898 review r1 row 2).
 //!
 //! The design is chosen so the censoring step is visible (measured on macOS arm64,
 //! coverage at H/4, H/2, 3H/4 over these 200 datasets): the shipped reverse-KM draw
 //! gives 0.925 / 0.895 / 0.910; dropping the per-subject censoring (`Observed` acting
-//! as `Horizon`) gives 0.900 / 0.850 / 0.820 and fails, since replicates with no dropout
+//! as `Horizon`) gives 0.900 / 0.850 / 0.820 and fails at 3H/4, since replicates with no dropout
 //! keep more subjects at risk and the late band narrows. Letting event subjects keep
 //! `H` (#1886 plan D4) gives 0.910 / 0.870 / 0.855, low but inside the interval at this
 //! M; `event_subjects_draw_censoring_from_the_observed_censorings` is the test that
@@ -132,7 +134,8 @@ mod self_consistency {
     }
 
     /// The 99 % binomial interval for `M = 200` datasets around the exchangeable
-    /// expectation `p₀ = 0.90`: `p₀ ± 2.576·√(p₀(1 − p₀)/M)`.
-    const LO: f64 = 0.845;
-    const HI: f64 = 0.955;
+    /// expectation `0.90·(N_SIM − 1)/(N_SIM + 1) = 0.891` (see the file doc):
+    /// `qbinom(c(.005, .995), 200, 0.891) / 200` in R.
+    const LO: f64 = 0.83;
+    const HI: f64 = 0.945;
 }

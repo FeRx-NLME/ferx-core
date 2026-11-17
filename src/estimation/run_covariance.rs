@@ -182,6 +182,11 @@ fn run_covariance_scoped(
     )?;
     let model_ref = inputs.model();
     let pop_ref = inputs.population();
+    // The plans' keys read these fingerprints; the plans leave with the call.
+    let _prints = crate::parser::model_parser::rhs_regcode::kernel_jit::register(
+        model_ref,
+        &pop_ref.subjects,
+    );
 
     // This entry point re-runs the inner loop (EBEs → the prediction walk), so
     // it needs the same dose-compartment precondition `fit()` enforces (#375) —
@@ -390,6 +395,14 @@ fn run_covariance_scoped(
     out.cov_fixed = crate::estimation::parameterization::cov_fixed_mask(&params, &out);
     crate::estimation::fit_inputs::note_unrecorded_fd_route(fit, model_ref, &mut out.warnings);
     inputs.note_warnings(&mut out.warnings);
+    // Subjects whose compiled plan failed in this step and took finite differences (#2786);
+    // the scope's failures leave with `_prints`, so this reads them first.
+    crate::api::postfit::refresh_plan_fd_fallback(
+        model_ref,
+        pop_ref,
+        "the covariance step",
+        &mut out,
+    );
     // Rebuild so the machine-readable payloads agree with the fields above: the
     // entries are keyed by message, so the surviving native ones are preserved and
     // the new covariance warnings get `details` sourced from the *refreshed*
@@ -434,7 +447,7 @@ fn reported_ebe_inputs(
     options: &FitOptions,
 ) -> (Vec<DVector<f64>>, Vec<DMatrix<f64>>, Vec<Vec<DVector<f64>>>) {
     use crate::estimation::inner_optimizer::{
-        ebe_h_matrices_at, run_inner_loop_warm_seeded, InnerHessianSeed,
+        ebe_h_matrices_at, run_inner_loop_warm_seeded, InnerHessianSeed, PrevEtas,
     };
 
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
@@ -454,6 +467,7 @@ fn reported_ebe_inputs(
         options.inner_restarts,
         InnerHessianSeed::for_options(options),
         options,
+        PrevEtas::Placeholder,
     );
 
     let reported: Vec<DVector<f64>> = fit.subjects.iter().map(|s| s.eta.clone()).collect();

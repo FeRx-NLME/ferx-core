@@ -158,6 +158,7 @@ fn obs_nll_subject_grad_iov_matches_fd() {
 
     // Minimal IOV model: CL = TVCL·exp(ETA_CL + KAPPA_CL), V = TVV.
     let model = CompiledModel {
+        plan_id: Default::default(),
         residual_serial: None,
         priors: Vec::new(),
         prior_from_fit: None,
@@ -706,6 +707,13 @@ fn assert_magnitude_takes_the_exact_score(model: &CompiledModel, theta: &[f64], 
     };
     let (nll_e, g_e) = run(false);
     let (nll_f, g_f) = run(true);
+    // A failed plan (#2786) takes the same per-θ quotient as the switch.
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::FORCE_PLAN_FAIL;
+    FORCE_PLAN_FAIL.set(true);
+    let (nll_p, g_p) = run(false);
+    FORCE_PLAN_FAIL.set(false);
+    assert_eq!(nll_e.to_bits(), nll_p.to_bits());
+    assert_eq!(g_f, g_p, "a failed plan takes the forced quotient");
     assert_eq!(nll_e.to_bits(), nll_f.to_bits());
     assert!(
         (0..n_theta).any(|i| g_e[i].to_bits() != g_f[i].to_bits()),
@@ -773,6 +781,37 @@ fn check_saem_mstep_matches_fd(model: &CompiledModel, theta: &[f64], sigma_value
             sigma_values[k] * (obs_nll_sum(model, &population, theta, &sp, &etas, &[]) - f0) / h;
     }
 
+    // Plans working, then every plan failing (#2786): the M-step score's per-θ fallback
+    // must meet the same reference.
+    use crate::parser::model_parser::rhs_regcode::kernel_jit::FORCE_PLAN_FAIL;
+    for fail in [false, true] {
+        FORCE_PLAN_FAIL.set(fail);
+        check_saem_mstep_score(
+            model,
+            &population,
+            theta,
+            sigma_values,
+            &etas,
+            f0,
+            &ref_grad,
+        );
+        FORCE_PLAN_FAIL.set(false);
+    }
+}
+
+/// [`check_saem_mstep_matches_fd`]'s comparison of the M-step `(nll, grad)` against `f0` and
+/// its forward difference `ref_grad`.
+fn check_saem_mstep_score(
+    model: &CompiledModel,
+    population: &crate::types::Population,
+    theta: &[f64],
+    sigma_values: &[f64],
+    etas: &[Vec<f64>],
+    f0: f64,
+    ref_grad: &[f64],
+) {
+    let (n_theta, n_sigma) = (theta.len(), sigma_values.len());
+    let n = n_theta + n_sigma;
     let mask = vec![true; n_theta];
     let lo = vec![-1e30f64; n];
     let hi = vec![1e30f64; n];
@@ -2126,14 +2165,14 @@ fn the_natural_theta_step_floor_ignores_the_packing() {
     let (model, _) = scaled_v_fixture(1e-4, false, false);
     let declared = &model.default_params;
     // TVCL 0.2 (log-packed), TVV_S 1e-3 (identity-packed), TVKA 1.5.
-    assert_eq!(fd_theta_step_floor(declared, 0), 0.2);
-    assert_eq!(fd_theta_step_floor(declared, 1), declared.theta[1].abs());
-    assert_eq!(fd_theta_step_floor(declared, 2), 1.0);
-    assert_eq!(fd_theta_step_floor(declared, 99), 1.0);
+    assert_eq!(fd_theta_step_floor(&model, 0), 0.2);
+    assert_eq!(fd_theta_step_floor(&model, 1), declared.theta[1].abs());
+    assert_eq!(fd_theta_step_floor(&model, 2), 1.0);
+    assert_eq!(fd_theta_step_floor(&model, 99), 1.0);
     assert_eq!(
-        fd_theta_step_floors(declared),
+        fd_theta_step_floors(&model),
         (0..3)
-            .map(|i| fd_theta_step_floor(declared, i))
+            .map(|i| fd_theta_step_floor(&model, i))
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -2144,6 +2183,84 @@ fn the_natural_theta_step_floor_ignores_the_packing() {
         theta_fd_step(&model, 1e-5, &[0.2, 1e-3, 7.7], 1),
         1e-5 * (1e-3 + 1e-3)
     );
+}
+
+/// #2406: the forward-differenced σ score of the M3 path (`DATA_SCORE_FD_FORCE`), IOV and
+/// non-IOV, against the exact data score, for a σ sd from 0.3 down to 0.003. The step is
+/// `h·σ`, so the relative error does not grow as σ shrinks. Under the old `h·(1 + σ)` it was
+/// about `1.5e-5/σ`: 5.0e-3 at 0.003, 1.5e-3 at 0.01.
+#[test]
+fn the_m3_sigma_forward_difference_is_relative_to_sigma() {
+    assert_eq!(sigma_fd_step(1e-5, 0.003), 1e-5 * 0.003);
+    assert_eq!(sigma_fd_step(1e-5, 0.0), 1e-5);
+    for iov in [false, true] {
+        let (model, subjects) = scaled_v_fixture(1.0, iov, true);
+        let theta = model.default_params.theta.clone();
+        let n_theta = theta.len();
+        let mask: Vec<bool> = (0..n_theta).map(|i| i != 1).collect();
+        let n = n_theta + 1;
+        let (lo, hi) = (vec![-1e30; n], vec![1e30; n]);
+        let mut scratch = EventPkParams::default();
+        for sd in [0.3, 0.1, 0.03, 0.01, 0.003] {
+            let sigma = vec![sd];
+            let mut worst = 0.0f64;
+            for s in &subjects {
+                let eta = vec![0.05; model.n_eta];
+                let mut score = |force: bool| -> f64 {
+                    DATA_SCORE_FD_FORCE.with(|c| c.set(force));
+                    let g = if iov {
+                        let kappas = vec![
+                            vec![0.0; model.n_kappa];
+                            crate::stats::likelihood::iov_occasion_groups(s).len()
+                        ];
+                        obs_nll_subject_grad_iov(
+                            &model,
+                            s,
+                            &theta,
+                            &sigma,
+                            &eta,
+                            &kappas,
+                            &mask,
+                            &lo,
+                            &hi,
+                            n_theta,
+                            1,
+                            &mut scratch,
+                        )
+                        .1
+                    } else {
+                        obs_nll_subject_grad(
+                            &model,
+                            s,
+                            &theta,
+                            &sigma,
+                            &eta,
+                            &mask,
+                            &lo,
+                            &hi,
+                            n_theta,
+                            1,
+                            &mut scratch,
+                        )
+                        .1
+                    };
+                    DATA_SCORE_FD_FORCE.with(|c| c.set(false));
+                    g[n_theta]
+                };
+                let (exact, fd) = (score(false), score(true));
+                assert!(exact.is_finite() && fd.is_finite(), "iov={iov} sd={sd}");
+                assert!(exact.abs() > 1e-3, "fixture: the σ score is live ({exact})");
+                let rel = (fd - exact).abs() / exact.abs();
+                assert!(rel.is_finite());
+                worst = worst.max(rel);
+            }
+            eprintln!("MEASURE #2406 iov={iov} sd={sd:e}: worst rel {worst:.2e}");
+            // Measured 1.50e-5..2.01e-5 at every sd, both paths, on Linux x86_64 and macOS arm64
+            // alike; the bound is 2× the worst. Reverting either path's step to `h·(1 + σ)`
+            // fails it at sd = 0.3 (8.7e-5).
+            assert!(worst < 4e-5, "iov={iov} sd={sd:e}: worst rel {worst:e}");
+        }
+    }
 }
 
 // ── #2440: LTBS + a θ-dependent residual magnitude, below a unit concentration ──
@@ -2732,7 +2849,7 @@ fn the_fixed_eta_score_is_exact_with_a_non_gaussian_term() {
 /// subject the predictor routes to its ODE twin, FREM covariate rows on the closed form
 /// (whose prediction the adjoint overrides to `θ_cov + η_cov`), the same FREM rows under
 /// IOV (the stacked `[η | κ_0 | κ_1 …]`), and an IOV subject whose stack (51) is wider than
-/// the widest η-dispatch bucket (48), which a θ-only recording does not need.
+/// the old widest η-dispatch bucket (48), which no recording needs now.
 ///
 /// The ODE fixtures integrate at `1e-10`/`1e-12`, so the differences of the adaptive
 /// solve resolve the score; the bound is relative to the largest component, so a θ whose
