@@ -10082,6 +10082,11 @@ pub struct FitOptions {
     /// [`SaemMstepSolver::Bobyqa`], the historical single-draw re-maximisation,
     /// so an existing fit's estimates do not change.
     pub saem_mstep_solver: SaemMstepSolver,
+    /// Optimizer of the numerical θ/σ M-step, shared by SAEM (`bobyqa` solver),
+    /// IMP and IMPMAP. Defaults to [`MstepOptimizer::Bobyqa`], the historical
+    /// derivative-free solve, so an existing fit's estimates do not change.
+    /// `[fit_options] mstep_optimizer`.
+    pub mstep_optimizer: MstepOptimizer,
     /// Number of E-step draws the **`bobyqa`** M-step objective is averaged over
     /// (#1458). `1` (the default) is the historical single-draw objective.
     ///
@@ -10876,6 +10881,7 @@ impl Default for FitOptions {
             saem_scale_deadband: Some(DEFAULT_SCALE_DEADBAND),
             saem_mstep_damping: None,
             saem_mstep_solver: SaemMstepSolver::default(),
+            mstep_optimizer: MstepOptimizer::default(),
             saem_mstep_draws: 1,
             saem_omega_burnin: 20,
             saem_seed: None,
@@ -11310,6 +11316,33 @@ pub enum SaemMstepSolver {
     /// returns 1.99 / 1.62 / 1.59. See
     /// `tests/saem_combined_error.rs::score_sa_does_not_bring_back_the_additive_sigma_collapse`.
     ScoreSa,
+}
+
+/// Optimizer of the numerical θ/σ M-step of SAEM, IMP and IMPMAP, set via
+/// `[fit_options] mstep_optimizer`.
+///
+/// Both arms minimise the same smooth, deterministic frozen-η (SAEM) or
+/// importance-weighted (IMP/IMPMAP) observation objective, in the same packed
+/// log/identity space, over the same bounds, with the same evaluation budget
+/// (`maxiter * (n + 1)`) and relative tolerance. They differ in what the solve
+/// reads from the objective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MstepOptimizer {
+    /// NLopt BOBYQA, derivative-free (the default).
+    #[default]
+    Bobyqa,
+    /// NLopt L-BFGS on the exact fixed-η score: the per-subject adjoint θ score
+    /// and the analytic σ score (the one `mstep_solver = score_sa` already
+    /// uses). One value-and-gradient pass replaces the `n + 1` value passes
+    /// BOBYQA's interpolation model needs per step. Where a subject's plan
+    /// declines (a model outside the adjoint's scope) that subject's θ score is
+    /// a forward difference, as everywhere the fixed-η score is used.
+    Lbfgs,
+    /// Fisher scoring (damped Gauss-Newton) on the same exact score and the expected
+    /// information from the same adjoint recording (`estimation::mstep_newton`):
+    /// a handful of fused value-gradient-information passes from the warm start. A subject
+    /// outside the information's closed form (and a mixture) keeps the BOBYQA solve.
+    Newton,
 }
 
 /// Inner-loop (EBE) optimizer, set via `[fit_options] inner_optimizer`. Lets the
@@ -12569,6 +12602,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "saem_mstep_solver",
             "mstep_draws",
             "saem_mstep_draws",
+            "mstep_optimizer",
             "saem_kernel",
             "saem_imh_proposals",
             "saem_imh_refresh",
@@ -12606,6 +12640,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             "imp_auto",
             "imp_max_time",
             "imp_defensive_alpha",
+            "mstep_optimizer",
         ],
         EstimationMethod::Impmap => &[
             "inner_maxiter",
@@ -12631,6 +12666,7 @@ pub fn method_specific_keys(m: EstimationMethod) -> &'static [&'static str] {
             // "unsupported" (issue #528).
             "impmap_defensive_alpha",
             "imp_defensive_alpha",
+            "mstep_optimizer",
         ],
         EstimationMethod::Bayes => &[
             "inner_maxiter",

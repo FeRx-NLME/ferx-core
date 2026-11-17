@@ -153,6 +153,29 @@ fn maximiser_at(
     etas: &[Vec<f64>],
     extra: &[Vec<Vec<f64>>],
 ) -> (Vec<f64>, Vec<f64>) {
+    maximiser_with(
+        model,
+        population,
+        p,
+        etas,
+        extra,
+        crate::types::MstepOptimizer::Bobyqa,
+        400,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maximiser_with(
+    model: &CompiledModel,
+    population: &Population,
+    p: &Packed,
+    etas: &[Vec<f64>],
+    extra: &[Vec<Vec<f64>>],
+    optimizer: crate::types::MstepOptimizer,
+    maxiter: u32,
+    scale_params: bool,
+) -> (Vec<f64>, Vec<f64>) {
     theta_sigma_mstep_light(
         model,
         population,
@@ -166,12 +189,13 @@ fn maximiser_at(
         &p.sigma_upper,
         4,
         1,
-        400,
-        false,
+        maxiter,
+        scale_params,
         &p.mask,
         None,
         &[],
         extra,
+        optimizer,
     )
 }
 
@@ -1270,5 +1294,427 @@ fn score_sa_gate_refuses_a_population_holding_a_sentinel_subject() {
     assert!(
         !score_sa_objective_usable(bad),
         "the gate accepted a population holding a sentinel subject: {bad}"
+    );
+}
+
+// ── `mstep_optimizer = lbfgs` ──────────────────────────────────────────────
+//
+// The L-BFGS arm drives the same objective through its exact fixed-η score
+// (`obs_nll_subject_grad`: adjoint θ score, analytic σ score), so a wrong
+// assembled gradient (the K-draw mean, the `scale` chain rule, a pinned
+// coordinate) lands L-BFGS on a different point than BOBYQA's converged one.
+// The two solvers share nothing but the objective, which is what makes the
+// agreement an oracle for the gradient the way a finite-difference parity is.
+
+/// Worst packed-space gap between two `(θ, σ)` results, over every coordinate.
+fn worst_gap(a: &(Vec<f64>, Vec<f64>), b: &(Vec<f64>, Vec<f64>)) -> f64 {
+    let mut worst = 0.0f64;
+    for (x, y) in
+        a.0.iter()
+            .chain(a.1.iter())
+            .zip(b.0.iter().chain(b.1.iter()))
+    {
+        assert!(
+            x.is_finite() && y.is_finite(),
+            "non-finite coordinate {x} vs {y}"
+        );
+        worst = worst.max((x - y).abs()); // nan-ok: both operands asserted finite above
+    }
+    worst
+}
+
+fn conditional_objective(
+    model: &CompiledModel,
+    population: &Population,
+    etas: &[Vec<f64>],
+    extra: &[Vec<Vec<f64>>],
+    r: &(Vec<f64>, Vec<f64>),
+) -> f64 {
+    let th: Vec<f64> = r.0.iter().map(|x| x.exp()).collect();
+    let sg: Vec<f64> = r.1.iter().map(|x| x.exp()).collect();
+    let mut v = obs_nll_sum(model, population, &th, &sg, etas, &[]);
+    for d in extra {
+        v += obs_nll_sum(model, population, &th, &sg, d, &[]);
+    }
+    v / (1 + extra.len()) as f64
+}
+
+/// Converged L-BFGS = converged BOBYQA, single draw, with and without the
+/// per-coordinate magnitude scaling (whose `g * scale` chain rule only the
+/// gradient arm exercises).
+#[test]
+fn lbfgs_mstep_reaches_the_bobyqa_maximiser() {
+    use crate::types::MstepOptimizer::{Bobyqa, Lbfgs};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    let reference = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    let f_ref = conditional_objective(&model, &population, &draws[0], &[], &reference);
+    for scale in [false, true] {
+        let got = maximiser_with(&model, &population, &p, &draws[0], &[], Lbfgs, 400, scale);
+        let f = conditional_objective(&model, &population, &draws[0], &[], &got);
+        let gap = worst_gap(&got, &reference);
+        eprintln!(
+            "lbfgs scale={scale}: worst |dx| = {gap:.3e}, dObj = {:.3e}",
+            f - f_ref
+        );
+        assert!(
+            f - f_ref < 1e-5,
+            "scale={scale}: lbfgs objective {f} vs bobyqa {f_ref}"
+        );
+        assert!(
+            gap < 5e-3,
+            "scale={scale}: lbfgs {got:?} vs bobyqa {reference:?}"
+        );
+    }
+}
+
+/// The K-draw mean objective's gradient (`mstep_draws > 1`) is the mean of the
+/// per-draw gradients: L-BFGS on it must land on BOBYQA's maximiser of the mean.
+#[test]
+fn lbfgs_mstep_reaches_the_bobyqa_maximiser_of_the_k_draw_mean() {
+    use crate::types::MstepOptimizer::{Bobyqa, Lbfgs};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    let extra = draws[1..4].to_vec();
+    let reference = maximiser_with(
+        &model,
+        &population,
+        &p,
+        &draws[0],
+        &extra,
+        Bobyqa,
+        900,
+        false,
+    );
+    let got = maximiser_with(
+        &model,
+        &population,
+        &p,
+        &draws[0],
+        &extra,
+        Lbfgs,
+        400,
+        false,
+    );
+    // Control: the single-draw maximiser is elsewhere, so a K-draw gradient that
+    // ignored the extra draws would not pass.
+    let single = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    let gap = worst_gap(&got, &reference);
+    let apart = worst_gap(&single, &reference);
+    eprintln!("lbfgs K-draw: worst |dx| = {gap:.3e}; single-draw maximiser is {apart:.3e} away");
+    assert!(
+        apart > 10.0 * gap.max(1e-4),
+        "fixture: the extra draws must move the maximiser"
+    );
+    assert!(gap < 5e-3, "lbfgs {got:?} vs bobyqa {reference:?}");
+}
+
+/// A pinned coordinate (`lower == upper`, a closed-form-owned or FIX theta) stays put
+/// under L-BFGS and the free ones still reach the optimum of the restricted problem.
+#[test]
+fn lbfgs_mstep_holds_a_pinned_coordinate() {
+    use crate::types::MstepOptimizer::{Bobyqa, Lbfgs};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let mut p = packed_start();
+    let pin = p.log_theta[1];
+    p.theta_lower[1] = pin;
+    p.theta_upper[1] = pin;
+    let draws = eta_draws();
+    let reference = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    let got = maximiser_with(&model, &population, &p, &draws[0], &[], Lbfgs, 400, false);
+    assert_eq!(got.0[1], pin, "the pinned theta moved");
+    let gap = worst_gap(&got, &reference);
+    eprintln!("lbfgs pinned: worst |dx| = {gap:.3e}");
+    assert!(gap < 5e-3, "lbfgs {got:?} vs bobyqa {reference:?}");
+}
+
+/// At the production budget (a handful of NLopt evaluations) the L-BFGS solve
+/// must still capture the gain of a converged solve, from the same 0.05-log start
+/// the BOBYQA budget test (`budgeted_mstep_returns_the_converged_conditional_maximiser`)
+/// uses.
+#[test]
+fn lbfgs_mstep_at_the_production_budget_captures_the_converged_gain() {
+    use crate::types::MstepOptimizer::{Bobyqa, Lbfgs};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let draws = eta_draws();
+    let mut p = packed_start();
+    let reference = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    for (v, r) in p.log_theta.iter_mut().zip(reference.0.iter()) {
+        *v = r + 0.05;
+    }
+    p.log_sigma[0] = reference.1[0] + 0.05;
+    let f_ref = conditional_objective(&model, &population, &draws[0], &[], &reference);
+    let f_start = conditional_objective(
+        &model,
+        &population,
+        &draws[0],
+        &[],
+        &(p.log_theta.clone(), p.log_sigma.clone()),
+    );
+    assert!(
+        f_start > f_ref + 0.5,
+        "fixture: the start must be off the optimum"
+    );
+    for maxiter in [3u32, 5] {
+        let got = maximiser_with(
+            &model,
+            &population,
+            &p,
+            &draws[0],
+            &[],
+            Lbfgs,
+            maxiter,
+            false,
+        );
+        let f = conditional_objective(&model, &population, &draws[0], &[], &got);
+        let captured = (f_start - f) / (f_start - f_ref);
+        eprintln!("lbfgs maxiter {maxiter}: captured {captured:.4} of the converged gain");
+        assert!(captured > 0.9, "maxiter {maxiter}: captured {captured}");
+    }
+}
+
+/// The advisory for `mstep_optimizer = lbfgs` names each way the option can fail to do what
+/// it says, and only those: silent under the default, silent where the θ score is exact, one
+/// message per cause otherwise. Each assertion carries its cause's own discriminator and the
+/// other's negative, so a message that names both cannot pass.
+#[test]
+fn the_lbfgs_advisory_names_its_cause() {
+    use crate::types::MstepOptimizer::{Bobyqa, Lbfgs};
+    assert!(mstep_optimizer_advisory_for(Bobyqa, false, false, "SAEM").is_none());
+    assert!(mstep_optimizer_advisory_for(Bobyqa, true, false, "SAEM").is_none());
+    assert!(mstep_optimizer_advisory_for(Lbfgs, false, true, "SAEM").is_none());
+    let sa = mstep_optimizer_advisory_for(Lbfgs, true, true, "SAEM").expect("score_sa");
+    assert!(
+        sa.contains("mstep_solver = score_sa") && !sa.contains("forward difference"),
+        "{sa}"
+    );
+    let fd = mstep_optimizer_advisory_for(Lbfgs, false, false, "IMPMAP").expect("out of scope");
+    assert!(fd.starts_with("IMPMAP:"), "{fd}");
+    assert!(
+        fd.contains("forward difference") && !fd.contains("score_sa"),
+        "{fd}"
+    );
+    // The production wrapper reads the adjoint's scope: an analytic two-compartment model is in it.
+    let model = no_eta_theta_model();
+    assert!(mstep_optimizer_advisory(&model, Lbfgs, false, "SAEM").is_none());
+    assert!(mstep_optimizer_advisory(&model, Lbfgs, true, "SAEM").is_some());
+}
+
+/// Converged Fisher scoring = converged BOBYQA, single draw: same objective, same optimum
+/// (the information is a curvature, not a different problem).
+#[test]
+fn newton_mstep_reaches_the_bobyqa_maximiser() {
+    use crate::types::MstepOptimizer::{Bobyqa, Newton};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    let reference = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    let f_ref = conditional_objective(&model, &population, &draws[0], &[], &reference);
+    let got = maximiser_with(&model, &population, &p, &draws[0], &[], Newton, 400, false);
+    let f = conditional_objective(&model, &population, &draws[0], &[], &got);
+    let gap = worst_gap(&got, &reference);
+    eprintln!("newton: worst |dx| = {gap:.3e}, dObj = {:.3e}", f - f_ref);
+    assert!(f - f_ref < 1e-5, "newton objective {f} vs bobyqa {f_ref}");
+    assert!(gap < 5e-3, "newton {got:?} vs bobyqa {reference:?}");
+    // Non-vacuity: the solve moved off the start (a no-op would also "not be worse").
+    assert!(worst_gap(&got, &(p.log_theta.clone(), p.log_sigma.clone())) > 1e-3);
+}
+
+/// The K-draw mean: the averaged value, score and information must land on BOBYQA's maximiser
+/// of the mean, away from the single-draw one.
+#[test]
+fn newton_mstep_reaches_the_bobyqa_maximiser_of_the_k_draw_mean() {
+    use crate::types::MstepOptimizer::{Bobyqa, Newton};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let p = packed_start();
+    let draws = eta_draws();
+    let extra = draws[1..4].to_vec();
+    let reference = maximiser_with(
+        &model,
+        &population,
+        &p,
+        &draws[0],
+        &extra,
+        Bobyqa,
+        900,
+        false,
+    );
+    let got = maximiser_with(
+        &model,
+        &population,
+        &p,
+        &draws[0],
+        &extra,
+        Newton,
+        400,
+        false,
+    );
+    let single = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    let gap = worst_gap(&got, &reference);
+    let apart = worst_gap(&single, &reference);
+    eprintln!("newton K-draw: worst |dx| = {gap:.3e}; single-draw maximiser is {apart:.3e} away");
+    assert!(
+        apart > 10.0 * gap.max(1e-4),
+        "fixture: the extra draws must move it"
+    );
+    assert!(gap < 5e-3, "newton {got:?} vs bobyqa {reference:?}");
+}
+
+/// A pinned coordinate stays put and the free ones reach the restricted optimum.
+#[test]
+fn newton_mstep_holds_a_pinned_coordinate() {
+    use crate::types::MstepOptimizer::{Bobyqa, Newton};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let mut p = packed_start();
+    let pin = p.log_theta[1];
+    p.theta_lower[1] = pin;
+    p.theta_upper[1] = pin;
+    let draws = eta_draws();
+    let reference = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    let got = maximiser_with(&model, &population, &p, &draws[0], &[], Newton, 400, false);
+    assert_eq!(got.0[1], pin, "the pinned theta moved");
+    let gap = worst_gap(&got, &reference);
+    eprintln!("newton pinned: worst |dx| = {gap:.3e}");
+    assert!(gap < 5e-3, "newton {got:?} vs bobyqa {reference:?}");
+}
+
+/// At the production budget the Fisher-scoring solve captures the converged gain from the
+/// same 0.05-log start the BOBYQA and L-BFGS budget tests use, and does it in fewer fused
+/// evaluations than BOBYQA's budget (the count is the point of the option).
+#[test]
+fn newton_mstep_at_the_production_budget_captures_the_converged_gain() {
+    use crate::types::MstepOptimizer::{Bobyqa, Newton};
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let draws = eta_draws();
+    let mut p = packed_start();
+    let reference = maximiser_with(&model, &population, &p, &draws[0], &[], Bobyqa, 900, false);
+    for (v, r) in p.log_theta.iter_mut().zip(reference.0.iter()) {
+        *v = r + 0.05;
+    }
+    p.log_sigma[0] = reference.1[0] + 0.05;
+    let f_ref = conditional_objective(&model, &population, &draws[0], &[], &reference);
+    let f_start = conditional_objective(
+        &model,
+        &population,
+        &draws[0],
+        &[],
+        &(p.log_theta.clone(), p.log_sigma.clone()),
+    );
+    assert!(
+        f_start > f_ref + 0.5,
+        "fixture: the start must be off the optimum"
+    );
+    for maxiter in [1u32, 3] {
+        let got = maximiser_with(
+            &model,
+            &population,
+            &p,
+            &draws[0],
+            &[],
+            Newton,
+            maxiter,
+            false,
+        );
+        let f = conditional_objective(&model, &population, &draws[0], &[], &got);
+        let captured = (f_start - f) / (f_start - f_ref);
+        eprintln!("newton maxiter {maxiter}: captured {captured:.4} of the converged gain");
+        assert!(captured > 0.9, "maxiter {maxiter}: captured {captured}");
+    }
+}
+
+/// The advisory for `newton`: silent where the information exists, one cause-named message
+/// otherwise (the scope message must not name `score_sa`, the `score_sa` one not the scope).
+#[test]
+fn the_newton_advisory_names_its_cause() {
+    use crate::types::MstepOptimizer::Newton;
+    assert!(mstep_optimizer_advisory_for(Newton, false, true, "SAEM").is_none());
+    let sa = mstep_optimizer_advisory_for(Newton, true, true, "SAEM").expect("score_sa");
+    assert!(
+        sa.contains("mstep_solver = score_sa") && !sa.contains("adjoint"),
+        "{sa}"
+    );
+    let scope = mstep_optimizer_advisory_for(Newton, false, false, "IMP").expect("scope");
+    assert!(scope.starts_with("IMP:"), "{scope}");
+    assert!(
+        scope.contains("adjoint")
+            && scope.contains("keeps `bobyqa`")
+            && !scope.contains("score_sa"),
+        "{scope}"
+    );
+}
+
+/// The value path with a prediction memo is the memo-free `obs_nll_sum` bit for bit, serves an
+/// unchanged θ from the slot (a stale draw proves it), and gives each draw its own slots.
+#[test]
+fn the_memoised_value_path_is_obs_nll_sum_bit_for_bit() {
+    use crate::estimation::pred_memo::PredMemo;
+    let model = no_eta_theta_model();
+    let population = no_eta_population(&model, &[1.3, 12.0, 2.6, 26.0]);
+    let draws = eta_draws();
+    let n = population.subjects.len();
+    let memo = PredMemo::new(2 * n);
+    let th: Vec<f64> = packed_start().log_theta.iter().map(|x| x.exp()).collect();
+    let th2: Vec<f64> = th.iter().map(|x| x * 1.01).collect();
+    for sg in [[0.1f64], [0.2], [0.35]] {
+        let plain = obs_nll_sum(&model, &population, &th, &sg, &draws[0], &[]);
+        let with = obs_nll_sum_memo(
+            &model,
+            &population,
+            &th,
+            &sg,
+            &draws[0],
+            &[],
+            Some((&memo, 0)),
+        );
+        assert_eq!(plain, with, "σ = {sg:?}");
+    }
+    // Stale: slots 0..n hold draw 0's predictions for `th`; draw 1 through them scores draw 0.
+    let sg = [0.2f64];
+    let d0 = obs_nll_sum(&model, &population, &th, &sg, &draws[0], &[]);
+    let d1 = obs_nll_sum(&model, &population, &th, &sg, &draws[1], &[]);
+    assert!(d0 != d1, "fixture: the draws must differ");
+    let stale = obs_nll_sum_memo(
+        &model,
+        &population,
+        &th,
+        &sg,
+        &draws[1],
+        &[],
+        Some((&memo, 0)),
+    );
+    assert_eq!(stale, d0, "served from the slot");
+    // Its own slots (base n) compute draw 1 itself; a changed θ recomputes through slot 0.
+    let own = obs_nll_sum_memo(
+        &model,
+        &population,
+        &th,
+        &sg,
+        &draws[1],
+        &[],
+        Some((&memo, n)),
+    );
+    assert_eq!(own, d1);
+    let moved = obs_nll_sum_memo(
+        &model,
+        &population,
+        &th2,
+        &sg,
+        &draws[1],
+        &[],
+        Some((&memo, 0)),
+    );
+    assert_eq!(
+        moved,
+        obs_nll_sum(&model, &population, &th2, &sg, &draws[1], &[])
     );
 }

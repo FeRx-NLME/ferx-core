@@ -13299,6 +13299,18 @@ pub fn apply_fit_option(opts: &mut FitOptions, key: &str, value: &str) -> Result
                 }
             };
         }
+        "mstep_optimizer" => {
+            opts.mstep_optimizer = match value.to_lowercase().as_str() {
+                "bobyqa" => crate::types::MstepOptimizer::Bobyqa,
+                "lbfgs" | "l-bfgs" | "l_bfgs" => crate::types::MstepOptimizer::Lbfgs,
+                "newton" | "fisher" => crate::types::MstepOptimizer::Newton,
+                other => {
+                    return Err(format!(
+                        "fit option `{key}`: unknown value `{other}` — expected bobyqa/lbfgs/newton"
+                    ));
+                }
+            };
+        }
         "mstep_draws" | "saem_mstep_draws" => {
             let v = parse_usize(key)?;
             if v == 0 {
