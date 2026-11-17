@@ -19,17 +19,16 @@
 //! 1.47 OFV units from the converged value, while from `1e-3` the decade moves it by 1.41. So a
 //! silent check does not certify the tolerance; a warning does say it is too loose.
 //!
-//! The re-scored objective is the fit's own (`pop_nll_opts` under the last estimating stage's
-//! method), so the shift is in the same units as the reported OFV; the fit-tolerance side is
+//! The re-scored objective is the published one (`pop_nll_opts` under the options of the stage
+//! that owns `FitResult::ofv` — the last estimating stage, or a trailing `agq_eval_only`
+//! readout), so the shift is in the same units as the reported OFV; the fit-tolerance side is
 //! re-scored here too rather than read off `FitResult::ofv`, so the penalties and priors that
 //! the reported OFV may add cancel out of the difference instead of entering it.
 
-use crate::estimation::inner_optimizer::find_ebe_for_stage;
 use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::compute_mu_k;
 use crate::types::{CompiledModel, EstimationMethod, FitOptions, ModelParameters, Population};
 use nalgebra::{DMatrix, DVector};
-use rayon::prelude::*;
 
 /// The factor `reltol` and `abstol` are multiplied by for the re-solve: one decade, as the
 /// issue that motivated the check asked for (#2994).
@@ -120,52 +119,60 @@ pub(crate) fn tightened_override(
     })
 }
 
-/// Re-find every subject's EBEs warm from `eta_hats` and score the objective, at whatever ODE
-/// tolerance is armed on the calling thread.
+/// Re-find every subject's EBEs warm from the fit's joint modes (η̂ and κ̂) and score the
+/// objective, at whatever ODE tolerance is armed on the calling thread. The same seeded warm
+/// solve an `agq_eval_only` stage runs, so on the fit-tolerance side it reproduces that
+/// stage's objective.
 fn rescored_ofv(
     model: &CompiledModel,
     population: &Population,
     params: &ModelParameters,
     eta_hats: &[DVector<f64>],
+    kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
 ) -> f64 {
+    use crate::estimation::inner_optimizer::{
+        run_inner_loop_warm_seeded, InnerHessianSeed, PrevEtas,
+    };
     let mu_k = compute_mu_k(model, &params.theta, options.mu_referencing);
-    let fit = crate::parser::model_parser::rhs_regcode::kernel_jit::current_fit();
-    let ebes: Vec<_> = (0..population.subjects.len())
-        .into_par_iter()
-        .map(|i| {
-            crate::parser::model_parser::rhs_regcode::kernel_jit::in_fit(fit, || {
-                find_ebe_for_stage(
-                    model,
-                    &population.subjects[i],
-                    params,
-                    options.inner_maxiter,
-                    options.inner_tol,
-                    Some(eta_hats[i].as_slice()),
-                    Some(&mu_k),
-                    0,
-                    options,
-                )
-            })
-        })
-        .collect();
-    let mut etas = Vec::with_capacity(ebes.len());
-    let mut hs = Vec::with_capacity(ebes.len());
-    let mut kappas = Vec::with_capacity(ebes.len());
-    for e in ebes {
-        etas.push(e.eta);
-        hs.push(e.h_matrix);
-        kappas.push(e.kappas);
-    }
+    let warm = crate::estimation::outer_optimizer::joint_warm_starts(eta_hats, kappas);
+    let (etas, hs, _stats, kappas) = run_inner_loop_warm_seeded(
+        model,
+        population,
+        params,
+        options.inner_maxiter,
+        options.inner_tol,
+        Some(&warm),
+        Some(&mu_k),
+        options.min_obs_for_convergence_check as usize,
+        options.inner_restarts,
+        InnerHessianSeed::for_options(options),
+        options,
+        PrevEtas::Solved,
+    );
     2.0 * pop_nll_opts(model, population, params, &etas, &hs, &kappas, options)
 }
 
-/// The check itself (#2994), or `None` when it does not apply ([`tightened_override`]) or the
-/// scope carrying the tighter tolerance could not be built.
+/// Which modes the fit-tolerance side of the check scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FitSide {
+    /// The fit's own η̂, `H` and κ̂, as they are: they are the modes the reported OFV was
+    /// scored at (an estimating stage owns it).
+    Stored,
+    /// Re-found at the fit's tolerance from the stored modes, as the tight side is: the stored
+    /// modes belong to a different objective than the one published — an `agq_eval_only`
+    /// readout re-found its own and kept only the OFV.
+    Resolved,
+}
+
+/// The check itself (#2994): `None` when it does not apply ([`tightened_override`]), `Err`
+/// with the reason when the scope carrying the tighter tolerance could not be built.
 ///
-/// `options` must be the last estimating stage's (its `method` and `interaction`), so the
-/// objective re-scored is the one the fit reported. The fit-tolerance side scores the fit's
-/// own modes and `H` as they are; the tight side re-finds both from those modes.
+/// `options` must be the options of the stage that owns the published OFV (its `method`,
+/// `interaction`, `n_agq` and inner settings), so the objective re-scored is the one the fit
+/// reported. The tight side always re-finds the modes from the stored ones; `fit_side` says
+/// what the fit-tolerance side scores.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn ofv_tolerance_shift(
     model: &CompiledModel,
     population: &Population,
@@ -174,25 +181,47 @@ pub(crate) fn ofv_tolerance_shift(
     h_matrices: &[DMatrix<f64>],
     kappas: &[Vec<DVector<f64>>],
     options: &FitOptions,
-) -> Option<OdeToleranceShift> {
+    fit_side: FitSide,
+) -> Option<Result<OdeToleranceShift, String>> {
     let eff = model.integrator_spec()?.effective_solver_opts();
     let tight = tightened_override(model, options)?;
-    let fit_ofv = 2.0
-        * pop_nll_opts(
-            model, population, params, eta_hats, h_matrices, kappas, options,
-        );
-    let tight_ofv = crate::api::with_fit_scope_ode(options, tight, || {
-        rescored_ofv(model, population, params, eta_hats, options)
-    })
-    .ok()?;
-    Some(OdeToleranceShift {
+    let fit_ofv = match fit_side {
+        FitSide::Stored => {
+            2.0 * pop_nll_opts(
+                model, population, params, eta_hats, h_matrices, kappas, options,
+            )
+        }
+        FitSide::Resolved => rescored_ofv(model, population, params, eta_hats, kappas, options),
+    };
+    let tight_ofv = match crate::api::with_fit_scope_ode(options, tight, || {
+        rescored_ofv(model, population, params, eta_hats, kappas, options)
+    }) {
+        Ok(v) => v,
+        Err(e) => return Some(Err(e.to_string())),
+    };
+    Some(Ok(OdeToleranceShift {
         fit_reltol: eff.reltol,
         fit_abstol: eff.abstol,
         tight_reltol: tight.reltol.expect("set by tightened_override"),
         tight_abstol: tight.abstol.expect("set by tightened_override"),
         fit_ofv,
         tight_ofv,
-    })
+    }))
+}
+
+/// The token of [`not_checked_warning`]; `classify_warning` maps it to `ode_solver`.
+pub(crate) const NOT_CHECKED_TOKEN: &str = "W_ODE_OFV_SETTLEMENT_UNCHECKED";
+
+/// The warning for a check that applied but could not run, because the scope carrying the
+/// tighter tolerance could not be built (`reason`). Never silent: an inapplicable check and a
+/// failed one must not read the same (#2994 review r1).
+pub(crate) fn not_checked_warning(reason: &str) -> String {
+    format!(
+        "{NOT_CHECKED_TOKEN}: whether the OFV is settled at the fit's ODE tolerance could not \
+         be checked: re-solving at a one decade tighter ode_reltol / ode_abstol could not be \
+         set up ({reason}). The fit and its OFV are unaffected; refit once with tighter \
+         ode_reltol / ode_abstol and compare the OFV before comparing models by it (#2994)."
+    )
 }
 
 /// The `W_ODE_OFV_NOT_SETTLED` text for `s`, or `None` when the objective is settled.

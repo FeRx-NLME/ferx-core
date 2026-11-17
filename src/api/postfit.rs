@@ -4125,6 +4125,15 @@ pub(crate) fn ode_ofv_not_settled_warning(
     Some((msg, entry))
 }
 
+/// The typed `W_ODE_OFV_SETTLEMENT_UNCHECKED` warning for a tolerance check that applied but
+/// could not run (#2994 review r1): the scope carrying the tighter tolerance could not be built.
+pub(crate) fn ode_ofv_not_checked_warning(reason: &str) -> (String, WarningEntry) {
+    let msg = crate::estimation::ode_tolerance_check::not_checked_warning(reason);
+    let details = serde_json::json!({ "reason": reason });
+    let entry = warning_entry(WarningCode::OdeSolver, msg.clone(), Some(details));
+    (msg, entry)
+}
+
 /// The one place a non-`fit()` entry point decides whether to open a
 /// [`crate::ode::solver::SolverStatsScope`] (#1304).
 ///

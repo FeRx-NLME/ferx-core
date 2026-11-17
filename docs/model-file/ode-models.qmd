@@ -426,9 +426,16 @@ So that model has no warning at the default and gets one at `1e-3`.
 
 Scope and limits:
 
-- It runs for `foce`, `focei`, `gn`, `gn_hybrid` and `laplace` (also with `n_agq > 1`), whose
-  reported objective it scores again. A `[mixture]` model, the Monte-Carlo estimators and a
-  model solved exactly by the [matrix exponential](#linear-exact) are not checked.
+- It checks the objective the fit publishes, so it runs when that objective comes from
+  `foce`, `focei`, `gn`, `gn_hybrid` or `laplace` (also with `n_agq > 1`). A trailing
+  `agq_eval_only` readout owns the published OFV, so `method = [focei, laplace]` is checked on
+  the quadrature marginal and `method = [vi, laplace]` is checked too; both sides then re-find
+  the modes under the readout's settings. A `[mixture]` model, an objective published by a
+  Monte-Carlo estimator and a model solved exactly by the [matrix exponential](#linear-exact)
+  are not checked.
+- If the tighter solve cannot be set up (its worker pool cannot be built), the fit carries
+  `W_ODE_OFV_SETTLEMENT_UNCHECKED` instead, so a check that did not run never reads as a
+  settled objective.
 - It costs one inner-loop pass over all subjects at the tighter tolerance.
 - A fit already at `ode_reltol = 1e-12` is not checked, since one more decade would measure
   round-off.

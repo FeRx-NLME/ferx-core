@@ -2058,6 +2058,11 @@ fn fit_inner(
     //
     // `None` only until the first stage writes one.
     let mut objective_stage: Option<EstimationMethod> = None;
+    // The options of an `agq_eval_only` readout while it owns the published objective, so the
+    // post-fit ODE tolerance check (#2994) re-scores *that* objective — its method, `n_agq` and
+    // inner settings — rather than the preceding estimator's. Cleared by every other stage that
+    // takes ownership.
+    let mut objective_stage_opts: Option<FitOptions> = None;
     // A VI stage's result must survive later stages of a chain: `method = [vi, imp]`
     // is the *recommended* way to finish a VI fit, and reading `vi` off only the
     // final stage would silently discard it exactly when it was used correctly.
@@ -2359,6 +2364,7 @@ fn fit_inner(
             // This stage writes `result.ofv` on both branches, so it owns the
             // published objective even though it estimates nothing (#1303).
             objective_stage = Some(method);
+            objective_stage_opts = Some(stage_opts.clone());
             match result.as_mut() {
                 // Chained: keep the estimator's parameters and replace only the OFV, so the
                 // reported objective is the quadrature marginal at the point it reached.
@@ -2474,6 +2480,7 @@ fn fit_inner(
                 // `result.ofv` alone, so `objective_stage` must stay pointing at
                 // that estimator — which is the #1303 review's P1.
                 objective_stage = Some(method);
+                objective_stage_opts = None;
                 let ofv = 2.0 * nll;
                 let mut converged = true;
                 let gate_warning = crate::estimation::outer_optimizer::gate_converged_on_objective(
@@ -2706,6 +2713,7 @@ fn fit_inner(
         // An estimating stage replaces the whole `OuterResult`, objective included,
         // so it becomes the owner of the published `ofv` (#1303).
         objective_stage = Some(method);
+        objective_stage_opts = None;
         result = Some(stage_result);
 
         // NONMEM-comparable IMP / IMPMAP objective. The reported `OuterResult.ofv`
@@ -3480,30 +3488,53 @@ fn fit_inner(
         native_warnings.push(entry);
     }
     // Whether the OFV is settled at the ODE tolerance the fit integrated at (#2994): the EBEs
-    // and the objective re-solved once at one decade tighter. A mixture's objective is the
-    // K-class marginal, which this single-population re-score would not reproduce, and the
-    // Monte-Carlo estimators report an objective it does not compute, so both are out of scope.
-    if result.mixture_posteriors.is_none()
-        && crate::estimation::ode_tolerance_check::method_in_scope(final_method)
+    // and the objective re-solved once at one decade tighter. The objective checked is the
+    // one published, so its stage is the tracked owner of `ofv` (`objective_stage`), not
+    // `final_method`: a trailing `agq_eval_only` readout publishes its quadrature marginal
+    // while the stored modes stay the estimator's, so its check runs under the readout's own
+    // options and re-finds the modes on both sides (`FitSide::Resolved`). A mixture's
+    // objective is the K-class marginal, which this single-population re-score would not
+    // reproduce, and the Monte-Carlo estimators publish an objective it does not compute, so
+    // both are out of scope.
     {
-        let stage = FitOptions {
-            method: final_method,
-            ..options.clone()
+        use crate::estimation::ode_tolerance_check::{self as otc, FitSide};
+        let (stage, fit_side) = match objective_stage_opts {
+            Some(ref readout) if readout.method == objective_stage => {
+                (readout.clone(), FitSide::Resolved)
+            }
+            _ => (
+                FitOptions {
+                    method: objective_stage,
+                    ..options.clone()
+                },
+                FitSide::Stored,
+            ),
         };
-        if let Some((msg, entry)) = crate::estimation::ode_tolerance_check::ofv_tolerance_shift(
-            model,
-            population,
-            &result.params,
-            &result.eta_hats,
-            &result.h_matrices,
-            &result.kappas,
-            &stage,
-        )
-        .as_ref()
-        .and_then(super::postfit::ode_ofv_not_settled_warning)
-        {
-            warnings.push(msg);
-            native_warnings.push(entry);
+        if result.mixture_posteriors.is_none() && otc::method_in_scope(stage.method) {
+            match otc::ofv_tolerance_shift(
+                model,
+                population,
+                &result.params,
+                &result.eta_hats,
+                &result.h_matrices,
+                &result.kappas,
+                &stage,
+                fit_side,
+            ) {
+                Some(Ok(shift)) => {
+                    if let Some((msg, entry)) = super::postfit::ode_ofv_not_settled_warning(&shift)
+                    {
+                        warnings.push(msg);
+                        native_warnings.push(entry);
+                    }
+                }
+                Some(Err(reason)) => {
+                    let (msg, entry) = super::postfit::ode_ofv_not_checked_warning(&reason);
+                    warnings.push(msg);
+                    native_warnings.push(entry);
+                }
+                None => {}
+            }
         }
     }
     // Twin-less transit/IG absorption closed form whose fitted per-subject EBE crosses

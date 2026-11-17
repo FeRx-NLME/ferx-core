@@ -181,3 +181,115 @@ fn fit_warns_when_the_ofv_moves_at_a_tighter_tolerance_and_not_when_settled() {
         tight.warnings
     );
 }
+
+fn details_of(r: &crate::types::FitResult) -> Option<&serde_json::Value> {
+    r.warnings_structured
+        .iter()
+        .find(|e| e.message.starts_with("W_ODE_OFV_NOT_SETTLED:"))
+        .and_then(|e| e.details.as_ref())
+}
+
+fn chain(
+    prep: &crate::api::PreparedRun,
+    methods: Vec<EstimationMethod>,
+    tol: f64,
+) -> crate::types::FitResult {
+    let opts = FitOptions {
+        verbose: false,
+        methods: methods.clone(),
+        agq_eval_only: methods.contains(&EstimationMethod::Laplace),
+        outer_maxiter: 0,
+        vi_iters: 1,
+        run_covariance_step: false,
+        ode_reltol: tol,
+        ode_abstol: tol,
+        ode_method: crate::ode::OdeMethod::Rk45,
+        ..prep.parsed.fit_options.clone()
+    };
+    crate::fit(
+        &prep.parsed.model,
+        &prep.population,
+        &prep.init_params,
+        &opts,
+    )
+    .expect("the chain runs")
+}
+
+/// #2994 review r1: a trailing `agq_eval_only` readout publishes its own quadrature marginal
+/// while the stored modes stay the estimator's, so the check must re-score the readout's
+/// objective. The fit-tolerance side of the check is the published OFV, and that OFV is a
+/// different number from the FOCEI objective the check used to score — the straddle is
+/// asserted, so the comparison cannot pass on the estimator's objective.
+#[test]
+fn an_agq_readout_is_checked_on_the_objective_it_publishes() {
+    let prep = mm_iv();
+    let readout = chain(
+        &prep,
+        vec![EstimationMethod::FoceI, EstimationMethod::Laplace],
+        1e-3,
+    );
+    let focei = chain(&prep, vec![EstimationMethod::FoceI], 1e-3);
+    let gap = (readout.ofv - focei.ofv).abs();
+    assert!(
+        gap > 1e-3,
+        "fixture: the readout must publish a different objective ({} vs {})",
+        readout.ofv,
+        focei.ofv
+    );
+    let d = details_of(&readout)
+        .unwrap_or_else(|| panic!("no W_ODE_OFV_NOT_SETTLED in {:?}", readout.warnings));
+    let fit_ofv = d["fit_ofv"].as_f64().expect("finite");
+    assert!(
+        (fit_ofv - readout.ofv).abs() < 1e-3 * gap,
+        "the check scored {fit_ofv}, the readout published {} (FOCEI: {})",
+        readout.ofv,
+        focei.ofv
+    );
+}
+
+/// #2994 review r1: `[vi, laplace]` + `agq_eval_only` — the recommended way to finish a VI
+/// fit — publishes the readout's objective, so it is checked even though the last estimating
+/// stage (VI) is out of scope. It used to be skipped.
+#[test]
+fn a_vi_fit_finished_by_an_agq_readout_is_checked() {
+    let prep = mm_iv();
+    let r = chain(
+        &prep,
+        vec![EstimationMethod::Vi, EstimationMethod::Laplace],
+        1e-3,
+    );
+    let d =
+        details_of(&r).unwrap_or_else(|| panic!("no W_ODE_OFV_NOT_SETTLED in {:?}", r.warnings));
+    let fit_ofv = d["fit_ofv"].as_f64().expect("finite");
+    assert!(
+        (fit_ofv - r.ofv).abs() < 1e-6 * r.ofv.abs().max(1.0),
+        "the check scored {fit_ofv}, the readout published {}",
+        r.ofv
+    );
+}
+
+/// A check that applied but could not run says so, typed, and is not the not-settled finding.
+#[test]
+fn a_check_that_could_not_run_is_reported_not_silent() {
+    let msg = not_checked_warning("pool build failed");
+    for clause in [
+        "W_ODE_OFV_SETTLEMENT_UNCHECKED: ",
+        "whether the OFV is settled at the fit's ODE tolerance could not be checked",
+        "could not be set up (pool build failed)",
+        "The fit and its OFV are unaffected",
+        "refit once with tighter ode_reltol / ode_abstol and compare the OFV",
+    ] {
+        assert!(msg.contains(clause), "missing {clause:?} in {msg}");
+    }
+    assert!(!msg.contains("W_ODE_OFV_NOT_SETTLED"), "{msg}");
+    let (_, entry) = crate::api::postfit::ode_ofv_not_checked_warning("pool build failed");
+    assert_eq!(entry.category, WarningCode::OdeSolver);
+    assert_eq!(entry.severity, WarningSeverity::Warning);
+    assert_eq!(
+        entry.details.as_ref().unwrap()["reason"],
+        "pool build failed"
+    );
+    let classified = crate::types::classify_warning(&msg);
+    assert_eq!(classified.category, WarningCode::OdeSolver);
+    assert_eq!(classified.severity, WarningSeverity::Warning);
+}
