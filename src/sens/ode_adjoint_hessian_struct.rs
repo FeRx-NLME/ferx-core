@@ -925,13 +925,15 @@ impl CovPlan<'_> {
                         .collect();
                     let lh = factor_anchor(&mut h, &oi)?;
                     let half_logdet = c(0.5) * chol_logdet(&lh);
-                    let mut wg = c(0.0);
-                    for k in 0..pn {
-                        wg = wg + w(k) * (oieta[k] + c(0.5) * ag(at[1] + k));
-                    }
+                    // `wᵀg` (stage 2 only: stage 1's inputs stop at the aggregates).
+                    let wg = || {
+                        (0..pn).fold(c(0.0), |acc, k| {
+                            acc + w(k) * (oieta[k] + c(0.5) * ag(at[1] + k))
+                        })
+                    };
                     if family == Family::LaplaceGn {
                         return Some(vec![
-                            c(0.5) * (ag(at[0]) + prior_of(ctx, &eta, &p)) + half_logdet - wg,
+                            c(0.5) * (ag(at[0]) + prior_of(ctx, &eta, &p)) + half_logdet - wg(),
                         ]);
                     }
                     // b = η + √2·L⁻ᵀz per node (the recorded kernel's arithmetic).
@@ -963,7 +965,7 @@ impl CovPlan<'_> {
                         })
                         .collect();
                     Some(vec![
-                        half_logdet - crate::sens::num::log_sum_exp(&terms) - wg,
+                        half_logdet - crate::sens::num::log_sum_exp(&terms) - wg(),
                     ])
                 }
             }
@@ -1304,8 +1306,7 @@ impl CovPlan<'_> {
         &self,
         along: &[Dir],
     ) -> Option<(Vec<f64>, DMatrix<f64>, DMatrix<f64>)> {
-        // A quadrature subject's `F` reads its nodes, which this assembly does not carry.
-        let family = self.family().filter(|f| !f.nodes())?;
+        let family = self.family()?;
         let model = self.sc.model;
         let pn = self.pn();
         let nx = self.nx;
@@ -1357,9 +1358,61 @@ impl CovPlan<'_> {
                 return None;
             }
         }
+        // Quadrature: the nodes' locations by stage 1 (values), and each node plan's basis there.
+        let n_par = self.th.len() + self.nz;
+        let (rin1, node_b) = if family.nodes() {
+            let aggr = {
+                let bases = self.bases.borrow();
+                let (_, lb0, v0, _) = bases.get(&PlanKey::Pred)?.parts();
+                let rows = self.rows(
+                    &|j| v0[j * lb0],
+                    &|_| None,
+                    &|j, k| v0[j * lb0 + 1 + k],
+                    &|j, t| v0[j * lb0 + 1 + pn + t],
+                    &|i| self.x[i],
+                )?;
+                rows.aggr.clone()
+            };
+            let rin1: Vec<f64> = eta
+                .iter()
+                .chain(self.x.iter())
+                .chain(&aggr)
+                .copied()
+                .collect();
+            let nn = match self.objective {
+                Objective::Agq { n_agq, .. } => agq_grid(n_agq, pn).len(),
+                _ => 0,
+            };
+            let kr = self.reduce_run(family, 1, &rin1, 0, nn * pn)?;
+            let b: Vec<Vec<f64>> = (0..nn)
+                .map(|d| (0..pn).map(|k| kr.out[d * pn + k]).collect())
+                .collect();
+            (rin1, b)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let nn = node_b.len();
+        for (d, bv) in node_b.iter().enumerate() {
+            let pr = self.plan_run(
+                PlanKey::Node(d),
+                along,
+                pn,
+                n_par,
+                true,
+                &zero,
+                kt,
+                &|lanes, et, k| self.run_pred(model, bv, et, lanes, Layout::F64, k),
+            )?;
+            if !matches!(pr, PlanRun::Basis(_)) {
+                return None;
+            }
+        }
         let bases = self.bases.borrow();
         let (axes, lb, vals, jac) = bases.get(&PlanKey::Pred)?.parts();
         let n_ax = axes.len();
+        let node_parts: Vec<_> = (0..nn)
+            .map(|d| bases.get(&PlanKey::Node(d)).map(|b| b.parts()))
+            .collect::<Option<Vec<_>>>()?;
         let pop = if need_pop {
             Some(bases.get(&PlanKey::Pop)?.parts())
         } else {
@@ -1374,10 +1427,27 @@ impl CovPlan<'_> {
         )?;
         let aggs = family.aggs();
         let (at, na) = offsets(aggs, pn);
+        let nodes = if nn > 0 {
+            Some(self.node_rows(
+                &|d, j| {
+                    let (_, nlb, nv, _) = node_parts[d];
+                    nv[j * nlb]
+                },
+                &|i| self.x[i],
+                nn,
+            )?)
+        } else {
+            None
+        };
         // The reduce at `w = 0` along each `w_o`: values `∂F/∂·`, tangent `o` `−∂g_o/∂·`.
         let lk = 1 + pn;
-        let n_in = pn + nx + na + pn;
+        let n_in = pn + nx + na + nn + pn;
         let mut rin = vec![0.0; n_in * lk];
+        if let Some(nr) = nodes.as_ref() {
+            for d in 0..nn {
+                rin[(pn + nx + na + d) * lk] = nr.agg[d];
+            }
+        }
         for k in 0..pn {
             rin[k * lk] = eta[k];
         }
@@ -1388,11 +1458,70 @@ impl CovPlan<'_> {
             rin[(pn + nx + t) * lk] = rows.aggr[t];
         }
         for o in 0..pn {
-            rin[(pn + nx + na + o) * lk + 1 + o] = 1.0;
+            rin[(pn + nx + na + nn + o) * lk + 1 + o] = 1.0;
         }
         let mut s2 = vec![0.0; lk];
         s2[0] = 1.0;
         let radj = self.reduce_for(family, 2, &rin, pn, &s2)?;
+        // Quadrature: `F`'s route through the nodes (`g` reads none). `N_d`'s adjoint back to the
+        // node predictions and σ, through each node plan's `Jᵀ` to its location (`b̄`) and to θ
+        // (its axes, a folded θ through the fold), then stage 1's reverse to η, x and the
+        // anchor's aggregates.
+        let n_th = self.th.len();
+        let width = self.nx + self.nz + pn;
+        let mut node_row = vec![0.0; width];
+        let (mut e0, mut x0, mut a0) = (vec![0.0; pn], vec![0.0; nx], vec![0.0; na]);
+        if let Some(nr) = nodes.as_ref() {
+            let s0 = packed_segments(self.template).sigma_start();
+            let n_sig = self.sc.params.sigma.values.len();
+            let mut b_bar = vec![0.0; nn * pn];
+            for d in 0..nn {
+                let an = radj[(pn + nx + na + d) * lk];
+                let (nax, nlb, _, njac) = node_parts[d];
+                let mut on = vec![0.0; nax.len()];
+                for (j, x) in nr.l[d].iter().enumerate() {
+                    let fa = an * x.grad[0];
+                    for q in 0..n_sig {
+                        x0[s0 + q] += an * x.grad[1 + q];
+                    }
+                    if fa != 0.0 {
+                        for (bb, v) in on.iter_mut().enumerate() {
+                            *v += fa * njac[j * nlb * nax.len() + bb];
+                        }
+                    }
+                }
+                for (bb, &ax) in nax.iter().enumerate() {
+                    match ax {
+                        Input::Eta(k) => b_bar[d * pn + k] += on[bb],
+                        Input::Param(i) if i < n_th => node_row[i] += on[bb] * self.d1[i],
+                        Input::Param(i) => node_row[self.nx + (i - n_th)] += on[bb],
+                    }
+                }
+                if let Some(f) = self.fold.as_ref() {
+                    for i in 0..n_th {
+                        if let Some(dd) = f.of(i) {
+                            let sm: f64 = dd
+                                .iter()
+                                .filter(|e| e.0 < pn)
+                                .map(|&(k, m)| m * b_bar[d * pn + k])
+                                .sum();
+                            node_row[i] += sm * self.d1[i];
+                        }
+                    }
+                }
+            }
+            let kr1 = self.reduce_run(family, 1, &rin1, 0, nn * pn)?;
+            let r1 = kr1.reverse_one(&b_bar)?;
+            for k in 0..pn {
+                e0[k] += r1[k];
+            }
+            for i in 0..nx {
+                x0[i] += r1[pn + i];
+            }
+            for t in 0..na {
+                a0[t] += r1[pn + nx + t];
+            }
+        }
         // Per output `y` (`F`, then each `g_o`): the aggregate adjoint, then back to the rows.
         let ny = 1 + pn;
         let sign = |y: usize| if y == 0 { 1.0 } else { -1.0 };
@@ -1403,14 +1532,15 @@ impl CovPlan<'_> {
         let mut ke = vec![vec![0.0; pn]; ny];
         let mut kx = vec![vec![0.0; nx]; ny];
         for y in 0..ny {
+            let f0 = |v: &[f64], i: usize| if y == 0 { v[i] } else { 0.0 };
             for k in 0..pn {
-                ke[y][k] = sign(y) * radj[k * lk + lane(y)];
+                ke[y][k] = sign(y) * radj[k * lk + lane(y)] + f0(&e0, k);
             }
             for i in 0..nx {
-                kx[y][i] = sign(y) * radj[(pn + i) * lk + lane(y)];
+                kx[y][i] = sign(y) * radj[(pn + i) * lk + lane(y)] + f0(&x0, i);
             }
             let ay: Vec<f64> = (0..na)
-                .map(|t| sign(y) * radj[(pn + nx + t) * lk + lane(y)])
+                .map(|t| sign(y) * radj[(pn + nx + t) * lk + lane(y)] + f0(&a0, t))
                 .collect();
             let py = Preps::new(aggs, &at, pn, 1, |_| &ay[..]);
             let kk = family.n_scalars();
@@ -1512,6 +1642,9 @@ impl CovPlan<'_> {
             for i in 0..nx {
                 row[i] += kx[y][i];
             }
+        }
+        for (v, n) in out[0].iter_mut().zip(&node_row) {
+            *v += n;
         }
         let grad_f: Vec<f64> = (0..pn).map(|k| out[0][self.eta_slot(k)]).collect();
         let h = DMatrix::from_fn(pn, pn, |o, k| out[1 + o][self.eta_slot(k)]);
