@@ -435,13 +435,15 @@ Scope and limits:
   are not checked.
 - A re-scored objective is used only if it can be trusted. The fit carries
   `W_ODE_OFV_SETTLEMENT_UNCHECKED` instead, naming every reason, when the tighter solve
-  cannot be set up (its worker pool cannot be built), or when a re-scored side has
+  cannot be set up (its worker pool cannot be built), or when either side has
   - an integration that is not clean: a step forced at the minimum step size, a segment
     left unfinished, stiff-aborted or diverged, or an abandoned timeline. Every integration
     behind the objective is counted, including the EBE search, `H` and each AGQ node, not
-    only the prediction at the mode;
-  - or EBEs that fail the fit's own convergence guard: a subject hard-rejected at its
-    start, or more unconverged subjects than `max_unconverged_frac` allows.
+    only the prediction at the mode. This holds for the fit-tolerance side too, also when it
+    is scored at the fit's own modes;
+  - or, on a side whose EBEs were re-found, EBEs that fail the fit's own convergence guard:
+    a subject hard-rejected at its start, or more unconverged subjects than
+    `max_unconverged_frac` allows.
 
   Each of those can still return a finite OFV, so a check that did not really run never
   reads as a settled objective.

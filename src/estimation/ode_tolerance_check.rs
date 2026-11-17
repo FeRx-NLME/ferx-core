@@ -25,7 +25,6 @@
 //! re-scored here too rather than read off `FitResult::ofv`, so the penalties and priors that
 //! the reported OFV may add cancel out of the difference instead of entering it.
 
-use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::estimation::parameterization::compute_mu_k;
 use crate::types::{CompiledModel, EstimationMethod, FitOptions, ModelParameters, Population};
 use nalgebra::{DMatrix, DVector};
@@ -264,26 +263,15 @@ fn rescore_counted(
             schedule.as_ref(),
             policy,
         );
-        let nll = match options.agq_nodes() {
-            Some(n_nodes) => crate::estimation::agq::agq_subject_nll_at_mode(
-                model,
-                subject,
-                params,
-                &ebe.eta,
-                &ebe.kappas,
-                n_nodes,
-                options.hessian_anchor(),
-            ),
-            None => crate::estimation::outer_optimizer::subject_nll(
-                model,
-                subject,
-                params,
-                &ebe.eta,
-                &ebe.h_matrix,
-                &ebe.kappas,
-                options.interaction,
-            ),
-        };
+        let nll = score_subject(
+            model,
+            subject,
+            params,
+            &ebe.eta,
+            &ebe.h_matrix,
+            &ebe.kappas,
+            options,
+        );
         let unconverged = !ebe.converged && subject.n_scored_rows() >= min_obs;
         (nll, unconverged, ebe.hard_reject, scope.collected())
     });
@@ -297,6 +285,97 @@ fn rescore_counted(
         solver.merge(st);
     }
     (ofv, ebe_stats, solver)
+}
+
+/// One subject's term of `pop_nll_opts` at the given modes: the AGQ marginal when the stage
+/// has nodes (which lays its own grid and anchor around `eta`, and ignores `h`), the
+/// FOCE/FOCEI one at `h` otherwise. The one scoring rule both sides of the check share.
+fn score_subject(
+    model: &CompiledModel,
+    subject: &crate::types::Subject,
+    params: &ModelParameters,
+    eta: &DVector<f64>,
+    h: &DMatrix<f64>,
+    kappas: &[DVector<f64>],
+    options: &FitOptions,
+) -> f64 {
+    match options.agq_nodes() {
+        Some(n_nodes) => crate::estimation::agq::agq_subject_nll_at_mode(
+            model,
+            subject,
+            params,
+            eta,
+            kappas,
+            n_nodes,
+            options.hessian_anchor(),
+        ),
+        None => crate::estimation::outer_optimizer::subject_nll(
+            model,
+            subject,
+            params,
+            eta,
+            h,
+            kappas,
+            options.interaction,
+        ),
+    }
+}
+
+/// `pop_nll_opts` at the fit's own stored modes, scored subject by subject so the solver
+/// counters of every integration behind it — every AGQ node and its anchor — are collected,
+/// one [`crate::ode::solver::SolverStatsScope`] per subject task (#2994 review r4).
+fn score_stored_counted(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> (f64, crate::ode::solver::OdeSolverStats) {
+    let per_subject = crate::par::map(population.subjects.len(), |i| {
+        let scope = crate::ode::solver::SolverStatsScope::enter();
+        let nll = score_subject(
+            model,
+            &population.subjects[i],
+            params,
+            &eta_hats[i],
+            &h_matrices[i],
+            kappas.get(i).map_or(&[], Vec::as_slice),
+            options,
+        );
+        (nll, scope.collected())
+    });
+    let mut ofv = 0.0;
+    let mut solver = crate::ode::solver::OdeSolverStats::default();
+    for (nll, st) in &per_subject {
+        ofv += 2.0 * nll;
+        solver.merge(st);
+    }
+    (ofv, solver)
+}
+
+/// The fit-tolerance objective at the stored modes, `Err` when an integration behind it was
+/// not clean: a clamped or unfinished AGQ node returns a finite, wrong term, and comparing it
+/// would read as settled whenever the tight side happens to land within the threshold.
+fn score_stored_checked(
+    model: &CompiledModel,
+    population: &Population,
+    params: &ModelParameters,
+    eta_hats: &[DVector<f64>],
+    h_matrices: &[DMatrix<f64>],
+    kappas: &[Vec<DVector<f64>>],
+    options: &FitOptions,
+) -> Result<f64, String> {
+    let (ofv, solver) = score_stored_counted(
+        model, population, params, eta_hats, h_matrices, kappas, options,
+    );
+    match unclean_integration(&solver) {
+        Some(counters) => Err(format!(
+            "the objective at the fit's modes did not integrate cleanly: {counters}"
+        )),
+        None => Ok(ofv),
+    }
 }
 
 /// Which modes the fit-tolerance side of the check scores.
@@ -333,19 +412,14 @@ pub(crate) fn ofv_tolerance_shift(
     let eff = model.integrator_spec()?.effective_solver_opts();
     let tight = tightened_override(model, options)?;
     let fit_ofv = match fit_side {
-        FitSide::Stored => {
-            2.0 * pop_nll_opts(
-                model, population, params, eta_hats, h_matrices, kappas, options,
-            )
-        }
-        FitSide::Resolved => {
-            match rescore_checked(model, population, params, eta_hats, kappas, options) {
-                Ok(v) => v,
-                Err(why) => {
-                    return Some(Err(format!("at the fit's own tolerance, {why}")));
-                }
-            }
-        }
+        FitSide::Stored => score_stored_checked(
+            model, population, params, eta_hats, h_matrices, kappas, options,
+        ),
+        FitSide::Resolved => rescore_checked(model, population, params, eta_hats, kappas, options),
+    };
+    let fit_ofv = match fit_ofv {
+        Ok(v) => v,
+        Err(why) => return Some(Err(format!("at the fit's own tolerance, {why}"))),
     };
     let tight_ofv = match crate::api::with_fit_scope_ode(options, tight, || {
         rescore_checked(model, population, params, eta_hats, kappas, options)

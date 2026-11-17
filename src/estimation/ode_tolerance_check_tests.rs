@@ -1,4 +1,5 @@
 use super::*;
+use crate::estimation::outer_optimizer::pop_nll_opts;
 use crate::types::{WarningCode, WarningSeverity};
 
 fn shift(fit_ofv: f64, tight_ofv: f64) -> OdeToleranceShift {
@@ -549,5 +550,67 @@ fn an_ebe_pass_failing_the_convergence_guard_is_reported_unchecked() {
     assert!(
         msg.contains("unconverged, max_unconverged_frac = 0"),
         "{msg}"
+    );
+}
+
+/// #2994 review r4: the fit-tolerance side scored at the fit's own stored modes is checked
+/// for solver health too, per subject and over every AGQ node, not taken from `pop_nll_opts`
+/// unseen. With a minimum step the fit's own tolerance cannot honour, that side clamps, and
+/// the check reports itself unchecked naming the fit side, rather than comparing a finite,
+/// wrong objective.
+#[test]
+fn a_stored_fit_side_that_did_not_integrate_cleanly_is_reported_unchecked() {
+    let mut prep = mm_iv();
+    {
+        let spec = prep.parsed.model.ode_spec.as_mut().unwrap();
+        spec.solver_opts.min_dt = 2.0;
+        spec.solver_opts.reltol = 1e-6;
+        spec.solver_opts.abstol = 1e-6;
+    }
+    let model = &prep.parsed.model;
+    let n = prep.population.subjects.len();
+    let etas: Vec<DVector<f64>> = (0..n).map(|_| DVector::zeros(model.n_eta)).collect();
+    let hs: Vec<DMatrix<f64>> = (0..n)
+        .map(|_| DMatrix::identity(model.n_eta, model.n_eta))
+        .collect();
+    let kappas: Vec<Vec<DVector<f64>>> = vec![Vec::new(); n];
+    let opts = FitOptions {
+        method: EstimationMethod::Laplace,
+        n_agq: 3,
+        ..FitOptions::default()
+    };
+    let (_, st) = score_stored_counted(
+        model,
+        &prep.population,
+        &prep.init_params,
+        &etas,
+        &hs,
+        &kappas,
+        &opts,
+    );
+    assert!(
+        unclean_integration(&st).is_some(),
+        "fixture: the stored-mode score must clamp: {st:?}"
+    );
+    let why = ofv_tolerance_shift(
+        model,
+        &prep.population,
+        &prep.init_params,
+        &etas,
+        &hs,
+        &kappas,
+        &opts,
+        FitSide::Stored,
+    )
+    .expect("the check applies")
+    .expect_err("an unclean fit side is not compared");
+    assert!(why.starts_with("at the fit's own tolerance, "), "{why}");
+    assert!(
+        why.contains("the objective at the fit's modes did not integrate cleanly:"),
+        "{why}"
+    );
+    assert!(
+        why.contains("steps clamped at the minimum step size"),
+        "{why}"
     );
 }
