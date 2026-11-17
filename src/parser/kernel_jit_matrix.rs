@@ -212,7 +212,7 @@ impl MatSpec {
             Sweep::Reverse => kappa(layout),
             Sweep::TangentReverse => kappa(layout),
             // Forwards (a tangent-rows forward runs a matrix call at one tangent per seed).
-            Sweep::Forward | Sweep::TangentRows => return false,
+            Sweep::Forward | Sweep::TangentRows | Sweep::TangentReverseRows => return false,
         };
         let lb = layout.base_lanes();
         for sd in 0..seeds {

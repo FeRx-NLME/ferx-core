@@ -912,22 +912,6 @@ fn rows_or_each(
 ) -> Option<Vec<Kept>> {
     let lt = Layout { tan: 1, ..base };
     let (l, w) = (base.lanes(), lt.lanes());
-    let keep = |fwd: kj::Fwd| -> Option<Kept> {
-        if !pl.kept_guard(&fwd) {
-            return None;
-        }
-        let mut du = vec![0.0; (n_obs + 1) * w];
-        for o in 0..n_obs {
-            du[o * w..(o + 1) * w].copy_from_slice(pl.kept_out(&fwd, o));
-        }
-        du[n_obs * w] = 1.0;
-        Some(Kept {
-            plan: pl.clone(),
-            fwd,
-            layout: lt,
-            du,
-        })
-    };
     // The packed inputs' values (the base lanes) and, per axis, their tangents.
     let packed: Vec<(Vec<f64>, Vec<f64>)> = (0..n).map(&inputs).collect();
     let split = |v: &[f64], tan: bool| -> Vec<f64> {
@@ -946,8 +930,31 @@ fn rows_or_each(
                 t
             })
             .collect();
-        if let Some(fwds) = pl.forward_rows(base, &u, &p, &tu, n) {
-            return fwds.into_iter().map(keep).collect();
+        if let Some(rf) = pl.forward_rows(base, &u, &p, &tu, n) {
+            if !pl.rows_guard(&rf) {
+                return None;
+            }
+            let rf = std::rc::Rc::new(rf);
+            return Some(
+                (0..n)
+                    .map(|sd| {
+                        // Each output's values, then this axis's tangents: a one-tangent run's.
+                        let mut du = vec![0.0; (n_obs + 1) * w];
+                        for o in 0..n_obs {
+                            let (v, t) = pl.rows_out(&rf, o, sd);
+                            du[o * w..o * w + l].copy_from_slice(v);
+                            du[o * w + l..(o + 1) * w].copy_from_slice(t);
+                        }
+                        du[n_obs * w] = 1.0;
+                        Kept {
+                            plan: pl.clone(),
+                            fwd: KeptFwd::Rows(rf.clone()),
+                            layout: lt,
+                            du,
+                        }
+                    })
+                    .collect(),
+            );
         }
     }
     packed
@@ -957,7 +964,7 @@ fn rows_or_each(
             let fwd = pl.forward_layout(lt, &u, &p, &mut du)?;
             (du[n_obs * w] == 1.0).then(|| Kept {
                 plan: pl.clone(),
-                fwd,
+                fwd: KeptFwd::One(fwd),
                 layout: lt,
                 du,
             })
@@ -965,9 +972,25 @@ fn rows_or_each(
         .collect()
 }
 
+/// A kept run's forward: its own, or its share of a forward along several axes at once.
+enum KeptFwd {
+    One(kj::Fwd),
+    Rows(std::rc::Rc<kj::RowsFwd>),
+}
+
+impl KeptFwd {
+    /// Its own forward (a run along a pass's directions always has one).
+    fn one(&self) -> Option<&kj::Fwd> {
+        match self {
+            KeptFwd::One(f) => Some(f),
+            KeptFwd::Rows(_) => None,
+        }
+    }
+}
+
 struct Kept {
     plan: PlanArc,
-    fwd: kj::Fwd,
+    fwd: KeptFwd,
     layout: Layout,
     du: Vec<f64>,
 }
@@ -1198,7 +1221,7 @@ impl<'a> CovPlan<'a> {
             (du[n_obs * layout.lanes()] == 1.0).then(|| {
                 vec![Kept {
                     plan: pl.clone(),
-                    fwd,
+                    fwd: KeptFwd::One(fwd),
                     layout,
                     du,
                 }]
@@ -1256,7 +1279,7 @@ impl<'a> CovPlan<'a> {
             (du[n_obs * layout.lanes()] == 1.0).then(|| {
                 vec![Kept {
                     plan: pl.clone(),
-                    fwd,
+                    fwd: KeptFwd::One(fwd),
                     layout,
                     du,
                 }]
@@ -1318,7 +1341,7 @@ impl<'a> CovPlan<'a> {
             (du[layout.lanes()] == 1.0).then(|| {
                 vec![Kept {
                     plan: pl.clone(),
-                    fwd,
+                    fwd: KeptFwd::One(fwd),
                     layout,
                     du,
                 }]
@@ -2040,10 +2063,10 @@ impl<'a> CovPlan<'a> {
         let (mut ub, mut pb) = (kj::Buf::new(ns * nu), kj::Buf::new(ns * np));
         let swept = if tangent {
             kept.plan
-                .reverse_tangent_from(&kept.fwd, 1, &mut ub, &mut pb, &du_bar)
+                .reverse_tangent_from(kept.fwd.one()?, 1, &mut ub, &mut pb, &du_bar)
         } else {
             kept.plan
-                .reverse_from(&kept.fwd, kept.layout, ns, &mut ub, &mut pb, &du_bar)
+                .reverse_from(kept.fwd.one()?, kept.layout, ns, &mut ub, &mut pb, &du_bar)
         };
         if !swept {
             return None;

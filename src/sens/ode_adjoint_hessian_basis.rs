@@ -607,7 +607,56 @@ impl CovPlan<'_> {
             // `∇²(ūᵀP)·B`: the basis's forward over reverse, `ū` on the value lanes.
             let mut g = vec![0.0; n_in];
             let mut t = vec![vec![0.0; b.axes.len()]; n_in];
-            for (c, kept) in b.runs.iter().enumerate() {
+            // Built along every axis at once: one forward over reverse, the reverse shared and
+            // each axis's tangent of it (#2980).
+            if let Some(super::KeptFwd::Rows(rf)) = b.runs.first().map(|k| &k.fwd) {
+                let kept = &b.runs[0];
+                let base = Layout {
+                    tan: 0,
+                    ..kept.layout
+                };
+                let lb = base.lanes();
+                let mut du_bar = vec![0.0; n_out * lb];
+                for j in 0..n_out {
+                    for x in 0..nl.min(lb) {
+                        let s = slot(j, x);
+                        if s != usize::MAX {
+                            du_bar[j * lb + x] = a0[s * lk];
+                        }
+                    }
+                }
+                let (ne, np) = (kept.plan.n_eta(), kept.plan.n_theta());
+                let n_ax = b.axes.len();
+                let (mut ub, mut pb) = (vec![0.0; ne * lb], vec![0.0; np * lb]);
+                let (mut ut, mut pt) = (vec![0.0; n_ax * ne * lb], vec![0.0; n_ax * np * lb]);
+                if rf.seeds() != n_ax
+                    || !kept
+                        .plan
+                        .reverse_rows(rf, &du_bar, &mut ub, &mut pb, &mut ut, &mut pt)
+                {
+                    return None;
+                }
+                for k in 0..ne.min(b.n_eta) {
+                    g[k] = ub[k * lb];
+                }
+                for i in 0..np.min(b.n_par) {
+                    g[b.n_eta + i] = pb[i * lb];
+                }
+                for ax in 0..n_ax {
+                    for k in 0..ne.min(b.n_eta) {
+                        t[k][ax] = ut[(ax * ne + k) * lb];
+                    }
+                    for i in 0..np.min(b.n_par) {
+                        t[b.n_eta + i][ax] = pt[(ax * np + i) * lb];
+                    }
+                }
+            }
+            for (c, kept) in b
+                .runs
+                .iter()
+                .enumerate()
+                .filter(|(_, k)| matches!(k.fwd, super::KeptFwd::One(_)))
+            {
                 let (l, lb) = (kept.layout.lanes(), kept.layout.base_lanes());
                 let w = n_out * l;
                 let mut du_bar = kj::Buf::new(w);
@@ -623,7 +672,7 @@ impl CovPlan<'_> {
                 let (mut ub, mut pb) = (kj::Buf::new(ne * l), kj::Buf::new(np * l));
                 if !kept
                     .plan
-                    .reverse_tangent_from(&kept.fwd, 1, &mut ub, &mut pb, &du_bar)
+                    .reverse_tangent_from(kept.fwd.one()?, 1, &mut ub, &mut pb, &du_bar)
                 {
                     return None;
                 }

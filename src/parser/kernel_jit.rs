@@ -3957,6 +3957,11 @@ pub(crate) enum Sweep {
     /// forward's — the reverse kernels' calling convention, read as tangents. A plan's loop
     /// calls take their forward at one tangent per seed instead ([`Plan::forward_rows`]).
     TangentRows,
+    /// [`Sweep::TangentRows`]'s reverse: forward over reverse with the adjoint seed every seed
+    /// shares, at a base layout (`ir::tangent_reverse_rows`). Values and adjoints run once per
+    /// call, each seed's tangents once per seed; its calls pass the chunk's slot table doubled
+    /// ([`Plan::reverse_rows`]).
+    TangentReverseRows,
 }
 
 impl Sweep {
@@ -4051,6 +4056,17 @@ impl ChunkProgram {
         let base = layout.base();
         let f = ir::forward(code, self.n_regs, base);
         let f = fold_chunk(&f, base, &self.spec);
+        if sweep == Sweep::TangentReverseRows {
+            let k = (layout.tan == 0)
+                .then(|| ir::tangent_reverse_rows(&f, self.n_in, layout.lanes()))
+                .flatten()
+                .map(|(g, prefix)| {
+                    let (g, prefix) = ir::dedup_calls(&g, prefix);
+                    Tiered::new(g, layout, self.n_in, true, prefix)
+                });
+            c.insert((layout, sweep), k.clone());
+            return k;
+        }
         if sweep == Sweep::TangentRows {
             // At a base layout only: the seeds are the directions.
             let k = (layout.tan == 0)
@@ -5345,6 +5361,25 @@ pub(crate) fn kept_in(scope: u64) -> usize {
     kept_lock().values().filter(|k| k.scope == scope).count()
 }
 
+/// A plan's forward along several directions at once, kept for its reverse
+/// ([`Plan::forward_rows`], [`Plan::reverse_rows`]): every slot's values, per seed every slot's
+/// tangents, per seed every loop call's log (#2980).
+pub(crate) struct RowsFwd {
+    plan: usize,
+    layout: Layout,
+    seeds: usize,
+    buf: Vec<f64>,
+    tb: Vec<f64>,
+    logs: Vec<Vec<CallLog>>,
+}
+
+impl RowsFwd {
+    /// The directions it carries.
+    pub(crate) fn seeds(&self) -> usize {
+        self.seeds
+    }
+}
+
 /// A plan's forward at one layout, kept for its reverse passes ([`Plan::forward_kept`]):
 /// every slot's lanes and every loop call's run log. A reverse at this layout, or at one
 /// whose lanes are a prefix of it ([`prefix_layout`]), reads it instead of running the
@@ -5420,12 +5455,17 @@ impl Plan {
             .map(|c| match c {
                 Call::Chunk { prog, .. } => prog.get(layout, sweep).map(Kern::Chunk),
                 Call::Loop { spec, .. } => match spec {
-                    // A tangent-rows forward runs each loop call per seed at one tangent.
+                    // A tangent-rows forward runs an ODE loop's bodies as rows kernels too
+                    // (`ode_loop::run_loop_rows`); its reverse per seed at one tangent.
                     CallKind::Ode(s) if sweep == Sweep::TangentRows => {
+                        ode_loop::LoopKernels::resolve(s, layout, Sweep::TangentRows)
+                            .map(Kern::Loop)
+                    }
+                    CallKind::Ode(s) if sweep == Sweep::TangentReverseRows => {
                         ode_loop::LoopKernels::resolve(
                             s,
                             Layout { tan: 1, ..layout },
-                            Sweep::Forward,
+                            Sweep::TangentReverse,
                         )
                         .map(Kern::Loop)
                     }
@@ -5732,14 +5772,11 @@ impl Plan {
     }
 
     /// The forward at the base layout `layout` and its tangent along each of `seeds` directions
-    /// (#2980), kept per seed exactly as [`Self::forward_kept`] at one tangent
-    /// (`Layout { tan: 1, .. }`) would keep it — every slot's values then tangents, every loop
-    /// call's log — so its outputs ([`Self::kept_out`]) and reverse passes read it the same way.
-    /// `u` and `params` as `forward_kept`'s at `layout`; `tu` per seed every input's tangents
-    /// (η's then θ's, `layout`'s lanes each). Each chunk runs its primal once and each seed's
-    /// tangent ([`Sweep::TangentRows`]); a loop call runs per seed at one tangent. `None` where a
-    /// chunk has no such kernel or a loop call fails; a failed guard shows in each seed's kept
-    /// forward ([`Self::kept_guard`]).
+    /// (#2980): `u` and `params` as [`Self::forward_kept`]'s at `layout`, `tu` per seed every
+    /// input's tangents (η's then θ's, `layout`'s lanes each). Each chunk runs its primal once
+    /// and each seed's tangent ([`Sweep::TangentRows`]); a loop call runs per seed at one
+    /// tangent. Kept for [`Self::reverse_rows`] and read through [`Self::rows_out`]. `None`
+    /// where a chunk has no such kernel or a loop call fails.
     pub(crate) fn forward_rows(
         &self,
         layout: Layout,
@@ -5747,7 +5784,7 @@ impl Plan {
         params: &[f64],
         tu: &[f64],
         seeds: usize,
-    ) -> Option<Vec<Fwd>> {
+    ) -> Option<RowsFwd> {
         if layout.tan != 0 {
             return None;
         }
@@ -5755,39 +5792,195 @@ impl Plan {
         let l = layout.lanes();
         let stride = self.n_slots * l;
         let n_in = (self.n_eta + self.n_theta) * l;
-        let mut buf = take(stride);
+        let mut buf = vec![0.0; stride];
         buf[..self.n_eta * l].copy_from_slice(&u[..self.n_eta * l]);
         buf[self.n_eta * l..n_in].copy_from_slice(&params[..self.n_theta * l]);
-        let mut tb = take(stride * seeds);
+        let mut tb = vec![0.0; stride * seeds];
         for sd in 0..seeds {
             tb[sd * stride..sd * stride + n_in].copy_from_slice(&tu[sd * n_in..(sd + 1) * n_in]);
         }
         let mut logs: Vec<Vec<CallLog>> = (0..seeds).map(|_| Vec::new()).collect();
-        let ok = self.forward_rows_into(&fns, &mut buf, &mut tb, layout, seeds, &mut logs);
+        self.forward_rows_into(&fns, &mut buf, &mut tb, layout, seeds, &mut logs)?;
+        Some(RowsFwd {
+            plan: self as *const Plan as usize,
+            layout,
+            seeds,
+            buf,
+            tb,
+            logs,
+        })
+    }
+
+    /// Output `o`'s lanes in a kept rows forward: its values, and seed `sd`'s tangents.
+    pub(crate) fn rows_out<'a>(
+        &self,
+        r: &'a RowsFwd,
+        o: usize,
+        sd: usize,
+    ) -> (&'a [f64], &'a [f64]) {
+        let l = r.layout.lanes();
+        let s = self.outs[o] as usize;
+        let stride = self.n_slots * l;
+        (
+            &r.buf[s * l..(s + 1) * l],
+            &r.tb[sd * stride + s * l..sd * stride + (s + 1) * l],
+        )
+    }
+
+    /// Whether the guard holds in a kept rows forward.
+    pub(crate) fn rows_guard(&self, r: &RowsFwd) -> bool {
+        self.guard
+            .is_none_or(|g| r.buf[g as usize * r.layout.lanes()] == 1.0)
+    }
+
+    /// Forward over reverse from a kept rows forward with the adjoint seed `du_bar` every seed
+    /// shares (#2980, [`Sweep::TangentReverseRows`]): the inputs' adjoints (`u_bar`, `p_bar`:
+    /// η's then θ's lanes at the forward's layout) and, per seed, their tangents along that
+    /// seed's direction (`ut_bar`, `pt_bar`, seed-major). Each chunk runs the shared reverse once
+    /// and each seed's tangent of it; a loop call runs per seed (forward over reverse at one
+    /// tangent, its own log). `false` where a chunk has no such kernel or a loop call fails.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn reverse_rows(
+        &self,
+        r: &RowsFwd,
+        du_bar: &[f64],
+        u_bar: &mut [f64],
+        p_bar: &mut [f64],
+        ut_bar: &mut [f64],
+        pt_bar: &mut [f64],
+    ) -> bool {
+        if r.plan != self as *const Plan as usize {
+            return false;
+        }
+        let layout = r.layout;
+        let Some(fns) = self.fns(layout, Sweep::TangentReverseRows) else {
+            return false;
+        };
+        let (l, seeds) = (layout.lanes(), r.seeds);
+        let need = self.n_slots * l;
+        // Shared `[values | adjoints]`, per seed `[values' tangents | adjoints' tangents]`.
+        let mut sh = vec![0.0; 2 * need];
+        sh[..need].copy_from_slice(&r.buf);
+        let mut ts = vec![0.0; 2 * need * seeds];
+        for sd in 0..seeds {
+            ts[sd * 2 * need..sd * 2 * need + need]
+                .copy_from_slice(&r.tb[sd * need..(sd + 1) * need]);
+        }
+        for (i, &o) in self.outs.iter().enumerate() {
+            for c in 0..l {
+                sh[need + o as usize * l + c] += du_bar[i * l + c];
+            }
+        }
         let lt = Layout { tan: 1, ..layout };
-        let out = ok.map(|()| {
-            logs.into_iter()
-                .enumerate()
-                .map(|(sd, lg)| {
-                    // Per slot: its values, then their tangents (`ir::tangent_packed` at `k = 1`).
-                    let mut packed = take(self.n_slots * 2 * l);
-                    for i in 0..self.n_slots {
-                        packed[i * 2 * l..i * 2 * l + l].copy_from_slice(&buf[i * l..(i + 1) * l]);
-                        packed[i * 2 * l + l..(i + 1) * 2 * l]
-                            .copy_from_slice(&tb[sd * stride + i * l..sd * stride + (i + 1) * l]);
+        let w = lt.lanes();
+        let mut li = r.logs.first().map_or(0, Vec::len);
+        for (c, k) in self.calls.iter().zip(fns.iter()).rev() {
+            match (c, k) {
+                (Call::Chunk { idx, lits, .. }, Kern::Chunk(k)) => {
+                    let n_slots = self.n_slots as u32;
+                    let idx2: Vec<u32> = idx
+                        .iter()
+                        .copied()
+                        .chain(idx.iter().map(|&e| e + n_slots))
+                        .collect();
+                    // SAFETY: the doubled table's entries are below `2·n_slots`, `sh` and each
+                    // seed's block of `ts` hold that many lane blocks.
+                    unsafe {
+                        k.call_seeds(
+                            sh.as_mut_ptr(),
+                            ts.as_mut_ptr(),
+                            2 * need,
+                            seeds,
+                            idx2.as_ptr(),
+                            lits.as_ptr(),
+                        )
+                    };
+                }
+                (Call::Loop { spec, args, outs }, k) if li > 0 => {
+                    li -= 1;
+                    for sd in 0..seeds {
+                        let tsd = &ts[sd * 2 * need..(sd + 1) * 2 * need];
+                        let mut inputs = Vec::with_capacity(args.len() * w);
+                        for &a in args {
+                            let a = a as usize;
+                            inputs.extend_from_slice(&sh[a * l..(a + 1) * l]);
+                            inputs.extend_from_slice(&tsd[a * l..(a + 1) * l]);
+                        }
+                        let mut out_adj = Vec::with_capacity(outs.len() * w);
+                        for &o in outs {
+                            let o = o as usize;
+                            out_adj.extend_from_slice(&sh[need + o * l..need + (o + 1) * l]);
+                            out_adj.extend_from_slice(&tsd[need + o * l..need + (o + 1) * l]);
+                        }
+                        let mut in_adj = vec![0.0; args.len() * w];
+                        let ok = match (spec, k, &r.logs[sd][li]) {
+                            (CallKind::Ode(spec), Kern::Loop(rk), CallLog::Ode(lg)) => {
+                                ode_loop::run_loop_rev(
+                                    spec,
+                                    rk,
+                                    w,
+                                    &inputs,
+                                    lg,
+                                    w,
+                                    1,
+                                    &out_adj,
+                                    &mut in_adj,
+                                )
+                            }
+                            (CallKind::Fixed(_), Kern::Fixed(fx), CallLog::Fixed(Some(fl))) => {
+                                fx.run_rev(lt, Sweep::TangentReverse, fl, 1, &out_adj, &mut in_adj)
+                            }
+                            (CallKind::Repeat(_), Kern::Repeat(rp), CallLog::Fixed(Some(fl))) => {
+                                rp.run_rev(lt, Sweep::TangentReverse, fl, 1, &out_adj, &mut in_adj)
+                            }
+                            (CallKind::Mat(_), Kern::Mat(m), CallLog::Fixed(_)) => m.run_rev(
+                                lt,
+                                Sweep::TangentReverse,
+                                &inputs,
+                                1,
+                                &out_adj,
+                                &mut in_adj,
+                            ),
+                            _ => false,
+                        };
+                        if !ok {
+                            return false;
+                        }
+                        // The adjoints' values are every seed's (the shared seed): taken once.
+                        for (j, &a) in args.iter().enumerate() {
+                            let a = a as usize;
+                            for x in 0..l {
+                                if sd == 0 {
+                                    sh[need + a * l + x] += in_adj[j * w + x];
+                                }
+                                ts[sd * 2 * need + need + a * l + x] += in_adj[j * w + l + x];
+                            }
+                        }
                     }
-                    Fwd {
-                        plan: self as *const Plan as usize,
-                        layout: lt,
-                        buf: packed,
-                        logs: lg,
-                    }
-                })
-                .collect()
-        });
-        give(buf);
-        give(tb);
-        out
+                }
+                _ => return false,
+            }
+        }
+        let (ne, nt) = (self.n_eta * l, self.n_theta * l);
+        for (x, y) in u_bar[..ne].iter_mut().zip(&sh[need..need + ne]) {
+            *x += *y;
+        }
+        for (x, y) in p_bar[..nt].iter_mut().zip(&sh[need + ne..need + ne + nt]) {
+            *x += *y;
+        }
+        for sd in 0..seeds {
+            let t = &ts[sd * 2 * need + need..];
+            for (x, y) in ut_bar[sd * ne..(sd + 1) * ne].iter_mut().zip(&t[..ne]) {
+                *x += *y;
+            }
+            for (x, y) in pt_bar[sd * nt..(sd + 1) * nt]
+                .iter_mut()
+                .zip(&t[ne..ne + nt])
+            {
+                *x += *y;
+            }
+        }
+        sh.iter().chain(&ts).all(|v| v.is_finite())
     }
 
     fn forward_rows_into(
@@ -5830,6 +6023,61 @@ impl Plan {
                     };
                     if guard.is_some_and(|g| buf[g as usize * l] != 1.0) {
                         return Some(());
+                    }
+                }
+                (
+                    Call::Loop {
+                        spec: CallKind::Ode(spec),
+                        args,
+                        outs,
+                    },
+                    Kern::Loop(lk),
+                ) => {
+                    // Every seed in one run: the steps are the values', each body the primal
+                    // once and each seed's tangent.
+                    let mut inputs = Vec::with_capacity(args.len() * l);
+                    let mut tin = Vec::with_capacity(seeds * args.len() * l);
+                    for &a in args {
+                        inputs.extend_from_slice(&buf[a as usize * l..(a as usize + 1) * l]);
+                    }
+                    for sd in 0..seeds {
+                        for &a in args {
+                            let a = a as usize;
+                            tin.extend_from_slice(
+                                &tb[sd * stride + a * l..sd * stride + (a + 1) * l],
+                            );
+                        }
+                    }
+                    let w_out = outs.len() * l;
+                    let mut out = vec![0.0; w_out];
+                    let mut tout = vec![0.0; seeds * w_out];
+                    let mut lgs: Vec<ode_loop::Log> =
+                        (0..seeds).map(|_| ode_loop::Log::take()).collect();
+                    if !ode_loop::run_loop_rows(
+                        spec,
+                        lk,
+                        l,
+                        &inputs,
+                        &tin,
+                        seeds,
+                        &mut out,
+                        &mut tout,
+                        &mut autos[0],
+                        Some(&mut lgs),
+                    ) {
+                        return None;
+                    }
+                    for (sd, lg) in lgs.into_iter().enumerate() {
+                        logs[sd].push(CallLog::Ode(lg));
+                    }
+                    for (j, &o) in outs.iter().enumerate() {
+                        let o = o as usize;
+                        buf[o * l..(o + 1) * l].copy_from_slice(&out[j * l..(j + 1) * l]);
+                        for sd in 0..seeds {
+                            tb[sd * stride + o * l..sd * stride + (o + 1) * l].copy_from_slice(
+                                &tout[sd * w_out + j * l..sd * w_out + (j + 1) * l],
+                            );
+                        }
                     }
                 }
                 (Call::Loop { spec, args, outs }, k) => {

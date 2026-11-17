@@ -605,10 +605,9 @@ fn tangent_rows_split_the_primal_from_each_seeds_tangent_on_random_programs() {
             }
         }
     }
-    // Measured: 54 of 360 draws split; the rest carry dead-arm masks, which keep their
-    // per-direction kernels (`tangent_rows` declines them).
+    // Every draw splits, dead-arm masks included (a forward needs none).
     assert!(
-        checked >= 40,
+        checked == 360,
         "the fixture must exercise the split: {checked} seeds"
     );
     eprintln!("tangent rows vs forward oracle: worst {worst:e} over {checked} seeds");
