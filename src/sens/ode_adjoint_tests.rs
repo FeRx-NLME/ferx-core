@@ -11876,3 +11876,62 @@ fn every_committed_subject_has_an_exact_inner_hessian_at_its_ebe() {
     assert!(ran >= 60, "only {ran} subjects ran");
     assert!(declined.is_empty(), "declined:\n{}", declined.join("\n"));
 }
+
+/// The structured kernel's reduce is one plan shared by every subject (`kernel_run_shared`,
+/// #2980). Two subjects with different doses and data on one thread — the second runs the
+/// first's cached plan — each against the recorded kernel, so a reduce keyed too loosely (one
+/// subject's recording served where it does not hold) or baking a subject's data shows.
+/// Mutation: key the shared plan without the parameter literals (or reuse one plan for every
+/// variant) → the second subject's Hessian moves.
+#[test]
+fn structured_reduce_is_shared_across_subjects_exactly() {
+    use super::hessian::st::{STRUCT_OFF, STRUCT_PASSES};
+    let model = parse_model_string(ONE_CPT_ORAL).unwrap();
+    let s1 = subject(
+        &model,
+        vec![DoseEvent::new(0.0, 100.0, 1, 0.0, false, 0.0)],
+        &TIMES,
+        &[0.1, -0.05, 0.2],
+    );
+    let s2 = subject(
+        &model,
+        vec![
+            DoseEvent::new(0.0, 250.0, 1, 0.0, false, 0.0),
+            DoseEvent::new(12.0, 100.0, 1, 0.0, false, 0.0),
+        ],
+        &TIMES,
+        &[-0.2, 0.15, 0.05],
+    );
+    let params = moved_params(&model);
+    let x = pack_params(&params);
+    with_fit_stack(|| {
+        let h = |s: &Subject, off: bool| {
+            STRUCT_OFF.with(|c| c.set(off));
+            let eta = ebe_for(&model, s, &params, 1e-12, true);
+            let h = subject_adjoint_cov_hessian(
+                &model,
+                s,
+                &params,
+                &x,
+                eta.as_slice(),
+                Objective::Focei,
+            )
+            .expect("in scope");
+            STRUCT_OFF.with(|c| c.set(false));
+            h
+        };
+        STRUCT_PASSES.with(|c| c.set(0));
+        let (a1, a2) = (h(&s1, false), h(&s2, false));
+        assert!(
+            STRUCT_PASSES.with(std::cell::Cell::get) > 0,
+            "the fixture must take the structured kernel"
+        );
+        let (b1, b2) = (h(&s1, true), h(&s2, true));
+        let (g1, g2) = (
+            rel_gap(a1.as_slice(), b1.as_slice()),
+            rel_gap(a2.as_slice(), b2.as_slice()),
+        );
+        eprintln!("structured vs recorded across subjects: {g1:.2e}, {g2:.2e}");
+        assert!(g1 < 1e-12 && g2 < 1e-12, "{g1:.2e} {g2:.2e}");
+    });
+}

@@ -195,6 +195,77 @@ pub(super) fn kernel_run(
     )
 }
 
+/// [`kernel_run`] for a kernel that reads no subject data — its leaves carry everything that
+/// differs between subjects, and `variant` everything its recording bakes in (layout, the
+/// parameter values it reads as literals): one plan per configuration serves every subject, so
+/// a subject neither records nor first-tier runs it (#2980: the structured covariance kernel's
+/// reduce). A thread's plans are kept in a small table, oldest dropped first.
+pub(super) fn kernel_run_shared(
+    model: &CompiledModel,
+    subject: &Subject,
+    variant: kj::Desc,
+    layout: Layout,
+    inputs: &[f64],
+    n_out: usize,
+    f: &dyn Fn(&[kj::Tr]) -> Option<Vec<kj::Tr>>,
+) -> Option<KernelRun> {
+    const KEEP: usize = 64;
+    thread_local! {
+        static SHARED: std::cell::RefCell<Vec<(kj::SubjectKey, Arc<kj::Plan>)>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let l = layout.lanes();
+    if inputs.len() % l != 0 {
+        return None;
+    }
+    let n_in = inputs.len() / l;
+    let key = kj::SubjectKey::new(model, subject, 0, n_in)
+        .with_kind(KERNEL_KIND)
+        .with_variant(variant)
+        .family();
+    let cached = SHARED.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, p)| p.clone())
+    });
+    let plan = match cached {
+        Some(p) => p,
+        None => {
+            let rec = kj::recorded(&key, || {
+                let leaves: Vec<kj::Tr> =
+                    (0..n_in).map(|j| kj::Tr::theta(j, inputs[j * l])).collect();
+                f(&leaves)
+                    .filter(|y| y.len() == n_out)
+                    .map(|y| y.iter().map(|x| x.reg()).collect())
+            })
+            .ok()?;
+            let p = Arc::new(rec.plan(Layout::F64, 0, n_in)?);
+            SHARED.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.len() >= KEEP {
+                    c.remove(0);
+                }
+                c.push((key, p.clone()));
+            });
+            p
+        }
+    };
+    let mut out = kj::Buf::new((n_out + 1) * l);
+    let fwd = plan.forward_layout(layout, &[], inputs, &mut out)?;
+    if out[n_out * l] != 1.0 {
+        return None;
+    }
+    Some(KernelRun {
+        plan,
+        fwd,
+        layout,
+        n_in,
+        n_out,
+        out,
+    })
+}
+
 /// A kernel configuration's [`kj::SubjectKey`] variant: everything that shapes the kernel's
 /// code and is not one of its leaves, as its canonical bytes (compared exactly).
 pub(super) fn variant_of(parts: &impl std::hash::Hash) -> kj::Desc {

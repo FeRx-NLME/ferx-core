@@ -688,6 +688,33 @@ pub(crate) fn structured_rows_supported(ctx: &LikCtx) -> bool {
         && ctx.params.residual_correlations.is_empty()
 }
 
+/// Row `j` of FOCE's Sheiner–Beal marginal as the structured covariance Hessian reads it
+/// (#2980): `(iv·e², iv·e, iv, log V)` with `e = y − f`, `V = R⁰` at `r_eval` (the population
+/// prediction under an `f`-dependent variance, else any — `V` does not read it) and `iv = 1/V`.
+/// [`foce_f`]'s aggregates over these: `Σ iv·res²` with `res = e + G·η`, `b = Σ iv·G·res`,
+/// `S = Σ iv·GGᵀ`, `Σ log V`.
+pub(crate) fn foce_row<T: PkNum>(
+    ctx: &LikCtx,
+    j: usize,
+    f: T,
+    r_eval: T,
+    p: &ParT<T>,
+) -> Option<[T; 4]> {
+    let v = ctx.variance_v(j, r_eval, T::from_f64(1.0), p);
+    if !positive_finite(v) {
+        return None;
+    }
+    let iv = T::from_f64(1.0) / v;
+    let e = T::from_f64(ctx.subject.observations[j]) - f;
+    Some([iv * e * e, iv * e, iv, v.ln()])
+}
+
+/// Whether [`foce_f`] takes its Woodbury form at `S = LᵀGᵀD⁻¹GL` with trace `tr_s` — the
+/// form the structured FOCE kernel is (#2980): otherwise production factors `R̃` itself.
+pub(crate) fn foce_woodbury_ok(tr_s: f64) -> bool {
+    1.0 + tr_s <= WOODBURY_MAX_INFO_TRACE || woodbury_forced()
+}
+
 /// `ηᵀΩ⁻¹η + log|Ω|` (the prior the objective reads), for the structured reduce.
 pub(crate) fn prior_of<T: PkNum>(ctx: &LikCtx, eta: &[T], p: &ParT<T>) -> T {
     ctx.prior(eta, p)
@@ -1618,7 +1645,7 @@ pub(crate) fn chol_logdet<T: PkNum>(l: &[Vec<T>]) -> T {
 }
 
 /// `A⁻¹b` from `A = LLᵀ`.
-fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
+pub(crate) fn chol_solve<T: PkNum>(l: &[Vec<T>], b: &[T]) -> Vec<T> {
     let n = l.len();
     let mut y = b.to_vec();
     for i in 0..n {

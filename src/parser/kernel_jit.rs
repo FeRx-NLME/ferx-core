@@ -6166,7 +6166,19 @@ fn lower_chunk_opt(
             sig.params.push(AbiParam::new(ptr));
         }
         let id = module
-            .declare_function(&format!("chunk{si}"), Linkage::Local, &sig)
+            // Named for profiles (`perf` reads the map Cranelift writes under
+            // `PERF_BUILDID_DIR`): direction, base lanes, tangents, size, segment.
+            .declare_function(
+                &format!(
+                    "kj_{}_l{}_t{}_i{}_s{si}",
+                    if rev { "rev" } else { "fwd" },
+                    layout.base_lanes(),
+                    layout.tan,
+                    f.insts.len(),
+                ),
+                Linkage::Local,
+                &sig,
+            )
             .ok()?;
         ctx.func.signature = sig;
         {
