@@ -22,10 +22,11 @@
 //! - The plan's value forward and one reverse seeded with each output give the gradients of
 //!   `F` and of every `g_k` with respect to every input: `∇_η F`, `H` and `∂g` along any
 //!   direction at once (`mode_response`).
-//! - The plan's forward along every `u_a` at once (its tangent layout) and one
-//!   forward-over-reverse sweep seeded with `Ψ_w` on the value lanes give, on the adjoints'
-//!   tangent lanes, every Hessian column `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`, contracted with every
-//!   `u_b` (`psi_along`): one pass of one compiled program per Hessian (#2980).
+//! - Per pass of [`MAX_PASS`] directions, the plan's forward along their `u_a` (its tangent
+//!   layout) and one forward-over-reverse sweep seeded with `Ψ_w` on the value lanes give, on
+//!   the adjoints' tangent lanes, their Hessian columns `∇_v(∂Ψ_w/∂u_a) = ∇²Ψ_w u_a`,
+//!   contracted with every `u_b` (`psi_along`): `⌈n / MAX_PASS⌉` passes of one compiled
+//!   program, its layout shared by every pass (#2980).
 //!
 //! There are no third-order sensitivity tables and no finite differences, and FOCE's
 //! frozen-variance mode (whose `R⁰` moves with θ through `f(η = 0)`) is just another term
@@ -322,9 +323,11 @@ fn mode_response(plan: &CovPlan<'_>, along: &[Dir]) -> Option<(Vec<f64>, DMatrix
         .then(|| (wv.iter().copied().collect(), eta_x))
 }
 
-/// Directions per pass over `n` of them: all, up to [`MAX_PASS`] (fewer under the test cap).
-fn pass_width(n: usize) -> usize {
-    let w = n.clamp(1, MAX_PASS);
+/// Directions per pass: [`MAX_PASS`] (fewer under the test cap), however few directions there
+/// are — a pass's unused lanes carry zeros, and one width means one compiled layout for a
+/// single-axis diagonal as for the full Hessian (#2980 review r3).
+fn pass_width() -> usize {
+    let w = MAX_PASS;
     #[cfg(test)]
     return PASS_WIDTH_CAP
         .with(|c| c.get())
@@ -428,7 +431,7 @@ fn psi_lanes(
     mut lane: impl FnMut(usize, f64, &dyn Fn(&Dir) -> f64),
 ) -> Option<()> {
     let n = plan.pn();
-    let width = pass_width(dirs.len());
+    let width = pass_width();
     let l = 1 + width;
     for (c, chunk) in dirs.chunks(width).enumerate() {
         let run = plan.run(chunk, width)?;
@@ -683,7 +686,7 @@ impl<'s> NnReduction<'s> {
                 (out.len() == mlp_out).then_some(out)
             };
             let variant = super::kernel::variant_of(&(7u8, net, off, n_w));
-            let width = pass_width(n_w);
+            let width = pass_width();
             let run = |dirs: &[usize]| {
                 let (layout, l) = if dirs.is_empty() {
                     (Layout::F64, 1)
@@ -728,15 +731,37 @@ impl<'s> NnReduction<'s> {
             let l = 1 + width;
             for blk in (off..off + n_w).collect::<Vec<_>>().chunks(width) {
                 let kr = run(blk)?;
+                // One forward-over-reverse sweep, a seed per output on its value lane: tangent
+                // `p` of each weight's adjoint in row `o` is output `o`'s column along `blk[p]`.
+                let rows = if reverse_per_direction() {
+                    None
+                } else {
+                    let mut seeds = vec![0.0; mlp_out * mlp_out * l];
+                    for o in 0..mlp_out {
+                        seeds[o * mlp_out * l + o * l] = 1.0;
+                    }
+                    Some(kr.reverse_tangent_flat(&seeds, mlp_out)?)
+                };
+                let row_w = n_th * l;
                 for o in 0..mlp_out {
-                    // Output `o`'s value lane: tangent `p` of each weight's adjoint is the
-                    // column along `blk[p]`.
-                    let mut s = vec![0.0; mlp_out * l];
-                    s[o * l] = 1.0;
-                    let adj = kr.reverse_tangent(&s)?;
+                    // Under the oracle switch, a reverse per direction seeded on tangent lane
+                    // `p`, whose value lanes are the same column.
+                    let column: Box<dyn Fn(usize, usize) -> f64 + '_> = if let Some(r) = &rows {
+                        Box::new(move |p, j| r[o * row_w + j * l + 1 + p])
+                    } else {
+                        let seeds: Vec<Vec<f64>> = (0..blk.len())
+                            .map(|p| {
+                                let mut s = vec![0.0; mlp_out * l];
+                                s[o * l + 1 + p] = 1.0;
+                                s
+                            })
+                            .collect();
+                        let adj = kr.reverse(&seeds)?;
+                        Box::new(move |p, j| adj[p][j * l])
+                    };
                     for (p, &i) in blk.iter().enumerate() {
                         for j in off..off + n_w {
-                            let v = adj[j * l + 1 + p];
+                            let v = column(p, j);
                             if v != 0.0 {
                                 hz[z0 + o].push(((i, j), v));
                             }
@@ -1760,7 +1785,7 @@ impl<'a> CovPlan<'a> {
         let (mut ub, mut pb) = (kj::Buf::new(ns * nu), kj::Buf::new(ns * np));
         let swept = if tangent {
             kept.plan
-                .reverse_tangent_from(&kept.fwd, &mut ub, &mut pb, &du_bar)
+                .reverse_tangent_from(&kept.fwd, 1, &mut ub, &mut pb, &du_bar)
         } else {
             kept.plan
                 .reverse_from(&kept.fwd, kept.layout, ns, &mut ub, &mut pb, &du_bar)

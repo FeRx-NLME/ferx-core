@@ -5946,21 +5946,9 @@ fn cov_hessian_narrow_passes_equal_the_full_width_ones() {
         .expect("in scope")
     };
     let full = run(None);
-    {
-        let cap = 1;
-        let narrow = run(Some(cap));
-        let scale = full.iter().fold(0.0f64, |m, v| m.max(v.abs()));
-        let mut worst = 0.0f64;
-        for (a, b) in narrow.iter().zip(full.iter()) {
-            assert!(
-                a.is_finite() && b.is_finite(),
-                "width {cap}: non-finite entry"
-            );
-            worst = worst.max((a - b).abs() / scale);
-        }
-        eprintln!("cov Hessian at width {cap} vs 2: {worst:.2e}");
-        assert!(worst < 1e-12, "width {cap} vs 2: {worst:.2e}");
-    }
+    let worst = rel_gap(run(Some(1)).as_slice(), full.as_slice());
+    eprintln!("cov Hessian at width 1 vs 2: {worst:.2e}");
+    assert!(worst < 1e-12, "width 1 vs 2: {worst:.2e}");
 }
 
 #[test]

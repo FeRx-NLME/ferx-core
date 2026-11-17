@@ -1331,16 +1331,20 @@ fn derivs_of(
     let vals = (0..n_out).map(|o| du[o * l]).collect();
     let (mut grad, mut hess) = (Vec::with_capacity(n_out), Vec::with_capacity(n_out));
     if second {
-        // Per output one forward-over-reverse sweep seeded on its value lane (#2980): the
+        // One forward-over-reverse sweep with a seed per output, on its value lane (#2980): the
         // inputs' value-lane adjoints are the gradient, tangent `j` of input `i`'s is
         // `∂²y/∂x_i∂x_j`.
+        let (w_out, w_in) = (n_out * l, n * l);
+        let mut du_bar = vec![0.0; n_out * w_out];
         for o in 0..n_out {
-            let mut du_bar = vec![0.0; n_out * l];
-            du_bar[o * l] = 1.0;
-            let mut pb = vec![0.0; n * l];
-            if !plan.reverse_tangent_from(&fwd, &mut [], &mut pb, &du_bar) {
-                return Err("the reverse failed".into());
-            }
+            du_bar[o * w_out + o * l] = 1.0;
+        }
+        let mut pb = vec![0.0; n_out * w_in];
+        if !plan.reverse_tangent_from(&fwd, n_out, &mut [], &mut pb, &du_bar) {
+            return Err("the reverse failed".into());
+        }
+        for o in 0..n_out {
+            let pb = &pb[o * w_in..(o + 1) * w_in];
             grad.push((0..n).map(|i| pb[i * l]).collect());
             hess.push(
                 (0..n)
@@ -3936,11 +3940,23 @@ impl ChunkProgram {
         if sweep == Sweep::TangentReverse {
             // The base layout's reverse, differentiated forward along the layout's directions:
             // the adjoint arguments get tangent lanes packed as the values' are, so the
-            // kernel's buffers are laid out as the reverse over forward's. It runs one seed,
-            // so its forward prefix needs no split from the seed's sweep (`prefix` 0).
-            let f = ir::tangent_packed(&ir::reverse(&f), layout.tan as usize, base.lanes(), false);
-            let (f, _) = ir::dedup_calls(&f, 0);
-            let k = Some(Tiered::new(f, layout, self.n_in, true, 0));
+            // kernel's buffers are laid out as the reverse over forward's. The reverse's forward
+            // recomputation reads no adjoint, and neither does its tangent, so that stays the
+            // prefix every seed shares.
+            let prefix = f
+                .insts
+                .iter()
+                .filter(|i| !matches!(i, Inst::Store { .. }))
+                .count();
+            let (f, prefix) = ir::tangent_packed_prefix(
+                &ir::reverse(&f),
+                layout.tan as usize,
+                base.lanes(),
+                false,
+                prefix,
+            );
+            let (f, prefix) = ir::dedup_calls(&f, prefix);
+            let k = Some(Tiered::new(f, layout, self.n_in, true, prefix));
             c.insert((layout, sweep), k.clone());
             return k;
         }
@@ -5635,16 +5651,18 @@ impl Plan {
     /// lanes and `u̇̄` on their tangent lanes, it adds `ūᵀ·∂du/∂(η, θ)` on the base lanes and its
     /// directional derivative along each direction on the tangent lanes: with `u̇̄ = 0` the
     /// columns of the second derivative of `ūᵀ·du` that [`Self::reverse_from`] at the same
-    /// layout needs one seed per direction for.
+    /// layout needs one seed per direction for. `seeds` such sweeps at once, each a block of
+    /// `du_bar`, `u_bar` and `p_bar`, share the recomputed forward as [`Self::reverse_from`]'s do.
     pub(crate) fn reverse_tangent_from(
         &self,
         f: &Fwd,
+        seeds: usize,
         u_bar: &mut [f64],
         p_bar: &mut [f64],
         du_bar: &[f64],
     ) -> bool {
         let sweep = Sweep::TangentReverse.at(f.layout);
-        self.sweep_back(f, f.layout, sweep, 1, u_bar, p_bar, du_bar)
+        self.sweep_back(f, f.layout, sweep, seeds, u_bar, p_bar, du_bar)
     }
 
     /// [`Self::reverse_from`] and [`Self::reverse_tangent_from`]: the same buffers and the same

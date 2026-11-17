@@ -54,11 +54,17 @@ impl KernelRun {
     /// laid out the same way — the value lanes' adjoints and their tangents along each
     /// direction ([`kj::Plan::reverse_tangent_from`]).
     pub(super) fn reverse_tangent(&self, seed: &[f64]) -> Option<kj::Buf> {
-        let mut p_bar = kj::Buf::new(self.n_in * self.layout.lanes());
-        if seed.len() != self.n_out * self.layout.lanes()
+        self.reverse_tangent_flat(seed, 1)
+    }
+
+    /// [`Self::reverse_tangent`] for `rows` seeds at once (laid out one after another), the
+    /// recomputed forward shared: per row, every leaf's lanes.
+    pub(super) fn reverse_tangent_flat(&self, seeds: &[f64], rows: usize) -> Option<kj::Buf> {
+        let mut p_bar = kj::Buf::new(rows * self.n_in * self.layout.lanes());
+        if seeds.len() != rows * self.n_out * self.layout.lanes()
             || !self
                 .plan
-                .reverse_tangent_from(&self.fwd, &mut [], &mut p_bar, seed)
+                .reverse_tangent_from(&self.fwd, rows, &mut [], &mut p_bar, seeds)
         {
             return None;
         }

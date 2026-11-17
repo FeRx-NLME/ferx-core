@@ -1563,6 +1563,14 @@ pub(super) fn reverse(fwd: &Func) -> Func {
 /// arm needs no mask here — its value is only read through the [`Inst::Select`] that chose
 /// it, and the select picks the taken arm's tangent.
 pub(super) fn tangent(f: &Func, k: usize) -> Func {
+    tangent_prefix(f, k, 0).0
+}
+
+/// [`tangent`], also returning how many of its instructions come from `f`'s first `prefix`:
+/// the tangent of a prefix that reads none of `f`'s later arguments reads none of their
+/// tangents either, so a reverse's forward recomputation stays a prefix of its forward over
+/// reverse (#2980) — run once and shared by every seed.
+pub(super) fn tangent_prefix(f: &Func, k: usize, prefix: usize) -> (Func, usize) {
     type Tan = Option<Vec<V>>;
     // `Σ ± scale·tangent`, sparse: `None` when every term is.
     fn lin(b: &mut Func, k: usize, terms: &[(&Tan, Option<V>, bool)]) -> Tan {
@@ -1595,6 +1603,7 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
     let mut b = Func::new(2 * n);
     let mut map = vec![V::MAX; f.insts.len()];
     let mut tan: Vec<Tan> = vec![None; f.insts.len()];
+    let mut emitted = 0;
     for (i, inst) in f.insts.iter().enumerate() {
         b.cur = f.live[i].map(|c| map[c as usize]);
         let fw = |x: V| map[x as usize];
@@ -1777,9 +1786,12 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
             Inst::Select(..) => None,
         };
         tan[i] = new;
+        if i + 1 == prefix {
+            emitted = b.insts.len();
+        }
     }
     b.cur = None;
-    b
+    (b, emitted)
 }
 
 /// [`tangent`] in `k` directions with the tangents packed into the value arguments: a
@@ -1788,7 +1800,19 @@ pub(super) fn tangent(f: &Func, k: usize) -> Func {
 /// `i·l(1+k) + l + lane·k + j` (`Layout::tan`). Argument 2 (the literals, indexed by slot
 /// alone) has no tangents: their loads are zeros.
 pub(super) fn tangent_packed(f: &Func, k: usize, l: usize, seed_tangents: bool) -> Func {
-    let t = tangent(f, k);
+    tangent_packed_prefix(f, k, l, seed_tangents, 0).0
+}
+
+/// [`tangent_packed`] with [`tangent_prefix`]'s count of the instructions `f`'s first `prefix`
+/// became (packing moves locations, never instructions).
+pub(super) fn tangent_packed_prefix(
+    f: &Func,
+    k: usize,
+    l: usize,
+    seed_tangents: bool,
+    prefix: usize,
+) -> (Func, usize) {
+    let (t, emitted) = tangent_prefix(f, k, prefix);
     let n = f.n_args;
     let wl = (l * (1 + k)) as u32;
     let (l32, k32) = (l as u32, k as u32);
@@ -1823,7 +1847,7 @@ pub(super) fn tangent_packed(f: &Func, k: usize, l: usize, seed_tangents: bool) 
         })
         .collect();
     out.live = t.live.clone();
-    out
+    (out, emitted)
 }
 
 /// Run a [`Func`] in Rust: the reference semantics the native lowering must reproduce, and

@@ -2371,7 +2371,7 @@ fn every_call_kind_sweeps_forward_over_reverse_as_a_reverse_per_direction() {
             }
             let mut fr = vec![0.0; 2 * l];
             assert!(
-                plan.reverse_tangent_from(&fwd, &mut fr, &mut [], &du_bar),
+                plan.reverse_tangent_from(&fwd, 1, &mut fr, &mut [], &du_bar),
                 "{name}: forward over reverse sweeps"
             );
             let mut du_rf = vec![0.0; K * n_out * l];
@@ -2407,6 +2407,58 @@ fn every_call_kind_sweeps_forward_over_reverse_as_a_reverse_per_direction() {
                 seen > 1e-3,
                 "{name}: the second derivatives vanish, testing nothing"
             );
+        }
+    }
+}
+
+/// `derivs_of`'s Hessians (#2980: one forward-over-reverse sweep, a seed per output) against
+/// closed forms, on two outputs of three live inputs whose every second derivative is
+/// distinct where it is not zero — so a swapped lane, a wrong input slot or
+/// one output's seed leaking into another's row shows. `y₀ = x₀²x₁ + x₀e^{x₂}`,
+/// `y₁ = e^{x₀x₂} + x₁³`.
+///
+/// Mutations: an input slot off by one in the read (`pb[((i + 1) % n) * l + 1 + j]`); every
+/// output's seed in row 0 (both outputs' rows then coincide). (A transposed read is not one:
+/// the matrix is symmetric.)
+#[test]
+fn derivs_hessians_match_closed_forms_on_several_live_inputs() {
+    let x = [0.7f64, -1.3, 0.4];
+    let f = |v: &[Tr]| -> Option<Vec<Tr>> {
+        let (a, b, c) = (v[0], v[1], v[2]);
+        Some(vec![a * a * b + a * c.exp(), (a * c).exp() + b * b * b])
+    };
+    let (vals, grad, hess) = derivs_of(&x, 2, true, &f).expect("served");
+    let (a, b, c) = (x[0], x[1], x[2]);
+    let (e2, e) = (c.exp(), (a * c).exp());
+    let want_vals = [a * a * b + a * e2, e + b * b * b];
+    let want_grad = [
+        [2.0 * a * b + e2, a * a, a * e2],
+        [c * e, 3.0 * b * b, a * e],
+    ];
+    // Row-major `[i][j]`, `∂²y/∂x_i∂x_j`.
+    let want_hess = [
+        [
+            [2.0 * b, 2.0 * a, e2],
+            [2.0 * a, 0.0, 0.0],
+            [e2, 0.0, a * e2],
+        ],
+        [
+            [c * c * e, 0.0, e * (1.0 + a * c)],
+            [0.0, 6.0 * b, 0.0],
+            [e * (1.0 + a * c), 0.0, a * a * e],
+        ],
+    ];
+    for o in 0..2 {
+        close(vals[o], want_vals[o], &format!("y{o}"));
+        for i in 0..3 {
+            close(grad[o][i], want_grad[o][i], &format!("∂y{o}/∂x{i}"));
+            for j in 0..3 {
+                close(
+                    hess[o][i * 3 + j],
+                    want_hess[o][i][j],
+                    &format!("∂²y{o}/∂x{i}∂x{j}"),
+                );
+            }
         }
     }
 }
